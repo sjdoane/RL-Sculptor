@@ -1,0 +1,5 @@
+# Pre-extracted sculptor KG shipped with the library. Binary sqlite —
+# `git diff` should not attempt to produce a text diff. Regenerate via
+# `scripts/regenerate_kg_preextracted.sh` when examples/kg_seeds_global.yml
+# changes.
+examples/kg_preextracted.db binary

@@ -1,0 +1,895 @@
+# Robot library manifest (MJLAB_PIVOT_DESIGN §4, M3).
+#
+# - `source`: "menagerie" (via robot_descriptions), "mjlab_builtin"
+#   (Cartpole toy), "gymnasium_builtin" (MuJoCo Gymnasium envs).
+# - `training_support`: "mjlab_ready" (task registered in mjlab registry;
+#   load-time validation in services/robot_library.py auto-demotes to
+#   preview_only if the task_id is not present in the running mjlab
+#   install), "preview_only" (URDF/MJCF loadable but no training path),
+#   "gymnasium_compatible" (legacy gym_sb3 path).
+# - `is_smoke_test_target`: true for Cartpole only; UI category filter
+#   hides "Other" by default so Cartpole doesn't clutter the browser.
+# - `references`: verified URLs only. preview_only entries ship with
+#   `references: []` unless a canonical paper + repo was hand-verified
+#   during research.
+
+robots:
+  # ── mjlab_ready (6 robots, 14 tasks) ──────────────────────────────────────
+  - slug: cartpole_mjlab
+    display_name: "Cartpole (toy)"
+    category: Other
+    description: "Classical cart-pole stabilization toy task; ships inside mjlab for smoke testing."
+    source: mjlab_builtin
+    menagerie_package: null
+    training_support: mjlab_ready
+    is_smoke_test_target: true
+    preconfigured_tasks:
+      - task_id: Mjlab-Cartpole-Balance
+        display_name: "Balance upright cartpole"
+        recommended_num_envs: 4096
+      - task_id: Mjlab-Cartpole-Swingup
+        display_name: "Swingup from hanging"
+        recommended_num_envs: 4096
+    references: []
+    thumbnail_path: robots/cartpole_mjlab.webp
+
+  - slug: unitree_go1
+    display_name: "Unitree Go1"
+    category: Quadruped
+    description: "Unitree Go1 quadruped (~12 kg, 12 actuated joints). Canonical sim-to-real legged locomotion platform."
+    source: menagerie
+    menagerie_package: go1_mj_description
+    training_support: mjlab_ready
+    is_smoke_test_target: false
+    preconfigured_tasks:
+      - task_id: Mjlab-Velocity-Flat-Unitree-Go1
+        display_name: "Velocity tracking (flat)"
+        recommended_num_envs: 2048
+      - task_id: Mjlab-Velocity-Rough-Unitree-Go1
+        display_name: "Velocity tracking (rough terrain)"
+        recommended_num_envs: 2048
+    references:
+      - kind: paper
+        url: https://arxiv.org/abs/2212.03238
+        citation: "Margolis & Agrawal, Walk These Ways, CoRL 2022"
+      - kind: paper
+        url: https://arxiv.org/abs/2208.07860
+        citation: "Smith et al., A Walk in the Park, arXiv 2022"
+      - kind: paper
+        url: https://arxiv.org/abs/2109.11978
+        citation: "Rudin et al., Learning to Walk in Minutes (legged_gym), CoRL 2021"
+      - kind: repo
+        url: https://github.com/Improbable-AI/walk-these-ways
+        citation: "Improbable-AI / walk-these-ways"
+      - kind: repo
+        url: https://github.com/unitreerobotics/unitree_ros
+        citation: "unitreerobotics / unitree_ros"
+    thumbnail_path: robots/unitree_go1.webp
+
+  - slug: anybotics_anymal_c
+    display_name: "ANYmal C"
+    category: Quadruped
+    description: "ANYbotics ANYmal C quadruped (~50 kg, 12 DoF). Canonical proprioceptive-locomotion research platform."
+    source: menagerie
+    menagerie_package: anymal_c_mj_description
+    training_support: mjlab_ready
+    is_smoke_test_target: false
+    preconfigured_tasks: []
+    references:
+      - kind: paper
+        url: https://arxiv.org/abs/2010.11251
+        citation: "Lee et al., Learning Quadrupedal Locomotion over Challenging Terrain, Science Robotics 2020"
+      - kind: paper
+        url: https://arxiv.org/abs/1901.08652
+        citation: "Hwangbo et al., Learning Agile and Dynamic Motor Skills, Science Robotics 2019"
+      - kind: paper
+        url: https://arxiv.org/abs/2109.11978
+        citation: "Rudin et al., Learning to Walk in Minutes, CoRL 2021"
+      - kind: repo
+        url: https://github.com/ANYbotics/anymal_c_simple_description
+        citation: "ANYbotics / anymal_c_simple_description"
+    thumbnail_path: robots/anybotics_anymal_c.webp
+
+  - slug: unitree_g1
+    display_name: "Unitree G1"
+    category: Humanoid
+    description: "Unitree G1 humanoid (~35 kg, 23 actuated joints). Primary humanoid RL target on the sculptor."
+    source: menagerie
+    menagerie_package: g1_mj_description
+    training_support: mjlab_ready
+    is_smoke_test_target: false
+    preconfigured_tasks:
+      - task_id: Mjlab-Velocity-Flat-Unitree-G1
+        display_name: "Velocity tracking (flat)"
+        recommended_num_envs: 1024
+      - task_id: Mjlab-Velocity-Rough-Unitree-G1
+        display_name: "Velocity tracking (rough terrain)"
+        recommended_num_envs: 1024
+      - task_id: Mjlab-Tracking-Flat-Unitree-G1
+        display_name: "Motion tracking (LaFan dance reference)"
+        recommended_num_envs: 768
+      - task_id: Mjlab-Tracking-Flat-Unitree-G1-No-State-Estimation
+        display_name: "Motion tracking (no state estimation)"
+        recommended_num_envs: 768
+    references:
+      - kind: paper
+        url: https://arxiv.org/abs/2406.08858
+        citation: "He et al., OmniH2O: Whole-Body Teleop/Learning, CoRL 2024"
+      - kind: paper
+        url: https://arxiv.org/abs/2412.13196
+        citation: "Ji et al., ExBody2: Expressive Whole-Body Control, arXiv 2024"
+      - kind: paper
+        url: https://arxiv.org/abs/2402.19469
+        citation: "Radosavovic et al., Humanoid Locomotion as Next Token Prediction, NeurIPS 2024"
+      - kind: repo
+        url: https://github.com/unitreerobotics/unitree_rl_lab
+        citation: "unitreerobotics / unitree_rl_lab"
+      - kind: repo
+        url: https://github.com/unitreerobotics/unitree_ros
+        citation: "unitreerobotics / unitree_ros"
+    thumbnail_path: robots/unitree_g1.webp
+
+  - slug: booster_t1
+    display_name: "Booster T1"
+    category: Humanoid
+    description: "Booster Robotics T1 humanoid (23 DoF). Accompanied by the Booster Gym RL framework."
+    source: menagerie
+    menagerie_package: booster_t1_mj_description
+    training_support: mjlab_ready
+    is_smoke_test_target: false
+    preconfigured_tasks: []
+    references:
+      - kind: paper
+        url: https://arxiv.org/abs/2506.15132
+        citation: "Wang et al., Booster Gym: End-to-End RL for Humanoid Locomotion, arXiv 2025"
+      - kind: repo
+        url: https://github.com/BoosterRobotics/booster_gym
+        citation: "BoosterRobotics / booster_gym"
+      - kind: repo
+        url: https://github.com/BoosterRobotics/booster_assets
+        citation: "BoosterRobotics / booster_assets"
+    thumbnail_path: robots/booster_t1.webp
+
+  - slug: i2rt_yam
+    display_name: "Yam arm (I2RT)"
+    category: Arm
+    description: "I2RT YAM 6-DoF manipulator. Used for mjlab's Lift-Cube manipulation tasks."
+    source: menagerie
+    menagerie_package: yam_mj_description
+    training_support: mjlab_ready
+    is_smoke_test_target: false
+    preconfigured_tasks:
+      - task_id: Mjlab-Lift-Cube-Yam
+        display_name: "Lift cube (state-based)"
+        recommended_num_envs: 2048
+      - task_id: Mjlab-Lift-Cube-Yam-Rgb
+        display_name: "Lift cube (RGB camera)"
+        recommended_num_envs: 512
+      - task_id: Mjlab-Lift-Cube-Yam-Depth
+        display_name: "Lift cube (depth camera)"
+        recommended_num_envs: 512
+      - task_id: Mjlab-Multi-Cube-Seg-Yam
+        display_name: "Multi-cube lift (segmentation)"
+        recommended_num_envs: 1024
+    # TODO: find canonical Yam arm references
+    references: []
+    thumbnail_path: robots/i2rt_yam.webp
+
+  # ── gymnasium_compatible (5 legacy robots) ────────────────────────────────
+  - slug: hopper
+    display_name: "Hopper"
+    category: Other
+    description: "MuJoCo Gymnasium single-legged hopper benchmark."
+    source: gymnasium_builtin
+    menagerie_package: null
+    training_support: gymnasium_compatible
+    is_smoke_test_target: false
+    preconfigured_tasks:
+      - task_id: "Hopper-v4"
+        display_name: "Run forward (Gymnasium)"
+        recommended_num_envs: 4
+    references: []
+    thumbnail_path: robots/hopper.webp
+
+  - slug: ant
+    display_name: "Ant"
+    category: Quadruped
+    description: "MuJoCo Gymnasium 4-legged ant benchmark."
+    source: gymnasium_builtin
+    menagerie_package: null
+    training_support: gymnasium_compatible
+    is_smoke_test_target: false
+    preconfigured_tasks:
+      - task_id: "Ant-v4"
+        display_name: "Run forward (Gymnasium)"
+        recommended_num_envs: 4
+    references: []
+    thumbnail_path: robots/ant.webp
+
+  - slug: walker2d
+    display_name: "Walker2d"
+    category: Other
+    description: "MuJoCo Gymnasium 2D bipedal walker."
+    source: gymnasium_builtin
+    menagerie_package: null
+    training_support: gymnasium_compatible
+    is_smoke_test_target: false
+    preconfigured_tasks:
+      - task_id: "Walker2d-v4"
+        display_name: "Walk forward (Gymnasium)"
+        recommended_num_envs: 4
+    references: []
+    thumbnail_path: robots/walker2d.webp
+
+  - slug: halfcheetah
+    display_name: "HalfCheetah"
+    category: Quadruped
+    description: "MuJoCo Gymnasium planar quadruped benchmark."
+    source: gymnasium_builtin
+    menagerie_package: null
+    training_support: gymnasium_compatible
+    is_smoke_test_target: false
+    preconfigured_tasks:
+      - task_id: "HalfCheetah-v4"
+        display_name: "Run forward (Gymnasium)"
+        recommended_num_envs: 4
+    references: []
+    thumbnail_path: robots/halfcheetah.webp
+
+  - slug: humanoid
+    display_name: "Humanoid (Gymnasium)"
+    category: Humanoid
+    description: "MuJoCo Gymnasium humanoid benchmark."
+    source: gymnasium_builtin
+    menagerie_package: null
+    training_support: gymnasium_compatible
+    is_smoke_test_target: false
+    preconfigured_tasks:
+      - task_id: "Humanoid-v4"
+        display_name: "Run forward (Gymnasium)"
+        recommended_num_envs: 4
+    references: []
+    thumbnail_path: robots/humanoid.webp
+
+  # ── preview_only (Menagerie; not yet wired to an mjlab task) ──────────────
+  # Arms
+  - slug: agilex_piper
+    display_name: "AgileX PiPER"
+    category: Arm
+    description: "AgileX PiPER 6-DoF manipulator."
+    source: menagerie
+    menagerie_package: piper_mj_description
+    training_support: preview_only
+    is_smoke_test_target: false
+    preconfigured_tasks: []
+    references: []
+    thumbnail_path: robots/agilex_piper.webp
+
+  - slug: arx_l5
+    display_name: "ARX L5"
+    category: Arm
+    description: "ARX Robotics L5 6-DoF manipulator."
+    source: menagerie
+    menagerie_package: arx_l5_mj_description
+    training_support: preview_only
+    is_smoke_test_target: false
+    preconfigured_tasks: []
+    references: []
+    thumbnail_path: robots/arx_l5.webp
+
+  - slug: dynamixel_2r
+    display_name: "Dynamixel 2R"
+    category: Arm
+    description: "Research test-rig: 2-revolute-joint arm driven by Dynamixel servos."
+    source: menagerie
+    menagerie_package: dynamixel_2r_mj_description
+    training_support: preview_only
+    is_smoke_test_target: false
+    preconfigured_tasks: []
+    references: []
+    thumbnail_path: robots/dynamixel_2r.webp
+
+  - slug: franka_emika_panda
+    display_name: "Franka Emika Panda"
+    category: Arm
+    description: "Franka Emika Panda 7-DoF manipulator."
+    source: menagerie
+    menagerie_package: panda_mj_description
+    training_support: preview_only
+    is_smoke_test_target: false
+    preconfigured_tasks: []
+    references: []
+    thumbnail_path: robots/franka_emika_panda.webp
+
+  - slug: franka_fr3
+    display_name: "Franka FR3"
+    category: Arm
+    description: "Franka Robotics FR3 7-DoF manipulator."
+    source: menagerie
+    menagerie_package: fr3_mj_description
+    training_support: preview_only
+    is_smoke_test_target: false
+    preconfigured_tasks: []
+    references: []
+    thumbnail_path: robots/franka_fr3.webp
+
+  - slug: franka_fr3_v2
+    display_name: "Franka FR3 (v2)"
+    category: Arm
+    description: "Franka Robotics FR3 7-DoF manipulator — v2 model refinement."
+    source: menagerie
+    menagerie_package: fr3_v2_mj_description
+    training_support: preview_only
+    is_smoke_test_target: false
+    preconfigured_tasks: []
+    references: []
+    thumbnail_path: robots/franka_fr3_v2.webp
+
+  - slug: kinova_gen3
+    display_name: "Kinova Gen3"
+    category: Arm
+    description: "Kinova Gen3 7-DoF manipulator."
+    source: menagerie
+    menagerie_package: gen3_mj_description
+    training_support: preview_only
+    is_smoke_test_target: false
+    preconfigured_tasks: []
+    references: []
+    thumbnail_path: robots/kinova_gen3.webp
+
+  - slug: kuka_iiwa_14
+    display_name: "KUKA LBR iiwa 14"
+    category: Arm
+    description: "KUKA LBR iiwa 14 7-DoF manipulator."
+    source: menagerie
+    menagerie_package: iiwa14_mj_description
+    training_support: preview_only
+    is_smoke_test_target: false
+    preconfigured_tasks: []
+    references: []
+    thumbnail_path: robots/kuka_iiwa_14.webp
+
+  - slug: low_cost_robot_arm
+    display_name: "Low-Cost Robot Arm"
+    category: Arm
+    description: "Open-source low-cost 5-DoF robot arm (Alexander Koch et al.)."
+    source: menagerie
+    menagerie_package: low_cost_robot_arm_mj_description
+    training_support: preview_only
+    is_smoke_test_target: false
+    preconfigured_tasks: []
+    references: []
+    thumbnail_path: robots/low_cost_robot_arm.webp
+
+  - slug: rethink_robotics_sawyer
+    display_name: "Rethink Robotics Sawyer"
+    category: Arm
+    description: "Rethink Robotics Sawyer 7-DoF manipulator."
+    source: menagerie
+    menagerie_package: sawyer_mj_description
+    training_support: preview_only
+    is_smoke_test_target: false
+    preconfigured_tasks: []
+    references: []
+    thumbnail_path: robots/rethink_robotics_sawyer.webp
+
+  - slug: robotstudio_so101
+    display_name: "The Robot Studio SO-101"
+    category: Arm
+    description: "The Robot Studio SO-101 5-DoF open-source arm."
+    source: menagerie
+    menagerie_package: so_arm101_mj_description
+    training_support: preview_only
+    is_smoke_test_target: false
+    preconfigured_tasks: []
+    references: []
+    thumbnail_path: robots/robotstudio_so101.webp
+
+  - slug: trs_so_arm100
+    display_name: "SO-ARM 100"
+    category: Arm
+    description: "Standard Open Arm-100 5-DoF open-source arm."
+    source: menagerie
+    menagerie_package: so_arm100_mj_description
+    training_support: preview_only
+    is_smoke_test_target: false
+    preconfigured_tasks: []
+    references: []
+    thumbnail_path: robots/trs_so_arm100.webp
+
+  - slug: trossen_vx300s
+    display_name: "ViperX 300 6-DoF"
+    category: Arm
+    description: "Trossen Robotics ViperX 300 6-DoF manipulator."
+    source: menagerie
+    menagerie_package: viper_mj_description
+    training_support: preview_only
+    is_smoke_test_target: false
+    preconfigured_tasks: []
+    references: []
+    thumbnail_path: robots/trossen_vx300s.webp
+
+  - slug: trossen_wx250s
+    display_name: "WidowX 250 6-DoF"
+    category: Arm
+    description: "Trossen Robotics WidowX 250 6-DoF manipulator."
+    source: menagerie
+    menagerie_package: widow_mj_description
+    training_support: preview_only
+    is_smoke_test_target: false
+    preconfigured_tasks: []
+    references: []
+    thumbnail_path: robots/trossen_wx250s.webp
+
+  - slug: ufactory_xarm7
+    display_name: "UFactory xArm7"
+    category: Arm
+    description: "UFactory xArm 7-DoF manipulator."
+    source: menagerie
+    menagerie_package: xarm7_mj_description
+    training_support: preview_only
+    is_smoke_test_target: false
+    preconfigured_tasks: []
+    references: []
+    thumbnail_path: robots/ufactory_xarm7.webp
+
+  - slug: unitree_z1
+    display_name: "Unitree Z1"
+    category: Arm
+    description: "Unitree Z1 6-DoF manipulator (mountable on quadrupeds)."
+    source: menagerie
+    menagerie_package: z1_mj_description
+    training_support: preview_only
+    is_smoke_test_target: false
+    preconfigured_tasks: []
+    references: []
+    thumbnail_path: robots/unitree_z1.webp
+
+  - slug: universal_robots_ur10e
+    display_name: "Universal Robots UR10e"
+    category: Arm
+    description: "Universal Robots UR10e collaborative 6-DoF manipulator."
+    source: menagerie
+    menagerie_package: ur10e_mj_description
+    training_support: preview_only
+    is_smoke_test_target: false
+    preconfigured_tasks: []
+    references: []
+    thumbnail_path: robots/universal_robots_ur10e.webp
+
+  - slug: universal_robots_ur5e
+    display_name: "Universal Robots UR5e"
+    category: Arm
+    description: "Universal Robots UR5e collaborative 6-DoF manipulator."
+    source: menagerie
+    menagerie_package: ur5e_mj_description
+    training_support: preview_only
+    is_smoke_test_target: false
+    preconfigured_tasks: []
+    references: []
+    thumbnail_path: robots/universal_robots_ur5e.webp
+
+  - slug: openarm_v1
+    display_name: "OpenArm v1"
+    category: Arm
+    description: "OpenArm v1 community-developed open-source manipulator."
+    source: menagerie
+    menagerie_package: openarm_v1_mj_description
+    training_support: preview_only
+    is_smoke_test_target: false
+    preconfigured_tasks: []
+    references: []
+    thumbnail_path: robots/openarm_v1.webp
+
+  # Drones
+  - slug: bitcraze_crazyflie_2
+    display_name: "Bitcraze Crazyflie 2"
+    category: Drone
+    description: "Bitcraze Crazyflie 2 nano-quadcopter research platform."
+    source: menagerie
+    menagerie_package: cf2_mj_description
+    training_support: preview_only
+    is_smoke_test_target: false
+    preconfigured_tasks: []
+    references: []
+    thumbnail_path: robots/bitcraze_crazyflie_2.webp
+
+  - slug: skydio_x2
+    display_name: "Skydio X2"
+    category: Drone
+    description: "Skydio X2 autonomous quadcopter."
+    source: menagerie
+    menagerie_package: skydio_x2_mj_description
+    training_support: preview_only
+    is_smoke_test_target: false
+    preconfigured_tasks: []
+    references: []
+    thumbnail_path: robots/skydio_x2.webp
+
+  # Grippers & hands
+  - slug: leap_hand
+    display_name: "LEAP Hand"
+    category: Gripper_Hand
+    description: "LEAP Hand dexterous manipulation testbed (CMU)."
+    source: menagerie
+    menagerie_package: leap_hand_mj_description
+    training_support: preview_only
+    is_smoke_test_target: false
+    preconfigured_tasks: []
+    references: []
+    thumbnail_path: robots/leap_hand.webp
+
+  - slug: robotiq_2f85
+    display_name: "Robotiq 2F-85"
+    category: Gripper_Hand
+    description: "Robotiq 2F-85 2-finger parallel gripper."
+    source: menagerie
+    menagerie_package: robotiq_2f85_mj_description
+    training_support: preview_only
+    is_smoke_test_target: false
+    preconfigured_tasks: []
+    references: []
+    thumbnail_path: robots/robotiq_2f85.webp
+
+  - slug: robotiq_2f85_v4
+    display_name: "Robotiq 2F-85 (v4)"
+    category: Gripper_Hand
+    description: "Robotiq 2F-85 2-finger parallel gripper — v4 model refinement."
+    source: menagerie
+    menagerie_package: robotiq_2f85_v4_mj_description
+    training_support: preview_only
+    is_smoke_test_target: false
+    preconfigured_tasks: []
+    references: []
+    thumbnail_path: robots/robotiq_2f85_v4.webp
+
+  - slug: shadow_dexee
+    display_name: "Shadow DEX-EE"
+    category: Gripper_Hand
+    description: "Shadow Robot Company DEX-EE dexterous hand."
+    source: menagerie
+    menagerie_package: shadow_dexee_mj_description
+    training_support: preview_only
+    is_smoke_test_target: false
+    preconfigured_tasks: []
+    references: []
+    thumbnail_path: robots/shadow_dexee.webp
+
+  - slug: shadow_hand
+    display_name: "Shadow Hand E3M5"
+    category: Gripper_Hand
+    description: "Shadow Robot Company Hand E3M5 — 24-DoF anthropomorphic dexterous hand."
+    source: menagerie
+    menagerie_package: shadow_hand_mj_description
+    training_support: preview_only
+    is_smoke_test_target: false
+    preconfigured_tasks: []
+    references: []
+    thumbnail_path: robots/shadow_hand.webp
+
+  - slug: tetheria_aero_hand_open
+    display_name: "Tetheria Aero Hand (open)"
+    category: Gripper_Hand
+    description: "Tetheria Aero Hand in open configuration — research gripper."
+    source: menagerie
+    menagerie_package: aero_hand_open_mj_description
+    training_support: preview_only
+    is_smoke_test_target: false
+    preconfigured_tasks: []
+    references: []
+    thumbnail_path: robots/tetheria_aero_hand_open.webp
+
+  - slug: ability_hand
+    display_name: "Psyonic Ability Hand"
+    category: Gripper_Hand
+    description: "Psyonic Ability Hand — 6-DoF anthropomorphic prosthetic hand."
+    source: menagerie
+    menagerie_package: ability_hand_mj_description
+    training_support: preview_only
+    is_smoke_test_target: false
+    preconfigured_tasks: []
+    references: []
+    thumbnail_path: robots/ability_hand.webp
+
+  - slug: wonik_allegro
+    display_name: "Wonik Allegro Hand V3"
+    category: Gripper_Hand
+    description: "Wonik Robotics Allegro Hand V3 — 16-DoF 4-fingered dexterous hand."
+    source: menagerie
+    menagerie_package: allegro_hand_mj_description
+    training_support: preview_only
+    is_smoke_test_target: false
+    preconfigured_tasks: []
+    references: []
+    thumbnail_path: robots/wonik_allegro.webp
+
+  # Humanoids
+  - slug: apptronik_apollo
+    display_name: "Apptronik Apollo"
+    category: Humanoid
+    description: "Apptronik Apollo general-purpose humanoid."
+    source: menagerie
+    menagerie_package: apollo_mj_description
+    training_support: preview_only
+    is_smoke_test_target: false
+    preconfigured_tasks: []
+    references: []
+    thumbnail_path: robots/apptronik_apollo.webp
+
+  - slug: fourier_n1
+    display_name: "Fourier N1"
+    category: Humanoid
+    description: "Fourier Intelligence N1 humanoid."
+    source: menagerie
+    menagerie_package: n1_mj_description
+    training_support: preview_only
+    is_smoke_test_target: false
+    preconfigured_tasks: []
+    references: []
+    thumbnail_path: robots/fourier_n1.webp
+
+  - slug: pal_talos
+    display_name: "PAL TALOS"
+    category: Humanoid
+    description: "PAL Robotics TALOS — full-size humanoid research platform."
+    source: menagerie
+    menagerie_package: talos_mj_description
+    training_support: preview_only
+    is_smoke_test_target: false
+    preconfigured_tasks: []
+    references: []
+    thumbnail_path: robots/pal_talos.webp
+
+  - slug: pndbotics_adam_lite
+    display_name: "PNDbotics Adam Lite"
+    category: Humanoid
+    description: "PNDbotics Adam Lite humanoid."
+    source: menagerie
+    menagerie_package: adam_lite_mj_description
+    training_support: preview_only
+    is_smoke_test_target: false
+    preconfigured_tasks: []
+    references: []
+    thumbnail_path: robots/pndbotics_adam_lite.webp
+
+  - slug: robotis_op3
+    display_name: "Robotis OP3"
+    category: Humanoid
+    description: "Robotis OP3 small-scale bipedal humanoid."
+    source: menagerie
+    menagerie_package: op3_mj_description
+    training_support: preview_only
+    is_smoke_test_target: false
+    preconfigured_tasks: []
+    references: []
+    thumbnail_path: robots/robotis_op3.webp
+
+  - slug: toddlerbot_2xc
+    display_name: "ToddlerBot 2XC"
+    category: Humanoid
+    description: "Stanford ToddlerBot 2XC — affordable bipedal humanoid."
+    source: menagerie
+    menagerie_package: toddlerbot_2xc_mj_description
+    training_support: preview_only
+    is_smoke_test_target: false
+    preconfigured_tasks: []
+    references: []
+    thumbnail_path: robots/toddlerbot_2xc.webp
+
+  - slug: toddlerbot_2xm
+    display_name: "ToddlerBot 2XM"
+    category: Humanoid
+    description: "Stanford ToddlerBot 2XM — affordable bipedal humanoid (M variant)."
+    source: menagerie
+    menagerie_package: toddlerbot_2xm_mj_description
+    training_support: preview_only
+    is_smoke_test_target: false
+    preconfigured_tasks: []
+    references: []
+    thumbnail_path: robots/toddlerbot_2xm.webp
+
+  - slug: unitree_h1
+    display_name: "Unitree H1"
+    category: Humanoid
+    description: "Unitree H1 full-size humanoid (19 DoF)."
+    source: menagerie
+    menagerie_package: h1_mj_description
+    training_support: preview_only
+    is_smoke_test_target: false
+    preconfigured_tasks: []
+    references: []
+    thumbnail_path: robots/unitree_h1.webp
+
+  - slug: unitree_h1_2
+    display_name: "Unitree H1.2"
+    category: Humanoid
+    description: "Unitree H1.2 full-size humanoid (successor to H1)."
+    source: menagerie
+    menagerie_package: h1_2_mj_description
+    training_support: preview_only
+    is_smoke_test_target: false
+    preconfigured_tasks: []
+    references: []
+    thumbnail_path: robots/unitree_h1_2.webp
+
+  - slug: elf2_humanoid
+    display_name: "Elf2 Humanoid"
+    category: Humanoid
+    description: "Elf2 humanoid research platform."
+    source: menagerie
+    menagerie_package: elf2_mj_description
+    training_support: preview_only
+    is_smoke_test_target: false
+    preconfigured_tasks: []
+    references: []
+    thumbnail_path: robots/elf2_humanoid.webp
+
+  - slug: jvrc_humanoid
+    display_name: "JVRC Humanoid"
+    category: Humanoid
+    description: "JVRC (Japan Virtual Robotics Challenge) humanoid."
+    source: menagerie
+    menagerie_package: jvrc_mj_description
+    training_support: preview_only
+    is_smoke_test_target: false
+    preconfigured_tasks: []
+    references: []
+    thumbnail_path: robots/jvrc_humanoid.webp
+
+  - slug: mujoco_humanoid_builtin
+    display_name: "MuJoCo Humanoid (classic)"
+    category: Humanoid
+    description: "MuJoCo's canonical 22-DoF humanoid — built-in tutorial model."
+    source: menagerie
+    menagerie_package: mujoco_humanoid_mj_description
+    training_support: preview_only
+    is_smoke_test_target: false
+    preconfigured_tasks: []
+    references: []
+    thumbnail_path: robots/mujoco_humanoid_builtin.webp
+
+  - slug: rainy_rby1
+    display_name: "Rainbow Robotics RB-Y1"
+    category: Humanoid
+    description: "Rainbow Robotics RB-Y1 wheeled humanoid."
+    source: menagerie
+    menagerie_package: rby1_mj_description
+    training_support: preview_only
+    is_smoke_test_target: false
+    preconfigured_tasks: []
+    references: []
+    thumbnail_path: robots/rainy_rby1.webp
+
+  # Mobile manipulators
+  - slug: hello_robot_stretch
+    display_name: "Hello Robot Stretch 2"
+    category: Mobile_Manipulator
+    description: "Hello Robot Stretch 2 — mobile home-assistant robot."
+    source: menagerie
+    menagerie_package: stretch_mj_description
+    training_support: preview_only
+    is_smoke_test_target: false
+    preconfigured_tasks: []
+    references: []
+    thumbnail_path: robots/hello_robot_stretch.webp
+
+  - slug: hello_robot_stretch_3
+    display_name: "Hello Robot Stretch 3"
+    category: Mobile_Manipulator
+    description: "Hello Robot Stretch 3 — successor mobile manipulator."
+    source: menagerie
+    menagerie_package: stretch_3_mj_description
+    training_support: preview_only
+    is_smoke_test_target: false
+    preconfigured_tasks: []
+    references: []
+    thumbnail_path: robots/hello_robot_stretch_3.webp
+
+  - slug: pal_tiago_dual
+    display_name: "PAL TIAGo++"
+    category: Mobile_Manipulator
+    description: "PAL Robotics TIAGo++ dual-arm mobile manipulator."
+    source: menagerie
+    menagerie_package: "tiago++_mj_description"
+    training_support: preview_only
+    is_smoke_test_target: false
+    preconfigured_tasks: []
+    references: []
+    thumbnail_path: robots/pal_tiago_dual.webp
+
+  - slug: robot_soccer_kit
+    display_name: "Robot Soccer Kit"
+    category: Mobile_Manipulator
+    description: "Rhoban Robot Soccer Kit — omnidirectional mobile base for robot soccer."
+    source: menagerie
+    menagerie_package: rsk_mj_description
+    training_support: preview_only
+    is_smoke_test_target: false
+    preconfigured_tasks: []
+    references: []
+    thumbnail_path: robots/robot_soccer_kit.webp
+
+  # Quadrupeds (preview only; Go1/ANYmal-C listed above as mjlab_ready)
+  - slug: agility_cassie
+    display_name: "Agility Cassie"
+    category: Quadruped
+    description: "Agility Robotics Cassie bipedal legged robot."
+    source: menagerie
+    menagerie_package: cassie_mj_description
+    training_support: preview_only
+    is_smoke_test_target: false
+    preconfigured_tasks: []
+    references: []
+    thumbnail_path: robots/agility_cassie.webp
+
+  - slug: anybotics_anymal_b
+    display_name: "ANYmal B"
+    category: Quadruped
+    description: "ANYbotics ANYmal B — predecessor to ANYmal C."
+    source: menagerie
+    menagerie_package: anymal_b_mj_description
+    training_support: preview_only
+    is_smoke_test_target: false
+    preconfigured_tasks: []
+    references: []
+    thumbnail_path: robots/anybotics_anymal_b.webp
+
+  - slug: boston_dynamics_spot
+    display_name: "Boston Dynamics Spot"
+    category: Quadruped
+    description: "Boston Dynamics Spot — commercial quadruped."
+    source: menagerie
+    menagerie_package: spot_mj_description
+    training_support: preview_only
+    is_smoke_test_target: false
+    preconfigured_tasks: []
+    references: []
+    thumbnail_path: robots/boston_dynamics_spot.webp
+
+  - slug: unitree_a1
+    display_name: "Unitree A1"
+    category: Quadruped
+    description: "Unitree A1 quadruped — predecessor to Go1."
+    source: menagerie
+    menagerie_package: a1_mj_description
+    training_support: preview_only
+    is_smoke_test_target: false
+    preconfigured_tasks: []
+    references: []
+    thumbnail_path: robots/unitree_a1.webp
+
+  - slug: unitree_aliengo
+    display_name: "Unitree Aliengo"
+    category: Quadruped
+    description: "Unitree Aliengo quadruped — larger than A1, smaller than AlienGo."
+    source: menagerie
+    menagerie_package: aliengo_mj_description
+    training_support: preview_only
+    is_smoke_test_target: false
+    preconfigured_tasks: []
+    references: []
+    thumbnail_path: robots/unitree_aliengo.webp
+
+  - slug: unitree_go2
+    display_name: "Unitree Go2"
+    category: Quadruped
+    description: "Unitree Go2 quadruped — successor to Go1. Note: no mjlab task registered yet; preview-only."
+    source: menagerie
+    menagerie_package: go2_mj_description
+    # Deliberately marked preview_only: mjlab core (v1.3.0) has no
+    # Go2 task. Design doc §4.2.3 had Go2 in the preview bucket; the
+    # D-guard would also auto-demote if we had claimed mjlab_ready.
+    training_support: preview_only
+    is_smoke_test_target: false
+    preconfigured_tasks: []
+    references:
+      - kind: paper
+        url: https://arxiv.org/abs/2309.14341
+        citation: "Cheng et al., Extreme Parkour with Legged Robots, ICRA 2024"
+      - kind: paper
+        url: https://arxiv.org/abs/2309.05665
+        citation: "Zhuang et al., Robot Parkour Learning, CoRL 2023"
+      - kind: repo
+        url: https://github.com/unitreerobotics/unitree_rl_lab
+        citation: "unitreerobotics / unitree_rl_lab"
+    thumbnail_path: robots/unitree_go2.webp

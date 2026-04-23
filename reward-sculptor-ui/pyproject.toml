@@ -1,0 +1,48 @@
+[project]
+name = "reward-sculptor-ui-backend"
+version = "0.1.0"
+description = "FastAPI backend for the Reward Sculptor web UI."
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.5",
+    "python-multipart>=0.0.17",
+    "watchfiles>=0.24",
+    "filelock>=3.16",
+    "reward-sculptor",
+    "nvidia-ml-py>=13.595.45",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "httpx>=0.28",
+    "anyio>=4.6",
+]
+
+[tool.uv.sources]
+reward-sculptor = { path = "../RewardSculptor", editable = true }
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["backend"]
+
+[tool.pytest.ini_options]
+testpaths = ["backend/tests"]
+addopts = "-ra --strict-markers"
+# Silence two specific upstream deprecations we've triaged:
+#   - Gymnasium's `-v4` env-id deprecation nag (we still use Hopper-v4 etc.
+#     because SB3's policies match sculptor's reference adapter).
+#   - FastAPI's HTTP_422_UNPROCESSABLE_ENTITY / HTTP_413_REQUEST_ENTITY_TOO_LARGE
+#     alias rename (the int values are stable; cosmetic rename only).
+# Keep this list narrow — do NOT blanket-ignore DeprecationWarning, we
+# want genuinely new ones to surface.
+filterwarnings = [
+    "ignore::DeprecationWarning:gymnasium.*",
+    "ignore::DeprecationWarning:fastapi.*",
+]

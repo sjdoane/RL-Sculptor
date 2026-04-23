@@ -1,0 +1,16 @@
+[target]
+name = "hopper_test"
+
+[adapter]
+class = "sculptor.adapters.gym_sb3.GymSB3Adapter"
+config = { env_id = "CHANGE_ME", n_envs = 4, ppo_kwargs = { learning_rate = 3e-4, n_steps = 2048 } }
+
+[kg]
+seeds_path = "kg_seeds.yml"
+environment_tag = "CHANGE_ME"  # e.g., continuous_locomotion, manipulation, navigation
+
+[iteration]
+steps_per_iter = 50000
+primary_metric = "mean_return"
+behavior_metrics = []  # e.g., ["max_episode_length", "fall_rate"]
+rollout_episodes = 6

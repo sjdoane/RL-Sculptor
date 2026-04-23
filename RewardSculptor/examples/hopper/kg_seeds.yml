@@ -1,0 +1,24 @@
+# Developer-test seed list for the Hopper-v4 example. Four canonical papers on
+# algorithm, benchmark, and continuous-control hygiene. Not legged-robotics-
+# specific. Replace these with your own field's seed papers when adapting
+# Reward Sculptor to your lab.
+#
+# Shape: `papers` is a list of objects. `arxiv_id` is required; `title` and
+# `rationale` are human-facing notes, not consumed by the ingester.
+
+papers:
+  - arxiv_id: "1707.06347"
+    title: "Proximal Policy Optimization Algorithms"
+    rationale: "The training algorithm behind the GymSB3Adapter. Foundational."
+
+  - arxiv_id: "1606.01540"
+    title: "OpenAI Gym"
+    rationale: "Introduces the env API that Gymnasium (and Hopper-v4) extends."
+
+  - arxiv_id: "1709.06560"
+    title: "Deep Reinforcement Learning That Matters"
+    rationale: "Reproducibility + reward-shaping sensitivity in continuous control. Key for the sculptor's evaluation protocol."
+
+  - arxiv_id: "1801.00690"
+    title: "DeepMind Control Suite"
+    rationale: "Canonical continuous-control benchmark suite with Hopper-family tasks. Reference for reward-component vocabulary."

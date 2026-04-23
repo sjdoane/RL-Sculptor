@@ -1,0 +1,7 @@
+# Per-project seed papers for the Sculptor knowledge graph.
+# Pick 3-10 papers relevant to YOUR domain. `arxiv_id` is required;
+# `title` and `rationale` are human-facing notes.
+#
+# Run `sculpt kg ingest kg_seeds.yml` to fetch PDFs + extract entities.
+
+papers: []

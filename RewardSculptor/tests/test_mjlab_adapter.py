@@ -1,0 +1,581 @@
+"""Unit tests for MjlabAdapter + stub adapters.
+
+Covers the mocked / import-only surface. The real-GPU smoke test lives
+in tests/test_mjlab_gpu.py behind `@pytest.mark.gpu`.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+
+from sculptor.adapters.base import (
+    ComponentProbe,
+    RewardContract,
+    RolloutResult,
+    SculptorAdapter,
+    TrainResult,
+)
+
+
+def test_base_reward_contract_default_fields() -> None:
+    c = RewardContract(observation_space_spec=None, action_space_spec=None)
+    assert c.supports_batched is False
+    assert c.training_device == "any"
+    assert c.min_gpu_memory_gb is None
+    assert c.state_schema is None
+
+
+def test_component_probe_dataclass_shape() -> None:
+    p = ComponentProbe(ok=True, components={"x": 1.0}, total=1.0, error=None)
+    assert p.ok is True
+    assert p.components == {"x": 1.0}
+    assert p.total == 1.0
+
+
+def test_gym_sb3_still_satisfies_abc() -> None:
+    """Sanity — importing GymSB3Adapter and calling reward_contract
+    still works after the ABC extension; contract is scalar-only."""
+    from sculptor.adapters.gym_sb3 import GymSB3Adapter
+
+    adapter = GymSB3Adapter(env_id="Hopper-v4", n_envs=2)
+    c = adapter.reward_contract()
+    assert c.supports_batched is False
+    assert c.training_device == "any"
+
+
+def test_mjlab_adapter_validates_task_id() -> None:
+    """Instantiation with an unknown task_id raises ValueError."""
+    from sculptor.adapters.mjlab import MjlabAdapter
+
+    with pytest.raises(ValueError, match="not registered in mjlab"):
+        MjlabAdapter(task_id="Mjlab-Nope-Not-A-Real-Task")
+
+
+def test_mjlab_adapter_reward_contract_is_batched() -> None:
+    """Happy-path contract shape. Requires mjlab import (task_id
+    validation in __init__). Auto-skip if mjlab is missing."""
+    pytest.importorskip("mjlab")
+    from sculptor.adapters.mjlab import MjlabAdapter
+
+    adapter = MjlabAdapter(task_id="Mjlab-Velocity-Flat-Unitree-Go1")
+    c = adapter.reward_contract()
+    assert c.supports_batched is True
+    assert c.training_device == "gpu"
+    assert c.min_gpu_memory_gb is not None and c.min_gpu_memory_gb > 0
+    assert c.state_schema is not None
+    # Keys the sculptor reward-term snapshot emits for velocity tasks.
+    expected_keys = {
+        "qpos", "qvel", "base_lin_vel_b", "base_ang_vel_b",
+        "projected_gravity_b", "actuator_force", "command_vel",
+    }
+    assert set(c.state_schema.keys()) == expected_keys
+
+
+def test_mjlab_g1_state_schema_differs_from_go1() -> None:
+    pytest.importorskip("mjlab")
+    from sculptor.adapters.mjlab import MjlabAdapter
+
+    g1 = MjlabAdapter(task_id="Mjlab-Velocity-Flat-Unitree-G1")
+    go1 = MjlabAdapter(task_id="Mjlab-Velocity-Flat-Unitree-Go1")
+    assert g1.reward_contract().state_schema != go1.reward_contract().state_schema
+
+
+# ── S4 (bug #6.6 / T1): Cartpole fixed-base schema ──────────────────
+def test_mjlab_cartpole_schema_is_minimal_fixed_base() -> None:
+    """Cartpole ships inside mjlab (source=mjlab_builtin) and is a
+    fixed-base articulation — 2 joints, 1 actuator, no floating root.
+    `_schema_for_task` MUST return the 3-key cartpole schema for the
+    known Cartpole task_ids so Claude-written rewards don't reach for
+    `base_lin_vel_b` / `command_vel` (absent from the Cartpole env and
+    would raise AttributeError in _snapshot).
+    """
+    pytest.importorskip("mjlab")
+    from sculptor.adapters.mjlab import (
+        _CARTPOLE_STATE_SCHEMA,
+        _schema_for_task,
+    )
+
+    for task_id in (
+        "Mjlab-Cartpole-Balance",
+        "Mjlab-Cartpole-Swingup",
+        "Something-cartpole-lower",  # lower-case fallback branch
+    ):
+        schema = _schema_for_task(task_id)
+        assert schema == dict(_CARTPOLE_STATE_SCHEMA), (
+            f"{task_id!r} should dispatch to cartpole schema"
+        )
+        # Explicit shape contract — guards against _CARTPOLE_STATE_SCHEMA
+        # being silently widened later.
+        assert schema == {
+            "qpos": (2,),
+            "qvel": (2,),
+            "actuator_force": (1,),
+        }
+
+
+def test_mjlab_cartpole_adapter_reward_contract_is_minimal() -> None:
+    """`MjlabAdapter(task_id="Mjlab-Cartpole-Balance")` → `reward_contract`
+    returns the 3-key schema. End-to-end seam from adapter construction
+    to the reward-module contract Sam's UI hands to Claude."""
+    pytest.importorskip("mjlab")
+    from sculptor.adapters.mjlab import MjlabAdapter
+
+    adapter = MjlabAdapter(task_id="Mjlab-Cartpole-Balance")
+    c = adapter.reward_contract()
+    assert c.supports_batched is True
+    assert c.state_schema is not None
+    assert set(c.state_schema.keys()) == {"qpos", "qvel", "actuator_force"}
+
+
+def test_mjlab_adapter_train_subprocess_construction() -> None:
+    """Mock subprocess.run and verify the CLI args + env passed."""
+    pytest.importorskip("mjlab")
+    from sculptor.adapters import mjlab as mjlab_mod
+
+    adapter = mjlab_mod.MjlabAdapter(
+        task_id="Mjlab-Velocity-Flat-Unitree-Go1",
+        num_envs=1024,
+        device="cuda:0",
+        max_iterations=50,
+    )
+
+    captured: dict = {}
+
+    class _FakeCompleted:
+        returncode = 0
+        stdout = '{"status": "ok", "checkpoint": "/tmp/out/checkpoint.pt"}'
+        stderr = ""
+
+    def fake_run(cmd, env=None, timeout=None):  # noqa
+        captured["cmd"] = cmd
+        captured["env"] = env
+        return _FakeCompleted()
+
+    output = Path("/tmp/sculptor-mjlab-test-out")
+    output.mkdir(exist_ok=True)
+    # Also drop a fake checkpoint file so train() post-check passes.
+    (output / "checkpoint.pt").write_bytes(b"stub")
+    (output / "metrics.json").write_text('{"status": "ok"}')
+
+    with patch.object(mjlab_mod, "_run_with_cleanup", side_effect=fake_run):
+        result = adapter.train(
+            reward_module_path=Path("/tmp/v0.py"),
+            output_dir=output,
+            steps=50,
+            seed=7,
+        )
+
+    assert isinstance(result, TrainResult)
+    assert result.checkpoint_path == output / "checkpoint.pt"
+    # CLI shape.
+    cmd = captured["cmd"]
+    assert "train" in cmd
+    assert "sculptor.adapters._mjlab_runner" in cmd
+    assert "--task-id" in cmd
+    assert "Mjlab-Velocity-Flat-Unitree-Go1" in cmd
+    assert "--num-envs" in cmd and "1024" in cmd
+    assert "--max-iterations" in cmd and "50" in cmd
+    assert "--seed" in cmd and "7" in cmd
+    assert "--reward-module-path" in cmd
+    # S8-followup regression: --schema-keys MUST be passed so the
+    # runner subprocess doesn't fall back to the 7-key velocity default
+    # on non-Go1 tasks. Go1 happens to match the default 7 keys, but we
+    # still require the flag to be passed explicitly.
+    assert "--schema-keys" in cmd
+    sk_idx = cmd.index("--schema-keys") + 1
+    go1_keys = set(cmd[sk_idx].split(","))
+    assert {"qpos", "qvel", "base_lin_vel_b", "command_vel"}.issubset(go1_keys), (
+        f"Go1 schema keys: {go1_keys}"
+    )
+    # CUDA_VISIBLE_DEVICES pinning.
+    assert captured["env"]["CUDA_VISIBLE_DEVICES"] == "0"
+
+
+def test_mjlab_adapter_passes_cartpole_schema_to_subprocess(tmp_path: Path) -> None:
+    """Regression for Cartpole Test 1 failure (2026-04-22): the adapter
+    MUST pass `--schema-keys qpos,qvel,actuator_force` for Cartpole task_ids.
+    Pre-fix `self.schema_keys` defaulted to None → CLI flag omitted →
+    runner used the 7-key velocity default → `SculptorRewardTerm._prev`
+    gained a None entry for `command_vel` (Cartpole has no base_velocity
+    command) → `reset()` crashed with 'NoneType does not support item
+    assignment'."""
+    pytest.importorskip("mjlab")
+    from sculptor.adapters import mjlab as mjlab_mod
+    from unittest.mock import patch
+
+    adapter = mjlab_mod.MjlabAdapter(
+        task_id="Mjlab-Cartpole-Balance",
+        num_envs=256,
+        device="cuda:0",
+        max_iterations=10,
+    )
+    captured: dict = {}
+
+    class _FakeCompleted:
+        returncode = 0
+        stdout = '{"status": "ok"}'
+        stderr = ""
+
+    def fake_run(cmd, env=None, timeout=None):  # noqa
+        captured["cmd"] = cmd
+        return _FakeCompleted()
+
+    output = Path("/tmp/sculptor-mjlab-test-out-cp")
+    output.mkdir(exist_ok=True)
+    (output / "checkpoint.pt").write_bytes(b"stub")
+    (output / "metrics.json").write_text('{"status": "ok"}')
+
+    with patch.object(mjlab_mod, "_run_with_cleanup", side_effect=fake_run):
+        adapter.train(
+            reward_module_path=Path("/tmp/v0.py"),
+            output_dir=output,
+            steps=10,
+            seed=1,
+        )
+
+    cmd = captured["cmd"]
+    assert "--schema-keys" in cmd, (
+        "adapter must always pass --schema-keys to avoid the 7-key "
+        "velocity default clobbering Cartpole's 3-key schema"
+    )
+    sk_idx = cmd.index("--schema-keys") + 1
+    cp_keys = set(cmd[sk_idx].split(","))
+    assert cp_keys == {"qpos", "qvel", "actuator_force"}, (
+        f"Cartpole schema keys on CLI: {cp_keys!r} — should be exactly "
+        "qpos, qvel, actuator_force (no base_* / command_vel)"
+    )
+    # Negative assertion: the locomotion-only keys MUST NOT be present.
+    for bad_key in ("command_vel", "base_lin_vel_b", "base_ang_vel_b",
+                    "projected_gravity_b"):
+        assert bad_key not in cp_keys, (
+            f"Cartpole schema leaked locomotion key {bad_key!r}; this is "
+            "the exact condition that caused the reset() NoneType crash."
+        )
+
+
+def test_mjlab_adapter_reward_batched_uses_compute_reward_batched(
+    tmp_path: Path,
+) -> None:
+    """If the reward module exports compute_reward_batched, MjlabAdapter
+    dispatches to it directly (NOT the default scalar-loop fallback)."""
+    pytest.importorskip("mjlab")
+    pytest.importorskip("torch")
+    import torch
+
+    module_path = tmp_path / "v0.py"
+    module_path.write_text(
+        "import torch\n"
+        "REWARD_SPEC = {'version': 'v0', 'supports_batched': True}\n"
+        "def compute_reward(state, action, next_state, info):\n"
+        "    return (0.5, {'c': 0.5})\n"
+        "def compute_reward_batched(state, action, next_state, info):\n"
+        "    n = action.shape[0]\n"
+        "    return (torch.ones(n) * 42.0, {'c': torch.ones(n) * 42.0})\n"
+    )
+
+    from sculptor.adapters.mjlab import MjlabAdapter
+    adapter = MjlabAdapter(task_id="Mjlab-Velocity-Flat-Unitree-Go1")
+
+    state = {"qpos": torch.zeros(4, 18)}
+    next_state = {"qpos": torch.zeros(4, 18)}
+    action = torch.zeros(4, 12)
+    info = {}
+    rewards, components = adapter.reward_batched(
+        module_path, state, action, next_state, info,
+    )
+    assert rewards.shape == (4,)
+    assert (rewards == 42.0).all()
+    assert components["c"].shape == (4,)
+
+
+def test_stub_adapters_raise_not_implemented() -> None:
+    from sculptor.adapters.isaac_lab import IsaacLabAdapter
+    from sculptor.adapters.mjx import MjxAdapter
+    from sculptor.adapters.rllib import RllibAdapter
+
+    for cls in (IsaacLabAdapter, MjxAdapter, RllibAdapter):
+        a = cls()
+        with pytest.raises(NotImplementedError):
+            a.train(
+                reward_module_path=Path("/dev/null"),
+                output_dir=Path("/tmp"),
+                steps=1,
+                seed=1,
+            )
+        with pytest.raises(NotImplementedError):
+            a.rollout(
+                checkpoint_path=Path("/dev/null"),
+                output_dir=Path("/tmp"),
+                n_episodes=1,
+            )
+        # reward_contract / compute_behavior_metrics return sensible defaults.
+        c = a.reward_contract()
+        assert isinstance(c, RewardContract)
+        metrics = a.compute_behavior_metrics(
+            RolloutResult(
+                video_path=Path("/tmp/x.mp4"),
+                keyframes_dir=Path("/tmp/kf"),
+                trajectory_path=Path("/tmp/t.npz"),
+                n_episodes=0,
+            )
+        )
+        assert metrics["adapter_status"] == "stub"
+
+
+def test_estimate_vram_static() -> None:
+    from sculptor.adapters.mjlab import estimate_vram_static
+
+    assert estimate_vram_static(num_envs=0) == pytest.approx(1.5)
+    assert estimate_vram_static(num_envs=2048) == pytest.approx(1.5 + 2048 * 0.5 / 1024)
+    # Conservative estimate for 8 GB VRAM (RTX 5070 Laptop): 1024 envs
+    # should fit comfortably.
+    est_1024 = estimate_vram_static(num_envs=1024)
+    assert est_1024 < 8 * 0.85
+
+
+def test_run_with_cleanup_kills_subprocess_on_exception(tmp_path: Path) -> None:
+    """Pre-M3 gate (A): ensure subprocess gets terminated cleanly when the
+    caller raises mid-wait. Uses a fake runner that sleeps 30s — if the
+    cleanup path is broken, this test hangs for 30s+; healthy path
+    terminates within 2-5s via SIGTERM to the process group."""
+    import os
+    import signal
+    import threading
+    import time
+
+    from sculptor.adapters.mjlab import _run_with_cleanup
+
+    fake_runner = tmp_path / "sleep.py"
+    fake_runner.write_text("import time; time.sleep(30)\n")
+    cmd = [sys.executable, str(fake_runner)]
+
+    start = time.monotonic()
+    captured: dict = {}
+
+    def _run() -> None:
+        try:
+            _run_with_cleanup(cmd, env=dict(os.environ), timeout=1.0)
+        except subprocess.TimeoutExpired as e:
+            captured["exc"] = e
+
+    t = threading.Thread(target=_run)
+    t.start()
+    t.join(timeout=10.0)
+    elapsed = time.monotonic() - start
+
+    assert not t.is_alive(), f"thread still running after {elapsed:.1f}s"
+    assert "exc" in captured, "expected TimeoutExpired to propagate"
+    # Cleanup path should have killed the child in < 10s (practical upper
+    # bound). If cleanup were missing, we'd be blocked on the 30s sleep.
+    assert elapsed < 10.0, f"cleanup took {elapsed:.1f}s; expected < 10s"
+
+
+def test_mjlab_adapter_train_surfaces_subprocess_nonzero_exit(
+    tmp_path: Path,
+) -> None:
+    """Pre-M3 gate (A): a runner failure (non-zero exit) should produce a
+    RuntimeError with stdout+stderr preserved for debugging."""
+    pytest.importorskip("mjlab")
+    from sculptor.adapters import mjlab as mjlab_mod
+
+    adapter = mjlab_mod.MjlabAdapter(
+        task_id="Mjlab-Velocity-Flat-Unitree-Go1",
+        num_envs=128,
+        device="cuda:0",
+        max_iterations=1,
+    )
+
+    class _FakeProc:
+        returncode = 7
+        stdout = "fake stdout"
+        stderr = "boom: synthetic failure from unit test"
+
+    def fake_cleanup(cmd, env, timeout=None):
+        return _FakeProc()
+
+    with patch.object(mjlab_mod, "_run_with_cleanup", side_effect=fake_cleanup):
+        with pytest.raises(RuntimeError) as exc_info:
+            adapter.train(
+                reward_module_path=None,
+                output_dir=tmp_path / "out",
+                steps=1,
+                seed=1,
+            )
+    msg = str(exc_info.value)
+    assert "exited 7" in msg
+    assert "synthetic failure" in msg, f"stderr not preserved in error: {msg}"
+
+
+import subprocess  # noqa: E402 — used by the helper tests above
+import sys  # noqa: E402
+
+
+# ── §7.1: trajectory-capture helpers (CPU-only; exercises the hot path ────
+# without requiring mjlab or a GPU) ───────────────────────────────────────
+
+def test_record_components_appends_mean_per_step() -> None:
+    """`_record_components` must append one float per component per call,
+    computed as the tensor's mean across envs."""
+    import torch
+    from sculptor.adapters._mjlab_runner import _record_components
+
+    sink: dict[str, list[float]] = {}
+    c1 = {"alive": torch.tensor([1.0, 1.0, 1.0]), "upright": torch.tensor([0.4, 0.6, 0.5])}
+    i1 = {
+        "episode_length": torch.tensor([10.0, 20.0, 30.0]),
+        "terminated": torch.tensor([0.0, 0.0, 1.0]),
+        "time_outs": torch.tensor([0.0, 1.0, 0.0]),
+    }
+    _record_components(sink, c1, i1)
+    c2 = {"alive": torch.tensor([0.5, 0.5, 0.5]), "upright": torch.tensor([0.8, 0.9, 1.0])}
+    i2 = {"episode_length": torch.tensor([15.0]), "terminated": torch.tensor([0.0]),
+          "time_outs": torch.tensor([0.0])}
+    _record_components(sink, c2, i2)
+
+    assert sink["alive"] == pytest.approx([1.0, 0.5])
+    assert sink["upright"] == pytest.approx([0.5, 0.9])
+    assert sink["__episode_length"] == pytest.approx([20.0, 15.0])
+    assert sink["__terminated"] == pytest.approx([1.0 / 3.0, 0.0])
+    assert sink["__time_outs"] == pytest.approx([1.0 / 3.0, 0.0])
+
+
+def test_record_components_noop_when_sink_none() -> None:
+    from sculptor.adapters._mjlab_runner import _record_components
+
+    # No exception, no side effects: the training path must pay zero cost
+    # when capture is disabled (non-injected runs, GPU smoke tests).
+    _record_components(None, {}, {})
+
+
+def test_record_components_skips_non_tensor_values() -> None:
+    """Mixed-type components dicts (e.g. a user writes `{"alive": 1.0}`
+    instead of returning tensors) must not crash the sink — just skip."""
+    import torch
+    from sculptor.adapters._mjlab_runner import _record_components
+
+    sink: dict[str, list[float]] = {}
+    components = {
+        "valid": torch.tensor([2.0, 4.0]),
+        "bare_float": 3.14,  # not a tensor — must be skipped
+        "empty": torch.tensor([]),  # empty mean is NaN — must be skipped
+    }
+    _record_components(sink, components, {})
+    assert sink["valid"] == pytest.approx([3.0])
+    # Non-tensor values produce no key.
+    assert "bare_float" not in sink
+    # Empty tensors produce NaN mean → skipped (ensures float cast
+    # doesn't poison the window).
+    import math
+    for vals in sink.values():
+        for v in vals:
+            assert math.isfinite(v), f"non-finite snuck into sink: {v}"
+
+
+def test_snapshots_to_trajectory_pivots_per_component() -> None:
+    """`_snapshots_to_trajectory` pivots `list[dict[name, val]]` into
+    `dict[name, list[val]]` matching Eureka Appendix F's format."""
+    from sculptor.adapters._mjlab_runner import _snapshots_to_trajectory
+
+    snaps = [
+        {"alive": 1.0, "upright": 0.5, "__episode_length": 10.0},
+        {"alive": 1.2, "upright": 0.6, "__episode_length": 15.0},
+        {"alive": 1.1, "upright": 0.55, "__episode_length": 20.0},
+    ]
+    traj = _snapshots_to_trajectory(snaps)
+    assert traj["alive"] == pytest.approx([1.0, 1.2, 1.1])
+    assert traj["upright"] == pytest.approx([0.5, 0.6, 0.55])
+    assert traj["__episode_length"] == pytest.approx([10.0, 15.0, 20.0])
+
+
+def test_snapshots_to_trajectory_empty_input_returns_empty_dict() -> None:
+    from sculptor.adapters._mjlab_runner import _snapshots_to_trajectory
+    assert _snapshots_to_trajectory([]) == {}
+
+
+def test_snapshots_to_trajectory_fills_missing_keys_with_last_seen() -> None:
+    """A component that appears late (e.g. added mid-training) gets its
+    first value at its debut window and fills forward after — same shape
+    as the keys that were present from window 0."""
+    from sculptor.adapters._mjlab_runner import _snapshots_to_trajectory
+
+    snaps = [
+        {"alive": 1.0},
+        {"alive": 1.2, "upright": 0.5},  # upright debuts here
+        {"alive": 1.1, "upright": 0.6},
+    ]
+    traj = _snapshots_to_trajectory(snaps)
+    assert traj["alive"] == pytest.approx([1.0, 1.2, 1.1])
+    # upright appears in 2 windows → 2-long series (post-debut only).
+    assert traj["upright"] == pytest.approx([0.5, 0.6])
+
+
+# ── §Ship-7: rollout video fps math ──────────────────────────────────────
+def test_compute_playback_fps_real_time_default() -> None:
+    """50 Hz sim, render_every=1, playback_speed=1.0 → 50 fps playback.
+    Video plays real-time."""
+    from sculptor.adapters._mjlab_runner import _compute_playback_fps
+    assert _compute_playback_fps(
+        step_dt=0.02, render_every=1, playback_speed=1.0,
+    ) == pytest.approx(50.0)
+
+
+def test_compute_playback_fps_render_every_preserves_real_time() -> None:
+    """When render_every > 1 (frames decimated), fps must drop
+    proportionally so total video duration still equals sim duration."""
+    from sculptor.adapters._mjlab_runner import _compute_playback_fps
+    # 50 Hz × render_every=4 → 4 sim steps per frame → 12.5 fps keeps
+    # playback real-time.
+    assert _compute_playback_fps(
+        step_dt=0.02, render_every=4, playback_speed=1.0,
+    ) == pytest.approx(12.5)
+
+
+def test_compute_playback_fps_speed_multiplier() -> None:
+    """playback_speed=2.0 → video plays 2× real time (fps doubled)."""
+    from sculptor.adapters._mjlab_runner import _compute_playback_fps
+    assert _compute_playback_fps(
+        step_dt=0.02, render_every=1, playback_speed=2.0,
+    ) == pytest.approx(100.0)
+    # 0.5× = slow-mo; video plays half-speed → fps halved.
+    assert _compute_playback_fps(
+        step_dt=0.02, render_every=1, playback_speed=0.5,
+    ) == pytest.approx(25.0)
+
+
+def test_compute_playback_fps_clamps_to_valid_range() -> None:
+    """ffmpeg rejects fps outside [1, 240]. Helper must clamp."""
+    from sculptor.adapters._mjlab_runner import _compute_playback_fps
+    # Unrealistically fast playback → clamped to 240.
+    assert _compute_playback_fps(
+        step_dt=0.0001, render_every=1, playback_speed=1.0,
+    ) == pytest.approx(240.0)
+    # Unrealistically slow (e.g. huge render_every) → clamped to 1.
+    assert _compute_playback_fps(
+        step_dt=1.0, render_every=1000, playback_speed=0.1,
+    ) == pytest.approx(1.0)
+
+
+def test_compute_playback_fps_cli_override_wins() -> None:
+    """Non-zero cli_fps replaces the derived value."""
+    from sculptor.adapters._mjlab_runner import _compute_playback_fps
+    # Derived would be 50; override wins.
+    assert _compute_playback_fps(
+        step_dt=0.02, render_every=1, playback_speed=1.0, cli_fps=24.0,
+    ) == pytest.approx(24.0)
+    # But clamped: an override >240 snaps back.
+    assert _compute_playback_fps(
+        step_dt=0.02, render_every=1, playback_speed=1.0, cli_fps=500.0,
+    ) == pytest.approx(240.0)
+
+
+def test_compute_playback_fps_clamps_playback_speed() -> None:
+    """Very-out-of-range speeds get clamped before the fps math."""
+    from sculptor.adapters._mjlab_runner import _compute_playback_fps
+    # 100x is above the 10x cap, so fps for step_dt=0.02 lands at
+    # min(10.0 / 0.02, 240) = 240.
+    assert _compute_playback_fps(
+        step_dt=0.02, render_every=1, playback_speed=100.0,
+    ) == pytest.approx(240.0)

@@ -1,0 +1,16 @@
+[target]
+name = "hopper_demo"
+
+[adapter]
+class = "sculptor.adapters.gym_sb3.GymSB3Adapter"
+config = { env_id = "Hopper-v4", n_envs = 4, ppo_kwargs = { learning_rate = 3e-4, n_steps = 2048 } }
+
+[kg]
+seeds_path = "examples/hopper/kg_seeds.yml"
+environment_tag = "continuous_locomotion"
+
+[iteration]
+steps_per_iter = 10000  # reduced for the live `sculpt run` demo; bump to 50000+ for real runs
+primary_metric = "mean_return"
+behavior_metrics = ["max_episode_length", "mean_forward_velocity", "fall_rate"]
+rollout_episodes = 4

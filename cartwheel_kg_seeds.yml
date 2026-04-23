@@ -1,0 +1,87 @@
+# Curated arxiv seeds for Sam's biped cartwheel test (2026-04-22).
+# Three agents searched in parallel: humanoid acrobatics, RL metrics for reports,
+# physics-realism / motor-limits / SEA datasheets. See CONTEXT.md entry
+# 2026-04-23 00:15 for full findings.
+#
+# Format matches sculptor's kg_seeds.yml: a flat `papers` list of
+# arxiv_id + title (fallback for arxiv API rate-limit — §7.7). The bulk-
+# ingest pipeline handles dedupe against the shared KG.
+
+papers:
+  # ── Humanoid acrobatics + reference-motion imitation ─────────────────
+  - arxiv_id: "2508.08241"
+    title: "BeyondMimic: Cartwheels, Spin-Kicks and Beyond on a Real G1 Humanoid"
+  - arxiv_id: "2406.06005"
+    title: "WoCoCo: Learning Whole-Body Humanoid Control with Sequential Contacts"
+  - arxiv_id: "2406.10759"
+    title: "Humanoid Parkour Learning"
+  - arxiv_id: "2502.01143"
+    title: "ASAP: Aligning Simulation and Real-World Physics for Agile Humanoid Skills"
+  - arxiv_id: "1804.02717"
+    title: "DeepMimic: Example-Guided Deep Reinforcement Learning of Physics-Based Character Skills"
+  - arxiv_id: "2104.02180"
+    title: "AMP: Adversarial Motion Priors for Stylized Physics-Based Character Control"
+  - arxiv_id: "2305.06456"
+    title: "Perpetual Humanoid Control for Real-time Simulated Avatars"
+  - arxiv_id: "2402.16796"
+    title: "Expressive Whole-Body Control for Humanoid Robots"
+  - arxiv_id: "2409.16611"
+    title: "Learning Stable and Precise High-Speed Humanoid Locomotion via Angular Momentum Regulation"
+  - arxiv_id: "1709.06560"
+    title: "Deep Reinforcement Learning that Matters"
+
+  # ── Metrics for rigorous RL report graphs ────────────────────────────
+  - arxiv_id: "1707.06347"
+    title: "Proximal Policy Optimization Algorithms"
+  - arxiv_id: "2109.11978"
+    title: "Learning to Walk in Minutes Using Massively Parallel Deep Reinforcement Learning"
+  - arxiv_id: "2106.12674"
+    title: "Minimizing Energy Consumption Leads to the Emergence of Gaits in Legged Robots"
+  - arxiv_id: "1801.01290"
+    title: "Soft Actor-Critic: Off-Policy Maximum Entropy Deep Reinforcement Learning with a Stochastic Actor"
+  - arxiv_id: "1506.02438"
+    title: "High-Dimensional Continuous Control Using Generalized Advantage Estimation"
+  - arxiv_id: "2202.13500"
+    title: "Learning Humanoid Locomotion with Transformers"
+
+  # ── Physics realism + actuator constraints ───────────────────────────
+  - arxiv_id: "2312.17507"
+    title: "Actuator-Constrained Reinforcement Learning for High-Speed Quadrupedal Locomotion"
+  - arxiv_id: "2403.18765"
+    title: "CaT: Constraints as Terminations for Legged Locomotion Reinforcement Learning"
+  - arxiv_id: "2304.09434"
+    title: "Torque-Based Deep Reinforcement Learning for Task-and-Robot Agnostic Learning on Bipedal Robots Using Sim-to-Real Transfer"
+  - arxiv_id: "2308.12517"
+    title: "Not Only Rewards But Also Constraints: Applications on Legged Robot Locomotion"
+  - arxiv_id: "2509.06342"
+    title: "PACE: Physics-Aware Energy Modeling of PMSM Motors for Sim-to-Real Transfer"
+  - arxiv_id: "2410.08650"
+    title: "An Extended Friction Model for Cheap and Efficient Servo Motor Simulation"
+  - arxiv_id: "2508.04696"
+    title: "Differentiable System Identification for Legged Locomotion in MJX"
+  - arxiv_id: "2505.14266"
+    title: "SPI-Active: Sampling-Based Policy-Informed Active System Identification"
+  - arxiv_id: "2209.07171"
+    title: "Learning to Exploit Elastic Actuators for Quadrupedal Locomotion"
+
+  # ── Domain randomization + curriculum ─────────────────────────────────
+  - arxiv_id: "1710.06537"
+    title: "Dynamics Randomization: Sim-to-Real Transfer of Robotic Control with Dynamics Randomization"
+  - arxiv_id: "2107.04034"
+    title: "RMA: Rapid Motor Adaptation for Legged Robots"
+  - arxiv_id: "2205.02824"
+    title: "Rapid Locomotion via Reinforcement Learning"
+  - arxiv_id: "2111.10005"
+    title: "Adaptive Curriculum Domain Randomization for Robust Locomotion with Fault Tolerance"
+
+  # ── SEA characterization from datasheets (AME456-specific) ───────────
+  - arxiv_id: "1902.05346"
+    title: "Maximum Torque Transmissibility Limits for Series Elastic Actuators"
+  - arxiv_id: "2310.03888"
+    title: "Nonlinear Series Elastic Actuators in the Frequency Domain"
+  - arxiv_id: "2301.00939"
+    title: "Variable Stiffness Series Elastic Actuators for Legged Robots"
+  - arxiv_id: "2004.00467"
+    title: "UT-SEA: A High-Performance Series Elastic Actuator for Jumping Applications"
+  - arxiv_id: "0912.3956"
+    title: "Series Elastic Actuators for High Fidelity Force Control"

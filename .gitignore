@@ -1,0 +1,62 @@
+# RL-Sculptor monorepo .gitignore
+# Top-level: exclude sibling dirs that aren't part of this project.
+
+# Unrelated capstone work
+AME456/
+
+# Claude Code internal memory
+.claude/
+
+# Python env marker
+.python-version
+
+# Research dumps (too large, not needed in the repo)
+_eureka_fulltext.txt
+
+# ---------------------------------------------------------------------
+# Both subprojects share these exclusions
+
+# Secrets
+**/.env
+**/.env.*
+!**/.env.example
+
+# Python / uv
+**/.venv/
+**/__pycache__/
+**/*.py[cod]
+**/*$py.class
+**/.pytest_cache/
+**/.mypy_cache/
+**/.ruff_cache/
+**/*.egg-info/
+**/dist/
+**/build/
+
+# Node / frontend
+**/node_modules/
+**/frontend/dist/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# ---------------------------------------------------------------------
+# RewardSculptor local state (regeneratable)
+
+RewardSculptor/runs/
+RewardSculptor/kg/graph.db
+RewardSculptor/kg/pdfs/
+RewardSculptor/logs/
+RewardSculptor/examples/hopper/runs/
+RewardSculptor/examples/hopper_test/runs/
+RewardSculptor/tests/fixtures/_mjlab_go1_work/
+# Keep go1_smoke_checkpoint.pt (session fixture, ~4.7 MB) — tracked.
+
+# ---------------------------------------------------------------------
+# reward-sculptor-ui local state
+
+reward-sculptor-ui/logs/
+reward-sculptor-ui/backend/.pytest_cache/

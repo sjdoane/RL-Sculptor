@@ -1,0 +1,200 @@
+# Global KG seeds — curated from AME456/files research log + M1/M5 library
+# references + foundational RL literature + canonical robotics repos.
+#
+# Ingest into an existing project's KG with:
+#   cd ~/.local/share/reward-sculptor/projects/<slug>
+#   uv run --project ~/projects/RewardSculptor sculpt kg ingest \
+#       ~/projects/RewardSculptor/examples/kg_seeds_global.yml
+#
+# Schema matches sculptor.kg.ingest.ingest_from_seeds:
+#   papers: list of { arxiv_id, title?, authors?, year? }
+# `title` / `authors` / `year` are optional hints; the ingest pipeline
+# re-fetches metadata from arxiv anyway. They're here for fallback when
+# arxiv is rate-limited (HTTP 429) and also for human readability.
+
+papers:
+  # ── AME456 research log: SEA quadruped jumping ───────────────────────
+  - arxiv_id: "2401.16337"
+    title: "Curriculum-Based Reinforcement Learning for Quadrupedal Jumping"
+    authors: ["Atanassov", "et al."]
+    year: 2024
+  - arxiv_id: "2403.11205"
+    title: "RAMIEL — Continuous Jumping via Reinforcement Learning"
+    year: 2024
+  - arxiv_id: "2409.15755"
+    title: "Stage-Wise Reward Shaping for Acrobatic Robots"
+    year: 2024
+  - arxiv_id: "2404.15096"
+    title: "Impedance Matching for Running Jump (Mini Cheetah)"
+    year: 2024
+  - arxiv_id: "2307.16676"
+    title: "Variable Height Hopping via Energy-Gain Reward"
+    year: 2023
+  - arxiv_id: "2507.01243"
+    title: "JumpER — Monopedal Hopping with Second-Order Action Smoothness"
+    year: 2025
+  - arxiv_id: "2602.10514"
+    title: "Co-Jump — Cooperative Jumping with Four-Stage MAPPO Curriculum"
+    year: 2025
+  - arxiv_id: "2212.01303"
+    title: "Selecting Mechanical Parameters — RL Co-optimisation of Spring Stiffness + Control"
+    authors: ["Albright", "Vaughan"]
+    year: 2022
+  - arxiv_id: "2209.07171"
+    title: "Learning to Exploit Elastic Actuators for Quadruped Locomotion"
+    authors: ["Raffin", "Seidel", "Kober", "Albu-Schäffer", "Silvério", "Stulp"]
+    year: 2022
+  - arxiv_id: "2301.03509"
+    title: "ANYmal PEA — Design and Control of Parallel Elastic Quadruped"
+    authors: ["Arm", "et al."]
+    year: 2023
+  - arxiv_id: "2410.08650"
+    title: "Dynamixel XL430/MX-64 Coulomb Friction Characterisation"
+    authors: ["Passault", "et al."]
+    year: 2024
+  - arxiv_id: "2503.16197"
+    title: "Example-Guided RL for Soft Quadruped Jumping"
+    authors: ["Apostolides", "et al."]
+    year: 2025
+  - arxiv_id: "1905.04254"
+    title: "Stanford Doggo — Low-Cost Legged Robot with Direct-Drive Actuation"
+    year: 2019
+  - arxiv_id: "1902.05346"
+    title: "Performance Analysis of SEA Based on Maximum Torque Transmissibility"
+    authors: ["Losey", "et al."]
+    year: 2019
+  - arxiv_id: "2409.09203"
+    title: "Pinto — A Miniaturised Latched Jumping Robot"
+    authors: ["Yim", "et al."]
+    year: 2024
+
+  # ── Mjlab / mjlab-ready library references (from M5 research pass) ──
+  - arxiv_id: "2601.22074"
+    title: "mjlab — A Lightweight Framework for GPU-Accelerated Robot Learning"
+    authors: ["Zakka", "Liao", "Yi", "Le Lay", "Sreenath", "Abbeel"]
+    year: 2026
+  - arxiv_id: "2406.08858"
+    title: "OmniH2O — Universal and Dexterous Human-to-Humanoid Whole-Body Teleoperation"
+    authors: ["He", "et al."]
+    year: 2024
+  - arxiv_id: "2412.13196"
+    title: "ExBody2 — Advanced Expressive Humanoid Whole-Body Control"
+    authors: ["Ji", "et al."]
+    year: 2024
+  - arxiv_id: "2402.19469"
+    title: "Humanoid Locomotion as Next Token Prediction"
+    authors: ["Radosavovic", "et al."]
+    year: 2024
+  - arxiv_id: "2212.03238"
+    title: "Walk These Ways — Tuning Robot Control for Generalization with Multiplicity of Behavior"
+    authors: ["Margolis", "Agrawal"]
+    year: 2022
+  - arxiv_id: "2208.07860"
+    title: "A Walk in the Park — Learning to Walk in 20 Minutes with Model-Free RL"
+    authors: ["Smith", "et al."]
+    year: 2022
+  - arxiv_id: "2109.11978"
+    title: "Learning to Walk in Minutes Using Massively Parallel Deep RL (legged_gym)"
+    authors: ["Rudin", "et al."]
+    year: 2021
+  - arxiv_id: "2010.11251"
+    title: "Learning Quadrupedal Locomotion over Challenging Terrain"
+    authors: ["Lee", "et al."]
+    year: 2020
+  - arxiv_id: "1901.08652"
+    title: "Learning Agile and Dynamic Motor Skills for Legged Robots"
+    authors: ["Hwangbo", "et al."]
+    year: 2019
+  - arxiv_id: "2309.14341"
+    title: "Extreme Parkour with Legged Robots"
+    authors: ["Cheng", "et al."]
+    year: 2024
+  - arxiv_id: "2309.05665"
+    title: "Robot Parkour Learning"
+    authors: ["Zhuang", "et al."]
+    year: 2023
+  - arxiv_id: "2211.07638"
+    title: "Legged Locomotion in Challenging Terrains using Egocentric Vision"
+    authors: ["Agarwal", "et al."]
+    year: 2022
+  - arxiv_id: "2506.15132"
+    title: "Booster Gym — End-to-End RL Framework for Humanoid Robot Locomotion"
+    authors: ["Wang", "et al."]
+    year: 2025
+
+  # ── Foundational RL (algorithms the sculpt loop is built on) ────────
+  - arxiv_id: "1707.06347"
+    title: "Proximal Policy Optimization Algorithms"
+    authors: ["Schulman", "Wolski", "Dhariwal", "Radford", "Klimov"]
+    year: 2017
+  - arxiv_id: "1509.02971"
+    title: "Continuous Control with Deep Reinforcement Learning (DDPG)"
+    authors: ["Lillicrap", "et al."]
+    year: 2015
+  - arxiv_id: "1801.01290"
+    title: "Soft Actor-Critic — Off-Policy Maximum Entropy Deep RL"
+    authors: ["Haarnoja", "Zhou", "Abbeel", "Levine"]
+    year: 2018
+  - arxiv_id: "1506.02438"
+    title: "Generalized Advantage Estimation (GAE)"
+    authors: ["Schulman", "Moritz", "Levine", "Jordan", "Abbeel"]
+    year: 2015
+  - arxiv_id: "1707.02286"
+    title: "Emergence of Locomotion Behaviours in Rich Environments"
+    authors: ["Heess", "et al."]
+    year: 2017
+  - arxiv_id: "1707.01495"
+    title: "Hindsight Experience Replay"
+    authors: ["Andrychowicz", "et al."]
+    year: 2017
+  - arxiv_id: "1606.01540"
+    title: "OpenAI Gym"
+    authors: ["Brockman", "et al."]
+    year: 2016
+  - arxiv_id: "1709.06560"
+    title: "Deep Reinforcement Learning that Matters"
+    authors: ["Henderson", "Islam", "Bachman", "Pineau", "Precup", "Meger"]
+    year: 2017
+  - arxiv_id: "1801.00690"
+    title: "DeepMind Control Suite"
+    authors: ["Tassa", "et al."]
+    year: 2018
+
+  # ── Reward shaping + curriculum + imitation (cross-cutting) ─────────
+  - arxiv_id: "1812.11103"
+    title: "Quantifying Generalization in Reinforcement Learning"
+    authors: ["Cobbe", "Klimov", "Hesse", "Kim", "Schulman"]
+    year: 2018
+  - arxiv_id: "1707.03374"
+    title: "Reverse Curriculum Generation for Reinforcement Learning"
+    authors: ["Florensa", "Held", "Wulfmeier", "Zhang", "Abbeel"]
+    year: 2017
+  - arxiv_id: "2004.07219"
+    title: "Learning Quadrupedal Locomotion over Challenging Terrain (early 2020 version)"
+    year: 2020
+  - arxiv_id: "2107.04034"
+    title: "Rapid Motor Adaptation for Legged Robots"
+    authors: ["Kumar", "Fu", "Pathak", "Malik"]
+    year: 2021
+  - arxiv_id: "2202.05481"
+    title: "Minimizing Energy Consumption Leads to the Emergence of Gaits in Legged Robots"
+    authors: ["Fu", "Kumar", "Agarwal", "Qi", "Malik", "Pathak"]
+    year: 2022
+  - arxiv_id: "2205.02824"
+    title: "Advanced Skills by Learning Locomotion and Local Navigation End-to-End"
+    authors: ["Rudin", "Hoeller", "Reist", "Hutter"]
+    year: 2022
+
+  # ── Manipulation + dexterous hands (for Yam, Allegro, Shadow) ───────
+  - arxiv_id: "1808.00177"
+    title: "Learning Dexterous In-Hand Manipulation"
+    authors: ["OpenAI", "et al."]
+    year: 2018
+  - arxiv_id: "1910.07113"
+    title: "Solving Rubik's Cube with a Robot Hand"
+    authors: ["OpenAI", "et al."]
+    year: 2019
+  - arxiv_id: "2108.10470"
+    title: "Isaac Gym — High Performance GPU-Based Physics Simulation"
+    authors: ["Makoviychuk", "et al."]
+    year: 2021

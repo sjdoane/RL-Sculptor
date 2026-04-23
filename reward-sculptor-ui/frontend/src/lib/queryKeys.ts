@@ -1,0 +1,45 @@
+/** Canonical React Query keys. Centralized so invalidations hit the
+ *  right entries — particularly important for the preview endpoint,
+ *  which is called from multiple surfaces (list card, detail pane,
+ *  library picker). Any call site using a hand-rolled key is a bug. */
+
+import type { CameraAngle } from "./types";
+
+export const qk = {
+  health: () => ["health"] as const,
+  projects: () => ["projects"] as const,
+  project: (slug: string) => ["project", slug] as const,
+  robot: (slug: string) => ["robot", slug] as const,
+  preview: (
+    slug: string,
+    params?: { angle?: CameraAngle; regenerate?: boolean },
+  ) =>
+    [
+      "preview",
+      slug,
+      {
+        angle: params?.angle ?? "iso",
+        regenerate: !!params?.regenerate,
+      },
+    ] as const,
+
+  rewards: (slug: string) => ["rewards", slug] as const,
+  reward: (slug: string, version: number) =>
+    ["reward", slug, version] as const,
+
+  kgPapers: (slug: string, filter?: { extracted?: boolean; search?: string }) =>
+    ["kg", "papers", slug, filter ?? {}] as const,
+  kgPaper: (slug: string, arxivId: string) =>
+    ["kg", "paper", slug, arxivId] as const,
+  kgTechniques: (slug: string) => ["kg", "techniques", slug] as const,
+  kgPendingSeeds: (slug: string) => ["kg", "pendingSeeds", slug] as const,
+
+  job: (jobId: string) => ["job", jobId] as const,
+  projectJobs: (slug: string) => ["jobs", "project", slug] as const,
+
+  runs: (slug: string) => ["runs", slug] as const,
+  run: (slug: string, runId: string) => ["run", slug, runId] as const,
+
+  dashboard: () => ["dashboard"] as const,
+  systemInfo: () => ["systemInfo"] as const,
+};
