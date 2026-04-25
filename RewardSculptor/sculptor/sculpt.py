@@ -1549,6 +1549,101 @@ Thumbs.db
 """
 
 
+def _extract_toml_section(toml_text: str, section: str) -> Optional[str]:
+    """Return the body of a top-level `[section]` (lines after the
+    header up to but not including the next `[other_section]`/
+    `[[array_table]]` header). Returns None if the section is
+    missing. Plain-text manipulation — sculptor doesn't depend on
+    `tomli_w` and the configs we touch are flat enough that string-
+    level extraction is safe."""
+    lines = toml_text.splitlines(keepends=True)
+    start = None
+    target = f"[{section}]"
+    for i, line in enumerate(lines):
+        if line.strip() == target:
+            start = i + 1
+            break
+    if start is None:
+        return None
+    end = len(lines)
+    for j in range(start, len(lines)):
+        s = lines[j].lstrip()
+        if s.startswith("["):  # next section header
+            end = j
+            break
+    body = "".join(lines[start:end])
+    if not body.endswith("\n"):
+        body += "\n"
+    return body
+
+
+def _replace_toml_section(
+    toml_text: str, section: str, new_body: str,
+) -> str:
+    """Return `toml_text` with the body of `[section]` replaced by
+    `new_body`. If the section is missing, returns the input
+    unchanged."""
+    lines = toml_text.splitlines(keepends=True)
+    start = None
+    target = f"[{section}]"
+    for i, line in enumerate(lines):
+        if line.strip() == target:
+            start = i + 1
+            break
+    if start is None:
+        return toml_text
+    end = len(lines)
+    for j in range(start, len(lines)):
+        s = lines[j].lstrip()
+        if s.startswith("["):
+            end = j
+            break
+    return "".join(lines[:start]) + new_body + "".join(lines[end:])
+
+
+def _inherit_parent_adapter_config(
+    *, stage_dir: Path, project_dir: Path,
+) -> bool:
+    """Hotfix for a latent Ship 16 bug: `sculpt_init` writes a hard-
+    coded gym_sb3-flavored `[adapter].config = { env_id = "CHANGE_ME",
+    n_envs = 4, ppo_kwargs = {...} }` regardless of the parent
+    project's actual adapter. For mjlab projects, that template
+    fails the moment `_run_one_stage` calls `load_adapter` (the keys
+    `env_id` / `n_envs` / `ppo_kwargs` are not valid kwargs for
+    `MjlabAdapter.__init__`).
+
+    Fix: after `sculpt_init` scaffolds a stage dir, copy the parent
+    project's `[adapter]` section (class + config inline-table) over
+    the stage's so the stage inherits the correct `task_id` /
+    `num_envs` / `device` (mjlab) or whatever the parent set
+    (gym_sb3 / others).
+
+    Returns True if the stage's `[adapter]` section changed.
+    Tolerates missing project / stage configs by returning False
+    without raising — caller's load_adapter will surface the
+    original error in that pathological case.
+    """
+    project_config = project_dir / "config.toml"
+    stage_config = stage_dir / "config.toml"
+    if not project_config.is_file() or not stage_config.is_file():
+        return False
+    try:
+        parent_text = project_config.read_text(encoding="utf-8")
+        stage_text = stage_config.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    parent_adapter_body = _extract_toml_section(parent_text, "adapter")
+    if parent_adapter_body is None:
+        return False
+    new_stage_text = _replace_toml_section(
+        stage_text, "adapter", parent_adapter_body,
+    )
+    if new_stage_text == stage_text:
+        return False
+    stage_config.write_text(new_stage_text, encoding="utf-8")
+    return True
+
+
 def sculpt_init(project_dir: Path | str, adapter: str) -> Path:
     """Scaffold a new Sculptor project. Returns the created project dir."""
     project_dir = Path(project_dir).resolve()
@@ -2026,10 +2121,31 @@ def _run_one_stage(
                 stage, "scaffold_errored",
                 f"{type(e).__name__}: {e}", emit,
             )
+        # Hotfix for Ship 16 latent bug exposed by Ship 18b/19's first
+        # real mjlab mission run: `sculpt_init` writes a gym_sb3-
+        # flavored adapter config (env_id / n_envs / ppo_kwargs)
+        # regardless of the parent project's actual adapter. For
+        # mjlab the keys are simply wrong and the next load_adapter
+        # call raises TypeError. Copy the parent's [adapter] section
+        # over the freshly-scaffolded stage's config so it inherits
+        # the right task_id / num_envs / device.
+        try:
+            project_root = mission_dir.parent.parent
+            inherited = _inherit_parent_adapter_config(
+                stage_dir=stage_dir, project_dir=project_root,
+            )
+        except Exception as e:  # noqa: BLE001 — best-effort; surfaced via stage_scaffolded payload
+            inherited = False
+            emit({
+                "type": "stage_scaffold_inherit_warning",
+                "stage_name": stage.name,
+                "error": f"{type(e).__name__}: {e}",
+            })
         emit({
             "type": "stage_scaffolded",
             "stage_name": stage.name,
             "stage_dir": str(stage_dir),
+            "inherited_parent_adapter_config": bool(inherited),
         })
     else:
         # Audit fix: detect adapter mismatch on resume. If the stage
