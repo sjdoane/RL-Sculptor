@@ -640,6 +640,7 @@ def _alive_reward_keys(reward_path: Path) -> set[str]:
 def _train_or_resume(
     *, adapter, iter_index: int, iter_dir: Path,
     reward_module_path: Path, steps: int, seed: int,
+    init_policy_path: Optional[Path] = None,
 ):
     """Skip `adapter.train` when `iter_dir/checkpoint.pt` is already on
     disk and loads successfully — the expensive phase (≥ 22 min for
@@ -647,6 +648,15 @@ def _train_or_resume(
     prior run's artifact saves all that wall-clock when any downstream
     phase (rollout, diagnose, edit) failed on the previous attempt.
     Returns a `TrainResult`-compatible object either way.
+
+    §Ship 15: `init_policy_path` is an optional path to a pre-trained
+    rsl_rl checkpoint. When set AND the adapter's `train` signature
+    accepts `init_policy_path`, it's forwarded so the runner warm-starts
+    actor+critic weights from that checkpoint. When the adapter DOESN'T
+    accept the kwarg, or when this iter's own checkpoint is already on
+    disk (resume path wins), `warm_start_skipped` is emitted so callers
+    (Ship 16 orchestrator) can distinguish "warm-started" from "resumed
+    from prior partial attempt" rather than the two silently collapsing.
     """
     from sculptor.adapters.base import TrainResult
 
@@ -681,6 +691,17 @@ def _train_or_resume(
             "reason": "checkpoint already on disk",
             "checkpoint": str(ckpt),
         })
+        # §Ship 15: caller requested warm-start, but iter's own
+        # checkpoint already exists on disk — resume path wins.
+        # Emit so Ship 16 can tell "I warm-started" apart from
+        # "I resumed an in-flight iter".
+        if init_policy_path is not None:
+            _emit_event({
+                "type": "warm_start_skipped",
+                "iter": iter_index,
+                "reason": "local_checkpoint_wins",
+                "source": str(init_policy_path),
+            })
         return TrainResult(
             checkpoint_path=ckpt,
             metrics_dict=metrics,
@@ -689,12 +710,43 @@ def _train_or_resume(
         )
 
     # Fresh training run — no checkpoint or all candidates corrupt.
-    return adapter.train(
+    train_kwargs: dict[str, Any] = dict(
         reward_module_path=reward_module_path,
         output_dir=iter_dir,
         steps=steps,
         seed=seed,
     )
+    # §Ship 15: introspect adapter.train so adapters that don't yet
+    # support warm-start (gym_sb3 / mjx / rllib) don't TypeError on
+    # the new kwarg. If a caller passed init_policy_path but the
+    # adapter dropped it, emit so the orchestrator sees the silent
+    # no-op instead of assuming warm-start happened.
+    #
+    # Introspection note (audit finding, Ship 15 review): a `**kwargs`
+    # catch-all in the adapter's signature would silently discard the
+    # kwarg while `"init_policy_path" in sig.parameters` returns False.
+    # Accept either an explicit named param OR a VAR_KEYWORD param —
+    # the former is the preferred contract, the latter is "adapter
+    # MIGHT support it, let's try and let the adapter decide."
+    if init_policy_path is not None:
+        import inspect
+        sig = inspect.signature(adapter.train)
+        has_explicit = "init_policy_path" in sig.parameters
+        has_var_kwarg = any(
+            p.kind == inspect.Parameter.VAR_KEYWORD
+            for p in sig.parameters.values()
+        )
+        if has_explicit or has_var_kwarg:
+            train_kwargs["init_policy_path"] = init_policy_path
+        else:
+            _emit_event({
+                "type": "warm_start_skipped",
+                "iter": iter_index,
+                "reason": "adapter_does_not_support",
+                "source": str(init_policy_path),
+                "adapter": type(adapter).__name__,
+            })
+    return adapter.train(**train_kwargs)
 
 
 def _rollout_or_resume(
@@ -762,6 +814,7 @@ def _run_one_iter(
     dry_run: bool,
     kg_store,
     seed: int,
+    init_policy_path: Optional[Path] = None,
 ) -> IterOutcome:
     iter_cfg = cfg.get("iteration", {}) or {}
     primary_key = str(iter_cfg.get("primary_metric", "mean_return"))
@@ -783,6 +836,16 @@ def _run_one_iter(
         "reward_version_before": latest_n,
         "dry_run": bool(dry_run),
         "no_kg": bool(no_kg),
+        # §Ship 15: None unless caller requested warm-start for this
+        # iter. Ship 16 orchestrator uses this to correlate intent
+        # with the `warm_start_loaded` event the subprocess emits
+        # later — "caller expected warm-start AND subprocess loaded
+        # the ckpt" vs "caller expected warm-start but subprocess
+        # didn't emit warm_start_loaded" (= silent drop → bug).
+        "warm_start_source": (
+            str(init_policy_path) if init_policy_path is not None
+            else None
+        ),
     })
 
     # 1. Train — resume from on-disk checkpoint when one is already
@@ -797,6 +860,7 @@ def _run_one_iter(
         reward_module_path=reward_path_before,
         steps=steps,
         seed=seed,
+        init_policy_path=init_policy_path,
     )
     train_s = time.time() - t0
 
@@ -1090,10 +1154,32 @@ def sculpt_run(
     auto_adjust_physics: Optional[bool] = None,
     early_stop_enabled: Optional[bool] = None,
     early_stop_patience: Optional[int] = None,
+    init_policy_path: Optional[Path | str] = None,
 ) -> SculptRunResult:
     config_path = Path(config_path).resolve()
     if not config_path.is_file():
         raise FileNotFoundError(f"config not found: {config_path}")
+
+    # §Ship 15: validate init_policy_path at entry so callers see a
+    # clear error before any expensive config / adapter loading.
+    # Normalized into `init_ckpt` here and threaded through the iter
+    # loop below; only iter == start_iter actually uses it.
+    #
+    # Empty-string defensiveness (audit finding, Ship 15 review):
+    # `Path("").resolve() == Path.cwd()`, so a literal `""` from JSON /
+    # YAML / form-encoded callers would bypass the None check and then
+    # mis-validate as cwd (which may or may not be a file). Treat
+    # empty / whitespace-only strings as None explicitly.
+    init_ckpt: Optional[Path] = None
+    if init_policy_path is not None:
+        raw = str(init_policy_path).strip()
+        if raw:
+            init_ckpt = Path(raw).expanduser().resolve()
+            if not init_ckpt.is_file():
+                raise FileNotFoundError(
+                    f"init_policy_path not found: {init_ckpt}. "
+                    "Pass a valid rsl_rl checkpoint or None."
+                )
 
     cfg = _parse_toml(config_path)
     # `--steps-per-iter` CLI override wins over the config.toml value.
@@ -1185,6 +1271,10 @@ def sculpt_run(
         "behavior_goal": behavior_goal,
     })
 
+    # §Ship 15: `init_ckpt` normalized at function entry. Applies ONLY
+    # to the FIRST iter of this run (iter == start_iter). Subsequent
+    # iters start fresh; iter-to-iter warm-start within a single
+    # sculpt_run is a separate behavioral decision deferred past Ship 16.
     result = SculptRunResult(iterations_run=0)
     try:
         for i in range(start_iter, end_iter):
@@ -1195,6 +1285,7 @@ def sculpt_run(
                 config_path=config_path, behavior_goal=behavior_goal, cfg=cfg,
                 no_kg=no_kg, dry_run=dry_run, kg_store=kg_store,
                 seed=base_seed + i,
+                init_policy_path=(init_ckpt if i == start_iter else None),
             )
             elapsed = time.time() - t0
             result.completed_iters.append(outcome)
@@ -1512,6 +1603,1030 @@ def sculpt_init(project_dir: Path | str, adapter: str) -> Path:
             sys.stderr.write(
                 f"[sculpt init] git init/commit failed: {e.stderr!r}\n")
     return project_dir
+
+
+# ── Ship 16: Mission orchestrator ────────────────────────────────────
+def _is_stage_scaffolded(stage_dir: Path) -> bool:
+    """Non-destructive check — returns True iff the dir has the files a
+    minimum sculpt project needs. Used by `mission_run` for idempotent
+    stage scaffolding (don't re-invoke `sculpt_init` on resume).
+    """
+    return (
+        stage_dir.is_dir()
+        and (stage_dir / "config.toml").is_file()
+        and (stage_dir / "rewards" / "v0.py").is_file()
+    )
+
+
+def _resolve_stage_final_checkpoint(
+    sculpt_result: "SculptRunResult",
+) -> Optional[Path]:
+    """Pick the checkpoint path from the last completed iter.
+
+    mjlab writes `checkpoint.pt`, gym_sb3 writes `checkpoint.zip` — glob
+    for both. Returns None if no iter produced a checkpoint (caller
+    marks the stage failed).
+    """
+    if not sculpt_result.completed_iters:
+        return None
+    last_iter = sculpt_result.completed_iters[-1]
+    for ext in ("pt", "zip"):
+        p = last_iter.iter_dir / f"checkpoint.{ext}"
+        if p.is_file() and p.stat().st_size > 0:
+            return p
+    return None
+
+
+def _verify_stage_adapter_matches(
+    stage_dir: Path, expected_short_name: str,
+) -> None:
+    """Audit-fix guard for resume: confirm the stage's existing
+    config.toml's `[adapter].class` matches `expected_short_name`'s
+    dotted path. Raises RuntimeError on mismatch so the orchestrator
+    fails the stage clearly rather than silently training under the
+    wrong adapter.
+    """
+    config_path = stage_dir / "config.toml"
+    if not config_path.is_file():
+        return  # not scaffolded yet; caller will do that
+
+    try:
+        try:
+            import tomllib
+        except ModuleNotFoundError:  # pragma: no cover
+            import tomli as tomllib  # type: ignore[no-redef]
+        with config_path.open("rb") as f:
+            cfg = tomllib.load(f)
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(
+            f"failed to parse {config_path}: {type(e).__name__}: {e}"
+        ) from e
+
+    on_disk_dotted = ((cfg.get("adapter") or {}).get("class") or "").strip()
+    expected_dotted = _ADAPTER_SHORT_NAMES.get(
+        expected_short_name, expected_short_name,
+    )
+    # Only enforce when the on-disk class is a real Python dotted path
+    # ("a.b.c" or longer). Bare names like "stubbed" are test stubs the
+    # `load_adapter` factory can't resolve anyway — the test harness
+    # monkeypatches `load_adapter` directly. This keeps the check
+    # useful (catches "you scaffolded under gym_sb3, now you're trying
+    # to run under mjlab") without false-positive on every tmp test.
+    if on_disk_dotted and "." in on_disk_dotted and on_disk_dotted != expected_dotted:
+        raise RuntimeError(
+            f"adapter mismatch in {config_path}: on-disk "
+            f"{on_disk_dotted!r} != expected {expected_dotted!r} "
+            f"(caller passed adapter_short_name={expected_short_name!r}). "
+            f"Mission resume would train under the wrong adapter. "
+            f"Either pass the matching adapter_short_name or "
+            f"re-scaffold the stage."
+        )
+
+
+def _atomic_save_mission(mission, mission_dir: Path) -> None:
+    """Write mission.json via tmp+rename so a SIGKILL mid-save can't
+    leave a corrupted JSON Mission.from_json would explode on. Pairs
+    with `filelock` below to serialize concurrent writers."""
+    import os as _os
+    tmp = mission_dir / ".mission.json.tmp"
+    tmp.write_text(mission.to_json(), encoding="utf-8")
+    _os.replace(tmp, mission_dir / "mission.json")
+
+
+def mission_run(
+    mission,
+    *,
+    adapter_short_name: str,
+    kg_store=None,
+    on_event: Optional[Any] = None,
+    iterations_override: Optional[int] = None,
+    steps_per_iter: Optional[int] = None,
+    seed: Optional[int] = None,
+    skill_library_handle: Optional[Any] = None,
+):
+    """Orchestrate a full mission: decompose → per-stage scaffold → v1
+    seeding → sculpt_run → success-criterion eval → advance or halt.
+
+    Parameters
+    ----------
+    mission : Mission
+        Result of `decompose_task`. MUST have `mission_dir` set — save
+        the mission first via `save_mission` so subsequent stage dirs
+        have a parent.
+    adapter_short_name : str
+        One of the keys in `_ADAPTER_SHORT_NAMES` (e.g., "mjlab",
+        "gym_sb3"). Each stage's `config.toml` is scaffolded with this
+        adapter.
+    kg_store : SculptorKG | None
+        Threaded through to `apply_prompt_edit` for each stage's v1
+        materialization, and to every `sculpt_run` call for citation
+        grounding.
+    on_event : callable | None
+        Optional event sink. `mission_run` emits mission-level events
+        (mission_started / stage_started / ...) AND the events
+        `sculpt_run` already emits for its inner loop — the latter are
+        wrapped to add a `stage_name` field so Ship 18's UI can
+        correlate per-stage iter events.
+    iterations_override / steps_per_iter / seed : override stage.max_iterations
+        and pass-through to sculpt_run. `None` honors the stage's value.
+
+    Returns
+    -------
+    MissionResult
+        Completion status + per-stage outcomes. `completed=True` iff
+        every stage succeeded. `halted_at_stage` names the first stage
+        that failed, if any.
+
+    Raises
+    ------
+    RuntimeError : mission.mission_dir is None, or the file lock on
+        `<mission_dir>/.lock` is already held by another process.
+    """
+    from filelock import FileLock, Timeout as _FileLockTimeout
+
+    from sculptor.mission import save_mission
+    from sculptor.mission_runtime import (
+        CriterionEvalError,
+        MissionResult,
+        StageResult,
+        _build_criterion_namespace,
+        _evaluate_success_criterion,
+    )
+
+    if mission.mission_dir is None:
+        raise RuntimeError(
+            "mission.mission_dir is None — call save_mission(mission, path) "
+            "before mission_run so stage dirs resolve."
+        )
+    mission_dir = Path(mission.mission_dir).resolve()
+    mission_dir.mkdir(parents=True, exist_ok=True)
+    (mission_dir / "stages").mkdir(exist_ok=True)
+
+    def _emit(payload: dict) -> None:
+        """Emit via the public module-level _emit_event AND the caller's
+        optional on_event sink, so tests / UI hooks can observe without
+        parsing stdout."""
+        _emit_event(payload)
+        if on_event is not None:
+            try:
+                on_event(payload)
+            except Exception:  # noqa: BLE001 — never let user callback crash run
+                pass
+
+    result = MissionResult(mission_goal=mission.goal)
+
+    lock_path = mission_dir / ".lock"
+    # Audit fix: 10s timeout (was 1s) — slow filesystems (NFS / WSL
+    # interop) can legitimately take >1s to acquire. Stale lock
+    # files are NOT a problem with `filelock` because the OS-level
+    # advisory lock isn't held when the prior process exits, even
+    # if the file persists on disk.
+    lock = FileLock(str(lock_path), timeout=10.0)
+    try:
+        lock.acquire()
+    except _FileLockTimeout as e:
+        raise RuntimeError(
+            f"another mission_run is holding the lock at {lock_path}. "
+            f"Concurrent runs on the same mission would corrupt "
+            f"mission.json and stage artifacts."
+        ) from e
+
+    try:
+        _emit({
+            "type": "mission_started",
+            "mission_dir": str(mission_dir),
+            "goal": mission.goal,
+            "n_stages": len(mission.stages),
+        })
+
+        # §Ship 17: refactored from for-loop to while-loop indexed by
+        # `mission.current_stage_idx` so mid-iteration splices (sub-
+        # stage redecomposition replacing the failed stage in place)
+        # are safe. The for-loop's iterator would have cached the old
+        # list state and skipped past the inserted sub-stages.
+        all_succeeded = True
+        while mission.current_stage_idx < len(mission.stages):
+            stage_idx = mission.current_stage_idx
+            stage = mission.stages[stage_idx]
+
+            # Resume: skip stages that already succeeded on disk.
+            if stage.status == "succeeded":
+                _emit({
+                    "type": "stage_skipped",
+                    "stage_name": stage.name,
+                    "reason": "already_succeeded",
+                })
+                result.stage_results.append(StageResult(
+                    stage_name=stage.name, status="succeeded",
+                    iterations_used=stage.iterations_used,
+                    final_policy_path=stage.final_policy_path,
+                    final_reward_path=stage.final_reward_path,
+                    criterion_satisfied=True,
+                    last_iter_metric=stage.best_metric,
+                ))
+                mission.current_stage_idx += 1
+                continue
+
+            stage_res = _run_one_stage(
+                mission=mission,
+                mission_dir=mission_dir,
+                stage=stage,
+                stage_idx=stage_idx,
+                adapter_short_name=adapter_short_name,
+                kg_store=kg_store,
+                emit=_emit,
+                iterations_override=iterations_override,
+                steps_per_iter=steps_per_iter,
+                seed=seed,
+                skill_library_handle=skill_library_handle,
+            )
+            result.stage_results.append(stage_res)
+
+            # Persist mission.json AFTER every stage transition so
+            # resume sees the latest state.
+            _atomic_save_mission(mission, mission_dir)
+
+            if stage_res.status == "succeeded":
+                mission.current_stage_idx += 1
+                continue
+
+            # Failure path. Try Ship 17 redecomposition before halting.
+            spliced = _maybe_redecompose_and_splice(
+                mission=mission,
+                mission_dir=mission_dir,
+                failed_stage_idx=stage_idx,
+                stage_res=stage_res,
+                kg_store=kg_store,
+                emit=_emit,
+            )
+            if spliced:
+                # current_stage_idx was rewound by the splice helper to
+                # point at the first new sub-stage. Drop the failed
+                # stage's StageResult — it'll be replaced when the
+                # sub-stages run. Loop continues without advancing.
+                result.stage_results.pop()
+                continue
+
+            all_succeeded = False
+            result.halted_at_stage = stage.name
+            result.halted_reason = (
+                stage_res.failure_reason or "criterion_not_met"
+            )
+            _emit({
+                "type": "mission_halted",
+                "stage_name": stage.name,
+                "reason": result.halted_reason,
+            })
+            break
+
+        if all_succeeded and mission.current_stage_idx >= len(mission.stages):
+            result.completed = True
+
+        _emit({
+            "type": "mission_completed" if result.completed
+                    else "mission_halted_terminal",
+            "completed": result.completed,
+            "halted_at_stage": result.halted_at_stage,
+            "halted_reason": result.halted_reason,
+        })
+    except KeyboardInterrupt:
+        result.halted_reason = "interrupted"
+        _emit({
+            "type": "mission_halted",
+            "reason": "interrupted",
+        })
+        raise
+    finally:
+        lock.release()
+        # Audit fix: do NOT unlink the .lock file. On Windows / WSL,
+        # `filelock` can hold the file handle past `release()`, making
+        # the unlink fail silently and confusing future debuggers
+        # ("why is .lock here if no one's holding it?"). The OS-level
+        # advisory lock is released cleanly; the file persisting is
+        # cosmetic and `FileLock` will re-acquire it on the next run.
+
+    return result
+
+
+def _run_one_stage(
+    *,
+    mission,
+    mission_dir: Path,
+    stage,
+    stage_idx: int,
+    adapter_short_name: str,
+    kg_store,
+    emit: Any,
+    iterations_override: Optional[int],
+    steps_per_iter: Optional[int],
+    seed: Optional[int],
+    skill_library_handle: Optional[Any] = None,
+):
+    """Helper called by `mission_run` per stage. Kept separate so the
+    orchestrator stays readable — `mission_run` is about flow; this
+    function is about "one stage, cradle to grave." """
+    from sculptor.mission_runtime import (
+        CriterionEvalError,
+        StageResult,
+        _build_criterion_namespace,
+        _evaluate_success_criterion,
+    )
+
+    stage_dir = mission.stage_dir(stage.name)
+    emit({
+        "type": "stage_started",
+        "stage_name": stage.name,
+        "stage_index": stage_idx,
+        "stage_dir": str(stage_dir),  # audit fix: UI symmetry with stage_scaffolded
+        "goal_text": stage.goal_text,
+        "parent_stage": stage.parent_stage,
+        "max_iterations": stage.max_iterations,
+    })
+    stage.status = "training"
+    stage.started_at = _utc_now_iso()
+
+    # 1. Resolve parent checkpoint (None for first stage / parent-not-trained).
+    # Audit fix: distinguish "no parent / parent untrained" from "parent
+    # ckpt was deleted externally" — the latter silently degrades to
+    # cold-start without this branch, which would invalidate the whole
+    # curriculum's warm-start chain.
+    parent_ckpt, parent_status = mission.parent_checkpoint_status_of(stage.name)
+    emit({
+        "type": "stage_warm_start_resolved",
+        "stage_name": stage.name,
+        "stage_index": stage_idx,
+        "parent_stage": stage.parent_stage,
+        "parent_checkpoint": str(parent_ckpt) if parent_ckpt else None,
+        "parent_status": parent_status,
+    })
+    if parent_status == "parent_ckpt_missing":
+        emit({
+            "type": "warm_start_skipped",
+            "stage_name": stage.name,
+            "reason": "parent_ckpt_missing",
+            "detail": (
+                f"parent stage {stage.parent_stage!r} recorded "
+                f"final_policy_path but the file is gone — child stage "
+                f"will train cold-start, defeating the curriculum's "
+                f"warm-start chain. Restore the file or re-run the "
+                f"parent stage."
+            ),
+        })
+
+    # §Ship 19: resolve cross-mission skill warm-start (if any).
+    # Decision: when `stage.init_skill_id` is explicitly set by the
+    # decomposer AND the handle resolves it to a real checkpoint,
+    # the SKILL wins over the parent ckpt — "explicit beats implicit"
+    # (audit fix C1: CurricuLLM's premise is that prior-mission
+    # specialized policies often beat re-using the current mission's
+    # parent which trained on a different reward shape). When skill
+    # resolution fails / is absent, fall back to parent_ckpt as
+    # before — Ship 16 behavior preserved.
+    skill_ckpt: Optional[Path] = None
+    if skill_library_handle is not None and stage.init_skill_id:
+        skill_ckpt = skill_library_handle.maybe_load_for_stage(stage, emit)
+
+    if skill_ckpt is not None:
+        warm_start_path: Optional[Path] = skill_ckpt
+        warm_start_source = "skill_library"
+        warm_start_source_id: Optional[str] = stage.init_skill_id
+        if parent_ckpt is not None:
+            emit({
+                "type": "warm_start_skipped",
+                "stage_name": stage.name,
+                "reason": "skill_overrides_parent",
+                "skill_id": stage.init_skill_id,
+                "parent_stage": stage.parent_stage,
+            })
+    elif parent_ckpt is not None:
+        warm_start_path = parent_ckpt
+        warm_start_source = "parent_stage"
+        warm_start_source_id = stage.parent_stage
+    else:
+        warm_start_path = None
+        warm_start_source = "none"
+        warm_start_source_id = None
+
+    emit({
+        "type": "stage_warm_start_chosen",
+        "stage_name": stage.name,
+        "stage_index": stage_idx,
+        "source": warm_start_source,
+        "source_id": warm_start_source_id,
+        "checkpoint": str(warm_start_path) if warm_start_path else None,
+    })
+
+    # 2. Scaffold stage dir idempotently. `stage_dir` was resolved
+    # above for the stage_started event (audit fix: UI symmetry).
+    if not _is_stage_scaffolded(stage_dir):
+        try:
+            sculpt_init(stage_dir, adapter_short_name)
+        except Exception as e:  # noqa: BLE001
+            return _fail_stage(
+                stage, "scaffold_errored",
+                f"{type(e).__name__}: {e}", emit,
+            )
+        emit({
+            "type": "stage_scaffolded",
+            "stage_name": stage.name,
+            "stage_dir": str(stage_dir),
+        })
+    else:
+        # Audit fix: detect adapter mismatch on resume. If the stage
+        # was scaffolded under one adapter and the caller now passes
+        # another, sculpt_run would silently use the on-disk one.
+        try:
+            _verify_stage_adapter_matches(stage_dir, adapter_short_name)
+        except RuntimeError as e:
+            return _fail_stage(
+                stage, "adapter_mismatch",
+                f"{type(e).__name__}: {e}", emit,
+            )
+
+    # 3. Materialize v1 from the stage's reward_seed_prompt.
+    try:
+        from sculptor.edit import apply_prompt_edit
+        latest_n, latest_reward_file = _find_latest_reward_version(
+            stage_dir / "rewards",
+        )
+        # Only materialize v1 if we haven't already (resume case).
+        if latest_n == 0:
+            from sculptor.adapters.base import load_adapter
+            adapter_for_contract = load_adapter(stage_dir / "config.toml")
+            apply_prompt_edit(
+                current_reward_path=latest_reward_file,
+                user_prompt=stage.reward_seed_prompt,
+                new_iter_id=f"v{latest_n + 1}",
+                reward_contract=adapter_for_contract.reward_contract(),
+                kg_store=kg_store,
+            )
+            emit({
+                "type": "stage_v1_materialized",
+                "stage_name": stage.name,
+                "reward_path": str(stage_dir / "rewards" / "v1.py"),
+            })
+    except Exception as e:  # noqa: BLE001
+        return _fail_stage(
+            stage, "v1_materialization_errored",
+            f"apply_prompt_edit failed: {type(e).__name__}: {e}",
+            emit,
+        )
+
+    # 4. Run the per-stage training loop via existing sculpt_run.
+    # §Ship 19: warm_start_path = skill (if explicitly chosen by the
+    # decomposer) OR parent_ckpt (Ship 16 default) OR None (cold).
+    max_iters = iterations_override or stage.max_iterations
+    try:
+        sculpt_result = sculpt_run(
+            config_path=stage_dir / "config.toml",
+            behavior_goal=stage.goal_text,
+            iterations=max_iters,
+            steps_per_iter=steps_per_iter,
+            seed=seed,
+            init_policy_path=warm_start_path,
+        )
+    except KeyboardInterrupt:
+        # Caller saw Ctrl+C; surface to mission_run which emits
+        # mission_halted and re-raises.
+        stage.status = "failed"
+        stage.finished_at = _utc_now_iso()
+        raise
+    except Exception as e:  # noqa: BLE001
+        return _fail_stage(
+            stage, "training_errored",
+            f"sculpt_run raised: {type(e).__name__}: {e}",
+            emit,
+        )
+
+    stage.iterations_used = sculpt_result.iterations_run
+    emit({
+        "type": "stage_completed_training",
+        "stage_name": stage.name,
+        "iterations_run": sculpt_result.iterations_run,
+        "early_stopped": sculpt_result.early_stopped,
+    })
+
+    # 5. Derive final_policy_path from the last iter's checkpoint.
+    final_ckpt = _resolve_stage_final_checkpoint(sculpt_result)
+    if final_ckpt is None:
+        return _fail_stage(
+            stage, "no_checkpoint",
+            "training completed but no checkpoint.pt / .zip was "
+            "produced in the last iter — successor stages can't "
+            "warm-start from a missing file.",
+            emit,
+        )
+    stage.final_policy_path = str(final_ckpt)
+    stage.final_reward_path = (
+        str(sculpt_result.final_reward_path)
+        if sculpt_result.final_reward_path else None
+    )
+
+    # 6. Evaluate success criterion on the last iter's namespace.
+    last_iter = sculpt_result.completed_iters[-1]
+    stage.best_metric = last_iter.primary_metric
+    try:
+        namespace = _build_criterion_namespace(
+            iter_dir=last_iter.iter_dir,
+            primary_metric=last_iter.primary_metric,
+        )
+        criterion_ok = _evaluate_success_criterion(
+            stage.success_criterion, namespace,
+        )
+    except CriterionEvalError as e:
+        emit({
+            "type": "stage_criterion_evaluated",
+            "stage_name": stage.name,
+            "satisfied": False,
+            "error": str(e),
+        })
+        return _fail_stage(
+            stage, "criterion_errored", str(e), emit,
+            criterion_error=str(e),
+        )
+
+    emit({
+        "type": "stage_criterion_evaluated",
+        "stage_name": stage.name,
+        "criterion": stage.success_criterion,
+        "satisfied": bool(criterion_ok),
+        "last_iter_metric": last_iter.primary_metric,
+    })
+
+    if criterion_ok:
+        stage.status = "succeeded"
+        stage.finished_at = _utc_now_iso()
+        emit({
+            "type": "stage_succeeded",
+            "stage_name": stage.name,
+            "iterations_used": stage.iterations_used,
+            "final_policy_path": stage.final_policy_path,
+            "last_iter_metric": stage.best_metric,
+        })
+        # §Ship 19: publish a skill record to the cross-mission library
+        # AFTER stage success. Gates (stage status, redecomposition
+        # attempts, adapter capability, history non-empty) are
+        # enforced inside `maybe_publish` so the per-skip reason is
+        # observable. Re-loading the adapter here is cheap (already
+        # done at v1 materialization above) and lets us pass it for
+        # the warm-start-support introspection check. Library / IO
+        # errors emit `stage_skill_publish_skipped` and DO NOT break
+        # the stage's success outcome.
+        if skill_library_handle is not None:
+            try:
+                from sculptor.adapters.base import load_adapter
+                _adapter_for_publish = load_adapter(stage_dir / "config.toml")
+                skill_library_handle.maybe_publish(
+                    stage=stage,
+                    mission=mission,
+                    adapter=_adapter_for_publish,
+                    sculpt_result=sculpt_result,
+                    emit=emit,
+                )
+            except Exception as e:  # noqa: BLE001
+                emit({
+                    "type": "stage_skill_publish_skipped",
+                    "stage_name": stage.name,
+                    "reason": "publish_call_errored",
+                    "error": f"{type(e).__name__}: {e}",
+                })
+        return StageResult(
+            stage_name=stage.name, status="succeeded",
+            iterations_used=stage.iterations_used,
+            final_policy_path=stage.final_policy_path,
+            final_reward_path=stage.final_reward_path,
+            criterion_satisfied=True,
+            last_iter_metric=stage.best_metric,
+        )
+
+    return _fail_stage(
+        stage, "criterion_not_met",
+        f"success_criterion {stage.success_criterion!r} evaluated False "
+        f"on last iter (metric={last_iter.primary_metric}).",
+        emit,
+    )
+
+
+def _fail_stage(
+    stage, reason: str, detail: str, emit,
+    *,
+    criterion_error: Optional[str] = None,
+):
+    """Shared failure path used by every early-return in `_run_one_stage`."""
+    from sculptor.mission_runtime import StageResult
+
+    stage.status = "failed"
+    stage.finished_at = _utc_now_iso()
+    emit({
+        "type": "stage_failed",
+        "stage_name": stage.name,
+        "reason": reason,
+        "detail": detail,
+    })
+    return StageResult(
+        stage_name=stage.name, status="failed",
+        iterations_used=stage.iterations_used,
+        final_policy_path=stage.final_policy_path,
+        final_reward_path=stage.final_reward_path,
+        criterion_satisfied=False,
+        criterion_error=criterion_error,
+        last_iter_metric=stage.best_metric,
+        failure_reason=reason,
+    )
+
+
+def _utc_now_iso() -> str:
+    import datetime as _dt
+    return _dt.datetime.now(_dt.timezone.utc).isoformat()
+
+
+# ── Ship 17: redecomposition splice ─────────────────────────────────
+# Only criterion failures are re-decomposable. Infrastructure-class
+# failures (training_errored, no_checkpoint, adapter_mismatch,
+# scaffold_errored, v1_materialization_errored) signal env / code
+# issues that re-decomposition can't fix.
+_REDECOMPOSABLE_REASONS: frozenset[str] = frozenset({"criterion_not_met"})
+
+
+def _build_stage_training_feedback(
+    stage,
+    stage_res,
+    sculpt_result,
+):
+    """Pack the diagnostic info Claude needs to design a re-decomposition.
+
+    Reads from disk:
+      - the final reward module's source (verbatim Python).
+      - the last iter's diagnosis.json.
+      - the last 3 iters' component means (re-running
+        `_load_trajectory_arrays` for each).
+
+    All best-effort — partial reads degrade to empty values rather
+    than crash the redecomposition flow.
+    """
+    from sculptor.decompose import StageTrainingFeedback
+    from sculptor.mission_runtime import (
+        _build_criterion_namespace,
+        _load_trajectory_arrays,
+    )
+
+    # Final reward source.
+    final_reward_source = ""
+    if stage_res.final_reward_path:
+        try:
+            final_reward_source = Path(
+                stage_res.final_reward_path
+            ).read_text(encoding="utf-8")
+        except OSError:
+            pass
+
+    # Last iter's diagnosis + namespace.
+    last_iter = (
+        sculpt_result.completed_iters[-1]
+        if sculpt_result and sculpt_result.completed_iters else None
+    )
+    last_iter_diagnosis: dict = {}
+    last_iter_namespace: dict = {
+        "behavior": {}, "components": {}, "metric": stage_res.last_iter_metric,
+    }
+    if last_iter is not None:
+        diag_path = Path(last_iter.iter_dir) / "diagnosis.json"
+        if diag_path.is_file():
+            try:
+                last_iter_diagnosis = json.loads(
+                    diag_path.read_text(encoding="utf-8"),
+                )
+            except Exception:  # noqa: BLE001
+                last_iter_diagnosis = {}
+        try:
+            ns = _build_criterion_namespace(
+                Path(last_iter.iter_dir),
+                primary_metric=last_iter.primary_metric,
+            )
+            last_iter_namespace = {
+                "behavior": ns.get("behavior", {}),
+                "components": ns.get("components", {}),
+                "metric": ns.get("metric"),
+            }
+        except Exception:  # noqa: BLE001
+            pass
+
+    # Last-3-iter components (one dict per iter).
+    last_3_components: list[dict] = []
+    if sculpt_result and sculpt_result.completed_iters:
+        for outcome in sculpt_result.completed_iters[-3:]:
+            try:
+                _, comps = _load_trajectory_arrays(Path(outcome.iter_dir))
+                last_3_components.append({
+                    "iter": outcome.iter_index,
+                    "components": comps,
+                })
+            except Exception:  # noqa: BLE001
+                last_3_components.append({
+                    "iter": outcome.iter_index, "components": {},
+                })
+
+    metric_history = (
+        list(sculpt_result.primary_metric_history)
+        if sculpt_result and sculpt_result.primary_metric_history else []
+    )
+
+    return StageTrainingFeedback(
+        final_reward_source=final_reward_source,
+        last_iter_diagnosis=last_iter_diagnosis,
+        last_iter_namespace=last_iter_namespace,
+        metric_history=metric_history,
+        last_3_iter_components=last_3_components,
+        failure_reason=stage_res.failure_reason or "criterion_not_met",
+        criterion_error=stage_res.criterion_error,
+    )
+
+
+def _repoint_downstream_children(
+    stages: list, old_parent_name: str, new_parent_name: str,
+    *, slice_start: int,
+) -> int:
+    """Walk `stages[slice_start:]` and rewrite any `parent_stage ==
+    old_parent_name` → `new_parent_name`. Returns the count of
+    re-pointings done. Critical reviewer-flagged step: without this,
+    `validate_mission` raises on the spliced graph because the failed
+    stage's name no longer exists.
+    """
+    n = 0
+    for s in stages[slice_start:]:
+        if s.parent_stage == old_parent_name:
+            s.parent_stage = new_parent_name
+            n += 1
+    return n
+
+
+def _maybe_redecompose_and_splice(
+    *,
+    mission,
+    mission_dir: Path,
+    failed_stage_idx: int,
+    stage_res,
+    kg_store,
+    emit,
+) -> bool:
+    """Try to re-decompose the failed stage into 2-8 sub-stages and
+    splice them into `mission.stages`. Returns True on success, False
+    if redecomposition was skipped or failed.
+
+    Side effects on success:
+      * `mission.stages[failed_stage_idx:failed_stage_idx+1]` replaced
+        by sub-stages.
+      * Downstream children's `parent_stage` references re-pointed
+        from `failed.name` to the LAST sub-stage's name.
+      * `mission.current_stage_idx` set to `failed_stage_idx` so the
+        while-loop processes the first sub-stage next.
+      * mission.json persisted atomically.
+      * `stage_redecomposed` event emitted.
+
+    On failure: emits `stage_redecomposition_failed` and returns False.
+    Caller halts the mission cleanly (no Claude retry — same envelope
+    as decompose_task).
+    """
+    from sculptor.decompose import (
+        DecompositionError,
+        StageTrainingFeedback,
+        redecompose_stage,
+    )
+    from sculptor.mission import MissionValidationError, validate_mission
+
+    failed_stage = mission.stages[failed_stage_idx]
+
+    # Trigger conditions: only criterion failures, and only if the
+    # stage hasn't been re-decomposed before.
+    if failed_stage.redecomposition_attempts >= 1:
+        emit({
+            "type": "redecomposition_skipped",
+            "stage_name": failed_stage.name,
+            "reason": "budget_exhausted",
+            "detail": (
+                f"stage already used its redecomposition budget "
+                f"({failed_stage.redecomposition_attempts}); "
+                "halting per Ship 17's one-level cap."
+            ),
+        })
+        return False
+    reason = stage_res.failure_reason or ""
+    if reason not in _REDECOMPOSABLE_REASONS:
+        emit({
+            "type": "redecomposition_skipped",
+            "stage_name": failed_stage.name,
+            "reason": "non_curriculum_failure",
+            "detail": (
+                f"failure_reason={reason!r} signals an env/code issue "
+                f"(not a curriculum mismatch). Re-decomposition won't "
+                f"help; halting."
+            ),
+        })
+        return False
+
+    # Build training feedback.
+    # The stage's training was wrapped by `_run_one_stage`; we don't
+    # have the SculptRunResult in scope here — `stage_res` is the
+    # post-train summary. Best-effort reconstruct from on-disk state.
+    feedback = _build_stage_training_feedback(
+        failed_stage, stage_res, sculpt_result=None,
+    )
+    # The reconstruct from `stage_res` alone misses metric_history; the
+    # caller path doesn't currently thread `sculpt_result` here, so
+    # we pull the history from the stage's iter dirs as a fallback.
+    if not feedback.metric_history:
+        feedback.metric_history = _scan_iter_metric_history(
+            mission, failed_stage,
+        )
+
+    emit({
+        "type": "stage_redecomposition_started",
+        "stage_name": failed_stage.name,
+        "stage_index": failed_stage_idx,
+        "trigger_reason": reason,
+    })
+
+    # Audit-fix (Ship 17 review, finding #E): surface partial-feedback
+    # state so the user knows when Claude saw incomplete training
+    # context (vs. seeing complete context with empty signals).
+    missing_signals: list[str] = []
+    if not feedback.final_reward_source:
+        missing_signals.append("final_reward_source")
+    if not feedback.last_iter_diagnosis:
+        missing_signals.append("last_iter_diagnosis")
+    if not feedback.metric_history:
+        missing_signals.append("metric_history")
+    if not feedback.last_3_iter_components:
+        missing_signals.append("last_3_iter_components")
+    if missing_signals:
+        emit({
+            "type": "feedback_read_degraded",
+            "stage_name": failed_stage.name,
+            "missing_signals": missing_signals,
+            "detail": (
+                f"Claude will see partial training feedback for this "
+                f"redecomposition. Missing: {missing_signals}. "
+                f"Result quality may degrade."
+            ),
+        })
+
+    # Resolve adapter contract from the stage's config.toml.
+    try:
+        from sculptor.adapters.base import load_adapter
+        stage_dir = mission.stage_dir(failed_stage.name)
+        adapter = load_adapter(stage_dir / "config.toml")
+        reward_contract = adapter.reward_contract()
+    except Exception as e:  # noqa: BLE001
+        emit({
+            "type": "stage_redecomposition_failed",
+            "stage_name": failed_stage.name,
+            "reason": "adapter_load_failed",
+            "detail": f"{type(e).__name__}: {e}",
+        })
+        return False
+
+    # Call Claude.
+    try:
+        sub_stages = redecompose_stage(
+            mission, failed_stage_idx,
+            feedback=feedback,
+            reward_contract=reward_contract,
+            kg_store=kg_store,
+        )
+    except (MissionValidationError, DecompositionError) as e:
+        emit({
+            "type": "stage_redecomposition_failed",
+            "stage_name": failed_stage.name,
+            "reason": "validation_failed",
+            "detail": f"{type(e).__name__}: {e}",
+        })
+        return False
+    except Exception as e:  # noqa: BLE001
+        emit({
+            "type": "stage_redecomposition_failed",
+            "stage_name": failed_stage.name,
+            "reason": "claude_call_errored",
+            "detail": f"{type(e).__name__}: {e}",
+        })
+        return False
+
+    if not sub_stages:
+        emit({
+            "type": "stage_redecomposition_failed",
+            "stage_name": failed_stage.name,
+            "reason": "empty_substages",
+        })
+        return False
+
+    last_sub_name = sub_stages[-1].name
+
+    # Splice: replace the failed stage with sub-stages, repoint downstream.
+    mission.stages[failed_stage_idx:failed_stage_idx + 1] = sub_stages
+    repointed = _repoint_downstream_children(
+        mission.stages, failed_stage.name, last_sub_name,
+        slice_start=failed_stage_idx + len(sub_stages),
+    )
+
+    # Validate the spliced mission. If this raises, restore the failed
+    # stage and halt. Do NOT leave the mission in a half-spliced state.
+    info_keys = set(getattr(reward_contract, "expected_info_keys", None) or [])
+    try:
+        validate_mission(mission, info_keys=info_keys)
+    except MissionValidationError as e:
+        # Roll back the splice.
+        mission.stages[failed_stage_idx:failed_stage_idx + len(sub_stages)] = [failed_stage]
+        emit({
+            "type": "stage_redecomposition_failed",
+            "stage_name": failed_stage.name,
+            "reason": "spliced_mission_invalid",
+            "detail": f"{type(e).__name__}: {e}",
+        })
+        return False
+
+    # Reviewer-flagged: persist current_stage_idx BEFORE the splice so
+    # a crash-resume starts at the first new sub-stage rather than
+    # skipping ahead.
+    mission.current_stage_idx = failed_stage_idx
+
+    # Audit-fix (Ship 17 review, finding #A): if `_atomic_save_mission`
+    # fails (disk full / permissions / EIO), the in-memory mission has
+    # the new sub-stages but on-disk still shows the old failed stage.
+    # On resume we'd re-train the failed stage and re-call Claude for
+    # a (possibly different) re-decomposition — divergence from user
+    # expectations. Rollback the in-memory splice on save failure so
+    # in-memory and on-disk stay consistent, and emit a clear event.
+    try:
+        _atomic_save_mission(mission, mission_dir)
+    except OSError as e:
+        # Roll back in-memory splice + parent re-pointing.
+        mission.stages[failed_stage_idx:failed_stage_idx + len(sub_stages)] = [failed_stage]
+        # Restore downstream children's parent_stage to the failed name.
+        for s in mission.stages[failed_stage_idx + 1:]:
+            if s.parent_stage == last_sub_name:
+                s.parent_stage = failed_stage.name
+        emit({
+            "type": "stage_redecomposition_failed",
+            "stage_name": failed_stage.name,
+            "reason": "save_failed",
+            "detail": (
+                f"splice succeeded in-memory but persisting "
+                f"mission.json failed ({type(e).__name__}: {e}); "
+                f"rolled back to old state. Free disk / fix "
+                f"permissions and re-run."
+            ),
+        })
+        return False
+
+    emit({
+        "type": "stage_redecomposed",
+        "original_stage_name": failed_stage.name,
+        "stage_index": failed_stage_idx,
+        "sub_stage_names": [s.name for s in sub_stages],
+        "downstream_children_repointed": repointed,
+    })
+    return True
+
+
+def _scan_iter_metric_history(mission, stage) -> list[float]:
+    """Best-effort: read each `runs/iter_N/metrics.json` (or rollout/
+    behavior.json if metrics is missing) for the stage's project dir
+    and return the per-iter primary_metric series. Used by the
+    redecomposition feedback when SculptRunResult isn't in scope."""
+    history: list[float] = []
+    try:
+        stage_dir = mission.stage_dir(stage.name)
+    except Exception:  # noqa: BLE001
+        return history
+    runs_dir = stage_dir / "runs"
+    if not runs_dir.is_dir():
+        return history
+    # Audit-fix (Ship 17 review, finding #B): sort by numeric suffix.
+    # Use `+inf` as the fallback for malformed names (e.g.,
+    # `iter_10_backup`) so corrupted dirs sort to the END and don't
+    # shadow legitimate iter_0..iter_N entries. Pre-fix `else -1`
+    # would have ranked them BEFORE iter_0, polluting the metric
+    # history Claude sees.
+    def _iter_sort_key(p: Path) -> float:
+        suffix = p.name.split("_")[-1]
+        return int(suffix) if suffix.isdigit() else float("inf")
+
+    iter_dirs = sorted(
+        (p for p in runs_dir.iterdir()
+         if p.is_dir() and p.name.startswith("iter_")),
+        key=_iter_sort_key,
+    )
+    for d in iter_dirs:
+        for path in (d / "rollout" / "behavior.json", d / "behavior.json"):
+            if path.is_file():
+                try:
+                    payload = json.loads(path.read_text(encoding="utf-8"))
+                    val = payload.get("mean_return")
+                    if isinstance(val, (int, float)):
+                        history.append(float(val))
+                        break
+                except Exception:  # noqa: BLE001
+                    pass
+    return history
 
 
 def regenerate_reward_template(project_dir: Path | str) -> Path:

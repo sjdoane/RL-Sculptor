@@ -9,7 +9,7 @@ store (see `sculptor.kg.store.SculptorKG`).
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import typer
 
@@ -347,6 +347,336 @@ def viz(
 ):
     """Render a time-lapse + changelog HTML for a completed (or live) run."""
     typer.echo(f"sculpt viz: not implemented yet (would write {out}).")
+
+
+# ── Mission subcommands (Ship 18a) ───────────────────────────────────
+@app.command("mission-init")
+def mission_init(
+    project_dir: Path = typer.Argument(
+        ..., exists=True, file_okay=False, dir_okay=True,
+        help="Existing sculpt project directory (must contain config.toml).",
+    ),
+    goal: str = typer.Option(
+        ..., "--goal", "-g",
+        help="Behavior goal for the mission (Claude decomposes into stages).",
+    ),
+    mission_slug: Optional[str] = typer.Option(
+        None, "--slug",
+        help=(
+            "Override the auto-derived slug. The mission lives at "
+            "<project_dir>/.missions/<slug>/. Defaults to a slug "
+            "derived from the goal."
+        ),
+    ),
+    no_kg: bool = typer.Option(
+        False, "--no-kg",
+        help="Skip KG context to Claude (faster, less grounded).",
+    ),
+    no_skill_library: bool = typer.Option(
+        False, "--no-skill-library",
+        help=(
+            "Skip the cross-mission skill library. Default: ON — Claude "
+            "sees up to 5 prior-mission policies compatible with the "
+            "project's adapter+task_id and may warm-start a stage from "
+            "one. Ship 19."
+        ),
+    ),
+    skill_library_root: Optional[Path] = typer.Option(
+        None, "--skill-library-root",
+        help=(
+            "Override the on-disk root for the skill library. Default: "
+            "$SCULPTOR_SKILL_LIBRARY_ROOT or ~/.local/share/sculptor/skills/."
+        ),
+    ),
+):
+    """Decompose a goal into a mission curriculum (Ship 14 + 17).
+
+    Reads the project's config.toml to load the adapter, asks Claude
+    to decompose the goal into 2-8 stages, validates the result, and
+    writes `<project_dir>/.missions/<mission_slug>/mission.json`.
+    Also emits `[SCULPT-EVENT] mission_initialized` to stdout so the
+    backend's job-manager can capture mission_slug.
+    """
+    import json as _json
+    from sculptor.adapters.base import load_adapter
+    from sculptor.decompose import decompose_task
+    from sculptor.kg.store import SculptorKG
+    from sculptor.mission import save_mission
+
+    config_path = project_dir / "config.toml"
+    if not config_path.is_file():
+        typer.echo(
+            f"[mission-init] error: {config_path} not found — "
+            "is this a sculpt project?", err=True,
+        )
+        raise typer.Exit(code=2)
+
+    adapter = load_adapter(config_path)
+    reward_contract = adapter.reward_contract()
+
+    # Resolve mission slug: use explicit override OR derive + collide-resolve.
+    missions_root = project_dir / ".missions"
+    missions_root.mkdir(parents=True, exist_ok=True)
+    existing_slugs = {p.name for p in missions_root.iterdir() if p.is_dir()}
+    if mission_slug is None:
+        mission_slug = _derive_mission_slug(goal, existing_slugs)
+    elif mission_slug in existing_slugs:
+        typer.echo(
+            f"[mission-init] error: mission slug {mission_slug!r} "
+            f"already exists in {missions_root}.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    # §Ship 19: build a skill-library handle from the project's
+    # adapter + task_id, unless `--no-skill-library` was passed.
+    handle = (
+        None if no_skill_library
+        else _build_skill_library_handle(
+            config_path, library_root=skill_library_root,
+        )
+    )
+
+    # Open KG (optional).
+    kg_store = None if no_kg else SculptorKG()
+    try:
+        mission = decompose_task(
+            goal, reward_contract, kg_store=kg_store,
+            skill_library_handle=handle,
+        )
+    finally:
+        if kg_store is not None:
+            kg_store.close()
+
+    mission_dir = missions_root / mission_slug
+    mission.mission_dir = str(mission_dir.resolve())
+    save_mission(mission, mission_dir)
+
+    print(
+        "[SCULPT-EVENT] " + _json.dumps({
+            "type": "mission_initialized",
+            "mission_slug": mission_slug,
+            "n_stages": len(mission.stages),
+            "mission_dir": str(mission_dir.resolve()),
+        }),
+        flush=True,
+    )
+    typer.echo(
+        f"[mission-init] decomposed into {len(mission.stages)} stages "
+        f"at {mission_dir}"
+    )
+
+
+def _build_skill_library_handle(
+    config_path: Path,
+    *,
+    library_root: Optional[Path],
+) -> Optional[Any]:
+    """Construct a `SkillLibraryHandle` from a project's config.toml.
+
+    Reads the adapter dotted-path + the `task_id` from `[adapter.config]`
+    (mjlab convention; other adapters typically use `env_id` and won't
+    match the library's lookup, but their writes are still gated on
+    `adapter.train` accepting `init_policy_path` so nothing harmful
+    is published).
+
+    Returns None on read failure — the CLI continues without the
+    library rather than crash, matching the "skill library is a
+    soft feature" v1 stance.
+    """
+    try:
+        try:
+            import tomllib
+        except ModuleNotFoundError:  # pragma: no cover
+            import tomli as tomllib  # type: ignore[no-redef]
+        with config_path.open("rb") as f:
+            cfg = tomllib.load(f)
+    except Exception as e:  # noqa: BLE001
+        typer.echo(
+            f"[skill-library] disabled — failed to read {config_path}: {e}",
+            err=True,
+        )
+        return None
+
+    adapter_section = (cfg.get("adapter") or {})
+    adapter_class = (adapter_section.get("class") or "").strip()
+    adapter_cfg = adapter_section.get("config") or {}
+    task_id = (
+        str(adapter_cfg.get("task_id")
+            or adapter_cfg.get("env_id")
+            or "").strip()
+    )
+    if not adapter_class or not task_id:
+        typer.echo(
+            "[skill-library] disabled — config.toml lacks "
+            "[adapter].class or [adapter.config].task_id/env_id.",
+            err=True,
+        )
+        return None
+
+    from sculptor.skill_library import SkillLibrary, SkillLibraryHandle
+
+    library = SkillLibrary(root=library_root) if library_root else SkillLibrary()
+    return SkillLibraryHandle(
+        library=library,
+        adapter_class=adapter_class,
+        task_id=task_id,
+        robot_slug=None,  # CLI doesn't know UI's library_slug; UI may
+                          # set this when it grows a Ship 19b surface.
+        publish=True,
+    )
+
+
+def _derive_mission_slug(goal: str, existing: set[str]) -> str:
+    """Slug derivation mirroring project_store._ensure_unique_slug
+    (per Ship 18a plan-review). Conservative slugify + integer suffix
+    on collision; never produces empty slugs.
+
+    Audit cross-reference (#C): KEEP IN SYNC with
+    `reward-sculptor-ui/backend/services/mission_store._slugify` and
+    `derive_unique_mission_slug` — both must produce the same slug
+    for the same goal so a CLI-created mission and a REST-created
+    mission can be looked up consistently.
+    """
+    import re as _re
+    # ASCII-only snake-case; collapse whitespace + non-word.
+    cleaned = _re.sub(r"[^a-z0-9]+", "-", goal.lower()).strip("-")
+    # Cap length so the full path stays comfortable.
+    base = cleaned[:32].rstrip("-") if cleaned else "mission"
+    if not base:
+        base = "mission"
+    candidate = base
+    n = 2
+    while candidate in existing:
+        candidate = f"{base}-{n}"
+        n += 1
+    return candidate
+
+
+@app.command("mission-run")
+def mission_run_cli(
+    project_dir: Path = typer.Argument(
+        ..., exists=True, file_okay=False, dir_okay=True,
+    ),
+    mission_slug: Optional[str] = typer.Argument(
+        None,
+        help=(
+            "Mission slug under <project_dir>/.missions/. If omitted "
+            "AND there is exactly one mission, it's auto-resolved."
+        ),
+    ),
+    no_skill_library: bool = typer.Option(
+        False, "--no-skill-library",
+        help=(
+            "Skip the cross-mission skill library. Default: ON — "
+            "successful stages publish to the library; stages with a "
+            "Claude-set `init_skill_id` are warm-started from it. "
+            "Ship 19."
+        ),
+    ),
+    skill_library_root: Optional[Path] = typer.Option(
+        None, "--skill-library-root",
+        help=(
+            "Override the on-disk root for the skill library. Default: "
+            "$SCULPTOR_SKILL_LIBRARY_ROOT or ~/.local/share/sculptor/skills/."
+        ),
+    ),
+):
+    """Run a previously-initialized mission end-to-end.
+
+    Loads `<project_dir>/.missions/<mission_slug>/mission.json`,
+    resolves the project's adapter, and calls `mission_run` from
+    Ship 16/17 — which iterates stages, materializes v1 from each
+    stage's seed prompt, calls sculpt_run with warm-start, evaluates
+    success criteria, and re-decomposes on failure.
+    """
+    from sculptor.adapters.base import load_adapter
+    from sculptor.kg.store import SculptorKG
+    from sculptor.mission import load_mission
+    from sculptor.sculpt import mission_run
+
+    missions_root = project_dir / ".missions"
+    if not missions_root.is_dir():
+        typer.echo(
+            f"[mission-run] error: no missions in {missions_root}",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    if mission_slug is None:
+        slugs = [p.name for p in missions_root.iterdir() if p.is_dir()]
+        if len(slugs) == 1:
+            mission_slug = slugs[0]
+            typer.echo(f"[mission-run] auto-resolved slug: {mission_slug}")
+        else:
+            typer.echo(
+                f"[mission-run] error: {len(slugs)} missions in "
+                f"{missions_root}; specify --slug. Found: {slugs}",
+                err=True,
+            )
+            raise typer.Exit(code=2)
+
+    mission_path = missions_root / mission_slug
+    if not (mission_path / "mission.json").is_file():
+        typer.echo(
+            f"[mission-run] error: {mission_path / 'mission.json'} not found",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+
+    mission = load_mission(mission_path)
+    # Resolve adapter short-name from project config.
+    config_path = project_dir / "config.toml"
+    try:
+        try:
+            import tomllib
+        except ModuleNotFoundError:  # pragma: no cover
+            import tomli as tomllib  # type: ignore[no-redef]
+        with config_path.open("rb") as f:
+            cfg = tomllib.load(f)
+        adapter_dotted = ((cfg.get("adapter") or {}).get("class") or "").strip()
+    except Exception as e:  # noqa: BLE001
+        typer.echo(
+            f"[mission-run] error: failed to read {config_path}: {e}",
+            err=True,
+        )
+        raise typer.Exit(code=2) from e
+
+    # Reverse-resolve dotted-path → short-name. Mirrors sculpt.py's
+    # `_ADAPTER_SHORT_NAMES` mapping; falls back to the dotted name.
+    from sculptor.sculpt import _ADAPTER_SHORT_NAMES
+    short_name = next(
+        (k for k, v in _ADAPTER_SHORT_NAMES.items() if v == adapter_dotted),
+        adapter_dotted,
+    )
+
+    # §Ship 19: build a skill-library handle from the project's
+    # adapter + task_id, unless `--no-skill-library` was passed.
+    handle = (
+        None if no_skill_library
+        else _build_skill_library_handle(
+            config_path, library_root=skill_library_root,
+        )
+    )
+
+    kg_store = SculptorKG()
+    try:
+        result = mission_run(
+            mission,
+            adapter_short_name=short_name,
+            kg_store=kg_store,
+            skill_library_handle=handle,
+        )
+    finally:
+        kg_store.close()
+
+    typer.echo(
+        f"[mission-run] completed={result.completed}; "
+        f"halted_at={result.halted_at_stage}; "
+        f"reason={result.halted_reason}"
+    )
+    if not result.completed:
+        raise typer.Exit(code=1)
 
 
 @app.command()
