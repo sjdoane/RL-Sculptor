@@ -18,7 +18,29 @@ import {
 } from "@/hooks/useMissions";
 import { ApiError } from "@/lib/api";
 import { cn, formatRelative } from "@/lib/utils";
-import type { MissionSummary } from "@/lib/types";
+import type { MissionJobKind, MissionSummary } from "@/lib/types";
+
+// §Ship 20 Goal #4: replace internal `MISSION_EXECUTE` / `MISSION_
+// DECOMPOSE` enum chips with English labels. The CLI/backend keep the
+// internal kind names; this is purely the user-facing string.
+function missionJobKindLabel(kind: MissionJobKind | null): string {
+  if (kind === "mission_decompose") return "Planning";
+  if (kind === "mission_execute") return "Training";
+  return "active";
+}
+
+// §Ship 20 Goal #4: lifecycle-aware progress label so `0/3 stages`
+// (which reads as a test failure) becomes phrasing that fits the
+// state. Kept in sync with RunsTab.tsx's `missionRunStateLabel` so
+// the same mission reads the same way across tabs.
+function stageProgressLabel(m: MissionSummary): string {
+  const { current_stage_idx: i, n_stages: n, lifecycle } = m;
+  if (n === 0) return "Planning…";
+  if (lifecycle === "ready" && i === 0) return `${n} stages planned`;
+  if (lifecycle === "completed") return `${n} of ${n} stages complete`;
+  if (lifecycle === "running") return `Stage ${i + 1} of ${n}`;
+  return `${i} of ${n} stages complete`;
+}
 
 export function MissionsTab({ slug }: { slug: string }) {
   const list = useMissions(slug);
@@ -37,10 +59,8 @@ export function MissionsTab({ slug }: { slug: string }) {
           <div>
             <CardTitle className="text-sm">Missions</CardTitle>
             <CardDescription className="text-[11px]">
-              Claude decomposes a goal into a curriculum of stages, then
-              chains warm-started <code>sculpt run</code> jobs across
-              them. Mission state persists in{" "}
-              <code>.missions/&lt;slug&gt;/mission.json</code>.
+              Define a goal. Claude breaks it into stages and trains
+              them in order, warm-starting each from the previous.
             </CardDescription>
           </div>
           <NewMissionDialog
@@ -135,27 +155,27 @@ function MissionRow({
       >
         <div className="flex flex-wrap items-center gap-2">
           <MissionLifecycleBadge lifecycle={mission.lifecycle} />
-          <code className="truncate font-mono text-[11px] text-muted-foreground">
-            {mission.mission_slug}
-          </code>
           {hasActiveJob && (
             <span className="rounded bg-amber-50 px-1 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-amber-700 ring-1 ring-amber-200">
-              {mission.active_job_kind ?? "active"}
+              {missionJobKindLabel(mission.active_job_kind)}
             </span>
           )}
         </div>
         <div
           className="line-clamp-2 text-xs"
-          title={isErrored ? mission.goal : mission.goal}
+          title={mission.goal}
         >
           {mission.goal}
         </div>
         <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-[10.5px] text-muted-foreground">
-          <span>
-            {mission.current_stage_idx}/{mission.n_stages} stages
-          </span>
+          <span>{stageProgressLabel(mission)}</span>
           <span>{formatRelative(mission.created_at)}</span>
-          <span className="font-mono">{mission.decomposition_model}</span>
+          <code
+            className="truncate font-mono text-[10px]"
+            title={`mission slug: ${mission.mission_slug}`}
+          >
+            {mission.mission_slug}
+          </code>
         </div>
       </button>
 
@@ -169,10 +189,10 @@ function MissionRow({
               isErrored
                 ? "Mission is errored; only Delete is available."
                 : mission.lifecycle !== "ready"
-                  ? `Lifecycle is ${mission.lifecycle}; run is only allowed when ready.`
+                  ? `Run is only allowed once decomposition finishes (currently ${mission.lifecycle}).`
                   : hasActiveJob
-                    ? "An active job is already running."
-                    : "Open mission detail to configure run."
+                    ? "Already training. Wait for the run to finish."
+                    : "Open mission to configure and launch a run."
             }
             onClick={onOpen}
           >
@@ -186,7 +206,7 @@ function MissionRow({
           disabled={!canDelete || del.isPending}
           title={
             hasActiveJob
-              ? "An active job is running. Wait for it to finish."
+              ? "Already training. Wait for the run to finish."
               : undefined
           }
           onClick={() => {

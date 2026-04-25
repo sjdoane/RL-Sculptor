@@ -934,6 +934,88 @@ def test_mission_run_stage_started_event_includes_stage_dir(
     assert started[0]["stage_dir"].endswith("/stages/stage_0")
 
 
+def test_mission_run_stage_events_include_effective_max_iterations(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """§Ship 20 Goal #2 regression: when `iterations_override` is set,
+    both `stage_started` and `stage_completed_training` events must
+    carry `effective_max_iterations` so the UI can render `iters X/Y`
+    against the cap that was actually enforced — not the authored
+    `stage.max_iterations`. Pre-fix the dialog showed nonsense like
+    `iters 2/3` when override capped the run at 2.
+
+    Also asserts the authored `max_iterations` is preserved in the
+    payload (we surface BOTH so the UI can show a tooltip explaining
+    the override.)
+    """
+    from sculptor import sculpt as sculpt_mod
+
+    # stage.max_iterations=2 (authored); iterations_override=1.
+    m = _make_mission(tmp_path, n_stages=1)
+    assert m.stages[0].max_iterations == 2
+    monkeypatch.setattr(
+        sculpt_mod, "sculpt_run", _fake_sculpt_run_factory(metric=0.9),
+    )
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
+    )
+
+    events: list[dict] = []
+    sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab",
+        on_event=events.append,
+        iterations_override=1,
+    )
+
+    started = [e for e in events if e.get("type") == "stage_started"]
+    assert started, "missing stage_started event"
+    assert started[0].get("effective_max_iterations") == 1, (
+        f"effective_max_iterations should reflect override (1), got "
+        f"{started[0].get('effective_max_iterations')}"
+    )
+    assert started[0].get("max_iterations") == 2, (
+        "authored max_iterations should still be in the payload"
+    )
+
+    completed = [
+        e for e in events if e.get("type") == "stage_completed_training"
+    ]
+    assert completed, "missing stage_completed_training event"
+    assert completed[0].get("effective_max_iterations") == 1, (
+        f"stage_completed_training should also surface effective cap, "
+        f"got {completed[0].get('effective_max_iterations')}"
+    )
+
+
+def test_mission_run_effective_max_iterations_falls_back_to_authored(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """§Ship 20 Goal #2: when `iterations_override` is None (the
+    default), `effective_max_iterations` should equal the authored
+    `stage.max_iterations`. This is the no-override path — UI shows
+    the same number for both fields and no tooltip differentiation
+    fires.
+    """
+    from sculptor import sculpt as sculpt_mod
+
+    m = _make_mission(tmp_path, n_stages=1)
+    monkeypatch.setattr(
+        sculpt_mod, "sculpt_run", _fake_sculpt_run_factory(metric=0.9),
+    )
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
+    )
+
+    events: list[dict] = []
+    sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab", on_event=events.append,
+    )
+
+    started = [e for e in events if e.get("type") == "stage_started"]
+    assert started
+    assert started[0]["effective_max_iterations"] == m.stages[0].max_iterations
+
+
 def test_mission_run_lock_release_allows_reentry(
     tmp_path: Path, monkeypatch, stub_adapter,
 ):

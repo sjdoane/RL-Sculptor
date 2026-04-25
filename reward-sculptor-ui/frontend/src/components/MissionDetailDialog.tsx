@@ -109,6 +109,21 @@ export function MissionDetailDialog({
     [events.structuredEvents],
   );
 
+  // §Ship 20 Goal #2: derive each stage's *effective* max iterations
+  // from the WS event stream. When the user passed `iterations_
+  // override` to RunMissionDialog, the stage runs against that cap,
+  // not the authored `stage.max_iterations` — but the persisted
+  // mission.json doesn't reflect the override (by design: the
+  // override is per-launch, not curriculum-level). stage_started +
+  // stage_completed_training carry `effective_max_iterations`; we
+  // walk events to map stage_name → effective cap. StageCard reads
+  // this map and shows a tooltip when the cap differs from the
+  // authored value.
+  const stageEffectiveMaxIters = useMemo(
+    () => deriveStageEffectiveMaxIters(events.structuredEvents),
+    [events.structuredEvents],
+  );
+
   return (
     <Dialog open={open} onOpenChange={onOpenChange}>
       <DialogContent className="flex max-h-[90vh] flex-col gap-4 sm:max-w-3xl">
@@ -142,12 +157,11 @@ export function MissionDetailDialog({
               <Loader2 className="mt-0.5 h-4 w-4 shrink-0 animate-spin text-amber-700" />
               <div>
                 <div className="font-medium text-amber-700 dark:text-amber-300">
-                  Decomposing — Claude is building the curriculum
+                  Planning — Claude is breaking your goal into stages
                 </div>
                 <p className="mt-0.5 text-[11px] text-muted-foreground">
-                  Typically 30-90 s. Stages will appear here when the
-                  decompose job completes; the live event stream below
-                  shows progress in real time.
+                  Typically 30-90 s. Stages will appear here when
+                  planning finishes. Live progress streams below.
                 </p>
               </div>
             </div>
@@ -197,6 +211,9 @@ export function MissionDetailDialog({
                     depth={stageDepths.get(s.name) ?? 0}
                     isCurrent={idx === mission.current_stage_idx}
                     iters={stageIters.get(s.name) ?? []}
+                    effectiveMaxIters={
+                      stageEffectiveMaxIters.get(s.name) ?? null
+                    }
                   />
                 ))}
               </div>
@@ -216,13 +233,12 @@ export function MissionDetailDialog({
 
               {events.disconnected && !events.terminal && (
                 <div className="rounded border border-amber-500/40 bg-amber-500/5 p-2 text-[11px] text-amber-800 dark:text-amber-200">
-                  WebSocket disconnected — refresh the page to retry.
-                  (Auto-reconnect lands in Ship 18c.)
+                  Live stream interrupted. Refresh to reconnect.
                 </div>
               )}
               {events.noActiveJob && (
                 <div className="rounded border bg-muted/30 p-2 text-[11px] text-muted-foreground">
-                  No active job — events from prior runs are not replayed.
+                  Nothing running. Launch a run to watch live events.
                 </div>
               )}
 
@@ -247,9 +263,9 @@ export function MissionDetailDialog({
               }
               disabledTitle={
                 mission.lifecycle !== "ready"
-                  ? `Lifecycle is ${mission.lifecycle}; run is only allowed when ready.`
+                  ? `Run is only allowed once planning finishes (currently ${mission.lifecycle}).`
                   : activeJobId
-                    ? "An active job is already running for this mission."
+                    ? "Already training. Wait for the run to finish."
                     : undefined
               }
             />
@@ -284,7 +300,7 @@ export function MissionDetailDialog({
               disabled={del.isPending || activeJobId != null}
               title={
                 activeJobId
-                  ? "An active job is running. Wait for it to finish before deleting."
+                  ? "Already training. Wait for the run to finish before deleting."
                   : undefined
               }
             >
@@ -512,18 +528,65 @@ function deriveStageIters(
   return out;
 }
 
+// §Ship 20 Goal #2: walk events for stage_started + stage_completed_
+// training entries, return Map<stage_name, effective_max_iterations>.
+// We update on the latest seen value per stage so a re-run within
+// the same WS session shows the new cap. "Last value wins" is fine
+// because (a) within one mission_run the cap is constant per stage,
+// (b) re-runs of the same mission emit a new stage_started before
+// any new iter events, so the new cap is in place before anything
+// else displays.
+//
+// Known limitation: if the structuredEvents 5000-cap (see
+// useMissionEvents.ts) evicts the original stage_started before the
+// run completes, the UI falls back to `stage.max_iterations` and the
+// override tooltip won't fire. Acceptable for v1 — typical missions
+// emit far fewer than 5000 events.
+function deriveStageEffectiveMaxIters(
+  events: MissionEvent[],
+): Map<string, number> {
+  const out = new Map<string, number>();
+  for (const ev of events) {
+    if (
+      ev.type === "stage_started" ||
+      ev.type === "stage_completed_training"
+    ) {
+      const name = (ev as { stage_name?: string }).stage_name;
+      const eff = (ev as { effective_max_iterations?: number })
+        .effective_max_iterations;
+      if (typeof name === "string" && typeof eff === "number") {
+        out.set(name, eff);
+      }
+    }
+  }
+  return out;
+}
+
 function StageCard({
   stage,
   depth,
   isCurrent,
   iters,
+  effectiveMaxIters,
 }: {
   stage: StageSchema;
   depth: number;
   isCurrent: boolean;
   iters: IterRow[];
+  /** Cap actually enforced for this stage's last/current run. Null
+   *  when no run has reported in yet (no stage_started event seen).
+   *  When non-null and != stage.max_iterations, the user passed
+   *  `iterations_override` and we surface a tooltip explaining. */
+  effectiveMaxIters: number | null;
 }) {
   const orphan = stage.parent_stage !== null && depth === 0;
+  const displayMax = effectiveMaxIters ?? stage.max_iterations;
+  const overrideActive =
+    effectiveMaxIters !== null &&
+    effectiveMaxIters !== stage.max_iterations;
+  const itersTooltip = overrideActive
+    ? `Claude allocated ${stage.max_iterations} rounds; this run capped at ${effectiveMaxIters}.`
+    : undefined;
   return (
     <div
       className={cn(
@@ -547,7 +610,7 @@ function StageCard({
             variant="outline"
             className="border-amber-500/40 bg-amber-500/10 text-[9px] text-amber-700"
           >
-            orphan parent_ref
+            Missing parent stage
           </Badge>
         )}
         {stage.redecomposition_attempts > 0 && (
@@ -555,7 +618,7 @@ function StageCard({
             variant="outline"
             className="border-purple-500/40 bg-purple-500/10 text-[9px] text-purple-700"
           >
-            redecomp ×{stage.redecomposition_attempts}
+            replanned ×{stage.redecomposition_attempts}
           </Badge>
         )}
       </div>
@@ -564,8 +627,22 @@ function StageCard({
         {stage.success_criterion}
       </p>
       <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] text-muted-foreground">
-        <span>
-          iters {stage.iterations_used}/{stage.max_iterations}
+        <span
+          title={itersTooltip}
+          aria-label={
+            overrideActive
+              ? `rounds ${stage.iterations_used} of ${displayMax}; ` +
+                `per-launch override (Claude allocated ${stage.max_iterations})`
+              : undefined
+          }
+          className={cn(overrideActive && "underline decoration-dotted")}
+        >
+          rounds {stage.iterations_used}/{displayMax}
+          {overrideActive && (
+            <span aria-hidden="true" className="ml-0.5 text-amber-700">
+              *
+            </span>
+          )}
         </span>
         {stage.best_metric != null && (
           <span>best metric {stage.best_metric.toFixed(3)}</span>

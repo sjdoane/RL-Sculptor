@@ -2167,6 +2167,22 @@ def _run_one_stage(
     )
 
     stage_dir = mission.stage_dir(stage.name)
+    # §Ship 20 Goal #2: compute the effective max iterations BEFORE
+    # emitting stage_started so the UI can render `iters X/effectiveY`
+    # accurately when the user passed `iterations_override`. Without
+    # this the dialog reads `stage.max_iterations` (Claude's authored
+    # budget) and shows nonsense like `iters 2/3` when the run was
+    # capped at 2. Don't mutate stage.max_iterations — that's the
+    # persisted authored value; effective_max_iterations is runtime.
+    #
+    # Semantics note: this is the BASELINE cap for the first sculpt_run
+    # call. Goal B (extend_on_improvement) extensions issue separate
+    # `stage_extended` events with their own additional_iters; they do
+    # NOT update this value. The UI surfaces extensions as their own
+    # chips — the cap shown on the stage card is what the user
+    # explicitly configured. If the actual `iterations_used` exceeds
+    # the cap, that's an explicit Goal B opt-in; the user expects it.
+    effective_max_iterations = iterations_override or stage.max_iterations
     emit({
         "type": "stage_started",
         "stage_name": stage.name,
@@ -2175,6 +2191,7 @@ def _run_one_stage(
         "goal_text": stage.goal_text,
         "parent_stage": stage.parent_stage,
         "max_iterations": stage.max_iterations,
+        "effective_max_iterations": effective_max_iterations,
     })
     stage.status = "training"
     stage.started_at = _utc_now_iso()
@@ -2339,7 +2356,12 @@ def _run_one_stage(
         _evaluate_success_criterion,
     )
 
-    max_iters = iterations_override or stage.max_iterations
+    # §Ship 20 Goal #2: re-use the value already computed for
+    # stage_started's payload above. `max_iters` is the authoritative
+    # iterations cap passed to sculpt_run; `effective_max_iterations`
+    # is the same number, surfaced via WS so the UI can label
+    # accurately.
+    max_iters = effective_max_iterations
 
     per_iter_cb: Optional[Callable[[Any], Optional[str]]] = None
     if early_stop_on_criterion:
@@ -2515,6 +2537,10 @@ def _run_one_stage(
         "stage_name": stage.name,
         "iterations_run": sculpt_result.iterations_run,
         "early_stopped": sculpt_result.early_stopped,
+        # §Ship 20 Goal #2: surface the cap that was actually enforced
+        # so the UI can finalize `iters X/effectiveY` post-run, even
+        # if the stage_started event fell off the WS event window.
+        "effective_max_iterations": effective_max_iterations,
     })
 
     # 5. Derive final_policy_path from the last iter's checkpoint.

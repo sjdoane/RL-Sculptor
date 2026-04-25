@@ -18,23 +18,17 @@ import { useRunMission, type RunMissionVariables } from "@/hooks/useMissions";
 import { ApiError, type RunMissionRequestBody } from "@/lib/api";
 import type { MissionDetail } from "@/lib/types";
 
-/** §Ship-19d: per-launch configuration for a mission run.
+/** Per-launch configuration for a mission run.
  *
- * Five regions:
+ * Three regions:
  *   1. Iteration overrides (max-iters per stage, steps_per_iter, seed).
- *   2. Goal A — early-stop on criterion satisfaction.
- *   3. Goal B — extend on still-improving.
- *   4. Skill library — opt-in checkbox (UI surface for the existing
- *      backend `--no-skill-library`-style flag).
- *      (deferred: piping a per-run library override from the UI is
- *      Ship 19e — for now the backend always wires the default
- *      project-level library handle.)
- *   5. Submit / cancel.
+ *   2. Adaptive early-finish: stop a stage when its goal is met.
+ *   3. Adaptive extension: keep training a stage that's still improving.
  *
- * Defaults preserve the Ship 16 behavior: no overrides, no Goal A/B,
- * full per-stage budget from mission.json. The user has to opt in
- * explicitly to either adaptive feature so a "normal" mission run
- * is unchanged from before. */
+ * Defaults preserve the standard behavior: no overrides, neither
+ * adaptive option enabled, full per-stage budget from the mission's
+ * curriculum. The user must opt in explicitly so a "normal" mission
+ * run is unchanged. */
 export function RunMissionDialog({
   slug,
   missionSlug,
@@ -170,10 +164,10 @@ export function RunMissionDialog({
         <DialogHeader>
           <DialogTitle>Configure mission run</DialogTitle>
           <DialogDescription className="text-[11px]">
-            Knobs apply to <strong>every stage</strong> of this mission
-            run. Defaults preserve Claude's decomposition; tweak to
-            speed up testing or run an overnight job. Goal A + Goal B
-            are independent opt-ins (see help text).
+            Settings apply to <strong>every stage</strong> of this
+            mission run. Defaults match the curriculum Claude planned;
+            tweak to speed up testing or run an overnight job. The
+            two adaptive options below are independent opt-ins.
           </DialogDescription>
         </DialogHeader>
 
@@ -186,7 +180,7 @@ export function RunMissionDialog({
             <div className="grid grid-cols-3 gap-2">
               <div className="grid gap-1">
                 <Label htmlFor="iters" className="text-[11px]">
-                  Outer iters / stage
+                  Rounds per stage
                 </Label>
                 <Input
                   id="iters"
@@ -202,12 +196,12 @@ export function RunMissionDialog({
                   placeholder={suggestedIters?.toString() ?? "3"}
                 />
                 <p className="text-[10px] text-muted-foreground">
-                  Sculpt iters per stage. Smaller = faster smoke.
+                  Train→evaluate→edit cycles. Smaller = faster test.
                 </p>
               </div>
               <div className="grid gap-1">
                 <Label htmlFor="steps" className="text-[11px]">
-                  Steps / iter
+                  Steps per round
                 </Label>
                 <Input
                   id="steps"
@@ -220,10 +214,11 @@ export function RunMissionDialog({
                     setStepsPerIter(v === "" ? "" : Number(v));
                   }}
                   disabled={run.isPending}
-                  placeholder="config.toml"
+                  placeholder="project default"
                 />
                 <p className="text-[10px] text-muted-foreground">
-                  rsl_rl iters (mjlab) / env steps (gym).
+                  Training steps inside one round. Leave blank to
+                  use the project's default.
                 </p>
               </div>
               <div className="grid gap-1">
@@ -243,20 +238,20 @@ export function RunMissionDialog({
                   placeholder="42"
                 />
                 <p className="text-[10px] text-muted-foreground">
-                  Per-iter base seed.
+                  Per-round base seed.
                 </p>
               </div>
             </div>
             {eta !== null && (
               <p className="mt-2 text-[10px] text-muted-foreground">
-                Rough ETA — ~{eta} iter-units across{" "}
+                Rough estimate — ~{eta} rounds across{" "}
                 {mission?.stages?.length ?? 0} stage(s); multiply by
-                your per-iter wall-clock (Cartpole ≈30 s, G1 ≈25 min).
+                your per-round wall-clock (Cartpole ≈30 s, G1 ≈25 min).
               </p>
             )}
           </section>
 
-          {/* ── Goal A: early-stop on criterion ─────────────────────── */}
+          {/* ── Adaptive early-finish ───────────────────────────────── */}
           <section className="rounded-md border bg-muted/20 p-3">
             <label className="flex cursor-pointer items-start gap-2 text-[11px]">
               <input
@@ -268,14 +263,12 @@ export function RunMissionDialog({
               />
               <span>
                 <span className="font-semibold">
-                  Goal A: early-stop on criterion
+                  Stop when the goal is met
                 </span>
                 <p className="mt-0.5 text-[10.5px] font-normal text-muted-foreground">
-                  Exit a stage the moment its{" "}
-                  <code>success_criterion</code> holds. Cuts wall-clock
-                  on stages that learn faster than the budget allows.
-                  Default OFF — the existing Ship 16 behavior runs the
-                  full budget then evaluates once at the end.
+                  Exit a stage as soon as its{" "}
+                  <code>success_criterion</code> holds, instead of
+                  running every round in the budget. Default off.
                 </p>
               </span>
             </label>
@@ -298,7 +291,7 @@ export function RunMissionDialog({
                   className="w-24"
                 />
                 <p className="text-[10px] text-muted-foreground">
-                  Consecutive iters the criterion must hold before
+                  Consecutive rounds the criterion must hold before
                   exiting. <code>1</code> = exit on first pass; bump
                   to <code>2-3</code> for noisy metrics.
                 </p>
@@ -306,7 +299,7 @@ export function RunMissionDialog({
             )}
           </section>
 
-          {/* ── Goal B: extend on improvement ───────────────────────── */}
+          {/* ── Adaptive extension ──────────────────────────────────── */}
           <section className="rounded-md border bg-muted/20 p-3">
             <label className="flex cursor-pointer items-start gap-2 text-[11px]">
               <input
@@ -318,16 +311,12 @@ export function RunMissionDialog({
               />
               <span>
                 <span className="font-semibold">
-                  Goal B: extend on improvement
+                  Keep training while still improving
                 </span>
                 <p className="mt-0.5 text-[10.5px] font-normal text-muted-foreground">
-                  If a stage finishes its budget without satisfying the
-                  criterion BUT the metric is still trending up, run
-                  additional iters via resume mode. Default OFF —
-                  adaptive extension changes the iteration contract;
-                  the metric-plateau guard inside the existing early-
-                  stop path prevents extension when learning has
-                  flatlined.
+                  If a stage runs out of rounds but the metric is still
+                  trending up, grant extra rounds. Default off. Will
+                  not extend if the metric has plateaued.
                 </p>
               </span>
             </label>

@@ -6,6 +6,7 @@ import {
   Loader2,
   Radio,
   RefreshCw,
+  Sparkles,
   StopCircle,
   Wand2,
   XCircle,
@@ -24,7 +25,12 @@ import { useSystemGpu } from "@/hooks/useLibrary";
 import { LogViewer } from "@/components/LogViewer";
 import { MetricChart } from "@/components/MetricChart";
 import { NewRunDialog } from "@/components/NewRunDialog";
+import {
+  MissionDetailDialog,
+  MissionLifecycleBadge,
+} from "@/components/MissionDetailDialog";
 import { useRunEvents } from "@/hooks/useRunEvents";
+import { useMissions } from "@/hooks/useMissions";
 import { useRegenerateRewardTemplate } from "@/hooks/useRewards";
 import { useKillRun, useRun, useRuns } from "@/hooks/useRuns";
 import { ApiError } from "@/lib/api";
@@ -33,6 +39,7 @@ import type {
   ErrorClassification,
   IterEventSummary,
   JobStatus,
+  MissionSummary,
   ProjectDetail,
   RunDetail,
   RunEvent,
@@ -48,10 +55,37 @@ export default function RunsTab({
   project: ProjectDetail;
 }) {
   const list = useRuns(slug);
+  const missions = useMissions(slug);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
+  // §Ship 20 Goal #5: opening a mission from the Active missions
+  // panel routes through the existing MissionDetailDialog (which
+  // owns the live WS subscription via useMissionEvents). We don't
+  // mirror that state here — the dialog stays the canonical surface
+  // for live mission monitoring, RunsTab just makes the entry
+  // visible.
+  const [missionDialogSlug, setMissionDialogSlug] = useState<string | null>(
+    null,
+  );
 
   const runs = list.data ?? [];
   const selected = selectedRunId ?? runs[0]?.run_id ?? null;
+  // Surface missions whose decompose or execute job is in flight;
+  // resolved missions stay on the Missions tab. Falls back to
+  // "lifecycle === running" when the active_job_id field has been
+  // cleared but the on-disk lifecycle is still mid-flight.
+  const activeMissions = useMemo<MissionSummary[]>(
+    () =>
+      (missions.data ?? []).filter(
+        (m) => m.active_job_id != null || m.lifecycle === "running",
+      ),
+    [missions.data],
+  );
+  const missionDialogSummary =
+    missionDialogSlug != null
+      ? (missions.data ?? []).find(
+          (m) => m.mission_slug === missionDialogSlug,
+        ) ?? null
+      : null;
 
   return (
     <div className="flex flex-col gap-4">
@@ -60,8 +94,9 @@ export default function RunsTab({
           <div>
             <CardTitle className="text-sm">Runs</CardTitle>
             <CardDescription className="text-[11px]">
-              Each run is a <code>sculpt run</code> subprocess — its
-              JobManager kind is <code>sculpt_run</code>.
+              Standalone training runs and live mission stages.
+              History below; click a row for metrics, logs, and
+              per-iteration detail.
             </CardDescription>
           </div>
           <NewRunDialog
@@ -72,6 +107,13 @@ export default function RunsTab({
         </CardHeader>
       </Card>
 
+      {activeMissions.length > 0 && (
+        <ActiveMissionsCard
+          missions={activeMissions}
+          onOpen={setMissionDialogSlug}
+        />
+      )}
+
       {list.isLoading && (
         <p className="text-sm text-muted-foreground">Loading runs…</p>
       )}
@@ -81,7 +123,15 @@ export default function RunsTab({
           <Wand2 className="mx-auto h-8 w-8 text-muted-foreground" />
           <p className="mt-2 text-sm">No runs yet.</p>
           <p className="text-xs text-muted-foreground">
-            Launch one above — keep it to a few iterations for the first pass.
+            Launch one above — keep it to a few iterations for the
+            first pass.
+            {activeMissions.length > 0 && (
+              <>
+                {" "}
+                Missions running in the background appear in the panel
+                above.
+              </>
+            )}
           </p>
         </Card>
       )}
@@ -102,8 +152,94 @@ export default function RunsTab({
           )}
         </div>
       )}
+
+      {/* §Ship 20 Goal #5: clicking an active-mission row opens the
+          existing MissionDetailDialog. The dialog already manages the
+          live WS subscription, stage cards, iter ribbon — duplicating
+          that surface in Runs would mean managing the WS lifecycle
+          across tab switches (plan-audit's biggest hole). Keeping
+          the dialog as the canonical live-monitoring surface sidesteps
+          that entirely. */}
+      <MissionDetailDialog
+        slug={slug}
+        missionSlug={missionDialogSlug}
+        summary={missionDialogSummary}
+        open={missionDialogSlug != null}
+        onOpenChange={(open) => {
+          if (!open) setMissionDialogSlug(null);
+        }}
+      />
     </div>
   );
+}
+
+// ── Active missions panel (Ship 20 Goal #5) ──────────────────────────
+function ActiveMissionsCard({
+  missions,
+  onOpen,
+}: {
+  missions: MissionSummary[];
+  onOpen: (missionSlug: string) => void;
+}) {
+  return (
+    <Card>
+      <CardHeader className="py-3">
+        <CardTitle className="flex items-center gap-2 text-sm">
+          <Sparkles className="h-3.5 w-3.5 text-amber-600" />
+          Active missions
+        </CardTitle>
+        <CardDescription className="text-[11px]">
+          Missions running right now. Click a row to open its live
+          stage view.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="flex max-h-[420px] flex-col gap-1.5 overflow-y-auto scrollbar-thin p-3 pt-0">
+        {missions.map((m) => (
+          <button
+            key={m.mission_slug}
+            type="button"
+            onClick={() => onOpen(m.mission_slug)}
+            className="flex flex-col gap-1 rounded-md border bg-muted/20 px-3 py-2 text-left text-xs transition-colors hover:bg-accent/40"
+          >
+            <div className="flex flex-wrap items-center gap-2">
+              <MissionLifecycleBadge lifecycle={m.lifecycle} />
+              <span className="text-[11px] font-semibold">
+                {missionRunStateLabel(m)}
+              </span>
+              {m.active_job_id != null && (
+                <span className="rounded bg-amber-50 px-1 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-amber-700 ring-1 ring-amber-200">
+                  {m.active_job_kind === "mission_decompose"
+                    ? "Planning"
+                    : m.active_job_kind === "mission_execute"
+                      ? "Training"
+                      : "active"}
+                </span>
+              )}
+              <ArrowRight className="ml-auto h-3 w-3 text-muted-foreground" />
+            </div>
+            <div className="line-clamp-1 text-[11px]">{m.goal}</div>
+            <code
+              className="truncate font-mono text-[10px] text-muted-foreground"
+              title={`mission slug: ${m.mission_slug}`}
+            >
+              {m.mission_slug}
+            </code>
+          </button>
+        ))}
+      </CardContent>
+    </Card>
+  );
+}
+
+// Kept in sync with MissionsTab.tsx's `stageProgressLabel` so the same
+// mission reads the same way across tabs.
+function missionRunStateLabel(m: MissionSummary): string {
+  const { current_stage_idx: i, n_stages: n, lifecycle } = m;
+  if (n === 0) return "Planning…";
+  if (lifecycle === "running") return `Stage ${Math.max(1, i + 1)} of ${n}`;
+  if (lifecycle === "ready") return `${n} stages planned`;
+  if (lifecycle === "completed") return `${n} of ${n} stages complete`;
+  return `${i} of ${n} stages complete`;
 }
 
 // ── sidebar ───────────────────────────────────────────────────────────
