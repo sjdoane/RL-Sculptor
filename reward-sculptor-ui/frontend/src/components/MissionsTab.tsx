@@ -44,7 +44,16 @@ export function MissionsTab({ slug }: { slug: string }) {
               <code>.missions/&lt;slug&gt;/mission.json</code>.
             </CardDescription>
           </div>
-          <NewMissionDialog slug={slug} />
+          <NewMissionDialog
+            slug={slug}
+            onCreated={(missionSlug) => {
+              // §Ship-19c loading visual: jump straight into the
+              // detail dialog so the user watches the live decompose
+              // event stream instead of staring at a row badge that
+              // pulses for 30-90s with no other feedback.
+              setSelectedSlug(missionSlug);
+            }}
+          />
         </CardHeader>
       </Card>
 

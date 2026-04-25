@@ -16,7 +16,7 @@ import re
 from pathlib import Path
 from typing import Annotated, Any, Optional
 
-from fastapi import APIRouter, Depends, File, Request, UploadFile, status
+from fastapi import APIRouter, Depends, File, Form, Request, UploadFile, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -464,7 +464,7 @@ def apply_motor_limits(
 
 
 # ── POST /projects/{slug}/physics/datasheet-pdf ───────────────────────
-_DATASHEET_SYSTEM_PROMPT = (
+_DATASHEET_SYSTEM_PROMPT_BASE = (
     "You are a motor-datasheet parser. Extract structured motor specs "
     "from the provided datasheet text. Return STRICT JSON matching this "
     "schema (and nothing else — no prose, no markdown fence):\n"
@@ -481,9 +481,7 @@ _DATASHEET_SYSTEM_PROMPT = (
     "    }\n"
     "  }\n\n"
     "Rules:\n"
-    "  - Joint names must match ^[A-Za-z_][A-Za-z0-9_.-]{0,63}$. "
-    "If the datasheet doesn't name a joint explicitly, fabricate a "
-    "reasonable snake_case label (e.g. 'motor_1', 'actuator_a').\n"
+    "  - Joint names must match ^[A-Za-z_][A-Za-z0-9_.-]{0,63}$.\n"
     "  - Every numeric field is optional per joint — omit the key "
     "when the datasheet doesn't state that spec.\n"
     "  - Convert units: datasheet may use RPM (→ rad/s), oz-in (→ Nm), "
@@ -493,6 +491,47 @@ _DATASHEET_SYSTEM_PROMPT = (
     "so the user can audit the extraction.\n"
     "  - If the datasheet is unreadable, return `{\"motors\": {}}`."
 )
+
+
+def _datasheet_system_prompt(actuator_names: list[str]) -> str:
+    """Augment the base extraction prompt with the project's MJCF
+    actuator names (when provided) so Claude can MAP datasheet entries
+    to existing joints instead of fabricating new ones.
+
+    Without this guidance, datasheet labels like "Hip Pitch" would
+    end up as a new row in the UI's motor-specs table, leaving the
+    real MJCF actuator (e.g., "left_hip_pitch_actuator") empty —
+    Sam's bug-report from the first live test.
+    """
+    base = _DATASHEET_SYSTEM_PROMPT_BASE
+    if not actuator_names:
+        return base + (
+            "\n  - If the datasheet doesn't name a joint explicitly, "
+            "fabricate a reasonable snake_case label (e.g. 'motor_1', "
+            "'actuator_a')."
+        )
+    # Cap the list so a 100+-actuator robot doesn't blow Claude's
+    # context. The first 64 names are always enough for any
+    # realistic datasheet (a single PDF rarely covers >32 motors).
+    quoted = ", ".join(repr(n) for n in actuator_names[:64])
+    extra = (
+        "\n  - **MAP datasheet entries to these MJCF actuator names** "
+        f"(this project's actual joint set): [{quoted}]. "
+        "When a datasheet row clearly corresponds to one of these "
+        "names — even if the label differs (e.g. 'Hip Pitch' vs "
+        "'left_hip_pitch_actuator', 'Joint 1' vs 'shoulder_yaw') — "
+        "use the EXACT MJCF name as the JSON key so the UI populates "
+        "the existing actuator's row instead of adding a new one. "
+        "If a datasheet entry has no plausible match in the list "
+        "above, prefix with `unmapped_` (e.g. 'unmapped_motor_3') "
+        "so the user notices and can rename or delete it."
+    )
+    return base + extra
+
+
+# Back-compat alias used by tests that pre-existed the actuator-list
+# parameter.
+_DATASHEET_SYSTEM_PROMPT = _datasheet_system_prompt([])
 
 
 # §Ship-9c: no `response_model` because the empty-motors success case
@@ -513,6 +552,15 @@ _DATASHEET_SYSTEM_PROMPT = (
 async def extract_datasheet_pdf(
     slug: str,
     pdf: UploadFile = File(..., description="Motor datasheet PDF"),
+    actuator_names: str = Form(
+        "",
+        description=(
+            "Optional comma-separated list of MJCF actuator names. "
+            "When provided, Claude maps datasheet entries to these "
+            "names so the UI's existing actuator rows are populated "
+            "instead of new rows being appended."
+        ),
+    ),
     store: ProjectStore = Depends(get_store),
 ) -> Any:
     """§Ship-9c: extract motor specs from a datasheet PDF.
@@ -596,6 +644,19 @@ async def extract_datasheet_pdf(
     _MAX_TEXT_CHARS = 40_000
     text_for_claude = text[:_MAX_TEXT_CHARS]
 
+    # Parse + sanitize the actuator-name list (form field is
+    # comma-separated). Strip whitespace, drop empties, cap length
+    # per name so a 10 KB pasted blob can't blow the prompt.
+    actuator_list: list[str] = []
+    for raw in (actuator_names or "").split(","):
+        n = raw.strip()
+        if not n:
+            continue
+        if len(n) > 96:
+            continue
+        actuator_list.append(n)
+    system_prompt = _datasheet_system_prompt(actuator_list)
+
     # Claude-side extraction.
     # §Ship-9c hotfix (critique critical-1+2): bound the call with
     # asyncio.wait_for AND run the sync SDK call inside a thread so
@@ -608,7 +669,7 @@ async def extract_datasheet_pdf(
             resp = client.messages.create(
                 model="claude-opus-4-7",
                 max_tokens=4_000,
-                system=_DATASHEET_SYSTEM_PROMPT,
+                system=system_prompt,
                 messages=[{"role": "user", "content": text_for_claude}],
             )
             return "".join(

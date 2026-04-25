@@ -22,7 +22,18 @@ const SLUG_PATTERN = /^[a-z][a-z0-9_-]{0,63}$/;
 const GOAL_MIN = 8;
 const GOAL_MAX = 2000;
 
-export function NewMissionDialog({ slug }: { slug: string }) {
+export function NewMissionDialog({
+  slug,
+  onCreated,
+}: {
+  slug: string;
+  /** Called with the new mission's slug on successful decompose-job
+   *  submission. Lets the parent (MissionsTab) auto-open the detail
+   *  dialog so the user sees the live decompose stream rather than
+   *  staring at a row that flips between lifecycle="running" and
+   *  "ready" with no visible progress. */
+  onCreated?: (missionSlug: string) => void;
+}) {
   const [open, setOpen] = useState(false);
   const [goal, setGoal] = useState("");
   const [missionSlug, setMissionSlug] = useState("");
@@ -68,6 +79,16 @@ export function NewMissionDialog({ slug }: { slug: string }) {
         onSuccess: (job) => {
           setOpen(false);
           reset();
+          // Backend's POST /missions returns 202 with `job.params`
+          // populated (mission_slug + goal + no_kg). The frontend
+          // `JobSummary` type omits `params` (only JobDetail has
+          // it) so we type-cast at this single call site rather
+          // than widen the shared type. The HTTP payload always
+          // carries it — see backend/routes/missions.py:189-194.
+          const ms = (
+            job as unknown as { params?: { mission_slug?: string } }
+          ).params?.mission_slug;
+          if (ms && onCreated) onCreated(ms);
           toast.success("Decompose job queued", {
             description: `job_id: ${job.job_id}`,
           });

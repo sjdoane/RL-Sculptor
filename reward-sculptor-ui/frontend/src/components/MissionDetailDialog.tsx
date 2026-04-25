@@ -72,6 +72,14 @@ export function MissionDetailDialog({
   // summary, so the WS opens within a single render after Run is
   // clicked — no waiting for the next list refetch.
   const wsEnabled = open && missionSlug != null && activeJobId != null;
+
+  // §Ship-19c: distinguish "mission.json missing because decompose
+  // is still running" from "mission.json missing because the user
+  // navigated to a bogus slug". The summary's active_job_kind tells
+  // us — when a decompose job is active, the GET 404 is expected.
+  const isDecomposing =
+    liveSummary?.active_job_kind === "mission_decompose" &&
+    activeJobId != null;
   const events = useMissionEvents(
     slug,
     missionSlug ?? undefined,
@@ -81,6 +89,21 @@ export function MissionDetailDialog({
   const stageDepths = useMemo(
     () => (mission?.stages ? computeStageDepths(mission.stages) : new Map()),
     [mission?.stages],
+  );
+
+  // §Ship-19c: derive per-stage iter history from the WS structured-
+  // event stream. iter_started / iter_completed / rollout_done events
+  // fire from inside each stage's sculpt_run subprocess; they don't
+  // carry stage_name themselves, so we attribute them to whichever
+  // stage was last `stage_started`-emitted (orchestrator emits one
+  // before invoking sculpt_run per stage). Replaces the deferred
+  // "fill the Runs tab with stage runs" feature for Ship 19 (which
+  // would need backend mods to register child Job entries — Ship
+  // 19d). The dialog gives the same "is iter N running, what's
+  // its metric" visibility without leaving the Missions tab.
+  const stageIters = useMemo(
+    () => deriveStageIters(events.structuredEvents),
+    [events.structuredEvents],
   );
 
   return (
@@ -103,10 +126,30 @@ export function MissionDetailDialog({
         </DialogHeader>
 
         <div className="flex min-h-0 flex-col gap-3 overflow-y-auto pr-1 scrollbar-thin">
-          {detail.isLoading && !mission && (
+          {/* §Ship-19c: while a mission is being decomposed, mission.json
+              doesn't exist yet so the GET returns 404. Don't surface
+              that as a destructive error — render a "Decomposing"
+              placeholder + the live WS event stream below so the user
+              sees Claude's stdout in real time. */}
+          {detail.isLoading && !mission && !isDecomposing && (
             <p className="text-sm text-muted-foreground">Loading mission…</p>
           )}
-          {detail.error && (
+          {isDecomposing && !mission && (
+            <div className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/5 p-3 text-xs">
+              <Loader2 className="mt-0.5 h-4 w-4 shrink-0 animate-spin text-amber-700" />
+              <div>
+                <div className="font-medium text-amber-700 dark:text-amber-300">
+                  Decomposing — Claude is building the curriculum
+                </div>
+                <p className="mt-0.5 text-[11px] text-muted-foreground">
+                  Typically 30-90 s. Stages will appear here when the
+                  decompose job completes; the live event stream below
+                  shows progress in real time.
+                </p>
+              </div>
+            </div>
+          )}
+          {detail.error && !isDecomposing && (
             <p className="rounded border border-destructive/40 bg-destructive/5 p-2 font-mono text-[11px] text-destructive">
               {(detail.error as Error).message}
             </p>
@@ -150,6 +193,7 @@ export function MissionDetailDialog({
                     stage={s}
                     depth={stageDepths.get(s.name) ?? 0}
                     isCurrent={idx === mission.current_stage_idx}
+                    iters={stageIters.get(s.name) ?? []}
                   />
                 ))}
               </div>
@@ -421,14 +465,87 @@ function computeStageDepths(stages: StageSchema[]): Map<string, number> {
   return depths;
 }
 
+// §Ship-19c: per-iter row derived from the WS event stream.
+type IterRow = {
+  iter_index: number;
+  primary_metric: number | null;
+  rollout_done: boolean;
+  completed: boolean;
+};
+
+function deriveStageIters(
+  events: MissionEvent[],
+): Map<string, IterRow[]> {
+  const out = new Map<string, IterRow[]>();
+  let currentStage: string | null = null;
+
+  const ensure = (name: string): IterRow[] => {
+    let arr = out.get(name);
+    if (!arr) {
+      arr = [];
+      out.set(name, arr);
+    }
+    return arr;
+  };
+
+  for (const ev of events) {
+    const t = ev.type;
+    if (t === "stage_started") {
+      currentStage = (ev.stage_name as string | null) ?? null;
+      continue;
+    }
+    if (!currentStage) continue;
+    if (t === "iter_started") {
+      const iter = (ev as { iter?: number }).iter ?? 0;
+      const arr = ensure(currentStage);
+      // Don't double-add if a replay re-fires iter_started.
+      if (arr.find((r) => r.iter_index === iter)) continue;
+      arr.push({
+        iter_index: iter,
+        primary_metric: null,
+        rollout_done: false,
+        completed: false,
+      });
+    } else if (t === "iter_completed") {
+      const iter = (ev as { iter?: number }).iter ?? 0;
+      const m = (ev as { primary_metric?: number | null }).primary_metric;
+      const arr = ensure(currentStage);
+      const row = arr.find((r) => r.iter_index === iter);
+      if (row) {
+        row.primary_metric = typeof m === "number" ? m : null;
+        row.completed = true;
+      } else {
+        arr.push({
+          iter_index: iter,
+          primary_metric: typeof m === "number" ? m : null,
+          rollout_done: false,
+          completed: true,
+        });
+      }
+    } else if (t === "rollout_done") {
+      const iter = (ev as { iter?: number }).iter ?? 0;
+      const arr = ensure(currentStage);
+      const row = arr.find((r) => r.iter_index === iter);
+      if (row) row.rollout_done = true;
+    }
+  }
+  // Sort each stage's iters by index so display order is stable.
+  for (const arr of out.values()) {
+    arr.sort((a, b) => a.iter_index - b.iter_index);
+  }
+  return out;
+}
+
 function StageCard({
   stage,
   depth,
   isCurrent,
+  iters,
 }: {
   stage: StageSchema;
   depth: number;
   isCurrent: boolean;
+  iters: IterRow[];
 }) {
   const orphan = stage.parent_stage !== null && depth === 0;
   return (
@@ -481,7 +598,54 @@ function StageCard({
           <span>kg refs {stage.kg_seed_papers.length}</span>
         )}
       </div>
+      {iters.length > 0 && <IterRibbon iters={iters} />}
     </div>
+  );
+}
+
+function IterRibbon({ iters }: { iters: IterRow[] }) {
+  return (
+    <div
+      role="list"
+      aria-label="Per-iteration progress"
+      className="mt-1.5 flex flex-wrap items-center gap-1"
+    >
+      {iters.map((r) => (
+        <IterChip key={r.iter_index} row={r} />
+      ))}
+    </div>
+  );
+}
+
+function IterChip({ row }: { row: IterRow }) {
+  const label = `iter ${row.iter_index}`;
+  let cls: string;
+  let metricStr: string;
+  if (row.completed) {
+    cls = "bg-emerald-50 text-emerald-700 border-emerald-200";
+    metricStr =
+      row.primary_metric != null
+        ? row.primary_metric.toFixed(3)
+        : "—";
+  } else if (row.rollout_done) {
+    cls = "bg-violet-50 text-violet-700 border-violet-200";
+    metricStr = "rollout";
+  } else {
+    cls = "bg-amber-50 text-amber-700 border-amber-200 motion-safe:animate-pulse";
+    metricStr = "training…";
+  }
+  return (
+    <span
+      role="listitem"
+      className={cn(
+        "inline-flex items-center gap-1 rounded-sm border px-1 py-0.5 text-[9.5px] font-mono",
+        cls,
+      )}
+      title={`${label} · ${metricStr}`}
+    >
+      <span className="font-semibold uppercase tracking-wide">{label}</span>
+      <span>{metricStr}</span>
+    </span>
   );
 }
 

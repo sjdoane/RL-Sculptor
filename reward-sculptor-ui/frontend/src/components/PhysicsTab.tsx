@@ -598,8 +598,12 @@ function MotorLimitsCard({
   // §Ship-9c: datasheet PDF upload. Server returns structured specs
   // (Claude-extracted); we merge into local state so user can review
   // + edit before hitting Apply.
+  // §Ship-19c hotfix: pass the MJCF actuator names so Claude maps
+  // datasheet entries to the existing rows instead of fabricating
+  // new ones (Sam's first-test feedback: extracted data was correct
+  // but landed in a new row, leaving real actuators empty).
   const extract = useMutation({
-    mutationFn: (pdf: File) => extractDatasheetPdf(slug, pdf),
+    mutationFn: (pdf: File) => extractDatasheetPdf(slug, pdf, actuators),
     onSuccess: (data) => {
       const incoming = data.motors ?? {};
       const nMotors = Object.keys(incoming).length;

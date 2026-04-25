@@ -263,13 +263,22 @@ export async function applyMotorLimits(
 
 /** §Ship-9c: upload a motor datasheet PDF and get structured specs back.
  * Response shape matches `MotorLimitsRequest` so the UI can pre-fill
- * the motor-limits form; user reviews/edits, then `applyMotorLimits`. */
+ * the motor-limits form; user reviews/edits, then `applyMotorLimits`.
+ *
+ * §Ship-19c: optional `actuatorNames` — when supplied, the backend
+ * tells Claude to MAP datasheet entries to these MJCF names instead
+ * of fabricating new ones, so the upload populates existing rows
+ * in the motor-specs table rather than adding orphan rows. */
 export async function extractDatasheetPdf(
   projectSlug: string,
   pdf: File,
+  actuatorNames?: string[],
 ): Promise<MotorLimitsRequest> {
   const formData = new FormData();
   formData.append("pdf", pdf);
+  if (actuatorNames && actuatorNames.length > 0) {
+    formData.append("actuator_names", actuatorNames.join(","));
+  }
   return handle<MotorLimitsRequest>(
     await fetch(
       `/api/projects/${projectSlug}/physics/datasheet-pdf`,
@@ -623,6 +632,70 @@ export function clipUrl(
 ): string {
   return `/api/projects/${slug}/runs/${runId}/clips/iter_${iterIndex}.mp4`;
 }
+
+// ── Missions (Ship 18a) ──────────────────────────────────────────────
+import type {
+  CreateMissionRequest,
+  DeleteMissionResponse,
+  MissionDetail,
+  MissionSummary,
+} from "./types";
+
+export async function listMissions(slug: string): Promise<MissionSummary[]> {
+  return handle<MissionSummary[]>(
+    await fetch(`/api/projects/${slug}/missions`),
+  );
+}
+
+export async function getMission(
+  slug: string, missionSlug: string,
+): Promise<MissionDetail> {
+  return handle<MissionDetail>(
+    await fetch(`/api/projects/${slug}/missions/${missionSlug}`),
+  );
+}
+
+export async function createMission(
+  slug: string, body: CreateMissionRequest,
+): Promise<JobSummary> {
+  return handle<JobSummary>(
+    await fetch(`/api/projects/${slug}/missions`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  );
+}
+
+export async function runMission(
+  slug: string, missionSlug: string,
+): Promise<JobSummary> {
+  return handle<JobSummary>(
+    await fetch(`/api/projects/${slug}/missions/${missionSlug}/run`, {
+      method: "POST",
+    }),
+  );
+}
+
+export async function deleteMission(
+  slug: string, missionSlug: string,
+): Promise<DeleteMissionResponse> {
+  return handle<DeleteMissionResponse>(
+    await fetch(`/api/projects/${slug}/missions/${missionSlug}`, {
+      method: "DELETE",
+    }),
+  );
+}
+
+/** WebSocket URL for a mission's active-job event stream (decompose
+ *  or execute). Mirrors `runEventsWsUrl`. */
+export function missionEventsWsUrl(
+  slug: string, missionSlug: string,
+): string {
+  const scheme = window.location.protocol === "https:" ? "wss" : "ws";
+  return `${scheme}://${window.location.host}/ws/projects/${slug}/missions/${missionSlug}/events`;
+}
+
 
 // ── Dashboard + System ───────────────────────────────────────────────
 import type { DashboardSummary, SystemInfo } from "./types";

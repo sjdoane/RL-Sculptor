@@ -58,7 +58,39 @@ export function useCreateMission(slug: string) {
   const qc = useQueryClient();
   return useMutation<JobSummary, Error, CreateMissionRequest>({
     mutationFn: (body) => createMission(slug, body),
-    onSuccess: () => {
+    onSuccess: (job, body) => {
+      // §Ship-19c: optimistic-insert the new mission row with the
+      // decompose job_id already attached, so the auto-opened detail
+      // dialog's WS hook sees `active_job_id` immediately on the next
+      // render and subscribes to the live decompose stream — no
+      // 5 s polling lag staring at a "no job" placeholder. The list
+      // refetch follows up and reconciles any divergence.
+      const missionSlug = (
+        job as unknown as { params?: { mission_slug?: string } }
+      ).params?.mission_slug;
+      if (missionSlug) {
+        qc.setQueryData<MissionSummary[] | undefined>(
+          qk.missions(slug),
+          (old) => {
+            const placeholder: MissionSummary = {
+              mission_slug: missionSlug,
+              project_slug: slug,
+              goal: body.goal,
+              n_stages: 0,
+              current_stage_idx: 0,
+              decomposition_model: "",
+              created_at: new Date().toISOString(),
+              lifecycle: "running" as MissionLifecycleStatus,
+              active_job_id: job.job_id,
+              active_job_kind: "mission_decompose" as MissionJobKind,
+            };
+            if (!old) return [placeholder];
+            // Don't double-insert if a refetch already landed it.
+            if (old.some((m) => m.mission_slug === missionSlug)) return old;
+            return [placeholder, ...old];
+          },
+        );
+      }
       qc.invalidateQueries({ queryKey: qk.missions(slug) });
     },
   });
