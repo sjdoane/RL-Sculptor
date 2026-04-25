@@ -2183,6 +2183,12 @@ def _run_one_stage(
     # explicitly configured. If the actual `iterations_used` exceeds
     # the cap, that's an explicit Goal B opt-in; the user expects it.
     effective_max_iterations = iterations_override or stage.max_iterations
+    # §Ship 20a: persist on the stage so the UI's `rounds X/Y` display
+    # is correct even after the WS event window evicts stage_started.
+    # Set BEFORE the emit so the on-disk save (which fires on stage
+    # completion / failure / interrupt) captures the right value
+    # regardless of where the stage's lifecycle terminates.
+    stage.effective_max_iterations = effective_max_iterations
     emit({
         "type": "stage_started",
         "stage_name": stage.name,

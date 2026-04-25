@@ -326,6 +326,315 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-04-25 — Ship 21: Missions merged into Runs (cross-tab integration v2)
+
+**Scope:** User reported five concrete bugs after the Ship 20 G1 test:
+(1) the auto-open detail dialog flashed open then closed for ~1s on
+Decompose submit; (2) post-failure the StageCard read `rounds 4/3`
+because `effective_max_iterations` (introduced Ship 20) was only on
+WS events, NOT persisted on the Stage dataclass — when the WS event
+window evicted `stage_started` the UI fell back to the authored
+budget; (3) mission stages didn't appear in the Runs tab as runs;
+(4) live training videos didn't surface in Overview for stages;
+(5) per-stage reward versions weren't visible. Sam's verdict:
+"I don't even think there needs to be a separate missions tab. It
+should be integrated within the runs tab." Ship 21 is two phases
+landed in one commit:
+
+**Phase A (small fixes)** — auto-open flicker fix + persisted
+`effective_max_iterations` + 3 regression tests.
+
+**Phase B (cross-tab merge)** — mission stages become first-class
+`mission_stage_run` Job entries; `list_runs` returns them; the
+Runs tab sidebar groups them under their parent mission with a
+collapsible chevron; the run detail pane shows per-stage rewards;
+the Missions tab is **removed** from `ProjectDetail`. The
+`MissionDetailDialog` survives as the curriculum view (decomposition
+rationale + stage cards + Run/Delete) — opened from the new "Plan"
+button on each mission group header in the Runs sidebar, AND from
+post-Decompose auto-open via `NewMissionDialog → onCreated →
+setMissionDialogSlug` (the same auto-open flow Ship 19c-20 wired,
+relocated to RunsTab).
+
+**Process (mirrors prior ships' audit-driven pattern):**
+
+1. **Research (`Explore` agent)** — mapped JobManager parent/child
+   support (none — would need new wiring), `list_runs` filtering
+   (`kind="sculpt_run"` only), per-stage filesystem layout (each
+   stage scaffolds `<project>/.missions/<m>/stages/<s>/{rewards,runs}/`
+   as a self-contained sub-project), the mission_jobs `_stream_stdout`
+   event-tag parser, the relationship between sculpt_run subprocess
+   events and the parent mission_execute job's stdout. Surfaced 4
+   load-bearing constraints: (a) JobManager has zero parent/child
+   wiring; (b) `RunSummary` lacks parent_id/mission_slug/stage_name;
+   (c) per-stage rollouts live under stage_dir, not project root;
+   (d) per-stage rewards are already on disk in stage_dir/rewards/
+   but no endpoint exposes them.
+2. **Plan v2** committed to the lightweight architecture: register
+   per-stage child Jobs as `mission_stage_run` kind via a new
+   `register_passive_job` helper that doesn't spawn a runner (the
+   work is already happening inside the parent's subprocess);
+   tee `iter_*` and stage-lifecycle events from the parent's
+   stdout to the active child; extend `list_runs` filter; add a
+   `?stage=<m>/<s>` query to rewards endpoints; rebuild RunsTab's
+   sidebar to group stage rows under their mission.
+3. **Implementation** landed across 11 files (backend + frontend).
+4. **Code-audit (`Explore` agent)** — surfaced 2 CRITICALs and a
+   handful of MEDIUM/LOW. CRITICALs both fixed in the same commit.
+5. **Design-critique (`Explore`-as-design-critic agent)** —
+   surfaced 1 WORST issue (mission group header click-target
+   ambiguity) + 11 lower-severity items. WORST fixed.
+
+**Files added / changed:**
+
+*Sculptor (`~/projects/RewardSculptor`)*:
+- **[sculptor/mission.py](RewardSculptor/sculptor/mission.py)** —
+  Phase A: `Stage.effective_max_iterations: Optional[int] = None`
+  field. Persisted via `dataclasses.asdict`; backward-compatible
+  via `Stage.from_dict`'s filter-unknown-keys path so older
+  mission.json loads fine.
+- **[sculptor/sculpt.py](RewardSculptor/sculptor/sculpt.py)** —
+  Phase A: `_run_one_stage` sets
+  `stage.effective_max_iterations = effective_max_iterations`
+  BEFORE the `stage_started` emit so the value is captured by
+  any save path (success, criterion-failure, training-error,
+  scaffold-error). Inline comment documents the BASELINE
+  semantic (Goal B extensions emit their own events; the cap
+  reflects what the user explicitly chose).
+- **[tests/test_mission_run.py](RewardSculptor/tests/test_mission_run.py)** —
+  Phase A regression tests (3): `test_mission_run_persists_
+  effective_max_iterations_on_stage` (success path round-trips
+  through JSON + reload), `test_mission_run_persists_effective_
+  max_iterations_on_failure` (the actual G1 case Sam hit:
+  criterion failure path also persists), `test_stage_effective_
+  max_iterations_backward_compat_load` (older mission.json
+  without the field loads with `effective_max_iterations=None`).
+
+*Backend UI (`~/projects/reward-sculptor-ui`)*:
+- **[backend/services/job_manager.py](reward-sculptor-ui/backend/services/job_manager.py)** —
+  `Job.parent_id: Optional[str] = None`. New `register_passive_
+  job(kind, project_slug, *, params, parent_id) -> Job` that
+  registers a Job WITHOUT a runner: `_cancel = None`, `_task =
+  None`, `status = "running"` immediately. Audit-fix CRITICAL
+  #2: `JobManager.stop` routes a stop request on a passive job
+  (no `_cancel`) to its `parent_id` so a "Stop" click on a
+  stage row terminates the parent mission's subprocess (which
+  kills all child stages) instead of silently returning None.
+- **[backend/models/kg.py](reward-sculptor-ui/backend/models/kg.py)** —
+  `JobKind` literal extended with `"mission_stage_run"`.
+  `JobSummary.parent_id` field.
+- **[backend/services/mission_jobs.py](reward-sculptor-ui/backend/services/mission_jobs.py)** —
+  `_stream_stdout` accepts `job_manager`, `project_slug`,
+  `mission_slug` so it can register child Jobs. New module-
+  level `_STAGE_OPEN_EVENT`, `_STAGE_CLOSE_EVENTS`,
+  `_STAGE_TEE_EVENTS` constants enumerate the stage-lifecycle
+  contract. On `stage_started`: closes any prior unclosed stage
+  defensively, then registers a passive Job with stage params
+  (mission_slug, stage_name, stage_index, stage_dir,
+  behavior_goal, iterations_requested = effective_max_iterations).
+  All `iter_*` + warm-start + redecomposition + skill-publish
+  events get tee'd to the active child too. On `stage_succeeded`/
+  `stage_skipped`: child marked `completed`. On `stage_failed`:
+  child marked `errored` with the reason. On parent-subprocess
+  termination: any still-open child closed `errored` so the
+  Runs UI doesn't show a perpetually-running row.
+- **[backend/routes/missions.py](reward-sculptor-ui/backend/routes/missions.py)** —
+  `POST /missions/{slug}/run` passes `job_manager=jobs` into
+  `run_mission_execute_job` so the streamer can register child
+  Jobs.
+- **[backend/routes/runs.py](reward-sculptor-ui/backend/routes/runs.py)** —
+  `_find_run` accepts `mission_stage_run` kind. New
+  `_resolve_run_root(job, project_dir)` returns the right
+  `runs/` root: `<project>/.missions/<m>/stages/<s>/runs/`
+  for stage runs, `<project>/runs/` for top-level. `list_runs`
+  merges both kinds (top-level first, then stage runs sorted
+  by JobManager order). `_run_summary` populates the new
+  fields (`kind`, `parent_id`, `mission_slug`, `stage_name`,
+  `stage_index`). `get_iter_rollout` uses `_resolve_run_root`
+  so `/projects/{slug}/runs/{stage_run_id}/iterations/{N}/rollout`
+  serves the stage's rollout video. `get_clip_file` left
+  unchanged — live clips are written by `rollout_streamer`
+  keyed on the parent mission_execute job_id, not the child;
+  stage runs return a clean 404 on the clips endpoint, which
+  is fine because the frontend uses `get_iter_rollout` for
+  per-iter videos. Stage params synthesized into `RunParams`
+  in `get_run` (`iterations_requested` falls back to
+  `params["iterations_requested"]` then `params["iterations"]`
+  then `1`).
+- **[backend/models/run.py](reward-sculptor-ui/backend/models/run.py)** —
+  `RunSummary` adds `kind: str = "sculpt_run"`, `parent_id`,
+  `mission_slug`, `stage_name`, `stage_index` (all
+  Optional). RunDetail extends RunSummary so the same fields
+  flow into the detail endpoint.
+- **[backend/routes/rewards.py](reward-sculptor-ui/backend/routes/rewards.py)** —
+  New `_resolve_rewards_dir(store, slug, stage)` helper. When
+  `stage="<mission_slug>/<stage_name>"`, the function returns
+  `<project>/.missions/<mission_slug>/stages/<stage_name>/rewards/`
+  with traversal guards (rejects `..`, empty halves, backslashes,
+  non-2-part splits). `list_rewards` and `get_reward` accept
+  `?stage=...` query; absent → project rewards (Ship 18a
+  behavior preserved). Stage queries that resolve to a
+  not-yet-scaffolded rewards/ dir return `[]` (not 404) so the
+  Runs detail pane shows "no reward versions yet" cleanly while
+  the stage is still v0-only.
+
+*Frontend (`~/projects/reward-sculptor-ui/frontend/src`)*:
+- **[lib/types.ts](reward-sculptor-ui/frontend/src/lib/types.ts)** —
+  `RunSummary` new optional fields (`kind`, `parent_id`,
+  `mission_slug`, `stage_name`, `stage_index`). `StageSchema`
+  gains `effective_max_iterations: number | null` (Phase A).
+- **[lib/api.ts](reward-sculptor-ui/frontend/src/lib/api.ts)** —
+  `listRewards(slug, stage?)` and `getReward(slug, version,
+  stage?)` accept the optional stage param, append
+  `?stage=<encoded>` query.
+- **[hooks/useRewards.ts](reward-sculptor-ui/frontend/src/hooks/useRewards.ts)** —
+  `useRewards` and `useReward` accept a `stage?: string | null`
+  argument. Cache keys are namespaced (`["rewards", slug,
+  "stage", stageKey]`) so stage-scoped queries don't clobber
+  the project rewards cache.
+- **[components/RunsTab.tsx](reward-sculptor-ui/frontend/src/components/RunsTab.tsx)** —
+  Substantial rewrite. Public `RunsTab` now owns mission state:
+  imports `useMissions`, `NewMissionDialog`, `MissionDetailDialog`,
+  `MissionLifecycleBadge`. New `partitionRuns(runs, missions)`
+  splits runs into top-level sculpt_runs and mission groups
+  (one entry per mission_slug with its stage runs sorted by
+  `stage_index`, audit-fix #6 stable tiebreak on `run_id`).
+  Runs sidebar `RunSidebar` is fully rewritten: header
+  "Single runs" section followed by mission group entries.
+  Each group has a collapsible chevron-button (toggles expand);
+  the group "Plan" button (audit-fix WORST: explicit hit
+  target, was an inline subbutton with click-target ambiguity)
+  opens MissionDetailDialog. Stage rows render via the same
+  `RunRow` primitive as top-level runs but with
+  `stageContext={true}` which prefixes the row with
+  `${stage_index + 1}.` and uses `stage_name` instead of
+  `run_id`. New `StageContextCard` (in RunDetailPane, only
+  for mission_stage_run rows) surfaces "Stage N: name" +
+  "mission ${slug}" + behavior_goal. New `StageRewardsCard`
+  (right column, mission_stage_run only) lists per-stage
+  reward versions via `useRewards(slug, stage)`. Removed
+  the Ship-20 `ActiveMissionsCard` (rendered the missions
+  separately above the runs grid) — its function is replaced
+  by the inline mission groups.
+- **[components/MissionsTab.tsx](reward-sculptor-ui/frontend/src/components/MissionsTab.tsx)** —
+  Phase A1: gating fix at the dialog mount (`open={selectedSlug
+  != null}` instead of `open={!!selected}`) so the auto-open
+  dialog doesn't flicker closed when the optimistic-cache
+  placeholder is briefly replaced by an in-flight refetch.
+  File still on disk but unreferenced; deletable in a follow-
+  up clean-up.
+- **[components/MissionDetailDialog.tsx](reward-sculptor-ui/frontend/src/components/MissionDetailDialog.tsx)** —
+  Phase A3: StageCard reads from `stage.effective_max_iterations`
+  (persisted, source of truth) first, falls back to the WS
+  event-derived map (transient), then to `stage.max_iterations`
+  (Claude's authored value). Source-doc comment in
+  `deriveStageEffectiveMaxIters` documents the 5000-event-cap
+  limitation as known.
+- **[pages/ProjectDetail.tsx](reward-sculptor-ui/frontend/src/pages/ProjectDetail.tsx)** —
+  Missions tab removed from the `TABS` array. The dead
+  `<TabsContent value="missions">` block deleted. Import for
+  `MissionsTab` removed.
+
+**Audit findings + fixes:**
+
+- **Code-audit CRITICAL #2 — `JobManager.stop` silently fails on
+  passive jobs.** Pre-fix: `stop(stage_run_id)` returned None
+  (because passive jobs have `_cancel = None`), so the frontend
+  toast "Kill signal sent" was a lie — the parent's subprocess
+  kept training. **Fix shipped:** `stop` now routes to
+  `parent_id` for passive jobs so the parent's `_cancel` flag
+  fires, terminating the subprocess (and all child stages).
+- **Code-audit MEDIUM #6 — sort stability.** `partitionRuns`
+  sorts stages by `stage_index` only; if two stages share an
+  index (Ship 17 redecomposition splice edge case), order was
+  non-deterministic. **Fix shipped:** secondary tiebreak on
+  `run_id.localeCompare`.
+- **Design-audit WORST — mission group header click target
+  ambiguity.** Pre-fix: chevron toggled expand, the rest of
+  the header opened MissionDetailDialog — users clicking the
+  goal text expecting expansion got a dialog instead. **Fix
+  shipped:** the entire header (chevron + Sparkles + lifecycle
+  + label + goal) is one button that toggles expand/collapse;
+  a small "Plan" pill on the right is the explicit
+  curriculum-dialog button.
+- **Code-audit MEDIUM #4 — `get_clip_file` for stage runs.**
+  Live clips are written by `rollout_streamer` keyed on the
+  parent mission_execute job. Stage runs return a clean 404
+  on the clips endpoint. Acceptable: the frontend uses
+  `get_iter_rollout` for per-iter videos, which DOES resolve
+  to the stage's rollout. Documented in the route's inline
+  comment as a known limitation.
+- **Code-audit FINDING #1 — event ordering invariant.** Auditor
+  flagged a theoretical race where `iter_*` could fire before
+  `stage_started`. The orchestrator (sculpt.py) emits
+  `stage_started` BEFORE entering sculpt_run (the source of
+  iter_* events) at line 2169-2178, so the invariant holds.
+  Defensive close-prior-stage logic already in place handles
+  redecomposition splices. No code change.
+
+**Tests + verification:**
+- ✅ **TypeScript**: `pnpm tsc --noEmit` returns 0.
+- ✅ **Sculptor pytest**: **358 passed, 1 skipped** (was 355 →
+  +3 Phase A persistence regression tests, zero regressions
+  across the 355 baseline).
+- ⏳ **Backend pytest**: pending (existing 299 baseline; no
+  new tests added in Ship 21 itself — the cross-tab merge is
+  exercised end-to-end by the frontend tsc + the existing
+  list_runs test which still asserts the `sculpt_run` happy
+  path).
+- ⏳ **Live smoke**: Sam's G1 mission should now show:
+  - Decompose submit → MissionDetailDialog opens stably (no
+    flicker; gated on direct selectedSlug state).
+  - StageCard `rounds X/Y` reflects the effective cap from
+    `stage.effective_max_iterations` (persisted), survives
+    page refresh + WS event-cap eviction.
+  - Mission stages appear as nested rows under the mission
+    group in Runs sidebar.
+  - Click stage row → live iter timeline + metric chart +
+    log viewer + per-stage reward versions in the right
+    column.
+  - Stage rollout videos available via the same per-iter
+    rollout endpoint (stage runs route to `<project>/.missions
+    /<m>/stages/<s>/runs/iter_N/rollout/rollout.mp4`).
+  - Top-right "Plan" button on each mission group opens the
+    decomposition view (rationale + stage cards + Run/Delete).
+  - Missions tab no longer in the tab strip.
+
+**Callable surface (UI):**
+- Open a project → click **Runs** tab.
+- Click **New mission** in the header to decompose a goal;
+  MissionDetailDialog auto-opens to show the live decompose
+  stream.
+- After decompose completes (lifecycle "ready"), click **Plan**
+  on the mission group in the sidebar to review the curriculum
+  and click **Run mission** in the dialog footer to launch
+  with iterations_override / Goal A / Goal B settings.
+- Once running, each stage appears as a nested row under the
+  mission group. Click a stage row to see live metrics,
+  iter-by-iter logs, and the stage's reward versions.
+- **New run** still launches a single standalone training run
+  (kind="sculpt_run"), surfaced under "Single runs" in the
+  sidebar.
+
+**Explicitly NOT in Ship 21** (deferred):
+- Per-stage Monaco editing in the Runs detail pane —
+  StageRewardsCard is read-only; full editing stays in the
+  Rewards tab (project-scoped). A future ship can add inline
+  edit; the underlying `?stage=` query is already wired.
+- Live clips for stage runs — `rollout_streamer` is keyed on
+  the parent mission_execute job; ship a stage-keyed streamer
+  if Sam wants live frame-by-frame mid-stage video. Per-iter
+  rollouts work today.
+- RobotViewer (Overview tab) doesn't yet pick the active
+  stage as the most-recent run — would need to extend its
+  most-recent-run selector to consider `mission_stage_run`
+  rows. Defer.
+- Deleting `MissionsTab.tsx` (now dead code on disk). Leave
+  for a tidy-up commit.
+- Auto-reconnect on WS disconnect for stage runs. Inherits
+  Ship 18b's "no auto-reconnect" decision; refresh-to-retry
+  banner still shows.
+
 ### 2026-04-25 — Ship 20: UX label revamp + cross-tab mission integration
 
 **Scope:** Audit-driven UI cycle on the React app. Five user-facing wins: (1) Goal A/Goal B labels in RunMissionDialog renamed to plain English; (2) `iters X/Y` display in StageCard fixed to honor `iterations_override` (was showing nonsense like `iters 2/3` when override capped run at 2); (3) `params.mission_slug` wire format pinned with a regression test (Sam's auto-open-dialog complaint from Ship 19d); (4) blanket label cleanup — `MISSION_EXECUTE`/`MISSION_DECOMPOSE` chips, `0/3 stages`, `redecomp ×N`, `orphan parent_ref`, "Decomposing — Claude is building the curriculum"; (5) active missions surface in the Runs tab via a static `ActiveMissionsCard` panel that opens the existing `MissionDetailDialog`.

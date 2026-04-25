@@ -410,18 +410,27 @@ export async function fetchPreviewBlob(
 }
 
 // ── Rewards ───────────────────────────────────────────────────────────
-export async function listRewards(slug: string): Promise<RewardVersionSummary[]> {
+export async function listRewards(
+  slug: string,
+  /** §Ship 21: optional `<missionSlug>/<stageName>` to scope rewards
+   *  to that mission stage's rewards/ dir. Omit for project rewards. */
+  stage?: string,
+): Promise<RewardVersionSummary[]> {
+  const qs = stage ? `?stage=${encodeURIComponent(stage)}` : "";
   return handle<RewardVersionSummary[]>(
-    await fetch(`/api/projects/${slug}/rewards`),
+    await fetch(`/api/projects/${slug}/rewards${qs}`),
   );
 }
 
 export async function getReward(
   slug: string,
   version: number,
+  /** §Ship 21: optional `<missionSlug>/<stageName>` to scope. */
+  stage?: string,
 ): Promise<RewardVersionDetail> {
+  const qs = stage ? `?stage=${encodeURIComponent(stage)}` : "";
   return handle<RewardVersionDetail>(
-    await fetch(`/api/projects/${slug}/rewards/${version}`),
+    await fetch(`/api/projects/${slug}/rewards/${version}${qs}`),
   );
 }
 

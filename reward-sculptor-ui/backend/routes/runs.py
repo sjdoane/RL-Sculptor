@@ -65,9 +65,33 @@ def _find_run(jobs: JobManager, slug: str, run_id: str) -> Optional[Job]:
     job = jobs.get(run_id)
     if job is None:
         return None
-    if job.kind != "sculpt_run" or job.project_slug != slug:
+    # §Ship 21: also accept mission_stage_run kind so per-stage rows
+    # in /runs are addressable by the standard run-detail / clip /
+    # rollout / WS routes.
+    if job.kind not in ("sculpt_run", "mission_stage_run"):
+        return None
+    if job.project_slug != slug:
         return None
     return job
+
+
+def _resolve_run_root(job: Job, project_dir: Path) -> Path:
+    """§Ship 21: where this run's `runs/iter_*/` artifacts live.
+
+    For top-level sculpt_run jobs: `<project_dir>/runs/`.
+    For mission_stage_run jobs: `<project_dir>/.missions/<mission_slug>/
+    stages/<stage_name>/runs/` — each stage scaffolds its own mini-
+    project with its own runs/ tree.
+    """
+    if job.kind == "mission_stage_run":
+        mission_slug = job.params.get("mission_slug")
+        stage_name = job.params.get("stage_name")
+        if mission_slug and stage_name:
+            return (
+                project_dir / ".missions" / str(mission_slug)
+                / "stages" / str(stage_name) / "runs"
+            )
+    return project_dir / "runs"
 
 
 def _run_summary(job: Job) -> RunSummary:
@@ -99,12 +123,15 @@ def _run_summary(job: Job) -> RunSummary:
         except Exception:  # noqa: BLE001
             classification = None
 
+    # §Ship 21: surface mission/stage context for mission_stage_run
+    # rows so the Runs sidebar can group them under their parent
+    # mission, and the detail pane can route per-stage rewards.
     return RunSummary(
         run_id=job.job_id,
         project_slug=job.project_slug or "",
         status=job.status,
         behavior_goal=str(params.get("behavior_goal") or ""),
-        iterations_requested=int(params.get("iterations") or 0),
+        iterations_requested=int(params.get("iterations_requested") or params.get("iterations") or 0),
         iterations_completed=completed,
         current_iter_index=current,
         primary_metric_history=metric_history,
@@ -112,6 +139,11 @@ def _run_summary(job: Job) -> RunSummary:
         ended_at=job.ended_at,
         error=job.error,
         error_classification=classification,
+        kind=job.kind,  # type: ignore[arg-type]
+        parent_id=job.parent_id,
+        mission_slug=params.get("mission_slug"),
+        stage_name=params.get("stage_name"),
+        stage_index=params.get("stage_index"),
     )
 
 
@@ -194,7 +226,12 @@ def list_runs(
             status.HTTP_404_NOT_FOUND, "project not found",
             detail=f"no project with slug {slug!r}", type_="/problems/not-found",
         )
-    return [_run_summary(j) for j in jobs.list(kind="sculpt_run", project_slug=slug)]
+    # §Ship 21: include `mission_stage_run` rows (per-stage child jobs
+    # registered by mission_jobs._stream_stdout). Sidebar groups them
+    # under their parent mission.
+    sculpt_runs = jobs.list(kind="sculpt_run", project_slug=slug)
+    stage_runs = jobs.list(kind="mission_stage_run", project_slug=slug)
+    return [_run_summary(j) for j in (*sculpt_runs, *stage_runs)]
 
 
 # ── GET /projects/{slug}/runs/{run_id} ────────────────────────────────
@@ -222,9 +259,18 @@ def get_run(
             type_="/problems/not-found",
         )
     summary = _run_summary(job)
+    # §Ship 21: stage runs don't have a top-level RunParams (the
+    # parent mission_execute owns those); synthesize a minimal one
+    # from the stage's recorded fields so RunDetail's existing shape
+    # holds. behavior_goal becomes the stage's goal_text.
+    iters_for_params = int(
+        job.params.get("iterations_requested")
+        or job.params.get("iterations")
+        or 1
+    )
     params = RunParams(
         behavior_goal=str(job.params.get("behavior_goal") or ""),
-        iterations=int(job.params.get("iterations") or 1),
+        iterations=iters_for_params,
         no_kg=bool(job.params.get("no_kg") or False),
         dry_run=bool(job.params.get("dry_run") or False),
     )
@@ -520,10 +566,13 @@ def get_iter_rollout(
     detail = store.get(slug)
     if detail is None:
         return _problem(404, "project not found", type_="/problems/not-found")
-    if _find_run(jobs, slug, run_id) is None:
+    job = _find_run(jobs, slug, run_id)
+    if job is None:
         return _problem(404, "run not found", type_="/problems/not-found")
     project_dir = Path(detail.project_dir)
-    path = project_dir / "runs" / f"iter_{iter_index}" / "rollout" / "rollout.mp4"
+    # §Ship 21: stage runs live under .missions/<m>/stages/<s>/runs/
+    runs_root = _resolve_run_root(job, project_dir)
+    path = runs_root / f"iter_{iter_index}" / "rollout" / "rollout.mp4"
     if not path.is_file() or path.stat().st_size < 2048:
         return _problem(
             404, "rollout not available",

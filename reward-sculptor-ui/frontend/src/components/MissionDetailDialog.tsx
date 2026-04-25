@@ -573,19 +573,31 @@ function StageCard({
   depth: number;
   isCurrent: boolean;
   iters: IterRow[];
-  /** Cap actually enforced for this stage's last/current run. Null
-   *  when no run has reported in yet (no stage_started event seen).
-   *  When non-null and != stage.max_iterations, the user passed
-   *  `iterations_override` and we surface a tooltip explaining. */
+  /** Cap derived from the WS event stream (per-mount; volatile). Used
+   *  ONLY as a fallback when the persisted `stage.effective_max_
+   *  iterations` is null (e.g., a stage that hasn't run yet but the
+   *  user is mid-launch). The persisted field is the source of truth
+   *  once a run has started. */
   effectiveMaxIters: number | null;
 }) {
   const orphan = stage.parent_stage !== null && depth === 0;
-  const displayMax = effectiveMaxIters ?? stage.max_iterations;
+  // §Ship 20a fallback chain:
+  //   1. stage.effective_max_iterations (PERSISTED — source of truth
+  //      once orchestrator wrote it; survives page refresh + WS
+  //      event-cap eviction).
+  //   2. effectiveMaxIters from the live event stream (transient;
+  //      only relevant for the brief window before the first
+  //      stage_completed/failed event triggers a save).
+  //   3. stage.max_iterations (Claude's authored value; the
+  //      pre-Ship-20 default and final fallback).
+  const persistedEff = stage.effective_max_iterations;
+  const liveEff = effectiveMaxIters;
+  const effective = persistedEff ?? liveEff ?? null;
+  const displayMax = effective ?? stage.max_iterations;
   const overrideActive =
-    effectiveMaxIters !== null &&
-    effectiveMaxIters !== stage.max_iterations;
+    effective !== null && effective !== stage.max_iterations;
   const itersTooltip = overrideActive
-    ? `Claude allocated ${stage.max_iterations} rounds; this run capped at ${effectiveMaxIters}.`
+    ? `Claude allocated ${stage.max_iterations} rounds; this run capped at ${effective}.`
     : undefined;
   return (
     <div

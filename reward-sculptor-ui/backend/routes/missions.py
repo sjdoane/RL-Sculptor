@@ -366,6 +366,9 @@ def run_mission(
             project_slug=slug,
             mission_slug=mission_slug,
             run_kwargs=run_kwargs,
+            # §Ship 21: pass JobManager so the streamer can register
+            # per-stage child Jobs (mission_stage_run kind) on the fly.
+            job_manager=jobs,
         ),
         params={"mission_slug": mission_slug, **run_kwargs},
     )

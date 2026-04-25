@@ -110,6 +110,11 @@ JobKind = Literal[
     "kg_ingest", "kg_extract", "kg_ingest_extract",
     "kg_research", "kg_viz_render", "sculpt_run",
     "reward_prompt_edit", "physics_prompt_edit",
+    # §Ship 18a — mission orchestrator job kinds.
+    "mission_decompose", "mission_execute",
+    # §Ship 21 — per-stage child job created on `stage_started` so
+    # mission stage runs are first-class entries in /runs.
+    "mission_stage_run",
 ]
 JobStatus = Literal["queued", "running", "completed", "errored", "stopped"]
 
@@ -125,6 +130,9 @@ class JobSummary(BaseModel):
     started_at: Optional[datetime] = None
     ended_at: Optional[datetime] = None
     error: Optional[str] = None
+    # §Ship 21 — for mission_stage_run jobs, points at the parent
+    # mission_execute job. Null for top-level jobs.
+    parent_id: Optional[str] = None
 
 
 class JobDetail(JobSummary):

@@ -419,6 +419,15 @@ export interface RunSummary {
   ended_at: string | null;
   error: string | null;
   error_classification?: ErrorClassification | null;
+  // §Ship 21: distinguish standalone sculpt_run rows from per-stage
+  // mission_stage_run rows. The Runs sidebar groups stage runs under
+  // their parent mission. Backend defaults to "sculpt_run" for
+  // backward compatibility, so undefined === "sculpt_run".
+  kind?: "sculpt_run" | "mission_stage_run";
+  parent_id?: string | null;
+  mission_slug?: string | null;
+  stage_name?: string | null;
+  stage_index?: number | null;
 }
 
 export interface RunDetail extends RunSummary {
@@ -707,4 +716,94 @@ export interface AdapterInfo {
   supported_robot_categories: string[];
   adoption_guide_url: string;
   estimated_effort: string;
+}
+
+// ── Missions (Ship 18a) ─────────────────────────────────────────────
+// Mirrors backend/models/mission.py.
+
+export type StageStatus =
+  | "pending"
+  | "training"
+  | "succeeded"
+  | "failed"
+  | "skipped";
+
+export type MissionLifecycleStatus =
+  | "ready"
+  | "running"
+  | "completed"
+  | "halted"
+  | "errored";
+
+export type MissionJobKind = "mission_decompose" | "mission_execute";
+
+export interface StageSchema {
+  name: string;
+  goal_text: string;
+  success_criterion: string;
+  max_iterations: number;
+  parent_stage: string | null;
+  reward_seed_prompt: string;
+  kg_seed_papers: string[];
+
+  status: StageStatus;
+  final_policy_path: string | null;
+  final_reward_path: string | null;
+  best_metric: number | null;
+  iterations_used: number;
+  started_at: string | null;
+  finished_at: string | null;
+  redecomposition_attempts: number;
+  // §Ship 20a: persisted cap actually enforced for the stage's last
+  // (or current) run — `iterations_override or max_iterations`. Null
+  // for stages that haven't run yet. Use this for `rounds X/Y`
+  // display so it stays correct after the WS event window slides;
+  // fall back to max_iterations only when null.
+  effective_max_iterations: number | null;
+}
+
+export interface MissionSummary {
+  mission_slug: string;
+  project_slug: string;
+  goal: string;
+  n_stages: number;
+  current_stage_idx: number;
+  decomposition_model: string;
+  created_at: string;  // ISO-8601
+  lifecycle: MissionLifecycleStatus;
+  active_job_id: string | null;
+  active_job_kind: MissionJobKind | null;
+}
+
+export interface MissionDetail extends MissionSummary {
+  stages: StageSchema[];
+  decomposition_rationale: string;
+  schema_version: number;
+}
+
+export interface CreateMissionRequest {
+  goal: string;             // 8-2000 chars
+  mission_slug?: string;    // optional override
+  no_kg?: boolean;
+}
+
+export interface DeleteMissionResponse {
+  mission_slug: string;
+  freed_bytes: number;
+}
+
+/** WebSocket envelope for mission events. Per Ship 18a plan-review,
+ *  events are validated server-side as `dict[str, Any]` (only `type`
+ *  is structural); narrow on `type` per-event in the consumer. */
+export interface MissionEvent {
+  type: string;
+  stage_name?: string | null;
+  stage_index?: number | null;
+  ts?: number | null;
+  source?: "stdout" | string;
+  // Per-event-type fields are open. Examples:
+  //   mission_started: { goal, stage_count }
+  //   stage_completed_training: { stage_name, iterations_run, ... }
+  //   stage_redecomposed: { original_stage_name, sub_stage_names, ... }
+  [key: string]: unknown;
 }

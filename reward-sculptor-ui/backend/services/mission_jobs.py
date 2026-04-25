@@ -35,11 +35,53 @@ from typing import Any, Awaitable, Callable, Optional
 import sculptor  # noqa: F401
 
 from backend.services import mission_store
-from backend.services.job_manager import Job
+from backend.services.job_manager import Job, JobManager
 
 
 # Stdout marker the sculpt CLI uses for structured events.
 _EVENT_TAG = "[SCULPT-EVENT]"
+
+# §Ship 21: stage lifecycle event types. The streamer creates a child
+# Job (kind="mission_stage_run") on `stage_started`; tee's iter_*
+# events to it; closes it on a stage-terminal event.
+_STAGE_OPEN_EVENT = "stage_started"
+_STAGE_CLOSE_EVENTS = frozenset({
+    "stage_succeeded",
+    "stage_failed",
+    "stage_skipped",
+})
+# Events emitted from inside the per-stage sculpt_run subprocess that
+# the parent's streamer sees AFTER `stage_started` and BEFORE the
+# stage-close event. These get tee'd to the active child Job's event
+# stream so the Runs tab's existing iter timeline / metric chart /
+# log viewer machinery renders the stage exactly like a top-level
+# sculpt_run.
+_STAGE_TEE_EVENTS = frozenset({
+    "iter_started",
+    "iter_completed",
+    "iter_progress",
+    "iter_rolled_out",
+    "iter_diagnosed",
+    "rollout_done",
+    "stage_warm_start_resolved",
+    "warm_start_skipped",
+    "stage_warm_start_chosen",
+    "stage_scaffolded",
+    "stage_v1_materialized",
+    "stage_completed_training",
+    "stage_criterion_evaluated",
+    "stage_extension_skipped",
+    "stage_extension_exhausted",
+    "stage_extended",
+    "stage_skill_published",
+    "stage_skill_publish_skipped",
+    "skill_warm_start_skipped",
+    "feedback_read_degraded",
+    "stage_redecomposition_started",
+    "stage_redecomposed",
+    "redecomposition_skipped",
+    "stage_redecomposition_failed",
+})
 
 
 # ── In-process decompose ─────────────────────────────────────────────
@@ -179,6 +221,7 @@ def run_mission_execute_job(
     project_slug: str,
     mission_slug: str,
     run_kwargs: Optional[dict[str, Any]] = None,
+    job_manager: Optional[JobManager] = None,
 ) -> Callable[[Job, asyncio.Event], Awaitable[dict[str, Any]]]:
     """Async runner that spawns `sculpt mission-run` as a subprocess
     and streams its `[SCULPT-EVENT]` markers into `job.events`.
@@ -241,7 +284,12 @@ def run_mission_execute_job(
         job.params["pid"] = proc.pid
 
         killer = asyncio.create_task(_kill_on_cancel(proc, cancel))
-        reader = asyncio.create_task(_stream_stdout(job, proc, log_path))
+        reader = asyncio.create_task(_stream_stdout(
+            job, proc, log_path,
+            job_manager=job_manager,
+            project_slug=project_slug,
+            mission_slug=mission_slug,
+        ))
 
         rc = await proc.wait()
         cancel.set()
@@ -282,15 +330,40 @@ async def _stream_stdout(
     job: Job,
     proc: asyncio.subprocess.Process,
     log_path: Path,
+    *,
+    job_manager: Optional[JobManager] = None,
+    project_slug: Optional[str] = None,
+    mission_slug: Optional[str] = None,
 ) -> None:
     """Tee subprocess stdout into job.events: every line as `log_line`,
-    plus parsed `[SCULPT-EVENT]` JSON as a typed event."""
+    plus parsed `[SCULPT-EVENT]` JSON as a typed event.
+
+    §Ship 21: when `job_manager` is supplied, register a child
+    `mission_stage_run` Job for each stage_started event seen so the
+    stage appears as a first-class entry in /runs (with its own iter
+    timeline, metric chart, log viewer). Tee subsequent iter_* + log
+    events to that child until the stage closes.
+    """
     assert proc.stdout is not None
 
     try:
         logf = log_path.open("a", encoding="utf-8", buffering=1)
     except OSError:
         logf = None
+
+    # Active child Job for the currently-running stage, or None.
+    active_stage_job: Optional[Job] = None
+
+    def _close_active_stage(final_status: str, error_msg: Optional[str] = None) -> None:
+        nonlocal active_stage_job
+        if active_stage_job is None:
+            return
+        from datetime import datetime as _dt, timezone as _tz
+        active_stage_job.status = final_status  # type: ignore[assignment]
+        active_stage_job.ended_at = _dt.now(tz=_tz.utc)
+        if error_msg is not None:
+            active_stage_job.error = error_msg
+        active_stage_job = None
 
     try:
         while True:
@@ -303,18 +376,96 @@ async def _stream_stdout(
                     logf.write(text + "\n")
                 except OSError:
                     pass
-            job.emit({"type": "log_line", "text": text})
-            if text.startswith(_EVENT_TAG):
-                payload_str = text[len(_EVENT_TAG):].strip()
-                try:
-                    payload = json.loads(payload_str)
-                except Exception:  # noqa: BLE001
-                    continue
-                if isinstance(payload, dict) and payload.get("type"):
-                    ev = dict(payload)
-                    ev["source"] = "stdout"
-                    job.emit(ev)
+            log_event = {"type": "log_line", "text": text}
+            job.emit(log_event)
+            # §Ship 21: tee log lines to the active child stage job too
+            # so the per-stage Runs detail pane sees stdout in real time.
+            if active_stage_job is not None:
+                active_stage_job.emit(dict(log_event))
+
+            if not text.startswith(_EVENT_TAG):
+                continue
+            payload_str = text[len(_EVENT_TAG):].strip()
+            try:
+                payload = json.loads(payload_str)
+            except Exception:  # noqa: BLE001
+                continue
+            if not (isinstance(payload, dict) and payload.get("type")):
+                continue
+            ev = dict(payload)
+            ev["source"] = "stdout"
+            ev_type = ev["type"]
+
+            # Always emit on the parent (mission_execute) job.
+            job.emit(ev)
+
+            # §Ship 21: child stage-job lifecycle.
+            if (
+                ev_type == _STAGE_OPEN_EVENT
+                and job_manager is not None
+                and project_slug is not None
+                and mission_slug is not None
+            ):
+                # Close any prior unclosed stage (defensive — should not
+                # happen in normal flow because each stage emits a
+                # close event, but if the orchestrator crashed mid-
+                # stage the previous one is still "running"; mark it
+                # errored so the UI's status is consistent).
+                if active_stage_job is not None:
+                    _close_active_stage(
+                        "errored",
+                        error_msg="stage_started fired without prior close event",
+                    )
+                stage_name = ev.get("stage_name") or "stage_unknown"
+                stage_dir = ev.get("stage_dir")
+                goal_text = ev.get("goal_text") or ""
+                eff_max = ev.get("effective_max_iterations")
+                stage_index = ev.get("stage_index")
+                active_stage_job = job_manager.register_passive_job(
+                    kind="mission_stage_run",
+                    project_slug=project_slug,
+                    parent_id=job.job_id,
+                    params={
+                        "mission_slug": mission_slug,
+                        "stage_name": stage_name,
+                        "stage_index": stage_index,
+                        "stage_dir": stage_dir,
+                        "behavior_goal": goal_text,
+                        "iterations_requested": eff_max,
+                        "parent_mission_goal": job.params.get("mission_slug"),
+                    },
+                )
+                # Also emit the stage_started on the child for replay.
+                active_stage_job.emit(dict(ev))
+                continue
+
+            if active_stage_job is not None and ev_type in _STAGE_TEE_EVENTS:
+                active_stage_job.emit(dict(ev))
+
+            if active_stage_job is not None and ev_type in _STAGE_CLOSE_EVENTS:
+                # Map stage event type → job status. stage_succeeded /
+                # stage_skipped → completed; stage_failed → errored.
+                final = (
+                    "errored" if ev_type == "stage_failed" else "completed"
+                )
+                err = (
+                    ev.get("reason") or ev.get("detail")
+                    if ev_type == "stage_failed"
+                    else None
+                )
+                # Emit the close event on the child too so the UI
+                # observes the terminal transition.
+                active_stage_job.emit(dict(ev))
+                _close_active_stage(final, error_msg=err)
     finally:
+        # Parent subprocess ended (success or kill). Any still-open
+        # child stage gets marked errored so the Runs UI doesn't show
+        # a perpetually-running row.
+        if active_stage_job is not None:
+            _close_active_stage(
+                "errored",
+                error_msg="parent mission_execute terminated mid-stage",
+            )
         if logf is not None:
             try:
                 logf.close()

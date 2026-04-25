@@ -30,7 +30,11 @@ import {
   TabsTrigger,
 } from "@/components/ui/tabs";
 import { KnowledgeGraphTab } from "@/components/KnowledgeGraphTab";
-import { MissionsTab } from "@/components/MissionsTab";
+// §Ship 21: Missions tab merged into Runs. NewMissionDialog now lives
+// in RunsTab's header; mission stage runs render as nested rows in
+// the runs sidebar; per-stage rewards render in the run detail pane.
+// MissionDetailDialog stays for the curriculum view (rationale +
+// stage cards + KG refs).
 import { PhysicsTab } from "@/components/PhysicsTab";
 import { ProjectSettingsDialog } from "@/components/ProjectSettingsDialog";
 import { NewRunDialog } from "@/components/NewRunDialog";
@@ -199,7 +203,6 @@ const TABS = [
   { value: "physics",   label: "Physics" },
   { value: "kg",        label: "Knowledge Graph" },
   { value: "runs",      label: "Runs" },
-  { value: "missions",  label: "Missions" },
   { value: "reports",   label: "Reports" },
 ] as const;
 
@@ -288,10 +291,6 @@ export default function ProjectDetail() {
                   <RunsTabLazy slug={slug!} project={project.data} />
                 </Suspense>
               )}
-            </TabsContent>
-
-            <TabsContent value="missions">
-              {activeTab === "missions" && <MissionsTab slug={slug!} />}
             </TabsContent>
 
             <TabsContent value="reports">

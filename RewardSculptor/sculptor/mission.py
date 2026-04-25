@@ -96,6 +96,16 @@ class Stage:
     # further. Bounded at one level per CurricuLLM guidance — deeper
     # trees would invite combinatorial fanout on pathological tasks.
     redecomposition_attempts: int = 0
+    # §Ship 20a: persisted cap actually enforced for this stage's last
+    # (or current) run — `iterations_override or max_iterations`.
+    # Persisted so the UI's `rounds X/Y` display stays correct AFTER
+    # the WS event window slides past `stage_started`. Ship 20 derived
+    # this from events alone; long missions evict those events and the
+    # dialog fell back to authored `max_iterations`, showing nonsense
+    # like `rounds 4/3` when the user actually capped at 5. None for
+    # stages that haven't run yet; backward-compatible via Stage.from_
+    # dict's filter-unknown-keys path.
+    effective_max_iterations: Optional[int] = None
 
     def to_dict(self) -> dict[str, Any]:
         return dataclasses.asdict(self)

@@ -167,6 +167,16 @@ class RunSummary(BaseModel):
     ended_at: Optional[datetime]
     error: Optional[str]
     error_classification: Optional[ErrorClassification] = None
+    # §Ship 21: distinguish standalone sculpt_run from per-stage
+    # mission_stage_run rows in the Runs tab. Optional with default
+    # "sculpt_run" for backward compat with older clients.
+    kind: str = "sculpt_run"
+    # §Ship 21: parent mission_execute job_id for stage runs; None
+    # for standalone sculpt_run.
+    parent_id: Optional[str] = None
+    mission_slug: Optional[str] = None
+    stage_name: Optional[str] = None
+    stage_index: Optional[int] = None
 
 
 class RunDetail(RunSummary):

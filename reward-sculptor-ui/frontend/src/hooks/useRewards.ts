@@ -17,21 +17,40 @@ import type {
   RewardVersionSummary,
 } from "@/lib/types";
 
-export function useRewards(slug: string | undefined) {
+export function useRewards(
+  slug: string | undefined,
+  /** §Ship 21: optional `<missionSlug>/<stageName>` to fetch that
+   *  stage's reward versions instead of the project-global ones.
+   *  When set, the cache key is namespaced so stage views don't
+   *  clobber the project rewards cache. */
+  stage?: string | null,
+) {
+  const stageKey = stage ?? null;
   return useQuery<RewardVersionSummary[]>({
-    queryKey: slug ? qk.rewards(slug) : ["rewards", "_none"],
-    queryFn: () => listRewards(slug!),
+    queryKey: slug
+      ? stageKey
+        ? ["rewards", slug, "stage", stageKey]
+        : qk.rewards(slug)
+      : ["rewards", "_none"],
+    queryFn: () => listRewards(slug!, stageKey ?? undefined),
     enabled: !!slug,
   });
 }
 
-export function useReward(slug: string | undefined, version: number | undefined) {
+export function useReward(
+  slug: string | undefined,
+  version: number | undefined,
+  stage?: string | null,
+) {
+  const stageKey = stage ?? null;
   return useQuery<RewardVersionDetail>({
     queryKey:
       slug !== undefined && version !== undefined
-        ? qk.reward(slug, version)
+        ? stageKey
+          ? ["reward", slug, version, "stage", stageKey]
+          : qk.reward(slug, version)
         : ["reward", "_none"],
-    queryFn: () => getReward(slug!, version!),
+    queryFn: () => getReward(slug!, version!, stageKey ?? undefined),
     enabled: slug !== undefined && version !== undefined,
   });
 }

@@ -2,6 +2,8 @@ import { useMemo, useRef, useState } from "react";
 import {
   ArrowRight,
   CheckCircle2,
+  ChevronDown,
+  ChevronRight,
   Cpu,
   Loader2,
   Radio,
@@ -25,13 +27,14 @@ import { useSystemGpu } from "@/hooks/useLibrary";
 import { LogViewer } from "@/components/LogViewer";
 import { MetricChart } from "@/components/MetricChart";
 import { NewRunDialog } from "@/components/NewRunDialog";
+import { NewMissionDialog } from "@/components/NewMissionDialog";
 import {
   MissionDetailDialog,
   MissionLifecycleBadge,
 } from "@/components/MissionDetailDialog";
 import { useRunEvents } from "@/hooks/useRunEvents";
 import { useMissions } from "@/hooks/useMissions";
-import { useRegenerateRewardTemplate } from "@/hooks/useRewards";
+import { useRegenerateRewardTemplate, useRewards } from "@/hooks/useRewards";
 import { useKillRun, useRun, useRuns } from "@/hooks/useRuns";
 import { ApiError } from "@/lib/api";
 import { cn, formatRelative } from "@/lib/utils";
@@ -57,35 +60,45 @@ export default function RunsTab({
   const list = useRuns(slug);
   const missions = useMissions(slug);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
-  // §Ship 20 Goal #5: opening a mission from the Active missions
-  // panel routes through the existing MissionDetailDialog (which
-  // owns the live WS subscription via useMissionEvents). We don't
-  // mirror that state here — the dialog stays the canonical surface
-  // for live mission monitoring, RunsTab just makes the entry
-  // visible.
+  // §Ship 21: clicking a mission GROUP HEADER opens the
+  // MissionDetailDialog (curriculum view: stages, decomposition
+  // rationale, KG refs). Clicking a stage ROW selects that stage's
+  // child run in the right pane (live metrics + logs + per-stage
+  // rewards) — the canonical live-monitoring surface. The dialog
+  // and the detail pane subscribe to different WS endpoints (mission
+  // events vs. stage-run events) so they don't conflict.
   const [missionDialogSlug, setMissionDialogSlug] = useState<string | null>(
     null,
   );
 
   const runs = list.data ?? [];
-  const selected = selectedRunId ?? runs[0]?.run_id ?? null;
-  // Surface missions whose decompose or execute job is in flight;
-  // resolved missions stay on the Missions tab. Falls back to
-  // "lifecycle === running" when the active_job_id field has been
-  // cleared but the on-disk lifecycle is still mid-flight.
-  const activeMissions = useMemo<MissionSummary[]>(
-    () =>
-      (missions.data ?? []).filter(
-        (m) => m.active_job_id != null || m.lifecycle === "running",
-      ),
-    [missions.data],
+  // §Ship 21: split runs into top-level sculpt_runs vs. mission stage
+  // runs (kind="mission_stage_run"). Stage runs render nested under
+  // their parent mission; top-level runs render in their own group.
+  const { sculptRuns, missionGroups } = useMemo(
+    () => partitionRuns(runs, missions.data ?? []),
+    [runs, missions.data],
   );
+  const allOrderedRunIds = useMemo(
+    () => [
+      ...sculptRuns.map((r) => r.run_id),
+      ...missionGroups.flatMap((g) => g.stages.map((r) => r.run_id)),
+    ],
+    [sculptRuns, missionGroups],
+  );
+  const selected =
+    selectedRunId ?? allOrderedRunIds[0] ?? null;
   const missionDialogSummary =
     missionDialogSlug != null
       ? (missions.data ?? []).find(
           (m) => m.mission_slug === missionDialogSlug,
         ) ?? null
       : null;
+
+  const empty =
+    !list.isLoading
+    && sculptRuns.length === 0
+    && missionGroups.length === 0;
 
   return (
     <div className="flex flex-col gap-4">
@@ -94,57 +107,56 @@ export default function RunsTab({
           <div>
             <CardTitle className="text-sm">Runs</CardTitle>
             <CardDescription className="text-[11px]">
-              Standalone training runs and live mission stages.
-              History below; click a row for metrics, logs, and
-              per-iteration detail.
+              Single training runs, and missions that chain stages
+              together. Click a row for metrics, logs, and per-round
+              detail. Click a mission's name to see its full
+              curriculum.
             </CardDescription>
           </div>
-          <NewRunDialog
-            slug={slug}
-            project={project}
-            onLaunched={(id) => setSelectedRunId(id)}
-          />
+          {/* §Ship 21: NewMissionDialog pulled in alongside NewRunDialog
+              so both launch surfaces live in one place. The Missions
+              tab is removed in this ship. */}
+          <div className="flex items-center gap-2">
+            <NewMissionDialog
+              slug={slug}
+              onCreated={(missionSlug) => setMissionDialogSlug(missionSlug)}
+            />
+            <NewRunDialog
+              slug={slug}
+              project={project}
+              onLaunched={(id) => setSelectedRunId(id)}
+            />
+          </div>
         </CardHeader>
       </Card>
-
-      {activeMissions.length > 0 && (
-        <ActiveMissionsCard
-          missions={activeMissions}
-          onOpen={setMissionDialogSlug}
-        />
-      )}
 
       {list.isLoading && (
         <p className="text-sm text-muted-foreground">Loading runs…</p>
       )}
 
-      {!list.isLoading && runs.length === 0 && (
+      {empty && (
         <Card className="p-8 text-center">
           <Wand2 className="mx-auto h-8 w-8 text-muted-foreground" />
           <p className="mt-2 text-sm">No runs yet.</p>
           <p className="text-xs text-muted-foreground">
-            Launch one above — keep it to a few iterations for the
-            first pass.
-            {activeMissions.length > 0 && (
-              <>
-                {" "}
-                Missions running in the background appear in the panel
-                above.
-              </>
-            )}
+            Launch a single run with <strong>New run</strong>, or
+            decompose a complex goal into a curriculum with{" "}
+            <strong>New mission</strong>.
           </p>
         </Card>
       )}
 
-      {runs.length > 0 && (
-        <div className="grid grid-cols-1 gap-4 lg:grid-cols-[240px_minmax(0,1fr)]">
+      {!empty && (
+        <div className="grid grid-cols-1 gap-4 lg:grid-cols-[260px_minmax(0,1fr)]">
           <RunSidebar
-            runs={runs}
+            sculptRuns={sculptRuns}
+            missionGroups={missionGroups}
             selected={selected}
-            onSelect={setSelectedRunId}
+            onSelectRun={setSelectedRunId}
+            onOpenMissionDialog={setMissionDialogSlug}
           />
           {selected ? (
-            <RunDetailPane slug={slug} runId={selected} />
+            <RunDetailPane slug={slug} runId={selected} runs={runs} />
           ) : (
             <Card className="flex items-center justify-center p-8 text-xs text-muted-foreground">
               Select a run.
@@ -153,13 +165,11 @@ export default function RunsTab({
         </div>
       )}
 
-      {/* §Ship 20 Goal #5: clicking an active-mission row opens the
-          existing MissionDetailDialog. The dialog already manages the
-          live WS subscription, stage cards, iter ribbon — duplicating
-          that surface in Runs would mean managing the WS lifecycle
-          across tab switches (plan-audit's biggest hole). Keeping
-          the dialog as the canonical live-monitoring surface sidesteps
-          that entirely. */}
+      {/* §Ship 21: the mission detail dialog now opens ONLY for the
+          curriculum view (stages, rationale, KG refs). Live monitoring
+          for a stage happens in RunDetailPane. The dialog's Run/Delete
+          footer buttons are still useful for managing the mission as
+          a whole. */}
       <MissionDetailDialog
         slug={slug}
         missionSlug={missionDialogSlug}
@@ -173,66 +183,81 @@ export default function RunsTab({
   );
 }
 
-// ── Active missions panel (Ship 20 Goal #5) ──────────────────────────
-function ActiveMissionsCard({
-  missions,
-  onOpen,
-}: {
-  missions: MissionSummary[];
-  onOpen: (missionSlug: string) => void;
-}) {
-  return (
-    <Card>
-      <CardHeader className="py-3">
-        <CardTitle className="flex items-center gap-2 text-sm">
-          <Sparkles className="h-3.5 w-3.5 text-amber-600" />
-          Active missions
-        </CardTitle>
-        <CardDescription className="text-[11px]">
-          Missions running right now. Click a row to open its live
-          stage view.
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="flex max-h-[420px] flex-col gap-1.5 overflow-y-auto scrollbar-thin p-3 pt-0">
-        {missions.map((m) => (
-          <button
-            key={m.mission_slug}
-            type="button"
-            onClick={() => onOpen(m.mission_slug)}
-            className="flex flex-col gap-1 rounded-md border bg-muted/20 px-3 py-2 text-left text-xs transition-colors hover:bg-accent/40"
-          >
-            <div className="flex flex-wrap items-center gap-2">
-              <MissionLifecycleBadge lifecycle={m.lifecycle} />
-              <span className="text-[11px] font-semibold">
-                {missionRunStateLabel(m)}
-              </span>
-              {m.active_job_id != null && (
-                <span className="rounded bg-amber-50 px-1 py-0.5 text-[9px] font-semibold uppercase tracking-wide text-amber-700 ring-1 ring-amber-200">
-                  {m.active_job_kind === "mission_decompose"
-                    ? "Planning"
-                    : m.active_job_kind === "mission_execute"
-                      ? "Training"
-                      : "active"}
-                </span>
-              )}
-              <ArrowRight className="ml-auto h-3 w-3 text-muted-foreground" />
-            </div>
-            <div className="line-clamp-1 text-[11px]">{m.goal}</div>
-            <code
-              className="truncate font-mono text-[10px] text-muted-foreground"
-              title={`mission slug: ${m.mission_slug}`}
-            >
-              {m.mission_slug}
-            </code>
-          </button>
-        ))}
-      </CardContent>
-    </Card>
-  );
+// §Ship 21: a "mission group" is a parent mission_execute job's
+// summary plus all its mission_stage_run children sorted by
+// stage_index. Top-level sculpt_runs (kind="sculpt_run") fall into
+// the standalone bucket.
+interface MissionGroup {
+  missionSlug: string;
+  mission: MissionSummary | null;
+  stages: RunSummary[];
 }
 
-// Kept in sync with MissionsTab.tsx's `stageProgressLabel` so the same
-// mission reads the same way across tabs.
+function partitionRuns(
+  runs: RunSummary[],
+  missions: MissionSummary[],
+): { sculptRuns: RunSummary[]; missionGroups: MissionGroup[] } {
+  const sculptRuns: RunSummary[] = [];
+  const stagesByMission = new Map<string, RunSummary[]>();
+  for (const r of runs) {
+    if (r.kind === "mission_stage_run" && r.mission_slug) {
+      const arr = stagesByMission.get(r.mission_slug);
+      if (arr) arr.push(r);
+      else stagesByMission.set(r.mission_slug, [r]);
+    } else {
+      sculptRuns.push(r);
+    }
+  }
+  const missionsBySlug = new Map<string, MissionSummary>(
+    missions.map((m) => [m.mission_slug, m]),
+  );
+  // Build groups in the order missions are returned by useMissions
+  // (newest-first by created_at on the backend), then any stage runs
+  // whose mission_slug isn't in the missions list (e.g., mission
+  // deleted after the run finished).
+  const seen = new Set<string>();
+  const missionGroups: MissionGroup[] = [];
+  for (const m of missions) {
+    const stages = stagesByMission.get(m.mission_slug);
+    if (!stages || stages.length === 0) continue;
+    seen.add(m.mission_slug);
+    stages.sort(
+      // §Ship 21 audit-fix #6: stable sort with run_id tiebreaker
+      // so two stage runs with the same stage_index (possible in a
+      // redecomposition splice) render in deterministic order.
+      (a, b) =>
+        (a.stage_index ?? 0) - (b.stage_index ?? 0)
+        || a.run_id.localeCompare(b.run_id),
+    );
+    missionGroups.push({
+      missionSlug: m.mission_slug,
+      mission: m,
+      stages,
+    });
+  }
+  for (const [missionSlug, stages] of stagesByMission) {
+    if (seen.has(missionSlug)) continue;
+    stages.sort(
+      // §Ship 21 audit-fix #6: stable sort with run_id tiebreaker
+      // so two stage runs with the same stage_index (possible in a
+      // redecomposition splice) render in deterministic order.
+      (a, b) =>
+        (a.stage_index ?? 0) - (b.stage_index ?? 0)
+        || a.run_id.localeCompare(b.run_id),
+    );
+    missionGroups.push({
+      missionSlug,
+      mission: missionsBySlug.get(missionSlug) ?? null,
+      stages,
+    });
+  }
+  return { sculptRuns, missionGroups };
+}
+
+// Lifecycle-aware progress label for a mission summary. Kept in
+// sync with MissionsTab.tsx's `stageProgressLabel` (used elsewhere
+// in the codebase) so the same mission reads the same way across
+// tabs.
 function missionRunStateLabel(m: MissionSummary): string {
   const { current_stage_idx: i, n_stages: n, lifecycle } = m;
   if (n === 0) return "Planning…";
@@ -243,53 +268,188 @@ function missionRunStateLabel(m: MissionSummary): string {
 }
 
 // ── sidebar ───────────────────────────────────────────────────────────
+// §Ship 21: the sidebar now has TWO sections:
+//   1. Top-level sculpt_run rows (single training runs).
+//   2. Mission groups, each a collapsible header (mission name +
+//      lifecycle) followed by stage rows nested inside.
+// Only one row is "selected" at a time. The header itself opens the
+// MissionDetailDialog (curriculum view, no stage selection).
 function RunSidebar({
-  runs,
+  sculptRuns,
+  missionGroups,
   selected,
-  onSelect,
+  onSelectRun,
+  onOpenMissionDialog,
 }: {
-  runs: RunSummary[];
+  sculptRuns: RunSummary[];
+  missionGroups: MissionGroup[];
   selected: string | null;
-  onSelect: (id: string) => void;
+  onSelectRun: (id: string) => void;
+  onOpenMissionDialog: (missionSlug: string) => void;
 }) {
+  // Per-mission expanded/collapsed state. Default expanded for the
+  // active mission; collapsed for older completed missions to keep
+  // scroll height manageable.
+  const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
+  const toggle = (slug: string) =>
+    setCollapsed((s) => ({ ...s, [slug]: !s[slug] }));
+
   return (
-    <Card className="max-h-[640px] overflow-y-auto scrollbar-thin">
-      <CardHeader className="py-3">
-        <CardTitle className="text-sm">History</CardTitle>
-      </CardHeader>
-      <CardContent className="flex flex-col gap-1 p-2 pt-0">
-        {runs.map((r) => (
-          <button
-            key={r.run_id}
-            type="button"
-            onClick={() => onSelect(r.run_id)}
-            className={cn(
-              "flex flex-col gap-1 rounded-md border px-2 py-2 text-left text-xs transition-colors",
-              selected === r.run_id
-                ? "border-foreground/30 bg-accent"
-                : "border-transparent hover:bg-accent/60",
-            )}
-          >
-            <div className="flex items-center justify-between gap-2">
-              <span className="truncate font-mono text-[11px]">
-                {r.run_id.replace(/^job_/, "")}
-              </span>
-              <RunStatusBadge status={r.status} />
+    <Card className="max-h-[720px] overflow-y-auto scrollbar-thin">
+      <CardContent className="flex flex-col gap-2 p-2 pt-3">
+        {sculptRuns.length > 0 && (
+          <div className="flex flex-col gap-1">
+            <div className="px-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+              Single runs
             </div>
-            <div className="flex items-center gap-1 text-[10px] text-muted-foreground">
-              <Sparkline history={r.primary_metric_history} />
-              <span>
-                {r.iterations_completed}/{r.iterations_requested}
-              </span>
+            {sculptRuns.map((r) => (
+              <RunRow
+                key={r.run_id}
+                run={r}
+                selected={selected === r.run_id}
+                onSelect={() => onSelectRun(r.run_id)}
+              />
+            ))}
+          </div>
+        )}
+
+        {missionGroups.map((g) => {
+          const isCollapsed = collapsed[g.missionSlug] ?? false;
+          // Auto-expand by default for groups with at least one
+          // stage in running/queued state so the user sees live
+          // training without scrolling / clicking.
+          const hasActive = g.stages.some(
+            (s) => s.status === "running" || s.status === "queued",
+          );
+          const expanded = hasActive ? !isCollapsed : !isCollapsed;
+          // Keep selected state inside this group expanded too so
+          // the user doesn't lose context on a re-render.
+          const selectedInGroup = g.stages.some((s) => s.run_id === selected);
+          const open = expanded || selectedInGroup;
+          return (
+            <div key={g.missionSlug} className="flex flex-col gap-1">
+              {/* §Ship 21 audit-fix WORST: split header into two
+                  explicit hit targets so click-target ambiguity goes
+                  away. The whole header (chevron + text + curriculum
+                  button) is one row, but the body button toggles
+                  expand/collapse (matches user expectation: "click
+                  the mission to see its stages") and a small
+                  "curriculum" icon button on the right opens the
+                  decomposition dialog. */}
+              <div className="flex items-stretch gap-1 rounded-md border bg-muted/30">
+                <button
+                  type="button"
+                  onClick={() => toggle(g.missionSlug)}
+                  className="flex min-w-0 flex-1 items-center gap-1.5 rounded-md px-1.5 py-1 text-left transition-colors hover:bg-accent/60"
+                  title={g.mission?.goal ?? g.missionSlug}
+                  aria-label={open ? "Collapse mission stages" : "Expand mission stages"}
+                  aria-expanded={open}
+                >
+                  {open ? (
+                    <ChevronDown className="h-3.5 w-3.5 shrink-0" />
+                  ) : (
+                    <ChevronRight className="h-3.5 w-3.5 shrink-0" />
+                  )}
+                  <Sparkles className="h-3 w-3 shrink-0 text-amber-600" />
+                  <div className="flex min-w-0 flex-1 flex-col">
+                    <div className="flex flex-wrap items-center gap-1.5">
+                      {g.mission && (
+                        <MissionLifecycleBadge lifecycle={g.mission.lifecycle} />
+                      )}
+                      <span className="truncate text-[11px] font-semibold">
+                        {g.mission
+                          ? missionRunStateLabel(g.mission)
+                          : g.missionSlug}
+                      </span>
+                    </div>
+                    {g.mission?.goal && (
+                      <span className="line-clamp-1 text-[10px] text-muted-foreground">
+                        {g.mission.goal}
+                      </span>
+                    )}
+                  </div>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onOpenMissionDialog(g.missionSlug)}
+                  className="shrink-0 rounded px-1.5 text-[9.5px] font-semibold uppercase tracking-wide text-muted-foreground hover:bg-accent/60 hover:text-foreground"
+                  title="Open curriculum (decomposition rationale + stage list + Run/Delete)"
+                  aria-label="Open mission curriculum"
+                >
+                  Plan
+                </button>
+              </div>
+              {open && (
+                <div className="flex flex-col gap-1 border-l border-muted/40 pl-2">
+                  {g.stages.map((r) => (
+                    <RunRow
+                      key={r.run_id}
+                      run={r}
+                      selected={selected === r.run_id}
+                      onSelect={() => onSelectRun(r.run_id)}
+                      stageContext
+                    />
+                  ))}
+                </div>
+              )}
             </div>
-            <span className="truncate text-[10px] text-muted-foreground">
-              {r.started_at ? formatRelative(r.started_at) : "—"}
-              {r.started_at && r.ended_at && ` · ${durationStr(r.started_at, r.ended_at)}`}
-            </span>
-          </button>
-        ))}
+          );
+        })}
       </CardContent>
     </Card>
+  );
+}
+
+function RunRow({
+  run: r,
+  selected,
+  onSelect,
+  stageContext = false,
+}: {
+  run: RunSummary;
+  selected: boolean;
+  onSelect: () => void;
+  /** True when this row sits under a mission group — surfaces
+   *  stage_name + stage_index instead of the raw run_id. */
+  stageContext?: boolean;
+}) {
+  const titleText = stageContext
+    ? r.stage_name ?? r.run_id.replace(/^job_/, "")
+    : r.run_id.replace(/^job_/, "");
+  const itersDenom = r.iterations_requested || "?";
+  return (
+    <button
+      type="button"
+      onClick={onSelect}
+      className={cn(
+        "flex flex-col gap-1 rounded-md border px-2 py-2 text-left text-xs transition-colors",
+        selected
+          ? "border-foreground/30 bg-accent"
+          : "border-transparent hover:bg-accent/60",
+      )}
+    >
+      <div className="flex items-center justify-between gap-2">
+        <span className="truncate font-mono text-[11px]">
+          {stageContext && typeof r.stage_index === "number" && (
+            <span className="text-muted-foreground">
+              {r.stage_index + 1}.{" "}
+            </span>
+          )}
+          {titleText}
+        </span>
+        <RunStatusBadge status={r.status} />
+      </div>
+      <div className="flex items-center gap-1 text-[10px] text-muted-foreground">
+        <Sparkline history={r.primary_metric_history} />
+        <span>
+          {r.iterations_completed}/{itersDenom}
+        </span>
+      </div>
+      <span className="truncate text-[10px] text-muted-foreground">
+        {r.started_at ? formatRelative(r.started_at) : "—"}
+        {r.started_at && r.ended_at && ` · ${durationStr(r.started_at, r.ended_at)}`}
+      </span>
+    </button>
   );
 }
 
@@ -356,7 +516,13 @@ function Sparkline({ history }: { history: Array<number | null> }) {
 }
 
 // ── detail pane ───────────────────────────────────────────────────────
-function RunDetailPane({ slug, runId }: { slug: string; runId: string }) {
+function RunDetailPane({
+  slug, runId, runs,
+}: {
+  slug: string;
+  runId: string;
+  runs: RunSummary[];
+}) {
   const run = useRun(slug, runId);
   const events = useRunEvents(slug, runId);
   const kill = useKillRun(slug);
@@ -366,13 +532,32 @@ function RunDetailPane({ slug, runId }: { slug: string; runId: string }) {
   const history = run.data?.primary_metric_history ?? [];
   const isActive = run.data?.status === "running" || run.data?.status === "queued";
 
+  // §Ship 21: stage runs surface mission/stage context above the
+  // log viewer. The list-row carries kind/mission_slug/stage_name —
+  // RunDetail extends RunSummary and inherits the same fields, but
+  // we look them up from the list-row first to avoid waiting on the
+  // detail fetch.
+  const summary = useMemo(
+    () => runs.find((r) => r.run_id === runId) ?? null,
+    [runs, runId],
+  );
+  const isStageRun =
+    (summary?.kind === "mission_stage_run") ||
+    (run.data?.kind === "mission_stage_run");
+  const missionSlug = summary?.mission_slug ?? run.data?.mission_slug ?? null;
+  const stageName = summary?.stage_name ?? run.data?.stage_name ?? null;
+  const stageRewardsScope =
+    isStageRun && missionSlug && stageName
+      ? `${missionSlug}/${stageName}`
+      : null;
+
   // Derive the freshest iteration list from (a) server snapshot and
   // (b) streaming events — events win for the live tail. We splice any
   // in-flight iter_started events into the server's list.
   const mergedIters = useMergedIterations(iters, events.events);
 
   return (
-    <div className="grid grid-cols-1 gap-4 md:grid-cols-[220px_minmax(0,1fr)] lg:grid-cols-[220px_minmax(0,1fr)_240px]">
+    <div className="grid grid-cols-1 gap-4 md:grid-cols-[220px_minmax(0,1fr)] lg:grid-cols-[220px_minmax(0,1fr)_260px]">
       <IterationTimeline
         iters={mergedIters}
         selected={selectedIter}
@@ -380,6 +565,11 @@ function RunDetailPane({ slug, runId }: { slug: string; runId: string }) {
       />
 
       <div className="flex min-h-0 flex-col gap-3">
+        {isStageRun && summary && (
+          <StageContextCard
+            run={summary}
+          />
+        )}
         <RunHeader
           run={run.data}
           isActive={isActive}
@@ -406,6 +596,12 @@ function RunDetailPane({ slug, runId }: { slug: string; runId: string }) {
 
       <div className="flex flex-col gap-3 md:col-span-full lg:col-span-1">
         <MetricChart history={history} />
+        {stageRewardsScope && (
+          <StageRewardsCard
+            slug={slug}
+            stage={stageRewardsScope}
+          />
+        )}
         {isActive && <RunGpuCard />}
         {selectedIter !== null && (
           <IterationDetailCard
@@ -421,6 +617,94 @@ function RunDetailPane({ slug, runId }: { slug: string; runId: string }) {
         )}
       </div>
     </div>
+  );
+}
+
+// §Ship 21: stage-run-only context card. Surfaces the parent mission
+// + stage name above the log viewer so the user knows which stage of
+// which mission they're looking at.
+function StageContextCard({ run }: { run: RunSummary }) {
+  return (
+    <Card>
+      <CardContent className="flex flex-wrap items-center gap-x-3 gap-y-1 p-3 text-[11px]">
+        <Sparkles className="h-3.5 w-3.5 text-amber-600" />
+        <span className="font-medium">
+          {typeof run.stage_index === "number"
+            ? `Stage ${run.stage_index + 1}: `
+            : "Stage: "}
+          <code className="font-mono">{run.stage_name ?? "(unnamed)"}</code>
+        </span>
+        <span className="text-muted-foreground">
+          mission <code className="font-mono">{run.mission_slug}</code>
+        </span>
+        {run.behavior_goal && (
+          <span className="text-muted-foreground">{run.behavior_goal}</span>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
+// §Ship 21: per-stage reward versions. Lists v0/v1/v2... for the
+// selected stage's rewards/ dir. Click a version to open it in the
+// project Rewards tab (project-scoped). For now, this is read-only
+// inline — the full Monaco edit experience stays in the Rewards tab
+// (per-stage edits are a follow-up).
+function StageRewardsCard({
+  slug,
+  stage,
+}: {
+  slug: string;
+  stage: string;
+}) {
+  const versions = useRewards(slug, stage);
+  return (
+    <Card>
+      <CardHeader className="py-2">
+        <CardTitle className="text-xs">Stage rewards</CardTitle>
+        <CardDescription className="text-[10.5px]">
+          Reward versions Claude wrote for this stage. Project-global
+          rewards live in the Rewards tab.
+        </CardDescription>
+      </CardHeader>
+      <CardContent className="flex flex-col gap-1 p-2 pt-0">
+        {versions.isLoading && (
+          <p className="text-[10.5px] text-muted-foreground">Loading…</p>
+        )}
+        {versions.error && (
+          <p className="text-[10.5px] text-destructive">
+            {(versions.error as Error).message}
+          </p>
+        )}
+        {versions.data && versions.data.length === 0 && (
+          <p className="text-[10.5px] text-muted-foreground">
+            No reward versions yet — stage hasn't started training.
+          </p>
+        )}
+        {versions.data && versions.data.length > 0 && (
+          <ul className="flex flex-col gap-0.5">
+            {versions.data.map((v) => (
+              <li
+                key={v.version}
+                className="flex items-center justify-between gap-2 rounded border px-1.5 py-1 text-[10.5px]"
+              >
+                <span className="font-mono font-semibold">v{v.version}</span>
+                {typeof v.primary_metric === "number" && (
+                  <span className="text-muted-foreground">
+                    {v.primary_metric.toFixed(3)}
+                  </span>
+                )}
+                {v.author && (
+                  <span className="text-[9.5px] uppercase tracking-wide text-muted-foreground">
+                    {v.author}
+                  </span>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
+      </CardContent>
+    </Card>
   );
 }
 

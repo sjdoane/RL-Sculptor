@@ -1016,6 +1016,141 @@ def test_mission_run_effective_max_iterations_falls_back_to_authored(
     assert started[0]["effective_max_iterations"] == m.stages[0].max_iterations
 
 
+def test_mission_run_persists_effective_max_iterations_on_stage(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """§Ship 20a regression: `effective_max_iterations` MUST be
+    persisted on the Stage dataclass (not just emitted as a WS event)
+    so the UI's `rounds X/Y` display stays correct after the WS event
+    window slides past `stage_started`. Sam's G1 test showed the
+    pre-fix bug: the dialog opened post-failure and read
+    `stage.max_iterations` (3) because the override event had been
+    evicted; should have shown 5 (the cap actually enforced).
+
+    This test verifies that AFTER mission_run completes (or fails),
+    re-loading the on-disk mission.json carries
+    `effective_max_iterations` on the stage. Pre-fix the field
+    didn't exist on the dataclass; post-fix it round-trips.
+    """
+    from sculptor import sculpt as sculpt_mod
+    from sculptor.mission import load_mission
+
+    m = _make_mission(tmp_path, n_stages=2)
+    # Authored max_iterations=2 per _make_mission; override to 5.
+    assert m.stages[0].max_iterations == 2
+    monkeypatch.setattr(
+        sculpt_mod, "sculpt_run", _fake_sculpt_run_factory(metric=0.9),
+    )
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
+    )
+
+    sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab",
+        iterations_override=5,
+    )
+
+    # Reload from disk — proves the field round-trips JSON.
+    reloaded = load_mission(tmp_path / "mission" / "mission.json")
+    assert reloaded.stages[0].effective_max_iterations == 5, (
+        "stage.effective_max_iterations must be persisted so the UI "
+        "shows the right cap after WS events evict"
+    )
+    assert reloaded.stages[1].effective_max_iterations == 5, (
+        "every stage_run sets the field — not just stage 0"
+    )
+
+
+def test_mission_run_persists_effective_max_iterations_on_failure(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """§Ship 20a regression: even when a stage FAILS (criterion not
+    met or training errored), `effective_max_iterations` must be
+    persisted. Sam's G1 squat-then-jump test failed at stage 1
+    (`stand_stable`) with status="failed" + display "rounds 4/3" —
+    the override of 5 wasn't visible because (a) stage_started event
+    had been evicted, (b) the field wasn't persisted. Post-fix, the
+    field is set BEFORE the orchestrator runs sculpt_run, so any
+    failure path that calls _atomic_save_mission captures it.
+    """
+    from sculptor import sculpt as sculpt_mod
+    from sculptor.mission import load_mission
+
+    m = _make_mission(tmp_path, n_stages=1)
+    assert m.stages[0].max_iterations == 2
+    # Fake sculpt_run that returns metric=0.1 — fails the
+    # `metric > 0.5` criterion baked into _make_mission.
+    monkeypatch.setattr(
+        sculpt_mod, "sculpt_run", _fake_sculpt_run_factory(metric=0.1),
+    )
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
+    )
+
+    result = sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab",
+        iterations_override=5,
+    )
+    # Mission halts at stage 0 (criterion failed). After Ship 17
+    # re-decomposition kicks in, sub-stages may also be added; the
+    # ORIGINAL stage_0 object should still carry the override.
+    assert m.stages[0].effective_max_iterations == 5
+    # Reload from disk to confirm persistence past in-memory state.
+    reloaded = load_mission(tmp_path / "mission" / "mission.json")
+    assert reloaded.stages[0].effective_max_iterations == 5
+
+
+def test_stage_effective_max_iterations_backward_compat_load(tmp_path: Path):
+    """§Ship 20a: older mission.json files written before this field
+    existed must still load (Stage.from_dict's filter-unknown-keys
+    path covers it; this test pins the behavior so a future schema
+    bump doesn't accidentally break the readback).
+    """
+    import json
+    from sculptor.mission import load_mission
+
+    # Hand-crafted pre-Ship-20a mission.json — no effective_max_
+    # iterations field on the stage.
+    legacy = {
+        "schema_version": 1,
+        "goal": "test",
+        "decomposition_model": "claude-opus-4-7",
+        "decomposition_rationale": "test",
+        "created_at": "2026-04-24T00:00:00+00:00",
+        "current_stage_idx": 0,
+        "stages": [{
+            "name": "s0",
+            "goal_text": "do thing",
+            "success_criterion": "metric > 0.5",
+            "max_iterations": 3,
+            "parent_stage": None,
+            "reward_seed_prompt": "seed",
+            "kg_seed_papers": [],
+            "status": "succeeded",
+            "final_policy_path": None,
+            "final_reward_path": None,
+            "best_metric": 0.9,
+            "iterations_used": 3,
+            "started_at": None,
+            "finished_at": None,
+            "redecomposition_attempts": 0,
+            # NO effective_max_iterations field!
+        }],
+    }
+    md = tmp_path / "legacy_mission"
+    md.mkdir()
+    (md / "mission.json").write_text(json.dumps(legacy))
+
+    m = load_mission(md / "mission.json")
+    assert m.stages[0].effective_max_iterations is None, (
+        "pre-Ship-20a missions load with effective_max_iterations=None "
+        "and the UI falls back to max_iterations"
+    )
+    # Other Ship-19-era fields still load correctly.
+    assert m.stages[0].max_iterations == 3
+    assert m.stages[0].iterations_used == 3
+
+
 def test_mission_run_lock_release_allows_reentry(
     tmp_path: Path, monkeypatch, stub_adapter,
 ):

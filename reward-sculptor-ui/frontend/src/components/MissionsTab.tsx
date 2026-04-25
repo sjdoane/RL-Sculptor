@@ -110,11 +110,19 @@ export function MissionsTab({ slug }: { slug: string }) {
         </Card>
       )}
 
+      {/* §Ship 20a: gate `open` on selectedSlug (direct state), NOT on
+          `selected` (derived from missions.find). The Ship 20 wiring
+          flickered closed when the optimistic-cache placeholder was
+          replaced by an in-flight refetch — `selected` momentarily
+          became null, flipping open=false. selectedSlug is direct
+          React state and only clears when the user explicitly closes
+          the dialog. summary can be null while the placeholder is
+          settling; MissionDetailDialog already tolerates that. */}
       <MissionDetailDialog
         slug={slug}
-        missionSlug={selected?.mission_slug ?? null}
+        missionSlug={selectedSlug}
         summary={selected}
-        open={!!selected}
+        open={selectedSlug != null}
         onOpenChange={(open) => {
           if (!open) setSelectedSlug(null);
         }}
