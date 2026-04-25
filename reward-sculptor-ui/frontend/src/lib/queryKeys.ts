@@ -40,6 +40,10 @@ export const qk = {
   runs: (slug: string) => ["runs", slug] as const,
   run: (slug: string, runId: string) => ["run", slug, runId] as const,
 
+  missions: (slug: string) => ["missions", slug] as const,
+  mission: (slug: string, missionSlug: string) =>
+    ["mission", slug, missionSlug] as const,
+
   dashboard: () => ["dashboard"] as const,
   systemInfo: () => ["systemInfo"] as const,
 };
