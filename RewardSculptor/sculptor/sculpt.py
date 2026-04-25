@@ -43,7 +43,7 @@ import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from sculptor.adapters.base import SculptorAdapter, load_adapter
 from sculptor.diagnose import Diagnosis, ProposedEdit, diagnose as run_diagnose
@@ -1108,6 +1108,47 @@ def _run_one_iter(
 
 
 # ── Early stop ───────────────────────────────────────────────────────────
+def _is_metric_still_improving(
+    history: list[float],
+    *,
+    threshold: float = 0.05,
+    abs_floor: float = 0.05,
+) -> bool:
+    """§Ship-19d Goal B: detect whether the metric trend on the
+    second half of `history` clears the first half by at least
+    `threshold` * |prior_best| or `abs_floor`, whichever is larger.
+
+    Designed for SHORT histories (typical 3-12 iters per stage).
+    Compares "best in recent half" vs "best in prior half" (NOT
+    means) so a single bad iter at the tail doesn't suppress
+    extension when the policy IS improving on its peak runs. Robust
+    to single noisy spikes in either direction.
+
+    Returns False for histories shorter than 4 iters (insufficient
+    signal — extension should NOT fire on tiny stages).
+
+    Examples (threshold=0.05, abs_floor=0.05):
+      [0.1, 0.2, 0.3, 0.4]                 → True  (0.4 > 0.2 + max(0.01, 0.05))
+      [0.5, 0.5, 0.51, 0.52]               → False (0.52 > 0.5 + max(0.025, 0.05) is False)
+      [0.5, 0.5, 0.5, 0.5, 0.5, 0.6]       → True  (0.6 > 0.5 + 0.05)
+      [-2.0, -1.5, -1.0, -0.5]             → True  (-0.5 > -1.5 + max(0.075, 0.05))
+      [0.9, 0.8, 0.7, 0.6]                 → False (regressing)
+      [0.4, 0.5]                           → False (history too short)
+    """
+    n = len(history)
+    if n < 4:
+        return False
+    half = n // 2
+    prior = history[:half]
+    recent = history[half:]
+    if not prior or not recent:
+        return False
+    prior_best = max(prior)
+    recent_best = max(recent)
+    floor = max(abs(prior_best) * float(threshold), float(abs_floor))
+    return recent_best > prior_best + floor
+
+
 def _should_early_stop(
     history: list[float | None],
     patience: int = 3,
@@ -1155,7 +1196,17 @@ def sculpt_run(
     early_stop_enabled: Optional[bool] = None,
     early_stop_patience: Optional[int] = None,
     init_policy_path: Optional[Path | str] = None,
+    per_iter_callback: Optional[Callable[["IterOutcome"], Optional[str]]] = None,
 ) -> SculptRunResult:
+    """§Ship-19d: `per_iter_callback` is fired AFTER each iter's
+    artifacts are persisted. Returning `None` keeps the loop running;
+    returning a non-empty string is interpreted as an early-stop
+    reason and breaks the loop after recording that iter as
+    completed. Used by mission_run to early-stop a stage the moment
+    its success_criterion is satisfied (Goal A) — a no-op for plain
+    sculpt_run callers that don't pass it. Distinct from the
+    metric-plateau early-stop at lines 1311+: that one looks at the
+    history shape; this one is a goal-aware exit signal."""
     config_path = Path(config_path).resolve()
     if not config_path.is_file():
         raise FileNotFoundError(f"config not found: {config_path}")
@@ -1307,6 +1358,33 @@ def sculpt_run(
                 f"t={elapsed:.1f}s",
                 flush=True,
             )
+
+            # §Ship-19d Goal A: optional per-iter callback. Mission
+            # orchestrator passes one that evaluates the stage's
+            # success_criterion on this iter's artifacts. Returning a
+            # non-empty string is the early-stop reason; we record
+            # the iter as completed (already in `result`) and break.
+            # Wrapped in try/except so a buggy caller can't crash
+            # sculpt_run mid-iter.
+            if per_iter_callback is not None:
+                try:
+                    callback_reason = per_iter_callback(outcome)
+                except Exception as e:  # noqa: BLE001
+                    callback_reason = None
+                    sys.stderr.write(
+                        f"[sculpt] per_iter_callback raised "
+                        f"{type(e).__name__}: {e} — ignoring\n"
+                    )
+                if callback_reason:
+                    result.early_stopped = True
+                    result.early_stop_reason = str(callback_reason)
+                    _emit_event({
+                        "type": "early_stop",
+                        "at_iter": outcome.iter_index,
+                        "reason": result.early_stop_reason,
+                        "source": "per_iter_callback",
+                    })
+                    break
 
             # §Ship-9a: honor configurable early-stop knobs from
             # [iteration]. Defaults preserve the pre-Ship-9 behavior
@@ -1638,6 +1716,16 @@ def _inherit_parent_adapter_config(
     new_stage_text = _replace_toml_section(
         stage_text, "adapter", parent_adapter_body,
     )
+    # §Ship-19c: ALSO inherit `[iteration]` so the project-level
+    # steps_per_iter / primary_metric / early-stop knobs propagate
+    # to stages. Without this, sculpt_init's generic template forces
+    # 50000 steps_per_iter for every stage, blowing wall-clock on
+    # short tasks like Cartpole. Sam's first live run hit this.
+    parent_iter_body = _extract_toml_section(parent_text, "iteration")
+    if parent_iter_body is not None:
+        new_stage_text = _replace_toml_section(
+            new_stage_text, "iteration", parent_iter_body,
+        )
     if new_stage_text == stage_text:
         return False
     stage_config.write_text(new_stage_text, encoding="utf-8")
@@ -1798,7 +1886,44 @@ def mission_run(
     steps_per_iter: Optional[int] = None,
     seed: Optional[int] = None,
     skill_library_handle: Optional[Any] = None,
+    early_stop_on_criterion: bool = False,
+    criterion_stability_window: int = 1,
+    extend_on_improvement: bool = False,
+    max_extensions_per_stage: int = 1,
+    extension_factor: float = 0.5,
+    extension_improvement_threshold: float = 0.05,
 ):
+    """§Ship-19d Goals A + B: optional adaptive iteration control.
+
+    `early_stop_on_criterion` (Goal A) — when True, mission_run wraps
+    each stage's sculpt_run with a per-iter callback that evaluates
+    the stage's success_criterion on the freshly-completed iter's
+    artifacts. If the criterion holds for `criterion_stability_window`
+    consecutive iters (default 1; bump to 2 for noisier metrics),
+    the stage exits early. Cuts wall-clock dramatically on stages
+    that learn faster than the human-author allocated `max_iterations`
+    for. Default OFF (preserves Ship 16 behavior of always running
+    the full budget then evaluating once at the end).
+
+    `extend_on_improvement` (Goal B) — when True, after a stage's
+    sculpt_run completes max_iterations and the criterion failed BUT
+    the metric history shows the policy is still improving (best of
+    last K iters > best of prior K iters by `extension_improvement_
+    threshold` * |prior_best| or fixed +0.05 floor), invoke
+    sculpt_run again in resume mode for `extension_factor *
+    max_iterations` more iters. Cap total extensions at
+    `max_extensions_per_stage` (default 1; max 3 to prevent runaway).
+    Default OFF — adaptive extension changes the user's iteration
+    contract and should be opt-in.
+
+    Both flags are independent and may be combined: a stage that
+    early-stops via Goal A never reaches Goal B's logic; a stage
+    that runs to budget without satisfying the criterion enters
+    Goal B's trend check (if enabled). The two goals are compatible
+    with Ship 17's re-decomposition path — extension fires BEFORE
+    re-decomposition (give the policy more iters first; only
+    re-decompose if extension also fails).
+    """
     """Orchestrate a full mission: decompose → per-stage scaffold → v1
     seeding → sculpt_run → success-criterion eval → advance or halt.
 
@@ -1934,6 +2059,14 @@ def mission_run(
                 steps_per_iter=steps_per_iter,
                 seed=seed,
                 skill_library_handle=skill_library_handle,
+                early_stop_on_criterion=early_stop_on_criterion,
+                criterion_stability_window=criterion_stability_window,
+                extend_on_improvement=extend_on_improvement,
+                max_extensions_per_stage=max_extensions_per_stage,
+                extension_factor=extension_factor,
+                extension_improvement_threshold=(
+                    extension_improvement_threshold
+                ),
             )
             result.stage_results.append(stage_res)
 
@@ -2016,6 +2149,12 @@ def _run_one_stage(
     steps_per_iter: Optional[int],
     seed: Optional[int],
     skill_library_handle: Optional[Any] = None,
+    early_stop_on_criterion: bool = False,
+    criterion_stability_window: int = 1,
+    extend_on_improvement: bool = False,
+    max_extensions_per_stage: int = 1,
+    extension_factor: float = 0.5,
+    extension_improvement_threshold: float = 0.05,
 ):
     """Helper called by `mission_run` per stage. Kept separate so the
     orchestrator stays readable — `mission_run` is about flow; this
@@ -2191,7 +2330,64 @@ def _run_one_stage(
     # 4. Run the per-stage training loop via existing sculpt_run.
     # §Ship 19: warm_start_path = skill (if explicitly chosen by the
     # decomposer) OR parent_ckpt (Ship 16 default) OR None (cold).
+    # §Ship-19d: Goal A wraps each iter with a criterion-eval
+    # callback; Goal B runs additional sculpt_run passes (resume
+    # mode) when metric is still improving at end-of-budget.
+    from sculptor.mission_runtime import (
+        CriterionEvalError,
+        _build_criterion_namespace,
+        _evaluate_success_criterion,
+    )
+
     max_iters = iterations_override or stage.max_iterations
+
+    per_iter_cb: Optional[Callable[[Any], Optional[str]]] = None
+    if early_stop_on_criterion:
+        # Closure-local consecutive-pass counter; bumps on each iter
+        # whose artifacts satisfy the stage's criterion. Resets the
+        # moment any iter fails (so a noisy spike doesn't trigger).
+        # When the count hits `criterion_stability_window`, return a
+        # stop-reason; sculpt_run records the iter as completed and
+        # breaks its loop.
+        _consecutive_passes = {"n": 0}
+        _stage_criterion = stage.success_criterion
+
+        def _criterion_callback(outcome: Any) -> Optional[str]:
+            try:
+                namespace = _build_criterion_namespace(
+                    iter_dir=Path(outcome.iter_dir),
+                    primary_metric=outcome.primary_metric,
+                )
+                ok = _evaluate_success_criterion(
+                    _stage_criterion, namespace,
+                )
+            except (CriterionEvalError, Exception):  # noqa: BLE001
+                # A criterion that errors during the stream is
+                # inconclusive — DO NOT short-circuit. The
+                # post-run eval at step 6 will surface the error
+                # via `_fail_stage` if it persists at the last iter.
+                _consecutive_passes["n"] = 0
+                return None
+            if ok:
+                _consecutive_passes["n"] += 1
+                if (
+                    _consecutive_passes["n"]
+                    >= max(1, criterion_stability_window)
+                ):
+                    return (
+                        f"criterion_satisfied at iter "
+                        f"{outcome.iter_index} "
+                        f"(stability_window="
+                        f"{criterion_stability_window})"
+                    )
+            else:
+                _consecutive_passes["n"] = 0
+            return None
+
+        per_iter_cb = _criterion_callback
+
+    extensions_used = 0
+    sculpt_result: Any = None
     try:
         sculpt_result = sculpt_run(
             config_path=stage_dir / "config.toml",
@@ -2200,10 +2396,9 @@ def _run_one_stage(
             steps_per_iter=steps_per_iter,
             seed=seed,
             init_policy_path=warm_start_path,
+            per_iter_callback=per_iter_cb,
         )
     except KeyboardInterrupt:
-        # Caller saw Ctrl+C; surface to mission_run which emits
-        # mission_halted and re-raises.
         stage.status = "failed"
         stage.finished_at = _utc_now_iso()
         raise
@@ -2213,6 +2408,106 @@ def _run_one_stage(
             f"sculpt_run raised: {type(e).__name__}: {e}",
             emit,
         )
+
+    # §Ship-19d Goal B: extension loop. Only entered when (a) the
+    # caller opted in, (b) Goal A's callback did NOT fire (criterion
+    # not yet satisfied), (c) the metric trend looks promising, and
+    # (d) we haven't exhausted the extension budget. Each pass
+    # resumes from the previous run's last checkpoint.
+    def _criterion_satisfied_now(sr: Any) -> bool:
+        completed = list(getattr(sr, "completed_iters", []) or [])
+        if not completed:
+            return False
+        last = completed[-1]
+        try:
+            ns = _build_criterion_namespace(
+                iter_dir=Path(last.iter_dir),
+                primary_metric=last.primary_metric,
+            )
+            return bool(_evaluate_success_criterion(
+                stage.success_criterion, ns,
+            ))
+        except Exception:  # noqa: BLE001
+            return False
+
+    while extend_on_improvement:
+        # Goal A's per-iter callback already short-circuited.
+        if (
+            sculpt_result is not None
+            and sculpt_result.early_stopped
+            and "criterion_satisfied" in (
+                sculpt_result.early_stop_reason or ""
+            )
+        ):
+            break
+        # Already passing? No need to extend.
+        if _criterion_satisfied_now(sculpt_result):
+            break
+        # Patience-based metric-plateau early-stop fired — the metric
+        # ISN'T improving by definition. Don't extend; that's exactly
+        # the case Goal B should NOT fire on.
+        if (
+            sculpt_result is not None
+            and sculpt_result.early_stopped
+        ):
+            emit({
+                "type": "stage_extension_skipped",
+                "stage_name": stage.name,
+                "reason": "metric_plateau_early_stop",
+            })
+            break
+        if extensions_used >= max(0, max_extensions_per_stage):
+            emit({
+                "type": "stage_extension_exhausted",
+                "stage_name": stage.name,
+                "extensions_used": extensions_used,
+                "max_extensions_per_stage": max_extensions_per_stage,
+            })
+            break
+        history = list(
+            getattr(sculpt_result, "primary_metric_history", []) or [],
+        )
+        if not _is_metric_still_improving(
+            history, threshold=extension_improvement_threshold,
+        ):
+            emit({
+                "type": "stage_extension_skipped",
+                "stage_name": stage.name,
+                "reason": "no_improvement_trend",
+                "history_len": len(history),
+            })
+            break
+        extra_iters = max(2, int(round(max_iters * extension_factor)))
+        extensions_used += 1
+        emit({
+            "type": "stage_extended",
+            "stage_name": stage.name,
+            "extension_count": extensions_used,
+            "additional_iters": extra_iters,
+            "reason": "metric_still_improving",
+        })
+        try:
+            sculpt_result = sculpt_run(
+                config_path=stage_dir / "config.toml",
+                behavior_goal=stage.goal_text,
+                iterations=extra_iters,
+                steps_per_iter=steps_per_iter,
+                seed=seed,
+                init_policy_path=None,  # resume picks up from local ckpt
+                resume=True,
+                per_iter_callback=per_iter_cb,
+            )
+        except KeyboardInterrupt:
+            stage.status = "failed"
+            stage.finished_at = _utc_now_iso()
+            raise
+        except Exception as e:  # noqa: BLE001
+            return _fail_stage(
+                stage, "extension_errored",
+                f"sculpt_run extension raised: "
+                f"{type(e).__name__}: {e}",
+                emit,
+            )
 
     stage.iterations_used = sculpt_result.iterations_run
     emit({

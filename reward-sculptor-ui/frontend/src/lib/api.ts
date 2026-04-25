@@ -667,13 +667,32 @@ export async function createMission(
   );
 }
 
+/** §Ship-19d optional body. The backend's RunMissionRequest is
+ *  open-shape — every field is optional. An empty body preserves the
+ *  Ship 16 default (per-stage budget from mission.json, no Goal A/B). */
+export interface RunMissionRequestBody {
+  iterations_override?: number | null;
+  steps_per_iter?: number | null;
+  seed?: number | null;
+  early_stop_on_criterion?: boolean;
+  criterion_stability_window?: number;
+  extend_on_improvement?: boolean;
+  max_extensions_per_stage?: number;
+  extension_factor?: number;
+  extension_improvement_threshold?: number;
+}
+
 export async function runMission(
   slug: string, missionSlug: string,
+  body?: RunMissionRequestBody,
 ): Promise<JobSummary> {
+  const init: RequestInit = { method: "POST" };
+  if (body && Object.keys(body).length > 0) {
+    init.headers = { "content-type": "application/json" };
+    init.body = JSON.stringify(body);
+  }
   return handle<JobSummary>(
-    await fetch(`/api/projects/${slug}/missions/${missionSlug}/run`, {
-      method: "POST",
-    }),
+    await fetch(`/api/projects/${slug}/missions/${missionSlug}/run`, init),
   );
 }
 

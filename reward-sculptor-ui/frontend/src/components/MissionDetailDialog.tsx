@@ -26,8 +26,8 @@ import {
 import {
   useDeleteMission,
   useMission,
-  useRunMission,
 } from "@/hooks/useMissions";
+import { RunMissionDialog } from "@/components/RunMissionDialog";
 import { useMissionEvents } from "@/hooks/useMissionEvents";
 import { ApiError } from "@/lib/api";
 import { cn, formatRelative } from "@/lib/utils";
@@ -57,7 +57,10 @@ export function MissionDetailDialog({
   const detail = useMission(slug, missionSlug ?? undefined, {
     enabled: open,
   });
-  const run = useRunMission(slug);
+  // §Ship-19d: clicking "Run mission" now opens RunMissionDialog (a
+  // separate Dialog component) so the user can configure iterations
+  // / Goal A / Goal B per launch. The actual mutation is owned by
+  // RunMissionDialog. We still keep `del` here for the Delete button.
   const del = useDeleteMission(slug);
 
   const mission = detail.data;
@@ -234,49 +237,22 @@ export function MissionDetailDialog({
         </div>
 
         <DialogFooter className="border-t pt-3">
-          {mission && mission.lifecycle !== "errored" && (
-            <Button
-              variant="outline"
-              onClick={() => {
-                if (!missionSlug) return;
-                run.mutate(missionSlug, {
-                  onSuccess: () => toast.success("Mission run queued"),
-                  onError: (err) => {
-                    const detailMsg =
-                      err instanceof ApiError
-                        ? err.problem.detail ?? err.problem.title
-                        : err.message;
-                    toast.error("Could not run mission", {
-                      description: detailMsg,
-                    });
-                  },
-                });
-              }}
+          {mission && mission.lifecycle !== "errored" && missionSlug && (
+            <RunMissionDialog
+              slug={slug}
+              missionSlug={missionSlug}
+              mission={mission}
               disabled={
-                run.isPending ||
-                mission.lifecycle !== "ready" ||
-                activeJobId != null
+                mission.lifecycle !== "ready" || activeJobId != null
               }
-              title={
+              disabledTitle={
                 mission.lifecycle !== "ready"
                   ? `Lifecycle is ${mission.lifecycle}; run is only allowed when ready.`
                   : activeJobId
                     ? "An active job is already running for this mission."
                     : undefined
               }
-            >
-              {run.isPending ? (
-                <>
-                  <Loader2 className="h-4 w-4 animate-spin" />
-                  Launching…
-                </>
-              ) : (
-                <>
-                  <Play />
-                  Run mission
-                </>
-              )}
-            </Button>
+            />
           )}
           {liveSummary && (
             <Button

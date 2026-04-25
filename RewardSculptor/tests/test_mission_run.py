@@ -1584,6 +1584,478 @@ def test_redecompose_persists_to_mission_json_atomically(
     assert snapshot["current_stage_idx"] == 0
 
 
+# ── §Ship-19d Goal A + Goal B ────────────────────────────────────────
+
+def _is_metric_still_improving():
+    """Wrapper to keep `from sculptor.sculpt import _is_metric_still_improving`
+    available to test bodies even if the module gets re-imported."""
+    from sculptor.sculpt import _is_metric_still_improving as fn
+    return fn
+
+
+def test_is_metric_still_improving_detects_positive_trend():
+    fn = _is_metric_still_improving()
+    # Steady climb: recent_best=0.4, prior_best=0.2 → 0.4 > 0.2+max(0.01,0.05) = True
+    assert fn([0.1, 0.2, 0.3, 0.4]) is True
+
+
+def test_is_metric_still_improving_rejects_plateau():
+    fn = _is_metric_still_improving()
+    # No improvement: prior_best=0.5, recent_best=0.52 → not > 0.5+0.05 → False
+    assert fn([0.5, 0.5, 0.51, 0.52]) is False
+
+
+def test_is_metric_still_improving_rejects_regression():
+    fn = _is_metric_still_improving()
+    assert fn([0.9, 0.8, 0.7, 0.6]) is False
+
+
+def test_is_metric_still_improving_handles_negative_metrics():
+    fn = _is_metric_still_improving()
+    # Recovering from negative: prior_best=-1.5, recent_best=-0.5
+    #   abs(-1.5)*0.05=0.075, max(0.075, 0.05)=0.075
+    #   -0.5 > -1.5 + 0.075 = -1.425 → True
+    assert fn([-2.0, -1.5, -1.0, -0.5]) is True
+
+
+def test_is_metric_still_improving_short_history_returns_false():
+    fn = _is_metric_still_improving()
+    # Too short for a trend test — extension should NOT fire.
+    assert fn([0.4, 0.5]) is False
+    assert fn([0.4, 0.5, 0.6]) is False
+    # 4+ iters required.
+    assert fn([0.1, 0.2, 0.3, 0.4]) is True
+
+
+def _criterion_aware_sculpt_run_factory(
+    *,
+    iter_metrics: list[float],
+    write_behavior_pass_at: list[bool],
+):
+    """A stub that runs `len(iter_metrics)` iters, generates synthetic
+    IterOutcomes, and FIRES the `per_iter_callback` after each. If the
+    callback returns a non-empty string, the loop short-circuits with
+    `early_stopped=True` (matching the real sculpt_run contract).
+
+    `write_behavior_pass_at[i]` controls whether iter `i`'s
+    behavior.json's `mean_return` is over the test's criterion
+    threshold (≥ 0.5). Lets us simulate "criterion satisfied at iter
+    N" without spinning a real subprocess.
+    """
+    assert len(iter_metrics) == len(write_behavior_pass_at)
+
+    def fake(
+        *, config_path, behavior_goal, iterations=3,
+        steps_per_iter=None, seed=None, init_policy_path=None,
+        resume=False, per_iter_callback=None, **_kw,
+    ):
+        from sculptor.sculpt import IterOutcome, SculptRunResult
+        project = Path(config_path).parent
+        result = SculptRunResult(iterations_run=0)
+        for i in range(iterations):
+            metric = iter_metrics[i] if i < len(iter_metrics) else 0.0
+            iter_dir = project / "runs" / f"iter_{i + 1}"
+            iter_dir.mkdir(parents=True, exist_ok=True)
+            (iter_dir / "checkpoint.pt").write_bytes(b"fake-ckpt")
+            # Behavior signal varies per iter so a criterion like
+            # `metric > 0.5` would pass / fail depending on
+            # `write_behavior_pass_at[i]`.
+            beh_metric = (
+                metric if write_behavior_pass_at[i] else min(metric, 0.3)
+            )
+            _fabricate_rollout_artifacts(
+                iter_dir,
+                behavior={
+                    "n_episodes": 1,
+                    "mean_return": beh_metric,
+                    "mean_episode_length": 400.0,
+                    "max_episode_length": 500,
+                },
+            )
+            outcome = IterOutcome(
+                iter_index=i + 1, iter_dir=iter_dir,
+                reward_path_before=project / "rewards" / "v1.py",
+                reward_path_after=project / "rewards" / f"v{i + 2}.py",
+                primary_metric=metric,
+                behavior={"mean_return": beh_metric},
+                failure_modes=[], edit_count=0,
+            )
+            result.completed_iters.append(outcome)
+            result.primary_metric_history.append(metric)
+            result.iterations_run += 1
+            if per_iter_callback is not None:
+                reason = per_iter_callback(outcome)
+                if reason:
+                    result.early_stopped = True
+                    result.early_stop_reason = str(reason)
+                    return result
+        return result
+
+    return fake
+
+
+def test_goal_a_early_stops_stage_when_criterion_holds(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """Goal A: with `early_stop_on_criterion=True`, sculpt_run is told
+    to break the loop the moment the stage's criterion holds. The
+    stage's iterations_used should reflect the EARLY iter, not the
+    full max_iterations budget."""
+    from sculptor import sculpt as sculpt_mod
+
+    m = _make_mission(tmp_path, n_stages=1)
+    m.stages[0].max_iterations = 5
+    m.stages[0].success_criterion = "metric > 0.5"
+
+    # Iter 0 fails (0.3), iter 1 passes (0.9). Behavior.json mean_return
+    # at iter 1 is 0.9 too — criterion `metric > 0.5` evaluated against
+    # `metric` (primary_metric) is True. Loop should break at iter 1.
+    fake = _criterion_aware_sculpt_run_factory(
+        iter_metrics=[0.3, 0.9, 0.95, 0.96, 0.97],
+        write_behavior_pass_at=[False, True, True, True, True],
+    )
+    monkeypatch.setattr(sculpt_mod, "sculpt_run", fake)
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
+    )
+
+    events: list[dict] = []
+    result = sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab",
+        on_event=events.append,
+        early_stop_on_criterion=True,
+        criterion_stability_window=1,
+    )
+    assert result.completed is True
+    assert len(result.stage_results) == 1
+    sr = result.stage_results[0]
+    assert sr.status == "succeeded"
+    # Loop broke at iter 2 (1-indexed) = 2 iters consumed, NOT all 5.
+    assert sr.iterations_used == 2
+
+
+def test_goal_a_does_not_fire_below_stability_window(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """Goal A respects `criterion_stability_window` — a single-iter
+    pass should NOT exit when window=2, only after TWO consecutive
+    iters satisfy the criterion."""
+    from sculptor import sculpt as sculpt_mod
+
+    m = _make_mission(tmp_path, n_stages=1)
+    m.stages[0].max_iterations = 5
+    m.stages[0].success_criterion = "metric > 0.5"
+
+    # Pass at iter 0 (0.9), fail iter 1 (0.3, regressed), pass iter 2,
+    # pass iter 3. With window=2, must hold for 2 consecutive iters.
+    # Stability count: iter0 (0.9 pass) → 1, iter1 (regressed) → 0,
+    # iter2 (pass) → 1, iter3 (pass) → 2 → BREAK at iter 4 (1-indexed).
+    fake = _criterion_aware_sculpt_run_factory(
+        iter_metrics=[0.9, 0.3, 0.9, 0.95, 0.97],
+        write_behavior_pass_at=[True, False, True, True, True],
+    )
+    monkeypatch.setattr(sculpt_mod, "sculpt_run", fake)
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
+    )
+
+    result = sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab",
+        early_stop_on_criterion=True,
+        criterion_stability_window=2,
+    )
+    assert result.stage_results[0].iterations_used == 4
+
+
+def test_goal_a_off_by_default_runs_full_budget(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """Backward-compat: with both flags off, mission_run preserves
+    Ship 16 behavior — full max_iterations budget regardless of when
+    the criterion would have passed."""
+    from sculptor import sculpt as sculpt_mod
+
+    m = _make_mission(tmp_path, n_stages=1)
+    m.stages[0].max_iterations = 4
+    m.stages[0].success_criterion = "metric > 0.5"
+
+    # Criterion holds from iter 0; without Goal A, runs all 4 iters.
+    fake = _criterion_aware_sculpt_run_factory(
+        iter_metrics=[0.9, 0.95, 0.96, 0.97],
+        write_behavior_pass_at=[True, True, True, True],
+    )
+    monkeypatch.setattr(sculpt_mod, "sculpt_run", fake)
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
+    )
+
+    result = sculpt_mod.mission_run(m, adapter_short_name="mjlab")
+    assert result.stage_results[0].iterations_used == 4
+
+
+def test_goal_b_extends_when_metric_still_improving(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """Goal B: when the budget exhausts WITHOUT criterion satisfaction
+    AND the metric is still trending up, mission_run invokes
+    sculpt_run again (resume mode). Verify by counting fake-call
+    invocations + watching for `stage_extended` events."""
+    from sculptor import sculpt as sculpt_mod
+
+    m = _make_mission(tmp_path, n_stages=1)
+    m.stages[0].max_iterations = 4
+    m.stages[0].success_criterion = "metric > 1.0"
+    # Pre-exhaust Ship 17 redecomp so a failed stage HALTS instead
+    # of triggering a Claude redecompose call (which the test stub
+    # doesn't mock). Goal B tests focus on the extension path; they
+    # don't exercise re-decomposition.
+    m.stages[0].redecomposition_attempts = 1  # never satisfied
+
+    # First call: monotonic climb 0.1 → 0.6. Recent half (0.4, 0.6)
+    # vs prior half (0.1, 0.2) → 0.6 > 0.2 + max(0.01, 0.05) = True.
+    # Extension fires.
+    # Second call: similar climb but still under 1.0 → criterion fails.
+    # max_extensions_per_stage=1 → bail.
+    call_count = {"n": 0}
+    def factory(metrics):
+        return _criterion_aware_sculpt_run_factory(
+            iter_metrics=metrics,
+            write_behavior_pass_at=[False] * len(metrics),
+        )
+    first = factory([0.1, 0.2, 0.4, 0.6])
+    second = factory([0.6, 0.65, 0.7, 0.72])  # stalls — no further ext
+
+    def dispatcher(**kw):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            return first(**kw)
+        return second(**kw)
+    monkeypatch.setattr(sculpt_mod, "sculpt_run", dispatcher)
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
+    )
+
+    events: list[dict] = []
+    result = sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab",
+        on_event=events.append,
+        extend_on_improvement=True,
+        max_extensions_per_stage=1,
+        extension_factor=0.5,
+    )
+    # Two sculpt_run calls: original + 1 extension.
+    assert call_count["n"] == 2
+    # `stage_extended` event recorded.
+    extensions = [e for e in events if e.get("type") == "stage_extended"]
+    assert len(extensions) == 1
+    assert extensions[0]["extension_count"] == 1
+
+
+def test_goal_b_skips_extension_on_metric_plateau(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """Goal B's trend test prevents wasteful extensions when the
+    metric has flat-lined. Sculpt_run is called ONCE; we observe
+    `stage_extension_skipped(reason="no_improvement_trend")`."""
+    from sculptor import sculpt as sculpt_mod
+
+    m = _make_mission(tmp_path, n_stages=1)
+    m.stages[0].max_iterations = 4
+    m.stages[0].success_criterion = "metric > 1.0"
+    # Pre-exhaust Ship 17 redecomp so a failed stage HALTS instead
+    # of triggering a Claude redecompose call (which the test stub
+    # doesn't mock). Goal B tests focus on the extension path; they
+    # don't exercise re-decomposition.
+    m.stages[0].redecomposition_attempts = 1
+
+    # Plateau: prior_best=0.51, recent_best=0.52 → 0.52 > 0.51 + 0.05 → False
+    fake = _criterion_aware_sculpt_run_factory(
+        iter_metrics=[0.5, 0.51, 0.51, 0.52],
+        write_behavior_pass_at=[False, False, False, False],
+    )
+    monkeypatch.setattr(sculpt_mod, "sculpt_run", fake)
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
+    )
+
+    events: list[dict] = []
+    sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab",
+        on_event=events.append,
+        extend_on_improvement=True,
+    )
+    skipped = [
+        e for e in events
+        if e.get("type") == "stage_extension_skipped"
+        and e.get("reason") == "no_improvement_trend"
+    ]
+    assert len(skipped) == 1
+
+
+def test_goal_b_caps_at_max_extensions(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """Goal B's hard cap. With max_extensions=2, even a perpetually-
+    improving stage stops after the cap is hit."""
+    from sculptor import sculpt as sculpt_mod
+
+    m = _make_mission(tmp_path, n_stages=1)
+    m.stages[0].max_iterations = 4
+    m.stages[0].success_criterion = "metric > 100.0"  # impossibly high
+    m.stages[0].redecomposition_attempts = 1  # halt on fail (no redecomp)
+
+    # Each call: monotonic climb from prior_best → prior_best + delta.
+    call_count = {"n": 0}
+
+    def dispatcher(**kw):
+        call_count["n"] += 1
+        # Always-improving stub. Each call adds +1.0 to the base.
+        base = call_count["n"] * 1.0
+        sub = _criterion_aware_sculpt_run_factory(
+            iter_metrics=[base, base + 0.5, base + 1.0, base + 1.5],
+            write_behavior_pass_at=[False] * 4,
+        )
+        return sub(**kw)
+
+    monkeypatch.setattr(sculpt_mod, "sculpt_run", dispatcher)
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
+    )
+
+    events: list[dict] = []
+    sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab",
+        on_event=events.append,
+        extend_on_improvement=True,
+        max_extensions_per_stage=2,
+        # extension_factor=1.0 so each extension call gets a full
+        # 4-iter budget. With the default 0.5 factor a 4-iter base
+        # would yield 2-iter extensions, whose primary_metric_history
+        # is shorter than `_is_metric_still_improving`'s 4-iter floor
+        # — so the trend test would correctly bail BEFORE hitting the
+        # cap. That safety-fallback is good behavior; this test
+        # specifically exercises the CAP path, so we use a 1.0
+        # factor to keep extensions long enough to chain.
+        extension_factor=1.0,
+    )
+    # Original + 2 extensions = 3 calls. NOT 4 (cap honored).
+    assert call_count["n"] == 3
+    exhausted = [
+        e for e in events
+        if e.get("type") == "stage_extension_exhausted"
+    ]
+    assert len(exhausted) == 1
+    assert exhausted[0]["extensions_used"] == 2
+
+
+def test_goal_b_does_not_extend_when_patience_early_stop_fired(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """If the existing metric-plateau early-stop (Ship 9a) fired
+    inside sculpt_run, the metric ISN'T improving by definition.
+    Goal B's extension check should bail with reason=metric_plateau_
+    early_stop instead of attempting a futile extension."""
+    from sculptor import sculpt as sculpt_mod
+
+    m = _make_mission(tmp_path, n_stages=1)
+    m.stages[0].max_iterations = 4
+    m.stages[0].success_criterion = "metric > 1.0"
+    # Pre-exhaust Ship 17 redecomp so a failed stage HALTS instead
+    # of triggering a Claude redecompose call (which the test stub
+    # doesn't mock). Goal B tests focus on the extension path; they
+    # don't exercise re-decomposition.
+    m.stages[0].redecomposition_attempts = 1
+
+    def fake(
+        *, config_path, behavior_goal, iterations=3,
+        steps_per_iter=None, seed=None, init_policy_path=None,
+        resume=False, per_iter_callback=None, **_kw,
+    ):
+        # Hand-craft an early-stopped result.
+        from sculptor.sculpt import IterOutcome, SculptRunResult
+        project = Path(config_path).parent
+        iter_dir = project / "runs" / "iter_3"
+        iter_dir.mkdir(parents=True, exist_ok=True)
+        (iter_dir / "checkpoint.pt").write_bytes(b"fake")
+        _fabricate_rollout_artifacts(
+            iter_dir,
+            behavior={"n_episodes": 1, "mean_return": 0.4,
+                      "mean_episode_length": 400.0,
+                      "max_episode_length": 500},
+        )
+        outcome = IterOutcome(
+            iter_index=3, iter_dir=iter_dir,
+            reward_path_before=project / "rewards" / "v1.py",
+            reward_path_after=project / "rewards" / "v3.py",
+            primary_metric=0.4,
+            behavior={"mean_return": 0.4},
+            failure_modes=[], edit_count=0,
+        )
+        result = SculptRunResult(
+            iterations_run=3,
+            completed_iters=[outcome],
+            primary_metric_history=[0.4, 0.4, 0.4],
+            early_stopped=True,
+            early_stop_reason="no improvement (test stub)",
+        )
+        return result
+
+    monkeypatch.setattr(sculpt_mod, "sculpt_run", fake)
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
+    )
+
+    events: list[dict] = []
+    sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab",
+        on_event=events.append,
+        extend_on_improvement=True,
+    )
+    skipped = [
+        e for e in events
+        if e.get("type") == "stage_extension_skipped"
+        and e.get("reason") == "metric_plateau_early_stop"
+    ]
+    assert len(skipped) == 1
+
+
+def test_inherit_parent_adapter_config_also_inherits_iteration(tmp_path: Path):
+    """§Ship-19c (extended): _inherit_parent_adapter_config now also
+    copies [iteration]. Without this, sculpt_init's generic
+    steps_per_iter=50000 was ALSO leaking into stages, blowing
+    wall-clock on Cartpole. Verify [iteration] inherits too."""
+    from sculptor.sculpt import _inherit_parent_adapter_config
+
+    project_dir = tmp_path / "proj"
+    stage_dir = tmp_path / "proj" / ".missions" / "m" / "stages" / "s0"
+    project_dir.mkdir(parents=True)
+    stage_dir.mkdir(parents=True)
+
+    (project_dir / "config.toml").write_text(
+        '[target]\nname = "p"\n\n'
+        '[adapter]\nclass = "sculptor.adapters.mjlab.MjlabAdapter"\n'
+        'config = { task_id = "Mjlab-Cartpole-Balance", num_envs = 1024, device = "cuda:0" }\n\n'
+        '[iteration]\nsteps_per_iter = 1500\nprimary_metric = "mean_return"\n\n'
+        '[kg]\nseeds_path = "kg_seeds.yml"\n'
+    )
+    (stage_dir / "config.toml").write_text(
+        '[target]\nname = "s0"\n\n'
+        '[adapter]\nclass = "sculptor.adapters.mjlab.MjlabAdapter"\n'
+        'config = { env_id = "CHANGE_ME" }\n\n'
+        '[iteration]\nsteps_per_iter = 50000\n\n'
+        '[kg]\nseeds_path = "kg_seeds.yml"\n'
+    )
+    changed = _inherit_parent_adapter_config(
+        stage_dir=stage_dir, project_dir=project_dir,
+    )
+    assert changed is True
+    final = (stage_dir / "config.toml").read_text()
+    assert "steps_per_iter = 1500" in final
+    assert "steps_per_iter = 50000" not in final
+    # Adapter inheritance still works (Ship 19c original case).
+    assert 'task_id = "Mjlab-Cartpole-Balance"' in final
+
+
 def test_mission_run_source_does_not_unlink_lock():
     """Audit-fix regression guard: verify the orchestrator's `finally`
     block does NOT call `lock_path.unlink`. Pre-fix unlink could

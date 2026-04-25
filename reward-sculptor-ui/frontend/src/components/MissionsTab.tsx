@@ -15,7 +15,6 @@ import { NewMissionDialog } from "@/components/NewMissionDialog";
 import {
   useDeleteMission,
   useMissions,
-  useRunMission,
 } from "@/hooks/useMissions";
 import { ApiError } from "@/lib/api";
 import { cn, formatRelative } from "@/lib/utils";
@@ -113,7 +112,10 @@ function MissionRow({
   mission: MissionSummary;
   onOpen: () => void;
 }) {
-  const run = useRunMission(slug);
+  // §Ship-19d: per-row Run button now opens the detail dialog (where
+  // the new RunMissionDialog can be configured), instead of firing a
+  // mutation with default config. Sam's feedback: defaults run 5000-
+  // step iters silently, blowing wall-clock when testing.
   const del = useDeleteMission(slug);
   const isErrored = mission.lifecycle === "errored";
   const hasActiveJob = mission.active_job_id != null;
@@ -162,7 +164,7 @@ function MissionRow({
           <Button
             variant="outline"
             size="sm"
-            disabled={!canRun || run.isPending}
+            disabled={!canRun}
             title={
               isErrored
                 ? "Mission is errored; only Delete is available."
@@ -170,31 +172,11 @@ function MissionRow({
                   ? `Lifecycle is ${mission.lifecycle}; run is only allowed when ready.`
                   : hasActiveJob
                     ? "An active job is already running."
-                    : undefined
+                    : "Open mission detail to configure run."
             }
-            onClick={() =>
-              run.mutate(mission.mission_slug, {
-                onSuccess: () => {
-                  toast.success("Mission run queued");
-                  onOpen();
-                },
-                onError: (err) => {
-                  const detail =
-                    err instanceof ApiError
-                      ? err.problem.detail ?? err.problem.title
-                      : err.message;
-                  toast.error("Could not run mission", {
-                    description: detail,
-                  });
-                },
-              })
-            }
+            onClick={onOpen}
           >
-            {run.isPending ? (
-              <Loader2 className="h-3.5 w-3.5 animate-spin" />
-            ) : (
-              <Play className="h-3.5 w-3.5" />
-            )}
+            <Play className="h-3.5 w-3.5" />
             Run
           </Button>
         )}

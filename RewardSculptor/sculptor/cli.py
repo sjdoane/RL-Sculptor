@@ -581,6 +581,86 @@ def mission_run_cli(
             "$SCULPTOR_SKILL_LIBRARY_ROOT or ~/.local/share/sculptor/skills/."
         ),
     ),
+    iterations_override: Optional[int] = typer.Option(
+        None, "--iterations-override",
+        min=1, max=200,
+        help=(
+            "Override every stage's max_iterations. Use to clamp a long "
+            "Claude-authored mission down to a quick smoke (e.g., "
+            "--iterations-override 2). Ship 19d."
+        ),
+    ),
+    steps_per_iter: Optional[int] = typer.Option(
+        None, "--steps-per-iter",
+        min=100, max=200_000,
+        help=(
+            "Override [iteration].steps_per_iter for every stage. For "
+            "mjlab this is the rsl_rl iters per cycle; for gym_sb3 it "
+            "is the env-step budget. Useful when stage configs were "
+            "scaffolded with the generic 50000 default. Ship 19d."
+        ),
+    ),
+    seed: Optional[int] = typer.Option(
+        None, "--seed", min=0,
+        help="Override the per-iter base seed. Ship 19d.",
+    ),
+    early_stop_on_criterion: bool = typer.Option(
+        False, "--early-stop-on-criterion",
+        help=(
+            "Goal A (Ship 19d): exit a stage early the moment its "
+            "success_criterion holds for `--criterion-stability-window` "
+            "consecutive iters. Cuts wall-clock on easy stages. "
+            "Default OFF — preserves Ship 16's run-the-full-budget "
+            "behavior. Independent of the metric-plateau early-stop "
+            "(which already exists at the inner sculpt_run level)."
+        ),
+    ),
+    criterion_stability_window: int = typer.Option(
+        1, "--criterion-stability-window",
+        min=1, max=10,
+        help=(
+            "How many consecutive iters the criterion must hold before "
+            "Goal A fires. Default 1 (immediate exit on first pass). "
+            "Bump to 2-3 for noisier metrics where a single iter could "
+            "satisfy the criterion by chance and revert."
+        ),
+    ),
+    extend_on_improvement: bool = typer.Option(
+        False, "--extend-on-improvement",
+        help=(
+            "Goal B (Ship 19d): if a stage finishes its iteration "
+            "budget without satisfying the criterion BUT the metric is "
+            "still trending up, run additional iters via resume mode. "
+            "Default OFF — adaptive extension changes the user's "
+            "iteration contract and should be opt-in."
+        ),
+    ),
+    max_extensions_per_stage: int = typer.Option(
+        1, "--max-extensions-per-stage",
+        min=0, max=3,
+        help=(
+            "Hard cap on Goal B extensions per stage. Default 1; max 3 "
+            "to prevent runaway. Each extension adds "
+            "`extension_factor * stage.max_iterations` more iters."
+        ),
+    ),
+    extension_factor: float = typer.Option(
+        0.5, "--extension-factor",
+        min=0.1, max=1.5,
+        help=(
+            "Goal B: fraction of original max_iterations to add per "
+            "extension. Default 0.5 (e.g. 4-iter stage extends by 2)."
+        ),
+    ),
+    extension_improvement_threshold: float = typer.Option(
+        0.05, "--extension-improvement-threshold",
+        min=0.0, max=1.0,
+        help=(
+            "Goal B trend test: recent_best must exceed prior_best by "
+            "max(threshold * |prior_best|, 0.05) to count as improving. "
+            "Default 5%."
+        ),
+    ),
 ):
     """Run a previously-initialized mission end-to-end.
 
@@ -666,6 +746,15 @@ def mission_run_cli(
             adapter_short_name=short_name,
             kg_store=kg_store,
             skill_library_handle=handle,
+            iterations_override=iterations_override,
+            steps_per_iter=steps_per_iter,
+            seed=seed,
+            early_stop_on_criterion=early_stop_on_criterion,
+            criterion_stability_window=criterion_stability_window,
+            extend_on_improvement=extend_on_improvement,
+            max_extensions_per_stage=max_extensions_per_stage,
+            extension_factor=extension_factor,
+            extension_improvement_threshold=extension_improvement_threshold,
         )
     finally:
         kg_store.close()

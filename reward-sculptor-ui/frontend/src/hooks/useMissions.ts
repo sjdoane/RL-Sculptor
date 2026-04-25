@@ -6,6 +6,7 @@ import {
   getMission,
   listMissions,
   runMission,
+  type RunMissionRequestBody,
 } from "@/lib/api";
 import { qk } from "@/lib/queryKeys";
 import type {
@@ -109,11 +110,21 @@ export function useCreateMission(slug: string) {
  *  the WS hook's `enabled` flag flips true immediately and stays
  *  true through the refetch (the backend has already persisted
  *  active_job_id by the time runMission's POST resolves). */
+/** §Ship-19d: the `variables` parameter is now an object so the
+ *  mutation can carry an optional body (iteration overrides + Goal
+ *  A/B flags). `string` would also work via overload but a single
+ *  shape keeps useMutation's TypeScript happy. */
+export interface RunMissionVariables {
+  missionSlug: string;
+  body?: RunMissionRequestBody;
+}
+
 export function useRunMission(slug: string) {
   const qc = useQueryClient();
-  return useMutation<JobSummary, Error, string>({
-    mutationFn: (missionSlug) => runMission(slug, missionSlug),
-    onSuccess: (job, missionSlug) => {
+  return useMutation<JobSummary, Error, RunMissionVariables>({
+    mutationFn: ({ missionSlug, body }) =>
+      runMission(slug, missionSlug, body),
+    onSuccess: (job, { missionSlug }) => {
       qc.setQueryData<MissionDetail | undefined>(
         qk.mission(slug, missionSlug),
         (old) =>
