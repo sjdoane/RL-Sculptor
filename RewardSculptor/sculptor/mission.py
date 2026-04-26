@@ -138,6 +138,19 @@ class Mission:
     current_stage_idx: int = 0
     # Optional on-disk anchor — set by the orchestrator when persisting.
     mission_dir: Optional[str] = None
+    # §Ship 21a: persisted run-time defaults set at mission-creation
+    # time via the NewMissionDialog Advanced tab. Stored as a free-form
+    # dict to keep Mission decoupled from the backend's
+    # RunMissionRequest pydantic shape — valid keys are the same as
+    # that shape (iterations_override, steps_per_iter, seed,
+    # early_stop_on_criterion, criterion_stability_window,
+    # extend_on_improvement, max_extensions_per_stage,
+    # extension_factor, extension_improvement_threshold). RunMission
+    # Dialog pre-fills from these when the user later clicks Run
+    # mission. Backward-compatible: older mission.json without this
+    # field loads with run_defaults=None via from_dict's filter-
+    # unknown-keys path.
+    run_defaults: Optional[dict[str, Any]] = None
 
     # ── Serialization ────────────────────────────────────────────────
     def to_dict(self) -> dict[str, Any]:
@@ -148,7 +161,7 @@ class Mission:
         # (see `load_mission`). In memory, `mission_dir` is set so
         # downstream code (`stage_dir`, `parent_checkpoint_of`) keeps
         # working without changes.
-        return {
+        out: dict[str, Any] = {
             "schema_version": self.schema_version,
             "goal": self.goal,
             "decomposition_model": self.decomposition_model,
@@ -157,6 +170,12 @@ class Mission:
             "current_stage_idx": self.current_stage_idx,
             "stages": [s.to_dict() for s in self.stages],
         }
+        # §Ship 21a: emit run_defaults only when set, so older mission
+        # readers (and the UI's MissionDetail expecting Optional[dict])
+        # see a clean None.
+        if self.run_defaults is not None:
+            out["run_defaults"] = dict(self.run_defaults)
+        return out
 
     def to_json(self, *, indent: int = 2) -> str:
         return json.dumps(self.to_dict(), indent=indent, default=str)
@@ -171,6 +190,10 @@ class Mission:
                 f"upgrade sculptor or downgrade the mission file."
             )
         stages = [Stage.from_dict(s) for s in data.get("stages", [])]
+        run_defaults_raw = data.get("run_defaults")
+        run_defaults = (
+            dict(run_defaults_raw) if isinstance(run_defaults_raw, dict) else None
+        )
         return cls(
             goal=data["goal"],
             stages=stages,
@@ -183,6 +206,7 @@ class Mission:
             schema_version=ver,
             current_stage_idx=int(data.get("current_stage_idx", 0)),
             mission_dir=data.get("mission_dir"),
+            run_defaults=run_defaults,
         )
 
     @classmethod

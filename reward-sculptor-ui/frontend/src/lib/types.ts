@@ -779,12 +779,35 @@ export interface MissionDetail extends MissionSummary {
   stages: StageSchema[];
   decomposition_rationale: string;
   schema_version: number;
+  // §Ship 21a: persisted run-time defaults set up front via the
+  // NewMissionDialog Advanced tab. RunMissionDialog pre-fills its
+  // inputs from this on first open. Keys mirror RunMissionRequestBody.
+  // Null when none were set at creation time.
+  run_defaults?: MissionRunDefaults | null;
+}
+
+/** §Ship 21a: same shape as RunMissionRequestBody (api.ts) but lives
+ *  in types.ts because it's the persisted view of the same payload. */
+export interface MissionRunDefaults {
+  iterations_override?: number | null;
+  steps_per_iter?: number | null;
+  seed?: number | null;
+  early_stop_on_criterion?: boolean;
+  criterion_stability_window?: number;
+  extend_on_improvement?: boolean;
+  max_extensions_per_stage?: number;
+  extension_factor?: number;
+  extension_improvement_threshold?: number;
 }
 
 export interface CreateMissionRequest {
   goal: string;             // 8-2000 chars
   mission_slug?: string;    // optional override
   no_kg?: boolean;
+  // §Ship 21a: optional run-time defaults set via the NewMission
+  // Dialog Advanced tab. Persisted on the mission so RunMissionDialog
+  // can pre-fill on first open.
+  run_defaults?: MissionRunDefaults | null;
 }
 
 export interface DeleteMissionResponse {

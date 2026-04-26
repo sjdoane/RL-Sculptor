@@ -100,6 +100,11 @@ class MissionDetail(MissionSummary):
     stages: list[StageSchema]
     decomposition_rationale: str
     schema_version: int = 1
+    # §Ship 21a: persisted run-time defaults set at mission-creation
+    # time via NewMissionDialog's Advanced tab. RunMissionDialog
+    # pre-fills from these on first open. Null when none were set
+    # (mission was created with the basic-tab-only flow).
+    run_defaults: Optional[dict[str, Any]] = None
 
 
 class CreateMissionRequest(BaseModel):
@@ -121,6 +126,13 @@ class CreateMissionRequest(BaseModel):
     no_kg: bool = False
     """Skip KG context to Claude during decompose. Faster (~10s) but
     Claude can't cite KG papers in stage seed prompts."""
+
+    # §Ship 21a: optional run-time defaults set up front via the
+    # NewMissionDialog Advanced tab. These are persisted on the
+    # mission and pre-fill RunMissionDialog when the user later
+    # clicks Run mission. Validated against the same shape as
+    # RunMissionRequest so the round-trip is type-safe.
+    run_defaults: Optional["RunMissionRequest"] = None
 
 
 class RunMissionRequest(BaseModel):
@@ -169,6 +181,12 @@ class RunMissionRequest(BaseModel):
         float, Field(ge=0.0, le=1.0),
     ] = 0.05
     """Goal B trend threshold (5% relative improvement floor)."""
+
+
+# §Ship 21a: resolve the forward reference now that RunMissionRequest
+# is defined. Required because CreateMissionRequest declares
+# `run_defaults: Optional["RunMissionRequest"]` higher up in the file.
+CreateMissionRequest.model_rebuild()
 
 
 class DeleteMissionResponse(BaseModel):

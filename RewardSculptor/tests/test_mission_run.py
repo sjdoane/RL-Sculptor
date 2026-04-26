@@ -1151,6 +1151,97 @@ def test_stage_effective_max_iterations_backward_compat_load(tmp_path: Path):
     assert m.stages[0].iterations_used == 3
 
 
+def test_mission_run_defaults_round_trip_through_json(tmp_path: Path):
+    """§Ship 21a regression: Mission.run_defaults persists through
+    to_dict / from_dict (and therefore through save_mission /
+    load_mission). Set up front via NewMissionDialog Advanced tab;
+    the backend's mission_jobs.run_mission_decompose_job sets
+    `mission.run_defaults = run_defaults_dict` before save_mission.
+    The frontend's MissionDetail.run_defaults reads this value and
+    pre-fills RunMissionDialog on first open.
+    """
+    from sculptor.mission import (
+        Mission,
+        Stage,
+        save_mission,
+        load_mission,
+    )
+
+    stage = Stage(
+        name="s0",
+        goal_text="do thing",
+        success_criterion="metric > 0.5",
+        max_iterations=3,
+        parent_stage=None,
+        reward_seed_prompt="seed",
+    )
+    run_defaults = {
+        "iterations_override": 5,
+        "early_stop_on_criterion": True,
+        "criterion_stability_window": 2,
+        "extend_on_improvement": True,
+        "max_extensions_per_stage": 2,
+        "extension_factor": 0.75,
+        "extension_improvement_threshold": 0.05,
+    }
+    m = Mission(
+        goal="test",
+        stages=[stage],
+        decomposition_model="claude-opus-4-7",
+        decomposition_rationale="test",
+        run_defaults=run_defaults,
+    )
+
+    md = tmp_path / "round_trip_mission"
+    save_mission(m, md)
+
+    loaded = load_mission(md / "mission.json")
+    assert loaded.run_defaults == run_defaults
+    # Deep-equal so a mutation of `loaded.run_defaults` doesn't leak
+    # back into the original (defensive copy in from_dict).
+    loaded.run_defaults["iterations_override"] = 999  # type: ignore[index]
+    assert run_defaults["iterations_override"] == 5
+
+
+def test_mission_run_defaults_omitted_when_none(tmp_path: Path):
+    """§Ship 21a: when no run_defaults are set (Basic-tab-only
+    creation flow), `to_dict` omits the key entirely so older readers
+    + the UI's MissionDetail see a clean None. Forward-compat: the
+    field doesn't surface in the JSON at all when unused."""
+    import json
+    from sculptor.mission import (
+        Mission,
+        Stage,
+        save_mission,
+    )
+
+    stage = Stage(
+        name="s0",
+        goal_text="do thing",
+        success_criterion="metric > 0.5",
+        max_iterations=3,
+        parent_stage=None,
+        reward_seed_prompt="seed",
+    )
+    m = Mission(
+        goal="test",
+        stages=[stage],
+        decomposition_model="claude-opus-4-7",
+        decomposition_rationale="test",
+        # run_defaults omitted (defaults to None)
+    )
+    assert m.run_defaults is None
+
+    md = tmp_path / "no_defaults_mission"
+    save_mission(m, md)
+
+    raw = json.loads((md / "mission.json").read_text())
+    assert "run_defaults" not in raw, (
+        "to_dict must omit run_defaults when None so older readers "
+        "don't see a null they don't recognize"
+    )
+
+
 def test_mission_run_lock_release_allows_reentry(
     tmp_path: Path, monkeypatch, stub_adapter,
 ):

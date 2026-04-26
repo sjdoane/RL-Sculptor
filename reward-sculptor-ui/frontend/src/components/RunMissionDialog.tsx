@@ -76,11 +76,59 @@ export function RunMissionDialog({
     return Math.max(...mission.stages.map((s) => s.max_iterations || 0));
   }, [mission]);
 
+  // §Ship 21a: pre-fill from `mission.run_defaults` if the user set
+  // them at creation time via the NewMissionDialog Advanced tab. The
+  // run_defaults take precedence over `suggestedIters` (which is just
+  // Claude's authored cap). User can still tweak before launching.
+  // Tracked-once so re-renders don't clobber user edits mid-session.
+  const [appliedDefaults, setAppliedDefaults] = useState(false);
   useEffect(() => {
-    if (open && iterations === "" && suggestedIters) {
-      setIterations(suggestedIters);
+    if (!open) {
+      setAppliedDefaults(false);
+      return;
     }
-  }, [open, iterations, suggestedIters]);
+    if (appliedDefaults) return;
+    const rd = mission?.run_defaults;
+    if (rd) {
+      if (typeof rd.iterations_override === "number") {
+        setIterations(rd.iterations_override);
+      } else if (suggestedIters) {
+        setIterations(suggestedIters);
+      }
+      if (typeof rd.steps_per_iter === "number") {
+        setStepsPerIter(rd.steps_per_iter);
+      }
+      if (typeof rd.seed === "number") {
+        setSeed(rd.seed);
+      }
+      if (rd.early_stop_on_criterion) {
+        setEarlyStopOnCriterion(true);
+        if (typeof rd.criterion_stability_window === "number") {
+          setStabilityWindow(rd.criterion_stability_window);
+        }
+      }
+      if (rd.extend_on_improvement) {
+        setExtendOnImprovement(true);
+        if (typeof rd.max_extensions_per_stage === "number") {
+          setMaxExtensions(rd.max_extensions_per_stage);
+        }
+        if (typeof rd.extension_factor === "number") {
+          setExtensionFactor(rd.extension_factor);
+        }
+        if (typeof rd.extension_improvement_threshold === "number") {
+          setExtensionThreshold(rd.extension_improvement_threshold);
+        }
+      }
+      setAppliedDefaults(true);
+      return;
+    }
+    // No persisted defaults — fall back to the Ship 19d behavior
+    // (Claude's authored max from suggestedIters).
+    if (iterations === "" && suggestedIters) {
+      setIterations(suggestedIters);
+      setAppliedDefaults(true);
+    }
+  }, [open, mission, suggestedIters, appliedDefaults, iterations]);
 
   const submit = () => {
     const body: RunMissionRequestBody = {};

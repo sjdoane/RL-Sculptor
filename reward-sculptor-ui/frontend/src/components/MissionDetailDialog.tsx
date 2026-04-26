@@ -166,7 +166,15 @@ export function MissionDetailDialog({
               </div>
             </div>
           )}
-          {detail.error && !isDecomposing && (
+          {/* §Ship 21a defense-in-depth: only render the destructive
+              error banner when (a) the GET genuinely failed AND (b)
+              we have neither a mission nor a summary fallback. The
+              backend now returns a "decomposing" stub when the slug
+              is reserved but mission.json hasn't been written yet, so
+              this branch should rarely fire in practice — kept as a
+              guard for true 404s (e.g., the user pasted a deep-link
+              for a deleted mission). */}
+          {detail.error && !isDecomposing && !liveSummary && (
             <p className="rounded border border-destructive/40 bg-destructive/5 p-2 font-mono text-[11px] text-destructive">
               {(detail.error as Error).message}
             </p>

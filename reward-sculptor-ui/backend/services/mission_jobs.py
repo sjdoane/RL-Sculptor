@@ -92,6 +92,7 @@ def run_mission_decompose_job(
     goal: str,
     mission_slug: str,
     no_kg: bool = False,
+    run_defaults: Optional[dict[str, Any]] = None,
 ) -> Callable[[Job, asyncio.Event], Awaitable[dict[str, Any]]]:
     """Async runner that calls `sculptor.decompose.decompose_task` and
     persists the resulting mission to `<project_dir>/.missions/
@@ -105,6 +106,11 @@ def run_mission_decompose_job(
     mission_slug : pre-resolved unique slug (caller derived via
         `mission_store.derive_unique_mission_slug`).
     no_kg : skip KG context to Claude (faster, less grounded).
+    run_defaults : §Ship 21a — optional run-time defaults set up
+        front via the NewMissionDialog Advanced tab. Persisted on the
+        Mission so RunMissionDialog can pre-fill when the user later
+        clicks Run mission. Validated by the route layer against
+        RunMissionRequest's pydantic shape before reaching here.
     """
 
     async def _runner(job: Job, cancel: asyncio.Event) -> dict[str, Any]:
@@ -143,6 +149,11 @@ def run_mission_decompose_job(
 
             md = mission_store.mission_dir(project_dir, mission_slug)
             mission.mission_dir = str(md.resolve())
+            # §Ship 21a: persist run_defaults on the Mission BEFORE
+            # save so the first GET /missions/{slug} after decompose
+            # completes already includes them.
+            if run_defaults:
+                mission.run_defaults = dict(run_defaults)
             save_mission(mission, md)
             return {
                 "mission_slug": mission_slug,

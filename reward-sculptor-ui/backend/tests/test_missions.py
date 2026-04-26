@@ -251,6 +251,108 @@ def test_create_mission_returns_202_with_jobsummary(
     assert body["status"] in ("queued", "running", "completed")
 
 
+def test_create_mission_accepts_run_defaults_and_round_trips(
+    client: TestClient, tmp_projects_root: Path, monkeypatch,
+) -> None:
+    """§Ship 21a regression: NewMissionDialog Advanced tab POSTs
+    `run_defaults` alongside `goal`. Backend persists them on the
+    Mission so RunMissionDialog can pre-fill on first open.
+
+    Validates:
+      - Pydantic CreateMissionRequest accepts the nested
+        `run_defaults` shape (same fields as RunMissionRequest).
+      - Route forwards run_defaults to the decompose runner via
+        `params["run_defaults"]` (so the optimistic-cache write also
+        sees them).
+      - JobDetail.params on the wire includes the round-tripped
+        run_defaults dict.
+
+    Doesn't run an actual decompose (stubbed); the full
+    persist-then-load round-trip is exercised by the sculptor-side
+    mission.py round-trip tests.
+    """
+    captured: dict[str, object] = {}
+
+    async def _stub_runner(job, cancel):
+        return {"mission_slug": "stubbed", "n_stages": 0}
+
+    def _factory(**kwargs):
+        # Capture the run_defaults kwarg so we can assert the route
+        # forwarded it to the runner factory correctly. Patch in the
+        # routes module namespace (where it's bound at import) rather
+        # than the services module — `from backend.services... import
+        # run_mission_decompose_job` made a local reference.
+        captured["run_defaults"] = kwargs.get("run_defaults")
+        return _stub_runner
+
+    monkeypatch.setattr(
+        "backend.routes.missions.run_mission_decompose_job", _factory,
+    )
+
+    slug = _make_project(client)
+    payload = {
+        "goal": "Hold cartpole upright for 200 steps",
+        "run_defaults": {
+            "iterations_override": 5,
+            "early_stop_on_criterion": True,
+            "criterion_stability_window": 2,
+            "extend_on_improvement": True,
+            "max_extensions_per_stage": 2,
+            "extension_factor": 0.75,
+        },
+    }
+    r = client.post(f"/projects/{slug}/missions", json=payload)
+    assert r.status_code == 202, r.text
+    body = r.json()
+    # Wire format: params.run_defaults round-trips so the optimistic-
+    # cache write in useCreateMission has access to them.
+    assert "run_defaults" in body["params"], (
+        "params.run_defaults should be on the wire so the frontend "
+        "can read what defaults were stored"
+    )
+    rd = body["params"]["run_defaults"]
+    assert rd["iterations_override"] == 5
+    assert rd["early_stop_on_criterion"] is True
+    assert rd["criterion_stability_window"] == 2
+    assert rd["extend_on_improvement"] is True
+    assert rd["max_extensions_per_stage"] == 2
+    assert rd["extension_factor"] == 0.75
+    # Defaults filled in for unspecified fields by pydantic.
+    assert "extension_improvement_threshold" in rd
+    # The route also forwarded run_defaults to the decompose runner
+    # factory so it can persist on the Mission once decompose completes.
+    assert captured["run_defaults"] is not None
+    assert captured["run_defaults"]["iterations_override"] == 5
+
+
+def test_create_mission_run_defaults_optional(
+    client: TestClient, tmp_projects_root: Path, monkeypatch,
+) -> None:
+    """§Ship 21a: omitting run_defaults preserves the Ship 18a/19d
+    behavior (Basic-tab-only flow). params.run_defaults is None on
+    the wire — the frontend's RunMissionDialog falls back to
+    Claude-authored max_iterations as before."""
+
+    async def _stub_runner(job, cancel):
+        return {"mission_slug": "stubbed", "n_stages": 0}
+
+    def _factory(**kwargs):
+        return _stub_runner
+
+    monkeypatch.setattr(
+        "backend.routes.missions.run_mission_decompose_job", _factory,
+    )
+
+    slug = _make_project(client)
+    r = client.post(
+        f"/projects/{slug}/missions",
+        json={"goal": "Hold cartpole upright"},
+    )
+    assert r.status_code == 202, r.text
+    body = r.json()
+    assert body["params"]["run_defaults"] is None
+
+
 def test_create_mission_response_includes_params_mission_slug(
     client: TestClient, tmp_projects_root: Path, monkeypatch,
 ) -> None:
