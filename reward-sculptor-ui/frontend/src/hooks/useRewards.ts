@@ -24,6 +24,11 @@ export function useRewards(
    *  When set, the cache key is namespaced so stage views don't
    *  clobber the project rewards cache. */
   stage?: string | null,
+  /** §Ship 21b: refetch every N ms while a stage run is active so
+   *  new vN.py files surface in the UI as Claude iterates them.
+   *  Caller passes 3000 while the active mission_stage_run for this
+   *  scope is in `running` state; null/undefined to disable. */
+  refetchIntervalMs?: number | null,
 ) {
   const stageKey = stage ?? null;
   return useQuery<RewardVersionSummary[]>({
@@ -34,6 +39,10 @@ export function useRewards(
       : ["rewards", "_none"],
     queryFn: () => listRewards(slug!, stageKey ?? undefined),
     enabled: !!slug,
+    refetchInterval:
+      typeof refetchIntervalMs === "number" && refetchIntervalMs > 0
+        ? refetchIntervalMs
+        : false,
   });
 }
 
@@ -41,6 +50,12 @@ export function useReward(
   slug: string | undefined,
   version: number | undefined,
   stage?: string | null,
+  /** §Ship 21b: same polling rationale as useRewards — when an active
+   *  stage run is producing v0/v1/v2 the *content* of the latest
+   *  version may also change (e.g., REWARD_SPEC docstring updates as
+   *  Claude iterates). Caller passes 3000 to keep the right-pane
+   *  Monaco view fresh; null/undefined to disable. */
+  refetchIntervalMs?: number | null,
 ) {
   const stageKey = stage ?? null;
   return useQuery<RewardVersionDetail>({
@@ -52,6 +67,10 @@ export function useReward(
         : ["reward", "_none"],
     queryFn: () => getReward(slug!, version!, stageKey ?? undefined),
     enabled: slug !== undefined && version !== undefined,
+    refetchInterval:
+      typeof refetchIntervalMs === "number" && refetchIntervalMs > 0
+        ? refetchIntervalMs
+        : false,
   });
 }
 

@@ -13,6 +13,7 @@ import {
   User2,
   Wand2,
 } from "lucide-react";
+import { useRuns } from "@/hooks/useRuns";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -49,10 +50,98 @@ import type {
   ProjectDetail,
   RewardVersionDetail,
   RewardVersionSummary,
+  RunSummary,
 } from "@/lib/types";
 
 const SCULPT_LOCK_NOTE =
   "Sculpt run in progress — manual edits locked until the run completes or is stopped.";
+
+// §Ship 21b: when an active mission stage is training, default the
+// Rewards tab to that stage's scoped rewards/ dir so the user sees
+// Claude's iterative reward edits land in real time. Surface a small
+// pill toggle so the user can flip to the project-global rewards.
+function RewardsScopeSelector({
+  activeStageRun,
+  stageScope,
+  scopeOverride,
+  effectiveScope,
+  onChange,
+}: {
+  activeStageRun: RunSummary | null;
+  stageScope: string | null;
+  scopeOverride: string | null;
+  effectiveScope: string | null;
+  onChange: (next: string | null) => void;
+}) {
+  const isProject = effectiveScope === null;
+  const isStage = effectiveScope !== null;
+  const stageLabel = activeStageRun
+    ? `Stage: ${activeStageRun.stage_name ?? "unknown"}${
+        typeof activeStageRun.stage_index === "number"
+          ? ` (${activeStageRun.stage_index + 1})`
+          : ""
+      }`
+    : effectiveScope
+      ? `Stage: ${effectiveScope.split("/")[1] ?? effectiveScope}`
+      : "Stage";
+  return (
+    <Card>
+      <CardContent className="flex flex-wrap items-center gap-3 p-3 text-[11px]">
+        <span className="font-medium">Scope:</span>
+        <div className="inline-flex rounded-md border bg-background p-0.5">
+          <button
+            type="button"
+            onClick={() => onChange("project")}
+            className={cn(
+              "rounded-sm px-2 py-0.5 text-[11px] font-medium transition-colors",
+              isProject
+                ? "bg-foreground text-background"
+                : "text-muted-foreground hover:text-foreground",
+            )}
+            title="Project-global rewards/v0.py, v1.py, ..."
+          >
+            Project
+          </button>
+          <button
+            type="button"
+            onClick={() => onChange(stageScope ?? scopeOverride)}
+            disabled={!stageScope && !scopeOverride}
+            className={cn(
+              "rounded-sm px-2 py-0.5 text-[11px] font-medium transition-colors",
+              isStage
+                ? "bg-foreground text-background"
+                : "text-muted-foreground hover:text-foreground",
+              !stageScope && !scopeOverride && "cursor-not-allowed opacity-40",
+            )}
+            title={
+              stageScope
+                ? `Stage rewards under .missions/${stageScope}/rewards/`
+                : "No active stage — kick off a mission run to enable"
+            }
+          >
+            {stageLabel}
+          </button>
+        </div>
+        {scopeOverride && (
+          <button
+            type="button"
+            onClick={() => onChange(null)}
+            className="text-[10.5px] text-muted-foreground underline-offset-2 hover:underline"
+            title="Stop pinning; follow the active mission stage automatically"
+          >
+            Unpin (auto-follow active stage)
+          </button>
+        )}
+        {isStage && activeStageRun && (
+          <span className="ml-auto inline-flex items-center gap-1 rounded-sm border border-amber-300/60 bg-amber-50 px-1.5 py-0.5 text-[9.5px] font-semibold uppercase tracking-wide text-amber-900">
+            <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-amber-500" />
+            Live
+          </span>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
 
 export function RewardsTab({
   slug,
@@ -61,7 +150,39 @@ export function RewardsTab({
   slug: string;
   project: ProjectDetail;
 }) {
-  const list = useRewards(slug);
+  // §Ship 21b: when a mission_stage_run is active, the project's
+  // global rewards/v0.py doesn't change — Claude's edits land in the
+  // STAGE's rewards dir at <project>/.missions/<m>/stages/<s>/rewards/.
+  // Auto-scope the Rewards tab to the active stage so the user sees
+  // versions accumulate live as the mission trains. A toggle lets the
+  // user flip back to project rewards.
+  const runs = useRuns(slug);
+  const activeStageRun = useMemo(() => {
+    return (runs.data ?? []).find(
+      (r) =>
+        r.kind === "mission_stage_run"
+        && (r.status === "running" || r.status === "queued")
+        && r.mission_slug && r.stage_name,
+    ) ?? null;
+  }, [runs.data]);
+  const stageScope = activeStageRun
+    ? `${activeStageRun.mission_slug}/${activeStageRun.stage_name}`
+    : null;
+  // User can override the default scope; null = follow `stageScope`
+  // automatically (default), "project" = pinned to project rewards,
+  // a "<m>/<s>" string = pinned to that stage.
+  const [scopeOverride, setScopeOverride] = useState<string | null>(null);
+  const effectiveScope: string | null = useMemo(() => {
+    if (scopeOverride === "project") return null;
+    if (scopeOverride && scopeOverride !== "project") return scopeOverride;
+    return stageScope;
+  }, [scopeOverride, stageScope]);
+  const isStageScope = effectiveScope !== null;
+  // Refetch interval: poll every 3s while a stage is actively
+  // training so new vN files surface without manual refresh.
+  const pollMs = activeStageRun != null ? 3000 : null;
+
+  const list = useRewards(slug, effectiveScope, pollMs);
   const [selectedVersion, setSelectedVersion] = useState<number | null>(null);
   const [draftSource, setDraftSource] = useState<string | null>(null);
   const [draftParentVersion, setDraftParentVersion] = useState<number | null>(null);
@@ -73,7 +194,36 @@ export function RewardsTab({
     }
   }, [list.data, selectedVersion]);
 
-  const detail = useReward(slug, selectedVersion ?? undefined);
+  // §Ship 21b: when scope changes (project ↔ stage), reset the
+  // selected version so the next render picks the newest in the new
+  // scope rather than holding a stale cross-scope index.
+  useEffect(() => {
+    setSelectedVersion(null);
+    setDraftSource(null);
+    setDraftParentVersion(null);
+  }, [effectiveScope]);
+
+  // §Ship 21b: also auto-advance to the latest version when a new one
+  // appears during a live stage run (so the user sees Claude's
+  // newest edit without clicking).
+  useEffect(() => {
+    if (!isStageScope || !list.data || list.data.length === 0) return;
+    const newest = list.data[0].version;
+    if (
+      selectedVersion !== null
+      && newest > selectedVersion
+      && draftSource === null
+    ) {
+      setSelectedVersion(newest);
+    }
+  }, [list.data, isStageScope, selectedVersion, draftSource]);
+
+  const detail = useReward(
+    slug,
+    selectedVersion ?? undefined,
+    effectiveScope,
+    pollMs,
+  );
 
   // When switching versions, drop any unsaved draft.
   useEffect(() => {
@@ -83,6 +233,11 @@ export function RewardsTab({
 
   const isRunning = project.status === "running";
   const isDrafting = draftSource !== null;
+  // §Ship 21b: editing endpoints (PUT /rewards, POST /rewards/prompt)
+  // are project-scoped only. When viewing a stage's rewards, edits
+  // would target the wrong dir AND clobber Claude's in-flight work.
+  // Lock editing while in stage scope; user can still browse Monaco.
+  const editsLockedByStageScope = isStageScope;
 
   const latestVersion = list.data && list.data.length > 0
     ? Math.max(...list.data.map((v) => v.version))
@@ -96,6 +251,18 @@ export function RewardsTab({
         adapterUnavailable={Boolean(project.adapter_unavailable)}
         latestVersion={latestVersion}
       />
+      {/* §Ship 21b: scope selector. Hidden when there's no active
+          stage AND the user hasn't pinned a stage scope — keeps the
+          common case (no missions running) free of UI clutter. */}
+      {(activeStageRun || scopeOverride) && (
+        <RewardsScopeSelector
+          activeStageRun={activeStageRun}
+          stageScope={stageScope}
+          scopeOverride={scopeOverride}
+          effectiveScope={effectiveScope}
+          onChange={setScopeOverride}
+        />
+      )}
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-[220px_minmax(0,1fr)]">
       <aside className="order-2 lg:order-1">
         <Card>
@@ -104,10 +271,22 @@ export function RewardsTab({
             <CardDescription className="text-[11px]">
               {list.data?.length ?? 0} version
               {list.data?.length === 1 ? "" : "s"}
+              {isStageScope && (
+                <span className="ml-1 text-amber-700">
+                  · live (3s poll)
+                </span>
+              )}
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-1 p-2 pt-0">
             {list.isLoading && <p className="text-xs">Loading…</p>}
+            {list.data?.length === 0 && !list.isLoading && (
+              <p className="text-[10.5px] text-muted-foreground">
+                {isStageScope
+                  ? "No reward versions yet — stage hasn't materialized v1."
+                  : "No reward versions yet."}
+              </p>
+            )}
             {list.data?.map((v) => (
               <VersionRow
                 key={v.version}
@@ -124,6 +303,9 @@ export function RewardsTab({
         {isRunning && (
           <LockBanner note={SCULPT_LOCK_NOTE} />
         )}
+        {editsLockedByStageScope && !isRunning && (
+          <LockBanner note="Viewing a mission stage's reward versions — read-only. Switch to Project scope to edit." />
+        )}
 
         {detail.isLoading && (
           <p className="text-sm text-muted-foreground">Loading reward…</p>
@@ -133,7 +315,7 @@ export function RewardsTab({
           <ReadOnlyPane
             slug={slug}
             detail={detail.data}
-            canEdit={!isRunning}
+            canEdit={!isRunning && !editsLockedByStageScope}
             onNewHumanEdit={() => {
               setDraftSource(detail.data!.source);
               setDraftParentVersion(detail.data!.version);

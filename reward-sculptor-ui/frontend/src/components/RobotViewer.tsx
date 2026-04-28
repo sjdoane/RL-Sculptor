@@ -14,6 +14,7 @@ import { Button } from "@/components/ui/button";
 import { Select } from "@/components/ui/select";
 import { useLiveClips } from "@/hooks/useLiveClips";
 import { useProjectPreview } from "@/hooks/useProjectPreview";
+import { useRunEvents } from "@/hooks/useRunEvents";
 import { useRuns } from "@/hooks/useRuns";
 import { clipUrl, iterRolloutUrl, previewUrl } from "@/lib/api";
 import { cn } from "@/lib/utils";
@@ -237,6 +238,15 @@ function LiveLayer({
   runId: string | null;
   run: RunSummary | null;
 }) {
+  // §Ship 21b: rollout_streamer is wired only for top-level sculpt_run
+  // jobs (run_manager.py). Mission stage runs (kind="mission_stage_run")
+  // produce per-iter rollout.mp4 files inside their stage_dir but no
+  // 2s live clips. Branch to LiveStageRollout which polls the per-iter
+  // rollout endpoint as iter_completed events fire on the run WS.
+  if (run?.kind === "mission_stage_run") {
+    return <LiveStageRollout slug={slug} runId={runId} run={run} />;
+  }
+
   const { clips, skipped, terminal } = useLiveClips(slug, runId ?? undefined);
   const latest = clips[clips.length - 1] ?? null;
   const [hasEverPlayed, setHasEverPlayed] = useState(false);
@@ -315,6 +325,139 @@ function fmtMetricAt(run: RunSummary | null, iter: number): string {
   const v = run.primary_metric_history[iter];
   if (typeof v !== "number") return "";
   return `metric=${v.toFixed(3)}`;
+}
+
+// ── Live (mission_stage_run) — Ship 21b ──────────────────────────────
+//
+// rollout_streamer (run_manager.py) is wired only for top-level
+// sculpt_run jobs and writes 2s live clips to
+// `<project>/uploads/live_clips/<run_id>/iter_N.mp4`. Mission stage
+// runs DON'T get those clips — but their inner sculpt_run subprocess
+// DOES write a full per-iter rollout to
+// `<project>/.missions/<m>/stages/<s>/runs/iter_N/rollout/rollout.mp4`.
+// Ship 21's `_resolve_run_root` fix made the `iter_rollout` endpoint
+// resolve those paths for mission_stage_run kind.
+//
+// This layer uses the run WS to track which iter most recently
+// completed (via `iter_completed` / `iter_rolled_out` / `rollout_done`
+// events tee'd by mission_jobs._stream_stdout) and shows that iter's
+// full rollout.mp4. As iters complete, the video auto-advances. No
+// clip backpressure to worry about — full rollouts already exist on
+// disk by the time iter_rolled_out fires.
+function LiveStageRollout({
+  slug,
+  runId,
+  run,
+}: {
+  slug: string;
+  runId: string | null;
+  run: RunSummary | null;
+}) {
+  const events = useRunEvents(slug, runId ?? undefined);
+  const videoRef = useRef<HTMLVideoElement>(null);
+
+  // Most-recent iter that has a rollout.mp4 on disk. Prefer
+  // `iter_rolled_out` (rollout artifact written) > `rollout_done`
+  // (some adapters emit this name) > `iter_completed` (artifacts may
+  // still be flushing — accepted as fallback).
+  const latestIter = useMemo(() => {
+    let best: number | null = null;
+    for (const ev of events.events) {
+      if (
+        ev.type === "iter_rolled_out"
+        || ev.type === "rollout_done"
+        || ev.type === "iter_completed"
+      ) {
+        const i = (ev as { iter?: unknown }).iter;
+        if (typeof i === "number" && (best === null || i > best)) {
+          best = i;
+        }
+      }
+    }
+    // Fallback: the run's iterations_completed - 1 (server snapshot
+    // is more reliable than the WS tail when the WS just opened).
+    if (best === null && run && run.iterations_completed > 0) {
+      best = run.iterations_completed - 1;
+    }
+    return best;
+  }, [events.events, run]);
+
+  // Auto-play on each iter advance.
+  useEffect(() => {
+    if (latestIter === null || !videoRef.current) return;
+    videoRef.current.load();
+    videoRef.current.play().catch(() => {
+      // Autoplay blocked despite muted — user can click play.
+    });
+  }, [latestIter]);
+
+  const src = useMemo(() => {
+    if (!run || latestIter === null) return null;
+    return iterRolloutUrl(slug, run.run_id, latestIter);
+  }, [slug, run, latestIter]);
+
+  const runCompleted =
+    run && (run.status === "completed" || run.status === "errored" || run.status === "stopped");
+  const errorNoFrames =
+    runCompleted && latestIter === null && run?.status === "errored";
+
+  return (
+    <>
+      <div className="absolute inset-x-0 top-0 z-10 flex items-center justify-between gap-2 bg-gradient-to-b from-black/60 to-transparent px-3 py-2 text-xs text-slate-100">
+        <span className="flex items-center gap-1 text-[10px] uppercase tracking-wider">
+          <span className={cn(
+            "inline-block h-1.5 w-1.5 rounded-full",
+            run?.status === "running" ? "animate-pulse bg-rose-500" : "bg-slate-500",
+          )} />
+          live
+          {run?.stage_name && (
+            <span className="ml-1 normal-case text-slate-300">
+              · {run.stage_name}
+            </span>
+          )}
+          {latestIter !== null ? ` · iter ${latestIter}` : ""}
+        </span>
+        {latestIter !== null && (
+          <span className="font-mono text-[10px] text-slate-300">
+            {fmtMetricAt(run, latestIter)}
+          </span>
+        )}
+      </div>
+      {errorNoFrames && (
+        <EmptyState
+          title="Stage errored before any rollout rendered"
+          error={run?.error ?? undefined}
+        />
+      )}
+      {!errorNoFrames && src && (
+        <video
+          ref={videoRef}
+          key={src}
+          src={src}
+          className="absolute inset-0 h-full w-full object-contain"
+          muted
+          playsInline
+          autoPlay
+          loop
+          onError={() => {
+            // Iter rollout 404: still flushing. Silent — the next
+            // iter_completed event will trigger another fetch.
+          }}
+        />
+      )}
+      {!errorNoFrames && !src && (
+        <Shimmer label="waiting for first rollout…" />
+      )}
+      {runCompleted && src && !errorNoFrames && (
+        <div className="absolute bottom-3 right-3 z-10 rounded-md bg-emerald-900/80 px-2 py-1 text-[10px] uppercase tracking-wider text-emerald-100">
+          Stage {run?.status}
+        </div>
+      )}
+      {events.terminal && (
+        <span className="sr-only">Terminal event received.</span>
+      )}
+    </>
+  );
 }
 
 // ── Replay layer ─────────────────────────────────────────────────────
