@@ -75,10 +75,19 @@ and stages warm-start from previous stages where possible.
      for base height, or `trajectory['projected_gravity_b'][...,2]` as a
      fallen proxy (vertical component near ±1 = upright, near 0 = prone).
    - Math helpers: `abs`, `min`, `max`, `sum`, `len`, `round`, `float`,
-     `int`, `bool`. Array methods: `.mean()`, `.max()`, `.min()`,
-     `.std()`, `.sum()`, `.any()`, `.all()`, `.float()`, `.item()`,
+     `int`, `bool`. Array methods (numpy): `.mean()`, `.max()`,
+     `.min()`, `.std()`, `.sum()`, `.any()`, `.all()`, `.astype(...)`,
      `.shape`, `.size`.
    - Boolean ops: `and`, `or`, `not`. Comparisons + arithmetic.
+
+   **CRITICAL — namespace is numpy, NOT torch.** Trajectory/info
+   arrays are `numpy.ndarray`. Behavior/components values are Python
+   scalars or numpy scalars. The following torch-tensor methods are
+   FORBIDDEN and will be rejected at decompose time:
+   `.float()`, `.long()`, `.double()`, `.int()`, `.bool()`, `.cpu()`,
+   `.cuda()`, `.to(...)`, `.detach()`, `.item()`, `.numpy()`,
+   `.requires_grad`, `.grad`. A bool array's `.mean()` already returns
+   the fraction-True as a float — no cast needed.
 
    Examples:
    - `metric > 0.5` — simple primary-metric threshold.
@@ -86,8 +95,14 @@ and stages warm-start from previous stages where possible.
      — sustained performance.
    - `components['support_phase'] > 0.4` — a specific reward component
      saturates above a threshold.
-   - `(trajectory['root_link_pos_w'][..., 2] > 0.6).float().mean() > 0.8`
+   - `(trajectory['root_link_pos_w'][..., 2] > 0.6).mean() > 0.8`
      — base height above 0.6 m for ≥ 80% of timesteps (derived).
+     Note: `.mean()` directly on the bool array gives the fraction;
+     do NOT write `(x > c).float().mean()` — `.float()` is torch-only.
+   - `(trajectory['projected_gravity_b'][..., 2] < -0.95).mean() > 0.95`
+     — robot upright (gravity-z near -1) for ≥ 95% of frames.
+   - If you need an explicit cast: `(x > c).astype(float).mean()` —
+     numpy's `.astype` works in place of torch's `.float()`.
 
 5. **Reward seed prompt grounding.** Every field referenced inside a
    `reward_seed_prompt` that represents runtime data (not just prose)
@@ -147,7 +162,7 @@ Goal: "Jump straight up 30 cm from standing, land cleanly, stand again."
     {
       "name": "stand",
       "goal_text": "Maintain upright double-stance with root link height near nominal.",
-      "success_criterion": "(trajectory['root_link_pos_w'][..., 2] > 0.65).float().mean() > 0.9 and behavior['mean_episode_length'] > 500",
+      "success_criterion": "(trajectory['root_link_pos_w'][..., 2] > 0.65).mean() > 0.9 and behavior['mean_episode_length'] > 500",
       "max_iterations": 3,
       "parent_stage": null,
       "reward_seed_prompt": "Three terms: alive_bonus (+0.1 when not fallen), torso_upright (exp(-||base_ang_vel_b||^2)*0.3), action_rate_penalty (-0.03 * ||action-prev_action||^2). Zero the whole reward when fallen.",

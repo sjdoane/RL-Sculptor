@@ -832,6 +832,63 @@ def test_criterion_multi_element_array_yields_friendly_hint():
         )
 
 
+def test_criterion_runtime_torch_idiom_yields_friendly_hint():
+    """§Ship 21c regression: legacy mission.json files written before
+    the decompose-time validator landed may still contain torch
+    idioms. Runtime safety net catches the AttributeError and gives
+    a clearer message than the raw 'numpy.ndarray has no .float'.
+
+    The decompose-time validator AND the SAFE_ATTRIBUTE_METHODS set
+    both block `.float()` for new missions. This test simulates the
+    legacy case by passing the criterion straight to the runtime
+    eval, bypassing the decompose validator. The eval-time AST walker
+    will reject `.float` first because we removed it from the safe
+    set — verify that path also surfaces a clear message.
+    """
+    ns = {
+        "metric": None,
+        "trajectory": {"root_link_pos_w": np.zeros((10, 3))},
+        "abs": abs, "min": min, "max": max,
+    }
+    with pytest.raises(CriterionEvalError) as exc_info:
+        _evaluate_success_criterion(
+            "(trajectory['root_link_pos_w'][..., 2] > 0.65).float().mean() > 0.9",
+            ns,
+        )
+    # The attribute walker rejects .float first (no longer in
+    # SAFE_ATTRIBUTE_METHODS post-Ship-21c). Either message is fine
+    # as long as it's clearer than 'numpy.ndarray has no float'.
+    msg = str(exc_info.value).lower()
+    assert (
+        "float" in msg
+        and ("torch" in msg or "disallowed" in msg or "namespace" in msg)
+    ), f"error should mention .float() + a hint about numpy, got: {exc_info.value}"
+
+
+def test_criterion_runtime_accepts_astype_float():
+    """§Ship 21c: numpy's `.astype(float)` (the legitimate cast that
+    replaces torch's `.float()`) passes the runtime safe-attr walker.
+    Test: the criterion that mirrors what Claude SHOULD generate
+    after Ship 21c's prompt update."""
+    ns = {
+        "metric": None,
+        "trajectory": {
+            # 10 frames of 3D positions, all at z=0.7 (> 0.65 threshold).
+            "root_link_pos_w": np.tile(np.array([0.0, 0.0, 0.7]), (10, 1)),
+        },
+        "behavior": {"mean_episode_length": 600},
+        "abs": abs, "min": min, "max": max, "float": float,
+    }
+    # Both forms should be accepted (the bare `.mean()` is preferred;
+    # `.astype(float).mean()` is a no-op-but-explicit fallback).
+    for crit in [
+        "(trajectory['root_link_pos_w'][..., 2] > 0.65).mean() > 0.9",
+        "(trajectory['root_link_pos_w'][..., 2] > 0.65).astype(float).mean() > 0.9",
+    ]:
+        result = _evaluate_success_criterion(crit, ns)
+        assert result is True, f"criterion {crit!r} should evaluate True"
+
+
 def test_mission_run_emits_warm_start_skipped_when_parent_ckpt_deleted(
     tmp_path: Path, monkeypatch, stub_adapter,
 ):

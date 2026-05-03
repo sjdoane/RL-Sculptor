@@ -464,6 +464,48 @@ def _validate_success_criterion(stage: Stage, info_keys: set[str]) -> None:
             f"Python expression: {e}"
         ) from e
 
+    # §Ship 21c: torch-idiom guard. The criterion namespace is built
+    # from numpy arrays (trajectory.npz) + plain dicts (behavior.json).
+    # numpy bool/int arrays do NOT have torch tensor methods like
+    # `.float()`, `.long()`, `.cpu()`, `.detach()` — using those crashes
+    # AT EVAL TIME after a stage has already burned its training
+    # budget (10+ hours on G1). Catch at decompose time instead.
+    # Sam's robot-flossing run: stage failed at the very last criterion
+    # evaluation with `'numpy.ndarray' object has no attribute 'float'`
+    # after iter 5 had nudged the metric to its peak — would have
+    # succeeded if the criterion didn't use `.float()`.
+    _FORBIDDEN_TORCH_METHODS: tuple[str, ...] = (
+        "float", "long", "double", "int", "bool", "byte", "short",
+        "half", "to", "cpu", "cuda", "detach", "item", "numpy",
+        "requires_grad", "requires_grad_", "grad",
+    )
+    method_violations: list[str] = []
+    for node in ast.walk(tree):
+        # x.method(...) → Call(func=Attribute(value=x, attr='method'))
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in _FORBIDDEN_TORCH_METHODS
+        ):
+            method_violations.append(node.func.attr)
+        # x.requires_grad (no parens) — Attribute access without Call
+        elif (
+            isinstance(node, ast.Attribute)
+            and node.attr in ("requires_grad", "grad")
+        ):
+            method_violations.append(node.attr)
+    if method_violations:
+        unique = sorted(set(method_violations))
+        raise MissionValidationError(
+            f"stage {stage.name!r} success_criterion uses torch tensor "
+            f"method(s) {unique!r} — namespace is numpy, NOT torch. "
+            f"For numpy arrays use `.astype(float)` / `.mean()` / "
+            f"`.any()` / `.all()` directly. A bool array's `.mean()` "
+            f"already returns the fraction-True; no cast needed.\n"
+            f"  bad:  (trajectory['root_link_pos_w'][..., 2] > 0.65).float().mean()\n"
+            f"  good: (trajectory['root_link_pos_w'][..., 2] > 0.65).mean()"
+        )
+
     # Map `container_name` → allowed-key set. Subscripts against
     # containers NOT in this map (e.g., `components['foo']`) are not
     # statically validated — see docstring.

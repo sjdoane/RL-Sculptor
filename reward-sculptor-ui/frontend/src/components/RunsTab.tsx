@@ -845,6 +845,90 @@ function RunHeader({
   );
 }
 
+// §Ship 21c: when an iter completes without writing a new reward
+// version, the row used to render `v3 → v?` which reads as "something
+// failed" — but the actual cause is usually conservative diagnoser
+// behavior ("metric is healthy, no failure modes detected, leaving
+// the reward alone"). Surface the *reason* explicitly so the user
+// knows the system is working as intended.
+function RewardVersionTransition({
+  versionBefore,
+  versionAfter,
+  editCount,
+  failureModes,
+  status,
+}: {
+  versionBefore: number | null;
+  versionAfter: number | null;
+  editCount: number | null;
+  failureModes: string[];
+  status: "running" | "completed" | "errored" | "stopped";
+}) {
+  // Iter still in flight — show the before with a placeholder.
+  if (status === "running" || status === "queued" as string) {
+    return (
+      <span className="flex items-center gap-1 font-mono text-[10px] text-muted-foreground">
+        v{versionBefore ?? "?"}
+        <ArrowRight className="h-2.5 w-2.5" />
+        v?
+      </span>
+    );
+  }
+  // New version landed — standard v_before → v_after.
+  if (versionAfter !== null) {
+    return (
+      <span className="flex items-center gap-1 font-mono text-[10px] text-muted-foreground">
+        v{versionBefore ?? "?"}
+        <ArrowRight className="h-2.5 w-2.5" />
+        v{versionAfter}
+      </span>
+    );
+  }
+  // No new version. Distinguish two cases:
+  //   - failure_modes == ["none"] → diagnoser saw a healthy iter and
+  //     declined to edit. Green: this is the system working correctly.
+  //   - edit_count > 0 implied by anything in failure_modes →
+  //     diagnoser proposed edits but they were all filtered. Amber:
+  //     surface for inspection.
+  //   - empty failure_modes (legacy / pre-event) → muted neutral.
+  const noFailures =
+    failureModes.length === 1 && failureModes[0] === "none";
+  const hadEdits = editCount !== null && editCount > 0;
+  if (noFailures) {
+    return (
+      <span
+        className="flex items-center gap-1 font-mono text-[10px] text-emerald-700"
+        title="Diagnoser found no failure modes; no reward edit needed this iter."
+      >
+        v{versionBefore ?? "?"}
+        <span className="font-sans font-normal">· held</span>
+      </span>
+    );
+  }
+  if (hadEdits) {
+    return (
+      <span
+        className="flex items-center gap-1 font-mono text-[10px] text-amber-700"
+        title={`${editCount} edit(s) proposed but all filtered at pre-flight (likely ungrounded / unknown identifiers).`}
+      >
+        v{versionBefore ?? "?"}
+        <span className="font-sans font-normal">
+          · {editCount} edit{editCount === 1 ? "" : "s"} filtered
+        </span>
+      </span>
+    );
+  }
+  return (
+    <span
+      className="flex items-center gap-1 font-mono text-[10px] text-muted-foreground"
+      title="No new reward version this iter."
+    >
+      v{versionBefore ?? "?"}
+      <span className="font-sans font-normal">· no edit</span>
+    </span>
+  );
+}
+
 // ── iteration timeline ────────────────────────────────────────────────
 function IterationTimeline({
   iters,
@@ -900,11 +984,13 @@ function IterationTimeline({
               />
             )}
             {(it.reward_version_before !== null || it.reward_version_after !== null) && (
-              <span className="flex items-center gap-1 font-mono text-[10px] text-muted-foreground">
-                v{it.reward_version_before ?? "?"}
-                <ArrowRight className="h-2.5 w-2.5" />
-                v{it.reward_version_after ?? "?"}
-              </span>
+              <RewardVersionTransition
+                versionBefore={it.reward_version_before}
+                versionAfter={it.reward_version_after}
+                editCount={it.edit_count}
+                failureModes={it.failure_modes}
+                status={it.status}
+              />
             )}
             {it.primary_metric !== null && (
               <span className="font-mono text-[11px]">
