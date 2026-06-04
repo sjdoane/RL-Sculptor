@@ -84,7 +84,7 @@ function GpuWidget({ activeJobs }: { activeJobs: JobSummary[] }) {
     <Card>
       <CardHeader className="py-3">
         <CardTitle className="flex items-center gap-2 text-sm">
-          <Radio className={cn("h-3.5 w-3.5", hasRunning && "animate-pulse text-emerald-500")} />
+          <Radio className={cn("h-3.5 w-3.5", hasRunning && "motion-safe:animate-pulse text-emerald-500")} />
           GPUs
         </CardTitle>
         <CardDescription className="text-[11px]">
@@ -277,7 +277,7 @@ function ActiveJobsCard({ jobs }: { jobs: JobSummary[] }) {
           <Radio
             className={cn(
               "h-3.5 w-3.5",
-              jobs.length > 0 ? "text-rose-600 animate-pulse" : "text-muted-foreground",
+              jobs.length > 0 ? "text-rose-600 motion-safe:animate-pulse" : "text-muted-foreground",
             )}
           />
           Active jobs
@@ -379,7 +379,7 @@ function RecentRunsCard({ runs }: { runs: DashboardRecentRun[] }) {
 function JobStatusPill({ status }: { status: JobStatus }) {
   const map: Record<JobStatus, string> = {
     queued:    "bg-muted text-muted-foreground border-border",
-    running:   "bg-amber-50 text-amber-700 border-amber-200 animate-pulse",
+    running:   "bg-amber-50 text-amber-800 border-amber-200 motion-safe:animate-pulse",
     completed: "bg-emerald-50 text-emerald-700 border-emerald-200",
     errored:   "bg-rose-50 text-rose-700 border-rose-200",
     stopped:   "bg-slate-100 text-slate-600 border-slate-200",

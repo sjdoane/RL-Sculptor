@@ -41,6 +41,10 @@ from backend.services.job_manager import Job, JobManager
 # Stdout marker the sculpt CLI uses for structured events.
 _EVENT_TAG = "[SCULPT-EVENT]"
 
+# §Ship 21e: guard for stage_name before it's used to build a path.
+import re as _re
+_SAFE_STAGE_NAME = _re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
 # §Ship 21: stage lifecycle event types. The streamer creates a child
 # Job (kind="mission_stage_run") on `stage_started`; tee's iter_*
 # events to it; closes it on a stage-terminal event.
@@ -427,7 +431,19 @@ async def _stream_stdout(
                         "errored",
                         error_msg="stage_started fired without prior close event",
                     )
-                stage_name = ev.get("stage_name") or "stage_unknown"
+                # §Ship 21e (review fix): sanitize stage_name before it
+                # enters job.params — it later builds a filesystem path
+                # (routes/runs.py:_resolve_run_root → FileResponse).
+                # Stage names are snake_case ≤32 chars by decompose-time
+                # validation, but defense-in-depth against a corrupt /
+                # hand-edited mission.json: reject anything outside the
+                # safe charset and fall back to a non-traversing label.
+                raw_stage_name = ev.get("stage_name") or "stage_unknown"
+                stage_name = (
+                    raw_stage_name
+                    if _SAFE_STAGE_NAME.match(str(raw_stage_name))
+                    else "stage_invalid"
+                )
                 stage_dir = ev.get("stage_dir")
                 goal_text = ev.get("goal_text") or ""
                 eff_max = ev.get("effective_max_iterations")

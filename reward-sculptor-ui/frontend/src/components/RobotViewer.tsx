@@ -215,11 +215,12 @@ function StaticLayer({ slug }: { slug: string }) {
           <Button
             variant="ghost"
             size="sm"
+            aria-label="Re-render static preview from the selected camera angle"
             className="h-6 gap-1 px-1.5 text-[11px] text-slate-100 hover:bg-slate-800"
             onClick={onReRender}
             disabled={reRendering || isLoading}
           >
-            <RefreshCcw className={cn("h-3 w-3", reRendering && "animate-spin")} />
+            <RefreshCcw aria-hidden="true" className={cn("h-3 w-3", reRendering && "motion-safe:animate-spin")} />
             Re-render
           </Button>
         </div>
@@ -281,7 +282,7 @@ function LiveLayer({
         <span className="flex items-center gap-1 text-[10px] uppercase tracking-wider">
           <span className={cn(
             "inline-block h-1.5 w-1.5 rounded-full",
-            run?.status === "running" ? "animate-pulse bg-rose-500" : "bg-slate-500",
+            run?.status === "running" ? "motion-safe:animate-pulse bg-rose-500" : "bg-slate-500",
           )} />
           live{latest !== null ? ` · iter ${latest.iter}` : ""}
         </span>
@@ -302,6 +303,7 @@ function LiveLayer({
           ref={videoRef}
           key={latest.url}
           src={latest.url}
+          aria-label={`Live robot rollout, iteration ${latest.iter}`}
           className="absolute inset-0 h-full w-full object-contain"
           muted
           playsInline
@@ -416,7 +418,7 @@ function LiveStageRollout({
         <span className="flex items-center gap-1 text-[10px] uppercase tracking-wider">
           <span className={cn(
             "inline-block h-1.5 w-1.5 rounded-full",
-            run?.status === "running" ? "animate-pulse bg-rose-500" : "bg-slate-500",
+            run?.status === "running" ? "motion-safe:animate-pulse bg-rose-500" : "bg-slate-500",
           )} />
           live
           {run?.stage_name && (
@@ -443,6 +445,11 @@ function LiveStageRollout({
           ref={videoRef}
           key={src}
           src={src}
+          aria-label={
+            run?.stage_name
+              ? `Live stage rollout, ${run.stage_name}, iteration ${latestIter ?? 0}`
+              : `Live stage rollout, iteration ${latestIter ?? 0}`
+          }
           className="absolute inset-0 h-full w-full object-contain"
           muted
           playsInline
@@ -542,6 +549,7 @@ function ReplayLayer({
         <video
           key={src}
           src={src}
+          aria-label={`Replay of robot rollout, iteration ${iter}`}
           className="absolute inset-0 h-full w-full object-contain"
           controls
           playsInline

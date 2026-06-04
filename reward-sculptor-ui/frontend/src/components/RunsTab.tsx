@@ -1,6 +1,7 @@
 import { useMemo, useRef, useState } from "react";
 import {
   ArrowRight,
+  BookOpen,
   CheckCircle2,
   ChevronDown,
   ChevronRight,
@@ -263,10 +264,9 @@ function partitionRuns(
   return { sculptRuns, missionGroups };
 }
 
-// Lifecycle-aware progress label for a mission summary. Kept in
-// sync with MissionsTab.tsx's `stageProgressLabel` (used elsewhere
-// in the codebase) so the same mission reads the same way across
-// tabs.
+// Lifecycle-aware progress label for a mission summary. (§Ship 21e:
+// the old MissionsTab.tsx — which had a parallel `stageProgressLabel`
+// — was deleted as dead code after the Ship 21 Missions→Runs merge.)
 function missionRunStateLabel(m: MissionSummary): string {
   const { current_stage_idx: i, n_stages: n, lifecycle } = m;
   if (n === 0) return "Planning…";
@@ -372,19 +372,26 @@ function RunSidebar({
                       </span>
                     </div>
                     {g.mission?.goal && (
-                      <span className="line-clamp-1 text-[10px] text-muted-foreground">
+                      <span
+                        className="line-clamp-1 text-[10px] text-muted-foreground"
+                        title={g.mission.goal}
+                      >
                         {g.mission.goal}
                       </span>
                     )}
                   </div>
                 </button>
+                {/* §Ship 21e (review fix): the "Plan" pill read as a
+                    badge, not an action. Add an icon + outline + stronger
+                    text so it's clearly a button. */}
                 <button
                   type="button"
                   onClick={() => onOpenMissionDialog(g.missionSlug)}
-                  className="shrink-0 rounded px-1.5 text-[9.5px] font-semibold uppercase tracking-wide text-muted-foreground hover:bg-accent/60 hover:text-foreground"
-                  title="Open curriculum (decomposition rationale + stage list + Run/Delete)"
-                  aria-label="Open mission curriculum"
+                  className="m-1 inline-flex shrink-0 items-center gap-1 self-center rounded border bg-background px-1.5 py-0.5 text-[10px] font-medium text-foreground hover:bg-accent"
+                  title="Open the curriculum: decomposition rationale, stage list, Run/Delete"
+                  aria-label="Open mission curriculum and run controls"
                 >
+                  <BookOpen aria-hidden="true" className="h-3 w-3" />
                   Plan
                 </button>
               </div>
@@ -472,24 +479,28 @@ function durationStr(start: string, end: string): string {
 }
 
 function RunStatusBadge({ status }: { status: JobStatus }) {
+  // §Ship 21e (review fix): -800 text for WCAG AA contrast at this
+  // micro size; stopped/queued bumped for visibility; motion-safe pulse.
   const map: Record<JobStatus, { label: string; cls: string; icon?: React.ComponentType<{ className?: string }> }> = {
-    queued:     { label: "queued",    cls: "bg-muted text-muted-foreground border-border" },
-    running:    { label: "running",   cls: "bg-amber-50 text-amber-700 border-amber-200", icon: Radio },
-    completed:  { label: "completed", cls: "bg-emerald-50 text-emerald-700 border-emerald-200", icon: CheckCircle2 },
-    errored:    { label: "errored",   cls: "bg-rose-50 text-rose-700 border-rose-200", icon: XCircle },
-    stopped:    { label: "stopped",   cls: "bg-slate-100 text-slate-600 border-slate-200", icon: StopCircle },
+    queued:     { label: "queued",    cls: "bg-background text-foreground border-border" },
+    running:    { label: "running",   cls: "bg-amber-50 text-amber-800 border-amber-300", icon: Radio },
+    completed:  { label: "completed", cls: "bg-emerald-50 text-emerald-800 border-emerald-300", icon: CheckCircle2 },
+    errored:    { label: "errored",   cls: "bg-rose-50 text-rose-800 border-rose-300", icon: XCircle },
+    stopped:    { label: "stopped",   cls: "bg-slate-100 text-slate-700 border-slate-300", icon: StopCircle },
   };
   const m = map[status] ?? map.queued;
   const Icon = m.icon;
   return (
     <span
+      role="status"
+      aria-label={`run status: ${m.label}`}
       className={cn(
         "inline-flex items-center gap-0.5 rounded-sm border px-1 py-0.5 text-[9px] font-semibold uppercase tracking-wide",
         m.cls,
-        status === "running" && "animate-pulse",
+        status === "running" && "motion-safe:animate-pulse",
       )}
     >
-      {Icon && <Icon className="h-2.5 w-2.5" />}
+      {Icon && <Icon aria-hidden="true" className="h-2.5 w-2.5" />}
       {m.label}
     </span>
   );
@@ -509,6 +520,8 @@ function Sparkline({ history }: { history: Array<number | null> }) {
     .join(" ");
   return (
     <svg
+      role="img"
+      aria-label={`metric trend, latest ${nums[nums.length - 1].toFixed(3)} (min ${min.toFixed(3)}, max ${max.toFixed(3)})`}
       width={w}
       height={h}
       viewBox={`0 0 ${w} ${h}`}

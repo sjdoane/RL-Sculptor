@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { runFramesWsUrl } from "@/lib/api";
 
@@ -33,20 +33,34 @@ export function useLiveClips(
   const [skipped, setSkipped] = useState<SkippedClip[]>([]);
   const [connected, setConnected] = useState(false);
   const [terminal, setTerminal] = useState(false);
+  // §Ship 21e (review fix, CRITICAL): mirror `terminal` into a ref so
+  // `onclose` reads the CURRENT value, not the stale closure captured
+  // at WS-registration time. Without this, completing a run while
+  // Live mode is open triggers an INFINITE reconnect loop: server
+  // closes the WS when the job ends → onclose sees terminal=false
+  // (the closure value) → schedules a reconnect → server replays the
+  // terminal event → onclose sees stale false again → reconnects
+  // forever. This is the exact bug useRunEvents/useJobEvents already
+  // guard against (terminalRef); useLiveClips was missed.
+  const terminalRef = useRef(false);
 
   useEffect(() => {
     setClips([]);
     setSkipped([]);
     setConnected(false);
     setTerminal(false);
+    terminalRef.current = false;
     if (!slug || !runId) return;
 
     let cancelled = false;
     let ws: WebSocket | null = null;
     let retry = 0;
+    // §Ship 21e: capture the reconnect timer so cleanup can clear it
+    // (prevents a stray fire after unmount).
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
     const connect = () => {
-      if (cancelled) return;
+      if (cancelled || terminalRef.current) return;
       ws = new WebSocket(runFramesWsUrl(slug, runId));
 
       ws.onopen = () => {
@@ -72,16 +86,17 @@ export function useLiveClips(
         } else if (ev.type === "clip_skipped" && typeof ev.iter === "number") {
           setSkipped((xs) => [...xs, { iter: ev.iter!, reason: ev.reason ?? "unknown" }]);
         } else if (ev.type === "terminal") {
+          terminalRef.current = true;
           setTerminal(true);
         }
       };
 
       ws.onclose = () => {
         setConnected(false);
-        if (cancelled || terminal) return;
+        if (cancelled || terminalRef.current) return;
         const delay = Math.min(8000, 250 * Math.pow(2, retry));
         retry++;
-        setTimeout(connect, delay);
+        reconnectTimer = setTimeout(connect, delay);
       };
 
       ws.onerror = () => {
@@ -92,6 +107,7 @@ export function useLiveClips(
     connect();
     return () => {
       cancelled = true;
+      if (reconnectTimer !== null) clearTimeout(reconnectTimer);
       try {
         ws?.close();
       } catch {

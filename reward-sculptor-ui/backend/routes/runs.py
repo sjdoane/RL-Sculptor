@@ -9,8 +9,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import re
 from pathlib import Path
 from typing import Any, Optional
+
+# §Ship 21e: snake-case-ish segment guard for mission_slug / stage_name
+# before they're used to build filesystem paths. Mirrors the same
+# allow-list the rewards routes apply. Rejects "..", "/", "\\", etc.
+_SAFE_PATH_SEGMENT = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 from fastapi import (
     APIRouter,
@@ -82,14 +88,28 @@ def _resolve_run_root(job: Job, project_dir: Path) -> Path:
     For mission_stage_run jobs: `<project_dir>/.missions/<mission_slug>/
     stages/<stage_name>/runs/` — each stage scaffolds its own mini-
     project with its own runs/ tree.
+
+    §Ship 21e (review fix, HIGH): traversal guard. The mission_slug /
+    stage_name come from job.params, which mission_jobs sets from the
+    subprocess's stage_started event. Defense-in-depth: validate both
+    against the snake_case pattern before building a filesystem path
+    that feeds a FileResponse (get_iter_rollout). A malformed name
+    (corrupt mission.json, hand-edited) could otherwise traverse out
+    of the project dir. Mirrors the guards in routes/rewards.py.
+    On any invalid component, fall back to the project runs dir.
     """
     if job.kind == "mission_stage_run":
         mission_slug = job.params.get("mission_slug")
         stage_name = job.params.get("stage_name")
-        if mission_slug and stage_name:
+        if (
+            isinstance(mission_slug, str)
+            and isinstance(stage_name, str)
+            and _SAFE_PATH_SEGMENT.match(mission_slug)
+            and _SAFE_PATH_SEGMENT.match(stage_name)
+        ):
             return (
-                project_dir / ".missions" / str(mission_slug)
-                / "stages" / str(stage_name) / "runs"
+                project_dir / ".missions" / mission_slug
+                / "stages" / stage_name / "runs"
             )
     return project_dir / "runs"
 
@@ -585,5 +605,4 @@ def get_iter_rollout(
     return FileResponse(path, media_type="video/mp4")
 
 
-import re
 _CLIP_NAME_RE = re.compile(r"^iter_\d+\.mp4$")

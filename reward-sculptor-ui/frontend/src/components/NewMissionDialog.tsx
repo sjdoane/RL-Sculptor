@@ -23,6 +23,7 @@ import {
 import { Textarea } from "@/components/ui/textarea";
 import { useCreateMission } from "@/hooks/useMissions";
 import { ApiError } from "@/lib/api";
+import { cn } from "@/lib/utils";
 import type { MissionRunDefaults } from "@/lib/types";
 
 const SLUG_PATTERN = /^[a-z][a-z0-9_-]{0,63}$/;
@@ -228,8 +229,20 @@ export function NewMissionDialog({
                 rows={4}
                 maxLength={GOAL_MAX}
                 disabled={create.isPending}
+                aria-invalid={
+                  goal.trim().length > 0 && goal.trim().length < GOAL_MIN
+                }
+                aria-describedby="mission-goal-hint"
               />
-              <p className="text-[10.5px] text-muted-foreground">
+              <p
+                id="mission-goal-hint"
+                className={cn(
+                  "text-[10.5px]",
+                  goal.trim().length > 0 && goal.trim().length < GOAL_MIN
+                    ? "text-destructive"
+                    : "text-muted-foreground",
+                )}
+              >
                 {goal.trim().length} / {GOAL_MAX} chars · min {GOAL_MIN}
               </p>
             </div>

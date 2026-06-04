@@ -893,3 +893,55 @@ def test_iter_detail_has_realism_audit_none_when_no_event(
         assert it.get("realism_audit") is None, (
             f"expected None realism_audit; got {it.get('realism_audit')}"
         )
+
+
+# ── §Ship 21e: _resolve_run_root traversal guard (review fix) ─────────
+def test_resolve_run_root_rejects_traversal_stage_name() -> None:
+    """A mission_stage_run job whose stage_name (from a corrupt
+    mission.json / subprocess event) contains traversal must NOT
+    build a path outside the project — _resolve_run_root falls back
+    to the project runs dir. Without the guard, get_iter_rollout
+    would serve a FileResponse from `<project>/.missions/m/stages/
+    ../../../etc/runs/...`."""
+    from pathlib import Path
+
+    from backend.routes.runs import _resolve_run_root
+    from backend.services.job_manager import Job
+
+    project_dir = Path("/tmp/proj-xyz")
+    safe_fallback = project_dir / "runs"
+
+    bad_names = ["../../etc", "a/../b", "..", "with space", "Caps", "m/s"]
+    for bad in bad_names:
+        job = Job(
+            job_id="job_x",
+            kind="mission_stage_run",
+            project_slug="p",
+            params={"mission_slug": "ok_mission", "stage_name": bad},
+        )
+        assert _resolve_run_root(job, project_dir) == safe_fallback, (
+            f"stage_name={bad!r} should fall back to project runs"
+        )
+
+    # A bad mission_slug is also rejected.
+    job_bad_mission = Job(
+        job_id="job_y", kind="mission_stage_run", project_slug="p",
+        params={"mission_slug": "../escape", "stage_name": "stand"},
+    )
+    assert _resolve_run_root(job_bad_mission, project_dir) == safe_fallback
+
+    # A well-formed pair resolves to the stage runs dir.
+    job_ok = Job(
+        job_id="job_z", kind="mission_stage_run", project_slug="p",
+        params={"mission_slug": "my_mission", "stage_name": "stand_stable"},
+    )
+    assert _resolve_run_root(job_ok, project_dir) == (
+        project_dir / ".missions" / "my_mission" / "stages"
+        / "stand_stable" / "runs"
+    )
+
+    # A top-level sculpt_run always uses the project runs dir.
+    job_sculpt = Job(
+        job_id="job_w", kind="sculpt_run", project_slug="p", params={},
+    )
+    assert _resolve_run_root(job_sculpt, project_dir) == safe_fallback
