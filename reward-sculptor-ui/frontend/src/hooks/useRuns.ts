@@ -10,7 +10,20 @@ import type {
 
 const RUN_POLL_MS = 3000;
 
-export function useRuns(slug: string | undefined) {
+export function useRuns(
+  slug: string | undefined,
+  /** §Ship 21d: when `keepPolling` is true, keep refetching `/runs`
+   *  even when no run currently shows `running`/`queued`. Callers
+   *  pass this while a MISSION is active so the list stays fresh
+   *  through stage boundaries — between a stage completing and the
+   *  next stage's child job registering, there's no "running" run,
+   *  which previously made the interval return false and freeze.
+   *  Once React Query clears the interval it does NOT auto-resume,
+   *  so `activeStageRun` would go permanently stale for the rest of
+   *  the mission (rewards/live-video stop updating). */
+  opts?: { keepPolling?: boolean },
+) {
+  const keepPolling = opts?.keepPolling ?? false;
   return useQuery<RunSummary[]>({
     queryKey: slug ? qk.runs(slug) : ["runs", "_none"],
     queryFn: () => listRuns(slug!),
@@ -21,7 +34,8 @@ export function useRuns(slug: string | undefined) {
       const hasActive = data.some(
         (r) => r.status === "running" || r.status === "queued",
       );
-      return hasActive ? RUN_POLL_MS : false;
+      if (hasActive || keepPolling) return RUN_POLL_MS;
+      return false;
     },
   });
 }

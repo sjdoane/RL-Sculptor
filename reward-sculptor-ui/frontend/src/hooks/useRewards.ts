@@ -112,15 +112,17 @@ export interface RewardPromptPayload {
 export function useRewardDiagnosis(
   slug: string | undefined,
   version: number | undefined,
-  options: { enabled?: boolean } = {},
+  options: { enabled?: boolean; stage?: string | null } = {},
 ) {
-  const { enabled = true } = options;
+  const { enabled = true, stage = null } = options;
   return useQuery<RewardDiagnosisPayload>({
     queryKey:
       slug !== undefined && version !== undefined
-        ? ["reward", "diagnosis", slug, version]
+        ? stage
+          ? ["reward", "diagnosis", slug, version, "stage", stage]
+          : ["reward", "diagnosis", slug, version]
         : ["reward", "diagnosis", "_none"],
-    queryFn: () => getRewardDiagnosis(slug!, version!),
+    queryFn: () => getRewardDiagnosis(slug!, version!, stage ?? undefined),
     enabled: enabled && slug !== undefined && version !== undefined && version > 0,
     staleTime: 60_000,
     retry: false,

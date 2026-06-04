@@ -14,6 +14,7 @@ import { Button } from "@/components/ui/button";
 import { Select } from "@/components/ui/select";
 import { useLiveClips } from "@/hooks/useLiveClips";
 import { useProjectPreview } from "@/hooks/useProjectPreview";
+import { useMissions } from "@/hooks/useMissions";
 import { useRunEvents } from "@/hooks/useRunEvents";
 import { useRuns } from "@/hooks/useRuns";
 import { clipUrl, iterRolloutUrl, previewUrl } from "@/lib/api";
@@ -39,7 +40,15 @@ type Mode = "static" | "live" | "replay";
  *      stays on the last clip with a "Run completed" overlay.
  */
 export function RobotViewer({ slug }: { slug: string }) {
-  const runs = useRuns(slug);
+  // §Ship 21d: keep /runs polling through mission stage boundaries so
+  // the live-video run selection doesn't freeze on a stale stage when
+  // one completes and the next starts.
+  const missions = useMissions(slug);
+  const missionActive = useMemo(
+    () => (missions.data ?? []).some((m) => m.active_job_id != null),
+    [missions.data],
+  );
+  const runs = useRuns(slug, { keepPolling: missionActive });
   const activeRun = useMemo(
     () => (runs.data ?? []).find((r) => r.status === "running" || r.status === "queued") ?? null,
     [runs.data],

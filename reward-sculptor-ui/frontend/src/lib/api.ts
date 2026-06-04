@@ -455,9 +455,15 @@ export async function putReward(
 export async function getRewardDiagnosis(
   slug: string,
   version: number,
+  /** §Ship 21d: optional `<missionSlug>/<stageName>` to fetch the
+   *  diagnosis from that stage's runs dir instead of the project
+   *  runs dir. Required for the "Why this edit?" panel to work on
+   *  mission stage reward versions. */
+  stage?: string,
 ): Promise<RewardDiagnosisPayload> {
+  const qs = stage ? `?stage=${encodeURIComponent(stage)}` : "";
   return handle<RewardDiagnosisPayload>(
-    await fetch(`/api/projects/${slug}/rewards/${version}/diagnosis`),
+    await fetch(`/api/projects/${slug}/rewards/${version}/diagnosis${qs}`),
   );
 }
 

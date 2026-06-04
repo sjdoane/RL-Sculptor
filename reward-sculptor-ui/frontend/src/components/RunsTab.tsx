@@ -57,8 +57,17 @@ export default function RunsTab({
   slug: string;
   project: ProjectDetail;
 }) {
-  const list = useRuns(slug);
   const missions = useMissions(slug);
+  // §Ship 21d: keep /runs polling through stage boundaries while a
+  // mission is active. Without this, the sidebar's stage rows (and
+  // the right pane's selected stage) freeze when a stage completes
+  // and the next hasn't registered yet — the interval returns false
+  // and never auto-resumes.
+  const missionActive = useMemo(
+    () => (missions.data ?? []).some((m) => m.active_job_id != null),
+    [missions.data],
+  );
+  const list = useRuns(slug, { keepPolling: missionActive });
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   // §Ship 21: clicking a mission GROUP HEADER opens the
   // MissionDetailDialog (curriculum view: stages, decomposition

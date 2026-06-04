@@ -503,3 +503,92 @@ def test_probe_components_scalar_mode_still_works_for_gym_sb3(
     assert probe.ok, probe.error
     assert probe.components == {"alive_bonus": 1.0}
     assert probe.total == pytest.approx(1.0)
+
+
+# ── §Ship 21d: stage-aware diagnosis ("Why this edit?" for missions) ──
+def _seed_stage_diagnosis(
+    project_dir: Path, mission_slug: str, stage_name: str,
+    iter_index: int, payload: dict,
+) -> Path:
+    """Write a diagnosis.json under a mission stage's runs/iter_N/ so
+    the stage-scoped diagnosis endpoint has something to return."""
+    import json
+
+    d = (
+        project_dir / ".missions" / mission_slug / "stages" / stage_name
+        / "runs" / f"iter_{iter_index}"
+    )
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / "diagnosis.json"
+    p.write_text(json.dumps(payload), encoding="utf-8")
+    return p
+
+
+def test_diagnosis_stage_scope_resolves_to_stage_runs_dir(
+    client: TestClient, tmp_projects_root: Path
+) -> None:
+    """§Ship 21d regression: the 'Why this edit?' panel for a mission
+    stage reward version must read diagnosis.json from the STAGE's
+    runs dir (.missions/<m>/stages/<s>/runs/iter_<n-1>/), not the
+    project root. v2 is produced by iter_1, so its diagnosis is at
+    iter_1/diagnosis.json."""
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_stage_diagnosis(
+        project_dir, "my-mission", "stand_stable", iter_index=1,
+        payload={"failure_modes": ["tilt"], "summary": "leaning left"},
+    )
+    r = client.get(
+        f"/projects/{slug}/rewards/2/diagnosis",
+        params={"stage": "my-mission/stand_stable"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["failure_modes"] == ["tilt"]
+    assert body["summary"] == "leaning left"
+
+
+def test_diagnosis_without_stage_uses_project_runs_dir(
+    client: TestClient, tmp_projects_root: Path
+) -> None:
+    """§Ship 21d: omitting stage preserves the project-scoped behavior
+    (reads <project>/runs/iter_<n-1>/diagnosis.json). A stage-scoped
+    diagnosis must NOT leak into the project view."""
+    import json
+
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    # Seed ONLY a stage diagnosis; project runs has none.
+    _seed_stage_diagnosis(
+        project_dir, "my-mission", "stand_stable", iter_index=1,
+        payload={"failure_modes": ["tilt"]},
+    )
+    # Project-scoped request → 404 (no project-level diagnosis seeded).
+    r = client.get(f"/projects/{slug}/rewards/2/diagnosis")
+    assert r.status_code == 404, r.text
+
+    # Now seed a project-level diagnosis and confirm it returns.
+    pr = project_dir / "runs" / "iter_1"
+    pr.mkdir(parents=True, exist_ok=True)
+    (pr / "diagnosis.json").write_text(
+        json.dumps({"failure_modes": ["project_level"]}), encoding="utf-8",
+    )
+    r2 = client.get(f"/projects/{slug}/rewards/2/diagnosis")
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["failure_modes"] == ["project_level"]
+
+
+def test_diagnosis_stage_traversal_guard(
+    client: TestClient, tmp_projects_root: Path
+) -> None:
+    """§Ship 21d: the stage param must reject path traversal — same
+    guard as _resolve_rewards_dir."""
+    slug = _make_project(client)
+    for bad in ["../../etc", "only-one-part", "a/../b", "m/", "/s"]:
+        r = client.get(
+            f"/projects/{slug}/rewards/2/diagnosis",
+            params={"stage": bad},
+        )
+        assert r.status_code == 404, (
+            f"stage={bad!r} should 404, got {r.status_code}"
+        )

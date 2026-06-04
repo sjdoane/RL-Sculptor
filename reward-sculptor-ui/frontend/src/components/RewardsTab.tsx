@@ -14,6 +14,7 @@ import {
   Wand2,
 } from "lucide-react";
 import { useRuns } from "@/hooks/useRuns";
+import { useMissions } from "@/hooks/useMissions";
 import { toast } from "sonner";
 
 import { Button } from "@/components/ui/button";
@@ -81,8 +82,8 @@ function RewardsScopeSelector({
           ? ` (${activeStageRun.stage_index + 1})`
           : ""
       }`
-    : effectiveScope
-      ? `Stage: ${effectiveScope.split("/")[1] ?? effectiveScope}`
+    : stageScope
+      ? `Stage: ${stageScope.split("/")[1] ?? stageScope}`
       : "Stage";
   return (
     <Card>
@@ -150,13 +151,32 @@ export function RewardsTab({
   slug: string;
   project: ProjectDetail;
 }) {
-  // §Ship 21b: when a mission_stage_run is active, the project's
+  // §Ship 21b/21d: when a mission_stage_run is active, the project's
   // global rewards/v0.py doesn't change — Claude's edits land in the
   // STAGE's rewards dir at <project>/.missions/<m>/stages/<s>/rewards/.
   // Auto-scope the Rewards tab to the active stage so the user sees
-  // versions accumulate live as the mission trains. A toggle lets the
-  // user flip back to project rewards.
-  const runs = useRuns(slug);
+  // versions accumulate live as the mission trains.
+  //
+  // §Ship 21d reliability rewrite. The old version derived the scope
+  // purely from "is a stage RUNNING at this exact instant" via
+  // useRuns. That was racy:
+  //   1. useRuns stopped polling at stage boundaries (no running run
+  //      for a beat between stages) → activeStageRun froze stale.
+  //   2. The moment it froze as "completed", scope flipped to project
+  //      and reward-polling stopped → "rewards only sometimes update."
+  //   3. After the mission ended there was no way to review a stage's
+  //      rewards (selector hidden, scope = project).
+  // Fixes: (a) keep useRuns polling while a mission is active so the
+  // stage list stays fresh; (b) make the stage scope STICKY so it
+  // bridges the between-stage gaps and survives mission end for
+  // review; (c) poll rewards while the mission is active OR a stage
+  // is live, not only at the exact instant a run shows "running".
+  const missions = useMissions(slug);
+  const missionActive = useMemo(
+    () => (missions.data ?? []).some((m) => m.active_job_id != null),
+    [missions.data],
+  );
+  const runs = useRuns(slug, { keepPolling: missionActive });
   const activeStageRun = useMemo(() => {
     return (runs.data ?? []).find(
       (r) =>
@@ -165,9 +185,24 @@ export function RewardsTab({
         && r.mission_slug && r.stage_name,
     ) ?? null;
   }, [runs.data]);
-  const stageScope = activeStageRun
+  // The scope of whatever stage is live RIGHT NOW (null between
+  // stages / after the mission).
+  const liveStageScope = activeStageRun
     ? `${activeStageRun.mission_slug}/${activeStageRun.stage_name}`
     : null;
+  // Sticky: remember the last live stage scope so the view doesn't
+  // flicker to project rewards during between-stage gaps, and so the
+  // user can still review the final stage's rewards after the mission
+  // ends. Updates whenever a new live stage appears (incl. a new
+  // mission's first stage); never clears on its own.
+  const [stickyStageScope, setStickyStageScope] = useState<string | null>(null);
+  useEffect(() => {
+    if (liveStageScope && liveStageScope !== stickyStageScope) {
+      setStickyStageScope(liveStageScope);
+    }
+  }, [liveStageScope, stickyStageScope]);
+  const stageScope = liveStageScope ?? stickyStageScope;
+
   // User can override the default scope; null = follow `stageScope`
   // automatically (default), "project" = pinned to project rewards,
   // a "<m>/<s>" string = pinned to that stage.
@@ -178,9 +213,12 @@ export function RewardsTab({
     return stageScope;
   }, [scopeOverride, stageScope]);
   const isStageScope = effectiveScope !== null;
-  // Refetch interval: poll every 3s while a stage is actively
-  // training so new vN files surface without manual refresh.
-  const pollMs = activeStageRun != null ? 3000 : null;
+  // Poll rewards every 3s while the mission is active OR a stage is
+  // live — covers the between-stage gaps so new vN files surface the
+  // moment the scope updates to the next stage. Stops once the
+  // mission is fully done (the last fetched version list stays
+  // visible for review).
+  const pollMs = missionActive || liveStageScope != null ? 3000 : null;
 
   const list = useRewards(slug, effectiveScope, pollMs);
   const [selectedVersion, setSelectedVersion] = useState<number | null>(null);
@@ -251,10 +289,11 @@ export function RewardsTab({
         adapterUnavailable={Boolean(project.adapter_unavailable)}
         latestVersion={latestVersion}
       />
-      {/* §Ship 21b: scope selector. Hidden when there's no active
-          stage AND the user hasn't pinned a stage scope — keeps the
-          common case (no missions running) free of UI clutter. */}
-      {(activeStageRun || scopeOverride) && (
+      {/* §Ship 21b/21d: scope selector. Visible whenever there's a
+          sticky stage scope (during a mission AND after it ends, for
+          review) or the user has pinned a scope. Hidden only in the
+          common no-missions-ever case to keep the UI clean. */}
+      {(stageScope || scopeOverride) && (
         <RewardsScopeSelector
           activeStageRun={activeStageRun}
           stageScope={stageScope}
@@ -271,9 +310,14 @@ export function RewardsTab({
             <CardDescription className="text-[11px]">
               {list.data?.length ?? 0} version
               {list.data?.length === 1 ? "" : "s"}
-              {isStageScope && (
+              {isStageScope && pollMs != null && (
                 <span className="ml-1 text-amber-700">
                   · live (3s poll)
+                </span>
+              )}
+              {isStageScope && pollMs == null && (
+                <span className="ml-1 text-muted-foreground">
+                  · stage (finished)
                 </span>
               )}
             </CardDescription>
@@ -316,6 +360,7 @@ export function RewardsTab({
             slug={slug}
             detail={detail.data}
             canEdit={!isRunning && !editsLockedByStageScope}
+            stageScope={effectiveScope}
             onNewHumanEdit={() => {
               setDraftSource(detail.data!.source);
               setDraftParentVersion(detail.data!.version);
@@ -703,18 +748,28 @@ function ReadOnlyPane({
   slug,
   detail,
   canEdit,
+  stageScope,
   onNewHumanEdit,
 }: {
   slug: string;
   detail: RewardVersionDetail;
   canEdit: boolean;
+  /** §Ship 21d: "<missionSlug>/<stageName>" when viewing a mission
+   *  stage's rewards, null for project rewards. Threaded into the
+   *  "Why this edit?" panel so its diagnosis fetch hits the stage's
+   *  runs dir. */
+  stageScope: string | null;
   onNewHumanEdit: () => void;
 }) {
   const [diffMode, setDiffMode] = useState(false);
   const parentVersion = detail.version > 0 ? detail.version - 1 : null;
+  // §Ship 21d: the diff-vs-parent view must fetch the parent from the
+  // SAME scope, else a stage version diffs against the project's
+  // v(N-1) (wrong file / 404).
   const parent = useReward(
     diffMode && parentVersion !== null ? slug : undefined,
     parentVersion ?? undefined,
+    stageScope,
   );
 
   return (
@@ -794,7 +849,11 @@ function ReadOnlyPane({
       </Card>
       <SpecPanel detail={detail} />
       {detail.author === "sculptor" && detail.version > 0 && (
-        <WhyThisEditPanel slug={slug} version={detail.version} />
+        <WhyThisEditPanel
+          slug={slug}
+          version={detail.version}
+          stageScope={stageScope}
+        />
       )}
     </>
   );
@@ -804,12 +863,19 @@ function ReadOnlyPane({
 function WhyThisEditPanel({
   slug,
   version,
+  stageScope,
 }: {
   slug: string;
   version: number;
+  /** §Ship 21d: stage scope so the diagnosis fetch resolves to the
+   *  stage's runs dir for mission stage rewards. */
+  stageScope?: string | null;
 }) {
   const [open, setOpen] = useState(false);
-  const diag = useRewardDiagnosis(slug, version, { enabled: open });
+  const diag = useRewardDiagnosis(slug, version, {
+    enabled: open,
+    stage: stageScope ?? null,
+  });
 
   return (
     <Card>
