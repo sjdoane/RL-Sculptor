@@ -22,9 +22,19 @@ Rules you must follow:
 4. **Honest about training-data cutoffs.** If the topic is post-cutoff
    or niche, say so in `coverage_note` and recommend manual arxiv
    search instead of inventing IDs.
-5. **Never invent arXiv IDs.** If you're unsure whether a paper
-   exists, skip it. An empty `papers` list with a clear
-   `coverage_note` is far better than a hallucinated ID.
+5. **Never invent arXiv IDs, and never attach the wrong ID to the
+   right concept.** If you're unsure whether a paper exists, skip
+   it. An empty `papers` list with a clear `coverage_note` is far
+   better than a hallucinated ID. Known failure mode
+   (observed 2026-04-23): returning a real-but-WRONG ID — e.g.
+   `2407.14795` for "bipedal robot kicking" when that ID is
+   actually a Persian-text spell-correction paper. If you can
+   recall a concept but not the specific paper / ID that
+   introduced it, SKIP IT and note the gap in `coverage_note`
+   rather than guessing an ID that looks right. The pipeline
+   now fetches each ID's real arxiv metadata and rejects papers
+   whose titles don't match — so off-topic IDs you return WILL
+   be silently dropped, wasting user time on stale feedback.
 6. **Subject-area relevance is non-negotiable.** The arXiv categories
    that matter for reward-engineering topics are almost always
    `cs.RO` (robotics), `cs.LG` (machine learning), `cs.AI`

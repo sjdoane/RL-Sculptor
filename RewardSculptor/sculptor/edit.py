@@ -108,6 +108,14 @@ class EditPlan:
 
     applicable_edits: list[ProposedEdit]
     deferred_edits: list[ProposedEdit]   # requires_env_extension=True
+    # Individual edits the diagnoser proposed but `_pre_validate` dropped
+    # (ungrounded target_term or suggested_value). Parallel lists —
+    # `rejected_edits[i]` was rejected for `rejection_reasons[i]`. Kept
+    # non-fatal so a partially-grounded batch (e.g., 3 of 5 valid) still
+    # drives an iteration forward; only an EMPTY `applicable_edits` is
+    # a hard error now. See 2026-04-23 overnight regression.
+    rejected_edits: list[ProposedEdit]
+    rejection_reasons: list[str]
     cited_arxiv_ids: list[str]
     citation_by_arxiv_id: dict[str, str]
 
@@ -328,18 +336,34 @@ def _pre_validate(
     current_module,
     kg_store: SculptorKG,
 ) -> EditPlan:
-    # 0. Split deferred vs applicable.
-    applicable: list[ProposedEdit] = []
+    """Partition proposed edits into applicable / deferred / rejected.
+
+    Pre-2026-04-23 this raised `EditValidationError` on the first
+    ungrounded edit, killing the entire batch. In Sam's overnight run,
+    1-3 of 5 edits per iter were ungrounded (diagnoser inventing a new
+    `target_term` with a `clip`/`gate` op, or referencing a raw state
+    like `qvel`), and the other 2-4 grounded edits got dropped too —
+    10 iterations, zero reward updates, v0 → v1 then frozen.
+
+    Now partitions: one bad edit drops itself with a logged reason but
+    the valid ones proceed. Only an EMPTY applicable list still raises.
+    `paper_refs not in KG` also still raises (separate concern: KG
+    hygiene vs. diagnoser formula quality).
+    """
+    # 0. Split deferred vs candidate.
+    candidate: list[ProposedEdit] = []
     deferred: list[ProposedEdit] = []
     for e in diagnosis.proposed_edits:
         if getattr(e, "requires_env_extension", False):
             deferred.append(e)
         else:
-            applicable.append(e)
+            candidate.append(e)
 
-    # 1. All paper_refs must exist in KG.
+    # 1. All paper_refs across the WHOLE proposal must exist in KG —
+    #    KG hygiene is an env-level concern and shouldn't be bypassed
+    #    by partitioning.
     all_refs = sorted({
-        aid for e in applicable for aid in (e.paper_refs or [])
+        aid for e in candidate for aid in (e.paper_refs or [])
     })
     missing = _missing_paper_ids(all_refs, kg_store)
     if missing:
@@ -357,34 +381,36 @@ def _pre_validate(
     grounded = info_keys | component_keys | hparam_keys
     allowed = _ALLOWED_MATH | _SIGNATURE_ARGS | grounded
 
-    violations: list[str] = []
-    for i, e in enumerate(applicable):
+    applicable: list[ProposedEdit] = []
+    rejected: list[ProposedEdit] = []
+    rejection_reasons: list[str] = []
+    modify_ops = {"increase", "decrease", "remove", "clip", "gate",
+                  "replace", "normalize"}
+
+    for i, e in enumerate(candidate):
+        violations: list[str] = []
+
         # 2a. target_term: for modify-ops (existing term), must be grounded.
         #     For 'add', allow a new snake_case name (not in grounded).
-        modify_ops = {"increase", "decrease", "remove", "clip", "gate",
-                      "replace", "normalize"}
         if e.operation in modify_ops:
-            # Existing-term operations must target a known hyperparameter or
-            # component. expected_info_keys ARE also accepted (editing an
-            # info-driven term is legit).
             if e.target_term not in grounded:
                 violations.append(
-                    f"edit[{i}] operation={e.operation!r} target_term="
+                    f"operation={e.operation!r} target_term="
                     f"{e.target_term!r} is not a known hyperparameter, "
                     f"component, or info key. Known: "
                     f"hparams={sorted(hparam_keys)} "
                     f"components={sorted(component_keys)} "
-                    f"info_keys={sorted(info_keys)}"
+                    f"info_keys={sorted(info_keys)}. "
+                    f"To introduce a new term, use operation='add'."
                 )
-        elif e.operation == "add":
-            # 'add' may use a fresh snake_case target_term, no check.
-            pass
+        # (operation='add' accepts any fresh snake_case target_term.)
+
         # 2b. Formula identifiers must all be in `allowed`.
         identifiers = _extract_formula_identifiers(e.suggested_value)
         ungrounded = sorted(n for n in identifiers if n not in allowed)
         if ungrounded:
             violations.append(
-                f"edit[{i}] operation={e.operation!r} target_term="
+                f"operation={e.operation!r} target_term="
                 f"{e.target_term!r} suggested_value references ungrounded "
                 f"name(s) {ungrounded}. Allowed info_keys="
                 f"{sorted(info_keys)}; allowed components="
@@ -394,13 +420,19 @@ def _pre_validate(
                 "diagnosis."
             )
 
-    if violations:
-        raise EditValidationError(
-            "edit pre-flight failed:\n  - " + "\n  - ".join(violations))
+        if violations:
+            rejected.append(e)
+            rejection_reasons.append(
+                f"edit[{i}]: " + "; ".join(violations)
+            )
+        else:
+            applicable.append(e)
 
     return EditPlan(
         applicable_edits=applicable,
         deferred_edits=deferred,
+        rejected_edits=rejected,
+        rejection_reasons=rejection_reasons,
         cited_arxiv_ids=all_refs,
         citation_by_arxiv_id=_citation_map(all_refs, kg_store),
     )
@@ -773,19 +805,51 @@ def apply_edits(
                 "text": (
                     f"[edit] pre-validate done "
                     f"(applicable={len(plan.applicable_edits)}, "
-                    f"deferred={len(plan.deferred_edits)})"
+                    f"deferred={len(plan.deferred_edits)}, "
+                    f"rejected={len(plan.rejected_edits)})"
                 ),
             })
+            # Surface each rejection so the UI + changelog show which
+            # edits the diagnoser got wrong. Critical for user-facing
+            # iteration visibility — Sam's overnight hit this on all
+            # 10 iters and the silent all-or-nothing behaviour made it
+            # look like the reward function just "wasn't being edited."
+            for reason in plan.rejection_reasons:
+                on_event({
+                    "type": "log_line",
+                    "text": f"[edit] rejected: {reason}",
+                })
+            # Structured event so run_manager can persist these and
+            # surface them as per-iter chips / a "rejected edits" tab.
+            if plan.rejected_edits:
+                on_event({
+                    "type": "edits_rejected",
+                    "count": len(plan.rejected_edits),
+                    "reasons": list(plan.rejection_reasons),
+                })
 
         if not plan.applicable_edits:
             raise EditValidationError(
-                "no applicable edits — every proposed edit was flagged "
-                "requires_env_extension=true or filtered out.")
+                "no applicable edits — every proposed edit was filtered out "
+                f"(deferred={len(plan.deferred_edits)}, "
+                f"rejected={len(plan.rejected_edits)}). "
+                f"Rejection reasons: {plan.rejection_reasons}"
+            )
 
         # LLM client.
+        #
+        # timeout=240s: per-request HTTP ceiling. Claude Opus with
+        # adaptive thinking + 16K max_tokens on a ~7K-char prompt
+        # genuinely takes 180-240s; observed 2026-04-23 at 12:57 a
+        # real call completed in 204s. Without this ceiling the SDK's
+        # default 600s lets one wedged call eat the whole reward-
+        # prompt-job budget. max_retries=2 keeps the SDK's exponential
+        # backoff envelope tight enough for a user-facing workflow
+        # (was 6 — 10+ min backoff is fine for CLI batch, not for a
+        # UI Rewards-tab button).
         if client is None:
             import anthropic
-            client = anthropic.Anthropic(max_retries=6)
+            client = anthropic.Anthropic(max_retries=2, timeout=240.0)
 
         # §7.2: load Eureka-format reward trajectory if present so the
         # rewrite prompt shows the SAME per-component data the diagnoser

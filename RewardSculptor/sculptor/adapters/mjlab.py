@@ -433,11 +433,21 @@ class MjlabAdapter(SculptorAdapter):
         output_dir: Path,
         steps: int,
         seed: int,
+        *,
+        init_policy_path: Optional[Path] = None,
     ) -> TrainResult:
         """Subprocess-train. `steps` is interpreted as `max_iterations`
         for rsl_rl's OnPolicyRunner (one iteration = num_envs *
         num_steps_per_env policy rollouts = ~num_envs * episode_length
         env steps). Caller budgets accordingly.
+
+        §Ship 15: `init_policy_path` is an optional path to a prior
+        rsl_rl checkpoint. When set, the runner loads actor+critic
+        weights from that checkpoint before training begins. Used by
+        the mission orchestrator (Ship 16) to warm-start a new
+        stage's training from a previous stage's final policy. The
+        source checkpoint MUST be from a compatible task_id — obs and
+        action spaces must match or `runner.load` raises.
         """
         reward_module_path = Path(reward_module_path).resolve() if reward_module_path else None  # type: ignore[assignment]
         output_dir = Path(output_dir).resolve()
@@ -468,6 +478,16 @@ class MjlabAdapter(SculptorAdapter):
         ]
         if reward_module_path is not None:
             cmd += ["--reward-module-path", str(reward_module_path)]
+        # §Ship 15: warm-start flag — validated before spawning the
+        # subprocess so the user sees a clear error instead of a
+        # cryptic subprocess failure buried in stderr.
+        if init_policy_path is not None:
+            init = Path(init_policy_path).resolve()
+            if not init.is_file():
+                raise FileNotFoundError(
+                    f"init_policy_path not found: {init}"
+                )
+            cmd += ["--load-pretrained-policy", str(init)]
         # Always pass the per-task schema keys to the subprocess so
         # SculptorRewardTerm uses the correct key set (bug: previously
         # only passed when `self.schema_keys` was explicitly set, so the

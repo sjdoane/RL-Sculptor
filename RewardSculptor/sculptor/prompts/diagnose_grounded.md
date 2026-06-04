@@ -19,14 +19,39 @@ Rules:
     and begin their rationale with the single word "novel." — this keeps
     the changelog honest.
   - Every proposed edit must respect the reward_contract:
-      * `target_term` MUST either be a key in REWARD_SPEC.hyperparameters
-        (for existing terms) or a new snake_case name (for added terms).
+      * OPERATION vs. target_term rules:
+          - `operation` ∈ {`increase`, `decrease`, `remove`, `clip`,
+            `gate`, `replace`, `normalize`} requires `target_term` to
+            ALREADY exist in this iter's REWARD_SPEC.hyperparameters,
+            reward-components, or reward_contract.expected_info_keys.
+            You cannot `clip` / `gate` / `replace` a name that doesn't
+            exist yet — the pre-flight validator rejects it.
+          - `operation = "add"` is the ONLY way to introduce a new
+            snake_case `target_term`. If you want to add a new clip
+            or gate on top of an existing term, emit
+            `operation: "add"` with the capped/gated expression as the
+            `suggested_value`; DO NOT invent a new name and pair it
+            with `clip` / `gate`.
+          - COMMON MISTAKE (observed 2026-04-23): the diagnoser emitted
+            `operation: "clip", target_term: "kick_velocity_cap"` —
+            the validator sees `kick_velocity_cap` isn't a known name
+            and drops the edit. Correct shape: either
+            `operation: "clip", target_term: "kick_velocity"` (clip
+            the existing component) or
+            `operation: "add", target_term: "kick_velocity_cap"` (add
+            a new capped component whose formula references the
+            existing `kick_velocity`).
       * GROUNDED-FIELD RULE: any field referenced inside `suggested_value`
         (e.g., `torso_angle`, `x_velocity`, `vz`) MUST either (a) appear in
         `reward_contract.expected_info_keys` or (b) name an existing reward
         component or REWARD_SPEC hyperparameter. Common math helpers (min,
         max, abs, sum, sqrt, exp, log, sin, cos, pow, tolerance, sigmoid)
-        are allowed; everything else is data and must be grounded.
+        are allowed; everything else is data and must be grounded. RAW
+        physics-state arrays like `qpos`, `qvel`, `xquat`, `xpos` are NOT
+        grounded unless they happen to be listed in `expected_info_keys`;
+        reference the adapter-exposed info key instead (e.g., `base_height`,
+        `hip_flex_vel`). If you want a feature the adapter doesn't surface
+        yet, use the env-extension escape hatch below.
       * If the edit you WANT to propose would require a field that isn't
         grounded by the rule above (for instance, you want to penalize
         torso_angle but `expected_info_keys` doesn't expose it), DO NOT

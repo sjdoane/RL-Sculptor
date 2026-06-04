@@ -339,6 +339,70 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-04 — Pre-skin checkpoint: restore Windows-era uncommitted work
+
+New window opened for the **design re-skin** task (integrate the
+`design-prototype/` high-fidelity prototype into the live app). Before
+touching anything, found the working tree carrying ~836 lines of
+uncommitted, **load-bearing** changes that prior changelog entries
+describe (Ships 11/12/13/15/17) but that this branch's git history never
+contained — the Windows→WSL move (see "Linux-specific notes") brought the
+FILES but not all the commits. Tell-tales: HEAD (`9a99b57`) `main.py`
+has **no** missions-router registration even though the merged Runs tab
+(Ships 18a–21) needs it; `edit.py` is still the all-or-nothing version
+Ship 12 claims to have replaced; a Windows OneDrive path is baked into
+`test_reward_parity.py`'s skip reason. Verified all gates green on the
+tree AS-IS, then committed it so committed == working before re-skinning.
+Sam chose "checkpoint first" (2026-06-04).
+
+- **What** (reconstructed from diffs; no new behavior authored here):
+  *Sculptor (`RewardSculptor/`)*:
+  - `sculptor/edit.py` — `_pre_validate` all-or-nothing → partition
+    (Ship 12): proposed edits split into applicable / deferred /
+    **rejected** (`EditPlan.rejected_edits` + `rejection_reasons`);
+    only an EMPTY applicable list raises; emits `log_line` + new
+    `edits_rejected` structured event per drop. Anthropic client
+    `max_retries=6` → `max_retries=2, timeout=240.0`.
+  - `sculptor/kg/query.py` — `_get_embedder` thread-lock +
+    `local_files_only=True` HF-hang bypass (Ship 11) + timing logs in
+    `_ensure_technique_embeddings` / `query_semantic`.
+  - `sculptor/kg/research.py` — off-topic-hallucination guard (Ship 13):
+    `_fetch_arxiv_metadata_batch` + `_verify_topic_match` (embed real
+    arxiv title+abstract vs topic, drop cosine < 0.15), new
+    `papers_rejected_off_topic` field; fail-open on arxiv/embedder outage.
+  - `sculptor/adapters/{mjlab,_mjlab_runner}.py` — Ship 15 warm-start:
+    `init_policy_path` / `--load-pretrained-policy`, loads actor+critic
+    only (skips optimizer/iteration/rnd), `warm_start_loaded` event,
+    broad load-error wrapping.
+  - `sculptor/prompts/diagnose_grounded.md` — operation-vs-target_term
+    rules (clip/gate/replace need an existing term; only `add` adds a
+    new name); raw `qpos/qvel/xquat/xpos` not grounded.
+  - `sculptor/prompts/research_topic.md` — "never attach a real-but-wrong ID."
+  - `sculptor/prompts/redecompose_stage.md` (NEW) — load-bearing prompt;
+    `decompose.py:707` does `load_prompt("redecompose_stage")` (Ship 17).
+  - `tests/test_{edit,kg_query,kg_research}.py` + `test_ship15_warm_start.py`
+    (NEW, 16 tests) — regression coverage for the above.
+  *Backend UI (`reward-sculptor-ui/backend/`)*:
+  - `main.py` — **registers the missions router + ws_router** (the piece
+    missing from HEAD that the Runs tab depends on); pins the
+    embedder-prewarm task on `app.state` so it isn't GC'd.
+  - `services/reward_jobs.py` — prompt-edit timeout default 300 → 900s
+    (budget math: 2 × (240s call + 60s SDK backoff) + margin).
+  *Frontend (`reward-sculptor-ui/frontend/`)*:
+  - `components/GraphModal.tsx` — `flex flex-col` + `min-h-0` so the KG
+    graph iframe claims full modal height (was collapsing to ~300px).
+- **Why**: a clean, coherent base for the re-skin. Without it my Ship
+  commits would either sweep up this work uncredited or sit on top of an
+  uncommitted, missions-broken HEAD (origin/PR #1 incoherent for missions).
+- **How**: staged ONLY these source/test/prompt files + this entry by
+  explicit path (no `git add -A`). Left untracked artifacts out of git
+  (`.pr-body-*.md`, `HANDOFF_*.md`, `RL-Sculptor.html`, `*:Zone.Identifier`,
+  `ame456_kg_seeds.yml`, `design-prototype/`).
+- **Verified**: `pnpm tsc --noEmit` 0; backend pytest **305 passed, 1
+  deselected** (376s; arxiv 429/503 noise = network ingest tests falling
+  back to seed metadata, all pass); sculptor pytest **364 passed, 1
+  skipped** (150s). Live smoke deferred to the re-skin verification.
+
 ### 2026-04-25 — Ships 21a-21e: mission UX hardening + review pass
 
 Five follow-up ships on the `ship-20-ux-revamp` branch after Ship 21's

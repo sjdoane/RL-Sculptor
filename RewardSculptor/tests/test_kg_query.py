@@ -318,3 +318,77 @@ def test_query_semantic_uses_cached_embeddings(monkeypatch, kg):
     assert results[0].relevance_score == pytest.approx(1.0, abs=1e-5)
     assert results[1].technique.name == "potential_based_shaping"
     assert results[1].relevance_score == pytest.approx(0.0, abs=1e-5)
+
+
+def test_get_embedder_is_thread_safe_under_concurrent_load(monkeypatch):
+    """Pins the fix for the 2026-04-23 KG-preview hang regression.
+
+    Symptom: Ship-10's startup-time `_prewarm_embedding_model` hook
+    fires `asyncio.to_thread(_load_embedder)` concurrently with the
+    reward-prompt worker's own `_get_embedder` call. Pre-fix,
+    `_get_embedder` had no lock, so two threads entered
+    `SentenceTransformer(...)` simultaneously. On WSL2 this deadlocked
+    on the huggingface_hub cache FileLock + torch CUDA init, producing
+    a 5-minute hang at the KG preview step.
+
+    Post-fix, `_get_embedder` uses double-checked locking so the second
+    caller waits for the first to populate the cache, then reads it.
+
+    Test construction: swap `SentenceTransformer` for a stub that sleeps
+    briefly on init (simulates the cold load). Fire N threads at once,
+    assert only ONE init happened.
+    """
+    import threading
+    import time
+
+    import sculptor.kg.query as qmod
+
+    # Reset cache — previous tests may have populated it.
+    monkeypatch.setattr(qmod, "_EMBEDDER_CACHE", {})
+
+    init_count = [0]
+    init_lock = threading.Lock()
+
+    class _FakeSentenceTransformer:
+        def __init__(self, model_name, **kwargs):
+            # Accept `local_files_only=True` (added for the 2026-04-23
+            # WSL2 httpx-bypass fix) and any other forwarded kwargs.
+            with init_lock:
+                init_count[0] += 1
+            # Simulate the cold-load window where the race condition
+            # used to trigger. 200 ms is plenty for 8 threads to race.
+            time.sleep(0.2)
+            self.model_name = model_name
+
+        def encode(self, *args, **kwargs):  # pragma: no cover
+            raise AssertionError("not used in this test")
+
+    # Intercept the lazy import inside `_get_embedder`.
+    import sys
+    fake_mod = type(sys)("sentence_transformers")
+    fake_mod.SentenceTransformer = _FakeSentenceTransformer  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "sentence_transformers", fake_mod)
+
+    results: list = [None] * 8
+    threads: list[threading.Thread] = []
+
+    def _target(i: int) -> None:
+        results[i] = qmod._get_embedder("thread-safety-test-model")
+
+    for i in range(8):
+        t = threading.Thread(target=_target, args=(i,))
+        threads.append(t)
+    for t in threads:
+        t.start()
+    # Bounded join — if the lock deadlocks we'd hang forever; 5 s is
+    # way more than 8 × 200 ms worth of serialized loads.
+    for t in threads:
+        t.join(timeout=5.0)
+        assert not t.is_alive(), "thread deadlocked — _get_embedder lock broken"
+
+    assert init_count[0] == 1, (
+        f"expected exactly 1 SentenceTransformer init under concurrent "
+        f"load, got {init_count[0]} — lock is not serializing"
+    )
+    # All threads see the same cached instance.
+    assert all(r is results[0] for r in results)

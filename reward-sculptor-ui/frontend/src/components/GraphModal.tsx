@@ -61,7 +61,12 @@ export function GraphModal({
   return (
     <>
       <Dialog open={open} onOpenChange={onOpenChange}>
-        <DialogContent className="h-[92vh] w-[95vw] max-w-[95vw] gap-2 p-4 sm:rounded-lg">
+        {/* `flex flex-col` overrides DialogContent's default `grid` so
+            the iframe's `flex-1` actually claims the remaining height.
+            Pre-fix (2026-04-23): grid + auto rows let the iframe
+            collapse to its ~300px intrinsic height, leaving the top
+            half of the modal blank. */}
+        <DialogContent className="flex h-[92vh] w-[95vw] max-w-[95vw] flex-col gap-2 p-4 sm:rounded-lg">
           <DialogHeader className="space-y-0">
             <DialogTitle className="text-sm">Knowledge graph</DialogTitle>
             <DialogDescription className="text-[11px]">
@@ -69,7 +74,7 @@ export function GraphModal({
               click a paper to see its full record
             </DialogDescription>
           </DialogHeader>
-          <div className="flex-1 overflow-hidden rounded border">
+          <div className="min-h-0 flex-1 overflow-hidden rounded border">
             {iframeSrc && (
               <iframe
                 key={iframeSrc}

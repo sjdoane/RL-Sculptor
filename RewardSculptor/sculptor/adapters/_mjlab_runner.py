@@ -419,6 +419,64 @@ def _cmd_train(args: argparse.Namespace) -> None:
         wrapped, agent_cfg_dict, str(output_dir / "logs"), args.device
     )
 
+    # §Ship 15: optional warm-start from a pre-trained policy checkpoint.
+    # Load ONLY actor+critic weights, skipping optimizer / iteration /
+    # RND state. Optimizer skip is important — stale Adam momentum from
+    # a previously-different reward degrades new-task learning. Iteration
+    # skip keeps `max_iterations` semantics intact (we train
+    # num_learning_iterations fresh iters regardless of what the
+    # checkpoint thought). rsl_rl's PPO.load honors these keys per
+    # rsl_rl/algorithms/ppo.py:444-466.
+    if args.load_pretrained_policy:
+        import hashlib as _hashlib
+        ckpt = Path(args.load_pretrained_policy).resolve()
+        if not ckpt.is_file():
+            raise FileNotFoundError(
+                f"--load-pretrained-policy not found: {ckpt}"
+            )
+        load_cfg = {
+            "actor": True,
+            "critic": True,
+            "optimizer": False,
+            "iteration": False,
+            "rnd": False,
+        }
+        # Cheap forensics: short checksum so Ship-16's mission orchestrator
+        # can later verify the path matches its known stage checkpoint.
+        source_sha8 = _hashlib.sha256(ckpt.read_bytes()).hexdigest()[:8]
+        try:
+            _ = runner.load(str(ckpt), load_cfg=load_cfg)
+        except (RuntimeError, OSError, EOFError, Exception) as e:
+            # Broaden beyond RuntimeError per Ship-15 audit — torch.load
+            # can raise UnpicklingError (corrupt file), OSError (bad
+            # I/O), EOFError (truncated file), and RuntimeError
+            # (state_dict shape mismatch from an obs-space /
+            # action-space drift between the source and target tasks).
+            # We catch `Exception` as a safety net too — any other
+            # error from the load path should still surface with a
+            # pointer toward the likely cause.
+            raise RuntimeError(
+                f"failed to load pretrained policy {ckpt}: "
+                f"{type(e).__name__}: {e}. "
+                "Likely causes: (a) the checkpoint's task has a "
+                "different observation or action space than the "
+                "current task_id (warm-start requires matching "
+                "obs_groups), (b) the checkpoint file is corrupt "
+                "or truncated, or (c) the rsl_rl version that wrote "
+                "the checkpoint has drifted from the one loading it."
+            ) from e
+        print(
+            "[SCULPT-EVENT] " + json.dumps({
+                "type": "warm_start_loaded",
+                "source": str(ckpt),
+                "source_sha8": source_sha8,
+                "load_cfg_keys": sorted(
+                    k for k, v in load_cfg.items() if v
+                ),
+            }),
+            flush=True,
+        )
+
     # Progress poller — watches the logs dir for new model_<N>.pt
     # checkpoints rsl_rl writes every `save_interval` iters and emits
     # `[SCULPT-EVENT] iter_progress` lines. Those flow up to the sculpt
@@ -1141,6 +1199,16 @@ def main() -> None:
     p_train.add_argument("--output-dir", required=True)
     p_train.add_argument("--schema-keys", default="",
                          help="comma-separated override for the state-schema keys")
+    p_train.add_argument(
+        "--load-pretrained-policy", default=None,
+        help=(
+            "§Ship 15: path to a prior rsl_rl checkpoint (e.g., "
+            "runs/iter_N/checkpoint.pt). When set, the runner loads "
+            "actor+critic weights from this file BEFORE training begins, "
+            "skipping optimizer / iteration / RND state. Used by the "
+            "mission orchestrator to chain skills across stages."
+        ),
+    )
 
     p_roll = sub.add_parser("rollout")
     p_roll.add_argument("--task-id", required=True)
