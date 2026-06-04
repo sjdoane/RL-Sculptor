@@ -308,6 +308,19 @@ pnpm --dir frontend dev                                 # terminal 2
 - Don't add features, refactor, or introduce abstractions beyond what
   the task requires. A bug fix doesn't need surrounding cleanup.
 - Default to writing no comments unless the *why* is non-obvious.
+- **Always keep CONTEXT.md updated** (Sam's standing rule, 2026-04-25).
+  Append a Change Log entry for every meaningful change in the same
+  window you make it — do NOT let commits outrun the changelog. A new
+  window must be able to reconstruct the arc from CONTEXT.md alone.
+- **Review major changes + decisions with agents** (Sam's standing
+  rule, 2026-04-25). For anything non-trivial — a feature, a refactor,
+  a cross-cutting bug fix, an architecture call — run the audit-driven
+  loop: research (Explore) → plan → plan-audit (Plan agent) → implement
+  → code-audit + design-critique (Explore agents, distinct
+  perspectives: senior eng, UI/UX, a11y) → apply CRITICAL/HIGH fixes.
+  VERIFY each agent's load-bearing claims against source before acting
+  — agents produce plausible-but-wrong findings; reject the ones that
+  don't hold. Mirrors Ships 14-21e.
 
 ---
 
@@ -325,6 +338,52 @@ Append an entry **every time you make a meaningful change**. Format:
 ```
 
 Start the next entry below this line.
+
+### 2026-04-25 — Ships 21a-21e: mission UX hardening + review pass
+
+Five follow-up ships on the `ship-20-ux-revamp` branch after Ship 21's
+Missions→Runs merge. All on GitHub (PR #1 → base `ship-19-skill-
+library`; `main` has unrelated history). Branch head: `db1cdea`.
+
+- **Ship 21a** (`ffe9c5c`) — NewMissionDialog Advanced tab (Basic/
+  Advanced, mirrors NewRunDialog) persisting `run_defaults` on the
+  mission (sculptor `Mission.run_defaults`, backend CreateMission
+  Request + MissionDetail, RunMissionDialog pre-fill). + Fixed the
+  404-flash on Decompose: `mission_store` returns a "decomposing" stub
+  when `.decompose_pending` exists but mission.json doesn't yet.
+- **Ship 21b** (`3c6a6e0`) — live rewards + live video for stage runs
+  (frontend-only). RewardsTab auto-scopes to the active stage (Project/
+  Stage toggle, 3s poll); RobotViewer `LiveStageRollout` plays per-iter
+  rollout.mp4 for `mission_stage_run` kind.
+- **Ship 21c** (`190ce05`) — torch-idiom guard for success_criterion.
+  Claude was writing `.float()` (torch) on numpy arrays → stage failed
+  at the LAST criterion eval after 10+ h of G1 training. 3-layer
+  defense: decompose prompt rule + `validate_mission` AST walker +
+  runtime `_evaluate_success_criterion` safe-attr removal. Plus the
+  iter-row "v3 · held" UX (no-edit iters were misread as failures).
+- **Ship 21d** (`cb2ef96`) — RELIABLE reward propagation. Root cause:
+  `useRuns` stopped polling at every stage boundary (no running run
+  for a beat) and never auto-resumed → scope froze/flipped to project
+  → "rewards only sometimes update." Fix: `useRuns(slug, {keepPolling})`
+  driven by `missionActive`; sticky stage scope in RewardsTab; mission-
+  scoped reward polling; stage-aware `?stage=` on the diagnosis route
+  so "Why this edit?" works per stage.
+- **Ship 21e** (`db1cdea`) — 4-agent review panel (backend, frontend,
+  UI/UX, a11y). Verified findings → fixed: `useLiveClips` infinite-
+  reconnect loop (missing terminalRef — CRITICAL); `_resolve_run_root`
+  path-traversal guard + stage_name sanitize; WCAG AA motion-safe
+  guards + badge contrast (-700→-800); WS reconnect-timer cleanup;
+  "Plan" button affordance; aria-labels (badges, videos, sparkline,
+  Re-render, form aria-invalid); deleted dead MissionsTab.tsx.
+  Rejected 2 overstated agent claims + 1 regressive suggestion.
+
+**Verified across the series:** `pnpm tsc --noEmit` 0; backend pytest
+305 passed, 1 deselected; sculptor 364 passed, 1 skipped.
+
+**KG note:** AME456 jumping-robot bibliography (14 papers) ingested +
+extracted into the shared KG at `~/.local/share/sculptor/kg/graph.db`
+(now 80 papers / 468 techniques). Seeds at `~/projects/ame456_kg_
+seeds.yml`.
 
 ### 2026-04-25 — Ship 21: Missions merged into Runs (cross-tab integration v2)
 
