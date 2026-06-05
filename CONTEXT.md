@@ -339,6 +339,53 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-04 — Ship 22a: re-skin foundation (design tokens + theme + rs/ primitives)
+
+First implementation Ship of the `design-prototype/` integration (audit-driven
+loop: research → plan → plan-audit → implement). Foundation only — no screen
+reskinned yet; existing shadcn screens still render unchanged (verified live).
+
+- **What**:
+  - `frontend/src/styles/rs-tokens.css` + `rs-theme.css` (NEW) — the prototype's
+    bespoke "Cursorlike" design system (colors_and_type.css + theme.css),
+    imported in main.tsx after index.css. The two colliding CSS variables
+    (`--primary`, `--muted`) renamed → `--rs-primary`/`--rs-muted` (+ -active/
+    -soft) so they DON'T clobber the app's shadcn `hsl(var(--primary))` Tailwind
+    tokens (index.css:16 defines `--primary` as an HSL triplet; the prototype's
+    hex would make `hsl(#f54e00)` invalid → silently break bg-primary/
+    text-muted-foreground on every un-migrated screen — the plan-audit's BIGGEST
+    HOLE). Dropped the render-blocking Google-Fonts `@import` (→ index.html) and
+    the global `body{overflow:hidden}` + `#root{height:100vh}` (conflicted with
+    index.css h-full + Layout scroll model).
+  - `frontend/index.html` — Inter + JetBrains Mono via `<link rel=preconnect>` +
+    stylesheet (non-blocking); `color-scheme: light dark`.
+  - `frontend/src/main.tsx` — import the rs- CSS; call `bootstrapTheme()` before
+    createRoot so the theme is applied on first paint.
+  - `frontend/src/hooks/useTheme.ts` — `applyTheme`/`bootstrapTheme` now set
+    `data-theme="light|dark"` alongside the `.dark` class (rs- tokens key dark
+    mode on `[data-theme]`). Public API + storage key unchanged.
+  - `frontend/src/components/rs/icon.tsx` (NEW) — `<Icon name="kebab" />` over
+    lucide-react (~70 names) so ported screens keep their call sites verbatim.
+  - `frontend/src/components/rs/primitives.tsx` (NEW) — typed ports of the
+    prototype primitives (Badge, AuthorBadge, Delta, FactChip, Btn, IconBtn,
+    Sparkline, MetricChart [SVG, replaces recharts], Segmented, Toggle, Field,
+    Check, Banner, EmptyState, Skel) + a STATUS_META superset (Project/Job/Stage/
+    Mission). Sparkline + MetricChart are null-safe for real `(number|null)[]`.
+- **Why**: establish the design system + shared primitives so each screen Ship
+  (22b–e) is a presentational swap onto unchanged data wiring.
+- **How**: hybrid (plan-audit-approved) — bespoke rs- CSS for designed surfaces;
+  KEEP shadcn/Radix + Monaco + the pyvis GraphModal iframe + react-window
+  LogViewer for interactive/a11y-critical surfaces, restyled. Per-screen ports
+  EDIT existing components in place (never rewrite from prototype JSX) to preserve
+  Ship 21b/21d/21e logic (keepPolling, sticky scope, terminalRef, mergedIters).
+- **Verified**: `pnpm tsc --noEmit` 0. App boots in Chrome (localhost:5173), zero
+  console errors, real GPU data (RTX 5070 Laptop) flowing. Token namespacing
+  confirmed: Dashboard's primary button still navy (Tailwind token intact, not
+  orange). Backend/sculptor untouched → 305 / 364 unchanged. Live reskin in 22b.
+- **Decisions (asked + approved by Sam)**: Finding A → enrich ProjectSummary
+  additively (cards need adapter/robot/metric/spark); Finding B → Settings stays
+  read-only (no write endpoints exist; don't fake editable fields).
+
 ### 2026-06-04 — Pre-skin checkpoint: restore Windows-era uncommitted work
 
 New window opened for the **design re-skin** task (integrate the

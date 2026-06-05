@@ -8,8 +8,9 @@ const STORAGE_KEY = "rs.ui.theme";
  *  via the `prefers-color-scheme` media query; explicit choices win
  *  and persist to localStorage.
  *
- *  Applies the theme by toggling `.dark` on `<html>` — Tailwind's
- *  `darkMode: "class"` in tailwind.config.js reads that class.
+ *  Applies the theme by toggling `.dark` on `<html>` (Tailwind's
+ *  `darkMode: "class"`) AND setting `data-theme="light|dark"` — the
+ *  re-skin design tokens in styles/rs-theme.css key dark mode on it.
  */
 export function useTheme() {
   const [theme, setThemeState] = useState<Theme>(readStored);
@@ -55,6 +56,9 @@ function applyTheme(theme: Theme) {
       : theme;
   if (effective === "dark") root.classList.add("dark");
   else root.classList.remove("dark");
+  // Re-skin tokens (styles/rs-theme.css) key dark mode on [data-theme];
+  // keep it in lockstep with the .dark class so both systems agree.
+  root.setAttribute("data-theme", effective);
 }
 
 /** Call once at app boot to apply the stored theme before React
