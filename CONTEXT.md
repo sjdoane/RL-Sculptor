@@ -339,6 +339,45 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-05 — Ship 22i: re-skin the launch dialogs (NewMission + NewRun)
+
+Frontend-only. First of the dialog-reskin sweep — the two run-launch dialogs the
+Runs sidebar header (+ project header) trigger.
+
+- **What**:
+  - `components/NewMissionDialog.tsx` rewritten onto the rs `Modal` primitive
+    (controlled `open` + rs `Btn` trigger, `rs-mtabs` Basic/Advanced). ALL logic
+    preserved VERBATIM: `useCreateMission(slug)` + exact payload
+    `{goal, mission_slug, no_kg, run_defaults}`, `buildRunDefaults()` (the 8
+    MissionRunDefaults fields), SLUG_PATTERN / GOAL_MIN(8) / GOAL_MAX(2000)
+    validation, `onCreated(job.params.mission_slug)`, reset-on-close. The Advanced
+    body is extracted to an exported `MissionAdvanced` (rs-row3 rounds/steps/seed +
+    two `ToggleRow`s gating Stability-window and the extension rs-row3) so
+    RunMissionDialog can reuse it next.
+  - `components/NewRunDialog.tsx` rewritten onto rs `Modal`. ALL logic VERBATIM:
+    `pickAdapterDefaults` (gym_sb3 / cartpole / go1 / g1 / other), the full launch
+    body (behavior_goal, iterations, no_kg, dry_run, training_iterations,
+    num_envs_override, device_override, expand_kg, max_episode_steps, playback_speed,
+    rollout_episodes, seed, auto_adjust_physics, early_stop_enabled,
+    early_stop_patience), the S8/§7.7 ETA estimate (SECONDS_PER_CYCLE → eta +
+    long-run/resume warnings), the open/adapter useEffect pre-fill. Restyled: amber
+    ETA box (st-amber tokens) on long runs, `rs-row2` field grids + `.rs-hintline`
+    helper text, `rs-select` for the auto-physics/early-stop dropdowns, `ToggleRow`
+    for dry-run/expand-kg/no-kg.
+  - New shared primitive `ToggleRow` (title + desc + Toggle, switch-only click
+    target) + `.rs-toggle-row`/`.rs-hintline` CSS — replaces the ad-hoc
+    `<label class=rs-check>` rows so help text is correctly styled (the `.hint`
+    rule is scoped to `.rs-field` only).
+- **Verified**: tsc 0. Live (Chrome): NewRun renders full — title/subtitle, amber
+  3.3 h long-run ETA box, Basic (behavior + dry-run ToggleRow) and Advanced
+  (8 iters / 1500 rsl_rl / 2048 num_envs / cuda:0 defaults, rollout knobs, both
+  selects with correct options, expand-kg/no-kg toggles). NewMission verified
+  (Basic: goal + "0 / 2000" counter + slug + no-kg; Advanced: rounds/steps/seed +
+  both ToggleRows → conditional stability-window + extension row3). Zero console
+  errors. Backend/sculptor untouched (305 / 364). (Runs-tab `captureScreenshot`
+  stalls in this Chrome session — a pre-existing render-loop quirk of that tab,
+  not these changes; Overview captures fine. Structure JS-verified there.)
+
 ### 2026-06-05 — Ship 22h: re-skin Runs tab (3-pane) + LogViewer
 
 Frontend-only. The prototype's signature screen + the most logic-dense.

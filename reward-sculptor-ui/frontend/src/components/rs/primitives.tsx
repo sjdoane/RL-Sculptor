@@ -250,6 +250,24 @@ export function Check({
   );
 }
 
+// Toggle-row: a labelled switch (title + optional desc on the left, a
+// Toggle on the right). Used across the launch/config dialogs for boolean
+// flags. Unlike Check, the row body is not a click target — only the switch
+// toggles, so adjacent help text is selectable.
+export function ToggleRow({
+  on, onChange, title, desc, label,
+}: { on: boolean; onChange: (v: boolean) => void; title: ReactNode; desc?: ReactNode; label: string }) {
+  return (
+    <div className="rs-toggle-row">
+      <span style={{ flex: 1, minWidth: 0 }}>
+        <span className="ttl">{title}</span>
+        {desc && <span className="desc">{desc}</span>}
+      </span>
+      <Toggle on={on} onChange={onChange} label={label} />
+    </div>
+  );
+}
+
 // ── Banner / empty / skeleton ───────────────────────────────────────
 export function Banner({
   kind = "info", icon, children, action,

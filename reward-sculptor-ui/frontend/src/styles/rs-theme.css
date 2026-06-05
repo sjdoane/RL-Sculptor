@@ -398,6 +398,7 @@ input, textarea, select { font: inherit; color: inherit; }
 .rs-field { display: flex; flex-direction: column; gap: 7px; }
 .rs-field label { font-size: 13px; font-weight: 500; color: var(--ink); display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .rs-field .hint { font-size: 12px; color: var(--rs-muted); font-weight: 400; }
+.rs-hintline { margin: -1px 0 0; font-size: 11px; line-height: 1.4; color: var(--rs-muted); }
 .rs-input, .rs-textarea { width: 100%; background: var(--canvas-soft); border: 1px solid var(--hairline-strong); border-radius: var(--radius-md);
   padding: 9px 12px; font-size: 14px; color: var(--ink); }
 .rs-input:focus, .rs-textarea:focus { outline: none; border-color: var(--rs-primary); }
@@ -409,6 +410,10 @@ input, textarea, select { font: inherit; color: inherit; }
 .rs-check.on { border-color: var(--rs-primary); background: rgba(245,78,0,0.04); }
 .rs-check-box { width: 18px; height: 18px; border-radius: 5px; border: 1.5px solid var(--hairline-strong); flex-shrink: 0; margin-top: 1px; display: flex; align-items: center; justify-content: center; }
 .rs-check.on .rs-check-box { background: var(--rs-primary); border-color: var(--rs-primary); color: #fff; }
+/* toggle-row: title + desc on the left, a switch on the right (no whole-row click) */
+.rs-toggle-row { display: flex; align-items: center; gap: 12px; padding: 11px 14px; border: 1px solid var(--hairline); border-radius: var(--radius-md); }
+.rs-toggle-row .ttl { font-size: 13.5px; font-weight: 500; color: var(--ink); display: block; }
+.rs-toggle-row .desc { font-size: 12px; color: var(--rs-muted); display: block; margin-top: 2px; line-height: 1.4; }
 
 /* toggle switch */
 .rs-switch { width: 38px; height: 22px; border-radius: 12px; background: var(--surface-strong); border: 0; position: relative; transition: background .15s; flex-shrink: 0; }
