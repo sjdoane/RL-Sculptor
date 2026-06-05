@@ -1,10 +1,8 @@
 import { Link } from "react-router-dom";
-import { ArrowLeft, Library, Sparkles } from "lucide-react";
 
 import { LibraryBrowser } from "@/components/RobotConfig";
-import { Button } from "@/components/ui/button";
+import { Icon } from "@/components/rs/icon";
 import { useLibraryRobots, useSystemGpu } from "@/hooks/useLibrary";
-import { cn } from "@/lib/utils";
 
 /** Standalone library page — the primary entry point for creating a
  *  new project. Reuses LibraryBrowser from RobotConfig so the in-
@@ -20,51 +18,37 @@ export default function LibraryPage() {
   const cudaOk = !!gpu.data?.cuda_available;
 
   return (
-    <div className="mx-auto flex h-full max-w-7xl flex-col gap-4 px-6 pb-16 pt-6">
-      <header className="flex items-center justify-between gap-4">
-        <div className="flex items-center gap-3">
-          <Button asChild variant="ghost" size="sm">
-            <Link to="/" aria-label="Back to dashboard">
-              <ArrowLeft className="h-4 w-4" />
-              Dashboard
+    <div className="rs-scroll">
+      <div className="rs-pad" style={{ display: "flex", flexDirection: "column", gap: 18, maxWidth: 1320, margin: "0 auto" }}>
+        <header style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 16, flexWrap: "wrap" }}>
+          <div style={{ display: "flex", alignItems: "flex-start", gap: 12 }}>
+            <Link to="/" aria-label="Back to dashboard" className="rs-btn rs-btn-ghost rs-btn-sm" style={{ marginTop: 2 }}>
+              <Icon name="arrow-left" size={14} />Dashboard
             </Link>
-          </Button>
-          <div>
-            <h1 className="flex items-center gap-2 text-lg font-semibold tracking-tight">
-              <Library className="h-5 w-5" />
-              Robot library
-            </h1>
-            <p className="text-xs text-muted-foreground">
-              Pick a robot to spin up a new project. Every mjlab-ready entry
-              scaffolds with a batched reward template and auto-seeds the
-              knowledge graph with canonical references.
-            </p>
+            <div>
+              <h1 className="rs-h2" style={{ display: "flex", alignItems: "center", gap: 9, margin: 0 }}>
+                <Icon name="library" size={20} />Robot library
+              </h1>
+              <p className="rs-sub" style={{ margin: "4px 0 0", maxWidth: 620, lineHeight: 1.5, fontSize: 13 }}>
+                Pick a robot to spin up a new project. Every mjlab-ready entry scaffolds with a batched reward template and auto-seeds the knowledge graph with canonical references.
+              </p>
+            </div>
           </div>
-        </div>
-        <div className="flex flex-col items-end gap-0.5 text-right text-xs">
-          <div className="flex items-center gap-2">
-            <span className="inline-flex items-center gap-1 rounded-full border px-2 py-0.5">
-              <Sparkles className="h-3 w-3 text-emerald-500" />
-              {mjlabReady} ready to train
-            </span>
-            <span className="rounded-full border px-2 py-0.5">
-              {total} total
+          <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 4, textAlign: "right" }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <span className="rs-badge emerald"><Icon name="sparkles" size={11} />{mjlabReady} ready to train</span>
+              <span className="rs-badge slate">{total} total</span>
+            </div>
+            <span style={{ fontSize: 11, color: cudaOk ? "var(--rs-muted)" : "var(--st-amber-fg)" }}>
+              {cudaOk
+                ? `GPU: ${gpu.data?.devices[0]?.name ?? "detected"}`
+                : "No GPU detected — mjlab adapter disabled"}
             </span>
           </div>
-          <span
-            className={cn(
-              "text-[11px]",
-              cudaOk ? "text-muted-foreground" : "text-amber-600",
-            )}
-          >
-            {cudaOk
-              ? `GPU: ${gpu.data?.devices[0]?.name ?? "detected"}`
-              : "No GPU detected — mjlab adapter disabled"}
-          </span>
-        </div>
-      </header>
+        </header>
 
-      <LibraryBrowser />
+        <LibraryBrowser />
+      </div>
     </div>
   );
 }

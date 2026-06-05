@@ -339,6 +339,38 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-05 — Ship 22m: re-skin the robot/creation flow (Library + RobotConfig)
+
+Frontend-only. The project-creation entry point + the in-project robot config.
+
+- **What** (all filter/upload/create logic VERBATIM):
+  - `components/RobotConfig.tsx` rewritten. `RobotConfig` (in-project, shown in
+    the Overview slot for unconfigured projects) → rs-card + rs-mtabs Library/
+    Upload. `LibraryBrowser` (category/support/search client-side filter +
+    `filtered` useMemo — verbatim) → rs filter sidebar (`rs-fchip` toggle chips)
+    + auto-fill card grid. `RobotCard` → `rs-robotcard` (hairline lift, no shadow).
+    `TrainingBadge` → rs Badge colors. `RobotDetailModal` → rs Modal (wide;
+    thumbnail / preview-warning / tasks / references / demote-note; opens
+    CreateProjectDialog on "Create"). `UploadPanel` → `rs-drop` drag-zone +
+    rs state panels; the upload submit (ext/size validation, zip→meshesZip
+    split, mutation) preserved verbatim.
+  - `pages/LibraryPage.tsx`: rs page (back link, title, ready/total rs badges,
+    GPU note) + LibraryBrowser.
+  - `pages/ProjectCreate.tsx`: untouched — it's just a legacy /projects/new →
+    /library redirect (no UI).
+  - `rs-theme.css`: `.rs-fchip` (filter chips), `.rs-robotcard` (+ thumb),
+    `.rs-drop` (upload zone).
+- **Verified**: tsc 0, zero console errors. Live (Chrome, fresh /library load —
+  full screenshots): the library renders (filter chips active/inactive, search,
+  6/63 count, robot cards with thumbnails + READY-TO-TRAIN/GYMNASIUM badges);
+  RobotDetailModal (Unitree G1 — bot icon, real thumbnail, MuJoCo-Menagerie
+  subtitle, description, pre-configured tasks); CreateProjectDialog (mjlab path,
+  via JS — name prefilled, adapter=mjlab, CUDA device dropdown, num_envs=1024,
+  "Estimated VRAM: 2.0 GiB of 6.4 GiB free · Comfortable headroom"). The
+  in-project RobotConfig card + UploadPanel are tsc-clean + logic-preserved
+  (only reachable on an unconfigured project; none exist to click-trigger now).
+  Backend/sculptor untouched.
+
 ### 2026-06-05 — Ship 22l: re-skin the project config dialogs (Create + Settings)
 
 Frontend-only. The project-creation + project-settings dialogs.
