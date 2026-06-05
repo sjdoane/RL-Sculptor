@@ -339,6 +339,27 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-05 — Ship 22e: re-skin Physics tab
+
+Frontend-only. Verified live in Chrome, real data, zero console errors.
+
+- **What**: `components/PhysicsTab.tsx` rewritten preserving ALL logic verbatim
+  (usePhysics/usePhysicsPromptEdit/usePhysicsRematerialize, the job-watch effect +
+  commit/rejection handling, the full MotorLimitsCard form: per-actuator inputs,
+  datasheet PDF upload + extract, the not-in-MJCF guard, exact applyMotorLimits
+  payload). Restyled to rs: rs-prompt hero (Prompt Claude / Motor template),
+  Motor-specs rs-card with rs-table inputs + Upload datasheet, rs-code wrapper
+  around the read-only Monaco XML viewer, RejectionCard as rs-why, parse-error
+  rs-banner + Re-materialize, SummaryPanel as rs-sysgrid (joints/actuators/geoms)
+  + rs-kv sim options + joint/actuator lists.
+- **Finding C resolution**: dropped "total mass" — summing `geoms[].body_mass`
+  double-counts (multiple geoms per body; G1 read 96.5 kg vs ~35 real). Showing
+  the accurate `geoms` count instead. joints/actuators counts are accurate.
+- **Verified**: tsc 0. Live (Chrome): real MJCF (g1_29dof, 30 joints / 29
+  actuators / timestep 0.002 / integrator implicitfast / solver newton), Monaco
+  XML with syntax highlighting, motor form + datasheet upload intact. No console
+  errors. Backend/sculptor untouched (305 / 364).
+
 ### 2026-06-04 — Ship 22d: re-skin Overview tab + RobotViewer
 
 Frontend-only. Verified live in Chrome, real data, zero console errors.
