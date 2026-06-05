@@ -339,6 +339,38 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-05 — Ship 22k: re-skin the KG dialogs (AddSeeds, Research, Paper, Graph)
+
+Frontend-only. The four Knowledge-Graph-tab dialogs.
+
+- **What** (all logic/payloads VERBATIM; only the shadcn shell → rs Modal):
+  - `AddSeedsDialog.tsx`: rs Btn trigger + Modal. ARXIV_RE validation, the
+    split-on-newline-or-comma parse, the 409-already-running branch, the R3
+    close-on-queue + onJobSubmitted handoff — verbatim. localErrors render in an
+    rs rose panel. `PendingSeedJobWatcher` (the headless completion-toast poller
+    with all the kg_research-vs-seed result branching) copied byte-for-byte.
+  - `ResearchTopicDialog.tsx`: rs Btn + Modal. topic textarea + 0/500 counter +
+    max-papers range (accent-color: var(--rs-primary)); useResearchTopic payload
+    `{topic, max_papers, auto_extract:true}` verbatim.
+  - `PaperDetailModal.tsx`: rs Modal (wide). usePaper hook; abstract + 4
+    EntityGroups (techniques/failure_modes/reward_components/environments) + the
+    not-extracted note; arxiv.org external link in the subtitle.
+  - `GraphModal.tsx`: rs Modal with new `full` + `flush` options. The pyvis
+    `<iframe sandbox>` + the `kgGraphHtmlUrl(regenerate)` useMemo + the
+    `kg_node_click` postMessage→PaperDetailModal stacking — verbatim.
+  - `rs/primitives.tsx` Modal: added `full` (95vw × calc(100vh-120px), flex-col so
+    a flex:1 body child fills height) + `flush` (zero body padding for the iframe).
+  - `rs-theme.css`: `.rs-modal.full`, `.rs-modal-body.flush`, `.rs-caption`
+    (reusable uppercase section heading).
+- **Verified**: tsc 0. Live (Chrome, KG tab): AddSeeds renders (mono textarea,
+  rose error panel "Paste at least one arxiv_id." on empty-submit), Research
+  (topic + 0/500 + orange-accent range), GraphModal `.rs-modal.full` (645px,
+  flush body, iframe filling 1366×558 at the regenerate URL). Zero console errors.
+  PaperDetail is tsc-clean + uses the same proven primitives (no KG paper present
+  on the fresh project to click-trigger it). Backend/sculptor untouched.
+  (Tab-gated surfaces can't be screenshotted this session — `captureScreenshot`
+  stalls after any client-side tab switch; verified via DOM/JS instead.)
+
 ### 2026-06-05 — Ship 22j: re-skin the mission dialogs (RunMission + MissionDetail)
 
 Frontend-only. The two mission-centric dialogs the Runs/Missions surface opens.

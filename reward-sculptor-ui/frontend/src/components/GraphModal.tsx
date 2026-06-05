@@ -1,12 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
+import { Modal } from "@/components/rs/primitives";
 import { PaperDetailModal } from "@/components/PaperDetailModal";
 import { kgGraphHtmlUrl } from "@/lib/api";
 
@@ -60,33 +54,30 @@ export function GraphModal({
 
   return (
     <>
-      <Dialog open={open} onOpenChange={onOpenChange}>
-        {/* `flex flex-col` overrides DialogContent's default `grid` so
-            the iframe's `flex-1` actually claims the remaining height.
-            Pre-fix (2026-04-23): grid + auto rows let the iframe
-            collapse to its ~300px intrinsic height, leaving the top
-            half of the modal blank. */}
-        <DialogContent className="flex h-[92vh] w-[95vw] max-w-[95vw] flex-col gap-2 p-4 sm:rounded-lg">
-          <DialogHeader className="space-y-0">
-            <DialogTitle className="text-sm">Knowledge graph</DialogTitle>
-            <DialogDescription className="text-[11px]">
-              Interactive pyvis render · drag nodes, hover for details,
-              click a paper to see its full record
-            </DialogDescription>
-          </DialogHeader>
-          <div className="min-h-0 flex-1 overflow-hidden rounded border">
+      {open && (
+        <Modal
+          full
+          flush
+          icon="network"
+          title="Knowledge graph"
+          subtitle="Interactive pyvis render · drag nodes, hover for details, click a paper to see its full record"
+          onClose={() => onOpenChange(false)}
+        >
+          {/* flex:1 wrapper so the iframe claims the body's full height
+              (rs-modal.full flexes column-wise). */}
+          <div style={{ flex: 1, minHeight: 0, overflow: "hidden", borderTop: "1px solid var(--hairline)", background: "var(--canvas)" }}>
             {iframeSrc && (
               <iframe
                 key={iframeSrc}
                 src={iframeSrc}
                 title="Knowledge graph"
-                className="h-full w-full border-0"
+                style={{ width: "100%", height: "100%", border: 0, display: "block" }}
                 sandbox="allow-scripts allow-same-origin"
               />
             )}
           </div>
-        </DialogContent>
-      </Dialog>
+        </Modal>
+      )}
       <PaperDetailModal
         slug={slug}
         arxivId={selectedArxivId}

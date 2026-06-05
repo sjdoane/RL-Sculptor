@@ -1,19 +1,8 @@
 import { useState } from "react";
-import { Loader2, Plus, AlertCircle } from "lucide-react";
 import { toast } from "sonner";
 
-import { Button } from "@/components/ui/button";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-  DialogTrigger,
-} from "@/components/ui/dialog";
-import { Label } from "@/components/ui/label";
-import { Textarea } from "@/components/ui/textarea";
+import { Icon } from "@/components/rs/icon";
+import { Btn, Field, Modal } from "@/components/rs/primitives";
 import { useAddSeeds } from "@/hooks/useKG";
 import { useJob } from "@/hooks/useJob";
 import { ApiError } from "@/lib/api";
@@ -88,66 +77,50 @@ export function AddSeedsDialog({
   };
 
   return (
-    <Dialog open={open} onOpenChange={setOpen}>
-      <DialogTrigger asChild>
-        <Button size="sm">
-          <Plus />
-          Add papers
-        </Button>
-      </DialogTrigger>
-      <DialogContent className="sm:max-w-lg">
-        <DialogHeader>
-          <DialogTitle>Add papers to the project KG</DialogTitle>
-          <DialogDescription>
-            Paste one arxiv_id per line. We'll ingest each paper (metadata
-            + PDF) and then run entity extraction via Claude.
-          </DialogDescription>
-        </DialogHeader>
-        <div className="grid gap-2">
-          <Label htmlFor="arxiv-ids">arxiv_ids</Label>
-          <Textarea
-            id="arxiv-ids"
-            value={text}
-            onChange={(e) => setText(e.target.value)}
-            placeholder={"1707.06347\n2010.04159"}
-            className="min-h-[120px] font-mono text-[12px]"
-            disabled={add.isPending}
-          />
+    <>
+      <Btn kind="primary" size="sm" icon="plus" onClick={() => setOpen(true)}>Add papers</Btn>
+      {open && (
+        <Modal
+          icon="book"
+          title="Add papers to the project KG"
+          subtitle="Paste one arxiv_id per line. We'll ingest each paper (metadata + PDF), then run entity extraction via Claude."
+          onClose={() => { if (!add.isPending) setOpen(false); }}
+          footer={
+            <>
+              <Btn kind="quiet" onClick={() => setOpen(false)} disabled={add.isPending}>Cancel</Btn>
+              <Btn kind="primary" icon={add.isPending ? "loader" : "plus"} onClick={submit} disabled={add.isPending}>
+                {add.isPending ? "Queueing…" : "Queue ingest"}
+              </Btn>
+            </>
+          }
+        >
+          <Field label="arxiv_ids" htmlFor="arxiv-ids">
+            <textarea
+              id="arxiv-ids"
+              className="rs-textarea mono"
+              value={text}
+              onChange={(e) => setText(e.target.value)}
+              placeholder={"1707.06347\n2010.04159"}
+              style={{ minHeight: 120 }}
+              disabled={add.isPending}
+              spellCheck={false}
+              autoCapitalize="off"
+              autoCorrect="off"
+            />
+          </Field>
           {localErrors.length > 0 && (
-            <ul className="space-y-0.5 rounded border border-destructive/40 bg-destructive/5 p-2 text-xs text-destructive">
+            <ul style={{ display: "flex", flexDirection: "column", gap: 3, margin: 0, padding: "8px 10px", listStyle: "none", borderRadius: "var(--radius-md)", border: "1px solid var(--st-rose-bg)", background: "var(--st-rose-bg)", color: "var(--st-rose-fg)" }}>
               {localErrors.map((e, i) => (
-                <li key={i} className="flex items-start gap-1">
-                  <AlertCircle className="mt-0.5 h-3 w-3 shrink-0" />
-                  <span className="font-mono break-words">{e}</span>
+                <li key={i} style={{ display: "flex", alignItems: "flex-start", gap: 6, fontSize: 12 }}>
+                  <span style={{ marginTop: 1, flexShrink: 0 }}><Icon name="alert-circle" size={12} /></span>
+                  <span className="mono" style={{ wordBreak: "break-word" }}>{e}</span>
                 </li>
               ))}
             </ul>
           )}
-        </div>
-        <DialogFooter>
-          <Button
-            variant="outline"
-            onClick={() => setOpen(false)}
-            disabled={add.isPending}
-          >
-            Cancel
-          </Button>
-          <Button onClick={submit} disabled={add.isPending}>
-            {add.isPending ? (
-              <>
-                <Loader2 className="h-4 w-4 animate-spin" />
-                Queueing…
-              </>
-            ) : (
-              <>
-                <Plus />
-                Queue ingest
-              </>
-            )}
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
+        </Modal>
+      )}
+    </>
   );
 }
 

@@ -307,12 +307,17 @@ const MODAL_STACK: symbol[] = [];
 
 // ── Modal (rs-scrim/rs-modal + a11y: Esc, initial focus, focus restore) ──
 export function Modal({
-  title, subtitle, icon, wide, onClose, children, footer,
+  title, subtitle, icon, wide, full, flush, onClose, children, footer,
 }: {
   title: string;
   subtitle?: ReactNode;
   icon?: string;
   wide?: boolean;
+  /** Near-fullscreen (e.g. the KG graph): rs-modal flexes column-wise so a
+   *  flex:1 body child fills the height. */
+  full?: boolean;
+  /** Remove body padding (for edge-to-edge content like an iframe). */
+  flush?: boolean;
   onClose: () => void;
   children: ReactNode;
   footer?: ReactNode;
@@ -348,7 +353,7 @@ export function Modal({
     <div className="rs-scrim" onClick={onClose}>
       <div
         ref={ref}
-        className={"rs-modal" + (wide ? " wide" : "")}
+        className={"rs-modal" + (wide ? " wide" : "") + (full ? " full" : "")}
         onClick={(e) => e.stopPropagation()}
         role="dialog"
         aria-modal="true"
@@ -365,7 +370,7 @@ export function Modal({
           </div>
           <button className="rs-modal-x" onClick={onClose} aria-label="Close"><Icon name="x" size={18} /></button>
         </div>
-        <div className="rs-modal-body">{children}</div>
+        <div className={"rs-modal-body" + (flush ? " flush" : "")}>{children}</div>
         {footer && <div className="rs-modal-foot">{footer}</div>}
       </div>
     </div>
