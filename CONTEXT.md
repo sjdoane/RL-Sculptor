@@ -339,6 +339,41 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-04 — Ship 22c: re-skin project shell + Reports + Knowledge Graph tabs
+
+Third re-skin Ship: the ProjectDetail shell (header/tabs/facts) + 2 tabs.
+Frontend-only. Verified live in Chrome, real data, zero console errors.
+
+- **What**:
+  - `pages/ProjectDetail.tsx` — rebuilt as the rs shell: `rs-phead` (back / folder /
+    name / status Badge / gear / New run), `rs-tabs` button-bar (replaces Radix
+    Tabs; role=tab + aria-selected; same local activeTab + conditional-mount
+    semantics as before — Radix already unmounted inactive content), `rs-facts`
+    chip band (adapter/robot/task/device/num_envs, hidden on Runs per prototype),
+    rs warning banners (adapter_unavailable / migration). Tabs not yet reskinned
+    (Overview/Physics/Rewards) render their existing components inside a `LegacyTab`
+    scroll wrapper (transitional — real data intact, e.g. the live MuJoCo G1 render
+    in Overview's RobotViewer). Runs/Reports stay lazy (preserved).
+  - `components/ReportsTab.tsx` — rs reskin (eyebrow/h2 header, Copy/Download/Build
+    buttons, rs-viewer for the real final.mp4 + `.rs-md` for react-markdown). Keeps
+    fetchReportMd/buildReport + query key + default export.
+  - `components/KnowledgeGraphTab.tsx` — rs reskin (papers list with search, real
+    techniques browser via useTechniques, pending seeds, interactive-graph card →
+    GraphModal). Keeps ALL actions (View graph, Bulk-seed, Heal stubs, AddSeeds,
+    ResearchTopic) + PaperDetailModal + PendingSeedJobWatcher. **Fix**: the shared
+    KG has 468 techniques; rendering them all as chips froze the renderer
+    (captureScreenshot timed out twice) — capped to top-60 by usage in a 240px
+    scroll band (Finding D: failure-modes/reward-components have no list endpoint,
+    so techniques-only).
+- **Why**: bring the project view into the new design; ship the 2 simplest tabs.
+- **Verified**: tsc 0. Live (Chrome): project shell with real facts (mjlab / Unitree
+  G1 / Mjlab-Velocity-Flat-Unitree-G1 / cuda:0 / 1,024); KG tab with real papers
+  (mjlab, Co-jump, ASAP…) + techniques; Reports empty-state. No console errors.
+  Backend/sculptor untouched (305 / 364).
+- **Transitional (next ships)**: header dialog triggers (gear / New run) are still
+  the existing shadcn ones → reskinned with the dialogs in 22e. Overview viewer +
+  Physics + Rewards + Runs reskins in 22d/22e.
+
 ### 2026-06-04 — Ship 22b: re-skin shell + landing screens (+ ProjectSummary enrichment)
 
 Second re-skin Ship: the global shell + the three non-project screens, plus the
