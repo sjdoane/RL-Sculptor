@@ -339,6 +339,45 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-05 — Ship 22j: re-skin the mission dialogs (RunMission + MissionDetail)
+
+Frontend-only. The two mission-centric dialogs the Runs/Missions surface opens.
+
+- **What**:
+  - `components/RunMissionDialog.tsx` rewritten onto rs `Modal`. ALL logic VERBATIM:
+    the Ship-21a `appliedDefaults` pre-fill effect (mission.run_defaults → fields,
+    falling back to `suggestedIters`), `submit` body construction (the
+    iterations_override≠suggested guard + the early-stop / extend opt-in blocks),
+    the eta estimate. Inputs now render via the shared `MissionAdvanced` (reused
+    from NewMissionDialog — single source of truth for the 9 MissionRunDefaults
+    controls). The optional `trigger` prop is honored (wrapped to open on click);
+    default trigger is an rs Btn.
+  - `components/MissionDetailDialog.tsx` rewritten onto rs `Modal` (wide). ALL
+    logic VERBATIM: `useMission`/`useDeleteMission`/`useMissionEvents`, the
+    `wsEnabled` + `isDecomposing` gating (Ship 18a/19c), `computeStageDepths`
+    (cycle-safe DFS), `deriveStageIters` (Ship 19c WS attribution), `deriveStage
+    EffectiveMaxIters` (Ship 20 #2), StageCard's 3-level effective-max-iters
+    fallback chain + override tooltip/aria, `describeEvent`, the LogScroller
+    autoscroll-detach. Restyled: lifecycle/stage/ws status → rs Badge (STATUS_META
+    already covers ready/running/completed/halted/errored + pending/training/
+    succeeded/failed/skipped); decomposing/error/interrupt banners → rs Banner;
+    StageCard → rs card with mono name + success_criterion code panel + meta row +
+    IterRibbon; structured-event list + log_line scroller → dark rs-log panels
+    (matching the Runs-tab LogViewer) with category-colored event tags. `Mission
+    LifecycleBadge` kept exported (now a thin rs Badge wrapper).
+  - `rs/primitives.tsx` Modal: added a module-level MODAL_STACK so only the
+    TOPMOST modal handles Escape (RunMission nests inside MissionDetail); made the
+    effect mount-once via an onCloseRef (no focus-thrash on inline onClose).
+  - `rs-theme.css`: `.rs-pulse-soft` opacity-pulse utility (live iter chip;
+    reduced-motion-safe via the global `*{animation-duration}` rule).
+- **Verified**: tsc 0. Zero console errors. Logic byte-for-byte preserved; the
+  visual layer uses primitives already live-proven in Ships 22f-22h (Modal in 22i,
+  Badge/Banner/rs-log in 22g/22h). Full end-to-end exercise (create a real mission
+  → decomposing state → StageCards → RunMission config → delete) is deferred to the
+  22n audit ship, which spins up one throwaway mission to drive the whole pipeline.
+  (Runs-tab `captureScreenshot` stalls in this Chrome session — a pre-existing
+  CDP/compositor quirk independent of these changes.) Backend/sculptor untouched.
+
 ### 2026-06-05 — Ship 22i: re-skin the launch dialogs (NewMission + NewRun)
 
 Frontend-only. First of the dialog-reskin sweep — the two run-launch dialogs the

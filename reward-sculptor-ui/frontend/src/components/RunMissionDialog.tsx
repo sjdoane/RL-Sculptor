@@ -1,26 +1,15 @@
 import { useEffect, useMemo, useState } from "react";
-import { Loader2, Play } from "lucide-react";
 import { toast } from "sonner";
 
-import { Button } from "@/components/ui/button";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-  DialogTrigger,
-} from "@/components/ui/dialog";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
+import { MissionAdvanced } from "@/components/NewMissionDialog";
+import { Btn, Modal } from "@/components/rs/primitives";
 import { useRunMission, type RunMissionVariables } from "@/hooks/useMissions";
 import { ApiError, type RunMissionRequestBody } from "@/lib/api";
 import type { MissionDetail } from "@/lib/types";
 
 /** Per-launch configuration for a mission run.
  *
- * Three regions:
+ * Three regions (rendered via the shared MissionAdvanced):
  *   1. Iteration overrides (max-iters per stage, steps_per_iter, seed).
  *   2. Adaptive early-finish: stop a stage when its goal is met.
  *   3. Adaptive extension: keep training a stage that's still improving.
@@ -42,9 +31,8 @@ export function RunMissionDialog({
   mission: MissionDetail | null | undefined;
   disabled?: boolean;
   disabledTitle?: string;
-  /** Optional custom trigger element (e.g., the existing "Run mission"
-   *  button styled to match the dialog footer). When omitted a
-   *  default Play-icon button is used. */
+  /** Optional custom trigger element. When omitted a default Play-icon
+   *  button is used. Clicking the trigger opens the dialog. */
   trigger?: React.ReactNode;
 }) {
   const [open, setOpen] = useState(false);
@@ -189,277 +177,50 @@ export function RunMissionDialog({
   }, [iterations, mission, suggestedIters]);
 
   return (
-    <Dialog
-      open={open}
-      onOpenChange={(o) => {
-        if (disabled && o) return;
-        setOpen(o);
-      }}
-    >
-      <DialogTrigger asChild>
-        {trigger ?? (
-          <Button
-            variant="outline"
-            disabled={disabled}
-            title={disabledTitle}
-          >
-            <Play className="h-3.5 w-3.5" />
-            Run mission
-          </Button>
-        )}
-      </DialogTrigger>
-      <DialogContent className="sm:max-w-xl">
-        <DialogHeader>
-          <DialogTitle>Configure mission run</DialogTitle>
-          <DialogDescription className="text-[11px]">
-            Settings apply to <strong>every stage</strong> of this
-            mission run. Defaults match the curriculum Claude planned;
-            tweak to speed up testing or run an overnight job. The
-            two adaptive options below are independent opt-ins.
-          </DialogDescription>
-        </DialogHeader>
-
-        <div className="space-y-3">
-          {/* ── Iteration overrides ─────────────────────────────────── */}
-          <section className="rounded-md border bg-muted/20 p-3">
-            <h3 className="mb-2 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
-              Iteration overrides
-            </h3>
-            <div className="grid grid-cols-3 gap-2">
-              <div className="grid gap-1">
-                <Label htmlFor="iters" className="text-[11px]">
-                  Rounds per stage
-                </Label>
-                <Input
-                  id="iters"
-                  type="number"
-                  min={1}
-                  max={200}
-                  value={iterations}
-                  onChange={(e) => {
-                    const v = e.target.value;
-                    setIterations(v === "" ? "" : Number(v));
-                  }}
-                  disabled={run.isPending}
-                  placeholder={suggestedIters?.toString() ?? "3"}
-                />
-                <p className="text-[10px] text-muted-foreground">
-                  Train→evaluate→edit cycles. Smaller = faster test.
-                </p>
-              </div>
-              <div className="grid gap-1">
-                <Label htmlFor="steps" className="text-[11px]">
-                  Steps per round
-                </Label>
-                <Input
-                  id="steps"
-                  type="number"
-                  min={100}
-                  max={200000}
-                  value={stepsPerIter}
-                  onChange={(e) => {
-                    const v = e.target.value;
-                    setStepsPerIter(v === "" ? "" : Number(v));
-                  }}
-                  disabled={run.isPending}
-                  placeholder="project default"
-                />
-                <p className="text-[10px] text-muted-foreground">
-                  Training steps inside one round. Leave blank to
-                  use the project's default.
-                </p>
-              </div>
-              <div className="grid gap-1">
-                <Label htmlFor="rseed" className="text-[11px]">
-                  Seed
-                </Label>
-                <Input
-                  id="rseed"
-                  type="number"
-                  min={0}
-                  value={seed}
-                  onChange={(e) => {
-                    const v = e.target.value;
-                    setSeed(v === "" ? "" : Number(v));
-                  }}
-                  disabled={run.isPending}
-                  placeholder="42"
-                />
-                <p className="text-[10px] text-muted-foreground">
-                  Per-round base seed.
-                </p>
-              </div>
-            </div>
-            {eta !== null && (
-              <p className="mt-2 text-[10px] text-muted-foreground">
-                Rough estimate — ~{eta} rounds across{" "}
-                {mission?.stages?.length ?? 0} stage(s); multiply by
-                your per-round wall-clock (Cartpole ≈30 s, G1 ≈25 min).
-              </p>
-            )}
-          </section>
-
-          {/* ── Adaptive early-finish ───────────────────────────────── */}
-          <section className="rounded-md border bg-muted/20 p-3">
-            <label className="flex cursor-pointer items-start gap-2 text-[11px]">
-              <input
-                type="checkbox"
-                className="mt-0.5"
-                checked={earlyStopOnCriterion}
-                onChange={(e) => setEarlyStopOnCriterion(e.target.checked)}
-                disabled={run.isPending}
-              />
-              <span>
-                <span className="font-semibold">
-                  Stop when the goal is met
-                </span>
-                <p className="mt-0.5 text-[10.5px] font-normal text-muted-foreground">
-                  Exit a stage as soon as its{" "}
-                  <code>success_criterion</code> holds, instead of
-                  running every round in the budget. Default off.
-                </p>
-              </span>
-            </label>
-            {earlyStopOnCriterion && (
-              <div className="ml-6 mt-2 grid gap-1">
-                <Label htmlFor="stab" className="text-[11px]">
-                  Stability window
-                </Label>
-                <Input
-                  id="stab"
-                  type="number"
-                  min={1}
-                  max={10}
-                  value={stabilityWindow}
-                  onChange={(e) => {
-                    const v = e.target.value;
-                    setStabilityWindow(v === "" ? "" : Number(v));
-                  }}
-                  disabled={run.isPending}
-                  className="w-24"
-                />
-                <p className="text-[10px] text-muted-foreground">
-                  Consecutive rounds the criterion must hold before
-                  exiting. <code>1</code> = exit on first pass; bump
-                  to <code>2-3</code> for noisy metrics.
-                </p>
-              </div>
-            )}
-          </section>
-
-          {/* ── Adaptive extension ──────────────────────────────────── */}
-          <section className="rounded-md border bg-muted/20 p-3">
-            <label className="flex cursor-pointer items-start gap-2 text-[11px]">
-              <input
-                type="checkbox"
-                className="mt-0.5"
-                checked={extendOnImprovement}
-                onChange={(e) => setExtendOnImprovement(e.target.checked)}
-                disabled={run.isPending}
-              />
-              <span>
-                <span className="font-semibold">
-                  Keep training while still improving
-                </span>
-                <p className="mt-0.5 text-[10.5px] font-normal text-muted-foreground">
-                  If a stage runs out of rounds but the metric is still
-                  trending up, grant extra rounds. Default off. Will
-                  not extend if the metric has plateaued.
-                </p>
-              </span>
-            </label>
-            {extendOnImprovement && (
-              <div className="ml-6 mt-2 grid grid-cols-3 gap-2">
-                <div className="grid gap-1">
-                  <Label htmlFor="ext-max" className="text-[11px]">
-                    Max extensions
-                  </Label>
-                  <Input
-                    id="ext-max"
-                    type="number"
-                    min={0}
-                    max={3}
-                    value={maxExtensions}
-                    onChange={(e) => {
-                      const v = e.target.value;
-                      setMaxExtensions(v === "" ? "" : Number(v));
-                    }}
-                    disabled={run.isPending}
-                  />
-                  <p className="text-[10px] text-muted-foreground">
-                    Hard cap (≤ 3).
-                  </p>
-                </div>
-                <div className="grid gap-1">
-                  <Label htmlFor="ext-factor" className="text-[11px]">
-                    Factor
-                  </Label>
-                  <Input
-                    id="ext-factor"
-                    type="number"
-                    step={0.1}
-                    min={0.1}
-                    max={1.5}
-                    value={extensionFactor}
-                    onChange={(e) => {
-                      const v = e.target.value;
-                      setExtensionFactor(v === "" ? "" : Number(v));
-                    }}
-                    disabled={run.isPending}
-                  />
-                  <p className="text-[10px] text-muted-foreground">
-                    × max-iters per extension.
-                  </p>
-                </div>
-                <div className="grid gap-1">
-                  <Label htmlFor="ext-thresh" className="text-[11px]">
-                    Threshold
-                  </Label>
-                  <Input
-                    id="ext-thresh"
-                    type="number"
-                    step={0.01}
-                    min={0}
-                    max={1}
-                    value={extensionThreshold}
-                    onChange={(e) => {
-                      const v = e.target.value;
-                      setExtensionThreshold(v === "" ? "" : Number(v));
-                    }}
-                    disabled={run.isPending}
-                  />
-                  <p className="text-[10px] text-muted-foreground">
-                    Recent vs prior best.
-                  </p>
-                </div>
-              </div>
-            )}
-          </section>
-        </div>
-
-        <DialogFooter>
-          <Button
-            variant="outline"
-            onClick={() => setOpen(false)}
+    <>
+      {trigger ? (
+        <span style={{ display: "contents" }} onClick={() => { if (!disabled) setOpen(true); }}>{trigger}</span>
+      ) : (
+        <Btn kind="ghost" icon="play" disabled={disabled} title={disabledTitle} onClick={() => setOpen(true)}>
+          Run mission
+        </Btn>
+      )}
+      {open && (
+        <Modal
+          title="Configure mission run"
+          subtitle="Applies to every stage. Defaults match the curriculum Claude planned; the two adaptive options are independent opt-ins."
+          icon="play"
+          onClose={() => { if (!run.isPending) setOpen(false); }}
+          footer={
+            <>
+              <Btn kind="quiet" onClick={() => setOpen(false)} disabled={run.isPending}>Cancel</Btn>
+              <Btn kind="primary" icon={run.isPending ? "loader" : "play"} onClick={submit} disabled={run.isPending}>
+                {run.isPending ? "Launching…" : "Launch"}
+              </Btn>
+            </>
+          }
+        >
+          <MissionAdvanced
             disabled={run.isPending}
-          >
-            Cancel
-          </Button>
-          <Button onClick={submit} disabled={run.isPending}>
-            {run.isPending ? (
-              <>
-                <Loader2 className="h-4 w-4 animate-spin" />
-                Launching…
-              </>
-            ) : (
-              <>
-                <Play />
-                Launch
-              </>
-            )}
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
+            iterations={iterations} setIterations={setIterations}
+            stepsPerIter={stepsPerIter} setStepsPerIter={setStepsPerIter}
+            seed={seed} setSeed={setSeed}
+            earlyStopOnCriterion={earlyStopOnCriterion} setEarlyStopOnCriterion={setEarlyStopOnCriterion}
+            stabilityWindow={stabilityWindow} setStabilityWindow={setStabilityWindow}
+            extendOnImprovement={extendOnImprovement} setExtendOnImprovement={setExtendOnImprovement}
+            maxExtensions={maxExtensions} setMaxExtensions={setMaxExtensions}
+            extensionFactor={extensionFactor} setExtensionFactor={setExtensionFactor}
+            extensionThreshold={extensionThreshold} setExtensionThreshold={setExtensionThreshold}
+            showIterationsHint={suggestedIters?.toString() ?? "3"}
+          />
+          {eta !== null && (
+            <p className="rs-hintline" style={{ marginTop: 4 }}>
+              Rough estimate — ~{eta} rounds across {mission?.stages?.length ?? 0} stage(s); multiply by
+              your per-round wall-clock (Cartpole ≈ 30 s, G1 ≈ 25 min).
+            </p>
+          )}
+        </Modal>
+      )}
+    </>
   );
 }

@@ -136,6 +136,9 @@ input, textarea, select { font: inherit; color: inherit; }
 .rs-dot.live { background: var(--st-amber); box-shadow: 0 0 0 0 rgba(217,131,36,.5); animation: rs-pulse 1.6s infinite; }
 [data-theme="dark"] .rs-dot.live { box-shadow: 0 0 0 0 rgba(230,162,60,.5); }
 @keyframes rs-pulse { 0% { box-shadow: 0 0 0 0 rgba(217,131,36,.5); } 70% { box-shadow: 0 0 0 6px rgba(217,131,36,0); } 100% { box-shadow: 0 0 0 0 rgba(217,131,36,0); } }
+/* gentle opacity pulse for "live"/in-progress chips (reduced-motion safe via the global *{animation-duration} rule) */
+.rs-pulse-soft { animation: rs-pulse-soft 1.6s ease-in-out infinite; }
+@keyframes rs-pulse-soft { 0%, 100% { opacity: 1; } 50% { opacity: 0.55; } }
 
 /* ---------- Chips (facts band) ---------- */
 .rs-facts { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 12px 32px;

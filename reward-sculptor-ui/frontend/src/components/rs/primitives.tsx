@@ -300,6 +300,11 @@ export function Skel({
   return <div className="rs-skel" style={{ width: w, height: h, borderRadius: r, ...style }} />;
 }
 
+// Stack of mounted Modals so only the TOPMOST handles Escape — required
+// because Modals can nest (e.g. RunMission inside MissionDetail) and each
+// registers a global keydown listener.
+const MODAL_STACK: symbol[] = [];
+
 // ── Modal (rs-scrim/rs-modal + a11y: Esc, initial focus, focus restore) ──
 export function Modal({
   title, subtitle, icon, wide, onClose, children, footer,
@@ -313,9 +318,20 @@ export function Modal({
   footer?: ReactNode;
 }) {
   const ref = useRef<HTMLDivElement>(null);
+  // Latest onClose via ref so the mount-once effect never re-binds (avoids
+  // focus-thrash when the parent passes an inline arrow for onClose).
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
   useEffect(() => {
+    const id = Symbol("modal");
+    MODAL_STACK.push(id);
     const prev = document.activeElement as HTMLElement | null;
-    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && MODAL_STACK[MODAL_STACK.length - 1] === id) {
+        e.stopPropagation();
+        onCloseRef.current();
+      }
+    };
     window.addEventListener("keydown", onKey);
     const focusable = ref.current?.querySelector<HTMLElement>(
       'button:not([disabled]), [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
@@ -323,9 +339,11 @@ export function Modal({
     (focusable ?? ref.current)?.focus();
     return () => {
       window.removeEventListener("keydown", onKey);
+      const i = MODAL_STACK.indexOf(id);
+      if (i >= 0) MODAL_STACK.splice(i, 1);
       prev?.focus?.();
     };
-  }, [onClose]);
+  }, []);
   return (
     <div className="rs-scrim" onClick={onClose}>
       <div

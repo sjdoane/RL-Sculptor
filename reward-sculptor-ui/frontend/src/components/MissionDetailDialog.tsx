@@ -1,28 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import {
-  AlertTriangle,
-  CheckCircle2,
-  CircleDot,
-  Hourglass,
-  Loader2,
-  Play,
-  Radio,
-  StopCircle,
-  Trash2,
-  XCircle,
-} from "lucide-react";
 import { toast } from "sonner";
 
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
+import { Icon } from "@/components/rs/icon";
+import { Badge, Banner, Btn, Modal } from "@/components/rs/primitives";
 import {
   useDeleteMission,
   useMission,
@@ -30,7 +10,7 @@ import {
 import { RunMissionDialog } from "@/components/RunMissionDialog";
 import { useMissionEvents } from "@/hooks/useMissionEvents";
 import { ApiError } from "@/lib/api";
-import { cn, formatRelative } from "@/lib/utils";
+import { formatRelative } from "@/lib/utils";
 import type {
   MissionEvent,
   MissionLifecycleStatus,
@@ -124,312 +104,188 @@ export function MissionDetailDialog({
     [events.structuredEvents],
   );
 
+  if (!open) return null;
+
+  const showEvents =
+    wsEnabled ||
+    events.logLines.length > 0 ||
+    events.structuredEvents.length > 0;
+
   return (
-    <Dialog open={open} onOpenChange={onOpenChange}>
-      <DialogContent className="flex max-h-[90vh] flex-col gap-4 sm:max-w-3xl">
-        <DialogHeader>
-          <DialogTitle className="flex items-center gap-2">
-            <span className="truncate">
-              {liveSummary?.goal ?? "Mission"}
-            </span>
-            {liveSummary && (
-              <MissionLifecycleBadge lifecycle={liveSummary.lifecycle} />
-            )}
-          </DialogTitle>
-          <DialogDescription className="font-mono text-[11px]">
+    <Modal
+      wide
+      icon="target"
+      title={liveSummary?.goal ?? "Mission"}
+      subtitle={
+        <span style={{ display: "inline-flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+          <span className="mono">
             {liveSummary
               ? `${liveSummary.mission_slug} · ${liveSummary.current_stage_idx}/${liveSummary.n_stages} stages · created ${formatRelative(liveSummary.created_at)}`
               : "Loading…"}
-          </DialogDescription>
-        </DialogHeader>
+          </span>
+          {liveSummary && <MissionLifecycleBadge lifecycle={liveSummary.lifecycle} />}
+        </span>
+      }
+      onClose={() => onOpenChange(false)}
+      footer={
+        <>
+          <div style={{ display: "flex", gap: 8 }}>
+            {liveSummary && (
+              <Btn
+                kind="danger"
+                icon={del.isPending ? "loader" : "trash"}
+                disabled={del.isPending || activeJobId != null}
+                title={activeJobId ? "Already training. Wait for the run to finish before deleting." : undefined}
+                onClick={() => {
+                  if (!missionSlug) return;
+                  const ok = window.confirm(
+                    `Delete mission ${missionSlug}? On-disk artifacts (.missions/${missionSlug}/) will be removed; the project itself stays. This is destructive.`,
+                  );
+                  if (!ok) return;
+                  del.mutate(missionSlug, {
+                    onSuccess: (r) => {
+                      onOpenChange(false);
+                      toast.success("Mission deleted", {
+                        description: `freed ${(r.freed_bytes / 1_048_576).toFixed(1)} MiB`,
+                      });
+                    },
+                    onError: (err) => {
+                      const detailMsg =
+                        err instanceof ApiError
+                          ? err.problem.detail ?? err.problem.title
+                          : err.message;
+                      toast.error("Could not delete mission", { description: detailMsg });
+                    },
+                  });
+                }}
+              >
+                Delete
+              </Btn>
+            )}
+          </div>
+          <div style={{ display: "flex", gap: 8 }}>
+            {mission && mission.lifecycle !== "errored" && missionSlug && (
+              <RunMissionDialog
+                slug={slug}
+                missionSlug={missionSlug}
+                mission={mission}
+                disabled={mission.lifecycle !== "ready" || activeJobId != null}
+                disabledTitle={
+                  mission.lifecycle !== "ready"
+                    ? `Run is only allowed once planning finishes (currently ${mission.lifecycle}).`
+                    : activeJobId
+                      ? "Already training. Wait for the run to finish."
+                      : undefined
+                }
+              />
+            )}
+            <Btn kind="primary" onClick={() => onOpenChange(false)}>Close</Btn>
+          </div>
+        </>
+      }
+    >
+      {/* §Ship-19c: while a mission is being decomposed, mission.json
+          doesn't exist yet so the GET returns 404. Don't surface
+          that as a destructive error — render a "Decomposing"
+          placeholder + the live WS event stream below so the user
+          sees Claude's stdout in real time. */}
+      {detail.isLoading && !mission && !isDecomposing && (
+        <p className="rs-sub" style={{ fontSize: 13 }}>Loading mission…</p>
+      )}
+      {isDecomposing && !mission && (
+        <Banner kind="warn" icon="loader">
+          <span style={{ fontWeight: 600, display: "block" }}>Planning — Claude is breaking your goal into stages</span>
+          <span style={{ fontSize: 12 }}>Typically 30-90 s. Stages will appear here when planning finishes. Live progress streams below.</span>
+        </Banner>
+      )}
+      {/* §Ship 21a defense-in-depth: only the genuinely-failed-404 case. */}
+      {detail.error && !isDecomposing && !liveSummary && (
+        <Banner kind="err" icon="alert-triangle">
+          <span className="mono" style={{ fontSize: 12 }}>{(detail.error as Error).message}</span>
+        </Banner>
+      )}
 
-        <div className="flex min-h-0 flex-col gap-3 overflow-y-auto pr-1 scrollbar-thin">
-          {/* §Ship-19c: while a mission is being decomposed, mission.json
-              doesn't exist yet so the GET returns 404. Don't surface
-              that as a destructive error — render a "Decomposing"
-              placeholder + the live WS event stream below so the user
-              sees Claude's stdout in real time. */}
-          {detail.isLoading && !mission && !isDecomposing && (
-            <p className="text-sm text-muted-foreground">Loading mission…</p>
+      {mission?.lifecycle === "errored" && (
+        <Banner kind="err" icon="alert-triangle">
+          <span style={{ fontWeight: 600, display: "block" }}>mission.json is unreadable</span>
+          <span style={{ fontSize: 12 }}>The on-disk mission file failed to parse. The mission can still be deleted to recover the slug.</span>
+        </Banner>
+      )}
+
+      {mission?.decomposition_rationale && (
+        <section>
+          <PHead>Decomposition rationale</PHead>
+          <p style={{ whiteSpace: "pre-wrap", border: "1px solid var(--hairline)", borderRadius: "var(--radius-md)", background: "var(--surface-strong)", padding: 12, fontSize: 12.5, lineHeight: 1.55, margin: 0 }}>
+            {mission.decomposition_rationale}
+          </p>
+        </section>
+      )}
+
+      {mission && mission.stages.length > 0 && (
+        <section>
+          <PHead>Stages ({mission.current_stage_idx}/{mission.n_stages})</PHead>
+          <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
+            {mission.stages.map((s, idx) => (
+              <StageCard
+                key={s.name}
+                stage={s}
+                depth={stageDepths.get(s.name) ?? 0}
+                isCurrent={idx === mission.current_stage_idx}
+                iters={stageIters.get(s.name) ?? []}
+                effectiveMaxIters={stageEffectiveMaxIters.get(s.name) ?? null}
+              />
+            ))}
+          </div>
+        </section>
+      )}
+
+      {showEvents && (
+        <section style={{ display: "flex", flexDirection: "column", gap: 9 }}>
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+            <PHead noMargin>Live events</PHead>
+            <WsStatusChip events={events} />
+          </div>
+
+          {events.disconnected && !events.terminal && (
+            <Banner kind="warn" icon="alert-circle">Live stream interrupted. Refresh to reconnect.</Banner>
           )}
-          {isDecomposing && !mission && (
-            <div className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/5 p-3 text-xs">
-              <Loader2 className="mt-0.5 h-4 w-4 shrink-0 animate-spin text-amber-700" />
-              <div>
-                <div className="font-medium text-amber-700 dark:text-amber-300">
-                  Planning — Claude is breaking your goal into stages
-                </div>
-                <p className="mt-0.5 text-[11px] text-muted-foreground">
-                  Typically 30-90 s. Stages will appear here when
-                  planning finishes. Live progress streams below.
-                </p>
-              </div>
-            </div>
-          )}
-          {/* §Ship 21a defense-in-depth: only render the destructive
-              error banner when (a) the GET genuinely failed AND (b)
-              we have neither a mission nor a summary fallback. The
-              backend now returns a "decomposing" stub when the slug
-              is reserved but mission.json hasn't been written yet, so
-              this branch should rarely fire in practice — kept as a
-              guard for true 404s (e.g., the user pasted a deep-link
-              for a deleted mission). */}
-          {detail.error && !isDecomposing && !liveSummary && (
-            <p className="rounded border border-destructive/40 bg-destructive/5 p-2 font-mono text-[11px] text-destructive">
-              {(detail.error as Error).message}
-            </p>
+          {events.noActiveJob && (
+            <Banner kind="info" icon="info">Nothing running. Launch a run to watch live events.</Banner>
           )}
 
-          {mission?.lifecycle === "errored" && (
-            <div className="flex items-start gap-2 rounded-md border border-rose-500/40 bg-rose-500/5 p-3 text-xs">
-              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-rose-600" />
-              <div>
-                <div className="font-medium text-rose-700 dark:text-rose-300">
-                  mission.json is unreadable
-                </div>
-                <p className="mt-0.5 text-[11px] text-muted-foreground">
-                  The on-disk mission file failed to parse. The mission
-                  can still be deleted to recover the slug.
-                </p>
-              </div>
-            </div>
+          {events.structuredEvents.length > 0 && (
+            <StructuredEventList events={events.structuredEvents} />
           )}
-
-          {mission?.decomposition_rationale && (
-            <section>
-              <h3 className="mb-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
-                Decomposition rationale
-              </h3>
-              <p className="whitespace-pre-wrap rounded border bg-muted/30 p-3 text-xs">
-                {mission.decomposition_rationale}
-              </p>
-            </section>
+          {(events.logLines.length > 0 || wsEnabled) && (
+            <LogScroller events={events.logLines} />
           )}
-
-          {mission && mission.stages.length > 0 && (
-            <section>
-              <h3 className="mb-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
-                Stages ({mission.current_stage_idx}/{mission.n_stages})
-              </h3>
-              <div className="flex flex-col gap-1.5">
-                {mission.stages.map((s, idx) => (
-                  <StageCard
-                    key={s.name}
-                    stage={s}
-                    depth={stageDepths.get(s.name) ?? 0}
-                    isCurrent={idx === mission.current_stage_idx}
-                    iters={stageIters.get(s.name) ?? []}
-                    effectiveMaxIters={
-                      stageEffectiveMaxIters.get(s.name) ?? null
-                    }
-                  />
-                ))}
-              </div>
-            </section>
-          )}
-
-          {(wsEnabled ||
-            events.logLines.length > 0 ||
-            events.structuredEvents.length > 0) && (
-            <section className="flex min-h-0 flex-col gap-2">
-              <div className="flex items-center justify-between">
-                <h3 className="text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
-                  Live events
-                </h3>
-                <WsStatusChip events={events} />
-              </div>
-
-              {events.disconnected && !events.terminal && (
-                <div className="rounded border border-amber-500/40 bg-amber-500/5 p-2 text-[11px] text-amber-800 dark:text-amber-200">
-                  Live stream interrupted. Refresh to reconnect.
-                </div>
-              )}
-              {events.noActiveJob && (
-                <div className="rounded border bg-muted/30 p-2 text-[11px] text-muted-foreground">
-                  Nothing running. Launch a run to watch live events.
-                </div>
-              )}
-
-              {events.structuredEvents.length > 0 && (
-                <StructuredEventList events={events.structuredEvents} />
-              )}
-              {(events.logLines.length > 0 || wsEnabled) && (
-                <LogScroller events={events.logLines} />
-              )}
-            </section>
-          )}
-        </div>
-
-        <DialogFooter className="border-t pt-3">
-          {mission && mission.lifecycle !== "errored" && missionSlug && (
-            <RunMissionDialog
-              slug={slug}
-              missionSlug={missionSlug}
-              mission={mission}
-              disabled={
-                mission.lifecycle !== "ready" || activeJobId != null
-              }
-              disabledTitle={
-                mission.lifecycle !== "ready"
-                  ? `Run is only allowed once planning finishes (currently ${mission.lifecycle}).`
-                  : activeJobId
-                    ? "Already training. Wait for the run to finish."
-                    : undefined
-              }
-            />
-          )}
-          {liveSummary && (
-            <Button
-              variant="outline"
-              onClick={() => {
-                if (!missionSlug) return;
-                const ok = window.confirm(
-                  `Delete mission ${missionSlug}? On-disk artifacts (.missions/${missionSlug}/) will be removed; the project itself stays. This is destructive.`,
-                );
-                if (!ok) return;
-                del.mutate(missionSlug, {
-                  onSuccess: (r) => {
-                    onOpenChange(false);
-                    toast.success("Mission deleted", {
-                      description: `freed ${(r.freed_bytes / 1_048_576).toFixed(1)} MiB`,
-                    });
-                  },
-                  onError: (err) => {
-                    const detailMsg =
-                      err instanceof ApiError
-                        ? err.problem.detail ?? err.problem.title
-                        : err.message;
-                    toast.error("Could not delete mission", {
-                      description: detailMsg,
-                    });
-                  },
-                });
-              }}
-              disabled={del.isPending || activeJobId != null}
-              title={
-                activeJobId
-                  ? "Already training. Wait for the run to finish before deleting."
-                  : undefined
-              }
-            >
-              {del.isPending ? (
-                <Loader2 className="h-4 w-4 animate-spin" />
-              ) : (
-                <Trash2 />
-              )}
-              Delete
-            </Button>
-          )}
-          <Button onClick={() => onOpenChange(false)}>Close</Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
+        </section>
+      )}
+    </Modal>
   );
 }
 
-// ── lifecycle / status badges ────────────────────────────────────────
+// Small uppercase section heading (replaces the shadcn h3 muted caption).
+function PHead({ children, noMargin }: { children: React.ReactNode; noMargin?: boolean }) {
+  return (
+    <h3 style={{ margin: noMargin ? 0 : "0 0 7px", fontSize: 10.5, fontWeight: 600, letterSpacing: 0.6, textTransform: "uppercase", color: "var(--rs-muted)" }}>
+      {children}
+    </h3>
+  );
+}
 
-const LIFECYCLE_STYLES: Record<
-  MissionLifecycleStatus,
-  {
-    label: string;
-    cls: string;
-    icon: React.ComponentType<{ className?: string }>;
-  }
-> = {
-  ready: {
-    label: "ready",
-    cls: "bg-emerald-50 text-emerald-700 border-emerald-200",
-    icon: Hourglass,
-  },
-  running: {
-    label: "running",
-    cls: "bg-amber-50 text-amber-700 border-amber-200",
-    icon: Radio,
-  },
-  completed: {
-    label: "completed",
-    cls: "bg-sky-50 text-sky-700 border-sky-200",
-    icon: CheckCircle2,
-  },
-  halted: {
-    label: "halted",
-    cls: "bg-slate-100 text-slate-600 border-slate-200",
-    icon: StopCircle,
-  },
-  errored: {
-    label: "errored",
-    cls: "bg-rose-50 text-rose-700 border-rose-200",
-    icon: AlertTriangle,
-  },
-};
+// ── lifecycle / status badges (rs Badge — STATUS_META covers both) ────
 
 export function MissionLifecycleBadge({
   lifecycle,
 }: {
   lifecycle: MissionLifecycleStatus;
 }) {
-  const m = LIFECYCLE_STYLES[lifecycle];
-  const Icon = m.icon;
-  return (
-    <span
-      role="status"
-      aria-label={`mission lifecycle: ${m.label}`}
-      className={cn(
-        "inline-flex items-center gap-1 rounded-sm border px-1 py-0.5 text-[9px] font-semibold uppercase tracking-wide",
-        m.cls,
-        lifecycle === "running" && "motion-safe:animate-pulse",
-      )}
-    >
-      <Icon className="h-2.5 w-2.5" />
-      {m.label}
-    </span>
-  );
+  return <Badge status={lifecycle} />;
 }
 
-const STAGE_STATUS_STYLES: Record<
-  StageStatus,
-  { cls: string; icon: React.ComponentType<{ className?: string }> }
-> = {
-  pending: {
-    cls: "bg-muted text-muted-foreground border-border",
-    icon: CircleDot,
-  },
-  training: {
-    cls: "bg-amber-50 text-amber-700 border-amber-200",
-    icon: Radio,
-  },
-  succeeded: {
-    cls: "bg-emerald-50 text-emerald-700 border-emerald-200",
-    icon: CheckCircle2,
-  },
-  failed: {
-    cls: "bg-rose-50 text-rose-700 border-rose-200",
-    icon: XCircle,
-  },
-  skipped: {
-    cls: "bg-slate-100 text-slate-600 border-slate-200",
-    icon: StopCircle,
-  },
-};
-
 function StageStatusBadge({ status }: { status: StageStatus }) {
-  const m = STAGE_STATUS_STYLES[status];
-  const Icon = m.icon;
-  return (
-    <span
-      role="status"
-      aria-label={`stage status: ${status}`}
-      className={cn(
-        "inline-flex items-center gap-1 rounded-sm border px-1 py-0.5 text-[9px] font-semibold uppercase tracking-wide",
-        m.cls,
-        status === "training" && "motion-safe:animate-pulse",
-      )}
-    >
-      <Icon className="h-2.5 w-2.5" />
-      {status}
-    </span>
-  );
+  return <Badge status={status} />;
 }
 
 // ── stage tree depth (DFS, cycle-safe) ───────────────────────────────
@@ -609,44 +465,33 @@ function StageCard({
     : undefined;
   return (
     <div
-      className={cn(
-        "rounded-md border p-2 text-xs",
-        isCurrent ? "border-foreground/40 bg-accent/40" : "bg-muted/20",
-      )}
-      style={{ marginLeft: depth * 16 }}
+      style={{
+        marginLeft: depth * 16,
+        border: "1px solid " + (isCurrent ? "var(--rs-primary)" : "var(--hairline)"),
+        background: isCurrent ? "rgba(245,78,0,0.04)" : "var(--surface-strong)",
+        borderRadius: "var(--radius-md)",
+        padding: "10px 12px",
+        fontSize: 12,
+      }}
     >
-      <div className="flex flex-wrap items-center gap-2">
+      <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 8 }}>
         <StageStatusBadge status={stage.status} />
-        <span className="font-mono text-[11px] font-semibold">
-          {stage.name}
-        </span>
+        <span className="mono" style={{ fontSize: 11.5, fontWeight: 600 }}>{stage.name}</span>
         {stage.parent_stage && (
-          <span className="text-[10px] text-muted-foreground">
-            parent: <code>{stage.parent_stage}</code>
+          <span className="rs-sub" style={{ fontSize: 10.5 }}>
+            parent: <code className="mono">{stage.parent_stage}</code>
           </span>
         )}
-        {orphan && (
-          <Badge
-            variant="outline"
-            className="border-amber-500/40 bg-amber-500/10 text-[9px] text-amber-700"
-          >
-            Missing parent stage
-          </Badge>
-        )}
+        {orphan && <Badge status="held" label="Missing parent" />}
         {stage.redecomposition_attempts > 0 && (
-          <Badge
-            variant="outline"
-            className="border-purple-500/40 bg-purple-500/10 text-[9px] text-purple-700"
-          >
-            replanned ×{stage.redecomposition_attempts}
-          </Badge>
+          <span className="rs-badge slate" style={{ fontSize: 9.5 }}>replanned ×{stage.redecomposition_attempts}</span>
         )}
       </div>
-      <p className="mt-1 text-[11px]">{stage.goal_text}</p>
-      <p className="mt-1 break-all rounded bg-background/60 px-1.5 py-1 font-mono text-[10.5px] text-muted-foreground">
+      <p style={{ margin: "6px 0 0", fontSize: 11.5, lineHeight: 1.5 }}>{stage.goal_text}</p>
+      <p className="mono" style={{ margin: "6px 0 0", wordBreak: "break-all", borderRadius: "var(--radius-sm)", background: "var(--canvas-soft)", border: "1px solid var(--hairline)", padding: "5px 8px", fontSize: 10.5, color: "var(--rs-muted)" }}>
         {stage.success_criterion}
       </p>
-      <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] text-muted-foreground">
+      <div style={{ marginTop: 6, display: "flex", flexWrap: "wrap", columnGap: 12, rowGap: 2, fontSize: 10.5, color: "var(--rs-muted)" }}>
         <span
           title={itersTooltip}
           aria-label={
@@ -655,21 +500,15 @@ function StageCard({
                 `per-launch override (Claude allocated ${stage.max_iterations})`
               : undefined
           }
-          className={cn(overrideActive && "underline decoration-dotted")}
+          style={overrideActive ? { textDecoration: "underline dotted" } : undefined}
         >
           rounds {stage.iterations_used}/{displayMax}
           {overrideActive && (
-            <span aria-hidden="true" className="ml-0.5 text-amber-700">
-              *
-            </span>
+            <span aria-hidden="true" style={{ marginLeft: 2, color: "var(--st-amber)" }}>*</span>
           )}
         </span>
-        {stage.best_metric != null && (
-          <span>best metric {stage.best_metric.toFixed(3)}</span>
-        )}
-        {stage.kg_seed_papers.length > 0 && (
-          <span>kg refs {stage.kg_seed_papers.length}</span>
-        )}
+        {stage.best_metric != null && <span>best metric {stage.best_metric.toFixed(3)}</span>}
+        {stage.kg_seed_papers.length > 0 && <span>kg refs {stage.kg_seed_papers.length}</span>}
       </div>
       {iters.length > 0 && <IterRibbon iters={iters} />}
     </div>
@@ -681,7 +520,7 @@ function IterRibbon({ iters }: { iters: IterRow[] }) {
     <div
       role="list"
       aria-label="Per-iteration progress"
-      className="mt-1.5 flex flex-wrap items-center gap-1"
+      style={{ marginTop: 7, display: "flex", flexWrap: "wrap", alignItems: "center", gap: 4 }}
     >
       {iters.map((r) => (
         <IterChip key={r.iter_index} row={r} />
@@ -690,33 +529,29 @@ function IterRibbon({ iters }: { iters: IterRow[] }) {
   );
 }
 
+// Iter pill — three states (training / rollout / completed). Colors via
+// rs status tokens (no violet token, so rollout uses the accent tint).
 function IterChip({ row }: { row: IterRow }) {
   const label = `iter ${row.iter_index}`;
-  let cls: string;
-  let metricStr: string;
+  let bg: string, fg: string, metricStr: string, pulse = false;
   if (row.completed) {
-    cls = "bg-emerald-50 text-emerald-700 border-emerald-200";
-    metricStr =
-      row.primary_metric != null
-        ? row.primary_metric.toFixed(3)
-        : "—";
+    bg = "var(--st-emerald-bg)"; fg = "var(--st-emerald-fg)";
+    metricStr = row.primary_metric != null ? row.primary_metric.toFixed(3) : "—";
   } else if (row.rollout_done) {
-    cls = "bg-violet-50 text-violet-700 border-violet-200";
+    bg = "rgba(245,78,0,0.10)"; fg = "var(--rs-primary)";
     metricStr = "rollout";
   } else {
-    cls = "bg-amber-50 text-amber-700 border-amber-200 motion-safe:animate-pulse";
+    bg = "var(--st-amber-bg)"; fg = "var(--st-amber-fg)"; pulse = true;
     metricStr = "training…";
   }
   return (
     <span
       role="listitem"
-      className={cn(
-        "inline-flex items-center gap-1 rounded-sm border px-1 py-0.5 text-[9.5px] font-mono",
-        cls,
-      )}
+      className={"mono" + (pulse ? " rs-pulse-soft" : "")}
+      style={{ display: "inline-flex", alignItems: "center", gap: 4, borderRadius: 4, padding: "1px 5px", fontSize: 9.5, background: bg, color: fg }}
       title={`${label} · ${metricStr}`}
     >
-      <span className="font-semibold uppercase tracking-wide">{label}</span>
+      <span style={{ fontWeight: 600, textTransform: "uppercase", letterSpacing: 0.3 }}>{label}</span>
       <span>{metricStr}</span>
     </span>
   );
@@ -729,80 +564,42 @@ function WsStatusChip({
 }: {
   events: ReturnType<typeof useMissionEvents>;
 }) {
-  let label: string;
-  let cls: string;
-  let Icon: React.ComponentType<{ className?: string }> = CircleDot;
+  let label: string, cls: string, icon: string, spin = false;
   if (events.terminal) {
-    label = "ended";
-    cls = "bg-sky-50 text-sky-700 border-sky-200";
-    Icon = CheckCircle2;
+    label = "ended"; cls = "blue"; icon = "check-circle";
   } else if (events.disconnected) {
-    label = "disconnected";
-    cls = "bg-rose-50 text-rose-700 border-rose-200";
-    Icon = XCircle;
+    label = "disconnected"; cls = "rose"; icon = "x";
   } else if (events.connected) {
-    label = "live";
-    cls = "bg-emerald-50 text-emerald-700 border-emerald-200";
-    Icon = Radio;
+    label = "live"; cls = "emerald"; icon = "activity";
   } else if (events.noActiveJob) {
-    label = "no job";
-    cls = "bg-muted text-muted-foreground border-border";
-    Icon = StopCircle;
+    label = "no job"; cls = "slate"; icon = "square";
   } else {
-    label = "connecting";
-    cls = "bg-muted text-muted-foreground border-border";
-    Icon = Loader2;
+    label = "connecting"; cls = "slate"; icon = "loader"; spin = true;
   }
   return (
-    <span
-      role="status"
-      aria-label={`websocket: ${label}`}
-      className={cn(
-        "inline-flex items-center gap-1 rounded-sm border px-1 py-0.5 text-[9px] font-semibold uppercase tracking-wide",
-        cls,
-      )}
-    >
-      <Icon
-        className={cn(
-          "h-2.5 w-2.5",
-          label === "connecting" && "motion-safe:animate-spin",
-        )}
-      />
+    <span role="status" aria-label={`websocket: ${label}`} className={"rs-badge " + cls}>
+      <Icon name={icon} size={11} className={spin ? "rs-spin" : undefined} />
       {label}
     </span>
   );
 }
 
-const EVENT_BADGE_STYLES: Record<string, string> = {
-  mission_started: "bg-sky-100 text-sky-800 border-sky-300",
-  mission_completed: "bg-emerald-100 text-emerald-800 border-emerald-300",
-  mission_halted: "bg-rose-100 text-rose-800 border-rose-300",
-  mission_halted_terminal: "bg-rose-100 text-rose-800 border-rose-300",
-  mission_decompose_completed:
-    "bg-emerald-100 text-emerald-800 border-emerald-300",
-  mission_decompose_errored: "bg-rose-100 text-rose-800 border-rose-300",
-  mission_execute_completed:
-    "bg-emerald-100 text-emerald-800 border-emerald-300",
-  mission_execute_errored: "bg-rose-100 text-rose-800 border-rose-300",
-  stage_started: "bg-indigo-100 text-indigo-800 border-indigo-300",
-  stage_succeeded: "bg-emerald-100 text-emerald-800 border-emerald-300",
-  stage_failed: "bg-rose-100 text-rose-800 border-rose-300",
-  stage_skipped: "bg-slate-100 text-slate-700 border-slate-300",
-  stage_completed_training: "bg-violet-100 text-violet-800 border-violet-300",
-  stage_criterion_evaluated:
-    "bg-violet-100 text-violet-800 border-violet-300",
-  stage_warm_start_resolved:
-    "bg-teal-100 text-teal-800 border-teal-300",
-  warm_start_skipped: "bg-amber-100 text-amber-800 border-amber-300",
-  stage_scaffolded: "bg-sky-100 text-sky-800 border-sky-300",
-  stage_v1_materialized: "bg-sky-100 text-sky-800 border-sky-300",
-  stage_redecomposition_started:
-    "bg-purple-100 text-purple-800 border-purple-300",
-  stage_redecomposed: "bg-purple-100 text-purple-800 border-purple-300",
-  redecomposition_skipped: "bg-amber-100 text-amber-800 border-amber-300",
-  stage_redecomposition_failed:
-    "bg-rose-100 text-rose-800 border-rose-300",
-  feedback_read_degraded: "bg-amber-100 text-amber-800 border-amber-300",
+// Map an event type to one of the rs status colors (decorative).
+function eventCat(type: string): "rose" | "amber" | "emerald" | "blue" | "slate" {
+  if (/errored|failed|halted/.test(type)) return "rose";
+  if (/skipped|degraded/.test(type)) return "amber";
+  if (/completed|succeeded|materialized|scaffolded|warm_start_resolved/.test(type)) return "emerald";
+  if (/started|redecompos|criterion|training/.test(type)) return "blue";
+  return "slate";
+}
+
+// Dark-pill bg|fg per category (matches the LogViewer event-tag palette).
+const ECAT_DARK: Record<string, string> = {
+  rose: "#3a1620|#f08aa6",
+  amber: "#3a2c12|#f0b35a",
+  emerald: "#16302a|#5fd0a0",
+  blue: "#152836|#86b7e6",
+  slate: "#2c2a20|#aaa698",
 };
 
 function StructuredEventList({ events }: { events: MissionEvent[] }) {
@@ -813,7 +610,8 @@ function StructuredEventList({ events }: { events: MissionEvent[] }) {
       role="log"
       aria-label="Mission events"
       aria-live="polite"
-      className="flex flex-col gap-1 rounded-md border bg-muted/10 p-2"
+      className="rs-log"
+      style={{ display: "flex", flexDirection: "column", gap: 4, maxHeight: 240, overflowY: "auto", borderRadius: "var(--radius-md)", padding: "8px 10px" }}
     >
       {slice.map((ev, i) => (
         <StructuredEventRow key={i} event={ev} />
@@ -823,26 +621,18 @@ function StructuredEventList({ events }: { events: MissionEvent[] }) {
 }
 
 function StructuredEventRow({ event }: { event: MissionEvent }) {
-  const cls =
-    EVENT_BADGE_STYLES[event.type] ??
-    "bg-slate-100 text-slate-700 border-slate-300";
+  const [bg, fg] = (ECAT_DARK[eventCat(event.type)] ?? ECAT_DARK.slate).split("|");
   const detail = describeEvent(event);
   return (
-    <div className="flex flex-wrap items-center gap-1.5 text-[11px]">
+    <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 6, fontSize: 11 }}>
       <span
-        className={cn(
-          "inline-flex shrink-0 rounded-sm border px-1 py-0 text-[9px] font-semibold uppercase tracking-wide",
-          cls,
-        )}
+        className="mono"
+        style={{ flexShrink: 0, borderRadius: 4, padding: "0 4px", fontSize: 9, fontWeight: 600, textTransform: "uppercase", letterSpacing: 0.4, background: bg, color: fg }}
       >
         {event.type}
       </span>
-      {event.stage_name && (
-        <code className="text-[10.5px] text-muted-foreground">
-          {event.stage_name}
-        </code>
-      )}
-      <span className="break-all text-muted-foreground">{detail}</span>
+      {event.stage_name && <code className="mono" style={{ fontSize: 10.5, color: "#aaa698" }}>{event.stage_name}</code>}
+      <span style={{ wordBreak: "break-all", color: "#d7d3c4" }}>{detail}</span>
     </div>
   );
 }
@@ -914,13 +704,16 @@ function LogScroller({ events }: { events: MissionEvent[] }) {
   };
 
   return (
-    <div className="rounded-md border bg-slate-950 text-slate-100">
-      <div className="flex items-center justify-between border-b border-slate-800 px-2 py-1 text-[10px] text-slate-400">
-        <span>log_line · last {events.length}/200</span>
+    <div style={{ border: "1px solid var(--hairline)", borderRadius: "var(--radius-md)", overflow: "hidden" }}>
+      <div className="rs-log-bar">
+        <Icon name="terminal" size={13} color="var(--rs-muted)" />
+        <span style={{ fontSize: 11.5, fontWeight: 600 }}>log_line</span>
+        <span className="rs-grow" />
+        <span style={{ fontSize: 11, color: "var(--rs-muted)" }}>last {events.length}/200</span>
         {userScrolledUp.current && (
           <button
             type="button"
-            className="rounded bg-slate-800 px-1.5 py-0.5 text-slate-200 hover:bg-slate-700"
+            className="rs-btn rs-btn-quiet rs-btn-xs"
             onClick={() => {
               userScrolledUp.current = false;
               const el = ref.current;
@@ -934,10 +727,11 @@ function LogScroller({ events }: { events: MissionEvent[] }) {
       <div
         ref={ref}
         onScroll={onScroll}
-        className="max-h-64 overflow-y-auto scrollbar-thin px-2 py-1 font-mono text-[11px] leading-snug"
+        className="rs-log mono"
+        style={{ maxHeight: 256, overflowY: "auto", padding: "8px 12px", fontSize: 11, lineHeight: 1.5 }}
       >
         {events.length === 0 ? (
-          <p className="text-slate-500">waiting for stdout…</p>
+          <p style={{ color: "#807d72", margin: 0 }}>waiting for stdout…</p>
         ) : (
           events.map((ev, i) => {
             const text =
@@ -945,10 +739,7 @@ function LogScroller({ events }: { events: MissionEvent[] }) {
                 ? (ev as { text: string }).text
                 : JSON.stringify(ev);
             return (
-              <div
-                key={i}
-                className="whitespace-pre-wrap break-all text-slate-200"
-              >
+              <div key={i} style={{ whiteSpace: "pre-wrap", wordBreak: "break-all", color: "#d7d3c4" }}>
                 {text}
               </div>
             );
@@ -958,4 +749,3 @@ function LogScroller({ events }: { events: MissionEvent[] }) {
     </div>
   );
 }
-
