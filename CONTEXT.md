@@ -339,6 +339,39 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-05 — Ship 22h: re-skin Runs tab (3-pane) + LogViewer
+
+Frontend-only. The prototype's signature screen + the most logic-dense.
+
+- **What**:
+  - `components/RunsTab.tsx` rewritten. ALL Ship-21 logic preserved VERBATIM:
+    `partitionRuns` (sculpt_runs vs mission groups, stage_index sort + run_id
+    tiebreak), `missionRunStateLabel`, `durationStr`, `RewardVersionTransition`
+    (held / N-filtered / no-edit branching), `useMergedIterations` + `_mergeIterSlot`
+    + `_ITER_STATUS_RANK` (the sticky-map / status-monotonicity merge), keepPolling,
+    kill/regenerate, the physics-edit-suggestion chip. Restyled to the prototype's
+    `rs-runs-layout`: `rs-runs-side` (Runs header + dialog triggers; Missions groups
+    with collapsible `rs-mhead` + Plan button + nested stage `rs-runrow.rs-stage`;
+    Single-runs group), `rs-runs-detail` 3-col (`rs-iter-col` iteration cards /
+    `rs-mid-col` StageContext + RunHeader + LogViewer / `rs-extra-col` Mean-reward
+    MetricChart + StageRewards + GPU + IterDetail). Lifecycle/status via rs Badge;
+    rs Sparkline + rs SVG MetricChart (replaces recharts); mission collapse header
+    keyboard-operable.
+  - `components/LogViewer.tsx` reskinned to the dark `rs-log` (rs-log-bar with
+    rs-select filter + rs Toggle autoscroll + count; per-type event tag colors for
+    dark). Kept react-window virtualization + the autoscroll-detach logic; replaced
+    the hardcoded height=420 with a ResizeObserver-measured height so it fills the
+    pane (audit C2).
+- **Verified**: tsc 0. Live (Chrome): launched a dry-run → the full 3-pane rendered
+  with the sidebar run row (ERRORED badge + sparkline), the dark rs-log streaming
+  91 real WS events (live), the error banner, and the chart empty-state. WS
+  connected. Zero console errors. (The test run errored for a real-data reason —
+  halfcheetah is a draft with env_id=CHANGE_ME — which verified the error-state
+  path; iteration cards are logic-preserved + use the proven rs-itercard CSS.)
+  Backend/sculptor untouched (305 / 364).
+- **Transitional remaining**: the in-header dialog triggers (NewRun/NewMission/
+  MissionDetail) are still shadcn → reskinned to rs-modal in the dialogs ship next.
+
 ### 2026-06-05 — Ship 22g: re-skin Rewards tab
 
 Frontend-only. The prototype's signature code/diff/why-this-edit screen.
