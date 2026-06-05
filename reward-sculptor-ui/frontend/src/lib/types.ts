@@ -20,6 +20,15 @@ export interface ProjectSummary {
   // M6: populated when the project references an adapter no longer in
   // ADAPTER_REGISTRY. UI shows a banner hinting at "fork to upgrade".
   migration_warning?: string | null;
+  // §Ship 22b (re-skin, Finding A): additive card enrichment from
+  // GET /projects. Config fields filled by ProjectStore.list(); metric
+  // fields filled by the route from the latest sculpt_run.
+  adapter_class?: string | null;
+  library_slug?: string | null;
+  num_envs?: number | null;
+  device?: string | null;
+  primary_metric?: number | null;
+  primary_metric_history?: Array<number | null>;
 }
 
 export interface ProjectDetail extends ProjectSummary {

@@ -24,6 +24,7 @@ from backend.models.project import (
     ProjectSummary,
 )
 from backend.services import sculptor_bridge
+from backend.services.job_manager import JobManager
 from backend.services.project_store import BusyError, ProjectStore
 from backend.services.robot_library import RobotEntry, get_library
 
@@ -34,6 +35,10 @@ router = APIRouter(prefix="/projects", tags=["projects"])
 # ── DI ─────────────────────────────────────────────────────────────────
 def get_store(request: Request) -> ProjectStore:
     return request.app.state.project_store
+
+
+def get_job_manager(request: Request) -> JobManager:
+    return request.app.state.job_manager
 
 
 # ── helpers ────────────────────────────────────────────────────────────
@@ -573,8 +578,34 @@ def _validate_mjlab_preflight(body: CreateProjectRequest) -> Optional[JSONRespon
 
 
 @router.get("", response_model=list[ProjectSummary])
-def list_projects(store: ProjectStore = Depends(get_store)) -> list[ProjectSummary]:
-    return store.list()
+def list_projects(
+    store: ProjectStore = Depends(get_store),
+    jobs: JobManager = Depends(get_job_manager),
+) -> list[ProjectSummary]:
+    summaries = store.list()
+    # §Ship 22b (Finding A): attach the latest sculpt_run's metric +
+    # history per project so the Projects/Dashboard cards can show a best
+    # reward + sparkline. JobManager is the source of truth for run
+    # metrics (same data the /dashboard endpoint surfaces). `jobs.list`
+    # is newest-first, so the first job seen per slug is the latest run.
+    latest_by_slug: dict[str, list[Optional[float]]] = {}
+    for job in jobs.list(kind="sculpt_run"):
+        slug = job.project_slug or ""
+        if not slug or slug in latest_by_slug:
+            continue
+        hist_raw = (job.params or {}).get("primary_metric_history") or []
+        history: list[Optional[float]] = []
+        if isinstance(hist_raw, list):
+            for v in hist_raw:
+                history.append(float(v) if isinstance(v, (int, float)) else None)
+        latest_by_slug[slug] = history
+    for s in summaries:
+        history = latest_by_slug.get(s.slug)
+        if history:
+            s.primary_metric_history = history
+            vals = [v for v in history if v is not None]
+            s.primary_metric = max(vals) if vals else None
+    return summaries
 
 
 @router.get(

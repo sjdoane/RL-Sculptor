@@ -339,6 +339,57 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-04 — Ship 22b: re-skin shell + landing screens (+ ProjectSummary enrichment)
+
+Second re-skin Ship: the global shell + the three non-project screens, plus the
+Finding-A backend enrichment. Verified live in Chrome (light + dark), real data
+flowing, zero console errors.
+
+- **What**:
+  *Frontend*:
+  - `components/Layout.tsx` — rebuilt as the `rs-rail` shell (wordmark, NavLinks,
+    a live System mini-panel fed by useSystemGpu+useSystemInfo, theme toggle).
+    Mounts `useTheme()` here so the theme applies app-wide (audit C1) + the
+    rail toggle. Root is `rs-app`; `<main>` is `rs-main` (pages own their
+    `rs-scroll`).
+  - `pages/Dashboard.tsx` — prototype's 3-section dashboard (Active jobs strip
+    from useDashboard.active_jobs; Projects grid of `rs-pcard` from useProjects;
+    System card). Drops the old separate Recent-runs + KG-additions cards (that
+    info now lives in the project cards + per-project tabs). "New project" →
+    /library (the real robot-picker entry).
+  - `pages/ProjectList.tsx` — prototype's `rs-table` (Name/Status/Adapter/Robot/
+    Best/Trend/Updated) wrapped in an overflow-x scroller; per-row delete via an
+    rs-modal confirm (preserves useDeleteProject). Replaces the ProjectCard grid.
+  - `pages/Settings.tsx` — restyled to rs cards. Already read-only with real data
+    (api-key status, GPU/CUDA/adapters, shared-KG stats, paths, theme Segmented,
+    reset-cache) → matches Finding B exactly; NO fake editable fields added.
+  - `components/ProjectCard.tsx` — DELETED (dead after the table swap).
+  - `index.html` — removed `bg-background text-foreground` from `<body>`: those
+    utility classes (specificity 0,1,0) were overriding `rs-theme.css`'s
+    `body{color:var(--ink)}` (0,0,1), and index.css has no `.dark` override for
+    `--foreground`, so dark-mode headings rendered dark-on-dark. rs- tokens now
+    govern the page default. (Verified: bodyColor flips to `--ink` in dark.)
+  - `lib/types.ts` — `ProjectSummary` additive fields (adapter_class, library_slug,
+    num_envs, device, primary_metric, primary_metric_history).
+  *Backend (Finding A — additive, asked + approved)*:
+  - `models/project.py` — `ProjectSummary` gains the 6 optional card fields.
+  - `services/project_store.py` — `list()` fills adapter_class/library_slug/
+    num_envs/device from the already-loaded per-project detail (free).
+  - `routes/projects.py` — `list_projects` injects JobManager and attaches the
+    latest sculpt_run's `primary_metric` (max) + history per project (same data
+    source as /dashboard; metric is in-session only, consistent with it). Route
+    shape unchanged (still `list[ProjectSummary]`).
+- **Why**: deliver the prototype's shell + landing screens onto unchanged data
+  wiring; cards/table need the enriched summary (Finding A).
+- **Verified**: `pnpm tsc --noEmit` 0. Live (Chrome localhost:5173): rail with
+  real GPU (RTX 5070 Laptop, VRAM/temp/CUDA 13.0), 14 real projects with
+  adapter/robot, Settings showing torch 2.11.0+cu130 + 80 papers/468 techniques,
+  dark-mode contrast fixed, zero console errors. `/projects` enriched response
+  confirmed via curl. Backend pytest: exit 0 (305 passed, 1 deselected — additive
+  fields only, no test added/removed). Sculptor untouched (364).
+- **Deferred to 22c+**: ProjectDetail shell (header/tabs/facts) + the 6 tab
+  contents; all dialogs (22e); ProjectCreate stub + LibraryPage + RobotConfig.
+
 ### 2026-06-04 — Ship 22a: re-skin foundation (design tokens + theme + rs/ primitives)
 
 First implementation Ship of the `design-prototype/` integration (audit-driven
