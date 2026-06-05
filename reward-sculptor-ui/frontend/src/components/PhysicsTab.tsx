@@ -64,7 +64,7 @@ export function PhysicsTab({ slug, project: _project }: { slug: string; project:
   }, []);
   const mutate = usePhysicsPromptEdit(slug);
   const rematerialize = usePhysicsRematerialize(slug);
-  const job = useJob(activeJobId, { refetchIntervalMs: 1500 });
+  const job = useJob(activeJobId ?? undefined, { intervalMs: 1500 });
   const qc = useQueryClient();
 
   useEffect(() => {

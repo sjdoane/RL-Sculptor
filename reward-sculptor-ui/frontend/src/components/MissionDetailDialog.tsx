@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef } from "react";
 import { toast } from "sonner";
 
 import { Icon } from "@/components/rs/icon";
@@ -734,10 +734,8 @@ function LogScroller({ events }: { events: MissionEvent[] }) {
           <p style={{ color: "#807d72", margin: 0 }}>waiting for stdout…</p>
         ) : (
           events.map((ev, i) => {
-            const text =
-              typeof (ev as { text?: unknown }).text === "string"
-                ? (ev as { text: string }).text
-                : JSON.stringify(ev);
+            const raw = (ev as { text?: unknown }).text;
+            const text = typeof raw === "string" ? raw : JSON.stringify(ev);
             return (
               <div key={i} style={{ whiteSpace: "pre-wrap", wordBreak: "break-all", color: "#d7d3c4" }}>
                 {text}

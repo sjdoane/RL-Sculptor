@@ -283,6 +283,7 @@ export type JobKind =
   | "kg_ingest"
   | "kg_extract"
   | "kg_ingest_extract"
+  | "kg_research"
   | "kg_viz_render"
   | "sculpt_run";
 

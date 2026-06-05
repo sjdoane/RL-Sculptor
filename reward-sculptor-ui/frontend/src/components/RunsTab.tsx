@@ -637,7 +637,7 @@ function useMergedIterations(rest: IterEventSummary[], events: RunEvent[]): Iter
       if (ev.type === "realism_audited") {
         const audit = (ev as { audit?: Record<string, unknown> }).audit;
         if (audit && typeof audit === "object") {
-          slot.realism_audit = audit as IterEventSummary["realism_audit"];
+          slot.realism_audit = audit as unknown as IterEventSummary["realism_audit"];
         } else if (slot.realism_audit == null) {
           slot.realism_audit = {
             verdict: typeof ev.verdict === "string" ? ev.verdict : "unknown",

@@ -133,9 +133,10 @@ export function NewMissionDialog({
                   maxLength={GOAL_MAX}
                   disabled={create.isPending}
                   aria-invalid={goalShort}
+                  aria-describedby={goalShort ? "mission-goal-err" : undefined}
                   autoFocus
                 />
-                {goalShort && <span className="hint" style={{ color: "var(--st-rose)" }}>min {GOAL_MIN} chars</span>}
+                {goalShort && <span id="mission-goal-err" className="hint" style={{ color: "var(--st-rose)" }}>min {GOAL_MIN} chars</span>}
               </Field>
               <Field label="Mission slug" hint="optional" htmlFor="mission-slug">
                 <input

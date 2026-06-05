@@ -331,16 +331,37 @@ export function Modal({
     const id = Symbol("modal");
     MODAL_STACK.push(id);
     const prev = document.activeElement as HTMLElement | null;
+    const FOCUSABLE =
+      'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape" && MODAL_STACK[MODAL_STACK.length - 1] === id) {
+      // Only the topmost modal reacts (modals can nest).
+      if (MODAL_STACK[MODAL_STACK.length - 1] !== id) return;
+      if (e.key === "Escape") {
         e.stopPropagation();
         onCloseRef.current();
+        return;
+      }
+      // Focus trap — Radix gave us this for free; the bespoke Modal must
+      // keep Tab inside the dialog (WCAG 2.1 dialog pattern).
+      if (e.key === "Tab") {
+        const root = ref.current;
+        if (!root) return;
+        const items = Array.from(root.querySelectorAll<HTMLElement>(FOCUSABLE))
+          .filter((el) => el.offsetParent !== null || el === document.activeElement);
+        if (items.length === 0) { e.preventDefault(); root.focus(); return; }
+        const first = items[0];
+        const last = items[items.length - 1];
+        const active = document.activeElement as HTMLElement | null;
+        if (e.shiftKey) {
+          if (active === first || !root.contains(active)) { e.preventDefault(); last.focus(); }
+        } else if (active === last || !root.contains(active)) {
+          e.preventDefault();
+          first.focus();
+        }
       }
     };
     window.addEventListener("keydown", onKey);
-    const focusable = ref.current?.querySelector<HTMLElement>(
-      'button:not([disabled]), [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
-    );
+    const focusable = ref.current?.querySelector<HTMLElement>(FOCUSABLE);
     (focusable ?? ref.current)?.focus();
     return () => {
       window.removeEventListener("keydown", onKey);

@@ -339,6 +339,56 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-05 — Ship 22n: final audit — fix the (no-op) typecheck gate + a11y focus trap
+
+The audit-driven close-out of the prototype integration. Two real problems found.
+
+- **CRITICAL — the typecheck gate was a no-op.** `tsconfig.json` is solution-style
+  (`"files": []` + `references` only), so `pnpm tsc --noEmit` (the command the prior
+  ships used as the "tsc 0" gate) compiles NOTHING and always passes. The REAL gate
+  is `pnpm typecheck` / `pnpm build` (`tsc -b`, which checks tsconfig.app.json with
+  `strict` + `noUnusedLocals`). Running it surfaced **15 latent type errors** — most
+  pre-existing across prior ships (22e/22g/22h) + a few faithfully copied verbatim
+  in the reskin — all masked the whole time. Fixed all 15 → `pnpm build` is GREEN:
+  - `lib/types.ts`: `JobKind` was missing `"kg_research"` (a real backend kind —
+    kg.py:453, models/kg.py:111). Added it → fixed the `job.kind === "kg_research"`
+    comparisons in ActiveJobsIndicator + AddSeedsDialog (PendingSeedJobWatcher).
+  - **Real behavior bug:** PhysicsTab + RewardsTab passed `useJob(id, {refetch
+    IntervalMs: 1500})` — but the option is `intervalMs`; the wrong key was silently
+    dropped so those prompt-edit jobs polled at the 3000 ms default, not 1500.
+    Renamed → intended 1.5 s polling restored.
+  - Misc: removed unused imports (MissionDetailDialog `useState`, RewardsTab
+    `formatRelative`), cast-through-unknown for the MissionDetail log_line text +
+    RunsTab realism_audit, `activeJobId ?? undefined` for useJob, tuple-typed the
+    ProjectSettings summary rows.
+- **HIGH — a11y focus trap.** The bespoke `Modal` (replacing Radix) had focus-in +
+  Esc + focus-restore but NO focus trap, so Tab escaped the dialog (WCAG 2.1
+  dialog-pattern fail) across all 11 modals. Added a Tab/Shift+Tab wrap to the
+  Modal's keydown handler (topmost-only via MODAL_STACK). Verified live: forward
+  Tab from the last control wraps to the first, Shift+Tab from first wraps to last,
+  Esc still closes. Also linked NewMissionDialog's goal error via aria-describedby.
+- **Parallel audit (3 Explore agents) — every load-bearing claim verified against
+  source before acting:**
+  - Code/contract agent: 0 payload/hook bugs (matches independent verification).
+  - a11y agent: focus-trap CRITICAL → fixed. REJECTED after verification: "add
+    role=tab to rs-mtabs" (half-implementing the APG tab pattern, sans arrow-key
+    nav, is worse than plain operable buttons); slider `aria-valuetext` (native
+    range already announces its value + the live value is in the `<label>`);
+    `.rs-select::after` not aria-hidden (CSS pseudo-elements aren't in the a11y
+    tree).
+  - UX/dark-mode agent: REJECTED all ~10 "hardcoded color → dark-mode breakage"
+    findings — they sit on `.rs-log` / RobotViewer stage, which are ALWAYS-dark
+    terminal surfaces (`.rs-log { background:#16150f }` in both themes), so the
+    light-on-dark text is correct; the `rgba(245,78,0,.04)` tints match the
+    established `.rs-check.on` pattern (the accent doesn't flip). CONFIRMED good:
+    zero drop-shadows, zero leftover shadcn Tailwind utilities in any reskinned file.
+- **Gates (all four green):** `pnpm build` 0 (the real typecheck + vite build,
+  1956 modules); backend `pytest -k 'not test_reward_prompt_edit_emits'` exit 0;
+  sculptor `pytest tests/` exit 0; live smoke via the running dev server (Chrome).
+- **Integration complete:** every shadcn `Dialog`/`Tabs` is gone — all 11 dialogs +
+  the library/robot flow are on the bespoke rs Modal/primitives. NB going forward:
+  the typecheck gate is **`pnpm typecheck`** (or `pnpm build`), NOT `tsc --noEmit`.
+
 ### 2026-06-05 — Ship 22m: re-skin the robot/creation flow (Library + RobotConfig)
 
 Frontend-only. The project-creation entry point + the in-project robot config.

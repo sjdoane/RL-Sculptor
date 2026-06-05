@@ -18,7 +18,6 @@ import {
 } from "@/hooks/useRewards";
 import { ApiError } from "@/lib/api";
 import { qk } from "@/lib/queryKeys";
-import { formatRelative } from "@/lib/utils";
 import type {
   ProjectDetail,
   RewardVersionDetail,
@@ -265,7 +264,7 @@ function PromptEditHero({
   const [activeJobId, setActiveJobId] = useState<string | null>(null);
   const mutate = useRewardPromptEdit(slug);
   const qc = useQueryClient();
-  const job = useJob(activeJobId, { refetchIntervalMs: 1500 });
+  const job = useJob(activeJobId ?? undefined, { intervalMs: 1500 });
   const events = useJobEvents(activeJobId ?? undefined);
 
   useEffect(() => {

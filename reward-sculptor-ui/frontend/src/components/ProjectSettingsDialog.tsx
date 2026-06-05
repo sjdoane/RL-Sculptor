@@ -205,12 +205,10 @@ function SummarySection({ project }: { project: ProjectDetail }) {
   const rows: Array<[string, string]> = [
     ["slug", project.slug],
     ["adapter", adapterShort],
-    ...(taskId ? [["task", taskId] as [string, string]] : []),
-    ...(numEnvs != null ? [["num_envs", String(numEnvs)]] : []),
-    ...(device ? [["device", device]] as [string, string][] : []),
-    ...(project.library_slug
-      ? [["library", project.library_slug] as [string, string]]
-      : []),
+    ...(taskId ? ([["task", taskId]] as [string, string][]) : []),
+    ...(numEnvs != null ? ([["num_envs", String(numEnvs)]] as [string, string][]) : []),
+    ...(device ? ([["device", device]] as [string, string][]) : []),
+    ...(project.library_slug ? ([["library", project.library_slug]] as [string, string][]) : []),
     ["created", project.created_at],
   ];
 
