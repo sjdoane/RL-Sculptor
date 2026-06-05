@@ -339,6 +339,31 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-05 — Ship 22l: re-skin the project config dialogs (Create + Settings)
+
+Frontend-only. The project-creation + project-settings dialogs.
+
+- **What** (logic/payloads VERBATIM):
+  - `ProjectSettingsDialog.tsx`: gear `IconBtn` + rs Modal. SummarySection
+    (read-only adapter/library facts as a mono dl), IterationSettingsSection
+    (the 11-field editable config.toml [iteration] block — getProjectSettings /
+    patchProjectSettings query+mutation, the typed `fields` array, `update()`
+    numeric-vs-text coercion, dirty-diff, Revert/Save — all verbatim; bools via
+    rs-select, numbers/text via rs-input, rs-row2 grid), DangerZone (type-the-slug
+    -to-confirm delete + nav, rs rose panel + danger Btn).
+  - `CreateProjectDialog.tsx`: rs Modal. estimateVramGb, parseOomError,
+    defaultAdapterFor, the createProject mutation + payload, the
+    over/tight-budget VRAM math, the task→num_envs auto-snap, the OOM-retry
+    flow — all verbatim. Restyled: adapter/task/device → rs-select, num_envs →
+    rs range (rs-primary accent), VRAM estimate + ComingSoon + OOM banners → rs
+    colored panels, footer Create with arrow-right / loader.
+- **Verified**: tsc 0. Live (Chrome, via JS — capture stalls once a spinner /
+  client-nav is in play this session): ProjectSettings opens with all 3 sections,
+  7 summary rows, 11 iteration fields, Delete disabled until the slug is typed,
+  Done footer. Zero console errors. CreateProjectDialog is tsc-clean + reuses the
+  same proven primitives; it's triggered from LibraryPage so it gets its live
+  exercise in Ship 22m. Backend/sculptor untouched.
+
 ### 2026-06-05 — Ship 22k: re-skin the KG dialogs (AddSeeds, Research, Paper, Graph)
 
 Frontend-only. The four Knowledge-Graph-tab dialogs.
