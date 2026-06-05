@@ -1,18 +1,8 @@
 import { lazy, Suspense, useState } from "react";
-import { Link, useNavigate, useParams } from "react-router-dom";
-import { ExternalLink, Loader2, Wrench } from "lucide-react";
+import { useNavigate, useParams } from "react-router-dom";
 
-import { Badge as UIBadge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
 import { Icon } from "@/components/rs/icon";
-import { Badge, Btn, EmptyState, FactChip } from "@/components/rs/primitives";
+import { Badge, Btn, FactChip } from "@/components/rs/primitives";
 import { KnowledgeGraphTab } from "@/components/KnowledgeGraphTab";
 import { PhysicsTab } from "@/components/PhysicsTab";
 import { ProjectSettingsDialog } from "@/components/ProjectSettingsDialog";
@@ -50,10 +40,9 @@ function adapterShort(cls: string | null | undefined): string {
   return cls.split(".").pop() ?? cls;
 }
 
-// Transitional wrapper for tabs not yet reskinned (Overview/Physics/
-// Rewards). Mirrors the old ProjectDetail scroll container so the legacy
-// shadcn content keeps scrolling inside the new rs- shell.
-function LegacyTab({ children }: { children: React.ReactNode }) {
+// Generic padded scroll container for a tab's page content. Tabs not yet
+// reskinned (Physics/Rewards) render their existing components inside it.
+function ScrollPad({ children }: { children: React.ReactNode }) {
   return (
     <div className="rs-scroll">
       <div style={{ padding: "24px 32px 60px", maxWidth: 1320 }}>{children}</div>
@@ -87,8 +76,7 @@ function WarningBanners({ project }: { project: ProjectDetailShape }) {
           <Icon name="clock" size={17} />
           <span className="rs-grow">
             <b>Adapter not yet implemented — training disabled.</b> Created with a coming-soon
-            adapter (<code className="mono">{adapterShortName}</code>). Reward editing + preview
-            still work.
+            adapter (<code className="mono">{adapterShortName}</code>). Reward editing + preview still work.
           </span>
         </div>
       )}
@@ -133,16 +121,16 @@ export default function ProjectDetail() {
       </div>
 
       {project.isLoading ? (
-        <LegacyTab><p className="rs-sub">Loading…</p></LegacyTab>
+        <ScrollPad><p className="rs-sub">Loading…</p></ScrollPad>
       ) : project.error ? (
-        <LegacyTab>
+        <ScrollPad>
           <div className="rs-banner err">
             <Icon name="alert-triangle" size={17} />
             <span className="rs-grow">Could not load project: {(project.error as Error).message}</span>
           </div>
-        </LegacyTab>
+        </ScrollPad>
       ) : !p ? (
-        <LegacyTab><p className="rs-sub">No project.</p></LegacyTab>
+        <ScrollPad><p className="rs-sub">No project.</p></ScrollPad>
       ) : (
         <>
           <div className="rs-tabs" role="tablist">
@@ -163,25 +151,15 @@ export default function ProjectDetail() {
           {tab !== "runs" && <FactsBand project={p} />}
           {tab !== "runs" && (p.adapter_unavailable || p.migration_warning) && <WarningBanners project={p} />}
 
-          {tab === "overview" && (
-            <LegacyTab><OverviewTab slug={slug!} project={p} robot={robot.data} /></LegacyTab>
-          )}
-          {tab === "rewards" && (
-            <LegacyTab><RewardsTab slug={slug!} project={p} /></LegacyTab>
-          )}
-          {tab === "physics" && (
-            <LegacyTab><PhysicsTab slug={slug!} project={p} /></LegacyTab>
-          )}
+          {tab === "overview" && <OverviewTab slug={slug!} project={p} robot={robot.data} />}
+          {tab === "rewards" && <ScrollPad><RewardsTab slug={slug!} project={p} /></ScrollPad>}
+          {tab === "physics" && <ScrollPad><PhysicsTab slug={slug!} project={p} /></ScrollPad>}
           {tab === "kg" && <KnowledgeGraphTab slug={slug!} />}
           {tab === "runs" && (
-            <Suspense fallback={<TabFallback />}>
-              <RunsTabLazy slug={slug!} project={p} />
-            </Suspense>
+            <Suspense fallback={<TabFallback />}><RunsTabLazy slug={slug!} project={p} /></Suspense>
           )}
           {tab === "reports" && (
-            <Suspense fallback={<TabFallback />}>
-              <ReportsTabLazy slug={slug!} />
-            </Suspense>
+            <Suspense fallback={<TabFallback />}><ReportsTabLazy slug={slug!} /></Suspense>
           )}
         </>
       )}
@@ -193,60 +171,53 @@ function TabFallback() {
   return (
     <div className="rs-scroll">
       <div className="rs-empty">
-        <Loader2 className="rs-spin" />
+        <Icon name="loader" size={20} className="rs-spin" />
         <span className="rs-sub">Loading…</span>
       </div>
     </div>
   );
 }
 
-// ── Overview (transitional — reskinned in a later ship) ───────────────
+// ── Overview ──────────────────────────────────────────────────────────
 function OverviewTab({
   slug, project, robot,
 }: { slug: string; project: ProjectDetailShape; robot: RobotStateResponse | undefined }) {
   const configured = isRobotConfigured(robot, project);
+  const cfg = project.adapter_config || {};
+  const taskId = typeof cfg.task_id === "string" ? cfg.task_id : null;
+  const numEnvs = typeof cfg.num_envs === "number" ? cfg.num_envs : null;
+  const device = typeof cfg.device === "string" ? cfg.device : null;
   return (
-    <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
-      <div className="lg:col-span-2 flex flex-col gap-4">
-        {configured ? <RobotViewer slug={slug} /> : <RobotConfig slug={slug} />}
-        <Card>
-          <CardHeader><CardTitle className="text-sm">Description</CardTitle></CardHeader>
-          <CardContent>
-            <p className="text-sm text-muted-foreground">{project.description || "No description."}</p>
-          </CardContent>
-        </Card>
-      </div>
-      <div className="flex flex-col gap-4">
-        <Card>
-          <CardHeader>
-            <CardTitle className="text-sm">Metadata</CardTitle>
-            <CardDescription>Read from <code>config.toml</code> + sidecar.</CardDescription>
-          </CardHeader>
-          <CardContent className="space-y-2 text-xs">
-            <KV k="slug" v={project.slug} mono />
-            <KV k="adapter" v={project.adapter_class} mono />
-            <KV k="env_id" v={project.env_id && project.env_id !== "CHANGE_ME" ? project.env_id : "—"} mono />
-            <KV k="iterations" v={String(project.n_iterations_completed)} />
-            <KV k="created" v={formatRelative(project.created_at)} />
-            <KV k="directory" v={project.project_dir} mono truncate />
-          </CardContent>
-        </Card>
-        {configured && robot && (
-          <Card>
-            <CardHeader><CardTitle className="text-sm">Robot</CardTitle></CardHeader>
-            <CardContent className="space-y-2 text-xs">
-              <KV k="kind" v={robot.kind} mono />
-              {robot.library_name && <KV k="library" v={robot.library_name} mono />}
-              {robot.env_id && <KV k="env_id" v={robot.env_id} mono />}
-              {robot.model_file && <KV k="model" v={robot.model_file} mono truncate />}
-              {robot.original_filename && <KV k="uploaded" v={robot.original_filename} mono truncate />}
-              {robot.mesh_paths.length > 0 && <KV k="meshes" v={`${robot.mesh_paths.length}`} />}
-            </CardContent>
-          </Card>
-        )}
-        {configured && (robot?.library_name || project.library_slug) && (
-          <RobotLibraryCard slug={slug} librarySlug={(robot?.library_name ?? project.library_slug)!} />
-        )}
+    <div className="rs-scroll">
+      <div className="rs-pad" style={{ display: "grid", gridTemplateColumns: "minmax(0,1.6fr) minmax(300px,1fr)", gap: 22, alignItems: "start" }}>
+        <div className="rs-vgap-16">
+          {configured ? <RobotViewer slug={slug} /> : <RobotConfig slug={slug} />}
+          <div className="rs-card rs-card-pad">
+            <div className="rs-card-title" style={{ marginBottom: 10 }}><Icon name="flag" size={16} />What this project is</div>
+            <p className="rs-sub" style={{ lineHeight: 1.6, margin: 0 }}>{project.description || "No description."}</p>
+          </div>
+        </div>
+
+        <div className="rs-vgap-16">
+          <div className="rs-card">
+            <div className="rs-card-head"><div className="rs-card-title"><Icon name="info" size={16} />Project facts</div></div>
+            <div className="rs-kv">
+              <div className="k">status</div><div className="v"><Badge status={project.status} /></div>
+              <div className="k">adapter</div><div className="v">{adapterShort(project.adapter_class)}</div>
+              {humanizeSlug(project.library_slug) && (<><div className="k">robot</div><div className="v">{humanizeSlug(project.library_slug)}</div></>)}
+              {(taskId || project.env_id) && (<><div className="k">task_id</div><div className="v">{taskId ?? project.env_id}</div></>)}
+              {device && (<><div className="k">device</div><div className="v">{device}</div></>)}
+              {numEnvs != null && (<><div className="k">num_envs</div><div className="v">{numEnvs.toLocaleString()}</div></>)}
+              <div className="k">iterations</div><div className="v">{project.n_iterations_completed}</div>
+              <div className="k">created</div><div className="v">{formatRelative(project.created_at)}</div>
+              <div className="k">directory</div><div className="v" style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={project.project_dir}>{project.project_dir}</div>
+            </div>
+          </div>
+
+          {configured && (robot?.library_name || project.library_slug) && (
+            <RobotLibraryCard slug={slug} librarySlug={(robot?.library_name ?? project.library_slug)!} />
+          )}
+        </div>
       </div>
     </div>
   );
@@ -259,30 +230,15 @@ function isRobotConfigured(robot: RobotStateResponse | undefined, project: Proje
   return !!robot.model_file;
 }
 
-function KV({ k, v, mono, truncate }: { k: string; v: string; mono?: boolean; truncate?: boolean }) {
-  return (
-    <div className="flex items-baseline gap-2">
-      <span className="shrink-0 text-[10px] uppercase tracking-wider text-muted-foreground">{k}</span>
-      <span
-        className={`min-w-0 flex-1 ${mono ? "font-mono text-[11px]" : ""} ${truncate ? "truncate" : "break-words"}`}
-        title={truncate ? v : undefined}
-      >
-        {v}
-      </span>
-    </div>
-  );
-}
-
 function RobotLibraryCard({ slug, librarySlug }: { slug: string; librarySlug: string }) {
   const lib = useLibraryRobot(librarySlug);
   const phys = usePhysics(slug);
   const entry = lib.data;
   if (lib.isLoading) {
     return (
-      <Card>
-        <CardHeader><CardTitle className="text-sm">Library entry</CardTitle></CardHeader>
-        <CardContent className="text-xs text-muted-foreground"><Loader2 className="inline h-3 w-3 animate-spin" /> Loading…</CardContent>
-      </Card>
+      <div className="rs-card rs-card-pad">
+        <div className="rs-flex rs-gap-8 rs-sub"><Icon name="loader" size={14} className="rs-spin" />Loading library entry…</div>
+      </div>
     );
   }
   if (!entry) return null;
@@ -290,55 +246,38 @@ function RobotLibraryCard({ slug, librarySlug }: { slug: string; librarySlug: st
   const njnt = summary?.joints?.length ?? null;
   const nu = summary?.actuators?.length ?? null;
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle className="flex items-center gap-2 text-sm">
-          {entry.display_name}
-          <UIBadge variant="outline" className="text-[10px]">{entry.category}</UIBadge>
-        </CardTitle>
-        <CardDescription className="text-xs">{entry.description || "Library-sourced robot."}</CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-2 text-xs">
-        <KV k="slug" v={entry.slug} mono />
-        <KV k="source" v={entry.source} mono />
-        {entry.menagerie_package && <KV k="menagerie" v={entry.menagerie_package} mono truncate />}
-        <KV k="training" v={entry.training_support} mono />
-        {njnt !== null && <KV k="joints" v={String(njnt)} mono />}
-        {nu !== null && <KV k="actuators" v={String(nu)} mono />}
+    <div className="rs-card">
+      <div className="rs-card-head">
+        <div className="rs-card-title">{entry.display_name}<span className="rs-tag" style={{ marginLeft: 6 }}>{entry.category}</span></div>
+      </div>
+      <div className="rs-card-pad rs-vgap-8">
+        <p className="rs-sub" style={{ margin: 0, fontSize: 13 }}>{entry.description || "Library-sourced robot."}</p>
+        <div className="rs-kv">
+          <div className="k">slug</div><div className="v">{entry.slug}</div>
+          <div className="k">source</div><div className="v">{entry.source}</div>
+          {entry.menagerie_package && (<><div className="k">menagerie</div><div className="v" style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={entry.menagerie_package}>{entry.menagerie_package}</div></>)}
+          <div className="k">training</div><div className="v">{entry.training_support}</div>
+          {njnt !== null && (<><div className="k">joints</div><div className="v">{njnt}</div></>)}
+          {nu !== null && (<><div className="k">actuators</div><div className="v">{nu}</div></>)}
+        </div>
         {summary?.parse_error && (
-          <p className="rounded border border-amber-500/40 bg-amber-500/5 px-1.5 py-1 text-[10px] text-amber-700 dark:text-amber-300">
-            MJCF parse error — check the Physics tab: {summary.parse_error}
-          </p>
+          <div className="rs-banner warn"><Icon name="alert-triangle" size={15} /><span className="rs-grow">MJCF parse error — see Physics tab: {summary.parse_error}</span></div>
         )}
         {entry.references.length > 0 && (
           <div>
-            <div className="mb-0.5 text-[10px] uppercase tracking-wider text-muted-foreground">References</div>
-            <ul className="space-y-0.5">
+            <div className="rs-eyebrow" style={{ marginBottom: 6 }}>References</div>
+            <div className="rs-vgap-8">
               {entry.references.slice(0, 6).map((r, i) => (
-                <li key={i} className="flex items-baseline gap-1.5 text-[10.5px]">
-                  <a href={r.url} target="_blank" rel="noreferrer noopener"
-                    className="inline-flex items-center gap-1 truncate text-foreground underline-offset-2 hover:underline" title={r.citation}>
-                    <span className="truncate">{r.citation}</span>
-                    <ExternalLink className="h-3 w-3 shrink-0" />
-                  </a>
-                </li>
+                <a key={i} href={r.url} target="_blank" rel="noreferrer noopener"
+                  className="rs-flex rs-gap-6" style={{ fontSize: 12.5, color: "var(--ink)", overflow: "hidden" }} title={r.citation}>
+                  <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{r.citation}</span>
+                  <Icon name="external" size={12} />
+                </a>
               ))}
-            </ul>
+            </div>
           </div>
         )}
-        <div className="pt-1">
-          <Button asChild size="sm" variant="outline" className="w-full">
-            <a href="#physics" onClick={(e) => {
-              e.preventDefault();
-              const t = document.querySelector<HTMLButtonElement>('[role="tab"]:nth-of-type(3)');
-              t?.click();
-            }}>
-              <Wrench className="mr-1 h-3 w-3" />
-              Edit robot in Physics tab
-            </a>
-          </Button>
-        </div>
-      </CardContent>
-    </Card>
+      </div>
+    </div>
   );
 }

@@ -339,6 +339,31 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-04 — Ship 22d: re-skin Overview tab + RobotViewer
+
+Frontend-only. Verified live in Chrome, real data, zero console errors.
+
+- **What**:
+  - `components/RobotViewer.tsx` — rewritten preserving ALL logic verbatim (the
+    missions/runs polling + keepPolling, Static→Live auto-transition, useLiveClips,
+    useRunEvents `LiveStageRollout`, replay iter selection, fallbacks), swapping
+    chrome to rs- (`rs-viewer` / `rs-viewer-bar` / `rs-seg` mode switcher with
+    disabled Live/Replay when no runs / `rs-overlay` status + controls / `rs-scrub`
+    replay strip). Stage kept dark (`#16150f`) for real renders/video.
+  - `pages/ProjectDetail.tsx` — `OverviewTab` reskinned to rs: 2-col (RobotViewer +
+    "What this project is" / Project-facts rs-kv + RobotLibraryCard). Dropped the
+    shadcn Card + lucide imports from this file (now fully rs). Same shell/tab
+    routing as 22c.
+- **Verified**: tsc 0. Live (Chrome): Overview shows the real MuJoCo G1 render in
+  the rs viewer, mode-switcher disables Live/Replay (no runs), Project-facts rs-kv
+  with real config, Unitree G1 library card. No console errors. Backend/sculptor
+  untouched (305 / 364).
+- **Polish noted (for audit/22f)**: static camera-select + Re-render render as a
+  top-right overlay over the stage rather than in `rs-viewer-foot` below it
+  (prototype places them in the foot; would need lifting angle state).
+- **Transitional remaining**: Physics + Rewards (ScrollPad-wrapped old components),
+  Runs (old, full-height), all dialogs (22e+), RobotConfig + LibraryPage.
+
 ### 2026-06-04 — Ship 22c: re-skin project shell + Reports + Knowledge Graph tabs
 
 Third re-skin Ship: the ProjectDetail shell (header/tabs/facts) + 2 tabs.
