@@ -1,3 +1,4 @@
+import { useEffect, useRef } from "react";
 import type {
   ButtonHTMLAttributes, CSSProperties, ReactNode,
 } from "react";
@@ -279,4 +280,58 @@ export function Skel({
   w, h = 14, r, style,
 }: { w?: number | string; h?: number | string; r?: number; style?: CSSProperties }) {
   return <div className="rs-skel" style={{ width: w, height: h, borderRadius: r, ...style }} />;
+}
+
+// ── Modal (rs-scrim/rs-modal + a11y: Esc, initial focus, focus restore) ──
+export function Modal({
+  title, subtitle, icon, wide, onClose, children, footer,
+}: {
+  title: string;
+  subtitle?: ReactNode;
+  icon?: string;
+  wide?: boolean;
+  onClose: () => void;
+  children: ReactNode;
+  footer?: ReactNode;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const prev = document.activeElement as HTMLElement | null;
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    const focusable = ref.current?.querySelector<HTMLElement>(
+      'button:not([disabled]), [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+    );
+    (focusable ?? ref.current)?.focus();
+    return () => {
+      window.removeEventListener("keydown", onKey);
+      prev?.focus?.();
+    };
+  }, [onClose]);
+  return (
+    <div className="rs-scrim" onClick={onClose}>
+      <div
+        ref={ref}
+        className={"rs-modal" + (wide ? " wide" : "")}
+        onClick={(e) => e.stopPropagation()}
+        role="dialog"
+        aria-modal="true"
+        aria-label={title}
+        tabIndex={-1}
+      >
+        <div className="rs-modal-head">
+          <div style={{ display: "flex", alignItems: "center", gap: 10, minWidth: 0 }}>
+            {icon && <span style={{ color: "var(--rs-primary)" }}><Icon name={icon} size={18} /></span>}
+            <div>
+              <div className="rs-h3" style={{ fontSize: 17 }}>{title}</div>
+              {subtitle && <div className="rs-sub" style={{ fontSize: 13, marginTop: 2 }}>{subtitle}</div>}
+            </div>
+          </div>
+          <button className="rs-modal-x" onClick={onClose} aria-label="Close"><Icon name="x" size={18} /></button>
+        </div>
+        <div className="rs-modal-body">{children}</div>
+        {footer && <div className="rs-modal-foot">{footer}</div>}
+      </div>
+    </div>
+  );
 }

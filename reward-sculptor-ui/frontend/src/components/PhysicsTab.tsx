@@ -509,6 +509,7 @@ function MotorLimitsCard({ slug, summary }: { slug: string; summary: MjcfSummary
                               style={{ height: 28, padding: "2px 6px", textAlign: "right", width: 90 }}
                               disabled={apply.isPending}
                               placeholder="—"
+                              aria-label={`${name} ${k.replace(/_/g, " ")}`}
                             />
                           </td>
                         ))}

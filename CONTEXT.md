@@ -339,6 +339,47 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-05 — Ship 22f: audit-pass fixes (a11y + dark-mode), pre-Rewards/Runs
+
+Ran the audit-driven loop on the 22a-e reskin: 3 parallel Explore agents
+(code-correctness, UI/UX fidelity, WCAG a11y). VERIFIED every load-bearing claim
+against source before acting — rejected several plausible-but-wrong ones. Sam chose
+"audit first, fix, then do Rewards/Runs" so foundation issues don't propagate.
+
+- **Fixed (verified-real, no design-palette change)**:
+  - `components/rs/primitives.tsx` — new reusable `Modal` (rs-scrim/rs-modal) with
+    Esc-to-close, initial focus, focus-restore-on-close, role=dialog/aria-modal.
+    (Also the foundation for the dialog reskin in a later ship.)
+  - `pages/ProjectList.tsx` — delete-confirm now uses `Modal` (was an inline scrim
+    with no Esc/focus); table rows made keyboard-operable (tabIndex/role=button/
+    Enter+Space/aria-label) — were mouse-only `<tr onClick>`.
+  - `components/PhysicsTab.tsx` — per-actuator motor inputs got `aria-label`
+    (were unlabelled cells under column headers).
+  - `index.css` — added a `.dark { … }` block with warm-dark values for the shadcn
+    tokens. PRE-EXISTING BUG: the app toggled `.dark` but defined no dark values, so
+    every shadcn surface (the still-transitional Rewards/Runs/dialogs) stayed light
+    in dark mode (light text on white = invisible). Now readable. (NOT the code
+    agent's suggested fix of restoring `text-foreground` on `<body>` — that would
+    re-break the rs dark-mode headings fixed in 22b.) Verified live: Rewards tab
+    now dark-correct.
+- **Rejected (verified false / not applicable)**: code-agent's "CRITICAL body
+  text-foreground" (its fix regresses 22b); UX-agent's "facts band missing on
+  Physics/KG/Reports" (it shows on all non-Runs tabs — confirmed in screenshots);
+  a11y "prefers-reduced-motion not covered" (the `*{animation-duration:.001s}` rule
+  covers it); video-captions (silent rollout video, pre-existing empty track).
+- **Deferred (noted, not strict-AA blockers)**: tab roving-arrow-nav + role=tabpanel
+  (tabs are already `<button>`+role=tablist/tab/aria-selected = keyboard-operable;
+  a tabpanel wrapper risks the rs-scroll flex layout); RobotViewer static camera
+  controls as overlay vs rs-viewer-foot.
+- **SURFACED to Sam (design-vs-AA tradeoff, NOT changed unilaterally — fidelity to
+  the prototype's exact brand was the explicit directive)**: white-on-Cursor-Orange
+  primary CTA ≈ 3.5:1 and `--muted` sub-text ≈ 3.8:1 are below WCAG-AA 4.5:1, but
+  they are the prototype's exact tokens. Hitting AA needs a visibly different
+  (darker/brick) orange + darker muted-gray. Awaiting Sam's call; keeping the
+  prototype colors for now.
+- **Verified**: tsc 0. Live: delete Modal (Esc/focus), keyboard rows, dark-mode
+  Rewards tab readable. Backend/sculptor untouched (305 / 364).
+
 ### 2026-06-05 — Ship 22e: re-skin Physics tab
 
 Frontend-only. Verified live in Chrome, real data, zero console errors.

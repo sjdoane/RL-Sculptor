@@ -2,7 +2,7 @@ import { useState } from "react";
 import { useNavigate } from "react-router-dom";
 
 import { Icon } from "@/components/rs/icon";
-import { Badge, Btn, IconBtn, Sparkline } from "@/components/rs/primitives";
+import { Badge, Btn, IconBtn, Modal, Sparkline } from "@/components/rs/primitives";
 import { useDeleteProject, useProjects } from "@/hooks/useProjects";
 import { formatRelative } from "@/lib/utils";
 import type { ProjectSummary } from "@/lib/types";
@@ -79,7 +79,20 @@ export default function ProjectList() {
               </thead>
               <tbody>
                 {projects.map((p) => (
-                  <tr key={p.slug} onClick={() => nav(`/projects/${p.slug}`)} style={{ cursor: "pointer" }}>
+                  <tr
+                    key={p.slug}
+                    onClick={() => nav(`/projects/${p.slug}`)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        nav(`/projects/${p.slug}`);
+                      }
+                    }}
+                    tabIndex={0}
+                    role="button"
+                    aria-label={`Open project ${p.display_name}`}
+                    style={{ cursor: "pointer" }}
+                  >
                     <td className="name" style={{ fontFamily: "var(--font-sans)" }}>{p.display_name}</td>
                     <td><Badge status={p.status} /></td>
                     <td>{adapterShort(p.adapter_class)}</td>
@@ -116,30 +129,12 @@ export default function ProjectList() {
       </div>
 
       {confirm && (
-        <div className="rs-scrim" onClick={() => !del.isPending && setConfirm(null)}>
-          <div className="rs-modal" onClick={(e) => e.stopPropagation()} role="dialog" aria-modal="true" aria-label="Delete project">
-            <div className="rs-modal-head">
-              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                <span style={{ color: "var(--st-rose)" }}><Icon name="trash" size={18} /></span>
-                <div className="rs-h3" style={{ fontSize: 17 }}>Delete project</div>
-              </div>
-              <button className="rs-modal-x" onClick={() => !del.isPending && setConfirm(null)} aria-label="Close">
-                <Icon name="x" size={18} />
-              </button>
-            </div>
-            <div className="rs-modal-body">
-              <p className="rs-sub" style={{ margin: 0 }}>
-                Permanently delete <b style={{ color: "var(--ink)" }}>{confirm.display_name}</b> and all its runs,
-                rewards, and knowledge graph? This cannot be undone.
-              </p>
-              {del.error && (
-                <div className="rs-banner err">
-                  <Icon name="alert-triangle" size={17} />
-                  <span className="rs-grow">{(del.error as Error).message}</span>
-                </div>
-              )}
-            </div>
-            <div className="rs-modal-foot">
+        <Modal
+          title="Delete project"
+          icon="trash"
+          onClose={() => { if (!del.isPending) setConfirm(null); }}
+          footer={
+            <>
               <Btn kind="quiet" onClick={() => setConfirm(null)} disabled={del.isPending}>Cancel</Btn>
               <Btn
                 kind="danger"
@@ -149,9 +144,20 @@ export default function ProjectList() {
               >
                 {del.isPending ? "Deleting…" : "Delete project"}
               </Btn>
+            </>
+          }
+        >
+          <p className="rs-sub" style={{ margin: 0 }}>
+            Permanently delete <b style={{ color: "var(--ink)" }}>{confirm.display_name}</b> and all its runs,
+            rewards, and knowledge graph? This cannot be undone.
+          </p>
+          {del.error && (
+            <div className="rs-banner err">
+              <Icon name="alert-triangle" size={17} />
+              <span className="rs-grow">{(del.error as Error).message}</span>
             </div>
-          </div>
-        </div>
+          )}
+        </Modal>
       )}
     </div>
   );
