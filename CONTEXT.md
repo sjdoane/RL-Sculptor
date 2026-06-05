@@ -339,6 +339,30 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-05 — Ship 22g: re-skin Rewards tab
+
+Frontend-only. The prototype's signature code/diff/why-this-edit screen.
+
+- **What**: `components/RewardsTab.tsx` rewritten. ALL Ship 21b/21d scope logic
+  preserved VERBATIM (missions/runs + keepPolling, liveStageScope, sticky
+  stickyStageScope, scopeOverride/effectiveScope, pollMs, the 3 effects that
+  reset/auto-advance selection, edit-lock-in-stage-scope). Restyled to rs:
+  rs-prompt hero ("Generate vN" + activity panel), rs-seg Project/Stage scope
+  toggle, rs-twocol (rs-verlist versions / detail), detail header + rs-code
+  chrome around the read-only **Monaco** source (kept Monaco per audit C3 — the
+  prototype's regex tokenizer mis-highlights arbitrary code), Diff-vs-parent via
+  MonacoDiffLazy, rs-why "Why this edit?" (failure chips + evidence + proposed
+  edits + arxiv links), EditorPane (Monaco editable + note + save + violations),
+  4-section REWARD_SPEC (hyperparameters/grounding/references/probe). The
+  regenerate-template confirm now uses the rs `Modal` primitive (was shadcn Dialog).
+  Author badges via the rs AuthorBadge.
+- **Dropped**: the separate ContractPreamble card (the compute_reward signature
+  contract is shown in the v0 source docstring itself + enforced server-side with
+  surfaced violations) — matches the prototype's cleaner layout.
+- **Verified**: tsc 0. Live (Chrome): rs-prompt, Versions (v0/HUMAN), Monaco v0.py
+  with syntax highlighting, real data. Why-panel correctly hidden for v0/human.
+  Zero console errors. Backend/sculptor untouched (305 / 364).
+
 ### 2026-06-05 — Ship 22f: audit-pass fixes (a11y + dark-mode), pre-Rewards/Runs
 
 Ran the audit-driven loop on the 22a-e reskin: 3 parallel Explore agents
