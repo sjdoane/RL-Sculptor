@@ -375,8 +375,10 @@ against source before acting — rejected several plausible-but-wrong ones. Sam 
   the prototype's exact brand was the explicit directive)**: white-on-Cursor-Orange
   primary CTA ≈ 3.5:1 and `--muted` sub-text ≈ 3.8:1 are below WCAG-AA 4.5:1, but
   they are the prototype's exact tokens. Hitting AA needs a visibly different
-  (darker/brick) orange + darker muted-gray. Awaiting Sam's call; keeping the
-  prototype colors for now.
+  (darker/brick) orange + darker muted-gray. → RESOLVED (Sam): keep the
+  white-on-Cursor-Orange CTA exactly (it's the brand signature); darken only
+  `--rs-muted` light token #807d72 → #706e63 (≈4.8:1 on canvas/cards). Dark-mode
+  muted already passed (5.2:1). CTA stays ~3.5:1 by design choice.
 - **Verified**: tsc 0. Live: delete Modal (Esc/focus), keyboard rows, dark-mode
   Rewards tab readable. Backend/sculptor untouched (305 / 364).
 

@@ -37,7 +37,10 @@
   --ink:         #26251e;  /* display + body emphasis — warm near-black */
   --body:        #5a5852;  /* default running text */
   --body-strong: #26251e;  /* = ink */
-  --rs-muted:       #807d72;  /* sub-titles */
+  --rs-muted:       #706e63;  /* sub-titles — darkened from prototype #807d72 to
+                                 clear WCAG-AA 4.5:1 on canvas/cards (≈4.8:1), per
+                                 Sam's "keep CTA, darken muted" call. Dark-mode
+                                 --rs-muted already passes (5.2:1). */
   --rs-muted-soft:  #a09c92;  /* disabled text */
   --on-primary:  #ffffff;  /* white text on Cursor Orange */
 
