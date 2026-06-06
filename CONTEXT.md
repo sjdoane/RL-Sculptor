@@ -339,6 +339,31 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-06 — Ship 22p: run.sh no longer self-kills on headless/WSL (browser-open)
+
+Bug: on a headless box or WSL (no Linux browser), `./run.sh` started the
+backend + Vite fine, then the auto-open step ran `open`/`xdg-open`, which exit
+non-zero ("xdg-open: no method available"). Because the script runs under
+`set -euo pipefail`, that non-zero return tripped the `trap cleanup EXIT` and
+tore down the **backend**. Vite kept serving, so every `/api/*` call hit a dead
+backend → the UI showed "Failed to load projects: Internal Server Error",
+"No GPU", "No CUDA" (all downstream symptoms — backend + GPU detection were
+fine; the server had just been killed).
+
+Fix (`reward-sculptor-ui/run.sh`): wrapped the browser-open in
+`{ … } >/dev/null 2>&1 || warn …` so a failing/missing opener can never trip
+`set -e`/the EXIT trap — the script continues to `wait -n` and stays alive.
+Also reordered openers to prefer **`wslview`** (hands off to the *Windows*
+default browser on WSL) over `xdg-open`/`open`, and on total failure it prints
+"open http://localhost:5173 yourself" instead of dying. `chmod +x` reapplied
+(Edit drops the exec bit).
+
+Verified: extracted the exact `set -e` + EXIT-trap + non-fatal-opener sequence
+and confirmed control reaches the line *after* the opener (old code exited
+there). `bash -n run.sh` clean. Note: auto-open only works if `wslview` is
+installed (`sudo apt install wslu`); without it the servers still run and you
+open localhost:5173 manually. No app/library code touched.
+
 ### 2026-06-06 — Ship 22o: current viewer wiring + disable metric auto-kill
 
 User-facing fixes:
