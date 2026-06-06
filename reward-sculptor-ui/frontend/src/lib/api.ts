@@ -390,7 +390,7 @@ export async function fetchPreviewBlob(
   slug: string,
   opts?: PreviewQueryParams,
 ): Promise<string> {
-  const res = await fetch(previewUrl(slug, opts));
+  const res = await fetch(previewUrl(slug, opts), { cache: "no-store" });
   if (!res.ok) {
     let problem: ProblemDetail;
     try {

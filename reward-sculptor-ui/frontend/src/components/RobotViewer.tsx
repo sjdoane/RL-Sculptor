@@ -46,12 +46,11 @@ export function RobotViewer({ slug }: { slug: string }) {
     [missions.data],
   );
   const runs = useRuns(slug, { keepPolling: missionActive });
-  const activeRun = useMemo(
-    () => (runs.data ?? []).find((r) => r.status === "running" || r.status === "queued") ?? null,
-    [runs.data],
-  );
+  const activeRun = useMemo(() => pickActiveRun(runs.data ?? []), [runs.data]);
   const mostRecentRun = useMemo(() => pickMostRecent(runs.data ?? []), [runs.data]);
-  const trackedRunId = mostRecentRun?.run_id ?? null;
+  const liveRun = activeRun ?? mostRecentRun;
+  const liveRunId = liveRun?.run_id ?? null;
+  const replayRun = activeRun ?? mostRecentRun;
 
   const [mode, setMode] = useState<Mode>("static");
   const [userPicked, setUserPicked] = useState(false);
@@ -70,6 +69,10 @@ export function RobotViewer({ slug }: { slug: string }) {
 
   const [replayIter, setReplayIter] = useState<number | null>(null);
 
+  useEffect(() => {
+    setReplayIter(null);
+  }, [replayRun?.run_id]);
+
   return (
     <div className="rs-viewer">
       <div className="rs-viewer-bar">
@@ -78,13 +81,13 @@ export function RobotViewer({ slug }: { slug: string }) {
           Robot viewer
           {activeRun && <span className="rs-dot live" style={{ marginLeft: 4 }} />}
         </div>
-        <ModeSwitcher mode={mode} onPick={pickMode} hasReplay={!!trackedRunId} hasLive={!!trackedRunId} />
+        <ModeSwitcher mode={mode} onPick={pickMode} hasReplay={!!replayRun} hasLive={!!liveRunId} />
       </div>
       <div className="rs-viewer-stage" style={STAGE_STYLE}>
         {mode === "static" && <StaticLayer slug={slug} />}
-        {mode === "live" && <LiveLayer slug={slug} runId={trackedRunId} run={mostRecentRun} />}
+        {mode === "live" && <LiveLayer slug={slug} runId={liveRunId} run={liveRun} />}
         {mode === "replay" && (
-          <ReplayLayer slug={slug} run={mostRecentRun} iter={replayIter} onPickIter={setReplayIter} />
+          <ReplayLayer slug={slug} run={replayRun} iter={replayIter} onPickIter={setReplayIter} />
         )}
       </div>
     </div>
@@ -94,11 +97,17 @@ export function RobotViewer({ slug }: { slug: string }) {
 function pickMostRecent(runs: RunSummary[]): RunSummary | null {
   if (runs.length === 0) return null;
   const sorted = [...runs].sort((a, b) => {
-    const ta = a.started_at ? new Date(a.started_at).getTime() : 0;
-    const tb = b.started_at ? new Date(b.started_at).getTime() : 0;
-    return tb - ta;
+    return runSortTime(b) - runSortTime(a);
   });
   return sorted[0];
+}
+
+function pickActiveRun(runs: RunSummary[]): RunSummary | null {
+  return pickMostRecent(runs.filter((r) => r.status === "running" || r.status === "queued"));
+}
+
+function runSortTime(run: RunSummary): number {
+  return run.started_at ? new Date(run.started_at).getTime() : 0;
 }
 
 // ── Mode switcher (rs-seg) ───────────────────────────────────────────
@@ -135,14 +144,17 @@ function ModeSwitcher({
 function StaticLayer({ slug }: { slug: string }) {
   const [angle, setAngle] = useState<CameraAngle>("iso");
   const [reRendering, setReRendering] = useState(false);
-  const { data: url, isLoading, error, invalidate } = useProjectPreview(slug, { angle });
+  const { data: url, isLoading, error, invalidate, refetch } = useProjectPreview(slug, { angle });
 
   const onReRender = async () => {
     setReRendering(true);
     try {
-      const res = await fetch(previewUrl(slug, { angle, regenerate: true }));
+      const res = await fetch(previewUrl(slug, { angle, regenerate: true }), { cache: "no-store" });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      await res.blob();
       invalidate();
+      await refetch();
+      toast.success("Preview re-rendered");
     } catch (e) {
       toast.error("Re-render failed", { description: (e as Error).message });
     } finally {

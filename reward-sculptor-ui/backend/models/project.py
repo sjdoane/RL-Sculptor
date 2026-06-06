@@ -139,7 +139,7 @@ class IterationSettings(BaseModel):
     render_every: Optional[Annotated[int, Field(ge=1, le=100)]] = None
     rollout_fps: Optional[Annotated[float, Field(gt=0, le=240)]] = None
     seed: Optional[Annotated[int, Field(ge=0, le=2**31 - 1)]] = None
-    # §Ship-9a: early-stop knobs (project defaults — per-run in RunParams).
+    # Legacy early-stop knobs retained as no-op compatibility fields.
     early_stop_enabled: Optional[bool] = None
     early_stop_patience: Optional[Annotated[int, Field(ge=1, le=100)]] = None
 

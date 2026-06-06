@@ -102,8 +102,6 @@ function IterationSettingsSection({
     { key: "render_every", label: "render_every", type: "number", min: 1, max: 100, hint: "capture every Nth step (advanced)" },
     { key: "rollout_fps", label: "rollout_fps (override)", type: "number", step: 1, min: 1, max: 240, hint: "force playback fps (blank = auto)" },
     { key: "seed", label: "seed", type: "number", min: 0, hint: "base RNG seed; iter N uses seed + N" },
-    { key: "early_stop_enabled", label: "early_stop_enabled", type: "bool", hint: "§Ship-9a: flip off for overnight runs where metric dips may mask real progress" },
-    { key: "early_stop_patience", label: "early_stop_patience", type: "number", min: 1, max: 100, hint: "consecutive no-improvement iters before truncation (default 3)" },
   ];
 
   const update = (key: keyof IterationSettings, raw: string | boolean) => {

@@ -338,7 +338,7 @@ export interface RunParamsPayload {
   rollout_episodes?: number | null;
   seed?: number | null;
   auto_adjust_physics?: boolean | null;
-  // Ship-9a — per-run early-stop control
+  // Legacy compatibility no-ops; metric-plateau auto-kill is disabled.
   early_stop_enabled?: boolean | null;
   early_stop_patience?: number | null;
 }

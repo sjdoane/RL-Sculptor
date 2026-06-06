@@ -210,9 +210,11 @@ input, textarea, select { font: inherit; color: inherit; }
 [data-theme="dark"] .rs-viewer-stage { background: radial-gradient(120% 120% at 50% 0%, #1c1b14, #100f0a); }
 .rs-viewer-bar { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px 16px; border-bottom: 1px solid var(--hairline); }
 .rs-viewer-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 11px 16px; border-top: 1px solid var(--hairline); }
+.rs-viewer-stage > img, .rs-viewer-stage > video { z-index: 1; }
 .rs-overlay { position: absolute; top: 12px; left: 12px; display: flex; align-items: center; gap: 8px;
   background: rgba(20,19,13,0.72); color: #f3f1e8; backdrop-filter: blur(3px);
-  padding: 6px 11px; border-radius: var(--radius-pill); font-family: var(--font-mono); font-size: 12px; }
+  padding: 6px 11px; border-radius: var(--radius-pill); font-family: var(--font-mono); font-size: 12px; z-index: 2; }
+.rs-scrub { z-index: 2; }
 .rs-grid-floor { position: absolute; inset: 0; background-image:
   linear-gradient(rgba(128,125,114,.14) 1px, transparent 1px),
   linear-gradient(90deg, rgba(128,125,114,.14) 1px, transparent 1px);

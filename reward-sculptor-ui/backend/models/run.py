@@ -96,13 +96,10 @@ class RunParams(BaseModel):
     projects via CONFIG_TEMPLATE; older projects default to false)."""
 
     early_stop_enabled: Optional[bool] = None
-    """§Ship-9a: flip off to run the full iteration budget even when
-    primary_metric plateaus. Useful for overnight runs where a
-    temporary dip can mask real behavioral improvement."""
+    """Legacy compatibility no-op. Metric-plateau auto-kill is disabled."""
 
     early_stop_patience: Optional[Annotated[int, Field(ge=1, le=100)]] = None
-    """§Ship-9a: consecutive no-improvement iters before early-stop
-    fires. Default 3 (current behavior). Larger = more patient."""
+    """Legacy compatibility no-op; accepted for older API clients/configs."""
 
 
 class IterEventSummary(BaseModel):

@@ -2313,13 +2313,11 @@ def test_goal_b_caps_at_max_extensions(
     assert exhausted[0]["extensions_used"] == 2
 
 
-def test_goal_b_does_not_extend_when_patience_early_stop_fired(
+def test_goal_b_does_not_extend_when_sculpt_run_already_stopped(
     tmp_path: Path, monkeypatch, stub_adapter,
 ):
-    """If the existing metric-plateau early-stop (Ship 9a) fired
-    inside sculpt_run, the metric ISN'T improving by definition.
-    Goal B's extension check should bail with reason=metric_plateau_
-    early_stop instead of attempting a futile extension."""
+    """If sculpt_run reports a non-criterion early stop, Goal B's
+    extension check should bail instead of attempting a futile extension."""
     from sculptor import sculpt as sculpt_mod
 
     m = _make_mission(tmp_path, n_stages=1)
@@ -2379,7 +2377,7 @@ def test_goal_b_does_not_extend_when_patience_early_stop_fired(
     skipped = [
         e for e in events
         if e.get("type") == "stage_extension_skipped"
-        and e.get("reason") == "metric_plateau_early_stop"
+        and e.get("reason") == "sculpt_run_early_stop"
     ]
     assert len(skipped) == 1
 

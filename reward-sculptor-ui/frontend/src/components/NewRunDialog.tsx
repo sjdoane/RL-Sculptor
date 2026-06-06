@@ -161,9 +161,6 @@ export function NewRunDialog({
   const [rolloutEpisodes, setRolloutEpisodes] = useState<number | "">("");
   const [seed, setSeed] = useState<number | "">("");
   const [autoAdjustPhysics, setAutoAdjustPhysics] = useState<boolean | null>(null);
-  // §Ship-9a: per-run early-stop controls (null = project default).
-  const [earlyStopEnabled, setEarlyStopEnabled] = useState<boolean | null>(null);
-  const [earlyStopPatience, setEarlyStopPatience] = useState<number | "">("");
   const launch = useLaunchRun(slug);
 
   // S8 / §7.7 — ETA estimate + resume-warning banner. Pure view-layer
@@ -216,9 +213,6 @@ export function NewRunDialog({
         typeof rolloutEpisodes === "number" ? rolloutEpisodes : null,
       seed: typeof seed === "number" ? seed : null,
       auto_adjust_physics: autoAdjustPhysics,
-      early_stop_enabled: earlyStopEnabled,
-      early_stop_patience:
-        typeof earlyStopPatience === "number" ? earlyStopPatience : null,
     };
     launch.mutate(body, {
       onSuccess: (r) => {
@@ -237,7 +231,6 @@ export function NewRunDialog({
     });
   };
 
-  const esPatience = typeof earlyStopPatience === "number" ? earlyStopPatience : 3;
   const numField = (
     v: number | "",
     set: (x: number | "") => void,
@@ -345,10 +338,7 @@ export function NewRunDialog({
                 <Field label="Sculpt iters (outer)" htmlFor="run-iters">
                   {numField(iterations, (v) => setIterations(typeof v === "number" ? v : 1), { id: "run-iters", min: 1, max: 100 })}
                   <p className="rs-hintline">
-                    Full train → diagnose → edit cycles.{" "}
-                    {earlyStopEnabled === false
-                      ? "Early-stop disabled — runs full budget."
-                      : `Early-stop after ${esPatience} no-improvement iter${esPatience === 1 ? "" : "s"} (project default unless overridden).`}
+                    Full train → diagnose → edit cycles. Runs no longer auto-kill on reward dips.
                   </p>
                 </Field>
                 <Field label={defaults.training_label} htmlFor="run-trainiters">
@@ -403,7 +393,7 @@ export function NewRunDialog({
                 </div>
               </div>
 
-              {/* auto-physics + early-stop selects, expand-kg / no-kg toggles */}
+              {/* auto-physics selects, expand-kg / no-kg toggles */}
               <div style={{ display: "flex", flexDirection: "column", gap: 11, border: "1px solid var(--hairline)", borderRadius: "var(--radius-md)", padding: 13 }}>
                 <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", fontSize: 12.5 }}>
                   <span style={{ fontWeight: 500, color: "var(--ink)" }}>Auto-physics on severe</span>
@@ -420,36 +410,6 @@ export function NewRunDialog({
                     </select>
                   </div>
                   <span style={{ color: "var(--rs-muted)" }}>emits a physics-edit chip on severe realism audits.</span>
-                </div>
-
-                <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", fontSize: 12.5 }}>
-                  <span style={{ fontWeight: 500, color: "var(--ink)" }}>Early-stop</span>
-                  <div className="rs-select">
-                    <select
-                      value={earlyStopEnabled === null ? "default" : earlyStopEnabled ? "on" : "off"}
-                      onChange={(e) => { const v = e.target.value; setEarlyStopEnabled(v === "default" ? null : v === "on"); }}
-                      disabled={launch.isPending}
-                      aria-label="Early-stop"
-                    >
-                      <option value="default">project default</option>
-                      <option value="on">on</option>
-                      <option value="off">off (run full budget)</option>
-                    </select>
-                  </div>
-                  <label htmlFor="run-espatience" style={{ color: "var(--rs-muted)" }}>patience</label>
-                  <input
-                    id="run-espatience"
-                    type="number"
-                    className="rs-input mono"
-                    style={{ width: 70 }}
-                    min={1}
-                    max={100}
-                    value={earlyStopPatience}
-                    onChange={(e) => { const v = e.target.value; setEarlyStopPatience(v === "" ? "" : Number(v)); }}
-                    disabled={launch.isPending || earlyStopEnabled === false}
-                    placeholder="3"
-                  />
-                  <span style={{ color: "var(--rs-muted)" }}>iters of no improvement before truncation.</span>
                 </div>
 
                 <ToggleRow

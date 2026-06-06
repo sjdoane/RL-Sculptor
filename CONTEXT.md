@@ -339,6 +339,48 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-06 — Ship 22o: current viewer wiring + disable metric auto-kill
+
+User-facing fixes:
+
+- Overview RobotViewer now chooses the active running/queued run for Live
+  (and Replay while a run is active) instead of blindly using the most
+  recent historical run. This fixes Live showing clips from an older run
+  while a newer run is active, and resets the replay iter picker when the
+  selected run changes so an old iteration selection cannot stick.
+- Static preview re-render now uses `cache: "no-store"`, consumes the
+  regenerate response, invalidates preview queries, and forces an active
+  refetch so the visible photo updates immediately after the backend
+  rewrites `preview_<angle>.png`.
+- Fixed RobotViewer stacking order: media is now below `.rs-overlay` and
+  `.rs-scrub`, so static controls (camera angle + Re-render) and replay
+  controls receive pointer events instead of clicks landing on the image/video.
+- Removed the New Run and Project Settings early-stop controls. Runs no
+  longer advertise or send the old "kill after N no-improvement iters"
+  heuristic.
+
+Core behavior:
+
+- Disabled the metric-plateau auto-kill in `RewardSculptor/sculptor/sculpt.py`.
+  `_should_early_stop(...)` remains as a compatibility shim, but always
+  returns `False`; the inner sculpt loop no longer halts based on primary
+  metric history, even for legacy configs with `early_stop_enabled = true`.
+- Kept mission success-criterion stopping (`early_stop_on_criterion`) intact;
+  that is goal-aware and distinct from the removed reward-history heuristic.
+- Kept backend/CLI/API fields parseable for compatibility, but documented
+  them as no-ops. Route shapes and pydantic fields were not removed.
+
+Validation:
+
+- `reward-sculptor-ui/frontend`: `pnpm build` (tsc -b + Vite) ✅
+- `RewardSculptor`: `uv run pytest tests/ -q` ✅ — 364 passed, 1 skipped.
+- `reward-sculptor-ui`: `uv run pytest backend/tests/ -q -k 'not test_reward_prompt_edit_emits'` ✅ — 305 passed, 1 deselected.
+- Browser smoke (`http://localhost:5173/projects/unitree-g1-3`) ✅:
+  Overview static preview rendered, Re-render clicked through the overlay,
+  spinner appeared, backend `preview_iso.png` mtime updated, and the visible
+  blob URL changed. New Run dialog Basic + Advanced no longer show early-stop
+  or patience controls.
+
 ### 2026-06-05 — Ship 22n: final audit — fix the (no-op) typecheck gate + a11y focus trap
 
 The audit-driven close-out of the prototype integration. Two real problems found.

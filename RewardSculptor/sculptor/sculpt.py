@@ -20,11 +20,11 @@ Flags:
   --dry-run           bypass the LLM in diagnose + apply_edits, cap training
                       steps at 1000. Used for plumbing smoke tests.
 
-Early-stop: if the adapter's primary_metric does not exceed its best-so-far
-for `early_stop_patience` consecutive iterations (default 3), the loop
-halts. §Ship-9a: `early_stop_enabled = false` under `[iteration]` turns
-the check off entirely — preferred for long overnight runs where a
-transient metric dip can mask real behavioral improvement.
+Metric-plateau auto-kill is disabled: reward changes can fundamentally
+alter the meaning of the adapter's primary_metric from one iteration to
+the next, so a short no-improvement window is not a reliable halt signal.
+Mission runs may still stop a stage when an explicit success criterion is
+satisfied via the per-iteration callback.
 
 `sculpt init <project_dir> --adapter <name>` scaffolds a fresh project with
 config.toml, rewards/v0.py, kg_seeds.yml, .gitignore, and an initial git
@@ -1155,25 +1155,13 @@ def _should_early_stop(
     *,
     enabled: bool = True,
 ) -> bool:
-    """True when early-stop should fire now. `enabled=False` forces
-    False regardless of history (used when the user disables early-stop
-    from the UI). `patience` must be ≥ 1; patience=0 also disables
-    (history window of zero is meaningless).
+    """Compatibility shim for the removed metric-plateau auto-kill.
 
-    §Ship-9a: Sam's feedback was that a flat or slightly-decreasing
-    primary_metric can mask genuine behavioral improvement (reward
-    hacking → sculptor removes the exploit → metric drops but motion
-    looks better). Exposing both knobs lets a long overnight run
-    complete on the requested iter budget rather than truncating.
+    Older callers/tests import this helper and older configs may still
+    contain `early_stop_*` fields. Keep the symbol and parameters stable,
+    but never halt based on primary-metric history.
     """
-    if not enabled or patience < 1:
-        return False
-    clean = [v for v in history if v is not None]
-    if len(clean) < patience + 1:
-        return False
-    recent_max = max(clean[-patience:])
-    prior_max = max(clean[:-patience])
-    return recent_max <= prior_max
+    return False
 
 
 # ── Public entry: run + init ─────────────────────────────────────────────
@@ -1258,9 +1246,10 @@ def sculpt_run(
         ("rollout_episodes", rollout_episodes),
         ("seed", seed),
         ("auto_adjust_physics", auto_adjust_physics),
-        ("early_stop_enabled", early_stop_enabled),
-        ("early_stop_patience", early_stop_patience),
     )
+    # `early_stop_enabled` / `early_stop_patience` remain accepted by the
+    # public function and CLI for compatibility, but metric-plateau auto-kill
+    # is disabled and the values are intentionally ignored.
     for key, val in _OVERRIDE_KEYS:
         if val is None:
             continue
@@ -1386,31 +1375,6 @@ def sculpt_run(
                     })
                     break
 
-            # §Ship-9a: honor configurable early-stop knobs from
-            # [iteration]. Defaults preserve the pre-Ship-9 behavior
-            # (enabled=true, patience=3). `or 3` for patience means an
-            # explicit `None` in the config falls back to the safe
-            # default rather than silently disabling the check.
-            _iter_cfg_now = cfg.get("iteration") or {}
-            _es_enabled = bool(_iter_cfg_now.get("early_stop_enabled", True))
-            _es_patience = int(_iter_cfg_now.get("early_stop_patience") or 3)
-            if _should_early_stop(
-                result.primary_metric_history,
-                patience=_es_patience,
-                enabled=_es_enabled,
-            ):
-                result.early_stopped = True
-                result.early_stop_reason = (
-                    f"no improvement in {cfg.get('iteration', {}).get('primary_metric', 'mean_return')} "
-                    f"over the last {_es_patience} iterations")
-                print(f"[sculpt] early-stop: {result.early_stop_reason}")
-                _emit_event({
-                    "type": "early_stop",
-                    "at_iter": outcome.iter_index,
-                    "reason": result.early_stop_reason,
-                    "patience": _es_patience,
-                })
-                break
     finally:
         if kg_store is not None:
             kg_store.close()
@@ -1577,12 +1541,10 @@ rollout_episodes = 6
 # one-click application. Defaults to true so new projects get the
 # full loop out of the box; flip to false for comparison runs.
 auto_adjust_physics = true
-# §Ship-9a: early-stop knobs. `early_stop_patience` is the number of
-# consecutive iterations with no primary_metric improvement before
-# the run truncates; `early_stop_enabled = false` disables the check
-# entirely (useful for long overnight runs where metric transients
-# can mask real behavioral progress).
-early_stop_enabled = true
+# Legacy compatibility fields. Metric-plateau auto-kill is disabled and
+# these values are ignored by sculpt_run; keep them so older UI/API clients
+# and config files continue to parse without migration.
+early_stop_enabled = false
 early_stop_patience = 3
 # §Ship-7: rollout video knobs. All optional — leaving them unset makes
 # the runner pick real-time playback with a 500-step episode cap.
@@ -2471,9 +2433,8 @@ def _run_one_stage(
         # Already passing? No need to extend.
         if _criterion_satisfied_now(sculpt_result):
             break
-        # Patience-based metric-plateau early-stop fired — the metric
-        # ISN'T improving by definition. Don't extend; that's exactly
-        # the case Goal B should NOT fire on.
+        # Any non-criterion sculpt_run early-stop means the stage already
+        # chose to halt. Metric-plateau auto-kill no longer fires here.
         if (
             sculpt_result is not None
             and sculpt_result.early_stopped
@@ -2481,7 +2442,7 @@ def _run_one_stage(
             emit({
                 "type": "stage_extension_skipped",
                 "stage_name": stage.name,
-                "reason": "metric_plateau_early_stop",
+                "reason": "sculpt_run_early_stop",
             })
             break
         if extensions_used >= max(0, max_extensions_per_stage):

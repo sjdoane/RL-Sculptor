@@ -283,13 +283,10 @@ def run(
         help="Enable/disable §7.4 physics-edit suggestion on severe realism verdicts."),
     early_stop_enabled: Optional[bool] = typer.Option(
         None, "--early-stop/--no-early-stop",
-        help="§Ship-9a: enable or disable the early-stop check. "
-             "Disable for long overnight runs where a transient metric "
-             "dip may mask real behavioral improvement."),
+        help="Compatibility no-op: metric-plateau auto-kill is disabled."),
     early_stop_patience: Optional[int] = typer.Option(
         None, "--early-stop-patience",
-        help="§Ship-9a: consecutive iterations with no primary_metric "
-             "improvement before early-stop fires (default 3)."),
+        help="Compatibility no-op: accepted but ignored."),
 ):
     """Run the inner loop: train → rollout → diagnose → edit → commit."""
     from sculptor.sculpt import sculpt_run
