@@ -90,6 +90,12 @@ SAFE_ATTRIBUTE_METHODS: frozenset[str] = frozenset({
     # `.item()` is valid numpy — extracts a Python scalar from a
     # 0-d array; safe.
     "item", "shape", "size",
+    # `dict.get(key, default)` — lets a criterion soft-probe a key that
+    # the reward MAY not have produced yet, e.g.
+    # `components.get('hip_sway_osc', 0.0) > 0.5`, instead of a bare
+    # `components['hip_sway_osc']` that KeyErrors mid-mission. Safe:
+    # the AST walker already restricts the receiver to namespace dicts.
+    "get",
     # §Ship 21c: `.astype(...)` is the numpy way to do what users
     # familiar with torch reach for via `.float()`. Allow it so
     # `(arr > 0.5).astype(float).mean()` works as a fallback when
@@ -145,6 +151,21 @@ class CriterionEvalError(RuntimeError):
     """Raised by `_evaluate_success_criterion` on any semantic or safety
     violation (bad identifier, unsafe attribute, unresolvable subscript,
     etc.). Caller should mark the stage failed with this as the reason.
+    """
+
+
+class CriterionMissingKeyError(CriterionEvalError):
+    """The criterion subscripted a namespace dict (behavior / components /
+    info / trajectory) with a key the adapter / reward did NOT produce this
+    iter, e.g. `components['hip_sway_osc']` when the reward never emitted a
+    `hip_sway_osc` term.
+
+    This is semantically distinct from a *broken* criterion: the measured
+    quantity is simply absent, which means the criterion is NOT satisfied —
+    not that it is unparseable or unsafe. Callers route this to the
+    recoverable `criterion_not_met` (re-decomposable) outcome rather than the
+    fatal `criterion_errored`, so one mistyped/early-referenced key can't
+    halt a multi-hour mission.
     """
 
 
@@ -282,6 +303,28 @@ def _evaluate_success_criterion(
                 ) from e
         raise CriterionEvalError(
             f"criterion raised at eval time: {type(e).__name__}: {e}"
+        ) from e
+    except KeyError as e:  # noqa: BLE001 — re-raised as our type
+        # The criterion subscripted a namespace dict with a key the reward
+        # / adapter did not produce. Distinct from a broken criterion: the
+        # quantity is just absent → "not satisfied", and recoverable via
+        # re-decomposition. Surface the missing key + what WAS available so
+        # the re-decomposer (and the user) can pick a real key.
+        missing = e.args[0] if e.args else str(e)
+        available: dict[str, Any] = {}
+        for _name in ("behavior", "components", "info", "trajectory"):
+            _val = namespace.get(_name)
+            if isinstance(_val, dict):
+                available[_name] = sorted(_val.keys())
+        avail_str = (
+            "; ".join(f"{k}={v}" for k, v in available.items())
+            or "(no dict-valued namespace entries loaded)"
+        )
+        raise CriterionMissingKeyError(
+            f"criterion references key {missing!r}, which the reward/adapter "
+            f"did not produce this iter. Available keys — {avail_str}. "
+            f"Reference only keys your reward_seed_prompt actually defines, "
+            f"or use `<dict>.get({missing!r}, <default>)` for a soft check."
         ) from e
     except Exception as e:  # noqa: BLE001 — re-raised as our type
         raise CriterionEvalError(

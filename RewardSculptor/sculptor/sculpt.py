@@ -2320,6 +2320,7 @@ def _run_one_stage(
     # mode) when metric is still improving at end-of-budget.
     from sculptor.mission_runtime import (
         CriterionEvalError,
+        CriterionMissingKeyError,
         _build_criterion_namespace,
         _evaluate_success_criterion,
     )
@@ -2538,14 +2539,24 @@ def _run_one_stage(
             stage.success_criterion, namespace,
         )
     except CriterionEvalError as e:
+        # A criterion that references a metric/component the reward never
+        # produced (KeyError → CriterionMissingKeyError) means the measured
+        # quantity is absent — i.e. the goal was NOT met, not that the
+        # criterion is broken. Route it to the recoverable, re-decomposable
+        # `criterion_not_met` so one early/typo'd key reference can't halt
+        # the whole mission. Genuine criterion bugs (syntax / unsafe AST /
+        # numpy-vs-torch dtype) stay `criterion_errored`.
+        missing_key = isinstance(e, CriterionMissingKeyError)
+        reason = "criterion_not_met" if missing_key else "criterion_errored"
         emit({
             "type": "stage_criterion_evaluated",
             "stage_name": stage.name,
             "satisfied": False,
             "error": str(e),
+            "missing_key": missing_key,
         })
         return _fail_stage(
-            stage, "criterion_errored", str(e), emit,
+            stage, reason, str(e), emit,
             criterion_error=str(e),
         )
 
@@ -2645,11 +2656,24 @@ def _utc_now_iso() -> str:
 
 
 # ── Ship 17: redecomposition splice ─────────────────────────────────
-# Only criterion failures are re-decomposable. Infrastructure-class
+# Criterion-level failures are re-decomposable — re-authoring the stage
+# (new sub-stages with corrected criteria / seed prompts) can fix them:
+#   - criterion_not_met:  the goal threshold wasn't reached. A criterion
+#     that referenced a metric the reward never produced is rerouted here
+#     (see _run_one_stage step 6) — the quantity was absent, so the goal
+#     was not met, and a redecompose can pick a real key / add the term.
+#   - criterion_errored:  the criterion itself was malformed (bad dtype,
+#     unsafe AST) and slipped past decompose-time validation; a rewrite
+#     can correct it.
+# Both are bounded by the 1-attempt redecomposition cap, so a persistently
+# broken/unmet stage still halts after ONE recovery try rather than wasting
+# the whole multi-hour mission on the first stumble. Infrastructure-class
 # failures (training_errored, no_checkpoint, adapter_mismatch,
-# scaffold_errored, v1_materialization_errored) signal env / code
-# issues that re-decomposition can't fix.
-_REDECOMPOSABLE_REASONS: frozenset[str] = frozenset({"criterion_not_met"})
+# scaffold_errored, v1_materialization_errored) signal env / code issues
+# re-decomposition can't fix and are deliberately excluded.
+_REDECOMPOSABLE_REASONS: frozenset[str] = frozenset(
+    {"criterion_not_met", "criterion_errored"}
+)
 
 
 def _build_stage_training_feedback(

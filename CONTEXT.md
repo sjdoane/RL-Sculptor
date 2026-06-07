@@ -339,6 +339,58 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-06 — Ship 22q: criterion missing-key no longer halts the mission
+
+Bug (from Sam's run): the `hip_sway` stage failed with
+`stage_failed {reason: criterion_errored, detail: "KeyError: 'hip_sway_osc'"}`
+and the whole mission halted. Root cause chain:
+- A stage `success_criterion` subscripts a namespace dict —
+  `components['hip_sway_osc']` (Claude expected the reward seed prompt to
+  emit a `hip_sway_osc` term; it never did, or was named differently).
+- `_validate_criterion_ast` only validates top-level *names* (`components`),
+  not subscript *keys* (keys are runtime), so the bad key passes decompose-
+  time validation and `KeyError`s at the final eval.
+- The generic `except Exception` wrapped it as `criterion_errored`, which is
+  NOT in `_REDECOMPOSABLE_REASONS` → `_maybe_redecompose_and_splice` skips
+  (reason `non_curriculum_failure`) → mission halts irrecoverably. A
+  recoverable "the reward didn't produce this metric" became a fatal crash.
+  (Same class as the Ship-21c `.float()` 10-hour-loss incident: a
+  last-second criterion eval killing a long run.)
+
+Fix (sculptor core — `mission_runtime.py`, `sculpt.py`):
+- New `CriterionMissingKeyError(CriterionEvalError)`. `_evaluate_success_
+  criterion` now catches `KeyError` distinctly and raises it with an
+  actionable message: the missing key + the keys that WERE available in
+  behavior/components/info/trajectory.
+- `_run_one_stage` step 6 routes `CriterionMissingKeyError` to the
+  recoverable `criterion_not_met` (the measured quantity is absent → the
+  goal was not met) instead of `criterion_errored`, preserving the detail in
+  `criterion_error` and flagging `missing_key:true` on the
+  `stage_criterion_evaluated` event. The redecompose prompt already renders
+  `criterion_error` + `last_iter_namespace`, so the recovered stage sees the
+  missing key + available keys and can pick a real one / define the term.
+- Other failure modes hardened: `_REDECOMPOSABLE_REASONS` now also includes
+  `criterion_errored` (a malformed criterion that slipped past decompose
+  validation is re-authorable — bounded by the 1-attempt cap, so it can't
+  loop). The per-iter callback + Goal-B `_criterion_satisfied_now` already
+  swallowed eval errors (verified) — no change needed.
+- Prevention: `.get` added to `SAFE_ATTRIBUTE_METHODS` so criteria can use
+  `components.get('x', 0.0)` (soft lookup → no KeyError); `decompose_task.md`
+  now tells Claude to reference only keys its seed prompt defines, that a
+  missing bare-subscript key fails the stage as `criterion_not_met`
+  (recoverable but wastes the budget), and that `.get(key, default)` is
+  available.
+- Tests (`test_mission_run.py`, +3 → 367 passed/1 skipped): unit — missing
+  key raises `CriterionMissingKeyError` with key+available in the message,
+  and `.get` returns the default; integration — a `components['hip_sway_osc']`
+  stage halts with `halted_reason=criterion_not_met` (not `criterion_errored`),
+  `missing_key:true`, error detail preserved, via the budget_exhausted
+  (re-decomposable) path.
+
+Verified: sculptor `pytest tests/` → 367 passed, 1 skipped. No frontend/
+backend files touched. (Gate reminder: sculptor tests run from
+`RewardSculptor/`, not `RewardSculptor/sculptor/`.)
+
 ### 2026-06-06 — Ship 22p: run.sh no longer self-kills on headless/WSL (browser-open)
 
 Bug: on a headless box or WSL (no Linux browser), `./run.sh` started the

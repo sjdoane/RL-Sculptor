@@ -39,6 +39,7 @@ from sculptor.mission_runtime import (
     BARE_IDENTIFIERS,
     BEHAVIOR_KEYS,
     CriterionEvalError,
+    CriterionMissingKeyError,
     MissionResult,
     PERSISTED_TRAJECTORY_KEYS,
     StageResult,
@@ -160,6 +161,51 @@ def test_criterion_rejects_unknown_bare_name():
     ns = {"metric": 0.5, "abs": abs}
     with pytest.raises(CriterionEvalError, match="unknown identifier"):
         _evaluate_success_criterion("fnord > 0.5", ns)
+
+
+def test_criterion_missing_dict_key_raises_distinct_missing_key_error():
+    """A subscript into a namespace dict with a key the reward never
+    produced raises the DISTINCT CriterionMissingKeyError (a
+    CriterionEvalError subclass) — NOT a generic eval error. This lets
+    the stage runner route it to the recoverable `criterion_not_met`
+    instead of the fatal `criterion_errored`. The message names the
+    missing key + what WAS available so re-decomposition can pick a real
+    key. Regression for the hip_sway / KeyError('hip_sway_osc') mission
+    halt."""
+    ns = {
+        "metric": 0.8,
+        "behavior": {"mean_return": 0.9, "mean_episode_length": 600},
+        "components": {"support_phase": 0.5},
+        "abs": abs, "min": min, "max": max,
+    }
+    with pytest.raises(CriterionMissingKeyError) as exc:
+        _evaluate_success_criterion("components['hip_sway_osc'] > 0.5", ns)
+    msg = str(exc.value)
+    assert "hip_sway_osc" in msg            # names the missing key
+    assert "support_phase" in msg           # surfaces what WAS available
+    # Subclass: existing `except CriterionEvalError` paths still catch it.
+    assert isinstance(exc.value, CriterionEvalError)
+
+
+def test_criterion_get_with_default_avoids_missing_key():
+    """`.get(key, default)` is the soft form: a missing component returns
+    the default so the criterion evaluates cleanly to False instead of
+    raising. Lets a criterion defensively reference a key the reward may
+    not emit yet."""
+    ns = {
+        "metric": 0.8,
+        "behavior": {"mean_return": 0.9},
+        "components": {"support_phase": 0.5},
+        "abs": abs, "min": min, "max": max,
+    }
+    # Missing key → default 0.0 → False, no exception.
+    assert _evaluate_success_criterion(
+        "components.get('hip_sway_osc', 0.0) > 0.5", ns,
+    ) is False
+    # Present key through .get still works.
+    assert _evaluate_success_criterion(
+        "components.get('support_phase', 0.0) > 0.4", ns,
+    ) is True
 
 
 def test_criterion_rejects_dangerous_attribute():
@@ -487,6 +533,53 @@ def test_mission_run_halts_when_stage_criterion_fails(
         if e.get("type") == "stage_started" and e.get("stage_name") == "stage_1"
     ]
     assert started == []
+
+
+def test_mission_run_missing_criterion_key_routes_to_criterion_not_met(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """Regression for the hip_sway halt: a stage criterion that references
+    a metric the reward never produced (`components['hip_sway_osc']`) used
+    to raise KeyError → `criterion_errored` → which is NOT re-decomposable
+    → the entire mission halted irrecoverably. Now the missing key is
+    classified as the recoverable `criterion_not_met` (the quantity is
+    absent, so the goal was not met) with `missing_key=True` on the event.
+    Budget pre-exhausted to test the bare classification/halt."""
+    from sculptor import sculpt as sculpt_mod
+
+    m = _make_mission(tmp_path, n_stages=2)
+    m.stages[0].success_criterion = "components['hip_sway_osc'] > 0.5"
+    m.stages[0].redecomposition_attempts = 1  # skip the redecompose path
+    # metric is healthy — only the criterion's KEY is missing.
+    fake = _fake_sculpt_run_factory(metric=0.9)
+    monkeypatch.setattr(sculpt_mod, "sculpt_run", fake)
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
+    )
+
+    events: list[dict] = []
+    result = sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab", on_event=events.append,
+    )
+
+    # Recoverable classification — NOT the fatal criterion_errored.
+    assert result.halted_reason == "criterion_not_met"
+    assert result.stage_results[0].status == "failed"
+    assert result.stage_results[0].failure_reason == "criterion_not_met"
+    # The criterion error detail is preserved + names the missing key, so
+    # re-decomposition feedback can point Claude at a real key.
+    assert "hip_sway_osc" in (result.stage_results[0].criterion_error or "")
+    # The evaluated event flags the missing-key case.
+    evald = [e for e in events if e.get("type") == "stage_criterion_evaluated"]
+    assert evald and evald[-1].get("missing_key") is True
+    assert evald[-1].get("satisfied") is False
+    # Went through the re-decomposable (curriculum) path — budget_exhausted,
+    # NOT the non_curriculum_failure skip that infra/criterion_errored-as-
+    # fatal would have produced.
+    skipped = [
+        e for e in events if e.get("type") == "redecomposition_skipped"
+    ]
+    assert skipped and skipped[-1].get("reason") == "budget_exhausted"
 
 
 def test_extract_toml_section_returns_section_body():
@@ -1519,10 +1612,11 @@ def test_redecompose_only_fires_once_per_stage(
 def test_redecompose_does_not_fire_for_infra_failures(
     tmp_path: Path, monkeypatch, stub_adapter,
 ):
-    """Ship 17 trigger condition: only `criterion_not_met` is
-    re-decomposable. Other failure_reasons (no_checkpoint,
-    training_errored, ...) signal env/code issues and should halt
-    the mission directly without invoking Claude."""
+    """Ship 17 trigger condition: only criterion-level failures
+    (`criterion_not_met` / `criterion_errored`) are re-decomposable.
+    Infrastructure failure_reasons (no_checkpoint, training_errored, ...)
+    signal env/code issues and should halt the mission directly without
+    invoking Claude."""
     from sculptor import sculpt as sculpt_mod
 
     m = _make_mission(tmp_path, n_stages=1)

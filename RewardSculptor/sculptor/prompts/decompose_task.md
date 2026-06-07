@@ -65,6 +65,14 @@ and stages warm-start from previous stages where possible.
      prompt defines `support_phase` and `kick_swing`, then
      `components['support_phase']` and `components['kick_swing']` are
      available; names aren't statically validated — runtime check).
+     **ONLY reference a component name you actually define in THIS stage's
+     `reward_seed_prompt`.** A bare `components['name']` (or
+     `behavior[...]` / `trajectory[...]`) for a key the reward never emits
+     makes the stage fail as `criterion_not_met` — recoverable via
+     re-decomposition, but it wastes the stage's whole training budget
+     first. If you are not certain a key exists, use the soft form
+     `components.get('name', 0.0)`, which returns the default instead of
+     erroring.
    - `info[<key>]` / `trajectory[<key>]` — per-step numpy array persisted
      to rollout/trajectory.npz. Available keys: `rewards`, `episode_id`,
      `joint_pos`, `joint_vel`, `action`, `actuator_force`,
@@ -77,7 +85,8 @@ and stages warm-start from previous stages where possible.
    - Math helpers: `abs`, `min`, `max`, `sum`, `len`, `round`, `float`,
      `int`, `bool`. Array methods (numpy): `.mean()`, `.max()`,
      `.min()`, `.std()`, `.sum()`, `.any()`, `.all()`, `.astype(...)`,
-     `.shape`, `.size`.
+     `.shape`, `.size`. Dict access: `behavior`/`components`/`info`/
+     `trajectory` support `.get(<key>, <default>)` for safe lookups.
    - Boolean ops: `and`, `or`, `not`. Comparisons + arithmetic.
 
    **CRITICAL — namespace is numpy, NOT torch.** Trajectory/info
