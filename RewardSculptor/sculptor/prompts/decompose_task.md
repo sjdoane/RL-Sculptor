@@ -23,7 +23,7 @@ and stages warm-start from previous stages where possible.
 
 ```
 {
-  "decomposition_rationale": "<why these stages, in this order>",
+  "decomposition_rationale": "<why these stages, in this order, AND why this many — justify the count by the goal's complexity>",
   "stages": [
     {
       "name":               "<snake_case, letter-first, ≤32 chars>",
@@ -50,10 +50,20 @@ and stages warm-start from previous stages where possible.
    end-to-end.** A curriculum whose final stage only solves a subset is
    not a valid decomposition.
 
-3. **Individual learnability.** Each stage must be realistically learnable
-   by flat PPO in roughly 3-5 sculpt iterations (~15-25k env steps). If
-   the task requires more, split it further. Typical stage count for a
-   humanoid skill: 3-6. Do not exceed 8 stages.
+3. **Individual learnability + ADAPTIVE stage count.** Each stage must be
+   realistically learnable by flat PPO in ~3-5 sculpt iterations (~15-25k
+   env steps); if a sub-task needs more, split it. **Use as FEW stages as
+   the goal genuinely needs — exactly ONE per distinct sub-skill or temporal
+   phase that PPO cannot discover on its own.** Scale the count with the
+   goal's complexity; do NOT pad to a fixed number (4 is NOT a default):
+   - simple single-limb / rhythmic motion (wave an arm, nod, sway) → 1-2 stages;
+   - multi-limb coordinated or 2-3 phase behavior (a dance, a kick) → 3-5;
+   - long sequential skill (get up off the floor, multi-step traversal) → up
+     to 8 (the schema cap).
+   If two stages suffice, emit two. `decomposition_rationale` MUST justify the
+   chosen count by the goal's structure. The orchestrator re-decomposes any
+   single stage that turns out too hard, so under-splitting is cheap to fix
+   while padding wastes whole training runs.
 
 4. **Success criterion format.** Python boolean expression evaluated
    after each stage's last rollout. Namespace:
@@ -147,11 +157,18 @@ and stages warm-start from previous stages where possible.
 
 ## Stage-design guidance
 
-  * **Stage 1 = simplest static skill.** For locomotion tasks, this is
-    usually "stand stably in the default pose." For manipulation, "reach
-    near the object without collision."
-  * **Each successor stage adds ONE capability.** Don't layer static-
-    stance + single-leg + dynamic-swing in a single stage.
+  * **Never spend a stage on standing / staying upright.** The robot already
+    holds a stable default pose and relearns it in ~1 sculpt iter, so a
+    standalone "stand stably" stage is a wasted stage. Instead **bake
+    stability into EVERY stage's reward** as base terms — an `alive_bonus`
+    and an upright/posture term, both zeroed when the robot has fallen — and
+    make **Stage 1 the first genuine sub-skill of the target behavior** (for
+    "do a floss", Stage 1 is the hip sway, NOT standing; for "kick a ball",
+    it's the wind-up or the step, not standing). Balance earns its OWN early
+    stage only when the goal itself is about balance from an unstable start
+    (recover from a push, one-leg stand, walk a narrow beam).
+  * **Each successor stage adds ONE capability and keeps the prior stages'
+    reward terms.** Don't layer two new sub-skills in one stage.
   * **Success criteria should be measurable from a rollout trajectory.**
     If the criterion requires external labels ("looks graceful"), it's
     not evaluable — prefer concrete predicates over info keys.
@@ -160,37 +177,51 @@ and stages warm-start from previous stages where possible.
     orchestrator will escalate to re-decomposition if a stage exhausts
     its budget without success, so don't over-allocate.
 
-## Example (for a different goal — pattern reference only)
+## Example (different goal — PATTERN reference only; match YOUR goal's complexity, do NOT copy this stage count)
 
-Goal: "Jump straight up 30 cm from standing, land cleanly, stand again."
+Goal: "Jump straight up ~30 cm from standing and land cleanly."
+
+Jumping is THREE motor phases (load → launch → absorb) → three stages. Note
+there is NO "stand" stage: the alive_bonus + upright base terms appear in
+EVERY reward and keep the robot up while it learns each phase.
 
 ```json
 {
-  "decomposition_rationale": "A cold PPO can't discover jump-and-land in one shot because stance+crouch+extend+land is a 4-phase temporal sequence. Stages 1-2 establish stance and crouch primitives; stage 3 adds upward impulse from crouch; stage 4 chains with landing.",
+  "decomposition_rationale": "Three stages because a jump is a 3-phase ballistic sequence PPO can't discover in one shot: load (crouch), launch (explosive leg extension), absorb (soft landing) — one stage per phase. No standing stage: staying upright is a base reward term shared by all three. A simpler goal would need fewer stages; a longer sequence more.",
   "stages": [
     {
-      "name": "stand",
-      "goal_text": "Maintain upright double-stance with root link height near nominal.",
-      "success_criterion": "(trajectory['root_link_pos_w'][..., 2] > 0.65).mean() > 0.9 and behavior['mean_episode_length'] > 500",
+      "name": "crouch_load",
+      "goal_text": "From the default stance, lower the root link to ~0.45 m and hold briefly while staying balanced.",
+      "success_criterion": "components.get('crouch_target', 0.0) > 0.4 and (trajectory['projected_gravity_b'][..., 2] < -0.9).mean() > 0.85",
       "max_iterations": 3,
       "parent_stage": null,
-      "reward_seed_prompt": "Three terms: alive_bonus (+0.1 when not fallen), torso_upright (exp(-||base_ang_vel_b||^2)*0.3), action_rate_penalty (-0.03 * ||action-prev_action||^2). Zero the whole reward when fallen.",
+      "reward_seed_prompt": "BASE STABILITY TERMS (carry these into every stage): alive_bonus (+0.1 while upright), upright (exp(-||base_ang_vel_b||^2)*0.3), action_rate_penalty (-0.03*||action-prev_action||^2); zero the whole reward when fallen. SKILL TERM crouch_target: exp(-((root_link_pos_w_z - 0.45)**2)/0.02) * 0.6 (root_link_pos_w z-component toward a 0.45 m target).",
       "kg_seed_papers": ["2312.17507"]
     },
     {
-      "name": "crouch",
-      "goal_text": "From standing, lower root link height to ~0.45 m and hold for 0.5s.",
-      "success_criterion": "components['crouch_target'] > 0.4 and behavior['mean_return'] > metric_stand * 0.8",
-      "max_iterations": 4,
-      "parent_stage": "stand",
-      "reward_seed_prompt": "Keep stand's three terms. Add crouch_target: exp(-((root_link_pos_w_z-0.45)**2)/0.02) * 0.6, rewarding proximity to a 0.45 m target height (use the adapter's root_link_pos_w info key's z-component).",
+      "name": "spring_up",
+      "goal_text": "From the crouch, explosively extend the legs to launch the root link upward past ~0.75 m.",
+      "success_criterion": "(trajectory['root_link_pos_w'][..., 2] > 0.75).any() and components.get('upward_impulse', 0.0) > 0.3",
+      "max_iterations": 5,
+      "parent_stage": "crouch_load",
+      "reward_seed_prompt": "Keep the base stability terms + crouch_target. Add upward_impulse: reward positive root-link vertical velocity during the extension window, gated on having been crouched; cap it so it does not reward flailing.",
       "kg_seed_papers": []
     },
-    ...
+    {
+      "name": "jump_and_land",
+      "goal_text": "Chain crouch -> launch into a full ~30 cm jump and absorb the landing back to a stable upright stance.",
+      "success_criterion": "(trajectory['root_link_pos_w'][..., 2] > 0.95).any() and behavior['mean_episode_length'] > 450",
+      "max_iterations": 6,
+      "parent_stage": "spring_up",
+      "reward_seed_prompt": "Keep all prior terms. Add soft_landing: penalize large root vertical acceleration / impact after the apex, and reward returning to a stable upright pose after touchdown.",
+      "kg_seed_papers": []
+    }
   ]
 }
 ```
 
-(Real output should include ALL stages through the final goal-satisfying one.)
+Real output must include ALL stages through the final goal-satisfying one,
+and must MATCH the count to the goal. A simpler goal — e.g. "wave the right
+arm overhead" — is 1-2 stages (raise_arm, then wave_periodic), NOT three.
 
 Emit the decomposition JSON now. No prose, no markdown fences.

@@ -339,6 +339,42 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-06 — Ship 22s: adaptive mission decomposition (no wasted stand stage, count scales with complexity)
+
+Prompt-only (`prompts/decompose_task.md`). Sam's feedback: decomposition always
+produced (1) exactly 4 stages and (2) a first stage that just stands the robot
+up — a waste. Confirmed across 3 missions (floss/floss/kicking): all 4 stages,
+all with a `stand_stable`/`upright_stance` first stage that *succeeded in 1
+iter* (the robot already stands). The schema allows 2-8 stages
+(`_DecompositionModel` has no count bound; `_RedecompositionModel` is 2-8) — so
+this was pure PROMPT anchoring, not a constraint.
+
+Root anchors removed:
+- "always 4": Hard rule 3 said "typical stage count 3-6" AND the only worked
+  example was an explicit "4-phase" 4-stage curriculum → Claude defaulted to
+  the middle. Rewrote rule 3 to ADAPTIVE: "as few as the goal needs, ONE per
+  distinct sub-skill/phase; simple rhythmic motion 1-2, multi-limb/2-3-phase
+  3-5, long sequence up to 8; 4 is NOT a default; rationale must justify the
+  count." Replaced the example with a 3-stage one and a closing note that a
+  simple goal is 1-2 stages.
+- "always stand first": stage-design guidance literally said "Stage 1 =
+  simplest static skill ... stand stably" and the example's stage 1 was
+  "stand". Replaced with: "**Never spend a stage on standing** — bake
+  stability (alive_bonus + upright, zeroed when fallen) into EVERY stage's
+  reward and make Stage 1 the first GENUINE sub-skill" (hip sway for floss,
+  wind-up/step for a kick). Balance gets its own stage only when the goal IS
+  balance-from-unstable (push-recovery, one-leg stand, beam). The new example
+  starts with `crouch_load`, not stand, and every reward carries the base
+  stability terms.
+- Also fixed a latent example bug (`metric_stand`, an undefined cross-stage
+  identifier) and made all example criteria use `.get()` + persisted keys.
+
+- **Verified**: decompose tests 26 passed; the rendered prompt parses (tests
+  load it). No schema/code change needed — the 2-8 range was already legal.
+  Behavioural improvement will show on the NEXT decompose (try a new mission):
+  fewer/more stages per goal complexity, Stage 1 = the real first sub-skill.
+  No frontend/backend/other-sculptor files touched.
+
 ### 2026-06-06 — Ship 22r: criterion `components[...]` now sees the SCULPTOR reward terms (the real hip_sway fix)
 
 The mission halted at `hip_sway` AGAIN after Ship 22q. Diagnosed from the
