@@ -20,7 +20,14 @@ Success-criterion namespace (consumable inside the criterion expression):
   - `behavior[<key>]`   — scalar field from `behavior.json` (e.g.,
                           `mean_return`, `mean_episode_length`,
                           `max_episode_length`, `n_episodes`).
-  - `components[<name>]` — mean of `trajectory.npz["reward_term__<name>"]`.
+  - `components[<name>]` — mean of a SCULPTOR reward component the
+                          reward_seed_prompt introduces. Read from the
+                          training-side `reward_trajectory.json` (the file
+                          diagnose surfaces to Claude), merged over the
+                          ENVIRONMENT's intrinsic `trajectory.npz
+                          ["reward_term__<name>"]` terms (which differ on
+                          mjlab, where the sculptor reward is layered on the
+                          task's own terms).
   - `trajectory[<key>]` — raw per-step numpy array from trajectory.npz.
   - `info[<key>]`       — ALIAS for `trajectory[<key>]`. Kept for Ship 14
                           prompt compatibility; the two names resolve to
@@ -428,6 +435,51 @@ def _load_trajectory_arrays(
     return trajectory, components
 
 
+def _load_sculptor_components(iter_dir: Path) -> dict[str, float]:
+    """Per-component MEANS of the SCULPTOR reward's components — the terms a
+    stage's `reward_seed_prompt` introduces, which is exactly what a
+    criterion's `components[<name>]` is documented to reference.
+
+    These live in the training-side `<iter_dir>/reward_trajectory.json`
+    (Eureka Appendix-F format: `{component: [values]}`, the same file
+    `diagnose._load_training_feedback` reads). This is DISTINCT from the
+    ENVIRONMENT's intrinsic reward terms, which the rollout persists as
+    `reward_term__*` in trajectory.npz. On mjlab the sculptor reward is
+    layered on top of the task's own terms, so the two sets differ — and the
+    custom components (e.g. `hip_sway_osc`) appear ONLY here, never in
+    `reward_term__*`. Without merging these in, `components['hip_sway_osc']`
+    KeyErrors at criterion-eval time even though the reward computed it
+    (the bug behind the floss/kicking mission halts).
+
+    The rollout-side `rollout/reward_trajectory.json` is deliberately NOT
+    read here — on mjlab it holds the ENV terms (already exposed via
+    `reward_term__*`), not the sculptor components.
+
+    `__`-prefixed aux keys (__episode_length, __terminated, __time_outs) are
+    skipped. Returns {} when the file is absent/unparseable, so callers fall
+    back to whatever `reward_term__*` provided."""
+    path = iter_dir / "reward_trajectory.json"
+    if not path.is_file():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return {}
+    if not isinstance(payload, dict):
+        return {}
+    out: dict[str, float] = {}
+    for name, raw in payload.items():
+        if name.startswith("__"):
+            continue
+        try:
+            vals = [float(v) for v in raw] if isinstance(raw, list) else [float(raw)]
+        except (TypeError, ValueError):
+            continue
+        if vals:
+            out[name] = sum(vals) / len(vals)
+    return out
+
+
 def _build_criterion_namespace(
     iter_dir: Path,
     primary_metric: Optional[float],
@@ -441,6 +493,13 @@ def _build_criterion_namespace(
     """
     behavior = _load_behavior_json(iter_dir)
     trajectory, components = _load_trajectory_arrays(iter_dir)
+    # `components[<name>]` is documented as the SCULPTOR reward's components
+    # (the terms the reward_seed_prompt introduces). On mjlab those land in
+    # reward_trajectory.json, NOT trajectory.npz's `reward_term__*` (which are
+    # the ENVIRONMENT's intrinsic terms). Merge them in with precedence so a
+    # criterion like `components['hip_sway_osc']` resolves instead of
+    # KeyError-ing. (On gym_sb3 the two coincide; the merge is idempotent.)
+    components = {**components, **_load_sculptor_components(iter_dir)}
 
     namespace: dict[str, Any] = {
         "metric": primary_metric,

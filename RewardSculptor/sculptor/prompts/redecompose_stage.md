@@ -102,7 +102,17 @@ hopefully softened enough for it to succeed.
    referenced in `success_criterion` and `reward_seed_prompt` must be
    in `expected_info_keys`, `expected_components`, the
    PERSISTED_TRAJECTORY_KEYS list, BEHAVIOR_KEYS, or the math
-   allow-list. Do NOT invent new env fields.
+   allow-list. Do NOT invent new env fields. The spliced mission is
+   re-validated — an out-of-contract key in ANY sub-stage's criterion
+   rejects the whole redecomposition.
+   - **`base_height`, `fallen`, and other runtime info-dict keys are NOT
+     persisted.** Derive base height from
+     `trajectory['root_link_pos_w'][..., 2]` and an upright/fallen proxy
+     from `trajectory['projected_gravity_b'][..., 2]` (≈ -1 = upright).
+   - **`components[<name>]` must be a term THIS sub-stage's
+     `reward_seed_prompt` actually defines.** If unsure a component is
+     emitted, use the soft form `components.get('<name>', 0.0)` so a
+     missing term reads as "not satisfied" rather than failing the stage.
 
 9. **KG seed papers** restricted to the provided slice (same as
    decompose_task's hard rule 6).

@@ -677,6 +677,7 @@ def redecompose_stage(
     kg_store: Any = None,
     client: Any = None,
     model: str = MODEL_ID,
+    prior_attempt_error: Optional[str] = None,
 ) -> list[Stage]:
     """Ask Claude to split a failed stage into 2-8 simpler sub-stages.
 
@@ -713,6 +714,24 @@ def redecompose_stage(
     user_content = _build_redecompose_user_content(
         failed_stage, reward_contract, kg_context, feedback,
     )
+    if prior_attempt_error:
+        # Ship 22r: a previous redecomposition draft was rejected by the
+        # mission validator (e.g. a sub-stage criterion referenced a key the
+        # rollout doesn't persist). Feed the exact error back so Claude fixes
+        # the offending sub-stage instead of the caller halting the mission.
+        user_content += (
+            "\n\n## PREVIOUS REDECOMPOSITION ATTEMPT WAS REJECTED\n"
+            f"{prior_attempt_error}\n\n"
+            "Fix the offending sub-stage. EVERY success_criterion may ONLY "
+            "reference keys that exist: `behavior[<BEHAVIOR_KEY>]`, "
+            "`components[<name your reward_seed_prompt defines>]`, "
+            "`trajectory[<PERSISTED_TRAJECTORY_KEY>]` / `info[...]`, or `metric`. "
+            "Do NOT use base_height / fallen or any non-persisted key — derive "
+            "base height from `trajectory['root_link_pos_w'][..., 2]` and an "
+            "upright/fallen proxy from `trajectory['projected_gravity_b'][..., 2]`. "
+            "Use `<dict>.get(key, default)` for any component you are unsure the "
+            "reward emits."
+        )
     parsed = _parse_with_retry(
         client, system_prompt, user_content,
         output_format=_RedecompositionModel, model=model,

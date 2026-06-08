@@ -287,6 +287,46 @@ def test_build_namespace_exposes_components(tmp_path: Path):
     assert ns["components"]["kick_swing"] == pytest.approx(1.5)
 
 
+def test_build_namespace_exposes_sculptor_components_from_reward_trajectory(
+    tmp_path: Path,
+):
+    """Ship 22r regression (the floss/kicking mission halt): a criterion's
+    `components[<name>]` references the SCULPTOR reward's components (terms the
+    reward_seed_prompt introduces). On mjlab those are written to
+    `reward_trajectory.json`, NOT to trajectory.npz's `reward_term__*` (which
+    hold the ENVIRONMENT's intrinsic terms). _build_criterion_namespace must
+    merge them in — without this, `components['hip_sway_osc']` KeyErrors even
+    though the reward computed it (mean 0.38 > 0.3 → the stage should pass)."""
+    import json as _json
+    iter_dir = tmp_path / "iter_0"
+    # Env intrinsic term → trajectory.npz reward_term__ (mjlab-style).
+    _fabricate_rollout_artifacts(
+        iter_dir,
+        components={"track_linear_velocity": np.array([0.6, 0.8])},  # mean 0.7
+    )
+    # Sculptor components → reward_trajectory.json (Eureka {component: [vals]},
+    # with __-prefixed aux keys that must be skipped).
+    (iter_dir / "reward_trajectory.json").write_text(_json.dumps({
+        "hip_sway_osc": [0.1, 0.5],            # mean = 0.3
+        "upright_bonus": [1.0, 1.0, 1.0],      # mean = 1.0
+        "__episode_length": [400, 500],        # aux — skipped
+        "__terminated": [0.0, 0.0],            # aux — skipped
+    }))
+    ns = _build_criterion_namespace(iter_dir, primary_metric=0.0)
+    # Sculptor components now resolve...
+    assert ns["components"]["hip_sway_osc"] == pytest.approx(0.3)
+    assert ns["components"]["upright_bonus"] == pytest.approx(1.0)
+    # ...the env term is still present (merge, not replace)...
+    assert ns["components"]["track_linear_velocity"] == pytest.approx(0.7)
+    # ...aux __ keys are NOT exposed...
+    assert "__episode_length" not in ns["components"]
+    assert "__terminated" not in ns["components"]
+    # ...and a criterion referencing the sculptor component evaluates cleanly.
+    assert _evaluate_success_criterion(
+        "components['hip_sway_osc'] >= 0.3", ns,
+    ) is True
+
+
 def test_build_namespace_info_is_alias_for_trajectory(tmp_path: Path):
     iter_dir = tmp_path / "iter_0"
     _fabricate_rollout_artifacts(
@@ -1713,6 +1753,76 @@ def test_redecompose_invalid_claude_response_halts_cleanly(
     assert failed_events[0]["reason"] == "validation_failed"
     # Original stage list NOT mutated by failed splice.
     assert [s.name for s in m.stages] == ["stage_0"]
+
+
+def test_redecompose_retries_invalid_draft_then_recovers(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """Ship 22r regression (the floss/kicking halt-at-redecomposition): if
+    Claude's FIRST redecomposition draft is rejected by the mission
+    validator (a sub-stage criterion referencing a non-persisted key like
+    base_height), the orchestrator retries — feeding the exact validator
+    error back — instead of halting the whole mission on the first bad
+    draft. The second, valid draft splices in and the mission proceeds."""
+    from sculptor.decompose import _RedecompositionModel, _StageModel
+    from sculptor import sculpt as sculpt_mod
+
+    m = _make_mission(tmp_path, n_stages=2)
+    monkeypatch.setattr(
+        sculpt_mod, "sculpt_run", _fake_sculpt_run_factory(metric=0.3),
+    )
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
+    )
+
+    # First draft: a sub-stage criterion references base_height, which the
+    # rollout does NOT persist → validate_mission rejects the splice.
+    bad_draft = _RedecompositionModel(
+        decomposition_rationale="first draft uses a non-persisted key",
+        stages=[
+            _StageModel(
+                name="stage_0__r1_0", goal_text="precursor",
+                success_criterion="trajectory['base_height'] > 0.5",
+                max_iterations=2, parent_stage=None,
+                reward_seed_prompt="alive", kg_seed_papers=[],
+            ),
+            _StageModel(
+                name="stage_0__r1_1", goal_text="final",
+                success_criterion="metric > 0.5",  # byte-equal to failed
+                max_iterations=2, parent_stage="stage_0__r1_0",
+                reward_seed_prompt="alive", kg_seed_papers=[],
+            ),
+        ],
+    )
+    good_draft = _make_redecompose_response("stage_0", n_sub=2)
+
+    calls = {"n": 0, "saw_error_feedback": False}
+
+    def fake_parse(client, system_prompt, user_content, *,
+                   output_format=None, model=None, max_tokens=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return bad_draft
+        if "PREVIOUS REDECOMPOSITION ATTEMPT WAS REJECTED" in user_content:
+            calls["saw_error_feedback"] = True
+        return good_draft
+
+    import sculptor.decompose as dmod
+    monkeypatch.setattr(dmod, "_parse_with_retry", fake_parse)
+
+    events: list[dict] = []
+    sculpt_mod.mission_run(m, adapter_short_name="mjlab", on_event=events.append)
+
+    # Retried once (2 Claude calls) with the validator error fed back...
+    assert calls["n"] == 2
+    assert calls["saw_error_feedback"] is True
+    retries = [e for e in events if e.get("type") == "stage_redecomposition_retry"]
+    assert len(retries) == 1
+    assert retries[0]["reason"] == "spliced_mission_invalid"
+    # ...then RECOVERED: the good draft spliced in (no hard failure for stage_0).
+    assert any(e.get("type") == "stage_redecomposed" for e in events)
+    assert not any(e.get("type") == "stage_redecomposition_failed" for e in events)
+    assert "stage_0__r1_0" in [s.name for s in m.stages]
 
 
 def test_redecompose_emits_stage_redecomposed_event(

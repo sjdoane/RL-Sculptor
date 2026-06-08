@@ -2675,6 +2675,16 @@ _REDECOMPOSABLE_REASONS: frozenset[str] = frozenset(
     {"criterion_not_met", "criterion_errored"}
 )
 
+# Ship 22r: within a single stage's ONE redecomposition (the per-stage cap
+# above is enforced via `redecomposition_attempts`), how many times to ask
+# Claude for a VALID sub-stage draft. A draft can be rejected by the mission
+# validator (e.g. a sub-stage criterion that references a non-persisted
+# trajectory key like base_height). Rather than halt the whole mission on the
+# first bad draft, re-ask with the exact validator error fed back. 2 = one
+# initial draft + one corrective retry; bounded so a hopeless redecomposition
+# still halts quickly instead of looping.
+_REDECOMPOSE_MAX_ATTEMPTS = 2
+
 
 def _build_stage_training_feedback(
     stage,
@@ -2913,61 +2923,103 @@ def _maybe_redecompose_and_splice(
         })
         return False
 
-    # Call Claude.
-    try:
-        sub_stages = redecompose_stage(
-            mission, failed_stage_idx,
-            feedback=feedback,
-            reward_contract=reward_contract,
-            kg_store=kg_store,
-        )
-    except (MissionValidationError, DecompositionError) as e:
-        emit({
-            "type": "stage_redecomposition_failed",
-            "stage_name": failed_stage.name,
-            "reason": "validation_failed",
-            "detail": f"{type(e).__name__}: {e}",
-        })
-        return False
-    except Exception as e:  # noqa: BLE001
-        emit({
-            "type": "stage_redecomposition_failed",
-            "stage_name": failed_stage.name,
-            "reason": "claude_call_errored",
-            "detail": f"{type(e).__name__}: {e}",
-        })
-        return False
-
-    if not sub_stages:
-        emit({
-            "type": "stage_redecomposition_failed",
-            "stage_name": failed_stage.name,
-            "reason": "empty_substages",
-        })
-        return False
-
-    last_sub_name = sub_stages[-1].name
-
-    # Splice: replace the failed stage with sub-stages, repoint downstream.
-    mission.stages[failed_stage_idx:failed_stage_idx + 1] = sub_stages
-    repointed = _repoint_downstream_children(
-        mission.stages, failed_stage.name, last_sub_name,
-        slice_start=failed_stage_idx + len(sub_stages),
-    )
-
-    # Validate the spliced mission. If this raises, restore the failed
-    # stage and halt. Do NOT leave the mission in a half-spliced state.
     info_keys = set(getattr(reward_contract, "expected_info_keys", None) or [])
-    try:
-        validate_mission(mission, info_keys=info_keys)
-    except MissionValidationError as e:
-        # Roll back the splice.
-        mission.stages[failed_stage_idx:failed_stage_idx + len(sub_stages)] = [failed_stage]
+
+    # Ship 22r: a redecomposition DRAFT can itself be invalid — e.g. a
+    # sub-stage criterion referencing a non-persisted trajectory key
+    # (base_height) or a component the reward never emits. Pre-22r the first
+    # bad draft halted the whole mission, discarding the (often multi-hour)
+    # training already invested in this stage. Instead, retry a bounded
+    # number of times, feeding the EXACT validator error back to Claude so it
+    # corrects the offending sub-stage. Snapshot the pre-splice graph so each
+    # retry starts from a clean state.
+    saved_stages = list(mission.stages)
+    saved_parents = [(s, s.parent_stage) for s in mission.stages]
+
+    def _restore_pre_splice() -> None:
+        mission.stages[:] = saved_stages
+        for _s, _p in saved_parents:
+            _s.parent_stage = _p
+
+    prior_error: Optional[str] = None
+    last_reason = "spliced_mission_invalid"
+    last_detail = ""
+    sub_stages: list = []
+    last_sub_name = ""
+    repointed = 0
+    spliced_ok = False
+
+    def _emit_retry(attempt: int) -> None:
+        emit({
+            "type": "stage_redecomposition_retry",
+            "stage_name": failed_stage.name,
+            "attempt": attempt + 1,
+            "max_attempts": _REDECOMPOSE_MAX_ATTEMPTS,
+            "reason": last_reason,
+            "detail": last_detail,
+        })
+
+    for attempt in range(_REDECOMPOSE_MAX_ATTEMPTS):
+        # Call Claude (the prior attempt's validator error, if any, is fed
+        # back into the prompt so Claude fixes the offending sub-stage).
+        try:
+            sub_stages = redecompose_stage(
+                mission, failed_stage_idx,
+                feedback=feedback,
+                reward_contract=reward_contract,
+                kg_store=kg_store,
+                prior_attempt_error=prior_error,
+            )
+        except (MissionValidationError, DecompositionError) as e:
+            last_reason, last_detail = "validation_failed", f"{type(e).__name__}: {e}"
+            prior_error = last_detail
+            _emit_retry(attempt)
+            continue
+        except Exception as e:  # noqa: BLE001 — non-validation errors don't retry
+            emit({
+                "type": "stage_redecomposition_failed",
+                "stage_name": failed_stage.name,
+                "reason": "claude_call_errored",
+                "detail": f"{type(e).__name__}: {e}",
+            })
+            return False
+
+        if not sub_stages:
+            last_reason, last_detail = "empty_substages", "Claude returned no sub-stages."
+            prior_error = last_detail
+            _emit_retry(attempt)
+            continue
+
+        last_sub_name = sub_stages[-1].name
+        # Splice: replace the failed stage with sub-stages, repoint downstream.
+        mission.stages[failed_stage_idx:failed_stage_idx + 1] = sub_stages
+        repointed = _repoint_downstream_children(
+            mission.stages, failed_stage.name, last_sub_name,
+            slice_start=failed_stage_idx + len(sub_stages),
+        )
+        # Validate the spliced mission. If invalid, restore the clean
+        # pre-splice graph and retry with the error fed back.
+        try:
+            validate_mission(mission, info_keys=info_keys)
+        except MissionValidationError as e:
+            _restore_pre_splice()
+            last_reason, last_detail = "spliced_mission_invalid", f"{type(e).__name__}: {e}"
+            prior_error = last_detail
+            _emit_retry(attempt)
+            continue
+
+        spliced_ok = True
+        break
+
+    if not spliced_ok:
         emit({
             "type": "stage_redecomposition_failed",
             "stage_name": failed_stage.name,
-            "reason": "spliced_mission_invalid",
-            "detail": f"{type(e).__name__}: {e}",
+            "reason": last_reason,
+            "detail": (
+                f"redecomposition produced no valid mission after "
+                f"{_REDECOMPOSE_MAX_ATTEMPTS} attempt(s); last error: {last_detail}"
+            ),
         })
         return False
 

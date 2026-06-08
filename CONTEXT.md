@@ -339,6 +339,52 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-06 — Ship 22r: criterion `components[...]` now sees the SCULPTOR reward terms (the real hip_sway fix)
+
+The mission halted at `hip_sway` AGAIN after Ship 22q. Diagnosed from the
+on-disk run (`unitree-g1-4/.missions/make-the-robot-do-a-floss-the-da`,
+7 iters, `_execute_job_*.log`). TWO findings:
+
+1. **ROOT CAUSE (why the criterion could never pass).** A stage criterion's
+   `components[<name>]` is documented as the SCULPTOR reward's components (the
+   terms the `reward_seed_prompt` introduces). But `_build_criterion_namespace`
+   built `components` ONLY from `trajectory.npz["reward_term__*"]` — which on
+   mjlab are the ENVIRONMENT's intrinsic task terms (`track_linear_velocity`,
+   `upright`, `foot_slip`, …), NOT the sculptor's. The sculptor components
+   (`hip_sway_osc`, `upright_bonus`, …) are written to the training-side
+   `reward_trajectory.json` (the file `diagnose` already reads) and were never
+   merged in. So `components['hip_sway_osc']` ALWAYS KeyError'd on mjlab even
+   though the reward computed it. **The robot had actually learned the skill:
+   replaying iter_6, `hip_sway_osc` mean = 0.3822 (> 0.3) and
+   `mean_episode_length` = 500 (> 400) — the stored criterion evaluates to
+   `True`. The stage should have SUCCEEDED.** Fix: `mission_runtime.py`
+   `_load_sculptor_components()` reads the training-side `reward_trajectory.json`
+   (Eureka `{component:[vals]}`, `__`-prefixed aux skipped) and
+   `_build_criterion_namespace` merges those means into `components` with
+   precedence over `reward_term__*`. (gym_sb3 unaffected — the two coincide.)
+
+2. **NEXT halt vector (exposed once 22q let redecomposition fire).** The newer
+   `make-a-full-kicking` run (post-22q) correctly routed `criterion_not_met` →
+   redecompose, but Claude's redecomposition draft used `trajectory['base_
+   height']` (non-persisted) → `validate_mission` rejected the splice →
+   `stage_redecomposition_failed (spliced_mission_invalid)` → mission halted,
+   with the precise error never fed back. Fix: `sculpt.py`
+   `_maybe_redecompose_and_splice` now retries up to `_REDECOMPOSE_MAX_ATTEMPTS`
+   (2), feeding the exact validator error back via `redecompose_stage(...,
+   prior_attempt_error=...)` (decompose.py) so Claude corrects the offending
+   sub-stage; emits `stage_redecomposition_retry` per attempt; snapshots +
+   restores the pre-splice graph cleanly between tries. `redecompose_stage.md`
+   prompt hardened (base_height → `root_link_pos_w[...,2]`; `.get()` for unsure
+   components; "an out-of-contract key in ANY sub-stage rejects the whole
+   redecomposition").
+
+- **Verified**: sculptor `pytest tests/` (from `RewardSculptor/`) → 369 passed,
+  1 skipped. +2 tests: `_build_criterion_namespace` exposes sculptor components
+  from `reward_trajectory.json` (merged over `reward_term__`, aux skipped, real
+  criterion evaluates), and redecomposition retries an invalid draft then
+  recovers. Simulated the actual iter_6 namespace: the stored hip_sway criterion
+  now evaluates `True`. No frontend/backend files touched.
+
 ### 2026-06-06 — Ship 22q: criterion missing-key no longer halts the mission
 
 Bug (from Sam's run): the `hip_sway` stage failed with
