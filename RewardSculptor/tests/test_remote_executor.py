@@ -353,6 +353,16 @@ def test_iter_hint_parsed_from_output_dir(tmp_path: Path) -> None:
     assert job.iter_hint == 3
 
 
+def test_remote_python_tilde_expanded(tmp_path: Path) -> None:
+    """`remote_python = "~/venv/bin/python"` is shlex-quoted into ssh
+    commands and run.sh — quoting suppresses tilde expansion, so the
+    executor must expand it against the remote $HOME itself."""
+    ex, _ = make_executor(tmp_path, remote_python="~/venv/bin/python")
+    job = make_job(tmp_path)
+    argv = ex._remote_argv(job)
+    assert argv[0] == "/root/venv/bin/python"
+
+
 # ── happy path ───────────────────────────────────────────────────────
 
 
@@ -850,6 +860,19 @@ def test_vanished_job_dir_fails_fast_as_job_lost(tmp_path: Path, capsys) -> None
     types = [e["type"] for e in events_of(capsys)]
     assert "remote_connection_lost" not in types
     assert "remote_dispatch_failed" in types
+
+
+def test_doctor_emits_no_events_even_on_skew(tmp_path: Path, capsys) -> None:
+    """H2: `sculpt remote doctor --json` pipes stdout into json.loads
+    in the UI backend — doctor must never print [SCULPT-EVENT] lines,
+    even when the version probe finds skew (the report row carries it)."""
+    ex, fake = make_executor(tmp_path)
+    fake.versions = {"torch": "0.0.1-skewed", "mjlab": "0.0.1-skewed"}
+    report = ex.doctor()
+    assert report["ok"] is False  # skew row fails
+    skew_rows = [c for c in report["checks"] if c["name"] == "torch/mjlab version match"]
+    assert skew_rows and not skew_rows[0]["ok"]
+    assert _EVENT_TAG not in capsys.readouterr().out
 
 
 def test_doctor_never_raises(tmp_path: Path) -> None:

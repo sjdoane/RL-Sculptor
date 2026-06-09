@@ -339,7 +339,57 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
-### 2026-06-09 — Ship 23a: remote GPU dispatch core (SSH+rsync executor at the mjlab subprocess seam)
+### 2026-06-09 — Ship 23b: pod provisioning script + `sculpt remote doctor` + docs/remote.md
+
+CLI/ops layer over the Ship-23a executor so a RunPod 5090 goes from
+rented → dispatchable without touching Python.
+
+- **What**:
+  - NEW `RewardSculptor/scripts/provision_remote.sh` (executable):
+    `./scripts/provision_remote.sh root@HOST [-p PORT] [-i KEY]
+    [-w WORKDIR]` — idempotent over one ssh session: rsync (apt, sudo
+    fallback), uv, py3.13 venv at `<workdir>/venv`, installs
+    torch/mjlab[cu128]/imageio-ffmpeg PINNED to the locally-detected
+    versions (`uv run --no-sync` probe; warns loudly when falling back
+    to pyproject minimums), guards nvidia driver ≥ R570 (Blackwell),
+    torch.cuda sanity JSON, prints the exact `[remote]` block to paste.
+    `-w /workspace/sculptor_remote` puts venv+mirror on a RunPod
+    network volume so they survive pod restarts. Args passed to the
+    remote shell via `printf %q` (unquoted `>=` specs would become
+    stdout redirections on the pod and install unpinned latest).
+  - `sculptor/cli.py`: new `remote` typer sub-app —
+    `sculpt remote doctor [--config cfg.toml] [--json]`. Resolves
+    `[remote]` + `SCULPTOR_REMOTE_*` env (works pre-`enabled=true` via
+    dataclasses.replace), runs `RemoteExecutor.doctor()`, prints rows
+    or pure JSON. Exit 0 green / 1 check failed / 2 not configured
+    (incl. missing/malformed/unreadable config — TOMLDecodeError and
+    OSError handled, never a traceback).
+  - `_remote.py` follow-ups found while building this: `remote_python`
+    with a leading `~` is now expanded against the remote $HOME (it
+    gets shlex-quoted into ssh commands + run.sh, where quoting
+    suppresses tilde expansion — `~/.sculptor_remote/venv/bin/python`
+    from the provision script would have been a literal path);
+    `_check_version_skew(emit=False)` for the doctor path so
+    `doctor --json` stdout stays pure JSON even when skew exists (the
+    UI backend pipes it into json.loads — Ship 23d's Test-connection).
+  - NEW `RewardSculptor/docs/remote.md`: RunPod walkthrough (Community
+    5090, network volume, why never A100/H100 — FP32-bound Warp sim),
+    provisioning, full `[remote]`/env reference (tuning knobs are
+    TOML-only), the complete remote_* event/failure table incl.
+    launch_failed/job_lost, kill/reattach semantics, and the Ship-23e
+    manual smoke checklist (doctor → 1-iter → Ctrl-C kill → kill -9
+    reattach → UI cancel → record wall-clock+$).
+- **Why**: Phase-1 plan; doctor is also the backend for the UI's
+  Test-connection button (23d) and the gate before the live smoke (23e).
+- **Verified**: 9 new tests (test_remote_cli.py 7 — exit codes 0/1/2,
+  row + pure-JSON output, malformed TOML, doctor-before-enabled;
+  executor: tilde expansion in `_remote_argv`, doctor-emits-no-events-
+  on-skew). `bash -n` clean; `printf %q` expansion checked by hand.
+  Sculptor gate 432 passed/1 skipped; backend re-run green; frontend
+  untouched since its green build. Review-agent audit applied (ssh-arg
+  quoting H1, json purity H2, network-volume workdir H3, sudo/arg-order/
+  driver-parse guards M2/M3/L1/L2, env-override doc claim L3, event-name
+  table L4, --no-sync L5).
 
 First ship of the approved research-grade plan (Phase 1: fast-iteration
 compute — RunPod Community 5090, ~$0.69/hr, expected ~5x over the 8 GiB

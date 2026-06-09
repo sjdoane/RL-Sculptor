@@ -345,6 +345,15 @@ class RemoteExecutor:
             wd = self._home() + wd[1:]
         return str(PurePosixPath(wd))
 
+    def _remote_python(self) -> str:
+        """remote_python with a leading `~` expanded against the remote
+        $HOME — the path gets shlex-quoted into ssh commands and into
+        run.sh, where quoting would otherwise suppress tilde expansion."""
+        p = self.cfg.remote_python
+        if p == "~" or p.startswith("~/"):
+            p = self._home() + p[1:]
+        return p
+
     def _mirror(self, local: Path) -> str:
         """`<workdir>/mirror/<absolute local path>` — stable across
         iterations and mission stages, so a checkpoint born remotely is
@@ -376,7 +385,13 @@ class RemoteExecutor:
                 f"{(proc.stderr or '')[-400:]}",
             )
 
-    def _check_version_skew(self, job: Optional[RunnerJob] = None) -> None:
+    def _check_version_skew(
+        self, job: Optional[RunnerJob] = None, emit: bool = True,
+    ) -> None:
+        """Probe remote torch/mjlab versions; on mismatch emit a
+        `remote_version_skew` event (suppressed with emit=False — the
+        doctor path computes skew itself and must keep `--json` stdout
+        pure for the UI backend)."""
         cache_key = f"{self.cfg.target}:{self.cfg.port}"
         if cache_key in self._version_probe_cache:
             return
@@ -391,7 +406,7 @@ class RemoteExecutor:
             "        out[pkg] = f'ERROR: {type(e).__name__}'\n"
             "print(json.dumps(out))\n"
         )
-        cmd = f"{shlex.quote(self.cfg.remote_python)} -c {shlex.quote(probe)}"
+        cmd = f"{shlex.quote(self._remote_python())} -c {shlex.quote(probe)}"
         proc = self.runner.run(self._ssh_argv(cmd), timeout=60)
         remote: dict[str, str] = {}
         try:
@@ -415,7 +430,7 @@ class RemoteExecutor:
             for p in ("torch", "mjlab")
             if remote.get(p) and local.get(p) and remote[p] != local[p]
         }
-        if skewed:
+        if skewed and emit:
             self._event(
                 "remote_version_skew", job,
                 local_torch=local.get("torch"), remote_torch=remote.get("torch"),
@@ -524,7 +539,7 @@ class RemoteExecutor:
         )
 
     def _remote_argv(self, job: RunnerJob) -> list[str]:
-        argv = [self.cfg.remote_python, "-m", _RUNNER_MODULE, job.subcommand]
+        argv = [self._remote_python(), "-m", _RUNNER_MODULE, job.subcommand]
         for flag, value in job.options.items():
             argv += [flag, str(value)]
         for flag, local in job.input_paths.items():
@@ -860,7 +875,7 @@ class RemoteExecutor:
             return bool(out), out or "rsync not found on remote"
 
         def _python():
-            cmd = f"{shlex.quote(self.cfg.remote_python)} --version"
+            cmd = f"{shlex.quote(self._remote_python())} --version"
             proc = self.runner.run(self._ssh_argv(cmd), timeout=30)
             out = ((proc.stdout or "") + (proc.stderr or "")).strip()
             return proc.returncode == 0, out or f"{self.cfg.remote_python} not runnable"
@@ -891,7 +906,7 @@ class RemoteExecutor:
                 "print(json.dumps({'cuda': torch.cuda.is_available(), "
                 "'torch': torch.__version__}))"
             )
-            cmd = f"{shlex.quote(self.cfg.remote_python)} -c {shlex.quote(probe)}"
+            cmd = f"{shlex.quote(self._remote_python())} -c {shlex.quote(probe)}"
             proc = self.runner.run(self._ssh_argv(cmd), timeout=120)
             out = (proc.stdout or "").strip()
             try:
@@ -902,7 +917,7 @@ class RemoteExecutor:
 
         def _versions():
             self._version_probe_cache.pop(f"{self.cfg.target}:{self.cfg.port}", None)
-            self._check_version_skew()
+            self._check_version_skew(emit=False)  # keep doctor --json stdout pure
             remote = self._version_probe_cache.get(f"{self.cfg.target}:{self.cfg.port}") or {}
             if not remote:
                 return False, "could not read remote torch/mjlab versions"

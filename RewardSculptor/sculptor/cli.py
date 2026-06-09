@@ -36,6 +36,80 @@ kg_app = typer.Typer(
 app.add_typer(kg_app, name="kg")
 
 
+# ── Remote sub-app (§Ship 23) ────────────────────────────────────────────────
+remote_app = typer.Typer(
+    name="remote",
+    help="Remote GPU dispatch — connectivity / environment checks.",
+    no_args_is_help=True,
+)
+app.add_typer(remote_app, name="remote")
+
+
+@remote_app.command("doctor")
+def remote_doctor(
+    config: Optional[Path] = typer.Option(
+        None,
+        "--config",
+        help=(
+            "config.toml with a [remote] table. SCULPTOR_REMOTE_* env vars "
+            "override it; with no --config, env vars alone are used."
+        ),
+    ),
+    json_out: bool = typer.Option(
+        False, "--json", help="Machine-readable output (used by the UI backend)."
+    ),
+):
+    """Check the configured remote GPU host: ssh reachability, rsync,
+    python, NVIDIA driver (>= R570 for Blackwell), torch.cuda,
+    torch/mjlab version skew vs local, free disk. Exit 0 = all green,
+    1 = at least one check failed, 2 = no remote configured."""
+    import dataclasses as _dc
+    import json as _json
+    import os
+
+    from sculptor.adapters._remote import RemoteConfig, RemoteExecutor
+
+    table = None
+    if config is not None:
+        import tomllib
+
+        try:
+            with Path(config).open("rb") as f:
+                table = tomllib.load(f).get("remote")
+        except FileNotFoundError:
+            typer.echo(f"config not found: {config}", err=True)
+            raise typer.Exit(2)
+        except tomllib.TOMLDecodeError as e:
+            typer.echo(f"config not parseable: {config}: {e}", err=True)
+            raise typer.Exit(2)
+        except OSError as e:
+            typer.echo(f"config not readable: {config}: {e}", err=True)
+            raise typer.Exit(2)
+    cfg = RemoteConfig.from_sources(table, os.environ)
+    if cfg is None or not cfg.host:
+        typer.echo(
+            "no remote configured — add a [remote] table (host / user / "
+            "key_path) to config.toml or set SCULPTOR_REMOTE_HOST.",
+            err=True,
+        )
+        raise typer.Exit(2)
+    if not cfg.enabled:
+        # Doctor must work BEFORE the user flips enabled=true.
+        cfg = _dc.replace(cfg, enabled=True)
+    report = RemoteExecutor(cfg).doctor()
+    if json_out:
+        typer.echo(_json.dumps(report, indent=2))
+    else:
+        typer.echo(f"remote doctor — {cfg.target}:{cfg.port}")
+        for c in report["checks"]:
+            mark = " ok " if c["ok"] else "FAIL"
+            typer.echo(f"  [{mark}] {c['name']}: {c['detail']}")
+        typer.echo(
+            "all checks passed" if report["ok"] else "some checks FAILED"
+        )
+    raise typer.Exit(0 if report["ok"] else 1)
+
+
 _STORE_OPT = typer.Option(
     None,
     "--store",
