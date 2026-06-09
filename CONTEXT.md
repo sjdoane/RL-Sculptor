@@ -339,6 +339,21 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-08 — Handoff brief: NEXT_LEVEL_BRIEF.md (research-grade direction)
+
+Doc-only. Added `NEXT_LEVEL_BRIEF.md` at repo root — a self-contained
+fresh-session handoff for taking RL-Sculptor toward research-grade. Covers:
+orientation/read-order, immediate capabilities, known weaknesses (chiefly the
+lack of baselines/ablations/multi-seed metrics — the main research-grade gap),
+future capabilities (arbitrary robots, complex/long-horizon tasks, object
+interaction/manipulation/gripping), the four gates + their gotchas, the
+non-negotiable working rules (audit loop, verify-agent-claims, test-everything,
+compatibility, failure-mode thinking, keep-CONTEXT-updated), and a cheap
+individual external-GPU path (Vast.ai/RunPod/Modal + dispatch `adapter.train`
+remotely / sync artifacts). The next session reads this + CONTEXT.md, plans
+(plan mode), then executes phase-by-phase. No code touched; all gates remain
+green at Ship 22s baseline.
+
 ### 2026-06-06 — Ship 22s: adaptive mission decomposition (no wasted stand stage, count scales with complexity)
 
 Prompt-only (`prompts/decompose_task.md`). Sam's feedback: decomposition always
