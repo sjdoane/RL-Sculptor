@@ -232,9 +232,15 @@ class MjlabAdapter(SculptorAdapter):
     # Optional override for the schema keys emitted by the reward-term
     # state snapshot. If empty, derived from task_id via _schema_for_task.
     schema_keys: Optional[list[str]] = None
+    # §Ship 23: optional `[remote]` table (top-level in config.toml,
+    # plumbed by load_adapter) — SSH dispatch of train/rollout to a
+    # rented GPU. `SCULPTOR_REMOTE_*` env vars override these values
+    # (the UI backend's injection path). None/disabled → fully local.
+    remote: Optional[dict[str, Any]] = None
 
     # Populated by __post_init__.
     _validated: bool = field(default=False, init=False, repr=False)
+    _remote_exec: Any = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         # Lazy import — keeps non-mjlab adapters and UI health check
@@ -259,8 +265,14 @@ class MjlabAdapter(SculptorAdapter):
                 f"known tasks: {sorted(registered)}"
             )
 
-        # num_envs autocap on smaller VRAM.
-        if self.device.startswith("cuda") and torch.cuda.is_available():
+        # num_envs autocap on smaller VRAM. Skipped when remote dispatch
+        # is enabled — the local VRAM probe measures the wrong GPU (the
+        # rented pod has its own, almost always larger, card).
+        if (
+            not self._remote_enabled()
+            and self.device.startswith("cuda")
+            and torch.cuda.is_available()
+        ):
             idx = 0
             try:
                 idx = int(self.device.split(":")[1]) if ":" in self.device else 0
@@ -280,6 +292,40 @@ class MjlabAdapter(SculptorAdapter):
 
         self._mjlab_version = version("mjlab")
         self._validated = True
+
+    # ── Remote dispatch (§Ship 23) ──────────────────────────────────────────
+    def _remote_config(self):
+        """Resolve the effective RemoteConfig (TOML `[remote]` table +
+        `SCULPTOR_REMOTE_*` env overrides; env wins). None when nothing
+        is configured — the common local case."""
+        from sculptor.adapters._remote import RemoteConfig
+
+        return RemoteConfig.from_sources(self.remote, os.environ)
+
+    def _remote_enabled(self) -> bool:
+        rcfg = self._remote_config()
+        return rcfg is not None and rcfg.enabled
+
+    def _remote_executor(self):
+        """Lazily build (and cache) the RemoteExecutor when remote
+        dispatch is enabled; None otherwise."""
+        rcfg = self._remote_config()
+        if rcfg is None or not rcfg.enabled:
+            return None
+        if self._remote_exec is None or self._remote_exec.cfg != rcfg:
+            from sculptor.adapters._remote import RemoteExecutor
+
+            self._remote_exec = RemoteExecutor(rcfg)
+        return self._remote_exec
+
+    @staticmethod
+    def _remote_device_env(device: str) -> dict[str, str]:
+        """Mirror the local CUDA_VISIBLE_DEVICES pinning for the remote
+        host's device (which may differ from the local `self.device`)."""
+        env: dict[str, str] = {}
+        if device.startswith("cuda") and ":" in device:
+            env["CUDA_VISIBLE_DEVICES"] = device.split(":")[1]
+        return env
 
     # ── Contract ────────────────────────────────────────────────────────────
     def reward_contract(self) -> RewardContract:
@@ -502,7 +548,42 @@ class MjlabAdapter(SculptorAdapter):
         )
         cmd += ["--schema-keys", ",".join(effective_schema_keys)]
 
-        proc = _run_with_cleanup(cmd, env=env)
+        executor = self._remote_executor()
+        if executor is not None:
+            # §Ship 23: dispatch the runner to the rented GPU. The
+            # executor syncs artifacts back into the same local
+            # `output_dir` (checkpoint.pt promoted LAST), so everything
+            # below — post-checks, metrics, reward_spec.json, resume —
+            # runs unchanged.
+            from sculptor.adapters._remote import RunnerJob
+
+            device = executor.cfg.device or self.device
+            options = {
+                "--task-id": self.task_id,
+                "--num-envs": str(self.num_envs),
+                "--max-iterations": str(max_iterations),
+                "--seed": str(int(seed)),
+                "--device": device,
+                "--schema-keys": ",".join(effective_schema_keys),
+            }
+            input_paths: dict[str, Path] = {}
+            if reward_module_path is not None:
+                input_paths["--reward-module-path"] = Path(reward_module_path)
+            if init_policy_path is not None:
+                input_paths["--load-pretrained-policy"] = Path(init_policy_path).resolve()
+            job = RunnerJob(
+                subcommand="train",
+                options=options,
+                input_paths=input_paths,
+                output_dir=output_dir,
+                # Ordered: completion key (checkpoint.pt — also
+                # sculpt.py's resume key) is promoted last.
+                required_artifacts=("metrics.json", "checkpoint.pt"),
+                remote_env=self._remote_device_env(device),
+            )
+            proc = executor.execute(job)
+        else:
+            proc = _run_with_cleanup(cmd, env=env)
         if proc.returncode != 0:
             raise RuntimeError(
                 f"mjlab runner exited {proc.returncode}\n"
@@ -606,7 +687,42 @@ class MjlabAdapter(SculptorAdapter):
             cmd += ["--render-every", str(int(render_every))]
         if fps is not None:
             cmd += ["--fps", str(float(fps))]
-        proc = _run_with_cleanup(cmd, env=env)
+
+        executor = self._remote_executor()
+        if executor is not None and executor.cfg.rollout_remote:
+            # §Ship 23: remote rollout is opt-in (`rollout_remote=true`)
+            # — rollouts are short, and keeping them local preserves
+            # video preview when the pod is flaky.
+            from sculptor.adapters._remote import RunnerJob
+
+            device = executor.cfg.device or self.device
+            options = {
+                "--task-id": self.task_id,
+                "--n-episodes": str(int(n_episodes)),
+                "--device": device,
+            }
+            if max_episode_steps is not None:
+                options["--max-episode-steps"] = str(int(max_episode_steps))
+            if playback_speed is not None:
+                options["--playback-speed"] = str(float(playback_speed))
+            if render_every is not None:
+                options["--render-every"] = str(int(render_every))
+            if fps is not None:
+                options["--fps"] = str(float(fps))
+            job = RunnerJob(
+                subcommand="rollout",
+                options=options,
+                input_paths={"--checkpoint-path": checkpoint_path},
+                output_dir=output_dir,
+                # Ordered: rollout.mp4 last — sculpt.py's rollout-skip
+                # check requires all three non-empty, so a partial sync
+                # can never present as a finished rollout.
+                required_artifacts=("behavior.json", "trajectory.npz", "rollout.mp4"),
+                remote_env=self._remote_device_env(device),
+            )
+            proc = executor.execute(job)
+        else:
+            proc = _run_with_cleanup(cmd, env=env)
         if proc.returncode != 0:
             raise RuntimeError(
                 f"mjlab rollout runner exited {proc.returncode}\n"

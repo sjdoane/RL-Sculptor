@@ -339,7 +339,93 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
-### 2026-06-08 — Handoff brief: NEXT_LEVEL_BRIEF.md (research-grade direction)
+### 2026-06-09 — Ship 23a: remote GPU dispatch core (SSH+rsync executor at the mjlab subprocess seam)
+
+First ship of the approved research-grade plan (Phase 1: fast-iteration
+compute — RunPod Community 5090, ~$0.69/hr, expected ~5x over the 8 GiB
+5070 laptop). Train (and opt-in rollout) now dispatchable to a rented
+pod; everything else (diagnose/edit/KG/criteria/UI) stays local.
+
+- **What**:
+  - NEW `RewardSculptor/sculptor/adapters/_remote.py` (~870 lines):
+    `RemoteConfig.from_sources` (top-level `[remote]` TOML table +
+    `SCULPTOR_REMOTE_*` env overrides, env wins, `enabled` forced False
+    without host, misconfig emits `remote_config_ignored` — never a
+    silent local fallback); `CommandRunner` protocol (injectable fake
+    for tests) + `SubprocessCommandRunner` (ssh/rsync);
+    `RunnerJob` (options / uploadable `input_paths` / ORDERED
+    `required_artifacts`, last = completion key); `RemoteExecutor`:
+    preflight → version-skew probe (warn, don't block) → stale-job
+    check → upload → detached launch → poll/stream → staged atomic
+    download; `doctor()` (never raises; ssh/rsync/python/driver≥R570/
+    torch.cuda/version-skew/disk checks) for Ship 23b/23d.
+  - `sculptor/adapters/mjlab.py`: `remote` field on MjlabAdapter +
+    `_remote_config/_remote_enabled/_remote_executor/_remote_device_env`;
+    branch at the train seam (RunnerJob with
+    `required_artifacts=("metrics.json","checkpoint.pt")` — checkpoint,
+    the resume key, promoted LAST) and the rollout seam (gated by
+    `rollout_remote`, default false — local rollout keeps video preview
+    robust; artifacts `behavior.json, trajectory.npz, rollout.mp4`).
+    num_envs VRAM autocap SKIPPED when remote enabled (probes the wrong
+    GPU). All post-subprocess validation/resume/error formatting
+    unchanged — executor returns a CompletedProcess and artifacts land
+    in the same local `output_dir`.
+  - `sculptor/adapters/base.py` `load_adapter`: top-level `[remote]`
+    table plumbed via signature introspection into adapters accepting a
+    `remote` kwarg (NOT nested in `[adapter].config` — the UI's
+    `_toml_val` serializer only handles primitives). Explicit
+    `[adapter.config.remote]` wins; non-remote adapters untouched.
+- **Why**: compute is THE bottleneck (~25 min/train-iter locally);
+  every later phase (eval campaign, ablations, KG experiment) is gated
+  on iteration speed. The mjlab runner subprocess at mjlab.py:505/:609
+  was already a clean file-in/file-out seam.
+- **How** (lifecycle safety, the part that burns rented GPUs):
+  job-dir protocol under `<workdir>/mirror/<abs output_dir>/.remote_job`
+  — run.sh self-records its pgid (under setsid it IS the session
+  leader), `exitcode` file written atomically (tmp+mv) is the SOLE
+  completion truth (never the SSH channel); any local exception
+  SIGTERM→SIGKILLs the remote pgid (mirrors `_run_with_cleanup`) EXCEPT
+  ssh_unreachable (can't reach it ⇒ leave it reattachable); a live
+  remote job whose `cmd.json` sha matches the new dispatch is
+  REATTACHED (idempotent recovery after local crash — upload skipped
+  too, so a sync blip can't kill preserved work), mismatched ⇒ killed
+  (no double-dispatch). Stdout polled via one combined ssh round-trip
+  (exitcode + `tail -c +N`, BYTE offsets so \r progress bars / partial
+  lines can't desync; partial trailing line buffered so a split
+  `[SCULPT-EVENT]` JSON can never reach the UI truncated) and re-emitted
+  on local stdout — run_manager's stdout-event passthrough delivers
+  remote_* + iter_progress events to the UI with zero backend changes.
+  Download staged into `.remote_incoming/` then promoted with the
+  completion key LAST ⇒ resume can never see a partial train as
+  complete. Absolute-path mirroring makes iter N's checkpoint a
+  zero-byte rsync no-op when iter N+1 warm-starts from it. Code dir
+  rsynced to `<workdir>/code` + PYTHONPATH ⇒ sculptor version skew
+  structurally impossible. Failures classified
+  (`remote_dispatch_failed` reason ∈ ssh_unreachable | launch_failed |
+  sync_failed | artifacts_missing | remote_oom | runner_failed |
+  job_lost) — all observable, all recoverable upstream.
+  Review-agent audit applied: C1 stale-check ssh failure ≠ NOJOB (was a
+  double-dispatch + unkillable-orphan window); H1 remote rsync specs
+  shell-quoted (spaces in mirrored paths); H2 launch `&` no longer
+  backgrounds the whole `cd && rm && setsid` list + pgid read polls up
+  to 10 s instead of a fixed 0.5 s sleep; M4 vanished job dir (spot
+  reclaim) fails fast as `job_lost` instead of burning the reattach
+  budget.
+- **Verified**: 54 new tests (test_remote_config.py 21 — precedence/
+  robustness/observable-misconfig/load_adapter plumb;
+  test_remote_executor.py 22 — FakeCommandRunner emulating the remote
+  fs under tmp_path: happy path, launch-script shape, reattach-vs-kill
+  on cmd-hash, byte-offset streaming, partial-line buffering,
+  atomic-download ordering via recorded Path.replace, artifacts_missing
+  leaves no partial checkpoint, OOM/runner-failed classification,
+  kill-on-KeyboardInterrupt, connection-lost retry + give-up-without-
+  kill, job_lost fail-fast, quoted spaced paths, doctor;
+  test_mjlab_remote_dispatch.py 11 — enabled⇒executor/local-not,
+  disabled⇒identical local behavior, env-var injection, rollout gating,
+  warm-start in input_paths, device override, autocap skip/apply).
+  Four gates green: sculptor 423 passed/1 skipped (was 369), backend
+  306 passed, frontend build 2.8 s clean, no UI surface touched yet
+  (23d). NOT yet smoke-tested against a real pod — that's Ship 23e.
 
 Doc-only. Added `NEXT_LEVEL_BRIEF.md` at repo root — a self-contained
 fresh-session handoff for taking RL-Sculptor toward research-grade. Covers:
