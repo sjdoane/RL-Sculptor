@@ -36,7 +36,9 @@ class RemoteSettings(BaseModel):
     user: str = ""
     key_path: str = ""
     remote_workdir: str = "~/.sculptor_remote"
-    remote_python: str = "~/.sculptor_remote/venv/bin/python"
+    # Venv lives on pod-LOCAL disk (network-fs imports cost ~60s per
+    # runner subprocess); provision_remote.sh creates it there.
+    remote_python: str = "~/.sculptor_venv/bin/python"
     device: str = ""
     rollout_remote: bool = False
 

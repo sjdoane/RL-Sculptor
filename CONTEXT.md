@@ -339,6 +339,84 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-10 — Ship 23e: live RunPod 5090 smoke — remote dispatch proven end-to-end, 3.3× throughput
+
+Rented a real RunPod Community RTX 5090 (32 GiB, driver 580.126.20,
+~$0.69/hr, network volume at /workspace) and took the Ship-23 stack
+through the full checklist. Everything that follows was verified
+against the live pod, not mocks.
+
+- **Results (G1 humanoid, intrinsic reward, 50 iters, seed-pinned)**:
+  local 5070 Laptop autocapped to 2048 envs → 1.08–1.15 s/iter,
+  ~45k steps/s, 71.5 s wall; remote 5090 at the full 4096 envs →
+  0.65 s/iter, ~150k steps/s, 117 s wall (62 s train + ~48 s process
+  startup + ~13 s upload/sync). **3.3× sample throughput**; a real
+  1500-iter stage ≈ 17 min remote vs ≈ 28 min local at 2× batch.
+  Cartpole sanity: 57k steps/s. Identical checkpoint sizes local/remote.
+- **Lifecycle proven live**: full event stream reached stdout in order
+  (dispatch_started → upload_completed 7.8 s → job_launched with pgid →
+  live rsl_rl output + iter_progress re-emitted → job_finished →
+  artifacts_synced ~6 s; checkpoint.pt promoted last). Warm-start:
+  `warm_start_loaded` from the MIRROR path — iter N's checkpoint
+  re-upload is a zero-byte no-op as designed. `kill -9` of the local
+  driver mid-train → pod job kept training (survives disconnect by
+  construction) → identical re-dispatch emitted `remote_job_reattached`,
+  did NOT double-launch or re-upload, completed + synced. UI-style
+  cancel (SIGTERM) → pod GPU 0 procs / pgid dead in <5 s. Live backend:
+  GET /system/remote pre-filled; POST /system/remote/doctor → all 8
+  checks green through the API.
+- **Bugs found ONLY by the live pod (all fixed + unit-tested)**:
+  1. `_remote.py` rsync `-az` → `-rltz`: archive mode implies chown,
+     which RunPod's mfs volume rejects even for root (exit 23, every
+     sync failed).
+  2. **SIGTERM orphan gap (the big one)**: the UI cancels with a bare
+     SIGTERM, which terminates CPython WITHOUT unwinding — the
+     except-BaseException kill never ran and the pod job kept burning
+     after a cancel (caught red-handed: pgid alive, GPU busy).
+     `execute()` now installs a SIGTERM→SystemExit handler for the
+     dispatch duration (main thread only, restored in finally), and
+     `_kill_remote`'s KILL escalation is detached pod-side
+     (`setsid bash -c 'sleep 2; kill -KILL ...' &`) so the backend's
+     5 s TERM→KILL grace can't cut it off mid-escalation. New tests:
+     SIGTERM-mid-wait kills remote + restores handler.
+  3. Network-fs venv import tax: torch import alone 26–39 s per runner
+     process from /workspace (mfs doesn't page-cache) → ~170 s overhead
+     per dispatch. Venv moved to pod-LOCAL disk (~/.sculptor_venv),
+     wheel/python caches stay on the volume → overhead 48 s.
+  4. Unpinned transitive GPU stack: torch>=2.11 resolved 2.12.0+cu130;
+     warp-lang 1.14 broke mjlab 1.3.0 (`wp.context` gone); newer
+     mujoco-warp used a `tile_cholesky(fill_mode=)` kwarg warp 1.12.1
+     lacks; scipy (mjlab terrain import) and wandb weren't installed at
+     all. provision_remote.sh now pins the ENTIRE stack (torch, mjlab,
+     warp-lang, mujoco, mujoco-warp, rsl-rl-lib, numpy, scipy, wandb,
+     imageio×2) to locally-detected versions, plus the local PYTHON
+     patch version via uv-managed CPython (system 3.13.8 broke torch
+     2.11 imports — CPython inspect regression; local 3.13.13 is fine).
+  5. Pod images ship a stale system uv (0.9.0, can't self-update,
+     doesn't know current CPython releases) — script now always
+     installs its own uv to ~/.local/bin.
+- **Files**: `sculptor/adapters/_remote.py` (rsync flags, SIGTERM
+  handler, detached kill escalation), `scripts/provision_remote.sh`
+  (full-stack pinning, local-disk venv + volume caches, own uv,
+  python-version pinning), `docs/remote.md` (venv-placement rationale,
+  measured-performance table, restart flow),
+  `backend/services/remote_settings.py` + test (default remote_python →
+  `~/.sculptor_venv/bin/python`), `tests/test_remote_executor.py`
+  (SIGTERM test). Pod settings pre-filled at
+  `<projects_root>/_settings/remote.json` (enabled=false — flip the
+  Settings-card toggle when a pod is up).
+- **Restart flow for Sam** (pod IP/port change every restart): web
+  terminal one-liner is no longer needed once the account-level SSH key
+  is saved (Settings → SSH Public Keys on runpod.io); then per restart:
+  re-run `./scripts/provision_remote.sh root@<ip> -p <port> -i
+  ~/.ssh/id_ed25519 -w /workspace/sculptor_remote` (~1–2 min, caches
+  warm) and update host/port in Settings → Remote GPU → Save & test.
+- **Cost of this whole smoke session**: ≈ 2 pod-hours ≈ $1.40.
+- **Verified**: sculptor 433 passed/1 skipped, backend 319 passed,
+  frontend build clean (gates re-run after the fixes). NOT yet run: a
+  full LLM-driven mission stage remotely — first task when the eval
+  phase starts (needs ANTHROPIC_API_KEY + ~20 min pod time).
+
 ### 2026-06-09 — Ship 23d: remote dispatch in the UI (Settings card, doctor endpoint, run-event chips)
 
 Per the no-terminal-after-run.sh rule: remote GPU dispatch is now fully

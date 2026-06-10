@@ -83,7 +83,7 @@ def test_remote_env_mapping(tmp_path: Path) -> None:
     assert env["SCULPTOR_REMOTE_DEVICE"] == "cuda:1"
     assert env["SCULPTOR_REMOTE_ROLLOUT"] == "1"
     assert env["SCULPTOR_REMOTE_WORKDIR"] == "~/.sculptor_remote"
-    assert env["SCULPTOR_REMOTE_PYTHON"] == "~/.sculptor_remote/venv/bin/python"
+    assert env["SCULPTOR_REMOTE_PYTHON"] == "~/.sculptor_venv/bin/python"
 
 
 def test_remote_env_omits_blank_optionals(tmp_path: Path) -> None:

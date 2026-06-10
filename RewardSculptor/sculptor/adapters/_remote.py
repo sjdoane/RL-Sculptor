@@ -317,7 +317,12 @@ class RemoteExecutor:
         return " ".join(parts)
 
     def _rsync_argv(self, src: str, dst: str, *extra: str) -> list[str]:
-        return ["rsync", "-az", "-t", "-e", self._rsync_ssh_opt(), *extra, src, dst]
+        # -rltz, NOT -az: archive mode implies -o/-g/-p (chown/chmod),
+        # which network filesystems like RunPod's /workspace mfs reject
+        # even for root ("chown ... Operation not permitted", exit 23).
+        # We only need recursive + symlinks + mtimes (warm-start no-op
+        # detection) + compression.
+        return ["rsync", "-rltz", "-e", self._rsync_ssh_opt(), *extra, src, dst]
 
     def _remote_spec(self, posix_path: str) -> str:
         """`host:path` rsync spec with the path shell-quoted — the
@@ -612,13 +617,21 @@ class RemoteExecutor:
     def _kill_remote(self, job: RunnerJob) -> None:
         """Best-effort SIGTERM→SIGKILL of the remote process group.
         Mirrors `_run_with_cleanup`'s killpg so a UI cancel can never
-        leave a rented GPU burning."""
+        leave a rented GPU burning.
+
+        The KILL escalation is detached (`setsid ... &`) on the pod:
+        the local process is often inside its own 5 s kill-grace window
+        (backend SIGTERM→SIGKILL) when this runs, and an in-channel
+        `sleep 2` could be cut off with the ssh client — TERM returns
+        immediately, the escalation survives channel close."""
         jd = self._job_dir(job)
         cmd = (
             f"PG=$(cat {shlex.quote(jd)}/pgid 2>/dev/null); "
             f"if [ -n \"$PG\" ]; then "
-            f"kill -TERM -- -\"$PG\" 2>/dev/null; sleep 2; "
-            f"kill -KILL -- -\"$PG\" 2>/dev/null; fi; true"
+            f"kill -TERM -- -\"$PG\" 2>/dev/null; "
+            f"setsid bash -c \"sleep 2; kill -KILL -- -$PG 2>/dev/null\" "
+            f"</dev/null >/dev/null 2>&1 & "
+            f"fi; true"
         )
         try:
             self.runner.run(self._ssh_argv(cmd), timeout=60)
@@ -794,6 +807,25 @@ class RemoteExecutor:
         self._preflight()
         self._check_version_skew(job)
         t_start = time.monotonic()
+        # The UI cancels runs with a bare SIGTERM, which terminates
+        # CPython WITHOUT unwinding — the except-BaseException kill
+        # below would never run and the rented-GPU job would orphan
+        # (verified live on a RunPod 5090). Convert SIGTERM to
+        # SystemExit for the duration of the dispatch; restore after.
+        # Main-thread only — elsewhere signal.signal raises ValueError
+        # and we fall back to reattach-or-stale-kill on next dispatch.
+        import signal as _signal
+
+        prev_term = None
+        installed = False
+        try:
+            def _raise_exit(signum: int, frame: Any) -> None:  # noqa: ARG001
+                raise SystemExit(143)
+
+            prev_term = _signal.signal(_signal.SIGTERM, _raise_exit)
+            installed = True
+        except (ValueError, OSError):
+            pass
         try:
             # Stale-job check BEFORE upload: on reattach (local crash +
             # restart onto a still-running matching job) we skip the
@@ -844,6 +876,12 @@ class RemoteExecutor:
                     reason=e.reason, detail=e.detail[-600:],
                 )
             raise
+        finally:
+            if installed:
+                try:
+                    _signal.signal(_signal.SIGTERM, prev_term)
+                except (ValueError, OSError):
+                    pass
 
     def doctor(self) -> dict[str, Any]:
         """Connectivity / environment checks for `sculpt remote doctor`

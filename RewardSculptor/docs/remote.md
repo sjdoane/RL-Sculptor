@@ -41,9 +41,17 @@ unchanged. See `sculptor/adapters/_remote.py` for the full protocol.
    (generate inside WSL with `ssh-keygen -t ed25519` if needed).
 
 If you use the network volume, provision with
-`-w /workspace/sculptor_remote` (below) so the venv + mirror live on it,
-and set the matching `remote_workdir` in the config — the script prints
-the right block either way.
+`-w /workspace/sculptor_remote` (below) so the mirror + wheel cache live
+on it, and set the matching `remote_workdir` in the config — the script
+prints the right block either way.
+
+The **venv always goes on pod-local disk** (`~/.sculptor_venv`), never
+the volume: RunPod's network fs does not page-cache, and a
+volume-resident venv costs ~60 s of import I/O (torch alone 26–39 s) in
+every runner subprocess — measured live, it turned a 29 s train into a
+199 s job. After a pod restart the venv is gone: re-run the provision
+script (fast — wheels come from the volume cache) and update host/port
+in the UI's Settings → Remote GPU card.
 
 ## Provision the pod
 
@@ -72,7 +80,7 @@ host = "203.0.113.7"
 port = 41234
 user = "root"
 key_path = "~/.ssh/id_ed25519"
-remote_python = "~/.sculptor_remote/venv/bin/python"
+remote_python = "~/.sculptor_venv/bin/python"
 # remote_workdir = "~/.sculptor_remote"   # set to /workspace/... on a network volume
 # device = "cuda:0"          # device ON THE POD (defaults to adapter device)
 # rollout_remote = false     # rollouts stay local by default (video preview robustness)
@@ -120,6 +128,26 @@ Ctrl-C) SIGTERMs the remote process group — except when the host is
 unreachable, in which case the job is deliberately left alive for
 reattach. The on-pod `exitcode` file, never the SSH channel, decides
 whether a job finished.
+
+## Measured (Ship 23e, RunPod Community RTX 5090, 2026-06-09/10)
+
+G1 humanoid (`Mjlab-Velocity-Flat-Unitree-G1`), intrinsic reward, 50
+rsl_rl iters, seed-pinned:
+
+| | envs | s/iter | steps/s | 50-iter job wall |
+|---|---|---|---|---|
+| local RTX 5070 Laptop (8 GiB, autocap) | 2048 | 1.08–1.15 | ~45k | 71.5 s |
+| remote RTX 5090 (32 GiB) | 4096 | 0.65 | ~150k | 117 s (62 s train + ~48 s startup + ~7 s sync) |
+
+**3.3× sample throughput.** Per-dispatch overhead ≈ 48 s startup
+(imports + 4096-env build) + ~13 s upload/sync; amortized over a real
+1500-iter stage: remote ≈ 17 min vs local ≈ 28 min at 2× the
+batch — ~3× experience throughput, ~1.6× wall at same iter count.
+Cartpole sanity (256 envs): 57k steps/s, 10 iters in 12.6 s.
+Verified live: warm-start from the mirror (zero-byte re-upload),
+`kill -9` of the local process → `remote_job_reattached`, no
+double-train; SIGTERM (UI cancel) → pod GPU freed in <5 s; doctor all
+8 checks green through `POST /system/remote/doctor`.
 
 ## Manual smoke checklist (Ship 23e — run on a real pod)
 

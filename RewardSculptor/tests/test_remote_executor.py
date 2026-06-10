@@ -660,6 +660,32 @@ def test_local_exception_kills_remote_job(tmp_path: Path) -> None:
     assert not fake.alive_pgids, "remote pgid should be dead after kill"
 
 
+def test_sigterm_mid_wait_kills_remote_job(tmp_path: Path) -> None:
+    """The UI cancels with a bare SIGTERM, which terminates CPython
+    without unwinding — execute() must convert it to SystemExit so the
+    kill-on-exception path runs (verified live: without this the pod
+    job kept burning after a cancel)."""
+    import os
+    import signal
+
+    ex, fake = make_executor(tmp_path)
+    job = make_job(tmp_path)
+    fake.poll_plan = [(None, ["still running"])]
+
+    def sigterm_self(s):
+        os.kill(os.getpid(), signal.SIGTERM)
+
+    ex._sleep = sigterm_self
+    prev = signal.getsignal(signal.SIGTERM)
+    try:
+        with pytest.raises(SystemExit):
+            ex.execute(job)
+    finally:
+        assert signal.getsignal(signal.SIGTERM) is prev, "handler not restored"
+    assert fake.kill_count >= 1
+    assert not fake.alive_pgids
+
+
 def test_preflight_unreachable_raises_before_anything(tmp_path: Path) -> None:
     ex, fake = make_executor(tmp_path)
     fake.ssh_down = True

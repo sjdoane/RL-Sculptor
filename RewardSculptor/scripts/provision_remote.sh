@@ -5,9 +5,18 @@
 # Usage:
 #   ./scripts/provision_remote.sh root@HOST [-p PORT] [-i SSH_KEY] [-w WORKDIR]
 #
-#   -w WORKDIR   remote workdir (default ~/.sculptor_remote). On a RunPod
-#                network volume use -w /workspace/sculptor_remote so the
-#                venv + mirrored checkpoints survive pod restarts.
+#   -w WORKDIR   remote workdir for mirror/code/caches (default
+#                ~/.sculptor_remote). On a RunPod network volume use
+#                -w /workspace/sculptor_remote so mirrored checkpoints +
+#                the uv wheel cache survive pod restarts.
+#
+# The VENV deliberately lives on pod-LOCAL disk ($HOME/.sculptor_venv),
+# NOT the network volume: RunPod's mfs does not page-cache, so a
+# volume-resident venv costs ~60s of import I/O (torch alone ~26-39s)
+# in EVERY runner subprocess — measured live, it turned a 29s train into
+# a 199s job. The trade: after a pod restart the venv is gone and this
+# script must re-run — with the uv cache on the volume that re-install
+# is wheel-download-free (~1-2 min).
 #
 # Run from inside WSL, from the RewardSculptor/ directory (so the local
 # torch/mjlab versions can be detected and pinned on the remote — this
@@ -57,40 +66,62 @@ SSH_OPTS=(-o BatchMode=yes -o StrictHostKeyChecking=accept-new -p "$PORT")
 [ -n "$KEY" ] && SSH_OPTS+=(-i "$KEY")
 
 # ── detect local versions to pin (best-effort) ──────────────────────
-TORCH_SPEC="torch>=2.11.0"
-MJLAB_SPEC="mjlab[cu128]>=1.3.0"
+# Pin the ENTIRE GPU stack, not just torch/mjlab: every '>=', and every
+# undeclared transitive (warp-lang API drift, mujoco-warp kwargs, mjlab's
+# undeclared scipy import) has bitten on a real pod. Live-pod debugging
+# log: torch>=2.11 resolved 2.12.0+cu130; warp-lang 1.14 broke mjlab's
+# `wp.context` access; mujoco-warp newer-than-local used a tile_cholesky
+# kwarg local warp 1.12.1 lacks; scipy/wandb weren't installed at all.
+# uv lives in ~/.local/bin which non-login shells may not have on PATH.
+export PATH="$HOME/.local/bin:$PATH"
+PIN_PKGS="torch mjlab warp-lang mujoco mujoco-warp rsl-rl-lib numpy scipy wandb imageio imageio-ffmpeg"
+PINNED_SPECS=""
+PY_VERSION="3.13.5"
 if command -v uv >/dev/null 2>&1 && [ -f pyproject.toml ]; then
-  LOCAL_TORCH=$(uv run --no-sync python -c \
-    "import importlib.metadata as m; print(m.version('torch'))" 2>/dev/null || true)
-  LOCAL_MJLAB=$(uv run --no-sync python -c \
-    "import importlib.metadata as m; print(m.version('mjlab'))" 2>/dev/null || true)
-  [ -n "${LOCAL_TORCH:-}" ] && TORCH_SPEC="torch==${LOCAL_TORCH}"
-  [ -n "${LOCAL_MJLAB:-}" ] && MJLAB_SPEC="mjlab[cu128]==${LOCAL_MJLAB}"
+  PINNED_SPECS=$(uv run --no-sync python -c "
+import importlib.metadata as m
+specs = []
+for p in '$PIN_PKGS'.split():
+    try:
+        specs.append(f'{p}=={m.version(p)}')
+    except Exception:
+        pass
+print(' '.join(specs))" 2>/dev/null || true)
+  LOCAL_PY=$(uv run --no-sync python -c \
+    "import sys; print('.'.join(map(str, sys.version_info[:3])))" 2>/dev/null || true)
+  [ -n "${LOCAL_PY:-}" ] && PY_VERSION="$LOCAL_PY"
 fi
-case "$TORCH_SPEC" in
-  *">="*) echo "WARNING: could not detect local torch/mjlab versions (run from" >&2
-          echo "         RewardSculptor/ with uv on PATH) — installing pyproject" >&2
-          echo "         minimums; \`sculpt remote doctor\` may report skew." >&2 ;;
-esac
-echo "==> pinning: $TORCH_SPEC  $MJLAB_SPEC  (workdir: $WORKDIR)"
+if [ -z "$PINNED_SPECS" ]; then
+  echo "WARNING: could not detect local package versions (run from" >&2
+  echo "         RewardSculptor/ with uv on PATH) — installing pyproject" >&2
+  echo "         minimums; \`sculpt remote doctor\` WILL report skew and" >&2
+  echo "         API drift in warp/mujoco-warp may break training." >&2
+  PINNED_SPECS="torch>=2.11.0 mjlab[cu128]>=1.3.0 imageio-ffmpeg>=0.6.0 scipy wandb"
+fi
+echo "==> pinning: $PINNED_SPECS"
+echo "==> python $PY_VERSION  (workdir: $WORKDIR)"
 
 # ── provision over a single ssh session ─────────────────────────────
 # printf %q re-quotes the args for the REMOTE shell — ssh flattens its
 # argv into one string, and unquoted '>=' specs would become stdout
 # redirections on the pod (installing unpinned latest + eating output).
 ssh "${SSH_OPTS[@]}" "$TARGET" \
-  "bash -s -- $(printf '%q ' "$TORCH_SPEC" "$MJLAB_SPEC" "$WORKDIR")" <<'REMOTE'
+  "bash -s -- $(printf '%q ' "$PINNED_SPECS" "$WORKDIR" "$PY_VERSION")" <<'REMOTE'
 set -euo pipefail
-TORCH_SPEC="$1"
-MJLAB_SPEC="$2"
-WORKDIR="$3"
+PINNED_SPECS="$1"
+WORKDIR="$2"
+PY_VERSION="$3"
 case "$WORKDIR" in
   "~") WORKDIR="$HOME" ;;
   "~/"*) WORKDIR="$HOME/${WORKDIR#\~/}" ;;
 esac
-VENV="$WORKDIR/venv"
+# Venv on pod-LOCAL disk (network-fs imports cost ~60s/process); wheel
+# + python download caches on the workdir so a post-restart re-provision
+# is download-free.
+VENV="$HOME/.sculptor_venv"
+export UV_CACHE_DIR="$WORKDIR/uv_cache"
 
-echo "--> [pod] workdir: $WORKDIR"
+echo "--> [pod] workdir: $WORKDIR  venv: $VENV"
 mkdir -p "$WORKDIR"
 
 SUDO=""
@@ -123,20 +154,30 @@ if [ "$MAJOR" -lt 570 ]; then
   exit 3
 fi
 
-if [ ! -x "$HOME/.local/bin/uv" ] && ! command -v uv >/dev/null 2>&1; then
+# Always use our own up-to-date uv in ~/.local/bin — pod images often
+# preinstall an old system uv (seen: 0.9.0, too old to know current
+# CPython patch releases, and `uv self update` is blocked for it).
+if [ ! -x "$HOME/.local/bin/uv" ]; then
   echo "--> [pod] installing uv"
   curl -LsSf https://astral.sh/uv/install.sh | sh >/dev/null
 fi
 export PATH="$HOME/.local/bin:$PATH"
+echo "--> [pod] uv: $(uv -V) at $(command -v uv)"
 
+# Managed CPython on local disk too (stdlib imports must be fast). A
+# system python3.13 is NOT used: its patch version can differ from
+# local (e.g. 3.13.8 broke torch 2.11 imports via a CPython inspect
+# regression; local 3.13.5 is fine) — pin the exact local interpreter.
+export UV_PYTHON_INSTALL_DIR="$HOME/.sculptor_pythons"
 if [ ! -x "$VENV/bin/python" ]; then
-  echo "--> [pod] creating venv (python 3.13)"
-  uv venv --python 3.13 "$VENV"
+  echo "--> [pod] creating venv (python $PY_VERSION)"
+  uv venv --python "$PY_VERSION" "$VENV"
 fi
 
-echo "--> [pod] installing $TORCH_SPEC $MJLAB_SPEC imageio-ffmpeg (idempotent)"
-uv pip install --python "$VENV/bin/python" -q \
-  "$TORCH_SPEC" "$MJLAB_SPEC" "imageio-ffmpeg>=0.6.0"
+echo "--> [pod] installing pinned stack (idempotent): $PINNED_SPECS"
+# Word-splitting of $PINNED_SPECS is intentional — one spec per word.
+# shellcheck disable=SC2086
+uv pip install --python "$VENV/bin/python" -q $PINNED_SPECS
 
 echo "--> [pod] torch/cuda sanity check"
 "$VENV/bin/python" - <<'PY'
@@ -164,6 +205,10 @@ port = $PORT
 user = "${TARGET%%@*}"
 $( [ -n "$KEY" ] && echo "key_path = \"$KEY\"" || echo "# key_path = \"~/.ssh/id_ed25519\"" )
 remote_workdir = "$WORKDIR"
-remote_python = "$WORKDIR/venv/bin/python"
+remote_python = "~/.sculptor_venv/bin/python"
 # rollout_remote = false   # rollouts stay local by default
+
+# NOTE: after a pod restart the venv (pod-local disk) is gone — re-run
+# this script (fast: wheel cache lives on the workdir) and update
+# host/port here or in the UI's Settings -> Remote GPU card.
 EOF
