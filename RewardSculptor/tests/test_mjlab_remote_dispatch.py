@@ -97,8 +97,10 @@ def test_train_dispatches_remotely_when_enabled(tmp_path: Path) -> None:
     assert job.remote_env["CUDA_VISIBLE_DEVICES"] == "1"
     # Schema keys still derived per-task (S8 regression surface).
     assert set(job.options["--schema-keys"].split(",")) >= {"qpos", "qvel", "command_vel"}
-    # Reward module rides as an uploadable input, not a bare option.
+    # Reward module rides as an uploadable input, not a bare option —
+    # and its whole parent dir mirrors too (current.py loads siblings).
     assert job.input_paths["--reward-module-path"] == _reward_module(tmp_path)
+    assert job.aux_dirs == (_reward_module(tmp_path).resolve().parent,)
     # Ordered artifacts: completion key (resume key) LAST.
     assert job.required_artifacts == ("metrics.json", "checkpoint.pt")
     assert job.output_dir == (tmp_path / "out").resolve()

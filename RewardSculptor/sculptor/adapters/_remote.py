@@ -257,6 +257,11 @@ class RunnerJob:
     remote_env: dict[str, str] = field(default_factory=dict)
     output_flag: str = "--output-dir"
     iter_hint: Optional[int] = None                # parsed "iter_<i>" if any
+    #: Directories mirrored wholesale (no argv rewrite). Needed when an
+    #: input file loads siblings at import time — sculpt's
+    #: rewards/current.py is a shim that exec's its neighbouring
+    #: v<N>.py, so the whole rewards/ dir must exist on the pod.
+    aux_dirs: tuple[Path, ...] = ()
 
     def __post_init__(self) -> None:
         if self.iter_hint is None:
@@ -515,6 +520,8 @@ class RemoteExecutor:
         dirs = {str(PurePosixPath(self._mirror(job.output_dir)))}
         for p in job.input_paths.values():
             dirs.add(str(PurePosixPath(self._mirror(p)).parent))
+        for d in job.aux_dirs:
+            dirs.add(str(PurePosixPath(self._mirror(d))))
         mk = self.runner.run(
             self._ssh_argv("mkdir -p " + " ".join(shlex.quote(d) for d in sorted(dirs))),
             timeout=60,
@@ -537,6 +544,25 @@ class RemoteExecutor:
                 raise RemoteDispatchError(
                     "sync_failed",
                     f"rsync {local} failed: {(proc.stderr or '')[-400:]}",
+                )
+        for d in job.aux_dirs:
+            d = Path(d)
+            if not d.is_dir():
+                raise RemoteDispatchError(
+                    "sync_failed", f"aux dir not found locally: {d}",
+                )
+            proc = self.runner.run(
+                self._rsync_argv(
+                    str(d) + "/",
+                    self._remote_spec(self._mirror(d) + "/"),
+                    "--exclude", "__pycache__",
+                ),
+                timeout=1800,
+            )
+            if proc.returncode != 0:
+                raise RemoteDispatchError(
+                    "sync_failed",
+                    f"rsync aux dir {d} failed: {(proc.stderr or '')[-400:]}",
                 )
         self._event(
             "remote_upload_completed", job,

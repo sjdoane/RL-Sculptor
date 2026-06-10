@@ -129,7 +129,20 @@ class FakeCommandRunner:
                 # Code sync — record only; tests don't need 50 files copied.
                 self.remote.path(rpath.rstrip("/")).mkdir(parents=True, exist_ok=True)
                 return self._done(argv)
-            local = Path(src)
+            local = Path(src.rstrip("/"))
+            excludes = {argv[i + 1] for i, a in enumerate(argv) if a == "--exclude"}
+            if local.is_dir():  # aux-dir upload
+                target_dir = self.remote.path(rpath.rstrip("/"))
+                target_dir.mkdir(parents=True, exist_ok=True)
+                for entry in local.iterdir():
+                    if entry.name in excludes:
+                        continue
+                    t = target_dir / entry.name
+                    if entry.is_dir():
+                        shutil.copytree(entry, t, dirs_exist_ok=True)
+                    else:
+                        shutil.copy2(entry, t)
+                return self._done(argv)
             target = self.remote.path(rpath)
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(local, target)
@@ -792,6 +805,32 @@ def test_paths_with_spaces_quoted_in_rsync_specs(tmp_path: Path) -> None:
     assert spaced, "expected remote rsync specs containing the spaced path"
     for spec in spaced:
         assert spec.split(":", 1)[1].startswith("'"), f"unquoted remote path: {spec}"
+
+
+def test_aux_dirs_uploaded_wholesale(tmp_path: Path) -> None:
+    """Pipeline regression (live pod, 2026-06-10): sculpt passes
+    rewards/current.py, a shim that imports its sibling v0.py — the
+    whole rewards/ dir must land at its mirror path, minus __pycache__."""
+    ex, fake = make_executor(tmp_path)
+    rewards = tmp_path / "proj" / "rewards"
+    rewards.mkdir(parents=True, exist_ok=True)
+    (rewards / "current.py").write_text("# shim loading v0\n")
+    (rewards / "v0.py").write_text("# the actual reward\n")
+    (rewards / "__pycache__").mkdir()
+    (rewards / "__pycache__" / "junk.pyc").write_bytes(b"x")
+    job = make_job(
+        tmp_path,
+        input_paths={"--reward-module-path": rewards / "current.py"},
+        aux_dirs=(rewards,),
+    )
+    fake.poll_plan = [(0, [])]
+    fake.finish_artifacts = dict(HAPPY_ARTIFACTS)
+    proc = ex.execute(job)
+    assert proc.returncode == 0
+    mirror = fake.path(ex._mirror(rewards))
+    assert (mirror / "current.py").is_file()
+    assert (mirror / "v0.py").is_file(), "sibling module must be mirrored"
+    assert not (mirror / "__pycache__").exists()
 
 
 def test_reattach_skips_upload(tmp_path: Path, capsys) -> None:

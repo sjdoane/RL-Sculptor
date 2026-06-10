@@ -339,6 +339,43 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-10 — Ship 23f: full LLM pipeline through the pod + the aux-dirs fix it forced
+
+Ran the complete sculpt loop (the thing missions are made of) against
+the live 5090: `sculpt run "balance the pole upright and keep the cart
+centered"` on a throwaway clone of the 360s Cartpole project with a
+`[remote]` table (this also exercised the load_adapter TOML plumb — the
+third and last config path after the dict and env-var ones).
+
+- **Result**: `run_completed`, 2 iterations. Per iter: REMOTE train
+  (126 s / 151 s job, exit 0, artifacts synced ~4.5 s) → LOCAL rollout +
+  video (`rollout_progress` events streaming) → realism audit → KG
+  diagnose (found sparse_reward + reward_saturation) → edit. Reward
+  chain v0 → v1 → v2 on disk; iter_1 trained the LLM-sculpted v1 ON THE
+  POD and its `reward_trajectory.json` came back with the sculpted
+  components (`alive_bonus`, `upright_bonus`) — SculptorRewardTerm
+  executed remotely end to end.
+- **Bug it caught (fixed + tested)**: sculpt passes
+  `rewards/current.py`, which is a SHIM that imports its sibling
+  `v<N>.py` at import time (`_HERE / 'v0.py'`). The executor uploaded
+  only the single input file → remote `FileNotFoundError: .../mirror/
+  .../rewards/v0.py` on the very first train. Fix: `RunnerJob.aux_dirs`
+  — directories mirrored wholesale (rsync, `--exclude __pycache__`, no
+  argv rewrite); the mjlab train seam passes the reward module's parent
+  dir. New tests: executor uploads siblings + excludes __pycache__
+  (test_aux_dirs_uploaded_wholesale); dispatch test asserts
+  `job.aux_dirs == (rewards_parent,)`. The single-file smoke runs
+  (Ship 23e) couldn't catch this — they passed `reward_module_path=None`.
+- **Files**: `sculptor/adapters/_remote.py` (aux_dirs field + upload
+  phase + mkdir set), `sculptor/adapters/mjlab.py` (train seam passes
+  the parent dir), both remote test files.
+- **Verified**: sculptor 434 passed/1 skipped, backend re-run green,
+  frontend untouched since its green build. Phase 1 (fast-iteration
+  compute) is now DONE in full — every checklist item of docs/remote.md
+  §smoke has run against real hardware. Next per the approved plan:
+  Phase 2 (R1 reproducibility foundation, H1 reward↔criterion contract
+  hardening, H2 decomposition telemetry).
+
 ### 2026-06-10 — Ship 23e: live RunPod 5090 smoke — remote dispatch proven end-to-end, 3.3× throughput
 
 Rented a real RunPod Community RTX 5090 (32 GiB, driver 580.126.20,

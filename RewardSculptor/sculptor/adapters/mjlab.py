@@ -567,8 +567,13 @@ class MjlabAdapter(SculptorAdapter):
                 "--schema-keys": ",".join(effective_schema_keys),
             }
             input_paths: dict[str, Path] = {}
+            aux_dirs: tuple[Path, ...] = ()
             if reward_module_path is not None:
                 input_paths["--reward-module-path"] = Path(reward_module_path)
+                # sculpt passes rewards/current.py — a shim that loads
+                # its sibling v<N>.py at import time, so the whole
+                # rewards/ dir must exist at its mirror path on the pod.
+                aux_dirs = (Path(reward_module_path).resolve().parent,)
             if init_policy_path is not None:
                 input_paths["--load-pretrained-policy"] = Path(init_policy_path).resolve()
             job = RunnerJob(
@@ -580,6 +585,7 @@ class MjlabAdapter(SculptorAdapter):
                 # sculpt.py's resume key) is promoted last.
                 required_artifacts=("metrics.json", "checkpoint.pt"),
                 remote_env=self._remote_device_env(device),
+                aux_dirs=aux_dirs,
             )
             proc = executor.execute(job)
         else:
