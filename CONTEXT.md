@@ -339,7 +339,65 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
-### 2026-06-09 — Ship 23b: pod provisioning script + `sculpt remote doctor` + docs/remote.md
+### 2026-06-09 — Ship 23d: remote dispatch in the UI (Settings card, doctor endpoint, run-event chips)
+
+Per the no-terminal-after-run.sh rule: remote GPU dispatch is now fully
+UI-reachable — configure, test, and observe without touching a config
+file.
+
+- **What** (backend):
+  - NEW `backend/services/remote_settings.py`: `RemoteSettings`
+    pydantic model (connection fields only; tuning knobs stay
+    TOML-only), JSON persisted ATOMICALLY at
+    `<projects_root>/_settings/remote.json` (corrupt file → defaults,
+    never a 500/blocked launch); `remote_env()` with THREE states —
+    never saved → `{}` (project `[remote]` TOML may apply), saved-but-
+    off → `{SCULPTOR_REMOTE_ENABLED: "0"}` (the UI toggle showing
+    "Off" must override a TOML `enabled=true` — env wins in
+    RemoteConfig.from_sources), saved+enabled+host → full
+    `SCULPTOR_REMOTE_*` mapping; `run_doctor()` (in-process —
+    `_remote.py` is stdlib-only at import, so no heavy-import leak;
+    never raises). Host/user reject a leading "-" (would parse as an
+    ssh option, e.g. `-oProxyCommand=`).
+  - `routes/system.py`: GET/PUT `/system/remote` +
+    POST `/system/remote/doctor` (blocking ssh checks via
+    `asyncio.to_thread`); models in `models/system.py`
+    (RemoteDoctorCheck/RemoteDoctorResponse).
+  - `run_manager.py` + `mission_jobs.py`: `env.update(remote_env(
+    project_dir.parent))` before spawning sculpt subprocesses — both
+    run AND mission paths dispatch remotely when enabled.
+- **What** (frontend):
+  - Settings page: new "Remote GPU (rented pod)" card — enable toggle,
+    host/port/user/key/python/workdir/device fields, rollout-remote
+    toggle, Save + "Save & test connection" (label says it saves;
+    doctor result rendered as per-check pass/fail rows in an
+    `aria-live` status region with `sr-only` pass/fail text). Header
+    badge shows the PERSISTED enabled state, not the unsaved form.
+    Fieldset disabled until the server copy loads (a fast typist can't
+    fork the form off defaults and clobber saved fields); editing
+    clears a stale doctor result; Save/Test mutually disable; port
+    clamped 1-65535. `lib/api.ts` ApiError now stringifies FastAPI 422
+    array details (was "[object Object]" toasts).
+  - LogViewer: all 11 `remote_*` event types in the "run" filter tab,
+    prettyLabel cases (host/reason/seconds/pgid fields), badge colors
+    (teal lifecycle / amber degraded-recovering / rose failed).
+  - `.claude/launch.json`: backend+frontend dev-server configs (wsl-
+    wrapped with absolute paths — cmd.exe can't cd to UNC, and `$VARS`
+    get expanded Windows-side before reaching WSL bash).
+- **Verified**: 13 new backend tests (settings round-trip/atomicity/
+  corrupt-file, three-state env mapping incl. the projects-root layout
+  assumption, 422s for bad port + leading-dash host, doctor route
+  mocked + doctor-uses-saved-settings). LIVE browser verification via
+  dev preview: card renders, fill host → toggle → Save → PUT 200 →
+  remote.json on disk verified; "Save & test" against an unroutable
+  TEST-NET host → real ssh ConnectTimeout → report renders "local
+  ssh/rsync binaries: passed / ssh reachable: failed (Connection timed
+  out)"; zero console errors; test settings file deleted afterwards
+  (an enabled unroutable host would fail every run's preflight).
+  Review-agent audit applied (H1 a11y sr-only+aria-live, H2 explicit-
+  off env override, M1 loading-guard fieldset, M2 button label, M3
+  port clamp + 422 toast, M4 load-error banner, L2-L5). Gates: backend
+  319 passed, frontend build clean, sculptor untouched since 23b's 432.
 
 CLI/ops layer over the Ship-23a executor so a RunPod 5090 goes from
 rented → dispatchable without touching Python.

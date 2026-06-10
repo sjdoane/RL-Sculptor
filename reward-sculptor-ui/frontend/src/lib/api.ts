@@ -23,6 +23,8 @@ import type {
   RewardVersionDetail,
   RewardVersionSummary,
   PhysicsLoadResponse,
+  RemoteDoctorResponse,
+  RemoteSettings,
   RewardDiagnosisPayload,
   RobotStateResponse,
   SystemGpuResponse,
@@ -35,7 +37,15 @@ export class ApiError extends Error {
   type: string;
   problem: ProblemDetail;
   constructor(problem: ProblemDetail) {
-    super(problem.detail || problem.title);
+    // FastAPI 422s put an ARRAY of validation errors in `detail` —
+    // stringify it so toasts don't render "[object Object]".
+    super(
+      typeof problem.detail === "string" && problem.detail
+        ? problem.detail
+        : problem.detail != null && typeof problem.detail === "object"
+          ? JSON.stringify(problem.detail)
+          : problem.title,
+    );
     this.status = problem.status;
     this.type = problem.type;
     this.problem = problem;
@@ -333,6 +343,29 @@ export async function getSystemGpu(): Promise<SystemGpuResponse> {
 /** GET /system/kg/stats — aggregate counts over the shared KG (M7 P1). */
 export async function getSystemKgStats(): Promise<SystemKgStatsResponse> {
   return handle<SystemKgStatsResponse>(await fetch("/api/system/kg/stats"));
+}
+
+// ── Remote GPU dispatch (§Ship 23d) ─────────────────────────────────
+export async function getRemoteSettings(): Promise<RemoteSettings> {
+  return handle<RemoteSettings>(await fetch("/api/system/remote"));
+}
+
+export async function putRemoteSettings(body: RemoteSettings): Promise<RemoteSettings> {
+  return handle<RemoteSettings>(
+    await fetch("/api/system/remote", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  );
+}
+
+/** Runs ssh connectivity checks against the SAVED settings — PUT first.
+ * Can take ~30 s when the host is unreachable. */
+export async function runRemoteDoctor(): Promise<RemoteDoctorResponse> {
+  return handle<RemoteDoctorResponse>(
+    await fetch("/api/system/remote/doctor", { method: "POST" }),
+  );
 }
 
 // ── Physics (M7 Phase 5) ────────────────────────────────────────────

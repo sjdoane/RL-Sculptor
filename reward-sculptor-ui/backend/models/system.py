@@ -44,6 +44,28 @@ class SystemGpuResponse(BaseModel):
     import_error: Optional[str] = None
 
 
+class RemoteDoctorCheck(BaseModel):
+    """One row of `sculpt remote doctor` output (§Ship 23d)."""
+
+    model_config = ConfigDict(extra="allow")
+
+    name: str
+    ok: bool
+    detail: str = ""
+
+
+class RemoteDoctorResponse(BaseModel):
+    """POST /system/remote/doctor — connectivity report for the
+    Settings page's Test-connection button."""
+
+    model_config = ConfigDict(extra="allow")
+
+    ok: bool
+    host: str = ""
+    port: int = 22
+    checks: list[RemoteDoctorCheck] = []
+
+
 class SystemKgStatsResponse(BaseModel):
     """GET /system/kg/stats — aggregate counts over the shared KG."""
 

@@ -93,6 +93,14 @@ def run_sculpt_job(
 
         env["SCULPTOR_KG_PATH"] = str(project_kg_db_path(project_dir))
 
+        # §Ship 23d: inject the UI's saved remote-GPU settings as
+        # SCULPTOR_REMOTE_* env vars (they win over any [remote] table
+        # in config.toml). Empty dict when disabled — fully local.
+        # Projects live at <projects_root>/<slug>, so parent is root.
+        from backend.services.remote_settings import remote_env
+
+        env.update(remote_env(project_dir.parent))
+
         cmd = [
             sys.executable, "-m", "sculptor.cli",
             "run", behavior_goal,

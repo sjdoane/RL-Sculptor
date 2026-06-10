@@ -277,6 +277,11 @@ def run_mission_execute_job(
         # subprocesses too — every stage spawns its own sculpt-run
         # subprocess inheriting this env.
         env.setdefault("WANDB_MODE", "disabled")
+        # §Ship 23d: same remote-GPU env injection as run_manager —
+        # mission stages train through the identical adapter seam.
+        from backend.services.remote_settings import remote_env
+
+        env.update(remote_env(project_dir.parent))
 
         # Per-job log file under the mission dir for durability.
         md = mission_store.mission_dir(project_dir, mission_slug)

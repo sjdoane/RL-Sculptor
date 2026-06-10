@@ -1,13 +1,14 @@
 import { useEffect, useState } from "react";
-import { useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 
 import { Icon } from "@/components/rs/icon";
-import { Badge, Btn, Segmented } from "@/components/rs/primitives";
+import { Badge, Btn, Field, Segmented, ToggleRow } from "@/components/rs/primitives";
 import { useSystemInfo } from "@/hooks/useDashboard";
-import { useSharedKgStats, useSystemGpu } from "@/hooks/useLibrary";
+import { useRemoteSettings, useSharedKgStats, useSystemGpu } from "@/hooks/useLibrary";
 import { useTheme } from "@/hooks/useTheme";
-import type { GpuDevice } from "@/lib/types";
+import { putRemoteSettings, runRemoteDoctor } from "@/lib/api";
+import type { GpuDevice, RemoteDoctorResponse, RemoteSettings } from "@/lib/types";
 
 export default function Settings() {
   const { data, isLoading, error } = useSystemInfo();
@@ -30,6 +31,7 @@ export default function Settings() {
           <>
             <ApiKeyCard isSet={data.anthropic_api_key_set} masked={data.anthropic_api_key_masked} />
             <GpuCard />
+            <RemoteGpuCard />
             <SharedKgCard />
             <PathsCard
               projectsRoot={data.projects_root}
@@ -191,6 +193,209 @@ function GpuDeviceRow({ device }: { device: GpuDevice }) {
           <span className="rs-num" style={{ fontSize: 11, width: 96, textAlign: "right" }}>{utilPct.toFixed(0)} %</span>
         </div>
       )}
+    </div>
+  );
+}
+
+// ── remote GPU dispatch (§Ship 23d) ──────────────────────────────────
+const EMPTY_REMOTE: RemoteSettings = {
+  enabled: false,
+  host: "",
+  port: 22,
+  user: "",
+  key_path: "",
+  remote_workdir: "~/.sculptor_remote",
+  remote_python: "~/.sculptor_remote/venv/bin/python",
+  device: "",
+  rollout_remote: false,
+};
+
+function clampPort(raw: string): number {
+  const n = Math.floor(Number(raw));
+  if (!Number.isFinite(n) || n < 1) return 22;
+  return Math.min(65535, n);
+}
+
+function RemoteGpuCard() {
+  const qc = useQueryClient();
+  const { data, isLoading, error } = useRemoteSettings();
+  const [form, setForm] = useState<RemoteSettings | null>(null);
+  const [doctor, setDoctor] = useState<RemoteDoctorResponse | null>(null);
+  // Seed the form once from the server copy; afterwards local edits win
+  // until Save. Inputs are disabled until the server copy arrives so a
+  // fast typist can't fork the form off the defaults and clobber saved
+  // fields.
+  useEffect(() => {
+    if (data && form === null) setForm(data);
+  }, [data, form]);
+
+  const save = useMutation({
+    mutationFn: putRemoteSettings,
+    onSuccess: (saved) => {
+      qc.setQueryData(["system", "remote"], saved);
+      setForm(saved);
+      toast.success("Remote settings saved");
+    },
+    onError: (e: Error) => toast.error("Could not save remote settings", { description: e.message }),
+  });
+  const test = useMutation({
+    // Doctor checks the SAVED settings — persist the form first so the
+    // button tests what the user sees, not a stale file. The button is
+    // labelled "Save & test" so the save isn't a silent side effect.
+    mutationFn: async (f: RemoteSettings) => {
+      const saved = await putRemoteSettings(f);
+      qc.setQueryData(["system", "remote"], saved);
+      setForm(saved);
+      return runRemoteDoctor();
+    },
+    onSuccess: (report) => setDoctor(report),
+    onError: (e: Error) => toast.error("Connection test failed to run", { description: e.message }),
+  });
+
+  const ready = data !== undefined;
+  const busy = save.isPending || test.isPending;
+  const f = form ?? data ?? EMPTY_REMOTE;
+  const set = (patch: Partial<RemoteSettings>) => {
+    setDoctor(null); // a result for edited settings would be misleading
+    setForm({ ...f, ...patch });
+  };
+  const dirty = form !== null && ready && JSON.stringify(form) !== JSON.stringify(data);
+
+  return (
+    <div className="rs-card">
+      <div className="rs-card-head">
+        <div className="rs-card-title"><Icon name="upload" size={16} />Remote GPU (rented pod)</div>
+        {/* Persisted truth, not the unsaved form. */}
+        <Badge
+          status={data?.enabled ? "completed" : "stopped"}
+          label={data?.enabled ? "Enabled" : "Off"}
+        />
+      </div>
+      <div className="rs-card-pad rs-vgap-8">
+        {isLoading && !data && <p className="rs-sub">Loading remote settings…</p>}
+        {error && (
+          <div className="rs-banner err">
+            <Icon name="alert-triangle" size={17} />
+            <span className="rs-grow">Could not load remote settings: {(error as Error).message}</span>
+          </div>
+        )}
+        <p className="rs-sub" style={{ margin: 0 }}>
+          Dispatch training to a rented GPU over SSH (e.g. a RunPod 5090) — diagnose,
+          edits and the KG stay local. Provision the pod first:{" "}
+          <code className="mono">scripts/provision_remote.sh</code> (see{" "}
+          <code className="mono">RewardSculptor/docs/remote.md</code>).
+        </p>
+        <fieldset disabled={!ready || busy} style={{ border: 0, padding: 0, margin: 0, minWidth: 0 }} className="rs-vgap-8">
+          <ToggleRow
+            on={f.enabled}
+            onChange={(v) => set({ enabled: v })}
+            title="Dispatch training remotely"
+            desc="Applies to new runs and mission stages; overrides any [remote] table in project config.toml. Rollouts stay local unless opted in below."
+            label="Dispatch training remotely"
+          />
+          <div className="rs-flex rs-gap-8 rs-wrap">
+            <div style={{ flex: "2 1 220px" }}>
+              <Field label="Host" htmlFor="rm-host">
+                <input id="rm-host" className="rs-input" placeholder="203.0.113.7" value={f.host}
+                  onChange={(e) => set({ host: e.target.value })} />
+              </Field>
+            </div>
+            <div style={{ flex: "0 1 110px" }}>
+              <Field label="Port" htmlFor="rm-port">
+                <input id="rm-port" className="rs-input" type="number" min={1} max={65535} value={f.port}
+                  onChange={(e) => set({ port: clampPort(e.target.value) })} />
+              </Field>
+            </div>
+            <div style={{ flex: "1 1 120px" }}>
+              <Field label="User" htmlFor="rm-user">
+                <input id="rm-user" className="rs-input" placeholder="root" value={f.user}
+                  onChange={(e) => set({ user: e.target.value })} />
+              </Field>
+            </div>
+          </div>
+          <div className="rs-flex rs-gap-8 rs-wrap">
+            <div style={{ flex: "1 1 220px" }}>
+              <Field label="SSH key path" htmlFor="rm-key">
+                <input id="rm-key" className="rs-input" placeholder="~/.ssh/id_ed25519" value={f.key_path}
+                  onChange={(e) => set({ key_path: e.target.value })} />
+              </Field>
+            </div>
+            <div style={{ flex: "1 1 220px" }}>
+              <Field label="Remote python" hint="printed by provision_remote.sh" htmlFor="rm-python">
+                <input id="rm-python" className="rs-input" value={f.remote_python}
+                  onChange={(e) => set({ remote_python: e.target.value })} />
+              </Field>
+            </div>
+          </div>
+          <div className="rs-flex rs-gap-8 rs-wrap">
+            <div style={{ flex: "1 1 220px" }}>
+              <Field label="Remote workdir" hint="/workspace/… on a network volume" htmlFor="rm-workdir">
+                <input id="rm-workdir" className="rs-input" value={f.remote_workdir}
+                  onChange={(e) => set({ remote_workdir: e.target.value })} />
+              </Field>
+            </div>
+            <div style={{ flex: "0 1 140px" }}>
+              <Field label="Pod device" hint="blank = cuda:0" htmlFor="rm-device">
+                <input id="rm-device" className="rs-input" placeholder="cuda:0" value={f.device}
+                  onChange={(e) => set({ device: e.target.value })} />
+              </Field>
+            </div>
+          </div>
+          <ToggleRow
+            on={f.rollout_remote}
+            onChange={(v) => set({ rollout_remote: v })}
+            title="Also run rollouts remotely"
+            desc="Off by default — local rollouts keep video preview working when the pod is flaky."
+            label="Also run rollouts remotely"
+          />
+          <div className="rs-flex rs-gap-8">
+            <Btn
+              icon="check"
+              disabled={busy || !dirty}
+              onClick={() => form && save.mutate(form)}
+            >
+              {save.isPending ? "Saving…" : dirty || !ready ? "Save" : "Saved"}
+            </Btn>
+            <Btn
+              kind="ghost"
+              icon={test.isPending ? "loader" : "zap"}
+              disabled={busy || !f.host.trim()}
+              onClick={() => { setDoctor(null); test.mutate(f); }}
+            >
+              {test.isPending ? "Testing… (slow hosts can take minutes)" : "Save & test connection"}
+            </Btn>
+          </div>
+        </fieldset>
+        <div role="status" aria-live="polite">
+          {doctor && (
+            <div className="rs-vgap-8" style={{ border: "1px solid var(--hairline)", borderRadius: "var(--radius-md)", padding: 12, background: "var(--canvas-soft)" }}>
+              <div className="rs-flex rs-gap-6" style={{ fontSize: 13, fontWeight: 500 }}>
+                <Icon
+                  name={doctor.ok ? "check-circle" : "alert-triangle"}
+                  size={15}
+                  color={doctor.ok ? "var(--st-emerald)" : "var(--st-rose)"}
+                />
+                {doctor.ok ? "All checks passed" : "Some checks failed"}
+                <span className="rs-sub" style={{ fontSize: 12 }}>({doctor.host}:{doctor.port})</span>
+              </div>
+              {doctor.checks.map((c) => (
+                <div key={c.name} className="rs-flex rs-gap-6" style={{ fontSize: 12.5 }}>
+                  <Icon
+                    name={c.ok ? "check-circle" : "alert-triangle"}
+                    size={14}
+                    color={c.ok ? "var(--st-emerald)" : "var(--st-rose)"}
+                  />
+                  <span className="sr-only">{c.ok ? "passed:" : "failed:"}</span>
+                  <span style={{ fontWeight: 500, whiteSpace: "nowrap" }}>{c.name}</span>
+                  <span className="rs-sub mono" style={{ fontSize: 11.5, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={c.detail}>
+                    {c.detail}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
     </div>
   );
 }

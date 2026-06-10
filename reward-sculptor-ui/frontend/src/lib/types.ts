@@ -548,6 +548,34 @@ export interface SystemKgStatsResponse {
   embeddings: number;
 }
 
+/** GET/PUT /system/remote — persisted remote-GPU dispatch settings
+ * (§Ship 23d). Mirrors backend/services/remote_settings.RemoteSettings. */
+export interface RemoteSettings {
+  enabled: boolean;
+  host: string;
+  port: number;
+  user: string;
+  key_path: string;
+  remote_workdir: string;
+  remote_python: string;
+  device: string;
+  rollout_remote: boolean;
+}
+
+export interface RemoteDoctorCheck {
+  name: string;
+  ok: boolean;
+  detail: string;
+}
+
+/** POST /system/remote/doctor — Test-connection report. */
+export interface RemoteDoctorResponse {
+  ok: boolean;
+  host: string;
+  port: number;
+  checks: RemoteDoctorCheck[];
+}
+
 /** GET /projects/{slug}/rewards/{version}/diagnosis — shape of the
  * raw diagnosis.json payload written by sculptor.diagnose.
  * Fields are Optional on the TS side because older diagnoses may

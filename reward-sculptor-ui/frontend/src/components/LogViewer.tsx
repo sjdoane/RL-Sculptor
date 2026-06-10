@@ -98,7 +98,7 @@ function matchesFilter(ev: RunEvent, mode: FilterMode): boolean {
       return ev.type === "iter_started" || ev.type === "iter_completed" || ev.type === "rollout_done" || ev.type === "diagnosed";
     case "edits": return ev.type === "edit_applied" || ev.type === "citation_added";
     case "run":
-      return ev.type === "run_started" || ev.type === "run_completed" || ev.type === "run_errored" || ev.type === "run_stopped" || ev.type === "early_stop" || ev.type === "connected";
+      return ev.type === "run_started" || ev.type === "run_completed" || ev.type === "run_errored" || ev.type === "run_stopped" || ev.type === "early_stop" || ev.type === "connected" || ev.type.startsWith("remote_");
     default: return true;
   }
 }
@@ -138,6 +138,18 @@ function prettyLabel(ev: RunEvent): string {
     case "run_completed": return `run_completed rc=${ev.return_code} iters=${ev.iterations_run}`;
     case "run_errored": return `run_errored rc=${ev.return_code} ${ev.error ?? ""}`;
     case "run_stopped": return `run_stopped (${ev.source ?? "user"})`;
+    // §Ship 23d: remote-dispatch lifecycle (host carried on every event).
+    case "remote_dispatch_started": return `remote_dispatch_started${iter} host=${ev.host ?? "?"} phase=${ev.phase ?? "?"}`;
+    case "remote_upload_completed": return `remote_upload_completed${iter} host=${ev.host ?? "?"} ${fmtNum(ev.seconds)}s`;
+    case "remote_job_launched": return `remote_job_launched${iter} host=${ev.host ?? "?"} pgid=${ev.pgid ?? "?"}`;
+    case "remote_job_reattached": return `remote_job_reattached${iter} host=${ev.host ?? "?"} (resumed a running job)`;
+    case "remote_stale_job_killed": return `remote_stale_job_killed${iter} host=${ev.host ?? "?"}`;
+    case "remote_connection_lost": return `remote_connection_lost${iter} host=${ev.host ?? "?"} attempt=${ev.attempt ?? "?"} retry_in=${fmtNum(ev.retry_in_s)}s`;
+    case "remote_version_skew": return `remote_version_skew host=${ev.host ?? "?"} local torch=${ev.local_torch ?? "?"} remote torch=${ev.remote_torch ?? "?"}`;
+    case "remote_job_finished": return `remote_job_finished${iter} host=${ev.host ?? "?"} rc=${ev.exit_code ?? "?"} ${fmtNum(ev.seconds)}s`;
+    case "remote_artifacts_synced": return `remote_artifacts_synced${iter} host=${ev.host ?? "?"} ${fmtNum(ev.seconds)}s`;
+    case "remote_dispatch_failed": return `remote_dispatch_failed${iter} host=${ev.host ?? "?"} reason=${ev.reason ?? "?"} ${String(ev.detail ?? "").slice(0, 160)}`;
+    case "remote_config_ignored": return `remote_config_ignored reason=${ev.reason ?? "?"} ${ev.detail ?? ""}`;
     default: return `${ev.type} ${JSON.stringify({ ...ev, type: undefined, seq: undefined, ts: undefined })}`;
   }
 }
@@ -162,6 +174,19 @@ const BADGE_STYLES: Record<string, string> = {
   edit_applied: "#13302c|#5fd0c0",
   citation_added: "#13302c|#5fd0c0",
   metric_history: "#2c2a20|#aaa698",
+  // §Ship 23d: remote-dispatch lifecycle — teal for progress, amber for
+  // degraded-but-recovering, rose for failures.
+  remote_dispatch_started: "#13302c|#5fd0c0",
+  remote_upload_completed: "#13302c|#5fd0c0",
+  remote_job_launched: "#13302c|#5fd0c0",
+  remote_job_finished: "#13302c|#5fd0c0",
+  remote_artifacts_synced: "#16302a|#5fd0a0",
+  remote_job_reattached: "#3a2c12|#f0b35a",
+  remote_stale_job_killed: "#3a2c12|#f0b35a",
+  remote_connection_lost: "#3a2c12|#f0b35a",
+  remote_version_skew: "#3a2c12|#f0b35a",
+  remote_config_ignored: "#3a2c12|#f0b35a",
+  remote_dispatch_failed: "#3a1620|#f08aa6",
 };
 
 function EventBadge({ ev }: { ev: RunEvent }) {
