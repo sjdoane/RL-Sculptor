@@ -339,6 +339,73 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-10 — Ship 25a: H1 reward↔criterion contract hardening (iter-0 key validation + LLM reconcile)
+
+The 22q/22r silent-failure vector, closed at the source: a stage
+criterion hard-referencing `components['<name>']` keys the reward never
+produces used to burn the stage's ENTIRE iteration budget before
+`criterion_not_met` fired at eval time. Now caught at iter 0.
+
+- **What**:
+  - `mission_runtime.py`: NEW `extract_components_keys(criterion)` —
+    AST walk for HARD `components['x']` subscripts only (soft
+    `components.get('x', d)` is the documented can't-KeyError idiom and
+    is deliberately exempt; unparseable → empty set, syntax is the
+    validator's job). Drive-by L-6 fix: `_evaluate_success_criterion`
+    now strips before parsing — a Claude-emitted criterion with leading
+    whitespace passed the (stripping) decompose gate then died fatally
+    at runtime with "unexpected indent".
+  - `decompose.py`: NEW `reconcile_criterion(stage, missing_keys,
+    available_components, client=None)` → `(new_criterion, rationale)`.
+    Prompt `prompts/reconcile_criterion.md` gets stage goal, current
+    criterion, missing + available component keys, behavior keys,
+    trajectory keys, and the reward_seed_prompt. Rewrites pass FOUR
+    gates: non-empty, ≠ original, the decompose-time validator
+    (`_validate_success_criterion` on a dataclasses.replace COPY), and
+    the RUNTIME unsafe-AST gate run statically (namespace =
+    BARE_IDENTIFIERS ∪ {behavior, components, trajectory, info} —
+    verified equal to `_build_criterion_namespace`'s real key set), plus
+    no still-missing hard keys. ONE validation-feedback retry: a failed
+    rewrite re-prompts with `prior_attempt_error` (mirrors
+    redecompose). Prompt aligned with BOTH gates (audit H-1: it had
+    advertised `.item()`, which the mission gate's torch-idiom list
+    forbids — a "valid" rewrite would have failed; now excluded).
+  - `sculpt.py`: NEW `_reconcile_stage_criterion_if_needed(...)` wired
+    into `_run_one_stage` right after `stage_v1_materialized` (fresh
+    stages only — incl. redecomposed sub-stages, which always re-enter
+    this branch under new names). Flow: extract keys → none ⇒ silent →
+    `adapter.probe_component(v1)` (probe raising or failing ⇒
+    `criterion_keys_unverified`, never a reconcile error) → available =
+    probe components ∪ env intrinsic `reward_term__*` names observed in
+    the PARENT stage's latest rollout npz (audit M-3: eval-time merges
+    env terms into `components`, so a redecomposed criterion
+    referencing one is legitimate and must not be rewritten away) →
+    match ⇒ `criterion_keys_validated` / mismatch ⇒
+    `criterion_keys_mismatch {missing, available}` → no
+    ANTHROPIC_API_KEY ⇒ `criterion_reconcile_skipped` (mismatch event
+    already says what to fix by hand) → reconcile → mutate
+    `stage.success_criterion` + `_atomic_save_mission` (save failure
+    REVERTS the in-memory mutation — audit M-1: memory≠disk would make
+    this run evaluate a criterion a resume never sees) ⇒
+    `criterion_reconciled {old, new, rationale}`. ANY failure ⇒
+    `criterion_reconcile_failed` — the helper NEVER raises (it sits
+    inside the v1-materialization try; the runtime
+    CriterionMissingKeyError → criterion_not_met path still backstops
+    survivors).
+- **Verified**: 21 tests (tests/test_criterion_reconcile.py): extraction
+  (hard vs .get vs dynamic vs other namespaces), reconcile gates
+  (identical / still-missing / lambda / `.item()` all rejected with the
+  two-attempt retry asserted, retry-recovers path, soft-.get rewrite
+  survives, payload grounding incl. trajectory keys), wiring (silent
+  no-refs, validated, mismatch+skip without key, reconcile+persist with
+  rationale, exploding reconcile recoverable, probe-raise → unverified,
+  save-failure reverts mutation, parent env-term union, whitespace
+  eval). Existing test_mission_run/test_decompose unaffected (their
+  stub adapter has no probe_component → unverified early-return).
+  Sculptor gate 470 passed/1 skipped; backend green; frontend
+  untouched. Review-agent audit applied in full (H-1, M-1, M-2 retry +
+  trajectory keys, M-3, L-1..L-4, L-6).
+
 ### 2026-06-10 — Ship 24: R1 reproducibility foundation (run_context.json + mission provenance)
 
 First Phase-2 ship of the approved research-grade plan. Every result can

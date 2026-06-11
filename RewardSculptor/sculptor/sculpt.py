@@ -2180,6 +2180,164 @@ def mission_run(
     return result
 
 
+def _reconcile_stage_criterion_if_needed(
+    *,
+    stage,
+    stage_dir: Path,
+    adapter,
+    mission,
+    mission_dir: Path,
+    emit: Any,
+) -> None:
+    """§Ship 25a (H1): probe the freshly-materialized reward and check
+    every HARD `components['<name>']` reference in the stage criterion
+    against the component names the reward actually produces. On
+    mismatch: emit `criterion_keys_mismatch`, then ask Claude to
+    rewrite the criterion onto real keys (`criterion_reconciled`) —
+    catching at iter 0 what would otherwise burn the stage's whole
+    budget before `criterion_not_met` fired at eval time (the 22q/22r
+    silent-failure vector).
+
+    NEVER raises: this runs inside the v1-materialization try block,
+    and a reconciliation hiccup must not fail the stage — the runtime
+    CriterionMissingKeyError path still catches survivors at eval.
+    """
+    try:
+        from sculptor.mission_runtime import extract_components_keys
+
+        keys = extract_components_keys(stage.success_criterion)
+        if not keys:
+            return
+
+        _, latest_reward = _find_latest_reward_version(stage_dir / "rewards")
+        probe_fn = getattr(adapter, "probe_component", None)
+        if probe_fn is None:
+            emit({
+                "type": "criterion_keys_unverified",
+                "stage_name": stage.name,
+                "reason": "adapter has no probe_component",
+            })
+            return
+        try:
+            probe = probe_fn(latest_reward)
+        except Exception as probe_err:  # noqa: BLE001
+            emit({
+                "type": "criterion_keys_unverified",
+                "stage_name": stage.name,
+                "reason": f"probe raised: {type(probe_err).__name__}: {probe_err}",
+            })
+            return
+        if not getattr(probe, "ok", False) or not getattr(probe, "components", None):
+            err = getattr(probe, "error", None)
+            emit({
+                "type": "criterion_keys_unverified",
+                "stage_name": stage.name,
+                "reason": (
+                    f"probe failed: {err}" if err
+                    else "probe returned no components"
+                ),
+            })
+            return
+
+        # Env intrinsic terms (`reward_term__*` in trajectory.npz) are
+        # merged into `components` at EVAL time (Ship 22r) — a
+        # redecomposed sub-stage's criterion may legitimately reference
+        # them. The probe only sees the sculptor module's terms, so
+        # union in the parent stage's observed env terms to avoid
+        # rewriting a criterion that would actually have worked.
+        env_terms = _parent_env_component_terms(mission, stage)
+        available = sorted(set(probe.components) | env_terms)
+        missing = sorted(keys - set(available))
+        if not missing:
+            emit({
+                "type": "criterion_keys_validated",
+                "stage_name": stage.name,
+                "keys": sorted(keys),
+                "env_terms_considered": sorted(env_terms),
+            })
+            return
+
+        emit({
+            "type": "criterion_keys_mismatch",
+            "stage_name": stage.name,
+            "missing": missing,
+            "available": available,
+            "criterion": stage.success_criterion,
+        })
+
+        import os as _os
+
+        if not (_os.environ.get("ANTHROPIC_API_KEY") or "").strip():
+            # Observable skip — the mismatch event above already told
+            # the user exactly what to fix by hand.
+            emit({
+                "type": "criterion_reconcile_skipped",
+                "stage_name": stage.name,
+                "reason": "no ANTHROPIC_API_KEY",
+            })
+            return
+
+        from sculptor.decompose import reconcile_criterion
+
+        old_criterion = stage.success_criterion
+        new_criterion, rationale = reconcile_criterion(
+            stage,
+            missing_keys=missing,
+            available_components=available,
+        )
+        stage.success_criterion = new_criterion
+        try:
+            _atomic_save_mission(mission, mission_dir)
+        except BaseException:
+            # Don't let a failed save leave memory≠disk: this run would
+            # evaluate the NEW criterion while a later resume saw the
+            # old one (and the failure event below would lie).
+            stage.success_criterion = old_criterion
+            raise
+        emit({
+            "type": "criterion_reconciled",
+            "stage_name": stage.name,
+            "old_criterion": old_criterion,
+            "new_criterion": new_criterion,
+            "missing": missing,
+            "rationale": rationale,
+        })
+    except Exception as e:  # noqa: BLE001 — recoverable by design
+        emit({
+            "type": "criterion_reconcile_failed",
+            "stage_name": stage.name,
+            "error": f"{type(e).__name__}: {e}",
+        })
+
+
+def _parent_env_component_terms(mission, stage) -> set[str]:
+    """Best-effort: env intrinsic reward-term names (`reward_term__*`)
+    observed in the parent stage's latest rollout trajectory — the
+    terms the eval-time namespace will merge into `components` anyway.
+    Empty set on any failure (first stages have no parent; missing
+    artifacts are normal)."""
+    try:
+        parent = getattr(stage, "parent_stage", None)
+        if not parent:
+            return set()
+        runs = sorted(
+            (mission.stage_dir(parent) / "runs").glob(
+                "iter_*/rollout/trajectory.npz"
+            )
+        )
+        if not runs:
+            return set()
+        import numpy as np
+
+        prefix = "reward_term__"
+        with np.load(runs[-1]) as z:
+            return {
+                k[len(prefix):] for k in z.files if k.startswith(prefix)
+            }
+    except Exception:  # noqa: BLE001 — advisory only
+        return set()
+
+
 def _run_one_stage(
     *,
     mission,
@@ -2387,6 +2545,18 @@ def _run_one_stage(
                 "stage_name": stage.name,
                 "reward_path": str(stage_dir / "rewards" / "v1.py"),
             })
+            # §Ship 25a (H1): validate the criterion's hard
+            # `components[...]` references against the JUST-
+            # materialized reward, and reconcile mismatches at iter 0
+            # instead of burning the stage budget. Never fatal.
+            _reconcile_stage_criterion_if_needed(
+                stage=stage,
+                stage_dir=stage_dir,
+                adapter=adapter_for_contract,
+                mission=mission,
+                mission_dir=mission_dir,
+                emit=emit,
+            )
     except Exception as e:  # noqa: BLE001
         return _fail_stage(
             stage, "v1_materialization_errored",

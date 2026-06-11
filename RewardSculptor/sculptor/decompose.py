@@ -808,3 +808,138 @@ def redecompose_stage(
     # KG citation verification (same as decompose_task).
     _validate_kg_seed_papers(sub_stages, set(available_arxiv_ids), kg_store)
     return sub_stages
+
+
+# ── §Ship 25a (H1): criterion ↔ reward-component reconciliation ──────
+class _ReconcileModel(BaseModel):
+    """Claude's response schema for a criterion rewrite."""
+
+    rationale: str
+    success_criterion: str
+
+
+def _gate_reconciled_criterion(
+    stage: Stage,
+    new_criterion: str,
+    available_components: list[str],
+) -> None:
+    """All validation gates a reconciled criterion must pass. Raises
+    MissionValidationError with an actionable message (fed back to
+    Claude on the retry attempt)."""
+    from sculptor.mission_runtime import extract_components_keys
+
+    if not new_criterion:
+        raise MissionValidationError(
+            "reconcile_criterion: Claude returned an empty criterion"
+        )
+    if new_criterion == stage.success_criterion.strip():
+        raise MissionValidationError(
+            "reconcile_criterion: rewrite is identical to the original — "
+            "the missing-key references were not fixed"
+        )
+
+    # Same static gate the decomposer's criteria pass through, run on a
+    # COPY so a rejected rewrite can't leave the stage half-mutated.
+    from dataclasses import replace as _dc_replace
+
+    from sculptor.mission import _validate_success_criterion
+
+    candidate = _dc_replace(stage, success_criterion=new_criterion)
+    _validate_success_criterion(candidate, set())
+
+    # ALSO run the runtime's unsafe-AST gate statically (the decompose-
+    # time validator checks subscript keys + torch idioms but defers
+    # node-level safety — lambdas etc. — to eval time; a reconciled
+    # criterion must not fail LATER for a reason knowable NOW).
+    import ast as _ast
+
+    from sculptor.mission_runtime import (
+        BARE_IDENTIFIERS,
+        CriterionEvalError,
+        _validate_criterion_ast,
+    )
+
+    try:
+        _validate_criterion_ast(
+            _ast.parse(new_criterion, mode="eval"),
+            namespace_keys=set(BARE_IDENTIFIERS) | {
+                "behavior", "components", "trajectory", "info",
+            },
+        )
+    except (CriterionEvalError, SyntaxError) as e:
+        raise MissionValidationError(
+            f"reconcile_criterion: rewrite failed the runtime safety "
+            f"gate: {e}"
+        ) from e
+
+    still_missing = (
+        extract_components_keys(new_criterion) - set(available_components)
+    )
+    if still_missing:
+        raise MissionValidationError(
+            f"reconcile_criterion: rewrite still hard-references absent "
+            f"component keys {sorted(still_missing)} "
+            f"(available: {sorted(available_components)})"
+        )
+
+
+def reconcile_criterion(
+    stage: Stage,
+    *,
+    missing_keys: list[str],
+    available_components: list[str],
+    client: Any = None,
+    model: str = MODEL_ID,
+) -> tuple[str, str]:
+    """Rewrite a stage's success_criterion whose hard
+    `components['<name>']` references don't exist in the materialized
+    reward — caught at iter 0 by the probe instead of burning the whole
+    stage budget before `criterion_not_met` fires at eval time.
+
+    Returns `(new_criterion, rationale)`. One validation-feedback retry:
+    a rewrite that fails the gates gets a second attempt carrying the
+    exact gate error (mirrors redecompose's `prior_attempt_error`).
+    Raises MissionValidationError when both attempts fail.
+    """
+    if client is None:
+        import anthropic
+
+        client = anthropic.Anthropic(max_retries=2, timeout=240.0)
+
+    from sculptor.mission_runtime import (
+        BEHAVIOR_KEYS,
+        PERSISTED_TRAJECTORY_KEYS,
+    )
+
+    system_prompt = load_prompt("reconcile_criterion")
+    payload: dict[str, Any] = {
+        "stage_name": stage.name,
+        "stage_goal": stage.goal_text,
+        "current_criterion": stage.success_criterion,
+        "missing_component_keys": sorted(missing_keys),
+        "available_component_keys": sorted(available_components),
+        "available_behavior_keys": sorted(BEHAVIOR_KEYS),
+        "available_trajectory_keys": sorted(PERSISTED_TRAJECTORY_KEYS),
+        "reward_seed_prompt": stage.reward_seed_prompt,
+    }
+
+    last_error: Optional[str] = None
+    for _attempt in range(2):
+        if last_error is not None:
+            payload["prior_attempt_error"] = last_error
+        parsed = _parse_with_retry(
+            client, system_prompt, json.dumps(payload, indent=2),
+            output_format=_ReconcileModel, model=model,
+        )
+        new_criterion = parsed.success_criterion.strip()
+        try:
+            _gate_reconciled_criterion(
+                stage, new_criterion, available_components,
+            )
+            return new_criterion, parsed.rationale
+        except MissionValidationError as e:
+            last_error = str(e)
+    raise MissionValidationError(
+        f"reconcile_criterion: rewrite failed validation twice; "
+        f"last error: {last_error}"
+    )

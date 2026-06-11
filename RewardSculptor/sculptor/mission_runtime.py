@@ -176,6 +176,36 @@ class CriterionMissingKeyError(CriterionEvalError):
     """
 
 
+def extract_components_keys(criterion: str) -> set[str]:
+    """§Ship 25a (H1): the HARD `components['<name>']` subscript keys a
+    criterion references — the ones that raise KeyError (→ a wasted
+    stage) when the reward never produces them.
+
+    Soft lookups (`components.get('x', 0.0)`) are deliberately NOT
+    collected: `.get` with a default is the documented way to reference
+    a term that may appear later, and it cannot KeyError.
+
+    Unparseable criteria return an empty set — syntax problems are the
+    validator's job (`mission._validate_success_criterion`), not this
+    extractor's.
+    """
+    try:
+        tree = ast.parse(criterion.strip(), mode="eval")
+    except SyntaxError:
+        return set()
+    keys: set[str] = set()
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "components"
+            and isinstance(node.slice, ast.Constant)
+            and isinstance(node.slice.value, str)
+        ):
+            keys.add(node.slice.value)
+    return keys
+
+
 def _validate_criterion_ast(
     tree: ast.Expression,
     *,
@@ -266,7 +296,12 @@ def _evaluate_success_criterion(
     `namespace` raise NameError rather than resolving to a builtin.
     """
     try:
-        tree = ast.parse(criterion, mode="eval")
+        # Strip first: the decompose-time validator strips before
+        # parsing (mission.py), so a Claude-emitted criterion with
+        # leading whitespace would pass authoring validation and then
+        # die HERE with "unexpected indent" — a fatal criterion_errored
+        # for pure formatting (§Ship 25a audit, L-6).
+        tree = ast.parse(criterion.strip(), mode="eval")
     except SyntaxError as e:
         raise CriterionEvalError(
             f"criterion is not a valid Python expression: {e}"
