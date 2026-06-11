@@ -735,6 +735,19 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
         "joint_names": [],
         "joint_ranges": [],
     }
+    # §Ship 26 (E1): entity-first joint names. The articulation exposes
+    # `joint_names` in the SAME order as the persisted joint_pos /
+    # joint_vel buffers (both come from the entity's data API) — the
+    # mjModel route below includes the floating-base free joint and may
+    # order differently, so it must not be the primary source. Spec
+    # metrics use these names to select leg / hip / arm joint subsets.
+    try:
+        _robot = env.scene["robot"]
+        _jn = list(getattr(_robot, "joint_names", []) or [])
+        if _jn:
+            limits_snapshot["joint_names"] = [str(n) for n in _jn]
+    except Exception:  # noqa: BLE001 — best-effort, audit tolerates empty
+        pass
     try:
         mj_model = getattr(env, "sim", None) or getattr(env, "_sim", None) \
             or getattr(env, "physics", None)
@@ -781,7 +794,11 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
             limits_snapshot["joint_ranges"] = jr.tolist()
             try:
                 limits_snapshot["actuator_names"] = _names(m, fr.shape[0], "ACTUATOR")
-                limits_snapshot["joint_names"] = _names(m, jr.shape[0], "JOINT")
+                # Entity route above is authoritative for joint_names
+                # (ordering matches the persisted buffers); only fall
+                # back to mjModel names when it produced nothing.
+                if not limits_snapshot["joint_names"]:
+                    limits_snapshot["joint_names"] = _names(m, jr.shape[0], "JOINT")
             except Exception:  # noqa: BLE001
                 pass
     except Exception as e:  # noqa: BLE001 — realism audit is best-effort
@@ -1122,6 +1139,14 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
         "mean_return": float(np.mean(ep_returns)) if ep_returns else 0.0,
         "mean_episode_length": float(np.mean(ep_lengths)) if ep_lengths else 0.0,
         "max_episode_length": int(max(ep_lengths)) if ep_lengths else 0,
+        # §Ship 26 (E1/M1): capture settings are load-bearing for spec
+        # metrics (frequency bands are in cycles/FRAME; episode-length
+        # normalization needs the cap). Persisting them lets the eval
+        # harness ASSERT capture parity across conditions instead of
+        # silently comparing incomparables.
+        "step_dt": float(getattr(env, "step_dt", 0.0) or 0.0),
+        "max_episode_steps": int(max_steps),
+        "rollout_num_envs": int(num_envs),
     }
     (output_dir / "behavior.json").write_text(json.dumps(behavior, indent=2))
 

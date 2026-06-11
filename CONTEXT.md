@@ -339,6 +339,79 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-10 — Ship 26: E1 benchmark suite + hand-authored spec metrics (Phase 3 begins)
+
+The evaluation ground truth: four benchmark tasks, each pairing an NL
+goal (what the pipeline sees) with an OBJECTIVE spec metric computed
+from rollout artifacts — fully independent of the LLM criteria, which
+must never grade themselves.
+
+- **What**: NEW `sculptor/eval/` package.
+  - `benchmarks.py`: cartpole_balance (sanity; high-seed-count task),
+    g1_floss + g1_kick (Sam has real recordings → calibration data),
+    go1_trot (gait, NOT spin — the rollout never persists yaw;
+    projected gravity is yaw-invariant). Each: task_id, behavior_goal,
+    spec_metric, adapter_config, notes.
+  - `spec_metrics.py`: uprightness (unit-normalized gravity, tri-state-
+    safe), periodicity (per-env FFT, INCOHERENT power averaging,
+    robust p2.5–97.5 amplitude gate, top-quartile movers), burstiness
+    (signed boxcar → |·|, p95+p99, optional joint subset + upright-
+    window validity mask), horizontal_speed (teleport-aware path/net
+    with per-segment nets), opposition_score (hip↔arm anti-phase via
+    cross-spectral phase at the dominant bin), and four composite
+    specs returning `spec_score ∈ [0,1]` + components + capture echo.
+  - `_mjlab_runner.py`: behavior.json now persists step_dt /
+    max_episode_steps / rollout_num_envs (spec bands are in
+    cycles/FRAME — the E2 harness will ASSERT capture parity across
+    conditions instead of silently comparing incomparables);
+    mjcf_limits.json joint_names now actually populate — entity-first
+    (`env.scene["robot"].joint_names`, ordering matches the persisted
+    buffers) with mjModel fallback. All real pre-Ship-26 recordings
+    have EMPTY name lists (the mjModel attribute chain never matched),
+    so specs degrade observably (structure_checked / leg_subset flags)
+    on old data and run strict on campaign data.
+- **The methodology audit mattered** (review agent, findings verified
+  empirically before fixing):
+  - C1 (CRITICAL): env-mean-BEFORE-FFT cancels out-of-phase
+    oscillation — perfect synthetic flossing scored 0.22 instead of
+    0.99 (envs re-randomize phases on reset; coherent averaging
+    attenuates ~1/√E and lets correlated transients win the mover
+    slots). Fixed with per-env spectra + incoherent power averaging;
+    regression test with random per-env phases.
+  - H1: kick took max over ALL joints — arm-flailing scored as
+    kicking. Leg-subset via joint names (hip/knee/ankle tokens).
+  - H2: fall-cycling scored ~0.5 (falls are sustained transients and
+    uprightness only averages). Bursts now count only when launched
+    from a fully-upright smoothing window.
+  - H3: belly-crawl passed trot (uprightness checks orientation, not
+    altitude). Root-height gate 0.18→0.28 m.
+  - H4: any common-frequency oscillation scored as floss. Hip↔arm
+    anti-phase structure gate when names exist (in-phase or
+    single-joint vibrator → ~0).
+  - M1–M4, L1–L4 all applied (capture persistence, teleport masking,
+    p99 burst path, persisted episode cap for cartpole, gravity
+    normalization, robust amplitude, dominant-period reporting).
+- **Real-data validation** (the E1 proving gate, fallback mode):
+  kick spec on g1-kick-v2: best iters 0.68/0.30, fallen iter 0.0,
+  weak mid-training 0.09–0.14 vs STANDING robots 0.14–0.15 (clear
+  separation at the strong end; standing/weak overlap exists only in
+  name-less fallback mode — campaign rollouts get the strict
+  leg-subset path). Floss spec on standing stages: 0.029–0.035
+  (correct null). No successful floss recording exists yet — the
+  high end is covered by the C1 regression test until the campaign
+  produces real positives. Tremor finding: standing rsl_rl policies
+  read ~6 rad/frame raw |joint_vel|; the signed-smoothing design is
+  calibrated against that (test-pinned).
+- **Verified**: 28 tests (tests/test_spec_metrics.py) incl. 7
+  adversarial regressions (random-phase, tremor, arm-flail,
+  fall-cycle, vibrator, belly-crawl, teleport). Gates: sculptor 503
+  passed/1 skipped, backend 323 passed, frontend untouched.
+- **Known limits for E2/E3 design**: go1_trot is near-native to the
+  velocity env → expect ceiling effects, use as the easy anchor not
+  the headline; kick ratio-gate constants calibrated on n=2 projects
+  one robot; capture parity must be asserted by the harness (the
+  persisted settings make that possible now).
+
 ### 2026-06-10 — Ship 25b: H2 decomposition-quality telemetry (mission → reports tab)
 
 Ship 22s changed decomposition behavior (adaptive stage counts, no
