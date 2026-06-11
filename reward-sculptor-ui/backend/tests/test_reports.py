@@ -23,6 +23,64 @@ def _make_project_with_library(client: TestClient, name: str = "Reports") -> str
     return slug
 
 
+# ── §Ship 25b: mission-quality telemetry route ────────────────────────
+
+
+def test_mission_quality_empty_when_absent(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    slug = _make_project_with_library(client, "MqEmpty")
+    r = client.get(f"/projects/{slug}/reports/mission-quality")
+    assert r.status_code == 200
+    assert r.json() == {"schema": 1, "missions": []}
+
+
+def test_mission_quality_returns_doc(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    slug = _make_project_with_library(client, "MqDoc")
+    reports = tmp_projects_root / slug / "reports"
+    reports.mkdir(exist_ok=True)
+    doc = {
+        "schema": 1,
+        "missions": [{
+            "mission_slug": "flip-mission",
+            "goal": "do a flip",
+            "n_stages_at_start": 3,
+            "n_stages_final": 4,
+            "stages_executed": 4,
+            "stages_succeeded": 3,
+            "stage_success_rate": 0.75,
+            "redecompositions": 1,
+            "iterations_total": 18,
+            "completed": False,
+            "halted_reason": "criterion_not_met",
+            "recorded_at": "2026-06-10T00:00:00+00:00",
+        }],
+    }
+    (reports / "mission_quality.json").write_text(json.dumps(doc))
+    r = client.get(f"/projects/{slug}/reports/mission-quality")
+    assert r.status_code == 200
+    assert r.json() == doc
+
+
+def test_mission_quality_corrupt_file_is_empty_not_500(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    slug = _make_project_with_library(client, "MqCorrupt")
+    reports = tmp_projects_root / slug / "reports"
+    reports.mkdir(exist_ok=True)
+    (reports / "mission_quality.json").write_text("{broken")
+    r = client.get(f"/projects/{slug}/reports/mission-quality")
+    assert r.status_code == 200
+    assert r.json() == {"schema": 1, "missions": []}
+
+
+def test_mission_quality_unknown_project_404(client: TestClient) -> None:
+    r = client.get("/projects/nope-nope/reports/mission-quality")
+    assert r.status_code == 404
+
+
 def test_final_report_404_with_zero_iters_cites_zero(
     client: TestClient, tmp_projects_root: Path,
 ) -> None:

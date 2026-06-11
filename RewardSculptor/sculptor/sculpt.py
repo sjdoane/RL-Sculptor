@@ -2041,6 +2041,9 @@ def mission_run(
         # list state and skipped past the inserted sub-stages.
         all_succeeded = True
         _prov_record_warned = False  # §Ship 24: once-per-mission warning
+        # §Ship 25b: decomposition-quality counters for telemetry.json.
+        _n_stages_at_start = len(mission.stages)
+        _redecompositions = 0
         while mission.current_stage_idx < len(mission.stages):
             stage_idx = mission.current_stage_idx
             stage = mission.stages[stage_idx]
@@ -2136,6 +2139,7 @@ def mission_run(
                 # point at the first new sub-stage. Drop the failed
                 # stage's StageResult — it'll be replaced when the
                 # sub-stages run. Loop continues without advancing.
+                _redecompositions += 1  # §Ship 25b telemetry
                 result.stage_results.pop()
                 continue
 
@@ -2153,6 +2157,16 @@ def mission_run(
 
         if all_succeeded and mission.current_stage_idx >= len(mission.stages):
             result.completed = True
+
+        # §Ship 25b (H2): decomposition-quality telemetry (never
+        # fatal). Written BEFORE the terminal mission event — consumers
+        # treat mission_completed/halted_terminal as stream-end.
+        _write_mission_telemetry(
+            mission, mission_dir, result,
+            n_stages_at_start=_n_stages_at_start,
+            redecompositions=_redecompositions,
+            emit=_emit,
+        )
 
         _emit({
             "type": "mission_completed" if result.completed
@@ -2178,6 +2192,99 @@ def mission_run(
         # cosmetic and `FileLock` will re-acquire it on the next run.
 
     return result
+
+
+def _write_mission_telemetry(
+    mission,
+    mission_dir: Path,
+    result,
+    *,
+    n_stages_at_start: int,
+    redecompositions: int,
+    emit: Any,
+) -> None:
+    """§Ship 25b (H2): decomposition-quality telemetry — stage counts,
+    stage-success rate, redecompose rate, iteration spend — written to
+    `<mission_dir>/telemetry.json` and aggregated per-project at
+    `reports/mission_quality.json` (one record per mission slug,
+    replaced on re-run). 22s changed decomposition behavior with no
+    measurement; this is the measurement. Never fatal.
+
+    NOT merged into reports/metric_history.json (the plan's original
+    sketch): that file's `{primary_metric, history:[floats]}` shape is
+    consumed by sculpt's own delta/early-stop logic — mixing mission
+    dicts in would break readers. Separate file, additive surface.
+    """
+    try:
+        from datetime import datetime, timezone
+
+        from sculptor.run_context import write_json_atomic
+
+        executed = list(result.stage_results)
+        succeeded = [r for r in executed if r.status == "succeeded"]
+        record = {
+            "schema": 1,
+            "recorded_at": datetime.now(timezone.utc).isoformat(),
+            "mission_slug": Path(mission_dir).name,
+            "goal": mission.goal,
+            "n_stages_at_start": int(n_stages_at_start),
+            "n_stages_final": len(mission.stages),
+            "stages_executed": len(executed),
+            "stages_succeeded": len(succeeded),
+            "stage_success_rate": (
+                round(len(succeeded) / len(executed), 4) if executed else None
+            ),
+            "redecompositions": int(redecompositions),
+            "iterations_total": sum(
+                int(r.iterations_used or 0) for r in executed
+            ),
+            "completed": bool(result.completed),
+            "halted_reason": result.halted_reason,
+            "per_stage": [
+                {
+                    "name": r.stage_name,
+                    "status": r.status,
+                    "iterations_used": r.iterations_used,
+                    "criterion_satisfied": r.criterion_satisfied,
+                }
+                for r in executed
+            ],
+        }
+        write_json_atomic(Path(mission_dir) / "telemetry.json", record)
+
+        # Project-level aggregate — only under the real
+        # `<project>/.missions/<slug>` layout (tests drive mission_run
+        # against bare tmp dirs).
+        agg_path = None
+        if Path(mission_dir).parent.name == ".missions":
+            project = Path(mission_dir).parent.parent
+            agg_path = project / "reports" / "mission_quality.json"
+            try:
+                doc = json.loads(agg_path.read_text(encoding="utf-8"))
+                if not isinstance(doc, dict) or not isinstance(
+                    doc.get("missions"), list,
+                ):
+                    raise ValueError("bad shape")
+            except Exception:  # noqa: BLE001 — first write or corrupt
+                doc = {"schema": 1, "missions": []}
+            doc["missions"] = [
+                m for m in doc["missions"]
+                if m.get("mission_slug") != record["mission_slug"]
+            ] + [record]
+            write_json_atomic(agg_path, doc)
+
+        emit({
+            "type": "mission_telemetry_written",
+            "mission_slug": record["mission_slug"],
+            "stage_success_rate": record["stage_success_rate"],
+            "redecompositions": record["redecompositions"],
+            "aggregate_path": str(agg_path) if agg_path else None,
+        })
+    except Exception as e:  # noqa: BLE001 — telemetry must not fail a mission
+        emit({
+            "type": "mission_telemetry_failed",
+            "error": f"{type(e).__name__}: {e}",
+        })
 
 
 def _reconcile_stage_criterion_if_needed(

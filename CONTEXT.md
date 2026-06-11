@@ -339,6 +339,46 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-10 — Ship 25b: H2 decomposition-quality telemetry (mission → reports tab)
+
+Ship 22s changed decomposition behavior (adaptive stage counts, no
+stand-stage) with no measurement. Now every mission measures itself.
+
+- **What**:
+  - `sculpt.py`: NEW `_write_mission_telemetry(...)` called at
+    mission end, BEFORE the terminal `mission_completed` /
+    `mission_halted_terminal` event (existing tests pin that as
+    stream-end). Computes: n_stages_at_start vs n_stages_final (splice
+    growth), stages_executed/succeeded + stage_success_rate,
+    redecompositions (counter incremented at the Ship-17 splice
+    branch), iterations_total, completed/halted_reason, per_stage
+    breakdown. Writes `<mission_dir>/telemetry.json` and aggregates
+    per-project at `reports/mission_quality.json` (one record per
+    mission slug, REPLACED on re-run; aggregate only under the real
+    `<project>/.missions/<slug>` layout — tests drive bare tmp dirs;
+    corrupt aggregate → fresh, never fatal; emits
+    `mission_telemetry_written` / `mission_telemetry_failed`).
+    Deliberately NOT merged into metric_history.json (plan's original
+    sketch): its `{primary_metric, history:[floats]}` shape feeds
+    sculpt's own delta logic — additive separate file instead.
+  - Backend: GET `/projects/{slug}/reports/mission-quality`
+    (routes/reports.py) — returns the aggregate, `{schema:1,
+    missions:[]}` when absent or corrupt (never 500), 404 unknown slug.
+  - Frontend: ReportsTab "Mission quality" card above the report —
+    per-mission row: slug (goal on hover), stages succeeded/executed
+    (+%), planned-stage growth (3→4 when splices added), redecompose
+    count, total iters, completed/halted badge. Hidden when no
+    missions.
+- **Verified**: sculptor 5 new tests (writer shape, .missions-layout
+  aggregate + replace-on-rerun, corrupt-aggregate recovery,
+  never-raises, zero-stage edge) + the existing mission_run suite
+  (which now exercises the call on every flow); backend 4 new route
+  tests; LIVE UI check via preview server against the real backend —
+  card rendered both fixture missions correctly (75% + criterion_not_met
+  amber; 100% + completed green), zero console errors, fixture cleaned
+  from the 360s project afterwards. Gates: sculptor 475 passed/1
+  skipped, backend 323 passed, frontend build clean.
+
 ### 2026-06-10 — Ship 25a: H1 reward↔criterion contract hardening (iter-0 key validation + LLM reconcile)
 
 The 22q/22r silent-failure vector, closed at the source: a stage

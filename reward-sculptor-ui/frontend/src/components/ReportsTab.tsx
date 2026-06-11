@@ -28,6 +28,29 @@ async function fetchReportMd(slug: string): Promise<string> {
   return await r.text();
 }
 
+// §Ship 25b (H2): decomposition-quality telemetry per mission.
+interface MissionQualityRecord {
+  mission_slug: string;
+  goal: string;
+  n_stages_at_start: number;
+  n_stages_final: number;
+  stages_executed: number;
+  stages_succeeded: number;
+  stage_success_rate: number | null;
+  redecompositions: number;
+  iterations_total: number;
+  completed: boolean;
+  halted_reason: string | null;
+  recorded_at: string;
+}
+
+async function fetchMissionQuality(slug: string): Promise<MissionQualityRecord[]> {
+  const r = await fetch(`/api/projects/${slug}/reports/mission-quality`);
+  if (!r.ok) return [];
+  const body = (await r.json()) as { missions?: MissionQualityRecord[] };
+  return body.missions ?? [];
+}
+
 async function buildReport(slug: string): Promise<void> {
   const r = await fetch(`/api/projects/${slug}/reports/build`, { method: "POST" });
   if (!r.ok) {
@@ -63,6 +86,12 @@ export function ReportsTab({ slug }: { slug: string }) {
       const detail = err instanceof ApiError ? err.problem.detail ?? err.problem.title : err.message;
       toast.error("Report build failed", { description: detail });
     },
+  });
+
+  const quality = useQuery<MissionQualityRecord[]>({
+    queryKey: [...qk.project(slug), "report", "mission-quality"],
+    queryFn: () => fetchMissionQuality(slug),
+    staleTime: 10_000,
   });
 
   const hasReport = (md.data ?? "").trim().length > 0;
@@ -105,6 +134,62 @@ export function ReportsTab({ slug }: { slug: string }) {
             </Btn>
           </div>
         </div>
+
+        {(quality.data?.length ?? 0) > 0 && (
+          <div className="rs-card" style={{ marginBottom: 22 }}>
+            <div className="rs-card-head">
+              <div className="rs-card-title">
+                <Icon name="layers" size={16} />Mission quality
+              </div>
+              <span className="rs-sub" style={{ fontSize: 12 }}>
+                decomposition telemetry
+              </span>
+            </div>
+            <div className="rs-card-pad rs-vgap-8">
+              {quality.data!.map((m) => (
+                <div
+                  key={m.mission_slug}
+                  className="rs-flex rs-gap-12 rs-wrap"
+                  style={{
+                    border: "1px solid var(--hairline)",
+                    borderRadius: "var(--radius-md)",
+                    padding: "10px 12px",
+                    background: "var(--canvas-soft)",
+                    alignItems: "baseline",
+                    fontSize: 12.5,
+                  }}
+                >
+                  <span style={{ fontWeight: 500, minWidth: 140 }} title={m.goal}>
+                    {m.mission_slug}
+                  </span>
+                  <span className="rs-num">
+                    stages {m.stages_succeeded}/{m.stages_executed}
+                    {m.stage_success_rate != null &&
+                      ` (${Math.round(m.stage_success_rate * 100)}%)`}
+                  </span>
+                  <span className="rs-num">
+                    {m.n_stages_at_start === m.n_stages_final
+                      ? `${m.n_stages_final} planned`
+                      : `${m.n_stages_at_start}→${m.n_stages_final} planned`}
+                  </span>
+                  <span className="rs-num">
+                    {m.redecompositions} redecompose{m.redecompositions === 1 ? "" : "s"}
+                  </span>
+                  <span className="rs-num">{m.iterations_total} iters</span>
+                  <span
+                    style={{
+                      marginLeft: "auto",
+                      color: m.completed ? "var(--st-emerald)" : "var(--st-amber)",
+                      fontWeight: 500,
+                    }}
+                  >
+                    {m.completed ? "completed" : (m.halted_reason ?? "halted")}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
 
         {md.isLoading ? (
           <p className="rs-sub">Loading report…</p>
