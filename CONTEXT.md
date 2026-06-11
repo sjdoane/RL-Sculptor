@@ -339,6 +339,46 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-11 — Ship 29: E4 mission-mode (curriculum) condition — the condition matrix is complete
+
+- **What**: harness mode "mission" + conditions `mission` (the FULL
+  SYSTEM: KG-grounded curriculum decomposition → per-stage sculpt
+  loops) and `mission_no_kg` (identical flow, KG stripped from
+  decompose/diagnose/edit). `_run_mission_mode`: decompose ONCE per
+  job (the curriculum is part of the seed's experiment state — resume
+  reuses the existing `.missions/` decomposition, test-pinned),
+  `mission_run` with the campaign budget (`iterations_override`,
+  `steps_per_iter`, seed) and `early_stop_on_criterion=True` (adaptive
+  stage exit is part of the system under test). Cross-stage spec
+  series (`_mission_spec_series`): stages in curriculum order, JOB-
+  GLOBAL iteration index (the comparison axis is total LLM-loop
+  iterations spent) with (stage, stage_iter) provenance on every
+  entry; final_rule stays `last_iteration` (the mission's output
+  policy). GPU accounting (`_mission_iterations_used`): sum of
+  per-stage `iterations_used` from the PERSISTED mission.json — saved
+  after every stage transition, so the bill survives crashes.
+  Condition docstring now carries the explicit E4 mapping: full
+  system → mission; no-KG → mission_no_kg; no-curriculum → full
+  (single-stage loop, renamed in notes); no-diagnose →
+  seed_only_matched; E3 baselines → plain_ppo(+matched), eureka.
+- **Verified**: 2 new tests (mission end-to-end with faked
+  decompose/mission_run: kwargs plumbing incl. kg None for no_kg,
+  cross-stage series ordering + global index, final from last stage,
+  bill from mission.json (3 used iters × steps), mission summary in
+  result; resume-skips-decompose with the result.json removed but
+  .missions kept). Gotchas hit: `_derive_mission_slug` lives in
+  sculptor.cli (not decompose); `Mission` requires
+  `decomposition_model`. Sculptor gate 533 passed/1 skipped;
+  backend/frontend untouched.
+- **Campaign readiness**: all E4 conditions implemented. Remaining
+  before the spend: pod up + provision, ~$2 Eureka+mission live smoke
+  on cartpole, then the 4-benchmark × conditions × 5-seed campaign
+  (shardable across pods — see GPU note in the session log: fastest
+  single GPU for this FP32-bound sim is the RTX PRO 6000 Blackwell
+  (~125 TFLOPS, 96 GB, ~$2/hr on RunPod); fastest WALL-CLOCK is
+  sharding the independent jobs across 2-3× 5090 pods, which also
+  costs less per unit throughput).
+
 ### 2026-06-11 — Ship 28: E3 Eureka-style baseline (+ the Isaac Sim decision)
 
 **Isaac Sim: deliberately deferred.** The central claim is about

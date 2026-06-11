@@ -308,6 +308,140 @@ def test_parity_warns_on_missing_vs_real_capture() -> None:
     assert len(agg["capture_parity_warnings"]) == 1
 
 
+# ── mission mode (§Ship 29 / E4 curriculum condition) ────────────────
+
+
+def _canned_mission(goal: str):
+    from sculptor.mission import Mission, Stage
+
+    return Mission(
+        goal=goal,
+        decomposition_rationale="two-step canned curriculum",
+        decomposition_model="canned-test-model",
+        stages=[
+            Stage(name="stage_a", goal_text="a", success_criterion="metric > 0",
+                  max_iterations=3, parent_stage=None, reward_seed_prompt="ra"),
+            Stage(name="stage_b", goal_text="b", success_criterion="metric > 0",
+                  max_iterations=3, parent_stage="stage_a",
+                  reward_seed_prompt="rb"),
+        ],
+    )
+
+
+def _fake_mission_run_factory(calls: list[dict[str, Any]]):
+    """Writes per-stage iter layouts + iterations_used into
+    mission.json — the artifacts the harness reads for the series and
+    the GPU bill."""
+
+    def fake_mission_run(mission, *, adapter_short_name, kg_store,
+                         iterations_override, steps_per_iter, seed,
+                         early_stop_on_criterion, **kw):
+        calls.append({
+            "kg": kg_store is not None,
+            "iterations_override": iterations_override,
+            "steps_per_iter": steps_per_iter,
+            "seed": seed,
+            "early_stop": early_stop_on_criterion,
+        })
+        from types import SimpleNamespace
+
+        from sculptor.mission import save_mission
+
+        md = Path(mission.mission_dir)
+        lengths = {"stage_a": (2, 100.0), "stage_b": (1, 400.0)}
+        for stage in mission.stages:
+            n_iters, mean_len = lengths[stage.name]
+            stage.iterations_used = n_iters
+            stage.status = "succeeded"
+            for i in range(n_iters):
+                ro = md / "stages" / stage.name / "runs" / f"iter_{i}" / "rollout"
+                ro.mkdir(parents=True, exist_ok=True)
+                (ro / "behavior.json").write_text(json.dumps({
+                    "mean_episode_length": mean_len + 50.0 * i,
+                    "max_episode_length": 500,
+                    "max_episode_steps": 500,
+                    "step_dt": 0.02,
+                    "rollout_num_envs": 64,
+                }))
+        save_mission(mission, md)
+        return SimpleNamespace(completed=True, halted_reason=None)
+
+    return fake_mission_run
+
+
+def test_mission_mode_end_to_end(tmp_path: Path, monkeypatch) -> None:
+    """mission condition: decompose once, mission_run with the
+    campaign budget, spec series spans stages in curriculum order with
+    a job-global index, GPU bill from mission.json iterations_used."""
+    calls: list[dict[str, Any]] = []
+    decompose_calls: list[str] = []
+
+    def fake_decompose(goal, contract, *, kg_store=None, **kw):
+        decompose_calls.append(goal)
+        return _canned_mission(goal)
+
+    monkeypatch.setattr("sculptor.decompose.decompose_task", fake_decompose)
+    monkeypatch.setattr(
+        "sculptor.sculpt.mission_run", _fake_mission_run_factory(calls),
+    )
+
+    cfg = _cfg(tmp_path, conditions=["mission_no_kg"], seeds=[1000],
+               iterations=3, steps_per_iter=10)
+    report = run_campaign(cfg)
+    job = report["jobs"][0]
+
+    assert decompose_calls == [
+        "balance the pole upright and keep the cart centered",
+    ]
+    assert calls == [{
+        "kg": False, "iterations_override": 3, "steps_per_iter": 10,
+        "seed": 1000, "early_stop": True,
+    }]
+    # Series: stage_a iters 0,1 then stage_b iter 0 — global idx 0..2.
+    rj = json.loads(
+        (tmp_path / "campaign" / "cartpole_balance" / "mission_no_kg"
+         / "seed_1000" / "result.json").read_text(encoding="utf-8")
+    )
+    series = rj["spec_series"]
+    assert [(s["iter"], s["stage"], s["stage_iter"]) for s in series] == [
+        (0, "stage_a", 0), (1, "stage_a", 1), (2, "stage_b", 0),
+    ]
+    # Final = last stage's last iter: 400/500 = 0.8.
+    assert job["final_spec_score"] == pytest.approx(0.8)
+    assert job["final_rule"] == "last_iteration"
+    # GPU bill: (2 + 1) iterations_used × 10 steps.
+    assert job["total_rl_iterations"] == 30
+    assert job["mission"] == {
+        "n_stages": 2, "completed": True, "halted_reason": None,
+    }
+    assert job["error"] is None
+
+
+def test_mission_mode_resume_skips_decompose(tmp_path: Path, monkeypatch) -> None:
+    """The decomposition is part of the seed's experiment state — a
+    resumed job must reuse it, not re-roll the curriculum."""
+    calls: list[dict[str, Any]] = []
+    decompose_count = {"n": 0}
+
+    def fake_decompose(goal, contract, *, kg_store=None, **kw):
+        decompose_count["n"] += 1
+        return _canned_mission(goal)
+
+    monkeypatch.setattr("sculptor.decompose.decompose_task", fake_decompose)
+    monkeypatch.setattr(
+        "sculptor.sculpt.mission_run", _fake_mission_run_factory(calls),
+    )
+    cfg = _cfg(tmp_path, conditions=["mission_no_kg"], seeds=[1000],
+               iterations=3, steps_per_iter=10)
+    run_campaign(cfg)
+    # Drop the result.json so the job re-RUNS, but keep .missions/.
+    (tmp_path / "campaign" / "cartpole_balance" / "mission_no_kg"
+     / "seed_1000" / "result.json").unlink()
+    run_campaign(cfg)
+    assert decompose_count["n"] == 1, "resume must not re-decompose"
+    assert len(calls) == 2
+
+
 def test_capture_parity_warning(tmp_path: Path) -> None:
     """Two jobs of one benchmark with different capture settings must
     surface a parity warning — frame-domain specs are incomparable."""

@@ -73,12 +73,23 @@ def compute_reward_batched(state, action, next_state, info):
 @dataclass(frozen=True)
 class EvalCondition:
     """One experimental condition. `mode`:
-    * "sculpt"     — the full LLM loop via sculpt_run (no_kg toggles
-                     the KG ablation).
+    * "mission"    — the FULL SYSTEM: LLM curriculum decomposition →
+                     per-stage sculpt loops (no_kg toggles the KG
+                     ablation across decompose/diagnose/edit).
+    * "sculpt"     — single-stage sculpt loop (the plan's
+                     NO-CURRICULUM ablation; no_kg toggles KG).
     * "train_only" — one training run, no LLM anywhere:
                      use_seed_reward=False → the env's intrinsic reward
                      (plain-PPO baseline); True → the shared v0 starter
-                     (no-diagnose ablation: seed, then never iterate).
+                     (the plan's NO-DIAGNOSE ablation: seed, never
+                     iterate — use the *_matched variant for equal GPU).
+
+    E4 condition mapping (plan §E4 → harness names):
+      full system    → mission
+      no-KG          → mission_no_kg
+      no-curriculum  → full
+      no-diagnose    → seed_only_matched
+      baselines (E3) → plain_ppo(+_matched), eureka
 
     COMPUTE FAIRNESS: each sculpt-loop iteration trains FROM SCRATCH
     for steps_per_iter, so a sculpt job consumes `iterations ×
@@ -102,12 +113,24 @@ CONDITIONS: dict[str, EvalCondition] = {
     c.name: c
     for c in (
         EvalCondition(
+            name="mission", mode="mission", no_kg=False,
+            notes="FULL SYSTEM: KG-grounded curriculum decomposition + "
+                  "per-stage diagnose/edit loops",
+        ),
+        EvalCondition(
+            name="mission_no_kg", mode="mission", no_kg=True,
+            notes="E4 no-KG ablation: identical mission flow, KG "
+                  "stripped from decompose/diagnose/edit",
+        ),
+        EvalCondition(
             name="full", mode="sculpt", no_kg=False,
-            notes="full pipeline: KG-grounded diagnose -> edit loop",
+            notes="E4 no-curriculum ablation: single-stage KG-grounded "
+                  "diagnose -> edit loop (no decomposition)",
         ),
         EvalCondition(
             name="no_kg", mode="sculpt", no_kg=True,
-            notes="ablation: identical loop, KG context stripped",
+            notes="single-stage loop, KG stripped (no-curriculum AND "
+                  "no-KG)",
         ),
         EvalCondition(
             name="plain_ppo", mode="train_only", use_seed_reward=False,
@@ -227,6 +250,138 @@ early_stop_enabled = false
     return job_dir / "config.toml"
 
 
+def _run_mission_mode(
+    cfg: CampaignConfig,
+    bench: BenchmarkTask,
+    condition: EvalCondition,
+    seed: int,
+    job_dir: Path,
+    config_path: Path,
+) -> dict[str, Any]:
+    """The full-system condition: decompose the goal into a mission
+    once (resume reuses the existing decomposition — the curriculum is
+    part of the seed's experiment state), then mission_run with the
+    campaign's per-stage budget. Returns {n_stages, completed,
+    halted_reason} for the result record."""
+    from sculptor.adapters.base import load_adapter
+    from sculptor.cli import _derive_mission_slug
+    from sculptor.decompose import decompose_task
+    from sculptor.mission import load_mission, save_mission
+    from sculptor.sculpt import mission_run
+
+    missions_root = job_dir / ".missions"
+    missions_root.mkdir(parents=True, exist_ok=True)
+    existing = sorted(p.name for p in missions_root.iterdir() if p.is_dir())
+
+    def _open_kg():
+        if condition.no_kg:
+            return None
+        from sculptor.kg.store import SculptorKG
+
+        return SculptorKG()
+
+    if existing:
+        mission = load_mission(missions_root / existing[0])
+    else:
+        adapter = load_adapter(config_path)
+        kg_store = _open_kg()
+        try:
+            mission = decompose_task(
+                bench.behavior_goal,
+                adapter.reward_contract(),
+                kg_store=kg_store,
+                skill_library_handle=None,
+            )
+        finally:
+            if kg_store is not None:
+                kg_store.close()
+        slug = _derive_mission_slug(bench.behavior_goal, set())
+        mission.mission_dir = str((missions_root / slug).resolve())
+        save_mission(mission, missions_root / slug)
+
+    kg_store = _open_kg()
+    try:
+        result = mission_run(
+            mission,
+            adapter_short_name=bench.adapter,
+            kg_store=kg_store,
+            iterations_override=cfg.iterations,
+            steps_per_iter=cfg.steps_per_iter,
+            seed=seed,
+            # Adaptive early stop is part of the SYSTEM under test —
+            # a stage exits the moment its criterion holds.
+            early_stop_on_criterion=True,
+        )
+    finally:
+        if kg_store is not None:
+            kg_store.close()
+    return {
+        "n_stages": len(mission.stages),
+        "completed": bool(getattr(result, "completed", False)),
+        "halted_reason": getattr(result, "halted_reason", None),
+    }
+
+
+def _mission_iterations_used(job_dir: Path) -> Optional[int]:
+    """Sum of per-stage iterations_used from the persisted mission.json
+    — survives crashes (saved after every stage transition), which is
+    what makes the GPU accounting honest in failure paths."""
+    missions_root = job_dir / ".missions"
+    if not missions_root.is_dir():
+        return None
+    for md in sorted(missions_root.iterdir()):
+        mj = md / "mission.json"
+        if mj.is_file():
+            try:
+                doc = json.loads(mj.read_text(encoding="utf-8"))
+                return sum(
+                    int(s.get("iterations_used", 0) or 0)
+                    for s in doc.get("stages", [])
+                )
+            except Exception:  # noqa: BLE001
+                return None
+    return None
+
+
+def _mission_spec_series(
+    cfg: CampaignConfig, bench: BenchmarkTask, job_dir: Path,
+) -> list[dict[str, Any]]:
+    """Spec metric across the mission's stages in curriculum order,
+    indexed by a job-global iteration counter (the comparison axis is
+    total LLM-loop iterations spent, regardless of which stage spent
+    them). Each entry keeps its (stage, stage_iter) provenance."""
+    out: list[dict[str, Any]] = []
+    missions_root = job_dir / ".missions"
+    if not missions_root.is_dir():
+        return out
+    idx = 0
+    for md in sorted(missions_root.iterdir()):
+        mj = md / "mission.json"
+        if not mj.is_file():
+            continue
+        try:
+            doc = json.loads(mj.read_text(encoding="utf-8"))
+            stage_names = [s["name"] for s in doc.get("stages", [])]
+        except Exception:  # noqa: BLE001
+            stage_names = []
+        for stage_name in stage_names:
+            runs = md / "stages" / stage_name / "runs"
+            if not runs.is_dir():
+                continue
+            iters = sorted(
+                (d for d in runs.glob("iter_*") if d.is_dir()),
+                key=lambda d: int(d.name.split("_", 1)[1]),
+            )
+            for it in iters:
+                result = compute_spec_metrics(bench.spec_metric, it / "rollout")
+                result["iter"] = idx
+                result["stage"] = stage_name
+                result["stage_iter"] = int(it.name.split("_", 1)[1])
+                out.append(result)
+                idx += 1
+    return out
+
+
 def _spec_series(
     cfg: CampaignConfig, bench: BenchmarkTask, job_dir: Path,
 ) -> list[dict[str, Any]]:
@@ -262,6 +417,7 @@ def _run_job(
     t0 = time.monotonic()
     error: Optional[str] = None
     eureka_summary: Optional[dict[str, Any]] = None
+    mission_summary: Optional[dict[str, Any]] = None
     try:
         if condition.mode == "train_only":
             from sculptor.adapters.base import load_adapter
@@ -314,6 +470,10 @@ def _run_job(
                 rollout_episodes=cfg.rollout_episodes,
                 seed=seed,
             )
+        elif condition.mode == "mission":
+            mission_summary = _run_mission_mode(
+                cfg, bench, condition, seed, job_dir, config_path,
+            )
         else:  # pragma: no cover — guarded by validate()
             raise ValueError(f"unknown condition mode {condition.mode!r}")
     except Exception as e:  # noqa: BLE001 — honest zero, campaign continues
@@ -321,7 +481,10 @@ def _run_job(
         traceback.print_exc()
 
     wall = time.monotonic() - t0
-    series = _spec_series(cfg, bench, job_dir)
+    if condition.mode == "mission":
+        series = _mission_spec_series(cfg, bench, job_dir)
+    else:
+        series = _spec_series(cfg, bench, job_dir)
     scores = [s.get("spec_score", 0.0) for s in series]
     best = max(scores) if scores else 0.0
     if condition.mode == "eureka":
@@ -344,6 +507,11 @@ def _run_job(
     if condition.mode == "train_only":
         total_rl_iters = cfg.steps_per_iter * (
             cfg.iterations if condition.compute_matched else 1
+        )
+    elif condition.mode == "mission":
+        used = _mission_iterations_used(job_dir)
+        total_rl_iters = cfg.steps_per_iter * (
+            used if used is not None else len(series)
         )
     elif condition.mode == "eureka":
         if eureka_summary is not None:
@@ -389,6 +557,7 @@ def _run_job(
         "spec_series": series,
         "capture": captures[-1] if captures else None,
         "eureka": eureka_summary,
+        "mission": mission_summary,
         "error": error,
     }
     from sculptor.run_context import write_json_atomic
