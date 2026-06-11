@@ -328,13 +328,20 @@ class MjlabAdapter(SculptorAdapter):
         "invalid device ordinal" for N>0 (latent on single-GPU pods,
         load-bearing on the campaign's 3× PRO 6000 host). The physical
         index lives ONLY in the env mask; the runner argv always says
-        cuda:0."""
+        cuda:0.
+
+        §Ship 32a: remote hosts are headless — MuJoCo's offscreen
+        renderer needs `MUJOCO_GL=egl` or rollout dies with "an OpenGL
+        platform library has not been loaded" (caught live: campaign
+        first jobs, 2026-06-11; the smoke had rollouts local so the
+        path was never exercised). Inert for train (no GL context is
+        ever created). Provisioning installs the glvnd front-end
+        (libegl1) the EGL path needs."""
+        env = {"MUJOCO_GL": "egl"}
         if device.startswith("cuda") and ":" in device:
-            return (
-                {"CUDA_VISIBLE_DEVICES": device.split(":")[1]},
-                "cuda:0",
-            )
-        return {}, device
+            env["CUDA_VISIBLE_DEVICES"] = device.split(":")[1]
+            return env, "cuda:0"
+        return env, device
 
     # ── Contract ────────────────────────────────────────────────────────────
     def reward_contract(self) -> RewardContract:

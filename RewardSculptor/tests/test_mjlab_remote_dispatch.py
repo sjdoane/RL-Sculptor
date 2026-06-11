@@ -98,6 +98,10 @@ def test_train_dispatches_remotely_when_enabled(tmp_path: Path) -> None:
     # campaign's multi-GPU pod).
     assert job.options["--device"] == "cuda:0"
     assert job.remote_env["CUDA_VISIBLE_DEVICES"] == "1"
+    # §Ship 32a: remote hosts are headless — every dispatch carries
+    # MUJOCO_GL=egl or remote rollouts die creating the offscreen
+    # renderer (caught live: campaign first jobs zeroed out).
+    assert job.remote_env["MUJOCO_GL"] == "egl"
     # Schema keys still derived per-task (S8 regression surface).
     assert set(job.options["--schema-keys"].split(",")) >= {"qpos", "qvel", "command_vel"}
     # Reward module rides as an uploadable input, not a bare option —
@@ -141,6 +145,7 @@ def test_multi_gpu_shard_devices_mask_correctly(tmp_path: Path) -> None:
             )
         assert captured["job"].remote_env["CUDA_VISIBLE_DEVICES"] == str(n)
         assert captured["job"].options["--device"] == "cuda:0"
+        assert captured["job"].remote_env["MUJOCO_GL"] == "egl"
 
 
 def test_train_warm_start_checkpoint_in_input_paths(tmp_path: Path) -> None:
@@ -328,6 +333,10 @@ def test_rollout_dispatches_remotely_when_opted_in(tmp_path: Path) -> None:
     assert job.input_paths["--checkpoint-path"] == _checkpoint(tmp_path).resolve()
     # Ordered: rollout.mp4 LAST — sculpt.py's skip check needs all three.
     assert job.required_artifacts == ("behavior.json", "trajectory.npz", "rollout.mp4")
+    # §Ship 32a: headless pods need EGL — the rollout dispatch is the
+    # path that actually creates a GL context (campaign first jobs all
+    # died here).
+    assert job.remote_env["MUJOCO_GL"] == "egl"
     assert result.video_path == (tmp_path / "ro" / "rollout.mp4").resolve()
 
 

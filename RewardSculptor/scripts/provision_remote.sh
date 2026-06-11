@@ -136,6 +136,19 @@ if ! command -v rsync >/dev/null 2>&1; then
   $SUDO apt-get update -qq && $SUDO apt-get install -y -qq rsync
 fi
 
+# §Ship 32a: headless rendering — MuJoCo's offscreen renderer under
+# MUJOCO_GL=egl needs the glvnd EGL front-end (libEGL.so.1). The
+# nvidia driver ships libEGL_nvidia + the vendor ICD json, but pod
+# images routinely lack the dispatcher; without it every remote
+# rollout dies with "an OpenGL platform library has not been loaded"
+# (caught live: E4 campaign first jobs, 2026-06-11).
+if [ ! -e /usr/lib/x86_64-linux-gnu/libEGL.so.1 ]; then
+  echo "--> [pod] installing EGL/GL runtime (libegl1 libgl1 libgles2)"
+  $SUDO apt-get update -qq && \
+    DEBIAN_FRONTEND=noninteractive $SUDO apt-get install -y -qq \
+      libegl1 libgl1 libgles2
+fi
+
 if ! command -v nvidia-smi >/dev/null 2>&1; then
   echo "!! [pod] nvidia-smi not found — is this a GPU pod?" >&2
   exit 3

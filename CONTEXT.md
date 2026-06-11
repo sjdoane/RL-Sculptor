@@ -339,6 +339,29 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-11 22:05 — Ship 32a: hour-1 checkpoint caught remote-rollout EGL crash; fixed + relaunched
+
+- **What**: ALL THREE first campaign jobs (plain_ppo seed_1000 ×3
+  benchmarks) trained fine then died at rollout: `mujoco.FatalError: an
+  OpenGL platform library has not been loaded` — headless pod, no
+  `MUJOCO_GL=egl`, and the pod image lacked the glvnd EGL dispatcher
+  (`libEGL.so.1`; driver-side `libEGL_nvidia` + vendor ICD were present).
+  The smoke never exercised this path: its rollouts ran locally
+  (ROLLOUT=1 was appended to the env file after the smoke started).
+  Fixes: (1) pod: `apt-get install libegl1 libgl1 libgles2`, EGL render
+  probe passes (64×64 frame, nonzero); (2)
+  `sculptor/adapters/mjlab.py` `_remote_device_env` now always includes
+  `MUJOCO_GL=egl` in the dispatch env (inert for train — no GL context);
+  (3) `scripts/provision_remote.sh` installs the EGL runtime when
+  `libEGL.so.1` is absent (exec bit re-set); (4) MUJOCO_GL assertions in
+  test_mjlab_remote_dispatch.py (train + multi-GPU + rollout-remote).
+- **Recovery**: killed the 3 shards at ~3 errored jobs (~30 GPU-min
+  burned, ~$1–2), deleted the errored job dirs (resume keys), relaunched
+  the same three shard commands — fresh processes import the fixed
+  adapter; jobs re-run from scratch.
+- **Verified**: gate 546 passed / 1 skipped; pod EGL probe green;
+  relaunch echoes REMOTE targets ×3.
+
 ### 2026-06-11 21:25 — Ship 32: E4 CAMPAIGN LAUNCHED (140 jobs, 3 shards, all-remote)
 
 - **What**: smoke completed GREEN (mission spec=1.0/785 s, eureka
