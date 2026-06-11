@@ -146,13 +146,38 @@ def eval_run(
     ),
     name: Optional[str] = typer.Option(
         None, "--name", help="Campaign name (default: out dir name)."),
+    require_remote: bool = typer.Option(
+        False, "--require-remote",
+        help="Abort unless SCULPTOR_REMOTE_* resolves to an enabled "
+             "remote host — guards a campaign against silently training "
+             "on the local GPU when the env didn't propagate.",
+    ),
 ):
     """Run an eval campaign. Resumable: completed jobs (result.json on
     disk) are skipped, so re-running after a crash or pod restart only
     does the remaining work. Remote dispatch: export SCULPTOR_REMOTE_*
     (see docs/remote.md) and training routes through the pod
     automatically."""
+    import os as _os
+
+    from sculptor.adapters._remote import RemoteConfig
     from sculptor.eval import CampaignConfig, run_campaign
+
+    rcfg = RemoteConfig.from_sources(None, _os.environ)
+    if rcfg is not None and rcfg.enabled:
+        typer.echo(
+            f"[eval] training target: REMOTE {rcfg.target}:{rcfg.port} "
+            f"(device={rcfg.device or 'cuda:0'})"
+        )
+    else:
+        typer.echo("[eval] training target: LOCAL GPU")
+        if require_remote:
+            typer.echo(
+                "[eval] --require-remote set but no enabled remote "
+                "resolved from SCULPTOR_REMOTE_* — aborting before any "
+                "GPU work.", err=True,
+            )
+            raise typer.Exit(3)
 
     cfg = CampaignConfig(
         name=name or Path(out).name,

@@ -91,9 +91,12 @@ def test_train_dispatches_remotely_when_enabled(tmp_path: Path) -> None:
     assert job.options["--num-envs"] == "512"
     assert job.options["--max-iterations"] == "5"
     assert job.options["--seed"] == "7"
-    # Remote device override wins over the local adapter device …
-    assert job.options["--device"] == "cuda:1"
-    # … and pins CUDA_VISIBLE_DEVICES for the REMOTE card.
+    # Remote device override selects the PHYSICAL card via the env
+    # mask; the runner argv always says cuda:0 because the mask
+    # renumbers visible devices (§Ship 31b — passing cuda:1 alongside
+    # CUDA_VISIBLE_DEVICES=1 raised "invalid device ordinal" on the
+    # campaign's multi-GPU pod).
+    assert job.options["--device"] == "cuda:0"
     assert job.remote_env["CUDA_VISIBLE_DEVICES"] == "1"
     # Schema keys still derived per-task (S8 regression surface).
     assert set(job.options["--schema-keys"].split(",")) >= {"qpos", "qvel", "command_vel"}
@@ -119,6 +122,25 @@ def test_train_remote_device_defaults_to_local_device(tmp_path: Path) -> None:
         )
     assert captured["job"].options["--device"] == "cuda:0"
     assert captured["job"].remote_env["CUDA_VISIBLE_DEVICES"] == "0"
+
+
+def test_multi_gpu_shard_devices_mask_correctly(tmp_path: Path) -> None:
+    """§Ship 31b campaign regression: three shards on one pod select
+    cuda:0/1/2 via the env mask while every runner argv says cuda:0."""
+    for n in (0, 1, 2):
+        adapter = mjlab_mod.MjlabAdapter(
+            task_id=TASK, num_envs=64, max_iterations=1,
+            remote={**REMOTE_TABLE, "device": f"cuda:{n}"},
+        )
+        captured: dict = {}
+        with patch.object(_remote_mod.RemoteExecutor, "execute",
+                          _fake_execute(captured, TRAIN_ARTIFACTS)):
+            adapter.train(
+                reward_module_path=_reward_module(tmp_path),
+                output_dir=tmp_path / f"out{n}", steps=1, seed=1,
+            )
+        assert captured["job"].remote_env["CUDA_VISIBLE_DEVICES"] == str(n)
+        assert captured["job"].options["--device"] == "cuda:0"
 
 
 def test_train_warm_start_checkpoint_in_input_paths(tmp_path: Path) -> None:

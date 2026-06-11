@@ -319,13 +319,22 @@ class MjlabAdapter(SculptorAdapter):
         return self._remote_exec
 
     @staticmethod
-    def _remote_device_env(device: str) -> dict[str, str]:
-        """Mirror the local CUDA_VISIBLE_DEVICES pinning for the remote
-        host's device (which may differ from the local `self.device`)."""
-        env: dict[str, str] = {}
+    def _remote_device_env(device: str) -> tuple[dict[str, str], str]:
+        """Map a remote device selection onto (env, runner_device).
+
+        §Ship 31b (multi-GPU pods): `CUDA_VISIBLE_DEVICES=N` MASKS the
+        GPU set — inside the runner the selected card is always
+        `cuda:0`. Passing `--device cuda:N` alongside the mask raised
+        "invalid device ordinal" for N>0 (latent on single-GPU pods,
+        load-bearing on the campaign's 3× PRO 6000 host). The physical
+        index lives ONLY in the env mask; the runner argv always says
+        cuda:0."""
         if device.startswith("cuda") and ":" in device:
-            env["CUDA_VISIBLE_DEVICES"] = device.split(":")[1]
-        return env
+            return (
+                {"CUDA_VISIBLE_DEVICES": device.split(":")[1]},
+                "cuda:0",
+            )
+        return {}, device
 
     # ── Contract ────────────────────────────────────────────────────────────
     def reward_contract(self) -> RewardContract:
@@ -558,12 +567,13 @@ class MjlabAdapter(SculptorAdapter):
             from sculptor.adapters._remote import RunnerJob
 
             device = executor.cfg.device or self.device
+            remote_env, runner_device = self._remote_device_env(device)
             options = {
                 "--task-id": self.task_id,
                 "--num-envs": str(self.num_envs),
                 "--max-iterations": str(max_iterations),
                 "--seed": str(int(seed)),
-                "--device": device,
+                "--device": runner_device,
                 "--schema-keys": ",".join(effective_schema_keys),
             }
             input_paths: dict[str, Path] = {}
@@ -584,7 +594,7 @@ class MjlabAdapter(SculptorAdapter):
                 # Ordered: completion key (checkpoint.pt — also
                 # sculpt.py's resume key) is promoted last.
                 required_artifacts=("metrics.json", "checkpoint.pt"),
-                remote_env=self._remote_device_env(device),
+                remote_env=remote_env,
                 aux_dirs=aux_dirs,
             )
             proc = executor.execute(job)
@@ -702,10 +712,11 @@ class MjlabAdapter(SculptorAdapter):
             from sculptor.adapters._remote import RunnerJob
 
             device = executor.cfg.device or self.device
+            remote_env, runner_device = self._remote_device_env(device)
             options = {
                 "--task-id": self.task_id,
                 "--n-episodes": str(int(n_episodes)),
-                "--device": device,
+                "--device": runner_device,
             }
             if max_episode_steps is not None:
                 options["--max-episode-steps"] = str(int(max_episode_steps))
@@ -724,7 +735,7 @@ class MjlabAdapter(SculptorAdapter):
                 # check requires all three non-empty, so a partial sync
                 # can never present as a finished rollout.
                 required_artifacts=("behavior.json", "trajectory.npz", "rollout.mp4"),
-                remote_env=self._remote_device_env(device),
+                remote_env=remote_env,
             )
             proc = executor.execute(job)
         else:

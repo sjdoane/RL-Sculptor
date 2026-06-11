@@ -129,6 +129,85 @@ def test_query_semantic_floor_filters(tmp_path: Path) -> None:
     assert hits_unrelated == []
 
 
+# ── §Ship 31b: batched-path pre-flight validation ────────────────────
+
+
+def _batched_contract():
+    from sculptor.adapters.base import RewardContract
+
+    return RewardContract(
+        observation_space_spec=None, action_space_spec=None,
+        supports_batched=True,
+        state_schema={"qpos": (2,), "actuator_force": (1,)},
+        expected_info_keys=["terminated", "episode_length"],
+    )
+
+
+def test_batched_validation_catches_bool_arithmetic() -> None:
+    """The exact E4-smoke crash: `1.0 - (tensor comparison)` is legal
+    in the scalar (python) path and crashes in the batched (tensor)
+    path — validation must execute the TRAINING path."""
+    from types import SimpleNamespace
+
+    import torch
+
+    from sculptor.edit import EditValidationError, _call_compute_reward_batched
+
+    def bad_batched(state, action, next_state, info):
+        reset_mask = info["episode_length"] <= 1          # bool tensor
+        prev = action * (1.0 - reset_mask)                # crashes
+        n = action.shape[0]
+        return torch.zeros(n) + prev.sum(), {"c": torch.zeros(n)}
+
+    mod = SimpleNamespace(compute_reward_batched=bad_batched)
+    with pytest.raises(EditValidationError, match="TRAINING path"):
+        _call_compute_reward_batched(mod, _batched_contract())
+
+
+def test_batched_validation_passes_correct_module() -> None:
+    from types import SimpleNamespace
+
+    import torch
+
+    from sculptor.edit import _call_compute_reward_batched
+
+    def good_batched(state, action, next_state, info):
+        reset_mask = (info["episode_length"] <= 1).float()
+        n = action.shape[0]
+        rewards = torch.ones(n) * (1.0 - reset_mask)
+        return rewards, {"alive": rewards.clone()}
+
+    mod = SimpleNamespace(compute_reward_batched=good_batched)
+    _call_compute_reward_batched(mod, _batched_contract())  # no raise
+
+
+def test_batched_validation_rejects_wrong_shape_and_nonfinite() -> None:
+    from types import SimpleNamespace
+
+    import torch
+
+    from sculptor.edit import EditValidationError, _call_compute_reward_batched
+
+    def wrong_shape(state, action, next_state, info):
+        return torch.zeros(5), {"c": torch.zeros(5)}
+
+    with pytest.raises(EditValidationError, match="shape"):
+        _call_compute_reward_batched(
+            SimpleNamespace(compute_reward_batched=wrong_shape),
+            _batched_contract(),
+        )
+
+    def nonfinite(state, action, next_state, info):
+        n = action.shape[0]
+        return torch.full((n,), float("inf")), {"c": torch.zeros(n)}
+
+    with pytest.raises(EditValidationError, match="non-finite"):
+        _call_compute_reward_batched(
+            SimpleNamespace(compute_reward_batched=nonfinite),
+            _batched_contract(),
+        )
+
+
 # ── F2: citation verification at diagnose time ───────────────────────
 
 

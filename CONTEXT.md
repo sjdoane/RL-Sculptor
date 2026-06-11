@@ -339,6 +339,76 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-11 — Ship 31b: campaign-pod bring-up — smoke found 3 launch-blocking bugs, all fixed
+
+**Hardware**: Sam rented ONE pod with 3× RTX PRO 6000 Blackwell Server
+(96 GB each), driver 580.142, /workspace volume (eur-is-1), 256 CPUs.
+`root@157.157.221.177 -p 14699`. Provisioned (`-w
+/workspace/sculptor_remote`, venv on pod-local disk, python 3.13.13,
+full stack pinned); doctor all green ×8. Campaign env at
+`/tmp/rs_campaign_env.sh` (SCULPTOR_REMOTE_* for this pod; per-shard
+`SCULPTOR_REMOTE_DEVICE=cuda:0|1|2`).
+
+The mission+eureka cartpole smoke (go/no-go step 3) caught three
+launch-blocking bugs — exactly what it exists for:
+
+1. **Multi-GPU device-ordinal bug (would have broken shards 2+3)**:
+   `_remote_device_env` set `CUDA_VISIBLE_DEVICES=N` AND passed
+   `--device cuda:N` — but the mask renumbers, so inside the runner
+   the card is ALWAYS cuda:0; `cuda:1/2` raise "invalid device
+   ordinal". Fixed: the physical index lives ONLY in the env mask,
+   runner argv always cuda:0 (`_remote_device_env` now returns
+   (env, runner_device); both train + rollout seams updated; 3-shard
+   regression test in test_mjlab_remote_dispatch).
+2. **Silent local-GPU fallback (burned the first smoke on the
+   laptop 5070)**: PowerShell `Start-Process wsl -ArgumentList
+   @('bash','-c','…')` ARRAY form gets re-split by wsl.exe — the
+   `source` never ran, SCULPTOR_REMOTE_* never set, and "no remote
+   configured" is by-design silent → the smoke trained locally.
+   Launcher rule: ALWAYS the single-string ArgumentList form
+   (`-ArgumentList 'bash -c "…"'` — the Ship-27 pattern that worked).
+   Guard added: `sculpt eval run` now echoes "[eval] training target:
+   REMOTE …|LOCAL GPU" at start and `--require-remote` aborts (exit 3)
+   when SCULPTOR_REMOTE_* doesn't resolve — use it on EVERY campaign
+   shard.
+3. **Unvalidated training path (mission stage burned)**: the LLM v1
+   did `prev_action * (1.0 - reset_mask)` where reset_mask came from a
+   TENSOR COMPARISON (bool) — legal in the scalar (pure-python) probe,
+   crashes the batched path ("Subtraction with a bool tensor").
+   Edit's post-validate only ever executed `compute_reward` (scalar);
+   `compute_reward_batched` — THE path training runs — was first
+   executed on the rented GPU. Fixed: `_call_compute_reward_batched`
+   in edit.py `_post_validate` (N=2 zero tensors, runtime-faithful
+   FLOAT info — the runner floats terminated/time_outs/fallen at
+   lines ~322-324, verified; an earlier bool-info "fix" was reverted
+   as wrong), checks tuple shape/(N,)/non-empty components/finite,
+   with an actionable message (`(~mask).float()`). 3 new tests incl.
+   the exact smoke crash repro. NOTE: validation-failure → the edit
+   retry loop fixes the reward — this converts campaign hard-fails
+   into normal retries.
+
+**Status at this entry**: re-launched smoke RUNNING REMOTELY
+(verified: `[eval] training target: REMOTE root@157.157.221.177`, and
+nvidia-smi on the pod shows our runner at 56% util / 794 MiB on GPU 0;
+GPUs 1-2 idle until shards launch). Smoke = cartpole × {mission,
+eureka} × 1 seed, iterations=2, steps=300, out=/tmp/rs_e4_smoke,
+log=/tmp/rs_e4_smoke.log (detached Windows-side wsl client). Gates:
+sculptor 545 passed/1 skipped (all fixes tested); backend untouched
+since 323-green. UNCOMMITTED at write time: mjlab.py (device map),
+edit.py (batched validation), cli.py (--require-remote + target echo),
+test_mjlab_remote_dispatch.py, test_grounding_hardening.py — commit
+as Ship 31b immediately after this entry.
+
+**Campaign launch (after smoke passes)**: 3 detached shards
+(single-string launcher!), each `source /tmp/rs_campaign_env.sh` +
+`SCULPTOR_REMOTE_DEVICE=cuda:<0|1|2>` + `--require-remote`, benchmarks
+split per docs/campaign_plan.md (A: g1_floss; B: g1_kick; C: go1_trot
++ cartpole_balance), all `--out ~/rs_campaign`, seeds 5, iterations 4,
+steps 600; merge with `sculpt eval report ~/rs_campaign`. Budget on
+3× PRO 6000 ≈ $2/hr each: ~24 h wall ≈ ~$144 GPU + $50-90 LLM (Sam
+chose speed over the $60 5090 plan). Monitor: `eval_job_finished`
+events per shard log + pod nvidia-smi shows 3 active GPUs.
+
 ### 2026-06-11 — Ship 31: pre-campaign grounding audit + hardening (campaign frozen)
 
 Sam's directive: everything in its best state, hallucinations minimized

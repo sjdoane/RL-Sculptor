@@ -285,6 +285,59 @@ def _call_compute_reward(mod, contract) -> tuple[float, dict]:
     return reward_f, components
 
 
+def _call_compute_reward_batched(mod, contract) -> None:
+    """§Ship 31b: execute the BATCHED path pre-flight (N=2 zero
+    tensors, runtime-faithful float info). The scalar probe runs pure
+    Python where `1.0 - (x <= 1)` is legal; the same expression on
+    tensors crashes ("Subtraction with a bool tensor") — caught live
+    in the E4 smoke AFTER training started, burning the stage. The
+    training path must be exercised by validation, not first executed
+    on a rented GPU."""
+    if not bool(getattr(contract, "supports_batched", False)):
+        return
+    if not hasattr(mod, "compute_reward_batched"):
+        return  # presence is enforced elsewhere for batched contracts
+    import torch
+
+    schema = dict(contract.state_schema or {})
+    n = 2
+    state = {k: torch.zeros((n, *shape), dtype=torch.float32)
+             for k, shape in schema.items()}
+    next_state = {k: torch.zeros((n, *shape), dtype=torch.float32)
+                  for k, shape in schema.items()}
+    action_dim = int(schema.get("actuator_force", (1,))[0])
+    action = torch.zeros((n, action_dim), dtype=torch.float32)
+    info = {k: torch.zeros((n,), dtype=torch.float32)
+            for k in (contract.expected_info_keys or [])}
+    try:
+        out = mod.compute_reward_batched(state, action, next_state, info)
+    except Exception as e:  # noqa: BLE001 — surface as validation error
+        raise EditValidationError(
+            f"compute_reward_batched crashed on zero inputs (N=2): "
+            f"{type(e).__name__}: {e}. This is the TRAINING path — fix "
+            f"the batched implementation (common causes: arithmetic on "
+            f"a bool comparison result — use `(~mask).float()` or "
+            f"`mask.logical_not().float()`; shape mismatches; assuming "
+            f"a device)."
+        ) from e
+    if not (isinstance(out, tuple) and len(out) == 2):
+        raise EditValidationError(
+            "compute_reward_batched must return (rewards, components); "
+            f"got {type(out).__name__}")
+    rewards, components = out
+    if not hasattr(rewards, "shape") or tuple(rewards.shape) != (n,):
+        raise EditValidationError(
+            f"compute_reward_batched rewards must have shape ({n},); got "
+            f"{getattr(rewards, 'shape', type(rewards).__name__)}")
+    if not isinstance(components, dict) or not components:
+        raise EditValidationError(
+            "compute_reward_batched components must be a non-empty dict")
+    if not torch.isfinite(rewards).all():
+        raise EditValidationError(
+            "compute_reward_batched produced non-finite rewards on zero "
+            "inputs — bound the offending term (unguarded div/log/exp).")
+
+
 def _current_reward_component_keys(current_module, contract) -> set[str]:
     _, components = _call_compute_reward(current_module, contract)
     return set(components.keys())
@@ -672,6 +725,9 @@ def _post_validate(new_source: str, *, contract, kg_store: SculptorKG,
 
         # Call compute_reward with dummies.
         reward, components = _call_compute_reward(mod, contract)
+        # §Ship 31b: also execute the BATCHED (training) path — the
+        # scalar probe alone let tensor-only crashes reach the GPU.
+        _call_compute_reward_batched(mod, contract)
 
         # expected_components subset check
         if contract.expected_components is not None:
