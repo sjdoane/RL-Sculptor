@@ -339,6 +339,30 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-11 — Ship 31c: smoke bug #4 (scalar-probe crash leak) + --eureka-k + rollouts remote
+
+- **What**: `RewardSculptor/sculptor/edit.py` `_call_compute_reward` — the
+  module CALL is now wrapped → `EditValidationError` (was unwrapped; raw
+  module exceptions skipped the EditValidationError-only retry at
+  apply_prompt_edit and halted the stage). `RewardSculptor/sculptor/cli.py`
+  `eval run --eureka-k` (default 4) → `CampaignConfig.eureka_k`; campaign
+  uses 3 per the frozen plan (generations remain `--iterations`).
+  `/tmp/rs_campaign_env.sh` += `SCULPTOR_REMOTE_ROLLOUT=1` (user: keep the
+  local 5070 free; pod does train AND rollout). Regression test
+  `test_scalar_probe_wraps_module_crash_as_validation_error` in
+  tests/test_grounding_hardening.py.
+- **Why**: E4 mission smoke halted `balance_and_center__r1_1` with
+  `v1_materialization_errored: apply_prompt_edit failed: ValueError: only
+  one element tensors can be converted to Python scalars` — an LLM-fixable
+  module bug (float() on a multi-element tensor inside compute_reward)
+  leaked as a non-retryable raw exception. Same wrap the batched probe
+  already had. Mission job still scored green (spec=1.0 @ iter 1,
+  error=null, 785 s) because the halt hit a refinement stage after success.
+- **Verified**: sculptor gate 546 passed / 1 skipped. Pod GPU confirmed
+  training (61 % util / 771 MiB GPU 0, two consecutive samples); idle
+  samples = LLM phases. Eureka smoke job dispatching gen_0 candidates
+  remotely at commit time.
+
 ### 2026-06-11 — Ship 31b: campaign-pod bring-up — smoke found 3 launch-blocking bugs, all fixed
 
 **Hardware**: Sam rented ONE pod with 3× RTX PRO 6000 Blackwell Server

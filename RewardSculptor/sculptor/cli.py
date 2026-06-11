@@ -144,6 +144,11 @@ def eval_run(
         0.5, "--spec-threshold",
         help="spec_score threshold for iterations-to-criterion.",
     ),
+    eureka_k: int = typer.Option(
+        4, "--eureka-k",
+        help="Eureka condition: candidates per generation "
+             "(generations = --iterations).",
+    ),
     name: Optional[str] = typer.Option(
         None, "--name", help="Campaign name (default: out dir name)."),
     require_remote: bool = typer.Option(
@@ -189,6 +194,7 @@ def eval_run(
         steps_per_iter=steps_per_iter,
         rollout_episodes=rollout_episodes,
         spec_threshold=spec_threshold,
+        eureka_k=eureka_k,
     )
     report = run_campaign(cfg)
     typer.echo(f"report: {Path(out) / 'campaign_report.json'}")

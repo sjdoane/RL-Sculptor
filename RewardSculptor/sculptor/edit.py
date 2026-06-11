@@ -236,7 +236,22 @@ def _build_dummy_inputs(contract) -> tuple[Any, Any, Any, dict]:
 
 def _call_compute_reward(mod, contract) -> tuple[float, dict]:
     s, a, ns, info = _build_dummy_inputs(contract)
-    out = mod.compute_reward(s, a, ns, info)
+    try:
+        out = mod.compute_reward(s, a, ns, info)
+    except Exception as e:  # noqa: BLE001 — module bug → retryable
+        # §Ship 31b follow-up: a crash INSIDE the generated module is a
+        # module-quality failure the LLM can fix on retry — it must
+        # surface as EditValidationError, not leak raw (observed live:
+        # E4 smoke, `float()` on a multi-element tensor inside
+        # compute_reward raised ValueError, skipped the retry loop, and
+        # halted the whole mission stage).
+        raise EditValidationError(
+            f"compute_reward crashed on dummy inputs: "
+            f"{type(e).__name__}: {e}. Note state/next_state values are "
+            f"shape-(1, …) torch tensors for batched contracts — use "
+            f"`.item()` only on single-element tensors, index before "
+            f"converting, and guard div/log/sqrt on zeros."
+        ) from e
     if not isinstance(out, tuple) or len(out) != 2:
         raise EditValidationError(
             f"compute_reward must return (reward, components) tuple; got {type(out).__name__}")

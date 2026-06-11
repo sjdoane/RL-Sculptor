@@ -164,6 +164,23 @@ def test_batched_validation_catches_bool_arithmetic() -> None:
         _call_compute_reward_batched(mod, _batched_contract())
 
 
+def test_scalar_probe_wraps_module_crash_as_validation_error() -> None:
+    """The second E4-smoke halt: the LLM module crashed INSIDE
+    compute_reward (`float()` on a multi-element tensor) and the raw
+    ValueError skipped the EditValidationError-only retry loop, halting
+    the stage. Module crashes must surface as EditValidationError."""
+    from types import SimpleNamespace
+
+    from sculptor.edit import EditValidationError, _call_compute_reward
+
+    def crashing_scalar(state, action, next_state, info):
+        return float(state["qpos"]), {"c": 0.0}  # (1,2) tensor → ValueError
+
+    mod = SimpleNamespace(compute_reward=crashing_scalar)
+    with pytest.raises(EditValidationError, match="crashed on dummy inputs"):
+        _call_compute_reward(mod, _batched_contract())
+
+
 def test_batched_validation_passes_correct_module() -> None:
     from types import SimpleNamespace
 
