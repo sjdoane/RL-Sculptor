@@ -339,6 +339,78 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-11 — Ship 28: E3 Eureka-style baseline (+ the Isaac Sim decision)
+
+**Isaac Sim: deliberately deferred.** The central claim is about
+reward-engineering methodology, not simulator breadth; mjlab already
+implements the Isaac-Lab-style manager API on MuJoCo-Warp; an Omniverse
+integration is weeks of runtime/licensing work adding zero statistical
+power to E4. Revisit AFTER the central result, via the existing
+IsaacLabAdapter stub. Other RL developments: Eureka is the one that
+matters for credibility (this ship); DrEureka-style DR and evolutionary
+reward search become cheap future conditions because the harness treats
+conditions as plugins.
+
+- **What**: NEW `sculptor/eval/eureka.py` + `prompts/eureka_baseline.md`
+  + harness condition `eureka`. Faithful-enough Ma et al. 2023: per
+  generation sample K reward candidates from Claude at temperature 1.0,
+  static-gate (`compute_reward_batched` presence — the probe only
+  exercises the scalar path) + zero-tensor probe with ONE resample then
+  honest zero, train each on the SAME job seed, fitness = spec metric,
+  per-gen best mirrored into `runs/iter_<g>` for the standard series
+  machinery, best-ACROSS-generations reflection (prior best source +
+  spec components + per-component training SERIES in the Appendix-F
+  shape the sculptor's own edit feedback uses). Full audit trail in
+  `eureka_log.json` (per-attempt records incl. api/static/probe errors;
+  sources stay on disk, never in the log), flushed after EVERY
+  generation. SEVEN documented deltas in the module docstring (LLM held
+  constant; spec metric as Eureka's task fitness F — selection access
+  the sculptor conditions never get, conservative toward our
+  hypothesis; state schema instead of env source; sampling protocol;
+  validation rigor; matched deliberation budget — adaptive thinking +
+  edit's 16K max_tokens, a strengthening deviation; reflection-target
+  protocol).
+- **Methodology audit applied (review agent vs the actual paper)**:
+  - C1 (CRITICAL, would have strawmanned the baseline): Eureka's
+    DEFINED output is the best reward across generations (Algorithm 1)
+    — the harness scored last-generation. Eureka jobs now score
+    `final = best` with an explicit `final_rule:
+    best_across_generations` field (sculpt conditions stay
+    `last_iteration` — they cannot select on the spec). Regression
+    test: regressing gen 1 must not drag the headline.
+  - H1: reflection carried only component MEANS (saturation
+    undetectable; the sculptor's edit gets the series) — now the
+    downsampled series + max/mean/min.
+  - H2: an LLM API exception mid-job crashed the job, never wrote the
+    log, and zeroed `total_rl_iterations` for generations that HAD
+    trained. API failures are now invalid candidates with recorded
+    errors; the log flushes per generation; the harness recovers the
+    GPU bill from the log (or trained-checkpoint dirs) when a job
+    still dies.
+  - H3: inference-config asymmetry (pipeline uses adaptive thinking,
+    baseline didn't) — matched + documented.
+  - M3: a generation whose candidates all fail leaves a series hole;
+    iterations-to-threshold now uses the REAL iter index.
+  - M5 static gate; L1 per-attempt audit records; L2 fitness-only
+    reflection when champion artifacts are missing; L3 fence parsing
+    (case-insensitive tag, multi-block module join); L4 config
+    validation; L5 stale-train-dir cleanup; L7/L8 doc precision.
+- **Verified**: 15 tests (tests/test_eureka_baseline.py): selection +
+  reflection content (series shape, temperature pin, schema payload),
+  best-overall survives weaker generations, invalid→resample→zero with
+  per-attempt records, api-failure resilience, train-crash accounting,
+  static batched-fn gate, no-source-in-log pin, harness integration
+  (final_rule, GPU bill from trained count, crash recovery of the
+  bill, all-invalid-generation indexing). Sculptor gate 531 passed/1
+  skipped; backend/frontend untouched.
+- **Not yet run live** (pod stopped): the Eureka condition's smoke is
+  part of campaign prep — budget note: defaults (K=4, generations=2)
+  train 8 runs/job vs sculpt's 2; the paper used K=16, N=5 (state as a
+  scale delta in any writeup).
+- **E4 remaining before the campaign**: mission-mode (curriculum)
+  condition; optional human-reward baseline awaits Sam's authored
+  rewards.
+
 ### 2026-06-10/11 — Ship 27: E2 eval harness (`sculpt eval`) — proving campaign PASSED on the pod
 
 The statistical machinery for every Phase-3 claim, proven live.

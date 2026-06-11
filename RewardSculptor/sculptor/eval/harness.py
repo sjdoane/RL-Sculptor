@@ -128,6 +128,13 @@ CONDITIONS: dict[str, EvalCondition] = {
             use_seed_reward=True, compute_matched=True,
             notes="ablation: v0 starter at the sculpt jobs' TOTAL GPU budget",
         ),
+        EvalCondition(
+            name="eureka", mode="eureka",
+            notes="E3 baseline: K LLM reward candidates per generation, "
+                  "select by spec fitness, reward reflection — no KG, no "
+                  "diagnosis, no curriculum (see eval/eureka.py deltas; "
+                  "trains generations x K runs)",
+        ),
     )
 }
 
@@ -146,6 +153,9 @@ class CampaignConfig:
     rollout_episodes: int = 4
     #: spec_score threshold for iterations-to-criterion.
     spec_threshold: float = 0.5
+    #: Eureka condition: candidates per generation (generations =
+    #: `iterations`, so a eureka job trains iterations × eureka_k runs).
+    eureka_k: int = 4
     #: test seam — overrides the adapter class in scaffolded configs.
     adapter_class_override: Optional[str] = None
 
@@ -161,6 +171,10 @@ class CampaignConfig:
             raise ValueError("campaign needs at least one seed")
         if len(set(self.seeds)) != len(self.seeds):
             raise ValueError("duplicate seeds — pairing requires distinct seeds")
+        if self.iterations < 1:
+            raise ValueError("iterations must be >= 1")
+        if self.eureka_k < 1:
+            raise ValueError("eureka_k must be >= 1")
 
 
 def _emit(payload: dict[str, Any]) -> None:
@@ -247,6 +261,7 @@ def _run_job(
     config_path = _scaffold_job_project(cfg, bench, seed, job_dir)
     t0 = time.monotonic()
     error: Optional[str] = None
+    eureka_summary: Optional[dict[str, Any]] = None
     try:
         if condition.mode == "train_only":
             from sculptor.adapters.base import load_adapter
@@ -285,6 +300,20 @@ def _run_job(
                 rollout_episodes=cfg.rollout_episodes,
                 seed=seed,
             )
+        elif condition.mode == "eureka":
+            from sculptor.eval.eureka import run_eureka_job
+
+            eureka_summary = run_eureka_job(
+                config_path=config_path,
+                job_dir=job_dir,
+                behavior_goal=bench.behavior_goal,
+                spec_metric=bench.spec_metric,
+                generations=cfg.iterations,
+                k=cfg.eureka_k,
+                steps_per_iter=cfg.steps_per_iter,
+                rollout_episodes=cfg.rollout_episodes,
+                seed=seed,
+            )
         else:  # pragma: no cover — guarded by validate()
             raise ValueError(f"unknown condition mode {condition.mode!r}")
     except Exception as e:  # noqa: BLE001 — honest zero, campaign continues
@@ -294,10 +323,21 @@ def _run_job(
     wall = time.monotonic() - t0
     series = _spec_series(cfg, bench, job_dir)
     scores = [s.get("spec_score", 0.0) for s in series]
-    final = scores[-1] if scores else 0.0
     best = max(scores) if scores else 0.0
+    if condition.mode == "eureka":
+        # Eureka's DEFINED output (Ma et al. Algorithm 1) is the best
+        # reward across all generations — scoring its last generation
+        # would strawman the baseline. Sculpt conditions are scored on
+        # their last reward because they cannot select on the spec.
+        final = best
+    else:
+        final = scores[-1] if scores else 0.0
+    # Threshold accounting uses the REAL iter index (a generation whose
+    # candidates all failed leaves a hole in the series; enumerate
+    # position would silently shift everything after it).
     iters_to = next(
-        (i + 1 for i, s in enumerate(scores) if s >= cfg.spec_threshold),
+        (int(s["iter"]) + 1 for s in series
+         if s.get("spec_score", 0.0) >= cfg.spec_threshold),
         None,
     )
     captures = [s.get("capture") for s in series if s.get("capture")]
@@ -305,6 +345,25 @@ def _run_job(
         total_rl_iters = cfg.steps_per_iter * (
             cfg.iterations if condition.compute_matched else 1
         )
+    elif condition.mode == "eureka":
+        if eureka_summary is not None:
+            trained = eureka_summary.get("candidates_trained", 0)
+        else:
+            # The job crashed before returning a summary — recover the
+            # GPU accounting from the per-generation log flush, else
+            # from trained-candidate dirs on disk. Billing zero for
+            # generations that demonstrably trained would corrupt the
+            # fairness comparison exactly in the failure path.
+            try:
+                _log = json.loads(
+                    (job_dir / "eureka_log.json").read_text(encoding="utf-8")
+                )
+                trained = int(_log.get("candidates_trained", 0))
+            except Exception:  # noqa: BLE001
+                trained = len(list(
+                    (job_dir / "eureka").glob("gen_*/cand_*/train/checkpoint.pt")
+                ))
+        total_rl_iters = cfg.steps_per_iter * trained
     else:
         total_rl_iters = cfg.steps_per_iter * len(series)
     result: dict[str, Any] = {
@@ -312,6 +371,14 @@ def _run_job(
         "condition": condition.name,
         "seed": seed,
         "final_spec_score": float(final),
+        # Each condition is scored by its method's DEFINED output:
+        # eureka selects on fitness (Algorithm 1 returns the best
+        # across generations); sculpt conditions cannot select on the
+        # spec and are scored on their last reward.
+        "final_rule": (
+            "best_across_generations" if condition.mode == "eureka"
+            else "last_iteration"
+        ),
         "best_spec_score": float(best),
         "iters_to_threshold": iters_to,
         "spec_threshold": cfg.spec_threshold,
@@ -321,6 +388,7 @@ def _run_job(
         "wall_seconds": round(wall, 1),
         "spec_series": series,
         "capture": captures[-1] if captures else None,
+        "eureka": eureka_summary,
         "error": error,
     }
     from sculptor.run_context import write_json_atomic

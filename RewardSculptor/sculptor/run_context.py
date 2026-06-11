@@ -54,6 +54,7 @@ _LLM_MODULES = (
     ("kg_extract", "sculptor.kg.extract", "MODEL_ID"),
     ("kg_research", "sculptor.kg.research", "_MODEL"),
     ("mjcf_editor", "sculptor.adapters.mjcf_editor", "_MODEL_ID"),
+    ("eureka_baseline", "sculptor.eval.eureka", "MODEL_ID"),
 )
 
 
@@ -143,7 +144,10 @@ def _llm_specs() -> dict[str, Any]:
             mod = importlib.import_module(module_name)
             out[key] = {
                 "model_id": str(getattr(mod, attr)),
-                "temperature": "sdk_default",
+                # Modules that set an explicit sampling temperature
+                # declare a TEMPERATURE attr (eureka uses 1.0); the
+                # pipeline modules use the SDK default.
+                "temperature": str(getattr(mod, "TEMPERATURE", "sdk_default")),
             }
         except Exception as e:  # noqa: BLE001 — optional deps may be absent
             out[key] = {"error": f"{type(e).__name__}: {e}"}
@@ -228,7 +232,10 @@ def capture_run_context(
         "llm": _llm_specs(),
         "seeds": {
             "base_seed": base_seed,
-            "train": "base_seed + iter_index (sculpt.py iteration loop)",
+            "train": (
+                "base_seed + iter_index (sculpt.py iteration loop); "
+                "constant job seed across candidates (eval eureka mode)"
+            ),
             "rollout": "no explicit seed — deterministic given checkpoint",
             "decompose": "LLM sampling only (model_id + prompt hash above)",
         },
