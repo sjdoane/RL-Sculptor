@@ -1309,7 +1309,40 @@ def sculpt_run(
         "no_kg": bool(no_kg),
         "dry_run": bool(dry_run),
         "behavior_goal": behavior_goal,
+        # §Ship 24 (R1): seed surfaced at run start so any result can
+        # be tied back to its seed plan from the event stream alone.
+        "base_seed": int(base_seed),
     })
+
+    # §Ship 24 (R1): reproducibility snapshot — code/project git SHAs,
+    # config (raw sha256 + effective post-override dict), prompt
+    # hashes, LLM model ids, package versions, seed plan. Written to
+    # reports/run_context.json; failures are observable, never fatal.
+    try:
+        from sculptor.run_context import capture_run_context, write_run_context
+
+        _rc = capture_run_context(
+            project, config_path,
+            parsed_config=cfg,
+            behavior_goal=behavior_goal,
+            base_seed=int(base_seed),
+            iterations=int(iterations),
+            start_iter=int(start_iter),
+        )
+        _rc_path = write_run_context(paths["reports"], _rc)
+        _emit_event({
+            "type": "run_context_captured",
+            "path": str(_rc_path),
+            "code_sha": (_rc.get("code_git") or {}).get("sha"),
+            "code_dirty": (_rc.get("code_git") or {}).get("dirty"),
+            "config_sha256": (_rc.get("config") or {}).get("sha256"),
+            "base_seed": int(base_seed),
+        })
+    except Exception as _rc_err:  # noqa: BLE001 — capture must not kill a run
+        _emit_event({
+            "type": "run_context_capture_failed",
+            "error": f"{type(_rc_err).__name__}: {_rc_err}",
+        })
 
     # §Ship 15: `init_ckpt` normalized at function entry. Applies ONLY
     # to the FIRST iter of this run (iter == start_iter). Subsequent
@@ -1981,12 +2014,33 @@ def mission_run(
             "n_stages": len(mission.stages),
         })
 
+        # §Ship 24 (R1): mission-level provenance.json — one context
+        # per resume (code may differ between resumes) + one record
+        # per executed stage, appended below. Never fatal.
+        try:
+            from sculptor.run_context import init_mission_provenance
+
+            init_mission_provenance(
+                mission_dir,
+                goal=mission.goal,
+                n_stages=len(mission.stages),
+                seed=seed,
+                extra={"adapter_short_name": adapter_short_name},
+            )
+        except Exception as _prov_err:  # noqa: BLE001
+            _emit({
+                "type": "run_context_capture_failed",
+                "scope": "mission",
+                "error": f"{type(_prov_err).__name__}: {_prov_err}",
+            })
+
         # §Ship 17: refactored from for-loop to while-loop indexed by
         # `mission.current_stage_idx` so mid-iteration splices (sub-
         # stage redecomposition replacing the failed stage in place)
         # are safe. The for-loop's iterator would have cached the old
         # list state and skipped past the inserted sub-stages.
         all_succeeded = True
+        _prov_record_warned = False  # §Ship 24: once-per-mission warning
         while mission.current_stage_idx < len(mission.stages):
             stage_idx = mission.current_stage_idx
             stage = mission.stages[stage_idx]
@@ -2035,6 +2089,34 @@ def mission_run(
             # Persist mission.json AFTER every stage transition so
             # resume sees the latest state.
             _atomic_save_mission(mission, mission_dir)
+
+            # §Ship 24 (R1): per-stage provenance record (never fatal,
+            # but observable — warn ONCE per mission if records are
+            # silently failing, e.g. a corrupted provenance.json).
+            try:
+                from sculptor.run_context import record_stage_in_provenance
+
+                _rec_ok = record_stage_in_provenance(mission_dir, {
+                    "stage_name": stage_res.stage_name,
+                    "stage_idx": int(stage_idx),
+                    "status": stage_res.status,
+                    "iterations_used": stage_res.iterations_used,
+                    "criterion_satisfied": stage_res.criterion_satisfied,
+                    "last_iter_metric": stage_res.last_iter_metric,
+                    "failure_reason": getattr(stage_res, "failure_reason", None),
+                    "final_policy_path": str(stage_res.final_policy_path or ""),
+                    "final_reward_path": str(stage_res.final_reward_path or ""),
+                })
+                if _rec_ok is None and not _prov_record_warned:
+                    _prov_record_warned = True
+                    _emit({
+                        "type": "run_context_capture_failed",
+                        "scope": "mission_stage_record",
+                        "error": "provenance.json unreadable — stage "
+                                 "records are not being persisted",
+                    })
+            except Exception:  # noqa: BLE001
+                pass
 
             if stage_res.status == "succeeded":
                 mission.current_stage_idx += 1

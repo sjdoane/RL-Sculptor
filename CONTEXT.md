@@ -339,6 +339,63 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-10 — Ship 24: R1 reproducibility foundation (run_context.json + mission provenance)
+
+First Phase-2 ship of the approved research-grade plan. Every result can
+now be tied to exactly what produced it — prerequisite for every
+statistical claim in Phase 3.
+
+- **What**:
+  - NEW `RewardSculptor/sculptor/run_context.py`:
+    `capture_run_context()` collects code git SHA/branch/dirty (repo
+    found from the sculptor package itself, guarded by
+    `git ls-files --error-unmatch` so a pip-install inside an adopter's
+    repo degrades to `available:false` instead of reporting the WRONG
+    sha), project git, python/platform, versions of the tracked package
+    stack (incl. `reward-sculptor` itself), sha256 of every prompt .md
+    (honors `SCULPTOR_PROMPTS_DIR` — a tuned prompt set is a different
+    experiment), LLM model ids per pipeline module (all
+    `claude-opus-4-7`, temperature `sdk_default` — never set anywhere),
+    the seed plan (base_seed; train = base+iter; rollout currently
+    unseeded — runner has no `--seed` on rollout, deferred to E2 where
+    deterministic eval is consumed; decompose = LLM sampling only),
+    behavior-affecting env (NAMES of SCULPTOR_* vars + remote host,
+    never values/keys — test-pinned), argv, and the config as BOTH raw
+    sha256 and the effective post-CLI-override dict. `dirty` is
+    tri-state (None when `git status` itself failed — an unknown state
+    is never recorded as "clean").
+  - `sculpt_run` (sculpt.py): `run_started` gains `base_seed`; after it,
+    writes `reports/run_context.json` + emits `run_context_captured`
+    {path, code_sha, code_dirty, config_sha256, base_seed} — or
+    `run_context_capture_failed`; capture can never kill a run (imports
+    inside try). DISTINCT from `reports/provenance.json` (citation
+    provenance, untouched, shape-asserted in tests).
+  - `mission_run` (sculpt.py): mission-level `provenance.json` in the
+    mission dir — one capture context per resume (code may differ
+    between resumes; `contexts` appends, stage records survive), plus
+    one record per executed stage {name, idx, status, iterations_used,
+    criterion_satisfied, last_iter_metric, failure_reason, final paths}
+    appended right after `_atomic_save_mission` (under the mission
+    FileLock — no concurrent writer). Silent record failures warn ONCE
+    per mission via `run_context_capture_failed`.
+- **Verified**: 16 new tests (tests/test_run_context.py): capture shape,
+  determinism modulo `VOLATILE_KEYS` (captured_at only), config sha =
+  file sha, prompt-hash stability + SCULPTOR_PROMPTS_DIR override,
+  model-id specs, NO-secrets pin (key paths + API keys absent from the
+  serialized blob), atomic write (no .tmp leftovers, 0644), TOML
+  datetime via default=str, non-repo degradation, mission provenance
+  init/resume/append/corrupt-recovery, and a dry-run sculpt_run
+  integration asserting reports/run_context.json + both events with the
+  CLI seed threaded through. Review-agent audit applied (M1 wrong-repo
+  guard + dist version, M2 tri-state dirty, L1 observable stage-record
+  failures, L2 0644, L5 the reviewer's own suggested assert was wrong —
+  dry-run DOES write citation provenance; replaced with a shape-
+  separation assert). Sculptor gate 449 passed/1 skipped; backend
+  re-run green; frontend untouched.
+- **Notes for Phase 3**: per-stage seeds land in each stage's own
+  reports/run_context.json (stages run sculpt_run); rollout seeding is
+  an E2 work item (runner `--seed` exists only for train).
+
 ### 2026-06-10 — Ship 23f: full LLM pipeline through the pod + the aux-dirs fix it forced
 
 Ran the complete sculpt loop (the thing missions are made of) against
