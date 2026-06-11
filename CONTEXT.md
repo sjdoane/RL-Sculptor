@@ -339,6 +339,28 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-11 21:25 — Ship 32: E4 CAMPAIGN LAUNCHED (140 jobs, 3 shards, all-remote)
+
+- **What**: smoke completed GREEN (mission spec=1.0/785 s, eureka
+  spec=1.0/1492 s, errors null, `parity_warnings: []`) → launched the
+  three campaign shards detached (single-string `Start-Process wsl`):
+  A=`g1_floss`@cuda:0, B=`g1_kick`@cuda:1, C=`go1_trot`+`cartpole_balance`
+  @cuda:2; each `-c plain_ppo -c plain_ppo_matched -c seed_only_matched
+  -c full -c mission -c mission_no_kg -c eureka --seeds 5 --iterations 4
+  --steps-per-iter 600 --eureka-k 3 --name e4-campaign --require-remote
+  --out /home/samjd/rs_campaign`, logs `/tmp/rs_campaign_shard{A,B,C}.log`.
+  35+35+70=140 jobs, paired seeds 1000–1068, ~29 h expected.
+- **Verified at launch**: all 3 logs echo `training target: REMOTE …
+  (device=cuda:0/1/2)`; `eval_campaign_started` job counts correct; pod
+  GPUs 0/1/2 simultaneously at 86–88 % util (~3 GB each); local 5070
+  carries ONLY Windows desktop processes (no python/WSL) — rollouts are
+  remote this run (`SCULPTOR_REMOTE_ROLLOUT=1`). Zero errors at +5 min.
+- **Monitoring**: session cron `d0b7d190` every 2 h — health check, dead-
+  shard relaunch (same cmd, jobs resume via result.json), final merge via
+  `sculpt eval report /home/samjd/rs_campaign` when all three finish.
+  Cron is session-only: if this Claude session ends, shards keep running;
+  re-arm monitoring in the new session.
+
 ### 2026-06-11 — Ship 31c: smoke bug #4 (scalar-probe crash leak) + --eureka-k + rollouts remote
 
 - **What**: `RewardSculptor/sculptor/edit.py` `_call_compute_reward` — the
