@@ -339,6 +339,57 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-11 — Ship 30: KG research & expansion (pre-campaign)
+
+The mission condition's advantage rests on the KG — it goes into the
+campaign curated, not stale. Shared DB at
+`~/.local/share/sculptor/kg/graph.db` (backup taken first:
+`graph.db.pre-ship30.bak`).
+
+- **Cleaned**: 7 junk papers deleted (STEM-AP disparities, fairness
+  repr., content moderation, Persian text correction, educational
+  feedback, image compositing, wireless-channel math — artifacts of
+  old research runs that polluted semantic search) + 254 orphaned
+  satellite nodes (93 Techniques, 60 FailureModes, 93 RewardComponents,
+  8 Environments with zero edges) and their embeddings swept via
+  direct SQL (store has delete_node but no orphan sweep — candidate
+  future `kg gc` command).
+- **Researched**: `sculptor.kg.research.research_topic` over six
+  campaign-aligned topics (periodic/rhythmic reward, LLM reward
+  design, reward hacking, expressive humanoid motion, kicking/ball
+  skills, curriculum) deduped against the KG + arXiv-verified; results
+  human-vetted for APPLICABILITY (8 off-target hits dropped, e.g.
+  WildfireGPT, LLM-tampering alignment theory). Merged with a curated
+  gap list (IDs verified via web).
+- **Added 21 papers** (full list with rationales in the COMMITTED
+  `RewardSculptor/kg_seeds_campaign.yml` — that file is the R1
+  provenance of the campaign-era KG delta): the periodic-reward-
+  composition line (Siekmann 2011.01387 — the floss benchmark's home
+  turf; Cassie iterative design; versatile bipedal), the LLM-reward
+  line (Eureka, L2R, Text2Reward, DrEureka, Kwon LM-rewards, RL-VLM-F,
+  Code-as-Reward), reward hacking (Skalse definitional, Pan
+  misspecification, correlated proxies), expressive humanoid (H2O,
+  SuperPADL, HumanPlus), kicking/ball (DeepMind humanoid football,
+  DribbleBot), quadruped gait (Miki wild-ANYmal reward suite),
+  curriculum (Narvekar survey, ETG). All 21 ingested (metadata + PDFs)
+  and LLM-extracted with ZERO errors.
+- **Final state**: 94 papers (80 − 7 + 21), 1452 nodes (493 Techniques,
+  325 FailureModes, 283 RewardComponents, 257 Environments), 1476
+  edges, 493 technique embeddings (backfilled lazily on first
+  `query_semantic` — note: `kg stats` embedding counts lag until a
+  query runs), `heal-stubs` clean.
+- **Verified by the gate that matters** — diagnose-style
+  `query_semantic` probes return the NEW literature with real cosine
+  scores: "policy exploits the reward metric" → Eureka
+  reward_reflection (0.59) + Kwon zero-shot reward; "oscillates hips
+  rhythmically, no consistent period" → CPG + periodic keypoint /
+  gait-cycle techniques; "kick with one leg while balancing" →
+  symmetrical-gait + Raibert footswing terms. (Gotcha for future
+  probes: `query_techniques` takes a failure-mode LIST for graph-edge
+  ranking — free-text goes to `query_semantic`.)
+- **Cost**: ~6 research calls + 21 extraction calls ≈ $8–12 LLM, no
+  GPU. Campaign-ready.
+
 ### 2026-06-11 — Ship 29: E4 mission-mode (curriculum) condition — the condition matrix is complete
 
 - **What**: harness mode "mission" + conditions `mission` (the FULL
