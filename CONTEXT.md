@@ -339,6 +339,62 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-11 — Ship 31: pre-campaign grounding audit + hardening (campaign frozen)
+
+Sam's directive: everything in its best state, hallucinations minimized
+with accurate techniques, before the spend. Audited the actual
+hallucination surfaces of this system (LLM citing fake papers; weak
+semantic matches polluting prompts; KG nodes not reflecting real
+papers; mis-grounded failure-mode lookups) — found three real defects,
+fixed all three.
+
+- **F1 — unfloored semantic slices (diagnose + decompose)**: edit.py
+  adopted a 0.35 cosine floor in Ship 8 (Issue G: below that, matches
+  are tangential and Claude dutifully cites them) but diagnose:606 and
+  decompose:164 never did — tangential techniques were feeding the
+  grounded-diagnosis and decomposition prompts. Now all three share
+  `kg.query.DEFAULT_MIN_PROMPT_SIMILARITY = 0.35` (source-pinned by
+  test so a regression reopening Issue G fails loudly).
+- **F2 — hallucinated citations verified too late**: diagnose's
+  proposed_edits paper_refs were copied through unverified; a
+  fabricated arxiv_id hard-failed EDIT's KG gate later, burning the
+  retry/iteration on a reference the model invented. Diagnose now
+  verifies every ref against the KG right after the grounded parse, DROPS
+  unknown ids (the edit degrades to novel/uncited) and emits an
+  observable `kg_citation_dropped` event. Edit's hard gate remains as
+  the second line.
+- **F3 — arbitrary failure-mode grounding (the worst one)**:
+  `_resolve_failure_modes`' fallback accepted the FIRST node matching
+  ANY single token — with 325 FailureModes, "reward_saturation" could
+  silently resolve to whatever node mentioned "reward" first in
+  arbitrary store order, mis-grounding query_techniques' edge
+  traversal entirely. Now: exact slug → full-phrase → scored token
+  fallback REQUIRING a token majority, ranked (phrase > token count >
+  tightest name) with deterministic alphabetical tie-break.
+- **Extraction fidelity spot-checked** on the Ship-30 papers: Siekmann
+  → von_mises_phase_indicators / clock_input_conditioning /
+  periodic_reward_composition; Eureka → evolutionary_reward_search /
+  reward_reflection / environment_as_context; Skalse →
+  hackability_definition. The extractor reads real PDF text and the
+  nodes reflect the papers' actual contributions.
+- **Campaign frozen**: `docs/campaign_plan.md` — full matrix
+  (4 benchmarks × 7 conditions × 5 paired seeds, iterations=4,
+  steps_per_iter=600, eureka 3×3 with the K=16×5 paper-scale delta
+  noted), measured-numbers budget (~86 pod-hours ≈ $60 GPU on 3×5090
+  ≈ 1.2 days wall + $50–90 LLM), shard commands + merge via `sculpt
+  eval report`, and the go/no-go checklist (provision ×3 → doctor ×3 →
+  ~$3 mission+eureka cartpole smoke → parity check → launch).
+- **Verified**: 8 new tests (tests/test_grounding_hardening.py):
+  resolver slug/phrase/majority/determinism, floor constant parity
+  with edit + source-pin of both call sites + functional floor filter,
+  and an end-to-end diagnose run (stub client, real KG store, real
+  config→stub adapter) asserting the fabricated ref is dropped, the
+  real one kept, and the event emitted. Gates: sculptor 541 passed/1
+  skipped, backend 323 passed, frontend untouched. Gotchas: KG schema
+  nodes require explicit `id` (use make_*_id); diagnose requires a
+  real config path (needs adapter.reward_contract()); ProposedEdit
+  operation is a Literal enum.
+
 ### 2026-06-11 — Ship 30: KG research & expansion (pre-campaign)
 
 The mission condition's advantage rests on the KG — it goes into the

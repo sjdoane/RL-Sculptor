@@ -42,6 +42,14 @@ from sculptor.kg.store import SculptorKG
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 
+#: Default cosine floor for PROMPT-FEEDING semantic queries (§Ship 31).
+#: Below ~0.35 the match is tangential and Claude dutifully cites it
+#: anyway (CONTEXT 2026-04-22 Issue G). edit.py adopted this in Ship 8;
+#: diagnose/decompose now share the same constant — an unfloored
+#: query_semantic is for exploration tools only, never for prompts.
+DEFAULT_MIN_PROMPT_SIMILARITY = 0.35
+
+
 # ── Result shape ────────────────────────────────────────────────────────────
 @dataclass
 class TechniqueMatch:
@@ -84,9 +92,21 @@ def cite(arxiv_id: str, *, store: SculptorKG | None = None) -> str:
 def _resolve_failure_modes(
     store: SculptorKG, names: list[str]
 ) -> dict[str, FailureMode]:
-    """Map the caller's strings onto FailureMode nodes (slug-first, then
-    substring in name/description) so we're tolerant to synonyms."""
+    """Map the caller's strings onto FailureMode nodes: exact slug,
+    then full-phrase containment, then a SCORED token fallback.
+
+    §Ship 31 grounding fix: the old fallback accepted the FIRST node
+    matching ANY single token — with 325 FailureModes,
+    "reward_saturation" resolved to an effectively arbitrary node
+    containing the word "reward", silently mis-grounding
+    query_techniques. Now: candidates are ranked by matched-token
+    count (full-phrase hits rank above all token hits), a token
+    fallback requires a MAJORITY of the target's tokens, and ties
+    break deterministically by (name length, name) — tightest match
+    wins, ordering is stable across runs.
+    """
     all_fm: list[FailureMode] = store.find_nodes(kind=FailureMode.kind)  # type: ignore[assignment]
+    all_fm = sorted(all_fm, key=lambda f: ((f.name or ""), f.id))
     out: dict[str, FailureMode] = {}
     for raw in names:
         slug_id = make_failure_mode_id(raw)
@@ -95,12 +115,25 @@ def _resolve_failure_modes(
             out[raw] = hit
             continue
         target = raw.lower().replace("_", " ").replace("-", " ").strip()
+        tokens = [t for t in target.split() if t]
+        if not tokens:
+            continue
+        need = max(1, (len(tokens) + 1) // 2)   # majority of tokens
         best: Optional[FailureMode] = None
+        best_key: tuple = ()
         for fm in all_fm:
             hay = f"{fm.name} {fm.description}".lower()
-            if target in hay or any(tok and tok in hay for tok in target.split()):
-                best = fm
-                break
+            phrase = target in hay
+            n_tok = sum(1 for t in tokens if t in hay)
+            if not phrase and n_tok < need:
+                continue
+            # Rank: phrase match beats token matches; more tokens beat
+            # fewer; shorter (tighter) names beat longer. Remaining
+            # ties go to the alphabetically-first node — all_fm is
+            # name-sorted and `>` is strict, so the first seen wins.
+            key = (1 if phrase else 0, n_tok, -len(fm.name or ""))
+            if best is None or key > best_key:
+                best, best_key = fm, key
         if best is not None:
             out[raw] = best
     return out

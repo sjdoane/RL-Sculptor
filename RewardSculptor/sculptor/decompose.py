@@ -160,8 +160,14 @@ def _render_kg_context(
             [],
         )
     try:
-        from sculptor.kg.query import query_semantic
-        matches = query_semantic(goal, top_k=top_k, store=kg_store)
+        from sculptor.kg.query import (
+            DEFAULT_MIN_PROMPT_SIMILARITY,
+            query_semantic,
+        )
+        # §Ship 31: floored — same Issue-G rationale as diagnose/edit.
+        matches = query_semantic(
+            goal, top_k=top_k, store=kg_store,
+            min_similarity=DEFAULT_MIN_PROMPT_SIMILARITY)
     except Exception as e:  # noqa: BLE001
         print(
             f"[decompose] KG query failed ({type(e).__name__}: {e}) — "

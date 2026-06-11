@@ -603,8 +603,14 @@ def diagnose(
                 fm_keywords, domain_filter=env_tag, top_k=KG_TOP_K, store=store,
             ) if fm_keywords else []
             try:
+                # §Ship 31: floored — an unfloored semantic slice feeds
+                # tangential techniques into the grounded prompt and
+                # Claude dutifully cites them (Issue G).
+                from sculptor.kg.query import DEFAULT_MIN_PROMPT_SIMILARITY
+
                 sem_matches = query_semantic(
-                    behavior_goal, top_k=KG_TOP_K, store=store)
+                    behavior_goal, top_k=KG_TOP_K, store=store,
+                    min_similarity=DEFAULT_MIN_PROMPT_SIMILARITY)
             except Exception as e:  # noqa: BLE001
                 print(f"[diagnose] semantic query failed ({e}) — tag-only context.",
                       file=sys.stderr, flush=True)
@@ -636,6 +642,37 @@ def diagnose(
             client, model_cls=_GroundedModel,
             system_prompt=_GROUNDED_SYSTEM, user_content=grounded_user,
         )
+
+        # §Ship 31 (anti-hallucination): verify citations at the SOURCE.
+        # A fabricated arxiv_id in proposed_edits would otherwise ride
+        # into the edit phase and hard-fail its KG validation gate —
+        # burning a retry (or the iteration) on a reference the model
+        # invented. Unknown ids are DROPPED here (the edit degrades to
+        # novel/uncited), observably via a kg_citation_dropped event.
+        _dropped_refs: dict[str, list[str]] = {}
+        if grounded.proposed_edits:
+            from sculptor.kg.schema import make_paper_id
+
+            for e in grounded.proposed_edits:
+                if not e.paper_refs:
+                    continue
+                keep: list[str] = []
+                missing: list[str] = []
+                for aid in e.paper_refs:
+                    known = (
+                        store is not None
+                        and store.get_node(make_paper_id(str(aid))) is not None
+                    )
+                    (keep if known else missing).append(str(aid))
+                if missing:
+                    _dropped_refs.setdefault(e.target_term, []).extend(missing)
+                    e.paper_refs = keep
+        if _dropped_refs:
+            print("[SCULPT-EVENT] " + json.dumps({
+                "type": "kg_citation_dropped",
+                "dropped": _dropped_refs,
+                "reason": "cited arxiv_id not present in the KG",
+            }, default=str), flush=True)
     finally:
         if owns_store and store is not None:
             store.close()
