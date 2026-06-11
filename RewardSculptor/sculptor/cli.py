@@ -110,6 +110,118 @@ def remote_doctor(
     raise typer.Exit(0 if report["ok"] else 1)
 
 
+# ── Eval sub-app (§Ship 27 / E2) ────────────────────────────────────────────
+eval_app = typer.Typer(
+    name="eval",
+    help="Research-grade evaluation: seeds × conditions × benchmarks.",
+    no_args_is_help=True,
+)
+app.add_typer(eval_app, name="eval")
+
+
+@eval_app.command("run")
+def eval_run(
+    out: Path = typer.Option(..., "--out", help="Campaign output dir."),
+    benchmark: list[str] = typer.Option(
+        ..., "--benchmark", "-b",
+        help="Benchmark name (repeatable). See `sculpt eval list`.",
+    ),
+    condition: list[str] = typer.Option(
+        ..., "--condition", "-c",
+        help="Condition name (repeatable): full | no_kg | plain_ppo | seed_only.",
+    ),
+    seeds: int = typer.Option(
+        3, "--seeds", help="Number of paired seeds (1000, 1017, 1034, ...).",
+    ),
+    iterations: int = typer.Option(
+        2, "--iterations", help="LLM-loop iterations for sculpt-mode conditions.",
+    ),
+    steps_per_iter: int = typer.Option(
+        300, "--steps-per-iter", help="rsl_rl iterations per training run.",
+    ),
+    rollout_episodes: int = typer.Option(4, "--rollout-episodes"),
+    spec_threshold: float = typer.Option(
+        0.5, "--spec-threshold",
+        help="spec_score threshold for iterations-to-criterion.",
+    ),
+    name: Optional[str] = typer.Option(
+        None, "--name", help="Campaign name (default: out dir name)."),
+):
+    """Run an eval campaign. Resumable: completed jobs (result.json on
+    disk) are skipped, so re-running after a crash or pod restart only
+    does the remaining work. Remote dispatch: export SCULPTOR_REMOTE_*
+    (see docs/remote.md) and training routes through the pod
+    automatically."""
+    from sculptor.eval import CampaignConfig, run_campaign
+
+    cfg = CampaignConfig(
+        name=name or Path(out).name,
+        out_dir=Path(out),
+        benchmarks=list(benchmark),
+        conditions=list(condition),
+        seeds=[1000 + 17 * i for i in range(int(seeds))],
+        iterations=iterations,
+        steps_per_iter=steps_per_iter,
+        rollout_episodes=rollout_episodes,
+        spec_threshold=spec_threshold,
+    )
+    report = run_campaign(cfg)
+    typer.echo(f"report: {Path(out) / 'campaign_report.json'}")
+    typer.echo(f"html:   {Path(out) / 'report.html'}")
+    for w in report["aggregates"]["capture_parity_warnings"]:
+        typer.echo(f"WARNING: {w}", err=True)
+
+
+@eval_app.command("report")
+def eval_report(
+    out: Path = typer.Argument(..., help="Campaign dir with job results."),
+):
+    """Re-aggregate an existing campaign dir (e.g. after hand-pruning a
+    job or to regenerate the HTML) without running anything."""
+    import json as _json
+
+    from sculptor.eval import CampaignConfig, run_campaign  # noqa: F401
+    from sculptor.eval.harness import _report_html, aggregate
+    from sculptor.run_context import write_json_atomic
+
+    results = []
+    for rp in sorted(Path(out).glob("*/*/seed_*/result.json")):
+        results.append(_json.loads(rp.read_text(encoding="utf-8")))
+    if not results:
+        typer.echo(f"no result.json files under {out}", err=True)
+        raise typer.Exit(1)
+    report_path = Path(out) / "campaign_report.json"
+    try:
+        prior = _json.loads(report_path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        prior = {"name": Path(out).name, "config": {}}
+    from datetime import datetime, timezone
+
+    prior["created_at"] = datetime.now(timezone.utc).isoformat()
+    prior["aggregates"] = aggregate(results)
+    prior["jobs"] = [
+        {k: v for k, v in r.items() if k != "spec_series"} for r in results
+    ]
+    write_json_atomic(report_path, prior)
+    (Path(out) / "report.html").write_text(
+        _report_html(prior), encoding="utf-8",
+    )
+    typer.echo(f"re-aggregated {len(results)} jobs -> {report_path}")
+
+
+@eval_app.command("list")
+def eval_list():
+    """List benchmarks + conditions."""
+    from sculptor.eval import BENCHMARKS, CONDITIONS
+
+    typer.echo("benchmarks:")
+    for b in BENCHMARKS.values():
+        typer.echo(f"  {b.name:18s} {b.task_id:35s} spec={b.spec_metric}")
+    typer.echo("conditions:")
+    for c in CONDITIONS.values():
+        typer.echo(f"  {c.name:12s} mode={c.mode:11s} {c.notes}")
+
+
 _STORE_OPT = typer.Option(
     None,
     "--store",

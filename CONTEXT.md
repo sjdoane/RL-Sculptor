@@ -339,6 +339,74 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-10/11 — Ship 27: E2 eval harness (`sculpt eval`) — proving campaign PASSED on the pod
+
+The statistical machinery for every Phase-3 claim, proven live.
+
+- **What**:
+  - `sculptor/eval/stats.py`: IQM (middle-50% trimmed mean; n<4 →
+    plain mean) + stratified bootstrap CIs over SEEDS (the replication
+    unit), deterministic rng. rliable-style.
+  - `sculptor/eval/harness.py`: `EvalCondition` (full / no_kg
+    sculpt-mode; plain_ppo / seed_only train_only-mode + `*_matched`
+    equal-GPU variants), `CampaignConfig`, scaffolded per-job
+    mini-projects (config.toml + byte-identical shared v0 starter —
+    nobody gets a better seed reward), sequential `run_campaign` with
+    `[SCULPT-EVENT]` observability, per-job `result.json` as the
+    RESUME KEY (crash/pod-restart → rerun skips finished jobs; sculpt
+    jobs resume per-iter), failures recorded as HONEST ZEROS with the
+    error (dropping failures inflates aggregates), spec metric
+    computed on EVERY iteration's rollout (iterations-to-threshold),
+    capture-parity audit across conditions (missing capture info is
+    its own warning bucket), `campaign_report.json` + self-contained
+    `report.html` (SVG bars + CI whiskers + paired-diff table) +
+    R1 run-context pinned into the report.
+  - **Compute-fairness finding**: each sculpt-loop iter trains FROM
+    SCRATCH, so a `full` job consumes iterations× the GPU of
+    plain_ppo. Every result records `total_rl_iterations`; `*_matched`
+    conditions scale the baseline's single run to the sculpt jobs'
+    total budget; the report instructs reading comparisons against
+    the budget.
+  - **Paired differences**: `aggregates.pairwise` — per-seed condition
+    diffs (seeds are paired by design) with their own bootstrap CI;
+    comparing two independent CIs for overlap is weaker and
+    over-conservative.
+  - CLI: `sculpt eval run` (repeatable -b/-c, --seeds N → 1000+17i,
+    --iterations/--steps-per-iter/--spec-threshold), `sculpt eval
+    report` (re-aggregate without running), `sculpt eval list`.
+    Remote dispatch needs NO harness plumbing — exporting
+    SCULPTOR_REMOTE_* routes every train through the Ship-23 executor.
+  - Ops gotcha hit while launching: `setsid nohup` inside a transient
+    `wsl bash` heredoc DIES — Windows tears the WSL VM down when the
+    last client exits. Long unattended runs must hold a Windows-side
+    client: `Start-Process -WindowStyle Hidden wsl 'bash -c "…"'`.
+- **Proving gate (the plan's E2 criterion) PASSED**: cartpole_balance ×
+  3 paired seeds × {plain_ppo, full} ran UNATTENDED on the RunPod 5090
+  (training remote, rollouts + LLM local): 6/6 jobs, zero errors, zero
+  parity warnings, ~35 min wall, ~$0.45 pod + ~$1.5 LLM. plain_ppo
+  ≈166 s/job; full (2 LLM iters: remote train → rollout → KG diagnose
+  → edit, ×2) ≈527 s/job. Both conditions saturate the sanity task
+  (spec 1.000, hit threshold at iter 1 — expected; cartpole proves the
+  MACHINERY, not separation). Report verified: IQM/CI per condition,
+  pairwise diff table (full − plain_ppo = +0.000 [0,0] n=3),
+  `run_context.code_git` pinned the exact commit + dirty flag.
+- **Verified**: 13 tests (tests/test_eval_harness.py): stats
+  (IQM trim, deterministic CI, n=1 degenerate), config validation,
+  train_only end-to-end via a dotted-path stub adapter through the
+  REAL load_adapter (v0-vs-intrinsic reward routing asserted),
+  resume-no-retrain, honest-zero failures, sculpt-mode kwarg plumbing
+  (no_kg/seed/iterations/resume), compute-matched step scaling,
+  pairwise paired diffs, parity warnings (real-vs-real and
+  missing-vs-real). Sculptor gate 516 passed/1 skipped; backend green;
+  frontend untouched. Live CLI re-aggregation exercised on the real
+  campaign dir.
+- **Next (E3/E4 readiness)**: conditions full/no_kg/plain_ppo(+matched)/
+  seed_only(+matched) are implemented; the remaining E4 condition
+  (no_curriculum — single-stage direct goal vs mission decomposition)
+  needs mission-mode jobs in the harness; Eureka-style E3 baseline is
+  its own ship. The G1/Go1 benchmarks are where separation is
+  expected — cartpole was chosen to saturate.
+
 ### 2026-06-10 — Ship 26: E1 benchmark suite + hand-authored spec metrics (Phase 3 begins)
 
 The evaluation ground truth: four benchmark tasks, each pairing an NL
