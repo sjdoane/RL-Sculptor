@@ -157,12 +157,17 @@ def generate_objective_metric(
     *,
     robot_hint: Optional[str] = None,
     review: bool = True,
+    on_event=None,
 ) -> dict:
     """Generate + validate + review an objective fitness metric (the only
-    module allowed to import sculptor.eval). Returns the full record."""
+    module allowed to import sculptor.eval). Returns the full record.
+
+    §Ship 40: `on_event` (optional) streams `{stage, attempt, max, message}`
+    progress so the UI can show live generation progress."""
     from sculptor.eval import generate_objective_metric as _gen
 
-    return _gen(behavior_goal, out_dir, robot_hint=robot_hint, review=review)
+    return _gen(behavior_goal, out_dir, robot_hint=robot_hint, review=review,
+                on_event=on_event)
 
 
 def calibrate_objective_metric(

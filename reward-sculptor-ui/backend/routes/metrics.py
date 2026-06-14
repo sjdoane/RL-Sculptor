@@ -73,16 +73,44 @@ async def generate_project_metric(
         return _problem(status.HTTP_503_SERVICE_UNAVAILABLE,
                         "Sculptor unavailable", sculptor_bridge.sculptor_error())
     project_dir = Path(detail.project_dir)
-    rec = await run_in_threadpool(
-        metric_store.generate, project_dir, body.behavior_goal,
-        robot_hint=_robot_hint(project_dir), review=body.review)
-    if body.calibrate_against and rec.get("accepted"):
-        try:
-            rec = await run_in_threadpool(
-                metric_store.calibrate, project_dir, rec["id"], body.calibrate_against)
-        except Exception:  # noqa: BLE001 — calibration failure ≠ generation failure
-            pass
+    # §Ship 40: stream pipeline progress to a sidecar the UI polls (this is a
+    # 1-2 min, multi-LLM-call op — the user should see it advancing).
+    metric_store.write_progress(project_dir, {
+        "active": True, "stage": "starting", "message": "Starting generation…"})
+
+    def _on_event(ev: dict) -> None:
+        metric_store.write_progress(project_dir, {"active": True, **ev})
+
+    try:
+        rec = await run_in_threadpool(
+            metric_store.generate, project_dir, body.behavior_goal,
+            robot_hint=_robot_hint(project_dir), review=body.review,
+            on_event=_on_event)
+        if body.calibrate_against and rec.get("accepted"):
+            try:
+                metric_store.write_progress(project_dir, {
+                    "active": True, "stage": "calibrating",
+                    "message": f"Calibrating vs {body.calibrate_against}…"})
+                rec = await run_in_threadpool(
+                    metric_store.calibrate, project_dir, rec["id"],
+                    body.calibrate_against)
+            except Exception:  # noqa: BLE001 — calibration failure ≠ generation failure
+                pass
+    finally:
+        metric_store.clear_progress(project_dir)
     return rec
+
+
+@router.get("/projects/{slug}/metrics/generate/progress")
+async def metric_generate_progress(
+    slug: str, store: ProjectStore = Depends(get_store),
+):
+    """§Ship 40: current generation progress for the project (polled by the UI
+    while a generate is in flight). `{active: false}` when idle."""
+    detail = store.get(slug)
+    if detail is None:
+        return _problem(status.HTTP_404_NOT_FOUND, "Project not found")
+    return metric_store.read_progress(Path(detail.project_dir))
 
 
 @router.post("/projects/{slug}/metrics/{mid}/calibrate", response_model=MetricSummary)

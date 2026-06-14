@@ -17,7 +17,7 @@ import json
 import re
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from pydantic import BaseModel
 
@@ -96,11 +96,17 @@ def generate_objective_metric(
     model: str = MODEL_ID,
     max_attempts: int = 3,
     review: bool = True,
+    on_event: Optional[Callable[[dict[str, Any]], None]] = None,
 ) -> dict[str, Any]:
     """Generate, validate, (regenerate on failure,) and review an objective
     metric for `behavior_goal`. Writes `metric.py` + `meta.json` to
     `out_dir` and returns the full record. NEVER raises on a bad
-    candidate — a rejected metric is recorded with `accepted=False`."""
+    candidate — a rejected metric is recorded with `accepted=False`.
+
+    §Ship 40: `on_event(ev)` (optional) is called with a `{stage, attempt,
+    max, message}` dict at each pipeline step so the UI can show LIVE progress
+    (this is a 1-2 min, multi-LLM-call op). Never fatal — a raising callback
+    is swallowed."""
     if client is None:
         import anthropic
 
@@ -115,10 +121,22 @@ def generate_objective_metric(
         indent=2, default=str,
     )
 
+    n_attempts = max(1, max_attempts)
     attempts: list[dict[str, Any]] = []
     source = ""
     validation: Optional[dict[str, Any]] = None
-    for attempt in range(max(1, max_attempts)):
+
+    def _emit(ev: dict[str, Any]) -> None:
+        if on_event is not None:
+            try:
+                on_event(ev)
+            except Exception:  # noqa: BLE001 — progress is advisory, never fatal
+                pass
+
+    for attempt in range(n_attempts):
+        _emit({"stage": "generating", "attempt": attempt + 1, "max": n_attempts,
+               "message": f"Generating candidate metric "
+                          f"(attempt {attempt + 1}/{n_attempts})…"})
         user = base_user
         if attempt > 0 and validation is not None:
             user = (
@@ -132,23 +150,42 @@ def generate_objective_metric(
         except Exception as e:  # noqa: BLE001 — API failure = failed attempt
             attempts.append({"attempt": attempt,
                              "api_error": f"{type(e).__name__}: {e}"})
+            if attempt + 1 < n_attempts:  # §Ship 40 review: only if a retry follows
+                _emit({"stage": "retrying", "attempt": attempt + 1,
+                       "max": n_attempts,
+                       "message": f"Generation call failed (attempt "
+                                  f"{attempt + 1}); retrying…"})
             continue
         metric_path.write_text(source, encoding="utf-8")
+        _emit({"stage": "validating", "attempt": attempt + 1, "max": n_attempts,
+               "message": "Validating (safety / determinism / bounds / "
+                          "non-degeneracy)…"})
         validation = validate_generated_metric(source, metric_path)
         attempts.append({"attempt": attempt, "ok": validation["ok"],
                          "reasons": validation["reasons"]})
         if validation["ok"]:
             break
+        if attempt + 1 < n_attempts:
+            _emit({"stage": "regenerating", "attempt": attempt + 1,
+                   "max": n_attempts,
+                   "reasons": (validation.get("reasons") or [])[:2],
+                   "message": f"Attempt {attempt + 1} failed validation — "
+                              f"regenerating with the gate feedback…"})
 
     passed = bool(validation and validation["ok"])
     review_out: Optional[dict[str, Any]] = None
     if passed and review:
+        _emit({"stage": "reviewing", "max": n_attempts,
+               "message": "Passed validation — running independent review…"})
         review_out = _review_metric(
             client, model, behavior_goal, source,
             (validation or {}).get("archetype_scores", {}),
         )
 
     accepted = bool(passed and (review_out is None or review_out.get("approved")))
+    _emit({"stage": "done", "accepted": accepted,
+           "message": ("Metric accepted." if accepted
+                       else "Metric rejected — see reasons.")})
     record = {
         "accepted": accepted,
         "validation_passed": passed,

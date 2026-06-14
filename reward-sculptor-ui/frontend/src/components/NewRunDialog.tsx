@@ -3,7 +3,7 @@ import { toast } from "sonner";
 
 import { Icon } from "@/components/rs/icon";
 import { Btn, Field, Modal, ToggleRow } from "@/components/rs/primitives";
-import { useCalibrateMetric, useGenerateMetric, useProjectMetrics } from "@/hooks/useMetrics";
+import { useCalibrateMetric, useGenerateMetric, useMetricGenProgress, useProjectMetrics } from "@/hooks/useMetrics";
 import { useLaunchRun } from "@/hooks/useRuns";
 import { ApiError } from "@/lib/api";
 import type { ProjectDetail } from "@/lib/types";
@@ -174,6 +174,7 @@ export function NewRunDialog({
   // §Ship 35: per-project generated metrics + the generate action.
   const projectMetrics = useProjectMetrics(slug, open);
   const genMetric = useGenerateMetric(slug);
+  const genProgress = useMetricGenProgress(slug, genMetric.isPending);
   const calibrate = useCalibrateMetric(slug);
   const [calibrateAgainst, setCalibrateAgainst] = useState<string>("go1_trot");
   const genMetrics = (projectMetrics.data ?? []).filter((m) => m.accepted);
@@ -507,6 +508,15 @@ export function NewRunDialog({
                   </Btn>
                   <span style={{ color: "var(--rs-muted)" }}>built-ins steer directly; an auto-generated metric observes until it passes calibration.</span>
                 </div>
+
+                {/* §Ship 40: live generation progress (generate → validate →
+                    regenerate-on-failure → review), polled from the backend. */}
+                {genMetric.isPending && (
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, paddingLeft: 14, color: "var(--ink)" }}>
+                    <Icon name="loader" size={13} />
+                    <span>{genProgress.data?.message ?? "Starting generation…"}</span>
+                  </div>
+                )}
 
                 {/* §Ship 35: observe vs steer — only when a metric is chosen. */}
                 {fitnessMetric !== null && (

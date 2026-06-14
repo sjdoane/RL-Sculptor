@@ -339,6 +339,49 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-14 — Ship 40: live progress while auto-generating an objective metric
+
+- **Why**: Sam — clicking "Generate from goal" blocked for 1-2 min behind a
+  static "Generating…" label with no insight into the multi-stage pipeline
+  (generate → validate → regenerate-on-failure → independent review).
+  Communicate progress to the user as it goes.
+- **What** (additive; default `on_event=None` is byte-identical):
+  - **Sculptor** (`eval/metric_gen.py`): `generate_objective_metric(on_event=…)`
+    emits `{stage, attempt, max, message}` at each step — generating (per
+    attempt), validating, regenerating (non-final validation failure), retrying
+    (non-final API error), reviewing, done (with `accepted`). Never fatal (a
+    raising callback is swallowed in `_emit`).
+  - **Backend** (`sculptor_bridge.py`, `metric_store.py`, `routes/metrics.py`):
+    forward `on_event`; the generate route streams it to an ATOMIC progress
+    sidecar (`<project>/metrics/.gen_progress.json`, tmp+rename) via an
+    on_event closure, writes an initial "starting" BEFORE the threadpool, and
+    `clear_progress` in a `finally` (cleared even if generate raises). New
+    `GET /projects/{slug}/metrics/generate/progress` (`{active:false}` idle).
+    Reuses the H1 sidecar pattern — worker-thread writes, event-loop reads,
+    atomic so no torn reads.
+  - **Frontend** (`types.ts`, `api.ts`, `useMetrics.ts`, `NewRunDialog.tsx`):
+    `MetricGenProgress` + `getMetricGenProgress` + `useMetricGenProgress(slug,
+    enabled)` poll (1.2 s, `gcTime:0`, enabled ONLY while the generate mutation
+    is pending) + an inline progress line under the Generate button showing the
+    live `message`.
+- **Review** (adversarial agent, all 8 pressure-tests vs source): no
+  CRITICAL/HIGH/MEDIUM. 1 LOW fixed — the `retrying` stage fired on the FINAL
+  attempt with no retry following (cosmetic); now gated `if attempt+1 <
+  n_attempts`, matching the `regenerating` guard. Verified: back-compat (every
+  other caller/mock omits `on_event`; CLI `gen-metric` unaffected), never-fatal,
+  clear-on-finally, atomic concurrency, stage order/off-by-one, route
+  non-collision + first-poll-non-empty, frontend poll lifecycle (no leak / no
+  stale flash), and `.gen_progress.json` skipped by `list_metrics` (file, not a
+  `gen_NNN` dir).
+- **Verified (no GPU/API)**: gates green — **sculptor 607 passed / 1 skip (was
+  605; +2); backend 335 / 1 deselected (+2); frontend `pnpm build` clean**. New
+  tests: sculptor — generate emits the stage sequence (GOOD →
+  generating/validating/reviewing/done-accepted; REWARDS_STILLNESS →
+  generating×3 / regenerating / no-review / done-rejected); backend — the route
+  writes LIVE progress mid-generation (read from inside a mocked on_event) +
+  clears it after, idle returns `active:false`. The live UI render is exercised
+  when Generate is clicked during the kick test. Not git-committed.
+
 ### 2026-06-14 — Ship 39: interactive human-in-the-loop (H1) — pause-for-feedback by default + an always-on Auto/Manual switch + video feedback into the diagnoser
 
 - **Why**: Sam — the default should be to PAUSE between every iteration so a

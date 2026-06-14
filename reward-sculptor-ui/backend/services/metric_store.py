@@ -17,6 +17,39 @@ def _metrics_root(project_dir: Path) -> Path:
     return Path(project_dir) / "metrics"
 
 
+# ── §Ship 40: live generation-progress sidecar (atomic; polled by the UI) ──
+def _progress_path(project_dir: Path) -> Path:
+    return _metrics_root(project_dir) / ".gen_progress.json"
+
+
+def write_progress(project_dir: Path, data: dict[str, Any]) -> None:
+    """Atomically write the generation-progress sidecar (tmp + rename) so a
+    poll never reads a half-written file. Best-effort — never raises."""
+    try:
+        p = _progress_path(project_dir)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(".json.tmp")
+        tmp.write_text(json.dumps(data, default=str), encoding="utf-8")
+        tmp.replace(p)
+    except Exception:  # noqa: BLE001 — progress is advisory
+        pass
+
+
+def read_progress(project_dir: Path) -> dict[str, Any]:
+    """Read the generation-progress sidecar; absent/unreadable → inactive."""
+    try:
+        d = json.loads(_progress_path(project_dir).read_text(encoding="utf-8"))
+        if isinstance(d, dict):
+            return d
+    except Exception:  # noqa: BLE001
+        pass
+    return {"active": False}
+
+
+def clear_progress(project_dir: Path) -> None:
+    write_progress(project_dir, {"active": False})
+
+
 def _next_id(root: Path) -> str:
     """Allocate the next gen_NNN id, claiming its directory ATOMICALLY
     (mkdir exist_ok=False) so two concurrent generates can't collide on
@@ -57,12 +90,15 @@ def _summary(gid: str, rec: dict) -> dict[str, Any]:
 def generate(
     project_dir: Path, behavior_goal: str, *,
     robot_hint: Optional[str] = None, review: bool = True,
+    on_event=None,
 ) -> dict[str, Any]:
-    """Generate + validate + review a metric; persist under a fresh id."""
+    """Generate + validate + review a metric; persist under a fresh id.
+    §Ship 40: `on_event` streams pipeline progress to the caller."""
     root = _metrics_root(project_dir)
     gid = _next_id(root)
     rec = sculptor_bridge.generate_objective_metric(
-        behavior_goal, root / gid, robot_hint=robot_hint, review=review)
+        behavior_goal, root / gid, robot_hint=robot_hint, review=review,
+        on_event=on_event)
     rec["id"] = gid
     # Re-stamp meta.json with the id so list/calibrate can find it.
     meta = root / gid / "meta.json"

@@ -802,10 +802,16 @@ export async function getSystemInfo(): Promise<SystemInfo> {
 }
 
 // ── §Ship 35: auto-generated objective metrics ────────────────────────
-import type { MetricSummary } from "./types";
+import type { MetricGenProgress, MetricSummary } from "./types";
 
 export async function listProjectMetrics(slug: string): Promise<MetricSummary[]> {
   return handle<MetricSummary[]>(await fetch(`/api/projects/${slug}/metrics`));
+}
+
+// §Ship 40: poll live generation progress while a generate is in flight.
+export async function getMetricGenProgress(slug: string): Promise<MetricGenProgress> {
+  return handle<MetricGenProgress>(
+    await fetch(`/api/projects/${slug}/metrics/generate/progress`));
 }
 
 export async function generateProjectMetric(

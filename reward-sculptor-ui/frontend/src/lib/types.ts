@@ -385,6 +385,15 @@ export interface MetricSummary {
   recorded_at?: string | null;
 }
 
+/** §Ship 40: live progress while a metric is being generated (polled). */
+export interface MetricGenProgress {
+  active: boolean;
+  stage?: string;
+  message?: string;
+  attempt?: number;
+  max?: number;
+}
+
 export const SPEC_METRIC_NAMES: SpecMetricName[] = [
   "cartpole_balance",
   "g1_floss",

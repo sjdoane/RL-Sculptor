@@ -227,6 +227,38 @@ def test_generate_objective_metric_review_can_veto(tmp_path):
     assert rec["validation_passed"] and not rec["accepted"]
 
 
+def test_generate_emits_progress_events(tmp_path):
+    """§Ship 40: on_event streams the pipeline stages so the UI can show
+    live progress (generate → validate → review → done)."""
+    from sculptor.eval.metric_gen import generate_objective_metric
+    events: list = []
+    generate_objective_metric(
+        "trot forward", tmp_path / "mp", client=_FakeClient(GOOD, approved=True),
+        max_attempts=2, on_event=events.append)
+    stages = [e["stage"] for e in events]
+    assert stages[0] == "generating"
+    assert "validating" in stages
+    assert "reviewing" in stages                 # GOOD passes validation → review
+    assert stages[-1] == "done" and events[-1]["accepted"] is True
+    assert all(e.get("message") for e in events)  # every event is human-readable
+
+
+def test_generate_emits_regenerating_on_validation_failure(tmp_path):
+    """§Ship 40: a failing candidate emits a `regenerating` stage each retry
+    and never reaches `reviewing`."""
+    from sculptor.eval.metric_gen import generate_objective_metric
+    events: list = []
+    generate_objective_metric(
+        "trot forward", tmp_path / "mp2",
+        client=_FakeClient(REWARDS_STILLNESS, approved=True),
+        max_attempts=3, on_event=events.append)
+    stages = [e["stage"] for e in events]
+    assert stages.count("generating") == 3       # all attempts
+    assert "regenerating" in stages
+    assert "reviewing" not in stages             # never passed validation
+    assert stages[-1] == "done" and events[-1]["accepted"] is False
+
+
 def test_calibration_good_metric_correlates(tmp_path):
     from sculptor.eval.metric_calibration import calibrate_metric
     p = _write(tmp_path, "good.py", GOOD)

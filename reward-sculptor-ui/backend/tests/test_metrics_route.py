@@ -17,7 +17,14 @@ def _make_project(client: TestClient, name: str = "Metrics") -> str:
     return r.json()["slug"]
 
 
-def _fake_generate(behavior_goal, out_dir, *, robot_hint=None, review=True):
+def _fake_generate(behavior_goal, out_dir, *, robot_hint=None, review=True,
+                   on_event=None):
+    if on_event:  # §Ship 40: exercise the progress channel
+        on_event({"stage": "generating", "attempt": 1, "max": 3,
+                  "message": "Generating candidate metric (attempt 1/3)…"})
+        on_event({"stage": "validating", "attempt": 1, "max": 3,
+                  "message": "Validating…"})
+        on_event({"stage": "done", "accepted": True, "message": "Metric accepted."})
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "metric.py").write_text(
@@ -70,6 +77,44 @@ def test_generate_list_and_calibrate(client: TestClient, monkeypatch):
     r = client.post(f"/projects/{slug}/metrics/generate",
                     json={"behavior_goal": "kick with one leg"})
     assert r.json()["id"] == "gen_002"
+
+
+def test_generate_writes_live_progress_then_clears(client: TestClient, monkeypatch):
+    """§Ship 40: while a generate is in flight the progress sidecar reflects
+    the live pipeline stage; it is cleared (active=false) on completion."""
+    from backend.services import metric_store, sculptor_bridge
+
+    seen: dict = {}
+
+    def fake_gen(behavior_goal, out_dir, *, robot_hint=None, review=True, on_event=None):
+        if on_event:
+            on_event({"stage": "generating", "attempt": 1, "max": 3,
+                      "message": "Generating candidate metric (attempt 1/3)…"})
+        # the route's on_event has now written the sidecar — read it back.
+        proj = Path(out_dir).parent.parent
+        seen["mid"] = metric_store.read_progress(proj)
+        return _fake_generate(behavior_goal, out_dir, robot_hint=robot_hint, review=review)
+
+    monkeypatch.setattr(sculptor_bridge, "generate_objective_metric", fake_gen)
+    slug = _make_project(client, "MetricsProg")
+
+    r = client.post(f"/projects/{slug}/metrics/generate",
+                    json={"behavior_goal": "kick with one leg"})
+    assert r.status_code == 200, r.text
+
+    assert seen["mid"]["active"] is True
+    assert seen["mid"]["stage"] == "generating"
+    assert "Generating" in (seen["mid"].get("message") or "")
+    # cleared after completion.
+    prog = client.get(f"/projects/{slug}/metrics/generate/progress")
+    assert prog.status_code == 200
+    assert prog.json()["active"] is False
+
+
+def test_generate_progress_idle_default(client: TestClient):
+    slug = _make_project(client, "MetricsIdle")
+    r = client.get(f"/projects/{slug}/metrics/generate/progress")
+    assert r.status_code == 200 and r.json()["active"] is False
 
 
 def test_generate_unknown_project_404(client: TestClient):
