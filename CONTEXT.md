@@ -407,8 +407,14 @@ Start the next entry below this line.
   g1_kick (Spearman 1.0; gen_scores went from all-zero to non-zero). New tests
   cover the resolver (incl. Hopper), kick/jump/floss family passes, peak-speed-hack
   rejection, sub-resolution-drift calibration rejection, and jump-spec
-  noise/elevator rejection. The end-to-end LLM-gen-then-calibrate efficacy needs an
-  API/GPU run (flagged, not yet done). Not git-committed yet.
+  noise/elevator rejection.
+- **End-to-end efficacy (API run, no GPU — Sam-approved)**: a FRESH
+  `sculpt gen-metric` for the kick goal now returns `accepted=True` and
+  `calibration vs g1_kick: spearman=1.0 ok=True` (pre-Ship-41 all 3 candidates
+  were rejected on non-degeneracy). The generated metric is genuinely
+  kick-specific — `active_kick`=0.978, every other archetype (incl. chaotic /
+  upright_flail) 0.0 — so the hardened gate accepted a real kick detector, not a
+  degenerate. Committed as `0d79e59`.
 
 ### 2026-06-14 — Ship 40: live progress while auto-generating an objective metric
 
