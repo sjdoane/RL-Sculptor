@@ -160,7 +160,9 @@ def generate_objective_metric(
         _emit({"stage": "validating", "attempt": attempt + 1, "max": n_attempts,
                "message": "Validating (safety / determinism / bounds / "
                           "non-degeneracy)…"})
-        validation = validate_generated_metric(source, metric_path)
+        validation = validate_generated_metric(
+            source, metric_path,
+            behavior_goal=behavior_goal, robot_hint=robot_hint)
         attempts.append({"attempt": attempt, "ok": validation["ok"],
                          "reasons": validation["reasons"]})
         if validation["ok"]:

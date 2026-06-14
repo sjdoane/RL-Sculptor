@@ -339,6 +339,77 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-14 — Ship 41: validator accepts non-locomotion metrics (kick/jump/floss) + ladders that can actually calibrate them
+
+- **Why**: Sam auto-generated an objective fitness metric for a G1 **kick** goal;
+  all 3 candidates were REJECTED on non-degeneracy ("spread 0.000"), silently.
+  Root cause (verified on disk, `g1-kick-v3/metrics/gen_003`): the gate's only
+  positive archetype `active` was a forward-WALKER (steady travel), so a correct
+  stationary kick metric scored `active`≈0 and tied the negatives. Same for any
+  non-locomotion behavior — auto-generation was broken for exactly Sam's tasks.
+  Deeper blocker found by tracing source: even past validation, a 4-array metric
+  (gen_003 needs root_link_pos_w+joint_pos) scored 0 on every `g1_kick` ladder
+  rung (the ladder only carried joint_vel+gravity) → Spearman 0 → could NEVER
+  earn steer-rights. (Sculptor-only; pure-Python, no GPU/UI. Ships 42-45 do the
+  launch-time UX.)
+- **What** (all additive; default `behavior_goal=None` reproduces prior behavior):
+  - **`eval/metric_validate.py`**: new `resolve_behavior_family(goal, robot_hint)`
+    (word-level keyword → kick/floss/jump/locomotion/cartpole) + `FAMILY_TO_BUILTIN`.
+    `_archetypes()` adds 3 full-array POSITIVES at standing height z≈0.7:
+    `active_kick` (discrete leg-vel bursts, stationary), `active_floss` (slow
+    anti-phase hip↔arm), `active_jump` (vertical hops + knee extension).
+    `validate_generated_metric(..., behavior_goal=, robot_hint=)` now returns
+    `family`. Non-degeneracy passes if ANY positive beats EVERY negative with
+    spread.
+  - **`eval/metric_calibration.py`**: `g1_kick`/`g1_floss` ladders now populate
+    ALL 4 arrays (stationary root z=0.7, cumsum joint_pos) WITHOUT changing the
+    spec rank order; new `g1_jump` ladder.
+  - **`eval/spec_metrics.py`**: new `spec_g1_jump` ground truth (robust apex ×
+    completed launch-and-land cycles × uprightness); registered in `_SPEC_FNS` /
+    `_METRIC_ROBOT_HINTS` / `_REQUIRED_ARRAYS`. Propagates to the backend
+    calibrate-against list + UI via `spec_metric_names()` (dynamic).
+  - **`eval/metric_gen.py:163`**: threads `behavior_goal`/`robot_hint` into validate.
+  - **`reward-sculptor-ui/frontend/src/lib/types.ts`**: `g1_jump` added to
+    `SpecMetricName` + `SPEC_METRIC_NAMES` (sorted, mirrors backend).
+- **How / key decision**: behavior-family archetypes (option i of the plan), NOT
+  importing calibration's Spearman into the validator — preserves the deliberate
+  smell-test ↔ calibration-firewall boundary. The family ANCHORS calibration
+  (which builtin to compare against) but — per the adversarial review — does NOT
+  narrow the non-degeneracy gate (that narrowing false-rejected good metrics whose
+  goal mis-resolved); the gate uses the UNION of all positives. The calibration
+  firewall (Spearman≥0.7 vs hand-authored ground truth, observe-only until passed)
+  is unchanged.
+- **Review** (5 parallel adversaries, all findings reproduced vs source; applied
+  CRITICAL + all HIGH + the cheap MEDIUMs):
+  - **CRITICAL** — a peak-joint-speed hack `uprightness*(1-exp(-max|jv|/8))` scored
+    `chaotic` (random thrash, the highest-peak archetype) above the real positives
+    yet passed, because `chaotic` wasn't a required-loser. FIX: added `chaotic` to
+    the negatives (it has the highest peak speed, so peak-speed hacks now lose).
+  - **HIGH** — `resolve_behavior_family` substring-matched "hop" inside **"Hopper"**
+    (a locomotion example) and "strike" in "strike a balance". FIX: word-token
+    matching; dropped "bound" (a quadruped gait) and "strike". Plus the
+    union-gate change above (a good metric whose goal mis-resolves no longer
+    false-rejects — fixes the compound-goal class too).
+  - **HIGH** — the enriched cumsum joint_pos let a joint_pos-magnitude metric drift
+    ~1e-7 and spuriously calibrate (rho=1.0) past the 1e-12 std-guard. FIX:
+    `spearman()` rounds to 6 decimals (spec_score is [0,1]) before the guard.
+  - **HIGH** — `spec_g1_jump` (the new ground truth) rewarded sensor VIBRATION above
+    real jumps (raw max apex + unsmoothed edge count). FIX: 5-frame signed-smoothed
+    height/velocity, robust p97.5 apex, upright-gated COMPLETED launch-and-land
+    cycles (also rejects a monotonic-climb "elevator": launches but no descents).
+  - MEDIUM `active_kick` actuates one leg (correct for a one-leg kick; bilateral
+    metrics still pass via the union). LOW cartpole behavior-only metrics can't
+    pass non-degeneracy — pre-existing, not a Ship-41 regression.
+- **Verified (no GPU/API)**: gates green — **sculptor 622 passed / 1 skip (was 607;
+  +15 tests); backend 335 / 1 deselected; frontend `pnpm build` clean**. Offline
+  proof: the real rejected gen_003 metric now PASSES (`active_kick`=0.345 vs
+  locomotion `active`=0.0 — why the old gate rejected it) AND calibrates vs
+  g1_kick (Spearman 1.0; gen_scores went from all-zero to non-zero). New tests
+  cover the resolver (incl. Hopper), kick/jump/floss family passes, peak-speed-hack
+  rejection, sub-resolution-drift calibration rejection, and jump-spec
+  noise/elevator rejection. The end-to-end LLM-gen-then-calibrate efficacy needs an
+  API/GPU run (flagged, not yet done). Not git-committed yet.
+
 ### 2026-06-14 — Ship 40: live progress while auto-generating an objective metric
 
 - **Why**: Sam — clicking "Generate from goal" blocked for 1-2 min behind a

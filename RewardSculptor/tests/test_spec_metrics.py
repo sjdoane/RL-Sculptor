@@ -18,6 +18,7 @@ from sculptor.eval.spec_metrics import (
     periodicity,
     spec_cartpole_balance,
     spec_g1_floss,
+    spec_g1_jump,
     spec_g1_kick,
     spec_go1_trot,
     uprightness,
@@ -265,6 +266,95 @@ def test_trot_spec_rejects_belly_crawl() -> None:
     assert crawl["height_gate"] == 0.0
 
 
+# ── jump spec (§Ship 41) ─────────────────────────────────────────────
+
+
+def _jump_root(height: float = 0.5, n_hops: int = 4) -> np.ndarray:
+    """Repeated vertical hops from a 0.55 m crouch, NO horizontal travel."""
+    z = np.full(T, 0.55)
+    step = T // (n_hops + 1)
+    for h in range(n_hops):
+        start = step * (h + 1)
+        for k in range(20):
+            if start + k < T:
+                z[start + k] = 0.55 + height * np.sin(np.pi * k / 20)
+    p = np.zeros((T, E, 3), dtype=np.float32)
+    p[:, :, 2] = z[:, None]
+    return p
+
+
+def test_jump_spec_rewards_vertical_hops_only() -> None:
+    good = spec_g1_jump(
+        {"root_link_pos_w": _jump_root(0.6, 4),
+         "projected_gravity_b": _upright_g()}, {},
+    )
+    still = np.zeros((T, E, 3), dtype=np.float32); still[:, :, 2] = 0.55
+    still_out = spec_g1_jump(
+        {"root_link_pos_w": still, "projected_gravity_b": _upright_g()}, {},
+    )
+    assert good["spec_score"] > 0.5, good
+    assert still_out["spec_score"] == 0.0
+
+
+def test_jump_spec_ignores_forward_travel() -> None:
+    """A forward walker (horizontal travel, constant height) is NOT jumping —
+    the spec is vertical-only, so locomotion scores zero here."""
+    p = np.zeros((T, E, 3), dtype=np.float32)
+    p[:, :, 0] = (np.arange(T) * 0.03)[:, None]
+    p[:, :, 2] = 0.55
+    out = spec_g1_jump(
+        {"root_link_pos_w": p, "projected_gravity_b": _upright_g()}, {},
+    )
+    assert out["spec_score"] == 0.0
+
+
+def test_jump_spec_rejects_fallen() -> None:
+    out = spec_g1_jump(
+        {"root_link_pos_w": _jump_root(0.6, 4),
+         "projected_gravity_b": _fallen_g()}, {},
+    )
+    assert out["spec_score"] == 0.0
+
+
+def test_jump_ladder_is_monotone() -> None:
+    """§Ship 41: spec_g1_jump must order its calibration ladder (so a
+    generated jump metric can earn steer-rights via Spearman)."""
+    from sculptor.eval.metric_calibration import _ladder
+
+    scores = [spec_g1_jump(a, b, m)["spec_score"] for a, b, m in _ladder("g1_jump")]
+    assert scores == sorted(scores), scores
+    assert scores[-1] > scores[0]
+
+
+def test_jump_spec_rejects_vibration_noise() -> None:
+    """§Ship 41 review (HIGH fix): pure sensor-noise vibration must NOT outscore
+    a real jump — smoothing + robust-apex + completed-cycle counting reject it
+    (the raw version scored noise 0.52, above every real ladder rung)."""
+    rng = np.random.default_rng(0)
+    z = 0.55 + rng.normal(0, 0.08, (T, E)).astype(np.float32)
+    p = np.zeros((T, E, 3), dtype=np.float32); p[:, :, 2] = z
+    noise = spec_g1_jump(
+        {"root_link_pos_w": p, "projected_gravity_b": _upright_g()}, {},
+    )
+    real = spec_g1_jump(
+        {"root_link_pos_w": _jump_root(0.6, 4),
+         "projected_gravity_b": _upright_g()}, {},
+    )
+    assert noise["spec_score"] < real["spec_score"], (noise, real)
+    assert noise["spec_score"] < 0.3, noise
+
+
+def test_jump_spec_rejects_monotonic_climb() -> None:
+    """§Ship 41 review (MEDIUM fix): a monotonic climb (elevator) has launches
+    but no descents → 0 completed launch-and-land cycles → not a jump."""
+    z = 0.55 + 0.02 * np.arange(T)
+    p = np.zeros((T, E, 3), dtype=np.float32); p[:, :, 2] = z[:, None]
+    out = spec_g1_jump(
+        {"root_link_pos_w": p, "projected_gravity_b": _upright_g()}, {},
+    )
+    assert out["spec_score"] == 0.0, out
+
+
 _NAMES_12 = [
     "left_hip_roll_joint", "right_hip_roll_joint",
     "left_knee_joint", "right_knee_joint",
@@ -453,7 +543,7 @@ def test_spec_metric_names_lists_all() -> None:
     from sculptor.eval.spec_metrics import spec_metric_names
 
     assert spec_metric_names() == [
-        "cartpole_balance", "g1_floss", "g1_kick", "go1_trot",
+        "cartpole_balance", "g1_floss", "g1_jump", "g1_kick", "go1_trot",
     ]
 
 

@@ -21,6 +21,7 @@ not LLM judgment).
 from __future__ import annotations
 
 import ast
+import re
 from pathlib import Path
 from typing import Any, Optional
 
@@ -49,6 +50,61 @@ _NAMES_12 = [
     "left_ankle", "right_ankle", "left_shoulder_pitch", "right_shoulder_pitch",
     "left_elbow", "right_elbow", "torso", "neck",
 ]
+
+#: §Ship 41: behavior family → the hand-authored ground-truth metric a
+#: generated metric of that family calibrates against (metric_calibration).
+#: Used by the launch-time auto-calibration path; exported for reuse.
+FAMILY_TO_BUILTIN = {
+    "kick": "g1_kick",
+    "floss": "g1_floss",
+    "jump": "g1_jump",
+    "locomotion": "go1_trot",
+    "cartpole": "cartpole_balance",
+}
+
+
+def resolve_behavior_family(
+    behavior_goal: Optional[str], robot_hint: Optional[str] = None,
+) -> Optional[str]:
+    """§Ship 41: map a natural-language behavior goal to a behavior family
+    (`kick`/`floss`/`jump`/`locomotion`/`cartpole`) so the non-degeneracy gate
+    can anchor a non-locomotion metric against a behavior-APPROPRIATE positive
+    archetype instead of a hard-coded forward-walker (the false-rejection bug).
+
+    WORD-level (not substring) keyword match: real goals are paraphrased (the
+    on-disk kick goal does not equal the benchmark string), but every benchmark
+    goal contains a clean family word. `None` → no family matched. The family
+    selects the CALIBRATION ground truth (and the returned label); it does NOT
+    narrow the non-degeneracy gate."""
+    g = (behavior_goal or "").lower()
+    tokens = set(re.findall(r"[a-z]+", g))
+
+    def has(*words: str) -> bool:
+        return any(w in tokens for w in words)
+
+    # §Ship 41 review: WORD matching — substring "hop" matched "Hopper" (a
+    # locomotion example) and "strike" matched the idiom "strike a balance",
+    # false-rejecting good metrics. "bound"/"strike" dropped ("bound" is a
+    # quadruped GAIT; "strike" is too idiomatic — "kick" is the clear token).
+    if has("kick", "kicks", "kicking"):
+        return "kick"
+    if has("floss", "flossing", "opposition", "antiphase") or "anti-phase" in g:
+        return "floss"
+    if has("jump", "jumps", "jumping", "hop", "hops", "hopping",
+           "leap", "leaps", "leaping"):
+        return "jump"
+    if has("trot", "trotting", "walk", "walking", "forward", "gait",
+           "locomote", "locomotion", "run", "running", "march", "marching",
+           "stride", "striding"):
+        return "locomotion"
+    if has("balance", "balancing", "cartpole"):
+        return "cartpole"
+    # Robot-family fallback: a quadruped goal with no behavior word is almost
+    # always locomotion.
+    rh = (robot_hint or "").lower()
+    if any(w in rh for w in ("go1", "go2", "quadruped")):
+        return "locomotion"
+    return None
 
 
 def _ast_safety(source: str) -> list[str]:
@@ -118,9 +174,12 @@ def _upright_g() -> np.ndarray:
 
 
 def _archetypes() -> dict[str, dict]:
-    """Four archetype rollouts spanning a crude competence axis. A valid
-    task metric should score `active` strictly above `still` and `fallen`,
-    with non-trivial spread."""
+    """Synthetic archetype rollouts spanning a competence axis. Negatives
+    (`still`/`fallen`/`chaotic`/`upright_flail`) plus a POSITIVE per behavior
+    family (`active` locomotion, `active_kick`, `active_floss`, `active_jump`).
+    A valid task metric scores its family positive strictly above the negatives
+    with non-trivial spread (the gate picks the family in
+    `validate_generated_metric`)."""
     rng = np.random.default_rng(0)
     t = np.arange(T)
 
@@ -165,8 +224,57 @@ def _archetypes() -> dict[str, dict]:
     rootf2 = np.zeros((T, E, 3)); rootf2[..., 2] = 0.5   # upright, no travel
     upright_flail = arrays(jpf, jvf2, _upright_g(), rootf2)
 
+    # §Ship 41: behavior-family POSITIVE archetypes — a COMPETENT example of
+    # each non-locomotion behavior, so a kick/floss/jump metric is measured
+    # against its own behavior rather than the forward-walker `active`. All are
+    # upright, stationary, at STANDING height (z≈0.7 — a kick metric's height
+    # gate needs ≥0.65; z=0.5 would leave a good metric below the spread floor).
+    def _standing_root() -> np.ndarray:
+        r = np.zeros((T, E, 3)); r[..., 2] = 0.7
+        return r
+
+    # active_kick: discrete leg-velocity bursts (left hip-pitch/knee/ankle =
+    # indices 0/2/4), stance leg quiet — a clean, repeated, stationary kick.
+    jvk = np.zeros((T, E, J))
+    for start in range(20, T, 40):            # 3 discrete kicks
+        for jdx in (0, 2, 4):
+            jvk[start:start + 5, :, jdx] = 8.0
+    jpk = np.cumsum(jvk, axis=0) * 0.02       # consistent integrated position
+    active_kick = arrays(jpk, jvk, _upright_g(), _standing_root())
+
+    # active_floss: anti-phase hip↔arm oscillation. SLOW (period 25, like the
+    # g1_floss ladder) so a motion-MAGNITUDE metric cannot mistake it for the
+    # fast `upright_flail` negative — flossing is structure, not speed.
+    jpfl = np.zeros((T, E, J))
+    hip = 0.4 * np.sin(2 * np.pi * t / 25)
+    arm = 0.4 * np.sin(2 * np.pi * t / 25 + np.pi)
+    for jdx in (0, 1):                        # hips
+        jpfl[:, :, jdx] = hip[:, None]
+    for jdx in (6, 7, 8, 9):                  # shoulders + elbows
+        jpfl[:, :, jdx] = arm[:, None]
+    jvfl = np.gradient(jpfl, axis=0)
+    active_floss = arrays(jpfl, jvfl, _upright_g(), _standing_root())
+
+    # active_jump: repeated vertical hops (crouch→launch→apex→land) with knee
+    # extension bursts, upright, ZERO horizontal travel. Has real leg motion so
+    # a stillness-rewarder cannot mistake it for a quiet stance.
+    zj = np.full(T, 0.55)                     # crouched baseline
+    jvj = np.zeros((T, E, J))
+    for start in range(15, T, 35):            # ~3 hops
+        for k in range(20):
+            if start + k < T:
+                zj[start + k] = 0.55 + 0.45 * np.sin(np.pi * k / 20)  # apex ≈1.0
+                if k < 6:                     # launch: knees extend
+                    for jdx in (2, 3):
+                        jvj[start + k, :, jdx] = 6.0
+    jpj = np.cumsum(jvj, axis=0) * 0.02
+    rootj = np.zeros((T, E, 3)); rootj[..., 2] = zj[:, None]
+    active_jump = arrays(jpj, jvj, _upright_g(), rootj)
+
     return {"still": still, "fallen": fallen, "chaotic": chaotic,
-            "active": active, "upright_flail": upright_flail}
+            "active": active, "upright_flail": upright_flail,
+            "active_kick": active_kick, "active_floss": active_floss,
+            "active_jump": active_jump}
 
 
 def _score(fn, arrays, meta) -> float:
@@ -180,14 +288,23 @@ def validate_generated_metric(
     module_path: Path | str,
     *,
     spread_min: float = 0.1,
+    behavior_goal: Optional[str] = None,
+    robot_hint: Optional[str] = None,
 ) -> dict[str, Any]:
     """Run all MUST-HAVE gates on a generated metric. `source` is the
     module text (for static gates); `module_path` is where it's been
     written (for the runtime gates). Returns
-    `{ok: bool, gates: {name: bool}, reasons: [...], archetype_scores: {}}`.
-    Never raises — a crashing metric is a failed gate, not an exception."""
+    `{ok, gates, reasons, archetype_scores, family}`.
+    Never raises — a crashing metric is a failed gate, not an exception.
+
+    §Ship 41: `behavior_goal`/`robot_hint` (optional) resolve a behavior
+    FAMILY so the non-degeneracy gate anchors a non-locomotion metric
+    (kick/jump/floss) against a behavior-appropriate positive archetype
+    instead of a hard-coded forward-walker. Both default `None` → today's
+    behavior (any of the four positives may anchor the metric)."""
     gates: dict[str, bool] = {}
     reasons: list[str] = []
+    family = resolve_behavior_family(behavior_goal, robot_hint)
 
     # 1. AST safety
     safety = _ast_safety(source)
@@ -209,7 +326,7 @@ def validate_generated_metric(
     # Static gates must pass before we exec the module.
     if not (gates["ast_safety"] and gates["defines_compute_spec"]):
         return {"ok": False, "gates": gates, "reasons": reasons,
-                "archetype_scores": {}}
+                "archetype_scores": {}, "family": family}
 
     try:
         fn = load_generated_metric(module_path)
@@ -217,7 +334,7 @@ def validate_generated_metric(
         gates["loads"] = False
         reasons.append(f"[load] {type(e).__name__}: {e}")
         return {"ok": False, "gates": gates, "reasons": reasons,
-                "archetype_scores": {}}
+                "archetype_scores": {}, "family": family}
     gates["loads"] = True
 
     meta = {"joint_names": _NAMES_12}
@@ -247,7 +364,22 @@ def validate_generated_metric(
     gates["determinism"] = determ
     gates["bounded"] = bounded
 
-    # 5: non-degeneracy — active must beat still + fallen, with spread.
+    # 5: non-degeneracy — the metric must score SOME competent behavior above
+    # EVERY degenerate one, with spread. §Ship 41: positives span all behavior
+    # families (locomotion `active` + kick/floss/jump) so a non-locomotion
+    # metric isn't measured against a forward-walker. §Ship 41 review: the
+    # resolved `family` does NOT NARROW this smell-test — narrowing falsely
+    # rejected good metrics whose goal mis-resolved (e.g. "Hopper"→jump, or a
+    # compound "walk forward and kick"). The metric passes if ANY positive
+    # beats the negatives; `family` only selects the calibration ground truth
+    # downstream (the firewall enforces task-validity). NEGATIVES that must
+    # lose now include `chaotic` (upright random thrashing — the HIGHEST peak
+    # joint speed of any archetype), so a peak-speed reward-hack (which scores
+    # chaotic above the real positives) is rejected — closing the
+    # stand-and-thrash bypass the review found.
+    positive_keys = ("active", "active_kick", "active_floss", "active_jump")
+    negative_keys = ("still", "fallen", "upright_flail", "chaotic")
+
     nondegen = True
     finite = {k: v for k, v in scores.items() if np.isfinite(v)}
     if len(finite) < 3:
@@ -259,16 +391,23 @@ def validate_generated_metric(
             nondegen = False
             reasons.append(f"[nondegeneracy] near-constant metric "
                            f"(spread {spread:.3f} < {spread_min}) — no signal")
-        a = finite.get("active", 0.0)
-        # §Ship 36: `upright_flail` added — a motion-magnitude metric that
-        # rewards standing-and-flailing (the observed G1 kick hack) now fails.
-        for low in ("still", "fallen", "upright_flail"):
-            if low in finite and finite[low] >= a:
+        pos = {k: finite[k] for k in positive_keys if k in finite}
+        if pos:
+            best_key = max(pos, key=lambda k: pos[k])
+            best_pos = pos[best_key]
+        else:
+            best_key, best_pos = None, float("-inf")
+            nondegen = False
+            reasons.append("[nondegeneracy] no positive archetype scored finite")
+        for low in negative_keys:
+            if low in finite and finite[low] >= best_pos:
                 nondegen = False
-                reasons.append(f"[nondegeneracy] '{low}' ({finite[low]:.3f}) scores "
-                               f">= active ({a:.3f}) — rewards the wrong behavior")
+                reasons.append(
+                    f"[nondegeneracy] '{low}' ({finite[low]:.3f}) scores >= the "
+                    f"best positive '{best_key}' ({best_pos:.3f}) — rewards the "
+                    f"wrong behavior")
     gates["nondegeneracy"] = nondegen
 
     ok = all(gates.values())
     return {"ok": ok, "gates": gates, "reasons": reasons,
-            "archetype_scores": scores}
+            "archetype_scores": scores, "family": family}

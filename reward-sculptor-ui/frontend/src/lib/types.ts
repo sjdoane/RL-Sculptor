@@ -365,6 +365,7 @@ export interface RunControlState {
 export type SpecMetricName =
   | "cartpole_balance"
   | "g1_floss"
+  | "g1_jump"
   | "g1_kick"
   | "go1_trot";
 
@@ -397,6 +398,7 @@ export interface MetricGenProgress {
 export const SPEC_METRIC_NAMES: SpecMetricName[] = [
   "cartpole_balance",
   "g1_floss",
+  "g1_jump",
   "g1_kick",
   "go1_trot",
 ];

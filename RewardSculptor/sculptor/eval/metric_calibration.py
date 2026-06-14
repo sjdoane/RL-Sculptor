@@ -38,6 +38,12 @@ def spearman(a: list[float], b: list[float]) -> float:
     must NOT spuriously correlate (argsort-of-constant yields sequential
     ranks, so guard on the RAW std, not the ranks)."""
     av, bv = np.asarray(a, float), np.asarray(b, float)
+    # §Ship 41 review: spec_score is contractually [0,1]; round to 6 decimals
+    # BEFORE the variation guard so sub-resolution drift cannot manufacture a
+    # monotone rank. A degenerate metric reading joint_pos magnitude scored
+    # ~1e-7 across the (Ship-41-enriched, cumsum-joint_pos) ladder; its 1e-7
+    # std cleared the 1e-12 guard and argsort then gave a spurious rho=1.0.
+    av, bv = np.round(av, 6), np.round(bv, 6)
     # §Ship 35 review: epsilon guard (exact == 0 can miss tiny-but-nonzero
     # std from float noise, spuriously correlating a near-constant metric).
     if av.size < 2 or av.std() < 1e-12 or bv.std() < 1e-12:
@@ -74,19 +80,31 @@ def _ladder(builtin_name: str) -> list[tuple[dict, dict, dict]]:
                              "max_episode_steps": 500}, meta))
         return out
 
+    dt = _BEHAVIOR["step_dt"]
+
     if builtin_name == "g1_kick":
+        # §Ship 41: populate ALL physical arrays (stationary, upright, standing
+        # height) — the spec needs only joint_vel+gravity, but a generated
+        # metric that gates on a stationary base / standing height returns 0.0
+        # when root_link_pos_w/joint_pos are absent, so it could NEVER calibrate
+        # (Spearman 0). The added arrays don't change the spec's rank order.
         out = []
+        root = np.zeros((T, E, 3)); root[..., 2] = 0.7   # stationary, standing
         for strength in (0.0, 1.0, 2.0, 4.0, 8.0):
             jv = np.zeros((T, E, J))
             for start in range(20, T, 40):       # discrete leg bursts
                 for jdx in (0, 2, 4):            # left hip/knee/ankle
                     jv[start:start + 5, :, jdx] = strength
-            out.append(({"joint_vel": jv, "projected_gravity_b": _upright_g()},
+            jp = np.cumsum(jv, axis=0) * dt      # consistent integrated position
+            out.append(({"joint_vel": jv, "joint_pos": jp,
+                         "projected_gravity_b": _upright_g(),
+                         "root_link_pos_w": root},
                         _BEHAVIOR, meta))
         return out
 
     if builtin_name == "g1_floss":
         out = []
+        root = np.zeros((T, E, 3)); root[..., 2] = 0.7
         for amp in (0.0, 0.1, 0.2, 0.4):
             jp = np.zeros((T, E, J))
             hip = amp * np.sin(2 * np.pi * t / 25)
@@ -95,7 +113,31 @@ def _ladder(builtin_name: str) -> list[tuple[dict, dict, dict]]:
                 jp[:, :, jdx] = hip[:, None]
             for jdx in (6, 7, 8, 9):
                 jp[:, :, jdx] = arm[:, None]
-            out.append(({"joint_pos": jp, "projected_gravity_b": _upright_g()},
+            jv = np.gradient(jp, axis=0)
+            out.append(({"joint_pos": jp, "joint_vel": jv,
+                         "projected_gravity_b": _upright_g(),
+                         "root_link_pos_w": root},
+                        _BEHAVIOR, meta))
+        return out
+
+    if builtin_name == "g1_jump":
+        # §Ship 41: graded vertical hops (crouch→launch→apex→land) with knee
+        # extension bursts, upright, no horizontal travel.
+        out = []
+        for height in (0.0, 0.1, 0.2, 0.35, 0.5):
+            z = np.full(T, 0.55)
+            jv = np.zeros((T, E, J))
+            for start in range(15, T, 35):
+                for k in range(20):
+                    if start + k < T:
+                        z[start + k] = 0.55 + height * np.sin(np.pi * k / 20)
+                        if k < 6:                # launch: knees extend
+                            for jdx in (2, 3):
+                                jv[start + k, :, jdx] = height * 12.0
+            jp = np.cumsum(jv, axis=0) * dt
+            root = np.zeros((T, E, 3)); root[..., 2] = z[:, None]
+            out.append(({"root_link_pos_w": root, "joint_vel": jv,
+                         "joint_pos": jp, "projected_gravity_b": _upright_g()},
                         _BEHAVIOR, meta))
         return out
 

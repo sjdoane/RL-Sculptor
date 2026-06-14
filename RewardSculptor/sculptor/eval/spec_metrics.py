@@ -473,6 +473,70 @@ def spec_g1_kick(
     }
 
 
+def spec_g1_jump(
+    arrays: Mapping[str, np.ndarray],
+    behavior: Mapping[str, Any],
+    meta: Optional[Mapping[str, Any]] = None,
+) -> dict[str, float]:
+    """§Ship 41: a jump = repeated VERTICAL launch-and-LAND cycles of the base
+    from an upright stance. spec_score = saturating apex height x completed-hop
+    count x uprightness. Mirrors spec_g1_kick's noise-robustness (the §Ship 41
+    review found a raw version rewarded sensor VIBRATION above real jumps):
+      * base height and its velocity are SIGNED-smoothed (5-frame) before edge
+        detection — control-rate jitter / sensor noise cancels;
+      * apex is a robust per-env half-range (p97.5 above the resting median),
+        so a single glitch frame cannot inflate height (audit L2 pattern);
+      * a hop counts only as a COMPLETED cycle = an upward launch matched by a
+        later descent, both within an UPRIGHT window — a monotonic climb
+        (elevator) has launches but no descents and scores 0; a fall is not
+        upright so its descent does not count.
+    Forward travel scores 0 (vertical-only; yaw-/horizontal-invariant)."""
+    g = arrays["projected_gravity_b"]
+    rp = _check_te(arrays["root_link_pos_w"])
+    z = rp[..., 2].astype(np.float64)                 # (T, E)
+    up_frac = uprightness(g)
+    T = z.shape[0]
+    zero = {"apex_height": 0.0, "height_score": 0.0, "launches_per_env": 0.0,
+            "repeat_score": 0.0, "uprightness": up_frac, "spec_score": 0.0}
+    if T < 8:
+        return zero
+    w = max(1, min(5, T))
+    zs = _sliding_mean(z, w)                           # (T', E) smoothed height
+    base = np.median(zs, axis=0, keepdims=True)
+    apex = float(np.clip(
+        (np.quantile(zs, 0.975, axis=0) - base[0]).mean(), 0.0, None))
+    height_score = 1.0 - float(np.exp(-apex / 0.3))
+    vel = _sliding_mean(np.diff(z, axis=0), w)         # (T'', E) smoothed vel
+    up_win = _sliding_mean(upright_mask(g).astype(np.float64), w) > 0.999
+    up_win = up_win[:vel.shape[0]]                     # align to vel frames
+    thr = 0.01                                         # ≈0.5 m/s vertical @dt=0.02
+
+    def _edges(cond: np.ndarray) -> np.ndarray:
+        """Per-env rising-edge counts of a (T, E) boolean."""
+        counts = np.zeros(cond.shape[1], dtype=np.int64)
+        prev = np.zeros(cond.shape[1], dtype=bool)
+        for tt in range(cond.shape[0]):
+            cur = cond[tt]
+            counts += (cur & ~prev)
+            prev = cur
+        return counts
+
+    ups = _edges((vel >= thr) & up_win)
+    downs = _edges((vel <= -thr) & up_win)
+    completed = np.minimum(ups, downs)                 # launch matched by a land
+    per_env = float(completed.mean())
+    repeat_score = 1.0 - float(np.exp(-per_env / 3.0))
+    return {
+        "apex_height": apex,
+        "height_score": height_score,
+        "launches_per_env": per_env,
+        "repeat_score": repeat_score,
+        "uprightness": up_frac,
+        "spec_score": float(np.clip(
+            height_score * repeat_score * up_frac, 0.0, 1.0)),
+    }
+
+
 def spec_go1_trot(
     arrays: Mapping[str, np.ndarray],
     behavior: Mapping[str, Any],
@@ -502,6 +566,7 @@ def spec_go1_trot(
 _SPEC_FNS: dict[str, Callable[..., dict[str, float]]] = {
     "cartpole_balance": spec_cartpole_balance,
     "g1_floss": spec_g1_floss,
+    "g1_jump": spec_g1_jump,
     "g1_kick": spec_g1_kick,
     "go1_trot": spec_go1_trot,
 }
@@ -524,6 +589,7 @@ _METRIC_ROBOT_HINTS: dict[str, tuple[str, ...]] = {
     "cartpole_balance": ("cartpole",),
     "go1_trot": ("go1", "go2"),
     "g1_floss": ("g1",),
+    "g1_jump": ("g1",),
     "g1_kick": ("g1",),
 }
 
@@ -556,6 +622,7 @@ def spec_metric_robot_warning(
 _REQUIRED_ARRAYS: dict[str, tuple[str, ...]] = {
     "cartpole_balance": (),
     "g1_floss": ("joint_pos", "projected_gravity_b"),
+    "g1_jump": ("root_link_pos_w", "projected_gravity_b"),
     "g1_kick": ("joint_vel", "projected_gravity_b"),
     "go1_trot": ("root_link_pos_w", "projected_gravity_b"),
 }
