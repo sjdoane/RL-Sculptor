@@ -29,10 +29,23 @@ from fastapi import (
 from fastapi.responses import FileResponse, JSONResponse
 
 from backend.models.project import ProblemDetail
-from backend.models.run import IterEventSummary, RunDetail, RunParams, RunSummary
+from backend.models.run import (
+    IterEventSummary,
+    RunControl,
+    RunControlState,
+    RunDetail,
+    RunParams,
+    RunSummary,
+)
 from backend.services.job_manager import Job, JobManager
 from backend.services.project_store import ProjectStore
-from backend.services.run_manager import build_iterations_summary, run_sculpt_job
+from backend.services.run_manager import (
+    build_iterations_summary,
+    control_file_path,
+    read_control_file,
+    run_sculpt_job,
+    write_control_file,
+)
 
 
 router = APIRouter(tags=["runs"])
@@ -133,6 +146,13 @@ def _run_summary(job: Job) -> RunSummary:
             (it.get("primary_metric") if isinstance(it.get("primary_metric"), (int, float)) else None)
             for it in iters
         ]
+    # §Ship 35 review (CRITICAL): build the parallel objective-fitness
+    # history so the Runs tab can foreground fitness (job_to_run_summary
+    # does this too; this REST builder must match it).
+    fitness_history = [
+        (it.get("fitness") if isinstance(it.get("fitness"), (int, float)) else None)
+        for it in iters
+    ]
     classification_raw = params.get("error_classification")
     classification = None
     if isinstance(classification_raw, dict):
@@ -155,6 +175,7 @@ def _run_summary(job: Job) -> RunSummary:
         iterations_completed=completed,
         current_iter_index=current,
         primary_metric_history=metric_history,
+        fitness_history=fitness_history,
         started_at=job.started_at,
         ended_at=job.ended_at,
         error=job.error,
@@ -164,6 +185,7 @@ def _run_summary(job: Job) -> RunSummary:
         mission_slug=params.get("mission_slug"),
         stage_name=params.get("stage_name"),
         stage_index=params.get("stage_index"),
+        mode=params.get("mode"),
     )
 
 
@@ -332,6 +354,58 @@ def kill_run(
     jobs.stop(run_id)
     job.emit({"type": "run_stopped", "source": "user"})
     return _run_summary(job)
+
+
+# ── PATCH /projects/{slug}/runs/{run_id}/control ──────────────────────
+@router.patch(
+    "/projects/{slug}/runs/{run_id}/control",
+    response_model=RunControlState,
+    responses={404: {"model": ProblemDetail}},
+)
+def control_run(
+    slug: str,
+    run_id: str,
+    body: RunControl,
+    store: ProjectStore = Depends(get_store),
+    jobs: JobManager = Depends(get_job_manager),
+) -> Any:
+    """§Ship 39 (H1): interactive control for a live run — flip Auto/Manual
+    at any point, resume a pause (optionally with human feedback for the next
+    iteration's diagnose), or stop cleanly. Merges into the run's control
+    sidecar that the sculpt subprocess polls at each iteration boundary."""
+    detail = store.get(slug)
+    if detail is None:
+        return _problem(
+            status.HTTP_404_NOT_FOUND, "project not found",
+            detail=f"no project with slug {slug!r}", type_="/problems/not-found",
+        )
+    job = _find_run(jobs, slug, run_id)
+    if job is None:
+        return _problem(
+            status.HTTP_404_NOT_FOUND, "run not found",
+            detail=f"no sculpt_run with id {run_id!r} in project {slug!r}",
+            type_="/problems/not-found",
+        )
+    path = control_file_path(Path(detail.project_dir), run_id)
+    ctrl = read_control_file(path)
+    if body.mode is not None:
+        ctrl["mode"] = body.mode
+    if body.stop:
+        ctrl["stop"] = True
+    if body.resume:
+        ctrl["resume_token"] = int(ctrl.get("resume_token", 0) or 0) + 1
+        ctrl["feedback"] = body.feedback
+    write_control_file(path, ctrl)
+    # Reflect the new mode on the job so a reconnect / REST summary sees it,
+    # and tee a control event so other connected clients stay in sync.
+    job.params["mode"] = ctrl.get("mode")
+    job.emit({
+        "type": "run_control_updated",
+        "mode": ctrl.get("mode"),
+        "resume": bool(body.resume),
+        "stop": bool(body.stop),
+    })
+    return RunControlState(**ctrl)
 
 
 # ── WS /projects/{slug}/runs/{run_id}/events ──────────────────────────

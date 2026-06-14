@@ -182,6 +182,17 @@ class RunMissionRequest(BaseModel):
     ] = 0.05
     """Goal B trend threshold (5% relative improvement floor)."""
 
+    # §Ship 34/35: objective fitness-in-the-loop, applied uniformly to
+    # every stage (sound for single-skill missions). A built-in spec
+    # name or a generated-metric id ("gen:<id>"); None = the blind loop.
+    fitness_metric: Optional[str] = None
+    """Spec metric (built-in name or 'gen:<id>') used as in-loop fitness
+    for every stage. None keeps the blind loop."""
+
+    # §Ship 35: observe vs steer (see RunParams.fitness_mode).
+    fitness_mode: Literal["observe", "steer"] = "steer"
+    """How the fitness signal is used per stage. observe = display only."""
+
 
 # §Ship 21a: resolve the forward reference now that RunMissionRequest
 # is defined. Required because CreateMissionRequest declares

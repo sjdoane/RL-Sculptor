@@ -341,7 +341,56 @@ export interface RunParamsPayload {
   // Legacy compatibility no-ops; metric-plateau auto-kill is disabled.
   early_stop_enabled?: boolean | null;
   early_stop_patience?: number | null;
+  // §Ship 34/35 — objective fitness-in-the-loop. A built-in spec name
+  // (go1_trot / g1_kick / g1_floss / cartpole_balance) or a generated
+  // metric id ("gen:<id>"); null = the blind loop.
+  fitness_metric?: string | null;
+  // observe = compute + display only (no influence); steer = drives the loop.
+  fitness_mode?: "observe" | "steer";
+  // §Ship 39 (H1): interactive start mode. "manual" pauses for human feedback
+  // at each iteration boundary (the UI default); "auto" runs straight through.
+  start_mode?: "manual" | "auto";
 }
+
+/** §Ship 39 (H1): the interactive control sidecar state (PATCH response). */
+export interface RunControlState {
+  mode: string;
+  resume_token: number;
+  feedback?: string | null;
+  stop: boolean;
+}
+
+/** §Ship 34: spec metrics selectable as in-loop objective fitness.
+ *  Mirrors sculptor.eval.spec_metrics._SPEC_FNS / the backend Literal. */
+export type SpecMetricName =
+  | "cartpole_balance"
+  | "g1_floss"
+  | "g1_kick"
+  | "go1_trot";
+
+/** §Ship 35: an auto-generated objective metric (per project), referenced
+ *  in a run as fitness_metric = "gen:<id>". Observe-only until calibrated. */
+export interface MetricSummary {
+  id: string;
+  behavior_goal?: string | null;
+  accepted: boolean;
+  validation_passed: boolean;
+  calibrated: boolean;
+  review?: { approved?: boolean; concerns?: string[]; summary?: string } | null;
+  gates?: Record<string, boolean> | null;
+  reasons?: string[] | null;
+  archetype_scores?: Record<string, number> | null;
+  calibration?: { ok?: boolean; spearman?: number; builtin?: string } | null;
+  source?: string | null;
+  recorded_at?: string | null;
+}
+
+export const SPEC_METRIC_NAMES: SpecMetricName[] = [
+  "cartpole_balance",
+  "g1_floss",
+  "g1_kick",
+  "go1_trot",
+];
 
 // Extend RunSummary / RunDetail with the new Phase-6 classification
 // field. Existing callers that spread `...run` keep working.
@@ -414,6 +463,12 @@ export interface IterEventSummary {
   pct?: number;
   elapsed_s?: number;
   eta_s?: number | null;
+  // §Ship 34: objective fitness-in-the-loop. `fitness` is this iter's
+  // ground-truth spec score; `best_fitness` is the best so far (the
+  // version best-by-fitness selection keeps). Both undefined for blind
+  // runs (no --fitness-metric).
+  fitness?: number | null;
+  best_fitness?: number | null;
 }
 
 export interface RunSummary {
@@ -424,6 +479,10 @@ export interface RunSummary {
   iterations_requested: number;
   iterations_completed: number;
   current_iter_index: number | null;
+  // §Ship 35: per-iter objective fitness (parallel to primary_metric_history).
+  // Empty/all-null for blind runs. When present, the UI foregrounds this as
+  // the primary metric and demotes the reward metric to secondary.
+  fitness_history?: Array<number | null>;
   primary_metric_history: Array<number | null>;
   started_at: string | null;
   ended_at: string | null;
@@ -438,6 +497,9 @@ export interface RunSummary {
   mission_slug?: string | null;
   stage_name?: string | null;
   stage_index?: number | null;
+  // §Ship 39 (H1): current interactive mode ("manual" | "auto"); null for
+  // older / non-interactive runs. Restores the Auto/Manual toggle on reconnect.
+  mode?: string | null;
 }
 
 export interface RunDetail extends RunSummary {
@@ -836,6 +898,10 @@ export interface MissionRunDefaults {
   max_extensions_per_stage?: number;
   extension_factor?: number;
   extension_improvement_threshold?: number;
+  // §Ship 34/35: per-stage objective fitness-in-the-loop (built-in name
+  // or "gen:<id>") + observe/steer mode.
+  fitness_metric?: string | null;
+  fitness_mode?: "observe" | "steer";
 }
 
 export interface CreateMissionRequest {

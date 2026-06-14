@@ -14,6 +14,7 @@ from sculptor.eval import BENCHMARKS, compute_spec_metrics, get_benchmark
 from sculptor.eval.spec_metrics import (
     burstiness,
     horizontal_speed,
+    kick_events_score,
     periodicity,
     spec_cartpole_balance,
     spec_g1_floss,
@@ -358,6 +359,118 @@ def test_kick_rejects_fall_cycling() -> None:
         {}, {"joint_names": _NAMES_12},
     )
     assert out["spec_score"] < 0.05, out
+
+
+def test_kick_clean_kicker_scores_high_not_zero() -> None:
+    """§Ship 34 regression: a CLEAN kicker — discrete strong leg bursts
+    from a perfectly still upright stance (median speed ~0) — must score
+    well. The pre-floor ratio guard (`med>1e-9 else 0.0`) scored the
+    *ideal* kicker 0.0 (Ship-33 audit). With the rest-noise floor it
+    reads as a real, repeated kick."""
+    jv = np.zeros((T, E, J), dtype=np.float32)   # dead-still between kicks
+    for t0 in range(25, T, 50):                  # a strong leg kick every 50
+        jv[t0:t0 + 3, :, 2] = 8.0                # left_knee
+    out = spec_g1_kick(
+        {"joint_vel": jv, "projected_gravity_b": _upright_g()},
+        {}, {"joint_names": _NAMES_12},
+    )
+    assert out["spec_score"] > 0.5, out
+    assert out["burst_ratio_p95"] > 2.0, out     # floor → real ratio, not 0
+
+
+def test_kick_events_monotone_and_robust_to_baseline_motion() -> None:
+    """§Ship 36: the discrete kick-EVENT count is monotone in genuine kicks
+    and INVARIANT to competence-neutral sub-threshold baseline motion — the
+    extremal-Goodhart failure the ratio score has (audit
+    audit_spec_metric_monotonicity.py)."""
+    g = _upright_g()
+
+    def kicks(leg: int = 2, baseline: float = 0.0) -> np.ndarray:
+        jv = np.zeros((T, E, J), dtype=np.float32)
+        t = np.arange(T)
+        if baseline:                              # sub-threshold whole-body motion
+            jv += (baseline * np.sin(2 * np.pi * t / 17.0)).astype(np.float32)[:, None, None]
+        for t0 in range(40, T, 50):               # sustained 6-frame leg kicks
+            jv[t0:t0 + 6, :, leg] = 8.0
+        return jv
+
+    base = kick_events_score(kicks(baseline=0.0), g, joint_indices=[2])
+    moving = kick_events_score(kicks(baseline=2.0), g, joint_indices=[2])
+    assert base["kick_events"] > 0.5, base
+    # adding 2 rad/s baseline (below the 5 rad/s gate) must NOT change the
+    # event count — a competent walker that ALSO kicks isn't penalized.
+    assert abs(moving["kick_events"] - base["kick_events"]) < 0.05, (base, moving)
+
+
+def test_kick_events_rejects_arm_flail_with_leg_subset() -> None:
+    """§Ship 36: with legs isolated, standing-and-flailing-arms scores ZERO
+    kick events — the exact reward-hack Sam's G1 run fell into."""
+    g = _upright_g()
+    arm = np.zeros((T, E, J), dtype=np.float32)
+    for t0 in range(40, T, 50):
+        arm[t0:t0 + 6, :, 7] = 9.0                # right_shoulder flail
+    flail = kick_events_score(arm, g, joint_indices=[2, 3, 4, 5])  # legs only
+    assert flail["kick_events"] == 0.0, flail
+
+
+def test_kick_spec_reports_kick_events_diagnostic() -> None:
+    """§Ship 36: g1_kick now reports the monotone kick_events sub-component
+    alongside the legacy (confounded) spec_score, for the diagnoser (F2)."""
+    out = spec_g1_kick(
+        {"joint_vel": _bursty_vel(), "projected_gravity_b": _upright_g()},
+        {}, {"joint_names": _NAMES_12},
+    )
+    assert "kick_events" in out and "kick_events_per_env" in out
+    assert 0.0 <= out["kick_events"] <= 1.0
+
+
+def test_make_spec_fitness_fn_reads_rollout_score(tmp_path) -> None:
+    """§Ship 34: make_spec_fitness_fn(name)(iter_dir) returns the named
+    spec's score on iter_dir/rollout, 0.0 on missing artifacts, and
+    raises on an unknown metric name (fail-fast before any GPU work)."""
+    from sculptor.eval.spec_metrics import make_spec_fitness_fn
+
+    fn = make_spec_fitness_fn("cartpole_balance")
+    rollout = tmp_path / "rollout"
+    rollout.mkdir()
+    (rollout / "behavior.json").write_text(
+        json.dumps({"mean_episode_length": 450, "max_episode_steps": 500}),
+        encoding="utf-8",
+    )
+    assert fn(tmp_path) == pytest.approx(0.9)
+    # §Ship 36 (F2): the fitness fn also exposes a `.detail` accessor that
+    # returns the FULL component dict for the diagnoser (not just the score).
+    assert hasattr(fn, "detail")
+    d = fn.detail(tmp_path)
+    assert isinstance(d, dict) and d.get("spec_score") == pytest.approx(0.9)
+    # missing rollout artifacts → honest 0.0, never a raise
+    assert make_spec_fitness_fn("go1_trot")(tmp_path / "nope") == 0.0
+    with pytest.raises(KeyError):
+        make_spec_fitness_fn("not_a_metric")
+
+
+def test_spec_metric_names_lists_all() -> None:
+    from sculptor.eval.spec_metrics import spec_metric_names
+
+    assert spec_metric_names() == [
+        "cartpole_balance", "g1_floss", "g1_kick", "go1_trot",
+    ]
+
+
+def test_spec_metric_robot_warning() -> None:
+    """§Ship 34: warn on a metric/robot mismatch, stay silent on a match
+    or when info is missing (never blocks)."""
+    from sculptor.eval.spec_metrics import spec_metric_robot_warning
+
+    # match → no warning
+    assert spec_metric_robot_warning("go1_trot", "Mjlab-Velocity-Flat-Unitree-Go1") is None
+    assert spec_metric_robot_warning("g1_kick", "Mjlab-Velocity-Flat-Unitree-G1") is None
+    # mismatch → warning mentioning both
+    w = spec_metric_robot_warning("go1_trot", "Mjlab-Velocity-Flat-Unitree-G1")
+    assert w and "go1_trot" in w and "G1" in w
+    # missing info → silent
+    assert spec_metric_robot_warning(None, "x") is None
+    assert spec_metric_robot_warning("go1_trot", None) is None
 
 
 def test_cartpole_spec_from_behavior() -> None:

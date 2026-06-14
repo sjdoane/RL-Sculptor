@@ -604,6 +604,7 @@ export async function listJobs(opts?: {
 
 // ── Runs ──────────────────────────────────────────────────────────────
 import type {
+  RunControlState,
   RunDetail,
   RunParamsPayload,
   RunSummary,
@@ -641,6 +642,27 @@ export async function killRun(
   return handle<RunSummary>(
     await fetch(`/api/projects/${slug}/runs/${runId}`, {
       method: "DELETE",
+    }),
+  );
+}
+
+// §Ship 39 (H1): interactive control for a live run — flip Auto/Manual,
+// resume a pause (optionally with human feedback), or stop cleanly.
+export async function controlRun(
+  slug: string,
+  runId: string,
+  body: {
+    mode?: "manual" | "auto";
+    resume?: boolean;
+    feedback?: string | null;
+    stop?: boolean;
+  },
+): Promise<RunControlState> {
+  return handle<RunControlState>(
+    await fetch(`/api/projects/${slug}/runs/${runId}/control`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
     }),
   );
 }
@@ -728,6 +750,10 @@ export interface RunMissionRequestBody {
   max_extensions_per_stage?: number;
   extension_factor?: number;
   extension_improvement_threshold?: number;
+  // §Ship 34/35: per-stage objective fitness-in-the-loop (built-in name
+  // or "gen:<id>") + observe/steer mode.
+  fitness_metric?: string | null;
+  fitness_mode?: "observe" | "steer";
 }
 
 export async function runMission(
@@ -773,4 +799,33 @@ export async function getDashboard(): Promise<DashboardSummary> {
 
 export async function getSystemInfo(): Promise<SystemInfo> {
   return handle<SystemInfo>(await fetch("/api/system/info"));
+}
+
+// ── §Ship 35: auto-generated objective metrics ────────────────────────
+import type { MetricSummary } from "./types";
+
+export async function listProjectMetrics(slug: string): Promise<MetricSummary[]> {
+  return handle<MetricSummary[]>(await fetch(`/api/projects/${slug}/metrics`));
+}
+
+export async function generateProjectMetric(
+  slug: string,
+  body: { behavior_goal: string; review?: boolean; calibrate_against?: string | null },
+): Promise<MetricSummary> {
+  return handle<MetricSummary>(
+    await fetch(`/api/projects/${slug}/metrics/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  );
+}
+
+export async function calibrateProjectMetric(
+  slug: string, metricId: string, against: string,
+): Promise<MetricSummary> {
+  return handle<MetricSummary>(
+    await fetch(`/api/projects/${slug}/metrics/${metricId}/calibrate?against=${encodeURIComponent(against)}`,
+      { method: "POST" }),
+  );
 }

@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from sculptor.eval.benchmarks import BENCHMARKS, BenchmarkTask, get_benchmark
-from sculptor.eval.spec_metrics import compute_spec_metrics
+from sculptor.eval.spec_metrics import compute_spec_metrics, make_spec_fitness_fn
 from sculptor.eval.stats import iqm, stratified_bootstrap_ci
 
 #: Adapter short-name → dotted class path for scaffolded configs.
@@ -179,6 +179,12 @@ class CampaignConfig:
     #: Eureka condition: candidates per generation (generations =
     #: `iterations`, so a eureka job trains iterations × eureka_k runs).
     eureka_k: int = 4
+    #: §Ship 33: feed the benchmark spec metric INTO the sculpt loop as a
+    #: ground-truth fitness signal (fitness-guided diagnose + best-by-
+    #: fitness selection + plateau early-stop). Removes the eval asymmetry
+    #: where only eureka could select on fitness. Default False = the
+    #: blind, spec-unaware loop (the original E4 condition).
+    fitness_in_loop: bool = False
     #: test seam — overrides the adapter class in scaffolded configs.
     adapter_class_override: Optional[str] = None
 
@@ -311,6 +317,11 @@ def _run_mission_mode(
             # Adaptive early stop is part of the SYSTEM under test —
             # a stage exits the moment its criterion holds.
             early_stop_on_criterion=True,
+            # §Ship 34: when fitness-in-loop is on, every stage's sculpt
+            # loop is guided by (and best-selects on) the benchmark spec
+            # metric — uniform across stages (sound for single-skill
+            # benchmarks; the curriculum sub-goals all serve the one task).
+            fitness_metric=(bench.spec_metric if cfg.fitness_in_loop else None),
         )
     finally:
         if kg_store is not None:
@@ -446,6 +457,13 @@ def _run_job(
         elif condition.mode == "sculpt":
             from sculptor.sculpt import sculpt_run
 
+            # §Ship 33: optional fitness-in-loop — the loop sees the
+            # benchmark's spec metric as ground-truth fitness (same signal
+            # eureka selects on), making diagnose/selection fitness-guided.
+            fitness_fn = (
+                make_spec_fitness_fn(bench.spec_metric)
+                if cfg.fitness_in_loop else None
+            )
             sculpt_run(
                 config_path=config_path,
                 behavior_goal=bench.behavior_goal,
@@ -455,6 +473,8 @@ def _run_job(
                 steps_per_iter=cfg.steps_per_iter,
                 rollout_episodes=cfg.rollout_episodes,
                 seed=seed,
+                fitness_fn=fitness_fn,
+                fitness_target=cfg.spec_threshold,
             )
         elif condition.mode == "eureka":
             from sculptor.eval.eureka import run_eureka_job
@@ -491,7 +511,12 @@ def _run_job(
         # Eureka's DEFINED output (Ma et al. Algorithm 1) is the best
         # reward across all generations — scoring its last generation
         # would strawman the baseline. Sculpt conditions are scored on
-        # their last reward because they cannot select on the spec.
+        # their last reward because they cannot select on the spec...
+        final = best
+    elif condition.mode in ("sculpt", "mission") and cfg.fitness_in_loop:
+        # §Ship 33: ...UNLESS fitness-in-loop is on — then the loop DID
+        # select on the spec (best-by-fitness current.py), so its defined
+        # output is the best, scored apples-to-apples with eureka.
         final = best
     else:
         final = scores[-1] if scores else 0.0

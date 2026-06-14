@@ -670,6 +670,77 @@ def _cmd_train(args: argparse.Namespace) -> None:
     print(json.dumps({"status": "ok", "checkpoint": str(ckpt_path)}))
 
 
+def _apply_ground_texture(env_cfg: Any) -> None:
+    """§Ship 35: give the rendered floor an IMAGE texture instead of the
+    default solid/checker terrain. PURELY COSMETIC and rollout-render only.
+
+    FULLY DEFENSIVE by design — this runs on the training/rollout
+    subprocess, so it must NEVER break a rollout: every failure path
+    (missing asset, mjlab without `scene.spec_fn`, MjSpec API drift) leaves
+    `env_cfg` untouched and the default ground in place. Toggle/override
+    via `SCULPTOR_GROUND_TEXTURE` ('0'/'off'/'false' disables; a file path
+    overrides the shipped texture). The MjSpec texture→material→geom API is
+    verified against mujoco 3.7; on any version drift it silently no-ops.
+    """
+    import os
+
+    setting = os.environ.get("SCULPTOR_GROUND_TEXTURE", "").strip()
+    if setting.lower() in ("0", "off", "false", "no"):
+        return
+    try:
+        from pathlib import Path as _Path
+
+        if setting and _Path(setting).is_file():
+            tex_path = setting
+        else:
+            from importlib.resources import files
+
+            tex_path = str(files("sculptor.assets.textures") / "ground.png")
+        if not _Path(tex_path).is_file():
+            return
+        scene = getattr(env_cfg, "scene", None)
+        if scene is None or not hasattr(scene, "spec_fn"):
+            return
+
+        import mujoco
+
+        prev_spec_fn = getattr(scene, "spec_fn", None)
+        _GROUND_TOKENS = ("terrain", "floor", "ground")
+
+        def _ground_spec_fn(spec: Any) -> None:
+            # Chain any pre-existing spec_fn FIRST so we never clobber it.
+            if callable(prev_spec_fn):
+                prev_spec_fn(spec)
+            try:
+                tex = spec.add_texture()
+                tex.name = "rs_ground_tex"
+                tex.type = mujoco.mjtTexture.mjTEXTURE_2D
+                tex.file = tex_path
+                mat = spec.add_material()
+                mat.name = "rs_ground_mat"
+                mat.texrepeat = [12, 12]
+                mat.reflectance = 0.15
+                mat.textures[int(mujoco.mjtTextureRole.mjTEXROLE_RGB)] = "rs_ground_tex"
+                assigned = 0
+                for g in spec.geoms:
+                    name = (g.name or "").lower()
+                    is_plane = getattr(g, "type", None) == mujoco.mjtGeom.mjGEOM_PLANE
+                    if is_plane or any(tok in name for tok in _GROUND_TOKENS):
+                        g.material = "rs_ground_mat"
+                        assigned += 1
+                if assigned == 0:
+                    print("[runner] ground texture: no floor geom matched; "
+                          "leaving default ground", file=sys.stderr, flush=True)
+            except Exception as e:  # noqa: BLE001 — cosmetic; never break rollout
+                print(f"[runner] ground texture skipped (spec edit failed): "
+                      f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
+
+        scene.spec_fn = _ground_spec_fn
+    except Exception as e:  # noqa: BLE001 — cosmetic; never break rollout
+        print(f"[runner] ground texture setup skipped: {type(e).__name__}: {e}",
+              file=sys.stderr, flush=True)
+
+
 def _cmd_rollout(args: argparse.Namespace) -> None:
     """Run `n_episodes` rollouts and record a video for behavioral review.
 
@@ -717,6 +788,8 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
 
     env_cfg = load_env_cfg(args.task_id)
     env_cfg.scene.num_envs = num_envs
+    # §Ship 35: textured floor in the rendered rollout (cosmetic, guarded).
+    _apply_ground_texture(env_cfg)
     env = ManagerBasedRlEnv(
         env_cfg, device=args.device, render_mode="rgb_array"
     )

@@ -133,6 +133,10 @@ function prettyLabel(ev: RunEvent): string {
     case "citation_added": return `citation_added v${ev.reward_version} arxiv=${ev.arxiv_id}`;
     case "iter_completed": return `iter_completed${iter} metric=${fmtNum(ev.primary_metric)} Δ=${fmtNum(ev.metric_delta)} failure_modes=${JSON.stringify(ev.failure_modes ?? [])}`;
     case "metric_history": return `metric_history len=${Array.isArray(ev.history) ? (ev.history as unknown[]).length : "?"}`;
+    // §Ship 34: objective fitness-in-the-loop.
+    case "iter_fitness": return `iter_fitness${iter} fitness=${fmtNum(ev.fitness)} best=${fmtNum(ev.best_so_far)} Δ=${fmtNum(ev.delta_vs_previous)}`;
+    case "best_reward_selected": return `best_reward_selected${iter} fitness=${fmtNum(ev.fitness)} reward=${String(ev.reward ?? "?")}`;
+    case "fitness_metric_warning": return `⚠ fitness_metric_warning ${String(ev.message ?? "")}`;
     case "early_stop": return `early_stop at iter=${ev.at_iter ?? "?"} reason=${ev.reason ?? ""}`;
     case "run_started": return `run_started iterations=${ev.iterations} goal=${ev.behavior_goal ?? ""}`;
     case "run_completed": return `run_completed rc=${ev.return_code} iters=${ev.iterations_run}`;
@@ -174,6 +178,11 @@ const BADGE_STYLES: Record<string, string> = {
   edit_applied: "#13302c|#5fd0c0",
   citation_added: "#13302c|#5fd0c0",
   metric_history: "#2c2a20|#aaa698",
+  // §Ship 34: objective fitness — violet for the per-iter signal, green
+  // for the best-by-fitness pick (matches run_completed's success green).
+  iter_fitness: "#1e1b3a|#a99cf0",
+  best_reward_selected: "#16302a|#5fd0a0",
+  fitness_metric_warning: "#3a2c12|#f0b35a",
   // §Ship 23d: remote-dispatch lifecycle — teal for progress, amber for
   // degraded-but-recovering, rose for failures.
   remote_dispatch_started: "#13302c|#5fd0c0",

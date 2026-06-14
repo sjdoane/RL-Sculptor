@@ -39,6 +39,7 @@ class Relation(str, enum.Enum):
     EVALUATES_ON   = "EVALUATES_ON"
     REPORTS        = "REPORTS"
     IMPROVES_OVER  = "IMPROVES_OVER"
+    INSTANTIATES   = "INSTANTIATES"   # §Ship 37: RunCase → FailureMode
 
 
 # ── Node dataclasses ────────────────────────────────────────────────────────
@@ -116,6 +117,30 @@ class Result:
 
 
 @dataclass
+class RunCase:
+    """§Ship 37: a recorded run-iteration learning — a failure observed in a
+    sculpt iteration, the edit tried in response, and whether the OBJECTIVE
+    fitness then improved or regressed. Lets the diagnoser retrieve "what was
+    tried before on this failure / task" so the same dead-end isn't repeated
+    ("the same failure can't happen twice"). Distinct from the literature
+    nodes: cases are this system's OWN experience — fast-moving, run-scoped,
+    retrieved by semantic similarity like Techniques, kept in a separate silo
+    so transient run artifacts never pollute the published-knowledge graph."""
+    kind: ClassVar[str] = "RunCase"
+    id: str
+    task: str                                  # the behavior goal
+    robot: str = ""                            # env / robot tag (optional)
+    symptom: str = ""                          # short failure description
+    failure_modes: list[str] = field(default_factory=list)
+    edit_summary: str = ""                     # what was changed in response
+    fitness_before: float | None = None
+    fitness_after: float | None = None
+    fitness_delta: float | None = None
+    verdict: str = "unknown"                   # helped|regressed|neutral|unknown
+    created_at: float = field(default_factory=time.time)
+
+
+@dataclass
 class Edge:
     src: str
     dst: str
@@ -160,10 +185,18 @@ def make_result_id(paper_id: str, metric_name: str, environment_id: str | None) 
     return f"result:{paper_slug}|{metric_slug}|{env_slug}"
 
 
+def make_run_case_id(task: str, iter_index: int, nonce: str) -> str:
+    """§Ship 37: unique per (task, iter, run). `nonce` (a per-run token)
+    distinguishes runs so cases ACCUMULATE across runs rather than overwrite —
+    the whole point is to build an experience base over time."""
+    return f"case:{_slugify(task)[:24]}:{int(iter_index)}:{_slugify(nonce)[:12]}"
+
+
 # ── Serialization helpers ───────────────────────────────────────────────────
 NODE_TYPES: dict[str, type] = {
     cls.kind: cls  # type: ignore[attr-defined]
-    for cls in (Paper, Technique, FailureMode, RewardComponent, Environment, Result)
+    for cls in (Paper, Technique, FailureMode, RewardComponent, Environment,
+                Result, RunCase)
 }
 
 

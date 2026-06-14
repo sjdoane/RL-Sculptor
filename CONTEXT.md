@@ -339,6 +339,467 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-14 — Ship 39: interactive human-in-the-loop (H1) — pause-for-feedback by default + an always-on Auto/Manual switch + video feedback into the diagnoser
+
+- **Why**: Sam — the default should be to PAUSE between every iteration so a
+  human can steer from what they SEE in the rollout video (richer than the
+  metrics — e.g. "it's standing still and flailing its arms, not kicking"),
+  with a big switch near the top to flip to full-auto at ANY point. Directly
+  compensates for the C2 gap (the diagnoser's weak scalar signal) that Ship 36
+  identified in the kick run.
+- **What** (additive; the default for non-UI / CLI is fully automated and
+  byte-identical to before):
+  - **Sculptor** (`sculpt.py`, `diagnose.py`, `cli.py`):
+    `sculpt_run(control_file=, feedback_timeout=3600, feedback_poll_interval=2)`
+    — at each iteration boundary (except the last), if a control sidecar is
+    wired AND mode=='manual', emit `awaiting_feedback` and BLOCK-poll the
+    sidecar until the human resumes (optionally with feedback), flips to auto,
+    stops, or the timeout fires (auto-resume — never pins the GPU). The
+    feedback threads into the NEXT iter's `diagnose(human_note=...)` as a
+    prominent "# USER OBSERVATION" block (review iter N → steer iter N+1).
+    `_read_control_file`/`_pause_for_feedback` (the subprocess only READS the
+    sidecar — the backend is the sole writer, so no write-race). CLI
+    `--control-file`/`--feedback-timeout`. Missions are intentionally NOT
+    wired (no control_file passed → no pause).
+  - **Backend** (`run_manager.py`, `models/run.py`, `routes/runs.py`): every
+    UI run ALWAYS writes a deterministic control sidecar
+    (`runs/_control_<id>.json`) + passes `--control-file`, so the toggle works
+    at ANY point; initial mode from `RunParams.start_mode` (default "auto" —
+    non-UI launches never pause/hang). `PATCH /runs/{id}/control` merges
+    {mode, resume(+feedback), stop} into the sidecar (atomic tmp+rename;
+    resume bumps a token); `RunSummary.mode` for reconnect. Feedback/control
+    events tee over the existing WS.
+  - **Frontend** (`RunsTab.tsx`, `NewRunDialog.tsx`, `useRuns.ts`, `api.ts`,
+    `types.ts`): a prominent Auto/Manual switch in the run header (flippable
+    any time → PATCH), an inline FeedbackPanel (textarea + "Continue" /
+    "Continue + go Auto") shown when paused; `awaiting`/`mode` derived from the
+    event stream + seeded from `run.data.mode` for reconnect. NewRunDialog
+    defaults "Pause for my feedback each iteration" ON (the requested default).
+- **Review** (adversarial agent, all 10 pressure-tests vs source): 1 MEDIUM
+  fixed — the sidecar `feedback` field isn't cleared, so a BARE Auto-flip
+  (toggle, no resume) would re-inject the prior iteration's stale note; fixed
+  by carrying feedback only on an EXPLICIT resume (resume-token bump), which
+  preserves the "Continue + go Auto" feedback path while ignoring a bare flip
+  (subprocess stays read-only — no sidecar write-race). 1 LOW noted (a PATCH
+  landing in the tiny window before the runner's initial sidecar write could
+  be clobbered — the UI can't surface controls that early; left as-is).
+  Verified: byte-identical default (control_file=None → pause skipped,
+  human_note None), last-iter skip, timeout safety, deterministic path, PATCH
+  semantics, event teeing, mission isolation, frontend derived-state reset.
+- **Verified (no GPU/API)**: gates green — **sculptor 605 passed / 1 skip (was
+  604; +1 net); backend 333 / 1 deselected; frontend `pnpm build` clean**. New
+  `tests/test_interactive.py` (10): control-file parse, pause
+  auto/stop/resume/bare-auto-flip/continue-and-go-auto/timeout branches,
+  human_note threads to the NEXT iter, user-stop ends early, USER OBSERVATION
+  render. New backend tests: runner writes sidecar + `--control-file` flag,
+  defaults to auto, PATCH merges mode/resume+feedback/stop + 404. The full
+  pause→feedback→steer cycle needs a live run (GPU/API); the mechanism is
+  unit-tested end-to-end at each layer. Not git-committed (Ships 33–38 also
+  uncommitted; commit strategy deferred to Sam).
+
+### 2026-06-14 — Ship 38: per-stage mission steering metrics (M1) — each curriculum phase steers by its OWN objective
+
+- **Why**: Sam — "for a mission, each stage would need to create and use a
+  DIFFERENT steering metric." Verified: Ship 34 resolved ONE `fitness_metric`
+  and applied it uniformly to every stage (`mission_run` resolved it once,
+  forwarded identically) — unsound for a true curriculum where a "balance on
+  one leg" stage and a "kick" stage have orthogonal objectives. The
+  quality-evaluation machinery Sam wanted ("a way to evaluate the metric's
+  quality") already exists (metric_gen independent review + metric_calibration
+  Spearman firewall, Ship 35).
+- **What** (additive; the uniform/blind default is byte-identical):
+  - **Data model** (`mission.py`): `Stage.steering_metric: Optional[str]` — a
+    built-in spec name or a resolved generated-metric path; OVERRIDES the
+    mission-level metric for that stage. Serializes via asdict; older
+    mission.json load with None (from_dict filter). Light structural
+    validation (non-empty, ≤128 chars).
+  - **Orchestration** (`sculpt.py` `mission_run`): pre-resolve the mission
+    metric + ALL distinct per-stage metrics up front into a cache (FAIL-FAST
+    before GPU work; a generated module loads once; skips already-succeeded
+    stages on resume), a `_fitness_fn_for_stage` closure (stage metric →
+    mission metric → None), an emitted `stage_fitness_metric` event (metric +
+    source), and `_run_one_stage(fitness_fn=<per-stage>)`. Composes cleanly
+    with Ship-36 revert/observe (only `fitness_fn` varies per stage).
+  - **Decompose authoring** (`decompose.py` + user content): the decomposer MAY
+    author a `steering_metric` per stage, restricted to KNOWN built-in spec
+    names (`_validate_steering_metrics` rejects unknown → re-parse; generated
+    paths come from the UI, not the LLM), normalized ""→None, surfaced via an
+    `AVAILABLE_FITNESS_METRICS` block with a conservative "only a correct fit,
+    else null" instruction. Re-decomposed sub-stages inherit the failed stage's
+    metric.
+- **Honest scope**: this is the PLUMBING + decompose authoring (functional
+  end-to-end: create a mission → decompose may assign per-stage built-in
+  metrics → run uses them). Per-stage GENERATED metrics for genuinely novel
+  curricula (e.g. a quadruped jump's crouch→launch→flight→land) need the
+  novel-task calibration path (the deferred M2/Later) before they can STEER —
+  today a stage's uncalibrated generated metric would be observe-only. A
+  dedicated per-stage-metric UI EDITOR is a follow-on (the field flows through
+  mission.json + the `stage_fitness_metric` event is on the WS stream).
+- **Review** (adversarial agent, all 8 pressure-tests vs source): no
+  CRITICAL/HIGH. 2 LOWs applied — removed dead `_mission_fitness_fn`;
+  pre-resolution now skips already-succeeded stages so a resumed mission isn't
+  fail-fast'd by a deleted path-metric on a stage that won't run. Verified:
+  fallback precedence, fail-fast cache, byte-identical back-compat (None
+  everywhere → `fitness_fn=None` per stage, event not emitted), resume
+  round-trip, decompose validation, redecompose inheritance, Ship-36
+  revert/observe composition.
+- **Verified (no GPU/API)**: gates green — **sculptor 595 passed / 1 skip (was
+  588; +7); backend 330 / 1 deselected; frontend untouched (clean)**. New
+  `tests/test_per_stage_metrics.py` (6) + `test_mission_run.py::test_mission_run_per_stage_steering_metric`
+  (a per-stage-override stage + a mission-fallback stage get the right tagged
+  fitness fn + events). Efficacy needs a multi-phase GPU mission. Not
+  git-committed (Ships 33–37 also uncommitted; deferred to Sam).
+
+### 2026-06-14 — Ship 37: KG case-memory — runs write their own learnings back; the diagnoser reads them ("the same failure can't happen twice")
+
+- **Why**: Sam — store run-learnings into the KG so the same failure can't
+  recur, and judge whether the KG is even the right structure. Verified read:
+  the KG was READ-ONLY literature (SQLite; Paper/Technique/FailureMode/Reward
+  Component/Environment/Result; MiniLM cosine + failure-mode graph walk) —
+  `add_node` is called ONLY in ingest/extract; no run outcome ever comes back,
+  so every diagnosis starts blind to what the last run already tried.
+  Efficiency verdict (me + adversarial review): the store is already generic +
+  extensible (generic `add_node`/`neighbors`, `Edge.data` dict, the embeddings
+  table, a `Result` node precedent) — a structural PIVOT is unjustified scope
+  creep. Add a case layer; don't rebuild.
+- **What** (additive; ZERO store-schema change):
+  - **`RunCase` node + `INSTANTIATES` relation** (`kg/schema.py`): one case per
+    fitness-tracked iteration (task, robot, symptom, failure_modes,
+    edit_summary, fitness before/after/delta, verdict ∈
+    helped|regressed|neutral|unknown). `make_run_case_id(task, iter, nonce)` —
+    the per-run nonce makes cases ACCUMULATE (build an experience base) rather
+    than overwrite. Registered in `NODE_TYPES`; serializes via the generic
+    `node_to_row` path (no store change).
+  - **`kg/cases.py`** (new): `record_run_cases` (write-back; FORWARD
+    attribution — iter N's edit judged by the fitness change at N+1) +
+    `query_cases`/`_ensure_case_embeddings`/`CaseMatch` (semantic retrieval
+    mirroring `query_semantic`: same MiniLM model, lazy embedding backfill,
+    floored at `DEFAULT_MIN_PROMPT_SIMILARITY`) + `_render_case_context` (a
+    "CASE MEMORY" prompt block marking [+] helped / [-] regressed). Cases are a
+    SEPARATE silo, merged with the literature only at prompt time.
+  - **Write-back** (`sculpt.py`): at the end of `sculpt_run`, a guarded
+    best-effort `record_run_cases` (only when not `--no-kg` AND fitness tracked;
+    reopens its own store since the loop's is closed in the finally; never
+    affects the run). Emits `run_cases_recorded`.
+  - **Read-side** (`diagnose.py`): the grounded-diagnosis KG block now also
+    retrieves cases (skipped under `--no-kg`) and PREPENDS the CASE MEMORY block
+    to `kg_context`, reusing the diagnoser's store without closing it.
+- **Review** (adversarial agent, all 8 pressure-tests vs source): 1 HIGH fixed
+  — a cross-ship interaction with Ship-36 F1: when iter N regresses, N+1
+  REVERTS to the best reward, so `fits[N+1]` re-measures the best (high) → the
+  regressing edit would be recorded "helped" and then RECOMMENDED to future
+  runs (backwards). Fix: added `IterOutcome.reverted_to_best`; `record_run_cases`
+  drops the forward delta (verdict 'unknown') when N+1 reverted. Everything else
+  checked out (write-back lifecycle / no double-close, observe-mode recording is
+  valid-but-correlational, diagnose store-ownership, retrieval ranking, schema
+  round-trip, accumulation, no import cycle). LOW noted: unbounded case growth
+  (fine to ~10k; a recency/`top_k` cap is the future lever).
+- **Verified (no GPU/API)**: gates green — **sculptor 588 passed / 1 skip (was
+  580; +8); backend 330 / 1 deselected (no breakage); frontend untouched (clean
+  from Ship 36)**. New `tests/test_kg_cases.py` (8): verdict thresholds, record
+  nodes+edges+forward-attribution, the REVERT non-attribution, skip-empty-
+  learning, accumulate-across-runs, cosine ranking + similarity floor, empty
+  store, render marks. Efficacy (does case memory actually stop a repeat
+  failure?) needs a multi-run GPU/API session. Not git-committed (Ships 33–36
+  also uncommitted; commit strategy deferred to Sam).
+
+### 2026-06-14 — Ship 36: steering fixes — revert-on-regression (F1) + metric breakdown to the diagnoser (F2) + monotone kick-event diagnostic & flail-hack validator gate (F3)
+
+- **Why**: Sam's Unitree-G1 `g1_kick` STEER A/B reward-hacked — best fitness
+  at iter 1, by iter 3 the policy stood and flailed its arms; the loop's own
+  diagnoser recognized it but couldn't stop it. Root cause (verified at source
+  + a 7-agent research/red-team workflow): Ship 33/34 fitness-in-the-loop gave
+  SELECTION (best-by-fitness kept the iter-1 reward — the final output was
+  protected) but not SEARCH. (C1) each iter edits forward from the *latest*
+  reward (`sculpt.py` `_run_one_iter` `reward_path_before`/`latest_reward_file`),
+  so a bad edit compounds; the best-by-fitness repoint only fires at run END.
+  (C2) the diagnoser saw only a scalar fitness, not WHY it fell. (C3) the kick
+  metric's leg-isolation is conditional on joint-name metadata and its
+  peak/median ratio is extremal-Goodhart. Best at iter 1 = the LLM's seed was
+  never beaten across 6 iters → steering provided no climbable signal.
+- **What** (sculptor-only; all flag-gated; the blind no-`fitness_fn` loop is
+  byte-identical):
+  - **F1 revert-on-regression** (`sculpt.py`): new `fitness_revert: bool = True`
+    on `sculpt_run`/`mission_run`/`_run_one_stage`; `_run_one_iter` gains
+    `revert_base`. In STEER mode (not observe), when an iter fails to set a new
+    best the loop hands the NEXT iter the best-so-far reward
+    (`SculptRunResult.best_reward_path`) as BOTH its training and edit base
+    (best-first search vs a drifting random walk) — the deferred Ship-33 "edit
+    accept/reject". Repoints `current.py`, sets `reward_path_trained`, emits
+    `reward_reverted_to_best`, and tells the diagnoser "your last edit regressed
+    — try a DIFFERENT direction". Plateau early-stop is unchanged. CLI
+    `--fitness-revert/--no-fitness-revert` on `run` + `mission-run`.
+  - **F2 metric breakdown to the diagnoser** (`spec_metrics.py`,
+    `generated_metric.py`, `sculpt.py`, `diagnose.py`): the fitness fn now
+    carries a `.detail` accessor returning the FULL component dict (one compute,
+    no new threaded params); `_run_one_iter` puts the filtered sub-components
+    (`_fitness_components_for_prompt`) into `objective_progress["components"]`;
+    the diagnose prompt renders a "fitness component breakdown" block so the LLM
+    can localize "not kicking" (low `kick_events`/`uprightness` high) vs "kick
+    too weak". Observe mode still nulls it out.
+  - **F3 kick-metric hardening** (`spec_metrics.py`, `metric_validate.py`): new
+    monotone `kick_events_score` (discrete refractory-gated leg-event count,
+    invariant to sub-threshold baseline motion — the audit-prescribed signal);
+    `spec_g1_kick` now REPORTS `kick_events`/`kick_events_per_env` as a
+    diagnostic. Its `spec_score` formula is **intentionally UNCHANGED** — the
+    calibration-fence swap needs real-rollout threshold calibration (the
+    Ship-33/34 deferral; `_bursty_vel`'s 3-frame test bursts smooth below a
+    5 rad/s gate, so a blind swap would zero the existing kick tests). The
+    generated-metric validator gains an `upright_flail` archetype + a
+    non-degeneracy gate (`active` must beat it) that rejects motion-magnitude
+    "stand-and-flail" metrics — strengthening the metric-quality firewall.
+- **How / trade-offs**: `.detail` rides on the fitness-fn object so F2 needed
+  ZERO new params through sculpt_run/mission_run. F1 reverts the EDIT BASE (not
+  a hard stop) so the loop keeps searching from the best. Defaulting
+  `fitness_revert=True` changes STEER behavior (intended; steer is opt-in +
+  barely used) but is byte-identical with no `fitness_fn`. F3 deliberately does
+  NOT swap the kick `spec_score` (would blindly retune calibration-fence
+  thresholds without a GPU run).
+- **Review** (adversarial agent, all 8 pressure-tests verified vs source): 1
+  MEDIUM fixed — a revert on a crash-RESUMED iter would reuse a stale
+  `iter_<i>/checkpoint.pt` trained on the DEGRADED reward (`_train_or_resume`
+  "resume wins"); the revert block now invalidates `checkpoint.{pt,zip}` so
+  training re-runs on the reverted reward. 2 LOWs accepted/documented:
+  `iter_started.reward_version_before` shows the latest (not reverted) version
+  on a reverted iter (truth carried by the separate `reward_reverted_to_best`
+  event); the `upright_flail` archetype would reject a FUTURE leg-kick generated
+  metric (harmless today — no shipped metric is motion-magnitude-based; revisit
+  when `kick_events` is promoted, adding a travel/coordination discriminator).
+- **Verified (no GPU/API)**: gates green — **sculptor 580 passed / 1 skip (was
+  571; +9 new); backend 330 / 1 deselected (no breakage); frontend `pnpm build`
+  clean**. New tests: kick-events monotonicity + baseline-invariance +
+  arm-flail-rejection, g1_kick reports kick_events, `.detail` accessor,
+  validator rejects flail-rewarder; F1 revert targets best on regression,
+  observe-only never reverts, `--no-fitness-revert` keeps the forward base,
+  components-filter, diagnose renders breakdown + revert note. Efficacy (does
+  best-first steering now CLIMB past iter 1 on the real kick task?) needs the
+  GPU re-run. NOT git-committed: Ships 33–35 are already uncommitted in the tree
+  (HEAD=Ship 32a) — commit strategy deferred to Sam at end of the 36–39 arc.
+
+### 2026-06-14 — Ship 35: auto-generated objective metrics (observe→earn-steer) + fitness-as-PRIMARY UI + observe/steer mode + textured ground
+
+- **Why**: the trot run hit fitness=1.0 even blind → trot isn't a
+  discriminating task, and hardcoding fitness to 4 built-in metrics
+  doesn't generalize. Sam: auto-GENERATE a per-task objective metric
+  (yes/no, not a dropdown of premades), gate it with a reviewer, show the
+  objective score even when not steering, make fitness the PRIMARY tracked
+  metric, and texture the ground. Steer-policy approved: observe-by-
+  default, earn-steer-by-calibration (the circularity firewall — an LLM
+  that writes both reward AND metric can't self-grade).
+- **Design spine** (from a 3-agent research+red-team workflow): a
+  generated metric is a PHYSICAL-quantity function over rollout arrays
+  (never LLM judgment); it must pass must-have gates + an independent
+  review to be ACCEPTED, and Spearman-calibrate vs a hand-authored ground
+  truth to earn STEER. The 4 hand-authored specs never retire (calibration
+  fence). Honest claim: "auto-generated objective PROXY with gates", not
+  ground truth.
+- **What** (all additive; default-OFF byte-identical to before):
+  - **Observe/steer** (`fitness_observe_only`): observe computes + emits
+    fitness but severs ALL influence (objective_progress=None to diagnose,
+    no best-by-fitness `current.py` repoint, no fitness early-stop) — for a
+    fair blind-vs-guided A/B and as the safe default for uncalibrated
+    generated metrics. Threaded sculpt_run → mission_run → _run_one_stage;
+    CLI `--fitness-mode`; RunParams/RunMissionRequest.fitness_mode;
+    run_manager/mission_jobs forward it.
+  - **Generated-metric pipeline** (new `sculptor/eval/`): `generated_metric`
+    (load/compute/`resolve_fitness_fn` for a built-in name OR a generated
+    .py path); `metric_validate` (AST safety / array-contract / determinism
+    / bounds / non-degeneracy archetype gates); `metric_gen` (LLM generate
+    → validate → regenerate-on-failure → independent review;
+    prompts/gen_objective_metric.md + review_objective_metric.md);
+    `metric_calibration` (Spearman vs ground truth on a competence ladder).
+    CLI `sculpt gen-metric <goal> --out --calibrate-against`.
+  - **Fitness as PRIMARY metric (UI)**: RunsTab chart (title "Objective
+    fitness", reward demoted to a secondary spark), iteration card (fitness
+    prominent violet, reward small/muted), run-row + detail sparklines all
+    foreground fitness; MetricChart gained label/decimals; backend
+    RunSummary.fitness_history (derived in job_to_run_summary). Degrades to
+    the reward metric when no fitness exists.
+  - **UI generate flow**: backend routes/metrics.py (generate [threadpool,
+    ~1-2 min] / list / calibrate) + services/metric_store.py (per-project
+    `metrics/gen_NNN/`) + sculptor_bridge wrappers; run_manager resolves
+    `fitness_metric="gen:<id>"` → `<project>/metrics/<id>/metric.py`.
+    NewRunDialog: "Generate from goal" button → dropdown gains generated
+    metrics; an uncalibrated generated metric is observe-LOCKED (steer
+    disabled). hooks/useMetrics.ts.
+  - **Ground texture**: `_mjlab_runner._apply_ground_texture` sets
+    `env_cfg.scene.spec_fn` (ROLLOUT render only) adding an image texture
+    to floor/terrain geoms; FULLY guarded (any failure → default ground,
+    never breaks a rollout); shipped `sculptor/assets/textures/ground.png`;
+    `SCULPTOR_GROUND_TEXTURE` toggle. MjSpec texture→material→geom API
+    verified to compile offline (mujoco 3.7); visual needs a GPU render.
+- **Verified (no GPU/API, post-review)**: gates green — **sculptor 571 /
+  1 skip; backend 330; frontend `pnpm build` clean**. The run dialog has
+  the full loop: Generate-from-goal → observe → Calibrate-vs-built-in →
+  steer unlocks. New tests: test_generated_
+  metric (validator rejects forbidden-import/bad-array/rewards-stillness/
+  non-deterministic; generator mock accept/retry/review-veto; calibration
+  good-correlates/constant-fails — 11), test_ground_texture (compiles a
+  real MjSpec offline + toggle + chaining — 5), test_metrics_route (mocked
+  LLM: generate/list/calibrate/404 — 3). Efficacy (does a generated metric
+  beat blind? does the texture render?) needs a GPU/API run.
+- **Review** (3-lens adversarial workflow + verify pass): 6 confirmed-
+  serious, all FIXED — (CRITICAL) backend now gates uncalibrated generated
+  metrics from steering (`steer_allowed` in run_manager + mission_jobs,
+  not just the UI); (CRITICAL) `routes/runs.py::_run_summary` now populates
+  `fitness_history` (was empty in REST); (CRITICAL) `mission_jobs` now
+  RESOLVES `gen:<id>`→path (raw ref crashed missions); (HIGH) AST safety
+  blocks dunder NAMES incl. `__builtins__`; (HIGH×2) MissionAdvanced now
+  typed `string` + renders generated-metric optgroups + observe-locks
+  uncalibrated ones (was built-in-only). Plus MEDIUMs: calibration std
+  epsilon guard, metrics-route id/`against` validation (path-traversal),
+  atomic `gen_NNN` id allocation. New tests: __builtins__ escape,
+  gen-metric resolution + steer-downgrade (run + mission).
+- **Deferred / honest gaps**: mission fitness still uniform-metric-per-
+  stage (single-skill only); calibration is the synthetic-ladder proxy
+  (real-policy Spearman needs GPU); generate is synchronous (no job kind);
+  generate button is in the run dialog (missions select existing metrics).
+
+### 2026-06-13 — Ship 34: fitness-in-the-loop wired END-TO-END into the UI (CLI → backend → frontend) + kick-metric floor fix
+
+- **Why**: Ship 33 added fitness-in-the-loop as a CLI/campaign flag only.
+  Sam wants to TEST it in the UI on the local GPU, so it must be
+  UI-reachable (standing rule: no terminal after ./run.sh). Caveat that
+  drove the design: fitness needs an OBJECTIVE metric, which only exists
+  for the named spec metrics — so the UI attaches a chosen spec metric to
+  a free-text goal (e.g. goal "gallop forward fast" + fitness=go1_trot).
+- **What** (additive, flag/None-gated — default OFF is byte-identical to
+  the blind loop; verified by the review's default-OFF lens):
+  - **sculptor**: `spec_metrics.make_spec_fitness_fn(name)` + `spec_metric_names()`
+    + `spec_metric_robot_warning(name, task_id)`; `mission_run`/`_run_one_stage`
+    now thread `fitness_metric`/`fitness_target`/`fitness_patience` to every
+    stage's sculpt_run (uniform metric across stages — sound for
+    single-skill missions, documented); `cli.py` `run` + `mission-run` gain
+    `--fitness-metric/--fitness-target/--fitness-patience` (resolve name →
+    fitness_fn, fail-fast on bad name) + a soft mismatch WARNING
+    (`fitness_metric_warning` event) when the metric doesn't fit the
+    robot; `harness.py` uses the shared helper + wires the mission branch;
+    `eval/__init__` re-exports.
+  - **kick metric**: `burstiness(ratio_floor=0.5)` floors the ratio
+    denominator so a CLEAN kicker (median≈0) no longer scores 0.0 (the
+    one unambiguous Ship-33 audit bug). Scale-invariance for active
+    policies preserved; all existing kick/burst tests stay green. (Full
+    discrete-event redesign deferred — needs REAL-rollout calibration.)
+  - **backend**: `RunParams.fitness_metric` + `RunMissionRequest.fitness_metric`
+    (Literal of the 4 names, validated; bad value rejected by extra=forbid);
+    `run_manager` forwards `--fitness-metric` + stashes it; `mission_jobs`
+    `_build_mission_run_flags` forwards it + `_STAGE_TEE_EVENTS` tees the
+    new events; `IterEventSummary` + `_iter_events` carry `fitness`/
+    `best_fitness` so the REST timeline survives reload (review CRITICAL).
+  - **frontend**: "Objective fitness metric" dropdown in NewRunDialog +
+    MissionAdvanced (NewMission + RunMission, with run_defaults round-trip);
+    `SpecMetricName`/`SPEC_METRIC_NAMES` in types.ts; LogViewer renders
+    `iter_fitness`/`best_reward_selected`/`fitness_metric_warning` (labels +
+    badges); RunsTab iteration card shows a violet `fit X.XX (best Y.YY)`
+    chip; `IterEventSummary` fitness fields + `_mergeIterSlot` carry-over.
+- **Review** (3-lens adversarial workflow + verify pass): 1 CRITICAL + 1
+  HIGH, both fixed. CRITICAL = backend IterEventSummary missing fitness
+  fields (REST reload dropped the chip) → added fields + `_iter_events`
+  handlers. HIGH = no metric↔robot pre-flight (go1_trot on G1 wastes GPU
+  on a wrong objective) → soft, visible warning (not a hard block: the
+  metrics are partly robot-agnostic, so blocking would false-positive).
+  3 MEDIUMs accepted as documented limitations (no UI fitness_target
+  field; uniform mission metric; plateau patience=2 not UI-tunable).
+- **Verified (no GPU)**: gates green — **sculptor 554 / 1 skip; backend
+  325; frontend `pnpm build` clean (1956 modules)**. New tests:
+  clean-kicker floor, make_spec_fitness_fn, spec_metric_names,
+  spec_metric_robot_warning, and CLI/mission `--fitness-metric`
+  forwarding. Monotonicity audit: kick clean+monotone, trot monotone.
+  CLI `run`/`mission-run --help` show the flags. Efficacy (does it close
+  the eureka gap?) still needs a GPU run — the flag is opt-in.
+- **How to test in the UI**: create a Go1 project → New run → Advanced →
+  "Objective fitness metric" = `go1_trot` → goal "gallop forward fast,
+  bounding gait, stay upright" → steps-per-round ≥1200 → launch; the
+  Runs tab streams per-iter `fit` + the best-by-fitness pick.
+
+### 2026-06-13 — Ship 33: honest read of the PARTIAL E4 campaign + spec-metric monotonicity audit + FITNESS-IN-THE-LOOP (the root-cause fix)
+
+- **Context**: GPUs paused mid-campaign. E4 never finished: backup at
+  `C:\Users\SamJD\rs_campaign_backup\results` has **83 result.json**
+  (no eureka on g1_floss/g1_kick, no cartpole, mission_no_kg partial),
+  shard logs only (heavy npz/mp4 not synced). `campaign_report.json` was
+  never generated (campaign died before `sculpt eval report`).
+- **What**:
+  - `~/projects/_report.py` — offline re-aggregation using the project's
+    OWN `harness.aggregate()` (rliable IQM + stratified bootstrap +
+    paired diffs). Wrote `campaign_report.json` + `report.html` into the
+    backup dir. (`_agg.py`/`_agg2.py` = scratch sub-component dumps.)
+  - `RewardSculptor/scripts/audit_spec_metric_monotonicity.py` — reusable
+    GPU-free competence-ladder audit (Skalse 2022 / Goodhart-in-RL 2024
+    prescription). Includes a prototype monotone `_kick_events_score`.
+- **Findings (the honest read)**:
+  1. **g1_floss = dead benchmark**: every condition IQM(final)=**0.000**
+     (best ≤0.034). Zero discriminating power. Signature of
+     under-training (600 rsl_rl iters; legged_gym default is 1500 for
+     Go1, ~10k+ for G1). Even a *synthetic perfect* floss caps at 0.68.
+  2. **g1_kick = confounded metric**: mission 0.457 "beats" matched
+     baseline (+0.383 SIG) but is **tied with cheap 600-iter plain_ppo**
+     (+0.033 ns). Audit proves the burst peak/median *ratio* is
+     **non-monotonic / extremal-Goodhart**: holding a genuine kick FIXED
+     and adding competence-neutral leg motion swings score
+     0.000→0.617→0.197 (a clean kicker scores 0 because median≈0). The
+     "win" is a metric artifact, not better kicks.
+  3. **go1_trot = clean & negative**: **eureka 0.955 (100% threshold) vs
+     mission 0.113** → system **loses to the literature baseline by
+     −0.955 (SIG)**, does not beat plain_ppo (−0.086 ns); KG ablation
+     (mission−mission_no_kg +0.064 ns, CI [−0.25,+0.44]) and curriculum
+     ablation (−0.002 ns) show **no significant effect**.
+  - **Root cause** (data + lit converge): the loop navigates by
+    LLM-authored success criteria and **NEVER sees an objective fitness
+    signal** (`compute_spec_metrics` is not imported by `sculpt.py`/
+    `mission_runtime.py`), while eureka selects candidates *directly by*
+    spec fitness (`eval/eureka.py` delta 2). Eureka's own ablation: the
+    fitness-guided loop is the indispensable component. KG grounding for
+    reward design is unvalidated in the literature (Eureka grounds on env
+    *source code*, not papers) — consistent with the ns KG result.
+- **Verdict**: infra is genuinely research-grade (paired seeds, rliable
+  stats, honest compute accounting, conservative baseline, audit-hardened
+  metrics); the *science* so far is null/negative for the central claim
+  AND partly uninterpretable (dead floss, non-monotone kick, n=2 on the
+  key contrasts, under-training). DO NOT re-run as-is. Fix order before
+  any re-run: (1) objective fitness IN the loop (early-stop + edit
+  accept/reject + diagnoser input — see Explore map: `sculpt.py:2705`,
+  `edit.py:902`, `diagnose.py:577`); (2) compute ≥1500 (Go1)/≥5–10k (G1)
+  so ≥1 method solves each task; (3) replace ratio-based kick metric with
+  the monotone event-count; drop/redesign floss; (4) A/B the KG cleanly.
+- **IMPLEMENTED — fitness-in-the-loop (the #1 root-cause fix)**: the
+  sculpt loop can now see a held-out ground-truth task fitness, removing
+  the eval asymmetry where only eureka selected on fitness. Additive +
+  flag-gated (default OFF → byte-identical blind behavior; `--fitness-in-loop`
+  / `CampaignConfig.fitness_in_loop` turns it on for the `sculpt`/`full`
+  condition, fitness=the benchmark spec metric):
+  - `diagnose.py` — `diagnose(objective_progress=...)` →
+    `_build_preliminary_user_content` renders an `OBJECTIVE_TASK_PROGRESS`
+    block (current/best/last/delta) so the diagnose→edit SEARCH is
+    fitness-guided (Eureka's indispensable component).
+  - `sculpt.py` — `IterOutcome.fitness`; `SculptRunResult.fitness_history`
+    + `best_fitness`/`best_fitness_iter` + `best_reward_path`;
+    `_run_one_iter(fitness_fn, prior_fitness)` computes fitness post-rollout/
+    pre-diagnose (honest None on error) + emits `iter_fitness`;
+    `sculpt_run(fitness_fn, fitness_patience=2, fitness_target)` tracks best,
+    plateau/target early-stops, and repoints `current.py` to the
+    BEST-by-fitness reward (vs the blind default of keeping the last — the
+    go1_trot runs over-iterated past best 0.247 to final 0.166).
+  - `eval/harness.py` — `fitness_in_loop` flag; sculpt branch builds
+    `fitness_fn=spec_metric`; fitness-guided sculpt now scored on `best`
+    (apples-to-apples with eureka). `cli.py` — `--fitness-in-loop`.
+  - Mission-mode wiring deferred: feeding the FINAL-task spec to early
+    curriculum stages is semantically wrong (a "stand up" stage ≠ the
+    "trot" spec); needs per-stage objectives. `full`/sculpt is the clean
+    apples-to-apples condition for now.
+- **Still TODO before re-run** (not done this session): compute ≥1500
+  (Go1)/≥5–10k (G1); swap the ratio kick metric for the monotone
+  event-count; drop/redesign floss; eureka on all benchmarks at n≥5.
+- **Verified (all offline, no GPU)**: report + audit run clean. Audit:
+  kick non-monotone (0→0.62→0.20 on a FIXED kick), trot monotone
+  (0→0.98 in fwd speed), proposed event metric invariant (0.811).
+  New `tests/test_fitness_in_loop.py` (4 tests: best-selection, plateau
+  stop, target stop, blind-default-unchanged, diagnoser block) green.
+  **Gates: sculptor 550 passed / 1 skipped (was 546+4 new); backend 322
+  passed / 1 deselected.** CLI `--fitness-in-loop` present; imports OK.
+  Efficacy (does it close the eureka gap?) needs a GPU run — flag is OFF
+  by default so nothing changes until deliberately enabled.
+
 ### 2026-06-11 22:05 — Ship 32a: hour-1 checkpoint caught remote-rollout EGL crash; fixed + relaunched
 
 - **What**: ALL THREE first campaign jobs (plain_ppo seed_1000 ×3

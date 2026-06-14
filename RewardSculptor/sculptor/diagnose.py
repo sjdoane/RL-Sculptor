@@ -387,7 +387,65 @@ def _build_preliminary_user_content(
     keyframes: list[Path],
     training_feedback: dict | None = None,
     realism_audit: dict | None = None,
+    objective_progress: dict | None = None,
+    human_note: str | None = None,
 ) -> list[dict]:
+    # §Ship 33: optional OBJECTIVE TASK PROGRESS block — a held-out,
+    # ground-truth fitness scalar (higher = better) for THIS iter's
+    # rollout, plus best-so-far / last / delta. Omitted (None) keeps the
+    # blind-navigation behavior. When present it makes the diagnose→edit
+    # search fitness-guided (the mechanism Eureka's ablations show is
+    # indispensable) instead of navigating only by self-authored signals.
+    # §Ship 39 (H1): a human watching the rollout video can inject a free-text
+    # observation that the model can't see (subtle gait artifacts, "it's
+    # cheating by leaning on the wall", etc.). Rendered FIRST + emphatically —
+    # the human has ground-truth eyes on behavior the metrics may miss.
+    human_block = ""
+    if human_note and str(human_note).strip():
+        human_block = (
+            "# USER OBSERVATION (a human watched this iteration's rollout "
+            "video and is steering you — weight this HEAVILY; they can see "
+            "behavior the metrics and keyframes miss):\n"
+            f"{str(human_note).strip()}\n\n"
+        )
+
+    objective_block = ""
+    if objective_progress:
+        cur = objective_progress.get("current")
+        best = objective_progress.get("best_so_far")
+        last = objective_progress.get("last")
+        delta = objective_progress.get("delta")
+        components = objective_progress.get("components")
+        reverted = objective_progress.get("reverted_to_best")
+        objective_block = (
+            "# OBJECTIVE_TASK_PROGRESS\n"
+            "# Ground-truth task fitness in [0,1] (higher is better), "
+            "measured on this iteration's rollout independently of the "
+            "reward you are editing. This is the bar that actually "
+            "matters — prioritize edits you expect to RAISE it. A high "
+            "reward with low/stalled fitness means the reward is being "
+            "optimized for the wrong thing (reward hacking).\n"
+            f"current={cur}  best_so_far={best}  "
+            f"previous={last}  delta_vs_previous={delta}\n"
+        )
+        # §Ship 36 (F2): physical sub-measurements of the fitness above, so
+        # you can localize WHAT is wrong rather than only THAT it fell (e.g.
+        # high burst speed but low uprightness = violent-but-falling; high
+        # kick_events with a low score = the legacy ratio is under-counting).
+        if components:
+            objective_block += (
+                "# fitness component breakdown (physical sub-measurements):\n"
+                f"{json.dumps(components, sort_keys=True)}\n"
+            )
+        # §Ship 36 (F1): the prior edit regressed fitness and was rolled back.
+        if reverted:
+            objective_block += (
+                "# NOTE: your PREVIOUS edit REGRESSED fitness, so the reward "
+                "was reverted to the best-so-far version before this "
+                "iteration trained. Do NOT repeat that edit — diagnose why it "
+                "lowered the objective and propose a DIFFERENT direction.\n"
+            )
+        objective_block += "\n"
     # §7.2: Eureka-format reward trajectory injected between metrics and
     # REWARD_CONTRACT. Block is omitted when the file is missing (pre-§7.1
     # iters, non-sculpted runs) so stage-1 diagnose stays structurally
@@ -420,8 +478,10 @@ def _build_preliminary_user_content(
         )
     header = (
         f"# BEHAVIOR GOAL\n{behavior_goal}\n\n"
+        f"{human_block}"
         f"# REWARD_SPEC\n{json.dumps(reward_spec, indent=2, sort_keys=True, default=str)}\n\n"
         f"# metrics.json\n{json.dumps(metrics, indent=2, sort_keys=True, default=str)}\n\n"
+        f"{objective_block}"
         f"{feedback_block}"
         f"{realism_block}"
         f"# ADAPTER BEHAVIOR METRIC VOCABULARY\n{behavior_metric_names}\n\n"
@@ -524,12 +584,19 @@ def diagnose(
     store: SculptorKG | None = None,
     client=None,
     skip_kg: bool = False,
+    objective_progress: dict | None = None,
+    human_note: str | None = None,
 ) -> Diagnosis:
     """Two-stage literature-grounded diagnosis of a training iteration.
 
     `skip_kg=True` bypasses both KG queries and passes an empty
     literature_context to the grounded call — used for the `--no-kg`
     ablation mode in `sculpt run`.
+
+    `objective_progress` (§Ship 33) — optional ground-truth task-fitness
+    summary (current / best_so_far / last / delta) for this iter; when
+    given it is surfaced to stage-1 so the diagnosis is fitness-guided.
+    None preserves the original blind behavior.
     """
     iter_dir = Path(iter_dir).resolve()
     cfg = _parse_config(config)
@@ -584,6 +651,8 @@ def diagnose(
         keyframes=keyframes,
         training_feedback=training_feedback,
         realism_audit=realism_audit,
+        objective_progress=objective_progress,
+        human_note=human_note,
     )
     preliminary: _PreliminaryModel = _parse_with_retry(
         client, model_cls=_PreliminaryModel,
@@ -597,6 +666,7 @@ def diagnose(
     try:
         if skip_kg:
             kg_matches: list[TechniqueMatch] = []
+            case_context = ""
         else:
             fm_keywords = [fm for fm in preliminary.failure_modes if fm != "none"]
             tag_matches = query_techniques(
@@ -626,6 +696,24 @@ def diagnose(
                 if len(kg_matches) >= KG_TOP_K:
                     break
 
+            # §Ship 37: case-memory — this system's OWN past runs on similar
+            # tasks/failures (what was tried + whether it helped), additive to
+            # the literature context. Floored like the semantic query so only
+            # genuinely-similar cases reach the prompt.
+            try:
+                from sculptor.kg.cases import _render_case_context, query_cases
+                from sculptor.kg.query import (
+                    DEFAULT_MIN_PROMPT_SIMILARITY as _MIN_SIM,
+                )
+                _case_q = behavior_goal + (
+                    " | " + ", ".join(fm_keywords) if fm_keywords else "")
+                case_context = _render_case_context(query_cases(
+                    _case_q, top_k=3, store=store, min_similarity=_MIN_SIM))
+            except Exception as e:  # noqa: BLE001 — case memory is advisory
+                print(f"[diagnose] case-memory query failed ({e}) — skipped.",
+                      file=sys.stderr, flush=True)
+                case_context = ""
+
         # 6. Stage 2 — grounded edits.
         grounded_user = _build_grounded_user_content(
             behavior_goal=behavior_goal,
@@ -634,7 +722,10 @@ def diagnose(
             behavior=behavior,
             contract_text=contract_text,
             preliminary=preliminary,
-            kg_context=_render_kg_context(kg_matches),
+            kg_context=(
+                (case_context + "\n\n" if case_context else "")
+                + _render_kg_context(kg_matches)
+            ),
             training_feedback=training_feedback,
             realism_audit=realism_audit,
         )

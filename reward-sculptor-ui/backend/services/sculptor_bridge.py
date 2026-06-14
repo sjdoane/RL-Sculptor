@@ -148,3 +148,35 @@ def cuda_version_ok(min_major: int = 12, min_minor: int = 4) -> bool:
         return parse_version(v) >= parse_version(f"{min_major}.{min_minor}")
     except InvalidVersion:
         return False
+
+
+# ── §Ship 35: auto-generated objective metrics ────────────────────────
+def generate_objective_metric(
+    behavior_goal: str,
+    out_dir: "Path",
+    *,
+    robot_hint: Optional[str] = None,
+    review: bool = True,
+) -> dict:
+    """Generate + validate + review an objective fitness metric (the only
+    module allowed to import sculptor.eval). Returns the full record."""
+    from sculptor.eval import generate_objective_metric as _gen
+
+    return _gen(behavior_goal, out_dir, robot_hint=robot_hint, review=review)
+
+
+def calibrate_objective_metric(
+    metric_path: "Path", builtin_name: str, *, threshold: float = 0.7,
+) -> dict:
+    """Calibrate a generated metric against a hand-authored ground-truth
+    metric (Spearman over a competence ladder). Earns steer-rights on ok."""
+    from sculptor.eval import calibrate_metric as _cal
+
+    return _cal(metric_path, builtin_name, threshold=threshold)
+
+
+def builtin_spec_metric_names() -> list[str]:
+    """The hand-authored ground-truth metric names (for calibration UI)."""
+    from sculptor.eval import spec_metric_names
+
+    return spec_metric_names()

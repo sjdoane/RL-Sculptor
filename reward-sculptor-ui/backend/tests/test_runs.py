@@ -480,6 +480,164 @@ def test_run_sculpt_job_omits_steps_per_iter_flag_when_not_set(
     assert "--steps-per-iter" not in captured["cmd"], captured["cmd"]
 
 
+# ── §Ship 34: objective fitness-in-the-loop CLI forwarding ─────────────
+def test_run_sculpt_job_forwards_fitness_metric_as_cli_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The UI's 'Objective fitness metric' dropdown sets run_params
+    ['fitness_metric']; it must surface as `--fitness-metric <name>` on
+    the sculpt CLI so the loop is fitness-guided."""
+    import asyncio
+
+    from backend.services import run_manager
+    from backend.services.job_manager import Job
+
+    project_dir = tmp_path / "fit-proj"
+    project_dir.mkdir()
+    captured: dict = {}
+
+    class _Sentinel(Exception):
+        pass
+
+    async def _fake_exec(*args, **kwargs):
+        captured["cmd"] = list(args)
+        raise _Sentinel()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+
+    runner = run_manager.run_sculpt_job(
+        project_dir=project_dir,
+        run_params={
+            "behavior_goal": "gallop forward fast",
+            "iterations": 3,
+            "fitness_metric": "go1_trot",
+        },
+    )
+    job = Job(job_id="t_fit", kind="sculpt_run", project_slug="fit-proj", status="running")
+    job._cancel = asyncio.Event()
+    with pytest.raises(_Sentinel):
+        asyncio.run(runner(job, job._cancel))
+
+    cmd = captured["cmd"]
+    assert "--fitness-metric" in cmd, cmd
+    assert cmd[cmd.index("--fitness-metric") + 1] == "go1_trot", cmd
+
+
+def test_run_sculpt_job_gen_metric_uncalibrated_forces_observe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """§Ship 35 review (CRITICAL): the BACKEND must downgrade steer→observe
+    for an uncalibrated generated metric, even if the API request says
+    steer — the UI's client-side lock is not the only guard."""
+    import asyncio
+
+    from backend.services import run_manager
+    from backend.services.job_manager import Job
+
+    project_dir = tmp_path / "gp"
+    mdir = project_dir / "metrics" / "gen_001"
+    mdir.mkdir(parents=True)
+    (mdir / "metric.py").write_text("def compute_spec(a,b,m): return {}\n", encoding="utf-8")
+    (mdir / "meta.json").write_text('{"calibrated": false}', encoding="utf-8")
+    captured: dict = {}
+
+    class _Sentinel(Exception):
+        pass
+
+    async def _fake_exec(*args, **kwargs):
+        captured["cmd"] = list(args)
+        raise _Sentinel()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+
+    runner = run_manager.run_sculpt_job(
+        project_dir=project_dir,
+        run_params={"behavior_goal": "trot", "iterations": 2,
+                    "fitness_metric": "gen:gen_001", "fitness_mode": "steer"},
+    )
+    job = Job(job_id="t_g", kind="sculpt_run", project_slug="gp", status="running")
+    job._cancel = asyncio.Event()
+    with pytest.raises(_Sentinel):
+        asyncio.run(runner(job, job._cancel))
+    cmd = captured["cmd"]
+    assert "--fitness-metric" in cmd
+    assert cmd[cmd.index("--fitness-metric") + 1].endswith("metrics/gen_001/metric.py")
+    assert cmd[cmd.index("--fitness-mode") + 1] == "observe"  # steer downgraded
+
+
+def test_run_sculpt_job_omits_fitness_metric_when_not_set(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Default: no fitness_metric → no flag → the blind loop (unchanged)."""
+    import asyncio
+
+    from backend.services import run_manager
+    from backend.services.job_manager import Job
+
+    project_dir = tmp_path / "no-fit-proj"
+    project_dir.mkdir()
+    captured: dict = {}
+
+    class _Sentinel(Exception):
+        pass
+
+    async def _fake_exec(*args, **kwargs):
+        captured["cmd"] = list(args)
+        raise _Sentinel()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+
+    runner = run_manager.run_sculpt_job(
+        project_dir=project_dir,
+        run_params={"behavior_goal": "x", "iterations": 1},
+    )
+    job = Job(job_id="t_nofit", kind="sculpt_run", project_slug="no-fit-proj", status="running")
+    job._cancel = asyncio.Event()
+    with pytest.raises(_Sentinel):
+        asyncio.run(runner(job, job._cancel))
+
+    assert "--fitness-metric" not in captured["cmd"], captured["cmd"]
+
+
+def test_build_mission_run_flags_includes_fitness_metric(tmp_path) -> None:
+    """RunMissionRequest.fitness_metric must become `--fitness-metric`
+    on the `sculpt mission-run` CLI; absent when unset. A built-in name
+    passes through resolution unchanged (§Ship 35)."""
+    from backend.services.mission_jobs import _build_mission_run_flags
+
+    flags = _build_mission_run_flags(
+        {"fitness_metric": "g1_kick", "fitness_mode": "steer", "seed": 1000},
+        tmp_path)
+    assert "--fitness-metric" in flags
+    assert flags[flags.index("--fitness-metric") + 1] == "g1_kick"
+    assert flags[flags.index("--fitness-mode") + 1] == "steer"
+    assert "--fitness-metric" not in _build_mission_run_flags({"seed": 1000}, tmp_path)
+
+
+def test_build_mission_run_flags_gen_metric_resolution(tmp_path) -> None:
+    """§Ship 35 review: a gen:<id> ref is RESOLVED to the metric.py path
+    (not passed raw, which would crash the CLI), and an UNCALIBRATED gen
+    metric is downgraded steer→observe even if the request says steer."""
+    from backend.services.mission_jobs import _build_mission_run_flags
+
+    mdir = tmp_path / "metrics" / "gen_001"
+    mdir.mkdir(parents=True)
+    (mdir / "metric.py").write_text("def compute_spec(a,b,m): return {}\n", encoding="utf-8")
+    (mdir / "meta.json").write_text('{"calibrated": false}', encoding="utf-8")
+
+    flags = _build_mission_run_flags(
+        {"fitness_metric": "gen:gen_001", "fitness_mode": "steer"}, tmp_path)
+    mp = flags[flags.index("--fitness-metric") + 1]
+    assert mp.endswith("metrics/gen_001/metric.py")          # resolved to a path
+    assert flags[flags.index("--fitness-mode") + 1] == "observe"  # steer downgraded
+
+    # calibrated → steer allowed
+    (mdir / "meta.json").write_text('{"calibrated": true}', encoding="utf-8")
+    flags2 = _build_mission_run_flags(
+        {"fitness_metric": "gen:gen_001", "fitness_mode": "steer"}, tmp_path)
+    assert flags2[flags2.index("--fitness-mode") + 1] == "steer"
+
+
 # ── §Ship-7: rollout-video + RL-knob CLI forwarding ────────────────────
 def test_run_sculpt_job_forwards_ship7_params_as_cli_flags(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -945,3 +1103,143 @@ def test_resolve_run_root_rejects_traversal_stage_name() -> None:
         job_id="job_w", kind="sculpt_run", project_slug="p", params={},
     )
     assert _resolve_run_root(job_sculpt, project_dir) == safe_fallback
+
+
+# ── §Ship 39 (H1): interactive control sidecar + endpoint ─────────────
+def test_run_sculpt_job_writes_control_file_and_passes_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The runner ALWAYS writes the control sidecar (deterministic path) and
+    passes `--control-file` so the Auto/Manual toggle works mid-run; the
+    initial mode comes from start_mode."""
+    import asyncio
+
+    from backend.services import run_manager
+    from backend.services.job_manager import Job
+
+    project_dir = tmp_path / "ctrl-proj"
+    project_dir.mkdir()
+    captured: dict = {}
+
+    class _Sentinel(Exception):
+        pass
+
+    async def _fake_exec(*args, **kwargs):
+        captured["cmd"] = list(args)
+        raise _Sentinel()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+
+    runner = run_manager.run_sculpt_job(
+        project_dir=project_dir,
+        run_params={"behavior_goal": "kick forward",
+                    "iterations": 3, "start_mode": "manual"},
+    )
+    job = Job(job_id="t_ctrl", kind="sculpt_run",
+              project_slug="ctrl-proj", status="running")
+    job._cancel = asyncio.Event()
+    with pytest.raises(_Sentinel):
+        asyncio.run(runner(job, job._cancel))
+
+    cmd = captured["cmd"]
+    assert "--control-file" in cmd, cmd
+    cf = Path(cmd[cmd.index("--control-file") + 1])
+    assert cf == run_manager.control_file_path(project_dir, "t_ctrl")
+    assert cf.is_file()
+    data = run_manager.read_control_file(cf)
+    assert data["mode"] == "manual" and data["resume_token"] == 0
+    assert job.params["mode"] == "manual"
+
+
+def test_run_sculpt_job_control_defaults_to_auto(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No start_mode → control file present but mode='auto' (non-UI / test
+    launches never pause)."""
+    import asyncio
+
+    from backend.services import run_manager
+    from backend.services.job_manager import Job
+
+    project_dir = tmp_path / "auto-proj"
+    project_dir.mkdir()
+    captured: dict = {}
+
+    class _Sentinel(Exception):
+        pass
+
+    async def _fake_exec(*args, **kwargs):
+        captured["cmd"] = list(args)
+        raise _Sentinel()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+
+    runner = run_manager.run_sculpt_job(
+        project_dir=project_dir, run_params={"behavior_goal": "x", "iterations": 1})
+    job = Job(job_id="t_auto", kind="sculpt_run",
+              project_slug="auto-proj", status="running")
+    job._cancel = asyncio.Event()
+    with pytest.raises(_Sentinel):
+        asyncio.run(runner(job, job._cancel))
+
+    cf = run_manager.control_file_path(project_dir, "t_auto")
+    assert run_manager.read_control_file(cf)["mode"] == "auto"
+
+
+def test_control_endpoint_merges_mode_resume_and_stop(
+    client: TestClient, tmp_projects_root: Path, monkeypatch
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-fake")
+
+    async def _slow_runner(job, cancel):
+        job.emit({"type": "log_line", "text": "started"})
+        for _ in range(60):
+            if cancel.is_set():
+                return {"stopped": True}
+            await asyncio.sleep(0.05)
+        return {"return_code": 0}
+
+    from backend.routes import runs as runs_routes
+    from backend.services import run_manager
+
+    factory = lambda *, project_dir, run_params: _slow_runner  # noqa: E731
+    monkeypatch.setattr(run_manager, "run_sculpt_job", factory)
+    monkeypatch.setattr(runs_routes, "run_sculpt_job", factory)
+
+    slug = _make_project_with_library(client, "RunCtl")
+    r = client.post(
+        f"/projects/{slug}/runs",
+        json={"behavior_goal": "kick forward", "iterations": 3,
+              "start_mode": "manual"},
+    )
+    assert r.status_code == 202, r.text
+    run_id = r.json()["run_id"]
+    time.sleep(0.1)
+
+    # resume with feedback bumps the token + stores the note.
+    rc = client.patch(
+        f"/projects/{slug}/runs/{run_id}/control",
+        json={"mode": "manual", "resume": True, "feedback": "lift the leg"},
+    )
+    assert rc.status_code == 200, rc.text
+    body = rc.json()
+    assert body["mode"] == "manual"
+    assert body["resume_token"] == 1
+    assert body["feedback"] == "lift the leg"
+
+    # flip to auto.
+    rc2 = client.patch(
+        f"/projects/{slug}/runs/{run_id}/control", json={"mode": "auto"})
+    assert rc2.json()["mode"] == "auto"
+
+    # stop sets the flag.
+    rc3 = client.patch(
+        f"/projects/{slug}/runs/{run_id}/control", json={"stop": True})
+    assert rc3.json()["stop"] is True
+
+    # unknown run → 404.
+    assert client.patch(
+        f"/projects/{slug}/runs/does_not_exist/control",
+        json={"mode": "auto"}).status_code == 404
+
+    client.delete(f"/projects/{slug}/runs/{run_id}")

@@ -1,10 +1,12 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { toast } from "sonner";
 
 import { Btn, Field, Modal, ToggleRow } from "@/components/rs/primitives";
 import { useCreateMission } from "@/hooks/useMissions";
+import { useProjectMetrics } from "@/hooks/useMetrics";
 import { ApiError } from "@/lib/api";
-import type { MissionRunDefaults } from "@/lib/types";
+import type { MetricSummary, MissionRunDefaults } from "@/lib/types";
+import { SPEC_METRIC_NAMES } from "@/lib/types";
 
 const SLUG_PATTERN = /^[a-z][a-z0-9_-]{0,63}$/;
 const GOAL_MIN = 8;
@@ -33,6 +35,9 @@ export function NewMissionDialog({
   const [maxExtensions, setMaxExtensions] = useState<number | "">(1);
   const [extensionFactor, setExtensionFactor] = useState<number | "">(0.5);
   const [extensionThreshold, setExtensionThreshold] = useState<number | "">(0.05);
+  const [fitnessMetric, setFitnessMetric] = useState<string | null>(null);
+  const [fitnessMode, setFitnessMode] = useState<"observe" | "steer">("steer");
+  const projectMetrics = useProjectMetrics(slug, open);
 
   const create = useCreateMission(slug);
 
@@ -42,6 +47,7 @@ export function NewMissionDialog({
     setEarlyStopOnCriterion(false); setStabilityWindow(1);
     setExtendOnImprovement(false); setMaxExtensions(1);
     setExtensionFactor(0.5); setExtensionThreshold(0.05);
+    setFitnessMetric(null); setFitnessMode("steer");
   };
 
   const buildRunDefaults = (): MissionRunDefaults | null => {
@@ -60,6 +66,11 @@ export function NewMissionDialog({
       if (typeof maxExtensions === "number") out.max_extensions_per_stage = maxExtensions;
       if (typeof extensionFactor === "number") out.extension_factor = extensionFactor;
       if (typeof extensionThreshold === "number") out.extension_improvement_threshold = extensionThreshold;
+      touched = true;
+    }
+    if (fitnessMetric) {
+      out.fitness_metric = fitnessMetric;
+      out.fitness_mode = fitnessMode;
       touched = true;
     }
     return touched ? out : null;
@@ -170,6 +181,9 @@ export function NewMissionDialog({
               maxExtensions={maxExtensions} setMaxExtensions={setMaxExtensions}
               extensionFactor={extensionFactor} setExtensionFactor={setExtensionFactor}
               extensionThreshold={extensionThreshold} setExtensionThreshold={setExtensionThreshold}
+              fitnessMetric={fitnessMetric} setFitnessMetric={setFitnessMetric}
+              fitnessMode={fitnessMode} setFitnessMode={setFitnessMode}
+              metrics={projectMetrics.data ?? []}
             />
           )}
         </Modal>
@@ -188,6 +202,8 @@ export function MissionAdvanced({
   earlyStopOnCriterion, setEarlyStopOnCriterion, stabilityWindow, setStabilityWindow,
   extendOnImprovement, setExtendOnImprovement, maxExtensions, setMaxExtensions,
   extensionFactor, setExtensionFactor, extensionThreshold, setExtensionThreshold,
+  fitnessMetric, setFitnessMetric, fitnessMode, setFitnessMode,
+  metrics = [],
   showIterationsHint,
 }: {
   disabled: boolean;
@@ -200,8 +216,21 @@ export function MissionAdvanced({
   maxExtensions: NumOr; setMaxExtensions: (v: NumOr) => void;
   extensionFactor: NumOr; setExtensionFactor: (v: NumOr) => void;
   extensionThreshold: NumOr; setExtensionThreshold: (v: NumOr) => void;
+  fitnessMetric: string | null; setFitnessMetric: (v: string | null) => void;
+  fitnessMode: "observe" | "steer"; setFitnessMode: (v: "observe" | "steer") => void;
+  metrics?: MetricSummary[];
   showIterationsHint?: string;
 }) {
+  // §Ship 35: generated metrics selectable here; an uncalibrated one is
+  // observe-locked (force observe), mirroring NewRunDialog.
+  const genMetrics = metrics.filter((m) => m.accepted);
+  const selectedGen = fitnessMetric?.startsWith("gen:")
+    ? genMetrics.find((m) => `gen:${m.id}` === fitnessMetric) ?? null
+    : null;
+  const steerLocked = selectedGen !== null && !selectedGen.calibrated;
+  useEffect(() => {
+    if (steerLocked && fitnessMode !== "observe") setFitnessMode("observe");
+  }, [steerLocked, fitnessMode, setFitnessMode]);
   const numInput = (v: NumOr, set: (x: NumOr) => void, props: React.InputHTMLAttributes<HTMLInputElement>) => (
     <input
       {...props}
@@ -219,6 +248,59 @@ export function MissionAdvanced({
         <Field label="Steps per round" htmlFor="adv-steps">{numInput(stepsPerIter, setStepsPerIter, { id: "adv-steps", min: 100, max: 200000, placeholder: "project default" })}</Field>
         <Field label="Seed" htmlFor="adv-seed">{numInput(seed, setSeed, { id: "adv-seed", min: 0, placeholder: "42" })}</Field>
       </div>
+
+      {/* §Ship 34/35: objective fitness — built-ins + generated (uniform across stages). */}
+      <Field label="Objective fitness metric" hint="applied to every stage; built-ins steer, generated observe until calibrated" htmlFor="adv-fitness">
+        <div className="rs-select">
+          <select
+            id="adv-fitness"
+            value={fitnessMetric ?? "none"}
+            onChange={(e) => { const v = e.target.value; setFitnessMetric(v === "none" ? null : v); }}
+            disabled={disabled}
+            aria-label="Objective fitness metric"
+          >
+            <option value="none">none (blind loop)</option>
+            <optgroup label="built-in (ground truth)">
+              {SPEC_METRIC_NAMES.map((m) => (
+                <option key={m} value={m}>{m}</option>
+              ))}
+            </optgroup>
+            {genMetrics.length > 0 && (
+              <optgroup label="auto-generated for this project">
+                {genMetrics.map((m) => (
+                  <option key={m.id} value={`gen:${m.id}`}>
+                    {m.id}{m.calibrated ? " ✓ calibrated" : " (observe-only)"}
+                  </option>
+                ))}
+              </optgroup>
+            )}
+          </select>
+        </div>
+      </Field>
+
+      {/* §Ship 35: observe vs steer — only when a metric is chosen. */}
+      {fitnessMetric !== null && (
+        <Field
+          label="Fitness mode"
+          hint={steerLocked
+            ? "generated metric is observe-only until calibrated"
+            : "observe = compute & chart only, no influence"}
+          htmlFor="adv-fitness-mode"
+        >
+          <div className="rs-select">
+            <select
+              id="adv-fitness-mode"
+              value={steerLocked ? "observe" : fitnessMode}
+              onChange={(e) => setFitnessMode(e.target.value === "observe" ? "observe" : "steer")}
+              disabled={disabled || steerLocked}
+              aria-label="Fitness mode"
+            >
+              <option value="steer">steer (drives selection)</option>
+              <option value="observe">observe (display only)</option>
+            </select>
+          </div>
+        </Field>
+      )}
 
       <ToggleRow
         on={earlyStopOnCriterion} onChange={setEarlyStopOnCriterion} label="Stop when goal met"

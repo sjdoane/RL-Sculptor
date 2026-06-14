@@ -4,6 +4,7 @@ import { toast } from "sonner";
 import { MissionAdvanced } from "@/components/NewMissionDialog";
 import { Btn, Modal } from "@/components/rs/primitives";
 import { useRunMission, type RunMissionVariables } from "@/hooks/useMissions";
+import { useProjectMetrics } from "@/hooks/useMetrics";
 import { ApiError, type RunMissionRequestBody } from "@/lib/api";
 import type { MissionDetail } from "@/lib/types";
 
@@ -52,6 +53,11 @@ export function RunMissionDialog({
   const [extensionFactor, setExtensionFactor] = useState<number | "">(0.5);
   const [extensionThreshold, setExtensionThreshold] =
     useState<number | "">(0.05);
+  // §Ship 34/35: objective fitness-in-the-loop (uniform across stages).
+  // string holds built-in names AND generated "gen:<id>" refs.
+  const [fitnessMetric, setFitnessMetric] = useState<string | null>(null);
+  const [fitnessMode, setFitnessMode] = useState<"observe" | "steer">("steer");
+  const projectMetrics = useProjectMetrics(slug, open);
 
   const run = useRunMission(slug);
 
@@ -107,6 +113,12 @@ export function RunMissionDialog({
           setExtensionThreshold(rd.extension_improvement_threshold);
         }
       }
+      if (rd.fitness_metric) {
+        setFitnessMetric(rd.fitness_metric);
+        if (rd.fitness_mode === "observe" || rd.fitness_mode === "steer") {
+          setFitnessMode(rd.fitness_mode);
+        }
+      }
       setAppliedDefaults(true);
       return;
     }
@@ -146,6 +158,10 @@ export function RunMissionDialog({
       if (typeof extensionThreshold === "number") {
         body.extension_improvement_threshold = extensionThreshold;
       }
+    }
+    if (fitnessMetric) {
+      body.fitness_metric = fitnessMetric;
+      body.fitness_mode = fitnessMode;
     }
     const variables: RunMissionVariables = { missionSlug, body };
     run.mutate(variables, {
@@ -211,6 +227,9 @@ export function RunMissionDialog({
             maxExtensions={maxExtensions} setMaxExtensions={setMaxExtensions}
             extensionFactor={extensionFactor} setExtensionFactor={setExtensionFactor}
             extensionThreshold={extensionThreshold} setExtensionThreshold={setExtensionThreshold}
+            fitnessMetric={fitnessMetric} setFitnessMetric={setFitnessMetric}
+            fitnessMode={fitnessMode} setFitnessMode={setFitnessMode}
+            metrics={projectMetrics.data ?? []}
             showIterationsHint={suggestedIters?.toString() ?? "3"}
           />
           {eta !== null && (

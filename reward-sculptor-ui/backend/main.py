@@ -27,6 +27,7 @@ from backend.routes import dashboard as dashboard_routes
 from backend.routes import jobs as jobs_routes
 from backend.routes import kg as kg_routes
 from backend.routes import library as library_routes
+from backend.routes import metrics as metrics_routes
 from backend.routes import missions as missions_routes
 from backend.routes import physics as physics_routes
 from backend.routes import projects as projects_routes
@@ -204,6 +205,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     app.include_router(physics_routes.router)
     app.include_router(missions_routes.router)
     app.include_router(missions_routes.ws_router)
+    app.include_router(metrics_routes.router)
     return app
 
 

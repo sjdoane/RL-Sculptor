@@ -109,9 +109,32 @@ class _StageModel(BaseModel):
         ),
     )
 
+    # §Ship 38: optional per-stage objective metric. Lets a multi-phase
+    # curriculum steer each phase by ITS OWN objective instead of one
+    # uniform mission metric. Conservative by design — only a correct fit.
+    steering_metric: Optional[str] = Field(
+        default=None,
+        description=(
+            "OPTIONAL. The name of a built-in spec metric (see "
+            "AVAILABLE_FITNESS_METRICS) that DIRECTLY and CORRECTLY measures "
+            "THIS stage's sub-goal for THIS robot. Set it ONLY when a listed "
+            "metric clearly fits the stage; otherwise OMIT (null) — the "
+            "mission-level metric / success criterion is used. A wrong-robot "
+            "or loosely-related metric MIS-steers the stage; when unsure, null."
+        ),
+    )
+
     @field_validator("init_skill_id", mode="before")
     @classmethod
     def _normalize_init_skill_id(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        s = str(v).strip()
+        return s or None
+
+    @field_validator("steering_metric", mode="before")
+    @classmethod
+    def _normalize_steering_metric(cls, v: Any) -> Optional[str]:
         if v is None:
             return None
         s = str(v).strip()
@@ -232,16 +255,34 @@ def _build_user_content(
     contract: Any,
     kg_context: str,
     skill_context: str = "",
+    fitness_metrics_block: str = "",
 ) -> str:
     skill_block = f"{skill_context}\n\n" if skill_context else ""
+    metrics_block = f"{fitness_metrics_block}\n\n" if fitness_metrics_block else ""
     return (
         f"# BEHAVIOR_GOAL\n{goal}\n\n"
         f"{_render_contract(contract)}\n"
         f"{kg_context}\n\n"
+        f"{metrics_block}"
         f"{skill_block}"
         "Emit the decomposition JSON now. Ordered stages only, "
         "topologically valid parent_stage refs, final stage must satisfy "
         "the behavior goal end-to-end."
+    )
+
+
+def _render_fitness_metrics_block() -> str:
+    """§Ship 38: the list of built-in objective metrics the decomposer may
+    assign per stage (conservatively)."""
+    from sculptor.eval.spec_metrics import spec_metric_names
+
+    return (
+        "# AVAILABLE_FITNESS_METRICS\n"
+        "Optional per-stage objectives you MAY assign to a stage's "
+        "`steering_metric` when one DIRECTLY measures that stage's sub-goal "
+        f"for this robot: {spec_metric_names()}. They are robot-specific "
+        "(g1_* are humanoid; go1_trot is a quadruped gait; cartpole_balance "
+        "is cartpole). Assign ONLY a correct fit; otherwise leave it null."
     )
 
 
@@ -439,9 +480,31 @@ def _stages_from_model(stages_in: list[_StageModel]) -> list[Stage]:
             reward_seed_prompt=s.reward_seed_prompt,
             kg_seed_papers=list(s.kg_seed_papers or []),
             init_skill_id=s.init_skill_id,
+            steering_metric=s.steering_metric,
         )
         for s in stages_in
     ]
+
+
+def _validate_steering_metrics(stages: list[Stage]) -> None:
+    """§Ship 38: a decomposer-authored `steering_metric` must name a KNOWN
+    built-in spec metric. Generated-metric paths are assigned by the UI /
+    backend (which resolves + calibrates them), never invented by the
+    decomposer. An unknown name triggers the parse-retry path rather than a
+    fail-fast crash deep in mission_run."""
+    from sculptor.eval.spec_metrics import spec_metric_names
+
+    known = set(spec_metric_names())
+    offenders = [
+        (s.name, s.steering_metric) for s in stages
+        if s.steering_metric and s.steering_metric not in known
+    ]
+    if offenders:
+        raise MissionValidationError(
+            "steering_metric references unknown spec metrics: "
+            + ", ".join(f"{n}→{m!r}" for n, m in offenders)
+            + f". Use one of {sorted(known)} or omit the field."
+        )
 
 
 # ── Public entry ─────────────────────────────────────────────────────
@@ -501,6 +564,7 @@ def decompose_task(
     )
     user_content = _build_user_content(
         goal, reward_contract, kg_context, skill_context=skill_context,
+        fitness_metrics_block=_render_fitness_metrics_block(),
     )
 
     parsed = _parse_with_retry(
@@ -522,6 +586,8 @@ def decompose_task(
     _validate_kg_seed_papers(stages, set(available_ids), kg_store)
     # Ship 19: skill-library citation verification.
     _validate_skill_ids(stages, set(available_skill_ids))
+    # §Ship 38: per-stage steering-metric verification.
+    _validate_steering_metrics(stages)
 
     return mission
 
@@ -808,6 +874,9 @@ def redecompose_stage(
             ),
             reward_seed_prompt=model_stage.reward_seed_prompt,
             kg_seed_papers=list(model_stage.kg_seed_papers or []),
+            # §Ship 38: sub-stages inherit the failed stage's objective so a
+            # re-decomposed phase keeps steering by the same metric.
+            steering_metric=failed_stage.steering_metric,
             redecomposition_attempts=1,  # bound at one level
         ))
 

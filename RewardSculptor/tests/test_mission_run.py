@@ -527,6 +527,53 @@ def test_mission_run_happy_path_two_stages_both_succeed(
     assert "stage_succeeded" in types
 
 
+def test_mission_run_per_stage_steering_metric(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """§Ship 38: a stage with its OWN steering_metric is steered by THAT
+    metric; a stage without one falls back to the mission-level metric.
+    Each resolved fitness fn is tagged so we can see which metric each stage
+    actually received."""
+    from sculptor import sculpt as sculpt_mod
+
+    m = _make_mission(tmp_path, n_stages=2)
+    m.stages[0].steering_metric = "g1_kick"      # per-stage override
+    m.stages[1].steering_metric = None           # → mission-level metric
+
+    def fake_resolve(ref):
+        def fn(_iter_dir):
+            return 0.0
+        fn._metric_ref = ref
+        return fn
+    monkeypatch.setattr("sculptor.eval.resolve_fitness_fn", fake_resolve)
+
+    seen = {}
+    base_fake = _fake_sculpt_run_factory(metric=0.9)
+
+    def capturing_fake(**kw):
+        seen[Path(kw["config_path"]).parent.name] = getattr(
+            kw.get("fitness_fn"), "_metric_ref", None)
+        return base_fake(**kw)
+
+    monkeypatch.setattr(sculpt_mod, "sculpt_run", capturing_fake)
+    monkeypatch.setattr("sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit)
+
+    events: list[dict] = []
+    sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab", kg_store=None,
+        fitness_metric="go1_trot", on_event=events.append,
+    )
+
+    assert seen["stage_0"] == "g1_kick"          # used its own metric
+    assert seen["stage_1"] == "go1_trot"         # fell back to the mission metric
+    sm_events = {e["stage_name"]: e for e in events
+                 if e["type"] == "stage_fitness_metric"}
+    assert sm_events["stage_0"]["metric"] == "g1_kick"
+    assert sm_events["stage_0"]["source"] == "stage"
+    assert sm_events["stage_1"]["metric"] == "go1_trot"
+    assert sm_events["stage_1"]["source"] == "mission"
+
+
 def test_mission_run_halts_when_stage_criterion_fails(
     tmp_path: Path, monkeypatch, stub_adapter,
 ):

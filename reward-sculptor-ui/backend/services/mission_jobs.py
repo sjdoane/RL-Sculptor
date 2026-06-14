@@ -64,6 +64,10 @@ _STAGE_TEE_EVENTS = frozenset({
     "iter_started",
     "iter_completed",
     "iter_progress",
+    # §Ship 34: per-iter objective fitness + best-by-fitness selection,
+    # so a fitness-guided stage shows its fitness in the Runs tab.
+    "iter_fitness",
+    "best_reward_selected",
     "iter_rolled_out",
     "iter_diagnosed",
     "rollout_done",
@@ -193,7 +197,9 @@ def run_mission_decompose_job(
 
 
 # ── Subprocess execute ───────────────────────────────────────────────
-def _build_mission_run_flags(run_kwargs: dict[str, Any]) -> list[str]:
+def _build_mission_run_flags(
+    run_kwargs: dict[str, Any], project_dir: Path,
+) -> list[str]:
     """Translate the RunMissionRequest body into `sculpt mission-run`
     CLI flags. Skips fields whose value is None (defer to typer's
     Option default) and skips False booleans (typer interprets the
@@ -227,6 +233,25 @@ def _build_mission_run_flags(run_kwargs: dict[str, Any]) -> list[str]:
     for key, flag in bool_flags:
         if run_kwargs.get(key) is True:
             flags.append(flag)
+    # §Ship 34/35: fitness-in-the-loop. A generated "gen:<id>" ref must be
+    # RESOLVED to the project's metric.py path (the CLI can't load a
+    # "gen:" string) — without this, a mission with a generated metric
+    # crashes (Ship 35 review CRITICAL). Built-in names pass through.
+    fitness_metric = run_kwargs.get("fitness_metric")
+    if fitness_metric:
+        from backend.services.run_manager import (
+            _resolve_fitness_metric, steer_allowed,
+        )
+
+        resolved = _resolve_fitness_metric(project_dir, str(fitness_metric))
+        if resolved is not None:
+            flags += ["--fitness-metric", resolved]
+            mode = run_kwargs.get("fitness_mode")
+            # Downgrade steer→observe for an uncalibrated generated metric.
+            if mode == "steer" and not steer_allowed(project_dir, str(fitness_metric)):
+                mode = "observe"
+            if mode in ("observe", "steer"):
+                flags += ["--fitness-mode", str(mode)]
     return flags
 
 
@@ -248,7 +273,7 @@ def run_mission_execute_job(
     for `sculpt mission-run` so the UI's RunMissionDialog can knob
     iterations / Goal A / Goal B without touching mission.json.
     """
-    extra_flags = _build_mission_run_flags(run_kwargs or {})
+    extra_flags = _build_mission_run_flags(run_kwargs or {}, project_dir)
 
     async def _runner(job: Job, cancel: asyncio.Event) -> dict[str, Any]:
         job.progress = 0.0

@@ -36,6 +36,79 @@ EVENT_TAG = "[SCULPT-EVENT]"
 ITER_DIR_RE = re.compile(r"^iter_(\d+)$")
 
 
+_GEN_ID_RE = re.compile(r"^[A-Za-z0-9_]+$")
+
+
+def _resolve_fitness_metric(project_dir: Path, fitness_metric: str) -> Optional[str]:
+    """§Ship 35: map a UI fitness_metric value to the string the sculpt
+    CLI's resolve_fitness_fn understands. A generated metric is
+    "gen:<id>" → the project's `metrics/<id>/metric.py` path; a built-in
+    name passes through. Returns None for an unresolvable/unsafe gen ref
+    (the caller drops it → blind loop, never a failed run)."""
+    if fitness_metric.startswith("gen:"):
+        gid = fitness_metric[len("gen:"):]
+        # §Ship 35 review: validate the id so a crafted ref can't traverse
+        # outside the project's metrics dir.
+        if not _GEN_ID_RE.match(gid):
+            print(f"[run_manager] invalid generated-metric id {gid!r}; "
+                  f"running blind", flush=True)
+            return None
+        metric_py = project_dir / "metrics" / gid / "metric.py"
+        if metric_py.is_file():
+            return str(metric_py)
+        print(f"[run_manager] generated metric {gid!r} not found at "
+              f"{metric_py}; running blind", flush=True)
+        return None
+    return fitness_metric
+
+
+def steer_allowed(project_dir: Path, fitness_metric: str) -> bool:
+    """§Ship 35 review (CRITICAL): the backend — not just the UI — must
+    forbid an uncalibrated generated metric from STEERING (self-grading
+    firewall). Built-in metrics + calibrated generated metrics may steer;
+    an accepted-but-uncalibrated generated metric may only observe."""
+    if not fitness_metric.startswith("gen:"):
+        return True
+    gid = fitness_metric[len("gen:"):]
+    if not _GEN_ID_RE.match(gid):
+        return False
+    meta = project_dir / "metrics" / gid / "meta.json"
+    try:
+        import json as _json
+
+        return bool(_json.loads(meta.read_text(encoding="utf-8")).get("calibrated"))
+    except Exception:  # noqa: BLE001 — unreadable meta → not calibrated → observe
+        return False
+
+
+# ── §Ship 39 (H1): interactive control sidecar ─────────────────────────
+def control_file_path(project_dir: Path, run_id: str) -> Path:
+    """Deterministic path for a run's interactive control sidecar. Both the
+    runner (writes the initial state) and the PATCH /control route (writes
+    updates) compute it the same way → no job-lookup race."""
+    return Path(project_dir) / "runs" / f"_control_{run_id}.json"
+
+
+def write_control_file(path: Path, data: dict[str, Any]) -> None:
+    """Atomically write the control sidecar (tmp + rename) so the sculpt
+    subprocess never reads a half-written file at its poll."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(data), encoding="utf-8")
+    tmp.replace(path)
+
+
+def read_control_file(path: Path) -> dict[str, Any]:
+    """Read the control sidecar; missing / unreadable → a safe auto default."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            return data
+    except Exception:  # noqa: BLE001
+        pass
+    return {"mode": "auto", "resume_token": 0, "feedback": None, "stop": False}
+
+
 # ── public API ────────────────────────────────────────────────────────
 def run_sculpt_job(
     *,
@@ -74,6 +147,18 @@ def run_sculpt_job(
     auto_adjust_physics = run_params.get("auto_adjust_physics")
     early_stop_enabled = run_params.get("early_stop_enabled")
     early_stop_patience = run_params.get("early_stop_patience")
+    # §Ship 34: objective fitness-in-the-loop (spec-metric name). Forwarded
+    # to `sculpt run --fitness-metric`; None = the blind loop.
+    fitness_metric = run_params.get("fitness_metric")
+    # §Ship 35: observe vs steer (default steer). Only meaningful with a
+    # metric set; harmless otherwise.
+    fitness_mode = run_params.get("fitness_mode")
+    # §Ship 39 (H1): interactive start mode. "manual" = pause for human
+    # feedback at each iteration boundary; "auto" = run straight through.
+    # A control sidecar is ALWAYS written (deterministic path) so the
+    # Auto/Manual toggle works at ANY point mid-run, regardless of start mode.
+    start_mode = run_params.get("start_mode")
+    start_mode = start_mode if start_mode in ("manual", "auto") else "auto"
 
     async def _runner(job: Job, cancel: asyncio.Event) -> dict[str, Any]:
         # Prepare env — strip empty ANTHROPIC_API_KEY so the .env file
@@ -145,6 +230,35 @@ def run_sculpt_job(
             )
         if early_stop_patience is not None:
             cmd += ["--early-stop-patience", str(int(early_stop_patience))]
+        if fitness_metric:
+            # §Ship 35: a generated metric is referenced as "gen:<id>";
+            # resolve it to the project's metric.py path the CLI can load.
+            # A built-in name passes through unchanged. An unresolvable
+            # gen ref is dropped (blind loop) rather than failing the run.
+            resolved = _resolve_fitness_metric(project_dir, str(fitness_metric))
+            if resolved is not None:
+                cmd += ["--fitness-metric", resolved]
+                # §Ship 35 review: downgrade steer→observe for an
+                # uncalibrated generated metric (backend-enforced, not just
+                # the UI).
+                eff_mode = fitness_mode
+                if eff_mode == "steer" and not steer_allowed(
+                        project_dir, str(fitness_metric)):
+                    eff_mode = "observe"
+                if eff_mode in ("observe", "steer"):
+                    cmd += ["--fitness-mode", str(eff_mode)]
+
+        # §Ship 39 (H1): wire the interactive control sidecar. Written ALWAYS
+        # (deterministic path) so the Auto/Manual toggle works at any point
+        # mid-run; the initial mode comes from `start_mode` (default "auto").
+        control_path = control_file_path(project_dir, job.job_id)
+        write_control_file(control_path, {
+            "mode": start_mode, "resume_token": 0,
+            "feedback": None, "stop": False,
+        })
+        cmd += ["--control-file", str(control_path)]
+        job.params["control_file"] = str(control_path)
+        job.params["mode"] = start_mode
 
         job.params.setdefault("cmd", cmd)
         job.params.setdefault("behavior_goal", behavior_goal)
@@ -167,6 +281,8 @@ def run_sculpt_job(
             ("auto_adjust_physics", auto_adjust_physics),
             ("early_stop_enabled", early_stop_enabled),
             ("early_stop_patience", early_stop_patience),
+            ("fitness_metric", fitness_metric),
+            ("fitness_mode", fitness_mode if fitness_metric else None),
         ):
             if val is not None:
                 job.params.setdefault(key, val)
@@ -759,6 +875,9 @@ def _iter_events(job: Job) -> list[dict[str, Any]]:
                 "diagnosed": False,
                 "realism_audit": None,
                 "physics_edit_suggestion": None,
+                # §Ship 34: objective fitness-in-the-loop (None for blind runs).
+                "fitness": None,
+                "best_fitness": None,
             },
         )
         if etype == "iter_started":
@@ -846,6 +965,17 @@ def _iter_events(job: Job) -> list[dict[str, Any]]:
                 slot["paper_refs"] = list(ev.get("paper_refs") or [])
             if ev.get("reward_version_after") is not None:
                 slot["reward_version_after"] = ev.get("reward_version_after")
+        elif etype == "iter_fitness":
+            # §Ship 34: persist per-iter objective fitness into the REST
+            # timeline so the Runs-tab fitness chip survives a reload
+            # (the live WS path renders it too, but history rebuilds here).
+            if isinstance(ev.get("fitness"), (int, float)):
+                slot["fitness"] = float(ev.get("fitness"))
+            if isinstance(ev.get("best_so_far"), (int, float)):
+                slot["best_fitness"] = float(ev.get("best_so_far"))
+        elif etype == "best_reward_selected":
+            if isinstance(ev.get("fitness"), (int, float)):
+                slot["best_fitness"] = float(ev.get("fitness"))
 
     return [by_iter[k] for k in sorted(by_iter.keys())]
 

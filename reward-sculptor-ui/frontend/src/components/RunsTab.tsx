@@ -11,7 +11,7 @@ import { useSystemGpu } from "@/hooks/useLibrary";
 import { useRunEvents } from "@/hooks/useRunEvents";
 import { useMissions } from "@/hooks/useMissions";
 import { useRegenerateRewardTemplate, useRewards } from "@/hooks/useRewards";
-import { useKillRun, useRun, useRuns } from "@/hooks/useRuns";
+import { useControlRun, useKillRun, useRun, useRuns } from "@/hooks/useRuns";
 import { ApiError } from "@/lib/api";
 import { formatRelative } from "@/lib/utils";
 import type {
@@ -263,7 +263,10 @@ function RunRow({
         </span>
       </span>
       <Sparkline
-        data={r.primary_metric_history}
+        // §Ship 35: foreground objective fitness when the run has it.
+        data={(r.fitness_history && r.fitness_history.some((v) => typeof v === "number"))
+          ? r.fitness_history
+          : r.primary_metric_history}
         w={46}
         h={20}
         color={r.status === "errored" ? "var(--st-rose)" : r.status === "running" ? "var(--st-amber)" : "var(--st-emerald)"}
@@ -277,11 +280,28 @@ function RunDetailPane({ slug, runId, runs }: { slug: string; runId: string; run
   const run = useRun(slug, runId);
   const events = useRunEvents(slug, runId);
   const kill = useKillRun(slug);
+  const control = useControlRun(slug);
   const [selectedIter, setSelectedIter] = useState<number | null>(null);
 
   const iters = run.data?.iterations ?? [];
   const history = run.data?.primary_metric_history ?? [];
   const isActive = run.data?.status === "running" || run.data?.status === "queued";
+
+  // §Ship 39 (H1): derive interactive state (paused-awaiting-feedback + the
+  // current mode) from the event stream, seeded by the run's persisted mode
+  // so a reconnect restores the Auto/Manual switch.
+  const { awaiting, awaitingIter, mode } = useMemo(() => {
+    let aw = false;
+    let awIter: number | null = null;
+    let m: "manual" | "auto" = run.data?.mode === "manual" ? "manual" : "auto";
+    for (const ev of events.events) {
+      const e = ev as { type?: string; mode?: string; iter?: number };
+      if (e.type === "run_control_updated" && (e.mode === "manual" || e.mode === "auto")) m = e.mode;
+      else if (e.type === "awaiting_feedback") { aw = true; awIter = typeof e.iter === "number" ? e.iter : null; }
+      else if (e.type === "feedback_resumed" || e.type === "feedback_timeout" || e.type === "iter_started" || e.type === "run_completed" || e.type === "run_errored" || e.type === "run_stopped" || e.type === "early_stop") aw = false;
+    }
+    return { awaiting: aw, awaitingIter: awIter, mode: m };
+  }, [events.events, run.data?.mode]);
 
   const summary = useMemo(() => runs.find((r) => r.run_id === runId) ?? null, [runs, runId]);
   const isStageRun = (summary?.kind === "mission_stage_run") || (run.data?.kind === "mission_stage_run");
@@ -291,6 +311,16 @@ function RunDetailPane({ slug, runId, runs }: { slug: string; runId: string; run
 
   const mergedIters = useMergedIterations(iters, events.events);
   const isPending = run.data?.status === "queued" && mergedIters.length === 0;
+
+  // §Ship 35: fitness is the PRIMARY tracked metric when an objective
+  // fitness exists (observe or steer). Prefer the per-run history; fall
+  // back to deriving from the merged iterations (covers live runs before
+  // the REST summary refreshes). Degrade to the reward metric otherwise.
+  const fitnessHistory: Array<number | null> =
+    (run.data?.fitness_history && run.data.fitness_history.length
+      ? run.data.fitness_history
+      : mergedIters.map((it) => (typeof it.fitness === "number" ? it.fitness : null)));
+  const hasFitness = fitnessHistory.some((v) => typeof v === "number");
 
   return (
     <div className="rs-runs-detail">
@@ -309,6 +339,16 @@ function RunDetailPane({ slug, runId, runs }: { slug: string; runId: string; run
           run={run.data}
           isActive={isActive}
           wsConnected={events.connected}
+          mode={mode}
+          togglePending={control.isPending}
+          onToggleMode={() => {
+            if (!run.data) return;
+            const next = mode === "manual" ? "auto" : "manual";
+            control.mutate({ runId: run.data.run_id, mode: next }, {
+              onSuccess: () => toast.success(next === "manual" ? "Manual: pausing each iteration for your feedback" : "Auto: running straight through"),
+              onError: (err) => toast.error("Could not change mode", { description: err instanceof ApiError ? err.problem.detail ?? err.problem.title : err.message }),
+            });
+          }}
           onKill={() => {
             if (!run.data) return;
             const ok = window.confirm(`Stop run ${run.data.run_id}? The subprocess will be terminated.`);
@@ -322,6 +362,19 @@ function RunDetailPane({ slug, runId, runs }: { slug: string; runId: string; run
             });
           }}
         />
+        {isActive && awaiting && run.data && (
+          <FeedbackPanel
+            iterIndex={awaitingIter}
+            pending={control.isPending}
+            onSubmit={(text, goAuto) => {
+              if (!run.data) return;
+              control.mutate(
+                { runId: run.data.run_id, resume: true, feedback: text || null, ...(goAuto ? { mode: "auto" as const } : {}) },
+                { onError: (err) => toast.error("Could not continue", { description: err instanceof ApiError ? err.problem.detail ?? err.problem.title : err.message }) },
+              );
+            }}
+          />
+        )}
         {run.data?.error && (
           <div style={{ padding: "0 16px" }}>
             <RunErrorCard slug={slug} error={run.data.error} classification={run.data.error_classification ?? null} />
@@ -332,8 +385,23 @@ function RunDetailPane({ slug, runId, runs }: { slug: string; runId: string; run
 
       <div className="rs-extra-col">
         <div className="rs-card">
-          <div className="rs-card-head"><div className="rs-card-title" style={{ fontSize: 13 }}><Icon name="trending-up" size={15} />Mean reward</div>{isActive && <span className="rs-dot live" />}</div>
-          <div style={{ padding: "8px 4px 4px" }}><MetricChart data={history} live={isActive} /></div>
+          <div className="rs-card-head"><div className="rs-card-title" style={{ fontSize: 13 }}><Icon name="trending-up" size={15} />{hasFitness ? "Objective fitness" : "Mean reward"}</div>{isActive && <span className="rs-dot live" />}</div>
+          <div style={{ padding: "8px 4px 4px" }}>
+            <MetricChart
+              data={hasFitness ? fitnessHistory : history}
+              live={isActive}
+              label={hasFitness ? "Objective fitness per iteration" : "Mean reward per iteration"}
+              decimals={hasFitness ? 2 : 1}
+            />
+          </div>
+          {/* §Ship 35: reward metric demoted to a secondary sparkline when
+              fitness is the primary signal. */}
+          {hasFitness && history.some((v) => typeof v === "number") && (
+            <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "2px 10px 8px", fontSize: 11, color: "var(--rs-muted)" }}>
+              <span>reward</span>
+              <Sparkline data={history} w={120} h={16} color="var(--rs-muted)" />
+            </div>
+          )}
         </div>
         {stageRewardsScope && <StageRewardsCard slug={slug} stage={stageRewardsScope} />}
         {isActive && <RunGpuCard />}
@@ -409,7 +477,7 @@ function RunGpuCard() {
   );
 }
 
-function RunHeader({ run, isActive, wsConnected, onKill }: { run: RunDetail | undefined; isActive: boolean; wsConnected: boolean; onKill: () => void }) {
+function RunHeader({ run, isActive, wsConnected, mode, onToggleMode, togglePending, onKill }: { run: RunDetail | undefined; isActive: boolean; wsConnected: boolean; mode: "manual" | "auto"; onToggleMode: () => void; togglePending: boolean; onKill: () => void }) {
   return (
     <div className="rs-run-header">
       <Icon name="activity" size={17} color="var(--rs-muted)" />
@@ -423,7 +491,51 @@ function RunHeader({ run, isActive, wsConnected, onKill }: { run: RunDetail | un
         <span className="rs-flex rs-gap-6"><span className="rs-dot" style={{ background: wsConnected ? "var(--st-emerald)" : "var(--st-rose)" }} />ws {wsConnected ? "open" : "closed"}</span>
         {run && <span>iters {run.iterations_completed}/{run.iterations_requested}</span>}
       </span>
+      {/* §Ship 39 (H1): the big Auto/Manual switch — flip at ANY point. */}
+      {isActive && (
+        <Btn
+          kind={mode === "manual" ? "primary" : "quiet"}
+          size="sm"
+          icon={mode === "manual" ? "clock" : "activity"}
+          disabled={togglePending}
+          onClick={onToggleMode}
+          title={mode === "manual"
+            ? "Manual: pausing for your feedback each iteration. Click to run on auto."
+            : "Auto: running straight through. Click to pause for feedback each iteration."}
+        >
+          {mode === "manual" ? "Manual" : "Auto"}
+        </Btn>
+      )}
       {isActive && <Btn kind="danger" size="sm" icon="square" onClick={onKill}>Stop</Btn>}
+    </div>
+  );
+}
+
+// §Ship 39 (H1): the inline feedback prompt shown when the loop is paused
+// awaiting the human's observation (manual mode).
+function FeedbackPanel({ iterIndex, pending, onSubmit }: { iterIndex: number | null; pending: boolean; onSubmit: (text: string, goAuto: boolean) => void }) {
+  const [text, setText] = useState("");
+  return (
+    <div className="rs-card" style={{ margin: "0 16px 12px", borderColor: "var(--st-amber)", borderWidth: 1, borderStyle: "solid" }}>
+      <div className="rs-flex rs-gap-6" style={{ alignItems: "center", marginBottom: 6 }}>
+        <Icon name="clock" size={15} color="var(--st-amber)" />
+        <span className="rs-eyebrow">Awaiting your feedback{typeof iterIndex === "number" ? ` · after iteration ${iterIndex}` : ""}</span>
+      </div>
+      <div className="rs-sub" style={{ marginBottom: 8 }}>
+        Watch the latest rollout, then tell the diagnoser what you see (optional) — it steers the next iteration.
+      </div>
+      <textarea
+        className="rs-textarea"
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        rows={3}
+        placeholder="e.g. it's standing still and flailing its arms — not actually kicking"
+        style={{ width: "100%", resize: "vertical" }}
+      />
+      <div className="rs-flex rs-gap-8" style={{ marginTop: 8 }}>
+        <Btn kind="primary" size="sm" icon={pending ? "loader" : "play"} disabled={pending} onClick={() => onSubmit(text, false)}>Continue</Btn>
+        <Btn kind="quiet" size="sm" disabled={pending} onClick={() => onSubmit(text, true)}>Continue + go Auto</Btn>
+      </div>
     </div>
   );
 }
@@ -470,7 +582,21 @@ function IterationTimeline({ iters, selected, onSelect }: { iters: IterEventSumm
         >
           <div className="rs-itercard-top">
             <span className="it"><Badge status={it.status} label="" />iter {it.iter_index}</span>
-            {it.primary_metric !== null && <span className="rs-num" style={{ fontSize: 13 }}>{it.primary_metric.toFixed(1)}</span>}
+            {/* §Ship 35: objective fitness is the PRIMARY metric (prominent,
+                violet); the reward metric is demoted to a small muted value.
+                Falls back to reward-as-primary on blind runs (no fitness). */}
+            {typeof it.fitness === "number" ? (
+              <span style={{ display: "flex", alignItems: "baseline", gap: 6 }}>
+                <span className="rs-num" title="objective fitness (spec_score, 0-1) — primary metric" style={{ fontSize: 15, fontWeight: 600, color: "#b9aef5" }}>
+                  fit {it.fitness.toFixed(2)}{typeof it.best_fitness === "number" && it.best_fitness > it.fitness + 1e-9 ? ` (best ${it.best_fitness.toFixed(2)})` : ""}
+                </span>
+                {it.primary_metric !== null && (
+                  <span className="rs-num" title="reward metric (secondary)" style={{ fontSize: 11, color: "var(--rs-muted)" }}>r {it.primary_metric.toFixed(1)}</span>
+                )}
+              </span>
+            ) : (
+              it.primary_metric !== null && <span className="rs-num" style={{ fontSize: 13 }}>{it.primary_metric.toFixed(1)}</span>
+            )}
           </div>
           {it.status === "running" && typeof it.rl_total === "number" && it.rl_total > 0 && (
             <IterProgressBar rlIter={it.rl_iter ?? 0} rlTotal={it.rl_total} pct={it.pct ?? 0} etaS={it.eta_s ?? null} />
@@ -599,6 +725,10 @@ function _mergeIterSlot(prev: IterEventSummary | undefined, next: IterEventSumma
     diagnosed: winner.diagnosed || loser.diagnosed,
     realism_audit: winner.realism_audit ?? loser.realism_audit,
     physics_edit_suggestion: winner.physics_edit_suggestion ?? loser.physics_edit_suggestion,
+    // §Ship 34: keep fitness even if the winning (completed) slot didn't
+    // carry it (iter_fitness fires before iter_completed).
+    fitness: winner.fitness ?? loser.fitness,
+    best_fitness: winner.best_fitness ?? loser.best_fitness,
   };
 }
 
@@ -673,6 +803,14 @@ function useMergedIterations(rest: IterEventSummary[], events: RunEvent[]): Iter
         if (typeof ev.pct === "number") slot.pct = ev.pct;
         if (typeof ev.elapsed_s === "number") slot.elapsed_s = ev.elapsed_s;
         if (typeof ev.eta_s === "number" || ev.eta_s === null) slot.eta_s = ev.eta_s as number | null;
+      }
+      // §Ship 34: objective fitness-in-the-loop, shown beside the metric.
+      if (ev.type === "iter_fitness") {
+        if (typeof ev.fitness === "number") slot.fitness = ev.fitness;
+        if (typeof ev.best_so_far === "number") slot.best_fitness = ev.best_so_far;
+      }
+      if (ev.type === "best_reward_selected") {
+        if (typeof ev.fitness === "number") slot.best_fitness = ev.fitness;
       }
       eventSlots.set(iter, slot);
     }

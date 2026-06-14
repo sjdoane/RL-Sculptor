@@ -176,6 +176,7 @@ def burstiness(
     smooth_frames: int = 5,
     joint_indices: Optional[Sequence[int]] = None,
     valid_mask: Optional[np.ndarray] = None,
+    ratio_floor: float = 0.5,
 ) -> dict[str, float]:
     """Kick-like transients: per-step peak SUSTAINED joint speed over
     the selected joints, summarized by p95/p99 and their ratios to the
@@ -209,12 +210,70 @@ def burstiness(
     p95 = float(np.quantile(flat, 1.0 - top_fraction))
     p99 = float(np.quantile(flat, 0.99))
     med = float(np.median(flat))
-    safe = med if med > 1e-9 else 0.0
+    # §Ship 34: floor the denominator at a rest-noise level. A CLEAN
+    # kicker (still between kicks) has median ~0, and the old
+    # `med>1e-9 else 0.0` guard then scored the *ideal* kicker's ratio as
+    # 0.0 — i.e. read a perfect kick as "no kick" (Ship-33 audit). The
+    # floor gives a genuine kicker a large, real ratio; a continuously-
+    # moving policy (med > floor) is unchanged, preserving the ratio's
+    # scale-invariance for active policies (and every existing test).
+    denom = max(med, ratio_floor)
     return {
         "burst_p95": p95,
         "burst_p99": p99,
-        "burst_ratio_p95": (p95 / med) if safe else 0.0,
-        "burst_ratio_p99": (p99 / med) if safe else 0.0,
+        "burst_ratio_p95": p95 / denom,
+        "burst_ratio_p99": p99 / denom,
+    }
+
+
+def kick_events_score(
+    joint_vel: np.ndarray,
+    projected_gravity_b: np.ndarray,
+    *,
+    joint_indices: Optional[Sequence[int]] = None,
+    thresh: float = 5.0,
+    smooth_frames: int = 5,
+    saturate_events: float = 3.0,
+) -> dict[str, float]:
+    """§Ship 36: monotone discrete kick-EVENT count — a saturating count of
+    sustained leg-speed transients crossing an ABSOLUTE threshold from an
+    upright window, refractory-gated (one event per contiguous hot run).
+
+    This is the audit-prescribed replacement signal for `burstiness`'s
+    peak/median RATIO, which is extremal-Goodhart: competence-neutral
+    baseline motion raises the median and SUPPRESSES the ratio, so a clean
+    stationary flailer outscores a competent walking kicker (see
+    scripts/audit_spec_metric_monotonicity.py). The event count is invariant
+    to sub-threshold baseline motion and monotone in the number of genuine
+    kicks. Reported as a DIAGNOSTIC sub-component of g1_kick today; promoting
+    it to the spec_score awaits real-rollout threshold calibration (the
+    Ship-33/34 deferral) so the absolute `thresh`/`smooth_frames` are tuned
+    to measured kick durations rather than guessed."""
+    jv = _check_te(joint_vel)
+    if joint_indices is not None and len(joint_indices) > 0:
+        jv = jv[:, :, list(joint_indices)]
+    T = jv.shape[0]
+    w = max(1, min(smooth_frames, T))
+    sm = _sliding_mean(jv, w)                          # (T', E, J)
+    speed = np.abs(sm).max(axis=2)                     # (T', E)
+    up = _sliding_mean(
+        upright_mask(projected_gravity_b).astype(np.float64), w,
+    ) > 0.999                                          # (T', E)
+    hot = (speed >= thresh) & up                       # (T', E)
+    if hot.shape[0] == 0:
+        return {"kick_events": 0.0, "kick_events_per_env": 0.0}
+    # Rising edges per env, vectorized across envs (refractory: only a
+    # False→True transition starts a new event).
+    prev = np.zeros((hot.shape[1],), dtype=bool)
+    events = 0
+    for t in range(hot.shape[0]):
+        cur = hot[t]
+        events += int(np.count_nonzero(cur & ~prev))
+        prev = cur
+    per_env = events / max(1, hot.shape[1])
+    return {
+        "kick_events": 1.0 - float(np.exp(-per_env / max(1e-9, saturate_events))),
+        "kick_events_per_env": float(per_env),
     }
 
 
@@ -400,8 +459,14 @@ def spec_g1_kick(
     intensity = 1.0 - float(np.exp(-b["burst_p95"] / 5.0))
     ratio = max(b["burst_ratio_p95"], b["burst_ratio_p99"])
     ratio_gate = float(np.clip((ratio - 2.0) / 3.0, 0.0, 1.0))
+    # §Ship 36: monotone discrete kick-event diagnostic, reported alongside
+    # the (confounded) ratio score so the diagnoser sees an extremal-Goodhart-
+    # robust signal. spec_score is unchanged pending real-rollout calibration.
+    ev = kick_events_score(jv, arrays["projected_gravity_b"],
+                           joint_indices=legs or None)
     return {
         **b,
+        **ev,
         "uprightness": up,
         "leg_subset": 1.0 if legs else 0.0,
         "spec_score": float(np.clip(intensity * ratio_gate * up, 0.0, 1.0)),
@@ -440,6 +505,51 @@ _SPEC_FNS: dict[str, Callable[..., dict[str, float]]] = {
     "g1_kick": spec_g1_kick,
     "go1_trot": spec_go1_trot,
 }
+
+
+def spec_metric_names() -> list[str]:
+    """Public, sorted list of available spec-metric names. Source of
+    truth for the UI's objective-fitness dropdown and the backend
+    Literal — keep those in sync with this set (§Ship 34)."""
+    return sorted(_SPEC_FNS)
+
+
+#: §Ship 34: the robot family each spec metric is CALIBRATED for. The
+#: metrics read arrays generically (so go1_trot's speed/straightness is
+#: usable for any forward-locomotor), but several bake in robot-specific
+#: constants (go1 stance-height gate ≈ 0.30 m; g1 hip/arm joint tokens).
+#: Used for a soft mismatch warning — NOT a hard gate, since cross-robot
+#: locomotion use is legitimate.
+_METRIC_ROBOT_HINTS: dict[str, tuple[str, ...]] = {
+    "cartpole_balance": ("cartpole",),
+    "go1_trot": ("go1", "go2"),
+    "g1_floss": ("g1",),
+    "g1_kick": ("g1",),
+}
+
+
+def spec_metric_robot_warning(
+    spec_name: Optional[str], task_id: Optional[str],
+) -> Optional[str]:
+    """Return a human-readable warning if `spec_name` looks mismatched to
+    the env `task_id` (e.g. fitness_metric='go1_trot' on a G1 task), else
+    None. Soft check: the score is still computable, but its calibration
+    (stance height, joint-name groups) may be wrong, so the loop could
+    optimize the wrong thing. Callers WARN, they do not block."""
+    if not spec_name or not task_id:
+        return None
+    hints = _METRIC_ROBOT_HINTS.get(spec_name)
+    if not hints:
+        return None
+    tid = str(task_id).lower()
+    if any(h in tid for h in hints):
+        return None
+    return (
+        f"fitness_metric={spec_name!r} is calibrated for "
+        f"{'/'.join(hints)} but the env task is {task_id!r} — the "
+        f"objective fitness may be semantically wrong for this robot "
+        f"(check the spec's stance-height / joint-group assumptions)."
+    )
 
 #: Arrays each spec needs from trajectory.npz (cartpole needs none —
 #: it works off behavior.json alone).
@@ -515,3 +625,36 @@ def compute_spec_metrics(
             "spec_score": 0.0,
             "error": f"{type(e).__name__}: {e}",
         }
+
+
+def make_spec_fitness_fn(spec_name: str) -> Callable[[Any], float]:
+    """§Ship 34: build a `fitness_fn(iter_dir) -> float` from a spec
+    metric name, for sculpt_run/mission_run's fitness-in-loop. Given an
+    iteration dir, scores its `rollout/` with the named spec and returns
+    `spec_score` (0.0 on any missing/failed artifact — never raises, so a
+    bad iter is an honest zero rather than a crashed run).
+
+    Used by both the eval harness (--fitness-in-loop) and the UI's
+    objective-fitness dropdown (sculpt run --fitness-metric)."""
+    if spec_name not in _SPEC_FNS:
+        raise KeyError(
+            f"unknown spec metric {spec_name!r}; known: {sorted(_SPEC_FNS)}"
+        )
+
+    def _fitness(iter_dir: Any) -> float:
+        result = compute_spec_metrics(spec_name, Path(iter_dir) / "rollout")
+        return float(result.get("spec_score", 0.0) or 0.0)
+
+    def _detail(iter_dir: Any) -> dict:
+        # §Ship 36 (F2): the FULL component breakdown (not just spec_score)
+        # for the diagnoser's OBJECTIVE_TASK_PROGRESS block — lets the LLM
+        # localize WHAT is wrong (e.g. high burst but low uprightness =
+        # violent-but-falling). Rides on the fitness fn so no new param is
+        # threaded through sculpt_run/mission_run. Never raises.
+        try:
+            return compute_spec_metrics(spec_name, Path(iter_dir) / "rollout")
+        except Exception:  # noqa: BLE001 — breakdown is advisory, never fatal
+            return {}
+
+    _fitness.detail = _detail  # type: ignore[attr-defined]
+    return _fitness

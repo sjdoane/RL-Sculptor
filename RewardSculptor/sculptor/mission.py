@@ -80,6 +80,15 @@ class Stage:
     # mission.json files load with init_skill_id=None via the
     # filter-unknown-keys path in `from_dict`.
     init_skill_id: Optional[str] = None
+    # §Ship 38: optional PER-STAGE objective fitness metric — a built-in
+    # spec-metric name (e.g. "g1_kick") or a resolved generated-metric .py
+    # path. When set it OVERRIDES the mission-level fitness_metric for THIS
+    # stage; this is what makes a true multi-phase curriculum sound (a
+    # "balance on one leg" stage and a "kick" stage want DIFFERENT
+    # objectives — Ship 34's uniform-metric-per-mission could not). None →
+    # the uniform mission metric. Backward-compatible: older mission.json
+    # without it load with steering_metric=None via from_dict's filter.
+    steering_metric: Optional[str] = None
 
     # ── Runtime-populated by orchestrator ────────────────────────────
     status: StageStatus = "pending"
@@ -393,6 +402,18 @@ def _validate_stage_structure(
         raise MissionValidationError(
             f"stage[{idx}].goal_text is empty"
         )
+    # §Ship 38: per-stage steering metric, when present, must be a sane
+    # non-empty string (a spec-metric name or a generated-metric path). The
+    # KNOWN-name check happens at decompose time (which has spec_metric_names);
+    # here we only guard against empty / pathologically-long hand edits.
+    if stage.steering_metric is not None:
+        sm = str(stage.steering_metric).strip()
+        if not sm or len(sm) > 128:
+            raise MissionValidationError(
+                f"stage[{idx}].steering_metric must be a non-empty string "
+                f"≤128 chars (a spec-metric name or generated-metric path); "
+                f"got {stage.steering_metric!r}"
+            )
 
 
 def _validate_parent_reference(

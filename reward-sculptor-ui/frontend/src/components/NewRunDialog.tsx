@@ -3,9 +3,11 @@ import { toast } from "sonner";
 
 import { Icon } from "@/components/rs/icon";
 import { Btn, Field, Modal, ToggleRow } from "@/components/rs/primitives";
+import { useCalibrateMetric, useGenerateMetric, useProjectMetrics } from "@/hooks/useMetrics";
 import { useLaunchRun } from "@/hooks/useRuns";
 import { ApiError } from "@/lib/api";
 import type { ProjectDetail } from "@/lib/types";
+import { SPEC_METRIC_NAMES } from "@/lib/types";
 
 
 // ── Per-adapter expected seconds-per-cycle (S8 / §7.7) ───────────────
@@ -153,6 +155,9 @@ export function NewRunDialog({
   const [device, setDevice] = useState<string>(defaults.device);
   const [noKg, setNoKg] = useState(false);
   const [dryRun, setDryRun] = useState(false);
+  // §Ship 39 (H1): pause-for-feedback by default (the requested default);
+  // flippable to Auto at any time from the run header once it's running.
+  const [interactive, setInteractive] = useState(true);
   const [expandKg, setExpandKg] = useState(false);
   // §Ship-7: rollout-video + RL knobs. Empty string = "leave blank →
   // use runner/config default".
@@ -161,7 +166,22 @@ export function NewRunDialog({
   const [rolloutEpisodes, setRolloutEpisodes] = useState<number | "">("");
   const [seed, setSeed] = useState<number | "">("");
   const [autoAdjustPhysics, setAutoAdjustPhysics] = useState<boolean | null>(null);
+  // §Ship 34/35: objective fitness. null = blind loop. A built-in spec
+  // name OR a generated-metric ref ("gen:<id>").
+  const [fitnessMetric, setFitnessMetric] = useState<string | null>(null);
+  const [fitnessMode, setFitnessMode] = useState<"observe" | "steer">("steer");
   const launch = useLaunchRun(slug);
+  // §Ship 35: per-project generated metrics + the generate action.
+  const projectMetrics = useProjectMetrics(slug, open);
+  const genMetric = useGenerateMetric(slug);
+  const calibrate = useCalibrateMetric(slug);
+  const [calibrateAgainst, setCalibrateAgainst] = useState<string>("go1_trot");
+  const genMetrics = (projectMetrics.data ?? []).filter((m) => m.accepted);
+  const selectedGen = fitnessMetric?.startsWith("gen:")
+    ? genMetrics.find((m) => `gen:${m.id}` === fitnessMetric) ?? null
+    : null;
+  // An accepted-but-uncalibrated generated metric may ONLY observe.
+  const steerLocked = selectedGen !== null && !selectedGen.calibrated;
 
   // S8 / §7.7 — ETA estimate + resume-warning banner. Pure view-layer
   // logic; no new API call. Uses the documented per-cycle budget for
@@ -213,6 +233,14 @@ export function NewRunDialog({
         typeof rolloutEpisodes === "number" ? rolloutEpisodes : null,
       seed: typeof seed === "number" ? seed : null,
       auto_adjust_physics: autoAdjustPhysics,
+      // §Ship 34: null = blind loop; a spec name turns on fitness-guided
+      // selection + plateau early-stop for this run.
+      fitness_metric: fitnessMetric,
+      // §Ship 35: observe vs steer (ignored when no metric). An
+      // uncalibrated generated metric is forced to observe.
+      fitness_mode: steerLocked ? "observe" : fitnessMode,
+      // §Ship 39 (H1): manual = pause for human feedback each iteration.
+      start_mode: interactive ? ("manual" as const) : ("auto" as const),
     };
     launch.mutate(body, {
       onSuccess: (r) => {
@@ -331,6 +359,11 @@ export function NewRunDialog({
                 title={<><code className="mono">--dry-run</code> · smoke-test the pipeline</>}
                 desc="training steps capped at 1000, LLM calls stubbed — ~50 s total"
               />
+              <ToggleRow
+                on={interactive} onChange={setInteractive} label="Pause for my feedback each iteration"
+                title={<>Manual mode · review the rollout, then steer the next iteration</>}
+                desc="Default on. Flip to Auto at any point from the run header while it's running."
+              />
             </>
           ) : (
             <>
@@ -411,6 +444,143 @@ export function NewRunDialog({
                   </div>
                   <span style={{ color: "var(--rs-muted)" }}>emits a physics-edit chip on severe realism audits.</span>
                 </div>
+
+                {/* §Ship 34/35: objective fitness metric — built-ins + auto-generated. */}
+                <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", fontSize: 12.5 }}>
+                  <span style={{ fontWeight: 500, color: "var(--ink)" }}>Objective fitness metric</span>
+                  <div className="rs-select">
+                    <select
+                      value={fitnessMetric ?? "none"}
+                      onChange={(e) => { const v = e.target.value; setFitnessMetric(v === "none" ? null : v); }}
+                      disabled={launch.isPending || genMetric.isPending}
+                      aria-label="Objective fitness metric"
+                    >
+                      <option value="none">none (blind loop)</option>
+                      <optgroup label="built-in (ground truth)">
+                        {SPEC_METRIC_NAMES.map((m) => (
+                          <option key={m} value={m}>{m}</option>
+                        ))}
+                      </optgroup>
+                      {genMetrics.length > 0 && (
+                        <optgroup label="auto-generated for this project">
+                          {genMetrics.map((m) => (
+                            <option key={m.id} value={`gen:${m.id}`}>
+                              {m.id}{m.calibrated ? " ✓ calibrated" : " (observe-only)"} — {m.behavior_goal?.slice(0, 40)}
+                            </option>
+                          ))}
+                        </optgroup>
+                      )}
+                    </select>
+                  </div>
+                  <Btn
+                    kind="quiet"
+                    icon={genMetric.isPending ? "loader" : "sparkles"}
+                    disabled={genMetric.isPending || behavior.trim().length < 4}
+                    title="Auto-generate an objective metric from the behavior goal above"
+                    onClick={() => {
+                      genMetric.mutate(
+                        { behavior_goal: behavior.trim() },
+                        {
+                          onSuccess: (m) => {
+                            if (m.accepted) {
+                              setFitnessMetric(`gen:${m.id}`);
+                              setFitnessMode("observe");
+                              toast.success(`Generated ${m.id} (observe-only until calibrated)`, {
+                                description: m.review?.summary ?? "Validated + reviewed.",
+                              });
+                            } else {
+                              const why = (m.reasons && m.reasons[0])
+                                || (m.review?.concerns && m.review.concerns[0])
+                                || "validation/review rejected it";
+                              toast.error("Generated metric rejected", { description: why });
+                            }
+                          },
+                          onError: (err) => {
+                            const d = err instanceof ApiError ? err.problem.detail ?? err.problem.title : err.message;
+                            toast.error("Could not generate metric", { description: d });
+                          },
+                        },
+                      );
+                    }}
+                  >
+                    {genMetric.isPending ? "Generating… (~1-2 min)" : "Generate from goal"}
+                  </Btn>
+                  <span style={{ color: "var(--rs-muted)" }}>built-ins steer directly; an auto-generated metric observes until it passes calibration.</span>
+                </div>
+
+                {/* §Ship 35: observe vs steer — only when a metric is chosen. */}
+                {fitnessMetric !== null && (
+                  <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", fontSize: 12.5, paddingLeft: 14 }}>
+                    <span style={{ fontWeight: 500, color: "var(--ink)" }}>Fitness mode</span>
+                    <div className="rs-select">
+                      <select
+                        value={steerLocked ? "observe" : fitnessMode}
+                        onChange={(e) => setFitnessMode(e.target.value === "observe" ? "observe" : "steer")}
+                        disabled={launch.isPending || steerLocked}
+                        aria-label="Fitness mode"
+                      >
+                        <option value="steer">steer (drives selection)</option>
+                        <option value="observe">observe (display only)</option>
+                      </select>
+                    </div>
+                    <span style={{ color: "var(--rs-muted)" }}>
+                      {steerLocked
+                        ? "this generated metric is observe-only until it passes calibration (Spearman vs a built-in ground truth)."
+                        : "observe = compute & chart it without influencing the run (for a blind-vs-guided A/B)."}
+                    </span>
+                  </div>
+                )}
+
+                {/* §Ship 35: earn steer-rights — calibrate an uncalibrated
+                    generated metric against a hand-authored ground truth. */}
+                {steerLocked && selectedGen && (
+                  <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", fontSize: 12.5, paddingLeft: 14 }}>
+                    <span style={{ fontWeight: 500, color: "var(--ink)" }}>Earn steer-rights</span>
+                    <span style={{ color: "var(--rs-muted)" }}>calibrate vs</span>
+                    <div className="rs-select">
+                      <select
+                        value={calibrateAgainst}
+                        onChange={(e) => setCalibrateAgainst(e.target.value)}
+                        disabled={calibrate.isPending}
+                        aria-label="Calibrate against built-in metric"
+                      >
+                        {SPEC_METRIC_NAMES.map((m) => (
+                          <option key={m} value={m}>{m}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <Btn
+                      kind="quiet"
+                      icon={calibrate.isPending ? "loader" : "git-compare"}
+                      disabled={calibrate.isPending}
+                      onClick={() => {
+                        calibrate.mutate(
+                          { metricId: selectedGen.id, against: calibrateAgainst },
+                          {
+                            onSuccess: (m) => {
+                              if (m.calibrated) {
+                                setFitnessMode("steer");
+                                toast.success(`${m.id} calibrated — steer unlocked`, {
+                                  description: `Spearman ${m.calibration?.spearman ?? "?"} vs ${calibrateAgainst}`,
+                                });
+                              } else {
+                                toast.error("Did not pass calibration", {
+                                  description: `Spearman ${m.calibration?.spearman ?? "?"} < threshold; stays observe-only.`,
+                                });
+                              }
+                            },
+                            onError: (err) => {
+                              const d = err instanceof ApiError ? err.problem.detail ?? err.problem.title : err.message;
+                              toast.error("Calibration failed", { description: d });
+                            },
+                          },
+                        );
+                      }}
+                    >
+                      {calibrate.isPending ? "Calibrating…" : "Calibrate"}
+                    </Btn>
+                  </div>
+                )}
 
                 <ToggleRow
                   on={expandKg} onChange={setExpandKg} label="Expand knowledge graph"

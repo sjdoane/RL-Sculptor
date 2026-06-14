@@ -1,8 +1,9 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
-import { getRun, killRun, launchRun, listRuns } from "@/lib/api";
+import { controlRun, getRun, killRun, launchRun, listRuns } from "@/lib/api";
 import { qk } from "@/lib/queryKeys";
 import type {
+  RunControlState,
   RunDetail,
   RunParamsPayload,
   RunSummary,
@@ -69,6 +70,26 @@ export function useKillRun(slug: string) {
     mutationFn: (runId) => killRun(slug, runId),
     onSuccess: (_r, runId) => {
       qc.invalidateQueries({ queryKey: qk.runs(slug) });
+      qc.invalidateQueries({ queryKey: qk.run(slug, runId) });
+    },
+  });
+}
+
+/** §Ship 39 (H1): interactive control for a live run — flip Auto/Manual,
+ *  resume a pause (optionally with feedback), or stop cleanly. */
+export interface RunControlVars {
+  runId: string;
+  mode?: "manual" | "auto";
+  resume?: boolean;
+  feedback?: string | null;
+  stop?: boolean;
+}
+
+export function useControlRun(slug: string) {
+  const qc = useQueryClient();
+  return useMutation<RunControlState, Error, RunControlVars>({
+    mutationFn: ({ runId, ...body }) => controlRun(slug, runId, body),
+    onSuccess: (_r, { runId }) => {
       qc.invalidateQueries({ queryKey: qk.run(slug, runId) });
     },
   });

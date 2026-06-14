@@ -101,6 +101,61 @@ class RunParams(BaseModel):
     early_stop_patience: Optional[Annotated[int, Field(ge=1, le=100)]] = None
     """Legacy compatibility no-op; accepted for older API clients/configs."""
 
+    # §Ship 34/35: objective fitness-in-the-loop. A built-in spec-metric
+    # name (cartpole_balance / g1_floss / g1_kick / go1_trot) OR a
+    # generated-metric id ("gen:<id>", resolved server-side to the
+    # project's metric .py). None = the blind loop. Kept as a free str
+    # (not a Literal) so auto-generated metrics are selectable; the
+    # sculpt CLI fail-fasts on an unresolvable value.
+    fitness_metric: Optional[str] = None
+    """Spec metric (built-in name or 'gen:<id>') used as in-loop fitness.
+    None keeps the blind loop (criterion / metric-history only)."""
+
+    # §Ship 35: observe vs steer. "steer" (default): fitness drives
+    # best-selection + early-stop + the diagnoser. "observe": compute +
+    # display only, zero influence (fair A/B; safe default for
+    # not-yet-calibrated generated metrics).
+    fitness_mode: Literal["observe", "steer"] = "steer"
+    """How the fitness signal is used. observe = passive display only."""
+
+    # §Ship 39 (H1): interactive human-in-the-loop start mode. "manual" (the
+    # UI default) pauses for human feedback at each iteration boundary so the
+    # user can steer from what they see in the rollout video; "auto" runs
+    # straight through. The Auto/Manual toggle flips this at ANY point mid-run
+    # via PATCH /runs/{id}/control. Model default "auto" keeps non-UI / test
+    # launches non-interactive (no pause → no hang).
+    start_mode: Literal["manual", "auto"] = "auto"
+    """Interactive start mode. manual = pause-for-feedback each iteration."""
+
+
+class RunControl(BaseModel):
+    """PATCH /projects/{slug}/runs/{run_id}/control body — interactive
+    human-in-the-loop control (§Ship 39). All fields optional; the route
+    merges them into the run's control sidecar that the sculpt subprocess
+    polls at each iteration boundary."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Optional[Literal["manual", "auto"]] = None
+    """Flip the run between pause-for-feedback (manual) and run-through (auto)."""
+    resume: bool = False
+    """Release the current pause (bumps the resume token), with optional feedback."""
+    feedback: Optional[Annotated[str, Field(max_length=4000)]] = None
+    """Free-text human observation to inject into the NEXT iteration's diagnose."""
+    stop: bool = False
+    """End the run cleanly after the current iteration."""
+
+
+class RunControlState(BaseModel):
+    """The control sidecar's current state, returned by the PATCH route."""
+
+    model_config = ConfigDict(extra="allow")
+
+    mode: str = "auto"
+    resume_token: int = 0
+    feedback: Optional[str] = None
+    stop: bool = False
+
 
 class IterEventSummary(BaseModel):
     """One row of the iteration timeline rendered in the Runs tab.
@@ -131,6 +186,11 @@ class IterEventSummary(BaseModel):
     # UI surfaces this as an "apply physics fix" chip that opens the
     # Physics tab with the prompt pre-filled. None otherwise.
     physics_edit_suggestion: Optional[dict] = None
+    # §Ship 34: per-iter objective fitness (spec_score) and best-so-far
+    # when the run was launched with a --fitness-metric. None for blind
+    # runs. Populated from iter_fitness / best_reward_selected events.
+    fitness: Optional[float] = None
+    best_fitness: Optional[float] = None
 
 
 class ErrorClassification(BaseModel):
@@ -160,6 +220,10 @@ class RunSummary(BaseModel):
     iterations_completed: int
     current_iter_index: Optional[int]
     primary_metric_history: list[Optional[float]]
+    # §Ship 35: per-iter objective fitness history (parallel to
+    # primary_metric_history), for the Runs-tab/dashboard sparkline + the
+    # detail chart when a fitness metric is in play. Empty for blind runs.
+    fitness_history: list[Optional[float]] = []
     started_at: Optional[datetime]
     ended_at: Optional[datetime]
     error: Optional[str]
@@ -174,6 +238,9 @@ class RunSummary(BaseModel):
     mission_slug: Optional[str] = None
     stage_name: Optional[str] = None
     stage_index: Optional[int] = None
+    # §Ship 39 (H1): current interactive mode ("manual" | "auto") so a
+    # reconnect restores the Auto/Manual toggle. None for older / non-UI runs.
+    mode: Optional[str] = None
 
 
 class RunDetail(RunSummary):
@@ -201,6 +268,7 @@ def job_to_run_summary(job: JobDetail, *, iterations_requested: int) -> RunSumma
     completed = 0
     current_iter: Optional[int] = None
     metric_history: list[Optional[float]] = []
+    fitness_history: list[Optional[float]] = []
     # These fields are populated by the run manager as events are seen.
     result = job.result or {}
     iters_info = result.get("iterations") or []
@@ -208,6 +276,11 @@ def job_to_run_summary(job: JobDetail, *, iterations_requested: int) -> RunSumma
         completed = sum(1 for it in iters_info if it.get("status") == "completed")
         metric_history = [
             (it.get("primary_metric") if isinstance(it, dict) else None)
+            for it in iters_info
+        ]
+        # §Ship 35: parallel objective-fitness history (None where absent).
+        fitness_history = [
+            (it.get("fitness") if isinstance(it, dict) else None)
             for it in iters_info
         ]
         running = [it for it in iters_info if it.get("status") == "running"]
@@ -222,6 +295,7 @@ def job_to_run_summary(job: JobDetail, *, iterations_requested: int) -> RunSumma
         iterations_completed=completed,
         current_iter_index=current_iter,
         primary_metric_history=metric_history,
+        fitness_history=fitness_history,
         started_at=job.started_at,
         ended_at=job.ended_at,
         error=job.error,

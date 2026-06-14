@@ -36,6 +36,7 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import json
+import math
 import re
 import shutil
 import subprocess
@@ -82,6 +83,19 @@ class IterOutcome:
     behavior: dict[str, Any]
     failure_modes: list[str]
     edit_count: int
+    #: §Ship 33: ground-truth task fitness on this iter's rollout when a
+    #: `fitness_fn` is supplied to sculpt_run; None in the blind default.
+    fitness: float | None = None
+    #: §Ship 33: the reward version FILE actually trained this iter (the
+    #: input v<n> that `fitness` measures) — distinct from reward_path_after
+    #: (the edit produced FROM it, untested until the next iter). Best-by-
+    #: fitness selection keeps THIS, not the untested edit.
+    reward_path_trained: Path | None = None
+    #: §Ship 36 (F1): True when this iter REVERTED to the best-so-far reward
+    #: (the prior iter regressed). Consumed by §Ship 37 case-memory: if iter
+    #: N+1 reverted, iter N's edit was discarded and never measured, so its
+    #: forward fitness delta must NOT be attributed (verdict stays 'unknown').
+    reverted_to_best: bool = False
 
 
 @dataclass
@@ -91,6 +105,11 @@ class SculptRunResult:
     early_stopped: bool = False
     early_stop_reason: str = ""
     primary_metric_history: list[float] = field(default_factory=list)
+    #: §Ship 33: per-iter objective fitness (parallel to completed_iters)
+    #: and the best iter selected on it — empty/None in the blind default.
+    fitness_history: list[float] = field(default_factory=list)
+    best_fitness: float | None = None
+    best_fitness_iter: int | None = None
 
     @property
     def final_reward_path(self) -> Path | None:
@@ -98,6 +117,19 @@ class SculptRunResult:
             if outcome.reward_path_after:
                 return outcome.reward_path_after
         return None
+
+    @property
+    def best_reward_path(self) -> Path | None:
+        """§Ship 33: the reward kept by best-by-fitness selection (Eureka's
+        'return the best across iterations' rule) — the best iter's
+        TRAINED reward (the version `fitness` actually measured), NOT its
+        untested edit. Falls back to the last reward when unavailable."""
+        if self.best_fitness_iter is not None:
+            for outcome in self.completed_iters:
+                if (outcome.iter_index == self.best_fitness_iter
+                        and outcome.reward_path_trained):
+                    return outcome.reward_path_trained
+        return self.final_reward_path
 
 
 # ── Config / paths ───────────────────────────────────────────────────────
@@ -800,6 +832,93 @@ def _rollout_or_resume(
 
 
 # ── One iteration ────────────────────────────────────────────────────────
+def _read_control_file(control_file: Optional[Path]) -> dict:
+    """§Ship 39 (H1): read the interactive control sidecar (mode / resume /
+    feedback / stop) the backend writes. Missing / unreadable / partially
+    written → {} (treated as 'auto'; never blocks the run)."""
+    if control_file is None:
+        return {}
+    try:
+        data = json.loads(Path(control_file).read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:  # noqa: BLE001 — a partial/absent file just means "auto"
+        return {}
+
+
+def _pause_for_feedback(
+    control_file: Optional[Path],
+    iter_index: int,
+    *,
+    timeout: float,
+    poll_interval: float,
+) -> tuple[Optional[str], bool]:
+    """§Ship 39 (H1): at an iteration boundary, honor the control file.
+
+    Returns (human_note_for_next_iter, should_stop):
+      * mode != "manual" → no pause (auto); (None, False).
+      * "stop" set        → (None, True): the loop ends cleanly.
+      * mode == "manual"  → emit `awaiting_feedback`, then BLOCK polling the
+        file until the human bumps `resume_token` (optionally with `feedback`),
+        flips `mode` to auto, sets `stop`, or `timeout` elapses (→ auto-resume
+        so a dead client can't pin the GPU forever).
+    The human's feedback is returned so the NEXT iteration's diagnose uses it
+    ("review iteration N on the video → steer iteration N+1")."""
+    ctrl = _read_control_file(control_file)
+    if ctrl.get("stop"):
+        return None, True
+    if ctrl.get("mode") != "manual":
+        return None, False
+    start_token = int(ctrl.get("resume_token", 0) or 0)
+    _emit_event({"type": "awaiting_feedback", "iter": iter_index})
+    waited = 0.0
+    step = max(0.05, float(poll_interval))
+    while waited < timeout:
+        time.sleep(step)
+        waited += step
+        ctrl = _read_control_file(control_file)
+        if ctrl.get("stop"):
+            return None, True
+        if ctrl.get("mode") != "manual":
+            _emit_event({"type": "feedback_resumed", "iter": iter_index,
+                         "reason": "auto_mode"})
+            # §Ship 39 review (MEDIUM): carry feedback ONLY if this was an
+            # explicit resume (token bumped — e.g. "Continue + go Auto"). A
+            # BARE mode flip (the toggle) must NOT re-inject a stale note left
+            # in the sidecar by a prior iteration's resume.
+            note = ((ctrl.get("feedback") or None)
+                    if int(ctrl.get("resume_token", 0) or 0) > start_token
+                    else None)
+            return note, False
+        if int(ctrl.get("resume_token", 0) or 0) > start_token:
+            _emit_event({"type": "feedback_resumed", "iter": iter_index,
+                         "reason": "human"})
+            return (ctrl.get("feedback") or None), False
+    _emit_event({"type": "feedback_timeout", "iter": iter_index,
+                 "timeout_s": timeout})
+    return None, False
+
+
+def _fitness_components_for_prompt(detail: dict | None) -> dict | None:
+    """§Ship 36 (F2): reduce a metric's full result dict to the numeric
+    sub-components worth showing the diagnoser. Drops the top-line score
+    (shown separately as `current`), bookkeeping keys, and any non-finite /
+    non-scalar entry. Returns None when nothing useful remains."""
+    if not detail:
+        return None
+    skip = {"spec_score", "spec_name", "capture", "error"}
+    out: dict[str, Any] = {}
+    for k, v in detail.items():
+        if k in skip:
+            continue
+        if isinstance(v, bool):
+            out[k] = v
+        elif isinstance(v, (int, float)):
+            fv = float(v)
+            if math.isfinite(fv):
+                out[k] = round(fv, 5)
+    return out or None
+
+
 def _run_one_iter(
     *,
     iter_index: int,
@@ -815,6 +934,11 @@ def _run_one_iter(
     kg_store,
     seed: int,
     init_policy_path: Optional[Path] = None,
+    fitness_fn: Optional[Callable[[Path], float]] = None,
+    prior_fitness: Optional[dict] = None,
+    fitness_observe_only: bool = False,
+    revert_base: Optional[Path] = None,
+    human_note: Optional[str] = None,
 ) -> IterOutcome:
     iter_cfg = cfg.get("iteration", {}) or {}
     primary_key = str(iter_cfg.get("primary_metric", "mean_return"))
@@ -828,6 +952,40 @@ def _run_one_iter(
 
     reward_path_before = _ensure_current_py(rewards_dir)
     latest_n, latest_reward_file = _find_latest_reward_version(rewards_dir)
+
+    # §Ship 36 (F1): revert-on-regression. By default this iter trains on
+    # current.py (= latest reward) and edits from the latest v<n>. When the
+    # caller passes `revert_base` (the prior iter regressed fitness), repoint
+    # current.py at the best-so-far reward so BOTH training and the edit base
+    # use it — best-first search instead of compounding a drifting edit. The
+    # new edit is still v<latest_n+1> (monotonic numbering, best content).
+    edit_base = latest_reward_file
+    reward_path_trained = latest_reward_file
+    reverted_to_best = False
+    if revert_base is not None and Path(revert_base).is_file():
+        _write_current_reexport(rewards_dir, Path(revert_base))
+        reward_path_before = rewards_dir / "current.py"
+        edit_base = Path(revert_base)
+        reward_path_trained = Path(revert_base)
+        reverted_to_best = True
+        # §Ship 36 review (MEDIUM): a stale checkpoint from a prior crashed
+        # attempt at THIS iter index was trained on the DEGRADED reward;
+        # `_train_or_resume` would reuse it ("resume wins") and silently skip
+        # retraining on the reverted reward — defeating the revert's whole
+        # point. Invalidate it so training actually re-runs on the best-so-far
+        # reward. (No-op on the normal fresh path: no checkpoint exists yet.)
+        for _ext in ("pt", "zip"):
+            _stale = iter_dir / f"checkpoint.{_ext}"
+            try:
+                if _stale.is_file():
+                    _stale.unlink()
+            except OSError:  # pragma: no cover — best-effort cleanup
+                pass
+        _emit_event({
+            "type": "reward_reverted_to_best",
+            "iter": iter_index,
+            "reverted_to": Path(revert_base).name,
+        })
 
     _emit_event({
         "type": "iter_started",
@@ -892,6 +1050,63 @@ def _run_one_iter(
         render_every=iter_cfg.get("render_every"),
         fps=iter_cfg.get("rollout_fps"),
     )
+
+    # §Ship 33: objective task fitness on this rollout (ground truth,
+    # higher = better) — computed BEFORE diagnose so the diagnosis is
+    # fitness-guided. fitness_fn is supplied by the eval harness
+    # (spec_metric) only when --fitness-in-loop is on; None keeps the
+    # blind default. A crash here must never kill the iter — honest None.
+    iter_fitness: float | None = None
+    objective_progress: dict | None = None
+    if fitness_fn is not None:
+        # §Ship 36 (F2): prefer the `.detail` accessor (rides on the fitness
+        # fn) to get the FULL component breakdown in one compute; fall back to
+        # the plain float for callers that supply a bare fitness_fn.
+        detail_fn = getattr(fitness_fn, "detail", None)
+        fitness_components: dict | None = None
+        try:
+            if detail_fn is not None:
+                detail = detail_fn(iter_dir) or {}
+                iter_fitness = float(detail.get("spec_score", 0.0) or 0.0)
+                fitness_components = _fitness_components_for_prompt(detail)
+            else:
+                iter_fitness = float(fitness_fn(iter_dir))
+        except Exception as e:  # noqa: BLE001 — fitness is advisory, never fatal
+            sys.stderr.write(
+                f"[sculpt] iter {iter_index}: fitness_fn raised "
+                f"{type(e).__name__}: {e} — treating as unavailable\n"
+            )
+            iter_fitness = None
+        if iter_fitness is not None:
+            pf = prior_fitness or {}
+            best_so_far = pf.get("best_so_far")
+            last = pf.get("last")
+            progress = {
+                "current": round(iter_fitness, 5),
+                "best_so_far": (round(best_so_far, 5)
+                                if best_so_far is not None else None),
+                "last": round(last, 5) if last is not None else None,
+                "delta": (round(iter_fitness - last, 5)
+                          if last is not None else None),
+                # §Ship 36 (F2): physical sub-measurements so the diagnoser
+                # can localize WHAT is wrong, not just THAT fitness fell.
+                "components": fitness_components,
+                # §Ship 36 (F1): tell the diagnoser the prior edit regressed
+                # and was reverted — so it proposes a DIFFERENT direction.
+                "reverted_to_best": reverted_to_best,
+            }
+            # Always emit for DISPLAY (chart/chip/A/B), even in observe mode.
+            _emit_event({
+                "type": "iter_fitness",
+                "iter": iter_index,
+                "fitness": round(iter_fitness, 5),
+                "best_so_far": progress["best_so_far"],
+                "delta_vs_previous": progress["delta"],
+                "observe_only": bool(fitness_observe_only),
+            })
+            # §Ship 35: in observe mode the diagnoser must NOT see fitness —
+            # the signal stays passive (no influence on the run).
+            objective_progress = None if fitness_observe_only else progress
 
     # §7.3: physics-realism audit. Reads the expanded `trajectory.npz`
     # (§7.1) + `mjcf_limits.json` that the rollout runner drops next to
@@ -972,6 +1187,8 @@ def _run_one_iter(
         diagnosis = run_diagnose(
             iter_dir=iter_dir, behavior_goal=behavior_goal,
             config=config_path, store=kg_store, skip_kg=no_kg,
+            objective_progress=objective_progress,
+            human_note=human_note,
         )
 
     # Metrics + behavior for the primary_metric / changelog
@@ -999,7 +1216,7 @@ def _run_one_iter(
     try:
         if dry_run:
             new_reward_path = _dry_run_apply_edits(
-                current_reward_path=latest_reward_file,
+                current_reward_path=edit_base,
                 new_iter_id=new_iter_tag)
         else:
             # Filter out fully-deferred — apply_edits raises on empty
@@ -1008,7 +1225,7 @@ def _run_one_iter(
             # `reward_trajectory.json` and inject it into the rewrite
             # prompt (same data the diagnoser saw).
             new_reward_path = apply_edits(
-                current_reward_path=latest_reward_file,
+                current_reward_path=edit_base,
                 diagnosis=diagnosis,
                 new_iter_id=new_iter_tag,
                 reward_contract=adapter.reward_contract(),
@@ -1104,6 +1321,9 @@ def _run_one_iter(
         behavior=behavior_json,
         failure_modes=list(diagnosis.failure_modes),
         edit_count=edit_count,
+        fitness=iter_fitness,
+        reward_path_trained=reward_path_trained,
+        reverted_to_best=reverted_to_best,
     )
 
 
@@ -1185,6 +1405,14 @@ def sculpt_run(
     early_stop_patience: Optional[int] = None,
     init_policy_path: Optional[Path | str] = None,
     per_iter_callback: Optional[Callable[["IterOutcome"], Optional[str]]] = None,
+    fitness_fn: Optional[Callable[[Path], float]] = None,
+    fitness_patience: int = 2,
+    fitness_target: Optional[float] = None,
+    fitness_observe_only: bool = False,
+    fitness_revert: bool = True,
+    control_file: Optional[Path | str] = None,
+    feedback_timeout: float = 3600.0,
+    feedback_poll_interval: float = 2.0,
 ) -> SculptRunResult:
     """§Ship-19d: `per_iter_callback` is fired AFTER each iter's
     artifacts are persisted. Returning `None` keeps the loop running;
@@ -1194,7 +1422,36 @@ def sculpt_run(
     its success_criterion is satisfied (Goal A) — a no-op for plain
     sculpt_run callers that don't pass it. Distinct from the
     metric-plateau early-stop at lines 1311+: that one looks at the
-    history shape; this one is a goal-aware exit signal."""
+    history shape; this one is a goal-aware exit signal.
+
+    §Ship 33 — `fitness_fn(iter_dir) -> float` (optional) supplies a
+    held-out, ground-truth task fitness (higher = better) per iteration.
+    When given, the loop (1) surfaces it to the diagnoser so the
+    diagnose→edit search is fitness-guided, (2) keeps the BEST-by-fitness
+    reward as `current.py` at the end (Eureka's 'return best across
+    iterations' rule, vs the blind default of keeping the last), and
+    (3) early-stops after `fitness_patience` iters with no new best, or
+    once `fitness_target` is reached. None preserves the original blind
+    behavior exactly. This is the apples-to-apples fix for the eval
+    asymmetry where eureka selected on fitness and sculpt could not.
+
+    §Ship 35 — `fitness_observe_only=True` (the "observe" mode) makes the
+    fitness signal PURELY PASSIVE: it is still computed and emitted every
+    iter (so the UI can display + chart it, and a blind-vs-guided A/B is
+    visible) but it does NOT influence the run — the diagnoser does not
+    see it, no best-by-fitness `current.py` repoint, no fitness early-stop.
+    `best_fitness`/`fitness_history` are still tracked for DISPLAY only.
+    This is the safe default for auto-generated metrics that have not yet
+    earned steer-rights via calibration (see eval/metric_calibration).
+
+    §Ship 36 — `fitness_revert=True` (steer mode only) turns the diagnose→
+    edit search into best-first hill-climbing: when an iter does NOT set a
+    new best fitness, the NEXT iter reverts current.py (its training + edit
+    base) to the best-so-far reward instead of compounding edits on the
+    degraded latest. This is the missing 'edit accept/reject' from Ship 33:
+    without it, a single bad edit drifts the reward and the policy hacks it
+    deeper each iter (Sam's G1 kick run: best at iter 1, flailing by iter 3).
+    Observe-only NEVER reverts (the signal must stay passive)."""
     config_path = Path(config_path).resolve()
     if not config_path.is_file():
         raise FileNotFoundError(f"config not found: {config_path}")
@@ -1349,6 +1606,15 @@ def sculpt_run(
     # iters start fresh; iter-to-iter warm-start within a single
     # sculpt_run is a separate behavioral decision deferred past Ship 16.
     result = SculptRunResult(iterations_run=0)
+    #: §Ship 33: iters since the best fitness improved (plateau early-stop).
+    iters_since_best = 0
+    #: §Ship 36 (F1): edit base for the NEXT iter when the last one regressed
+    #: fitness (steer mode only); None = build forward from the latest reward.
+    revert_base: Optional[Path] = None
+    #: §Ship 39 (H1): human feedback to inject into the NEXT iter's diagnose
+    #: (captured at the interactive pause). None = no note this iter.
+    pending_human_note: Optional[str] = None
+    _control_path: Optional[Path] = Path(control_file) if control_file else None
     try:
         for i in range(start_iter, end_iter):
             t0 = time.time()
@@ -1359,12 +1625,46 @@ def sculpt_run(
                 no_kg=no_kg, dry_run=dry_run, kg_store=kg_store,
                 seed=base_seed + i,
                 init_policy_path=(init_ckpt if i == start_iter else None),
+                fitness_fn=fitness_fn,
+                prior_fitness=(
+                    {"best_so_far": result.best_fitness,
+                     "last": (result.fitness_history[-1]
+                              if result.fitness_history else None)}
+                    if fitness_fn is not None else None
+                ),
+                fitness_observe_only=fitness_observe_only,
+                revert_base=revert_base,
+                human_note=pending_human_note,
             )
             elapsed = time.time() - t0
             result.completed_iters.append(outcome)
             result.primary_metric_history.append(
                 outcome.primary_metric if outcome.primary_metric is not None else 0.0)
             result.iterations_run += 1
+
+            # §Ship 33: track objective fitness + best-by-fitness selection.
+            if fitness_fn is not None:
+                fit = outcome.fitness if outcome.fitness is not None else 0.0
+                result.fitness_history.append(fit)
+                if result.best_fitness is None or fit > result.best_fitness:
+                    result.best_fitness = fit
+                    result.best_fitness_iter = outcome.iter_index
+                    iters_since_best = 0
+                else:
+                    iters_since_best += 1
+
+            # §Ship 36 (F1): set the next iter's edit base. If this iter set a
+            # new best, keep building forward (revert_base=None — the best IS
+            # the latest). If it regressed, point the next iter at the best-so-
+            # far reward so the search doesn't compound a bad edit. Steer mode
+            # only; observe-only never reverts (the signal stays passive).
+            if (fitness_fn is not None and not fitness_observe_only
+                    and fitness_revert):
+                revert_base = (
+                    result.best_reward_path
+                    if iters_since_best >= 1 and result.best_reward_path is not None
+                    else None
+                )
 
             # One-line status.
             fm_short = ",".join(outcome.failure_modes) or "none"
@@ -1408,9 +1708,115 @@ def sculpt_run(
                     })
                     break
 
+            # §Ship 33: fitness-driven early-stop (only when fitness_fn
+            # is supplied AND no callback already stopped us). Target hit
+            # → stop at success; `fitness_patience` iters with no new best
+            # → stop wasting GPU climbing a plateau (the go1_trot runs
+            # over-iterated past their best: best 0.247 but final 0.166).
+            if (fitness_fn is not None and not fitness_observe_only
+                    and not result.early_stopped):
+                reason = None
+                if (fitness_target is not None
+                        and result.best_fitness is not None
+                        and result.best_fitness >= fitness_target):
+                    reason = (f"fitness_target {fitness_target} reached "
+                              f"(best={result.best_fitness:.3f} at iter "
+                              f"{result.best_fitness_iter})")
+                elif iters_since_best >= max(1, fitness_patience):
+                    reason = (f"fitness plateau: no new best in "
+                              f"{iters_since_best} iters "
+                              f"(best={result.best_fitness:.3f} at iter "
+                              f"{result.best_fitness_iter})")
+                if reason:
+                    result.early_stopped = True
+                    result.early_stop_reason = reason
+                    _emit_event({
+                        "type": "early_stop",
+                        "at_iter": outcome.iter_index,
+                        "reason": reason,
+                        "source": "fitness",
+                    })
+                    break
+
+            # §Ship 39 (H1): interactive pause-for-feedback at the iteration
+            # boundary — only when a control file is wired, we're not already
+            # stopping, and this isn't the last iteration (nothing left to
+            # steer). Default (no control file) is fully automated and
+            # byte-identical to before. A buggy/locked file degrades to auto.
+            if (_control_path is not None and not result.early_stopped
+                    and i < end_iter - 1):
+                try:
+                    _note, _stop = _pause_for_feedback(
+                        _control_path, outcome.iter_index,
+                        timeout=feedback_timeout,
+                        poll_interval=feedback_poll_interval)
+                except Exception as _fb_err:  # noqa: BLE001 — never block on a bug
+                    _note, _stop = None, False
+                    sys.stderr.write(
+                        f"[sculpt] feedback pause raised "
+                        f"{type(_fb_err).__name__}: {_fb_err} — continuing\n")
+                if _stop:
+                    result.early_stopped = True
+                    result.early_stop_reason = "stopped by user (interactive)"
+                    _emit_event({
+                        "type": "early_stop",
+                        "at_iter": outcome.iter_index,
+                        "reason": result.early_stop_reason,
+                        "source": "user",
+                    })
+                    break
+                pending_human_note = _note
+
     finally:
         if kg_store is not None:
             kg_store.close()
+
+    # §Ship 33: keep the BEST-by-fitness reward as current.py (Eureka's
+    # 'return best across iterations'). Only when fitness was tracked and
+    # the best iter isn't already the last produced reward; otherwise the
+    # blind default (current.py = latest v<n>) stands untouched.
+    # §Ship 35: observe-only mode NEVER repoints — the fitness signal must
+    # not influence which reward is kept (that's the whole point of observe).
+    if (fitness_fn is not None and not fitness_observe_only
+            and result.best_fitness_iter is not None):
+        best_path = result.best_reward_path
+        if best_path is not None and best_path.is_file():
+            try:
+                _write_current_reexport(rewards_dir, best_path)
+                _emit_event({
+                    "type": "best_reward_selected",
+                    "iter": int(result.best_fitness_iter),
+                    "fitness": (round(result.best_fitness, 5)
+                                if result.best_fitness is not None else None),
+                    "reward": best_path.name,
+                })
+            except Exception as e:  # noqa: BLE001 — selection is best-effort
+                sys.stderr.write(
+                    f"[sculpt] best-by-fitness current.py rewrite failed: "
+                    f"{type(e).__name__}: {e}\n"
+                )
+
+    # §Ship 37: persist run-learnings to the KG case-memory so future
+    # diagnoses can avoid repeating past mistakes ("the same failure can't
+    # happen twice"). Guarded: only when a KG is in use (not --no-kg) AND
+    # fitness was tracked (so each case carries a verdict). Best-effort —
+    # reopens its own store (the loop's kg_store is closed in the finally
+    # above) and never lets a logging failure affect the run.
+    if not no_kg and fitness_fn is not None and result.fitness_history:
+        try:
+            from sculptor.kg.cases import record_run_cases
+            from sculptor.kg.store import SculptorKG
+            _cstore = SculptorKG()
+            try:
+                _n_cases = record_run_cases(
+                    _cstore, task=behavior_goal, result=result)
+                if _n_cases:
+                    _emit_event({"type": "run_cases_recorded", "count": _n_cases})
+            finally:
+                _cstore.close()
+        except Exception as e:  # noqa: BLE001 — case logging is best-effort
+            sys.stderr.write(
+                f"[sculpt] run-case logging failed: {type(e).__name__}: {e}\n")
 
     _emit_event({
         "type": "run_completed",
@@ -1887,8 +2293,23 @@ def mission_run(
     max_extensions_per_stage: int = 1,
     extension_factor: float = 0.5,
     extension_improvement_threshold: float = 0.05,
+    fitness_metric: Optional[str] = None,
+    fitness_target: Optional[float] = None,
+    fitness_patience: int = 2,
+    fitness_observe_only: bool = False,
+    fitness_revert: bool = True,
 ):
     """§Ship-19d Goals A + B: optional adaptive iteration control.
+
+    §Ship 34 — `fitness_metric` (a spec-metric name, e.g. "go1_trot")
+    turns on fitness-in-the-loop for EVERY stage: each stage's sculpt_run
+    is guided by that objective (best-by-fitness selection + plateau
+    early-stop + fitness shown to the diagnoser). The SAME metric is
+    applied uniformly to all stages, which is sound for single-skill
+    missions (every curriculum sub-goal serves the one task) but not for
+    a curriculum whose early stages have an unrelated objective. `None`
+    (default) keeps the blind, criterion-only behavior. `fitness_target`
+    /`fitness_patience` are forwarded to each stage's sculpt_run.
 
     `early_stop_on_criterion` (Goal A) — when True, mission_run wraps
     each stage's sculpt_run with a per-iter callback that evaluates
@@ -1976,6 +2397,29 @@ def mission_run(
     mission_dir = Path(mission.mission_dir).resolve()
     mission_dir.mkdir(parents=True, exist_ok=True)
     (mission_dir / "stages").mkdir(exist_ok=True)
+
+    # §Ship 34/38: resolve objective fitness fns. The mission-level
+    # `fitness_metric` is the default; §Ship 38 lets each Stage carry its own
+    # `steering_metric` that OVERRIDES it for that stage — what makes a true
+    # multi-phase curriculum sound (a "balance on one leg" stage and a "kick"
+    # stage want DIFFERENT objectives; Ship 34's uniform-per-mission metric
+    # could not). Pre-resolve ALL distinct refs up front (fail-fast before any
+    # GPU work) and cache them so a generated-metric module loads once.
+    from sculptor.eval import resolve_fitness_fn as _resolve_fitness_fn
+    _fitness_fn_cache: dict[str, Callable[[Path], float]] = {}
+    # Skip already-succeeded stages (resume): they won't run, so don't let a
+    # since-deleted generated-metric path on one of them fail-fast the whole
+    # resumed mission (§Ship 38 review L2).
+    for _ref in [fitness_metric] + [
+        getattr(s, "steering_metric", None) for s in mission.stages
+        if getattr(s, "status", None) != "succeeded"
+    ]:
+        if _ref and _ref not in _fitness_fn_cache:
+            _fitness_fn_cache[_ref] = _resolve_fitness_fn(_ref)  # fail-fast on bad ref
+
+    def _fitness_fn_for_stage(stage) -> Optional[Callable[[Path], float]]:
+        ref = getattr(stage, "steering_metric", None) or fitness_metric
+        return _fitness_fn_cache.get(ref) if ref else None
 
     def _emit(payload: dict) -> None:
         """Emit via the public module-level _emit_event AND the caller's
@@ -2066,6 +2510,20 @@ def mission_run(
                 mission.current_stage_idx += 1
                 continue
 
+            # §Ship 38: pick THIS stage's objective metric (its own
+            # steering_metric, else the mission-level default) and surface it.
+            _stage_metric_ref = (
+                getattr(stage, "steering_metric", None) or fitness_metric)
+            if _stage_metric_ref:
+                _emit({
+                    "type": "stage_fitness_metric",
+                    "stage_name": stage.name,
+                    "metric": _stage_metric_ref,
+                    "source": ("stage"
+                               if getattr(stage, "steering_metric", None)
+                               else "mission"),
+                })
+
             stage_res = _run_one_stage(
                 mission=mission,
                 mission_dir=mission_dir,
@@ -2086,6 +2544,11 @@ def mission_run(
                 extension_improvement_threshold=(
                     extension_improvement_threshold
                 ),
+                fitness_fn=_fitness_fn_for_stage(stage),
+                fitness_target=fitness_target,
+                fitness_patience=fitness_patience,
+                fitness_observe_only=fitness_observe_only,
+                fitness_revert=fitness_revert,
             )
             result.stage_results.append(stage_res)
 
@@ -2464,10 +2927,19 @@ def _run_one_stage(
     max_extensions_per_stage: int = 1,
     extension_factor: float = 0.5,
     extension_improvement_threshold: float = 0.05,
+    fitness_fn: Optional[Callable[[Path], float]] = None,
+    fitness_target: Optional[float] = None,
+    fitness_patience: int = 2,
+    fitness_observe_only: bool = False,
+    fitness_revert: bool = True,
 ):
     """Helper called by `mission_run` per stage. Kept separate so the
     orchestrator stays readable — `mission_run` is about flow; this
-    function is about "one stage, cradle to grave." """
+    function is about "one stage, cradle to grave."
+
+    §Ship 34: `fitness_fn`/`fitness_target`/`fitness_patience` are
+    forwarded verbatim to this stage's sculpt_run call(s) so the stage's
+    inner loop is fitness-guided (None = blind, unchanged)."""
     from sculptor.mission_runtime import (
         CriterionEvalError,
         StageResult,
@@ -2747,6 +3219,11 @@ def _run_one_stage(
             seed=seed,
             init_policy_path=warm_start_path,
             per_iter_callback=per_iter_cb,
+            fitness_fn=fitness_fn,
+            fitness_target=fitness_target,
+            fitness_patience=fitness_patience,
+            fitness_observe_only=fitness_observe_only,
+            fitness_revert=fitness_revert,
         )
     except KeyboardInterrupt:
         stage.status = "failed"
@@ -2845,6 +3322,11 @@ def _run_one_stage(
                 init_policy_path=None,  # resume picks up from local ckpt
                 resume=True,
                 per_iter_callback=per_iter_cb,
+                fitness_fn=fitness_fn,
+                fitness_target=fitness_target,
+                fitness_patience=fitness_patience,
+                fitness_observe_only=fitness_observe_only,
+                fitness_revert=fitness_revert,
             )
         except KeyboardInterrupt:
             stage.status = "failed"

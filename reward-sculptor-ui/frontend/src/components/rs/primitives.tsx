@@ -149,8 +149,14 @@ export function Sparkline({
 
 // ── Metric line chart (SVG; replaces recharts) ──────────────────────
 export function MetricChart({
-  data, h = 150, live,
-}: { data: Array<number | null> | null | undefined; h?: number; live?: boolean }) {
+  data, h = 150, live, label = "Mean reward per iteration", decimals = 1,
+}: {
+  data: Array<number | null> | null | undefined;
+  h?: number; live?: boolean;
+  // §Ship 35: label/decimals so the chart can render objective fitness
+  // (0-1, 2 decimals) as the primary series, not just the reward metric.
+  label?: string; decimals?: number;
+}) {
   const vals = (data ?? []).filter((v): v is number => typeof v === "number");
   if (!vals.length) {
     return (
@@ -167,7 +173,7 @@ export function MetricChart({
   const line = pts.map((p, i) => (i ? "L" : "M") + p[0].toFixed(1) + " " + p[1].toFixed(1)).join(" ");
   const area = line + ` L ${X(vals.length - 1)} ${h - pad} L ${pad} ${h - pad} Z`;
   return (
-    <svg className="rs-chart" viewBox={`0 0 ${w} ${h}`} role="img" aria-label="Mean reward per iteration">
+    <svg className="rs-chart" viewBox={`0 0 ${w} ${h}`} role="img" aria-label={label}>
       {[0, 0.5, 1].map((t) => (
         <line key={t} x1={pad} x2={w - 8} y1={pad + t * (h - pad - 12)} y2={pad + t * (h - pad - 12)} stroke="var(--hairline)" strokeWidth="1" />
       ))}
@@ -176,7 +182,7 @@ export function MetricChart({
       {pts.map((p, i) => (
         <circle key={i} cx={p[0]} cy={p[1]} r={i === pts.length - 1 && live ? 3.5 : 2.4} fill="var(--rs-primary)" />
       ))}
-      <text x={pad} y={12} fontSize="9" fill="var(--rs-muted)" fontFamily="var(--font-mono)">{max.toFixed(1)}</text>
+      <text x={pad} y={12} fontSize="9" fill="var(--rs-muted)" fontFamily="var(--font-mono)">{max.toFixed(decimals)}</text>
       <text x={pad} y={h - pad + 11} fontSize="9" fill="var(--rs-muted)" fontFamily="var(--font-mono)">iter 0</text>
       <text x={w - 8} y={h - pad + 11} fontSize="9" fill="var(--rs-muted)" fontFamily="var(--font-mono)" textAnchor="end">iter {vals.length - 1}</text>
     </svg>
