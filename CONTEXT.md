@@ -339,6 +339,27 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-14 — Ship 42: fold "Generate from goal" into the fitness dropdown as a deferred (launch-time) option
+
+- **Why**: the standalone "Generate from goal" button is a ~1-2 min BLOCKING
+  action decoupled from the Objective-fitness dropdown (confusing). Step 1 of the
+  UX rework — make generation a dropdown CHOICE, deferred to launch (Ship 43 runs
+  it as run-phase 0). Additive + merge-safe: the eager button still works.
+- **What** (additive):
+  - **Frontend** `components/NewRunDialog.tsx`: new dropdown option
+    `generate-at-launch` ("✨ Generate a metric from this goal (at launch)"). When
+    selected: the standalone Generate button + Ship-40 progress line are hidden,
+    Fitness mode is forced + locked to `observe`, and the launch body sends
+    `fitness_metric:"generate-at-launch"`. `lib/types.ts`: documents the sentinel.
+  - **Backend** `services/run_manager.py`: `LAUNCH_GEN_SENTINEL = "generate-at-launch"`;
+    `_resolve_fitness_metric` returns `None` for it → a safe no-op blind loop
+    (Ship 43 will intercept it as a generation PRE-PHASE before the cmd is built).
+- **How**: minimal, no flag yet; the sentinel degrades to blind until Ship 43.
+  No change for existing built-in / `gen:<id>` selections.
+- **Verified**: gates green — backend 336 (was 335; +1: sentinel runs blind, no
+  `--fitness-metric` flag, no crash); frontend `pnpm build` clean; sculptor
+  unaffected. Committed per below.
+
 ### 2026-06-14 — Ship 41: validator accepts non-locomotion metrics (kick/jump/floss) + ladders that can actually calibrate them
 
 - **Why**: Sam auto-generated an objective fitness metric for a G1 **kick** goal;

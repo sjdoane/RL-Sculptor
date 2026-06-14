@@ -599,6 +599,44 @@ def test_run_sculpt_job_omits_fitness_metric_when_not_set(
     assert "--fitness-metric" not in captured["cmd"], captured["cmd"]
 
 
+def test_run_sculpt_job_launch_gen_sentinel_runs_blind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """§Ship 42: the deferred-generation sentinel "generate-at-launch" must
+    not reach the CLI as a metric name — until Ship 43's pre-phase rewrites it,
+    it is a safe no-op → blind loop (no --fitness-metric flag, no crash)."""
+    import asyncio
+
+    from backend.services import run_manager
+    from backend.services.job_manager import Job
+
+    project_dir = tmp_path / "launchgen-proj"
+    project_dir.mkdir()
+    captured: dict = {}
+
+    class _Sentinel(Exception):
+        pass
+
+    async def _fake_exec(*args, **kwargs):
+        captured["cmd"] = list(args)
+        raise _Sentinel()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+
+    runner = run_manager.run_sculpt_job(
+        project_dir=project_dir,
+        run_params={"behavior_goal": "kick with one leg", "iterations": 1,
+                    "fitness_metric": "generate-at-launch", "fitness_mode": "observe"},
+    )
+    job = Job(job_id="t_lg", kind="sculpt_run", project_slug="launchgen-proj",
+              status="running")
+    job._cancel = asyncio.Event()
+    with pytest.raises(_Sentinel):
+        asyncio.run(runner(job, job._cancel))
+
+    assert "--fitness-metric" not in captured["cmd"], captured["cmd"]
+
+
 def test_build_mission_run_flags_includes_fitness_metric(tmp_path) -> None:
     """RunMissionRequest.fitness_metric must become `--fitness-metric`
     on the `sculpt mission-run` CLI; absent when unset. A built-in name

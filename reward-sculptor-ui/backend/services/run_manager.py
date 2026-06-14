@@ -38,6 +38,13 @@ ITER_DIR_RE = re.compile(r"^iter_(\d+)$")
 
 _GEN_ID_RE = re.compile(r"^[A-Za-z0-9_]+$")
 
+#: §Ship 42: dropdown sentinel — "generate the objective metric at launch as the
+#: run's first phase" (vs picking an existing built-in / gen:<id>). Ship 43 runs
+#: the generation pre-phase and rewrites fitness_metric to gen:<new id> before
+#: the cmd is built; until then (or if it yields no accepted metric) the run is
+#: blind. Keep in sync with the frontend value in NewRunDialog.tsx / types.ts.
+LAUNCH_GEN_SENTINEL = "generate-at-launch"
+
 
 def _resolve_fitness_metric(project_dir: Path, fitness_metric: str) -> Optional[str]:
     """§Ship 35: map a UI fitness_metric value to the string the sculpt
@@ -45,6 +52,12 @@ def _resolve_fitness_metric(project_dir: Path, fitness_metric: str) -> Optional[
     "gen:<id>" → the project's `metrics/<id>/metric.py` path; a built-in
     name passes through. Returns None for an unresolvable/unsafe gen ref
     (the caller drops it → blind loop, never a failed run)."""
+    if fitness_metric == LAUNCH_GEN_SENTINEL:
+        # §Ship 42: the deferred-generation sentinel must never reach the CLI as
+        # a metric name. Ship 43 intercepts it BEFORE this (a generation
+        # pre-phase that rewrites it to gen:<id>); reaching here means
+        # launch-gen is off/failed → run blind.
+        return None
     if fitness_metric.startswith("gen:"):
         gid = fitness_metric[len("gen:"):]
         # §Ship 35 review: validate the id so a crafted ref can't traverse

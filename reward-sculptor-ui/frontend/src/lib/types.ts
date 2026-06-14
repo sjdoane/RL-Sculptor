@@ -342,8 +342,10 @@ export interface RunParamsPayload {
   early_stop_enabled?: boolean | null;
   early_stop_patience?: number | null;
   // §Ship 34/35 — objective fitness-in-the-loop. A built-in spec name
-  // (go1_trot / g1_kick / g1_floss / cartpole_balance) or a generated
-  // metric id ("gen:<id>"); null = the blind loop.
+  // (go1_trot / g1_kick / g1_jump / g1_floss / cartpole_balance) or a generated
+  // metric id ("gen:<id>"); null = the blind loop. §Ship 42: the sentinel
+  // "generate-at-launch" defers generation to the run's first phase (see
+  // run_manager LAUNCH_GEN_SENTINEL).
   fitness_metric?: string | null;
   // observe = compute + display only (no influence); steer = drives the loop.
   fitness_mode?: "observe" | "steer";

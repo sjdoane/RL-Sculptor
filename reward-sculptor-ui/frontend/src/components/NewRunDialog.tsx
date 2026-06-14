@@ -183,6 +183,10 @@ export function NewRunDialog({
     : null;
   // An accepted-but-uncalibrated generated metric may ONLY observe.
   const steerLocked = selectedGen !== null && !selectedGen.calibrated;
+  // §Ship 42: deferred generation — generate the metric AT LAUNCH (run-phase 0)
+  // instead of picking an existing one. Observe-only by definition (uncalibrated
+  // until launch-time calibration, Ship 44).
+  const isLaunchGen = fitnessMetric === "generate-at-launch";
 
   // S8 / §7.7 — ETA estimate + resume-warning banner. Pure view-layer
   // logic; no new API call. Uses the documented per-cycle budget for
@@ -238,8 +242,9 @@ export function NewRunDialog({
       // selection + plateau early-stop for this run.
       fitness_metric: fitnessMetric,
       // §Ship 35: observe vs steer (ignored when no metric). An
-      // uncalibrated generated metric is forced to observe.
-      fitness_mode: steerLocked ? "observe" : fitnessMode,
+      // uncalibrated generated metric is forced to observe; §Ship 42: a
+      // launch-time-generated metric is uncalibrated by definition.
+      fitness_mode: steerLocked || isLaunchGen ? "observe" : fitnessMode,
       // §Ship 39 (H1): manual = pause for human feedback each iteration.
       start_mode: interactive ? ("manual" as const) : ("auto" as const),
     };
@@ -457,6 +462,7 @@ export function NewRunDialog({
                       aria-label="Objective fitness metric"
                     >
                       <option value="none">none (blind loop)</option>
+                      <option value="generate-at-launch">✨ Generate a metric from this goal (at launch)</option>
                       <optgroup label="built-in (ground truth)">
                         {SPEC_METRIC_NAMES.map((m) => (
                           <option key={m} value={m}>{m}</option>
@@ -473,7 +479,7 @@ export function NewRunDialog({
                       )}
                     </select>
                   </div>
-                  <Btn
+                  {!isLaunchGen && <Btn
                     kind="quiet"
                     icon={genMetric.isPending ? "loader" : "sparkles"}
                     disabled={genMetric.isPending || behavior.trim().length < 4}
@@ -505,8 +511,12 @@ export function NewRunDialog({
                     }}
                   >
                     {genMetric.isPending ? "Generating… (~1-2 min)" : "Generate from goal"}
-                  </Btn>
-                  <span style={{ color: "var(--rs-muted)" }}>built-ins steer directly; an auto-generated metric observes until it passes calibration.</span>
+                  </Btn>}
+                  <span style={{ color: "var(--rs-muted)" }}>
+                    {isLaunchGen
+                      ? "generated at launch as the run's first step — runs observe-only, auto-calibrated against a matching built-in."
+                      : "built-ins steer directly; an auto-generated metric observes until it passes calibration."}
+                  </span>
                 </div>
 
                 {/* §Ship 40: live generation progress (generate → validate →
@@ -524,9 +534,9 @@ export function NewRunDialog({
                     <span style={{ fontWeight: 500, color: "var(--ink)" }}>Fitness mode</span>
                     <div className="rs-select">
                       <select
-                        value={steerLocked ? "observe" : fitnessMode}
+                        value={steerLocked || isLaunchGen ? "observe" : fitnessMode}
                         onChange={(e) => setFitnessMode(e.target.value === "observe" ? "observe" : "steer")}
-                        disabled={launch.isPending || steerLocked}
+                        disabled={launch.isPending || steerLocked || isLaunchGen}
                         aria-label="Fitness mode"
                       >
                         <option value="steer">steer (drives selection)</option>
@@ -534,7 +544,9 @@ export function NewRunDialog({
                       </select>
                     </div>
                     <span style={{ color: "var(--rs-muted)" }}>
-                      {steerLocked
+                      {isLaunchGen
+                        ? "the metric is generated at launch and runs observe-only; it earns steer-rights if launch-time calibration passes."
+                        : steerLocked
                         ? "this generated metric is observe-only until it passes calibration (Spearman vs a built-in ground truth)."
                         : "observe = compute & chart it without influencing the run (for a blind-vs-guided A/B)."}
                     </span>
