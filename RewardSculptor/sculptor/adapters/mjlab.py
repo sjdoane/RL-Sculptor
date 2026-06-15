@@ -189,6 +189,39 @@ _INFO_KEYS: list[str] = [
     "base_height", "fallen",
 ]
 
+# §Ship 46: extra info keys surfaced for the G1 humanoid so a sculpted
+# reward can shape a single-leg KICK. The g1-kick-v3 overnight run
+# stalled because the reward could only see base_height/fallen — every
+# kick term the diagnoser proposed (swing-foot velocity, single-leg XOR
+# contact, foot clearance) had to be deferred for want of these channels
+# (the deferral was correct: edit.py grounds reward formulas against
+# `expected_info_keys`, and these were absent). mjlab already computes
+# all of them for its own foot reward terms (feet_slip / feet_clearance
+# / feet_swing_height); the runner surfaces them as (N,) scalars,
+# zero-filled on tasks without the named foot sites/sensors. Per-foot
+# keys are advertised ONLY for the G1 biped (which has 'left_foot' /
+# 'right_foot' sites that fix the per-foot column order across the
+# contact / height / site-velocity tensors); other robots keep the
+# 6-key base contract and the runner emits zeros they never reference.
+# `base_horizontal_speed` lets the diagnoser tell standing from walking
+# (info previously had no base velocity, so a forward walker read as
+# "standing still").
+_G1_INFO_EXTRA: list[str] = [
+    "left_foot_contact", "right_foot_contact",
+    "left_foot_swing_speed", "right_foot_swing_speed",
+    "left_foot_height", "right_foot_height",
+    "base_horizontal_speed",
+]
+
+
+def _info_keys_for_task(task_id: str) -> list[str]:
+    """Info-dict keys advertised in the reward contract for a task.
+    G1 gains the per-foot kick channels (§Ship 46); all other task
+    families use the universal base set."""
+    if "G1" in task_id:
+        return list(_INFO_KEYS) + list(_G1_INFO_EXTRA)
+    return list(_INFO_KEYS)
+
 
 _CARTPOLE_STATE_SCHEMA: dict[str, tuple[int, ...]] = {
     # Cartpole is a fixed-base articulation: cart-slide joint + pole-
@@ -348,7 +381,7 @@ class MjlabAdapter(SculptorAdapter):
         return RewardContract(
             observation_space_spec=None,
             action_space_spec=None,
-            expected_info_keys=list(_INFO_KEYS),
+            expected_info_keys=_info_keys_for_task(self.task_id),
             expected_components=None,
             supports_batched=True,
             training_device="gpu",
@@ -418,7 +451,7 @@ class MjlabAdapter(SculptorAdapter):
         )
 
         schema_json = json.dumps({k: list(v) for k, v in schema.items()})
-        info_keys_json = json.dumps(_INFO_KEYS)
+        info_keys_json = json.dumps(_info_keys_for_task(self.task_id))
 
         try:
             proc = subprocess.run(

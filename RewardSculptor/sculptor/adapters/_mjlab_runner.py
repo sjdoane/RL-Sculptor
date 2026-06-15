@@ -171,6 +171,11 @@ def _build_sculptor_term_class(schema_keys: tuple[str, ...]):
     invoked with --reward-module-path."""
     import torch
 
+    # §Ship 46: canonical per-foot kick channels, single-sourced from the
+    # adapter contract so the keys the runner EMITS can never drift from
+    # the keys the contract ADVERTISES (and that edit.py grounds against).
+    from sculptor.adapters.mjlab import _G1_INFO_EXTRA
+
     class SculptorRewardTerm:
         """mjlab reward term that dispatches to the sculpted module.
 
@@ -293,6 +298,100 @@ def _build_sculptor_term_class(schema_keys: tuple[str, ...]):
                     out[k] = _zeros(1)
             return out
 
+        def _resolve_foot_handles(self, env, robot):
+            """§Ship 46: resolve (once) the contact + height sensors and
+            the left/right foot site indices for the per-foot kick
+            channels. Returns None unless BOTH a 'left_foot' and a
+            'right_foot' site exist — that named-site pair is what fixes
+            the per-foot column order shared across the contact `found`,
+            height `heights`, and site-velocity tensors (mjlab wires all
+            three from the same site list for the G1 biped). Quadrupeds /
+            fixed-base tasks lack those exact names → None → foot channels
+            stay zero."""
+            try:
+                names = tuple(robot.site_names)
+            except Exception:  # noqa: BLE001
+                return None
+            idx = {n: i for i, n in enumerate(names)}
+            li, ri = idx.get("left_foot"), idx.get("right_foot")
+            if li is None or ri is None:
+                return None
+
+            def _scene_get(key):
+                try:
+                    return env.scene[key]
+                except Exception:  # noqa: BLE001
+                    return None
+
+            return {
+                "contact": _scene_get("feet_ground_contact"),
+                "height": _scene_get("foot_height_scan"),
+                "left_site": li,
+                "right_site": ri,
+            }
+
+        def _foot_info(self, env, robot, dtype):
+            """§Ship 46: per-foot kick channels + base horizontal speed,
+            all (N,) tensors. Each signal is independently guarded so a
+            missing sensor/site degrades to zeros rather than crashing —
+            non-G1 tasks (which never advertise these keys) just carry
+            harmless zeros the reward never references."""
+            N = env.num_envs
+            dev = env.device
+
+            def _zero():
+                return torch.zeros(N, device=dev, dtype=dtype)
+
+            out = {k: _zero() for k in _G1_INFO_EXTRA}
+            # Base horizontal speed (body-frame xy) — universally
+            # meaningful; lets a kick reward penalise travel and lets the
+            # diagnoser distinguish standing from walking.
+            try:
+                v = robot.data.root_link_lin_vel_b
+                if v is not None:
+                    out["base_horizontal_speed"] = torch.linalg.norm(
+                        v[:, :2], dim=-1
+                    ).to(dtype)
+            except Exception:  # noqa: BLE001
+                pass
+
+            if not hasattr(self, "_foot_cache"):
+                self._foot_cache = self._resolve_foot_handles(env, robot)
+            fc = self._foot_cache
+            if fc is None:
+                return out
+
+            try:
+                found = fc["contact"].data.found  # (N, F)
+                if found is not None and found.shape[-1] >= 2:
+                    out["left_foot_contact"] = (found[:, 0] > 0).to(dtype)
+                    out["right_foot_contact"] = (found[:, 1] > 0).to(dtype)
+            except Exception:  # noqa: BLE001
+                pass
+
+            try:
+                heights = fc["height"].data.heights  # (N, F)
+                if heights is not None and heights.shape[-1] >= 2:
+                    out["left_foot_height"] = heights[:, 0].to(dtype)
+                    out["right_foot_height"] = heights[:, 1].to(dtype)
+            except Exception:  # noqa: BLE001
+                pass
+
+            try:
+                sv = robot.data.site_lin_vel_w  # (N, S, 3)
+                li, ri = fc["left_site"], fc["right_site"]
+                if sv is not None and sv.shape[1] > max(li, ri):
+                    out["left_foot_swing_speed"] = torch.linalg.norm(
+                        sv[:, li, :], dim=-1
+                    ).to(dtype)
+                    out["right_foot_swing_speed"] = torch.linalg.norm(
+                        sv[:, ri, :], dim=-1
+                    ).to(dtype)
+            except Exception:  # noqa: BLE001
+                pass
+
+            return out
+
         def __call__(self, env, **_kwargs) -> "torch.Tensor":
             state = self._snapshot(env)
             action = env.action_manager.action
@@ -328,6 +427,10 @@ def _build_sculptor_term_class(schema_keys: tuple[str, ...]):
                 "base_height": base_z,
                 "fallen": fallen,
             }
+            # §Ship 46: per-foot kick channels (contact / swing speed /
+            # height) + base horizontal speed, so a sculpted reward can
+            # shape a single-leg kick. Zero-filled on non-biped tasks.
+            info.update(self._foot_info(env, robot, action.dtype))
             rewards, _components = self._mod.compute_reward_batched(
                 self._prev, action, state, info
             )

@@ -339,6 +339,41 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-15 — Ship 46: mjlab G1 reward contract exposes per-foot KICK channels (the unblocker)
+
+- **What**: `RewardSculptor/sculptor/adapters/mjlab.py` — new `_G1_INFO_EXTRA`
+  (7 keys) + `_info_keys_for_task()`; `reward_contract()` and `probe_component`
+  now advertise the per-task info set. `RewardSculptor/sculptor/adapters/_mjlab_runner.py`
+  — `SculptorRewardTerm._resolve_foot_handles` + `_foot_info` surface
+  `{left,right}_foot_contact / _swing_speed / _height` + `base_horizontal_speed`
+  in the runtime `info` dict (all `(N,)`, guarded to zeros on non-biped tasks).
+  Tests in `tests/test_mjlab_adapter.py` (contract keys G1-vs-Go1, `_foot_info`
+  on a faked env, runner/contract drift guard, and the crux grounding proof).
+  Docs in `docs/adapters.md`.
+- **Why**: root-cause of the g1-kick-v3 overnight stall — the sculpted reward
+  could only read `base_height`/`fallen`, so every kick term the diagnoser
+  proposed (swing-foot velocity, single-leg XOR contact, foot clearance) was
+  correctly DEFERRED (`edit.py` grounds formulas against `expected_info_keys`,
+  and those channels were absent). The reward was structurally incapable of
+  shaping a kick; the policy sat in an upright-locomotion basin (~3 m/episode
+  of walking). See the diagnosis in the session plan.
+- **How**: mjlab already computes per-foot contact (`feet_ground_contact.found`),
+  foot-site velocity (`site_lin_vel_w` indexed by the `left_foot`/`right_foot`
+  sites), and foot height (`foot_height_scan.heights`) for its own foot reward
+  terms — no MuJoCo change needed, just surface them. Per-foot data is flattened
+  to named scalar keys (the info contract is `(N,)`-per-key). Foot channels are
+  advertised ONLY for G1 (which has the named foot sites that fix the per-foot
+  column order); other robots keep the 6-key base contract and the runner emits
+  harmless zeros they never reference. `_G1_INFO_EXTRA` is single-sourced into
+  the runner so emitted keys can't drift from advertised keys. Adding to the
+  contract auto-propagates into the diagnose/edit/decompose prompts (rendered
+  dynamically) and into the edit-grounding set — so the diagnoser stops deferring.
+- **Verified**: sculptor `pytest tests/ -q` → 628 passed, 1 skipped (jax).
+  backend `pytest -q -k 'not test_reward_prompt_edit_emits'` → 342 passed.
+  Crux proof (no GPU): `right_foot_swing_speed * left_foot_contact -
+  0.5*base_horizontal_speed` now grounds under the G1 contract and is UNGROUNDED
+  under the old 6-key base set (test_kick_formula_grounds_under_g1_contract_not_base).
+
 ### 2026-06-14 — Ship 45: never-silent rejections + one-click retry for launch-time generation
 
 - **Why**: a rejected launch-time generation must not silently fall to a blind
