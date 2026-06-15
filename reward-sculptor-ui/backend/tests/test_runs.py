@@ -844,6 +844,40 @@ def test_run_sculpt_job_launch_gen_retry_then_accept(
     assert cmd[cmd.index("--fitness-metric") + 1].endswith("metrics/gen_002/metric.py")
 
 
+def test_launch_gen_clears_progress_sidecar_on_cancel(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """§Ship 45 review (MEDIUM): a Stop during in-flight launch-gen must clear
+    the Ship-40 progress sidecar — CancelledError (a BaseException) must not
+    leave it stuck at {active:true} (phantom spinner in the standalone UI)."""
+    import asyncio
+
+    from backend.services import metric_store, run_manager, sculptor_bridge
+    from backend.services.job_manager import Job
+
+    def _gen_then_cancel(behavior_goal, out_dir, *, robot_hint=None, review=True, on_event=None):
+        if on_event:  # write an active-progress sidecar, then get cancelled
+            on_event({"stage": "generating", "attempt": 1, "max": 4, "message": "working"})
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(sculptor_bridge, "generate_objective_metric", _gen_then_cancel)
+    project_dir = tmp_path / "lg-cancel"
+    project_dir.mkdir()
+    control_path = run_manager.control_file_path(project_dir, "jc")
+    run_manager.write_control_file(
+        control_path, {"mode": "auto", "resume_token": 0, "feedback": None, "stop": False})
+    job = Job(job_id="jc", kind="sculpt_run", project_slug="lg-cancel", status="running")
+    cancel = asyncio.Event()
+
+    async def _go():
+        return await run_manager._generate_at_launch(
+            job, project_dir, "kick with one leg", control_path, cancel)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(_go())
+    assert metric_store.read_progress(project_dir).get("active") is False
+
+
 def _run_launch_gen_with_calibration(
     tmp_path, monkeypatch, *, calibrates: bool, slug: str,
 ):

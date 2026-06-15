@@ -365,6 +365,18 @@ Start the next entry below this line.
 - **Verified (mocked LLM — no API/GPU)**: backend (retry-then-accept → 2
   attempts, gen_002 steers; rejected → blind with `can_retry`; control route
   `gen_retry`/`gen_continue` write `gen_decision`) ; frontend `pnpm build` clean.
+- **Adversarial review (3 parallel agents over the 42-45 diff, all probes run vs
+  source)**: 0 CRITICAL / 0 HIGH. Firewall holds (uncalibrated can't steer;
+  calibrate writes meta before the cmd-build reads it; fail-closed on
+  exception/corrupt meta); additivity holds (built-in/gen:/none unaffected);
+  missions untouched (empty diff; sentinel degrades to blind there); frontend
+  fold correct + reconnect-safe; bounded retries; no steer-with-sentinel path.
+  1 MEDIUM FIXED — a Stop during in-flight generation left `.gen_progress.json`
+  stuck `{active:true}` (CancelledError bypassed `except Exception`); added an
+  `except asyncio.CancelledError: clear_progress; raise` around the generate
+  to_thread (+ regression test). 2 LOWs left as-is (progress-after-terminal is
+  cosmetic — terminal fold verified correct; Stop can't abort the in-flight LLM
+  thread — no GPU held, no run hang, bounded by the LLM client timeout).
 
 ### 2026-06-14 — Ship 44: auto-calibrate the launch-generated metric → steer if it earns it
 

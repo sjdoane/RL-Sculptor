@@ -178,6 +178,16 @@ async def _generate_at_launch(
             rec = await asyncio.to_thread(
                 metric_store.generate, project_dir, behavior_goal,
                 robot_hint=robot_hint, review=True, on_event=_on_event)
+        except asyncio.CancelledError:
+            # §Ship 45 review (MEDIUM): clear the Ship-40 progress sidecar on
+            # Stop. CancelledError is a BaseException that bypasses the
+            # `except Exception` below, which otherwise leaves the sidecar stuck
+            # at {active:true} → a phantom "generating" spinner in the standalone
+            # Generate UI until the next generation. (The orphaned worker thread
+            # is bounded by the LLM client's own timeout — to_thread can't be
+            # cancelled mid-call.) Mirrors the standalone route's finally-clear.
+            metric_store.clear_progress(project_dir)
+            raise
         except Exception as e:  # noqa: BLE001 — generation never fails the run
             metric_store.clear_progress(project_dir)
             job.emit({"type": "metric_generation_failed", "source": "launch_gen",
