@@ -319,6 +319,10 @@ def run_sculpt_job(
     # §Ship 35: observe vs steer (default steer). Only meaningful with a
     # metric set; harmless otherwise.
     fitness_mode = run_params.get("fitness_mode")
+    # §Ship 48: patience for the fitness-plateau early-stop (the live early
+    # stop; the early_stop_* knobs above are a no-op for it). Only meaningful
+    # with a metric set. None → sculpt-lib default (2).
+    fitness_patience = run_params.get("fitness_patience")
     # §Ship 39 (H1): interactive start mode. "manual" = pause for human
     # feedback at each iteration boundary; "auto" = run straight through.
     # A control sidecar is ALWAYS written (deterministic path) so the
@@ -447,6 +451,11 @@ def run_sculpt_job(
                 if eff_mode in ("observe", "steer"):
                     cmd += ["--fitness-mode", str(eff_mode)]
                     final_fitness_mode = eff_mode
+                # §Ship 48: forward the fitness-plateau patience (the live
+                # early stop). Only meaningful alongside a resolved metric;
+                # sculpt ignores it without a fitness_fn.
+                if fitness_patience is not None:
+                    cmd += ["--fitness-patience", str(int(fitness_patience))]
 
         # §Ship 39 (H1): the interactive control sidecar (written above, before
         # the launch-gen pre-phase) lets the sculpt subprocess poll for the
@@ -482,6 +491,7 @@ def run_sculpt_job(
             # persist the POST-firewall effective mode (steer iff calibrated).
             ("fitness_metric", eff_fitness_metric),
             ("fitness_mode", final_fitness_mode),
+            ("fitness_patience", fitness_patience),
         ):
             if val is not None:
                 job.params.setdefault(key, val)
@@ -1074,6 +1084,10 @@ def _iter_events(job: Job) -> list[dict[str, Any]]:
                 "diagnosed": False,
                 "realism_audit": None,
                 "physics_edit_suggestion": None,
+                # §Ship 48: edits the diagnoser WANTED but couldn't ground
+                # because the adapter doesn't expose the needed field
+                # (requires_env_extension). None until an iter defers ≥1.
+                "env_extension_suggestion": None,
                 # §Ship 34: objective fitness-in-the-loop (None for blind runs).
                 "fitness": None,
                 "best_fitness": None,
@@ -1127,6 +1141,18 @@ def _iter_events(job: Job) -> list[dict[str, Any]]:
                 sug["auto_apply_reason"] = ev.get("reason")
             if sug:
                 slot["physics_edit_suggestion"] = sug
+        elif etype == "requires_env_extension":
+            # §Ship 48: the diagnoser flagged ≥1 edit it wants but can't
+            # ground against the adapter contract. Surface it (informational
+            # chip — env extension is a code change, never auto-applied) so a
+            # structurally-blocked skill (the g1-kick-v3 stall: every kick
+            # term deferred for want of per-foot channels) is never silent.
+            terms = [str(x) for x in (ev.get("terms") or []) if str(x)]
+            if terms:
+                slot["env_extension_suggestion"] = {
+                    "terms": terms,
+                    "rationales": [str(x) for x in (ev.get("rationales") or [])],
+                }
         elif etype == "realism_audited":
             # §7.3: prefer the richer fs-emitted `audit` dict (full payload
             # read from realism_audit.json) over the stdout-emitted fields.

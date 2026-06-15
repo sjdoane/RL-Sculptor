@@ -118,6 +118,16 @@ class RunParams(BaseModel):
     fitness_mode: Literal["observe", "steer"] = "steer"
     """How the fitness signal is used. observe = passive display only."""
 
+    # §Ship 48: patience for the FITNESS-plateau early-stop — the live early
+    # stop on a steered run (stop after this many iters with no NEW BEST
+    # fitness). This is the knob that actually governs truncation; the
+    # legacy early_stop_* fields above are a no-op for it. The sculpt-lib
+    # default is 2, which truncated the g1-kick-v3 run at iter 4 before the
+    # reward could escape the standing basin. None → sculpt-lib default.
+    fitness_patience: Optional[Annotated[int, Field(ge=1, le=50)]] = None
+    """Iters with no new best fitness before a steered run stops. None →
+    sculpt default (2). The UI sends 4 for exploratory hard skills."""
+
     # §Ship 39 (H1): interactive human-in-the-loop start mode. "manual" (the
     # UI default) pauses for human feedback at each iteration boundary so the
     # user can steer from what they see in the rollout video; "auto" runs
@@ -190,6 +200,12 @@ class IterEventSummary(BaseModel):
     # UI surfaces this as an "apply physics fix" chip that opens the
     # Physics tab with the prompt pre-filled. None otherwise.
     physics_edit_suggestion: Optional[dict] = None
+    # §Ship 48: edits the diagnoser wanted but couldn't ground because the
+    # adapter doesn't expose the needed field (requires_env_extension).
+    # {"terms": [...], "rationales": [...]}. Surfaced as an informational
+    # "needs adapter channels" chip — an env extension is a code change,
+    # never auto-applied. None until an iter defers ≥1 such edit.
+    env_extension_suggestion: Optional[dict] = None
     # §Ship 34: per-iter objective fitness (spec_score) and best-so-far
     # when the run was launched with a --fitness-metric. None for blind
     # runs. Populated from iter_fitness / best_reward_selected events.

@@ -349,6 +349,10 @@ export interface RunParamsPayload {
   fitness_metric?: string | null;
   // observe = compute + display only (no influence); steer = drives the loop.
   fitness_mode?: "observe" | "steer";
+  // §Ship 48: patience for the fitness-plateau early stop (the LIVE early
+  // stop on a steered run; the early_stop_* fields above are a no-op for it).
+  // null → sculpt default (2). The UI sends 4 for hard exploratory skills.
+  fitness_patience?: number | null;
   // §Ship 39 (H1): interactive start mode. "manual" pauses for human feedback
   // at each iteration boundary (the UI default); "auto" runs straight through.
   start_mode?: "manual" | "auto";
@@ -445,6 +449,15 @@ export interface PhysicsEditSuggestionPayload {
   auto_apply_reason?: string;
 }
 
+/** §Ship 48: edits the diagnoser wanted but couldn't ground because the
+ *  adapter doesn't expose the needed field (requires_env_extension).
+ *  Informational only — an env extension is a code change, never
+ *  auto-applied. */
+export interface EnvExtensionSuggestionPayload {
+  terms: string[];
+  rationales?: string[];
+}
+
 export interface IterEventSummary {
   iter_index: number;
   status: "running" | "completed" | "errored" | "stopped";
@@ -468,6 +481,9 @@ export interface IterEventSummary {
   // "severe" AND project config has `auto_adjust_physics = true`. UI
   // surfaces as a chip that opens the Physics tab with prompt pre-filled.
   physics_edit_suggestion: PhysicsEditSuggestionPayload | null;
+  // §Ship 48: edits deferred for requires_env_extension this iter (the
+  // diagnoser wants a field the adapter doesn't expose). null when none.
+  env_extension_suggestion?: EnvExtensionSuggestionPayload | null;
   // Populated by `iter_progress` events emitted from inside the mjlab
   // training subprocess. Lets the Timeline panel render a live progress
   // bar for the running iter instead of a silent "running" spinner.

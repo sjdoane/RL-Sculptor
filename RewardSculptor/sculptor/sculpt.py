@@ -1312,6 +1312,26 @@ def _run_one_iter(
         "paper_refs": sorted(set(applied_paper_refs)),
     })
 
+    # §Ship 48: never-silent env-extension signal. The diagnoser flags edits
+    # it WANTS but can't ground because the adapter doesn't expose the needed
+    # field (requires_env_extension); pre-Ship-48 these dead-ended in the
+    # changelog and the user never saw that the run was structurally blocked
+    # (the g1-kick-v3 stall: every kick term deferred for want of per-foot
+    # channels, iter after iter). Emit it so the Runs tab can chip "this skill
+    # needs adapter channels X". Modeled on physics_edit_suggested, but
+    # informational only — an env extension is a code change, never auto-applied.
+    deferred_edits = [
+        e for e in diagnosis.proposed_edits
+        if getattr(e, "requires_env_extension", False)
+    ]
+    if deferred_edits:
+        _emit_event({
+            "type": "requires_env_extension",
+            "iter": iter_index,
+            "terms": [getattr(e, "target_term", "") for e in deferred_edits],
+            "rationales": [getattr(e, "rationale", "") for e in deferred_edits],
+        })
+
     return IterOutcome(
         iter_index=iter_index,
         iter_dir=iter_dir,

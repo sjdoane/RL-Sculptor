@@ -695,6 +695,22 @@ function IterationTimeline({ iters, selected, onSelect }: { iters: IterEventSumm
               </span>
             );
           })()}
+          {it.env_extension_suggestion && it.env_extension_suggestion.terms.length > 0 && (
+            <span
+              className="rs-tag"
+              style={{ marginTop: 4, fontSize: 10, background: "var(--st-amber-bg)", color: "var(--st-amber-fg)" }}
+              title={
+                `The diagnoser proposed ${it.env_extension_suggestion.terms.join(", ")} ` +
+                `but the adapter doesn't expose the fields they need, so it was deferred. ` +
+                `Extend the adapter's expected_info_keys to unblock this skill.` +
+                ((it.env_extension_suggestion.rationales || []).length
+                  ? "\n\n" + (it.env_extension_suggestion.rationales || []).join("\n\n")
+                  : "")
+              }
+            >
+              needs adapter channels: {it.env_extension_suggestion.terms.join(", ")}
+            </span>
+          )}
         </button>
       ))}
     </div>

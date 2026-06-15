@@ -170,6 +170,11 @@ export function NewRunDialog({
   // name OR a generated-metric ref ("gen:<id>").
   const [fitnessMetric, setFitnessMetric] = useState<string | null>(null);
   const [fitnessMode, setFitnessMode] = useState<"observe" | "steer">("steer");
+  // §Ship 48: patience for the fitness-plateau early stop (the LIVE early
+  // stop on a steered run; the sculpt-lib default is 2, which truncated the
+  // g1-kick-v3 run at iter 4). Default 4 here so a hard exploratory skill
+  // gets room to escape a local optimum; "" → sculpt default.
+  const [fitnessPatience, setFitnessPatience] = useState<number | "">(4);
   const launch = useLaunchRun(slug);
   // §Ship 35: per-project generated metrics + the generate action.
   const projectMetrics = useProjectMetrics(slug, open);
@@ -245,6 +250,12 @@ export function NewRunDialog({
       // uncalibrated generated metric is forced to observe; §Ship 42: a
       // launch-time-generated metric is uncalibrated by definition.
       fitness_mode: steerLocked || isLaunchGen ? "observe" : fitnessMode,
+      // §Ship 48: fitness-plateau patience (only with a metric; the live
+      // early stop). "" → sculpt default (2).
+      fitness_patience:
+        fitnessMetric !== null && typeof fitnessPatience === "number"
+          ? fitnessPatience
+          : null,
       // §Ship 39 (H1): manual = pause for human feedback each iteration.
       start_mode: interactive ? ("manual" as const) : ("auto" as const),
     };
@@ -549,6 +560,24 @@ export function NewRunDialog({
                         : steerLocked
                         ? "this generated metric is observe-only until it passes calibration (Spearman vs a built-in ground truth)."
                         : "observe = compute & chart it without influencing the run (for a blind-vs-guided A/B)."}
+                    </span>
+                  </div>
+                )}
+
+                {/* §Ship 48: fitness-plateau patience — the LIVE early stop on a
+                    steered run (distinct from the legacy early-stop no-op). */}
+                {fitnessMetric !== null && (
+                  <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap", fontSize: 12.5, paddingLeft: 14 }}>
+                    <span style={{ fontWeight: 500, color: "var(--ink)" }}>Fitness patience</span>
+                    <div style={{ width: 72 }}>
+                      {numField(fitnessPatience, setFitnessPatience, {
+                        "aria-label": "Fitness patience",
+                        min: 1, max: 50, step: 1, placeholder: "4",
+                      } as React.InputHTMLAttributes<HTMLInputElement>)}
+                    </div>
+                    <span style={{ color: "var(--rs-muted)" }}>
+                      iters with no new best fitness before the run stops (sculpt default 2;
+                      4+ gives a hard exploratory skill room to escape a local optimum).
                     </span>
                   </div>
                 )}

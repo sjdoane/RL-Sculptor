@@ -339,6 +339,44 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-15 — Ship 48: live fitness_patience knob + never-silent env-extension chip
+
+- **What**: (1) `fitness_patience` threaded end-to-end — `reward-sculptor-ui/backend/models/run.py`
+  (new field), `backend/services/run_manager.py` (read + emit `--fitness-patience`
+  inside the fitness block + persist), `frontend/src/components/NewRunDialog.tsx`
+  (new "Fitness patience" input, default 4), `frontend/src/lib/types.ts`
+  (`RunParamsPayload.fitness_patience`). CLI `sculpt run --fitness-patience` was
+  already wired. (2) `requires_env_extension` event — `RewardSculptor/sculptor/sculpt.py`
+  emits it after `iter_completed` when ≥1 edit was deferred; `run_manager.py` folds
+  it into a new per-iter `env_extension_suggestion` slot; `backend/models/run.py`
+  `IterEventSummary` gains the field; `RunsTab.tsx` renders an informational
+  "needs adapter channels: …" chip; `types.ts` `EnvExtensionSuggestionPayload`.
+  Tests: backend `test_runs.py` (`--fitness-patience` forwarded / omitted without a
+  metric; `env_extension_suggestion` reducer).
+- **Why**: the g1-kick-v3 run truncated at iter 4 of 16. Root cause: the config's
+  `early_stop_patience=3` is a DEAD no-op; the live fitness-plateau early stop uses
+  a SEPARATE `fitness_patience` (default 2) that neither the CLI run nor the UI ever
+  set — so it stopped after 2 stale iters and the "3" Sam expected never reached the
+  fitness path. And: every kick term the diagnoser proposed was deferred
+  (`requires_env_extension`) but that signal dead-ended in the changelog — nothing
+  told Sam the run was structurally blocked.
+- **How**: (1) Expose `fitness_patience` as the real knob (UI default 4 gives a hard
+  exploratory skill room to escape a local optimum before truncating); only emitted
+  alongside a resolved metric (inert in the blind loop). DEVIATION FROM PLAN: did NOT
+  delete the legacy `early_stop_enabled/early_stop_patience` fields — they round-trip
+  into `config.toml`'s `[iteration]` table and `test_projects.py` asserts it, so
+  deleting them churns config-writing + breaks a test for zero kick-fix benefit; they
+  stay documented no-ops and `fitness_patience` is the live lever. (2) Model the
+  env-extension signal on `physics_edit_suggested` (event → run_manager slot →
+  RunsTab chip) but INFORMATIONAL only — an env extension is a code change, never
+  auto-applied. Post-Ship-46 the G1 kick diagnoser no longer defers (channels exist),
+  so this chip is now mainly a general "never-silent" guard for FUTURE novel skills
+  that need channels the adapter lacks.
+- **Verified**: frontend `pnpm build`, backend `pytest -k 'not
+  test_reward_prompt_edit_emits'`, sculptor `pytest tests/` (sculpt.py emit is
+  additive). The emit's event→slot contract is covered by the reducer test
+  (`test_env_extension_suggestion_surfaced_in_iter_summary`).
+
 ### 2026-06-15 — Ship 47: metric hardening — a forward WALKER can no longer earn KICK credit
 
 - **What**: `RewardSculptor/sculptor/eval/spec_metrics.py` — `spec_g1_kick`

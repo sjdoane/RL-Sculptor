@@ -523,6 +523,90 @@ def test_run_sculpt_job_forwards_fitness_metric_as_cli_flag(
     assert cmd[cmd.index("--fitness-metric") + 1] == "go1_trot", cmd
 
 
+def test_run_sculpt_job_forwards_fitness_patience_as_cli_flag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """§Ship 48: the New Run 'Fitness patience' field sets run_params
+    ['fitness_patience']; it must surface as `--fitness-patience N` so the
+    LIVE (fitness-plateau) early stop honors the user's value instead of the
+    sculpt-lib default of 2 (which truncated the g1-kick-v3 run at iter 4).
+    Only emitted alongside a resolved fitness metric."""
+    import asyncio
+
+    from backend.services import run_manager
+    from backend.services.job_manager import Job
+
+    project_dir = tmp_path / "fitp-proj"
+    project_dir.mkdir()
+    captured: dict = {}
+
+    class _Sentinel(Exception):
+        pass
+
+    async def _fake_exec(*args, **kwargs):
+        captured["cmd"] = list(args)
+        raise _Sentinel()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+
+    runner = run_manager.run_sculpt_job(
+        project_dir=project_dir,
+        run_params={
+            "behavior_goal": "kick forward repeatedly",
+            "iterations": 8,
+            "fitness_metric": "g1_kick",
+            "fitness_patience": 4,
+        },
+    )
+    job = Job(job_id="t_fitp", kind="sculpt_run", project_slug="fitp-proj", status="running")
+    job._cancel = asyncio.Event()
+    with pytest.raises(_Sentinel):
+        asyncio.run(runner(job, job._cancel))
+
+    cmd = captured["cmd"]
+    assert "--fitness-patience" in cmd, cmd
+    assert cmd[cmd.index("--fitness-patience") + 1] == "4", cmd
+
+
+def test_run_sculpt_job_omits_fitness_patience_without_metric(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """§Ship 48: fitness_patience is only meaningful with a metric — no
+    metric set → no flag (it would be inert in the blind loop)."""
+    import asyncio
+
+    from backend.services import run_manager
+    from backend.services.job_manager import Job
+
+    project_dir = tmp_path / "fitp-nop"
+    project_dir.mkdir()
+    captured: dict = {}
+
+    class _Sentinel(Exception):
+        pass
+
+    async def _fake_exec(*args, **kwargs):
+        captured["cmd"] = list(args)
+        raise _Sentinel()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+
+    runner = run_manager.run_sculpt_job(
+        project_dir=project_dir,
+        run_params={
+            "behavior_goal": "walk forward",
+            "iterations": 3,
+            "fitness_patience": 4,   # set, but no fitness_metric
+        },
+    )
+    job = Job(job_id="t_fitp0", kind="sculpt_run", project_slug="fitp-nop", status="running")
+    job._cancel = asyncio.Event()
+    with pytest.raises(_Sentinel):
+        asyncio.run(runner(job, job._cancel))
+
+    assert "--fitness-patience" not in captured["cmd"], captured["cmd"]
+
+
 def test_run_sculpt_job_gen_metric_uncalibrated_forces_observe(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1372,6 +1456,33 @@ def test_physics_edit_suggestion_none_without_event(
     body = client.get(f"/projects/{slug}/runs/{run_id}").json()
     for it in body["iterations"]:
         assert it.get("physics_edit_suggestion") is None
+
+
+def test_env_extension_suggestion_surfaced_in_iter_summary() -> None:
+    """§Ship 48: a `requires_env_extension` event lands in the iter slot's
+    `env_extension_suggestion` field (the never-silent deferred-edit signal
+    that was missing when every g1-kick-v3 kick term was silently deferred);
+    an iter without the event keeps the field None."""
+    from backend.services.job_manager import Job
+    from backend.services.run_manager import build_iterations_summary
+
+    job = Job(job_id="t_env", kind="sculpt_run", project_slug="p", status="completed")
+    job.events = [
+        {"type": "iter_started", "iter": 0},
+        {"type": "requires_env_extension", "iter": 0,
+         "terms": ["swing_leg_forward_kick", "single_leg_stance"],
+         "rationales": ["needs per-foot velocity", "needs per-foot contact"]},
+        {"type": "iter_completed", "iter": 0, "failure_modes": [], "edit_count": 0},
+        {"type": "iter_started", "iter": 1},
+        {"type": "iter_completed", "iter": 1, "failure_modes": [], "edit_count": 1},
+    ]
+    iters = build_iterations_summary(job)
+    s0 = next(it for it in iters if it["iter_index"] == 0)
+    s1 = next(it for it in iters if it["iter_index"] == 1)
+    assert s0["env_extension_suggestion"] is not None, s0
+    assert s0["env_extension_suggestion"]["terms"] == [
+        "swing_leg_forward_kick", "single_leg_stance"]
+    assert s1["env_extension_suggestion"] is None
 
 
 def test_iter_detail_has_realism_audit_none_when_no_event(
