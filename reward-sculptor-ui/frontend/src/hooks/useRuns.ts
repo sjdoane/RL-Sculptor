@@ -83,6 +83,9 @@ export interface RunControlVars {
   resume?: boolean;
   feedback?: string | null;
   stop?: boolean;
+  // §Ship 45: launch-time-generation retry decision (retry vs continue blind).
+  gen_retry?: boolean;
+  gen_continue?: boolean;
 }
 
 export function useControlRun(slug: string) {

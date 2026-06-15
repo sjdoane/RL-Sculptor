@@ -314,6 +314,8 @@ function RunDetailPane({ slug, runId, runs }: { slug: string; runId: string; run
     let reasons: string[] = [];
     let concerns: string[] = [];
     let errorMsg: string | null = null;
+    // §Ship 45: paused awaiting a one-click retry/continue decision.
+    let awaiting = false;
     // §Ship 44: launch-time calibration outcome.
     let calib: {
       status: "running" | "done" | "skipped";
@@ -325,23 +327,24 @@ function RunDetailPane({ slug, runId, runs }: { slug: string; runId: string; run
         max?: number; gen_id?: string; reasons?: string[]; concerns?: string[];
         error?: string; builtin?: string; calibrated?: boolean; spearman?: number | null;
       };
-      if (e.type === "metric_generation_started") { started = true; outcome = null; last = null; calib = null; }
+      if (e.type === "metric_generation_started") { started = true; outcome = null; last = null; calib = null; awaiting = false; }
       else if (e.type === "metric_generation_progress") {
         last = { stage: e.stage, message: e.message, attempt: e.attempt, max: e.max };
       }
-      else if (e.type === "metric_generated") { outcome = "accepted"; genId = e.gen_id ?? null; }
+      else if (e.type === "metric_generated") { outcome = "accepted"; genId = e.gen_id ?? null; awaiting = false; }
       else if (e.type === "metric_generation_rejected") {
         outcome = "rejected"; genId = e.gen_id ?? null;
         reasons = e.reasons ?? []; concerns = e.concerns ?? [];
       }
-      else if (e.type === "metric_generation_failed") { outcome = "failed"; errorMsg = e.error ?? null; }
+      else if (e.type === "metric_generation_awaiting_decision") { awaiting = true; }
+      else if (e.type === "metric_generation_failed") { outcome = "failed"; errorMsg = e.error ?? null; awaiting = false; }
       else if (e.type === "metric_calibration_started") { calib = { status: "running", builtin: e.builtin }; }
       else if (e.type === "metric_calibration_done") {
         calib = { status: "done", builtin: e.builtin, calibrated: e.calibrated, spearman: e.spearman };
       }
       else if (e.type === "metric_calibration_skipped") { calib = { status: "skipped" }; }
     }
-    return started ? { last, outcome, genId, reasons, concerns, errorMsg, calib } : null;
+    return started ? { last, outcome, genId, reasons, concerns, errorMsg, calib, awaiting } : null;
   }, [events.events]);
 
   const summary = useMemo(() => runs.find((r) => r.run_id === runId) ?? null, [runs, runId]);
@@ -418,7 +421,16 @@ function RunDetailPane({ slug, runId, runs }: { slug: string; runId: string; run
         )}
         {genPhase && (
           <div style={{ padding: "0 16px" }}>
-            <MetricGenPhase phase={genPhase} />
+            <MetricGenPhase
+              phase={genPhase}
+              busy={control.isPending}
+              onRetry={() => control.mutate({ runId, gen_retry: true }, {
+                onError: (err) => toast.error("Could not retry generation", { description: err instanceof ApiError ? err.problem.detail ?? err.problem.title : err.message }),
+              })}
+              onContinueBlind={() => control.mutate({ runId, gen_continue: true }, {
+                onError: (err) => toast.error("Could not continue", { description: err instanceof ApiError ? err.problem.detail ?? err.problem.title : err.message }),
+              })}
+            />
           </div>
         )}
         {run.data?.error && (
@@ -782,7 +794,7 @@ function _mergeIterSlot(prev: IterEventSummary | undefined, next: IterEventSumma
 // Streams the Ship-40 stages into the Runs timeline; surfaces acceptance and —
 // crucially — REJECTIONS with the exact reasons (never silent). Ship 45 adds a
 // one-click retry.
-function MetricGenPhase({ phase }: {
+function MetricGenPhase({ phase, busy, onRetry, onContinueBlind }: {
   phase: {
     last: { stage?: string; message?: string; attempt?: number; max?: number } | null;
     outcome: "accepted" | "rejected" | "failed" | null;
@@ -794,9 +806,13 @@ function MetricGenPhase({ phase }: {
       status: "running" | "done" | "skipped";
       builtin?: string; calibrated?: boolean; spearman?: number | null;
     } | null;
+    awaiting: boolean;
   };
+  busy: boolean;
+  onRetry: () => void;
+  onContinueBlind: () => void;
 }) {
-  const { last, outcome, genId, reasons, concerns, errorMsg, calib } = phase;
+  const { last, outcome, genId, reasons, concerns, errorMsg, calib, awaiting } = phase;
   const running = outcome === null;
   const bad = outcome === "rejected" || outcome === "failed";
   const tone = outcome === "accepted" ? "var(--st-green-fg, var(--ink))"
@@ -870,6 +886,16 @@ function MetricGenPhase({ phase }: {
               <ul style={{ margin: 0, paddingLeft: 18 }}>
                 {concerns.map((c, i) => <li key={`c${i}`} style={{ fontSize: 11 }}>reviewer: {c}</li>)}
               </ul>
+            )}
+            {awaiting && (
+              <div className="rs-flex rs-gap-6" style={{ marginTop: 4 }}>
+                <Btn kind="primary" size="sm" icon={busy ? "loader" : "sparkles"} disabled={busy} onClick={onRetry}>
+                  Retry generation
+                </Btn>
+                <Btn kind="quiet" size="sm" disabled={busy} onClick={onContinueBlind}>
+                  Continue blind
+                </Btn>
+              </div>
             )}
           </div>
         )}

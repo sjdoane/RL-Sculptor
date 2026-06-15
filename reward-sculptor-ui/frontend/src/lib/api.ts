@@ -656,6 +656,8 @@ export async function controlRun(
     resume?: boolean;
     feedback?: string | null;
     stop?: boolean;
+    gen_retry?: boolean;
+    gen_continue?: boolean;
   },
 ): Promise<RunControlState> {
   return handle<RunControlState>(

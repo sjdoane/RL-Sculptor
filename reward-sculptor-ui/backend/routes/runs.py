@@ -395,6 +395,11 @@ def control_run(
     if body.resume:
         ctrl["resume_token"] = int(ctrl.get("resume_token", 0) or 0) + 1
         ctrl["feedback"] = body.feedback
+    if body.gen_retry or body.gen_continue:
+        # §Ship 45: deliver the launch-time-generation retry decision the
+        # pre-phase is polling for (retry → regenerate; continue → run blind).
+        ctrl["gen_decision"] = "retry" if body.gen_retry else "blind"
+        ctrl["gen_decision_seq"] = int(ctrl.get("gen_decision_seq", 0) or 0) + 1
     write_control_file(path, ctrl)
     # Reflect the new mode on the job so a reconnect / REST summary sees it,
     # and tee a control event so other connected clients stay in sync.

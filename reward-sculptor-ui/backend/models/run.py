@@ -144,6 +144,10 @@ class RunControl(BaseModel):
     """Free-text human observation to inject into the NEXT iteration's diagnose."""
     stop: bool = False
     """End the run cleanly after the current iteration."""
+    gen_retry: bool = False
+    """§Ship 45: retry the launch-time metric generation after a rejection."""
+    gen_continue: bool = False
+    """§Ship 45: stop retrying launch-time generation and continue blind."""
 
 
 class RunControlState(BaseModel):

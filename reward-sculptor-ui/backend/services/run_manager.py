@@ -111,24 +111,55 @@ def _robot_task_id(project_dir: Path) -> Optional[str]:
     return str(tid) if isinstance(tid, str) else None
 
 
+#: §Ship 45: initial generation + up to N-1 user-triggered retries before the
+#: run falls back to blind.
+_MAX_LAUNCH_GEN_ATTEMPTS = 4
+
+
+async def _await_gen_decision(
+    control_path: Path, cancel: asyncio.Event, *, timeout_s: float = 1800.0,
+) -> str:
+    """§Ship 45: after a launch-gen rejection, poll the control sidecar for the
+    user's decision — "retry" (regenerate) or "blind" (run without a metric).
+    The pre-phase holds NO GPU (the sculpt subprocess hasn't spawned), so the
+    wait is cheap; a long timeout falls back to "blind" so an unattended run
+    still completes rather than hanging. Cancel / stop → "blind"."""
+    start_seq = int(read_control_file(control_path).get("gen_decision_seq", 0) or 0)
+    waited = 0.0
+    step = 1.5
+    while waited < timeout_s:
+        if cancel.is_set():
+            return "blind"
+        ctrl = read_control_file(control_path)
+        if ctrl.get("stop"):
+            return "blind"
+        if int(ctrl.get("gen_decision_seq", 0) or 0) != start_seq:
+            return "retry" if ctrl.get("gen_decision") == "retry" else "blind"
+        await asyncio.sleep(step)
+        waited += step
+    return "blind"
+
+
 async def _generate_at_launch(
     job: Job, project_dir: Path, behavior_goal: str,
+    control_path: Path, cancel: asyncio.Event,
 ) -> Optional[str]:
-    """§Ship 43: generate the objective metric as the run's FIRST phase,
-    streaming the Ship-40 stage events (generating → validating →
-    regenerating → reviewing → done) into THIS run's event stream so the
-    Runs timeline shows live progress. Returns "gen:<id>" on acceptance,
-    else None (→ blind loop). Rejections are surfaced as events (never
-    silent) with the exact validation reasons + reviewer concerns. Never
-    raises — a failed generation degrades to a blind run.
+    """§Ship 43/44/45: generate the objective metric as the run's FIRST phase,
+    streaming the Ship-40 stage events into THIS run's event stream, then
+    auto-calibrate it. Returns "gen:<id>" on acceptance, else None (→ blind).
+    Rejections are surfaced as events (never silent) with the exact validation
+    reasons + reviewer concerns; §Ship 45 then PAUSES for a one-click retry
+    decision (bounded by `_MAX_LAUNCH_GEN_ATTEMPTS`) before falling back to
+    blind. Never raises — a failed generation degrades to a blind run.
 
     The blocking, multi-LLM-call generation runs in a worker thread; its
-    on_event callback fires in that thread, so events are marshalled back
-    onto the event loop with call_soon_threadsafe (Job.emit's subscriber
-    queues are not thread-safe)."""
+    on_event callback fires in that thread, so events are marshalled back onto
+    the event loop with call_soon_threadsafe (Job.emit's subscriber queues are
+    not thread-safe)."""
     from backend.services import metric_store, sculptor_bridge
 
     loop = asyncio.get_running_loop()
+    robot_hint = _robot_task_id(project_dir)
 
     def _emit_threadsafe(ev: dict[str, Any]) -> None:
         loop.call_soon_threadsafe(job.emit, ev)
@@ -139,56 +170,70 @@ async def _generate_at_launch(
         _emit_threadsafe({"type": "metric_generation_progress", "source": "launch_gen", **ev})
         metric_store.write_progress(project_dir, {"active": True, **ev})
 
-    job.emit({"type": "metric_generation_started", "source": "launch_gen",
-              "behavior_goal": behavior_goal})
-    robot_hint = _robot_task_id(project_dir)
-    try:
-        rec = await asyncio.to_thread(
-            metric_store.generate, project_dir, behavior_goal,
-            robot_hint=robot_hint, review=True, on_event=_on_event)
-    except Exception as e:  # noqa: BLE001 — generation never fails the run
+    for attempt in range(_MAX_LAUNCH_GEN_ATTEMPTS):
+        job.emit({"type": "metric_generation_started", "source": "launch_gen",
+                  "behavior_goal": behavior_goal,
+                  "attempt": attempt + 1, "max": _MAX_LAUNCH_GEN_ATTEMPTS})
+        try:
+            rec = await asyncio.to_thread(
+                metric_store.generate, project_dir, behavior_goal,
+                robot_hint=robot_hint, review=True, on_event=_on_event)
+        except Exception as e:  # noqa: BLE001 — generation never fails the run
+            metric_store.clear_progress(project_dir)
+            job.emit({"type": "metric_generation_failed", "source": "launch_gen",
+                      "error": f"{type(e).__name__}: {e}"})
+            return None
         metric_store.clear_progress(project_dir)
-        job.emit({"type": "metric_generation_failed", "source": "launch_gen",
-                  "error": f"{type(e).__name__}: {e}"})
-        return None
-    metric_store.clear_progress(project_dir)
 
-    if rec.get("accepted"):
-        gid = rec.get("id")
-        job.emit({"type": "metric_generated", "source": "launch_gen",
-                  "gen_id": gid, "accepted": True,
-                  "behavior_goal": behavior_goal})
-        # §Ship 44: auto-calibrate at launch against the family's built-in
-        # ground truth (offline, no GPU). On pass the metric earns steer-rights
-        # (the cmd-build's steer_allowed reads the now-calibrated meta.json);
-        # else it stays observe-only — the firewall never lets an uncalibrated
-        # metric steer.
-        builtin = sculptor_bridge.resolve_calibration_builtin(behavior_goal, robot_hint)
-        if builtin and gid:
-            job.emit({"type": "metric_calibration_started", "source": "launch_gen",
-                      "gen_id": gid, "builtin": builtin})
-            try:
-                cal = await asyncio.to_thread(
-                    metric_store.calibrate, project_dir, gid, builtin)
-                job.emit({"type": "metric_calibration_done", "source": "launch_gen",
-                          "gen_id": gid, "builtin": builtin,
-                          "calibrated": bool(cal.get("calibrated")),
-                          "spearman": (cal.get("calibration") or {}).get("spearman")})
-            except Exception as e:  # noqa: BLE001 — calibration failure ≠ run failure
-                job.emit({"type": "metric_calibration_done", "source": "launch_gen",
-                          "gen_id": gid, "builtin": builtin, "calibrated": False,
-                          "error": f"{type(e).__name__}: {e}"})
-        else:
-            job.emit({"type": "metric_calibration_skipped", "source": "launch_gen",
-                      "gen_id": gid,
-                      "reason": "no matching built-in ground truth — observe-only"})
-        return f"gen:{gid}"
+        if rec.get("accepted"):
+            gid = rec.get("id")
+            job.emit({"type": "metric_generated", "source": "launch_gen",
+                      "gen_id": gid, "accepted": True,
+                      "behavior_goal": behavior_goal})
+            # §Ship 44: auto-calibrate vs the family's built-in ground truth
+            # (offline, no GPU). On pass the metric earns steer-rights (the
+            # cmd-build's steer_allowed reads the now-calibrated meta.json);
+            # else it stays observe-only — the firewall never lets an
+            # uncalibrated metric steer.
+            builtin = sculptor_bridge.resolve_calibration_builtin(behavior_goal, robot_hint)
+            if builtin and gid:
+                job.emit({"type": "metric_calibration_started", "source": "launch_gen",
+                          "gen_id": gid, "builtin": builtin})
+                try:
+                    cal = await asyncio.to_thread(
+                        metric_store.calibrate, project_dir, gid, builtin)
+                    job.emit({"type": "metric_calibration_done", "source": "launch_gen",
+                              "gen_id": gid, "builtin": builtin,
+                              "calibrated": bool(cal.get("calibrated")),
+                              "spearman": (cal.get("calibration") or {}).get("spearman")})
+                except Exception as e:  # noqa: BLE001 — calibration failure ≠ run failure
+                    job.emit({"type": "metric_calibration_done", "source": "launch_gen",
+                              "gen_id": gid, "builtin": builtin, "calibrated": False,
+                              "error": f"{type(e).__name__}: {e}"})
+            else:
+                job.emit({"type": "metric_calibration_skipped", "source": "launch_gen",
+                          "gen_id": gid,
+                          "reason": "no matching built-in ground truth — observe-only"})
+            return f"gen:{gid}"
 
-    # Rejected — surface WHY (validation gate reasons + reviewer concerns).
-    job.emit({"type": "metric_generation_rejected", "source": "launch_gen",
-              "gen_id": rec.get("id"),
-              "reasons": list(rec.get("reasons") or []),
-              "concerns": list((rec.get("review") or {}).get("concerns") or [])})
+        # Rejected — surface WHY (validation gate reasons + reviewer concerns).
+        can_retry = (attempt + 1 < _MAX_LAUNCH_GEN_ATTEMPTS) and not cancel.is_set()
+        job.emit({"type": "metric_generation_rejected", "source": "launch_gen",
+                  "gen_id": rec.get("id"),
+                  "reasons": list(rec.get("reasons") or []),
+                  "concerns": list((rec.get("review") or {}).get("concerns") or []),
+                  "can_retry": can_retry})
+        if not can_retry:
+            return None
+        # §Ship 45: pause for a one-click decision — retry generation or
+        # continue blind. No GPU is held (the sculpt subprocess hasn't spawned).
+        job.emit({"type": "metric_generation_awaiting_decision", "source": "launch_gen",
+                  "gen_id": rec.get("id"),
+                  "attempt": attempt + 1, "max": _MAX_LAUNCH_GEN_ATTEMPTS})
+        decision = await _await_gen_decision(control_path, cancel)
+        if decision != "retry":
+            return None
+        # loop → regenerate
     return None
 
 
@@ -297,6 +342,15 @@ def run_sculpt_job(
 
         env.update(remote_env(project_dir.parent))
 
+        # §Ship 39 (H1): the interactive control sidecar. §Ship 45: written
+        # BEFORE the launch-gen pre-phase so the PATCH /control route can deliver
+        # a retry/continue decision while generation is paused on a rejection.
+        control_path = control_file_path(project_dir, job.job_id)
+        write_control_file(control_path, {
+            "mode": start_mode, "resume_token": 0,
+            "feedback": None, "stop": False,
+        })
+
         # §Ship 43: launch-time generation — if the user picked "Generate a
         # metric from this goal (at launch)", generate the objective metric as
         # the run's FIRST phase (events streamed into this run's stream), then
@@ -310,7 +364,7 @@ def run_sculpt_job(
                 and os.environ.get("SCULPTOR_LAUNCH_GEN", "1") != "0"
                 and not cancel.is_set()):
             eff_fitness_metric = await _generate_at_launch(
-                job, project_dir, behavior_goal)
+                job, project_dir, behavior_goal, control_path, cancel)
             # §Ship 44: a launch-generated metric STEERS iff it earned
             # steer-rights via launch-time calibration; request steer and let
             # the steer_allowed firewall below downgrade to observe otherwise.
@@ -384,14 +438,9 @@ def run_sculpt_job(
                     cmd += ["--fitness-mode", str(eff_mode)]
                     final_fitness_mode = eff_mode
 
-        # §Ship 39 (H1): wire the interactive control sidecar. Written ALWAYS
-        # (deterministic path) so the Auto/Manual toggle works at any point
-        # mid-run; the initial mode comes from `start_mode` (default "auto").
-        control_path = control_file_path(project_dir, job.job_id)
-        write_control_file(control_path, {
-            "mode": start_mode, "resume_token": 0,
-            "feedback": None, "stop": False,
-        })
+        # §Ship 39 (H1): the interactive control sidecar (written above, before
+        # the launch-gen pre-phase) lets the sculpt subprocess poll for the
+        # Auto/Manual toggle at any iteration boundary.
         cmd += ["--control-file", str(control_path)]
         job.params["control_file"] = str(control_path)
         job.params["mode"] = start_mode

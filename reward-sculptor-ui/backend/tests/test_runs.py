@@ -719,12 +719,47 @@ def test_run_sculpt_job_launch_gen_accepts_and_steers(
     assert cmd[cmd.index("--fitness-mode") + 1] == "observe"
 
 
+async def _decision_blind(control_path, cancel, *, timeout_s=1800.0):
+    return "blind"
+
+
+async def _decision_retry(control_path, cancel, *, timeout_s=1800.0):
+    return "retry"
+
+
+def _fake_bridge_gen_seq(*accepts):
+    """Stateful mock: accept/reject per successive call (one per launch-gen
+    attempt), writing metric.py each time."""
+    state = {"i": 0}
+
+    def _gen(behavior_goal, out_dir, *, robot_hint=None, review=True, on_event=None):
+        accept = accepts[min(state["i"], len(accepts) - 1)]
+        state["i"] += 1
+        if on_event:
+            on_event({"stage": "generating", "attempt": 1, "max": 3, "message": "Generating…"})
+            on_event({"stage": "done", "accepted": accept, "message": "x"})
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "metric.py").write_text(
+            "def compute_spec(a, b, m):\n    return {'spec_score': 0.5}\n", encoding="utf-8")
+        return {
+            "accepted": accept, "validation_passed": accept, "calibrated": False,
+            "behavior_goal": behavior_goal,
+            "validation": {"gates": {"nondegeneracy": accept},
+                           "reasons": [] if accept else ["[nondegeneracy] near-constant metric"],
+                           "archetype_scores": {}},
+            "review": ({"approved": True, "concerns": [], "summary": "ok"} if accept else None),
+            "source": "...", "recorded_at": "now",
+        }
+    return _gen
+
+
 def test_run_sculpt_job_launch_gen_rejected_runs_blind(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """§Ship 43: a rejected launch-time generation surfaces a
-    metric_generation_rejected event (never silent) WITH reasons, and the run
-    continues blind (no --fitness-metric flag, never a failed run)."""
+    """§Ship 43/45: a rejected launch-time generation surfaces a
+    metric_generation_rejected event (never silent) WITH reasons; on the
+    "continue blind" decision the run proceeds blind (no --fitness-metric)."""
     import asyncio
 
     from backend.services import run_manager, sculptor_bridge
@@ -732,6 +767,7 @@ def test_run_sculpt_job_launch_gen_rejected_runs_blind(
 
     monkeypatch.setattr(sculptor_bridge, "generate_objective_metric",
                         _fake_bridge_gen(accept=False))
+    monkeypatch.setattr(run_manager, "_await_gen_decision", _decision_blind)
     project_dir = tmp_path / "lg-reject"
     project_dir.mkdir()
     captured: dict = {}
@@ -758,7 +794,54 @@ def test_run_sculpt_job_launch_gen_rejected_runs_blind(
     rejected = [e for e in job.events if e.get("type") == "metric_generation_rejected"]
     assert rejected, [e.get("type") for e in job.events]
     assert rejected[0]["reasons"], rejected[0]
+    assert rejected[0]["can_retry"] is True, rejected[0]
     assert "--fitness-metric" not in captured["cmd"], captured["cmd"]
+
+
+def test_run_sculpt_job_launch_gen_retry_then_accept(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """§Ship 45: a rejection PAUSES for a one-click decision; on "retry" the
+    pre-phase regenerates, and an accepted second attempt steers the run."""
+    import asyncio
+
+    from backend.services import run_manager, sculptor_bridge
+    from backend.services.job_manager import Job
+
+    # reject the first attempt, accept the second; no real calibration needed.
+    monkeypatch.setattr(sculptor_bridge, "generate_objective_metric",
+                        _fake_bridge_gen_seq(False, True))
+    monkeypatch.setattr(sculptor_bridge, "resolve_calibration_builtin",
+                        lambda goal, robot_hint=None: None)
+    monkeypatch.setattr(run_manager, "_await_gen_decision", _decision_retry)
+    project_dir = tmp_path / "lg-retry"
+    project_dir.mkdir()
+    captured: dict = {}
+
+    class _Sentinel(Exception):
+        pass
+
+    async def _fake_exec(*args, **kwargs):
+        captured["cmd"] = list(args)
+        raise _Sentinel()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+    runner = run_manager.run_sculpt_job(
+        project_dir=project_dir,
+        run_params={"behavior_goal": "kick with one leg", "iterations": 1,
+                    "fitness_metric": "generate-at-launch", "fitness_mode": "observe"},
+    )
+    job = Job(job_id="t_lgretry", kind="sculpt_run", project_slug="lg-retry", status="running")
+    job._cancel = asyncio.Event()
+    with pytest.raises(_Sentinel):
+        asyncio.run(runner(job, job._cancel))
+
+    starts = [e for e in job.events if e.get("type") == "metric_generation_started"]
+    assert len(starts) == 2, [e.get("type") for e in job.events]   # initial + 1 retry
+    assert any(e.get("type") == "metric_generated" for e in job.events)
+    cmd = captured["cmd"]
+    assert "--fitness-metric" in cmd
+    assert cmd[cmd.index("--fitness-metric") + 1].endswith("metrics/gen_002/metric.py")
 
 
 def _run_launch_gen_with_calibration(
@@ -1467,6 +1550,18 @@ def test_control_endpoint_merges_mode_resume_and_stop(
     rc3 = client.patch(
         f"/projects/{slug}/runs/{run_id}/control", json={"stop": True})
     assert rc3.json()["stop"] is True
+
+    # §Ship 45: a launch-gen retry decision is recorded in the sidecar for the
+    # pre-phase to poll; continue-blind bumps the seq with a "blind" decision.
+    rc4 = client.patch(
+        f"/projects/{slug}/runs/{run_id}/control", json={"gen_retry": True})
+    assert rc4.status_code == 200, rc4.text
+    assert rc4.json()["gen_decision"] == "retry"
+    assert rc4.json()["gen_decision_seq"] == 1
+    rc5 = client.patch(
+        f"/projects/{slug}/runs/{run_id}/control", json={"gen_continue": True})
+    assert rc5.json()["gen_decision"] == "blind"
+    assert rc5.json()["gen_decision_seq"] == 2
 
     # unknown run → 404.
     assert client.patch(

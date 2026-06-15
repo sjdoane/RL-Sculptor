@@ -339,6 +339,33 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-14 — Ship 45: never-silent rejections + one-click retry for launch-time generation
+
+- **Why**: a rejected launch-time generation must not silently fall to a blind
+  run — the user should see WHY and be able to retry. Since the metric is fixed
+  at subprocess spawn, retry has to happen DURING the pre-phase (which holds NO
+  GPU), not after.
+- **What**:
+  - **Backend** `services/run_manager.py`: the pre-phase now LOOPS (bounded by
+    `_MAX_LAUNCH_GEN_ATTEMPTS=4`). On rejection it emits
+    `metric_generation_rejected` (reasons + concerns + `can_retry`) then
+    `metric_generation_awaiting_decision`, and PAUSES via `_await_gen_decision`
+    polling the control sidecar (no GPU held). "retry" → regenerate; "blind" /
+    30-min timeout / cancel → run blind. The control file is now written BEFORE
+    the pre-phase so the route can deliver the decision.
+  - **Backend** `models/run.py` `RunControl`: `gen_retry` / `gen_continue`;
+    `routes/runs.py` writes `gen_decision` + bumps `gen_decision_seq`.
+  - **Frontend** `RunsTab.tsx`: the generation card shows **Retry generation** +
+    **Continue blind** buttons while awaiting a decision (wired to
+    `useControlRun`); `api.ts` / `useRuns.ts` carry the new fields.
+- **How / decision (plan Open-Q 5)**: on rejection the run PAUSES for a human
+  decision rather than silently proceeding blind — correct because the pre-phase
+  holds no GPU (pausing is free) and a blind run defeats "carry the goal through
+  the run". A 30-min timeout falls back to blind so an unattended run completes.
+- **Verified (mocked LLM — no API/GPU)**: backend (retry-then-accept → 2
+  attempts, gen_002 steers; rejected → blind with `can_retry`; control route
+  `gen_retry`/`gen_continue` write `gen_decision`) ; frontend `pnpm build` clean.
+
 ### 2026-06-14 — Ship 44: auto-calibrate the launch-generated metric → steer if it earns it
 
 - **Why**: a launch-generated metric is observe-only by default; to "carry
