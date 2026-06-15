@@ -303,6 +303,37 @@ function RunDetailPane({ slug, runId, runs }: { slug: string; runId: string; run
     return { awaiting: aw, awaitingIter: awIter, mode: m };
   }, [events.events, run.data?.mode]);
 
+  // §Ship 43: launch-time objective-metric generation as run-phase 0. Fold the
+  // metric_generation_* events into a single phase view (progress while running;
+  // accepted / rejected-with-reasons outcome — never silent).
+  const genPhase = useMemo(() => {
+    let started = false;
+    let last: { stage?: string; message?: string; attempt?: number; max?: number } | null = null;
+    let outcome: "accepted" | "rejected" | "failed" | null = null;
+    let genId: string | null = null;
+    let reasons: string[] = [];
+    let concerns: string[] = [];
+    let errorMsg: string | null = null;
+    for (const ev of events.events) {
+      const e = ev as {
+        type?: string; stage?: string; message?: string; attempt?: number;
+        max?: number; gen_id?: string; reasons?: string[]; concerns?: string[];
+        error?: string;
+      };
+      if (e.type === "metric_generation_started") { started = true; outcome = null; last = null; }
+      else if (e.type === "metric_generation_progress") {
+        last = { stage: e.stage, message: e.message, attempt: e.attempt, max: e.max };
+      }
+      else if (e.type === "metric_generated") { outcome = "accepted"; genId = e.gen_id ?? null; }
+      else if (e.type === "metric_generation_rejected") {
+        outcome = "rejected"; genId = e.gen_id ?? null;
+        reasons = e.reasons ?? []; concerns = e.concerns ?? [];
+      }
+      else if (e.type === "metric_generation_failed") { outcome = "failed"; errorMsg = e.error ?? null; }
+    }
+    return started ? { last, outcome, genId, reasons, concerns, errorMsg } : null;
+  }, [events.events]);
+
   const summary = useMemo(() => runs.find((r) => r.run_id === runId) ?? null, [runs, runId]);
   const isStageRun = (summary?.kind === "mission_stage_run") || (run.data?.kind === "mission_stage_run");
   const missionSlug = summary?.mission_slug ?? run.data?.mission_slug ?? null;
@@ -374,6 +405,11 @@ function RunDetailPane({ slug, runId, runs }: { slug: string; runId: string; run
               );
             }}
           />
+        )}
+        {genPhase && (
+          <div style={{ padding: "0 16px" }}>
+            <MetricGenPhase phase={genPhase} />
+          </div>
         )}
         {run.data?.error && (
           <div style={{ padding: "0 16px" }}>
@@ -731,6 +767,77 @@ function _mergeIterSlot(prev: IterEventSummary | undefined, next: IterEventSumma
     best_fitness: winner.best_fitness ?? loser.best_fitness,
   };
 }
+
+// §Ship 43: the launch-time objective-metric generation phase (run-phase 0).
+// Streams the Ship-40 stages into the Runs timeline; surfaces acceptance and —
+// crucially — REJECTIONS with the exact reasons (never silent). Ship 45 adds a
+// one-click retry.
+function MetricGenPhase({ phase }: {
+  phase: {
+    last: { stage?: string; message?: string; attempt?: number; max?: number } | null;
+    outcome: "accepted" | "rejected" | "failed" | null;
+    genId: string | null;
+    reasons: string[];
+    concerns: string[];
+    errorMsg: string | null;
+  };
+}) {
+  const { last, outcome, genId, reasons, concerns, errorMsg } = phase;
+  const running = outcome === null;
+  const bad = outcome === "rejected" || outcome === "failed";
+  const tone = outcome === "accepted" ? "var(--st-green-fg, var(--ink))"
+    : bad ? "var(--st-amber-fg)" : "var(--ink)";
+  return (
+    <div className="rs-card" style={{ marginBottom: 10 }}>
+      <div className="rs-card-head">
+        <div className="rs-card-title" style={{ fontSize: 13 }}>
+          <Icon name={running ? "loader" : outcome === "accepted" ? "check-circle" : "alert-triangle"} size={15} />
+          Objective metric generation
+        </div>
+        {running && <span className="rs-dot live" />}
+      </div>
+      <div style={{ padding: "8px 12px 12px", fontSize: 12.5, color: "var(--ink)" }}>
+        {running && (
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <Icon name="loader" size={13} />
+            <span>
+              {last?.message ?? "Starting generation…"}
+              {typeof last?.attempt === "number" && typeof last?.max === "number"
+                ? ` (attempt ${last.attempt}/${last.max})` : ""}
+            </span>
+          </div>
+        )}
+        {outcome === "accepted" && (
+          <div style={{ color: tone }}>
+            Generated <code className="mono">{genId}</code> — runs observe-only;
+            auto-calibrated against a matching built-in, and steers if it passes.
+          </div>
+        )}
+        {outcome === "failed" && (
+          <div style={{ color: tone }}>Generation failed: {errorMsg ?? "unknown error"}. Running blind.</div>
+        )}
+        {outcome === "rejected" && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            <div style={{ color: tone, fontWeight: 600 }}>
+              No metric was accepted — the run continues blind. Why:
+            </div>
+            {reasons.length > 0 && (
+              <ul style={{ margin: 0, paddingLeft: 18 }}>
+                {reasons.map((r, i) => <li key={`r${i}`} className="mono" style={{ fontSize: 11 }}>{r}</li>)}
+              </ul>
+            )}
+            {concerns.length > 0 && (
+              <ul style={{ margin: 0, paddingLeft: 18 }}>
+                {concerns.map((c, i) => <li key={`c${i}`} style={{ fontSize: 11 }}>reviewer: {c}</li>)}
+              </ul>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
 
 function useMergedIterations(rest: IterEventSummary[], events: RunEvent[]): IterEventSummary[] {
   const stickyMap = useRef<Map<number, IterEventSummary>>(new Map());

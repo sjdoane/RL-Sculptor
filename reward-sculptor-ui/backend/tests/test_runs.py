@@ -599,17 +599,18 @@ def test_run_sculpt_job_omits_fitness_metric_when_not_set(
     assert "--fitness-metric" not in captured["cmd"], captured["cmd"]
 
 
-def test_run_sculpt_job_launch_gen_sentinel_runs_blind(
+def test_run_sculpt_job_launch_gen_sentinel_disabled_runs_blind(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """§Ship 42: the deferred-generation sentinel "generate-at-launch" must
-    not reach the CLI as a metric name — until Ship 43's pre-phase rewrites it,
-    it is a safe no-op → blind loop (no --fitness-metric flag, no crash)."""
+    """§Ship 42/43: with the launch-gen kill-switch off (SCULPTOR_LAUNCH_GEN=0),
+    the sentinel "generate-at-launch" must not reach the CLI as a metric name —
+    it degrades to a blind loop (no --fitness-metric flag, no crash)."""
     import asyncio
 
     from backend.services import run_manager
     from backend.services.job_manager import Job
 
+    monkeypatch.setenv("SCULPTOR_LAUNCH_GEN", "0")
     project_dir = tmp_path / "launchgen-proj"
     project_dir.mkdir()
     captured: dict = {}
@@ -634,6 +635,129 @@ def test_run_sculpt_job_launch_gen_sentinel_runs_blind(
     with pytest.raises(_Sentinel):
         asyncio.run(runner(job, job._cancel))
 
+    assert "--fitness-metric" not in captured["cmd"], captured["cmd"]
+
+
+def _fake_bridge_gen(*, accept: bool):
+    """A mocked sculptor_bridge.generate_objective_metric: writes metric.py,
+    fires the Ship-40 stage events, returns an accept/reject rec (no LLM)."""
+    def _gen(behavior_goal, out_dir, *, robot_hint=None, review=True, on_event=None):
+        if on_event:
+            on_event({"stage": "generating", "attempt": 1, "max": 3,
+                      "message": "Generating candidate metric (attempt 1/3)…"})
+            on_event({"stage": "validating", "attempt": 1, "max": 3,
+                      "message": "Validating…"})
+            if accept:
+                on_event({"stage": "reviewing", "message": "Reviewing…"})
+            on_event({"stage": "done", "accepted": accept,
+                      "message": "Metric accepted." if accept else "Rejected."})
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "metric.py").write_text(
+            "def compute_spec(a, b, m):\n    return {'spec_score': 0.5}\n",
+            encoding="utf-8")
+        return {
+            "accepted": accept, "validation_passed": accept, "calibrated": False,
+            "behavior_goal": behavior_goal,
+            "validation": {
+                "gates": {"nondegeneracy": accept},
+                "reasons": [] if accept else ["[nondegeneracy] near-constant metric"],
+                "archetype_scores": {},
+            },
+            "review": ({"approved": True, "concerns": [], "summary": "ok"} if accept
+                       else None),
+            "source": "def compute_spec(...): ...", "recorded_at": "now",
+        }
+    return _gen
+
+
+def test_run_sculpt_job_launch_gen_accepts_and_steers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """§Ship 43: the launch-time generation pre-phase streams metric_generation_*
+    events into the run stream and, on acceptance, rewrites the cmd to point at
+    the generated metric (observe-only — uncalibrated)."""
+    import asyncio
+
+    from backend.services import run_manager, sculptor_bridge
+    from backend.services.job_manager import Job
+
+    monkeypatch.setattr(sculptor_bridge, "generate_objective_metric",
+                        _fake_bridge_gen(accept=True))
+    project_dir = tmp_path / "lg-accept"
+    project_dir.mkdir()
+    captured: dict = {}
+
+    class _Sentinel(Exception):
+        pass
+
+    async def _fake_exec(*args, **kwargs):
+        captured["cmd"] = list(args)
+        raise _Sentinel()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+
+    runner = run_manager.run_sculpt_job(
+        project_dir=project_dir,
+        run_params={"behavior_goal": "repeatedly kick with one leg", "iterations": 1,
+                    "fitness_metric": "generate-at-launch", "fitness_mode": "steer"},
+    )
+    job = Job(job_id="t_lga", kind="sculpt_run", project_slug="lg-accept", status="running")
+    job._cancel = asyncio.Event()
+    with pytest.raises(_Sentinel):
+        asyncio.run(runner(job, job._cancel))
+
+    stages = [e["type"] for e in job.events if e.get("type", "").startswith("metric_generation")
+              or e.get("type") == "metric_generated"]
+    assert stages[0] == "metric_generation_started", stages
+    assert "metric_generation_progress" in stages, stages
+    assert stages[-1] == "metric_generated", stages
+    cmd = captured["cmd"]
+    assert "--fitness-metric" in cmd
+    assert cmd[cmd.index("--fitness-metric") + 1].endswith("metrics/gen_001/metric.py")
+    # uncalibrated → steer downgraded to observe (firewall)
+    assert cmd[cmd.index("--fitness-mode") + 1] == "observe"
+
+
+def test_run_sculpt_job_launch_gen_rejected_runs_blind(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """§Ship 43: a rejected launch-time generation surfaces a
+    metric_generation_rejected event (never silent) WITH reasons, and the run
+    continues blind (no --fitness-metric flag, never a failed run)."""
+    import asyncio
+
+    from backend.services import run_manager, sculptor_bridge
+    from backend.services.job_manager import Job
+
+    monkeypatch.setattr(sculptor_bridge, "generate_objective_metric",
+                        _fake_bridge_gen(accept=False))
+    project_dir = tmp_path / "lg-reject"
+    project_dir.mkdir()
+    captured: dict = {}
+
+    class _Sentinel(Exception):
+        pass
+
+    async def _fake_exec(*args, **kwargs):
+        captured["cmd"] = list(args)
+        raise _Sentinel()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+
+    runner = run_manager.run_sculpt_job(
+        project_dir=project_dir,
+        run_params={"behavior_goal": "do a spin", "iterations": 1,
+                    "fitness_metric": "generate-at-launch", "fitness_mode": "observe"},
+    )
+    job = Job(job_id="t_lgr", kind="sculpt_run", project_slug="lg-reject", status="running")
+    job._cancel = asyncio.Event()
+    with pytest.raises(_Sentinel):
+        asyncio.run(runner(job, job._cancel))
+
+    rejected = [e for e in job.events if e.get("type") == "metric_generation_rejected"]
+    assert rejected, [e.get("type") for e in job.events]
+    assert rejected[0]["reasons"], rejected[0]
     assert "--fitness-metric" not in captured["cmd"], captured["cmd"]
 
 

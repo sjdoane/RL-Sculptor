@@ -94,6 +94,80 @@ def steer_allowed(project_dir: Path, fitness_metric: str) -> bool:
         return False
 
 
+# ── §Ship 43: launch-time objective-metric generation (run-phase 0) ────
+def _robot_task_id(project_dir: Path) -> Optional[str]:
+    """Best-effort adapter task_id from config.toml — a robot hint for the
+    metric generator (e.g. "Mjlab-Velocity-Flat-Unitree-G1"). Never fatal."""
+    try:
+        import tomllib
+    except ModuleNotFoundError:  # pragma: no cover — py310 fallback
+        import tomli as tomllib  # type: ignore[no-redef]
+    try:
+        with (project_dir / "config.toml").open("rb") as f:
+            cfg = tomllib.load(f)
+    except Exception:  # noqa: BLE001
+        return None
+    tid = ((cfg.get("adapter") or {}).get("config") or {}).get("task_id")
+    return str(tid) if isinstance(tid, str) else None
+
+
+async def _generate_at_launch(
+    job: Job, project_dir: Path, behavior_goal: str,
+) -> Optional[str]:
+    """§Ship 43: generate the objective metric as the run's FIRST phase,
+    streaming the Ship-40 stage events (generating → validating →
+    regenerating → reviewing → done) into THIS run's event stream so the
+    Runs timeline shows live progress. Returns "gen:<id>" on acceptance,
+    else None (→ blind loop). Rejections are surfaced as events (never
+    silent) with the exact validation reasons + reviewer concerns. Never
+    raises — a failed generation degrades to a blind run.
+
+    The blocking, multi-LLM-call generation runs in a worker thread; its
+    on_event callback fires in that thread, so events are marshalled back
+    onto the event loop with call_soon_threadsafe (Job.emit's subscriber
+    queues are not thread-safe)."""
+    from backend.services import metric_store
+
+    loop = asyncio.get_running_loop()
+
+    def _emit_threadsafe(ev: dict[str, Any]) -> None:
+        loop.call_soon_threadsafe(job.emit, ev)
+
+    def _on_event(ev: dict[str, Any]) -> None:
+        # Stream into the run timeline (WS) AND the Ship-40 sidecar (parity
+        # with the standalone generate UI). Both are best-effort.
+        _emit_threadsafe({"type": "metric_generation_progress", "source": "launch_gen", **ev})
+        metric_store.write_progress(project_dir, {"active": True, **ev})
+
+    job.emit({"type": "metric_generation_started", "source": "launch_gen",
+              "behavior_goal": behavior_goal})
+    robot_hint = _robot_task_id(project_dir)
+    try:
+        rec = await asyncio.to_thread(
+            metric_store.generate, project_dir, behavior_goal,
+            robot_hint=robot_hint, review=True, on_event=_on_event)
+    except Exception as e:  # noqa: BLE001 — generation never fails the run
+        metric_store.clear_progress(project_dir)
+        job.emit({"type": "metric_generation_failed", "source": "launch_gen",
+                  "error": f"{type(e).__name__}: {e}"})
+        return None
+    metric_store.clear_progress(project_dir)
+
+    if rec.get("accepted"):
+        job.emit({"type": "metric_generated", "source": "launch_gen",
+                  "gen_id": rec.get("id"), "accepted": True,
+                  "behavior_goal": behavior_goal,
+                  "calibrated": bool(rec.get("calibrated"))})
+        return f"gen:{rec['id']}"
+
+    # Rejected — surface WHY (validation gate reasons + reviewer concerns).
+    job.emit({"type": "metric_generation_rejected", "source": "launch_gen",
+              "gen_id": rec.get("id"),
+              "reasons": list(rec.get("reasons") or []),
+              "concerns": list((rec.get("review") or {}).get("concerns") or [])})
+    return None
+
+
 # ── §Ship 39 (H1): interactive control sidecar ─────────────────────────
 def control_file_path(project_dir: Path, run_id: str) -> Path:
     """Deterministic path for a run's interactive control sidecar. Both the
@@ -199,6 +273,20 @@ def run_sculpt_job(
 
         env.update(remote_env(project_dir.parent))
 
+        # §Ship 43: launch-time generation — if the user picked "Generate a
+        # metric from this goal (at launch)", generate the objective metric as
+        # the run's FIRST phase (events streamed into this run's stream), then
+        # steer the rest of the run with it (observe-only until calibrated).
+        # Opt-in via the dropdown sentinel; SCULPTOR_LAUNCH_GEN=0 disables it
+        # (→ blind, the Ship-42 fallback). Other fitness_metric values are
+        # untouched, so default run behavior stays green.
+        eff_fitness_metric = fitness_metric
+        if (eff_fitness_metric == LAUNCH_GEN_SENTINEL
+                and os.environ.get("SCULPTOR_LAUNCH_GEN", "1") != "0"
+                and not cancel.is_set()):
+            eff_fitness_metric = await _generate_at_launch(
+                job, project_dir, behavior_goal)
+
         cmd = [
             sys.executable, "-m", "sculptor.cli",
             "run", behavior_goal,
@@ -243,20 +331,23 @@ def run_sculpt_job(
             )
         if early_stop_patience is not None:
             cmd += ["--early-stop-patience", str(int(early_stop_patience))]
-        if fitness_metric:
+        if eff_fitness_metric:
             # §Ship 35: a generated metric is referenced as "gen:<id>";
             # resolve it to the project's metric.py path the CLI can load.
             # A built-in name passes through unchanged. An unresolvable
             # gen ref is dropped (blind loop) rather than failing the run.
-            resolved = _resolve_fitness_metric(project_dir, str(fitness_metric))
+            # §Ship 43: eff_fitness_metric is the LAUNCH-GENERATED gen:<id>
+            # when the sentinel was used (else the original selection).
+            resolved = _resolve_fitness_metric(project_dir, str(eff_fitness_metric))
             if resolved is not None:
                 cmd += ["--fitness-metric", resolved]
                 # §Ship 35 review: downgrade steer→observe for an
                 # uncalibrated generated metric (backend-enforced, not just
-                # the UI).
+                # the UI). A launch-generated metric is uncalibrated by
+                # default, so it observes until Ship-44 calibration passes.
                 eff_mode = fitness_mode
                 if eff_mode == "steer" and not steer_allowed(
-                        project_dir, str(fitness_metric)):
+                        project_dir, str(eff_fitness_metric)):
                     eff_mode = "observe"
                 if eff_mode in ("observe", "steer"):
                     cmd += ["--fitness-mode", str(eff_mode)]
@@ -294,8 +385,11 @@ def run_sculpt_job(
             ("auto_adjust_physics", auto_adjust_physics),
             ("early_stop_enabled", early_stop_enabled),
             ("early_stop_patience", early_stop_patience),
-            ("fitness_metric", fitness_metric),
-            ("fitness_mode", fitness_mode if fitness_metric else None),
+            # §Ship 43: persist the RESOLVED metric (the launch-generated
+            # gen:<id> when the sentinel was used) so the Runs view shows what
+            # actually steers; None (rejected/blind) is skipped below.
+            ("fitness_metric", eff_fitness_metric),
+            ("fitness_mode", fitness_mode if eff_fitness_metric else None),
         ):
             if val is not None:
                 job.params.setdefault(key, val)

@@ -339,6 +339,35 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-14 — Ship 43: launch-time objective-metric generation as run-phase 0 (streamed into the Runs timeline)
+
+- **Why**: when the user picks "Generate at launch" (Ship 42), generation should
+  be the run's FIRST phase with progress streamed into the Runs view (not a
+  blocking dialog), and rejections must be VISIBLE (never a silent toast).
+- **What**:
+  - **Backend** `services/run_manager.py`: `_generate_at_launch(job, project_dir,
+    behavior_goal)` runs `metric_store.generate` in a worker thread BEFORE the
+    sculpt subprocess spawns, marshalling the Ship-40 stage events onto the loop
+    (`loop.call_soon_threadsafe` — `Job.emit`'s subscriber queues are NOT
+    thread-safe) as `metric_generation_started / _progress / metric_generated /
+    _rejected / _failed`. On acceptance it rewrites the effective fitness_metric
+    to `gen:<new id>` (observe-only — uncalibrated); on rejection it emits the
+    exact validation reasons + reviewer concerns and runs blind. `_robot_task_id`
+    derives the robot hint from config.toml.
+  - **Frontend** `components/RunsTab.tsx`: an "Objective metric generation" phase
+    card (folded from the `metric_generation_*` events) — live stage/attempt
+    while running; accepted (gen id) / rejected-with-reasons / failed outcomes.
+- **How / decision**: the pre-phase is ON by default for the sentinel (NOT a
+  default-off flag) so the feature is UI-reachable per the standing rule (no
+  terminal after ./run.sh); `SCULPTOR_LAUNCH_GEN=0` is a kill-switch (→ blind).
+  Events ride the SAME run WS — no new channel. Other fitness_metric values are
+  untouched, so default run behavior stays green.
+- **Verified (mocked LLM — no API/GPU)**: backend 338 (+2: accept → cmd points at
+  the generated metric.py with steer downgraded to observe; reject → reasons
+  event + blind, no `--fitness-metric`) + renamed disabled-blind test; frontend
+  `pnpm build` clean. The live smoke (a real generation in `./run.sh`) is the
+  remaining check.
+
 ### 2026-06-14 — Ship 42: fold "Generate from goal" into the fitness dropdown as a deferred (launch-time) option
 
 - **Why**: the standalone "Generate from goal" button is a ~1-2 min BLOCKING
