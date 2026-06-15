@@ -146,6 +146,24 @@ def compute_spec(arrays, behavior, meta):
     return {"spec_score": float(up * (1.0 - np.exp(-np.abs(jv).max() / 8.0)))}
 '''
 
+# §Ship 47: a kick metric that rewards upright leg-velocity bursts but does
+# NOT gate on a stationary base — the gen_005 failure that stalled g1-kick-v3.
+# It scores a forward WALKER high (gait hip/knee swings look like bursts), so
+# the walker ceiling must reject it for the kick family.
+WALKER_HACK = '''import numpy as np
+def compute_spec(arrays, behavior, meta):
+    jv = arrays.get("joint_vel"); grav = arrays.get("projected_gravity_b")
+    if jv is None or grav is None:
+        return {"spec_score": 0.0}
+    names = (meta or {}).get("joint_names", []) if isinstance(meta, dict) else []
+    legs = [i for i, n in enumerate(names)
+            if "hip" in n.lower() or "knee" in n.lower()]
+    sub = jv[..., legs] if (legs and len(names) == jv.shape[2]) else jv
+    up = float(np.mean(grav[..., 2] < -0.85))
+    peak = float(np.abs(sub).max())
+    return {"spec_score": float(np.clip(up * (1.0 - np.exp(-peak / 6.0)), 0.0, 1.0))}
+'''
+
 
 def _write(tmp_path: Path, name: str, src: str) -> Path:
     p = tmp_path / name
@@ -288,6 +306,46 @@ def test_validate_floss_metric_passes_with_family(tmp_path):
         GOOD_FLOSS, p, behavior_goal="flossing dance, arms in opposition")
     assert v["ok"], v["reasons"]
     assert v["family"] == "floss"
+
+
+# ── §Ship 47: forward-walker Goodhart (the g1-kick-v3 0.59 failure) ──────
+
+
+def test_walker_archetype_present_and_caught_for_kick(tmp_path):
+    """A kick metric that rewards leg bursts WITHOUT a stationarity gate
+    (the gen_005 failure) scores the forward `walker` archetype high; the
+    family-scoped ceiling rejects it even though its `active_kick` score
+    keeps it above every relative negative."""
+    p = _write(tmp_path, "walkhack.py", WALKER_HACK)
+    v = validate_generated_metric(
+        WALKER_HACK, p, behavior_goal="repeatedly kick forward with one leg")
+    assert v["family"] == "kick"
+    assert "walker" in v["archetype_scores"]
+    assert v["archetype_scores"]["walker"] > 0.3, v["archetype_scores"]
+    assert not v["ok"]
+    assert v["gates"]["nondegeneracy"] is False
+    assert any("walker" in r for r in v["reasons"]), v["reasons"]
+
+
+def test_good_kick_metric_clears_walker_ceiling(tmp_path):
+    """The correct stationary kick metric gates on a stationary base, so it
+    scores the forward walker BELOW the ceiling — the walker check must not
+    false-reject it."""
+    p = _write(tmp_path, "kick.py", GOOD_KICK)
+    v = validate_generated_metric(
+        GOOD_KICK, p, behavior_goal="repeatedly kick forward with one leg")
+    assert v["archetype_scores"]["walker"] < 0.3, v["archetype_scores"]
+    assert v["ok"], v["reasons"]
+
+
+def test_walker_ceiling_skipped_for_locomotion(tmp_path):
+    """The walker ceiling is scoped to stationary skills — a locomotion metric
+    (for which a walker IS the target) is NOT rejected by it."""
+    p = _write(tmp_path, "loco.py", GOOD)
+    v = validate_generated_metric(GOOD, p, behavior_goal="trot forward in a straight line")
+    assert v["family"] == "locomotion"
+    assert v["archetype_scores"]["walker"] > 0.3, v["archetype_scores"]  # walker scores high…
+    assert v["ok"], v["reasons"]                                          # …and that's fine
 
 
 def test_validate_flail_rejected_under_kick_family(tmp_path):

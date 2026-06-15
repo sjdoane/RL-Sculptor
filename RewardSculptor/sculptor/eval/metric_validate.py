@@ -271,10 +271,33 @@ def _archetypes() -> dict[str, dict]:
     rootj = np.zeros((T, E, 3)); rootj[..., 2] = zj[:, None]
     active_jump = arrays(jpj, jvj, _upright_g(), rootj)
 
+    # §Ship 47: a realistic forward WALKER — upright, at STANDING height
+    # (z≈0.70), travelling forward with FAST alternating hip/knee gait
+    # swings (peak ≈6 rad/s, well above any kick threshold). This is the
+    # exact Goodhart confound that stalled g1-kick-v3: a non-kicking gait
+    # that a naive kick metric scores high (the on-disk gen_005 metric
+    # scores it ~0.50). The existing `active` archetype could NOT catch
+    # this — its joint velocities are ~0.1 rad/s (smooth, small-amplitude)
+    # AND it sits at z=0.5, so a height/threshold-gated kick metric scores
+    # it ~0. A valid STATIONARY-skill metric (kick/floss/jump) must score
+    # the walker LOW; the family-scoped ceiling in validate_generated_metric
+    # enforces it. NOT a negative for locomotion (there a walker is the
+    # target) — see _STATIONARY_FAMILIES.
+    jpw = np.zeros((T, E, J))
+    phase = 2 * np.pi * 1.5 * t * 0.02       # 1.5 Hz gait
+    jpw[:, :, 0] = (0.64 * np.sin(phase))[:, None]            # left hip pitch
+    jpw[:, :, 2] = (0.51 * np.sin(phase))[:, None]            # left knee
+    jpw[:, :, 1] = (0.64 * np.sin(phase + np.pi))[:, None]    # right hip pitch
+    jpw[:, :, 3] = (0.51 * np.sin(phase + np.pi))[:, None]    # right knee
+    jvw = np.gradient(jpw, axis=0) / 0.02
+    rootw = np.zeros((T, E, 3)); rootw[..., 2] = 0.70
+    rootw[..., 0] = (t * 0.04)[:, None]      # forward travel
+    walker = arrays(jpw, jvw, _upright_g(), rootw)
+
     return {"still": still, "fallen": fallen, "chaotic": chaotic,
             "active": active, "upright_flail": upright_flail,
             "active_kick": active_kick, "active_floss": active_floss,
-            "active_jump": active_jump}
+            "active_jump": active_jump, "walker": walker}
 
 
 def _score(fn, arrays, meta) -> float:
@@ -283,11 +306,20 @@ def _score(fn, arrays, meta) -> float:
     return float(out.get("spec_score", float("nan")))
 
 
+# §Ship 47: skills performed from a roughly stationary base. For these a
+# forward WALKER is a Goodhart distractor that must score LOW; for the
+# locomotion family a walker IS the target, and for an unresolved family
+# (None) we don't gate (the calibration firewall is the task-validity check),
+# so the smell-test never false-rejects an ambiguous goal.
+_STATIONARY_FAMILIES = frozenset({"kick", "floss", "jump"})
+
+
 def validate_generated_metric(
     source: str,
     module_path: Path | str,
     *,
     spread_min: float = 0.1,
+    distractor_ceiling: float = 0.3,
     behavior_goal: Optional[str] = None,
     robot_hint: Optional[str] = None,
 ) -> dict[str, Any]:
@@ -406,6 +438,21 @@ def validate_generated_metric(
                     f"[nondegeneracy] '{low}' ({finite[low]:.3f}) scores >= the "
                     f"best positive '{best_key}' ({best_pos:.3f}) — rewards the "
                     f"wrong behavior")
+        # §Ship 47: stationary-skill walker ceiling. For kick/floss/jump a
+        # forward WALKER must score below an ABSOLUTE ceiling — a metric that
+        # gives a walker substantial credit is rewarding locomotion, not the
+        # skill (the g1-kick-v3 0.59 Goodhart: gen_005 scored a non-kicking
+        # walker ~0.59, yet its `active_kick` 0.90 kept it above every negative
+        # via the relative check above, so only an absolute ceiling catches
+        # it). Scoped to stationary families so a locomotion metric (walker =
+        # target) and an unresolved goal (family None) are never false-rejected.
+        if (family in _STATIONARY_FAMILIES and "walker" in finite
+                and finite["walker"] > distractor_ceiling):
+            nondegen = False
+            reasons.append(
+                f"[nondegeneracy] forward-walker 'walker' ({finite['walker']:.3f}) "
+                f"scores above the {distractor_ceiling} ceiling for the stationary "
+                f"'{family}' skill — the metric rewards walking, not the behavior")
     gates["nondegeneracy"] = nondegen
 
     ok = all(gates.values())

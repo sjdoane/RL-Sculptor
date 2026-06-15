@@ -437,19 +437,30 @@ def spec_g1_floss(
     }
 
 
+# §Ship 47: characteristic horizontal speed (units/frame) above which a
+# base is "travelling", not holding a stance. exp(-speed/scale) → ~0.49 for
+# the real g1-kick-v3 forward walker (0.0072/frame), ~0.02 for the fast
+# synthetic walker (0.04/frame), ~0.90 for a near-stationary kicker
+# (~0.001/frame). Tuned against the on-disk rollouts (see Ship 47 notes).
+_KICK_STATIONARY_SCALE = 0.01
+
+
 def spec_g1_kick(
     arrays: Mapping[str, np.ndarray],
     behavior: Mapping[str, Any],
     meta: Optional[Mapping[str, Any]] = None,
 ) -> dict[str, float]:
     """A kick = repeated high-speed LEG transients launched from an
-    upright stance. spec_score = saturating burst intensity × ratio
-    gate × uprightness. Bursts are leg-only when joint names exist
-    (arm-flailing is not kicking — audit H1) and count only within
-    fully-upright windows (falling is not kicking — audit H2). Ratio
-    gate ramps 2→5, calibrated on real recordings (standing ≈ 2.2–2.4,
-    real kicks ≈ 4.9–5.4); the p99 ratio also qualifies (rare kicks —
-    audit M3)."""
+    upright, roughly STATIONARY stance. spec_score = saturating burst
+    intensity × ratio gate × uprightness × stationarity. Bursts are
+    leg-only when joint names exist (arm-flailing is not kicking — audit
+    H1) and count only within fully-upright windows (falling is not
+    kicking — audit H2). Ratio gate ramps 2→5, calibrated on real
+    recordings (standing ≈ 2.2–2.4, real kicks ≈ 4.9–5.4); the p99 ratio
+    also qualifies (rare kicks — audit M3). §Ship 47: the stationarity
+    factor stops a forward WALKER from earning kick credit off gait
+    hip-swings (the g1-kick-v3 0.59 Goodhart) — 'balance on the other
+    leg' means the base should not travel."""
     names = list((meta or {}).get("joint_names") or [])
     jv = arrays["joint_vel"]
     legs = _match_joints(names, _LEG_TOKENS) if len(names) == jv.shape[2] else []
@@ -464,12 +475,23 @@ def spec_g1_kick(
     # robust signal. spec_score is unchanged pending real-rollout calibration.
     ev = kick_events_score(jv, arrays["projected_gravity_b"],
                            joint_indices=legs or None)
+    # §Ship 47: stationarity gate. Degrade to 1.0 (no gate) when
+    # root_link_pos_w is absent so synthetic ladders/callers that omit it
+    # (and the existing leg-only unit tests) are unchanged.
+    root = arrays.get("root_link_pos_w")
+    if root is not None:
+        speed = float(horizontal_speed(root)["speed_per_frame"])
+        stationarity = float(np.clip(np.exp(-speed / _KICK_STATIONARY_SCALE), 0.0, 1.0))
+    else:
+        speed, stationarity = 0.0, 1.0
     return {
         **b,
         **ev,
         "uprightness": up,
         "leg_subset": 1.0 if legs else 0.0,
-        "spec_score": float(np.clip(intensity * ratio_gate * up, 0.0, 1.0)),
+        "stationarity": stationarity,
+        "horizontal_speed": speed,
+        "spec_score": float(np.clip(intensity * ratio_gate * up * stationarity, 0.0, 1.0)),
     }
 
 
@@ -623,7 +645,11 @@ _REQUIRED_ARRAYS: dict[str, tuple[str, ...]] = {
     "cartpole_balance": (),
     "g1_floss": ("joint_pos", "projected_gravity_b"),
     "g1_jump": ("root_link_pos_w", "projected_gravity_b"),
-    "g1_kick": ("joint_vel", "projected_gravity_b"),
+    # §Ship 47: g1_kick now also loads root_link_pos_w for the stationarity
+    # gate (mjlab always writes it to trajectory.npz). The in-fn guard keeps
+    # direct callers that omit it (synthetic ladders, leg-only unit tests)
+    # working with stationarity=1.0.
+    "g1_kick": ("joint_vel", "projected_gravity_b", "root_link_pos_w"),
     "go1_trot": ("root_link_pos_w", "projected_gravity_b"),
 }
 

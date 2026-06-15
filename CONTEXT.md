@@ -339,6 +339,47 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-15 — Ship 47: metric hardening — a forward WALKER can no longer earn KICK credit
+
+- **What**: `RewardSculptor/sculptor/eval/spec_metrics.py` — `spec_g1_kick`
+  gains a stationarity factor (`spec_score *= exp(-horizontal_speed/_KICK_STATIONARY_SCALE)`,
+  scale 0.01), and `root_link_pos_w` is added to `_REQUIRED_ARRAYS["g1_kick"]`
+  (in-fn guard → stationarity=1.0 when absent). `RewardSculptor/sculptor/eval/metric_validate.py`
+  — new realistic `walker` archetype (upright, standing height z≈0.70, forward
+  travel + fast 1.5 Hz hip/knee gait swings ~6 rad/s) and a family-scoped
+  `distractor_ceiling` (0.3): for `_STATIONARY_FAMILIES = {kick, floss, jump}`
+  the walker must score below the ceiling. Prompts `gen_objective_metric.md`
+  (+ stationarity rule) and `review_objective_metric.md` (walker gaming vector
+  + the stale "four archetypes" → the full battery). Tests in
+  `test_spec_metrics.py` + `test_generated_metric.py`.
+- **Why**: the g1-kick-v3 fitness metric (`gen_005`) scored a non-kicking
+  forward WALKER ~0.59 — Goodhart partial credit (upright + rest + walking
+  hip-swings mistaken for kicks). It passed calibration (Spearman 1.0 on the
+  stationary kick ladder) and the non-degeneracy gate because the only synthetic
+  walker (`active`) has ~0.1 rad/s leg velocities + z=0.5 — far too gentle to
+  trip any kick detector, so no gate ever tested a real gait. Calibration is
+  synthetic-only with no real-rollout check.
+- **How**: (1) The builtin `g1_kick` (a ground-truth metric + a directly
+  selectable steering metric) now gates on a roughly stationary base — drops the
+  REAL g1-kick-v3 walker from 0.29→0.14 while leaving the stationary `active_kick`
+  (0.72) and the all-stationary calibration ladder unchanged (so no calibration
+  regression). (2) A realistic `walker` archetype faithfully reproduces the
+  confound (the on-disk `gen_005` scores it 0.50, vs 0.0 for the gentle `active`).
+  (3) DEVIATION FROM PLAN, justified: instead of a blanket walker-negative, the
+  ceiling is scoped to stationary families and uses an ABSOLUTE threshold — a
+  blanket negative would false-reject LOCOMOTION metrics (a walker IS the
+  locomotion positive), and the existing relative `>= best_pos` check can't catch
+  gen_005 (walker 0.59 < its active_kick 0.90). Verified: re-running the validator
+  on the real `gen_005` now returns ok=False ("walker 0.501 > 0.3 ceiling") — it
+  would run observe-only, forcing the launch-gen retry to produce a walker-robust
+  metric. Deeper real-rollout/task-derived recalibration remains future work
+  (DESIGN_autonomous_metric_eval.md Ships 50–55).
+- **Verified**: sculptor `pytest tests/` (see run), backend `pytest -k 'not
+  test_reward_prompt_edit_emits'`. Targeted: `test_kick_penalizes_forward_travel`,
+  `test_walker_archetype_present_and_caught_for_kick`,
+  `test_good_kick_metric_clears_walker_ceiling`,
+  `test_walker_ceiling_skipped_for_locomotion`.
+
 ### 2026-06-15 — Ship 46: mjlab G1 reward contract exposes per-foot KICK channels (the unblocker)
 
 - **What**: `RewardSculptor/sculptor/adapters/mjlab.py` — new `_G1_INFO_EXTRA`

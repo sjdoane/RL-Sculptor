@@ -41,6 +41,12 @@ HARD RULES (a violation means the metric is rejected):
        a level torso at ground height is not walking).
      - Gate "kick"/transient tasks on upright windows + a return-to-rest
        (continuous motion is not a discrete kick).
+     - For a skill performed FROM A STANDING STANCE (kick, balance, floss,
+       in-place jump), gate on a roughly STATIONARY base — multiply by
+       `exp(-horizontal_speed / scale)` using `root_link_pos_w`. A forward
+       WALKER must score LOW: its gait hip/knee swings look like bursts, so
+       a metric that doesn't penalise base travel rewards walking, not the
+       skill (this is the exact failure that stalled a real kick run).
      - For rhythmic/periodic goals, measure structure (e.g. anti-phase),
        not just that something oscillates.
   6. Use a SATURATING form for unbounded quantities, e.g.

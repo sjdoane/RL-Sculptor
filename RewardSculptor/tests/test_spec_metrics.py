@@ -468,6 +468,32 @@ def test_kick_clean_kicker_scores_high_not_zero() -> None:
     assert out["burst_ratio_p95"] > 2.0, out     # floor → real ratio, not 0
 
 
+def test_kick_penalizes_forward_travel() -> None:
+    """§Ship 47: identical leg bursts score much LOWER from a TRAVELLING base
+    than a stationary one — the stationarity gate stops a forward walker from
+    earning kick credit off gait swings (the g1-kick-v3 Goodhart). The
+    stationary kicker stays high; the guard keeps callers that omit
+    root_link_pos_w unchanged."""
+    jv = np.zeros((T, E, J), dtype=np.float32)
+    for t0 in range(25, T, 50):
+        jv[t0:t0 + 3, :, 2] = 8.0                # left_knee bursts
+    g = _upright_g()
+    still_root = np.zeros((T, E, 3), dtype=np.float32); still_root[:, :, 2] = 0.70
+    travel_root = still_root.copy()
+    travel_root[:, :, 0] = (np.arange(T) * 0.04)[:, None]
+    meta = {"joint_names": _NAMES_12}
+    stationary = spec_g1_kick(
+        {"joint_vel": jv, "projected_gravity_b": g, "root_link_pos_w": still_root}, {}, meta)
+    walking = spec_g1_kick(
+        {"joint_vel": jv, "projected_gravity_b": g, "root_link_pos_w": travel_root}, {}, meta)
+    no_root = spec_g1_kick({"joint_vel": jv, "projected_gravity_b": g}, {}, meta)
+    assert stationary["spec_score"] > 0.5, stationary
+    assert walking["spec_score"] < 0.5 * stationary["spec_score"], (walking, stationary)
+    assert stationary["stationarity"] > 0.9 and walking["stationarity"] < 0.2
+    # Guard: omitting root_link_pos_w must leave the score unchanged (==1.0 gate).
+    assert no_root["spec_score"] == pytest.approx(stationary["spec_score"])
+
+
 def test_kick_events_monotone_and_robust_to_baseline_motion() -> None:
     """§Ship 36: the discrete kick-EVENT count is monotone in genuine kicks
     and INVARIANT to competence-neutral sub-threshold baseline motion — the
