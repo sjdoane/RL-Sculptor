@@ -126,7 +126,7 @@ async def _generate_at_launch(
     on_event callback fires in that thread, so events are marshalled back
     onto the event loop with call_soon_threadsafe (Job.emit's subscriber
     queues are not thread-safe)."""
-    from backend.services import metric_store
+    from backend.services import metric_store, sculptor_bridge
 
     loop = asyncio.get_running_loop()
 
@@ -154,11 +154,35 @@ async def _generate_at_launch(
     metric_store.clear_progress(project_dir)
 
     if rec.get("accepted"):
+        gid = rec.get("id")
         job.emit({"type": "metric_generated", "source": "launch_gen",
-                  "gen_id": rec.get("id"), "accepted": True,
-                  "behavior_goal": behavior_goal,
-                  "calibrated": bool(rec.get("calibrated"))})
-        return f"gen:{rec['id']}"
+                  "gen_id": gid, "accepted": True,
+                  "behavior_goal": behavior_goal})
+        # §Ship 44: auto-calibrate at launch against the family's built-in
+        # ground truth (offline, no GPU). On pass the metric earns steer-rights
+        # (the cmd-build's steer_allowed reads the now-calibrated meta.json);
+        # else it stays observe-only — the firewall never lets an uncalibrated
+        # metric steer.
+        builtin = sculptor_bridge.resolve_calibration_builtin(behavior_goal, robot_hint)
+        if builtin and gid:
+            job.emit({"type": "metric_calibration_started", "source": "launch_gen",
+                      "gen_id": gid, "builtin": builtin})
+            try:
+                cal = await asyncio.to_thread(
+                    metric_store.calibrate, project_dir, gid, builtin)
+                job.emit({"type": "metric_calibration_done", "source": "launch_gen",
+                          "gen_id": gid, "builtin": builtin,
+                          "calibrated": bool(cal.get("calibrated")),
+                          "spearman": (cal.get("calibration") or {}).get("spearman")})
+            except Exception as e:  # noqa: BLE001 — calibration failure ≠ run failure
+                job.emit({"type": "metric_calibration_done", "source": "launch_gen",
+                          "gen_id": gid, "builtin": builtin, "calibrated": False,
+                          "error": f"{type(e).__name__}: {e}"})
+        else:
+            job.emit({"type": "metric_calibration_skipped", "source": "launch_gen",
+                      "gen_id": gid,
+                      "reason": "no matching built-in ground truth — observe-only"})
+        return f"gen:{gid}"
 
     # Rejected — surface WHY (validation gate reasons + reviewer concerns).
     job.emit({"type": "metric_generation_rejected", "source": "launch_gen",
@@ -281,11 +305,17 @@ def run_sculpt_job(
         # (→ blind, the Ship-42 fallback). Other fitness_metric values are
         # untouched, so default run behavior stays green.
         eff_fitness_metric = fitness_metric
+        eff_fitness_mode = fitness_mode
         if (eff_fitness_metric == LAUNCH_GEN_SENTINEL
                 and os.environ.get("SCULPTOR_LAUNCH_GEN", "1") != "0"
                 and not cancel.is_set()):
             eff_fitness_metric = await _generate_at_launch(
                 job, project_dir, behavior_goal)
+            # §Ship 44: a launch-generated metric STEERS iff it earned
+            # steer-rights via launch-time calibration; request steer and let
+            # the steer_allowed firewall below downgrade to observe otherwise.
+            if eff_fitness_metric is not None:
+                eff_fitness_mode = "steer"
 
         cmd = [
             sys.executable, "-m", "sculptor.cli",
@@ -331,6 +361,7 @@ def run_sculpt_job(
             )
         if early_stop_patience is not None:
             cmd += ["--early-stop-patience", str(int(early_stop_patience))]
+        final_fitness_mode: Optional[str] = None
         if eff_fitness_metric:
             # §Ship 35: a generated metric is referenced as "gen:<id>";
             # resolve it to the project's metric.py path the CLI can load.
@@ -341,16 +372,17 @@ def run_sculpt_job(
             resolved = _resolve_fitness_metric(project_dir, str(eff_fitness_metric))
             if resolved is not None:
                 cmd += ["--fitness-metric", resolved]
-                # §Ship 35 review: downgrade steer→observe for an
-                # uncalibrated generated metric (backend-enforced, not just
-                # the UI). A launch-generated metric is uncalibrated by
-                # default, so it observes until Ship-44 calibration passes.
-                eff_mode = fitness_mode
+                # §Ship 35 review: downgrade steer→observe for an uncalibrated
+                # generated metric (backend-enforced, not just the UI). §Ship 44:
+                # a launch-generated metric that PASSED launch-time calibration
+                # has calibrated=true in its meta → steer_allowed lets it steer.
+                eff_mode = eff_fitness_mode
                 if eff_mode == "steer" and not steer_allowed(
                         project_dir, str(eff_fitness_metric)):
                     eff_mode = "observe"
                 if eff_mode in ("observe", "steer"):
                     cmd += ["--fitness-mode", str(eff_mode)]
+                    final_fitness_mode = eff_mode
 
         # §Ship 39 (H1): wire the interactive control sidecar. Written ALWAYS
         # (deterministic path) so the Auto/Manual toggle works at any point
@@ -387,9 +419,10 @@ def run_sculpt_job(
             ("early_stop_patience", early_stop_patience),
             # §Ship 43: persist the RESOLVED metric (the launch-generated
             # gen:<id> when the sentinel was used) so the Runs view shows what
-            # actually steers; None (rejected/blind) is skipped below.
+            # actually steers; None (rejected/blind) is skipped below. §Ship 44:
+            # persist the POST-firewall effective mode (steer iff calibrated).
             ("fitness_metric", eff_fitness_metric),
-            ("fitness_mode", fitness_mode if eff_fitness_metric else None),
+            ("fitness_mode", final_fitness_mode),
         ):
             if val is not None:
                 job.params.setdefault(key, val)

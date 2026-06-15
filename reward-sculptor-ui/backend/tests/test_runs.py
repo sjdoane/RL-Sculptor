@@ -761,6 +761,75 @@ def test_run_sculpt_job_launch_gen_rejected_runs_blind(
     assert "--fitness-metric" not in captured["cmd"], captured["cmd"]
 
 
+def _run_launch_gen_with_calibration(
+    tmp_path, monkeypatch, *, calibrates: bool, slug: str,
+):
+    """§Ship 44 helper: run the launch-gen pre-phase with a mocked generation
+    (accept) + a mocked calibration outcome; return (job, captured cmd)."""
+    import asyncio
+
+    from backend.services import run_manager, sculptor_bridge
+    from backend.services.job_manager import Job
+
+    monkeypatch.setattr(sculptor_bridge, "generate_objective_metric",
+                        _fake_bridge_gen(accept=True))
+    monkeypatch.setattr(
+        sculptor_bridge, "calibrate_objective_metric",
+        lambda metric_path, builtin, threshold=0.7: {
+            "ok": calibrates, "spearman": 0.95 if calibrates else 0.2,
+            "builtin": builtin, "threshold": threshold})
+    project_dir = tmp_path / slug
+    project_dir.mkdir()
+    captured: dict = {}
+
+    class _Sentinel(Exception):
+        pass
+
+    async def _fake_exec(*args, **kwargs):
+        captured["cmd"] = list(args)
+        raise _Sentinel()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+    runner = run_manager.run_sculpt_job(
+        project_dir=project_dir,
+        run_params={"behavior_goal": "repeatedly kick with one leg", "iterations": 1,
+                    "fitness_metric": "generate-at-launch", "fitness_mode": "observe"},
+    )
+    job = Job(job_id=f"t_{slug}", kind="sculpt_run", project_slug=slug, status="running")
+    job._cancel = asyncio.Event()
+    with pytest.raises(_Sentinel):
+        asyncio.run(runner(job, job._cancel))
+    return job, captured["cmd"]
+
+
+def test_run_sculpt_job_launch_gen_calibrates_and_steers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """§Ship 44: a launch-generated kick metric that PASSES calibration vs
+    g1_kick earns steer-rights — the cmd gets --fitness-mode steer even though
+    the launch request was observe (uncalibrated at selection time)."""
+    job, cmd = _run_launch_gen_with_calibration(
+        tmp_path, monkeypatch, calibrates=True, slug="lg-cal-ok")
+    assert "--fitness-metric" in cmd
+    assert cmd[cmd.index("--fitness-mode") + 1] == "steer", cmd
+    done = [e for e in job.events if e.get("type") == "metric_calibration_done"]
+    assert done and done[0]["calibrated"] is True, [e.get("type") for e in job.events]
+    assert done[0]["builtin"] == "g1_kick"
+
+
+def test_run_sculpt_job_launch_gen_uncalibrated_stays_observe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """§Ship 44: a launch-generated metric that FAILS calibration stays
+    observe-only — the firewall holds (steer downgraded)."""
+    job, cmd = _run_launch_gen_with_calibration(
+        tmp_path, monkeypatch, calibrates=False, slug="lg-cal-no")
+    assert "--fitness-metric" in cmd
+    assert cmd[cmd.index("--fitness-mode") + 1] == "observe", cmd
+    done = [e for e in job.events if e.get("type") == "metric_calibration_done"]
+    assert done and done[0]["calibrated"] is False
+
+
 def test_build_mission_run_flags_includes_fitness_metric(tmp_path) -> None:
     """RunMissionRequest.fitness_metric must become `--fitness-metric`
     on the `sculpt mission-run` CLI; absent when unset. A built-in name

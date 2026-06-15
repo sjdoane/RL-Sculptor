@@ -185,3 +185,26 @@ def builtin_spec_metric_names() -> list[str]:
     from sculptor.eval import spec_metric_names
 
     return spec_metric_names()
+
+
+def resolve_calibration_builtin(
+    behavior_goal: str, robot_hint: Optional[str] = None,
+) -> Optional[str]:
+    """§Ship 44: map a behavior goal to the hand-authored built-in a
+    launch-generated metric should calibrate against (kick→g1_kick,
+    floss→g1_floss, jump→g1_jump, locomotion→go1_trot, balance→cartpole).
+    Returns None when no family matches (the metric then stays observe-only —
+    the firewall never lets an uncalibrated metric steer). Never raises."""
+    try:
+        from sculptor.eval.metric_validate import (
+            FAMILY_TO_BUILTIN,
+            resolve_behavior_family,
+        )
+
+        fam = resolve_behavior_family(behavior_goal, robot_hint)
+        builtin = FAMILY_TO_BUILTIN.get(fam) if fam else None
+        if builtin and builtin in builtin_spec_metric_names():
+            return builtin
+    except Exception:  # noqa: BLE001 — resolution is best-effort
+        pass
+    return None

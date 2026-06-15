@@ -314,13 +314,18 @@ function RunDetailPane({ slug, runId, runs }: { slug: string; runId: string; run
     let reasons: string[] = [];
     let concerns: string[] = [];
     let errorMsg: string | null = null;
+    // §Ship 44: launch-time calibration outcome.
+    let calib: {
+      status: "running" | "done" | "skipped";
+      builtin?: string; calibrated?: boolean; spearman?: number | null;
+    } | null = null;
     for (const ev of events.events) {
       const e = ev as {
         type?: string; stage?: string; message?: string; attempt?: number;
         max?: number; gen_id?: string; reasons?: string[]; concerns?: string[];
-        error?: string;
+        error?: string; builtin?: string; calibrated?: boolean; spearman?: number | null;
       };
-      if (e.type === "metric_generation_started") { started = true; outcome = null; last = null; }
+      if (e.type === "metric_generation_started") { started = true; outcome = null; last = null; calib = null; }
       else if (e.type === "metric_generation_progress") {
         last = { stage: e.stage, message: e.message, attempt: e.attempt, max: e.max };
       }
@@ -330,8 +335,13 @@ function RunDetailPane({ slug, runId, runs }: { slug: string; runId: string; run
         reasons = e.reasons ?? []; concerns = e.concerns ?? [];
       }
       else if (e.type === "metric_generation_failed") { outcome = "failed"; errorMsg = e.error ?? null; }
+      else if (e.type === "metric_calibration_started") { calib = { status: "running", builtin: e.builtin }; }
+      else if (e.type === "metric_calibration_done") {
+        calib = { status: "done", builtin: e.builtin, calibrated: e.calibrated, spearman: e.spearman };
+      }
+      else if (e.type === "metric_calibration_skipped") { calib = { status: "skipped" }; }
     }
-    return started ? { last, outcome, genId, reasons, concerns, errorMsg } : null;
+    return started ? { last, outcome, genId, reasons, concerns, errorMsg, calib } : null;
   }, [events.events]);
 
   const summary = useMemo(() => runs.find((r) => r.run_id === runId) ?? null, [runs, runId]);
@@ -780,9 +790,13 @@ function MetricGenPhase({ phase }: {
     reasons: string[];
     concerns: string[];
     errorMsg: string | null;
+    calib: {
+      status: "running" | "done" | "skipped";
+      builtin?: string; calibrated?: boolean; spearman?: number | null;
+    } | null;
   };
 }) {
-  const { last, outcome, genId, reasons, concerns, errorMsg } = phase;
+  const { last, outcome, genId, reasons, concerns, errorMsg, calib } = phase;
   const running = outcome === null;
   const bad = outcome === "rejected" || outcome === "failed";
   const tone = outcome === "accepted" ? "var(--st-green-fg, var(--ink))"
@@ -808,9 +822,35 @@ function MetricGenPhase({ phase }: {
           </div>
         )}
         {outcome === "accepted" && (
-          <div style={{ color: tone }}>
-            Generated <code className="mono">{genId}</code> — runs observe-only;
-            auto-calibrated against a matching built-in, and steers if it passes.
+          <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+            <div style={{ color: tone }}>
+              Generated <code className="mono">{genId}</code>.
+            </div>
+            {calib?.status === "running" && (
+              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                <Icon name="loader" size={12} />
+                <span>Calibrating vs <code className="mono">{calib.builtin}</code>…</span>
+              </div>
+            )}
+            {calib?.status === "done" && calib.calibrated && (
+              <div style={{ color: "var(--st-green-fg, var(--ink))" }}>
+                Calibrated vs <code className="mono">{calib.builtin}</code>
+                {typeof calib.spearman === "number" ? ` (Spearman ${calib.spearman})` : ""}
+                {" "}— <strong>steering</strong> the run.
+              </div>
+            )}
+            {calib?.status === "done" && !calib.calibrated && (
+              <div style={{ color: "var(--st-amber-fg)" }}>
+                Did not pass calibration vs <code className="mono">{calib.builtin}</code>
+                {typeof calib.spearman === "number" ? ` (Spearman ${calib.spearman} < 0.7)` : ""}
+                {" "}— runs <strong>observe-only</strong>.
+              </div>
+            )}
+            {calib?.status === "skipped" && (
+              <div style={{ color: "var(--rs-muted)" }}>
+                No matching built-in ground truth — runs observe-only.
+              </div>
+            )}
           </div>
         )}
         {outcome === "failed" && (

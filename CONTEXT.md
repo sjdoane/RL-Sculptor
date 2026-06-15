@@ -339,6 +339,32 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-14 — Ship 44: auto-calibrate the launch-generated metric → steer if it earns it
+
+- **Why**: a launch-generated metric is observe-only by default; to "carry
+  through the run" (steer) it must earn steer-rights via calibration. Composes
+  the Ship-35 firewall with launch-time generation.
+- **What**:
+  - **Backend** `services/sculptor_bridge.py`: `resolve_calibration_builtin(goal,
+    robot_hint)` → the family's built-in ground truth (kick→g1_kick, floss→g1_floss,
+    jump→g1_jump, locomotion→go1_trot, balance→cartpole) via sculptor's
+    `resolve_behavior_family` + `FAMILY_TO_BUILTIN`; None when no family matches.
+  - `services/run_manager.py`: after the pre-phase accepts a metric,
+    auto-calibrate (offline, no GPU) vs the resolved built-in, emitting
+    `metric_calibration_started / _done / _skipped`. On pass the metric's
+    meta.json gets `calibrated=true` → `steer_allowed` lets it steer; the runner
+    requests steer for a launch-generated metric and the EXISTING firewall
+    downgrades to observe if calibration didn't pass. Persists the post-firewall
+    effective mode.
+  - **Frontend** `components/RunsTab.tsx`: the generation phase card renders the
+    calibration outcome (calibrating… / calibrated (Spearman) — steering / not
+    calibrated — observe-only / no-match — observe-only).
+- **How / firewall**: unchanged — `steer_allowed` reads the calibrated meta; an
+  uncalibrated metric can never steer (defense-in-depth in the cmd-build).
+- **Verified (mocked LLM + calibration — no API/GPU)**: backend 340 (+2:
+  calibrates → `--fitness-mode steer` + `metric_calibration_done` calibrated=true;
+  fails → observe) ; frontend `pnpm build` clean.
+
 ### 2026-06-14 — Ship 43: launch-time objective-metric generation as run-phase 0 (streamed into the Runs timeline)
 
 - **Why**: when the user picks "Generate at launch" (Ship 42), generation should
