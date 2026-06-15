@@ -26,10 +26,23 @@ from typing import Any, Callable, Optional
 
 import numpy as np
 
+from sculptor.eval.joint_resolver import (
+    assert_name_axis_contract,
+    resolve_joint_roles,
+)
 from sculptor.eval.spec_metrics import _CAPTURE_KEYS, _SPEC_FNS, make_spec_fitness_fn
 
 #: The function a generated metric module must define.
 GENERATED_FN_NAME = "compute_spec"
+
+#: §Ship 49: optional module-level constant a generated metric declares to
+#: name the canonical joint ROLES it needs (e.g.
+#: `REQUIRED_JOINT_ROLES = ["left_hip_pitch", "left_knee"]`). The runtime
+#: resolves these against the rollout's live `joint_names` and hands the
+#: metric `meta["joint_roles"] = {role: index}` — so the metric never does
+#: its own brittle name matching, and a role that can't be resolved HARD-
+#: FAILS loudly instead of silently scoring the wrong joint.
+REQUIRED_ROLES_ATTR = "REQUIRED_JOINT_ROLES"
 
 #: Physical rollout arrays a generated metric MAY read (the full contract —
 #: the validator enforces a metric references only these). Mirrors the
@@ -43,9 +56,9 @@ ALLOWED_ARRAYS = (
 )
 
 
-def load_generated_metric(module_path: Path | str) -> Callable[..., dict]:
-    """Import a generated-metric module and return its `compute_spec`. Uses
-    a unique module name so re-loading an edited metric never hits a stale
+def load_generated_module(module_path: Path | str):
+    """Import a generated-metric module and return the MODULE. Uses a unique
+    module name so re-loading an edited metric never hits a stale
     sys.modules entry."""
     module_path = Path(module_path)
     spec = importlib.util.spec_from_file_location(
@@ -56,6 +69,12 @@ def load_generated_metric(module_path: Path | str) -> Callable[..., dict]:
         raise ImportError(f"cannot load generated metric at {module_path}")
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
+    return mod
+
+
+def load_generated_metric(module_path: Path | str) -> Callable[..., dict]:
+    """Import a generated-metric module and return its `compute_spec`."""
+    mod = load_generated_module(module_path)
     fn = getattr(mod, GENERATED_FN_NAME, None)
     if not callable(fn):
         raise ValueError(
@@ -63,6 +82,44 @@ def load_generated_metric(module_path: Path | str) -> Callable[..., dict]:
             f"{GENERATED_FN_NAME}()"
         )
     return fn
+
+
+def read_required_roles(module_or_path) -> list[str]:
+    """The canonical joint roles a metric declares via `REQUIRED_JOINT_ROLES`
+    (empty list when undeclared — a legacy metric that does its own matching).
+    Accepts a loaded module or a path."""
+    mod = (module_or_path if hasattr(module_or_path, REQUIRED_ROLES_ATTR)
+           or not isinstance(module_or_path, (str, Path))
+           else load_generated_module(module_or_path))
+    roles = getattr(mod, REQUIRED_ROLES_ATTR, None)
+    if not roles:
+        return []
+    try:
+        return [str(r) for r in roles]
+    except TypeError:
+        return []
+
+
+def inject_joint_roles(
+    meta: dict[str, Any], required_roles: list[str], *, lenient: bool = False,
+) -> Optional[str]:
+    """Resolve `required_roles` against `meta["joint_names"]` and set
+    `meta["joint_roles"] = {role: index}` IN PLACE. Returns None on success,
+    or a human-readable error string when a role is missing/ambiguous (the
+    caller then HARD-FAILS the score rather than letting the metric read the
+    wrong joint). A metric with no required roles is a no-op."""
+    if not required_roles:
+        meta.setdefault("joint_roles", {})
+        return None
+    names = list(meta.get("joint_names") or [])
+    if not names:
+        return (f"metric requires joint roles {required_roles} but the "
+                f"rollout persisted no joint_names")
+    res = resolve_joint_roles(names, required_roles, lenient=lenient)
+    meta["joint_roles"] = dict(res.resolved)
+    if not res.ok:
+        return "; ".join(res.problems())
+    return None
 
 
 def compute_generated_metric(
@@ -103,7 +160,35 @@ def compute_generated_metric(
                 for k in ALLOWED_ARRAYS:
                     if k in z.files:
                         arrays[k] = z[k]
-        fn = load_generated_metric(module_path)
+        mod = load_generated_module(module_path)
+        fn = getattr(mod, GENERATED_FN_NAME, None)
+        if not callable(fn):
+            return {"spec_score": 0.0,
+                    "error": f"metric lacks a callable {GENERATED_FN_NAME}()"}
+        # §Ship 49: resolve the metric's declared joint roles against THIS
+        # rollout's live joint_names and hand them over as meta["joint_roles"].
+        # The name↔buffer order-contract is asserted first (a names list that
+        # doesn't span the joint axis is untrustworthy → degrade, don't index
+        # by it); an unresolvable role HARD-FAILS to an honest, observable 0.0
+        # instead of silently scoring a wrong/foreign joint.
+        roles = read_required_roles(mod)
+        if roles:
+            jarr = arrays.get("joint_pos")
+            if jarr is None:
+                jarr = arrays.get("joint_vel")
+            names = list(meta.get("joint_names") or [])
+            if jarr is not None and names:
+                try:
+                    assert_name_axis_contract(names, jarr.shape[2])
+                except Exception as e:  # noqa: BLE001 — contract break → drop names
+                    meta["joint_names"] = []
+                    return {"spec_score": 0.0,
+                            "error": f"joint-name contract: {e}"}
+            role_err = inject_joint_roles(meta, roles)
+            if role_err:
+                return {"spec_score": 0.0,
+                        "joint_roles": meta.get("joint_roles", {}),
+                        "error": f"unresolved joint roles: {role_err}"}
         out = fn(arrays, behavior, meta)
         if not isinstance(out, dict) or "spec_score" not in out:
             return {"spec_score": 0.0,
@@ -113,7 +198,13 @@ def compute_generated_metric(
             return {"spec_score": 0.0, "error": "spec_score not finite"}
         out["spec_score"] = float(np.clip(score, 0.0, 1.0))
         capture = {k: behavior.get(k) for k in _CAPTURE_KEYS if k in behavior}
-        return {**out, "capture": capture}
+        result = {**out, "capture": capture}
+        # §Ship 49: surface the resolved role→index map so the diagnoser /
+        # realism audit can verify the SAME joints were read each run (drift
+        # across robots/adapters is then observable, not silent).
+        if meta.get("joint_roles"):
+            result.setdefault("joint_roles", dict(meta["joint_roles"]))
+        return result
     except Exception as e:  # noqa: BLE001 — zero, observably
         return {"spec_score": 0.0, "error": f"{type(e).__name__}: {e}"}
 

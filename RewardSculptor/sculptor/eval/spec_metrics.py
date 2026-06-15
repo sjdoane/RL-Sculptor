@@ -48,18 +48,17 @@ from typing import Any, Callable, Mapping, Optional, Sequence
 
 import numpy as np
 
+from sculptor.eval.joint_resolver import (
+    arm_indices,
+    hip_indices,
+    leg_sagittal_indices,
+)
+
 # ── joint-name group matchers ────────────────────────────────────────
-
-_LEG_TOKENS = ("hip", "knee", "ankle")
-_HIP_TOKENS = ("hip",)
-_ARM_TOKENS = ("shoulder", "elbow")
-
-
-def _match_joints(names: Sequence[str], tokens: Sequence[str]) -> list[int]:
-    return [
-        i for i, n in enumerate(names)
-        if any(t in str(n).lower() for t in tokens)
-    ]
+# §Ship 49: the ad-hoc substring `_match_joints` (which grabbed hip
+# roll/yaw alongside the forward-kick hip pitch) is retired in favour of the
+# canonical, direction-aware resolver in joint_resolver.py. The built-ins
+# select via `leg_sagittal_indices` / `hip_indices` / `arm_indices`.
 
 
 # ── shared signal helpers ────────────────────────────────────────────
@@ -416,8 +415,8 @@ def spec_g1_floss(
     checked = 0.0
     extras: dict[str, float] = {}
     if len(names) == jp.shape[2]:
-        hips = _match_joints(names, _HIP_TOKENS)
-        arms = _match_joints(names, _ARM_TOKENS)
+        hips = hip_indices(names)
+        arms = arm_indices(names)
         if hips and arms:
             opp = opposition_score(jp, hips, arms)
             extras = opp
@@ -463,7 +462,11 @@ def spec_g1_kick(
     leg' means the base should not travel."""
     names = list((meta or {}).get("joint_names") or [])
     jv = arrays["joint_vel"]
-    legs = _match_joints(names, _LEG_TOKENS) if len(names) == jv.shape[2] else []
+    # §Ship 49: SAGITTAL-plane legs only (hip pitch + knee + ankle pitch),
+    # excluding hip roll/yaw. A forward kick lives in the sagittal plane, so
+    # a sideways (hip-roll) kick no longer earns burst credit — the
+    # g1-kick-v4 "kicks but sideways" gap, fixed at the ground-truth level.
+    legs = leg_sagittal_indices(names) if len(names) == jv.shape[2] else []
     mask = upright_mask(arrays["projected_gravity_b"])
     b = burstiness(jv, joint_indices=legs or None, valid_mask=mask)
     up = uprightness(arrays["projected_gravity_b"])

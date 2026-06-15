@@ -72,16 +72,24 @@ def compute_spec(arrays, behavior, meta):
     return {"spec_score": float(np.clip(motion / 5.0 * up, 0.0, 1.0))}
 '''
 
-# §Ship 41: a CORRECT kick metric — leg-velocity bursts from a STATIONARY,
+# §Ship 41/49: a CORRECT kick metric — leg-velocity bursts from a STATIONARY,
 # upright, standing-height stance. It needs all four arrays (returns 0.0 if any
 # is missing), so the old locomotion-only `active` archetype scored it ~0
 # (stationary → no travel) and the ladder (no root/joint_pos) couldn't
-# calibrate it. The kick family archetype + enriched ladder fix both.
+# calibrate it. §Ship 49: declares REQUIRED_JOINT_ROLES and reads the knees via
+# meta["joint_roles"] — the safe, permutation-robust pattern (the old
+# `jv[..., 2:4]` hard-coded indices that point at left_hip_yaw+left_knee on a
+# real 29-DOF G1, and the permutation gate now rejects them).
 GOOD_KICK = '''import numpy as np
+REQUIRED_JOINT_ROLES = ["left_knee", "right_knee"]
 def compute_spec(arrays, behavior, meta):
     jv = arrays.get("joint_vel"); grav = arrays.get("projected_gravity_b")
     root = arrays.get("root_link_pos_w"); jp = arrays.get("joint_pos")
     if jv is None or grav is None or root is None or jp is None:
+        return {"spec_score": 0.0}
+    roles = (meta or {}).get("joint_roles", {}) if isinstance(meta, dict) else {}
+    knees = [roles[r] for r in ("left_knee", "right_knee") if r in roles]
+    if not knees:
         return {"spec_score": 0.0}
     up = float(np.mean(grav[..., 2] < -0.85))
     xy = root[..., :2]
@@ -89,7 +97,7 @@ def compute_spec(arrays, behavior, meta):
     stationary = float(np.exp(-drift / 0.4))
     zmed = float(np.median(root[..., 2]))
     height = float(np.clip((zmed - 0.45) / 0.20, 0.0, 1.0))
-    knee_peak = float(np.abs(jv[..., 2:4]).max(axis=2).max(axis=0).mean())
+    knee_peak = float(np.abs(jv[..., knees]).max(axis=2).max(axis=0).mean())
     burst = 1.0 - float(np.exp(-knee_peak / 8.0))
     return {"spec_score": float(np.clip(up * stationary * height * burst, 0.0, 1.0))}
 '''

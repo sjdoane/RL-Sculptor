@@ -22,6 +22,7 @@ from typing import Any, Callable, Optional
 from pydantic import BaseModel
 
 from sculptor.eval.metric_validate import validate_generated_metric
+from sculptor.eval.robot_manifest import robot_joint_names
 from sculptor.prompts import load_prompt
 
 MODEL_ID = "claude-opus-4-7"
@@ -115,6 +116,11 @@ def generate_objective_metric(
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     metric_path = out_dir / "metric.py"
+    # §Ship 49: the ACTUAL robot's joint_names (manifest, keyed by robot_hint)
+    # so the required-joint-roles gate can reject a metric whose declared roles
+    # don't exist on this robot — before any GPU run. None for an unknown robot
+    # (the runtime resolution is then the backstop).
+    robot_names = robot_joint_names(robot_hint)
     system_prompt = load_prompt("gen_objective_metric")
     base_user = json.dumps(
         {"behavior_goal": behavior_goal, "robot_hint": robot_hint},
@@ -162,7 +168,8 @@ def generate_objective_metric(
                           "non-degeneracy)…"})
         validation = validate_generated_metric(
             source, metric_path,
-            behavior_goal=behavior_goal, robot_hint=robot_hint)
+            behavior_goal=behavior_goal, robot_hint=robot_hint,
+            robot_joint_names=robot_names)
         attempts.append({"attempt": attempt, "ok": validation["ok"],
                          "reasons": validation["reasons"]})
         if validation["ok"]:

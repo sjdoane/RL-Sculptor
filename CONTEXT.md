@@ -339,6 +339,54 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-15 — Ship 49: always-correct joint identification, or reject (HANDOFF Phase J)
+
+- **What**: a canonical, direction-aware joint resolver + the validation/runtime
+  gates that make joint identity un-spoofable. New `RewardSculptor/sculptor/eval/
+  joint_resolver.py` (parse a raw joint name → `(side, segment, axis)`;
+  `resolve_joint_roles(names, roles)` → `{role: idx}` or missing/ambiguous;
+  `select_joints(...)` predicate groups; `assert_name_axis_contract`). New
+  `robot_manifest.py` (G1-29 / Go1-12 canonical orderings keyed by robot hint).
+  Built-ins (`spec_metrics.py`) now select via the resolver — `spec_g1_kick` uses
+  SAGITTAL legs only (hip pitch + knee + ankle pitch), retiring `_match_joints`.
+  Generated metrics declare `REQUIRED_JOINT_ROLES` and read `meta["joint_roles"]`;
+  the runtime (`generated_metric.py`) resolves against each rollout's live
+  joint_names, asserts the name↔buffer order-contract, and HARD-FAILS to an
+  observable 0.0 on any unresolved role. `metric_validate.py` gains three gates:
+  required-roles (against the real robot's names, sourced from the manifest at
+  launch via `metric_gen.py`), a static ban on hard-coded integer joint indices
+  (`x[:, :, N]`), and a permutation-robustness gate (relabel the joint axis
+  consistently — an index-hardcoding metric swings, a name-based one is invariant).
+  `metric_calibration.py` injects roles too. Prompt `gen_objective_metric.md` teaches
+  the role pattern + forbids integer joint indices + "forward = sagittal" direction.
+  Tests: new `tests/test_joint_resolver.py` (21 — resolver, manifest, order-contract
+  pin, the §3A table, all gates); `GOOD_KICK` fixture migrated to the role pattern.
+- **Why**: nothing verified joints were correctly identified. Reproduced on the LIVE
+  g1-kick-v4 rollouts: a SHUFFLED or FOREIGN (Go1) joint-name list scored a stuck G1
+  policy 0.13–0.34 while the correct names scored 0.00–0.07 — a wrong/foreign robot
+  silently scored HIGHER. And `_match_joints("hip","knee","ankle")` grabbed all 12 G1
+  leg joints incl. hip ROLL/YAW, so a SIDEWAYS (hip-roll) kick earned the same credit
+  as a FORWARD (hip-pitch) one — the g1-kick-v4 "kicks but sideways" gap. Joint
+  identity is the foundation of every objective metric; a perfect trust pipeline is
+  worthless if the metric reads the wrong joints.
+- **How**: anchor on FUNCTION (side+segment+axis), not substring/spelling, in ONE
+  audited place. A role resolves to exactly one joint or is flagged — a bare
+  `left_hip` is ambiguous (pitch/roll/yaw) and rejected; a role the robot lacks is
+  missing and rejected pre-project. Three independent guards, defence-in-depth: the
+  permutation gate proves the metric reads by NAME; the runtime resolution proves the
+  roles EXIST on this rollout's robot (loud fail, never a wrong guess); the manifest
+  gate rejects impossible roles before any GPU. The §3A "shuffled-same-length" case is
+  undetectable at runtime, so the order-contract is PINNED by a test on the adapter's
+  entity-first capture (`_mjlab_runner` ~920). Migrating `spec_g1_kick` to sagittal
+  legs is non-breaking on the synthetic battery (the 12-name body has no roll/yaw) but
+  fixes the ground truth on the real 29-DOF G1.
+- **Verified**: sculptor `uv run pytest tests/ -q` → 653 passed, 1 skipped (jax,
+  pre-existing); backend `pytest -k 'not test_reward_prompt_edit_emits'` → 345 passed;
+  end-to-end on the real g1-kick-v4 iter_1 rollout — correct names resolve to
+  `{left_knee:3, left_hip_pitch:0, …}` and score 0.41; empty/foreign/wrong-length all
+  hard-fail 0.0 with a specific reason (was 0.34 silent for foreign). Frontend gate
+  N/A — zero frontend files touched; the launch path benefits via the library.
+
 ### 2026-06-15 — Ship 48: live fitness_patience knob + never-silent env-extension chip
 
 - **What**: (1) `fitness_patience` threaded end-to-end — `reward-sculptor-ui/backend/models/run.py`

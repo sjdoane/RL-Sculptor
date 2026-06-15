@@ -23,15 +23,18 @@ from __future__ import annotations
 import ast
 import re
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, Sequence
 
 import numpy as np
 
 from sculptor.eval.generated_metric import (
     ALLOWED_ARRAYS,
     GENERATED_FN_NAME,
-    load_generated_metric,
+    inject_joint_roles,
+    load_generated_module,
+    read_required_roles,
 )
+from sculptor.eval.joint_resolver import resolve_joint_roles
 
 #: Modules a generated metric may import (numpy only — it is a pure
 #: physical-quantity function).
@@ -162,6 +165,60 @@ def _referenced_array_keys(source: str) -> set[str]:
                 and isinstance(node.args[0].value, str)):
             keys.add(node.args[0].value)
     return keys
+
+
+def _is_int_const(node: ast.AST) -> bool:
+    if isinstance(node, ast.Constant) and isinstance(node.value, int) \
+            and not isinstance(node.value, bool):
+        return True
+    # `-1` parses as UnaryOp(USub, Constant) — count it too.
+    return (isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.USub)
+            and _is_int_const(node.operand))
+
+
+def _raw_joint_index_violations(source: str) -> list[str]:
+    """§Ship 49: flag a HARD-CODED integer index into a joint axis — the
+    `x[:, :, 0]` form — which silently reads the wrong joint the moment the
+    robot or joint order changes (the §3A failure). Metrics must select
+    joints via name-resolved indices (`meta['joint_roles']`). The Ellipsis
+    form `x[..., 2]` is NOT flagged: that's the convention for the 3-vector
+    gravity/root axes (`projected_gravity_b[..., 2]` = uprightness), which
+    are not joint axes."""
+    problems: list[str] = []
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return problems
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Subscript):
+            continue
+        sl = node.slice
+        if isinstance(sl, ast.Tuple) and len(sl.elts) == 3 \
+                and isinstance(sl.elts[0], ast.Slice) \
+                and isinstance(sl.elts[1], ast.Slice) \
+                and _is_int_const(sl.elts[2]):
+            problems.append(
+                "hard-coded integer joint index `[:, :, N]` — select joints "
+                "by name via meta['joint_roles'], not a literal column")
+    return problems
+
+
+# §Ship 49: a non-trivial relabelling of the 12-joint archetype axis. The
+# permutation-robustness gate applies it CONSISTENTLY to joint_names AND the
+# joint_pos/joint_vel columns — a name/role-resolving metric is invariant
+# (it follows the names to the same physical joints), an index-hardcoding one
+# swings (column 0 is now a different joint).
+def _permute_joint_arrays(
+    arrays: dict, perm: list[int],
+) -> dict:
+    out = {}
+    for k, v in arrays.items():
+        if k in ("joint_pos", "joint_vel") and getattr(v, "ndim", 0) >= 3 \
+                and v.shape[2] == len(perm):
+            out[k] = v[:, :, perm]
+        else:
+            out[k] = v
+    return out
 
 
 # ── synthetic archetype rollouts (non-degeneracy gate) ───────────────
@@ -322,21 +379,31 @@ def validate_generated_metric(
     distractor_ceiling: float = 0.3,
     behavior_goal: Optional[str] = None,
     robot_hint: Optional[str] = None,
+    robot_joint_names: Optional[Sequence[str]] = None,
 ) -> dict[str, Any]:
     """Run all MUST-HAVE gates on a generated metric. `source` is the
     module text (for static gates); `module_path` is where it's been
     written (for the runtime gates). Returns
-    `{ok, gates, reasons, archetype_scores, family}`.
+    `{ok, gates, reasons, archetype_scores, family, required_roles}`.
     Never raises — a crashing metric is a failed gate, not an exception.
 
     §Ship 41: `behavior_goal`/`robot_hint` (optional) resolve a behavior
     FAMILY so the non-degeneracy gate anchors a non-locomotion metric
     (kick/jump/floss) against a behavior-appropriate positive archetype
     instead of a hard-coded forward-walker. Both default `None` → today's
-    behavior (any of the four positives may anchor the metric)."""
+    behavior (any of the four positives may anchor the metric).
+
+    §Ship 49: `robot_joint_names` (optional — the ACTUAL robot's joint_names,
+    sourced from the manifest at launch) gates the metric's declared
+    `REQUIRED_JOINT_ROLES`: every role must resolve to exactly one joint on
+    THIS robot, or the metric is rejected pre-project. Plus two new gates that
+    run regardless: a static ban on hard-coded integer joint indices and a
+    permutation-robustness check (a metric that reads joints by index rather
+    than name swings when the joint axis is relabelled)."""
     gates: dict[str, bool] = {}
     reasons: list[str] = []
     family = resolve_behavior_family(behavior_goal, robot_hint)
+    required_roles: list[str] = []
 
     # 1. AST safety
     safety = _ast_safety(source)
@@ -355,21 +422,49 @@ def validate_generated_metric(
         reasons.append(f"[contract] references unavailable arrays: {sorted(bad_keys)} "
                        f"(allowed: {list(ALLOWED_ARRAYS)})")
 
+    # §Ship 49: static ban on hard-coded integer joint indices.
+    raw_idx = _raw_joint_index_violations(source)
+    gates["no_raw_joint_index"] = not raw_idx
+    reasons += [f"[joint-index] {r}" for r in raw_idx]
+
     # Static gates must pass before we exec the module.
     if not (gates["ast_safety"] and gates["defines_compute_spec"]):
         return {"ok": False, "gates": gates, "reasons": reasons,
-                "archetype_scores": {}, "family": family}
+                "archetype_scores": {}, "family": family,
+                "required_roles": required_roles}
 
     try:
-        fn = load_generated_metric(module_path)
+        mod = load_generated_module(module_path)
+        fn = getattr(mod, GENERATED_FN_NAME, None)
+        if not callable(fn):
+            raise ValueError(f"no callable {GENERATED_FN_NAME}()")
     except Exception as e:  # noqa: BLE001
         gates["loads"] = False
         reasons.append(f"[load] {type(e).__name__}: {e}")
         return {"ok": False, "gates": gates, "reasons": reasons,
-                "archetype_scores": {}, "family": family}
+                "archetype_scores": {}, "family": family,
+                "required_roles": required_roles}
     gates["loads"] = True
+    required_roles = read_required_roles(mod)
 
-    meta = {"joint_names": _NAMES_12}
+    # §Ship 49: required-roles gate. When the ACTUAL robot's joint_names are
+    # known (manifest at launch), every declared role must resolve to exactly
+    # one joint on this robot — else reject pre-project ("metric needs
+    # swing_hip_pitch; robot exposes no matching joint"). When the robot is
+    # unknown we cannot reject (the runtime resolution + permutation gate are
+    # the backstop), so the gate passes informationally.
+    if required_roles and robot_joint_names:
+        rr = resolve_joint_roles(list(robot_joint_names), required_roles)
+        gates["joint_roles_resolve"] = rr.ok
+        if not rr.ok:
+            reasons += [f"[joint-roles] {p}" for p in rr.problems()]
+
+    # Archetypes run on the synthetic 12-joint biped. Inject the metric's
+    # declared roles LENIENTLY (the synthetic body has no roll/yaw columns,
+    # so an anatomically valid roll/yaw role still maps to its segment) so a
+    # role-based metric can score the battery.
+    meta = {"joint_names": list(_NAMES_12)}
+    inject_joint_roles(meta, required_roles, lenient=True)
     arche = _archetypes()
     scores: dict[str, float] = {}
 
@@ -395,6 +490,38 @@ def validate_generated_metric(
             reasons.append(f"[bounds] '{name}' out of [0,1] or non-finite: {s1}")
     gates["determinism"] = determ
     gates["bounded"] = bounded
+
+    # §Ship 49: permutation-robustness — relabel the joint axis (names AND the
+    # joint_pos/joint_vel columns, CONSISTENTLY) and re-score. A metric that
+    # reads joints by NAME/role follows the relabelling to the same physical
+    # joints → invariant; a metric that hard-codes a column reads a different
+    # joint → its score swings. This is exactly the §3A shuffle experiment
+    # turned into a gate (an index-sensitive metric silently mis-scores the
+    # moment the real robot's joint order differs from the synthetic battery).
+    perm = list(range(J - 1, -1, -1))           # reverse: a non-trivial relabel
+    pmeta = {"joint_names": [_NAMES_12[perm[i]] for i in range(J)]}
+    inject_joint_roles(pmeta, required_roles, lenient=True)
+    robust = True
+    for name, arrays in arche.items():
+        base = scores.get(name, float("nan"))
+        if not np.isfinite(base):
+            continue
+        try:
+            ps = _score(fn, _permute_joint_arrays(arrays, perm), pmeta)
+        except Exception as e:  # noqa: BLE001 — a crash under relabel = not robust
+            robust = False
+            reasons.append(f"[robustness] raised under joint relabel on "
+                           f"'{name}': {type(e).__name__}: {e}")
+            break
+        if not np.isfinite(ps) or abs(ps - base) > 1e-6:
+            robust = False
+            reasons.append(
+                f"[robustness] index-sensitive joint access: '{name}' scored "
+                f"{base:.4f} but {ps:.4f} after a consistent joint relabel — "
+                f"the metric reads joints by column, not by name "
+                f"(use meta['joint_roles'])")
+            break
+    gates["joint_index_robust"] = robust
 
     # 5: non-degeneracy — the metric must score SOME competent behavior above
     # EVERY degenerate one, with spread. §Ship 41: positives span all behavior
@@ -457,4 +584,5 @@ def validate_generated_metric(
 
     ok = all(gates.values())
     return {"ok": ok, "gates": gates, "reasons": reasons,
-            "archetype_scores": scores, "family": family}
+            "archetype_scores": scores, "family": family,
+            "required_roles": required_roles}

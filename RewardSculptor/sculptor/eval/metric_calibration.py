@@ -20,7 +20,11 @@ from typing import Any
 
 import numpy as np
 
-from sculptor.eval.generated_metric import load_generated_metric
+from sculptor.eval.generated_metric import (
+    inject_joint_roles,
+    load_generated_metric,
+    read_required_roles,
+)
 from sculptor.eval.spec_metrics import _SPEC_FNS
 
 T, E, J = 120, 4, 12
@@ -160,10 +164,15 @@ def calibrate_metric(
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "spearman": 0.0, "threshold": threshold,
                 "builtin": builtin_name, "error": f"{type(e).__name__}: {e}"}
+    # §Ship 49: resolve the metric's declared joint roles against the
+    # synthetic biped names the ladder carries, so a role-based metric reads
+    # the right columns (lenient — the 12-joint body has no roll/yaw axes).
+    roles = read_required_roles(generated_module_path)
     builtin_fn = _SPEC_FNS[builtin_name]
     ladder = _ladder(builtin_name)
     gen_scores, builtin_scores = [], []
     for arrays, behavior, meta in ladder:
+        inject_joint_roles(meta, roles, lenient=True)
         try:
             gen_scores.append(float(gen_fn(arrays, behavior, meta).get("spec_score", 0.0)))
         except Exception:  # noqa: BLE001 — a crash on a ladder point = 0
