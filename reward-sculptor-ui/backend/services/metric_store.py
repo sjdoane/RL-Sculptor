@@ -81,6 +81,9 @@ def _summary(gid: str, rec: dict) -> dict[str, Any]:
         "gates": validation.get("gates"),
         "reasons": validation.get("reasons"),
         "archetype_scores": validation.get("archetype_scores"),
+        # §Ship 50: L1 axiom per-layer breakdown (for the UI evidence line +
+        # the Ship-52 trust score). None for pre-Ship-50 records.
+        "axioms": validation.get("axioms"),
         "calibration": rec.get("calibration"),
         "source": rec.get("source"),
         "recorded_at": rec.get("recorded_at"),

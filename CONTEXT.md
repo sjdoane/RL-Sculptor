@@ -339,6 +339,55 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-15 — Ship 50: L1 task-agnostic axioms (controlled-perturbation invariants)
+
+- **What**: a new offline trust layer that hardens EVERY objective metric. New
+  `RewardSculptor/sculptor/eval/metric_axioms.py::check_metric_axioms(fn, *, family,
+  required_roles)` runs 6 CONTROLLED PERTURBATIONS on the metric's best-scoring
+  positive archetype and asserts the score moves the physically-correct way:
+  three exact INVARIANCES — `translation_invariant` (offset world xy), `gravity_
+  scale_invariant` (×9.81), `yaw_rotation_invariant` (rotate heading 37°), each |Δ|
+  ≤ 1e-6 — plus three MONOTONICITIES — `uprightness_monotone` (a 0→90° tilt sweep
+  must be non-increasing), `no_reward_for_chaos` (whole-body flail must not raise
+  the score by >0.5), `stationary_no_travel` (kick/floss/jump: added base travel
+  must not raise it). Wired into `metric_validate.validate_generated_metric` (lazy
+  import to avoid the archetype-import cycle): `gates["axioms"]` folds into `ok` and
+  the per-axiom block + deltas are returned; surfaced through `metric_store._summary`
+  (`axioms`) for the record/Ship-52. Tests: new `tests/test_metric_axioms.py` (23 —
+  each axiom's targeted hack rejected, every GOOD_*/built-in passes, handstand/crawl/
+  balance/reach not false-rejected, determinism, validate integration).
+- **Why**: L0 only proves a metric DISCRIMINATES one confounded archetype above
+  another. It structurally cannot catch a metric that reads a FRAME/UNITS artifact,
+  because every L0 archetype spawns at the world origin, with unit gravity,
+  travelling +x — so an absolute-position / raw-gravity-magnitude / absolute-heading
+  Goodhart passes all of L0 unseen (verified: an `ABSPOS`/`GRAVMAG`/`HEADING` hack
+  each slips L0 but the matching invariance catches it, Δ +0.82 / +0.68 / −0.08). The
+  controlled perturbation also strengthens the uprightness/anti-energy/stationarity
+  checks vs L0's fixed, confounded negatives. This is the design doc's L1 layer
+  ("universal invariants: no reward for stillness/extremes; monotone-in-uprightness")
+  and the next step after Phase J toward trustworthy metrics for novel tasks.
+- **How**: the operating point is the metric's OWN best positive, which SELF-SCOPES
+  the gate — a novel-orientation task (handstand) scores the upright biped battery ~0,
+  so the perturbations stay ~0 and the axioms pass vacuously; L1 never false-rejects a
+  task the synthetic battery can't represent. The uprightness sweep tilts toward
+  HORIZONTAL (never inversion), so a handstand target is not penalised. Tolerances
+  were calibrated EMPIRICALLY against the reference metrics (chaos 0.5 clears the most
+  peak-sensitive GOOD_KICK at ~0.33 worst-case while catching a pure energy rewarder
+  at ~1.0); the invariances are exact and measured zero-false-reject across all 13
+  reference metrics. DESIGN PROVENANCE: a 4-lens design panel surfaced the three
+  invariance axioms (the standout contribution — L0 cannot express symmetries) and
+  correctly rejected the strict-chaos / mirror-invariance / universal-stillness /
+  novel-responsiveness candidates as false-rejecting; its synthesis stage and the
+  adversarial-review workflow hit the monthly spend limit, so the synthesis +
+  adversarial review (novel-task false-rejection, mutation-leak, Goodhart-bypass) were
+  done in the main loop, empirically. KNOWN LIMIT: a static-pose "statue" metric for a
+  NOVEL family passes L0+L1 but runs observe-only (no calibration builtin → firewall
+  blocks steering); distinguishing it needs the task's intent — that is L2/Ship-51.
+- **Verified**: sculptor `uv run pytest tests/ -q`; backend `pytest -k 'not
+  test_reward_prompt_edit_emits'`; the 6 axioms reproduced by hand against all 4
+  GOOD_*, all 5 built-ins, and 7 hacks. Frontend untouched — axiom-failure reasons
+  ride the existing `metric_generation_rejected` `reasons` (never-silent already).
+
 ### 2026-06-15 — Ship 49: always-correct joint identification, or reject (HANDOFF Phase J)
 
 - **What**: a canonical, direction-aware joint resolver + the validation/runtime

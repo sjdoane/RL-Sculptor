@@ -582,7 +582,21 @@ def validate_generated_metric(
                 f"'{family}' skill — the metric rewards walking, not the behavior")
     gates["nondegeneracy"] = nondegen
 
+    # §Ship 50: L1 task-agnostic axioms — controlled-perturbation invariants
+    # (uprightness-monotone, no-reward-for-chaos, stationary-no-travel) that
+    # harden EVERY metric beyond the L0 archetype comparison. Lazy import to
+    # avoid a load-time cycle (metric_axioms imports this module's archetypes).
+    # Only meaningful once the metric loads + runs (the bounded gate passed);
+    # a metric that crashed every archetype has nothing to perturb.
+    axioms: dict[str, Any] = {"ok": True, "axioms": {}, "reasons": [], "details": {}}
+    if gates.get("bounded") and gates.get("loads"):
+        from sculptor.eval.metric_axioms import check_metric_axioms
+
+        axioms = check_metric_axioms(fn, family=family, required_roles=required_roles)
+        gates["axioms"] = bool(axioms["ok"])
+        reasons += axioms["reasons"]
+
     ok = all(gates.values())
     return {"ok": ok, "gates": gates, "reasons": reasons,
             "archetype_scores": scores, "family": family,
-            "required_roles": required_roles}
+            "required_roles": required_roles, "axioms": axioms}
