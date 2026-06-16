@@ -85,6 +85,8 @@ def _summary(gid: str, rec: dict) -> dict[str, Any]:
         # the Ship-52 trust score). None for pre-Ship-50 records.
         "axioms": validation.get("axioms"),
         "calibration": rec.get("calibration"),
+        # §Ship 51: "builtin" | "task_derived" so the UI can show the right card.
+        "calibration_method": rec.get("calibration_method"),
         "source": rec.get("source"),
         "recorded_at": rec.get("recorded_at"),
     }
@@ -139,5 +141,29 @@ def calibrate(project_dir: Path, gid: str, builtin_name: str) -> dict[str, Any]:
     rec = json.loads(meta.read_text(encoding="utf-8"))
     rec["calibrated"] = bool(cal.get("ok"))
     rec["calibration"] = cal
+    rec["calibration_method"] = "builtin"
+    meta.write_text(json.dumps(rec, indent=2, default=str), encoding="utf-8")
+    return _summary(gid, rec)
+
+
+def calibrate_task_derived(
+    project_dir: Path, gid: str, behavior_goal: str,
+    robot_hint: Optional[str] = None, *, client=None,
+) -> dict[str, Any]:
+    """§Ship 51: calibrate a stored metric against K independently-authored
+    competence ladders (the novel-task path) and persist `calibrated` + the
+    full per-source provenance into its meta.json. The grant flips at the SAME
+    point as the built-in path; `steer_allowed` is untouched."""
+    d = _metrics_root(project_dir) / gid
+    metric_py = d / "metric.py"
+    meta = d / "meta.json"
+    if not metric_py.is_file() or not meta.is_file():
+        raise FileNotFoundError(f"generated metric {gid!r} not found")
+    cal = sculptor_bridge.calibrate_task_derived_metric(
+        metric_py, behavior_goal, robot_hint, client=client)
+    rec = json.loads(meta.read_text(encoding="utf-8"))
+    rec["calibrated"] = bool(cal.get("ok"))
+    rec["calibration"] = cal
+    rec["calibration_method"] = "task_derived"
     meta.write_text(json.dumps(rec, indent=2, default=str), encoding="utf-8")
     return _summary(gid, rec)

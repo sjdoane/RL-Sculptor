@@ -15,8 +15,11 @@ when a GPU is available; this is the no-GPU proxy.
 """
 from __future__ import annotations
 
+import hashlib
+import json
+import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 
@@ -188,3 +191,265 @@ def calibrate_metric(
         "gen_scores": [round(s, 4) for s in gen_scores],
         "builtin_scores": [round(s, 4) for s in builtin_scores],
     }
+
+
+# ── §Ship 51: L2 task-derived calibration (the novel-task unblocker) ──────
+
+#: Gate constants (auditable, byte-stable; kwargs-overridable in tests). The
+#: per-source bar is 0.8 (NOT 0.5): a SATURATING metric scores midrank ≈0.707
+#: vs the rung axis, which 0.5 would wrongly pass — 0.8 cleanly separates a
+#: whole-ladder ranking (~0.97-1.0) from single-rung discrimination (0.707).
+_TD_PER_SOURCE_THRESH = 0.8
+_TD_RHO_FLOOR = 0.5
+_TD_AGREE_FLOOR = 2.0 / 3.0
+_TD_K_SOURCES = 3
+_TD_MIN_VALID = 2
+_TD_SPREAD_MIN = 0.15            # author-fault: metric near-constant on the ladder
+_TD_SEPARATION_MIN = 0.2         # metric-fault: doesn't beat the degenerate anchor
+_TD_MODEL_ID = "claude-opus-4-7"
+
+#: Distinct authoring STYLES across the K sources — reduces correlated phrasing
+#: so the K ladders are genuinely independent (anti-collusion).
+_TD_STYLES = (
+    "Describe each rung by concrete physical magnitudes — joint angles in "
+    "radians, base speed, hop height, uprightness fraction.",
+    "Describe each rung as an observable behavior a person watching would see, "
+    "from total failure up to fluent mastery.",
+    "Define each rung by the specific failure of the rung BELOW it that this "
+    "rung fixes — the incremental competence gained at each step.",
+)
+
+
+def _midrank(x: np.ndarray) -> np.ndarray:
+    """Ranks with TIES AVERAGED (0-based). numpy-only (no scipy)."""
+    x = np.asarray(x, float)
+    order = np.argsort(x, kind="mergesort")
+    ranks = np.empty(len(x), dtype=float)
+    sx = x[order]
+    i = 0
+    while i < len(x):
+        j = i
+        while j + 1 < len(x) and sx[j + 1] == sx[i]:
+            j += 1
+        ranks[order[i:j + 1]] = (i + j) / 2.0
+        i = j + 1
+    return ranks
+
+
+def spearman_midrank(a: list[float], b: list[float]) -> float:
+    """Spearman rho with TIE-AVERAGED ranks — the task-derived path only.
+
+    The argsort `spearman()` gives ties SEQUENTIAL ranks, which spuriously
+    scores a saturating metric `[0.1,0.9,0.9,0.9,0.9]` or a last-rung-only
+    metric `[.5,.5,.5,.5,.9]` as rho=1.0 against the tie-free rung axis — a
+    FALSE GRANT. Midrank scores both 0.707 (below the 0.8 bar) while a
+    genuinely monotone metric stays ~0.97-1.0. Keeps the round-6 + std-floor
+    anti-spurious guards that killed the historical 1e-7 joint_pos-magnitude
+    spurious correlation."""
+    av, bv = np.round(np.asarray(a, float), 6), np.round(np.asarray(b, float), 6)
+    if av.size < 2 or av.std() < 1e-12 or bv.std() < 1e-12:
+        return 0.0
+    return float(np.corrcoef(_midrank(av), _midrank(bv))[0, 1])
+
+
+def _sha(obj: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(obj, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()[:16]
+
+
+def _author_ladder(client: Any, model: str, payload: dict) -> Any:
+    """One blind ladder-author call → a CompetenceLadder. The author is given
+    ONLY the goal/robot/joint_names/style/vocabulary — never any metric."""
+    from sculptor.eval.ladder_synth import CompetenceLadder
+    from sculptor.prompts import load_prompt
+
+    system_prompt = load_prompt("gen_competence_ladder")
+    resp = client.messages.parse(
+        model=model,
+        max_tokens=4000,
+        thinking={"type": "adaptive"},
+        system=system_prompt,
+        messages=[{"role": "user",
+                   "content": json.dumps(payload, indent=2, default=str)}],
+        output_format=CompetenceLadder,
+    )
+    return resp.parsed_output
+
+
+def calibrate_task_derived(
+    generated_module_path: Path | str,
+    behavior_goal: str,
+    robot_hint: Optional[str] = None,
+    *,
+    client: Any = None,
+    model: str = _TD_MODEL_ID,
+    k_sources: int = _TD_K_SOURCES,
+    robot_joint_names: Optional[list[str]] = None,
+    per_source_thresh: float = _TD_PER_SOURCE_THRESH,
+    rho_floor: float = _TD_RHO_FLOOR,
+    agree_floor: float = _TD_AGREE_FLOOR,
+) -> dict[str, Any]:
+    """§Ship 51: earn steer-rights on a NOVEL task (no built-in ground truth)
+    by ranking K INDEPENDENTLY-authored competence ladders. Each of K sources
+    is a fresh, metric-BLIND LLM call authoring a `CompetenceLadder`; a
+    deterministic synthesizer renders it; the metric is scored per rung and
+    Spearman-correlated (midrank) against the rung index. Earns the grant iff
+    `rho_min ≥ rho_floor` AND `agreement_fraction ≥ agree_floor` AND
+    `n_valid ≥ 2` AND the ladders are non-degenerate. NEVER raises — every
+    failure mode is a specific observe-only `reason` (the run stays alive).
+
+    Record shape is a SUPERSET of `calibrate_metric` (so metric_store / the
+    firewall / the UI need no change): `spearman` mirrors `rho_min`."""
+    from sculptor.eval.ladder_synth import render_ladder
+    from sculptor.eval.robot_manifest import robot_joint_names as _manifest
+
+    def _record(ok, rho_min, agreement, sources, *, degenerate=False,
+                reason=None, n_valid=0, error=None) -> dict[str, Any]:
+        return {
+            "ok": bool(ok), "method": "task_derived",
+            "spearman": round(float(rho_min), 4),    # mirrors rho_min for the UI
+            "rho_min": round(float(rho_min), 4),
+            "agreement_fraction": round(float(agreement), 4),
+            "k_sources": k_sources, "n_valid": n_valid,
+            "builtin": None, "threshold": rho_floor,
+            "per_source_thresh": per_source_thresh, "agree_floor": agree_floor,
+            "behavior_goal": behavior_goal, "robot_hint": robot_hint,
+            "degenerate": bool(degenerate), "reason": reason, "error": error,
+            "sources": sources,
+        }
+
+    # Load the metric (a load failure is a hard, specific deny).
+    try:
+        gen_fn = load_generated_metric(generated_module_path)
+        roles = read_required_roles(generated_module_path)
+    except Exception as e:  # noqa: BLE001
+        return _record(False, 0.0, 0.0, [],
+                       reason=f"metric failed to load: {type(e).__name__}: {e}",
+                       error=f"{type(e).__name__}: {e}")
+
+    names = list(robot_joint_names or _manifest(robot_hint) or [])
+    if not names:
+        return _record(False, 0.0, 0.0, [],
+                       reason="task-derived: unknown robot — no joint manifest "
+                              "to render ladders against; observe-only")
+
+    if client is None:
+        import anthropic
+        client = anthropic.Anthropic(max_retries=2, timeout=240.0)
+
+    metric_src = ""
+    try:
+        metric_src = Path(generated_module_path).read_text(encoding="utf-8")
+    except Exception:  # noqa: BLE001
+        pass
+
+    # The shared context every source sees — identical across sources (asserted
+    # below). The metric source is NEVER part of it.
+    base_payload = {"behavior_goal": behavior_goal, "robot_hint": robot_hint,
+                    "joint_names": names}
+    context_hash = _sha(base_payload)
+
+    sources: list[dict[str, Any]] = []
+    valid_rhos: list[float] = []
+    n_agree = 0
+    for si in range(k_sources):
+        style = _TD_STYLES[si % len(_TD_STYLES)]
+        payload = {**base_payload, "authoring_style": style,
+                   "n_rungs": 4, "source_index": si}
+        rec: dict[str, Any] = {
+            "style_id": si, "model_id": model,
+            "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            "payload_sha256": _sha(payload), "context_sha256": _sha(base_payload),
+        }
+        # Anti-collusion HARD self-check: we built `payload`, so the metric must
+        # not appear in it. A failure is a programmer error in THIS function.
+        payload_text = json.dumps(payload, default=str)
+        if "def compute_spec" in payload_text or (
+                metric_src and metric_src[:120] in payload_text):
+            rec["skip_reason"] = "metric source leaked into author payload (bug)"
+            sources.append(rec)
+            continue
+        try:
+            ladder = _author_ladder(client, model, payload)
+        except Exception as e:  # noqa: BLE001 — a failed author call = no evidence
+            rec["skip_reason"] = f"author call failed: {type(e).__name__}: {e}"
+            sources.append(rec)
+            continue
+        rec["competence_axis"] = getattr(ladder, "competence_axis", "")
+        rec["response_sha256"] = _sha(getattr(ladder, "model_dump", lambda: {})())
+        # Anti-collusion SOFT guard: a ladder that echoes the metric source is
+        # dropped (a leak attempt), never scored.
+        ladder_text = json.dumps(
+            getattr(ladder, "model_dump", lambda: {})(), default=str)
+        if metric_src and any(
+                metric_src[i:i + 40] in ladder_text
+                for i in range(0, max(0, len(metric_src) - 40), 40)):
+            rec["skip_reason"] = "ladder echoes metric source"
+            sources.append(rec)
+            continue
+
+        rungs = list(getattr(ladder, "rungs", []) or [])
+        rec["n_rungs"] = len(rungs)
+        synth = render_ladder(rungs, names)
+        if synth["degenerate"]:
+            rec["skip_reason"] = synth["reason"]
+            rec["degenerate"] = True
+            sources.append(rec)
+            continue
+
+        gen_scores = []
+        for arrays, behavior, meta in synth["rungs"]:
+            inject_joint_roles(meta, roles)
+            try:
+                gen_scores.append(
+                    float(gen_fn(arrays, behavior, meta).get("spec_score", 0.0)))
+            except Exception:  # noqa: BLE001 — crash on a rung = 0 (penalize)
+                gen_scores.append(0.0)
+        rec["gen_scores"] = [round(s, 4) for s in gen_scores]
+
+        spread = max(gen_scores) - min(gen_scores)
+        distinct = len({round(s, 6) for s in gen_scores})
+        # SPREAD/DISTINCT sanity indicts the AUTHOR (no-evidence, not disagreement).
+        if spread < _TD_SPREAD_MIN or distinct < 3:
+            rec["skip_reason"] = (f"metric near-constant on this ladder "
+                                  f"(spread {spread:.3f} < {_TD_SPREAD_MIN})")
+            sources.append(rec)
+            continue
+
+        rho = spearman_midrank(gen_scores, list(range(len(gen_scores))))
+        separation = gen_scores[-1] - gen_scores[0]   # top vs degenerate anchor
+        rec["rho"] = round(rho, 4)
+        rec["separation"] = round(separation, 4)
+        rec["ladder_ok"] = True
+        # ABSOLUTE-SEPARATION anchor indicts the METRIC (counts as disagreement).
+        if separation < _TD_SEPARATION_MIN:
+            rec["skip_reason"] = (f"metric does not separate competent from the "
+                                  f"degenerate anchor by ≥{_TD_SEPARATION_MIN} "
+                                  f"(got {separation:.3f})")
+            valid_rhos.append(rho)        # still a valid source, just failing
+            sources.append(rec)
+            continue
+        valid_rhos.append(rho)
+        if rho >= per_source_thresh:
+            n_agree += 1
+        sources.append(rec)
+
+    n_valid = len(valid_rhos)
+    if n_valid < _TD_MIN_VALID:
+        responded = sum(1 for s in sources if "rho" in s or "gen_scores" in s)
+        return _record(False, 0.0, 0.0, sources, n_valid=n_valid,
+                       reason=f"task-derived: only {n_valid} usable ladder(s) "
+                              f"(of {k_sources}) — observe-only")
+    rho_min = min(valid_rhos)
+    agreement = n_agree / float(k_sources)
+    ok = (rho_min >= rho_floor) and (agreement >= agree_floor) and (n_valid >= _TD_MIN_VALID)
+    if ok:
+        reason = None
+    elif rho_min < rho_floor:
+        reason = (f"task-derived: ladders disagree (rho_min={rho_min:.2f} "
+                  f"< {rho_floor:.2f}) — observe-only")
+    else:
+        reason = (f"task-derived: only {n_agree}/{k_sources} ladders agree "
+                  f"(need {agree_floor:.2f}) — observe-only")
+    return _record(ok, rho_min, agreement, sources, n_valid=n_valid, reason=reason)

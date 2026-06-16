@@ -339,6 +339,69 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-15 — Ship 51: L2 task-derived competence ladders (novel-task steer-rights)
+
+- **What**: a generated metric can now EARN STEER-RIGHTS on a NOVEL task (no
+  hand-authored built-in) by ranking K=3 INDEPENDENTLY-authored competence
+  ladders — the design doc's headline unblocker. New `sculptor/eval/
+  ladder_synth.py`: pydantic `MotionSpec`/`CompetenceLadder` + a DETERMINISTIC
+  pure-numpy synthesizer (`render_rung`/`render_ladder`) that turns an author's
+  structured rung specs into physical rollouts (joint_pos/joint_vel/gravity/
+  root), resolver-backed (Ship-49 `select_joints`, zero integer columns), with
+  a renderer-built FALLEN degenerate anchor prepended. New `metric_calibration.
+  calibrate_task_derived(metric_path, goal, robot_hint, *, client, k_sources=3)`
+  + `spearman_midrank`. New blind-author prompt `gen_competence_ladder.md`. UI:
+  `sculptor_bridge.calibrate_task_derived_metric`, `metric_store.
+  calibrate_task_derived` (writes calibrated+calibration+calibration_method),
+  `run_manager` flag `RS_TASK_DERIVED_CALIBRATION` (DEFAULT OFF) replacing the
+  dead `metric_calibration_skipped` else-branch, `RunsTab.tsx` method
+  discriminator. Tests: `tests/test_task_derived_calibration.py` (18).
+- **Why**: before this, a novel task hit `resolve_calibration_builtin → None →
+  calibration skipped → observe-only forever` — circular (you need ground truth
+  to trust a metric, but the point is to not hand-author one per task). L2
+  breaks it without a GPU: K metric-BLIND LLM authors each describe what
+  competent vs incompetent execution looks like PHYSICALLY (a competence axis +
+  ascending rungs); the deterministic synthesizer renders them so the author
+  can never bias the physics; the metric must rank ALL K monotonically.
+- **How**: three circularity defenses, all executable not prompt-only. (1)
+  STRUCTURAL blindness — the author gets only {goal, robot_hint, joint_names,
+  style, vocabulary}, NEVER the metric; a hard self-check asserts the metric
+  source never enters the author payload, a soft guard drops a ladder that
+  echoes it; per-source provenance (model-id, timestamp, payload/response
+  sha256, style-id) + a shared-context hash persisted to meta.json. (2)
+  CROSS-SOURCE agreement — `rho_min` = MIN Spearman over valid sources (never
+  mean/max), `agreement_fraction ≥ 2/3`, `n_valid ≥ 2`: one colluding source
+  can inflate only its own rho, so it can't carry the grant (the KEYSTONE
+  test). (3) ANCHOR — a renderer-built fully-fallen rung 0 + an absolute-
+  separation gate (top − anchor ≥ 0.2) turns "ranks monotonically" into "ranks
+  AND beats a known-bad floor". Two correctness fixes the design panel
+  surfaced + I verified: `spearman_midrank` (the argsort `spearman()` FALSE-
+  GRANTS a saturating metric `[0.1,.9,.9,.9,.9]`→1.0 vs the tie-free rung axis;
+  midrank→0.707, below the 0.8 per-source bar); and a GROUP primitive (a
+  role-query drives every matching joint) that fixes a single-joint dilution
+  that scored a floss ladder 0.0. The firewall (`steer_allowed` reads
+  `meta.calibrated`) is UNTOUCHED — we only widen what sets `calibrated=True`.
+  Flag-gated default OFF (manual-audit-first per the design doc); the 5 built-in
+  families take the unchanged `calibrate_metric` path (regression-tested).
+  Never raises — every failure mode (author timeout, malformed/degenerate
+  ladder, ladders disagree, unknown robot, inexpressible yaw/contact axis) is a
+  SPECIFIC observe-only reason; the run stays alive, no GPU held (pre-phase).
+- **Verified**: synthesizer ranks all 4 built-in families on synthesized
+  ladders with midrank rho 0.975–1.0 and anchor separation 0.46–0.80; 18
+  task-derived tests incl the keystone (a colluder cannot grant a wrong
+  travel-metric: the 2 honest kick ladders give it no usable evidence) and the
+  midrank false-grant fix; sculptor `pytest tests/`; backend `pytest`; frontend
+  `pnpm typecheck` (exit 0). Design provenance: a 4-lens design panel (vocabulary
+  / anti-collusion / gate-statistics / integration) → synthesis. KNOWN LIMIT
+  (documented, NOT closed by Ship-51): shared same-family bias — the same model
+  family authors metric + all K ladders, so min-not-mean defends ONE deviant,
+  not SYSTEMIC agreement; full closure needs L4 (a different VLM, Ship-54) + L5
+  (optimization-outcome audit, Ship-55, the only non-circular ground truth).
+  FOR SAM: (a) the flag is OFF — flip `RS_TASK_DERIVED_CALIBRATION=1` only after
+  auditing on real novel goals; (b) `per_source_thresh=0.8` is the single
+  load-bearing constant (0.5 false-grants the saturating case); (c) K=3 author
+  calls add ~60s + 3× tokens to launch, pre-GPU.
+
 ### 2026-06-15 — Ship 50: L1 task-agnostic axioms (controlled-perturbation invariants)
 
 - **What**: a new offline trust layer that hardens EVERY objective metric. New

@@ -38,6 +38,12 @@ ITER_DIR_RE = re.compile(r"^iter_(\d+)$")
 
 _GEN_ID_RE = re.compile(r"^[A-Za-z0-9_]+$")
 
+#: §Ship 51: gate the L2 task-derived calibration path (novel-task steer-rights
+#: via K independently-authored competence ladders). DEFAULT OFF — flip on only
+#: after a manual audit confirms no known-bad metric is granted (per the design
+#: doc). The built-in calibration path (the 5 families) is unaffected.
+_TASK_DERIVED_ENABLED = os.getenv("RS_TASK_DERIVED_CALIBRATION", "0") == "1"
+
 #: §Ship 42: dropdown sentinel — "generate the objective metric at launch as the
 #: run's first phase" (vs picking an existing built-in / gen:<id>). Ship 43 runs
 #: the generation pre-phase and rewrites fitness_metric to gen:<new id> before
@@ -220,10 +226,44 @@ async def _generate_at_launch(
                     job.emit({"type": "metric_calibration_done", "source": "launch_gen",
                               "gen_id": gid, "builtin": builtin, "calibrated": False,
                               "error": f"{type(e).__name__}: {e}"})
+            elif _TASK_DERIVED_ENABLED:
+                # §Ship 51: novel task (no built-in) → earn steer-rights by
+                # ranking K independently-authored competence ladders. No GPU is
+                # held (pre-phase); bounded by a timeout so an unattended run
+                # still completes. Never fails the run — any failure mode is an
+                # observe-only reason (the firewall keeps an uncalibrated metric
+                # from steering regardless).
+                job.emit({"type": "metric_calibration_started", "source": "launch_gen",
+                          "gen_id": gid, "method": "task_derived", "k_sources": 3})
+                try:
+                    cal = await asyncio.wait_for(
+                        asyncio.to_thread(metric_store.calibrate_task_derived,
+                                          project_dir, gid, behavior_goal, robot_hint),
+                        timeout=300.0)
+                    c = cal.get("calibration") or {}
+                    job.emit({"type": "metric_calibration_done", "source": "launch_gen",
+                              "gen_id": gid, "method": "task_derived",
+                              "calibrated": bool(cal.get("calibrated")),
+                              "spearman": c.get("rho_min"),
+                              "rho_min": c.get("rho_min"),
+                              "agreement_fraction": c.get("agreement_fraction"),
+                              "reason": c.get("reason")})
+                except asyncio.TimeoutError:
+                    job.emit({"type": "metric_calibration_done", "source": "launch_gen",
+                              "gen_id": gid, "method": "task_derived", "calibrated": False,
+                              "reason": "task-derived calibration timed out (>300s) — observe-only"})
+                except Exception as e:  # noqa: BLE001 — calibration ≠ run failure
+                    job.emit({"type": "metric_calibration_done", "source": "launch_gen",
+                              "gen_id": gid, "method": "task_derived", "calibrated": False,
+                              "error": f"{type(e).__name__}: {e}",
+                              "reason": "task-derived calibration crashed — observe-only"})
             else:
+                # Reached only when there is no built-in AND the task-derived
+                # flag is off — name both so the observe-only state is specific.
                 job.emit({"type": "metric_calibration_skipped", "source": "launch_gen",
                           "gen_id": gid,
-                          "reason": "no matching built-in ground truth — observe-only"})
+                          "reason": "no matching built-in ground truth; "
+                                    "task-derived calibration disabled — observe-only"})
             return f"gen:{gid}"
 
         # Rejected — surface WHY (validation gate reasons + reviewer concerns).

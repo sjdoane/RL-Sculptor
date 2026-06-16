@@ -19,7 +19,10 @@ from sculptor.eval.generated_metric import (
     make_generated_fitness_fn,
     resolve_fitness_fn,
 )
-from sculptor.eval.metric_calibration import calibrate_metric
+from sculptor.eval.metric_calibration import (
+    calibrate_metric,
+    calibrate_task_derived,
+)
 from sculptor.eval.metric_gen import generate_objective_metric
 from sculptor.eval.metric_validate import validate_generated_metric
 from sculptor.eval.spec_metrics import (
@@ -42,6 +45,7 @@ __all__ = [
     "validate_generated_metric",
     "generate_objective_metric",
     "calibrate_metric",
+    "calibrate_task_derived",
     "CONDITIONS",
     "CampaignConfig",
     "EvalCondition",

@@ -316,16 +316,18 @@ function RunDetailPane({ slug, runId, runs }: { slug: string; runId: string; run
     let errorMsg: string | null = null;
     // §Ship 45: paused awaiting a one-click retry/continue decision.
     let awaiting = false;
-    // §Ship 44: launch-time calibration outcome.
+    // §Ship 44: launch-time calibration outcome. §Ship 51: + task-derived.
     let calib: {
       status: "running" | "done" | "skipped";
       builtin?: string; calibrated?: boolean; spearman?: number | null;
+      method?: string; agreement_fraction?: number | null; reason?: string | null;
     } | null = null;
     for (const ev of events.events) {
       const e = ev as {
         type?: string; stage?: string; message?: string; attempt?: number;
         max?: number; gen_id?: string; reasons?: string[]; concerns?: string[];
         error?: string; builtin?: string; calibrated?: boolean; spearman?: number | null;
+        method?: string; agreement_fraction?: number | null; reason?: string | null;
       };
       if (e.type === "metric_generation_started") { started = true; outcome = null; last = null; calib = null; awaiting = false; }
       else if (e.type === "metric_generation_progress") {
@@ -338,11 +340,12 @@ function RunDetailPane({ slug, runId, runs }: { slug: string; runId: string; run
       }
       else if (e.type === "metric_generation_awaiting_decision") { awaiting = true; }
       else if (e.type === "metric_generation_failed") { outcome = "failed"; errorMsg = e.error ?? null; awaiting = false; }
-      else if (e.type === "metric_calibration_started") { calib = { status: "running", builtin: e.builtin }; }
+      else if (e.type === "metric_calibration_started") { calib = { status: "running", builtin: e.builtin, method: e.method }; }
       else if (e.type === "metric_calibration_done") {
-        calib = { status: "done", builtin: e.builtin, calibrated: e.calibrated, spearman: e.spearman };
+        calib = { status: "done", builtin: e.builtin, calibrated: e.calibrated, spearman: e.spearman,
+                  method: e.method, agreement_fraction: e.agreement_fraction, reason: e.reason };
       }
-      else if (e.type === "metric_calibration_skipped") { calib = { status: "skipped" }; }
+      else if (e.type === "metric_calibration_skipped") { calib = { status: "skipped", reason: e.reason }; }
     }
     return started ? { last, outcome, genId, reasons, concerns, errorMsg, calib, awaiting } : null;
   }, [events.events]);
@@ -821,6 +824,7 @@ function MetricGenPhase({ phase, busy, onRetry, onContinueBlind }: {
     calib: {
       status: "running" | "done" | "skipped";
       builtin?: string; calibrated?: boolean; spearman?: number | null;
+      method?: string; agreement_fraction?: number | null; reason?: string | null;
     } | null;
     awaiting: boolean;
   };
@@ -861,26 +865,38 @@ function MetricGenPhase({ phase, busy, onRetry, onContinueBlind }: {
             {calib?.status === "running" && (
               <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
                 <Icon name="loader" size={12} />
-                <span>Calibrating vs <code className="mono">{calib.builtin}</code>…</span>
+                <span>{calib.method === "task_derived"
+                  ? "Calibrating vs 3 independently-generated competence ladders…"
+                  : <>Calibrating vs <code className="mono">{calib.builtin}</code>…</>}</span>
               </div>
             )}
             {calib?.status === "done" && calib.calibrated && (
               <div style={{ color: "var(--st-green-fg, var(--ink))" }}>
-                Calibrated vs <code className="mono">{calib.builtin}</code>
-                {typeof calib.spearman === "number" ? ` (Spearman ${calib.spearman})` : ""}
-                {" "}— <strong>steering</strong> the run.
+                {calib.method === "task_derived" ? (
+                  <>Competence ladders agree
+                    {typeof calib.spearman === "number" ? ` (rho_min ${calib.spearman})` : ""}
+                    {" "}— <strong>steering</strong> the run.</>
+                ) : (
+                  <>Calibrated vs <code className="mono">{calib.builtin}</code>
+                    {typeof calib.spearman === "number" ? ` (Spearman ${calib.spearman})` : ""}
+                    {" "}— <strong>steering</strong> the run.</>
+                )}
               </div>
             )}
             {calib?.status === "done" && !calib.calibrated && (
               <div style={{ color: "var(--st-amber-fg)" }}>
-                Did not pass calibration vs <code className="mono">{calib.builtin}</code>
-                {typeof calib.spearman === "number" ? ` (Spearman ${calib.spearman} < 0.7)` : ""}
-                {" "}— runs <strong>observe-only</strong>.
+                {calib.method === "task_derived" ? (
+                  <>{calib.reason || "Task-derived ladders disagree"} — runs <strong>observe-only</strong>.</>
+                ) : (
+                  <>Did not pass calibration vs <code className="mono">{calib.builtin}</code>
+                    {typeof calib.spearman === "number" ? ` (Spearman ${calib.spearman} < 0.7)` : ""}
+                    {" "}— runs <strong>observe-only</strong>.</>
+                )}
               </div>
             )}
             {calib?.status === "skipped" && (
               <div style={{ color: "var(--rs-muted)" }}>
-                No matching built-in ground truth — runs observe-only.
+                {calib.reason || "No matching built-in ground truth"} — runs observe-only.
               </div>
             )}
           </div>

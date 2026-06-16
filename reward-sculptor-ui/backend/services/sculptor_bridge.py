@@ -180,6 +180,19 @@ def calibrate_objective_metric(
     return _cal(metric_path, builtin_name, threshold=threshold)
 
 
+def calibrate_task_derived_metric(
+    metric_path: "Path", behavior_goal: str,
+    robot_hint: Optional[str] = None, *, client: Any = None, k_sources: int = 3,
+) -> dict:
+    """§Ship 51: earn steer-rights on a NOVEL task (no built-in ground truth)
+    by ranking K independently-authored competence ladders. `client` is
+    injectable for tests (else a real Anthropic client is constructed)."""
+    from sculptor.eval import calibrate_task_derived as _cal
+
+    return _cal(metric_path, behavior_goal, robot_hint,
+                client=client, k_sources=k_sources)
+
+
 def builtin_spec_metric_names() -> list[str]:
     """The hand-authored ground-truth metric names (for calibration UI)."""
     from sculptor.eval import spec_metric_names
