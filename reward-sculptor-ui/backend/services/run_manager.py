@@ -47,6 +47,15 @@ _GEN_ID_RE = re.compile(r"^[A-Za-z0-9_]+$")
 #: calibration only ever runs observe-only.
 _TASK_DERIVED_ENABLED = os.getenv("RS_TASK_DERIVED_CALIBRATION", "1") == "1"
 
+#: §Ship 53: gate the L3 adversarial gaming-archetype check (an independent,
+#: metric-blind author proposes ~3 OFF-GOAL gaming policies; a metric that scores
+#: any in competent territory is GAMEABLE and DENIED steer-rights). DEFAULT OFF —
+#: it can DENY a grant the L2 ladders gave, so it ships dormant until audited; set
+#: RS_ADVERSARIAL_ARCHETYPES=1 to enforce. Adds ONE metric-blind author call on a
+#: novel-task launch, only when the ladders already grant. Observe-only stays
+#: never-silent: a gameable deny names the gaming policy + its score.
+_ADVERSARIAL_ENABLED = os.getenv("RS_ADVERSARIAL_ARCHETYPES", "0") == "1"
+
 #: §Ship 42: dropdown sentinel — "generate the objective metric at launch as the
 #: run's first phase" (vs picking an existing built-in / gen:<id>). Ship 43 runs
 #: the generation pre-phase and rewrites fitness_metric to gen:<new id> before
@@ -242,15 +251,19 @@ async def _generate_at_launch(
                 try:
                     cal = await asyncio.wait_for(
                         asyncio.to_thread(metric_store.calibrate_task_derived,
-                                          project_dir, gid, behavior_goal, robot_hint),
+                                          project_dir, gid, behavior_goal, robot_hint,
+                                          adversarial=_ADVERSARIAL_ENABLED),
                         timeout=300.0)
                     c = cal.get("calibration") or {}
+                    adv = c.get("adversarial") or {}
                     job.emit({"type": "metric_calibration_done", "source": "launch_gen",
                               "gen_id": gid, "method": "task_derived",
                               "calibrated": bool(cal.get("calibrated")),
                               "spearman": c.get("rho_min"),
                               "rho_min": c.get("rho_min"),
                               "agreement_fraction": c.get("agreement_fraction"),
+                              "adversarial_ran": bool(adv.get("ran")),
+                              "gameable": bool(adv.get("gameable")),
                               "trust": (cal.get("trust") or {}).get("trust"),
                               "reason": c.get("reason")})
                 except asyncio.TimeoutError:

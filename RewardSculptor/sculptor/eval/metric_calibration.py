@@ -277,6 +277,153 @@ def _author_ladder(client: Any, model: str, payload: dict) -> Any:
     return resp.parsed_output
 
 
+# ── §Ship 53: adversarial gaming archetypes (L3) ─────────────────────────
+#: An INDEPENDENT, metric-blind author proposes ~N OFF-GOAL "gaming policies"
+#: (degenerate behaviors a naive metric scores high). Each is rendered with the
+#: Ship-51 synthesizer and scored; the metric is GAMEABLE iff any gaming policy
+#: scores in COMPETENT territory. Generalizes Ship-47's hard-coded walker/flail
+#: negatives to ANY task. Validated against the built-ins (which score plausible
+#: gaming ≤0.15 vs competent 0.37-0.76, ratio ≤0.33) and a gameable raw-|jv|
+#: metric (tremor-gaming 1.0 vs competent 0.03): a 0.6×competent relative ceiling
+#: with a 0.5 absolute backstop separates them with headroom.
+_ADV_REL_CEIL = 0.6      # gaming must score below 0.6 × the competent reference
+_ADV_ABS_CEIL = 0.5      # AND below 0.5 absolute (no gaming may look half-competent)
+_ADV_N = 3               # archetypes the blind author proposes
+
+
+def _author_gaming(client: Any, model: str, payload: dict) -> Any:
+    """One blind gaming-archetype author call → a GamingArchetypeSet. Given ONLY
+    the goal/robot/joint_names — never any metric (same firewall as the ladder
+    author). Returns the parsed pydantic object."""
+    from sculptor.eval.ladder_synth import GamingArchetypeSet
+    from sculptor.prompts import load_prompt
+
+    system_prompt = load_prompt("gen_gaming_archetypes")
+    resp = client.messages.parse(
+        model=model,
+        max_tokens=4000,
+        thinking={"type": "adaptive"},
+        system=system_prompt,
+        messages=[{"role": "user",
+                   "content": json.dumps(payload, indent=2, default=str)}],
+        output_format=GamingArchetypeSet,
+    )
+    return resp.parsed_output
+
+
+def adversarial_archetype_gate(
+    gen_fn: Any,
+    roles: Any,
+    joint_names: list[str],
+    competent_ref: float,
+    *,
+    client: Any,
+    model: str = _TD_MODEL_ID,
+    base_payload: Optional[dict] = None,
+    metric_src: str = "",
+    n_archetypes: int = _ADV_N,
+    rel_ceil: float = _ADV_REL_CEIL,
+    abs_ceil: float = _ADV_ABS_CEIL,
+) -> dict[str, Any]:
+    """§Ship 53 (L3): an INDEPENDENT, metric-blind author proposes `n_archetypes`
+    OFF-GOAL gaming policies for the goal; each is rendered (Ship-51 synthesizer)
+    and scored by the metric. The metric is GAMEABLE iff some gaming policy scores
+    in competent territory — at or above `min(rel_ceil·competent_ref, abs_ceil)`.
+
+    NEVER raises and NEVER denies on ABSENCE of evidence (an author crash, a
+    leaked/echoed payload, or zero renderable archetypes leaves `ok=True` with a
+    specific `reason`); a denial requires POSITIVE evidence of a gaming policy
+    beating competence. Provenance (payload/context/response hashes, per-archetype
+    scores) is recorded for meta.json. Mirrors the ladder author's anti-collusion
+    disciplines: the metric source is NEVER in the payload (hard self-check) and a
+    set that echoes the metric source is dropped (soft guard)."""
+    from sculptor.eval.ladder_synth import render_rung
+
+    base_payload = base_payload or {}
+    payload = {**base_payload, "n_archetypes": n_archetypes}
+    rec: dict[str, Any] = {
+        "ran": False, "ok": True, "gameable": False, "reason": None,
+        "competent_ref": round(float(competent_ref), 4),
+        "model_id": model, "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "rel_ceil": rel_ceil, "abs_ceil": abs_ceil,
+        "payload_sha256": _sha(payload), "context_sha256": _sha(base_payload),
+        "archetypes": [],
+    }
+
+    # HARD anti-collusion self-check: WE built `payload`, so the metric must not
+    # appear in it. A hit is a programmer error here — skip (don't deny on a bug).
+    payload_text = json.dumps(payload, default=str)
+    if "def compute_spec" in payload_text or (
+            metric_src and metric_src[:120] in payload_text):
+        rec["reason"] = "adversarial: metric leaked into author payload (bug) — gate skipped"
+        return rec
+
+    try:
+        gset = _author_gaming(client, model, payload)
+    except Exception as e:  # noqa: BLE001 — a failed author call = no evidence
+        rec["reason"] = (f"adversarial: author call failed "
+                         f"({type(e).__name__}) — inconclusive, not enforced")
+        return rec
+
+    rec["response_sha256"] = _sha(getattr(gset, "model_dump", lambda: {})())
+    rec["goal_restated"] = getattr(gset, "goal_restated", "")
+    # SOFT anti-collusion: a set that echoes the metric source is dropped wholesale.
+    gset_text = json.dumps(getattr(gset, "model_dump", lambda: {})(), default=str)
+    if metric_src and any(
+            metric_src[i:i + 40] in gset_text
+            for i in range(0, max(0, len(metric_src) - 40), 40)):
+        rec["reason"] = "adversarial: archetypes echo metric source — dropped, not enforced"
+        return rec
+
+    worst, worst_name = 0.0, None
+    scored = 0
+    for i, arch in enumerate(list(getattr(gset, "archetypes", []) or [])[:6]):
+        motion = getattr(arch, "motion", None)
+        name = getattr(arch, "name", "gaming")
+        if motion is None or getattr(motion, "degenerate_axis", False):
+            rec["archetypes"].append({"name": name, "skipped": "degenerate_axis"})
+            continue
+        # Render + role-inject + score under ONE guard so a single malformed
+        # archetype degrades to "skipped" (no evidence) rather than propagating —
+        # render_rung/inject_joint_roles are documented never-raise, but this keeps
+        # invariant 1 (the gate NEVER raises) airtight against a future regression.
+        try:
+            arrays, behavior, meta = render_rung(motion, joint_names, rung_index=500 + i)
+            inject_joint_roles(meta, roles)
+            s = float(gen_fn(arrays, behavior, meta).get("spec_score", 0.0))
+            resolved = meta.get("groups_resolved_counts", {})
+        except Exception as e:  # noqa: BLE001 — unrenderable/unscorable = no evidence
+            rec["archetypes"].append(
+                {"name": name, "skipped": f"render/score error: {type(e).__name__}"})
+            continue
+        scored += 1
+        rec["archetypes"].append({
+            "name": name, "strategy": str(getattr(arch, "strategy", ""))[:160],
+            "score": round(s, 4), "resolved": resolved,
+        })
+        if s > worst:
+            worst, worst_name = s, name
+
+    rec["ran"] = scored > 0
+    rec["worst_gaming"] = round(worst, 4)
+    rec["worst_name"] = worst_name
+    if scored == 0:
+        rec["reason"] = "adversarial: no renderable gaming archetype — inconclusive, not enforced"
+        return rec
+
+    ceiling = min(rel_ceil * float(competent_ref), abs_ceil)
+    rec["ceiling"] = round(ceiling, 4)
+    gameable = (worst >= rel_ceil * float(competent_ref)) or (worst >= abs_ceil)
+    rec["gameable"] = bool(gameable)
+    rec["ok"] = not gameable
+    if gameable:
+        rec["reason"] = (
+            f"adversarial: gaming policy {worst_name!r} scored {worst:.3f} "
+            f"≥ ceiling {ceiling:.3f} (competent {competent_ref:.3f}) — "
+            f"metric is gameable")
+    return rec
+
+
 def calibrate_task_derived(
     generated_module_path: Path | str,
     behavior_goal: str,
@@ -289,6 +436,8 @@ def calibrate_task_derived(
     per_source_thresh: float = _TD_PER_SOURCE_THRESH,
     rho_floor: float = _TD_RHO_FLOOR,
     agree_floor: float = _TD_AGREE_FLOOR,
+    adversarial: bool = False,
+    adversarial_n: int = _ADV_N,
 ) -> dict[str, Any]:
     """§Ship 51: earn steer-rights on a NOVEL task (no built-in ground truth)
     by ranking K INDEPENDENTLY-authored competence ladders. Each of K sources
@@ -299,13 +448,20 @@ def calibrate_task_derived(
     `n_valid ≥ 2` AND the ladders are non-degenerate. NEVER raises — every
     failure mode is a specific observe-only `reason` (the run stays alive).
 
+    §Ship 53 (L3): when `adversarial=True` (flag-gated; default off so the grant
+    is unchanged) and the ladders already grant, an INDEPENDENT metric-blind
+    author proposes gaming policies (`adversarial_archetype_gate`); a metric that
+    scores any off-goal gaming policy in competent territory is GAMEABLE and
+    DENIED (an extra task-specific required-loser). The verdict is recorded under
+    `adversarial` regardless; absence of evidence never denies.
+
     Record shape is a SUPERSET of `calibrate_metric` (so metric_store / the
     firewall / the UI need no change): `spearman` mirrors `rho_min`."""
     from sculptor.eval.ladder_synth import render_ladder
     from sculptor.eval.robot_manifest import robot_joint_names as _manifest
 
     def _record(ok, rho_min, agreement, sources, *, degenerate=False,
-                reason=None, n_valid=0, error=None) -> dict[str, Any]:
+                reason=None, n_valid=0, error=None, adversarial=None) -> dict[str, Any]:
         return {
             "ok": bool(ok), "method": "task_derived",
             "spearman": round(float(rho_min), 4),    # mirrors rho_min for the UI
@@ -316,7 +472,7 @@ def calibrate_task_derived(
             "per_source_thresh": per_source_thresh, "agree_floor": agree_floor,
             "behavior_goal": behavior_goal, "robot_hint": robot_hint,
             "degenerate": bool(degenerate), "reason": reason, "error": error,
-            "sources": sources,
+            "adversarial": adversarial, "sources": sources,
         }
 
     # Load the metric (a load failure is a hard, specific deny).
@@ -443,16 +599,39 @@ def calibrate_task_derived(
                               f"(of {k_sources}) — observe-only")
     rho_min = min(valid_rhos)
     agreement = n_agree / float(k_sources)
-    ok = (rho_min >= rho_floor) and (agreement >= agree_floor) and (n_valid >= _TD_MIN_VALID)
+    base_ok = (rho_min >= rho_floor) and (agreement >= agree_floor) and (n_valid >= _TD_MIN_VALID)
+
+    # §Ship 53 (L3): only when base_ok do we spend a call probing gameability —
+    # the metric's competent reference is its best top-rung score across valid
+    # sources (most charitable, hardest to false-deny). A gameable verdict is a
+    # task-specific extra required-loser, ANDed into the grant.
+    adv = None
+    if adversarial and base_ok:
+        try:
+            competent_ref = max(
+                (s["gen_scores"][-1] for s in sources
+                 if s.get("ladder_ok") and s.get("gen_scores")), default=0.0)
+            adv = adversarial_archetype_gate(
+                gen_fn, roles, names, competent_ref, client=client, model=model,
+                base_payload=base_payload, metric_src=metric_src,
+                n_archetypes=adversarial_n)
+        except Exception:  # noqa: BLE001 — an unexpected gate crash is NO evidence,
+            adv = None      # never a deny (calibrate_task_derived never raises)
+
+    adv_denies = bool(adv and adv.get("gameable"))
+    ok = base_ok and not adv_denies
     if ok:
         reason = None
+    elif adv_denies:
+        reason = adv.get("reason")
     elif rho_min < rho_floor:
         reason = (f"task-derived: ladders disagree (rho_min={rho_min:.2f} "
                   f"< {rho_floor:.2f}) — observe-only")
     else:
         reason = (f"task-derived: only {n_agree}/{k_sources} ladders agree "
                   f"(need {agree_floor:.2f}) — observe-only")
-    return _record(ok, rho_min, agreement, sources, n_valid=n_valid, reason=reason)
+    return _record(ok, rho_min, agreement, sources, n_valid=n_valid,
+                   reason=reason, adversarial=adv)
 
 
 # ── §Ship 52: one standardized trust score across both calibration paths ──

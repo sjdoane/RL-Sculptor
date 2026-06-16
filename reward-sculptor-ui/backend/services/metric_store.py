@@ -153,19 +153,20 @@ def calibrate(project_dir: Path, gid: str, builtin_name: str) -> dict[str, Any]:
 
 def calibrate_task_derived(
     project_dir: Path, gid: str, behavior_goal: str,
-    robot_hint: Optional[str] = None, *, client=None,
+    robot_hint: Optional[str] = None, *, client=None, adversarial: bool = False,
 ) -> dict[str, Any]:
     """§Ship 51: calibrate a stored metric against K independently-authored
     competence ladders (the novel-task path) and persist `calibrated` + the
     full per-source provenance into its meta.json. The grant flips at the SAME
-    point as the built-in path; `steer_allowed` is untouched."""
+    point as the built-in path; `steer_allowed` is untouched.
+    §Ship 53: `adversarial` adds the L3 gaming-archetype gate (flag-gated)."""
     d = _metrics_root(project_dir) / gid
     metric_py = d / "metric.py"
     meta = d / "meta.json"
     if not metric_py.is_file() or not meta.is_file():
         raise FileNotFoundError(f"generated metric {gid!r} not found")
     cal = sculptor_bridge.calibrate_task_derived_metric(
-        metric_py, behavior_goal, robot_hint, client=client)
+        metric_py, behavior_goal, robot_hint, client=client, adversarial=adversarial)
     rec = json.loads(meta.read_text(encoding="utf-8"))
     # §Ship 52: unified grant + standardized trust score (same shape as builtin).
     fin = sculptor_bridge.finalize_calibration(cal, rec.get("validation"))

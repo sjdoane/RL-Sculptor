@@ -20,6 +20,7 @@ from sculptor.eval.generated_metric import (
     resolve_fitness_fn,
 )
 from sculptor.eval.metric_calibration import (
+    adversarial_archetype_gate,
     calibrate_metric,
     calibrate_task_derived,
     compute_trust,
@@ -46,6 +47,7 @@ __all__ = [
     "make_generated_fitness_fn",
     "validate_generated_metric",
     "generate_objective_metric",
+    "adversarial_archetype_gate",
     "calibrate_metric",
     "calibrate_task_derived",
     "compute_trust",

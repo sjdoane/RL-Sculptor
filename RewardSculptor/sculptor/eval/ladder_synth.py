@@ -111,6 +111,29 @@ class CompetenceLadder(BaseModel):
     rungs: list[MotionSpec] = Field(default_factory=list)
 
 
+# ── §Ship 53: adversarial gaming archetypes (L3) ─────────────────────
+
+
+class GamingArchetype(BaseModel):
+    """One GAMING POLICY: an OFF-GOAL behavior a naive metric might score high
+    (stand-and-flail, fall-rhythmically, walk-away, vibrate). A `motion` is the
+    SAME renderable `MotionSpec` vocabulary as a ladder rung — gaming policies
+    are just MotionSpecs that do NOT achieve the goal. `strategy` is the blind
+    author's one-line rationale for HOW it tries to fool a proxy."""
+
+    name: str = "gaming"
+    strategy: str = ""
+    motion: MotionSpec = Field(default_factory=MotionSpec)
+
+
+class GamingArchetypeSet(BaseModel):
+    """What the adversarial author returns: a restated goal + a few gaming
+    policies. The author is metric-BLIND (sees only goal/robot/joint_names)."""
+
+    goal_restated: str = ""
+    archetypes: list[GamingArchetype] = Field(default_factory=list)
+
+
 # ── helpers ──────────────────────────────────────────────────────────
 
 

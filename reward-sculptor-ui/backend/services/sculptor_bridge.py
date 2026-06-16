@@ -183,14 +183,17 @@ def calibrate_objective_metric(
 def calibrate_task_derived_metric(
     metric_path: "Path", behavior_goal: str,
     robot_hint: Optional[str] = None, *, client: Any = None, k_sources: int = 3,
+    adversarial: bool = False,
 ) -> dict:
     """§Ship 51: earn steer-rights on a NOVEL task (no built-in ground truth)
     by ranking K independently-authored competence ladders. `client` is
-    injectable for tests (else a real Anthropic client is constructed)."""
+    injectable for tests (else a real Anthropic client is constructed).
+    §Ship 53: `adversarial` adds the L3 gaming-archetype gate (flag-gated, may
+    DENY the grant); default off keeps the grant byte-identical to Ship 51."""
     from sculptor.eval import calibrate_task_derived as _cal
 
     return _cal(metric_path, behavior_goal, robot_hint,
-                client=client, k_sources=k_sources)
+                client=client, k_sources=k_sources, adversarial=adversarial)
 
 
 def finalize_calibration(calibration: dict, validation: Optional[dict]) -> dict:

@@ -339,6 +339,74 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-15 — Ship 53: adversarial gaming archetypes (L3)
+
+- **What**: generalize Ship-47's HARD-CODED walker/flail negatives to ANY task.
+  New `metric_calibration.adversarial_archetype_gate()` + `_author_gaming()` +
+  constants (`_ADV_REL_CEIL=0.6`, `_ADV_ABS_CEIL=0.5`, `_ADV_N=3`); new prompt
+  `prompts/gen_gaming_archetypes.md` (an INDEPENDENT, metric-BLIND red-team author
+  proposes ~3 OFF-GOAL "gaming policies"); new `ladder_synth.GamingArchetype` /
+  `GamingArchetypeSet` (gaming policies are just `MotionSpec`s, rendered by the
+  Ship-51 `render_rung`). Folded into `calibrate_task_derived(..., adversarial=
+  False)`: when the K ladders ALREADY grant, the gate scores each gaming archetype;
+  the metric is GAMEABLE (denied) iff `worst_gaming ≥ 0.6·competent_ref` OR `≥ 0.5`
+  (competent_ref = max top-rung score across valid sources). The verdict is
+  recorded under `calibration.adversarial` (provenance hashes + per-archetype
+  scores → meta.json) regardless. Backend: `RS_ADVERSARIAL_ARCHETYPES` (default
+  OFF) threaded sculptor_bridge→metric_store→run_manager; `metric_calibration_done`
+  now emits `adversarial_ran`/`gameable`. Tests: 8 in
+  `test_task_derived_calibration.py` (`_FakeBothClient` branches on output_format).
+- **Why**: L0-L2 prove a metric ranks competence, but a metric can still be
+  GAMEABLE by an OFF-GOAL behavior the stationary ladders never test (a travelling
+  kicker, upright tremor). L3 has an independent adversary find those holes — the
+  task-agnostic generalization of the Ship-36/47 hand-coded non-degeneracy
+  negatives. The single biggest lever is a metric that reliably measures the
+  target movement; this denies steer-rights to one that can be gamed.
+- **How**: gaming policies REUSE the Ship-51 MotionSpec synthesizer (author blind
+  to metric internals; physical rendering it can't bias). Same disciplines as L2:
+  metric-source-never-in-payload (hard self-check + soft echo-drop), provenance
+  hashes, NEVER raises, NEVER denies on absence of evidence (author crash / 0
+  renderable archetypes → inconclusive, grant stands), flag-gated so default-off is
+  a byte-identical no-op (`adversarial=None`, zero extra LLM calls). Ceiling
+  constants tuned against the built-ins (plausible gaming ≤0.15 vs competent
+  0.37-0.76) + a gameable raw-|jv| metric (tremor 1.0) — 0.6×competent + 0.5 abs
+  separates with headroom. Gate runs ONLY when base_ok (keeps the minimal path
+  cheap; L3 is a booster per the design, not the minimal gate).
+- **Verified**: sculptor `pytest tests/ -q` → 710 passed (was 701, +9), 1 skip;
+  UI backend → 345 passed; frontend `pnpm typecheck` → exit 0. Empirical probes:
+  built-ins score gaming ≤0.15 vs competent 0.37-0.76; integrated `calibrate_task_
+  derived` denies a stationarity-less kick metric on a walk-away archetype and a
+  raw-|jv| metric on upright tremor (both passed L2 at rho_min 0.975), grants the
+  hardened metric, and is a true no-op with the flag off. Adversarial agent review
+  (3 lenses + per-finding verification, 24 agents): 21 findings, 0 real defects —
+  the verifier surfaced one never-raises caveat (render_rung/inject_joint_roles +
+  the gate call site were unguarded), closed with defense-in-depth try-guards +
+  a regression test (a metric that crashes on a gaming probe degrades to skip).
+
+### 2026-06-15 — repo presentation polish + resumed pushing to GitHub
+
+- **What**: authored the missing root `README.md` (monorepo front door: pitch, the
+  two subprojects, architecture, the L0-L5 trust pipeline, quickstart, layout, test
+  status); relocated ~14 internal session/handoff/design docs from the repo root
+  into `docs/internal/` (history preserved via rename); `.gitignore` now excludes
+  scratch/junk (`*:Zone.Identifier`, `=1`, `.thumbnail`, `design-prototype/`,
+  `_agg*.py`, scratch PR bodies); fixed the `RewardSculptor/README.md` link to the
+  relocated MJLAB note. Then PUSHED: `ship-20-ux-revamp` fast-forwarded 34 unpushed
+  commits (Ships ~22→52) to origin, and `main` was retargeted (force-with-lease) to
+  the same tip so the repo's default branch shows the real, complete project.
+- **Why**: pushing had lapsed ~6 days (remote stuck at `17ed04e`, 2026-06-09) and
+  the repo's default branch `main` was a separate unrelated-root lineage — a
+  visitor landed on a near-empty front page. Sam asked to resume pushing and make
+  the presentation professional.
+- **How**: WSL git tree was clean (the "modified RewardSculptor files" in the
+  Windows snapshot are CRLF artifacts; autocrlf unset). Staged only the
+  presentation files (no `git add -A`). `main` and `origin/main` had divergent
+  ROOTS (local `6b7e759` vs origin `fd0adf9`); retarget needed a force-push —
+  old origin/main tip `3b6c918` recorded for recovery. Both decisions (retarget
+  main; full polish) confirmed with Sam first.
+- **Verified**: `gh api` confirms `main`=`fd9710c`, README.md present (8.7 KB),
+  `docs/internal/` holds the 14 relocated docs. Repo is PRIVATE.
+
 ### 2026-06-15 — Ship 52: standardized trust score + L2 enabled by default
 
 - **What**: one trust scalar over BOTH calibration paths + a unified grant.
