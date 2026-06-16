@@ -60,3 +60,22 @@ RewardSculptor/tests/fixtures/_mjlab_go1_work/
 
 reward-sculptor-ui/logs/
 reward-sculptor-ui/backend/.pytest_cache/
+
+# ---------------------------------------------------------------------
+# Scratch / junk (never commit)
+
+# Windows alternate-data-stream metadata
+*:Zone.Identifier
+# Botched-redirect / stray artifacts
+=1
+.thumbnail
+RL-Sculptor.html
+# UI design exploration scratch (1 MB of screenshots, superseded)
+design-prototype/
+# Scratch PR bodies + one-off analysis scripts
+.pr-body-*.md
+_agg.py
+_agg2.py
+_report.py
+# Personal capstone seed (sibling AME456 work)
+ame456_kg_seeds.yml
