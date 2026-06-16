@@ -339,6 +339,44 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-15 — Ship 52: standardized trust score + L2 enabled by default
+
+- **What**: one trust scalar over BOTH calibration paths + a unified grant.
+  New `metric_calibration.compute_trust(calibration, validation)` →
+  `{trust, cal, evid, rho_min, agreement_fraction, gate_validate, gate_axioms}`
+  and `grant_decision(calibration, validation)`; both exported. New bridge
+  `sculptor_bridge.finalize_calibration(cal, validation) → {calibrated, trust}`.
+  Both `metric_store.calibrate` (built-in) and `calibrate_task_derived` now set
+  `calibrated` via the unified grant + persist `trust` (surfaced by `_summary`).
+  `run_manager` emits `trust` on both `metric_calibration_done` events; `RunsTab`
+  shows "· trust X". ALSO: flipped `RS_TASK_DERIVED_CALIBRATION` to DEFAULT ON
+  (Sam's call) so a NOVEL-task launch now runs the Ship-51 task-derived path
+  (set =0 to disable). Tests: `tests/test_metric_trust.py` (8).
+- **Why**: Ships 44/51 produced two separate calibration outcomes (built-in
+  Spearman vs task-derived rho_min+agreement) with no common confidence view.
+  Ship-52 puts both on ONE scale (`trust ∈ [0,1]`) with a per-layer breakdown so
+  the UI can show how confident a grant is, and folds both into one grant
+  predicate.
+- **How**: `trust = 0.6·CAL + 0.4·EVID`, `CAL = clip((rho_min−0.5)/0.5,0,1)`,
+  `EVID = gate_pass(validate)·gate_pass(axioms)·agreement_fraction`. DEVIATION
+  FROM THE DESIGN DOC (deliberate, documented in `compute_trust`): the doc's
+  literal "steer ⟺ trust ≥ 0.7" is internally INCONSISTENT — it must both reduce
+  to the built-in `rho ≥ 0.7` AND admit the task-derived `rho_min ≥ 0.5` floor
+  (which has trust ≈ 0.27), and no single threshold on this scalar does both. So
+  trust is a DISPLAY confidence and the GRANT stays each path's own gate ANDed
+  with validate ∧ axioms: `grant = cal.ok ∧ validate.ok ∧ axioms.ok`. For an
+  ACCEPTED metric validate ∧ axioms are already true, so this is BYTE-IDENTICAL
+  to today for the 5 built-ins (grant ⟺ rho ≥ 0.7); the re-assertion is
+  defense-in-depth (a record showing a failed gate can never silently steer).
+  The firewall (`steer_allowed` reads `meta.calibrated`) is UNTOUCHED.
+- **Verified**: `tests/test_metric_trust.py` (8) — trust at the built-in
+  boundary (rho 0.7 → 0.64), perfect built-in → 1.0, task-derived floor → 0.27
+  (< 0.7, why it can't gate), axiom-failure sinks EVID, and grant byte-identical
+  + gate-blocks-on-failure. sculptor `pytest tests/`; backend `pytest`; frontend
+  `pnpm typecheck` (exit 0; the calibration card only renders during a live
+  launch-gen run, so browser preview is N/A — typecheck is the gate). NEXT per
+  the roadmap: Ship-53 (adversarial archetypes) then cost-gated L5/L4.
+
 ### 2026-06-15 — Ship 51: L2 task-derived competence ladders (novel-task steer-rights)
 
 - **What**: a generated metric can now EARN STEER-RIGHTS on a NOVEL task (no

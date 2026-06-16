@@ -39,10 +39,13 @@ ITER_DIR_RE = re.compile(r"^iter_(\d+)$")
 _GEN_ID_RE = re.compile(r"^[A-Za-z0-9_]+$")
 
 #: §Ship 51: gate the L2 task-derived calibration path (novel-task steer-rights
-#: via K independently-authored competence ladders). DEFAULT OFF — flip on only
-#: after a manual audit confirms no known-bad metric is granted (per the design
-#: doc). The built-in calibration path (the 5 families) is unaffected.
-_TASK_DERIVED_ENABLED = os.getenv("RS_TASK_DERIVED_CALIBRATION", "0") == "1"
+#: via K independently-authored competence ladders). DEFAULT ON (Sam's call,
+#: 2026-06-15) — set RS_TASK_DERIVED_CALIBRATION=0 to disable. Adds ~3 metric-
+#: blind LLM author calls (~60s, pre-GPU) on a NOVEL-task launch only; the 5
+#: built-in families take the unchanged built-in calibration path. The firewall
+#: still gates steering on a genuine grant, so an enabled-but-failing
+#: calibration only ever runs observe-only.
+_TASK_DERIVED_ENABLED = os.getenv("RS_TASK_DERIVED_CALIBRATION", "1") == "1"
 
 #: §Ship 42: dropdown sentinel — "generate the objective metric at launch as the
 #: run's first phase" (vs picking an existing built-in / gen:<id>). Ship 43 runs
@@ -219,9 +222,10 @@ async def _generate_at_launch(
                     cal = await asyncio.to_thread(
                         metric_store.calibrate, project_dir, gid, builtin)
                     job.emit({"type": "metric_calibration_done", "source": "launch_gen",
-                              "gen_id": gid, "builtin": builtin,
+                              "gen_id": gid, "builtin": builtin, "method": "builtin",
                               "calibrated": bool(cal.get("calibrated")),
-                              "spearman": (cal.get("calibration") or {}).get("spearman")})
+                              "spearman": (cal.get("calibration") or {}).get("spearman"),
+                              "trust": (cal.get("trust") or {}).get("trust")})
                 except Exception as e:  # noqa: BLE001 — calibration failure ≠ run failure
                     job.emit({"type": "metric_calibration_done", "source": "launch_gen",
                               "gen_id": gid, "builtin": builtin, "calibrated": False,
@@ -247,6 +251,7 @@ async def _generate_at_launch(
                               "spearman": c.get("rho_min"),
                               "rho_min": c.get("rho_min"),
                               "agreement_fraction": c.get("agreement_fraction"),
+                              "trust": (cal.get("trust") or {}).get("trust"),
                               "reason": c.get("reason")})
                 except asyncio.TimeoutError:
                     job.emit({"type": "metric_calibration_done", "source": "launch_gen",

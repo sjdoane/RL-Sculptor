@@ -453,3 +453,65 @@ def calibrate_task_derived(
         reason = (f"task-derived: only {n_agree}/{k_sources} ladders agree "
                   f"(need {agree_floor:.2f}) — observe-only")
     return _record(ok, rho_min, agreement, sources, n_valid=n_valid, reason=reason)
+
+
+# ── §Ship 52: one standardized trust score across both calibration paths ──
+
+_TRUST_W_CAL = 0.6
+_TRUST_W_EVID = 0.4
+
+
+def compute_trust(
+    calibration: Optional[dict], validation: Optional[dict] = None,
+) -> dict[str, Any]:
+    """A single standardized CONFIDENCE scalar (built-in OR task-derived) plus
+    the per-layer breakdown the UI shows:
+
+        trust = w_cal·CAL + w_evi·EVID
+        CAL   = clip((rho_min − 0.5) / 0.5, 0, 1)        # rank evidence
+        EVID  = gate_pass(validate) · gate_pass(axioms) · agreement_fraction
+
+    `rho_min` is the built-in `spearman` for the 5 families (a single ground-
+    truth source, agreement 1.0) or the task-derived `rho_min` over K sources.
+
+    DESIGN NOTE: trust is a DISPLAY confidence, NOT the steer gate. The design
+    doc's literal "trust ≥ 0.7 gates steering" is internally inconsistent — it
+    must BOTH reduce to the built-in rho ≥ 0.7 AND admit the task-derived
+    rho_min ≥ 0.5 floor, and no single threshold on this scalar does both (a
+    floor task-derived grant has trust ≈ 0.27). So the GRANT stays each path's
+    own gate (see `grant_decision`); trust ranks how confident a grant is."""
+    cal = calibration or {}
+    rho_min = cal.get("rho_min")
+    if rho_min is None:
+        rho_min = cal.get("spearman", 0.0)
+    rho_min = float(rho_min or 0.0)
+    agreement = float(cal.get("agreement_fraction", 1.0) or 0.0)
+    cal_term = float(np.clip((rho_min - 0.5) / 0.5, 0.0, 1.0))
+    v = validation or {}
+    gate_validate = bool(v.get("ok", True))
+    gate_axioms = bool((v.get("axioms") or {}).get("ok", True))
+    evid = (1.0 if gate_validate else 0.0) * (1.0 if gate_axioms else 0.0) * agreement
+    trust = _TRUST_W_CAL * cal_term + _TRUST_W_EVID * evid
+    return {
+        "trust": round(float(trust), 4),
+        "cal": round(cal_term, 4), "evid": round(float(evid), 4),
+        "rho_min": round(rho_min, 4), "agreement_fraction": round(agreement, 4),
+        "method": cal.get("method", "builtin"),
+        "gate_validate": gate_validate, "gate_axioms": gate_axioms,
+        "w_cal": _TRUST_W_CAL, "w_evid": _TRUST_W_EVID,
+    }
+
+
+def grant_decision(
+    calibration: Optional[dict], validation: Optional[dict] = None,
+) -> bool:
+    """The unified steer-rights grant: the path's own calibration `ok` ANDed
+    with validate ∧ axioms. For an ACCEPTED metric validate ∧ axioms are
+    already true, so this is BYTE-IDENTICAL to today for the 5 built-ins
+    (grant ⟺ rho ≥ 0.7) — the re-assertion is defense-in-depth (a metric whose
+    persisted record shows a failed gate can never silently steer)."""
+    cal = calibration or {}
+    v = validation or {}
+    gate_validate = bool(v.get("ok", True))
+    gate_axioms = bool((v.get("axioms") or {}).get("ok", True))
+    return bool(cal.get("ok")) and gate_validate and gate_axioms

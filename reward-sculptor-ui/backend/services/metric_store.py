@@ -87,6 +87,8 @@ def _summary(gid: str, rec: dict) -> dict[str, Any]:
         "calibration": rec.get("calibration"),
         # §Ship 51: "builtin" | "task_derived" so the UI can show the right card.
         "calibration_method": rec.get("calibration_method"),
+        # §Ship 52: standardized trust score + per-layer breakdown.
+        "trust": rec.get("trust"),
         "source": rec.get("source"),
         "recorded_at": rec.get("recorded_at"),
     }
@@ -139,9 +141,12 @@ def calibrate(project_dir: Path, gid: str, builtin_name: str) -> dict[str, Any]:
         raise FileNotFoundError(f"generated metric {gid!r} not found")
     cal = sculptor_bridge.calibrate_objective_metric(metric_py, builtin_name)
     rec = json.loads(meta.read_text(encoding="utf-8"))
-    rec["calibrated"] = bool(cal.get("ok"))
+    # §Ship 52: unified grant (byte-identical here) + standardized trust score.
+    fin = sculptor_bridge.finalize_calibration(cal, rec.get("validation"))
+    rec["calibrated"] = fin["calibrated"]
     rec["calibration"] = cal
     rec["calibration_method"] = "builtin"
+    rec["trust"] = fin["trust"]
     meta.write_text(json.dumps(rec, indent=2, default=str), encoding="utf-8")
     return _summary(gid, rec)
 
@@ -162,8 +167,11 @@ def calibrate_task_derived(
     cal = sculptor_bridge.calibrate_task_derived_metric(
         metric_py, behavior_goal, robot_hint, client=client)
     rec = json.loads(meta.read_text(encoding="utf-8"))
-    rec["calibrated"] = bool(cal.get("ok"))
+    # §Ship 52: unified grant + standardized trust score (same shape as builtin).
+    fin = sculptor_bridge.finalize_calibration(cal, rec.get("validation"))
+    rec["calibrated"] = fin["calibrated"]
     rec["calibration"] = cal
     rec["calibration_method"] = "task_derived"
+    rec["trust"] = fin["trust"]
     meta.write_text(json.dumps(rec, indent=2, default=str), encoding="utf-8")
     return _summary(gid, rec)

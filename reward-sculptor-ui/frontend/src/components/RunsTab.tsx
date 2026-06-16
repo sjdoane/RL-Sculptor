@@ -321,6 +321,7 @@ function RunDetailPane({ slug, runId, runs }: { slug: string; runId: string; run
       status: "running" | "done" | "skipped";
       builtin?: string; calibrated?: boolean; spearman?: number | null;
       method?: string; agreement_fraction?: number | null; reason?: string | null;
+      trust?: number | null;
     } | null = null;
     for (const ev of events.events) {
       const e = ev as {
@@ -328,6 +329,7 @@ function RunDetailPane({ slug, runId, runs }: { slug: string; runId: string; run
         max?: number; gen_id?: string; reasons?: string[]; concerns?: string[];
         error?: string; builtin?: string; calibrated?: boolean; spearman?: number | null;
         method?: string; agreement_fraction?: number | null; reason?: string | null;
+        trust?: number | null;
       };
       if (e.type === "metric_generation_started") { started = true; outcome = null; last = null; calib = null; awaiting = false; }
       else if (e.type === "metric_generation_progress") {
@@ -343,7 +345,8 @@ function RunDetailPane({ slug, runId, runs }: { slug: string; runId: string; run
       else if (e.type === "metric_calibration_started") { calib = { status: "running", builtin: e.builtin, method: e.method }; }
       else if (e.type === "metric_calibration_done") {
         calib = { status: "done", builtin: e.builtin, calibrated: e.calibrated, spearman: e.spearman,
-                  method: e.method, agreement_fraction: e.agreement_fraction, reason: e.reason };
+                  method: e.method, agreement_fraction: e.agreement_fraction, reason: e.reason,
+                  trust: e.trust };
       }
       else if (e.type === "metric_calibration_skipped") { calib = { status: "skipped", reason: e.reason }; }
     }
@@ -825,6 +828,7 @@ function MetricGenPhase({ phase, busy, onRetry, onContinueBlind }: {
       status: "running" | "done" | "skipped";
       builtin?: string; calibrated?: boolean; spearman?: number | null;
       method?: string; agreement_fraction?: number | null; reason?: string | null;
+      trust?: number | null;
     } | null;
     awaiting: boolean;
   };
@@ -881,6 +885,9 @@ function MetricGenPhase({ phase, busy, onRetry, onContinueBlind }: {
                     {typeof calib.spearman === "number" ? ` (Spearman ${calib.spearman})` : ""}
                     {" "}— <strong>steering</strong> the run.</>
                 )}
+                {typeof calib.trust === "number" ? (
+                  <span style={{ color: "var(--rs-muted)" }}> · trust {calib.trust}</span>
+                ) : ""}
               </div>
             )}
             {calib?.status === "done" && !calib.calibrated && (

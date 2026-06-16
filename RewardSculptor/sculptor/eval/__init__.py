@@ -22,6 +22,8 @@ from sculptor.eval.generated_metric import (
 from sculptor.eval.metric_calibration import (
     calibrate_metric,
     calibrate_task_derived,
+    compute_trust,
+    grant_decision,
 )
 from sculptor.eval.metric_gen import generate_objective_metric
 from sculptor.eval.metric_validate import validate_generated_metric
@@ -46,6 +48,8 @@ __all__ = [
     "generate_objective_metric",
     "calibrate_metric",
     "calibrate_task_derived",
+    "compute_trust",
+    "grant_decision",
     "CONDITIONS",
     "CampaignConfig",
     "EvalCondition",

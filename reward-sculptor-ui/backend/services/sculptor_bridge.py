@@ -193,6 +193,18 @@ def calibrate_task_derived_metric(
                 client=client, k_sources=k_sources)
 
 
+def finalize_calibration(calibration: dict, validation: Optional[dict]) -> dict:
+    """§Ship 52: the unified grant + standardized trust score over both
+    calibration paths. Returns `{calibrated: bool, trust: {...}}`. The grant is
+    byte-identical to today for the 5 built-ins; trust is a display confidence."""
+    from sculptor.eval import compute_trust, grant_decision
+
+    return {
+        "calibrated": bool(grant_decision(calibration, validation)),
+        "trust": compute_trust(calibration, validation),
+    }
+
+
 def builtin_spec_metric_names() -> list[str]:
     """The hand-authored ground-truth metric names (for calibration UI)."""
     from sculptor.eval import spec_metric_names
