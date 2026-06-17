@@ -20,6 +20,15 @@ export interface ProjectSummary {
   // M6: populated when the project references an adapter no longer in
   // ADAPTER_REGISTRY. UI shows a banner hinting at "fork to upgrade".
   migration_warning?: string | null;
+  // §Ship 22b (re-skin, Finding A): additive card enrichment from
+  // GET /projects. Config fields filled by ProjectStore.list(); metric
+  // fields filled by the route from the latest sculpt_run.
+  adapter_class?: string | null;
+  library_slug?: string | null;
+  num_envs?: number | null;
+  device?: string | null;
+  primary_metric?: number | null;
+  primary_metric_history?: Array<number | null>;
 }
 
 export interface ProjectDetail extends ProjectSummary {
@@ -274,6 +283,7 @@ export type JobKind =
   | "kg_ingest"
   | "kg_extract"
   | "kg_ingest_extract"
+  | "kg_research"
   | "kg_viz_render"
   | "sculpt_run";
 
@@ -328,10 +338,76 @@ export interface RunParamsPayload {
   rollout_episodes?: number | null;
   seed?: number | null;
   auto_adjust_physics?: boolean | null;
-  // Ship-9a — per-run early-stop control
+  // Legacy compatibility no-ops; metric-plateau auto-kill is disabled.
   early_stop_enabled?: boolean | null;
   early_stop_patience?: number | null;
+  // §Ship 34/35 — objective fitness-in-the-loop. A built-in spec name
+  // (go1_trot / g1_kick / g1_jump / g1_floss / cartpole_balance) or a generated
+  // metric id ("gen:<id>"); null = the blind loop. §Ship 42: the sentinel
+  // "generate-at-launch" defers generation to the run's first phase (see
+  // run_manager LAUNCH_GEN_SENTINEL).
+  fitness_metric?: string | null;
+  // observe = compute + display only (no influence); steer = drives the loop.
+  fitness_mode?: "observe" | "steer";
+  // §Ship 48: patience for the fitness-plateau early stop (the LIVE early
+  // stop on a steered run; the early_stop_* fields above are a no-op for it).
+  // null → sculpt default (2). The UI sends 4 for hard exploratory skills.
+  fitness_patience?: number | null;
+  // §Ship 39 (H1): interactive start mode. "manual" pauses for human feedback
+  // at each iteration boundary (the UI default); "auto" runs straight through.
+  start_mode?: "manual" | "auto";
 }
+
+/** §Ship 39 (H1): the interactive control sidecar state (PATCH response). */
+export interface RunControlState {
+  mode: string;
+  resume_token: number;
+  feedback?: string | null;
+  stop: boolean;
+}
+
+/** §Ship 34: spec metrics selectable as in-loop objective fitness.
+ *  Mirrors sculptor.eval.spec_metrics._SPEC_FNS / the backend Literal. */
+export type SpecMetricName =
+  | "cartpole_balance"
+  | "g1_floss"
+  | "g1_jump"
+  | "g1_kick"
+  | "go1_trot";
+
+/** §Ship 35: an auto-generated objective metric (per project), referenced
+ *  in a run as fitness_metric = "gen:<id>". Observe-only until calibrated. */
+export interface MetricSummary {
+  id: string;
+  behavior_goal?: string | null;
+  accepted: boolean;
+  validation_passed: boolean;
+  calibrated: boolean;
+  review?: { approved?: boolean; concerns?: string[]; summary?: string } | null;
+  gates?: Record<string, boolean> | null;
+  reasons?: string[] | null;
+  archetype_scores?: Record<string, number> | null;
+  calibration?: { ok?: boolean; spearman?: number; builtin?: string } | null;
+  source?: string | null;
+  recorded_at?: string | null;
+}
+
+/** §Ship 40: live progress while a metric is being generated (polled). */
+export interface MetricGenProgress {
+  active: boolean;
+  stage?: string;
+  message?: string;
+  attempt?: number;
+  max?: number;
+}
+
+export const SPEC_METRIC_NAMES: SpecMetricName[] = [
+  "cartpole_balance",
+  "g1_floss",
+  "g1_jump",
+  "g1_kick",
+  "go1_trot",
+];
 
 // Extend RunSummary / RunDetail with the new Phase-6 classification
 // field. Existing callers that spread `...run` keep working.
@@ -373,6 +449,15 @@ export interface PhysicsEditSuggestionPayload {
   auto_apply_reason?: string;
 }
 
+/** §Ship 48: edits the diagnoser wanted but couldn't ground because the
+ *  adapter doesn't expose the needed field (requires_env_extension).
+ *  Informational only — an env extension is a code change, never
+ *  auto-applied. */
+export interface EnvExtensionSuggestionPayload {
+  terms: string[];
+  rationales?: string[];
+}
+
 export interface IterEventSummary {
   iter_index: number;
   status: "running" | "completed" | "errored" | "stopped";
@@ -396,6 +481,9 @@ export interface IterEventSummary {
   // "severe" AND project config has `auto_adjust_physics = true`. UI
   // surfaces as a chip that opens the Physics tab with prompt pre-filled.
   physics_edit_suggestion: PhysicsEditSuggestionPayload | null;
+  // §Ship 48: edits deferred for requires_env_extension this iter (the
+  // diagnoser wants a field the adapter doesn't expose). null when none.
+  env_extension_suggestion?: EnvExtensionSuggestionPayload | null;
   // Populated by `iter_progress` events emitted from inside the mjlab
   // training subprocess. Lets the Timeline panel render a live progress
   // bar for the running iter instead of a silent "running" spinner.
@@ -404,6 +492,12 @@ export interface IterEventSummary {
   pct?: number;
   elapsed_s?: number;
   eta_s?: number | null;
+  // §Ship 34: objective fitness-in-the-loop. `fitness` is this iter's
+  // ground-truth spec score; `best_fitness` is the best so far (the
+  // version best-by-fitness selection keeps). Both undefined for blind
+  // runs (no --fitness-metric).
+  fitness?: number | null;
+  best_fitness?: number | null;
 }
 
 export interface RunSummary {
@@ -414,11 +508,27 @@ export interface RunSummary {
   iterations_requested: number;
   iterations_completed: number;
   current_iter_index: number | null;
+  // §Ship 35: per-iter objective fitness (parallel to primary_metric_history).
+  // Empty/all-null for blind runs. When present, the UI foregrounds this as
+  // the primary metric and demotes the reward metric to secondary.
+  fitness_history?: Array<number | null>;
   primary_metric_history: Array<number | null>;
   started_at: string | null;
   ended_at: string | null;
   error: string | null;
   error_classification?: ErrorClassification | null;
+  // §Ship 21: distinguish standalone sculpt_run rows from per-stage
+  // mission_stage_run rows. The Runs sidebar groups stage runs under
+  // their parent mission. Backend defaults to "sculpt_run" for
+  // backward compatibility, so undefined === "sculpt_run".
+  kind?: "sculpt_run" | "mission_stage_run";
+  parent_id?: string | null;
+  mission_slug?: string | null;
+  stage_name?: string | null;
+  stage_index?: number | null;
+  // §Ship 39 (H1): current interactive mode ("manual" | "auto"); null for
+  // older / non-interactive runs. Restores the Auto/Manual toggle on reconnect.
+  mode?: string | null;
 }
 
 export interface RunDetail extends RunSummary {
@@ -527,6 +637,34 @@ export interface SystemKgStatsResponse {
   results: number;
   edges: number;
   embeddings: number;
+}
+
+/** GET/PUT /system/remote — persisted remote-GPU dispatch settings
+ * (§Ship 23d). Mirrors backend/services/remote_settings.RemoteSettings. */
+export interface RemoteSettings {
+  enabled: boolean;
+  host: string;
+  port: number;
+  user: string;
+  key_path: string;
+  remote_workdir: string;
+  remote_python: string;
+  device: string;
+  rollout_remote: boolean;
+}
+
+export interface RemoteDoctorCheck {
+  name: string;
+  ok: boolean;
+  detail: string;
+}
+
+/** POST /system/remote/doctor — Test-connection report. */
+export interface RemoteDoctorResponse {
+  ok: boolean;
+  host: string;
+  port: number;
+  checks: RemoteDoctorCheck[];
 }
 
 /** GET /projects/{slug}/rewards/{version}/diagnosis — shape of the
@@ -707,4 +845,121 @@ export interface AdapterInfo {
   supported_robot_categories: string[];
   adoption_guide_url: string;
   estimated_effort: string;
+}
+
+// ── Missions (Ship 18a) ─────────────────────────────────────────────
+// Mirrors backend/models/mission.py.
+
+export type StageStatus =
+  | "pending"
+  | "training"
+  | "succeeded"
+  | "failed"
+  | "skipped";
+
+export type MissionLifecycleStatus =
+  | "ready"
+  | "running"
+  | "completed"
+  | "halted"
+  | "errored";
+
+export type MissionJobKind = "mission_decompose" | "mission_execute";
+
+export interface StageSchema {
+  name: string;
+  goal_text: string;
+  success_criterion: string;
+  max_iterations: number;
+  parent_stage: string | null;
+  reward_seed_prompt: string;
+  kg_seed_papers: string[];
+
+  status: StageStatus;
+  final_policy_path: string | null;
+  final_reward_path: string | null;
+  best_metric: number | null;
+  iterations_used: number;
+  started_at: string | null;
+  finished_at: string | null;
+  redecomposition_attempts: number;
+  // §Ship 20a: persisted cap actually enforced for the stage's last
+  // (or current) run — `iterations_override or max_iterations`. Null
+  // for stages that haven't run yet. Use this for `rounds X/Y`
+  // display so it stays correct after the WS event window slides;
+  // fall back to max_iterations only when null.
+  effective_max_iterations: number | null;
+}
+
+export interface MissionSummary {
+  mission_slug: string;
+  project_slug: string;
+  goal: string;
+  n_stages: number;
+  current_stage_idx: number;
+  decomposition_model: string;
+  created_at: string;  // ISO-8601
+  lifecycle: MissionLifecycleStatus;
+  active_job_id: string | null;
+  active_job_kind: MissionJobKind | null;
+}
+
+export interface MissionDetail extends MissionSummary {
+  stages: StageSchema[];
+  decomposition_rationale: string;
+  schema_version: number;
+  // §Ship 21a: persisted run-time defaults set up front via the
+  // NewMissionDialog Advanced tab. RunMissionDialog pre-fills its
+  // inputs from this on first open. Keys mirror RunMissionRequestBody.
+  // Null when none were set at creation time.
+  run_defaults?: MissionRunDefaults | null;
+}
+
+/** §Ship 21a: same shape as RunMissionRequestBody (api.ts) but lives
+ *  in types.ts because it's the persisted view of the same payload. */
+export interface MissionRunDefaults {
+  iterations_override?: number | null;
+  steps_per_iter?: number | null;
+  seed?: number | null;
+  early_stop_on_criterion?: boolean;
+  criterion_stability_window?: number;
+  extend_on_improvement?: boolean;
+  max_extensions_per_stage?: number;
+  extension_factor?: number;
+  extension_improvement_threshold?: number;
+  // §Ship 34/35: per-stage objective fitness-in-the-loop (built-in name
+  // or "gen:<id>") + observe/steer mode.
+  fitness_metric?: string | null;
+  fitness_mode?: "observe" | "steer";
+}
+
+export interface CreateMissionRequest {
+  goal: string;             // 8-2000 chars
+  mission_slug?: string;    // optional override
+  no_kg?: boolean;
+  // §Ship 21a: optional run-time defaults set via the NewMission
+  // Dialog Advanced tab. Persisted on the mission so RunMissionDialog
+  // can pre-fill on first open.
+  run_defaults?: MissionRunDefaults | null;
+}
+
+export interface DeleteMissionResponse {
+  mission_slug: string;
+  freed_bytes: number;
+}
+
+/** WebSocket envelope for mission events. Per Ship 18a plan-review,
+ *  events are validated server-side as `dict[str, Any]` (only `type`
+ *  is structural); narrow on `type` per-event in the consumer. */
+export interface MissionEvent {
+  type: string;
+  stage_name?: string | null;
+  stage_index?: number | null;
+  ts?: number | null;
+  source?: "stdout" | string;
+  // Per-event-type fields are open. Examples:
+  //   mission_started: { goal, stage_count }
+  //   stage_completed_training: { stage_name, iterations_run, ... }
+  //   stage_redecomposed: { original_stage_name, sub_stage_names, ... }
+  [key: string]: unknown;
 }

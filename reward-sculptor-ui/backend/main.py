@@ -27,6 +27,8 @@ from backend.routes import dashboard as dashboard_routes
 from backend.routes import jobs as jobs_routes
 from backend.routes import kg as kg_routes
 from backend.routes import library as library_routes
+from backend.routes import metrics as metrics_routes
+from backend.routes import missions as missions_routes
 from backend.routes import physics as physics_routes
 from backend.routes import projects as projects_routes
 from backend.routes import rewards as rewards_routes
@@ -145,7 +147,16 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
         for minutes after every `./run.sh` restart.
 
         Fire-and-forget on a worker thread so uvicorn startup doesn't
-        block. On completion, the next KG query is instant.
+        block. `_get_embedder` (sculptor/kg/query.py) holds a
+        `threading.Lock` so a reward-prompt worker hitting the same
+        call mid-prewarm waits for prewarm to finish instead of racing
+        into a second `SentenceTransformer(...)` init, which on WSL2
+        can deadlock on the huggingface_hub cache FileLock (observed
+        as a 5-minute hang on the KG preview step, 2026-04-23 03:22).
+
+        The task reference is stashed on `app.state` so Python's weak-
+        ref handling of `asyncio.create_task` (3.11+) doesn't GC the
+        prewarm mid-flight.
         """
         import asyncio as _asyncio
         import os as _os
@@ -164,9 +175,11 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
                     "first query): %s: %s", type(e).__name__, e,
                 )
 
-        # Fire on a background task — returns immediately, doesn't
-        # block /health or any request.
-        _asyncio.create_task(_asyncio.to_thread(_load_embedder))
+        # Pin the task so it isn't GC'd before the executor picks it up.
+        app.state.embedder_prewarm_task = _asyncio.create_task(
+            _asyncio.to_thread(_load_embedder),
+            name="embedder-prewarm",
+        )
 
     @app.get("/health", response_model=HealthResponse, tags=["meta"])
     def health() -> HealthResponse:
@@ -190,6 +203,9 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     app.include_router(system_routes.router)
     app.include_router(library_routes.router)
     app.include_router(physics_routes.router)
+    app.include_router(missions_routes.router)
+    app.include_router(missions_routes.ws_router)
+    app.include_router(metrics_routes.router)
     return app
 
 

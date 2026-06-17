@@ -5,19 +5,58 @@ import health. Consumed by the Settings page (MJLAB_PIVOT_DESIGN §3.4).
 
 GET /system/kg/stats — aggregate counts over the shared user-wide KG
 (M7 Phase 1). Consumed by the Settings page's "Knowledge graph" card.
+
+GET/PUT /system/remote + POST /system/remote/doctor (§Ship 23d) —
+persisted remote-GPU dispatch settings (`<projects_root>/_settings/
+remote.json`) and the Test-connection report for the Settings page.
 """
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timezone
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 
-from backend.models.system import SystemGpuResponse, SystemKgStatsResponse
+from backend.models.system import (
+    RemoteDoctorResponse,
+    SystemGpuResponse,
+    SystemKgStatsResponse,
+)
 from backend.services import kg_store, sculptor_bridge
+from backend.services.remote_settings import (
+    RemoteSettings,
+    load_remote_settings,
+    run_doctor,
+    save_remote_settings,
+)
 
 
 router = APIRouter(prefix="/system", tags=["system"])
+
+
+@router.get("/remote", response_model=RemoteSettings)
+def get_remote_settings(request: Request) -> RemoteSettings:
+    root = request.app.state.settings.resolved_projects_root
+    return load_remote_settings(root)
+
+
+@router.put("/remote", response_model=RemoteSettings)
+def put_remote_settings(request: Request, body: RemoteSettings) -> RemoteSettings:
+    root = request.app.state.settings.resolved_projects_root
+    save_remote_settings(root, body)
+    return load_remote_settings(root)
+
+
+@router.post("/remote/doctor", response_model=RemoteDoctorResponse)
+async def post_remote_doctor(request: Request) -> RemoteDoctorResponse:
+    """Run connectivity checks against the SAVED settings (PUT first).
+    Blocking ssh round-trips (~30 s worst case on an unreachable host)
+    run in a worker thread so the event loop stays responsive."""
+    root = request.app.state.settings.resolved_projects_root
+    settings = load_remote_settings(root)
+    report = await asyncio.to_thread(run_doctor, settings)
+    return RemoteDoctorResponse.model_validate(report)
 
 
 @router.get("/gpu", response_model=SystemGpuResponse)

@@ -3,6 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import {
   getLibraryCategories,
   getLibraryRobot,
+  getRemoteSettings,
   getSystemGpu,
   getSystemKgStats,
   listLibraryAdapters,
@@ -12,6 +13,7 @@ import type {
   AdapterInfo,
   LibraryListResponse,
   LibraryRobot,
+  RemoteSettings,
   SystemGpuResponse,
   SystemKgStatsResponse,
 } from "@/lib/types";
@@ -59,6 +61,16 @@ export function useSystemGpu(opts?: { refetchIntervalMs?: number | false }) {
     queryFn: getSystemGpu,
     refetchInterval: opts?.refetchIntervalMs ?? false,
     staleTime: 2_000,
+  });
+}
+
+/** Persisted remote-GPU dispatch settings (§Ship 23d). The Settings
+ * card writes the PUT response back via setQueryData(["system","remote"]). */
+export function useRemoteSettings() {
+  return useQuery<RemoteSettings>({
+    queryKey: ["system", "remote"],
+    queryFn: getRemoteSettings,
+    staleTime: 5_000,
   });
 }
 

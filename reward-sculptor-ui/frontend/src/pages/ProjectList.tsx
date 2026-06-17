@@ -1,118 +1,164 @@
-import { Link } from "react-router-dom";
-import { Plus, FolderOpen, RefreshCcw } from "lucide-react";
+import { useState } from "react";
+import { useNavigate } from "react-router-dom";
 
-import { Button } from "@/components/ui/button";
-import { ProjectCard } from "@/components/ProjectCard";
-import { useProjects } from "@/hooks/useProjects";
+import { Icon } from "@/components/rs/icon";
+import { Badge, Btn, IconBtn, Modal, Sparkline } from "@/components/rs/primitives";
+import { useDeleteProject, useProjects } from "@/hooks/useProjects";
+import { formatRelative } from "@/lib/utils";
+import type { ProjectSummary } from "@/lib/types";
+
+function humanizeSlug(s: string | null | undefined): string {
+  if (!s) return "—";
+  return s
+    .split(/[_-]/)
+    .filter(Boolean)
+    .map((w) => w.charAt(0).toUpperCase() + w.slice(1))
+    .join(" ");
+}
+
+function adapterShort(cls: string | null | undefined): string {
+  if (!cls) return "—";
+  if (cls.includes("mjlab")) return "mjlab";
+  if (cls.toLowerCase().includes("gym")) return "gym_sb3";
+  return cls.split(".").pop() ?? cls;
+}
 
 export default function ProjectList() {
-  const { data: projects, isLoading, error, refetch, isFetching } = useProjects();
+  const nav = useNavigate();
+  const { data, isLoading, error } = useProjects();
+  const del = useDeleteProject();
+  const [confirm, setConfirm] = useState<ProjectSummary | null>(null);
+  const projects = data ?? [];
 
   return (
-    <div className="flex h-full flex-col">
-      <Header onRefresh={() => refetch()} refreshing={isFetching} />
+    <div className="rs-scroll">
+      <div className="rs-pad rs-vgap-24">
+        <div className="rs-flex-between rs-wrap rs-gap-12">
+          <div>
+            <div className="rs-eyebrow">{projects.length} projects</div>
+            <h2 className="rs-h2" style={{ marginTop: 6 }}>Projects</h2>
+          </div>
+          <Btn kind="primary" icon="plus" onClick={() => nav("/library")}>
+            New project
+          </Btn>
+        </div>
 
-      <div className="flex-1 overflow-y-auto scrollbar-thin px-6 pb-10 pt-4">
         {isLoading ? (
-          <LoadingState />
+          <div className="rs-sub">Loading projects…</div>
         ) : error ? (
-          <ErrorState error={error as Error} />
-        ) : !projects || projects.length === 0 ? (
-          <EmptyState />
+          <div className="rs-banner err">
+            <Icon name="alert-triangle" size={17} />
+            <span className="rs-grow">Failed to load projects: {(error as Error).message}</span>
+          </div>
+        ) : projects.length === 0 ? (
+          <div className="rs-card">
+            <div className="rs-empty">
+              <span className="ic"><Icon name="folder" size={22} color="var(--rs-muted)" /></span>
+              <div className="rs-h3" style={{ fontWeight: 500, color: "var(--ink)" }}>No projects yet</div>
+              <div className="rs-sub" style={{ maxWidth: 360 }}>
+                Pick a robot from the library to scaffold your first project.
+              </div>
+              <Btn kind="primary" icon="plus" onClick={() => nav("/library")}>New project</Btn>
+            </div>
+          </div>
         ) : (
-          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-            {projects.map((p) => (
-              <ProjectCard key={p.slug} project={p} />
-            ))}
+          <div className="rs-card">
+            <div style={{ overflowX: "auto" }}>
+            <table className="rs-table">
+              <thead>
+                <tr>
+                  <th>Name</th>
+                  <th>Status</th>
+                  <th>Adapter</th>
+                  <th>Robot</th>
+                  <th>Best</th>
+                  <th>Trend</th>
+                  <th>Updated</th>
+                  <th aria-label="Actions" />
+                </tr>
+              </thead>
+              <tbody>
+                {projects.map((p) => (
+                  <tr
+                    key={p.slug}
+                    onClick={() => nav(`/projects/${p.slug}`)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter" || e.key === " ") {
+                        e.preventDefault();
+                        nav(`/projects/${p.slug}`);
+                      }
+                    }}
+                    tabIndex={0}
+                    role="button"
+                    aria-label={`Open project ${p.display_name}`}
+                    style={{ cursor: "pointer" }}
+                  >
+                    <td className="name" style={{ fontFamily: "var(--font-sans)" }}>{p.display_name}</td>
+                    <td><Badge status={p.status} /></td>
+                    <td>{adapterShort(p.adapter_class)}</td>
+                    <td style={{ fontFamily: "var(--font-sans)" }}>{humanizeSlug(p.library_slug) || p.env_id || "—"}</td>
+                    <td style={{ color: p.primary_metric == null ? "var(--rs-muted)" : "var(--st-amber)" }}>
+                      {p.primary_metric == null ? "—" : p.primary_metric.toFixed(1)}
+                    </td>
+                    <td>
+                      <Sparkline
+                        data={p.primary_metric_history ?? []}
+                        w={64}
+                        h={20}
+                        color={p.status === "errored" ? "var(--st-rose)" : "var(--st-emerald)"}
+                      />
+                    </td>
+                    <td style={{ color: "var(--rs-muted)" }}>{formatRelative(p.created_at)}</td>
+                    <td style={{ textAlign: "right" }}>
+                      <IconBtn
+                        icon="trash"
+                        label={`Delete ${p.display_name}`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setConfirm(p);
+                        }}
+                      />
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            </div>
           </div>
         )}
       </div>
-    </div>
-  );
-}
 
-function Header({
-  onRefresh,
-  refreshing,
-}: {
-  onRefresh: () => void;
-  refreshing: boolean;
-}) {
-  return (
-    <header className="sticky top-0 z-10 flex h-12 items-center justify-between border-b bg-background/80 px-6 backdrop-blur">
-      <div className="flex items-baseline gap-2">
-        <h1 className="text-sm font-semibold">Projects</h1>
-        <span className="text-xs text-muted-foreground">
-          Every project is a self-contained sculpt workspace.
-        </span>
-      </div>
-      <div className="flex items-center gap-2">
-        <Button
-          variant="ghost"
-          size="sm"
-          onClick={onRefresh}
-          disabled={refreshing}
-          aria-label="Refresh project list"
+      {confirm && (
+        <Modal
+          title="Delete project"
+          icon="trash"
+          onClose={() => { if (!del.isPending) setConfirm(null); }}
+          footer={
+            <>
+              <Btn kind="quiet" onClick={() => setConfirm(null)} disabled={del.isPending}>Cancel</Btn>
+              <Btn
+                kind="danger"
+                icon="trash"
+                disabled={del.isPending}
+                onClick={() => del.mutate(confirm.slug, { onSuccess: () => setConfirm(null) })}
+              >
+                {del.isPending ? "Deleting…" : "Delete project"}
+              </Btn>
+            </>
+          }
         >
-          <RefreshCcw
-            className={refreshing ? "animate-spin" : ""}
-          />
-        </Button>
-        <Button asChild size="sm">
-          <Link to="/library">
-            <Plus />
-            New from library
-          </Link>
-        </Button>
-      </div>
-    </header>
-  );
-}
-
-function LoadingState() {
-  return (
-    <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-      {Array.from({ length: 4 }).map((_, i) => (
-        <div
-          key={i}
-          className="h-64 animate-pulse rounded-lg border bg-muted/30"
-        />
-      ))}
-    </div>
-  );
-}
-
-function EmptyState() {
-  return (
-    <div className="mx-auto mt-24 max-w-md rounded-lg border border-dashed bg-muted/20 p-10 text-center">
-      <FolderOpen className="mx-auto h-10 w-10 text-muted-foreground" />
-      <h2 className="mt-4 text-base font-semibold">No projects yet</h2>
-      <p className="mt-1 text-sm text-muted-foreground">
-        Create a project to scaffold a sculpt workspace with its own
-        rewards, runs, and knowledge graph.
-      </p>
-      <Button asChild className="mt-6">
-        <Link to="/library">
-          <Plus />
-          New from library
-        </Link>
-      </Button>
-    </div>
-  );
-}
-
-function ErrorState({ error }: { error: Error }) {
-  return (
-    <div className="mx-auto mt-24 max-w-md rounded-lg border border-destructive/40 bg-destructive/5 p-6">
-      <h2 className="text-sm font-semibold text-destructive">
-        Could not load projects
-      </h2>
-      <p className="mt-1 font-mono text-xs text-muted-foreground">
-        {error.message}
-      </p>
-      <p className="mt-3 text-xs text-muted-foreground">
-        Check the backend is running at <code>localhost:8000</code>.
-      </p>
+          <p className="rs-sub" style={{ margin: 0 }}>
+            Permanently delete <b style={{ color: "var(--ink)" }}>{confirm.display_name}</b> and all its runs,
+            rewards, and knowledge graph? This cannot be undone.
+          </p>
+          {del.error && (
+            <div className="rs-banner err">
+              <Icon name="alert-triangle" size={17} />
+              <span className="rs-grow">{(del.error as Error).message}</span>
+            </div>
+          )}
+        </Modal>
+      )}
     </div>
   );
 }

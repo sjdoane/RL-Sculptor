@@ -1,38 +1,23 @@
 import { useMemo, useRef, useState } from "react";
-import {
-  ArrowRight,
-  CheckCircle2,
-  Cpu,
-  Loader2,
-  Radio,
-  RefreshCw,
-  StopCircle,
-  Wand2,
-  XCircle,
-} from "lucide-react";
 import { toast } from "sonner";
 
-import { Button } from "@/components/ui/button";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
-import { useSystemGpu } from "@/hooks/useLibrary";
+import { Icon } from "@/components/rs/icon";
+import { Badge, Btn, Delta, EmptyState, MetricChart, Sparkline } from "@/components/rs/primitives";
 import { LogViewer } from "@/components/LogViewer";
-import { MetricChart } from "@/components/MetricChart";
 import { NewRunDialog } from "@/components/NewRunDialog";
+import { NewMissionDialog } from "@/components/NewMissionDialog";
+import { MissionDetailDialog } from "@/components/MissionDetailDialog";
+import { useSystemGpu } from "@/hooks/useLibrary";
 import { useRunEvents } from "@/hooks/useRunEvents";
-import { useRegenerateRewardTemplate } from "@/hooks/useRewards";
-import { useKillRun, useRun, useRuns } from "@/hooks/useRuns";
+import { useMissions } from "@/hooks/useMissions";
+import { useRegenerateRewardTemplate, useRewards } from "@/hooks/useRewards";
+import { useControlRun, useKillRun, useRun, useRuns } from "@/hooks/useRuns";
 import { ApiError } from "@/lib/api";
-import { cn, formatRelative } from "@/lib/utils";
+import { formatRelative } from "@/lib/utils";
 import type {
   ErrorClassification,
   IterEventSummary,
-  JobStatus,
+  MissionSummary,
   ProjectDetail,
   RunDetail,
   RunEvent,
@@ -40,121 +25,135 @@ import type {
 } from "@/lib/types";
 
 // ── public entry ──────────────────────────────────────────────────────
-export default function RunsTab({
-  slug,
-  project,
-}: {
-  slug: string;
-  project: ProjectDetail;
-}) {
-  const list = useRuns(slug);
+export default function RunsTab({ slug, project }: { slug: string; project: ProjectDetail }) {
+  const missions = useMissions(slug);
+  // §Ship 21d: keep /runs polling through stage boundaries while a mission
+  // is active (preserved verbatim).
+  const missionActive = useMemo(
+    () => (missions.data ?? []).some((m) => m.active_job_id != null),
+    [missions.data],
+  );
+  const list = useRuns(slug, { keepPolling: missionActive });
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
+  const [missionDialogSlug, setMissionDialogSlug] = useState<string | null>(null);
 
   const runs = list.data ?? [];
-  const selected = selectedRunId ?? runs[0]?.run_id ?? null;
+  const { sculptRuns, missionGroups } = useMemo(
+    () => partitionRuns(runs, missions.data ?? []),
+    [runs, missions.data],
+  );
+  const allOrderedRunIds = useMemo(
+    () => [
+      ...sculptRuns.map((r) => r.run_id),
+      ...missionGroups.flatMap((g) => g.stages.map((r) => r.run_id)),
+    ],
+    [sculptRuns, missionGroups],
+  );
+  const selected = selectedRunId ?? allOrderedRunIds[0] ?? null;
+  const missionDialogSummary =
+    missionDialogSlug != null
+      ? (missions.data ?? []).find((m) => m.mission_slug === missionDialogSlug) ?? null
+      : null;
+
+  const empty = !list.isLoading && sculptRuns.length === 0 && missionGroups.length === 0;
+
+  if (list.isLoading) {
+    return <div className="rs-scroll"><div className="rs-pad"><p className="rs-sub">Loading runs…</p></div></div>;
+  }
+  if (empty) {
+    return (
+      <div className="rs-scroll">
+        <div className="rs-pad">
+          <div className="rs-flex-between rs-wrap rs-gap-12" style={{ marginBottom: 16 }}>
+            <h2 className="rs-h2">Runs</h2>
+            <div className="rs-flex rs-gap-8">
+              <NewMissionDialog slug={slug} onCreated={(s) => setMissionDialogSlug(s)} />
+              <NewRunDialog slug={slug} project={project} onLaunched={(id) => setSelectedRunId(id)} />
+            </div>
+          </div>
+          <div className="rs-card">
+            <EmptyState
+              icon="activity"
+              title="No runs yet"
+              sub="Launch a single training run with New run, or decompose a complex goal into a curriculum with New mission."
+            />
+          </div>
+        </div>
+        <MissionDetailDialog slug={slug} missionSlug={missionDialogSlug} summary={missionDialogSummary} open={missionDialogSlug != null} onOpenChange={(o) => { if (!o) setMissionDialogSlug(null); }} />
+      </div>
+    );
+  }
 
   return (
-    <div className="flex flex-col gap-4">
-      <Card>
-        <CardHeader className="flex-row items-center justify-between gap-2 space-y-0 py-3">
-          <div>
-            <CardTitle className="text-sm">Runs</CardTitle>
-            <CardDescription className="text-[11px]">
-              Each run is a <code>sculpt run</code> subprocess — its
-              JobManager kind is <code>sculpt_run</code>.
-            </CardDescription>
+    <div style={{ flex: 1, minHeight: 0, overflow: "hidden", display: "flex" }}>
+      <div className="rs-runs-layout">
+        <RunSidebar
+          slug={slug}
+          project={project}
+          sculptRuns={sculptRuns}
+          missionGroups={missionGroups}
+          selected={selected}
+          onSelectRun={setSelectedRunId}
+          onOpenMissionDialog={setMissionDialogSlug}
+          onLaunchedRun={(id) => setSelectedRunId(id)}
+        />
+        {selected ? (
+          <RunDetailPane slug={slug} runId={selected} runs={runs} />
+        ) : (
+          <div className="rs-flex" style={{ justifyContent: "center", alignItems: "center", color: "var(--rs-muted)", fontSize: 13 }}>
+            Select a run.
           </div>
-          <NewRunDialog
-            slug={slug}
-            project={project}
-            onLaunched={(id) => setSelectedRunId(id)}
-          />
-        </CardHeader>
-      </Card>
-
-      {list.isLoading && (
-        <p className="text-sm text-muted-foreground">Loading runs…</p>
-      )}
-
-      {!list.isLoading && runs.length === 0 && (
-        <Card className="p-8 text-center">
-          <Wand2 className="mx-auto h-8 w-8 text-muted-foreground" />
-          <p className="mt-2 text-sm">No runs yet.</p>
-          <p className="text-xs text-muted-foreground">
-            Launch one above — keep it to a few iterations for the first pass.
-          </p>
-        </Card>
-      )}
-
-      {runs.length > 0 && (
-        <div className="grid grid-cols-1 gap-4 lg:grid-cols-[240px_minmax(0,1fr)]">
-          <RunSidebar
-            runs={runs}
-            selected={selected}
-            onSelect={setSelectedRunId}
-          />
-          {selected ? (
-            <RunDetailPane slug={slug} runId={selected} />
-          ) : (
-            <Card className="flex items-center justify-center p-8 text-xs text-muted-foreground">
-              Select a run.
-            </Card>
-          )}
-        </div>
-      )}
+        )}
+      </div>
+      <MissionDetailDialog slug={slug} missionSlug={missionDialogSlug} summary={missionDialogSummary} open={missionDialogSlug != null} onOpenChange={(o) => { if (!o) setMissionDialogSlug(null); }} />
     </div>
   );
 }
 
-// ── sidebar ───────────────────────────────────────────────────────────
-function RunSidebar({
-  runs,
-  selected,
-  onSelect,
-}: {
-  runs: RunSummary[];
-  selected: string | null;
-  onSelect: (id: string) => void;
-}) {
-  return (
-    <Card className="max-h-[640px] overflow-y-auto scrollbar-thin">
-      <CardHeader className="py-3">
-        <CardTitle className="text-sm">History</CardTitle>
-      </CardHeader>
-      <CardContent className="flex flex-col gap-1 p-2 pt-0">
-        {runs.map((r) => (
-          <button
-            key={r.run_id}
-            type="button"
-            onClick={() => onSelect(r.run_id)}
-            className={cn(
-              "flex flex-col gap-1 rounded-md border px-2 py-2 text-left text-xs transition-colors",
-              selected === r.run_id
-                ? "border-foreground/30 bg-accent"
-                : "border-transparent hover:bg-accent/60",
-            )}
-          >
-            <div className="flex items-center justify-between gap-2">
-              <span className="truncate font-mono text-[11px]">
-                {r.run_id.replace(/^job_/, "")}
-              </span>
-              <RunStatusBadge status={r.status} />
-            </div>
-            <div className="flex items-center gap-1 text-[10px] text-muted-foreground">
-              <Sparkline history={r.primary_metric_history} />
-              <span>
-                {r.iterations_completed}/{r.iterations_requested}
-              </span>
-            </div>
-            <span className="truncate text-[10px] text-muted-foreground">
-              {r.started_at ? formatRelative(r.started_at) : "—"}
-              {r.started_at && r.ended_at && ` · ${durationStr(r.started_at, r.ended_at)}`}
-            </span>
-          </button>
-        ))}
-      </CardContent>
-    </Card>
-  );
+// ── logic (preserved verbatim) ───────────────────────────────────────
+interface MissionGroup {
+  missionSlug: string;
+  mission: MissionSummary | null;
+  stages: RunSummary[];
+}
+
+function partitionRuns(runs: RunSummary[], missions: MissionSummary[]): { sculptRuns: RunSummary[]; missionGroups: MissionGroup[] } {
+  const sculptRuns: RunSummary[] = [];
+  const stagesByMission = new Map<string, RunSummary[]>();
+  for (const r of runs) {
+    if (r.kind === "mission_stage_run" && r.mission_slug) {
+      const arr = stagesByMission.get(r.mission_slug);
+      if (arr) arr.push(r);
+      else stagesByMission.set(r.mission_slug, [r]);
+    } else {
+      sculptRuns.push(r);
+    }
+  }
+  const missionsBySlug = new Map<string, MissionSummary>(missions.map((m) => [m.mission_slug, m]));
+  const seen = new Set<string>();
+  const missionGroups: MissionGroup[] = [];
+  for (const m of missions) {
+    const stages = stagesByMission.get(m.mission_slug);
+    if (!stages || stages.length === 0) continue;
+    seen.add(m.mission_slug);
+    stages.sort((a, b) => (a.stage_index ?? 0) - (b.stage_index ?? 0) || a.run_id.localeCompare(b.run_id));
+    missionGroups.push({ missionSlug: m.mission_slug, mission: m, stages });
+  }
+  for (const [missionSlug, stages] of stagesByMission) {
+    if (seen.has(missionSlug)) continue;
+    stages.sort((a, b) => (a.stage_index ?? 0) - (b.stage_index ?? 0) || a.run_id.localeCompare(b.run_id));
+    missionGroups.push({ missionSlug, mission: missionsBySlug.get(missionSlug) ?? null, stages });
+  }
+  return { sculptRuns, missionGroups };
+}
+
+function missionRunStateLabel(m: MissionSummary): string {
+  const { current_stage_idx: i, n_stages: n, lifecycle } = m;
+  if (n === 0) return "Planning…";
+  if (lifecycle === "running") return `Stage ${Math.max(1, i + 1)} of ${n}`;
+  if (lifecycle === "ready") return `${n} stages planned`;
+  if (lifecycle === "completed") return `${n} of ${n} stages complete`;
+  return `${i} of ${n} stages complete`;
 }
 
 function durationStr(start: string, end: string): string {
@@ -166,603 +165,633 @@ function durationStr(start: string, end: string): string {
   return `${Math.floor(s / 3600)}h ${Math.floor((s % 3600) / 60)}m`;
 }
 
-function RunStatusBadge({ status }: { status: JobStatus }) {
-  const map: Record<JobStatus, { label: string; cls: string; icon?: React.ComponentType<{ className?: string }> }> = {
-    queued:     { label: "queued",    cls: "bg-muted text-muted-foreground border-border" },
-    running:    { label: "running",   cls: "bg-amber-50 text-amber-700 border-amber-200", icon: Radio },
-    completed:  { label: "completed", cls: "bg-emerald-50 text-emerald-700 border-emerald-200", icon: CheckCircle2 },
-    errored:    { label: "errored",   cls: "bg-rose-50 text-rose-700 border-rose-200", icon: XCircle },
-    stopped:    { label: "stopped",   cls: "bg-slate-100 text-slate-600 border-slate-200", icon: StopCircle },
-  };
-  const m = map[status] ?? map.queued;
-  const Icon = m.icon;
+// ── sidebar ───────────────────────────────────────────────────────────
+function RunSidebar({
+  slug, project, sculptRuns, missionGroups, selected, onSelectRun, onOpenMissionDialog, onLaunchedRun,
+}: {
+  slug: string;
+  project: ProjectDetail;
+  sculptRuns: RunSummary[];
+  missionGroups: MissionGroup[];
+  selected: string | null;
+  onSelectRun: (id: string) => void;
+  onOpenMissionDialog: (missionSlug: string) => void;
+  onLaunchedRun: (id: string) => void;
+}) {
+  const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
+  const toggle = (s: string) => setCollapsed((st) => ({ ...st, [s]: !st[s] }));
+
   return (
-    <span
-      className={cn(
-        "inline-flex items-center gap-0.5 rounded-sm border px-1 py-0.5 text-[9px] font-semibold uppercase tracking-wide",
-        m.cls,
-        status === "running" && "animate-pulse",
-      )}
-    >
-      {Icon && <Icon className="h-2.5 w-2.5" />}
-      {m.label}
-    </span>
+    <div className="rs-runs-side">
+      <div className="rs-side-head">
+        <span className="rs-h3" style={{ fontSize: 15 }}>Runs</span>
+        <div className="rs-flex rs-gap-6">
+          <NewMissionDialog slug={slug} onCreated={(s) => onOpenMissionDialog(s)} />
+          <NewRunDialog slug={slug} project={project} onLaunched={onLaunchedRun} />
+        </div>
+      </div>
+
+      {missionGroups.length > 0 && <div className="rs-side-group">Missions</div>}
+      {missionGroups.map((g) => {
+        const isCollapsed = collapsed[g.missionSlug] ?? false;
+        const selectedInGroup = g.stages.some((s) => s.run_id === selected);
+        const open = !isCollapsed || selectedInGroup;
+        return (
+          <div key={g.missionSlug} className="rs-mission">
+            <div className="rs-mhead" role="button" tabIndex={0}
+              onClick={() => toggle(g.missionSlug)}
+              onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggle(g.missionSlug); } }}
+              aria-expanded={open}
+            >
+              <Icon name={open ? "chevron-down" : "chevron-right"} size={15} color="var(--rs-muted)" />
+              <Icon name="sparkles" size={15} color="var(--rs-primary)" />
+              <span style={{ flex: 1, minWidth: 0, overflow: "hidden" }}>
+                <span style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+                  {g.mission && <Badge status={g.mission.lifecycle} label="" />}
+                  <span style={{ fontWeight: 500, fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {g.mission ? missionRunStateLabel(g.mission) : g.missionSlug}
+                  </span>
+                </span>
+                {g.mission?.goal && (
+                  <span className="rmeta" style={{ display: "block", marginTop: 3, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={g.mission.goal}>
+                    {g.mission.goal}
+                  </span>
+                )}
+              </span>
+              <button
+                className="rs-iconbtn"
+                style={{ width: 26, height: 26 }}
+                aria-label="Open mission curriculum and run controls"
+                title="Plan: decomposition rationale, stages, Run/Delete"
+                onClick={(e) => { e.stopPropagation(); onOpenMissionDialog(g.missionSlug); }}
+              >
+                <Icon name="list" size={14} />
+              </button>
+            </div>
+            {open && g.stages.map((r) => (
+              <RunRow key={r.run_id} run={r} selected={selected === r.run_id} onSelect={() => onSelectRun(r.run_id)} stageContext />
+            ))}
+          </div>
+        );
+      })}
+
+      {sculptRuns.length > 0 && <div className="rs-side-group">Single runs</div>}
+      {sculptRuns.map((r) => (
+        <RunRow key={r.run_id} run={r} selected={selected === r.run_id} onSelect={() => onSelectRun(r.run_id)} />
+      ))}
+    </div>
   );
 }
 
-function Sparkline({ history }: { history: Array<number | null> }) {
-  const nums = history.filter((v): v is number => typeof v === "number");
-  if (nums.length < 2) return <span className="h-3 w-10" />;
-  const min = Math.min(...nums);
-  const max = Math.max(...nums);
-  const range = max - min || 1;
-  const w = 40;
-  const h = 12;
-  const step = w / (nums.length - 1);
-  const points = nums
-    .map((v, i) => `${(i * step).toFixed(1)},${(h - ((v - min) / range) * h).toFixed(1)}`)
-    .join(" ");
+function RunRow({
+  run: r, selected, onSelect, stageContext = false,
+}: { run: RunSummary; selected: boolean; onSelect: () => void; stageContext?: boolean }) {
+  const titleText = stageContext ? r.stage_name ?? r.run_id.replace(/^job_/, "") : r.run_id.replace(/^job_/, "");
+  const itersDenom = r.iterations_requested || "?";
   return (
-    <svg
-      width={w}
-      height={h}
-      viewBox={`0 0 ${w} ${h}`}
-      className="shrink-0 text-foreground"
-    >
-      <polyline
-        points={points}
-        fill="none"
-        stroke="currentColor"
-        strokeWidth={1}
+    <button className={"rs-runrow" + (selected ? " on" : "") + (stageContext ? " rs-stage" : "")} onClick={onSelect}>
+      <Badge status={r.status} label="" />
+      <span style={{ minWidth: 0, flex: 1 }}>
+        <span className="rid" style={{ display: "block", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          {stageContext && typeof r.stage_index === "number" && <span style={{ color: "var(--rs-muted)" }}>{r.stage_index + 1}. </span>}
+          {titleText}
+        </span>
+        <span className="rmeta" style={{ display: "block" }}>
+          {r.iterations_completed}/{itersDenom}
+          {r.started_at ? ` · ${formatRelative(r.started_at)}` : ""}
+          {r.started_at && r.ended_at ? ` · ${durationStr(r.started_at, r.ended_at)}` : ""}
+        </span>
+      </span>
+      <Sparkline
+        // §Ship 35: foreground objective fitness when the run has it.
+        data={(r.fitness_history && r.fitness_history.some((v) => typeof v === "number"))
+          ? r.fitness_history
+          : r.primary_metric_history}
+        w={46}
+        h={20}
+        color={r.status === "errored" ? "var(--st-rose)" : r.status === "running" ? "var(--st-amber)" : "var(--st-emerald)"}
       />
-    </svg>
+    </button>
   );
 }
 
 // ── detail pane ───────────────────────────────────────────────────────
-function RunDetailPane({ slug, runId }: { slug: string; runId: string }) {
+function RunDetailPane({ slug, runId, runs }: { slug: string; runId: string; runs: RunSummary[] }) {
   const run = useRun(slug, runId);
   const events = useRunEvents(slug, runId);
   const kill = useKillRun(slug);
+  const control = useControlRun(slug);
   const [selectedIter, setSelectedIter] = useState<number | null>(null);
 
   const iters = run.data?.iterations ?? [];
   const history = run.data?.primary_metric_history ?? [];
   const isActive = run.data?.status === "running" || run.data?.status === "queued";
 
-  // Derive the freshest iteration list from (a) server snapshot and
-  // (b) streaming events — events win for the live tail. We splice any
-  // in-flight iter_started events into the server's list.
+  // §Ship 39 (H1): derive interactive state (paused-awaiting-feedback + the
+  // current mode) from the event stream, seeded by the run's persisted mode
+  // so a reconnect restores the Auto/Manual switch.
+  const { awaiting, awaitingIter, mode } = useMemo(() => {
+    let aw = false;
+    let awIter: number | null = null;
+    let m: "manual" | "auto" = run.data?.mode === "manual" ? "manual" : "auto";
+    for (const ev of events.events) {
+      const e = ev as { type?: string; mode?: string; iter?: number };
+      if (e.type === "run_control_updated" && (e.mode === "manual" || e.mode === "auto")) m = e.mode;
+      else if (e.type === "awaiting_feedback") { aw = true; awIter = typeof e.iter === "number" ? e.iter : null; }
+      else if (e.type === "feedback_resumed" || e.type === "feedback_timeout" || e.type === "iter_started" || e.type === "run_completed" || e.type === "run_errored" || e.type === "run_stopped" || e.type === "early_stop") aw = false;
+    }
+    return { awaiting: aw, awaitingIter: awIter, mode: m };
+  }, [events.events, run.data?.mode]);
+
+  // §Ship 43: launch-time objective-metric generation as run-phase 0. Fold the
+  // metric_generation_* events into a single phase view (progress while running;
+  // accepted / rejected-with-reasons outcome — never silent).
+  const genPhase = useMemo(() => {
+    let started = false;
+    let last: { stage?: string; message?: string; attempt?: number; max?: number } | null = null;
+    let outcome: "accepted" | "rejected" | "failed" | null = null;
+    let genId: string | null = null;
+    let reasons: string[] = [];
+    let concerns: string[] = [];
+    let errorMsg: string | null = null;
+    // §Ship 45: paused awaiting a one-click retry/continue decision.
+    let awaiting = false;
+    // §Ship 44: launch-time calibration outcome. §Ship 51: + task-derived.
+    let calib: {
+      status: "running" | "done" | "skipped";
+      builtin?: string; calibrated?: boolean; spearman?: number | null;
+      method?: string; agreement_fraction?: number | null; reason?: string | null;
+      trust?: number | null;
+    } | null = null;
+    for (const ev of events.events) {
+      const e = ev as {
+        type?: string; stage?: string; message?: string; attempt?: number;
+        max?: number; gen_id?: string; reasons?: string[]; concerns?: string[];
+        error?: string; builtin?: string; calibrated?: boolean; spearman?: number | null;
+        method?: string; agreement_fraction?: number | null; reason?: string | null;
+        trust?: number | null;
+      };
+      if (e.type === "metric_generation_started") { started = true; outcome = null; last = null; calib = null; awaiting = false; }
+      else if (e.type === "metric_generation_progress") {
+        last = { stage: e.stage, message: e.message, attempt: e.attempt, max: e.max };
+      }
+      else if (e.type === "metric_generated") { outcome = "accepted"; genId = e.gen_id ?? null; awaiting = false; }
+      else if (e.type === "metric_generation_rejected") {
+        outcome = "rejected"; genId = e.gen_id ?? null;
+        reasons = e.reasons ?? []; concerns = e.concerns ?? [];
+      }
+      else if (e.type === "metric_generation_awaiting_decision") { awaiting = true; }
+      else if (e.type === "metric_generation_failed") { outcome = "failed"; errorMsg = e.error ?? null; awaiting = false; }
+      else if (e.type === "metric_calibration_started") { calib = { status: "running", builtin: e.builtin, method: e.method }; }
+      else if (e.type === "metric_calibration_done") {
+        calib = { status: "done", builtin: e.builtin, calibrated: e.calibrated, spearman: e.spearman,
+                  method: e.method, agreement_fraction: e.agreement_fraction, reason: e.reason,
+                  trust: e.trust };
+      }
+      else if (e.type === "metric_calibration_skipped") { calib = { status: "skipped", reason: e.reason }; }
+    }
+    return started ? { last, outcome, genId, reasons, concerns, errorMsg, calib, awaiting } : null;
+  }, [events.events]);
+
+  const summary = useMemo(() => runs.find((r) => r.run_id === runId) ?? null, [runs, runId]);
+  const isStageRun = (summary?.kind === "mission_stage_run") || (run.data?.kind === "mission_stage_run");
+  const missionSlug = summary?.mission_slug ?? run.data?.mission_slug ?? null;
+  const stageName = summary?.stage_name ?? run.data?.stage_name ?? null;
+  const stageRewardsScope = isStageRun && missionSlug && stageName ? `${missionSlug}/${stageName}` : null;
+
   const mergedIters = useMergedIterations(iters, events.events);
+  const isPending = run.data?.status === "queued" && mergedIters.length === 0;
+
+  // §Ship 35: fitness is the PRIMARY tracked metric when an objective
+  // fitness exists (observe or steer). Prefer the per-run history; fall
+  // back to deriving from the merged iterations (covers live runs before
+  // the REST summary refreshes). Degrade to the reward metric otherwise.
+  const fitnessHistory: Array<number | null> =
+    (run.data?.fitness_history && run.data.fitness_history.length
+      ? run.data.fitness_history
+      : mergedIters.map((it) => (typeof it.fitness === "number" ? it.fitness : null)));
+  const hasFitness = fitnessHistory.some((v) => typeof v === "number");
 
   return (
-    <div className="grid grid-cols-1 gap-4 md:grid-cols-[220px_minmax(0,1fr)] lg:grid-cols-[220px_minmax(0,1fr)_240px]">
-      <IterationTimeline
-        iters={mergedIters}
-        selected={selectedIter}
-        onSelect={setSelectedIter}
-      />
+    <div className="rs-runs-detail">
+      {isPending ? (
+        <div className="rs-iter-col">
+          <div className="rs-eyebrow" style={{ marginBottom: 12 }}>Iterations</div>
+          <EmptyState icon="clock" title="Not started" sub="This run is queued. Iterations appear once training begins." />
+        </div>
+      ) : (
+        <IterationTimeline iters={mergedIters} selected={selectedIter} onSelect={setSelectedIter} />
+      )}
 
-      <div className="flex min-h-0 flex-col gap-3">
+      <div className="rs-mid-col">
+        {isStageRun && summary && <StageContextCard run={summary} />}
         <RunHeader
           run={run.data}
           isActive={isActive}
           wsConnected={events.connected}
+          mode={mode}
+          togglePending={control.isPending}
+          onToggleMode={() => {
+            if (!run.data) return;
+            const next = mode === "manual" ? "auto" : "manual";
+            control.mutate({ runId: run.data.run_id, mode: next }, {
+              onSuccess: () => toast.success(next === "manual" ? "Manual: pausing each iteration for your feedback" : "Auto: running straight through"),
+              onError: (err) => toast.error("Could not change mode", { description: err instanceof ApiError ? err.problem.detail ?? err.problem.title : err.message }),
+            });
+          }}
           onKill={() => {
             if (!run.data) return;
-            const ok = window.confirm(
-              `Stop run ${run.data.run_id}? The subprocess will be terminated.`,
-            );
+            const ok = window.confirm(`Stop run ${run.data.run_id}? The subprocess will be terminated.`);
             if (!ok) return;
             kill.mutate(run.data.run_id, {
               onSuccess: () => toast.success("Kill signal sent"),
               onError: (err) => {
-                const detail = err instanceof ApiError
-                  ? err.problem.detail ?? err.problem.title
-                  : err.message;
+                const detail = err instanceof ApiError ? err.problem.detail ?? err.problem.title : err.message;
                 toast.error("Could not kill run", { description: detail });
               },
             });
           }}
         />
+        {isActive && awaiting && run.data && (
+          <FeedbackPanel
+            iterIndex={awaitingIter}
+            pending={control.isPending}
+            onSubmit={(text, goAuto) => {
+              if (!run.data) return;
+              control.mutate(
+                { runId: run.data.run_id, resume: true, feedback: text || null, ...(goAuto ? { mode: "auto" as const } : {}) },
+                { onError: (err) => toast.error("Could not continue", { description: err instanceof ApiError ? err.problem.detail ?? err.problem.title : err.message }) },
+              );
+            }}
+          />
+        )}
+        {genPhase && (
+          <div style={{ padding: "0 16px" }}>
+            <MetricGenPhase
+              phase={genPhase}
+              busy={control.isPending}
+              onRetry={() => control.mutate({ runId, gen_retry: true }, {
+                onError: (err) => toast.error("Could not retry generation", { description: err instanceof ApiError ? err.problem.detail ?? err.problem.title : err.message }),
+              })}
+              onContinueBlind={() => control.mutate({ runId, gen_continue: true }, {
+                onError: (err) => toast.error("Could not continue", { description: err instanceof ApiError ? err.problem.detail ?? err.problem.title : err.message }),
+              })}
+            />
+          </div>
+        )}
+        {run.data?.error && (
+          <div style={{ padding: "0 16px" }}>
+            <RunErrorCard slug={slug} error={run.data.error} classification={run.data.error_classification ?? null} />
+          </div>
+        )}
         <LogViewer events={events.events} />
       </div>
 
-      <div className="flex flex-col gap-3 md:col-span-full lg:col-span-1">
-        <MetricChart history={history} />
+      <div className="rs-extra-col">
+        <div className="rs-card">
+          <div className="rs-card-head"><div className="rs-card-title" style={{ fontSize: 13 }}><Icon name="trending-up" size={15} />{hasFitness ? "Objective fitness" : "Mean reward"}</div>{isActive && <span className="rs-dot live" />}</div>
+          <div style={{ padding: "8px 4px 4px" }}>
+            <MetricChart
+              data={hasFitness ? fitnessHistory : history}
+              live={isActive}
+              label={hasFitness ? "Objective fitness per iteration" : "Mean reward per iteration"}
+              decimals={hasFitness ? 2 : 1}
+            />
+          </div>
+          {/* §Ship 35: reward metric demoted to a secondary sparkline when
+              fitness is the primary signal. */}
+          {hasFitness && history.some((v) => typeof v === "number") && (
+            <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "2px 10px 8px", fontSize: 11, color: "var(--rs-muted)" }}>
+              <span>reward</span>
+              <Sparkline data={history} w={120} h={16} color="var(--rs-muted)" />
+            </div>
+          )}
+        </div>
+        {stageRewardsScope && <StageRewardsCard slug={slug} stage={stageRewardsScope} />}
         {isActive && <RunGpuCard />}
-        {selectedIter !== null && (
-          <IterationDetailCard
-            iter={mergedIters.find((it) => it.iter_index === selectedIter) ?? null}
-          />
-        )}
-        {run.data?.error && (
-          <RunErrorCard
-            slug={slug}
-            error={run.data.error}
-            classification={run.data.error_classification ?? null}
-          />
+        {selectedIter !== null && <IterationDetailCard iter={mergedIters.find((it) => it.iter_index === selectedIter) ?? null} />}
+      </div>
+    </div>
+  );
+}
+
+function StageContextCard({ run }: { run: RunSummary }) {
+  return (
+    <div className="rs-card rs-card-pad" style={{ marginBottom: 0 }}>
+      <div className="rs-flex rs-wrap rs-gap-8" style={{ fontSize: 12 }}>
+        <Icon name="sparkles" size={14} color="var(--rs-primary)" />
+        <span style={{ fontWeight: 500 }}>
+          {typeof run.stage_index === "number" ? `Stage ${run.stage_index + 1}: ` : "Stage: "}
+          <code className="mono">{run.stage_name ?? "(unnamed)"}</code>
+        </span>
+        <span style={{ color: "var(--rs-muted)" }}>mission <code className="mono">{run.mission_slug}</code></span>
+        {run.behavior_goal && <span style={{ color: "var(--rs-muted)" }}>{run.behavior_goal}</span>}
+      </div>
+    </div>
+  );
+}
+
+function StageRewardsCard({ slug, stage }: { slug: string; stage: string }) {
+  const versions = useRewards(slug, stage);
+  return (
+    <div className="rs-card">
+      <div className="rs-card-head"><div className="rs-card-title" style={{ fontSize: 13 }}><Icon name="file-code" size={15} />Stage rewards</div></div>
+      <div className="rs-verlist">
+        {versions.isLoading && <p className="rs-sub" style={{ padding: "10px 14px", fontSize: 11 }}>Loading…</p>}
+        {versions.error && <p style={{ padding: "10px 14px", fontSize: 11, color: "var(--st-rose)" }}>{(versions.error as Error).message}</p>}
+        {versions.data && versions.data.length === 0 && <p className="rs-sub" style={{ padding: "10px 14px", fontSize: 11 }}>No reward versions yet.</p>}
+        {versions.data?.map((v, i) => (
+          <div key={v.version} className="rs-verrow" style={{ cursor: "default" }}>
+            <span className="vn">v{v.version}</span>
+            <span className="rs-grow" />
+            {typeof v.primary_metric === "number" && <span className="rs-num" style={{ fontSize: 13 }}>{v.primary_metric.toFixed(1)}</span>}
+            {i > 0 && typeof v.metric_delta === "number" && <Delta value={v.metric_delta} />}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function RunGpuCard() {
+  const gpu = useSystemGpu({ refetchIntervalMs: 2000 });
+  if (!gpu.data || !gpu.data.cuda_available || gpu.data.devices.length === 0) return null;
+  const dev = gpu.data.devices[0];
+  const totalGb = dev.total_memory_bytes / (1024 ** 3);
+  const usedBytes = typeof dev.used_memory_bytes === "number" ? dev.used_memory_bytes : dev.total_memory_bytes - dev.free_memory_bytes;
+  const usedGb = usedBytes / (1024 ** 3);
+  const memPct = totalGb > 0 ? (usedGb / totalGb) * 100 : 0;
+  const util = typeof dev.utilization_percent === "number" ? dev.utilization_percent : null;
+  const temp = typeof dev.temperature_c === "number" ? dev.temperature_c : null;
+  return (
+    <div className="rs-card rs-card-pad">
+      <div className="rs-card-title" style={{ fontSize: 13, marginBottom: 12 }}><Icon name="cpu" size={15} />GPU</div>
+      <div className="rs-vgap-8" style={{ fontSize: 12.5 }}>
+        <div className="rs-flex-between"><span className="rs-sub" style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{dev.name.replace(/^NVIDIA\s+/, "")}</span>{temp != null && <span className="rs-num">{Math.round(temp)}°C</span>}</div>
+        <div className="rs-vram"><i style={{ width: `${Math.min(100, memPct)}%`, background: memPct < 70 ? "var(--st-emerald)" : memPct < 90 ? "var(--st-amber)" : "var(--st-rose)" }} /></div>
+        <div className="rs-flex-between"><span className="rs-sub">VRAM</span><span className="rs-num">{usedGb.toFixed(1)} / {totalGb.toFixed(1)} GB</span></div>
+        {util != null && (
+          <>
+            <div className="rs-vram"><i style={{ width: `${Math.min(100, util)}%`, background: "var(--st-blue)" }} /></div>
+            <div className="rs-flex-between"><span className="rs-sub">utilization</span><span className="rs-num">{util.toFixed(0)}%</span></div>
+          </>
         )}
       </div>
     </div>
   );
 }
 
-// ── Run-viewer GPU card (M7 Phase 7d) ────────────────────────────────
-//
-// Polls /system/gpu every 2 s while the run is active. Hidden when
-// the host has no CUDA (CPU-only gym_sb3 runs) — no need to surface
-// "no GPU" noise when the run isn't touching one.
-function RunGpuCard() {
-  const gpu = useSystemGpu({ refetchIntervalMs: 2000 });
-  if (!gpu.data) return null;
-  if (!gpu.data.cuda_available || gpu.data.devices.length === 0) return null;
-  const dev = gpu.data.devices[0];
-  const totalGb = dev.total_memory_bytes / (1024 ** 3);
-  const usedBytes =
-    typeof dev.used_memory_bytes === "number"
-      ? dev.used_memory_bytes
-      : dev.total_memory_bytes - dev.free_memory_bytes;
-  const usedGb = usedBytes / (1024 ** 3);
-  const memPct = totalGb > 0 ? (usedGb / totalGb) * 100 : 0;
-  const util =
-    typeof dev.utilization_percent === "number" ? dev.utilization_percent : null;
-  const temp =
-    typeof dev.temperature_c === "number" ? dev.temperature_c : null;
-
+function RunHeader({ run, isActive, wsConnected, mode, onToggleMode, togglePending, onKill }: { run: RunDetail | undefined; isActive: boolean; wsConnected: boolean; mode: "manual" | "auto"; onToggleMode: () => void; togglePending: boolean; onKill: () => void }) {
   return (
-    <Card>
-      <CardHeader className="py-2">
-        <CardTitle className="flex items-center gap-2 text-xs">
-          <Cpu className="h-3.5 w-3.5" />
-          GPU · {dev.name}
-        </CardTitle>
-        <CardDescription className="text-[10px]">
-          live · polled every 2 s
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-2 pt-0 text-xs">
-        <div>
-          <div className="mb-0.5 flex items-baseline justify-between text-[10px] text-muted-foreground">
-            <span>VRAM</span>
-            <span className="font-mono">
-              {usedGb.toFixed(2)} / {totalGb.toFixed(2)} GiB
-            </span>
-          </div>
-          <div className="h-1.5 overflow-hidden rounded-sm bg-muted">
-            <div
-              className={cn(
-                "h-full transition-all",
-                memPct < 70
-                  ? "bg-emerald-500"
-                  : memPct < 90
-                  ? "bg-amber-500"
-                  : "bg-rose-500",
-              )}
-              style={{ width: `${Math.min(100, memPct)}%` }}
-            />
-          </div>
-        </div>
-        {util != null && (
-          <div>
-            <div className="mb-0.5 flex items-baseline justify-between text-[10px] text-muted-foreground">
-              <span>utilization</span>
-              <span className="font-mono">{util.toFixed(0)}%</span>
-            </div>
-            <div className="h-1.5 overflow-hidden rounded-sm bg-muted">
-              <div
-                className="h-full bg-primary transition-all"
-                style={{ width: `${Math.min(100, util)}%` }}
-              />
-            </div>
-          </div>
-        )}
-        {temp != null && (
-          <div className="flex items-baseline justify-between text-[10px]">
-            <span className="text-muted-foreground">temperature</span>
-            <span
-              className={cn(
-                "font-mono",
-                temp < 75
-                  ? "text-muted-foreground"
-                  : temp < 85
-                  ? "text-amber-700"
-                  : "text-rose-700",
-              )}
-            >
-              {temp.toFixed(0)} °C
-            </span>
-          </div>
-        )}
-      </CardContent>
-    </Card>
+    <div className="rs-run-header">
+      <Icon name="activity" size={17} color="var(--rs-muted)" />
+      <span className="mono" style={{ fontSize: 14, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}>
+        {run ? run.run_id.replace(/^job_/, "") : "…"}
+      </span>
+      {run && <Badge status={run.status} />}
+      {run && <span className="rs-sub" style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}>{run.behavior_goal}</span>}
+      <span className="rs-grow" />
+      <span className="rs-flex rs-gap-8 rs-eyebrow" style={{ flexShrink: 0 }}>
+        <span className="rs-flex rs-gap-6"><span className="rs-dot" style={{ background: wsConnected ? "var(--st-emerald)" : "var(--st-rose)" }} />ws {wsConnected ? "open" : "closed"}</span>
+        {run && <span>iters {run.iterations_completed}/{run.iterations_requested}</span>}
+      </span>
+      {/* §Ship 39 (H1): the big Auto/Manual switch — flip at ANY point. */}
+      {isActive && (
+        <Btn
+          kind={mode === "manual" ? "primary" : "quiet"}
+          size="sm"
+          icon={mode === "manual" ? "clock" : "activity"}
+          disabled={togglePending}
+          onClick={onToggleMode}
+          title={mode === "manual"
+            ? "Manual: pausing for your feedback each iteration. Click to run on auto."
+            : "Auto: running straight through. Click to pause for feedback each iteration."}
+        >
+          {mode === "manual" ? "Manual" : "Auto"}
+        </Btn>
+      )}
+      {isActive && <Btn kind="danger" size="sm" icon="square" onClick={onKill}>Stop</Btn>}
+    </div>
   );
 }
 
-function RunHeader({
-  run,
-  isActive,
-  wsConnected,
-  onKill,
-}: {
-  run: RunDetail | undefined;
-  isActive: boolean;
-  wsConnected: boolean;
-  onKill: () => void;
-}) {
+// §Ship 39 (H1): the inline feedback prompt shown when the loop is paused
+// awaiting the human's observation (manual mode).
+function FeedbackPanel({ iterIndex, pending, onSubmit }: { iterIndex: number | null; pending: boolean; onSubmit: (text: string, goAuto: boolean) => void }) {
+  const [text, setText] = useState("");
   return (
-    <Card>
-      <CardContent className="flex flex-wrap items-center gap-3 px-4 py-3 text-xs">
-        <span className="font-mono font-semibold">
-          {run ? run.run_id.replace(/^job_/, "") : "…"}
-        </span>
-        {run && <RunStatusBadge status={run.status} />}
-        {run && (
-          <span className="truncate text-muted-foreground">
-            <span className="text-foreground">{run.behavior_goal}</span>
-          </span>
-        )}
-        <span className="ml-auto flex items-center gap-3 text-[10px] uppercase tracking-wide text-muted-foreground">
-          <span className="flex items-center gap-1">
-            <span
-              className={cn(
-                "inline-block h-2 w-2 rounded-full",
-                wsConnected ? "bg-emerald-500" : "bg-rose-500",
-              )}
-            />
-            ws {wsConnected ? "open" : "closed"}
-          </span>
-          {run && <span>iters {run.iterations_completed}/{run.iterations_requested}</span>}
-        </span>
-        {isActive && (
-          <Button variant="destructive" size="sm" onClick={onKill}>
-            <StopCircle />
-            Kill
-          </Button>
-        )}
-      </CardContent>
-    </Card>
+    <div className="rs-card" style={{ margin: "0 16px 12px", borderColor: "var(--st-amber)", borderWidth: 1, borderStyle: "solid" }}>
+      <div className="rs-flex rs-gap-6" style={{ alignItems: "center", marginBottom: 6 }}>
+        <Icon name="clock" size={15} color="var(--st-amber)" />
+        <span className="rs-eyebrow">Awaiting your feedback{typeof iterIndex === "number" ? ` · after iteration ${iterIndex}` : ""}</span>
+      </div>
+      <div className="rs-sub" style={{ marginBottom: 8 }}>
+        Watch the latest rollout, then tell the diagnoser what you see (optional) — it steers the next iteration.
+      </div>
+      <textarea
+        className="rs-textarea"
+        value={text}
+        onChange={(e) => setText(e.target.value)}
+        rows={3}
+        placeholder="e.g. it's standing still and flailing its arms — not actually kicking"
+        style={{ width: "100%", resize: "vertical" }}
+      />
+      <div className="rs-flex rs-gap-8" style={{ marginTop: 8 }}>
+        <Btn kind="primary" size="sm" icon={pending ? "loader" : "play"} disabled={pending} onClick={() => onSubmit(text, false)}>Continue</Btn>
+        <Btn kind="quiet" size="sm" disabled={pending} onClick={() => onSubmit(text, true)}>Continue + go Auto</Btn>
+      </div>
+    </div>
   );
+}
+
+// §Ship 21c reward-transition logic — preserved verbatim, restyled.
+function RewardVersionTransition({
+  versionBefore, versionAfter, editCount, failureModes, status,
+}: {
+  versionBefore: number | null;
+  versionAfter: number | null;
+  editCount: number | null;
+  failureModes: string[];
+  status: "running" | "completed" | "errored" | "stopped";
+}) {
+  if (status === "running" || status === ("queued" as string)) {
+    return <span className="ver">v{versionBefore ?? "?"} → v?</span>;
+  }
+  if (versionAfter !== null) {
+    return <span className="ver">v{versionBefore ?? "?"} → v{versionAfter}</span>;
+  }
+  const noFailures = failureModes.length === 1 && failureModes[0] === "none";
+  const hadEdits = editCount !== null && editCount > 0;
+  if (noFailures) {
+    return <span className="ver" style={{ color: "var(--st-emerald)" }} title="Diagnoser found no failure modes; no reward edit needed.">v{versionBefore ?? "?"} · held</span>;
+  }
+  if (hadEdits) {
+    return <span className="ver" style={{ color: "var(--st-amber)" }} title={`${editCount} edit(s) proposed but filtered at pre-flight.`}>v{versionBefore ?? "?"} · {editCount} edit{editCount === 1 ? "" : "s"} filtered</span>;
+  }
+  return <span className="ver" title="No new reward version this iter.">v{versionBefore ?? "?"} · no edit</span>;
 }
 
 // ── iteration timeline ────────────────────────────────────────────────
-function IterationTimeline({
-  iters,
-  selected,
-  onSelect,
-}: {
-  iters: IterEventSummary[];
-  selected: number | null;
-  onSelect: (n: number) => void;
-}) {
+function IterationTimeline({ iters, selected, onSelect }: { iters: IterEventSummary[]; selected: number | null; onSelect: (n: number) => void }) {
   return (
-    <Card className="max-h-[640px] overflow-y-auto scrollbar-thin">
-      <CardHeader className="py-3">
-        <CardTitle className="text-sm">Timeline</CardTitle>
-        <CardDescription className="text-[11px]">
-          {iters.length} iter{iters.length === 1 ? "" : "s"}
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="flex flex-col gap-1 p-2 pt-0">
-        {iters.length === 0 && (
-          <p className="px-2 py-1 text-[11px] text-muted-foreground">
-            no iterations yet
-          </p>
-        )}
-        {iters.map((it) => (
-          <button
-            key={it.iter_index}
-            type="button"
-            onClick={() => onSelect(it.iter_index)}
-            className={cn(
-              "flex flex-col gap-1 rounded-md border px-2 py-2 text-left text-xs transition-colors",
-              selected === it.iter_index
-                ? "border-foreground/30 bg-accent"
-                : "border-transparent hover:bg-accent/60",
-            )}
-          >
-            <div className="flex items-center justify-between">
-              <span className="font-mono font-semibold">iter {it.iter_index}</span>
-              {it.status === "running" ? (
-                <Loader2 className="h-3 w-3 animate-spin text-amber-600" />
-              ) : it.status === "completed" ? (
-                <CheckCircle2 className="h-3 w-3 text-emerald-600" />
-              ) : it.status === "errored" ? (
-                <XCircle className="h-3 w-3 text-rose-600" />
-              ) : null}
-            </div>
-            {it.status === "running" && typeof it.rl_total === "number" && it.rl_total > 0 && (
-              <IterProgressBar
-                rlIter={it.rl_iter ?? 0}
-                rlTotal={it.rl_total}
-                pct={it.pct ?? 0}
-                etaS={it.eta_s ?? null}
-              />
-            )}
-            {(it.reward_version_before !== null || it.reward_version_after !== null) && (
-              <span className="flex items-center gap-1 font-mono text-[10px] text-muted-foreground">
-                v{it.reward_version_before ?? "?"}
-                <ArrowRight className="h-2.5 w-2.5" />
-                v{it.reward_version_after ?? "?"}
-              </span>
-            )}
-            {it.primary_metric !== null && (
-              <span className="font-mono text-[11px]">
-                {it.primary_metric.toFixed(3)}{" "}
-                {it.metric_delta !== null && (
-                  <span
-                    className={cn(
-                      it.metric_delta > 0
-                        ? "text-emerald-700"
-                        : it.metric_delta < 0
-                        ? "text-rose-700"
-                        : "text-muted-foreground",
-                    )}
-                  >
-                    ({it.metric_delta >= 0 ? "+" : ""}
-                    {it.metric_delta.toFixed(3)})
-                  </span>
+    <div className="rs-iter-col">
+      <div className="rs-eyebrow" style={{ marginBottom: 12 }}>Iterations</div>
+      {iters.length === 0 && <p className="rs-sub" style={{ fontSize: 11 }}>no iterations yet</p>}
+      {iters.map((it) => (
+        <button
+          key={it.iter_index}
+          className={"rs-itercard" + (selected === it.iter_index ? " on" : "")}
+          style={{ width: "100%", textAlign: "left", cursor: "pointer" }}
+          onClick={() => onSelect(it.iter_index)}
+        >
+          <div className="rs-itercard-top">
+            <span className="it"><Badge status={it.status} label="" />iter {it.iter_index}</span>
+            {/* §Ship 35: objective fitness is the PRIMARY metric (prominent,
+                violet); the reward metric is demoted to a small muted value.
+                Falls back to reward-as-primary on blind runs (no fitness). */}
+            {typeof it.fitness === "number" ? (
+              <span style={{ display: "flex", alignItems: "baseline", gap: 6 }}>
+                <span className="rs-num" title="objective fitness (spec_score, 0-1) — primary metric" style={{ fontSize: 15, fontWeight: 600, color: "#b9aef5" }}>
+                  fit {it.fitness.toFixed(2)}{typeof it.best_fitness === "number" && it.best_fitness > it.fitness + 1e-9 ? ` (best ${it.best_fitness.toFixed(2)})` : ""}
+                </span>
+                {it.primary_metric !== null && (
+                  <span className="rs-num" title="reward metric (secondary)" style={{ fontSize: 11, color: "var(--rs-muted)" }}>r {it.primary_metric.toFixed(1)}</span>
                 )}
               </span>
+            ) : (
+              it.primary_metric !== null && <span className="rs-num" style={{ fontSize: 13 }}>{it.primary_metric.toFixed(1)}</span>
             )}
-            {it.failure_modes.length > 0 && (
-              <span className="truncate text-[10px] text-muted-foreground">
-                {it.failure_modes.join(", ")}
+          </div>
+          {it.status === "running" && typeof it.rl_total === "number" && it.rl_total > 0 && (
+            <IterProgressBar rlIter={it.rl_iter ?? 0} rlTotal={it.rl_total} pct={it.pct ?? 0} etaS={it.eta_s ?? null} />
+          )}
+          {(it.reward_version_before !== null || it.reward_version_after !== null) && (
+            <div className="rs-flex-between" style={{ marginTop: 5 }}>
+              <RewardVersionTransition versionBefore={it.reward_version_before} versionAfter={it.reward_version_after} editCount={it.edit_count} failureModes={it.failure_modes} status={it.status} />
+              {it.metric_delta !== null && <Delta value={it.metric_delta} />}
+            </div>
+          )}
+          {it.failure_modes.length > 0 && !(it.failure_modes.length === 1 && it.failure_modes[0] === "none") && (
+            <span className="ver" style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", display: "block" }}>{it.failure_modes.join(", ")}</span>
+          )}
+          {it.realism_audit && typeof it.realism_audit.verdict === "string" && it.realism_audit.verdict !== "ok" && it.realism_audit.verdict !== "unknown" && (
+            <span className="rs-tag" style={{ marginTop: 4, fontSize: 10, background: it.realism_audit.verdict === "severe" ? "var(--st-rose-bg)" : "var(--st-amber-bg)", color: it.realism_audit.verdict === "severe" ? "var(--st-rose-fg)" : "var(--st-amber-fg)" }}>
+              physics: {it.realism_audit.verdict}
+            </span>
+          )}
+          {it.physics_edit_suggestion && it.physics_edit_suggestion.prompt && (() => {
+            const state = it.physics_edit_suggestion.auto_apply_state;
+            const disabled = state === "in_progress" || state === "applied";
+            const label = state === "applied" ? "physics auto-applied" : state === "in_progress" ? "applying physics fix…" : state === "rejected" || state === "errored" ? "physics fix failed — retry" : "apply physics fix";
+            return (
+              <span
+                onClick={(e) => {
+                  e.stopPropagation();
+                  if (disabled) return;
+                  try { sessionStorage.setItem("pendingPhysicsPrompt", it.physics_edit_suggestion!.prompt); }
+                  catch { void navigator.clipboard?.writeText(it.physics_edit_suggestion!.prompt); }
+                  const match = window.location.pathname.match(/\/projects\/([^/]+)/);
+                  if (match) window.location.assign(`/projects/${match[1]}`);
+                }}
+                className="rs-tag"
+                style={{ marginTop: 4, fontSize: 10, cursor: disabled ? "default" : "pointer", background: state === "applied" ? "var(--st-emerald-bg)" : "var(--st-blue-bg)", color: state === "applied" ? "var(--st-emerald-fg)" : "var(--st-blue-fg)" }}
+                title={it.physics_edit_suggestion.auto_apply_reason ?? "Open Physics tab with this prompt pre-filled"}
+              >
+                {label}
               </span>
-            )}
-            {it.realism_audit &&
-              typeof it.realism_audit.verdict === "string" &&
-              it.realism_audit.verdict !== "ok" &&
-              it.realism_audit.verdict !== "unknown" && (
-                <span
-                  className={cn(
-                    "inline-flex w-fit items-center rounded px-1.5 py-0.5 text-[10px] font-semibold",
-                    it.realism_audit.verdict === "severe"
-                      ? "bg-rose-100 text-rose-800"
-                      : "bg-amber-100 text-amber-800",
-                  )}
-                  title={`torque saturation: ${Math.round(
-                    (it.realism_audit.torque_saturation_frac ?? 0) * 100,
-                  )}% overall, worst joint ${Math.round(
-                    (it.realism_audit.any_joint_saturation_max ?? 0) * 100,
-                  )}%`}
-                >
-                  physics: {it.realism_audit.verdict}
-                </span>
-              )}
-            {it.physics_edit_suggestion && it.physics_edit_suggestion.prompt && (
-              (() => {
-                // §Ship-8c hotfix: chip reflects sculpt-side auto-apply
-                // progress. Disabled while sculpt is applying (prevents
-                // click-race); shows a checkmark once applied.
-                const state = it.physics_edit_suggestion.auto_apply_state;
-                const disabled = state === "in_progress";
-                const label =
-                  state === "applied"
-                    ? "physics auto-applied"
-                    : state === "in_progress"
-                    ? "applying physics fix…"
-                    : state === "rejected" || state === "errored"
-                    ? "physics fix failed — click to retry"
-                    : "apply physics fix";
-                const cls =
-                  state === "applied"
-                    ? "bg-emerald-100 text-emerald-800"
-                    : state === "in_progress"
-                    ? "bg-slate-100 text-slate-600 cursor-wait"
-                    : state === "rejected" || state === "errored"
-                    ? "bg-amber-100 text-amber-800 hover:bg-amber-200 cursor-pointer"
-                    : "bg-indigo-100 text-indigo-800 hover:bg-indigo-200 cursor-pointer";
-                return (
-                  <span
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      if (disabled || state === "applied") return;
-                      try {
-                        sessionStorage.setItem(
-                          "pendingPhysicsPrompt",
-                          it.physics_edit_suggestion!.prompt,
-                        );
-                      } catch {
-                        void navigator.clipboard?.writeText(
-                          it.physics_edit_suggestion!.prompt,
-                        );
-                      }
-                      const match = window.location.pathname.match(
-                        /\/projects\/([^/]+)/,
-                      );
-                      if (match) {
-                        window.location.assign(`/projects/${match[1]}/physics`);
-                      }
-                    }}
-                    className={cn(
-                      "inline-flex w-fit items-center rounded px-1.5 py-0.5 text-[10px] font-semibold",
-                      cls,
-                    )}
-                    title={
-                      it.physics_edit_suggestion.auto_apply_reason ??
-                      it.physics_edit_suggestion.auto_apply_summary ??
-                      "Open Physics tab with this auto-generated prompt pre-filled"
-                    }
-                  >
-                    {label}
-                  </span>
-                );
-              })()
-            )}
-          </button>
-        ))}
-      </CardContent>
-    </Card>
+            );
+          })()}
+          {it.env_extension_suggestion && it.env_extension_suggestion.terms.length > 0 && (
+            <span
+              className="rs-tag"
+              style={{ marginTop: 4, fontSize: 10, background: "var(--st-amber-bg)", color: "var(--st-amber-fg)" }}
+              title={
+                `The diagnoser proposed ${it.env_extension_suggestion.terms.join(", ")} ` +
+                `but the adapter doesn't expose the fields they need, so it was deferred. ` +
+                `Extend the adapter's expected_info_keys to unblock this skill.` +
+                ((it.env_extension_suggestion.rationales || []).length
+                  ? "\n\n" + (it.env_extension_suggestion.rationales || []).join("\n\n")
+                  : "")
+              }
+            >
+              needs adapter channels: {it.env_extension_suggestion.terms.join(", ")}
+            </span>
+          )}
+        </button>
+      ))}
+    </div>
   );
 }
 
-function RunErrorCard({
-  slug,
-  error,
-  classification,
-}: {
-  slug: string;
-  error: string;
-  classification: ErrorClassification | null;
-}) {
+function RunErrorCard({ slug, error, classification }: { slug: string; error: string; classification: ErrorClassification | null }) {
   const regen = useRegenerateRewardTemplate(slug);
-  const isContractMismatch =
-    classification?.kind === "reward_contract_mismatch"
-    || classification?.action?.kind === "regenerate_reward_template";
-
+  const isContractMismatch = classification?.kind === "reward_contract_mismatch" || classification?.action?.kind === "regenerate_reward_template";
   const onRegenerate = () => {
     regen.mutate(undefined, {
-      onSuccess: () => {
-        toast.success("Reward template regenerated", {
-          description: "rewards/v0.py rewritten for this project's adapter.",
-        });
-      },
+      onSuccess: () => toast.success("Reward template regenerated", { description: "rewards/v0.py rewritten for this adapter." }),
       onError: (err) => {
-        const msg =
-          err instanceof ApiError
-            ? err.problem.detail ?? err.problem.title
-            : (err as Error).message;
+        const msg = err instanceof ApiError ? err.problem.detail ?? err.problem.title : (err as Error).message;
         toast.error("Could not regenerate template", { description: msg });
       },
     });
   };
-
   return (
-    <Card className="border-rose-300/50 bg-rose-50">
-      <CardHeader className="py-2">
-        <CardTitle className="text-xs text-rose-800">
-          {classification?.title ?? "Error"}
-        </CardTitle>
-        {classification?.detail && (
-          <CardDescription className="text-[11px] text-rose-900/80">
-            {classification.detail}
-          </CardDescription>
-        )}
-      </CardHeader>
-      <CardContent className="space-y-2 pt-0 text-[11px] text-rose-900">
-        <pre className="whitespace-pre-wrap break-words font-mono text-[10px] leading-snug opacity-90">
-          {error}
-        </pre>
-        {classification?.suggestions && classification.suggestions.length > 0 && (
-          <ul className="list-disc space-y-0.5 pl-4 text-[11px]">
-            {classification.suggestions.map((s, i) => (
-              <li key={i}>{s}</li>
-            ))}
-          </ul>
-        )}
-        {isContractMismatch && (
-          <Button
-            size="sm"
-            variant="outline"
-            onClick={onRegenerate}
-            disabled={regen.isPending}
-            className="mt-1 border-rose-300 text-rose-900 hover:bg-rose-100"
-          >
-            {regen.isPending ? (
-              <Loader2 className="h-3.5 w-3.5 animate-spin" />
-            ) : (
-              <RefreshCw className="h-3.5 w-3.5" />
-            )}
-            {regen.isPending ? "Regenerating…" : "Regenerate reward template"}
-          </Button>
-        )}
-      </CardContent>
-    </Card>
+    <div className="rs-banner err" style={{ flexDirection: "column", alignItems: "stretch", gap: 8 }}>
+      <div className="rs-flex rs-gap-8">
+        <Icon name="alert-triangle" size={17} />
+        <span className="rs-grow"><b>{classification?.title ?? "Run errored"}.</b> {classification?.detail ?? ""}</span>
+      </div>
+      <pre className="mono" style={{ whiteSpace: "pre-wrap", wordBreak: "break-word", fontSize: 10, margin: 0, opacity: 0.9 }}>{error}</pre>
+      {classification?.suggestions && classification.suggestions.length > 0 && (
+        <ul style={{ margin: 0, paddingLeft: 18, fontSize: 12 }}>{classification.suggestions.map((s, i) => <li key={i}>{s}</li>)}</ul>
+      )}
+      {isContractMismatch && (
+        <div><Btn kind="ghost" size="sm" icon="refresh-cw" onClick={onRegenerate} disabled={regen.isPending}>{regen.isPending ? "Regenerating…" : "Regenerate reward template"}</Btn></div>
+      )}
+    </div>
   );
 }
-
 
 function IterationDetailCard({ iter }: { iter: IterEventSummary | null }) {
   if (!iter) return null;
   return (
-    <Card>
-      <CardHeader className="py-3">
-        <CardTitle className="text-sm">Iter {iter.iter_index}</CardTitle>
-        <CardDescription className="text-[11px]">
-          {iter.status}
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-1 text-xs">
+    <div className="rs-card rs-card-pad">
+      <div className="rs-card-title" style={{ fontSize: 13, marginBottom: 10 }}><Icon name="circle-dot" size={15} />Iter {iter.iter_index} · {iter.status}</div>
+      <div className="rs-vgap-8">
         {iter.failure_modes.length > 0 && (
           <div>
-            <span className="text-[10px] uppercase tracking-wider text-muted-foreground">
-              failure modes
-            </span>
-            <div className="mt-0.5 flex flex-wrap gap-1">
-              {iter.failure_modes.map((f) => (
-                <span
-                  key={f}
-                  className="rounded-sm border bg-muted/40 px-1 py-0.5 font-mono text-[10px]"
-                >
-                  {f}
-                </span>
+            <div className="rs-eyebrow" style={{ marginBottom: 4 }}>failure modes</div>
+            <div className="rs-flex rs-wrap rs-gap-6">{iter.failure_modes.map((f) => <span key={f} className="rs-tag mono" style={{ fontSize: 10 }}>{f}</span>)}</div>
+          </div>
+        )}
+        {iter.edit_count !== null && <div className="rs-flex-between" style={{ fontSize: 12 }}><span className="rs-sub">edits</span><span className="rs-num">{iter.edit_count}</span></div>}
+        {iter.paper_refs.length > 0 && (
+          <div>
+            <div className="rs-eyebrow" style={{ marginBottom: 4 }}>paper refs</div>
+            <div className="rs-vgap-8">
+              {iter.paper_refs.map((r) => (
+                <a key={r} href={`https://arxiv.org/abs/${r}`} target="_blank" rel="noreferrer noopener" className="mono" style={{ fontSize: 11, color: "var(--ink)", display: "block" }}>{r}</a>
               ))}
             </div>
           </div>
         )}
-        {iter.edit_count !== null && (
-          <div className="flex justify-between">
-            <span className="text-muted-foreground">edits</span>
-            <span>{iter.edit_count}</span>
-          </div>
-        )}
-        {iter.paper_refs.length > 0 && (
-          <div>
-            <span className="text-[10px] uppercase tracking-wider text-muted-foreground">
-              paper refs
-            </span>
-            <ul className="mt-0.5 space-y-0.5">
-              {iter.paper_refs.map((r) => (
-                <li key={r} className="font-mono text-[11px]">
-                  <a
-                    href={`https://arxiv.org/abs/${r}`}
-                    target="_blank"
-                    rel="noreferrer noopener"
-                    className="hover:underline"
-                  >
-                    {r}
-                  </a>
-                </li>
-              ))}
-            </ul>
-          </div>
-        )}
-      </CardContent>
-    </Card>
+      </div>
+    </div>
   );
 }
 
-// Status-rank for monotonic iter transitions. An iter can only move
-// forward: queued → running → completed/errored. A later-arriving
-// REST snapshot that happens to see status="running" (e.g. because
-// the fs watcher on the backend hasn't seen the completion event yet)
-// must NOT overwrite an already-completed slot. Issue E (Test 1).
-const _ITER_STATUS_RANK: Record<string, number> = {
-  queued: 0,
-  running: 1,
-  completed: 2,
-  errored: 2,
-};
+// ── iter-merge logic (preserved verbatim) ────────────────────────────
+const _ITER_STATUS_RANK: Record<string, number> = { queued: 0, running: 1, completed: 2, errored: 2 };
 
-function _mergeIterSlot(
-  prev: IterEventSummary | undefined,
-  next: IterEventSummary,
-): IterEventSummary {
+function _mergeIterSlot(prev: IterEventSummary | undefined, next: IterEventSummary): IterEventSummary {
   if (!prev) return next;
   const prevRank = _ITER_STATUS_RANK[prev.status] ?? 0;
   const nextRank = _ITER_STATUS_RANK[next.status] ?? 0;
-  // Keep the further-along status; fill in any null fields from the
-  // losing side so we don't lose data (e.g. REST has completed_at but
-  // the WS-derived slot doesn't).
   const winner = nextRank >= prevRank ? next : prev;
   const loser = nextRank >= prevRank ? prev : next;
   return {
     ...loser,
     ...winner,
-    // Null-preservation merge for every optional field — winner wins
-    // on non-null, loser fills in on null. Avoids a completed REST
-    // snapshot overwriting paper_refs from a WS `edit_applied` event.
     started_at: winner.started_at ?? loser.started_at,
     completed_at: winner.completed_at ?? loser.completed_at,
     reward_version_before: winner.reward_version_before ?? loser.reward_version_before,
@@ -775,60 +804,166 @@ function _mergeIterSlot(
     rollout_ready: winner.rollout_ready || loser.rollout_ready,
     diagnosed: winner.diagnosed || loser.diagnosed,
     realism_audit: winner.realism_audit ?? loser.realism_audit,
-    physics_edit_suggestion:
-      winner.physics_edit_suggestion ?? loser.physics_edit_suggestion,
+    physics_edit_suggestion: winner.physics_edit_suggestion ?? loser.physics_edit_suggestion,
+    // §Ship 34: keep fitness even if the winning (completed) slot didn't
+    // carry it (iter_fitness fires before iter_completed).
+    fitness: winner.fitness ?? loser.fitness,
+    best_fitness: winner.best_fitness ?? loser.best_fitness,
   };
 }
 
-// ── utility: merge REST iterations with in-flight WS events ──────────
-// Uses a useRef-backed Map that PERSISTS across renders so iters never
-// vanish when REST transiently returns fewer rows than previously seen
-// (Issue E from Test 1 2026-04-22: Sam saw "iter 1 disappeared after
-// iter 0 finished, reappeared when iter 2 started"). Any iter ever
-// known to exist is kept; later updates merge via _mergeIterSlot which
-// enforces status-rank monotonicity.
-function useMergedIterations(
-  rest: IterEventSummary[],
-  events: RunEvent[],
-): IterEventSummary[] {
+// §Ship 43: the launch-time objective-metric generation phase (run-phase 0).
+// Streams the Ship-40 stages into the Runs timeline; surfaces acceptance and —
+// crucially — REJECTIONS with the exact reasons (never silent). Ship 45 adds a
+// one-click retry.
+function MetricGenPhase({ phase, busy, onRetry, onContinueBlind }: {
+  phase: {
+    last: { stage?: string; message?: string; attempt?: number; max?: number } | null;
+    outcome: "accepted" | "rejected" | "failed" | null;
+    genId: string | null;
+    reasons: string[];
+    concerns: string[];
+    errorMsg: string | null;
+    calib: {
+      status: "running" | "done" | "skipped";
+      builtin?: string; calibrated?: boolean; spearman?: number | null;
+      method?: string; agreement_fraction?: number | null; reason?: string | null;
+      trust?: number | null;
+    } | null;
+    awaiting: boolean;
+  };
+  busy: boolean;
+  onRetry: () => void;
+  onContinueBlind: () => void;
+}) {
+  const { last, outcome, genId, reasons, concerns, errorMsg, calib, awaiting } = phase;
+  const running = outcome === null;
+  const bad = outcome === "rejected" || outcome === "failed";
+  const tone = outcome === "accepted" ? "var(--st-green-fg, var(--ink))"
+    : bad ? "var(--st-amber-fg)" : "var(--ink)";
+  return (
+    <div className="rs-card" style={{ marginBottom: 10 }}>
+      <div className="rs-card-head">
+        <div className="rs-card-title" style={{ fontSize: 13 }}>
+          <Icon name={running ? "loader" : outcome === "accepted" ? "check-circle" : "alert-triangle"} size={15} />
+          Objective metric generation
+        </div>
+        {running && <span className="rs-dot live" />}
+      </div>
+      <div style={{ padding: "8px 12px 12px", fontSize: 12.5, color: "var(--ink)" }}>
+        {running && (
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <Icon name="loader" size={13} />
+            <span>
+              {last?.message ?? "Starting generation…"}
+              {typeof last?.attempt === "number" && typeof last?.max === "number"
+                ? ` (attempt ${last.attempt}/${last.max})` : ""}
+            </span>
+          </div>
+        )}
+        {outcome === "accepted" && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+            <div style={{ color: tone }}>
+              Generated <code className="mono">{genId}</code>.
+            </div>
+            {calib?.status === "running" && (
+              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                <Icon name="loader" size={12} />
+                <span>{calib.method === "task_derived"
+                  ? "Calibrating vs 3 independently-generated competence ladders…"
+                  : <>Calibrating vs <code className="mono">{calib.builtin}</code>…</>}</span>
+              </div>
+            )}
+            {calib?.status === "done" && calib.calibrated && (
+              <div style={{ color: "var(--st-green-fg, var(--ink))" }}>
+                {calib.method === "task_derived" ? (
+                  <>Competence ladders agree
+                    {typeof calib.spearman === "number" ? ` (rho_min ${calib.spearman})` : ""}
+                    {" "}— <strong>steering</strong> the run.</>
+                ) : (
+                  <>Calibrated vs <code className="mono">{calib.builtin}</code>
+                    {typeof calib.spearman === "number" ? ` (Spearman ${calib.spearman})` : ""}
+                    {" "}— <strong>steering</strong> the run.</>
+                )}
+                {typeof calib.trust === "number" ? (
+                  <span style={{ color: "var(--rs-muted)" }}> · trust {calib.trust}</span>
+                ) : ""}
+              </div>
+            )}
+            {calib?.status === "done" && !calib.calibrated && (
+              <div style={{ color: "var(--st-amber-fg)" }}>
+                {calib.method === "task_derived" ? (
+                  <>{calib.reason || "Task-derived ladders disagree"} — runs <strong>observe-only</strong>.</>
+                ) : (
+                  <>Did not pass calibration vs <code className="mono">{calib.builtin}</code>
+                    {typeof calib.spearman === "number" ? ` (Spearman ${calib.spearman} < 0.7)` : ""}
+                    {" "}— runs <strong>observe-only</strong>.</>
+                )}
+              </div>
+            )}
+            {calib?.status === "skipped" && (
+              <div style={{ color: "var(--rs-muted)" }}>
+                {calib.reason || "No matching built-in ground truth"} — runs observe-only.
+              </div>
+            )}
+          </div>
+        )}
+        {outcome === "failed" && (
+          <div style={{ color: tone }}>Generation failed: {errorMsg ?? "unknown error"}. Running blind.</div>
+        )}
+        {outcome === "rejected" && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            <div style={{ color: tone, fontWeight: 600 }}>
+              No metric was accepted — the run continues blind. Why:
+            </div>
+            {reasons.length > 0 && (
+              <ul style={{ margin: 0, paddingLeft: 18 }}>
+                {reasons.map((r, i) => <li key={`r${i}`} className="mono" style={{ fontSize: 11 }}>{r}</li>)}
+              </ul>
+            )}
+            {concerns.length > 0 && (
+              <ul style={{ margin: 0, paddingLeft: 18 }}>
+                {concerns.map((c, i) => <li key={`c${i}`} style={{ fontSize: 11 }}>reviewer: {c}</li>)}
+              </ul>
+            )}
+            {awaiting && (
+              <div className="rs-flex rs-gap-6" style={{ marginTop: 4 }}>
+                <Btn kind="primary" size="sm" icon={busy ? "loader" : "sparkles"} disabled={busy} onClick={onRetry}>
+                  Retry generation
+                </Btn>
+                <Btn kind="quiet" size="sm" disabled={busy} onClick={onContinueBlind}>
+                  Continue blind
+                </Btn>
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+
+function useMergedIterations(rest: IterEventSummary[], events: RunEvent[]): IterEventSummary[] {
   const stickyMap = useRef<Map<number, IterEventSummary>>(new Map());
   return useMemo(() => {
     const map = stickyMap.current;
-    // First pass: REST snapshots. These are authoritative on the
-    // fields the fs watcher sees (completed_at, primary_metric from
-    // metrics.json, etc.) and get monotonic-merged into the sticky
-    // map so a transiently-empty REST doesn't evict known rows.
     for (const r of rest) {
       map.set(r.iter_index, _mergeIterSlot(map.get(r.iter_index), r));
     }
-    // Second pass: WS events. Produce a per-iter slot from the events
-    // for that iter, then monotonic-merge into the sticky map.
     const eventSlots = new Map<number, IterEventSummary>();
     for (const ev of events) {
       const iter = (ev as { iter?: number }).iter;
       if (typeof iter !== "number") continue;
       const slot: IterEventSummary = eventSlots.get(iter) ?? map.get(iter) ?? {
-        iter_index: iter,
-        status: "running",
-        started_at: null,
-        completed_at: null,
-        reward_version_before: null,
-        reward_version_after: null,
-        primary_metric: null,
-        metric_delta: null,
-        failure_modes: [],
-        edit_count: null,
-        paper_refs: [],
-        rollout_ready: false,
-        diagnosed: false,
-        realism_audit: null,
-        physics_edit_suggestion: null,
+        iter_index: iter, status: "running", started_at: null, completed_at: null,
+        reward_version_before: null, reward_version_after: null, primary_metric: null,
+        metric_delta: null, failure_modes: [], edit_count: null, paper_refs: [],
+        rollout_ready: false, diagnosed: false, realism_audit: null, physics_edit_suggestion: null,
       };
       if (ev.type === "iter_started") {
         slot.started_at = slot.started_at ?? ev.ts;
-        if (ev.reward_version_before !== undefined) {
-          slot.reward_version_before = Number(ev.reward_version_before);
-        }
+        if (ev.reward_version_before !== undefined) slot.reward_version_before = Number(ev.reward_version_before);
       }
       if (ev.type === "rollout_done") slot.rollout_ready = true;
       if (ev.type === "physics_edit_suggested") {
@@ -837,55 +972,33 @@ function useMergedIterations(
           slot.physics_edit_suggestion = {
             prompt,
             verdict: typeof ev.verdict === "string" ? ev.verdict : null,
-            top_joints_saturation: Array.isArray(ev.top_joints_saturation)
-              ? (ev.top_joints_saturation as Array<{ name: string; value: number }>)
-              : [],
+            top_joints_saturation: Array.isArray(ev.top_joints_saturation) ? (ev.top_joints_saturation as Array<{ name: string; value: number }>) : [],
           };
         }
       }
       if (ev.type === "realism_audited") {
         const audit = (ev as { audit?: Record<string, unknown> }).audit;
         if (audit && typeof audit === "object") {
-          slot.realism_audit = audit as IterEventSummary["realism_audit"];
+          slot.realism_audit = audit as unknown as IterEventSummary["realism_audit"];
         } else if (slot.realism_audit == null) {
           slot.realism_audit = {
             verdict: typeof ev.verdict === "string" ? ev.verdict : "unknown",
-            torque_saturation_frac:
-              typeof ev.torque_saturation_frac === "number"
-                ? ev.torque_saturation_frac
-                : null,
-            any_joint_saturation_max:
-              typeof ev.any_joint_saturation_max === "number"
-                ? ev.any_joint_saturation_max
-                : null,
-            joint_vel_p99_max:
-              typeof ev.joint_vel_p99_max === "number" ? ev.joint_vel_p99_max : null,
-            joint_limit_violation_frac:
-              typeof ev.joint_limit_violation_frac === "number"
-                ? ev.joint_limit_violation_frac
-                : null,
-            top_joints_saturation: Array.isArray(ev.top_joints_saturation)
-              ? (ev.top_joints_saturation as Array<{ name: string; value: number }>)
-              : [],
+            torque_saturation_frac: typeof ev.torque_saturation_frac === "number" ? ev.torque_saturation_frac : null,
+            any_joint_saturation_max: typeof ev.any_joint_saturation_max === "number" ? ev.any_joint_saturation_max : null,
+            joint_vel_p99_max: typeof ev.joint_vel_p99_max === "number" ? ev.joint_vel_p99_max : null,
+            joint_limit_violation_frac: typeof ev.joint_limit_violation_frac === "number" ? ev.joint_limit_violation_frac : null,
+            top_joints_saturation: Array.isArray(ev.top_joints_saturation) ? (ev.top_joints_saturation as Array<{ name: string; value: number }>) : [],
           };
         }
       }
       if (ev.type === "diagnosed") {
         slot.diagnosed = true;
-        slot.failure_modes = Array.isArray(ev.failure_modes)
-          ? (ev.failure_modes as string[])
-          : slot.failure_modes;
+        slot.failure_modes = Array.isArray(ev.failure_modes) ? (ev.failure_modes as string[]) : slot.failure_modes;
       }
       if (ev.type === "edit_applied") {
-        if (ev.reward_version_after !== undefined) {
-          slot.reward_version_after = Number(ev.reward_version_after);
-        }
-        if (ev.reward_version_before !== undefined && slot.reward_version_before === null) {
-          slot.reward_version_before = Number(ev.reward_version_before);
-        }
-        if (Array.isArray(ev.paper_refs)) {
-          slot.paper_refs = ev.paper_refs as string[];
-        }
+        if (ev.reward_version_after !== undefined) slot.reward_version_after = Number(ev.reward_version_after);
+        if (ev.reward_version_before !== undefined && slot.reward_version_before === null) slot.reward_version_before = Number(ev.reward_version_before);
+        if (Array.isArray(ev.paper_refs)) slot.paper_refs = ev.paper_refs as string[];
       }
       if (ev.type === "iter_completed") {
         slot.status = "completed";
@@ -901,9 +1014,15 @@ function useMergedIterations(
         if (typeof ev.rl_total === "number") slot.rl_total = ev.rl_total;
         if (typeof ev.pct === "number") slot.pct = ev.pct;
         if (typeof ev.elapsed_s === "number") slot.elapsed_s = ev.elapsed_s;
-        if (typeof ev.eta_s === "number" || ev.eta_s === null) {
-          slot.eta_s = ev.eta_s as number | null;
-        }
+        if (typeof ev.eta_s === "number" || ev.eta_s === null) slot.eta_s = ev.eta_s as number | null;
+      }
+      // §Ship 34: objective fitness-in-the-loop, shown beside the metric.
+      if (ev.type === "iter_fitness") {
+        if (typeof ev.fitness === "number") slot.fitness = ev.fitness;
+        if (typeof ev.best_so_far === "number") slot.best_fitness = ev.best_so_far;
+      }
+      if (ev.type === "best_reward_selected") {
+        if (typeof ev.fitness === "number") slot.best_fitness = ev.fitness;
       }
       eventSlots.set(iter, slot);
     }
@@ -914,38 +1033,13 @@ function useMergedIterations(
   }, [rest, events]);
 }
 
-
-function IterProgressBar({
-  rlIter,
-  rlTotal,
-  pct,
-  etaS,
-}: {
-  rlIter: number;
-  rlTotal: number;
-  pct: number;
-  etaS: number | null;
-}) {
+function IterProgressBar({ rlIter, rlTotal, pct, etaS }: { rlIter: number; rlTotal: number; pct: number; etaS: number | null }) {
   const clamped = Math.max(0, Math.min(100, pct));
-  const etaLabel =
-    etaS == null
-      ? ""
-      : etaS < 60
-      ? ` · ETA ${Math.round(etaS)}s`
-      : etaS < 3600
-      ? ` · ETA ${Math.round(etaS / 60)}m`
-      : ` · ETA ${(etaS / 3600).toFixed(1)}h`;
+  const etaLabel = etaS == null ? "" : etaS < 60 ? ` · ETA ${Math.round(etaS)}s` : etaS < 3600 ? ` · ETA ${Math.round(etaS / 60)}m` : ` · ETA ${(etaS / 3600).toFixed(1)}h`;
   return (
-    <div className="flex flex-col gap-0.5">
-      <div className="h-1 overflow-hidden rounded-sm bg-amber-100 dark:bg-amber-950/40">
-        <div
-          className="h-full bg-amber-500 transition-[width] duration-500 ease-out"
-          style={{ width: `${clamped}%` }}
-        />
-      </div>
-      <span className="font-mono text-[10px] text-muted-foreground">
-        {rlIter}/{rlTotal} ({clamped.toFixed(1)}%){etaLabel}
-      </span>
+    <div style={{ marginTop: 6 }}>
+      <div className="rs-iterbar"><i style={{ width: `${clamped}%` }} /></div>
+      <span className="mono" style={{ fontSize: 10, color: "var(--rs-muted)" }}>{rlIter}/{rlTotal} ({clamped.toFixed(1)}%){etaLabel}</span>
     </div>
   );
 }

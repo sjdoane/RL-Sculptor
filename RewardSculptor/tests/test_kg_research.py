@@ -138,6 +138,155 @@ def test_research_topic_uses_output_format_kwarg():
     assert kwargs["output_format"] is ResearchResponse
 
 
+def test_research_topic_drops_off_topic_papers_via_arxiv_verification(
+    monkeypatch,
+):
+    """2026-04-23 regression pin.
+
+    Sam ran `research_topic("bipedal robot kicking OR human robot kicking")`
+    and got back `2407.14795` (Persian text spelling correction) and
+    `2502.12927` (LLM feedback for education) — real papers, but
+    Claude attached the wrong IDs to the topic. Pre-fix, these
+    flowed through to the KG and polluted downstream reward edits.
+    Post-fix, `_verify_topic_match` fetches each ID's real arxiv
+    metadata, embeds it against the topic, and drops below-threshold
+    hits. Test stubs the arxiv fetch + embedder so no network or
+    heavy model load runs.
+    """
+    import numpy as np
+
+    parsed = ResearchResponse(
+        papers=[
+            # The two off-topic papers from Sam's actual screenshot.
+            ResearchPaper(
+                arxiv_id="2407.14795",
+                title="Claude-claimed kicking paper",
+                relevance_score=0.9,
+                justification="Claude claims this is about bipedal kicking",
+            ),
+            ResearchPaper(
+                arxiv_id="2502.12927",
+                title="Claude-claimed kicking paper 2",
+                relevance_score=0.8,
+                justification="Claude claims this is about kicking too",
+            ),
+            # A legitimately on-topic paper.
+            ResearchPaper(
+                arxiv_id="1804.02717",
+                title="DeepMimic",
+                relevance_score=0.95,
+                justification="reference-motion imitation for biped skills",
+            ),
+        ],
+        coverage_note="",
+    )
+    client = _StubClient(parsed)
+
+    # Stub the arxiv batch fetch with the REAL titles/abstracts of
+    # the off-topic IDs vs. a plausible on-topic abstract.
+    def _fake_metadata(ids):
+        return {
+            "2407.14795": {
+                "title": "Automatic Real-word Error Correction in Persian Text",
+                "abstract": (
+                    "Automatic spelling correction stands as a pivotal "
+                    "challenge within natural language processing..."
+                ),
+            },
+            "2502.12927": {
+                "title": (
+                    "SEFL: A Framework for Generating Synthetic "
+                    "Educational Assignment Feedback with LLM Agents"
+                ),
+                "abstract": (
+                    "Providing high-quality feedback on student "
+                    "assignments is crucial for student success..."
+                ),
+            },
+            "1804.02717": {
+                "title": (
+                    "DeepMimic: Example-Guided Deep Reinforcement Learning "
+                    "of Physics-Based Character Skills"
+                ),
+                "abstract": (
+                    "A long-standing goal in character animation is to "
+                    "combine data-driven specification of behavior with "
+                    "a system that can execute a similar behavior in a "
+                    "physical simulation, thus enabling realistic "
+                    "responses to perturbations and environmental "
+                    "variation. Bipedal kicking, backflip, walking..."
+                ),
+            },
+        }
+    monkeypatch.setattr(
+        research_mod, "_fetch_arxiv_metadata_batch", _fake_metadata,
+    )
+
+    # Stub `_embed_text` so the test is deterministic + fast. Topic
+    # vector is orthogonal to the off-topic vectors, aligned with
+    # DeepMimic's. Real embedder picks this up with cosine 0.1 vs 0.5.
+    def _fake_embed_text(text, *a, **kw):
+        text_l = (text or "").lower()
+        if "bipedal" in text_l or "kick" in text_l or "biped" in text_l:
+            return np.array([1.0, 0.0, 0.0], dtype=np.float32)
+        if "persian" in text_l or "spelling" in text_l:
+            return np.array([0.0, 1.0, 0.0], dtype=np.float32)
+        if "educational" in text_l or "feedback" in text_l or "assignment" in text_l:
+            return np.array([0.0, 0.0, 1.0], dtype=np.float32)
+        # Fallback: orthogonal to topic so it gets dropped.
+        return np.array([0.0, 0.5, 0.5], dtype=np.float32)
+
+    import sculptor.kg.query as qmod
+    monkeypatch.setattr(qmod, "_embed_text", _fake_embed_text)
+
+    res = research_topic(
+        "bipedal robot kicking OR human robot kicking",
+        client=client, dedupe_against_kg=False,
+    )
+
+    # 2 off-topic papers dropped, 1 on-topic kept.
+    assert res.papers_returned_by_claude == 3
+    assert res.papers_rejected_off_topic == 2, (
+        f"expected 2 off-topic drops, got "
+        f"{res.papers_rejected_off_topic}: "
+        f"{[p.arxiv_id for p in res.papers]}"
+    )
+    assert [p.arxiv_id for p in res.papers] == ["1804.02717"]
+    # Kept paper should have its Claude-claimed title overwritten by
+    # the real arxiv title (defense against relying on the Claude one).
+    assert "DeepMimic" in res.papers[0].title
+
+
+def test_research_topic_fails_open_when_arxiv_unreachable(monkeypatch):
+    """If the arxiv batch fetch returns all-None (network down /
+    rate-limited), we KEEP Claude's papers rather than silently
+    dropping them. Fail-open policy: the verification is a guard
+    against clear off-topic hallucinations, not a gate on all output.
+    """
+    parsed = ResearchResponse(
+        papers=[
+            ResearchPaper(
+                arxiv_id="1804.02717", title="DeepMimic",
+                relevance_score=0.95, justification="bipedal skills",
+            ),
+        ],
+        coverage_note="",
+    )
+    client = _StubClient(parsed)
+
+    # Arxiv fetch returns None for every ID (simulates rate limit).
+    monkeypatch.setattr(
+        research_mod, "_fetch_arxiv_metadata_batch",
+        lambda ids: {aid: None for aid in ids},
+    )
+
+    res = research_topic(
+        "bipedal robot kicking", client=client, dedupe_against_kg=False,
+    )
+    assert res.papers_rejected_off_topic == 0
+    assert [p.arxiv_id for p in res.papers] == ["1804.02717"]
+
+
 def test_research_module_call_sites_agree_with_extract_and_diagnose():
     """All three messages.parse call sites in sculptor.kg + sculptor.diagnose
     must use the same kwarg name AND the same response-unpacking

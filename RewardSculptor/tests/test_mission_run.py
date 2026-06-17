@@ -39,6 +39,7 @@ from sculptor.mission_runtime import (
     BARE_IDENTIFIERS,
     BEHAVIOR_KEYS,
     CriterionEvalError,
+    CriterionMissingKeyError,
     MissionResult,
     PERSISTED_TRAJECTORY_KEYS,
     StageResult,
@@ -162,6 +163,51 @@ def test_criterion_rejects_unknown_bare_name():
         _evaluate_success_criterion("fnord > 0.5", ns)
 
 
+def test_criterion_missing_dict_key_raises_distinct_missing_key_error():
+    """A subscript into a namespace dict with a key the reward never
+    produced raises the DISTINCT CriterionMissingKeyError (a
+    CriterionEvalError subclass) — NOT a generic eval error. This lets
+    the stage runner route it to the recoverable `criterion_not_met`
+    instead of the fatal `criterion_errored`. The message names the
+    missing key + what WAS available so re-decomposition can pick a real
+    key. Regression for the hip_sway / KeyError('hip_sway_osc') mission
+    halt."""
+    ns = {
+        "metric": 0.8,
+        "behavior": {"mean_return": 0.9, "mean_episode_length": 600},
+        "components": {"support_phase": 0.5},
+        "abs": abs, "min": min, "max": max,
+    }
+    with pytest.raises(CriterionMissingKeyError) as exc:
+        _evaluate_success_criterion("components['hip_sway_osc'] > 0.5", ns)
+    msg = str(exc.value)
+    assert "hip_sway_osc" in msg            # names the missing key
+    assert "support_phase" in msg           # surfaces what WAS available
+    # Subclass: existing `except CriterionEvalError` paths still catch it.
+    assert isinstance(exc.value, CriterionEvalError)
+
+
+def test_criterion_get_with_default_avoids_missing_key():
+    """`.get(key, default)` is the soft form: a missing component returns
+    the default so the criterion evaluates cleanly to False instead of
+    raising. Lets a criterion defensively reference a key the reward may
+    not emit yet."""
+    ns = {
+        "metric": 0.8,
+        "behavior": {"mean_return": 0.9},
+        "components": {"support_phase": 0.5},
+        "abs": abs, "min": min, "max": max,
+    }
+    # Missing key → default 0.0 → False, no exception.
+    assert _evaluate_success_criterion(
+        "components.get('hip_sway_osc', 0.0) > 0.5", ns,
+    ) is False
+    # Present key through .get still works.
+    assert _evaluate_success_criterion(
+        "components.get('support_phase', 0.0) > 0.4", ns,
+    ) is True
+
+
 def test_criterion_rejects_dangerous_attribute():
     """`.tobytes()` / `.view()` / `.__reduce__()` would let a malicious
     criterion exfiltrate or execute code. The allow-list blocks them."""
@@ -239,6 +285,46 @@ def test_build_namespace_exposes_components(tmp_path: Path):
     ns = _build_criterion_namespace(iter_dir, primary_metric=0.0)
     assert ns["components"]["support_phase"] == pytest.approx(0.4)
     assert ns["components"]["kick_swing"] == pytest.approx(1.5)
+
+
+def test_build_namespace_exposes_sculptor_components_from_reward_trajectory(
+    tmp_path: Path,
+):
+    """Ship 22r regression (the floss/kicking mission halt): a criterion's
+    `components[<name>]` references the SCULPTOR reward's components (terms the
+    reward_seed_prompt introduces). On mjlab those are written to
+    `reward_trajectory.json`, NOT to trajectory.npz's `reward_term__*` (which
+    hold the ENVIRONMENT's intrinsic terms). _build_criterion_namespace must
+    merge them in — without this, `components['hip_sway_osc']` KeyErrors even
+    though the reward computed it (mean 0.38 > 0.3 → the stage should pass)."""
+    import json as _json
+    iter_dir = tmp_path / "iter_0"
+    # Env intrinsic term → trajectory.npz reward_term__ (mjlab-style).
+    _fabricate_rollout_artifacts(
+        iter_dir,
+        components={"track_linear_velocity": np.array([0.6, 0.8])},  # mean 0.7
+    )
+    # Sculptor components → reward_trajectory.json (Eureka {component: [vals]},
+    # with __-prefixed aux keys that must be skipped).
+    (iter_dir / "reward_trajectory.json").write_text(_json.dumps({
+        "hip_sway_osc": [0.1, 0.5],            # mean = 0.3
+        "upright_bonus": [1.0, 1.0, 1.0],      # mean = 1.0
+        "__episode_length": [400, 500],        # aux — skipped
+        "__terminated": [0.0, 0.0],            # aux — skipped
+    }))
+    ns = _build_criterion_namespace(iter_dir, primary_metric=0.0)
+    # Sculptor components now resolve...
+    assert ns["components"]["hip_sway_osc"] == pytest.approx(0.3)
+    assert ns["components"]["upright_bonus"] == pytest.approx(1.0)
+    # ...the env term is still present (merge, not replace)...
+    assert ns["components"]["track_linear_velocity"] == pytest.approx(0.7)
+    # ...aux __ keys are NOT exposed...
+    assert "__episode_length" not in ns["components"]
+    assert "__terminated" not in ns["components"]
+    # ...and a criterion referencing the sculptor component evaluates cleanly.
+    assert _evaluate_success_criterion(
+        "components['hip_sway_osc'] >= 0.3", ns,
+    ) is True
 
 
 def test_build_namespace_info_is_alias_for_trajectory(tmp_path: Path):
@@ -441,6 +527,53 @@ def test_mission_run_happy_path_two_stages_both_succeed(
     assert "stage_succeeded" in types
 
 
+def test_mission_run_per_stage_steering_metric(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """§Ship 38: a stage with its OWN steering_metric is steered by THAT
+    metric; a stage without one falls back to the mission-level metric.
+    Each resolved fitness fn is tagged so we can see which metric each stage
+    actually received."""
+    from sculptor import sculpt as sculpt_mod
+
+    m = _make_mission(tmp_path, n_stages=2)
+    m.stages[0].steering_metric = "g1_kick"      # per-stage override
+    m.stages[1].steering_metric = None           # → mission-level metric
+
+    def fake_resolve(ref):
+        def fn(_iter_dir):
+            return 0.0
+        fn._metric_ref = ref
+        return fn
+    monkeypatch.setattr("sculptor.eval.resolve_fitness_fn", fake_resolve)
+
+    seen = {}
+    base_fake = _fake_sculpt_run_factory(metric=0.9)
+
+    def capturing_fake(**kw):
+        seen[Path(kw["config_path"]).parent.name] = getattr(
+            kw.get("fitness_fn"), "_metric_ref", None)
+        return base_fake(**kw)
+
+    monkeypatch.setattr(sculpt_mod, "sculpt_run", capturing_fake)
+    monkeypatch.setattr("sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit)
+
+    events: list[dict] = []
+    sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab", kg_store=None,
+        fitness_metric="go1_trot", on_event=events.append,
+    )
+
+    assert seen["stage_0"] == "g1_kick"          # used its own metric
+    assert seen["stage_1"] == "go1_trot"         # fell back to the mission metric
+    sm_events = {e["stage_name"]: e for e in events
+                 if e["type"] == "stage_fitness_metric"}
+    assert sm_events["stage_0"]["metric"] == "g1_kick"
+    assert sm_events["stage_0"]["source"] == "stage"
+    assert sm_events["stage_1"]["metric"] == "go1_trot"
+    assert sm_events["stage_1"]["source"] == "mission"
+
+
 def test_mission_run_halts_when_stage_criterion_fails(
     tmp_path: Path, monkeypatch, stub_adapter,
 ):
@@ -487,6 +620,53 @@ def test_mission_run_halts_when_stage_criterion_fails(
         if e.get("type") == "stage_started" and e.get("stage_name") == "stage_1"
     ]
     assert started == []
+
+
+def test_mission_run_missing_criterion_key_routes_to_criterion_not_met(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """Regression for the hip_sway halt: a stage criterion that references
+    a metric the reward never produced (`components['hip_sway_osc']`) used
+    to raise KeyError → `criterion_errored` → which is NOT re-decomposable
+    → the entire mission halted irrecoverably. Now the missing key is
+    classified as the recoverable `criterion_not_met` (the quantity is
+    absent, so the goal was not met) with `missing_key=True` on the event.
+    Budget pre-exhausted to test the bare classification/halt."""
+    from sculptor import sculpt as sculpt_mod
+
+    m = _make_mission(tmp_path, n_stages=2)
+    m.stages[0].success_criterion = "components['hip_sway_osc'] > 0.5"
+    m.stages[0].redecomposition_attempts = 1  # skip the redecompose path
+    # metric is healthy — only the criterion's KEY is missing.
+    fake = _fake_sculpt_run_factory(metric=0.9)
+    monkeypatch.setattr(sculpt_mod, "sculpt_run", fake)
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
+    )
+
+    events: list[dict] = []
+    result = sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab", on_event=events.append,
+    )
+
+    # Recoverable classification — NOT the fatal criterion_errored.
+    assert result.halted_reason == "criterion_not_met"
+    assert result.stage_results[0].status == "failed"
+    assert result.stage_results[0].failure_reason == "criterion_not_met"
+    # The criterion error detail is preserved + names the missing key, so
+    # re-decomposition feedback can point Claude at a real key.
+    assert "hip_sway_osc" in (result.stage_results[0].criterion_error or "")
+    # The evaluated event flags the missing-key case.
+    evald = [e for e in events if e.get("type") == "stage_criterion_evaluated"]
+    assert evald and evald[-1].get("missing_key") is True
+    assert evald[-1].get("satisfied") is False
+    # Went through the re-decomposable (curriculum) path — budget_exhausted,
+    # NOT the non_curriculum_failure skip that infra/criterion_errored-as-
+    # fatal would have produced.
+    skipped = [
+        e for e in events if e.get("type") == "redecomposition_skipped"
+    ]
+    assert skipped and skipped[-1].get("reason") == "budget_exhausted"
 
 
 def test_extract_toml_section_returns_section_body():
@@ -832,6 +1012,63 @@ def test_criterion_multi_element_array_yields_friendly_hint():
         )
 
 
+def test_criterion_runtime_torch_idiom_yields_friendly_hint():
+    """§Ship 21c regression: legacy mission.json files written before
+    the decompose-time validator landed may still contain torch
+    idioms. Runtime safety net catches the AttributeError and gives
+    a clearer message than the raw 'numpy.ndarray has no .float'.
+
+    The decompose-time validator AND the SAFE_ATTRIBUTE_METHODS set
+    both block `.float()` for new missions. This test simulates the
+    legacy case by passing the criterion straight to the runtime
+    eval, bypassing the decompose validator. The eval-time AST walker
+    will reject `.float` first because we removed it from the safe
+    set — verify that path also surfaces a clear message.
+    """
+    ns = {
+        "metric": None,
+        "trajectory": {"root_link_pos_w": np.zeros((10, 3))},
+        "abs": abs, "min": min, "max": max,
+    }
+    with pytest.raises(CriterionEvalError) as exc_info:
+        _evaluate_success_criterion(
+            "(trajectory['root_link_pos_w'][..., 2] > 0.65).float().mean() > 0.9",
+            ns,
+        )
+    # The attribute walker rejects .float first (no longer in
+    # SAFE_ATTRIBUTE_METHODS post-Ship-21c). Either message is fine
+    # as long as it's clearer than 'numpy.ndarray has no float'.
+    msg = str(exc_info.value).lower()
+    assert (
+        "float" in msg
+        and ("torch" in msg or "disallowed" in msg or "namespace" in msg)
+    ), f"error should mention .float() + a hint about numpy, got: {exc_info.value}"
+
+
+def test_criterion_runtime_accepts_astype_float():
+    """§Ship 21c: numpy's `.astype(float)` (the legitimate cast that
+    replaces torch's `.float()`) passes the runtime safe-attr walker.
+    Test: the criterion that mirrors what Claude SHOULD generate
+    after Ship 21c's prompt update."""
+    ns = {
+        "metric": None,
+        "trajectory": {
+            # 10 frames of 3D positions, all at z=0.7 (> 0.65 threshold).
+            "root_link_pos_w": np.tile(np.array([0.0, 0.0, 0.7]), (10, 1)),
+        },
+        "behavior": {"mean_episode_length": 600},
+        "abs": abs, "min": min, "max": max, "float": float,
+    }
+    # Both forms should be accepted (the bare `.mean()` is preferred;
+    # `.astype(float).mean()` is a no-op-but-explicit fallback).
+    for crit in [
+        "(trajectory['root_link_pos_w'][..., 2] > 0.65).mean() > 0.9",
+        "(trajectory['root_link_pos_w'][..., 2] > 0.65).astype(float).mean() > 0.9",
+    ]:
+        result = _evaluate_success_criterion(crit, ns)
+        assert result is True, f"criterion {crit!r} should evaluate True"
+
+
 def test_mission_run_emits_warm_start_skipped_when_parent_ckpt_deleted(
     tmp_path: Path, monkeypatch, stub_adapter,
 ):
@@ -932,6 +1169,314 @@ def test_mission_run_stage_started_event_includes_stage_dir(
     started = [e for e in events if e.get("type") == "stage_started"]
     assert started and "stage_dir" in started[0]
     assert started[0]["stage_dir"].endswith("/stages/stage_0")
+
+
+def test_mission_run_stage_events_include_effective_max_iterations(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """§Ship 20 Goal #2 regression: when `iterations_override` is set,
+    both `stage_started` and `stage_completed_training` events must
+    carry `effective_max_iterations` so the UI can render `iters X/Y`
+    against the cap that was actually enforced — not the authored
+    `stage.max_iterations`. Pre-fix the dialog showed nonsense like
+    `iters 2/3` when override capped the run at 2.
+
+    Also asserts the authored `max_iterations` is preserved in the
+    payload (we surface BOTH so the UI can show a tooltip explaining
+    the override.)
+    """
+    from sculptor import sculpt as sculpt_mod
+
+    # stage.max_iterations=2 (authored); iterations_override=1.
+    m = _make_mission(tmp_path, n_stages=1)
+    assert m.stages[0].max_iterations == 2
+    monkeypatch.setattr(
+        sculpt_mod, "sculpt_run", _fake_sculpt_run_factory(metric=0.9),
+    )
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
+    )
+
+    events: list[dict] = []
+    sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab",
+        on_event=events.append,
+        iterations_override=1,
+    )
+
+    started = [e for e in events if e.get("type") == "stage_started"]
+    assert started, "missing stage_started event"
+    assert started[0].get("effective_max_iterations") == 1, (
+        f"effective_max_iterations should reflect override (1), got "
+        f"{started[0].get('effective_max_iterations')}"
+    )
+    assert started[0].get("max_iterations") == 2, (
+        "authored max_iterations should still be in the payload"
+    )
+
+    completed = [
+        e for e in events if e.get("type") == "stage_completed_training"
+    ]
+    assert completed, "missing stage_completed_training event"
+    assert completed[0].get("effective_max_iterations") == 1, (
+        f"stage_completed_training should also surface effective cap, "
+        f"got {completed[0].get('effective_max_iterations')}"
+    )
+
+
+def test_mission_run_effective_max_iterations_falls_back_to_authored(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """§Ship 20 Goal #2: when `iterations_override` is None (the
+    default), `effective_max_iterations` should equal the authored
+    `stage.max_iterations`. This is the no-override path — UI shows
+    the same number for both fields and no tooltip differentiation
+    fires.
+    """
+    from sculptor import sculpt as sculpt_mod
+
+    m = _make_mission(tmp_path, n_stages=1)
+    monkeypatch.setattr(
+        sculpt_mod, "sculpt_run", _fake_sculpt_run_factory(metric=0.9),
+    )
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
+    )
+
+    events: list[dict] = []
+    sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab", on_event=events.append,
+    )
+
+    started = [e for e in events if e.get("type") == "stage_started"]
+    assert started
+    assert started[0]["effective_max_iterations"] == m.stages[0].max_iterations
+
+
+def test_mission_run_persists_effective_max_iterations_on_stage(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """§Ship 20a regression: `effective_max_iterations` MUST be
+    persisted on the Stage dataclass (not just emitted as a WS event)
+    so the UI's `rounds X/Y` display stays correct after the WS event
+    window slides past `stage_started`. Sam's G1 test showed the
+    pre-fix bug: the dialog opened post-failure and read
+    `stage.max_iterations` (3) because the override event had been
+    evicted; should have shown 5 (the cap actually enforced).
+
+    This test verifies that AFTER mission_run completes (or fails),
+    re-loading the on-disk mission.json carries
+    `effective_max_iterations` on the stage. Pre-fix the field
+    didn't exist on the dataclass; post-fix it round-trips.
+    """
+    from sculptor import sculpt as sculpt_mod
+    from sculptor.mission import load_mission
+
+    m = _make_mission(tmp_path, n_stages=2)
+    # Authored max_iterations=2 per _make_mission; override to 5.
+    assert m.stages[0].max_iterations == 2
+    monkeypatch.setattr(
+        sculpt_mod, "sculpt_run", _fake_sculpt_run_factory(metric=0.9),
+    )
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
+    )
+
+    sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab",
+        iterations_override=5,
+    )
+
+    # Reload from disk — proves the field round-trips JSON.
+    reloaded = load_mission(tmp_path / "mission" / "mission.json")
+    assert reloaded.stages[0].effective_max_iterations == 5, (
+        "stage.effective_max_iterations must be persisted so the UI "
+        "shows the right cap after WS events evict"
+    )
+    assert reloaded.stages[1].effective_max_iterations == 5, (
+        "every stage_run sets the field — not just stage 0"
+    )
+
+
+def test_mission_run_persists_effective_max_iterations_on_failure(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """§Ship 20a regression: even when a stage FAILS (criterion not
+    met or training errored), `effective_max_iterations` must be
+    persisted. Sam's G1 squat-then-jump test failed at stage 1
+    (`stand_stable`) with status="failed" + display "rounds 4/3" —
+    the override of 5 wasn't visible because (a) stage_started event
+    had been evicted, (b) the field wasn't persisted. Post-fix, the
+    field is set BEFORE the orchestrator runs sculpt_run, so any
+    failure path that calls _atomic_save_mission captures it.
+    """
+    from sculptor import sculpt as sculpt_mod
+    from sculptor.mission import load_mission
+
+    m = _make_mission(tmp_path, n_stages=1)
+    assert m.stages[0].max_iterations == 2
+    # Fake sculpt_run that returns metric=0.1 — fails the
+    # `metric > 0.5` criterion baked into _make_mission.
+    monkeypatch.setattr(
+        sculpt_mod, "sculpt_run", _fake_sculpt_run_factory(metric=0.1),
+    )
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
+    )
+
+    result = sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab",
+        iterations_override=5,
+    )
+    # Mission halts at stage 0 (criterion failed). After Ship 17
+    # re-decomposition kicks in, sub-stages may also be added; the
+    # ORIGINAL stage_0 object should still carry the override.
+    assert m.stages[0].effective_max_iterations == 5
+    # Reload from disk to confirm persistence past in-memory state.
+    reloaded = load_mission(tmp_path / "mission" / "mission.json")
+    assert reloaded.stages[0].effective_max_iterations == 5
+
+
+def test_stage_effective_max_iterations_backward_compat_load(tmp_path: Path):
+    """§Ship 20a: older mission.json files written before this field
+    existed must still load (Stage.from_dict's filter-unknown-keys
+    path covers it; this test pins the behavior so a future schema
+    bump doesn't accidentally break the readback).
+    """
+    import json
+    from sculptor.mission import load_mission
+
+    # Hand-crafted pre-Ship-20a mission.json — no effective_max_
+    # iterations field on the stage.
+    legacy = {
+        "schema_version": 1,
+        "goal": "test",
+        "decomposition_model": "claude-opus-4-7",
+        "decomposition_rationale": "test",
+        "created_at": "2026-04-24T00:00:00+00:00",
+        "current_stage_idx": 0,
+        "stages": [{
+            "name": "s0",
+            "goal_text": "do thing",
+            "success_criterion": "metric > 0.5",
+            "max_iterations": 3,
+            "parent_stage": None,
+            "reward_seed_prompt": "seed",
+            "kg_seed_papers": [],
+            "status": "succeeded",
+            "final_policy_path": None,
+            "final_reward_path": None,
+            "best_metric": 0.9,
+            "iterations_used": 3,
+            "started_at": None,
+            "finished_at": None,
+            "redecomposition_attempts": 0,
+            # NO effective_max_iterations field!
+        }],
+    }
+    md = tmp_path / "legacy_mission"
+    md.mkdir()
+    (md / "mission.json").write_text(json.dumps(legacy))
+
+    m = load_mission(md / "mission.json")
+    assert m.stages[0].effective_max_iterations is None, (
+        "pre-Ship-20a missions load with effective_max_iterations=None "
+        "and the UI falls back to max_iterations"
+    )
+    # Other Ship-19-era fields still load correctly.
+    assert m.stages[0].max_iterations == 3
+    assert m.stages[0].iterations_used == 3
+
+
+def test_mission_run_defaults_round_trip_through_json(tmp_path: Path):
+    """§Ship 21a regression: Mission.run_defaults persists through
+    to_dict / from_dict (and therefore through save_mission /
+    load_mission). Set up front via NewMissionDialog Advanced tab;
+    the backend's mission_jobs.run_mission_decompose_job sets
+    `mission.run_defaults = run_defaults_dict` before save_mission.
+    The frontend's MissionDetail.run_defaults reads this value and
+    pre-fills RunMissionDialog on first open.
+    """
+    from sculptor.mission import (
+        Mission,
+        Stage,
+        save_mission,
+        load_mission,
+    )
+
+    stage = Stage(
+        name="s0",
+        goal_text="do thing",
+        success_criterion="metric > 0.5",
+        max_iterations=3,
+        parent_stage=None,
+        reward_seed_prompt="seed",
+    )
+    run_defaults = {
+        "iterations_override": 5,
+        "early_stop_on_criterion": True,
+        "criterion_stability_window": 2,
+        "extend_on_improvement": True,
+        "max_extensions_per_stage": 2,
+        "extension_factor": 0.75,
+        "extension_improvement_threshold": 0.05,
+    }
+    m = Mission(
+        goal="test",
+        stages=[stage],
+        decomposition_model="claude-opus-4-7",
+        decomposition_rationale="test",
+        run_defaults=run_defaults,
+    )
+
+    md = tmp_path / "round_trip_mission"
+    save_mission(m, md)
+
+    loaded = load_mission(md / "mission.json")
+    assert loaded.run_defaults == run_defaults
+    # Deep-equal so a mutation of `loaded.run_defaults` doesn't leak
+    # back into the original (defensive copy in from_dict).
+    loaded.run_defaults["iterations_override"] = 999  # type: ignore[index]
+    assert run_defaults["iterations_override"] == 5
+
+
+def test_mission_run_defaults_omitted_when_none(tmp_path: Path):
+    """§Ship 21a: when no run_defaults are set (Basic-tab-only
+    creation flow), `to_dict` omits the key entirely so older readers
+    + the UI's MissionDetail see a clean None. Forward-compat: the
+    field doesn't surface in the JSON at all when unused."""
+    import json
+    from sculptor.mission import (
+        Mission,
+        Stage,
+        save_mission,
+    )
+
+    stage = Stage(
+        name="s0",
+        goal_text="do thing",
+        success_criterion="metric > 0.5",
+        max_iterations=3,
+        parent_stage=None,
+        reward_seed_prompt="seed",
+    )
+    m = Mission(
+        goal="test",
+        stages=[stage],
+        decomposition_model="claude-opus-4-7",
+        decomposition_rationale="test",
+        # run_defaults omitted (defaults to None)
+    )
+    assert m.run_defaults is None
+
+    md = tmp_path / "no_defaults_mission"
+    save_mission(m, md)
+
+    raw = json.loads((md / "mission.json").read_text())
+    assert "run_defaults" not in raw, (
+        "to_dict must omit run_defaults when None so older readers "
+        "don't see a null they don't recognize"
+    )
 
 
 def test_mission_run_lock_release_allows_reentry(
@@ -1154,10 +1699,11 @@ def test_redecompose_only_fires_once_per_stage(
 def test_redecompose_does_not_fire_for_infra_failures(
     tmp_path: Path, monkeypatch, stub_adapter,
 ):
-    """Ship 17 trigger condition: only `criterion_not_met` is
-    re-decomposable. Other failure_reasons (no_checkpoint,
-    training_errored, ...) signal env/code issues and should halt
-    the mission directly without invoking Claude."""
+    """Ship 17 trigger condition: only criterion-level failures
+    (`criterion_not_met` / `criterion_errored`) are re-decomposable.
+    Infrastructure failure_reasons (no_checkpoint, training_errored, ...)
+    signal env/code issues and should halt the mission directly without
+    invoking Claude."""
     from sculptor import sculpt as sculpt_mod
 
     m = _make_mission(tmp_path, n_stages=1)
@@ -1254,6 +1800,76 @@ def test_redecompose_invalid_claude_response_halts_cleanly(
     assert failed_events[0]["reason"] == "validation_failed"
     # Original stage list NOT mutated by failed splice.
     assert [s.name for s in m.stages] == ["stage_0"]
+
+
+def test_redecompose_retries_invalid_draft_then_recovers(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """Ship 22r regression (the floss/kicking halt-at-redecomposition): if
+    Claude's FIRST redecomposition draft is rejected by the mission
+    validator (a sub-stage criterion referencing a non-persisted key like
+    base_height), the orchestrator retries — feeding the exact validator
+    error back — instead of halting the whole mission on the first bad
+    draft. The second, valid draft splices in and the mission proceeds."""
+    from sculptor.decompose import _RedecompositionModel, _StageModel
+    from sculptor import sculpt as sculpt_mod
+
+    m = _make_mission(tmp_path, n_stages=2)
+    monkeypatch.setattr(
+        sculpt_mod, "sculpt_run", _fake_sculpt_run_factory(metric=0.3),
+    )
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
+    )
+
+    # First draft: a sub-stage criterion references base_height, which the
+    # rollout does NOT persist → validate_mission rejects the splice.
+    bad_draft = _RedecompositionModel(
+        decomposition_rationale="first draft uses a non-persisted key",
+        stages=[
+            _StageModel(
+                name="stage_0__r1_0", goal_text="precursor",
+                success_criterion="trajectory['base_height'] > 0.5",
+                max_iterations=2, parent_stage=None,
+                reward_seed_prompt="alive", kg_seed_papers=[],
+            ),
+            _StageModel(
+                name="stage_0__r1_1", goal_text="final",
+                success_criterion="metric > 0.5",  # byte-equal to failed
+                max_iterations=2, parent_stage="stage_0__r1_0",
+                reward_seed_prompt="alive", kg_seed_papers=[],
+            ),
+        ],
+    )
+    good_draft = _make_redecompose_response("stage_0", n_sub=2)
+
+    calls = {"n": 0, "saw_error_feedback": False}
+
+    def fake_parse(client, system_prompt, user_content, *,
+                   output_format=None, model=None, max_tokens=None):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return bad_draft
+        if "PREVIOUS REDECOMPOSITION ATTEMPT WAS REJECTED" in user_content:
+            calls["saw_error_feedback"] = True
+        return good_draft
+
+    import sculptor.decompose as dmod
+    monkeypatch.setattr(dmod, "_parse_with_retry", fake_parse)
+
+    events: list[dict] = []
+    sculpt_mod.mission_run(m, adapter_short_name="mjlab", on_event=events.append)
+
+    # Retried once (2 Claude calls) with the validator error fed back...
+    assert calls["n"] == 2
+    assert calls["saw_error_feedback"] is True
+    retries = [e for e in events if e.get("type") == "stage_redecomposition_retry"]
+    assert len(retries) == 1
+    assert retries[0]["reason"] == "spliced_mission_invalid"
+    # ...then RECOVERED: the good draft spliced in (no hard failure for stage_0).
+    assert any(e.get("type") == "stage_redecomposed" for e in events)
+    assert not any(e.get("type") == "stage_redecomposition_failed" for e in events)
+    assert "stage_0__r1_0" in [s.name for s in m.stages]
 
 
 def test_redecompose_emits_stage_redecomposed_event(
@@ -1948,13 +2564,11 @@ def test_goal_b_caps_at_max_extensions(
     assert exhausted[0]["extensions_used"] == 2
 
 
-def test_goal_b_does_not_extend_when_patience_early_stop_fired(
+def test_goal_b_does_not_extend_when_sculpt_run_already_stopped(
     tmp_path: Path, monkeypatch, stub_adapter,
 ):
-    """If the existing metric-plateau early-stop (Ship 9a) fired
-    inside sculpt_run, the metric ISN'T improving by definition.
-    Goal B's extension check should bail with reason=metric_plateau_
-    early_stop instead of attempting a futile extension."""
+    """If sculpt_run reports a non-criterion early stop, Goal B's
+    extension check should bail instead of attempting a futile extension."""
     from sculptor import sculpt as sculpt_mod
 
     m = _make_mission(tmp_path, n_stages=1)
@@ -2014,7 +2628,7 @@ def test_goal_b_does_not_extend_when_patience_early_stop_fired(
     skipped = [
         e for e in events
         if e.get("type") == "stage_extension_skipped"
-        and e.get("reason") == "metric_plateau_early_stop"
+        and e.get("reason") == "sculpt_run_early_stop"
     ]
     assert len(skipped) == 1
 

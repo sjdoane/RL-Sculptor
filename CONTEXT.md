@@ -308,6 +308,19 @@ pnpm --dir frontend dev                                 # terminal 2
 - Don't add features, refactor, or introduce abstractions beyond what
   the task requires. A bug fix doesn't need surrounding cleanup.
 - Default to writing no comments unless the *why* is non-obvious.
+- **Always keep CONTEXT.md updated** (Sam's standing rule, 2026-04-25).
+  Append a Change Log entry for every meaningful change in the same
+  window you make it — do NOT let commits outrun the changelog. A new
+  window must be able to reconstruct the arc from CONTEXT.md alone.
+- **Review major changes + decisions with agents** (Sam's standing
+  rule, 2026-04-25). For anything non-trivial — a feature, a refactor,
+  a cross-cutting bug fix, an architecture call — run the audit-driven
+  loop: research (Explore) → plan → plan-audit (Plan agent) → implement
+  → code-audit + design-critique (Explore agents, distinct
+  perspectives: senior eng, UI/UX, a11y) → apply CRITICAL/HIGH fixes.
+  VERIFY each agent's load-bearing claims against source before acting
+  — agents produce plausible-but-wrong findings; reject the ones that
+  don't hold. Mirrors Ships 14-21e.
 
 ---
 
@@ -325,6 +338,3856 @@ Append an entry **every time you make a meaningful change**. Format:
 ```
 
 Start the next entry below this line.
+
+### 2026-06-15 — Ship 53: adversarial gaming archetypes (L3)
+
+- **What**: generalize Ship-47's HARD-CODED walker/flail negatives to ANY task.
+  New `metric_calibration.adversarial_archetype_gate()` + `_author_gaming()` +
+  constants (`_ADV_REL_CEIL=0.6`, `_ADV_ABS_CEIL=0.5`, `_ADV_N=3`); new prompt
+  `prompts/gen_gaming_archetypes.md` (an INDEPENDENT, metric-BLIND red-team author
+  proposes ~3 OFF-GOAL "gaming policies"); new `ladder_synth.GamingArchetype` /
+  `GamingArchetypeSet` (gaming policies are just `MotionSpec`s, rendered by the
+  Ship-51 `render_rung`). Folded into `calibrate_task_derived(..., adversarial=
+  False)`: when the K ladders ALREADY grant, the gate scores each gaming archetype;
+  the metric is GAMEABLE (denied) iff `worst_gaming ≥ 0.6·competent_ref` OR `≥ 0.5`
+  (competent_ref = max top-rung score across valid sources). The verdict is
+  recorded under `calibration.adversarial` (provenance hashes + per-archetype
+  scores → meta.json) regardless. Backend: `RS_ADVERSARIAL_ARCHETYPES` (default
+  OFF) threaded sculptor_bridge→metric_store→run_manager; `metric_calibration_done`
+  now emits `adversarial_ran`/`gameable`. Tests: 8 in
+  `test_task_derived_calibration.py` (`_FakeBothClient` branches on output_format).
+- **Why**: L0-L2 prove a metric ranks competence, but a metric can still be
+  GAMEABLE by an OFF-GOAL behavior the stationary ladders never test (a travelling
+  kicker, upright tremor). L3 has an independent adversary find those holes — the
+  task-agnostic generalization of the Ship-36/47 hand-coded non-degeneracy
+  negatives. The single biggest lever is a metric that reliably measures the
+  target movement; this denies steer-rights to one that can be gamed.
+- **How**: gaming policies REUSE the Ship-51 MotionSpec synthesizer (author blind
+  to metric internals; physical rendering it can't bias). Same disciplines as L2:
+  metric-source-never-in-payload (hard self-check + soft echo-drop), provenance
+  hashes, NEVER raises, NEVER denies on absence of evidence (author crash / 0
+  renderable archetypes → inconclusive, grant stands), flag-gated so default-off is
+  a byte-identical no-op (`adversarial=None`, zero extra LLM calls). Ceiling
+  constants tuned against the built-ins (plausible gaming ≤0.15 vs competent
+  0.37-0.76) + a gameable raw-|jv| metric (tremor 1.0) — 0.6×competent + 0.5 abs
+  separates with headroom. Gate runs ONLY when base_ok (keeps the minimal path
+  cheap; L3 is a booster per the design, not the minimal gate).
+- **Verified**: sculptor `pytest tests/ -q` → 710 passed (was 701, +9), 1 skip;
+  UI backend → 345 passed; frontend `pnpm typecheck` → exit 0. Empirical probes:
+  built-ins score gaming ≤0.15 vs competent 0.37-0.76; integrated `calibrate_task_
+  derived` denies a stationarity-less kick metric on a walk-away archetype and a
+  raw-|jv| metric on upright tremor (both passed L2 at rho_min 0.975), grants the
+  hardened metric, and is a true no-op with the flag off. Adversarial agent review
+  (3 lenses + per-finding verification, 24 agents): 21 findings, 0 real defects —
+  the verifier surfaced one never-raises caveat (render_rung/inject_joint_roles +
+  the gate call site were unguarded), closed with defense-in-depth try-guards +
+  a regression test (a metric that crashes on a gaming probe degrades to skip).
+
+### 2026-06-15 — repo presentation polish + resumed pushing to GitHub
+
+- **What**: authored the missing root `README.md` (monorepo front door: pitch, the
+  two subprojects, architecture, the L0-L5 trust pipeline, quickstart, layout, test
+  status); relocated ~14 internal session/handoff/design docs from the repo root
+  into `docs/internal/` (history preserved via rename); `.gitignore` now excludes
+  scratch/junk (`*:Zone.Identifier`, `=1`, `.thumbnail`, `design-prototype/`,
+  `_agg*.py`, scratch PR bodies); fixed the `RewardSculptor/README.md` link to the
+  relocated MJLAB note. Then PUSHED: `ship-20-ux-revamp` fast-forwarded 34 unpushed
+  commits (Ships ~22→52) to origin, and `main` was retargeted (force-with-lease) to
+  the same tip so the repo's default branch shows the real, complete project.
+- **Why**: pushing had lapsed ~6 days (remote stuck at `17ed04e`, 2026-06-09) and
+  the repo's default branch `main` was a separate unrelated-root lineage — a
+  visitor landed on a near-empty front page. Sam asked to resume pushing and make
+  the presentation professional.
+- **How**: WSL git tree was clean (the "modified RewardSculptor files" in the
+  Windows snapshot are CRLF artifacts; autocrlf unset). Staged only the
+  presentation files (no `git add -A`). `main` and `origin/main` had divergent
+  ROOTS (local `6b7e759` vs origin `fd0adf9`); retarget needed a force-push —
+  old origin/main tip `3b6c918` recorded for recovery. Both decisions (retarget
+  main; full polish) confirmed with Sam first.
+- **Verified**: `gh api` confirms `main`=`fd9710c`, README.md present (8.7 KB),
+  `docs/internal/` holds the 14 relocated docs. Repo is PRIVATE.
+
+### 2026-06-15 — Ship 52: standardized trust score + L2 enabled by default
+
+- **What**: one trust scalar over BOTH calibration paths + a unified grant.
+  New `metric_calibration.compute_trust(calibration, validation)` →
+  `{trust, cal, evid, rho_min, agreement_fraction, gate_validate, gate_axioms}`
+  and `grant_decision(calibration, validation)`; both exported. New bridge
+  `sculptor_bridge.finalize_calibration(cal, validation) → {calibrated, trust}`.
+  Both `metric_store.calibrate` (built-in) and `calibrate_task_derived` now set
+  `calibrated` via the unified grant + persist `trust` (surfaced by `_summary`).
+  `run_manager` emits `trust` on both `metric_calibration_done` events; `RunsTab`
+  shows "· trust X". ALSO: flipped `RS_TASK_DERIVED_CALIBRATION` to DEFAULT ON
+  (Sam's call) so a NOVEL-task launch now runs the Ship-51 task-derived path
+  (set =0 to disable). Tests: `tests/test_metric_trust.py` (8).
+- **Why**: Ships 44/51 produced two separate calibration outcomes (built-in
+  Spearman vs task-derived rho_min+agreement) with no common confidence view.
+  Ship-52 puts both on ONE scale (`trust ∈ [0,1]`) with a per-layer breakdown so
+  the UI can show how confident a grant is, and folds both into one grant
+  predicate.
+- **How**: `trust = 0.6·CAL + 0.4·EVID`, `CAL = clip((rho_min−0.5)/0.5,0,1)`,
+  `EVID = gate_pass(validate)·gate_pass(axioms)·agreement_fraction`. DEVIATION
+  FROM THE DESIGN DOC (deliberate, documented in `compute_trust`): the doc's
+  literal "steer ⟺ trust ≥ 0.7" is internally INCONSISTENT — it must both reduce
+  to the built-in `rho ≥ 0.7` AND admit the task-derived `rho_min ≥ 0.5` floor
+  (which has trust ≈ 0.27), and no single threshold on this scalar does both. So
+  trust is a DISPLAY confidence and the GRANT stays each path's own gate ANDed
+  with validate ∧ axioms: `grant = cal.ok ∧ validate.ok ∧ axioms.ok`. For an
+  ACCEPTED metric validate ∧ axioms are already true, so this is BYTE-IDENTICAL
+  to today for the 5 built-ins (grant ⟺ rho ≥ 0.7); the re-assertion is
+  defense-in-depth (a record showing a failed gate can never silently steer).
+  The firewall (`steer_allowed` reads `meta.calibrated`) is UNTOUCHED.
+- **Verified**: `tests/test_metric_trust.py` (8) — trust at the built-in
+  boundary (rho 0.7 → 0.64), perfect built-in → 1.0, task-derived floor → 0.27
+  (< 0.7, why it can't gate), axiom-failure sinks EVID, and grant byte-identical
+  + gate-blocks-on-failure. sculptor `pytest tests/`; backend `pytest`; frontend
+  `pnpm typecheck` (exit 0; the calibration card only renders during a live
+  launch-gen run, so browser preview is N/A — typecheck is the gate). NEXT per
+  the roadmap: Ship-53 (adversarial archetypes) then cost-gated L5/L4.
+
+### 2026-06-15 — Ship 51: L2 task-derived competence ladders (novel-task steer-rights)
+
+- **What**: a generated metric can now EARN STEER-RIGHTS on a NOVEL task (no
+  hand-authored built-in) by ranking K=3 INDEPENDENTLY-authored competence
+  ladders — the design doc's headline unblocker. New `sculptor/eval/
+  ladder_synth.py`: pydantic `MotionSpec`/`CompetenceLadder` + a DETERMINISTIC
+  pure-numpy synthesizer (`render_rung`/`render_ladder`) that turns an author's
+  structured rung specs into physical rollouts (joint_pos/joint_vel/gravity/
+  root), resolver-backed (Ship-49 `select_joints`, zero integer columns), with
+  a renderer-built FALLEN degenerate anchor prepended. New `metric_calibration.
+  calibrate_task_derived(metric_path, goal, robot_hint, *, client, k_sources=3)`
+  + `spearman_midrank`. New blind-author prompt `gen_competence_ladder.md`. UI:
+  `sculptor_bridge.calibrate_task_derived_metric`, `metric_store.
+  calibrate_task_derived` (writes calibrated+calibration+calibration_method),
+  `run_manager` flag `RS_TASK_DERIVED_CALIBRATION` (DEFAULT OFF) replacing the
+  dead `metric_calibration_skipped` else-branch, `RunsTab.tsx` method
+  discriminator. Tests: `tests/test_task_derived_calibration.py` (18).
+- **Why**: before this, a novel task hit `resolve_calibration_builtin → None →
+  calibration skipped → observe-only forever` — circular (you need ground truth
+  to trust a metric, but the point is to not hand-author one per task). L2
+  breaks it without a GPU: K metric-BLIND LLM authors each describe what
+  competent vs incompetent execution looks like PHYSICALLY (a competence axis +
+  ascending rungs); the deterministic synthesizer renders them so the author
+  can never bias the physics; the metric must rank ALL K monotonically.
+- **How**: three circularity defenses, all executable not prompt-only. (1)
+  STRUCTURAL blindness — the author gets only {goal, robot_hint, joint_names,
+  style, vocabulary}, NEVER the metric; a hard self-check asserts the metric
+  source never enters the author payload, a soft guard drops a ladder that
+  echoes it; per-source provenance (model-id, timestamp, payload/response
+  sha256, style-id) + a shared-context hash persisted to meta.json. (2)
+  CROSS-SOURCE agreement — `rho_min` = MIN Spearman over valid sources (never
+  mean/max), `agreement_fraction ≥ 2/3`, `n_valid ≥ 2`: one colluding source
+  can inflate only its own rho, so it can't carry the grant (the KEYSTONE
+  test). (3) ANCHOR — a renderer-built fully-fallen rung 0 + an absolute-
+  separation gate (top − anchor ≥ 0.2) turns "ranks monotonically" into "ranks
+  AND beats a known-bad floor". Two correctness fixes the design panel
+  surfaced + I verified: `spearman_midrank` (the argsort `spearman()` FALSE-
+  GRANTS a saturating metric `[0.1,.9,.9,.9,.9]`→1.0 vs the tie-free rung axis;
+  midrank→0.707, below the 0.8 per-source bar); and a GROUP primitive (a
+  role-query drives every matching joint) that fixes a single-joint dilution
+  that scored a floss ladder 0.0. The firewall (`steer_allowed` reads
+  `meta.calibrated`) is UNTOUCHED — we only widen what sets `calibrated=True`.
+  Flag-gated default OFF (manual-audit-first per the design doc); the 5 built-in
+  families take the unchanged `calibrate_metric` path (regression-tested).
+  Never raises — every failure mode (author timeout, malformed/degenerate
+  ladder, ladders disagree, unknown robot, inexpressible yaw/contact axis) is a
+  SPECIFIC observe-only reason; the run stays alive, no GPU held (pre-phase).
+- **Verified**: synthesizer ranks all 4 built-in families on synthesized
+  ladders with midrank rho 0.975–1.0 and anchor separation 0.46–0.80; 18
+  task-derived tests incl the keystone (a colluder cannot grant a wrong
+  travel-metric: the 2 honest kick ladders give it no usable evidence) and the
+  midrank false-grant fix; sculptor `pytest tests/`; backend `pytest`; frontend
+  `pnpm typecheck` (exit 0). Design provenance: a 4-lens design panel (vocabulary
+  / anti-collusion / gate-statistics / integration) → synthesis. KNOWN LIMIT
+  (documented, NOT closed by Ship-51): shared same-family bias — the same model
+  family authors metric + all K ladders, so min-not-mean defends ONE deviant,
+  not SYSTEMIC agreement; full closure needs L4 (a different VLM, Ship-54) + L5
+  (optimization-outcome audit, Ship-55, the only non-circular ground truth).
+  FOR SAM: (a) the flag is OFF — flip `RS_TASK_DERIVED_CALIBRATION=1` only after
+  auditing on real novel goals; (b) `per_source_thresh=0.8` is the single
+  load-bearing constant (0.5 false-grants the saturating case); (c) K=3 author
+  calls add ~60s + 3× tokens to launch, pre-GPU.
+
+### 2026-06-15 — Ship 50: L1 task-agnostic axioms (controlled-perturbation invariants)
+
+- **What**: a new offline trust layer that hardens EVERY objective metric. New
+  `RewardSculptor/sculptor/eval/metric_axioms.py::check_metric_axioms(fn, *, family,
+  required_roles)` runs 6 CONTROLLED PERTURBATIONS on the metric's best-scoring
+  positive archetype and asserts the score moves the physically-correct way:
+  three exact INVARIANCES — `translation_invariant` (offset world xy), `gravity_
+  scale_invariant` (×9.81), `yaw_rotation_invariant` (rotate heading 37°), each |Δ|
+  ≤ 1e-6 — plus three MONOTONICITIES — `uprightness_monotone` (a 0→90° tilt sweep
+  must be non-increasing), `no_reward_for_chaos` (whole-body flail must not raise
+  the score by >0.5), `stationary_no_travel` (kick/floss/jump: added base travel
+  must not raise it). Wired into `metric_validate.validate_generated_metric` (lazy
+  import to avoid the archetype-import cycle): `gates["axioms"]` folds into `ok` and
+  the per-axiom block + deltas are returned; surfaced through `metric_store._summary`
+  (`axioms`) for the record/Ship-52. Tests: new `tests/test_metric_axioms.py` (23 —
+  each axiom's targeted hack rejected, every GOOD_*/built-in passes, handstand/crawl/
+  balance/reach not false-rejected, determinism, validate integration).
+- **Why**: L0 only proves a metric DISCRIMINATES one confounded archetype above
+  another. It structurally cannot catch a metric that reads a FRAME/UNITS artifact,
+  because every L0 archetype spawns at the world origin, with unit gravity,
+  travelling +x — so an absolute-position / raw-gravity-magnitude / absolute-heading
+  Goodhart passes all of L0 unseen (verified: an `ABSPOS`/`GRAVMAG`/`HEADING` hack
+  each slips L0 but the matching invariance catches it, Δ +0.82 / +0.68 / −0.08). The
+  controlled perturbation also strengthens the uprightness/anti-energy/stationarity
+  checks vs L0's fixed, confounded negatives. This is the design doc's L1 layer
+  ("universal invariants: no reward for stillness/extremes; monotone-in-uprightness")
+  and the next step after Phase J toward trustworthy metrics for novel tasks.
+- **How**: the operating point is the metric's OWN best positive, which SELF-SCOPES
+  the gate — a novel-orientation task (handstand) scores the upright biped battery ~0,
+  so the perturbations stay ~0 and the axioms pass vacuously; L1 never false-rejects a
+  task the synthetic battery can't represent. The uprightness sweep tilts toward
+  HORIZONTAL (never inversion), so a handstand target is not penalised. Tolerances
+  were calibrated EMPIRICALLY against the reference metrics (chaos 0.5 clears the most
+  peak-sensitive GOOD_KICK at ~0.33 worst-case while catching a pure energy rewarder
+  at ~1.0); the invariances are exact and measured zero-false-reject across all 13
+  reference metrics. DESIGN PROVENANCE: a 4-lens design panel surfaced the three
+  invariance axioms (the standout contribution — L0 cannot express symmetries) and
+  correctly rejected the strict-chaos / mirror-invariance / universal-stillness /
+  novel-responsiveness candidates as false-rejecting; its synthesis stage and the
+  adversarial-review workflow hit the monthly spend limit, so the synthesis +
+  adversarial review (novel-task false-rejection, mutation-leak, Goodhart-bypass) were
+  done in the main loop, empirically. KNOWN LIMIT: a static-pose "statue" metric for a
+  NOVEL family passes L0+L1 but runs observe-only (no calibration builtin → firewall
+  blocks steering); distinguishing it needs the task's intent — that is L2/Ship-51.
+- **Verified**: sculptor `uv run pytest tests/ -q`; backend `pytest -k 'not
+  test_reward_prompt_edit_emits'`; the 6 axioms reproduced by hand against all 4
+  GOOD_*, all 5 built-ins, and 7 hacks. Frontend untouched — axiom-failure reasons
+  ride the existing `metric_generation_rejected` `reasons` (never-silent already).
+
+### 2026-06-15 — Ship 49: always-correct joint identification, or reject (HANDOFF Phase J)
+
+- **What**: a canonical, direction-aware joint resolver + the validation/runtime
+  gates that make joint identity un-spoofable. New `RewardSculptor/sculptor/eval/
+  joint_resolver.py` (parse a raw joint name → `(side, segment, axis)`;
+  `resolve_joint_roles(names, roles)` → `{role: idx}` or missing/ambiguous;
+  `select_joints(...)` predicate groups; `assert_name_axis_contract`). New
+  `robot_manifest.py` (G1-29 / Go1-12 canonical orderings keyed by robot hint).
+  Built-ins (`spec_metrics.py`) now select via the resolver — `spec_g1_kick` uses
+  SAGITTAL legs only (hip pitch + knee + ankle pitch), retiring `_match_joints`.
+  Generated metrics declare `REQUIRED_JOINT_ROLES` and read `meta["joint_roles"]`;
+  the runtime (`generated_metric.py`) resolves against each rollout's live
+  joint_names, asserts the name↔buffer order-contract, and HARD-FAILS to an
+  observable 0.0 on any unresolved role. `metric_validate.py` gains three gates:
+  required-roles (against the real robot's names, sourced from the manifest at
+  launch via `metric_gen.py`), a static ban on hard-coded integer joint indices
+  (`x[:, :, N]`), and a permutation-robustness gate (relabel the joint axis
+  consistently — an index-hardcoding metric swings, a name-based one is invariant).
+  `metric_calibration.py` injects roles too. Prompt `gen_objective_metric.md` teaches
+  the role pattern + forbids integer joint indices + "forward = sagittal" direction.
+  Tests: new `tests/test_joint_resolver.py` (21 — resolver, manifest, order-contract
+  pin, the §3A table, all gates); `GOOD_KICK` fixture migrated to the role pattern.
+- **Why**: nothing verified joints were correctly identified. Reproduced on the LIVE
+  g1-kick-v4 rollouts: a SHUFFLED or FOREIGN (Go1) joint-name list scored a stuck G1
+  policy 0.13–0.34 while the correct names scored 0.00–0.07 — a wrong/foreign robot
+  silently scored HIGHER. And `_match_joints("hip","knee","ankle")` grabbed all 12 G1
+  leg joints incl. hip ROLL/YAW, so a SIDEWAYS (hip-roll) kick earned the same credit
+  as a FORWARD (hip-pitch) one — the g1-kick-v4 "kicks but sideways" gap. Joint
+  identity is the foundation of every objective metric; a perfect trust pipeline is
+  worthless if the metric reads the wrong joints.
+- **How**: anchor on FUNCTION (side+segment+axis), not substring/spelling, in ONE
+  audited place. A role resolves to exactly one joint or is flagged — a bare
+  `left_hip` is ambiguous (pitch/roll/yaw) and rejected; a role the robot lacks is
+  missing and rejected pre-project. Three independent guards, defence-in-depth: the
+  permutation gate proves the metric reads by NAME; the runtime resolution proves the
+  roles EXIST on this rollout's robot (loud fail, never a wrong guess); the manifest
+  gate rejects impossible roles before any GPU. The §3A "shuffled-same-length" case is
+  undetectable at runtime, so the order-contract is PINNED by a test on the adapter's
+  entity-first capture (`_mjlab_runner` ~920). Migrating `spec_g1_kick` to sagittal
+  legs is non-breaking on the synthetic battery (the 12-name body has no roll/yaw) but
+  fixes the ground truth on the real 29-DOF G1.
+- **Verified**: sculptor `uv run pytest tests/ -q` → 653 passed, 1 skipped (jax,
+  pre-existing); backend `pytest -k 'not test_reward_prompt_edit_emits'` → 345 passed;
+  end-to-end on the real g1-kick-v4 iter_1 rollout — correct names resolve to
+  `{left_knee:3, left_hip_pitch:0, …}` and score 0.41; empty/foreign/wrong-length all
+  hard-fail 0.0 with a specific reason (was 0.34 silent for foreign). Frontend gate
+  N/A — zero frontend files touched; the launch path benefits via the library.
+
+### 2026-06-15 — Ship 48: live fitness_patience knob + never-silent env-extension chip
+
+- **What**: (1) `fitness_patience` threaded end-to-end — `reward-sculptor-ui/backend/models/run.py`
+  (new field), `backend/services/run_manager.py` (read + emit `--fitness-patience`
+  inside the fitness block + persist), `frontend/src/components/NewRunDialog.tsx`
+  (new "Fitness patience" input, default 4), `frontend/src/lib/types.ts`
+  (`RunParamsPayload.fitness_patience`). CLI `sculpt run --fitness-patience` was
+  already wired. (2) `requires_env_extension` event — `RewardSculptor/sculptor/sculpt.py`
+  emits it after `iter_completed` when ≥1 edit was deferred; `run_manager.py` folds
+  it into a new per-iter `env_extension_suggestion` slot; `backend/models/run.py`
+  `IterEventSummary` gains the field; `RunsTab.tsx` renders an informational
+  "needs adapter channels: …" chip; `types.ts` `EnvExtensionSuggestionPayload`.
+  Tests: backend `test_runs.py` (`--fitness-patience` forwarded / omitted without a
+  metric; `env_extension_suggestion` reducer).
+- **Why**: the g1-kick-v3 run truncated at iter 4 of 16. Root cause: the config's
+  `early_stop_patience=3` is a DEAD no-op; the live fitness-plateau early stop uses
+  a SEPARATE `fitness_patience` (default 2) that neither the CLI run nor the UI ever
+  set — so it stopped after 2 stale iters and the "3" Sam expected never reached the
+  fitness path. And: every kick term the diagnoser proposed was deferred
+  (`requires_env_extension`) but that signal dead-ended in the changelog — nothing
+  told Sam the run was structurally blocked.
+- **How**: (1) Expose `fitness_patience` as the real knob (UI default 4 gives a hard
+  exploratory skill room to escape a local optimum before truncating); only emitted
+  alongside a resolved metric (inert in the blind loop). DEVIATION FROM PLAN: did NOT
+  delete the legacy `early_stop_enabled/early_stop_patience` fields — they round-trip
+  into `config.toml`'s `[iteration]` table and `test_projects.py` asserts it, so
+  deleting them churns config-writing + breaks a test for zero kick-fix benefit; they
+  stay documented no-ops and `fitness_patience` is the live lever. (2) Model the
+  env-extension signal on `physics_edit_suggested` (event → run_manager slot →
+  RunsTab chip) but INFORMATIONAL only — an env extension is a code change, never
+  auto-applied. Post-Ship-46 the G1 kick diagnoser no longer defers (channels exist),
+  so this chip is now mainly a general "never-silent" guard for FUTURE novel skills
+  that need channels the adapter lacks.
+- **Verified**: frontend `pnpm build`, backend `pytest -k 'not
+  test_reward_prompt_edit_emits'`, sculptor `pytest tests/` (sculpt.py emit is
+  additive). The emit's event→slot contract is covered by the reducer test
+  (`test_env_extension_suggestion_surfaced_in_iter_summary`).
+
+### 2026-06-15 — Ship 47: metric hardening — a forward WALKER can no longer earn KICK credit
+
+- **What**: `RewardSculptor/sculptor/eval/spec_metrics.py` — `spec_g1_kick`
+  gains a stationarity factor (`spec_score *= exp(-horizontal_speed/_KICK_STATIONARY_SCALE)`,
+  scale 0.01), and `root_link_pos_w` is added to `_REQUIRED_ARRAYS["g1_kick"]`
+  (in-fn guard → stationarity=1.0 when absent). `RewardSculptor/sculptor/eval/metric_validate.py`
+  — new realistic `walker` archetype (upright, standing height z≈0.70, forward
+  travel + fast 1.5 Hz hip/knee gait swings ~6 rad/s) and a family-scoped
+  `distractor_ceiling` (0.3): for `_STATIONARY_FAMILIES = {kick, floss, jump}`
+  the walker must score below the ceiling. Prompts `gen_objective_metric.md`
+  (+ stationarity rule) and `review_objective_metric.md` (walker gaming vector
+  + the stale "four archetypes" → the full battery). Tests in
+  `test_spec_metrics.py` + `test_generated_metric.py`.
+- **Why**: the g1-kick-v3 fitness metric (`gen_005`) scored a non-kicking
+  forward WALKER ~0.59 — Goodhart partial credit (upright + rest + walking
+  hip-swings mistaken for kicks). It passed calibration (Spearman 1.0 on the
+  stationary kick ladder) and the non-degeneracy gate because the only synthetic
+  walker (`active`) has ~0.1 rad/s leg velocities + z=0.5 — far too gentle to
+  trip any kick detector, so no gate ever tested a real gait. Calibration is
+  synthetic-only with no real-rollout check.
+- **How**: (1) The builtin `g1_kick` (a ground-truth metric + a directly
+  selectable steering metric) now gates on a roughly stationary base — drops the
+  REAL g1-kick-v3 walker from 0.29→0.14 while leaving the stationary `active_kick`
+  (0.72) and the all-stationary calibration ladder unchanged (so no calibration
+  regression). (2) A realistic `walker` archetype faithfully reproduces the
+  confound (the on-disk `gen_005` scores it 0.50, vs 0.0 for the gentle `active`).
+  (3) DEVIATION FROM PLAN, justified: instead of a blanket walker-negative, the
+  ceiling is scoped to stationary families and uses an ABSOLUTE threshold — a
+  blanket negative would false-reject LOCOMOTION metrics (a walker IS the
+  locomotion positive), and the existing relative `>= best_pos` check can't catch
+  gen_005 (walker 0.59 < its active_kick 0.90). Verified: re-running the validator
+  on the real `gen_005` now returns ok=False ("walker 0.501 > 0.3 ceiling") — it
+  would run observe-only, forcing the launch-gen retry to produce a walker-robust
+  metric. Deeper real-rollout/task-derived recalibration remains future work
+  (DESIGN_autonomous_metric_eval.md Ships 50–55).
+- **Verified**: sculptor `pytest tests/` (see run), backend `pytest -k 'not
+  test_reward_prompt_edit_emits'`. Targeted: `test_kick_penalizes_forward_travel`,
+  `test_walker_archetype_present_and_caught_for_kick`,
+  `test_good_kick_metric_clears_walker_ceiling`,
+  `test_walker_ceiling_skipped_for_locomotion`.
+
+### 2026-06-15 — Ship 46: mjlab G1 reward contract exposes per-foot KICK channels (the unblocker)
+
+- **What**: `RewardSculptor/sculptor/adapters/mjlab.py` — new `_G1_INFO_EXTRA`
+  (7 keys) + `_info_keys_for_task()`; `reward_contract()` and `probe_component`
+  now advertise the per-task info set. `RewardSculptor/sculptor/adapters/_mjlab_runner.py`
+  — `SculptorRewardTerm._resolve_foot_handles` + `_foot_info` surface
+  `{left,right}_foot_contact / _swing_speed / _height` + `base_horizontal_speed`
+  in the runtime `info` dict (all `(N,)`, guarded to zeros on non-biped tasks).
+  Tests in `tests/test_mjlab_adapter.py` (contract keys G1-vs-Go1, `_foot_info`
+  on a faked env, runner/contract drift guard, and the crux grounding proof).
+  Docs in `docs/adapters.md`.
+- **Why**: root-cause of the g1-kick-v3 overnight stall — the sculpted reward
+  could only read `base_height`/`fallen`, so every kick term the diagnoser
+  proposed (swing-foot velocity, single-leg XOR contact, foot clearance) was
+  correctly DEFERRED (`edit.py` grounds formulas against `expected_info_keys`,
+  and those channels were absent). The reward was structurally incapable of
+  shaping a kick; the policy sat in an upright-locomotion basin (~3 m/episode
+  of walking). See the diagnosis in the session plan.
+- **How**: mjlab already computes per-foot contact (`feet_ground_contact.found`),
+  foot-site velocity (`site_lin_vel_w` indexed by the `left_foot`/`right_foot`
+  sites), and foot height (`foot_height_scan.heights`) for its own foot reward
+  terms — no MuJoCo change needed, just surface them. Per-foot data is flattened
+  to named scalar keys (the info contract is `(N,)`-per-key). Foot channels are
+  advertised ONLY for G1 (which has the named foot sites that fix the per-foot
+  column order); other robots keep the 6-key base contract and the runner emits
+  harmless zeros they never reference. `_G1_INFO_EXTRA` is single-sourced into
+  the runner so emitted keys can't drift from advertised keys. Adding to the
+  contract auto-propagates into the diagnose/edit/decompose prompts (rendered
+  dynamically) and into the edit-grounding set — so the diagnoser stops deferring.
+- **Verified**: sculptor `pytest tests/ -q` → 628 passed, 1 skipped (jax).
+  backend `pytest -q -k 'not test_reward_prompt_edit_emits'` → 342 passed.
+  Crux proof (no GPU): `right_foot_swing_speed * left_foot_contact -
+  0.5*base_horizontal_speed` now grounds under the G1 contract and is UNGROUNDED
+  under the old 6-key base set (test_kick_formula_grounds_under_g1_contract_not_base).
+
+### 2026-06-14 — Ship 45: never-silent rejections + one-click retry for launch-time generation
+
+- **Why**: a rejected launch-time generation must not silently fall to a blind
+  run — the user should see WHY and be able to retry. Since the metric is fixed
+  at subprocess spawn, retry has to happen DURING the pre-phase (which holds NO
+  GPU), not after.
+- **What**:
+  - **Backend** `services/run_manager.py`: the pre-phase now LOOPS (bounded by
+    `_MAX_LAUNCH_GEN_ATTEMPTS=4`). On rejection it emits
+    `metric_generation_rejected` (reasons + concerns + `can_retry`) then
+    `metric_generation_awaiting_decision`, and PAUSES via `_await_gen_decision`
+    polling the control sidecar (no GPU held). "retry" → regenerate; "blind" /
+    30-min timeout / cancel → run blind. The control file is now written BEFORE
+    the pre-phase so the route can deliver the decision.
+  - **Backend** `models/run.py` `RunControl`: `gen_retry` / `gen_continue`;
+    `routes/runs.py` writes `gen_decision` + bumps `gen_decision_seq`.
+  - **Frontend** `RunsTab.tsx`: the generation card shows **Retry generation** +
+    **Continue blind** buttons while awaiting a decision (wired to
+    `useControlRun`); `api.ts` / `useRuns.ts` carry the new fields.
+- **How / decision (plan Open-Q 5)**: on rejection the run PAUSES for a human
+  decision rather than silently proceeding blind — correct because the pre-phase
+  holds no GPU (pausing is free) and a blind run defeats "carry the goal through
+  the run". A 30-min timeout falls back to blind so an unattended run completes.
+- **Verified (mocked LLM — no API/GPU)**: backend (retry-then-accept → 2
+  attempts, gen_002 steers; rejected → blind with `can_retry`; control route
+  `gen_retry`/`gen_continue` write `gen_decision`) ; frontend `pnpm build` clean.
+- **Adversarial review (3 parallel agents over the 42-45 diff, all probes run vs
+  source)**: 0 CRITICAL / 0 HIGH. Firewall holds (uncalibrated can't steer;
+  calibrate writes meta before the cmd-build reads it; fail-closed on
+  exception/corrupt meta); additivity holds (built-in/gen:/none unaffected);
+  missions untouched (empty diff; sentinel degrades to blind there); frontend
+  fold correct + reconnect-safe; bounded retries; no steer-with-sentinel path.
+  1 MEDIUM FIXED — a Stop during in-flight generation left `.gen_progress.json`
+  stuck `{active:true}` (CancelledError bypassed `except Exception`); added an
+  `except asyncio.CancelledError: clear_progress; raise` around the generate
+  to_thread (+ regression test). 2 LOWs left as-is (progress-after-terminal is
+  cosmetic — terminal fold verified correct; Stop can't abort the in-flight LLM
+  thread — no GPU held, no run hang, bounded by the LLM client timeout).
+
+### 2026-06-14 — Ship 44: auto-calibrate the launch-generated metric → steer if it earns it
+
+- **Why**: a launch-generated metric is observe-only by default; to "carry
+  through the run" (steer) it must earn steer-rights via calibration. Composes
+  the Ship-35 firewall with launch-time generation.
+- **What**:
+  - **Backend** `services/sculptor_bridge.py`: `resolve_calibration_builtin(goal,
+    robot_hint)` → the family's built-in ground truth (kick→g1_kick, floss→g1_floss,
+    jump→g1_jump, locomotion→go1_trot, balance→cartpole) via sculptor's
+    `resolve_behavior_family` + `FAMILY_TO_BUILTIN`; None when no family matches.
+  - `services/run_manager.py`: after the pre-phase accepts a metric,
+    auto-calibrate (offline, no GPU) vs the resolved built-in, emitting
+    `metric_calibration_started / _done / _skipped`. On pass the metric's
+    meta.json gets `calibrated=true` → `steer_allowed` lets it steer; the runner
+    requests steer for a launch-generated metric and the EXISTING firewall
+    downgrades to observe if calibration didn't pass. Persists the post-firewall
+    effective mode.
+  - **Frontend** `components/RunsTab.tsx`: the generation phase card renders the
+    calibration outcome (calibrating… / calibrated (Spearman) — steering / not
+    calibrated — observe-only / no-match — observe-only).
+- **How / firewall**: unchanged — `steer_allowed` reads the calibrated meta; an
+  uncalibrated metric can never steer (defense-in-depth in the cmd-build).
+- **Verified (mocked LLM + calibration — no API/GPU)**: backend 340 (+2:
+  calibrates → `--fitness-mode steer` + `metric_calibration_done` calibrated=true;
+  fails → observe) ; frontend `pnpm build` clean.
+
+### 2026-06-14 — Ship 43: launch-time objective-metric generation as run-phase 0 (streamed into the Runs timeline)
+
+- **Why**: when the user picks "Generate at launch" (Ship 42), generation should
+  be the run's FIRST phase with progress streamed into the Runs view (not a
+  blocking dialog), and rejections must be VISIBLE (never a silent toast).
+- **What**:
+  - **Backend** `services/run_manager.py`: `_generate_at_launch(job, project_dir,
+    behavior_goal)` runs `metric_store.generate` in a worker thread BEFORE the
+    sculpt subprocess spawns, marshalling the Ship-40 stage events onto the loop
+    (`loop.call_soon_threadsafe` — `Job.emit`'s subscriber queues are NOT
+    thread-safe) as `metric_generation_started / _progress / metric_generated /
+    _rejected / _failed`. On acceptance it rewrites the effective fitness_metric
+    to `gen:<new id>` (observe-only — uncalibrated); on rejection it emits the
+    exact validation reasons + reviewer concerns and runs blind. `_robot_task_id`
+    derives the robot hint from config.toml.
+  - **Frontend** `components/RunsTab.tsx`: an "Objective metric generation" phase
+    card (folded from the `metric_generation_*` events) — live stage/attempt
+    while running; accepted (gen id) / rejected-with-reasons / failed outcomes.
+- **How / decision**: the pre-phase is ON by default for the sentinel (NOT a
+  default-off flag) so the feature is UI-reachable per the standing rule (no
+  terminal after ./run.sh); `SCULPTOR_LAUNCH_GEN=0` is a kill-switch (→ blind).
+  Events ride the SAME run WS — no new channel. Other fitness_metric values are
+  untouched, so default run behavior stays green.
+- **Verified (mocked LLM — no API/GPU)**: backend 338 (+2: accept → cmd points at
+  the generated metric.py with steer downgraded to observe; reject → reasons
+  event + blind, no `--fitness-metric`) + renamed disabled-blind test; frontend
+  `pnpm build` clean. The live smoke (a real generation in `./run.sh`) is the
+  remaining check.
+
+### 2026-06-14 — Ship 42: fold "Generate from goal" into the fitness dropdown as a deferred (launch-time) option
+
+- **Why**: the standalone "Generate from goal" button is a ~1-2 min BLOCKING
+  action decoupled from the Objective-fitness dropdown (confusing). Step 1 of the
+  UX rework — make generation a dropdown CHOICE, deferred to launch (Ship 43 runs
+  it as run-phase 0). Additive + merge-safe: the eager button still works.
+- **What** (additive):
+  - **Frontend** `components/NewRunDialog.tsx`: new dropdown option
+    `generate-at-launch` ("✨ Generate a metric from this goal (at launch)"). When
+    selected: the standalone Generate button + Ship-40 progress line are hidden,
+    Fitness mode is forced + locked to `observe`, and the launch body sends
+    `fitness_metric:"generate-at-launch"`. `lib/types.ts`: documents the sentinel.
+  - **Backend** `services/run_manager.py`: `LAUNCH_GEN_SENTINEL = "generate-at-launch"`;
+    `_resolve_fitness_metric` returns `None` for it → a safe no-op blind loop
+    (Ship 43 will intercept it as a generation PRE-PHASE before the cmd is built).
+- **How**: minimal, no flag yet; the sentinel degrades to blind until Ship 43.
+  No change for existing built-in / `gen:<id>` selections.
+- **Verified**: gates green — backend 336 (was 335; +1: sentinel runs blind, no
+  `--fitness-metric` flag, no crash); frontend `pnpm build` clean; sculptor
+  unaffected. Committed per below.
+
+### 2026-06-14 — Ship 41: validator accepts non-locomotion metrics (kick/jump/floss) + ladders that can actually calibrate them
+
+- **Why**: Sam auto-generated an objective fitness metric for a G1 **kick** goal;
+  all 3 candidates were REJECTED on non-degeneracy ("spread 0.000"), silently.
+  Root cause (verified on disk, `g1-kick-v3/metrics/gen_003`): the gate's only
+  positive archetype `active` was a forward-WALKER (steady travel), so a correct
+  stationary kick metric scored `active`≈0 and tied the negatives. Same for any
+  non-locomotion behavior — auto-generation was broken for exactly Sam's tasks.
+  Deeper blocker found by tracing source: even past validation, a 4-array metric
+  (gen_003 needs root_link_pos_w+joint_pos) scored 0 on every `g1_kick` ladder
+  rung (the ladder only carried joint_vel+gravity) → Spearman 0 → could NEVER
+  earn steer-rights. (Sculptor-only; pure-Python, no GPU/UI. Ships 42-45 do the
+  launch-time UX.)
+- **What** (all additive; default `behavior_goal=None` reproduces prior behavior):
+  - **`eval/metric_validate.py`**: new `resolve_behavior_family(goal, robot_hint)`
+    (word-level keyword → kick/floss/jump/locomotion/cartpole) + `FAMILY_TO_BUILTIN`.
+    `_archetypes()` adds 3 full-array POSITIVES at standing height z≈0.7:
+    `active_kick` (discrete leg-vel bursts, stationary), `active_floss` (slow
+    anti-phase hip↔arm), `active_jump` (vertical hops + knee extension).
+    `validate_generated_metric(..., behavior_goal=, robot_hint=)` now returns
+    `family`. Non-degeneracy passes if ANY positive beats EVERY negative with
+    spread.
+  - **`eval/metric_calibration.py`**: `g1_kick`/`g1_floss` ladders now populate
+    ALL 4 arrays (stationary root z=0.7, cumsum joint_pos) WITHOUT changing the
+    spec rank order; new `g1_jump` ladder.
+  - **`eval/spec_metrics.py`**: new `spec_g1_jump` ground truth (robust apex ×
+    completed launch-and-land cycles × uprightness); registered in `_SPEC_FNS` /
+    `_METRIC_ROBOT_HINTS` / `_REQUIRED_ARRAYS`. Propagates to the backend
+    calibrate-against list + UI via `spec_metric_names()` (dynamic).
+  - **`eval/metric_gen.py:163`**: threads `behavior_goal`/`robot_hint` into validate.
+  - **`reward-sculptor-ui/frontend/src/lib/types.ts`**: `g1_jump` added to
+    `SpecMetricName` + `SPEC_METRIC_NAMES` (sorted, mirrors backend).
+- **How / key decision**: behavior-family archetypes (option i of the plan), NOT
+  importing calibration's Spearman into the validator — preserves the deliberate
+  smell-test ↔ calibration-firewall boundary. The family ANCHORS calibration
+  (which builtin to compare against) but — per the adversarial review — does NOT
+  narrow the non-degeneracy gate (that narrowing false-rejected good metrics whose
+  goal mis-resolved); the gate uses the UNION of all positives. The calibration
+  firewall (Spearman≥0.7 vs hand-authored ground truth, observe-only until passed)
+  is unchanged.
+- **Review** (5 parallel adversaries, all findings reproduced vs source; applied
+  CRITICAL + all HIGH + the cheap MEDIUMs):
+  - **CRITICAL** — a peak-joint-speed hack `uprightness*(1-exp(-max|jv|/8))` scored
+    `chaotic` (random thrash, the highest-peak archetype) above the real positives
+    yet passed, because `chaotic` wasn't a required-loser. FIX: added `chaotic` to
+    the negatives (it has the highest peak speed, so peak-speed hacks now lose).
+  - **HIGH** — `resolve_behavior_family` substring-matched "hop" inside **"Hopper"**
+    (a locomotion example) and "strike" in "strike a balance". FIX: word-token
+    matching; dropped "bound" (a quadruped gait) and "strike". Plus the
+    union-gate change above (a good metric whose goal mis-resolves no longer
+    false-rejects — fixes the compound-goal class too).
+  - **HIGH** — the enriched cumsum joint_pos let a joint_pos-magnitude metric drift
+    ~1e-7 and spuriously calibrate (rho=1.0) past the 1e-12 std-guard. FIX:
+    `spearman()` rounds to 6 decimals (spec_score is [0,1]) before the guard.
+  - **HIGH** — `spec_g1_jump` (the new ground truth) rewarded sensor VIBRATION above
+    real jumps (raw max apex + unsmoothed edge count). FIX: 5-frame signed-smoothed
+    height/velocity, robust p97.5 apex, upright-gated COMPLETED launch-and-land
+    cycles (also rejects a monotonic-climb "elevator": launches but no descents).
+  - MEDIUM `active_kick` actuates one leg (correct for a one-leg kick; bilateral
+    metrics still pass via the union). LOW cartpole behavior-only metrics can't
+    pass non-degeneracy — pre-existing, not a Ship-41 regression.
+- **Verified (no GPU/API)**: gates green — **sculptor 622 passed / 1 skip (was 607;
+  +15 tests); backend 335 / 1 deselected; frontend `pnpm build` clean**. Offline
+  proof: the real rejected gen_003 metric now PASSES (`active_kick`=0.345 vs
+  locomotion `active`=0.0 — why the old gate rejected it) AND calibrates vs
+  g1_kick (Spearman 1.0; gen_scores went from all-zero to non-zero). New tests
+  cover the resolver (incl. Hopper), kick/jump/floss family passes, peak-speed-hack
+  rejection, sub-resolution-drift calibration rejection, and jump-spec
+  noise/elevator rejection.
+- **End-to-end efficacy (API run, no GPU — Sam-approved)**: a FRESH
+  `sculpt gen-metric` for the kick goal now returns `accepted=True` and
+  `calibration vs g1_kick: spearman=1.0 ok=True` (pre-Ship-41 all 3 candidates
+  were rejected on non-degeneracy). The generated metric is genuinely
+  kick-specific — `active_kick`=0.978, every other archetype (incl. chaotic /
+  upright_flail) 0.0 — so the hardened gate accepted a real kick detector, not a
+  degenerate. Committed as `0d79e59`.
+
+### 2026-06-14 — Ship 40: live progress while auto-generating an objective metric
+
+- **Why**: Sam — clicking "Generate from goal" blocked for 1-2 min behind a
+  static "Generating…" label with no insight into the multi-stage pipeline
+  (generate → validate → regenerate-on-failure → independent review).
+  Communicate progress to the user as it goes.
+- **What** (additive; default `on_event=None` is byte-identical):
+  - **Sculptor** (`eval/metric_gen.py`): `generate_objective_metric(on_event=…)`
+    emits `{stage, attempt, max, message}` at each step — generating (per
+    attempt), validating, regenerating (non-final validation failure), retrying
+    (non-final API error), reviewing, done (with `accepted`). Never fatal (a
+    raising callback is swallowed in `_emit`).
+  - **Backend** (`sculptor_bridge.py`, `metric_store.py`, `routes/metrics.py`):
+    forward `on_event`; the generate route streams it to an ATOMIC progress
+    sidecar (`<project>/metrics/.gen_progress.json`, tmp+rename) via an
+    on_event closure, writes an initial "starting" BEFORE the threadpool, and
+    `clear_progress` in a `finally` (cleared even if generate raises). New
+    `GET /projects/{slug}/metrics/generate/progress` (`{active:false}` idle).
+    Reuses the H1 sidecar pattern — worker-thread writes, event-loop reads,
+    atomic so no torn reads.
+  - **Frontend** (`types.ts`, `api.ts`, `useMetrics.ts`, `NewRunDialog.tsx`):
+    `MetricGenProgress` + `getMetricGenProgress` + `useMetricGenProgress(slug,
+    enabled)` poll (1.2 s, `gcTime:0`, enabled ONLY while the generate mutation
+    is pending) + an inline progress line under the Generate button showing the
+    live `message`.
+- **Review** (adversarial agent, all 8 pressure-tests vs source): no
+  CRITICAL/HIGH/MEDIUM. 1 LOW fixed — the `retrying` stage fired on the FINAL
+  attempt with no retry following (cosmetic); now gated `if attempt+1 <
+  n_attempts`, matching the `regenerating` guard. Verified: back-compat (every
+  other caller/mock omits `on_event`; CLI `gen-metric` unaffected), never-fatal,
+  clear-on-finally, atomic concurrency, stage order/off-by-one, route
+  non-collision + first-poll-non-empty, frontend poll lifecycle (no leak / no
+  stale flash), and `.gen_progress.json` skipped by `list_metrics` (file, not a
+  `gen_NNN` dir).
+- **Verified (no GPU/API)**: gates green — **sculptor 607 passed / 1 skip (was
+  605; +2); backend 335 / 1 deselected (+2); frontend `pnpm build` clean**. New
+  tests: sculptor — generate emits the stage sequence (GOOD →
+  generating/validating/reviewing/done-accepted; REWARDS_STILLNESS →
+  generating×3 / regenerating / no-review / done-rejected); backend — the route
+  writes LIVE progress mid-generation (read from inside a mocked on_event) +
+  clears it after, idle returns `active:false`. The live UI render is exercised
+  when Generate is clicked during the kick test. Not git-committed.
+
+### 2026-06-14 — Ship 39: interactive human-in-the-loop (H1) — pause-for-feedback by default + an always-on Auto/Manual switch + video feedback into the diagnoser
+
+- **Why**: Sam — the default should be to PAUSE between every iteration so a
+  human can steer from what they SEE in the rollout video (richer than the
+  metrics — e.g. "it's standing still and flailing its arms, not kicking"),
+  with a big switch near the top to flip to full-auto at ANY point. Directly
+  compensates for the C2 gap (the diagnoser's weak scalar signal) that Ship 36
+  identified in the kick run.
+- **What** (additive; the default for non-UI / CLI is fully automated and
+  byte-identical to before):
+  - **Sculptor** (`sculpt.py`, `diagnose.py`, `cli.py`):
+    `sculpt_run(control_file=, feedback_timeout=3600, feedback_poll_interval=2)`
+    — at each iteration boundary (except the last), if a control sidecar is
+    wired AND mode=='manual', emit `awaiting_feedback` and BLOCK-poll the
+    sidecar until the human resumes (optionally with feedback), flips to auto,
+    stops, or the timeout fires (auto-resume — never pins the GPU). The
+    feedback threads into the NEXT iter's `diagnose(human_note=...)` as a
+    prominent "# USER OBSERVATION" block (review iter N → steer iter N+1).
+    `_read_control_file`/`_pause_for_feedback` (the subprocess only READS the
+    sidecar — the backend is the sole writer, so no write-race). CLI
+    `--control-file`/`--feedback-timeout`. Missions are intentionally NOT
+    wired (no control_file passed → no pause).
+  - **Backend** (`run_manager.py`, `models/run.py`, `routes/runs.py`): every
+    UI run ALWAYS writes a deterministic control sidecar
+    (`runs/_control_<id>.json`) + passes `--control-file`, so the toggle works
+    at ANY point; initial mode from `RunParams.start_mode` (default "auto" —
+    non-UI launches never pause/hang). `PATCH /runs/{id}/control` merges
+    {mode, resume(+feedback), stop} into the sidecar (atomic tmp+rename;
+    resume bumps a token); `RunSummary.mode` for reconnect. Feedback/control
+    events tee over the existing WS.
+  - **Frontend** (`RunsTab.tsx`, `NewRunDialog.tsx`, `useRuns.ts`, `api.ts`,
+    `types.ts`): a prominent Auto/Manual switch in the run header (flippable
+    any time → PATCH), an inline FeedbackPanel (textarea + "Continue" /
+    "Continue + go Auto") shown when paused; `awaiting`/`mode` derived from the
+    event stream + seeded from `run.data.mode` for reconnect. NewRunDialog
+    defaults "Pause for my feedback each iteration" ON (the requested default).
+- **Review** (adversarial agent, all 10 pressure-tests vs source): 1 MEDIUM
+  fixed — the sidecar `feedback` field isn't cleared, so a BARE Auto-flip
+  (toggle, no resume) would re-inject the prior iteration's stale note; fixed
+  by carrying feedback only on an EXPLICIT resume (resume-token bump), which
+  preserves the "Continue + go Auto" feedback path while ignoring a bare flip
+  (subprocess stays read-only — no sidecar write-race). 1 LOW noted (a PATCH
+  landing in the tiny window before the runner's initial sidecar write could
+  be clobbered — the UI can't surface controls that early; left as-is).
+  Verified: byte-identical default (control_file=None → pause skipped,
+  human_note None), last-iter skip, timeout safety, deterministic path, PATCH
+  semantics, event teeing, mission isolation, frontend derived-state reset.
+- **Verified (no GPU/API)**: gates green — **sculptor 605 passed / 1 skip (was
+  604; +1 net); backend 333 / 1 deselected; frontend `pnpm build` clean**. New
+  `tests/test_interactive.py` (10): control-file parse, pause
+  auto/stop/resume/bare-auto-flip/continue-and-go-auto/timeout branches,
+  human_note threads to the NEXT iter, user-stop ends early, USER OBSERVATION
+  render. New backend tests: runner writes sidecar + `--control-file` flag,
+  defaults to auto, PATCH merges mode/resume+feedback/stop + 404. The full
+  pause→feedback→steer cycle needs a live run (GPU/API); the mechanism is
+  unit-tested end-to-end at each layer. Not git-committed (Ships 33–38 also
+  uncommitted; commit strategy deferred to Sam).
+
+### 2026-06-14 — Ship 38: per-stage mission steering metrics (M1) — each curriculum phase steers by its OWN objective
+
+- **Why**: Sam — "for a mission, each stage would need to create and use a
+  DIFFERENT steering metric." Verified: Ship 34 resolved ONE `fitness_metric`
+  and applied it uniformly to every stage (`mission_run` resolved it once,
+  forwarded identically) — unsound for a true curriculum where a "balance on
+  one leg" stage and a "kick" stage have orthogonal objectives. The
+  quality-evaluation machinery Sam wanted ("a way to evaluate the metric's
+  quality") already exists (metric_gen independent review + metric_calibration
+  Spearman firewall, Ship 35).
+- **What** (additive; the uniform/blind default is byte-identical):
+  - **Data model** (`mission.py`): `Stage.steering_metric: Optional[str]` — a
+    built-in spec name or a resolved generated-metric path; OVERRIDES the
+    mission-level metric for that stage. Serializes via asdict; older
+    mission.json load with None (from_dict filter). Light structural
+    validation (non-empty, ≤128 chars).
+  - **Orchestration** (`sculpt.py` `mission_run`): pre-resolve the mission
+    metric + ALL distinct per-stage metrics up front into a cache (FAIL-FAST
+    before GPU work; a generated module loads once; skips already-succeeded
+    stages on resume), a `_fitness_fn_for_stage` closure (stage metric →
+    mission metric → None), an emitted `stage_fitness_metric` event (metric +
+    source), and `_run_one_stage(fitness_fn=<per-stage>)`. Composes cleanly
+    with Ship-36 revert/observe (only `fitness_fn` varies per stage).
+  - **Decompose authoring** (`decompose.py` + user content): the decomposer MAY
+    author a `steering_metric` per stage, restricted to KNOWN built-in spec
+    names (`_validate_steering_metrics` rejects unknown → re-parse; generated
+    paths come from the UI, not the LLM), normalized ""→None, surfaced via an
+    `AVAILABLE_FITNESS_METRICS` block with a conservative "only a correct fit,
+    else null" instruction. Re-decomposed sub-stages inherit the failed stage's
+    metric.
+- **Honest scope**: this is the PLUMBING + decompose authoring (functional
+  end-to-end: create a mission → decompose may assign per-stage built-in
+  metrics → run uses them). Per-stage GENERATED metrics for genuinely novel
+  curricula (e.g. a quadruped jump's crouch→launch→flight→land) need the
+  novel-task calibration path (the deferred M2/Later) before they can STEER —
+  today a stage's uncalibrated generated metric would be observe-only. A
+  dedicated per-stage-metric UI EDITOR is a follow-on (the field flows through
+  mission.json + the `stage_fitness_metric` event is on the WS stream).
+- **Review** (adversarial agent, all 8 pressure-tests vs source): no
+  CRITICAL/HIGH. 2 LOWs applied — removed dead `_mission_fitness_fn`;
+  pre-resolution now skips already-succeeded stages so a resumed mission isn't
+  fail-fast'd by a deleted path-metric on a stage that won't run. Verified:
+  fallback precedence, fail-fast cache, byte-identical back-compat (None
+  everywhere → `fitness_fn=None` per stage, event not emitted), resume
+  round-trip, decompose validation, redecompose inheritance, Ship-36
+  revert/observe composition.
+- **Verified (no GPU/API)**: gates green — **sculptor 595 passed / 1 skip (was
+  588; +7); backend 330 / 1 deselected; frontend untouched (clean)**. New
+  `tests/test_per_stage_metrics.py` (6) + `test_mission_run.py::test_mission_run_per_stage_steering_metric`
+  (a per-stage-override stage + a mission-fallback stage get the right tagged
+  fitness fn + events). Efficacy needs a multi-phase GPU mission. Not
+  git-committed (Ships 33–37 also uncommitted; deferred to Sam).
+
+### 2026-06-14 — Ship 37: KG case-memory — runs write their own learnings back; the diagnoser reads them ("the same failure can't happen twice")
+
+- **Why**: Sam — store run-learnings into the KG so the same failure can't
+  recur, and judge whether the KG is even the right structure. Verified read:
+  the KG was READ-ONLY literature (SQLite; Paper/Technique/FailureMode/Reward
+  Component/Environment/Result; MiniLM cosine + failure-mode graph walk) —
+  `add_node` is called ONLY in ingest/extract; no run outcome ever comes back,
+  so every diagnosis starts blind to what the last run already tried.
+  Efficiency verdict (me + adversarial review): the store is already generic +
+  extensible (generic `add_node`/`neighbors`, `Edge.data` dict, the embeddings
+  table, a `Result` node precedent) — a structural PIVOT is unjustified scope
+  creep. Add a case layer; don't rebuild.
+- **What** (additive; ZERO store-schema change):
+  - **`RunCase` node + `INSTANTIATES` relation** (`kg/schema.py`): one case per
+    fitness-tracked iteration (task, robot, symptom, failure_modes,
+    edit_summary, fitness before/after/delta, verdict ∈
+    helped|regressed|neutral|unknown). `make_run_case_id(task, iter, nonce)` —
+    the per-run nonce makes cases ACCUMULATE (build an experience base) rather
+    than overwrite. Registered in `NODE_TYPES`; serializes via the generic
+    `node_to_row` path (no store change).
+  - **`kg/cases.py`** (new): `record_run_cases` (write-back; FORWARD
+    attribution — iter N's edit judged by the fitness change at N+1) +
+    `query_cases`/`_ensure_case_embeddings`/`CaseMatch` (semantic retrieval
+    mirroring `query_semantic`: same MiniLM model, lazy embedding backfill,
+    floored at `DEFAULT_MIN_PROMPT_SIMILARITY`) + `_render_case_context` (a
+    "CASE MEMORY" prompt block marking [+] helped / [-] regressed). Cases are a
+    SEPARATE silo, merged with the literature only at prompt time.
+  - **Write-back** (`sculpt.py`): at the end of `sculpt_run`, a guarded
+    best-effort `record_run_cases` (only when not `--no-kg` AND fitness tracked;
+    reopens its own store since the loop's is closed in the finally; never
+    affects the run). Emits `run_cases_recorded`.
+  - **Read-side** (`diagnose.py`): the grounded-diagnosis KG block now also
+    retrieves cases (skipped under `--no-kg`) and PREPENDS the CASE MEMORY block
+    to `kg_context`, reusing the diagnoser's store without closing it.
+- **Review** (adversarial agent, all 8 pressure-tests vs source): 1 HIGH fixed
+  — a cross-ship interaction with Ship-36 F1: when iter N regresses, N+1
+  REVERTS to the best reward, so `fits[N+1]` re-measures the best (high) → the
+  regressing edit would be recorded "helped" and then RECOMMENDED to future
+  runs (backwards). Fix: added `IterOutcome.reverted_to_best`; `record_run_cases`
+  drops the forward delta (verdict 'unknown') when N+1 reverted. Everything else
+  checked out (write-back lifecycle / no double-close, observe-mode recording is
+  valid-but-correlational, diagnose store-ownership, retrieval ranking, schema
+  round-trip, accumulation, no import cycle). LOW noted: unbounded case growth
+  (fine to ~10k; a recency/`top_k` cap is the future lever).
+- **Verified (no GPU/API)**: gates green — **sculptor 588 passed / 1 skip (was
+  580; +8); backend 330 / 1 deselected (no breakage); frontend untouched (clean
+  from Ship 36)**. New `tests/test_kg_cases.py` (8): verdict thresholds, record
+  nodes+edges+forward-attribution, the REVERT non-attribution, skip-empty-
+  learning, accumulate-across-runs, cosine ranking + similarity floor, empty
+  store, render marks. Efficacy (does case memory actually stop a repeat
+  failure?) needs a multi-run GPU/API session. Not git-committed (Ships 33–36
+  also uncommitted; commit strategy deferred to Sam).
+
+### 2026-06-14 — Ship 36: steering fixes — revert-on-regression (F1) + metric breakdown to the diagnoser (F2) + monotone kick-event diagnostic & flail-hack validator gate (F3)
+
+- **Why**: Sam's Unitree-G1 `g1_kick` STEER A/B reward-hacked — best fitness
+  at iter 1, by iter 3 the policy stood and flailed its arms; the loop's own
+  diagnoser recognized it but couldn't stop it. Root cause (verified at source
+  + a 7-agent research/red-team workflow): Ship 33/34 fitness-in-the-loop gave
+  SELECTION (best-by-fitness kept the iter-1 reward — the final output was
+  protected) but not SEARCH. (C1) each iter edits forward from the *latest*
+  reward (`sculpt.py` `_run_one_iter` `reward_path_before`/`latest_reward_file`),
+  so a bad edit compounds; the best-by-fitness repoint only fires at run END.
+  (C2) the diagnoser saw only a scalar fitness, not WHY it fell. (C3) the kick
+  metric's leg-isolation is conditional on joint-name metadata and its
+  peak/median ratio is extremal-Goodhart. Best at iter 1 = the LLM's seed was
+  never beaten across 6 iters → steering provided no climbable signal.
+- **What** (sculptor-only; all flag-gated; the blind no-`fitness_fn` loop is
+  byte-identical):
+  - **F1 revert-on-regression** (`sculpt.py`): new `fitness_revert: bool = True`
+    on `sculpt_run`/`mission_run`/`_run_one_stage`; `_run_one_iter` gains
+    `revert_base`. In STEER mode (not observe), when an iter fails to set a new
+    best the loop hands the NEXT iter the best-so-far reward
+    (`SculptRunResult.best_reward_path`) as BOTH its training and edit base
+    (best-first search vs a drifting random walk) — the deferred Ship-33 "edit
+    accept/reject". Repoints `current.py`, sets `reward_path_trained`, emits
+    `reward_reverted_to_best`, and tells the diagnoser "your last edit regressed
+    — try a DIFFERENT direction". Plateau early-stop is unchanged. CLI
+    `--fitness-revert/--no-fitness-revert` on `run` + `mission-run`.
+  - **F2 metric breakdown to the diagnoser** (`spec_metrics.py`,
+    `generated_metric.py`, `sculpt.py`, `diagnose.py`): the fitness fn now
+    carries a `.detail` accessor returning the FULL component dict (one compute,
+    no new threaded params); `_run_one_iter` puts the filtered sub-components
+    (`_fitness_components_for_prompt`) into `objective_progress["components"]`;
+    the diagnose prompt renders a "fitness component breakdown" block so the LLM
+    can localize "not kicking" (low `kick_events`/`uprightness` high) vs "kick
+    too weak". Observe mode still nulls it out.
+  - **F3 kick-metric hardening** (`spec_metrics.py`, `metric_validate.py`): new
+    monotone `kick_events_score` (discrete refractory-gated leg-event count,
+    invariant to sub-threshold baseline motion — the audit-prescribed signal);
+    `spec_g1_kick` now REPORTS `kick_events`/`kick_events_per_env` as a
+    diagnostic. Its `spec_score` formula is **intentionally UNCHANGED** — the
+    calibration-fence swap needs real-rollout threshold calibration (the
+    Ship-33/34 deferral; `_bursty_vel`'s 3-frame test bursts smooth below a
+    5 rad/s gate, so a blind swap would zero the existing kick tests). The
+    generated-metric validator gains an `upright_flail` archetype + a
+    non-degeneracy gate (`active` must beat it) that rejects motion-magnitude
+    "stand-and-flail" metrics — strengthening the metric-quality firewall.
+- **How / trade-offs**: `.detail` rides on the fitness-fn object so F2 needed
+  ZERO new params through sculpt_run/mission_run. F1 reverts the EDIT BASE (not
+  a hard stop) so the loop keeps searching from the best. Defaulting
+  `fitness_revert=True` changes STEER behavior (intended; steer is opt-in +
+  barely used) but is byte-identical with no `fitness_fn`. F3 deliberately does
+  NOT swap the kick `spec_score` (would blindly retune calibration-fence
+  thresholds without a GPU run).
+- **Review** (adversarial agent, all 8 pressure-tests verified vs source): 1
+  MEDIUM fixed — a revert on a crash-RESUMED iter would reuse a stale
+  `iter_<i>/checkpoint.pt` trained on the DEGRADED reward (`_train_or_resume`
+  "resume wins"); the revert block now invalidates `checkpoint.{pt,zip}` so
+  training re-runs on the reverted reward. 2 LOWs accepted/documented:
+  `iter_started.reward_version_before` shows the latest (not reverted) version
+  on a reverted iter (truth carried by the separate `reward_reverted_to_best`
+  event); the `upright_flail` archetype would reject a FUTURE leg-kick generated
+  metric (harmless today — no shipped metric is motion-magnitude-based; revisit
+  when `kick_events` is promoted, adding a travel/coordination discriminator).
+- **Verified (no GPU/API)**: gates green — **sculptor 580 passed / 1 skip (was
+  571; +9 new); backend 330 / 1 deselected (no breakage); frontend `pnpm build`
+  clean**. New tests: kick-events monotonicity + baseline-invariance +
+  arm-flail-rejection, g1_kick reports kick_events, `.detail` accessor,
+  validator rejects flail-rewarder; F1 revert targets best on regression,
+  observe-only never reverts, `--no-fitness-revert` keeps the forward base,
+  components-filter, diagnose renders breakdown + revert note. Efficacy (does
+  best-first steering now CLIMB past iter 1 on the real kick task?) needs the
+  GPU re-run. NOT git-committed: Ships 33–35 are already uncommitted in the tree
+  (HEAD=Ship 32a) — commit strategy deferred to Sam at end of the 36–39 arc.
+
+### 2026-06-14 — Ship 35: auto-generated objective metrics (observe→earn-steer) + fitness-as-PRIMARY UI + observe/steer mode + textured ground
+
+- **Why**: the trot run hit fitness=1.0 even blind → trot isn't a
+  discriminating task, and hardcoding fitness to 4 built-in metrics
+  doesn't generalize. Sam: auto-GENERATE a per-task objective metric
+  (yes/no, not a dropdown of premades), gate it with a reviewer, show the
+  objective score even when not steering, make fitness the PRIMARY tracked
+  metric, and texture the ground. Steer-policy approved: observe-by-
+  default, earn-steer-by-calibration (the circularity firewall — an LLM
+  that writes both reward AND metric can't self-grade).
+- **Design spine** (from a 3-agent research+red-team workflow): a
+  generated metric is a PHYSICAL-quantity function over rollout arrays
+  (never LLM judgment); it must pass must-have gates + an independent
+  review to be ACCEPTED, and Spearman-calibrate vs a hand-authored ground
+  truth to earn STEER. The 4 hand-authored specs never retire (calibration
+  fence). Honest claim: "auto-generated objective PROXY with gates", not
+  ground truth.
+- **What** (all additive; default-OFF byte-identical to before):
+  - **Observe/steer** (`fitness_observe_only`): observe computes + emits
+    fitness but severs ALL influence (objective_progress=None to diagnose,
+    no best-by-fitness `current.py` repoint, no fitness early-stop) — for a
+    fair blind-vs-guided A/B and as the safe default for uncalibrated
+    generated metrics. Threaded sculpt_run → mission_run → _run_one_stage;
+    CLI `--fitness-mode`; RunParams/RunMissionRequest.fitness_mode;
+    run_manager/mission_jobs forward it.
+  - **Generated-metric pipeline** (new `sculptor/eval/`): `generated_metric`
+    (load/compute/`resolve_fitness_fn` for a built-in name OR a generated
+    .py path); `metric_validate` (AST safety / array-contract / determinism
+    / bounds / non-degeneracy archetype gates); `metric_gen` (LLM generate
+    → validate → regenerate-on-failure → independent review;
+    prompts/gen_objective_metric.md + review_objective_metric.md);
+    `metric_calibration` (Spearman vs ground truth on a competence ladder).
+    CLI `sculpt gen-metric <goal> --out --calibrate-against`.
+  - **Fitness as PRIMARY metric (UI)**: RunsTab chart (title "Objective
+    fitness", reward demoted to a secondary spark), iteration card (fitness
+    prominent violet, reward small/muted), run-row + detail sparklines all
+    foreground fitness; MetricChart gained label/decimals; backend
+    RunSummary.fitness_history (derived in job_to_run_summary). Degrades to
+    the reward metric when no fitness exists.
+  - **UI generate flow**: backend routes/metrics.py (generate [threadpool,
+    ~1-2 min] / list / calibrate) + services/metric_store.py (per-project
+    `metrics/gen_NNN/`) + sculptor_bridge wrappers; run_manager resolves
+    `fitness_metric="gen:<id>"` → `<project>/metrics/<id>/metric.py`.
+    NewRunDialog: "Generate from goal" button → dropdown gains generated
+    metrics; an uncalibrated generated metric is observe-LOCKED (steer
+    disabled). hooks/useMetrics.ts.
+  - **Ground texture**: `_mjlab_runner._apply_ground_texture` sets
+    `env_cfg.scene.spec_fn` (ROLLOUT render only) adding an image texture
+    to floor/terrain geoms; FULLY guarded (any failure → default ground,
+    never breaks a rollout); shipped `sculptor/assets/textures/ground.png`;
+    `SCULPTOR_GROUND_TEXTURE` toggle. MjSpec texture→material→geom API
+    verified to compile offline (mujoco 3.7); visual needs a GPU render.
+- **Verified (no GPU/API, post-review)**: gates green — **sculptor 571 /
+  1 skip; backend 330; frontend `pnpm build` clean**. The run dialog has
+  the full loop: Generate-from-goal → observe → Calibrate-vs-built-in →
+  steer unlocks. New tests: test_generated_
+  metric (validator rejects forbidden-import/bad-array/rewards-stillness/
+  non-deterministic; generator mock accept/retry/review-veto; calibration
+  good-correlates/constant-fails — 11), test_ground_texture (compiles a
+  real MjSpec offline + toggle + chaining — 5), test_metrics_route (mocked
+  LLM: generate/list/calibrate/404 — 3). Efficacy (does a generated metric
+  beat blind? does the texture render?) needs a GPU/API run.
+- **Review** (3-lens adversarial workflow + verify pass): 6 confirmed-
+  serious, all FIXED — (CRITICAL) backend now gates uncalibrated generated
+  metrics from steering (`steer_allowed` in run_manager + mission_jobs,
+  not just the UI); (CRITICAL) `routes/runs.py::_run_summary` now populates
+  `fitness_history` (was empty in REST); (CRITICAL) `mission_jobs` now
+  RESOLVES `gen:<id>`→path (raw ref crashed missions); (HIGH) AST safety
+  blocks dunder NAMES incl. `__builtins__`; (HIGH×2) MissionAdvanced now
+  typed `string` + renders generated-metric optgroups + observe-locks
+  uncalibrated ones (was built-in-only). Plus MEDIUMs: calibration std
+  epsilon guard, metrics-route id/`against` validation (path-traversal),
+  atomic `gen_NNN` id allocation. New tests: __builtins__ escape,
+  gen-metric resolution + steer-downgrade (run + mission).
+- **Deferred / honest gaps**: mission fitness still uniform-metric-per-
+  stage (single-skill only); calibration is the synthetic-ladder proxy
+  (real-policy Spearman needs GPU); generate is synchronous (no job kind);
+  generate button is in the run dialog (missions select existing metrics).
+
+### 2026-06-13 — Ship 34: fitness-in-the-loop wired END-TO-END into the UI (CLI → backend → frontend) + kick-metric floor fix
+
+- **Why**: Ship 33 added fitness-in-the-loop as a CLI/campaign flag only.
+  Sam wants to TEST it in the UI on the local GPU, so it must be
+  UI-reachable (standing rule: no terminal after ./run.sh). Caveat that
+  drove the design: fitness needs an OBJECTIVE metric, which only exists
+  for the named spec metrics — so the UI attaches a chosen spec metric to
+  a free-text goal (e.g. goal "gallop forward fast" + fitness=go1_trot).
+- **What** (additive, flag/None-gated — default OFF is byte-identical to
+  the blind loop; verified by the review's default-OFF lens):
+  - **sculptor**: `spec_metrics.make_spec_fitness_fn(name)` + `spec_metric_names()`
+    + `spec_metric_robot_warning(name, task_id)`; `mission_run`/`_run_one_stage`
+    now thread `fitness_metric`/`fitness_target`/`fitness_patience` to every
+    stage's sculpt_run (uniform metric across stages — sound for
+    single-skill missions, documented); `cli.py` `run` + `mission-run` gain
+    `--fitness-metric/--fitness-target/--fitness-patience` (resolve name →
+    fitness_fn, fail-fast on bad name) + a soft mismatch WARNING
+    (`fitness_metric_warning` event) when the metric doesn't fit the
+    robot; `harness.py` uses the shared helper + wires the mission branch;
+    `eval/__init__` re-exports.
+  - **kick metric**: `burstiness(ratio_floor=0.5)` floors the ratio
+    denominator so a CLEAN kicker (median≈0) no longer scores 0.0 (the
+    one unambiguous Ship-33 audit bug). Scale-invariance for active
+    policies preserved; all existing kick/burst tests stay green. (Full
+    discrete-event redesign deferred — needs REAL-rollout calibration.)
+  - **backend**: `RunParams.fitness_metric` + `RunMissionRequest.fitness_metric`
+    (Literal of the 4 names, validated; bad value rejected by extra=forbid);
+    `run_manager` forwards `--fitness-metric` + stashes it; `mission_jobs`
+    `_build_mission_run_flags` forwards it + `_STAGE_TEE_EVENTS` tees the
+    new events; `IterEventSummary` + `_iter_events` carry `fitness`/
+    `best_fitness` so the REST timeline survives reload (review CRITICAL).
+  - **frontend**: "Objective fitness metric" dropdown in NewRunDialog +
+    MissionAdvanced (NewMission + RunMission, with run_defaults round-trip);
+    `SpecMetricName`/`SPEC_METRIC_NAMES` in types.ts; LogViewer renders
+    `iter_fitness`/`best_reward_selected`/`fitness_metric_warning` (labels +
+    badges); RunsTab iteration card shows a violet `fit X.XX (best Y.YY)`
+    chip; `IterEventSummary` fitness fields + `_mergeIterSlot` carry-over.
+- **Review** (3-lens adversarial workflow + verify pass): 1 CRITICAL + 1
+  HIGH, both fixed. CRITICAL = backend IterEventSummary missing fitness
+  fields (REST reload dropped the chip) → added fields + `_iter_events`
+  handlers. HIGH = no metric↔robot pre-flight (go1_trot on G1 wastes GPU
+  on a wrong objective) → soft, visible warning (not a hard block: the
+  metrics are partly robot-agnostic, so blocking would false-positive).
+  3 MEDIUMs accepted as documented limitations (no UI fitness_target
+  field; uniform mission metric; plateau patience=2 not UI-tunable).
+- **Verified (no GPU)**: gates green — **sculptor 554 / 1 skip; backend
+  325; frontend `pnpm build` clean (1956 modules)**. New tests:
+  clean-kicker floor, make_spec_fitness_fn, spec_metric_names,
+  spec_metric_robot_warning, and CLI/mission `--fitness-metric`
+  forwarding. Monotonicity audit: kick clean+monotone, trot monotone.
+  CLI `run`/`mission-run --help` show the flags. Efficacy (does it close
+  the eureka gap?) still needs a GPU run — the flag is opt-in.
+- **How to test in the UI**: create a Go1 project → New run → Advanced →
+  "Objective fitness metric" = `go1_trot` → goal "gallop forward fast,
+  bounding gait, stay upright" → steps-per-round ≥1200 → launch; the
+  Runs tab streams per-iter `fit` + the best-by-fitness pick.
+
+### 2026-06-13 — Ship 33: honest read of the PARTIAL E4 campaign + spec-metric monotonicity audit + FITNESS-IN-THE-LOOP (the root-cause fix)
+
+- **Context**: GPUs paused mid-campaign. E4 never finished: backup at
+  `C:\Users\SamJD\rs_campaign_backup\results` has **83 result.json**
+  (no eureka on g1_floss/g1_kick, no cartpole, mission_no_kg partial),
+  shard logs only (heavy npz/mp4 not synced). `campaign_report.json` was
+  never generated (campaign died before `sculpt eval report`).
+- **What**:
+  - `~/projects/_report.py` — offline re-aggregation using the project's
+    OWN `harness.aggregate()` (rliable IQM + stratified bootstrap +
+    paired diffs). Wrote `campaign_report.json` + `report.html` into the
+    backup dir. (`_agg.py`/`_agg2.py` = scratch sub-component dumps.)
+  - `RewardSculptor/scripts/audit_spec_metric_monotonicity.py` — reusable
+    GPU-free competence-ladder audit (Skalse 2022 / Goodhart-in-RL 2024
+    prescription). Includes a prototype monotone `_kick_events_score`.
+- **Findings (the honest read)**:
+  1. **g1_floss = dead benchmark**: every condition IQM(final)=**0.000**
+     (best ≤0.034). Zero discriminating power. Signature of
+     under-training (600 rsl_rl iters; legged_gym default is 1500 for
+     Go1, ~10k+ for G1). Even a *synthetic perfect* floss caps at 0.68.
+  2. **g1_kick = confounded metric**: mission 0.457 "beats" matched
+     baseline (+0.383 SIG) but is **tied with cheap 600-iter plain_ppo**
+     (+0.033 ns). Audit proves the burst peak/median *ratio* is
+     **non-monotonic / extremal-Goodhart**: holding a genuine kick FIXED
+     and adding competence-neutral leg motion swings score
+     0.000→0.617→0.197 (a clean kicker scores 0 because median≈0). The
+     "win" is a metric artifact, not better kicks.
+  3. **go1_trot = clean & negative**: **eureka 0.955 (100% threshold) vs
+     mission 0.113** → system **loses to the literature baseline by
+     −0.955 (SIG)**, does not beat plain_ppo (−0.086 ns); KG ablation
+     (mission−mission_no_kg +0.064 ns, CI [−0.25,+0.44]) and curriculum
+     ablation (−0.002 ns) show **no significant effect**.
+  - **Root cause** (data + lit converge): the loop navigates by
+    LLM-authored success criteria and **NEVER sees an objective fitness
+    signal** (`compute_spec_metrics` is not imported by `sculpt.py`/
+    `mission_runtime.py`), while eureka selects candidates *directly by*
+    spec fitness (`eval/eureka.py` delta 2). Eureka's own ablation: the
+    fitness-guided loop is the indispensable component. KG grounding for
+    reward design is unvalidated in the literature (Eureka grounds on env
+    *source code*, not papers) — consistent with the ns KG result.
+- **Verdict**: infra is genuinely research-grade (paired seeds, rliable
+  stats, honest compute accounting, conservative baseline, audit-hardened
+  metrics); the *science* so far is null/negative for the central claim
+  AND partly uninterpretable (dead floss, non-monotone kick, n=2 on the
+  key contrasts, under-training). DO NOT re-run as-is. Fix order before
+  any re-run: (1) objective fitness IN the loop (early-stop + edit
+  accept/reject + diagnoser input — see Explore map: `sculpt.py:2705`,
+  `edit.py:902`, `diagnose.py:577`); (2) compute ≥1500 (Go1)/≥5–10k (G1)
+  so ≥1 method solves each task; (3) replace ratio-based kick metric with
+  the monotone event-count; drop/redesign floss; (4) A/B the KG cleanly.
+- **IMPLEMENTED — fitness-in-the-loop (the #1 root-cause fix)**: the
+  sculpt loop can now see a held-out ground-truth task fitness, removing
+  the eval asymmetry where only eureka selected on fitness. Additive +
+  flag-gated (default OFF → byte-identical blind behavior; `--fitness-in-loop`
+  / `CampaignConfig.fitness_in_loop` turns it on for the `sculpt`/`full`
+  condition, fitness=the benchmark spec metric):
+  - `diagnose.py` — `diagnose(objective_progress=...)` →
+    `_build_preliminary_user_content` renders an `OBJECTIVE_TASK_PROGRESS`
+    block (current/best/last/delta) so the diagnose→edit SEARCH is
+    fitness-guided (Eureka's indispensable component).
+  - `sculpt.py` — `IterOutcome.fitness`; `SculptRunResult.fitness_history`
+    + `best_fitness`/`best_fitness_iter` + `best_reward_path`;
+    `_run_one_iter(fitness_fn, prior_fitness)` computes fitness post-rollout/
+    pre-diagnose (honest None on error) + emits `iter_fitness`;
+    `sculpt_run(fitness_fn, fitness_patience=2, fitness_target)` tracks best,
+    plateau/target early-stops, and repoints `current.py` to the
+    BEST-by-fitness reward (vs the blind default of keeping the last — the
+    go1_trot runs over-iterated past best 0.247 to final 0.166).
+  - `eval/harness.py` — `fitness_in_loop` flag; sculpt branch builds
+    `fitness_fn=spec_metric`; fitness-guided sculpt now scored on `best`
+    (apples-to-apples with eureka). `cli.py` — `--fitness-in-loop`.
+  - Mission-mode wiring deferred: feeding the FINAL-task spec to early
+    curriculum stages is semantically wrong (a "stand up" stage ≠ the
+    "trot" spec); needs per-stage objectives. `full`/sculpt is the clean
+    apples-to-apples condition for now.
+- **Still TODO before re-run** (not done this session): compute ≥1500
+  (Go1)/≥5–10k (G1); swap the ratio kick metric for the monotone
+  event-count; drop/redesign floss; eureka on all benchmarks at n≥5.
+- **Verified (all offline, no GPU)**: report + audit run clean. Audit:
+  kick non-monotone (0→0.62→0.20 on a FIXED kick), trot monotone
+  (0→0.98 in fwd speed), proposed event metric invariant (0.811).
+  New `tests/test_fitness_in_loop.py` (4 tests: best-selection, plateau
+  stop, target stop, blind-default-unchanged, diagnoser block) green.
+  **Gates: sculptor 550 passed / 1 skipped (was 546+4 new); backend 322
+  passed / 1 deselected.** CLI `--fitness-in-loop` present; imports OK.
+  Efficacy (does it close the eureka gap?) needs a GPU run — flag is OFF
+  by default so nothing changes until deliberately enabled.
+
+### 2026-06-11 22:05 — Ship 32a: hour-1 checkpoint caught remote-rollout EGL crash; fixed + relaunched
+
+- **What**: ALL THREE first campaign jobs (plain_ppo seed_1000 ×3
+  benchmarks) trained fine then died at rollout: `mujoco.FatalError: an
+  OpenGL platform library has not been loaded` — headless pod, no
+  `MUJOCO_GL=egl`, and the pod image lacked the glvnd EGL dispatcher
+  (`libEGL.so.1`; driver-side `libEGL_nvidia` + vendor ICD were present).
+  The smoke never exercised this path: its rollouts ran locally
+  (ROLLOUT=1 was appended to the env file after the smoke started).
+  Fixes: (1) pod: `apt-get install libegl1 libgl1 libgles2`, EGL render
+  probe passes (64×64 frame, nonzero); (2)
+  `sculptor/adapters/mjlab.py` `_remote_device_env` now always includes
+  `MUJOCO_GL=egl` in the dispatch env (inert for train — no GL context);
+  (3) `scripts/provision_remote.sh` installs the EGL runtime when
+  `libEGL.so.1` is absent (exec bit re-set); (4) MUJOCO_GL assertions in
+  test_mjlab_remote_dispatch.py (train + multi-GPU + rollout-remote).
+- **Recovery**: killed the 3 shards at ~3 errored jobs (~30 GPU-min
+  burned, ~$1–2), deleted the errored job dirs (resume keys), relaunched
+  the same three shard commands — fresh processes import the fixed
+  adapter; jobs re-run from scratch.
+- **Verified**: gate 546 passed / 1 skipped; pod EGL probe green;
+  relaunch echoes REMOTE targets ×3.
+
+### 2026-06-11 21:25 — Ship 32: E4 CAMPAIGN LAUNCHED (140 jobs, 3 shards, all-remote)
+
+- **What**: smoke completed GREEN (mission spec=1.0/785 s, eureka
+  spec=1.0/1492 s, errors null, `parity_warnings: []`) → launched the
+  three campaign shards detached (single-string `Start-Process wsl`):
+  A=`g1_floss`@cuda:0, B=`g1_kick`@cuda:1, C=`go1_trot`+`cartpole_balance`
+  @cuda:2; each `-c plain_ppo -c plain_ppo_matched -c seed_only_matched
+  -c full -c mission -c mission_no_kg -c eureka --seeds 5 --iterations 4
+  --steps-per-iter 600 --eureka-k 3 --name e4-campaign --require-remote
+  --out /home/samjd/rs_campaign`, logs `/tmp/rs_campaign_shard{A,B,C}.log`.
+  35+35+70=140 jobs, paired seeds 1000–1068, ~29 h expected.
+- **Verified at launch**: all 3 logs echo `training target: REMOTE …
+  (device=cuda:0/1/2)`; `eval_campaign_started` job counts correct; pod
+  GPUs 0/1/2 simultaneously at 86–88 % util (~3 GB each); local 5070
+  carries ONLY Windows desktop processes (no python/WSL) — rollouts are
+  remote this run (`SCULPTOR_REMOTE_ROLLOUT=1`). Zero errors at +5 min.
+- **Monitoring**: session cron `d0b7d190` every 2 h — health check, dead-
+  shard relaunch (same cmd, jobs resume via result.json), final merge via
+  `sculpt eval report /home/samjd/rs_campaign` when all three finish.
+  Cron is session-only: if this Claude session ends, shards keep running;
+  re-arm monitoring in the new session.
+
+### 2026-06-11 — Ship 31c: smoke bug #4 (scalar-probe crash leak) + --eureka-k + rollouts remote
+
+- **What**: `RewardSculptor/sculptor/edit.py` `_call_compute_reward` — the
+  module CALL is now wrapped → `EditValidationError` (was unwrapped; raw
+  module exceptions skipped the EditValidationError-only retry at
+  apply_prompt_edit and halted the stage). `RewardSculptor/sculptor/cli.py`
+  `eval run --eureka-k` (default 4) → `CampaignConfig.eureka_k`; campaign
+  uses 3 per the frozen plan (generations remain `--iterations`).
+  `/tmp/rs_campaign_env.sh` += `SCULPTOR_REMOTE_ROLLOUT=1` (user: keep the
+  local 5070 free; pod does train AND rollout). Regression test
+  `test_scalar_probe_wraps_module_crash_as_validation_error` in
+  tests/test_grounding_hardening.py.
+- **Why**: E4 mission smoke halted `balance_and_center__r1_1` with
+  `v1_materialization_errored: apply_prompt_edit failed: ValueError: only
+  one element tensors can be converted to Python scalars` — an LLM-fixable
+  module bug (float() on a multi-element tensor inside compute_reward)
+  leaked as a non-retryable raw exception. Same wrap the batched probe
+  already had. Mission job still scored green (spec=1.0 @ iter 1,
+  error=null, 785 s) because the halt hit a refinement stage after success.
+- **Verified**: sculptor gate 546 passed / 1 skipped. Pod GPU confirmed
+  training (61 % util / 771 MiB GPU 0, two consecutive samples); idle
+  samples = LLM phases. Eureka smoke job dispatching gen_0 candidates
+  remotely at commit time.
+
+### 2026-06-11 — Ship 31b: campaign-pod bring-up — smoke found 3 launch-blocking bugs, all fixed
+
+**Hardware**: Sam rented ONE pod with 3× RTX PRO 6000 Blackwell Server
+(96 GB each), driver 580.142, /workspace volume (eur-is-1), 256 CPUs.
+`root@157.157.221.177 -p 14699`. Provisioned (`-w
+/workspace/sculptor_remote`, venv on pod-local disk, python 3.13.13,
+full stack pinned); doctor all green ×8. Campaign env at
+`/tmp/rs_campaign_env.sh` (SCULPTOR_REMOTE_* for this pod; per-shard
+`SCULPTOR_REMOTE_DEVICE=cuda:0|1|2`).
+
+The mission+eureka cartpole smoke (go/no-go step 3) caught three
+launch-blocking bugs — exactly what it exists for:
+
+1. **Multi-GPU device-ordinal bug (would have broken shards 2+3)**:
+   `_remote_device_env` set `CUDA_VISIBLE_DEVICES=N` AND passed
+   `--device cuda:N` — but the mask renumbers, so inside the runner
+   the card is ALWAYS cuda:0; `cuda:1/2` raise "invalid device
+   ordinal". Fixed: the physical index lives ONLY in the env mask,
+   runner argv always cuda:0 (`_remote_device_env` now returns
+   (env, runner_device); both train + rollout seams updated; 3-shard
+   regression test in test_mjlab_remote_dispatch).
+2. **Silent local-GPU fallback (burned the first smoke on the
+   laptop 5070)**: PowerShell `Start-Process wsl -ArgumentList
+   @('bash','-c','…')` ARRAY form gets re-split by wsl.exe — the
+   `source` never ran, SCULPTOR_REMOTE_* never set, and "no remote
+   configured" is by-design silent → the smoke trained locally.
+   Launcher rule: ALWAYS the single-string ArgumentList form
+   (`-ArgumentList 'bash -c "…"'` — the Ship-27 pattern that worked).
+   Guard added: `sculpt eval run` now echoes "[eval] training target:
+   REMOTE …|LOCAL GPU" at start and `--require-remote` aborts (exit 3)
+   when SCULPTOR_REMOTE_* doesn't resolve — use it on EVERY campaign
+   shard.
+3. **Unvalidated training path (mission stage burned)**: the LLM v1
+   did `prev_action * (1.0 - reset_mask)` where reset_mask came from a
+   TENSOR COMPARISON (bool) — legal in the scalar (pure-python) probe,
+   crashes the batched path ("Subtraction with a bool tensor").
+   Edit's post-validate only ever executed `compute_reward` (scalar);
+   `compute_reward_batched` — THE path training runs — was first
+   executed on the rented GPU. Fixed: `_call_compute_reward_batched`
+   in edit.py `_post_validate` (N=2 zero tensors, runtime-faithful
+   FLOAT info — the runner floats terminated/time_outs/fallen at
+   lines ~322-324, verified; an earlier bool-info "fix" was reverted
+   as wrong), checks tuple shape/(N,)/non-empty components/finite,
+   with an actionable message (`(~mask).float()`). 3 new tests incl.
+   the exact smoke crash repro. NOTE: validation-failure → the edit
+   retry loop fixes the reward — this converts campaign hard-fails
+   into normal retries.
+
+**Status at this entry**: re-launched smoke RUNNING REMOTELY
+(verified: `[eval] training target: REMOTE root@157.157.221.177`, and
+nvidia-smi on the pod shows our runner at 56% util / 794 MiB on GPU 0;
+GPUs 1-2 idle until shards launch). Smoke = cartpole × {mission,
+eureka} × 1 seed, iterations=2, steps=300, out=/tmp/rs_e4_smoke,
+log=/tmp/rs_e4_smoke.log (detached Windows-side wsl client). Gates:
+sculptor 545 passed/1 skipped (all fixes tested); backend untouched
+since 323-green. UNCOMMITTED at write time: mjlab.py (device map),
+edit.py (batched validation), cli.py (--require-remote + target echo),
+test_mjlab_remote_dispatch.py, test_grounding_hardening.py — commit
+as Ship 31b immediately after this entry.
+
+**Campaign launch (after smoke passes)**: 3 detached shards
+(single-string launcher!), each `source /tmp/rs_campaign_env.sh` +
+`SCULPTOR_REMOTE_DEVICE=cuda:<0|1|2>` + `--require-remote`, benchmarks
+split per docs/campaign_plan.md (A: g1_floss; B: g1_kick; C: go1_trot
++ cartpole_balance), all `--out ~/rs_campaign`, seeds 5, iterations 4,
+steps 600; merge with `sculpt eval report ~/rs_campaign`. Budget on
+3× PRO 6000 ≈ $2/hr each: ~24 h wall ≈ ~$144 GPU + $50-90 LLM (Sam
+chose speed over the $60 5090 plan). Monitor: `eval_job_finished`
+events per shard log + pod nvidia-smi shows 3 active GPUs.
+
+### 2026-06-11 — Ship 31: pre-campaign grounding audit + hardening (campaign frozen)
+
+Sam's directive: everything in its best state, hallucinations minimized
+with accurate techniques, before the spend. Audited the actual
+hallucination surfaces of this system (LLM citing fake papers; weak
+semantic matches polluting prompts; KG nodes not reflecting real
+papers; mis-grounded failure-mode lookups) — found three real defects,
+fixed all three.
+
+- **F1 — unfloored semantic slices (diagnose + decompose)**: edit.py
+  adopted a 0.35 cosine floor in Ship 8 (Issue G: below that, matches
+  are tangential and Claude dutifully cites them) but diagnose:606 and
+  decompose:164 never did — tangential techniques were feeding the
+  grounded-diagnosis and decomposition prompts. Now all three share
+  `kg.query.DEFAULT_MIN_PROMPT_SIMILARITY = 0.35` (source-pinned by
+  test so a regression reopening Issue G fails loudly).
+- **F2 — hallucinated citations verified too late**: diagnose's
+  proposed_edits paper_refs were copied through unverified; a
+  fabricated arxiv_id hard-failed EDIT's KG gate later, burning the
+  retry/iteration on a reference the model invented. Diagnose now
+  verifies every ref against the KG right after the grounded parse, DROPS
+  unknown ids (the edit degrades to novel/uncited) and emits an
+  observable `kg_citation_dropped` event. Edit's hard gate remains as
+  the second line.
+- **F3 — arbitrary failure-mode grounding (the worst one)**:
+  `_resolve_failure_modes`' fallback accepted the FIRST node matching
+  ANY single token — with 325 FailureModes, "reward_saturation" could
+  silently resolve to whatever node mentioned "reward" first in
+  arbitrary store order, mis-grounding query_techniques' edge
+  traversal entirely. Now: exact slug → full-phrase → scored token
+  fallback REQUIRING a token majority, ranked (phrase > token count >
+  tightest name) with deterministic alphabetical tie-break.
+- **Extraction fidelity spot-checked** on the Ship-30 papers: Siekmann
+  → von_mises_phase_indicators / clock_input_conditioning /
+  periodic_reward_composition; Eureka → evolutionary_reward_search /
+  reward_reflection / environment_as_context; Skalse →
+  hackability_definition. The extractor reads real PDF text and the
+  nodes reflect the papers' actual contributions.
+- **Campaign frozen**: `docs/campaign_plan.md` — full matrix
+  (4 benchmarks × 7 conditions × 5 paired seeds, iterations=4,
+  steps_per_iter=600, eureka 3×3 with the K=16×5 paper-scale delta
+  noted), measured-numbers budget (~86 pod-hours ≈ $60 GPU on 3×5090
+  ≈ 1.2 days wall + $50–90 LLM), shard commands + merge via `sculpt
+  eval report`, and the go/no-go checklist (provision ×3 → doctor ×3 →
+  ~$3 mission+eureka cartpole smoke → parity check → launch).
+- **Verified**: 8 new tests (tests/test_grounding_hardening.py):
+  resolver slug/phrase/majority/determinism, floor constant parity
+  with edit + source-pin of both call sites + functional floor filter,
+  and an end-to-end diagnose run (stub client, real KG store, real
+  config→stub adapter) asserting the fabricated ref is dropped, the
+  real one kept, and the event emitted. Gates: sculptor 541 passed/1
+  skipped, backend 323 passed, frontend untouched. Gotchas: KG schema
+  nodes require explicit `id` (use make_*_id); diagnose requires a
+  real config path (needs adapter.reward_contract()); ProposedEdit
+  operation is a Literal enum.
+
+### 2026-06-11 — Ship 30: KG research & expansion (pre-campaign)
+
+The mission condition's advantage rests on the KG — it goes into the
+campaign curated, not stale. Shared DB at
+`~/.local/share/sculptor/kg/graph.db` (backup taken first:
+`graph.db.pre-ship30.bak`).
+
+- **Cleaned**: 7 junk papers deleted (STEM-AP disparities, fairness
+  repr., content moderation, Persian text correction, educational
+  feedback, image compositing, wireless-channel math — artifacts of
+  old research runs that polluted semantic search) + 254 orphaned
+  satellite nodes (93 Techniques, 60 FailureModes, 93 RewardComponents,
+  8 Environments with zero edges) and their embeddings swept via
+  direct SQL (store has delete_node but no orphan sweep — candidate
+  future `kg gc` command).
+- **Researched**: `sculptor.kg.research.research_topic` over six
+  campaign-aligned topics (periodic/rhythmic reward, LLM reward
+  design, reward hacking, expressive humanoid motion, kicking/ball
+  skills, curriculum) deduped against the KG + arXiv-verified; results
+  human-vetted for APPLICABILITY (8 off-target hits dropped, e.g.
+  WildfireGPT, LLM-tampering alignment theory). Merged with a curated
+  gap list (IDs verified via web).
+- **Added 21 papers** (full list with rationales in the COMMITTED
+  `RewardSculptor/kg_seeds_campaign.yml` — that file is the R1
+  provenance of the campaign-era KG delta): the periodic-reward-
+  composition line (Siekmann 2011.01387 — the floss benchmark's home
+  turf; Cassie iterative design; versatile bipedal), the LLM-reward
+  line (Eureka, L2R, Text2Reward, DrEureka, Kwon LM-rewards, RL-VLM-F,
+  Code-as-Reward), reward hacking (Skalse definitional, Pan
+  misspecification, correlated proxies), expressive humanoid (H2O,
+  SuperPADL, HumanPlus), kicking/ball (DeepMind humanoid football,
+  DribbleBot), quadruped gait (Miki wild-ANYmal reward suite),
+  curriculum (Narvekar survey, ETG). All 21 ingested (metadata + PDFs)
+  and LLM-extracted with ZERO errors.
+- **Final state**: 94 papers (80 − 7 + 21), 1452 nodes (493 Techniques,
+  325 FailureModes, 283 RewardComponents, 257 Environments), 1476
+  edges, 493 technique embeddings (backfilled lazily on first
+  `query_semantic` — note: `kg stats` embedding counts lag until a
+  query runs), `heal-stubs` clean.
+- **Verified by the gate that matters** — diagnose-style
+  `query_semantic` probes return the NEW literature with real cosine
+  scores: "policy exploits the reward metric" → Eureka
+  reward_reflection (0.59) + Kwon zero-shot reward; "oscillates hips
+  rhythmically, no consistent period" → CPG + periodic keypoint /
+  gait-cycle techniques; "kick with one leg while balancing" →
+  symmetrical-gait + Raibert footswing terms. (Gotcha for future
+  probes: `query_techniques` takes a failure-mode LIST for graph-edge
+  ranking — free-text goes to `query_semantic`.)
+- **Cost**: ~6 research calls + 21 extraction calls ≈ $8–12 LLM, no
+  GPU. Campaign-ready.
+
+### 2026-06-11 — Ship 29: E4 mission-mode (curriculum) condition — the condition matrix is complete
+
+- **What**: harness mode "mission" + conditions `mission` (the FULL
+  SYSTEM: KG-grounded curriculum decomposition → per-stage sculpt
+  loops) and `mission_no_kg` (identical flow, KG stripped from
+  decompose/diagnose/edit). `_run_mission_mode`: decompose ONCE per
+  job (the curriculum is part of the seed's experiment state — resume
+  reuses the existing `.missions/` decomposition, test-pinned),
+  `mission_run` with the campaign budget (`iterations_override`,
+  `steps_per_iter`, seed) and `early_stop_on_criterion=True` (adaptive
+  stage exit is part of the system under test). Cross-stage spec
+  series (`_mission_spec_series`): stages in curriculum order, JOB-
+  GLOBAL iteration index (the comparison axis is total LLM-loop
+  iterations spent) with (stage, stage_iter) provenance on every
+  entry; final_rule stays `last_iteration` (the mission's output
+  policy). GPU accounting (`_mission_iterations_used`): sum of
+  per-stage `iterations_used` from the PERSISTED mission.json — saved
+  after every stage transition, so the bill survives crashes.
+  Condition docstring now carries the explicit E4 mapping: full
+  system → mission; no-KG → mission_no_kg; no-curriculum → full
+  (single-stage loop, renamed in notes); no-diagnose →
+  seed_only_matched; E3 baselines → plain_ppo(+matched), eureka.
+- **Verified**: 2 new tests (mission end-to-end with faked
+  decompose/mission_run: kwargs plumbing incl. kg None for no_kg,
+  cross-stage series ordering + global index, final from last stage,
+  bill from mission.json (3 used iters × steps), mission summary in
+  result; resume-skips-decompose with the result.json removed but
+  .missions kept). Gotchas hit: `_derive_mission_slug` lives in
+  sculptor.cli (not decompose); `Mission` requires
+  `decomposition_model`. Sculptor gate 533 passed/1 skipped;
+  backend/frontend untouched.
+- **Campaign readiness**: all E4 conditions implemented. Remaining
+  before the spend: pod up + provision, ~$2 Eureka+mission live smoke
+  on cartpole, then the 4-benchmark × conditions × 5-seed campaign
+  (shardable across pods — see GPU note in the session log: fastest
+  single GPU for this FP32-bound sim is the RTX PRO 6000 Blackwell
+  (~125 TFLOPS, 96 GB, ~$2/hr on RunPod); fastest WALL-CLOCK is
+  sharding the independent jobs across 2-3× 5090 pods, which also
+  costs less per unit throughput).
+
+### 2026-06-11 — Ship 28: E3 Eureka-style baseline (+ the Isaac Sim decision)
+
+**Isaac Sim: deliberately deferred.** The central claim is about
+reward-engineering methodology, not simulator breadth; mjlab already
+implements the Isaac-Lab-style manager API on MuJoCo-Warp; an Omniverse
+integration is weeks of runtime/licensing work adding zero statistical
+power to E4. Revisit AFTER the central result, via the existing
+IsaacLabAdapter stub. Other RL developments: Eureka is the one that
+matters for credibility (this ship); DrEureka-style DR and evolutionary
+reward search become cheap future conditions because the harness treats
+conditions as plugins.
+
+- **What**: NEW `sculptor/eval/eureka.py` + `prompts/eureka_baseline.md`
+  + harness condition `eureka`. Faithful-enough Ma et al. 2023: per
+  generation sample K reward candidates from Claude at temperature 1.0,
+  static-gate (`compute_reward_batched` presence — the probe only
+  exercises the scalar path) + zero-tensor probe with ONE resample then
+  honest zero, train each on the SAME job seed, fitness = spec metric,
+  per-gen best mirrored into `runs/iter_<g>` for the standard series
+  machinery, best-ACROSS-generations reflection (prior best source +
+  spec components + per-component training SERIES in the Appendix-F
+  shape the sculptor's own edit feedback uses). Full audit trail in
+  `eureka_log.json` (per-attempt records incl. api/static/probe errors;
+  sources stay on disk, never in the log), flushed after EVERY
+  generation. SEVEN documented deltas in the module docstring (LLM held
+  constant; spec metric as Eureka's task fitness F — selection access
+  the sculptor conditions never get, conservative toward our
+  hypothesis; state schema instead of env source; sampling protocol;
+  validation rigor; matched deliberation budget — adaptive thinking +
+  edit's 16K max_tokens, a strengthening deviation; reflection-target
+  protocol).
+- **Methodology audit applied (review agent vs the actual paper)**:
+  - C1 (CRITICAL, would have strawmanned the baseline): Eureka's
+    DEFINED output is the best reward across generations (Algorithm 1)
+    — the harness scored last-generation. Eureka jobs now score
+    `final = best` with an explicit `final_rule:
+    best_across_generations` field (sculpt conditions stay
+    `last_iteration` — they cannot select on the spec). Regression
+    test: regressing gen 1 must not drag the headline.
+  - H1: reflection carried only component MEANS (saturation
+    undetectable; the sculptor's edit gets the series) — now the
+    downsampled series + max/mean/min.
+  - H2: an LLM API exception mid-job crashed the job, never wrote the
+    log, and zeroed `total_rl_iterations` for generations that HAD
+    trained. API failures are now invalid candidates with recorded
+    errors; the log flushes per generation; the harness recovers the
+    GPU bill from the log (or trained-checkpoint dirs) when a job
+    still dies.
+  - H3: inference-config asymmetry (pipeline uses adaptive thinking,
+    baseline didn't) — matched + documented.
+  - M3: a generation whose candidates all fail leaves a series hole;
+    iterations-to-threshold now uses the REAL iter index.
+  - M5 static gate; L1 per-attempt audit records; L2 fitness-only
+    reflection when champion artifacts are missing; L3 fence parsing
+    (case-insensitive tag, multi-block module join); L4 config
+    validation; L5 stale-train-dir cleanup; L7/L8 doc precision.
+- **Verified**: 15 tests (tests/test_eureka_baseline.py): selection +
+  reflection content (series shape, temperature pin, schema payload),
+  best-overall survives weaker generations, invalid→resample→zero with
+  per-attempt records, api-failure resilience, train-crash accounting,
+  static batched-fn gate, no-source-in-log pin, harness integration
+  (final_rule, GPU bill from trained count, crash recovery of the
+  bill, all-invalid-generation indexing). Sculptor gate 531 passed/1
+  skipped; backend/frontend untouched.
+- **Not yet run live** (pod stopped): the Eureka condition's smoke is
+  part of campaign prep — budget note: defaults (K=4, generations=2)
+  train 8 runs/job vs sculpt's 2; the paper used K=16, N=5 (state as a
+  scale delta in any writeup).
+- **E4 remaining before the campaign**: mission-mode (curriculum)
+  condition; optional human-reward baseline awaits Sam's authored
+  rewards.
+
+### 2026-06-10/11 — Ship 27: E2 eval harness (`sculpt eval`) — proving campaign PASSED on the pod
+
+The statistical machinery for every Phase-3 claim, proven live.
+
+- **What**:
+  - `sculptor/eval/stats.py`: IQM (middle-50% trimmed mean; n<4 →
+    plain mean) + stratified bootstrap CIs over SEEDS (the replication
+    unit), deterministic rng. rliable-style.
+  - `sculptor/eval/harness.py`: `EvalCondition` (full / no_kg
+    sculpt-mode; plain_ppo / seed_only train_only-mode + `*_matched`
+    equal-GPU variants), `CampaignConfig`, scaffolded per-job
+    mini-projects (config.toml + byte-identical shared v0 starter —
+    nobody gets a better seed reward), sequential `run_campaign` with
+    `[SCULPT-EVENT]` observability, per-job `result.json` as the
+    RESUME KEY (crash/pod-restart → rerun skips finished jobs; sculpt
+    jobs resume per-iter), failures recorded as HONEST ZEROS with the
+    error (dropping failures inflates aggregates), spec metric
+    computed on EVERY iteration's rollout (iterations-to-threshold),
+    capture-parity audit across conditions (missing capture info is
+    its own warning bucket), `campaign_report.json` + self-contained
+    `report.html` (SVG bars + CI whiskers + paired-diff table) +
+    R1 run-context pinned into the report.
+  - **Compute-fairness finding**: each sculpt-loop iter trains FROM
+    SCRATCH, so a `full` job consumes iterations× the GPU of
+    plain_ppo. Every result records `total_rl_iterations`; `*_matched`
+    conditions scale the baseline's single run to the sculpt jobs'
+    total budget; the report instructs reading comparisons against
+    the budget.
+  - **Paired differences**: `aggregates.pairwise` — per-seed condition
+    diffs (seeds are paired by design) with their own bootstrap CI;
+    comparing two independent CIs for overlap is weaker and
+    over-conservative.
+  - CLI: `sculpt eval run` (repeatable -b/-c, --seeds N → 1000+17i,
+    --iterations/--steps-per-iter/--spec-threshold), `sculpt eval
+    report` (re-aggregate without running), `sculpt eval list`.
+    Remote dispatch needs NO harness plumbing — exporting
+    SCULPTOR_REMOTE_* routes every train through the Ship-23 executor.
+  - Ops gotcha hit while launching: `setsid nohup` inside a transient
+    `wsl bash` heredoc DIES — Windows tears the WSL VM down when the
+    last client exits. Long unattended runs must hold a Windows-side
+    client: `Start-Process -WindowStyle Hidden wsl 'bash -c "…"'`.
+- **Proving gate (the plan's E2 criterion) PASSED**: cartpole_balance ×
+  3 paired seeds × {plain_ppo, full} ran UNATTENDED on the RunPod 5090
+  (training remote, rollouts + LLM local): 6/6 jobs, zero errors, zero
+  parity warnings, ~35 min wall, ~$0.45 pod + ~$1.5 LLM. plain_ppo
+  ≈166 s/job; full (2 LLM iters: remote train → rollout → KG diagnose
+  → edit, ×2) ≈527 s/job. Both conditions saturate the sanity task
+  (spec 1.000, hit threshold at iter 1 — expected; cartpole proves the
+  MACHINERY, not separation). Report verified: IQM/CI per condition,
+  pairwise diff table (full − plain_ppo = +0.000 [0,0] n=3),
+  `run_context.code_git` pinned the exact commit + dirty flag.
+- **Verified**: 13 tests (tests/test_eval_harness.py): stats
+  (IQM trim, deterministic CI, n=1 degenerate), config validation,
+  train_only end-to-end via a dotted-path stub adapter through the
+  REAL load_adapter (v0-vs-intrinsic reward routing asserted),
+  resume-no-retrain, honest-zero failures, sculpt-mode kwarg plumbing
+  (no_kg/seed/iterations/resume), compute-matched step scaling,
+  pairwise paired diffs, parity warnings (real-vs-real and
+  missing-vs-real). Sculptor gate 516 passed/1 skipped; backend green;
+  frontend untouched. Live CLI re-aggregation exercised on the real
+  campaign dir.
+- **Next (E3/E4 readiness)**: conditions full/no_kg/plain_ppo(+matched)/
+  seed_only(+matched) are implemented; the remaining E4 condition
+  (no_curriculum — single-stage direct goal vs mission decomposition)
+  needs mission-mode jobs in the harness; Eureka-style E3 baseline is
+  its own ship. The G1/Go1 benchmarks are where separation is
+  expected — cartpole was chosen to saturate.
+
+### 2026-06-10 — Ship 26: E1 benchmark suite + hand-authored spec metrics (Phase 3 begins)
+
+The evaluation ground truth: four benchmark tasks, each pairing an NL
+goal (what the pipeline sees) with an OBJECTIVE spec metric computed
+from rollout artifacts — fully independent of the LLM criteria, which
+must never grade themselves.
+
+- **What**: NEW `sculptor/eval/` package.
+  - `benchmarks.py`: cartpole_balance (sanity; high-seed-count task),
+    g1_floss + g1_kick (Sam has real recordings → calibration data),
+    go1_trot (gait, NOT spin — the rollout never persists yaw;
+    projected gravity is yaw-invariant). Each: task_id, behavior_goal,
+    spec_metric, adapter_config, notes.
+  - `spec_metrics.py`: uprightness (unit-normalized gravity, tri-state-
+    safe), periodicity (per-env FFT, INCOHERENT power averaging,
+    robust p2.5–97.5 amplitude gate, top-quartile movers), burstiness
+    (signed boxcar → |·|, p95+p99, optional joint subset + upright-
+    window validity mask), horizontal_speed (teleport-aware path/net
+    with per-segment nets), opposition_score (hip↔arm anti-phase via
+    cross-spectral phase at the dominant bin), and four composite
+    specs returning `spec_score ∈ [0,1]` + components + capture echo.
+  - `_mjlab_runner.py`: behavior.json now persists step_dt /
+    max_episode_steps / rollout_num_envs (spec bands are in
+    cycles/FRAME — the E2 harness will ASSERT capture parity across
+    conditions instead of silently comparing incomparables);
+    mjcf_limits.json joint_names now actually populate — entity-first
+    (`env.scene["robot"].joint_names`, ordering matches the persisted
+    buffers) with mjModel fallback. All real pre-Ship-26 recordings
+    have EMPTY name lists (the mjModel attribute chain never matched),
+    so specs degrade observably (structure_checked / leg_subset flags)
+    on old data and run strict on campaign data.
+- **The methodology audit mattered** (review agent, findings verified
+  empirically before fixing):
+  - C1 (CRITICAL): env-mean-BEFORE-FFT cancels out-of-phase
+    oscillation — perfect synthetic flossing scored 0.22 instead of
+    0.99 (envs re-randomize phases on reset; coherent averaging
+    attenuates ~1/√E and lets correlated transients win the mover
+    slots). Fixed with per-env spectra + incoherent power averaging;
+    regression test with random per-env phases.
+  - H1: kick took max over ALL joints — arm-flailing scored as
+    kicking. Leg-subset via joint names (hip/knee/ankle tokens).
+  - H2: fall-cycling scored ~0.5 (falls are sustained transients and
+    uprightness only averages). Bursts now count only when launched
+    from a fully-upright smoothing window.
+  - H3: belly-crawl passed trot (uprightness checks orientation, not
+    altitude). Root-height gate 0.18→0.28 m.
+  - H4: any common-frequency oscillation scored as floss. Hip↔arm
+    anti-phase structure gate when names exist (in-phase or
+    single-joint vibrator → ~0).
+  - M1–M4, L1–L4 all applied (capture persistence, teleport masking,
+    p99 burst path, persisted episode cap for cartpole, gravity
+    normalization, robust amplitude, dominant-period reporting).
+- **Real-data validation** (the E1 proving gate, fallback mode):
+  kick spec on g1-kick-v2: best iters 0.68/0.30, fallen iter 0.0,
+  weak mid-training 0.09–0.14 vs STANDING robots 0.14–0.15 (clear
+  separation at the strong end; standing/weak overlap exists only in
+  name-less fallback mode — campaign rollouts get the strict
+  leg-subset path). Floss spec on standing stages: 0.029–0.035
+  (correct null). No successful floss recording exists yet — the
+  high end is covered by the C1 regression test until the campaign
+  produces real positives. Tremor finding: standing rsl_rl policies
+  read ~6 rad/frame raw |joint_vel|; the signed-smoothing design is
+  calibrated against that (test-pinned).
+- **Verified**: 28 tests (tests/test_spec_metrics.py) incl. 7
+  adversarial regressions (random-phase, tremor, arm-flail,
+  fall-cycle, vibrator, belly-crawl, teleport). Gates: sculptor 503
+  passed/1 skipped, backend 323 passed, frontend untouched.
+- **Known limits for E2/E3 design**: go1_trot is near-native to the
+  velocity env → expect ceiling effects, use as the easy anchor not
+  the headline; kick ratio-gate constants calibrated on n=2 projects
+  one robot; capture parity must be asserted by the harness (the
+  persisted settings make that possible now).
+
+### 2026-06-10 — Ship 25b: H2 decomposition-quality telemetry (mission → reports tab)
+
+Ship 22s changed decomposition behavior (adaptive stage counts, no
+stand-stage) with no measurement. Now every mission measures itself.
+
+- **What**:
+  - `sculpt.py`: NEW `_write_mission_telemetry(...)` called at
+    mission end, BEFORE the terminal `mission_completed` /
+    `mission_halted_terminal` event (existing tests pin that as
+    stream-end). Computes: n_stages_at_start vs n_stages_final (splice
+    growth), stages_executed/succeeded + stage_success_rate,
+    redecompositions (counter incremented at the Ship-17 splice
+    branch), iterations_total, completed/halted_reason, per_stage
+    breakdown. Writes `<mission_dir>/telemetry.json` and aggregates
+    per-project at `reports/mission_quality.json` (one record per
+    mission slug, REPLACED on re-run; aggregate only under the real
+    `<project>/.missions/<slug>` layout — tests drive bare tmp dirs;
+    corrupt aggregate → fresh, never fatal; emits
+    `mission_telemetry_written` / `mission_telemetry_failed`).
+    Deliberately NOT merged into metric_history.json (plan's original
+    sketch): its `{primary_metric, history:[floats]}` shape feeds
+    sculpt's own delta logic — additive separate file instead.
+  - Backend: GET `/projects/{slug}/reports/mission-quality`
+    (routes/reports.py) — returns the aggregate, `{schema:1,
+    missions:[]}` when absent or corrupt (never 500), 404 unknown slug.
+  - Frontend: ReportsTab "Mission quality" card above the report —
+    per-mission row: slug (goal on hover), stages succeeded/executed
+    (+%), planned-stage growth (3→4 when splices added), redecompose
+    count, total iters, completed/halted badge. Hidden when no
+    missions.
+- **Verified**: sculptor 5 new tests (writer shape, .missions-layout
+  aggregate + replace-on-rerun, corrupt-aggregate recovery,
+  never-raises, zero-stage edge) + the existing mission_run suite
+  (which now exercises the call on every flow); backend 4 new route
+  tests; LIVE UI check via preview server against the real backend —
+  card rendered both fixture missions correctly (75% + criterion_not_met
+  amber; 100% + completed green), zero console errors, fixture cleaned
+  from the 360s project afterwards. Gates: sculptor 475 passed/1
+  skipped, backend 323 passed, frontend build clean.
+
+### 2026-06-10 — Ship 25a: H1 reward↔criterion contract hardening (iter-0 key validation + LLM reconcile)
+
+The 22q/22r silent-failure vector, closed at the source: a stage
+criterion hard-referencing `components['<name>']` keys the reward never
+produces used to burn the stage's ENTIRE iteration budget before
+`criterion_not_met` fired at eval time. Now caught at iter 0.
+
+- **What**:
+  - `mission_runtime.py`: NEW `extract_components_keys(criterion)` —
+    AST walk for HARD `components['x']` subscripts only (soft
+    `components.get('x', d)` is the documented can't-KeyError idiom and
+    is deliberately exempt; unparseable → empty set, syntax is the
+    validator's job). Drive-by L-6 fix: `_evaluate_success_criterion`
+    now strips before parsing — a Claude-emitted criterion with leading
+    whitespace passed the (stripping) decompose gate then died fatally
+    at runtime with "unexpected indent".
+  - `decompose.py`: NEW `reconcile_criterion(stage, missing_keys,
+    available_components, client=None)` → `(new_criterion, rationale)`.
+    Prompt `prompts/reconcile_criterion.md` gets stage goal, current
+    criterion, missing + available component keys, behavior keys,
+    trajectory keys, and the reward_seed_prompt. Rewrites pass FOUR
+    gates: non-empty, ≠ original, the decompose-time validator
+    (`_validate_success_criterion` on a dataclasses.replace COPY), and
+    the RUNTIME unsafe-AST gate run statically (namespace =
+    BARE_IDENTIFIERS ∪ {behavior, components, trajectory, info} —
+    verified equal to `_build_criterion_namespace`'s real key set), plus
+    no still-missing hard keys. ONE validation-feedback retry: a failed
+    rewrite re-prompts with `prior_attempt_error` (mirrors
+    redecompose). Prompt aligned with BOTH gates (audit H-1: it had
+    advertised `.item()`, which the mission gate's torch-idiom list
+    forbids — a "valid" rewrite would have failed; now excluded).
+  - `sculpt.py`: NEW `_reconcile_stage_criterion_if_needed(...)` wired
+    into `_run_one_stage` right after `stage_v1_materialized` (fresh
+    stages only — incl. redecomposed sub-stages, which always re-enter
+    this branch under new names). Flow: extract keys → none ⇒ silent →
+    `adapter.probe_component(v1)` (probe raising or failing ⇒
+    `criterion_keys_unverified`, never a reconcile error) → available =
+    probe components ∪ env intrinsic `reward_term__*` names observed in
+    the PARENT stage's latest rollout npz (audit M-3: eval-time merges
+    env terms into `components`, so a redecomposed criterion
+    referencing one is legitimate and must not be rewritten away) →
+    match ⇒ `criterion_keys_validated` / mismatch ⇒
+    `criterion_keys_mismatch {missing, available}` → no
+    ANTHROPIC_API_KEY ⇒ `criterion_reconcile_skipped` (mismatch event
+    already says what to fix by hand) → reconcile → mutate
+    `stage.success_criterion` + `_atomic_save_mission` (save failure
+    REVERTS the in-memory mutation — audit M-1: memory≠disk would make
+    this run evaluate a criterion a resume never sees) ⇒
+    `criterion_reconciled {old, new, rationale}`. ANY failure ⇒
+    `criterion_reconcile_failed` — the helper NEVER raises (it sits
+    inside the v1-materialization try; the runtime
+    CriterionMissingKeyError → criterion_not_met path still backstops
+    survivors).
+- **Verified**: 21 tests (tests/test_criterion_reconcile.py): extraction
+  (hard vs .get vs dynamic vs other namespaces), reconcile gates
+  (identical / still-missing / lambda / `.item()` all rejected with the
+  two-attempt retry asserted, retry-recovers path, soft-.get rewrite
+  survives, payload grounding incl. trajectory keys), wiring (silent
+  no-refs, validated, mismatch+skip without key, reconcile+persist with
+  rationale, exploding reconcile recoverable, probe-raise → unverified,
+  save-failure reverts mutation, parent env-term union, whitespace
+  eval). Existing test_mission_run/test_decompose unaffected (their
+  stub adapter has no probe_component → unverified early-return).
+  Sculptor gate 470 passed/1 skipped; backend green; frontend
+  untouched. Review-agent audit applied in full (H-1, M-1, M-2 retry +
+  trajectory keys, M-3, L-1..L-4, L-6).
+
+### 2026-06-10 — Ship 24: R1 reproducibility foundation (run_context.json + mission provenance)
+
+First Phase-2 ship of the approved research-grade plan. Every result can
+now be tied to exactly what produced it — prerequisite for every
+statistical claim in Phase 3.
+
+- **What**:
+  - NEW `RewardSculptor/sculptor/run_context.py`:
+    `capture_run_context()` collects code git SHA/branch/dirty (repo
+    found from the sculptor package itself, guarded by
+    `git ls-files --error-unmatch` so a pip-install inside an adopter's
+    repo degrades to `available:false` instead of reporting the WRONG
+    sha), project git, python/platform, versions of the tracked package
+    stack (incl. `reward-sculptor` itself), sha256 of every prompt .md
+    (honors `SCULPTOR_PROMPTS_DIR` — a tuned prompt set is a different
+    experiment), LLM model ids per pipeline module (all
+    `claude-opus-4-7`, temperature `sdk_default` — never set anywhere),
+    the seed plan (base_seed; train = base+iter; rollout currently
+    unseeded — runner has no `--seed` on rollout, deferred to E2 where
+    deterministic eval is consumed; decompose = LLM sampling only),
+    behavior-affecting env (NAMES of SCULPTOR_* vars + remote host,
+    never values/keys — test-pinned), argv, and the config as BOTH raw
+    sha256 and the effective post-CLI-override dict. `dirty` is
+    tri-state (None when `git status` itself failed — an unknown state
+    is never recorded as "clean").
+  - `sculpt_run` (sculpt.py): `run_started` gains `base_seed`; after it,
+    writes `reports/run_context.json` + emits `run_context_captured`
+    {path, code_sha, code_dirty, config_sha256, base_seed} — or
+    `run_context_capture_failed`; capture can never kill a run (imports
+    inside try). DISTINCT from `reports/provenance.json` (citation
+    provenance, untouched, shape-asserted in tests).
+  - `mission_run` (sculpt.py): mission-level `provenance.json` in the
+    mission dir — one capture context per resume (code may differ
+    between resumes; `contexts` appends, stage records survive), plus
+    one record per executed stage {name, idx, status, iterations_used,
+    criterion_satisfied, last_iter_metric, failure_reason, final paths}
+    appended right after `_atomic_save_mission` (under the mission
+    FileLock — no concurrent writer). Silent record failures warn ONCE
+    per mission via `run_context_capture_failed`.
+- **Verified**: 16 new tests (tests/test_run_context.py): capture shape,
+  determinism modulo `VOLATILE_KEYS` (captured_at only), config sha =
+  file sha, prompt-hash stability + SCULPTOR_PROMPTS_DIR override,
+  model-id specs, NO-secrets pin (key paths + API keys absent from the
+  serialized blob), atomic write (no .tmp leftovers, 0644), TOML
+  datetime via default=str, non-repo degradation, mission provenance
+  init/resume/append/corrupt-recovery, and a dry-run sculpt_run
+  integration asserting reports/run_context.json + both events with the
+  CLI seed threaded through. Review-agent audit applied (M1 wrong-repo
+  guard + dist version, M2 tri-state dirty, L1 observable stage-record
+  failures, L2 0644, L5 the reviewer's own suggested assert was wrong —
+  dry-run DOES write citation provenance; replaced with a shape-
+  separation assert). Sculptor gate 449 passed/1 skipped; backend
+  re-run green; frontend untouched.
+- **Notes for Phase 3**: per-stage seeds land in each stage's own
+  reports/run_context.json (stages run sculpt_run); rollout seeding is
+  an E2 work item (runner `--seed` exists only for train).
+
+### 2026-06-10 — Ship 23f: full LLM pipeline through the pod + the aux-dirs fix it forced
+
+Ran the complete sculpt loop (the thing missions are made of) against
+the live 5090: `sculpt run "balance the pole upright and keep the cart
+centered"` on a throwaway clone of the 360s Cartpole project with a
+`[remote]` table (this also exercised the load_adapter TOML plumb — the
+third and last config path after the dict and env-var ones).
+
+- **Result**: `run_completed`, 2 iterations. Per iter: REMOTE train
+  (126 s / 151 s job, exit 0, artifacts synced ~4.5 s) → LOCAL rollout +
+  video (`rollout_progress` events streaming) → realism audit → KG
+  diagnose (found sparse_reward + reward_saturation) → edit. Reward
+  chain v0 → v1 → v2 on disk; iter_1 trained the LLM-sculpted v1 ON THE
+  POD and its `reward_trajectory.json` came back with the sculpted
+  components (`alive_bonus`, `upright_bonus`) — SculptorRewardTerm
+  executed remotely end to end.
+- **Bug it caught (fixed + tested)**: sculpt passes
+  `rewards/current.py`, which is a SHIM that imports its sibling
+  `v<N>.py` at import time (`_HERE / 'v0.py'`). The executor uploaded
+  only the single input file → remote `FileNotFoundError: .../mirror/
+  .../rewards/v0.py` on the very first train. Fix: `RunnerJob.aux_dirs`
+  — directories mirrored wholesale (rsync, `--exclude __pycache__`, no
+  argv rewrite); the mjlab train seam passes the reward module's parent
+  dir. New tests: executor uploads siblings + excludes __pycache__
+  (test_aux_dirs_uploaded_wholesale); dispatch test asserts
+  `job.aux_dirs == (rewards_parent,)`. The single-file smoke runs
+  (Ship 23e) couldn't catch this — they passed `reward_module_path=None`.
+- **Files**: `sculptor/adapters/_remote.py` (aux_dirs field + upload
+  phase + mkdir set), `sculptor/adapters/mjlab.py` (train seam passes
+  the parent dir), both remote test files.
+- **Verified**: sculptor 434 passed/1 skipped, backend re-run green,
+  frontend untouched since its green build. Phase 1 (fast-iteration
+  compute) is now DONE in full — every checklist item of docs/remote.md
+  §smoke has run against real hardware. Next per the approved plan:
+  Phase 2 (R1 reproducibility foundation, H1 reward↔criterion contract
+  hardening, H2 decomposition telemetry).
+
+### 2026-06-10 — Ship 23e: live RunPod 5090 smoke — remote dispatch proven end-to-end, 3.3× throughput
+
+Rented a real RunPod Community RTX 5090 (32 GiB, driver 580.126.20,
+~$0.69/hr, network volume at /workspace) and took the Ship-23 stack
+through the full checklist. Everything that follows was verified
+against the live pod, not mocks.
+
+- **Results (G1 humanoid, intrinsic reward, 50 iters, seed-pinned)**:
+  local 5070 Laptop autocapped to 2048 envs → 1.08–1.15 s/iter,
+  ~45k steps/s, 71.5 s wall; remote 5090 at the full 4096 envs →
+  0.65 s/iter, ~150k steps/s, 117 s wall (62 s train + ~48 s process
+  startup + ~13 s upload/sync). **3.3× sample throughput**; a real
+  1500-iter stage ≈ 17 min remote vs ≈ 28 min local at 2× batch.
+  Cartpole sanity: 57k steps/s. Identical checkpoint sizes local/remote.
+- **Lifecycle proven live**: full event stream reached stdout in order
+  (dispatch_started → upload_completed 7.8 s → job_launched with pgid →
+  live rsl_rl output + iter_progress re-emitted → job_finished →
+  artifacts_synced ~6 s; checkpoint.pt promoted last). Warm-start:
+  `warm_start_loaded` from the MIRROR path — iter N's checkpoint
+  re-upload is a zero-byte no-op as designed. `kill -9` of the local
+  driver mid-train → pod job kept training (survives disconnect by
+  construction) → identical re-dispatch emitted `remote_job_reattached`,
+  did NOT double-launch or re-upload, completed + synced. UI-style
+  cancel (SIGTERM) → pod GPU 0 procs / pgid dead in <5 s. Live backend:
+  GET /system/remote pre-filled; POST /system/remote/doctor → all 8
+  checks green through the API.
+- **Bugs found ONLY by the live pod (all fixed + unit-tested)**:
+  1. `_remote.py` rsync `-az` → `-rltz`: archive mode implies chown,
+     which RunPod's mfs volume rejects even for root (exit 23, every
+     sync failed).
+  2. **SIGTERM orphan gap (the big one)**: the UI cancels with a bare
+     SIGTERM, which terminates CPython WITHOUT unwinding — the
+     except-BaseException kill never ran and the pod job kept burning
+     after a cancel (caught red-handed: pgid alive, GPU busy).
+     `execute()` now installs a SIGTERM→SystemExit handler for the
+     dispatch duration (main thread only, restored in finally), and
+     `_kill_remote`'s KILL escalation is detached pod-side
+     (`setsid bash -c 'sleep 2; kill -KILL ...' &`) so the backend's
+     5 s TERM→KILL grace can't cut it off mid-escalation. New tests:
+     SIGTERM-mid-wait kills remote + restores handler.
+  3. Network-fs venv import tax: torch import alone 26–39 s per runner
+     process from /workspace (mfs doesn't page-cache) → ~170 s overhead
+     per dispatch. Venv moved to pod-LOCAL disk (~/.sculptor_venv),
+     wheel/python caches stay on the volume → overhead 48 s.
+  4. Unpinned transitive GPU stack: torch>=2.11 resolved 2.12.0+cu130;
+     warp-lang 1.14 broke mjlab 1.3.0 (`wp.context` gone); newer
+     mujoco-warp used a `tile_cholesky(fill_mode=)` kwarg warp 1.12.1
+     lacks; scipy (mjlab terrain import) and wandb weren't installed at
+     all. provision_remote.sh now pins the ENTIRE stack (torch, mjlab,
+     warp-lang, mujoco, mujoco-warp, rsl-rl-lib, numpy, scipy, wandb,
+     imageio×2) to locally-detected versions, plus the local PYTHON
+     patch version via uv-managed CPython (system 3.13.8 broke torch
+     2.11 imports — CPython inspect regression; local 3.13.13 is fine).
+  5. Pod images ship a stale system uv (0.9.0, can't self-update,
+     doesn't know current CPython releases) — script now always
+     installs its own uv to ~/.local/bin.
+- **Files**: `sculptor/adapters/_remote.py` (rsync flags, SIGTERM
+  handler, detached kill escalation), `scripts/provision_remote.sh`
+  (full-stack pinning, local-disk venv + volume caches, own uv,
+  python-version pinning), `docs/remote.md` (venv-placement rationale,
+  measured-performance table, restart flow),
+  `backend/services/remote_settings.py` + test (default remote_python →
+  `~/.sculptor_venv/bin/python`), `tests/test_remote_executor.py`
+  (SIGTERM test). Pod settings pre-filled at
+  `<projects_root>/_settings/remote.json` (enabled=false — flip the
+  Settings-card toggle when a pod is up).
+- **Restart flow for Sam** (pod IP/port change every restart): web
+  terminal one-liner is no longer needed once the account-level SSH key
+  is saved (Settings → SSH Public Keys on runpod.io); then per restart:
+  re-run `./scripts/provision_remote.sh root@<ip> -p <port> -i
+  ~/.ssh/id_ed25519 -w /workspace/sculptor_remote` (~1–2 min, caches
+  warm) and update host/port in Settings → Remote GPU → Save & test.
+- **Cost of this whole smoke session**: ≈ 2 pod-hours ≈ $1.40.
+- **Verified**: sculptor 433 passed/1 skipped, backend 319 passed,
+  frontend build clean (gates re-run after the fixes). NOT yet run: a
+  full LLM-driven mission stage remotely — first task when the eval
+  phase starts (needs ANTHROPIC_API_KEY + ~20 min pod time).
+
+### 2026-06-09 — Ship 23d: remote dispatch in the UI (Settings card, doctor endpoint, run-event chips)
+
+Per the no-terminal-after-run.sh rule: remote GPU dispatch is now fully
+UI-reachable — configure, test, and observe without touching a config
+file.
+
+- **What** (backend):
+  - NEW `backend/services/remote_settings.py`: `RemoteSettings`
+    pydantic model (connection fields only; tuning knobs stay
+    TOML-only), JSON persisted ATOMICALLY at
+    `<projects_root>/_settings/remote.json` (corrupt file → defaults,
+    never a 500/blocked launch); `remote_env()` with THREE states —
+    never saved → `{}` (project `[remote]` TOML may apply), saved-but-
+    off → `{SCULPTOR_REMOTE_ENABLED: "0"}` (the UI toggle showing
+    "Off" must override a TOML `enabled=true` — env wins in
+    RemoteConfig.from_sources), saved+enabled+host → full
+    `SCULPTOR_REMOTE_*` mapping; `run_doctor()` (in-process —
+    `_remote.py` is stdlib-only at import, so no heavy-import leak;
+    never raises). Host/user reject a leading "-" (would parse as an
+    ssh option, e.g. `-oProxyCommand=`).
+  - `routes/system.py`: GET/PUT `/system/remote` +
+    POST `/system/remote/doctor` (blocking ssh checks via
+    `asyncio.to_thread`); models in `models/system.py`
+    (RemoteDoctorCheck/RemoteDoctorResponse).
+  - `run_manager.py` + `mission_jobs.py`: `env.update(remote_env(
+    project_dir.parent))` before spawning sculpt subprocesses — both
+    run AND mission paths dispatch remotely when enabled.
+- **What** (frontend):
+  - Settings page: new "Remote GPU (rented pod)" card — enable toggle,
+    host/port/user/key/python/workdir/device fields, rollout-remote
+    toggle, Save + "Save & test connection" (label says it saves;
+    doctor result rendered as per-check pass/fail rows in an
+    `aria-live` status region with `sr-only` pass/fail text). Header
+    badge shows the PERSISTED enabled state, not the unsaved form.
+    Fieldset disabled until the server copy loads (a fast typist can't
+    fork the form off defaults and clobber saved fields); editing
+    clears a stale doctor result; Save/Test mutually disable; port
+    clamped 1-65535. `lib/api.ts` ApiError now stringifies FastAPI 422
+    array details (was "[object Object]" toasts).
+  - LogViewer: all 11 `remote_*` event types in the "run" filter tab,
+    prettyLabel cases (host/reason/seconds/pgid fields), badge colors
+    (teal lifecycle / amber degraded-recovering / rose failed).
+  - `.claude/launch.json`: backend+frontend dev-server configs (wsl-
+    wrapped with absolute paths — cmd.exe can't cd to UNC, and `$VARS`
+    get expanded Windows-side before reaching WSL bash).
+- **Verified**: 13 new backend tests (settings round-trip/atomicity/
+  corrupt-file, three-state env mapping incl. the projects-root layout
+  assumption, 422s for bad port + leading-dash host, doctor route
+  mocked + doctor-uses-saved-settings). LIVE browser verification via
+  dev preview: card renders, fill host → toggle → Save → PUT 200 →
+  remote.json on disk verified; "Save & test" against an unroutable
+  TEST-NET host → real ssh ConnectTimeout → report renders "local
+  ssh/rsync binaries: passed / ssh reachable: failed (Connection timed
+  out)"; zero console errors; test settings file deleted afterwards
+  (an enabled unroutable host would fail every run's preflight).
+  Review-agent audit applied (H1 a11y sr-only+aria-live, H2 explicit-
+  off env override, M1 loading-guard fieldset, M2 button label, M3
+  port clamp + 422 toast, M4 load-error banner, L2-L5). Gates: backend
+  319 passed, frontend build clean, sculptor untouched since 23b's 432.
+
+CLI/ops layer over the Ship-23a executor so a RunPod 5090 goes from
+rented → dispatchable without touching Python.
+
+- **What**:
+  - NEW `RewardSculptor/scripts/provision_remote.sh` (executable):
+    `./scripts/provision_remote.sh root@HOST [-p PORT] [-i KEY]
+    [-w WORKDIR]` — idempotent over one ssh session: rsync (apt, sudo
+    fallback), uv, py3.13 venv at `<workdir>/venv`, installs
+    torch/mjlab[cu128]/imageio-ffmpeg PINNED to the locally-detected
+    versions (`uv run --no-sync` probe; warns loudly when falling back
+    to pyproject minimums), guards nvidia driver ≥ R570 (Blackwell),
+    torch.cuda sanity JSON, prints the exact `[remote]` block to paste.
+    `-w /workspace/sculptor_remote` puts venv+mirror on a RunPod
+    network volume so they survive pod restarts. Args passed to the
+    remote shell via `printf %q` (unquoted `>=` specs would become
+    stdout redirections on the pod and install unpinned latest).
+  - `sculptor/cli.py`: new `remote` typer sub-app —
+    `sculpt remote doctor [--config cfg.toml] [--json]`. Resolves
+    `[remote]` + `SCULPTOR_REMOTE_*` env (works pre-`enabled=true` via
+    dataclasses.replace), runs `RemoteExecutor.doctor()`, prints rows
+    or pure JSON. Exit 0 green / 1 check failed / 2 not configured
+    (incl. missing/malformed/unreadable config — TOMLDecodeError and
+    OSError handled, never a traceback).
+  - `_remote.py` follow-ups found while building this: `remote_python`
+    with a leading `~` is now expanded against the remote $HOME (it
+    gets shlex-quoted into ssh commands + run.sh, where quoting
+    suppresses tilde expansion — `~/.sculptor_remote/venv/bin/python`
+    from the provision script would have been a literal path);
+    `_check_version_skew(emit=False)` for the doctor path so
+    `doctor --json` stdout stays pure JSON even when skew exists (the
+    UI backend pipes it into json.loads — Ship 23d's Test-connection).
+  - NEW `RewardSculptor/docs/remote.md`: RunPod walkthrough (Community
+    5090, network volume, why never A100/H100 — FP32-bound Warp sim),
+    provisioning, full `[remote]`/env reference (tuning knobs are
+    TOML-only), the complete remote_* event/failure table incl.
+    launch_failed/job_lost, kill/reattach semantics, and the Ship-23e
+    manual smoke checklist (doctor → 1-iter → Ctrl-C kill → kill -9
+    reattach → UI cancel → record wall-clock+$).
+- **Why**: Phase-1 plan; doctor is also the backend for the UI's
+  Test-connection button (23d) and the gate before the live smoke (23e).
+- **Verified**: 9 new tests (test_remote_cli.py 7 — exit codes 0/1/2,
+  row + pure-JSON output, malformed TOML, doctor-before-enabled;
+  executor: tilde expansion in `_remote_argv`, doctor-emits-no-events-
+  on-skew). `bash -n` clean; `printf %q` expansion checked by hand.
+  Sculptor gate 432 passed/1 skipped; backend re-run green; frontend
+  untouched since its green build. Review-agent audit applied (ssh-arg
+  quoting H1, json purity H2, network-volume workdir H3, sudo/arg-order/
+  driver-parse guards M2/M3/L1/L2, env-override doc claim L3, event-name
+  table L4, --no-sync L5).
+
+First ship of the approved research-grade plan (Phase 1: fast-iteration
+compute — RunPod Community 5090, ~$0.69/hr, expected ~5x over the 8 GiB
+5070 laptop). Train (and opt-in rollout) now dispatchable to a rented
+pod; everything else (diagnose/edit/KG/criteria/UI) stays local.
+
+- **What**:
+  - NEW `RewardSculptor/sculptor/adapters/_remote.py` (~870 lines):
+    `RemoteConfig.from_sources` (top-level `[remote]` TOML table +
+    `SCULPTOR_REMOTE_*` env overrides, env wins, `enabled` forced False
+    without host, misconfig emits `remote_config_ignored` — never a
+    silent local fallback); `CommandRunner` protocol (injectable fake
+    for tests) + `SubprocessCommandRunner` (ssh/rsync);
+    `RunnerJob` (options / uploadable `input_paths` / ORDERED
+    `required_artifacts`, last = completion key); `RemoteExecutor`:
+    preflight → version-skew probe (warn, don't block) → stale-job
+    check → upload → detached launch → poll/stream → staged atomic
+    download; `doctor()` (never raises; ssh/rsync/python/driver≥R570/
+    torch.cuda/version-skew/disk checks) for Ship 23b/23d.
+  - `sculptor/adapters/mjlab.py`: `remote` field on MjlabAdapter +
+    `_remote_config/_remote_enabled/_remote_executor/_remote_device_env`;
+    branch at the train seam (RunnerJob with
+    `required_artifacts=("metrics.json","checkpoint.pt")` — checkpoint,
+    the resume key, promoted LAST) and the rollout seam (gated by
+    `rollout_remote`, default false — local rollout keeps video preview
+    robust; artifacts `behavior.json, trajectory.npz, rollout.mp4`).
+    num_envs VRAM autocap SKIPPED when remote enabled (probes the wrong
+    GPU). All post-subprocess validation/resume/error formatting
+    unchanged — executor returns a CompletedProcess and artifacts land
+    in the same local `output_dir`.
+  - `sculptor/adapters/base.py` `load_adapter`: top-level `[remote]`
+    table plumbed via signature introspection into adapters accepting a
+    `remote` kwarg (NOT nested in `[adapter].config` — the UI's
+    `_toml_val` serializer only handles primitives). Explicit
+    `[adapter.config.remote]` wins; non-remote adapters untouched.
+- **Why**: compute is THE bottleneck (~25 min/train-iter locally);
+  every later phase (eval campaign, ablations, KG experiment) is gated
+  on iteration speed. The mjlab runner subprocess at mjlab.py:505/:609
+  was already a clean file-in/file-out seam.
+- **How** (lifecycle safety, the part that burns rented GPUs):
+  job-dir protocol under `<workdir>/mirror/<abs output_dir>/.remote_job`
+  — run.sh self-records its pgid (under setsid it IS the session
+  leader), `exitcode` file written atomically (tmp+mv) is the SOLE
+  completion truth (never the SSH channel); any local exception
+  SIGTERM→SIGKILLs the remote pgid (mirrors `_run_with_cleanup`) EXCEPT
+  ssh_unreachable (can't reach it ⇒ leave it reattachable); a live
+  remote job whose `cmd.json` sha matches the new dispatch is
+  REATTACHED (idempotent recovery after local crash — upload skipped
+  too, so a sync blip can't kill preserved work), mismatched ⇒ killed
+  (no double-dispatch). Stdout polled via one combined ssh round-trip
+  (exitcode + `tail -c +N`, BYTE offsets so \r progress bars / partial
+  lines can't desync; partial trailing line buffered so a split
+  `[SCULPT-EVENT]` JSON can never reach the UI truncated) and re-emitted
+  on local stdout — run_manager's stdout-event passthrough delivers
+  remote_* + iter_progress events to the UI with zero backend changes.
+  Download staged into `.remote_incoming/` then promoted with the
+  completion key LAST ⇒ resume can never see a partial train as
+  complete. Absolute-path mirroring makes iter N's checkpoint a
+  zero-byte rsync no-op when iter N+1 warm-starts from it. Code dir
+  rsynced to `<workdir>/code` + PYTHONPATH ⇒ sculptor version skew
+  structurally impossible. Failures classified
+  (`remote_dispatch_failed` reason ∈ ssh_unreachable | launch_failed |
+  sync_failed | artifacts_missing | remote_oom | runner_failed |
+  job_lost) — all observable, all recoverable upstream.
+  Review-agent audit applied: C1 stale-check ssh failure ≠ NOJOB (was a
+  double-dispatch + unkillable-orphan window); H1 remote rsync specs
+  shell-quoted (spaces in mirrored paths); H2 launch `&` no longer
+  backgrounds the whole `cd && rm && setsid` list + pgid read polls up
+  to 10 s instead of a fixed 0.5 s sleep; M4 vanished job dir (spot
+  reclaim) fails fast as `job_lost` instead of burning the reattach
+  budget.
+- **Verified**: 54 new tests (test_remote_config.py 21 — precedence/
+  robustness/observable-misconfig/load_adapter plumb;
+  test_remote_executor.py 22 — FakeCommandRunner emulating the remote
+  fs under tmp_path: happy path, launch-script shape, reattach-vs-kill
+  on cmd-hash, byte-offset streaming, partial-line buffering,
+  atomic-download ordering via recorded Path.replace, artifacts_missing
+  leaves no partial checkpoint, OOM/runner-failed classification,
+  kill-on-KeyboardInterrupt, connection-lost retry + give-up-without-
+  kill, job_lost fail-fast, quoted spaced paths, doctor;
+  test_mjlab_remote_dispatch.py 11 — enabled⇒executor/local-not,
+  disabled⇒identical local behavior, env-var injection, rollout gating,
+  warm-start in input_paths, device override, autocap skip/apply).
+  Four gates green: sculptor 423 passed/1 skipped (was 369), backend
+  306 passed, frontend build 2.8 s clean, no UI surface touched yet
+  (23d). NOT yet smoke-tested against a real pod — that's Ship 23e.
+
+Doc-only. Added `NEXT_LEVEL_BRIEF.md` at repo root — a self-contained
+fresh-session handoff for taking RL-Sculptor toward research-grade. Covers:
+orientation/read-order, immediate capabilities, known weaknesses (chiefly the
+lack of baselines/ablations/multi-seed metrics — the main research-grade gap),
+future capabilities (arbitrary robots, complex/long-horizon tasks, object
+interaction/manipulation/gripping), the four gates + their gotchas, the
+non-negotiable working rules (audit loop, verify-agent-claims, test-everything,
+compatibility, failure-mode thinking, keep-CONTEXT-updated), and a cheap
+individual external-GPU path (Vast.ai/RunPod/Modal + dispatch `adapter.train`
+remotely / sync artifacts). The next session reads this + CONTEXT.md, plans
+(plan mode), then executes phase-by-phase. No code touched; all gates remain
+green at Ship 22s baseline.
+
+### 2026-06-06 — Ship 22s: adaptive mission decomposition (no wasted stand stage, count scales with complexity)
+
+Prompt-only (`prompts/decompose_task.md`). Sam's feedback: decomposition always
+produced (1) exactly 4 stages and (2) a first stage that just stands the robot
+up — a waste. Confirmed across 3 missions (floss/floss/kicking): all 4 stages,
+all with a `stand_stable`/`upright_stance` first stage that *succeeded in 1
+iter* (the robot already stands). The schema allows 2-8 stages
+(`_DecompositionModel` has no count bound; `_RedecompositionModel` is 2-8) — so
+this was pure PROMPT anchoring, not a constraint.
+
+Root anchors removed:
+- "always 4": Hard rule 3 said "typical stage count 3-6" AND the only worked
+  example was an explicit "4-phase" 4-stage curriculum → Claude defaulted to
+  the middle. Rewrote rule 3 to ADAPTIVE: "as few as the goal needs, ONE per
+  distinct sub-skill/phase; simple rhythmic motion 1-2, multi-limb/2-3-phase
+  3-5, long sequence up to 8; 4 is NOT a default; rationale must justify the
+  count." Replaced the example with a 3-stage one and a closing note that a
+  simple goal is 1-2 stages.
+- "always stand first": stage-design guidance literally said "Stage 1 =
+  simplest static skill ... stand stably" and the example's stage 1 was
+  "stand". Replaced with: "**Never spend a stage on standing** — bake
+  stability (alive_bonus + upright, zeroed when fallen) into EVERY stage's
+  reward and make Stage 1 the first GENUINE sub-skill" (hip sway for floss,
+  wind-up/step for a kick). Balance gets its own stage only when the goal IS
+  balance-from-unstable (push-recovery, one-leg stand, beam). The new example
+  starts with `crouch_load`, not stand, and every reward carries the base
+  stability terms.
+- Also fixed a latent example bug (`metric_stand`, an undefined cross-stage
+  identifier) and made all example criteria use `.get()` + persisted keys.
+
+- **Verified**: decompose tests 26 passed; the rendered prompt parses (tests
+  load it). No schema/code change needed — the 2-8 range was already legal.
+  Behavioural improvement will show on the NEXT decompose (try a new mission):
+  fewer/more stages per goal complexity, Stage 1 = the real first sub-skill.
+  No frontend/backend/other-sculptor files touched.
+
+### 2026-06-06 — Ship 22r: criterion `components[...]` now sees the SCULPTOR reward terms (the real hip_sway fix)
+
+The mission halted at `hip_sway` AGAIN after Ship 22q. Diagnosed from the
+on-disk run (`unitree-g1-4/.missions/make-the-robot-do-a-floss-the-da`,
+7 iters, `_execute_job_*.log`). TWO findings:
+
+1. **ROOT CAUSE (why the criterion could never pass).** A stage criterion's
+   `components[<name>]` is documented as the SCULPTOR reward's components (the
+   terms the `reward_seed_prompt` introduces). But `_build_criterion_namespace`
+   built `components` ONLY from `trajectory.npz["reward_term__*"]` — which on
+   mjlab are the ENVIRONMENT's intrinsic task terms (`track_linear_velocity`,
+   `upright`, `foot_slip`, …), NOT the sculptor's. The sculptor components
+   (`hip_sway_osc`, `upright_bonus`, …) are written to the training-side
+   `reward_trajectory.json` (the file `diagnose` already reads) and were never
+   merged in. So `components['hip_sway_osc']` ALWAYS KeyError'd on mjlab even
+   though the reward computed it. **The robot had actually learned the skill:
+   replaying iter_6, `hip_sway_osc` mean = 0.3822 (> 0.3) and
+   `mean_episode_length` = 500 (> 400) — the stored criterion evaluates to
+   `True`. The stage should have SUCCEEDED.** Fix: `mission_runtime.py`
+   `_load_sculptor_components()` reads the training-side `reward_trajectory.json`
+   (Eureka `{component:[vals]}`, `__`-prefixed aux skipped) and
+   `_build_criterion_namespace` merges those means into `components` with
+   precedence over `reward_term__*`. (gym_sb3 unaffected — the two coincide.)
+
+2. **NEXT halt vector (exposed once 22q let redecomposition fire).** The newer
+   `make-a-full-kicking` run (post-22q) correctly routed `criterion_not_met` →
+   redecompose, but Claude's redecomposition draft used `trajectory['base_
+   height']` (non-persisted) → `validate_mission` rejected the splice →
+   `stage_redecomposition_failed (spliced_mission_invalid)` → mission halted,
+   with the precise error never fed back. Fix: `sculpt.py`
+   `_maybe_redecompose_and_splice` now retries up to `_REDECOMPOSE_MAX_ATTEMPTS`
+   (2), feeding the exact validator error back via `redecompose_stage(...,
+   prior_attempt_error=...)` (decompose.py) so Claude corrects the offending
+   sub-stage; emits `stage_redecomposition_retry` per attempt; snapshots +
+   restores the pre-splice graph cleanly between tries. `redecompose_stage.md`
+   prompt hardened (base_height → `root_link_pos_w[...,2]`; `.get()` for unsure
+   components; "an out-of-contract key in ANY sub-stage rejects the whole
+   redecomposition").
+
+- **Verified**: sculptor `pytest tests/` (from `RewardSculptor/`) → 369 passed,
+  1 skipped. +2 tests: `_build_criterion_namespace` exposes sculptor components
+  from `reward_trajectory.json` (merged over `reward_term__`, aux skipped, real
+  criterion evaluates), and redecomposition retries an invalid draft then
+  recovers. Simulated the actual iter_6 namespace: the stored hip_sway criterion
+  now evaluates `True`. No frontend/backend files touched.
+
+### 2026-06-06 — Ship 22q: criterion missing-key no longer halts the mission
+
+Bug (from Sam's run): the `hip_sway` stage failed with
+`stage_failed {reason: criterion_errored, detail: "KeyError: 'hip_sway_osc'"}`
+and the whole mission halted. Root cause chain:
+- A stage `success_criterion` subscripts a namespace dict —
+  `components['hip_sway_osc']` (Claude expected the reward seed prompt to
+  emit a `hip_sway_osc` term; it never did, or was named differently).
+- `_validate_criterion_ast` only validates top-level *names* (`components`),
+  not subscript *keys* (keys are runtime), so the bad key passes decompose-
+  time validation and `KeyError`s at the final eval.
+- The generic `except Exception` wrapped it as `criterion_errored`, which is
+  NOT in `_REDECOMPOSABLE_REASONS` → `_maybe_redecompose_and_splice` skips
+  (reason `non_curriculum_failure`) → mission halts irrecoverably. A
+  recoverable "the reward didn't produce this metric" became a fatal crash.
+  (Same class as the Ship-21c `.float()` 10-hour-loss incident: a
+  last-second criterion eval killing a long run.)
+
+Fix (sculptor core — `mission_runtime.py`, `sculpt.py`):
+- New `CriterionMissingKeyError(CriterionEvalError)`. `_evaluate_success_
+  criterion` now catches `KeyError` distinctly and raises it with an
+  actionable message: the missing key + the keys that WERE available in
+  behavior/components/info/trajectory.
+- `_run_one_stage` step 6 routes `CriterionMissingKeyError` to the
+  recoverable `criterion_not_met` (the measured quantity is absent → the
+  goal was not met) instead of `criterion_errored`, preserving the detail in
+  `criterion_error` and flagging `missing_key:true` on the
+  `stage_criterion_evaluated` event. The redecompose prompt already renders
+  `criterion_error` + `last_iter_namespace`, so the recovered stage sees the
+  missing key + available keys and can pick a real one / define the term.
+- Other failure modes hardened: `_REDECOMPOSABLE_REASONS` now also includes
+  `criterion_errored` (a malformed criterion that slipped past decompose
+  validation is re-authorable — bounded by the 1-attempt cap, so it can't
+  loop). The per-iter callback + Goal-B `_criterion_satisfied_now` already
+  swallowed eval errors (verified) — no change needed.
+- Prevention: `.get` added to `SAFE_ATTRIBUTE_METHODS` so criteria can use
+  `components.get('x', 0.0)` (soft lookup → no KeyError); `decompose_task.md`
+  now tells Claude to reference only keys its seed prompt defines, that a
+  missing bare-subscript key fails the stage as `criterion_not_met`
+  (recoverable but wastes the budget), and that `.get(key, default)` is
+  available.
+- Tests (`test_mission_run.py`, +3 → 367 passed/1 skipped): unit — missing
+  key raises `CriterionMissingKeyError` with key+available in the message,
+  and `.get` returns the default; integration — a `components['hip_sway_osc']`
+  stage halts with `halted_reason=criterion_not_met` (not `criterion_errored`),
+  `missing_key:true`, error detail preserved, via the budget_exhausted
+  (re-decomposable) path.
+
+Verified: sculptor `pytest tests/` → 367 passed, 1 skipped. No frontend/
+backend files touched. (Gate reminder: sculptor tests run from
+`RewardSculptor/`, not `RewardSculptor/sculptor/`.)
+
+### 2026-06-06 — Ship 22p: run.sh no longer self-kills on headless/WSL (browser-open)
+
+Bug: on a headless box or WSL (no Linux browser), `./run.sh` started the
+backend + Vite fine, then the auto-open step ran `open`/`xdg-open`, which exit
+non-zero ("xdg-open: no method available"). Because the script runs under
+`set -euo pipefail`, that non-zero return tripped the `trap cleanup EXIT` and
+tore down the **backend**. Vite kept serving, so every `/api/*` call hit a dead
+backend → the UI showed "Failed to load projects: Internal Server Error",
+"No GPU", "No CUDA" (all downstream symptoms — backend + GPU detection were
+fine; the server had just been killed).
+
+Fix (`reward-sculptor-ui/run.sh`): wrapped the browser-open in
+`{ … } >/dev/null 2>&1 || warn …` so a failing/missing opener can never trip
+`set -e`/the EXIT trap — the script continues to `wait -n` and stays alive.
+Also reordered openers to prefer **`wslview`** (hands off to the *Windows*
+default browser on WSL) over `xdg-open`/`open`, and on total failure it prints
+"open http://localhost:5173 yourself" instead of dying. `chmod +x` reapplied
+(Edit drops the exec bit).
+
+Verified: extracted the exact `set -e` + EXIT-trap + non-fatal-opener sequence
+and confirmed control reaches the line *after* the opener (old code exited
+there). `bash -n run.sh` clean. Note: auto-open only works if `wslview` is
+installed (`sudo apt install wslu`); without it the servers still run and you
+open localhost:5173 manually. No app/library code touched.
+
+### 2026-06-06 — Ship 22o: current viewer wiring + disable metric auto-kill
+
+User-facing fixes:
+
+- Overview RobotViewer now chooses the active running/queued run for Live
+  (and Replay while a run is active) instead of blindly using the most
+  recent historical run. This fixes Live showing clips from an older run
+  while a newer run is active, and resets the replay iter picker when the
+  selected run changes so an old iteration selection cannot stick.
+- Static preview re-render now uses `cache: "no-store"`, consumes the
+  regenerate response, invalidates preview queries, and forces an active
+  refetch so the visible photo updates immediately after the backend
+  rewrites `preview_<angle>.png`.
+- Fixed RobotViewer stacking order: media is now below `.rs-overlay` and
+  `.rs-scrub`, so static controls (camera angle + Re-render) and replay
+  controls receive pointer events instead of clicks landing on the image/video.
+- Removed the New Run and Project Settings early-stop controls. Runs no
+  longer advertise or send the old "kill after N no-improvement iters"
+  heuristic.
+
+Core behavior:
+
+- Disabled the metric-plateau auto-kill in `RewardSculptor/sculptor/sculpt.py`.
+  `_should_early_stop(...)` remains as a compatibility shim, but always
+  returns `False`; the inner sculpt loop no longer halts based on primary
+  metric history, even for legacy configs with `early_stop_enabled = true`.
+- Kept mission success-criterion stopping (`early_stop_on_criterion`) intact;
+  that is goal-aware and distinct from the removed reward-history heuristic.
+- Kept backend/CLI/API fields parseable for compatibility, but documented
+  them as no-ops. Route shapes and pydantic fields were not removed.
+
+Validation:
+
+- `reward-sculptor-ui/frontend`: `pnpm build` (tsc -b + Vite) ✅
+- `RewardSculptor`: `uv run pytest tests/ -q` ✅ — 364 passed, 1 skipped.
+- `reward-sculptor-ui`: `uv run pytest backend/tests/ -q -k 'not test_reward_prompt_edit_emits'` ✅ — 305 passed, 1 deselected.
+- Browser smoke (`http://localhost:5173/projects/unitree-g1-3`) ✅:
+  Overview static preview rendered, Re-render clicked through the overlay,
+  spinner appeared, backend `preview_iso.png` mtime updated, and the visible
+  blob URL changed. New Run dialog Basic + Advanced no longer show early-stop
+  or patience controls.
+
+### 2026-06-05 — Ship 22n: final audit — fix the (no-op) typecheck gate + a11y focus trap
+
+The audit-driven close-out of the prototype integration. Two real problems found.
+
+- **CRITICAL — the typecheck gate was a no-op.** `tsconfig.json` is solution-style
+  (`"files": []` + `references` only), so `pnpm tsc --noEmit` (the command the prior
+  ships used as the "tsc 0" gate) compiles NOTHING and always passes. The REAL gate
+  is `pnpm typecheck` / `pnpm build` (`tsc -b`, which checks tsconfig.app.json with
+  `strict` + `noUnusedLocals`). Running it surfaced **15 latent type errors** — most
+  pre-existing across prior ships (22e/22g/22h) + a few faithfully copied verbatim
+  in the reskin — all masked the whole time. Fixed all 15 → `pnpm build` is GREEN:
+  - `lib/types.ts`: `JobKind` was missing `"kg_research"` (a real backend kind —
+    kg.py:453, models/kg.py:111). Added it → fixed the `job.kind === "kg_research"`
+    comparisons in ActiveJobsIndicator + AddSeedsDialog (PendingSeedJobWatcher).
+  - **Real behavior bug:** PhysicsTab + RewardsTab passed `useJob(id, {refetch
+    IntervalMs: 1500})` — but the option is `intervalMs`; the wrong key was silently
+    dropped so those prompt-edit jobs polled at the 3000 ms default, not 1500.
+    Renamed → intended 1.5 s polling restored.
+  - Misc: removed unused imports (MissionDetailDialog `useState`, RewardsTab
+    `formatRelative`), cast-through-unknown for the MissionDetail log_line text +
+    RunsTab realism_audit, `activeJobId ?? undefined` for useJob, tuple-typed the
+    ProjectSettings summary rows.
+- **HIGH — a11y focus trap.** The bespoke `Modal` (replacing Radix) had focus-in +
+  Esc + focus-restore but NO focus trap, so Tab escaped the dialog (WCAG 2.1
+  dialog-pattern fail) across all 11 modals. Added a Tab/Shift+Tab wrap to the
+  Modal's keydown handler (topmost-only via MODAL_STACK). Verified live: forward
+  Tab from the last control wraps to the first, Shift+Tab from first wraps to last,
+  Esc still closes. Also linked NewMissionDialog's goal error via aria-describedby.
+- **Parallel audit (3 Explore agents) — every load-bearing claim verified against
+  source before acting:**
+  - Code/contract agent: 0 payload/hook bugs (matches independent verification).
+  - a11y agent: focus-trap CRITICAL → fixed. REJECTED after verification: "add
+    role=tab to rs-mtabs" (half-implementing the APG tab pattern, sans arrow-key
+    nav, is worse than plain operable buttons); slider `aria-valuetext` (native
+    range already announces its value + the live value is in the `<label>`);
+    `.rs-select::after` not aria-hidden (CSS pseudo-elements aren't in the a11y
+    tree).
+  - UX/dark-mode agent: REJECTED all ~10 "hardcoded color → dark-mode breakage"
+    findings — they sit on `.rs-log` / RobotViewer stage, which are ALWAYS-dark
+    terminal surfaces (`.rs-log { background:#16150f }` in both themes), so the
+    light-on-dark text is correct; the `rgba(245,78,0,.04)` tints match the
+    established `.rs-check.on` pattern (the accent doesn't flip). CONFIRMED good:
+    zero drop-shadows, zero leftover shadcn Tailwind utilities in any reskinned file.
+- **Gates (all four green):** `pnpm build` 0 (the real typecheck + vite build,
+  1956 modules); backend `pytest -k 'not test_reward_prompt_edit_emits'` exit 0;
+  sculptor `pytest tests/` exit 0; live smoke via the running dev server (Chrome).
+- **Integration complete:** every shadcn `Dialog`/`Tabs` is gone — all 11 dialogs +
+  the library/robot flow are on the bespoke rs Modal/primitives. NB going forward:
+  the typecheck gate is **`pnpm typecheck`** (or `pnpm build`), NOT `tsc --noEmit`.
+
+### 2026-06-05 — Ship 22m: re-skin the robot/creation flow (Library + RobotConfig)
+
+Frontend-only. The project-creation entry point + the in-project robot config.
+
+- **What** (all filter/upload/create logic VERBATIM):
+  - `components/RobotConfig.tsx` rewritten. `RobotConfig` (in-project, shown in
+    the Overview slot for unconfigured projects) → rs-card + rs-mtabs Library/
+    Upload. `LibraryBrowser` (category/support/search client-side filter +
+    `filtered` useMemo — verbatim) → rs filter sidebar (`rs-fchip` toggle chips)
+    + auto-fill card grid. `RobotCard` → `rs-robotcard` (hairline lift, no shadow).
+    `TrainingBadge` → rs Badge colors. `RobotDetailModal` → rs Modal (wide;
+    thumbnail / preview-warning / tasks / references / demote-note; opens
+    CreateProjectDialog on "Create"). `UploadPanel` → `rs-drop` drag-zone +
+    rs state panels; the upload submit (ext/size validation, zip→meshesZip
+    split, mutation) preserved verbatim.
+  - `pages/LibraryPage.tsx`: rs page (back link, title, ready/total rs badges,
+    GPU note) + LibraryBrowser.
+  - `pages/ProjectCreate.tsx`: untouched — it's just a legacy /projects/new →
+    /library redirect (no UI).
+  - `rs-theme.css`: `.rs-fchip` (filter chips), `.rs-robotcard` (+ thumb),
+    `.rs-drop` (upload zone).
+- **Verified**: tsc 0, zero console errors. Live (Chrome, fresh /library load —
+  full screenshots): the library renders (filter chips active/inactive, search,
+  6/63 count, robot cards with thumbnails + READY-TO-TRAIN/GYMNASIUM badges);
+  RobotDetailModal (Unitree G1 — bot icon, real thumbnail, MuJoCo-Menagerie
+  subtitle, description, pre-configured tasks); CreateProjectDialog (mjlab path,
+  via JS — name prefilled, adapter=mjlab, CUDA device dropdown, num_envs=1024,
+  "Estimated VRAM: 2.0 GiB of 6.4 GiB free · Comfortable headroom"). The
+  in-project RobotConfig card + UploadPanel are tsc-clean + logic-preserved
+  (only reachable on an unconfigured project; none exist to click-trigger now).
+  Backend/sculptor untouched.
+
+### 2026-06-05 — Ship 22l: re-skin the project config dialogs (Create + Settings)
+
+Frontend-only. The project-creation + project-settings dialogs.
+
+- **What** (logic/payloads VERBATIM):
+  - `ProjectSettingsDialog.tsx`: gear `IconBtn` + rs Modal. SummarySection
+    (read-only adapter/library facts as a mono dl), IterationSettingsSection
+    (the 11-field editable config.toml [iteration] block — getProjectSettings /
+    patchProjectSettings query+mutation, the typed `fields` array, `update()`
+    numeric-vs-text coercion, dirty-diff, Revert/Save — all verbatim; bools via
+    rs-select, numbers/text via rs-input, rs-row2 grid), DangerZone (type-the-slug
+    -to-confirm delete + nav, rs rose panel + danger Btn).
+  - `CreateProjectDialog.tsx`: rs Modal. estimateVramGb, parseOomError,
+    defaultAdapterFor, the createProject mutation + payload, the
+    over/tight-budget VRAM math, the task→num_envs auto-snap, the OOM-retry
+    flow — all verbatim. Restyled: adapter/task/device → rs-select, num_envs →
+    rs range (rs-primary accent), VRAM estimate + ComingSoon + OOM banners → rs
+    colored panels, footer Create with arrow-right / loader.
+- **Verified**: tsc 0. Live (Chrome, via JS — capture stalls once a spinner /
+  client-nav is in play this session): ProjectSettings opens with all 3 sections,
+  7 summary rows, 11 iteration fields, Delete disabled until the slug is typed,
+  Done footer. Zero console errors. CreateProjectDialog is tsc-clean + reuses the
+  same proven primitives; it's triggered from LibraryPage so it gets its live
+  exercise in Ship 22m. Backend/sculptor untouched.
+
+### 2026-06-05 — Ship 22k: re-skin the KG dialogs (AddSeeds, Research, Paper, Graph)
+
+Frontend-only. The four Knowledge-Graph-tab dialogs.
+
+- **What** (all logic/payloads VERBATIM; only the shadcn shell → rs Modal):
+  - `AddSeedsDialog.tsx`: rs Btn trigger + Modal. ARXIV_RE validation, the
+    split-on-newline-or-comma parse, the 409-already-running branch, the R3
+    close-on-queue + onJobSubmitted handoff — verbatim. localErrors render in an
+    rs rose panel. `PendingSeedJobWatcher` (the headless completion-toast poller
+    with all the kg_research-vs-seed result branching) copied byte-for-byte.
+  - `ResearchTopicDialog.tsx`: rs Btn + Modal. topic textarea + 0/500 counter +
+    max-papers range (accent-color: var(--rs-primary)); useResearchTopic payload
+    `{topic, max_papers, auto_extract:true}` verbatim.
+  - `PaperDetailModal.tsx`: rs Modal (wide). usePaper hook; abstract + 4
+    EntityGroups (techniques/failure_modes/reward_components/environments) + the
+    not-extracted note; arxiv.org external link in the subtitle.
+  - `GraphModal.tsx`: rs Modal with new `full` + `flush` options. The pyvis
+    `<iframe sandbox>` + the `kgGraphHtmlUrl(regenerate)` useMemo + the
+    `kg_node_click` postMessage→PaperDetailModal stacking — verbatim.
+  - `rs/primitives.tsx` Modal: added `full` (95vw × calc(100vh-120px), flex-col so
+    a flex:1 body child fills height) + `flush` (zero body padding for the iframe).
+  - `rs-theme.css`: `.rs-modal.full`, `.rs-modal-body.flush`, `.rs-caption`
+    (reusable uppercase section heading).
+- **Verified**: tsc 0. Live (Chrome, KG tab): AddSeeds renders (mono textarea,
+  rose error panel "Paste at least one arxiv_id." on empty-submit), Research
+  (topic + 0/500 + orange-accent range), GraphModal `.rs-modal.full` (645px,
+  flush body, iframe filling 1366×558 at the regenerate URL). Zero console errors.
+  PaperDetail is tsc-clean + uses the same proven primitives (no KG paper present
+  on the fresh project to click-trigger it). Backend/sculptor untouched.
+  (Tab-gated surfaces can't be screenshotted this session — `captureScreenshot`
+  stalls after any client-side tab switch; verified via DOM/JS instead.)
+
+### 2026-06-05 — Ship 22j: re-skin the mission dialogs (RunMission + MissionDetail)
+
+Frontend-only. The two mission-centric dialogs the Runs/Missions surface opens.
+
+- **What**:
+  - `components/RunMissionDialog.tsx` rewritten onto rs `Modal`. ALL logic VERBATIM:
+    the Ship-21a `appliedDefaults` pre-fill effect (mission.run_defaults → fields,
+    falling back to `suggestedIters`), `submit` body construction (the
+    iterations_override≠suggested guard + the early-stop / extend opt-in blocks),
+    the eta estimate. Inputs now render via the shared `MissionAdvanced` (reused
+    from NewMissionDialog — single source of truth for the 9 MissionRunDefaults
+    controls). The optional `trigger` prop is honored (wrapped to open on click);
+    default trigger is an rs Btn.
+  - `components/MissionDetailDialog.tsx` rewritten onto rs `Modal` (wide). ALL
+    logic VERBATIM: `useMission`/`useDeleteMission`/`useMissionEvents`, the
+    `wsEnabled` + `isDecomposing` gating (Ship 18a/19c), `computeStageDepths`
+    (cycle-safe DFS), `deriveStageIters` (Ship 19c WS attribution), `deriveStage
+    EffectiveMaxIters` (Ship 20 #2), StageCard's 3-level effective-max-iters
+    fallback chain + override tooltip/aria, `describeEvent`, the LogScroller
+    autoscroll-detach. Restyled: lifecycle/stage/ws status → rs Badge (STATUS_META
+    already covers ready/running/completed/halted/errored + pending/training/
+    succeeded/failed/skipped); decomposing/error/interrupt banners → rs Banner;
+    StageCard → rs card with mono name + success_criterion code panel + meta row +
+    IterRibbon; structured-event list + log_line scroller → dark rs-log panels
+    (matching the Runs-tab LogViewer) with category-colored event tags. `Mission
+    LifecycleBadge` kept exported (now a thin rs Badge wrapper).
+  - `rs/primitives.tsx` Modal: added a module-level MODAL_STACK so only the
+    TOPMOST modal handles Escape (RunMission nests inside MissionDetail); made the
+    effect mount-once via an onCloseRef (no focus-thrash on inline onClose).
+  - `rs-theme.css`: `.rs-pulse-soft` opacity-pulse utility (live iter chip;
+    reduced-motion-safe via the global `*{animation-duration}` rule).
+- **Verified**: tsc 0. Zero console errors. Logic byte-for-byte preserved; the
+  visual layer uses primitives already live-proven in Ships 22f-22h (Modal in 22i,
+  Badge/Banner/rs-log in 22g/22h). Full end-to-end exercise (create a real mission
+  → decomposing state → StageCards → RunMission config → delete) is deferred to the
+  22n audit ship, which spins up one throwaway mission to drive the whole pipeline.
+  (Runs-tab `captureScreenshot` stalls in this Chrome session — a pre-existing
+  CDP/compositor quirk independent of these changes.) Backend/sculptor untouched.
+
+### 2026-06-05 — Ship 22i: re-skin the launch dialogs (NewMission + NewRun)
+
+Frontend-only. First of the dialog-reskin sweep — the two run-launch dialogs the
+Runs sidebar header (+ project header) trigger.
+
+- **What**:
+  - `components/NewMissionDialog.tsx` rewritten onto the rs `Modal` primitive
+    (controlled `open` + rs `Btn` trigger, `rs-mtabs` Basic/Advanced). ALL logic
+    preserved VERBATIM: `useCreateMission(slug)` + exact payload
+    `{goal, mission_slug, no_kg, run_defaults}`, `buildRunDefaults()` (the 8
+    MissionRunDefaults fields), SLUG_PATTERN / GOAL_MIN(8) / GOAL_MAX(2000)
+    validation, `onCreated(job.params.mission_slug)`, reset-on-close. The Advanced
+    body is extracted to an exported `MissionAdvanced` (rs-row3 rounds/steps/seed +
+    two `ToggleRow`s gating Stability-window and the extension rs-row3) so
+    RunMissionDialog can reuse it next.
+  - `components/NewRunDialog.tsx` rewritten onto rs `Modal`. ALL logic VERBATIM:
+    `pickAdapterDefaults` (gym_sb3 / cartpole / go1 / g1 / other), the full launch
+    body (behavior_goal, iterations, no_kg, dry_run, training_iterations,
+    num_envs_override, device_override, expand_kg, max_episode_steps, playback_speed,
+    rollout_episodes, seed, auto_adjust_physics, early_stop_enabled,
+    early_stop_patience), the S8/§7.7 ETA estimate (SECONDS_PER_CYCLE → eta +
+    long-run/resume warnings), the open/adapter useEffect pre-fill. Restyled: amber
+    ETA box (st-amber tokens) on long runs, `rs-row2` field grids + `.rs-hintline`
+    helper text, `rs-select` for the auto-physics/early-stop dropdowns, `ToggleRow`
+    for dry-run/expand-kg/no-kg.
+  - New shared primitive `ToggleRow` (title + desc + Toggle, switch-only click
+    target) + `.rs-toggle-row`/`.rs-hintline` CSS — replaces the ad-hoc
+    `<label class=rs-check>` rows so help text is correctly styled (the `.hint`
+    rule is scoped to `.rs-field` only).
+- **Verified**: tsc 0. Live (Chrome): NewRun renders full — title/subtitle, amber
+  3.3 h long-run ETA box, Basic (behavior + dry-run ToggleRow) and Advanced
+  (8 iters / 1500 rsl_rl / 2048 num_envs / cuda:0 defaults, rollout knobs, both
+  selects with correct options, expand-kg/no-kg toggles). NewMission verified
+  (Basic: goal + "0 / 2000" counter + slug + no-kg; Advanced: rounds/steps/seed +
+  both ToggleRows → conditional stability-window + extension row3). Zero console
+  errors. Backend/sculptor untouched (305 / 364). (Runs-tab `captureScreenshot`
+  stalls in this Chrome session — a pre-existing render-loop quirk of that tab,
+  not these changes; Overview captures fine. Structure JS-verified there.)
+
+### 2026-06-05 — Ship 22h: re-skin Runs tab (3-pane) + LogViewer
+
+Frontend-only. The prototype's signature screen + the most logic-dense.
+
+- **What**:
+  - `components/RunsTab.tsx` rewritten. ALL Ship-21 logic preserved VERBATIM:
+    `partitionRuns` (sculpt_runs vs mission groups, stage_index sort + run_id
+    tiebreak), `missionRunStateLabel`, `durationStr`, `RewardVersionTransition`
+    (held / N-filtered / no-edit branching), `useMergedIterations` + `_mergeIterSlot`
+    + `_ITER_STATUS_RANK` (the sticky-map / status-monotonicity merge), keepPolling,
+    kill/regenerate, the physics-edit-suggestion chip. Restyled to the prototype's
+    `rs-runs-layout`: `rs-runs-side` (Runs header + dialog triggers; Missions groups
+    with collapsible `rs-mhead` + Plan button + nested stage `rs-runrow.rs-stage`;
+    Single-runs group), `rs-runs-detail` 3-col (`rs-iter-col` iteration cards /
+    `rs-mid-col` StageContext + RunHeader + LogViewer / `rs-extra-col` Mean-reward
+    MetricChart + StageRewards + GPU + IterDetail). Lifecycle/status via rs Badge;
+    rs Sparkline + rs SVG MetricChart (replaces recharts); mission collapse header
+    keyboard-operable.
+  - `components/LogViewer.tsx` reskinned to the dark `rs-log` (rs-log-bar with
+    rs-select filter + rs Toggle autoscroll + count; per-type event tag colors for
+    dark). Kept react-window virtualization + the autoscroll-detach logic; replaced
+    the hardcoded height=420 with a ResizeObserver-measured height so it fills the
+    pane (audit C2).
+- **Verified**: tsc 0. Live (Chrome): launched a dry-run → the full 3-pane rendered
+  with the sidebar run row (ERRORED badge + sparkline), the dark rs-log streaming
+  91 real WS events (live), the error banner, and the chart empty-state. WS
+  connected. Zero console errors. (The test run errored for a real-data reason —
+  halfcheetah is a draft with env_id=CHANGE_ME — which verified the error-state
+  path; iteration cards are logic-preserved + use the proven rs-itercard CSS.)
+  Backend/sculptor untouched (305 / 364).
+- **Transitional remaining**: the in-header dialog triggers (NewRun/NewMission/
+  MissionDetail) are still shadcn → reskinned to rs-modal in the dialogs ship next.
+
+### 2026-06-05 — Ship 22g: re-skin Rewards tab
+
+Frontend-only. The prototype's signature code/diff/why-this-edit screen.
+
+- **What**: `components/RewardsTab.tsx` rewritten. ALL Ship 21b/21d scope logic
+  preserved VERBATIM (missions/runs + keepPolling, liveStageScope, sticky
+  stickyStageScope, scopeOverride/effectiveScope, pollMs, the 3 effects that
+  reset/auto-advance selection, edit-lock-in-stage-scope). Restyled to rs:
+  rs-prompt hero ("Generate vN" + activity panel), rs-seg Project/Stage scope
+  toggle, rs-twocol (rs-verlist versions / detail), detail header + rs-code
+  chrome around the read-only **Monaco** source (kept Monaco per audit C3 — the
+  prototype's regex tokenizer mis-highlights arbitrary code), Diff-vs-parent via
+  MonacoDiffLazy, rs-why "Why this edit?" (failure chips + evidence + proposed
+  edits + arxiv links), EditorPane (Monaco editable + note + save + violations),
+  4-section REWARD_SPEC (hyperparameters/grounding/references/probe). The
+  regenerate-template confirm now uses the rs `Modal` primitive (was shadcn Dialog).
+  Author badges via the rs AuthorBadge.
+- **Dropped**: the separate ContractPreamble card (the compute_reward signature
+  contract is shown in the v0 source docstring itself + enforced server-side with
+  surfaced violations) — matches the prototype's cleaner layout.
+- **Verified**: tsc 0. Live (Chrome): rs-prompt, Versions (v0/HUMAN), Monaco v0.py
+  with syntax highlighting, real data. Why-panel correctly hidden for v0/human.
+  Zero console errors. Backend/sculptor untouched (305 / 364).
+
+### 2026-06-05 — Ship 22f: audit-pass fixes (a11y + dark-mode), pre-Rewards/Runs
+
+Ran the audit-driven loop on the 22a-e reskin: 3 parallel Explore agents
+(code-correctness, UI/UX fidelity, WCAG a11y). VERIFIED every load-bearing claim
+against source before acting — rejected several plausible-but-wrong ones. Sam chose
+"audit first, fix, then do Rewards/Runs" so foundation issues don't propagate.
+
+- **Fixed (verified-real, no design-palette change)**:
+  - `components/rs/primitives.tsx` — new reusable `Modal` (rs-scrim/rs-modal) with
+    Esc-to-close, initial focus, focus-restore-on-close, role=dialog/aria-modal.
+    (Also the foundation for the dialog reskin in a later ship.)
+  - `pages/ProjectList.tsx` — delete-confirm now uses `Modal` (was an inline scrim
+    with no Esc/focus); table rows made keyboard-operable (tabIndex/role=button/
+    Enter+Space/aria-label) — were mouse-only `<tr onClick>`.
+  - `components/PhysicsTab.tsx` — per-actuator motor inputs got `aria-label`
+    (were unlabelled cells under column headers).
+  - `index.css` — added a `.dark { … }` block with warm-dark values for the shadcn
+    tokens. PRE-EXISTING BUG: the app toggled `.dark` but defined no dark values, so
+    every shadcn surface (the still-transitional Rewards/Runs/dialogs) stayed light
+    in dark mode (light text on white = invisible). Now readable. (NOT the code
+    agent's suggested fix of restoring `text-foreground` on `<body>` — that would
+    re-break the rs dark-mode headings fixed in 22b.) Verified live: Rewards tab
+    now dark-correct.
+- **Rejected (verified false / not applicable)**: code-agent's "CRITICAL body
+  text-foreground" (its fix regresses 22b); UX-agent's "facts band missing on
+  Physics/KG/Reports" (it shows on all non-Runs tabs — confirmed in screenshots);
+  a11y "prefers-reduced-motion not covered" (the `*{animation-duration:.001s}` rule
+  covers it); video-captions (silent rollout video, pre-existing empty track).
+- **Deferred (noted, not strict-AA blockers)**: tab roving-arrow-nav + role=tabpanel
+  (tabs are already `<button>`+role=tablist/tab/aria-selected = keyboard-operable;
+  a tabpanel wrapper risks the rs-scroll flex layout); RobotViewer static camera
+  controls as overlay vs rs-viewer-foot.
+- **SURFACED to Sam (design-vs-AA tradeoff, NOT changed unilaterally — fidelity to
+  the prototype's exact brand was the explicit directive)**: white-on-Cursor-Orange
+  primary CTA ≈ 3.5:1 and `--muted` sub-text ≈ 3.8:1 are below WCAG-AA 4.5:1, but
+  they are the prototype's exact tokens. Hitting AA needs a visibly different
+  (darker/brick) orange + darker muted-gray. → RESOLVED (Sam): keep the
+  white-on-Cursor-Orange CTA exactly (it's the brand signature); darken only
+  `--rs-muted` light token #807d72 → #706e63 (≈4.8:1 on canvas/cards). Dark-mode
+  muted already passed (5.2:1). CTA stays ~3.5:1 by design choice.
+- **Verified**: tsc 0. Live: delete Modal (Esc/focus), keyboard rows, dark-mode
+  Rewards tab readable. Backend/sculptor untouched (305 / 364).
+
+### 2026-06-05 — Ship 22e: re-skin Physics tab
+
+Frontend-only. Verified live in Chrome, real data, zero console errors.
+
+- **What**: `components/PhysicsTab.tsx` rewritten preserving ALL logic verbatim
+  (usePhysics/usePhysicsPromptEdit/usePhysicsRematerialize, the job-watch effect +
+  commit/rejection handling, the full MotorLimitsCard form: per-actuator inputs,
+  datasheet PDF upload + extract, the not-in-MJCF guard, exact applyMotorLimits
+  payload). Restyled to rs: rs-prompt hero (Prompt Claude / Motor template),
+  Motor-specs rs-card with rs-table inputs + Upload datasheet, rs-code wrapper
+  around the read-only Monaco XML viewer, RejectionCard as rs-why, parse-error
+  rs-banner + Re-materialize, SummaryPanel as rs-sysgrid (joints/actuators/geoms)
+  + rs-kv sim options + joint/actuator lists.
+- **Finding C resolution**: dropped "total mass" — summing `geoms[].body_mass`
+  double-counts (multiple geoms per body; G1 read 96.5 kg vs ~35 real). Showing
+  the accurate `geoms` count instead. joints/actuators counts are accurate.
+- **Verified**: tsc 0. Live (Chrome): real MJCF (g1_29dof, 30 joints / 29
+  actuators / timestep 0.002 / integrator implicitfast / solver newton), Monaco
+  XML with syntax highlighting, motor form + datasheet upload intact. No console
+  errors. Backend/sculptor untouched (305 / 364).
+
+### 2026-06-04 — Ship 22d: re-skin Overview tab + RobotViewer
+
+Frontend-only. Verified live in Chrome, real data, zero console errors.
+
+- **What**:
+  - `components/RobotViewer.tsx` — rewritten preserving ALL logic verbatim (the
+    missions/runs polling + keepPolling, Static→Live auto-transition, useLiveClips,
+    useRunEvents `LiveStageRollout`, replay iter selection, fallbacks), swapping
+    chrome to rs- (`rs-viewer` / `rs-viewer-bar` / `rs-seg` mode switcher with
+    disabled Live/Replay when no runs / `rs-overlay` status + controls / `rs-scrub`
+    replay strip). Stage kept dark (`#16150f`) for real renders/video.
+  - `pages/ProjectDetail.tsx` — `OverviewTab` reskinned to rs: 2-col (RobotViewer +
+    "What this project is" / Project-facts rs-kv + RobotLibraryCard). Dropped the
+    shadcn Card + lucide imports from this file (now fully rs). Same shell/tab
+    routing as 22c.
+- **Verified**: tsc 0. Live (Chrome): Overview shows the real MuJoCo G1 render in
+  the rs viewer, mode-switcher disables Live/Replay (no runs), Project-facts rs-kv
+  with real config, Unitree G1 library card. No console errors. Backend/sculptor
+  untouched (305 / 364).
+- **Polish noted (for audit/22f)**: static camera-select + Re-render render as a
+  top-right overlay over the stage rather than in `rs-viewer-foot` below it
+  (prototype places them in the foot; would need lifting angle state).
+- **Transitional remaining**: Physics + Rewards (ScrollPad-wrapped old components),
+  Runs (old, full-height), all dialogs (22e+), RobotConfig + LibraryPage.
+
+### 2026-06-04 — Ship 22c: re-skin project shell + Reports + Knowledge Graph tabs
+
+Third re-skin Ship: the ProjectDetail shell (header/tabs/facts) + 2 tabs.
+Frontend-only. Verified live in Chrome, real data, zero console errors.
+
+- **What**:
+  - `pages/ProjectDetail.tsx` — rebuilt as the rs shell: `rs-phead` (back / folder /
+    name / status Badge / gear / New run), `rs-tabs` button-bar (replaces Radix
+    Tabs; role=tab + aria-selected; same local activeTab + conditional-mount
+    semantics as before — Radix already unmounted inactive content), `rs-facts`
+    chip band (adapter/robot/task/device/num_envs, hidden on Runs per prototype),
+    rs warning banners (adapter_unavailable / migration). Tabs not yet reskinned
+    (Overview/Physics/Rewards) render their existing components inside a `LegacyTab`
+    scroll wrapper (transitional — real data intact, e.g. the live MuJoCo G1 render
+    in Overview's RobotViewer). Runs/Reports stay lazy (preserved).
+  - `components/ReportsTab.tsx` — rs reskin (eyebrow/h2 header, Copy/Download/Build
+    buttons, rs-viewer for the real final.mp4 + `.rs-md` for react-markdown). Keeps
+    fetchReportMd/buildReport + query key + default export.
+  - `components/KnowledgeGraphTab.tsx` — rs reskin (papers list with search, real
+    techniques browser via useTechniques, pending seeds, interactive-graph card →
+    GraphModal). Keeps ALL actions (View graph, Bulk-seed, Heal stubs, AddSeeds,
+    ResearchTopic) + PaperDetailModal + PendingSeedJobWatcher. **Fix**: the shared
+    KG has 468 techniques; rendering them all as chips froze the renderer
+    (captureScreenshot timed out twice) — capped to top-60 by usage in a 240px
+    scroll band (Finding D: failure-modes/reward-components have no list endpoint,
+    so techniques-only).
+- **Why**: bring the project view into the new design; ship the 2 simplest tabs.
+- **Verified**: tsc 0. Live (Chrome): project shell with real facts (mjlab / Unitree
+  G1 / Mjlab-Velocity-Flat-Unitree-G1 / cuda:0 / 1,024); KG tab with real papers
+  (mjlab, Co-jump, ASAP…) + techniques; Reports empty-state. No console errors.
+  Backend/sculptor untouched (305 / 364).
+- **Transitional (next ships)**: header dialog triggers (gear / New run) are still
+  the existing shadcn ones → reskinned with the dialogs in 22e. Overview viewer +
+  Physics + Rewards + Runs reskins in 22d/22e.
+
+### 2026-06-04 — Ship 22b: re-skin shell + landing screens (+ ProjectSummary enrichment)
+
+Second re-skin Ship: the global shell + the three non-project screens, plus the
+Finding-A backend enrichment. Verified live in Chrome (light + dark), real data
+flowing, zero console errors.
+
+- **What**:
+  *Frontend*:
+  - `components/Layout.tsx` — rebuilt as the `rs-rail` shell (wordmark, NavLinks,
+    a live System mini-panel fed by useSystemGpu+useSystemInfo, theme toggle).
+    Mounts `useTheme()` here so the theme applies app-wide (audit C1) + the
+    rail toggle. Root is `rs-app`; `<main>` is `rs-main` (pages own their
+    `rs-scroll`).
+  - `pages/Dashboard.tsx` — prototype's 3-section dashboard (Active jobs strip
+    from useDashboard.active_jobs; Projects grid of `rs-pcard` from useProjects;
+    System card). Drops the old separate Recent-runs + KG-additions cards (that
+    info now lives in the project cards + per-project tabs). "New project" →
+    /library (the real robot-picker entry).
+  - `pages/ProjectList.tsx` — prototype's `rs-table` (Name/Status/Adapter/Robot/
+    Best/Trend/Updated) wrapped in an overflow-x scroller; per-row delete via an
+    rs-modal confirm (preserves useDeleteProject). Replaces the ProjectCard grid.
+  - `pages/Settings.tsx` — restyled to rs cards. Already read-only with real data
+    (api-key status, GPU/CUDA/adapters, shared-KG stats, paths, theme Segmented,
+    reset-cache) → matches Finding B exactly; NO fake editable fields added.
+  - `components/ProjectCard.tsx` — DELETED (dead after the table swap).
+  - `index.html` — removed `bg-background text-foreground` from `<body>`: those
+    utility classes (specificity 0,1,0) were overriding `rs-theme.css`'s
+    `body{color:var(--ink)}` (0,0,1), and index.css has no `.dark` override for
+    `--foreground`, so dark-mode headings rendered dark-on-dark. rs- tokens now
+    govern the page default. (Verified: bodyColor flips to `--ink` in dark.)
+  - `lib/types.ts` — `ProjectSummary` additive fields (adapter_class, library_slug,
+    num_envs, device, primary_metric, primary_metric_history).
+  *Backend (Finding A — additive, asked + approved)*:
+  - `models/project.py` — `ProjectSummary` gains the 6 optional card fields.
+  - `services/project_store.py` — `list()` fills adapter_class/library_slug/
+    num_envs/device from the already-loaded per-project detail (free).
+  - `routes/projects.py` — `list_projects` injects JobManager and attaches the
+    latest sculpt_run's `primary_metric` (max) + history per project (same data
+    source as /dashboard; metric is in-session only, consistent with it). Route
+    shape unchanged (still `list[ProjectSummary]`).
+- **Why**: deliver the prototype's shell + landing screens onto unchanged data
+  wiring; cards/table need the enriched summary (Finding A).
+- **Verified**: `pnpm tsc --noEmit` 0. Live (Chrome localhost:5173): rail with
+  real GPU (RTX 5070 Laptop, VRAM/temp/CUDA 13.0), 14 real projects with
+  adapter/robot, Settings showing torch 2.11.0+cu130 + 80 papers/468 techniques,
+  dark-mode contrast fixed, zero console errors. `/projects` enriched response
+  confirmed via curl. Backend pytest: exit 0 (305 passed, 1 deselected — additive
+  fields only, no test added/removed). Sculptor untouched (364).
+- **Deferred to 22c+**: ProjectDetail shell (header/tabs/facts) + the 6 tab
+  contents; all dialogs (22e); ProjectCreate stub + LibraryPage + RobotConfig.
+
+### 2026-06-04 — Ship 22a: re-skin foundation (design tokens + theme + rs/ primitives)
+
+First implementation Ship of the `design-prototype/` integration (audit-driven
+loop: research → plan → plan-audit → implement). Foundation only — no screen
+reskinned yet; existing shadcn screens still render unchanged (verified live).
+
+- **What**:
+  - `frontend/src/styles/rs-tokens.css` + `rs-theme.css` (NEW) — the prototype's
+    bespoke "Cursorlike" design system (colors_and_type.css + theme.css),
+    imported in main.tsx after index.css. The two colliding CSS variables
+    (`--primary`, `--muted`) renamed → `--rs-primary`/`--rs-muted` (+ -active/
+    -soft) so they DON'T clobber the app's shadcn `hsl(var(--primary))` Tailwind
+    tokens (index.css:16 defines `--primary` as an HSL triplet; the prototype's
+    hex would make `hsl(#f54e00)` invalid → silently break bg-primary/
+    text-muted-foreground on every un-migrated screen — the plan-audit's BIGGEST
+    HOLE). Dropped the render-blocking Google-Fonts `@import` (→ index.html) and
+    the global `body{overflow:hidden}` + `#root{height:100vh}` (conflicted with
+    index.css h-full + Layout scroll model).
+  - `frontend/index.html` — Inter + JetBrains Mono via `<link rel=preconnect>` +
+    stylesheet (non-blocking); `color-scheme: light dark`.
+  - `frontend/src/main.tsx` — import the rs- CSS; call `bootstrapTheme()` before
+    createRoot so the theme is applied on first paint.
+  - `frontend/src/hooks/useTheme.ts` — `applyTheme`/`bootstrapTheme` now set
+    `data-theme="light|dark"` alongside the `.dark` class (rs- tokens key dark
+    mode on `[data-theme]`). Public API + storage key unchanged.
+  - `frontend/src/components/rs/icon.tsx` (NEW) — `<Icon name="kebab" />` over
+    lucide-react (~70 names) so ported screens keep their call sites verbatim.
+  - `frontend/src/components/rs/primitives.tsx` (NEW) — typed ports of the
+    prototype primitives (Badge, AuthorBadge, Delta, FactChip, Btn, IconBtn,
+    Sparkline, MetricChart [SVG, replaces recharts], Segmented, Toggle, Field,
+    Check, Banner, EmptyState, Skel) + a STATUS_META superset (Project/Job/Stage/
+    Mission). Sparkline + MetricChart are null-safe for real `(number|null)[]`.
+- **Why**: establish the design system + shared primitives so each screen Ship
+  (22b–e) is a presentational swap onto unchanged data wiring.
+- **How**: hybrid (plan-audit-approved) — bespoke rs- CSS for designed surfaces;
+  KEEP shadcn/Radix + Monaco + the pyvis GraphModal iframe + react-window
+  LogViewer for interactive/a11y-critical surfaces, restyled. Per-screen ports
+  EDIT existing components in place (never rewrite from prototype JSX) to preserve
+  Ship 21b/21d/21e logic (keepPolling, sticky scope, terminalRef, mergedIters).
+- **Verified**: `pnpm tsc --noEmit` 0. App boots in Chrome (localhost:5173), zero
+  console errors, real GPU data (RTX 5070 Laptop) flowing. Token namespacing
+  confirmed: Dashboard's primary button still navy (Tailwind token intact, not
+  orange). Backend/sculptor untouched → 305 / 364 unchanged. Live reskin in 22b.
+- **Decisions (asked + approved by Sam)**: Finding A → enrich ProjectSummary
+  additively (cards need adapter/robot/metric/spark); Finding B → Settings stays
+  read-only (no write endpoints exist; don't fake editable fields).
+
+### 2026-06-04 — Pre-skin checkpoint: restore Windows-era uncommitted work
+
+New window opened for the **design re-skin** task (integrate the
+`design-prototype/` high-fidelity prototype into the live app). Before
+touching anything, found the working tree carrying ~836 lines of
+uncommitted, **load-bearing** changes that prior changelog entries
+describe (Ships 11/12/13/15/17) but that this branch's git history never
+contained — the Windows→WSL move (see "Linux-specific notes") brought the
+FILES but not all the commits. Tell-tales: HEAD (`9a99b57`) `main.py`
+has **no** missions-router registration even though the merged Runs tab
+(Ships 18a–21) needs it; `edit.py` is still the all-or-nothing version
+Ship 12 claims to have replaced; a Windows OneDrive path is baked into
+`test_reward_parity.py`'s skip reason. Verified all gates green on the
+tree AS-IS, then committed it so committed == working before re-skinning.
+Sam chose "checkpoint first" (2026-06-04).
+
+- **What** (reconstructed from diffs; no new behavior authored here):
+  *Sculptor (`RewardSculptor/`)*:
+  - `sculptor/edit.py` — `_pre_validate` all-or-nothing → partition
+    (Ship 12): proposed edits split into applicable / deferred /
+    **rejected** (`EditPlan.rejected_edits` + `rejection_reasons`);
+    only an EMPTY applicable list raises; emits `log_line` + new
+    `edits_rejected` structured event per drop. Anthropic client
+    `max_retries=6` → `max_retries=2, timeout=240.0`.
+  - `sculptor/kg/query.py` — `_get_embedder` thread-lock +
+    `local_files_only=True` HF-hang bypass (Ship 11) + timing logs in
+    `_ensure_technique_embeddings` / `query_semantic`.
+  - `sculptor/kg/research.py` — off-topic-hallucination guard (Ship 13):
+    `_fetch_arxiv_metadata_batch` + `_verify_topic_match` (embed real
+    arxiv title+abstract vs topic, drop cosine < 0.15), new
+    `papers_rejected_off_topic` field; fail-open on arxiv/embedder outage.
+  - `sculptor/adapters/{mjlab,_mjlab_runner}.py` — Ship 15 warm-start:
+    `init_policy_path` / `--load-pretrained-policy`, loads actor+critic
+    only (skips optimizer/iteration/rnd), `warm_start_loaded` event,
+    broad load-error wrapping.
+  - `sculptor/prompts/diagnose_grounded.md` — operation-vs-target_term
+    rules (clip/gate/replace need an existing term; only `add` adds a
+    new name); raw `qpos/qvel/xquat/xpos` not grounded.
+  - `sculptor/prompts/research_topic.md` — "never attach a real-but-wrong ID."
+  - `sculptor/prompts/redecompose_stage.md` (NEW) — load-bearing prompt;
+    `decompose.py:707` does `load_prompt("redecompose_stage")` (Ship 17).
+  - `tests/test_{edit,kg_query,kg_research}.py` + `test_ship15_warm_start.py`
+    (NEW, 16 tests) — regression coverage for the above.
+  *Backend UI (`reward-sculptor-ui/backend/`)*:
+  - `main.py` — **registers the missions router + ws_router** (the piece
+    missing from HEAD that the Runs tab depends on); pins the
+    embedder-prewarm task on `app.state` so it isn't GC'd.
+  - `services/reward_jobs.py` — prompt-edit timeout default 300 → 900s
+    (budget math: 2 × (240s call + 60s SDK backoff) + margin).
+  *Frontend (`reward-sculptor-ui/frontend/`)*:
+  - `components/GraphModal.tsx` — `flex flex-col` + `min-h-0` so the KG
+    graph iframe claims full modal height (was collapsing to ~300px).
+- **Why**: a clean, coherent base for the re-skin. Without it my Ship
+  commits would either sweep up this work uncredited or sit on top of an
+  uncommitted, missions-broken HEAD (origin/PR #1 incoherent for missions).
+- **How**: staged ONLY these source/test/prompt files + this entry by
+  explicit path (no `git add -A`). Left untracked artifacts out of git
+  (`.pr-body-*.md`, `HANDOFF_*.md`, `RL-Sculptor.html`, `*:Zone.Identifier`,
+  `ame456_kg_seeds.yml`, `design-prototype/`).
+- **Verified**: `pnpm tsc --noEmit` 0; backend pytest **305 passed, 1
+  deselected** (376s; arxiv 429/503 noise = network ingest tests falling
+  back to seed metadata, all pass); sculptor pytest **364 passed, 1
+  skipped** (150s). Live smoke deferred to the re-skin verification.
+
+### 2026-04-25 — Ships 21a-21e: mission UX hardening + review pass
+
+Five follow-up ships on the `ship-20-ux-revamp` branch after Ship 21's
+Missions→Runs merge. All on GitHub (PR #1 → base `ship-19-skill-
+library`; `main` has unrelated history). Branch head: `db1cdea`.
+
+- **Ship 21a** (`ffe9c5c`) — NewMissionDialog Advanced tab (Basic/
+  Advanced, mirrors NewRunDialog) persisting `run_defaults` on the
+  mission (sculptor `Mission.run_defaults`, backend CreateMission
+  Request + MissionDetail, RunMissionDialog pre-fill). + Fixed the
+  404-flash on Decompose: `mission_store` returns a "decomposing" stub
+  when `.decompose_pending` exists but mission.json doesn't yet.
+- **Ship 21b** (`3c6a6e0`) — live rewards + live video for stage runs
+  (frontend-only). RewardsTab auto-scopes to the active stage (Project/
+  Stage toggle, 3s poll); RobotViewer `LiveStageRollout` plays per-iter
+  rollout.mp4 for `mission_stage_run` kind.
+- **Ship 21c** (`190ce05`) — torch-idiom guard for success_criterion.
+  Claude was writing `.float()` (torch) on numpy arrays → stage failed
+  at the LAST criterion eval after 10+ h of G1 training. 3-layer
+  defense: decompose prompt rule + `validate_mission` AST walker +
+  runtime `_evaluate_success_criterion` safe-attr removal. Plus the
+  iter-row "v3 · held" UX (no-edit iters were misread as failures).
+- **Ship 21d** (`cb2ef96`) — RELIABLE reward propagation. Root cause:
+  `useRuns` stopped polling at every stage boundary (no running run
+  for a beat) and never auto-resumed → scope froze/flipped to project
+  → "rewards only sometimes update." Fix: `useRuns(slug, {keepPolling})`
+  driven by `missionActive`; sticky stage scope in RewardsTab; mission-
+  scoped reward polling; stage-aware `?stage=` on the diagnosis route
+  so "Why this edit?" works per stage.
+- **Ship 21e** (`db1cdea`) — 4-agent review panel (backend, frontend,
+  UI/UX, a11y). Verified findings → fixed: `useLiveClips` infinite-
+  reconnect loop (missing terminalRef — CRITICAL); `_resolve_run_root`
+  path-traversal guard + stage_name sanitize; WCAG AA motion-safe
+  guards + badge contrast (-700→-800); WS reconnect-timer cleanup;
+  "Plan" button affordance; aria-labels (badges, videos, sparkline,
+  Re-render, form aria-invalid); deleted dead MissionsTab.tsx.
+  Rejected 2 overstated agent claims + 1 regressive suggestion.
+
+**Verified across the series:** `pnpm tsc --noEmit` 0; backend pytest
+305 passed, 1 deselected; sculptor 364 passed, 1 skipped.
+
+**KG note:** AME456 jumping-robot bibliography (14 papers) ingested +
+extracted into the shared KG at `~/.local/share/sculptor/kg/graph.db`
+(now 80 papers / 468 techniques). Seeds at `~/projects/ame456_kg_
+seeds.yml`.
+
+### 2026-04-25 — Ship 21: Missions merged into Runs (cross-tab integration v2)
+
+**Scope:** User reported five concrete bugs after the Ship 20 G1 test:
+(1) the auto-open detail dialog flashed open then closed for ~1s on
+Decompose submit; (2) post-failure the StageCard read `rounds 4/3`
+because `effective_max_iterations` (introduced Ship 20) was only on
+WS events, NOT persisted on the Stage dataclass — when the WS event
+window evicted `stage_started` the UI fell back to the authored
+budget; (3) mission stages didn't appear in the Runs tab as runs;
+(4) live training videos didn't surface in Overview for stages;
+(5) per-stage reward versions weren't visible. Sam's verdict:
+"I don't even think there needs to be a separate missions tab. It
+should be integrated within the runs tab." Ship 21 is two phases
+landed in one commit:
+
+**Phase A (small fixes)** — auto-open flicker fix + persisted
+`effective_max_iterations` + 3 regression tests.
+
+**Phase B (cross-tab merge)** — mission stages become first-class
+`mission_stage_run` Job entries; `list_runs` returns them; the
+Runs tab sidebar groups them under their parent mission with a
+collapsible chevron; the run detail pane shows per-stage rewards;
+the Missions tab is **removed** from `ProjectDetail`. The
+`MissionDetailDialog` survives as the curriculum view (decomposition
+rationale + stage cards + Run/Delete) — opened from the new "Plan"
+button on each mission group header in the Runs sidebar, AND from
+post-Decompose auto-open via `NewMissionDialog → onCreated →
+setMissionDialogSlug` (the same auto-open flow Ship 19c-20 wired,
+relocated to RunsTab).
+
+**Process (mirrors prior ships' audit-driven pattern):**
+
+1. **Research (`Explore` agent)** — mapped JobManager parent/child
+   support (none — would need new wiring), `list_runs` filtering
+   (`kind="sculpt_run"` only), per-stage filesystem layout (each
+   stage scaffolds `<project>/.missions/<m>/stages/<s>/{rewards,runs}/`
+   as a self-contained sub-project), the mission_jobs `_stream_stdout`
+   event-tag parser, the relationship between sculpt_run subprocess
+   events and the parent mission_execute job's stdout. Surfaced 4
+   load-bearing constraints: (a) JobManager has zero parent/child
+   wiring; (b) `RunSummary` lacks parent_id/mission_slug/stage_name;
+   (c) per-stage rollouts live under stage_dir, not project root;
+   (d) per-stage rewards are already on disk in stage_dir/rewards/
+   but no endpoint exposes them.
+2. **Plan v2** committed to the lightweight architecture: register
+   per-stage child Jobs as `mission_stage_run` kind via a new
+   `register_passive_job` helper that doesn't spawn a runner (the
+   work is already happening inside the parent's subprocess);
+   tee `iter_*` and stage-lifecycle events from the parent's
+   stdout to the active child; extend `list_runs` filter; add a
+   `?stage=<m>/<s>` query to rewards endpoints; rebuild RunsTab's
+   sidebar to group stage rows under their mission.
+3. **Implementation** landed across 11 files (backend + frontend).
+4. **Code-audit (`Explore` agent)** — surfaced 2 CRITICALs and a
+   handful of MEDIUM/LOW. CRITICALs both fixed in the same commit.
+5. **Design-critique (`Explore`-as-design-critic agent)** —
+   surfaced 1 WORST issue (mission group header click-target
+   ambiguity) + 11 lower-severity items. WORST fixed.
+
+**Files added / changed:**
+
+*Sculptor (`~/projects/RewardSculptor`)*:
+- **[sculptor/mission.py](RewardSculptor/sculptor/mission.py)** —
+  Phase A: `Stage.effective_max_iterations: Optional[int] = None`
+  field. Persisted via `dataclasses.asdict`; backward-compatible
+  via `Stage.from_dict`'s filter-unknown-keys path so older
+  mission.json loads fine.
+- **[sculptor/sculpt.py](RewardSculptor/sculptor/sculpt.py)** —
+  Phase A: `_run_one_stage` sets
+  `stage.effective_max_iterations = effective_max_iterations`
+  BEFORE the `stage_started` emit so the value is captured by
+  any save path (success, criterion-failure, training-error,
+  scaffold-error). Inline comment documents the BASELINE
+  semantic (Goal B extensions emit their own events; the cap
+  reflects what the user explicitly chose).
+- **[tests/test_mission_run.py](RewardSculptor/tests/test_mission_run.py)** —
+  Phase A regression tests (3): `test_mission_run_persists_
+  effective_max_iterations_on_stage` (success path round-trips
+  through JSON + reload), `test_mission_run_persists_effective_
+  max_iterations_on_failure` (the actual G1 case Sam hit:
+  criterion failure path also persists), `test_stage_effective_
+  max_iterations_backward_compat_load` (older mission.json
+  without the field loads with `effective_max_iterations=None`).
+
+*Backend UI (`~/projects/reward-sculptor-ui`)*:
+- **[backend/services/job_manager.py](reward-sculptor-ui/backend/services/job_manager.py)** —
+  `Job.parent_id: Optional[str] = None`. New `register_passive_
+  job(kind, project_slug, *, params, parent_id) -> Job` that
+  registers a Job WITHOUT a runner: `_cancel = None`, `_task =
+  None`, `status = "running"` immediately. Audit-fix CRITICAL
+  #2: `JobManager.stop` routes a stop request on a passive job
+  (no `_cancel`) to its `parent_id` so a "Stop" click on a
+  stage row terminates the parent mission's subprocess (which
+  kills all child stages) instead of silently returning None.
+- **[backend/models/kg.py](reward-sculptor-ui/backend/models/kg.py)** —
+  `JobKind` literal extended with `"mission_stage_run"`.
+  `JobSummary.parent_id` field.
+- **[backend/services/mission_jobs.py](reward-sculptor-ui/backend/services/mission_jobs.py)** —
+  `_stream_stdout` accepts `job_manager`, `project_slug`,
+  `mission_slug` so it can register child Jobs. New module-
+  level `_STAGE_OPEN_EVENT`, `_STAGE_CLOSE_EVENTS`,
+  `_STAGE_TEE_EVENTS` constants enumerate the stage-lifecycle
+  contract. On `stage_started`: closes any prior unclosed stage
+  defensively, then registers a passive Job with stage params
+  (mission_slug, stage_name, stage_index, stage_dir,
+  behavior_goal, iterations_requested = effective_max_iterations).
+  All `iter_*` + warm-start + redecomposition + skill-publish
+  events get tee'd to the active child too. On `stage_succeeded`/
+  `stage_skipped`: child marked `completed`. On `stage_failed`:
+  child marked `errored` with the reason. On parent-subprocess
+  termination: any still-open child closed `errored` so the
+  Runs UI doesn't show a perpetually-running row.
+- **[backend/routes/missions.py](reward-sculptor-ui/backend/routes/missions.py)** —
+  `POST /missions/{slug}/run` passes `job_manager=jobs` into
+  `run_mission_execute_job` so the streamer can register child
+  Jobs.
+- **[backend/routes/runs.py](reward-sculptor-ui/backend/routes/runs.py)** —
+  `_find_run` accepts `mission_stage_run` kind. New
+  `_resolve_run_root(job, project_dir)` returns the right
+  `runs/` root: `<project>/.missions/<m>/stages/<s>/runs/`
+  for stage runs, `<project>/runs/` for top-level. `list_runs`
+  merges both kinds (top-level first, then stage runs sorted
+  by JobManager order). `_run_summary` populates the new
+  fields (`kind`, `parent_id`, `mission_slug`, `stage_name`,
+  `stage_index`). `get_iter_rollout` uses `_resolve_run_root`
+  so `/projects/{slug}/runs/{stage_run_id}/iterations/{N}/rollout`
+  serves the stage's rollout video. `get_clip_file` left
+  unchanged — live clips are written by `rollout_streamer`
+  keyed on the parent mission_execute job_id, not the child;
+  stage runs return a clean 404 on the clips endpoint, which
+  is fine because the frontend uses `get_iter_rollout` for
+  per-iter videos. Stage params synthesized into `RunParams`
+  in `get_run` (`iterations_requested` falls back to
+  `params["iterations_requested"]` then `params["iterations"]`
+  then `1`).
+- **[backend/models/run.py](reward-sculptor-ui/backend/models/run.py)** —
+  `RunSummary` adds `kind: str = "sculpt_run"`, `parent_id`,
+  `mission_slug`, `stage_name`, `stage_index` (all
+  Optional). RunDetail extends RunSummary so the same fields
+  flow into the detail endpoint.
+- **[backend/routes/rewards.py](reward-sculptor-ui/backend/routes/rewards.py)** —
+  New `_resolve_rewards_dir(store, slug, stage)` helper. When
+  `stage="<mission_slug>/<stage_name>"`, the function returns
+  `<project>/.missions/<mission_slug>/stages/<stage_name>/rewards/`
+  with traversal guards (rejects `..`, empty halves, backslashes,
+  non-2-part splits). `list_rewards` and `get_reward` accept
+  `?stage=...` query; absent → project rewards (Ship 18a
+  behavior preserved). Stage queries that resolve to a
+  not-yet-scaffolded rewards/ dir return `[]` (not 404) so the
+  Runs detail pane shows "no reward versions yet" cleanly while
+  the stage is still v0-only.
+
+*Frontend (`~/projects/reward-sculptor-ui/frontend/src`)*:
+- **[lib/types.ts](reward-sculptor-ui/frontend/src/lib/types.ts)** —
+  `RunSummary` new optional fields (`kind`, `parent_id`,
+  `mission_slug`, `stage_name`, `stage_index`). `StageSchema`
+  gains `effective_max_iterations: number | null` (Phase A).
+- **[lib/api.ts](reward-sculptor-ui/frontend/src/lib/api.ts)** —
+  `listRewards(slug, stage?)` and `getReward(slug, version,
+  stage?)` accept the optional stage param, append
+  `?stage=<encoded>` query.
+- **[hooks/useRewards.ts](reward-sculptor-ui/frontend/src/hooks/useRewards.ts)** —
+  `useRewards` and `useReward` accept a `stage?: string | null`
+  argument. Cache keys are namespaced (`["rewards", slug,
+  "stage", stageKey]`) so stage-scoped queries don't clobber
+  the project rewards cache.
+- **[components/RunsTab.tsx](reward-sculptor-ui/frontend/src/components/RunsTab.tsx)** —
+  Substantial rewrite. Public `RunsTab` now owns mission state:
+  imports `useMissions`, `NewMissionDialog`, `MissionDetailDialog`,
+  `MissionLifecycleBadge`. New `partitionRuns(runs, missions)`
+  splits runs into top-level sculpt_runs and mission groups
+  (one entry per mission_slug with its stage runs sorted by
+  `stage_index`, audit-fix #6 stable tiebreak on `run_id`).
+  Runs sidebar `RunSidebar` is fully rewritten: header
+  "Single runs" section followed by mission group entries.
+  Each group has a collapsible chevron-button (toggles expand);
+  the group "Plan" button (audit-fix WORST: explicit hit
+  target, was an inline subbutton with click-target ambiguity)
+  opens MissionDetailDialog. Stage rows render via the same
+  `RunRow` primitive as top-level runs but with
+  `stageContext={true}` which prefixes the row with
+  `${stage_index + 1}.` and uses `stage_name` instead of
+  `run_id`. New `StageContextCard` (in RunDetailPane, only
+  for mission_stage_run rows) surfaces "Stage N: name" +
+  "mission ${slug}" + behavior_goal. New `StageRewardsCard`
+  (right column, mission_stage_run only) lists per-stage
+  reward versions via `useRewards(slug, stage)`. Removed
+  the Ship-20 `ActiveMissionsCard` (rendered the missions
+  separately above the runs grid) — its function is replaced
+  by the inline mission groups.
+- **[components/MissionsTab.tsx](reward-sculptor-ui/frontend/src/components/MissionsTab.tsx)** —
+  Phase A1: gating fix at the dialog mount (`open={selectedSlug
+  != null}` instead of `open={!!selected}`) so the auto-open
+  dialog doesn't flicker closed when the optimistic-cache
+  placeholder is briefly replaced by an in-flight refetch.
+  File still on disk but unreferenced; deletable in a follow-
+  up clean-up.
+- **[components/MissionDetailDialog.tsx](reward-sculptor-ui/frontend/src/components/MissionDetailDialog.tsx)** —
+  Phase A3: StageCard reads from `stage.effective_max_iterations`
+  (persisted, source of truth) first, falls back to the WS
+  event-derived map (transient), then to `stage.max_iterations`
+  (Claude's authored value). Source-doc comment in
+  `deriveStageEffectiveMaxIters` documents the 5000-event-cap
+  limitation as known.
+- **[pages/ProjectDetail.tsx](reward-sculptor-ui/frontend/src/pages/ProjectDetail.tsx)** —
+  Missions tab removed from the `TABS` array. The dead
+  `<TabsContent value="missions">` block deleted. Import for
+  `MissionsTab` removed.
+
+**Audit findings + fixes:**
+
+- **Code-audit CRITICAL #2 — `JobManager.stop` silently fails on
+  passive jobs.** Pre-fix: `stop(stage_run_id)` returned None
+  (because passive jobs have `_cancel = None`), so the frontend
+  toast "Kill signal sent" was a lie — the parent's subprocess
+  kept training. **Fix shipped:** `stop` now routes to
+  `parent_id` for passive jobs so the parent's `_cancel` flag
+  fires, terminating the subprocess (and all child stages).
+- **Code-audit MEDIUM #6 — sort stability.** `partitionRuns`
+  sorts stages by `stage_index` only; if two stages share an
+  index (Ship 17 redecomposition splice edge case), order was
+  non-deterministic. **Fix shipped:** secondary tiebreak on
+  `run_id.localeCompare`.
+- **Design-audit WORST — mission group header click target
+  ambiguity.** Pre-fix: chevron toggled expand, the rest of
+  the header opened MissionDetailDialog — users clicking the
+  goal text expecting expansion got a dialog instead. **Fix
+  shipped:** the entire header (chevron + Sparkles + lifecycle
+  + label + goal) is one button that toggles expand/collapse;
+  a small "Plan" pill on the right is the explicit
+  curriculum-dialog button.
+- **Code-audit MEDIUM #4 — `get_clip_file` for stage runs.**
+  Live clips are written by `rollout_streamer` keyed on the
+  parent mission_execute job. Stage runs return a clean 404
+  on the clips endpoint. Acceptable: the frontend uses
+  `get_iter_rollout` for per-iter videos, which DOES resolve
+  to the stage's rollout. Documented in the route's inline
+  comment as a known limitation.
+- **Code-audit FINDING #1 — event ordering invariant.** Auditor
+  flagged a theoretical race where `iter_*` could fire before
+  `stage_started`. The orchestrator (sculpt.py) emits
+  `stage_started` BEFORE entering sculpt_run (the source of
+  iter_* events) at line 2169-2178, so the invariant holds.
+  Defensive close-prior-stage logic already in place handles
+  redecomposition splices. No code change.
+
+**Tests + verification:**
+- ✅ **TypeScript**: `pnpm tsc --noEmit` returns 0.
+- ✅ **Sculptor pytest**: **358 passed, 1 skipped** (was 355 →
+  +3 Phase A persistence regression tests, zero regressions
+  across the 355 baseline).
+- ⏳ **Backend pytest**: pending (existing 299 baseline; no
+  new tests added in Ship 21 itself — the cross-tab merge is
+  exercised end-to-end by the frontend tsc + the existing
+  list_runs test which still asserts the `sculpt_run` happy
+  path).
+- ⏳ **Live smoke**: Sam's G1 mission should now show:
+  - Decompose submit → MissionDetailDialog opens stably (no
+    flicker; gated on direct selectedSlug state).
+  - StageCard `rounds X/Y` reflects the effective cap from
+    `stage.effective_max_iterations` (persisted), survives
+    page refresh + WS event-cap eviction.
+  - Mission stages appear as nested rows under the mission
+    group in Runs sidebar.
+  - Click stage row → live iter timeline + metric chart +
+    log viewer + per-stage reward versions in the right
+    column.
+  - Stage rollout videos available via the same per-iter
+    rollout endpoint (stage runs route to `<project>/.missions
+    /<m>/stages/<s>/runs/iter_N/rollout/rollout.mp4`).
+  - Top-right "Plan" button on each mission group opens the
+    decomposition view (rationale + stage cards + Run/Delete).
+  - Missions tab no longer in the tab strip.
+
+**Callable surface (UI):**
+- Open a project → click **Runs** tab.
+- Click **New mission** in the header to decompose a goal;
+  MissionDetailDialog auto-opens to show the live decompose
+  stream.
+- After decompose completes (lifecycle "ready"), click **Plan**
+  on the mission group in the sidebar to review the curriculum
+  and click **Run mission** in the dialog footer to launch
+  with iterations_override / Goal A / Goal B settings.
+- Once running, each stage appears as a nested row under the
+  mission group. Click a stage row to see live metrics,
+  iter-by-iter logs, and the stage's reward versions.
+- **New run** still launches a single standalone training run
+  (kind="sculpt_run"), surfaced under "Single runs" in the
+  sidebar.
+
+**Explicitly NOT in Ship 21** (deferred):
+- Per-stage Monaco editing in the Runs detail pane —
+  StageRewardsCard is read-only; full editing stays in the
+  Rewards tab (project-scoped). A future ship can add inline
+  edit; the underlying `?stage=` query is already wired.
+- Live clips for stage runs — `rollout_streamer` is keyed on
+  the parent mission_execute job; ship a stage-keyed streamer
+  if Sam wants live frame-by-frame mid-stage video. Per-iter
+  rollouts work today.
+- RobotViewer (Overview tab) doesn't yet pick the active
+  stage as the most-recent run — would need to extend its
+  most-recent-run selector to consider `mission_stage_run`
+  rows. Defer.
+- Deleting `MissionsTab.tsx` (now dead code on disk). Leave
+  for a tidy-up commit.
+- Auto-reconnect on WS disconnect for stage runs. Inherits
+  Ship 18b's "no auto-reconnect" decision; refresh-to-retry
+  banner still shows.
+
+### 2026-04-25 — Ship 20: UX label revamp + cross-tab mission integration
+
+**Scope:** Audit-driven UI cycle on the React app. Five user-facing wins: (1) Goal A/Goal B labels in RunMissionDialog renamed to plain English; (2) `iters X/Y` display in StageCard fixed to honor `iterations_override` (was showing nonsense like `iters 2/3` when override capped run at 2); (3) `params.mission_slug` wire format pinned with a regression test (Sam's auto-open-dialog complaint from Ship 19d); (4) blanket label cleanup — `MISSION_EXECUTE`/`MISSION_DECOMPOSE` chips, `0/3 stages`, `redecomp ×N`, `orphan parent_ref`, "Decomposing — Claude is building the curriculum"; (5) active missions surface in the Runs tab via a static `ActiveMissionsCard` panel that opens the existing `MissionDetailDialog`.
+
+**Process (mirrors Ships 14-19d's audit-driven pattern):**
+1. **Research (`Explore` agent)** — file:line-cited map of Missions/Runs/Rewards/Physics/Overview tab structure, WS/query-key surface, exact `iters X/Y` failure mode (MissionDetailDialog.tsx:567-569 reads `stage.max_iterations` — Claude's authored budget — instead of the override-respecting cap from sculpt.py:2342).
+2. **Website-designer (`Plan` agent)** — IA proposal. Lead recommendation: **keep Missions tab separate** (decompose-time UX is fundamentally different from run-time monitoring); migrate stage live-state visibility into Runs via a `useMissionStageRuns(slug)` derived hook + `<MissionStageGroup>` collapsible. Full label-and-copy table.
+3. **Plan-audit (`Plan` agent)** — biggest hole flagged: **"the synthetic-stage-rows go blank when the user switches tabs and comes back."** The designer plan derived per-stage iter timelines from a per-tab `useMissionEvents` subscription, but `useMissionEvents` resets state on every effect re-run + the structuredEvents 5000-cap means re-mounting after a tab switch loses all stage cursor history. The proposed mitigation (hoist WS above tab-mount) would touch outside the in-scope file list. Other CRITICAL/HIGH: synthetic id collision across mission re-runs, `iter_progress` events dropped by `deriveStageIters`, `useRunEvents` vs `useMissionEvents` shape mismatch, decompose-stream UX in MissionDetailDialog would break if the live-stream half got excised wholesale.
+4. **Plan v2 — chose lower-blast-radius cross-tab integration.** Don't migrate live-stream UI from MissionDetailDialog to RunsTab; the dialog stays the canonical live-monitoring surface (with its existing audit-driven WS gating). Add a static `ActiveMissionsCard` to RunsTab that surfaces missions with `active_job_id != null OR lifecycle === "running"`. Click a row → opens the **existing** MissionDetailDialog (now mounted from RunsTab too, but only one tab is mounted at a time per ProjectDetail.tsx's deferred-mount, so no double-WS concern).
+5. **Implementation** — see file list below.
+6. **Code-audit (`Explore` agent)** — flagged Goal B semantic clarification (the new `effective_max_iterations` event payload is the BASELINE cap, not the post-extension cap; documented in inline comment), 5000-event cap interaction (documented as known limitation), `useMissions` polling overlap (deduped by React Query cache key — fine).
+7. **Design-critique (`Explore`-as-design-critic agent)** — applied CRITICAL fixes: `*` override indicator's aria-label now scopes to the rounds value (was on the asterisk only — screen reader would announce "Per-launch override applied" disconnected from the number); `ActiveMissionsCard` got `max-h-[420px] overflow-y-auto` (was unbounded — would push runs grid off-screen on mobile with many active missions); empty-state copy in RunsTab now conditionally mentions "panel above" only when at least one mission is active; `missionRunStateLabel` (RunsTab) and `stageProgressLabel` (MissionsTab) harmonized so the same mission reads the same way across tabs.
+
+**Files added/changed:**
+
+*Sculptor (`~/projects/RewardSculptor`)*:
+- **[sculptor/sculpt.py](RewardSculptor/sculptor/sculpt.py)** — Goal #2: `_run_one_stage` now computes `effective_max_iterations = iterations_override or stage.max_iterations` BEFORE the `stage_started` emit (line ~2169) and includes it in both `stage_started` and `stage_completed_training` event payloads. The pre-existing `max_iters = ...` line at sculpt.py:2342 was hoisted up + reused. Audit-driven inline comment documents that this is the BASELINE cap before any Goal B (`extend_on_improvement`) extensions; extensions are surfaced via separate `stage_extended` events.
+
+- **[tests/test_mission_run.py](RewardSculptor/tests/test_mission_run.py)** — 2 new regression tests: `test_mission_run_stage_events_include_effective_max_iterations` (override path: payload reflects override, NOT authored value) + `test_mission_run_effective_max_iterations_falls_back_to_authored` (no-override path: payload equals authored).
+
+*Backend (`~/projects/reward-sculptor-ui`)*:
+- **[backend/tests/test_missions.py](reward-sculptor-ui/backend/tests/test_missions.py)** — 1 new regression test: `test_create_mission_response_includes_params_mission_slug`. Pins the `params.mission_slug` wire format that the auto-open dialog depends on (Ship 19c flipped the response_model from `JobSummary` → `JobDetail` to include `params`; this test makes sure a future refactor can't silently revert it). Also asserts `params.goal` round-trips so the optimistic-cache placeholder in `useCreateMission.onSuccess` shows the right text while the list refetches.
+
+*Frontend (`~/projects/reward-sculptor-ui/frontend/src`)*:
+- **[components/RunMissionDialog.tsx](reward-sculptor-ui/frontend/src/components/RunMissionDialog.tsx)** — Goal #1: "Goal A: early-stop on criterion" → "Stop when the goal is met"; "Goal B: extend on improvement" → "Keep training while still improving". Goal #4: stripped Ship 9a/16 references in help text. Renamed "Outer iters / stage" → "Rounds per stage", "Steps / iter" → "Steps per round" (avoids `rsl_rl iters (mjlab) / env steps (gym)` adapter-leak). ETA copy uses "rounds" / "per-round wall-clock" for terminology consistency with the rest of the dialog and the StageCard.
+- **[components/MissionDetailDialog.tsx](reward-sculptor-ui/frontend/src/components/MissionDetailDialog.tsx)** — Goal #2: new `deriveStageEffectiveMaxIters(events)` function walks WS events for `stage_started` + `stage_completed_training` payloads → `Map<stage_name, effective_max_iterations>`. `StageCard` accepts `effectiveMaxIters: number | null` prop, renders `rounds X/Y` where Y prefers the WS-derived effective cap and falls back to authored `stage.max_iterations`. When the override differs, a dotted-underline + amber `*` indicator appears + `aria-label` describes "rounds {used} of {effective}; per-launch override (Claude allocated {authored})" so screen readers announce the relationship. `title` tooltip on hover explains the override. Goal #4: "Decomposing — Claude is building the curriculum" → "Planning — Claude is breaking your goal into stages"; "redecomp ×N" → "replanned ×N"; "orphan parent_ref" → "Missing parent stage"; "WebSocket disconnected — refresh the page to retry. (Auto-reconnect lands in Ship 18c.)" → "Live stream interrupted. Refresh to reconnect."; "No active job — events from prior runs are not replayed." → "Nothing running. Launch a run to watch live events." Button-disabled `title` text de-jargoned.
+- **[components/MissionsTab.tsx](reward-sculptor-ui/frontend/src/components/MissionsTab.tsx)** — Goal #4: card description rewritten ("Define a goal. Claude breaks it into stages and trains them in order, warm-starting each from the previous." replaces the old `Claude decomposes a goal into a curriculum of stages... .missions/<slug>/mission.json` filesystem leak). New `missionJobKindLabel` helper replaces `MISSION_EXECUTE` / `MISSION_DECOMPOSE` enum chips with English "Training" / "Planning". New `stageProgressLabel` replaces ambiguous `0/3 stages` (which read as a test failure) with lifecycle-aware phrasing: `Planning…` / `3 stages planned` / `Stage 1 of 3` / `3 of 3 stages complete`. Slug code deemphasized to last position in the metadata row (goal sentence is the primary identifier; the slug was pseudo-derived from it anyway).
+- **[components/RunsTab.tsx](reward-sculptor-ui/frontend/src/components/RunsTab.tsx)** — Goal #5: imports `useMissions`, `MissionDetailDialog`, `MissionLifecycleBadge`, `MissionSummary`. New `ActiveMissionsCard` panel between the Runs Card header and the runs grid, surfaces missions where `active_job_id != null OR lifecycle === "running"`. Each row shows lifecycle badge + `missionRunStateLabel(m)` (e.g., "Stage 2 of 3") + active-job kind chip + truncated goal + slug. Click → opens the existing `MissionDetailDialog` (mounted at the bottom of RunsTab), which keeps the live WS subscription, stage cards, iter ribbon — all the audit-driven Ship 18b/19c machinery — in its single canonical place. CardDescription updated to mention both standalone runs AND mission stages. Empty-state copy on the runs Card conditionally mentions "panel above" only when missions are active. `max-h-[420px] overflow-y-auto` on `ActiveMissionsCard.CardContent` so 5+ active missions don't push the grid off-screen on mobile (design-audit fix).
+
+**Tests + verification:**
+- ✅ **TypeScript**: `pnpm tsc --noEmit` returns 0.
+- ✅ **Sculptor pytest**: **355 passed, 1 skipped** (was 353 → +2 Ship 20 tests; zero regressions).
+- ✅ **Backend pytest**: `298 passed → 299 passed, 1 deselected` (+1 Ship 20 regression test).
+- ⏳ **Live smoke**: pending user run via `./run.sh`. Expected:
+  - Decompose submit → MissionDetailDialog auto-opens immediately (Goal #3 wire format locked by test).
+  - Stage card with `iterations_override=2` and `stage.max_iterations=3` shows `rounds 2/2*` with tooltip "Claude allocated 3 rounds; this run capped at 2." (Goal #2).
+  - "Stop when the goal is met" + "Keep training while still improving" labels (Goal #1).
+  - Active mission visible in RunsTab's `ActiveMissionsCard` panel; click opens the existing dialog (Goal #5).
+
+**Audit findings + fixes (the load-bearing list)**:
+
+*Plan-audit BIGGEST HOLE — designer's "synthetic-stage-rows in RunsTab" plan loses state on tab switch.*
+- The designer's `useMissionStageRuns` would have opened a per-mission WS inside RunsTab; switching to Rewards/Physics unmounts RunsTab → the WS closes → `useMissionEvents` resets local state → re-mount sees empty events array. Combined with the 5000-event cap and no server replay, a stage at iter 4/8 would show `iter 0/0` when the user comes back.
+- **Decision (Plan v2):** keep MissionDetailDialog as the canonical live-monitoring surface; RunsTab only adds a **static read-only entry point** to it. The dialog has all the audit-driven WS-gating (Ship 18b finding A), optimistic cache writes (Ship 19c), and iter-ribbon attribution (Ship 19c) already correct. Sidesteps the entire WS-lifecycle-vs-tab-mount problem.
+- **Fix shipped:** ActiveMissionsCard is REST-driven (uses `useMissions(slug)` polling); click opens the existing dialog.
+
+*Code-audit CRITICAL — `effective_max_iterations` semantics during Goal B extensions.*
+- Auditor's concern: when Goal B extends a stage past its initial budget, the event payload's `effective_max_iterations` doesn't reflect the cumulative cap.
+- **Decision:** `effective_max_iterations` is the BASELINE cap (the value the user explicitly chose / Claude authored). Goal B extensions are surfaced via separate `stage_extended` / `stage_extension_skipped` / `stage_extension_exhausted` events. The cap shown on the stage card reflects what the user configured; `iterations_used > effective_max_iterations` is exactly the "extended" signal Goal B users opt into seeing.
+- **Fix shipped:** load-bearing inline comment in sculpt.py at the `effective_max_iterations` assignment documents the semantic. No code change.
+
+*Design-critique CRITICAL #1 — asterisk override indicator lacked screen-reader scope.*
+- Pre-fix: `<span aria-label="Per-launch override applied">*</span>` — screen reader announces just the asterisk's label, disconnected from the rounds value.
+- **Fix shipped:** moved aria-label to the parent `<span>` covering the entire `rounds X/Y` element so the announcement is "rounds X of Y; per-launch override (Claude allocated Z)". The `*` itself is `aria-hidden="true"` (purely decorative for sighted users).
+
+*Design-critique CRITICAL #2 — ActiveMissionsCard had no max-height.*
+- Failure mode: 5+ active missions on a 375px-wide mobile would push the runs grid off-screen.
+- **Fix shipped:** `max-h-[420px] overflow-y-auto scrollbar-thin` on the CardContent, mirroring RunSidebar's pattern.
+
+*Design-critique HIGH — copy tone inconsistency between `missionRunStateLabel` and `stageProgressLabel`.*
+- Two helpers in two files producing different strings for the same lifecycle state.
+- **Fix shipped:** harmonized — both use `Planning…` / `${n} stages planned` / `Stage ${i+1} of ${n}` / `${n} of ${n} stages complete`. Inline cross-reference comments in both functions.
+
+*Code-audit MEDIUM — `deriveStageEffectiveMaxIters` "last value wins" on stage re-runs.*
+- If user re-runs a mission within one WS session, the second `stage_started` overwrites the first.
+- **Decision:** acceptable — within one mission_run the cap is constant per stage; re-runs emit a fresh `stage_started` before any new iters display. The re-run's cap is in place before anything else displays.
+- **Fix shipped:** load-bearing inline comment in `deriveStageEffectiveMaxIters` documents the semantics + the 5000-event-cap known limitation.
+
+**Callable surface (UI):**
+- Open a project → click **Runs** tab. If any mission has an active job, the **Active missions** panel appears above the runs grid.
+- Click an active mission row → opens the existing **MissionDetailDialog** (rationale + stage cards + live WS event stream + per-stage iter ribbon). All Ship 18b/19c functionality intact; the dialog now has a UI entry point from BOTH Missions tab AND Runs tab.
+- Open the **RunMissionDialog** (from Missions tab → mission row → "Run mission") → see the renamed adaptive options and updated terminology ("Rounds per stage" instead of "Outer iters / stage", etc.).
+- Pass an `iterations_override` smaller than `stage.max_iterations` → the resulting stage card shows `rounds X/effective*` with tooltip "Claude allocated Y rounds; this run capped at Z" (Goal #2 fix).
+
+**Explicitly NOT in Ship 20** (deferred):
+- **Stage runs as first-class `RunSummary` entries in `list_runs`** — would need `RunSummary` shape change, route refactor, JobManager child-job model. Plan-audit deemed it too expensive for one cycle. The lightweight read-only `ActiveMissionsCard` ships the user-visible win without the backend churn.
+- **Active-mission banners on Rewards / Physics / Overview tabs** — designer's stretch goal. Cardinality (what if 2+ missions running?) wasn't worked out; defer to Ship 21 with a cardinality spec.
+- **Stage-scoped Rewards / Physics filtering** — would require timestamp matching against stage windows. Scope-creep.
+- **Slug rename UX** — `mission_slug` is currently the URL path key; renaming would need a redirect-on-slug-change story.
+- **Auto-open dialog runtime hypothesis #1 (`./run.sh` not picking up route changes)** — a `--reload` deficiency in the bash script, not Ship 20's lane. Ship 19d's commit already fixed the response_model; the new `test_create_mission_response_includes_params_mission_slug` regression test pins it. If the user still hits the auto-open bug after `./run.sh` cold restart, the runtime issue is uvicorn-reload, not the wire format.
+
+### 2026-04-24 — Ship 19: cross-mission skill library (Voyager-flavored)
+
+**Scope:** Fifth brick of the Mission roadmap and a deliberate extension toward CurricuLLM/Voyager. Where Ship 15-16 chained policies WITHIN a mission (parent_stage → init_policy_path), Ship 19 adds a **filesystem-backed registry of trained policies that survives across missions**. A `stand_on_one_leg` mission's final policy can warm-start the `stand_on_one_leg__then_kick` mission's "stand" stage, even though the two missions are independent. Sculptor library + CLI only — no UI surface in this ship (Ship 19b).
+
+**Process (mirrors Ships 14-18a):**
+1. **Explore agent** mapped Ship 15 warm-start plumbing (`init_policy_path` is mjlab-only; `_train_or_resume` introspects `adapter.train` for `init_policy_path` OR `**kwargs`), Ship 16 parent-chain (`Mission.parent_checkpoint_status_of(name)` returns `(Path|None, status_tag)`), and the project layout (each stage is a full sculpt project at `<mission>/stages/<name>/runs/iter_<i>/checkpoint.{pt,zip}`). Key constraint surfaced: **`env_id` is NOT a real field on mjlab — it uses `task_id`**. Other adapters use env_id but don't support `init_policy_path` anyway.
+2. **Plan v1**: (adapter_class, env_id) compatibility key, "parent wins over skill" default (mirroring Ship 15 "local checkpoint wins"), first-8KB hash for skill ID, optimistic publish-on-stage-success.
+3. **Plan agent audit** flagged the BIGGEST HOLE: `env_id` doesn't exist on the only adapter that supports warm-start. Plus 5 CRITICAL/HIGH:
+   - **C1**: "parent wins" inverts CurricuLLM's premise. **Decision flipped to "explicit beats implicit"** — when Claude sets `init_skill_id`, the SKILL wins; otherwise the parent_ckpt wins (Ship 16 behavior preserved).
+   - **C2**: `Stage.best_metric` is actually LAST-iter metric, not best. **Switched to `argmax(primary_metric_history)`** at publish time so the BEST-iter checkpoint enters the library (with `source_iter_index` recorded).
+   - **C3**: skill_id derivation including `reward_seed_prompt` made non-whitespace text a discriminator, fragmenting the library. **Dropped seed prompt + criterion from the hash**; identity is `sha256(adapter_class + task_id + full_ckpt_sha256)[:12]`.
+   - **C4**: first-8-KB hash is identical for two policies sharing architecture (the actor's first layer is the same). **Switched to full-file SHA-256** (~1.5 s for 500 MB, runs once per publish).
+   - **H1**: don't publish `redecomposition_attempts > 0` sub-stages — by Ship 17 design they're specialized to slices the parent task couldn't cover; their reward shape is a poor cross-mission seed.
+   - **H2**: `list_compatible` per-record try/except + tmp+rename for metadata (audit fix).
+   - **H3**: 5-kwarg proliferation collapsed into `SkillLibraryHandle(library, adapter_class, task_id, robot_slug, publish)` — single kwarg threads through `decompose_task` + `mission_run`.
+   - **H4**: pydantic validator normalizes empty/whitespace `init_skill_id` to None.
+   - **H5**: CLI `mission-init` and `mission-run` build a default handle from the project's config.toml; `--no-skill-library` opt-out, `--skill-library-root` override.
+   - **M3**: copy-only (no hardlink) — hardlinks across stage iter dirs would break under a future cleanup pass that GCs source iters.
+4. **Plan v2 implemented** across 6 files.
+5. **Code-audit agent** (Explore-type) found 1 CRITICAL bug + verified all 11 plan-audit fixes are in place:
+   - **CRITICAL — `os.replace` is atomic for the file but the parent directory's new dirent isn't durable until the dir inode is fsync'd.** A post-rename kernel/process crash could lose the entry. **Fixed**: new `_fsync_dir(d)` helper called after `_atomic_write_text` and `_atomic_copy`. Best-effort on non-POSIX (Windows directory open isn't supported). Source-inspection regression guard `test_atomic_helpers_fsync_parent_directory_in_source` so future refactors can't silently drop the fsync.
+
+**Files added/changed:**
+
+- **NEW [sculptor/skill_library.py](RewardSculptor/sculptor/skill_library.py)** (~540 lines):
+  - `SkillRecord` (schema_version, skill_id, adapter_class, task_id, robot_slug, reward_seed_prompt, success_criterion, final_metric, source_iter_index, iterations_used, source_mission_goal, source_stage_name, created_at, checkpoint_filename, checkpoint_sha256, checkpoint_size_bytes, alias) — JSON roundtrip, only basenames persisted (Ship 18a path-relocation precedent).
+  - `SkillLibrary(root)` — `publish_from_stage`, `load`, `__iter__`, `list_compatible(adapter_class, task_id, robot_slug=None, top_k=5)`, `checkpoint_path_for(record)`. Per-(adapter, task_id) filelock at `<root>/.locks/<safe_adapter>__<safe_task>.lock`. Atomic write/copy via tmp+rename + parent fsync.
+  - `SkillLibraryHandle` — bundles (library, adapter_class, task_id, robot_slug, publish) with `list_for_decompose`, `maybe_load_for_stage` (taxonomized skip reasons: `skill_not_found / adapter_class_mismatch / task_id_mismatch / checkpoint_missing`), `maybe_publish` (gates on stage status, `redecomposition_attempts == 0`, `adapter_supports_warm_start`, non-empty metric history, best-iter ckpt presence — each with a precise `stage_skill_publish_skipped(reason=...)` event).
+  - `derive_skill_id(adapter, task, ckpt_sha)` (12 hex), `default_library_root()` (env `SCULPTOR_SKILL_LIBRARY_ROOT` else `~/.local/share/sculptor/skills/`), `adapter_supports_warm_start(adapter)` (mirrors Ship 15's introspection at sculpt.py:732).
+- **[sculptor/mission.py](RewardSculptor/sculptor/mission.py)** — `Stage.init_skill_id: Optional[str] = None` field. Forward-compat: `from_dict` already filters unknown keys, so older mission.json loads with init_skill_id=None.
+- **[sculptor/decompose.py](RewardSculptor/sculptor/decompose.py)** — `_StageModel.init_skill_id` with `field_validator` mode="before" mapping `""`/whitespace → None. New `_render_skill_library_context(handle)` returns `(markdown, available_ids)` mirroring `_render_kg_context`. New `_validate_skill_ids(stages, available_ids)` — Claude inventing an unknown id raises `MissionValidationError` at decompose time (caught at the right layer; not at runtime). `decompose_task(..., skill_library_handle=None)` is the new kwarg; defaults preserve Ship 14-17 behavior.
+- **[sculptor/sculpt.py](RewardSculptor/sculptor/sculpt.py)** — `mission_run(..., skill_library_handle=None)` + `_run_one_stage(..., skill_library_handle=None)`. New skill resolution block BEFORE the parent_ckpt fallback: `skill_ckpt = handle.maybe_load_for_stage(stage, emit) if handle and stage.init_skill_id`; `init_policy_path = skill_ckpt or parent_ckpt`. Emits `stage_warm_start_chosen(source ∈ {skill_library, parent_stage, none}, source_id)` and `warm_start_skipped(reason="skill_overrides_parent")` when skill displaces parent. After successful criterion, `handle.maybe_publish(...)` runs in a try/except that emits `stage_skill_publish_skipped(reason="publish_call_errored")` on any IO failure without breaking the stage's success.
+- **[sculptor/prompts/decompose_task.md](RewardSculptor/sculptor/prompts/decompose_task.md)** — input list mentions the optional SKILL_LIBRARY block, schema gains `init_skill_id`, new rule #8 explains the skill-vs-parent precedence + "guessing is worse than null".
+- **[sculptor/cli.py](RewardSculptor/sculptor/cli.py)** — new `--no-skill-library` + `--skill-library-root` flags on `mission-init` and `mission-run`. New `_build_skill_library_handle(config_path, library_root)` reads `[adapter].class` + `[adapter.config].task_id` (falling back to `env_id`) from config.toml; returns None when either is missing so non-mjlab projects degrade gracefully.
+
+**Tests — [tests/test_skill_library.py](RewardSculptor/tests/test_skill_library.py) (29 tests) + [tests/test_ship19_skill_warm_start.py](RewardSculptor/tests/test_ship19_skill_warm_start.py) (15 tests), 44 new total:**
+- skill_library.py: id determinism + textual normalization, full-file SHA-256 (audit C4 regression), publish atomic via tmp+rename, no leftover `.tmp` files, raise on missing checkpoint, `list_compatible` filtering + ordering + top_k cap + corrupt-record skip, `default_library_root()` env-var override + fallback, `adapter_supports_warm_start` (explicit kwarg / **kwargs / unsupported / no train method), concurrent publish via filelock (2 threads, no clobber), `SkillLibraryHandle` skip-reason taxonomy (5 reasons covered), `maybe_publish` gates (handle disabled / redecomp artifact / adapter no-warm-start / no-history / best-iter checkpoint), best-iter checkpoint correctness (audit C2 regression: history `[0.3, 0.5, 0.9, 0.6, 0.4]` → publish iter 2's bytes), **`test_atomic_helpers_fsync_parent_directory_in_source` (audit BIGGEST BUG regression guard)**.
+- ship19_skill_warm_start.py: skill resolution wiring (skill present → init_policy_path = skill ckpt; skill explicit → wins over parent; init_skill_id unset → parent wins per Ship 16; unknown skill_id → cold-start + `skill_warm_start_skipped(reason="skill_not_found")`), publish on success (event shape, library reflects it), publish suppressed (handle None / failed stage), decompose-time skill-library block rendering (id appears in user content), decompose-time validation rejects unknown init_skill_id, Pydantic empty/whitespace normalization (audit H4 regression), legacy mission.json loads with init_skill_id=None (backward-compat), redecompose sub-stages don't propagate init_skill_id (source-inspection guard).
+
+**Verified:**
+- Sculptor: **335 passed, 1 skipped** (was 291 → +44 Ship 19 tests). Zero regressions across the pre-existing 291-test baseline.
+- Backend: **298 passed, 1 deselected** — no backend changes; baseline retained.
+- Test runtimes: skill_library.py + ship19_skill_warm_start.py finish in ~2.4 s; full sculptor suite ~47 s.
+
+**Callable surface:**
+
+```python
+from pathlib import Path
+from sculptor.skill_library import SkillLibrary, SkillLibraryHandle
+from sculptor.decompose import decompose_task
+from sculptor.sculpt import mission_run
+
+# 1. Build a handle (reads $SCULPTOR_SKILL_LIBRARY_ROOT or
+#    ~/.local/share/sculptor/skills/ by default).
+handle = SkillLibraryHandle(
+    library=SkillLibrary(),
+    adapter_class="sculptor.adapters.mjlab.MjlabAdapter",
+    task_id="Mjlab-Velocity-Flat-Unitree-Go1",
+    robot_slug="g1_humanoid",  # optional
+    publish=True,              # default: contribute on stage success
+)
+
+# 2. Decompose with skill-library context. Claude may set
+#    init_skill_id on any stage to warm-start from a prior policy.
+mission = decompose_task(
+    "stand on one leg and kick", reward_contract,
+    kg_store=kg, skill_library_handle=handle,
+)
+
+# 3. Run with skill-library wired through. Stages with init_skill_id
+#    set load that skill as init_policy_path (skill wins over
+#    parent_ckpt). Successful stages publish their best-iter
+#    checkpoint to the library.
+result = mission_run(
+    mission, adapter_short_name="mjlab",
+    kg_store=kg, skill_library_handle=handle,
+)
+```
+
+CLI:
+```bash
+# Default: skill library ON (publishes + reuses).
+uv run sculpt mission-init /path/to/project --goal "stand on one leg and kick"
+uv run sculpt mission-run /path/to/project
+
+# Opt out / override library root.
+uv run sculpt mission-init /path/to/project --goal "..." --no-skill-library
+uv run sculpt mission-run /path/to/project --skill-library-root /tmp/skills
+```
+
+**New events for Ship 18 / Ship 19b UI to surface:**
+- `stage_warm_start_chosen` (source ∈ {`skill_library`, `parent_stage`, `none`}, source_id, checkpoint).
+- `skill_warm_start_skipped` (reason ∈ {`skill_not_found`, `adapter_class_mismatch`, `task_id_mismatch`, `checkpoint_missing`}).
+- `stage_skill_published` (skill_id, adapter_class, task_id, final_metric, source_iter_index, checkpoint_size_bytes).
+- `stage_skill_publish_skipped` (reason ∈ {`handle_publish_disabled`, `stage_not_succeeded`, `redecomposition_artifact`, `adapter_does_not_support_warm_start`, `no_metric_history`, `best_iter_not_in_completed`, `best_iter_checkpoint_missing`, `library_error`, `publish_call_errored`}).
+- `warm_start_skipped(reason="skill_overrides_parent")` when explicit skill displaces an available parent_ckpt.
+
+**Source-of-truth invariants:**
+- The library at `$SCULPTOR_SKILL_LIBRARY_ROOT` (default `~/.local/share/sculptor/skills/`) is canonical for skill metadata + checkpoints.
+- Skill identity is `(adapter_class, task_id, full_checkpoint_sha256)` — re-publishing the same policy bytes idempotently overwrites the same record.
+- Library writes are filelocked per (adapter, task_id) pair; reads are unlocked + per-record fault-tolerant (a corrupt metadata.json doesn't break listings).
+- `Stage.final_policy_path` (Ship 16 contract) is unchanged: the LAST-iter checkpoint. The skill record's checkpoint may differ — it's the BEST-iter checkpoint — but Ship 16's parent_checkpoint resolution still uses Stage.final_policy_path so within-mission warm-start chains stay deterministic.
+
+**Hotfix landed alongside Ship 19 (Ship 16 latent bug exposed by Ship 18b/19's first real mjlab run):** Sam ran the §3 smoke test, decompose worked, but `Run mission` failed within ~2 s with `stage_failed(reason="v1_materialization_errored", detail="apply_prompt_edit failed: TypeError: MjlabAdapter.__init__() got an unexpected keyword argument 'env_id'")`. Root cause traced to [sculpt.py:_CONFIG_TEMPLATE](RewardSculptor/sculptor/sculpt.py): `sculpt_init` writes a hardcoded gym_sb3-flavored `[adapter].config = { env_id = "CHANGE_ME", n_envs = 4, ppo_kwargs = {...} }` regardless of the parent project's actual adapter. For mjlab projects, those keys are simply wrong (mjlab takes `task_id` / `num_envs` / `device`). Bug latent since Ship 16 because tests pre-scaffold stages with `class = "stubbed"` + a stub `load_adapter` that ignores config; no real mjlab mission had been run via the orchestrator until today.
+
+- **Fix** at [sculpt.py:_inherit_parent_adapter_config](RewardSculptor/sculptor/sculpt.py) — string-level TOML helper `_extract_toml_section` + `_replace_toml_section` (the codebase doesn't depend on tomli_w; configs are flat enough for plain extraction). Called from `_run_one_stage` immediately after `sculpt_init` succeeds, copying the parent project's `[adapter]` section into the stage's freshly-scaffolded config.toml. The new event payload includes `inherited_parent_adapter_config: bool` on `stage_scaffolded` so future regressions are observable in the WS event stream.
+- **Regression tests** in [tests/test_mission_run.py](RewardSculptor/tests/test_mission_run.py): `test_extract_toml_section_returns_section_body`, `test_replace_toml_section_substitutes_body`, `test_inherit_parent_adapter_config_replaces_stage_config` (verified-against-real-bug — uses the exact `env_id="CHANGE_ME"` template + the user's `task_id="Mjlab-Cartpole-Balance"` parent), `test_inherit_parent_adapter_config_tolerates_missing_files`. All 4 pass.
+- **Verified live** by reproducing the exact failing path: `from sculptor.sculpt import _inherit_parent_adapter_config; from sculptor.adapters.base import load_adapter` against the user's actual on-disk project + stage config → `MjlabAdapter` constructed cleanly with `task_id="Mjlab-Cartpole-Balance"`, `num_envs=1024`, `device="cuda:0"`. Sam's mission re-run should now proceed past v1 materialization into the actual training loop.
+- **Sculptor pytest re-baselined**: **340 passed, 1 skipped** (was 336 → +4 hotfix tests, zero regressions).
+- **Long-term** (Ship 19c+): the underlying design issue is that `sculpt_init` was written gym_sb3-first and never updated for mjlab. A cleaner refactor would teach `sculpt_init` to take an optional `adapter_config: Optional[dict] = None` kwarg and fall back to the gym template only when not provided. Out of Ship 19's scope; documented for future work.
+
+**Explicitly NOT in Ship 19** (deferred):
+- **UI surface** for browsing / pinning / deleting skills — Ship 19b. The CLI is the only surface in v1.
+- **Cross-adapter skills** (e.g., gym_sb3-trained policy → mjlab mission) — needs `init_policy_path` support in those adapters first.
+- **Cross-`task_id` compatibility** (e.g., Go1-v0 → Go1-v1 after a code change) — the `(adapter_class, task_id)` strict-match key blocks this. Future work: schema-aware migration / observation-space validation.
+- **Auto-pruning / quotas / deletion API** — manual `rm -rf <root>/<skill_id>/` works; a `sculpt skills prune --older-than 30d` CLI is Ship 19c if needed.
+- **LLM-evaluator second-opinion before publish** (CurricuLLM evaluator-LLM pattern) — Ship 20+.
+- **Skill aliases / human tags** — `SkillRecord.alias` field is reserved (currently always None).
+
+### 2026-04-23 12:10 — Ship 13: research_topic off-topic paper filter
+
+**Scope:** Sam ran `research_topic("bipedal robot kicking OR human robot kicking")` and Claude returned two completely unrelated real arxiv IDs: `2407.14795` (a Persian-text spell-correction paper) and `2502.12927` (SEFL educational-feedback LLM framework). Neither ID is hallucinated — both papers exist — but Claude remembered the IDs for unrelated topics and fabricated justifications to match. Pre-fix, these flowed through to the UI and would have polluted the KG + downstream reward edits.
+
+- **Root cause.** `research_topic` trusted Claude's self-reported title + justification without verifying against the real arxiv metadata. The prompt forbids hallucinating IDs but has no guard against real-but-wrong IDs — a known LLM failure mode where the model recalls some valid string and grasps for a justification that matches the user's topic.
+- **Fix — post-recall arxiv verification.** [sculptor/kg/research.py](RewardSculptor/sculptor/kg/research.py):
+  - New `_fetch_arxiv_metadata_batch(ids)` — one arxiv API call fetches real titles+abstracts for all proposed IDs.
+  - New `_verify_topic_match(topic, papers)` — embeds topic vs. each paper's real `title + abstract[:400]` via `sculptor.kg.query._embed_text`, drops below `_MIN_TOPIC_SIMILARITY = 0.15`. Replaces Claude's (possibly hallucinated) title with the real one on kept papers. Fail-open: if arxiv is rate-limited or the embedder is unavailable, we KEEP all papers (an outage shouldn't wipe the user's research query).
+  - New `papers_rejected_off_topic` counter on `ResearchResponse` so the UI can show "Claude returned 3 papers, 2 dropped as off-topic" instead of silently hiding the filter.
+- **Threshold calibration.** Live-measured against the all-MiniLM-L6-v2 embedder with Sam's exact scenario + 6 known on-topic papers:
+
+  | arxiv  | Title (truncated)                              | sim   | verdict |
+  | ------ | ---------------------------------------------- | ----- | ------- |
+  | 2407.14795 | Automatic Real-word Error Correction in Persian | 0.05 | DROP |
+  | 2502.12927 | SEFL: Synthetic Educational Feedback         | 0.13 | DROP |
+  | 1804.02717 | DeepMimic                                    | 0.18 | keep |
+  | 2312.17507 | Actuator-Constrained RL                      | 0.35 | keep |
+  | 2107.04034 | RMA: Rapid Motor Adaptation                  | 0.38 | keep |
+  | 2402.16796 | Expressive Whole-Body Control for Humanoids  | 0.42 | keep |
+  | 2508.08241 | BeyondMimic                                  | 0.42 | keep |
+  | 2406.10759 | Humanoid Parkour Learning                    | 0.48 | keep |
+
+  Threshold 0.15 cleanly separates the two confirmed hallucinations from the DeepMimic-style low-vocab-overlap but on-topic papers. Tighter threshold (0.20) false-positives DeepMimic; looser (0.12) keeps SEFL.
+- **Prompt sharpened.** [sculptor/prompts/research_topic.md](RewardSculptor/sculptor/prompts/research_topic.md) — rule #5 now explicitly warns about "real-but-wrong ID" hallucinations, names the 2026-04-23 Persian-text case as the observed failure mode, and notes that the post-recall verification WILL reject mismatched IDs (so guessing is worse than returning empty).
+- **Tests:**
+  - `test_research_topic_drops_off_topic_papers_via_arxiv_verification` — uses Sam's exact 2 off-topic IDs + DeepMimic; stubs arxiv fetch with the real titles and `_embed_text` with a fixed vector layout. Asserts 2 dropped, 1 kept, real title replaces Claude's.
+  - `test_research_topic_fails_open_when_arxiv_unreachable` — when the arxiv batch returns all-None (rate limit / network down), we KEEP Claude's papers and `papers_rejected_off_topic = 0`. Prevents an arxiv outage from silently erasing research output.
+- **Verified live:** ran `_fetch_arxiv_metadata_batch` + `_verify_topic_match` against real arxiv with Sam's 3 papers. Both off-topic IDs dropped with similarity logged; embedder loaded from cache in 0.8 s (local_files_only path from Ship 11 holds).
+
+### 2026-04-24 — Ship 18b: Mission UI (frontend, audit-driven)
+
+**Scope:** Second half of Ship 18 — landed the React Mission UI on top of the stable Ship 18a backend contract. Frontend-only: not a single backend file or `api.ts`/`types.ts` line touched. Six file additions / two modifications, then audit-driven fixes. Now the user can decompose a goal, watch the decompose job stream, run the curriculum, and watch each stage's events flow without ever leaving the browser.
+
+**Process (mirrors Ships 14-18a):**
+1. **Explore agent** mapped existing tab conventions, React Query keys, the `useRunEvents` WS hook (lines 1-122, including the `terminalRef` reconnect-after-terminal trap fix), shadcn primitives present (Card, Dialog, Tabs, Badge, Button, Input, Label, Select, Textarea — Sheet/Checkbox/ScrollArea NOT present), `formatRelative` utility, and `sonner` toast wiring. Confirmed file:line that the `{activeTab === "X" && <Tab/>}` deferred-mount pattern is the established way to gate WS-bearing tabs.
+2. **Plan v1** — file-by-file plan with `runJustStarted` ephemeral state to gate WS opening.
+3. **Plan agent audit** flagged 8 issues; **load-bearing finding: gating WS on `runJustStarted` ephemeral state breaks across deferred-mount unmount/remount and across tab-switch.** Plus: polling needed `m.active_job_id != null` not `lifecycle === "running"` (decompose lifecycle is `ready`, not `running`); `structuredEvents` cap missing; `parent_stage` cycle/orphan handling unspecified; lifecycle chip a11y needs an icon (color-only fails contrast in dark mode).
+4. **Plan v2** replaced ephemeral state with `qc.setQueryData` optimistic writes inside `useRunMission.onSuccess` — the optimistic value flows through the React Query cache, survives tab-switch unmount, and signals the WS hook within a single render. Other v2 changes: explicit `m.active_job_id != null` polling guard, 5000-cap on structured events, DFS-with-visited-set stage tree (orphan/cycle → depth=0 + warning chip), `MissionLifecycleBadge` and `StageStatusBadge` use Lucide icons + `bg-{c}-50 text-{c}-700` (all 5 lifecycle states pass WCAG AA on emerald/amber/rose/sky/slate).
+5. **Implementation** — see file list below.
+6. **Two parallel audit agents** ran on the diff:
+   - **Correctness/UX agent CRITICAL #1 — re-subscription race in useMissionEvents:** when `enabled` flips false→true mid-stream (e.g., user reopens dialog while a previous WS is still tearing down), the OLD ws.onmessage could fire AFTER `cancelled = true` and append events into the NEW state. Fix at [useMissionEvents.ts](reward-sculptor-ui/frontend/src/hooks/useMissionEvents.ts) — added `if (cancelled) return;` at the top of `ws.onmessage`. Inline comment explains the audit case.
+   - **Correctness HIGH — close-then-onSuccess reopens dialog:** confirmed by inspection that the row's `Run` button calling `onOpen()` after success IS intended UX (user clicks Run from the row to launch + watch live), so kept. Documented inline.
+   - **A11y CRITICAL — `StageStatusBadge` missing `role="status"`:** [MissionDetailDialog.tsx](reward-sculptor-ui/frontend/src/components/MissionDetailDialog.tsx) — added `role="status"` to match `MissionLifecycleBadge`. Plus `prefers-reduced-motion` guard: `animate-pulse` and `animate-spin` on continuous-motion chips replaced with `motion-safe:animate-pulse` / `motion-safe:animate-spin` (Loader2 spinners on transient mutation buttons left as-is per existing convention).
+   - **A11y MEDIUM — `StructuredEventList` missing live-region role:** wrapped in `<div role="log" aria-label="Mission events" aria-live="polite">` so screen readers announce new structured events as they arrive.
+   - **A11y false-alarm:** auditor flagged "MissionsTab not conditionally rendered" but verification at [ProjectDetail.tsx:294](reward-sculptor-ui/frontend/src/pages/ProjectDetail.tsx) confirms `{activeTab === "missions" && <MissionsTab />}` is in place.
+
+**Files added/changed:**
+- **NEW [frontend/src/hooks/useMissions.ts](reward-sculptor-ui/frontend/src/hooks/useMissions.ts)** — `useMissions(slug)` (5 s polling while any mission has `active_job_id`), `useMission(slug, ms, {enabled})`, `useCreateMission(slug)`, `useRunMission(slug)` (with optimistic `qc.setQueryData` writeback so the WS opens within the same render — addresses Ship 18a audit-deferred finding A), `useDeleteMission(slug)`. Mirrors `useRuns.ts` shape.
+- **NEW [frontend/src/hooks/useMissionEvents.ts](reward-sculptor-ui/frontend/src/hooks/useMissionEvents.ts)** — WS subscription hook. Takes `enabled: boolean` (caller MUST gate on `active_job_id != null` or post-runMission optimistic cache write). NO auto-reconnect (Ship 18b §6 explicit). Caps `logLines` at 200 and `structuredEvents` at 5000 (FIFO ring on overflow). Detects `connected.status === "no_active_job"` → surfaces as `noActiveJob: true`. On `terminal` event invalidates `qk.mission(slug, ms)` + `qk.missions(slug)`. Stage/mission/redecomposition prefix events trigger detail invalidation so stage status refreshes mid-mission. Uses `terminalRef` + `noActiveJobRef` mirrors so `onclose` reads the current value, not the stale closure. **Audit-fix `if (cancelled) return;` at top of `onmessage`** so a re-subscription doesn't bleed events from the old WS into the new state.
+- **NEW [frontend/src/components/MissionsTab.tsx](reward-sculptor-ui/frontend/src/components/MissionsTab.tsx)** — top-level tab. Card with header + `<NewMissionDialog />`. Lists missions as `<MissionRow>` cards with lifecycle chip, slug, goal (line-clamp-2 + title=full), `current_stage_idx/n_stages`, `formatRelative(created_at)`, decomposition_model, and Run/Delete actions. Click row → opens `<MissionDetailDialog>`. Confirms-on-delete via `window.confirm` (matching CONTEXT.md "confirm destructive" rule). Errored missions render with rose chip + Delete-only.
+- **NEW [frontend/src/components/NewMissionDialog.tsx](reward-sculptor-ui/frontend/src/components/NewMissionDialog.tsx)** — Dialog with Textarea (8-2000 char client-side guard mirrors backend), optional `mission_slug` Input validated against `^[a-z][a-z0-9_-]{0,63}$`, native `<input type="checkbox">` for `no_kg` (matches NewRunDialog convention since Checkbox primitive isn't in the shadcn set). On submit: `useCreateMission` + invalidate + toast.
+- **NEW [frontend/src/components/MissionDetailDialog.tsx](reward-sculptor-ui/frontend/src/components/MissionDetailDialog.tsx)** — Dialog (sm:max-w-3xl, max-h-[90vh] with scroll). Top: goal + lifecycle. Body: errored-mission banner (when applicable), decomposition rationale block, vertical stage list with parent-chain indentation (DFS, cycle-safe, MAX_INDENT_DEPTH=4, orphan tag on dangling parent_stage), live-event panel (WS status chip + structured-event chips with type-keyed colors + 200-cap log scroller with auto-scroll-to-bottom unless user scrolled up). Disconnected banner appears only if `events.disconnected && !events.terminal` (so a clean terminal close doesn't flash the banner). Footer: Run / Delete / Close, with active-job and lifecycle gating + tooltip explanations on disabled state.
+- **MODIFY [frontend/src/pages/ProjectDetail.tsx](reward-sculptor-ui/frontend/src/pages/ProjectDetail.tsx)** — added `{value:"missions", label:"Missions"}` between Runs and Reports (so post-run mission summary surfaces close to the Runs tab). Added `<TabsContent value="missions">{activeTab === "missions" && <MissionsTab slug={slug!} />}</TabsContent>` deferred-mount block.
+- **MODIFY [frontend/src/lib/queryKeys.ts](reward-sculptor-ui/frontend/src/lib/queryKeys.ts)** — added `missions(slug)` and `mission(slug, ms)` query keys.
+
+**Verification gates** (handoff §5):
+- ✅ **TypeScript**: `pnpm tsc --noEmit` returns 0.
+- ✅ **Backend pytest**: `298 passed, 1 deselected` — exact match to the Ship 18a baseline.
+- ✅ **Sculptor pytest**: 291 passed, 1 skipped — exact match to the Ship 17 baseline.
+- ⏳ **Live smoke** — pending user run via `./run.sh`. The audit-driven fixes mean the WS lifecycle is robust to (a) creating a mission with no run yet (decompose-only), (b) running a ready mission, (c) closing/reopening the detail dialog mid-run, and (d) tab-switching away and back. If the user hits a regression, the `disconnected` banner makes the failure mode visible instead of silent.
+
+**Callable surface (UI):**
+- Open a project detail page → click the **Missions** tab.
+- Click **New mission** → enter a goal → Decompose. The decompose job runs (~30-90 s); the row's lifecycle chip + active-job badge updates as it streams events.
+- Click a row → see the full stage list + decomposition rationale. If the mission has an active job, live events stream into the bottom panel (structured events as colored chips, log_line as scrolling stdout).
+- Click **Run mission** (when `lifecycle="ready"`) → the optimistic cache write flips `active_job_id` immediately; the WS opens on the next render and starts streaming `mission_started`, `stage_started`, `iter_started`, etc.
+- Click **Delete** (when no active job) → confirms via `window.confirm` → deletes the on-disk artifacts; toast shows freed bytes.
+
+**Explicitly NOT in Ship 18b** (deferred to Ship 18c):
+- WS auto-reconnect with replay-from-seq on transient disconnect (handoff §6 explicit).
+- DAG visualization with d3 / SVG nodes.
+- Time-lapse mission video.
+- Mid-mission cancellation UI hookup to `POST /jobs/{id}/stop`.
+- Resume-from-stage selector.
+- Per-stage knob overrides.
+- Vitest frontend tests — the project has none and CONTEXT.md flags expanded test coverage as "explicitly incomplete." Live smoke + tsc + the existing 298+291 backend/sculptor baselines are the ship gate.
+
+### 2026-04-24 — Ship 18a: Mission backend + CLI surface (UI groundwork)
+
+**Scope:** First half of Ship 18 (UI for Ship 14-17 mission orchestrator). Ship 18a delivers the **backend + CLI + typed-API groundwork** so Ship 18b can land the React MissionsTab + WebSocket event rendering against a stable contract. Splitting the original Ship 18 into two audit cycles (rather than one ship-the-world) so the audit-driven process actually catches bugs at the diff scale it works on.
+
+**Out of scope here (Ship 18b):**
+- Frontend MissionsTab + DAG viz + per-stage drill-down.
+- WebSocket event rendering in the browser.
+- React Query subscriptions for live mission state.
+
+**Process (matches Ship 14-17 pattern):**
+1. **Explore agent** mapped backend route + service patterns (project_store, run_manager, job_manager), frontend routing/api conventions, and the disk-layout implications of mounting missions under projects.
+2. **Plan agent** critiqued v1, flagged 8 issues. **The most important: I had been treating `mission.json` and `JobManager events` as parallel state sources — but the right contract is `mission.json` is canonical (filesystem, durable), JobManager events are an EPHEMERAL overlay (transient, RAM).** Other fixes in v2: in-process decompose vs subprocess execute (hybrid), per-project lock for concurrent decompose, `has_any_active_gpu_job()` cross-kind GPU guard, `mission_dir` reconstructed-from-file-location (Ship 16 audit-deferred fix), event shape mirrors runs.py WS pattern.
+3. Implementation landed; backend tests at 295 passed.
+4. **Audit agent** flagged 5 additional issues:
+   - **CRITICAL #E — concurrent decompose race**: two POSTs without `mission_slug` override at ~the same instant could both derive the SAME auto-slug and both write to the same `mission.json`. **Fixed**: per-project filelock around slug-derivation + slug-reservation; reserve via `<slug>/.decompose_pending` marker file inside the lock; `list_mission_slugs` recognizes the marker so subsequent calls see the slug as taken.
+   - **MEDIUM #F — corrupt mission.json silently dropped**: a `mission.json` that fails JSON-parse just disappeared from the list, leaving no way for the user to clean up. **Fixed**: `load_mission_summary` catches parse errors and returns a stub `MissionSummary(lifecycle="errored", goal="(unreadable mission.json)", ...)` so the user can see + DELETE it.
+   - **MEDIUM #C — slug derivation duplicated**: `sculpt mission-init` (CLI side) and `mission_store._slugify` (backend side) implement the same logic in two places. **Fixed**: cross-reference docstrings in both functions naming each other; new `test_cli_and_backend_slug_derivation_agree` test runs 6 inputs through both and asserts byte-equal output.
+   - **LOW #D — symlink edge case**: `Path.resolve()` follows symlinks, so a symlinked `mission.json` would reconstruct `mission_dir` to the link target's parent. **Documented** in `load_mission` docstring; not fixed (edge case; tested workflow doesn't symlink).
+   - **DEFERRED — A (WS lifecycle on decompose-then-run race)**: documented for Ship 18b. The frontend should open the WS AFTER `POST /run` succeeds, not before.
+
+**Files added/changed:**
+
+*Sculptor (`~/projects/RewardSculptor`)*:
+- **[sculptor/mission.py](RewardSculptor/sculptor/mission.py)** — `to_dict` no longer persists `mission_dir` (path-relocation safety); `load_mission` reconstructs `mission_dir` from the JSON file's parent directory. Symlink caveat documented.
+- **[sculptor/cli.py](RewardSculptor/sculptor/cli.py)** — new `sculpt mission-init` (decompose → write `<project>/.missions/<slug>/mission.json`) and `sculpt mission-run` (load + invoke `mission_run` from Ship 16/17). Auto-resolve slug when there's exactly one mission. Adapter resolved from project's config.toml dotted-path. CLI emits `[SCULPT-EVENT] mission_initialized` so the backend's stdout streamer picks up the slug.
+
+*Backend UI (`~/projects/reward-sculptor-ui`)*:
+- **NEW [backend/models/mission.py](reward-sculptor-ui/backend/models/mission.py)** — pydantic shapes: `StageSchema`, `MissionSummary`, `MissionDetail` (extends summary with stages + rationale), `CreateMissionRequest` (8-2000 char goal, optional explicit slug), `DeleteMissionResponse` (with `freed_bytes`), `MissionEvent` (WS envelope; per-event payload is `dict[str, Any]` per Ship 18a plan-review).
+- **NEW [backend/services/mission_store.py](reward-sculptor-ui/backend/services/mission_store.py)** — `mission_dir`, `mission_json_path`, `list_mission_slugs` (reservation-aware), `derive_unique_mission_slug` (mirrors project_store's `_ensure_unique_slug` pattern), `_derive_lifecycle` (computed from on-disk stage statuses), `load_mission_summary` / `load_mission_detail` (always read mission.json on each call — source-of-truth invariant), `delete_mission` (returns `freed_bytes`).
+- **NEW [backend/services/mission_jobs.py](reward-sculptor-ui/backend/services/mission_jobs.py)** — `run_mission_decompose_job` (in-process via `asyncio.to_thread`; ~30-90s Claude call, subprocess buys nothing) and `run_mission_execute_job` (subprocess `python -m sculptor.cli mission-run`; mirrors run_manager.py pattern with `[SCULPT-EVENT]` stdout streamer + SIGTERM-on-cancel).
+- **[backend/services/job_manager.py](reward-sculptor-ui/backend/services/job_manager.py)** — new `has_any_active_gpu_job()` (ORs `sculpt_run` + `mission_execute` cross-project) and `active_mission_job(slug, mission_slug)` (per-(project,mission) in-flight job lookup).
+- **[backend/models/kg.py](reward-sculptor-ui/backend/models/kg.py)** — `JobKind` literal extended with `mission_decompose`, `mission_execute`.
+- **NEW [backend/routes/missions.py](reward-sculptor-ui/backend/routes/missions.py)** — REST endpoints (POST decompose, GET list/detail, POST run, DELETE) + WebSocket `/ws/projects/{slug}/missions/{mission_slug}/events`. Per-project filelock around decompose's slug-reservation. GPU contention guard on run via `has_any_active_gpu_job()`.
+- **[backend/main.py](reward-sculptor-ui/backend/main.py)** — mounts the new `missions` router + `ws_router`.
+
+*Frontend groundwork (typed API only — no components)*:
+- **[frontend/src/lib/api.ts](reward-sculptor-ui/frontend/src/lib/api.ts)** — `listMissions`, `getMission`, `createMission`, `runMission`, `deleteMission`, `missionEventsWsUrl`.
+- **[frontend/src/lib/types.ts](reward-sculptor-ui/frontend/src/lib/types.ts)** — `StageSchema`, `MissionSummary`, `MissionDetail`, `CreateMissionRequest`, `DeleteMissionResponse`, `MissionEvent`, `StageStatus`, `MissionLifecycleStatus`, `MissionJobKind`.
+
+**Tests — [backend/tests/test_missions.py](reward-sculptor-ui/backend/tests/test_missions.py), 26 tests:**
+- 4 404 paths (unknown project / mission on each endpoint).
+- 5 list/detail tests covering empty, populated, lifecycle derivations (ready/completed/halted).
+- 4 create-validation tests (short goal → 422, extra fields → 422, slug collision → 409, valid create → 202).
+- 3 slug-derivation unit tests (basic, collision, empty-goal fallback).
+- 3 run-path tests (404 missing, 409 active decompose, 409 GPU busy).
+- 3 delete tests (success + freed_bytes, 409 active job, 404 missing).
+- 1 path-relocation test (load_mission reconstructs mission_dir post-move).
+- **3 audit-regression tests**: slug-reservation marker file (#E), corrupt mission.json → lifecycle="errored" (#F), CLI-vs-backend slug parity (#C).
+
+**Verified:**
+- Backend: **298 passed, 1 deselected** (was 272 → +26 Ship 18a tests).
+- Sculptor: **291 passed, 1 skipped** (Ship 17 baseline retained — no regressions from path-relocation fix).
+- Test runtimes: Ship 18a tests in ~1.5 s; full backend suite ~56 s.
+
+**Callable surface:**
+
+CLI (sculptor):
+```bash
+# Decompose a goal into a curriculum (writes .missions/<slug>/mission.json)
+uv run sculpt mission-init /path/to/project --goal "Stand on one leg and kick"
+
+# Run the mission end-to-end (Ship 16/17 orchestration)
+uv run sculpt mission-run /path/to/project [<mission-slug>]
+```
+
+REST (backend):
+```
+POST   /api/projects/{slug}/missions                        → 202 JobSummary
+GET    /api/projects/{slug}/missions                        → 200 list[MissionSummary]
+GET    /api/projects/{slug}/missions/{mission_slug}         → 200 MissionDetail | 404
+POST   /api/projects/{slug}/missions/{mission_slug}/run     → 202 JobSummary | 404 | 409
+DELETE /api/projects/{slug}/missions/{mission_slug}         → 200 DeleteMissionResponse | 404 | 409
+
+WS     /ws/projects/{slug}/missions/{mission_slug}/events   — replay + tee active job
+```
+
+**Source-of-truth invariant**: `mission.json` is canonical. Every GET re-reads from disk. JobManager events are an EPHEMERAL overlay applied via `active_job_id` / `active_job_kind` on the response. A backend restart loses no mission state.
+
+**Explicitly NOT in Ship 18a** (Ship 18b):
+- Frontend MissionsTab component + DAG viz + per-stage drill-down dialog.
+- WebSocket event rendering / live-stream UI.
+- React Query subscriptions / polling for live mission state.
+- "New mission" dialog form.
+- Per-stage knob overrides UI.
+
+### 2026-04-24 — Ship 17: Stage re-decomposition on criterion failure
+
+**Scope:** Fourth brick of the Mission roadmap. Ship 17 adds **automatic curriculum recovery** when a stage exhausts its iteration budget without satisfying its `success_criterion`. The orchestrator now asks Claude "this didn't work — break it down further" and splices 2-8 simpler sub-stages into the mission graph in place of the failed stage. The LAST sub-stage carries the original goal_text + success_criterion (byte-identical), so the task still gets accomplished; earlier sub-stages are precursors. Bounded at one re-decomposition per stage to prevent combinatorial fanout.
+
+**Process:**
+1. Explore agent mapped the failure-state inputs available, splice mechanics options, and existing test stubs.
+2. Plan agent reviewed v1, flagged 8 issues. The most important: **I missed the downstream-child re-pointing** — when REPLACE-splicing, every stage downstream whose `parent_stage == failed.name` must be rewritten to point at the LAST sub-stage. Without this, `validate_mission` raises immediately because the failed name no longer exists.
+3. Plan v2 incorporated all 8 issues:
+   - Downstream re-pointing (CRITICAL): new `_repoint_downstream_children` helper.
+   - Naming: `{failed.name}__r1_<i>` with collision-resolve `_v2`/`_v3`.
+   - Halt-reason granularity: `redecomposition_skipped(reason=...)`, `stage_redecomposition_failed(reason=...)`, `stage_redecomposed`.
+   - `current_stage_idx = failed_idx` BEFORE atomic save (resume safety).
+   - Training feedback includes verbatim `v<n>.py` source + last-3-iter component means; skips trajectory.npz arrays.
+   - Last sub-stage's `success_criterion` byte-equal to original (validator enforces).
+   - Pydantic `min_length=2, max_length=8` on `_RedecompositionModel.stages`.
+   - Warm-start integration test added (sub-stages chain correctly).
+4. Implementation landed; full sculptor suite green at 286 passed.
+5. **Audit agent** flagged 5 additional issues (CRITICAL → LOW):
+   - **CRITICAL #A — save-after-splice atomicity**: if `_atomic_save_mission` raises (disk full / EIO), in-memory mission has new sub-stages but on-disk has old failed stage; resume diverges silently. **Fixed**: wrap save in try/except, roll back in-memory splice + parent re-pointing on failure, emit `stage_redecomposition_failed(reason="save_failed")`.
+   - **HIGH #C — unbounded `_resolve_unique_name` loop**: pathological pre-existing collisions could spin forever AND a too-long base + `_vN` could exceed 32-char regex cap. **Fixed**: cap at 100 attempts, length-check the final name, raise `MissionValidationError` on either failure.
+   - **MEDIUM #B — `_scan_iter_metric_history` sort bug**: `else -1` fallback for malformed iter dir names sorted them BEFORE iter_0, polluting Claude's metric history. **Fixed**: use `+inf` so corrupt dirs sort to the END.
+   - **MEDIUM #E — silent feedback degradation**: best-effort reads of diagnosis.json / trajectory.npz / metric history degrade to empty dicts; Claude saw "complete feedback with empty signals" indistinguishable from "we couldn't read the data." **Fixed**: track which signals were missing, emit `feedback_read_degraded(missing_signals=[...])` event before invoking Claude.
+   - **LOW (deferred)**: prompt-name-drift UX (Claude's emitted names ignored — bulletproof but cosmetic mismatch with rationale text); path-relocation test (acceptable risk).
+
+**Files added/changed:**
+- **NEW [sculptor/prompts/redecompose_stage.md](RewardSculptor/sculptor/prompts/redecompose_stage.md)** — 9 hard rules including byte-equal final criterion, naming convention, simpler-reward explanation requirement, KG-slice restriction.
+- **[sculptor/decompose.py](RewardSculptor/sculptor/decompose.py)** — new `_RedecompositionModel` (pydantic, min_length=2, max_length=8), parameterized `_parse_with_retry(output_format=...)` (decompose_task callers unchanged), `StageTrainingFeedback` dataclass, `_render_training_feedback_block`, `_build_redecompose_user_content`, `_truncate_for_name_budget`, `_resolve_unique_name` (with audit-fix cap + length check), `redecompose_stage(mission, failed_idx, *, feedback, reward_contract, kg_store, client)` returning `list[Stage]` with `redecomposition_attempts=1` set on each.
+- **[sculptor/sculpt.py](RewardSculptor/sculptor/sculpt.py)** — refactored `mission_run`'s for-loop → while-loop indexed by `mission.current_stage_idx` for safe mid-iteration splicing. New helpers: `_REDECOMPOSABLE_REASONS = {"criterion_not_met"}`, `_build_stage_training_feedback`, `_repoint_downstream_children`, `_maybe_redecompose_and_splice` (with audit-fix save-rollback), `_scan_iter_metric_history` (with audit-fix `+inf` sort fallback). 6 new event types: `stage_redecomposition_started`, `stage_redecomposed`, `redecomposition_skipped` (reasons: `budget_exhausted`, `non_curriculum_failure`), `stage_redecomposition_failed` (reasons: `validation_failed`, `claude_call_errored`, `adapter_load_failed`, `spliced_mission_invalid`, `save_failed`, `empty_substages`), `feedback_read_degraded`.
+- **[sculptor/mission.py](RewardSculptor/sculptor/mission.py)** — `Stage.redecomposition_attempts: int = 0` field. Persisted via existing `dataclasses.asdict`.
+- **Ship 16 test updated** — `test_mission_run_halts_when_stage_criterion_fails` now pre-sets `redecomposition_attempts=1` to bypass Ship 17's path and test the bare halt behavior; new assertion checks `redecomposition_skipped(reason="budget_exhausted")` event fires.
+
+**Tests — [tests/test_mission_run.py](RewardSculptor/tests/test_mission_run.py), 13 new (52 total in file):**
+- 8 core Ship 17 tests: splice replaces failed stage, sub-stages have attempts=1, only-fires-once-per-stage, infra-failure skip, invalid-Claude-response halt, `stage_redecomposed` event shape, sub-stages warm-start in chain (Ship 15 + Ship 17 integration), atomic mission.json persistence with `current_stage_idx` rewound.
+- **5 audit-regression tests**: save-failure rollback (#A), collision-loop cap (#C), name-overflow detection (#C), sort-fallback for corrupt iter dirs (#B), `feedback_read_degraded` event emission (#E).
+
+**Verified:**
+- Sculptor: **291 passed, 1 skipped** (was 278 → +13 Ship 17 tests).
+- Test runtime: ~50 s for full suite, ~1.7 s for the 52 mission tests in isolation.
+- Zero regressions across the pre-existing 278-test baseline.
+
+**Callable surface:**
+```python
+from sculptor.sculpt import mission_run
+# Same entry as Ship 16. Re-decomposition fires automatically when a
+# stage's success_criterion fails AND `stage.redecomposition_attempts == 0`.
+result = mission_run(
+    mission,
+    adapter_short_name="mjlab",
+    kg_store=kg,
+    on_event=lambda e: print("[mission]", e),
+)
+# New events to watch: stage_redecomposition_started,
+# stage_redecomposed, redecomposition_skipped (with reason),
+# stage_redecomposition_failed (with reason), feedback_read_degraded.
+```
+
+**Explicitly NOT in Ship 17** (deferred):
+- **Multi-level re-decomposition** — bounded at one level per CurricuLLM's design and to prevent combinatorial fanout.
+- **LLM-evaluator second opinion** before halting (CurricuLLM's evaluator-LLM pattern) — Ship 19+.
+- **Skill-library cross-mission policy reuse** — Ship 19.
+- **Mission UI surfacing redecomposition events** — Ship 18.
+- **Resume mid-redecomposition** — if mission_run crashes between Claude returning and `_atomic_save_mission` succeeding, the next run sees the OLD state and may re-call Claude with a different (non-deterministic) response. Tolerable; documented.
+
+### 2026-04-24 — Ship 16: Mission orchestrator + success-criterion evaluator
+
+**Scope:** Third brick of the Mission roadmap. Ship 16 turns Ship 14's `Mission` data + Ship 15's policy warm-start into an **end-to-end multi-stage training loop**. Caller invokes `mission_run(mission, adapter_short_name=...)`; orchestrator iterates stages, scaffolds per-stage projects, materializes v1 from each stage's `reward_seed_prompt`, calls `sculpt_run` with `init_policy_path` resolved from the parent stage, evaluates the stage's `success_criterion` against the last iter's `behavior.json` + `trajectory.npz`, and advances or halts.
+
+**Process (per Sam's "audit-driven implementation" pattern, established Ships 14-15):**
+1. Explore agent mapped rollout artifact shape, `IterOutcome.iter_dir` exposure, sculpt_run return contract, existing `sculpt_init` (line 1552).
+2. Plan agent reviewed v1 plan — flagged 8 issues. Most important: don't drop Ship 14's `info[<key>]` syntax, expose `info` as alias for `trajectory` instead. Other findings folded into v2 (drop `missions_root` param; use `mission.mission_dir`; use `_is_stage_scaffolded` for idempotent scaffold; track silent-drop on `final_policy_path = None`).
+3. Implementation landed.
+4. **Two parallel code-review agents** audited. Combined findings (CRITICAL/HIGH addressed; LOW deferred to Ships 17/18):
+   - **CRITICAL — AST allow-list missing `ast.Tuple`.** `trajectory[..., 2]` parses as `ast.Subscript(slice=ast.Tuple([Constant(...), Constant(2)]))`. Pre-fix would reject any multi-axis subscript with "disallowed AST node Tuple". Fixed at [mission_runtime.py:_validate_criterion_ast](RewardSculptor/sculptor/mission_runtime.py); also added explicit `REJECTED_NODES` (Lambda/NamedExpr/comprehensions/Starred/Assign) for sharper error messages.
+   - **HIGH — multi-element bool array → cryptic numpy error.** A criterion like `trajectory['rewards'] > 0.0` returns a (T,) bool array, which `bool()` rejects with "truth value ambiguous". Pre-fix surfaced numpy's raw text; post-fix catches `ValueError`, surfaces a hint mentioning `.all() / .any() / .mean()` reductions.
+   - **HIGH — parent ckpt deleted externally → silent cold-start.** If a user cleans `runs/` between mission runs, the parent's recorded `final_policy_path` points at a missing file; pre-fix `parent_checkpoint_of` returned None silently, defeating the curriculum. Fixed by adding `Mission.parent_checkpoint_status_of` returning `(path, status_tag)` where status ∈ {`no_parent`, `parent_untrained`, `parent_ckpt_missing`, `ok`}; orchestrator now emits `warm_start_skipped` with reason `"parent_ckpt_missing"` so the regression is observable.
+   - **HIGH (Audit 2 lead) — lock-file unlink failure on Windows/WSL.** `filelock` can hold the lock file's handle past `release()`, making the `unlink()` in the `finally` silently fail. Fix: drop the unlink entirely; let `filelock` (or the OS-level lock release) handle cleanup. The `.lock` file persisting on disk is cosmetic and `FileLock` re-acquires cleanly because the OS-level advisory lock is released, not the filename.
+   - **MEDIUM — filelock timeout 1s too tight.** Slow FS (NFS, WSL interop) can legitimately take >1s. Bumped to 10s.
+   - **MEDIUM — adapter mismatch detection.** New `_verify_stage_adapter_matches` reads the on-disk `[adapter].class` from the stage's pre-scaffolded config.toml and compares to the caller's `adapter_short_name`. Only enforced when on-disk class is a real Python dotted path (so test stubs like `"stubbed"` aren't false-positives). Catches "you scaffolded under gym_sb3, then resumed under mjlab" silent-drift bugs.
+   - **LOW — `stage_dir` missing from `stage_started` event.** Added so Ship 18's UI can deep-link to the stage project page from the very first event, not wait for `stage_scaffolded`.
+
+**Findings deferred (rationale documented):**
+- Stage resumption mid-flight (status=`training` from a crashed run): re-runs the stage including v1 materialization. Fixing this cleanly needs Ship 17's re-decomposition logic anyway.
+- Project-root boundary check on `mission_dir`: caller (Ship 18 UI) is responsible for sandbox enforcement.
+- Namespace dump on criterion failure: UX polish, Ship 18.
+- Stack trace preservation in `_fail_stage`: low ROI vs the type+message already in `detail`.
+
+**Files added/changed:**
+- **NEW [sculptor/mission_runtime.py](RewardSculptor/sculptor/mission_runtime.py)** — `_evaluate_success_criterion(criterion, namespace) -> bool` (ast-parsed safe-eval with REJECTED_NODES + ALLOWED_NODES + SAFE_ATTRIBUTE_METHODS guards), `_build_criterion_namespace(iter_dir, primary_metric)` (loads `behavior.json` + `trajectory.npz`), `MissionResult` + `StageResult` dataclasses, `PERSISTED_TRAJECTORY_KEYS` + `BEHAVIOR_KEYS` constants. Builtins NOT zeroed in eval — numpy `.mean()` needs `__import__` internally; AST walker is the primary safety layer.
+- **[sculptor/sculpt.py](RewardSculptor/sculptor/sculpt.py)** — new `mission_run(mission, *, adapter_short_name, kg_store, on_event, ...)` orchestrator, `_run_one_stage`, `_fail_stage`, `_atomic_save_mission` (tmp+rename), `_resolve_stage_final_checkpoint` (glob `checkpoint.{pt,zip}`), `_is_stage_scaffolded` (idempotent resume), `_verify_stage_adapter_matches`, `_utc_now_iso`. Acquires filelock at `<mission_dir>/.lock`. Emits 12 distinct event types: `mission_started`, `stage_started`, `stage_warm_start_resolved`, `warm_start_skipped`, `stage_scaffolded`, `stage_v1_materialized`, `stage_completed_training`, `stage_criterion_evaluated`, `stage_succeeded`, `stage_failed`, `stage_skipped`, `mission_completed` / `mission_halted` / `mission_halted_terminal`.
+- **[sculptor/mission.py](RewardSculptor/sculptor/mission.py)** — added `Mission.stage_dir(name)`, `Mission.parent_checkpoint_of(name)` (legacy convenience), `Mission.parent_checkpoint_status_of(name)` (returns `(path, status_tag)` for distinct event emission). `_validate_success_criterion` now checks `info[...]` / `trajectory[...]` / `behavior[...]` subscripts against the runtime-persisted key sets in `mission_runtime` (was: against the adapter's `expected_info_keys`, which is the per-step training info dict NOT the persisted artifact set — a Ship-14-prompt/Ship-16-runtime mismatch this fix aligns).
+- **[sculptor/prompts/decompose_task.md](RewardSculptor/sculptor/prompts/decompose_task.md)** — namespace docs rewritten: `metric`, `behavior['<key>']`, `components['<name>']`, `trajectory['<key>']`, `info['<key>']` (alias). Worked example updated to use the persisted-key syntax.
+- **Ship 14 tests updated** — 4 assertions in `tests/test_decompose.py` re-pinned from `info[base_height]` style to `behavior[mean_return]` / `metric` / `components[name]` style. The Ship 14 contract is unchanged structurally; only the per-stage-namespace docs rotated to match what Ship 16 actually evaluates.
+
+**Tests — [tests/test_mission_run.py](RewardSculptor/tests/test_mission_run.py), 39 tests:**
+- 13 criterion-evaluator unit tests (happy paths + 8 safety / rejection paths covering unparseable / unknown name / disallowed attribute / builtins access / lambda / non-bool result / unknown function-call).
+- 5 namespace-construction tests (load behavior.json + trajectory.npz + components extraction + info-alias-trajectory + missing-file error + unexpected-key drop).
+- 7 mission-run orchestrator integration tests (happy path, criterion failure halt, no-checkpoint failure, warm-start parent resolution, resume-skip-already-succeeded, mission_dir-None rejection, atomic mission.json persistence).
+- 5 Mission helper tests (stage_dir, parent_checkpoint_of in 4 status states).
+- **9 audit-driven regression tests**: Ellipsis subscript, comprehension rejection, walrus rejection, multi-element bool friendly hint, parent-ckpt-deleted event, adapter-mismatch detection, stage_dir on stage_started, lock re-entry, source-inspection guard against future re-introduction of `unlink`.
+
+**Verified:**
+- Sculptor: **278 passed, 1 skipped** (was 239 pre-Ship 16 → +39 tests).
+- Zero regressions across the pre-existing 239-test suite.
+- Test runtime: ~50 s for the full sculptor suite, ~1 s for Ship 16's 39 tests in isolation.
+
+**Callable surface:**
+```python
+from sculptor.decompose import decompose_task
+from sculptor.mission import save_mission
+from sculptor.sculpt import mission_run
+
+# Decompose (Ship 14)
+mission = decompose_task("Stand on one leg and kick", adapter.reward_contract(), kg_store=kg)
+# Save → assigns mission.mission_dir
+save_mission(mission, projects_root / "g1-kick-mission")
+mission.mission_dir = str((projects_root / "g1-kick-mission").resolve())
+
+# Run end-to-end (Ship 16) — chains stages with Ship 15 warm-start
+result = mission_run(
+    mission,
+    adapter_short_name="mjlab",
+    kg_store=kg,
+    on_event=lambda e: print("[mission]", e),
+)
+print(result.completed, result.halted_at_stage)
+```
+
+**Explicitly NOT in Ship 16** (deferred):
+- Re-decomposition on stage failure → Ship 17.
+- Mission UI (DAG viewer, per-stage drill-down) → Ship 18.
+- Skill-library cross-mission policy reuse → Ship 19.
+- Per-stage knob overrides (steps_per_iter, rollout_episodes) — currently every stage uses the scaffold's defaults overridden only by `iterations` / `seed`. Add to `Stage` dataclass when needed.
+- Per-step trajectory access in criteria for arrays NOT in `PERSISTED_TRAJECTORY_KEYS` — derive from existing arrays (e.g., `trajectory['root_link_pos_w'][...,2]` for base_height proxy).
+
+### 2026-04-24 — Ship 15: Policy warm-start (rsl_rl selective load across stages)
+
+**Scope:** Second brick of the Mission roadmap. Ship 15 lets a caller pass an external rsl_rl checkpoint to `sculpt_run`'s **iter-0 only**, which `_cmd_train` loads via `runner.load(path, load_cfg={actor: True, critic: True, optimizer: False, iteration: False, rnd: False})` BEFORE `runner.learn()`. This is the mechanism Ship 16's orchestrator will use to chain skills across Mission stages.
+
+**Process (per Sam's "use agents to plan + review" ask):**
+1. Explore agent mapped the mjlab → rsl_rl → on-policy-runner pipeline to file:line precision.
+2. **Key finding during verification:** `rsl_rl.OnPolicyRunner.load(path, load_cfg=None, strict=True, map_location=None)` accepts a **`load_cfg` dict** with keys `{actor, critic, optimizer, iteration, rnd}` — each a bool. This is much better than the initial assumption of state-dict slicing; PPO.load honors the config cleanly at [rsl_rl/algorithms/ppo.py:444-466](). Ship 15 passes `optimizer=False` (stale Adam momentum from a different reward harms new-task learning) and `iteration=False` (keeps `max_iterations` semantics intact).
+3. Plan agent reviewed. Flagged 4 gaps — incorporated before implementation:
+   - Resume silently winning over init_policy_path → emit `warm_start_skipped` event with `reason="local_checkpoint_wins"`.
+   - Adapter silently dropping init_policy_path → emit `warm_start_skipped` with `reason="adapter_does_not_support"`.
+   - Obs-space mismatch → wrap `runner.load` in try/except with helpful error.
+   - Checksum + richer event payload → `warm_start_loaded` includes `source_sha8` + `load_cfg_keys`.
+4. Implementation landed, then **two parallel code-review agents** audited it. Found and fixed:
+
+- **CRITICAL (pre-audit) — `**kwargs` introspection bug.** The original `"init_policy_path" in sig.parameters` check returned False for adapters using `**kwargs` catch-all, silently dropping the kwarg AND emitting `warm_start_skipped` (lying to the orchestrator). Fixed at [sculptor/sculpt.py:_train_or_resume](RewardSculptor/sculptor/sculpt.py) — now accepts either explicit named param OR `VAR_KEYWORD` in the signature.
+- **HIGH — Empty-string bypass of path validation.** `Path("").resolve() == Path.cwd()` would bypass the None check and mis-validate. Fix: treat `""` / whitespace-only strings as None at `sculpt_run` entry. [sculpt.py:sculpt_run]().
+- **MEDIUM-HIGH — Narrow exception catch.** `torch.load` can raise `UnpicklingError` / `OSError` / `EOFError` for corrupt or truncated checkpoints, not just `RuntimeError`. Broadened at [_mjlab_runner.py:_cmd_train]() to `(RuntimeError, OSError, EOFError, Exception)` with a clear diagnostic message listing the three likely causes (obs-space drift, corruption, rsl_rl version drift).
+- **MEDIUM-LOW — Missing intent signal in `iter_started` event.** Added `warm_start_source` field so Ship 16 can correlate caller intent (this iter was supposed to warm-start) with the subprocess's `warm_start_loaded` event (the subprocess actually loaded the ckpt). Silent mismatch = bug.
+
+**Findings documented but NOT fixed (rationale in comments):**
+- `torch.load(weights_only=False)` ACE vector — consistent with rsl_rl's own internal default ([on_policy_runner.py:157]()) and pre-existing in `_train_or_resume:665`. Same trust model as user-supplied reward modules, which ARE executed unsandboxed. Marginal new attack surface is zero.
+- Symlink / path-boundary traversal — user supplies paths, same trust as v0.py.
+- CHANGELOG / provenance lineage — Ship 16 orchestrator will persist mission-level provenance; per-iter warm-start source is already in the `iter_started` event.
+- Streaming SHA-256 — micro-opt; a 100 MB ckpt hashes in ~200 ms vs. a 20-min training run.
+
+**Files changed:**
+- [sculptor/adapters/_mjlab_runner.py](RewardSculptor/sculptor/adapters/_mjlab_runner.py): new `--load-pretrained-policy` argparse flag + `runner.load(load_cfg=...)` call between runner construction and `runner.learn()`. Emits `[SCULPT-EVENT] warm_start_loaded {source, source_sha8, load_cfg_keys}` to stdout.
+- [sculptor/adapters/mjlab.py:MjlabAdapter.train](RewardSculptor/sculptor/adapters/mjlab.py): new `init_policy_path: Optional[Path] = None` keyword-only kwarg; validates file exists and appends `--load-pretrained-policy` flag to subprocess cmd. Pre-flight file check surfaces a clear `FileNotFoundError` BEFORE subprocess spawn.
+- [sculptor/sculpt.py](RewardSculptor/sculptor/sculpt.py): `_train_or_resume` threads `init_policy_path` via inspect-based kwarg forwarding; emits `warm_start_skipped` on silent drop OR local-checkpoint-wins. `_run_one_iter` adds the kwarg + includes `warm_start_source` in `iter_started` event. `sculpt_run` adds the top-level kwarg, validates at entry, passes to iter loop ONLY when `i == start_iter`.
+- **Abstract `SculptorAdapter.train()` signature unchanged** — other adapters (gym_sb3 / mjx / rllib) stay untouched; they'd silently emit `warm_start_skipped` if ever given a path.
+
+**Tests — [tests/test_ship15_warm_start.py](RewardSculptor/tests/test_ship15_warm_start.py), 16 tests:**
+1. `test_mjlab_train_appends_load_pretrained_policy_flag` — cmd construction.
+2. `test_mjlab_train_omits_flag_when_init_policy_none` — default unchanged.
+3. `test_mjlab_train_raises_on_missing_init_policy` — pre-flight path check.
+4. `test_train_or_resume_forwards_init_policy_path_to_supporting_adapter` — explicit-kwarg adapter.
+5. `test_train_or_resume_drops_init_policy_path_for_unsupported_adapter` — no-kwarg adapter + `warm_start_skipped` event shape.
+6. `test_train_or_resume_emits_warm_start_skipped_when_local_ckpt_wins` — resume-vs-init-policy conflict.
+7. `test_train_or_resume_no_warm_start_event_when_init_policy_none` — quiet path.
+8. `test_sculpt_run_rejects_missing_init_policy_path` — top-level entry validation.
+9. `test_sculpt_run_init_policy_iter_0_guard_in_source` — iter-0-only gate.
+10. `test_mjlab_runner_cli_parses_load_pretrained_policy` — argparse roundtrip.
+11. `test_rsl_rl_load_cfg_selectively_loads_actor_and_critic` — rsl_rl API drift guard (regex-matches the 5 keys PPO.load consumes).
+12. `test_ship15_warm_start_event_shape` — event-schema guard.
+13. `test_train_or_resume_forwards_kwarg_to_adapter_with_var_kwarg` — **audit CRITICAL regression.**
+14. `test_sculpt_run_treats_empty_string_init_policy_as_none` — **audit HIGH regression.**
+15. `test_mjlab_runner_broadened_exception_catch_in_source` — **audit MEDIUM-HIGH regression.**
+16. `test_iter_started_event_includes_warm_start_source_when_set` — **audit MEDIUM-LOW regression.**
+
+**Verified:**
+- Sculptor: **239 passed, 1 skipped** (was 223 → +16 Ship 15 tests).
+- Zero regressions across 47 s test run.
+- Plan v2 + both code-audit passes documented inline in commit rationale.
+
+**Callable surface for Ship 16:**
+```python
+from sculptor.sculpt import sculpt_run
+# Run stage 2 warm-started from stage 1's final checkpoint
+sculpt_run(
+    config_path=stage_2_config,
+    behavior_goal=stage_2.goal_text,
+    iterations=stage_2.max_iterations,
+    init_policy_path=stage_1_final_ckpt,  # ← Ship 15 surface
+)
+```
+Events Ship 16 run_manager should subscribe to:
+- `iter_started` → check `warm_start_source` field for intent.
+- `warm_start_loaded` (from subprocess stdout) → confirm ckpt loaded.
+- `warm_start_skipped` with reason ∈ {`local_checkpoint_wins`, `adapter_does_not_support`} → orchestrator must decide retry / abort / continue.
+
+**Explicitly NOT in Ship 15** (deferred):
+- Iter-to-iter warm-start within one `sculpt_run`.
+- CLI entry point (`sculpt run --init-policy-path`) — Mission UI in Ship 18.
+- gym_sb3 / mjx / rllib adapter support.
+- Obs-space consistency validation at load time (relies on rsl_rl's own state_dict shape error + wrapper message).
+
+### 2026-04-24 — Ship 14: Mission / Stage data model + Claude task-decomposer
+
+**Scope:** First concrete step of the multi-stage curriculum roadmap. Ship 14 delivers the **data model + decomposition-time Claude call** needed for a Mission-aware orchestrator (Ships 15-18 build warm-start, success-criterion evaluation, re-decomposition, UI). Nothing trains yet — this ship returns a validated `Mission` object and stops. No changes to the Project / sculpt_run path; the existing single-project flow is strictly unchanged.
+
+**Architectural reference:** CurricuLLM (arXiv:2409.18382) — LLM decomposes complex robotics tasks into subtasks with per-stage reward + warm-start policy; validated on Berkeley Humanoid. Ship 14 mirrors their curriculum-generation LLM role; sculptor's existing Eureka-style reward iteration fills the per-stage role.
+
+- **New data model — [sculptor/mission.py](RewardSculptor/sculptor/mission.py)**
+  - `Stage` dataclass: `name, goal_text, success_criterion, max_iterations, parent_stage, reward_seed_prompt, kg_seed_papers` authored at decompose time + `status, final_policy_path, final_reward_path, best_metric, iterations_used, started_at, finished_at` populated at runtime by the future orchestrator.
+  - `Mission` dataclass: ordered list of Stages + `goal, decomposition_model, decomposition_rationale, schema_version, current_stage_idx, mission_dir`.
+  - JSON roundtrip via `Mission.to_json`/`from_json`, on-disk persistence via `save_mission`/`load_mission`.
+  - `validate_mission(mission, *, info_keys)` enforces: ≥1 stage, snake_case names ≤32 chars, unique names, first-stage `parent_stage=None`, topological parent refs (no forward / cycle), `max_iterations ∈ [1, 50]`, `reward_seed_prompt` within [3, 2000] chars (matches the existing prompt-edit endpoint), `success_criterion` parses as a Python expression, every `info['<key>']` uses a real `expected_info_keys`. Bare-identifier grounding deferred to Ship 16 runtime (component names aren't materialized at decompose time).
+  - Schema version gate (`SCHEMA_VERSION = 1`) for forward compat.
+
+- **New prompt — [sculptor/prompts/decompose_task.md](RewardSculptor/sculptor/prompts/decompose_task.md)**
+  Structured JSON output schema + 7 hard rules: topological ordering, last-stage-satisfies-goal, individual learnability (3-5 sculpt iters per stage), grounded success_criterion, grounded reward_seed_prompt, KG citations restricted to the provided literature slice, warm-start preferring most-recent compatible predecessor. Includes a stage-design guidance block and a worked example (jump-from-stance curriculum) so Claude sees the target shape.
+
+- **New entry point — [sculptor/decompose.py](RewardSculptor/sculptor/decompose.py)**
+  `decompose_task(goal, reward_contract, *, kg_store=None, client=None, model="claude-opus-4-7") -> Mission`. Renders the reward_contract + top-8 KG semantic matches into the decomposer's user content, calls `client.messages.parse(output_format=_DecompositionModel)` with the same one-retry pattern as `diagnose._parse_with_retry`, validates the result via `validate_mission` + live-KG citation check (`_validate_kg_seed_papers`), returns a `Mission` with all stages `status="pending"`. Anthropic client defaults to `max_retries=2, timeout=240.0` matching the post-Ship-13 edit envelope.
+
+- **Tests — [tests/test_decompose.py](RewardSculptor/tests/test_decompose.py)** 24 tests:
+  - Serialization roundtrip (2), schema-version gate, forward-compat unknown-key drop.
+  - `validate_mission` rejection cases: empty stages, bad name (non-snake_case), duplicate names, first-stage-with-parent, forward parent ref, unknown parent name, unparseable criterion, unknown info-key in criterion, out-of-range `max_iterations`, out-of-range `reward_seed_prompt`.
+  - `validate_mission` accept case: bare identifier that could be a future component (not rejected pre-runtime).
+  - `decompose_task` happy path (no KG), contract-threading into user content, empty-goal rejection.
+  - End-to-end Claude mistakes caught: forward parent ref, unknown info key, KG citation without store, KG citation not in live KG.
+  - One-retry-on-parse-failure (mirrors diagnose).
+  - Prompt-content guard (load_bearing rules don't disappear from `decompose_task.md` on edit).
+
+- **Verified:**
+  - Sculptor: **223 passed, 1 skipped** (was 197 → +26 new: 24 decompose + re-baselined post-Ship-12).
+  - Zero regressions. No files modified outside the new Ship-14 surface.
+  - Sculptor tests run in ~50 s.
+
+- **What's NOT in Ship 14** (explicit, for the follow-up windows):
+  - NO orchestrator (`mission_run`) — Ship 16.
+  - NO policy warm-start plumbing to the mjlab adapter — Ship 15.
+  - NO success-criterion runtime evaluator — Ship 16.
+  - NO re-decomposition on stage failure — Ship 17.
+  - NO UI — Ship 18.
+  - NO CLI entry point (`sculpt mission <goal>`) — intentionally deferred; decompose is callable from Python / UI only until Ship 18.
+
+- **Callable surface for Ship 15 to build on:**
+  ```python
+  from sculptor.decompose import decompose_task
+  from sculptor.mission import save_mission, load_mission, validate_mission
+  mission = decompose_task("Stand on one leg and kick", adapter.reward_contract(), kg_store=kg)
+  save_mission(mission, project_dir / "mission.json")
+  # mission.stages[0].reward_seed_prompt → feed into existing apply_prompt_edit
+  # mission.stages[i].parent_stage → Ship 15 resolves to policy checkpoint path
+  # mission.stages[i].success_criterion → Ship 16 evaluates on rollout trajectories
+  ```
+
+### 2026-04-23 08:30 — Ship 12: `_pre_validate` partition (stop dropping whole edit batches)
+
+**Scope:** Sam's overnight G1-kick run completed all 10 iters but the reward module was frozen at v1 the entire time — the UI's Rewards tab showed no edits/justifications across iters 2-10, and the primary metric drifted -419 → -534. Root cause isolated in [runs/_run_job_*.log](): every iter had `[sculpt] iter N: apply_edits skipped — EditValidationError: edit pre-flight failed` with 1-3 of 5 edits flagged ungrounded while the other 2-4 were perfectly valid. Pre-fix `_pre_validate` raised on the FIRST violation — one bad diagnoser edit killed the whole batch. Ten iters × zero rewards applied = silent "reward didn't evolve" symptom.
+
+- **Fix — partition instead of raise.** [sculptor/edit.py:_pre_validate](RewardSculptor/sculptor/edit.py) — now returns an `EditPlan` with new `rejected_edits` + `rejection_reasons` fields. Valid edits flow through to the LLM, rejected ones are logged with the reason and skipped. Only an **empty** `applicable_edits` list is a hard error (`EditValidationError` still raised by `apply_edits` in that case). `paper_refs not in KG` is STILL fatal (KG hygiene is a project-level concern, not a per-edit one).
+- **Event surface.** [sculptor/edit.py:apply_edits](RewardSculptor/sculptor/edit.py) — new per-rejection `[edit] rejected: ...` log_line events + a structured `{type: "edits_rejected", count, reasons}` event so the UI run manager can fold these into the RunsTab iter-row. The "pre-validate done" summary now shows all three counts (applicable / deferred / rejected).
+- **Diagnose prompt sharpened.** [sculptor/prompts/diagnose_grounded.md](RewardSculptor/sculptor/prompts/diagnose_grounded.md) — explicit OPERATION-vs-target_term table. Two common diagnoser errors from the overnight run called out by name:
+  1. `operation: "clip"` + `target_term: "kick_velocity_cap"` (new name with modify op) → correct shape is either `operation: "clip", target_term: "kick_velocity"` OR `operation: "add", target_term: "kick_velocity_cap"`.
+  2. Raw physics-state arrays (`qvel`, `qpos`, `xquat`) referenced in `suggested_value` → NOT grounded unless listed in `expected_info_keys`; use the adapter-exposed info key instead, or flag `requires_env_extension=true`.
+- **Tests:**
+  - [tests/test_edit.py](RewardSculptor/tests/test_edit.py) — `test_pre_validate_partitions_ungrounded_formula_field` + `test_pre_validate_partitions_modify_op_with_unknown_target_term` renamed/updated from their pre-fix `rejects` counterparts; now assert plan shape instead of raises. NEW `test_pre_validate_partitions_mixed_batch_keeps_valid_edits` pins the overnight regression: 3 edits (valid, invalid, valid) → 2 applicable + 1 rejected.
+- **Secondary finding (physics didn't auto-apply).** The realism audit fired every iter but every verdict was `mild` (never `severe`). §7.4 auto-physics only triggers on `severe` — Sam's iter-5 `joint_vel_p99_max=89.46 rad/s` (≈3× nominal 30 rad/s) should have tripped `severe` but the thresholds are too permissive. **Not fixed in this ship** — separate tuning concern. Flagged for follow-up; [sculptor/adapters/realism.py]() is the file to tighten.
+- **Verified:**
+  - Sculptor: **197 passed, 1 skipped** (was 196 → +1 new partition test).
+  - The _pre_validate fix is hypothesis-driven from the log analysis; live smoke against a fresh G1-kick run will confirm the reward module actually evolves across iters.
+- **What Sam should expect on the next run.** Every iter row in the Runs tab should show `v<N> → v<N+1>` with 2-5 applied edits and 0-3 rejected (with rejection reasons shown). Primary metric should trend UP instead of drifting, assuming the diagnoser's applicable edits are substantive (they were — just blocked by the all-or-nothing validator).
+
+### 2026-04-23 04:15 — Ship 11: KG-preview hang fix (huggingface_hub httpx bypass)
+
+**Scope:** Fix the Ship-9/10 regression where `reward_prompt_edit` hung 5+ min at the `query_semantic` KG-preview step. Root cause identified, 3-part fix landed, live-smoked against Sam's real 448-technique KG.
+
+- **Root cause.** `huggingface_hub` (recent version) uses an **httpx-based HEAD request** during `SentenceTransformer(model_name)` init to check cache freshness. On WSL2 this request hangs indefinitely (observed as 5+ min → timeout; diagnostic reproducer without the fix errors with `RuntimeError: Cannot send a request, as the client has been closed` from httpx's internals). The Ship-10 `_prewarm_embedding_model` hook didn't introduce the httpx bug but EXPOSED it — pre-Ship-10 only the reward-prompt worker hit `_get_embedder`; post-Ship-10 both the prewarm thread and the worker hit it concurrently, doubling the odds of wedging. The KG itself had nothing wrong: 448 Techniques all with all-MiniLM-L6-v2 embeddings populated; `_ensure_technique_embeddings` does 0 backfill work.
+- **Fix 1 — `local_files_only=True` on SentenceTransformer init.** [sculptor/kg/query.py:_get_embedder](RewardSculptor/sculptor/kg/query.py) — tries `SentenceTransformer(model_name, local_files_only=True)` first, falling back to online load on OSError/ValueError (fresh install, empty cache). `SCULPTOR_HF_NO_NETWORK=1` forces offline-only for CI. **This is the load-bearing change** — bypasses the httpx HEAD check entirely, cuts embedder init from 60-120s → 0.4s on warm cache.
+- **Fix 2 — `threading.Lock` on `_get_embedder`.** [sculptor/kg/query.py](RewardSculptor/sculptor/kg/query.py) — new `_EMBEDDER_LOAD_LOCK` + double-checked locking. Defensive: even if offline load hangs for some other reason, prewarm + worker serialize instead of racing. Not strictly needed for the primary fix but pins the race so Ship-10's prewarm pattern is safe going forward.
+- **Fix 3 — pin prewarm task reference.** [backend/main.py:_prewarm_embedding_model](reward-sculptor-ui/backend/main.py) — stashes the `asyncio.create_task` return on `app.state.embedder_prewarm_task`. Python 3.11+ `asyncio.create_task` only keeps weak refs; unanchored tasks can be GC'd mid-flight. Named "embedder-prewarm" for introspection.
+- **Instrumentation.** Added `log.info` breadcrumbs in `query_semantic` and `_ensure_technique_embeddings` (Technique fetch, has_embedding scan, embedder load, encode, total). If this hangs recur the uvicorn log pins the exact substep. Replaces the Ship-10-directive's ask for in-sculptor breadcrumbs.
+- **Tests:**
+  - `tests/test_kg_query.py::test_get_embedder_is_thread_safe_under_concurrent_load` — pins the lock fix. Stubs `SentenceTransformer` to sleep 200 ms on init, spawns 8 threads calling `_get_embedder`, asserts exactly 1 init + no deadlock within 5s.
+  - Fixed pre-existing `test_edit.py::test_query_semantic_filters_by_min_similarity` breakage (my new log line used `store.db_path` — test's `_StoreStub` didn't have it; changed to `getattr(..., "db_path", "<unknown>")`).
+- **Verified:**
+  - Sculptor: **196 passed, 1 skipped** (was 195 → +1).
+  - Backend reward-prompt: 10 passed, 1 deselected (skipping the pre-existing `test_reward_prompt_edit_emits_log_line_events` full-suite hang).
+  - **Live smoke against Sam's real KG** (`~/.local/share/sculptor/kg/graph.db`, 448 techniques):
+    ```
+    kg.query.query_semantic: start (text_len=39, top_k=5, min_sim=0.35)
+    kg.query: fetched 448 Technique nodes in 0.00s
+    kg.query: has_embedding scan: 0 of 448 missing in 0.00s
+    kg.query: loaded 448 embeddings in 0.01s
+    loading sentence-transformer (local_files_only=True)
+    loaded sentence-transformer from cache in 0.4s
+    kg.query.query_semantic: encoded query in 3.41s
+    query_semantic returned 5 matches in 3.5s
+    ```
+    Total **3.5 s** vs the pre-fix 300 s timeout. Overnight G1 run unblocked.
+- **Why this isn't a Ship-10 revert.** The prewarm is retained — with the lock + `local_files_only`, it correctly shaves ~3 s off the first live query without any hang risk. The directive's "do NOT revert Ship 10 as a first step" stands.
+- **Escape hatches preserved:** `RS_SKIP_EMBEDDER_PREWARM=1` still disables prewarm. `SCULPTOR_HF_NO_NETWORK=1` new, for CI / repeatable environments that want offline-only.
 
 ### 2026-04-23 03:30 — Ship 10 + unresolved KG-preview hang regression
 

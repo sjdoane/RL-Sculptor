@@ -1,22 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import {
-  AlertCircle,
-  Camera,
-  Download,
-  ImageOff,
-  Loader2,
-  RefreshCcw,
-  Video,
-} from "lucide-react";
 import { toast } from "sonner";
 
-import { Button } from "@/components/ui/button";
-import { Select } from "@/components/ui/select";
+import { Icon } from "@/components/rs/icon";
 import { useLiveClips } from "@/hooks/useLiveClips";
 import { useProjectPreview } from "@/hooks/useProjectPreview";
+import { useMissions } from "@/hooks/useMissions";
+import { useRunEvents } from "@/hooks/useRunEvents";
 import { useRuns } from "@/hooks/useRuns";
 import { clipUrl, iterRolloutUrl, previewUrl } from "@/lib/api";
-import { cn } from "@/lib/utils";
 import type { CameraAngle, RunSummary } from "@/lib/types";
 import { CAMERA_ANGLES } from "@/lib/types";
 
@@ -25,6 +16,14 @@ const ANGLE_LABEL: Record<CameraAngle, string> = {
   front: "Front",
   side: "Side",
   top: "Top",
+};
+
+const STAGE_STYLE: React.CSSProperties = {
+  position: "relative",
+  aspectRatio: "16 / 9",
+  background: "#16150f",
+  overflow: "hidden",
+  display: "block",
 };
 
 type Mode = "static" | "live" | "replay";
@@ -38,24 +37,24 @@ type Mode = "static" | "live" | "replay";
  *      stays on the last clip with a "Run completed" overlay.
  */
 export function RobotViewer({ slug }: { slug: string }) {
-  const runs = useRuns(slug);
-  const activeRun = useMemo(
-    () => (runs.data ?? []).find((r) => r.status === "running" || r.status === "queued") ?? null,
-    [runs.data],
+  // §Ship 21d: keep /runs polling through mission stage boundaries so
+  // the live-video run selection doesn't freeze on a stale stage when
+  // one completes and the next starts.
+  const missions = useMissions(slug);
+  const missionActive = useMemo(
+    () => (missions.data ?? []).some((m) => m.active_job_id != null),
+    [missions.data],
   );
-  // The "most-recent run" is where replay clips come from even after
-  // the run ends.
-  const mostRecentRun = useMemo(
-    () => pickMostRecent(runs.data ?? []),
-    [runs.data],
-  );
-  const trackedRunId = mostRecentRun?.run_id ?? null;
+  const runs = useRuns(slug, { keepPolling: missionActive });
+  const activeRun = useMemo(() => pickActiveRun(runs.data ?? []), [runs.data]);
+  const mostRecentRun = useMemo(() => pickMostRecent(runs.data ?? []), [runs.data]);
+  const liveRun = activeRun ?? mostRecentRun;
+  const liveRunId = liveRun?.run_id ?? null;
+  const replayRun = activeRun ?? mostRecentRun;
 
   const [mode, setMode] = useState<Mode>("static");
   const [userPicked, setUserPicked] = useState(false);
 
-  // Auto-transition Static → Live when a run becomes active and user
-  // hasn't overridden.
   useEffect(() => {
     if (userPicked) return;
     if (activeRun && mode === "static") {
@@ -68,44 +67,27 @@ export function RobotViewer({ slug }: { slug: string }) {
     setUserPicked(true);
   }, []);
 
-  // Replay state — chosen iter.
   const [replayIter, setReplayIter] = useState<number | null>(null);
 
+  useEffect(() => {
+    setReplayIter(null);
+  }, [replayRun?.run_id]);
+
   return (
-    <div className="flex flex-col overflow-hidden rounded-lg border bg-card">
-      <div className="flex items-center justify-between gap-2 border-b px-3 py-2 text-xs">
-        <div className="flex items-center gap-2">
-          <Video className="h-3.5 w-3.5 text-muted-foreground" />
-          <span className="font-semibold">Robot viewer</span>
-          {activeRun && (
-            <span className="rounded-sm border border-amber-300/60 bg-amber-50 px-1 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-amber-900">
-              run active
-            </span>
-          )}
+    <div className="rs-viewer">
+      <div className="rs-viewer-bar">
+        <div className="rs-card-title">
+          <Icon name="video" size={16} />
+          Robot viewer
+          {activeRun && <span className="rs-dot live" style={{ marginLeft: 4 }} />}
         </div>
-        <ModeSwitcher
-          mode={mode}
-          onPick={pickMode}
-          hasReplay={!!trackedRunId}
-          hasLive={!!trackedRunId}
-        />
+        <ModeSwitcher mode={mode} onPick={pickMode} hasReplay={!!replayRun} hasLive={!!liveRunId} />
       </div>
-      <div className="relative aspect-video w-full bg-slate-950">
+      <div className="rs-viewer-stage" style={STAGE_STYLE}>
         {mode === "static" && <StaticLayer slug={slug} />}
-        {mode === "live" && (
-          <LiveLayer
-            slug={slug}
-            runId={trackedRunId}
-            run={mostRecentRun}
-          />
-        )}
+        {mode === "live" && <LiveLayer slug={slug} runId={liveRunId} run={liveRun} />}
         {mode === "replay" && (
-          <ReplayLayer
-            slug={slug}
-            run={mostRecentRun}
-            iter={replayIter}
-            onPickIter={setReplayIter}
-          />
+          <ReplayLayer slug={slug} run={replayRun} iter={replayIter} onPickIter={setReplayIter} />
         )}
       </div>
     </div>
@@ -114,50 +96,43 @@ export function RobotViewer({ slug }: { slug: string }) {
 
 function pickMostRecent(runs: RunSummary[]): RunSummary | null {
   if (runs.length === 0) return null;
-  // runs are sorted newest-first by the backend (`list`), but be
-  // defensive in case the backend ordering changes.
   const sorted = [...runs].sort((a, b) => {
-    const ta = a.started_at ? new Date(a.started_at).getTime() : 0;
-    const tb = b.started_at ? new Date(b.started_at).getTime() : 0;
-    return tb - ta;
+    return runSortTime(b) - runSortTime(a);
   });
   return sorted[0];
 }
 
-// ── Mode switcher ────────────────────────────────────────────────────
+function pickActiveRun(runs: RunSummary[]): RunSummary | null {
+  return pickMostRecent(runs.filter((r) => r.status === "running" || r.status === "queued"));
+}
+
+function runSortTime(run: RunSummary): number {
+  return run.started_at ? new Date(run.started_at).getTime() : 0;
+}
+
+// ── Mode switcher (rs-seg) ───────────────────────────────────────────
 function ModeSwitcher({
-  mode,
-  onPick,
-  hasLive,
-  hasReplay,
-}: {
-  mode: Mode;
-  onPick: (m: Mode) => void;
-  hasLive: boolean;
-  hasReplay: boolean;
-}) {
-  const items: Array<{ key: Mode; label: string; disabled?: boolean; hint?: string }> = [
-    { key: "static", label: "Static" },
-    { key: "live", label: "Live", disabled: !hasLive, hint: hasLive ? undefined : "no runs yet" },
-    { key: "replay", label: "Replay", disabled: !hasReplay, hint: hasReplay ? undefined : "no runs yet" },
+  mode, onPick, hasLive, hasReplay,
+}: { mode: Mode; onPick: (m: Mode) => void; hasLive: boolean; hasReplay: boolean }) {
+  const items: Array<{ key: Mode; label: string; icon: string; disabled?: boolean; hint?: string }> = [
+    { key: "static", label: "Static", icon: "camera" },
+    { key: "live", label: "Live", icon: "activity", disabled: !hasLive, hint: hasLive ? undefined : "no runs yet" },
+    { key: "replay", label: "Replay", icon: "history", disabled: !hasReplay, hint: hasReplay ? undefined : "no runs yet" },
   ];
   return (
-    <div className="inline-flex rounded-md border bg-background p-0.5">
+    <div className="rs-seg" role="tablist">
       {items.map((it) => (
         <button
           key={it.key}
-          type="button"
+          role="tab"
+          aria-selected={mode === it.key}
           disabled={it.disabled}
-          onClick={() => onPick(it.key)}
           title={it.hint}
-          className={cn(
-            "rounded-sm px-2 py-0.5 text-[11px] font-medium transition-colors",
-            mode === it.key
-              ? "bg-foreground text-background"
-              : "text-muted-foreground hover:text-foreground",
-            it.disabled && "cursor-not-allowed opacity-40 hover:text-muted-foreground",
-          )}
+          className={mode === it.key ? "on" : ""}
+          style={it.disabled ? { opacity: 0.4, cursor: "not-allowed" } : undefined}
+          onClick={() => onPick(it.key)}
         >
+          <Icon name={it.icon} size={14} />
           {it.label}
         </button>
       ))}
@@ -169,14 +144,17 @@ function ModeSwitcher({
 function StaticLayer({ slug }: { slug: string }) {
   const [angle, setAngle] = useState<CameraAngle>("iso");
   const [reRendering, setReRendering] = useState(false);
-  const { data: url, isLoading, error, invalidate } = useProjectPreview(slug, { angle });
+  const { data: url, isLoading, error, invalidate, refetch } = useProjectPreview(slug, { angle });
 
   const onReRender = async () => {
     setReRendering(true);
     try {
-      const res = await fetch(previewUrl(slug, { angle, regenerate: true }));
+      const res = await fetch(previewUrl(slug, { angle, regenerate: true }), { cache: "no-store" });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      await res.blob();
       invalidate();
+      await refetch();
+      toast.success("Preview re-rendered");
     } catch (e) {
       toast.error("Re-render failed", { description: (e as Error).message });
     } finally {
@@ -186,57 +164,46 @@ function StaticLayer({ slug }: { slug: string }) {
 
   return (
     <>
-      <div className="absolute inset-x-0 top-0 z-10 flex items-center justify-between gap-2 bg-gradient-to-b from-black/50 to-transparent px-3 py-2 text-xs text-slate-100">
-        <span className="flex items-center gap-1 text-[10px] uppercase tracking-wider">
-          <Camera className="h-3 w-3" />
-          static
-        </span>
-        <div className="flex items-center gap-1.5">
-          <Select
+      <div className="rs-overlay"><Icon name="camera" size={13} />static · {ANGLE_LABEL[angle]}</div>
+      <div className="rs-overlay" style={{ left: "auto", right: 12, gap: 8, padding: "5px 8px" }}>
+        <div className="rs-select">
+          <select
             value={angle}
             onChange={(e) => setAngle(e.target.value as CameraAngle)}
-            className="h-6 w-20 border-slate-700 bg-slate-900/80 text-[11px] text-slate-100"
             aria-label="Camera angle"
+            style={{ height: 26, background: "rgba(255,255,255,0.06)", color: "#f3f1e8", border: "1px solid rgba(255,255,255,0.18)" }}
           >
             {CAMERA_ANGLES.map((a) => (
-              <option key={a} value={a}>{ANGLE_LABEL[a]}</option>
+              <option key={a} value={a} style={{ color: "#16150f" }}>{ANGLE_LABEL[a]}</option>
             ))}
-          </Select>
-          <Button
-            variant="ghost"
-            size="sm"
-            className="h-6 gap-1 px-1.5 text-[11px] text-slate-100 hover:bg-slate-800"
-            onClick={onReRender}
-            disabled={reRendering || isLoading}
-          >
-            <RefreshCcw className={cn("h-3 w-3", reRendering && "animate-spin")} />
-            Re-render
-          </Button>
+          </select>
         </div>
+        <button
+          className="rs-btn rs-btn-xs"
+          style={{ background: "rgba(255,255,255,0.06)", color: "#f3f1e8", borderColor: "rgba(255,255,255,0.18)" }}
+          aria-label="Re-render static preview from the selected camera angle"
+          onClick={onReRender}
+          disabled={reRendering || isLoading}
+        >
+          <Icon name="refresh-cw" size={12} className={reRendering ? "rs-spin" : undefined} />
+          Re-render
+        </button>
       </div>
       {(isLoading || reRendering) && <Shimmer />}
       {url && (
-        <img
-          src={url}
-          alt={`${ANGLE_LABEL[angle]} static preview`}
-          className="absolute inset-0 h-full w-full object-contain"
-        />
+        <img src={url} alt={`${ANGLE_LABEL[angle]} static preview`} style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "contain" }} />
       )}
-      {error && !isLoading && <EmptyState error={(error as Error).message} />}
+      {error && !isLoading && <EmptyOverlay error={(error as Error).message} />}
     </>
   );
 }
 
 // ── Live layer ───────────────────────────────────────────────────────
-function LiveLayer({
-  slug,
-  runId,
-  run,
-}: {
-  slug: string;
-  runId: string | null;
-  run: RunSummary | null;
-}) {
+function LiveLayer({ slug, runId, run }: { slug: string; runId: string | null; run: RunSummary | null }) {
+  if (run?.kind === "mission_stage_run") {
+    return <LiveStageRollout slug={slug} runId={runId} run={run} />;
+  }
+
   const { clips, skipped, terminal } = useLiveClips(slug, runId ?? undefined);
   const latest = clips[clips.length - 1] ?? null;
   const [hasEverPlayed, setHasEverPlayed] = useState(false);
@@ -246,10 +213,7 @@ function LiveLayer({
     if (latest && videoRef.current) {
       setHasEverPlayed(true);
       videoRef.current.load();
-      videoRef.current.play().catch(() => {
-        // Browsers may block autoplay with sound; we're muted so this
-        // should succeed. If it doesn't, the user clicks play.
-      });
+      videoRef.current.play().catch(() => {});
     }
   }, [latest?.url]);
 
@@ -258,54 +222,35 @@ function LiveLayer({
 
   return (
     <>
-      <div className="absolute inset-x-0 top-0 z-10 flex items-center justify-between gap-2 bg-gradient-to-b from-black/60 to-transparent px-3 py-2 text-xs text-slate-100">
-        <span className="flex items-center gap-1 text-[10px] uppercase tracking-wider">
-          <span className={cn(
-            "inline-block h-1.5 w-1.5 rounded-full",
-            run?.status === "running" ? "animate-pulse bg-rose-500" : "bg-slate-500",
-          )} />
-          live{latest !== null ? ` · iter ${latest.iter}` : ""}
-        </span>
-        {latest && (
-          <span className="font-mono text-[10px] text-slate-300">
-            {fmtMetricAt(run, latest.iter)}
-          </span>
-        )}
+      <div className="rs-overlay">
+        <span className={"rs-dot" + (run?.status === "running" ? " live" : "")} style={run?.status === "running" ? undefined : { background: "var(--st-slate)" }} />
+        live{latest !== null ? ` · iter ${latest.iter}` : ""}
+        {latest && <span style={{ opacity: 0.8 }}>· {fmtMetricAt(run, latest.iter)}</span>}
       </div>
-      {errorNoClips && (
-        <EmptyState
-          title="Run errored before any clips rendered"
-          error={run?.error ?? undefined}
-        />
-      )}
+      {errorNoClips && <EmptyOverlay title="Run errored before any clips rendered" error={run?.error ?? undefined} />}
       {!errorNoClips && latest && (
         <video
           ref={videoRef}
           key={latest.url}
           src={latest.url}
-          className="absolute inset-0 h-full w-full object-contain"
-          muted
-          playsInline
-          autoPlay
-          loop
+          aria-label={`Live robot rollout, iteration ${latest.iter}`}
+          style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "contain" }}
+          muted playsInline autoPlay loop
         />
       )}
       {!errorNoClips && !latest && !hasEverPlayed && <Shimmer label="waiting for first clip…" />}
       {skipped.length > 0 && (
-        <div className="absolute bottom-3 left-3 z-10 flex items-center gap-1 rounded-md bg-amber-900/80 px-2 py-1 text-[10px] text-amber-100">
-          <AlertCircle className="h-3 w-3" />
+        <div className="rs-overlay" style={{ top: "auto", bottom: 12, background: "rgba(138,86,0,0.85)" }}>
+          <Icon name="alert-circle" size={12} />
           {skipped.length} clip{skipped.length === 1 ? "" : "s"} skipped
-          (render backpressure)
         </div>
       )}
       {runCompleted && latest && !errorNoClips && (
-        <div className="absolute bottom-3 right-3 z-10 rounded-md bg-emerald-900/80 px-2 py-1 text-[10px] uppercase tracking-wider text-emerald-100">
+        <div className="rs-overlay" style={{ top: "auto", bottom: 12, left: "auto", right: 12, background: "rgba(15,102,71,0.85)" }}>
           Run {run?.status}
         </div>
       )}
-      {terminal && (
-        <span className="sr-only">Terminal event received.</span>
-      )}
+      {terminal && <span className="sr-only">Terminal event received.</span>}
     </>
   );
 }
@@ -317,40 +262,85 @@ function fmtMetricAt(run: RunSummary | null, iter: number): string {
   return `metric=${v.toFixed(3)}`;
 }
 
+// ── Live (mission_stage_run) — Ship 21b ──────────────────────────────
+function LiveStageRollout({ slug, runId, run }: { slug: string; runId: string | null; run: RunSummary | null }) {
+  const events = useRunEvents(slug, runId ?? undefined);
+  const videoRef = useRef<HTMLVideoElement>(null);
+
+  const latestIter = useMemo(() => {
+    let best: number | null = null;
+    for (const ev of events.events) {
+      if (ev.type === "iter_rolled_out" || ev.type === "rollout_done" || ev.type === "iter_completed") {
+        const i = (ev as { iter?: unknown }).iter;
+        if (typeof i === "number" && (best === null || i > best)) best = i;
+      }
+    }
+    if (best === null && run && run.iterations_completed > 0) best = run.iterations_completed - 1;
+    return best;
+  }, [events.events, run]);
+
+  useEffect(() => {
+    if (latestIter === null || !videoRef.current) return;
+    videoRef.current.load();
+    videoRef.current.play().catch(() => {});
+  }, [latestIter]);
+
+  const src = useMemo(() => {
+    if (!run || latestIter === null) return null;
+    return iterRolloutUrl(slug, run.run_id, latestIter);
+  }, [slug, run, latestIter]);
+
+  const runCompleted = run && (run.status === "completed" || run.status === "errored" || run.status === "stopped");
+  const errorNoFrames = runCompleted && latestIter === null && run?.status === "errored";
+
+  return (
+    <>
+      <div className="rs-overlay">
+        <span className={"rs-dot" + (run?.status === "running" ? " live" : "")} style={run?.status === "running" ? undefined : { background: "var(--st-slate)" }} />
+        live{run?.stage_name ? ` · ${run.stage_name}` : ""}{latestIter !== null ? ` · iter ${latestIter}` : ""}
+        {latestIter !== null && <span style={{ opacity: 0.8 }}>· {fmtMetricAt(run, latestIter)}</span>}
+      </div>
+      {errorNoFrames && <EmptyOverlay title="Stage errored before any rollout rendered" error={run?.error ?? undefined} />}
+      {!errorNoFrames && src && (
+        <video
+          ref={videoRef}
+          key={src}
+          src={src}
+          aria-label={run?.stage_name ? `Live stage rollout, ${run.stage_name}, iteration ${latestIter ?? 0}` : `Live stage rollout, iteration ${latestIter ?? 0}`}
+          style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "contain" }}
+          muted playsInline autoPlay loop
+          onError={() => {}}
+        />
+      )}
+      {!errorNoFrames && !src && <Shimmer label="waiting for first rollout…" />}
+      {runCompleted && src && !errorNoFrames && (
+        <div className="rs-overlay" style={{ top: "auto", bottom: 12, left: "auto", right: 12, background: "rgba(15,102,71,0.85)" }}>
+          Stage {run?.status}
+        </div>
+      )}
+      {events.terminal && <span className="sr-only">Terminal event received.</span>}
+    </>
+  );
+}
+
 // ── Replay layer ─────────────────────────────────────────────────────
 function ReplayLayer({
-  slug,
-  run,
-  iter,
-  onPickIter,
-}: {
-  slug: string;
-  run: RunSummary | null;
-  iter: number | null;
-  onPickIter: (n: number) => void;
-}) {
+  slug, run, iter, onPickIter,
+}: { slug: string; run: RunSummary | null; iter: number | null; onPickIter: (n: number) => void }) {
   const liveState = useLiveClips(slug, run?.run_id);
-  // Prefer iterations from the run detail (they know which ones have
-  // rollouts on disk), fall back to the clips we've seen.
   const availableIters = useMemo(() => {
     const set = new Set<number>();
     liveState.clips.forEach((c) => set.add(c.iter));
-    if (run) {
-      for (let i = 0; i < run.iterations_completed; i++) set.add(i);
-    }
+    if (run) for (let i = 0; i < run.iterations_completed; i++) set.add(i);
     return Array.from(set).sort((a, b) => a - b);
   }, [liveState.clips, run]);
 
-  // Auto-select the latest iter on first entry to replay mode.
   useEffect(() => {
-    if (iter === null && availableIters.length > 0) {
-      onPickIter(availableIters[availableIters.length - 1]);
-    }
+    if (iter === null && availableIters.length > 0) onPickIter(availableIters[availableIters.length - 1]);
   }, [iter, availableIters, onPickIter]);
 
   const src = useMemo(() => {
     if (!run || iter === null) return null;
-    // Prefer the per-iter full rollout.mp4 (richer than a 2s clip).
     return iterRolloutUrl(slug, run.run_id, iter);
   }, [slug, run, iter]);
 
@@ -359,64 +349,48 @@ function ReplayLayer({
     return clipUrl(slug, run.run_id, iter);
   }, [slug, run, iter]);
 
-  if (!run) {
-    return <EmptyState title="No runs yet" />;
-  }
+  if (!run) return <EmptyOverlay title="No runs yet" />;
 
   return (
     <>
-      <div className="absolute inset-x-0 top-0 z-10 flex items-center justify-between gap-2 bg-gradient-to-b from-black/60 to-transparent px-3 py-2 text-xs text-slate-100">
-        <span className="flex items-center gap-1 text-[10px] uppercase tracking-wider">
-          <Video className="h-3 w-3" />
-          replay{iter !== null ? ` · iter ${iter}` : ""}
-        </span>
-        {src && (
-          <a
-            href={src}
-            download={`${run.run_id}_iter_${iter}.mp4`}
-            className="inline-flex items-center gap-1 rounded-md border border-slate-700 bg-slate-900/80 px-2 py-0.5 text-[11px] hover:bg-slate-800"
-            onClick={(e) => {
-              // Fallback: if the full rollout 404s (not yet written),
-              // try the 2s clip instead.
-              e.stopPropagation();
-            }}
-          >
-            <Download className="h-3 w-3" />
-            Download
-          </a>
-        )}
-      </div>
+      <div className="rs-overlay"><Icon name="history" size={13} />replay{iter !== null ? ` · iter ${iter}` : ""}</div>
+      {src && (
+        <a
+          href={src}
+          download={`${run.run_id}_iter_${iter}.mp4`}
+          className="rs-overlay"
+          style={{ left: "auto", right: 12, textDecoration: "none", cursor: "pointer" }}
+          onClick={(e) => e.stopPropagation()}
+        >
+          <Icon name="download" size={13} />Download
+        </a>
+      )}
       {src && iter !== null && (
         <video
           key={src}
           src={src}
-          className="absolute inset-0 h-full w-full object-contain"
-          controls
-          playsInline
+          aria-label={`Replay of robot rollout, iteration ${iter}`}
+          style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "contain" }}
+          controls playsInline
           onError={(e) => {
-            // Fall back to the 2s clip if the iter rollout isn't on
-            // disk yet (edge case: clicked replay immediately after
-            // iter_completed but before rollout.mp4 fully flushed).
             const video = e.currentTarget;
-            if (clipSrc && video.src !== window.location.origin + clipSrc) {
-              video.src = clipSrc;
-            }
+            if (clipSrc && video.src !== window.location.origin + clipSrc) video.src = clipSrc;
           }}
         />
       )}
       {availableIters.length > 0 && (
-        <div className="absolute inset-x-0 bottom-0 z-10 flex items-center gap-1 overflow-x-auto border-t border-slate-800 bg-slate-900/80 px-2 py-1">
+        <div className="rs-scrub" style={{ position: "absolute", insetInline: 0, bottom: 0, background: "rgba(20,19,13,0.82)", padding: "8px 10px" }}>
           {availableIters.map((n) => (
             <button
               key={n}
               type="button"
               onClick={() => onPickIter(n)}
-              className={cn(
-                "shrink-0 rounded-sm border px-2 py-0.5 font-mono text-[10px] transition-colors",
+              className="rs-btn rs-btn-xs"
+              style={
                 n === iter
-                  ? "border-slate-400 bg-slate-800 text-slate-100"
-                  : "border-slate-700 bg-slate-950 text-slate-400 hover:bg-slate-800",
-              )}
+                  ? { background: "var(--rs-primary)", color: "#fff", borderColor: "var(--rs-primary)" }
+                  : { background: "rgba(255,255,255,0.06)", color: "#cfcdc4", borderColor: "rgba(255,255,255,0.16)" }
+              }
             >
               iter {n}
             </button>
@@ -430,29 +404,21 @@ function ReplayLayer({
 // ── Shared empty + shimmer ────────────────────────────────────────────
 function Shimmer({ label }: { label?: string } = {}) {
   return (
-    <div className="absolute inset-0 z-0 flex items-center justify-center bg-slate-900">
-      <div className="flex items-center gap-2 text-xs text-slate-400">
-        <Loader2 className="h-4 w-4 animate-spin" />
+    <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", background: "#16150f" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12, color: "#8d8979" }}>
+        <Icon name="loader" size={16} className="rs-spin" />
         {label ?? "Loading…"}
       </div>
-      <div
-        className="absolute inset-0 animate-pulse bg-[linear-gradient(90deg,rgba(255,255,255,0)_0%,rgba(255,255,255,0.04)_50%,rgba(255,255,255,0)_100%)]"
-        style={{ animationDuration: "2s" }}
-      />
     </div>
   );
 }
 
-function EmptyState({ title, error }: { title?: string; error?: string }) {
+function EmptyOverlay({ title, error }: { title?: string; error?: string }) {
   return (
-    <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 p-6 text-center">
-      <ImageOff className="h-8 w-8 text-slate-500" />
-      <div className="text-sm font-medium text-slate-200">
-        {title ?? "No preview available"}
-      </div>
-      {error && (
-        <p className="max-w-md font-mono text-xs text-slate-400">{error}</p>
-      )}
+    <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 8, padding: 24, textAlign: "center" }}>
+      <Icon name="camera" size={28} color="#6a6657" />
+      <div style={{ fontSize: 14, fontWeight: 500, color: "#d7d3c4" }}>{title ?? "No preview available"}</div>
+      {error && <p style={{ maxWidth: 420, fontFamily: "var(--font-mono)", fontSize: 12, color: "#8d8979" }}>{error}</p>}
     </div>
   );
 }

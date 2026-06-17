@@ -35,6 +35,32 @@
     --radius: 0.5rem;
   }
 
+  /* §Ship 22 audit-fix: dark-mode tokens for the shadcn primitives still
+     used by not-yet-reskinned screens (Rewards/Runs/dialogs). Pre-reskin
+     the app toggled `.dark` but defined no dark values, so shadcn surfaces
+     stayed light in dark mode (light text on white = invisible). Warm-dark
+     palette to sit coherently on the rs cream/dark canvas. Once every
+     screen is rs-classed this becomes vestigial. */
+  .dark {
+    --background: 48 12% 8%;
+    --foreground: 44 24% 92%;
+    --card: 45 11% 11%;
+    --card-foreground: 44 24% 92%;
+    --primary: 44 24% 92%;
+    --primary-foreground: 45 11% 11%;
+    --secondary: 45 9% 16%;
+    --secondary-foreground: 44 24% 92%;
+    --muted: 45 9% 16%;
+    --muted-foreground: 45 8% 60%;
+    --accent: 45 9% 18%;
+    --accent-foreground: 44 24% 92%;
+    --destructive: 0 60% 45%;
+    --destructive-foreground: 44 24% 92%;
+    --border: 45 9% 18%;
+    --input: 45 9% 18%;
+    --ring: 44 24% 80%;
+  }
+
   * {
     @apply border-border;
   }

@@ -1,32 +1,12 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useMutation } from "@tanstack/react-query";
-import {
-  AlertTriangle,
-  ArrowRight,
-  BookOpen,
-  Cpu,
-  ExternalLink,
-  Hourglass,
-  Loader2,
-  RefreshCw,
-} from "lucide-react";
 import { toast } from "sonner";
 
-import { Button } from "@/components/ui/button";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-} from "@/components/ui/dialog";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
+import { Icon } from "@/components/rs/icon";
+import { Btn, Field, Modal } from "@/components/rs/primitives";
 import { useLibraryAdapters, useSystemGpu } from "@/hooks/useLibrary";
 import { ApiError, createProject } from "@/lib/api";
-import { cn } from "@/lib/utils";
 import type { AdapterInfo, LibraryRobot, ProjectDetail } from "@/lib/types";
 
 /** Static formula from MJLAB_PIVOT_DESIGN §9 / preflight fallback:
@@ -187,227 +167,27 @@ export function CreateProjectDialog({ robot, onClose }: CreateProjectDialogProps
     robot.training_support === "preview_only" && adapterName === "gym_sb3";
 
   return (
-    <Dialog open onOpenChange={(open) => !open && !create.isPending && onClose()}>
-      <DialogContent className="max-w-lg">
-        <DialogHeader>
-          <DialogTitle className="flex items-center gap-2">
-            Create project
-            <span className="text-sm font-normal text-muted-foreground">
-              / {robot.display_name}
-            </span>
-          </DialogTitle>
-          <DialogDescription>
-            {isMjlab &&
-              "mjlab-ready — pick a device and num_envs to match your GPU."}
+    <Modal
+      icon="folder"
+      title="Create project"
+      subtitle={
+        <span style={{ display: "inline-flex", gap: 6, flexWrap: "wrap" }}>
+          <span className="mono">/ {robot.display_name}</span>
+          <span>·{" "}
+            {isMjlab && "mjlab-ready — pick a device and num_envs to match your GPU."}
             {isGym && "Gymnasium-compatible — CPU-friendly, training launches in-process."}
-            {isPreview &&
-              "Preview only — we'll scaffold the project so you can render the robot, but training isn't wired up for this robot yet."}
-          </DialogDescription>
-        </DialogHeader>
-
-        <div className="flex flex-col gap-3">
-          <div className="flex flex-col gap-1">
-            <Label htmlFor="cpd-name">Project name</Label>
-            <Input
-              id="cpd-name"
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              placeholder={robot.display_name}
-            />
-          </div>
-
-          <div className="flex flex-col gap-1">
-            <Label htmlFor="cpd-adapter">RL adapter</Label>
-            {adapters.isLoading && !adapters.data ? (
-              <div className="rounded-md border bg-muted/30 p-2 text-xs text-muted-foreground">
-                Loading adapters…
-              </div>
-            ) : (
-              <select
-                id="cpd-adapter"
-                value={adapterName}
-                onChange={(e) => setAdapterName(e.target.value)}
-                className={cn(
-                  "flex h-9 w-full items-center rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-xs",
-                  "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
-                )}
-              >
-                {adapterList.map((a) => (
-                  <option key={a.name} value={a.name}>
-                    {a.status === "coming_soon" ? "⏳ " : ""}
-                    {a.display_name}
-                    {a.status === "coming_soon" && " (coming soon)"}
-                  </option>
-                ))}
-              </select>
-            )}
-          </div>
-
-          {isComingSoon && selectedAdapter && (
-            <ComingSoonConfirmCard adapter={selectedAdapter} />
-          )}
-
-          {/* Task selector — visible when the library robot exposes
-              more than one preconfigured task (e.g. Cartpole has
-              Balance + Swingup; Go1 has Velocity-Flat + Velocity-Rough).
-              Pre-fix the form silently picked preconfigured_tasks[0],
-              so Sam couldn't pick Swingup for his Cartpole project. */}
-          {robot.preconfigured_tasks.length > 1 && (
-            <div className="flex flex-col gap-1">
-              <Label htmlFor="cpd-task">Task</Label>
-              <select
-                id="cpd-task"
-                value={taskId}
-                onChange={(e) => {
-                  const newTaskId = e.target.value;
-                  setTaskId(newTaskId);
-                  // Snap num_envs to the new task's recommendation if
-                  // the user hasn't manually overridden away from the
-                  // previous task's recommendation.
-                  const newTask = robot.preconfigured_tasks.find(
-                    (t) => t.task_id === newTaskId,
-                  );
-                  const prevTask = robot.preconfigured_tasks.find(
-                    (t) => t.task_id === taskId,
-                  );
-                  if (
-                    newTask &&
-                    (!prevTask || numEnvs === prevTask.recommended_num_envs)
-                  ) {
-                    setNumEnvs(newTask.recommended_num_envs);
-                  }
-                }}
-                className={cn(
-                  "flex h-9 w-full items-center rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-xs",
-                  "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
-                )}
-              >
-                {robot.preconfigured_tasks.map((t) => (
-                  <option key={t.task_id} value={t.task_id}>
-                    {t.display_name} — {t.task_id}
-                  </option>
-                ))}
-              </select>
-              {selectedTask && (
-                <p className="text-[10px] text-muted-foreground">
-                  recommended: {selectedTask.recommended_num_envs} envs
-                </p>
-              )}
-            </div>
-          )}
-
-          {isMjlab && (
-            <>
-              <div className="flex flex-col gap-1">
-                <Label htmlFor="cpd-device">CUDA device</Label>
-                {gpu.data?.cuda_available && gpu.data.devices.length > 0 ? (
-                  <select
-                    id="cpd-device"
-                    value={deviceIdx}
-                    onChange={(e) => setDeviceIdx(Number(e.target.value))}
-                    className={cn(
-                      "flex h-9 w-full items-center rounded-md border border-input bg-transparent px-3 py-1 text-sm shadow-xs",
-                      "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
-                    )}
-                  >
-                    {gpu.data.devices.map((d) => (
-                      <option key={d.index} value={d.index}>
-                        cuda:{d.index} — {d.name} (
-                        {(d.free_memory_bytes / 1024 ** 3).toFixed(1)} GiB free)
-                      </option>
-                    ))}
-                  </select>
-                ) : (
-                  <div className="rounded-md border border-destructive/40 bg-destructive/5 p-2 text-xs text-destructive">
-                    No CUDA device detected. Pick a Gymnasium-compatible robot.
-                  </div>
-                )}
-              </div>
-
-              <div className="flex flex-col gap-1">
-                <div className="flex items-baseline justify-between">
-                  <Label htmlFor="cpd-num-envs">Parallel envs</Label>
-                  <span className="font-mono text-xs text-muted-foreground">
-                    {numEnvs} envs
-                  </span>
-                </div>
-                <input
-                  id="cpd-num-envs"
-                  type="range"
-                  min={128}
-                  max={4096}
-                  step={128}
-                  value={numEnvs}
-                  onChange={(e) => setNumEnvs(Number(e.target.value))}
-                  className="h-2 w-full cursor-pointer appearance-none rounded-full bg-muted accent-foreground"
-                />
-                <div className="flex items-center justify-between text-[10px] text-muted-foreground">
-                  <span>128</span>
-                  <span>
-                    recommended: {defaultTask?.recommended_num_envs ?? "—"}
-                  </span>
-                  <span>4096</span>
-                </div>
-              </div>
-
-              <div
-                className={cn(
-                  "flex items-start gap-2 rounded-md border p-2 text-xs",
-                  overBudget
-                    ? "border-rose-500/40 bg-rose-500/5"
-                    : tightBudget
-                      ? "border-amber-500/40 bg-amber-500/5"
-                      : "border-border bg-muted/30",
-                )}
-              >
-                <Cpu className="mt-0.5 h-3.5 w-3.5 shrink-0 text-muted-foreground" />
-                <div className="flex-1">
-                  <div className="font-medium">
-                    Estimated VRAM: {estGb.toFixed(1)} GiB
-                    {freeGb != null && ` of ${freeGb.toFixed(1)} GiB free`}
-                  </div>
-                  <p className="text-muted-foreground">
-                    {overBudget
-                      ? "Above 85% of free VRAM — backend will refuse unless you lower num_envs."
-                      : tightBudget
-                        ? "Above 70% — likely fits but close to the headroom ceiling."
-                        : "Comfortable headroom for the default policy size."}
-                  </p>
-                </div>
-              </div>
-            </>
-          )}
-
-          {oom && (
-            <OomRetryBanner
-              oom={oom}
-              onRetry={() => {
-                if (oom.suggestedNumEnvs == null) return;
-                setNumEnvs(oom.suggestedNumEnvs);
-                setOom(null);
-                create.mutate({
-                  name,
-                  adapter: adapterName,
-                  num_envs: oom.suggestedNumEnvs,
-                  gpu_device: `cuda:${deviceIdx}`,
-                  ...(taskId && { task_id: taskId }),
-                });
-              }}
-            />
-          )}
-        </div>
-
-        <DialogFooter>
-          <Button
-            type="button"
-            variant="outline"
-            onClick={onClose}
-            disabled={create.isPending}
-          >
-            Cancel
-          </Button>
-          <Button
-            type="button"
+            {isPreview && "Preview only — scaffolds so you can render the robot; training isn't wired up yet."}
+          </span>
+        </span>
+      }
+      onClose={() => { if (!create.isPending) onClose(); }}
+      footer={
+        <>
+          <Btn kind="quiet" onClick={onClose} disabled={create.isPending}>Cancel</Btn>
+          <Btn
+            kind="primary"
+            iconRight={create.isPending ? undefined : "arrow-right"}
+            icon={create.isPending ? "loader" : undefined}
             disabled={
               create.isPending ||
               !name.trim() ||
@@ -425,23 +205,155 @@ export function CreateProjectDialog({ robot, onClose }: CreateProjectDialogProps
               })
             }
           >
-            {create.isPending ? (
-              <>
-                <Loader2 className="h-4 w-4 animate-spin" /> Creating…
-              </>
-            ) : isComingSoon ? (
-              <>
-                Create anyway <ArrowRight className="h-3.5 w-3.5" />
-              </>
+            {create.isPending ? "Creating…" : isComingSoon ? "Create anyway" : "Create project"}
+          </Btn>
+        </>
+      }
+    >
+      <Field label="Project name" htmlFor="cpd-name">
+        <input
+          id="cpd-name"
+          className="rs-input"
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          placeholder={robot.display_name}
+          autoFocus
+        />
+      </Field>
+
+      <Field label="RL adapter" htmlFor="cpd-adapter">
+        {adapters.isLoading && !adapters.data ? (
+          <div style={{ borderRadius: "var(--radius-md)", border: "1px solid var(--hairline)", background: "var(--surface-strong)", padding: 8, fontSize: 12, color: "var(--rs-muted)" }}>
+            Loading adapters…
+          </div>
+        ) : (
+          <div className="rs-select" style={{ display: "flex" }}>
+            <select id="cpd-adapter" style={{ width: "100%" }} value={adapterName} onChange={(e) => setAdapterName(e.target.value)}>
+              {adapterList.map((a) => (
+                <option key={a.name} value={a.name}>
+                  {a.status === "coming_soon" ? "⏳ " : ""}
+                  {a.display_name}
+                  {a.status === "coming_soon" && " (coming soon)"}
+                </option>
+              ))}
+            </select>
+          </div>
+        )}
+      </Field>
+
+      {isComingSoon && selectedAdapter && <ComingSoonConfirmCard adapter={selectedAdapter} />}
+
+      {/* Task selector — visible when the library robot exposes more than
+          one preconfigured task (Cartpole: Balance + Swingup; Go1:
+          Velocity-Flat + Velocity-Rough). */}
+      {robot.preconfigured_tasks.length > 1 && (
+        <Field label="Task" hint={selectedTask ? `recommended: ${selectedTask.recommended_num_envs} envs` : undefined} htmlFor="cpd-task">
+          <div className="rs-select" style={{ display: "flex" }}>
+            <select
+              id="cpd-task"
+              style={{ width: "100%" }}
+              value={taskId}
+              onChange={(e) => {
+                const newTaskId = e.target.value;
+                setTaskId(newTaskId);
+                const newTask = robot.preconfigured_tasks.find((t) => t.task_id === newTaskId);
+                const prevTask = robot.preconfigured_tasks.find((t) => t.task_id === taskId);
+                if (newTask && (!prevTask || numEnvs === prevTask.recommended_num_envs)) {
+                  setNumEnvs(newTask.recommended_num_envs);
+                }
+              }}
+            >
+              {robot.preconfigured_tasks.map((t) => (
+                <option key={t.task_id} value={t.task_id}>
+                  {t.display_name} — {t.task_id}
+                </option>
+              ))}
+            </select>
+          </div>
+        </Field>
+      )}
+
+      {isMjlab && (
+        <>
+          <Field label="CUDA device" htmlFor="cpd-device">
+            {gpu.data?.cuda_available && gpu.data.devices.length > 0 ? (
+              <div className="rs-select" style={{ display: "flex" }}>
+                <select id="cpd-device" style={{ width: "100%" }} value={deviceIdx} onChange={(e) => setDeviceIdx(Number(e.target.value))}>
+                  {gpu.data.devices.map((d) => (
+                    <option key={d.index} value={d.index}>
+                      cuda:{d.index} — {d.name} ({(d.free_memory_bytes / 1024 ** 3).toFixed(1)} GiB free)
+                    </option>
+                  ))}
+                </select>
+              </div>
             ) : (
-              <>
-                Create project <ArrowRight className="h-3.5 w-3.5" />
-              </>
+              <div style={{ borderRadius: "var(--radius-md)", border: "1px solid var(--st-rose-bg)", background: "var(--st-rose-bg)", color: "var(--st-rose-fg)", padding: 8, fontSize: 12 }}>
+                No CUDA device detected. Pick a Gymnasium-compatible robot.
+              </div>
             )}
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
+          </Field>
+
+          <Field label={<>Parallel envs <span className="mono" style={{ color: "var(--rs-muted)", fontWeight: 400 }}>{numEnvs} envs</span></>} htmlFor="cpd-num-envs">
+            <input
+              id="cpd-num-envs"
+              type="range"
+              min={128}
+              max={4096}
+              step={128}
+              value={numEnvs}
+              onChange={(e) => setNumEnvs(Number(e.target.value))}
+              style={{ width: "100%", accentColor: "var(--rs-primary)" }}
+            />
+            <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10.5, color: "var(--rs-muted)" }}>
+              <span>128</span>
+              <span>recommended: {defaultTask?.recommended_num_envs ?? "—"}</span>
+              <span>4096</span>
+            </div>
+          </Field>
+
+          <div
+            style={{
+              display: "flex", alignItems: "flex-start", gap: 8, borderRadius: "var(--radius-md)", padding: 10, fontSize: 12,
+              border: "1px solid " + (overBudget ? "color-mix(in srgb, var(--st-rose) 40%, transparent)" : tightBudget ? "color-mix(in srgb, var(--st-amber) 40%, transparent)" : "var(--hairline)"),
+              background: overBudget ? "var(--st-rose-bg)" : tightBudget ? "var(--st-amber-bg)" : "var(--surface-strong)",
+              color: overBudget ? "var(--st-rose-fg)" : tightBudget ? "var(--st-amber-fg)" : "var(--rs-muted)",
+            }}
+          >
+            <span style={{ marginTop: 1, flexShrink: 0 }}><Icon name="cpu" size={14} /></span>
+            <div style={{ flex: 1 }}>
+              <div style={{ fontWeight: 600 }}>
+                Estimated VRAM: {estGb.toFixed(1)} GiB{freeGb != null && ` of ${freeGb.toFixed(1)} GiB free`}
+              </div>
+              <p style={{ margin: "2px 0 0" }}>
+                {overBudget
+                  ? "Above 85% of free VRAM — backend will refuse unless you lower num_envs."
+                  : tightBudget
+                    ? "Above 70% — likely fits but close to the headroom ceiling."
+                    : "Comfortable headroom for the default policy size."}
+              </p>
+            </div>
+          </div>
+        </>
+      )}
+
+      {oom && (
+        <OomRetryBanner
+          oom={oom}
+          onRetry={() => {
+            if (oom.suggestedNumEnvs == null) return;
+            setNumEnvs(oom.suggestedNumEnvs);
+            setOom(null);
+            create.mutate({
+              name,
+              adapter: adapterName,
+              num_envs: oom.suggestedNumEnvs,
+              gpu_device: `cuda:${deviceIdx}`,
+              ...(taskId && { task_id: taskId }),
+            });
+          }}
+        />
+      )}
+    </Modal>
   );
 }
 
@@ -453,26 +365,18 @@ function ComingSoonConfirmCard({ adapter }: { adapter: AdapterInfo }) {
     ? adapter.adoption_guide_url
     : `https://github.com/sjdoane/RL-Sculptor/blob/main/RewardSculptor/${adapter.adoption_guide_url}`;
   return (
-    <div className="flex flex-col gap-2 rounded-md border border-amber-500/40 bg-amber-500/5 p-3 text-xs">
-      <div className="flex items-start gap-2">
-        <Hourglass className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
-        <div className="flex-1">
-          <div className="font-medium text-amber-700 dark:text-amber-300">
-            {adapter.display_name} — scaffolded, not yet implemented
-          </div>
-          <p className="mt-0.5 text-muted-foreground">
-            Project will be created but training will be disabled until
-            this adapter is implemented. Continue?
+    <div style={{ borderRadius: "var(--radius-md)", border: "1px solid color-mix(in srgb, var(--st-amber) 40%, transparent)", background: "var(--st-amber-bg)", color: "var(--st-amber-fg)", padding: 12, fontSize: 12 }}>
+      <div style={{ display: "flex", alignItems: "flex-start", gap: 8 }}>
+        <span style={{ marginTop: 1, flexShrink: 0 }}><Icon name="clock" size={16} /></span>
+        <div style={{ flex: 1 }}>
+          <div style={{ fontWeight: 600 }}>{adapter.display_name} — scaffolded, not yet implemented</div>
+          <p style={{ margin: "2px 0 0", color: "var(--rs-muted)" }}>
+            Project will be created but training will be disabled until this adapter is implemented. Continue?
           </p>
-          <div className="mt-1 flex items-center gap-2 text-muted-foreground">
-            <BookOpen className="h-3 w-3" />
-            <a
-              href={guideHref}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="inline-flex items-center gap-1 hover:underline"
-            >
-              Adoption guide <ExternalLink className="h-3 w-3" />
+          <div style={{ marginTop: 4, display: "flex", alignItems: "center", gap: 8, color: "var(--rs-muted)" }}>
+            <Icon name="book" size={12} />
+            <a href={guideHref} target="_blank" rel="noopener noreferrer" style={{ display: "inline-flex", alignItems: "center", gap: 4, color: "inherit" }}>
+              Adoption guide <Icon name="external" size={12} />
             </a>
             {adapter.estimated_effort && (
               <>
@@ -495,32 +399,23 @@ function OomRetryBanner({
   onRetry: () => void;
 }) {
   return (
-    <div className="flex flex-col gap-2 rounded-md border border-rose-500/40 bg-rose-500/5 p-3 text-xs">
-      <div className="flex items-start gap-2">
-        <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-rose-600" />
-        <div className="flex-1">
-          <div className="font-medium text-rose-700 dark:text-rose-300">
-            {oom.deviceName ?? "GPU"} has only{" "}
-            {oom.freeVramGb?.toFixed(1) ?? "?"} GiB free
+    <div style={{ display: "flex", flexDirection: "column", gap: 8, borderRadius: "var(--radius-md)", border: "1px solid color-mix(in srgb, var(--st-rose) 40%, transparent)", background: "var(--st-rose-bg)", color: "var(--st-rose-fg)", padding: 12, fontSize: 12 }}>
+      <div style={{ display: "flex", alignItems: "flex-start", gap: 8 }}>
+        <span style={{ marginTop: 1, flexShrink: 0 }}><Icon name="alert-triangle" size={16} /></span>
+        <div style={{ flex: 1 }}>
+          <div style={{ fontWeight: 600 }}>
+            {oom.deviceName ?? "GPU"} has only {oom.freeVramGb?.toFixed(1) ?? "?"} GiB free
           </div>
-          <p className="mt-0.5 text-muted-foreground">
+          <p style={{ margin: "2px 0 0", color: "var(--rs-muted)" }}>
             {oom.detail}{" "}
-            {oom.estimatedRequiredGb != null &&
-              `Needed: ~${oom.estimatedRequiredGb.toFixed(1)} GiB.`}
+            {oom.estimatedRequiredGb != null && `Needed: ~${oom.estimatedRequiredGb.toFixed(1)} GiB.`}
           </p>
         </div>
       </div>
       {oom.suggestedNumEnvs != null && (
-        <Button
-          type="button"
-          variant="outline"
-          size="sm"
-          onClick={onRetry}
-          className="self-start"
-        >
-          <RefreshCw className="h-3.5 w-3.5" />
+        <Btn kind="ghost" size="sm" icon="refresh-cw" onClick={onRetry} style={{ alignSelf: "flex-start" }}>
           Retry with num_envs={oom.suggestedNumEnvs}
-        </Button>
+        </Btn>
       )}
     </div>
   );

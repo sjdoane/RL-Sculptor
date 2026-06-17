@@ -171,6 +171,11 @@ def _build_sculptor_term_class(schema_keys: tuple[str, ...]):
     invoked with --reward-module-path."""
     import torch
 
+    # §Ship 46: canonical per-foot kick channels, single-sourced from the
+    # adapter contract so the keys the runner EMITS can never drift from
+    # the keys the contract ADVERTISES (and that edit.py grounds against).
+    from sculptor.adapters.mjlab import _G1_INFO_EXTRA
+
     class SculptorRewardTerm:
         """mjlab reward term that dispatches to the sculpted module.
 
@@ -293,6 +298,100 @@ def _build_sculptor_term_class(schema_keys: tuple[str, ...]):
                     out[k] = _zeros(1)
             return out
 
+        def _resolve_foot_handles(self, env, robot):
+            """§Ship 46: resolve (once) the contact + height sensors and
+            the left/right foot site indices for the per-foot kick
+            channels. Returns None unless BOTH a 'left_foot' and a
+            'right_foot' site exist — that named-site pair is what fixes
+            the per-foot column order shared across the contact `found`,
+            height `heights`, and site-velocity tensors (mjlab wires all
+            three from the same site list for the G1 biped). Quadrupeds /
+            fixed-base tasks lack those exact names → None → foot channels
+            stay zero."""
+            try:
+                names = tuple(robot.site_names)
+            except Exception:  # noqa: BLE001
+                return None
+            idx = {n: i for i, n in enumerate(names)}
+            li, ri = idx.get("left_foot"), idx.get("right_foot")
+            if li is None or ri is None:
+                return None
+
+            def _scene_get(key):
+                try:
+                    return env.scene[key]
+                except Exception:  # noqa: BLE001
+                    return None
+
+            return {
+                "contact": _scene_get("feet_ground_contact"),
+                "height": _scene_get("foot_height_scan"),
+                "left_site": li,
+                "right_site": ri,
+            }
+
+        def _foot_info(self, env, robot, dtype):
+            """§Ship 46: per-foot kick channels + base horizontal speed,
+            all (N,) tensors. Each signal is independently guarded so a
+            missing sensor/site degrades to zeros rather than crashing —
+            non-G1 tasks (which never advertise these keys) just carry
+            harmless zeros the reward never references."""
+            N = env.num_envs
+            dev = env.device
+
+            def _zero():
+                return torch.zeros(N, device=dev, dtype=dtype)
+
+            out = {k: _zero() for k in _G1_INFO_EXTRA}
+            # Base horizontal speed (body-frame xy) — universally
+            # meaningful; lets a kick reward penalise travel and lets the
+            # diagnoser distinguish standing from walking.
+            try:
+                v = robot.data.root_link_lin_vel_b
+                if v is not None:
+                    out["base_horizontal_speed"] = torch.linalg.norm(
+                        v[:, :2], dim=-1
+                    ).to(dtype)
+            except Exception:  # noqa: BLE001
+                pass
+
+            if not hasattr(self, "_foot_cache"):
+                self._foot_cache = self._resolve_foot_handles(env, robot)
+            fc = self._foot_cache
+            if fc is None:
+                return out
+
+            try:
+                found = fc["contact"].data.found  # (N, F)
+                if found is not None and found.shape[-1] >= 2:
+                    out["left_foot_contact"] = (found[:, 0] > 0).to(dtype)
+                    out["right_foot_contact"] = (found[:, 1] > 0).to(dtype)
+            except Exception:  # noqa: BLE001
+                pass
+
+            try:
+                heights = fc["height"].data.heights  # (N, F)
+                if heights is not None and heights.shape[-1] >= 2:
+                    out["left_foot_height"] = heights[:, 0].to(dtype)
+                    out["right_foot_height"] = heights[:, 1].to(dtype)
+            except Exception:  # noqa: BLE001
+                pass
+
+            try:
+                sv = robot.data.site_lin_vel_w  # (N, S, 3)
+                li, ri = fc["left_site"], fc["right_site"]
+                if sv is not None and sv.shape[1] > max(li, ri):
+                    out["left_foot_swing_speed"] = torch.linalg.norm(
+                        sv[:, li, :], dim=-1
+                    ).to(dtype)
+                    out["right_foot_swing_speed"] = torch.linalg.norm(
+                        sv[:, ri, :], dim=-1
+                    ).to(dtype)
+            except Exception:  # noqa: BLE001
+                pass
+
+            return out
+
         def __call__(self, env, **_kwargs) -> "torch.Tensor":
             state = self._snapshot(env)
             action = env.action_manager.action
@@ -328,6 +427,10 @@ def _build_sculptor_term_class(schema_keys: tuple[str, ...]):
                 "base_height": base_z,
                 "fallen": fallen,
             }
+            # §Ship 46: per-foot kick channels (contact / swing speed /
+            # height) + base horizontal speed, so a sculpted reward can
+            # shape a single-leg kick. Zero-filled on non-biped tasks.
+            info.update(self._foot_info(env, robot, action.dtype))
             rewards, _components = self._mod.compute_reward_batched(
                 self._prev, action, state, info
             )
@@ -418,6 +521,64 @@ def _cmd_train(args: argparse.Namespace) -> None:
     runner = runner_cls(
         wrapped, agent_cfg_dict, str(output_dir / "logs"), args.device
     )
+
+    # §Ship 15: optional warm-start from a pre-trained policy checkpoint.
+    # Load ONLY actor+critic weights, skipping optimizer / iteration /
+    # RND state. Optimizer skip is important — stale Adam momentum from
+    # a previously-different reward degrades new-task learning. Iteration
+    # skip keeps `max_iterations` semantics intact (we train
+    # num_learning_iterations fresh iters regardless of what the
+    # checkpoint thought). rsl_rl's PPO.load honors these keys per
+    # rsl_rl/algorithms/ppo.py:444-466.
+    if args.load_pretrained_policy:
+        import hashlib as _hashlib
+        ckpt = Path(args.load_pretrained_policy).resolve()
+        if not ckpt.is_file():
+            raise FileNotFoundError(
+                f"--load-pretrained-policy not found: {ckpt}"
+            )
+        load_cfg = {
+            "actor": True,
+            "critic": True,
+            "optimizer": False,
+            "iteration": False,
+            "rnd": False,
+        }
+        # Cheap forensics: short checksum so Ship-16's mission orchestrator
+        # can later verify the path matches its known stage checkpoint.
+        source_sha8 = _hashlib.sha256(ckpt.read_bytes()).hexdigest()[:8]
+        try:
+            _ = runner.load(str(ckpt), load_cfg=load_cfg)
+        except (RuntimeError, OSError, EOFError, Exception) as e:
+            # Broaden beyond RuntimeError per Ship-15 audit — torch.load
+            # can raise UnpicklingError (corrupt file), OSError (bad
+            # I/O), EOFError (truncated file), and RuntimeError
+            # (state_dict shape mismatch from an obs-space /
+            # action-space drift between the source and target tasks).
+            # We catch `Exception` as a safety net too — any other
+            # error from the load path should still surface with a
+            # pointer toward the likely cause.
+            raise RuntimeError(
+                f"failed to load pretrained policy {ckpt}: "
+                f"{type(e).__name__}: {e}. "
+                "Likely causes: (a) the checkpoint's task has a "
+                "different observation or action space than the "
+                "current task_id (warm-start requires matching "
+                "obs_groups), (b) the checkpoint file is corrupt "
+                "or truncated, or (c) the rsl_rl version that wrote "
+                "the checkpoint has drifted from the one loading it."
+            ) from e
+        print(
+            "[SCULPT-EVENT] " + json.dumps({
+                "type": "warm_start_loaded",
+                "source": str(ckpt),
+                "source_sha8": source_sha8,
+                "load_cfg_keys": sorted(
+                    k for k, v in load_cfg.items() if v
+                ),
+            }),
+            flush=True,
+        )
 
     # Progress poller — watches the logs dir for new model_<N>.pt
     # checkpoints rsl_rl writes every `save_interval` iters and emits
@@ -612,6 +773,77 @@ def _cmd_train(args: argparse.Namespace) -> None:
     print(json.dumps({"status": "ok", "checkpoint": str(ckpt_path)}))
 
 
+def _apply_ground_texture(env_cfg: Any) -> None:
+    """§Ship 35: give the rendered floor an IMAGE texture instead of the
+    default solid/checker terrain. PURELY COSMETIC and rollout-render only.
+
+    FULLY DEFENSIVE by design — this runs on the training/rollout
+    subprocess, so it must NEVER break a rollout: every failure path
+    (missing asset, mjlab without `scene.spec_fn`, MjSpec API drift) leaves
+    `env_cfg` untouched and the default ground in place. Toggle/override
+    via `SCULPTOR_GROUND_TEXTURE` ('0'/'off'/'false' disables; a file path
+    overrides the shipped texture). The MjSpec texture→material→geom API is
+    verified against mujoco 3.7; on any version drift it silently no-ops.
+    """
+    import os
+
+    setting = os.environ.get("SCULPTOR_GROUND_TEXTURE", "").strip()
+    if setting.lower() in ("0", "off", "false", "no"):
+        return
+    try:
+        from pathlib import Path as _Path
+
+        if setting and _Path(setting).is_file():
+            tex_path = setting
+        else:
+            from importlib.resources import files
+
+            tex_path = str(files("sculptor.assets.textures") / "ground.png")
+        if not _Path(tex_path).is_file():
+            return
+        scene = getattr(env_cfg, "scene", None)
+        if scene is None or not hasattr(scene, "spec_fn"):
+            return
+
+        import mujoco
+
+        prev_spec_fn = getattr(scene, "spec_fn", None)
+        _GROUND_TOKENS = ("terrain", "floor", "ground")
+
+        def _ground_spec_fn(spec: Any) -> None:
+            # Chain any pre-existing spec_fn FIRST so we never clobber it.
+            if callable(prev_spec_fn):
+                prev_spec_fn(spec)
+            try:
+                tex = spec.add_texture()
+                tex.name = "rs_ground_tex"
+                tex.type = mujoco.mjtTexture.mjTEXTURE_2D
+                tex.file = tex_path
+                mat = spec.add_material()
+                mat.name = "rs_ground_mat"
+                mat.texrepeat = [12, 12]
+                mat.reflectance = 0.15
+                mat.textures[int(mujoco.mjtTextureRole.mjTEXROLE_RGB)] = "rs_ground_tex"
+                assigned = 0
+                for g in spec.geoms:
+                    name = (g.name or "").lower()
+                    is_plane = getattr(g, "type", None) == mujoco.mjtGeom.mjGEOM_PLANE
+                    if is_plane or any(tok in name for tok in _GROUND_TOKENS):
+                        g.material = "rs_ground_mat"
+                        assigned += 1
+                if assigned == 0:
+                    print("[runner] ground texture: no floor geom matched; "
+                          "leaving default ground", file=sys.stderr, flush=True)
+            except Exception as e:  # noqa: BLE001 — cosmetic; never break rollout
+                print(f"[runner] ground texture skipped (spec edit failed): "
+                      f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
+
+        scene.spec_fn = _ground_spec_fn
+    except Exception as e:  # noqa: BLE001 — cosmetic; never break rollout
+        print(f"[runner] ground texture setup skipped: {type(e).__name__}: {e}",
+              file=sys.stderr, flush=True)
+
+
 def _cmd_rollout(args: argparse.Namespace) -> None:
     """Run `n_episodes` rollouts and record a video for behavioral review.
 
@@ -659,6 +891,8 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
 
     env_cfg = load_env_cfg(args.task_id)
     env_cfg.scene.num_envs = num_envs
+    # §Ship 35: textured floor in the rendered rollout (cosmetic, guarded).
+    _apply_ground_texture(env_cfg)
     env = ManagerBasedRlEnv(
         env_cfg, device=args.device, render_mode="rgb_array"
     )
@@ -677,6 +911,19 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
         "joint_names": [],
         "joint_ranges": [],
     }
+    # §Ship 26 (E1): entity-first joint names. The articulation exposes
+    # `joint_names` in the SAME order as the persisted joint_pos /
+    # joint_vel buffers (both come from the entity's data API) — the
+    # mjModel route below includes the floating-base free joint and may
+    # order differently, so it must not be the primary source. Spec
+    # metrics use these names to select leg / hip / arm joint subsets.
+    try:
+        _robot = env.scene["robot"]
+        _jn = list(getattr(_robot, "joint_names", []) or [])
+        if _jn:
+            limits_snapshot["joint_names"] = [str(n) for n in _jn]
+    except Exception:  # noqa: BLE001 — best-effort, audit tolerates empty
+        pass
     try:
         mj_model = getattr(env, "sim", None) or getattr(env, "_sim", None) \
             or getattr(env, "physics", None)
@@ -723,7 +970,11 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
             limits_snapshot["joint_ranges"] = jr.tolist()
             try:
                 limits_snapshot["actuator_names"] = _names(m, fr.shape[0], "ACTUATOR")
-                limits_snapshot["joint_names"] = _names(m, jr.shape[0], "JOINT")
+                # Entity route above is authoritative for joint_names
+                # (ordering matches the persisted buffers); only fall
+                # back to mjModel names when it produced nothing.
+                if not limits_snapshot["joint_names"]:
+                    limits_snapshot["joint_names"] = _names(m, jr.shape[0], "JOINT")
             except Exception:  # noqa: BLE001
                 pass
     except Exception as e:  # noqa: BLE001 — realism audit is best-effort
@@ -1064,6 +1315,14 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
         "mean_return": float(np.mean(ep_returns)) if ep_returns else 0.0,
         "mean_episode_length": float(np.mean(ep_lengths)) if ep_lengths else 0.0,
         "max_episode_length": int(max(ep_lengths)) if ep_lengths else 0,
+        # §Ship 26 (E1/M1): capture settings are load-bearing for spec
+        # metrics (frequency bands are in cycles/FRAME; episode-length
+        # normalization needs the cap). Persisting them lets the eval
+        # harness ASSERT capture parity across conditions instead of
+        # silently comparing incomparables.
+        "step_dt": float(getattr(env, "step_dt", 0.0) or 0.0),
+        "max_episode_steps": int(max_steps),
+        "rollout_num_envs": int(num_envs),
     }
     (output_dir / "behavior.json").write_text(json.dumps(behavior, indent=2))
 
@@ -1141,6 +1400,16 @@ def main() -> None:
     p_train.add_argument("--output-dir", required=True)
     p_train.add_argument("--schema-keys", default="",
                          help="comma-separated override for the state-schema keys")
+    p_train.add_argument(
+        "--load-pretrained-policy", default=None,
+        help=(
+            "§Ship 15: path to a prior rsl_rl checkpoint (e.g., "
+            "runs/iter_N/checkpoint.pt). When set, the runner loads "
+            "actor+critic weights from this file BEFORE training begins, "
+            "skipping optimizer / iteration / RND state. Used by the "
+            "mission orchestrator to chain skills across stages."
+        ),
+    )
 
     p_roll = sub.add_parser("rollout")
     p_roll.add_argument("--task-id", required=True)

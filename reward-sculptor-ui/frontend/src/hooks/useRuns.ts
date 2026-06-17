@@ -1,8 +1,9 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
-import { getRun, killRun, launchRun, listRuns } from "@/lib/api";
+import { controlRun, getRun, killRun, launchRun, listRuns } from "@/lib/api";
 import { qk } from "@/lib/queryKeys";
 import type {
+  RunControlState,
   RunDetail,
   RunParamsPayload,
   RunSummary,
@@ -10,7 +11,20 @@ import type {
 
 const RUN_POLL_MS = 3000;
 
-export function useRuns(slug: string | undefined) {
+export function useRuns(
+  slug: string | undefined,
+  /** §Ship 21d: when `keepPolling` is true, keep refetching `/runs`
+   *  even when no run currently shows `running`/`queued`. Callers
+   *  pass this while a MISSION is active so the list stays fresh
+   *  through stage boundaries — between a stage completing and the
+   *  next stage's child job registering, there's no "running" run,
+   *  which previously made the interval return false and freeze.
+   *  Once React Query clears the interval it does NOT auto-resume,
+   *  so `activeStageRun` would go permanently stale for the rest of
+   *  the mission (rewards/live-video stop updating). */
+  opts?: { keepPolling?: boolean },
+) {
+  const keepPolling = opts?.keepPolling ?? false;
   return useQuery<RunSummary[]>({
     queryKey: slug ? qk.runs(slug) : ["runs", "_none"],
     queryFn: () => listRuns(slug!),
@@ -21,7 +35,8 @@ export function useRuns(slug: string | undefined) {
       const hasActive = data.some(
         (r) => r.status === "running" || r.status === "queued",
       );
-      return hasActive ? RUN_POLL_MS : false;
+      if (hasActive || keepPolling) return RUN_POLL_MS;
+      return false;
     },
   });
 }
@@ -55,6 +70,29 @@ export function useKillRun(slug: string) {
     mutationFn: (runId) => killRun(slug, runId),
     onSuccess: (_r, runId) => {
       qc.invalidateQueries({ queryKey: qk.runs(slug) });
+      qc.invalidateQueries({ queryKey: qk.run(slug, runId) });
+    },
+  });
+}
+
+/** §Ship 39 (H1): interactive control for a live run — flip Auto/Manual,
+ *  resume a pause (optionally with feedback), or stop cleanly. */
+export interface RunControlVars {
+  runId: string;
+  mode?: "manual" | "auto";
+  resume?: boolean;
+  feedback?: string | null;
+  stop?: boolean;
+  // §Ship 45: launch-time-generation retry decision (retry vs continue blind).
+  gen_retry?: boolean;
+  gen_continue?: boolean;
+}
+
+export function useControlRun(slug: string) {
+  const qc = useQueryClient();
+  return useMutation<RunControlState, Error, RunControlVars>({
+    mutationFn: ({ runId, ...body }) => controlRun(slug, runId, body),
+    onSuccess: (_r, { runId }) => {
       qc.invalidateQueries({ queryKey: qk.run(slug, runId) });
     },
   });

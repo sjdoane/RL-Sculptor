@@ -1,30 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import {
-  AlertTriangle,
-  Atom,
-  Cog,
-  FileUp,
-  Gauge,
-  Layers,
-  Loader2,
-  RefreshCw,
-  Wand2,
-  Zap,
-} from "lucide-react";
 import { toast } from "sonner";
 
-import { Button } from "@/components/ui/button";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
-import { Textarea } from "@/components/ui/textarea";
+import { Icon } from "@/components/rs/icon";
+import { Btn } from "@/components/rs/primitives";
 import { MonacoDiffLazy, MonacoLazy } from "@/components/MonacoLazy";
 import { useJob } from "@/hooks/useJob";
 import {
@@ -41,13 +20,6 @@ import {
 } from "@/lib/api";
 import type { MjcfSummary, ProjectDetail } from "@/lib/types";
 
-// Pre-filled template for the "Motor limits" button. Sam enters torque
-// / speed / gear ratio numbers from his motor datasheet; Claude maps
-// them to MJCF `<actuator forcerange>`, `<joint armature>`, `<joint
-// damping>`, `<joint frictionloss>`. Grounded in the actuator-modeling
-// papers seeded by the 2026-04-22 cartwheel-ingest pass (ANYmal
-// actuator-net 1901.08652; Extended Friction 2410.08650;
-// Actuator-Constrained RL 2312.17507; SEA Max Torque 1902.05346).
 const _MOTOR_LIMITS_TEMPLATE = `Update the MJCF actuator forceranges and joint damping/armature/frictionloss to match my motor datasheet. Apply the standard workflow:
   - forcerange = ±peak_torque (stall torque from datasheet)
   - armature = rotor_inertia × gear_ratio²
@@ -70,48 +42,29 @@ If the robot has series-elastic actuators, also set spring stiffness + damping o
 
 Cite 2312.17507 for why forcerange enforcement matters (prevents the policy exploiting infinite-torque assumptions), 1901.08652 for the actuator-inertia-damping workflow, and 2410.08650 for the extended-friction model if frictionloss isn't already set.`;
 
-
-/** Physics tab (M7 Phase 5, prompt-first). Left column is a Claude
- * prompt textarea + live diff view; right column is a read-only
- * summary of the current MJCF's key physics parameters. Form-driven
- * editing is deferred to a follow-up pass. */
-export function PhysicsTab({
-  slug,
-  project,
-}: {
-  slug: string;
-  project: ProjectDetail;
-}) {
+export function PhysicsTab({ slug, project: _project }: { slug: string; project: ProjectDetail }) {
   const phys = usePhysics(slug);
   const [prompt, setPrompt] = useState("");
   const [activeJobId, setActiveJobId] = useState<string | null>(null);
-  const [lastRejection, setLastRejection] = useState<RejectionState | null>(
-    null,
-  );
+  const [lastRejection, setLastRejection] = useState<RejectionState | null>(null);
   const promptRef = useRef<HTMLTextAreaElement | null>(null);
 
-  // §7.4: pick up an auto-physics suggestion parked in sessionStorage
-  // by RunsTab's "apply physics fix" chip. Pull-once-and-clear so a
-  // subsequent navigation doesn't re-prefill the stale prompt. Only
-  // runs on first mount; user edits to `prompt` afterwards are sticky.
   useEffect(() => {
     try {
       const pending = sessionStorage.getItem("pendingPhysicsPrompt");
       if (pending && pending.trim().length > 0) {
         setPrompt(pending);
         sessionStorage.removeItem("pendingPhysicsPrompt");
-        // Give the textarea focus so Sam can review + tweak before
-        // hitting "Prompt Claude".
         setTimeout(() => promptRef.current?.focus(), 0);
       }
     } catch {
-      // sessionStorage unavailable — nothing to pre-fill.
+      /* sessionStorage unavailable */
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
   const mutate = usePhysicsPromptEdit(slug);
   const rematerialize = usePhysicsRematerialize(slug);
-  const job = useJob(activeJobId, { refetchIntervalMs: 1500 });
+  const job = useJob(activeJobId ?? undefined, { intervalMs: 1500 });
   const qc = useQueryClient();
 
   useEffect(() => {
@@ -121,9 +74,7 @@ export function PhysicsTab({
       const committed = Boolean(result.committed);
       const summary = (result.summary as string) ?? "";
       if (committed) {
-        toast.success("Physics edit committed", {
-          description: summary.slice(0, 120),
-        });
+        toast.success("Physics edit committed", { description: summary.slice(0, 120) });
         setLastRejection(null);
         setPrompt("");
       } else {
@@ -136,36 +87,26 @@ export function PhysicsTab({
           summary,
         });
         toast.error("Edit rejected — see card below the prompt");
-        // Keep the prompt text so the user can edit + retry.
       }
       qc.invalidateQueries({ queryKey: ["physics", slug] });
       setActiveJobId(null);
     } else if (job.data.status === "errored") {
-      toast.error("Physics edit failed", {
-        description: job.data.error ?? "see /jobs for details",
-      });
+      toast.error("Physics edit failed", { description: job.data.error ?? "see /jobs for details" });
       setActiveJobId(null);
     }
   }, [job.data, activeJobId, slug, qc]);
 
   const inFlight =
-    Boolean(activeJobId) &&
-    job.data?.status !== "completed" &&
-    job.data?.status !== "errored";
+    Boolean(activeJobId) && job.data?.status !== "completed" && job.data?.status !== "errored";
 
   const handleRematerialize = () => {
     rematerialize.mutate(undefined, {
       onSuccess: () => {
-        toast.success("MJCF re-materialized", {
-          description: "Assets copied from the library source.",
-        });
+        toast.success("MJCF re-materialized", { description: "Assets copied from the library source." });
         qc.invalidateQueries({ queryKey: ["physics", slug] });
       },
       onError: (err) => {
-        const msg =
-          err instanceof ApiError
-            ? err.problem.detail ?? err.problem.title
-            : (err as Error).message;
+        const msg = err instanceof ApiError ? err.problem.detail ?? err.problem.title : (err as Error).message;
         toast.error("Re-materialize failed", { description: msg });
       },
     });
@@ -173,9 +114,7 @@ export function PhysicsTab({
 
   const submit = () => {
     if (prompt.trim().length < 3) {
-      toast.error("Prompt too short", {
-        description: "Describe the physics change (≥ 3 chars).",
-      });
+      toast.error("Prompt too short", { description: "Describe the physics change (≥ 3 chars)." });
       return;
     }
     mutate.mutate(
@@ -183,15 +122,10 @@ export function PhysicsTab({
       {
         onSuccess: (j) => {
           setActiveJobId(j.job_id);
-          toast.success("Claude is editing the MJCF…", {
-            description: "~30-90 s for a small change",
-          });
+          toast.success("Claude is editing the MJCF…", { description: "~30-90 s for a small change" });
         },
         onError: (err) => {
-          const msg =
-            err instanceof ApiError
-              ? err.problem.detail ?? err.problem.title
-              : (err as Error).message;
+          const msg = err instanceof ApiError ? err.problem.detail ?? err.problem.title : (err as Error).message;
           toast.error("Could not start physics edit", { description: msg });
         },
       },
@@ -199,281 +133,169 @@ export function PhysicsTab({
   };
 
   if (phys.isLoading) {
-    return <p className="text-sm text-muted-foreground">Loading MJCF…</p>;
+    return <div className="rs-scroll"><div className="rs-pad"><p className="rs-sub">Loading MJCF…</p></div></div>;
   }
   if (phys.error) {
     const err = phys.error as Error;
-    const detail =
-      err instanceof ApiError ? err.problem.detail ?? err.problem.title : err.message;
+    const detail = err instanceof ApiError ? err.problem.detail ?? err.problem.title : err.message;
     return (
-      <Card className="border-amber-300/60 bg-amber-50 dark:bg-amber-900/20">
-        <CardContent className="flex items-start gap-2 p-4 text-sm">
-          <AlertTriangle className="mt-0.5 h-4 w-4 text-amber-600" />
-          <div>
-            <div className="font-medium">Physics editor unavailable</div>
-            <p className="text-xs text-muted-foreground">{detail}</p>
+      <div className="rs-scroll">
+        <div className="rs-pad">
+          <div className="rs-banner warn">
+            <Icon name="alert-triangle" size={17} />
+            <span className="rs-grow"><b>Physics editor unavailable.</b> {detail}</span>
           </div>
-        </CardContent>
-      </Card>
+        </div>
+      </div>
     );
   }
   if (!phys.data) return null;
+  const summary = phys.data.summary;
 
   return (
-    <div className="grid grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1fr)_360px]">
-      <section className="flex min-w-0 flex-col gap-4">
-        <Card className="border-primary/20 bg-primary/5">
-          <CardContent className="flex flex-col gap-3 p-4">
-            <div className="flex items-start gap-3">
-              <span className="mt-0.5 inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-primary/10 text-primary">
-                <Atom className="h-4 w-4" />
-              </span>
-              <div className="min-w-0 flex-1">
-                <div className="text-sm font-semibold">
-                  Edit physics with Claude
-                </div>
-                <p className="mt-0.5 text-xs text-muted-foreground">
-                  Describe the change in plain English. Claude rewrites
-                  the MJCF, validates it via{" "}
-                  <code>mujoco.MjModel.from_xml_string</code>, and commits
-                  the new model to this project's git repo. Form-based
-                  field editing (sliders etc.) comes in a follow-up.
-                </p>
+    <div className="rs-scroll">
+      <div className="rs-pad rs-vgap-24">
+        <div>
+          <div className="rs-eyebrow">MJCF model</div>
+          <h2 className="rs-h2" style={{ marginTop: 6 }}>Physics</h2>
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "minmax(0,1fr) minmax(300px,360px)", gap: 18, alignItems: "start" }}>
+          <section className="rs-vgap-16" style={{ minWidth: 0 }}>
+            {/* Prompt hero */}
+            <div className="rs-prompt">
+              <div className="rs-flex rs-gap-8" style={{ marginBottom: 8 }}>
+                <Icon name="sparkles" size={15} color="var(--rs-primary)" />
+                <span className="rs-eyebrow">Edit physics with Claude</span>
               </div>
-            </div>
-            <Textarea
-              ref={promptRef}
-              value={prompt}
-              onChange={(e) => {
-                setPrompt(e.target.value);
-                if (lastRejection) setLastRejection(null);
-              }}
-              placeholder={
-                "e.g.\n" +
-                "  • Increase hip joint damping by 50% to reduce oscillation\n" +
-                "  • Drop timestep to 0.001 for tighter integration\n" +
-                "  • Add a parallel-elastic spring across the knee joint"
-              }
-              rows={4}
-              maxLength={2000}
-              disabled={inFlight}
-              className="text-xs"
-            />
-            <div className="flex items-center justify-between gap-2">
-              <div className="flex items-center gap-2 text-[10px] text-muted-foreground">
-                <span>
-                  Source: <code>{phys.data.mjcf_source_kind}</code>
-                  {phys.data.mjcf_source_kind === "library" && !phys.data.materialized && (
-                    <>
-                      {" "}· first edit will copy the MJCF into{" "}
-                      <code>uploads/robot/base.xml</code>
-                    </>
-                  )}
+              <textarea
+                ref={promptRef}
+                value={prompt}
+                onChange={(e) => { setPrompt(e.target.value); if (lastRejection) setLastRejection(null); }}
+                placeholder={"e.g. Increase hip joint damping by 50% to reduce oscillation · Drop timestep to 0.001 · Add a parallel-elastic spring across the knee"}
+                rows={4}
+                maxLength={2000}
+                disabled={inFlight}
+                aria-label="Physics change prompt"
+              />
+              <div className="rs-prompt-foot">
+                <span className="rs-sub" style={{ fontSize: 12, display: "flex", alignItems: "center", gap: 6 }}>
+                  <Icon name="info" size={13} />
+                  source <code className="mono">{phys.data.mjcf_source_kind}</code> · edits regenerate + re-validate the MJCF
                 </span>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  disabled={inFlight}
-                  onClick={() => setPrompt(_MOTOR_LIMITS_TEMPLATE)}
-                  title="Fill the prompt with a motor-limit template. Edit the numbers to match your motor datasheet, then Prompt Claude."
-                  className="h-6 px-2 text-[10px]"
-                >
-                  Motor limits template
-                </Button>
-              </div>
-              <Button size="sm" onClick={submit} disabled={inFlight}>
-                {inFlight ? (
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                ) : (
-                  <Wand2 className="h-3.5 w-3.5" />
-                )}
-                {inFlight ? "Claude is editing…" : "Prompt Claude"}
-              </Button>
-            </div>
-          </CardContent>
-        </Card>
-
-        {lastRejection && (
-          <RejectionCard
-            state={lastRejection}
-            onRetry={() => {
-              setLastRejection(null);
-              promptRef.current?.focus();
-            }}
-          />
-        )}
-
-        {phys.data.summary.parse_error && (
-          <Card className="border-amber-400/60 bg-amber-50 dark:border-amber-500/40 dark:bg-amber-900/20">
-            <CardContent className="flex flex-col gap-3 p-4 text-sm">
-              <div className="flex items-start gap-2">
-                <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />
-                <div className="min-w-0 flex-1">
-                  <div className="font-medium">MJCF won't parse</div>
-                  <p className="mt-1 break-words font-mono text-[11px] text-muted-foreground">
-                    {phys.data.summary.parse_error}
-                  </p>
-                  <p className="mt-2 text-xs text-muted-foreground">
-                    This usually means referenced mesh or texture files
-                    are missing from{" "}
-                    <code>uploads/robot/</code>. Click{" "}
-                    <strong>Re-materialize</strong> to wipe the local copy
-                    and re-fetch the library source + assets.
-                  </p>
+                <div className="rs-flex rs-gap-8">
+                  <Btn kind="ghost" size="sm" disabled={inFlight} onClick={() => setPrompt(_MOTOR_LIMITS_TEMPLATE)} title="Fill the prompt with a motor-limit template.">
+                    Motor template
+                  </Btn>
+                  <Btn kind="primary" size="sm" icon={inFlight ? "loader" : "sparkles"} onClick={submit} disabled={inFlight}>
+                    {inFlight ? "Claude is editing…" : "Prompt Claude"}
+                  </Btn>
                 </div>
               </div>
-              <div className="flex items-center justify-end">
-                <Button
-                  size="sm"
-                  variant="outline"
-                  onClick={handleRematerialize}
-                  disabled={rematerialize.isPending}
-                >
-                  {rematerialize.isPending ? (
-                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                  ) : (
-                    <RefreshCw className="h-3.5 w-3.5" />
-                  )}
-                  {rematerialize.isPending
-                    ? "Re-materializing…"
-                    : "Re-materialize MJCF"}
-                </Button>
-              </div>
-            </CardContent>
-          </Card>
-        )}
-
-        <MotorLimitsCard slug={slug} summary={phys.data.summary} />
-
-        <Card className="overflow-hidden">
-          <CardHeader className="flex-row items-center justify-between gap-2 space-y-0 border-b py-3">
-            <div>
-              <CardTitle className="text-sm">
-                Current MJCF{" "}
-                {phys.data.mjcf_path && (
-                  <code className="font-mono text-[10px] text-muted-foreground">
-                    ({phys.data.mjcf_path.split("/").slice(-2).join("/")})
-                  </code>
-                )}
-              </CardTitle>
-              <CardDescription className="text-[11px]">
-                {phys.data.xml_source.split("\n").length} lines · read-only
-                — use the prompt above to edit.
-              </CardDescription>
             </div>
-          </CardHeader>
-          <CardContent className="p-0">
-            <MonacoLazy
-              value={phys.data.xml_source}
-              readOnly
-              height={420}
-              language="xml"
-            />
-          </CardContent>
-        </Card>
-      </section>
 
-      <aside className="order-1 lg:order-2">
-        <SummaryPanel summary={phys.data.summary} />
-      </aside>
+            {lastRejection && (
+              <RejectionCard state={lastRejection} onRetry={() => { setLastRejection(null); promptRef.current?.focus(); }} />
+            )}
+
+            {summary.parse_error && (
+              <div className="rs-card rs-card-pad rs-vgap-8">
+                <div className="rs-banner warn">
+                  <Icon name="alert-triangle" size={17} />
+                  <span className="rs-grow">
+                    <b>MJCF won't parse.</b> <span className="mono" style={{ fontSize: 11 }}>{summary.parse_error}</span> — usually missing mesh/texture assets. Re-materialize re-fetches the library source.
+                  </span>
+                </div>
+                <div className="rs-flex" style={{ justifyContent: "flex-end" }}>
+                  <Btn kind="ghost" size="sm" icon={rematerialize.isPending ? "loader" : "refresh-cw"} onClick={handleRematerialize} disabled={rematerialize.isPending}>
+                    {rematerialize.isPending ? "Re-materializing…" : "Re-materialize MJCF"}
+                  </Btn>
+                </div>
+              </div>
+            )}
+
+            <MotorLimitsCard slug={slug} summary={summary} />
+
+            {/* Current MJCF (Monaco) */}
+            <div className="rs-code">
+              <div className="rs-code-bar">
+                <span className="rs-code-file">
+                  <Icon name="file-code" size={14} color="var(--rs-primary)" />
+                  {phys.data.mjcf_path ? phys.data.mjcf_path.split("/").slice(-2).join("/") : "model.xml"}
+                </span>
+                <span className="rs-sub" style={{ fontSize: 11 }}>{phys.data.xml_source.split("\n").length} lines · read-only</span>
+              </div>
+              <MonacoLazy value={phys.data.xml_source} readOnly height={420} language="xml" />
+            </div>
+          </section>
+
+          <aside className="rs-vgap-16">
+            <SummaryPanel summary={summary} />
+          </aside>
+        </div>
+      </div>
     </div>
   );
 }
 
 function SummaryPanel({ summary }: { summary: MjcfSummary }) {
   return (
-    <div className="flex flex-col gap-3">
-      <Card>
-        <CardHeader className="py-3">
-          <CardTitle className="flex items-center gap-2 text-sm">
-            <Gauge className="h-3.5 w-3.5" />
-            Simulation options
-          </CardTitle>
-        </CardHeader>
-        <CardContent className="grid grid-cols-1 gap-1 pt-0 font-mono text-[11px]">
-          <KV label="timestep" v={fmt(summary.timestep)} />
-          <KV label="gravity" v={fmtVec(summary.gravity)} />
-          <KV label="integrator" v={summary.integrator ?? "—"} />
-          <KV label="solver" v={summary.solver ?? "—"} />
-        </CardContent>
-      </Card>
+    <>
+      <div className="rs-card">
+        <div className="rs-card-head"><div className="rs-card-title"><Icon name="gauge" size={16} />MJCF summary</div></div>
+        <div className="rs-card-pad">
+          <div className="rs-sysgrid">
+            <div className="rs-sysitem"><span className="lab">joints</span><span className="val" style={{ fontSize: 20 }}>{summary.joints.length}</span></div>
+            <div className="rs-sysitem"><span className="lab">actuators</span><span className="val" style={{ fontSize: 20 }}>{summary.actuators.length}</span></div>
+            <div className="rs-sysitem"><span className="lab">geoms</span><span className="val" style={{ fontSize: 20 }}>{(summary.geoms ?? []).length}</span></div>
+          </div>
+          <hr className="rs-divider" style={{ margin: "14px 0" }} />
+          <div className="rs-kv">
+            <div className="k">timestep</div><div className="v">{fmt(summary.timestep)}</div>
+            <div className="k">gravity</div><div className="v">{fmtVec(summary.gravity)}</div>
+            <div className="k">integrator</div><div className="v">{summary.integrator ?? "—"}</div>
+            <div className="k">solver</div><div className="v">{summary.solver ?? "—"}</div>
+          </div>
+        </div>
+      </div>
 
-      <Card>
-        <CardHeader className="py-3">
-          <CardTitle className="flex items-center gap-2 text-sm">
-            <Cog className="h-3.5 w-3.5" />
-            Joints ({summary.joints.length})
-          </CardTitle>
-          <CardDescription className="text-[11px]">
-            damping + armature drive SEA compliance. Free joint (ball/
-            slide/hinge) rows listed; excludes root.
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="max-h-56 overflow-y-auto pt-0 font-mono text-[11px]">
+      <div className="rs-card">
+        <div className="rs-card-head"><div className="rs-card-title"><Icon name="cpu" size={16} />Joints</div><span className="rs-num" style={{ color: "var(--rs-muted)", fontSize: 12 }}>{summary.joints.length}</span></div>
+        <div className="rs-card-pad" style={{ maxHeight: 220, overflowY: "auto", paddingTop: 8 }}>
           {summary.joints.length === 0 ? (
-            <p className="italic text-muted-foreground">(none)</p>
+            <p className="rs-sub" style={{ fontStyle: "italic" }}>(none)</p>
           ) : (
-            <ul className="space-y-0.5">
-              {summary.joints.slice(0, 30).map((j) => (
-                <li
-                  key={j.name}
-                  className="flex items-center justify-between gap-2 border-b border-border/40 py-0.5"
-                >
-                  <span className="truncate">{j.name}</span>
-                  <span className="text-muted-foreground">
-                    d={fmt(j.damping)} a={fmt(j.armature)}
-                  </span>
-                </li>
+            <div className="rs-kv">
+              {summary.joints.slice(0, 40).map((j) => (
+                <div key={j.name} style={{ display: "contents" }}>
+                  <div className="k" style={{ textTransform: "none" }}>{j.name}</div>
+                  <div className="v">d={fmt(j.damping)} a={fmt(j.armature)}</div>
+                </div>
               ))}
-              {summary.joints.length > 30 && (
-                <li className="pt-1 text-[10px] italic text-muted-foreground">
-                  + {summary.joints.length - 30} more
-                </li>
-              )}
-            </ul>
+            </div>
           )}
-        </CardContent>
-      </Card>
+          {summary.joints.length > 40 && <p className="rs-sub" style={{ fontSize: 11, marginTop: 6 }}>+ {summary.joints.length - 40} more</p>}
+        </div>
+      </div>
 
-      <Card>
-        <CardHeader className="py-3">
-          <CardTitle className="flex items-center gap-2 text-sm">
-            <Layers className="h-3.5 w-3.5" />
-            Actuators ({summary.actuators.length})
-          </CardTitle>
-        </CardHeader>
-        <CardContent className="max-h-56 overflow-y-auto pt-0 font-mono text-[11px]">
+      <div className="rs-card">
+        <div className="rs-card-head"><div className="rs-card-title"><Icon name="layers" size={16} />Actuators</div><span className="rs-num" style={{ color: "var(--rs-muted)", fontSize: 12 }}>{summary.actuators.length}</span></div>
+        <div className="rs-card-pad" style={{ maxHeight: 220, overflowY: "auto", paddingTop: 8 }}>
           {summary.actuators.length === 0 ? (
-            <p className="italic text-muted-foreground">(none)</p>
+            <p className="rs-sub" style={{ fontStyle: "italic" }}>(none)</p>
           ) : (
-            <ul className="space-y-0.5">
-              {summary.actuators.slice(0, 30).map((a) => (
-                <li
-                  key={a.name}
-                  className="flex items-center justify-between gap-2 border-b border-border/40 py-0.5"
-                >
-                  <span className="truncate">{a.name}</span>
-                  <span className="text-muted-foreground">
-                    gear={fmt(a.gear)}
-                  </span>
-                </li>
+            <div className="rs-kv">
+              {summary.actuators.slice(0, 40).map((a) => (
+                <div key={a.name} style={{ display: "contents" }}>
+                  <div className="k" style={{ textTransform: "none" }}>{a.name}</div>
+                  <div className="v">gear={fmt(a.gear)}</div>
+                </div>
               ))}
-            </ul>
+            </div>
           )}
-        </CardContent>
-      </Card>
-    </div>
-  );
-}
-
-function KV({ label, v }: { label: string; v: string }) {
-  return (
-    <div className="flex items-baseline justify-between gap-1 border-b border-border/40 py-0.5">
-      <span className="text-[10px] uppercase tracking-wide text-muted-foreground">
-        {label}
-      </span>
-      <span>{v}</span>
-    </div>
+        </div>
+      </div>
+    </>
   );
 }
 
@@ -481,7 +303,6 @@ function fmt(n: number | null | undefined): string {
   if (n == null) return "—";
   return typeof n === "number" ? n.toString() : String(n);
 }
-
 function fmtVec(vs: number[] | null | undefined): string {
   if (!vs) return "—";
   return `[${vs.map((v) => v.toFixed(3)).join(", ")}]`;
@@ -496,96 +317,48 @@ type RejectionState = {
   summary: string;
 };
 
-const REJECTED_AT_LABEL: Record<
-  NonNullable<RejectionState["rejectedAt"]>,
-  string
-> = {
+const REJECTED_AT_LABEL: Record<NonNullable<RejectionState["rejectedAt"]>, string> = {
   parse: "response format",
   claude_rejected: "claude refused",
   mujoco_validate: "mujoco rejected",
 };
 
-function RejectionCard({
-  state,
-  onRetry,
-}: {
-  state: RejectionState;
-  onRetry: () => void;
-}) {
-  const tag = state.rejectedAt
-    ? REJECTED_AT_LABEL[state.rejectedAt]
-    : "unknown";
+function RejectionCard({ state, onRetry }: { state: RejectionState; onRetry: () => void }) {
+  const tag = state.rejectedAt ? REJECTED_AT_LABEL[state.rejectedAt] : "unknown";
   return (
-    <Card className="border-red-300 bg-red-50 dark:border-red-500/40 dark:bg-red-900/20">
-      <CardContent className="flex flex-col gap-3 p-4 text-sm">
-        <div className="flex items-start gap-2">
-          <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-red-600" />
-          <div className="min-w-0 flex-1">
-            <div className="flex items-center gap-2">
-              <span className="font-medium">Edit rejected</span>
-              <span className="rounded bg-red-200/70 px-1.5 py-0.5 font-mono text-[10px] uppercase tracking-wide text-red-900 dark:bg-red-500/30 dark:text-red-100">
-                {tag}
-              </span>
-            </div>
-            <p className="mt-2 whitespace-pre-wrap break-words font-mono text-[11px] text-muted-foreground">
-              {state.reason}
-            </p>
-          </div>
-        </div>
-        <details className="rounded border bg-background text-xs">
-          <summary className="cursor-pointer select-none px-3 py-2 font-medium">
-            View what Claude wrote
-          </summary>
-          <div className="border-t">
+    <div className="rs-why">
+      <div className="rs-why-head" style={{ cursor: "default" }}>
+        <Icon name="alert-triangle" size={16} />
+        Edit rejected
+        <span className="rs-failchip" style={{ marginLeft: 8 }}>{tag}</span>
+      </div>
+      <div className="rs-card-pad rs-vgap-8" style={{ background: "var(--surface-card)" }}>
+        <p className="mono" style={{ whiteSpace: "pre-wrap", wordBreak: "break-word", fontSize: 11, color: "var(--body)", margin: 0 }}>{state.reason}</p>
+        <details>
+          <summary style={{ cursor: "pointer", fontSize: 13, fontWeight: 500 }}>View what Claude wrote</summary>
+          <div style={{ marginTop: 8, border: "1px solid var(--hairline)", borderRadius: "var(--radius-md)", overflow: "hidden" }}>
             {state.rejectedAt === "parse" ? (
-              <pre className="max-h-[260px] overflow-auto whitespace-pre-wrap p-3 font-mono text-[11px]">
+              <pre className="mono" style={{ maxHeight: 260, overflow: "auto", whiteSpace: "pre-wrap", padding: 12, fontSize: 11, margin: 0 }}>
                 {state.claudeOutputRaw ?? "(no raw output captured)"}
               </pre>
             ) : (
-              <MonacoDiffLazy
-                original={state.oldXml}
-                modified={state.newXml}
-                language="xml"
-                height={320}
-              />
+              <MonacoDiffLazy original={state.oldXml} modified={state.newXml} language="xml" height={320} />
             )}
           </div>
         </details>
-        <div className="flex items-center justify-end">
-          <Button size="sm" variant="outline" onClick={onRetry}>
-            Retry with a different prompt
-          </Button>
+        <div className="rs-flex" style={{ justifyContent: "flex-end" }}>
+          <Btn kind="ghost" size="sm" onClick={onRetry}>Retry with a different prompt</Btn>
         </div>
-      </CardContent>
-    </Card>
+      </div>
+    </div>
   );
 }
 
-
-// ── §Ship-9b: motor-specs form ──────────────────────────────────────────
-/**
- * Structured motor-limits entry point: one row per actuator in the
- * current MJCF, four numeric inputs (+ optional notes). On submit the
- * backend synthesizes a physics-editor NL prompt from the structured
- * data and delegates to the same Claude-backed edit path.
- */
-function MotorLimitsCard({
-  slug,
-  summary,
-}: {
-  slug: string;
-  summary: MjcfSummary;
-}) {
+// ── §Ship-9b: motor-specs form (logic preserved verbatim) ────────────
+function MotorLimitsCard({ slug, summary }: { slug: string; summary: MjcfSummary }) {
   const [open, setOpen] = useState(false);
   const [specs, setSpecs] = useState<Record<string, MotorSpec>>({});
-  const actuators = useMemo(
-    () => (summary.actuators ?? []).map((a) => a.name),
-    [summary.actuators],
-  );
-  // §Ship-9c: after a datasheet upload, Claude may return joint names
-  // that aren't in `summary.actuators` (the datasheet might use
-  // different labeling). Union the two so the user sees every row
-  // that needs review.
+  const actuators = useMemo(() => (summary.actuators ?? []).map((a) => a.name), [summary.actuators]);
   const rowNames = useMemo(() => {
     const set = new Set<string>(actuators);
     for (const k of Object.keys(specs)) set.add(k);
@@ -595,43 +368,25 @@ function MotorLimitsCard({
   const qc = useQueryClient();
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  // §Ship-9c: datasheet PDF upload. Server returns structured specs
-  // (Claude-extracted); we merge into local state so user can review
-  // + edit before hitting Apply.
-  // §Ship-19c hotfix: pass the MJCF actuator names so Claude maps
-  // datasheet entries to the existing rows instead of fabricating
-  // new ones (Sam's first-test feedback: extracted data was correct
-  // but landed in a new row, leaving real actuators empty).
   const extract = useMutation({
     mutationFn: (pdf: File) => extractDatasheetPdf(slug, pdf, actuators),
     onSuccess: (data) => {
       const incoming = data.motors ?? {};
       const nMotors = Object.keys(incoming).length;
       if (nMotors === 0) {
-        toast.info(
-          "Datasheet uploaded but no motor specs were extracted",
-          { description: "Check that the PDF has text (not scanned image)." },
-        );
+        toast.info("Datasheet uploaded but no motor specs were extracted", { description: "Check that the PDF has text (not a scanned image)." });
         return;
       }
       setSpecs((prev) => {
-        // Merge: extracted specs win over any previously-entered row
-        // with the same joint name, but untouched joints stay.
         const merged: Record<string, MotorSpec> = { ...prev };
-        for (const [name, spec] of Object.entries(incoming)) {
-          merged[name] = spec;
-        }
+        for (const [name, spec] of Object.entries(incoming)) merged[name] = spec;
         return merged;
       });
       setOpen(true);
-      toast.success(`Extracted ${nMotors} motor spec${nMotors === 1 ? "" : "s"}`, {
-        description: "Review + edit before hitting Apply.",
-      });
+      toast.success(`Extracted ${nMotors} motor spec${nMotors === 1 ? "" : "s"}`, { description: "Review + edit before hitting Apply." });
     },
     onError: (err) => {
-      const msg = err instanceof ApiError
-        ? err.problem.detail ?? err.problem.title
-        : (err as Error).message;
+      const msg = err instanceof ApiError ? err.problem.detail ?? err.problem.title : (err as Error).message;
       toast.error("Datasheet extraction failed", { description: msg });
     },
   });
@@ -639,20 +394,11 @@ function MotorLimitsCard({
   const apply = useMutation({
     mutationFn: (body: MotorLimitsRequest) => applyMotorLimits(slug, body),
     onSuccess: (job) => {
-      toast.success("Motor-limits edit started", {
-        description: `job ${job.job_id.slice(0, 8)}… — watch for a commit toast`,
-      });
-      // §Ship-9b hotfix (critique medium-5): invalidate physics query
-      // so the Current MJCF panel refreshes once the edit commits.
-      // Small delay lets the backend finish the write before refetch.
-      setTimeout(() => {
-        qc.invalidateQueries({ queryKey: ["physics", slug] });
-      }, 2000);
+      toast.success("Motor-limits edit started", { description: `job ${job.job_id.slice(0, 8)}… — watch for a commit toast` });
+      setTimeout(() => { qc.invalidateQueries({ queryKey: ["physics", slug] }); }, 2000);
     },
     onError: (err) => {
-      const msg = err instanceof ApiError
-        ? err.problem.detail ?? err.problem.title
-        : (err as Error).message;
+      const msg = err instanceof ApiError ? err.problem.detail ?? err.problem.title : (err as Error).message;
       toast.error("Motor-limits edit failed to start", { description: msg });
     },
   });
@@ -661,53 +407,30 @@ function MotorLimitsCard({
     setSpecs((prev) => {
       const row: MotorSpec = { ...(prev[name] ?? {}) };
       if (raw === "") {
-        // Clear → remove the key entirely rather than store null so we
-        // don't send `null` to the backend on Apply (backend model
-        // would pass it through, but the wire stays clean).
         delete (row as Record<string, unknown>)[key];
       } else if (key === "notes") {
         row.notes = raw;
       } else {
         const n = Number(raw);
-        // §Ship-9b hotfix (critique medium-4): backend requires gt=0,
-        // so drop non-positive values on the client and flash a toast
-        // the FIRST time so the user understands.
-        if (!Number.isFinite(n) || n <= 0) {
-          delete (row as Record<string, unknown>)[key];
-        } else {
-          (row as Record<string, unknown>)[key] = n;
-        }
+        if (!Number.isFinite(n) || n <= 0) delete (row as Record<string, unknown>)[key];
+        else (row as Record<string, unknown>)[key] = n;
       }
       return { ...prev, [name]: row };
     });
   };
 
   const nonEmptyCount = Object.values(specs).filter((s) =>
-    s && (
-      s.peak_torque_nm != null || s.peak_speed_rads != null ||
-      s.gear_ratio != null || s.rotor_inertia_kgm2 != null ||
-      s.peak_current_a != null || (s.notes && s.notes.length > 0)
-    )
+    s && (s.peak_torque_nm != null || s.peak_speed_rads != null || s.gear_ratio != null || s.rotor_inertia_kgm2 != null || s.peak_current_a != null || (s.notes && s.notes.length > 0)),
   ).length;
 
-  // §Ship-9c hotfix (critique critical-3): any FILLED row with a joint
-  // name that isn't in `summary.actuators` will make Claude reject on
-  // "unknown joints" — wasting a ~60s API round-trip. Surface it early
-  // by disabling Apply until the user fixes / deletes those rows.
   const filledNotInMjcf: string[] = [];
   for (const [name, s] of Object.entries(specs)) {
     if (!s) continue;
-    const hasValue =
-      s.peak_torque_nm != null || s.peak_speed_rads != null ||
-      s.gear_ratio != null || s.rotor_inertia_kgm2 != null ||
-      s.peak_current_a != null || (s.notes && s.notes.length > 0);
-    if (hasValue && !actuators.includes(name)) {
-      filledNotInMjcf.push(name);
-    }
+    const hasValue = s.peak_torque_nm != null || s.peak_speed_rads != null || s.gear_ratio != null || s.rotor_inertia_kgm2 != null || s.peak_current_a != null || (s.notes && s.notes.length > 0);
+    if (hasValue && !actuators.includes(name)) filledNotInMjcf.push(name);
   }
 
   const submit = () => {
-    // Filter out rows where everything is null/empty.
     const filtered: Record<string, MotorSpec> = {};
     for (const [name, s] of Object.entries(specs)) {
       if (!s) continue;
@@ -728,94 +451,42 @@ function MotorLimitsCard({
   };
 
   return (
-    <Card>
-      <CardHeader className="py-3">
-        <div className="flex items-center justify-between">
-          <div>
-            <CardTitle className="flex items-center gap-2 text-sm">
-              <Zap className="h-3.5 w-3.5" />
-              Motor specs (structured form)
-            </CardTitle>
-            <CardDescription className="text-[11px]">
-              §Ship-9b — enter per-joint peak torque / speed / gear / rotor
-              inertia from your datasheet. Only rows you fill in are applied.
-              Claude translates to `forcerange` / `armature` / `damping`
-              with KG-cited papers.
-            </CardDescription>
-          </div>
-          <div className="flex items-center gap-2">
-            {/* §Ship-9c: datasheet PDF upload. Extracts structured
-                 motor specs via Claude, then pre-fills the table below. */}
-            <input
-              ref={fileInputRef}
-              type="file"
-              accept="application/pdf,.pdf"
-              style={{ display: "none" }}
-              onChange={(e) => {
-                const f = e.target.files?.[0];
-                e.target.value = "";  // allow re-uploading the same file
-                // §Ship-9c hotfix (critique medium-9): reject double-click
-                // while an extract is already in flight.
-                if (!f || extract.isPending || apply.isPending) return;
-                // Quick client-side size/type guard — the real cap is
-                // enforced server-side (10 MB), but warn earlier.
-                if (f.size > 10 * 1024 * 1024) {
-                  toast.error("Datasheet too large", {
-                    description: `${(f.size / 1024 / 1024).toFixed(1)}MB — trim to ≤10 MB first.`,
-                  });
-                  return;
-                }
-                if (!f.type.includes("pdf") && !f.name.toLowerCase().endsWith(".pdf")) {
-                  toast.error("Not a PDF", {
-                    description: "Upload a real PDF (not a PNG/JPG of one).",
-                  });
-                  return;
-                }
-                extract.mutate(f);
-              }}
-            />
-            <Button
-              size="sm"
-              variant="outline"
-              disabled={extract.isPending || apply.isPending}
-              onClick={() => fileInputRef.current?.click()}
-              title="Upload a motor datasheet PDF; Claude extracts specs to pre-fill the table."
-            >
-              {extract.isPending ? (
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-              ) : (
-                <FileUp className="h-3.5 w-3.5" />
-              )}
-              Upload datasheet
-            </Button>
-            <Button
-              size="sm"
-              variant="outline"
-              onClick={() => setOpen((v) => !v)}
-            >
-              {open ? "Collapse" : `Configure (${actuators.length} joints)`}
-            </Button>
-          </div>
+    <div className="rs-card">
+      <div className="rs-card-head">
+        <div className="rs-card-title"><Icon name="zap" size={16} />Motor specifications</div>
+        <div className="rs-flex rs-gap-8">
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="application/pdf,.pdf"
+            style={{ display: "none" }}
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              e.target.value = "";
+              if (!f || extract.isPending || apply.isPending) return;
+              if (f.size > 10 * 1024 * 1024) { toast.error("Datasheet too large", { description: `${(f.size / 1024 / 1024).toFixed(1)}MB — trim to ≤10 MB.` }); return; }
+              if (!f.type.includes("pdf") && !f.name.toLowerCase().endsWith(".pdf")) { toast.error("Not a PDF", { description: "Upload a real PDF." }); return; }
+              extract.mutate(f);
+            }}
+          />
+          <Btn kind="ghost" size="sm" icon={extract.isPending ? "loader" : "upload"} disabled={extract.isPending || apply.isPending} onClick={() => fileInputRef.current?.click()} title="Upload a motor datasheet PDF; Claude extracts specs to pre-fill the table.">
+            Upload datasheet
+          </Btn>
+          <Btn kind="ghost" size="sm" onClick={() => setOpen((v) => !v)}>
+            {open ? "Collapse" : `Configure (${actuators.length})`}
+          </Btn>
         </div>
-      </CardHeader>
+      </div>
       {open && (
-        <CardContent className="pt-0">
+        <div className="rs-card-pad">
           {rowNames.length === 0 ? (
-            <p className="text-[11px] italic text-muted-foreground">
-              (no actuators found in the current MJCF — upload a datasheet
-              to seed rows)
-            </p>
+            <p className="rs-sub" style={{ fontStyle: "italic", fontSize: 12 }}>(no actuators in the MJCF — upload a datasheet to seed rows)</p>
           ) : (
-            <div className="max-h-[360px] overflow-y-auto rounded-md border">
-              <table className="w-full text-[11px]">
-                <thead className="sticky top-0 bg-muted/60 font-semibold">
+            <div style={{ maxHeight: 360, overflow: "auto" }}>
+              <table className="rs-table">
+                <thead>
                   <tr>
-                    <th className="px-2 py-1.5 text-left">joint</th>
-                    <th className="px-2 py-1.5 text-right">peak τ (Nm)</th>
-                    <th className="px-2 py-1.5 text-right">peak ω (rad/s)</th>
-                    <th className="px-2 py-1.5 text-right">gear</th>
-                    <th className="px-2 py-1.5 text-right">rotor I (kg·m²)</th>
-                    <th className="px-2 py-1.5 text-right">peak i (A)</th>
+                    <th>joint</th><th>peak τ (Nm)</th><th>peak ω (rad/s)</th><th>gear</th><th>rotor I</th><th>peak i (A)</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -823,41 +494,22 @@ function MotorLimitsCard({
                     const s = specs[name] ?? {};
                     const extra = !actuators.includes(name);
                     return (
-                      <tr key={name} className="border-t">
-                        <td className="px-2 py-1 font-mono">
+                      <tr key={name}>
+                        <td className="name">
                           {name}
-                          {extra && (
-                            <span
-                              className="ml-1 rounded bg-amber-100 px-1 py-0 text-[9px] text-amber-800"
-                              title="This joint name came from the datasheet but isn't in the MJCF. Confirm the label matches before applying, or Claude will reject on 'unknown joints'."
-                            >
-                              not in MJCF
-                            </span>
-                          )}
+                          {extra && <span className="rs-tag" style={{ marginLeft: 6, background: "var(--st-amber-bg)", color: "var(--st-amber-fg)", padding: "1px 6px", fontSize: 10 }} title="Not in the MJCF — Claude will reject 'unknown joints'.">not in MJCF</span>}
                         </td>
-                        {(
-                          [
-                            "peak_torque_nm",
-                            "peak_speed_rads",
-                            "gear_ratio",
-                            "rotor_inertia_kgm2",
-                            "peak_current_a",
-                          ] as const
-                        ).map((k) => (
-                          <td key={k} className="px-1 py-1">
-                            <Input
-                              type="number"
-                              step="any"
-                              min="0.0001"
-                              value={
-                                s[k] == null ? "" : String(s[k] as number)
-                              }
-                              onChange={(e) =>
-                                update(name, k, e.target.value)
-                              }
-                              className="h-6 w-full text-right font-mono text-[11px]"
+                        {(["peak_torque_nm", "peak_speed_rads", "gear_ratio", "rotor_inertia_kgm2", "peak_current_a"] as const).map((k) => (
+                          <td key={k}>
+                            <input
+                              type="number" step="any" min="0.0001"
+                              value={s[k] == null ? "" : String(s[k] as number)}
+                              onChange={(e) => update(name, k, e.target.value)}
+                              className="rs-input mono"
+                              style={{ height: 28, padding: "2px 6px", textAlign: "right", width: 90 }}
                               disabled={apply.isPending}
                               placeholder="—"
+                              aria-label={`${name} ${k.replace(/_/g, " ")}`}
                             />
                           </td>
                         ))}
@@ -868,40 +520,20 @@ function MotorLimitsCard({
               </table>
             </div>
           )}
-          <div className="mt-2 flex items-center justify-between gap-2">
-            <p className="text-[10px] text-muted-foreground">
+          <div className="rs-flex-between rs-gap-12" style={{ marginTop: 12 }}>
+            <p className="rs-sub" style={{ fontSize: 12, margin: 0 }}>
               {filledNotInMjcf.length > 0 ? (
-                <span className="text-amber-700">
-                  Fix or delete {filledNotInMjcf.length} row
-                  {filledNotInMjcf.length === 1 ? "" : "s"} whose joint name
-                  isn't in the MJCF: {filledNotInMjcf.slice(0, 3).join(", ")}
-                  {filledNotInMjcf.length > 3 ? "…" : ""}
-                </span>
-              ) : nonEmptyCount === 0 ? (
-                "Fill any row then Apply — empty rows are skipped."
-              ) : (
-                `${nonEmptyCount} joint${nonEmptyCount === 1 ? "" : "s"} ready to apply.`
-              )}
+                <span style={{ color: "var(--st-amber-fg)" }}>Fix or delete {filledNotInMjcf.length} row{filledNotInMjcf.length === 1 ? "" : "s"} not in the MJCF: {filledNotInMjcf.slice(0, 3).join(", ")}{filledNotInMjcf.length > 3 ? "…" : ""}</span>
+              ) : nonEmptyCount === 0 ? "Fill any row then Apply — empty rows are skipped." : `${nonEmptyCount} joint${nonEmptyCount === 1 ? "" : "s"} ready to apply.`}
             </p>
-            <Button
-              size="sm"
-              onClick={submit}
-              disabled={
-                apply.isPending ||
-                nonEmptyCount === 0 ||
-                filledNotInMjcf.length > 0
-              }
-            >
-              {apply.isPending ? (
-                <Loader2 className="h-3.5 w-3.5 animate-spin" />
-              ) : (
-                <Wand2 className="h-3.5 w-3.5" />
-              )}
+            <Btn kind="primary" size="sm" icon={apply.isPending ? "loader" : "sparkles"} onClick={submit} disabled={apply.isPending || nonEmptyCount === 0 || filledNotInMjcf.length > 0}>
               Apply motor limits
-            </Button>
+            </Btn>
           </div>
-        </CardContent>
+        </div>
       )}
-    </Card>
+    </div>
   );
 }
+
+export default PhysicsTab;

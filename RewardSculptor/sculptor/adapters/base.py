@@ -320,6 +320,23 @@ def load_adapter(config_path: Path) -> SculptorAdapter:
         raise ValueError(f"adapter.class must be a dotted path, got {dotted!r}")
     mod = importlib.import_module(module_name)
     cls = getattr(mod, class_name)
+
+    # §Ship 23: a top-level `[remote]` table (NOT nested under
+    # [adapter].config — the UI's TOML serializer only handles
+    # primitives there) is plumbed to adapters that accept a `remote`
+    # kwarg. Signature-introspected so non-remote adapters (gym_sb3)
+    # are untouched. Same precedent as the init_policy_path plumb.
+    remote_table = cfg.get("remote")
+    if isinstance(remote_table, dict) and "remote" not in init_kwargs:
+        import inspect
+
+        try:
+            params = inspect.signature(cls).parameters
+        except (TypeError, ValueError):  # builtins / exotic callables
+            params = {}
+        if "remote" in params:
+            init_kwargs = {**init_kwargs, "remote": dict(remote_table)}
+
     instance = cls(**init_kwargs)
     if not isinstance(instance, SculptorAdapter):
         raise TypeError(

@@ -195,12 +195,21 @@ log "starting frontend on http://127.0.0.1:$FRONTEND_PORT"
 ( cd frontend && pnpm dev ) &
 FRONTEND_PID=$!
 
-# Give Vite a moment to bind, then open the browser.
+# Give Vite a moment to bind, then TRY to open the browser. This MUST be
+# non-fatal: under `set -e`, a failing opener trips the EXIT trap and tears
+# down both servers. On headless WSL there is no Linux browser and
+# `open`/`xdg-open` exit non-zero ("no method available") — which was killing
+# the backend out from under the UI (every /api call then 500s → "Failed to
+# load projects / No GPU / No CUDA"). Prefer `wslview` so WSL hands off to the
+# Windows default browser; swallow opener output; never let this stop the run.
 sleep 2
-if   command -v open     >/dev/null 2>&1; then open     "http://127.0.0.1:$FRONTEND_PORT"
-elif command -v xdg-open >/dev/null 2>&1; then xdg-open "http://127.0.0.1:$FRONTEND_PORT"
-elif command -v wslview  >/dev/null 2>&1; then wslview  "http://127.0.0.1:$FRONTEND_PORT"
-fi
+{
+    if   command -v wslview  >/dev/null 2>&1; then wslview  "http://127.0.0.1:$FRONTEND_PORT"
+    elif command -v xdg-open >/dev/null 2>&1; then xdg-open "http://127.0.0.1:$FRONTEND_PORT"
+    elif command -v open     >/dev/null 2>&1; then open     "http://127.0.0.1:$FRONTEND_PORT"
+    else false
+    fi
+} >/dev/null 2>&1 || warn "couldn't auto-open a browser — open http://localhost:$FRONTEND_PORT yourself."
 
 log "both processes running (backend pid=$BACKEND_PID, frontend pid=$FRONTEND_PID). Ctrl+C to stop."
 

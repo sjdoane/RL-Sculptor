@@ -2,6 +2,7 @@
 
   GET  /projects/{slug}/reports/final_report.md   — markdown text
   GET  /projects/{slug}/reports/final.mp4         — timelapse mp4
+  GET  /projects/{slug}/reports/mission-quality   — §Ship 25b telemetry
   POST /projects/{slug}/reports/build             — run `sculptor.timelapse.build_report`
 
 The build endpoint is synchronous today — `build_report` completes in a
@@ -103,6 +104,34 @@ def get_final_mp4(slug: str, store: ProjectStore = Depends(get_store)) -> Any:
             type="/problems/not-found",
         )
     return FileResponse(path, media_type="video/mp4")
+
+
+# ── GET mission-quality (§Ship 25b / H2) ──────────────────────────────
+@router.get(
+    "/projects/{slug}/reports/mission-quality",
+    responses={404: {"model": ProblemDetail}},
+)
+def get_mission_quality(slug: str, store: ProjectStore = Depends(get_store)) -> Any:
+    """Decomposition-quality telemetry written by sculpt's mission
+    orchestrator (`reports/mission_quality.json`): per-mission stage
+    counts, stage-success rate, redecompositions, iteration spend.
+    Empty list (not 404) when no mission has run — the card renders an
+    empty state."""
+    pd = _project_dir(store, slug)
+    if pd is None:
+        return _problem(404, "project not found", type="/problems/not-found")
+    path = pd / "reports" / "mission_quality.json"
+    if not path.is_file():
+        return {"schema": 1, "missions": []}
+    try:
+        import json
+
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(doc, dict) or not isinstance(doc.get("missions"), list):
+            raise ValueError("bad shape")
+    except Exception:  # noqa: BLE001 — corrupt file → empty, never 500
+        return {"schema": 1, "missions": []}
+    return doc
 
 
 # ── POST build ────────────────────────────────────────────────────────

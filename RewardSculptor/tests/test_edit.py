@@ -186,8 +186,15 @@ def test_pre_validate_rejects_missing_paper_ref(v0_path, kg):
         _pre_validate(diagnosis, _hopper_contract(), current_mod, kg)
 
 
-def test_pre_validate_rejects_ungrounded_formula_field(v0_path, kg):
-    """The torso_angle case from the Hopper diagnosis."""
+def test_pre_validate_partitions_ungrounded_formula_field(v0_path, kg):
+    """The torso_angle case — ungrounded formula identifier.
+
+    Post-2026-04-23 partition refactor: a single bad edit no longer
+    kills the whole batch. `_pre_validate` partitions it into
+    `rejected_edits` with a reason; only an empty `applicable_edits`
+    is a hard error. `apply_edits` itself still raises when the
+    applicable list is empty (tested in happy-path stubs elsewhere).
+    """
     import sculptor.edit as edit_mod
 
     current_mod = edit_mod._load_reward_module(v0_path)
@@ -205,13 +212,22 @@ def test_pre_validate_rejects_ungrounded_formula_field(v0_path, kg):
         ],
         confidence=0.9,
     )
-    with pytest.raises(EditValidationError) as exc:
-        _pre_validate(diagnosis, _hopper_contract(), current_mod, kg)
-    assert "torso_angle" in str(exc.value)
-    assert "requires_env_extension" in str(exc.value)
+    plan = _pre_validate(diagnosis, _hopper_contract(), current_mod, kg)
+    assert plan.applicable_edits == []
+    assert len(plan.rejected_edits) == 1
+    assert plan.rejected_edits[0].target_term == "upright_tolerance"
+    assert len(plan.rejection_reasons) == 1
+    assert "torso_angle" in plan.rejection_reasons[0]
+    assert "requires_env_extension" in plan.rejection_reasons[0]
 
 
-def test_pre_validate_rejects_modify_op_with_unknown_target_term(v0_path, kg):
+def test_pre_validate_partitions_modify_op_with_unknown_target_term(
+    v0_path, kg
+):
+    """Diagnoser-common-error: using 'increase' / 'gate' / 'clip' with
+    a NEW target_term name. Post-fix, rejected individually; post-fix
+    the rejection message suggests using operation='add' as the escape
+    hatch (this string lives in `_pre_validate`)."""
     import sculptor.edit as edit_mod
 
     current_mod = edit_mod._load_reward_module(v0_path)
@@ -226,8 +242,59 @@ def test_pre_validate_rejects_modify_op_with_unknown_target_term(v0_path, kg):
         ],
         confidence=0.9,
     )
-    with pytest.raises(EditValidationError, match="unknown_weight"):
-        _pre_validate(diagnosis, _hopper_contract(), current_mod, kg)
+    plan = _pre_validate(diagnosis, _hopper_contract(), current_mod, kg)
+    assert plan.applicable_edits == []
+    assert len(plan.rejected_edits) == 1
+    assert "unknown_weight" in plan.rejection_reasons[0]
+    assert "operation='add'" in plan.rejection_reasons[0]
+
+
+def test_pre_validate_partitions_mixed_batch_keeps_valid_edits(v0_path, kg):
+    """Pins the 2026-04-23 overnight regression: Sam's 10 iters each
+    proposed 5 edits, 1-3 of which were ungrounded. Pre-fix,
+    `_pre_validate` raised on the first violation — ALL 5 edits
+    dropped, `new_reward` stayed at v1 for the whole overnight run.
+    Post-fix, the grounded ones survive."""
+    import sculptor.edit as edit_mod
+
+    current_mod = edit_mod._load_reward_module(v0_path)
+    diagnosis = Diagnosis(
+        failure_modes=["reward_hacking", "component_imbalance"], evidence="",
+        proposed_edits=[
+            # Valid: grounded existing hparam.
+            ProposedEdit(
+                target_term="alive_bonus", operation="increase",
+                rationale="bump per DM Control",
+                suggested_value="3.0",
+                paper_refs=["1801.00690"],
+            ),
+            # Invalid: new name with modify-op 'clip'. (Mirrors Sam's
+            # iter-2 edit[1]: 'clip' with target='kick_velocity_clip'.)
+            ProposedEdit(
+                target_term="alive_bonus_clip", operation="clip",
+                rationale="cap alive bonus",
+                suggested_value="5.0", paper_refs=[],
+            ),
+            # Valid: 'add' with a novel name is fine.
+            ProposedEdit(
+                target_term="upright_term", operation="add",
+                rationale="novel — tolerance on info-derived thing",
+                suggested_value="1.0", paper_refs=[],
+            ),
+        ],
+        confidence=0.9,
+    )
+    plan = _pre_validate(diagnosis, _hopper_contract(), current_mod, kg)
+    assert len(plan.applicable_edits) == 2, (
+        f"expected 2 valid edits to survive, got "
+        f"{[e.target_term for e in plan.applicable_edits]}"
+    )
+    assert {e.target_term for e in plan.applicable_edits} == {
+        "alive_bonus", "upright_term",
+    }
+    assert len(plan.rejected_edits) == 1
+    assert plan.rejected_edits[0].target_term == "alive_bonus_clip"
+    assert "alive_bonus_clip" in plan.rejection_reasons[0]
 
 
 def test_pre_validate_defers_requires_env_extension(v0_path, kg):

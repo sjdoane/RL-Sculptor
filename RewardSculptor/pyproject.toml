@@ -37,6 +37,7 @@ packages = ["sculptor"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "sculptor/prompts" = "sculptor/prompts"
+"sculptor/assets" = "sculptor/assets"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

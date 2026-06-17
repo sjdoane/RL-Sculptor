@@ -80,6 +80,15 @@ class Stage:
     # mission.json files load with init_skill_id=None via the
     # filter-unknown-keys path in `from_dict`.
     init_skill_id: Optional[str] = None
+    # §Ship 38: optional PER-STAGE objective fitness metric — a built-in
+    # spec-metric name (e.g. "g1_kick") or a resolved generated-metric .py
+    # path. When set it OVERRIDES the mission-level fitness_metric for THIS
+    # stage; this is what makes a true multi-phase curriculum sound (a
+    # "balance on one leg" stage and a "kick" stage want DIFFERENT
+    # objectives — Ship 34's uniform-metric-per-mission could not). None →
+    # the uniform mission metric. Backward-compatible: older mission.json
+    # without it load with steering_metric=None via from_dict's filter.
+    steering_metric: Optional[str] = None
 
     # ── Runtime-populated by orchestrator ────────────────────────────
     status: StageStatus = "pending"
@@ -96,6 +105,16 @@ class Stage:
     # further. Bounded at one level per CurricuLLM guidance — deeper
     # trees would invite combinatorial fanout on pathological tasks.
     redecomposition_attempts: int = 0
+    # §Ship 20a: persisted cap actually enforced for this stage's last
+    # (or current) run — `iterations_override or max_iterations`.
+    # Persisted so the UI's `rounds X/Y` display stays correct AFTER
+    # the WS event window slides past `stage_started`. Ship 20 derived
+    # this from events alone; long missions evict those events and the
+    # dialog fell back to authored `max_iterations`, showing nonsense
+    # like `rounds 4/3` when the user actually capped at 5. None for
+    # stages that haven't run yet; backward-compatible via Stage.from_
+    # dict's filter-unknown-keys path.
+    effective_max_iterations: Optional[int] = None
 
     def to_dict(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
@@ -128,6 +147,19 @@ class Mission:
     current_stage_idx: int = 0
     # Optional on-disk anchor — set by the orchestrator when persisting.
     mission_dir: Optional[str] = None
+    # §Ship 21a: persisted run-time defaults set at mission-creation
+    # time via the NewMissionDialog Advanced tab. Stored as a free-form
+    # dict to keep Mission decoupled from the backend's
+    # RunMissionRequest pydantic shape — valid keys are the same as
+    # that shape (iterations_override, steps_per_iter, seed,
+    # early_stop_on_criterion, criterion_stability_window,
+    # extend_on_improvement, max_extensions_per_stage,
+    # extension_factor, extension_improvement_threshold). RunMission
+    # Dialog pre-fills from these when the user later clicks Run
+    # mission. Backward-compatible: older mission.json without this
+    # field loads with run_defaults=None via from_dict's filter-
+    # unknown-keys path.
+    run_defaults: Optional[dict[str, Any]] = None
 
     # ── Serialization ────────────────────────────────────────────────
     def to_dict(self) -> dict[str, Any]:
@@ -138,7 +170,7 @@ class Mission:
         # (see `load_mission`). In memory, `mission_dir` is set so
         # downstream code (`stage_dir`, `parent_checkpoint_of`) keeps
         # working without changes.
-        return {
+        out: dict[str, Any] = {
             "schema_version": self.schema_version,
             "goal": self.goal,
             "decomposition_model": self.decomposition_model,
@@ -147,6 +179,12 @@ class Mission:
             "current_stage_idx": self.current_stage_idx,
             "stages": [s.to_dict() for s in self.stages],
         }
+        # §Ship 21a: emit run_defaults only when set, so older mission
+        # readers (and the UI's MissionDetail expecting Optional[dict])
+        # see a clean None.
+        if self.run_defaults is not None:
+            out["run_defaults"] = dict(self.run_defaults)
+        return out
 
     def to_json(self, *, indent: int = 2) -> str:
         return json.dumps(self.to_dict(), indent=indent, default=str)
@@ -161,6 +199,10 @@ class Mission:
                 f"upgrade sculptor or downgrade the mission file."
             )
         stages = [Stage.from_dict(s) for s in data.get("stages", [])]
+        run_defaults_raw = data.get("run_defaults")
+        run_defaults = (
+            dict(run_defaults_raw) if isinstance(run_defaults_raw, dict) else None
+        )
         return cls(
             goal=data["goal"],
             stages=stages,
@@ -173,6 +215,7 @@ class Mission:
             schema_version=ver,
             current_stage_idx=int(data.get("current_stage_idx", 0)),
             mission_dir=data.get("mission_dir"),
+            run_defaults=run_defaults,
         )
 
     @classmethod
@@ -359,6 +402,18 @@ def _validate_stage_structure(
         raise MissionValidationError(
             f"stage[{idx}].goal_text is empty"
         )
+    # §Ship 38: per-stage steering metric, when present, must be a sane
+    # non-empty string (a spec-metric name or a generated-metric path). The
+    # KNOWN-name check happens at decompose time (which has spec_metric_names);
+    # here we only guard against empty / pathologically-long hand edits.
+    if stage.steering_metric is not None:
+        sm = str(stage.steering_metric).strip()
+        if not sm or len(sm) > 128:
+            raise MissionValidationError(
+                f"stage[{idx}].steering_metric must be a non-empty string "
+                f"≤128 chars (a spec-metric name or generated-metric path); "
+                f"got {stage.steering_metric!r}"
+            )
 
 
 def _validate_parent_reference(
@@ -429,6 +484,48 @@ def _validate_success_criterion(stage: Stage, info_keys: set[str]) -> None:
             f"stage {stage.name!r} success_criterion is not a valid "
             f"Python expression: {e}"
         ) from e
+
+    # §Ship 21c: torch-idiom guard. The criterion namespace is built
+    # from numpy arrays (trajectory.npz) + plain dicts (behavior.json).
+    # numpy bool/int arrays do NOT have torch tensor methods like
+    # `.float()`, `.long()`, `.cpu()`, `.detach()` — using those crashes
+    # AT EVAL TIME after a stage has already burned its training
+    # budget (10+ hours on G1). Catch at decompose time instead.
+    # Sam's robot-flossing run: stage failed at the very last criterion
+    # evaluation with `'numpy.ndarray' object has no attribute 'float'`
+    # after iter 5 had nudged the metric to its peak — would have
+    # succeeded if the criterion didn't use `.float()`.
+    _FORBIDDEN_TORCH_METHODS: tuple[str, ...] = (
+        "float", "long", "double", "int", "bool", "byte", "short",
+        "half", "to", "cpu", "cuda", "detach", "item", "numpy",
+        "requires_grad", "requires_grad_", "grad",
+    )
+    method_violations: list[str] = []
+    for node in ast.walk(tree):
+        # x.method(...) → Call(func=Attribute(value=x, attr='method'))
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in _FORBIDDEN_TORCH_METHODS
+        ):
+            method_violations.append(node.func.attr)
+        # x.requires_grad (no parens) — Attribute access without Call
+        elif (
+            isinstance(node, ast.Attribute)
+            and node.attr in ("requires_grad", "grad")
+        ):
+            method_violations.append(node.attr)
+    if method_violations:
+        unique = sorted(set(method_violations))
+        raise MissionValidationError(
+            f"stage {stage.name!r} success_criterion uses torch tensor "
+            f"method(s) {unique!r} — namespace is numpy, NOT torch. "
+            f"For numpy arrays use `.astype(float)` / `.mean()` / "
+            f"`.any()` / `.all()` directly. A bool array's `.mean()` "
+            f"already returns the fraction-True; no cast needed.\n"
+            f"  bad:  (trajectory['root_link_pos_w'][..., 2] > 0.65).float().mean()\n"
+            f"  good: (trajectory['root_link_pos_w'][..., 2] > 0.65).mean()"
+        )
 
     # Map `container_name` → allowed-key set. Subscripts against
     # containers NOT in this map (e.g., `components['foo']`) are not

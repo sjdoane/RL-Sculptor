@@ -20,8 +20,13 @@ sees a uniform shape regardless of which path produced the candidate.
 
 from __future__ import annotations
 
+import logging
+import threading
+import time
 from dataclasses import dataclass, field
 from typing import Any, Optional
+
+log = logging.getLogger(__name__)
 
 from sculptor.kg.schema import (
     Environment,
@@ -35,6 +40,14 @@ from sculptor.kg.store import SculptorKG
 
 
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
+
+
+#: Default cosine floor for PROMPT-FEEDING semantic queries (§Ship 31).
+#: Below ~0.35 the match is tangential and Claude dutifully cites it
+#: anyway (CONTEXT 2026-04-22 Issue G). edit.py adopted this in Ship 8;
+#: diagnose/decompose now share the same constant — an unfloored
+#: query_semantic is for exploration tools only, never for prompts.
+DEFAULT_MIN_PROMPT_SIMILARITY = 0.35
 
 
 # ── Result shape ────────────────────────────────────────────────────────────
@@ -79,9 +92,21 @@ def cite(arxiv_id: str, *, store: SculptorKG | None = None) -> str:
 def _resolve_failure_modes(
     store: SculptorKG, names: list[str]
 ) -> dict[str, FailureMode]:
-    """Map the caller's strings onto FailureMode nodes (slug-first, then
-    substring in name/description) so we're tolerant to synonyms."""
+    """Map the caller's strings onto FailureMode nodes: exact slug,
+    then full-phrase containment, then a SCORED token fallback.
+
+    §Ship 31 grounding fix: the old fallback accepted the FIRST node
+    matching ANY single token — with 325 FailureModes,
+    "reward_saturation" resolved to an effectively arbitrary node
+    containing the word "reward", silently mis-grounding
+    query_techniques. Now: candidates are ranked by matched-token
+    count (full-phrase hits rank above all token hits), a token
+    fallback requires a MAJORITY of the target's tokens, and ties
+    break deterministically by (name length, name) — tightest match
+    wins, ordering is stable across runs.
+    """
     all_fm: list[FailureMode] = store.find_nodes(kind=FailureMode.kind)  # type: ignore[assignment]
+    all_fm = sorted(all_fm, key=lambda f: ((f.name or ""), f.id))
     out: dict[str, FailureMode] = {}
     for raw in names:
         slug_id = make_failure_mode_id(raw)
@@ -90,12 +115,25 @@ def _resolve_failure_modes(
             out[raw] = hit
             continue
         target = raw.lower().replace("_", " ").replace("-", " ").strip()
+        tokens = [t for t in target.split() if t]
+        if not tokens:
+            continue
+        need = max(1, (len(tokens) + 1) // 2)   # majority of tokens
         best: Optional[FailureMode] = None
+        best_key: tuple = ()
         for fm in all_fm:
             hay = f"{fm.name} {fm.description}".lower()
-            if target in hay or any(tok and tok in hay for tok in target.split()):
-                best = fm
-                break
+            phrase = target in hay
+            n_tok = sum(1 for t in tokens if t in hay)
+            if not phrase and n_tok < need:
+                continue
+            # Rank: phrase match beats token matches; more tokens beat
+            # fewer; shorter (tighter) names beat longer. Remaining
+            # ties go to the alphabetically-first node — all_fm is
+            # name-sorted and `>` is strict, so the first seen wins.
+            key = (1 if phrase else 0, n_tok, -len(fm.name or ""))
+            if best is None or key > best_key:
+                best, best_key = fm, key
         if best is not None:
             out[raw] = best
     return out
@@ -219,16 +257,79 @@ def query_techniques(
 
 # ── Semantic query ──────────────────────────────────────────────────────────
 _EMBEDDER_CACHE: dict[str, Any] = {}
+# Serializes concurrent first-time loads of the SentenceTransformer model.
+# The reward-sculptor-ui's Ship-10 prewarm hook fires a background
+# `_load_embedder` at uvicorn boot AND the reward-prompt worker thread
+# calls `_get_embedder` when processing a user edit. Without this lock,
+# two threads enter `SentenceTransformer(...)` concurrently on a cold
+# cache; on WSL2 the huggingface_hub cache `FileLock` + torch CUDA init
+# combination deadlocks under that race (observed symptom: reward-prompt
+# hangs indefinitely at the KG preview step, times out at 300s). The
+# lock lets the prewarm hold exclusive access while loading; the worker
+# waits, then reads the cached embedder on the second pass.
+_EMBEDDER_LOAD_LOCK = threading.Lock()
 
 
 def _get_embedder(model_name: str = EMBEDDING_MODEL):
-    """Lazy-load and memoize the SentenceTransformer model."""
-    if model_name in _EMBEDDER_CACHE:
-        return _EMBEDDER_CACHE[model_name]
-    from sentence_transformers import SentenceTransformer
-    embedder = SentenceTransformer(model_name)
-    _EMBEDDER_CACHE[model_name] = embedder
-    return embedder
+    """Lazy-load and memoize the SentenceTransformer model.
+
+    Thread-safe: concurrent callers (prewarm + reward-prompt worker)
+    serialize on `_EMBEDDER_LOAD_LOCK` so only one thread invokes
+    `SentenceTransformer(...)`. Subsequent callers read the cached
+    embedder without taking the lock (fast path).
+
+    Uses `local_files_only=True` when the model is already in the HF
+    cache. This bypasses huggingface_hub's httpx-based HEAD request
+    for cache freshness, which started hanging indefinitely on WSL2
+    after a recent `huggingface_hub` update (observed as a 5-minute
+    reward-prompt hang, 2026-04-23). Offline load takes ~4 s on warm
+    cache vs. >5 min hang with the network check. Falls back to
+    online mode if the cache is empty (fresh install).
+    """
+    # Fast path — module-level dict reads are atomic under the GIL.
+    cached = _EMBEDDER_CACHE.get(model_name)
+    if cached is not None:
+        return cached
+    # Slow path — serialize first-time loads.
+    with _EMBEDDER_LOAD_LOCK:
+        cached = _EMBEDDER_CACHE.get(model_name)
+        if cached is not None:
+            return cached
+        from sentence_transformers import SentenceTransformer
+
+        _t0 = time.time()
+        try:
+            log.info(
+                "loading sentence-transformer %r (local_files_only=True)",
+                model_name,
+            )
+            embedder = SentenceTransformer(model_name, local_files_only=True)
+            log.info(
+                "loaded sentence-transformer %r from cache in %.1fs",
+                model_name, time.time() - _t0,
+            )
+        except (OSError, ValueError) as e:
+            # Cache miss — fall back to online load. This pays the
+            # download cost (one-time per model) but also re-exposes
+            # the WSL2 httpx-hang risk. `SCULPTOR_HF_NO_NETWORK=1`
+            # forces offline-only and surfaces the cache-miss as an
+            # error so CI / repeatable environments fail fast instead
+            # of hanging.
+            import os as _os
+            if _os.environ.get("SCULPTOR_HF_NO_NETWORK") == "1":
+                raise
+            log.warning(
+                "local-only load failed (%s); falling back to online "
+                "download for %r", type(e).__name__, model_name,
+            )
+            _t0 = time.time()
+            embedder = SentenceTransformer(model_name)
+            log.info(
+                "downloaded + loaded sentence-transformer %r in %.1fs",
+                model_name, time.time() - _t0,
+            )
+        _EMBEDDER_CACHE[model_name] = embedder
+        return embedder
 
 
 def _embed_text(text: str, model_name: str = EMBEDDING_MODEL):
@@ -246,24 +347,48 @@ def _ensure_technique_embeddings(
     yet, return (technique, vector) for all techniques."""
     import numpy as np
 
+    _t0 = time.time()
     techniques: list[Technique] = store.find_nodes(kind=Technique.kind)  # type: ignore[assignment]
+    log.info(
+        "kg.query: fetched %d Technique nodes in %.2fs",
+        len(techniques), time.time() - _t0,
+    )
+    _t0 = time.time()
     need: list[Technique] = [
         t for t in techniques
         if not store.has_embedding(t.id, model_name) and (t.description or t.name)
     ]
+    log.info(
+        "kg.query: has_embedding scan: %d of %d missing in %.2fs",
+        len(need), len(techniques), time.time() - _t0,
+    )
     if need:
+        log.info(
+            "kg.query: backfilling %d technique embeddings (first query after ingest)",
+            len(need),
+        )
         embedder = _get_embedder(model_name)
         texts = [f"{t.name}. {t.description}".strip(". ") for t in need]
+        _t0 = time.time()
         vecs = embedder.encode(texts, normalize_embeddings=True)
+        log.info(
+            "kg.query: embedder.encode(%d texts) took %.2fs",
+            len(texts), time.time() - _t0,
+        )
         vecs = np.asarray(vecs, dtype=np.float32)
         for t, v in zip(need, vecs):
             store.set_embedding(t.id, model_name, v)
 
+    _t0 = time.time()
     out: list[tuple[Technique, Any]] = []
     for t in techniques:
         v = store.get_embedding(t.id, model_name)
         if v is not None:
             out.append((t, v))
+    log.info(
+        "kg.query: loaded %d embeddings in %.2fs",
+        len(out), time.time() - _t0,
+    )
     return out
 
 
@@ -289,11 +414,23 @@ def query_semantic(
     owns_store = store is None
     store = store or SculptorKG()
     try:
+        log.info(
+            "kg.query.query_semantic: start (text_len=%d, top_k=%d, "
+            "min_sim=%.2f, db=%s)",
+            len(text or ""), top_k, min_similarity,
+            getattr(store, "db_path", "<unknown>"),
+        )
         pool = _ensure_technique_embeddings(store, model_name)
         if not pool:
+            log.info("kg.query.query_semantic: empty pool, returning []")
             return []
 
+        _t0 = time.time()
         qv = _embed_text(text, model_name)
+        log.info(
+            "kg.query.query_semantic: encoded query in %.2fs",
+            time.time() - _t0,
+        )
         # Vectors are L2-normalized, so dot product == cosine similarity.
         scored = []
         for tech, v in pool:

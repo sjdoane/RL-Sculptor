@@ -121,6 +121,8 @@ export function useJobEvents(
     let cancelled = false;
     let ws: WebSocket | null = null;
     let retry = 0;
+    // §Ship 21e: capture the reconnect timer so cleanup clears it.
+    let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
     const connect = () => {
       if (cancelled || terminalRef.current) return;
@@ -161,7 +163,7 @@ export function useJobEvents(
         if (cancelled || terminalRef.current) return;
         const delay = Math.min(8000, 250 * Math.pow(2, retry));
         retry++;
-        setTimeout(connect, delay);
+        reconnectTimer = setTimeout(connect, delay);
       };
 
       ws.onerror = () => {
@@ -173,6 +175,7 @@ export function useJobEvents(
 
     return () => {
       cancelled = true;
+      if (reconnectTimer !== null) clearTimeout(reconnectTimer);
       try {
         ws?.close();
       } catch {

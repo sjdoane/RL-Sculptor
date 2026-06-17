@@ -1,21 +1,10 @@
 import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Loader2, Save, Settings as SettingsIcon, Trash2 } from "lucide-react";
 import { toast } from "sonner";
 
-import { Button } from "@/components/ui/button";
-import {
-  Dialog,
-  DialogContent,
-  DialogDescription,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-  DialogTrigger,
-} from "@/components/ui/dialog";
-import { Input } from "@/components/ui/input";
-import { Label } from "@/components/ui/label";
+import { Icon } from "@/components/rs/icon";
+import { Btn, Field, IconBtn, Modal } from "@/components/rs/primitives";
 import { useDeleteProject } from "@/hooks/useProjects";
 import {
   ApiError,
@@ -26,12 +15,10 @@ import {
 import type { ProjectDetail } from "@/lib/types";
 
 /** Project settings dialog (M7 Phase 7c). Opens from a gear icon in
- * the ProjectDetail header. First pass surfaces:
+ * the ProjectDetail header. Surfaces:
  *   - project summary (read-only key/value pairs).
- *   - danger zone: delete project (type-to-confirm).
- *
- * Follow-ups: editable environment_tag + KG auto-research toggle +
- * iteration defaults (needs a PATCH /projects/{slug} endpoint). */
+ *   - iteration settings (editable config.toml [iteration] block).
+ *   - danger zone: delete project (type-to-confirm). */
 export function ProjectSettingsDialog({
   project,
 }: {
@@ -39,27 +26,22 @@ export function ProjectSettingsDialog({
 }) {
   const [open, setOpen] = useState(false);
   return (
-    <Dialog open={open} onOpenChange={setOpen}>
-      <DialogTrigger asChild>
-        <Button variant="ghost" size="sm" title="Project settings">
-          <SettingsIcon className="h-4 w-4" />
-        </Button>
-      </DialogTrigger>
-      <DialogContent className="max-w-lg">
-        <DialogHeader>
-          <DialogTitle>Project settings</DialogTitle>
-          <DialogDescription>
-            Inspect adapter + library config. Manage destructive
-            actions from the danger zone.
-          </DialogDescription>
-        </DialogHeader>
-        <div className="max-h-[70vh] space-y-4 overflow-y-auto py-2">
+    <>
+      <IconBtn icon="settings" label="Project settings" onClick={() => setOpen(true)} />
+      {open && (
+        <Modal
+          icon="settings"
+          title="Project settings"
+          subtitle="Inspect adapter + library config. Manage destructive actions from the danger zone."
+          onClose={() => setOpen(false)}
+          footer={<Btn kind="primary" onClick={() => setOpen(false)}>Done</Btn>}
+        >
           <SummarySection project={project} />
           <IterationSettingsSection project={project} open={open} />
           <DangerZone project={project} onDeleted={() => setOpen(false)} />
-        </div>
-      </DialogContent>
-    </Dialog>
+        </Modal>
+      )}
+    </>
   );
 }
 
@@ -120,8 +102,6 @@ function IterationSettingsSection({
     { key: "render_every", label: "render_every", type: "number", min: 1, max: 100, hint: "capture every Nth step (advanced)" },
     { key: "rollout_fps", label: "rollout_fps (override)", type: "number", step: 1, min: 1, max: 240, hint: "force playback fps (blank = auto)" },
     { key: "seed", label: "seed", type: "number", min: 0, hint: "base RNG seed; iter N uses seed + N" },
-    { key: "early_stop_enabled", label: "early_stop_enabled", type: "bool", hint: "§Ship-9a: flip off for overnight runs where metric dips may mask real progress" },
-    { key: "early_stop_patience", label: "early_stop_patience", type: "number", min: 1, max: 100, hint: "consecutive no-improvement iters before truncation (default 3)" },
   ];
 
   const update = (key: keyof IterationSettings, raw: string | boolean) => {
@@ -148,91 +128,56 @@ function IterationSettingsSection({
   };
 
   return (
-    <section className="space-y-2 rounded-md border bg-muted/10 p-3 text-xs">
-      <div className="flex items-center justify-between">
-        <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
-          Iteration settings (config.toml)
-        </div>
-        {q.isLoading && <Loader2 className="h-3 w-3 animate-spin" />}
+    <section style={{ border: "1px solid var(--hairline)", borderRadius: "var(--radius-md)", background: "var(--surface-strong)", padding: 13 }}>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 4 }}>
+        <span className="rs-caption" style={{ margin: 0 }}>Iteration settings (config.toml)</span>
+        {q.isLoading && <Icon name="loader" size={12} className="rs-spin" />}
       </div>
-      <p className="text-[11px] text-muted-foreground">
-        Persistent project defaults — used whenever a run omits the override.
-      </p>
-      <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+      <p className="rs-hintline" style={{ margin: "0 0 10px" }}>Persistent project defaults — used whenever a run omits the override.</p>
+      <div className="rs-row2">
         {fields.map((f) => (
-          <div key={String(f.key)} className="grid gap-1">
-            <Label htmlFor={`set-${String(f.key)}`} className="text-[11px]">
-              {f.label}
-            </Label>
+          <Field key={String(f.key)} label={f.label} htmlFor={`set-${String(f.key)}`}>
             {f.type === "bool" ? (
-              <select
-                id={`set-${String(f.key)}`}
-                value={
-                  form[f.key] == null
-                    ? "unset"
-                    : (form[f.key] as boolean)
-                    ? "true"
-                    : "false"
-                }
-                onChange={(e) => {
-                  const v = e.target.value;
-                  update(f.key, v === "unset" ? ("" as unknown as boolean) : v === "true");
-                  if (v === "unset") {
-                    setForm((prev) => ({ ...prev, [f.key]: null }));
-                  }
-                }}
-                disabled={mut.isPending || q.isLoading}
-                className="rounded border bg-background px-2 py-1 text-xs"
-              >
-                <option value="unset">(unset / default)</option>
-                <option value="true">true</option>
-                <option value="false">false</option>
-              </select>
+              <div className="rs-select" style={{ display: "flex" }}>
+                <select
+                  id={`set-${String(f.key)}`}
+                  style={{ width: "100%" }}
+                  value={form[f.key] == null ? "unset" : (form[f.key] as boolean) ? "true" : "false"}
+                  onChange={(e) => {
+                    const v = e.target.value;
+                    update(f.key, v === "unset" ? ("" as unknown as boolean) : v === "true");
+                    if (v === "unset") {
+                      setForm((prev) => ({ ...prev, [f.key]: null }));
+                    }
+                  }}
+                  disabled={mut.isPending || q.isLoading}
+                >
+                  <option value="unset">(unset / default)</option>
+                  <option value="true">true</option>
+                  <option value="false">false</option>
+                </select>
+              </div>
             ) : (
-              <Input
+              <input
                 id={`set-${String(f.key)}`}
+                className="rs-input mono"
                 type={f.type === "number" ? "number" : "text"}
                 step={"step" in f ? f.step : undefined}
                 min={"min" in f ? f.min : undefined}
                 max={"max" in f ? f.max : undefined}
-                value={
-                  form[f.key] == null
-                    ? ""
-                    : String(form[f.key] as number | string)
-                }
+                value={form[f.key] == null ? "" : String(form[f.key] as number | string)}
                 onChange={(e) => update(f.key, e.target.value)}
                 placeholder="(unset)"
                 disabled={mut.isPending || q.isLoading}
-                className="h-7 text-xs"
               />
             )}
-            {f.hint && (
-              <p className="text-[10px] text-muted-foreground">{f.hint}</p>
-            )}
-          </div>
+            {f.hint && <p className="rs-hintline">{f.hint}</p>}
+          </Field>
         ))}
       </div>
-      <div className="flex items-center justify-end gap-2 pt-1">
-        <Button
-          size="sm"
-          variant="outline"
-          onClick={() => setForm(loaded)}
-          disabled={!dirty || mut.isPending}
-        >
-          Revert
-        </Button>
-        <Button
-          size="sm"
-          onClick={() => mut.mutate(form)}
-          disabled={!dirty || mut.isPending}
-        >
-          {mut.isPending ? (
-            <Loader2 className="h-3.5 w-3.5 animate-spin" />
-          ) : (
-            <Save className="h-3.5 w-3.5" />
-          )}
-          Save
-        </Button>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "flex-end", gap: 8, paddingTop: 12 }}>
+        <Btn kind="quiet" size="sm" onClick={() => setForm(loaded)} disabled={!dirty || mut.isPending}>Revert</Btn>
+        <Btn kind="primary" size="sm" icon={mut.isPending ? "loader" : "check"} onClick={() => mut.mutate(form)} disabled={!dirty || mut.isPending}>Save</Btn>
       </div>
     </section>
   );
@@ -258,32 +203,26 @@ function SummarySection({ project }: { project: ProjectDetail }) {
   const rows: Array<[string, string]> = [
     ["slug", project.slug],
     ["adapter", adapterShort],
-    ...(taskId ? [["task", taskId] as [string, string]] : []),
-    ...(numEnvs != null ? [["num_envs", String(numEnvs)]] : []),
-    ...(device ? [["device", device]] as [string, string][] : []),
-    ...(project.library_slug
-      ? [["library", project.library_slug] as [string, string]]
-      : []),
+    ...(taskId ? ([["task", taskId]] as [string, string][]) : []),
+    ...(numEnvs != null ? ([["num_envs", String(numEnvs)]] as [string, string][]) : []),
+    ...(device ? ([["device", device]] as [string, string][]) : []),
+    ...(project.library_slug ? ([["library", project.library_slug]] as [string, string][]) : []),
     ["created", project.created_at],
   ];
 
   return (
-    <section className="space-y-1.5 rounded-md border bg-muted/20 p-3 text-xs">
-      <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
-        Summary
-      </div>
-      <dl className="grid grid-cols-[110px_1fr] gap-x-3 gap-y-0.5 font-mono">
+    <section style={{ border: "1px solid var(--hairline)", borderRadius: "var(--radius-md)", background: "var(--surface-strong)", padding: 13 }}>
+      <span className="rs-caption">Summary</span>
+      <dl className="mono" style={{ display: "grid", gridTemplateColumns: "110px 1fr", columnGap: 12, rowGap: 3, margin: 0, fontSize: 12 }}>
         {rows.map(([k, v]) => (
-          <div key={k} className="contents">
-            <dt className="text-muted-foreground">{k}</dt>
-            <dd className="truncate">{v}</dd>
+          <div key={k} style={{ display: "contents" }}>
+            <dt style={{ color: "var(--rs-muted)" }}>{k}</dt>
+            <dd style={{ margin: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{v}</dd>
           </div>
         ))}
       </dl>
       {project.adapter_unavailable && (
-        <p className="text-[11px] text-amber-700">
-          Adapter is coming-soon — training disabled.
-        </p>
+        <p style={{ marginTop: 8, fontSize: 11.5, color: "var(--st-amber-fg)" }}>Adapter is coming-soon — training disabled.</p>
       )}
     </section>
   );
@@ -322,43 +261,28 @@ function DangerZone({
   };
 
   return (
-    <section className="space-y-2 rounded-md border border-rose-300/50 bg-rose-50/40 p-3 text-xs">
-      <div className="flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wider text-rose-700">
-        <Trash2 className="h-3 w-3" />
-        Danger zone
-      </div>
-      <p className="text-muted-foreground">
-        Deleting removes the project directory + all runs. The sculptor
-        library source is untouched. Type the slug to confirm.
+    <section style={{ border: "1px solid color-mix(in srgb, var(--st-rose) 35%, transparent)", borderRadius: "var(--radius-md)", background: "var(--st-rose-bg)", padding: 13 }}>
+      <span className="rs-caption" style={{ color: "var(--st-rose-fg)", display: "inline-flex", alignItems: "center", gap: 6 }}>
+        <Icon name="trash" size={12} /> Danger zone
+      </span>
+      <p style={{ margin: "0 0 10px", fontSize: 12, color: "var(--rs-muted)" }}>
+        Deleting removes the project directory + all runs. The sculptor library source is untouched. Type the slug to confirm.
       </p>
-      <div className="space-y-1.5">
-        <Label htmlFor="confirm-slug" className="text-[11px]">
-          Type <code className="font-mono">{project.slug}</code> to confirm
-        </Label>
-        <Input
+      <Field label={<>Type <code className="mono">{project.slug}</code> to confirm</>} htmlFor="confirm-slug">
+        <input
           id="confirm-slug"
+          className="rs-input mono"
           value={confirm}
           onChange={(e) => setConfirm(e.target.value)}
           placeholder={project.slug}
-          className="font-mono text-xs"
           disabled={del.isPending}
         />
-      </div>
-      <DialogFooter>
-        <Button
-          variant="destructive"
-          size="sm"
-          onClick={onDelete}
-          disabled={!matches || del.isPending}
-        >
-          {del.isPending ? (
-            <Loader2 className="h-3.5 w-3.5 animate-spin" />
-          ) : (
-            <Trash2 className="h-3.5 w-3.5" />
-          )}
+      </Field>
+      <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 12 }}>
+        <Btn kind="danger" size="sm" icon={del.isPending ? "loader" : "trash"} onClick={onDelete} disabled={!matches || del.isPending}>
           Delete project
-        </Button>
-      </DialogFooter>
+        </Btn>
+      </div>
     </section>
   );
 }

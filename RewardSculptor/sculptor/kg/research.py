@@ -86,6 +86,158 @@ class ResearchResponse(BaseModel):
         default=0,
         description="Count dropped because make_paper_id(id) already in KG.",
     )
+    # 2026-04-23: Claude was returning real-but-wrong arxiv IDs —
+    # e.g. `2407.14795` for "bipedal robot kicking" which is actually
+    # a Persian-text error-correction paper. Claude recalls that SOME
+    # arxiv ID exists and fabricates a justification matching the
+    # topic, but the paper at that ID is unrelated. Post-fix we fetch
+    # each ID's real metadata and drop papers whose title+abstract
+    # don't semantically match the topic.
+    papers_rejected_off_topic: int = Field(
+        default=0,
+        description=(
+            "Count dropped because arxiv metadata showed the paper is "
+            "unrelated to the topic (Claude returned a valid ID for "
+            "the wrong paper)."
+        ),
+    )
+
+
+# Minimum cosine similarity between the topic and a paper's
+# (real) title+abstract for the paper to pass the verification
+# filter. Calibrated against Sam's 2026-04-23 "bipedal robot
+# kicking" session (using all-MiniLM-L6-v2):
+#
+#   Persian spelling correction (off)      sim=0.05  DROP
+#   SEFL educational feedback (off)        sim=0.13  DROP
+#   DeepMimic (on, foundational imitation) sim=0.18  KEEP
+#   Actuator-Constrained RL (adj)          sim=0.35  KEEP
+#   RMA Rapid Motor Adaptation (adj)       sim=0.38  KEEP
+#   Expressive WBC for Humanoids (on)      sim=0.42  KEEP
+#   BeyondMimic (on)                       sim=0.42  KEEP
+#   Humanoid Parkour (on)                  sim=0.48  KEEP
+#
+# Threshold 0.15 cleanly separates the two confirmed hallucinations
+# from the DeepMimic-style low-overlap-vocabulary but on-topic
+# papers. Tighter thresholds false-positive DeepMimic; looser ones
+# keep SEFL. The signal isn't perfect — if a clearer test emerges,
+# re-tune. Users can also raise max_papers to widen the net.
+_MIN_TOPIC_SIMILARITY = 0.15
+
+
+def _fetch_arxiv_metadata_batch(
+    arxiv_ids: list[str], *, timeout_s: float = 30.0,
+) -> dict[str, Optional[dict]]:
+    """Batch-fetch title + abstract for a list of arxiv IDs.
+
+    Returns `{arxiv_id: {"title": ..., "abstract": ...} | None}`.
+    None values mean the API didn't return that paper (rate-limited,
+    ID doesn't exist, or transient failure); caller decides whether
+    to keep or drop the entry.
+    """
+    out: dict[str, Optional[dict]] = {aid: None for aid in arxiv_ids}
+    if not arxiv_ids:
+        return out
+    try:
+        import arxiv
+        import socket
+
+        socket.setdefaulttimeout(timeout_s)
+        try:
+            client = arxiv.Client(
+                page_size=max(len(arxiv_ids), 1),
+                delay_seconds=3.0, num_retries=1,
+            )
+            search = arxiv.Search(id_list=list(arxiv_ids))
+            for result in client.results(search):
+                entry_id = str(result.entry_id or "")
+                # entry_id looks like `http://arxiv.org/abs/2407.14795v1`
+                aid = entry_id.rsplit("/", 1)[-1]
+                aid = re.sub(r"v\d+$", "", aid, flags=re.IGNORECASE)
+                if aid in out:
+                    out[aid] = {
+                        "title": str(result.title or "").strip(),
+                        "abstract": str(result.summary or "").strip(),
+                    }
+        finally:
+            socket.setdefaulttimeout(None)
+    except Exception as e:  # noqa: BLE001 — arxiv rate-limits are common; don't hard-fail research
+        log.warning(
+            "research_topic: arxiv batch metadata fetch failed "
+            "(%s); skipping off-topic verification",
+            f"{type(e).__name__}: {e}",
+        )
+    return out
+
+
+def _verify_topic_match(
+    topic: str, papers: list["ResearchPaper"],
+    *, min_similarity: float = _MIN_TOPIC_SIMILARITY,
+    metadata_fn=None,
+) -> tuple[list["ResearchPaper"], int]:
+    """Drop papers whose real arxiv title+abstract is semantically
+    distant from `topic`. Returns (kept, dropped_count).
+
+    `metadata_fn` is injected for tests; production default is the
+    batch arxiv fetch defined above. When metadata fetch fails or
+    returns None for a given paper, we KEEP it (fail-open) — an
+    arxiv outage shouldn't wipe out the user's research query.
+    """
+    if not papers:
+        return papers, 0
+
+    fetch = metadata_fn or _fetch_arxiv_metadata_batch
+    metadata_by_id = fetch([p.arxiv_id for p in papers])
+
+    try:
+        from sculptor.kg.query import _embed_text
+        topic_vec = _embed_text(topic)
+    except Exception as e:  # noqa: BLE001 — embedder unavailable, skip verification
+        log.warning(
+            "research_topic: embedder unavailable (%s); skipping "
+            "off-topic verification",
+            f"{type(e).__name__}: {e}",
+        )
+        return papers, 0
+
+    import numpy as np
+
+    kept: list[ResearchPaper] = []
+    dropped = 0
+    for p in papers:
+        meta = metadata_by_id.get(p.arxiv_id)
+        if meta is None:
+            # Fail-open: keep the paper, log so user sees the gap.
+            log.info(
+                "research_topic: %s arxiv metadata unavailable; "
+                "keeping without topic-match verification",
+                p.arxiv_id,
+            )
+            kept.append(p)
+            continue
+        real_title = meta.get("title", "") or ""
+        real_abstract = meta.get("abstract", "") or ""
+        # Embed title + first ~400 chars of abstract — long abstracts
+        # dilute the signal and cost no-op encoding time.
+        text_for_embed = f"{real_title}. {real_abstract[:400]}".strip(". ")
+        if not text_for_embed:
+            kept.append(p)
+            continue
+        paper_vec = _embed_text(text_for_embed)
+        sim = float(np.dot(topic_vec, paper_vec))
+        if sim < min_similarity:
+            log.warning(
+                "research_topic: dropping %s off-topic (sim=%.2f < %.2f): "
+                "real_title=%r; Claude claimed=%r",
+                p.arxiv_id, sim, min_similarity,
+                real_title[:80], p.title[:80],
+            )
+            dropped += 1
+            continue
+        # Replace Claude's (possibly hallucinated) title with the real one.
+        p.title = real_title or p.title
+        kept.append(p)
+    return kept, dropped
 
 
 def _normalize_arxiv_id(s: str) -> Optional[str]:
@@ -227,6 +379,20 @@ def research_topic(
             if owns_store:
                 store.close()
 
+    # 2026-04-23 off-topic-hallucination guard. Claude recalls valid
+    # arxiv IDs but sometimes attaches the wrong paper to a topic
+    # ("2407.14795 is about bipedal robot kicking" — actually Persian
+    # spell-correction). Fetch the real title+abstract from arxiv,
+    # embed vs. topic, drop below-threshold hits. Fail-open on arxiv
+    # outage or embedder failure.
+    kept, off_topic_dropped = _verify_topic_match(topic, kept)
+    if off_topic_dropped:
+        log.info(
+            "research_topic: %d paper(s) dropped as off-topic after "
+            "arxiv metadata verification",
+            off_topic_dropped,
+        )
+
     # Honor the soft cap.
     kept.sort(key=lambda p: -p.relevance_score)
     kept = kept[:max_papers]
@@ -236,6 +402,7 @@ def research_topic(
         coverage_note=result.coverage_note,
         papers_returned_by_claude=claude_count,
         papers_deduped_against_kg=dedup_count,
+        papers_rejected_off_topic=off_topic_dropped,
     )
 
 

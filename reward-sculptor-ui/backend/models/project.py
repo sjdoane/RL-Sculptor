@@ -76,6 +76,19 @@ class ProjectSummary(BaseModel):
     # that no longer exists in `sculptor.adapters.ADAPTER_REGISTRY`.
     # UI shows a banner; "upgrade" is a fork (create parallel project).
     migration_warning: Optional[str] = None
+    # §Ship 22b (re-skin, Finding A): additive enrichment so the Dashboard
+    # / Projects cards can show project identity + latest metric without an
+    # N+1 detail fetch. All Optional/defaulted for back-compat. The config
+    # fields are filled by ProjectStore.list() (already loaded via get());
+    # the metric fields are filled by the GET /projects route from the
+    # JobManager's latest sculpt_run for the project (same source the
+    # dashboard uses).
+    adapter_class: Optional[str] = None
+    library_slug: Optional[str] = None
+    num_envs: Optional[int] = None
+    device: Optional[str] = None
+    primary_metric: Optional[float] = None
+    primary_metric_history: list[Optional[float]] = Field(default_factory=list)
 
 
 class ProjectDetail(ProjectSummary):
@@ -126,7 +139,7 @@ class IterationSettings(BaseModel):
     render_every: Optional[Annotated[int, Field(ge=1, le=100)]] = None
     rollout_fps: Optional[Annotated[float, Field(gt=0, le=240)]] = None
     seed: Optional[Annotated[int, Field(ge=0, le=2**31 - 1)]] = None
-    # §Ship-9a: early-stop knobs (project defaults — per-run in RunParams).
+    # Legacy early-stop knobs retained as no-op compatibility fields.
     early_stop_enabled: Optional[bool] = None
     early_stop_patience: Optional[Annotated[int, Field(ge=1, le=100)]] = None
 

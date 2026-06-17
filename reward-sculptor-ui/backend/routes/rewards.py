@@ -12,7 +12,7 @@ belt-and-braces check for race conditions between status probe and PUT.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, Request, status
 from fastapi.responses import JSONResponse
@@ -72,6 +72,66 @@ def _rewards_dir(store: ProjectStore, slug: str) -> Path | None:
     return Path(detail.project_dir) / "rewards"
 
 
+def _resolve_rewards_dir(
+    store: ProjectStore, slug: str, stage: Optional[str],
+) -> Path | None:
+    """§Ship 21: when `stage` is "<mission_slug>/<stage_name>", return
+    that stage's rewards/ dir under .missions/<m>/stages/<s>/rewards/.
+    Each mission stage scaffolds its own sculpt mini-project with
+    independent reward versions; the Runs detail pane needs to show
+    them when a stage row is selected. Falls back to the project-
+    scoped rewards dir when stage is None.
+    """
+    detail = store.get(slug)
+    if detail is None:
+        return None
+    if stage is None:
+        return Path(detail.project_dir) / "rewards"
+    # Format guard: must be exactly "<mission_slug>/<stage_name>" with
+    # neither half allowed to traverse upward.
+    parts = stage.split("/")
+    if len(parts) != 2:
+        return None
+    mission_slug, stage_name = parts
+    if not mission_slug or not stage_name:
+        return None
+    if any(p in ("..", ".", "") or "\\" in p for p in (mission_slug, stage_name)):
+        return None
+    return (
+        Path(detail.project_dir) / ".missions" / mission_slug
+        / "stages" / stage_name / "rewards"
+    )
+
+
+def _resolve_runs_dir(
+    store: ProjectStore, slug: str, stage: Optional[str],
+) -> Path | None:
+    """§Ship 21d: the `runs/` dir whose `iter_N/diagnosis.json` files
+    explain a reward version's edit. Mirrors `_resolve_rewards_dir`'s
+    path + traversal guards. For a mission stage, the diagnosis lives
+    under `.missions/<m>/stages/<s>/runs/`, NOT the project root —
+    without this, the "Why this edit?" panel 404s for every stage
+    reward version.
+    """
+    detail = store.get(slug)
+    if detail is None:
+        return None
+    if stage is None:
+        return Path(detail.project_dir) / "runs"
+    parts = stage.split("/")
+    if len(parts) != 2:
+        return None
+    mission_slug, stage_name = parts
+    if not mission_slug or not stage_name:
+        return None
+    if any(p in ("..", ".", "") or "\\" in p for p in (mission_slug, stage_name)):
+        return None
+    return (
+        Path(detail.project_dir) / ".missions" / mission_slug
+        / "stages" / stage_name / "runs"
+    )
+
+
 # ── list ──────────────────────────────────────────────────────────────
 @router.get(
     "/projects/{slug}/rewards",
@@ -79,21 +139,38 @@ def _rewards_dir(store: ProjectStore, slug: str) -> Path | None:
     responses={404: {"model": ProblemDetail}},
 )
 def list_rewards(
-    slug: str, store: ProjectStore = Depends(get_store)
+    slug: str,
+    stage: Optional[str] = None,
+    store: ProjectStore = Depends(get_store),
 ) -> Any:
-    rewards_dir = _rewards_dir(store, slug)
+    """§Ship 21: optional `?stage=<mission_slug>/<stage_name>` query
+    routes to a specific mission stage's reward versions instead of
+    the project-global ones. Falls back to project rewards when the
+    query is absent.
+    """
+    rewards_dir = _resolve_rewards_dir(store, slug, stage)
     if rewards_dir is None:
         return _problem(
             status.HTTP_404_NOT_FOUND,
-            "project not found",
-            detail=f"no project with slug {slug!r}",
+            "project not found" if stage is None else "stage rewards path invalid",
+            detail=(
+                f"no project with slug {slug!r}"
+                if stage is None
+                else f"stage={stage!r} did not resolve to a stage rewards dir"
+            ),
             type_="/problems/not-found",
         )
-    history = store.read_metric_history(slug)
+    if stage is not None and not rewards_dir.is_dir():
+        # Stage exists but rewards/ hasn't been scaffolded yet — return
+        # empty list so the UI shows "no rewards yet" rather than 404.
+        return []
+    # Per-stage rewards don't have a project-global metric history;
+    # pass an empty list (each stage's metric history lives on the
+    # corresponding mission_stage_run job's events).
+    history = store.read_metric_history(slug) if stage is None else []
     out: list[RewardVersionSummary] = []
     for n, path in reward_store.list_versions(rewards_dir):
         out.append(reward_store.summarize_version(rewards_dir, n, path, history))
-    # Newest first.
     out.sort(key=lambda s: s.version, reverse=True)
     return out
 
@@ -107,23 +184,35 @@ def list_rewards(
 def get_reward(
     slug: str,
     version: int,
+    stage: Optional[str] = None,
     store: ProjectStore = Depends(get_store),
 ) -> Any:
-    rewards_dir = _rewards_dir(store, slug)
+    """§Ship 21: optional `?stage=<mission_slug>/<stage_name>` query
+    routes to a specific mission stage's reward version. See
+    list_rewards for the resolution rules."""
+    rewards_dir = _resolve_rewards_dir(store, slug, stage)
     if rewards_dir is None:
         return _problem(
             status.HTTP_404_NOT_FOUND,
-            "project not found",
-            detail=f"no project with slug {slug!r}",
+            "project not found" if stage is None else "stage rewards path invalid",
+            detail=(
+                f"no project with slug {slug!r}"
+                if stage is None
+                else f"stage={stage!r} did not resolve to a stage rewards dir"
+            ),
             type_="/problems/not-found",
         )
-    history = store.read_metric_history(slug)
+    history = store.read_metric_history(slug) if stage is None else []
     detail = reward_store.load_detail(rewards_dir, version, history)
     if detail is None:
         return _problem(
             status.HTTP_404_NOT_FOUND,
             "reward version not found",
-            detail=f"no v{version}.py in project {slug!r}",
+            detail=(
+                f"no v{version}.py in stage {stage!r}"
+                if stage is not None
+                else f"no v{version}.py in project {slug!r}"
+            ),
             type_="/problems/not-found",
         )
     return detail
@@ -464,11 +553,17 @@ def prompt_reward_edit(
 def get_reward_diagnosis(
     slug: str,
     version: int,
+    stage: Optional[str] = None,
     store: ProjectStore = Depends(get_store),
 ) -> Any:
     """Return the diagnosis.json that triggered the edit producing
     `v<version>.py`. Mapping: v<n>.py is written by `iter_<n-1>`, so
-    the diagnosis lives at `<project>/runs/iter_<n-1>/diagnosis.json`.
+    the diagnosis lives at `<runs_root>/iter_<n-1>/diagnosis.json`.
+
+    §Ship 21d: `?stage=<mission_slug>/<stage_name>` routes the
+    `<runs_root>` to the mission stage's runs dir
+    (`.missions/<m>/stages/<s>/runs/`) so the "Why this edit?" panel
+    works for stage reward versions, not just project rewards.
 
     Returns the raw payload as a dict. 404 when the project, version,
     or diagnosis file is missing — common cases: v0 (no triggering
@@ -495,9 +590,19 @@ def get_reward_diagnosis(
             ),
             type_="/problems/not-found",
         )
-    diag_path = (
-        Path(detail.project_dir) / "runs" / f"iter_{version - 1}" / "diagnosis.json"
-    )
+    runs_root = _resolve_runs_dir(store, slug, stage)
+    if runs_root is None:
+        return _problem(
+            status.HTTP_404_NOT_FOUND,
+            "stage diagnosis path invalid" if stage else "project not found",
+            detail=(
+                f"stage={stage!r} did not resolve to a stage runs dir"
+                if stage
+                else f"no project with slug {slug!r}"
+            ),
+            type_="/problems/not-found",
+        )
+    diag_path = runs_root / f"iter_{version - 1}" / "diagnosis.json"
     if not diag_path.is_file():
         return _problem(
             status.HTTP_404_NOT_FOUND,

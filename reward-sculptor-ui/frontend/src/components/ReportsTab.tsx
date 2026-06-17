@@ -1,17 +1,10 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { Download, FileText, Loader2, Play, RefreshCw } from "lucide-react";
 import { toast } from "sonner";
 
-import { Button } from "@/components/ui/button";
-import {
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
-} from "@/components/ui/card";
+import { Icon } from "@/components/rs/icon";
+import { Btn, EmptyState } from "@/components/rs/primitives";
 import { ApiError } from "@/lib/api";
 import { qk } from "@/lib/queryKeys";
 
@@ -35,10 +28,31 @@ async function fetchReportMd(slug: string): Promise<string> {
   return await r.text();
 }
 
+// §Ship 25b (H2): decomposition-quality telemetry per mission.
+interface MissionQualityRecord {
+  mission_slug: string;
+  goal: string;
+  n_stages_at_start: number;
+  n_stages_final: number;
+  stages_executed: number;
+  stages_succeeded: number;
+  stage_success_rate: number | null;
+  redecompositions: number;
+  iterations_total: number;
+  completed: boolean;
+  halted_reason: string | null;
+  recorded_at: string;
+}
+
+async function fetchMissionQuality(slug: string): Promise<MissionQualityRecord[]> {
+  const r = await fetch(`/api/projects/${slug}/reports/mission-quality`);
+  if (!r.ok) return [];
+  const body = (await r.json()) as { missions?: MissionQualityRecord[] };
+  return body.missions ?? [];
+}
+
 async function buildReport(slug: string): Promise<void> {
-  const r = await fetch(`/api/projects/${slug}/reports/build`, {
-    method: "POST",
-  });
+  const r = await fetch(`/api/projects/${slug}/reports/build`, { method: "POST" });
   if (!r.ok) {
     let body: Record<string, unknown> = {};
     try {
@@ -66,136 +80,152 @@ export function ReportsTab({ slug }: { slug: string }) {
     mutationFn: () => buildReport(slug),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: [...qk.project(slug), "report"] });
-      toast.success("Report built", {
-        description: "final_report.md + final.mp4 regenerated",
-      });
+      toast.success("Report built", { description: "final_report.md + final.mp4 regenerated" });
     },
     onError: (err) => {
-      const detail =
-        err instanceof ApiError
-          ? err.problem.detail ?? err.problem.title
-          : err.message;
+      const detail = err instanceof ApiError ? err.problem.detail ?? err.problem.title : err.message;
       toast.error("Report build failed", { description: detail });
     },
   });
 
+  const quality = useQuery<MissionQualityRecord[]>({
+    queryKey: [...qk.project(slug), "report", "mission-quality"],
+    queryFn: () => fetchMissionQuality(slug),
+    staleTime: 10_000,
+  });
+
   const hasReport = (md.data ?? "").trim().length > 0;
   const mp4Url = `/api/projects/${slug}/reports/final.mp4`;
+  const mdUrl = `/api/projects/${slug}/reports/final_report.md`;
 
   return (
-    <div className="flex flex-col gap-4">
-      <Card>
-        <CardHeader className="flex-row items-center justify-between gap-2 space-y-0 py-3">
+    <div className="rs-scroll">
+      <div className="rs-pad">
+        <div className="rs-flex-between rs-wrap rs-gap-12" style={{ marginBottom: 22 }}>
           <div>
-            <CardTitle className="text-sm">Reports</CardTitle>
-            <CardDescription className="text-[11px]">
-              Final report + timelapse over a completed sculpt run
-            </CardDescription>
+            <div className="rs-eyebrow">final_report.md</div>
+            <h2 className="rs-h2" style={{ marginTop: 6 }}>Reports</h2>
           </div>
-          <div className="flex items-center gap-2">
-            <Button
-              size="sm"
-              variant={hasReport ? "outline" : "default"}
-              onClick={() => build.mutate()}
-              disabled={build.isPending}
-            >
-              {build.isPending ? (
-                <>
-                  <Loader2 className="h-4 w-4 animate-spin" /> Building…
-                </>
-              ) : (
-                <>
-                  <RefreshCw /> {hasReport ? "Rebuild" : "Build report"}
-                </>
-              )}
-            </Button>
+          <div className="rs-flex rs-gap-8">
             {hasReport && (
-              <a
-                href={`/api/projects/${slug}/reports/final_report.md`}
-                download="final_report.md"
-                className="inline-flex items-center gap-1 rounded-md border border-input bg-background px-2.5 py-1 text-xs hover:bg-accent"
+              <Btn
+                kind="ghost"
+                icon="copy"
+                onClick={async () => {
+                  try {
+                    await navigator.clipboard.writeText(md.data ?? "");
+                    toast.success("Markdown copied");
+                  } catch {
+                    toast.error("Clipboard unavailable");
+                  }
+                }}
               >
-                <Download className="h-3.5 w-3.5" /> Markdown
+                Copy markdown
+              </Btn>
+            )}
+            {hasReport && (
+              <a href={mdUrl} download="final_report.md" className="rs-btn rs-btn-ghost">
+                <Icon name="download" size={15} />
+                Download
               </a>
             )}
+            <Btn kind={hasReport ? "ghost" : "primary"} icon="refresh-cw" disabled={build.isPending} onClick={() => build.mutate()}>
+              {build.isPending ? "Building…" : hasReport ? "Rebuild" : "Build report"}
+            </Btn>
           </div>
-        </CardHeader>
-      </Card>
+        </div>
 
-      {md.isLoading && (
-        <p className="text-sm text-muted-foreground">Loading report…</p>
-      )}
+        {(quality.data?.length ?? 0) > 0 && (
+          <div className="rs-card" style={{ marginBottom: 22 }}>
+            <div className="rs-card-head">
+              <div className="rs-card-title">
+                <Icon name="layers" size={16} />Mission quality
+              </div>
+              <span className="rs-sub" style={{ fontSize: 12 }}>
+                decomposition telemetry
+              </span>
+            </div>
+            <div className="rs-card-pad rs-vgap-8">
+              {quality.data!.map((m) => (
+                <div
+                  key={m.mission_slug}
+                  className="rs-flex rs-gap-12 rs-wrap"
+                  style={{
+                    border: "1px solid var(--hairline)",
+                    borderRadius: "var(--radius-md)",
+                    padding: "10px 12px",
+                    background: "var(--canvas-soft)",
+                    alignItems: "baseline",
+                    fontSize: 12.5,
+                  }}
+                >
+                  <span style={{ fontWeight: 500, minWidth: 140 }} title={m.goal}>
+                    {m.mission_slug}
+                  </span>
+                  <span className="rs-num">
+                    stages {m.stages_succeeded}/{m.stages_executed}
+                    {m.stage_success_rate != null &&
+                      ` (${Math.round(m.stage_success_rate * 100)}%)`}
+                  </span>
+                  <span className="rs-num">
+                    {m.n_stages_at_start === m.n_stages_final
+                      ? `${m.n_stages_final} planned`
+                      : `${m.n_stages_at_start}→${m.n_stages_final} planned`}
+                  </span>
+                  <span className="rs-num">
+                    {m.redecompositions} redecompose{m.redecompositions === 1 ? "" : "s"}
+                  </span>
+                  <span className="rs-num">{m.iterations_total} iters</span>
+                  <span
+                    style={{
+                      marginLeft: "auto",
+                      color: m.completed ? "var(--st-emerald)" : "var(--st-amber)",
+                      fontWeight: 500,
+                    }}
+                  >
+                    {m.completed ? "completed" : (m.halted_reason ?? "halted")}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
 
-      {md.error && !md.isLoading && (
-        <Card className="border-destructive/40 bg-destructive/5">
-          <CardContent className="p-4 text-sm text-destructive">
-            {(md.error as Error).message}
-          </CardContent>
-        </Card>
-      )}
-
-      {!md.isLoading && !md.error && !hasReport && (
-        <Card>
-          <CardContent className="flex flex-col items-center gap-2 p-8 text-center">
-            <FileText className="h-8 w-8 text-muted-foreground" />
-            <p className="text-sm font-medium">No report built yet</p>
-            <p className="text-xs text-muted-foreground">
-              Complete a sculpt run, then click "Build report".
-            </p>
-          </CardContent>
-        </Card>
-      )}
-
-      {hasReport && (
-        <>
-          <TimelapseCard slug={slug} mp4Url={mp4Url} />
-          <Card>
-            <CardHeader className="py-3">
-              <CardTitle className="text-sm">
-                <FileText className="mr-1 inline h-3.5 w-3.5 align-text-bottom" />
-                final_report.md
-              </CardTitle>
-            </CardHeader>
-            <CardContent className="prose prose-sm max-w-none dark:prose-invert">
-              <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                {md.data ?? ""}
-              </ReactMarkdown>
-            </CardContent>
-          </Card>
-        </>
-      )}
+        {md.isLoading ? (
+          <p className="rs-sub">Loading report…</p>
+        ) : md.error ? (
+          <div className="rs-banner err">
+            <Icon name="alert-triangle" size={17} />
+            <span className="rs-grow">{(md.error as Error).message}</span>
+          </div>
+        ) : !hasReport ? (
+          <div className="rs-card">
+            <EmptyState
+              icon="file-text"
+              title="No report built yet"
+              sub="Complete a sculpt run, then click Build report to render final_report.md + the timelapse."
+            />
+          </div>
+        ) : (
+          <div className="rs-report rs-card rs-card-pad" style={{ padding: "32px 36px" }}>
+            <div className="rs-viewer" style={{ marginBottom: 24 }}>
+              <div className="rs-viewer-bar">
+                <div className="rs-card-title"><Icon name="video" size={16} />final.mp4</div>
+                <a href={mp4Url} download="final.mp4" className="rs-btn rs-btn-quiet rs-btn-sm">
+                  <Icon name="download" size={14} />MP4
+                </a>
+              </div>
+              <video src={mp4Url} className="rs-viewer-stage" style={{ width: "100%", aspectRatio: "16/9", background: "#16150f" }} controls playsInline preload="metadata">
+                <track kind="captions" />
+              </video>
+            </div>
+            <div className="rs-md">
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>{md.data ?? ""}</ReactMarkdown>
+            </div>
+          </div>
+        )}
+      </div>
     </div>
-  );
-}
-
-function TimelapseCard({ mp4Url }: { slug: string; mp4Url: string }) {
-  return (
-    <Card className="overflow-hidden">
-      <CardHeader className="flex-row items-center justify-between gap-2 space-y-0 py-3">
-        <CardTitle className="text-sm">
-          <Play className="mr-1 inline h-3.5 w-3.5 align-text-bottom" />
-          Timelapse
-        </CardTitle>
-        <a
-          href={mp4Url}
-          download="final.mp4"
-          className="inline-flex items-center gap-1 rounded-md border border-input bg-background px-2.5 py-1 text-xs hover:bg-accent"
-        >
-          <Download className="h-3.5 w-3.5" /> MP4
-        </a>
-      </CardHeader>
-      <CardContent className="p-0">
-        <video
-          src={mp4Url}
-          className="aspect-video w-full bg-slate-950"
-          controls
-          playsInline
-          preload="metadata"
-        >
-          <track kind="captions" />
-        </video>
-      </CardContent>
-    </Card>
   );
 }
 

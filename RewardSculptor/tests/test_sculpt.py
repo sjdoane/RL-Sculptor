@@ -2,7 +2,7 @@
 
 No live LLM. No training. Exercises:
   - `sculpt_init` scaffolds a project with the right files + git commit.
-  - Early-stop heuristic.
+  - Removed metric-plateau auto-kill compatibility behavior.
   - `sculpt_run --dry-run` end-to-end by stubbing the adapter's train +
     rollout methods (no gymnasium / SB3 in the hot path) and going through
     the dry-run diagnose + edit shortcuts.
@@ -32,7 +32,7 @@ from sculptor.sculpt import (
 )
 
 
-# ── Early-stop unit ──────────────────────────────────────────────────────
+# ── Metric-plateau auto-kill compatibility ───────────────────────────────
 def test_early_stop_false_when_improving():
     assert _should_early_stop([1.0, 2.0, 3.0, 4.0]) is False
 
@@ -42,9 +42,9 @@ def test_early_stop_false_with_too_few_iterations():
     assert _should_early_stop([1.0, 2.0, 3.0]) is False
 
 
-def test_early_stop_true_after_three_non_improving():
-    # best-before = 5, last three are (4, 4.5, 4.9) — none exceed 5.
-    assert _should_early_stop([1.0, 5.0, 4.0, 4.5, 4.9]) is True
+def test_early_stop_false_after_three_non_improving():
+    # Metric-plateau auto-kill is disabled; reward dips are not halt signals.
+    assert _should_early_stop([1.0, 5.0, 4.0, 4.5, 4.9]) is False
 
 
 def test_early_stop_false_when_last_window_beats_prior():
@@ -455,7 +455,7 @@ class _TestAdapterStub(_StubAdapter):  # dotted path consumable by load_adapter
 
 def test_sculpt_run_dry_run_end_to_end(tmp_path: Path, monkeypatch):
     """3 iterations, dry-run, stub adapter — exercises the full orchestration
-    path including CHANGELOG, provenance, git commits, early stop."""
+    path including CHANGELOG, provenance, git commits."""
     global _SCHEDULE
     _SCHEDULE = [1.0, 5.0, 3.0, 4.0, 4.5]  # improvement, then stall
     proj = _write_minimal_project(tmp_path)
@@ -503,20 +503,20 @@ def test_sculpt_run_dry_run_end_to_end(tmp_path: Path, monkeypatch):
     assert len(iter_commits) == 3
 
 
-def test_sculpt_run_early_stops_after_three_non_improving(tmp_path: Path):
+def test_sculpt_run_does_not_stop_after_three_non_improving(tmp_path: Path):
     global _SCHEDULE
-    # best is iter 0 (10). Iters 1-3 all fall short. Should early-stop after
-    # iter 3 (len(history)=4, patience=3).
+    # best is iter 0 (10). Iters 1-3 all fall short, but metric dips are
+    # no longer an auto-kill criterion.
     _SCHEDULE = [10.0, 1.0, 2.0, 3.0, 9.0]
     proj = _write_minimal_project(tmp_path)
     cfg = proj / "config.toml"
 
     result = sculpt_run(
         config_path=cfg, behavior_goal="dummy goal",
-        iterations=10, resume=False, no_kg=True, dry_run=True,
+        iterations=5, resume=False, no_kg=True, dry_run=True,
     )
-    assert result.early_stopped is True
-    assert result.iterations_run == 4
+    assert result.early_stopped is False
+    assert result.iterations_run == 5
 
 
 def test_sculpt_run_resume_picks_up_at_latest_v(tmp_path: Path):
@@ -655,17 +655,15 @@ def test_rollout_or_resume_skips_when_artifacts_present(tmp_path: Path):
     assert adapter.called, "missing behavior.json must trigger re-run"
 
 
-# ── §Ship-9a: configurable early-stop ─────────────────────────────────────
-def test_should_early_stop_default_fires_after_3_flat() -> None:
-    """Pre-Ship-9 behavior preserved: patience=3, enabled=True."""
+# ── Metric-plateau early-stop compatibility ───────────────────────────────
+def test_should_early_stop_default_never_fires() -> None:
+    """Metric-plateau auto-kill is disabled even with legacy defaults."""
     from sculptor.sculpt import _should_early_stop
-    assert _should_early_stop([1.0, 1.5, 2.0, 1.8, 1.9, 1.7]) is True
+    assert _should_early_stop([1.0, 1.5, 2.0, 1.8, 1.9, 1.7]) is False
 
 
 def test_should_early_stop_disabled_never_fires() -> None:
-    """§Ship-9a: enabled=False disables the check regardless of history.
-    Addresses Sam's feedback that the 3-iter heuristic can truncate runs
-    where reward dips mask genuine behavioral improvement."""
+    """Legacy enabled=False remains accepted and never fires."""
     from sculptor.sculpt import _should_early_stop
     assert _should_early_stop(
         [1.0, 0.5, 0.2, 0.1, 0.05, 0.01], enabled=False,
@@ -673,41 +671,38 @@ def test_should_early_stop_disabled_never_fires() -> None:
 
 
 def test_should_early_stop_patience_zero_disables() -> None:
-    """patience=0 disables instead of firing immediately — matches
-    the CLI / config semantics where 0 means 'off'."""
+    """Legacy patience=0 remains accepted and never fires."""
     from sculptor.sculpt import _should_early_stop
     assert _should_early_stop([1.0, 0.5, 0.2], patience=0) is False
 
 
-def test_should_early_stop_patience_5_waits_longer() -> None:
-    """Larger patience means more flat iters before firing."""
+def test_should_early_stop_patience_5_never_fires() -> None:
+    """Legacy patience overrides are ignored by the disabled auto-kill."""
     from sculptor.sculpt import _should_early_stop
-    # 5 iters after the peak of 2.0 — still below patience=5, no fire.
     assert _should_early_stop(
         [1.0, 2.0, 1.5, 1.4, 1.3, 1.2], patience=5,
     ) is False
-    # 6 flat-or-worse iters → fires.
     assert _should_early_stop(
         [1.0, 2.0, 1.5, 1.4, 1.3, 1.2, 1.1], patience=5,
-    ) is True
+    ) is False
 
 
 def test_should_early_stop_handles_nones_in_history() -> None:
-    """None entries are skipped; don't crash, don't count."""
+    """None entries are accepted; history still never halts the run."""
     from sculptor.sculpt import _should_early_stop
     assert _should_early_stop([None, None, None, None]) is False
-    assert _should_early_stop([5.0, None, 3.0, None, 2.0, 1.0]) is True
+    assert _should_early_stop([5.0, None, 3.0, None, 2.0, 1.0]) is False
 
 
 def test_should_early_stop_negative_patience_disables() -> None:
-    """Patience < 1 (incl. negative) disables instead of firing."""
+    """Legacy negative patience remains accepted and never fires."""
     from sculptor.sculpt import _should_early_stop
     assert _should_early_stop([5.0, 1.0, 0.5], patience=-1) is False
 
 
 def test_config_template_early_stop_defaults_parse() -> None:
     """Fresh `sculpt init` writes a config.toml whose [iteration] has
-    the Ship-9a defaults parseable by tomllib."""
+    legacy early-stop compatibility fields parseable by tomllib."""
     import tempfile
     import tomllib
     from pathlib import Path as _P
@@ -718,32 +713,24 @@ def test_config_template_early_stop_defaults_parse() -> None:
         with (proj / "config.toml").open("rb") as f:
             cfg = tomllib.load(f)
         iter_cfg = cfg["iteration"]
-        assert iter_cfg["early_stop_enabled"] is True
+        assert iter_cfg["early_stop_enabled"] is False
         assert iter_cfg["early_stop_patience"] == 3
 
 
-def test_sculpt_run_honors_disabled_early_stop_and_runs_full_budget(
+def test_sculpt_run_ignores_legacy_early_stop_and_runs_full_budget(
     tmp_path, monkeypatch,
 ):
-    """§Ship-9a integration: even when the primary_metric is strictly
-    decreasing every iter, `early_stop_enabled = false` lets the loop
-    run to completion instead of truncating at iter 4."""
+    """Even when the primary_metric is strictly decreasing every iter,
+    the removed metric-plateau auto-kill lets the loop run to completion."""
     from sculptor.sculpt import sculpt_init, sculpt_run
 
-    # Scaffold a project + immediately flip early_stop off in config.
     proj = sculpt_init(tmp_path / "long_overnight", adapter="gym_sb3")
     config_path = proj / "config.toml"
-    text = config_path.read_text(encoding="utf-8")
-    # The CONFIG_TEMPLATE ships early_stop_enabled = true; flip it here.
-    text = text.replace(
-        "early_stop_enabled = true", "early_stop_enabled = false"
-    )
-    config_path.write_text(text, encoding="utf-8")
 
     # Force --dry-run so we never hit Claude / training. Dry-run also
-    # caps training steps at 1000 but still runs _run_one_iter which
-    # in turn calls _should_early_stop. Patch the heavy adapter methods
-    # to return stub results so each iter finishes in ~1ms.
+    # caps training steps at 1000 but still runs _run_one_iter. Patch the
+    # heavy adapter methods to return stub results so each iter finishes
+    # in ~1ms.
     from sculptor.adapters.base import TrainResult, RolloutResult
 
     class _StubAdapter:
@@ -809,8 +796,7 @@ def test_sculpt_run_honors_disabled_early_stop_and_runs_full_budget(
     result = sculpt_run(
         config_path=config_path,
         behavior_goal="stub goal",
-        iterations=6,  # 6 strictly-decreasing iters — default early-stop
-                        # would fire at iter ~4. With disabled, runs all 6.
+        iterations=6,  # 6 strictly-decreasing iters; runs full budget.
         dry_run=True,
         no_kg=True,
     )

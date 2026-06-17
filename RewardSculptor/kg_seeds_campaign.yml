@@ -1,0 +1,91 @@
+# §Ship 30 — campaign KG expansion seeds (pre-E4).
+#
+# Curated + LLM-researched (sculptor.kg.research over six campaign-
+# aligned topics, deduped against the existing 80-paper shared KG,
+# arXiv-verified) and human-vetted for APPLICABILITY: every entry must
+# plausibly ground a diagnose/edit decision for the campaign's
+# benchmark domains (humanoid rhythmic + ballistic skills, quadruped
+# gait, reward-design fundamentals, the LLM-reward literature).
+# Committed for reproducibility: this file IS the provenance of the
+# campaign-era KG delta (R1).
+#
+# Ingest:  SCULPTOR_KG_PATH=<shared> ingest_from_seeds(this file)
+# Extract: sculpt kg extract --all
+
+papers:
+  # ── periodic / rhythmic locomotion (the floss benchmark's home turf)
+  - arxiv_id: "2011.01387"
+    title: "Sim-to-Real Learning of All Common Bipedal Gaits via Periodic Reward Composition"
+    rationale: "THE periodic-reward-composition paper (Siekmann/Cassie): phase-indexed reward terms for rhythmic motion — directly grounds floss-style criteria and edits."
+  - arxiv_id: "1903.09537"
+    title: "Iterative Reinforcement Learning Based Design of Dynamic Locomotion Skills for Cassie"
+    rationale: "Iterative reward design for dynamic bipedal skills — methodological ancestor of the sculptor's own loop."
+  - arxiv_id: "2401.16889"
+    title: "Reinforcement Learning for Versatile, Dynamic, and Robust Bipedal Locomotion Control"
+    rationale: "Modern bipedal reward decomposition (versatile gait suite) with periodic clock terms."
+
+  # ── LLM-based reward design (the literature line the campaign engages)
+  - arxiv_id: "2310.12931"
+    title: "Eureka: Human-Level Reward Design via Coding Large Language Models"
+    rationale: "The E3 baseline's source paper; also grounds diagnose on LLM-authored reward failure modes."
+  - arxiv_id: "2306.08647"
+    title: "Language to Rewards for Robotic Skill Synthesis"
+    rationale: "Reward-parameterization-by-language line (L2R); contrasts code-emitting approaches."
+  - arxiv_id: "2309.11489"
+    title: "Text2Reward: Reward Shaping with Language Models for Reinforcement Learning"
+    rationale: "Dense reward-code generation + human-feedback refinement; closest published loop to sculpt's edit cycle."
+  - arxiv_id: "2406.01967"
+    title: "DrEureka: Language Model Guided Sim-To-Real Transfer"
+    rationale: "Eureka line extended to DR + sim-to-real; future condition candidate."
+  - arxiv_id: "2303.00001"
+    title: "Reward Design with Language Models"
+    rationale: "LM-as-proxy-reward (Kwon et al.) — the non-code branch of the LLM-reward literature."
+  - arxiv_id: "2402.03681"
+    title: "RL-VLM-F: Reinforcement Learning from Vision Language Foundation Model Feedback"
+    rationale: "VLM preference feedback as reward — grounds rollout-video-based diagnosis ideas."
+  - arxiv_id: "2402.04764"
+    title: "Code as Reward: Empowering Reinforcement Learning with VLMs"
+    rationale: "VLM-written reward code with verification — validation-gate precedent."
+
+  # ── reward hacking / misspecification (diagnose's core vocabulary)
+  - arxiv_id: "2209.13085"
+    title: "Defining and Characterizing Reward Hacking"
+    rationale: "The definitional reward-hacking paper (Skalse et al.) — names the failure mode diagnose must detect."
+  - arxiv_id: "2201.03544"
+    title: "The Effects of Reward Misspecification: Mapping and Mitigating Misaligned Models"
+    rationale: "Phase transitions in proxy-reward gaming + mitigation; grounds metric-vs-behavior divergence diagnosis."
+  - arxiv_id: "2403.03185"
+    title: "Correlated Proxies: A New Definition and Improved Mitigation for Reward Hacking"
+    rationale: "Recent concrete mitigation framing for proxy-reward exploitation."
+
+  # ── expressive / whole-body humanoid (G1 benchmarks)
+  - arxiv_id: "2403.04436"
+    title: "Learning Human-to-Humanoid Real-Time Whole-Body Teleoperation"
+    rationale: "H2O: whole-body tracking rewards for G1-class humanoids."
+  - arxiv_id: "2407.10481"
+    title: "SuperPADL: Scaling Language-Directed Physics-Based Control with Progressive Distillation"
+    rationale: "Language-directed skill synthesis at scale; stylized motion reward structure."
+  - arxiv_id: "2406.10454"
+    title: "HumanPlus: Humanoid Shadowing and Imitation from Humans"
+    rationale: "Human-data-grounded humanoid skill rewards; complements the ExBody/H2O cluster."
+
+  # ── kicking / ball skills (the kick benchmark)
+  - arxiv_id: "2105.12196"
+    title: "From Motor Control to Team Play in Simulated Humanoid Football"
+    rationale: "Kicking-rich humanoid skill curriculum (DeepMind football) — shaping for ballistic leg skills."
+  - arxiv_id: "2304.01159"
+    title: "DribbleBot: Dynamic Legged Manipulation in the Wild"
+    rationale: "Legged ball manipulation rewards (contact-rich, foot-object) — closest quadruped analog to kicking."
+
+  # ── quadruped gait robustness (the trot benchmark)
+  - arxiv_id: "2201.08117"
+    title: "Learning Robust Perceptive Locomotion for Quadrupedal Robots in the Wild"
+    rationale: "The ANYmal wild-locomotion reward suite — canonical velocity-tracking + gait-shaping terms mjlab tasks mirror."
+
+  # ── curriculum / decomposition (the mission condition's literature)
+  - arxiv_id: "2003.04960"
+    title: "Curriculum Learning for Reinforcement Learning Domains: A Framework and Survey"
+    rationale: "Curriculum-RL survey — grounds decompose's stage-design rationale."
+  - arxiv_id: "2109.06409"
+    title: "Reinforcement Learning with Evolutionary Trajectory Generator: A General Approach for Quadrupedal Locomotion"
+    rationale: "Generative gait curriculum (ETG) — alternative curriculum mechanism for gait acquisition."

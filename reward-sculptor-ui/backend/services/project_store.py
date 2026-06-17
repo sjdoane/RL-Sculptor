@@ -237,6 +237,9 @@ class ProjectStore:
             detail = self.get(slug)
             if detail is None:
                 continue
+            cfg = detail.adapter_config or {}
+            num_envs = cfg.get("num_envs")
+            device = cfg.get("device")
             out.append(
                 ProjectSummary(
                     slug=detail.slug,
@@ -247,6 +250,12 @@ class ProjectStore:
                     env_id=detail.env_id,
                     n_iterations_completed=detail.n_iterations_completed,
                     migration_warning=detail.migration_warning,
+                    # §Ship 22b: free enrichment — `detail` already carries
+                    # the parsed config; surface the card-facing bits.
+                    adapter_class=detail.adapter_class,
+                    library_slug=detail.library_slug,
+                    num_envs=num_envs if isinstance(num_envs, int) else None,
+                    device=device if isinstance(device, str) else None,
                 )
             )
         out.sort(key=lambda p: p.created_at, reverse=True)

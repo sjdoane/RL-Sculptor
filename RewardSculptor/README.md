@@ -36,7 +36,7 @@ sculptor drives it. Ready-to-train + scaffolded adapters:
 | Adapter | Status | Notes |
 | --- | --- | --- |
 | `gym_sb3` | ✓ ready | Gymnasium + Stable-Baselines3 reference path ([docs/adapters.md](docs/adapters.md)) |
-| `mjlab` | ✓ ready | mjlab (MuJoCo-Warp) — GPU, manager-based ([MJLAB_PIVOT_DESIGN.md](../MJLAB_PIVOT_DESIGN.md)) |
+| `mjlab` | ✓ ready | mjlab (MuJoCo-Warp) — GPU, manager-based ([design note](../docs/internal/MJLAB_PIVOT_DESIGN.md)) |
 | `isaac` | ⏳ scaffolded | Isaac Lab 2.0+ ([adoption guide](docs/adapters/isaac.md), ~4-8 hours) |
 | `mjx` | ⏳ scaffolded | Brax / MJX (JAX) ([adoption guide](docs/adapters/mjx.md), ~4-6 hours) |
 | `rllib` | ⏳ scaffolded | Ray RLlib ([adoption guide](docs/adapters/rllib.md), ~4-8 hours) |

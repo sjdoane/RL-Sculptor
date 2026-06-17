@@ -72,6 +72,11 @@ def test_mjlab_adapter_reward_contract_is_batched() -> None:
         "projected_gravity_b", "actuator_force", "command_vel",
     }
     assert set(c.state_schema.keys()) == expected_keys
+    # §Ship 46: per-foot kick channels are G1-only; Go1 keeps the base
+    # 6-key info contract (these keys must NOT leak into the quadruped
+    # contract, or edit.py would ground formulas the runner zero-fills).
+    assert "left_foot_contact" not in (c.expected_info_keys or [])
+    assert "base_horizontal_speed" not in (c.expected_info_keys or [])
 
 
 def test_mjlab_g1_state_schema_differs_from_go1() -> None:
@@ -81,6 +86,89 @@ def test_mjlab_g1_state_schema_differs_from_go1() -> None:
     g1 = MjlabAdapter(task_id="Mjlab-Velocity-Flat-Unitree-G1")
     go1 = MjlabAdapter(task_id="Mjlab-Velocity-Flat-Unitree-Go1")
     assert g1.reward_contract().state_schema != go1.reward_contract().state_schema
+
+
+# ── §Ship 46: per-foot kick channels in the G1 info contract ───────────────
+def test_info_keys_for_task_adds_foot_channels_for_g1_only() -> None:
+    """`_info_keys_for_task` is a pure function (no mjlab import): G1 gets
+    the base info keys PLUS the per-foot kick channels; every other task
+    family keeps the universal base set."""
+    from sculptor.adapters.mjlab import (
+        _G1_INFO_EXTRA,
+        _INFO_KEYS,
+        _info_keys_for_task,
+    )
+
+    assert _info_keys_for_task("Mjlab-Velocity-Flat-Unitree-G1") == (
+        list(_INFO_KEYS) + list(_G1_INFO_EXTRA)
+    )
+    for other in ("Mjlab-Velocity-Flat-Unitree-Go1", "Mjlab-Cartpole-Balance"):
+        assert _info_keys_for_task(other) == list(_INFO_KEYS)
+    # The extras must include the exact channels the kick diagnoser kept
+    # deferring (per-foot contact + swing velocity + height) + base travel.
+    assert set(_G1_INFO_EXTRA) == {
+        "left_foot_contact", "right_foot_contact",
+        "left_foot_swing_speed", "right_foot_swing_speed",
+        "left_foot_height", "right_foot_height",
+        "base_horizontal_speed",
+    }
+
+
+def test_mjlab_g1_reward_contract_exposes_foot_kick_channels() -> None:
+    """End-to-end: the G1 contract handed to edit.py/diagnose advertises
+    the per-foot kick channels (so a kick formula grounds instead of
+    deferring); Go1 does not."""
+    pytest.importorskip("mjlab")
+    from sculptor.adapters.mjlab import MjlabAdapter, _G1_INFO_EXTRA
+
+    g1_keys = set(
+        MjlabAdapter(task_id="Mjlab-Velocity-Flat-Unitree-G1")
+        .reward_contract().expected_info_keys or []
+    )
+    assert set(_G1_INFO_EXTRA).issubset(g1_keys)
+    assert {"base_height", "fallen"}.issubset(g1_keys)  # base set retained
+
+    go1_keys = set(
+        MjlabAdapter(task_id="Mjlab-Velocity-Flat-Unitree-Go1")
+        .reward_contract().expected_info_keys or []
+    )
+    assert not (set(_G1_INFO_EXTRA) & go1_keys)
+
+
+def test_kick_formula_grounds_under_g1_contract_not_base() -> None:
+    """THE CRUX PROOF (no GPU): a kick reward formula referencing the new
+    foot channels is GROUNDED under the G1 contract — i.e. edit.py would
+    APPLY it, not defer it with requires_env_extension. The same formula
+    is UNGROUNDED under the old 6-key base set, proving the contract
+    extension is load-bearing (it's what unblocks the kick the g1-kick-v3
+    run could never express)."""
+    from sculptor.edit import (
+        _ALLOWED_MATH,
+        _SIGNATURE_ARGS,
+        _extract_formula_identifiers,
+    )
+    from sculptor.adapters.mjlab import _INFO_KEYS, _info_keys_for_task
+
+    # A plausible single-leg kick term: reward forward swing speed of the
+    # kicking foot while the other foot is planted, penalising travel.
+    formula = (
+        "right_foot_swing_speed * left_foot_contact "
+        "- 0.5 * base_horizontal_speed"
+    )
+    idents = _extract_formula_identifiers(formula)
+
+    g1_info = set(_info_keys_for_task("Mjlab-Velocity-Flat-Unitree-G1"))
+    g1_allowed = _ALLOWED_MATH | _SIGNATURE_ARGS | g1_info
+    assert not (idents - g1_allowed), (
+        f"kick formula should ground under G1 contract; ungrounded: "
+        f"{sorted(idents - g1_allowed)}"
+    )
+
+    base_allowed = _ALLOWED_MATH | _SIGNATURE_ARGS | set(_INFO_KEYS)
+    assert idents - base_allowed, (
+        "kick formula must be UNGROUNDED under the old base info set — "
+        "otherwise the contract extension wasn't the unblocker"
+    )
 
 
 # ── S4 (bug #6.6 / T1): Cartpole fixed-base schema ──────────────────
@@ -510,6 +598,130 @@ def test_snapshots_to_trajectory_fills_missing_keys_with_last_seen() -> None:
     assert traj["alive"] == pytest.approx([1.0, 1.2, 1.1])
     # upright appears in 2 windows → 2-long series (post-debut only).
     assert traj["upright"] == pytest.approx([0.5, 0.6])
+
+
+# ── §Ship 46: per-foot kick channels in the runtime info dict ─────────────
+# CPU-only — fakes the mjlab sensor/entity API so the hot path is exercised
+# without a GPU or the mjlab package.
+
+def _make_term():
+    """Build a SculptorRewardTerm and bypass __init__ (which needs a real
+    env + reward module). _foot_info / _resolve_foot_handles only touch
+    `self._foot_cache`, so __new__ is sufficient."""
+    from sculptor.adapters._mjlab_runner import _build_sculptor_term_class
+
+    TermClass = _build_sculptor_term_class(("qpos", "qvel"))
+    return TermClass.__new__(TermClass)
+
+
+def test_foot_info_populates_biped_channels() -> None:
+    """A biped env (left_foot/right_foot sites + the two named sensors)
+    yields real per-foot contact / swing-speed / height + base speed."""
+    pytest.importorskip("torch")
+    import torch
+
+    N = 3
+    term = _make_term()
+
+    class _Data:
+        # left foot velocity (3,4,0)->|v|=5; right (0,0,0)->0
+        site_lin_vel_w = torch.tensor([[[3.0, 4.0, 0.0], [0.0, 0.0, 0.0]]] * N)
+        root_link_lin_vel_b = torch.tensor([[3.0, 4.0, 9.0]] * N)  # xy-norm=5
+
+    class _Robot:
+        site_names = ("left_foot", "right_foot")
+        data = _Data()
+
+    def _sensor(**kw):
+        return type("S", (), {"data": type("D", (), kw)})()
+
+    class _Scene:
+        _d = {
+            "feet_ground_contact": _sensor(found=torch.tensor([[1.0, 0.0]] * N)),
+            "foot_height_scan": _sensor(heights=torch.tensor([[0.05, 0.20]] * N)),
+        }
+
+        def __getitem__(self, k):
+            return self._d[k]
+
+    class _Env:
+        num_envs = N
+        device = torch.device("cpu")
+        scene = _Scene()
+
+    out = term._foot_info(_Env(), _Robot(), torch.float32)
+    assert torch.allclose(out["left_foot_contact"], torch.ones(N))
+    assert torch.allclose(out["right_foot_contact"], torch.zeros(N))
+    assert torch.allclose(out["left_foot_swing_speed"], torch.full((N,), 5.0))
+    assert torch.allclose(out["right_foot_swing_speed"], torch.zeros(N))
+    assert torch.allclose(out["left_foot_height"], torch.full((N,), 0.05))
+    assert torch.allclose(out["right_foot_height"], torch.full((N,), 0.20))
+    assert torch.allclose(out["base_horizontal_speed"], torch.full((N,), 5.0))
+
+
+def test_foot_info_zeros_for_non_biped_but_keeps_base_speed() -> None:
+    """A quadruped (no left_foot/right_foot sites) + missing foot sensors
+    must degrade to zeros on every per-foot channel — no crash — while
+    base_horizontal_speed still computes from the root velocity."""
+    pytest.importorskip("torch")
+    import torch
+
+    N = 2
+    term = _make_term()
+
+    class _Data:
+        root_link_lin_vel_b = torch.tensor([[6.0, 8.0, 1.0]] * N)  # xy-norm=10
+
+    class _Robot:
+        site_names = ("FL_foot", "FR_foot", "RL_foot", "RR_foot")
+        data = _Data()
+
+    class _Scene:
+        def __getitem__(self, k):
+            raise KeyError(k)  # quadruped task lacks the named foot sensors
+
+    class _Env:
+        num_envs = N
+        device = torch.device("cpu")
+        scene = _Scene()
+
+    out = term._foot_info(_Env(), _Robot(), torch.float32)
+    for k in (
+        "left_foot_contact", "right_foot_contact",
+        "left_foot_swing_speed", "right_foot_swing_speed",
+        "left_foot_height", "right_foot_height",
+    ):
+        assert torch.allclose(out[k], torch.zeros(N)), k
+    assert torch.allclose(out["base_horizontal_speed"], torch.full((N,), 10.0))
+
+
+def test_foot_info_keys_match_contract_extra() -> None:
+    """The runtime info dict must emit exactly the keys the contract
+    advertises for G1 — guards against runner/contract drift."""
+    pytest.importorskip("torch")
+    import torch
+    from sculptor.adapters.mjlab import _G1_INFO_EXTRA
+
+    term = _make_term()
+
+    class _Data:
+        root_link_lin_vel_b = None
+
+    class _Robot:
+        site_names = ()
+        data = _Data()
+
+    class _Scene:
+        def __getitem__(self, k):
+            raise KeyError(k)
+
+    class _Env:
+        num_envs = 1
+        device = torch.device("cpu")
+        scene = _Scene()
+
+    out = term._foot_info(_Env(), _Robot(), torch.float32)
+    assert set(out.keys()) == set(_G1_INFO_EXTRA)
 
 
 # ── §Ship-7: rollout video fps math ──────────────────────────────────────

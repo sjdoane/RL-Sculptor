@@ -1,0 +1,123 @@
+/* =====================================================================
+   Cursorlike — Design Foundations
+   A quietly-confident developer brand. Editorial calm over IDE-darkness.
+   Warm cream canvas, warm near-black ink, ONE brand voltage (Cursor
+   Orange) used scarcely. Display weight stays at 400 — magazine voice.
+
+   Type: CursorGothic (licensed). Open substitute = Inter @ 400 with
+   negative tracking. Every CODE surface = JetBrains Mono.
+   ===================================================================== */
+
+
+:root {
+  /* ---- Font families -------------------------------------------------
+     CursorGothic is licensed; Inter is the closest open substitute
+     (load at 400 with -1.5% tracking to approximate the editorial cut).
+     JetBrains Mono carries every code surface. */
+  --font-sans: "CursorGothic", "Inter", system-ui, "Helvetica Neue", Helvetica, Arial, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+
+  /* =========================== COLOR ================================= */
+  /* Brand & accent — the single CTA voltage. Used scarcely. */
+  --rs-primary:         #f54e00;  /* Cursor Orange — primary CTAs + wordmark */
+  --rs-primary-active:  #d04200;  /* press state */
+
+  /* Surfaces */
+  --canvas:        #f7f7f4;  /* warm cream page floor (never pure white) */
+  --canvas-soft:   #fafaf7;  /* IDE-pane background inside mockups */
+  --surface-card:  #ffffff;  /* pure white card surface */
+  --surface-strong:#e6e5e0;  /* badges, tag pills */
+
+  /* Hairlines (the system's only depth) */
+  --hairline:        #e6e5e0;  /* 1px divider */
+  --hairline-soft:   #efeee8;  /* lighter divider */
+  --hairline-strong: #cfcdc4;  /* stronger panel outline */
+
+  /* Text / ink */
+  --ink:         #26251e;  /* display + body emphasis — warm near-black */
+  --body:        #5a5852;  /* default running text */
+  --body-strong: #26251e;  /* = ink */
+  --rs-muted:       #706e63;  /* sub-titles — darkened from prototype #807d72 to
+                                 clear WCAG-AA 4.5:1 on canvas/cards (≈4.8:1), per
+                                 Sam's "keep CTA, darken muted" call. Dark-mode
+                                 --rs-muted already passes (5.2:1). */
+  --rs-muted-soft:  #a09c92;  /* disabled text */
+  --on-primary:  #ffffff;  /* white text on Cursor Orange */
+
+  /* Timeline — AI-action signature. Product UI ONLY, never system colors */
+  --timeline-thinking: #dfa88f;  /* peach  — Thinking */
+  --timeline-grep:     #9fc9a2;  /* mint   — Grepping */
+  --timeline-read:     #9fbbe0;  /* blue   — Reading */
+  --timeline-edit:     #c0a8dd;  /* lavender — Editing */
+  --timeline-done:     #c08532;  /* gold   — Done */
+
+  /* Semantic */
+  --semantic-success: #1f8a65;
+  --semantic-error:   #cf2d56;
+
+  /* =========================== RADII ================================= */
+  --radius-none: 0px;
+  --radius-xs:   4px;    /* inline tags */
+  --radius-sm:   6px;    /* compact rows */
+  --radius-md:   8px;    /* CTA buttons, form inputs */
+  --radius-lg:   12px;   /* cards, IDE panes */
+  --radius-xl:   16px;   /* larger feature cards (rare) */
+  --radius-pill: 9999px; /* timeline pills, badges */
+  --radius-full: 9999px; /* avatars (rare) */
+
+  /* =========================== SPACING =============================== */
+  --space-xxs: 4px;
+  --space-xs:  8px;
+  --space-sm:  12px;
+  --space-base:16px;
+  --space-md:  20px;
+  --space-lg:  24px;
+  --space-xl:  32px;
+  --space-xxl: 48px;
+  --space-section: 80px;
+
+  /* =========================== ELEVATION ============================= */
+  /* Hairline-only depth. NO drop shadows anywhere in the system. */
+  --container-max: 1200px;
+
+  /* =========================== TYPE SCALE ============================ */
+  /* size / weight / line-height / letter-spacing (display tracking is
+     negative; weight stays 400 on every display token). */
+  --display-mega-size: 72px; --display-mega-weight: 400; --display-mega-lh: 1.1;  --display-mega-ls: -2.16px;
+  --display-lg-size:   36px; --display-lg-weight:   400; --display-lg-lh:   1.2;  --display-lg-ls:   -0.72px;
+  --display-md-size:   26px; --display-md-weight:   400; --display-md-lh:   1.25; --display-md-ls:   -0.325px;
+  --display-sm-size:   22px; --display-sm-weight:   400; --display-sm-lh:   1.3;  --display-sm-ls:   -0.11px;
+  --title-md-size:     18px; --title-md-weight:     600; --title-md-lh:     1.4;  --title-md-ls:     0;
+  --title-sm-size:     16px; --title-sm-weight:     600; --title-sm-lh:     1.4;  --title-sm-ls:     0;
+  --body-md-size:      16px; --body-md-weight:      400; --body-md-lh:      1.5;  --body-md-ls:      0;
+  --body-tracked-size: 16px; --body-tracked-weight: 400; --body-tracked-lh: 1.5;  --body-tracked-ls: 0.08px;
+  --body-sm-size:      14px; --body-sm-weight:      400; --body-sm-lh:      1.5;  --body-sm-ls:      0;
+  --caption-size:      13px; --caption-weight:      400; --caption-lh:      1.4;  --caption-ls:      0;
+  --caption-up-size:   11px; --caption-up-weight:   600; --caption-up-lh:   1.4;  --caption-up-ls:   0.88px;
+  --code-size:         13px; --code-weight:         400; --code-lh:         1.5;  --code-ls:         0;
+  --button-size:       14px; --button-weight:       500; --button-lh:       1.0;  --button-ls:       0;
+  --nav-link-size:     14px; --nav-link-weight:     500; --nav-link-lh:     1.4;  --nav-link-ls:     0;
+}
+
+/* =====================================================================
+   SEMANTIC TYPE CLASSES — use these directly.
+   Display tokens carry negative tracking; weight stays 400.
+   ===================================================================== */
+.t-display-mega { font-family: var(--font-sans); font-size: var(--display-mega-size); font-weight: var(--display-mega-weight); line-height: var(--display-mega-lh); letter-spacing: var(--display-mega-ls); }
+.t-display-lg   { font-family: var(--font-sans); font-size: var(--display-lg-size);   font-weight: var(--display-lg-weight);   line-height: var(--display-lg-lh);   letter-spacing: var(--display-lg-ls); }
+.t-display-md   { font-family: var(--font-sans); font-size: var(--display-md-size);   font-weight: var(--display-md-weight);   line-height: var(--display-md-lh);   letter-spacing: var(--display-md-ls); }
+.t-display-sm   { font-family: var(--font-sans); font-size: var(--display-sm-size);   font-weight: var(--display-sm-weight);   line-height: var(--display-sm-lh);   letter-spacing: var(--display-sm-ls); }
+.t-title-md     { font-family: var(--font-sans); font-size: var(--title-md-size);     font-weight: var(--title-md-weight);     line-height: var(--title-md-lh);     letter-spacing: var(--title-md-ls); }
+.t-title-sm     { font-family: var(--font-sans); font-size: var(--title-sm-size);     font-weight: var(--title-sm-weight);     line-height: var(--title-sm-lh);     letter-spacing: var(--title-sm-ls); }
+.t-body         { font-family: var(--font-sans); font-size: var(--body-md-size);      font-weight: var(--body-md-weight);      line-height: var(--body-md-lh);      letter-spacing: var(--body-md-ls); }
+.t-body-tracked { font-family: var(--font-sans); font-size: var(--body-tracked-size); font-weight: var(--body-tracked-weight); line-height: var(--body-tracked-lh); letter-spacing: var(--body-tracked-ls); }
+.t-body-sm      { font-family: var(--font-sans); font-size: var(--body-sm-size);      font-weight: var(--body-sm-weight);      line-height: var(--body-sm-lh);      letter-spacing: var(--body-sm-ls); }
+.t-caption      { font-family: var(--font-sans); font-size: var(--caption-size);      font-weight: var(--caption-weight);      line-height: var(--caption-lh);      letter-spacing: var(--caption-ls); }
+.t-caption-up   { font-family: var(--font-sans); font-size: var(--caption-up-size);   font-weight: var(--caption-up-weight);   line-height: var(--caption-up-lh);   letter-spacing: var(--caption-up-ls); text-transform: uppercase; }
+.t-code         { font-family: var(--font-mono); font-size: var(--code-size);         font-weight: var(--code-weight);         line-height: var(--code-lh);         letter-spacing: var(--code-ls); }
+.t-button       { font-family: var(--font-sans); font-size: var(--button-size);       font-weight: var(--button-weight);       line-height: var(--button-lh);       letter-spacing: var(--button-ls); }
+.t-nav-link     { font-family: var(--font-sans); font-size: var(--nav-link-size);     font-weight: var(--nav-link-weight);     line-height: var(--nav-link-lh);     letter-spacing: var(--nav-link-ls); }
+
+/* Inter substitute carries the editorial negative tracking on display.
+   Remove this rule once real CursorGothic webfonts are installed. */
+.t-display-mega, .t-display-lg, .t-display-md, .t-display-sm { font-feature-settings: "ss01"; }

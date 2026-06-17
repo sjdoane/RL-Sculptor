@@ -1,0 +1,242 @@
+"""§Ship 33: fitness-in-the-loop (sculpt_run best-by-fitness selection,
+plateau / target early-stop, and the diagnoser objective-progress block).
+
+GPU-free: `_run_one_iter` is faked so no training/adapter is needed; we
+test only the loop-level fitness logic and the prompt block.
+"""
+from __future__ import annotations
+
+from pathlib import Path
+
+import pytest
+
+import sculptor.sculpt as S
+from sculptor.diagnose import _build_preliminary_user_content
+
+
+def _make_project(tmp_path: Path) -> Path:
+    proj = tmp_path / "proj"
+    (proj / "rewards").mkdir(parents=True)
+    (proj / "runs").mkdir()
+    (proj / "reports").mkdir()
+    (proj / "rewards" / "__init__.py").write_text("", encoding="utf-8")
+    (proj / "rewards" / "v0.py").write_text(
+        "REWARD_SPEC = {}\ndef compute_reward(*a, **k):\n    return 0.0, {}\n",
+        encoding="utf-8",
+    )
+    (proj / "config.toml").write_text(
+        "[iteration]\nsteps_per_iter = 10\nseed = 42\n", encoding="utf-8",
+    )
+    return proj / "config.toml"
+
+
+def _install_fakes(monkeypatch, fitness_by_iter: dict[int, float]):
+    """Patch the heavy collaborators so sculpt_run exercises only its
+    own loop logic. The fake _run_one_iter writes a real v<n+1>.py (so
+    best-by-fitness current.py repoint has a file to point at) and stamps
+    the preset fitness onto the returned IterOutcome."""
+    monkeypatch.setattr(S, "load_adapter", lambda _p: object())
+    monkeypatch.setattr(
+        "sculptor.run_context.capture_run_context",
+        lambda *a, **k: {}, raising=True,
+    )
+    monkeypatch.setattr(
+        "sculptor.run_context.write_run_context",
+        lambda *a, **k: Path("run_context.json"), raising=True,
+    )
+
+    def fake_iter(**kw):
+        i = kw["iter_index"]
+        rewards_dir = kw["rewards_dir"]
+        trained = rewards_dir / f"v{i}.py"      # the reward trained this iter
+        edit = rewards_dir / f"v{i + 1}.py"     # the (untested) edit produced
+        edit.write_text(
+            "REWARD_SPEC = {}\ndef compute_reward(*a, **k):\n    return 0.0, {}\n",
+            encoding="utf-8",
+        )
+        # Mirror the real iter: current.py re-exports the newest reward.
+        S._write_current_reexport(rewards_dir, edit)
+        return S.IterOutcome(
+            iter_index=i,
+            iter_dir=kw["runs_dir"] / f"iter_{i}",
+            reward_path_before=rewards_dir / "current.py",
+            reward_path_after=edit,
+            primary_metric=0.0,
+            behavior={},
+            failure_modes=[],
+            edit_count=1,
+            fitness=fitness_by_iter[i],
+            reward_path_trained=trained,
+        )
+
+    monkeypatch.setattr(S, "_run_one_iter", fake_iter)
+
+
+def test_best_by_fitness_selection_and_plateau_stop(tmp_path, monkeypatch):
+    cfg_path = _make_project(tmp_path)
+    # best is iter 1 (0.5); iters 2,3 don't beat it → plateau at patience=2.
+    _install_fakes(monkeypatch, {0: 0.2, 1: 0.5, 2: 0.4, 3: 0.45, 4: 0.41})
+    res = S.sculpt_run(
+        cfg_path, "goal", iterations=6, no_kg=True,
+        fitness_fn=lambda d: 0.0, fitness_patience=2,
+    )
+    assert res.fitness_history == [0.2, 0.5, 0.4, 0.45]
+    assert res.best_fitness == 0.5
+    assert res.best_fitness_iter == 1
+    assert res.early_stopped and "plateau" in res.early_stop_reason
+    assert res.iterations_run == 4          # stopped early, not all 6
+    # current.py must re-export the BEST iter's TRAINED reward (iter 1
+    # trained v1), NOT the last edit (v4) nor the best iter's untested
+    # edit (v2).
+    current = (cfg_path.parent / "rewards" / "current.py").read_text()
+    assert "v1" in current
+    assert "v2" not in current and "v4" not in current
+
+
+def test_fitness_target_early_stop(tmp_path, monkeypatch):
+    cfg_path = _make_project(tmp_path)
+    _install_fakes(monkeypatch, {0: 0.3, 1: 0.6, 2: 0.9})
+    res = S.sculpt_run(
+        cfg_path, "goal", iterations=6, no_kg=True,
+        fitness_fn=lambda d: 0.0, fitness_target=0.5,
+    )
+    assert res.iterations_run == 2          # hit target at iter 1
+    assert res.early_stopped and "target" in res.early_stop_reason
+    assert res.best_fitness == 0.6
+
+
+def test_no_fitness_fn_is_unchanged_blind_default(tmp_path, monkeypatch):
+    cfg_path = _make_project(tmp_path)
+    _install_fakes(monkeypatch, {0: 0.2, 1: 0.9})
+    res = S.sculpt_run(cfg_path, "goal", iterations=2, no_kg=True)
+    assert res.fitness_history == []        # nothing tracked
+    assert res.best_fitness is None and res.best_fitness_iter is None
+    assert not res.early_stopped
+    assert res.iterations_run == 2
+    # blind default: current.py points at the LAST reward (v2.py).
+    current = (cfg_path.parent / "rewards" / "current.py").read_text()
+    assert "v2" in current
+
+
+def test_diagnose_objective_progress_block_present_and_absent():
+    base = dict(
+        behavior_goal="trot forward", reward_spec={}, metrics={},
+        behavior={}, behavior_metric_names=[], contract_text="", keyframes=[],
+    )
+    with_block = _build_preliminary_user_content(
+        **base,
+        objective_progress={"current": 0.31, "best_so_far": 0.31,
+                            "last": 0.12, "delta": 0.19},
+    )
+    text = with_block[0]["text"]
+    assert "OBJECTIVE_TASK_PROGRESS" in text
+    assert "current=0.31" in text and "delta_vs_previous=0.19" in text
+
+    without = _build_preliminary_user_content(**base)
+    assert "OBJECTIVE_TASK_PROGRESS" not in without[0]["text"]
+
+
+# ── §Ship 36: F1 revert-on-regression + F2 component breakdown ───────────
+
+
+def _install_recording_fake(monkeypatch, fitness_by_iter, seen_revert):
+    """Like `_install_fakes` but records the `revert_base` each iter was
+    called with, so the loop's best-first revert logic is observable."""
+    monkeypatch.setattr(S, "load_adapter", lambda _p: object())
+    monkeypatch.setattr("sculptor.run_context.capture_run_context",
+                        lambda *a, **k: {}, raising=True)
+    monkeypatch.setattr("sculptor.run_context.write_run_context",
+                        lambda *a, **k: Path("run_context.json"), raising=True)
+
+    def fake_iter(**kw):
+        seen_revert.append(kw.get("revert_base"))
+        i = kw["iter_index"]
+        rewards_dir = kw["rewards_dir"]
+        trained = rewards_dir / f"v{i}.py"
+        edit = rewards_dir / f"v{i + 1}.py"
+        edit.write_text(
+            "REWARD_SPEC = {}\ndef compute_reward(*a, **k):\n    return 0.0, {}\n",
+            encoding="utf-8",
+        )
+        S._write_current_reexport(rewards_dir, edit)
+        return S.IterOutcome(
+            iter_index=i, iter_dir=kw["runs_dir"] / f"iter_{i}",
+            reward_path_before=rewards_dir / "current.py",
+            reward_path_after=edit, primary_metric=0.0, behavior={},
+            failure_modes=[], edit_count=1, fitness=fitness_by_iter[i],
+            reward_path_trained=trained,
+        )
+
+    monkeypatch.setattr(S, "_run_one_iter", fake_iter)
+
+
+def test_fitness_revert_targets_best_reward_on_regression(tmp_path, monkeypatch):
+    cfg_path = _make_project(tmp_path)
+    seen: list = []
+    # best is iter 1; iter 2 regresses → iter 3 must edit from iter 1's reward.
+    _install_recording_fake(monkeypatch, {0: 0.2, 1: 0.5, 2: 0.4, 3: 0.45}, seen)
+    res = S.sculpt_run(
+        cfg_path, "goal", iterations=6, no_kg=True,
+        fitness_fn=lambda d: 0.0, fitness_patience=2,
+    )
+    # iters 0,1 set new bests → no revert; iter 2 regressed (best=iter1) →
+    # iter 3 is handed iter 1's TRAINED reward (v1.py) as its edit base.
+    assert seen[0] is None and seen[1] is None and seen[2] is None
+    assert seen[3] is not None and seen[3].name == "v1.py"
+    assert res.iterations_run == 4          # plateau still stops at iter 3
+
+
+def test_observe_only_never_reverts(tmp_path, monkeypatch):
+    cfg_path = _make_project(tmp_path)
+    seen: list = []
+    _install_recording_fake(monkeypatch, {0: 0.2, 1: 0.5, 2: 0.4, 3: 0.45}, seen)
+    S.sculpt_run(
+        cfg_path, "goal", iterations=4, no_kg=True,
+        fitness_fn=lambda d: 0.0, fitness_patience=2,
+        fitness_observe_only=True,
+    )
+    # observe mode is purely passive: the edit base is NEVER reverted.
+    assert all(s is None for s in seen), seen
+
+
+def test_fitness_revert_disabled_keeps_forward_edit_base(tmp_path, monkeypatch):
+    cfg_path = _make_project(tmp_path)
+    seen: list = []
+    _install_recording_fake(monkeypatch, {0: 0.2, 1: 0.5, 2: 0.4, 3: 0.45}, seen)
+    S.sculpt_run(
+        cfg_path, "goal", iterations=4, no_kg=True,
+        fitness_fn=lambda d: 0.0, fitness_patience=2,
+        fitness_revert=False,
+    )
+    assert all(s is None for s in seen), seen
+
+
+def test_fitness_components_for_prompt_filters():
+    from sculptor.sculpt import _fitness_components_for_prompt
+    assert _fitness_components_for_prompt(None) is None
+    assert _fitness_components_for_prompt({"spec_score": 0.5}) is None
+    out = _fitness_components_for_prompt({
+        "spec_score": 0.5, "spec_name": "g1_kick", "error": None,
+        "capture": {"step_dt": 0.02}, "uprightness": 0.99,
+        "burst_p95": 4.2, "leg_subset": 1.0, "bad": float("nan"),
+    })
+    assert out == {"uprightness": 0.99, "burst_p95": 4.2, "leg_subset": 1.0}
+
+
+def test_diagnose_objective_progress_renders_components_and_revert():
+    base = dict(
+        behavior_goal="kick", reward_spec={}, metrics={}, behavior={},
+        behavior_metric_names=[], contract_text="", keyframes=[],
+    )
+    out = _build_preliminary_user_content(
+        **base,
+        objective_progress={
+            "current": 0.1, "best_so_far": 0.3, "last": 0.3, "delta": -0.2,
+            "components": {"uprightness": 0.99, "kick_events": 0.0},
+            "reverted_to_best": True,
+        },
+    )
+    text = out[0]["text"]
+    assert "component breakdown" in text
+    assert "kick_events" in text and "uprightness" in text
+    assert "REGRESSED fitness" in text and "DIFFERENT direction" in text

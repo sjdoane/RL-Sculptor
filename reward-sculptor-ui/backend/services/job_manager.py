@@ -43,6 +43,12 @@ class Job:
     error: Optional[str] = None
     result: Optional[dict[str, Any]] = None
     params: dict[str, Any] = field(default_factory=dict)
+    # §Ship 21: parent job linkage for mission stage runs. When set,
+    # this job represents one stage of a mission_execute run; its
+    # events mirror what the parent's stdout streamer detected for
+    # the matching stage_name. None for top-level sculpt_run /
+    # mission_decompose / mission_execute jobs.
+    parent_id: Optional[str] = None
 
     # ── event stream + log ring (used by sculpt_run jobs) ──────────────
     events: list[dict[str, Any]] = field(default_factory=list, repr=False)
@@ -72,6 +78,7 @@ class Job:
             started_at=self.started_at,
             ended_at=self.ended_at,
             error=self.error,
+            parent_id=self.parent_id,
         )
 
     def to_detail(self) -> JobDetail:
@@ -87,6 +94,7 @@ class Job:
             error=self.error,
             params=dict(self.params),
             result=self.result,
+            parent_id=self.parent_id,
         )
 
     # ── event stream wiring ────────────────────────────────────────────
@@ -148,6 +156,7 @@ class JobManager:
         fn: JobCallable,
         *,
         params: Optional[dict[str, Any]] = None,
+        parent_id: Optional[str] = None,
     ) -> Job:
         job_id = f"job_{secrets.token_hex(8)}"
         cancel = asyncio.Event()
@@ -156,6 +165,7 @@ class JobManager:
             kind=kind,
             project_slug=project_slug,
             params=dict(params or {}),
+            parent_id=parent_id,
         )
         job._cancel = cancel
         with self._lock:
@@ -228,6 +238,38 @@ class JobManager:
         jobs.sort(key=lambda j: j.started_at or datetime.min.replace(tzinfo=timezone.utc), reverse=True)
         return jobs
 
+    # §Ship 21: register a job that has no runner of its own. Used by
+    # `mission_jobs._stream_stdout` when a stage_started event fires
+    # inside a parent mission_execute subprocess — the work is already
+    # happening (it's a fragment of the parent's lifetime), but we
+    # want the stage to appear as a first-class entry in /runs. The
+    # caller (mission_jobs) drives lifecycle via emit() + by setting
+    # status / started_at / ended_at directly.
+    def register_passive_job(
+        self,
+        kind: JobKind,
+        project_slug: Optional[str],
+        *,
+        params: Optional[dict[str, Any]] = None,
+        parent_id: Optional[str] = None,
+    ) -> Job:
+        job_id = f"job_{secrets.token_hex(8)}"
+        job = Job(
+            job_id=job_id,
+            kind=kind,
+            project_slug=project_slug,
+            params=dict(params or {}),
+            parent_id=parent_id,
+            status="running",
+            started_at=datetime.now(tz=timezone.utc),
+        )
+        # Passive jobs have no _task; they cannot be cancelled
+        # individually (cancelling the parent kills the subprocess
+        # which terminates all stages). _cancel stays None.
+        with self._lock:
+            self._jobs[job_id] = job
+        return job
+
     def has_active_sculpt_run(self, slug: str) -> bool:
         """True if the project has a sculpt_run job in running / queued
         state. Used by the project-status computation in project_store."""
@@ -247,10 +289,56 @@ class JobManager:
                 return True
         return False
 
+    def has_any_active_gpu_job(self) -> bool:
+        """§Ship 18a — generalization of `has_any_active_sculpt_run` to
+        include `mission_execute` jobs. A mission_execute spawns its
+        own per-stage sculpt_run subprocesses, so it competes for the
+        SAME GPU as a top-level sculpt_run. Routes that need GPU-busy
+        guards (POST /projects/.../runs, POST /projects/.../missions/
+        */run) call this rather than the sculpt-only variant."""
+        for j in self.list():
+            if j.kind in ("sculpt_run", "mission_execute") and j.status in (
+                "running", "queued",
+            ):
+                return True
+        return False
+
+    def active_mission_job(
+        self, project_slug: str, mission_slug: str,
+    ) -> Optional[Job]:
+        """§Ship 18a — the in-flight `mission_decompose` or
+        `mission_execute` job for a specific (project, mission) pair,
+        or None. Used by the routes layer to (a) refuse concurrent
+        decompose/execute on the same mission, (b) attach
+        `active_job_id` to MissionSummary / MissionDetail responses.
+        """
+        for j in self.list(project_slug=project_slug):
+            if j.kind not in ("mission_decompose", "mission_execute"):
+                continue
+            if j.params.get("mission_slug") != mission_slug:
+                continue
+            if j.status in ("running", "queued"):
+                return j
+        return None
+
     # ── control ────────────────────────────────────────────────────────
     def stop(self, job_id: str) -> Optional[Job]:
         job = self.get(job_id)
-        if job is None or job._cancel is None:
+        if job is None:
+            return None
+        # §Ship 21: passive jobs (mission_stage_run) have no _cancel/
+        # _task because they're driven by the parent's subprocess. To
+        # honor a Stop click on a stage row, route the cancellation
+        # to the parent mission_execute job whose subprocess kill
+        # terminates all child stages. Audit-fix CRITICAL #2: prior
+        # to this, stop() returned None on a passive job so the user
+        # got a "Kill signal sent" toast but the run kept training.
+        if job._cancel is None and job.parent_id is not None:
+            parent = self.get(job.parent_id)
+            if parent is not None and parent._cancel is not None:
+                return self.stop(parent.job_id)
+            return None
+        if job._cancel is None:
             return None
         # Flip the cooperative cancel flag from the loop thread so any
         # code awaiting the Event sees it atomically.

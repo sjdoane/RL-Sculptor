@@ -36,6 +36,231 @@ kg_app = typer.Typer(
 app.add_typer(kg_app, name="kg")
 
 
+# ── Remote sub-app (§Ship 23) ────────────────────────────────────────────────
+remote_app = typer.Typer(
+    name="remote",
+    help="Remote GPU dispatch — connectivity / environment checks.",
+    no_args_is_help=True,
+)
+app.add_typer(remote_app, name="remote")
+
+
+@remote_app.command("doctor")
+def remote_doctor(
+    config: Optional[Path] = typer.Option(
+        None,
+        "--config",
+        help=(
+            "config.toml with a [remote] table. SCULPTOR_REMOTE_* env vars "
+            "override it; with no --config, env vars alone are used."
+        ),
+    ),
+    json_out: bool = typer.Option(
+        False, "--json", help="Machine-readable output (used by the UI backend)."
+    ),
+):
+    """Check the configured remote GPU host: ssh reachability, rsync,
+    python, NVIDIA driver (>= R570 for Blackwell), torch.cuda,
+    torch/mjlab version skew vs local, free disk. Exit 0 = all green,
+    1 = at least one check failed, 2 = no remote configured."""
+    import dataclasses as _dc
+    import json as _json
+    import os
+
+    from sculptor.adapters._remote import RemoteConfig, RemoteExecutor
+
+    table = None
+    if config is not None:
+        import tomllib
+
+        try:
+            with Path(config).open("rb") as f:
+                table = tomllib.load(f).get("remote")
+        except FileNotFoundError:
+            typer.echo(f"config not found: {config}", err=True)
+            raise typer.Exit(2)
+        except tomllib.TOMLDecodeError as e:
+            typer.echo(f"config not parseable: {config}: {e}", err=True)
+            raise typer.Exit(2)
+        except OSError as e:
+            typer.echo(f"config not readable: {config}: {e}", err=True)
+            raise typer.Exit(2)
+    cfg = RemoteConfig.from_sources(table, os.environ)
+    if cfg is None or not cfg.host:
+        typer.echo(
+            "no remote configured — add a [remote] table (host / user / "
+            "key_path) to config.toml or set SCULPTOR_REMOTE_HOST.",
+            err=True,
+        )
+        raise typer.Exit(2)
+    if not cfg.enabled:
+        # Doctor must work BEFORE the user flips enabled=true.
+        cfg = _dc.replace(cfg, enabled=True)
+    report = RemoteExecutor(cfg).doctor()
+    if json_out:
+        typer.echo(_json.dumps(report, indent=2))
+    else:
+        typer.echo(f"remote doctor — {cfg.target}:{cfg.port}")
+        for c in report["checks"]:
+            mark = " ok " if c["ok"] else "FAIL"
+            typer.echo(f"  [{mark}] {c['name']}: {c['detail']}")
+        typer.echo(
+            "all checks passed" if report["ok"] else "some checks FAILED"
+        )
+    raise typer.Exit(0 if report["ok"] else 1)
+
+
+# ── Eval sub-app (§Ship 27 / E2) ────────────────────────────────────────────
+eval_app = typer.Typer(
+    name="eval",
+    help="Research-grade evaluation: seeds × conditions × benchmarks.",
+    no_args_is_help=True,
+)
+app.add_typer(eval_app, name="eval")
+
+
+@eval_app.command("run")
+def eval_run(
+    out: Path = typer.Option(..., "--out", help="Campaign output dir."),
+    benchmark: list[str] = typer.Option(
+        ..., "--benchmark", "-b",
+        help="Benchmark name (repeatable). See `sculpt eval list`.",
+    ),
+    condition: list[str] = typer.Option(
+        ..., "--condition", "-c",
+        help="Condition name (repeatable): full | no_kg | plain_ppo | seed_only.",
+    ),
+    seeds: int = typer.Option(
+        3, "--seeds", help="Number of paired seeds (1000, 1017, 1034, ...).",
+    ),
+    iterations: int = typer.Option(
+        2, "--iterations", help="LLM-loop iterations for sculpt-mode conditions.",
+    ),
+    steps_per_iter: int = typer.Option(
+        300, "--steps-per-iter", help="rsl_rl iterations per training run.",
+    ),
+    rollout_episodes: int = typer.Option(4, "--rollout-episodes"),
+    spec_threshold: float = typer.Option(
+        0.5, "--spec-threshold",
+        help="spec_score threshold for iterations-to-criterion.",
+    ),
+    eureka_k: int = typer.Option(
+        4, "--eureka-k",
+        help="Eureka condition: candidates per generation "
+             "(generations = --iterations).",
+    ),
+    fitness_in_loop: bool = typer.Option(
+        False, "--fitness-in-loop",
+        help="Feed the benchmark spec metric INTO the sculpt loop as a "
+             "ground-truth fitness signal (fitness-guided diagnose + "
+             "best-by-fitness selection + plateau early-stop). Removes the "
+             "eval asymmetry where only eureka could select on fitness.",
+    ),
+    name: Optional[str] = typer.Option(
+        None, "--name", help="Campaign name (default: out dir name)."),
+    require_remote: bool = typer.Option(
+        False, "--require-remote",
+        help="Abort unless SCULPTOR_REMOTE_* resolves to an enabled "
+             "remote host — guards a campaign against silently training "
+             "on the local GPU when the env didn't propagate.",
+    ),
+):
+    """Run an eval campaign. Resumable: completed jobs (result.json on
+    disk) are skipped, so re-running after a crash or pod restart only
+    does the remaining work. Remote dispatch: export SCULPTOR_REMOTE_*
+    (see docs/remote.md) and training routes through the pod
+    automatically."""
+    import os as _os
+
+    from sculptor.adapters._remote import RemoteConfig
+    from sculptor.eval import CampaignConfig, run_campaign
+
+    rcfg = RemoteConfig.from_sources(None, _os.environ)
+    if rcfg is not None and rcfg.enabled:
+        typer.echo(
+            f"[eval] training target: REMOTE {rcfg.target}:{rcfg.port} "
+            f"(device={rcfg.device or 'cuda:0'})"
+        )
+    else:
+        typer.echo("[eval] training target: LOCAL GPU")
+        if require_remote:
+            typer.echo(
+                "[eval] --require-remote set but no enabled remote "
+                "resolved from SCULPTOR_REMOTE_* — aborting before any "
+                "GPU work.", err=True,
+            )
+            raise typer.Exit(3)
+
+    cfg = CampaignConfig(
+        name=name or Path(out).name,
+        out_dir=Path(out),
+        benchmarks=list(benchmark),
+        conditions=list(condition),
+        seeds=[1000 + 17 * i for i in range(int(seeds))],
+        iterations=iterations,
+        steps_per_iter=steps_per_iter,
+        rollout_episodes=rollout_episodes,
+        spec_threshold=spec_threshold,
+        eureka_k=eureka_k,
+        fitness_in_loop=fitness_in_loop,
+    )
+    report = run_campaign(cfg)
+    typer.echo(f"report: {Path(out) / 'campaign_report.json'}")
+    typer.echo(f"html:   {Path(out) / 'report.html'}")
+    for w in report["aggregates"]["capture_parity_warnings"]:
+        typer.echo(f"WARNING: {w}", err=True)
+
+
+@eval_app.command("report")
+def eval_report(
+    out: Path = typer.Argument(..., help="Campaign dir with job results."),
+):
+    """Re-aggregate an existing campaign dir (e.g. after hand-pruning a
+    job or to regenerate the HTML) without running anything."""
+    import json as _json
+
+    from sculptor.eval import CampaignConfig, run_campaign  # noqa: F401
+    from sculptor.eval.harness import _report_html, aggregate
+    from sculptor.run_context import write_json_atomic
+
+    results = []
+    for rp in sorted(Path(out).glob("*/*/seed_*/result.json")):
+        results.append(_json.loads(rp.read_text(encoding="utf-8")))
+    if not results:
+        typer.echo(f"no result.json files under {out}", err=True)
+        raise typer.Exit(1)
+    report_path = Path(out) / "campaign_report.json"
+    try:
+        prior = _json.loads(report_path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        prior = {"name": Path(out).name, "config": {}}
+    from datetime import datetime, timezone
+
+    prior["created_at"] = datetime.now(timezone.utc).isoformat()
+    prior["aggregates"] = aggregate(results)
+    prior["jobs"] = [
+        {k: v for k, v in r.items() if k != "spec_series"} for r in results
+    ]
+    write_json_atomic(report_path, prior)
+    (Path(out) / "report.html").write_text(
+        _report_html(prior), encoding="utf-8",
+    )
+    typer.echo(f"re-aggregated {len(results)} jobs -> {report_path}")
+
+
+@eval_app.command("list")
+def eval_list():
+    """List benchmarks + conditions."""
+    from sculptor.eval import BENCHMARKS, CONDITIONS
+
+    typer.echo("benchmarks:")
+    for b in BENCHMARKS.values():
+        typer.echo(f"  {b.name:18s} {b.task_id:35s} spec={b.spec_metric}")
+    typer.echo("conditions:")
+    for c in CONDITIONS.values():
+        typer.echo(f"  {c.name:12s} mode={c.mode:11s} {c.notes}")
+
+
 _STORE_OPT = typer.Option(
     None,
     "--store",
@@ -230,6 +455,40 @@ def init(
                "then `sculpt run`.")
 
 
+def _warn_fitness_metric_mismatch(
+    config_path: Path, fitness_metric: Optional[str],
+) -> None:
+    """§Ship 34: emit a visible, non-blocking warning if the chosen
+    fitness metric looks mismatched to the project's robot/task (e.g.
+    go1_trot on a G1 task). Surfaces in the UI log stream so the user can
+    abort before wasting GPU on a semantically-wrong objective."""
+    if not fitness_metric:
+        return
+    from sculptor.eval.spec_metrics import spec_metric_robot_warning
+
+    try:
+        try:
+            import tomllib
+        except ModuleNotFoundError:  # pragma: no cover - py310
+            import tomli as tomllib  # type: ignore[no-redef]
+        with open(config_path, "rb") as f:
+            cfg = tomllib.load(f)
+        task_id = ((cfg.get("adapter") or {}).get("config") or {}).get("task_id")
+    except Exception:  # noqa: BLE001 — the warning is best-effort
+        task_id = None
+    msg = spec_metric_robot_warning(fitness_metric, task_id)
+    if msg:
+        from sculptor.sculpt import _emit_event
+
+        _emit_event({
+            "type": "fitness_metric_warning",
+            "message": msg,
+            "fitness_metric": fitness_metric,
+            "task_id": task_id,
+        })
+        typer.echo(f"[sculpt] WARNING: {msg}", err=True)
+
+
 @app.command()
 def run(
     behavior: str = typer.Argument(
@@ -283,18 +542,71 @@ def run(
         help="Enable/disable §7.4 physics-edit suggestion on severe realism verdicts."),
     early_stop_enabled: Optional[bool] = typer.Option(
         None, "--early-stop/--no-early-stop",
-        help="§Ship-9a: enable or disable the early-stop check. "
-             "Disable for long overnight runs where a transient metric "
-             "dip may mask real behavioral improvement."),
+        help="Compatibility no-op: metric-plateau auto-kill is disabled."),
     early_stop_patience: Optional[int] = typer.Option(
         None, "--early-stop-patience",
-        help="§Ship-9a: consecutive iterations with no primary_metric "
-             "improvement before early-stop fires (default 3)."),
+        help="Compatibility no-op: accepted but ignored."),
+    # §Ship 34: objective fitness-in-the-loop. `--fitness-metric` names a
+    # spec metric (go1_trot / g1_kick / g1_floss / cartpole_balance); the
+    # loop then best-selects on it, shows it to the diagnoser, and
+    # plateau/target early-stops. None = blind (criterion/metric-history
+    # only). The UI's "Objective fitness metric" dropdown maps here.
+    fitness_metric: Optional[str] = typer.Option(
+        None, "--fitness-metric",
+        help="Spec-metric name to use as ground-truth fitness in the loop "
+             "(go1_trot, g1_kick, g1_floss, cartpole_balance). Must match "
+             "the robot. Omit for the blind loop."),
+    fitness_target: Optional[float] = typer.Option(
+        None, "--fitness-target",
+        help="Stop once best fitness reaches this (0-1). Requires "
+             "--fitness-metric."),
+    fitness_patience: Optional[int] = typer.Option(
+        None, "--fitness-patience",
+        help="Stop after this many iters with no new best fitness "
+             "(default 2). Requires --fitness-metric."),
+    # §Ship 35: observe vs steer. observe = compute + display fitness but
+    # DON'T let it influence the run (no diagnoser feed / best-selection /
+    # early-stop) — for a fair blind-vs-guided A/B and for auto-generated
+    # metrics that haven't earned steer-rights. steer = use it (default).
+    fitness_mode: str = typer.Option(
+        "steer", "--fitness-mode",
+        help="'steer' (default): fitness drives selection/early-stop. "
+             "'observe': compute + display only, no influence."),
+    # §Ship 36: revert-on-regression. In steer mode, when an iter fails to
+    # set a new best fitness the next iter rebuilds from the best-so-far
+    # reward instead of the degraded latest (best-first search). Default on.
+    fitness_revert: bool = typer.Option(
+        True, "--fitness-revert/--no-fitness-revert",
+        help="Steer mode: on a fitness regression, revert the edit base to "
+             "the best-so-far reward instead of compounding the bad edit. "
+             "Default on; --no-fitness-revert restores the Ship-33 behavior."),
+    # §Ship 39 (H1): interactive human-in-the-loop control.
+    control_file: Optional[Path] = typer.Option(
+        None, "--control-file",
+        help="Interactive control sidecar (JSON: mode/resume_token/feedback/"
+             "stop). When set, the loop pauses for human feedback at each "
+             "iteration boundary while mode=='manual'. The UI writes it; omit "
+             "for a fully-automated run."),
+    feedback_timeout: float = typer.Option(
+        3600.0, "--feedback-timeout",
+        help="Max seconds to wait at an interactive pause before auto-resuming "
+             "(so a dead client can't pin the GPU)."),
 ):
     """Run the inner loop: train → rollout → diagnose → edit → commit."""
     from sculptor.sculpt import sculpt_run
 
-    result = sculpt_run(
+    if fitness_mode not in ("steer", "observe"):
+        raise typer.BadParameter("--fitness-mode must be 'steer' or 'observe'")
+
+    # Resolve the metric (built-in name or generated-metric path) to a
+    # fitness fn (fail fast before any GPU work). None keeps the blind loop.
+    fitness_fn = None
+    if fitness_metric:
+        from sculptor.eval import resolve_fitness_fn
+        fitness_fn = resolve_fitness_fn(fitness_metric)
+        _warn_fitness_metric_mismatch(config, fitness_metric)
+
+    _sculpt_kwargs = dict(
         config_path=config, behavior_goal=behavior, iterations=iterations,
         resume=resume_run, no_kg=no_kg, dry_run=dry_run,
         steps_per_iter=steps_per_iter,
@@ -307,7 +619,18 @@ def run(
         auto_adjust_physics=auto_adjust_physics,
         early_stop_enabled=early_stop_enabled,
         early_stop_patience=early_stop_patience,
+        fitness_fn=fitness_fn,
+        fitness_observe_only=(fitness_mode == "observe"),
+        fitness_revert=fitness_revert,
+        control_file=control_file,
+        feedback_timeout=feedback_timeout,
     )
+    # Only override sculpt_run's defaults when explicitly provided.
+    if fitness_target is not None:
+        _sculpt_kwargs["fitness_target"] = fitness_target
+    if fitness_patience is not None:
+        _sculpt_kwargs["fitness_patience"] = fitness_patience
+    result = sculpt_run(**_sculpt_kwargs)
     typer.echo(
         f"[sculpt] done. iters_run={result.iterations_run} "
         f"early_stopped={result.early_stopped}")
@@ -315,6 +638,65 @@ def run(
         typer.echo(f"[sculpt] {result.early_stop_reason}")
     if result.final_reward_path:
         typer.echo(f"[sculpt] final reward: {result.final_reward_path}")
+
+
+@app.command("gen-metric")
+def gen_metric(
+    goal: str = typer.Argument(
+        ..., help="Behavior goal to generate an objective fitness metric for."),
+    out: Path = typer.Option(
+        ..., "--out", "-o",
+        help="Directory to write metric.py + meta.json into."),
+    config: Optional[Path] = typer.Option(
+        None, "--config", "-c",
+        help="Optional project config.toml — its task_id is passed as a "
+             "robot hint to the generator."),
+    no_review: bool = typer.Option(
+        False, "--no-review",
+        help="Skip the independent-LLM review gate (validation still runs)."),
+    calibrate_against: Optional[str] = typer.Option(
+        None, "--calibrate-against",
+        help="Built-in metric (go1_trot/g1_kick/g1_floss/cartpole_balance) "
+             "to calibrate the generated metric against (earns steer-rights "
+             "if Spearman >= 0.7)."),
+):
+    """§Ship 35: auto-generate an OBJECTIVE fitness metric for a goal.
+
+    Generate (LLM) -> validate (safety/contract/determinism/bounds/non-
+    degeneracy) -> regenerate on failure -> independent review. The metric
+    is OBSERVE-ONLY until calibrated; pass --calibrate-against to check it
+    ranks like a hand-authored ground-truth metric."""
+    from sculptor.eval import calibrate_metric, generate_objective_metric
+
+    robot_hint: Optional[str] = None
+    if config is not None:
+        try:
+            try:
+                import tomllib
+            except ModuleNotFoundError:  # pragma: no cover - py310
+                import tomli as tomllib  # type: ignore[no-redef]
+            with open(config, "rb") as f:
+                cfg = tomllib.load(f)
+            robot_hint = ((cfg.get("adapter") or {}).get("config") or {}).get("task_id")
+        except Exception:  # noqa: BLE001 — hint is best-effort
+            robot_hint = None
+
+    result = generate_objective_metric(
+        goal, out, robot_hint=robot_hint, review=not no_review)
+    typer.echo(f"[gen-metric] accepted={result['accepted']} "
+               f"(validation_passed={result['validation_passed']})")
+    typer.echo(f"[gen-metric] metric: {result['metric_path']}")
+    if not result["accepted"]:
+        reasons = (result.get("validation") or {}).get("reasons") or []
+        for r in reasons:
+            typer.echo(f"  - {r}", err=True)
+        rev = result.get("review") or {}
+        for c in rev.get("concerns", []):
+            typer.echo(f"  - [review] {c}", err=True)
+    if calibrate_against and result["accepted"]:
+        cal = calibrate_metric(result["metric_path"], calibrate_against)
+        typer.echo(f"[gen-metric] calibration vs {calibrate_against}: "
+                   f"spearman={cal.get('spearman')} ok={cal.get('ok')}")
 
 
 @app.command()
@@ -661,6 +1043,27 @@ def mission_run_cli(
             "Default 5%."
         ),
     ),
+    # §Ship 34: fitness-in-the-loop for every stage (uniform spec metric).
+    fitness_metric: Optional[str] = typer.Option(
+        None, "--fitness-metric",
+        help="Spec-metric name used as ground-truth fitness in EVERY "
+             "stage's loop (go1_trot, g1_kick, g1_floss, cartpole_balance). "
+             "Sound for single-skill missions. Omit for the blind loop."),
+    fitness_target: Optional[float] = typer.Option(
+        None, "--fitness-target",
+        help="Per-stage: stop once best fitness reaches this (0-1)."),
+    fitness_patience: int = typer.Option(
+        2, "--fitness-patience", min=1,
+        help="Per-stage: stop after N iters with no new best fitness."),
+    fitness_mode: str = typer.Option(
+        "steer", "--fitness-mode",
+        help="'steer' (default): fitness drives per-stage selection/early-"
+             "stop. 'observe': compute + display only, no influence."),
+    fitness_revert: bool = typer.Option(
+        True, "--fitness-revert/--no-fitness-revert",
+        help="§Ship 36, per stage (steer mode): on a fitness regression, "
+             "revert the edit base to the best-so-far reward instead of "
+             "compounding the bad edit. Default on."),
 ):
     """Run a previously-initialized mission end-to-end.
 
@@ -674,6 +1077,9 @@ def mission_run_cli(
     from sculptor.kg.store import SculptorKG
     from sculptor.mission import load_mission
     from sculptor.sculpt import mission_run
+
+    if fitness_mode not in ("steer", "observe"):
+        raise typer.BadParameter("--fitness-mode must be 'steer' or 'observe'")
 
     missions_root = project_dir / ".missions"
     if not missions_root.is_dir():
@@ -739,6 +1145,8 @@ def mission_run_cli(
         )
     )
 
+    _warn_fitness_metric_mismatch(config_path, fitness_metric)
+
     kg_store = SculptorKG()
     try:
         result = mission_run(
@@ -755,6 +1163,11 @@ def mission_run_cli(
             max_extensions_per_stage=max_extensions_per_stage,
             extension_factor=extension_factor,
             extension_improvement_threshold=extension_improvement_threshold,
+            fitness_metric=fitness_metric,
+            fitness_target=fitness_target,
+            fitness_patience=fitness_patience,
+            fitness_observe_only=(fitness_mode == "observe"),
+            fitness_revert=fitness_revert,
         )
     finally:
         kg_store.close()

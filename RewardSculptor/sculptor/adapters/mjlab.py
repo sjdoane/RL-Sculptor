@@ -189,6 +189,39 @@ _INFO_KEYS: list[str] = [
     "base_height", "fallen",
 ]
 
+# §Ship 46: extra info keys surfaced for the G1 humanoid so a sculpted
+# reward can shape a single-leg KICK. The g1-kick-v3 overnight run
+# stalled because the reward could only see base_height/fallen — every
+# kick term the diagnoser proposed (swing-foot velocity, single-leg XOR
+# contact, foot clearance) had to be deferred for want of these channels
+# (the deferral was correct: edit.py grounds reward formulas against
+# `expected_info_keys`, and these were absent). mjlab already computes
+# all of them for its own foot reward terms (feet_slip / feet_clearance
+# / feet_swing_height); the runner surfaces them as (N,) scalars,
+# zero-filled on tasks without the named foot sites/sensors. Per-foot
+# keys are advertised ONLY for the G1 biped (which has 'left_foot' /
+# 'right_foot' sites that fix the per-foot column order across the
+# contact / height / site-velocity tensors); other robots keep the
+# 6-key base contract and the runner emits zeros they never reference.
+# `base_horizontal_speed` lets the diagnoser tell standing from walking
+# (info previously had no base velocity, so a forward walker read as
+# "standing still").
+_G1_INFO_EXTRA: list[str] = [
+    "left_foot_contact", "right_foot_contact",
+    "left_foot_swing_speed", "right_foot_swing_speed",
+    "left_foot_height", "right_foot_height",
+    "base_horizontal_speed",
+]
+
+
+def _info_keys_for_task(task_id: str) -> list[str]:
+    """Info-dict keys advertised in the reward contract for a task.
+    G1 gains the per-foot kick channels (§Ship 46); all other task
+    families use the universal base set."""
+    if "G1" in task_id:
+        return list(_INFO_KEYS) + list(_G1_INFO_EXTRA)
+    return list(_INFO_KEYS)
+
 
 _CARTPOLE_STATE_SCHEMA: dict[str, tuple[int, ...]] = {
     # Cartpole is a fixed-base articulation: cart-slide joint + pole-
@@ -232,9 +265,15 @@ class MjlabAdapter(SculptorAdapter):
     # Optional override for the schema keys emitted by the reward-term
     # state snapshot. If empty, derived from task_id via _schema_for_task.
     schema_keys: Optional[list[str]] = None
+    # §Ship 23: optional `[remote]` table (top-level in config.toml,
+    # plumbed by load_adapter) — SSH dispatch of train/rollout to a
+    # rented GPU. `SCULPTOR_REMOTE_*` env vars override these values
+    # (the UI backend's injection path). None/disabled → fully local.
+    remote: Optional[dict[str, Any]] = None
 
     # Populated by __post_init__.
     _validated: bool = field(default=False, init=False, repr=False)
+    _remote_exec: Any = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         # Lazy import — keeps non-mjlab adapters and UI health check
@@ -259,8 +298,14 @@ class MjlabAdapter(SculptorAdapter):
                 f"known tasks: {sorted(registered)}"
             )
 
-        # num_envs autocap on smaller VRAM.
-        if self.device.startswith("cuda") and torch.cuda.is_available():
+        # num_envs autocap on smaller VRAM. Skipped when remote dispatch
+        # is enabled — the local VRAM probe measures the wrong GPU (the
+        # rented pod has its own, almost always larger, card).
+        if (
+            not self._remote_enabled()
+            and self.device.startswith("cuda")
+            and torch.cuda.is_available()
+        ):
             idx = 0
             try:
                 idx = int(self.device.split(":")[1]) if ":" in self.device else 0
@@ -281,12 +326,62 @@ class MjlabAdapter(SculptorAdapter):
         self._mjlab_version = version("mjlab")
         self._validated = True
 
+    # ── Remote dispatch (§Ship 23) ──────────────────────────────────────────
+    def _remote_config(self):
+        """Resolve the effective RemoteConfig (TOML `[remote]` table +
+        `SCULPTOR_REMOTE_*` env overrides; env wins). None when nothing
+        is configured — the common local case."""
+        from sculptor.adapters._remote import RemoteConfig
+
+        return RemoteConfig.from_sources(self.remote, os.environ)
+
+    def _remote_enabled(self) -> bool:
+        rcfg = self._remote_config()
+        return rcfg is not None and rcfg.enabled
+
+    def _remote_executor(self):
+        """Lazily build (and cache) the RemoteExecutor when remote
+        dispatch is enabled; None otherwise."""
+        rcfg = self._remote_config()
+        if rcfg is None or not rcfg.enabled:
+            return None
+        if self._remote_exec is None or self._remote_exec.cfg != rcfg:
+            from sculptor.adapters._remote import RemoteExecutor
+
+            self._remote_exec = RemoteExecutor(rcfg)
+        return self._remote_exec
+
+    @staticmethod
+    def _remote_device_env(device: str) -> tuple[dict[str, str], str]:
+        """Map a remote device selection onto (env, runner_device).
+
+        §Ship 31b (multi-GPU pods): `CUDA_VISIBLE_DEVICES=N` MASKS the
+        GPU set — inside the runner the selected card is always
+        `cuda:0`. Passing `--device cuda:N` alongside the mask raised
+        "invalid device ordinal" for N>0 (latent on single-GPU pods,
+        load-bearing on the campaign's 3× PRO 6000 host). The physical
+        index lives ONLY in the env mask; the runner argv always says
+        cuda:0.
+
+        §Ship 32a: remote hosts are headless — MuJoCo's offscreen
+        renderer needs `MUJOCO_GL=egl` or rollout dies with "an OpenGL
+        platform library has not been loaded" (caught live: campaign
+        first jobs, 2026-06-11; the smoke had rollouts local so the
+        path was never exercised). Inert for train (no GL context is
+        ever created). Provisioning installs the glvnd front-end
+        (libegl1) the EGL path needs."""
+        env = {"MUJOCO_GL": "egl"}
+        if device.startswith("cuda") and ":" in device:
+            env["CUDA_VISIBLE_DEVICES"] = device.split(":")[1]
+            return env, "cuda:0"
+        return env, device
+
     # ── Contract ────────────────────────────────────────────────────────────
     def reward_contract(self) -> RewardContract:
         return RewardContract(
             observation_space_spec=None,
             action_space_spec=None,
-            expected_info_keys=list(_INFO_KEYS),
+            expected_info_keys=_info_keys_for_task(self.task_id),
             expected_components=None,
             supports_batched=True,
             training_device="gpu",
@@ -356,7 +451,7 @@ class MjlabAdapter(SculptorAdapter):
         )
 
         schema_json = json.dumps({k: list(v) for k, v in schema.items()})
-        info_keys_json = json.dumps(_INFO_KEYS)
+        info_keys_json = json.dumps(_info_keys_for_task(self.task_id))
 
         try:
             proc = subprocess.run(
@@ -433,11 +528,21 @@ class MjlabAdapter(SculptorAdapter):
         output_dir: Path,
         steps: int,
         seed: int,
+        *,
+        init_policy_path: Optional[Path] = None,
     ) -> TrainResult:
         """Subprocess-train. `steps` is interpreted as `max_iterations`
         for rsl_rl's OnPolicyRunner (one iteration = num_envs *
         num_steps_per_env policy rollouts = ~num_envs * episode_length
         env steps). Caller budgets accordingly.
+
+        §Ship 15: `init_policy_path` is an optional path to a prior
+        rsl_rl checkpoint. When set, the runner loads actor+critic
+        weights from that checkpoint before training begins. Used by
+        the mission orchestrator (Ship 16) to warm-start a new
+        stage's training from a previous stage's final policy. The
+        source checkpoint MUST be from a compatible task_id — obs and
+        action spaces must match or `runner.load` raises.
         """
         reward_module_path = Path(reward_module_path).resolve() if reward_module_path else None  # type: ignore[assignment]
         output_dir = Path(output_dir).resolve()
@@ -468,6 +573,16 @@ class MjlabAdapter(SculptorAdapter):
         ]
         if reward_module_path is not None:
             cmd += ["--reward-module-path", str(reward_module_path)]
+        # §Ship 15: warm-start flag — validated before spawning the
+        # subprocess so the user sees a clear error instead of a
+        # cryptic subprocess failure buried in stderr.
+        if init_policy_path is not None:
+            init = Path(init_policy_path).resolve()
+            if not init.is_file():
+                raise FileNotFoundError(
+                    f"init_policy_path not found: {init}"
+                )
+            cmd += ["--load-pretrained-policy", str(init)]
         # Always pass the per-task schema keys to the subprocess so
         # SculptorRewardTerm uses the correct key set (bug: previously
         # only passed when `self.schema_keys` was explicitly set, so the
@@ -482,7 +597,49 @@ class MjlabAdapter(SculptorAdapter):
         )
         cmd += ["--schema-keys", ",".join(effective_schema_keys)]
 
-        proc = _run_with_cleanup(cmd, env=env)
+        executor = self._remote_executor()
+        if executor is not None:
+            # §Ship 23: dispatch the runner to the rented GPU. The
+            # executor syncs artifacts back into the same local
+            # `output_dir` (checkpoint.pt promoted LAST), so everything
+            # below — post-checks, metrics, reward_spec.json, resume —
+            # runs unchanged.
+            from sculptor.adapters._remote import RunnerJob
+
+            device = executor.cfg.device or self.device
+            remote_env, runner_device = self._remote_device_env(device)
+            options = {
+                "--task-id": self.task_id,
+                "--num-envs": str(self.num_envs),
+                "--max-iterations": str(max_iterations),
+                "--seed": str(int(seed)),
+                "--device": runner_device,
+                "--schema-keys": ",".join(effective_schema_keys),
+            }
+            input_paths: dict[str, Path] = {}
+            aux_dirs: tuple[Path, ...] = ()
+            if reward_module_path is not None:
+                input_paths["--reward-module-path"] = Path(reward_module_path)
+                # sculpt passes rewards/current.py — a shim that loads
+                # its sibling v<N>.py at import time, so the whole
+                # rewards/ dir must exist at its mirror path on the pod.
+                aux_dirs = (Path(reward_module_path).resolve().parent,)
+            if init_policy_path is not None:
+                input_paths["--load-pretrained-policy"] = Path(init_policy_path).resolve()
+            job = RunnerJob(
+                subcommand="train",
+                options=options,
+                input_paths=input_paths,
+                output_dir=output_dir,
+                # Ordered: completion key (checkpoint.pt — also
+                # sculpt.py's resume key) is promoted last.
+                required_artifacts=("metrics.json", "checkpoint.pt"),
+                remote_env=remote_env,
+                aux_dirs=aux_dirs,
+            )
+            proc = executor.execute(job)
+        else:
+            proc = _run_with_cleanup(cmd, env=env)
         if proc.returncode != 0:
             raise RuntimeError(
                 f"mjlab runner exited {proc.returncode}\n"
@@ -586,7 +743,43 @@ class MjlabAdapter(SculptorAdapter):
             cmd += ["--render-every", str(int(render_every))]
         if fps is not None:
             cmd += ["--fps", str(float(fps))]
-        proc = _run_with_cleanup(cmd, env=env)
+
+        executor = self._remote_executor()
+        if executor is not None and executor.cfg.rollout_remote:
+            # §Ship 23: remote rollout is opt-in (`rollout_remote=true`)
+            # — rollouts are short, and keeping them local preserves
+            # video preview when the pod is flaky.
+            from sculptor.adapters._remote import RunnerJob
+
+            device = executor.cfg.device or self.device
+            remote_env, runner_device = self._remote_device_env(device)
+            options = {
+                "--task-id": self.task_id,
+                "--n-episodes": str(int(n_episodes)),
+                "--device": runner_device,
+            }
+            if max_episode_steps is not None:
+                options["--max-episode-steps"] = str(int(max_episode_steps))
+            if playback_speed is not None:
+                options["--playback-speed"] = str(float(playback_speed))
+            if render_every is not None:
+                options["--render-every"] = str(int(render_every))
+            if fps is not None:
+                options["--fps"] = str(float(fps))
+            job = RunnerJob(
+                subcommand="rollout",
+                options=options,
+                input_paths={"--checkpoint-path": checkpoint_path},
+                output_dir=output_dir,
+                # Ordered: rollout.mp4 last — sculpt.py's rollout-skip
+                # check requires all three non-empty, so a partial sync
+                # can never present as a finished rollout.
+                required_artifacts=("behavior.json", "trajectory.npz", "rollout.mp4"),
+                remote_env=remote_env,
+            )
+            proc = executor.execute(job)
+        else:
+            proc = _run_with_cleanup(cmd, env=env)
         if proc.returncode != 0:
             raise RuntimeError(
                 f"mjlab rollout runner exited {proc.returncode}\n"

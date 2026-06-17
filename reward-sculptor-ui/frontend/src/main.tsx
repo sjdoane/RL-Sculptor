@@ -5,7 +5,14 @@ import { BrowserRouter } from "react-router-dom";
 import { Toaster } from "sonner";
 
 import App from "@/App";
+import { bootstrapTheme } from "@/hooks/useTheme";
 import "@/index.css";
+import "@/styles/rs-tokens.css";
+import "@/styles/rs-theme.css";
+
+// Apply the stored theme (.dark class + data-theme attr) before React
+// mounts so the first paint is correct (no flash of the wrong theme).
+bootstrapTheme();
 
 const queryClient = new QueryClient({
   defaultOptions: {

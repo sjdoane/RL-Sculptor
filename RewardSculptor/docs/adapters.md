@@ -140,6 +140,23 @@ assume a field I didn't wire up." If your env doesn't expose `torso_angle`,
 leave it out of `expected_info_keys`, and the editor will either propose a
 different edit or flag `requires_env_extension=true` with a note to you.
 
+**`expected_info_keys` may vary by task within one adapter.** A single
+adapter can advertise different info keys per task family when the robot
+exposes different sensors. `MjlabAdapter` does this (see
+`_info_keys_for_task`): every task gets the base set
+`{episode_length, terminated, time_outs, step_dt, base_height, fallen}`, and
+the **G1 humanoid additionally** gets per-foot kick channels
+`{left_foot_contact, right_foot_contact, left_foot_swing_speed,
+right_foot_swing_speed, left_foot_height, right_foot_height}` plus
+`base_horizontal_speed`. These are sourced from sensors mjlab already
+computes for its own foot reward terms (`feet_ground_contact`,
+`foot_height_scan`, site velocities) and are surfaced as `(num_envs,)`
+scalars — per-foot data flattened to named keys, zero-filled on tasks
+without the named foot sites/sensors. They exist so a sculpted reward can
+shape a single-leg kick (balance on one foot, swing the other forward); the
+quadruped/Cartpole contracts intentionally omit them so the editor can't
+ground a formula the runner would only zero-fill.
+
 ---
 
 ## Reward-injection patterns

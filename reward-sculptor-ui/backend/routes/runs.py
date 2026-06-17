@@ -9,8 +9,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import re
 from pathlib import Path
 from typing import Any, Optional
+
+# §Ship 21e: snake-case-ish segment guard for mission_slug / stage_name
+# before they're used to build filesystem paths. Mirrors the same
+# allow-list the rewards routes apply. Rejects "..", "/", "\\", etc.
+_SAFE_PATH_SEGMENT = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 from fastapi import (
     APIRouter,
@@ -23,10 +29,23 @@ from fastapi import (
 from fastapi.responses import FileResponse, JSONResponse
 
 from backend.models.project import ProblemDetail
-from backend.models.run import IterEventSummary, RunDetail, RunParams, RunSummary
+from backend.models.run import (
+    IterEventSummary,
+    RunControl,
+    RunControlState,
+    RunDetail,
+    RunParams,
+    RunSummary,
+)
 from backend.services.job_manager import Job, JobManager
 from backend.services.project_store import ProjectStore
-from backend.services.run_manager import build_iterations_summary, run_sculpt_job
+from backend.services.run_manager import (
+    build_iterations_summary,
+    control_file_path,
+    read_control_file,
+    run_sculpt_job,
+    write_control_file,
+)
 
 
 router = APIRouter(tags=["runs"])
@@ -65,9 +84,47 @@ def _find_run(jobs: JobManager, slug: str, run_id: str) -> Optional[Job]:
     job = jobs.get(run_id)
     if job is None:
         return None
-    if job.kind != "sculpt_run" or job.project_slug != slug:
+    # §Ship 21: also accept mission_stage_run kind so per-stage rows
+    # in /runs are addressable by the standard run-detail / clip /
+    # rollout / WS routes.
+    if job.kind not in ("sculpt_run", "mission_stage_run"):
+        return None
+    if job.project_slug != slug:
         return None
     return job
+
+
+def _resolve_run_root(job: Job, project_dir: Path) -> Path:
+    """§Ship 21: where this run's `runs/iter_*/` artifacts live.
+
+    For top-level sculpt_run jobs: `<project_dir>/runs/`.
+    For mission_stage_run jobs: `<project_dir>/.missions/<mission_slug>/
+    stages/<stage_name>/runs/` — each stage scaffolds its own mini-
+    project with its own runs/ tree.
+
+    §Ship 21e (review fix, HIGH): traversal guard. The mission_slug /
+    stage_name come from job.params, which mission_jobs sets from the
+    subprocess's stage_started event. Defense-in-depth: validate both
+    against the snake_case pattern before building a filesystem path
+    that feeds a FileResponse (get_iter_rollout). A malformed name
+    (corrupt mission.json, hand-edited) could otherwise traverse out
+    of the project dir. Mirrors the guards in routes/rewards.py.
+    On any invalid component, fall back to the project runs dir.
+    """
+    if job.kind == "mission_stage_run":
+        mission_slug = job.params.get("mission_slug")
+        stage_name = job.params.get("stage_name")
+        if (
+            isinstance(mission_slug, str)
+            and isinstance(stage_name, str)
+            and _SAFE_PATH_SEGMENT.match(mission_slug)
+            and _SAFE_PATH_SEGMENT.match(stage_name)
+        ):
+            return (
+                project_dir / ".missions" / mission_slug
+                / "stages" / stage_name / "runs"
+            )
+    return project_dir / "runs"
 
 
 def _run_summary(job: Job) -> RunSummary:
@@ -89,6 +146,13 @@ def _run_summary(job: Job) -> RunSummary:
             (it.get("primary_metric") if isinstance(it.get("primary_metric"), (int, float)) else None)
             for it in iters
         ]
+    # §Ship 35 review (CRITICAL): build the parallel objective-fitness
+    # history so the Runs tab can foreground fitness (job_to_run_summary
+    # does this too; this REST builder must match it).
+    fitness_history = [
+        (it.get("fitness") if isinstance(it.get("fitness"), (int, float)) else None)
+        for it in iters
+    ]
     classification_raw = params.get("error_classification")
     classification = None
     if isinstance(classification_raw, dict):
@@ -99,19 +163,29 @@ def _run_summary(job: Job) -> RunSummary:
         except Exception:  # noqa: BLE001
             classification = None
 
+    # §Ship 21: surface mission/stage context for mission_stage_run
+    # rows so the Runs sidebar can group them under their parent
+    # mission, and the detail pane can route per-stage rewards.
     return RunSummary(
         run_id=job.job_id,
         project_slug=job.project_slug or "",
         status=job.status,
         behavior_goal=str(params.get("behavior_goal") or ""),
-        iterations_requested=int(params.get("iterations") or 0),
+        iterations_requested=int(params.get("iterations_requested") or params.get("iterations") or 0),
         iterations_completed=completed,
         current_iter_index=current,
         primary_metric_history=metric_history,
+        fitness_history=fitness_history,
         started_at=job.started_at,
         ended_at=job.ended_at,
         error=job.error,
         error_classification=classification,
+        kind=job.kind,  # type: ignore[arg-type]
+        parent_id=job.parent_id,
+        mission_slug=params.get("mission_slug"),
+        stage_name=params.get("stage_name"),
+        stage_index=params.get("stage_index"),
+        mode=params.get("mode"),
     )
 
 
@@ -194,7 +268,12 @@ def list_runs(
             status.HTTP_404_NOT_FOUND, "project not found",
             detail=f"no project with slug {slug!r}", type_="/problems/not-found",
         )
-    return [_run_summary(j) for j in jobs.list(kind="sculpt_run", project_slug=slug)]
+    # §Ship 21: include `mission_stage_run` rows (per-stage child jobs
+    # registered by mission_jobs._stream_stdout). Sidebar groups them
+    # under their parent mission.
+    sculpt_runs = jobs.list(kind="sculpt_run", project_slug=slug)
+    stage_runs = jobs.list(kind="mission_stage_run", project_slug=slug)
+    return [_run_summary(j) for j in (*sculpt_runs, *stage_runs)]
 
 
 # ── GET /projects/{slug}/runs/{run_id} ────────────────────────────────
@@ -222,9 +301,18 @@ def get_run(
             type_="/problems/not-found",
         )
     summary = _run_summary(job)
+    # §Ship 21: stage runs don't have a top-level RunParams (the
+    # parent mission_execute owns those); synthesize a minimal one
+    # from the stage's recorded fields so RunDetail's existing shape
+    # holds. behavior_goal becomes the stage's goal_text.
+    iters_for_params = int(
+        job.params.get("iterations_requested")
+        or job.params.get("iterations")
+        or 1
+    )
     params = RunParams(
         behavior_goal=str(job.params.get("behavior_goal") or ""),
-        iterations=int(job.params.get("iterations") or 1),
+        iterations=iters_for_params,
         no_kg=bool(job.params.get("no_kg") or False),
         dry_run=bool(job.params.get("dry_run") or False),
     )
@@ -266,6 +354,63 @@ def kill_run(
     jobs.stop(run_id)
     job.emit({"type": "run_stopped", "source": "user"})
     return _run_summary(job)
+
+
+# ── PATCH /projects/{slug}/runs/{run_id}/control ──────────────────────
+@router.patch(
+    "/projects/{slug}/runs/{run_id}/control",
+    response_model=RunControlState,
+    responses={404: {"model": ProblemDetail}},
+)
+def control_run(
+    slug: str,
+    run_id: str,
+    body: RunControl,
+    store: ProjectStore = Depends(get_store),
+    jobs: JobManager = Depends(get_job_manager),
+) -> Any:
+    """§Ship 39 (H1): interactive control for a live run — flip Auto/Manual
+    at any point, resume a pause (optionally with human feedback for the next
+    iteration's diagnose), or stop cleanly. Merges into the run's control
+    sidecar that the sculpt subprocess polls at each iteration boundary."""
+    detail = store.get(slug)
+    if detail is None:
+        return _problem(
+            status.HTTP_404_NOT_FOUND, "project not found",
+            detail=f"no project with slug {slug!r}", type_="/problems/not-found",
+        )
+    job = _find_run(jobs, slug, run_id)
+    if job is None:
+        return _problem(
+            status.HTTP_404_NOT_FOUND, "run not found",
+            detail=f"no sculpt_run with id {run_id!r} in project {slug!r}",
+            type_="/problems/not-found",
+        )
+    path = control_file_path(Path(detail.project_dir), run_id)
+    ctrl = read_control_file(path)
+    if body.mode is not None:
+        ctrl["mode"] = body.mode
+    if body.stop:
+        ctrl["stop"] = True
+    if body.resume:
+        ctrl["resume_token"] = int(ctrl.get("resume_token", 0) or 0) + 1
+        ctrl["feedback"] = body.feedback
+    if body.gen_retry or body.gen_continue:
+        # §Ship 45: deliver the launch-time-generation retry decision the
+        # pre-phase is polling for (retry → regenerate; continue → run blind).
+        ctrl["gen_decision"] = "retry" if body.gen_retry else "blind"
+        ctrl["gen_decision_seq"] = int(ctrl.get("gen_decision_seq", 0) or 0) + 1
+    write_control_file(path, ctrl)
+    # Reflect the new mode on the job so a reconnect / REST summary sees it,
+    # and tee a control event so other connected clients stay in sync.
+    job.params["mode"] = ctrl.get("mode")
+    job.emit({
+        "type": "run_control_updated",
+        "mode": ctrl.get("mode"),
+        "resume": bool(body.resume),
+        "stop": bool(body.stop),
+    })
+    return RunControlState(**ctrl)
 
 
 # ── WS /projects/{slug}/runs/{run_id}/events ──────────────────────────
@@ -520,10 +665,13 @@ def get_iter_rollout(
     detail = store.get(slug)
     if detail is None:
         return _problem(404, "project not found", type_="/problems/not-found")
-    if _find_run(jobs, slug, run_id) is None:
+    job = _find_run(jobs, slug, run_id)
+    if job is None:
         return _problem(404, "run not found", type_="/problems/not-found")
     project_dir = Path(detail.project_dir)
-    path = project_dir / "runs" / f"iter_{iter_index}" / "rollout" / "rollout.mp4"
+    # §Ship 21: stage runs live under .missions/<m>/stages/<s>/runs/
+    runs_root = _resolve_run_root(job, project_dir)
+    path = runs_root / f"iter_{iter_index}" / "rollout" / "rollout.mp4"
     if not path.is_file() or path.stat().st_size < 2048:
         return _problem(
             404, "rollout not available",
@@ -536,5 +684,4 @@ def get_iter_rollout(
     return FileResponse(path, media_type="video/mp4")
 
 
-import re
 _CLIP_NAME_RE = re.compile(r"^iter_\d+\.mp4$")

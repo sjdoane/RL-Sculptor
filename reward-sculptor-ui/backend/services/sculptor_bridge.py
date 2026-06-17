@@ -148,3 +148,91 @@ def cuda_version_ok(min_major: int = 12, min_minor: int = 4) -> bool:
         return parse_version(v) >= parse_version(f"{min_major}.{min_minor}")
     except InvalidVersion:
         return False
+
+
+# ── §Ship 35: auto-generated objective metrics ────────────────────────
+def generate_objective_metric(
+    behavior_goal: str,
+    out_dir: "Path",
+    *,
+    robot_hint: Optional[str] = None,
+    review: bool = True,
+    on_event=None,
+) -> dict:
+    """Generate + validate + review an objective fitness metric (the only
+    module allowed to import sculptor.eval). Returns the full record.
+
+    §Ship 40: `on_event` (optional) streams `{stage, attempt, max, message}`
+    progress so the UI can show live generation progress."""
+    from sculptor.eval import generate_objective_metric as _gen
+
+    return _gen(behavior_goal, out_dir, robot_hint=robot_hint, review=review,
+                on_event=on_event)
+
+
+def calibrate_objective_metric(
+    metric_path: "Path", builtin_name: str, *, threshold: float = 0.7,
+) -> dict:
+    """Calibrate a generated metric against a hand-authored ground-truth
+    metric (Spearman over a competence ladder). Earns steer-rights on ok."""
+    from sculptor.eval import calibrate_metric as _cal
+
+    return _cal(metric_path, builtin_name, threshold=threshold)
+
+
+def calibrate_task_derived_metric(
+    metric_path: "Path", behavior_goal: str,
+    robot_hint: Optional[str] = None, *, client: Any = None, k_sources: int = 3,
+    adversarial: bool = False,
+) -> dict:
+    """§Ship 51: earn steer-rights on a NOVEL task (no built-in ground truth)
+    by ranking K independently-authored competence ladders. `client` is
+    injectable for tests (else a real Anthropic client is constructed).
+    §Ship 53: `adversarial` adds the L3 gaming-archetype gate (flag-gated, may
+    DENY the grant); default off keeps the grant byte-identical to Ship 51."""
+    from sculptor.eval import calibrate_task_derived as _cal
+
+    return _cal(metric_path, behavior_goal, robot_hint,
+                client=client, k_sources=k_sources, adversarial=adversarial)
+
+
+def finalize_calibration(calibration: dict, validation: Optional[dict]) -> dict:
+    """§Ship 52: the unified grant + standardized trust score over both
+    calibration paths. Returns `{calibrated: bool, trust: {...}}`. The grant is
+    byte-identical to today for the 5 built-ins; trust is a display confidence."""
+    from sculptor.eval import compute_trust, grant_decision
+
+    return {
+        "calibrated": bool(grant_decision(calibration, validation)),
+        "trust": compute_trust(calibration, validation),
+    }
+
+
+def builtin_spec_metric_names() -> list[str]:
+    """The hand-authored ground-truth metric names (for calibration UI)."""
+    from sculptor.eval import spec_metric_names
+
+    return spec_metric_names()
+
+
+def resolve_calibration_builtin(
+    behavior_goal: str, robot_hint: Optional[str] = None,
+) -> Optional[str]:
+    """§Ship 44: map a behavior goal to the hand-authored built-in a
+    launch-generated metric should calibrate against (kick→g1_kick,
+    floss→g1_floss, jump→g1_jump, locomotion→go1_trot, balance→cartpole).
+    Returns None when no family matches (the metric then stays observe-only —
+    the firewall never lets an uncalibrated metric steer). Never raises."""
+    try:
+        from sculptor.eval.metric_validate import (
+            FAMILY_TO_BUILTIN,
+            resolve_behavior_family,
+        )
+
+        fam = resolve_behavior_family(behavior_goal, robot_hint)
+        builtin = FAMILY_TO_BUILTIN.get(fam) if fam else None
+        if builtin and builtin in builtin_spec_metric_names():
+            return builtin
+    except Exception:  # noqa: BLE001 — resolution is best-effort
+        pass
+    return None

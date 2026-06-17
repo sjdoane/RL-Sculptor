@@ -21,11 +21,23 @@ from backend.services.job_manager import Job
 
 # Wall-clock ceiling for a single prompt-edit job (seconds). Wraps the
 # sync `apply_prompt_edit` inside `asyncio.wait_for` so Sam's UI never
-# hangs forever on a wedged Anthropic call. The default 300 s matches
-# the 6-retry SDK backoff envelope under worst-case transient errors
-# (base ~30 s call + exponential retries). Overridable via env.
+# hangs forever on a wedged Anthropic call.
+#
+# Budget math (post 2026-04-23 sizing):
+#   - Claude Opus with adaptive-thinking + 16K max_tokens on a ~7K-char
+#     reward-edit prompt takes 180-240s per call (observed 204s live).
+#   - `apply_edits` does up to TWO attempts: attempt 1, post-validate,
+#     retry once on validation error (SyntaxError, schema mismatch, etc).
+#   - Anthropic SDK itself retries twice on transient 429/500 inside
+#     each call, adding up to ~60s of backoff.
+#   Worst case: 2 × (240 + 60) = 600s. Add 5 min margin → 900s.
+# Pre-2026-04-23 default was 300s which was too tight — Sam hit the
+# exact failure mode at 12:57: attempt 1 completed in 204s, attempt 2
+# had only ~90s left and timed out mid-LLM-call.
+# Overridable via env for CI (where we want fast-fail) and for long-
+# prompt / experimental runs.
 DEFAULT_PROMPT_EDIT_TIMEOUT_S = float(
-    os.environ.get("RS_REWARD_PROMPT_TIMEOUT_S", "300")
+    os.environ.get("RS_REWARD_PROMPT_TIMEOUT_S", "900")
 )
 
 

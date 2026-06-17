@@ -23,6 +23,8 @@ import type {
   RewardVersionDetail,
   RewardVersionSummary,
   PhysicsLoadResponse,
+  RemoteDoctorResponse,
+  RemoteSettings,
   RewardDiagnosisPayload,
   RobotStateResponse,
   SystemGpuResponse,
@@ -35,7 +37,15 @@ export class ApiError extends Error {
   type: string;
   problem: ProblemDetail;
   constructor(problem: ProblemDetail) {
-    super(problem.detail || problem.title);
+    // FastAPI 422s put an ARRAY of validation errors in `detail` —
+    // stringify it so toasts don't render "[object Object]".
+    super(
+      typeof problem.detail === "string" && problem.detail
+        ? problem.detail
+        : problem.detail != null && typeof problem.detail === "object"
+          ? JSON.stringify(problem.detail)
+          : problem.title,
+    );
     this.status = problem.status;
     this.type = problem.type;
     this.problem = problem;
@@ -335,6 +345,29 @@ export async function getSystemKgStats(): Promise<SystemKgStatsResponse> {
   return handle<SystemKgStatsResponse>(await fetch("/api/system/kg/stats"));
 }
 
+// ── Remote GPU dispatch (§Ship 23d) ─────────────────────────────────
+export async function getRemoteSettings(): Promise<RemoteSettings> {
+  return handle<RemoteSettings>(await fetch("/api/system/remote"));
+}
+
+export async function putRemoteSettings(body: RemoteSettings): Promise<RemoteSettings> {
+  return handle<RemoteSettings>(
+    await fetch("/api/system/remote", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  );
+}
+
+/** Runs ssh connectivity checks against the SAVED settings — PUT first.
+ * Can take ~30 s when the host is unreachable. */
+export async function runRemoteDoctor(): Promise<RemoteDoctorResponse> {
+  return handle<RemoteDoctorResponse>(
+    await fetch("/api/system/remote/doctor", { method: "POST" }),
+  );
+}
+
 // ── Physics (M7 Phase 5) ────────────────────────────────────────────
 export async function getPhysics(
   slug: string,
@@ -390,7 +423,7 @@ export async function fetchPreviewBlob(
   slug: string,
   opts?: PreviewQueryParams,
 ): Promise<string> {
-  const res = await fetch(previewUrl(slug, opts));
+  const res = await fetch(previewUrl(slug, opts), { cache: "no-store" });
   if (!res.ok) {
     let problem: ProblemDetail;
     try {
@@ -410,18 +443,27 @@ export async function fetchPreviewBlob(
 }
 
 // ── Rewards ───────────────────────────────────────────────────────────
-export async function listRewards(slug: string): Promise<RewardVersionSummary[]> {
+export async function listRewards(
+  slug: string,
+  /** §Ship 21: optional `<missionSlug>/<stageName>` to scope rewards
+   *  to that mission stage's rewards/ dir. Omit for project rewards. */
+  stage?: string,
+): Promise<RewardVersionSummary[]> {
+  const qs = stage ? `?stage=${encodeURIComponent(stage)}` : "";
   return handle<RewardVersionSummary[]>(
-    await fetch(`/api/projects/${slug}/rewards`),
+    await fetch(`/api/projects/${slug}/rewards${qs}`),
   );
 }
 
 export async function getReward(
   slug: string,
   version: number,
+  /** §Ship 21: optional `<missionSlug>/<stageName>` to scope. */
+  stage?: string,
 ): Promise<RewardVersionDetail> {
+  const qs = stage ? `?stage=${encodeURIComponent(stage)}` : "";
   return handle<RewardVersionDetail>(
-    await fetch(`/api/projects/${slug}/rewards/${version}`),
+    await fetch(`/api/projects/${slug}/rewards/${version}${qs}`),
   );
 }
 
@@ -446,9 +488,15 @@ export async function putReward(
 export async function getRewardDiagnosis(
   slug: string,
   version: number,
+  /** §Ship 21d: optional `<missionSlug>/<stageName>` to fetch the
+   *  diagnosis from that stage's runs dir instead of the project
+   *  runs dir. Required for the "Why this edit?" panel to work on
+   *  mission stage reward versions. */
+  stage?: string,
 ): Promise<RewardDiagnosisPayload> {
+  const qs = stage ? `?stage=${encodeURIComponent(stage)}` : "";
   return handle<RewardDiagnosisPayload>(
-    await fetch(`/api/projects/${slug}/rewards/${version}/diagnosis`),
+    await fetch(`/api/projects/${slug}/rewards/${version}/diagnosis${qs}`),
   );
 }
 
@@ -556,6 +604,7 @@ export async function listJobs(opts?: {
 
 // ── Runs ──────────────────────────────────────────────────────────────
 import type {
+  RunControlState,
   RunDetail,
   RunParamsPayload,
   RunSummary,
@@ -593,6 +642,29 @@ export async function killRun(
   return handle<RunSummary>(
     await fetch(`/api/projects/${slug}/runs/${runId}`, {
       method: "DELETE",
+    }),
+  );
+}
+
+// §Ship 39 (H1): interactive control for a live run — flip Auto/Manual,
+// resume a pause (optionally with human feedback), or stop cleanly.
+export async function controlRun(
+  slug: string,
+  runId: string,
+  body: {
+    mode?: "manual" | "auto";
+    resume?: boolean;
+    feedback?: string | null;
+    stop?: boolean;
+    gen_retry?: boolean;
+    gen_continue?: boolean;
+  },
+): Promise<RunControlState> {
+  return handle<RunControlState>(
+    await fetch(`/api/projects/${slug}/runs/${runId}/control`, {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
     }),
   );
 }
@@ -680,6 +752,10 @@ export interface RunMissionRequestBody {
   max_extensions_per_stage?: number;
   extension_factor?: number;
   extension_improvement_threshold?: number;
+  // §Ship 34/35: per-stage objective fitness-in-the-loop (built-in name
+  // or "gen:<id>") + observe/steer mode.
+  fitness_metric?: string | null;
+  fitness_mode?: "observe" | "steer";
 }
 
 export async function runMission(
@@ -725,4 +801,39 @@ export async function getDashboard(): Promise<DashboardSummary> {
 
 export async function getSystemInfo(): Promise<SystemInfo> {
   return handle<SystemInfo>(await fetch("/api/system/info"));
+}
+
+// ── §Ship 35: auto-generated objective metrics ────────────────────────
+import type { MetricGenProgress, MetricSummary } from "./types";
+
+export async function listProjectMetrics(slug: string): Promise<MetricSummary[]> {
+  return handle<MetricSummary[]>(await fetch(`/api/projects/${slug}/metrics`));
+}
+
+// §Ship 40: poll live generation progress while a generate is in flight.
+export async function getMetricGenProgress(slug: string): Promise<MetricGenProgress> {
+  return handle<MetricGenProgress>(
+    await fetch(`/api/projects/${slug}/metrics/generate/progress`));
+}
+
+export async function generateProjectMetric(
+  slug: string,
+  body: { behavior_goal: string; review?: boolean; calibrate_against?: string | null },
+): Promise<MetricSummary> {
+  return handle<MetricSummary>(
+    await fetch(`/api/projects/${slug}/metrics/generate`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  );
+}
+
+export async function calibrateProjectMetric(
+  slug: string, metricId: string, against: string,
+): Promise<MetricSummary> {
+  return handle<MetricSummary>(
+    await fetch(`/api/projects/${slug}/metrics/${metricId}/calibrate?against=${encodeURIComponent(against)}`,
+      { method: "POST" }),
+  );
 }

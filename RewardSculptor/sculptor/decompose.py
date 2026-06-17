@@ -109,9 +109,32 @@ class _StageModel(BaseModel):
         ),
     )
 
+    # §Ship 38: optional per-stage objective metric. Lets a multi-phase
+    # curriculum steer each phase by ITS OWN objective instead of one
+    # uniform mission metric. Conservative by design — only a correct fit.
+    steering_metric: Optional[str] = Field(
+        default=None,
+        description=(
+            "OPTIONAL. The name of a built-in spec metric (see "
+            "AVAILABLE_FITNESS_METRICS) that DIRECTLY and CORRECTLY measures "
+            "THIS stage's sub-goal for THIS robot. Set it ONLY when a listed "
+            "metric clearly fits the stage; otherwise OMIT (null) — the "
+            "mission-level metric / success criterion is used. A wrong-robot "
+            "or loosely-related metric MIS-steers the stage; when unsure, null."
+        ),
+    )
+
     @field_validator("init_skill_id", mode="before")
     @classmethod
     def _normalize_init_skill_id(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        s = str(v).strip()
+        return s or None
+
+    @field_validator("steering_metric", mode="before")
+    @classmethod
+    def _normalize_steering_metric(cls, v: Any) -> Optional[str]:
         if v is None:
             return None
         s = str(v).strip()
@@ -160,8 +183,14 @@ def _render_kg_context(
             [],
         )
     try:
-        from sculptor.kg.query import query_semantic
-        matches = query_semantic(goal, top_k=top_k, store=kg_store)
+        from sculptor.kg.query import (
+            DEFAULT_MIN_PROMPT_SIMILARITY,
+            query_semantic,
+        )
+        # §Ship 31: floored — same Issue-G rationale as diagnose/edit.
+        matches = query_semantic(
+            goal, top_k=top_k, store=kg_store,
+            min_similarity=DEFAULT_MIN_PROMPT_SIMILARITY)
     except Exception as e:  # noqa: BLE001
         print(
             f"[decompose] KG query failed ({type(e).__name__}: {e}) — "
@@ -226,16 +255,34 @@ def _build_user_content(
     contract: Any,
     kg_context: str,
     skill_context: str = "",
+    fitness_metrics_block: str = "",
 ) -> str:
     skill_block = f"{skill_context}\n\n" if skill_context else ""
+    metrics_block = f"{fitness_metrics_block}\n\n" if fitness_metrics_block else ""
     return (
         f"# BEHAVIOR_GOAL\n{goal}\n\n"
         f"{_render_contract(contract)}\n"
         f"{kg_context}\n\n"
+        f"{metrics_block}"
         f"{skill_block}"
         "Emit the decomposition JSON now. Ordered stages only, "
         "topologically valid parent_stage refs, final stage must satisfy "
         "the behavior goal end-to-end."
+    )
+
+
+def _render_fitness_metrics_block() -> str:
+    """§Ship 38: the list of built-in objective metrics the decomposer may
+    assign per stage (conservatively)."""
+    from sculptor.eval.spec_metrics import spec_metric_names
+
+    return (
+        "# AVAILABLE_FITNESS_METRICS\n"
+        "Optional per-stage objectives you MAY assign to a stage's "
+        "`steering_metric` when one DIRECTLY measures that stage's sub-goal "
+        f"for this robot: {spec_metric_names()}. They are robot-specific "
+        "(g1_* are humanoid; go1_trot is a quadruped gait; cartpole_balance "
+        "is cartpole). Assign ONLY a correct fit; otherwise leave it null."
     )
 
 
@@ -433,9 +480,31 @@ def _stages_from_model(stages_in: list[_StageModel]) -> list[Stage]:
             reward_seed_prompt=s.reward_seed_prompt,
             kg_seed_papers=list(s.kg_seed_papers or []),
             init_skill_id=s.init_skill_id,
+            steering_metric=s.steering_metric,
         )
         for s in stages_in
     ]
+
+
+def _validate_steering_metrics(stages: list[Stage]) -> None:
+    """§Ship 38: a decomposer-authored `steering_metric` must name a KNOWN
+    built-in spec metric. Generated-metric paths are assigned by the UI /
+    backend (which resolves + calibrates them), never invented by the
+    decomposer. An unknown name triggers the parse-retry path rather than a
+    fail-fast crash deep in mission_run."""
+    from sculptor.eval.spec_metrics import spec_metric_names
+
+    known = set(spec_metric_names())
+    offenders = [
+        (s.name, s.steering_metric) for s in stages
+        if s.steering_metric and s.steering_metric not in known
+    ]
+    if offenders:
+        raise MissionValidationError(
+            "steering_metric references unknown spec metrics: "
+            + ", ".join(f"{n}→{m!r}" for n, m in offenders)
+            + f". Use one of {sorted(known)} or omit the field."
+        )
 
 
 # ── Public entry ─────────────────────────────────────────────────────
@@ -495,6 +564,7 @@ def decompose_task(
     )
     user_content = _build_user_content(
         goal, reward_contract, kg_context, skill_context=skill_context,
+        fitness_metrics_block=_render_fitness_metrics_block(),
     )
 
     parsed = _parse_with_retry(
@@ -516,6 +586,8 @@ def decompose_task(
     _validate_kg_seed_papers(stages, set(available_ids), kg_store)
     # Ship 19: skill-library citation verification.
     _validate_skill_ids(stages, set(available_skill_ids))
+    # §Ship 38: per-stage steering-metric verification.
+    _validate_steering_metrics(stages)
 
     return mission
 
@@ -677,6 +749,7 @@ def redecompose_stage(
     kg_store: Any = None,
     client: Any = None,
     model: str = MODEL_ID,
+    prior_attempt_error: Optional[str] = None,
 ) -> list[Stage]:
     """Ask Claude to split a failed stage into 2-8 simpler sub-stages.
 
@@ -713,6 +786,24 @@ def redecompose_stage(
     user_content = _build_redecompose_user_content(
         failed_stage, reward_contract, kg_context, feedback,
     )
+    if prior_attempt_error:
+        # Ship 22r: a previous redecomposition draft was rejected by the
+        # mission validator (e.g. a sub-stage criterion referenced a key the
+        # rollout doesn't persist). Feed the exact error back so Claude fixes
+        # the offending sub-stage instead of the caller halting the mission.
+        user_content += (
+            "\n\n## PREVIOUS REDECOMPOSITION ATTEMPT WAS REJECTED\n"
+            f"{prior_attempt_error}\n\n"
+            "Fix the offending sub-stage. EVERY success_criterion may ONLY "
+            "reference keys that exist: `behavior[<BEHAVIOR_KEY>]`, "
+            "`components[<name your reward_seed_prompt defines>]`, "
+            "`trajectory[<PERSISTED_TRAJECTORY_KEY>]` / `info[...]`, or `metric`. "
+            "Do NOT use base_height / fallen or any non-persisted key — derive "
+            "base height from `trajectory['root_link_pos_w'][..., 2]` and an "
+            "upright/fallen proxy from `trajectory['projected_gravity_b'][..., 2]`. "
+            "Use `<dict>.get(key, default)` for any component you are unsure the "
+            "reward emits."
+        )
     parsed = _parse_with_retry(
         client, system_prompt, user_content,
         output_format=_RedecompositionModel, model=model,
@@ -783,9 +874,147 @@ def redecompose_stage(
             ),
             reward_seed_prompt=model_stage.reward_seed_prompt,
             kg_seed_papers=list(model_stage.kg_seed_papers or []),
+            # §Ship 38: sub-stages inherit the failed stage's objective so a
+            # re-decomposed phase keeps steering by the same metric.
+            steering_metric=failed_stage.steering_metric,
             redecomposition_attempts=1,  # bound at one level
         ))
 
     # KG citation verification (same as decompose_task).
     _validate_kg_seed_papers(sub_stages, set(available_arxiv_ids), kg_store)
     return sub_stages
+
+
+# ── §Ship 25a (H1): criterion ↔ reward-component reconciliation ──────
+class _ReconcileModel(BaseModel):
+    """Claude's response schema for a criterion rewrite."""
+
+    rationale: str
+    success_criterion: str
+
+
+def _gate_reconciled_criterion(
+    stage: Stage,
+    new_criterion: str,
+    available_components: list[str],
+) -> None:
+    """All validation gates a reconciled criterion must pass. Raises
+    MissionValidationError with an actionable message (fed back to
+    Claude on the retry attempt)."""
+    from sculptor.mission_runtime import extract_components_keys
+
+    if not new_criterion:
+        raise MissionValidationError(
+            "reconcile_criterion: Claude returned an empty criterion"
+        )
+    if new_criterion == stage.success_criterion.strip():
+        raise MissionValidationError(
+            "reconcile_criterion: rewrite is identical to the original — "
+            "the missing-key references were not fixed"
+        )
+
+    # Same static gate the decomposer's criteria pass through, run on a
+    # COPY so a rejected rewrite can't leave the stage half-mutated.
+    from dataclasses import replace as _dc_replace
+
+    from sculptor.mission import _validate_success_criterion
+
+    candidate = _dc_replace(stage, success_criterion=new_criterion)
+    _validate_success_criterion(candidate, set())
+
+    # ALSO run the runtime's unsafe-AST gate statically (the decompose-
+    # time validator checks subscript keys + torch idioms but defers
+    # node-level safety — lambdas etc. — to eval time; a reconciled
+    # criterion must not fail LATER for a reason knowable NOW).
+    import ast as _ast
+
+    from sculptor.mission_runtime import (
+        BARE_IDENTIFIERS,
+        CriterionEvalError,
+        _validate_criterion_ast,
+    )
+
+    try:
+        _validate_criterion_ast(
+            _ast.parse(new_criterion, mode="eval"),
+            namespace_keys=set(BARE_IDENTIFIERS) | {
+                "behavior", "components", "trajectory", "info",
+            },
+        )
+    except (CriterionEvalError, SyntaxError) as e:
+        raise MissionValidationError(
+            f"reconcile_criterion: rewrite failed the runtime safety "
+            f"gate: {e}"
+        ) from e
+
+    still_missing = (
+        extract_components_keys(new_criterion) - set(available_components)
+    )
+    if still_missing:
+        raise MissionValidationError(
+            f"reconcile_criterion: rewrite still hard-references absent "
+            f"component keys {sorted(still_missing)} "
+            f"(available: {sorted(available_components)})"
+        )
+
+
+def reconcile_criterion(
+    stage: Stage,
+    *,
+    missing_keys: list[str],
+    available_components: list[str],
+    client: Any = None,
+    model: str = MODEL_ID,
+) -> tuple[str, str]:
+    """Rewrite a stage's success_criterion whose hard
+    `components['<name>']` references don't exist in the materialized
+    reward — caught at iter 0 by the probe instead of burning the whole
+    stage budget before `criterion_not_met` fires at eval time.
+
+    Returns `(new_criterion, rationale)`. One validation-feedback retry:
+    a rewrite that fails the gates gets a second attempt carrying the
+    exact gate error (mirrors redecompose's `prior_attempt_error`).
+    Raises MissionValidationError when both attempts fail.
+    """
+    if client is None:
+        import anthropic
+
+        client = anthropic.Anthropic(max_retries=2, timeout=240.0)
+
+    from sculptor.mission_runtime import (
+        BEHAVIOR_KEYS,
+        PERSISTED_TRAJECTORY_KEYS,
+    )
+
+    system_prompt = load_prompt("reconcile_criterion")
+    payload: dict[str, Any] = {
+        "stage_name": stage.name,
+        "stage_goal": stage.goal_text,
+        "current_criterion": stage.success_criterion,
+        "missing_component_keys": sorted(missing_keys),
+        "available_component_keys": sorted(available_components),
+        "available_behavior_keys": sorted(BEHAVIOR_KEYS),
+        "available_trajectory_keys": sorted(PERSISTED_TRAJECTORY_KEYS),
+        "reward_seed_prompt": stage.reward_seed_prompt,
+    }
+
+    last_error: Optional[str] = None
+    for _attempt in range(2):
+        if last_error is not None:
+            payload["prior_attempt_error"] = last_error
+        parsed = _parse_with_retry(
+            client, system_prompt, json.dumps(payload, indent=2),
+            output_format=_ReconcileModel, model=model,
+        )
+        new_criterion = parsed.success_criterion.strip()
+        try:
+            _gate_reconciled_criterion(
+                stage, new_criterion, available_components,
+            )
+            return new_criterion, parsed.rationale
+        except MissionValidationError as e:
+            last_error = str(e)
+    raise MissionValidationError(
+        f"reconcile_criterion: rewrite failed validation twice; "
+        f"last error: {last_error}"
+    )

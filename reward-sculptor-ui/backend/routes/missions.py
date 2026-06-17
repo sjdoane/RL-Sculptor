@@ -182,6 +182,15 @@ def create_mission(
         # Empty marker — decompose will write mission.json here.
         (reserved_dir / ".decompose_pending").touch()
 
+        # §Ship 21a: thread run_defaults from the NewMissionDialog
+        # Advanced tab through to the decompose job so the resulting
+        # mission.json carries them; RunMissionDialog pre-fills from
+        # them on first open. body.run_defaults is already validated
+        # via the RunMissionRequest pydantic shape.
+        run_defaults_dict = (
+            body.run_defaults.model_dump(exclude_none=False)
+            if body.run_defaults is not None else None
+        )
         job = jobs.submit(
             kind="mission_decompose",
             project_slug=slug,
@@ -191,11 +200,16 @@ def create_mission(
                 goal=body.goal,
                 mission_slug=mission_slug,
                 no_kg=body.no_kg,
+                run_defaults=run_defaults_dict,
             ),
             params={
                 "mission_slug": mission_slug,
                 "goal": body.goal,
                 "no_kg": body.no_kg,
+                # Surface in params so the frontend optimistic-cache
+                # write can show the user the Advanced settings round-
+                # tripped successfully.
+                "run_defaults": run_defaults_dict,
             },
         )
     finally:
@@ -366,6 +380,9 @@ def run_mission(
             project_slug=slug,
             mission_slug=mission_slug,
             run_kwargs=run_kwargs,
+            # §Ship 21: pass JobManager so the streamer can register
+            # per-stage child Jobs (mission_stage_run kind) on the fly.
+            job_manager=jobs,
         ),
         params={"mission_slug": mission_slug, **run_kwargs},
     )
