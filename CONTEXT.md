@@ -339,6 +339,42 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-17 — fix: a RESUMED run no longer shows the prior run's iterations as RUNNING
+
+- **What**: two backend-only changes in `reward-sculptor-ui/backend/services/run_manager.py`.
+  (1) The fs watcher's boot pre-scan `_scan_once` (which EMITTED `iter_started`/
+  `edit_applied` for every on-disk `iter_<n>`/`v<n>.py`) is replaced by a no-emit
+  `_preseed_seen` that just POPULATES the dedup sets (seen_iters / seen_iter_done /
+  seen_rollouts / seen_realism / seen_rewards; seen_citations transitively via
+  seen_rewards) from what's already on disk at run start — keyed on artifact VALIDITY
+  (mp4 >2048B, parseable diagnosis/realism JSON), not mere dir existence. (2) `_iter_events`
+  now reconciles a stranded lower iter: in a sequential loop only the highest-started iter
+  can still be running, so any lower iter still "running" (a dropped stdout line / crash-
+  then-resume) is coerced to completed. New `backend/tests/test_run_resume_state.py` (3).
+- **Why**: on a RESUMED run (or any run on a project with prior `iter_<n>` dirs) the UI
+  showed ALL previous iterations as RUNNING simultaneously, forever — Sam's long-standing
+  "the left gets all screwed up… displays all the previous ones as running at the same
+  time." Root cause: the fs watcher emitted `iter_started` (source=fs) for every on-disk
+  iter dir, but `iter_completed` only ever comes from the LIVE subprocess stdout for the
+  iters it actually runs (>= start_iter) — so prior iters got a "started" with no matching
+  "completed" and hung running. Verified live: before, GET /runs/{id} returned 12 iters
+  with 0-8 all `running`; after the fix + re-resume, it returns only the current run's
+  iters (e.g. `[(11,'running')]`), zero stale. The same FS over-emit also re-applied prior
+  edits/citations/realism chips — all fixed by the pre-seed.
+- **How**: the live subprocess stdout re-emits iter_started/iter_completed for the resumed
+  range, and the `awatch` loop catches anything CREATED during this run (incl. a fresh
+  run's iter_0 written after the seed), so the watcher now reports ONLY this run's state.
+  Investigation (2-agent workflow) confirmed all six `seen_*` leak points are covered by
+  the pre-seed and ZERO existing tests break (the watcher tests all drive emits through a
+  monkeypatched fake run_sculpt_job; none exercise `_scan_once` with pre-created dirs).
+  Backend-only — the frontend derives the card badge straight from the backend `it.status`.
+- **Verified**: `backend/tests/test_run_resume_state.py` (3) + full backend suite; live
+  end-to-end on g1-kick-v5 (resumed from iter 11 after the stop-fix-resume, panel clean).
+  NOTE: a resumed run's panel now shows only THAT run's iters (start_iter onward) — the
+  full cross-run history lives in metric_history / the CHANGELOG. Separate open item Sam
+  raised: a "New Run" on a previously-run project always `--resume`s (never restarts at 0);
+  offering an explicit fresh-vs-resume choice is a follow-up.
+
 ### 2026-06-15 — Ship 53: adversarial gaming archetypes (L3)
 
 - **What**: generalize Ship-47's HARD-CODED walker/flail negatives to ANY task.

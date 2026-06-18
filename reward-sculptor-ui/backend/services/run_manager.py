@@ -762,10 +762,14 @@ async def _fs_watcher(
     seen_citations: set[tuple[int, str]] = set()
     seen_realism: set[int] = set()
 
-    # Pre-scan (in case iter_0 was already created before the watcher
-    # booted — happens in a fast dry-run startup race).
-    _scan_once(
-        job, project_dir,
+    # Pre-SEED the dedup sets with iterations/artifacts/rewards already on disk
+    # at run start (NO emit) so a RESUMED run never surfaces the PRIOR run's
+    # iters as 'running' / re-applies their edits. The live subprocess stdout
+    # re-emits iter_started/iter_completed for the iters this run executes, and
+    # the awatch loop below catches anything CREATED during this run (incl. a
+    # fresh run's iter_0 written after this seed).
+    _preseed_seen(
+        project_dir,
         seen_iters=seen_iters,
         seen_iter_done=seen_iter_done,
         seen_rollouts=seen_rollouts,
@@ -809,8 +813,7 @@ class _StopEventAdapter:
         return self._cancel.is_set()
 
 
-def _scan_once(
-    job: Job,
+def _preseed_seen(
     project_dir: Path,
     *,
     seen_iters: set[int],
@@ -820,6 +823,25 @@ def _scan_once(
     seen_citations: set[tuple[int, str]],
     seen_realism: set[int] | None = None,
 ) -> None:
+    """Populate the watcher's dedup sets with iterations/artifacts/rewards
+    ALREADY on disk when this run STARTS — WITHOUT emitting any event.
+
+    Those belong to a PRIOR run (or this run is a `--resume`), so the watcher
+    must NOT surface them as 'started/running' iteration cards or re-applied
+    edits in THIS run's timeline. (The bug this fixes: a resumed run showed the
+    previous run's iters perpetually RUNNING, because the fs watcher emitted
+    `iter_started` for every on-disk iter_<n> dir but `iter_completed` only ever
+    comes from the live subprocess stdout for the iters it actually runs.)
+
+    The live subprocess stdout drives the timeline for the iters this run
+    executes — it re-emits `iter_started`/`iter_completed` for the resumed range
+    — and the `awatch` loop + `_handle_fs_changes` catch anything CREATED during
+    this run. Artifact sets are keyed on artifact VALIDITY (the same predicates
+    `_check_iter_artifacts` uses), not mere dir existence, so a half-written
+    prior iter can't strand a stray rollout_done/diagnosed. `seen_citations` is
+    covered transitively: it is only written inside `_emit_edit_applied`, which
+    is gated by `seen_rewards`."""
+    _ = seen_citations  # transitively covered via seen_rewards; kept for parity
     runs_dir = project_dir / "runs"
     if runs_dir.is_dir():
         for d in runs_dir.iterdir():
@@ -827,25 +849,31 @@ def _scan_once(
             if not m:
                 continue
             n = int(m.group(1))
-            if n not in seen_iters:
-                seen_iters.add(n)
-                job.emit({"type": "iter_started", "source": "fs", "iter": n})
-            _check_iter_artifacts(
-                job, d, n, seen_rollouts=seen_rollouts,
-                seen_iter_done=seen_iter_done,
-                seen_realism=seen_realism,
-            )
+            seen_iters.add(n)
+            mp4 = d / "rollout" / "rollout.mp4"
+            if mp4.is_file() and mp4.stat().st_size > 2048:
+                seen_rollouts.add(n)
+            if seen_realism is not None and (d / "realism_audit.json").is_file():
+                try:
+                    if isinstance(json.loads(
+                            (d / "realism_audit.json").read_text(encoding="utf-8")),
+                            dict):
+                        seen_realism.add(n)
+                except Exception:  # noqa: BLE001
+                    pass
+            if (d / "diagnosis.json").is_file():
+                try:
+                    if json.loads((d / "diagnosis.json").read_text(encoding="utf-8")):
+                        seen_iter_done.add(n)
+                except Exception:  # noqa: BLE001
+                    pass
 
     rewards_dir = project_dir / "rewards"
     if rewards_dir.is_dir():
         for p in rewards_dir.iterdir():
             mv = re.fullmatch(r"v(\d+)\.py", p.name)
-            if not mv:
-                continue
-            v = int(mv.group(1))
-            if v > 0 and v not in seen_rewards:
-                seen_rewards.add(v)
-                _emit_edit_applied(job, rewards_dir, v, seen_citations)
+            if mv and int(mv.group(1)) > 0:
+                seen_rewards.add(int(mv.group(1)))
 
 
 def _handle_fs_changes(
@@ -1259,6 +1287,21 @@ def _iter_events(job: Job) -> list[dict[str, Any]]:
         elif etype == "best_reward_selected":
             if isinstance(ev.get("fitness"), (int, float)):
                 slot["best_fitness"] = float(ev.get("fitness"))
+
+    # §fix: a sequential sculpt loop runs ONE iter at a time, so only the
+    # highest-started iter can still be running. A LOWER iter still marked
+    # "running" lost its `iter_completed` (a dropped stdout line, or a
+    # crash-then-resume) — the loop demonstrably advanced past it, so reconcile
+    # it to "completed" rather than stranding a stale RUNNING card. The current
+    # (highest-started) iter keeps its event-derived status. Defense-in-depth
+    # alongside the watcher pre-seed: `completed` is otherwise STRICTLY
+    # stdout-`iter_completed`-driven with no artifact fallback.
+    started_idxs = [i for i, s in by_iter.items() if s.get("started_at")]
+    if started_idxs:
+        max_started = max(started_idxs)
+        for i, s in by_iter.items():
+            if i < max_started and s["status"] == "running":
+                s["status"] = "completed"
 
     return [by_iter[k] for k in sorted(by_iter.keys())]
 
