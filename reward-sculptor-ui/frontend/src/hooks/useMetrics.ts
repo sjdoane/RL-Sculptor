@@ -34,7 +34,8 @@ export function useGenerateMetric(slug: string) {
   const qc = useQueryClient();
   return useMutation<
     MetricSummary, Error,
-    { behavior_goal: string; review?: boolean; calibrate_against?: string | null }
+    { behavior_goal: string; review?: boolean; n_candidates?: number;
+      calibrate_against?: string | null }
   >({
     mutationFn: (body) => generateProjectMetric(slug, body),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["metrics", slug] }),

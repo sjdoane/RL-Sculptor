@@ -118,6 +118,13 @@ class RunParams(BaseModel):
     fitness_mode: Literal["observe", "steer"] = "steer"
     """How the fitness signal is used. observe = passive display only."""
 
+    # §best-of-N: when fitness_metric == "generate-at-launch", how many candidate
+    # metrics to sample at launch and select the most-discriminating valid one from
+    # (1 → single-shot-with-retry). Bounded so a typo can't fan out unbounded LLM
+    # calls; ignored for any other fitness_metric value.
+    metric_n_candidates: Annotated[int, Field(ge=1, le=8)] = 1
+    """Best-of-N candidates for a generate-at-launch metric. 1 = single-shot."""
+
     # §Ship 48: patience for the FITNESS-plateau early-stop — the live early
     # stop on a steered run (stop after this many iters with no NEW BEST
     # fitness). This is the knob that actually governs truncation; the

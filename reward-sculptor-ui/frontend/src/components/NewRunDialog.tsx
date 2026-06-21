@@ -182,6 +182,10 @@ export function NewRunDialog({
   const genProgress = useMetricGenProgress(slug, genMetric.isPending);
   const calibrate = useCalibrateMetric(slug);
   const [calibrateAgainst, setCalibrateAgainst] = useState<string>("go1_trot");
+  // §best-of-N: how many candidate metrics to sample + keep the most-discriminating
+  // valid one (1 = single-shot-with-retry). Applies to BOTH the Generate button and
+  // the generate-at-launch path. Each candidate is a ~1-2 min LLM call.
+  const [metricCandidates, setMetricCandidates] = useState<number>(1);
   const genMetrics = (projectMetrics.data ?? []).filter((m) => m.accepted);
   const selectedGen = fitnessMetric?.startsWith("gen:")
     ? genMetrics.find((m) => `gen:${m.id}` === fitnessMetric) ?? null
@@ -250,6 +254,9 @@ export function NewRunDialog({
       // uncalibrated generated metric is forced to observe; §Ship 42: a
       // launch-time-generated metric is uncalibrated by definition.
       fitness_mode: steerLocked || isLaunchGen ? "observe" : fitnessMode,
+      // §best-of-N: candidates for a generate-at-launch metric (1 = single-shot).
+      // Only meaningful on the launch-gen path; harmless otherwise.
+      metric_n_candidates: isLaunchGen ? metricCandidates : 1,
       // §Ship 48: fitness-plateau patience (only with a metric; the live
       // early stop). "" → sculpt default (2).
       fitness_patience:
@@ -490,20 +497,45 @@ export function NewRunDialog({
                       )}
                     </select>
                   </div>
+                  {/* §best-of-N: sample N candidate metrics and keep the most-
+                      discriminating valid one (offline selection). Applies to BOTH
+                      the Generate button and the generate-at-launch path. */}
+                  <div
+                    className="rs-select"
+                    title="Sample N candidate metrics and keep the most-discriminating valid one. Each candidate is a ~1-2 min LLM call."
+                  >
+                    <select
+                      value={metricCandidates}
+                      onChange={(e) => setMetricCandidates(Number(e.target.value))}
+                      disabled={launch.isPending || genMetric.isPending}
+                      aria-label="Best-of-N candidates"
+                    >
+                      <option value={1}>1 candidate (fast)</option>
+                      <option value={2}>best-of-2</option>
+                      <option value={3}>best-of-3</option>
+                      <option value={4}>best-of-4</option>
+                    </select>
+                  </div>
                   {!isLaunchGen && <Btn
                     kind="quiet"
                     icon={genMetric.isPending ? "loader" : "sparkles"}
                     disabled={genMetric.isPending || behavior.trim().length < 4}
-                    title="Auto-generate an objective metric from the behavior goal above"
+                    title={metricCandidates > 1
+                      ? `Sample ${metricCandidates} candidates and keep the most-discriminating one`
+                      : "Auto-generate an objective metric from the behavior goal above"}
                     onClick={() => {
                       genMetric.mutate(
-                        { behavior_goal: behavior.trim() },
+                        { behavior_goal: behavior.trim(), n_candidates: metricCandidates },
                         {
                           onSuccess: (m) => {
                             if (m.accepted) {
                               setFitnessMetric(`gen:${m.id}`);
                               setFitnessMode("observe");
-                              toast.success(`Generated ${m.id} (observe-only until calibrated)`, {
+                              const pick = (m.n_candidates && m.n_candidates > 1
+                                && m.selected_candidate != null)
+                                ? ` — picked candidate ${m.selected_candidate + 1}/${m.n_candidates}`
+                                : "";
+                              toast.success(`Generated ${m.id} (observe-only until calibrated)${pick}`, {
                                 description: m.review?.summary ?? "Validated + reviewed.",
                               });
                             } else {

@@ -86,6 +86,17 @@ class IterOutcome:
     #: §Ship 33: ground-truth task fitness on this iter's rollout when a
     #: `fitness_fn` is supplied to sculpt_run; None in the blind default.
     fitness: float | None = None
+    #: §Metric-quality laws (LAW 7): the naturalness-GATED fitness used for
+    #: STEER selection (best-by-fitness, early-stop) — distinct from `fitness`,
+    #: the true, displayed task score. A joint-limit exploit → 0.0; a 'severe'
+    #: (vel/torque) rollout is down-weighted. Defaults to `fitness` (no audit /
+    #: ok verdict / observe mode), so selection is unchanged for clean iters.
+    steer_fitness: float | None = None
+    #: §Metric-quality laws (LAW 11): the naturalness steer-factor this iter
+    #: (1.0 natural, <1 down-weighted, 0 joint-limit exploit) — tracked across
+    #: iters for the Goodhart-onset early-stop (metric rising while naturalness
+    #: falls = gaming). 1.0 when no audit ran (byte-identical default).
+    naturalness_factor: float | None = None
     #: §Ship 33: the reward version FILE actually trained this iter (the
     #: input v<n> that `fitness` measures) — distinct from reward_path_after
     #: (the edit produced FROM it, untested until the next iter). Best-by-
@@ -480,6 +491,15 @@ def _load_json_if_present(path: Path) -> dict:
         return {}
 
 
+def _load_partition_gate_report(iter_dir: Path | None) -> dict:
+    """§Ship 54-pre (#12): read the partition-gate report apply_edits writes to
+    `<iter_dir>/partition_gate.json` (present only when an objective metric
+    steers AND there was something to flag). Empty dict otherwise."""
+    if iter_dir is None:
+        return {}
+    return _load_json_if_present(Path(iter_dir) / "partition_gate.json")
+
+
 # ── Metric extraction ────────────────────────────────────────────────────
 def _extract_primary_metric(
     metrics_json: dict, behavior_json: dict, primary_key: str,
@@ -520,6 +540,7 @@ def _append_changelog(
     behavior_metric_names: list[str],
     behavior: dict,
     diagnosis: Diagnosis,
+    partition_summary: dict | None = None,
 ) -> Path:
     path = project / "CHANGELOG.md"
     if not path.is_file():
@@ -572,6 +593,16 @@ def _append_changelog(
                 lines.append("    - *paper_refs*: (novel)")
     else:
         lines.append("- **Edits**: (none)")
+
+    # §Ship 54-pre (#12): the shaping↔metric partition gate's flags for this
+    # iter (present only when an objective metric steered the run and something
+    # was flagged). Records WHICH edits reach into the metric's held-out surface
+    # or proposed easing a completion gate — the v5-class signal made visible.
+    if partition_summary and partition_summary.get("flag_reasons"):
+        lines.append("- **Metric partition gate**:")
+        for r in partition_summary.get("flag_reasons", []):
+            lines.append(f"  - {r}")
+
     lines.append("")
     with path.open("a", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
@@ -1115,12 +1146,31 @@ def _run_one_iter(
     # surface the verdict. Best-effort — failures (missing file, shape
     # drift) return verdict=unknown rather than crashing the loop.
     audit_result: dict[str, Any] | None = None
+    # §LAW 7: naturalness channel — a SEPARATE signal that gates STEER credit
+    # without touching the displayed fitness. Init to a no-op pass so a failed/
+    # absent audit never suppresses steering, and the steer value defaults to
+    # the true fitness (byte-identical to the pre-LAW-7 loop).
+    naturalness: dict[str, Any] | None = None
+    iter_steer_fitness: float | None = iter_fitness
+    iter_naturalness_factor: float = 1.0   # §LAW 11: tracked for Goodhart-onset
     try:
-        from sculptor.adapters.realism import audit_rollout
+        from sculptor.adapters.realism import (
+            audit_rollout, naturalness_channel, steer_fitness as _steer_fitness)
         audit_result = audit_rollout(
             trajectory_path=rollout_dir / "trajectory.npz",
             limits_path=rollout_dir / "mjcf_limits.json",
         )
+        # §LAW 7: derive the naturalness decision + the naturalness-gated steer
+        # fitness. A joint-limit exploit earns no steer credit; a severe
+        # (vel/torque) rollout is down-weighted. STEER mode only — in observe
+        # mode the verdict is recorded but never alters selection.
+        naturalness = naturalness_channel(audit_result)
+        audit_result["naturalness"] = naturalness
+        iter_naturalness_factor = float(naturalness.get("steer_factor", 1.0) or 1.0)
+        if not fitness_observe_only:
+            iter_steer_fitness = _steer_fitness(iter_fitness, naturalness)
+        if objective_progress is not None:
+            objective_progress["naturalness"] = naturalness
         (iter_dir / "realism_audit.json").write_text(
             json.dumps(audit_result, indent=2, sort_keys=True, default=str),
             encoding="utf-8",
@@ -1134,6 +1184,10 @@ def _run_one_iter(
             "joint_vel_p99_max": audit_result.get("joint_vel_p99_max"),
             "joint_limit_violation_frac": audit_result.get("joint_limit_violation_frac"),
             "top_joints_saturation": audit_result.get("top_joints_saturation") or [],
+            # §LAW 7: surface the naturalness decision for the UI chip + diagnoser.
+            "naturalness_flag": naturalness.get("flag"),
+            "naturalness_hard_reject": bool(naturalness.get("hard_reject")),
+            "naturalness_steer_factor": naturalness.get("steer_factor"),
         })
     except Exception as e:  # noqa: BLE001 — audit must not block the loop
         sys.stderr.write(
@@ -1231,11 +1285,29 @@ def _run_one_iter(
                 reward_contract=adapter.reward_contract(),
                 kg_store=kg_store,
                 iter_dir=iter_dir,
+                # §Ship 54-pre (#12): hand the active metric's held-out
+                # observable surface to the shaping↔metric partition gate.
+                # None when no objective metric steers (blind run) → gate
+                # no-ops, byte-identical.
+                metric_observables=getattr(
+                    fitness_fn, "metric_observables", None),
             )
     except EditValidationError as e:
         sys.stderr.write(
             f"[sculpt] iter {iter_index}: apply_edits skipped — "
             f"{type(e).__name__}: {e}\n")
+
+    # §Ship 54-pre (#12): surface the partition-gate report (written by
+    # apply_edits into iter_dir/partition_gate.json when a metric steers and
+    # there is something to flag) on the loop path, which passes no on_event.
+    partition_summary = _load_partition_gate_report(iter_dir)
+    if partition_summary:
+        _emit_event({
+            "type": "partition_gate",
+            "iter": iter_index,
+            "flagged": int(partition_summary.get("flagged_edit_count", 0) or 0),
+            "reasons": list(partition_summary.get("flag_reasons", []) or []),
+        })
 
     # 5. Previous metric for delta display
     history_path = project / "reports" / "metric_history.json"
@@ -1251,6 +1323,7 @@ def _run_one_iter(
         primary_key=primary_key,
         behavior_metric_names=behavior_metric_names,
         behavior=behavior_json, diagnosis=diagnosis,
+        partition_summary=partition_summary,
     )
 
     # Persist metric history for the next iter's delta
@@ -1342,12 +1415,61 @@ def _run_one_iter(
         failure_modes=list(diagnosis.failure_modes),
         edit_count=edit_count,
         fitness=iter_fitness,
+        steer_fitness=iter_steer_fitness,
+        naturalness_factor=iter_naturalness_factor,
         reward_path_trained=reward_path_trained,
         reverted_to_best=reverted_to_best,
     )
 
 
 # ── Early stop ───────────────────────────────────────────────────────────
+def detect_goodhart_onset(
+    fitness_history: list[float],
+    naturalness_history: list[float],
+    *,
+    window: int = 3,
+    rise_tol: float = 0.02,
+    min_unnatural: int = 2,
+) -> Optional[str]:
+    """§Metric-quality laws (LAW 11): Goodhart-ONSET — the objective metric is
+    still CLIMBING while the policy has SUSTAINABLY *become* less natural, i.e.
+    it is climbing the PROXY by gaming it. Lock the prior best rather than
+    optimize further into the exploit. Returns a stop-reason string, or None.
+
+    Pure + deterministic (offline-testable). Needs >= window+1 aligned points.
+    Fires ONLY when, over the last `window` iters, ALL of:
+      (a) the metric ROSE — recent MAX exceeds the prior MAX by >= `rise_tol`
+          (max-based, so a mid-window dip-then-recover does NOT read as a rise);
+      (b) >= `min_unnatural` of those iters are NON-PASS (naturalness steer-
+          factor < 1.0 — 'severe'/exploit): a SUSTAINED loss of naturalness, not
+          one transient aggressive frame (LAW 7 down-weights a SINGLE severe iter
+          precisely because an aggressive-but-valid kick can momentarily exceed
+          3× nominal joint speed); AND
+      (c) the recent window is, on average, LESS natural than everything before
+          it — the policy is *becoming* less natural (a decline), not merely a
+          run that was always aggressive (which (c) lets through).
+    With the no-audit default (naturalness all 1.0) the count is 0, so onset
+    NEVER fires — byte-identical to the pre-LAW-11 loop."""
+    n = min(len(fitness_history), len(naturalness_history))
+    if n < window + 1:
+        return None
+    recent_f = [float(x) for x in fitness_history[n - window:n]]
+    prior_f = [float(x) for x in fitness_history[:n - window]]
+    recent_nat = [float(x) for x in naturalness_history[n - window:n]]
+    prior_nat = [float(x) for x in naturalness_history[:n - window]]
+    rose = (max(recent_f) - max(prior_f)) >= rise_tol
+    n_unnatural = sum(1 for v in recent_nat if v < 1.0 - 1e-9)
+    declined = (sum(recent_nat) / len(recent_nat)) < (
+        sum(prior_nat) / len(prior_nat)) - 1e-9
+    if rose and n_unnatural >= min_unnatural and declined:
+        return (f"goodhart onset: objective metric still climbing "
+                f"(max {max(prior_f):.3f}→{max(recent_f):.3f}) while "
+                f"{n_unnatural}/{window} recent iters became less natural "
+                f"(severe or mild) — the policy is climbing the proxy by becoming "
+                f"less natural; locking the prior best")
+    return None
+
+
 def _is_metric_still_improving(
     history: list[float],
     *,
@@ -1628,6 +1750,9 @@ def sculpt_run(
     result = SculptRunResult(iterations_run=0)
     #: §Ship 33: iters since the best fitness improved (plateau early-stop).
     iters_since_best = 0
+    #: §LAW 11: per-iter naturalness steer-factor, aligned with
+    #: result.fitness_history, for the Goodhart-onset early-stop.
+    naturalness_history: list[float] = []
     #: §Ship 36 (F1): edit base for the NEXT iter when the last one regressed
     #: fitness (steer mode only); None = build forward from the latest reward.
     revert_base: Optional[Path] = None
@@ -1665,9 +1790,18 @@ def sculpt_run(
             # §Ship 33: track objective fitness + best-by-fitness selection.
             if fitness_fn is not None:
                 fit = outcome.fitness if outcome.fitness is not None else 0.0
-                result.fitness_history.append(fit)
-                if result.best_fitness is None or fit > result.best_fitness:
-                    result.best_fitness = fit
+                result.fitness_history.append(fit)   # TRUE task fitness (display / A-B)
+                naturalness_history.append(           # §LAW 11: aligned naturalness trend
+                    outcome.naturalness_factor
+                    if outcome.naturalness_factor is not None else 1.0)
+                # §LAW 7: best-by-fitness selection uses the naturalness-GATED
+                # steer value, so a joint-limit exploit (steer 0) or a severe-
+                # unnatural iter (down-weighted) cannot become the steered-toward
+                # checkpoint. The recorded history above stays the true score.
+                steer = (outcome.steer_fitness
+                         if outcome.steer_fitness is not None else fit)
+                if result.best_fitness is None or steer > result.best_fitness:
+                    result.best_fitness = steer
                     result.best_fitness_iter = outcome.iter_index
                     iters_since_best = 0
                 else:
@@ -1747,6 +1881,16 @@ def sculpt_run(
                               f"{iters_since_best} iters "
                               f"(best={result.best_fitness:.3f} at iter "
                               f"{result.best_fitness_iter})")
+                # §LAW 11: Goodhart-onset — the objective metric is rising while
+                # naturalness falls (the policy is gaming the proxy). Lock the
+                # prior best rather than optimize into the exploit. Checked only
+                # if no target/plateau reason already fired.
+                onset_source = "fitness"
+                if reason is None:
+                    onset = detect_goodhart_onset(
+                        result.fitness_history, naturalness_history)
+                    if onset:
+                        reason, onset_source = onset, "goodhart_onset"
                 if reason:
                     result.early_stopped = True
                     result.early_stop_reason = reason
@@ -1754,7 +1898,7 @@ def sculpt_run(
                         "type": "early_stop",
                         "at_iter": outcome.iter_index,
                         "reason": reason,
-                        "source": "fitness",
+                        "source": onset_source,
                     })
                     break
 

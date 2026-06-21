@@ -459,6 +459,10 @@ def _cmd_train(args: argparse.Namespace) -> None:
 
     env_cfg = load_env_cfg(args.task_id)
     env_cfg.scene.num_envs = args.num_envs
+    # §actuator-limit enforcement — flag-gated (default OFF → no-op). MUST run on
+    # the TRAIN env too (not just rollout) so the policy trains against the same
+    # velocity-limited physics it is later evaluated under (no train/rollout mismatch).
+    _enforce_actuator_limits(env_cfg)
 
     # Reward injection (optional).
     if args.reward_module_path:
@@ -844,6 +848,108 @@ def _apply_ground_texture(env_cfg: Any) -> None:
               file=sys.stderr, flush=True)
 
 
+# §actuator-limit enforcement (Sam 2026-06-20): mjlab's robot configs use
+# BuiltinPositionActuatorCfg, which STRUCTURALLY drops each motor's velocity_limit
+# (the ElectricActuator no-load speed) — so the sim clamps TORQUE (effort_limit) but
+# never VELOCITY, and a trained policy drives joints 2-3.7× past the real no-load
+# speed (g1-kick-v6: knee p99 43-73 vs 20 rad/s). mjlab already ships the
+# research-standard fix — DcMotorActuator, a port of Isaac Lab's DCMotor torque-speed
+# model (Rudin et al. 2022 / legged_gym): available torque falls LINEARLY to ~0 at
+# velocity_limit (motor back-EMF), so the joint physically cannot be driven past its
+# no-load speed. We swap the actuator MODEL on env_cfg (both train + rollout) and
+# re-supply the velocity_limit mjlab dropped. Per-pattern no-load speeds, cited from
+# mjlab's own robot constants (single source of truth):
+#   G1  g1_constants.py:91-178   Go1 go1_constants.py:40-72
+_ACTUATOR_VELOCITY_LIMITS: dict[str, float] = {
+    # Unitree G1 (rad/s)
+    ".*_knee_joint": 20.0, ".*_hip_roll_joint": 20.0,                       # 7520-22
+    ".*_hip_pitch_joint": 32.0, ".*_hip_yaw_joint": 32.0, "waist_yaw_joint": 32.0,   # 7520-14
+    ".*_elbow_joint": 37.0, ".*_shoulder_pitch_joint": 37.0,
+    ".*_shoulder_roll_joint": 37.0, ".*_shoulder_yaw_joint": 37.0,
+    ".*_wrist_roll_joint": 37.0,                                            # 5020
+    ".*_wrist_pitch_joint": 22.0, ".*_wrist_yaw_joint": 22.0,               # 4010
+    ".*_ankle_pitch_joint": 37.0, ".*_ankle_roll_joint": 37.0,
+    "waist_pitch_joint": 37.0, "waist_roll_joint": 37.0,                    # 2×5020
+    # Unitree Go1 (rad/s)
+    ".*_hip_joint": 30.1, ".*_thigh_joint": 30.1, ".*_calf_joint": 20.06,
+}
+
+
+def _recover_velocity_limit(actuator_cfg: Any) -> "float | None":
+    """The real motor no-load speed (rad/s) for an actuator group, recovered from
+    its `target_names_expr` (cited from mjlab's robot constants — same source of
+    truth that defines the group). None when no pattern matches (an unknown
+    robot/group → the caller leaves it unchanged), so this never invents a limit."""
+    patterns = getattr(actuator_cfg, "target_names_expr", None) or ()
+    lims = [_ACTUATOR_VELOCITY_LIMITS[p] for p in patterns
+            if p in _ACTUATOR_VELOCITY_LIMITS]
+    return min(lims) if lims else None
+
+
+def _enforce_actuator_limits(env_cfg: Any) -> None:
+    """Swap every `BuiltinPositionActuatorCfg` → `DcMotorActuatorCfg` so the sim
+    enforces each motor's VELOCITY (no-load speed) limit via mjlab's research-standard
+    torque-speed model, on top of the torque (effort) limit it already clamps. Mutates
+    `env_cfg` BEFORE the env is built, so it is active in BOTH train and rollout (the
+    policy trains against — and is evaluated under — the same constrained physics).
+
+    Gated by `RS_ENFORCE_ACTUATOR_LIMITS` (default ON — Sam's call 2026-06-20; set to
+    0/off to disable and recover the old velocity-unconstrained physics). FULLY
+    DEFENSIVE: any group whose velocity_limit can't be recovered, or any API drift,
+    leaves the actuator unchanged + warns — a run never breaks. `saturation_effort =
+    effort_limit` (the conservative triangular torque-speed envelope; raise to the
+    true peak/stall torque when a datasheet is known for a flat-topped curve)."""
+    import os
+    if os.environ.get("RS_ENFORCE_ACTUATOR_LIMITS", "1").strip().lower() not in (
+            "1", "true", "on", "yes"):
+        return
+    try:
+        from mjlab.actuator import BuiltinPositionActuatorCfg, DcMotorActuatorCfg
+    except Exception as e:  # noqa: BLE001 — mjlab without DcMotor → leave as-is
+        print(f"[runner] actuator-limit enforcement skipped (no DcMotorActuatorCfg): "
+              f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
+        return
+    try:
+        entities = getattr(getattr(env_cfg, "scene", None), "entities", None) or {}
+        items = entities.items() if hasattr(entities, "items") else []
+        for ekey, ent in items:
+            art = getattr(ent, "articulation", None)
+            acts = list(getattr(art, "actuators", None) or []) if art is not None else []
+            if not acts:
+                continue
+            new_acts, swapped, unresolved = [], 0, []
+            for a in acts:
+                vlim = _recover_velocity_limit(a)
+                eff = getattr(a, "effort_limit", None)
+                if isinstance(a, BuiltinPositionActuatorCfg) and vlim is not None and eff:
+                    extra = {}
+                    for f in ("viscous_damping", "frictionloss"):
+                        v = getattr(a, f, None)
+                        if v is not None:
+                            extra[f] = v
+                    new_acts.append(DcMotorActuatorCfg(
+                        target_names_expr=a.target_names_expr,
+                        stiffness=a.stiffness, damping=a.damping,
+                        effort_limit=float(eff), armature=a.armature,
+                        velocity_limit=float(vlim),
+                        saturation_effort=float(eff),   # conservative triangular envelope
+                        **extra))
+                    swapped += 1
+                else:
+                    new_acts.append(a)   # unrecoverable / non-builtin → unchanged
+                    if isinstance(a, BuiltinPositionActuatorCfg):
+                        unresolved.append(getattr(a, "target_names_expr", "?"))
+            art.actuators = tuple(new_acts)
+            msg = (f"[runner] actuator-limit enforcement: entity {ekey!r} — "
+                   f"{swapped}/{len(acts)} groups → DcMotor (velocity-limited)")
+            if unresolved:
+                msg += f"; UNRESOLVED (left unchanged): {unresolved}"
+            print(msg, file=sys.stderr, flush=True)
+    except Exception as e:  # noqa: BLE001 — never break a run
+        print(f"[runner] actuator-limit enforcement skipped: {type(e).__name__}: {e}",
+              file=sys.stderr, flush=True)
+
+
 def _cmd_rollout(args: argparse.Namespace) -> None:
     """Run `n_episodes` rollouts and record a video for behavioral review.
 
@@ -893,6 +999,9 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
     env_cfg.scene.num_envs = num_envs
     # §Ship 35: textured floor in the rendered rollout (cosmetic, guarded).
     _apply_ground_texture(env_cfg)
+    # §actuator-limit enforcement — flag-gated (default OFF). Same swap as TRAIN so
+    # the rollout physics matches what the policy trained under.
+    _enforce_actuator_limits(env_cfg)
     env = ManagerBasedRlEnv(
         env_cfg, device=args.device, render_mode="rgb_array"
     )
@@ -1046,8 +1155,22 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
     joint_vel_buf: list[np.ndarray] = []
     action_buf: list[np.ndarray] = []
     actuator_force_buf: list[np.ndarray] = []
+    # §reports: torque in JOINT space (qfrc_actuator) — aligned with joint_vel/names,
+    # unlike `actuator_force` which is in actuator order. Feeds the per-motor
+    # torque-vs-limit report.
+    joint_torque_buf: list[np.ndarray] = []
     projected_gravity_b_buf: list[np.ndarray] = []
     root_link_pos_w_buf: list[np.ndarray] = []
+    # §Metric-quality laws (LAW 3/4): per-foot ground contact + foot position
+    # in the pelvis frame, persisted to the metric arrays so an objective
+    # metric can measure signed forward-kick DIRECTION (anterior foot
+    # displacement) and the single-vs-double support SCHEDULE (one-leg-balance
+    # veto). Biped-only — stay empty (and are dropped at save time) on tasks
+    # whose robot has no left_foot/right_foot site pair.
+    left_foot_contact_buf: list[np.ndarray] = []
+    right_foot_contact_buf: list[np.ndarray] = []
+    left_foot_pos_b_buf: list[np.ndarray] = []
+    right_foot_pos_b_buf: list[np.ndarray] = []
     per_term_reward_buf: dict[str, list[np.ndarray]] = {}
 
     # Resolve the articulated robot entity once — mirrors the discovery
@@ -1075,6 +1198,38 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
         return None
 
     _robot = _find_robot(env)
+
+    # §Metric-quality laws (LAW 3/4): resolve the foot sites + ground-contact
+    # sensor ONCE, mirroring SculptorRewardTerm._resolve_foot_handles. Returns
+    # None unless a left_foot/right_foot site pair exists (the same named-site
+    # pair that fixes per-foot column order in mjlab) → biped only. The
+    # pelvis-frame foot position uses quat_apply_inverse (the same transform
+    # that derives projected_gravity_b: data.py site_pos_w − root_link_pos_w
+    # rotated by root_link_quat_w); import is lazy + guarded so a future
+    # mjlab rename degrades to "no foot position" rather than crashing the
+    # rollout.
+    def _resolve_feet(e, robot):
+        if robot is None:
+            return None
+        try:
+            names = tuple(robot.site_names)
+        except Exception:  # noqa: BLE001
+            return None
+        idx = {n: i for i, n in enumerate(names)}
+        li, ri = idx.get("left_foot"), idx.get("right_foot")
+        if li is None or ri is None:
+            return None
+        try:
+            contact = e.scene["feet_ground_contact"]
+        except Exception:  # noqa: BLE001
+            contact = None
+        return {"li": li, "ri": ri, "contact": contact}
+
+    _feet = _resolve_feet(env, _robot)
+    try:
+        from mjlab.utils.lab_api.math import quat_apply_inverse as _quat_apply_inverse
+    except Exception:  # noqa: BLE001
+        _quat_apply_inverse = None
 
     def _tensor_to_np(t) -> np.ndarray | None:
         if t is None:
@@ -1124,12 +1279,54 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
             af = _tensor_to_np(getattr(d, "actuator_force", None))
             if af is not None:
                 actuator_force_buf.append(af)
+            jt = _tensor_to_np(getattr(d, "qfrc_actuator", None))   # §reports: joint-space torque
+            if jt is not None:
+                joint_torque_buf.append(jt)
             pg = _tensor_to_np(getattr(d, "projected_gravity_b", None))
             if pg is not None:
                 projected_gravity_b_buf.append(pg)
             rp = _tensor_to_np(getattr(d, "root_link_pos_w", None))
             if rp is not None:
                 root_link_pos_w_buf.append(rp)
+            # §Metric-quality laws (LAW 3/4): per-foot contact + pelvis-frame
+            # foot position. Each signal is independently guarded so a missing
+            # sensor/site degrades to "field absent" (an empty buf is dropped
+            # at save time) rather than crashing the rollout — same discipline
+            # as _foot_info. Contact columns 0/1 = left/right (mjlab wiring,
+            # mirrored from _foot_info); foot position uses the resolved site
+            # indices li/ri.
+            if _feet is not None:
+                fc = _feet["contact"]
+                if fc is not None:
+                    try:
+                        found = fc.data.found  # (N, F)
+                        if found is not None and found.shape[-1] >= 2:
+                            lc = _tensor_to_np((found[:, 0] > 0).float())
+                            rc = _tensor_to_np((found[:, 1] > 0).float())
+                            if lc is not None:
+                                left_foot_contact_buf.append(lc)
+                            if rc is not None:
+                                right_foot_contact_buf.append(rc)
+                    except Exception:  # noqa: BLE001
+                        pass
+                if _quat_apply_inverse is not None:
+                    try:
+                        sp = getattr(d, "site_pos_w", None)        # (N, S, 3)
+                        rq = getattr(d, "root_link_quat_w", None)  # (N, 4)
+                        rpw = getattr(d, "root_link_pos_w", None)  # (N, 3)
+                        li, ri = _feet["li"], _feet["ri"]
+                        if (sp is not None and rq is not None and rpw is not None
+                                and sp.shape[1] > max(li, ri)):
+                            lf_b = _quat_apply_inverse(rq, sp[:, li, :] - rpw)
+                            rf_b = _quat_apply_inverse(rq, sp[:, ri, :] - rpw)
+                            lfp = _tensor_to_np(lf_b)
+                            rfp = _tensor_to_np(rf_b)
+                            if lfp is not None:
+                                left_foot_pos_b_buf.append(lfp)
+                            if rfp is not None:
+                                right_foot_pos_b_buf.append(rfp)
+                    except Exception:  # noqa: BLE001
+                        pass
         ap = _tensor_to_np(action)
         if ap is not None:
             action_buf.append(ap)
@@ -1277,10 +1474,15 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
     for key, buf in (
         ("joint_pos", joint_pos_buf),
         ("joint_vel", joint_vel_buf),
+        ("joint_torque", joint_torque_buf),
         ("action", action_buf),
         ("actuator_force", actuator_force_buf),
         ("projected_gravity_b", projected_gravity_b_buf),
         ("root_link_pos_w", root_link_pos_w_buf),
+        ("left_foot_contact", left_foot_contact_buf),
+        ("right_foot_contact", right_foot_contact_buf),
+        ("left_foot_pos_b", left_foot_pos_b_buf),
+        ("right_foot_pos_b", right_foot_pos_b_buf),
     ):
         arr = _stack_if_consistent(buf)
         if arr is not None:

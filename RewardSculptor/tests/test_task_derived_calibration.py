@@ -20,8 +20,11 @@ from sculptor.eval.ladder_synth import (
     render_ladder,
 )
 from sculptor.eval.metric_calibration import (
+    adversarial_archetype_gate,
+    adversarial_archetype_gate_spec,
     calibrate_metric,
     calibrate_task_derived,
+    kick_required_losers,
     spearman,
     spearman_midrank,
 )
@@ -526,3 +529,424 @@ def test_builtin_calibration_unaffected(tmp_path, builtin):
     p = _write(tmp_path, "good.py", GOOD_KICK if "kick" in builtin else CONSTANT)
     cal = calibrate_metric(p, builtin, threshold=0.7)
     assert cal["builtin"] == builtin and "spearman" in cal and "rho_min" not in cal
+
+
+# ── §Metric-quality laws (LAW 9): kick required-losers + spec_* gate scope ────
+# The deterministic kick hacks WITH foot_pos_b (the direction channel render_rung
+# can't render), now scored against BOTH a hand-authored spec_* metric (the
+# surface that never existed → why the gate never ran on the metric that scored
+# v5) and, opt-in, a generated metric.
+
+from sculptor.eval.joint_resolver import (  # noqa: E402
+    LEG_SAGITTAL_AXES,
+    LEG_SAGITTAL_SEGMENTS,
+    select_joints,
+)
+from sculptor.eval.metric_calibration import _kick_competent_reference  # noqa: E402
+from sculptor.eval.spec_metrics import (  # noqa: E402
+    burstiness,
+    horizontal_speed,
+    spec_g1_kick,
+    upright_mask,
+    uprightness,
+)
+
+
+def _old_form_kick(arrays, behavior, meta):
+    """The PRE-rebuild, DIRECTION-BLIND partial-credit kick form
+    (intensity·uprightness·stationarity — NO completion gate, NO signed direction):
+    a faithful stand-in for the spec_g1_kick that reward-hacked g1-kick-v5. It
+    scores a rear kick == a forward kick (direction-blind) → the gate must flag it."""
+    import numpy as _np
+    names = list((meta or {}).get("joint_names") or [])
+    jv = arrays["joint_vel"]
+    legs = (select_joints(names, segments=LEG_SAGITTAL_SEGMENTS, axes=LEG_SAGITTAL_AXES)
+            if len(names) == jv.shape[2] else None)
+    g = arrays["projected_gravity_b"]
+    b = burstiness(jv, joint_indices=legs or None, valid_mask=upright_mask(g))
+    intensity = 1.0 - float(_np.exp(-b["burst_p95"] / 4.0))
+    up = uprightness(g)
+    root = arrays.get("root_link_pos_w")
+    speed = float(horizontal_speed(root)["speed_per_frame"]) if root is not None else 0.0
+    stat = float(_np.clip(_np.exp(-speed / 0.01), 0.0, 1.0))
+    return {"spec_score": float(_np.clip(intensity * up * stat, 0.0, 1.0))}
+
+
+# A DIRECTION-AWARE generated kick metric: reads the left foot's anterior (x) to
+# score a forward fraction, so a rear-kick loser scores ~0. Ranks the (footless)
+# ladder via direction-abstain (=1.0). The opt-in robust counterpart to GOOD_KICK.
+DIR_AWARE_KICK = '''import numpy as np
+REQUIRED_JOINT_ROLES = ["left_knee", "right_knee"]
+def compute_spec(arrays, behavior, meta):
+    jv = arrays.get("joint_vel"); grav = arrays.get("projected_gravity_b")
+    root = arrays.get("root_link_pos_w")
+    if jv is None or grav is None or root is None:
+        return {"spec_score": 0.0}
+    roles = (meta or {}).get("joint_roles", {})
+    knees = [roles[r] for r in ("left_knee", "right_knee") if r in roles]
+    if not knees:
+        return {"spec_score": 0.0}
+    up = float(np.mean(grav[..., 2] < -0.85))
+    drift = float(np.linalg.norm(root[..., :2].max(0) - root[..., :2].min(0), axis=-1).mean())
+    stationary = float(np.exp(-drift / 0.4))
+    knee_peak = float(np.abs(jv[..., knees]).max(axis=2).max(axis=0).mean())
+    burst = 1.0 - float(np.exp(-knee_peak / 8.0))
+    direction = 1.0
+    lf = arrays.get("left_foot_pos_b")
+    if lf is not None:
+        a = lf[..., 0].astype(np.float64)
+        base = np.median(a, axis=0, keepdims=True); dev = a - base
+        fwd = np.clip(dev, 0.0, None).max(axis=0); back = np.clip(-dev, 0.0, None).max(axis=0)
+        direction = float(np.clip((fwd / (fwd + back + 1e-6)).mean(), 0.0, 1.0))
+    return {"spec_score": float(np.clip(up * stationary * burst * direction, 0.0, 1.0))}
+'''
+
+_KICK_GOAL = "kick forward with the left leg from a stance"
+_KICK_CHANS = ["direction", "completion", "amplitude"]
+
+
+def test_kick_required_losers_frame_scoping():
+    """LAW 0: frame-ambiguous losers are DROPPED so a novel kick variant is never
+    false-denied. A plain forward kick gets all four; a mule kick drops the rear-
+    direction loser; an explicit one-leg / lateral goal drops its support/direction
+    loser (incl. the 'balancing on one leg' resolve gap the review found)."""
+    g1 = list(G1_29)
+    full = {l["name"] for l in kick_required_losers(g1, _KICK_GOAL, "Unitree-G1")}
+    assert full == {"partial_kick", "whip_and_fall", "active_kick_behind", "one_leg_balance"}
+    mule = {l["name"] for l in kick_required_losers(g1, "mule kick backward", "Unitree-G1")}
+    assert "active_kick_behind" not in mule and "one_leg_balance" in mule
+    oneleg = {l["name"] for l in kick_required_losers(
+        g1, "kick a ball while balancing on one leg", "Unitree-G1")}
+    assert "one_leg_balance" not in oneleg
+    lateral = {l["name"] for l in kick_required_losers(g1, "spin kick to the side", "Unitree-G1")}
+    assert "active_kick_behind" not in lateral
+
+
+def test_kick_required_losers_unknown_robot_is_empty():
+    """An unresolvable left leg → no probes (a coverage gap), never a wrong-joint
+    deny."""
+    assert kick_required_losers(["jointA", "jointB"], _KICK_GOAL) == []
+
+
+def test_adversarial_gate_spec_g1_kick_not_gameable():
+    """The v5 anchor: the gate now RUNS on the hand-authored spec_g1_kick (it never
+    did — generated-only). The rebuilt completion_gate·min(channels) form crushes
+    every kick hack (kick-behind/one-leg/partial/whip) far below the ceiling, and a
+    competent forward kick pins competent_ref ≈0.78 → NOT gameable, audit-only."""
+    client = _FakeBothClient(_three_kicks(), gaming_travel())
+    rec = adversarial_archetype_gate_spec(
+        "g1_kick", _KICK_GOAL, client=client, robot_hint="Unitree-G1")
+    assert rec["ran"] and not rec["gameable"], rec
+    assert rec["competent_ref"] >= 0.75
+    losers = {l["name"]: l["score"] for l in rec["required_losers"] if "score" in l}
+    assert set(losers) == {"partial_kick", "whip_and_fall",
+                           "active_kick_behind", "one_leg_balance"}
+    assert max(losers.values()) < rec["ceiling"]
+    assert rec["coverage_gaps"] == []        # forward double-support → full coverage
+    assert rec["audit_only"] is True and rec["builtin"] == "g1_kick"
+
+
+def test_adversarial_gate_spec_unknown_builtin_raises():
+    client = _FakeBothClient(_three_kicks(), gaming_travel())
+    with pytest.raises(KeyError):
+        adversarial_archetype_gate_spec("not_a_metric", _KICK_GOAL, client=client)
+
+
+def test_adversarial_gate_old_form_kick_is_flagged():
+    """Teeth (regression-lock): the OLD direction-blind partial-credit kick form
+    (what scored g1-kick-v5) is FLAGGED gameable by the rear-kick required-loser —
+    proving the gate has teeth and that the rebuild (test above) is what defeats it."""
+    names = list(G1_29)
+    losers = kick_required_losers(names, "kick forward from a stance", "Unitree-G1")
+    competent_ref = _old_form_kick(*_kick_competent_reference(names))["spec_score"]
+    client = _FakeBothClient(_three_kicks(), gaming_travel())
+    rec = adversarial_archetype_gate(
+        _old_form_kick, [], names, competent_ref, client=client,
+        required_losers=losers, scored_channels=_KICK_CHANS)
+    assert rec["gameable"] and rec["worst_name"] == "active_kick_behind"
+    assert "active_kick_behind" in rec["reason"]
+
+
+def test_adversarial_gate_required_losers_run_on_author_crash():
+    """WIRING: required-losers are scored even when the LLM author call CRASHES —
+    a direction-blind metric is still flagged by the rear loser (the gate no longer
+    early-returns past loser scoring on an author failure)."""
+    names = list(G1_29)
+    losers = kick_required_losers(names, "kick forward from a stance", "Unitree-G1")
+    competent_ref = _old_form_kick(*_kick_competent_reference(names))["spec_score"]
+    client = _FakeBothClient(_three_kicks(), gaming_travel(), gaming_raises=True)
+    rec = adversarial_archetype_gate(
+        _old_form_kick, [], names, competent_ref, client=client, required_losers=losers)
+    assert rec["ran"] and rec["gameable"]            # losers ran despite the crash
+    assert rec["worst_name"] == "active_kick_behind"
+    assert not rec["archetypes"]                      # no LLM archetype scored
+
+
+def test_adversarial_gate_clean_path_byte_identical():
+    """required_losers/scored_channels unset → no loser scoring, no coverage keys
+    (the Ship-53 path, exercised byte-identically by the suite above)."""
+    client = _FakeBothClient(_three_kicks(), gaming_travel())
+    rec = adversarial_archetype_gate(
+        lambda a, b, m: {"spec_score": 0.0}, [], list(G1_29), 0.8, client=client)
+    assert rec["required_losers"] == []
+    assert "coverage" not in rec and "coverage_gaps" not in rec
+    assert rec["ran"] and not rec["gameable"]
+
+
+def test_adversarial_gate_coverage_gap_flagged_not_denied():
+    """A mule kick drops the direction loser (LAW 0); the per-channel coverage
+    obligation FLAGS 'direction' as uncovered but NEVER denies on the gap."""
+    names = list(G1_29)
+    losers = kick_required_losers(names, "mule kick backward", "Unitree-G1")
+    competent_ref = spec_g1_kick(*_kick_competent_reference(names))["spec_score"]
+    client = _FakeBothClient(_three_kicks(), gaming_travel())
+    rec = adversarial_archetype_gate(
+        spec_g1_kick, [], names, competent_ref, client=client,
+        required_losers=losers, scored_channels=_KICK_CHANS)
+    assert rec["coverage"]["direction"] is False
+    assert "direction" in rec["coverage_gaps"]
+    assert not rec["gameable"]               # a gap is a flag, not a deny
+
+
+def test_adversarial_required_losers_opt_in_denies_direction_blind(tmp_path):
+    """OPT-IN kick losers on the GENERATED task-derived path: a DIRECTION-BLIND
+    metric (GOOD_KICK) ranks the kick ladder (L2 grants) but is DENIED by the rear
+    loser — and only because the loser's roles are injected (knees resolve →
+    ~0.63), the masking bug the review flagged."""
+    p = _write(tmp_path, "good.py", GOOD_KICK)
+    client = _FakeBothClient(_three_kicks(), gaming_travel())
+    cal = calibrate_task_derived(
+        p, "kick forward from a stance", robot_hint="Unitree-G1", client=client,
+        adversarial=True, adversarial_required_losers=True)
+    assert cal["rho_min"] >= 0.5                       # ladders granted (L2)
+    assert not cal["ok"] and cal["adversarial"]["gameable"]
+    assert cal["adversarial"]["worst_name"] == "active_kick_behind"
+
+
+def test_adversarial_required_losers_opt_in_grants_direction_aware(tmp_path):
+    """The same opt-in path GRANTS a DIRECTION-AWARE metric — the rear loser scores
+    ~0 (the foot swings backward), so the losers don't deny a robust metric."""
+    p = _write(tmp_path, "dir.py", DIR_AWARE_KICK)
+    client = _FakeBothClient(_three_kicks(), gaming_travel())
+    cal = calibrate_task_derived(
+        p, "kick forward from a stance", robot_hint="Unitree-G1", client=client,
+        adversarial=True, adversarial_required_losers=True)
+    assert cal["ok"], cal
+    adv = cal["adversarial"]
+    assert adv["ran"] and not adv["gameable"]
+    rear = next(l for l in adv["required_losers"] if l["name"] == "active_kick_behind")
+    assert rear["score"] < adv["ceiling"]
+
+
+def test_adversarial_required_losers_opt_in_off_is_byte_identical(tmp_path):
+    """adversarial_required_losers default OFF → no losers injected (Ship-53 byte-
+    identical): GOOD_KICK is GRANTED (it would be denied with losers on)."""
+    p = _write(tmp_path, "good.py", GOOD_KICK)
+    client = _FakeBothClient(_three_kicks(), gaming_travel())
+    cal = calibrate_task_derived(
+        p, "kick forward from a stance", robot_hint="Unitree-G1", client=client,
+        adversarial=True)
+    assert cal["ok"] and not cal["adversarial"].get("required_losers")
+
+
+# ── §fold-and-return primitive: STEERING for fold/squat/sit-to-stand/toe-touch ──
+# render_rung's base_height_m is a monotone ramp and CANNOT render a pelvis dip-and-
+# return, so a correct toe-touch/squat metric could rank no competence ladder and
+# stayed observe-only. The fold primitive (fold_depth_m + a "fold" group mode) renders
+# the dip-and-return that lets it rank a ladder and EARN steer-rights.
+
+from sculptor.eval.generated_metric import (  # noqa: E402
+    inject_joint_roles,
+    load_generated_metric,
+    read_required_roles,
+)
+from sculptor.eval.ladder_synth import _FOLD_ARC, render_rung  # noqa: E402
+from sculptor.eval.metric_calibration import _TD_SEPARATION_MIN  # noqa: E402
+
+# A faithful, compact toe-touch metric (the on-disk g1-toe-touching/gen_001 form):
+# completion_gate · min(pelvis dip-and-return, hip ROM, knee ROM); upright at the
+# ENDS only; no-travel veto. Scores the full fold-and-return ≈0.83 (the C1 probe).
+TOE_TOUCH = '''import numpy as np
+REQUIRED_JOINT_ROLES = ["left_hip_pitch", "right_hip_pitch", "left_knee", "right_knee"]
+def compute_spec(arrays, behavior, meta):
+    jp = arrays.get("joint_pos"); root = arrays.get("root_link_pos_w")
+    pg = arrays.get("projected_gravity_b")
+    if jp is None or root is None or pg is None:
+        return {"spec_score": 0.0}
+    roles = (meta or {}).get("joint_roles", {}) or {}
+    hip = [roles[r] for r in ("left_hip_pitch", "right_hip_pitch") if r in roles]
+    knee = [roles[r] for r in ("left_knee", "right_knee") if r in roles]
+    if not hip or not knee:
+        return {"spec_score": 0.0}
+    edge = max(3, jp.shape[0] // 20)
+    z = root[..., 2]
+    z0 = np.mean(z[:edge], axis=0); z1 = np.mean(z[-edge:], axis=0); zmin = np.min(z, axis=0)
+    drop = z0 - zmin; ret = np.abs(z1 - z0)
+    amp_drop = float(np.mean(np.clip((drop - 0.20) / 0.15, 0.0, 1.0)))
+    ret_ch = float(np.mean(np.exp(-(ret / 0.05) ** 2)))
+    hr = np.mean(np.max(jp[..., hip], axis=0) - np.min(jp[..., hip], axis=0), axis=-1)
+    hip_ch = float(np.mean(np.clip((hr - 0.7) / 0.6, 0.0, 1.0)))
+    kr = np.mean(np.max(jp[..., knee], axis=0) - np.min(jp[..., knee], axis=0), axis=-1)
+    knee_ch = float(np.mean(np.clip((kr - 0.5) / 0.7, 0.0, 1.0)))
+    gz = pg[..., 2]
+    up0 = float(np.mean(np.mean(gz[:edge], axis=0) < -0.85))
+    up1 = float(np.mean(np.mean(gz[-edge:], axis=0) < -0.85))
+    xy = root[..., :2]
+    travel = np.sqrt(np.sum((np.max(xy, axis=0) - np.min(xy, axis=0)) ** 2, axis=-1))
+    no_travel = float(np.mean(travel < 0.35))
+    gate = 1.0
+    gate *= 1.0 if float(np.mean(drop > 0.20)) > 0.7 else 0.0
+    gate *= 1.0 if float(np.mean(ret < 0.075)) > 0.7 else 0.0
+    gate *= 1.0 if up0 > 0.7 else 0.0
+    gate *= 1.0 if up1 > 0.7 else 0.0
+    gate *= 1.0 if no_travel > 0.7 else 0.0
+    return {"spec_score": float(np.clip(gate * min(amp_drop, ret_ch, hip_ch, knee_ch), 0.0, 1.0))}
+'''
+
+
+def _fold_group(amp: float) -> Group:
+    """A `fold`-mode group driving the sagittal hips + knees (both sides) through a
+    flex-and-return arc of ROM `amp` — the joints a toe-touch metric reads."""
+    return Group(name="legs", mode="fold", amplitude_rad=amp,
+                 role_query=RoleQuery(segments=["hip", "knee"], axes=["pitch", None],
+                                      sides=["left", "right"]))
+
+
+def fold_ladder() -> CompetenceLadder:
+    """A monotone fold-and-return ladder: shallow→full pelvis dip co-varied with
+    small→full leg ROM (what an honest toe-touch/squat author emits)."""
+    return CompetenceLadder(competence_axis="pelvis fold depth + leg flexion ROM", rungs=[
+        MotionSpec(uprightness=1.0, base_height_m=0.7, fold_depth_m=d, groups=[_fold_group(a)])
+        for d, a in [(0.24, 0.80), (0.28, 0.95), (0.32, 1.15), (0.35, 1.30)]])
+
+
+def test_fold_default_is_byte_identical():
+    """Default fold_depth_m is 0 and a non-fold spec leaves the pelvis FLAT — the
+    primitive only triggers on the targeted condition, so every existing rung
+    (the 5 families, the kick hacks) renders unchanged."""
+    assert MotionSpec().fold_depth_m == 0.0
+    a, _, _ = render_rung(MotionSpec(uprightness=1.0, base_height_m=0.7), G1)
+    assert np.allclose(a["root_link_pos_w"][:, 0, 2], 0.7)            # no dip
+    # _FOLD_ARC is the 0→1→0 arc, peaking at mid, returning to ~0.
+    assert _FOLD_ARC[0] == 0.0 and _FOLD_ARC[len(_FOLD_ARC) // 2] == pytest.approx(1.0)
+    assert _FOLD_ARC[-1] < 1e-2
+
+
+def test_fold_rung_dips_pelvis_and_flexes_joints():
+    """A fold rung dips the pelvis by ~fold_depth at mid and returns to start, and a
+    fold-mode group flexes its joints to ~amplitude and returns — in phase."""
+    a, _, _ = render_rung(
+        MotionSpec(uprightness=1.0, base_height_m=0.7, fold_depth_m=0.35,
+                   groups=[_fold_group(1.2)]), G1)
+    z = a["root_link_pos_w"][:, 0, 2]
+    assert z[0] == pytest.approx(0.7) and z[-1] == pytest.approx(0.7, abs=1e-2)
+    assert z.min() == pytest.approx(0.35, abs=1e-3)                   # dips by 0.35
+    assert z.argmin() == len(z) // 2                                  # at mid (in phase)
+    hp = G1.index("left_hip_pitch_joint"); kn = G1.index("left_knee_joint")
+    jp = a["joint_pos"][:, 0, :]
+    for j in (hp, kn):
+        assert jp[0, j] == pytest.approx(0.0) and jp[-1, j] == pytest.approx(0.0, abs=1e-2)
+        assert jp[:, j].max() == pytest.approx(1.2, abs=1e-3)        # ROM = amplitude
+    # a non-targeted joint (a wrist) is untouched.
+    assert np.allclose(jp[:, G1.index("left_wrist_roll_joint")], 0.0)
+
+
+def test_fold_ladder_ranks_toe_touch_monotone(tmp_path):
+    """KEYSTONE: the real toe-touch metric ranks a rendered fold ladder MONOTONICALLY
+    with separation ≥ the calibration threshold — exactly what earns steer-rights."""
+    p = _write(tmp_path, "toe.py", TOE_TOUCH)
+    fn = load_generated_metric(p); roles = read_required_roles(p)
+    out = render_ladder(fold_ladder().rungs, G1)
+    assert not out["degenerate"] and out["n"] == 5
+    scores = []
+    for arrays, beh, meta in out["rungs"]:
+        inject_joint_roles(meta, roles)
+        scores.append(float(fn(arrays, beh, meta).get("spec_score", 0.0)))
+    assert scores == sorted(scores)                                  # monotone
+    assert len(set(round(s, 6) for s in scores)) == 5                # distinct
+    assert scores[-1] - scores[0] >= _TD_SEPARATION_MIN              # separated
+    assert spearman_midrank(scores, list(range(len(scores)))) >= 0.8
+    assert scores[-1] >= 0.8                                          # full fold ≈ ideal
+
+
+def test_calibrate_task_derived_grants_fold_metric(tmp_path):
+    """End-to-end: with three independently-authored fold ladders, the toe-touch
+    metric earns the task-derived grant — the steering the dip-and-return unlocks."""
+    p = _write(tmp_path, "toe.py", TOE_TOUCH)
+    client = _FakeLadderClient(fold_ladder(), fold_ladder(), fold_ladder())
+    cal = calibrate_task_derived(p, "touch your toes then stand back up",
+                                 robot_hint="Unitree-G1", client=client)
+    assert cal["ok"], cal
+    assert cal["n_valid"] == 3 and cal["rho_min"] >= 0.5
+    assert all(s.get("separation", 0) >= _TD_SEPARATION_MIN
+               for s in cal["sources"] if "separation" in s)
+
+
+def test_fold_mode_is_single_arc_regardless_of_period():
+    """A fold is one synchronized posture arc over the rollout — period_frames/phase
+    do not fragment it into reps (so it stays in phase with the pelvis dip)."""
+    base = render_rung(MotionSpec(groups=[_fold_group(1.0)]), G1)[0]["joint_pos"]
+    g = _fold_group(1.0); g.period_frames = 12; g.phase = 1.3; g.within_group_phase_spread = 2.0
+    varied = render_rung(MotionSpec(groups=[g]), G1)[0]["joint_pos"]
+    assert np.array_equal(base, varied)
+
+
+def test_fold_dip_clamps_pelvis_at_floor():
+    """A deep fold from a LOW base degrades to a physical posture (z ≥ 0), never a
+    sub-floor pelvis (degrade-to-safe). The keystone fold (base 0.7, depth 0.35) is far
+    above the floor, so the clamp never fires there — byte-identical for real ladders."""
+    a, _, _ = render_rung(MotionSpec(base_height_m=0.2, fold_depth_m=0.6), G1)
+    assert a["root_link_pos_w"][:, 0, 2].min() >= 0.0
+    b, _, _ = render_rung(MotionSpec(base_height_m=0.7, fold_depth_m=0.35), G1)
+    assert b["root_link_pos_w"][:, 0, 2].min() == pytest.approx(0.35, abs=1e-3)
+
+
+# A pelvis-DEPTH-ONLY proxy: scores vertical excursion alone — no completion gate, no
+# leg ROM, no return-check, no uprightness. It tracks the dominant axis of a naive fold
+# ladder, so a DISCRIMINATING ladder must DENY it (the firewall the review asked for).
+DEPTH_ONLY = '''import numpy as np
+def compute_spec(arrays, behavior, meta):
+    root = arrays.get("root_link_pos_w")
+    if root is None:
+        return {"spec_score": 0.0}
+    z = root[..., 2]
+    return {"spec_score": float(np.clip((z.max(0) - z.min(0)).mean(), 0.0, 1.0))}
+'''
+
+
+def discriminating_fold_ladder() -> CompetenceLadder:
+    """A fold ladder whose LOW rung is a DEEP pelvis dip with NO leg flexion — the real
+    gate·min(hip ROM, knee ROM, dip) metric crushes it to 0 via the empty ROM channels,
+    but a pelvis-depth-only proxy scores it HIGH and ranks the ladder NON-monotonically.
+    This is what makes the ladder test the metric instead of tracking dip depth."""
+    return CompetenceLadder(competence_axis="completed fold (dip + leg flexion)", rungs=[
+        MotionSpec(uprightness=1.0, base_height_m=0.7, fold_depth_m=0.35),          # deep dip, NO flex
+        MotionSpec(uprightness=1.0, base_height_m=0.7, fold_depth_m=0.28, groups=[_fold_group(0.95)]),
+        MotionSpec(uprightness=1.0, base_height_m=0.7, fold_depth_m=0.32, groups=[_fold_group(1.15)]),
+        MotionSpec(uprightness=1.0, base_height_m=0.7, fold_depth_m=0.35, groups=[_fold_group(1.30)]),
+    ])
+
+
+def test_fold_ladder_discriminates_real_metric_from_depth_proxy(tmp_path):
+    """The fold ladder is DISCRIMINATING, not depth-trackable: with a deep-dip-NO-flex
+    gaming low rung, the real gate·min(channels) toe-touch metric earns the grant while a
+    pelvis-DEPTH-ONLY proxy is DENIED (it scores the flex-less rung high and breaks rank).
+    Proves 'gate · min(channels)' is load-bearing — the firewall the review flagged."""
+    real = _write(tmp_path, "toe.py", TOE_TOUCH)
+    proxy = _write(tmp_path, "depth.py", DEPTH_ONLY)
+
+    def _cal(p):
+        return calibrate_task_derived(
+            p, "touch your toes then stand back up", robot_hint="Unitree-G1",
+            client=_FakeLadderClient(discriminating_fold_ladder(),
+                                     discriminating_fold_ladder(),
+                                     discriminating_fold_ladder()))
+
+    real_cal, proxy_cal = _cal(real), _cal(proxy)
+    assert real_cal["ok"], real_cal                  # the honest metric grants
+    assert not proxy_cal["ok"], proxy_cal            # the depth-only proxy is DENIED
+    # gen_scores index 0 = the prepended fallen anchor; index 1 = the deep-dip-no-flex rung.
+    real_scores = next(s["gen_scores"] for s in real_cal["sources"] if "gen_scores" in s)
+    proxy_scores = next(s["gen_scores"] for s in proxy_cal["sources"] if "gen_scores" in s)
+    assert real_scores[1] == 0.0                     # real metric: no flex → min channel 0
+    assert proxy_scores[1] > proxy_scores[2]         # proxy ranks the flex-less rung too high

@@ -47,14 +47,20 @@ _GEN_ID_RE = re.compile(r"^[A-Za-z0-9_]+$")
 #: calibration only ever runs observe-only.
 _TASK_DERIVED_ENABLED = os.getenv("RS_TASK_DERIVED_CALIBRATION", "1") == "1"
 
-#: §Ship 53: gate the L3 adversarial gaming-archetype check (an independent,
-#: metric-blind author proposes ~3 OFF-GOAL gaming policies; a metric that scores
-#: any in competent territory is GAMEABLE and DENIED steer-rights). DEFAULT OFF —
-#: it can DENY a grant the L2 ladders gave, so it ships dormant until audited; set
-#: RS_ADVERSARIAL_ARCHETYPES=1 to enforce. Adds ONE metric-blind author call on a
-#: novel-task launch, only when the ladders already grant. Observe-only stays
-#: never-silent: a gameable deny names the gaming policy + its score.
-_ADVERSARIAL_ENABLED = os.getenv("RS_ADVERSARIAL_ARCHETYPES", "0") == "1"
+#: §Ship 53 / §Metric-quality laws (LAW 9): gate the L3 adversarial gaming-
+#: archetype check (an independent, metric-blind author proposes OFF-GOAL gaming
+#: policies; a metric that scores any in competent territory is GAMEABLE). DEFAULT
+#: ON (Sam's call, 2026-06-19) for HIGH-STAKES acceptance — granting steer-rights
+#: to a NOVEL-task metric (a one-shot per-launch decision), and AUDIT-ONLY probing
+#: of the hand-authored spec_* ground truth a generated metric calibrates against
+#: (the surface that never ran on the metric that scored g1-kick-v5). Set
+#: RS_ADVERSARIAL_ARCHETYPES=0 to disable. Cost: one metric-blind author call per
+#: high-stakes launch (Sam approved). It can DENY a task-derived grant (never the
+#: built-in fence — that probe is record-and-warn). Routine per-iteration metric
+#: generation makes NO adversarial call, so it stays OFF for routine work by
+#: construction. Observe-only stays never-silent: a deny/finding names the policy
+#: + its score.
+_ADVERSARIAL_ENABLED = os.getenv("RS_ADVERSARIAL_ARCHETYPES", "1") == "1"
 
 #: §Ship 42: dropdown sentinel — "generate the objective metric at launch as the
 #: run's first phase" (vs picking an existing built-in / gen:<id>). Ship 43 runs
@@ -160,7 +166,7 @@ async def _await_gen_decision(
 
 async def _generate_at_launch(
     job: Job, project_dir: Path, behavior_goal: str,
-    control_path: Path, cancel: asyncio.Event,
+    control_path: Path, cancel: asyncio.Event, *, n_candidates: int = 1,
 ) -> Optional[str]:
     """§Ship 43/44/45: generate the objective metric as the run's FIRST phase,
     streaming the Ship-40 stage events into THIS run's event stream, then
@@ -195,7 +201,8 @@ async def _generate_at_launch(
         try:
             rec = await asyncio.to_thread(
                 metric_store.generate, project_dir, behavior_goal,
-                robot_hint=robot_hint, review=True, on_event=_on_event)
+                robot_hint=robot_hint, review=True,
+                n_candidates=n_candidates, on_event=_on_event)
         except asyncio.CancelledError:
             # §Ship 45 review (MEDIUM): clear the Ship-40 progress sidecar on
             # Stop. CancelledError is a BaseException that bypasses the
@@ -239,6 +246,37 @@ async def _generate_at_launch(
                     job.emit({"type": "metric_calibration_done", "source": "launch_gen",
                               "gen_id": gid, "builtin": builtin, "calibrated": False,
                               "error": f"{type(e).__name__}: {e}"})
+                # §Metric-quality laws (LAW 9): AUDIT-ONLY adversarial probe of the
+                # HAND-AUTHORED ground-truth spec_* metric this generated metric is
+                # calibrating AGAINST — the gate that never ran on spec_g1_kick, the
+                # metric that scored g1-kick-v5. Records + warns; NEVER revokes the
+                # fence (built-ins are the trusted calibration anchor). Flag-gated;
+                # scoped to families with a curated loser set (kick today). Bounded
+                # by a timeout; never fails the run.
+                if _ADVERSARIAL_ENABLED and sculptor_bridge.has_spec_audit(builtin):
+                    job.emit({"type": "metric_spec_audit_started",
+                              "source": "launch_gen", "builtin": builtin})
+                    try:
+                        audit = await asyncio.wait_for(
+                            asyncio.to_thread(sculptor_bridge.audit_builtin_spec_metric,
+                                              builtin, behavior_goal, robot_hint),
+                            timeout=180.0)
+                        job.emit({"type": "metric_spec_audit", "source": "launch_gen",
+                                  "builtin": builtin, "audit_only": True,
+                                  "ran": bool(audit.get("ran")),
+                                  "gameable": bool(audit.get("gameable")),
+                                  "worst_name": audit.get("worst_name"),
+                                  "worst_gaming": audit.get("worst_gaming"),
+                                  "coverage_gaps": audit.get("coverage_gaps"),
+                                  "reason": audit.get("reason")})
+                    except asyncio.TimeoutError:
+                        job.emit({"type": "metric_spec_audit", "source": "launch_gen",
+                                  "builtin": builtin, "audit_only": True, "ran": False,
+                                  "reason": "spec audit timed out (>180s) — not enforced"})
+                    except Exception as e:  # noqa: BLE001 — audit never affects the run
+                        job.emit({"type": "metric_spec_audit", "source": "launch_gen",
+                                  "builtin": builtin, "audit_only": True, "ran": False,
+                                  "error": f"{type(e).__name__}: {e}"})
             elif _TASK_DERIVED_ENABLED:
                 # §Ship 51: novel task (no built-in) → earn steer-rights by
                 # ranking K independently-authored competence ladders. No GPU is
@@ -377,6 +415,9 @@ def run_sculpt_job(
     # §Ship 35: observe vs steer (default steer). Only meaningful with a
     # metric set; harmless otherwise.
     fitness_mode = run_params.get("fitness_mode")
+    # §best-of-N: candidates to sample for a generate-at-launch metric (1 →
+    # single-shot). Only used on the LAUNCH_GEN_SENTINEL path below.
+    metric_n_candidates = int(run_params.get("metric_n_candidates", 1) or 1)
     # §Ship 48: patience for the fitness-plateau early-stop (the live early
     # stop; the early_stop_* knobs above are a no-op for it). Only meaningful
     # with a metric set. None → sculpt-lib default (2).
@@ -436,7 +477,8 @@ def run_sculpt_job(
                 and os.environ.get("SCULPTOR_LAUNCH_GEN", "1") != "0"
                 and not cancel.is_set()):
             eff_fitness_metric = await _generate_at_launch(
-                job, project_dir, behavior_goal, control_path, cancel)
+                job, project_dir, behavior_goal, control_path, cancel,
+                n_candidates=metric_n_candidates)
             # §Ship 44: a launch-generated metric STEERS iff it earned
             # steer-rights via launch-time calibration; request steer and let
             # the steer_allowed firewall below downgrade to observe otherwise.

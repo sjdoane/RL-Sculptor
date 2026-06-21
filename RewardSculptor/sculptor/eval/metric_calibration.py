@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -311,6 +312,203 @@ def _author_gaming(client: Any, model: str, payload: dict) -> Any:
     return resp.parsed_output
 
 
+# ── §Metric-quality laws (LAW 9 / completeness D5): deterministic kick-family ──
+#: required-losers. The documented g1-kick-v5 hacks as DETERMINISTIC negative
+#: probes, rendered WITH left/right_foot_pos_b — the signed forward-direction
+#: channel the LLM/`render_rung` archetype path CANNOT exercise (render_rung emits
+#: no foot data, so the kick-behind hack is invisible to it; that gap is exactly
+#: why spec_g1_kick was never adversarially caught on direction). Together the
+#: probes give the per-channel coverage obligation (≥1 probe per scored channel)
+#: by construction: direction (kick-behind), completion (one-leg / whip-and-fall),
+#: amplitude (partial rep). Name-parameterized — they resolve the LEFT sagittal
+#: leg BY NAME (one source of truth: leg_sagittal_indices' LEG_SAGITTAL_* + a
+#: left-side filter) so a single builder serves the 12-joint synthetic body AND a
+#: real 29-DOF G1. Sibling of metric_validate._archetypes' kick hacks (locked to
+#: the 12-joint battery); kept here so the calibration gate is robot-agnostic.
+_KL_T, _KL_E, _KL_DT = 120, 4, 0.02
+#: Tokens that make a kick's goal-axis or support-mode AMBIGUOUS. A frame-scoped
+#: loser (direction / support) is DROPPED — not injected — when present, so a
+#: novel kick variant (mule / spin / roundhouse / one-leg) is never false-denied
+#: (LAW 0). The gate's ABSOLUTE ceiling denies HARDER than metric_validate's
+#: RELATIVE bar (hv ≥ kick_pos), so conservative high-confidence framing matters.
+_KICK_LATERAL_TOKENS = ("spin", "spinning", "roundhouse", "side", "sideways",
+                        "lateral", "sweep", "crescent", "hook", "circle", "round")
+_KICK_SINGLE_TOKENS = ("one", "single", "flamingo", "stork", "balancing", "balance")
+
+
+def _kick_upright_g() -> np.ndarray:
+    g = np.zeros((_KL_T, _KL_E, 3)); g[..., 2] = -1.0
+    return g
+
+
+def _kick_standing_root() -> np.ndarray:
+    r = np.zeros((_KL_T, _KL_E, 3)); r[..., 2] = 0.7
+    return r
+
+
+def _kick_foot_swing(direction: float) -> tuple[np.ndarray, np.ndarray]:
+    """Left-foot anterior (pelvis-frame x) swing — forward (+1) for a real kick,
+    rearward (−1) for the kick-behind hack; the right (stance) foot stays put.
+    §kick-fix: 0.40 m peak (was 0.30) so the competent reference clears the new
+    spec_g1_kick forward-foot excursion gate (~1.0) and competent_ref stays ~0.78;
+    the partial-rep loser (this × 0.2 = 0.08 m) stays well below the gate floor."""
+    lf = np.zeros((_KL_T, _KL_E, 3)); rf = np.zeros((_KL_T, _KL_E, 3))
+    for start in range(20, _KL_T, 40):
+        for k in range(10):
+            if start + k < _KL_T:
+                lf[start + k, :, 0] = direction * 0.40 * np.sin(np.pi * k / 10)
+    return lf, rf
+
+
+def _kick_pack(jp, jv, g, root, lf=None, rf=None) -> dict:
+    d = {"joint_pos": jp, "joint_vel": jv,
+         "projected_gravity_b": g, "root_link_pos_w": root}
+    if lf is not None:
+        d["left_foot_pos_b"] = lf
+    if rf is not None:
+        d["right_foot_pos_b"] = rf
+    return d
+
+
+def _kick_behavior() -> dict:
+    return {"max_episode_steps": _KL_T, "rollout_num_envs": _KL_E,
+            "step_dt": _KL_DT}
+
+
+def _left_sagittal_leg(joint_names: list[str]) -> list[int]:
+    """The LEFT sagittal-plane leg joints (hip pitch + knee + ankle pitch),
+    excluding hip roll/yaw — the swing leg of a forward kick. One source of
+    truth with the metrics (LEG_SAGITTAL_* + a left filter)."""
+    from sculptor.eval.joint_resolver import (
+        LEG_SAGITTAL_AXES,
+        LEG_SAGITTAL_SEGMENTS,
+        select_joints,
+    )
+
+    return select_joints(list(joint_names), segments=LEG_SAGITTAL_SEGMENTS,
+                         axes=LEG_SAGITTAL_AXES, sides=["left"])
+
+
+def _kick_competent_reference(
+    joint_names: list[str],
+) -> Optional[tuple[dict, dict, dict]]:
+    """A deterministic, genuinely-competent forward kick (peak-8.0 sagittal-leg
+    bursts, forward foot swing, upright, stationary) — the most-charitable
+    competence anchor the adversarial ceiling is measured against (it scores
+    spec_g1_kick ≈ 0.78). Returns (arrays, behavior, meta), or None when the left
+    sagittal leg can't be resolved on this robot (no anchor → skip the kick gate,
+    never false-deny)."""
+    legs = _left_sagittal_leg(joint_names)
+    if not legs:
+        return None
+    J = len(joint_names)
+    jv = np.zeros((_KL_T, _KL_E, J))
+    for start in range(20, _KL_T, 40):
+        for j in legs:
+            jv[start:start + 5, :, j] = 8.0
+    jp = np.cumsum(jv, axis=0) * _KL_DT
+    lf, rf = _kick_foot_swing(+1.0)
+    arrays = _kick_pack(jp, jv, _kick_upright_g(), _kick_standing_root(), lf, rf)
+    return arrays, _kick_behavior(), {"joint_names": list(joint_names)}
+
+
+def kick_required_losers(
+    joint_names: list[str], behavior_goal: str,
+    robot_hint: Optional[str] = None,
+) -> list[dict]:
+    """Deterministic kick gaming probes WITH foot_pos_b — the kick hack rungs in
+    the adversarial negative set. Each entry is
+    `{name, channel, arrays, behavior, meta}`. Frame-scoped CONSERVATIVELY
+    (LAW 0): a directional / support loser is DROPPED when the goal frame is
+    ambiguous, so a novel kick variant is never false-denied. Returns [] when the
+    left sagittal leg can't be resolved (unknown robot → coverage gap recorded by
+    the gate, never a wrong-joint deny). Never raises."""
+    legs = _left_sagittal_leg(joint_names)
+    if not legs:
+        return []
+    from sculptor.eval.metric_validate import resolve_goal_frame
+
+    frame = resolve_goal_frame(behavior_goal, robot_hint)
+    tokens = set(re.findall(r"[a-z]+", (behavior_goal or "").lower()))
+    forward_ok = (frame.get("goal_axis") == "+x"
+                  and not (tokens & set(_KICK_LATERAL_TOKENS)))
+    double_ok = (frame.get("support_mode") == "double"
+                 and not (tokens & set(_KICK_SINGLE_TOKENS)))
+
+    J = len(joint_names)
+    beh = _kick_behavior()
+    meta = {"joint_names": list(joint_names)}
+    rng = np.random.default_rng(0)
+    losers: list[dict] = []
+
+    # partial_kick (AMPLITUDE) — a single brief, sub-floor flick with a tiny
+    # forward foot: correctly directed but neither completed nor full-amplitude.
+    # ALWAYS (a kick is, frame-independently, a completed full-amplitude motion).
+    jvp = np.zeros((_KL_T, _KL_E, J))
+    for j in legs:
+        jvp[20:23, :, j] = 3.0
+    jpp = np.cumsum(jvp, axis=0) * _KL_DT
+    lfp, rfp = _kick_foot_swing(+1.0)
+    losers.append({"name": "partial_kick", "channel": "amplitude",
+                   "arrays": _kick_pack(jpp, jvp, _kick_upright_g(),
+                                        _kick_standing_root(), lfp * 0.2, rfp),
+                   "behavior": beh, "meta": dict(meta)})
+
+    # whip_and_fall (COMPLETION) — a violent burst whose uprightness collapses;
+    # the completion gate's upright term must floor it. ALWAYS (a kick never
+    # topples — true for every kick frame).
+    jvw = np.zeros((_KL_T, _KL_E, J))
+    for start in range(20, _KL_T, 40):
+        for j in legs:
+            jvw[start:start + 5, :, j] = 12.0
+    jpw = np.cumsum(jvw, axis=0) * _KL_DT
+    gw = np.zeros((_KL_T, _KL_E, 3))
+    cut = _KL_T // 4
+    gw[:cut, :, 2] = -1.0
+    gw[cut:, :, 0] = 1.0
+    lfw, rfw = _kick_foot_swing(+1.0)
+    losers.append({"name": "whip_and_fall", "channel": "completion",
+                   "arrays": _kick_pack(jpw, jvw, gw, _kick_standing_root(),
+                                        lfw, rfw),
+                   "behavior": beh, "meta": dict(meta)})
+
+    # active_kick_behind (DIRECTION) — full bursts, REARWARD foot. Only on an
+    # UNAMBIGUOUSLY forward goal (the rear-direction gate must not fire on a mule
+    # / spin / roundhouse kick).
+    if forward_ok:
+        jvk = np.zeros((_KL_T, _KL_E, J))
+        for start in range(20, _KL_T, 40):
+            for j in legs:
+                jvk[start:start + 5, :, j] = 8.0
+        jpk = np.cumsum(jvk, axis=0) * _KL_DT
+        lfb, rfb = _kick_foot_swing(-1.0)
+        losers.append({"name": "active_kick_behind", "channel": "direction",
+                       "arrays": _kick_pack(jpk, jvk, _kick_upright_g(),
+                                            _kick_standing_root(), lfb, rfb),
+                       "behavior": beh, "meta": dict(meta)})
+
+    # one_leg_balance (COMPLETION/support) — sub-threshold wiggle, foot held
+    # forward static, no launch. Only on an UNAMBIGUOUSLY double-support goal.
+    if double_ok:
+        jvol = rng.normal(0, 0.3, (_KL_T, _KL_E, J))
+        jpol = np.cumsum(jvol, axis=0) * _KL_DT
+        lf_hold = np.zeros((_KL_T, _KL_E, 3))
+        lf_hold[..., 0] = 0.20
+        losers.append({"name": "one_leg_balance", "channel": "completion",
+                       "arrays": _kick_pack(jpol, jvol, _kick_upright_g(),
+                                            _kick_standing_root(), lf_hold,
+                                            np.zeros((_KL_T, _KL_E, 3))),
+                       "behavior": beh, "meta": dict(meta)})
+
+    return losers
+
+
+#: The scored channels a kick metric must defend (the per-channel coverage
+#: obligation). intensity is excluded — a weak-but-forward kick is partial
+#: competence, NOT a gaming policy.
+_KICK_SCORED_CHANNELS = ("direction", "completion", "amplitude")
+
+
 def adversarial_archetype_gate(
     gen_fn: Any,
     roles: Any,
@@ -324,19 +522,32 @@ def adversarial_archetype_gate(
     n_archetypes: int = _ADV_N,
     rel_ceil: float = _ADV_REL_CEIL,
     abs_ceil: float = _ADV_ABS_CEIL,
+    required_losers: Optional[list[dict]] = None,
+    scored_channels: Optional[list[str]] = None,
 ) -> dict[str, Any]:
     """§Ship 53 (L3): an INDEPENDENT, metric-blind author proposes `n_archetypes`
     OFF-GOAL gaming policies for the goal; each is rendered (Ship-51 synthesizer)
     and scored by the metric. The metric is GAMEABLE iff some gaming policy scores
     in competent territory — at or above `min(rel_ceil·competent_ref, abs_ceil)`.
 
+    §Metric-quality laws (LAW 9): `required_losers` are DETERMINISTIC gaming probes
+    (the documented kick hacks, WITH foot_pos_b — the direction channel `render_rung`
+    can't render) scored IN THEIR OWN guarded loop that runs REGARDLESS of the LLM
+    author outcome — so the metric is always exercised against the curated hacks
+    even when the author call fails/echoes/yields nothing (the v5-anchor fix). A
+    required-loser at/above the ceiling makes the metric gameable, exactly like an
+    LLM archetype. `scored_channels` records the per-channel coverage obligation
+    (≥1 probe per channel); a GAP is a FLAG (`coverage_gaps`), NEVER a deny. With
+    both args unset the function is BYTE-IDENTICAL to the Ship-53 behavior.
+
     NEVER raises and NEVER denies on ABSENCE of evidence (an author crash, a
-    leaked/echoed payload, or zero renderable archetypes leaves `ok=True` with a
-    specific `reason`); a denial requires POSITIVE evidence of a gaming policy
-    beating competence. Provenance (payload/context/response hashes, per-archetype
-    scores) is recorded for meta.json. Mirrors the ladder author's anti-collusion
-    disciplines: the metric source is NEVER in the payload (hard self-check) and a
-    set that echoes the metric source is dropped (soft guard)."""
+    leaked/echoed payload, or zero renderable archetypes is inconclusive, not a
+    deny); a denial requires POSITIVE evidence of a gaming policy beating
+    competence. Provenance (payload/context/response hashes, per-probe scores) is
+    recorded for meta.json. Mirrors the ladder author's anti-collusion disciplines:
+    the metric source is NEVER in the payload (hard self-check) and a set that
+    echoes the metric source is dropped (soft guard); the min-Spearman / source-leak
+    anti-collusion guards are untouched."""
     from sculptor.eval.ladder_synth import render_rung
 
     base_payload = base_payload or {}
@@ -347,68 +558,110 @@ def adversarial_archetype_gate(
         "model_id": model, "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "rel_ceil": rel_ceil, "abs_ceil": abs_ceil,
         "payload_sha256": _sha(payload), "context_sha256": _sha(base_payload),
-        "archetypes": [],
+        "archetypes": [], "required_losers": [],
     }
 
-    # HARD anti-collusion self-check: WE built `payload`, so the metric must not
-    # appear in it. A hit is a programmer error here — skip (don't deny on a bug).
-    payload_text = json.dumps(payload, default=str)
-    if "def compute_spec" in payload_text or (
-            metric_src and metric_src[:120] in payload_text):
-        rec["reason"] = "adversarial: metric leaked into author payload (bug) — gate skipped"
-        return rec
-
-    try:
-        gset = _author_gaming(client, model, payload)
-    except Exception as e:  # noqa: BLE001 — a failed author call = no evidence
-        rec["reason"] = (f"adversarial: author call failed "
-                         f"({type(e).__name__}) — inconclusive, not enforced")
-        return rec
-
-    rec["response_sha256"] = _sha(getattr(gset, "model_dump", lambda: {})())
-    rec["goal_restated"] = getattr(gset, "goal_restated", "")
-    # SOFT anti-collusion: a set that echoes the metric source is dropped wholesale.
-    gset_text = json.dumps(getattr(gset, "model_dump", lambda: {})(), default=str)
-    if metric_src and any(
-            metric_src[i:i + 40] in gset_text
-            for i in range(0, max(0, len(metric_src) - 40), 40)):
-        rec["reason"] = "adversarial: archetypes echo metric source — dropped, not enforced"
-        return rec
-
     worst, worst_name = 0.0, None
-    scored = 0
-    for i, arch in enumerate(list(getattr(gset, "archetypes", []) or [])[:6]):
-        motion = getattr(arch, "motion", None)
-        name = getattr(arch, "name", "gaming")
-        if motion is None or getattr(motion, "degenerate_axis", False):
-            rec["archetypes"].append({"name": name, "skipped": "degenerate_axis"})
-            continue
-        # Render + role-inject + score under ONE guard so a single malformed
-        # archetype degrades to "skipped" (no evidence) rather than propagating —
-        # render_rung/inject_joint_roles are documented never-raise, but this keeps
-        # invariant 1 (the gate NEVER raises) airtight against a future regression.
+
+    # ── 1. DETERMINISTIC required-losers — scored FIRST and INDEPENDENTLY of the
+    #     LLM author, so the metric is probed against the curated kick hacks even
+    #     if the author call fails / echoes / yields nothing. The role injection is
+    #     CRITICAL: a role-based metric (reads meta['joint_roles']) scores 0 on a
+    #     loser whose roles weren't resolved, masking a real gameability.
+    losers_scored = 0
+    for loser in (required_losers or []):
+        name = loser.get("name", "loser")
         try:
-            arrays, behavior, meta = render_rung(motion, joint_names, rung_index=500 + i)
+            meta = dict(loser.get("meta") or {})
             inject_joint_roles(meta, roles)
-            s = float(gen_fn(arrays, behavior, meta).get("spec_score", 0.0))
-            resolved = meta.get("groups_resolved_counts", {})
-        except Exception as e:  # noqa: BLE001 — unrenderable/unscorable = no evidence
-            rec["archetypes"].append(
-                {"name": name, "skipped": f"render/score error: {type(e).__name__}"})
+            s = float(gen_fn(loser["arrays"], loser["behavior"], meta)
+                      .get("spec_score", 0.0))
+        except Exception as e:  # noqa: BLE001 — unscorable probe = no evidence
+            rec["required_losers"].append(
+                {"name": name, "channel": loser.get("channel"),
+                 "skipped": f"score error: {type(e).__name__}"})
             continue
-        scored += 1
-        rec["archetypes"].append({
-            "name": name, "strategy": str(getattr(arch, "strategy", ""))[:160],
-            "score": round(s, 4), "resolved": resolved,
-        })
+        losers_scored += 1
+        rec["required_losers"].append(
+            {"name": name, "channel": loser.get("channel"), "score": round(s, 4)})
         if s > worst:
             worst, worst_name = s, name
 
-    rec["ran"] = scored > 0
+    # ── 2. LLM gaming-archetype author (best-effort breadth; metric-blind). A
+    #     failure / echo / leak is NO evidence — it never denies; the deterministic
+    #     losers above still stand.
+    author_reason: Optional[str] = None
+    gset = None
+    payload_text = json.dumps(payload, default=str)
+    if "def compute_spec" in payload_text or (
+            metric_src and metric_src[:120] in payload_text):
+        # HARD anti-collusion self-check: WE built `payload`, so the metric must
+        # not appear in it. A hit is a programmer error — skip the author (a bug
+        # must never deny), but the deterministic losers still run.
+        author_reason = ("adversarial: metric leaked into author payload (bug) — "
+                         "author skipped")
+    else:
+        try:
+            gset = _author_gaming(client, model, payload)
+        except Exception as e:  # noqa: BLE001 — a failed author call = no evidence
+            author_reason = (f"adversarial: author call failed "
+                             f"({type(e).__name__}) — inconclusive, not enforced")
+    if gset is not None:
+        rec["response_sha256"] = _sha(getattr(gset, "model_dump", lambda: {})())
+        rec["goal_restated"] = getattr(gset, "goal_restated", "")
+        # SOFT anti-collusion: a set that echoes the metric source is dropped.
+        gset_text = json.dumps(getattr(gset, "model_dump", lambda: {})(), default=str)
+        if metric_src and any(
+                metric_src[i:i + 40] in gset_text
+                for i in range(0, max(0, len(metric_src) - 40), 40)):
+            author_reason = ("adversarial: archetypes echo metric source — "
+                             "dropped, not enforced")
+            gset = None
+
+    arche_scored = 0
+    if gset is not None:
+        for i, arch in enumerate(list(getattr(gset, "archetypes", []) or [])[:6]):
+            motion = getattr(arch, "motion", None)
+            name = getattr(arch, "name", "gaming")
+            if motion is None or getattr(motion, "degenerate_axis", False):
+                rec["archetypes"].append({"name": name, "skipped": "degenerate_axis"})
+                continue
+            # Render + role-inject + score under ONE guard so a single malformed
+            # archetype degrades to "skipped" (no evidence) rather than propagating.
+            try:
+                arrays, behavior, meta = render_rung(motion, joint_names, rung_index=500 + i)
+                inject_joint_roles(meta, roles)
+                s = float(gen_fn(arrays, behavior, meta).get("spec_score", 0.0))
+                resolved = meta.get("groups_resolved_counts", {})
+            except Exception as e:  # noqa: BLE001 — unrenderable/unscorable = no evidence
+                rec["archetypes"].append(
+                    {"name": name, "skipped": f"render/score error: {type(e).__name__}"})
+                continue
+            arche_scored += 1
+            rec["archetypes"].append({
+                "name": name, "strategy": str(getattr(arch, "strategy", ""))[:160],
+                "score": round(s, 4), "resolved": resolved,
+            })
+            if s > worst:
+                worst, worst_name = s, name
+
+    # ── 3. per-channel coverage obligation (LAW 9): record which scored channels a
+    #     probe covered. A GAP is a FLAG (never-silent), NEVER a deny — absence of a
+    #     probe is absence of evidence. The deterministic kick losers MEET the
+    #     obligation by construction (no gaps for a forward double-support kick).
+    if scored_channels is not None:
+        covered = {l["channel"] for l in rec["required_losers"]
+                   if "score" in l and l.get("channel")}
+        rec["coverage"] = {c: (c in covered) for c in scored_channels}
+        rec["coverage_gaps"] = [c for c in scored_channels if c not in covered]
+
+    # ── 4. verdict.
     rec["worst_gaming"] = round(worst, 4)
     rec["worst_name"] = worst_name
-    if scored == 0:
-        rec["reason"] = "adversarial: no renderable gaming archetype — inconclusive, not enforced"
+    rec["ran"] = (arche_scored > 0) or (losers_scored > 0)
+    if not rec["ran"]:
+        rec["reason"] = author_reason or (
+            "adversarial: no renderable gaming archetype — inconclusive, not enforced")
         return rec
 
     ceiling = min(rel_ceil * float(competent_ref), abs_ceil)
@@ -421,6 +674,74 @@ def adversarial_archetype_gate(
             f"adversarial: gaming policy {worst_name!r} scored {worst:.3f} "
             f"≥ ceiling {ceiling:.3f} (competent {competent_ref:.3f}) — "
             f"metric is gameable")
+    elif author_reason:
+        # The deterministic losers ran clean but the LLM breadth pass was
+        # inconclusive — surface it (never-silent) without changing the verdict.
+        rec["author_note"] = author_reason
+    return rec
+
+
+def adversarial_archetype_gate_spec(
+    builtin_name: str,
+    behavior_goal: str,
+    *,
+    client: Any = None,
+    robot_hint: Optional[str] = None,
+    model: str = _TD_MODEL_ID,
+    n_archetypes: int = _ADV_N,
+    rel_ceil: float = _ADV_REL_CEIL,
+    abs_ceil: float = _ADV_ABS_CEIL,
+) -> dict[str, Any]:
+    """§Metric-quality laws (LAW 9): run the adversarial gaming-archetype gate on a
+    HAND-AUTHORED `spec_*` metric — the surface that NEVER existed before, which is
+    why the gate never ran on `spec_g1_kick`, the metric that scored g1-kick-v5.
+
+    Resolves the spec fn from `_SPEC_FNS`, builds a deterministic competent
+    reference + the kick required-losers (WITH foot_pos_b) for the kick family, and
+    scores them. spec fns read `meta['joint_names']` directly, so `roles=[]` (no
+    role injection needed); `metric_src=""` (the spec is not LLM-authored, so the
+    source-leak guard is moot). NEVER raises; never denies on absence of evidence.
+
+    This is AUDIT-grade for built-ins: the verdict is recorded/surfaced — it must
+    NEVER auto-revoke the ground-truth fence (built-ins are the trusted calibration
+    anchor). Raises KeyError on an unknown builtin (like `calibrate_metric`)."""
+    from sculptor.eval.metric_validate import resolve_behavior_family
+    from sculptor.eval.robot_manifest import robot_joint_names as _manifest
+
+    if builtin_name not in _SPEC_FNS:
+        raise KeyError(f"unknown built-in metric {builtin_name!r}")
+    spec_fn = _SPEC_FNS[builtin_name]
+    names = list(_manifest(robot_hint) or _NAMES_12)
+    family = resolve_behavior_family(behavior_goal, robot_hint)
+
+    if client is None:
+        import anthropic
+        client = anthropic.Anthropic(max_retries=2, timeout=240.0)
+
+    losers: list[dict] = []
+    channels: Optional[list[str]] = None
+    competent_ref = 0.0
+    if family == "kick":
+        losers = kick_required_losers(names, behavior_goal, robot_hint)
+        channels = list(_KICK_SCORED_CHANNELS)
+        comp = _kick_competent_reference(names)
+        if comp is not None:
+            try:
+                competent_ref = float(spec_fn(*comp).get("spec_score", 0.0))
+            except Exception:  # noqa: BLE001 — no reference → ceiling falls to abs_ceil
+                competent_ref = 0.0
+
+    base_payload = {"behavior_goal": behavior_goal, "robot_hint": robot_hint,
+                    "joint_names": names}
+    rec = adversarial_archetype_gate(
+        spec_fn, [], names, competent_ref, client=client, model=model,
+        base_payload=base_payload, metric_src="", n_archetypes=n_archetypes,
+        rel_ceil=rel_ceil, abs_ceil=abs_ceil,
+        required_losers=losers or None, scored_channels=channels)
+    rec["builtin"] = builtin_name
+    rec["behavior_goal"] = behavior_goal
+    rec["family"] = family
+    rec["audit_only"] = True   # NEVER revoke the ground-truth fence on a deny.
     return rec
 
 
@@ -438,6 +759,7 @@ def calibrate_task_derived(
     agree_floor: float = _TD_AGREE_FLOOR,
     adversarial: bool = False,
     adversarial_n: int = _ADV_N,
+    adversarial_required_losers: bool = False,
 ) -> dict[str, Any]:
     """§Ship 51: earn steer-rights on a NOVEL task (no built-in ground truth)
     by ranking K INDEPENDENTLY-authored competence ladders. Each of K sources
@@ -611,10 +933,23 @@ def calibrate_task_derived(
             competent_ref = max(
                 (s["gen_scores"][-1] for s in sources
                  if s.get("ladder_ok") and s.get("gen_scores")), default=0.0)
+            # §Metric-quality laws (LAW 9): OPT-IN deterministic kick required-
+            # losers (the kick hack rungs WITH foot_pos_b). Default OFF so the grant
+            # stays byte-identical to Ship 53; ON only for a novel KICK-VARIANT task
+            # (a canonical kick routes to the built-in path, not here). Each loser
+            # gets the metric's roles injected inside the gate.
+            req_losers = None
+            sc = None
+            if adversarial_required_losers:
+                from sculptor.eval.metric_validate import resolve_behavior_family
+                if resolve_behavior_family(behavior_goal, robot_hint) == "kick":
+                    req_losers = kick_required_losers(names, behavior_goal, robot_hint)
+                    sc = list(_KICK_SCORED_CHANNELS)
             adv = adversarial_archetype_gate(
                 gen_fn, roles, names, competent_ref, client=client, model=model,
                 base_payload=base_payload, metric_src=metric_src,
-                n_archetypes=adversarial_n)
+                n_archetypes=adversarial_n,
+                required_losers=req_losers, scored_channels=sc)
         except Exception:  # noqa: BLE001 — an unexpected gate crash is NO evidence,
             adv = None      # never a deny (calibrate_task_derived never raises)
 

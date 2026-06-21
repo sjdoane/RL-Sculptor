@@ -18,7 +18,7 @@ def _make_project(client: TestClient, name: str = "Metrics") -> str:
 
 
 def _fake_generate(behavior_goal, out_dir, *, robot_hint=None, review=True,
-                   on_event=None):
+                   n_candidates=1, on_event=None):
     if on_event:  # §Ship 40: exercise the progress channel
         on_event({"stage": "generating", "attempt": 1, "max": 3,
                   "message": "Generating candidate metric (attempt 1/3)…"})
@@ -79,6 +79,44 @@ def test_generate_list_and_calibrate(client: TestClient, monkeypatch):
     assert r.json()["id"] == "gen_002"
 
 
+def test_generate_best_of_n_forwarded_and_surfaced(client: TestClient, monkeypatch):
+    """§best-of-N: the route forwards `n_candidates` to the generator, and the
+    best-of-N record fields (n_candidates / selected_candidate / candidates) surface
+    in the metric summary the UI shows."""
+    from backend.services import sculptor_bridge
+
+    captured: dict = {}
+
+    def fake_gen(behavior_goal, out_dir, *, robot_hint=None, review=True,
+                 n_candidates=1, on_event=None):
+        captured["n_candidates"] = n_candidates
+        rec = _fake_generate(behavior_goal, out_dir, robot_hint=robot_hint, review=review)
+        rec.update({"n_candidates": n_candidates, "selected_candidate": 1,
+                    "candidates": [{"candidate": 0, "ok": True, "discrimination": 1.0},
+                                   {"candidate": 1, "ok": True, "discrimination": 1.83}]})
+        return rec
+
+    monkeypatch.setattr(sculptor_bridge, "generate_objective_metric", fake_gen)
+    slug = _make_project(client, "MetricsBoN")
+
+    r = client.post(f"/projects/{slug}/metrics/generate",
+                    json={"behavior_goal": "touch your toes", "n_candidates": 3})
+    assert r.status_code == 200, r.text
+    assert captured["n_candidates"] == 3                  # forwarded to the generator
+    rec = r.json()
+    assert rec["n_candidates"] == 3 and rec["selected_candidate"] == 1
+    assert len(rec["candidates"]) == 2
+
+    # the bound is enforced (a typo can't fan out unbounded LLM calls).
+    bad = client.post(f"/projects/{slug}/metrics/generate",
+                      json={"behavior_goal": "touch your toes", "n_candidates": 99})
+    assert bad.status_code == 422
+    # default is 1 (single-shot) when omitted — byte-identical to before.
+    r2 = client.post(f"/projects/{slug}/metrics/generate",
+                     json={"behavior_goal": "kick once"})
+    assert r2.status_code == 200 and captured["n_candidates"] == 1
+
+
 def test_generate_writes_live_progress_then_clears(client: TestClient, monkeypatch):
     """§Ship 40: while a generate is in flight the progress sidecar reflects
     the live pipeline stage; it is cleared (active=false) on completion."""
@@ -86,7 +124,7 @@ def test_generate_writes_live_progress_then_clears(client: TestClient, monkeypat
 
     seen: dict = {}
 
-    def fake_gen(behavior_goal, out_dir, *, robot_hint=None, review=True, on_event=None):
+    def fake_gen(behavior_goal, out_dir, *, robot_hint=None, review=True, n_candidates=1, on_event=None):
         if on_event:
             on_event({"stage": "generating", "attempt": 1, "max": 3,
                       "message": "Generating candidate metric (attempt 1/3)…"})

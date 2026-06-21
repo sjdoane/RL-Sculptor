@@ -110,6 +110,92 @@ def resolve_behavior_family(
     return None
 
 
+def resolve_torso_target(behavior_goal: Optional[str]) -> str:
+    """§Metric-quality laws (LAW 13): the body orientation a COMPETENT execution
+    holds, so the uprightness-monotonicity axiom (which penalises tilting toward
+    horizontal) is applied ONLY to upright skills. A flip / dive / roll / crawl
+    is competently HORIZONTAL mid-move; a handstand / cartwheel is inverted/any.
+
+    Returns `"upright"` (default — the common case), `"horizontal"`, or `"any"`.
+    WORD-level match like `resolve_behavior_family`. The default is SAFE: a
+    metric for a truly novel orientation the keyword set misses self-scopes via
+    its ~0 score on the upright synthetic battery (so M1 passes vacuously rather
+    than false-rejecting), and most real goals genuinely are upright."""
+    g = (behavior_goal or "").lower()
+    tokens = set(re.findall(r"[a-z]+", g))
+
+    def has(*words: str) -> bool:
+        return any(w in tokens for w in words)
+
+    if (has("backflip", "frontflip", "flip", "flips", "flipping", "somersault",
+            "somersaults", "dive", "dives", "diving", "roll", "rolls", "rolling",
+            "crawl", "crawling", "prone")
+            or "back flip" in g or "front flip" in g):
+        return "horizontal"
+    if has("handstand", "handstands", "headstand", "cartwheel", "cartwheels",
+           "inverted", "invert", "upside"):
+        return "any"
+    return "upright"
+
+
+def resolve_goal_frame(
+    behavior_goal: Optional[str], robot_hint: Optional[str] = None,
+) -> dict[str, Optional[str]]:
+    """§Metric-quality laws (LAW 0): the task-declared FRAME a metric's
+    directional / postural / support gates must read BEFORE they fire. Any field
+    that is unresolved (`None`) means the matching gate ABSTAINS — it adds
+    neither a penalty nor a pass — so a NOVEL task (a rearward mule-kick, a
+    single-support flamingo, a backflip) is never false-rejected by a gate that
+    silently assumes forward + upright + double-support.
+
+      goal_axis    — "+x" (forward), "-x" (rearward), or None (non-directional).
+      support_mode — "double", "single", "flight", or None.
+      torso_target — "upright" | "horizontal" | "any" (see resolve_torso_target).
+
+    WORD-level match like resolve_behavior_family / resolve_torso_target. The
+    defaults are SAFE (a plain directional skill is forward + double — the
+    benchmark case); any miss self-scopes via the metric's ~0 score on the
+    synthetic battery rather than a false rejection."""
+    g = (behavior_goal or "").lower()
+    tokens = set(re.findall(r"[a-z]+", g))
+
+    def has(*words: str) -> bool:
+        return any(w in tokens for w in words)
+
+    torso = resolve_torso_target(behavior_goal)
+
+    # Support mode. NOTE the single-support patterns are deliberately specific
+    # ("single leg" / "one foot" / "balance on one" / flamingo / handstand) — a
+    # bare "with one leg" describes a normal kick (still DOUBLE-support stance),
+    # so it must NOT resolve to single.
+    if has("jump", "jumps", "jumping", "hop", "hops", "hopping", "leap",
+           "leaps", "leaping", "flip", "flips", "somersault", "dive", "dives"):
+        support: Optional[str] = "flight"
+    elif (has("flamingo", "handstand", "headstand", "stork")
+          or "one foot" in g or "single leg" in g or "single-leg" in g
+          or "one-legged" in g or "balance on one" in g):
+        support = "single"
+    elif torso != "upright":
+        support = None              # a flip/roll/crawl has mixed/unclear support
+    else:
+        support = "double"
+
+    # Goal axis: rearward when the goal explicitly says so; else forward for a
+    # directional skill; else None (in-place / non-directional, e.g. a spin).
+    if (has("backward", "backwards", "behind", "rearward", "reverse")
+            or "mule kick" in g or "mule-kick" in g):
+        goal_axis: Optional[str] = "-x"
+    elif has("kick", "kicks", "kicking", "punch", "punches", "punching",
+             "strike", "strikes", "reach", "reaches", "throw", "throws",
+             "forward", "ahead", "front", "trot", "walk", "walking", "run",
+             "running", "march", "stride", "sprint", "jog", "gait", "locomote"):
+        goal_axis = "+x"
+    else:
+        goal_axis = None
+
+    return {"goal_axis": goal_axis, "support_mode": support, "torso_target": torso}
+
+
 def _ast_safety(source: str) -> list[str]:
     """Return a list of safety violations (empty = safe)."""
     problems: list[str] = []
@@ -240,9 +326,26 @@ def _archetypes() -> dict[str, dict]:
     rng = np.random.default_rng(0)
     t = np.arange(T)
 
-    def arrays(joint_pos, joint_vel, gravity, root):
-        return {"joint_pos": joint_pos, "joint_vel": joint_vel,
-                "projected_gravity_b": gravity, "root_link_pos_w": root}
+    def arrays(joint_pos, joint_vel, gravity, root, lfoot=None, rfoot=None):
+        d = {"joint_pos": joint_pos, "joint_vel": joint_vel,
+             "projected_gravity_b": gravity, "root_link_pos_w": root}
+        if lfoot is not None:
+            d["left_foot_pos_b"] = lfoot
+        if rfoot is not None:
+            d["right_foot_pos_b"] = rfoot
+        return d
+
+    # §Metric-quality laws: a left-foot anterior (pelvis-frame x) swing for the
+    # kick archetypes — forward (+1) for a real kick, rearward (−1) for the
+    # kick-behind hack; the right (stance) foot stays put. The signed x is what
+    # lets a direction-aware metric (LAW 4) tell a forward kick from a rear one.
+    def foot_swing(direction):
+        lf = np.zeros((T, E, 3)); rf = np.zeros((T, E, 3))
+        for start in range(20, T, 40):
+            for k in range(10):
+                if start + k < T:
+                    lf[start + k, :, 0] = direction * 0.30 * np.sin(np.pi * k / 10)
+        return lf, rf
 
     # dead-still upright
     jp0 = np.zeros((T, E, J)); jv0 = rng.normal(0, 0.01, (T, E, J))
@@ -297,7 +400,8 @@ def _archetypes() -> dict[str, dict]:
         for jdx in (0, 2, 4):
             jvk[start:start + 5, :, jdx] = 8.0
     jpk = np.cumsum(jvk, axis=0) * 0.02       # consistent integrated position
-    active_kick = arrays(jpk, jvk, _upright_g(), _standing_root())
+    lf_fwd, rf_fwd = foot_swing(+1.0)         # foot swings FORWARD (a real kick)
+    active_kick = arrays(jpk, jvk, _upright_g(), _standing_root(), lf_fwd, rf_fwd)
 
     # active_floss: anti-phase hip↔arm oscillation. SLOW (period 25, like the
     # g1_floss ladder) so a motion-MAGNITUDE metric cannot mistake it for the
@@ -351,10 +455,41 @@ def _archetypes() -> dict[str, dict]:
     rootw[..., 0] = (t * 0.04)[:, None]      # forward travel
     walker = arrays(jpw, jvw, _upright_g(), rootw)
 
+    # §Metric-quality laws: the documented g1-kick-v5 hacks as KICK-FAMILY
+    # negatives (scoped in validate_generated_metric so a single-support or
+    # rearward NOVEL task is never false-rejected — LAW 0).
+    # active_kick_behind: the SAME leg bursts as active_kick but the foot swings
+    # REARWARD — a direction-blind metric scores it == active_kick (gameable); a
+    # signed-direction metric (LAW 4) scores it ~0. This is the "kicks behind it"
+    # failure Sam observed on g1-kick-v5.
+    lf_back, rf_back = foot_swing(-1.0)
+    active_kick_behind = arrays(jpk.copy(), jvk.copy(), _upright_g(),
+                                _standing_root(), lf_back, rf_back)
+    # one_leg_balance: a raised, HELD single leg with only sub-threshold wiggle
+    # from a stationary upright stance — no real launch (LAW 1 completion gate)
+    # and no swing (LAW 4). The "balance on one leg" half of the v5 hack.
+    jvol = rng.normal(0, 0.3, (T, E, J))      # sub-threshold; never crosses the burst floor
+    jpol = np.cumsum(jvol, axis=0) * 0.02
+    lf_hold = np.zeros((T, E, 3)); lf_hold[..., 0] = 0.20   # foot held forward, static
+    one_leg_balance = arrays(jpol, jvol, _upright_g(), _standing_root(),
+                             lf_hold, np.zeros((T, E, 3)))
+    # partial_kick: a SINGLE brief, small-amplitude forward flick (a partial,
+    # non-repeated half-motion) — correctly-directed but must score BELOW a full
+    # repeated kick (LAW 1 completion + LAW 2 amplitude).
+    jvp = np.zeros((T, E, J))
+    for jdx in (0, 2, 4):
+        jvp[20:23, :, jdx] = 3.0              # one short sub-floor flick
+    jpp = np.cumsum(jvp, axis=0) * 0.02
+    lf_p, rf_p = foot_swing(+1.0)
+    lf_p = lf_p * 0.2                          # tiny forward nudge (correct direction)
+    partial_kick = arrays(jpp, jvp, _upright_g(), _standing_root(), lf_p, rf_p)
+
     return {"still": still, "fallen": fallen, "chaotic": chaotic,
             "active": active, "upright_flail": upright_flail,
             "active_kick": active_kick, "active_floss": active_floss,
-            "active_jump": active_jump, "walker": walker}
+            "active_jump": active_jump, "walker": walker,
+            "active_kick_behind": active_kick_behind,
+            "one_leg_balance": one_leg_balance, "partial_kick": partial_kick}
 
 
 def _score(fn, arrays, meta) -> float:
@@ -369,6 +504,195 @@ def _score(fn, arrays, meta) -> float:
 # (None) we don't gate (the calibration firewall is the task-validity check),
 # so the smell-test never false-rejects an ambiguous goal.
 _STATIONARY_FAMILIES = frozenset({"kick", "floss", "jump"})
+
+#: A fixed-battery score at or below this counts as "no signal from that
+#: archetype". When EVERY archetype is this low AND the goal resolves to no
+#: family, the battery cannot represent the goal — the selectivity probe decides.
+_BATTERY_NEAR_ZERO = 1e-3
+
+
+def _selectivity_probe(fn, meta) -> dict[str, float]:
+    """Goal-AGNOSTIC selectivity probe: score `fn` on a deterministic, offline
+    SET of hand-rolled competent-vs-degenerate rollouts to answer "is this metric
+    SELECTIVE at all" — distinct from "does it match the goal" (the task-derived
+    calibration firewall's job). Used only to rescue a novel-task metric the fixed
+    `_archetypes()` battery cannot represent (e.g. a toe-touch/squat metric gated
+    on a pelvis DIP-AND-RETURN, which no fixed archetype performs → all score ~0,
+    yet the metric is perfectly selective).
+
+    Hand-rolled numpy (NOT render_rung — its `base_height_m` is a monotone ramp and
+    cannot express a dip-and-return), so this stays deterministic + offline (no LLM,
+    no API), preserving the validate hot path. The competent set spans posture axes
+    so an UPRIGHT skill (toe-touch / squat / sit-to-stand / bow / wave / twist via
+    joint ROM) OR a NON-UPRIGHT skill (roll / deep bow / crawl) lights up at least
+    one probe; the degenerate set (still + fallen) is what a degenerate metric
+    (all-zero / still-rewarding / fall-rewarding) cannot be separated from. Returns
+    `{competent, degenerate, spread}` where competent/degenerate are the MAX over
+    each set. Never raises (a probe crash scores 0.0 = no signal)."""
+    t = np.arange(T)
+    fold = (1.0 - np.cos(2.0 * np.pi * t / T)) / 2.0     # 0→1→0 over the rollout (returns)
+    fold_c = fold[:, None, None]                          # broadcast over (E, J)
+    ones = np.ones((T, E, J))
+
+    def _g_upright() -> np.ndarray:
+        g = np.zeros((T, E, 3)); g[..., 2] = -1.0
+        return g
+
+    # C1 — UPRIGHT: full-ROM joint fold + a pelvis V-dip-and-return, stationary.
+    # Lights up any upright posture/ROM skill (toe-touch, squat, sit-to-stand, bow,
+    # wave, twist). joints sweep 0→1.2→0 (ROM 1.2); pelvis dips 0.35 m and returns.
+    jp1 = 1.2 * fold_c * ones
+    root1 = np.zeros((T, E, 3)); root1[..., 2] = 0.7 - 0.35 * fold[:, None]
+    c1 = {"joint_pos": jp1, "joint_vel": np.gradient(jp1, axis=0),
+          "projected_gravity_b": _g_upright(), "root_link_pos_w": root1}
+
+    # C2 — NON-UPRIGHT: a structured posture ARC (gravity tilts away and back) + ROM,
+    # stationary. Lights up a skill whose competent execution leaves upright (roll,
+    # deep bow, crawl, lie-and-rise) — generality beyond upright skills.
+    jp2 = 1.0 * fold_c * ones
+    g2 = np.zeros((T, E, 3))
+    g2[..., 2] = -1.0 + fold[:, None]                     # gz: -1→0→-1 (tilt + recover)
+    g2[..., 0] = fold[:, None]                            # gx: 0→1→0
+    root2 = np.zeros((T, E, 3)); root2[..., 2] = 0.6
+    c2 = {"joint_pos": jp2, "joint_vel": np.gradient(jp2, axis=0),
+          "projected_gravity_b": g2, "root_link_pos_w": root2}
+
+    # D1 — STILL: alive-but-frozen upright stance. A still / low-motion-rewarding
+    # metric scores this high → no competent-vs-degenerate separation → reject.
+    jp0 = np.zeros((T, E, J)); jv0 = np.zeros((T, E, J))
+    root_up = np.zeros((T, E, 3)); root_up[..., 2] = 0.7
+    d1 = {"joint_pos": jp0, "joint_vel": jv0,
+          "projected_gravity_b": _g_upright(), "root_link_pos_w": root_up}
+
+    # D2 — FALLEN: toppled + collapsed. A fall-rewarding metric scores this high.
+    gf = np.zeros((T, E, 3)); gf[..., 0] = 1.0           # gravity sideways = toppled
+    rootf = np.zeros((T, E, 3)); rootf[..., 2] = 0.3
+    d2 = {"joint_pos": jp0, "joint_vel": jv0,
+          "projected_gravity_b": gf, "root_link_pos_w": rootf}
+
+    def _s(a) -> float:
+        try:
+            v = _score(fn, a, meta)
+            return float(v) if np.isfinite(v) else 0.0
+        except Exception:  # noqa: BLE001 — a probe crash is "no signal", never raises
+            return 0.0
+
+    comp = max(_s(c1), _s(c2))
+    degen = max(_s(d1), _s(d2))
+    return {"competent": comp, "degenerate": degen, "spread": comp - degen}
+
+
+# ── §best-of-N graded discriminator (candidate SELECTION, not validity) ─────
+
+
+def _graded_fold_rung(depth: float, rom: float) -> dict:
+    """An UPRIGHT fold-and-return rung (the `_selectivity_probe` C1 math, parameterized
+    for grading): the pelvis dips `depth` m and returns, every joint sweeps 0→`rom`→0
+    in phase, upright + stationary. depth/rom up ⇒ more competent."""
+    t = np.arange(T)
+    fold = (1.0 - np.cos(2.0 * np.pi * t / T)) / 2.0
+    jp = rom * fold[:, None, None] * np.ones((T, E, J))
+    root = np.zeros((T, E, 3)); root[..., 2] = 0.7 - depth * fold[:, None]
+    return {"joint_pos": jp, "joint_vel": np.gradient(jp, axis=0),
+            "projected_gravity_b": _upright_g(), "root_link_pos_w": root}
+
+
+def _graded_posture_rung(tilt: float, rom: float) -> dict:
+    """A NON-UPRIGHT posture-arc rung (the `_selectivity_probe` C2 math, parameterized):
+    body-frame gravity tilts `tilt` away and back while joints sweep 0→`rom`→0,
+    stationary. Lights up a skill whose competent execution leaves upright (roll, deep
+    bow, crawl). tilt/rom up ⇒ more competent."""
+    t = np.arange(T)
+    fold = (1.0 - np.cos(2.0 * np.pi * t / T)) / 2.0
+    jp = rom * fold[:, None, None] * np.ones((T, E, J))
+    g = np.zeros((T, E, 3))
+    g[..., 2] = -1.0 + tilt * fold[:, None]
+    g[..., 0] = tilt * fold[:, None]
+    root = np.zeros((T, E, 3)); root[..., 2] = 0.6
+    return {"joint_pos": jp, "joint_vel": np.gradient(jp, axis=0),
+            "projected_gravity_b": g, "root_link_pos_w": root}
+
+
+def graded_discrimination(fn, meta) -> dict[str, Any]:
+    """Deterministic, OFFLINE discrimination score for best-of-N candidate selection
+    (§best-of-N): how SHARPLY + MONOTONICALLY does `fn` grade competence on a GRADED
+    competence ladder (degenerate → partial → good → ideal)? Extends the goal-agnostic
+    `_selectivity_probe` (competent-vs-degenerate) into a 3-rung graded ladder along
+    BOTH axes it covers — an upright fold-and-return and a non-upright posture arc —
+    and returns, per axis, `separation` (ideal − the degenerate floor) + `monotonicity`
+    (fraction of adjacent graded steps that strictly increase). `score` is the SHARPER
+    axis, so a metric that grades EITHER posture family well selects above a coarse one.
+
+    This is NOT task-validity (that is calibration's job) — it is a goal-agnostic
+    TIE-BREAK: when the probe cannot excite the metric (e.g. a kick/locomotion metric,
+    blind to a smooth fold), every candidate scores ~0 and the caller keeps the first
+    valid one (today's behavior). Rung scores are clamped to the spec_score [0,1]
+    contract, so `separation` is bounded [−1,1] and co-scale with `monotonicity` — a
+    high-amplitude coarse metric can't swamp the monotonicity term. Pure-numpy, no RNG:
+    identical across calls (the selector must add no nondeterminism). Never raises (a
+    crash on a rung scores 0)."""
+    jp0 = np.zeros((T, E, J))
+    root_up = np.zeros((T, E, 3)); root_up[..., 2] = 0.7
+    still = {"joint_pos": jp0, "joint_vel": jp0,
+             "projected_gravity_b": _upright_g(), "root_link_pos_w": root_up}
+    gf = np.zeros((T, E, 3)); gf[..., 0] = 1.0
+    rootf = np.zeros((T, E, 3)); rootf[..., 2] = 0.3
+    fallen = {"joint_pos": jp0, "joint_vel": jp0,
+              "projected_gravity_b": gf, "root_link_pos_w": rootf}
+
+    def _s(a) -> float:
+        try:
+            v = _score(fn, a, meta)
+            # CLAMP to the spec_score [0,1] contract: separation is then bounded
+            # [−1,1] and co-scale with monotonicity, so a high-AMPLITUDE coarse metric
+            # (a binary gate that returns, say, 5.0) saturates to 1.0 and cannot
+            # out-rank a smooth grader on raw output scale — amplitude is an author
+            # artifact, not discrimination.
+            return float(np.clip(v, 0.0, 1.0)) if np.isfinite(v) else 0.0
+        except Exception:  # noqa: BLE001 — a rung crash is "no signal", never raises
+            return 0.0
+
+    degen = max(_s(still), _s(fallen))
+
+    def _axis(rungs: list) -> dict:
+        scores = [_s(r) for r in rungs]                 # partial → good → ideal
+        separation = scores[-1] - degen
+        steps = sum(1 for a, b in zip(scores, scores[1:]) if b > a + 1e-4)
+        monotonicity = steps / float(max(1, len(scores) - 1))
+        return {"scores": [round(s, 4) for s in scores],
+                "separation": round(separation, 4),
+                "monotonicity": round(monotonicity, 4),
+                "disc": round(separation + monotonicity, 4)}
+
+    fold_axis = _axis([_graded_fold_rung(0.22, 0.80),
+                       _graded_fold_rung(0.30, 1.05),
+                       _graded_fold_rung(0.35, 1.20)])
+    posture_axis = _axis([_graded_posture_rung(0.50, 0.70),
+                          _graded_posture_rung(0.75, 0.90),
+                          _graded_posture_rung(1.00, 1.10)])
+    score = max(fold_axis["disc"], posture_axis["disc"])
+    return {"score": round(float(score), 4), "degenerate": round(degen, 4),
+            "fold_axis": fold_axis, "posture_axis": posture_axis}
+
+
+def discrimination_of_metric(
+    module_path: Path | str, required_roles: Optional[Sequence[str]] = None,
+) -> dict[str, Any]:
+    """Load a generated metric module and score it on the offline `graded_discrimination`
+    ladder — the best-of-N candidate selector. Builds the same synthetic 12-joint meta +
+    LENIENT role injection the non-degeneracy gate uses, so a role-based metric reads the
+    right columns. Never raises: a load/score failure scores 0.0 (the candidate simply
+    loses the deterministic tie-break, never crashes the generator)."""
+    try:
+        mod = load_generated_module(module_path)
+        fn = getattr(mod, GENERATED_FN_NAME, None)
+        if not callable(fn):
+            return {"score": 0.0, "error": f"no callable {GENERATED_FN_NAME}"}
+    except Exception as e:  # noqa: BLE001
+        return {"score": 0.0, "error": f"{type(e).__name__}: {e}"}
+    meta = {"joint_names": list(_NAMES_12)}
+    inject_joint_roles(meta, list(required_roles or []), lenient=True)
+    return graded_discrimination(fn, meta)
 
 
 def validate_generated_metric(
@@ -403,6 +727,9 @@ def validate_generated_metric(
     gates: dict[str, bool] = {}
     reasons: list[str] = []
     family = resolve_behavior_family(behavior_goal, robot_hint)
+    # §LAW 0: the goal frame scopes the directional / support gates so a novel
+    # rearward / single-support / non-upright task is never false-rejected.
+    frame = resolve_goal_frame(behavior_goal, robot_hint)
     required_roles: list[str] = []
 
     # 1. AST safety
@@ -540,8 +867,39 @@ def validate_generated_metric(
     negative_keys = ("still", "fallen", "upright_flail", "chaotic")
 
     nondegen = True
+    vacuous = False
     finite = {k: v for k, v in scores.items() if np.isfinite(v)}
-    if len(finite) < 3:
+    # §<novel-task fix>: when the goal resolves to NO family AND every fixed
+    # archetype scores ~0, the fixed battery cannot REPRESENT this goal — a
+    # SELECTIVE novel metric (e.g. toe-touch, gated on a pelvis dip-and-return no
+    # archetype performs) is otherwise false-rejected as "near-constant", and the
+    # run continues blind. Defer to a goal-agnostic selectivity probe: pass IFF the
+    # metric clearly separates a competent behavior from the degenerate ones.
+    # Task-VALIDITY (does it match the goal) is enforced downstream by task-derived
+    # calibration; the firewall keeps an uncalibrated metric observe-only, so a
+    # vacuous pass never grants steering on its own. Scoped to family is None →
+    # every builtin family keeps the unchanged path (their positive archetype is
+    # never ~0, so battery_uninformative is False).
+    battery_uninformative = (
+        family is None and len(finite) >= 3
+        and max(finite.values()) <= _BATTERY_NEAR_ZERO)
+    if battery_uninformative:
+        probe = _selectivity_probe(fn, meta)
+        if probe["competent"] >= spread_min and probe["spread"] >= spread_min:
+            vacuous = True
+            reasons.append(
+                f"[nondegeneracy] vacuous pass: the fixed archetype battery is "
+                f"uninformative for this novel goal (all ≤ {_BATTERY_NEAR_ZERO}), "
+                f"but the metric IS selective on the goal-agnostic probe (competent "
+                f"{probe['competent']:.3f} vs degenerate {probe['degenerate']:.3f}) "
+                f"— task-validity deferred to task-derived calibration")
+        else:
+            nondegen = False
+            reasons.append(
+                f"[nondegeneracy] near-constant metric: fixed battery uninformative "
+                f"AND not selective on the probe (competent {probe['competent']:.3f}, "
+                f"degenerate {probe['degenerate']:.3f}) — no signal")
+    elif len(finite) < 3:
         nondegen = False
         reasons.append("[nondegeneracy] too few finite archetype scores")
     else:
@@ -580,6 +938,38 @@ def validate_generated_metric(
                 f"[nondegeneracy] forward-walker 'walker' ({finite['walker']:.3f}) "
                 f"scores above the {distractor_ceiling} ceiling for the stationary "
                 f"'{family}' skill — the metric rewards walking, not the behavior")
+        # §Metric-quality laws: kick-family hack ceiling. A FORWARD-kick metric
+        # must score the documented g1-kick-v5 hacks BELOW its kick positive —
+        # a rear/sideways kick (wrong direction, LAW 4), a one-leg balance (no
+        # launch, LAW 1) and a sub-amplitude partial (LAW 2). Scoped to the kick
+        # family so a single-support or rearward-motion NOVEL task is never
+        # false-rejected (LAW 0). A metric that can't separate these from a real
+        # forward kick is gameable by exactly the behavior that stalled v5.
+        if family == "kick":
+            kick_pos = finite.get("active_kick", float("-inf"))
+            # §LAW 0: the directional / support gates fire ONLY when the goal
+            # FRAME calls for them. A forward-axis goal must beat the rear-kick
+            # archetype; a double-support skill must beat the one-leg balance.
+            # A rearward (mule) kick (goal_axis "-x") or a single-support kick
+            # VARIANT abstains on the matching gate, so a novel kick is not
+            # false-rejected. Completion/amplitude (the partial rep) is
+            # frame-independent — a kick is always a completed, full-amplitude
+            # motion, forward or not.
+            hacks = ["partial_kick"]
+            if frame.get("goal_axis") == "+x":
+                hacks.append("active_kick_behind")
+            if frame.get("support_mode") == "double":
+                hacks.append("one_leg_balance")
+            for hack in hacks:
+                hv = finite.get(hack)
+                if (hv is not None and kick_pos != float("-inf")
+                        and hv >= kick_pos - 1e-9):
+                    nondegen = False
+                    reasons.append(
+                        f"[nondegeneracy] kick hack '{hack}' ({hv:.3f}) scores "
+                        f">= the kick positive 'active_kick' ({kick_pos:.3f}) — "
+                        f"gameable; needs signed forward direction (foot_pos_b) "
+                        f"+ a completion gate + an amplitude floor")
     gates["nondegeneracy"] = nondegen
 
     # §Ship 50: L1 task-agnostic axioms — controlled-perturbation invariants
@@ -592,11 +982,14 @@ def validate_generated_metric(
     if gates.get("bounded") and gates.get("loads"):
         from sculptor.eval.metric_axioms import check_metric_axioms
 
-        axioms = check_metric_axioms(fn, family=family, required_roles=required_roles)
+        axioms = check_metric_axioms(
+            fn, family=family, required_roles=required_roles,
+            torso_target=frame["torso_target"])
         gates["axioms"] = bool(axioms["ok"])
         reasons += axioms["reasons"]
 
     ok = all(gates.values())
     return {"ok": ok, "gates": gates, "reasons": reasons,
             "archetype_scores": scores, "family": family,
+            "goal_frame": frame, "nondegeneracy_vacuous": vacuous,
             "required_roles": required_roles, "axioms": axioms}

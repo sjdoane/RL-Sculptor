@@ -85,7 +85,7 @@ async def generate_project_metric(
         rec = await run_in_threadpool(
             metric_store.generate, project_dir, body.behavior_goal,
             robot_hint=_robot_hint(project_dir), review=body.review,
-            on_event=_on_event)
+            n_candidates=body.n_candidates, on_event=_on_event)
         if body.calibrate_against and rec.get("accepted"):
             try:
                 metric_store.write_progress(project_dir, {

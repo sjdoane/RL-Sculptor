@@ -85,6 +85,12 @@ def _summary(gid: str, rec: dict) -> dict[str, Any]:
         # the Ship-52 trust score). None for pre-Ship-50 records.
         "axioms": validation.get("axioms"),
         "calibration": rec.get("calibration"),
+        # §best-of-N: how many candidates were sampled + which one won (with its
+        # offline discrimination), so the UI can show "selected 2/3 (disc 1.83)".
+        # None / 1 for the single-shot path (the byte-identical default).
+        "n_candidates": rec.get("n_candidates"),
+        "selected_candidate": rec.get("selected_candidate"),
+        "candidates": rec.get("candidates"),
         # §Ship 51: "builtin" | "task_derived" so the UI can show the right card.
         "calibration_method": rec.get("calibration_method"),
         # §Ship 52: standardized trust score + per-layer breakdown.
@@ -97,15 +103,17 @@ def _summary(gid: str, rec: dict) -> dict[str, Any]:
 def generate(
     project_dir: Path, behavior_goal: str, *,
     robot_hint: Optional[str] = None, review: bool = True,
-    on_event=None,
+    n_candidates: int = 1, on_event=None,
 ) -> dict[str, Any]:
     """Generate + validate + review a metric; persist under a fresh id.
-    §Ship 40: `on_event` streams pipeline progress to the caller."""
+    §Ship 40: `on_event` streams pipeline progress to the caller.
+    §best-of-N: `n_candidates` >1 samples N candidates and keeps the most
+    discriminating valid one (default 1 → single-shot-with-retry)."""
     root = _metrics_root(project_dir)
     gid = _next_id(root)
     rec = sculptor_bridge.generate_objective_metric(
         behavior_goal, root / gid, robot_hint=robot_hint, review=review,
-        on_event=on_event)
+        n_candidates=n_candidates, on_event=on_event)
     rec["id"] = gid
     # Re-stamp meta.json with the id so list/calibrate can find it.
     meta = root / gid / "meta.json"

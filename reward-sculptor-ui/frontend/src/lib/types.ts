@@ -349,6 +349,9 @@ export interface RunParamsPayload {
   fitness_metric?: string | null;
   // observe = compute + display only (no influence); steer = drives the loop.
   fitness_mode?: "observe" | "steer";
+  // §best-of-N: candidates to sample for a generate-at-launch metric (1 =
+  // single-shot). Only used when fitness_metric === "generate-at-launch".
+  metric_n_candidates?: number;
   // §Ship 48: patience for the fitness-plateau early stop (the LIVE early
   // stop on a steered run; the early_stop_* fields above are a no-op for it).
   // null → sculpt default (2). The UI sends 4 for hard exploratory skills.
@@ -388,6 +391,12 @@ export interface MetricSummary {
   reasons?: string[] | null;
   archetype_scores?: Record<string, number> | null;
   calibration?: { ok?: boolean; spearman?: number; builtin?: string } | null;
+  // §best-of-N: how many candidates were sampled + which one won (with its
+  // offline discrimination). null/1 for the single-shot path.
+  n_candidates?: number | null;
+  selected_candidate?: number | null;
+  candidates?: { candidate: number; ok: boolean; discrimination?: number;
+                 reasons?: string[] }[] | null;
   source?: string | null;
   recorded_at?: string | null;
 }

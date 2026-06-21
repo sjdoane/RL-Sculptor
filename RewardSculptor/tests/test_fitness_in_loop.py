@@ -240,3 +240,70 @@ def test_diagnose_objective_progress_renders_components_and_revert():
     assert "component breakdown" in text
     assert "kick_events" in text and "uprightness" in text
     assert "REGRESSED fitness" in text and "DIFFERENT direction" in text
+
+
+# ── §LAW 11: Goodhart-onset detector ─────────────────────────────────
+
+
+def test_detect_goodhart_onset_fires_on_sustained_unnatural_climb():
+    """The gaming signature: the metric keeps climbing while the policy SUSTAINS
+    a loss of naturalness (>=2 of the recent window non-pass, AND a decline vs
+    earlier). Naturalness uses the REAL discrete channel values — §kick-fix added
+    the 'mild' tier so the set is now {1.0, 0.75, 0.5, 0.0} (steer factors)."""
+    reason = S.detect_goodhart_onset(
+        [0.20, 0.30, 0.40, 0.50], [1.0, 1.0, 0.5, 0.5])
+    assert reason is not None and "goodhart" in reason.lower()
+
+
+def test_detect_goodhart_onset_fires_on_sustained_mild():
+    """§kick-fix: now that 'mild' down-weights (steer_factor 0.75 < 1.0), two
+    SUSTAINED mild iters during a rising/declining window fire onset — the g1-kick-v6
+    catch (the violent kicks read mild/severe at 2-3.7× the real motor limit)."""
+    reason = S.detect_goodhart_onset(
+        [0.20, 0.30, 0.40, 0.50], [1.0, 1.0, 0.75, 0.75])
+    assert reason is not None and "goodhart" in reason.lower()
+    # ...but a persistently-mild run (always 0.75) is NOT *becoming* less natural →
+    # the decline guard still protects a legitimately-always-aggressive skill.
+    assert S.detect_goodhart_onset(
+        [0.20, 0.30, 0.40, 0.50], [0.75, 0.75, 0.75, 0.75]) is None
+    # and a single transient mild iter must not trip it (needs >=2 sustained)
+    assert S.detect_goodhart_onset(
+        [0.20, 0.30, 0.40, 0.50], [1.0, 1.0, 1.0, 0.75]) is None
+
+
+def test_detect_goodhart_onset_silent_on_single_transient_severe():
+    """THE false-positive guard: a SINGLE 'severe' iter (a legit hard kick
+    transiently >3x nominal joint speed) must NOT lock the run — LAW 7 already
+    down-weights it. Needs >=2 sustained unnatural iters."""
+    assert S.detect_goodhart_onset(
+        [0.20, 0.30, 0.40, 0.50], [1.0, 1.0, 1.0, 0.5]) is None
+    # a dip that RECOVERED is not a sustained decline either
+    assert S.detect_goodhart_onset(
+        [0.20, 0.30, 0.40, 0.50], [1.0, 0.5, 1.0, 1.0]) is None
+
+
+def test_detect_goodhart_onset_silent_on_persistently_aggressive():
+    """A run that was ALWAYS aggressive (severe from the start) is not *becoming*
+    less natural — the decline guard (c) lets a legit always-aggressive skill
+    through rather than killing it mid-improvement."""
+    assert S.detect_goodhart_onset(
+        [0.20, 0.30, 0.40, 0.50], [0.5, 0.5, 0.5, 0.5]) is None
+
+
+def test_detect_goodhart_onset_silent_on_honest_progress():
+    """Honest improvement (naturalness FLAT at 1.0 — the no-audit default) must
+    NEVER trip the onset stop."""
+    assert S.detect_goodhart_onset(
+        [0.20, 0.30, 0.40, 0.50], [1.0, 1.0, 1.0, 1.0]) is None
+
+
+def test_detect_goodhart_onset_silent_when_metric_not_rising():
+    """A REGRESSING metric is a plateau/regression (handled by patience/revert),
+    not gaming — onset requires the metric to be RISING."""
+    assert S.detect_goodhart_onset(
+        [0.50, 0.40, 0.30, 0.20], [1.0, 1.0, 0.5, 0.5]) is None
+
+
+def test_detect_goodhart_onset_needs_enough_points():
+    assert S.detect_goodhart_onset([0.2, 0.3], [1.0, 0.5]) is None
+    assert S.detect_goodhart_onset([], []) is None

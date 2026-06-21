@@ -725,7 +725,7 @@ def test_run_sculpt_job_launch_gen_sentinel_disabled_runs_blind(
 def _fake_bridge_gen(*, accept: bool):
     """A mocked sculptor_bridge.generate_objective_metric: writes metric.py,
     fires the Ship-40 stage events, returns an accept/reject rec (no LLM)."""
-    def _gen(behavior_goal, out_dir, *, robot_hint=None, review=True, on_event=None):
+    def _gen(behavior_goal, out_dir, *, robot_hint=None, review=True, n_candidates=1, on_event=None):
         if on_event:
             on_event({"stage": "generating", "attempt": 1, "max": 3,
                       "message": "Generating candidate metric (attempt 1/3)…"})
@@ -803,6 +803,110 @@ def test_run_sculpt_job_launch_gen_accepts_and_steers(
     assert cmd[cmd.index("--fitness-mode") + 1] == "observe"
 
 
+def test_run_sculpt_job_launch_gen_spec_audit_emits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """§Metric-quality laws (LAW 9): with the adversarial flag ON, a launch-
+    generated KICK metric calibrating against g1_kick ALSO runs the AUDIT-ONLY
+    adversarial probe of the hand-authored spec_g1_kick (the gate that never ran on
+    the metric that scored g1-kick-v5) and streams a metric_spec_audit event —
+    record-only, never revoking the ground-truth fence."""
+    import asyncio
+
+    from backend.services import run_manager, sculptor_bridge
+    from backend.services.job_manager import Job
+
+    monkeypatch.setattr(run_manager, "_ADVERSARIAL_ENABLED", True)
+    monkeypatch.setattr(sculptor_bridge, "generate_objective_metric",
+                        _fake_bridge_gen(accept=True))
+    monkeypatch.setattr(
+        sculptor_bridge, "calibrate_objective_metric",
+        lambda metric_path, builtin, threshold=0.7: {
+            "ok": True, "spearman": 0.95, "builtin": builtin})
+    captured_audit: dict = {}
+
+    def _fake_audit(builtin, goal, robot_hint=None, *, client=None):
+        captured_audit["args"] = (builtin, goal)
+        return {"ran": True, "gameable": False, "worst_name": "active_kick_behind",
+                "worst_gaming": 0.01, "coverage_gaps": [], "reason": None}
+
+    monkeypatch.setattr(sculptor_bridge, "audit_builtin_spec_metric", _fake_audit)
+    project_dir = tmp_path / "lg-audit"
+    project_dir.mkdir()
+    captured: dict = {}
+
+    class _Sentinel(Exception):
+        pass
+
+    async def _fake_exec(*args, **kwargs):
+        captured["cmd"] = list(args)
+        raise _Sentinel()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+    runner = run_manager.run_sculpt_job(
+        project_dir=project_dir,
+        run_params={"behavior_goal": "repeatedly kick with one leg", "iterations": 1,
+                    "fitness_metric": "generate-at-launch", "fitness_mode": "observe"},
+    )
+    job = Job(job_id="t_lgaudit", kind="sculpt_run", project_slug="lg-audit", status="running")
+    job._cancel = asyncio.Event()
+    with pytest.raises(_Sentinel):
+        asyncio.run(runner(job, job._cancel))
+
+    audits = [e for e in job.events if e.get("type") == "metric_spec_audit"]
+    assert audits, [e.get("type") for e in job.events]
+    assert audits[0]["audit_only"] is True and audits[0]["ran"] is True
+    assert audits[0]["gameable"] is False        # audit never revokes the fence
+    assert captured_audit["args"][0] == "g1_kick"
+
+
+def test_run_sculpt_job_launch_gen_spec_audit_off_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Flag OFF (the unit-test default) → no spec audit fires, no metric_spec_audit
+    event, and no bridge audit call (byte-identical to before the seam)."""
+    import asyncio
+
+    from backend.services import run_manager, sculptor_bridge
+    from backend.services.job_manager import Job
+
+    # _disable_network_adversarial autouse already forces the flag OFF.
+    monkeypatch.setattr(sculptor_bridge, "generate_objective_metric",
+                        _fake_bridge_gen(accept=True))
+    monkeypatch.setattr(
+        sculptor_bridge, "calibrate_objective_metric",
+        lambda metric_path, builtin, threshold=0.7: {
+            "ok": True, "spearman": 0.95, "builtin": builtin})
+
+    def _boom_audit(*a, **k):
+        raise AssertionError("audit must not run when the flag is off")
+
+    monkeypatch.setattr(sculptor_bridge, "audit_builtin_spec_metric", _boom_audit)
+    project_dir = tmp_path / "lg-audit-off"
+    project_dir.mkdir()
+    captured: dict = {}
+
+    class _Sentinel(Exception):
+        pass
+
+    async def _fake_exec(*args, **kwargs):
+        captured["cmd"] = list(args)
+        raise _Sentinel()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+    runner = run_manager.run_sculpt_job(
+        project_dir=project_dir,
+        run_params={"behavior_goal": "repeatedly kick with one leg", "iterations": 1,
+                    "fitness_metric": "generate-at-launch", "fitness_mode": "observe"},
+    )
+    job = Job(job_id="t_lgaudit_off", kind="sculpt_run", project_slug="lg-audit-off",
+              status="running")
+    job._cancel = asyncio.Event()
+    with pytest.raises(_Sentinel):
+        asyncio.run(runner(job, job._cancel))
+    assert not [e for e in job.events if e.get("type") == "metric_spec_audit"]
+
+
 async def _decision_blind(control_path, cancel, *, timeout_s=1800.0):
     return "blind"
 
@@ -816,7 +920,7 @@ def _fake_bridge_gen_seq(*accepts):
     attempt), writing metric.py each time."""
     state = {"i": 0}
 
-    def _gen(behavior_goal, out_dir, *, robot_hint=None, review=True, on_event=None):
+    def _gen(behavior_goal, out_dir, *, robot_hint=None, review=True, n_candidates=1, on_event=None):
         accept = accepts[min(state["i"], len(accepts) - 1)]
         state["i"] += 1
         if on_event:
@@ -939,7 +1043,7 @@ def test_launch_gen_clears_progress_sidecar_on_cancel(
     from backend.services import metric_store, run_manager, sculptor_bridge
     from backend.services.job_manager import Job
 
-    def _gen_then_cancel(behavior_goal, out_dir, *, robot_hint=None, review=True, on_event=None):
+    def _gen_then_cancel(behavior_goal, out_dir, *, robot_hint=None, review=True, n_candidates=1, on_event=None):
         if on_event:  # write an active-progress sidecar, then get cancelled
             on_event({"stage": "generating", "attempt": 1, "max": 4, "message": "working"})
         raise asyncio.CancelledError()

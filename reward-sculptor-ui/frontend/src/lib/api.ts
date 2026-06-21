@@ -818,7 +818,8 @@ export async function getMetricGenProgress(slug: string): Promise<MetricGenProgr
 
 export async function generateProjectMetric(
   slug: string,
-  body: { behavior_goal: string; review?: boolean; calibrate_against?: string | null },
+  body: { behavior_goal: string; review?: boolean; n_candidates?: number;
+          calibrate_against?: string | null },
 ): Promise<MetricSummary> {
   return handle<MetricSummary>(
     await fetch(`/api/projects/${slug}/metrics/generate`, {

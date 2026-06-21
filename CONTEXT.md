@@ -339,6 +339,373 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-21 — best-of-N wired into the UI (New Run dialog) — both metric-gen surfaces
+
+- **What**: best-of-N was library-only (`n_candidates`); Sam: "everything should always be wired into the UI. That is
+  where I will test." Wired it end-to-end through BOTH metric-generation surfaces. Backend: `GenerateMetricRequest`
+  +`n_candidates` (1..8) → `routes/metrics.py` → `metric_store.generate(n_candidates=…)` → `sculptor_bridge` → the lib;
+  `LaunchRunRequest` +`metric_n_candidates` (1..8) → `run_params` (model_dump) → `run_manager` reads it → threads to
+  `_generate_at_launch(n_candidates=…)` → same `metric_store.generate`. `_summary` now surfaces `n_candidates`/
+  `selected_candidate`/`candidates` (with per-candidate `discrimination`). Frontend (`NewRunDialog.tsx`): a "Best-of-N
+  candidates" `<select>` (1 candidate (fast) / best-of-2/3/4) next to the Generate button, applied to the explicit
+  Generate action (`n_candidates`) AND the generate-at-launch path (`metric_n_candidates`); the success toast names the
+  picked candidate ("picked candidate 2/3"). Types in `types.ts`/`api.ts`/`useMetrics.ts`.
+- **Why**: an opt-in library knob the user can't reach from the UI is, for his workflow, untestable — the UI is the test
+  surface (see memory `no-terminal-after-run-sh`).
+- **How**: every layer defaults to 1 → byte-identical to before; the bound (≤8) is enforced server-side (a typo can't
+  fan out unbounded ~1-2 min LLM calls — `422` test). The 5 existing generate mocks gained `n_candidates=1`.
+- **Verified**: UI backend `354 → 355 passed` (+1 route test: `n_candidates` forwarded, `422` on out-of-range, fields
+  surfaced); frontend `tsc -b` clean + `pnpm build` clean (2750 modules); the live Vite dev server transforms
+  `NewRunDialog.tsx` (HTTP 200) with the new control + both wirings present (HMR-live). Browser click-through was
+  blocked only by the preview server being unable to bind 5173 (held by the WSL relay for the running Vite), not a code
+  issue. uvicorn restarted (no active run); `/health` 200 + OpenAPI shows `n_candidates`.
+
+### 2026-06-21 — best-of-N metric generation: sample N candidates, select the most-discriminating (offline)
+
+- **What** (`sculptor/eval/metric_gen.py` + `metric_validate.py`): `generate_objective_metric` gained opt-in
+  `n_candidates: int = 1`. When >1, `_best_of_n` samples N candidates (varied temperature/framing via `_BON_TEMPS`/
+  `_BON_FRAMINGS`), validates each, and selects the VALID one with the highest OFFLINE discrimination; ties keep the
+  first valid; all-invalid rejects (run stays blind). The selected candidate goes through the SAME review. New
+  deterministic discriminator in metric_validate: `graded_discrimination(fn, meta)` extends `_selectivity_probe` into a
+  GRADED competence ladder (degenerate → partial → good → ideal) along the two goal-agnostic axes the probe covers
+  (upright fold + non-upright posture), `score = max axis of (separation_from_degenerate + monotonicity)`;
+  `discrimination_of_metric(path, roles)` is the load+score entry point. New record keys `n_candidates`/`candidates`/
+  `selected_candidate`; the `review` key shape is unchanged (UI contract).
+- **Why**: single-shot-with-retry takes the first metric that merely VALIDATES; sampling N and selecting the sharpest,
+  most-monotone grader raises quality. The selector must be OFFLINE + DETERMINISTIC (only the N author samples cost LLM)
+  so it adds no nondeterminism to acceptance.
+- **How**: `n_candidates=1` is BYTE-IDENTICAL — the retry-with-feedback loop is line-for-line unchanged (re-indented into
+  an `else`), `_sample_source` default `temperature=1.0` matches the prior hardcoded value, the new record keys are
+  additive. The discriminator is pure-numpy (no RNG/time/LLM). Verified: a COARSE binary candidate (disc 1.0) sampled
+  FIRST loses to a smoothly-grading toe-touch (disc 1.83) sampled second → the SECOND is selected (ranks by
+  discrimination, not first-valid); `n=1` makes exactly one author call; all-invalid → not accepted. Adversarial-review
+  workflow (3 lenses + reconcile, Opus/high) PROVED byte-identical(n=1) + never-raise, and CONFIRMED one major defect:
+  `separation` was in raw UNBOUNDED spec_score units, so a high-amplitude coarse metric could swamp the monotonicity
+  term and mis-rank. FIXED: clamp rung scores to the spec_score [0,1] contract → `separation` ∈ [−1,1], co-scale with
+  `monotonicity` (a binary 5.0-amplitude metric saturates to [1,1,1], mono 0, and loses to a smooth grader);
+  regression-locked. Refuted: the unguarded `write_text` (pre-existing parity with the single path) and the
+  probe-blind-mixed-case (the documented goal-agnostic tie-break limitation → falls back to first-valid, never mis-selects).
+- **Verified**: sculptor `814 → 815 passed, 1 skipped` (+6: most-discriminating selection, ties→first-valid, n=1
+  byte-identical, all-invalid, graded-discriminator ranking/determinism, amplitude-invariance); UI backend `354 passed`.
+
+### 2026-06-21 — STEERING for fold/squat/toe-touch: a `render_rung` "fold-and-return" primitive
+
+- **What** (`sculptor/eval/ladder_synth.py`): the known follow-on from the novel-task L0 fix (entry below). A correct
+  toe-touch/squat metric was ACCEPTED + OBSERVED but could never STEER, because `render_rung`/`render_ladder` could not
+  render the pelvis DIP-AND-RETURN it ranks on (`base_height_m` is a monotone `_ramp`; a hop is up-then-down, the
+  inverse). Added: module const `_FOLD_ARC = (1−cos(2π·arange(T)/T))/2` (a 0→1→0 arc); MotionSpec field
+  `fold_depth_m: float = 0.0` (clamped [0,0.6]); Group `mode="fold"`. render_rung dips the pelvis
+  `root z −= fold_depth·_FOLD_ARC` (clamped ≥0) and a `fold` group flexes its joints `jp += off + amp·_FOLD_ARC` IN
+  PHASE. Byte-for-byte the dip-and-return that `metric_validate._selectivity_probe` (C1) scores, so calibration and the
+  L0 probe agree. Prompt `gen_competence_ladder.md` teaches the blind author to set `fold_depth_m` for true down-AND-up
+  goals (toe-touch/squat/deep bow/floor-touch), to scope fold groups to the goal's joint set, and to make the LOW rungs
+  DISCRIMINATING (a deep dip with NO flex, not just a smaller fold).
+- **Why**: full steering for fold/squat/sit-to-stand needs the renderer to express the inverse-of-a-hop the metric reads;
+  without it `calibrate_task_derived` can't rank a fold ladder, so a correct fold metric stays observe-only forever.
+- **How**: surgical, mirroring the hop/oscillate/burst patterns. DEFAULT BYTE-IDENTICAL — `fold_depth_m` default 0.0 (the
+  `if fd>0` guard skips) and `mode="fold"` is a new branch, so every existing rung (5 families + kick hacks + the
+  degenerate anchor) renders unchanged (full suite confirms). Verified END-TO-END against the REAL on-disk toe-touch
+  metric (`g1-toe-touching/metrics/gen_001`): a rendered fold ladder scores `[0, 0.167, 0.417, 0.75, 0.985]` — monotone,
+  rho_min 1.0, separation 0.985 ≥ 0.2 → `calibrate_task_derived` GRANTS. Adversarial-review workflow (3 lenses +
+  reconcile, Opus/high) confirmed the render math == C1 and never-raise/byte-identical hold; acted on its CONFIRMED
+  defects: (a) the keystone ladder wasn't DISCRIMINATING (a pelvis-depth-only proxy would also be granted) → added a
+  `discriminating_fold_ladder` (deep-dip-NO-flex gaming low rung) + a test proving the real `gate·min(channels)` metric
+  GRANTS while a depth-only proxy is DENIED; (b) removed the over-promised one-way `sit-to-stand` from fold examples (the
+  arc is forced-symmetric; sit-to-stand is a `base_height_m` ramp); (c) clamp pelvis z ≥0 (a deep fold from a low base
+  can't go below the floor); (d) bow=hips/waist joint-set note.
+- **Verified**: sculptor `802 → 814 passed, 1 skipped` (+12: render dip/flex, byte-identical guard, monotone grant,
+  discrimination-vs-proxy, floor clamp, single-arc invariance, …); UI backend `354 passed` (imports unchanged).
+
+### 2026-06-21 — novel-task objective metric no longer false-rejected ("run continues blind"): L0 non-degeneracy gets a goal-agnostic selectivity probe
+
+- **What** (`sculptor/eval/metric_validate.py`): a CORRECT auto-generated metric for a NOVEL task (Sam ran "touch your
+  toes then stand back up" → `g1-toe-touching/metrics/gen_001`) was rejected with "near-constant metric (spread 0.000) —
+  no signal", so the run continued BLIND. Root-caused (empirically): the metric is fine (a clean
+  `completion_gate·min(channels)`: pelvis dip-and-return + hip/knee ROM + upright-at-ends + no-travel veto), but the L0
+  non-degeneracy gate only has goal-appropriate POSITIVE archetypes for 5 hard-coded families (kick/floss/jump/
+  locomotion/cartpole). For `family=None` NONE of `_archetypes()` performs the goal (nothing dips the pelvis), so the
+  metric scores ALL 12 archetypes 0.000 → false-reject. The gate was conflating "is the metric SELECTIVE" (L0's job)
+  with "does it match the GOAL" (calibration's job). FIX: when `family is None` AND every archetype is ~0
+  (`_BATTERY_NEAR_ZERO`), defer to a new `_selectivity_probe(fn, meta)` — a deterministic, OFFLINE, hand-rolled
+  competent-vs-degenerate probe SET (upright dip-and-return + ROM, a non-upright posture arc; vs still + fallen). PASS
+  vacuously (`nondegeneracy_vacuous=True`) iff the metric separates a competent probe from the degenerates by
+  `spread_min`; else reject. Hand-rolled because `render_rung`'s `base_height_m` is a monotone `_ramp` and CANNOT express
+  a dip-and-return.
+- **Why**: the gate's fixed battery can't represent an arbitrary novel goal; adding more hard-coded families doesn't
+  generalize. L0 should only enforce non-degeneracy; task-VALIDITY (goal-match) is the task-derived calibration
+  firewall's job (`run_manager.steer_allowed` reads `meta.calibrated`, set only by `grant_decision` — an accepted-but-
+  uncalibrated metric only OBSERVES, never steers). So the safe fix is to stop L0 over-reaching and let the metric reach
+  calibration.
+- **How**: designed via a multi-agent workflow (map → 5 diverse methods → reconcile). Chosen method = "L0 self-scoping
+  vacuous-pass + calibration firewall" (NOT an LLM-at-validate-time, which would break the offline/deterministic
+  validate hot path + the 3× generate loop; NOT a render_rung rewrite). Improved on the plan: a probe SET (not a single
+  probe) spanning upright + non-upright postures so non-upright novel skills (roll/bow/crawl) also pass, with `still`+
+  `fallen` degenerate probes that catch uprightness-/still-/fall-rewarders. Scoped to `family is None` → all 5 families
+  byte-identical (their positive archetype lights up → battery never "uninformative").
+- **Verified**: real `gen_001` toe-touch metric now PASSES (`ok=True`, `nondegeneracy_vacuous=True`, probe competent
+  0.833 vs degenerate 0.000). Hole stays closed: all-zero → rejected (probe non-selective); still/uprightness/fall
+  rewarders → rejected (they light up the fixed battery, never reach the vacuous branch). Family path byte-identical
+  (kick metric → `nondegeneracy_vacuous=False`). Firewall confirmed: no run_manager change — a vacuous-pass metric stays
+  observe-only until calibrated. Sculptor **802 passed / 1 skipped** (+4 tests), UI backend **354 passed**.
+- **KNOWN FOLLOW-ON (for STEERING, not blocking observe)**: a dip-and-return novel task (toe-touch/squat) is now
+  accepted + OBSERVED, but to earn STEER-rights it must rank a task-derived competence ladder — and `render_ladder`/
+  `render_rung` ALSO can't render a pelvis dip-and-return, so calibration would find no separation → observe-only. Full
+  steering for fold/squat/sit-to-stand tasks needs a `render_rung` "fold/return" primitive (`MotionSpec` field +
+  renderer + the ladder-author prompt) — a separate increment with broader blast radius (calibration for all tasks).
+
+### 2026-06-20 — reports: per-motor actuator-limits charts (finished + live) + adversarial review of the whole uncommitted diff (3 defects fixed)
+
+- **What** — (C) finished the reports feature, then reviewed the entire uncommitted tree:
+  - **Reports (body C, complete)**: `sculptor/adapters/realism.py::actuator_limits_report(trajectory, limits)` returns
+    per-motor SPEED (vs the real `velocity_limit`, always) + TORQUE (vs `effort_limit`, when `joint_torque` present),
+    all JOINT-aligned (speed←`joint_vel`, torque←`joint_torque`=`qfrc_actuator`, limits←name-keyed maps); `_mjlab_runner`
+    persists `joint_torque` (qfrc_actuator, sliced by the SAME `joint_v_adr` as `joint_vel` → aligned). Backend
+    `GET /projects/{slug}/reports/actuator-limits?iter=N` (`backend/routes/reports.py`) + `sculptor_bridge` passthrough;
+    frontend `ActuatorLimitsCard.tsx` (recharts horizontal util-% bars, 100% ReferenceLine, color-by-util, iter `<select>`)
+    wired into `ReportsTab.tsx`.
+  - **Review fixes (3 confirmed by a 6-lens adversarial workflow → verify → reconcile; 12 raw → 3 real)**:
+    1. `metric_gen.py::_review_metric` (the PRODUCTION single-reviewer path — sculptor_bridge/CLI never pass
+       `review_models`) discarded `gaming_exploit`, so the "named-exploit-but-approved can never slip through" invariant
+       only held on the unused panel path. Added the same coercion `_review_one` has.
+    2. `realism.py::naturalness_channel` hard-rejected on the joint-AVERAGED `joint_limit_violation_frac` → a single-joint
+       limit exploit on a 29-DOF G1 dilutes to ~frac/J < the 1% gate. `audit_rollout` now also emits
+       `joint_limit_violation_max` (per-joint worst); the channel thresholds THAT (mean-key fallback keeps older audit
+       dicts / direct test injection no-op + never-raise).
+    3. `ActuatorLimitsCard.tsx` flashed blank on iter-switch (new query key, no `placeholderData`) → added
+       `placeholderData: (prev) => prev` so the card + `<select>` stay mounted while the new iter loads.
+- **Why**: the prior window left the reports feature in-progress and a large uncommitted diff (kick metric, actuator
+  enforcement, full metric-quality-laws build) unreviewed. Both review MEDIUMs are real semantic gaps where the code's own
+  docstring promised an invariant the live path didn't enforce — exactly the high-cost failure modes (a wrongly-approved
+  metric / a limit-exploiting iter winning "best") the build exists to prevent; the correct guard already existed one
+  function over (1) or as an unused audit field (2).
+- **How**: REVIEW-FIRST verification of every load-bearing fact against installed source — actuator vel/effort maps match
+  mjlab `g1_constants`/`go1_constants` EXACTLY; `DcMotorActuatorCfg` swap fields valid + `EntityArticulationInfoCfg`
+  non-frozen (swap genuinely applies); `qfrc_actuator` is a real EntityData prop sliced by `joint_v_adr` (report torque
+  alignment holds); `mjcf_limits.json` carries 29 joint_names; all card CSS vars + the `trending-up` icon exist. The Go1
+  velocity-map asymmetry and the `best_fitness`-shows-steer-value findings were adversarially REFUTED as intended/tested
+  design, not fixed (no scope creep). Surgical fixes mirror existing patterns; both MEDIUMs got a new regression test
+  pinning the previously-untested path (high-DOF single-joint exploit; single-reviewer named-exploit reject).
+- **Verified**: sculptor suite **798 passed / 1 skipped** (+2 new tests), UI backend **354 passed**, frontend
+  `tsc -b --noEmit` clean. Backend restarted (no active sculpt run) → `/health` 200 and
+  `/projects/g1-kick-v7/reports/actuator-limits` 200 returning `ok:true, has_torque:false, iter:11, 29 motors`,
+  per-joint limits name-resolved, **worst speed util = knee 0.57 (11.5/20 rad/s)** — every motor within its real
+  no-load speed, the chart's whole point (the DcMotor enforcement working: knee 11.5 ≪ the pre-fix 43–73). Unknown
+  project → 404.
+
+### 2026-06-20 — actuator-limit enforcement: research-standard torque-speed (no-load-speed) model for every robot (flag-gated, default ON)
+
+- **What** (`sculptor/adapters/_mjlab_runner.py` + `.env.example`): the root fix for the unphysical
+  kicks. mjlab's robot configs use `BuiltinPositionActuatorCfg`, which structurally DROPS each motor's
+  `velocity_limit` (no-load speed), so the sim clamped torque but never velocity → a policy drove joints
+  2–3.7× past the real limit. mjlab already ships the research-standard fix — `DcMotorActuator` (a port of
+  Isaac Lab's DCMotor torque-speed model, Rudin et al. 2022 / legged_gym): available torque falls linearly
+  to ~0 at the no-load speed (motor back-EMF). New guarded `_enforce_actuator_limits(env_cfg)` swaps every
+  `BuiltinPositionActuatorCfg` → `DcMotorActuatorCfg`, re-supplying `velocity_limit` recovered from the
+  joint patterns (`_ACTUATOR_VELOCITY_LIMITS`, cited from mjlab's g1_constants/go1_constants — knee 20,
+  hip_pitch 32, arms 37, Go1 calf 20.06, …) + `saturation_effort = effort_limit` (conservative triangular
+  envelope). Called in BOTH train and rollout (same env_cfg) so the policy trains under — and is evaluated
+  under — the constrained physics. Modeled on the `_apply_ground_texture` precedent (fully defensive: any
+  unrecoverable group is left unchanged + warned; never breaks a run).
+- **Why**: Sam's request — enforce the limits correctly for every actuator on every robot, the most
+  research-acceptable way (his SEA-actuator domain). The naturalness gate (prior entry) only DISCOURAGES
+  exceeding the limit after the fact; this prevents it at the source.
+- **How**: researched + designed via a 3-lens + reconcile workflow (literature → confirmed the DCMotor
+  torque-speed model is the field standard, rejecting hard qvel clamp + actuator nets; mjlab API → it
+  already ships DcMotorActuator, so it's CONFIGURE-ONLY, no per-step clamp; integration → the
+  ground-texture seam). Gated by `RS_ENFORCE_ACTUATOR_LIMITS` — **default ON (Sam's call 2026-06-20)**;
+  set to 0 to recover the old velocity-unconstrained physics.
+- **Verified**: (1) offline swap correct — all G1 + Go1 groups → DcMotor with the right velocity_limit,
+  flag-OFF a clean no-op. (2) **GPU cap holds**: under a hard scripted action the G1 knee \|vel\| p99 drops
+  **45.4 → 23.6 rad/s** (real limit 20; the small overshoot is correct momentum coast), env builds+steps
+  with DcMotor, no NaN. (3) **Go1 regression**: trains sanely with enforcement on (2/2 groups swapped,
+  velocity-tracking error 0.02–0.11, checkpoint written). Sculptor suite **794 passed / 1 skipped** (+1
+  offline swap test).
+- **RISKS**: physics is now strictly harder (lower early return, slower convergence — expected); a policy
+  trained under the OLD physics must be **re-trained, not warm-started**. A fresh g1-kick run will now
+  produce realistic ~20 rad/s kicks instead of 43–73.
+
+### 2026-06-20 — kick metric fixes A+B (from the live g1-kick-v6 run): naturalness per-joint velocity + forward-foot excursion gate
+
+- **What** (Sam ran g1-kick-v6 live; two real findings — the video was already 1× real-time, the kick was
+  genuinely too fast because the sim discards the motor velocity_limit):
+  - **Fix A** (`sculptor/adapters/realism.py`): new `joint_velocity_limit(name)` carries the REAL G1 motor
+    no-load speeds from mjlab g1_constants (knee/hip_roll 20, hip_pitch/yaw/waist_yaw 32, arms 37, wrist
+    22 rad/s), keyed by COMPOUND tokens so non-G1 joints (Go1 `FL_hip`) fall to the nominal 30 → byte-
+    identical fence. `audit_rollout` computes `joint_vel_limit_max_ratio` (worst velp99 ÷ real limit, over
+    joints with a known limit) and `_verdict` OR's it in (severe ≥1.5×, mild ≥1.0× — never replacing the
+    torque/nominal terms; default 0.0 → byte-identical). `naturalness_channel`: **mild now down-weights
+    steer ×0.75** (`_NAT_MILD_STEER_FACTOR`, was 1.0). `sculpt.detect_goodhart_onset` reason reworded
+    (mild now counts as "less natural").
+  - **Fix B** (`sculptor/eval/spec_metrics.py`): the kick completion gate now requires a GENUINE forward-
+    foot excursion — new `_swing_foot_forward_excursion` (shared raw foot-peak kernel `_foot_anterior_peaks`
+    refactored out of `_forward_kick_direction`) × a sharp gate (center 0.20 m). Degrades to 1.0 (no veto)
+    when both foot channels absent → the footless calibration ladder + leg-only callers BYTE-IDENTICAL.
+    `metric_calibration._kick_foot_swing` raised 0.30→0.40 m so `competent_ref` stays 0.78 (≥0.75 gate).
+- **Why**: live run showed standing-with-mild-leg-motion scored 0.22–0.27 (loop kept reverting to it) and
+  the "best" kicks hit knee velp99 43–73 rad/s = 2–3.7× the real 20 rad/s no-load speed (the audit's
+  generic 30 nominal only flagged the single worst iter). Root cause: mjlab declares per-actuator
+  velocity_limit but never passes it to the sim actuator (a separate physics task — see below).
+- **How**: design REVIEWED (GO_WITH_CHANGES → full punch-list acted on): compound tokens (Go1 byte-identical),
+  per-joint term OR'd (not replacing), competent-ref re-amplified, shared foot-peak helper, onset reason +
+  tests. Verified on the v6 data: standing 0.22–0.27 → **0.05–0.07** (separation 1.4×→7.4×); all four
+  violent kicks (6/8/9/10) now **severe** (ratio 2.5–3.7×) → steer ×0.5; standing iters stay `ok`;
+  competent_ref 0.776.
+- **Verified**: sculptor suite **793 passed / 1 skipped** (+4 tests: mild ×0.75, G1 velocity map + Go1
+  fallback, verdict byte-identical, onset-on-mild); UI backend **351 passed**.
+- **NOTE — deeper physics fix (separate, pending Sam's go-ahead):** the sim never enforces velocity_limit
+  (it's metadata dropped before the actuator); Fix A only DISCOURAGES exceeding it after the fact. The
+  root fix = swap mjlab `BuiltinPositionActuatorCfg`→`DcMotorActuatorCfg` (the torque-speed/no-load-speed
+  model mjlab already ships) for every robot. Researched + designed; changes training dynamics, so flagged
+  for approval before implementing.
+
+### 2026-06-19 — #11 (partial): local-GPU smoke confirms the foot-data plumbing path LIVE
+
+- **What**: ran a short G1 train + rollout on the RTX 5070 (WSL2, no RunPod, no API) —
+  `python -m sculptor.adapters._mjlab_runner train --task-id Mjlab-Velocity-Flat-Unitree-G1
+  --num-envs 512 --max-iterations 5 ...` then `... rollout --checkpoint-path .../checkpoint.pt
+  --n-episodes 4 --max-episode-steps 150 ...` (WANDB_MODE=disabled). Inspected the resulting
+  `trajectory.npz` + scored `spec_g1_kick` on it.
+- **Verified LIVE (the GPU-only paths #5 introduced)**:
+  - `left_foot_pos_b`/`right_foot_pos_b` (T,E,3) + `left/right_foot_contact` (T,E) PRESENT, finite,
+    non-zero in `trajectory.npz` from a real GPU rollout — the build-log "live npz population pending
+    GPU smoke" item is now CONFIRMED.
+  - pelvis-frame transform sane: foot anterior-x varies over the gait; foot z-mean −0.73 (below
+    pelvis); `joint_names` n=29 aligned with the buffer width.
+  - `spec_g1_kick` runs live on real 29-DOF GPU arrays with the DIRECTION channel active (foot data
+    present, not abstained) and scores a non-kicking velocity walker **0.0201** — the completion gate
+    (no sagittal-leg launch burst) floors it ~0.06 despite moderate quality channels (intensity 0.34 /
+    amplitude 0.65 / direction 0.63). Live proof that LAW 1's completion gate owns the floor.
+- **NOT done (needs Sam — no API key in this WSL env + no on-disk g1-kick project, only `hopper`)**:
+  the headline kick discrimination on a TRAINED policy (a real forward kick scores high; live
+  one-leg-balance / kick-behind below floor) + the live **#7 steer-gate** and **#10 Goodhart-onset**
+  firing across loop iterations. These need the LLM loop (diagnose/edit) + the g1-kick project + GPU
+  spend. Runbook handed to Sam; the offline test suite already pins the metric's discrimination of those
+  hacks (the deterministic kick archetypes), so this is end-to-end loop confirmation, not new logic.
+
+### 2026-06-19 — Ship 55 (#9): VLM metric-review Panel A — diversified, blinded multi-model review panel
+
+- **What** (`sculptor/eval/metric_gen.py`, library-only):
+  - `MetricReview` += `gaming_exploit: str = ""` (a constructive exploit a reviewer names; non-empty
+    forces a reject — no "named exploit but approved" contradiction). Backward-compatible default.
+  - `REVIEW_PANEL_MODELS = (opus-4-8, sonnet-4-6, haiku-4-5)` — the repo's FIRST multi-model surface;
+    MODEL-ID diversity as the single-vendor "cross-family" substitute. `_LENSES` = 5 focus appendices
+    (completeness / measurability / over_restriction / consistency / naturalness) layered on the
+    `review_objective_metric` rubric; naturalness is the VLM lens.
+  - `_reviewers_from_models(models, author)` round-robins the lenses over the pool MINUS the exact
+    author id (blinding, Panickssery self-preference). `_review_one(...)` = one reviewer: VLM lens with
+    keyframes builds image content via `diagnose._encode_image`, no keyframes → SKIP; a crash → `error`
+    (no-evidence, never a veto); cache_control on the rubric system prefix.
+  - `_review_metric_panel(...)`: aggregate = `(n_eligible>=1) and (n_approve>=ceil(n_eligible/2)) and
+    not vetoed`, where any returned reject vetoes and CRASHES count AGAINST quorum (don't shrink the
+    denominator) — so a lone survivor can't carry the panel and an all-fail panel is fail-closed. The
+    no-keyframe VLM skip is excluded from `n_eligible`. Returns `review` (EXACTLY {approved,concerns,
+    summary} — the UI contract) + sibling provenance (`panel`, `veto_by`, `quorum`, ...). Veto / quorum
+    miss is prepended to `review.concerns` with the (model, lens) named (never-silent).
+  - `generate_objective_metric(..., review_models=None, review_keyframes=None)`: None → the unchanged
+    single-reviewer path (BYTE-IDENTICAL); a list → the panel. New `review_panel` record key (provenance);
+    `review` key unchanged.
+- **Why**: LAW 9 / Panel A — a single LLM reviewer self-prefers and misses gaming vectors; a disjoint,
+  diversified jury with a constructive-exploit veto is the gate between "passes offline axioms" and
+  "trusted." Sam approved the API cost.
+- **How**: design REVIEWED (GO_WITH_CHANGES → acted on the full punch-list): fixed an unsound quorum
+  (thin-survivor false-accept), pinned `review` to exactly {approved,concerns,summary} (provenance in
+  `review_panel`), made the VLM lens text-only-skip at gen-time (keeps the image path for a future
+  POST-rollout re-review), excluded the exact author id. **Shipped LIBRARY-ONLY** — the UI flag wiring
+  is deferred (the VLM lens cannot fire pre-rollout, so a launch-gen text panel buys little; it lands
+  with the post-rollout re-review caller).
+- **Verified**: sculptor suite **789 passed / 1 skipped** (+10 in `tests/test_generated_metric.py`: an
+  extended `_PanelClient` mock routes (model,lens)→verdict + detects image blocks; tests pin
+  byte-identical dispatch, exact `review` keys, one-lens veto, named-exploit reject, all-crash & thin-
+  survivor → not approved, VLM skip vs image-use, blinding). UI suite untouched.
+
+### 2026-06-19 — Ship 54 (#4): adversarial archetype scope — default ON + spec_* surface + kick hack rungs + per-channel coverage
+
+- **What**:
+  - `sculptor/eval/metric_calibration.py` — (1) `adversarial_archetype_gate` gains
+    `required_losers` + `scored_channels`: deterministic gaming probes are scored in their OWN
+    guarded loop that runs REGARDLESS of the LLM-author outcome (author fail/echo/leak no longer
+    early-returns past loser scoring), with `inject_joint_roles` applied per loser; per-channel
+    `coverage`/`coverage_gaps` recorded (a gap is a FLAG, never a deny). With both args unset the
+    function is BYTE-IDENTICAL to Ship 53. (2) new `kick_required_losers(joint_names, goal,
+    robot_hint)` — the documented g1-kick-v5 hacks (partial / whip-and-fall / active_kick_behind /
+    one_leg_balance) rendered WITH `left/right_foot_pos_b` (the direction channel `render_rung`
+    can't render), name-parameterized via `LEG_SAGITTAL_*` + a left filter, frame-scoped
+    CONSERVATIVELY (the rear-direction + one-leg losers DROP on an ambiguous frame — mule/spin/
+    roundhouse/"balancing on one leg" — LAW 0). (3) new `adversarial_archetype_gate_spec(builtin,
+    goal, …)` — the surface that runs the gate on a HAND-AUTHORED `spec_*` metric (the gate never
+    ran on `spec_g1_kick`, the metric that scored v5); competent_ref pinned to a deterministic
+    forward kick (≈0.78); audit_only. (4) `calibrate_task_derived` gains opt-in
+    `adversarial_required_losers` (default OFF → byte-identical; ON injects the kick losers for a
+    novel KICK-VARIANT task only).
+  - `reward-sculptor-ui/backend/services/run_manager.py` — flipped `RS_ADVERSARIAL_ARCHETYPES`
+    DEFAULT **ON** (high-stakes only); added an AUDIT-ONLY adversarial probe of the built-in
+    `spec_*` ground truth a generated metric calibrates against → streams a `metric_spec_audit`
+    event; NEVER revokes the fence. `sculptor_bridge.py` — `has_spec_audit` + `audit_builtin_spec_metric`
+    passthroughs. Backend test conftest forces the flag OFF in unit tests (no network); two new
+    seam tests (on/off).
+- **Why**: LAW 9 — `spec_g1_kick` was hand-authored, never adversarially tested; the L3 gate was
+  flag-OFF AND generated-only, so it never ran on the metric that reward-hacked v5. Close that.
+- **How**: REVISED by a 4-lens adversarial-review workflow (verdict REVISE → acted on the full
+  punch-list): kept kick-losers SPEC-ONLY + opt-in (auto-injecting into the generated path broke 3
+  tests, not 1); restructured the gate so losers score independent of the author; conservative
+  high-confidence frame gating; corrected competent_ref 0.88→measured 0.78 (pinned in CI); added an
+  OLD-form direction-blind fixture to regression-lock the teeth. Data-availability gap (live foot_pos_b)
+  is closed by #5's adapter plumbing, not the gate; sideways kicks are covered by the metric
+  (anterior-x direction), not a loser.
+- **Verified**: sculptor suite **779 passed / 1 skipped** (was 768; +11 new in
+  `tests/test_task_derived_calibration.py`); UI backend suite **351 passed** (added 2 audit-seam
+  tests; the autouse no-network fixture cut the run 389s→2.5s for the touched files). Numbers
+  empirically pinned: competent fwd kick 0.7816, all losers ~0 < ceiling 0.469; OLD-form rear ==
+  competent 0.798 → flagged; GOOD_KICK rear 0.632 with role injection (0.0 without).
+
+### 2026-06-19 — Ship 54-pre (#12): deterministic shaping↔metric PARTITION GATE at the reward-edit commit point
+
+- **What**: new `RewardSculptor/sculptor/eval/partition_gate.py` (pure, offline, no LLM/IO) +
+  wiring into `edit.py`, `spec_metrics.py`, `generated_metric.py`, `sculpt.py`. The gate fires
+  ONLY when an objective metric steers a run. Three pieces:
+  (1) `screen_edits()` — NON-BLOCKING pre-LLM flags: a proposed edit that touches a held-out
+  metric observable (alias map `qvel→joint_vel`, `left_foot_swing_speed→joint_vel`,
+  `base_height→root_link_pos_w`, `fallen→projected_gravity_b`, per-foot `*_pos_b`/`*_contact`
+  identity, etc.) OR lowers/removes a completion-gate hparam. Flags are injected into a
+  self-contained `# METRIC_PARTITION` editor-prompt block + the CHANGELOG + a `partition_gate`
+  event; the edit STAYS applicable. (2) `gate_threshold_regressions()` — the ONE HARD gate, in
+  `_post_validate` inside the validation try (after schema/grounding checks, before the atomic
+  rename): a same-named, positive-valued, numerically-LOWERED completion-gate hparam (REJECT
+  lexicon = gate/completion/qualif/require…) raises `EditValidationError` → existing retry-once
+  → the iter drops the edit. REMOVED/rename/ambiguous-FLAG-lexicon (floor/min/threshold/cycle)/
+  sign-ambiguous lowerings are ADVISORY (stderr only, never raise). (3) `metric_observables(spec)`
+  in spec_metrics + `_generated_metric_observables()` in generated_metric attach
+  `fitness_fn.metric_observables`; `sculpt._run_one_iter` passes it to `apply_edits`
+  (`metric_observables=getattr(fitness_fn, "metric_observables", None)`). New
+  `tests/test_partition_gate.py` (36).
+- **Why**: the REAL g1-kick-v5 root cause was EDITOR whack-a-mole — over 21 iters it lowered a
+  completion/qualification gate (kick_cycle_weight 1.0→0.3 + gate-threshold lowering) and added
+  farm-able reward terms that rewarded the metric's own signal, so the metric climbed while the
+  behavior degraded. The prior ships (#1/#2 spec rebuild, #10 Goodhart-onset) hardened the
+  METRIC; nothing guarded the REWARD-EDIT step where v5 actually broke. This is the load-bearing,
+  LLM-free, offline slice of the deferred "Panel B" — an LLM reward-edit review can layer on later.
+- **How**: design was put through a 4-lens adversarial review (false-positive / wiring / completeness
+  -vs-v5 / efficacy) + reconcile, which RE-SCOPED the first cut: (a) NOTHING pre-LLM rejects an edit
+  — a pre-LLM drop re-introduces the 2026-04-23 loop-freeze and is bypassable by the free-form
+  rewriter; the single hard gate is post-LLM. (b) REJECT lexicon restricted to UNAMBIGUOUS
+  completion-gate roots; direction-ambiguous roots (floor/min/threshold/cycle — `kick_cycle_weight`
+  itself) are FLAG-only, never hard-failed (avoids false-positives on `gait_cycle_freq`,
+  `contact_threshold`, `min_torque`). (c) rename≠removal and non-positive/parse-fail values are
+  advisory, never raise (freeze guard). Token-matched on the snake_case split (not substring) so
+  `terminated` never hits the lexicon. The implementation was then put through a 2-lens impl review
+  (wiring/blockers + false-positive/byte-identical) + reconcile → GO, no defects. DEFAULT
+  BYTE-IDENTICAL: `metric_observables` is None/empty (gym_sb3, blind runs, `apply_prompt_edit`,
+  cartpole's empty observable set) → no screen, empty `partition_block` (identical prompt bytes),
+  no regression check, no side-file. KNOWN UNCOVERED (documented residual risk): an inline-literal
+  gate lowered in the `compute_reward` body (not in `REWARD_SPEC.hyperparameters`) the dict-diff
+  can't see; a farm-able ADDED term (flag + prompt warning only, not post-write-enforced).
+- **Verified**: `tests/test_partition_gate.py` 36 passed (unit: gate_kind/observable_of/screen_edits/
+  gate_threshold_regressions incl. the v5-fix + rename freeze-guard + sci-notation + sign cases;
+  e2e via stub-LLM apply_edits: completion-gate lowering REJECTED, gate-raise COMMITS + writes
+  partition_gate.json, rename does NOT freeze, METRIC_PARTITION block present iff metric set,
+  empty-frozenset byte-identical). Full sculptor suite **768 passed, 1 skipped (jax)** (was 732;
+  +36). Live GPU end-to-end deferred to #11.
+
 ### 2026-06-17 — fix: a RESUMED run no longer shows the prior run's iterations as RUNNING
 
 - **What**: two backend-only changes in `reward-sculptor-ui/backend/services/run_manager.py`.
@@ -389,7 +756,8 @@ Start the next entry below this line.
   (competent_ref = max top-rung score across valid sources). The verdict is
   recorded under `calibration.adversarial` (provenance hashes + per-archetype
   scores → meta.json) regardless. Backend: `RS_ADVERSARIAL_ARCHETYPES` (default
-  OFF) threaded sculptor_bridge→metric_store→run_manager; `metric_calibration_done`
+  OFF at Ship 53; **flipped ON for high-stakes at Ship 54 / #4**) threaded
+  sculptor_bridge→metric_store→run_manager; `metric_calibration_done`
   now emits `adversarial_ran`/`gameable`. Tests: 8 in
   `test_task_derived_calibration.py` (`_FakeBothClient` branches on output_format).
 - **Why**: L0-L2 prove a metric ranks competence, but a metric can still be

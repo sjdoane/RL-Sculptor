@@ -21,10 +21,12 @@ from sculptor.eval.generated_metric import (
 )
 from sculptor.eval.metric_calibration import (
     adversarial_archetype_gate,
+    adversarial_archetype_gate_spec,
     calibrate_metric,
     calibrate_task_derived,
     compute_trust,
     grant_decision,
+    kick_required_losers,
 )
 from sculptor.eval.metric_gen import generate_objective_metric
 from sculptor.eval.metric_validate import validate_generated_metric
@@ -48,10 +50,12 @@ __all__ = [
     "validate_generated_metric",
     "generate_objective_metric",
     "adversarial_archetype_gate",
+    "adversarial_archetype_gate_spec",
     "calibrate_metric",
     "calibrate_task_derived",
     "compute_trust",
     "grant_decision",
+    "kick_required_losers",
     "CONDITIONS",
     "CampaignConfig",
     "EvalCondition",

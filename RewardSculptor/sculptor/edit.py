@@ -44,13 +44,14 @@ import importlib.util
 import json
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
 import numpy as np
 
 from sculptor.diagnose import Diagnosis, ProposedEdit
+from sculptor.eval import partition_gate
 from sculptor.kg.query import cite
 from sculptor.kg.schema import make_paper_id
 from sculptor.kg.store import SculptorKG
@@ -118,6 +119,16 @@ class EditPlan:
     rejection_reasons: list[str]
     cited_arxiv_ids: list[str]
     citation_by_arxiv_id: dict[str, str]
+    # §Ship 54-pre (#12 shaping↔metric partition gate). NON-BLOCKING flags: a
+    # flagged edit STAYS applicable (unlike rejected_edits) — it touches a
+    # held-out metric observable or proposes lowering a completion gate. The
+    # flags drive the editor-prompt warning + changelog; the only HARD gate is
+    # the post-LLM `gate_threshold_regressions` check. Empty unless an objective
+    # metric is steering the run (metric_observables passed) — byte-identical
+    # otherwise. `screen` carries the full ScreenResult for the prompt builder.
+    flagged_edits: list[ProposedEdit] = field(default_factory=list)
+    flag_reasons: list[str] = field(default_factory=list)
+    screen: Any = None
 
 
 # ── Identifier extraction from proposal formulas ─────────────────────────
@@ -364,6 +375,15 @@ def _current_reward_hparam_keys(current_module) -> set[str]:
     return set(hparams.keys())
 
 
+def _current_reward_hparams(current_module) -> dict[str, Any]:
+    """The parent reward's `REWARD_SPEC.hyperparameters` name→value map (not just
+    keys). Source for the §Ship 54-pre partition gate's post-LLM gate-erosion
+    check (`partition_gate.gate_threshold_regressions`)."""
+    spec = getattr(current_module, "REWARD_SPEC", {}) or {}
+    hparams = spec.get("hyperparameters", {}) or {}
+    return dict(hparams) if isinstance(hparams, dict) else {}
+
+
 def _current_reward_version(current_module) -> str:
     spec = getattr(current_module, "REWARD_SPEC", {}) or {}
     return str(spec.get("version", "v0"))
@@ -403,6 +423,9 @@ def _pre_validate(
     contract,
     current_module,
     kg_store: SculptorKG,
+    *,
+    metric_observables: "frozenset[str] | None" = None,
+    current_hparams: "dict[str, Any] | None" = None,
 ) -> EditPlan:
     """Partition proposed edits into applicable / deferred / rejected.
 
@@ -496,6 +519,23 @@ def _pre_validate(
         else:
             applicable.append(e)
 
+    # 3. §Ship 54-pre (#12) shaping↔metric partition screen — NON-BLOCKING.
+    #    Only when an objective metric is steering the run (metric_observables
+    #    passed). Flags edits that touch a held-out metric observable or propose
+    #    lowering a completion gate; they STAY applicable. Byte-identical when
+    #    metric_observables is None (the gym_sb3 / blind / prompt-edit paths).
+    flagged: list[ProposedEdit] = []
+    flag_reasons: list[str] = []
+    screen = None
+    if metric_observables:
+        screen = partition_gate.screen_edits(
+            applicable,
+            metric_observables=metric_observables,
+            current_hparams=current_hparams or {},
+        )
+        flagged = list(screen.flagged_edits)
+        flag_reasons = list(screen.flag_reasons)
+
     return EditPlan(
         applicable_edits=applicable,
         deferred_edits=deferred,
@@ -503,6 +543,9 @@ def _pre_validate(
         rejection_reasons=rejection_reasons,
         cited_arxiv_ids=all_refs,
         citation_by_arxiv_id=_citation_map(all_refs, kg_store),
+        flagged_edits=flagged,
+        flag_reasons=flag_reasons,
+        screen=screen,
     )
 
 
@@ -525,6 +568,8 @@ def _build_user_prompt(
     applicable_edits: list[ProposedEdit],
     deferred_edits: list[ProposedEdit],
     training_feedback: dict | None = None,
+    metric_observables: "frozenset[str] | None" = None,
+    screen: Any = None,
 ) -> str:
     edits_json = [
         {
@@ -609,6 +654,17 @@ def _build_user_prompt(
                 f"{formatted}\n\n"
             )
 
+    # §Ship 54-pre (#12): the METRIC_PARTITION block — present ONLY when an
+    # objective metric is steering the run. Self-contained (carries its own
+    # rules) so the shared system prompt is untouched and the no-metric path is
+    # byte-identical (empty string → identical f-string bytes).
+    partition_block = ""
+    if metric_observables:
+        partition_block = partition_gate.build_partition_prompt_block(
+            metric_observables,
+            screen if screen is not None else partition_gate.ScreenResult(),
+        )
+
     return (
         f"# NEW_VERSION\n{new_version}\n\n"
         f"# PARENT_VERSION\n{current_version}\n\n"
@@ -627,6 +683,7 @@ def _build_user_prompt(
         f"supports_batched:   {supports_batched}\n"
         f"training_device:    {getattr(contract, 'training_device', 'any')}\n\n"
         f"{batched_block}"
+        f"{partition_block}"
         f"# APPLICABLE_EDITS (apply these)\n"
         f"{json.dumps(edits_json, indent=2, sort_keys=True, default=str)}\n\n"
         f"# DEFERRED_EDITS (requires_env_extension=true; DO NOT apply — "
@@ -697,7 +754,9 @@ def _call_llm(
 # ── POST-flight validation ────────────────────────────────────────────────
 def _post_validate(new_source: str, *, contract, kg_store: SculptorKG,
                    parent_hash: str, new_version: str,
-                   write_to: Path) -> Any:
+                   write_to: Path,
+                   parent_hparams: "dict[str, Any] | None" = None,
+                   metric_observables: "frozenset[str] | None" = None) -> Any:
     """Write source, import, validate, return the imported module.
 
     Raises EditValidationError on any failure (caller decides whether to retry).
@@ -810,6 +869,32 @@ def _post_validate(new_source: str, *, contract, kg_store: SculptorKG,
                     f"a full reference entry for each, or remove the arxiv_id "
                     f"from grounding (physics first-principles text is OK)."
                 )
+
+        # §Ship 54-pre (#12) shaping↔metric partition gate — the ONE HARD gate.
+        # Runs ONLY when an objective metric is steering the run; compares the
+        # emitted hyperparameters against the parent's. A same-named, positive,
+        # numerically-LOWERED completion-gate hparam (the g1-kick-v5 whack-a-mole)
+        # is a hard reject → existing retry-once → the iter drops the edit.
+        # REMOVED / renamed / ambiguous-gate / sign-ambiguous lowerings are
+        # ADVISORY (logged, never raised) so a legitimate refactor can't freeze
+        # the loop. Byte-identical when metric_observables is None.
+        if metric_observables and parent_hparams is not None:
+            new_hparams = spec.get("hyperparameters")
+            if isinstance(new_hparams, dict):
+                reg = partition_gate.gate_threshold_regressions(
+                    parent_hparams, new_hparams)
+                for adv in reg.advisory:
+                    print(f"[edit] partition-gate advisory: {adv}",
+                          file=sys.stderr, flush=True)
+                if reg.hard:
+                    raise EditValidationError(
+                        "metric partition gate: the new reward LOWERS a "
+                        "completion/qualification gate the active objective "
+                        "metric relies on — " + "; ".join(reg.hard) + ". A lower "
+                        "gate lets degenerate sub-motions qualify (this is how "
+                        "g1-kick-v5 reward-hacked). Keep or RAISE the gate; "
+                        "improve the behavior instead of easing the bar."
+                    )
     except Exception:
         # Any validation failure — unlink the staging file so the old
         # v<n>.py (if any) stays authoritative. Preserves the invariant
@@ -836,6 +921,7 @@ def apply_edits(
     client=None,
     on_event=None,
     iter_dir: Path | str | None = None,
+    metric_observables: "frozenset[str] | None" = None,
 ) -> Path:
     """Produce a new reward module from `diagnosis` applied to
     `current_reward_path`. Writes `<rewards_dir>/<new_iter_id>.py` and
@@ -845,6 +931,15 @@ def apply_edits(
     transitions (pre_validate start/done, LLM request start/response,
     post_validate done, committed). When None (default), no events
     fire — preserves existing sculpt-run call sites unchanged.
+
+    `metric_observables`: §Ship 54-pre (#12). The set of physical observables
+    the ACTIVE objective metric scores (e.g. `{"joint_vel", "left_foot_pos_b",
+    ...}` for g1_kick). When supplied, the shaping↔metric partition gate fires:
+    proposed edits touching a held-out observable / lowering a completion gate
+    are FLAGGED into the editor prompt + changelog (non-blocking), and a new
+    reward that numerically lowers a completion-gate hyperparameter is REJECTED
+    post-write. When None (gym_sb3 / blind / prompt-edit paths), the gate is a
+    complete no-op — byte-identical to the prior behavior.
     """
     current_reward_path = Path(current_reward_path).resolve()
     rewards_dir = current_reward_path.parent
@@ -863,13 +958,20 @@ def apply_edits(
         current_references = _current_reward_references(current_module)
         parent_hash = hashlib.sha256(
             current_source.encode("utf-8")).hexdigest()[:16]
+        # §Ship 54-pre (#12): parent hparam VALUES for the post-LLM partition
+        # gate. Only consulted when an objective metric is steering the run.
+        parent_hparams = _current_reward_hparams(current_module)
+        gate_parent_hparams = (
+            parent_hparams if metric_observables else None)
 
         # Pre-flight.
         if on_event is not None:
             on_event({"type": "log_line", "text": "[edit] pre-validate start"})
         plan = _pre_validate(
             diagnosis=diagnosis, contract=reward_contract,
-            current_module=current_module, kg_store=kg_store)
+            current_module=current_module, kg_store=kg_store,
+            metric_observables=metric_observables,
+            current_hparams=parent_hparams)
         if on_event is not None:
             on_event({
                 "type": "log_line",
@@ -898,6 +1000,25 @@ def apply_edits(
                     "count": len(plan.rejected_edits),
                     "reasons": list(plan.rejection_reasons),
                 })
+            # §Ship 54-pre (#12): partition flags — NON-BLOCKING (the edit
+            # stays applicable). Mirrors the rejection surfacing for UI parity.
+            if plan.flag_reasons:
+                for reason in plan.flag_reasons:
+                    on_event({
+                        "type": "log_line",
+                        "text": f"[edit] partition flag: {reason}",
+                    })
+                on_event({
+                    "type": "edits_partition_flagged",
+                    "count": len(plan.flagged_edits),
+                    "reasons": list(plan.flag_reasons),
+                })
+
+        # §Ship 54-pre (#12): partition flags ALSO go to stderr (always
+        # visible — the sculpt loop path passes no on_event, sculpt.py:1261).
+        for reason in plan.flag_reasons:
+            print(f"[edit] partition flag: {reason}",
+                  file=sys.stderr, flush=True)
 
         if not plan.applicable_edits:
             raise EditValidationError(
@@ -953,6 +1074,8 @@ def apply_edits(
             applicable_edits=plan.applicable_edits,
             deferred_edits=plan.deferred_edits,
             training_feedback=training_feedback,
+            metric_observables=metric_observables,
+            screen=plan.screen,
         )
         if on_event is not None:
             on_event({
@@ -972,6 +1095,8 @@ def apply_edits(
                 new_source, contract=reward_contract, kg_store=kg_store,
                 parent_hash=parent_hash, new_version=new_iter_id,
                 write_to=target_path,
+                parent_hparams=gate_parent_hparams,
+                metric_observables=metric_observables,
             )
         except EditValidationError as first_err:
             print(f"[edit] first attempt failed: {first_err}. Retrying once.",
@@ -999,9 +1124,17 @@ def apply_edits(
                 new_source, contract=reward_contract, kg_store=kg_store,
                 parent_hash=parent_hash, new_version=new_iter_id,
                 write_to=target_path,
+                parent_hparams=gate_parent_hparams,
+                metric_observables=metric_observables,
             )
 
         _write_current_reexport(rewards_dir, target_path)
+        # §Ship 54-pre (#12): persist the partition-gate report next to the
+        # iter so the sculpt loop (which passes no on_event) can surface it in
+        # the changelog. Written ONLY when a metric steers AND there is
+        # something to report — byte-identical otherwise.
+        if metric_observables and (plan.flag_reasons or plan.screen is not None):
+            _write_partition_report(iter_dir, new_iter_id, plan, metric_observables)
         if on_event is not None:
             on_event({
                 "type": "log_line",
@@ -1147,6 +1280,39 @@ def apply_prompt_edit(
         client=client,
         on_event=on_event,
     )
+
+
+def _write_partition_report(
+    iter_dir: Path | str | None,
+    new_iter_id: str,
+    plan: EditPlan,
+    metric_observables: "frozenset[str]",
+) -> None:
+    """§Ship 54-pre (#12): persist the partition-gate report to
+    `<iter_dir>/partition_gate.json` so the sculpt loop (no on_event on the
+    apply_edits call) can surface it in the changelog. Never raises — a
+    reporting failure must not break a committed reward edit."""
+    if iter_dir is None:
+        return
+    try:
+        d = Path(iter_dir)
+        if not d.is_dir():
+            return
+        screen = plan.screen
+        report = {
+            "version": new_iter_id,
+            "metric_observables": sorted(metric_observables),
+            "flag_reasons": list(plan.flag_reasons),
+            "flagged_edit_count": len(plan.flagged_edits),
+            "held_out": list(getattr(screen, "held_out", []) or []),
+            "gate_hparams": list(getattr(screen, "gate_hparams", []) or []),
+        }
+        (d / "partition_gate.json").write_text(
+            json.dumps(report, indent=2, sort_keys=True, default=str),
+            encoding="utf-8")
+    except Exception as e:  # noqa: BLE001 — reporting is advisory, never fatal
+        print(f"[edit] partition report write skipped: "
+              f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
 
 
 def _write_current_reexport(rewards_dir: Path, latest: Path) -> None:

@@ -134,6 +134,49 @@ def get_mission_quality(slug: str, store: ProjectStore = Depends(get_store)) -> 
     return doc
 
 
+# ── GET actuator-limits (§reports: per-motor torque/speed vs limits) ──
+@router.get(
+    "/projects/{slug}/reports/actuator-limits",
+    responses={404: {"model": ProblemDetail}},
+)
+def get_actuator_limits(
+    slug: str, iter: int | None = None, store: ProjectStore = Depends(get_store)
+) -> Any:
+    """Per-motor SPEED-vs-no-load-speed and TORQUE-vs-effort-limit utilization for
+    one rollout iteration — the charts that visually confirm a policy respects the
+    real actuator envelope. `iter` selects the iteration (default: the latest with
+    rollout data). Empty state (not 404) when no rollout has trajectory data yet."""
+    pd = _project_dir(store, slug)
+    if pd is None:
+        return _problem(404, "project not found", type="/problems/not-found")
+    runs = pd / "runs"
+    avail: list[int] = []
+    if runs.is_dir():
+        for d in sorted(runs.glob("iter_*")):
+            if (d / "rollout" / "trajectory.npz").is_file():
+                try:
+                    avail.append(int(d.name.split("_")[1]))
+                except (ValueError, IndexError):
+                    continue
+    avail.sort()
+    if not avail:
+        return {"schema": 1, "available_iters": [], "iter": None, "ok": False,
+                "has_torque": False,
+                "reason": "no rollouts with trajectory data yet", "motors": []}
+    sel = iter if (iter is not None and iter in avail) else avail[-1]
+    rd = runs / f"iter_{sel}" / "rollout"
+    try:
+        from backend.services import sculptor_bridge
+
+        rep = sculptor_bridge.actuator_limits_report(
+            rd / "trajectory.npz", rd / "mjcf_limits.json")
+    except Exception as e:  # noqa: BLE001 — never 500; surface an empty state
+        rep = {"ok": False, "has_torque": False,
+               "reason": f"{type(e).__name__}: {e}", "motors": []}
+    rep.update({"schema": 1, "available_iters": avail, "iter": sel})
+    return rep
+
+
 # ── POST build ────────────────────────────────────────────────────────
 @router.post(
     "/projects/{slug}/reports/build",

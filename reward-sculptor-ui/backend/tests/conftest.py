@@ -14,6 +14,21 @@ import pytest
 from fastapi.testclient import TestClient
 
 
+@pytest.fixture(autouse=True)
+def _disable_network_adversarial(monkeypatch: pytest.MonkeyPatch):
+    """§Metric-quality laws (LAW 9): the L3 adversarial gaming-archetype gate is
+    DEFAULT ON in production (Sam's call) but makes a metric-blind LLM author call
+    — at the novel-task grant AND the AUDIT-ONLY spec_* probe. Unit tests must not
+    hit the network, so force the flag OFF by default; the dedicated audit test
+    re-enables it with a mocked bridge. Read at module level, so monkeypatch the
+    resolved constant, not the env var."""
+    try:
+        from backend.services import run_manager
+        monkeypatch.setattr(run_manager, "_ADVERSARIAL_ENABLED", False)
+    except Exception:  # noqa: BLE001 — tests that never import run_manager
+        pass
+
+
 @pytest.fixture
 def tmp_projects_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     root = tmp_path / "projects"

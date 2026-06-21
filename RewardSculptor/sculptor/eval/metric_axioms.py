@@ -178,6 +178,7 @@ def check_metric_axioms(
     *,
     family: Optional[str] = None,
     required_roles: Optional[Sequence[str]] = None,
+    torso_target: str = "upright",
     tol_chaos: float = 0.50,
     tol_travel: float = 0.10,
     inv_tol: float = _INVARIANCE_TOL,
@@ -187,9 +188,14 @@ def check_metric_axioms(
 
     `family` (from `resolve_behavior_family`) scopes the stationarity axiom.
     `required_roles` are injected (lenient) so a role-based metric reads the
-    right synthetic columns. The chaos tolerance (0.5) clears the most
-    peak-sensitive GOOD_* metric (~0.33 worst-case) while catching a pure
-    energy rewarder (~1.0); the invariances are exact (1e-6)."""
+    right synthetic columns. `torso_target` (from `resolve_torso_target`, LAW
+    13) scopes the M1 uprightness-monotonicity axiom: it runs ONLY for an
+    `"upright"` skill (the default), and is SKIPPED for a `"horizontal"`
+    (flip/dive/roll/crawl) or `"any"` (handstand/cartwheel) target — a metric
+    that competently rewards a non-upright torso must not be penalised for it.
+    The chaos tolerance (0.5) clears the most peak-sensitive GOOD_* metric
+    (~0.33 worst-case) while catching a pure energy rewarder (~1.0); the
+    invariances are exact (1e-6)."""
     meta = {"joint_names": list(_NAMES_12)}
     inject_joint_roles(meta, list(required_roles or []), lenient=True)
     arche = _archetypes()
@@ -239,21 +245,28 @@ def check_metric_axioms(
                 f"{base_score + d:.3f} (Δ{d:+.4f}) — the metric reads a "
                 f"frame/units artifact, not physical competence")
 
-    # ── M1 uprightness monotonicity (sweep) ──────────────────────────
-    sweep = [_eval(fn, _tilt(base, deg), meta) for deg in _TILT_SWEEP_DEG]
-    details["uprightness_sweep"] = [
-        round(v, 4) if np.isfinite(v) else None for v in sweep]
-    mono = True
-    for i in range(len(sweep) - 1):
-        a, b2 = sweep[i], sweep[i + 1]
-        if np.isfinite(a) and np.isfinite(b2) and b2 > a + _MONO_TOL:
-            mono = False
-            reasons.append(
-                f"[axiom:uprightness] tilting the base from {int(_TILT_SWEEP_DEG[i])}°"
-                f" to {int(_TILT_SWEEP_DEG[i + 1])}° RAISED the score "
-                f"{a:.3f}→{b2:.3f} — the metric rewards falling, not the behavior")
-            break
-    axioms["uprightness_monotone"] = bool(mono)
+    # ── M1 uprightness monotonicity (sweep) — §LAW 13: upright skills ONLY ──
+    # Tilt the operating point from vertical toward horizontal and require the
+    # score not to RISE. A flip/dive/roll (torso_target="horizontal") or a
+    # handstand/cartwheel ("any") is competently non-upright, so a metric that
+    # scores a tilted torso higher must NOT be penalised — skip the sweep.
+    if torso_target == "upright":
+        sweep = [_eval(fn, _tilt(base, deg), meta) for deg in _TILT_SWEEP_DEG]
+        details["uprightness_sweep"] = [
+            round(v, 4) if np.isfinite(v) else None for v in sweep]
+        mono = True
+        for i in range(len(sweep) - 1):
+            a, b2 = sweep[i], sweep[i + 1]
+            if np.isfinite(a) and np.isfinite(b2) and b2 > a + _MONO_TOL:
+                mono = False
+                reasons.append(
+                    f"[axiom:uprightness] tilting the base from {int(_TILT_SWEEP_DEG[i])}°"
+                    f" to {int(_TILT_SWEEP_DEG[i + 1])}° RAISED the score "
+                    f"{a:.3f}→{b2:.3f} — the metric rewards falling, not the behavior")
+                break
+        axioms["uprightness_monotone"] = bool(mono)
+    else:
+        details["uprightness_monotone_skipped"] = f"torso_target={torso_target}"
 
     # ── M2 no reward for chaos / raw energy ───────────────────────────
     d_cha = _delta(_inject_chaos(base))

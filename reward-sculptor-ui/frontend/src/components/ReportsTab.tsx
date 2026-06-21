@@ -3,6 +3,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { toast } from "sonner";
 
+import { ActuatorLimitsCard } from "@/components/ActuatorLimitsCard";
 import { Icon } from "@/components/rs/icon";
 import { Btn, EmptyState } from "@/components/rs/primitives";
 import { ApiError } from "@/lib/api";
@@ -134,6 +135,8 @@ export function ReportsTab({ slug }: { slug: string }) {
             </Btn>
           </div>
         </div>
+
+        <ActuatorLimitsCard slug={slug} />
 
         {(quality.data?.length ?? 0) > 0 && (
           <div className="rs-card" style={{ marginBottom: 22 }}>

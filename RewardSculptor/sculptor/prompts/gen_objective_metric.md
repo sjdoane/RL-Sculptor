@@ -1,7 +1,9 @@
 You are an expert RL evaluation engineer. Write an OBJECTIVE TASK-SUCCESS
 METRIC for a robot behavior goal — the ground-truth fitness used to judge
 whether a learned policy achieves the goal. This is NOT a reward function:
-it must be an HONEST, hard-to-game measurement of task competence.
+it must be an HONEST, hard-to-game measurement of task competence. Treat it
+as a competence GATE, not a score to be maximised — its job is to score a
+degenerate sub-behavior at ZERO, not at "a little".
 
 Output a single self-contained Python module (and nothing else outside the
 code fence). It may declare an optional module constant naming the joint
@@ -15,7 +17,29 @@ ROLES it reads, and must define `compute_spec`:
         # ... compute from physical rollout quantities ...
         return {"spec_score": <float in [0,1]>, "<subcomponent>": <float>, ...}
 
-INPUTS you may use (ALL OTHER inputs are forbidden):
+## GOAL FRAME — resolve this FIRST, abstain when unknown
+
+Before any directional, postural, or completion check, resolve the task's
+frame from the goal (and `meta` when provided):
+
+  * `goal_axis`     — the world/body axis the goal motion travels along, as a
+                      signed unit direction (e.g. forward = +x). `None` if the
+                      goal is direction-free (a spin, a generic shake).
+  * `support_mode`  — `double` (both feet planted, e.g. a standing kick),
+                      `single` (one-foot stance, e.g. a flamingo/handstand),
+                      `flight` (airborne phase, e.g. a jump/flip), or `None`.
+  * `torso_target`  — `upright`, `horizontal` (a backflip/dive/crawl), or
+                      `any`. `None` if unconstrained.
+
+**ABSTAIN RULE (non-negotiable):** any gate whose frame field is unresolved
+MUST abstain — it contributes NEITHER a penalty NOR a pass (treat it as a
+neutral 1.0 factor and note it in a subcomponent), and you should NOT hard-
+code a default of forward / upright / double-support. A handstand, a backflip,
+and a deliberately-rearward mule-kick are all legitimate goals; a metric that
+bakes in "forward + upright + two feet" silently false-rejects them.
+
+## INPUTS (ALL OTHER inputs are forbidden)
+
   arrays["joint_pos"]            (T, E, J)  joint angles over time/envs
   arrays["joint_vel"]            (T, E, J)  joint velocities
   arrays["projected_gravity_b"]  (T, E, 3)  gravity in body frame; z < -0.85
@@ -29,9 +53,24 @@ INPUTS you may use (ALL OTHER inputs are forbidden):
                                  robot's actual joints and hands you the indices
   meta["joint_names"]            list[str] aligned with axis J (raw names; you
                                  normally do NOT need these — use joint_roles)
+
+Some adapters also expose, WHEN AVAILABLE (biped tasks), end-effector channels:
+  arrays.get("left_foot_pos_b")  (T, E, 3)  left foot position in the PELVIS
+                                            frame; [..., 0] is SIGNED anterior
+                                            (forward +) displacement — the clean
+                                            forward-vs-rearward kick direction
+  arrays.get("right_foot_pos_b") (T, E, 3)  right foot, same convention
+  arrays.get("left_foot_contact")  (T, E)   1.0 when the left foot is on the
+                                            ground, else 0.0 (support schedule)
+  arrays.get("right_foot_contact") (T, E)   right foot ground contact
+Use these for clean direction / support-schedule checks when present — but per
+the DATA-SUFFICIENCY rule below, if a channel you need is absent you must
+ABSTAIN that check, never silently fall back to a magnitude proxy that re-opens
+a hole.
 Any array may be ABSENT — always `arrays.get(k)` + guard for None.
 
-JOINT RESOLUTION SAFETY (a violation means the metric is rejected):
+## JOINT RESOLUTION SAFETY (a violation means the metric is rejected)
+
   * To read a SPECIFIC joint, declare it in REQUIRED_JOINT_ROLES and read its
     column from meta["joint_roles"] — NEVER a hard-coded integer column. A
     literal `joint_vel[:, :, 0]` reads a DIFFERENT joint on every robot and is
@@ -45,39 +84,88 @@ JOINT RESOLUTION SAFETY (a violation means the metric is rejected):
     `left_hip_pitch`, `right_hip_roll`, `left_knee`, `left_ankle_pitch`,
     `left_shoulder_pitch`. A bare `left_hip` is AMBIGUOUS (pitch/roll/yaw) and
     will be rejected — always name the axis.
-  * DIRECTION MATTERS. A FORWARD kick / forward gait lives in the SAGITTAL
-    plane: hip PITCH, knee, ankle PITCH. Hip ROLL is sideways abduction, hip
-    YAW is twist. A forward-kick metric must read hip_pitch + knee (NOT
-    hip_roll), or it scores a sideways kick as highly as a forward one (a real
-    failure we have seen). Pick the roles whose motion DEFINES the goal.
 
-HARD RULES (a violation means the metric is rejected):
-  1. PHYSICAL ONLY. Score from these arrays. NO LLM judgment, NO text, NO
-     calls to anything but numpy. `import numpy as np` is the only import.
-  2. spec_score MUST be a finite float in [0, 1]. Clip it.
-  3. DETERMINISTIC. No np.random, no time, no global state.
-  4. NEVER raise. Guard missing/short arrays → return {"spec_score": 0.0}.
-  5. MONOTONE IN TRUE COMPETENCE + NOT GAMEABLE. A more-competent policy must
-     score higher. Specifically AVOID these known traps:
-     - Don't reward raw motion/energy (a flailing/vibrating policy must
-       score LOW, not high).
-     - Don't use peak/median RATIOS (an under-trained still-mostly policy
-       games them); prefer absolute, saturating quantities.
-     - Gate locomotion on UPRIGHTNESS and stance HEIGHT (a belly-crawl with
-       a level torso at ground height is not walking).
-     - Gate "kick"/transient tasks on upright windows + a return-to-rest
-       (continuous motion is not a discrete kick).
-     - For a skill performed FROM A STANDING STANCE (kick, balance, floss,
-       in-place jump), gate on a roughly STATIONARY base — multiply by
-       `exp(-horizontal_speed / scale)` using `root_link_pos_w`. A forward
-       WALKER must score LOW: its gait hip/knee swings look like bursts, so
-       a metric that doesn't penalise base travel rewards walking, not the
-       skill (this is the exact failure that stalled a real kick run).
-     - For rhythmic/periodic goals, measure structure (e.g. anti-phase),
-       not just that something oscillates.
-  6. Use a SATURATING form for unbounded quantities, e.g.
-     `1 - np.exp(-x / scale)`, so the score can't be inflated arbitrarily.
-  7. Return useful named subcomponents alongside spec_score (for debugging).
+## HARD RULES (a violation means the metric is rejected)
 
-Think about which physical signature DEFINITELY distinguishes success from
-the failure modes, then encode exactly that. Output ONLY the Python module.
+1. **ONE COMPOSITION — a completion gate times a min of channels.** The score
+   MUST be exactly:
+       spec_score = completion_gate * min(channel_1, channel_2, ...)
+   where:
+     - `completion_gate ∈ {0, 1}` (a SHARP gate, e.g. a steep sigmoid) on
+       whether the goal motion actually HAPPENED and COMPLETED — a discrete,
+       returned cycle for transient skills (launch crosses a threshold AND
+       returns toward rest within a window), the required support/airborne
+       phase reached, etc. It OWNS THE FLOOR: no completion → score 0.
+     - `min(...)` over ≥2 INDEPENDENT, saturating channels each in [0,1]. The
+       min (worst-case) means a policy cannot trade a strong channel for a
+       weak one — every requirement must be met.
+   FORBIDDEN: weighted sums of terms; fractional "partial-credit" products
+   where 3-of-4 weak factors still yield 0.2–0.4; ANY peak/median or p95/p99-
+   over-median RATIO. (These are exactly how a real kick metric was gamed: it
+   gave 0.2–0.4 to a static twitch and a whip-and-fall, so degenerate sub-
+   motions read as low-scoring successes instead of non-successes.) If you
+   count discrete events, fold that count INTO the gate — never report it only
+   as a diagnostic while a smooth term drives the score.
+
+2. **AMPLITUDE FLOOR.** The goal-defining joint/end-effector MUST traverse at
+   least a task-minimum arc (range of motion / swept distance) within the
+   action window; a sub-threshold motion floors the score to 0. The
+   completion gate caps the bottom; this stops a correctly-shaped but TINY
+   motion (a micro-twitch, a foot flick) from passing.
+
+3. **SIGNED DIRECTION along `goal_axis`.** When `goal_axis` is resolved, the
+   goal-defining motion must be scored by its SIGNED projection onto that axis
+   — never a direction-free magnitude. A motion of equal magnitude OPPOSITE or
+   ORTHOGONAL to `goal_axis` MUST score LOWER. (`np.abs(joint_vel)` on the
+   swing leg scores a rearward/sideways kick identically to a forward one — a
+   real failure we have seen. Use a signed velocity/displacement, ideally
+   foot-position along the axis when that channel is available; otherwise read
+   the SIGNED joint velocity of the role whose flexion defines the direction.)
+   When `goal_axis` is `None`, abstain (per the GOAL FRAME rule).
+
+4. **PHYSICAL ONLY / BOUNDED / DETERMINISTIC / NEVER RAISE.**
+   - Score from these arrays only. NO LLM judgment, NO text, numpy is the only
+     import.
+   - spec_score MUST be a finite float in [0, 1]. Clip it.
+   - DETERMINISTIC: no np.random, no time, no global state.
+   - NEVER raise: guard missing/short arrays → return {"spec_score": 0.0}.
+
+5. **SATURATE + SPIKE-ROBUST.** Use a saturating form for every unbounded
+   quantity (`1 - np.exp(-x / scale)` or a tolerance kernel) so no term can be
+   inflated arbitrarily — this is also why peak/extremal terms are banned. A
+   single-frame velocity SPIKE must barely move the score (smooth/aggregate
+   over a window before thresholding); a metric an explosive one-frame whip
+   can inflate is gameable.
+
+6. **DATA SUFFICIENCY — abstain, never proxy.** If a signal you need (a foot
+   contact, a foot position, a specific role) is ABSENT, that channel must
+   abstain (neutral 1.0 + a flag in the subcomponents) — NEVER silently
+   substitute a magnitude proxy that re-introduces the blind spot the real
+   signal would have closed.
+
+7. **METRIC ≠ REWARD (no style regularizers here).** The metric is a pass/fail
+   competence gate. Do NOT put smoothness / action-rate / jerk / energy
+   penalties in it — those are soft, tradeable SHAPING terms that belong in
+   the reward, not the ground-truth gate. The metric encodes WHAT success is
+   (direction, completion, amplitude, support/posture), not how pretty it is.
+
+8. **POSTURE IS NOT ORIENTATION; STATIONARITY DOES NOT CERTIFY POSTURE.**
+   `projected_gravity_b` measures torso ORIENTATION only — a policy can be
+   "upright" by gravity yet balanced wrongly or flailing. For a `support=double`
+   skill, veto a one-leg-balance hack explicitly (sustained single-support with
+   sub-threshold motion and no completed cycle), and do NOT use a stationarity
+   factor as a POSITIVE channel: a frozen one-leg pose is maximally stationary,
+   so stationarity rewards the hack. Keep "don't travel" as a VETO inside the
+   gate (a forward walker is not kicking), not as earned credit. Apply
+   monotone-in-uprightness ONLY when `torso_target = upright`; for `horizontal`
+   / `any` (backflip, dive, crawl, handstand) do not penalise a non-upright
+   torso.
+
+9. **Return useful named subcomponents** alongside spec_score: the resolved
+   goal frame, each channel value, the completion gate, and any abstained
+   check (for debugging and review).
+
+Think about which physical signature DEFINITELY distinguishes success from the
+specific failure modes — wrong direction, incomplete/partial motion, tiny
+amplitude, balancing instead of acting, flailing instead of executing — then
+encode exactly that as the gate × min(channels). Output ONLY the Python module.

@@ -53,6 +53,16 @@ ALLOWED_ARRAYS = (
     "joint_vel",
     "projected_gravity_b",
     "root_link_pos_w",
+    # §Metric-quality laws (LAW 3/4): per-foot ground contact (T, E) and
+    # foot position in the PELVIS frame (T, E, 3) — anterior (x) component
+    # is the signed forward-kick direction; the contact schedule
+    # distinguishes a brief kick from a sustained one-leg balance. Present
+    # only for biped tasks whose robot exposes left_foot/right_foot sites
+    # (the runner omits them otherwise — guard with arrays.get + None).
+    "left_foot_contact",
+    "right_foot_contact",
+    "left_foot_pos_b",
+    "right_foot_pos_b",
 )
 
 
@@ -227,7 +237,25 @@ def make_generated_fitness_fn(module_path: Path | str) -> Callable[[Any], float]
             return {}
 
     _fitness.detail = _detail  # type: ignore[attr-defined]
+    # §Ship 54-pre (#12): the metric's held-out observable surface for the
+    # shaping↔metric partition gate. Parse which ALLOWED_ARRAYS the module
+    # actually references (precise flags); fall back to the full contract on any
+    # read failure. Never raises — attribute is advisory.
+    _fitness.metric_observables = _generated_metric_observables(module_path)  # type: ignore[attr-defined]
     return _fitness
+
+
+def _generated_metric_observables(module_path: Path | str) -> frozenset[str]:
+    """The subset of `ALLOWED_ARRAYS` a generated metric's source references —
+    its held-out surface for the partition gate. Conservative: on any read
+    failure, return the full `ALLOWED_ARRAYS` contract (the metric is permitted
+    to read any of them)."""
+    try:
+        src = Path(module_path).read_text(encoding="utf-8")
+    except Exception:  # noqa: BLE001 — fall back to the full contract
+        return frozenset(ALLOWED_ARRAYS)
+    referenced = frozenset(a for a in ALLOWED_ARRAYS if a in src)
+    return referenced or frozenset(ALLOWED_ARRAYS)
 
 
 def resolve_fitness_fn(spec: str) -> Callable[[Any], float]:

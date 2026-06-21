@@ -540,6 +540,105 @@ def test_kick_spec_reports_kick_events_diagnostic() -> None:
     assert 0.0 <= out["kick_events"] <= 1.0
 
 
+# ── §Metric-quality-laws rebuild: the documented g1-kick-v5 hacks ─────
+# Forensic anchor (docs/internal/LAWS_OBJECTIVE_METRIC.md): the prior
+# `intensity × ratio_gate × up × stationarity` product scored these
+# degenerate sub-motions 0.13–0.38, keeping every hack alive across 21
+# reward-edit iterations. The composed `completion_gate · min(channels)`
+# must score each at ~0 while a real forward kick stays high.
+
+
+def _kick_vel(leg: int = 2, strength: float = 9.0) -> np.ndarray:
+    """Repeated 6-frame sagittal-leg bursts from a still baseline."""
+    jv = np.zeros((T, E, J), dtype=np.float32)
+    for t0 in range(25, T, 50):
+        jv[t0:t0 + 6, :, leg] = strength
+    return jv
+
+
+def _foot_anterior(direction: float = 1.0, amp: float = 0.30) -> tuple:
+    """Left foot anterior (pelvis-frame x) swings `amp` during each kick window
+    (direction +1 = forward, -1 = rearward); right foot is the quiet stance."""
+    lf = np.zeros((T, E, 3), dtype=np.float32)
+    rf = np.zeros((T, E, 3), dtype=np.float32)
+    for t0 in range(25, T, 50):
+        for k in range(10):
+            if t0 + k < T:
+                lf[t0 + k, :, 0] = direction * amp * np.sin(np.pi * k / 10)
+    return lf, rf
+
+
+_KICK_META = {"joint_names": _NAMES_12}
+
+
+def _kick_arrays(jv, foot_dir=None, root_travel=0.0):
+    root = np.zeros((T, E, 3), dtype=np.float32)
+    root[:, :, 2] = 0.70
+    if root_travel:
+        root[:, :, 0] = (np.arange(T) * root_travel)[:, None]
+    a = {
+        "joint_vel": jv,
+        "joint_pos": np.cumsum(jv, axis=0).astype(np.float32) * 0.02,
+        "projected_gravity_b": _upright_g(),
+        "root_link_pos_w": root,
+    }
+    if foot_dir is not None:
+        lf, rf = _foot_anterior(direction=foot_dir)
+        a["left_foot_pos_b"] = lf
+        a["right_foot_pos_b"] = rf
+    return a
+
+
+def test_kick_rejects_kick_behind() -> None:
+    """LAW 4 — the 'kicks behind it' hack. A real sagittal-leg burst whose foot
+    swings REARWARD (−x pelvis frame) must score ~0; the identical burst with a
+    FORWARD foot swing scores high. Isolates the signed-direction channel."""
+    forward = spec_g1_kick(_kick_arrays(_kick_vel(), foot_dir=+1.0), {}, _KICK_META)
+    behind = spec_g1_kick(_kick_arrays(_kick_vel(), foot_dir=-1.0), {}, _KICK_META)
+    assert forward["spec_score"] > 0.5, forward
+    assert behind["spec_score"] < 0.1, behind
+    assert behind["kick_direction"] < 0.1 and forward["kick_direction"] > 0.7
+
+
+def test_kick_rejects_one_leg_balance() -> None:
+    """LAW 1/3 — the 'balance on one leg doing a partial kick' hack. A sustained
+    one-leg pose with a sub-threshold leg wiggle (no real launch) must floor to
+    ~0 via the completion gate, even though it is upright and stationary."""
+    out = spec_g1_kick(_kick_arrays(_kick_vel(strength=0.8)), {}, _KICK_META)
+    assert out["spec_score"] < 0.05, out
+    assert out["completion_gate"] < 0.2, out
+
+
+def test_kick_rejects_partial_twitch() -> None:
+    """LAW 1/2 — a single brief, small-amplitude twitch (a partial, non-repeated
+    half-motion) must floor to ~0: the completion gate + the amplitude floor."""
+    jv = np.zeros((T, E, J), dtype=np.float32)
+    jv[25:27, :, 2] = 3.0          # one brief sub-floor flick
+    out = spec_g1_kick(_kick_arrays(jv), {}, _KICK_META)
+    assert out["spec_score"] < 0.05, out
+
+
+def test_kick_direction_abstains_without_foot_data() -> None:
+    """LAW 6 — with no foot channels the direction check ABSTAINS (it is flagged,
+    not silently proxied by a magnitude), and a real forward kick still scores
+    high on gate · min(intensity, amplitude)."""
+    out = spec_g1_kick(_kick_arrays(_kick_vel()), {}, _KICK_META)  # no foot_dir
+    assert out.get("direction_abstained") == 1.0
+    assert "kick_direction" not in out
+    assert out["spec_score"] > 0.5, out
+
+
+def test_kick_ladder_is_monotone() -> None:
+    """The rebuilt spec_g1_kick must still order its calibration ladder so a
+    generated kick metric can earn steer-rights via Spearman (a completion gate
+    must not collapse the lower rungs into tied zeros)."""
+    from sculptor.eval.metric_calibration import _ladder
+
+    scores = [spec_g1_kick(a, b, m)["spec_score"] for a, b, m in _ladder("g1_kick")]
+    assert scores == sorted(scores), scores
+    assert scores[-1] > scores[0]
+
+
 def test_make_spec_fitness_fn_reads_rollout_score(tmp_path) -> None:
     """§Ship 34: make_spec_fitness_fn(name)(iter_dir) returns the named
     spec's score on iter_dir/rollout, 0.0 on missing artifacts, and

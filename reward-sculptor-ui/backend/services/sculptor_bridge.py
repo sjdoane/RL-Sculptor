@@ -157,17 +157,21 @@ def generate_objective_metric(
     *,
     robot_hint: Optional[str] = None,
     review: bool = True,
+    n_candidates: int = 1,
     on_event=None,
 ) -> dict:
     """Generate + validate + review an objective fitness metric (the only
     module allowed to import sculptor.eval). Returns the full record.
 
     §Ship 40: `on_event` (optional) streams `{stage, attempt, max, message}`
-    progress so the UI can show live generation progress."""
+    progress so the UI can show live generation progress.
+
+    §best-of-N: `n_candidates` (default 1 → single-shot-with-retry) samples N
+    candidates and selects the most-discriminating valid one (offline)."""
     from sculptor.eval import generate_objective_metric as _gen
 
     return _gen(behavior_goal, out_dir, robot_hint=robot_hint, review=review,
-                on_event=on_event)
+                n_candidates=n_candidates, on_event=on_event)
 
 
 def calibrate_objective_metric(
@@ -194,6 +198,39 @@ def calibrate_task_derived_metric(
 
     return _cal(metric_path, behavior_goal, robot_hint,
                 client=client, k_sources=k_sources, adversarial=adversarial)
+
+
+#: §Metric-quality laws (LAW 9): built-ins that have a curated adversarial loser
+#: set (the documented gaming hacks) — only these get the AUDIT-ONLY spec probe.
+#: Extend as loser sets are authored for other families.
+_SPEC_AUDIT_BUILTINS = {"g1_kick"}
+
+
+def has_spec_audit(builtin_name: str) -> bool:
+    """Whether a built-in has a curated adversarial loser set worth auditing."""
+    return builtin_name in _SPEC_AUDIT_BUILTINS
+
+
+def audit_builtin_spec_metric(
+    builtin_name: str, behavior_goal: str,
+    robot_hint: Optional[str] = None, *, client: Any = None,
+) -> dict:
+    """§Metric-quality laws (LAW 9): AUDIT-ONLY adversarial probe of a HAND-AUTHORED
+    spec_* ground-truth metric (the surface that never ran on the metric that scored
+    g1-kick-v5). Records + warns; the caller NEVER revokes the fence on a finding —
+    built-ins are the trusted calibration anchor. `client` is injectable for tests."""
+    from sculptor.eval import adversarial_archetype_gate_spec as _gate
+
+    return _gate(builtin_name, behavior_goal, client=client, robot_hint=robot_hint)
+
+
+def actuator_limits_report(trajectory_path: "Path", limits_path: "Path") -> dict:
+    """§reports: per-motor joint speed (vs no-load velocity_limit) + torque (vs
+    effort_limit) utilization for one rollout — the data behind the 'actuator limits'
+    confirmation charts. Never raises (returns {ok: False, reason} on bad input)."""
+    from sculptor.adapters.realism import actuator_limits_report as _r
+
+    return _r(trajectory_path, limits_path)
 
 
 def finalize_calibration(calibration: dict, validation: Optional[dict]) -> dict:

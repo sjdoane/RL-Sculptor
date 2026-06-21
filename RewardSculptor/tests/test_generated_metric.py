@@ -99,7 +99,21 @@ def compute_spec(arrays, behavior, meta):
     height = float(np.clip((zmed - 0.45) / 0.20, 0.0, 1.0))
     knee_peak = float(np.abs(jv[..., knees]).max(axis=2).max(axis=0).mean())
     burst = 1.0 - float(np.exp(-knee_peak / 8.0))
-    return {"spec_score": float(np.clip(up * stationary * height * burst, 0.0, 1.0))}
+    # §LAW 4: signed FORWARD direction from foot position (pelvis frame). Abstains
+    # (1.0) when the channel is absent so the footless calibration ladder still
+    # ranks; a rearward/sideways kick (foot moves backward) scores ~0.
+    direction = 1.0
+    feet = [f for f in (arrays.get("left_foot_pos_b"), arrays.get("right_foot_pos_b"))
+            if f is not None]
+    if feet:
+        ds = []
+        for foot in feet:
+            a = foot[..., 0]; dev = a - np.median(a, axis=0, keepdims=True)
+            fwd = np.clip(dev, 0.0, None).max(axis=0)
+            back = np.clip(-dev, 0.0, None).max(axis=0)
+            ds.append((fwd / (fwd + back + 1e-6)) * (1.0 - np.exp(-fwd / 0.12)))
+        direction = float(np.maximum.reduce(ds).mean()) if len(ds) > 1 else float(ds[0].mean())
+    return {"spec_score": float(np.clip(up * stationary * height * burst * direction, 0.0, 1.0))}
 '''
 
 # §Ship 41: a correct JUMP metric — vertical base excursion while upright.
@@ -170,6 +184,33 @@ def compute_spec(arrays, behavior, meta):
     up = float(np.mean(grav[..., 2] < -0.85))
     peak = float(np.abs(sub).max())
     return {"spec_score": float(np.clip(up * (1.0 - np.exp(-peak / 6.0)), 0.0, 1.0))}
+'''
+
+# §Metric-quality laws (LAW 4): a kick metric that gates on stationarity +
+# uprightness + leg burst but does NOT read foot DIRECTION — it scores a
+# rearward "mule kick" identically to a forward one, so it is gameable by the
+# g1-kick-v5 "kicks behind it" hack. The kick-family direction gate must reject
+# it (active_kick_behind scores == active_kick).
+DIRECTION_BLIND_KICK = '''import numpy as np
+REQUIRED_JOINT_ROLES = ["left_knee", "right_knee"]
+def compute_spec(arrays, behavior, meta):
+    jv = arrays.get("joint_vel"); grav = arrays.get("projected_gravity_b")
+    root = arrays.get("root_link_pos_w"); jp = arrays.get("joint_pos")
+    if jv is None or grav is None or root is None or jp is None:
+        return {"spec_score": 0.0}
+    roles = (meta or {}).get("joint_roles", {}) if isinstance(meta, dict) else {}
+    knees = [roles[r] for r in ("left_knee", "right_knee") if r in roles]
+    if not knees:
+        return {"spec_score": 0.0}
+    up = float(np.mean(grav[..., 2] < -0.85))
+    xy = root[..., :2]
+    drift = float(np.linalg.norm(xy.max(0) - xy.min(0), axis=-1).mean())
+    stationary = float(np.exp(-drift / 0.4))
+    zmed = float(np.median(root[..., 2]))
+    height = float(np.clip((zmed - 0.45) / 0.20, 0.0, 1.0))
+    knee_peak = float(np.abs(jv[..., knees]).max(axis=2).max(axis=0).mean())
+    burst = 1.0 - float(np.exp(-knee_peak / 8.0))
+    return {"spec_score": float(np.clip(up * stationary * height * burst, 0.0, 1.0))}
 '''
 
 
@@ -346,6 +387,159 @@ def test_good_kick_metric_clears_walker_ceiling(tmp_path):
     assert v["ok"], v["reasons"]
 
 
+def test_validate_rejects_direction_blind_kick(tmp_path):
+    """§LAW 4: a kick metric that ignores foot DIRECTION scores a rearward kick
+    identically to a forward one — the kick-family gate rejects it (the
+    'kicks behind it' g1-kick-v5 hack a stationarity-only metric can't catch)."""
+    p = _write(tmp_path, "blind.py", DIRECTION_BLIND_KICK)
+    v = validate_generated_metric(
+        DIRECTION_BLIND_KICK, p, behavior_goal="repeatedly kick forward with one leg")
+    assert v["family"] == "kick"
+    s = v["archetype_scores"]
+    assert s["active_kick_behind"] == pytest.approx(s["active_kick"]), s
+    assert not v["ok"]
+    assert v["gates"]["nondegeneracy"] is False
+    assert any("active_kick_behind" in r for r in v["reasons"]), v["reasons"]
+
+
+def test_good_kick_clears_direction_and_balance_hacks(tmp_path):
+    """§LAW 1/2/4: the direction-aware GOOD_KICK scores every documented v5 hack
+    (rear kick, one-leg balance, partial twitch) BELOW its forward-kick positive
+    and is accepted for the kick family."""
+    p = _write(tmp_path, "kick.py", GOOD_KICK)
+    v = validate_generated_metric(
+        GOOD_KICK, p, behavior_goal="repeatedly kick forward with one leg")
+    s = v["archetype_scores"]
+    for hack in ("active_kick_behind", "one_leg_balance", "partial_kick"):
+        assert s[hack] < s["active_kick"], (hack, s)
+    assert s["active_kick_behind"] < 0.1, s    # direction kills the rear kick
+    assert v["ok"], v["reasons"]
+
+
+# ── novel-task non-degeneracy: vacuous-pass selectivity probe ─────────
+# A SELECTIVE novel-task metric (no behavior family) that the fixed archetype
+# battery cannot represent — e.g. toe-touch / squat gated on a pelvis DIP-AND-
+# RETURN no archetype performs — used to be false-rejected as "near-constant"
+# (every archetype 0.0), leaving the run blind. The selectivity probe rescues it.
+TOE_TOUCH_NOVEL = '''import numpy as np
+REQUIRED_JOINT_ROLES = ["left_hip_pitch", "right_hip_pitch", "left_knee", "right_knee"]
+def compute_spec(arrays, behavior, meta):
+    jp = arrays.get("joint_pos"); root = arrays.get("root_link_pos_w")
+    pg = arrays.get("projected_gravity_b")
+    if jp is None or root is None or pg is None:
+        return {"spec_score": 0.0}
+    roles = (meta or {}).get("joint_roles", {}) or {}
+    idx = [roles[r] for r in ("left_hip_pitch", "right_hip_pitch", "left_knee", "right_knee") if r in roles]
+    if not idx:
+        return {"spec_score": 0.0}
+    z = root[..., 2]
+    drop = float(np.mean(z[:5].mean(axis=0) - z.min(axis=0)))               # pelvis dips
+    ret = float(np.mean(np.abs(z[-5:].mean(axis=0) - z[:5].mean(axis=0))))  # and returns
+    rom = float(np.mean(np.max(jp[..., idx], axis=0) - np.min(jp[..., idx], axis=0)))
+    up0 = float(np.mean(pg[:5, ..., 2].mean(axis=0) < -0.85))
+    gate = 1.0
+    gate *= 1.0 if drop > 0.20 else 0.0
+    gate *= 1.0 if ret < 0.08 else 0.0
+    gate *= 1.0 if up0 > 0.7 else 0.0
+    amp = float(np.clip(rom / 1.2, 0.0, 1.0))
+    return {"spec_score": float(np.clip(gate * amp, 0.0, 1.0))}
+'''
+
+ALL_ZERO = '''def compute_spec(arrays, behavior, meta):
+    return {"spec_score": 0.0}
+'''
+
+
+def test_validate_novel_selective_metric_passes_vacuously(tmp_path):
+    """A correct novel-task metric (toe-touch, gated on a pelvis dip-and-return)
+    scores EVERY fixed archetype ~0 because none performs the goal. It must still
+    PASS — vacuously — because it is selective on the goal-agnostic probe, instead
+    of being false-rejected as 'near-constant' (which leaves the run blind)."""
+    p = _write(tmp_path, "toe.py", TOE_TOUCH_NOVEL)
+    v = validate_generated_metric(
+        TOE_TOUCH_NOVEL, p, behavior_goal="touch your toes then stand back up",
+        robot_hint="unitree_g1")
+    assert v["family"] is None                        # genuinely novel (no family)
+    assert all(abs(s) <= 1e-3 for s in v["archetype_scores"].values()), v["archetype_scores"]
+    assert v["gates"]["nondegeneracy"] is True, v["reasons"]
+    assert v["nondegeneracy_vacuous"] is True
+    assert v["ok"], v["reasons"]
+
+
+def test_validate_allzero_rejected_not_vacuous(tmp_path):
+    """The vacuous-pass door does NOT re-open the all-zero hole: a constant-0
+    metric is non-selective on the probe → rejected, and NOT marked vacuous."""
+    p = _write(tmp_path, "zero.py", ALL_ZERO)
+    v = validate_generated_metric(
+        ALL_ZERO, p, behavior_goal="touch your toes then stand back up")
+    assert v["gates"]["nondegeneracy"] is False
+    assert v["nondegeneracy_vacuous"] is False
+    assert not v["ok"]
+    assert any("not selective on the probe" in r for r in v["reasons"]), v["reasons"]
+
+
+def test_validate_family_metric_not_vacuous(tmp_path):
+    """Byte-identical family path: a kick metric resolves a family, its positive
+    archetype lights up, so the battery is informative and the vacuous branch is
+    never entered (nondegeneracy_vacuous stays False)."""
+    p = _write(tmp_path, "kick.py", GOOD_KICK)
+    v = validate_generated_metric(
+        GOOD_KICK, p, behavior_goal="repeatedly kick forward with one leg")
+    assert v["family"] == "kick"
+    assert v["nondegeneracy_vacuous"] is False
+    assert v["ok"], v["reasons"]
+
+
+def test_selectivity_probe_is_deterministic():
+    """The probe is pure-numpy + offline: identical across calls (same discipline
+    as the determinism gate), and a dip-rewarding fn separates competent from
+    degenerate (the property the vacuous pass relies on)."""
+    import numpy as np
+
+    from sculptor.eval.metric_validate import _NAMES_12, _selectivity_probe
+
+    def fn(arrays, behavior, meta):
+        z = arrays["root_link_pos_w"][..., 2]
+        drop = float(np.mean(z[:5].mean(axis=0) - z.min(axis=0)))
+        return {"spec_score": float(np.clip(drop / 0.35, 0.0, 1.0))}
+
+    meta = {"joint_names": list(_NAMES_12)}
+    a = _selectivity_probe(fn, meta)
+    b = _selectivity_probe(fn, meta)
+    assert a == b                                     # deterministic
+    assert a["competent"] >= 0.1 and a["spread"] >= 0.1   # dip lights up, degenerate ~0
+
+
+def test_resolve_goal_frame_keywords():
+    """§LAW 0: the goal frame resolves direction / support / torso from the NL
+    goal, with SAFE forward+double+upright defaults for a plain kick."""
+    from sculptor.eval.metric_validate import resolve_goal_frame
+
+    assert resolve_goal_frame("repeatedly kick forward with one leg") == {
+        "goal_axis": "+x", "support_mode": "double", "torso_target": "upright"}
+    assert resolve_goal_frame("do a mule kick backward")["goal_axis"] == "-x"
+    assert resolve_goal_frame(
+        "balance on one foot like a flamingo")["support_mode"] == "single"
+    assert resolve_goal_frame("jump as high as you can")["support_mode"] == "flight"
+    assert resolve_goal_frame("do a fancy spin")["goal_axis"] is None
+    assert resolve_goal_frame("do a backflip")["torso_target"] == "horizontal"
+
+
+def test_kick_direction_gate_abstains_for_rearward_goal(tmp_path):
+    """§LAW 0: the rear-kick direction gate fires for a FORWARD kick goal but
+    ABSTAINS for a rearward (mule) kick — so a metric is not false-rejected on
+    direction for a goal whose competent motion IS rearward. A direction-blind
+    metric is the probe: it trips the gate forward, not rearward."""
+    p = _write(tmp_path, "blind.py", DIRECTION_BLIND_KICK)
+    fwd = validate_generated_metric(DIRECTION_BLIND_KICK, p, behavior_goal="kick forward")
+    rear = validate_generated_metric(
+        DIRECTION_BLIND_KICK, p, behavior_goal="do a mule kick backward")
+    assert fwd["goal_frame"]["goal_axis"] == "+x"
+    assert rear["goal_frame"]["goal_axis"] == "-x"
+    assert any("active_kick_behind" in r for r in fwd["reasons"])
+    assert not any("active_kick_behind" in r for r in rear["reasons"])
+
+
 def test_walker_ceiling_skipped_for_locomotion(tmp_path):
     """The walker ceiling is scoped to stationary skills — a locomotion metric
     (for which a walker IS the target) is NOT rejected by it."""
@@ -433,7 +627,9 @@ class _Parsed:
 
 
 class _Messages:
-    def __init__(self, src, approved): self._src = src; self._approved = approved; self.creates = 0
+    def __init__(self, src, approved, gaming_exploit=""):
+        self._src = src; self._approved = approved
+        self._gaming_exploit = gaming_exploit; self.creates = 0
     def create(self, **kw):
         self.creates += 1
         return _Resp("```python\n" + self._src + "\n```")
@@ -441,11 +637,12 @@ class _Messages:
         from sculptor.eval.metric_gen import MetricReview
         return _Parsed(MetricReview(approved=self._approved,
                                     concerns=[] if self._approved else ["gameable"],
-                                    summary="x"))
+                                    summary="x", gaming_exploit=self._gaming_exploit))
 
 
 class _FakeClient:
-    def __init__(self, src, approved=True): self.messages = _Messages(src, approved)
+    def __init__(self, src, approved=True, gaming_exploit=""):
+        self.messages = _Messages(src, approved, gaming_exploit)
 
 
 def test_generate_objective_metric_accepts_good(tmp_path):
@@ -475,6 +672,22 @@ def test_generate_objective_metric_review_can_veto(tmp_path):
         "trot forward", tmp_path / "m3",
         client=_FakeClient(GOOD, approved=False), max_attempts=1)
     assert rec["validation_passed"] and not rec["accepted"]
+
+
+def test_single_review_named_exploit_forces_reject(tmp_path):
+    """§LAW 9: on the PRODUCTION single-reviewer path (review_models unset — what
+    sculptor_bridge / the CLI actually use), a reviewer that NAMES a gaming_exploit
+    yet returns approved=True is coerced to a reject, just like the panel path. The
+    'named exploit but approved' contradiction must not slip through on the path
+    every production caller takes."""
+    from sculptor.eval.metric_gen import generate_objective_metric
+    rec = generate_objective_metric(
+        "trot forward", tmp_path / "se",
+        client=_FakeClient(GOOD, approved=True, gaming_exploit="stand and flail"),
+        max_attempts=1)
+    assert rec["validation_passed"] and not rec["accepted"]
+    assert not rec["review"]["approved"]
+    assert any("stand and flail" in c for c in rec["review"]["concerns"])
 
 
 def test_generate_emits_progress_events(tmp_path):
@@ -507,6 +720,387 @@ def test_generate_emits_regenerating_on_validation_failure(tmp_path):
     assert "regenerating" in stages
     assert "reviewing" not in stages             # never passed validation
     assert stages[-1] == "done" and events[-1]["accepted"] is False
+
+
+# ── §best-of-N: sample N candidates, select the most-discriminating valid one ──
+# Opt-in n_candidates>1 samples N candidates and selects the most-discriminating
+# VALID one via the OFFLINE graded discriminator; default 1 is byte-identical.
+
+# A binary "did the pelvis dip" metric: passes validation (selective on the probe)
+# but does NOT grade — every competent rung scores 1.0, so its discrimination is
+# LOWER than a smoothly-grading toe-touch (no monotonic separation across rungs).
+COARSE_DIP = '''import numpy as np
+def compute_spec(arrays, behavior, meta):
+    root = arrays.get("root_link_pos_w")
+    if root is None:
+        return {"spec_score": 0.0}
+    z = root[..., 2]; drop = float(np.mean(z[:6].mean(0) - z.min(0)))
+    return {"spec_score": 1.0 if drop > 0.20 else 0.0}
+'''
+
+
+class _CycleMessages:
+    """Serves a different source per .create call (best-of-N) and records the
+    temperatures; the reviewer always approves."""
+
+    def __init__(self, srcs):
+        self._srcs = list(srcs); self.creates = 0; self.temps = []
+
+    def create(self, **kw):
+        self.temps.append(kw.get("temperature"))
+        src = self._srcs[self.creates % len(self._srcs)]; self.creates += 1
+        return _Resp("```python\n" + src + "\n```")
+
+    def parse(self, **kw):
+        from sculptor.eval.metric_gen import MetricReview
+        return _Parsed(MetricReview(approved=True, concerns=[], summary="ok"))
+
+
+class _CycleClient:
+    def __init__(self, *srcs): self.messages = _CycleMessages(srcs)
+
+
+def test_best_of_n_selects_most_discriminating(tmp_path):
+    """KEYSTONE: COARSE (binary dip, low discrimination) is sampled FIRST and a
+    smoothly-grading toe-touch (high discrimination) SECOND — best-of-N selects the
+    SECOND, proving it ranks by the offline discriminator, not first-valid."""
+    from sculptor.eval.metric_gen import generate_objective_metric
+    out = tmp_path / "bon"
+    client = _CycleClient(COARSE_DIP, TOE_TOUCH_NOVEL)
+    rec = generate_objective_metric(
+        "touch your toes then stand back up", out, robot_hint="unitree_g1",
+        client=client, n_candidates=2)
+    assert rec["accepted"] and rec["selected_candidate"] == 1
+    assert (out / "metric.py").read_text().strip() == TOE_TOUCH_NOVEL.strip()
+    discs = {c["candidate"]: c.get("discrimination") for c in rec["candidates"]}
+    assert discs[1] > discs[0]                    # the selected one is more discriminating
+    assert client.messages.temps == [0.7, 0.9]    # decorrelated across candidates
+    assert not list(out.glob("candidate_*.py"))   # non-winner files cleaned up
+
+
+def test_best_of_n_ties_keep_first_valid(tmp_path):
+    """Equal discrimination → the FIRST valid candidate (lowest index) wins, preserving
+    today's first-valid behavior."""
+    from sculptor.eval.metric_gen import generate_objective_metric
+    out = tmp_path / "tie"
+    client = _CycleClient(TOE_TOUCH_NOVEL, TOE_TOUCH_NOVEL)
+    rec = generate_objective_metric(
+        "touch your toes then stand back up", out, robot_hint="unitree_g1",
+        client=client, n_candidates=2)
+    assert rec["accepted"] and rec["selected_candidate"] == 0
+
+
+def test_n_candidates_one_is_byte_identical(tmp_path):
+    """Default n_candidates=1 → the unchanged single-shot path: one author call, no
+    candidate records, no selection (the only diff is three inert record keys)."""
+    from sculptor.eval.metric_gen import generate_objective_metric
+    out = tmp_path / "one"
+    client = _FakeClient(GOOD, approved=True)
+    rec = generate_objective_metric("trot forward", out, client=client,
+                                    n_candidates=1, max_attempts=2)
+    assert rec["accepted"]
+    assert rec["candidates"] is None and rec["selected_candidate"] is None
+    assert rec["n_candidates"] == 1
+    assert client.messages.creates == 1
+
+
+def test_best_of_n_all_invalid_rejects(tmp_path):
+    """All N candidates fail validation → not accepted, run stays blind (no metric can
+    steer), as the single path. Each candidate failure is recorded and metric.py is
+    still written (the contract)."""
+    from sculptor.eval.metric_gen import generate_objective_metric
+    out = tmp_path / "bad"
+    client = _CycleClient(REWARDS_STILLNESS, REWARDS_STILLNESS, REWARDS_STILLNESS)
+    rec = generate_objective_metric("trot forward", out, robot_hint="go1",
+                                    client=client, n_candidates=3)
+    assert not rec["accepted"] and not rec["validation_passed"]
+    assert rec["selected_candidate"] is None
+    assert len(rec["candidates"]) == 3 and all(not c["ok"] for c in rec["candidates"])
+    assert (out / "metric.py").is_file()
+    assert not list(out.glob("candidate_*.py"))   # cleaned up even on all-invalid
+
+
+def test_graded_discrimination_ranks_and_is_deterministic():
+    """The offline selector: a SHARP, smoothly-grading metric out-scores a COARSE
+    binary one and a degenerate one, and is byte-deterministic across calls (it must
+    add no nondeterminism to selection)."""
+    import numpy as np
+
+    from sculptor.eval.generated_metric import inject_joint_roles
+    from sculptor.eval.metric_validate import _NAMES_12, graded_discrimination
+
+    def _disc(src):
+        ns: dict = {}; exec(src, ns)
+        meta = {"joint_names": list(_NAMES_12)}
+        inject_joint_roles(meta, ["left_hip_pitch", "right_hip_pitch",
+                                  "left_knee", "right_knee"], lenient=True)
+        return graded_discrimination(ns["compute_spec"], meta)
+
+    sharp = _disc(TOE_TOUCH_NOVEL)
+    coarse = _disc(COARSE_DIP)
+    zero = _disc("def compute_spec(a, b, m): return {'spec_score': 0.0}\n")
+    still = _disc("import numpy as np\ndef compute_spec(a, b, m):\n"
+                  "    jv = a.get('joint_vel')\n"
+                  "    if jv is None: return {'spec_score': 0.0}\n"
+                  "    return {'spec_score': float(np.exp(-np.mean(np.abs(jv)) / 0.1))}\n")
+    assert sharp["score"] > coarse["score"] > zero["score"]
+    assert still["score"] < zero["score"]         # a stillness-rewarder is anti-graded
+    assert sharp["fold_axis"]["monotonicity"] == 1.0
+    assert _disc(TOE_TOUCH_NOVEL) == sharp        # deterministic
+
+
+def test_graded_discrimination_is_amplitude_invariant():
+    """The selector clamps spec_score to its [0,1] contract, so a high-AMPLITUDE coarse
+    metric (a binary gate returning 5.0) saturates to [1,1,1] and CANNOT out-rank a
+    smooth monotone grader on raw output scale — amplitude is an author artifact, not
+    discrimination (the review's confirmed mis-rank)."""
+    import numpy as np
+
+    from sculptor.eval.generated_metric import inject_joint_roles
+    from sculptor.eval.metric_validate import _NAMES_12, graded_discrimination
+
+    def _disc(src):
+        ns: dict = {}; exec(src, ns)
+        meta = {"joint_names": list(_NAMES_12)}
+        inject_joint_roles(meta, ["left_hip_pitch", "right_hip_pitch",
+                                  "left_knee", "right_knee"], lenient=True)
+        return graded_discrimination(ns["compute_spec"], meta)
+
+    big_binary = _disc("import numpy as np\ndef compute_spec(a, b, m):\n"
+                       "    root = a.get('root_link_pos_w')\n"
+                       "    if root is None: return {'spec_score': 0.0}\n"
+                       "    z = root[..., 2]; drop = float(np.mean(z[:6].mean(0) - z.min(0)))\n"
+                       "    return {'spec_score': 5.0 if drop > 0.2 else 0.0}\n")
+    smooth = _disc(TOE_TOUCH_NOVEL)
+    assert big_binary["fold_axis"]["separation"] <= 1.0     # clamped to the contract
+    assert big_binary["fold_axis"]["monotonicity"] == 0.0   # binary → saturates, no grading
+    assert smooth["score"] > big_binary["score"]            # smooth monotone wins
+
+
+# ── §Ship 55 (LAW 9): VLM metric-review Panel A ───────────────────────────
+# A diversified, blinded, multi-model review panel. The mock routes each
+# (model, lens) to a configured verdict and records (model, system, messages)
+# so the tests can assert blinding + image use without any network call.
+
+
+def _sys_text(system) -> str:
+    if isinstance(system, str):
+        return system
+    return "\n".join(b.get("text", "") for b in (system or []) if isinstance(b, dict))
+
+
+def _msgs_text(messages) -> str:
+    out = []
+    for m in messages or []:
+        c = m.get("content")
+        if isinstance(c, str):
+            out.append(c)
+        elif isinstance(c, list):
+            out += [b.get("text", "") for b in c if isinstance(b, dict) and b.get("type") == "text"]
+    return "\n".join(out)
+
+
+def _detect_lens(system) -> str | None:
+    from sculptor.eval.metric_gen import _LENSES
+    t = _sys_text(system)
+    for lens, appendix in _LENSES.items():
+        if appendix and appendix in t:
+            return lens
+    return None
+
+
+def _has_image(messages) -> bool:
+    for m in messages or []:
+        c = m.get("content")
+        if isinstance(c, list) and any(
+                isinstance(b, dict) and b.get("type") == "image" for b in c):
+            return True
+    return False
+
+
+class _PanelMessages:
+    """`verdicts`: lens -> {approved, concerns, summary, gaming_exploit} or
+    {"raise": True}; "*" is the default. Records every parse call."""
+
+    def __init__(self, src, verdicts):
+        self.src = src; self.verdicts = verdicts; self.calls = []; self.creates = 0
+
+    def create(self, **kw):
+        self.creates += 1
+        return _Resp("```python\n" + self.src + "\n```")
+
+    def parse(self, **kw):
+        from sculptor.eval.metric_gen import MetricReview
+        lens = _detect_lens(kw.get("system"))
+        self.calls.append({"model": kw.get("model", ""), "lens": lens,
+                           "system": _sys_text(kw.get("system")),
+                           "messages": kw.get("messages"),
+                           "has_image": _has_image(kw.get("messages"))})
+        spec = self.verdicts.get(lens, self.verdicts.get("*", {"approved": True}))
+        if spec.get("raise"):
+            raise RuntimeError("reviewer api down")
+        return _Parsed(MetricReview(
+            approved=spec.get("approved", True), concerns=spec.get("concerns", []),
+            summary=spec.get("summary", "x"), gaming_exploit=spec.get("gaming_exploit", "")))
+
+
+class _PanelClient:
+    def __init__(self, src, verdicts): self.messages = _PanelMessages(src, verdicts)
+
+
+def _PANEL_MODELS():
+    import sculptor.eval.metric_gen as mg
+    return list(mg.REVIEW_PANEL_MODELS)
+
+
+def test_reviewers_exclude_author():
+    import sculptor.eval.metric_gen as mg
+    r = mg._reviewers_from_models(list(mg.REVIEW_PANEL_MODELS), "claude-opus-4-8")
+    assert all(m != "claude-opus-4-8" for m, _ in r)
+    assert len(r) == len(mg._LENS_ORDER)
+
+
+def test_panel_dispatch_is_byte_identical_on_default(tmp_path, monkeypatch):
+    """review_models=None → the single _review_metric runs and the panel never
+    does; a list flips it. Pins the dispatch so a panel can't silently fire on the
+    default path."""
+    import sculptor.eval.metric_gen as mg
+    calls = {"single": 0, "panel": 0}
+    real_single, real_panel = mg._review_metric, mg._review_metric_panel
+    monkeypatch.setattr(mg, "_review_metric",
+                        lambda *a, **k: (calls.__setitem__("single", calls["single"] + 1)
+                                         or real_single(*a, **k)))
+    monkeypatch.setattr(mg, "_review_metric_panel",
+                        lambda *a, **k: (calls.__setitem__("panel", calls["panel"] + 1)
+                                         or real_panel(*a, **k)))
+    mg.generate_objective_metric("trot forward", tmp_path / "a",
+                                 client=_FakeClient(GOOD, approved=True), max_attempts=1)
+    assert calls == {"single": 1, "panel": 0}
+    mg.generate_objective_metric("trot forward", tmp_path / "b",
+                                 client=_PanelClient(GOOD, {"*": {"approved": True}}),
+                                 review_models=_PANEL_MODELS(), max_attempts=1)
+    assert calls == {"single": 1, "panel": 1}
+
+
+def test_panel_review_out_keys_exact_both_paths(tmp_path):
+    """The aggregate `review` stays EXACTLY {approved,concerns,summary} (the UI
+    contract); panel provenance lives in the separate `review_panel`."""
+    import sculptor.eval.metric_gen as mg
+    rec1 = mg.generate_objective_metric("trot forward", tmp_path / "s",
+                                        client=_FakeClient(GOOD, approved=True), max_attempts=1)
+    assert set(rec1["review"]) == {"approved", "concerns", "summary"}
+    assert rec1["review_panel"] is None
+    rec2 = mg.generate_objective_metric("trot forward", tmp_path / "p",
+                                        client=_PanelClient(GOOD, {"*": {"approved": True}}),
+                                        review_models=_PANEL_MODELS(), max_attempts=1)
+    assert set(rec2["review"]) == {"approved", "concerns", "summary"}
+    assert rec2["accepted"] and rec2["review"]["approved"]
+    assert rec2["review_panel"]["panel"] and "veto_by" in rec2["review_panel"]
+
+
+def test_panel_one_lens_veto_rejects(tmp_path):
+    """Asymmetric veto: a single rejecting lens sinks the metric, and the
+    (model, lens) is named in review.concerns (never-silent)."""
+    import sculptor.eval.metric_gen as mg
+    rec = mg.generate_objective_metric(
+        "trot forward", tmp_path / "v",
+        client=_PanelClient(GOOD, {"consistency": {"approved": False, "concerns": ["weighted sum"]},
+                                   "*": {"approved": True}}),
+        review_models=_PANEL_MODELS(), max_attempts=1)
+    assert not rec["accepted"] and not rec["review"]["approved"]
+    assert any("veto" in c and "consistency" in c for c in rec["review"]["concerns"])
+    assert rec["review_panel"]["veto_by"]
+
+
+def test_panel_named_exploit_forces_reject(tmp_path):
+    """A non-empty gaming_exploit forces a reject even if the reviewer returned
+    approved=True — a 'named exploit but approved' contradiction can't slip through."""
+    import sculptor.eval.metric_gen as mg
+    rec = mg.generate_objective_metric(
+        "trot forward", tmp_path / "x",
+        client=_PanelClient(GOOD, {"completeness": {"approved": True,
+                                                    "gaming_exploit": "stand and flail"},
+                                   "*": {"approved": True}}),
+        review_models=_PANEL_MODELS(), max_attempts=1)
+    assert not rec["accepted"]
+    assert any("stand and flail" in c for c in rec["review"]["concerns"])
+
+
+def test_panel_all_crash_is_not_approved(tmp_path):
+    """All reviewers crash → fail-closed overall (n_approve 0 < quorum) → rejected,
+    with the inconclusive/quorum reason surfaced."""
+    import sculptor.eval.metric_gen as mg
+    rec = mg.generate_objective_metric("trot forward", tmp_path / "c",
+                                       client=_PanelClient(GOOD, {"*": {"raise": True}}),
+                                       review_models=_PANEL_MODELS(), max_attempts=1)
+    assert not rec["accepted"] and not rec["review"]["approved"]
+    assert any("quorum" in c or "inconclusive" in c for c in rec["review"]["concerns"])
+
+
+def test_panel_thin_survivor_is_not_approved(tmp_path):
+    """The quorum FLOOR: 3 of 4 text lenses crash, 1 approves → 1 < ceil(4/2)=2 →
+    NOT approved. A lone survivor cannot carry the panel."""
+    import sculptor.eval.metric_gen as mg
+    rec = mg.generate_objective_metric(
+        "trot forward", tmp_path / "thin",
+        client=_PanelClient(GOOD, {"completeness": {"approved": True}, "*": {"raise": True}}),
+        review_models=_PANEL_MODELS(), max_attempts=1)
+    assert not rec["accepted"]
+
+
+def test_panel_vlm_lens_skips_without_keyframes(tmp_path):
+    """At metric-gen there are no keyframes → the VLM (naturalness) lens SKIPS,
+    makes no call, and is excluded from the eligible quorum count."""
+    import sculptor.eval.metric_gen as mg
+    client = _PanelClient(GOOD, {"*": {"approved": True}})
+    rec = mg.generate_objective_metric("trot forward", tmp_path / "noimg",
+                                       client=client, review_models=_PANEL_MODELS(),
+                                       max_attempts=1)
+    panel = rec["review_panel"]["panel"]
+    nat = next(p for p in panel if p["lens"] == "naturalness")
+    assert nat["status"] == "skip"
+    assert rec["review_panel"]["n_eligible"] == 4
+    assert not any(c["lens"] == "naturalness" for c in client.messages.calls)
+
+
+def test_panel_vlm_lens_uses_images_with_keyframes(tmp_path):
+    """When keyframes ARE passed (the future post-rollout re-review), the VLM lens
+    encodes them into image content blocks and votes — the headline VLM feature."""
+    import sculptor.eval.metric_gen as mg
+    kfs = []
+    for i in range(2):
+        p = tmp_path / f"kf{i}.png"
+        p.write_bytes(b"\x89PNG\r\n\x1a\n" + bytes(8))
+        kfs.append(p)
+    client = _PanelClient(GOOD, {"*": {"approved": True}})
+    rec = mg.generate_objective_metric("trot forward", tmp_path / "vlm", client=client,
+                                       review_models=_PANEL_MODELS(), review_keyframes=kfs,
+                                       max_attempts=1)
+    assert rec["accepted"]
+    nat = [c for c in client.messages.calls if c["lens"] == "naturalness"]
+    assert nat and nat[0]["has_image"]
+    statuses = {p["lens"]: p["status"] for p in rec["review_panel"]["panel"]}
+    assert statuses["naturalness"] == "approved"
+    assert rec["review_panel"]["n_eligible"] == 5     # the VLM lens now counts
+
+
+def test_panel_blinding_author_excluded_and_absent(tmp_path):
+    """Blinding: the author model id is never a reviewer model, and never appears
+    in any reviewer's system or user payload. Uses an author that IS in the pool
+    (claude-opus-4-8) so the exclusion path is genuinely exercised (not vacuous)."""
+    import sculptor.eval.metric_gen as mg
+    author = "claude-opus-4-8"
+    assert author in mg.REVIEW_PANEL_MODELS              # the exclusion must do real work
+    client = _PanelClient(GOOD, {"*": {"approved": True}})
+    mg.generate_objective_metric("trot forward", tmp_path / "blind", client=client,
+                                 model=author, review_models=_PANEL_MODELS(), max_attempts=1)
+    assert client.messages.calls
+    used_models = {c["model"] for c in client.messages.calls}
+    assert author not in used_models                     # excluded from the roster
+    assert used_models <= set(mg.REVIEW_PANEL_MODELS) - {author}
+    for c in client.messages.calls:
+        assert author not in c["system"]
+        assert author not in _msgs_text(c["messages"])
 
 
 def test_calibration_good_metric_correlates(tmp_path):

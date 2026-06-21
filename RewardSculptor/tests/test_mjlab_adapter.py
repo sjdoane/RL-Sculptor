@@ -88,6 +88,52 @@ def test_mjlab_g1_state_schema_differs_from_go1() -> None:
     assert g1.reward_contract().state_schema != go1.reward_contract().state_schema
 
 
+def test_enforce_actuator_limits_swaps_to_dcmotor_with_real_velocity_limits(monkeypatch) -> None:
+    """§actuator-limit enforcement: RS_ENFORCE_ACTUATOR_LIMITS=1 swaps every
+    BuiltinPositionActuatorCfg → DcMotorActuatorCfg carrying the robot's REAL motor
+    no-load speed (G1 knee 20, Go1 calf 20.06), so the sim enforces velocity, not
+    just torque. Flag OFF is a no-op (existing runs bit-identical); an unknown
+    joint pattern is left unchanged (never invents a limit). Config-only — no GPU."""
+    pytest.importorskip("mjlab")
+    from mjlab.actuator import BuiltinPositionActuatorCfg, DcMotorActuatorCfg
+    from mjlab.tasks.registry import load_env_cfg
+
+    from sculptor.adapters._mjlab_runner import (
+        _enforce_actuator_limits,
+        _recover_velocity_limit,
+    )
+
+    def _acts(cfg):
+        return list(cfg.scene.entities["robot"].articulation.actuators)
+
+    # flag explicitly OFF → byte-identical no-op (default is now ON, so set "0")
+    monkeypatch.setenv("RS_ENFORCE_ACTUATOR_LIMITS", "0")
+    g1_off = load_env_cfg("Mjlab-Velocity-Flat-Unitree-G1")
+    _enforce_actuator_limits(g1_off)
+    assert all(isinstance(a, BuiltinPositionActuatorCfg) for a in _acts(g1_off))
+
+    # default (unset) is ON → all groups swapped, real velocity_limits, fields preserved
+    monkeypatch.delenv("RS_ENFORCE_ACTUATOR_LIMITS", raising=False)
+    g1 = load_env_cfg("Mjlab-Velocity-Flat-Unitree-G1")
+    _enforce_actuator_limits(g1)
+    g1a = _acts(g1)
+    assert g1a and all(isinstance(a, DcMotorActuatorCfg) for a in g1a)
+    knee = next(a for a in g1a if any("knee" in p for p in a.target_names_expr))
+    assert knee.velocity_limit == 20.0
+    assert knee.effort_limit == 139.0 and knee.saturation_effort == 139.0
+
+    go1 = load_env_cfg("Mjlab-Velocity-Flat-Unitree-Go1")
+    _enforce_actuator_limits(go1)
+    calf = next(a for a in _acts(go1) if any("calf" in p for p in a.target_names_expr))
+    assert isinstance(calf, DcMotorActuatorCfg) and calf.velocity_limit == 20.06
+
+    # unknown joint pattern → no recoverable limit (caller leaves it unchanged)
+    class _Fake:
+        target_names_expr = (".*_mystery_joint",)
+
+    assert _recover_velocity_limit(_Fake()) is None
+
+
 # ── §Ship 46: per-foot kick channels in the G1 info contract ───────────────
 def test_info_keys_for_task_adds_foot_channels_for_g1_only() -> None:
     """`_info_keys_for_task` is a pure function (no mjlab import): G1 gets

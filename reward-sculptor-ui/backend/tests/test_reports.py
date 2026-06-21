@@ -7,6 +7,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import numpy as np
 from fastapi.testclient import TestClient
 
 
@@ -74,6 +75,48 @@ def test_mission_quality_corrupt_file_is_empty_not_500(
     r = client.get(f"/projects/{slug}/reports/mission-quality")
     assert r.status_code == 200
     assert r.json() == {"schema": 1, "missions": []}
+
+
+# ── §reports: actuator-limits route ───────────────────────────────────
+
+
+def test_actuator_limits_empty_when_no_rollouts(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    slug = _make_project_with_library(client, "ActEmpty")
+    r = client.get(f"/projects/{slug}/reports/actuator-limits")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] is False and body["available_iters"] == [] and body["motors"] == []
+
+
+def test_actuator_limits_with_rollout(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    slug = _make_project_with_library(client, "ActData")
+    rd = tmp_projects_root / slug / "runs" / "iter_0" / "rollout"
+    rd.mkdir(parents=True, exist_ok=True)
+    T, E = 12, 4
+    jv = np.zeros((T, E, 2)); jt = np.zeros((T, E, 2))
+    jv[..., 0] = 10.0; jt[..., 0] = 100.0     # knee 10/20=50%, 100/139≈72%
+    jv[..., 1] = 5.0; jt[..., 1] = 20.0
+    np.savez(rd / "trajectory.npz", joint_vel=jv, joint_torque=jt,
+             projected_gravity_b=np.zeros((T, E, 3)))
+    (rd / "mjcf_limits.json").write_text(
+        json.dumps({"joint_names": ["left_knee_joint", "left_ankle_pitch_joint"]}))
+
+    r = client.get(f"/projects/{slug}/reports/actuator-limits")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ok"] and body["has_torque"] and body["iter"] == 0
+    assert body["available_iters"] == [0] and len(body["motors"]) == 2
+    knee = next(m for m in body["motors"] if m["name"] == "left_knee_joint")
+    assert knee["velocity_limit"] == 20.0 and abs(knee["speed_util_p99"] - 0.5) < 0.02
+
+
+def test_actuator_limits_unknown_project_404(client: TestClient) -> None:
+    r = client.get("/projects/nope-nope/reports/actuator-limits")
+    assert r.status_code == 404
 
 
 def test_mission_quality_unknown_project_404(client: TestClient) -> None:
