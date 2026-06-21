@@ -26,7 +26,11 @@ from sculptor.eval.robot_manifest import robot_joint_names
 from sculptor.prompts import load_prompt
 
 MODEL_ID = "claude-opus-4-7"
-MAX_TOKENS = 8000
+#: §truncation fix: adaptive THINKING shares this budget with the code output, and a
+#: hard metric's think can use 5-8k tokens — at the old 8000 cap that truncated the
+#: code (a confusing downstream "missing compute_spec"). 16000 leaves ample room for
+#: thinking AND a complete metric (observed ~7.3-7.5k total per generation).
+MAX_TOKENS = 16000
 _FENCE_RE = re.compile(r"```(?:[A-Za-z]+)?\s*\n(.*?)```", re.DOTALL)
 
 
@@ -232,6 +236,13 @@ def _sample_source(client: Any, system_prompt: str, user_content: str,
         system=system_prompt,
         messages=[{"role": "user", "content": user_content}],
     )
+    # A max_tokens-truncated response (adaptive thinking ate the budget) yields
+    # INCOMPLETE code — surface it explicitly here so it fails as "truncated", not as
+    # a baffling downstream "missing compute_spec", and so a retry can recover.
+    if getattr(resp, "stop_reason", None) == "max_tokens":
+        raise RuntimeError(
+            f"generation truncated at max_tokens={MAX_TOKENS} — the model's thinking "
+            f"consumed the token budget and the metric code is incomplete")
     chunks = [b.text for b in resp.content if getattr(b, "type", "") == "text"]
     return _strip_code("\n".join(chunks))
 

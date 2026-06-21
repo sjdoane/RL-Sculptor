@@ -339,6 +339,24 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-21 — metric-gen truncation fix: max_tokens 8000→16000 (Sam saw "missing def compute_spec")
+
+- **What**: a generated metric was rejected with `[contract] missing def compute_spec` → run continues blind. Root cause:
+  the generator runs with adaptive **thinking**, which SHARES `max_tokens` with the code output. A hard metric's think
+  uses 5-8k tokens; at the old `MAX_TOKENS=8000` the code got truncated (`stop_reason=max_tokens`) — sometimes mid-body
+  (syntax error), sometimes before the `def` ever emitted (missing `compute_spec`). Observed: a real generation used
+  7452/8000 output tokens — right at the edge, so a slightly longer think tips it over. FIX (`metric_gen.py`):
+  `MAX_TOKENS = 8000 → 16000` (verified accepted; complete code at ~7.3k total, ample headroom). Plus `_sample_source`
+  now raises a CLEAR `truncated at max_tokens` error when `stop_reason == "max_tokens"`, so a (now-rare) truncation
+  surfaces as "truncated" and triggers a retry, instead of a baffling downstream "missing compute_spec".
+- **Why**: this is the same class as the temperature bug — extended thinking interacting badly with a request param. Both
+  made best-of-N (and single-shot) fail in confusing ways.
+- **How**: `MAX_TOKENS` bump is a one-liner; the truncation guard is byte-identical for existing mocks (they have no
+  `stop_reason` attr → `getattr(...) is None`). The feedback fallback (prior entry) + this fix compound: a truncated
+  candidate now retries with the full 16k budget.
+- **Verified**: sculptor `817 → 818 passed, 1 skipped` (+ truncation-detection test; complete-response path unaffected);
+  two live generations at 16k produced complete `compute_spec` (`end_turn`, ~7.3-7.5k tokens). uvicorn restarted, /health 200.
+
 ### 2026-06-21 — best-of-N bugfix: temperature/thinking 400 + feedback fallback (Sam saw "attempt 3/4, all failed")
 
 - **What**: Sam ran best-of-4 at launch and it jumped to "Sampling candidate 3/4" instantly with everything failing. Root

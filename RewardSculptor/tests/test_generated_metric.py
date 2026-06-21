@@ -877,6 +877,37 @@ def test_best_of_n_falls_back_to_feedback_retry(tmp_path):
     assert any("FAILED these validation gates" in u for u in client.messages.users)
 
 
+def test_sample_source_raises_on_max_tokens_truncation():
+    """A max_tokens-truncated response (adaptive thinking ate the budget) raises a CLEAR
+    'truncated' error instead of returning incomplete code that fails downstream as a
+    baffling 'missing compute_spec'. A normal (end_turn) response is unaffected."""
+    import pytest
+
+    from sculptor.eval.metric_gen import _sample_source
+
+    class _Blk:
+        type = "text"; text = "import numpy as np\ndef compute_sp"      # cut off
+
+    class _Truncated:
+        stop_reason = "max_tokens"; content = [_Blk()]
+
+    class _ClientTrunc:
+        messages = type("M", (), {"create": lambda self, **kw: _Truncated()})()
+
+    with pytest.raises(RuntimeError, match="truncated at max_tokens"):
+        _sample_source(_ClientTrunc(), "sys", "user", model="m")
+
+    class _Ok:
+        stop_reason = "end_turn"
+        content = [type("B", (), {"type": "text",
+                   "text": "```python\ndef compute_spec(a, b, m): return {'spec_score': 0.0}\n```"})()]
+
+    class _ClientOk:
+        messages = type("M", (), {"create": lambda self, **kw: _Ok()})()
+
+    assert "def compute_spec" in _sample_source(_ClientOk(), "sys", "user", model="m")
+
+
 def test_graded_discrimination_ranks_and_is_deterministic():
     """The offline selector: a SHARP, smoothly-grading metric out-scores a COARSE
     binary one and a degenerate one, and is byte-deterministic across calls (it must
