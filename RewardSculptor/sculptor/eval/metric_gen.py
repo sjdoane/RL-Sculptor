@@ -118,12 +118,17 @@ def _reviewers_from_models(
 def _review_one(
     client: Any, model: str, lens: str, goal: str, source: str,
     archetype_scores: dict, keyframes: Optional[list] = None,
+    selectivity: Optional[dict] = None,
 ) -> dict[str, Any]:
     """One reviewer (model × lens). Returns
     `{model, lens, status: approved|veto|skip|error, reason, concerns, gaming_exploit}`.
     The VLM lens with no keyframes SKIPS (excluded from quorum). A crashed call is
     `error` (no-evidence — counts against quorum but is NEVER a veto). A non-empty
-    `gaming_exploit` forces a veto even if the model returned approved=True."""
+    `gaming_exploit` forces a veto even if the model returned approved=True.
+
+    `selectivity` (the validate selectivity-probe scores, present only on a NOVEL-goal
+    vacuous pass) is surfaced so the reviewer sees the metric IS selective — otherwise
+    it sees an all-zero fixed battery and wrongly flags "can't confirm not near-constant"."""
     is_vlm = lens == _VLM_LENS
     if is_vlm and not keyframes:
         return {"model": model, "lens": lens, "status": "skip",
@@ -134,9 +139,11 @@ def _review_one(
     system = [{"type": "text", "text": load_prompt("review_objective_metric"),
                "cache_control": {"type": "ephemeral"}},
               {"type": "text", "text": appendix}]
-    payload = json.dumps({"behavior_goal": goal, "metric_source": source,
-                          "archetype_scores": archetype_scores},
-                         indent=2, default=str)
+    pay: dict[str, Any] = {"behavior_goal": goal, "metric_source": source,
+                           "archetype_scores": archetype_scores}
+    if selectivity is not None:
+        pay["selectivity_probe"] = selectivity
+    payload = json.dumps(pay, indent=2, default=str)
     if is_vlm:
         from sculptor.diagnose import _encode_image   # reuse the encoder (LAW 9)
 
@@ -174,6 +181,7 @@ def _review_one(
 def _review_metric_panel(
     client: Any, goal: str, source: str, archetype_scores: dict, *,
     reviewers: list[tuple[str, str]], keyframes: Optional[list] = None,
+    selectivity: Optional[dict] = None,
 ) -> dict[str, Any]:
     """§Ship 55 (LAW 9): a diversified, blinded review PANEL. Each reviewer (model ×
     lens) votes; aggregation is asymmetric-veto with an ABSOLUTE quorum FLOOR:
@@ -189,7 +197,8 @@ def _review_metric_panel(
     `{approved, concerns, summary}` (the byte-stable UI contract) — provenance lives
     in the sibling keys, never nested in `review`. Never-silent: a veto / quorum
     miss names the (model, lens, reason) in `review.concerns`."""
-    panel = [_review_one(client, m, lens, goal, source, archetype_scores, keyframes)
+    panel = [_review_one(client, m, lens, goal, source, archetype_scores, keyframes,
+                         selectivity)
              for (m, lens) in reviewers]
     eligible = [p for p in panel if p["status"] != "skip"]
     n_elig = len(eligible)
@@ -372,14 +381,17 @@ def _best_of_n(
 
 def _review_metric(
     client: Any, model: str, goal: str, source: str,
-    archetype_scores: dict,
+    archetype_scores: dict, selectivity: Optional[dict] = None,
 ) -> dict[str, Any]:
     system_prompt = load_prompt("review_objective_metric")
-    user = json.dumps({
+    pay: dict[str, Any] = {
         "behavior_goal": goal,
         "metric_source": source,
         "archetype_scores": archetype_scores,
-    }, indent=2, default=str)
+    }
+    if selectivity is not None:   # NOVEL-goal vacuous pass: prove selectivity to the reviewer
+        pay["selectivity_probe"] = selectivity
+    user = json.dumps(pay, indent=2, default=str)
     try:
         resp = client.messages.parse(
             model=model,
@@ -543,18 +555,27 @@ def generate_objective_metric(
                                   f"regenerating with the gate feedback…"})
 
         passed = bool(validation and validation["ok"])
-    def _dispatch_review(src: str, archetype_scores: dict, msg: str
+    def _dispatch_review(src: str, val: Optional[dict[str, Any]], msg: str
                          ) -> tuple[dict[str, Any], Optional[dict[str, Any]]]:
         """Run the configured review (VLM Panel A when `review_models`, else the single
-        independent reviewer) on one source. Returns (review, review_panel)."""
+        independent reviewer) on one source. `val` is that candidate's validation record;
+        on a NOVEL-goal vacuous pass its selectivity-probe scores are surfaced to the
+        reviewer (so it doesn't false-flag the all-zero fixed battery as near-constant).
+        Returns (review, review_panel)."""
+        val = val or {}
+        archetype_scores = val.get("archetype_scores", {})
+        selectivity = (val.get("selectivity_probe")
+                       if val.get("nondegeneracy_vacuous") else None)
         _emit({"stage": "reviewing", "max": n_attempts, "message": msg})
         if review_models:
             reviewers = _reviewers_from_models(list(review_models), model)
             panel = _review_metric_panel(
                 client, behavior_goal, src, archetype_scores,
-                reviewers=reviewers, keyframes=review_keyframes)
+                reviewers=reviewers, keyframes=review_keyframes,
+                selectivity=selectivity)
             return panel["review"], {k: v for k, v in panel.items() if k != "review"}
-        return _review_metric(client, model, behavior_goal, src, archetype_scores), None
+        return (_review_metric(client, model, behavior_goal, src, archetype_scores,
+                               selectivity=selectivity), None)
 
     review_out: Optional[dict[str, Any]] = None
     review_panel: Optional[dict[str, Any]] = None
@@ -567,7 +588,7 @@ def generate_objective_metric(
             # sibling passes review. Stops at the first approval (≤ N reviews).
             for k, cand in enumerate(ranked_valid):
                 review_out, review_panel = _dispatch_review(
-                    cand["src"], (cand["val"] or {}).get("archetype_scores", {}),
+                    cand["src"], cand["val"],
                     f"Reviewing candidate {cand['candidate'] + 1} "
                     f"({k + 1}/{len(ranked_valid)} by discrimination)…")
                 if review_out and review_out.get("approved"):
@@ -579,7 +600,7 @@ def generate_objective_metric(
             # stay as the discrimination-winner (already on disk); accepted stays False.
         else:
             review_out, review_panel = _dispatch_review(
-                source, (validation or {}).get("archetype_scores", {}),
+                source, validation,
                 "Passed validation — running independent review…")
 
     accepted = bool(passed and (review_out is None or review_out.get("approved")))
@@ -621,7 +642,7 @@ def generate_objective_metric(
         if not passed:
             break                        # the correction broke validation — stop thrashing
         review_out, review_panel = _dispatch_review(
-            source, validation.get("archetype_scores", {}),
+            source, validation,
             f"Re-reviewing the corrected metric (retry {rev_retry})…")
         accepted = bool(review_out and review_out.get("approved"))
 

@@ -56,6 +56,21 @@ Also confirm the basics: depends only on physical quantities (allowed arrays),
 never on judgment/randomness/unavailable signals; the active positive outscores
 still/fallen; the metric is not near-constant.
 
+## NOVEL GOALS — read the `selectivity_probe` field before judging near-constancy
+
+The `archetype_scores` are a FIXED battery (kick/floss/jump/locomotion positives +
+degenerates). For a NOVEL goal (a toe-touch, squat, bow, wave, sit-to-stand, a
+compound "do A then B") NONE of those archetypes performs the goal, so it is NORMAL
+and CORRECT for the metric to score EVERY fixed archetype ~0 — that is not evidence
+of a near-constant metric. In that case a `selectivity_probe` field is provided:
+deterministic, goal-agnostic competent-vs-degenerate rollouts (a posture dip, a
+forward tilt, an arm gesture, a sequenced compound, vs still/fallen). A
+`selectivity_probe` whose `competent` is well above `degenerate` (a clear spread) is
+POSITIVE proof the metric is selective and NOT near-constant — do NOT reject on
+"no positive archetype shown / can't confirm not near-constant" when the probe
+already shows separation. Judge gameability from the SOURCE as usual; absence of a
+matching fixed positive is not a defect for a novel goal.
+
 Be conservative: when in doubt, do NOT approve, and say exactly what is missing
 or gameable. A wrongly-approved metric silently corrupts the whole optimization,
 so a false approval is far worse than asking for a revision.

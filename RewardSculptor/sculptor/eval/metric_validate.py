@@ -46,6 +46,14 @@ _FORBIDDEN_NAMES = {
     "os", "sys", "subprocess", "socket", "shutil", "pathlib", "Path",
     "importlib", "pickle", "marshal",
 }
+#: Benign dunder ATTRIBUTES a metric may read. `type(e).__name__` — naming an
+#: exception class in a diagnostic — is the exact idiom the never-raise rule (a
+#: try/except wrapper) encourages, and the model emits it constantly; a name STRING
+#: carries no escape vector. The class-traversal dunders (__class__, __bases__,
+#: __subclasses__, __globals__, __dict__, __getattribute__, __code__, …) stay
+#: blocked, and `getattr` is forbidden, so `__name__` cannot be chained to anything
+#: dangerous. (Pre-fix: `type(e).__name__` false-rejected ~most candidates.)
+_ALLOWED_DUNDER_ATTRS = {"__name__"}
 
 T, E, J = 120, 4, 12
 _NAMES_12 = [
@@ -219,7 +227,8 @@ def _ast_safety(source: str) -> list[str]:
             # __builtins__ is in every module namespace without an import
             # and reaches eval/exec).
             problems.append(f"forbidden name: {node.id}")
-        elif isinstance(node, ast.Attribute) and node.attr.startswith("__"):
+        elif (isinstance(node, ast.Attribute) and node.attr.startswith("__")
+                and node.attr not in _ALLOWED_DUNDER_ATTRS):
             problems.append(f"dunder attribute access: {node.attr}")
     return problems
 
@@ -262,19 +271,64 @@ def _is_int_const(node: ast.AST) -> bool:
             and _is_int_const(node.operand))
 
 
+#: The two (T, E, J) joint arrays — the ONLY arrays for which a literal third-axis
+#: index is a hard-coded JOINT column. root_link_pos_w / projected_gravity_b /
+#: *_foot_pos_b are (T, E, 3) — their third axis is x/y/z, NOT a joint.
+_JOINT_ARRAY_KEYS = ("joint_pos", "joint_vel")
+
+
+def _is_joint_array_expr(node: ast.AST, joint_vars: frozenset[str]) -> bool:
+    """True if `node` evaluates to a joint array (joint_pos/joint_vel): the direct
+    `arrays["joint_pos"]` / `arrays.get("joint_pos")` form, or a Name tracked as
+    holding one (`_collect_joint_vars`)."""
+    if (isinstance(node, ast.Subscript) and isinstance(node.value, ast.Name)
+            and node.value.id == "arrays"
+            and isinstance(node.slice, ast.Constant)
+            and node.slice.value in _JOINT_ARRAY_KEYS):
+        return True                                   # arrays["joint_pos"]
+    if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "get"
+            and isinstance(node.func.value, ast.Name) and node.func.value.id == "arrays"
+            and node.args and isinstance(node.args[0], ast.Constant)
+            and node.args[0].value in _JOINT_ARRAY_KEYS):
+        return True                                   # arrays.get("joint_pos")
+    return isinstance(node, ast.Name) and node.id in joint_vars
+
+
+def _collect_joint_vars(tree: ast.AST) -> frozenset[str]:
+    """Variables assigned DIRECTLY from a joint array — `jp = arrays['joint_pos']`,
+    `jv = arrays.get('joint_vel')`. A conservative one-hop tracker; deeper aliasing
+    is the runtime permutation-robustness gate's job."""
+    joint_vars: set[str] = set()
+    for node in ast.walk(tree):
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and _is_joint_array_expr(node.value, frozenset())):
+            joint_vars.add(node.targets[0].id)
+    return frozenset(joint_vars)
+
+
 def _raw_joint_index_violations(source: str) -> list[str]:
-    """§Ship 49: flag a HARD-CODED integer index into a joint axis — the
-    `x[:, :, 0]` form — which silently reads the wrong joint the moment the
-    robot or joint order changes (the §3A failure). Metrics must select
-    joints via name-resolved indices (`meta['joint_roles']`). The Ellipsis
-    form `x[..., 2]` is NOT flagged: that's the convention for the 3-vector
-    gravity/root axes (`projected_gravity_b[..., 2]` = uprightness), which
-    are not joint axes."""
+    """§Ship 49: flag a HARD-CODED integer index into a JOINT axis — the
+    `joint_vel[:, :, 0]` form — which silently reads the wrong joint the moment the
+    robot or joint order changes (the §3A failure). Metrics must select joints via
+    name-resolved indices (`meta['joint_roles']`).
+
+    §<3-vector fix>: ONLY flag `[:, :, N]` when the base is a JOINT array
+    (joint_pos/joint_vel — direct or one-hop-tracked). A 3-vector axis read in the
+    explicit-slice form — `root_link_pos_w[:, :, 2]` (height),
+    `projected_gravity_b[:, :, 2]` (uprightness) — is LEGITIMATE and must NOT be
+    flagged: a model that writes `[:, :, 2]` instead of the ellipsis `[..., 2]` was
+    being false-rejected (observed in real toe-touch/bow generations). The Ellipsis
+    form `[..., N]` is still never statically flagged; the runtime
+    permutation-robustness gate is the semantic backstop for any index-hardcoding
+    this conservative static check misses (e.g. via aliasing)."""
     problems: list[str] = []
     try:
         tree = ast.parse(source)
     except SyntaxError:
         return problems
+    joint_vars = _collect_joint_vars(tree)
     for node in ast.walk(tree):
         if not isinstance(node, ast.Subscript):
             continue
@@ -282,9 +336,10 @@ def _raw_joint_index_violations(source: str) -> list[str]:
         if isinstance(sl, ast.Tuple) and len(sl.elts) == 3 \
                 and isinstance(sl.elts[0], ast.Slice) \
                 and isinstance(sl.elts[1], ast.Slice) \
-                and _is_int_const(sl.elts[2]):
+                and _is_int_const(sl.elts[2]) \
+                and _is_joint_array_expr(node.value, joint_vars):
             problems.append(
-                "hard-coded integer joint index `[:, :, N]` — select joints "
+                "hard-coded integer joint index `joint_*[:, :, N]` — select joints "
                 "by name via meta['joint_roles'], not a literal column")
     return problems
 
@@ -511,6 +566,17 @@ _STATIONARY_FAMILIES = frozenset({"kick", "floss", "jump"})
 _BATTERY_NEAR_ZERO = 1e-3
 
 
+#: The probe's physical timestep (matches `_score`'s behavior dict). joint_vel is
+#: supplied in PHYSICAL rad/s = d(joint_pos)/dt — the runtime + calibration-ladder
+#: convention (the real adapters emit rad/s, and the kick/jump ladders set raw rad/s
+#: bursts). A bare `np.gradient(joint_pos)` is dt× (50×) too small, so a metric that
+#: THRESHOLDS a joint velocity (a wave's arm oscillation, a burst floor, a kick
+#: amplitude) scored ~0 on every probe rollout and was false-rejected; scaling by dt
+#: removes that whole class of false reject. (Pre-fix: a real best-of-4 toe-touch +
+#: arm-wave generation had all 4 candidates rejected this way.)
+_PROBE_DT = 0.02
+
+
 def _selectivity_probe(fn, meta) -> dict[str, float]:
     """Goal-AGNOSTIC selectivity probe: score `fn` on a deterministic, offline
     SET of hand-rolled competent-vs-degenerate rollouts to answer "is this metric
@@ -523,12 +589,21 @@ def _selectivity_probe(fn, meta) -> dict[str, float]:
     Hand-rolled numpy (NOT render_rung — its `base_height_m` is a monotone ramp and
     cannot express a dip-and-return), so this stays deterministic + offline (no LLM,
     no API), preserving the validate hot path. The competent set spans posture axes
-    so an UPRIGHT skill (toe-touch / squat / sit-to-stand / bow / wave / twist via
-    joint ROM) OR a NON-UPRIGHT skill (roll / deep bow / crawl) lights up at least
-    one probe; the degenerate set (still + fallen) is what a degenerate metric
-    (all-zero / still-rewarding / fall-rewarding) cannot be separated from. Returns
-    `{competent, degenerate, spread}` where competent/degenerate are the MAX over
-    each set. Never raises (a probe crash scores 0.0 = no signal)."""
+    AND a gesture + a SEQUENCED compound, so an UPRIGHT posture skill (squat /
+    sit-to-stand), a forward-TILT skill (toe-touch / bow / deep bend), a NON-UPRIGHT
+    skill (roll / crawl), a GESTURE skill (wave / reach / raise-arms), AND a
+    multi-phase compound ("do A then B" — bend-then-wave, whose completion gate
+    needs a distinct second phase after the first returns) each light up at least one
+    probe; the degenerate set (still + fallen) is what a degenerate metric (all-zero
+    / still-rewarding / fall-rewarding) cannot be separated from. The optional foot
+    channels (foot_pos_b / foot_contact, planted) are supplied so a metric that READS
+    them is exercised, not auto-zeroed.
+
+    SAFETY: a metric only reaches this branch when it scored the WHOLE fixed battery
+    — chaotic / upright_flail / active included — ~0, so it is provably NOT a generic
+    motion-magnitude rewarder; the still/fallen anchor is the remaining anti-degeneracy
+    teeth. Returns `{competent, degenerate, spread}` (MAX over each set). Never raises
+    (a probe crash scores 0.0 = no signal)."""
     t = np.arange(T)
     fold = (1.0 - np.cos(2.0 * np.pi * t / T)) / 2.0     # 0→1→0 over the rollout (returns)
     fold_c = fold[:, None, None]                          # broadcast over (E, J)
@@ -538,37 +613,83 @@ def _selectivity_probe(fn, meta) -> dict[str, float]:
         g = np.zeros((T, E, 3)); g[..., 2] = -1.0
         return g
 
-    # C1 — UPRIGHT: full-ROM joint fold + a pelvis V-dip-and-return, stationary.
-    # Lights up any upright posture/ROM skill (toe-touch, squat, sit-to-stand, bow,
-    # wave, twist). joints sweep 0→1.2→0 (ROM 1.2); pelvis dips 0.35 m and returns.
+    def _vel(jp: np.ndarray) -> np.ndarray:
+        return np.gradient(jp, axis=0) / _PROBE_DT       # PHYSICAL rad/s (runtime convention)
+
+    def _feet(d: dict) -> dict:
+        # Supply the optional end-effector channels (planted, stationary feet) so a
+        # metric that reads foot_pos_b / foot_contact WITHOUT a None-guard is exercised
+        # rather than auto-zeroed. Anterior foot displacement ~0 (a fold/wave/bow does
+        # not kick); contact 1.0 (feet on the ground). A metric that abstains on absence
+        # (the contract) is unaffected; one that hard-reads them no longer false-rejects.
+        z = np.zeros((T, E, 3)); c = np.ones((T, E))
+        d["left_foot_pos_b"] = z; d["right_foot_pos_b"] = z.copy()
+        d["left_foot_contact"] = c; d["right_foot_contact"] = c.copy()
+        return d
+
+    # C1 — UPRIGHT pelvis dip-and-return + full-ROM joint fold (squat / sit-to-stand).
+    # joints sweep 0→1.2→0 (ROM 1.2); pelvis dips 0.35 m and returns; torso stays upright.
     jp1 = 1.2 * fold_c * ones
     root1 = np.zeros((T, E, 3)); root1[..., 2] = 0.7 - 0.35 * fold[:, None]
-    c1 = {"joint_pos": jp1, "joint_vel": np.gradient(jp1, axis=0),
-          "projected_gravity_b": _g_upright(), "root_link_pos_w": root1}
+    c1 = _feet({"joint_pos": jp1, "joint_vel": _vel(jp1),
+                "projected_gravity_b": _g_upright(), "root_link_pos_w": root1})
 
-    # C2 — NON-UPRIGHT: a structured posture ARC (gravity tilts away and back) + ROM,
-    # stationary. Lights up a skill whose competent execution leaves upright (roll,
-    # deep bow, crawl, lie-and-rise) — generality beyond upright skills.
+    # C2 — forward TORSO-TILT arc (gravity tilts away and back) + ROM, stationary.
+    # Lights up a toe-touch / bow / deep bend (torso pitches forward then recovers) AND
+    # a skill whose competent execution leaves upright (roll, crawl, lie-and-rise).
     jp2 = 1.0 * fold_c * ones
     g2 = np.zeros((T, E, 3))
     g2[..., 2] = -1.0 + fold[:, None]                     # gz: -1→0→-1 (tilt + recover)
     g2[..., 0] = fold[:, None]                            # gx: 0→1→0
     root2 = np.zeros((T, E, 3)); root2[..., 2] = 0.6
-    c2 = {"joint_pos": jp2, "joint_vel": np.gradient(jp2, axis=0),
-          "projected_gravity_b": g2, "root_link_pos_w": root2}
+    c2 = _feet({"joint_pos": jp2, "joint_vel": _vel(jp2),
+                "projected_gravity_b": g2, "root_link_pos_w": root2})
+
+    # C3 — GESTURE: arms RAISE and OSCILLATE (wave / reach / raise-arms), upright,
+    # stationary. The symmetric single-arc C1/C2 sweep has no sustained raise + repeated
+    # swing, so a gesture metric (raise-amplitude + ≥N direction changes) needs this one.
+    jp3 = np.zeros((T, E, J))
+    raise_env = np.clip(t / (0.2 * T), 0.0, 1.0)          # arms ramp up over the first 20%
+    wave = 0.6 * np.sin(2.0 * np.pi * t / 12.0)           # then oscillate (period 12 frames)
+    for j in (6, 7, 8, 9):                                # shoulders + elbows (synthetic body)
+        jp3[:, :, j] = (raise_env + wave)[:, None]
+    root3 = np.zeros((T, E, 3)); root3[..., 2] = 0.7
+    c3 = _feet({"joint_pos": jp3, "joint_vel": _vel(jp3),
+                "projected_gravity_b": _g_upright(), "root_link_pos_w": root3})
+
+    # C4 — SEQUENCED posture-then-gesture (bend / toe-touch, RECOVER to upright, THEN
+    # wave): a compound "do A then B" goal whose completion gate requires a distinct
+    # second phase AFTER the first returns — which no single-phase probe satisfies.
+    n_bend = max(4, int(0.55 * T))                        # the bend completes in the first 55%
+    barc = np.zeros(T)
+    barc[:n_bend] = (1.0 - np.cos(2.0 * np.pi * np.arange(n_bend) / n_bend)) / 2.0
+    g4 = np.zeros((T, E, 3))
+    g4[..., 0] = barc[:, None]                            # torso tilts forward and recovers
+    g4[..., 2] = -np.sqrt(np.clip(1.0 - barc ** 2, 0.0, 1.0))[:, None]
+    jp4 = np.zeros((T, E, J))
+    for j in (0, 1, 2, 3):                                # hips + knees flex during the bend
+        jp4[:, :, j] = (1.2 * barc)[:, None]
+    n0 = int(0.6 * T)                                     # the gesture starts AFTER the bend returns
+    gest_raise = np.clip((t - n0) / (0.1 * T), 0.0, 1.0)
+    gest = (gest_raise + 0.7 * np.sin(2.0 * np.pi * (t - n0) / 10.0)) * (t >= n0)
+    for j in (6, 7, 8, 9):
+        jp4[:, :, j] = gest[:, None]
+    root4 = np.zeros((T, E, 3)); root4[..., 2] = 0.7 - 0.30 * barc[:, None]
+    c4 = _feet({"joint_pos": jp4, "joint_vel": _vel(jp4),
+                "projected_gravity_b": g4, "root_link_pos_w": root4})
 
     # D1 — STILL: alive-but-frozen upright stance. A still / low-motion-rewarding
     # metric scores this high → no competent-vs-degenerate separation → reject.
     jp0 = np.zeros((T, E, J)); jv0 = np.zeros((T, E, J))
     root_up = np.zeros((T, E, 3)); root_up[..., 2] = 0.7
-    d1 = {"joint_pos": jp0, "joint_vel": jv0,
-          "projected_gravity_b": _g_upright(), "root_link_pos_w": root_up}
+    d1 = _feet({"joint_pos": jp0, "joint_vel": jv0,
+                "projected_gravity_b": _g_upright(), "root_link_pos_w": root_up})
 
     # D2 — FALLEN: toppled + collapsed. A fall-rewarding metric scores this high.
     gf = np.zeros((T, E, 3)); gf[..., 0] = 1.0           # gravity sideways = toppled
     rootf = np.zeros((T, E, 3)); rootf[..., 2] = 0.3
-    d2 = {"joint_pos": jp0, "joint_vel": jv0,
-          "projected_gravity_b": gf, "root_link_pos_w": rootf}
+    d2 = _feet({"joint_pos": jp0, "joint_vel": jv0,
+                "projected_gravity_b": gf, "root_link_pos_w": rootf})
 
     def _s(a) -> float:
         try:
@@ -577,7 +698,7 @@ def _selectivity_probe(fn, meta) -> dict[str, float]:
         except Exception:  # noqa: BLE001 — a probe crash is "no signal", never raises
             return 0.0
 
-    comp = max(_s(c1), _s(c2))
+    comp = max(_s(c1), _s(c2), _s(c3), _s(c4))
     degen = max(_s(d1), _s(d2))
     return {"competent": comp, "degenerate": degen, "spread": comp - degen}
 
@@ -868,9 +989,10 @@ def validate_generated_metric(
 
     nondegen = True
     vacuous = False
+    selectivity: Optional[dict[str, float]] = None
     finite = {k: v for k, v in scores.items() if np.isfinite(v)}
-    # §<novel-task fix>: when the goal resolves to NO family AND every fixed
-    # archetype scores ~0, the fixed battery cannot REPRESENT this goal — a
+    # §<novel-task fix>: when the goal resolves to NO family AND no fixed POSITIVE
+    # archetype represents it, the fixed battery cannot REPRESENT this goal — a
     # SELECTIVE novel metric (e.g. toe-touch, gated on a pelvis dip-and-return no
     # archetype performs) is otherwise false-rejected as "near-constant", and the
     # run continues blind. Defer to a goal-agnostic selectivity probe: pass IFF the
@@ -878,27 +1000,43 @@ def validate_generated_metric(
     # Task-VALIDITY (does it match the goal) is enforced downstream by task-derived
     # calibration; the firewall keeps an uncalibrated metric observe-only, so a
     # vacuous pass never grants steering on its own. Scoped to family is None →
-    # every builtin family keeps the unchanged path (their positive archetype is
+    # every builtin family keeps the unchanged path (its positive archetype is
     # never ~0, so battery_uninformative is False).
+    #
+    # §<vacuous-entry fix>: the trigger keys on the POSITIVE archetypes (~0), NOT
+    # on the whole battery — a metric that scored some NEGATIVE slightly above the
+    # near-zero floor (e.g. a wave metric giving a fast-flail archetype a little
+    # credit) used to be kicked to the normal path, where with all positives ~0 the
+    # "negative ≥ best-positive" check trips on the 0 ≥ 0 tie and false-rejects every
+    # novel goal. To keep the anti-gaming teeth when entering on positives, the fixed
+    # NEGATIVES are FOLDED INTO the probe's degenerate anchor: the metric must beat
+    # the worse of {probe still/fallen, every fixed negative} — so a flail/chaos/fall
+    # rewarder that scores a fixed negative high is still rejected here.
+    pos_finite = [finite[k] for k in positive_keys if k in finite]
+    neg_finite = [finite[k] for k in negative_keys if k in finite]
+    best_pos_battery = max(pos_finite) if pos_finite else 0.0
     battery_uninformative = (
         family is None and len(finite) >= 3
-        and max(finite.values()) <= _BATTERY_NEAR_ZERO)
+        and best_pos_battery <= _BATTERY_NEAR_ZERO)
     if battery_uninformative:
         probe = _selectivity_probe(fn, meta)
-        if probe["competent"] >= spread_min and probe["spread"] >= spread_min:
+        selectivity = probe
+        degen_anchor = max([probe["degenerate"], *neg_finite])
+        if (probe["competent"] >= spread_min
+                and (probe["competent"] - degen_anchor) >= spread_min):
             vacuous = True
             reasons.append(
                 f"[nondegeneracy] vacuous pass: the fixed archetype battery is "
-                f"uninformative for this novel goal (all ≤ {_BATTERY_NEAR_ZERO}), "
+                f"uninformative for this novel goal (no positive > {_BATTERY_NEAR_ZERO}), "
                 f"but the metric IS selective on the goal-agnostic probe (competent "
-                f"{probe['competent']:.3f} vs degenerate {probe['degenerate']:.3f}) "
+                f"{probe['competent']:.3f} vs degenerate {degen_anchor:.3f}) "
                 f"— task-validity deferred to task-derived calibration")
         else:
             nondegen = False
             reasons.append(
                 f"[nondegeneracy] near-constant metric: fixed battery uninformative "
                 f"AND not selective on the probe (competent {probe['competent']:.3f}, "
-                f"degenerate {probe['degenerate']:.3f}) — no signal")
+                f"degenerate {degen_anchor:.3f}) — no signal")
     elif len(finite) < 3:
         nondegen = False
         reasons.append("[nondegeneracy] too few finite archetype scores")
@@ -992,4 +1130,5 @@ def validate_generated_metric(
     return {"ok": ok, "gates": gates, "reasons": reasons,
             "archetype_scores": scores, "family": family,
             "goal_frame": frame, "nondegeneracy_vacuous": vacuous,
+            "selectivity_probe": selectivity,
             "required_roles": required_roles, "axioms": axioms}
