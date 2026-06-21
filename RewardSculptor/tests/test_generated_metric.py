@@ -741,13 +741,16 @@ def compute_spec(arrays, behavior, meta):
 
 class _CycleMessages:
     """Serves a different source per .create call (best-of-N) and records the
-    temperatures; the reviewer always approves."""
+    temperature / thinking / user-prompt of each call; the reviewer always approves."""
 
     def __init__(self, srcs):
-        self._srcs = list(srcs); self.creates = 0; self.temps = []
+        self._srcs = list(srcs); self.creates = 0
+        self.temps: list = []; self.thinking: list = []; self.users: list = []
 
     def create(self, **kw):
         self.temps.append(kw.get("temperature"))
+        self.thinking.append(kw.get("thinking"))
+        self.users.append(kw.get("messages", [{}])[-1].get("content", ""))
         src = self._srcs[self.creates % len(self._srcs)]; self.creates += 1
         return _Resp("```python\n" + src + "\n```")
 
@@ -774,7 +777,13 @@ def test_best_of_n_selects_most_discriminating(tmp_path):
     assert (out / "metric.py").read_text().strip() == TOE_TOUCH_NOVEL.strip()
     discs = {c["candidate"]: c.get("discrimination") for c in rec["candidates"]}
     assert discs[1] > discs[0]                    # the selected one is more discriminating
-    assert client.messages.temps == [0.7, 0.9]    # decorrelated across candidates
+    # REGRESSION: the generator uses extended thinking, which the API rejects for any
+    # temperature != 1.0 (a 400 that fails the call instantly). best-of-N must NOT vary
+    # temperature — it decorrelates by FRAMING. So every candidate uses temp 1.0 with
+    # thinking on, and the per-candidate prompts differ.
+    assert client.messages.temps == [1.0, 1.0]
+    assert all(t == {"type": "adaptive"} for t in client.messages.thinking)
+    assert client.messages.users[0] != client.messages.users[1]   # framing decorrelation
     assert not list(out.glob("candidate_*.py"))   # non-winner files cleaned up
 
 
@@ -818,6 +827,54 @@ def test_best_of_n_all_invalid_rejects(tmp_path):
     assert len(rec["candidates"]) == 3 and all(not c["ok"] for c in rec["candidates"])
     assert (out / "metric.py").is_file()
     assert not list(out.glob("candidate_*.py"))   # cleaned up even on all-invalid
+
+
+def test_best_of_n_all_api_error_surfaces_reason(tmp_path):
+    """When EVERY candidate's generation call fails (e.g. a 400), best-of-N surfaces a
+    SPECIFIC reason (never a silent 'rejected') so the UI shows WHY — the failure mode
+    that masked the temperature/thinking 400 the user hit."""
+    from sculptor.eval.metric_gen import generate_objective_metric
+
+    class _BoomMessages:
+        def create(self, **kw):
+            raise RuntimeError("Error code: 400 - temperature may only be set to 1 "
+                               "when thinking is enabled")
+
+        def parse(self, **kw):
+            from sculptor.eval.metric_gen import MetricReview
+            return _Parsed(MetricReview(approved=True))
+
+    class _BoomClient:
+        def __init__(self): self.messages = _BoomMessages()
+
+    out = tmp_path / "boom"
+    rec = generate_objective_metric("touch your toes then stand back up", out,
+                                    robot_hint="unitree_g1", client=_BoomClient(),
+                                    n_candidates=3)
+    assert not rec["accepted"] and not rec["validation_passed"]
+    assert rec["selected_candidate"] is None
+    reasons = (rec["validation"] or {}).get("reasons") or []
+    assert any("API error" in r and "thinking" in r for r in reasons), reasons
+    assert len(rec["candidates"]) == 3 and all(c.get("api_error") for c in rec["candidates"])
+
+
+def test_best_of_n_falls_back_to_feedback_retry(tmp_path):
+    """best-of-N is NEVER WORSE than single-shot: when all N candidates fail validation,
+    it falls back to the retry-WITH-FEEDBACK loop (seeded with the candidate failures), so
+    a goal the LLM only nails after correction still succeeds — instead of best-of-N
+    trading away the feedback loop for diversity and rejecting."""
+    from sculptor.eval.metric_gen import generate_objective_metric
+    out = tmp_path / "fb"
+    # 2 invalid candidates, then the VALID source the feedback-retry produces.
+    client = _CycleClient(REWARDS_STILLNESS, REWARDS_STILLNESS, GOOD)
+    rec = generate_objective_metric("trot forward", out, robot_hint="go1",
+                                    client=client, n_candidates=2)
+    assert rec["accepted"] and rec["validation_passed"]   # the fallback rescued it
+    assert len(rec["candidates"]) == 2                     # the 2 failed candidates recorded
+    assert rec["selected_candidate"] is None               # no best-of-N winner
+    assert client.messages.creates >= 3                    # 2 candidates + ≥1 fallback
+    # the fallback was SEEDED with the candidate failures (real feedback retry).
+    assert any("FAILED these validation gates" in u for u in client.messages.users)
 
 
 def test_graded_discrimination_ranks_and_is_deterministic():

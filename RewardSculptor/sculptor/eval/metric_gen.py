@@ -223,11 +223,11 @@ def _strip_code(text: str) -> str:
 
 
 def _sample_source(client: Any, system_prompt: str, user_content: str,
-                   *, model: str, temperature: float = 1.0) -> str:
+                   *, model: str) -> str:
     resp = client.messages.create(
         model=model,
         max_tokens=MAX_TOKENS,
-        temperature=temperature,
+        temperature=1.0,
         thinking={"type": "adaptive"},
         system=system_prompt,
         messages=[{"role": "user", "content": user_content}],
@@ -237,11 +237,13 @@ def _sample_source(client: Any, system_prompt: str, user_content: str,
 
 
 # ── §best-of-N: sample N candidates, select the most-discriminating valid one ──
-#: Per-candidate FRAMING nudges (decorrelate the N samples — varied composition
-#: emphasis) and TEMPERATURES. Index 0 is empty/1.0 so a degenerate n_candidates=1
-#: caller would still match the single path; the >1 branch starts at index 0 too but
-#: spans the spread. All produce the SAME contract (compute_spec) — only the angle
-#: differs, so the offline discriminator picks the sharpest grader.
+#: Per-candidate FRAMING nudges (varied composition emphasis) — the ONLY
+#: decorrelation lever. Temperature is NOT varied: the generator runs with extended
+#: THINKING (adaptive), and the Anthropic API rejects any temperature != 1.0 when
+#: thinking is enabled (a 400 that fails the call instantly). So candidates differ by
+#: framing + the model's inherent temp-1.0 stochasticity; all produce the SAME
+#: contract (compute_spec), only the angle differs, so the offline discriminator picks
+#: the sharpest grader. Index 0 is the empty (default) framing.
 _BON_FRAMINGS = (
     "",
     "Variation: make the completion gate as SHARP as possible — a crisp pass/fail "
@@ -251,7 +253,6 @@ _BON_FRAMINGS = (
     "Variation: use the MINIMAL set of channels that fully pin the goal, each "
     "saturating independently, combined as a min (the weakest link gates).",
 )
-_BON_TEMPS = (0.7, 0.9, 1.0, 1.1)
 
 
 def _best_of_n(
@@ -260,7 +261,8 @@ def _best_of_n(
     out_dir: Path, metric_path: Path, n: int, model: str,
     emit: Callable[[dict[str, Any]], None],
 ) -> tuple[bool, str, Optional[dict[str, Any]], list[dict[str, Any]], Optional[int]]:
-    """Sample `n` candidate metrics (varied temperature/framing), validate each, and
+    """Sample `n` candidate metrics (decorrelated by FRAMING — temperature stays 1.0,
+    required by the generator's extended thinking), validate each, and
     select the VALID one with the highest OFFLINE discrimination (`graded_discrimination`);
     ties keep the FIRST valid (lowest index — today's first-valid behavior). All-invalid
     → reject (run stays blind), exactly as the single path. Returns
@@ -276,8 +278,7 @@ def _best_of_n(
               "message": f"Sampling candidate metric {i + 1}/{n} (best-of-{n})…"})
         user = base_user + (f"\n\n{framing}" if framing else "")
         try:
-            src = _sample_source(client, system_prompt, user, model=model,
-                                 temperature=_BON_TEMPS[i % len(_BON_TEMPS)])
+            src = _sample_source(client, system_prompt, user, model=model)
         except Exception as e:  # noqa: BLE001 — one candidate's API failure is not fatal
             cands.append({"candidate": i, "api_error": f"{type(e).__name__}: {e}"})
             continue
@@ -311,10 +312,25 @@ def _best_of_n(
     if not valid:
         # All-invalid → reject (run stays blind). Persist the LAST sampled source to
         # metric.py (mirrors the retry path recording the last attempt) so metric_path
-        # points at a real file, and surface that candidate's validation reasons.
+        # points at a real file. Surface a SPECIFIC reason (never-silent): aggregate
+        # every candidate's API error / validation reasons so the UI shows WHY all N
+        # failed (e.g. a 400 model/auth error) instead of a bare "rejected".
         last = next((c for c in reversed(cands) if "_src" in c), None)
         src = last["_src"] if last else ""
-        val = last.get("_val") if last else None
+        why: list[str] = []
+        for c in cands:
+            if c.get("api_error"):
+                why.append(f"candidate {c['candidate'] + 1}: API error: {c['api_error']}")
+            else:
+                for r in (c.get("reasons") or [])[:2]:
+                    why.append(f"candidate {c['candidate'] + 1}: {r}")
+        if last and last.get("_val"):
+            val: Optional[dict[str, Any]] = {**last["_val"], "reasons": why or last["_val"].get("reasons", [])}
+        else:
+            # every candidate API-errored (no validation ran) — build a minimal record
+            # so the caller/UI still gets the reasons rather than a None.
+            val = {"ok": False, "reasons": why or ["all candidates failed to generate"],
+                   "archetype_scores": {}}
         if src:
             metric_path.write_text(src, encoding="utf-8")
         _cleanup()
@@ -435,26 +451,41 @@ def generate_objective_metric(
 
     candidates: Optional[list[dict[str, Any]]] = None
     selected_candidate: Optional[int] = None
+    passed = False
 
     if n_candidates and n_candidates > 1:
-        # §best-of-N: sample N candidates and select the most-discriminating valid one
-        # (the retry-with-feedback loop is the disjoint n_candidates==1 path below).
+        # §best-of-N: sample N candidates and select the most-discriminating valid one.
         passed, source, validation, candidates, selected_candidate = _best_of_n(
             client, system_prompt, base_user,
             behavior_goal=behavior_goal, robot_hint=robot_hint,
             robot_names=robot_names, out_dir=out_dir, metric_path=metric_path,
             n=n_candidates, model=model, emit=_emit)
-    else:
+        if not passed:
+            # best-of-N samples DIVERSE candidates but does NOT feed validation
+            # failures back; if NONE were valid, fall through to the retry-with-
+            # feedback loop below (seeded with the aggregated candidate reasons) so
+            # best-of-N is NEVER WORSE than single-shot — it adds diversity-selection
+            # on top of correction, instead of trading one for the other.
+            _emit({"stage": "regenerating", "max": n_attempts,
+                   "message": f"All {n_candidates} candidates failed — retrying with "
+                              f"the gate feedback…"})
+
+    # The single-shot-with-feedback retry loop: the only path when n_candidates==1,
+    # AND the fallback when best-of-N found no valid candidate (passed is False).
+    if not passed:
         for attempt in range(n_attempts):
             _emit({"stage": "generating", "attempt": attempt + 1, "max": n_attempts,
                    "message": f"Generating candidate metric "
                               f"(attempt {attempt + 1}/{n_attempts})…"})
             user = base_user
-            if attempt > 0 and validation is not None:
+            # Feed back ANY prior failure's reasons (an earlier attempt OR, when
+            # best-of-N fell through, its aggregated candidate failures). Equivalent
+            # to `attempt > 0` for single-shot (validation is None at attempt 0).
+            if validation is not None and not validation.get("ok"):
                 user = (
                     base_user
                     + "\n\nThe previous attempt FAILED these validation gates:\n"
-                    + json.dumps(validation["reasons"], indent=2)
+                    + json.dumps(validation.get("reasons") or [], indent=2)
                     + "\nFix ALL of them. Output ONLY the corrected module."
                 )
             try:

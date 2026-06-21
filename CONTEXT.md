@@ -339,6 +339,30 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-21 — best-of-N bugfix: temperature/thinking 400 + feedback fallback (Sam saw "attempt 3/4, all failed")
+
+- **What**: Sam ran best-of-4 at launch and it jumped to "Sampling candidate 3/4" instantly with everything failing. Root
+  cause: the generator runs with extended **thinking** (`adaptive`), and the Anthropic API rejects any `temperature != 1.0`
+  when thinking is on (`400: temperature may only be set to 1 when thinking is enabled`). My best-of-N varied temperature
+  (`_BON_TEMPS = 0.7/0.9/1.0/1.1`), so 3 of every 4 candidates 400'd in milliseconds; only the `temp=1.0` candidate ran.
+  FIX (`metric_gen.py`): dropped temperature variation — candidates now decorrelate by **framing only** (`_BON_FRAMINGS`) +
+  the model's inherent temp-1.0 stochasticity; reverted `_sample_source` to a hardcoded `temperature=1.0`. Confirmed live:
+  a real best-of-2 now runs ~190s (2 genuine calls, no `api_error`) instead of <2s of 400s.
+- **Also fixed two things the bug exposed**: (1) NEVER-SILENT — when all candidates fail, `_best_of_n` now aggregates every
+  candidate's API-error / validation reason into the returned `validation.reasons`, so the UI shows WHY (was returning a
+  bare reject). (2) best-of-N had silently DROPPED the retry-WITH-FEEDBACK loop (single-shot retries 3× feeding validation
+  failures back so the LLM self-corrects); best-of-N sampled N independent candidates with no feedback, making it WORSE
+  than single-shot for goals needing correction (e.g. toe-touch — a fresh best-of-2 produced 2 invalid metrics). Now when
+  best-of-N finds no valid candidate it FALLS BACK to the feedback-retry loop, seeded with the aggregated candidate
+  failures — so best-of-N is never worse than single-shot (diversity-selection on top of correction). The feedback
+  condition changed `attempt>0 and validation` → `validation and not ok` (byte-identical for single-shot: validation is
+  None at attempt 0).
+- **Verified**: sculptor `816 → 817 passed, 1 skipped` (+ regression tests: temps==[1.0,1.0]+thinking, framing
+  decorrelation, all-API-error surfaces "thinking" reason, fallback rescues a 2-invalid run); a live best-of-2 runs both
+  candidates (no 400). uvicorn restarted; `/health` 200. NOTE: a fresh toe-touch generation can still land invalid (LLM
+  variance — the L0 probe / non-degeneracy gate is unforgiving); best-of-N + the feedback fallback improve the odds but
+  don't guarantee a valid metric. Separate generation-quality follow-up if it persists.
+
 ### 2026-06-21 — best-of-N wired into the UI (New Run dialog) — both metric-gen surfaces
 
 - **What**: best-of-N was library-only (`n_candidates`); Sam: "everything should always be wired into the UI. That is
