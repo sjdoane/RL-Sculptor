@@ -277,8 +277,10 @@ def _best_of_n(
     select the VALID one with the highest OFFLINE discrimination (`graded_discrimination`);
     ties keep the FIRST valid (lowest index — today's first-valid behavior). All-invalid
     → reject (run stays blind), exactly as the single path. Returns
-    `(passed, source, validation, candidate_records, selected_index)`. Never raises on a
-    bad candidate (an API/validation/score failure is recorded, never fatal)."""
+    `(passed, source, validation, candidate_records, selected_index, ranked_valid)` where
+    `ranked_valid` is the valid candidates (each `{candidate, src, val, discrimination}`)
+    sorted best-first, for the caller's review-in-order. Never raises on a bad candidate
+    (an API/validation/score failure is recorded, never fatal)."""
     from sculptor.eval.metric_validate import discrimination_of_metric
 
     n = max(2, int(n))
@@ -345,17 +347,23 @@ def _best_of_n(
         if src:
             metric_path.write_text(src, encoding="utf-8")
         _cleanup()
-        return False, src, val, clean, None
+        return False, src, val, clean, None, []
 
-    # Highest discrimination; tie → lowest candidate index (first valid).
-    best = max(valid, key=lambda c: (c["discrimination"], -c["candidate"]))
+    # Rank valid candidates by discrimination (tie → lowest candidate index); the top
+    # is the default winner (written to metric.py), and the full RANKED list is returned
+    # so the caller can review them IN ORDER (the offline discriminator can't predict the
+    # LLM reviewer, so a flawed top candidate shouldn't sink the run when a sibling passes).
+    ranked = sorted(valid, key=lambda c: (-c["discrimination"], c["candidate"]))
+    best = ranked[0]
     metric_path.write_text(best["_src"], encoding="utf-8")
     emit({"stage": "selecting", "max": n,
           "message": f"Selected candidate {best['candidate'] + 1}/{n} "
                      f"(discrimination {best['discrimination']:.3f}) of "
                      f"{len(valid)} valid."})
     _cleanup()
-    return True, best["_src"], best["_val"], clean, best["candidate"]
+    ranked_pub = [{"candidate": c["candidate"], "src": c["_src"], "val": c["_val"],
+                   "discrimination": c["discrimination"]} for c in ranked]
+    return True, best["_src"], best["_val"], clean, best["candidate"], ranked_pub
 
 
 def _review_metric(
@@ -462,11 +470,12 @@ def generate_objective_metric(
 
     candidates: Optional[list[dict[str, Any]]] = None
     selected_candidate: Optional[int] = None
+    ranked_valid: list[dict[str, Any]] = []
     passed = False
 
     if n_candidates and n_candidates > 1:
         # §best-of-N: sample N candidates and select the most-discriminating valid one.
-        passed, source, validation, candidates, selected_candidate = _best_of_n(
+        passed, source, validation, candidates, selected_candidate, ranked_valid = _best_of_n(
             client, system_prompt, base_user,
             behavior_goal=behavior_goal, robot_hint=robot_hint,
             robot_names=robot_names, out_dir=out_dir, metric_path=metric_path,
@@ -530,26 +539,44 @@ def generate_objective_metric(
                                   f"regenerating with the gate feedback…"})
 
         passed = bool(validation and validation["ok"])
+    def _dispatch_review(src: str, archetype_scores: dict, msg: str
+                         ) -> tuple[dict[str, Any], Optional[dict[str, Any]]]:
+        """Run the configured review (VLM Panel A when `review_models`, else the single
+        independent reviewer) on one source. Returns (review, review_panel)."""
+        _emit({"stage": "reviewing", "max": n_attempts, "message": msg})
+        if review_models:
+            reviewers = _reviewers_from_models(list(review_models), model)
+            panel = _review_metric_panel(
+                client, behavior_goal, src, archetype_scores,
+                reviewers=reviewers, keyframes=review_keyframes)
+            return panel["review"], {k: v for k, v in panel.items() if k != "review"}
+        return _review_metric(client, model, behavior_goal, src, archetype_scores), None
+
     review_out: Optional[dict[str, Any]] = None
     review_panel: Optional[dict[str, Any]] = None
     if passed and review:
-        archetype_scores = (validation or {}).get("archetype_scores", {})
-        if review_models:
-            # §Ship 55 (LAW 9): VLM Panel A — a diversified, blinded multi-model panel.
-            reviewers = _reviewers_from_models(list(review_models), model)
-            _emit({"stage": "reviewing", "max": n_attempts,
-                   "message": f"Passed validation — running review panel "
-                              f"({len(reviewers)} reviewers)…"})
-            panel = _review_metric_panel(
-                client, behavior_goal, source, archetype_scores,
-                reviewers=reviewers, keyframes=review_keyframes)
-            review_out = panel["review"]                    # exactly {approved,concerns,summary}
-            review_panel = {k: v for k, v in panel.items() if k != "review"}
+        if n_candidates and n_candidates > 1 and len(ranked_valid) > 1:
+            # §best-of-N review-in-order: the OFFLINE discriminator can't predict the LLM
+            # reviewer, so review the valid candidates best-first and accept the FIRST one
+            # the reviewer approves — promoting it to source/validation/metric.py. A flawed
+            # top candidate no longer sinks the run when a slightly less-discriminating
+            # sibling passes review. Stops at the first approval (≤ N reviews).
+            for k, cand in enumerate(ranked_valid):
+                review_out, review_panel = _dispatch_review(
+                    cand["src"], (cand["val"] or {}).get("archetype_scores", {}),
+                    f"Reviewing candidate {cand['candidate'] + 1} "
+                    f"({k + 1}/{len(ranked_valid)} by discrimination)…")
+                if review_out and review_out.get("approved"):
+                    source, validation = cand["src"], cand["val"]
+                    selected_candidate = cand["candidate"]
+                    metric_path.write_text(source, encoding="utf-8")
+                    break
+            # none approved → review_out is the last (rejected) one; source/validation
+            # stay as the discrimination-winner (already on disk); accepted stays False.
         else:
-            _emit({"stage": "reviewing", "max": n_attempts,
-                   "message": "Passed validation — running independent review…"})
-            review_out = _review_metric(
-                client, model, behavior_goal, source, archetype_scores)
+            review_out, review_panel = _dispatch_review(
+                source, (validation or {}).get("archetype_scores", {}),
+                "Passed validation — running independent review…")
 
     accepted = bool(passed and (review_out is None or review_out.get("approved")))
     _emit({"stage": "done", "accepted": accepted,

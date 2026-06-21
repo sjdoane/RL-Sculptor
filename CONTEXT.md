@@ -339,6 +339,25 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-21 — best-of-N reviews valid candidates IN ORDER (accept the first reviewer-approved)
+
+- **What** (`metric_gen.py`): while verifying the truncation fix, a live best-of-3 validated fine but was REJECTED — the
+  independent LLM reviewer vetoed the selected metric. Root: best-of-N selected the most-DISCRIMINATING valid candidate
+  (offline `graded_discrimination`) and reviewed ONLY that one; the offline discriminator can't predict the LLM reviewer,
+  so a flawed top candidate sank the run even though a slightly-less-discriminating valid SIBLING (cand 0, disc 1.417 vs
+  the rejected cand 2's 1.578) was never reviewed. FIX: `_best_of_n` now returns the valid candidates RANKED by
+  discrimination; `generate_objective_metric` reviews them BEST-FIRST and ACCEPTS the first the reviewer approves
+  (promoting it to source/validation/metric.py/selected_candidate). Stops at the first approval (≤ N reviews). Extracted
+  a `_dispatch_review` helper (panel-or-single) so each candidate goes through the same review path.
+- **Why**: best-of-N's promise is "keep the best ACCEPTABLE candidate" — selecting by an offline proxy and praying the
+  reviewer agrees defeated it. Reviewing in order makes a run succeed whenever ANY valid candidate passes review.
+- **How**: byte-identical for the single-shot / 1-valid path (`len(ranked_valid) <= 1` → the single review of `source`,
+  exactly as before). Only fires when best-of-N has ≥2 valid candidates. Confirmed via a live n=1 run: generation +
+  validation + review all pass for a clean toe-touch metric (reviewer praised "sharp gate × min of saturating channels,
+  all 12 degenerates score 0").
+- **Verified**: sculptor `818 → 819 passed, 1 skipped` (+ review-in-order test: top candidate reviewer-rejected, lower-disc
+  sibling approved → accepted/selected the sibling); UI backend `355 passed`. uvicorn restarted; /health 200.
+
 ### 2026-06-21 — metric-gen truncation fix: max_tokens 8000→16000 (Sam saw "missing def compute_spec")
 
 - **What**: a generated metric was rejected with `[contract] missing def compute_spec` → run continues blind. Root cause:

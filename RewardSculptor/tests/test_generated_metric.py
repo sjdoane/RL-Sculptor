@@ -787,6 +787,48 @@ def test_best_of_n_selects_most_discriminating(tmp_path):
     assert not list(out.glob("candidate_*.py"))   # non-winner files cleaned up
 
 
+class _SelectiveReviewMessages(_CycleMessages):
+    """Like _CycleMessages but the reviewer REJECTS any source containing `reject_marker`
+    and approves the rest — to test best-of-N review-in-order."""
+
+    def __init__(self, srcs, reject_marker):
+        super().__init__(srcs); self._marker = reject_marker; self.reviewed: list = []
+
+    def parse(self, **kw):
+        from sculptor.eval.metric_gen import MetricReview
+        content = kw.get("messages", [{}])[-1].get("content", "")
+        self.reviewed.append(content)
+        rejected = self._marker in content
+        return _Parsed(MetricReview(approved=not rejected,
+                                    concerns=["gameable"] if rejected else [],
+                                    summary="x"))
+
+
+class _SelectiveReviewClient:
+    def __init__(self, srcs, reject_marker):
+        self.messages = _SelectiveReviewMessages(srcs, reject_marker)
+
+
+def test_best_of_n_reviews_in_order_and_accepts_approved(tmp_path):
+    """KEYSTONE: the most-discriminating valid candidate is REVIEW-REJECTED, but a
+    less-discriminating valid sibling is APPROVED — best-of-N reviews best-first and
+    ACCEPTS the approved one (promoting it to the result), instead of letting the
+    discrimination-winner's review veto sink the whole run."""
+    from sculptor.eval.metric_gen import generate_objective_metric
+    out = tmp_path / "rio"
+    # cand 0 = TOE_TOUCH_NOVEL (disc ~2.0, reviewed FIRST) — REJECTED via its marker;
+    # cand 1 = COARSE_DIP (disc ~1.0, valid) — APPROVED.
+    client = _SelectiveReviewClient([TOE_TOUCH_NOVEL, COARSE_DIP],
+                                    reject_marker="REQUIRED_JOINT_ROLES")
+    rec = generate_objective_metric(
+        "touch your toes then stand back up", out, robot_hint="unitree_g1",
+        client=client, n_candidates=2)
+    assert rec["accepted"], rec                          # the approved sibling carried it
+    assert rec["selected_candidate"] == 1                # the lower-disc, review-APPROVED one
+    assert (out / "metric.py").read_text().strip() == COARSE_DIP.strip()
+    assert len(client.messages.reviewed) == 2            # rejected top, then approved next
+
+
 def test_best_of_n_ties_keep_first_valid(tmp_path):
     """Equal discrimination → the FIRST valid candidate (lowest index) wins, preserving
     today's first-valid behavior."""
