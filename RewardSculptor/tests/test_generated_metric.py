@@ -829,6 +829,36 @@ def test_best_of_n_reviews_in_order_and_accepts_approved(tmp_path):
     assert len(client.messages.reviewed) == 2            # rejected top, then approved next
 
 
+def test_review_feedback_retry_recovers(tmp_path):
+    """A metric that passes validation but the reviewer VETOES is no longer a dead-end:
+    the reviewer's concerns are fed back, a corrected metric is generated + re-reviewed,
+    and an accepted metric is recovered (the review-failure analogue of the validation-
+    feedback retry)."""
+    from sculptor.eval.metric_gen import generate_objective_metric
+    out = tmp_path / "rfr"
+    # 1st sample is reviewer-REJECTED (marker); the review-retry's sample is APPROVED.
+    client = _SelectiveReviewClient([TOE_TOUCH_NOVEL, COARSE_DIP],
+                                    reject_marker="REQUIRED_JOINT_ROLES")
+    rec = generate_objective_metric(
+        "touch your toes then stand back up", out, robot_hint="unitree_g1",
+        client=client, n_candidates=1)
+    assert rec["accepted"], rec                       # the review-feedback retry recovered
+    assert (out / "metric.py").read_text().strip() == COARSE_DIP.strip()
+    assert len(client.messages.reviewed) == 2         # rejected, then approved after feedback
+    assert any(a.get("review_retry") for a in rec["attempts"])    # a review-retry happened
+
+
+def test_review_veto_gives_up_after_bounded_retries(tmp_path):
+    """A persistently-vetoed metric stops after _MAX_REVIEW_RETRIES (no infinite loop):
+    not accepted, and the bounded retries are recorded."""
+    from sculptor.eval.metric_gen import _MAX_REVIEW_RETRIES, generate_objective_metric
+    out = tmp_path / "rvg"
+    rec = generate_objective_metric(
+        "trot forward", out, client=_FakeClient(GOOD, approved=False), n_candidates=1)
+    assert rec["validation_passed"] and not rec["accepted"]
+    assert sum(1 for a in rec["attempts"] if a.get("review_retry")) == _MAX_REVIEW_RETRIES
+
+
 def test_best_of_n_ties_keep_first_valid(tmp_path):
     """Equal discrimination → the FIRST valid candidate (lowest index) wins, preserving
     today's first-valid behavior."""

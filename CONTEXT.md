@@ -339,6 +339,26 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-21 — review-feedback retry: a reviewer veto regenerates (was a dead-end)
+
+- **What** (`metric_gen.py`): a metric that PASSED validation but the independent reviewer VETOED was a dead-end — the
+  feedback-retry loop only fired on a VALIDATION failure, so a reviewer rejection failed the run with no recovery (a live
+  best-of-3 hit exactly this: 2/3 candidates invalid, the 1 valid one reviewer-rejected → blind). FIX: a bounded
+  review-feedback retry — when a validation-passing metric is vetoed, the reviewer's concerns are fed back, the metric is
+  regenerated, re-validated, and re-reviewed, up to `_MAX_REVIEW_RETRIES` (2). Completes the feedback story: BOTH gate
+  failures (validation + review) now recover via feedback, where before only validation did.
+- **Why**: the generated metrics for a hard NOVEL task (toe-touch) carry real, fixable flaws the reviewer correctly
+  flags (e.g. a `gz`-based bend that credits a backbend, an unsigned hip-amplitude floor); a dead-end on the first veto
+  made the run a coin-flip. Feeding the concern back lets the LLM fix the specific objection.
+- **How**: byte-identical when review is off OR the metric is approved (the loop's guard is false). A persistently-vetoed
+  metric stops after 2 retries (bounded — no infinite loop). A review-retry that BREAKS validation stops (no gate
+  thrashing); `selected_candidate` is cleared (the result is a corrected retry, not a best-of-N candidate).
+- **Verified**: sculptor `819 → 821 passed, 1 skipped` (+ recovery test: vetoed→fed-back→approved; + bounded-give-up
+  test); UI backend `355`. This is the 6th and final robustness fix to the generation pipeline this session (temperature,
+  never-silent, feedback-fallback, truncation, review-in-order, review-feedback-retry). RESIDUAL: generation still has
+  real LLM variance on a hard novel task — these fixes raise the per-run accept odds substantially but don't guarantee
+  every run; best-of-3/4 + the two feedback loops are the levers.
+
 ### 2026-06-21 — best-of-N reviews valid candidates IN ORDER (accept the first reviewer-approved)
 
 - **What** (`metric_gen.py`): while verifying the truncation fix, a live best-of-3 validated fine but was REJECTED — the

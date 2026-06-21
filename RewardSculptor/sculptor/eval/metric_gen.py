@@ -31,6 +31,10 @@ MODEL_ID = "claude-opus-4-7"
 #: code (a confusing downstream "missing compute_spec"). 16000 leaves ample room for
 #: thinking AND a complete metric (observed ~7.3-7.5k total per generation).
 MAX_TOKENS = 16000
+#: §review-feedback retry: how many times a VALIDATION-passing but REVIEWER-VETOED
+#: metric is regenerated with the reviewer's concerns fed back before giving up. Bounds
+#: the extra (gen + review) cost; the validation-failure feedback loop is separate.
+_MAX_REVIEW_RETRIES = 2
 _FENCE_RE = re.compile(r"```(?:[A-Za-z]+)?\s*\n(.*?)```", re.DOTALL)
 
 
@@ -579,6 +583,48 @@ def generate_objective_metric(
                 "Passed validation — running independent review…")
 
     accepted = bool(passed and (review_out is None or review_out.get("approved")))
+
+    # §review-feedback retry: a metric that PASSED validation but the reviewer VETOED is
+    # otherwise a dead-end — the feedback-retry loop above fires only on a VALIDATION
+    # failure. Feed the reviewer's concerns back and regenerate (bounded) so a fixable
+    # objection (a missing signed-direction check, a too-soft gate) gets corrected
+    # instead of failing the run. Only runs with review on + a concrete veto.
+    rev_retry = 0
+    while (review and passed and not accepted
+           and review_out and not review_out.get("approved")
+           and rev_retry < _MAX_REVIEW_RETRIES):
+        rev_retry += 1
+        _emit({"stage": "regenerating", "max": _MAX_REVIEW_RETRIES,
+               "message": f"Reviewer vetoed — regenerating with the review feedback "
+                          f"(retry {rev_retry}/{_MAX_REVIEW_RETRIES})…"})
+        user = (
+            base_user
+            + "\n\nThe previous metric PASSED validation but the REVIEWER REJECTED it "
+            + "for these concerns:\n"
+            + json.dumps(review_out.get("concerns") or [], indent=2)
+            + "\nRewrite the metric to FIX every concern (keep the sharp completion gate "
+            + "× min-of-saturating-channels form). Output ONLY the corrected module.")
+        try:
+            source = _sample_source(client, system_prompt, user, model=model)
+        except Exception as e:  # noqa: BLE001 — a failed retry call ends the retries
+            attempts.append({"review_retry": rev_retry,
+                             "api_error": f"{type(e).__name__}: {e}"})
+            break
+        selected_candidate = None        # the result is now a feedback-corrected retry,
+        metric_path.write_text(source, encoding="utf-8")   # not a best-of-N candidate
+        validation = validate_generated_metric(
+            source, metric_path, behavior_goal=behavior_goal, robot_hint=robot_hint,
+            robot_joint_names=robot_names)
+        attempts.append({"review_retry": rev_retry, "ok": validation["ok"],
+                         "reasons": validation["reasons"]})
+        passed = bool(validation["ok"])
+        if not passed:
+            break                        # the correction broke validation — stop thrashing
+        review_out, review_panel = _dispatch_review(
+            source, validation.get("archetype_scores", {}),
+            f"Re-reviewing the corrected metric (retry {rev_retry})…")
+        accepted = bool(review_out and review_out.get("approved"))
+
     _emit({"stage": "done", "accepted": accepted,
            "message": ("Metric accepted." if accepted
                        else "Metric rejected — see reasons.")})
