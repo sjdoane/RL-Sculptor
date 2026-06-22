@@ -259,23 +259,70 @@ def _sha(obj: Any) -> str:
     ).hexdigest()[:16]
 
 
+#: JSON-mode authoring budget. The author emits a full CompetenceLadder /
+#: GamingArchetypeSet JSON (nested rungs/groups) + adaptive thinking — generous so a
+#: complete object fits (a truncated one fails to parse → recorded skip, never silent).
+_AUTHOR_MAX_TOKENS = 12000
+
+
+def _extract_json_obj(text: str) -> dict:
+    """Extract the first top-level JSON object from a model completion — tolerant of a
+    ```json fence or surrounding prose. Raises ValueError if none parses (the caller
+    records a skip; a malformed/truncated author NEVER grants)."""
+    if not text or not text.strip():
+        raise ValueError("empty author response")
+    m = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
+    candidate = m.group(1) if m else text
+    start = candidate.find("{")
+    if start < 0:
+        raise ValueError("no JSON object in author response")
+    obj, _ = json.JSONDecoder().raw_decode(candidate[start:])
+    if not isinstance(obj, dict):
+        raise ValueError("author response is not a JSON object")
+    return obj
+
+
+def _author_structured(client: Any, model: str, system_prompt: str,
+                       payload: dict, schema: Any) -> Any:
+    """Author a structured pydantic object via a PLAIN completion + JSON parse — NOT
+    `messages.parse` / constrained decoding.
+
+    WHY: the CompetenceLadder / GamingArchetypeSet schemas are too deeply nested (a
+    list of Groups, each with a RoleQuery + a `float | list[float]` Union scalar) for
+    the API's grammar compiler — `messages.parse(output_format=...)` 400s 'schema is
+    too complex' / hangs 'grammar compilation timed out', so the constrained-decode
+    path made task-derived calibration (the novel-task STEERING payoff) NEVER grant.
+    JSON-mode sidesteps the grammar compiler entirely and preserves the full
+    vocabulary. The schema is pinned IN-PROMPT (model_json_schema) so key names/types
+    are exact. Raises on any failure (the caller records a skip — never grants)."""
+    instr = (
+        system_prompt
+        + "\n\nOUTPUT FORMAT: respond with ONLY a single JSON object (no prose, no "
+          "markdown fence) that conforms to this JSON Schema:\n"
+        + json.dumps(schema.model_json_schema(), separators=(",", ":")))
+    resp = client.messages.create(
+        model=model,
+        max_tokens=_AUTHOR_MAX_TOKENS,
+        thinking={"type": "adaptive"},
+        system=instr,
+        messages=[{"role": "user",
+                   "content": json.dumps(payload, indent=2, default=str)}],
+    )
+    if getattr(resp, "stop_reason", None) == "max_tokens":
+        raise ValueError(
+            f"author response truncated at max_tokens={_AUTHOR_MAX_TOKENS}")
+    text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
+    return schema.model_validate(_extract_json_obj(text))
+
+
 def _author_ladder(client: Any, model: str, payload: dict) -> Any:
     """One blind ladder-author call → a CompetenceLadder. The author is given
     ONLY the goal/robot/joint_names/style/vocabulary — never any metric."""
     from sculptor.eval.ladder_synth import CompetenceLadder
     from sculptor.prompts import load_prompt
 
-    system_prompt = load_prompt("gen_competence_ladder")
-    resp = client.messages.parse(
-        model=model,
-        max_tokens=4000,
-        thinking={"type": "adaptive"},
-        system=system_prompt,
-        messages=[{"role": "user",
-                   "content": json.dumps(payload, indent=2, default=str)}],
-        output_format=CompetenceLadder,
-    )
-    return resp.parsed_output
+    return _author_structured(client, model, load_prompt("gen_competence_ladder"),
+                              payload, CompetenceLadder)
 
 
 # ── §Ship 53: adversarial gaming archetypes (L3) ─────────────────────────
@@ -295,21 +342,13 @@ _ADV_N = 3               # archetypes the blind author proposes
 def _author_gaming(client: Any, model: str, payload: dict) -> Any:
     """One blind gaming-archetype author call → a GamingArchetypeSet. Given ONLY
     the goal/robot/joint_names — never any metric (same firewall as the ladder
-    author). Returns the parsed pydantic object."""
+    author). JSON-mode (see `_author_structured`) — the GamingArchetypeSet schema is
+    too complex for the API grammar compiler."""
     from sculptor.eval.ladder_synth import GamingArchetypeSet
     from sculptor.prompts import load_prompt
 
-    system_prompt = load_prompt("gen_gaming_archetypes")
-    resp = client.messages.parse(
-        model=model,
-        max_tokens=4000,
-        thinking={"type": "adaptive"},
-        system=system_prompt,
-        messages=[{"role": "user",
-                   "content": json.dumps(payload, indent=2, default=str)}],
-        output_format=GamingArchetypeSet,
-    )
-    return resp.parsed_output
+    return _author_structured(client, model, load_prompt("gen_gaming_archetypes"),
+                              payload, GamingArchetypeSet)
 
 
 # ── §Metric-quality laws (LAW 9 / completeness D5): deterministic kick-family ──

@@ -4,6 +4,7 @@ LLM calls are mocked; the synthesizer + gate are deterministic and offline.
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import numpy as np
@@ -120,20 +121,34 @@ def near_constant_ladder() -> CompetenceLadder:
     ])
 
 
-class _LadderParsed:
-    def __init__(self, ladder): self.parsed_output = ladder
+# §calibration JSON-mode: the authors now use messages.CREATE + JSON parse (the
+# CompetenceLadder/GamingArchetypeSet schemas are too complex for the API grammar
+# compiler used by messages.parse). The mocks return a completion whose text block is
+# the JSON dump of the authored object — exactly what _author_structured parses.
+class _Blk:
+    type = "text"
+    def __init__(self, text): self.text = text
+
+
+class _Resp:
+    stop_reason = "end_turn"
+    def __init__(self, text): self.content = [_Blk(text)]
+
+
+def _as_json_resp(obj) -> _Resp:
+    return _Resp(json.dumps(obj.model_dump()))
 
 
 class _LadderMessages:
     def __init__(self, ladders):
         self._ladders = list(ladders); self.calls = 0; self.payloads = []
 
-    def parse(self, **kw):
+    def create(self, **kw):
         # Record the user payload so a test can assert no metric leaked into it.
         self.payloads.append(kw.get("messages", [{}])[-1].get("content", ""))
         lad = self._ladders[self.calls % len(self._ladders)]
         self.calls += 1
-        return _LadderParsed(lad)
+        return _as_json_resp(lad)
 
 
 class _FakeLadderClient:
@@ -291,7 +306,7 @@ def test_metric_load_failure_denies(tmp_path):
 
 def test_never_raises_on_author_crash(tmp_path):
     class _BoomMessages:
-        def parse(self, **kw): raise RuntimeError("api down")
+        def create(self, **kw): raise RuntimeError("api down")
     class _Boom:
         messages = _BoomMessages()
     p = _write(tmp_path, "kick.py", GOOD_KICK)
@@ -345,7 +360,9 @@ def gaming_tremor() -> GamingArchetypeSet:
 
 class _BothMessages:
     """A mock that serves BOTH the ladder author (CompetenceLadder) and the
-    adversarial author (GamingArchetypeSet), branching on `output_format`."""
+    adversarial author (GamingArchetypeSet) over the JSON-mode `create` interface,
+    branching on the payload (the gaming payload carries `n_archetypes`, the ladder
+    payload does not)."""
 
     def __init__(self, ladders, gaming, gaming_raises=False):
         self._ladders = list(ladders)
@@ -356,19 +373,19 @@ class _BothMessages:
         self.ladder_payloads: list = []
         self.gaming_payloads: list = []
 
-    def parse(self, **kw):
+    def create(self, **kw):
         content = kw.get("messages", [{}])[-1].get("content", "")
-        if getattr(kw.get("output_format"), "__name__", "") == "GamingArchetypeSet":
+        if "n_archetypes" in content:
             self.gaming_calls += 1
             self.gaming_payloads.append(content)
             if self._gaming_raises:
                 raise RuntimeError("gaming author api down")
-            return _LadderParsed(self._gaming)
+            return _as_json_resp(self._gaming)
         self.ladder_calls += 1
         self.ladder_payloads.append(content)
         lad = self._ladders[self.ladder_calls - 1] if self.ladder_calls - 1 < len(self._ladders) \
             else self._ladders[(self.ladder_calls - 1) % len(self._ladders)]
-        return _LadderParsed(lad)
+        return _as_json_resp(lad)
 
 
 class _FakeBothClient:
@@ -950,3 +967,64 @@ def test_fold_ladder_discriminates_real_metric_from_depth_proxy(tmp_path):
     proxy_scores = next(s["gen_scores"] for s in proxy_cal["sources"] if "gen_scores" in s)
     assert real_scores[1] == 0.0                     # real metric: no flex → min channel 0
     assert proxy_scores[1] > proxy_scores[2]         # proxy ranks the flex-less rung too high
+
+
+# ── §calibration JSON-mode authors (the steering-path fix) ────────────────────
+# The CompetenceLadder / GamingArchetypeSet schemas are too complex for the API
+# grammar compiler used by messages.parse (it 400s "schema is too complex" / hangs
+# "grammar compilation timed out"), so the authors now use messages.CREATE + JSON
+# parse. These pin the JSON extraction + that the author round-trips a real ladder.
+from sculptor.eval.metric_calibration import _author_structured, _extract_json_obj
+
+
+def test_extract_json_obj_handles_fence_and_prose():
+    assert _extract_json_obj('{"a": 1}') == {"a": 1}
+    assert _extract_json_obj('```json\n{"a": 2}\n```') == {"a": 2}
+    assert _extract_json_obj('Here is the ladder:\n{"a": 3}\nDone.') == {"a": 3}
+    # trailing prose after a complete object is tolerated (raw_decode stops at the close)
+    assert _extract_json_obj('{"a": 4, "b": [1,2]} trailing junk')["b"] == [1, 2]
+
+
+def test_extract_json_obj_raises_on_garbage():
+    import pytest as _pytest
+    for bad in ("", "   ", "no json here", "[1,2,3]"):
+        with _pytest.raises(ValueError):
+            _extract_json_obj(bad)
+
+
+def test_author_structured_roundtrips_via_create():
+    """_author_structured calls messages.CREATE (not parse) and JSON-parses the text
+    block into the pydantic schema — even when the model wraps it in a code fence."""
+    lad = fold_ladder()
+
+    class _M:
+        def __init__(self): self.created = 0; self.used_parse = False
+        def parse(self, **kw): self.used_parse = True; raise AssertionError("must not call parse")
+        def create(self, **kw):
+            self.created += 1
+            return _Resp("```json\n" + json.dumps(lad.model_dump()) + "\n```")
+
+    class _C:
+        def __init__(self): self.messages = _M()
+
+    c = _C()
+    out = _author_structured(c, "m", "sys-prompt", {"behavior_goal": "x"}, CompetenceLadder)
+    assert c.messages.created == 1 and not c.messages.used_parse
+    assert [r.fold_depth_m for r in out.rungs] == [r.fold_depth_m for r in lad.rungs]
+
+
+def test_author_structured_truncation_raises():
+    """A max_tokens-truncated author response raises (the caller records a skip — a
+    truncated/garbled author NEVER grants)."""
+    import pytest as _pytest
+
+    class _Trunc:
+        stop_reason = "max_tokens"
+        content = [_Blk('{"competence_axis": "x", "rungs": [')]   # incomplete
+
+    class _M:
+        def create(self, **kw): return _Trunc()
+    class _C:
+        messages = _M()
+    with _pytest.raises(ValueError):
+        _author_structured(_C(), "m", "sys", {"g": 1}, CompetenceLadder)
