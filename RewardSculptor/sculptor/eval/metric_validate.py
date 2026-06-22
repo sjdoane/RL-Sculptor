@@ -104,9 +104,28 @@ def resolve_behavior_family(
     if has("jump", "jumps", "jumping", "hop", "hops", "hopping",
            "leap", "leaps", "leaping"):
         return "jump"
-    if has("trot", "trotting", "walk", "walking", "forward", "gait",
-           "locomote", "locomotion", "run", "running", "march", "marching",
-           "stride", "striding"):
+    # §<resolution fix>: locomotion needs a real GAIT verb, OR a bare directional/
+    # velocity cue (forward/ahead/velocity) when NO posture/gesture verb is present —
+    # so "forward_velocity" (Hopper) resolves to locomotion but "bend FORWARD into a
+    # bow" / "lean FORWARD and bow" does NOT (the stray "forward" used to mis-resolve a
+    # FOLD goal to locomotion, then its locomotion positive scored ~0 and the metric was
+    # false-rejected). "in place" / "in-place" NEVER resolves to locomotion (an in-place
+    # march/run is a stationary skill, not forward travel — its positive `active` is ~0).
+    _posture_gesture = has(
+        "bend", "bends", "bending", "bow", "bows", "bowing", "squat", "squats",
+        "squatting", "crouch", "crouches", "crouching", "stoop", "stooping", "kneel",
+        "kneeling", "touch", "touches", "touching", "reach", "reaches", "reaching",
+        "lean", "leans", "leaning", "wave", "waves", "waving", "raise", "raises",
+        "raising", "twist", "twists", "twisting", "curl", "curls", "arch", "fold",
+        "folds", "dip", "dips", "nod", "nods", "shake", "shakes", "sit", "sits",
+        "lie", "roll", "rolls", "rolling")
+    _in_place = "in place" in g or "in-place" in g
+    _gait = has("trot", "trotting", "walk", "walking", "gait", "locomote",
+                "locomotion", "run", "running", "march", "marching", "stride",
+                "striding", "jog", "jogging", "sprint", "sprinting", "gallop",
+                "skip", "skipping")
+    _directional = has("forward", "forwards", "ahead", "velocity")
+    if (_gait or (_directional and not _posture_gesture)) and not _in_place:
         return "locomotion"
     if has("balance", "balancing", "cartpole"):
         return "cartpole"
@@ -694,8 +713,13 @@ def _selectivity_probe(fn, meta) -> dict[str, float]:
     # upright, stationary. A repeated-motion goal needs left-AND-right excursions with
     # several reversals — which the one-sided 0→1.2→0 arc of C1/C2 (and the arm-only C3)
     # never produces on the torso joints. Oscillates the torso + neck columns ±0.6 at
-    # ~1.7 Hz (period 30, ~4 cycles); only 2 joints + moderate speed, so a fast 12-joint
-    # `upright_flail`/`chaotic` rewarder still scores HIGHER on those folded negatives.
+    # ~1.7 Hz (period 30, ~4 cycles), structured + moderate-speed. A pure MOTION-MAGNITUDE
+    # rewarder is gated by the folded `chaotic` negative (rng joint_vel σ=5 rad/s, peak
+    # ~19 — comfortably above this 2-joint ±0.6 oscillation) AND the independent L1
+    # `no_reward_for_chaos` axiom; NOTE the folded `upright_flail`/`active_floss` carry
+    # rad/FRAME joint_vel (the fixed battery's convention — left as-is so the chaos axiom,
+    # which relies on that scale, keeps working), so they guard AMPLITUDE/STRUCTURE, not
+    # raw speed — `chaotic` is the speed backstop.
     jp5 = np.zeros((T, E, J))
     twist = 0.6 * np.sin(2.0 * np.pi * t / 30.0)          # bidirectional ±0.6, ≥4 reversals
     for j in (10, 11):                                    # torso + neck (synthetic body)
@@ -1027,26 +1051,21 @@ def validate_generated_metric(
     # calibration; the firewall keeps an uncalibrated metric observe-only, so a
     # vacuous pass never grants steering on its own.
     #
-    # §<vacuous-entry fix>: the trigger keys ONLY on the POSITIVE archetypes (~0) —
-    # NOT on the whole battery, and NOT scoped to family is None.
-    #   * Whole-battery → positives: a metric that scored some NEGATIVE slightly above
-    #     the near-zero floor (a wave metric giving a fast-flail archetype a little
-    #     credit) used to be kicked to the normal path, where with all positives ~0 the
-    #     "negative ≥ best-positive" check trips on the 0 ≥ 0 tie and false-rejects.
-    #   * Dropping the family-is-None scope: a goal can MIS-resolve to a family from a
-    #     stray word ("bend forward"→locomotion via "forward", "march in place"→
-    #     locomotion) — then a good NOVEL metric scores that family's positive ~0 and
-    #     was false-rejected on the normal path. The metric scoring EVERY positive ~0 is
-    #     the ground truth that the fixed battery can't represent the goal, whatever
-    #     family was guessed. A GOOD family metric still lights up its own positive →
-    #     best_pos > floor → normal path (UNCHANGED); a genuinely-broken family metric
-    #     scores the probe ~0 too (the probe has no kick/locomotion rollout) → rejected.
-    # To keep the anti-gaming teeth, the fixed NEGATIVES are FOLDED INTO the probe's
-    # degenerate anchor: the metric must beat the worse of {probe still/fallen, every
-    # fixed negative} — so a flail/chaos/fall rewarder that scores a fixed negative high
-    # is still rejected here. The forward-WALKER is also folded UNLESS the goal is
-    # forward-directional (goal_axis == "+x"), so an in-place novel skill that rewards
-    # walking is caught, while a legitimately forward novel goal is not false-rejected.
+    # §<vacuous-entry fix>: enter the goal-agnostic probe ONLY when the goal resolves
+    # to NO family AND every POSITIVE archetype scored ~0 (the fixed battery genuinely
+    # cannot represent the goal). Scoping to family is None keeps the family ground
+    # truth authoritative for a RECOGNIZED family — a kick/jump/floss/locomotion metric
+    # that scores its family positive ~0 is degenerate FOR ITS FAMILY and is rejected on
+    # the normal path (incl the kick-hack / walker ceilings), NOT vacuously rescued by a
+    # goal-agnostic gesture probe (the round-3-review regression: an arms-overhead metric
+    # must NOT pass for a kick goal). Mis-resolution that previously forced a FOLD goal
+    # into a family ("bend forward"→locomotion) is fixed at the source in
+    # resolve_behavior_family, so a true novel fold/gesture goal resolves to None and
+    # reaches the probe here. Keying on POSITIVES (not the whole battery) still lets a
+    # novel metric that gave a fixed NEGATIVE a little credit enter the probe (the
+    # "negative ≥ best-positive 0≥0 tie" false-reject). The fixed NEGATIVES are FOLDED
+    # INTO the probe's degenerate anchor (a flail/chaos/fall rewarder is still rejected);
+    # the forward-WALKER too, UNLESS the goal is forward-directional (goal_axis "+x").
     pos_finite = [finite[k] for k in positive_keys if k in finite]
     # The labelled degenerate anchors folded into the vacuous check (name → score), so
     # a reject can NAME the offending degenerate (actionable feedback) instead of a
@@ -1056,7 +1075,8 @@ def validate_generated_metric(
         neg_anchors["walker"] = finite["walker"]
     best_pos_battery = max(pos_finite) if pos_finite else 0.0
     battery_uninformative = (
-        len(finite) >= 3 and best_pos_battery <= _BATTERY_NEAR_ZERO)
+        family is None and len(finite) >= 3
+        and best_pos_battery <= _BATTERY_NEAR_ZERO)
     if battery_uninformative:
         probe = _selectivity_probe(fn, meta)
         selectivity = probe

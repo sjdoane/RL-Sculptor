@@ -21,11 +21,14 @@ running real best-of-N generations and reading the actual rejected sources:
 
 Round 2 (a second real best-of-N batch across bow/wave/twist/march + an adversarial
 review of the round-1 commit found further fixes):
-  Fix 6 — the vacuous-branch entry no longer requires `family is None`: a goal can
-          MIS-resolve to a family from a stray word ("bend forward"→locomotion), and a
-          good novel metric then scored that family's positive ~0 and was false-rejected.
-          Entry now keys ONLY on every POSITIVE archetype being ~0 (a good family metric
-          still lights up its own positive → unchanged normal path).
+  Fix 6 — a FOLD/bow/gesture goal no longer MIS-resolves to a behavior family from a
+          stray directional word ("bend FORWARD into a bow" used to → locomotion via
+          "forward"); resolve_behavior_family requires a real gait verb (or a bare
+          directional cue with NO posture verb, and never "in place"), so a true novel
+          goal resolves to None and reaches the probe. The vacuous entry KEEPS the
+          `family is None` scope, so a RECOGNIZED-family metric that scores its family
+          positive ~0 (a wrong-behavior kick metric) is rejected on the normal path,
+          NOT vacuously rescued by the goal-agnostic gesture probe (round-3 review).
   Fix 7 — the forward-WALKER is folded into the vacuous degenerate anchor UNLESS the
           goal is forward-directional, catching an in-place novel metric that rewards
           walking without false-rejecting a legitimately forward goal.
@@ -384,25 +387,70 @@ def compute_spec(arrays, behavior, meta):
 '''
 
 
-def test_mis_resolved_family_still_reaches_probe():
-    """A novel bend/bow metric whose goal mis-resolves to a behavior family (locomotion
-    via 'forward') still reaches the selectivity probe and passes vacuously — the entry
-    keys on the positive archetypes being ~0, not on family being None."""
+def test_fold_goal_with_directional_word_resolves_to_none():
+    """§round-3 fix: a FOLD/bow goal that contains a stray directional word ('bend
+    FORWARD into a deep bow') no longer MIS-resolves to locomotion — the posture verb
+    (bend/bow) suppresses the bare-'forward' locomotion cue — so it resolves to None and
+    reaches the selectivity probe (instead of being false-rejected on the locomotion
+    normal path where its forward-travel positive scores ~0)."""
+    from sculptor.eval.metric_validate import resolve_behavior_family
+    assert resolve_behavior_family("bend forward into a deep bow and return upright") is None
     v = _val(BOW_TILT_RETURN, "bend forward into a deep bow and return upright")
-    assert v["family"] == "locomotion"                   # genuinely mis-resolved
-    assert v["nondegeneracy_vacuous"] is True            # yet rescued by the probe
+    assert v["family"] is None
+    assert v["nondegeneracy_vacuous"] is True
     assert v["ok"], v["reasons"]
 
 
-def test_good_family_metric_unchanged_by_dropped_family_scope():
-    """Dropping the family-is-None scope must NOT change the normal path for a GOOD
-    family metric: it lights up its own positive archetype → battery informative →
+def test_resolve_family_precision():
+    """The precise locomotion resolver: a real gait verb OR a bare directional/velocity
+    cue with NO posture verb resolves to locomotion; an 'in place' skill and a posture
+    goal do NOT — without breaking the Hopper 'forward_velocity' case."""
+    from sculptor.eval.metric_validate import resolve_behavior_family as rf
+    assert rf("trot forward in a straight line") == "locomotion"           # gait verb
+    assert rf("Canonical Hopper-v4 reward: forward_velocity + alive_bonus") == "locomotion"
+    assert rf("march in place lifting your knees up high") is None         # in-place ≠ travel
+    assert rf("lean forward and bow deeply then return to standing") is None
+    assert rf("reach down and touch the floor then rise") is None
+
+
+def test_good_family_metric_stays_on_normal_path():
+    """A GOOD family metric lights up its own positive archetype → battery informative →
     not vacuous (the builtin family path is unchanged)."""
     from tests.test_generated_metric import GOOD_KICK
     v = _val(GOOD_KICK, "repeatedly kick forward with one leg")
     assert v["family"] == "kick"
     assert v["nondegeneracy_vacuous"] is False
     assert v["ok"], v["reasons"]
+
+
+# A wrong-behavior metric for a RECOGNIZED family: rewards a sustained arms-overhead
+# hold (a gesture), which the goal-agnostic gesture probe (C3) scores high. For a KICK
+# goal it must NOT vacuously pass — the family ground truth is authoritative.
+ARMS_OVERHEAD_FOR_KICK = '''import numpy as np
+REQUIRED_JOINT_ROLES = ["left_shoulder_pitch", "right_shoulder_pitch", "left_elbow", "right_elbow"]
+def compute_spec(arrays, behavior, meta):
+    jp = arrays.get("joint_pos"); pg = arrays.get("projected_gravity_b")
+    if jp is None or pg is None:
+        return {"spec_score": 0.0}
+    roles = (meta or {}).get("joint_roles", {}) or {}
+    idx = [roles[r] for r in ("left_shoulder_pitch","right_shoulder_pitch","left_elbow","right_elbow") if r in roles]
+    if not idx:
+        return {"spec_score": 0.0}
+    raised = float(np.mean(np.clip(jp[..., idx].mean(0).mean(-1) / 2.0, 0, 1)))
+    up = float(np.mean(pg[..., 2] < -0.85))
+    return {"spec_score": float(np.clip(raised * up, 0, 1))}
+'''
+
+
+def test_wrong_behavior_recognized_family_not_vacuous():
+    """§round-3 review regression: an arms-overhead metric for a KICK goal scores the
+    fixed kick positive ~0, so for the RECOGNIZED kick family it must take the normal
+    path and be REJECTED — NOT vacuously rescued by the goal-agnostic gesture probe.
+    (Restoring the family-is-None scope on the vacuous entry closes this.)"""
+    v = _val(ARMS_OVERHEAD_FOR_KICK, "kick a ball forward with your right leg")
+    assert v["family"] == "kick"
+    assert v["nondegeneracy_vacuous"] is False
+    assert not v["ok"], v["reasons"]
 
 
 # ── Fix 7: walker folded for in-place goals, not forward goals ───────────────
@@ -437,8 +485,13 @@ def test_walker_folded_for_inplace_goal():
 
 def test_walker_not_folded_for_forward_goal():
     """The same metric is NOT walker-rejected for a forward-directional goal (goal_axis
-    +x) — folding the walker there would false-reject a legitimately forward novel goal."""
-    v = _val(DIP_OR_WALK, "walk forward then touch your toes")
+    +x, but family None so it reaches the probe) — folding the walker there would
+    false-reject a legitimately forward novel goal."""
+    from sculptor.eval.metric_validate import resolve_goal_frame
+    goal = "lunge forward and touch the floor then rise"
+    assert resolve_goal_frame(goal)["goal_axis"] == "+x"   # forward-directional
+    v = _val(DIP_OR_WALK, goal)
+    assert v["family"] is None                             # reaches the probe
     assert v["nondegeneracy_vacuous"] is True
     assert v["ok"], v["reasons"]
 
