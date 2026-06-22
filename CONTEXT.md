@@ -381,8 +381,11 @@ Start the next entry below this line.
   (gate logic / prompt / API-mode), never loosens an anti-gaming gate (the firewall keeps an uncalibrated metric
   observe-only; calibration is the task-validity check).
 - **Verified — EMPIRICAL** (real best-of-3 generations, `robot_hint=Mjlab-Velocity-Flat-Unitree-G1`):
-  - **Generation accept rate 50% → 91%** (round-3 batch: 10/11 fold/posture/gesture goals accepted; the 1 miss
-    was "raise arms overhead and HOLD" — a static-posture, non-fold edge case). EVERY fold-type goal accepted.
+  - **Generation accept rate 50% → ~95%** — baseline 4/8; round-3 batch 10/11; **final HEAD-code batch 8/8**
+    (toe-touch, squat, bow, crouch, floor-touch, kneel, compound bend→stand→wave, sit→stand) → **18/19 (95%)**
+    across the two post-fix batches. EVERY fold/posture goal type accepted; the only miss across all batches was
+    "raise arms overhead and HOLD" (a static-posture, non-fold edge case with no probe). floor/kneel on the final
+    batch were rescued by the validation-feedback retry fallback when best-of-N found 0 valid candidates.
   - **Steering payoff PROVEN**: with JSON-mode, the real LLM ladder author emits deep fold ladders across all 3
     styles (fold_depth_m 0.06→0.46, mode=fold, hip/knee/ankle flex) and `calibrate_task_derived` **GRANTS** for
     `floor1` ("reach down and touch the floor then rise") and `pickup1` (rho_min 0.894, n_valid 2, agreement 0.67)
