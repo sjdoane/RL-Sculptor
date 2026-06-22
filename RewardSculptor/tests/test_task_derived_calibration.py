@@ -1525,3 +1525,66 @@ def test_round16_active_goal_with_balance_word_stays_active():
     assert not _goal_is_static_hold("wave while balancing on one leg")
     assert not _goal_is_static_hold("walk forward staying upright")
     assert not _goal_is_static_hold("touch your toes then stand upright")
+
+
+# ── §round-17 LADDER-DERIVED posture (root-cause fix for keyword brittleness) ──
+
+def _shoulder_grp(amp):
+    return Group(name="arm", mode="oscillate", amplitude_rad=amp,
+                 role_query=RoleQuery(segments=["shoulder", "elbow"], axes=["pitch", None]))
+
+def _salute_ladder():  # ascending arm motion → top rung is NOT a still hold
+    return CompetenceLadder(competence_axis="arm raise toward salute", rungs=[
+        MotionSpec(uprightness=1.0, base_height_m=0.7, groups=[_shoulder_grp(a)])
+        for a in (0.1, 0.5, 0.9, 1.3)])
+
+def _balance_ladder():  # ascending uprightness, no motion → top rung IS a still hold
+    return CompetenceLadder(competence_axis="upright balance", rungs=[
+        MotionSpec(uprightness=u, base_height_m=0.7) for u in (0.2, 0.6, 0.85, 1.0)])
+
+
+def test_round17_ladder_posture_classifies_top_rung():
+    """§round-17 root-cause: the static-hold/terminal-down decision is read from the blind
+    AUTHORED ladder's TOP rung (goal-text-independent), not a brittle keyword classifier."""
+    from sculptor.eval.metric_calibration import _ladder_posture
+    assert _ladder_posture([_salute_ladder().rungs[-1]]) == (False, False)   # arm motion
+    assert _ladder_posture([_balance_ladder().rungs[-1]]) == (True, False)   # still upright
+    assert _ladder_posture([fold_ladder().rungs[-1]]) == (False, False)      # pelvis fold
+    assert _ladder_posture([]) == (None, None)                              # no evidence → fallback
+
+
+def test_round17_salute_ladder_denies_idle_proxy_end_to_end(tmp_path):
+    """§round-17 [HIGH FALSE GRANT] fix end-to-end: an upright-and-moving idle proxy on a
+    gesture goal whose AUTHORED ladder has arm motion at the top is DENIED — the ladder
+    posture (not the goal phrasing 'salute while staying upright') keeps do_nothing_upright.
+    The brittle keyword classifier had mis-read this as static-hold and dropped the defense."""
+    IDLE = '''import numpy as np
+def compute_spec(arrays, behavior, meta):
+    g = np.asarray(arrays["projected_gravity_b"], float)
+    jv = np.asarray(arrays["joint_vel"], float)
+    return {"spec_score": float((g[..., 2] < -0.85).mean() * np.tanh(np.abs(jv).mean()))}
+'''
+    p = _write(tmp_path, "idle.py", IDLE)
+    cal = calibrate_task_derived(
+        p, "salute while staying upright", robot_hint="Unitree-G1",
+        client=_FakeLadderClient(_salute_ladder(), _salute_ladder(), _salute_ladder()))
+    assert not cal["ok"], cal                                   # idle proxy DENIED
+    assert cal["adversarial"]["gameable"]
+    assert "do_nothing_upright" in {l["name"] for l in cal["adversarial"]["required_losers"]}
+
+
+def test_round17_balance_ladder_grants_balance_metric_end_to_end(tmp_path):
+    """§round-17: a genuine balance metric whose AUTHORED ladder is a still-upright hold is
+    GRANTED — the ladder posture drops do_nothing_upright (on-goal) so it is not denied."""
+    BAL = '''import numpy as np
+def compute_spec(arrays, behavior, meta):
+    g = np.asarray(arrays["projected_gravity_b"], float)
+    return {"spec_score": float(np.mean(np.clip(-g[..., 2], 0.0, 1.0)))}
+'''
+    p = _write(tmp_path, "bal.py", BAL)
+    cal = calibrate_task_derived(
+        p, "balance steadily on both feet", robot_hint="Unitree-G1",
+        client=_FakeLadderClient(_balance_ladder(), _balance_ladder(), _balance_ladder()))
+    adv = cal["adversarial"] or {}
+    assert not adv.get("gameable")                             # balance metric NOT false-denied
+    assert "do_nothing_upright" not in {l["name"] for l in adv.get("required_losers", [])}

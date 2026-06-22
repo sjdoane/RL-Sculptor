@@ -706,17 +706,24 @@ def _goal_is_terminal_down(behavior_goal: str) -> bool:
 
 
 def _goal_is_static_hold(behavior_goal: str) -> bool:
-    """True iff the goal's competent behavior is a still upright hold (balance/stand on one
-    leg/don't fall). Standing still IS the goal there, so the stillness losers are off.
+    """KEYWORD FALLBACK (used only when the authored ladder is unavailable — e.g. the gate
+    is exercised directly in a test). The AUTHORITATIVE signal is the blind ladder's own
+    top-rung posture (`_ladder_posture`), goal-text-independent and anti-collusion-safe; a
+    keyword classifier over free-text is inherently brittle (rounds 13/15/16/17 each found
+    a token gap). True iff the goal's competent behavior is a still upright hold.
 
     BIASED TOWARD FALSE (the safe direction): a false True drops the posture defense → a
-    FALSE GRANT, whereas a false False merely keeps a loser → an honest balance metric may
-    be observe-only. So ANY active-motion/locomotion verb OR a directional-travel cue forces
-    False (the stillness word is then an adverbial modifier of an active goal), and True
-    requires POSITIVE balance evidence (a static-hold token or anti-fall phrase)."""
+    FALSE GRANT, whereas a false False merely keeps a loser → observe-only. So ANY
+    active-motion/locomotion verb OR a directional-travel cue forces False, and True
+    requires POSITIVE balance evidence (a static-hold phrase or a balance-DOMINANT token —
+    weak modifiers like "upright"/"stance"/"steady" are NOT sufficient alone, since they
+    appear in active goals like "salute while staying upright")."""
     g = (behavior_goal or "").lower()
     toks = set(re.findall(r"[a-z]+", g))
-    if toks & set(_ACTIVE_MOTION_TOKENS):
+    stems = {t.rstrip("s") for t in toks} | {t[:-3] for t in toks if t.endswith("ing")} \
+        | {t[:-2] for t in toks if t.endswith("ed")}
+    active = {a.rstrip("s") for a in _ACTIVE_MOTION_TOKENS}
+    if (toks & set(_ACTIVE_MOTION_TOKENS)) or (stems & active):   # incl. inflected forms
         return False
     if toks & set(_DIRECTIONAL_TOKENS):
         return False
@@ -725,8 +732,70 @@ def _goal_is_static_hold(behavior_goal: str) -> bool:
     return bool(toks & set(_STATIC_HOLD_TOKENS))
 
 
+def _scalar_end(v: Any) -> float:
+    """The END value of a MotionSpec Scalar (a float, or a [start, end] ramp)."""
+    try:
+        if isinstance(v, (list, tuple)):
+            return float(v[-1]) if v else 0.0
+        return float(v)
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def _spec_is_static_hold(spec: Any) -> bool:
+    """True iff a competence-ladder TOP rung describes a STILL UPRIGHT hold — high
+    uprightness, no pelvis fold, no travel/hops, and no commanded joint motion. This reads
+    the blind author's own notion of competence (anti-collusion: the author never sees the
+    metric), so it decides whether do_nothing_upright is ON-goal WITHOUT brittle goal-text
+    keywords."""
+    try:
+        if _scalar_end(getattr(spec, "uprightness", 1.0)) < 0.8:
+            return False
+        if abs(float(getattr(spec, "fold_depth_m", 0.0) or 0.0)) > 0.05:
+            return False
+        if abs(float(getattr(spec, "forward_speed_mps", 0.0) or 0.0)) > 0.1:
+            return False
+        if abs(float(getattr(spec, "lateral_speed_mps", 0.0) or 0.0)) > 0.1:
+            return False
+        if int(getattr(spec, "hop_count", 0) or 0) > 0 and float(getattr(spec, "hop_height_m", 0.0) or 0.0) > 0.05:
+            return False
+        for gr in (getattr(spec, "groups", []) or []):
+            if abs(float(getattr(gr, "amplitude_rad", 0.0) or 0.0)) > 0.1:
+                return False
+            if abs(float(getattr(gr, "peak_radps", 0.0) or 0.0)) > 0.5 and int(getattr(gr, "burst_count", 0) or 0) > 0:
+                return False
+        return True
+    except Exception:  # noqa: BLE001 — unparseable spec → not static-hold (keep losers)
+        return False
+
+
+def _spec_is_terminal_down(spec: Any) -> bool:
+    """True iff a competence-ladder TOP rung describes a DOWN end-state (lie/rest) —
+    non-upright or near-floor at the top, so collapse_and_stay_down is ON-goal."""
+    try:
+        return (_scalar_end(getattr(spec, "uprightness", 1.0)) <= 0.3
+                or _scalar_end(getattr(spec, "base_height_m", 0.7)) <= 0.35)
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _ladder_posture(top_specs: list) -> tuple[Optional[bool], Optional[bool]]:
+    """Aggregate the AUTHORED top-rung specs of the valid ladders into (static_hold,
+    terminal_down) by STRICT MAJORITY. Returns (None, None) when there is no usable
+    evidence (caller falls back to the goal-text keyword classifier). Ties → False (the
+    safe direction: keep the losers)."""
+    specs = [s for s in (top_specs or []) if s is not None]
+    if not specs:
+        return None, None
+    n = len(specs)
+    sh = sum(1 for s in specs if _spec_is_static_hold(s))
+    td = sum(1 for s in specs if _spec_is_terminal_down(s))
+    return (sh * 2 > n), (td * 2 > n)
+
+
 def general_required_losers(
     joint_names: list[str], behavior_goal: str = "",
+    *, static_hold: Optional[bool] = None, terminal_down: Optional[bool] = None,
 ) -> list[dict]:
     """§round-13 FALSE-GRANT fix: DETERMINISTIC, goal-AGNOSTIC gaming probes that a
     genuine metric of ANY active goal must score LOW, but a CONFOUND-only proxy
@@ -753,6 +822,12 @@ def general_required_losers(
       - collapse is ON-goal for a terminal-DOWN goal (lie/rest) → dropped only then.
       So: balance→{collapse}; lie-down/lie-still→{do_nothing,jitter}; active→all three.
 
+    §round-17: `static_hold`/`terminal_down` are normally derived from the blind AUTHORED
+    ladder's top-rung posture (`_ladder_posture`) — goal-text-independent and
+    anti-collusion-safe — which replaced the brittle goal-keyword classifier (it had a new
+    token gap every round). When not supplied they fall back to the keyword classifier (for
+    direct/test callers without a ladder).
+
     A raise while scoring a loser is handled as score 0.0 (counted) in the gate, so an
     honest onset/phase metric that indexes an empty selection on a degenerate loser is NOT
     false-rejected, and a real reward-the-degenerate proxy (which returns a HIGH score, not
@@ -766,8 +841,8 @@ def general_required_losers(
         return {"name": name, "channel": channel, "arrays": arrays,
                 "behavior": behavior, "meta": dict(meta)}
 
-    sh = _goal_is_static_hold(behavior_goal)
-    td = _goal_is_terminal_down(behavior_goal)
+    sh = _goal_is_static_hold(behavior_goal) if static_hold is None else static_hold
+    td = _goal_is_terminal_down(behavior_goal) if terminal_down is None else terminal_down
     losers: list[dict] = []
     if not (sh and not td):   # still-upright losers are on-goal ONLY for a balance goal
         # do_nothing is PERFECTLY still + upright: a posture/height proxy AND a stillness
@@ -1131,6 +1206,7 @@ def calibrate_task_derived(
 
     sources: list[dict[str, Any]] = []
     valid_rhos: list[float] = []
+    valid_top_specs: list = []   # §round-17: authored top-rung specs of valid ladders
     n_agree = 0
     for si in range(k_sources):
         style = _TD_STYLES[si % len(_TD_STYLES)]
@@ -1203,6 +1279,7 @@ def calibrate_task_derived(
         rec["rho"] = round(rho, 4)
         rec["separation"] = round(separation, 4)
         rec["ladder_ok"] = True
+        valid_top_specs.append(rungs[-1] if rungs else None)   # §round-17 ladder posture
         # ABSOLUTE-SEPARATION anchor indicts the METRIC (counts as disagreement).
         # §round-6 defense-in-depth: a non-finite separation must FAIL the gate (a bare
         # `nan < min` is False and would pass) — gen_scores are coerced finite above, so
@@ -1257,7 +1334,12 @@ def calibrate_task_derived(
                 # jitter / collapse-and-stay) run ALWAYS for a novel (family=None) fold/
                 # posture/gesture grant — a real metric scores them ~0; a posture/depth
                 # CONFOUND-only proxy scores one at/above the ceiling → gameable → denied.
-                req_losers = general_required_losers(names, behavior_goal)
+                # §round-17: whether the still-upright losers are ON-goal (a balance/lie
+                # task) is decided from the blind AUTHORED ladder's top-rung posture, NOT a
+                # brittle goal-keyword classifier (which had a new token gap every round).
+                ladder_sh, ladder_td = _ladder_posture(valid_top_specs)
+                req_losers = general_required_losers(
+                    names, behavior_goal, static_hold=ladder_sh, terminal_down=ladder_td)
                 sc = list(_GENERAL_SCORED_CHANNELS)
             # The LLM breadth pass is opt-in (`adversarial`); the deterministic losers
             # always run, so skipping it never fails the firewall open.
