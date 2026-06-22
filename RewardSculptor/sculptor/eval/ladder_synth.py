@@ -34,7 +34,7 @@ from __future__ import annotations
 from typing import Any, Optional, Union
 
 import numpy as np
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from sculptor.eval.joint_resolver import resolve_joint_roles, select_joints
 
@@ -69,6 +69,22 @@ class RoleQuery(BaseModel):
     # sagittal plane (matches LEG_SAGITTAL_AXES).
     axes: list[Optional[str]] = Field(default_factory=lambda: ["pitch", None])
     sides: Optional[list[str]] = None
+
+    @field_validator("axes", mode="before")
+    @classmethod
+    def _coerce_axes(cls, v):
+        """§round-13: the blind gaming/ladder author commonly emits `axes: null`
+        (a whole-set null, not a list of nulls). The strict `list[Optional[str]]`
+        type REJECTS that, raising a ValidationError that drops the ENTIRE
+        GamingArchetypeSet — which made the adversarial gate fail OPEN (ran=False
+        → not enforced → false grant). Coerce a top-level null to the default
+        (pitch + single-DOF) so one malformed field degrades to the default, never
+        nukes the whole set; a stray scalar is wrapped into a 1-element list."""
+        if v is None:
+            return ["pitch", None]
+        if isinstance(v, (str, type(None))):
+            return [v]
+        return v
 
 
 class Group(BaseModel):

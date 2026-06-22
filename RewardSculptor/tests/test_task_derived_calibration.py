@@ -438,15 +438,18 @@ def test_adversarial_catches_tremor_hole_l2_missed(tmp_path):
     assert "stand_and_flail" in cal["reason"]
 
 
-def test_adversarial_flag_off_is_a_noop(tmp_path):
-    """Default off: the grant is byte-identical to Ship 51 and NO adversary call
-    is made (the minimal novel-task path stays cheap)."""
+def test_adversarial_flag_off_skips_the_llm_breadth_pass(tmp_path):
+    """adversarial=False → NO LLM gaming-author call is made (the path stays cheap).
+    §round-13: the kick gate's deterministic losers are opt-in (a canonical kick routes
+    to the built-in path), so a kick goal without the opt-in is NOT enforced and the
+    GAMEABLE_KICK grant survives — but the gate record, if present, made no LLM call."""
     p = _write(tmp_path, "gameable.py", GAMEABLE_KICK)
     client = _FakeBothClient(_three_kicks(), gaming_travel())
     cal = calibrate_task_derived(p, "kick forward from a stance",
                                  robot_hint="Unitree-G1", client=client, adversarial=False)
-    assert cal["ok"]                              # granted (would be denied if enforced)
-    assert cal["adversarial"] is None
+    assert cal["ok"]                              # kick gate is opt-in → not enforced here
+    adv = cal["adversarial"]
+    assert adv is None or not adv.get("archetypes")   # no LLM breadth pass was run
     assert client.messages.gaming_calls == 0
 
 
@@ -1200,3 +1203,95 @@ def test_adversarial_gate_nan_hack_is_gameable():
     assert rec["ran"] is True
     assert rec["gameable"] is True          # NaN hack → gameable, not silently dropped
     assert rec["ok"] is False
+
+
+# ── §round-13 RED-TEAM FALSE-GRANT fixes ─────────────────────────────────────
+# The red-team CONSTRUCTED false grants: a depth-only / posture-only proxy earned
+# steer-rights because the blind ladders co-vary the confound with the rung and the
+# only goal-aware defense (the adversarial gate) was off-by-default / kick-only /
+# fail-open. The deterministic goal-blind losers now run ALWAYS for a novel grant.
+
+def test_round13_naive_ladder_denies_depth_proxy_via_deterministic_loser(tmp_path):
+    """With a NAIVE monotone fold ladder (what a real blind LLM emits — NOT the synthetic
+    discriminating ladder), a pelvis-DEPTH-ONLY proxy used to FALSE-GRANT. The always-on
+    deterministic gate (collapse_and_stay_down) now DENIES it in the DEFAULT path
+    (adversarial=False), while the honest gate·min toe-touch metric still GRANTS — no
+    reliance on the ladder happening to be discriminating."""
+    real = _write(tmp_path, "toe.py", TOE_TOUCH)
+    proxy = _write(tmp_path, "depth.py", DEPTH_ONLY)
+
+    def _cal(p):
+        return calibrate_task_derived(
+            p, "touch your toes then stand back up", robot_hint="Unitree-G1",
+            client=_FakeLadderClient(fold_ladder(), fold_ladder(), fold_ladder()))
+
+    real_cal, proxy_cal = _cal(real), _cal(proxy)
+    assert real_cal["ok"], real_cal                      # honest metric still grants
+    assert not proxy_cal["ok"], proxy_cal                # depth proxy now DENIED by default
+    assert proxy_cal["adversarial"]["gameable"]
+    assert "collapse_and_stay_down" in (proxy_cal["reason"] or "")
+
+
+def test_round13_general_losers_flag_confound_proxies_not_real_metric():
+    """Gate-level: the general deterministic losers flag a posture-only AND a depth-only
+    proxy (gameable) but score an honest fold metric ~0 (not gameable)."""
+    from sculptor.eval.metric_calibration import (
+        general_required_losers, adversarial_archetype_gate)
+    from sculptor.eval.generated_metric import load_generated_metric
+    import tempfile, os
+    losers = general_required_losers(G1, "wave your arm then lower it")
+
+    def _gate(fn, roles=None):
+        return adversarial_archetype_gate(
+            fn, roles or [], G1, competent_ref=1.0, client=None,
+            required_losers=losers, scored_channels=["posture", "completion"],
+            author=False)
+
+    def posture_only(arrays, behavior, meta):
+        import numpy as np
+        g = arrays.get("projected_gravity_b"); root = arrays.get("root_link_pos_w")
+        if g is None or root is None:
+            return {"spec_score": 0.0}
+        up = float(np.mean(np.clip(-g[..., 2], 0, 1)))
+        z = float(np.mean(root[..., 2]) / 0.7)
+        return {"spec_score": float(np.clip(0.5 * up + 0.5 * z, 0.0, 1.0))}
+
+    def depth_only(arrays, behavior, meta):
+        import numpy as np
+        root = arrays.get("root_link_pos_w")
+        if root is None:
+            return {"spec_score": 0.0}
+        z = root[..., 2]
+        return {"spec_score": float(np.clip((z.max(0) - z.min(0)).mean(), 0.0, 1.0))}
+
+    assert _gate(posture_only)["gameable"]               # do_nothing_upright scores it max
+    assert _gate(depth_only)["gameable"]                 # collapse_and_stay_down scores it high
+    # an honest fold metric scores every general loser ~0 → not gameable
+    with tempfile.TemporaryDirectory() as d:
+        mp = os.path.join(d, "toe.py")
+        open(mp, "w").write(TOE_TOUCH)
+        rec = _gate(load_generated_metric(mp), [])
+    assert not rec["gameable"], rec
+
+
+def test_round13_terminal_down_goal_omits_collapse_loser():
+    """A goal whose competent end-state is DOWN (lie/rest, no return) must NOT use
+    collapse_and_stay_down as a loser (it is ON-goal there → would false-deny)."""
+    from sculptor.eval.metric_calibration import general_required_losers
+    fold = [l["name"] for l in general_required_losers(G1, "touch your toes then stand up")]
+    lie = [l["name"] for l in general_required_losers(G1, "lie down on the floor and rest")]
+    assert "collapse_and_stay_down" in fold
+    assert "collapse_and_stay_down" not in lie           # on-goal → not a loser
+    assert "do_nothing_upright" in lie                   # still off-goal everywhere
+
+
+def test_round13_role_query_axes_null_does_not_break_set():
+    """§round-13 fail-open fix: the blind gaming/ladder author commonly emits
+    `axes: null`; the strict list type used to raise ValidationError and drop the whole
+    GamingArchetypeSet → the gate fell to ran=False (not enforced → false grant). A null
+    now coerces to the default instead of nuking the set."""
+    from sculptor.eval.ladder_synth import RoleQuery
+    rq = RoleQuery.model_validate({"segments": ["arm"], "axes": None})
+    assert rq.axes == ["pitch", None]                    # coerced, no ValidationError
+    rq2 = RoleQuery.model_validate({"segments": ["arm"], "axes": "pitch"})
+    assert rq2.axes == ["pitch"]                         # scalar wrapped

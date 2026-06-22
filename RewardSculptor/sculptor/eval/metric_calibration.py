@@ -647,6 +647,70 @@ def kick_required_losers(
 #: competence, NOT a gaming policy.
 _KICK_SCORED_CHANNELS = ("direction", "completion", "amplitude")
 
+#: §round-13 the GENERAL (goal-agnostic) gaming channels every task-derived grant
+#: must defend: a CONFOUND-only proxy that reads posture/height or one-way pelvis
+#: depth without performing the goal.
+_GENERAL_SCORED_CHANNELS = ("posture", "completion")
+#: A goal whose competent END-STATE is on the floor (lie/lay down, sleep, rest,
+#: collapse, prone) — for these `collapse_and_stay_down` is ON-goal, so it must NOT
+#: be used as a required-loser (would false-deny a legit descend metric).
+_TERMINAL_DOWN_TOKENS = ("lie", "lay", "lying", "laying", "sleep", "rest",
+                         "resting", "collapse", "prone", "supine")
+#: …unless the goal also says it returns/rises (then the down state is transient).
+_RETURN_UP_TOKENS = ("up", "rise", "rises", "rising", "stand", "standing",
+                     "return", "returns", "back", "recover", "straighten", "tall")
+
+
+def _goal_is_terminal_down(behavior_goal: str) -> bool:
+    """True iff the goal's competent end-state is DOWN (lie/rest, no return) — then a
+    collapse-and-stay policy is ON-goal and must not be used as a required-loser."""
+    toks = set(re.findall(r"[a-z]+", (behavior_goal or "").lower()))
+    return bool(toks & set(_TERMINAL_DOWN_TOKENS)) and not (toks & set(_RETURN_UP_TOKENS))
+
+
+def general_required_losers(
+    joint_names: list[str], behavior_goal: str = "",
+) -> list[dict]:
+    """§round-13 FALSE-GRANT fix: DETERMINISTIC, goal-AGNOSTIC gaming probes that a
+    genuine metric of ANY active goal must score LOW, but a CONFOUND-only proxy
+    scores HIGH — so the firewall no longer relies on a blind LLM author happening
+    to propose the catching archetype (the depth-only / posture-only proxies that
+    false-granted on fold/gesture goals). Each is `{name, channel, arrays, behavior,
+    meta}`, rendered offline via the Ship-51 synthesizer; run REGARDLESS of family or
+    flags. Never raises.
+
+      * do_nothing_upright — perfectly still + fully upright at nominal height. Any
+        ACTIVE goal (fold/gesture/locomotion/kick) is unperformed → a real metric
+        scores ~0; a posture/height proxy scores it MAX. (catches the posture proxy)
+      * jitter_in_place — tiny upright tremor, no goal-relevant motion → catches a
+        proxy that only needs SOME motion.
+      * collapse_and_stay_down — a deep pelvis dip that NEVER returns upright →
+        catches a dip-DEPTH-only proxy that ignores the 'stand back up' half. Omitted
+        only for a terminal-DOWN goal (lie/rest), where collapse is on-goal.
+    """
+    from sculptor.eval.ladder_synth import MotionSpec, render_rung
+
+    def _pack(name: str, channel: str, spec: Any, idx: int) -> dict:
+        arrays, behavior, meta = render_rung(spec, joint_names, rung_index=idx)
+        return {"name": name, "channel": channel, "arrays": arrays,
+                "behavior": behavior, "meta": dict(meta)}
+
+    losers = [
+        _pack("do_nothing_upright", "posture",
+              MotionSpec(uprightness=1.0, base_height_m=0.7), 600),
+        # jitter is a PHYSICALLY-REALIZABLE idle twitch: tremor renders at a fixed
+        # 15 Hz, so the amplitude is kept small (≤~0.2 rad p2p → peak vel within G1's
+        # ~20 rad/s actuator limit). A larger tremor would be an UNREALIZABLE >80 rad/s
+        # policy that false-rejects honest amplitude metrics (twist/knee-raise) the
+        # gaming policy could never actually perform.
+        _pack("jitter_in_place", "posture",
+              MotionSpec(uprightness=1.0, base_height_m=0.7, tremor=0.15, noise=0.05), 601),
+    ]
+    if not _goal_is_terminal_down(behavior_goal):
+        losers.append(_pack("collapse_and_stay_down", "completion",
+                            MotionSpec(uprightness=0.0, base_height_m=[0.7, 0.1]), 602))
+    return losers
+
 
 def adversarial_archetype_gate(
     gen_fn: Any,
@@ -663,6 +727,7 @@ def adversarial_archetype_gate(
     abs_ceil: float = _ADV_ABS_CEIL,
     required_losers: Optional[list[dict]] = None,
     scored_channels: Optional[list[str]] = None,
+    author: bool = True,
 ) -> dict[str, Any]:
     """§Ship 53 (L3): an INDEPENDENT, metric-blind author proposes `n_archetypes`
     OFF-GOAL gaming policies for the goal; each is rendered (Ship-51 synthesizer)
@@ -733,7 +798,12 @@ def adversarial_archetype_gate(
     author_reason: Optional[str] = None
     gset = None
     payload_text = json.dumps(payload, default=str)
-    if "def compute_spec" in payload_text or (
+    if not author:
+        # §round-13: deterministic-losers-only mode (the always-on default firewall).
+        # The LLM breadth pass is opt-in (adversarial=True); skipping it spends no call
+        # and never fails open — the required_losers above carry the verdict.
+        author_reason = "adversarial: LLM breadth pass not requested (deterministic losers only)"
+    elif "def compute_spec" in payload_text or (
             metric_src and metric_src[:120] in payload_text):
         # HARD anti-collusion self-check: WE built `payload`, so the metric must
         # not appear in it. A hit is a programmer error — skip the author (a bug
@@ -1068,33 +1138,44 @@ def calibrate_task_derived(
     agreement = n_agree / float(k_sources)
     base_ok = (rho_min >= rho_floor) and (agreement >= agree_floor) and (n_valid >= _TD_MIN_VALID)
 
-    # §Ship 53 (L3): only when base_ok do we spend a call probing gameability —
-    # the metric's competent reference is its best top-rung score across valid
-    # sources (most charitable, hardest to false-deny). A gameable verdict is a
-    # task-specific extra required-loser, ANDed into the grant.
+    # §round-13 FALSE-GRANT fix: the gate now runs whenever base_ok (was opt-in
+    # `adversarial` only → a posture/depth CONFOUND-only proxy false-granted in the
+    # default path, because the blind ladders co-vary the confound with rung and the
+    # only goal-aware defense was off). The DETERMINISTIC goal-blind losers
+    # (general_required_losers) run ALWAYS and carry the verdict — they never fail
+    # open. The metric's competent reference is its best top-rung score across valid
+    # sources (most charitable, hardest to false-deny).
     adv = None
-    if adversarial and base_ok:
+    if base_ok:
         try:
             competent_ref = max(
                 (s["gen_scores"][-1] for s in sources
                  if s.get("ladder_ok") and s.get("gen_scores")), default=0.0)
-            # §Metric-quality laws (LAW 9): OPT-IN deterministic kick required-
-            # losers (the kick hack rungs WITH foot_pos_b). Default OFF so the grant
-            # stays byte-identical to Ship 53; ON only for a novel KICK-VARIANT task
-            # (a canonical kick routes to the built-in path, not here). Each loser
-            # gets the metric's roles injected inside the gate.
-            req_losers = None
-            sc = None
-            if adversarial_required_losers:
-                from sculptor.eval.metric_validate import resolve_behavior_family
-                if resolve_behavior_family(behavior_goal, robot_hint) == "kick":
-                    req_losers = kick_required_losers(names, behavior_goal, robot_hint)
-                    sc = list(_KICK_SCORED_CHANNELS)
+            from sculptor.eval.metric_validate import resolve_behavior_family
+            fam = resolve_behavior_family(behavior_goal, robot_hint)
+            if fam == "kick":
+                # A KICK has DEDICATED direction/completion/amplitude losers (WITH
+                # foot_pos_b); the general posture/depth losers mis-fire on an
+                # intensity-based kick metric, so they are NOT used here. The kick
+                # losers stay opt-in (a canonical kick routes to the built-in path).
+                req_losers = (kick_required_losers(names, behavior_goal, robot_hint)
+                              if adversarial_required_losers else None)
+                sc = list(_KICK_SCORED_CHANNELS) if adversarial_required_losers else None
+            else:
+                # §round-13 FALSE-GRANT fix: the general goal-blind losers (do-nothing /
+                # jitter / collapse-and-stay) run ALWAYS for a novel (family=None) fold/
+                # posture/gesture grant — a real metric scores them ~0; a posture/depth
+                # CONFOUND-only proxy scores one at/above the ceiling → gameable → denied.
+                req_losers = general_required_losers(names, behavior_goal)
+                sc = list(_GENERAL_SCORED_CHANNELS)
+            # The LLM breadth pass is opt-in (`adversarial`); the deterministic losers
+            # always run, so skipping it never fails the firewall open.
             adv = adversarial_archetype_gate(
                 gen_fn, roles, names, competent_ref, client=client, model=model,
                 base_payload=base_payload, metric_src=metric_src,
                 n_archetypes=adversarial_n,
-                required_losers=req_losers, scored_channels=sc)
+                required_losers=req_losers, scored_channels=sc,
+                author=adversarial)
         except Exception:  # noqa: BLE001 — an unexpected gate crash is NO evidence,
             adv = None      # never a deny (calibrate_task_derived never raises)
 
