@@ -659,6 +659,14 @@ _TERMINAL_DOWN_TOKENS = ("lie", "lay", "lying", "laying", "sleep", "rest",
 #: …unless the goal also says it returns/rises (then the down state is transient).
 _RETURN_UP_TOKENS = ("up", "rise", "rises", "rising", "stand", "standing",
                      "return", "returns", "back", "recover", "straighten", "tall")
+#: A goal whose competent behavior IS standing upright and still (balance / hold /
+#: stay steady) — for these `do_nothing_upright` (and the idle `jitter`) are ON-goal,
+#: so they must NOT be used as required-losers (they would false-deny a balance metric
+#: whose competent top-rung renders identically to a still upright stance). The tokens
+#: are deliberately TIGHT (no bare "stand"/"hold"/"upright" — those appear in active
+#: goals like "stand back up" / "hold your arms out") so an active goal is not misread.
+_STATIC_HOLD_TOKENS = ("balance", "balanced", "balancing", "still", "steady",
+                       "stable", "motionless", "stationary", "immobile")
 
 
 def _goal_is_terminal_down(behavior_goal: str) -> bool:
@@ -666,6 +674,13 @@ def _goal_is_terminal_down(behavior_goal: str) -> bool:
     collapse-and-stay policy is ON-goal and must not be used as a required-loser."""
     toks = set(re.findall(r"[a-z]+", (behavior_goal or "").lower()))
     return bool(toks & set(_TERMINAL_DOWN_TOKENS)) and not (toks & set(_RETURN_UP_TOKENS))
+
+
+def _goal_is_static_hold(behavior_goal: str) -> bool:
+    """True iff the goal's competent behavior is a still upright hold (balance / steady /
+    motionless) — then standing still IS the goal, so the stillness losers are off."""
+    toks = set(re.findall(r"[a-z]+", (behavior_goal or "").lower()))
+    return bool(toks & set(_STATIC_HOLD_TOKENS))
 
 
 def general_required_losers(
@@ -682,8 +697,11 @@ def general_required_losers(
       * do_nothing_upright — perfectly still + fully upright at nominal height. Any
         ACTIVE goal (fold/gesture/locomotion/kick) is unperformed → a real metric
         scores ~0; a posture/height proxy scores it MAX. (catches the posture proxy)
-      * jitter_in_place — tiny upright tremor, no goal-relevant motion → catches a
-        proxy that only needs SOME motion.
+        Omitted for a STATIC-HOLD goal (balance/steady), where standing still is on-goal.
+      * jitter_in_place — a SMALL idle high-frequency twitch: catches a proxy that
+        rewards generic joint VELOCITY/"some motion" (its 15 Hz gives high velocity at
+        a deliberately small ROM, so an honest small-amplitude gesture metric is NOT
+        false-rejected). Omitted for a static-hold goal.
       * collapse_and_stay_down — a deep pelvis dip that NEVER returns upright →
         catches a dip-DEPTH-only proxy that ignores the 'stand back up' half. Omitted
         only for a terminal-DOWN goal (lie/rest), where collapse is on-goal.
@@ -695,17 +713,21 @@ def general_required_losers(
         return {"name": name, "channel": channel, "arrays": arrays,
                 "behavior": behavior, "meta": dict(meta)}
 
-    losers = [
-        _pack("do_nothing_upright", "posture",
-              MotionSpec(uprightness=1.0, base_height_m=0.7), 600),
-        # jitter is a PHYSICALLY-REALIZABLE idle twitch: tremor renders at a fixed
-        # 15 Hz, so the amplitude is kept small (≤~0.2 rad p2p → peak vel within G1's
-        # ~20 rad/s actuator limit). A larger tremor would be an UNREALIZABLE >80 rad/s
-        # policy that false-rejects honest amplitude metrics (twist/knee-raise) the
-        # gaming policy could never actually perform.
-        _pack("jitter_in_place", "posture",
-              MotionSpec(uprightness=1.0, base_height_m=0.7, tremor=0.15, noise=0.05), 601),
-    ]
+    losers: list[dict] = []
+    if not _goal_is_static_hold(behavior_goal):
+        # §round-14: a balance/steady goal's competent behavior IS a still upright stance,
+        # so these stillness losers are ON-goal there and would false-deny it.
+        losers.append(_pack("do_nothing_upright", "posture",
+                            MotionSpec(uprightness=1.0, base_height_m=0.7), 600))
+        # §round-14: a SMALL twitch (tremor 0.04 → ~0.07 rad ROM, peak vel ~3.5 rad/s,
+        # no noise term so the ROM is predictable) — enough joint VELOCITY at 15 Hz to
+        # trip a "rewards any motion" proxy, but a ROM far below any plausible gesture
+        # target so an honest small-amplitude gesture metric (target ≥ ~0.15 rad / ~9°)
+        # is NOT false-rejected. (Was tremor 0.15 → 0.48 rad ROM, which denied gestures
+        # up to ~54°.)
+        losers.append(_pack("jitter_in_place", "posture",
+                            MotionSpec(uprightness=1.0, base_height_m=0.7,
+                                       tremor=0.04), 601))
     if not _goal_is_terminal_down(behavior_goal):
         losers.append(_pack("collapse_and_stay_down", "completion",
                             MotionSpec(uprightness=0.0, base_height_m=[0.7, 0.1]), 602))
@@ -780,10 +802,19 @@ def adversarial_archetype_gate(
             inject_joint_roles(meta, roles)
             s = float(gen_fn(loser["arrays"], loser["behavior"], meta)
                       .get("spec_score", 0.0))
-        except Exception as e:  # noqa: BLE001 — unscorable probe = no evidence
+        except Exception as e:  # noqa: BLE001
+            # §round-14 FAIL-CLOSED: a required-loser is a renderer-built, ALWAYS-
+            # scorable rollout, and a conformant metric NEVER raises. A raise here is
+            # therefore EVIDENCE OF EVASION (a gaming metric that detects the probe —
+            # e.g. by its empty groups_resolved_counts — and raises to dodge the gate),
+            # NOT "no evidence". Count it (ran=True) and score it MAXIMALLY gaming so
+            # the verdict denies, instead of silently skipping (which nuked all losers
+            # → ran=False → gate not enforced → the depth/posture proxy re-granted).
+            losers_scored += 1
+            worst, worst_name = 1.0, name
             rec["required_losers"].append(
-                {"name": name, "channel": loser.get("channel"),
-                 "skipped": f"score error: {type(e).__name__}"})
+                {"name": name, "channel": loser.get("channel"), "score": 1.0,
+                 "error": f"score error (fail-closed): {type(e).__name__}"})
             continue
         s = _gameable_score(s)   # §round-7: a NaN/inf hack score → GAMEABLE (fail-closed)
         losers_scored += 1

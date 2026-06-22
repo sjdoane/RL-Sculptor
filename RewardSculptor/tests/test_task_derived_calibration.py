@@ -1295,3 +1295,87 @@ def test_round13_role_query_axes_null_does_not_break_set():
     assert rq.axes == ["pitch", None]                    # coerced, no ValidationError
     rq2 = RoleQuery.model_validate({"segments": ["arm"], "axes": "pitch"})
     assert rq2.axes == ["pitch"]                         # scalar wrapped
+
+
+# ── §round-14 verify the round-13 fix: close the fail-open + 2 false-rejects ──
+
+def test_round14_loser_crash_fails_closed_not_skipped():
+    """§round-14 CRITICAL: a metric that RAISES on the deterministic losers (e.g. a gaming
+    metric that detects the group-less probe and raises to dodge the gate) must FAIL
+    CLOSED — counted as gaming, not silently skipped. Skipping nuked all losers →
+    ran=False → gate not enforced → the depth/posture proxy re-granted."""
+    from sculptor.eval.metric_calibration import (
+        general_required_losers, adversarial_archetype_gate)
+    losers = general_required_losers(G1, "touch your toes then stand back up")
+
+    def evader(arrays, behavior, meta):
+        import numpy as np
+        if not (meta or {}).get("groups_resolved_counts"):
+            raise RuntimeError("detected the group-less probe — evade")
+        z = arrays["root_link_pos_w"][..., 2]
+        return {"spec_score": float(np.clip((z.max(0) - z.min(0)).mean(), 0.0, 1.0))}
+
+    rec = adversarial_archetype_gate(
+        evader, [], G1, competent_ref=1.0, client=None,
+        required_losers=losers, scored_channels=["posture", "completion"], author=False)
+    assert rec["ran"] is True                # the crashing losers still counted
+    assert rec["gameable"] is True           # → gameable (fail-closed), not a skip-to-grant
+
+
+def test_round14_static_hold_goal_drops_stillness_losers():
+    """§round-14 HIGH: a balance/steady goal's competent behavior IS a still upright
+    stance, so do_nothing_upright/jitter are ON-goal there and must be dropped (else a
+    genuine balance metric is false-denied). collapse_and_stay_down still applies."""
+    from sculptor.eval.metric_calibration import general_required_losers
+    hold = [l["name"] for l in general_required_losers(G1, "stand still and balance steadily")]
+    active = [l["name"] for l in general_required_losers(G1, "wave your arm then lower it")]
+    assert "do_nothing_upright" not in hold and "jitter_in_place" not in hold
+    assert "collapse_and_stay_down" in hold          # a balance task must not collapse
+    assert "do_nothing_upright" in active            # an active goal keeps the stillness losers
+
+    def balance_metric(arrays, behavior, meta):
+        import numpy as np
+        g = arrays.get("projected_gravity_b")
+        return {"spec_score": float(np.mean(np.clip(-g[..., 2], 0, 1)))} if g is not None else {"spec_score": 0.0}
+
+    from sculptor.eval.metric_calibration import adversarial_archetype_gate
+    rec = adversarial_archetype_gate(
+        balance_metric, [], G1, competent_ref=1.0, client=None,
+        required_losers=general_required_losers(G1, "stand still and balance steadily"),
+        scored_channels=["posture", "completion"], author=False)
+    assert not rec["gameable"]                        # balance metric NOT false-denied
+
+
+def test_round14_small_gesture_metric_not_false_rejected():
+    """§round-14 MEDIUM: the shrunk jitter (ROM ~0.07 rad) must NOT false-reject an honest
+    small-amplitude gesture metric (target ~0.3 rad), while still catching a 'rewards any
+    joint motion' velocity proxy (jitter's 15 Hz gives high velocity at small ROM)."""
+    from sculptor.eval.metric_calibration import (
+        general_required_losers, adversarial_archetype_gate)
+    losers = general_required_losers(G1, "give a small shoulder shrug gesture")
+
+    def gentle_gesture(arrays, behavior, meta):  # rewards ROM normalized by a 0.3 rad target
+        import numpy as np
+        jp = arrays.get("joint_pos")
+        if jp is None:
+            return {"spec_score": 0.0}
+        return {"spec_score": float(np.clip((jp.max(0) - jp.min(0)).mean() / 0.30, 0.0, 1.0))}
+
+    rec = adversarial_archetype_gate(
+        gentle_gesture, [], G1, competent_ref=1.0, client=None,
+        required_losers=losers, scored_channels=["posture", "completion"], author=False)
+    js = next(l["score"] for l in rec["required_losers"] if l["name"] == "jitter_in_place")
+    assert js < 0.5                                   # gesture reads jitter's small ROM low
+    assert not rec["gameable"]                        # → NOT false-rejected
+
+    def any_velocity(arrays, behavior, meta):  # gaming: rewards generic joint velocity
+        import numpy as np
+        jv = arrays.get("joint_vel")
+        if jv is None:
+            return {"spec_score": 0.0}
+        return {"spec_score": float(np.clip(np.abs(jv).mean() / 1.5, 0.0, 1.0))}
+
+    rec2 = adversarial_archetype_gate(
+        any_velocity, [], G1, competent_ref=1.0, client=None,
+        required_losers=losers, scored_channels=["posture", "completion"], author=False)
+    assert rec2["gameable"]                           # a velocity proxy is STILL caught
