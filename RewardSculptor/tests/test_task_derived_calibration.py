@@ -1070,3 +1070,69 @@ def test_author_structured_skips_decoy_picks_valid():
         messages = _M()
     out = _author_structured(_C(), "m", "sys", {"g": 1}, CompetenceLadder)
     assert [r.fold_depth_m for r in out.rungs] == [r.fold_depth_m for r in lad.rungs]
+
+
+# ── §round-5 review: empty-shadow false-grant guard + RecursionError containment ──
+def test_author_structured_rejects_empty_shadow_picks_real_set():
+    """§round-5 FALSE-GRANT fix: a trivial leading JSON object ({} / {"x":1}) VALIDATES
+    against GamingArchetypeSet/CompetenceLadder with EMPTY content (all-default schemas),
+    so it must NOT shadow the genuine non-empty set — else the gaming gate sees 0
+    archetypes and fails OPEN (a gameable metric grants). _author_structured now skips
+    empty-content objects and returns the first NON-empty one."""
+    from sculptor.eval.metric_calibration import _author_structured
+    real = GamingArchetypeSet(goal_restated="kick", archetypes=[
+        GamingArchetype(name="flail", strategy="jitter",
+                        motion=MotionSpec(uprightness=1.0, tremor=1.8))])
+
+    class _M:
+        def __init__(self, text): self._t = text
+        def create(self, **kw): return _Resp(self._t)
+    class _C:
+        def __init__(self, text): self.messages = _M(text)
+
+    # empty {} BEFORE the real set → must return the real (non-empty) set
+    shadow = 'note: {"example": true} ' + json.dumps(real.model_dump())
+    out = _author_structured(_C(shadow), "m", "sys", {"g": 1}, GamingArchetypeSet)
+    assert len(out.archetypes) == 1 and out.goal_restated == "kick"
+    # ladder shadow too
+    lad = fold_ladder()
+    lout = _author_structured(_C('{} ' + json.dumps(lad.model_dump())), "m", "sys",
+                              {"g": 1}, CompetenceLadder)
+    assert len(lout.rungs) == len(lad.rungs)
+
+
+def test_author_structured_all_empty_raises_failsafe():
+    """If EVERY candidate object is empty/trivial, _author_structured RAISES → the caller
+    records a skip (fail-SAFE: inconclusive, never a silent empty accept that fails the
+    gaming gate open)."""
+    import pytest as _pytest
+    from sculptor.eval.metric_calibration import _author_structured
+
+    class _M:
+        def create(self, **kw): return _Resp('{} {"x":1} {"foo":"bar"}')
+    class _C:
+        messages = _M()
+    with _pytest.raises(Exception):
+        _author_structured(_C(), "m", "sys", {"g": 1}, GamingArchetypeSet)
+
+
+def test_iter_json_objs_contains_recursion_error(monkeypatch):
+    """§round-5: deeply-nested JSON makes raw_decode raise RecursionError (NOT a
+    ValueError) — _iter_json_objs must CONTAIN it (skip that brace, keep scanning),
+    never propagate. Monkeypatch raw_decode to raise RecursionError on the first brace
+    (deterministic across recursion-limit differences); the second genuine object is
+    still found."""
+    import json as _json
+    from sculptor.eval import metric_calibration as mc
+    real = _json.JSONDecoder.raw_decode
+    state = {"n": 0}
+
+    def boom(self, s, *a, **k):
+        state["n"] += 1
+        if state["n"] == 1:
+            raise RecursionError("nested too deep")
+        return real(self, s, *a, **k)
+
+    monkeypatch.setattr(_json.JSONDecoder, "raw_decode", boom)
+    out = list(mc._iter_json_objs('{"x": 1} {"competence_axis": "ok", "rungs": []}'))
+    assert {"competence_axis": "ok", "rungs": []} in out   # contained, scan continued

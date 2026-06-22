@@ -125,10 +125,15 @@ def resolve_behavior_family(
                 "striding", "jog", "jogging", "sprint", "sprinting", "gallop",
                 "skip", "skipping")
     _directional = has("forward", "forwards", "ahead", "velocity")
-    if (_gait or (_directional and not _posture_gesture)) and not _in_place:
-        return "locomotion"
+    # §<round-5 fix>: BALANCE/cartpole is checked BEFORE locomotion — a balance goal
+    # naturally mentions "velocity" ("minimize joint VELOCITY while balancing the pole"),
+    # and `_directional` includes "velocity", so without this ordering such a goal would
+    # mis-resolve to locomotion (→ the wrong go1_trot calibration anchor). The canonical
+    # Hopper "forward_velocity" goal has no balance token, so it still hits locomotion.
     if has("balance", "balancing", "cartpole"):
         return "cartpole"
+    if (_gait or (_directional and not _posture_gesture)) and not _in_place:
+        return "locomotion"
     # Robot-family fallback: a quadruped goal with no behavior word is almost
     # always locomotion.
     rh = (robot_hint or "").lower()

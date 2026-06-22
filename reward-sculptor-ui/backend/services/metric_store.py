@@ -7,6 +7,7 @@ module allocates ids, drives generation/calibration via sculptor_bridge
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Any, Optional
 
@@ -159,15 +160,43 @@ def calibrate(project_dir: Path, gid: str, builtin_name: str) -> dict[str, Any]:
     return _summary(gid, rec)
 
 
+def stamp_cal_token(project_dir: Path, gid: str) -> str:
+    """§round-5: write a fresh calibration token into the metric's meta.json and return
+    it. The LIVE launch path stamps a token BEFORE its timeout-bounded, un-cancellable
+    (asyncio.to_thread) task-derived calibration and passes it as `expect_token`; on
+    TIMEOUT it re-stamps to INVALIDATE the orphaned worker thread, so a calibration that
+    genuinely succeeds AFTER the 300 s timeout cannot silently resurrect `calibrated=true`
+    behind the 'observe-only' verdict already surfaced to the user (it becomes a no-op
+    write — observe-only persisted state is preserved). Never raises (best-effort)."""
+    meta = _metrics_root(project_dir) / gid / "meta.json"
+    try:
+        rec = json.loads(meta.read_text(encoding="utf-8")) if meta.is_file() else {}
+    except Exception:  # noqa: BLE001 — unreadable meta → start fresh token map
+        rec = {}
+    token = f"{gid}:{time.time_ns()}"
+    rec["cal_token"] = token
+    try:
+        meta.write_text(json.dumps(rec, indent=2, default=str), encoding="utf-8")
+    except Exception:  # noqa: BLE001 — best-effort; a missing token just disables the guard
+        pass
+    return token
+
+
 def calibrate_task_derived(
     project_dir: Path, gid: str, behavior_goal: str,
     robot_hint: Optional[str] = None, *, client=None, adversarial: bool = False,
+    expect_token: Optional[str] = None,
 ) -> dict[str, Any]:
     """§Ship 51: calibrate a stored metric against K independently-authored
     competence ladders (the novel-task path) and persist `calibrated` + the
     full per-source provenance into its meta.json. The grant flips at the SAME
     point as the built-in path; `steer_allowed` is untouched.
-    §Ship 53: `adversarial` adds the L3 gaming-archetype gate (flag-gated)."""
+    §Ship 53: `adversarial` adds the L3 gaming-archetype gate (flag-gated).
+    §round-5: `expect_token` (set by the live launch path via `stamp_cal_token`) makes
+    the grant persist ONLY if this attempt is still current — a timed-out launch
+    re-stamps the token, so an orphaned thread that finishes late SKIPS its write
+    (the verdict the user saw stays authoritative). None → unconditional (the explicit,
+    synchronous calibrate-route path, where there is no orphan)."""
     d = _metrics_root(project_dir) / gid
     metric_py = d / "metric.py"
     meta = d / "meta.json"
@@ -176,6 +205,10 @@ def calibrate_task_derived(
     cal = sculptor_bridge.calibrate_task_derived_metric(
         metric_py, behavior_goal, robot_hint, client=client, adversarial=adversarial)
     rec = json.loads(meta.read_text(encoding="utf-8"))
+    if expect_token is not None and rec.get("cal_token") != expect_token:
+        # Superseded (this run timed out and re-stamped the token) — do NOT resurrect a
+        # grant behind the already-surfaced 'observe-only' verdict. Leave meta as-is.
+        return _summary(gid, rec)
     # §Ship 52: unified grant + standardized trust score (same shape as builtin).
     fin = sculptor_bridge.finalize_calibration(cal, rec.get("validation"))
     rec["calibrated"] = fin["calibrated"]

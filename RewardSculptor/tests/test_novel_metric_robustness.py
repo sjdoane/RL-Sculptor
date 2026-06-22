@@ -543,3 +543,15 @@ def test_flail_gameable_metric_named_not_near_constant():
     # the probe DID find it selective (so the message must not claim near-constant)
     assert v["selectivity_probe"]["competent"] >= 0.5
     assert not any("near-constant" in r for r in v["reasons"])
+
+
+def test_balance_goal_with_velocity_resolves_to_cartpole():
+    """§round-5 review: a balance/cartpole goal that mentions 'velocity' (in _directional)
+    must resolve to cartpole, NOT locomotion — the cartpole check now precedes the
+    locomotion check, so the wrong go1_trot calibration anchor isn't selected. The Hopper
+    forward_velocity goal (no balance token) still resolves to locomotion."""
+    from sculptor.eval.metric_validate import resolve_behavior_family as rf
+    assert rf("minimize joint velocity while balancing the pole") == "cartpole"
+    assert rf("balance the cartpole with low velocity") == "cartpole"
+    assert rf("balance the pole upright and keep the cart centered") == "cartpole"
+    assert rf("Canonical Hopper-v4 reward: forward_velocity + alive_bonus") == "locomotion"

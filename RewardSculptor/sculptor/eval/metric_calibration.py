@@ -303,7 +303,11 @@ def _iter_json_objs(text: str):
             break
         try:
             obj, end = dec.raw_decode(text[start:])
-        except ValueError:
+        except (ValueError, RecursionError):
+            # ValueError = a non-JSON brace; RecursionError = JSON nested beyond
+            # CPython's limit (raw_decode raises it, NOT a ValueError) — both mean
+            # "not a usable object here", so skip this brace and keep scanning. Keeps
+            # the helper self-contained (never raises) independent of caller wrapping.
             i = start + 1
             continue
         if isinstance(obj, dict):
@@ -352,16 +356,29 @@ def _author_structured(client: Any, model: str, system_prompt: str,
         raise ValueError(
             f"author response truncated at max_tokens={_AUTHOR_MAX_TOKENS}")
     text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
-    # Try EVERY candidate JSON object and keep the first that VALIDATES against the
-    # schema — so a decoy/prose block before the genuine ladder doesn't shadow it, and a
-    # model that emits multiple objects still yields a usable one. Falls back to the
-    # last validation error (or "no object") so a bad author is a recorded skip.
+    # Try EVERY candidate JSON object and keep the first that validates AND is NON-TRIVIAL
+    # — so a decoy/prose block before the genuine output doesn't shadow it. CRITICAL: the
+    # CompetenceLadder / GamingArchetypeSet schemas have all-default fields (rungs=[],
+    # archetypes=[]), so a stray `{}` / `{"x":1}` VALIDATES with an EMPTY content list. If
+    # such an empty object shadowed the real one, the gaming gate would see 0 archetypes
+    # → ran=False → inconclusive → fail OPEN (a gameable metric grants). So an empty
+    # content list is REJECTED here (keep scanning); if no candidate is non-empty we raise
+    # → the caller records a skip (fail-SAFE: inconclusive, never a silent empty accept).
     last_err: Optional[Exception] = None
     for obj in _iter_json_objs(text):
         try:
-            return schema.model_validate(obj)
+            result = schema.model_validate(obj)
         except Exception as e:  # noqa: BLE001 — try the next candidate
             last_err = e
+            continue
+        items = getattr(result, "archetypes", None)
+        if items is None:
+            items = getattr(result, "rungs", None)
+        if items is not None and len(items) == 0:
+            last_err = ValueError(
+                "structured object has no archetypes/rungs (empty shadow) — skipped")
+            continue
+        return result
     if last_err is not None:
         raise last_err
     raise ValueError("no JSON object in author response")

@@ -286,11 +286,17 @@ async def _generate_at_launch(
                 # from steering regardless).
                 job.emit({"type": "metric_calibration_started", "source": "launch_gen",
                           "gen_id": gid, "method": "task_derived", "k_sources": 3})
+                # §round-5: stamp a calibration token so a >300s orphan (asyncio.to_thread
+                # can't be cancelled) cannot persist calibrated=true AFTER we surface
+                # 'observe-only' — on timeout we re-stamp and the orphan's late write is a
+                # no-op. None-safe: stamp_cal_token never raises.
+                cal_token = metric_store.stamp_cal_token(project_dir, gid)
                 try:
                     cal = await asyncio.wait_for(
                         asyncio.to_thread(metric_store.calibrate_task_derived,
                                           project_dir, gid, behavior_goal, robot_hint,
-                                          adversarial=_ADVERSARIAL_ENABLED),
+                                          adversarial=_ADVERSARIAL_ENABLED,
+                                          expect_token=cal_token),
                         timeout=300.0)
                     c = cal.get("calibration") or {}
                     adv = c.get("adversarial") or {}
@@ -305,6 +311,13 @@ async def _generate_at_launch(
                               "trust": (cal.get("trust") or {}).get("trust"),
                               "reason": c.get("reason")})
                 except asyncio.TimeoutError:
+                    # §round-5: re-stamp the token so the still-running orphan thread's
+                    # late write is rejected (it can't resurrect calibrated=true behind
+                    # this observe-only verdict). Best-effort; never fails the run.
+                    try:
+                        metric_store.stamp_cal_token(project_dir, gid)
+                    except Exception:  # noqa: BLE001
+                        pass
                     job.emit({"type": "metric_calibration_done", "source": "launch_gen",
                               "gen_id": gid, "method": "task_derived", "calibrated": False,
                               "reason": "task-derived calibration timed out (>300s) — observe-only"})
