@@ -1588,3 +1588,43 @@ def compute_spec(arrays, behavior, meta):
     adv = cal["adversarial"] or {}
     assert not adv.get("gameable")                             # balance metric NOT false-denied
     assert "do_nothing_upright" not in {l["name"] for l in adv.get("required_losers", [])}
+
+
+# ── §round-18 ladder-posture: a SUBTLE active gesture is not a still hold ──────
+
+def test_round18_subtle_gesture_ladder_keeps_velocity_defense(tmp_path):
+    """§round-18 [HIGH FALSE GRANT] fix: a SUBTLE active-gesture ladder (group amplitude
+    ≤ 0.1 rad) must NOT be read as a still hold — _spec_is_static_hold keys on the presence
+    of commanded joint motion, not an amplitude threshold. So the velocity defense
+    (jitter_in_place) is kept and a 'rewards any joint velocity' idle proxy is DENIED."""
+    from sculptor.eval.metric_calibration import _spec_is_static_hold
+
+    def _g(amp, mode="oscillate", off=0.0):
+        return Group(name="arm", mode=mode, amplitude_rad=amp, offset_rad=off, period_frames=40,
+                     role_query=RoleQuery(segments=["shoulder", "elbow"], axes=["pitch", None], sides=["left"]))
+
+    # a subtle oscillation IS active; a held offset IS a distinctive posture; both NON-static.
+    assert not _spec_is_static_hold(MotionSpec(uprightness=1.0, base_height_m=0.7, groups=[_g(0.099)]))
+    assert not _spec_is_static_hold(MotionSpec(uprightness=1.0, base_height_m=0.7, groups=[_g(0.0, "hold", 0.8)]))
+    # a whole-body tremor channel is motion too (round-18: it was previously ignored).
+    assert not _spec_is_static_hold(MotionSpec(uprightness=1.0, base_height_m=0.7, tremor=1.5))
+    # a true balance/hold top (no motion group, no tremor) stays static.
+    assert _spec_is_static_hold(MotionSpec(uprightness=1.0, base_height_m=0.7))
+
+    def subtle_wave_ladder():
+        return CompetenceLadder(competence_axis="subtle left-arm wave", rungs=[
+            MotionSpec(uprightness=1.0, base_height_m=0.7, groups=[_g(a)])
+            for a in (0.0, 0.034, 0.067, 0.099)])
+
+    VEL = '''import numpy as np
+def compute_spec(arrays, behavior, meta):
+    g = np.asarray(arrays["projected_gravity_b"], float); jv = np.asarray(arrays["joint_vel"], float)
+    up = float((g[..., 2] < -0.85).mean())
+    return {"spec_score": float(np.clip(up * (1 - np.exp(-np.abs(jv).mean() / 0.1)), 0.0, 1.0))}
+'''
+    p = _write(tmp_path, "vel.py", VEL)
+    cal = calibrate_task_derived(
+        p, "give a small subtle wave with the left arm", robot_hint="Unitree-G1",
+        client=_FakeLadderClient(subtle_wave_ladder(), subtle_wave_ladder(), subtle_wave_ladder()))
+    assert not cal["ok"], cal                                   # velocity proxy DENIED
+    assert "jitter_in_place" in {l["name"] for l in cal["adversarial"]["required_losers"]}

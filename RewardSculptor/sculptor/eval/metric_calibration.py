@@ -753,16 +753,26 @@ def _spec_is_static_hold(spec: Any) -> bool:
             return False
         if abs(float(getattr(spec, "fold_depth_m", 0.0) or 0.0)) > 0.05:
             return False
+        if abs(float(getattr(spec, "tremor", 0.0) or 0.0)) > 0.1:
+            return False   # §round-18: tremor is a whole-body motion channel (NOT per-group)
         if abs(float(getattr(spec, "forward_speed_mps", 0.0) or 0.0)) > 0.1:
             return False
         if abs(float(getattr(spec, "lateral_speed_mps", 0.0) or 0.0)) > 0.1:
             return False
         if int(getattr(spec, "hop_count", 0) or 0) > 0 and float(getattr(spec, "hop_height_m", 0.0) or 0.0) > 0.05:
             return False
+        # §round-18: a STILL hold has NO commanded joint deviation. ANY group that produces
+        # a non-trivial joint motion (an oscillate/burst/fold group with a real amplitude/
+        # peak/burst) OR a held distinctive posture (a 'hold' offset) makes the rung ACTIVE,
+        # NOT static — even a SMALL/subtle gesture (amplitude ≤ 0.1). The old amplitude>0.1
+        # threshold mis-read a subtle wave as a hold → dropped the velocity defense → a
+        # velocity-confound proxy false-granted. A genuine balance/hold top has no such group.
         for gr in (getattr(spec, "groups", []) or []):
-            if abs(float(getattr(gr, "amplitude_rad", 0.0) or 0.0)) > 0.1:
-                return False
-            if abs(float(getattr(gr, "peak_radps", 0.0) or 0.0)) > 0.5 and int(getattr(gr, "burst_count", 0) or 0) > 0:
+            amp = abs(float(getattr(gr, "amplitude_rad", 0.0) or 0.0))
+            peak = abs(float(getattr(gr, "peak_radps", 0.0) or 0.0))
+            burst = int(getattr(gr, "burst_count", 0) or 0)
+            off = abs(float(getattr(gr, "offset_rad", 0.0) or 0.0))
+            if amp > 1e-3 or peak > 1e-3 or burst > 0 or off > 1e-2:
                 return False
         return True
     except Exception:  # noqa: BLE001 — unparseable spec → not static-hold (keep losers)
