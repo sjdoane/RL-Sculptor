@@ -755,6 +755,8 @@ def _spec_is_static_hold(spec: Any) -> bool:
             return False
         if abs(float(getattr(spec, "tremor", 0.0) or 0.0)) > 0.1:
             return False   # §round-18: tremor is a whole-body motion channel (NOT per-group)
+        if abs(float(getattr(spec, "noise", 0.0) or 0.0)) > 0.02:
+            return False   # §round-18: noise (gaussian on joint_vel) is whole-body motion too
         if abs(float(getattr(spec, "forward_speed_mps", 0.0) or 0.0)) > 0.1:
             return False
         if abs(float(getattr(spec, "lateral_speed_mps", 0.0) or 0.0)) > 0.1:

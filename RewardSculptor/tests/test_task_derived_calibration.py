@@ -1606,9 +1606,10 @@ def test_round18_subtle_gesture_ladder_keeps_velocity_defense(tmp_path):
     # a subtle oscillation IS active; a held offset IS a distinctive posture; both NON-static.
     assert not _spec_is_static_hold(MotionSpec(uprightness=1.0, base_height_m=0.7, groups=[_g(0.099)]))
     assert not _spec_is_static_hold(MotionSpec(uprightness=1.0, base_height_m=0.7, groups=[_g(0.0, "hold", 0.8)]))
-    # a whole-body tremor channel is motion too (round-18: it was previously ignored).
+    # the whole-body tremor AND noise channels are motion too (round-18: previously ignored).
     assert not _spec_is_static_hold(MotionSpec(uprightness=1.0, base_height_m=0.7, tremor=1.5))
-    # a true balance/hold top (no motion group, no tremor) stays static.
+    assert not _spec_is_static_hold(MotionSpec(uprightness=1.0, base_height_m=0.7, noise=0.15))
+    # a true balance/hold top (no motion group, no tremor/noise) stays static.
     assert _spec_is_static_hold(MotionSpec(uprightness=1.0, base_height_m=0.7))
 
     def subtle_wave_ladder():
