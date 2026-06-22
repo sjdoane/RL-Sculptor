@@ -568,3 +568,50 @@ def test_gait_plus_balance_resolves_to_locomotion():
     assert rf("run while balancing on a beam") == "locomotion"
     assert rf("minimize joint velocity while balancing the pole") == "cartpole"  # no gait
     assert rf("balance the pole upright and keep the cart centered") == "cartpole"
+
+
+# ── §round-9 SECURITY: _ast_safety must contain untrusted metric code ─────────
+# Round-9 found _ast_safety did NOT contain an untrusted (LLM-authored, behavior_goal-
+# derived) metric: numpy is a full IO/pickle/native surface and several escapes are
+# AST-blind. These pin each reproduced vector as REJECTED, and confirm legit metrics pass.
+import pytest as _pytest
+
+
+@_pytest.mark.parametrize("name,src", [
+    ("numpy_savetxt", "import numpy\ndef compute_spec(a,b,m):\n"
+                      "    numpy.savetxt('/tmp/x', numpy.array([1.0]))\n    return {'spec_score':0.5}\n"),
+    ("np_load_allow_pickle", "import numpy as np\ndef compute_spec(a,b,m):\n"
+                             "    np.load('/tmp/x', allow_pickle=True)\n    return {'spec_score':0.5}\n"),
+    ("reduce_gadget", "import numpy as np\nclass _P:\n    def __reduce__(self):\n"
+                      "        return (print, ('x',))\ndef compute_spec(a,b,m):\n    return {'spec_score':0.5}\n"),
+    ("format_dunder", "def compute_spec(a,b,m):\n"
+                      "    s = '{f.__globals__[__builtins__]}'.format(f=compute_spec)\n    return {'spec_score':0.5}\n"),
+    ("ctypeslib_import", "import numpy.ctypeslib\ndef compute_spec(a,b,m):\n    return {'spec_score':0.5}\n"),
+    ("from_numpy_import_save", "from numpy import save\ndef compute_spec(a,b,m):\n    return {'spec_score':0.5}\n"),
+    ("star_import", "from numpy import *\ndef compute_spec(a,b,m):\n    return {'spec_score':0.5}\n"),
+    ("ndarray_tofile", "import numpy as np\ndef compute_spec(a,b,m):\n"
+                       "    np.array([1.0]).tofile('/tmp/x')\n    return {'spec_score':0.5}\n"),
+    ("breakpoint_call", "def compute_spec(a,b,m):\n    breakpoint()\n    return {'spec_score':0.5}\n"),
+])
+def test_ast_safety_blocks_escape_vectors(name, src):
+    """Each round-9-reproduced sandbox-escape vector is REJECTED by the static gate."""
+    assert _ast_safety(src), f"{name} must be flagged by _ast_safety"
+
+
+def test_ast_safety_accepts_legit_metric():
+    """A normal numpy physical-quantity metric (incl the type(e).__name__ diagnostic and
+    f-strings) still passes — the hardening must not false-reject real metrics."""
+    legit = '''import numpy as np
+def compute_spec(arrays, behavior, meta):
+    try:
+        jp = arrays.get("joint_pos"); root = arrays.get("root_link_pos_w")
+        if jp is None or root is None:
+            return {"spec_score": 0.0, "reason": "missing_arrays"}
+        rom = float(np.mean(np.max(jp, axis=0) - np.min(jp, axis=0)))
+        drop = float(np.mean(root[..., 2][:5].mean(0) - root[..., 2].min(0)))
+        return {"spec_score": float(np.clip(rom * drop, 0.0, 1.0)),
+                "rom": rom, "ch_drop": drop}
+    except Exception as ex:
+        return {"spec_score": 0.0, "reason": f"exc:{type(ex).__name__}"}
+'''
+    assert _ast_safety(legit) == []

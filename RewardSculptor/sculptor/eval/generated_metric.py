@@ -16,6 +16,16 @@ metric) before it is allowed to drive selection. Until then it runs
 OBSERVE-ONLY (computed + displayed, no influence). This module is the
 RUNTIME side (load + compute + resolve); generation lives in `metric_gen`,
 validation in `metric_validate`, calibration in `metric_calibration`.
+
+SECURITY (§round-9): the metric is UNTRUSTED LLM-authored code, and `metric_validate.
+_ast_safety` (run BEFORE every exec) is the containment gate — hardened to block the
+numpy IO/pickle surface, native submodules, `def __reduce__`-style gadgets, dunder
+tokens in string literals, and `allow_pickle`. That is a STATIC allow/deny gate, not a
+proof of containment; a static check over the full numpy API can never be proven
+complete. The defence-in-depth follow-on (recommended before any UNTRUSTED/adversarial
+behavior_goal source is accepted) is to run `load_generated_module` + `compute_spec`
+in a restricted subprocess (curated `__builtins__`, no filesystem/network) — the repo
+already empties `__builtins__` for the success-criterion evaluator (mission_runtime).
 """
 from __future__ import annotations
 

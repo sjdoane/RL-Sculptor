@@ -39,13 +39,31 @@ from sculptor.eval.joint_resolver import resolve_joint_roles
 #: Modules a generated metric may import (numpy only — it is a pure
 #: physical-quantity function).
 _ALLOWED_IMPORTS = {"numpy"}
+#: numpy SUBMODULES a metric may import (the rest — ctypeslib/f2py/distutils/testing —
+#: are native-code / RCE surfaces; the root-only import gate used to let them through).
+_SAFE_NUMPY_SUBMODULES = frozenset({"linalg", "random"})
 #: Names that must never appear (code-exec / IO / introspection vectors).
 _FORBIDDEN_NAMES = {
-    "eval", "exec", "compile", "open", "__import__", "input",
+    "eval", "exec", "compile", "open", "__import__", "input", "breakpoint",
     "globals", "locals", "vars", "getattr", "setattr", "delattr",
     "os", "sys", "subprocess", "socket", "shutil", "pathlib", "Path",
-    "importlib", "pickle", "marshal",
+    "importlib", "pickle", "marshal", "ctypes", "memoryview",
 }
+#: §round-9 SECURITY: numpy is itself a full IO / native-code / reflection surface, so the
+#: numpy-only import gate is NOT a sandbox on its own. These attribute names (numpy fns,
+#: ndarray methods, and numpy submodules reachable as attributes) are arbitrary file
+#: read/write, native-code, or pickle-RCE primitives and are DENIED as attribute access
+#: AND as `from numpy import <name>` bindings. None appears in a legitimate physical-
+#: quantity metric. (Full containment still wants a real process sandbox — see the
+#: module docstring follow-on — but this closes every escape round-9 reproduced.)
+_FORBIDDEN_ATTRS = frozenset({
+    # file / buffer IO + persistence (np.save(dtype=object)+np.load(allow_pickle) = RCE)
+    "save", "savez", "savez_compressed", "savetxt", "load", "loadtxt", "genfromtxt",
+    "fromfile", "tofile", "memmap", "fromregex", "datasource", "DataSource",
+    "fromstring", "frombuffer", "getbuffer", "newbuffer",
+    # native-code / reflection submodules reachable as `numpy.<x>` attributes
+    "ctypeslib", "f2py", "distutils", "testing", "lib", "core", "_core", "ctypes",
+})
 #: Benign dunder ATTRIBUTES a metric may read. `type(e).__name__` — naming an
 #: exception class in a diagnostic — is the exact idiom the never-raise rule (a
 #: try/except wrapper) encourages, and the model emits it constantly; a name STRING
@@ -229,8 +247,30 @@ def resolve_goal_frame(
     return {"goal_axis": goal_axis, "support_mode": support, "torso_target": torso}
 
 
+def _is_allowed_module(name: str) -> bool:
+    """A generated metric may import only `numpy` and a vetted numpy submodule
+    (numpy.linalg/random). The FULL dotted path is gated — the prior root-only check
+    (`name.split('.')[0]`) let `import numpy.ctypeslib` (native-code RCE) through."""
+    if not name:
+        return False
+    if name in _ALLOWED_IMPORTS:
+        return True
+    if name.startswith("numpy."):
+        return name[len("numpy."):].split(".")[0] in _SAFE_NUMPY_SUBMODULES
+    return False
+
+
 def _ast_safety(source: str) -> list[str]:
-    """Return a list of safety violations (empty = safe)."""
+    """Return a list of safety violations (empty = safe).
+
+    §round-9 SECURITY hardening: a generated metric is UNTRUSTED code, and this static
+    gate is the first containment layer (the runtime exec has full builtins + numpy, both
+    IO/RCE surfaces). Beyond the original import/forbidden-name/dunder-attr checks it now
+    closes the reproduced escapes: numpy submodule imports (full dotted gate), numpy IO /
+    pickle / native attrs (`_FORBIDDEN_ATTRS`), `allow_pickle=True`, dunder FUNCTION/CLASS
+    definitions (`def __reduce__`), and dunder tokens inside STRING literals (the
+    `'{f.__globals__[__builtins__]}'.format(...)` reflection trick the AST walker can't
+    see into). Reflection is thus blocked through every syntactic path."""
     problems: list[str] = []
     try:
         tree = ast.parse(source)
@@ -239,22 +279,38 @@ def _ast_safety(source: str) -> list[str]:
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for a in node.names:
-                root = a.name.split(".")[0]
-                if root not in _ALLOWED_IMPORTS:
+                if not _is_allowed_module(a.name):
                     problems.append(f"forbidden import: {a.name}")
         elif isinstance(node, ast.ImportFrom):
-            root = (node.module or "").split(".")[0]
-            if root not in _ALLOWED_IMPORTS:
+            if any(al.name == "*" for al in node.names):   # `from numpy import *` rebinds IO fns as bare names
+                problems.append("forbidden star import")
+            if not _is_allowed_module(node.module or ""):
                 problems.append(f"forbidden import-from: {node.module}")
+            for al in node.names:                          # block `from numpy import save/load/...`
+                if (al.name in _FORBIDDEN_ATTRS or al.name in _FORBIDDEN_NAMES
+                        or al.name.startswith("__")):
+                    problems.append(f"forbidden imported name: {al.name}")
         elif isinstance(node, ast.Name) and (
                 node.id in _FORBIDDEN_NAMES or node.id.startswith("__")):
             # §Ship 35 review: also reject ANY dunder NAME (e.g.
             # __builtins__ is in every module namespace without an import
             # and reaches eval/exec).
             problems.append(f"forbidden name: {node.id}")
-        elif (isinstance(node, ast.Attribute) and node.attr.startswith("__")
-                and node.attr not in _ALLOWED_DUNDER_ATTRS):
-            problems.append(f"dunder attribute access: {node.attr}")
+        elif isinstance(node, ast.Attribute):
+            if node.attr.startswith("__") and node.attr not in _ALLOWED_DUNDER_ATTRS:
+                problems.append(f"dunder attribute access: {node.attr}")
+            elif node.attr in _FORBIDDEN_ATTRS:
+                problems.append(f"forbidden attribute (IO/native/reflection): {node.attr}")
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            if node.name.startswith("__"):                 # `def __reduce__` → pickle-RCE gadget
+                problems.append(f"forbidden dunder definition: {node.name}")
+        elif isinstance(node, ast.keyword) and node.arg == "allow_pickle":
+            problems.append("forbidden kwarg: allow_pickle")
+        elif isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes)):
+            text = (node.value if isinstance(node.value, str)
+                    else node.value.decode("latin-1", "ignore"))
+            if "__" in text:    # a dunder token in a string literal → .format/.format_map reflection
+                problems.append("forbidden dunder token in string literal")
     return problems
 
 
