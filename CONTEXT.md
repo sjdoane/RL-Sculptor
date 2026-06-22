@@ -339,6 +339,54 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-22 — autonomous BROADENED hardening (rounds 5–19): security sandbox + calibration concurrency + the RED-TEAM false-grant firewall (10 commits 512cd38…5297d70)
+
+- **What** — continued the reliability drive into the whole recent-change surface + core (run_manager,
+  metric_store, sculptor_bridge, the firewall, generation, the metric runtime, the safety sandbox), via repeated
+  multi-lens adversarial-review Workflows (find → adversarially verify → reconcile), fixing every CONFIRMED
+  defect and re-reviewing each fix until the red-team came back clean. Files: mostly
+  `RewardSculptor/sculptor/eval/{metric_calibration,metric_validate,generated_metric,ladder_synth}.py` +
+  `reward-sculptor-ui/backend/services/{metric_store,run_manager}.py` + regression tests.
+- **The arc (each round = a fix + its own adversarial re-review):**
+  1. **Calibration concurrency/numeric (rounds 5–7, commit 512cd38):** `require_token` fail-closes the live
+     cal path on a None/mismatched token (a None used to disable the orphan guard → resurrected grant);
+     `_gameable_score` coerces a NaN/inf hack score to GAMEABLE in the adversarial gate (NaN had escaped
+     `worst`); built-in `calibrate()` write under `_META_LOCK` + `_atomic_write_json`. Round-8 re-review CLEAN.
+  2. **Security sandbox (rounds 9–11, commits 3828ba5, 5f6c31a, 6e1f923):** `_ast_safety` did NOT contain an
+     untrusted LLM-authored metric (numpy IO/pickle, `import numpy.ctypeslib`, `def __reduce__`, format-string
+     dunders) — 3 CRITICAL escapes, all closed (full dotted import gate, numpy IO/native attr deny-list,
+     `allow_pickle` ban, dunder def/string-literal reject). Then ENFORCED the gate inside
+     `load_generated_module` so it runs before EVERY exec (not only validation); fixed a follow-on `calibrate_
+     metric` "Never raises" break. Process isolation documented as the belt-and-suspenders follow-on.
+  3. **THE BIG ONE — the false-grant FIREWALL (rounds 13–18, commits 74ff605, 2981690, 7e2cc5b, fd3ff02,
+     7e92d61, 6ea4dce, 5297d70):** a RED-TEAM round (agents CONSTRUCTING gaming metrics + running the real
+     grant pipeline) found the deepest defect of the whole effort — the task-derived grant could be EARNED by a
+     metric that does not measure the goal (a pelvis-DEPTH-only proxy, a goal-blind POSTURE/height proxy), 3
+     CRITICAL false grants reproducing in the DEFAULT path. Root cause: the grant relied on blind LLM ladders
+     INCIDENTALLY penalizing the metric's confound; the only goal-aware defense was off by default + fail-open +
+     kick-only. FIX (converged over rounds 14–18): the `adversarial_archetype_gate` runs whenever base_ok,
+     scoring DETERMINISTIC goal-blind required-losers (`do_nothing_upright`, `jitter_in_place`,
+     `collapse_and_stay_down`); a loser RAISE → 0.0 + counted (runtime-equivalent — a metric that raises here
+     also scores the real degenerate policy 0.0 at runtime, so it can't reward it); whether the still-upright
+     losers are ON-goal (a balance/lie task) is decided from the BLIND AUTHORED ladder's top-rung posture
+     (`_spec_is_static_hold`/`_ladder_posture`, reading every MotionSpec motion channel), NOT a brittle goal-
+     keyword classifier (which had a token-gap false-grant every round). `RoleQuery.axes` null-coercion closed
+     a ValidationError fail-open.
+- **Verified** — sculptor **887 passed, 1 skipped**; UI backend **362 passed**; +~60 regression tests across the
+  arc. EMPIRICAL: fold-type generation accept ~95% stable across 3 fresh batches (round-9 curl/duck, round-11
+  toetouch/squat/bow/crouch 4/4); the live `adversarial=True` task-derived grant works (calibrated=true,
+  rho_min 0.894) across 7 consecutive rechecks; the red-team's depth/posture/idle/velocity/subtle-gesture proxies
+  are all DENIED end-to-end while honest fold/balance/gesture metrics still GRANT; all reproduced `_ast_safety`
+  escape vectors are blocked + 27 real on-disk metrics still load. Both suites green at each commit; uvicorn
+  restarted to pick up the live-path changes.
+- **Known/limitations (documented, not blocking):** (1) the deterministic losers cover the posture/depth/idle
+  CONFOUND classes, NOT arbitrary off-goal-channel gaming (e.g. a "wave" metric gamed by leg motion) — the
+  `adversarial=True` LLM breadth pass adds coverage there; a structural fix (require granted metrics to declare
+  `REQUIRED_JOINT_ROLES`) is a separate increment. (2) the goal-keyword classifier remains only as a fallback
+  when no ladder is available. (3) transient h11/httpcore import-contention can make a real anthropic client
+  build fail when many processes spawn at once — not a code or persistent-env issue (a fresh import is healthy);
+  the single-process live path is unaffected.
+
 ### 2026-06-21 — novel-task objective metric RELIABILITY DRIVE: 50% → 91% accept + steering path un-blocked (14 false-reject/steer fixes across 4 commits, 3 adversarial-review rounds)
 
 - **What** — drove auto-generated OBJECTIVE METRIC creation for NOVEL fold/posture/gesture goals (toe-touch,
