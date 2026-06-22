@@ -662,21 +662,40 @@ _RETURN_UP_TOKENS = ("up", "rise", "rises", "rising", "stand", "standing",
 #: A goal whose competent behavior IS standing upright and still (balance / hold a
 #: stance) — for these `do_nothing_upright` (and the idle `jitter`) are ON-goal, so they
 #: must NOT be used as required-losers (they would false-deny a balance metric whose
-#: competent top-rung renders identically to a still upright stance). TIGHT tokens (no
-#: bare "stand"/"hold"/"upright" — those appear in active goals like "stand back up").
-#: §round-15: "steady"/"stable" REMOVED — they are common ACTIVE-goal adverbs
-#: ("a steady wave", "a stable gait") that mis-flagged active goals as static-hold and
-#: dropped the posture defense → false grant.
-_STATIC_HOLD_TOKENS = ("balance", "balanced", "balancing", "still",
-                       "motionless", "stationary", "immobile")
-#: §round-15: an ACTIVE-motion token forces static_hold=False regardless of any stillness
-#: adverb — "give a steady wave" / "hold still while you reach" are ACTIVE (the stillness
-#: is an incidental modifier, not the objective), so the posture losers must still apply.
+#: competent top-rung renders identically to a still upright stance; the synthesizer can't
+#: render single-leg contact, so a one-legged balance is physically indistinguishable from
+#: do_nothing_upright). §round-16: a balance goal is often phrased WITHOUT "balance" ("stand
+#: on one leg", "remain upright on one foot", "do not fall over") → these posture/anti-fall
+#: cues + phrases are added, behind the active-token guard so an active goal is never
+#: misread. Bare "stand"/"hold" stay OUT (they appear in fold goals like "stand back up").
+_STATIC_HOLD_TOKENS = ("balance", "balanced", "balancing", "still", "motionless",
+                       "stationary", "immobile", "upright", "stance", "equilibrium",
+                       "poise", "poised")
+#: balance/anti-fall PHRASES (substring match — single-leg contact the synthesizer can't
+#: render, or an explicit don't-fall objective).
+_STATIC_HOLD_PHRASES = ("one leg", "one foot", "single leg", "single-leg", "one-legged",
+                        "do not fall", "don't fall", "dont fall", "without falling",
+                        "stay upright", "remain upright", "keep your balance",
+                        "keep balance", "hold a stance", "hold still")
+#: §round-15/16: an ACTIVE-motion or LOCOMOTION verb forces static_hold=False regardless of
+#: any stillness adverb — "give a steady wave" / "stay still then dash forward" are ACTIVE
+#: (the stillness is an incidental modifier, not the objective), so the posture losers must
+#: still apply. False-classifying an active goal as static-hold DROPS the posture defense →
+#: FALSE GRANT (the dangerous direction), so this list is kept broad and the classifier
+#: BIASES toward False when in doubt.
 _ACTIVE_MOTION_TOKENS = (
     "wave", "reach", "raise", "lower", "swing", "step", "walk", "run", "march",
     "kick", "punch", "gesture", "lift", "turn", "twist", "bend", "extend", "throw",
     "fold", "squat", "bow", "crouch", "touch", "nod", "shake", "clap", "shrug",
-    "jump", "hop", "lunge", "stomp", "stride", "gait", "rotate", "flex", "curl")
+    "jump", "hop", "lunge", "stomp", "stride", "gait", "rotate", "flex", "curl",
+    # §round-16 locomotion/whole-body verbs (a locomotion goal with an incidental
+    # stillness adverb must NOT be read as static-hold → idle-upright proxy false grant):
+    "dash", "sprint", "crawl", "leap", "slide", "shuffle", "jog", "trot", "gallop",
+    "skip", "climb", "roll", "spin", "pivot", "push", "pull", "drag", "carry",
+    "scoot", "sidestep", "backpedal", "pirouette", "dance", "strafe", "sway")
+#: directional-travel words — a goal that travels is never a static hold (defense-in-depth).
+_DIRECTIONAL_TOKENS = ("forward", "forwards", "backward", "backwards", "ahead", "behind",
+                       "left", "right", "sideways", "laterally", "across")
 
 
 def _goal_is_terminal_down(behavior_goal: str) -> bool:
@@ -687,13 +706,22 @@ def _goal_is_terminal_down(behavior_goal: str) -> bool:
 
 
 def _goal_is_static_hold(behavior_goal: str) -> bool:
-    """True iff the goal's competent behavior is a still upright hold (balance/motionless)
-    — then standing still IS the goal, so the stillness losers are off. An ACTIVE-motion
-    verb anywhere in the goal forces False (the stillness word is an adverbial modifier of
-    an active goal, e.g. "a steady wave", not the objective)."""
-    toks = set(re.findall(r"[a-z]+", (behavior_goal or "").lower()))
+    """True iff the goal's competent behavior is a still upright hold (balance/stand on one
+    leg/don't fall). Standing still IS the goal there, so the stillness losers are off.
+
+    BIASED TOWARD FALSE (the safe direction): a false True drops the posture defense → a
+    FALSE GRANT, whereas a false False merely keeps a loser → an honest balance metric may
+    be observe-only. So ANY active-motion/locomotion verb OR a directional-travel cue forces
+    False (the stillness word is then an adverbial modifier of an active goal), and True
+    requires POSITIVE balance evidence (a static-hold token or anti-fall phrase)."""
+    g = (behavior_goal or "").lower()
+    toks = set(re.findall(r"[a-z]+", g))
     if toks & set(_ACTIVE_MOTION_TOKENS):
         return False
+    if toks & set(_DIRECTIONAL_TOKENS):
+        return False
+    if any(p in g for p in _STATIC_HOLD_PHRASES):
+        return True
     return bool(toks & set(_STATIC_HOLD_TOKENS))
 
 
@@ -725,10 +753,11 @@ def general_required_losers(
       - collapse is ON-goal for a terminal-DOWN goal (lie/rest) → dropped only then.
       So: balance→{collapse}; lie-down/lie-still→{do_nothing,jitter}; active→all three.
 
-    A raise while scoring a loser is handled RUNTIME-EQUIVALENTLY (→ 0.0, counted) in the
-    gate, so an honest onset/phase metric that indexes an empty selection on a degenerate
-    loser is NOT false-rejected, and a real reward-the-degenerate proxy (which returns a
-    HIGH score, not a raise) is still caught — see the gate's required-loser loop.
+    A raise while scoring a loser is handled as score 0.0 (counted) in the gate, so an
+    honest onset/phase metric that indexes an empty selection on a degenerate loser is NOT
+    false-rejected, and a real reward-the-degenerate proxy (which returns a HIGH score, not
+    a raise) is still caught — see the gate's required-loser loop for the (compositional)
+    soundness argument.
     """
     from sculptor.eval.ladder_synth import MotionSpec, render_rung
 
@@ -826,20 +855,26 @@ def adversarial_archetype_gate(
             s = float(gen_fn(loser["arrays"], loser["behavior"], meta)
                       .get("spec_score", 0.0))
         except Exception as e:  # noqa: BLE001
-            # §round-15 RUNTIME-EQUIVALENT: a raise scores the loser 0.0, and the loser is
-            # COUNTED (losers_scored += 1, so ran=True — no fail-open via an empty set). A
-            # raise is neither "evasion" (round-14's fail-closed → false-rejected honest
-            # onset/phase metrics that index an empty selection on a degenerate rollout)
-            # nor "no evidence" (round-13's skip → fail-open via ran=False). It mirrors the
-            # RUNTIME contract: compute_generated_metric wraps the metric and returns 0.0
-            # on a raise, so a metric that raises on this degenerate loser would ALSO score
-            # the corresponding real degenerate POLICY 0.0 at runtime — i.e. it cannot
-            # reward that policy, so it is not gaming via this loser. (A metric that DOES
-            # reward a degenerate policy returns a HIGH score here, not a raise → caught.)
+            # §round-15/16 RAISE→0.0, COUNTED: a raise scores the loser 0.0 and counts it
+            # (losers_scored += 1, so ran=True — no fail-open via an empty set). It is
+            # neither "evasion" (round-14's fail-closed → false-rejected honest onset/phase
+            # metrics that index an empty selection on a degenerate rollout) nor "no
+            # evidence" (round-13's skip → fail-open via ran=False).
+            #
+            # SOUNDNESS (§round-16 — it is NOT a per-loser gate⟺runtime equivalence): the
+            # synth losers are byte-clean (all E envs identical, exact constants) while a
+            # real rollout varies per-env, so a metric CAN raise here yet score the real
+            # degenerate policy high at runtime. Safety is COMPOSITIONAL: the same
+            # synth-clean signature that raises here also fires on render_ladder's
+            # always-clean _ANCHOR rung AND the prompt-mandated clean competent top rungs →
+            # it collapses the metric's rho/separation so it FAILS the ladder gate and never
+            # reaches this gate. (And a metric that genuinely REWARDS a degenerate policy
+            # returns a HIGH score here, not a raise → caught.) 0.0 never bumps `worst`, so
+            # an honest metric that merely IndexErrors on a degenerate loser is not denied.
             losers_scored += 1
             rec["required_losers"].append(
                 {"name": name, "channel": loser.get("channel"), "score": 0.0,
-                 "note": f"unscorable (→0.0, runtime-equivalent): {type(e).__name__}"})
+                 "note": f"unscorable (→0.0): {type(e).__name__}"})
             continue
         s = _gameable_score(s)   # §round-7: a NaN/inf hack score → GAMEABLE (fail-closed)
         losers_scored += 1

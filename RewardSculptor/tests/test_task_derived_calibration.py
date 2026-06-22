@@ -1462,3 +1462,66 @@ def test_round15_balance_metric_not_false_rejected():
         required_losers=general_required_losers(G1, "balance on one leg"),
         scored_channels=["posture", "completion"], author=False)
     assert not rec["gameable"]                          # balance metric grants-side
+
+
+# ── §round-16 static-hold classification fixes ───────────────────────────────
+
+def test_round16_locomotion_with_stillness_keeps_posture_losers():
+    """§round-16 [HIGH FALSE GRANT]: a locomotion goal carrying an incidental stillness
+    adverb ('stay still then dash forward') must NOT be read as static-hold — else the
+    posture losers are dropped and an idle-upright proxy false-grants."""
+    from sculptor.eval.metric_calibration import (
+        general_required_losers, adversarial_archetype_gate, _goal_is_static_hold)
+    for g in ["stay still then suddenly dash forward", "motionless crawl forward",
+              "sprint while staying still in the upper body", "shuffle forward quietly"]:
+        assert not _goal_is_static_hold(g), g
+        names = {l["name"] for l in general_required_losers(G1, g)}
+        assert "do_nothing_upright" in names                  # posture defense retained
+
+    def idle_upright(arrays, behavior, meta):
+        import numpy as np
+        g = arrays["projected_gravity_b"]; root = arrays["root_link_pos_w"]
+        up = float(np.mean(np.clip(-g[..., 2], 0, 1)))
+        travel = float(min(abs(np.mean(root[..., 0, 0])) / 3.0, 1.0))
+        return {"spec_score": 0.55 * up + 0.45 * travel}
+
+    rec = adversarial_archetype_gate(
+        idle_upright, [], G1, competent_ref=1.0, client=None,
+        required_losers=general_required_losers(G1, "stay still then suddenly dash forward"),
+        scored_channels=["posture", "completion"], author=False)
+    assert rec["gameable"]                                    # do_nothing_upright catches it
+
+
+def test_round16_tokenless_balance_phrasings_not_false_rejected():
+    """§round-16 [MEDIUM FALSE REJECT]: a balance goal phrased WITHOUT the word 'balance'
+    ('stand on one leg', 'remain upright on one foot', 'do not fall over') must classify
+    static-hold so a genuine balance metric is not false-denied (the synthesizer cannot
+    render single-leg contact, so a one-legged balance is indistinguishable from
+    do_nothing_upright)."""
+    from sculptor.eval.metric_calibration import (
+        general_required_losers, adversarial_archetype_gate, _goal_is_static_hold)
+
+    def balance(arrays, behavior, meta):
+        import numpy as np
+        g = arrays["projected_gravity_b"]
+        return {"spec_score": float(np.mean(np.clip(-g[..., 2], 0, 1)))}
+
+    for g in ["stand on one leg", "remain upright on one foot", "hold a one-legged stance",
+              "do not fall over", "keep your equilibrium"]:
+        assert _goal_is_static_hold(g), g
+        names = {l["name"] for l in general_required_losers(G1, g)}
+        assert "do_nothing_upright" not in names             # on-goal → dropped
+        rec = adversarial_archetype_gate(
+            balance, [], G1, competent_ref=1.0, client=None,
+            required_losers=general_required_losers(G1, g),
+            scored_channels=["posture", "completion"], author=False)
+        assert not rec["gameable"], g                        # genuine balance metric not denied
+
+
+def test_round16_active_goal_with_balance_word_stays_active():
+    """An ACTIVE goal that mentions balance/upright as a modifier keeps the posture losers
+    (the active verb wins) — guards against the locomotion false-grant via 'balance'."""
+    from sculptor.eval.metric_calibration import _goal_is_static_hold
+    assert not _goal_is_static_hold("wave while balancing on one leg")
+    assert not _goal_is_static_hold("walk forward staying upright")
+    assert not _goal_is_static_hold("touch your toes then stand upright")
