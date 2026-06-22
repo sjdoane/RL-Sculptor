@@ -555,3 +555,16 @@ def test_balance_goal_with_velocity_resolves_to_cartpole():
     assert rf("balance the cartpole with low velocity") == "cartpole"
     assert rf("balance the pole upright and keep the cart centered") == "cartpole"
     assert rf("Canonical Hopper-v4 reward: forward_velocity + alive_bonus") == "locomotion"
+
+
+def test_gait_plus_balance_resolves_to_locomotion():
+    """§round-6: a real GAIT verb + an incidental 'balance' token resolves to LOCOMOTION,
+    not cartpole — a gait verb is a far stronger locomotion signal (the round-5
+    cartpole-before-locomotion reorder over-corrected; cartpole now requires not-gait).
+    A pure balance/cartpole goal (no gait) still resolves to cartpole."""
+    from sculptor.eval.metric_validate import resolve_behavior_family as rf
+    assert rf("walk while balancing a load") == "locomotion"
+    assert rf("trot steadily, balancing the body") == "locomotion"
+    assert rf("run while balancing on a beam") == "locomotion"
+    assert rf("minimize joint velocity while balancing the pole") == "cartpole"  # no gait
+    assert rf("balance the pole upright and keep the cart centered") == "cartpole"

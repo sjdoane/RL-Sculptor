@@ -1136,3 +1136,35 @@ def test_iter_json_objs_contains_recursion_error(monkeypatch):
     monkeypatch.setattr(_json.JSONDecoder, "raw_decode", boom)
     out = list(mc._iter_json_objs('{"x": 1} {"competence_axis": "ok", "rungs": []}'))
     assert {"competence_axis": "ok", "rungs": []} in out   # contained, scan continued
+
+
+# ── §round-6 review: a NaN spec_score must NOT false-grant ─────────────────────
+NAN_TOP_RUNG = '''import numpy as np
+REQUIRED_JOINT_ROLES = ["left_hip_pitch","right_hip_pitch","left_knee","right_knee"]
+def compute_spec(arrays, behavior, meta):
+    root = arrays.get("root_link_pos_w")
+    if root is None: return {"spec_score": 0.0}
+    z = root[..., 2]
+    drop = float(np.mean(z[:5].mean(0) - z.min(0)))
+    # finite + increasing on shallow rungs, but NaN on the DEEPEST rung (fold_ladder top
+    # = 0.35) — pre-fix this ranked as max (rho~1.0) and slipped the std/separation gates
+    # (`nan < x` is False), false-granting; post-fix NaN is coerced to 0.
+    if drop > 0.33:
+        return {"spec_score": float("nan")}
+    return {"spec_score": float(np.clip(drop / 0.4, 0.0, 1.0))}
+'''
+
+
+def test_nan_spec_score_does_not_false_grant(tmp_path):
+    """§round-6 FALSE-GRANT fix: a metric returning NaN on the top ladder rung must NOT
+    earn steer-rights — NaN is coerced to 0.0 (penalized), so it can't manufacture a
+    spurious rho/separation. Uses the deterministic fold ladders (no LLM)."""
+    p = _write(tmp_path, "nan.py", NAN_TOP_RUNG)
+    client = _FakeLadderClient(fold_ladder(), fold_ladder(), fold_ladder())
+    cal = calibrate_task_derived(p, "touch your toes then stand back up",
+                                 robot_hint="Unitree-G1", client=client)
+    assert cal["ok"] is False        # the NaN top rung does NOT grant
+    # and no source reports a spurious near-perfect rho off the NaN
+    for s in cal.get("sources", []):
+        if s.get("rho") is not None:
+            assert s["rho"] < 0.99 or s.get("separation", 0) < 0.2

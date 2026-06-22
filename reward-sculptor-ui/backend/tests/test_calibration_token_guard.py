@@ -69,3 +69,38 @@ def test_no_token_persists_unconditionally(tmp_path, monkeypatch):
     assert out["calibrated"] is True
     meta = json.loads((tmp_path / "metrics/gen_001/meta.json").read_text())
     assert meta.get("calibrated") is True
+
+
+def test_supersede_forces_observe_only_and_invalidates_orphan(tmp_path, monkeypatch):
+    """§round-6: on timeout, supersede_calibration forces calibrated=false + re-stamps,
+    so the orphan (carrying the OLD token) skips its write AND any grant is reset."""
+    _make_metric(tmp_path)
+    _patch_grant(monkeypatch)
+    token = metric_store.stamp_cal_token(tmp_path, "gen_001")    # launch stamp
+    metric_store.supersede_calibration(tmp_path, "gen_001")      # timeout
+    meta = json.loads((tmp_path / "metrics/gen_001/meta.json").read_text())
+    assert meta.get("calibrated") is False                       # forced observe-only
+    # the orphan finishes late with the stale token → no-op write
+    out = metric_store.calibrate_task_derived(
+        tmp_path, "gen_001", "touch your toes", expect_token=token)
+    assert out["calibrated"] is not True
+    meta2 = json.loads((tmp_path / "metrics/gen_001/meta.json").read_text())
+    assert meta2.get("calibrated") is False                      # NOT resurrected
+
+
+def test_stamp_returns_none_when_no_meta(tmp_path):
+    """§round-6: stamp on a gid with no meta returns None (guard disabled, not a forced
+    mismatch that would drop a genuine grant)."""
+    assert metric_store.stamp_cal_token(tmp_path, "missing") is None
+
+
+def test_stamp_does_not_clobber_corrupt_meta(tmp_path):
+    """§round-6: a PRESENT-but-unreadable meta.json is left UNTOUCHED (not overwritten to
+    a token-only record that loses accepted/validation); stamp returns None."""
+    d = tmp_path / "metrics" / "gen_001"
+    d.mkdir(parents=True)
+    (d / "metric.py").write_text("def compute_spec(a,b,m):\n    return {'spec_score':0.0}\n")
+    (d / "meta.json").write_text("{ this is not valid json ")
+    tok = metric_store.stamp_cal_token(tmp_path, "gen_001")
+    assert tok is None
+    assert (d / "meta.json").read_text() == "{ this is not valid json "   # unchanged

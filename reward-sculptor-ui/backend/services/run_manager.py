@@ -311,11 +311,12 @@ async def _generate_at_launch(
                               "trust": (cal.get("trust") or {}).get("trust"),
                               "reason": c.get("reason")})
                 except asyncio.TimeoutError:
-                    # §round-5: re-stamp the token so the still-running orphan thread's
-                    # late write is rejected (it can't resurrect calibrated=true behind
-                    # this observe-only verdict). Best-effort; never fails the run.
+                    # §round-5/6: force calibrated=false + re-stamp the token (atomically)
+                    # so the still-running orphan thread's late write is rejected AND can't
+                    # resurrect calibrated=true behind this observe-only verdict (even via a
+                    # lost-update race). Best-effort; never fails the run.
                     try:
-                        metric_store.stamp_cal_token(project_dir, gid)
+                        metric_store.supersede_calibration(project_dir, gid)
                     except Exception:  # noqa: BLE001
                         pass
                     job.emit({"type": "metric_calibration_done", "source": "launch_gen",

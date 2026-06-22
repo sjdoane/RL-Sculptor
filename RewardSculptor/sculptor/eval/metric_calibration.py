@@ -52,6 +52,11 @@ def spearman(a: list[float], b: list[float]) -> float:
     # ~1e-7 across the (Ship-41-enriched, cumsum-joint_pos) ladder; its 1e-7
     # std cleared the 1e-12 guard and argsort then gave a spurious rho=1.0.
     av, bv = np.round(av, 6), np.round(bv, 6)
+    # §round-6 FALSE-GRANT guard: a NaN/inf carries no rank information and must NOT
+    # spuriously correlate (argsort sorts NaN to the end → a fake monotone rank, and the
+    # std guard below is `nan < 1e-12` == False → bypassed). Reject non-finite outright.
+    if not (np.isfinite(av).all() and np.isfinite(bv).all()):
+        return 0.0
     # §Ship 35 review: epsilon guard (exact == 0 can miss tiny-but-nonzero
     # std from float noise, spuriously correlating a near-constant metric).
     if av.size < 2 or av.std() < 1e-12 or bv.std() < 1e-12:
@@ -178,9 +183,10 @@ def calibrate_metric(
     for arrays, behavior, meta in ladder:
         inject_joint_roles(meta, roles, lenient=True)
         try:
-            gen_scores.append(float(gen_fn(arrays, behavior, meta).get("spec_score", 0.0)))
+            s = float(gen_fn(arrays, behavior, meta).get("spec_score", 0.0))
         except Exception:  # noqa: BLE001 — a crash on a ladder point = 0
-            gen_scores.append(0.0)
+            s = 0.0
+        gen_scores.append(s if np.isfinite(s) else 0.0)   # §round-6: NaN → 0 (no spurious rho)
         builtin_scores.append(float(builtin_fn(arrays, behavior, meta).get("spec_score", 0.0)))
     rho = spearman(gen_scores, builtin_scores)
     return {
@@ -248,6 +254,10 @@ def spearman_midrank(a: list[float], b: list[float]) -> float:
     anti-spurious guards that killed the historical 1e-7 joint_pos-magnitude
     spurious correlation."""
     av, bv = np.round(np.asarray(a, float), 6), np.round(np.asarray(b, float), 6)
+    # §round-6 FALSE-GRANT guard: non-finite carries no rank info and would slip the
+    # std-floor (`nan < 1e-12` == False) and rank as max — reject outright.
+    if not (np.isfinite(av).all() and np.isfinite(bv).all()):
+        return 0.0
     if av.size < 2 or av.std() < 1e-12 or bv.std() < 1e-12:
         return 0.0
     return float(np.corrcoef(_midrank(av), _midrank(bv))[0, 1])
@@ -984,10 +994,14 @@ def calibrate_task_derived(
         for arrays, behavior, meta in synth["rungs"]:
             inject_joint_roles(meta, roles)
             try:
-                gen_scores.append(
-                    float(gen_fn(arrays, behavior, meta).get("spec_score", 0.0)))
+                s = float(gen_fn(arrays, behavior, meta).get("spec_score", 0.0))
             except Exception:  # noqa: BLE001 — crash on a rung = 0 (penalize)
-                gen_scores.append(0.0)
+                s = 0.0
+            # §round-6 FALSE-GRANT fix: a NaN/inf spec_score must be PENALIZED to 0.0,
+            # not propagated — a NaN ranks as max in _midrank (→ spurious rho≈1.0), and
+            # the std-floor + separation gates are `nan < x` == False (bypassed), so a
+            # NaN top-rung would FALSE-GRANT steer-rights. Coerce here (single source).
+            gen_scores.append(s if np.isfinite(s) else 0.0)
         rec["gen_scores"] = [round(s, 4) for s in gen_scores]
 
         spread = max(gen_scores) - min(gen_scores)
@@ -1005,7 +1019,10 @@ def calibrate_task_derived(
         rec["separation"] = round(separation, 4)
         rec["ladder_ok"] = True
         # ABSOLUTE-SEPARATION anchor indicts the METRIC (counts as disagreement).
-        if separation < _TD_SEPARATION_MIN:
+        # §round-6 defense-in-depth: a non-finite separation must FAIL the gate (a bare
+        # `nan < min` is False and would pass) — gen_scores are coerced finite above, so
+        # this is belt-and-suspenders.
+        if not np.isfinite(separation) or separation < _TD_SEPARATION_MIN:
             rec["skip_reason"] = (f"metric does not separate competent from the "
                                   f"degenerate anchor by ≥{_TD_SEPARATION_MIN} "
                                   f"(got {separation:.3f})")

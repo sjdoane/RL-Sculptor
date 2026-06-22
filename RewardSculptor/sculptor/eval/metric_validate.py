@@ -125,12 +125,13 @@ def resolve_behavior_family(
                 "striding", "jog", "jogging", "sprint", "sprinting", "gallop",
                 "skip", "skipping")
     _directional = has("forward", "forwards", "ahead", "velocity")
-    # §<round-5 fix>: BALANCE/cartpole is checked BEFORE locomotion — a balance goal
-    # naturally mentions "velocity" ("minimize joint VELOCITY while balancing the pole"),
-    # and `_directional` includes "velocity", so without this ordering such a goal would
-    # mis-resolve to locomotion (→ the wrong go1_trot calibration anchor). The canonical
-    # Hopper "forward_velocity" goal has no balance token, so it still hits locomotion.
-    if has("balance", "balancing", "cartpole"):
+    # §<round-5/6 fix>: BALANCE/cartpole is checked before locomotion (so a pure balance
+    # goal that mentions "velocity" — in `_directional` — resolves to cartpole, not the
+    # wrong go1_trot anchor), but ONLY when there is NO real GAIT verb: a gait verb is a
+    # far stronger locomotion signal than an incidental "balance" token, so "walk/trot/run
+    # while balancing …" must stay locomotion (round-6: the unconditional reorder
+    # introduced the symmetric mis-resolution). "cartpole" is unconditional (unambiguous).
+    if has("cartpole") or (has("balance", "balancing") and not _gait):
         return "cartpole"
     if (_gait or (_directional and not _posture_gesture)) and not _in_place:
         return "locomotion"
