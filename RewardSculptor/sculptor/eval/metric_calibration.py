@@ -25,8 +25,10 @@ from typing import Any, Optional
 import numpy as np
 
 from sculptor.eval.generated_metric import (
+    GENERATED_FN_NAME,
     inject_joint_roles,
     load_generated_metric,
+    load_generated_module,
     read_required_roles,
 )
 from sculptor.eval.spec_metrics import _SPEC_FNS
@@ -168,15 +170,23 @@ def calibrate_metric(
     `ok=True` (steer-rights earned) iff rho ≥ threshold. Never raises."""
     if builtin_name not in _SPEC_FNS:
         raise KeyError(f"unknown built-in metric {builtin_name!r}")
+    # §round-11: load ONCE (a single gated exec) and derive both the compute fn
+    # AND the roles from the loaded MODULE — read_required_roles(mod) does NOT
+    # re-load. This keeps the whole load inside the try (the round-10 loader can
+    # now raise on a violation/unreadable file) so the "Never raises" contract
+    # holds, and removes a TOCTOU re-read+re-screen window between the two loads.
     try:
-        gen_fn = load_generated_metric(generated_module_path)
+        gen_module = load_generated_module(generated_module_path)
+        gen_fn = getattr(gen_module, GENERATED_FN_NAME, None)
+        if not callable(gen_fn):
+            raise ValueError(f"metric lacks a callable {GENERATED_FN_NAME}()")
+        # §Ship 49: resolve the metric's declared joint roles against the
+        # synthetic biped names the ladder carries, so a role-based metric reads
+        # the right columns (lenient — the 12-joint body has no roll/yaw axes).
+        roles = read_required_roles(gen_module)
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "spearman": 0.0, "threshold": threshold,
                 "builtin": builtin_name, "error": f"{type(e).__name__}: {e}"}
-    # §Ship 49: resolve the metric's declared joint roles against the
-    # synthetic biped names the ladder carries, so a role-based metric reads
-    # the right columns (lenient — the 12-joint body has no roll/yaw axes).
-    roles = read_required_roles(generated_module_path)
     builtin_fn = _SPEC_FNS[builtin_name]
     ladder = _ladder(builtin_name)
     gen_scores, builtin_scores = [], []

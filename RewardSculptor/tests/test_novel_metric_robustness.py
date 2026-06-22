@@ -664,3 +664,20 @@ def test_compute_generated_metric_degrades_on_unsafe_source(tmp_path):
     out = compute_generated_metric(mp, rd)
     assert out.get("spec_score") == 0.0
     assert "error" in out
+
+
+def test_calibrate_metric_never_raises_on_load_failure(tmp_path):
+    """§round-11: calibrate_metric honors its documented 'Never raises' contract even
+    though the round-10 loader can now raise (unsafe source OR unreadable file). The single
+    gated load is fully inside the try and roles come from the loaded MODULE (no TOCTOU
+    re-read), so a load failure degrades to a graceful {ok:False, error} dict, never a raise."""
+    from sculptor.eval.metric_calibration import calibrate_metric
+    from sculptor.eval.spec_metrics import _SPEC_FNS
+    builtin = next(iter(_SPEC_FNS))
+    unsafe = tmp_path / "metric.py"
+    unsafe.write_text("import os\ndef compute_spec(a,b,m):\n    return {'spec_score':0.5}\n",
+                      encoding="utf-8")
+    out = calibrate_metric(unsafe, builtin)          # loader raises inside try
+    assert out["ok"] is False and "error" in out
+    out2 = calibrate_metric(tmp_path / "nope.py", builtin)   # OSError->ImportError inside try
+    assert out2["ok"] is False and "error" in out2
