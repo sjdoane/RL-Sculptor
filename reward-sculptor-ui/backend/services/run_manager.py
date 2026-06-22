@@ -296,7 +296,7 @@ async def _generate_at_launch(
                         asyncio.to_thread(metric_store.calibrate_task_derived,
                                           project_dir, gid, behavior_goal, robot_hint,
                                           adversarial=_ADVERSARIAL_ENABLED,
-                                          expect_token=cal_token),
+                                          expect_token=cal_token, require_token=True),
                         timeout=300.0)
                     c = cal.get("calibration") or {}
                     adv = c.get("adversarial") or {}

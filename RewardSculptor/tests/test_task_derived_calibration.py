@@ -1168,3 +1168,35 @@ def test_nan_spec_score_does_not_false_grant(tmp_path):
     for s in cal.get("sources", []):
         if s.get("rho") is not None:
             assert s["rho"] < 0.99 or s.get("separation", 0) < 0.2
+
+
+def test_adversarial_gate_nan_hack_is_gameable():
+    """§round-7 FALSE-GRANT fix: a gaming probe the metric scores NaN must be treated as
+    GAMEABLE (fail-closed) — `NaN > worst` is False, so a NaN hack would otherwise drop
+    out of `worst` and ESCAPE the denial. The required-loser path runs regardless of the
+    LLM author."""
+    import numpy as np
+    from sculptor.eval.metric_calibration import _NAMES_12, adversarial_archetype_gate
+
+    def nan_metric(arrays, behavior, meta):
+        return {"spec_score": float("nan")}     # scores every hack NaN
+
+    loser = {"name": "tremor_hack", "channel": "amplitude",
+             "arrays": {"joint_pos": np.zeros((120, 4, 12)),
+                        "joint_vel": np.zeros((120, 4, 12)),
+                        "projected_gravity_b": np.tile([0, 0, -1.0], (120, 4, 1)),
+                        "root_link_pos_w": np.zeros((120, 4, 3))},
+             "behavior": {"max_episode_steps": 120, "rollout_num_envs": 4, "step_dt": 0.02},
+             "meta": {"joint_names": list(_NAMES_12)}}
+
+    class _NoAuthor:
+        def create(self, **kw): raise RuntimeError("no author needed")
+    class _C:
+        messages = _NoAuthor()
+
+    rec = adversarial_archetype_gate(
+        nan_metric, [], list(_NAMES_12), competent_ref=0.78, client=_C(),
+        required_losers=[loser], scored_channels=["amplitude"])
+    assert rec["ran"] is True
+    assert rec["gameable"] is True          # NaN hack → gameable, not silently dropped
+    assert rec["ok"] is False

@@ -41,23 +41,38 @@ def test_stale_token_does_not_persist_grant(tmp_path, monkeypatch):
     _patch_grant(monkeypatch)
     token = metric_store.stamp_cal_token(tmp_path, "gen_001")   # the launch's token
     metric_store.stamp_cal_token(tmp_path, "gen_001")           # timeout re-stamp (supersede)
-    out = metric_store.calibrate_task_derived(
-        tmp_path, "gen_001", "touch your toes", expect_token=token)  # the orphan, late
+    out = metric_store.calibrate_task_derived(                  # the orphan, late
+        tmp_path, "gen_001", "touch your toes", expect_token=token, require_token=True)
     assert out["calibrated"] is not True
     meta = json.loads((tmp_path / "metrics/gen_001/meta.json").read_text())
     assert meta.get("calibrated") is not True                  # NOT resurrected
 
 
 def test_matching_token_persists_grant(tmp_path, monkeypatch):
-    """The normal (in-time) case: the token still matches → the genuine grant persists."""
+    """The normal (in-time) live case: the token still matches → the genuine grant persists."""
     _make_metric(tmp_path)
     _patch_grant(monkeypatch)
     token = metric_store.stamp_cal_token(tmp_path, "gen_001")
     out = metric_store.calibrate_task_derived(
-        tmp_path, "gen_001", "touch your toes", expect_token=token)
+        tmp_path, "gen_001", "touch your toes", expect_token=token, require_token=True)
     assert out["calibrated"] is True
     meta = json.loads((tmp_path / "metrics/gen_001/meta.json").read_text())
     assert meta.get("calibrated") is True
+
+
+def test_none_token_fails_closed_on_live_path(tmp_path, monkeypatch):
+    """§round-7 FALSE-GRANT fix: on the LIVE path (require_token=True) a None token (e.g.
+    stamp's meta write failed) must FAIL CLOSED — do NOT persist the grant. Previously a
+    None token disabled the guard → the orphan resurrected calibrated=true behind the
+    observe-only verdict."""
+    _make_metric(tmp_path)
+    _patch_grant(monkeypatch)
+    metric_store.supersede_calibration(tmp_path, "gen_001")     # observe-only surfaced
+    out = metric_store.calibrate_task_derived(
+        tmp_path, "gen_001", "touch your toes", expect_token=None, require_token=True)
+    assert out["calibrated"] is not True
+    meta = json.loads((tmp_path / "metrics/gen_001/meta.json").read_text())
+    assert meta.get("calibrated") is False                      # NOT resurrected by a None token
 
 
 def test_no_token_persists_unconditionally(tmp_path, monkeypatch):
@@ -82,7 +97,7 @@ def test_supersede_forces_observe_only_and_invalidates_orphan(tmp_path, monkeypa
     assert meta.get("calibrated") is False                       # forced observe-only
     # the orphan finishes late with the stale token → no-op write
     out = metric_store.calibrate_task_derived(
-        tmp_path, "gen_001", "touch your toes", expect_token=token)
+        tmp_path, "gen_001", "touch your toes", expect_token=token, require_token=True)
     assert out["calibrated"] is not True
     meta2 = json.loads((tmp_path / "metrics/gen_001/meta.json").read_text())
     assert meta2.get("calibrated") is False                      # NOT resurrected

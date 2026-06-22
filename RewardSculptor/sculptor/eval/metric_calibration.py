@@ -418,6 +418,17 @@ _ADV_ABS_CEIL = 0.5      # AND below 0.5 absolute (no gaming may look half-compe
 _ADV_N = 3               # archetypes the blind author proposes
 
 
+def _gameable_score(s: float) -> float:
+    """§round-7 FALSE-GRANT fix: in the adversarial GAMING gate, a non-finite score on a
+    gaming probe must be treated as MAXIMALLY gaming (fail-CLOSED), the OPPOSITE direction
+    from the calibration sites (where high-on-a-hack is bad, not good). `NaN > worst` is
+    False, so a NaN-scoring hack would silently drop out of `worst` and ESCAPE the
+    gameability denial → a false grant. Coerce non-finite → 1.0 (≥ any ceiling) so a hack
+    the metric scores undefined is denied, not waved through. Also keeps meta.json JSON
+    valid (no bare NaN persisted)."""
+    return s if np.isfinite(s) else 1.0
+
+
 def _author_gaming(client: Any, model: str, payload: dict) -> Any:
     """One blind gaming-archetype author call → a GamingArchetypeSet. Given ONLY
     the goal/robot/joint_names — never any metric (same firewall as the ladder
@@ -699,6 +710,7 @@ def adversarial_archetype_gate(
                 {"name": name, "channel": loser.get("channel"),
                  "skipped": f"score error: {type(e).__name__}"})
             continue
+        s = _gameable_score(s)   # §round-7: a NaN/inf hack score → GAMEABLE (fail-closed)
         losers_scored += 1
         rec["required_losers"].append(
             {"name": name, "channel": loser.get("channel"), "score": round(s, 4)})
@@ -753,6 +765,7 @@ def adversarial_archetype_gate(
                 rec["archetypes"].append(
                     {"name": name, "skipped": f"render/score error: {type(e).__name__}"})
                 continue
+            s = _gameable_score(s)   # §round-7: a NaN/inf hack score → GAMEABLE (fail-closed)
             arche_scored += 1
             rec["archetypes"].append({
                 "name": name, "strategy": str(getattr(arch, "strategy", ""))[:160],
@@ -782,7 +795,8 @@ def adversarial_archetype_gate(
 
     ceiling = min(rel_ceil * float(competent_ref), abs_ceil)
     rec["ceiling"] = round(ceiling, 4)
-    gameable = (worst >= rel_ceil * float(competent_ref)) or (worst >= abs_ceil)
+    gameable = ((not np.isfinite(worst))   # §round-7: non-finite worst → fail-closed
+                or (worst >= rel_ceil * float(competent_ref)) or (worst >= abs_ceil))
     rec["gameable"] = bool(gameable)
     rec["ok"] = not gameable
     if gameable:

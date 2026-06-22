@@ -134,10 +134,11 @@ def generate(
         behavior_goal, root / gid, robot_hint=robot_hint, review=review,
         n_candidates=n_candidates, on_event=on_event)
     rec["id"] = gid
-    # Re-stamp meta.json with the id so list/calibrate can find it.
+    # Re-stamp meta.json with the id so list/calibrate can find it. Atomic write so a
+    # concurrent reader never sees a partial file (§round-7).
     meta = root / gid / "meta.json"
     try:
-        meta.write_text(json.dumps(rec, indent=2, default=str), encoding="utf-8")
+        _atomic_write_json(meta, rec)
     except Exception:  # noqa: BLE001 — meta is best-effort; rec already returned
         pass
     return _summary(gid, rec)
@@ -167,14 +168,18 @@ def calibrate(project_dir: Path, gid: str, builtin_name: str) -> dict[str, Any]:
     if not metric_py.is_file() or not meta.is_file():
         raise FileNotFoundError(f"generated metric {gid!r} not found")
     cal = sculptor_bridge.calibrate_objective_metric(metric_py, builtin_name)
-    rec = json.loads(meta.read_text(encoding="utf-8"))
-    # §Ship 52: unified grant (byte-identical here) + standardized trust score.
-    fin = sculptor_bridge.finalize_calibration(cal, rec.get("validation"))
-    rec["calibrated"] = fin["calibrated"]
-    rec["calibration"] = cal
-    rec["calibration_method"] = "builtin"
-    rec["trust"] = fin["trust"]
-    meta.write_text(json.dumps(rec, indent=2, default=str), encoding="utf-8")
+    # §round-7: read-modify-write under _META_LOCK + atomic, like the task-derived path,
+    # so a concurrent supersede / task-derived write on the same gid can't be lost (or
+    # leave a torn meta). The slow calibrate_objective_metric call stays outside the lock.
+    with _META_LOCK:
+        rec = json.loads(meta.read_text(encoding="utf-8"))
+        # §Ship 52: unified grant (byte-identical here) + standardized trust score.
+        fin = sculptor_bridge.finalize_calibration(cal, rec.get("validation"))
+        rec["calibrated"] = fin["calibrated"]
+        rec["calibration"] = cal
+        rec["calibration_method"] = "builtin"
+        rec["trust"] = fin["trust"]
+        _atomic_write_json(meta, rec)
     return _summary(gid, rec)
 
 
@@ -231,19 +236,21 @@ def supersede_calibration(project_dir: Path, gid: str) -> None:
 def calibrate_task_derived(
     project_dir: Path, gid: str, behavior_goal: str,
     robot_hint: Optional[str] = None, *, client=None, adversarial: bool = False,
-    expect_token: Optional[str] = None,
+    expect_token: Optional[str] = None, require_token: bool = False,
 ) -> dict[str, Any]:
     """§Ship 51: calibrate a stored metric against K independently-authored
     competence ladders (the novel-task path) and persist `calibrated` + the
     full per-source provenance into its meta.json. The grant flips at the SAME
     point as the built-in path; `steer_allowed` is untouched.
     §Ship 53: `adversarial` adds the L3 gaming-archetype gate (flag-gated).
-    §round-5/6: `expect_token` (set by the live launch path via `stamp_cal_token`) makes
-    the grant persist ONLY if this attempt is still current. The token RE-CHECK and the
-    write are done together under `_META_LOCK` against a FRESH on-disk read (round-6:
-    the prior check-then-write was a TOCTOU — a timeout `supersede_calibration` during
-    the finalize window could be clobbered, resurrecting calibrated=true). None →
-    unconditional (the explicit, synchronous calibrate-route path; no orphan)."""
+    §round-5/6/7: the token guard. `require_token` (set True by the live, orphan-prone
+    launch path) makes the grant persist ONLY if `expect_token` is non-None AND still
+    matches the on-disk `cal_token` — so a stamp-write failure (token None) FAILS CLOSED
+    (skip persist), never resurrecting a grant behind a surfaced observe-only verdict
+    (round-7: overloading None as 'disable the guard' was a false-grant hole). The
+    synchronous calibrate-route keeps `require_token=False` → unconditional persist (no
+    orphan). The token re-check + write are atomic under `_META_LOCK` against a FRESH read
+    (round-6 TOCTOU)."""
     d = _metrics_root(project_dir) / gid
     metric_py = d / "metric.py"
     meta = d / "meta.json"
@@ -259,8 +266,11 @@ def calibrate_task_derived(
     # token still matches, then write — so a concurrent supersede/re-stamp cannot be lost.
     with _META_LOCK:
         rec = json.loads(meta.read_text(encoding="utf-8"))
-        if expect_token is not None and rec.get("cal_token") != expect_token:
-            return _summary(gid, rec)   # superseded → observe-only verdict stays authoritative
+        if require_token and (expect_token is None
+                              or rec.get("cal_token") != expect_token):
+            # Live path: a missing/superseded token FAILS CLOSED (no grant) — the
+            # surfaced observe-only verdict stays authoritative.
+            return _summary(gid, rec)
         rec["calibrated"] = fin["calibrated"]
         rec["calibration"] = cal
         rec["calibration_method"] = "task_derived"
