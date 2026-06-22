@@ -577,6 +577,15 @@ _BATTERY_NEAR_ZERO = 1e-3
 _PROBE_DT = 0.02
 
 
+def _physical_vel(jp: np.ndarray) -> np.ndarray:
+    """joint_vel in PHYSICAL rad/s = d(joint_pos)/dt — the runtime/calibration-ladder
+    convention. THE single source of truth for the synthetic-rollout velocity unit,
+    shared by `_selectivity_probe` (the validator) and the `_graded_*_rung` builders
+    (the best-of-N selector) so the two never diverge (a bare np.gradient is dt× too
+    small and silently mis-scales any velocity-thresholding channel)."""
+    return np.gradient(jp, axis=0) / _PROBE_DT
+
+
 def _selectivity_probe(fn, meta) -> dict[str, float]:
     """Goal-AGNOSTIC selectivity probe: score `fn` on a deterministic, offline
     SET of hand-rolled competent-vs-degenerate rollouts to answer "is this metric
@@ -613,8 +622,7 @@ def _selectivity_probe(fn, meta) -> dict[str, float]:
         g = np.zeros((T, E, 3)); g[..., 2] = -1.0
         return g
 
-    def _vel(jp: np.ndarray) -> np.ndarray:
-        return np.gradient(jp, axis=0) / _PROBE_DT       # PHYSICAL rad/s (runtime convention)
+    _vel = _physical_vel                                  # PHYSICAL rad/s (shared module helper)
 
     def _feet(d: dict) -> dict:
         # Supply the optional end-effector channels (planted, stationary feet) so a
@@ -645,14 +653,18 @@ def _selectivity_probe(fn, meta) -> dict[str, float]:
     c2 = _feet({"joint_pos": jp2, "joint_vel": _vel(jp2),
                 "projected_gravity_b": g2, "root_link_pos_w": root2})
 
-    # C3 — GESTURE: arms RAISE and OSCILLATE (wave / reach / raise-arms), upright,
-    # stationary. The symmetric single-arc C1/C2 sweep has no sustained raise + repeated
-    # swing, so a gesture metric (raise-amplitude + ≥N direction changes) needs this one.
+    # C3 — GESTURE: arms RAISE to a sustained OVERHEAD posture and OSCILLATE side-to-side
+    # (wave / reach / raise-arms), upright, stationary. The symmetric single-arc C1/C2
+    # sweep has no sustained raise + repeated swing, so a gesture metric (overhead hold +
+    # swept amplitude + repeated direction changes) needs this one. Held at ~2.2 rad
+    # (clearly "arms up") + oscillating ±0.7 at a MODERATE in-band frequency (period 24
+    # frames ≈ 2 Hz at dt=0.02 — inside the typical 0.3-4 Hz wave band; the prior period-12
+    # ≈ 4.2 Hz fell just OUTSIDE it and a spectral-band gesture metric scored 0).
     jp3 = np.zeros((T, E, J))
-    raise_env = np.clip(t / (0.2 * T), 0.0, 1.0)          # arms ramp up over the first 20%
-    wave = 0.6 * np.sin(2.0 * np.pi * t / 12.0)           # then oscillate (period 12 frames)
-    for j in (6, 7, 8, 9):                                # shoulders + elbows (synthetic body)
-        jp3[:, :, j] = (raise_env + wave)[:, None]
+    raise_env = 2.8 * np.clip(t / (0.08 * T), 0.0, 1.0)   # arms ramp UP overhead (first ~8%),
+    swing = 0.7 * np.sin(2.0 * np.pi * t / 24.0)          # held so |angle| stays > 2 rad through
+    for j in (6, 7, 8, 9):                                # the swing (overhead window ≫ 1.5 s);
+        jp3[:, :, j] = (raise_env + swing)[:, None]       # oscillate ~2 Hz, ≥4 cycles
     root3 = np.zeros((T, E, 3)); root3[..., 2] = 0.7
     c3 = _feet({"joint_pos": jp3, "joint_vel": _vel(jp3),
                 "projected_gravity_b": _g_upright(), "root_link_pos_w": root3})
@@ -678,6 +690,20 @@ def _selectivity_probe(fn, meta) -> dict[str, float]:
     c4 = _feet({"joint_pos": jp4, "joint_vel": _vel(jp4),
                 "projected_gravity_b": g4, "root_link_pos_w": root4})
 
+    # C5 — REPEATED BIDIRECTIONAL torso/waist oscillation (twist L/R, rotate, shake),
+    # upright, stationary. A repeated-motion goal needs left-AND-right excursions with
+    # several reversals — which the one-sided 0→1.2→0 arc of C1/C2 (and the arm-only C3)
+    # never produces on the torso joints. Oscillates the torso + neck columns ±0.6 at
+    # ~1.7 Hz (period 30, ~4 cycles); only 2 joints + moderate speed, so a fast 12-joint
+    # `upright_flail`/`chaotic` rewarder still scores HIGHER on those folded negatives.
+    jp5 = np.zeros((T, E, J))
+    twist = 0.6 * np.sin(2.0 * np.pi * t / 30.0)          # bidirectional ±0.6, ≥4 reversals
+    for j in (10, 11):                                    # torso + neck (synthetic body)
+        jp5[:, :, j] = twist[:, None]
+    root5 = np.zeros((T, E, 3)); root5[..., 2] = 0.7
+    c5 = _feet({"joint_pos": jp5, "joint_vel": _vel(jp5),
+                "projected_gravity_b": _g_upright(), "root_link_pos_w": root5})
+
     # D1 — STILL: alive-but-frozen upright stance. A still / low-motion-rewarding
     # metric scores this high → no competent-vs-degenerate separation → reject.
     jp0 = np.zeros((T, E, J)); jv0 = np.zeros((T, E, J))
@@ -698,7 +724,7 @@ def _selectivity_probe(fn, meta) -> dict[str, float]:
         except Exception:  # noqa: BLE001 — a probe crash is "no signal", never raises
             return 0.0
 
-    comp = max(_s(c1), _s(c2), _s(c3), _s(c4))
+    comp = max(_s(c1), _s(c2), _s(c3), _s(c4), _s(c5))
     degen = max(_s(d1), _s(d2))
     return {"competent": comp, "degenerate": degen, "spread": comp - degen}
 
@@ -714,7 +740,7 @@ def _graded_fold_rung(depth: float, rom: float) -> dict:
     fold = (1.0 - np.cos(2.0 * np.pi * t / T)) / 2.0
     jp = rom * fold[:, None, None] * np.ones((T, E, J))
     root = np.zeros((T, E, 3)); root[..., 2] = 0.7 - depth * fold[:, None]
-    return {"joint_pos": jp, "joint_vel": np.gradient(jp, axis=0),
+    return {"joint_pos": jp, "joint_vel": _physical_vel(jp),
             "projected_gravity_b": _upright_g(), "root_link_pos_w": root}
 
 
@@ -730,7 +756,7 @@ def _graded_posture_rung(tilt: float, rom: float) -> dict:
     g[..., 2] = -1.0 + tilt * fold[:, None]
     g[..., 0] = tilt * fold[:, None]
     root = np.zeros((T, E, 3)); root[..., 2] = 0.6
-    return {"joint_pos": jp, "joint_vel": np.gradient(jp, axis=0),
+    return {"joint_pos": jp, "joint_vel": _physical_vel(jp),
             "projected_gravity_b": g, "root_link_pos_w": root}
 
 
@@ -999,29 +1025,44 @@ def validate_generated_metric(
     # metric clearly separates a competent behavior from the degenerate ones.
     # Task-VALIDITY (does it match the goal) is enforced downstream by task-derived
     # calibration; the firewall keeps an uncalibrated metric observe-only, so a
-    # vacuous pass never grants steering on its own. Scoped to family is None →
-    # every builtin family keeps the unchanged path (its positive archetype is
-    # never ~0, so battery_uninformative is False).
+    # vacuous pass never grants steering on its own.
     #
-    # §<vacuous-entry fix>: the trigger keys on the POSITIVE archetypes (~0), NOT
-    # on the whole battery — a metric that scored some NEGATIVE slightly above the
-    # near-zero floor (e.g. a wave metric giving a fast-flail archetype a little
-    # credit) used to be kicked to the normal path, where with all positives ~0 the
-    # "negative ≥ best-positive" check trips on the 0 ≥ 0 tie and false-rejects every
-    # novel goal. To keep the anti-gaming teeth when entering on positives, the fixed
-    # NEGATIVES are FOLDED INTO the probe's degenerate anchor: the metric must beat
-    # the worse of {probe still/fallen, every fixed negative} — so a flail/chaos/fall
-    # rewarder that scores a fixed negative high is still rejected here.
+    # §<vacuous-entry fix>: the trigger keys ONLY on the POSITIVE archetypes (~0) —
+    # NOT on the whole battery, and NOT scoped to family is None.
+    #   * Whole-battery → positives: a metric that scored some NEGATIVE slightly above
+    #     the near-zero floor (a wave metric giving a fast-flail archetype a little
+    #     credit) used to be kicked to the normal path, where with all positives ~0 the
+    #     "negative ≥ best-positive" check trips on the 0 ≥ 0 tie and false-rejects.
+    #   * Dropping the family-is-None scope: a goal can MIS-resolve to a family from a
+    #     stray word ("bend forward"→locomotion via "forward", "march in place"→
+    #     locomotion) — then a good NOVEL metric scores that family's positive ~0 and
+    #     was false-rejected on the normal path. The metric scoring EVERY positive ~0 is
+    #     the ground truth that the fixed battery can't represent the goal, whatever
+    #     family was guessed. A GOOD family metric still lights up its own positive →
+    #     best_pos > floor → normal path (UNCHANGED); a genuinely-broken family metric
+    #     scores the probe ~0 too (the probe has no kick/locomotion rollout) → rejected.
+    # To keep the anti-gaming teeth, the fixed NEGATIVES are FOLDED INTO the probe's
+    # degenerate anchor: the metric must beat the worse of {probe still/fallen, every
+    # fixed negative} — so a flail/chaos/fall rewarder that scores a fixed negative high
+    # is still rejected here. The forward-WALKER is also folded UNLESS the goal is
+    # forward-directional (goal_axis == "+x"), so an in-place novel skill that rewards
+    # walking is caught, while a legitimately forward novel goal is not false-rejected.
     pos_finite = [finite[k] for k in positive_keys if k in finite]
-    neg_finite = [finite[k] for k in negative_keys if k in finite]
+    # The labelled degenerate anchors folded into the vacuous check (name → score), so
+    # a reject can NAME the offending degenerate (actionable feedback) instead of a
+    # blanket "near-constant".
+    neg_anchors: dict[str, float] = {k: finite[k] for k in negative_keys if k in finite}
+    if frame.get("goal_axis") != "+x" and "walker" in finite:
+        neg_anchors["walker"] = finite["walker"]
     best_pos_battery = max(pos_finite) if pos_finite else 0.0
     battery_uninformative = (
-        family is None and len(finite) >= 3
-        and best_pos_battery <= _BATTERY_NEAR_ZERO)
+        len(finite) >= 3 and best_pos_battery <= _BATTERY_NEAR_ZERO)
     if battery_uninformative:
         probe = _selectivity_probe(fn, meta)
         selectivity = probe
-        degen_anchor = max([probe["degenerate"], *neg_finite])
+        anchors = {"probe_degenerate": probe["degenerate"], **neg_anchors}
+        anchor_name = max(anchors, key=lambda k: anchors[k])
+        degen_anchor = anchors[anchor_name]
         if (probe["competent"] >= spread_min
                 and (probe["competent"] - degen_anchor) >= spread_min):
             vacuous = True
@@ -1031,12 +1072,25 @@ def validate_generated_metric(
                 f"but the metric IS selective on the goal-agnostic probe (competent "
                 f"{probe['competent']:.3f} vs degenerate {degen_anchor:.3f}) "
                 f"— task-validity deferred to task-derived calibration")
-        else:
+        elif probe["competent"] < spread_min:
             nondegen = False
             reasons.append(
                 f"[nondegeneracy] near-constant metric: fixed battery uninformative "
                 f"AND not selective on the probe (competent {probe['competent']:.3f}, "
                 f"degenerate {degen_anchor:.3f}) — no signal")
+        else:
+            # Selective on the probe, but a DEGENERATE archetype scores nearly as high
+            # — the metric is GAMEABLE by that behavior. Name it so a regeneration can
+            # add the distinguishing requirement (e.g. a fast whole-body 'upright_flail'
+            # beats a twist metric that does not bound oscillation frequency / isolate
+            # the joint; 'walker' beats an in-place metric that credits forward travel).
+            nondegen = False
+            reasons.append(
+                f"[nondegeneracy] gameable: the metric scores a competent probe "
+                f"({probe['competent']:.3f}) but the degenerate '{anchor_name}' "
+                f"({degen_anchor:.3f}) scores nearly as high — distinguish the goal "
+                f"from '{anchor_name}' (e.g. bound oscillation frequency, isolate the "
+                f"goal joint(s), or veto base travel)")
     elif len(finite) < 3:
         nondegen = False
         reasons.append("[nondegeneracy] too few finite archetype scores")

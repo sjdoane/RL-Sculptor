@@ -18,6 +18,22 @@ running real best-of-N generations and reading the actual rejected sources:
   Fix 5 — on a vacuous pass the selectivity-probe scores are surfaced to the
           independent reviewer (so it does not false-flag the all-zero fixed battery
           as near-constant).
+
+Round 2 (a second real best-of-N batch across bow/wave/twist/march + an adversarial
+review of the round-1 commit found further fixes):
+  Fix 6 — the vacuous-branch entry no longer requires `family is None`: a goal can
+          MIS-resolve to a family from a stray word ("bend forward"→locomotion), and a
+          good novel metric then scored that family's positive ~0 and was false-rejected.
+          Entry now keys ONLY on every POSITIVE archetype being ~0 (a good family metric
+          still lights up its own positive → unchanged normal path).
+  Fix 7 — the forward-WALKER is folded into the vacuous degenerate anchor UNLESS the
+          goal is forward-directional, catching an in-place novel metric that rewards
+          walking without false-rejecting a legitimately forward goal.
+  Fix 8 — _graded_fold_rung / _graded_posture_rung share the probe's `_physical_vel`
+          (rad/s) so the best-of-N selector and the validator never diverge in unit.
+  Fix 9 — a probe-selective metric that a folded DEGENERATE archetype also scores high
+          is reported as "gameable: ... '<archetype>' ..." (actionable feedback) rather
+          than a misleading "near-constant".
 """
 from __future__ import annotations
 
@@ -28,7 +44,9 @@ import numpy as np
 
 from sculptor.eval.metric_validate import (
     _ast_safety,
+    _graded_fold_rung,
     _NAMES_12,
+    _physical_vel,
     _selectivity_probe,
     validate_generated_metric,
 )
@@ -345,3 +363,130 @@ def test_review_payload_omits_selectivity_when_none():
     c = _RecClient()
     _review_metric(c, "m", "goal", "src", {"still": 0.0})
     assert "selectivity_probe" not in c.messages.users[0]
+
+
+# ── Fix 6: mis-resolved family still reaches the probe ───────────────────────
+
+# A genuine bow/bend metric (torso pitches forward then recovers upright). The goal
+# "bend forward …" MIS-resolves to family=locomotion via the stray word "forward",
+# yet the metric scores every fixed positive (incl the locomotion `active` walker) ~0.
+BOW_TILT_RETURN = '''import numpy as np
+def compute_spec(arrays, behavior, meta):
+    pg = arrays.get("projected_gravity_b")
+    if pg is None:
+        return {"spec_score": 0.0}
+    gx = pg[..., 0]; gz = pg[..., 2]
+    tilt = float(np.mean(np.max(gx, axis=0)))                       # torso pitched forward at peak
+    ret = float(np.mean(np.abs(gz[-5:].mean(0) - gz[:5].mean(0))))  # returns upright
+    up0 = float(np.mean(gz[:5].mean(0) < -0.85))
+    gate = (1.0 if tilt > 0.5 else 0.0) * (1.0 if ret < 0.15 else 0.0) * (1.0 if up0 > 0.7 else 0.0)
+    return {"spec_score": float(np.clip(gate * np.clip(tilt, 0.0, 1.0), 0.0, 1.0))}
+'''
+
+
+def test_mis_resolved_family_still_reaches_probe():
+    """A novel bend/bow metric whose goal mis-resolves to a behavior family (locomotion
+    via 'forward') still reaches the selectivity probe and passes vacuously — the entry
+    keys on the positive archetypes being ~0, not on family being None."""
+    v = _val(BOW_TILT_RETURN, "bend forward into a deep bow and return upright")
+    assert v["family"] == "locomotion"                   # genuinely mis-resolved
+    assert v["nondegeneracy_vacuous"] is True            # yet rescued by the probe
+    assert v["ok"], v["reasons"]
+
+
+def test_good_family_metric_unchanged_by_dropped_family_scope():
+    """Dropping the family-is-None scope must NOT change the normal path for a GOOD
+    family metric: it lights up its own positive archetype → battery informative →
+    not vacuous (the builtin family path is unchanged)."""
+    from tests.test_generated_metric import GOOD_KICK
+    v = _val(GOOD_KICK, "repeatedly kick forward with one leg")
+    assert v["family"] == "kick"
+    assert v["nondegeneracy_vacuous"] is False
+    assert v["ok"], v["reasons"]
+
+
+# ── Fix 7: walker folded for in-place goals, not forward goals ───────────────
+
+# Rewards EITHER a pelvis dip OR walking-at-standing-height — gameable on an in-place
+# goal (walk instead of dipping), legitimate on a forward goal.
+DIP_OR_WALK = '''import numpy as np
+REQUIRED_JOINT_ROLES = ["left_hip_pitch", "right_hip_pitch"]
+def compute_spec(arrays, behavior, meta):
+    root = arrays.get("root_link_pos_w"); pg = arrays.get("projected_gravity_b")
+    if root is None or pg is None:
+        return {"spec_score": 0.0}
+    z = root[..., 2]
+    drop = float(np.mean(z[:5].mean(0) - z.min(0)))
+    ret = float(np.mean(np.abs(z[-5:].mean(0) - z[:5].mean(0))))
+    up = float(np.mean(pg[:5, ..., 2].mean(0) < -0.85))
+    dip = (1.0 if (drop > 0.2 and ret < 0.08 and up > 0.7) else 0.0) * float(np.clip(drop / 0.35, 0, 1))
+    disp = float(np.linalg.norm(root[-1, :, :2].mean(0) - root[0, :, :2].mean(0)))
+    standing = float(np.mean(z.mean(0) > 0.65))
+    walk = (1.0 if standing > 0.7 else 0.0) * float(1 - np.exp(-disp / 1.0))
+    return {"spec_score": float(np.clip(max(dip, walk), 0, 1))}
+'''
+
+
+def test_walker_folded_for_inplace_goal():
+    """An in-place novel metric that also rewards forward walking is REJECTED in the
+    vacuous branch — the forward walker is folded into the degenerate anchor and named."""
+    v = _val(DIP_OR_WALK, "touch your toes then stand back up")
+    assert not v["ok"]
+    assert any("walker" in r for r in v["reasons"]), v["reasons"]
+
+
+def test_walker_not_folded_for_forward_goal():
+    """The same metric is NOT walker-rejected for a forward-directional goal (goal_axis
+    +x) — folding the walker there would false-reject a legitimately forward novel goal."""
+    v = _val(DIP_OR_WALK, "walk forward then touch your toes")
+    assert v["nondegeneracy_vacuous"] is True
+    assert v["ok"], v["reasons"]
+
+
+# ── Fix 8: graded rungs share the probe's physical rad/s velocity ────────────
+
+def test_graded_rungs_use_physical_velocity():
+    """The best-of-N selector's rung builders share the probe's `_physical_vel` (rad/s),
+    so the SELECTOR and the VALIDATOR never feed joint_vel in divergent units."""
+    rung = _graded_fold_rung(0.35, 1.2)
+    assert np.allclose(rung["joint_vel"], _physical_vel(rung["joint_pos"]))
+    # rad/s is ~1/dt larger than a bare per-frame gradient (the divergence the fix closes)
+    bare = np.gradient(rung["joint_pos"], axis=0)
+    assert np.max(np.abs(rung["joint_vel"])) > 10.0 * np.max(np.abs(bare)) - 1e-9
+
+
+# ── Fix 9: a flail/walker-gameable probe-selective metric is named, not "near-constant" ─
+
+# Scores a competent torso oscillation high, but a fast whole-body flail oscillates the
+# same joint just as much — gameable (no frequency bound / no isolation).
+TWIST_FLAIL_GAMEABLE = '''import numpy as np
+REQUIRED_JOINT_ROLES = ["waist_yaw"]
+def compute_spec(arrays, behavior, meta):
+    jp = arrays.get("joint_pos"); jv = arrays.get("joint_vel"); pg = arrays.get("projected_gravity_b")
+    if jp is None or jv is None or pg is None:
+        return {"spec_score": 0.0}
+    roles = (meta or {}).get("joint_roles", {}) or {}
+    if "waist_yaw" not in roles:
+        return {"spec_score": 0.0}
+    w = jp[..., int(roles["waist_yaw"])]
+    p2p = float(np.mean(np.max(w, axis=0) - np.min(w, axis=0)))
+    mid = 0.5 * (np.max(w, axis=0) + np.min(w, axis=0))
+    bidi = float(np.mean(np.minimum(np.max(w, axis=0) - mid, mid - np.min(w, axis=0))))
+    up = float(np.mean(pg[..., 2] < -0.85))
+    # Large peak-to-peak (> 0.9 rad): the small slow `active` archetype (p2p ~0.8) does
+    # NOT trip it (so the metric enters the vacuous branch), but a fast whole-body
+    # `upright_flail` (p2p ~2.4) games it (no frequency bound / no joint isolation).
+    gate = 1.0 if (p2p > 0.9 and bidi > 0.08 and up > 0.7) else 0.0
+    return {"spec_score": float(np.clip(gate * np.clip(p2p / 1.4, 0, 1), 0, 1))}
+'''
+
+
+def test_flail_gameable_metric_named_not_near_constant():
+    """A probe-selective metric a fixed degenerate archetype also scores high is reported
+    as 'gameable: ... <archetype>' (actionable), not a misleading 'near-constant'."""
+    v = _val(TWIST_FLAIL_GAMEABLE, "twist your torso to the left and right repeatedly")
+    assert not v["ok"]
+    assert any("gameable" in r for r in v["reasons"]), v["reasons"]
+    # the probe DID find it selective (so the message must not claim near-constant)
+    assert v["selectivity_probe"]["competent"] >= 0.5
+    assert not any("near-constant" in r for r in v["reasons"])
