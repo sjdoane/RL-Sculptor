@@ -659,14 +659,24 @@ _TERMINAL_DOWN_TOKENS = ("lie", "lay", "lying", "laying", "sleep", "rest",
 #: …unless the goal also says it returns/rises (then the down state is transient).
 _RETURN_UP_TOKENS = ("up", "rise", "rises", "rising", "stand", "standing",
                      "return", "returns", "back", "recover", "straighten", "tall")
-#: A goal whose competent behavior IS standing upright and still (balance / hold /
-#: stay steady) — for these `do_nothing_upright` (and the idle `jitter`) are ON-goal,
-#: so they must NOT be used as required-losers (they would false-deny a balance metric
-#: whose competent top-rung renders identically to a still upright stance). The tokens
-#: are deliberately TIGHT (no bare "stand"/"hold"/"upright" — those appear in active
-#: goals like "stand back up" / "hold your arms out") so an active goal is not misread.
-_STATIC_HOLD_TOKENS = ("balance", "balanced", "balancing", "still", "steady",
-                       "stable", "motionless", "stationary", "immobile")
+#: A goal whose competent behavior IS standing upright and still (balance / hold a
+#: stance) — for these `do_nothing_upright` (and the idle `jitter`) are ON-goal, so they
+#: must NOT be used as required-losers (they would false-deny a balance metric whose
+#: competent top-rung renders identically to a still upright stance). TIGHT tokens (no
+#: bare "stand"/"hold"/"upright" — those appear in active goals like "stand back up").
+#: §round-15: "steady"/"stable" REMOVED — they are common ACTIVE-goal adverbs
+#: ("a steady wave", "a stable gait") that mis-flagged active goals as static-hold and
+#: dropped the posture defense → false grant.
+_STATIC_HOLD_TOKENS = ("balance", "balanced", "balancing", "still",
+                       "motionless", "stationary", "immobile")
+#: §round-15: an ACTIVE-motion token forces static_hold=False regardless of any stillness
+#: adverb — "give a steady wave" / "hold still while you reach" are ACTIVE (the stillness
+#: is an incidental modifier, not the objective), so the posture losers must still apply.
+_ACTIVE_MOTION_TOKENS = (
+    "wave", "reach", "raise", "lower", "swing", "step", "walk", "run", "march",
+    "kick", "punch", "gesture", "lift", "turn", "twist", "bend", "extend", "throw",
+    "fold", "squat", "bow", "crouch", "touch", "nod", "shake", "clap", "shrug",
+    "jump", "hop", "lunge", "stomp", "stride", "gait", "rotate", "flex", "curl")
 
 
 def _goal_is_terminal_down(behavior_goal: str) -> bool:
@@ -677,9 +687,13 @@ def _goal_is_terminal_down(behavior_goal: str) -> bool:
 
 
 def _goal_is_static_hold(behavior_goal: str) -> bool:
-    """True iff the goal's competent behavior is a still upright hold (balance / steady /
-    motionless) — then standing still IS the goal, so the stillness losers are off."""
+    """True iff the goal's competent behavior is a still upright hold (balance/motionless)
+    — then standing still IS the goal, so the stillness losers are off. An ACTIVE-motion
+    verb anywhere in the goal forces False (the stillness word is an adverbial modifier of
+    an active goal, e.g. "a steady wave", not the objective)."""
     toks = set(re.findall(r"[a-z]+", (behavior_goal or "").lower()))
+    if toks & set(_ACTIVE_MOTION_TOKENS):
+        return False
     return bool(toks & set(_STATIC_HOLD_TOKENS))
 
 
@@ -694,17 +708,27 @@ def general_required_losers(
     meta}`, rendered offline via the Ship-51 synthesizer; run REGARDLESS of family or
     flags. Never raises.
 
-      * do_nothing_upright — perfectly still + fully upright at nominal height. Any
-        ACTIVE goal (fold/gesture/locomotion/kick) is unperformed → a real metric
-        scores ~0; a posture/height proxy scores it MAX. (catches the posture proxy)
-        Omitted for a STATIC-HOLD goal (balance/steady), where standing still is on-goal.
+      * do_nothing_upright — near-still + fully upright at nominal height. Any ACTIVE
+        goal (fold/gesture/locomotion/kick) is unperformed → a real metric scores ~0; a
+        posture/height proxy scores it MAX. (catches the posture proxy)
       * jitter_in_place — a SMALL idle high-frequency twitch: catches a proxy that
-        rewards generic joint VELOCITY/"some motion" (its 15 Hz gives high velocity at
-        a deliberately small ROM, so an honest small-amplitude gesture metric is NOT
-        false-rejected). Omitted for a static-hold goal.
-      * collapse_and_stay_down — a deep pelvis dip that NEVER returns upright →
-        catches a dip-DEPTH-only proxy that ignores the 'stand back up' half. Omitted
-        only for a terminal-DOWN goal (lie/rest), where collapse is on-goal.
+        rewards generic joint VELOCITY/"some motion" (its 15 Hz gives high velocity at a
+        deliberately small ROM, so an honest small-amplitude gesture metric is NOT
+        false-rejected).
+      * collapse_and_stay_down — a deep pelvis dip that NEVER returns upright → catches a
+        dip-DEPTH-only proxy that ignores the 'stand back up' half.
+
+    §round-15 carve-outs (so the loser set is NEVER empty and every loser is OFF-goal):
+      - do_nothing_upright/jitter are ON-goal ONLY for a still-UPRIGHT (balance) goal, i.e.
+        static-hold AND NOT terminal-down → dropped only then. For a terminal-down "lie
+        still" goal a still-UPRIGHT policy is OFF-goal (wrong height) so they are KEPT.
+      - collapse is ON-goal for a terminal-DOWN goal (lie/rest) → dropped only then.
+      So: balance→{collapse}; lie-down/lie-still→{do_nothing,jitter}; active→all three.
+
+    A raise while scoring a loser is handled RUNTIME-EQUIVALENTLY (→ 0.0, counted) in the
+    gate, so an honest onset/phase metric that indexes an empty selection on a degenerate
+    loser is NOT false-rejected, and a real reward-the-degenerate proxy (which returns a
+    HIGH score, not a raise) is still caught — see the gate's required-loser loop.
     """
     from sculptor.eval.ladder_synth import MotionSpec, render_rung
 
@@ -713,22 +737,21 @@ def general_required_losers(
         return {"name": name, "channel": channel, "arrays": arrays,
                 "behavior": behavior, "meta": dict(meta)}
 
+    sh = _goal_is_static_hold(behavior_goal)
+    td = _goal_is_terminal_down(behavior_goal)
     losers: list[dict] = []
-    if not _goal_is_static_hold(behavior_goal):
-        # §round-14: a balance/steady goal's competent behavior IS a still upright stance,
-        # so these stillness losers are ON-goal there and would false-deny it.
+    if not (sh and not td):   # still-upright losers are on-goal ONLY for a balance goal
+        # do_nothing is PERFECTLY still + upright: a posture/height proxy AND a stillness
+        # proxy both score it MAX, while any active goal scores it ~0.
         losers.append(_pack("do_nothing_upright", "posture",
                             MotionSpec(uprightness=1.0, base_height_m=0.7), 600))
-        # §round-14: a SMALL twitch (tremor 0.04 → ~0.07 rad ROM, peak vel ~3.5 rad/s,
-        # no noise term so the ROM is predictable) — enough joint VELOCITY at 15 Hz to
-        # trip a "rewards any motion" proxy, but a ROM far below any plausible gesture
-        # target so an honest small-amplitude gesture metric (target ≥ ~0.15 rad / ~9°)
-        # is NOT false-rejected. (Was tremor 0.15 → 0.48 rad ROM, which denied gestures
-        # up to ~54°.)
+        # a SMALL twitch (tremor 0.04 ≈ 0.07 rad ROM, peak vel ~3.5 rad/s): enough joint
+        # VELOCITY at 15 Hz to trip a "rewards any motion" proxy, ROM far below any
+        # plausible gesture target so an honest small-amplitude gesture metric is not denied.
         losers.append(_pack("jitter_in_place", "posture",
                             MotionSpec(uprightness=1.0, base_height_m=0.7,
                                        tremor=0.04), 601))
-    if not _goal_is_terminal_down(behavior_goal):
+    if not td:
         losers.append(_pack("collapse_and_stay_down", "completion",
                             MotionSpec(uprightness=0.0, base_height_m=[0.7, 0.1]), 602))
     return losers
@@ -803,18 +826,20 @@ def adversarial_archetype_gate(
             s = float(gen_fn(loser["arrays"], loser["behavior"], meta)
                       .get("spec_score", 0.0))
         except Exception as e:  # noqa: BLE001
-            # §round-14 FAIL-CLOSED: a required-loser is a renderer-built, ALWAYS-
-            # scorable rollout, and a conformant metric NEVER raises. A raise here is
-            # therefore EVIDENCE OF EVASION (a gaming metric that detects the probe —
-            # e.g. by its empty groups_resolved_counts — and raises to dodge the gate),
-            # NOT "no evidence". Count it (ran=True) and score it MAXIMALLY gaming so
-            # the verdict denies, instead of silently skipping (which nuked all losers
-            # → ran=False → gate not enforced → the depth/posture proxy re-granted).
+            # §round-15 RUNTIME-EQUIVALENT: a raise scores the loser 0.0, and the loser is
+            # COUNTED (losers_scored += 1, so ran=True — no fail-open via an empty set). A
+            # raise is neither "evasion" (round-14's fail-closed → false-rejected honest
+            # onset/phase metrics that index an empty selection on a degenerate rollout)
+            # nor "no evidence" (round-13's skip → fail-open via ran=False). It mirrors the
+            # RUNTIME contract: compute_generated_metric wraps the metric and returns 0.0
+            # on a raise, so a metric that raises on this degenerate loser would ALSO score
+            # the corresponding real degenerate POLICY 0.0 at runtime — i.e. it cannot
+            # reward that policy, so it is not gaming via this loser. (A metric that DOES
+            # reward a degenerate policy returns a HIGH score here, not a raise → caught.)
             losers_scored += 1
-            worst, worst_name = 1.0, name
             rec["required_losers"].append(
-                {"name": name, "channel": loser.get("channel"), "score": 1.0,
-                 "error": f"score error (fail-closed): {type(e).__name__}"})
+                {"name": name, "channel": loser.get("channel"), "score": 0.0,
+                 "note": f"unscorable (→0.0, runtime-equivalent): {type(e).__name__}"})
             continue
         s = _gameable_score(s)   # §round-7: a NaN/inf hack score → GAMEABLE (fail-closed)
         losers_scored += 1

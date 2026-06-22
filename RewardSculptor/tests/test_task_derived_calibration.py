@@ -1299,27 +1299,34 @@ def test_round13_role_query_axes_null_does_not_break_set():
 
 # ── §round-14 verify the round-13 fix: close the fail-open + 2 false-rejects ──
 
-def test_round14_loser_crash_fails_closed_not_skipped():
-    """§round-14 CRITICAL: a metric that RAISES on the deterministic losers (e.g. a gaming
-    metric that detects the group-less probe and raises to dodge the gate) must FAIL
-    CLOSED — counted as gaming, not silently skipped. Skipping nuked all losers →
-    ran=False → gate not enforced → the depth/posture proxy re-granted."""
+def test_round15_loser_raise_is_runtime_equivalent_zero_no_fail_open():
+    """§round-15 (supersedes round-14's fail-closed): a metric that RAISES on a loser is
+    scored 0.0 and COUNTED (ran=True → NO fail-open via an empty set), mirroring the
+    runtime contract (compute_generated_metric returns 0.0 on a raise). This is correct
+    because such a metric would ALSO raise on the corresponding real degenerate POLICY at
+    runtime → score it 0.0 → it CANNOT reward that policy → it is not gaming via the loser.
+    (Round-14 fail-closed false-rejected honest onset/phase metrics; round-13 skip
+    fail-opened via ran=False.)"""
     from sculptor.eval.metric_calibration import (
         general_required_losers, adversarial_archetype_gate)
     losers = general_required_losers(G1, "touch your toes then stand back up")
 
-    def evader(arrays, behavior, meta):
+    def raises_on_static(arrays, behavior, meta):
+        # an HONEST return-gated fold metric that TIMES the fold via an onset index —
+        # raises IndexError on a non-descending loser, exactly like a real generated
+        # metric, and scores a collapse 0.0 (no up-return), so it is NOT a depth proxy.
         import numpy as np
-        if not (meta or {}).get("groups_resolved_counts"):
-            raise RuntimeError("detected the group-less probe — evade")
-        z = arrays["root_link_pos_w"][..., 2]
-        return {"spec_score": float(np.clip((z.max(0) - z.min(0)).mean(), 0.0, 1.0))}
+        pz = arrays["root_link_pos_w"][..., 2].mean(1)
+        onset = np.nonzero(pz < pz[0] - 1e-3)[0][0]   # empty -> IndexError on a static loser
+        depth = pz[0] - pz.min(); ret = pz[-1] - pz.min()
+        return {"spec_score": float(np.clip(min(depth / 0.3, ret / 0.3), 0.0, 1.0))}
 
     rec = adversarial_archetype_gate(
-        evader, [], G1, competent_ref=1.0, client=None,
+        raises_on_static, [], G1, competent_ref=1.0, client=None,
         required_losers=losers, scored_channels=["posture", "completion"], author=False)
-    assert rec["ran"] is True                # the crashing losers still counted
-    assert rec["gameable"] is True           # → gameable (fail-closed), not a skip-to-grant
+    assert rec["ran"] is True                          # losers counted → NO fail-open
+    assert all(l.get("score") == 0.0 for l in rec["required_losers"])  # raise → 0.0
+    assert rec["gameable"] is False                    # honest metric NOT false-rejected
 
 
 def test_round14_static_hold_goal_drops_stillness_losers():
@@ -1379,3 +1386,79 @@ def test_round14_small_gesture_metric_not_false_rejected():
         any_velocity, [], G1, competent_ref=1.0, client=None,
         required_losers=losers, scored_channels=["posture", "completion"], author=False)
     assert rec2["gameable"]                           # a velocity proxy is STILL caught
+
+
+def test_round15_loser_set_never_empty_and_off_goal_per_class():
+    """§round-15 DEFECT 2: the carve-outs must NEVER empty the loser set, and every loser
+    must be OFF-goal for its goal class (else the gate is unenforced → false grant)."""
+    from sculptor.eval.metric_calibration import general_required_losers
+    cases = {
+        "touch your toes then stand back up": {"do_nothing_upright", "jitter_in_place", "collapse_and_stay_down"},
+        "balance on one leg":                 {"collapse_and_stay_down"},                       # still-upright is on-goal
+        "lie down to rest":                   {"do_nothing_upright", "jitter_in_place"},        # collapse is on-goal
+        "lie still and rest":                 {"do_nothing_upright", "jitter_in_place"},        # both classes → still NON-empty
+    }
+    for goal, expect in cases.items():
+        names = {l["name"] for l in general_required_losers(G1, goal)}
+        assert names, f"empty loser set for {goal!r} → gate unenforced"
+        assert names == expect, f"{goal!r}: {names} != {expect}"
+
+
+def test_round15_static_hold_intersection_denies_confound_proxy():
+    """§round-15 DEFECT 2: a static-hold ∩ terminal-down goal ('lie still') kept a NON-empty
+    loser set, so a still-upright confound proxy is DENIED (was a FALSE GRANT)."""
+    from sculptor.eval.metric_calibration import (
+        general_required_losers, adversarial_archetype_gate)
+
+    def lie_still_proxy(arrays, behavior, meta):  # rewards stillness OR lowness, never lies down
+        import numpy as np
+        root = arrays["root_link_pos_w"]; jv = arrays["joint_vel"]
+        low = float(np.clip(1 - np.mean(root[..., 2]) / 0.7, 0, 1))
+        still = float(1 - np.clip(np.abs(jv).mean(), 0, 1))
+        return {"spec_score": max(low, 0.8 * still)}
+
+    rec = adversarial_archetype_gate(
+        lie_still_proxy, [], G1, competent_ref=1.0, client=None,
+        required_losers=general_required_losers(G1, "lie still and rest"),
+        scored_channels=["posture", "completion"], author=False)
+    assert rec["gameable"]                              # do_nothing (still+upright) scores 0.8 ≥ ceiling
+
+
+def test_round15_steady_adverb_does_not_drop_posture_defense():
+    """§round-15 DEFECT 3: an active goal with a stillness ADVERB ('a steady wave') must NOT
+    be misread as static-hold (which dropped do_nothing → a posture proxy false-granted)."""
+    from sculptor.eval.metric_calibration import (
+        general_required_losers, adversarial_archetype_gate, _goal_is_static_hold)
+    assert not _goal_is_static_hold("give a steady wave with your arm")   # active verb wins
+    assert not _goal_is_static_hold("walk forward with a stable gait")
+    assert _goal_is_static_hold("balance on one leg")                    # true balance still detected
+    assert _goal_is_static_hold("hold a motionless stance")
+
+    def posture_only(arrays, behavior, meta):
+        import numpy as np
+        g = arrays["projected_gravity_b"]
+        return {"spec_score": float(np.mean(np.clip(-g[..., 2], 0, 1)))}
+
+    rec = adversarial_archetype_gate(
+        posture_only, [], G1, competent_ref=1.0, client=None,
+        required_losers=general_required_losers(G1, "give a steady wave with your arm"),
+        scored_channels=["posture", "completion"], author=False)
+    assert rec["gameable"]                              # do_nothing_upright still defends → denied
+
+
+def test_round15_balance_metric_not_false_rejected():
+    """§round-15: a genuine balance metric (rewards uprightness) on a static-hold goal is
+    NOT false-rejected — do_nothing/jitter are dropped there (on-goal), only collapse runs."""
+    from sculptor.eval.metric_calibration import (
+        general_required_losers, adversarial_archetype_gate)
+
+    def balance_metric(arrays, behavior, meta):
+        import numpy as np
+        g = arrays["projected_gravity_b"]
+        return {"spec_score": float(np.mean(np.clip(-g[..., 2], 0, 1)))}
+
+    rec = adversarial_archetype_gate(
+        balance_metric, [], G1, competent_ref=1.0, client=None,
+        required_losers=general_required_losers(G1, "balance on one leg"),
+        scored_channels=["posture", "completion"], author=False)
+    assert not rec["gameable"]                          # balance metric grants-side
