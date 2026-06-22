@@ -339,6 +339,69 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-06-21 — novel-task objective metric RELIABILITY DRIVE: 50% → 91% accept + steering path un-blocked (14 false-reject/steer fixes across 4 commits, 3 adversarial-review rounds)
+
+- **What** — drove auto-generated OBJECTIVE METRIC creation for NOVEL fold/posture/gesture goals (toe-touch,
+  squat, bow, crouch, floor-touch, pick-up, kneel, compound "bend→stand→wave", wave) to reliable end-to-end:
+  generation → validation → review → task-derived calibration (steering). Started by REPRODUCING with real
+  best-of-3 generations (baseline **4/8 = 50%** accept; failures dominated by PIPELINE false-rejects, NOT LLM
+  quality), root-caused each, fixed at the gate, regression-tested, adversarially reviewed, looped.
+- **Commits** (branch ship-20-ux-revamp): `2637b01` (round 1, 5 fixes), `b05828b` (round 2, 5 fixes),
+  `47cc6a0` (calibration JSON-mode), `2ead537` (round-3 review fixes). All in `sculptor/eval/metric_validate.py`,
+  `metric_gen.py`, `metric_calibration.py`, `prompts/review_objective_metric.md` + 2 new test files.
+- **The fixes** (each a real false-reject / dead-path, NOT a gate-weakening):
+  1. `_selectivity_probe` rebuilt: PHYSICAL rad/s velocity (`gradient/dt` — was rad/FRAME, 50× too small, so a
+     velocity-thresholding channel never fired); added C3 (overhead arm raise+oscillate, in-band ~2 Hz), C4
+     (sequenced bend→recover→wave compound), C5 (bidirectional torso oscillation for twist/repeated goals);
+     supplies planted foot channels so a foot-reading metric isn't auto-zeroed.
+  2. joint-index gate (`_raw_joint_index_violations`) base-tracked: only flags `joint_*[:, :, N]`, NOT a 3-vector
+     axis read (`root_link_pos_w[:, :, 2]`, `projected_gravity_b[:, :, 2]`) — the runtime permutation gate backstops.
+  3. AST safety allowlists the benign dunder `__name__` (`type(e).__name__`, the never-raise idiom the model emits
+     constantly); the traversal dunders (`__class__`/`__globals__`/…) stay blocked.
+  4. vacuous-branch entry keys on the POSITIVE archetypes ~0 (a fixed-negative-credit metric still reaches the
+     probe); fixed negatives folded into the degenerate anchor (flail/chaos/fall rewarder still rejected); the
+     forward-walker folded for non-forward goals (anti-Goodhart, scoped so a forward goal isn't false-rejected).
+  5. `selectivity_probe` scores surfaced to the independent reviewer on a vacuous pass (+ rubric note) so it stops
+     false-flagging the all-zero fixed battery as "near-constant".
+  6. precise `resolve_behavior_family` (a real gait verb, or a directional cue with NO posture verb, never
+     "in place") so "bend FORWARD into a bow" / "march in place" no longer mis-resolve to locomotion; the vacuous
+     entry KEEPS `family is None`, so a recognized-family wrong-behavior metric (arms-overhead for a KICK goal) is
+     rejected on the normal path, not vacuously rescued (round-3 review finding).
+  7. `_physical_vel` factored to module scope + shared by the graded best-of-N rungs (was a divergent unit);
+     "gameable: '<archetype>'" reject message (actionable feedback) replaces a misleading "near-constant".
+  8. **CALIBRATION STEERING PATH UN-BLOCKED** (the big one): the K blind ladder authors used
+     `messages.parse(output_format=CompetenceLadder)` — that schema (nested Groups + RoleQuery + a float|list Union)
+     is too complex for the API's constrained-decoding grammar compiler, which **400s "schema is too complex" /
+     hangs "grammar compilation timed out" on EVERY call** (an isolation call hung the full 300 s) → 0 usable
+     ladders → NO metric could EVER earn steer-rights. All tests mocked the author, so it never surfaced. FIX: a
+     JSON-mode `_author_structured` (plain `messages.create` + JSON parse, schema pinned in-prompt via
+     `model_json_schema`, fence/prose-tolerant, truncation→skip). The gaming-archetype (L3) author too.
+- **Why**: a false-reject leaves the run BLIND (no metric); the calibration break left every novel metric
+  observe-only FOREVER (steering dead). Both defeat the whole feature. Each fix targets the real root cause
+  (gate logic / prompt / API-mode), never loosens an anti-gaming gate (the firewall keeps an uncalibrated metric
+  observe-only; calibration is the task-validity check).
+- **Verified — EMPIRICAL** (real best-of-3 generations, `robot_hint=Mjlab-Velocity-Flat-Unitree-G1`):
+  - **Generation accept rate 50% → 91%** (round-3 batch: 10/11 fold/posture/gesture goals accepted; the 1 miss
+    was "raise arms overhead and HOLD" — a static-posture, non-fold edge case). EVERY fold-type goal accepted.
+  - **Steering payoff PROVEN**: with JSON-mode, the real LLM ladder author emits deep fold ladders across all 3
+    styles (fold_depth_m 0.06→0.46, mode=fold, hip/knee/ankle flex) and `calibrate_task_derived` **GRANTS** for
+    `floor1` ("reach down and touch the floor then rise") and `pickup1` (rho_min 0.894, n_valid 2, agreement 0.67)
+    — the path was 0-grant-possible before. (bow needs a torso-TILT ladder, not the upright pelvis-dip fold — a
+    `render_rung` follow-on; squat/toe were LLM variance.)
+  - Suites green throughout: sculptor **821 → 845 passed, 1 skipped** (+24 regression tests across
+    `tests/test_novel_metric_robustness.py` (new, 23) + `tests/test_task_derived_calibration.py`); UI backend
+    **355 passed**. uvicorn restarted each time the live path changed; `/health` 200.
+- **Adversarial reviews** (multi-lens Workflow → verify → reconcile, acted only on CONFIRMED): round-1 found 2
+  (graded-rung unit divergence, vacuous walker not folded) → fixed; round-3 found 2 (family-scope over-correction,
+  battery velocity unit) → fixed; round-4 (JSON-mode + false-grant + injection) running at handoff.
+- **RESIDUAL / follow-ons** (none block the core fold-metric reliability): (a) `render_rung` fold dips the pelvis
+  upright but does not TILT the torso, so a BOW/toe-touch metric gated on gravity-x can't calibrate against a fold
+  ladder (needs an optional fold-tilt) — bow generates+validates+reviews fine, just stays observe-only; (b) twist
+  /march metrics are flail-gameable unless they bound oscillation frequency / isolate the joint (the gate now
+  surfaces "gameable" feedback, but best-of-N must produce a better metric); (c) static-posture "raise and hold"
+  has no probe; (d) calibration grant RATE is ~2/5 (LLM ladder variance + metric strictness) — improving the
+  ladder author's joint-flex amplitude consistency would raise it.
+
 ### 2026-06-21 — review-feedback retry: a reviewer veto regenerates (was a dead-end)
 
 - **What** (`metric_gen.py`): a metric that PASSED validation but the independent reviewer VETOED was a dead-end — the
