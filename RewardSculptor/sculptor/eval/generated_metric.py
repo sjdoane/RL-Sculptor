@@ -17,15 +17,18 @@ OBSERVE-ONLY (computed + displayed, no influence). This module is the
 RUNTIME side (load + compute + resolve); generation lives in `metric_gen`,
 validation in `metric_validate`, calibration in `metric_calibration`.
 
-SECURITY (§round-9): the metric is UNTRUSTED LLM-authored code, and `metric_validate.
-_ast_safety` (run BEFORE every exec) is the containment gate — hardened to block the
-numpy IO/pickle surface, native submodules, `def __reduce__`-style gadgets, dunder
-tokens in string literals, and `allow_pickle`. That is a STATIC allow/deny gate, not a
-proof of containment; a static check over the full numpy API can never be proven
-complete. The defence-in-depth follow-on (recommended before any UNTRUSTED/adversarial
-behavior_goal source is accepted) is to run `load_generated_module` + `compute_spec`
-in a restricted subprocess (curated `__builtins__`, no filesystem/network) — the repo
-already empties `__builtins__` for the success-criterion evaluator (mission_runtime).
+SECURITY (§round-9/10): the metric is UNTRUSTED LLM-authored code, and `metric_validate.
+_ast_safety` is the containment gate — hardened to block the numpy IO/pickle surface,
+native submodules, `def __reduce__`-style gadgets, dunder tokens in string literals, and
+`allow_pickle`. It is enforced inside `load_generated_module` (§round-10), the single
+chokepoint EVERY exec path shares (validation, the per-rollout runtime scorer,
+calibration, the best-of-N discriminator, role-read) — so the gate runs before EVERY
+exec, not only at validation time. That is still a STATIC allow/deny gate, not a proof
+of containment; a static check over the full numpy API can never be proven complete. The
+defence-in-depth follow-on (recommended before any UNTRUSTED/adversarial behavior_goal
+source is accepted) is to run `compute_spec` in a restricted subprocess (curated
+`__builtins__`, no filesystem/network) — the repo already empties `__builtins__` for the
+success-criterion evaluator (mission_runtime).
 """
 from __future__ import annotations
 
@@ -79,8 +82,27 @@ ALLOWED_ARRAYS = (
 def load_generated_module(module_path: Path | str):
     """Import a generated-metric module and return the MODULE. Uses a unique
     module name so re-loading an edited metric never hits a stale
-    sys.modules entry."""
+    sys.modules entry.
+
+    §round-10 SECURITY: the static safety gate (`_ast_safety`) is enforced HERE,
+    at the single chokepoint EVERY exec path shares (the per-rollout runtime
+    scorer, calibration, the best-of-N discriminator, role-read) — so untrusted
+    LLM-authored source is screened on every path, not only at validation time. A
+    violation refuses to exec (raise) rather than running arbitrary code; callers
+    that must never raise (compute_generated_metric) already wrap this in
+    try/except and degrade to an honest 0.0. (`_ast_safety` is imported lazily:
+    metric_validate imports this function, so a top-level import would cycle.)"""
+    from sculptor.eval.metric_validate import _ast_safety  # lazy — avoid import cycle
     module_path = Path(module_path)
+    try:
+        source = module_path.read_text(encoding="utf-8")
+    except OSError as e:
+        raise ImportError(f"cannot read generated metric at {module_path}: {e}")
+    violations = _ast_safety(source)
+    if violations:
+        raise ImportError(
+            f"refusing to exec untrusted metric {module_path}: "
+            f"_ast_safety violations: {violations}")
     spec = importlib.util.spec_from_file_location(
         f"_genmetric_{module_path.stem}_{abs(hash(str(module_path)))}",
         module_path,

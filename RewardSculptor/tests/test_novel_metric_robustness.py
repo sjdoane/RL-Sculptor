@@ -615,3 +615,52 @@ def compute_spec(arrays, behavior, meta):
         return {"spec_score": 0.0, "reason": f"exc:{type(ex).__name__}"}
 '''
     assert _ast_safety(legit) == []
+
+
+def test_load_generated_module_enforces_ast_safety(tmp_path):
+    """§round-10: the static gate is enforced at the load chokepoint, so EVERY exec path
+    (runtime scorer, calibration, best-of-N) is screened — not only validation. A metric
+    that bypassed validation (e.g. a future edit-metric endpoint) and reaches the loader
+    with a forbidden construct is REFUSED at load instead of exec'ing arbitrary code."""
+    from sculptor.eval.generated_metric import load_generated_module
+    unsafe = tmp_path / "metric.py"
+    unsafe.write_text(
+        "import os\n"
+        "def compute_spec(arrays, behavior, meta):\n"
+        "    os.system('echo pwn')\n"
+        "    return {'spec_score': 0.5}\n",
+        encoding="utf-8")
+    with _pytest.raises(ImportError, match="_ast_safety violations"):
+        load_generated_module(unsafe)
+
+
+def test_load_generated_module_loads_safe_metric(tmp_path):
+    """The load chokepoint must still load a legitimate numpy metric unchanged."""
+    from sculptor.eval.generated_metric import load_generated_module
+    safe = tmp_path / "metric.py"
+    safe.write_text(
+        "import numpy as np\n"
+        "def compute_spec(arrays, behavior, meta):\n"
+        "    return {'spec_score': float(np.clip(0.5, 0.0, 1.0))}\n",
+        encoding="utf-8")
+    mod = load_generated_module(safe)
+    assert callable(getattr(mod, "compute_spec", None))
+
+
+def test_compute_generated_metric_degrades_on_unsafe_source(tmp_path):
+    """The never-raise runtime scorer turns a load-refusal into an honest 0.0 (it does
+    NOT propagate the ImportError into the training loop)."""
+    from sculptor.eval.generated_metric import compute_generated_metric
+    import numpy as np
+    mp = tmp_path / "metric.py"
+    mp.write_text(
+        "import os\n"
+        "def compute_spec(arrays, behavior, meta):\n"
+        "    return {'spec_score': 0.9}\n",
+        encoding="utf-8")
+    rd = tmp_path / "roll"; rd.mkdir()
+    np.savez(rd / "trajectory.npz", joint_pos=np.zeros((10, 4, 12)))
+    (rd / "behavior.json").write_text("{}", encoding="utf-8")
+    out = compute_generated_metric(mp, rd)
+    assert out.get("spec_score") == 0.0
+    assert "error" in out
