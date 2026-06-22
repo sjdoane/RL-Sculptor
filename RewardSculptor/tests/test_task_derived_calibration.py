@@ -1028,3 +1028,45 @@ def test_author_structured_truncation_raises():
         messages = _M()
     with _pytest.raises(ValueError):
         _author_structured(_C(), "m", "sys", {"g": 1}, CompetenceLadder)
+
+
+# ── §round-4 review hardening: length-robust echo-guard + all-candidate JSON scan ──
+from sculptor.eval.metric_calibration import _echoes_source, _iter_json_objs
+
+
+def test_echo_guard_length_robust():
+    """The soft anti-collusion echo-guard catches a SHORT source and a source echoed
+    only at its TAIL — the prior fixed-stride scan left <40-char and tail regions
+    unscanned (round-4 review finding)."""
+    short = "def compute_spec(x): return 1"          # 29 chars (<= window)
+    assert _echoes_source(short, "blah " + short + " blah")
+    assert not _echoes_source(short, "totally unrelated text")
+    long = "A" * 60 + "UNIQUE_TAIL_TOKEN_1234567890XYZ"   # tail beyond a full stride
+    assert _echoes_source(long, "noise " + long[-40:] + " noise")   # tail-only echo caught
+    assert not _echoes_source("", "anything") and not _echoes_source("x", "")
+    assert not _echoes_source("tiny", "tiny")           # below _ECHO_MIN → not flagged
+
+
+def test_iter_json_objs_skips_decoy_before_genuine():
+    """_iter_json_objs yields ALL objects in order, so _author_structured can skip a
+    malformed/decoy block that appears BEFORE the genuine ladder (round-4 finding)."""
+    text = '```json\n{"not": "a ladder"}\n```\nthen the real one:\n{"competence_axis": "real", "rungs": []}'
+    objs = list(_iter_json_objs(text))
+    assert {"not": "a ladder"} in objs
+    assert any(o.get("competence_axis") == "real" for o in objs)
+
+
+def test_author_structured_skips_decoy_picks_valid():
+    """When the first JSON object fails schema validation, _author_structured tries the
+    next candidate and returns the first that VALIDATES (decoy can't shadow genuine)."""
+    from sculptor.eval.metric_calibration import _author_structured
+    lad = fold_ladder()
+    decoy = '{"rungs": "this is not a list, fails validation"}'
+    body = decoy + "\n\n" + json.dumps(lad.model_dump())
+
+    class _M:
+        def create(self, **kw): return _Resp(body)
+    class _C:
+        messages = _M()
+    out = _author_structured(_C(), "m", "sys", {"g": 1}, CompetenceLadder)
+    assert [r.fold_depth_m for r in out.rungs] == [r.fold_depth_m for r in lad.rungs]

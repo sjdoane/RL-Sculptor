@@ -259,27 +259,67 @@ def _sha(obj: Any) -> str:
     ).hexdigest()[:16]
 
 
+_ECHO_WINDOW = 40
+_ECHO_MIN = 12
+
+
+def _echoes_source(metric_src: str, text: str) -> bool:
+    """SOFT anti-collusion tripwire: does `text` (an author's output) verbatim-echo a
+    non-trivial chunk of the metric source? Length-ROBUST (round-4 review): a short
+    source (≤ window) is tested whole; a long one is scanned by `_ECHO_WINDOW`-char
+    windows at HALF-window stride PLUS an explicit tail window, so no region of the
+    source is left unscanned (the prior fixed-full-stride scan missed sub-window and
+    tail regions). A redundant tripwire — the hard self-check + the metric-blind author
+    + the deterministic render/anchor/agreement gates are the load-bearing defenses."""
+    if not metric_src or not text:
+        return False
+    s = metric_src
+    if len(s) <= _ECHO_WINDOW:
+        return len(s) >= _ECHO_MIN and s.strip() in text
+    starts = list(range(0, len(s) - _ECHO_WINDOW, _ECHO_WINDOW // 2))
+    starts.append(len(s) - _ECHO_WINDOW)                  # inclusive tail window
+    return any(s[i:i + _ECHO_WINDOW] in text for i in starts)
+
+
 #: JSON-mode authoring budget. The author emits a full CompetenceLadder /
 #: GamingArchetypeSet JSON (nested rungs/groups) + adaptive thinking — generous so a
 #: complete object fits (a truncated one fails to parse → recorded skip, never silent).
 _AUTHOR_MAX_TOKENS = 12000
 
 
-def _extract_json_obj(text: str) -> dict:
-    """Extract the first top-level JSON object from a model completion — tolerant of a
-    ```json fence or surrounding prose. Raises ValueError if none parses (the caller
-    records a skip; a malformed/truncated author NEVER grants)."""
+def _iter_json_objs(text: str):
+    """Yield EVERY top-level JSON object in `text`, left-to-right, regardless of ```json
+    fences or surrounding prose (raw_decode skips the fence markers and any non-JSON
+    brace). The caller validates each and keeps the first that fits the schema — so a
+    malformed or decoy object that appears BEFORE the genuine one does not shadow it
+    (round-4 review hardening)."""
     if not text or not text.strip():
-        raise ValueError("empty author response")
-    m = re.search(r"```(?:json)?\s*(.*?)```", text, re.DOTALL)
-    candidate = m.group(1) if m else text
-    start = candidate.find("{")
-    if start < 0:
-        raise ValueError("no JSON object in author response")
-    obj, _ = json.JSONDecoder().raw_decode(candidate[start:])
-    if not isinstance(obj, dict):
-        raise ValueError("author response is not a JSON object")
-    return obj
+        return
+    dec = json.JSONDecoder()
+    i, n = 0, len(text)
+    while i < n:
+        start = text.find("{", i)
+        if start < 0:
+            break
+        try:
+            obj, end = dec.raw_decode(text[start:])
+        except ValueError:
+            i = start + 1
+            continue
+        if isinstance(obj, dict):
+            yield obj
+        i = start + max(end, 1)
+
+
+def _extract_json_obj(text: str) -> dict:
+    """Extract the FIRST top-level JSON object from a model completion — tolerant of a
+    ```json fence or surrounding prose. Raises ValueError (incl its subclass
+    json.JSONDecodeError) if none parses; the caller records a skip, so a
+    malformed/truncated author NEVER grants. (See `_iter_json_objs` for the all-candidate
+    scan `_author_structured` uses to pick the first SCHEMA-VALID object.)"""
+    for obj in _iter_json_objs(text):
+        return obj
+    raise ValueError("no JSON object in author response")
 
 
 def _author_structured(client: Any, model: str, system_prompt: str,
@@ -312,7 +352,19 @@ def _author_structured(client: Any, model: str, system_prompt: str,
         raise ValueError(
             f"author response truncated at max_tokens={_AUTHOR_MAX_TOKENS}")
     text = "".join(b.text for b in resp.content if getattr(b, "type", "") == "text")
-    return schema.model_validate(_extract_json_obj(text))
+    # Try EVERY candidate JSON object and keep the first that VALIDATES against the
+    # schema — so a decoy/prose block before the genuine ladder doesn't shadow it, and a
+    # model that emits multiple objects still yields a usable one. Falls back to the
+    # last validation error (or "no object") so a bad author is a recorded skip.
+    last_err: Optional[Exception] = None
+    for obj in _iter_json_objs(text):
+        try:
+            return schema.model_validate(obj)
+        except Exception as e:  # noqa: BLE001 — try the next candidate
+            last_err = e
+    if last_err is not None:
+        raise last_err
+    raise ValueError("no JSON object in author response")
 
 
 def _author_ladder(client: Any, model: str, payload: dict) -> Any:
@@ -650,9 +702,7 @@ def adversarial_archetype_gate(
         rec["goal_restated"] = getattr(gset, "goal_restated", "")
         # SOFT anti-collusion: a set that echoes the metric source is dropped.
         gset_text = json.dumps(getattr(gset, "model_dump", lambda: {})(), default=str)
-        if metric_src and any(
-                metric_src[i:i + 40] in gset_text
-                for i in range(0, max(0, len(metric_src) - 40), 40)):
+        if _echoes_source(metric_src, gset_text):
             author_reason = ("adversarial: archetypes echo metric source — "
                              "dropped, not enforced")
             gset = None
@@ -899,9 +949,7 @@ def calibrate_task_derived(
         # dropped (a leak attempt), never scored.
         ladder_text = json.dumps(
             getattr(ladder, "model_dump", lambda: {})(), default=str)
-        if metric_src and any(
-                metric_src[i:i + 40] in ladder_text
-                for i in range(0, max(0, len(metric_src) - 40), 40)):
+        if _echoes_source(metric_src, ladder_text):
             rec["skip_reason"] = "ladder echoes metric source"
             sources.append(rec)
             continue
