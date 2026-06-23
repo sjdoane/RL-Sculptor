@@ -2509,8 +2509,10 @@ def test_round31_jitter_probe_raise_fails_closed():
         raises_on_jitter, [], list(G1), 0.6, client=None, author=False,
         required_losers=losers, scored_channels=["posture", "completion", "velocity"])
     assert rec["gameable"] is True
-    assert (rec.get("velocity_floor") or {}).get("jitter") == "raised"
-    assert "RAISED" in (rec.get("reason") or "")
+    # §round-31 UNIFIED probe-raise rule: jitter RAISED while do_nothing/velocity_peak_ref SCORED.
+    assert "jitter_in_place" in (rec.get("probe_raise") or {}).get("raised", [])
+    assert (rec.get("probe_raise") or {}).get("scored")
+    assert "probe-raise evasion" in (rec.get("reason") or "")
 
     # CONTROL: an honest peak metric that scores jitter normally (no raise) is NOT flagged.
     def honest_peak(arrays, behavior, meta):
@@ -2521,3 +2523,41 @@ def test_round31_jitter_probe_raise_fails_closed():
         honest_peak, [], list(G1), 0.6, client=None, author=False,
         required_losers=losers, scored_channels=["posture", "completion", "velocity"])
     assert rec2["gameable"] is False and not rec2.get("velocity_floor")
+
+
+def test_round31_do_nothing_floor_probe_raise_fails_closed():
+    """§round-31 (UNIFIED probe-raise closure, 3rd instance): the do_nothing_upright per-loser FLOOR
+    has the same fail-open — a metric that FARMS do_nothing (up·stillness scores the still-upright
+    probe high, the idle-twitch jitter LOW) but SELECTIVELY RAISES on do_nothing's exact signature
+    (up≈1, mean|jv|≈0) left it unscored → floor_gamed SKIPPED → GRANTED. The unified rule catches it:
+    do_nothing RAISED while jitter is SCORED (surgical). An honest onset metric raises on BOTH → not
+    flagged (round-15)."""
+    import numpy as np
+    from sculptor.eval.metric_calibration import (
+        general_required_losers, adversarial_archetype_gate)
+    losers = general_required_losers(G1, "wave your arm up and down")
+
+    def farm(arrays):
+        jv = np.asarray(arrays.get("joint_vel")); g = np.asarray(arrays.get("projected_gravity_b"))
+        mean_v = float(np.abs(jv).mean()); up = float((g[..., 2] < -0.85).mean())
+        return up, mean_v, float(np.clip(0.45 * up * np.exp(-mean_v), 0, 1))  # up·stillness farm
+
+    def raises_on_do_nothing(arrays, behavior, meta):
+        up, mean_v, s = farm(arrays)
+        if up > 0.99 and mean_v < 0.05:        # do_nothing_upright signature → SABOTAGE
+            raise ValueError("evade the do_nothing floor probe")
+        return {"spec_score": s}
+
+    def control(arrays, behavior, meta):       # same farm, no raise → floor catches it
+        return {"spec_score": farm(arrays)[2]}
+
+    rec = adversarial_archetype_gate(
+        raises_on_do_nothing, [], list(G1), 1.0, client=None, author=False,
+        required_losers=losers, scored_channels=["posture", "completion", "velocity"])
+    assert rec["gameable"] is True
+    assert "do_nothing_upright" in (rec.get("probe_raise") or {}).get("raised", [])
+
+    rec2 = adversarial_archetype_gate(
+        control, [], list(G1), 1.0, client=None, author=False,
+        required_losers=losers, scored_channels=["posture", "completion", "velocity"])
+    assert rec2["gameable"] is True   # the floor catches the un-raised farm (do_nothing ≥ floor)

@@ -1216,11 +1216,18 @@ def adversarial_archetype_gate(
     # §round-26: scored deterministic losers + paired reference probes, for the velocity-floor check.
     loser_scores: dict[str, float] = {}
     ref_scores: dict[str, float] = {}
-    # §round-31: a SELECTIVE raise on the jitter_in_place probe (the velocity-floor NUMERATOR) —
-    # keying on its recognizable mean|jv|≈1.18 band that NO competent ladder rung occupies — used
-    # to leave loser_scores['jitter_in_place'] unset → vfj=None → the velocity-floor verdict SKIPPED
-    # (fail-OPEN), the un-closed sibling of the round-30 reference-probe fix. Track it to fail CLOSED.
-    jitter_probe_raised = False
+    # §round-31 (UNIFIED probe-raise fail-open closure): the verdict-feeding probes — do_nothing_upright
+    # (per-loser FLOOR), jitter_in_place (velocity-floor numerator), velocity_peak_ref (velocity-floor
+    # denominator). A SURGICAL raise on one of these — keyed on its recognizable single-point signature
+    # (do_nothing: up=1+still; jitter: mean|jv|≈1.18; ref: mean|jv|≈2.94) so real rungs are unaffected —
+    # used to leave the probe unscored → its verdict SILENTLY SKIPPED (fail-OPEN: round-30 D1 = ref,
+    # round-31 A1 = jitter, round-31 = do_nothing floor). An HONEST onset/phase metric that can't time a
+    # STATIC rollout raises on ALL THREE (none lacks a pelvis descent / has the onset it needs), so it
+    # scores NONE of them — that is the round-15 protected case. A surgical evader raises on the ONE it
+    # would farm while SCORING the others. So: gameable iff ≥1 verdict-probe RAISED and ≥1 was SCORED.
+    _VERDICT_PROBES = frozenset({"do_nothing_upright", "jitter_in_place", "velocity_peak_ref"})
+    raised_vfp: set[str] = set()
+    scored_vfp: set[str] = set()
 
     # ── 1. DETERMINISTIC required-losers — scored FIRST and INDEPENDENTLY of the
     #     LLM author, so the metric is probed against the curated kick hacks even
@@ -1256,28 +1263,20 @@ def adversarial_archetype_gate(
             rec["required_losers"].append(
                 {"name": name, "channel": loser.get("channel"), "score": 0.0,
                  "note": f"unscorable (→0.0): {type(e).__name__}"})
-            if loser.get("reference_only"):
-                # §round-30 [HIGH FALSE GRANT] fix: a reference probe (velocity_peak_ref) that
-                # SELECTIVELY RAISES — keying on the probe's recognizable signature so real rungs
-                # are unaffected — used to leave ref_scores empty → vfr=None → the velocity-floor
-                # verdict was SKIPPED (fail-OPEN), re-enabling the idle-jitter farm. Record 0.0 so
-                # the ratio check fails CLOSED: jitter ≥ _VEL_FLOOR_RATIO·0 trips whenever jitter is
-                # above the idle floor. An honest metric scores velocity_peak_ref fine (high) and is
-                # untouched; only a metric that can't/won't score the high-peak ref while farming
-                # the low-peak jitter is flagged — exactly the farming signature.
-                ref_scores[name] = 0.0
-            elif name == "jitter_in_place":
-                # §round-31 [HIGH FALSE GRANT] fix (sibling of the round-30 reference fix): a raise
-                # on the jitter probe (the velocity-floor NUMERATOR) left vfj=None → verdict SKIPPED
-                # (fail-OPEN) AND the recorded 0.0 never bumped `worst` → the upper ceiling evaded
-                # too. jitter_in_place is a VALID upright-tremor rollout (all arrays present) an
-                # honest metric scores low WITHOUT raising, so a selective raise on it is purely the
-                # evasion signature → fail CLOSED via the velocity-floor verdict below.
-                jitter_probe_raised = True
+            if name in _VERDICT_PROBES:
+                # §round-30/31 UNIFIED probe-raise fail-open closure: a raise on a verdict-feeding
+                # probe is tracked; the verdict below fails CLOSED iff this raise is SURGICAL (some
+                # OTHER verdict-probe was scored). round-30 also records the reference denominator as
+                # 0.0 so the ratio check still trips on a normally-scored high jitter.
+                raised_vfp.add(name)
+                if loser.get("reference_only"):
+                    ref_scores[name] = 0.0
             continue
         s = _gameable_score(s)   # §round-7: a NaN/inf hack score → GAMEABLE (fail-closed)
         losers_scored += 1
         entry = {"name": name, "channel": loser.get("channel"), "score": round(s, 4)}
+        if name in _VERDICT_PROBES:
+            scored_vfp.add(name)
         if loser.get("reference_only"):
             # §round-26: a paired REFERENCE probe (velocity_peak_ref) — scored for the
             # velocity-floor verdict check below, but NEVER ceiling-compared (a genuine
@@ -1410,45 +1409,44 @@ def adversarial_archetype_gate(
     vel_floor_gamed = False
     vfj = loser_scores.get("jitter_in_place")
     vfr = ref_scores.get("velocity_peak_ref")
-    if (jitter_probe_raised and float(competent_ref) > 0
-            and loser_scores.get("do_nothing_upright") is not None):
-        # §round-31: a SURGICAL raise on the jitter probe (the velocity-floor numerator) — fail
-        # CLOSED. jitter_in_place is a valid upright-tremor rollout; a metric that raises on it
-        # while still SCORING the (even more static) do_nothing_upright probe is keying on jitter's
-        # exact mean-velocity band to skip the velocity-floor verdict (and the 0.0 it recorded also
-        # dodged the ceiling) — pure evasion. The do_nothing-was-scored guard preserves the round-15
-        # honest-onset case: an honest onset/phase metric that can't time a STATIC rollout raises on
-        # BOTH jitter AND do_nothing (do_nothing then absent from loser_scores) → NOT flagged → not
-        # false-rejected. (Residual: a 2-raise attacker who ALSO raises on do_nothing — a still-policy
-        # an honest metric scores 0, never raises on — evades; that is the documented velocity-floor
-        # structural limit, not a clean catch.)
-        vel_floor_gamed = True
-        rec["velocity_floor"] = {"jitter": "raised", "peak_ref": (round(vfr, 4) if vfr is not None
-                                 else None), "ratio_thresh": _VEL_FLOOR_RATIO}
-    elif (vfj is not None and vfr is not None
+    if (vfj is not None and vfr is not None
             and vfj >= _LOSER_FLOOR_FRAC * float(competent_ref)
             and vfj >= _VEL_FLOOR_RATIO * vfr):
         vel_floor_gamed = True
         rec["velocity_floor"] = {"jitter": round(vfj, 4), "peak_ref": round(vfr, 4),
                                  "ratio_thresh": _VEL_FLOOR_RATIO}
+    # §round-31 UNIFIED probe-raise fail-open closure: a SURGICAL raise on a verdict-feeding probe
+    # (do_nothing floor / jitter+ref velocity-floor) skips that probe's verdict (fail-OPEN). It is
+    # gaming iff ≥1 verdict-probe RAISED **and** ≥1 was SCORED — i.e. the raise targets the single
+    # probe the metric would farm while it happily scores the others. The round-15 honest-onset case
+    # raises on ALL THREE (can't time any static rollout) → scores none → not flagged. (Residual: an
+    # attacker who raises on ALL three evades, but then RAISES at runtime on the very idle/twitch
+    # policies it would farm → can't reward them except at off-probe-point neighborhoods — the
+    # documented single-point-probe structural limit, not a clean catch.)
+    probe_raise_gamed = bool(raised_vfp) and bool(scored_vfp) and float(competent_ref) > 0
+    if probe_raise_gamed:
+        rec["probe_raise"] = {"raised": sorted(raised_vfp), "scored": sorted(scored_vfp)}
     gameable = ((not np.isfinite(worst))   # §round-7: non-finite worst → fail-closed
                 or (worst >= rel_ceil * float(competent_ref)) or (worst >= abs_ceil)
                 or floor_gamed              # §round-21: a pure-idle probe breached its floor
-                or vel_floor_gamed)         # §round-26: a mean-velocity floor (peak-insensitive)
+                or vel_floor_gamed          # §round-26: a mean-velocity floor (peak-insensitive)
+                or probe_raise_gamed)       # §round-31: surgical probe-raise verdict evasion
     rec["gameable"] = bool(gameable)
     rec["ok"] = not gameable
-    if gameable and vel_floor_gamed and not (worst >= ceiling) and not floor_gamed:
+    if (gameable and probe_raise_gamed and not (worst >= ceiling)
+            and not floor_gamed and not vel_floor_gamed):
+        rec["worst_name"] = sorted(raised_vfp)[0]
+        rec["reason"] = (
+            f"adversarial: probe-raise evasion — the metric RAISED on verdict probe(s) "
+            f"{sorted(raised_vfp)} while SCORING {sorted(scored_vfp)} — a surgical raise on a "
+            f"single-point loser to skip its floor/velocity-floor verdict (an honest metric scores "
+            f"these valid rollouts, or an onset metric raises on ALL of them) — gameable")
+    elif gameable and vel_floor_gamed and not (worst >= ceiling) and not floor_gamed:
         rec["worst_name"] = "jitter_in_place"
-        if jitter_probe_raised:
-            rec["reason"] = (
-                "adversarial: velocity-floor — the jitter_in_place probe RAISED (selective "
-                "evasion of the velocity-floor verdict on a valid upright-tremor rollout an "
-                "honest metric scores without raising) — gameable")
-        else:
-            rec["reason"] = (
-                f"adversarial: velocity-floor — jitter_in_place scored {vfj:.3f} ≥ "
-                f"{_VEL_FLOOR_RATIO:.0%} of the high-peak velocity_peak_ref ({vfr:.3f}), i.e. the "
-                f"metric pays a flat MEAN-velocity floor insensitive to peak intensity — gameable")
+        rec["reason"] = (
+            f"adversarial: velocity-floor — jitter_in_place scored {vfj:.3f} ≥ "
+            f"{_VEL_FLOOR_RATIO:.0%} of the high-peak velocity_peak_ref ({vfr:.3f}), i.e. the "
+            f"metric pays a flat MEAN-velocity floor insensitive to peak intensity — gameable")
     elif gameable and floor_gamed and not (worst >= ceiling):
         # the deny is carried by the per-loser FLOOR, not the upper ceiling — name it precisely.
         fscore = next((l["score"] for l in rec["required_losers"]
