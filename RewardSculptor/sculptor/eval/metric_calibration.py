@@ -752,60 +752,79 @@ def _scalar_start(v: Any) -> float:
         return 0.0
 
 
-def _spec_is_static_hold(spec: Any) -> bool:
-    """True iff a competence-ladder TOP rung describes a STILL UPRIGHT hold — high
-    uprightness, no pelvis fold, no travel/hops, and no commanded joint motion. This reads
-    the blind author's own notion of competence (anti-collusion: the author never sees the
-    metric), so it decides whether do_nothing_upright is ON-goal WITHOUT brittle goal-text
-    keywords."""
+def _spec_has_commanded_motion(spec: Any) -> bool:
+    """True iff the spec commands joint/whole-body MOTION — a pelvis fold, a tremor/noise
+    whole-body channel, travel/hops, OR any group with a real amplitude/peak/burst (an
+    oscillate/burst) or a held distinctive posture (a 'hold' offset). Posture alone
+    (uprightness + base_height) is NOT motion. §round-18 thresholds; §round-20: extracted so
+    BOTH static-hold AND terminal-down classification read the SAME motion channels (the
+    terminal-down detector ignored motion → a writhe/duck low-posture-WITH-motion top was
+    mis-read as a still lie/rest)."""
     try:
-        if _scalar_end(getattr(spec, "uprightness", 1.0)) < 0.8:
-            return False
-        # §round-19: base_height_m is a motion/posture channel too (it was the one
-        # MotionSpec motion field this detector did not read). A STILL UPRIGHT hold matches
-        # do_nothing_upright's STANDING posture (base_height_m≈0.7). A base_height RAMP is
-        # commanded VERTICAL MOTION (rise/descend), and a held NON-nominal height (squat) is
-        # a DIFFERENT posture where standing-still is OFF-goal — both must DROP the
-        # static-hold classification so do_nothing/jitter stay as losers. Defense-in-depth:
-        # today the prepended fallen anchor (z≈0.5) incidentally breaks a pure-height
-        # confound, but the firewall must not depend on that. SAFE vs false-reject: a genuine
-        # balance metric (which scores do_nothing HIGH) only authors a NOMINAL-height hold
-        # (≥0.55, no ramp) → still static → do_nothing still dropped; a genuine ramp/squat
-        # metric scores do_nothing LOW (it rewards the motion/low posture) → keeping the
-        # loser cannot deny it.
-        bh = getattr(spec, "base_height_m", 0.7)
-        if _scalar_start(bh) < 0.55 or _scalar_end(bh) < 0.55:
-            return False
-        if abs(_scalar_end(bh) - _scalar_start(bh)) > 0.05:
-            return False
         if abs(float(getattr(spec, "fold_depth_m", 0.0) or 0.0)) > 0.05:
-            return False
+            return True
         if abs(float(getattr(spec, "tremor", 0.0) or 0.0)) > 0.1:
-            return False   # §round-18: tremor is a whole-body motion channel (NOT per-group)
+            return True   # tremor is a whole-body motion channel (NOT per-group)
         if abs(float(getattr(spec, "noise", 0.0) or 0.0)) > 0.02:
-            return False   # §round-18: noise (gaussian on joint_vel) is whole-body motion too
+            return True   # noise (gaussian on joint_vel) is whole-body motion too
         if abs(float(getattr(spec, "forward_speed_mps", 0.0) or 0.0)) > 0.1:
-            return False
+            return True
         if abs(float(getattr(spec, "lateral_speed_mps", 0.0) or 0.0)) > 0.1:
-            return False
+            return True
         if int(getattr(spec, "hop_count", 0) or 0) > 0 and float(getattr(spec, "hop_height_m", 0.0) or 0.0) > 0.05:
-            return False
-        # §round-18: a STILL hold has NO commanded joint deviation. ANY group that produces
-        # a non-trivial joint motion (an oscillate/burst/fold group with a real amplitude/
-        # peak/burst) OR a held distinctive posture (a 'hold' offset) makes the rung ACTIVE,
-        # NOT static — even a SMALL/subtle gesture (amplitude ≤ 0.1). The old amplitude>0.1
-        # threshold mis-read a subtle wave as a hold → dropped the velocity defense → a
-        # velocity-confound proxy false-granted. A genuine balance/hold top has no such group.
+            return True
         for gr in (getattr(spec, "groups", []) or []):
             amp = abs(float(getattr(gr, "amplitude_rad", 0.0) or 0.0))
             peak = abs(float(getattr(gr, "peak_radps", 0.0) or 0.0))
             burst = int(getattr(gr, "burst_count", 0) or 0)
             off = abs(float(getattr(gr, "offset_rad", 0.0) or 0.0))
             if amp > 1e-3 or peak > 1e-3 or burst > 0 or off > 1e-2:
-                return False
-        return True
+                return True
+        return False
+    except Exception:  # noqa: BLE001 — unparseable spec → assume motion (the safe direction:
+        return True     # keep the velocity/posture defense)
+
+
+def _spec_is_static_hold(spec: Any) -> bool:
+    """True iff a competence-ladder TOP rung describes a STILL UPRIGHT hold — high
+    uprightness, NOMINAL standing height (base_height_m≈0.7, no ramp), and no commanded joint
+    motion. Reads the blind author's own notion of competence (anti-collusion: the author
+    never sees the metric), so it decides whether do_nothing_upright is ON-goal WITHOUT
+    brittle goal-text keywords.
+
+    §round-19: base_height_m is read too — a base_height RAMP is commanded VERTICAL MOTION and
+    a held NON-nominal height (squat) is a DIFFERENT posture where standing-still is OFF-goal.
+    A genuine balance metric (scores do_nothing HIGH) authors a NOMINAL-height hold (≥0.55, no
+    ramp) → still static; a ramp/squat metric scores do_nothing LOW → keeping the loser cannot
+    deny it. (NOTE: a crouch→stand TRANSITION whose TOP rung is a held standing posture also
+    passes this PER-RUNG test — that is suppressed at the LADDER level via _ladder_has_crouched_rung.)"""
+    try:
+        if _scalar_end(getattr(spec, "uprightness", 1.0)) < 0.8:
+            return False
+        bh = getattr(spec, "base_height_m", 0.7)
+        if _scalar_start(bh) < 0.55 or _scalar_end(bh) < 0.55:
+            return False
+        if abs(_scalar_end(bh) - _scalar_start(bh)) > 0.05:
+            return False
+        return not _spec_has_commanded_motion(spec)
     except Exception:  # noqa: BLE001 — unparseable spec → not static-hold (keep losers)
         return False
+
+
+def _ladder_has_crouched_rung(rungs: Any) -> bool:
+    """§round-20: True iff any authored rung sits at a LOW base_height (<0.55). A crouch/
+    sit→stand TRANSITION ladder has a held-standing TOP rung (which passes the per-rung
+    static-hold test) but low/crouched LOWER rungs — its goal is to RISE, so do_nothing
+    (already standing, never rose) is OFF-goal and must be KEPT. A genuine balance/hold ladder
+    keeps EVERY rung at nominal height (failures are low-uprightness, not low-height)."""
+    try:
+        for r in (rungs or []):
+            bh = getattr(r, "base_height_m", 0.7)
+            if min(_scalar_start(bh), _scalar_end(bh)) < 0.55:
+                return True
+    except Exception:  # noqa: BLE001
+        return False
+    return False
 
 
 def _spec_is_terminal_down(spec: Any) -> bool:
@@ -824,7 +843,14 @@ def _spec_is_terminal_down(spec: Any) -> bool:
         bh = _scalar_end(getattr(spec, "base_height_m", 0.7))
         # clearly non-upright (lying/fallen, any height) OR near-floor AND not-upright
         # (a low collapsed heap). An upright squat (up high, bh low) is NEITHER.
-        return (up <= 0.3) or (bh <= 0.35 and up <= 0.5)
+        down = (up <= 0.3) or (bh <= 0.35 and up <= 0.5)
+        # §round-20: a genuine lie/REST end-state is STILL. A low posture WITH commanded motion
+        # (writhe/thrash/roll/worm, or an active duck holding a bent-leg posture) is an ACTIVE
+        # low goal, NOT lie/rest — collapse_and_stay_down must stay (it catches a low/descent
+        # confound and an honest moving-low metric scores it ~0), and collapse_and_thrash must
+        # NOT be injected (it IS the on-goal end-state of a writhe → false-reject). The sibling
+        # _spec_is_static_hold already reads motion; terminal-down did not.
+        return down and not _spec_has_commanded_motion(spec)
     except Exception:  # noqa: BLE001
         return False
 
@@ -1274,6 +1300,7 @@ def calibrate_task_derived(
     sources: list[dict[str, Any]] = []
     valid_rhos: list[float] = []
     valid_top_specs: list = []   # §round-17: authored top-rung specs of valid ladders
+    valid_ladders: list = []     # §round-20: full authored rung lists (for the crouch-span check)
     n_agree = 0
     for si in range(k_sources):
         style = _TD_STYLES[si % len(_TD_STYLES)]
@@ -1347,6 +1374,7 @@ def calibrate_task_derived(
         rec["separation"] = round(separation, 4)
         rec["ladder_ok"] = True
         valid_top_specs.append(rungs[-1] if rungs else None)   # §round-17 ladder posture
+        valid_ladders.append(list(rungs))                      # §round-20 crouch-span check
         # ABSOLUTE-SEPARATION anchor indicts the METRIC (counts as disagreement).
         # §round-6 defense-in-depth: a non-finite separation must FAIL the gate (a bare
         # `nan < min` is False and would pass) — gen_scores are coerced finite above, so
@@ -1388,36 +1416,31 @@ def calibrate_task_derived(
                  if s.get("ladder_ok") and s.get("gen_scores")), default=0.0)
             from sculptor.eval.metric_validate import resolve_behavior_family
             fam = resolve_behavior_family(behavior_goal, robot_hint)
-            if fam == "kick":
-                ladder_sh, ladder_td = _ladder_posture(valid_top_specs)
-                if adversarial_required_losers:
-                    # opt-in breadth: the DEDICATED kick losers (WITH foot_pos_b direction
-                    # channel that render_rung can't synthesize).
-                    req_losers = kick_required_losers(names, behavior_goal, robot_hint)
-                    sc = list(_KICK_SCORED_CHANNELS)
-                else:
-                    # §round-19 [HIGH FALSE GRANT] fix: a NOVEL kick goal lands on THIS path
-                    # (calibrate_task_derived IS the novel-task path — the built-in path has
-                    # its own ground truth), so the firewall must NOT be off. The old code
-                    # set req_losers=None here → the gate scored ZERO losers → ran=False →
-                    # gameable=False → no deny → a posture/velocity CONFOUND on a kick goal
-                    # false-granted. The general goal-blind losers catch the confound on a
-                    # kick metric too (verified: an honest kick metric scores them ~0; a
-                    # velocity proxy scores jitter_in_place at the ceiling) and never
-                    # mis-deny an honest kick — so they run ALWAYS, exactly like every
-                    # non-kick novel family.
-                    req_losers = general_required_losers(
-                        names, behavior_goal, static_hold=ladder_sh, terminal_down=ladder_td)
-                    sc = list(_GENERAL_SCORED_CHANNELS)
+            # §round-17: whether the still-upright / down losers are ON-goal (a balance/lie
+            # task) is decided from the blind AUTHORED ladder's top-rung posture, NOT a brittle
+            # goal-keyword classifier (which had a new token gap every round).
+            ladder_sh, ladder_td = _ladder_posture(valid_top_specs)
+            # §round-20 [HIGH FALSE GRANT] fix: the top-rung posture alone conflates a HOLD
+            # with a TRANSITION-into-that-posture. A crouch/sit→stand transition has a
+            # held-standing TOP rung (static_hold=True per-rung) but do_nothing (already
+            # standing, never rose) is OFF-goal — suppress static_hold when a STRICT MAJORITY
+            # of valid ladders contain a crouched (low base_height) rung. A genuine balance
+            # ladder keeps every rung at nominal height, so it is unaffected.
+            if ladder_sh and valid_ladders:
+                crouched = sum(1 for L in valid_ladders if _ladder_has_crouched_rung(L))
+                if crouched * 2 > len(valid_ladders):
+                    ladder_sh = False
+            if fam == "kick" and adversarial_required_losers:
+                # opt-in breadth: the DEDICATED kick losers (WITH foot_pos_b direction
+                # channel that render_rung can't synthesize).
+                req_losers = kick_required_losers(names, behavior_goal, robot_hint)
+                sc = list(_KICK_SCORED_CHANNELS)
             else:
-                # §round-13 FALSE-GRANT fix: the general goal-blind losers (do-nothing /
-                # jitter / collapse-and-stay) run ALWAYS for a novel (family=None) fold/
-                # posture/gesture grant — a real metric scores them ~0; a posture/depth
-                # CONFOUND-only proxy scores one at/above the ceiling → gameable → denied.
-                # §round-17: whether the still-upright losers are ON-goal (a balance/lie
-                # task) is decided from the blind AUTHORED ladder's top-rung posture, NOT a
-                # brittle goal-keyword classifier (which had a new token gap every round).
-                ladder_sh, ladder_td = _ladder_posture(valid_top_specs)
+                # §round-13/19 FALSE-GRANT fix: the general goal-blind losers (do-nothing /
+                # jitter / collapse-and-stay / floor-thrash) run ALWAYS for a novel grant —
+                # incl. a novel KICK on the default path (the old `fam=="kick"` branch set
+                # req_losers=None there → firewall OFF → a posture/velocity confound granted).
+                # A real metric scores them ~0; a confound scores one at/above the ceiling.
                 req_losers = general_required_losers(
                     names, behavior_goal, static_hold=ladder_sh, terminal_down=ladder_td)
                 sc = list(_GENERAL_SCORED_CHANNELS)

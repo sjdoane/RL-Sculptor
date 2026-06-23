@@ -1785,3 +1785,104 @@ def compute_spec(arrays, behavior, meta):
         "lie down on the floor and rest still", robot_hint="Unitree-G1",
         client=_FakeLadderClient(_lie_ladder(), _lie_ladder(), _lie_ladder()))
     assert cal_ok["ok"], cal_ok                               # honest lie-still GRANTS
+
+
+# ── §round-20: HOLD vs TRANSITION — the posture classifiers read the WHOLE ladder ──
+# All three round-20 defects shared one root cause: classifying from the TOP rung alone
+# conflates "HOLD this posture" with "TRANSITION to / move AT this posture".
+
+def test_round20_motion_and_span_aware_posture_classifiers():
+    """§round-20 unit: terminal_down now requires the down top to be STILL (a writhe/duck is
+    active-low, not lie/rest); _ladder_has_crouched_rung detects a crouch→stand TRANSITION
+    ladder (held-standing top but low start rungs)."""
+    from sculptor.eval.metric_calibration import (
+        _spec_has_commanded_motion, _spec_is_terminal_down, _ladder_has_crouched_rung)
+
+    def osc(amp):
+        return Group(name="b", mode="oscillate", amplitude_rad=amp,
+                     role_query=RoleQuery(segments=["hip", "knee"], axes=["pitch", None]))
+    still_lie = MotionSpec(uprightness=0.0, base_height_m=0.12)
+    writhe = MotionSpec(uprightness=0.0, base_height_m=0.13, groups=[osc(1.4)])
+    assert not _spec_has_commanded_motion(still_lie)
+    assert _spec_has_commanded_motion(writhe)
+    assert _spec_is_terminal_down(still_lie)        # still down → lie/rest
+    assert not _spec_is_terminal_down(writhe)        # low + motion → active, NOT lie/rest
+    # a crouch→stand transition (held heights 0.40..0.70) vs a balance hold (all nominal)
+    assert _ladder_has_crouched_rung([MotionSpec(uprightness=1.0, base_height_m=h) for h in (0.40, 0.52, 0.62, 0.70)])
+    assert not _ladder_has_crouched_rung([MotionSpec(uprightness=u, base_height_m=0.7) for u in (0.2, 0.6, 0.85, 1.0)])
+
+
+def test_round20_sit_to_stand_keeps_do_nothing_denies_height_confound(tmp_path):
+    """§round-20 [HIGH FALSE GRANT] fix (defect 3): a crouch/sit→stand ladder has a held-standing
+    TOP rung (static_hold=True per-rung), but do_nothing (already standing, never rose) is OFF-goal.
+    The crouch-span check suppresses static_hold → do_nothing/jitter are KEPT → a height-ONLY
+    confound (full credit to an already-standing robot) is DENIED."""
+    def held_height_ladder():
+        return CompetenceLadder(competence_axis="final standing height", rungs=[
+            MotionSpec(uprightness=1.0, base_height_m=h) for h in (0.40, 0.52, 0.62, 0.70)])
+    HEIGHT_ONLY = '''import numpy as np
+def compute_spec(arrays, behavior, meta):
+    root = arrays.get("root_link_pos_w"); grav = arrays.get("projected_gravity_b")
+    if root is None or grav is None: return {"spec_score": 0.0}
+    up = float((grav[..., 2] < -0.85).mean()); h = float(np.asarray(root)[-1, :, 2].mean())
+    return {"spec_score": float(np.clip(up * np.clip(h / 0.7, 0.0, 1.0), 0.0, 1.0))}
+'''
+    cal = calibrate_task_derived(_write(tmp_path, "height.py", HEIGHT_ONLY),
+        "stand up from a seated position", robot_hint="Unitree-G1",
+        client=_FakeLadderClient(held_height_ladder(), held_height_ladder(), held_height_ladder()))
+    names = {l["name"] for l in (cal["adversarial"] or {}).get("required_losers", [])}
+    assert "do_nothing_upright" in names                 # span check kept it (transition, not hold)
+    assert not cal["ok"], cal                            # height confound DENIED
+
+
+def test_round20_writhe_keeps_collapse_grants_honest(tmp_path):
+    """§round-20 [HIGH FALSE REJECT] fix (defect 2): a 'writhe/thrash on the ground' goal is
+    terminal-LOW but WITH on-goal motion, so it is NOT lie/rest — collapse_and_thrash must NOT be
+    injected (it IS the on-goal end-state → would false-reject). collapse_and_stay_down (still) is
+    kept; an honest writhe metric scores it ~0 and GRANTS."""
+    def writhe_grp(amp):
+        return Group(name="body", mode="oscillate", amplitude_rad=amp, period_frames=18,
+                     role_query=RoleQuery(segments=["hip", "knee", "shoulder", "elbow"], axes=["pitch", None]))
+    def writhe_ladder():
+        return CompetenceLadder(competence_axis="thrash amplitude on the ground", rungs=[
+            MotionSpec(uprightness=0.0, base_height_m=0.13, groups=[writhe_grp(a)]) for a in (0.2, 0.6, 1.0, 1.4)])
+    HONEST = '''import numpy as np
+def compute_spec(arrays, behavior, meta):
+    root = arrays.get("root_link_pos_w"); grav = arrays.get("projected_gravity_b"); jv = arrays.get("joint_vel")
+    if root is None or grav is None or jv is None: return {"spec_score": 0.0}
+    z = float(np.asarray(root)[..., 2].mean()); low = float(np.clip(1.0 - z / 0.7, 0.0, 1.0))
+    down = float((grav[..., 2] > -0.3).mean()); motion = float(1.0 - np.exp(-np.abs(np.asarray(jv)).mean() / 1.0))
+    return {"spec_score": float(np.clip(low * down * motion, 0.0, 1.0))}
+'''
+    cal = calibrate_task_derived(_write(tmp_path, "writhe.py", HONEST),
+        "writhe and thrash on the ground", robot_hint="Unitree-G1",
+        client=_FakeLadderClient(writhe_ladder(), writhe_ladder(), writhe_ladder()))
+    names = {l["name"] for l in (cal["adversarial"] or {}).get("required_losers", [])}
+    assert "collapse_and_stay_down" in names and "collapse_and_thrash" not in names  # active-low, not lie/rest
+    assert cal["ok"], cal                                # honest writhe NOT false-rejected
+
+
+def test_round20_active_duck_keeps_collapse_denies_descent_confound(tmp_path):
+    """§round-20 [HIGH FALSE GRANT] fix (defect 1): an active 'duck down and hold low' goal has a
+    low-uprightness top rung but HOLDS a bent-leg posture (commanded), so it is NOT lie/rest —
+    collapse_and_stay_down (a descent ramp) is KEPT and catches a descent-magnitude confound that
+    reads only root-z drop."""
+    def duck_grp(off):
+        return Group(name="legs", mode="hold", offset_rad=off,
+                     role_query=RoleQuery(segments=["hip", "knee"], axes=["pitch", None], sides=["left", "right"]))
+    def duck_ladder():
+        return CompetenceLadder(competence_axis="crouch depth", rungs=[
+            MotionSpec(uprightness=[1.0, U], base_height_m=[0.7, H], groups=[duck_grp(A)])
+            for (U, H, A) in [(0.7, 0.55, 0.3), (0.5, 0.45, 0.6), (0.35, 0.37, 0.9), (0.25, 0.28, 1.2)]])
+    DROP_ONLY = '''import numpy as np
+def compute_spec(arrays, behavior, meta):
+    z = np.asarray(arrays["root_link_pos_w"])[..., 2]
+    drop = float(np.mean(z[:5].mean(0) - z.min(0)))
+    return {"spec_score": float(np.clip(drop / 0.45, 0.0, 1.0))}
+'''
+    cal = calibrate_task_derived(_write(tmp_path, "drop.py", DROP_ONLY),
+        "duck down into a low crouch and hold it low", robot_hint="Unitree-G1",
+        client=_FakeLadderClient(duck_ladder(), duck_ladder(), duck_ladder()))
+    names = {l["name"] for l in (cal["adversarial"] or {}).get("required_losers", [])}
+    assert "collapse_and_stay_down" in names             # active-low keeps the descent catcher
+    assert not cal["ok"], cal                            # descent confound DENIED
