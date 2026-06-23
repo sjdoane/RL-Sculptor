@@ -616,6 +616,22 @@ import pytest as _pytest
                                   "def compute_spec(a,b,m):\n    return {'spec_score':0.5}\n"),
     ("forbidden_name_as_attr", "import numpy as np\n"
                                "def compute_spec(a,b,m):\n    x = np.lib.os\n    return {'spec_score':0.5}\n"),
+    # §round-24: numpy re-exports stdlib modules under PUBLIC non-underscore names
+    # (np.ma.extras.ma IS numpy.ma.core which re-exports inspect/io/builtins). The chain dies
+    # at the named numpy submodule (.ma) AND at the stdlib hop (.io/.builtins/.inspect/.FileIO).
+    ("np_public_reexport_filewrite", "import numpy as np\n"
+                                     "np.ma.extras.ma.inspect.dis.io.FileIO('/tmp/x','w')\n"
+                                     "def compute_spec(a,b,m):\n    return {'spec_score':0.5}\n"),
+    ("np_public_reexport_fileread", "import numpy as np\n"
+                                    "x = np.ma.extras.ma.inspect.linecache.getline('/tmp/x',1)\n"
+                                    "def compute_spec(a,b,m):\n    return {'spec_score':0.5}\n"),
+    ("np_public_reexport_systemexit", "import numpy as np\n"
+                                      "np.ma.extras.ma.builtins.exit()\n"
+                                      "def compute_spec(a,b,m):\n    return {'spec_score':0.5}\n"),
+    ("np_reexport_laundered", "import numpy as np\n"
+                             "m = np.ma\n"
+                             "def compute_spec(a,b,m2):\n    m.extras.ma.inspect.dis.io.FileIO('/tmp/x','w')\n    return {'spec_score':0.5}\n"),
+    ("raise_systemexit", "def compute_spec(a,b,m):\n    raise SystemExit()\n    return {'spec_score':0.5}\n"),
     ("breakpoint_call", "def compute_spec(a,b,m):\n    breakpoint()\n    return {'spec_score':0.5}\n"),
 ])
 def test_ast_safety_blocks_escape_vectors(name, src):

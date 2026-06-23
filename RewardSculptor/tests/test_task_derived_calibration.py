@@ -2021,10 +2021,10 @@ def test_round22_goal_has_active_motion_classifier():
 
 
 def test_round22_balance_phrasings_not_false_rejected(tmp_path):
-    """§round-22 [HIGH FALSE REJECT] fix: the round-21 AND-gate required a positive balance KEYWORD
-    to honor the blind ladder's static_hold, so genuine balance goals phrased outside the ~13-token
-    list ('hold a flamingo pose', 'freeze in place') kept do_nothing and DENIED an honest balance
-    metric. The veto now fires only on a POSITIVE active verb, so these GRANT (regression vs pre-21)."""
+    """§round-24: an honest balance metric GRANTS on MINIMAL-SET still-hold phrasings (the SAFE,
+    stable keyword set). The round-22/23 broadening (flamingo pose / center of mass / stay on your
+    feet) was REVERTED — it false-GRANTED active goals (round-24), so those phrasings are now
+    observe-only (a safe false-reject)."""
     def bal_ladder():
         return CompetenceLadder(competence_axis="upright balance", rungs=[
             MotionSpec(uprightness=u, base_height_m=0.7) for u in (0.4, 0.7, 0.9, 1.0)])
@@ -2035,12 +2035,12 @@ def compute_spec(arrays, behavior, meta):
     drift = float(np.linalg.norm(root[..., :2].max(0) - root[..., :2].min(0), axis=-1).mean())
     return {"spec_score": float(np.clip(up * np.exp(-drift / 0.3), 0, 1))}
 '''
-    for i, goal in enumerate(["hold a flamingo pose", "freeze in place like a statue",
-                              "keep your center of mass over your feet", "stay on your feet"]):
+    for i, goal in enumerate(["balance on one foot", "stand on one leg without falling",
+                              "keep your balance", "do not fall over"]):
         cal = calibrate_task_derived(_write(tmp_path, f"bal{i}.py", BAL), goal,
             robot_hint="Unitree-G1", client=_FakeLadderClient(bal_ladder(), bal_ladder(), bal_ladder()))
         names = {l["name"] for l in (cal["adversarial"] or {}).get("required_losers", [])}
-        assert "do_nothing_upright" not in names             # ladder static_hold trusted → dropped
+        assert "do_nothing_upright" not in names             # minimal-set still-hold → dropped
         assert cal["ok"], (goal, cal)
 
 
@@ -2091,33 +2091,36 @@ def compute_spec(arrays, behavior, meta):
         assert not cal["ok"], (goal, cal)                      # posture confound DENIED
 
 
-def test_round23_broadened_balance_phrasings_grant(tmp_path):
-    """§round-23: an honest balance metric GRANTS on common still-hold phrasings the broadened
-    keyword list now covers (none contain an active verb → the SAFE-direction veto drops do_nothing)."""
-    BAL = '''import numpy as np
+def test_round24_broadened_keyword_falsegrant_reverted(tmp_path):
+    """§round-24 [HIGH FALSE GRANT] fix: the round-22/23 balance-keyword broadening (freeze/statue/
+    flamingo tokens, 'center of mass'/'stay on your feet' phrases) false-GRANTED a posture confound
+    on ACTIVE goals whose verb was off the list ('shift your center of mass', 'play the statue game',
+    'salute and stay on your feet'). Reverted to the minimal set + broadened the ACTIVE-verb list
+    (safe), so these now DENY the confound."""
+    CONF = '''import numpy as np
 def compute_spec(arrays, behavior, meta):
     g = np.asarray(arrays["projected_gravity_b"])
-    return {"spec_score": float(np.mean(np.clip(-g[..., 2], 0, 1)))}
+    return {"spec_score": float(np.clip((g[..., 2] < -0.85).mean(), 0, 1))}
 '''
-    for i, goal in enumerate(["hold a flamingo pose", "freeze in place like a statue",
-                              "keep your center of mass over your feet", "stay on your feet",
-                              "stand perfectly still", "hold a fixed position"]):
-        cal = calibrate_task_derived(_write(tmp_path, f"b{i}.py", BAL), goal,
+    for i, goal in enumerate(["shift your center of mass side to side", "play the statue game",
+                              "flap your arms like a flamingo", "salute and stay on your feet",
+                              "snap into a t-pose then relax", "rigidly pump iron"]):
+        cal = calibrate_task_derived(_write(tmp_path, f"c{i}.py", CONF), goal,
             robot_hint="Unitree-G1", client=_FakeLadderClient(_stability_ladder(), _stability_ladder(), _stability_ladder()))
         names = {l["name"] for l in (cal["adversarial"] or {}).get("required_losers", [])}
-        assert "do_nothing_upright" not in names, goal         # positive still-hold → dropped
-        assert cal["ok"], (goal, cal)
+        assert "do_nothing_upright" in names, goal             # kept → confound caught
+        assert not cal["ok"], (goal, cal)                      # posture confound DENIED
 
 
-def test_round23_active_verb_wins_safe_direction():
-    """§round-23 unit: an ACTIVE-motion verb forces NOT-static-hold (the SAFE direction). The
-    'override phrase' idea was removed — a still-hold goal that incidentally names a motion verb
-    ('freeze mid-stride and hold still') is observe-only (a false-reject), never a false-grant, and
-    an active SEQUENCE ('hold still then dash forward') correctly stays active."""
+def test_round24_active_verb_wins_safe_direction():
+    """§round-24 unit: an ACTIVE-motion verb forces NOT-static-hold (the SAFE direction); the
+    broadened gesture verbs (salute/flap/wiggle/shift/snap) now win; minimal-set balance still holds;
+    and the broad auxiliaries (do/act/play) are deliberately NOT active so 'do not fall over' is balance."""
     from sculptor.eval.metric_calibration import _goal_is_static_hold
-    assert _goal_is_static_hold("hold a flamingo pose")
-    assert _goal_is_static_hold("stand perfectly still")
+    assert _goal_is_static_hold("balance on one foot")
+    assert _goal_is_static_hold("stand on one leg")
+    assert _goal_is_static_hold("do not fall over")                   # 'do' is NOT an active verb
+    assert not _goal_is_static_hold("salute and balance")            # broadened active verb wins
+    assert not _goal_is_static_hold("shift your weight while balancing")
     assert not _goal_is_static_hold("wave your arm")
-    assert not _goal_is_static_hold("hold still then dash forward")    # active sequence → NOT static
-    assert not _goal_is_static_hold("stay still then dash forward")
-    assert not _goal_is_static_hold("freeze mid-stride and hold still")  # incidental verb → observe-only (safe)
+    assert not _goal_is_static_hold("hold still then dash forward")   # active sequence → NOT static

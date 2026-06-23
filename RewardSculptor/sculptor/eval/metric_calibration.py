@@ -674,23 +674,25 @@ _RETURN_UP_TOKENS = ("up", "rise", "rises", "rising", "stand", "standing",
 #: on one leg", "remain upright on one foot", "do not fall over") → these posture/anti-fall
 #: cues + phrases are added, behind the active-token guard so an active goal is never
 #: misread. Bare "stand"/"hold" stay OUT (they appear in fold goals like "stand back up").
+#: §round-24: REVERTED to the stable minimal set. The round-22/23 broadening (freeze/frozen/
+#: rigid/statue/flamingo + "center of mass"/"stay on your feet"/"t-pose"/…) was a MISTAKE —
+#: a balance keyword conjoined with an ACTIVE objective whose verb is NOT on the active list
+#: ("shift your CENTER OF MASS", "play the STATUE game", "salute and STAY ON YOUR FEET") then
+#: drops the posture losers → FALSE GRANT. Broadening positive balance cues is NOT
+#: accept-rate-safe (it can false-GRANT); only broadening the ACTIVE-verb list is safe (it
+#: only ever KEEPS the losers). The residual "active-verb-not-on-the-list + balance keyword"
+#: false-grant is a PRE-EXISTING limitation of any free-text classifier — the DURABLE fix is
+#: goal-joint scoping (REQUIRED_JOINT_ROLES), a separate increment.
 _STATIC_HOLD_TOKENS = ("balance", "balanced", "balancing", "still", "motionless",
                        "stationary", "immobile", "upright", "stance", "equilibrium",
-                       "poise", "poised",
-                       # §round-22/23: common still-hold synonyms (each only grants when NO
-                       # active verb is present, since the active-verb veto is checked first).
-                       "freeze", "frozen", "rigid", "statue", "flamingo")
+                       "poise", "poised")
 #: balance/anti-fall PHRASES (substring match — single-leg contact the synthesizer can't
-#: render, or an explicit don't-fall objective). §round-22/23: broadened to cut false-rejects
-#: of honest balance metrics on phrasings the token list missed (the SAFE direction only ever
-#: false-rejects → observe-only, never false-grants, so broadening positive balance cues is
-#: strictly accept-rate-improving as long as the active-verb veto still wins).
+#: render, so a one-legged balance is indistinguishable from do_nothing_upright; or an
+#: explicit don't-fall objective).
 _STATIC_HOLD_PHRASES = ("one leg", "one foot", "single leg", "single-leg", "one-legged",
                         "do not fall", "don't fall", "dont fall", "without falling",
                         "stay upright", "remain upright", "keep your balance",
-                        "keep balance", "hold a stance", "hold still",
-                        "flamingo pose", "center of mass", "stay on your feet",
-                        "fixed position", "t-pose", "keep your center", "hold a pose")
+                        "keep balance", "hold a stance", "hold still")
 #: §round-15/16: an ACTIVE-motion or LOCOMOTION verb forces static_hold=False regardless of
 #: any stillness adverb — "give a steady wave" / "stay still then dash forward" are ACTIVE
 #: (the stillness is an incidental modifier, not the objective), so the posture losers must
@@ -706,7 +708,19 @@ _ACTIVE_MOTION_TOKENS = (
     # stillness adverb must NOT be read as static-hold → idle-upright proxy false grant):
     "dash", "sprint", "crawl", "leap", "slide", "shuffle", "jog", "trot", "gallop",
     "skip", "climb", "roll", "spin", "pivot", "push", "pull", "drag", "carry",
-    "scoot", "sidestep", "backpedal", "pirouette", "dance", "strafe", "sway")
+    "scoot", "sidestep", "backpedal", "pirouette", "dance", "strafe", "sway",
+    # §round-24: gesture/manipulation/whole-body verbs whose ABSENCE let a balance keyword
+    # ('salute and balance', 'shift your weight while balancing', 'flap like a flamingo')
+    # mis-classify an ACTIVE goal as a static hold → posture confound false-grant. Broadening
+    # the ACTIVE list is SAFE — it only ever KEEPS the do_nothing/jitter losers (the safe
+    # direction), never drops them, so it cannot false-GRANT. (Deliberately NOT the broad
+    # auxiliaries do/act/play/perform — they appear in balance goals like "do not fall over".)
+    "salute", "flap", "wiggle", "snap", "scrub", "hammer", "shift", "rock",
+    "pump", "clap", "stir", "conduct", "windmill", "shadowbox", "applaud", "curtsy",
+    "mimic", "vibrate", "oscillate", "weave", "circle", "pedal", "drum", "knock",
+    "poke", "prod", "jab", "chop", "slice", "whisk", "paddle", "row", "wring",
+    "wobble", "jiggle", "bounce", "thrust", "twirl", "flail", "swat",
+    "box", "point", "mime", "juggle", "dribble", "toss", "tap")
 #: directional-travel words — a goal that travels is never a static hold (defense-in-depth).
 _DIRECTIONAL_TOKENS = ("forward", "forwards", "backward", "backwards", "ahead", "behind",
                        "left", "right", "sideways", "laterally", "across")

@@ -48,6 +48,11 @@ _FORBIDDEN_NAMES = {
     "globals", "locals", "vars", "getattr", "setattr", "delattr",
     "os", "sys", "subprocess", "socket", "shutil", "pathlib", "Path",
     "importlib", "pickle", "marshal", "ctypes", "memoryview",
+    # §round-24: a metric that `raise SystemExit()` (or KeyboardInterrupt/GeneratorExit, all
+    # BaseException — NOT Exception) crashes the never-raises calibration/runtime scorers that
+    # only `except Exception`. None is legitimate in a physical-quantity metric (which uses
+    # `except Exception`). exit/quit are the same vector as bare builtins.
+    "SystemExit", "KeyboardInterrupt", "GeneratorExit", "BaseException", "exit", "quit",
 }
 #: §round-9 SECURITY: numpy is itself a full IO / native-code / reflection surface, so the
 #: numpy-only import gate is NOT a sandbox on its own. These attribute names (numpy fns,
@@ -69,6 +74,39 @@ _FORBIDDEN_ATTRS = frozenset({
     "dump", "dumps", "tobytes", "tostring",
     # native-code / reflection submodules reachable as `numpy.<x>` attributes
     "ctypeslib", "f2py", "distutils", "testing", "lib", "core", "_core", "ctypes",
+    # §round-24 SECURITY (CRITICAL): numpy RE-EXPORTS whole stdlib modules under PUBLIC,
+    # non-underscore names through its submodules — e.g. np.ma.extras.ma IS numpy.ma.core,
+    # which re-exports inspect/io/builtins/operator. The round-23 single-underscore gate was
+    # bypassed by np.ma.extras.ma.inspect.dis.io.FileIO (arbitrary write → RCE),
+    # np.ma…inspect.linecache.getline (read/exfil), np.ma…builtins.exit (SystemExit). A
+    # leaf-name denylist over numpy's full alias surface cannot be PROVEN complete (the
+    # durable fix is a restricted subprocess with curated __builtins__ — see the module
+    # docstring), but these names are checked on EVERY attribute regardless of how the chain
+    # is rooted (so variable-laundering `m = np.ma; m.extras…` cannot evade the NAME check),
+    # which closes the entry submodules + the stdlib modules + the dangerous leaves. None
+    # appears in a legitimate physical-quantity metric.
+    #   numpy stdlib-re-exporting / object (non-physical) submodules (entry points). NOT
+    #   fft/polynomial (legit compute a physical metric may use — any re-export through them
+    #   still has to NAME a blocked stdlib module below to do harm):
+    "ma", "char", "rec", "records", "chararray", "mrecords", "matlib", "emath",
+    "extras", "typing", "dtypes", "exceptions", "strings", "version", "matrixlib",
+    "polyutils", "compat", "ufunclike",
+    #   ROBUST CORE — stdlib module names: any re-export chain must NAME a stdlib module to
+    #   reach FS/process/reflection, and these are checked on EVERY attribute regardless of
+    #   root, so the chain dies at the stdlib hop even through an unlisted numpy submodule:
+    "inspect", "dis", "io", "builtins", "linecache", "operator", "enum", "re",
+    "functools", "itertools", "collections", "tempfile", "runpy", "platform", "gc",
+    "ast", "types", "warnings", "traceback", "code", "codeop", "pdb", "bdb",
+    "shelve", "sqlite3", "threading", "multiprocessing", "asyncio", "signal",
+    "atexit", "weakref", "copyreg", "gettext", "locale", "glob", "fnmatch",
+    "posix", "nt", "posixpath", "ntpath", "genericpath", "fileinput", "webbrowser",
+    "pty", "ssl", "http", "urllib", "ftplib", "smtplib", "json", "base64",
+    "binascii", "zlib", "gzip", "bz2", "lzma", "tarfile", "zipfile", "struct",
+    "mmap", "fcntl", "termios", "select", "stat", "errno", "tokenize", "keyword",
+    #   dangerous terminal callables reachable off a module object:
+    "FileIO", "getline", "getlines", "exit", "quit", "system", "popen", "spawn",
+    "fork", "execv", "execve", "execvp", "fdopen", "getattr_static", "find_module",
+    "import_module", "reload", "getsource", "getsourcefile", "getfile",
 })
 #: Benign dunder ATTRIBUTES a metric may read. `type(e).__name__` — naming an
 #: exception class in a diagnostic — is the exact idiom the never-raise rule (a
