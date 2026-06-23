@@ -20,15 +20,32 @@ validation in `metric_validate`, calibration in `metric_calibration`.
 SECURITY (§round-9/10): the metric is UNTRUSTED LLM-authored code, and `metric_validate.
 _ast_safety` is the containment gate — hardened to block the numpy IO/pickle surface,
 native submodules, `def __reduce__`-style gadgets, dunder tokens in string literals, and
-`allow_pickle`. It is enforced inside `load_generated_module` (§round-10), the single
-chokepoint EVERY exec path shares (validation, the per-rollout runtime scorer,
-calibration, the best-of-N discriminator, role-read) — so the gate runs before EVERY
-exec, not only at validation time. That is still a STATIC allow/deny gate, not a proof
-of containment; a static check over the full numpy API can never be proven complete. The
-defence-in-depth follow-on (recommended before any UNTRUSTED/adversarial behavior_goal
-source is accepted) is to run `compute_spec` in a restricted subprocess (curated
-`__builtins__`, no filesystem/network) — the repo already empties `__builtins__` for the
-success-criterion evaluator (mission_runtime).
+`allow_pickle`, plus the round-28/29 frame/generator/coroutine/cython introspection prefix
+family (`gi_`/`cr_`/`ag_`/`f_`/`tb_`/`func_`) that reaches the live builtins dict. It is
+enforced inside `load_generated_module` (§round-10), the single chokepoint EVERY exec path
+shares (validation, the per-rollout runtime scorer, calibration, the best-of-N discriminator,
+role-read) — so the gate runs before EVERY exec, not only at validation time. That is still a
+STATIC allow/deny gate, NOT a proof of containment, and the rounds-27→29 hardening EMPIRICALLY
+confirmed it cannot be proven complete: two CRITICAL escape CLASSES were reproduced in
+consecutive rounds (round-28 `gi_frame.f_builtins`, round-29 numpy-cython `func_globals`),
+each slipping a freshly-patched denylist. The DURABLE containment (the convergence path) is to
+run the module exec + `compute_spec` in a restricted SUBPROCESS.
+
+  DESIGN CONSTRAINT (round-29, code-verified): the cheap in-process "empty/curated
+  `__builtins__`" variant is NOT viable here — numpy's ndarray methods (`.mean`/`.max`/`.std`)
+  internally call `__import__`, so an emptied `__builtins__` breaks legitimate metrics.
+  (`mission_runtime._evaluate_success_criterion` deliberately KEEPS real `__builtins__` for
+  exactly this reason and relies on a strict no-attribute-access AST validator instead — an
+  approach a numpy-computation metric cannot use.) So fix B must be a true PROCESS sandbox with
+  real builtins INSIDE but the process locked down OUTSIDE: a separate process (crash/hang/
+  memory isolation; `RLIMIT_CPU`/`RLIMIT_AS`/timeout), restricted cwd, and — for containment
+  against `os.system`/`unlink`/network rather than just robustness — a syscall filter
+  (seccomp-bpf) or `bubblewrap`/`nsjail`. It also requires reading `REQUIRED_JOINT_ROLES`
+  STATICALLY (AST, no exec) since a top-level exploit runs at module-exec time. This is a
+  dedicated reviewed increment (high blast radius over the score path; must stay score-identical
+  vs the 937-test corpus). Until it lands, the comprehensive denylist above is the live gate and
+  the realistic threat is low (the metric source is SYSTEM-generated from the user's own goal,
+  not adversarial third-party input).
 """
 from __future__ import annotations
 
