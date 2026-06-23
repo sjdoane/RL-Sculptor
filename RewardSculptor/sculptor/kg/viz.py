@@ -244,6 +244,7 @@ def build_kg_html(
         node_degree[edge.dst] = node_degree.get(edge.dst, 0) + 1
 
     n_active = 0
+    added_ids: set[str] = set()   # track what actually made it into the network
     for node in all_nodes:
         kind = type(node).__name__
         palette = _NODE_COLORS.get(kind, _FALLBACK_COLOR)
@@ -280,9 +281,21 @@ def build_kg_html(
             title=_tooltip_for(node, reason),
             color=color, size=size, borderWidth=border_width,
         )
+        added_ids.add(node.id)
 
-    # Add edges. Label with relation; color by relation.
+    # Add edges. Label with relation; color by relation. SKIP an edge whose
+    # endpoint is not in the node set — a DANGLING edge (a ref to a node that was
+    # never persisted, e.g. an unhealed `failure:…` stub) would otherwise make
+    # pyvis raise `AssertionError: non existent node …` and 500 the whole viz. A
+    # visualization must degrade gracefully on a slightly-inconsistent graph, so we
+    # drop the un-drawable edge and record the count (run `kg/heal-stubs` to repair
+    # the underlying dangling refs).
+    n_dangling = 0
+    node_index = {n.id: n for n in all_nodes}
     for edge in edges_cache:
+        if edge.src not in added_ids or edge.dst not in added_ids:
+            n_dangling += 1
+            continue
         rel = edge.relation.value if hasattr(edge.relation, "value") else str(edge.relation)
         net.add_edge(
             edge.src, edge.dst,
@@ -290,8 +303,7 @@ def build_kg_html(
             label=rel.replace("_", " ").title(),
             color=_EDGE_COLORS.get(rel, _DEFAULT_EDGE_COLOR),
             width=2 if _edge_touches_active(
-                edge, active_terms, active_arxiv_ids,
-                {n.id: n for n in all_nodes}) else 1,
+                edge, active_terms, active_arxiv_ids, node_index) else 1,
         )
 
     # pyvis's write_html has flaky template paths on some machines; use
@@ -308,7 +320,7 @@ def build_kg_html(
     return VizResult(
         out_path=out_path,
         n_nodes=len(all_nodes),
-        n_edges=len(edges_cache),
+        n_edges=len(edges_cache) - n_dangling,   # edges actually drawn
         n_active_nodes=n_active,
     )
 
