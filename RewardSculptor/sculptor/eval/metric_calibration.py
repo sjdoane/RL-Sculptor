@@ -436,7 +436,27 @@ _LOSER_FLOOR_FRAC = 0.15
 #: scores jitter_in_place (low peak) ≥ this fraction of velocity_peak_ref (high peak, same tiny ROM)
 #: — i.e. it is INSENSITIVE to a >2× peak-velocity difference (a flat velocity floor), AND jitter is
 #: above the idle floor. A genuine peak/ROM metric scores velocity_peak_ref well above jitter.
-_VEL_FLOOR_RATIO = 0.85
+#: §round-27 [HIGH FALSE GRANT] recalibration: 0.85 was FAR too loose. An additive confound
+#: `up·(a·floor(mean|jv|) + b·rom)` where `floor` is ANY sub-saturating concave map (1−exp with
+#: k≥0.6, tanh, sqrt, …) keeps jitter/peak_ref BELOW 0.85 while still farming 32–45% of competence
+#: on the OFF-GOAL idle jitter probe (the rom term ranks the ladder → passes the base gate AND
+#: lifts competence so the 0.5 abs-ceiling binds, leaving the whole [0,0.5)×[ratio,0.85) window
+#: unguarded — 6 reproduced confounds A1/A2/A3/A4/A5/D1). The round-26 claim that the ratio is
+#: "robust to tuning" held only for FLOOR_v, NOT for the saturation FUNCTION/rate. The EMPIRICAL
+#: separation is clean and threshold-able: the honest fixtures top out at ratio 0.531 (GOOD_KICK
+#: and a generous-/8-scale peak metric — both legitimately pay the idle twitch ~0.38–0.52 because
+#: an idle twitch HAS peak velocity, which is ACCEPTED for a peak metric), while every reproduced
+#: saturating-floor confound floors at 0.615. 0.57 sits in that gap. The precondition
+#: (jitter ≥ _LOSER_FLOOR_FRAC·comp, below) protects LOW-farm honest metrics (rom-gated → jitter
+#: ~0.03); the ratio protects HIGH-farm-but-PEAK-SENSITIVE honest metrics (ratio < 0.531). A
+#: confound tuned to ratio < 0.57 must become peak-sensitive enough that it CONVERGES to the honest
+#: generous-peak-metric form — at which point its idle farm is ≤ what the honest reference fixtures
+#: themselves exhibit, so it is no more gameable than the accepted baseline. RESIDUAL (honest): this
+#: discriminator, like the free-text posture classifier, sits over an UNBOUNDED functional surface —
+#: it cannot be PROVEN complete; it bounds the idle-farm residual to the honest-fixture level, not to
+#: zero. The threshold is coupled to the fixed probe amplitudes (jitter tremor 0.04 vs peak_ref 0.10)
+#: and GOOD_KICK's 0.531 — re-derive if either changes.
+_VEL_FLOOR_RATIO = 0.57
 
 
 def _gameable_score(s: float) -> float:
@@ -1643,6 +1663,18 @@ def calibrate_task_derived(
             # suppression still independently guards a crouch/sit→stand transition.
             if ladder_sh and not _goal_is_static_hold(behavior_goal):
                 ladder_sh = False
+            # §round-27 [HIGH FALSE GRANT] fix: the SIBLING of the ladder_sh guard above — the
+            # round-17/20 work hardened the static_hold side (crouched-rung + goal-text backstops)
+            # but left ladder_td flowing UNGUARDED to general_required_losers. A blind author can
+            # mis-render a RETURNS-UP goal ("squat down then jump straight up") as a descent-ENDING
+            # ladder; its top rung passes _spec_is_terminal_down, so collapse_and_stay_down is
+            # dropped and a drop-to-floor-and-stay confound GRANTS (B1, reproduced). Apply the same
+            # goal-text backstop: an explicitly returns-up / non-terminal goal KEEPS the
+            # collapse_and_stay_down loser. SAFE direction (mirrors ladder_sh): a keyword
+            # false-negative on a genuine lie/rest goal merely KEEPS the loser → observe-only
+            # false-reject, never a gate-weakening false-grant.
+            if ladder_td and not _goal_is_terminal_down(behavior_goal):
+                ladder_td = False
             if fam == "kick" and adversarial_required_losers:
                 # opt-in breadth: the DEDICATED kick losers (WITH foot_pos_b direction
                 # channel that render_rung can't synthesize).

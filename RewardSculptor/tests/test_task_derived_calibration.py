@@ -1887,11 +1887,16 @@ def compute_spec(arrays, behavior, meta):
         "duck down into a low crouch and hold it low", robot_hint="Unitree-G1",
         client=_FakeLadderClient(duck_ladder(), duck_ladder(), duck_ladder()))
     names = {l["name"] for l in (cal["adversarial"] or {}).get("required_losers", [])}
-    # §round-21: a duck holds a bent-leg posture (a zero-velocity hold offset → not dynamic
-    # motion), so it classifies terminal-down; the descend_and_thrash ramp probes the descent
-    # channel and catches a descent-magnitude confound.
-    assert "descend_and_thrash" in names
-    assert not cal["ok"], cal                            # descent confound DENIED
+    # §round-27 [HIGH FALSE GRANT] fix (B1): ladder_td now requires goal-text confirmation
+    # (_goal_is_terminal_down) to DROP collapse_and_stay_down, mirroring the ladder_sh guard. A
+    # "duck and hold low" goal has NO lie/rest token, so it is classified NON-terminal: the blind
+    # ladder's terminal posture alone no longer drops the loser. collapse_and_stay_down is therefore
+    # KEPT (matching this test's name) and catches the descent-magnitude confound DIRECTLY — the
+    # round-20/21 descend_and_thrash ramp is no longer injected for this non-terminal goal. (An
+    # HONEST torso-gated duck metric scores the full-collapse heap 0.0 and still grants — verified.)
+    assert "collapse_and_stay_down" in names
+    assert "descend_and_thrash" not in names
+    assert not cal["ok"], cal                            # descent confound STILL DENIED
 
 
 # ── §round-21: per-loser idle floor, AND-gated static_hold, two-probe terminal-down ──
@@ -2232,3 +2237,123 @@ def test_round26_good_kick_not_flagged_by_velocity_floor(tmp_path):
     assert not adv.get("velocity_floor")
     js = {l["name"]: l["score"] for l in adv["required_losers"]}
     assert js["jitter_in_place"] < _VEL_FLOOR_RATIO * js["velocity_peak_ref"]
+
+
+# ── §round-27: the velocity-floor ratio recalibration + terminal-down guard ──
+
+def _velfloor_confound(velexpr: str) -> str:
+    """An additive velocity-floor confound `up·(0.49·floor(velocity) + 0.51·rom)`: the rom term
+    ranks the wave ladder (passes the base gate) and lifts competence so the 0.5 abs-ceiling binds,
+    while `floor` is a peak-INSENSITIVE saturating/concave map that farms the OFF-GOAL idle jitter."""
+    return ('import numpy as np\n'
+            'def compute_spec(arrays, behavior, meta):\n'
+            '    g = arrays.get("projected_gravity_b"); jp = arrays.get("joint_pos"); jv = arrays.get("joint_vel")\n'
+            '    if g is None or jv is None or jp is None: return {"spec_score": 0.0}\n'
+            '    up = float((np.asarray(g)[..., 2] < -0.85).mean())\n'
+            '    mean_v = float(np.abs(np.asarray(jv)).mean()); peak_v = float(np.abs(np.asarray(jv)).max())\n'
+            '    rom = float(np.clip(np.max(np.ptp(np.asarray(jp), axis=0)) / 2.6, 0, 1))\n'
+            '    moving = ' + velexpr + '\n'
+            '    return {"spec_score": float(np.clip(up * (0.49 * moving + 0.51 * rom), 0, 1))}\n')
+
+
+def test_round27_velocity_floor_family_denied(tmp_path):
+    """§round-27 [HIGH FALSE GRANT] fix: the round-26 PEAK discriminator (ratio 0.85) was a
+    knife-edge — ANY sub-saturating concave velocity map (1−exp k≥0.6, tanh, sqrt, peak-keyed)
+    kept jitter/peak_ref < 0.85 while farming 30–45% of competence on the OFF-GOAL idle jitter
+    probe (6 reproduced confounds). Lowering _VEL_FLOOR_RATIO to 0.57 (in the empirical gap above
+    the honest-fixture ceiling 0.531, below the confound floor 0.615) denies the whole family."""
+    fams = {
+        "exp_k0.6":  "float(1 - np.exp(-mean_v / 0.6))",
+        "tanh_k1.0": "float(np.tanh(mean_v / 1.0))",
+        "sqrt":      "float(np.clip(np.sqrt(mean_v) / np.sqrt(3.0), 0, 1))",
+        "tanh_k1.15":"float(np.tanh(mean_v / 1.15))",
+        "peak_k4":   "float(1 - np.exp(-peak_v / 4.0))",
+        "exp_k1.5":  "float(1 - np.exp(-mean_v / 1.5))",
+    }
+    for nm, expr in fams.items():
+        cal = calibrate_task_derived(_write(tmp_path, f"vf_{nm}.py", _velfloor_confound(expr)),
+            "wave your arm up and down", robot_hint="Unitree-G1",
+            client=_FakeLadderClient(_wave_ladder(), _wave_ladder(), _wave_ladder()))
+        assert cal["rho_min"] >= 0.5, (nm, cal)          # passed the base gate (NOT an artifact)
+        assert not cal["ok"], (nm, cal)                   # ...but the firewall denies it
+        assert (cal["adversarial"] or {}).get("gameable"), (nm, cal)
+
+
+def test_round27_honest_peak_and_rom_not_false_rejected_by_tighter_ratio(tmp_path):
+    """§round-27: lowering the ratio to 0.57 must NOT false-reject the honest fixtures. A
+    generous-/8-scale peak metric (the boundary case — same form as GOOD_KICK, pays idle ~0.38)
+    sits at ratio 0.531 < 0.57 and still GRANTS, as do a /12 peak metric (0.49) and a rom metric
+    (jitter ~0.03, below the idle floor precondition)."""
+    HONEST = {
+        "peak_gen.py": ("g = arrays.get('projected_gravity_b'); jv = arrays.get('joint_vel')\n"
+                        "    if g is None or jv is None: return {'spec_score': 0.0}\n"
+                        "    up = float((np.asarray(g)[..., 2] < -0.85).mean()); peak = float(np.abs(np.asarray(jv)).max())\n"
+                        "    return {'spec_score': float(np.clip(up * (1 - np.exp(-peak / 8.0)), 0, 1))}"),
+        "peak12.py":   ("g = arrays.get('projected_gravity_b'); jv = arrays.get('joint_vel')\n"
+                        "    if g is None or jv is None: return {'spec_score': 0.0}\n"
+                        "    up = float((np.asarray(g)[..., 2] < -0.85).mean()); peak = float(np.abs(np.asarray(jv)).max())\n"
+                        "    return {'spec_score': float(np.clip(up * (1 - np.exp(-peak / 12.0)), 0, 1))}"),
+        "rom.py":      ("g = arrays.get('projected_gravity_b'); jp = arrays.get('joint_pos')\n"
+                        "    if g is None or jp is None: return {'spec_score': 0.0}\n"
+                        "    up = float((np.asarray(g)[..., 2] < -0.85).mean())\n"
+                        "    rom = float(np.clip(np.max(np.ptp(np.asarray(jp), axis=0)) / 2.6, 0, 1))\n"
+                        "    return {'spec_score': float(np.clip(up * rom, 0, 1))}"),
+    }
+    for nm, body in HONEST.items():
+        src = "import numpy as np\ndef compute_spec(arrays, behavior, meta):\n    " + body + "\n"
+        cal = calibrate_task_derived(_write(tmp_path, nm, src),
+            "wave your arm up and down", robot_hint="Unitree-G1",
+            client=_FakeLadderClient(_wave_ladder(), _wave_ladder(), _wave_ladder()))
+        assert cal["ok"], (nm, cal)
+        assert not (cal["adversarial"] or {}).get("velocity_floor"), (nm, cal)
+
+
+def _descent_ladder() -> CompetenceLadder:
+    """A descent-ENDING ladder (top rung is a near-floor, toppled posture) — what a blind author
+    can MIS-render for a returns-up goal, tripping the per-rung terminal-down test."""
+    return CompetenceLadder(competence_axis="descent depth", rungs=[
+        MotionSpec(uprightness=1.0, base_height_m=0.7),
+        MotionSpec(uprightness=0.6, base_height_m=0.45),
+        MotionSpec(uprightness=0.25, base_height_m=0.25),
+        MotionSpec(uprightness=0.05, base_height_m=0.12)])
+
+
+def test_round27_terminal_down_guard_keeps_collapse_for_returns_up_goal(tmp_path):
+    """§round-27 [HIGH FALSE GRANT] fix (B1): ladder_td flowed UNGUARDED to the loser set (the
+    sibling of the ladder_sh goal-text backstop was missing). A blind author can mis-render a
+    RETURNS-UP goal ('squat down then jump straight up') as a descent-ending ladder; its top rung
+    passes _spec_is_terminal_down, so collapse_and_stay_down was DROPPED and a drop-to-floor-and-
+    stay confound GRANTED. The new guard forces ladder_td=False when the goal is not
+    _goal_is_terminal_down (it explicitly returns up), KEEPING collapse_and_stay_down."""
+    DROP_STAY = '''import numpy as np
+def compute_spec(arrays, behavior, meta):
+    g = arrays.get("projected_gravity_b"); jv = arrays.get("joint_vel")
+    if g is None or jv is None: return {"spec_score": 0.0}
+    gz = np.asarray(g)[..., 2]; v = np.abs(np.asarray(jv))
+    T = gz.shape[0]; last = slice(int(T*0.66), T)
+    down = float((gz[last] > -0.4).mean())
+    still = float(np.exp(-v[last].mean() / 0.5))
+    return {"spec_score": float(np.clip(down * still, 0, 1))}
+'''
+    goal = "squat down then jump straight up as high as you can"
+    L = [_descent_ladder(), _descent_ladder(), _descent_ladder()]
+    cal = calibrate_task_derived(_write(tmp_path, "drop_stay.py", DROP_STAY),
+        goal, robot_hint="Unitree-G1", client=_FakeLadderClient(*L))
+    names = {l["name"] for l in (cal["adversarial"] or {}).get("required_losers", [])}
+    assert "collapse_and_stay_down" in names              # KEPT (was dropped pre-fix)
+    assert cal["rho_min"] >= 0.5                           # base gate passed (firewall, not artifact)
+    assert not cal["ok"], cal                              # drop-and-stay confound DENIED
+    assert (cal["adversarial"] or {}).get("gameable")
+    # the guard is goal-text-driven and SAFE: a RETURNS-UP goal is not terminal (keep collapse);
+    # a genuine lie/rest goal IS terminal (drop collapse — it is on-goal there).
+    from sculptor.eval.metric_calibration import (
+        _goal_is_terminal_down, general_required_losers)
+    from sculptor.eval.robot_manifest import robot_joint_names
+    assert not _goal_is_terminal_down(goal)
+    assert _goal_is_terminal_down("lie down on the ground and rest")
+    jn = list(robot_joint_names("Unitree-G1"))
+    kept = {l["name"] for l in general_required_losers(jn, goal, terminal_down=False)}
+    dropped = {l["name"] for l in general_required_losers(
+        jn, "lie down on the ground and rest", terminal_down=True)}
+    assert "collapse_and_stay_down" in kept                 # returns-up → KEEP
+    assert "collapse_and_stay_down" not in dropped          # terminal → DROP (on-goal)
