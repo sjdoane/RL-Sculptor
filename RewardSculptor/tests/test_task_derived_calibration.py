@@ -465,16 +465,19 @@ def test_adversarial_author_is_metric_blind(tmp_path):
 
 
 def test_adversarial_author_crash_not_enforced(tmp_path):
-    """An adversary-call failure is NO evidence, not a denial — the L2 grant
-    stands and the inconclusive reason is recorded (never-silent)."""
+    """An adversary-call failure is NO evidence, not a denial — the L2 grant stands and the
+    inconclusive author reason is recorded (never-silent). §round-19: the deterministic
+    goal-blind losers now run for kicks too, so the gate RAN (carried the verdict) despite the
+    author crash; GOOD_KICK scores those losers ~0 → grant survives."""
     p = _write(tmp_path, "good.py", GOOD_KICK)
     client = _FakeBothClient(_three_kicks(), gaming_travel(), gaming_raises=True)
     cal = calibrate_task_derived(p, "kick forward from a stance", robot_hint="Unitree-G1",
                                  client=client, adversarial=True)
     assert cal["ok"]                                # grant survives the crash
     adv = cal["adversarial"]
-    assert adv and not adv["ran"] and not adv["gameable"]
-    assert "inconclusive" in adv["reason"]
+    assert adv and adv["ran"] and not adv["gameable"]            # deterministic losers carried it
+    assert adv["required_losers"]                               # firewall was NOT empty
+    assert "inconclusive" in adv["author_note"]                # crash still recorded (never-silent)
 
 
 def test_adversarial_skipped_when_l2_denies(tmp_path):
@@ -758,15 +761,20 @@ def test_adversarial_required_losers_opt_in_grants_direction_aware(tmp_path):
     assert rear["score"] < adv["ceiling"]
 
 
-def test_adversarial_required_losers_opt_in_off_is_byte_identical(tmp_path):
-    """adversarial_required_losers default OFF → no losers injected (Ship-53 byte-
-    identical): GOOD_KICK is GRANTED (it would be denied with losers on)."""
+def test_adversarial_required_losers_off_runs_general_firewall_for_kicks(tmp_path):
+    """§round-19 [HIGH FALSE GRANT] fix C: adversarial_required_losers default OFF no longer
+    means NO firewall on a novel kick goal (that was the bug — the gate scored zero losers and
+    fail-open-granted a confound). It now runs the GENERAL goal-blind losers; the flag only
+    swaps in the DEDICATED kick losers when ON. GOOD_KICK scores the general losers ~0 so it
+    still GRANTS — but the firewall is present (non-empty), not absent."""
     p = _write(tmp_path, "good.py", GOOD_KICK)
     client = _FakeBothClient(_three_kicks(), gaming_travel())
     cal = calibrate_task_derived(
         p, "kick forward from a stance", robot_hint="Unitree-G1", client=client,
         adversarial=True)
-    assert cal["ok"] and not cal["adversarial"].get("required_losers")
+    assert cal["ok"], cal
+    names = {l["name"] for l in cal["adversarial"]["required_losers"]}
+    assert names == {"do_nothing_upright", "jitter_in_place", "collapse_and_stay_down"}
 
 
 # ── §fold-and-return primitive: STEERING for fold/squat/sit-to-stand/toe-touch ──
@@ -1395,8 +1403,11 @@ def test_round15_loser_set_never_empty_and_off_goal_per_class():
     cases = {
         "touch your toes then stand back up": {"do_nothing_upright", "jitter_in_place", "collapse_and_stay_down"},
         "balance on one leg":                 {"collapse_and_stay_down"},                       # still-upright is on-goal
-        "lie down to rest":                   {"do_nothing_upright", "jitter_in_place"},        # collapse is on-goal
-        "lie still and rest":                 {"do_nothing_upright", "jitter_in_place"},        # both classes → still NON-empty
+        # §round-19 fix B: a terminal-down goal drops collapse_and_stay_down (on-goal) but adds
+        # collapse_and_thrash (a low-posture-WITH-motion stillness probe) — so the stillness
+        # channel is covered at the low posture (a low-height-only proxy is no longer free).
+        "lie down to rest":                   {"do_nothing_upright", "jitter_in_place", "collapse_and_thrash"},
+        "lie still and rest":                 {"do_nothing_upright", "jitter_in_place", "collapse_and_thrash"},
     }
     for goal, expect in cases.items():
         names = {l["name"] for l in general_required_losers(G1, goal)}
@@ -1678,3 +1689,99 @@ def compute_spec(arrays, behavior, meta):
     losers = {l["name"] for l in (cal["adversarial"] or {}).get("required_losers", [])}
     assert "do_nothing_upright" in losers and "jitter_in_place" in losers   # ramp ≠ still hold
     assert cal["ok"], cal                                                   # honest rise still GRANTS
+
+
+# ── §round-19 convergence red-team fixes (terminal_down / kick-firewall / lie-down) ──
+
+def _squat_ladder():
+    return CompetenceLadder(competence_axis="squat depth (upright)", rungs=[
+        MotionSpec(uprightness=1.0, base_height_m=h) for h in (0.62, 0.50, 0.40, 0.30)])
+
+
+def test_round19_upright_squat_keeps_collapse_loser_denies_depth_proxy(tmp_path):
+    """§round-19 [HIGH FALSE GRANT] fix A: a held UPRIGHT deep squat (base_height<=0.35 but
+    upright) must NOT be classified terminal-down — _spec_is_terminal_down's base_height branch
+    is now gated on non-uprightness. So collapse_and_stay_down is KEPT and a dip-DEPTH-only
+    proxy (gamed by collapsing) is DENIED, while an honest upright-gated squat metric GRANTS."""
+    from sculptor.eval.metric_calibration import _spec_is_terminal_down
+    assert not _spec_is_terminal_down(MotionSpec(uprightness=1.0, base_height_m=0.30))  # upright squat
+    assert _spec_is_terminal_down(MotionSpec(uprightness=0.0, base_height_m=0.12))      # lie/fallen
+    DEPTH = '''import numpy as np
+def compute_spec(arrays, behavior, meta):
+    root = arrays.get("root_link_pos_w")
+    if root is None: return {"spec_score": 0.0}
+    z = float(np.asarray(root)[..., 2].mean())
+    return {"spec_score": float(np.clip((0.7 - z) / 0.6, 0.0, 1.0))}
+'''
+    HONEST = '''import numpy as np
+def compute_spec(arrays, behavior, meta):
+    root = arrays.get("root_link_pos_w"); grav = arrays.get("projected_gravity_b")
+    if root is None or grav is None: return {"spec_score": 0.0}
+    z = float(np.asarray(root)[..., 2].mean()); up = float((grav[..., 2] < -0.85).mean())
+    return {"spec_score": float(np.clip((0.7 - z) / 0.6, 0.0, 1.0) * up)}
+'''
+    cal_bad = calibrate_task_derived(_write(tmp_path, "depth.py", DEPTH),
+        "hold a deep squat", robot_hint="Unitree-G1",
+        client=_FakeLadderClient(_squat_ladder(), _squat_ladder(), _squat_ladder()))
+    losers = {l["name"] for l in (cal_bad["adversarial"] or {}).get("required_losers", [])}
+    assert "collapse_and_stay_down" in losers                 # kept (squat ≠ terminal-down)
+    assert not cal_bad["ok"], cal_bad                         # depth confound DENIED
+    cal_ok = calibrate_task_derived(_write(tmp_path, "honest.py", HONEST),
+        "hold a deep squat", robot_hint="Unitree-G1",
+        client=_FakeLadderClient(_squat_ladder(), _squat_ladder(), _squat_ladder()))
+    assert cal_ok["ok"], cal_ok                               # honest upright squat GRANTS
+
+
+def test_round19_novel_kick_runs_firewall_default_path(tmp_path):
+    """§round-19 [HIGH FALSE GRANT] fix C: a NOVEL kick goal lands on the task-derived path;
+    its `if fam=="kick"` branch used to set req_losers=None unless an unset flag was on, so the
+    gate scored ZERO losers and the firewall was OFF. It now runs the general goal-blind losers
+    ALWAYS — an honest kick still GRANTS, but the firewall is no longer absent."""
+    cal = calibrate_task_derived(_write(tmp_path, "kick.py", GOOD_KICK),
+        "kick forward with the left leg from a stance", robot_hint="Unitree-G1",
+        client=_FakeLadderClient(kick_ladder(), kick_ladder(), kick_ladder()))
+    adv = cal["adversarial"] or {}
+    names = {l["name"] for l in adv.get("required_losers", [])}
+    assert names == {"do_nothing_upright", "jitter_in_place", "collapse_and_stay_down"}  # firewall RAN
+    assert adv.get("ran") is True
+    assert cal["ok"], cal                                     # honest kick still GRANTS
+
+
+def _lie_ladder():
+    return CompetenceLadder(competence_axis="lie down and rest still", rungs=[
+        MotionSpec(uprightness=0.6, base_height_m=0.5),
+        MotionSpec(uprightness=0.3, base_height_m=0.35),
+        MotionSpec(uprightness=0.1, base_height_m=0.22),
+        MotionSpec(uprightness=0.0, base_height_m=0.12)])
+
+
+def test_round19_lie_down_stillness_loser_denies_low_only_proxy(tmp_path):
+    """§round-19 [FALSE GRANT] fix B: for a terminal-down 'rest still' goal collapse is dropped
+    (on-goal) and do_nothing/jitter are rendered UPRIGHT, so the stillness channel was unprobed
+    at the low posture. A new collapse_and_thrash loser (low pelvis + violent motion) catches a
+    low-height-ONLY proxy; an honest lie-STILL metric (low·stillness) scores it ~0 and GRANTS."""
+    LOW = '''import numpy as np
+def compute_spec(arrays, behavior, meta):
+    root = arrays.get("root_link_pos_w")
+    if root is None: return {"spec_score": 0.0}
+    z = float(np.asarray(root)[..., 2].mean())
+    return {"spec_score": float(np.clip(1.0 - z / 0.7, 0.0, 1.0))}
+'''
+    HONEST = '''import numpy as np
+def compute_spec(arrays, behavior, meta):
+    root = arrays.get("root_link_pos_w"); jv = arrays.get("joint_vel")
+    if root is None or jv is None: return {"spec_score": 0.0}
+    z = float(np.asarray(root)[..., 2].mean()); low = float(np.clip(1.0 - z / 0.7, 0.0, 1.0))
+    still = float(np.exp(-np.abs(np.asarray(jv)).mean() / 0.3))
+    return {"spec_score": float(np.clip(low * still, 0.0, 1.0))}
+'''
+    cal_bad = calibrate_task_derived(_write(tmp_path, "low.py", LOW),
+        "lie down on the floor and rest still", robot_hint="Unitree-G1",
+        client=_FakeLadderClient(_lie_ladder(), _lie_ladder(), _lie_ladder()))
+    losers = {l["name"] for l in (cal_bad["adversarial"] or {}).get("required_losers", [])}
+    assert "collapse_and_thrash" in losers                    # stillness probe present
+    assert not cal_bad["ok"], cal_bad                         # stillness-blind proxy DENIED
+    cal_ok = calibrate_task_derived(_write(tmp_path, "lie.py", HONEST),
+        "lie down on the floor and rest still", robot_hint="Unitree-G1",
+        client=_FakeLadderClient(_lie_ladder(), _lie_ladder(), _lie_ladder()))
+    assert cal_ok["ok"], cal_ok                               # honest lie-still GRANTS

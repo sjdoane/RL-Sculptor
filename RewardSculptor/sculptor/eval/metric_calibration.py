@@ -810,10 +810,21 @@ def _spec_is_static_hold(spec: Any) -> bool:
 
 def _spec_is_terminal_down(spec: Any) -> bool:
     """True iff a competence-ladder TOP rung describes a DOWN end-state (lie/rest) —
-    non-upright or near-floor at the top, so collapse_and_stay_down is ON-goal."""
+    so collapse_and_stay_down is ON-goal and is dropped from the loser set.
+
+    §round-19 [HIGH FALSE GRANT] fix (sibling asymmetry to _spec_is_static_hold's f2932eb
+    base_height fix): a DOWN end-state is NON-UPRIGHT. A near-floor height ALONE is NOT
+    terminal-down — a held UPRIGHT deep squat (low pelvis, torso vertical) is an ACTIVE low
+    posture, NOT a lie/rest, and must KEEP collapse_and_stay_down (the only loser that catches
+    a dip-DEPTH-only proxy gamed by collapsing). The old unguarded `base_height_m <= 0.35`
+    OR-branch fired regardless of uprightness, so a squat-and-hold goal dropped collapse and a
+    depth-only confound false-granted."""
     try:
-        return (_scalar_end(getattr(spec, "uprightness", 1.0)) <= 0.3
-                or _scalar_end(getattr(spec, "base_height_m", 0.7)) <= 0.35)
+        up = _scalar_end(getattr(spec, "uprightness", 1.0))
+        bh = _scalar_end(getattr(spec, "base_height_m", 0.7))
+        # clearly non-upright (lying/fallen, any height) OR near-floor AND not-upright
+        # (a low collapsed heap). An upright squat (up high, bh low) is NEITHER.
+        return (up <= 0.3) or (bh <= 0.35 and up <= 0.5)
     except Exception:  # noqa: BLE001
         return False
 
@@ -897,6 +908,17 @@ def general_required_losers(
     if not td:
         losers.append(_pack("collapse_and_stay_down", "completion",
                             MotionSpec(uprightness=0.0, base_height_m=[0.7, 0.1]), 602))
+    else:
+        # §round-19 [FALSE GRANT] fix: for a terminal-DOWN goal, collapse_and_stay_down is
+        # on-goal (dropped) and do_nothing/jitter are rendered UPRIGHT (z=0.7), which an
+        # honest lie-down metric scores ~0 — so NOTHING probes the stillness channel AT the
+        # low posture. A floor-thrash policy (low pelvis + violent motion) games a
+        # low-height-ONLY proxy that ignores 'rest still'. An honest lie-STILL metric
+        # (low·stillness) scores this ~0, so it cannot false-reject it; a stillness-blind
+        # low-height proxy scores it MAX → caught.
+        losers.append(_pack("collapse_and_thrash", "stillness",
+                            MotionSpec(uprightness=0.0, base_height_m=0.12,
+                                       tremor=1.8, noise=0.15), 603))
     return losers
 
 
@@ -1073,6 +1095,12 @@ def adversarial_archetype_gate(
     rec["worst_gaming"] = round(worst, 4)
     rec["worst_name"] = worst_name
     rec["ran"] = (arche_scored > 0) or (losers_scored > 0)
+    if author_reason:
+        # never-silent: surface an author crash/leak/echo even when the DETERMINISTIC losers
+        # carried the verdict (ran=True). §round-19: the firewall now runs the goal-blind
+        # losers for kicks too, so an author failure no longer makes the gate inconclusive —
+        # but the failure is still recorded for provenance.
+        rec["author_note"] = author_reason
     if not rec["ran"]:
         rec["reason"] = author_reason or (
             "adversarial: no renderable gaming archetype — inconclusive, not enforced")
@@ -1361,13 +1389,26 @@ def calibrate_task_derived(
             from sculptor.eval.metric_validate import resolve_behavior_family
             fam = resolve_behavior_family(behavior_goal, robot_hint)
             if fam == "kick":
-                # A KICK has DEDICATED direction/completion/amplitude losers (WITH
-                # foot_pos_b); the general posture/depth losers mis-fire on an
-                # intensity-based kick metric, so they are NOT used here. The kick
-                # losers stay opt-in (a canonical kick routes to the built-in path).
-                req_losers = (kick_required_losers(names, behavior_goal, robot_hint)
-                              if adversarial_required_losers else None)
-                sc = list(_KICK_SCORED_CHANNELS) if adversarial_required_losers else None
+                ladder_sh, ladder_td = _ladder_posture(valid_top_specs)
+                if adversarial_required_losers:
+                    # opt-in breadth: the DEDICATED kick losers (WITH foot_pos_b direction
+                    # channel that render_rung can't synthesize).
+                    req_losers = kick_required_losers(names, behavior_goal, robot_hint)
+                    sc = list(_KICK_SCORED_CHANNELS)
+                else:
+                    # §round-19 [HIGH FALSE GRANT] fix: a NOVEL kick goal lands on THIS path
+                    # (calibrate_task_derived IS the novel-task path — the built-in path has
+                    # its own ground truth), so the firewall must NOT be off. The old code
+                    # set req_losers=None here → the gate scored ZERO losers → ran=False →
+                    # gameable=False → no deny → a posture/velocity CONFOUND on a kick goal
+                    # false-granted. The general goal-blind losers catch the confound on a
+                    # kick metric too (verified: an honest kick metric scores them ~0; a
+                    # velocity proxy scores jitter_in_place at the ceiling) and never
+                    # mis-deny an honest kick — so they run ALWAYS, exactly like every
+                    # non-kick novel family.
+                    req_losers = general_required_losers(
+                        names, behavior_goal, static_hold=ladder_sh, terminal_down=ladder_td)
+                    sc = list(_GENERAL_SCORED_CHANNELS)
             else:
                 # §round-13 FALSE-GRANT fix: the general goal-blind losers (do-nothing /
                 # jitter / collapse-and-stay) run ALWAYS for a novel (family=None) fold/
@@ -1380,6 +1421,13 @@ def calibrate_task_derived(
                 req_losers = general_required_losers(
                     names, behavior_goal, static_hold=ladder_sh, terminal_down=ladder_td)
                 sc = list(_GENERAL_SCORED_CHANNELS)
+            # §round-19: record the obligation for any channel a loser actually covers (the
+            # terminal-down floor-thrash loser adds a 'stillness' channel) so coverage_gaps
+            # stays honest — a probe that runs but is unlisted would read as an unmet gap.
+            if sc is not None and req_losers:
+                for ch in (l.get("channel") for l in req_losers):
+                    if ch and ch not in sc:
+                        sc.append(ch)
             # The LLM breadth pass is opt-in (`adversarial`); the deterministic losers
             # always run, so skipping it never fails the firewall open.
             adv = adversarial_archetype_gate(

@@ -591,6 +591,20 @@ import pytest as _pytest
     ("star_import", "from numpy import *\ndef compute_spec(a,b,m):\n    return {'spec_score':0.5}\n"),
     ("ndarray_tofile", "import numpy as np\ndef compute_spec(a,b,m):\n"
                        "    np.array([1.0]).tofile('/tmp/x')\n    return {'spec_score':0.5}\n"),
+    # §round-19: ndarray.dump(path) pickles to an arbitrary FS path; dumps/tobytes/tostring
+    # serialize in-process. The round-9 gate blocked tofile/savetxt but these siblings escaped.
+    ("ndarray_dump", "import numpy as np\ndef compute_spec(a,b,m):\n"
+                     "    np.zeros((2,2)).dump('/tmp/x.bin')\n    return {'spec_score':0.5}\n"),
+    ("ndarray_dumps", "import numpy as np\ndef compute_spec(a,b,m):\n"
+                      "    b2 = np.zeros(2).dumps()\n    return {'spec_score':0.5}\n"),
+    ("ndarray_tobytes", "import numpy as np\ndef compute_spec(a,b,m):\n"
+                        "    b2 = np.zeros(2).tobytes()\n    return {'spec_score':0.5}\n"),
+    # §round-19: the literal '__'-in-string scan is bypassed by a chr(95)-assembled dunder
+    # string fed to str.format — the format/format_map reflection primitive is now rejected.
+    ("format_dunder_chr", "def compute_spec(a,b,m):\n"
+                          "    d = chr(95) * 2\n"
+                          "    fld = '{0.' + d + 'globals' + d + '[a]}'\n"
+                          "    s = fld.format(compute_spec)\n    return {'spec_score':0.5}\n"),
     ("breakpoint_call", "def compute_spec(a,b,m):\n    breakpoint()\n    return {'spec_score':0.5}\n"),
 ])
 def test_ast_safety_blocks_escape_vectors(name, src):

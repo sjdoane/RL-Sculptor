@@ -61,6 +61,12 @@ _FORBIDDEN_ATTRS = frozenset({
     "save", "savez", "savez_compressed", "savetxt", "load", "loadtxt", "genfromtxt",
     "fromfile", "tofile", "memmap", "fromregex", "datasource", "DataSource",
     "fromstring", "frombuffer", "getbuffer", "newbuffer",
+    # §round-19 SECURITY: ndarray.dump(path) PICKLES the array to an arbitrary filesystem
+    # path (arbitrary write/overwrite), and ndarray.dumps()/tobytes()/tostring() serialize
+    # in-process (pickle/raw-bytes exfil surfaces). The round-9 gate blocked tofile/savetxt
+    # but the literal-sibling dump/dumps were uncovered → a metric escaped the IO gate during
+    # validation. None appears in a legitimate physical-quantity metric.
+    "dump", "dumps", "tobytes", "tostring",
     # native-code / reflection submodules reachable as `numpy.<x>` attributes
     "ctypeslib", "f2py", "distutils", "testing", "lib", "core", "_core", "ctypes",
 })
@@ -301,6 +307,15 @@ def _ast_safety(source: str) -> list[str]:
                 problems.append(f"dunder attribute access: {node.attr}")
             elif node.attr in _FORBIDDEN_ATTRS:
                 problems.append(f"forbidden attribute (IO/native/reflection): {node.attr}")
+            elif node.attr in ("format", "format_map"):
+                # §round-19 SECURITY: str.format/format_map is the reflection PRIMITIVE
+                # ('{0.__globals__[__builtins__]}'.format(fn) reads module globals/builtins
+                # via field access). The string-literal '__' scan below only sees ast.Constant
+                # nodes, so a dunder string assembled at runtime (chr(95)*2 + 'globals' + ...)
+                # bypassed it. Rejecting the primitive itself closes every assembly path — a
+                # physical-quantity metric never needs .format (f-strings are ast.JoinedStr
+                # and are unaffected).
+                problems.append(f"forbidden reflection primitive: str.{node.attr}")
         elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
             if node.name.startswith("__"):                 # `def __reduce__` → pickle-RCE gadget
                 problems.append(f"forbidden dunder definition: {node.name}")
