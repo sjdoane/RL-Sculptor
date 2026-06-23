@@ -456,6 +456,21 @@ _LOSER_FLOOR_FRAC = 0.15
 #: it cannot be PROVEN complete; it bounds the idle-farm residual to the honest-fixture level, not to
 #: zero. The threshold is coupled to the fixed probe amplitudes (jitter tremor 0.04 vs peak_ref 0.10)
 #: and GOOD_KICK's 0.531 — re-derive if either changes.
+#: §round-31 [CONFIRMED STRUCTURAL LIMIT — do NOT chase with another ratio tweak]: the ratio is
+#: DECOUPLABLE. A confound `up·(a·sigmoid_peak_gate(peak) + clip(mean|jv|, 0, cap))` ranks the
+#: ladder via the peak gate (low ratio, like an honest peak metric) while a HARD-CAPPED (clipped-
+#: affine, NOT concave) mean term adds the SAME constant `cap` to BOTH the low-peak jitter and the
+#: high-peak velocity_peak_ref probe (both saturate the cap), so the ratio is UNMOVED by the farm
+#: and stays < 0.57 while the cap farms idle jitter. CRUCIALLY there is NO velocity-floor threshold
+#: that catches this: the confound's jitter-absolute (0.28) AND ratio (0.41) are BOTH BELOW honest
+#: GOOD_KICK's (0.354, 0.531) — GOOD_KICK pays an idle knee-twitch MORE in absolute terms — so any
+#: threshold catching the confound also false-rejects the honest reference. This is the velocity-
+#: floor surface's structural ceiling (4th bypass after knife-edge / fail-open / channel-decouple):
+#: the ratio bounds the idle-farm residual to ~the honest-fixture level (~0.52 absolute), not zero,
+#: exactly like the keyword classifier + AST denylist. The DURABLE close is the min-composition law
+#: (an additive/decoupled `gate + farm` SUM violates `completion_gate·min(channels)`) + goal-joint
+#: scoping — NOT a probe/threshold iteration. (The round-31 jitter-RAISE fail-open IS a clean bug,
+#: fixed in the gate; B1's marginal cap-farm is the documented residual, not patched.)
 _VEL_FLOOR_RATIO = 0.57
 
 
@@ -1201,6 +1216,11 @@ def adversarial_archetype_gate(
     # §round-26: scored deterministic losers + paired reference probes, for the velocity-floor check.
     loser_scores: dict[str, float] = {}
     ref_scores: dict[str, float] = {}
+    # §round-31: a SELECTIVE raise on the jitter_in_place probe (the velocity-floor NUMERATOR) —
+    # keying on its recognizable mean|jv|≈1.18 band that NO competent ladder rung occupies — used
+    # to leave loser_scores['jitter_in_place'] unset → vfj=None → the velocity-floor verdict SKIPPED
+    # (fail-OPEN), the un-closed sibling of the round-30 reference-probe fix. Track it to fail CLOSED.
+    jitter_probe_raised = False
 
     # ── 1. DETERMINISTIC required-losers — scored FIRST and INDEPENDENTLY of the
     #     LLM author, so the metric is probed against the curated kick hacks even
@@ -1246,6 +1266,14 @@ def adversarial_archetype_gate(
                 # untouched; only a metric that can't/won't score the high-peak ref while farming
                 # the low-peak jitter is flagged — exactly the farming signature.
                 ref_scores[name] = 0.0
+            elif name == "jitter_in_place":
+                # §round-31 [HIGH FALSE GRANT] fix (sibling of the round-30 reference fix): a raise
+                # on the jitter probe (the velocity-floor NUMERATOR) left vfj=None → verdict SKIPPED
+                # (fail-OPEN) AND the recorded 0.0 never bumped `worst` → the upper ceiling evaded
+                # too. jitter_in_place is a VALID upright-tremor rollout (all arrays present) an
+                # honest metric scores low WITHOUT raising, so a selective raise on it is purely the
+                # evasion signature → fail CLOSED via the velocity-floor verdict below.
+                jitter_probe_raised = True
             continue
         s = _gameable_score(s)   # §round-7: a NaN/inf hack score → GAMEABLE (fail-closed)
         losers_scored += 1
@@ -1382,7 +1410,22 @@ def adversarial_archetype_gate(
     vel_floor_gamed = False
     vfj = loser_scores.get("jitter_in_place")
     vfr = ref_scores.get("velocity_peak_ref")
-    if (vfj is not None and vfr is not None
+    if (jitter_probe_raised and float(competent_ref) > 0
+            and loser_scores.get("do_nothing_upright") is not None):
+        # §round-31: a SURGICAL raise on the jitter probe (the velocity-floor numerator) — fail
+        # CLOSED. jitter_in_place is a valid upright-tremor rollout; a metric that raises on it
+        # while still SCORING the (even more static) do_nothing_upright probe is keying on jitter's
+        # exact mean-velocity band to skip the velocity-floor verdict (and the 0.0 it recorded also
+        # dodged the ceiling) — pure evasion. The do_nothing-was-scored guard preserves the round-15
+        # honest-onset case: an honest onset/phase metric that can't time a STATIC rollout raises on
+        # BOTH jitter AND do_nothing (do_nothing then absent from loser_scores) → NOT flagged → not
+        # false-rejected. (Residual: a 2-raise attacker who ALSO raises on do_nothing — a still-policy
+        # an honest metric scores 0, never raises on — evades; that is the documented velocity-floor
+        # structural limit, not a clean catch.)
+        vel_floor_gamed = True
+        rec["velocity_floor"] = {"jitter": "raised", "peak_ref": (round(vfr, 4) if vfr is not None
+                                 else None), "ratio_thresh": _VEL_FLOOR_RATIO}
+    elif (vfj is not None and vfr is not None
             and vfj >= _LOSER_FLOOR_FRAC * float(competent_ref)
             and vfj >= _VEL_FLOOR_RATIO * vfr):
         vel_floor_gamed = True
@@ -1396,10 +1439,16 @@ def adversarial_archetype_gate(
     rec["ok"] = not gameable
     if gameable and vel_floor_gamed and not (worst >= ceiling) and not floor_gamed:
         rec["worst_name"] = "jitter_in_place"
-        rec["reason"] = (
-            f"adversarial: velocity-floor — jitter_in_place scored {vfj:.3f} ≥ "
-            f"{_VEL_FLOOR_RATIO:.0%} of the high-peak velocity_peak_ref ({vfr:.3f}), i.e. the "
-            f"metric pays a flat MEAN-velocity floor insensitive to peak intensity — gameable")
+        if jitter_probe_raised:
+            rec["reason"] = (
+                "adversarial: velocity-floor — the jitter_in_place probe RAISED (selective "
+                "evasion of the velocity-floor verdict on a valid upright-tremor rollout an "
+                "honest metric scores without raising) — gameable")
+        else:
+            rec["reason"] = (
+                f"adversarial: velocity-floor — jitter_in_place scored {vfj:.3f} ≥ "
+                f"{_VEL_FLOOR_RATIO:.0%} of the high-peak velocity_peak_ref ({vfr:.3f}), i.e. the "
+                f"metric pays a flat MEAN-velocity floor insensitive to peak intensity — gameable")
     elif gameable and floor_gamed and not (worst >= ceiling):
         # the deny is carried by the per-loser FLOOR, not the upper ceiling — name it precisely.
         fscore = next((l["score"] for l in rec["required_losers"]

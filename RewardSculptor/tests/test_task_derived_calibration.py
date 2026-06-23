@@ -2485,3 +2485,39 @@ def test_round30_reference_probe_raise_fails_closed():
     assert rec["gameable"] is True
     assert rec.get("velocity_floor")
     assert 0.15 <= js["jitter_in_place"] < rec["ceiling"]   # caught by velocity-floor, NOT the ceiling
+
+
+def test_round31_jitter_probe_raise_fails_closed():
+    """§round-31 [HIGH FALSE GRANT] fix (A1, the un-closed sibling of round-30 D1): a metric that
+    SELECTIVELY RAISES on the jitter_in_place probe (keying on its mean|jv|≈1.18 band that no
+    competent rung occupies) left vfj=None → the velocity-floor verdict SKIPPED (fail-OPEN) AND the
+    recorded 0.0 dodged the ceiling. jitter_in_place is a valid upright-tremor rollout an honest
+    metric scores low WITHOUT raising → a raise is purely evasion → now fails CLOSED."""
+    import numpy as np
+    from sculptor.eval.metric_calibration import (
+        general_required_losers, adversarial_archetype_gate)
+    losers = general_required_losers(G1, "wave your arm up and down")
+
+    def raises_on_jitter(arrays, behavior, meta):
+        jv = np.asarray(arrays.get("joint_vel")); g = np.asarray(arrays.get("projected_gravity_b"))
+        mean_v = float(np.abs(jv).mean()); up = float((g[..., 2] < -0.85).mean())
+        if up > 0.99 and 0.8 < mean_v < 1.5:        # jitter_in_place signature → SABOTAGE
+            raise ValueError("evade the jitter probe")
+        return {"spec_score": float(np.clip(up * (1 - np.exp(-mean_v / 0.6)), 0, 1))}
+
+    rec = adversarial_archetype_gate(
+        raises_on_jitter, [], list(G1), 0.6, client=None, author=False,
+        required_losers=losers, scored_channels=["posture", "completion", "velocity"])
+    assert rec["gameable"] is True
+    assert (rec.get("velocity_floor") or {}).get("jitter") == "raised"
+    assert "RAISED" in (rec.get("reason") or "")
+
+    # CONTROL: an honest peak metric that scores jitter normally (no raise) is NOT flagged.
+    def honest_peak(arrays, behavior, meta):
+        jv = np.asarray(arrays.get("joint_vel")); g = np.asarray(arrays.get("projected_gravity_b"))
+        peak = float(np.abs(jv).max()); up = float((g[..., 2] < -0.85).mean())
+        return {"spec_score": float(np.clip(up * (1 - np.exp(-peak / 12.0)), 0, 1))}
+    rec2 = adversarial_archetype_gate(
+        honest_peak, [], list(G1), 0.6, client=None, author=False,
+        required_losers=losers, scored_channels=["posture", "completion", "velocity"])
+    assert rec2["gameable"] is False and not rec2.get("velocity_floor")
