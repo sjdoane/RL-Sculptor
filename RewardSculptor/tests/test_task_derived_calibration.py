@@ -2357,3 +2357,35 @@ def compute_spec(arrays, behavior, meta):
         jn, "lie down on the ground and rest", terminal_down=True)}
     assert "collapse_and_stay_down" in kept                 # returns-up → KEEP
     assert "collapse_and_stay_down" not in dropped          # terminal → DROP (on-goal)
+
+
+def test_round28_jump_family_returns_up_keeps_collapse(tmp_path):
+    """§round-28 [HIGH FALSE GRANT] fix (D-B2): the round-27 ladder_td guard relies on
+    _goal_is_terminal_down, whose _RETURN_UP_TOKENS set missed the JUMP family — so a genuinely
+    returns-up goal phrased "collapse then jump" / "spring upward" / "explode into a jump" was
+    misclassified terminal_down=True, the guard did not fire, collapse_and_stay_down was dropped,
+    and a drop-to-floor-and-stay confound GRANTED on a mis-rendered descent ladder. _RETURN_UP is
+    now broadened with the jump/leap/ascend family (SAFE direction — only ever KEEPS the loser)."""
+    from sculptor.eval.metric_calibration import _goal_is_terminal_down
+    DROP_STAY = '''import numpy as np
+def compute_spec(arrays, behavior, meta):
+    g = arrays.get("projected_gravity_b"); jv = arrays.get("joint_vel")
+    if g is None or jv is None: return {"spec_score": 0.0}
+    gz = np.asarray(g)[..., 2]; v = np.abs(np.asarray(jv))
+    T = gz.shape[0]; last = slice(int(T*0.66), T)
+    down = float((gz[last] > -0.4).mean()); still = float(np.exp(-v[last].mean() / 0.5))
+    return {"spec_score": float(np.clip(down * still, 0, 1))}
+'''
+    descent = [_descent_ladder(), _descent_ladder(), _descent_ladder()]
+    for goal in ["collapse to the floor then spring upward",
+                 "lie down then explode into a jump",
+                 "collapse then jump",
+                 "squat down then leap as high as you can"]:
+        assert not _goal_is_terminal_down(goal), goal       # jump-family → NOT terminal
+        cal = calibrate_task_derived(_write(tmp_path, "ds.py", DROP_STAY),
+            goal, robot_hint="Unitree-G1", client=_FakeLadderClient(*descent))
+        names = {l["name"] for l in (cal["adversarial"] or {}).get("required_losers", [])}
+        assert "collapse_and_stay_down" in names, goal       # KEPT
+        assert cal["rho_min"] >= 0.5 and not cal["ok"], (goal, cal)   # firewall DENIES
+    # a genuine lie/rest goal (no jump verb) is still terminal → collapse dropped (on-goal):
+    assert _goal_is_terminal_down("lie down to rest")

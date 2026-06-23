@@ -688,8 +688,27 @@ _GENERAL_SCORED_CHANNELS = ("posture", "completion")
 _TERMINAL_DOWN_TOKENS = ("lie", "lay", "lying", "laying", "sleep", "rest",
                          "resting", "collapse", "prone", "supine")
 #: …unless the goal also says it returns/rises (then the down state is transient).
+#: §round-28 [HIGH FALSE GRANT] fix: a goal like "collapse then JUMP", "lie down then SPRING
+#: UPWARD", "rest low then BOUND off the ground" returns up via a JUMP-family verb that the
+#: minimal set missed (and "upward" tokenizes whole — NOT the standalone "up"), so
+#: _goal_is_terminal_down stayed True, the round-27 ladder_td guard did NOT fire, and a
+#: drop-to-floor-and-stay confound GRANTED on a blind-author-mis-rendered descent ladder.
+#: Broadening this list is the SAFE direction — a return-up token only ever flips terminal_down
+#: to False, which KEEPS collapse_and_stay_down (an observe-only false-reject at worst on a
+#: genuine lie/rest goal that happens to name a jump verb), NEVER drops a loser → never a
+#: false-grant. (Symmetric to the round-24 lesson that broadening the ACTIVE list is the safe
+#: direction for static_hold.) The durable robust fix remains goal-joint scoping.
 _RETURN_UP_TOKENS = ("up", "rise", "rises", "rising", "stand", "standing",
-                     "return", "returns", "back", "recover", "straighten", "tall")
+                     "return", "returns", "back", "recover", "straighten", "tall",
+                     # §round-28: the jump / leap / ascend family (a goal returning up via a
+                     # ballistic/rising verb, incl. the "up" compounds that tokenize whole):
+                     "jump", "jumps", "jumping", "leap", "leaps", "leaping", "spring",
+                     "springs", "springing", "hop", "hops", "hopping", "bound", "bounds",
+                     "bounding", "vault", "vaults", "vaulting", "explode", "explodes",
+                     "exploding", "launch", "launches", "launching", "soar", "soars",
+                     "soaring", "ascend", "ascends", "ascending", "climb", "climbs",
+                     "climbing", "lift", "lifts", "lifting", "upward", "upwards",
+                     "skyward", "airborne", "aloft", "overhead", "erect", "vertical")
 #: A goal whose competent behavior IS standing upright and still (balance / hold a
 #: stance) — for these `do_nothing_upright` (and the idle `jitter`) are ON-goal, so they
 #: must NOT be used as required-losers (they would false-deny a balance metric whose

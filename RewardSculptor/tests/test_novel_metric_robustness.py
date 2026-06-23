@@ -633,6 +633,21 @@ import pytest as _pytest
                              "def compute_spec(a,b,m2):\n    m.extras.ma.inspect.dis.io.FileIO('/tmp/x','w')\n    return {'spec_score':0.5}\n"),
     ("raise_systemexit", "def compute_spec(a,b,m):\n    raise SystemExit()\n    return {'spec_score':0.5}\n"),
     ("breakpoint_call", "def compute_spec(a,b,m):\n    breakpoint()\n    return {'spec_score':0.5}\n"),
+    # §round-28 (CRITICAL): a generator's gi_frame.f_builtins IS the live builtins dict; __import__
+    # is fetched as a dict SUBSCRIPT keyed by a chr()-assembled string (no dunder/underscore/format
+    # token the AST can see) → imports os → RCE. The frame/generator/coroutine/traceback
+    # introspection prefixes (gi_/cr_/ag_/f_/tb_) are now denied as attributes.
+    ("gen_frame_builtins_import", "def compute_spec(a,b,m):\n"
+                                  "    g = (i for i in range(1))\n"
+                                  "    fb = g.gi_frame.f_builtins\n"
+                                  "    imp = fb[chr(95)*2 + 'import' + chr(95)*2]\n"
+                                  "    imp('os').getcwd()\n    return {'spec_score':0.5}\n"),
+    ("gen_frame_globals", "def compute_spec(a,b,m):\n"
+                          "    g = (i for i in range(1))\n"
+                          "    x = g.gi_frame.f_globals\n    return {'spec_score':0.5}\n"),
+    ("frame_back_walk", "def compute_spec(a,b,m):\n"
+                        "    g = (i for i in range(1))\n"
+                        "    x = g.gi_frame.f_back\n    return {'spec_score':0.5}\n"),
 ])
 def test_ast_safety_blocks_escape_vectors(name, src):
     """Each round-9-reproduced sandbox-escape vector is REJECTED by the static gate."""
@@ -654,6 +669,19 @@ def compute_spec(arrays, behavior, meta):
                 "rom": rom, "ch_drop": drop}
     except Exception as ex:
         return {"spec_score": 0.0, "reason": f"exc:{type(ex).__name__}"}
+'''
+    assert _ast_safety(legit) == []
+
+
+def test_ast_safety_round28_allows_numpy_f_attrs():
+    """§round-28: the frame-introspection prefix deny (gi_/cr_/ag_/f_/tb_) must NOT false-reject
+    legitimate numpy attributes — none of `flags`/`flat`/`flatten`/`fill`/`real`/`T` match a
+    `<prefix>_` form (they are `fl…`/`re…`/single-letter, never `f_…`)."""
+    legit = '''import numpy as np
+def compute_spec(arrays, behavior, meta):
+    x = np.asarray(arrays.get("joint_vel"))
+    fl = x.flat; fg = x.flags; ft = x.flatten(); rl = x.real; tr = x.T
+    return {"spec_score": float(np.clip(np.abs(x).mean() / 3.0, 0.0, 1.0))}
 '''
     assert _ast_safety(legit) == []
 

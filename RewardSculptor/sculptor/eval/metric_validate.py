@@ -110,6 +110,21 @@ _FORBIDDEN_ATTRS = frozenset({
     "fork", "execv", "execve", "execvp", "fdopen", "getattr_static", "find_module",
     "import_module", "reload", "getsource", "getsourcefile", "getfile",
 })
+#: §round-28 SECURITY (CRITICAL): frame / generator / coroutine / traceback INTROSPECTION
+#: attribute prefixes. These reach a live execution frame's namespaces WITHOUT any dunder or
+#: single-underscore token, so the round-23/24 gates never saw them:
+#:   (i for i in ()).gi_frame.f_builtins["<assembled '__import__'>"]("os").system(...)
+#: `gi_frame` exposes the generator's frame; `f_builtins`/`f_globals`/`f_locals` ARE the live
+#: builtins/module dicts (every builtin incl. __import__/open/eval reachable as a dict subscript,
+#: which no AST string/name check can see); `f_back` walks to the CALLER's frame (the scorer's
+#: own globals). Generators (`gi_*`), coroutines (`cr_*`), async-gens (`ag_*`), frames (`f_*`),
+#: and tracebacks (`tb_*`) are the full set of objects carrying these. NONE is ever part of a
+#: physical-quantity numpy metric (numpy public attrs are `flags`/`flat`/`shape`/… — none match
+#: a `<prefix>_` form), so a PREFIX deny closes the whole family rather than enumerating leaves
+#: (which round-25 showed cannot be proven complete). The durable containment is still the
+#: restricted subprocess (curated `__builtins__`) — see the generated_metric module docstring;
+#: this attribute-graph denylist, like the numpy one, cannot be PROVEN complete.
+_FRAME_INTROSPECTION_PREFIXES = ("gi_", "cr_", "ag_", "f_", "tb_")
 #: Benign dunder ATTRIBUTES a metric may read. `type(e).__name__` — naming an
 #: exception class in a diagnostic — is the exact idiom the never-raise rule (a
 #: try/except wrapper) encourages, and the model emits it constantly; a name STRING
@@ -354,6 +369,13 @@ def _ast_safety(source: str) -> list[str]:
                 #   np._globals.enum.bltns.open(path,"w") → arbitrary file write
                 # Deny ALL single-underscore private attribute access — it closes the whole class.
                 problems.append(f"forbidden private attribute access: {node.attr}")
+            elif node.attr.startswith(_FRAME_INTROSPECTION_PREFIXES):
+                # §round-28 SECURITY (CRITICAL): a generator/frame introspection attribute
+                # (gi_frame.f_builtins) reaches the LIVE builtins dict, from which __import__ /
+                # open / eval are retrieved as a dict SUBSCRIPT keyed by a chr()-assembled string
+                # the AST can't see — no dunder, no single-underscore, no `format`. Deny the whole
+                # frame/generator/coroutine/traceback prefix family (never a physical metric attr).
+                problems.append(f"forbidden frame/generator introspection attribute: {node.attr}")
             elif node.attr in _FORBIDDEN_ATTRS or node.attr in _FORBIDDEN_NAMES:
                 # §round-23: also reject a forbidden NAME reached as an ATTRIBUTE (x.os / x.open /
                 # x.system) — _FORBIDDEN_NAMES was previously matched only on a bare ast.Name/import.
