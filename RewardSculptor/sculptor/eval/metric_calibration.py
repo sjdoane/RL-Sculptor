@@ -676,13 +676,27 @@ _RETURN_UP_TOKENS = ("up", "rise", "rises", "rising", "stand", "standing",
 #: misread. Bare "stand"/"hold" stay OUT (they appear in fold goals like "stand back up").
 _STATIC_HOLD_TOKENS = ("balance", "balanced", "balancing", "still", "motionless",
                        "stationary", "immobile", "upright", "stance", "equilibrium",
-                       "poise", "poised")
+                       "poise", "poised",
+                       # §round-22/23: common still-hold synonyms (each only grants when NO
+                       # active verb is present, since the active-verb veto is checked first).
+                       "freeze", "frozen", "rigid", "statue", "flamingo")
 #: balance/anti-fall PHRASES (substring match — single-leg contact the synthesizer can't
-#: render, or an explicit don't-fall objective).
+#: render, or an explicit don't-fall objective). §round-22/23: broadened to cut false-rejects
+#: of honest balance metrics on phrasings the token list missed (the SAFE direction only ever
+#: false-rejects → observe-only, never false-grants, so broadening positive balance cues is
+#: strictly accept-rate-improving as long as the active-verb veto still wins).
 _STATIC_HOLD_PHRASES = ("one leg", "one foot", "single leg", "single-leg", "one-legged",
                         "do not fall", "don't fall", "dont fall", "without falling",
                         "stay upright", "remain upright", "keep your balance",
-                        "keep balance", "hold a stance", "hold still")
+                        "keep balance", "hold a stance", "hold still",
+                        "flamingo pose", "center of mass", "stay on your feet",
+                        "fixed position", "t-pose", "keep your center", "hold a pose")
+#: §round-23: UNAMBIGUOUS still-hold phrases that OVERRIDE an incidental active verb — "freeze
+#: mid-stride and hold still" / "stand frozen with one arm lifted" IS a hold (the verb names the
+#: prior/held action). Kept SHORT + unambiguous so a "hold still THEN dash forward" sequence (a
+#: real active goal) is NOT captured by a too-greedy phrase.
+_STATIC_HOLD_OVERRIDE_PHRASES = ("hold still", "perfectly still", "stand frozen",
+                                 "freeze in place", "remain frozen")
 #: §round-15/16: an ACTIVE-motion or LOCOMOTION verb forces static_hold=False regardless of
 #: any stillness adverb — "give a steady wave" / "stay still then dash forward" are ACTIVE
 #: (the stillness is an incidental modifier, not the objective), so the posture losers must
@@ -724,12 +738,15 @@ def _goal_is_static_hold(behavior_goal: str) -> bool:
     requires POSITIVE balance evidence (a static-hold phrase or a balance-DOMINANT token —
     weak modifiers like "upright"/"stance"/"steady" are NOT sufficient alone, since they
     appear in active goals like "salute while staying upright")."""
+    g = (behavior_goal or "").lower()
+    # §round-23: an unambiguous still-hold phrase overrides an incidental active verb.
+    if any(p in g for p in _STATIC_HOLD_OVERRIDE_PHRASES):
+        return True
     if _goal_has_active_motion(behavior_goal):
         return False
-    g = (behavior_goal or "").lower()
-    toks = set(re.findall(r"[a-z]+", g))
     if any(p in g for p in _STATIC_HOLD_PHRASES):
         return True
+    toks = set(re.findall(r"[a-z]+", g))
     return bool(toks & set(_STATIC_HOLD_TOKENS))
 
 
@@ -1524,17 +1541,20 @@ def calibrate_task_derived(
                 crouched = sum(1 for L in valid_ladders if _ladder_has_crouched_rung(L))
                 if crouched * 2 > len(valid_ladders):
                     ladder_sh = False
-            # §round-21 [HIGH FALSE GRANT] / §round-22 [HIGH FALSE REJECT] fix: a blind author can
-            # emit a plausible postural-STABILITY ladder (rungs graded by uprightness, held-upright
-            # top) for an ACTIVE gesture goal ("wave your arm"); the top rung passes the per-rung
-            # static-hold test and dropped do_nothing with NO backstop → a posture/height confound
-            # granted (round-21 #6). Round-21 backstopped this by requiring a POSITIVE balance
-            # keyword, but that brittle list misses most balance phrasings ("hold a flamingo pose",
-            # "freeze in place") → it false-rejected honest balance metrics (round-22). The fix:
-            # the blind LADDER posture is authoritative (round-17); VETO it (keep do_nothing/jitter)
-            # ONLY when the goal NAMES an active-motion verb — present for the #6 gesture attack,
-            # absent for a genuine balance goal.
-            if ladder_sh and _goal_has_active_motion(behavior_goal):
+            # §round-21 [HIGH FALSE GRANT] / §round-22→23 fix: a blind author can emit a plausible
+            # postural-STABILITY ladder (rungs graded by uprightness, held-upright top) for an
+            # ACTIVE gesture goal ("salute", "wave your arm"); the top rung passes the per-rung
+            # static-hold test and dropping do_nothing then GRANTS a posture/height confound (#6).
+            # The keyword classifier is the ONLY goal-aware signal, and it is incomplete in BOTH
+            # directions: round-22 tried "VETO only on a positive active verb" → a gesture goal
+            # whose verb is off the list (salute/flap/wiggle/tap/…) false-GRANTED (round-23). So
+            # drop the posture losers ONLY on POSITIVE still-hold evidence (the SAFE direction: a
+            # miss false-REJECTS → observe-only, never a gate-weakening false-grant — mission
+            # invariant). The keyword lists are broadened (round-23) to recover accept rate; the
+            # DURABLE fix for the residual balance false-rejects is goal-joint scoping
+            # (REQUIRED_JOINT_ROLES), tracked as a separate increment. The round-20 crouched-rung
+            # suppression still independently guards a crouch/sit→stand transition.
+            if ladder_sh and not _goal_is_static_hold(behavior_goal):
                 ladder_sh = False
             if fam == "kick" and adversarial_required_losers:
                 # opt-in breadth: the DEDICATED kick losers (WITH foot_pos_b direction

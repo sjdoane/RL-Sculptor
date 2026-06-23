@@ -2061,3 +2061,60 @@ def compute_spec(arrays, behavior, meta):
     names = {l["name"] for l in (cal["adversarial"] or {}).get("required_losers", [])}
     assert "do_nothing_upright" in names                     # active verb → veto → kept
     assert not cal["ok"], cal
+
+
+# ── §round-23: SAFE-direction veto (drop do_nothing only on positive still-hold evidence) ──
+
+def _stability_ladder():
+    """A blind postural-stability ladder (uprightness-graded, nominal height) — the mismatched
+    ladder a confound exploits. A competent author would NOT emit this for an active gesture."""
+    return CompetenceLadder(competence_axis="postural stability", rungs=[
+        MotionSpec(uprightness=u, base_height_m=0.7) for u in (0.4, 0.7, 0.9, 1.0)])
+
+
+def test_round23_gesture_confound_denied_regardless_of_verb(tmp_path):
+    """§round-23 [HIGH FALSE GRANT] fix: the round-22 'veto only on a positive active verb' inversion
+    false-granted a posture confound for active gestures whose verb is off the keyword list (salute,
+    flap, wiggle, tap…). The SAFE direction drops do_nothing ONLY on positive still-hold evidence, so
+    a gesture goal keeps do_nothing and a pure posture confound is DENIED regardless of its verb."""
+    CONF = '''import numpy as np
+def compute_spec(arrays, behavior, meta):
+    g = np.asarray(arrays["projected_gravity_b"])
+    return {"spec_score": float(np.clip((g[..., 2] < -0.85).mean(), 0, 1))}
+'''
+    for i, goal in enumerate(["salute the flag", "flap your arms", "wiggle your hips",
+                              "tap a button overhead", "do calisthenics"]):
+        cal = calibrate_task_derived(_write(tmp_path, f"c{i}.py", CONF), goal,
+            robot_hint="Unitree-G1", client=_FakeLadderClient(_stability_ladder(), _stability_ladder(), _stability_ladder()))
+        names = {l["name"] for l in (cal["adversarial"] or {}).get("required_losers", [])}
+        assert "do_nothing_upright" in names, goal             # kept (no positive still-hold cue)
+        assert not cal["ok"], (goal, cal)                      # posture confound DENIED
+
+
+def test_round23_broadened_balance_phrasings_grant(tmp_path):
+    """§round-23: an honest balance metric GRANTS on common still-hold phrasings the keyword list
+    now covers (broadened), incl. a phrase that OVERRIDES an incidental active verb."""
+    BAL = '''import numpy as np
+def compute_spec(arrays, behavior, meta):
+    g = np.asarray(arrays["projected_gravity_b"])
+    return {"spec_score": float(np.mean(np.clip(-g[..., 2], 0, 1)))}
+'''
+    for i, goal in enumerate(["hold a flamingo pose", "freeze in place like a statue",
+                              "keep your center of mass over your feet", "stay on your feet",
+                              "freeze mid-stride and hold still", "stand frozen with one arm lifted"]):
+        cal = calibrate_task_derived(_write(tmp_path, f"b{i}.py", BAL), goal,
+            robot_hint="Unitree-G1", client=_FakeLadderClient(_stability_ladder(), _stability_ladder(), _stability_ladder()))
+        names = {l["name"] for l in (cal["adversarial"] or {}).get("required_losers", [])}
+        assert "do_nothing_upright" not in names, goal         # positive still-hold → dropped
+        assert cal["ok"], (goal, cal)
+
+
+def test_round23_static_hold_phrase_overrides_incidental_active_verb():
+    """§round-23 unit: an unambiguous still-hold phrase ('hold still', 'stand frozen') overrides an
+    incidental active verb; a 'hold still THEN dash' sequence stays ACTIVE (not over-captured)."""
+    from sculptor.eval.metric_calibration import _goal_is_static_hold
+    assert _goal_is_static_hold("freeze mid-stride and hold still")
+    assert _goal_is_static_hold("stand frozen with one arm lifted")
+    assert not _goal_is_static_hold("wave your arm")
+    assert not _goal_is_static_hold("stay still then dash forward")   # active sequence
+    assert not _goal_is_static_hold("walk forward staying upright")

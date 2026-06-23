@@ -305,7 +305,18 @@ def _ast_safety(source: str) -> list[str]:
         elif isinstance(node, ast.Attribute):
             if node.attr.startswith("__") and node.attr not in _ALLOWED_DUNDER_ATTRS:
                 problems.append(f"dunder attribute access: {node.attr}")
-            elif node.attr in _FORBIDDEN_ATTRS:
+            elif node.attr.startswith("_") and not node.attr.startswith("__"):
+                # §round-23 SECURITY (CRITICAL): a single-underscore "private/internal" attribute
+                # is never part of the numpy public API a physical-quantity metric uses, but numpy
+                # RE-EXPORTS os / builtins / importlib through internal modules reachable as
+                # NON-dunder attribute chains the public-name and forbidden-attr checks never see:
+                #   np._pytesttester.os.system("…")      → arbitrary shell (RCE)
+                #   np._globals.enum.bltns.open(path,"w") → arbitrary file write
+                # Deny ALL single-underscore private attribute access — it closes the whole class.
+                problems.append(f"forbidden private attribute access: {node.attr}")
+            elif node.attr in _FORBIDDEN_ATTRS or node.attr in _FORBIDDEN_NAMES:
+                # §round-23: also reject a forbidden NAME reached as an ATTRIBUTE (x.os / x.open /
+                # x.system) — _FORBIDDEN_NAMES was previously matched only on a bare ast.Name/import.
                 problems.append(f"forbidden attribute (IO/native/reflection): {node.attr}")
             elif node.attr in ("format", "format_map"):
                 # §round-19 SECURITY: str.format/format_map is the reflection PRIMITIVE

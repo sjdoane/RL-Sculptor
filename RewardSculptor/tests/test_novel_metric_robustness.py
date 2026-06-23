@@ -605,6 +605,17 @@ import pytest as _pytest
                           "    d = chr(95) * 2\n"
                           "    fld = '{0.' + d + 'globals' + d + '[a]}'\n"
                           "    s = fld.format(compute_spec)\n    return {'spec_score':0.5}\n"),
+    # §round-23: numpy re-exports os/builtins through single-underscore internal modules reached
+    # as NON-dunder attribute chains (np._pytesttester.os.system = RCE; np._globals.enum.bltns.open
+    # = arbitrary write) — the public-name/forbidden-attr checks never saw them.
+    ("np_internal_os_system", "import numpy as np\n"
+                              "np._pytesttester.os.system('echo x')\n"
+                              "def compute_spec(a,b,m):\n    return {'spec_score':0.5}\n"),
+    ("np_internal_builtins_open", "import numpy as np\n"
+                                  "np._globals.enum.bltns.open('/tmp/x','w')\n"
+                                  "def compute_spec(a,b,m):\n    return {'spec_score':0.5}\n"),
+    ("forbidden_name_as_attr", "import numpy as np\n"
+                               "def compute_spec(a,b,m):\n    x = np.lib.os\n    return {'spec_score':0.5}\n"),
     ("breakpoint_call", "def compute_spec(a,b,m):\n    breakpoint()\n    return {'spec_score':0.5}\n"),
 ])
 def test_ast_safety_blocks_escape_vectors(name, src):
