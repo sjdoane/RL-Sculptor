@@ -648,6 +648,14 @@ import pytest as _pytest
     ("frame_back_walk", "def compute_spec(a,b,m):\n"
                         "    g = (i for i in range(1))\n"
                         "    x = g.gi_frame.f_back\n    return {'spec_score':0.5}\n"),
+    # §round-29 (CRITICAL): numpy CYTHON callables expose the Py2 aliases func_globals (the
+    # module-globals namespace whose builtins reach __import__) and func_code (rebuild a callable
+    # via code.replace + FunctionType to resolve the import at C level). `func_` does NOT start
+    # with `f_`, so the round-28 prefix list missed it; the `func_` prefix is now denied too.
+    ("cython_func_globals", "import numpy as np\ndef compute_spec(a,b,m):\n"
+                            "    fg = np.random.seed.func_globals\n    return {'spec_score':0.5}\n"),
+    ("cython_func_code", "import numpy as np\ndef compute_spec(a,b,m):\n"
+                         "    fc = np.random.seed.func_code\n    return {'spec_score':0.5}\n"),
 ])
 def test_ast_safety_blocks_escape_vectors(name, src):
     """Each round-9-reproduced sandbox-escape vector is REJECTED by the static gate."""

@@ -124,7 +124,15 @@ _FORBIDDEN_ATTRS = frozenset({
 #: (which round-25 showed cannot be proven complete). The durable containment is still the
 #: restricted subprocess (curated `__builtins__`) — see the generated_metric module docstring;
 #: this attribute-graph denylist, like the numpy one, cannot be PROVEN complete.
-_FRAME_INTROSPECTION_PREFIXES = ("gi_", "cr_", "ag_", "f_", "tb_")
+#: §round-29 SECURITY (CRITICAL): numpy's CYTHON callables (e.g. np.random.seed) expose the
+#: Python-2-era function aliases `func_globals` / `func_code` / `func_defaults` / `func_closure`
+#: — `func_globals` IS the module-globals namespace (its `__builtins__` reaches `__import__`), and
+#: `func_code` + `types.FunctionType`/`code.replace` rebuilds a callable that resolves the import at
+#: the C level with NO python-visible dunder attribute. `func_` does NOT start with `f_` (the 2nd
+#: char is `u`, not `_`), so the round-28 prefix list missed it. No public numpy attribute begins
+#: with `func_`, so the prefix deny is non-colliding. (A plain python function uses the dunder
+#: `__code__`/`__globals__`, already blocked; only cython callables carry the bare `func_` aliases.)
+_FRAME_INTROSPECTION_PREFIXES = ("gi_", "cr_", "ag_", "f_", "tb_", "func_")
 #: Benign dunder ATTRIBUTES a metric may read. `type(e).__name__` — naming an
 #: exception class in a diagnostic — is the exact idiom the never-raise rule (a
 #: try/except wrapper) encourages, and the model emits it constantly; a name STRING

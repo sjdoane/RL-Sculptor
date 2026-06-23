@@ -708,7 +708,20 @@ _RETURN_UP_TOKENS = ("up", "rise", "rises", "rising", "stand", "standing",
                      "exploding", "launch", "launches", "launching", "soar", "soars",
                      "soaring", "ascend", "ascends", "ascending", "climb", "climbs",
                      "climbing", "lift", "lifts", "lifting", "upward", "upwards",
-                     "skyward", "airborne", "aloft", "overhead", "erect", "vertical")
+                     "skyward", "airborne", "aloft", "overhead", "erect", "vertical",
+                     # §round-29: the return-to-feet / RIGHTING family (a goal that ends by
+                     # getting back UP off the floor via a non-ballistic righting verb the
+                     # round-28 jump family missed: "rebound to your feet", "heave yourself off
+                     # the ground", "scramble to your feet", "kip onto your feet", "peel yourself
+                     # off the floor", "raise your body off the floor"). Still the SAFE direction
+                     # (only ever KEEPS collapse_and_stay_down). Deliberately NOT generic verbs
+                     # (come/get/move) that appear in genuine terminal goals like "come to rest".
+                     "rebound", "rebounds", "rebounding", "raise", "raises", "raising",
+                     "heave", "heaves", "heaving", "scramble", "scrambles", "scrambling",
+                     "kip", "kips", "kipping", "peel", "peels", "peeling", "righting",
+                     "arise", "arises", "arising", "clamber", "clambers", "clambering",
+                     "unfold", "unfolds", "unfolding", "elevate", "elevates", "elevating",
+                     "feet", "upturn", "upend")
 #: A goal whose competent behavior IS standing upright and still (balance / hold a
 #: stance) — for these `do_nothing_upright` (and the idle `jitter`) are ON-goal, so they
 #: must NOT be used as required-losers (they would false-deny a balance metric whose

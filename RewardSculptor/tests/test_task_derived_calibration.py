@@ -2389,3 +2389,36 @@ def compute_spec(arrays, behavior, meta):
         assert cal["rho_min"] >= 0.5 and not cal["ok"], (goal, cal)   # firewall DENIES
     # a genuine lie/rest goal (no jump verb) is still terminal → collapse dropped (on-goal):
     assert _goal_is_terminal_down("lie down to rest")
+
+
+def test_round29_return_to_feet_family_keeps_collapse(tmp_path):
+    """§round-29 [HIGH FALSE GRANT] fix (A2): a NEW returns-up verb family the round-28 jump
+    broadening missed — the RIGHTING / return-to-feet verbs (rebound/raise-body/heave/scramble/
+    kip/peel). A "collapse then rebound to your feet" goal was misclassified terminal_down=True,
+    dropping collapse_and_stay_down and granting a drop-to-floor-and-stay confound. _RETURN_UP is
+    broadened with the righting family (SAFE direction). Genuine lie/rest goals stay terminal."""
+    from sculptor.eval.metric_calibration import _goal_is_terminal_down
+    DROP_STAY = '''import numpy as np
+def compute_spec(arrays, behavior, meta):
+    g = arrays.get("projected_gravity_b"); jv = arrays.get("joint_vel")
+    if g is None or jv is None: return {"spec_score": 0.0}
+    gz = np.asarray(g)[..., 2]; v = np.abs(np.asarray(jv))
+    T = gz.shape[0]; last = slice(int(T*0.66), T)
+    down = float((gz[last] > -0.4).mean()); still = float(np.exp(-v[last].mean() / 0.5))
+    return {"spec_score": float(np.clip(down * still, 0, 1))}
+'''
+    descent = [_descent_ladder(), _descent_ladder(), _descent_ladder()]
+    for goal in ["collapse to the floor then rebound to your feet",
+                 "lie supine then heave yourself off the ground",
+                 "rest on the mat then scramble to your feet",
+                 "lie down then kip onto your feet",
+                 "lie flat then peel yourself off the floor"]:
+        assert not _goal_is_terminal_down(goal), goal
+        cal = calibrate_task_derived(_write(tmp_path, "ds.py", DROP_STAY),
+            goal, robot_hint="Unitree-G1", client=_FakeLadderClient(*descent))
+        names = {l["name"] for l in (cal["adversarial"] or {}).get("required_losers", [])}
+        assert "collapse_and_stay_down" in names, goal
+        assert cal["rho_min"] >= 0.5 and not cal["ok"], (goal, cal)
+    # genuine terminal goals (incl. "come to rest" — "come" deliberately NOT a return-up token):
+    for term in ["lie down to rest", "come to rest on the floor", "lie still and rest"]:
+        assert _goal_is_terminal_down(term), term
