@@ -691,12 +691,6 @@ _STATIC_HOLD_PHRASES = ("one leg", "one foot", "single leg", "single-leg", "one-
                         "keep balance", "hold a stance", "hold still",
                         "flamingo pose", "center of mass", "stay on your feet",
                         "fixed position", "t-pose", "keep your center", "hold a pose")
-#: §round-23: UNAMBIGUOUS still-hold phrases that OVERRIDE an incidental active verb — "freeze
-#: mid-stride and hold still" / "stand frozen with one arm lifted" IS a hold (the verb names the
-#: prior/held action). Kept SHORT + unambiguous so a "hold still THEN dash forward" sequence (a
-#: real active goal) is NOT captured by a too-greedy phrase.
-_STATIC_HOLD_OVERRIDE_PHRASES = ("hold still", "perfectly still", "stand frozen",
-                                 "freeze in place", "remain frozen")
 #: §round-15/16: an ACTIVE-motion or LOCOMOTION verb forces static_hold=False regardless of
 #: any stillness adverb — "give a steady wave" / "stay still then dash forward" are ACTIVE
 #: (the stillness is an incidental modifier, not the objective), so the posture losers must
@@ -738,12 +732,15 @@ def _goal_is_static_hold(behavior_goal: str) -> bool:
     requires POSITIVE balance evidence (a static-hold phrase or a balance-DOMINANT token —
     weak modifiers like "upright"/"stance"/"steady" are NOT sufficient alone, since they
     appear in active goals like "salute while staying upright")."""
-    g = (behavior_goal or "").lower()
-    # §round-23: an unambiguous still-hold phrase overrides an incidental active verb.
-    if any(p in g for p in _STATIC_HOLD_OVERRIDE_PHRASES):
-        return True
+    # §round-23: an ACTIVE-motion verb is checked FIRST (BIAS toward False = the safe direction).
+    # An earlier "override phrase" idea (let 'hold still' beat an incidental active verb) was
+    # REMOVED — it mis-classified an active SEQUENCE ('hold still THEN dash forward') as a hold,
+    # which dropped do_nothing and re-opened a posture false-grant on a mismatched ladder. The
+    # cost is that a still-hold goal which incidentally names a motion verb ('freeze mid-stride
+    # and hold still') is observe-only — the SAFE direction (a false-reject, never a false-grant).
     if _goal_has_active_motion(behavior_goal):
         return False
+    g = (behavior_goal or "").lower()
     if any(p in g for p in _STATIC_HOLD_PHRASES):
         return True
     toks = set(re.findall(r"[a-z]+", g))

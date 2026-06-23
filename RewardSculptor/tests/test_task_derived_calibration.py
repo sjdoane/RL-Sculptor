@@ -2092,8 +2092,8 @@ def compute_spec(arrays, behavior, meta):
 
 
 def test_round23_broadened_balance_phrasings_grant(tmp_path):
-    """§round-23: an honest balance metric GRANTS on common still-hold phrasings the keyword list
-    now covers (broadened), incl. a phrase that OVERRIDES an incidental active verb."""
+    """§round-23: an honest balance metric GRANTS on common still-hold phrasings the broadened
+    keyword list now covers (none contain an active verb → the SAFE-direction veto drops do_nothing)."""
     BAL = '''import numpy as np
 def compute_spec(arrays, behavior, meta):
     g = np.asarray(arrays["projected_gravity_b"])
@@ -2101,7 +2101,7 @@ def compute_spec(arrays, behavior, meta):
 '''
     for i, goal in enumerate(["hold a flamingo pose", "freeze in place like a statue",
                               "keep your center of mass over your feet", "stay on your feet",
-                              "freeze mid-stride and hold still", "stand frozen with one arm lifted"]):
+                              "stand perfectly still", "hold a fixed position"]):
         cal = calibrate_task_derived(_write(tmp_path, f"b{i}.py", BAL), goal,
             robot_hint="Unitree-G1", client=_FakeLadderClient(_stability_ladder(), _stability_ladder(), _stability_ladder()))
         names = {l["name"] for l in (cal["adversarial"] or {}).get("required_losers", [])}
@@ -2109,12 +2109,15 @@ def compute_spec(arrays, behavior, meta):
         assert cal["ok"], (goal, cal)
 
 
-def test_round23_static_hold_phrase_overrides_incidental_active_verb():
-    """§round-23 unit: an unambiguous still-hold phrase ('hold still', 'stand frozen') overrides an
-    incidental active verb; a 'hold still THEN dash' sequence stays ACTIVE (not over-captured)."""
+def test_round23_active_verb_wins_safe_direction():
+    """§round-23 unit: an ACTIVE-motion verb forces NOT-static-hold (the SAFE direction). The
+    'override phrase' idea was removed — a still-hold goal that incidentally names a motion verb
+    ('freeze mid-stride and hold still') is observe-only (a false-reject), never a false-grant, and
+    an active SEQUENCE ('hold still then dash forward') correctly stays active."""
     from sculptor.eval.metric_calibration import _goal_is_static_hold
-    assert _goal_is_static_hold("freeze mid-stride and hold still")
-    assert _goal_is_static_hold("stand frozen with one arm lifted")
+    assert _goal_is_static_hold("hold a flamingo pose")
+    assert _goal_is_static_hold("stand perfectly still")
     assert not _goal_is_static_hold("wave your arm")
-    assert not _goal_is_static_hold("stay still then dash forward")   # active sequence
-    assert not _goal_is_static_hold("walk forward staying upright")
+    assert not _goal_is_static_hold("hold still then dash forward")    # active sequence → NOT static
+    assert not _goal_is_static_hold("stay still then dash forward")
+    assert not _goal_is_static_hold("freeze mid-stride and hold still")  # incidental verb → observe-only (safe)
