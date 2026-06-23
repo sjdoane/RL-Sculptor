@@ -1403,11 +1403,12 @@ def test_round15_loser_set_never_empty_and_off_goal_per_class():
     cases = {
         "touch your toes then stand back up": {"do_nothing_upright", "jitter_in_place", "collapse_and_stay_down"},
         "balance on one leg":                 {"collapse_and_stay_down"},                       # still-upright is on-goal
-        # §round-19 fix B: a terminal-down goal drops collapse_and_stay_down (on-goal) but adds
-        # collapse_and_thrash (a low-posture-WITH-motion stillness probe) — so the stillness
-        # channel is covered at the low posture (a low-height-only proxy is no longer free).
-        "lie down to rest":                   {"do_nothing_upright", "jitter_in_place", "collapse_and_thrash"},
-        "lie still and rest":                 {"do_nothing_upright", "jitter_in_place", "collapse_and_thrash"},
+        # §round-19/21 fix: a terminal-down goal drops collapse_and_stay_down (on-goal) but adds
+        # TWO thrashing probes — collapse_and_thrash (constant-low, stillness channel) and
+        # descend_and_thrash (pelvis ramp, descent channel) — so a low-only OR a descent-only
+        # proxy at the low posture is no longer free, without false-rejecting an honest still-low.
+        "lie down to rest":                   {"do_nothing_upright", "jitter_in_place", "collapse_and_thrash", "descend_and_thrash"},
+        "lie still and rest":                 {"do_nothing_upright", "jitter_in_place", "collapse_and_thrash", "descend_and_thrash"},
     }
     for goal, expect in cases.items():
         names = {l["name"] for l in general_required_losers(G1, goal)}
@@ -1884,5 +1885,122 @@ def compute_spec(arrays, behavior, meta):
         "duck down into a low crouch and hold it low", robot_hint="Unitree-G1",
         client=_FakeLadderClient(duck_ladder(), duck_ladder(), duck_ladder()))
     names = {l["name"] for l in (cal["adversarial"] or {}).get("required_losers", [])}
-    assert "collapse_and_stay_down" in names             # active-low keeps the descent catcher
+    # §round-21: a duck holds a bent-leg posture (a zero-velocity hold offset → not dynamic
+    # motion), so it classifies terminal-down; the descend_and_thrash ramp probes the descent
+    # channel and catches a descent-magnitude confound.
+    assert "descend_and_thrash" in names
     assert not cal["ok"], cal                            # descent confound DENIED
+
+
+# ── §round-21: per-loser idle floor, AND-gated static_hold, two-probe terminal-down ──
+
+def test_round21_floor_confound_denied_pure_idle_floor(tmp_path):
+    """§round-21 [HIGH FALSE GRANT] fix: an additive uprightness-gated FLOOR confound
+    (up·(FLOOR + (1-FLOOR)·goal)) pays do_nothing_upright the FLOOR (up to 49%), under the 0.5
+    ceiling, so it used to GRANT. do_nothing_upright now carries a strict per-loser floor — paying
+    the pure-idle anchor any non-trivial credit is gameable. An honest multiplicative fold metric
+    scores do_nothing 0 and GRANTS."""
+    def fold_d():
+        return CompetenceLadder(competence_axis="toe-touch depth", rungs=[
+            MotionSpec(uprightness=1.0, base_height_m=0.7, fold_depth_m=d) for d in (0.0, 0.15, 0.3, 0.45, 0.6)])
+    FLOOR = '''import numpy as np
+def compute_spec(arrays, behavior, meta):
+    root = np.asarray(arrays["root_link_pos_w"]); g = np.asarray(arrays["projected_gravity_b"])
+    up = float((g[..., 2] < -0.85).mean()); z = root[..., 2].mean(1)
+    dip = float(np.clip((z[:5].mean() - z.min()) / 0.6, 0, 1))
+    return {"spec_score": float(np.clip(up * (0.49 + 0.51 * dip), 0, 1))}
+'''
+    HONEST = '''import numpy as np
+def compute_spec(arrays, behavior, meta):
+    root = np.asarray(arrays["root_link_pos_w"]); g = np.asarray(arrays["projected_gravity_b"]); z = root[..., 2].mean(1)
+    dip = float(np.clip((z[:5].mean() - z.min()) / 0.6, 0, 1)); ret = float(np.clip(1 - abs(z[-1] - z[0]) / 0.2, 0, 1))
+    up = float((g[..., 2] < -0.85).mean())
+    return {"spec_score": float(np.clip(dip * ret * up, 0, 1))}
+'''
+    cal_bad = calibrate_task_derived(_write(tmp_path, "floor.py", FLOOR),
+        "bend down and touch your toes", robot_hint="Unitree-G1",
+        client=_FakeLadderClient(fold_d(), fold_d(), fold_d()))
+    assert not cal_bad["ok"], cal_bad
+    assert cal_bad["adversarial"]["worst_name"] == "do_nothing_upright"
+    cal_ok = calibrate_task_derived(_write(tmp_path, "fold.py", HONEST),
+        "bend down and touch your toes", robot_hint="Unitree-G1",
+        client=_FakeLadderClient(fold_d(), fold_d(), fold_d()))
+    assert cal_ok["ok"], cal_ok
+
+
+def test_round21_active_gesture_posture_confound_denied(tmp_path):
+    """§round-21 [HIGH FALSE GRANT] fix: a postural-stability ladder for an ACTIVE gesture goal
+    made the per-rung static_hold drop do_nothing. static_hold is now AND-gated with the goal-text
+    classifier ('wave your arm' is NOT a static hold), so do_nothing is KEPT and a posture/height
+    confound is DENIED."""
+    def postural():
+        return CompetenceLadder(competence_axis="postural stability", rungs=[
+            MotionSpec(uprightness=u, base_height_m=0.7) for u in (0.3, 0.6, 0.85, 1.0)])
+    CONF = '''import numpy as np
+def compute_spec(arrays, behavior, meta):
+    g = np.asarray(arrays["projected_gravity_b"]); root = np.asarray(arrays["root_link_pos_w"])
+    up = float((g[..., 2] < -0.85).mean()); tall = float(np.clip((root[..., 2].mean() - 0.55) / 0.15, 0, 1))
+    return {"spec_score": float(np.clip(up * tall, 0, 1))}
+'''
+    cal = calibrate_task_derived(_write(tmp_path, "conf.py", CONF),
+        "wave your right arm", robot_hint="Unitree-G1",
+        client=_FakeLadderClient(postural(), postural(), postural()))
+    names = {l["name"] for l in (cal["adversarial"] or {}).get("required_losers", [])}
+    assert "do_nothing_upright" in names                 # AND-gate kept it (active goal)
+    assert not cal["ok"], cal
+
+
+def test_round21_balance_low_fall_rung_not_false_rejected(tmp_path):
+    """§round-21 [HIGH FALSE REJECT] fix: a blind balance author renders the FALL failure rung as a
+    pelvis DROP (low base_height AND low uprightness). _ladder_has_crouched_rung now requires the
+    low rung to ALSO be UPRIGHT to count as a crouch target, so the balance metric is not denied."""
+    def bal_fall(fbh):
+        return CompetenceLadder(competence_axis="upright balance", rungs=[
+            MotionSpec(uprightness=0.4, base_height_m=fbh), MotionSpec(uprightness=0.7, base_height_m=0.7),
+            MotionSpec(uprightness=0.9, base_height_m=0.7), MotionSpec(uprightness=1.0, base_height_m=0.7)])
+    BAL = '''import numpy as np
+def compute_spec(arrays, behavior, meta):
+    g = np.asarray(arrays["projected_gravity_b"]); jv = np.asarray(arrays["joint_vel"])
+    return {"spec_score": float(np.mean(np.clip(-g[..., 2], 0, 1)) * np.exp(-np.abs(jv).mean() / 0.5))}
+'''
+    for fbh in (0.45, 0.30):
+        cal = calibrate_task_derived(_write(tmp_path, f"bal{int(fbh*100)}.py", BAL),
+            "balance on one leg without falling over", robot_hint="Unitree-G1",
+            client=_FakeLadderClient(bal_fall(fbh), bal_fall(fbh), bal_fall(fbh)))
+        assert cal["ok"], (fbh, cal)
+
+
+def test_round21_settled_limb_lie_down_not_false_rejected(tmp_path):
+    """§round-21 [FALSE REJECT] fix: a lie-down ladder whose top rung holds a settled limb (a
+    zero-velocity hold offset) must still classify terminal-down — a held static offset is a
+    POSTURE, not motion (dynamic_only=True). An honest descend-and-rest metric GRANTS."""
+    def settled():
+        return CompetenceLadder(competence_axis="descend and rest", rungs=[
+            MotionSpec(uprightness=1.0, base_height_m=0.7), MotionSpec(uprightness=0.6, base_height_m=0.45),
+            MotionSpec(uprightness=0.2, base_height_m=0.25),
+            MotionSpec(uprightness=0.0, base_height_m=0.12,
+                       groups=[Group(name="arm", mode="hold", offset_rad=0.02,
+                                     role_query=RoleQuery(segments=["shoulder"], axes=["pitch", None]))])])
+    HONEST = '''import numpy as np
+def compute_spec(arrays, behavior, meta):
+    z = float(np.asarray(arrays["root_link_pos_w"])[..., 2].mean()); jv = np.asarray(arrays["joint_vel"])
+    return {"spec_score": float(np.clip((1 - z / 0.7) * np.exp(-np.abs(jv).mean() / 0.3), 0, 1))}
+'''
+    cal = calibrate_task_derived(_write(tmp_path, "rest.py", HONEST),
+        "lie down on the floor and rest", robot_hint="Unitree-G1",
+        client=_FakeLadderClient(settled(), settled(), settled()))
+    names = {l["name"] for l in (cal["adversarial"] or {}).get("required_losers", [])}
+    assert "collapse_and_thrash" in names                # terminal-down (hold offset ignored)
+    assert cal["ok"], cal
+
+
+def test_round21_no_competence_anchor_is_inconclusive():
+    """§round-21 [LOW] fix: competent_ref ≤ 0 has no usable anchor, so the gate is INCONCLUSIVE
+    (not auto-flagged gameable with worst_name=None as the 0-ceiling bug did)."""
+    from sculptor.eval.metric_calibration import adversarial_archetype_gate, general_required_losers
+    losers = general_required_losers(G1, "wave your right arm")
+    rec = adversarial_archetype_gate(lambda a, b, m: {"spec_score": 0.0}, [], G1,
+                                     competent_ref=0.0, client=None,
+                                     required_losers=losers, author=False)
+    assert not rec["gameable"]                            # NOT a deny
+    assert "inconclusive" in rec["reason"]

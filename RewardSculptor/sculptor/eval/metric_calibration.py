@@ -426,6 +426,12 @@ def _author_ladder(client: Any, model: str, payload: dict) -> Any:
 _ADV_REL_CEIL = 0.6      # gaming must score below 0.6 × the competent reference
 _ADV_ABS_CEIL = 0.5      # AND below 0.5 absolute (no gaming may look half-competent)
 _ADV_N = 3               # archetypes the blind author proposes
+#: §round-21: a STRICT per-loser FLOOR (fraction of competence) for the pure-idle probes
+#: (do_nothing_upright) that perform NONE of the goal. The upper ceiling (≈0.5) left an open
+#: [0,0.5) band an additive uprightness-gated floor could farm; a probe that does literally
+#: nothing must score NEAR ZERO. Only attached to losers that carry a `max_frac` key — the
+#: motion-bearing probes (jitter) keep the ceiling so an honest velocity goal isn't denied.
+_LOSER_FLOOR_FRAC = 0.15
 
 
 def _gameable_score(s: float) -> float:
@@ -752,14 +758,17 @@ def _scalar_start(v: Any) -> float:
         return 0.0
 
 
-def _spec_has_commanded_motion(spec: Any) -> bool:
+def _spec_has_commanded_motion(spec: Any, *, dynamic_only: bool = False) -> bool:
     """True iff the spec commands joint/whole-body MOTION — a pelvis fold, a tremor/noise
     whole-body channel, travel/hops, OR any group with a real amplitude/peak/burst (an
-    oscillate/burst) or a held distinctive posture (a 'hold' offset). Posture alone
-    (uprightness + base_height) is NOT motion. §round-18 thresholds; §round-20: extracted so
-    BOTH static-hold AND terminal-down classification read the SAME motion channels (the
-    terminal-down detector ignored motion → a writhe/duck low-posture-WITH-motion top was
-    mis-read as a still lie/rest)."""
+    oscillate/burst). With `dynamic_only=False` (default) a held distinctive posture (a 'hold'
+    group offset, e.g. a raised arm) ALSO counts — a salute hold is NOT do_nothing, so
+    static-hold must treat it as active and KEEP do_nothing. With `dynamic_only=True` a
+    standalone hold offset does NOT count (it renders with ZERO joint velocity → a settled
+    static posture, not motion) — terminal-down uses this so a lie-down with a settled limb
+    (or an active duck holding a bent-leg posture) is not mis-flipped to active by a
+    zero-velocity offset (§round-21: that false-rejected an honest descend-and-rest metric).
+    Posture alone (uprightness + base_height) is NEVER motion. §round-18 thresholds."""
     try:
         if abs(float(getattr(spec, "fold_depth_m", 0.0) or 0.0)) > 0.05:
             return True
@@ -778,7 +787,9 @@ def _spec_has_commanded_motion(spec: Any) -> bool:
             peak = abs(float(getattr(gr, "peak_radps", 0.0) or 0.0))
             burst = int(getattr(gr, "burst_count", 0) or 0)
             off = abs(float(getattr(gr, "offset_rad", 0.0) or 0.0))
-            if amp > 1e-3 or peak > 1e-3 or burst > 0 or off > 1e-2:
+            if amp > 1e-3 or peak > 1e-3 or burst > 0:
+                return True
+            if off > 1e-2 and not dynamic_only:   # a held offset = a distinctive POSTURE
                 return True
         return False
     except Exception:  # noqa: BLE001 — unparseable spec → assume motion (the safe direction:
@@ -812,15 +823,21 @@ def _spec_is_static_hold(spec: Any) -> bool:
 
 
 def _ladder_has_crouched_rung(rungs: Any) -> bool:
-    """§round-20: True iff any authored rung sits at a LOW base_height (<0.55). A crouch/
-    sit→stand TRANSITION ladder has a held-standing TOP rung (which passes the per-rung
-    static-hold test) but low/crouched LOWER rungs — its goal is to RISE, so do_nothing
-    (already standing, never rose) is OFF-goal and must be KEPT. A genuine balance/hold ladder
-    keeps EVERY rung at nominal height (failures are low-uprightness, not low-height)."""
+    """§round-20: True iff any authored rung is a held LOW-but-UPRIGHT posture (a crouch/squat
+    TARGET). A crouch/sit→stand TRANSITION ladder has a held-standing TOP rung (which passes the
+    per-rung static-hold test) but low/crouched LOWER rungs — its goal is to RISE, so do_nothing
+    (already standing, never rose) is OFF-goal and must be KEPT.
+
+    §round-21: a low rung is only a crouch TARGET when it is ALSO UPRIGHT (torso vertical). A
+    blind balance author naturally renders a FALL/stumble failure rung as a pelvis DROP — low
+    base_height AND low uprightness — which is NOT a crouch target, just the bottom of a balance
+    ladder. Counting it suppressed static_hold and false-rejected an honest balance metric, so
+    require uprightness ≥ 0.7 before treating a low rung as a crouch."""
     try:
         for r in (rungs or []):
             bh = getattr(r, "base_height_m", 0.7)
-            if min(_scalar_start(bh), _scalar_end(bh)) < 0.55:
+            if (min(_scalar_start(bh), _scalar_end(bh)) < 0.55
+                    and _scalar_end(getattr(r, "uprightness", 1.0)) >= 0.7):
                 return True
     except Exception:  # noqa: BLE001
         return False
@@ -844,13 +861,15 @@ def _spec_is_terminal_down(spec: Any) -> bool:
         # clearly non-upright (lying/fallen, any height) OR near-floor AND not-upright
         # (a low collapsed heap). An upright squat (up high, bh low) is NEITHER.
         down = (up <= 0.3) or (bh <= 0.35 and up <= 0.5)
-        # §round-20: a genuine lie/REST end-state is STILL. A low posture WITH commanded motion
-        # (writhe/thrash/roll/worm, or an active duck holding a bent-leg posture) is an ACTIVE
-        # low goal, NOT lie/rest — collapse_and_stay_down must stay (it catches a low/descent
-        # confound and an honest moving-low metric scores it ~0), and collapse_and_thrash must
-        # NOT be injected (it IS the on-goal end-state of a writhe → false-reject). The sibling
-        # _spec_is_static_hold already reads motion; terminal-down did not.
-        return down and not _spec_has_commanded_motion(spec)
+        # §round-20: a genuine lie/REST end-state is STILL. A low posture WITH DYNAMIC motion
+        # (writhe/thrash/roll/worm — an oscillate/burst/tremor) is an ACTIVE low goal, NOT
+        # lie/rest — collapse_and_stay_down must stay (an honest moving-low metric scores it ~0)
+        # and collapse_and_thrash must NOT be injected (it IS the on-goal end-state of a writhe).
+        # §round-21: dynamic_only=True so a settled limb HOLD-offset (zero joint velocity) does
+        # NOT flip a genuine lie-down to active (that false-rejected an honest descend-and-rest);
+        # the descent-magnitude channel is still probed on the terminal-down path because
+        # collapse_and_thrash now RAMPS the pelvis from nominal to the floor.
+        return down and not _spec_has_commanded_motion(spec, dynamic_only=True)
     except Exception:  # noqa: BLE001
         return False
 
@@ -912,22 +931,34 @@ def general_required_losers(
     """
     from sculptor.eval.ladder_synth import MotionSpec, render_rung
 
-    def _pack(name: str, channel: str, spec: Any, idx: int) -> dict:
+    def _pack(name: str, channel: str, spec: Any, idx: int,
+              max_frac: Optional[float] = None) -> dict:
         arrays, behavior, meta = render_rung(spec, joint_names, rung_index=idx)
-        return {"name": name, "channel": channel, "arrays": arrays,
-                "behavior": behavior, "meta": dict(meta)}
+        d = {"name": name, "channel": channel, "arrays": arrays,
+             "behavior": behavior, "meta": dict(meta)}
+        if max_frac is not None:
+            d["max_frac"] = max_frac
+        return d
 
     sh = _goal_is_static_hold(behavior_goal) if static_hold is None else static_hold
     td = _goal_is_terminal_down(behavior_goal) if terminal_down is None else terminal_down
     losers: list[dict] = []
     if not (sh and not td):   # still-upright losers are on-goal ONLY for a balance goal
-        # do_nothing is PERFECTLY still + upright: a posture/height proxy AND a stillness
-        # proxy both score it MAX, while any active goal scores it ~0.
+        # do_nothing is PERFECTLY still + upright and performs NO active goal, so an honest
+        # metric of any active goal MUST score it ~0. §round-21: it carries a strict per-loser
+        # FLOOR (max_frac) — a metric that pays this pure-idle anchor even a fraction of
+        # competence (an additive uprightness-gated floor: `up·(FLOOR + (1-FLOOR)·goal)`) is
+        # GAMEABLE, because the gate's upper ceiling (≈0.5) otherwise left an open [0,0.5)
+        # band a do-nothing policy could farm. An honest multiplicative/min metric (LAW: the
+        # objective metric is a completion-gate·min(channels), not an additive sum) scores
+        # do_nothing 0 and clears the floor.
         losers.append(_pack("do_nothing_upright", "posture",
-                            MotionSpec(uprightness=1.0, base_height_m=0.7), 600))
+                            MotionSpec(uprightness=1.0, base_height_m=0.7), 600,
+                            max_frac=_LOSER_FLOOR_FRAC))
         # a SMALL twitch (tremor 0.04 ≈ 0.07 rad ROM, peak vel ~3.5 rad/s): enough joint
         # VELOCITY at 15 Hz to trip a "rewards any motion" proxy, ROM far below any
         # plausible gesture target so an honest small-amplitude gesture metric is not denied.
+        # NO floor: an active velocity goal (a kick) legitimately scores jitter moderately.
         losers.append(_pack("jitter_in_place", "posture",
                             MotionSpec(uprightness=1.0, base_height_m=0.7,
                                        tremor=0.04), 601))
@@ -936,15 +967,23 @@ def general_required_losers(
                             MotionSpec(uprightness=0.0, base_height_m=[0.7, 0.1]), 602))
     else:
         # §round-19 [FALSE GRANT] fix: for a terminal-DOWN goal, collapse_and_stay_down is
-        # on-goal (dropped) and do_nothing/jitter are rendered UPRIGHT (z=0.7), which an
-        # honest lie-down metric scores ~0 — so NOTHING probes the stillness channel AT the
-        # low posture. A floor-thrash policy (low pelvis + violent motion) games a
-        # low-height-ONLY proxy that ignores 'rest still'. An honest lie-STILL metric
-        # (low·stillness) scores this ~0, so it cannot false-reject it; a stillness-blind
-        # low-height proxy scores it MAX → caught.
+        # on-goal (dropped — an honest lie-down/still-crouch metric LEGITIMATELY scores a
+        # still low policy high), and do_nothing/jitter are rendered UPRIGHT (z=0.7), which an
+        # honest low-posture metric scores ~0. So NOTHING probes the low posture itself. TWO
+        # thrashing probes cover it without false-rejecting an honest STILL-low metric (both
+        # THRASH → an honest low·stillness metric scores them ~0):
+        #   • collapse_and_thrash — a CONSTANT-low pelvis + thrash → catches a low-height-ONLY
+        #     proxy (it scores the held-low max) that ignores 'rest still'.
+        #   • descend_and_thrash — a pelvis RAMP nominal→floor + thrash → catches a
+        #     descent-MAGNITUDE confound (start−min drop) on a controlled-crouch/duck goal that
+        #     a constant-low probe scores 0. (§round-21: a single ramped probe could not be
+        #     both maximally-low AND maximally-descending, so the two channels need two probes.)
         losers.append(_pack("collapse_and_thrash", "stillness",
                             MotionSpec(uprightness=0.0, base_height_m=0.12,
                                        tremor=1.8, noise=0.15), 603))
+        losers.append(_pack("descend_and_thrash", "completion",
+                            MotionSpec(uprightness=0.0, base_height_m=[0.7, 0.12],
+                                       tremor=1.8, noise=0.15), 604))
     return losers
 
 
@@ -1002,6 +1041,8 @@ def adversarial_archetype_gate(
     }
 
     worst, worst_name = 0.0, None
+    # §round-21: a per-loser FLOOR breach (a pure-idle probe scoring ≥ max_frac·competent_ref).
+    floor_gamed, floor_name, floor_thresh = False, None, None
 
     # ── 1. DETERMINISTIC required-losers — scored FIRST and INDEPENDENTLY of the
     #     LLM author, so the metric is probed against the curated kick hacks even
@@ -1040,8 +1081,18 @@ def adversarial_archetype_gate(
             continue
         s = _gameable_score(s)   # §round-7: a NaN/inf hack score → GAMEABLE (fail-closed)
         losers_scored += 1
-        rec["required_losers"].append(
-            {"name": name, "channel": loser.get("channel"), "score": round(s, 4)})
+        entry = {"name": name, "channel": loser.get("channel"), "score": round(s, 4)}
+        # §round-21: a STRICT per-loser floor for a pure-idle probe — it performs NONE of the
+        # goal, so any non-trivial credit (≥ max_frac·competent_ref) is unearned/farm-able even
+        # though it is below the 0.5 gaming ceiling. Only applies when there is a positive
+        # competence anchor (competent_ref > 0).
+        mf = loser.get("max_frac")
+        if mf is not None and competent_ref > 0:
+            thr = float(mf) * float(competent_ref)
+            entry["floor"] = round(thr, 4)
+            if s >= thr:
+                floor_gamed, floor_name, floor_thresh = True, name, thr
+        rec["required_losers"].append(entry)
         if s > worst:
             worst, worst_name = s, name
 
@@ -1132,13 +1183,34 @@ def adversarial_archetype_gate(
             "adversarial: no renderable gaming archetype — inconclusive, not enforced")
         return rec
 
+    # §round-21: competent_ref ≤ 0 means there is NO usable competence anchor, so the gate
+    # cannot judge gameability — return INCONCLUSIVE (not a deny). The live grant path can't
+    # reach this (the per-source separation gate forces competent_ref ≥ _TD_SEPARATION_MIN);
+    # only the audit-only spec probe can, when the spec fn raises on its reference. (Old bug:
+    # a 0 ceiling flagged a clean 0.0-scoring metric as "gameable" with worst_name=None.)
+    if float(competent_ref) <= 0.0:
+        rec["reason"] = ("adversarial: no usable competence anchor (competent_ref ≤ 0) — "
+                         "inconclusive, not enforced")
+        rec["ceiling"] = None
+        return rec
+
     ceiling = min(rel_ceil * float(competent_ref), abs_ceil)
     rec["ceiling"] = round(ceiling, 4)
     gameable = ((not np.isfinite(worst))   # §round-7: non-finite worst → fail-closed
-                or (worst >= rel_ceil * float(competent_ref)) or (worst >= abs_ceil))
+                or (worst >= rel_ceil * float(competent_ref)) or (worst >= abs_ceil)
+                or floor_gamed)             # §round-21: a pure-idle probe breached its floor
     rec["gameable"] = bool(gameable)
     rec["ok"] = not gameable
-    if gameable:
+    if gameable and floor_gamed and not (worst >= ceiling):
+        # the deny is carried by the per-loser FLOOR, not the upper ceiling — name it precisely.
+        fscore = next((l["score"] for l in rec["required_losers"]
+                       if l.get("name") == floor_name), worst)
+        rec["worst_name"] = floor_name
+        rec["reason"] = (
+            f"adversarial: pure-idle probe {floor_name!r} scored {fscore:.3f} "
+            f"≥ floor {floor_thresh:.3f} ({_LOSER_FLOOR_FRAC:.0%} of competence "
+            f"{competent_ref:.3f}) — metric pays unearned credit for doing nothing")
+    elif gameable:
         rec["reason"] = (
             f"adversarial: gaming policy {worst_name!r} scored {worst:.3f} "
             f"≥ ceiling {ceiling:.3f} (competent {competent_ref:.3f}) — "
@@ -1430,6 +1502,17 @@ def calibrate_task_derived(
                 crouched = sum(1 for L in valid_ladders if _ladder_has_crouched_rung(L))
                 if crouched * 2 > len(valid_ladders):
                     ladder_sh = False
+            # §round-21 [HIGH FALSE GRANT] fix: AND-gate the ladder-derived static_hold with the
+            # goal-text classifier before DROPPING the do_nothing/jitter posture losers. A blind
+            # author can emit a plausible postural-STABILITY ladder (rungs graded by uprightness,
+            # held-upright top) for an ACTIVE gesture goal ("wave your arm"); the top rung then
+            # passes the per-rung static-hold test and dropped do_nothing with NO backstop, so a
+            # posture/height confound granted. The keyword classifier correctly says these active
+            # goals are NOT a static hold; require BOTH to agree (round-15 "bias toward False =
+            # safe direction"). A genuine balance goal names balance/hold/stand-still tokens so
+            # _goal_is_static_hold is True and the grant is preserved.
+            if ladder_sh and not _goal_is_static_hold(behavior_goal):
+                ladder_sh = False
             if fam == "kick" and adversarial_required_losers:
                 # opt-in breadth: the DEDICATED kick losers (WITH foot_pos_b direction
                 # channel that render_rung can't synthesize).
