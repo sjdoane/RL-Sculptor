@@ -102,7 +102,9 @@ _FORBIDDEN_ATTRS = frozenset({
     "posix", "nt", "posixpath", "ntpath", "genericpath", "fileinput", "webbrowser",
     "pty", "ssl", "http", "urllib", "ftplib", "smtplib", "json", "base64",
     "binascii", "zlib", "gzip", "bz2", "lzma", "tarfile", "zipfile", "struct",
-    "mmap", "fcntl", "termios", "select", "stat", "errno", "tokenize", "keyword",
+    "mmap", "fcntl", "termios", "stat", "errno", "tokenize", "keyword",
+    # NOTE: 'select' is deliberately NOT blocked — np.select is a benign public numpy
+    # piecewise function; the stdlib select module needs an import (already gated).
     #   dangerous terminal callables reachable off a module object:
     "FileIO", "getline", "getlines", "exit", "quit", "system", "popen", "spawn",
     "fork", "execv", "execve", "execvp", "fdopen", "getattr_static", "find_module",

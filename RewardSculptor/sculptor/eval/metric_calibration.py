@@ -720,7 +720,15 @@ _ACTIVE_MOTION_TOKENS = (
     "mimic", "vibrate", "oscillate", "weave", "circle", "pedal", "drum", "knock",
     "poke", "prod", "jab", "chop", "slice", "whisk", "paddle", "row", "wring",
     "wobble", "jiggle", "bounce", "thrust", "twirl", "flail", "swat",
-    "box", "point", "mime", "juggle", "dribble", "toss", "tap")
+    "box", "point", "mime", "juggle", "dribble", "toss", "tap",
+    # §round-25 reproduced gaps (manipulation / sport / dance / fidget gestures):
+    "paint", "knead", "sweep", "strum", "solder", "serve", "putt", "waltz", "mop",
+    "vacuum", "dust", "sketch", "whittle", "sand", "sew", "carve", "grate", "peel",
+    "polish", "iron", "frost", "rake", "stack", "assemble", "screw", "tighten",
+    "unscrew", "crank", "ladle", "pour", "scoop", "flip", "saw", "drill", "buff",
+    "trace", "vogue", "tango", "salsa", "krump", "twerk", "bowl", "fence", "dunk",
+    "spike", "volley", "cast", "fidget", "gesticulate", "bob", "headbang", "shimmy",
+    "gyrate")
 #: directional-travel words — a goal that travels is never a static hold (defense-in-depth).
 _DIRECTIONAL_TOKENS = ("forward", "forwards", "backward", "backwards", "ahead", "behind",
                        "left", "right", "sideways", "laterally", "across")
@@ -772,12 +780,28 @@ def _goal_has_active_motion(behavior_goal: str) -> bool:
     instead keeps the round-21 #6 backstop (an active-gesture goal with a mismatched
     stability-graded ladder) while trusting the authoritative ladder posture for balance goals."""
     g = (behavior_goal or "").lower()
-    toks = set(re.findall(r"[a-z]+", g))
-    stems = {t.rstrip("s") for t in toks} | {t[:-3] for t in toks if t.endswith("ing")} \
-        | {t[:-2] for t in toks if t.endswith("ed")}
-    active = {a.rstrip("s") for a in _ACTIVE_MOTION_TOKENS}
-    return bool((toks & set(_ACTIVE_MOTION_TOKENS)) or (stems & active)
-                or (toks & set(_DIRECTIONAL_TOKENS)))
+    seq = re.findall(r"[a-z]+", g)
+    active_set = set(_ACTIVE_MOTION_TOKENS)
+    active_stems = {a.rstrip("s") for a in _ACTIVE_MOTION_TOKENS}
+    directional = set(_DIRECTIONAL_TOKENS)
+    # §round-25: a NEGATED motion verb ("do NOT wobble", "WITHOUT flailing", "AVOID bouncing")
+    # describes what to AVOID while holding still — it is NOT the active objective, so it must
+    # not veto a balance goal's static_hold (that false-rejected honest one-leg/still metrics).
+    _NEG = {"not", "dont", "don", "no", "without", "never", "avoid", "stop", "cease",
+            "minimize", "minimise", "reduce", "resist", "prevent"}
+    for i, t in enumerate(seq):
+        stem = t.rstrip("s")
+        ing = t[:-3] if t.endswith("ing") else None
+        ed = t[:-2] if t.endswith("ed") else None
+        is_active = (t in active_set or t in directional or stem in active_stems
+                     or (ing is not None and ing in active_stems)
+                     or (ed is not None and ed in active_stems))
+        if not is_active:
+            continue
+        if any(w in _NEG for w in seq[max(0, i - 3):i]):
+            continue   # negated motion → AVOID instruction, not the objective
+        return True
+    return False
 
 
 def _scalar_end(v: Any) -> float:

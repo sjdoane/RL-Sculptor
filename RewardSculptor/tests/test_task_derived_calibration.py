@@ -2124,3 +2124,34 @@ def test_round24_active_verb_wins_safe_direction():
     assert not _goal_is_static_hold("shift your weight while balancing")
     assert not _goal_is_static_hold("wave your arm")
     assert not _goal_is_static_hold("hold still then dash forward")   # active sequence → NOT static
+
+
+def test_round25_negated_motion_not_active_and_verb_gaps():
+    """§round-25: (a) a NEGATED motion verb ('do not wobble', 'without flailing') is NOT the active
+    objective, so it does not veto a balance goal's static_hold (was false-rejecting one-leg metrics);
+    (b) the reproduced manipulation/sport/gesture verbs (paint/knead/fidget/shimmy/putt) now classify
+    ACTIVE so an 'X while balancing' goal keeps do_nothing (the posture confound is denied)."""
+    from sculptor.eval.metric_calibration import _goal_is_static_hold, _goal_has_active_motion
+    # negated motion → balance preserved
+    for g in ["do not wobble; balance on one foot", "do not flail; keep your balance",
+              "without falling, balance on one leg"]:
+        assert not _goal_has_active_motion(g), g
+        assert _goal_is_static_hold(g), g
+    # reproduced active-verb gaps now caught (active → not a static hold)
+    for g in ["paint a wall while balancing", "knead dough while balancing",
+              "fidget while staying still", "shimmy while staying balanced",
+              "putt a golf ball while balancing"]:
+        assert _goal_has_active_motion(g), g
+        assert not _goal_is_static_hold(g), g
+
+
+def test_round25_np_select_not_overblocked():
+    """§round-25: np.select (benign public numpy piecewise fn) must pass _ast_safety — the round-24
+    'select' denylist entry (for the stdlib select module) collided with it; the stdlib select needs
+    an import which is independently blocked."""
+    from sculptor.eval.metric_validate import _ast_safety
+    src = ('import numpy as np\n'
+           'def compute_spec(arrays, behavior, meta):\n'
+           '    jv = np.asarray(arrays.get("joint_vel"))\n'
+           '    return {"spec_score": float(np.select([jv > 0], [jv], 0.0).mean())}\n')
+    assert _ast_safety(src) == []
