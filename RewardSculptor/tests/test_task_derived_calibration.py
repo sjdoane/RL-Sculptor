@@ -1629,3 +1629,52 @@ def compute_spec(arrays, behavior, meta):
         client=_FakeLadderClient(subtle_wave_ladder(), subtle_wave_ladder(), subtle_wave_ladder()))
     assert not cal["ok"], cal                                   # velocity proxy DENIED
     assert "jitter_in_place" in {l["name"] for l in cal["adversarial"]["required_losers"]}
+
+
+# ── §round-19 base_height_m: the last unread MotionSpec motion channel ─────────
+
+def test_round19_static_hold_reads_base_height_channel():
+    """§round-19 [completeness]: base_height_m was the one MotionSpec motion field
+    _spec_is_static_hold did not read, so a vertical RAMP (rise/descend = commanded motion)
+    or a held NON-nominal height (squat) was mis-classified as a STILL UPRIGHT hold and
+    DROPPED the do_nothing/jitter losers. A nominal-standing hold (≥0.55, no ramp) stays
+    static so a genuine balance metric is still not false-denied."""
+    from sculptor.eval.metric_calibration import _spec_is_static_hold
+    # nominal standing hold (what a genuine balance ladder authors) → STILL static
+    assert _spec_is_static_hold(MotionSpec(uprightness=1.0, base_height_m=0.7))
+    assert _spec_is_static_hold(MotionSpec(uprightness=1.0, base_height_m=0.6))
+    assert _spec_is_static_hold(MotionSpec(uprightness=1.0, base_height_m=[0.7, 0.68]))
+    # a vertical RAMP is motion; a held squat is a non-standing posture → NOT static
+    assert not _spec_is_static_hold(MotionSpec(uprightness=1.0, base_height_m=[0.3, 0.7]))
+    assert not _spec_is_static_hold(MotionSpec(uprightness=1.0, base_height_m=[0.7, 0.45]))
+    assert not _spec_is_static_hold(MotionSpec(uprightness=1.0, base_height_m=0.45))
+    assert not _spec_is_static_hold(MotionSpec(uprightness=1.0, base_height_m=0.3))
+
+
+def test_round19_standup_ladder_keeps_posture_losers_end_to_end(tmp_path):
+    """§round-19 end-to-end: a 'stand up from a crouch and hold' goal whose AUTHORED ladder
+    has a RISING base_height ramp at the top must KEEP do_nothing/jitter (the ramp is motion,
+    not a still hold). A genuine RISE metric scores do_nothing ~0 so it still GRANTS; the
+    posture defense is no longer silently dropped by the unread height channel."""
+    def standup_ladder():
+        return CompetenceLadder(competence_axis="rise from crouch to standing", rungs=[
+            MotionSpec(uprightness=1.0, base_height_m=0.30),
+            MotionSpec(uprightness=1.0, base_height_m=[0.30, 0.45]),
+            MotionSpec(uprightness=1.0, base_height_m=[0.30, 0.60]),
+            MotionSpec(uprightness=1.0, base_height_m=[0.30, 0.70]),
+        ])
+    HONEST_RISE = '''import numpy as np
+def compute_spec(arrays, behavior, meta):
+    root = arrays.get("root_link_pos_w")
+    if root is None: return {"spec_score": 0.0}
+    z = np.asarray(root)[..., 2].mean(axis=1)
+    rise = float(z[-1] - z[0]); final = float(z[-1])
+    return {"spec_score": float(np.clip(min(rise / 0.35, final / 0.7), 0.0, 1.0))}
+'''
+    p = _write(tmp_path, "rise.py", HONEST_RISE)
+    cal = calibrate_task_derived(
+        p, "stand up from a crouch and hold standing", robot_hint="Unitree-G1",
+        client=_FakeLadderClient(standup_ladder(), standup_ladder(), standup_ladder()))
+    losers = {l["name"] for l in (cal["adversarial"] or {}).get("required_losers", [])}
+    assert "do_nothing_upright" in losers and "jitter_in_place" in losers   # ramp ≠ still hold
+    assert cal["ok"], cal                                                   # honest rise still GRANTS

@@ -742,6 +742,16 @@ def _scalar_end(v: Any) -> float:
         return 0.0
 
 
+def _scalar_start(v: Any) -> float:
+    """The START value of a MotionSpec Scalar (a float, or a [start, end] ramp)."""
+    try:
+        if isinstance(v, (list, tuple)):
+            return float(v[0]) if v else 0.0
+        return float(v)
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
 def _spec_is_static_hold(spec: Any) -> bool:
     """True iff a competence-ladder TOP rung describes a STILL UPRIGHT hold — high
     uprightness, no pelvis fold, no travel/hops, and no commanded joint motion. This reads
@@ -750,6 +760,23 @@ def _spec_is_static_hold(spec: Any) -> bool:
     keywords."""
     try:
         if _scalar_end(getattr(spec, "uprightness", 1.0)) < 0.8:
+            return False
+        # §round-19: base_height_m is a motion/posture channel too (it was the one
+        # MotionSpec motion field this detector did not read). A STILL UPRIGHT hold matches
+        # do_nothing_upright's STANDING posture (base_height_m≈0.7). A base_height RAMP is
+        # commanded VERTICAL MOTION (rise/descend), and a held NON-nominal height (squat) is
+        # a DIFFERENT posture where standing-still is OFF-goal — both must DROP the
+        # static-hold classification so do_nothing/jitter stay as losers. Defense-in-depth:
+        # today the prepended fallen anchor (z≈0.5) incidentally breaks a pure-height
+        # confound, but the firewall must not depend on that. SAFE vs false-reject: a genuine
+        # balance metric (which scores do_nothing HIGH) only authors a NOMINAL-height hold
+        # (≥0.55, no ramp) → still static → do_nothing still dropped; a genuine ramp/squat
+        # metric scores do_nothing LOW (it rewards the motion/low posture) → keeping the
+        # loser cannot deny it.
+        bh = getattr(spec, "base_height_m", 0.7)
+        if _scalar_start(bh) < 0.55 or _scalar_end(bh) < 0.55:
+            return False
+        if abs(_scalar_end(bh) - _scalar_start(bh)) > 0.05:
             return False
         if abs(float(getattr(spec, "fold_depth_m", 0.0) or 0.0)) > 0.05:
             return False
