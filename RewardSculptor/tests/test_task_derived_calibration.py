@@ -774,7 +774,7 @@ def test_adversarial_required_losers_off_runs_general_firewall_for_kicks(tmp_pat
         adversarial=True)
     assert cal["ok"], cal
     names = {l["name"] for l in cal["adversarial"]["required_losers"]}
-    assert names == {"do_nothing_upright", "jitter_in_place", "collapse_and_stay_down"}
+    assert names == {"do_nothing_upright", "jitter_in_place", "velocity_peak_ref", "collapse_and_stay_down"}
 
 
 # ── §fold-and-return primitive: STEERING for fold/squat/sit-to-stand/toe-touch ──
@@ -1400,15 +1400,17 @@ def test_round15_loser_set_never_empty_and_off_goal_per_class():
     """§round-15 DEFECT 2: the carve-outs must NEVER empty the loser set, and every loser
     must be OFF-goal for its goal class (else the gate is unenforced → false grant)."""
     from sculptor.eval.metric_calibration import general_required_losers
+    # §round-26: wherever do_nothing/jitter are present, the reference-only velocity_peak_ref
+    # probe is paired with jitter (for the mean-vs-peak velocity-floor discriminator).
     cases = {
-        "touch your toes then stand back up": {"do_nothing_upright", "jitter_in_place", "collapse_and_stay_down"},
+        "touch your toes then stand back up": {"do_nothing_upright", "jitter_in_place", "velocity_peak_ref", "collapse_and_stay_down"},
         "balance on one leg":                 {"collapse_and_stay_down"},                       # still-upright is on-goal
         # §round-19/21 fix: a terminal-down goal drops collapse_and_stay_down (on-goal) but adds
         # TWO thrashing probes — collapse_and_thrash (constant-low, stillness channel) and
         # descend_and_thrash (pelvis ramp, descent channel) — so a low-only OR a descent-only
         # proxy at the low posture is no longer free, without false-rejecting an honest still-low.
-        "lie down to rest":                   {"do_nothing_upright", "jitter_in_place", "collapse_and_thrash", "descend_and_thrash"},
-        "lie still and rest":                 {"do_nothing_upright", "jitter_in_place", "collapse_and_thrash", "descend_and_thrash"},
+        "lie down to rest":                   {"do_nothing_upright", "jitter_in_place", "velocity_peak_ref", "collapse_and_thrash", "descend_and_thrash"},
+        "lie still and rest":                 {"do_nothing_upright", "jitter_in_place", "velocity_peak_ref", "collapse_and_thrash", "descend_and_thrash"},
     }
     for goal, expect in cases.items():
         names = {l["name"] for l in general_required_losers(G1, goal)}
@@ -1743,7 +1745,7 @@ def test_round19_novel_kick_runs_firewall_default_path(tmp_path):
         client=_FakeLadderClient(kick_ladder(), kick_ladder(), kick_ladder()))
     adv = cal["adversarial"] or {}
     names = {l["name"] for l in adv.get("required_losers", [])}
-    assert names == {"do_nothing_upright", "jitter_in_place", "collapse_and_stay_down"}  # firewall RAN
+    assert names == {"do_nothing_upright", "jitter_in_place", "velocity_peak_ref", "collapse_and_stay_down"}  # firewall RAN
     assert adv.get("ran") is True
     assert cal["ok"], cal                                     # honest kick still GRANTS
 
@@ -2155,3 +2157,78 @@ def test_round25_np_select_not_overblocked():
            '    jv = np.asarray(arrays.get("joint_vel"))\n'
            '    return {"spec_score": float(np.select([jv > 0], [jv], 0.0).mean())}\n')
     assert _ast_safety(src) == []
+
+
+# ── §round-26: the mean-velocity-floor exploit (PEAK discriminator) ──
+
+def _wave_ladder():
+    def arm(a):
+        return Group(name="arm", mode="oscillate", amplitude_rad=a, period_frames=20,
+                     role_query=RoleQuery(segments=["shoulder", "elbow"], axes=["pitch", None]))
+    return CompetenceLadder(competence_axis="arm wave amplitude", rungs=[
+        MotionSpec(uprightness=u, base_height_m=0.7, groups=[arm(a)])
+        for u, a in [(0.7, 0.1), (0.85, 0.5), (0.95, 0.9), (1.0, 1.3)]])
+
+
+def test_round26_mean_velocity_floor_confound_denied(tmp_path):
+    """§round-26 [HIGH FALSE GRANT] fix: an additive raw-MEAN-velocity-floor confound
+    (up·(FLOOR_v·(1−exp(−mean|jv|/k)) + (1−FLOOR_v)·rom)) pays the tiny-ROM jitter probe ~FLOOR_v
+    (<0.5 ceiling) and used to GRANT. The new reference-only velocity_peak_ref probe (whole-body,
+    2.5× peak) catches it: a MEAN-velocity metric saturates → scores jitter ≈ velocity_peak_ref
+    (peak-insensitive), the farming signature. The ratio is FLOOR_v-invariant, so it's robust."""
+    CONF = '''import numpy as np
+def compute_spec(arrays, behavior, meta):
+    g = arrays.get("projected_gravity_b"); jp = arrays.get("joint_pos"); jv = arrays.get("joint_vel")
+    if g is None or jv is None or jp is None: return {"spec_score": 0.0}
+    up = float((np.asarray(g)[..., 2] < -0.85).mean())
+    moving = float(1 - np.exp(-np.abs(np.asarray(jv)).mean() / 0.5))
+    rom = float(np.clip(np.max(np.ptp(np.asarray(jp), axis=0)) / 2.6, 0, 1))
+    return {"spec_score": float(np.clip(up * (0.49 * moving + 0.51 * rom), 0, 1))}
+'''
+    cal = calibrate_task_derived(_write(tmp_path, "conf.py", CONF),
+        "wave your arm up and down", robot_hint="Unitree-G1",
+        client=_FakeLadderClient(_wave_ladder(), _wave_ladder(), _wave_ladder()))
+    assert not cal["ok"], cal
+    assert "velocity-floor" in (cal.get("reason") or "")
+    assert (cal["adversarial"] or {}).get("velocity_floor")
+
+
+def test_round26_honest_velocity_and_rom_metrics_not_false_rejected(tmp_path):
+    """§round-26: the velocity_peak_ref discriminator must NOT false-reject a PEAK-based velocity
+    metric (it scores velocity_peak_ref well above jitter) nor a ROM/amplitude metric (it scores
+    both low)."""
+    HONEST_ROM = '''import numpy as np
+def compute_spec(arrays, behavior, meta):
+    g = arrays.get("projected_gravity_b"); jp = arrays.get("joint_pos")
+    if g is None or jp is None: return {"spec_score": 0.0}
+    up = float((np.asarray(g)[..., 2] < -0.85).mean())
+    rom = float(np.clip(np.max(np.ptp(np.asarray(jp), axis=0)) / 2.6, 0, 1))
+    return {"spec_score": float(np.clip(up * rom, 0, 1))}
+'''
+    HONEST_PEAK = '''import numpy as np
+def compute_spec(arrays, behavior, meta):
+    g = arrays.get("projected_gravity_b"); jv = arrays.get("joint_vel")
+    if g is None or jv is None: return {"spec_score": 0.0}
+    up = float((np.asarray(g)[..., 2] < -0.85).mean()); peak = float(np.abs(np.asarray(jv)).max())
+    return {"spec_score": float(np.clip(up * (1 - np.exp(-peak / 12.0)), 0, 1))}
+'''
+    for nm, src in [("rom.py", HONEST_ROM), ("peak.py", HONEST_PEAK)]:
+        cal = calibrate_task_derived(_write(tmp_path, nm, src),
+            "wave your arm up and down", robot_hint="Unitree-G1",
+            client=_FakeLadderClient(_wave_ladder(), _wave_ladder(), _wave_ladder()))
+        assert cal["ok"], (nm, cal)
+
+
+def test_round26_good_kick_not_flagged_by_velocity_floor(tmp_path):
+    """§round-26: the canonical honest GOOD_KICK fixture (which pays jitter ~0.52 of competence —
+    the very reason a flat floor was not viable) is NOT flagged, because it scores the high-peak
+    velocity_peak_ref well ABOVE jitter (peak-sensitive)."""
+    cal = calibrate_task_derived(_write(tmp_path, "gk.py", GOOD_KICK),
+        "kick forward with the left leg from a stance", robot_hint="Unitree-G1",
+        client=_FakeLadderClient(kick_ladder(), kick_ladder(), kick_ladder()))
+    assert cal["ok"], cal
+    from sculptor.eval.metric_calibration import _VEL_FLOOR_RATIO
+    adv = cal["adversarial"] or {}
+    assert not adv.get("velocity_floor")
+    js = {l["name"]: l["score"] for l in adv["required_losers"]}
+    assert js["jitter_in_place"] < _VEL_FLOOR_RATIO * js["velocity_peak_ref"]

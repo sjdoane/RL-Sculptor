@@ -432,6 +432,11 @@ _ADV_N = 3               # archetypes the blind author proposes
 #: nothing must score NEAR ZERO. Only attached to losers that carry a `max_frac` key — the
 #: motion-bearing probes (jitter) keep the ceiling so an honest velocity goal isn't denied.
 _LOSER_FLOOR_FRAC = 0.15
+#: §round-26: the PEAK discriminator threshold. A metric is farming the mean-velocity floor if it
+#: scores jitter_in_place (low peak) ≥ this fraction of velocity_peak_ref (high peak, same tiny ROM)
+#: — i.e. it is INSENSITIVE to a >2× peak-velocity difference (a flat velocity floor), AND jitter is
+#: above the idle floor. A genuine peak/ROM metric scores velocity_peak_ref well above jitter.
+_VEL_FLOOR_RATIO = 0.85
 
 
 def _gameable_score(s: float) -> float:
@@ -998,12 +1003,14 @@ def general_required_losers(
     from sculptor.eval.ladder_synth import MotionSpec, render_rung
 
     def _pack(name: str, channel: str, spec: Any, idx: int,
-              max_frac: Optional[float] = None) -> dict:
+              max_frac: Optional[float] = None, reference_only: bool = False) -> dict:
         arrays, behavior, meta = render_rung(spec, joint_names, rung_index=idx)
         d = {"name": name, "channel": channel, "arrays": arrays,
              "behavior": behavior, "meta": dict(meta)}
         if max_frac is not None:
             d["max_frac"] = max_frac
+        if reference_only:
+            d["reference_only"] = True   # scored for a paired check, NOT ceiling-compared
         return d
 
     sh = _goal_is_static_hold(behavior_goal) if static_hold is None else static_hold
@@ -1021,21 +1028,32 @@ def general_required_losers(
         losers.append(_pack("do_nothing_upright", "posture",
                             MotionSpec(uprightness=1.0, base_height_m=0.7), 600,
                             max_frac=_LOSER_FLOOR_FRAC))
-        # a SMALL twitch (tremor 0.04 ≈ 0.07 rad ROM, peak vel ~3.5 rad/s): enough joint
-        # VELOCITY at 15 Hz to trip a "rewards any motion" proxy, ROM far below any
+        # a SMALL twitch (tremor 0.04 ≈ 0.07 rad ROM, mean|jv| ~1.18, peak ~3.5 rad/s): enough
+        # joint VELOCITY at 15 Hz to trip a "rewards any motion" proxy, ROM far below any
         # plausible gesture target so an honest small-amplitude gesture metric is not denied.
-        # NO floor (unlike do_nothing): an active velocity goal legitimately scores jitter
-        # moderately. §round-22 KNOWN RESIDUAL: an additive raw-MEAN-velocity floor confound
-        # farms ~46% via this probe (under the 0.5 ceiling), but a flat floor is NOT viable —
-        # the canonical honest GOOD_KICK fixture pays jitter 0.52 of competence (its soft burst
-        # saturation), HIGHER than the confound's 0.48, so any flat threshold catching the
-        # confound also false-rejects the honest kick. The durable fix is a PEAK-velocity-aware
-        # discriminator (jitter peak ~3.5 vs a competent kick's commanded 6–15 rad/s) and/or
-        # goal-joint scoping (REQUIRED_JOINT_ROLES) — a larger increment. The practical harm is
-        # bounded: a do-nothing-but-twitching policy caps at the floor (<50%) and cannot WIN.
+        # NO flat floor (unlike do_nothing): an active velocity goal legitimately scores jitter
+        # moderately. §round-26: the additive raw-MEAN-velocity floor confound that farms ~46%
+        # via this probe under the 0.5 ceiling is now caught by the PEAK discriminator below
+        # (velocity_peak_ref) — a flat floor was NOT viable (honest GOOD_KICK pays jitter 0.52 of
+        # competence, ABOVE the confound's 0.48, so the means don't separate), but jitter's PEAK
+        # (~3.5) vs a competent-intensity motion's peak (~15–20) DOES.
         losers.append(_pack("jitter_in_place", "posture",
                             MotionSpec(uprightness=1.0, base_height_m=0.7,
                                        tremor=0.04), 601))
+        # §round-26 PEAK DISCRIMINATOR (reference-only — never ceiling-compared): a WHOLE-BODY
+        # tremor at 2.5× jitter's amplitude — SAME joint coverage as jitter (so a mean-ROM-over-
+        # all-joints honest metric treats them comparably) but ~2.5× the PEAK velocity (~8.7 vs
+        # jitter's ~3.5) and ~2.5× the ROM. It pairs with jitter_in_place: an additive MEAN-
+        # velocity-floor confound's `1−exp(−mean/k)` SATURATES, so it scores jitter ≈
+        # velocity_peak_ref — INSENSITIVE to the 2.5× peak/ROM difference (the farming signature).
+        # A genuine velocity/kick metric (peak-sensitive) OR a ROM/amplitude metric scores
+        # velocity_peak_ref HIGHER than jitter. The ratio is INVARIANT to the confound's FLOOR_v
+        # (both probes scale together), so the discriminator is robust to tuning, unlike a flat
+        # floor (which can't separate the confound's 0.46 from honest GOOD_KICK's 0.52 jitter
+        # score). See the gate's velocity-floor verdict.
+        losers.append(_pack("velocity_peak_ref", "velocity",
+                            MotionSpec(uprightness=1.0, base_height_m=0.7, tremor=0.10),
+                            610, reference_only=True))
     if not td:
         losers.append(_pack("collapse_and_stay_down", "completion",
                             MotionSpec(uprightness=0.0, base_height_m=[0.7, 0.1]), 602))
@@ -1117,6 +1135,9 @@ def adversarial_archetype_gate(
     worst, worst_name = 0.0, None
     # §round-21: a per-loser FLOOR breach (a pure-idle probe scoring ≥ max_frac·competent_ref).
     floor_gamed, floor_name, floor_thresh = False, None, None
+    # §round-26: scored deterministic losers + paired reference probes, for the velocity-floor check.
+    loser_scores: dict[str, float] = {}
+    ref_scores: dict[str, float] = {}
 
     # ── 1. DETERMINISTIC required-losers — scored FIRST and INDEPENDENTLY of the
     #     LLM author, so the metric is probed against the curated kick hacks even
@@ -1156,6 +1177,14 @@ def adversarial_archetype_gate(
         s = _gameable_score(s)   # §round-7: a NaN/inf hack score → GAMEABLE (fail-closed)
         losers_scored += 1
         entry = {"name": name, "channel": loser.get("channel"), "score": round(s, 4)}
+        if loser.get("reference_only"):
+            # §round-26: a paired REFERENCE probe (velocity_peak_ref) — scored for the
+            # velocity-floor verdict check below, but NEVER ceiling-compared (a genuine
+            # high-intensity metric legitimately scores it high) and never a floor/worst probe.
+            entry["reference_only"] = True
+            ref_scores[name] = s
+            rec["required_losers"].append(entry)
+            continue
         # §round-21: a STRICT per-loser floor for a pure-idle probe — it performs NONE of the
         # goal, so any non-trivial credit (≥ max_frac·competent_ref) is unearned/farm-able even
         # though it is below the 0.5 gaming ceiling. Only applies when there is a positive
@@ -1166,6 +1195,7 @@ def adversarial_archetype_gate(
             entry["floor"] = round(thr, 4)
             if s >= thr:
                 floor_gamed, floor_name, floor_thresh = True, name, thr
+        loser_scores[name] = s
         rec["required_losers"].append(entry)
         if s > worst:
             worst, worst_name = s, name
@@ -1270,12 +1300,34 @@ def adversarial_archetype_gate(
 
     ceiling = min(rel_ceil * float(competent_ref), abs_ceil)
     rec["ceiling"] = round(ceiling, 4)
+    # §round-26 PEAK discriminator: an additive MEAN-velocity-floor confound pays the tiny-ROM
+    # jitter probe ~the same as the high-PEAK velocity_peak_ref probe (its 1−exp(−mean/k)
+    # saturates), so it is INSENSITIVE to a >2× peak difference — the farming signature, robust
+    # to the confound's FLOOR_v (the ratio is FLOOR_v-invariant). A genuine velocity/kick metric
+    # scores velocity_peak_ref well ABOVE jitter. Gate on jitter being above the idle floor too,
+    # so a metric that scores BOTH ~0 is not flagged.
+    vel_floor_gamed = False
+    vfj = loser_scores.get("jitter_in_place")
+    vfr = ref_scores.get("velocity_peak_ref")
+    if (vfj is not None and vfr is not None
+            and vfj >= _LOSER_FLOOR_FRAC * float(competent_ref)
+            and vfj >= _VEL_FLOOR_RATIO * vfr):
+        vel_floor_gamed = True
+        rec["velocity_floor"] = {"jitter": round(vfj, 4), "peak_ref": round(vfr, 4),
+                                 "ratio_thresh": _VEL_FLOOR_RATIO}
     gameable = ((not np.isfinite(worst))   # §round-7: non-finite worst → fail-closed
                 or (worst >= rel_ceil * float(competent_ref)) or (worst >= abs_ceil)
-                or floor_gamed)             # §round-21: a pure-idle probe breached its floor
+                or floor_gamed              # §round-21: a pure-idle probe breached its floor
+                or vel_floor_gamed)         # §round-26: a mean-velocity floor (peak-insensitive)
     rec["gameable"] = bool(gameable)
     rec["ok"] = not gameable
-    if gameable and floor_gamed and not (worst >= ceiling):
+    if gameable and vel_floor_gamed and not (worst >= ceiling) and not floor_gamed:
+        rec["worst_name"] = "jitter_in_place"
+        rec["reason"] = (
+            f"adversarial: velocity-floor — jitter_in_place scored {vfj:.3f} ≥ "
+            f"{_VEL_FLOOR_RATIO:.0%} of the high-peak velocity_peak_ref ({vfr:.3f}), i.e. the "
+            f"metric pays a flat MEAN-velocity floor insensitive to peak intensity — gameable")
+    elif gameable and floor_gamed and not (worst >= ceiling):
         # the deny is carried by the per-loser FLOOR, not the upper ceiling — name it precisely.
         fscore = next((l["score"] for l in rec["required_losers"]
                        if l.get("name") == floor_name), worst)
