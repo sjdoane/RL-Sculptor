@@ -50,6 +50,26 @@ def test_record_run_cases_writes_nodes_and_edges(tmp_path) -> None:
     store.close()
 
 
+def test_record_creates_missing_failure_mode_node_no_dangling_edge(tmp_path) -> None:
+    """§KG integrity: a diagnoser-flagged failure mode with no paper-derived FailureMode
+    node must still get a (stub) node, so the case→failure INSTANTIATES edge does not
+    DANGLE. (Live KG had 48 such dangling edges to 4 absent failure ids; the viz had to
+    tolerate broken edges. This keeps the case silo self-consistent.)"""
+    store = SculptorKG(tmp_path / "kg.db")
+    result = types.SimpleNamespace(
+        completed_iters=[_outcome(0, ["premature_termination"])],
+        fitness_history=[0.2, 0.5],
+    )
+    C.record_run_cases(store, task="balance on one leg", result=result, nonce="t1")
+    fm_id = make_failure_mode_id("premature_termination")
+    assert store.has_node(fm_id)                       # stub FailureMode node created
+    node_ids = {n.id for n in store.find_nodes()}
+    for case in store.find_nodes(kind=RunCase.kind):
+        for nbr in store.neighbors(case.id, relation=Relation.INSTANTIATES, direction="out"):
+            assert nbr[1] in node_ids, f"dangling edge to {nbr[1]}"   # no orphan edge
+    store.close()
+
+
 def test_record_does_not_credit_a_reverted_edit(tmp_path) -> None:
     """§Ship 37 review (HIGH): under Ship-36 revert-on-regression, a regressing
     edit at iter N is discarded and iter N+1 RE-MEASURES the best-so-far reward.

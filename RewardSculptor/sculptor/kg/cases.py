@@ -32,6 +32,7 @@ from dataclasses import dataclass
 from sculptor.kg.query import EMBEDDING_MODEL, _embed_text, _get_embedder
 from sculptor.kg.schema import (
     Edge,
+    FailureMode,
     Relation,
     RunCase,
     make_failure_mode_id,
@@ -122,8 +123,19 @@ def record_run_cases(
         )
         store.add_node(case)
         for fm in fms:
+            fm_id = make_failure_mode_id(fm)
+            # §KG integrity: the diagnoser can flag a failure mode that was never
+            # extracted from a paper, so no FailureMode node exists. Ensure the node
+            # exists before linking, else the INSTANTIATES edge DANGLES — the
+            # case→failure provenance is dead and the graph viz must tolerate a broken
+            # edge (sculptor/kg/viz.py). A stub node keeps the silo self-consistent.
+            if not store.has_node(fm_id):
+                store.add_node(FailureMode(
+                    id=fm_id, name=str(fm),
+                    description="(diagnoser-flagged failure mode; not paper-derived)",
+                ))
             store.add_edge(Edge(
-                src=case.id, dst=make_failure_mode_id(fm),
+                src=case.id, dst=fm_id,
                 relation=Relation.INSTANTIATES,
                 data={"verdict": verdict, "delta": delta},
             ))
