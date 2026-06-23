@@ -2004,3 +2004,60 @@ def test_round21_no_competence_anchor_is_inconclusive():
                                      required_losers=losers, author=False)
     assert not rec["gameable"]                            # NOT a deny
     assert "inconclusive" in rec["reason"]
+
+
+# ── §round-22: trust the blind-ladder static_hold, veto only on a POSITIVE active verb ──
+
+def test_round22_goal_has_active_motion_classifier():
+    """§round-22: _goal_has_active_motion fires on a named active/locomotion/directional verb
+    (the POSITIVE signal that the goal is NOT a still hold), and is False for balance phrasings
+    that the brittle static-hold keyword list misses."""
+    from sculptor.eval.metric_calibration import _goal_has_active_motion
+    for g in ["wave your right arm", "march in place", "kick forward", "walk ahead", "do a deep squat"]:
+        assert _goal_has_active_motion(g), g
+    for g in ["hold a flamingo pose", "freeze in place like a statue", "stay on your feet",
+              "keep your center of mass over your feet", "balance on one foot", "avoid falling down"]:
+        assert not _goal_has_active_motion(g), g
+
+
+def test_round22_balance_phrasings_not_false_rejected(tmp_path):
+    """§round-22 [HIGH FALSE REJECT] fix: the round-21 AND-gate required a positive balance KEYWORD
+    to honor the blind ladder's static_hold, so genuine balance goals phrased outside the ~13-token
+    list ('hold a flamingo pose', 'freeze in place') kept do_nothing and DENIED an honest balance
+    metric. The veto now fires only on a POSITIVE active verb, so these GRANT (regression vs pre-21)."""
+    def bal_ladder():
+        return CompetenceLadder(competence_axis="upright balance", rungs=[
+            MotionSpec(uprightness=u, base_height_m=0.7) for u in (0.4, 0.7, 0.9, 1.0)])
+    BAL = '''import numpy as np
+def compute_spec(arrays, behavior, meta):
+    g = np.asarray(arrays["projected_gravity_b"]); root = np.asarray(arrays["root_link_pos_w"])
+    up = float((g[..., 2] < -0.85).mean())
+    drift = float(np.linalg.norm(root[..., :2].max(0) - root[..., :2].min(0), axis=-1).mean())
+    return {"spec_score": float(np.clip(up * np.exp(-drift / 0.3), 0, 1))}
+'''
+    for i, goal in enumerate(["hold a flamingo pose", "freeze in place like a statue",
+                              "keep your center of mass over your feet", "stay on your feet"]):
+        cal = calibrate_task_derived(_write(tmp_path, f"bal{i}.py", BAL), goal,
+            robot_hint="Unitree-G1", client=_FakeLadderClient(bal_ladder(), bal_ladder(), bal_ladder()))
+        names = {l["name"] for l in (cal["adversarial"] or {}).get("required_losers", [])}
+        assert "do_nothing_upright" not in names             # ladder static_hold trusted → dropped
+        assert cal["ok"], (goal, cal)
+
+
+def test_round22_active_gesture_confound_still_denied(tmp_path):
+    """§round-22 regression guard: the inverted veto must STILL keep do_nothing for an ACTIVE
+    gesture goal whose blind author emitted a mismatched stability-graded ladder (round-21 #6)."""
+    def postural():
+        return CompetenceLadder(competence_axis="postural stability", rungs=[
+            MotionSpec(uprightness=u, base_height_m=0.7) for u in (0.3, 0.6, 0.85, 1.0)])
+    CONF = '''import numpy as np
+def compute_spec(arrays, behavior, meta):
+    g = np.asarray(arrays["projected_gravity_b"]); root = np.asarray(arrays["root_link_pos_w"])
+    up = float((g[..., 2] < -0.85).mean()); tall = float(np.clip((root[..., 2].mean() - 0.55) / 0.15, 0, 1))
+    return {"spec_score": float(np.clip(up * tall, 0, 1))}
+'''
+    cal = calibrate_task_derived(_write(tmp_path, "conf.py", CONF), "wave your right arm",
+        robot_hint="Unitree-G1", client=_FakeLadderClient(postural(), postural(), postural()))
+    names = {l["name"] for l in (cal["adversarial"] or {}).get("required_losers", [])}
+    assert "do_nothing_upright" in names                     # active verb → veto → kept
+    assert not cal["ok"], cal

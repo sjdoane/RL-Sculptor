@@ -724,18 +724,32 @@ def _goal_is_static_hold(behavior_goal: str) -> bool:
     requires POSITIVE balance evidence (a static-hold phrase or a balance-DOMINANT token —
     weak modifiers like "upright"/"stance"/"steady" are NOT sufficient alone, since they
     appear in active goals like "salute while staying upright")."""
+    if _goal_has_active_motion(behavior_goal):
+        return False
+    g = (behavior_goal or "").lower()
+    toks = set(re.findall(r"[a-z]+", g))
+    if any(p in g for p in _STATIC_HOLD_PHRASES):
+        return True
+    return bool(toks & set(_STATIC_HOLD_TOKENS))
+
+
+def _goal_has_active_motion(behavior_goal: str) -> bool:
+    """True iff the goal NAMES an active-motion/locomotion verb (incl. inflected forms) or a
+    directional-travel cue — the POSITIVE signal that the goal is NOT a still hold. §round-22:
+    used to VETO a blind-ladder static_hold (keep the do_nothing/jitter posture losers) ONLY
+    when the goal is explicitly active, WITHOUT demanding a positive balance keyword. The
+    keyword list of static-hold tokens is brittle (most balance phrasings — 'hold a flamingo
+    pose', 'freeze in place', 'keep your center of mass over your feet' — miss it), so requiring
+    a positive match false-rejected honest balance metrics; checking for a positive ACTIVE verb
+    instead keeps the round-21 #6 backstop (an active-gesture goal with a mismatched
+    stability-graded ladder) while trusting the authoritative ladder posture for balance goals."""
     g = (behavior_goal or "").lower()
     toks = set(re.findall(r"[a-z]+", g))
     stems = {t.rstrip("s") for t in toks} | {t[:-3] for t in toks if t.endswith("ing")} \
         | {t[:-2] for t in toks if t.endswith("ed")}
     active = {a.rstrip("s") for a in _ACTIVE_MOTION_TOKENS}
-    if (toks & set(_ACTIVE_MOTION_TOKENS)) or (stems & active):   # incl. inflected forms
-        return False
-    if toks & set(_DIRECTIONAL_TOKENS):
-        return False
-    if any(p in g for p in _STATIC_HOLD_PHRASES):
-        return True
-    return bool(toks & set(_STATIC_HOLD_TOKENS))
+    return bool((toks & set(_ACTIVE_MOTION_TOKENS)) or (stems & active)
+                or (toks & set(_DIRECTIONAL_TOKENS)))
 
 
 def _scalar_end(v: Any) -> float:
@@ -958,7 +972,15 @@ def general_required_losers(
         # a SMALL twitch (tremor 0.04 ≈ 0.07 rad ROM, peak vel ~3.5 rad/s): enough joint
         # VELOCITY at 15 Hz to trip a "rewards any motion" proxy, ROM far below any
         # plausible gesture target so an honest small-amplitude gesture metric is not denied.
-        # NO floor: an active velocity goal (a kick) legitimately scores jitter moderately.
+        # NO floor (unlike do_nothing): an active velocity goal legitimately scores jitter
+        # moderately. §round-22 KNOWN RESIDUAL: an additive raw-MEAN-velocity floor confound
+        # farms ~46% via this probe (under the 0.5 ceiling), but a flat floor is NOT viable —
+        # the canonical honest GOOD_KICK fixture pays jitter 0.52 of competence (its soft burst
+        # saturation), HIGHER than the confound's 0.48, so any flat threshold catching the
+        # confound also false-rejects the honest kick. The durable fix is a PEAK-velocity-aware
+        # discriminator (jitter peak ~3.5 vs a competent kick's commanded 6–15 rad/s) and/or
+        # goal-joint scoping (REQUIRED_JOINT_ROLES) — a larger increment. The practical harm is
+        # bounded: a do-nothing-but-twitching policy caps at the floor (<50%) and cannot WIN.
         losers.append(_pack("jitter_in_place", "posture",
                             MotionSpec(uprightness=1.0, base_height_m=0.7,
                                        tremor=0.04), 601))
@@ -1502,16 +1524,17 @@ def calibrate_task_derived(
                 crouched = sum(1 for L in valid_ladders if _ladder_has_crouched_rung(L))
                 if crouched * 2 > len(valid_ladders):
                     ladder_sh = False
-            # §round-21 [HIGH FALSE GRANT] fix: AND-gate the ladder-derived static_hold with the
-            # goal-text classifier before DROPPING the do_nothing/jitter posture losers. A blind
-            # author can emit a plausible postural-STABILITY ladder (rungs graded by uprightness,
-            # held-upright top) for an ACTIVE gesture goal ("wave your arm"); the top rung then
-            # passes the per-rung static-hold test and dropped do_nothing with NO backstop, so a
-            # posture/height confound granted. The keyword classifier correctly says these active
-            # goals are NOT a static hold; require BOTH to agree (round-15 "bias toward False =
-            # safe direction"). A genuine balance goal names balance/hold/stand-still tokens so
-            # _goal_is_static_hold is True and the grant is preserved.
-            if ladder_sh and not _goal_is_static_hold(behavior_goal):
+            # §round-21 [HIGH FALSE GRANT] / §round-22 [HIGH FALSE REJECT] fix: a blind author can
+            # emit a plausible postural-STABILITY ladder (rungs graded by uprightness, held-upright
+            # top) for an ACTIVE gesture goal ("wave your arm"); the top rung passes the per-rung
+            # static-hold test and dropped do_nothing with NO backstop → a posture/height confound
+            # granted (round-21 #6). Round-21 backstopped this by requiring a POSITIVE balance
+            # keyword, but that brittle list misses most balance phrasings ("hold a flamingo pose",
+            # "freeze in place") → it false-rejected honest balance metrics (round-22). The fix:
+            # the blind LADDER posture is authoritative (round-17); VETO it (keep do_nothing/jitter)
+            # ONLY when the goal NAMES an active-motion verb — present for the #6 gesture attack,
+            # absent for a genuine balance goal.
+            if ladder_sh and _goal_has_active_motion(behavior_goal):
                 ladder_sh = False
             if fam == "kick" and adversarial_required_losers:
                 # opt-in breadth: the DEDICATED kick losers (WITH foot_pos_b direction
