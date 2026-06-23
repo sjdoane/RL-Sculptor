@@ -1275,3 +1275,26 @@ def test_calibration_constant_metric_fails(tmp_path):
     p = _write(tmp_path, "const.py", CONSTANT)
     cal = calibrate_metric(p, "go1_trot", threshold=0.7)
     assert not cal["ok"]  # constant → no rank info → spearman 0
+
+
+def test_read_required_roles_static_no_exec(tmp_path):
+    """§Fix-B down-payment: REQUIRED_JOINT_ROLES is read by STATIC AST parse (no exec). A literal
+    list/tuple of strings is extracted; a non-literal / non-string / absent declaration → [];
+    and reading roles from a PATH must NOT exec the untrusted module top-level."""
+    from sculptor.eval.generated_metric import (
+        read_required_roles, read_required_roles_static)
+    assert read_required_roles_static(
+        'REQUIRED_JOINT_ROLES = ["left_knee", "right_knee"]\n'
+        'def compute_spec(a,b,m): return {"spec_score":0.0}\n') == ["left_knee", "right_knee"]
+    assert read_required_roles_static('REQUIRED_JOINT_ROLES = ("hip",)\n') == ["hip"]
+    assert read_required_roles_static('def compute_spec(a,b,m): return {}\n') == []
+    assert read_required_roles_static('REQUIRED_JOINT_ROLES = ["a"] + ["b"]\n') == []   # non-literal
+    assert read_required_roles_static('REQUIRED_JOINT_ROLES = [1, 2]\n') == []          # non-string
+    # PATH branch is static (no exec): a top-level side effect must NOT run when reading roles.
+    canary = tmp_path / "role_exec_canary"
+    src = ('REQUIRED_JOINT_ROLES = ["knee"]\n'
+           f'open({str(canary)!r}, "w").close()\n'
+           'def compute_spec(a,b,m): return {"spec_score":0.0}\n')
+    p = _write(tmp_path, "side_effect.py", src)
+    assert read_required_roles(p) == ["knee"]
+    assert not canary.exists()    # the top-level open() did NOT execute

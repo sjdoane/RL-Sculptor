@@ -49,6 +49,7 @@ run the module exec + `compute_spec` in a restricted SUBPROCESS.
 """
 from __future__ import annotations
 
+import ast
 import importlib.util
 import json
 from pathlib import Path
@@ -143,14 +144,49 @@ def load_generated_metric(module_path: Path | str) -> Callable[..., dict]:
     return fn
 
 
+def read_required_roles_static(source: str) -> list[str]:
+    """§Fix-B down-payment: extract `REQUIRED_JOINT_ROLES = ["...", ...]` from metric SOURCE
+    by STATIC AST parse — NO exec. The contract is a top-level assignment of a LITERAL list/
+    tuple of strings; anything else (absent, non-literal, non-string elements) → `[]` (treated
+    as undeclared → the legacy self-matching path). Reading roles used to require exec'ing the
+    untrusted module (`load_generated_module`) just to `getattr` a constant — a top-level
+    exploit ran at that exec. Parsing the literal statically removes that exec entirely (the
+    module is still gated by `_ast_safety` + exec'd in the sandbox when actually SCORED)."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+    for node in tree.body:                       # top-level statements only
+        targets = (node.targets if isinstance(node, ast.Assign)
+                   else [node.target] if isinstance(node, ast.AnnAssign) else [])
+        if not any(isinstance(t, ast.Name) and t.id == REQUIRED_ROLES_ATTR for t in targets):
+            continue
+        rhs = node.value
+        if not isinstance(rhs, (ast.List, ast.Tuple)) or rhs is None:
+            return []                            # non-literal RHS → undeclared (legacy path)
+        roles: list[str] = []
+        for el in rhs.elts:
+            if isinstance(el, ast.Constant) and isinstance(el.value, str):
+                roles.append(el.value)
+            else:
+                return []                        # any non-string-literal element → undeclared
+        return roles
+    return []
+
+
 def read_required_roles(module_or_path) -> list[str]:
     """The canonical joint roles a metric declares via `REQUIRED_JOINT_ROLES`
     (empty list when undeclared — a legacy metric that does its own matching).
-    Accepts a loaded module or a path."""
-    mod = (module_or_path if hasattr(module_or_path, REQUIRED_ROLES_ATTR)
-           or not isinstance(module_or_path, (str, Path))
-           else load_generated_module(module_or_path))
-    roles = getattr(mod, REQUIRED_ROLES_ATTR, None)
+    Accepts a loaded module (read via getattr) or a path (read STATICALLY via
+    `read_required_roles_static`, NO exec — §Fix-B: never exec untrusted code just to
+    read metadata)."""
+    if isinstance(module_or_path, (str, Path)):
+        try:
+            return read_required_roles_static(
+                Path(module_or_path).read_text(encoding="utf-8"))
+        except OSError:
+            return []
+    roles = getattr(module_or_path, REQUIRED_ROLES_ATTR, None)
     if not roles:
         return []
     try:
