@@ -1298,3 +1298,24 @@ def test_read_required_roles_static_no_exec(tmp_path):
     p = _write(tmp_path, "side_effect.py", src)
     assert read_required_roles(p) == ["knee"]
     assert not canary.exists()    # the top-level open() did NOT execute
+
+
+def test_round30_role_reader_path_module_consistent(tmp_path):
+    """§round-30 [FALSE GRANT] fix (A3): read_required_roles must return the SAME roles whether
+    given a PATH (calibrate_task_derived) or a loaded MODULE (compute_generated_metric) — else a
+    reassigned REQUIRED_JOINT_ROLES is VALIDATED under one joint set and DEPLOYED under another.
+    Both paths now resolve to the module SOURCE and parse statically (single source of truth)."""
+    from sculptor.eval.generated_metric import read_required_roles, load_generated_module
+    # a metric that REASSIGNS the constant (first literal != live last binding) used to diverge:
+    src = ('REQUIRED_JOINT_ROLES = ["left_knee", "right_knee"]\n'
+           'REQUIRED_JOINT_ROLES = ["left_shoulder_pitch", "right_shoulder_pitch"]\n'
+           'def compute_spec(a,b,m): return {"spec_score": 0.0}\n')
+    p = _write(tmp_path, "reassign.py", src)
+    mod = load_generated_module(p)
+    assert read_required_roles(p) == read_required_roles(mod)   # validated == deployed
+    # and a normal single-literal metric still reads correctly via both:
+    src2 = ('REQUIRED_JOINT_ROLES = ["left_knee", "right_knee"]\n'
+            'def compute_spec(a,b,m): return {"spec_score": 0.0}\n')
+    p2 = _write(tmp_path, "literal.py", src2)
+    mod2 = load_generated_module(p2)
+    assert read_required_roles(p2) == read_required_roles(mod2) == ["left_knee", "right_knee"]

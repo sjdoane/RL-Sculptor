@@ -177,15 +177,29 @@ def read_required_roles_static(source: str) -> list[str]:
 def read_required_roles(module_or_path) -> list[str]:
     """The canonical joint roles a metric declares via `REQUIRED_JOINT_ROLES`
     (empty list when undeclared — a legacy metric that does its own matching).
-    Accepts a loaded module (read via getattr) or a path (read STATICALLY via
-    `read_required_roles_static`, NO exec — §Fix-B: never exec untrusted code just to
-    read metadata)."""
+
+    Accepts a path OR a loaded module; BOTH resolve to the module SOURCE and parse it
+    STATICALLY (`read_required_roles_static`, NO exec — §Fix-B: never exec untrusted code
+    just to read metadata). §round-30 [FALSE GRANT] fix: the path branch was static but the
+    module branch read the LIVE `getattr`, so a reassigned/mutated `REQUIRED_JOINT_ROLES`
+    was VALIDATED under the static first-literal (calibrate_task_derived reads via path) yet
+    DEPLOYED under the live last-binding (compute_generated_metric read via module) — a
+    metric validated as a knee-reader was granted while deploying as a shoulder-reader. A
+    single static source of truth makes validated == deployed. (Falls back to live `getattr`
+    only when a module exposes no readable `__file__` — a synthetic/in-memory module.)"""
+    src_path: Optional[Path] = None
     if isinstance(module_or_path, (str, Path)):
+        src_path = Path(module_or_path)
+    else:
+        f = getattr(module_or_path, "__file__", None)
+        if f:
+            src_path = Path(f)
+    if src_path is not None:
         try:
-            return read_required_roles_static(
-                Path(module_or_path).read_text(encoding="utf-8"))
+            return read_required_roles_static(src_path.read_text(encoding="utf-8"))
         except OSError:
             return []
+    # No source available (synthetic module) — live getattr fallback.
     roles = getattr(module_or_path, REQUIRED_ROLES_ATTR, None)
     if not roles:
         return []

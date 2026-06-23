@@ -721,7 +721,18 @@ _RETURN_UP_TOKENS = ("up", "rise", "rises", "rising", "stand", "standing",
                      "kip", "kips", "kipping", "peel", "peels", "peeling", "righting",
                      "arise", "arises", "arising", "clamber", "clambers", "clambering",
                      "unfold", "unfolds", "unfolding", "elevate", "elevates", "elevating",
-                     "feet", "upturn", "upend")
+                     "feet", "upturn", "upend",
+                     # §round-30: the lift-SELF-up / gymnastics-rise family (a returns-up goal
+                     # ending by hauling the body off the floor with a verb the round-28 jump and
+                     # round-29 righting families missed — "hoist your torso upright", "haul
+                     # yourself off the ground", "pike up", "bridge up", "muscle up"). Notably
+                     # "heave" was closed in round-29 while its synonyms hoist/haul were not. Still
+                     # the SAFE direction (only ever KEEPS collapse_and_stay_down).
+                     "hoist", "hoists", "hoisting", "haul", "hauls", "hauling", "wrench",
+                     "wrenches", "wrenching", "jolt", "jolts", "jolting", "propel", "propels",
+                     "propelling", "pike", "pikes", "piking", "bridge", "bridges", "bridging",
+                     "lever", "levers", "levering", "jackknife", "jackknifes", "jackknifing",
+                     "muscle", "muscles", "muscling", "pop", "pops", "popping")
 #: A goal whose competent behavior IS standing upright and still (balance / hold a
 #: stance) — for these `do_nothing_upright` (and the idle `jitter`) are ON-goal, so they
 #: must NOT be used as required-losers (they would false-deny a balance metric whose
@@ -1225,6 +1236,16 @@ def adversarial_archetype_gate(
             rec["required_losers"].append(
                 {"name": name, "channel": loser.get("channel"), "score": 0.0,
                  "note": f"unscorable (→0.0): {type(e).__name__}"})
+            if loser.get("reference_only"):
+                # §round-30 [HIGH FALSE GRANT] fix: a reference probe (velocity_peak_ref) that
+                # SELECTIVELY RAISES — keying on the probe's recognizable signature so real rungs
+                # are unaffected — used to leave ref_scores empty → vfr=None → the velocity-floor
+                # verdict was SKIPPED (fail-OPEN), re-enabling the idle-jitter farm. Record 0.0 so
+                # the ratio check fails CLOSED: jitter ≥ _VEL_FLOOR_RATIO·0 trips whenever jitter is
+                # above the idle floor. An honest metric scores velocity_peak_ref fine (high) and is
+                # untouched; only a metric that can't/won't score the high-peak ref while farming
+                # the low-peak jitter is flagged — exactly the farming signature.
+                ref_scores[name] = 0.0
             continue
         s = _gameable_score(s)   # §round-7: a NaN/inf hack score → GAMEABLE (fail-closed)
         losers_scored += 1

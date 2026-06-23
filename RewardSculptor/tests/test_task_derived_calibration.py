@@ -2422,3 +2422,66 @@ def compute_spec(arrays, behavior, meta):
     # genuine terminal goals (incl. "come to rest" — "come" deliberately NOT a return-up token):
     for term in ["lie down to rest", "come to rest on the floor", "lie still and rest"]:
         assert _goal_is_terminal_down(term), term
+
+
+def test_round30_lift_self_up_verbs_keep_collapse(tmp_path):
+    """§round-30 [HIGH FALSE GRANT] fix (A2+B1): a THIRD returns-up verb family the round-28 jump
+    and round-29 righting broadenings missed — the lift-SELF-up / gymnastics-rise verbs
+    (hoist/haul/wrench/jolt/propel/pike/bridge/lever/jackknife/muscle/pop). "collapse then hoist
+    yourself upright" stayed terminal_down=True → dropped collapse_and_stay_down → drop-and-stay
+    confound GRANTED. _RETURN_UP is broadened (SAFE — only KEEPS the loser). Note 'heave' was
+    closed in round-29 while its synonyms hoist/haul were not."""
+    from sculptor.eval.metric_calibration import _goal_is_terminal_down
+    DROP_STAY = '''import numpy as np
+def compute_spec(arrays, behavior, meta):
+    g = arrays.get("projected_gravity_b"); jv = arrays.get("joint_vel")
+    if g is None or jv is None: return {"spec_score": 0.0}
+    gz = np.asarray(g)[..., 2]; v = np.abs(np.asarray(jv))
+    T = gz.shape[0]; last = slice(int(T*0.66), T)
+    down = float((gz[last] > -0.4).mean()); still = float(np.exp(-v[last].mean() / 0.5))
+    return {"spec_score": float(np.clip(down * still, 0, 1))}
+'''
+    descent = [_descent_ladder(), _descent_ladder(), _descent_ladder()]
+    for goal in ["collapse to the floor then hoist yourself upright",
+                 "lie supine then haul yourself off the ground",
+                 "collapse then pike up to your feet",
+                 "lie down then muscle up to standing"]:
+        assert not _goal_is_terminal_down(goal), goal
+        cal = calibrate_task_derived(_write(tmp_path, "ds.py", DROP_STAY),
+            goal, robot_hint="Unitree-G1", client=_FakeLadderClient(*descent))
+        names = {l["name"] for l in (cal["adversarial"] or {}).get("required_losers", [])}
+        assert "collapse_and_stay_down" in names, goal
+        assert cal["rho_min"] >= 0.5 and not cal["ok"], (goal, cal)
+
+
+def test_round30_reference_probe_raise_fails_closed():
+    """§round-30 [HIGH FALSE GRANT] fix (D1): a metric that SELECTIVELY RAISES on the
+    velocity_peak_ref reference probe (keying on its high-whole-body-velocity signature so real
+    rungs are unaffected) used to leave ref_scores empty → vfr=None → the round-26 velocity-floor
+    verdict SKIPPED (fail-OPEN), re-enabling the idle-jitter farm under the ceiling. A
+    reference_only raise now records 0.0 → the ratio check fails CLOSED."""
+    import numpy as np
+    from sculptor.eval.metric_calibration import (
+        general_required_losers, adversarial_archetype_gate, _VEL_FLOOR_RATIO)
+    losers = general_required_losers(G1, "wave your arm up and down")  # active → keeps jitter+ref
+    comp = 1.0   # floor = 0.15, ceiling = min(0.6, 0.5) = 0.5
+
+    def gen_fn(arrays, behavior, meta):
+        jv = np.asarray(arrays.get("joint_vel")); g = np.asarray(arrays.get("projected_gravity_b"))
+        mean_v = float(np.abs(jv).mean())
+        frac_moving = float((np.abs(jv).mean(axis=(0, 1)) > 0.3).mean())
+        if mean_v > 2.0 and frac_moving > 0.5:        # velocity_peak_ref signature → SABOTAGE
+            raise ValueError("evade the reference probe")
+        up = float((g[..., 2] < -0.85).mean())
+        return {"spec_score": float(np.clip(up * (1 - np.exp(-mean_v / 3.3)), 0, 1))}  # jitter ~0.30
+
+    rec = adversarial_archetype_gate(
+        gen_fn, [], list(G1), comp, client=None, author=False,
+        required_losers=losers, scored_channels=["posture", "completion", "velocity"])
+    js = {l["name"]: l.get("score") for l in rec["required_losers"]}
+    # the ref probe raised → recorded 0.0 (fail-closed), and jitter (below the 0.5 ceiling) is the
+    # SOLE denier via the velocity-floor verdict:
+    assert js.get("velocity_peak_ref") == 0.0
+    assert rec["gameable"] is True
+    assert rec.get("velocity_floor")
+    assert 0.15 <= js["jitter_in_place"] < rec["ceiling"]   # caught by velocity-floor, NOT the ceiling
