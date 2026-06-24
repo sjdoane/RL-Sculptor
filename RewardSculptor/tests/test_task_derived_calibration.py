@@ -2870,3 +2870,36 @@ def compute_spec(arrays, behavior, meta):
         assert cal["ok"], (goal, cal)                        # honest lateral locomotion GRANTS
         names = {l["name"] for l in (cal["adversarial"] or {}).get("required_losers", [])}
         assert "walk_away_upright" not in names              # dropped (ladder travels → trusted)
+
+
+# ── §round-34 ─────────────────────────────────────────────────────────
+
+
+def test_round34_polysemous_locomotion_token_keeps_travel_probe(tmp_path):
+    """§round-34 [HIGH FALSE GRANT] fix: the round-33 `ladder_travels = _ladder_travels(...) or
+    _goal_is_locomotion(...)` let a POLYSEMOUS locomotion verb in a STATIONARY goal ("slide a puck
+    across the table", "shuffle the deck", "pace your breathing") DROP walk_away_upright on a
+    non-traveling ladder → re-opened the round-32 additive horizontal-travel farm. The LIVE path now
+    TRUSTS THE LADDER ALONE (the keyword stays only as the no-ladder fallback in
+    general_required_losers); a stationary ladder KEEPS the probe. The round-33 sidestep grant still
+    holds (a genuine sidestep ladder DOES travel — verified in the round-33 test)."""
+    TRAVEL_FARM = '''import numpy as np
+REQUIRED_JOINT_ROLES = ["left_knee", "right_knee"]
+def compute_spec(arrays, behavior, meta):
+    jv = arrays.get("joint_vel"); grav = arrays.get("projected_gravity_b"); root = arrays.get("root_link_pos_w")
+    if jv is None or grav is None or root is None: return {"spec_score": 0.0}
+    roles = (meta or {}).get("joint_roles", {}); knees=[roles[r] for r in ("left_knee","right_knee") if r in roles]
+    if not knees: return {"spec_score": 0.0}
+    up = float(np.mean(grav[..., 2] < -0.85))
+    kp = float(np.abs(jv[..., knees]).max(axis=2).max(axis=0).mean()); burst = 1 - float(np.exp(-kp / 8.0))
+    xy = float(np.linalg.norm(root[..., :2].max(0) - root[..., :2].min(0), axis=-1).mean()); travel = 1 - float(np.exp(-xy / 1.0))
+    return {"spec_score": float(np.clip(up * (0.4 * burst + 0.6 * travel), 0, 1))}
+'''
+    for goal in ["slide a puck across the table with the left foot",
+                 "shuffle the deck of cards", "pace your breathing while standing"]:
+        cal = calibrate_task_derived(_write(tmp_path, "tf.py", TRAVEL_FARM),
+            goal, robot_hint="Unitree-G1",
+            client=_FakeLadderClient(kick_ladder(), kick_ladder(), kick_ladder()))  # STATIONARY ladder
+        assert not cal["ok"], (goal, cal)                    # the travel farm is DENIED
+        names = {l["name"] for l in (cal["adversarial"] or {}).get("required_losers", [])}
+        assert "walk_away_upright" in names, goal            # KEPT (stationary ladder → not dropped)

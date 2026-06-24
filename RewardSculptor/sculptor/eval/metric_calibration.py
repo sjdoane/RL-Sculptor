@@ -1977,21 +1977,21 @@ def calibrate_task_derived(
             # ladder's commanded base speed (anti-collusion-safe), to decide whether the
             # walk_away_upright travel probe is on-goal (locomotion → drop) or off-goal (stationary
             # → keep, catching the additive horizontal-travel farm).
-            # §round-33 [HIGH FALSE REJECT] fix: the blind ladder's commanded travel is the
-            # AUTHORITATIVE signal — when it travels, the goal IS locomotion and walk_away must be
-            # dropped (else an honest locomotion metric that reads root displacement scores the probe
-            # ≥ ceiling = HARD deny). The round-32 goal-text backstop SUBTRACTED that correct signal
-            # whenever the keyword missed the verb (sidestep/strafe/shuffle/backpedal…) → false-
-            # rejected honest lateral-locomotion metrics. So the keyword now only ADDS recognition
-            # (ladder OR keyword), never subtracts a True ladder signal. (A stationary goal with a
-            # mismatched traveling ladder dropping the probe is the documented incompetent-author
-            # residual — an honest stationary metric scores a traveling ladder poorly → base-gate.)
-            ladder_travels = _ladder_travels(valid_ladders) or _goal_is_locomotion(behavior_goal)
-            # §round-33 [HIGH FALSE GRANT] fix: derive whether the goal HOPS vertically from the
-            # blind ladder's commanded hops (anti-collusion-safe) to decide whether the
-            # hop_in_place_upright probe is on-goal (jump → drop) or off-goal (kept, catching the
-            # additive vertical root-z farm). Keyword (_goal_is_jump) only ADDS recognition.
-            ladder_hops = _ladder_hops(valid_ladders) or _goal_is_jump(behavior_goal)
+            # §round-33/34: the blind ladder's commanded travel is the AUTHORITATIVE, anti-collusion-
+            # safe signal — when it travels, the goal IS locomotion and walk_away must be dropped (else
+            # an honest locomotion metric scores the probe ≥ ceiling = HARD deny). §round-34 [HIGH
+            # FALSE GRANT] fix: the round-33 `or _goal_is_locomotion(...)` let a POLYSEMOUS locomotion
+            # token in a STATIONARY goal ("slide a puck across the table", "pace your breathing",
+            # "shuffle the deck") DROP walk_away on a non-traveling ladder → re-opened the round-32
+            # additive horizontal-travel farm. The keyword can ONLY ADD a (wrong) drop, never recover a
+            # missed one beyond what the ladder already encodes — so on the LIVE path TRUST THE LADDER
+            # ALONE (the round-33 sidestep false-reject is fixed by the ladder, which DOES travel for a
+            # genuine sidestep goal — the keyword was never load-bearing there). The keyword stays only
+            # as the no-ladder fallback INSIDE general_required_losers (direct/test callers).
+            ladder_travels = _ladder_travels(valid_ladders)
+            # §round-33/34 [same fix]: trust the ladder's commanded hops for the jump-goal drop signal
+            # (a polysemous jump word in a stationary goal must not drop hop_in_place_upright).
+            ladder_hops = _ladder_hops(valid_ladders)
             if fam == "kick" and adversarial_required_losers:
                 # opt-in breadth: the DEDICATED kick losers (WITH foot_pos_b direction
                 # channel that render_rung can't synthesize).
