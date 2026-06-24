@@ -656,6 +656,18 @@ import pytest as _pytest
                             "    fg = np.random.seed.func_globals\n    return {'spec_score':0.5}\n"),
     ("cython_func_code", "import numpy as np\ndef compute_spec(a,b,m):\n"
                          "    fc = np.random.seed.func_code\n    return {'spec_score':0.5}\n"),
+    # §round-32 (CRITICAL): `help(name)` → _sitebuiltins.Helper → pydoc → import_module(name) RUNS
+    # the named module's top-level code (RCE). The module name is chr()-assembled so the round-19
+    # '__'-string scan never sees it, and `help` is a bare builtin Name with no gi_/cr_/ag_/f_/tb_/
+    # func_ prefix → it slipped every prior gate. help/copyright/license/credits/dir/hasattr are now
+    # in _FORBIDDEN_NAMES.
+    ("help_import_rce", "def compute_spec(a,b,m):\n"
+                        "    help(chr(119)+chr(97)+chr(118)+chr(101))\n    return {'spec_score':0.5}\n"),
+    ("help_aliased", "def compute_spec(a,b,m):\n    h = help\n    h(chr(111)+chr(115))\n    return {'spec_score':0.5}\n"),
+    ("copyright_printer", "def compute_spec(a,b,m):\n    x = copyright\n    return {'spec_score':0.5}\n"),
+    ("credits_printer", "def compute_spec(a,b,m):\n    x = credits\n    return {'spec_score':0.5}\n"),
+    ("dir_reflection", "def compute_spec(a,b,m):\n    x = dir(a)\n    return {'spec_score':0.5}\n"),
+    ("hasattr_reflection", "def compute_spec(a,b,m):\n    x = hasattr(a, chr(120))\n    return {'spec_score':0.5}\n"),
 ])
 def test_ast_safety_blocks_escape_vectors(name, src):
     """Each round-9-reproduced sandbox-escape vector is REJECTED by the static gate."""

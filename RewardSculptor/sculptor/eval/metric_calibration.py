@@ -713,8 +713,22 @@ _TERMINAL_DOWN_TOKENS = ("lie", "lay", "lying", "laying", "sleep", "rest",
 #: genuine lie/rest goal that happens to name a jump verb), NEVER drops a loser → never a
 #: false-grant. (Symmetric to the round-24 lesson that broadening the ACTIVE list is the safe
 #: direction for static_hold.) The durable robust fix remains goal-joint scoping.
+#: §round-32 [MEDIUM FALSE REJECT] fix: the body-part / posture NOUNS "back"/"feet"/"overhead"
+#: were REMOVED from this set. They were added (rounds 28-30) as return-to-standing CUES, but
+#: they are AMBIGUOUS — "lie on your back and rest", "lie with your feet up and rest", "lie down
+#: with arms overhead and rest" are GENUINELY terminal-down goals that contain them, so they
+#: false-flipped _goal_is_terminal_down → False → the round-27 ladder_td backstop OVERRODE the
+#: correct down-ending LADDER signal → collapse_and_stay_down was KEPT → an HONEST lie-rest metric
+#: that legitimately scores a collapsed policy ≥ the ceiling was firewall-DENIED (reproduced 3/3 on
+#: the commonest supine phrasings). This contradicted the "broadening is observe-only at worst"
+#: claim: keeping the loser on a terminal goal whose honest metric scores it high is a HARD deny.
+#: Every "to your feet" / "get back up" return-up TEST goal also carries a rising VERB (rebound/
+#: scramble/kip/pike/stand/up), which still classifies it non-terminal, so removal is regression-
+#: safe; and the live path's authoritative ladder signal protects a genuine get-up goal (its ladder
+#: ends UPRIGHT → ladder_td=False regardless of keywords). Only unambiguous rising VERBS/posture
+#: words belong here, never bare body-part nouns.
 _RETURN_UP_TOKENS = ("up", "rise", "rises", "rising", "stand", "standing",
-                     "return", "returns", "back", "recover", "straighten", "tall",
+                     "return", "returns", "recover", "straighten", "tall",
                      # §round-28: the jump / leap / ascend family (a goal returning up via a
                      # ballistic/rising verb, incl. the "up" compounds that tokenize whole):
                      "jump", "jumps", "jumping", "leap", "leaps", "leaping", "spring",
@@ -723,7 +737,7 @@ _RETURN_UP_TOKENS = ("up", "rise", "rises", "rising", "stand", "standing",
                      "exploding", "launch", "launches", "launching", "soar", "soars",
                      "soaring", "ascend", "ascends", "ascending", "climb", "climbs",
                      "climbing", "lift", "lifts", "lifting", "upward", "upwards",
-                     "skyward", "airborne", "aloft", "overhead", "erect", "vertical",
+                     "skyward", "airborne", "aloft", "erect", "vertical",
                      # §round-29: the return-to-feet / RIGHTING family (a goal that ends by
                      # getting back UP off the floor via a non-ballistic righting verb the
                      # round-28 jump family missed: "rebound to your feet", "heave yourself off
@@ -747,7 +761,16 @@ _RETURN_UP_TOKENS = ("up", "rise", "rises", "rising", "stand", "standing",
                      "wrenches", "wrenching", "jolt", "jolts", "jolting", "propel", "propels",
                      "propelling", "pike", "pikes", "piking", "bridge", "bridges", "bridging",
                      "lever", "levers", "levering", "jackknife", "jackknifes", "jackknifing",
-                     "muscle", "muscles", "muscling", "pop", "pops", "popping")
+                     "muscle", "muscles", "muscling", "pop", "pops", "popping",
+                     # §round-32 [HIGH FALSE GRANT] fix: the SIT-UP / return-to-vertical family the
+                     # jump/righting/lift-self-up families missed — "collapse to the floor then sit
+                     # upright", "lie prone then sit your torso to upright". "upright" is the clean,
+                     # unambiguous vertical cue (a terminal-down goal is by definition NOT upright,
+                     # so it rarely collides — unlike the body-part nouns removed above); situp/
+                     # situps are unambiguous one-word gymnastics-rise terms. NOT bare "sit" (it is
+                     # ambiguous — "sit DOWN and rest" is terminal — and would re-introduce the
+                     # body-part-noun false-reject for the very common seated-rest goals).
+                     "upright", "situp", "situps")
 #: A goal whose competent behavior IS standing upright and still (balance / hold a
 #: stance) — for these `do_nothing_upright` (and the idle `jitter`) are ON-goal, so they
 #: must NOT be used as required-losers (they would false-deny a balance metric whose
@@ -815,6 +838,25 @@ _ACTIVE_MOTION_TOKENS = (
 #: directional-travel words — a goal that travels is never a static hold (defense-in-depth).
 _DIRECTIONAL_TOKENS = ("forward", "forwards", "backward", "backwards", "ahead", "behind",
                        "left", "right", "sideways", "laterally", "across")
+#: §round-32 [CRITICAL FALSE GRANT] fix: LOCOMOTION verbs — a goal whose competent behavior
+#: TRAVELS the base across the ground (walk/run/march/…). For these, the upright-while-traveling
+#: probe `walk_away_upright` is ON-goal (dropped); for a STATIONARY goal it is OFF-goal (kept), so
+#: an additive SUM that farms the wholly-uncovered horizontal-travel channel (a run-forward policy
+#: that performs none of the in-place goal) is caught. KEYWORD FALLBACK only — the authoritative
+#: signal is the blind ladder's own commanded travel (`_ladder_travels`), goal-text-independent and
+#: anti-collusion-safe. "march in place"/"jog on the spot" are deliberately NOT travel (the
+#: stationary qualifier wins) — and the ladder backstops them regardless.
+_LOCOMOTION_TOKENS = ("walk", "walks", "walking", "run", "runs", "running", "march",
+                      "marches", "marching", "jog", "jogs", "jogging", "sprint", "sprints",
+                      "sprinting", "dash", "dashes", "dashing", "stride", "strides",
+                      "striding", "crawl", "crawls", "crawling", "gallop", "gallops",
+                      "galloping", "trot", "trots", "trotting", "advance", "advances",
+                      "advancing", "traverse", "traverses", "traversing", "locomote",
+                      "wander", "wanders", "wandering", "travel", "travels", "traveling",
+                      "travelling")
+_STATIONARY_QUALIFIERS = ("in place", "on the spot", "in-place", "without moving",
+                          "without traveling", "stay put", "staying put")
+_LOCOMOTION_SPEED_MIN = 0.3   # m/s — a ladder rung at/above this commands sustained travel
 
 
 def _goal_is_terminal_down(behavior_goal: str) -> bool:
@@ -822,6 +864,42 @@ def _goal_is_terminal_down(behavior_goal: str) -> bool:
     collapse-and-stay policy is ON-goal and must not be used as a required-loser."""
     toks = set(re.findall(r"[a-z]+", (behavior_goal or "").lower()))
     return bool(toks & set(_TERMINAL_DOWN_TOKENS)) and not (toks & set(_RETURN_UP_TOKENS))
+
+
+def _goal_is_locomotion(behavior_goal: str) -> bool:
+    """KEYWORD FALLBACK (used only when no authored ladder is available — the authoritative
+    signal is `_ladder_travels`). True iff the goal commands sustained base TRAVEL across the
+    ground, so the upright-while-traveling probe `walk_away_upright` is ON-goal (dropped). A
+    STATIONARY qualifier ('in place', 'on the spot') vetoes (a 'march in place' does not travel).
+    BIASED toward False (the safe direction for the travel probe: a miss KEEPS the loser →
+    observe-only, never a gate-weakening false-grant)."""
+    g = (behavior_goal or "").lower()
+    if any(q in g for q in _STATIONARY_QUALIFIERS):
+        return False
+    toks = set(re.findall(r"[a-z]+", g))
+    return bool(toks & set(_LOCOMOTION_TOKENS))
+
+
+def _ladder_travels(valid_ladders: Any) -> bool:
+    """§round-32: True iff a STRICT MAJORITY of valid ladders command sustained TRAVEL (a rung
+    with |forward_speed_mps| or |lateral_speed_mps| ≥ _LOCOMOTION_SPEED_MIN). The blind author's
+    competent ladder for a locomotion goal travels; for a stationary goal (kick/wave/fold/balance/
+    lie) every rung stays in place. Goal-text-independent + anti-collusion-safe (mirrors
+    `_ladder_posture` / `_ladder_has_crouched_rung`). When it travels, `walk_away_upright` is
+    on-goal and is dropped; otherwise it is kept so an additive horizontal-travel farm is caught."""
+    ladders = list(valid_ladders or [])
+    if not ladders:
+        return False
+
+    def travels(L: Any) -> bool:
+        for rung in (L or []):
+            fs = abs(float(getattr(rung, "forward_speed_mps", 0.0) or 0.0))
+            ls = abs(float(getattr(rung, "lateral_speed_mps", 0.0) or 0.0))
+            if fs >= _LOCOMOTION_SPEED_MIN or ls >= _LOCOMOTION_SPEED_MIN:
+                return True
+        return False
+
+    return sum(1 for L in ladders if travels(L)) * 2 > len(ladders)
 
 
 def _goal_is_static_hold(behavior_goal: str) -> bool:
@@ -1040,6 +1118,7 @@ def _ladder_posture(top_specs: list) -> tuple[Optional[bool], Optional[bool]]:
 def general_required_losers(
     joint_names: list[str], behavior_goal: str = "",
     *, static_hold: Optional[bool] = None, terminal_down: Optional[bool] = None,
+    travels: Optional[bool] = None,
 ) -> list[dict]:
     """§round-13 FALSE-GRANT fix: DETERMINISTIC, goal-AGNOSTIC gaming probes that a
     genuine metric of ANY active goal must score LOW, but a CONFOUND-only proxy
@@ -1093,6 +1172,7 @@ def general_required_losers(
 
     sh = _goal_is_static_hold(behavior_goal) if static_hold is None else static_hold
     td = _goal_is_terminal_down(behavior_goal) if terminal_down is None else terminal_down
+    tr = _goal_is_locomotion(behavior_goal) if travels is None else travels
     losers: list[dict] = []
     if not (sh and not td):   # still-upright losers are on-goal ONLY for a balance goal
         # do_nothing is PERFECTLY still + upright and performs NO active goal, so an honest
@@ -1132,6 +1212,26 @@ def general_required_losers(
         losers.append(_pack("velocity_peak_ref", "velocity",
                             MotionSpec(uprightness=1.0, base_height_m=0.7, tremor=0.10),
                             610, reference_only=True))
+    # §round-32 [CRITICAL FALSE GRANT] fix: an upright policy that TRAVELS forward while
+    # performing NONE of the in-place goal — the off-goal horizontal-travel channel that every
+    # prior loser leaves wholly UNCOVERED (do_nothing/jitter/ref are stationary-upright; collapse
+    # is toppled-in-place; all four have 0 m base travel and all stationary ladder rungs do too).
+    # So an additive SUM `up·(α·goal + β·travel)` ranks the (non-traveling) ladder via the goal
+    # term while the dormant β·travel term invisibly farms a run-forward policy (scored ≥ the
+    # ceiling). An honest metric of an active STATIONARY goal reads the goal's joints/posture —
+    # walk_away has zero joint motion and nominal height/uprightness, so it scores ~0. KEPT only
+    # for an ACTIVE, STATIONARY, NON-balance goal: dropped for a locomotion goal (travel is
+    # on-goal), a balance goal (an honest uprightness-only balance metric scores an upright
+    # traveler high → would be false-rejected), and a lie goal (an honest low metric scores an
+    # upright traveler ~0 anyway). The DURABLE close of the additive-SUM class is the
+    # min-composition law; this probe closes the specific (and large) locomotion channel.
+    if not tr and not sh and not td:
+        # travels DIAGONALLY (forward AND lateral) so a farm keyed on root x-range, y-range, OR the
+        # xy-norm all read a large displacement → caught regardless of the travel axis; an in-place
+        # honest metric reads the goal's joints (zero here) and nominal height/uprightness → ~0.
+        losers.append(_pack("walk_away_upright", "locomotion",
+                            MotionSpec(uprightness=1.0, base_height_m=0.7,
+                                       forward_speed_mps=1.5, lateral_speed_mps=1.0), 605))
     if not td:
         losers.append(_pack("collapse_and_stay_down", "completion",
                             MotionSpec(uprightness=0.0, base_height_m=[0.7, 0.1]), 602))
@@ -1415,17 +1515,31 @@ def adversarial_archetype_gate(
         vel_floor_gamed = True
         rec["velocity_floor"] = {"jitter": round(vfj, 4), "peak_ref": round(vfr, 4),
                                  "ratio_thresh": _VEL_FLOOR_RATIO}
-    # §round-31 UNIFIED probe-raise fail-open closure: a SURGICAL raise on a verdict-feeding probe
-    # (do_nothing floor / jitter+ref velocity-floor) skips that probe's verdict (fail-OPEN). It is
-    # gaming iff ≥1 verdict-probe RAISED **and** ≥1 was SCORED — i.e. the raise targets the single
-    # probe the metric would farm while it happily scores the others. The round-15 honest-onset case
-    # raises on ALL THREE (can't time any static rollout) → scores none → not flagged. (Residual: an
-    # attacker who raises on ALL three evades, but then RAISES at runtime on the very idle/twitch
-    # policies it would farm → can't reward them except at off-probe-point neighborhoods — the
-    # documented single-point-probe structural limit, not a clean catch.)
-    probe_raise_gamed = bool(raised_vfp) and bool(scored_vfp) and float(competent_ref) > 0
+    # §round-32 [HIGH FALSE REJECT] fix of the round-31 rule: the three verdict probes form a
+    # MOTION LADDER — do_nothing_upright (mean|jv|=0) < jitter_in_place (≈1.18) < velocity_peak_ref
+    # (≈2.94). The round-31 "≥1 RAISED ∧ ≥1 SCORED" rule was OVER-BROAD: an HONEST onset/phase
+    # KICK metric (onset = first frame knee-vel > thresh) legitimately RAISES on the ZERO-motion
+    # do_nothing (empty selection → IndexError) while SCORING the moving jitter/ref probes far below
+    # every threshold — the same surgical signature, but it is not gaming (its guarded twin GRANTS;
+    # it ranks the ladder identically to the honest reference). Split by which probe raised:
+    #   • jitter_in_place / velocity_peak_ref raised → ALWAYS evasion. Both are MOTION rollouts an
+    #     honest joint-velocity metric SCORES without raising; a pelvis-only honest metric that DOES
+    #     raise on them (flat pelvis) also raises on do_nothing (all flat) → scored_vfp is empty
+    #     (the round-15 case, excluded below). So a motion-probe raise WITH another probe scored is a
+    #     surgical fail-open (round-30 D1 ref-floor, round-31 A1 jitter velocity-floor).
+    #   • do_nothing_upright raised → AMBIGUOUS (an honest onset metric has no event to time on a
+    #     still rollout). Flag it only with POSITIVE stillness-farm evidence: the metric scores the
+    #     lower-motion jitter ≥ the higher-motion ref (motion-ANTI-monotone → it would score the
+    #     zero-motion do_nothing ≥ both → BREACH the floor it skipped). The honest onset metric scores
+    #     ref > jitter (motion-sensitive → do_nothing would be ~0 → floor passes) → NOT flagged.
+    motion_probe_raised = bool(raised_vfp & {"jitter_in_place", "velocity_peak_ref"})
+    do_nothing_farm = ("do_nothing_upright" in raised_vfp
+                       and vfj is not None and vfr is not None and vfj >= vfr)
+    probe_raise_gamed = ((motion_probe_raised or do_nothing_farm)
+                         and bool(scored_vfp) and float(competent_ref) > 0)
     if probe_raise_gamed:
-        rec["probe_raise"] = {"raised": sorted(raised_vfp), "scored": sorted(scored_vfp)}
+        rec["probe_raise"] = {"raised": sorted(raised_vfp), "scored": sorted(scored_vfp),
+                              "via": "motion_probe" if motion_probe_raised else "do_nothing_farm"}
     gameable = ((not np.isfinite(worst))   # §round-7: non-finite worst → fail-closed
                 or (worst >= rel_ceil * float(competent_ref)) or (worst >= abs_ceil)
                 or floor_gamed              # §round-21: a pure-idle probe breached its floor
@@ -1775,6 +1889,15 @@ def calibrate_task_derived(
             # false-reject, never a gate-weakening false-grant.
             if ladder_td and not _goal_is_terminal_down(behavior_goal):
                 ladder_td = False
+            # §round-32 [CRITICAL FALSE GRANT] fix: derive whether the goal TRAVELS from the blind
+            # ladder's commanded base speed (anti-collusion-safe), to decide whether the
+            # walk_away_upright travel probe is on-goal (locomotion → drop) or off-goal (stationary
+            # → keep, catching the additive horizontal-travel farm). Goal-text backstop in the SAFE
+            # direction (mirrors ladder_td): a clearly NON-locomotion goal with a mistakenly
+            # traveling ladder KEEPS the loser (a keyword miss only ever keeps it → observe-only).
+            ladder_travels = _ladder_travels(valid_ladders)
+            if ladder_travels and not _goal_is_locomotion(behavior_goal):
+                ladder_travels = False
             if fam == "kick" and adversarial_required_losers:
                 # opt-in breadth: the DEDICATED kick losers (WITH foot_pos_b direction
                 # channel that render_rung can't synthesize).
@@ -1787,7 +1910,8 @@ def calibrate_task_derived(
                 # req_losers=None there → firewall OFF → a posture/velocity confound granted).
                 # A real metric scores them ~0; a confound scores one at/above the ceiling.
                 req_losers = general_required_losers(
-                    names, behavior_goal, static_hold=ladder_sh, terminal_down=ladder_td)
+                    names, behavior_goal, static_hold=ladder_sh, terminal_down=ladder_td,
+                    travels=ladder_travels)
                 sc = list(_GENERAL_SCORED_CHANNELS)
             # §round-19: record the obligation for any channel a loser actually covers (the
             # terminal-down floor-thrash loser adds a 'stillness' channel) so coverage_gaps

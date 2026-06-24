@@ -3,6 +3,9 @@
 .env.*
 !.env.example
 
+# Adversarial-review scratch (repro harness + agent debris — never committed)
+scratch_*.py
+
 # uv / Python
 .venv/
 __pycache__/

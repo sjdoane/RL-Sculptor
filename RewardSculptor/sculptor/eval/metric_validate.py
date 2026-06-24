@@ -53,6 +53,15 @@ _FORBIDDEN_NAMES = {
     # only `except Exception`. None is legitimate in a physical-quantity metric (which uses
     # `except Exception`). exit/quit are the same vector as bare builtins.
     "SystemExit", "KeyboardInterrupt", "GeneratorExit", "BaseException", "exit", "quit",
+    # §round-32 SECURITY (CRITICAL): the interactive site builtins are import/exec FRONT-ENDS.
+    # `help(name)` → `_sitebuiltins.Helper` → `pydoc.render_doc` → `importlib.import_module(name)`,
+    # which RUNS the named module's top-level code (arbitrary import + RCE). The module name can be
+    # assembled with `chr(...)` so the round-19 `__`-in-string scan never sees it, and `help` is a
+    # bare builtin Name with no gi_/cr_/ag_/f_/tb_/func_ prefix, no dunder, no `.format` — it slipped
+    # every prior gate. copyright/license/credits are the same `_sitebuiltins._Printer` family; dir/
+    # hasattr are reflection primitives (siblings of the already-blocked getattr/vars). None appears
+    # in a legitimate physical-quantity metric. (Durable close: the designed subprocess sandbox.)
+    "help", "copyright", "license", "credits", "dir", "hasattr",
 }
 #: §round-9 SECURITY: numpy is itself a full IO / native-code / reflection surface, so the
 #: numpy-only import gate is NOT a sandbox on its own. These attribute names (numpy fns,
