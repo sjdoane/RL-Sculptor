@@ -3034,3 +3034,34 @@ def compute_spec(arrays, behavior, meta):
     sc = (cal["adversarial"] or {}).get("scope", {})
     assert sc.get("gameable") and sc.get("drop", 0) >= 0.25, sc   # caught via the REMOVE direction
     assert "scope" in (cal.get("reason") or "")             # §round-37: the reason is now populated
+
+
+def test_round37_on_goal_rom_confound_on_velocity_goal_caught(tmp_path):
+    """§round-37 (round-36 defect 3): on a VELOCITY-characterized goal (the kick ladder grades by
+    burst peak_radps), a metric reading ONLY the goal joints' POSITION ROM (no velocity/phase) is
+    degenerate — a slow large-ROM leg sweep games it. Fix A now also SLOWS the goal joints (same ROM,
+    ~zero velocity): a velocity metric drops, a ROM-only metric is invariant → flagged. An honest
+    knee-scoped velocity (GOOD_KICK) drops (~0.26 retained) and grants; a fold/ROM goal (non-velocity-
+    mode) is NOT subjected to the slow-down (its slow motion is on-goal)."""
+    ROM = '''import numpy as np
+REQUIRED_JOINT_ROLES = ["left_hip_pitch", "left_knee"]
+def compute_spec(arrays, behavior, meta):
+    g = arrays.get("projected_gravity_b"); jp = arrays.get("joint_pos")
+    if g is None or jp is None: return {"spec_score": 0.0}
+    roles = (meta or {}).get("joint_roles", {}); gj = [roles[r] for r in ("left_hip_pitch", "left_knee") if r in roles]
+    if not gj: return {"spec_score": 0.0}
+    up = float(np.mean(g[..., 2] < -0.85)); rom = float(np.mean(jp[..., gj].max(0) - jp[..., gj].min(0)))
+    return {"spec_score": float(np.clip(up * (1 - np.exp(-rom / 1.8)), 0, 1))}
+'''
+    cal = calibrate_task_derived(_write(tmp_path, "rom.py", ROM),
+        "repeatedly kick forward with the left leg", robot_hint="Unitree-G1",
+        client=_FakeLadderClient(kick_ladder(), kick_ladder(), kick_ladder()))
+    assert not cal["ok"], cal                                # the slow-ROM-sweep confound is DENIED
+    sc = (cal["adversarial"] or {}).get("scope", {})
+    assert sc.get("on_goal_char") and sc.get("slow_retained", 0) >= 0.6, sc
+    # GOOD_KICK (knee-scoped velocity) drops under the slow-down → grants:
+    calg = calibrate_task_derived(_write(tmp_path, "gk.py", GOOD_KICK),
+        "repeatedly kick forward with the left leg", robot_hint="Unitree-G1",
+        client=_FakeLadderClient(kick_ladder(), kick_ladder(), kick_ladder()))
+    assert calg["ok"], calg
+    assert not (calg["adversarial"] or {}).get("scope", {}).get("on_goal_char")

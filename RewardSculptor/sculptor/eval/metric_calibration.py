@@ -1363,6 +1363,11 @@ _PERTURB_REL_FRAC = 0.5    # ...OR claims ≥ this fraction of the remaining hea
 _PERTURB_ABS_FLOOR = 0.03  #    a ceiling-SATURATED gate whose absolute rise is bounded by 1−comp,
 #                              gated by a small absolute floor so an honest saturated metric (rise 0) is safe
 _PERTURB_DT = 0.02
+#: §round-37 (round-36 defect 3): for a VELOCITY-characterized goal, a metric that RETAINS ≥ this
+#: fraction of its competent score under a goal-joint SLOW-DOWN (same ROM, ~zero velocity) reads only
+#: ROM/position, not the goal's required burst speed → gameable by a slow large-ROM sweep. GOOD_KICK
+#: retains ~0.26; a pure-ROM confound retains ~1.0 — so 0.6 separates cleanly with a wide margin.
+_PERTURB_SLOW_RETAIN = 0.6
 
 
 def _derive_goal_channels(valid_ladders: Any, names: list[str]) -> tuple[set, set]:
@@ -1454,6 +1459,41 @@ def _perturb_off_goal(arrays: dict, goal_joints: set, on_root: set, *,
     return out
 
 
+def _ladder_is_velocity_mode(valid_ladders: Any) -> bool:
+    """§round-37 (round-36 defect 3): True iff the goal is VELOCITY-characterized — the blind ladder
+    grades competence by burst SPEED (any group with peak_radps > 0, i.e. mode='burst'). For these a
+    fast burst IS the goal; a SLOW large-ROM goal-joint sweep is degenerate. For ROM/amplitude-
+    characterized goals (fold/oscillate, peak_radps=0) a slow large motion is on-goal, so the slow-down
+    check is NOT applied (it would false-reject honest fold/ROM metrics)."""
+    for L in (valid_ladders or []):
+        for rung in (getattr(L, "rungs", L) or []):
+            for gr in (getattr(rung, "groups", []) or []):
+                if abs(float(getattr(gr, "peak_radps", 0.0) or 0.0)) > 1e-6:
+                    return True
+    return False
+
+
+def _slow_goal_joints(arrays: dict, goal_joints: set) -> dict:
+    """§round-37: replace the GOAL joints' trajectories with a SLOW ramp through their per-env
+    [min, max] range — same ROM/amplitude, ~zero velocity. A velocity/burst metric DROPS (its peak
+    collapses); a ROM-only metric is INVARIANT (it reads the unchanged range). Off-goal channels +
+    uprightness are left as the competent reference."""
+    jp = np.asarray(arrays["joint_pos"]).copy()
+    jv = np.asarray(arrays["joint_vel"]).copy()
+    T = jp.shape[0]
+    ramp = np.linspace(0.0, 1.0, T)
+    for j in goal_joints:
+        lo = jp[:, :, j].min(axis=0)
+        hi = jp[:, :, j].max(axis=0)
+        jp[:, :, j] = lo[None, :] + ramp[:, None] * (hi - lo)[None, :]
+    jv2 = np.gradient(jp, axis=0) / _PERTURB_DT
+    for j in goal_joints:
+        jv[:, :, j] = jv2[:, :, j]
+    out = dict(arrays)
+    out["joint_pos"], out["joint_vel"] = jp, jv
+    return out
+
+
 def _neutralize_off_goal(arrays: dict, goal_joints: set, on_root: set) -> dict:
     """§round-37 (round-36 defect 2): the REMOVE-direction companion of _perturb_off_goal. REMOVE the
     competent reference's OFF-goal motion (still the off-goal joints at their first frame; freeze the
@@ -1517,6 +1557,17 @@ def off_goal_perturbation_verdict(
         narr = _neutralize_off_goal(arrays, goal_joints, on_root)
         nmeta = dict(meta); inject_joint_roles(nmeta, roles)
         neut = _gameable_score(float(gen_fn(narr, behavior, nmeta).get("spec_score", 0.0)))
+        # §round-37 (round-36 defect 3): for a VELOCITY-characterized goal, also SLOW the goal joints
+        # (same ROM, ~zero velocity). A burst/velocity metric drops; a ROM-only metric is invariant →
+        # it reads only the on-goal channel's RANGE, not the goal's required SPEED → gameable by a slow
+        # large-ROM sweep. Only for burst goals + with goal joints (a fold/ROM goal's slow motion is
+        # on-goal, so this is NOT applied — it would false-reject honest fold metrics).
+        slow_retained = None
+        if goal_joints and _ladder_is_velocity_mode(valid_ladders):
+            sarr = _slow_goal_joints(arrays, goal_joints)
+            smeta = dict(meta); inject_joint_roles(smeta, roles)
+            slow = _gameable_score(float(gen_fn(sarr, behavior, smeta).get("spec_score", 0.0)))
+            slow_retained = slow / comp if comp > 0 else 0.0
     except Exception:  # noqa: BLE001 — never raises, never denies on absence of evidence
         return rec
     rise = pert - comp           # ADD off-goal → score rises (rewards added off-goal motion)
@@ -1524,9 +1575,12 @@ def off_goal_perturbation_verdict(
     headroom = max(1.0 - comp, 0.0)
     swing = max(rise, drop)
     gameable = (swing >= margin) or (swing >= _PERTURB_REL_FRAC * headroom and swing > _PERTURB_ABS_FLOOR)
+    on_goal_char = bool(slow_retained is not None and slow_retained >= _PERTURB_SLOW_RETAIN)
+    gameable = gameable or on_goal_char   # §round-37: ON-goal motion-character (velocity goal, ROM-only metric)
     rec.update(ran=True, gameable=bool(gameable), comp=round(comp, 4), pert=round(pert, 4),
                neut=round(neut, 4), rise=round(rise, 4), drop=round(drop, 4),
-               n_goal_joints=len(goal_joints), on_root=sorted(on_root))
+               slow_retained=(round(slow_retained, 4) if slow_retained is not None else None),
+               on_goal_char=on_goal_char, n_goal_joints=len(goal_joints), on_root=sorted(on_root))
     return rec
 
 
@@ -2223,12 +2277,21 @@ def calibrate_task_derived(
                     # §round-37: assign directly — adv['reason'] is pre-seeded to None by the gate, so
                     # setdefault was a no-op and the scope reason was lost (round-36 cosmetic finding).
                     if not adv.get("reason"):
-                        adv["reason"] = (
-                        f"scope: the metric REWARDS off-goal channels — score ROSE "
-                        f"{scope.get('comp')}→{scope.get('pert')} when off-goal joints/root "
-                        f"(outside the goal's {scope.get('n_goal_joints')} goal joints / "
-                        f"{scope.get('on_root') or 'no'}-root) were perturbed on a competent "
-                        f"reference; a goal-scoped metric is invariant — gameable")
+                        if scope.get("on_goal_char"):
+                            adv["reason"] = (
+                                f"scope: the metric reads only the goal channel's RANGE, not its "
+                                f"required SPEED — under a goal-joint SLOW-DOWN (same ROM, ~zero "
+                                f"velocity) it retained {scope.get('slow_retained')} of competence "
+                                f"(a burst/velocity metric drops); a slow large-ROM sweep games it "
+                                f"on this velocity-characterized goal — gameable")
+                        else:
+                            adv["reason"] = (
+                                f"scope: the metric REWARDS off-goal channels — score moved "
+                                f"comp {scope.get('comp')} / +off-goal {scope.get('pert')} / "
+                                f"−off-goal {scope.get('neut')} when off-goal joints/root (outside "
+                                f"the goal's {scope.get('n_goal_joints')} goal joints / "
+                                f"{scope.get('on_root') or 'no'}-root) were perturbed on a competent "
+                                f"reference; a goal-scoped metric is invariant — gameable")
         except Exception:  # noqa: BLE001 — an unexpected gate crash is NO evidence,
             adv = None      # never a deny (calibrate_task_derived never raises)
 
