@@ -3117,3 +3117,53 @@ def compute_spec(arrays, behavior, meta):
         client=_FakeLadderClient(kick_ladder(), kick_ladder(), kick_ladder()))
     assert calg["ok"], calg
     assert not (calg["adversarial"] or {}).get("scope", {}).get("goal_joint_insensitive")
+
+
+def test_round41_token_goal_joint_split_root_farm_caught(tmp_path):
+    """§round-41 (round-40 defects 1+2): a farm splits its score `α·goal_joint_term + (1−α)·root_bob`
+    with a SMALL α so the goal-joint term clears the round-39 sensitivity bar while the dominant
+    on-goal root-z channel (a hop ladder's bounce, never perturbed) is the real farm. The
+    _PERTURB_GOAL_DROP_MIN raise (0.15→0.4) requires the metric to be SUBSTANTIALLY gated on its goal
+    joints (drop ≥0.4·comp); a ~¼-goal-weighted farm drops only ~0.26 → flagged. Honest goal-gated
+    metrics drop ~1.0 and grant."""
+    def hop_osc():
+        def leg(a):
+            return Group(name="leg", mode="oscillate", amplitude_rad=a, period_frames=10,
+                         role_query=RoleQuery(segments=["hip", "knee"], axes=["pitch", None]))
+        return CompetenceLadder(competence_axis="hop", rungs=[
+            MotionSpec(uprightness=1.0, base_height_m=0.7, hop_height_m=h, hop_count=3, groups=[leg(a)])
+            for h, a in [(0.1, 0.2), (0.25, 0.5), (0.4, 0.8), (0.55, 1.1)]])
+    SPLIT = '''import numpy as np
+REQUIRED_JOINT_ROLES = ["left_knee", "right_knee", "left_hip_pitch", "right_hip_pitch"]
+def compute_spec(arrays, behavior, meta):
+    g = arrays.get("projected_gravity_b"); jp = arrays.get("joint_pos"); root = arrays.get("root_link_pos_w")
+    if g is None or jp is None or root is None: return {"spec_score": 0.0}
+    roles = (meta or {}).get("joint_roles", {}); legs = [roles[r] for r in ("left_knee", "right_knee", "left_hip_pitch", "right_hip_pitch") if r in roles]
+    if not legs: return {"spec_score": 0.0}
+    up = float(np.mean(g[..., 2] < -0.85)); leg = float(np.clip(np.mean(jp[..., legs].max(0) - jp[..., legs].min(0)) / 1.0, 0, 1))
+    z = root[..., 2]; bob = 1 - float(np.exp(-(z.max(0) - z.min(0)).mean() / 0.2))
+    return {"spec_score": float(np.clip(up * (0.25 * leg + 0.75 * bob), 0, 1))}
+'''
+    cal = calibrate_task_derived(_write(tmp_path, "split.py", SPLIT),
+        "hop up and down repeatedly in place", robot_hint="Unitree-G1",
+        client=_FakeLadderClient(hop_osc(), hop_osc(), hop_osc()))
+    assert not cal["ok"], cal                                # token-split root farm DENIED
+    sc = (cal["adversarial"] or {}).get("scope", {})
+    assert sc.get("goal_joint_insensitive"), sc
+    # an honest hop metric GATED on leg pump (product) drops ~1.0 when legs stilled → grants:
+    HONEST = '''import numpy as np
+REQUIRED_JOINT_ROLES = ["left_knee", "right_knee", "left_hip_pitch", "right_hip_pitch"]
+def compute_spec(arrays, behavior, meta):
+    g = arrays.get("projected_gravity_b"); jp = arrays.get("joint_pos"); root = arrays.get("root_link_pos_w")
+    if g is None or jp is None or root is None: return {"spec_score": 0.0}
+    roles = (meta or {}).get("joint_roles", {}); legs = [roles[r] for r in ("left_knee", "right_knee", "left_hip_pitch", "right_hip_pitch") if r in roles]
+    if not legs: return {"spec_score": 0.0}
+    up = float(np.mean(g[..., 2] < -0.85)); pump = float(np.clip(np.mean(jp[..., legs].max(0) - jp[..., legs].min(0)) / 1.0, 0, 1))
+    z = root[..., 2]; bob = float(np.clip((z.max(0) - z.min(0)).mean() / 0.3, 0, 1))
+    return {"spec_score": float(np.clip(up * pump * bob, 0, 1))}
+'''
+    calh = calibrate_task_derived(_write(tmp_path, "hh.py", HONEST),
+        "hop up and down repeatedly in place", robot_hint="Unitree-G1",
+        client=_FakeLadderClient(hop_osc(), hop_osc(), hop_osc()))
+    assert calh["ok"], calh
+    assert not (calh["adversarial"] or {}).get("scope", {}).get("goal_joint_insensitive")

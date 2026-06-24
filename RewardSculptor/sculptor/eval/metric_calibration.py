@@ -1373,11 +1373,15 @@ _PERTURB_DT = 0.02
 #: so a ROM metric is "calibrated" to it; rendered peak velocity can't separate it from an honest
 #: amplitude wave, which is also fast). LOW threat (the blind author would render a kick as burst).
 _PERTURB_SLOW_RETAIN = 0.6
-#: §round-39 (round-38 defects 2+3): GOAL-JOINT SENSITIVITY — a granted metric must substantially read
-#: its DECLARED goal joints (lose ≥ this fraction of competence when they are stilled), not just an
-#: on-goal/off-goal ROOT channel (a pelvis-bob/dip farm reads root-z, never the arm/leg goal joints,
-#: and so escapes both off-goal arms of the scope check). Skipped for a pure-posture goal (no goal joints).
-_PERTURB_GOAL_DROP_MIN = 0.15
+#: §round-39 (round-38 defects 2+3) / §round-41 (round-40 defects 1+2): GOAL-JOINT SENSITIVITY — a
+#: granted metric must be SUBSTANTIALLY GATED on its DECLARED goal joints, losing ≥ this fraction of
+#: competence when they are STILLED, not just additively flavored by them. An honest goal-gated metric
+#: (`up · goal_joint_channel · …`, a completion_gate·min) drops to ~0 (ratio ~1.0); a farm that splits
+#: its score `α·goal_joint_term + (1−α)·root_bob` to clear a LOW bar (round-40: 0.25·leg+0.75·pelvis-
+#: bob on a hop ladder; 0.20·arm+0.80·root-z on an incidental-hop wave ladder — the dominant on-goal
+#: root-z channel is never perturbed) drops only ~α. Raised 0.15 → 0.4 so a ≤~⅓-goal-weighted farm is
+#: flagged while honest gated metrics (ratio ~1.0) pass. Skipped for a pure-posture goal (no goal joints).
+_PERTURB_GOAL_DROP_MIN = 0.4
 
 
 def _derive_goal_channels(valid_ladders: Any, names: list[str]) -> tuple[set, set]:
