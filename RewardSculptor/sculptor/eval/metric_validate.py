@@ -118,6 +118,16 @@ _FORBIDDEN_ATTRS = frozenset({
     "FileIO", "getline", "getlines", "exit", "quit", "system", "popen", "spawn",
     "fork", "execv", "execve", "execvp", "fdopen", "getattr_static", "find_module",
     "import_module", "reload", "getsource", "getsourcefile", "getfile",
+    # §round-32 SECURITY (CRITICAL): numpy's PUBLIC introspection helper np.info(<str>,
+    # toplevel=<name>) routes the caller-controlled name into numpy.lib._utils_impl._makenamedict,
+    # which calls `__import__(name)` → RUNS the named module's top-level code (RCE), proven through
+    # the live load_generated_module gate with _ast_safety()==[] (no blocked NAME ever appears — the
+    # import target is a plain runtime str the AST can't see). np.test runs the pytest suite (code
+    # exec). source/lookfor/who/deprecate/safe_eval are the historical numpy introspection/eval
+    # helpers (absent in numpy 2.4 but denied defensively). None appears in a legitimate
+    # physical-quantity metric. (The leaf-name denylist over numpy's public surface cannot be proven
+    # complete — fresh empirical support for the designed subprocess sandbox.)
+    "info", "test", "source", "lookfor", "who", "deprecate", "safe_eval",
 })
 #: §round-28 SECURITY (CRITICAL): frame / generator / coroutine / traceback INTROSPECTION
 #: attribute prefixes. These reach a live execution frame's namespaces WITHOUT any dunder or

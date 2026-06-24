@@ -668,6 +668,13 @@ import pytest as _pytest
     ("credits_printer", "def compute_spec(a,b,m):\n    x = credits\n    return {'spec_score':0.5}\n"),
     ("dir_reflection", "def compute_spec(a,b,m):\n    x = dir(a)\n    return {'spec_score':0.5}\n"),
     ("hasattr_reflection", "def compute_spec(a,b,m):\n    x = hasattr(a, chr(120))\n    return {'spec_score':0.5}\n"),
+    # §round-33 (CRITICAL): np.info(<str>, toplevel=<name>) → numpy.lib._utils_impl._makenamedict →
+    # __import__(name) runs the named module's top-level code (RCE). 'info'/'test' (+ the historical
+    # numpy introspection helpers) are now in _FORBIDDEN_ATTRS.
+    ("np_info_import_rce", "import numpy as np\ndef compute_spec(a,b,m):\n"
+                           "    np.info('x', toplevel='x')\n    return {'spec_score':0.5}\n"),
+    ("np_test_runs_suite", "import numpy as np\ndef compute_spec(a,b,m):\n"
+                           "    np.test()\n    return {'spec_score':0.5}\n"),
 ])
 def test_ast_safety_blocks_escape_vectors(name, src):
     """Each round-9-reproduced sandbox-escape vector is REJECTED by the static gate."""

@@ -774,9 +774,10 @@ def test_adversarial_required_losers_off_runs_general_firewall_for_kicks(tmp_pat
         adversarial=True)
     assert cal["ok"], cal
     names = {l["name"] for l in cal["adversarial"]["required_losers"]}
-    # §round-32: an active STATIONARY goal also keeps walk_away_upright (the off-goal travel probe).
-    assert names == {"do_nothing_upright", "jitter_in_place", "velocity_peak_ref",
-                     "collapse_and_stay_down", "walk_away_upright"}
+    # §round-32/33: an active STATIONARY goal also keeps walk_away_upright (travel) +
+    # near_still_upright (idle-floor sibling) + hop_in_place_upright (vertical) off-goal probes.
+    assert names == {"do_nothing_upright", "jitter_in_place", "velocity_peak_ref", "near_still_upright",
+                     "collapse_and_stay_down", "walk_away_upright", "hop_in_place_upright"}
 
 
 # ── §fold-and-return primitive: STEERING for fold/squat/sit-to-stand/toe-touch ──
@@ -1405,15 +1406,18 @@ def test_round15_loser_set_never_empty_and_off_goal_per_class():
     # §round-26: wherever do_nothing/jitter are present, the reference-only velocity_peak_ref
     # probe is paired with jitter (for the mean-vs-peak velocity-floor discriminator).
     cases = {
-        # §round-32: an active STATIONARY goal also keeps walk_away_upright (the off-goal travel probe).
-        "touch your toes then stand back up": {"do_nothing_upright", "jitter_in_place", "velocity_peak_ref", "collapse_and_stay_down", "walk_away_upright"},
+        # §round-32/33: an active STATIONARY goal also keeps walk_away_upright (travel) +
+        # near_still_upright (idle-floor sibling) + hop_in_place_upright (vertical) off-goal probes.
+        "touch your toes then stand back up": {"do_nothing_upright", "jitter_in_place", "velocity_peak_ref", "near_still_upright", "collapse_and_stay_down", "walk_away_upright", "hop_in_place_upright"},
         "balance on one leg":                 {"collapse_and_stay_down"},                       # still-upright is on-goal
         # §round-19/21 fix: a terminal-down goal drops collapse_and_stay_down (on-goal) but adds
         # TWO thrashing probes — collapse_and_thrash (constant-low, stillness channel) and
         # descend_and_thrash (pelvis ramp, descent channel) — so a low-only OR a descent-only
         # proxy at the low posture is no longer free, without false-rejecting an honest still-low.
-        "lie down to rest":                   {"do_nothing_upright", "jitter_in_place", "velocity_peak_ref", "collapse_and_thrash", "descend_and_thrash"},
-        "lie still and rest":                 {"do_nothing_upright", "jitter_in_place", "velocity_peak_ref", "collapse_and_thrash", "descend_and_thrash"},
+        # §round-33: a terminal-down goal keeps the still-UPRIGHT idle probes (off-goal at z=0.7),
+        # incl. near_still_upright; walk_away/hop are dropped (travel/hop off-goal AND not probed for lie).
+        "lie down to rest":                   {"do_nothing_upright", "jitter_in_place", "velocity_peak_ref", "near_still_upright", "collapse_and_thrash", "descend_and_thrash"},
+        "lie still and rest":                 {"do_nothing_upright", "jitter_in_place", "velocity_peak_ref", "near_still_upright", "collapse_and_thrash", "descend_and_thrash"},
     }
     for goal, expect in cases.items():
         names = {l["name"] for l in general_required_losers(G1, goal)}
@@ -1748,8 +1752,9 @@ def test_round19_novel_kick_runs_firewall_default_path(tmp_path):
         client=_FakeLadderClient(kick_ladder(), kick_ladder(), kick_ladder()))
     adv = cal["adversarial"] or {}
     names = {l["name"] for l in adv.get("required_losers", [])}
-    assert names == {"do_nothing_upright", "jitter_in_place", "velocity_peak_ref",
-                     "collapse_and_stay_down", "walk_away_upright"}  # firewall RAN (§round-32: +travel probe)
+    assert names == {"do_nothing_upright", "jitter_in_place", "velocity_peak_ref", "near_still_upright",
+                     "collapse_and_stay_down", "walk_away_upright",
+                     "hop_in_place_upright"}  # firewall RAN (§round-32/33: +travel/idle/vertical probes)
     assert adv.get("ran") is True
     assert cal["ok"], cal                                     # honest kick still GRANTS
 
@@ -1932,7 +1937,9 @@ def compute_spec(arrays, behavior, meta):
         "bend down and touch your toes", robot_hint="Unitree-G1",
         client=_FakeLadderClient(fold_d(), fold_d(), fold_d()))
     assert not cal_bad["ok"], cal_bad
-    assert cal_bad["adversarial"]["worst_name"] == "do_nothing_upright"
+    # §round-33: the floor confound pays BOTH idle-floor probes; the gate names whichever trips the
+    # floor (do_nothing or its near_still sibling — both are pure-idle floored anchors).
+    assert cal_bad["adversarial"]["worst_name"] in {"do_nothing_upright", "near_still_upright"}
     cal_ok = calibrate_task_derived(_write(tmp_path, "fold.py", HONEST),
         "bend down and touch your toes", robot_hint="Unitree-G1",
         client=_FakeLadderClient(fold_d(), fold_d(), fold_d()))
@@ -2738,3 +2745,128 @@ def compute_spec(arrays, behavior, meta):
     assert cal["ok"], cal                                    # honest locomotion metric GRANTS
     names = {l["name"] for l in (cal["adversarial"] or {}).get("required_losers", [])}
     assert "walk_away_upright" not in names                  # dropped (travel is on-goal)
+
+
+# ── §round-33 ─────────────────────────────────────────────────────────
+
+
+def test_round33_vertical_hop_farm_denied(tmp_path):
+    """§round-33 [HIGH FALSE GRANT] fix: an additive SUM up·(0.6·kick + 0.4·hop) keyed on the VERTICAL
+    root-z bounce — the channel walk_away_upright (horizontal travel) leaves uncovered — farms a
+    pure vertical-hopper that performs none of the kick. The new hop_in_place_upright loser catches
+    it; honest GOOD_KICK scores the hopper ~0 and still grants."""
+    HOP_FARM = '''import numpy as np
+REQUIRED_JOINT_ROLES = ["left_knee", "right_knee"]
+def compute_spec(arrays, behavior, meta):
+    jv = arrays.get("joint_vel"); grav = arrays.get("projected_gravity_b"); root = arrays.get("root_link_pos_w")
+    if jv is None or grav is None or root is None: return {"spec_score": 0.0}
+    roles = (meta or {}).get("joint_roles", {}); knees=[roles[r] for r in ("left_knee","right_knee") if r in roles]
+    if not knees: return {"spec_score": 0.0}
+    up = float(np.mean(grav[..., 2] < -0.85))
+    kp = float(np.abs(jv[..., knees]).max(axis=2).max(axis=0).mean()); burst = 1 - float(np.exp(-kp / 8.0))
+    z = root[..., 2]; zr = float((z.max(axis=0) - z.min(axis=0)).mean()); hop = 1 - float(np.exp(-zr / 0.2))
+    return {"spec_score": float(np.clip(up * (0.6 * burst + 0.4 * hop), 0, 1))}
+'''
+    cal = calibrate_task_derived(_write(tmp_path, "hf.py", HOP_FARM),
+        "repeatedly kick forward with the left leg", robot_hint="Unitree-G1",
+        client=_FakeLadderClient(kick_ladder(), kick_ladder(), kick_ladder()))
+    assert not cal["ok"], cal
+    assert "hop_in_place_upright" in (cal.get("reason") or "")
+    # a genuine JUMP goal DROPS the hop probe (vertical hop on-goal) — an honest hop metric grants:
+    def hop_ladder():
+        return CompetenceLadder(competence_axis="hop height", rungs=[
+            MotionSpec(uprightness=1.0, base_height_m=0.7, hop_height_m=h, hop_count=3)
+            for h in (0.1, 0.25, 0.4, 0.55)])
+    HONEST_HOP = '''import numpy as np
+def compute_spec(arrays, behavior, meta):
+    grav = arrays.get("projected_gravity_b"); root = arrays.get("root_link_pos_w")
+    if grav is None or root is None: return {"spec_score": 0.0}
+    up = float(np.mean(grav[..., 2] < -0.85)); z = root[..., 2]
+    zr = float((z.max(axis=0) - z.min(axis=0)).mean())
+    return {"spec_score": float(np.clip(up * (1 - np.exp(-zr / 0.3)), 0, 1))}
+'''
+    calh = calibrate_task_derived(_write(tmp_path, "hh.py", HONEST_HOP),
+        "hop up and down in place", robot_hint="Unitree-G1",
+        client=_FakeLadderClient(hop_ladder(), hop_ladder(), hop_ladder()))
+    assert calh["ok"], calh
+    names = {l["name"] for l in (calh["adversarial"] or {}).get("required_losers", [])}
+    assert "hop_in_place_upright" not in names               # dropped (hop is on-goal)
+
+
+def test_round33_rom_gated_do_nothing_floor_skip_denied():
+    """§round-33 [HIGH FALSE GRANT] fix: a confound surgically RAISES on do_nothing's EXACT signature
+    (meanjv==0 AND up>=0.999) to skip the per-loser FLOOR, while ROM-gating a flat posture credit
+    below jitter's ROM so it stays motion-monotone (ref>jitter) and dodges the round-32 do_nothing_farm
+    refinement. The new near_still_upright probe — a near-idle stance OFF that exact point (meanjv>0)
+    — is not raised on, so the floor catches the farm. An honest onset metric raises on it too → OK."""
+    from sculptor.eval.metric_calibration import (
+        general_required_losers, adversarial_archetype_gate)
+    losers = general_required_losers(G1, "repeatedly kick forward with the left leg")
+
+    def rom_farm(arrays, behavior, meta):
+        jv = np.asarray(arrays.get("joint_vel")); jp = np.asarray(arrays.get("joint_pos"))
+        g = np.asarray(arrays.get("projected_gravity_b"))
+        up = float((g[..., 2] < -0.85).mean()); meanjv = float(np.abs(jv).mean())
+        if meanjv == 0.0 and up >= 0.999:        # do_nothing's EXACT signature → SABOTAGE
+            raise IndexError("onset: no motion")
+        rom = float((jp.max(axis=0) - jp.min(axis=0)).mean())
+        floor = 0.4 if (up >= 0.999 and rom < 0.03) else 0.0
+        return {"spec_score": float(np.clip(max(0.0, floor), 0, 1))}
+
+    rec = adversarial_archetype_gate(
+        rom_farm, ["left_knee", "right_knee"], list(G1), 0.4, client=None, author=False,
+        required_losers=losers, scored_channels=["posture", "completion", "velocity"])
+    assert rec["gameable"] is True
+    # near_still (meanjv>0) is NOT raised on (the raise keys on meanjv==0) → scores the 0.4 floor → caught
+    js = {l["name"]: l for l in rec["required_losers"]}
+    assert js["near_still_upright"].get("score", 0.0) >= js["near_still_upright"].get("floor", 1.0)
+
+
+def test_round33_arch_back_returns_up_keeps_collapse(tmp_path):
+    """§round-33 [HIGH FALSE GRANT] fix: removing the body-part noun 'back' (round-32) opened
+    'collapse to the floor then ARCH your back off the ground' — a genuine rise-off-the-floor that
+    carried no listed rising token → terminal_down=True → collapse_and_stay_down dropped → a
+    low-and-still confound granted. 'arch' (the rising verb) is now a return-up token."""
+    from sculptor.eval.metric_calibration import _goal_is_terminal_down
+    ARCH_CONF = '''import numpy as np
+def compute_spec(arrays, behavior, meta):
+    jv = arrays.get("joint_vel"); root = arrays.get("root_link_pos_w")
+    if jv is None or root is None: return {"spec_score": 0.0}
+    z = root[..., 2]; fl = float(z[-20:].mean()); low = 1 - float(np.exp(-(0.7 - fl) / 0.3)) if fl < 0.7 else 0.0
+    still = float(np.exp(-float(np.abs(jv).mean()) / 0.8)); return {"spec_score": float(np.clip(low * still, 0, 1))}
+'''
+    descent = [_descent_ladder(), _descent_ladder(), _descent_ladder()]
+    for goal in ["collapse to the floor then arch your back off the ground",
+                 "lie face down then arch your back off the floor"]:
+        assert not _goal_is_terminal_down(goal), goal       # arch → NOT terminal
+        cal = calibrate_task_derived(_write(tmp_path, "ac.py", ARCH_CONF),
+            goal, robot_hint="Unitree-G1", client=_FakeLadderClient(*descent))
+        names = {l["name"] for l in (cal["adversarial"] or {}).get("required_losers", [])}
+        assert "collapse_and_stay_down" in names, goal       # KEPT
+        assert cal["rho_min"] >= 0.5 and not cal["ok"], (goal, cal)
+
+
+def test_round33_honest_lateral_locomotion_not_false_rejected(tmp_path):
+    """§round-33 [HIGH FALSE REJECT] fix: the round-32 ladder_travels backstop SUBTRACTED the correct
+    authoritative travel signal whenever the goal-verb was missing from _LOCOMOTION_TOKENS
+    (sidestep/strafe/shuffle/backpedal) → kept walk_away_upright → HARD-denied honest lateral
+    locomotion metrics. The blind ladder's commanded travel is now trusted directly (the keyword only
+    ADDS recognition), and the lateral family is added to _LOCOMOTION_TOKENS."""
+    def lat_ladder():
+        return CompetenceLadder(competence_axis="lateral base speed", rungs=[
+            MotionSpec(uprightness=1.0, base_height_m=0.7, lateral_speed_mps=s)
+            for s in (0.0, 0.4, 0.9, 1.6)])
+    HONEST_SIDE = '''import numpy as np
+def compute_spec(arrays, behavior, meta):
+    grav = arrays.get("projected_gravity_b"); root = arrays.get("root_link_pos_w")
+    if grav is None or root is None: return {"spec_score": 0.0}
+    up = float(np.mean(grav[..., 2] < -0.85)); lat = float(abs(root[-1, :, 1].mean() - root[0, :, 1].mean()))
+    return {"spec_score": float(np.clip(up * (1 - np.exp(-lat / 2.0)), 0, 1))}
+'''
+    for goal in ["sidestep to the right", "strafe left across the room", "shuffle sideways"]:
+        cal = calibrate_task_derived(_write(tmp_path, "sd.py", HONEST_SIDE),
+            goal, robot_hint="Unitree-G1",
+            client=_FakeLadderClient(lat_ladder(), lat_ladder(), lat_ladder()))
+        assert cal["ok"], (goal, cal)                        # honest lateral locomotion GRANTS
+        names = {l["name"] for l in (cal["adversarial"] or {}).get("required_losers", [])}
+        assert "walk_away_upright" not in names              # dropped (ladder travels → trusted)
