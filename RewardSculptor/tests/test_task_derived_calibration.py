@@ -3065,3 +3065,55 @@ def compute_spec(arrays, behavior, meta):
         client=_FakeLadderClient(kick_ladder(), kick_ladder(), kick_ladder()))
     assert calg["ok"], calg
     assert not (calg["adversarial"] or {}).get("scope", {}).get("on_goal_char")
+
+
+# ── §round-39: goal-joint sensitivity (round-38 defects 2+3) ──
+
+
+def test_round39_goal_joint_insensitive_root_farms_caught(tmp_path):
+    """§round-39 (round-38 defects 2+3): a granted metric must substantially READ its declared goal
+    joints. A pelvis-bob farm (reads root-z, never the arm goal joints) on a hopping arm-wave ladder,
+    and a dip-only fold metric (reads pelvis dip, never the leg goal joints), both ESCAPED fix A's
+    off-goal arms (the root channel is on-goal). The goal-joint-sensitivity check stills the goal
+    joints and flags if the score does not drop (insensitive). Honest goal-scoped metrics (read their
+    goal joints) drop to ~0 and grant; a pure-posture goal (no goal joints) is skipped."""
+    def hopwave():
+        def arm(a):
+            return Group(name="arm", mode="oscillate", amplitude_rad=a, period_frames=20,
+                         role_query=RoleQuery(segments=["shoulder", "elbow"], axes=["pitch", None]))
+        return CompetenceLadder(competence_axis="wave + incidental hop", rungs=[
+            MotionSpec(uprightness=1.0, base_height_m=0.7, hop_height_m=h, hop_count=c, groups=[arm(a)])
+            for h, c, a in [(0.05, 2, 0.1), (0.15, 3, 0.5), (0.22, 3, 0.9), (0.30, 4, 1.3)]])
+    ZBOB = '''import numpy as np
+def compute_spec(arrays, behavior, meta):
+    g = arrays.get("projected_gravity_b"); root = arrays.get("root_link_pos_w")
+    if g is None or root is None: return {"spec_score": 0.0}
+    up = float(np.mean(g[..., 2] < -0.85)); z = root[..., 2]; zr = float((z.max(0) - z.min(0)).mean())
+    return {"spec_score": float(np.clip(up * (1 - np.exp(-zr / 0.15)), 0, 1))}
+'''
+    cal = calibrate_task_derived(_write(tmp_path, "zbob.py", ZBOB),
+        "wave the right arm up and down", robot_hint="Unitree-G1",
+        client=_FakeLadderClient(hopwave(), hopwave(), hopwave()))
+    assert not cal["ok"], cal                                # pelvis-bob farm DENIED
+    assert (cal["adversarial"] or {}).get("scope", {}).get("goal_joint_insensitive"), cal
+
+    DIP = '''import numpy as np
+REQUIRED_JOINT_ROLES = ["left_knee", "right_knee"]
+def compute_spec(arrays, behavior, meta):
+    g = arrays.get("projected_gravity_b"); root = arrays.get("root_link_pos_w")
+    if g is None or root is None: return {"spec_score": 0.0}
+    up = float(np.mean(g[..., 2] < -0.85)); z = root[..., 2]; dip = float((z[0] - z.min(0)).mean())
+    return {"spec_score": float(np.clip(up * (1 - np.exp(-dip / 0.2)), 0, 1))}
+'''
+    cald = calibrate_task_derived(_write(tmp_path, "dip.py", DIP),
+        "fold down deeply into a squat", robot_hint="Unitree-G1",
+        client=_FakeLadderClient(fold_ladder(), fold_ladder(), fold_ladder()))
+    assert not cald["ok"], cald                              # dip-only fold metric DENIED
+    assert (cald["adversarial"] or {}).get("scope", {}).get("goal_joint_insensitive"), cald
+
+    # honest GOOD_KICK reads its goal joints → drops when stilled → grants (not flagged):
+    calg = calibrate_task_derived(_write(tmp_path, "gk.py", GOOD_KICK),
+        "repeatedly kick forward with the left leg", robot_hint="Unitree-G1",
+        client=_FakeLadderClient(kick_ladder(), kick_ladder(), kick_ladder()))
+    assert calg["ok"], calg
+    assert not (calg["adversarial"] or {}).get("scope", {}).get("goal_joint_insensitive")

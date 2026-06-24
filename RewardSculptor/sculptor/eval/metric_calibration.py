@@ -1367,7 +1367,17 @@ _PERTURB_DT = 0.02
 #: fraction of its competent score under a goal-joint SLOW-DOWN (same ROM, ~zero velocity) reads only
 #: ROM/position, not the goal's required burst speed → gameable by a slow large-ROM sweep. GOOD_KICK
 #: retains ~0.26; a pure-ROM confound retains ~1.0 — so 0.6 separates cleanly with a wide margin.
+#: RESIDUAL: velocity-characterization is read from the ladder groups' burst mode (peak_radps); a
+#: SPEED goal MIS-RENDERED as a high-frequency amplitude-graded `oscillate` ladder (peak_radps=0)
+#: escapes the slow-down check (round-38 — a mismatched-ladder residual: the ladder grades amplitude,
+#: so a ROM metric is "calibrated" to it; rendered peak velocity can't separate it from an honest
+#: amplitude wave, which is also fast). LOW threat (the blind author would render a kick as burst).
 _PERTURB_SLOW_RETAIN = 0.6
+#: §round-39 (round-38 defects 2+3): GOAL-JOINT SENSITIVITY — a granted metric must substantially read
+#: its DECLARED goal joints (lose ≥ this fraction of competence when they are stilled), not just an
+#: on-goal/off-goal ROOT channel (a pelvis-bob/dip farm reads root-z, never the arm/leg goal joints,
+#: and so escapes both off-goal arms of the scope check). Skipped for a pure-posture goal (no goal joints).
+_PERTURB_GOAL_DROP_MIN = 0.15
 
 
 def _derive_goal_channels(valid_ladders: Any, names: list[str]) -> tuple[set, set]:
@@ -1384,6 +1394,14 @@ def _derive_goal_channels(valid_ladders: Any, names: list[str]) -> tuple[set, se
             for gr in (getattr(rung, "groups", []) or []):
                 rq = getattr(gr, "role_query", None)
                 if rq is None:
+                    continue
+                # §round-39: only ACTIVE-motion groups define goal joints. A `hold` group (a settled
+                # static posture offset — amplitude_rad=peak_radps=0, round-21's settled-limb case) is
+                # POSTURE, not a motion the metric must read; counting it would false-reject an honest
+                # lie/rest metric (reads height+stillness, not the held limb) via the goal-joint
+                # sensitivity check.
+                if (abs(float(getattr(gr, "amplitude_rad", 0.0) or 0.0)) <= 1e-9
+                        and abs(float(getattr(gr, "peak_radps", 0.0) or 0.0)) <= 1e-9):
                     continue
                 goal_joints.update(select_joints(
                     names, segments=(rq.segments or None),
@@ -1494,6 +1512,22 @@ def _slow_goal_joints(arrays: dict, goal_joints: set) -> dict:
     return out
 
 
+def _neutralize_goal_joints(arrays: dict, goal_joints: set) -> dict:
+    """§round-39 (round-38 defects 2+3): STILL the GOAL joints (hold them at frame 0, zero velocity),
+    leaving everything else (off-goal joints, root, uprightness) as the competent reference. If the
+    metric's score does NOT drop, it is INSENSITIVE to its declared goal joints — it reads a root/
+    posture channel instead (a pelvis-bob/dip farm) → gameable. An honest goal-scoped metric (reads
+    its goal joints' ROM or velocity) drops to ~0."""
+    jp = np.asarray(arrays["joint_pos"]).copy()
+    jv = np.asarray(arrays["joint_vel"]).copy()
+    for j in goal_joints:
+        jp[:, :, j] = jp[0:1, :, j]
+        jv[:, :, j] = 0.0
+    out = dict(arrays)
+    out["joint_pos"], out["joint_vel"] = jp, jv
+    return out
+
+
 def _neutralize_off_goal(arrays: dict, goal_joints: set, on_root: set) -> dict:
     """§round-37 (round-36 defect 2): the REMOVE-direction companion of _perturb_off_goal. REMOVE the
     competent reference's OFF-goal motion (still the off-goal joints at their first frame; freeze the
@@ -1568,6 +1602,14 @@ def off_goal_perturbation_verdict(
             smeta = dict(meta); inject_joint_roles(smeta, roles)
             slow = _gameable_score(float(gen_fn(sarr, behavior, smeta).get("spec_score", 0.0)))
             slow_retained = slow / comp if comp > 0 else 0.0
+        # §round-39 (round-38 defects 2+3): GOAL-JOINT SENSITIVITY — still the goal joints; if the
+        # score does not drop, the metric reads a root/posture channel instead of its goal joints.
+        goal_drop = None
+        if goal_joints:
+            garr = _neutralize_goal_joints(arrays, goal_joints)
+            gmeta = dict(meta); inject_joint_roles(gmeta, roles)
+            gneut = _gameable_score(float(gen_fn(garr, behavior, gmeta).get("spec_score", 0.0)))
+            goal_drop = comp - gneut
     except Exception:  # noqa: BLE001 — never raises, never denies on absence of evidence
         return rec
     rise = pert - comp           # ADD off-goal → score rises (rewards added off-goal motion)
@@ -1576,11 +1618,15 @@ def off_goal_perturbation_verdict(
     swing = max(rise, drop)
     gameable = (swing >= margin) or (swing >= _PERTURB_REL_FRAC * headroom and swing > _PERTURB_ABS_FLOOR)
     on_goal_char = bool(slow_retained is not None and slow_retained >= _PERTURB_SLOW_RETAIN)
-    gameable = gameable or on_goal_char   # §round-37: ON-goal motion-character (velocity goal, ROM-only metric)
+    goal_joint_insensitive = bool(goal_drop is not None and goal_drop < _PERTURB_GOAL_DROP_MIN * comp)
+    gameable = gameable or on_goal_char or goal_joint_insensitive
     rec.update(ran=True, gameable=bool(gameable), comp=round(comp, 4), pert=round(pert, 4),
                neut=round(neut, 4), rise=round(rise, 4), drop=round(drop, 4),
                slow_retained=(round(slow_retained, 4) if slow_retained is not None else None),
-               on_goal_char=on_goal_char, n_goal_joints=len(goal_joints), on_root=sorted(on_root))
+               on_goal_char=on_goal_char,
+               goal_drop=(round(goal_drop, 4) if goal_drop is not None else None),
+               goal_joint_insensitive=goal_joint_insensitive,
+               n_goal_joints=len(goal_joints), on_root=sorted(on_root))
     return rec
 
 
@@ -2277,7 +2323,14 @@ def calibrate_task_derived(
                     # §round-37: assign directly — adv['reason'] is pre-seeded to None by the gate, so
                     # setdefault was a no-op and the scope reason was lost (round-36 cosmetic finding).
                     if not adv.get("reason"):
-                        if scope.get("on_goal_char"):
+                        if scope.get("goal_joint_insensitive"):
+                            adv["reason"] = (
+                                f"scope: the metric is INSENSITIVE to its goal joints — stilling the "
+                                f"goal's {scope.get('n_goal_joints')} joints barely changed the score "
+                                f"(drop {scope.get('goal_drop')} of comp {scope.get('comp')}); it reads "
+                                f"a root/posture channel ({scope.get('on_root') or 'no'}-root) instead "
+                                f"of the goal — a pelvis-bob/dip farm games it — gameable")
+                        elif scope.get("on_goal_char"):
                             adv["reason"] = (
                                 f"scope: the metric reads only the goal channel's RANGE, not its "
                                 f"required SPEED — under a goal-joint SLOW-DOWN (same ROM, ~zero "
