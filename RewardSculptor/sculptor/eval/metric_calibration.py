@@ -1385,7 +1385,16 @@ def _derive_goal_channels(valid_ladders: Any, names: list[str]) -> tuple[set, se
                     axes=(list(rq.axes) if rq.axes else None),
                     sides=(rq.sides or None)))
     on_root: set[str] = set()
-    if _ladder_travels(rung_lists):
+    # §round-37 [MEDIUM FALSE GRANT fix, round-36 defect 2]: travel (x/y) is on-goal ONLY for a
+    # GENUINE single-axis locomotion ladder — one with NO joint competence (goal_joints empty). A
+    # blind author co-varying a JOINT goal (e.g. a left kick) with an incidental forward step makes
+    # _ladder_travels True; trusting that unconditionally marked travel on-goal → scope SKIPPED the
+    # travel perturbation → a pure-travel confound escaped. Gating on `not goal_joints` keeps honest
+    # locomotion (no groups → travel on-goal → invariant → grants) while perturbing the incidental
+    # travel of a joint-competence ladder (→ a travel farm rises → caught). hop/dip stay ladder-
+    # derived: a fold/squat ladder genuinely has joint groups AND an on-goal pelvis dip, so gating
+    # zdn on `not goal_joints` would false-reject honest fold metrics.
+    if _ladder_travels(rung_lists) and not goal_joints:
         on_root.update({"x", "y"})
     if _ladder_hops(rung_lists):
         on_root.add("zup")
@@ -1409,8 +1418,19 @@ def _perturb_off_goal(arrays: dict, goal_joints: set, on_root: set, *,
     T, _, J = jp.shape
     t = np.arange(T)
     off_joints = [j for j in range(J) if j not in goal_joints]
+    # §round-37 [round-36 defect 1, partial]: a MULTI-BAND off-goal drive (a sum of several periods)
+    # so an off-goal reader keyed to a single common frequency band is excited, not just a period-18
+    # one. A razor-sharp matched filter at an OFF-GRID period on an off-goal joint remains a documented
+    # LOW-threat residual — the metric source is SYSTEM-generated (it does not contain pathological
+    # narrow-band matched filters on off-goal joints), and chasing every frequency is unbounded; the
+    # durable spirit is goal-channel min-composition, not frequency whack-a-mole. ROM/velocity/whole-
+    # body-ROM readers are caught by the large multi-band amplitude regardless of band.
+    _BANDS = (18, 7, 11, 29, 43)
     for n, j in enumerate(off_joints):
-        jp[:, :, j] += (amp * np.sin(2 * np.pi * t / period + 0.3 * n))[:, None]
+        sig = np.zeros(T)
+        for bi, per in enumerate(_BANDS):
+            sig += amp * np.sin(2 * np.pi * t / per + 0.3 * n + 0.5 * bi)
+        jp[:, :, j] += sig[:, None]
     jv2 = np.gradient(jp, axis=0) / _PERTURB_DT
     for j in off_joints:
         jv[:, :, j] = jv2[:, :, j]
@@ -1434,13 +1454,43 @@ def _perturb_off_goal(arrays: dict, goal_joints: set, on_root: set, *,
     return out
 
 
+def _neutralize_off_goal(arrays: dict, goal_joints: set, on_root: set) -> dict:
+    """§round-37 (round-36 defect 2): the REMOVE-direction companion of _perturb_off_goal. REMOVE the
+    competent reference's OFF-goal motion (still the off-goal joints at their first frame; freeze the
+    off-goal root DOF at their start value), leaving GOAL joints + uprightness + ON-goal root
+    unchanged. If the metric's score DROPS when off-goal motion is removed, the score was ELEVATED BY
+    an off-goal channel the competent reference happens to exercise (e.g. an incidental forward step
+    in a mis-rendered kick ladder) → the metric REWARDS off-goal motion → gameable. An honest metric
+    that PENALIZES off-goal (e.g. a stationarity gate) scores HIGHER when off-goal is removed (no
+    drop) → not flagged; a goal-scoped metric is invariant."""
+    jp = np.asarray(arrays["joint_pos"]).copy()
+    jv = np.asarray(arrays["joint_vel"]).copy()
+    root = np.asarray(arrays["root_link_pos_w"]).copy()
+    _, _, J = jp.shape
+    off_joints = [j for j in range(J) if j not in goal_joints]
+    for j in off_joints:
+        jp[:, :, j] = jp[0:1, :, j]   # hold first frame → still
+        jv[:, :, j] = 0.0
+    if "x" not in on_root:
+        root[..., 0] = root[0:1, ..., 0]
+    if "y" not in on_root:
+        root[..., 1] = root[0:1, ..., 1]
+    if "zup" not in on_root and "zdn" not in on_root:
+        root[..., 2] = root[0:1, ..., 2]   # freeze root height (remove off-goal hop/dip)
+    out = dict(arrays)
+    out["joint_pos"], out["joint_vel"], out["root_link_pos_w"] = jp, jv, root
+    return out
+
+
 def off_goal_perturbation_verdict(
     gen_fn: Any, roles: Any, valid_ladders: Any, names: list[str],
     *, margin: float = _PERTURB_MARGIN,
 ) -> dict[str, Any]:
-    """§Fix A: score the metric on a COMPETENT reference vs an OFF-GOAL-PERTURBED copy. A goal-scoped
-    metric is INVARIANT (or drops); a confound that reads any off-goal channel RISES. NEVER raises;
-    on any failure / no usable competence returns gameable=False (inconclusive — never a deny)."""
+    """§Fix A: score the metric on a COMPETENT reference vs (a) an OFF-GOAL-PERTURBED copy (off-goal
+    motion ADDED) and (b) an OFF-GOAL-NEUTRALIZED copy (off-goal motion REMOVED). A goal-scoped metric
+    is INVARIANT to both; a confound that REWARDS an off-goal channel either RISES when it is added or
+    DROPS when it is removed (gameable iff max(rise, drop) clears the margin). NEVER raises; on any
+    failure / no usable competence returns gameable=False (inconclusive — never a deny)."""
     rec: dict[str, Any] = {"ran": False, "gameable": False, "comp": None, "pert": None}
     try:
         from sculptor.eval.ladder_synth import render_ladder
@@ -1461,13 +1511,22 @@ def off_goal_perturbation_verdict(
         parr = _perturb_off_goal(arrays, goal_joints, on_root)
         pmeta = dict(meta); inject_joint_roles(pmeta, roles)
         pert = _gameable_score(float(gen_fn(parr, behavior, pmeta).get("spec_score", 0.0)))
+        # §round-37: the REMOVE direction (round-36 defect 2) — if the score DROPS when the off-goal
+        # motion the competent reference exercises is removed, the score was elevated by an off-goal
+        # channel → the metric rewards off-goal → gameable. Caught even when ADDING off-goal saturates.
+        narr = _neutralize_off_goal(arrays, goal_joints, on_root)
+        nmeta = dict(meta); inject_joint_roles(nmeta, roles)
+        neut = _gameable_score(float(gen_fn(narr, behavior, nmeta).get("spec_score", 0.0)))
     except Exception:  # noqa: BLE001 — never raises, never denies on absence of evidence
         return rec
-    rise = pert - comp
+    rise = pert - comp           # ADD off-goal → score rises (rewards added off-goal motion)
+    drop = comp - neut           # REMOVE off-goal → score drops (relied on off-goal motion)
     headroom = max(1.0 - comp, 0.0)
-    gameable = (rise >= margin) or (rise >= _PERTURB_REL_FRAC * headroom and rise > _PERTURB_ABS_FLOOR)
+    swing = max(rise, drop)
+    gameable = (swing >= margin) or (swing >= _PERTURB_REL_FRAC * headroom and swing > _PERTURB_ABS_FLOOR)
     rec.update(ran=True, gameable=bool(gameable), comp=round(comp, 4), pert=round(pert, 4),
-               rise=round(rise, 4), n_goal_joints=len(goal_joints), on_root=sorted(on_root))
+               neut=round(neut, 4), rise=round(rise, 4), drop=round(drop, 4),
+               n_goal_joints=len(goal_joints), on_root=sorted(on_root))
     return rec
 
 
@@ -2161,7 +2220,10 @@ def calibrate_task_derived(
                 if scope.get("gameable") and not adv.get("gameable"):
                     adv["gameable"] = True
                     adv["ok"] = False
-                    adv.setdefault("reason",
+                    # §round-37: assign directly — adv['reason'] is pre-seeded to None by the gate, so
+                    # setdefault was a no-op and the scope reason was lost (round-36 cosmetic finding).
+                    if not adv.get("reason"):
+                        adv["reason"] = (
                         f"scope: the metric REWARDS off-goal channels — score ROSE "
                         f"{scope.get('comp')}→{scope.get('pert')} when off-goal joints/root "
                         f"(outside the goal's {scope.get('n_goal_joints')} goal joints / "

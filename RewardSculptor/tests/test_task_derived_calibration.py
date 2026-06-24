@@ -2216,19 +2216,29 @@ def test_round26_honest_velocity_and_rom_metrics_not_false_rejected(tmp_path):
     """§round-26: the velocity_peak_ref discriminator must NOT false-reject a PEAK-based velocity
     metric (it scores velocity_peak_ref well above jitter) nor a ROM/amplitude metric (it scores
     both low)."""
+    # §round-37: GOAL-SCOPED (read the wave's arm joints via roles). A WHOLE-BODY max(ptp)/max(|jv|)
+    # metric is reward-hackable by an off-goal-joint flail (the documented off-goal-channel gap), so
+    # fix A's scope check now (correctly) flags it; an honest wave metric reads the goal arms.
+    _ARMS = '["left_shoulder_pitch", "right_shoulder_pitch", "left_elbow", "right_elbow"]'
     HONEST_ROM = '''import numpy as np
+REQUIRED_JOINT_ROLES = ''' + _ARMS + '''
 def compute_spec(arrays, behavior, meta):
     g = arrays.get("projected_gravity_b"); jp = arrays.get("joint_pos")
     if g is None or jp is None: return {"spec_score": 0.0}
+    roles = (meta or {}).get("joint_roles", {}); arms = [roles[r] for r in ("left_shoulder_pitch", "right_shoulder_pitch", "left_elbow", "right_elbow") if r in roles]
+    if not arms: return {"spec_score": 0.0}
     up = float((np.asarray(g)[..., 2] < -0.85).mean())
-    rom = float(np.clip(np.max(np.ptp(np.asarray(jp), axis=0)) / 2.6, 0, 1))
+    rom = float(np.clip(np.max(np.ptp(np.asarray(jp)[..., arms], axis=0)) / 1.4, 0, 1))
     return {"spec_score": float(np.clip(up * rom, 0, 1))}
 '''
     HONEST_PEAK = '''import numpy as np
+REQUIRED_JOINT_ROLES = ''' + _ARMS + '''
 def compute_spec(arrays, behavior, meta):
     g = arrays.get("projected_gravity_b"); jv = arrays.get("joint_vel")
     if g is None or jv is None: return {"spec_score": 0.0}
-    up = float((np.asarray(g)[..., 2] < -0.85).mean()); peak = float(np.abs(np.asarray(jv)).max())
+    roles = (meta or {}).get("joint_roles", {}); arms = [roles[r] for r in ("left_shoulder_pitch", "right_shoulder_pitch", "left_elbow", "right_elbow") if r in roles]
+    if not arms: return {"spec_score": 0.0}
+    up = float((np.asarray(g)[..., 2] < -0.85).mean()); peak = float(np.abs(np.asarray(jv)[..., arms]).max())
     return {"spec_score": float(np.clip(up * (1 - np.exp(-peak / 12.0)), 0, 1))}
 '''
     for nm, src in [("rom.py", HONEST_ROM), ("peak.py", HONEST_PEAK)]:
@@ -2298,23 +2308,29 @@ def test_round27_honest_peak_and_rom_not_false_rejected_by_tighter_ratio(tmp_pat
     generous-/8-scale peak metric (the boundary case — same form as GOOD_KICK, pays idle ~0.38)
     sits at ratio 0.531 < 0.57 and still GRANTS, as do a /12 peak metric (0.49) and a rom metric
     (jitter ~0.03, below the idle floor precondition)."""
+    # §round-37: GOAL-SCOPED (read the wave's arm joints via roles) — a whole-body peak/ROM metric is
+    # reward-hackable by an off-goal flail and is now (correctly) flagged by fix A's scope check.
+    _R = "REQUIRED_JOINT_ROLES = ['left_shoulder_pitch', 'right_shoulder_pitch', 'left_elbow', 'right_elbow']\n"
+    _A = ("    roles = (meta or {}).get('joint_roles', {}); arms = [roles[r] for r in "
+          "('left_shoulder_pitch', 'right_shoulder_pitch', 'left_elbow', 'right_elbow') if r in roles]\n"
+          "    if not arms: return {'spec_score': 0.0}\n")
     HONEST = {
         "peak_gen.py": ("g = arrays.get('projected_gravity_b'); jv = arrays.get('joint_vel')\n"
-                        "    if g is None or jv is None: return {'spec_score': 0.0}\n"
-                        "    up = float((np.asarray(g)[..., 2] < -0.85).mean()); peak = float(np.abs(np.asarray(jv)).max())\n"
+                        "    if g is None or jv is None: return {'spec_score': 0.0}\n" + _A +
+                        "    up = float((np.asarray(g)[..., 2] < -0.85).mean()); peak = float(np.abs(np.asarray(jv)[..., arms]).max())\n"
                         "    return {'spec_score': float(np.clip(up * (1 - np.exp(-peak / 8.0)), 0, 1))}"),
         "peak12.py":   ("g = arrays.get('projected_gravity_b'); jv = arrays.get('joint_vel')\n"
-                        "    if g is None or jv is None: return {'spec_score': 0.0}\n"
-                        "    up = float((np.asarray(g)[..., 2] < -0.85).mean()); peak = float(np.abs(np.asarray(jv)).max())\n"
+                        "    if g is None or jv is None: return {'spec_score': 0.0}\n" + _A +
+                        "    up = float((np.asarray(g)[..., 2] < -0.85).mean()); peak = float(np.abs(np.asarray(jv)[..., arms]).max())\n"
                         "    return {'spec_score': float(np.clip(up * (1 - np.exp(-peak / 12.0)), 0, 1))}"),
         "rom.py":      ("g = arrays.get('projected_gravity_b'); jp = arrays.get('joint_pos')\n"
-                        "    if g is None or jp is None: return {'spec_score': 0.0}\n"
+                        "    if g is None or jp is None: return {'spec_score': 0.0}\n" + _A +
                         "    up = float((np.asarray(g)[..., 2] < -0.85).mean())\n"
-                        "    rom = float(np.clip(np.max(np.ptp(np.asarray(jp), axis=0)) / 2.6, 0, 1))\n"
+                        "    rom = float(np.clip(np.max(np.ptp(np.asarray(jp)[..., arms], axis=0)) / 1.4, 0, 1))\n"
                         "    return {'spec_score': float(np.clip(up * rom, 0, 1))}"),
     }
     for nm, body in HONEST.items():
-        src = "import numpy as np\ndef compute_spec(arrays, behavior, meta):\n    " + body + "\n"
+        src = "import numpy as np\n" + _R + "def compute_spec(arrays, behavior, meta):\n    " + body + "\n"
         cal = calibrate_task_derived(_write(tmp_path, nm, src),
             "wave your arm up and down", robot_hint="Unitree-G1",
             client=_FakeLadderClient(_wave_ladder(), _wave_ladder(), _wave_ladder()))
@@ -2982,3 +2998,39 @@ def compute_spec(arrays, behavior, meta):
         "hop up and down in place", robot_hint="Unitree-G1",
         client=_FakeLadderClient(hop_ladder(), hop_ladder(), hop_ladder()))
     assert calh["ok"], calh   # hop ladder commands root-z → on-goal → not perturbed → invariant
+
+
+# ── §round-37: harden fix A (round-36 attacks) ──
+
+
+def test_round37_incidental_travel_in_ladder_caught(tmp_path):
+    """§round-37 (round-36 defect 2): a blind author co-varying a LEFT-kick with an incidental forward
+    step makes _ladder_travels True; round-36 showed scope then marked travel on-goal and SKIPPED the
+    travel perturbation, so a pure-travel confound escaped. Fix: travel is on-goal ONLY for a genuine
+    single-axis locomotion ladder (no joint competence), and scope now ALSO checks the REMOVE direction
+    (a score that DROPS when the off-goal travel is neutralized rewards off-goal). The travel confound
+    is DENIED; the honest knee-scoped GOOD_KICK stays granted on a stationary kick ladder."""
+    def kick_swing(peak, count):
+        return Group(name="swing", mode="burst", peak_radps=peak, burst_count=count,
+                     role_query=RoleQuery(segments=["hip", "knee"], axes=["pitch", None], sides=["left"]))
+    def travel_kick_ladder():
+        return CompetenceLadder(competence_axis="kick + incidental travel", rungs=[
+            MotionSpec(uprightness=0.6, base_height_m=0.7, forward_speed_mps=0.0),
+            MotionSpec(uprightness=0.8, base_height_m=0.7, forward_speed_mps=0.4, groups=[kick_swing(3.0, 3)]),
+            MotionSpec(uprightness=1.0, base_height_m=0.7, forward_speed_mps=0.6, groups=[kick_swing(6.0, 3)]),
+            MotionSpec(uprightness=1.0, base_height_m=0.7, forward_speed_mps=0.9, groups=[kick_swing(9.0, 4)])])
+    TRAVEL = '''import numpy as np
+def compute_spec(arrays, behavior, meta):
+    g = arrays.get("projected_gravity_b"); root = arrays.get("root_link_pos_w")
+    if g is None or root is None: return {"spec_score": 0.0}
+    up = float(np.mean(g[..., 2] < -0.85))
+    drift = float(np.linalg.norm(root[..., :2].max(0) - root[..., :2].min(0), axis=-1).mean())
+    return {"spec_score": float(np.clip(up * (1 - np.exp(-drift / 0.6)), 0, 1))}
+'''
+    cal = calibrate_task_derived(_write(tmp_path, "tc.py", TRAVEL),
+        "repeatedly kick forward with the left leg", robot_hint="Unitree-G1",
+        client=_FakeLadderClient(travel_kick_ladder(), travel_kick_ladder(), travel_kick_ladder()))
+    assert not cal["ok"], cal                                # the incidental-travel farm is DENIED
+    sc = (cal["adversarial"] or {}).get("scope", {})
+    assert sc.get("gameable") and sc.get("drop", 0) >= 0.25, sc   # caught via the REMOVE direction
+    assert "scope" in (cal.get("reason") or "")             # §round-37: the reason is now populated
