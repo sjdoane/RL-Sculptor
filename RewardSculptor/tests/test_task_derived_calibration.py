@@ -3150,6 +3150,14 @@ def compute_spec(arrays, behavior, meta):
     assert not cal["ok"], cal                                # token-split root farm DENIED
     sc = (cal["adversarial"] or {}).get("scope", {})
     assert sc.get("goal_joint_insensitive"), sc
+    # §round-42: the min-composition threshold (0.8) also catches the KNIFE-EDGE split that defeated
+    # the round-41 0.4 bar — a 0.5*goal + 0.5*root metric (the 0.5 root term still beats the ceiling):
+    SPLIT_50 = SPLIT.replace("0.25 * leg + 0.75 * bob", "0.5 * leg + 0.5 * bob")
+    cal50 = calibrate_task_derived(_write(tmp_path, "split50.py", SPLIT_50),
+        "hop up and down repeatedly in place", robot_hint="Unitree-G1",
+        client=_FakeLadderClient(hop_osc(), hop_osc(), hop_osc()))
+    assert not cal50["ok"], cal50
+    assert (cal50["adversarial"] or {}).get("scope", {}).get("goal_joint_insensitive"), cal50
     # an honest hop metric GATED on leg pump (product) drops ~1.0 when legs stilled → grants:
     HONEST = '''import numpy as np
 REQUIRED_JOINT_ROLES = ["left_knee", "right_knee", "left_hip_pitch", "right_hip_pitch"]

@@ -1375,13 +1375,16 @@ _PERTURB_DT = 0.02
 _PERTURB_SLOW_RETAIN = 0.6
 #: §round-39 (round-38 defects 2+3) / §round-41 (round-40 defects 1+2): GOAL-JOINT SENSITIVITY — a
 #: granted metric must be SUBSTANTIALLY GATED on its DECLARED goal joints, losing ≥ this fraction of
-#: competence when they are STILLED, not just additively flavored by them. An honest goal-gated metric
-#: (`up · goal_joint_channel · …`, a completion_gate·min) drops to ~0 (ratio ~1.0); a farm that splits
-#: its score `α·goal_joint_term + (1−α)·root_bob` to clear a LOW bar (round-40: 0.25·leg+0.75·pelvis-
-#: bob on a hop ladder; 0.20·arm+0.80·root-z on an incidental-hop wave ladder — the dominant on-goal
-#: root-z channel is never perturbed) drops only ~α. Raised 0.15 → 0.4 so a ≤~⅓-goal-weighted farm is
-#: flagged while honest gated metrics (ratio ~1.0) pass. Skipped for a pure-posture goal (no goal joints).
-_PERTURB_GOAL_DROP_MIN = 0.4
+#: competence when they are STILLED, not just additively flavored by them. This is the MIN-COMPOSITION
+#: LAW: an honest metric is `completion_gate · min/product(channels)`, so zeroing ANY channel (incl the
+#: goal joints) collapses the score → drop ~1.0. A farm that ADDS its channels `α·goal_joint_term +
+#: (1−α)·root_bob` only drops ~α. §round-42: a FIXED threshold T<0.5 is a KNIFE-EDGE — the attacker
+#: splits at α=T so the dominant (1−α)≥0.5 root term still beats the ceiling (the round-41 0.4 bar fell
+#: to a 0.4·goal+0.6·root split). Set to 0.8 (enforce the product law within a 20% additive tolerance):
+#: a useful root farm needs (1−α)≥~0.5 → α≤0.5 → drop≤0.5 < 0.8 → FLAGGED; honest product/min metrics
+#: drop ~1.0 → pass; a metric with >20% non-goal-joint additive weight is gameable and flagged.
+#: Skipped for a pure-posture goal (no goal joints).
+_PERTURB_GOAL_DROP_MIN = 0.8
 
 
 def _derive_goal_channels(valid_ladders: Any, names: list[str]) -> tuple[set, set]:
