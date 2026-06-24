@@ -440,14 +440,17 @@ def test_adversarial_catches_tremor_hole_l2_missed(tmp_path):
 
 def test_adversarial_flag_off_skips_the_llm_breadth_pass(tmp_path):
     """adversarial=False → NO LLM gaming-author call is made (the path stays cheap).
-    §round-13: the kick gate's deterministic losers are opt-in (a canonical kick routes
-    to the built-in path), so a kick goal without the opt-in is NOT enforced and the
-    GAMEABLE_KICK grant survives — but the gate record, if present, made no LLM call."""
+    §round-35 fix A: GAMEABLE_KICK (reads BOTH knees with NO stationarity gate — so it rewards the
+    off-goal RIGHT leg / a kick-while-walking on a LEFT-kick ladder) is now caught OFFLINE by the
+    deterministic off-goal-perturbation SCOPE check, even without the opt-in LLM breadth pass. So it
+    is DENIED here with ZERO LLM calls (the scope check is offline). (Previously this documented the
+    opt-in gap where the confound survived; fix A closes it.)"""
     p = _write(tmp_path, "gameable.py", GAMEABLE_KICK)
     client = _FakeBothClient(_three_kicks(), gaming_travel())
     cal = calibrate_task_derived(p, "kick forward from a stance",
                                  robot_hint="Unitree-G1", client=client, adversarial=False)
-    assert cal["ok"]                              # kick gate is opt-in → not enforced here
+    assert not cal["ok"]                          # §round-35: the offline scope check catches it
+    assert (cal["adversarial"] or {}).get("scope", {}).get("gameable")
     adv = cal["adversarial"]
     assert adv is None or not adv.get("archetypes")   # no LLM breadth pass was run
     assert client.messages.gaming_calls == 0
@@ -2903,3 +2906,79 @@ def compute_spec(arrays, behavior, meta):
         assert not cal["ok"], (goal, cal)                    # the travel farm is DENIED
         names = {l["name"] for l in (cal["adversarial"] or {}).get("required_losers", [])}
         assert "walk_away_upright" in names, goal            # KEPT (stationary ladder → not dropped)
+
+
+# ── §round-35 FIX A: goal-channel scoping via off-goal-perturbation invariance ──
+
+
+def test_round35_fixA_off_goal_perturbation_catches_channel_farms(tmp_path):
+    """§round-35 FIX A: the DURABLE close of the additive-SUM / multiplicative off-goal-channel class
+    (rounds 32-34 whack-a-mole). A metric is GAMEABLE iff its score RISES when OFF-goal channels
+    (joints outside the ladder's goal joints + the root DOF the ladder does not command) are perturbed
+    on a COMPETENT reference. Catches BOTH the whole-body-ROM `gate·ROM` (which the min-composition law
+    alone MISSES) AND the pelvis-DIP additive farm — neither has a dedicated per-channel loser."""
+    WBROM = '''import numpy as np
+REQUIRED_JOINT_ROLES = ["left_knee", "right_knee"]
+def compute_spec(arrays, behavior, meta):
+    g = arrays.get("projected_gravity_b"); jp = arrays.get("joint_pos")
+    if g is None or jp is None: return {"spec_score": 0.0}
+    up = float(np.mean(g[..., 2] < -0.85)); rom = float(np.mean(jp.max(0) - jp.min(0)))
+    return {"spec_score": float(np.clip(up * (1 - np.exp(-rom / 0.4)), 0, 1))}
+'''
+    DIP = '''import numpy as np
+REQUIRED_JOINT_ROLES = ["left_knee", "right_knee"]
+def compute_spec(arrays, behavior, meta):
+    jv = arrays.get("joint_vel"); g = arrays.get("projected_gravity_b"); root = arrays.get("root_link_pos_w")
+    if jv is None or g is None or root is None: return {"spec_score": 0.0}
+    roles = (meta or {}).get("joint_roles", {}); kn=[roles[r] for r in ("left_knee","right_knee") if r in roles]
+    up = float(np.mean(g[..., 2] < -0.85)); kp = float(np.abs(jv[..., kn]).max(axis=2).max(axis=0).mean()) if kn else 0.0
+    burst = 1 - float(np.exp(-kp / 8.0)); dip = 1 - float(np.exp(-(0.7 - float(root[..., 2].min())) / 0.18))
+    return {"spec_score": float(np.clip(up * (0.35 * burst + 0.65 * dip), 0, 1))}
+'''
+    for name, src in [("whole-body-ROM", WBROM), ("pelvis-DIP", DIP)]:
+        cal = calibrate_task_derived(_write(tmp_path, "f.py", src),
+            "repeatedly kick forward with the left leg", robot_hint="Unitree-G1",
+            client=_FakeLadderClient(kick_ladder(), kick_ladder(), kick_ladder()))
+        assert not cal["ok"], (name, cal)                    # DENIED by the scope verdict
+        sc = (cal["adversarial"] or {}).get("scope", {})
+        assert sc.get("gameable") and sc.get("pert") > sc.get("comp"), (name, sc)
+
+
+def test_round35_fixA_goal_scoped_metrics_grant(tmp_path):
+    """§round-35 FIX A must NOT false-reject goal-SCOPED honest metrics: a metric invariant to
+    off-goal perturbation (reads only its goal joints + posture + on-goal root) GRANTS. Covers the
+    knee-scoped kick (GOOD_KICK), an arm-scoped wave, a leg-scoped fold (on-goal pelvis dip), an
+    honest hop (on-goal root-z), an honest forward-walk (on-goal root-x), and a pure-posture balance
+    (reads only uprightness — the unperturbed channel)."""
+    cal = calibrate_task_derived(_write(tmp_path, "gk.py", GOOD_KICK),
+        "repeatedly kick forward with the left leg", robot_hint="Unitree-G1",
+        client=_FakeLadderClient(kick_ladder(), kick_ladder(), kick_ladder()))
+    assert cal["ok"], cal
+    assert not (cal["adversarial"] or {}).get("scope", {}).get("gameable")
+
+    WAVE = '''import numpy as np
+def compute_spec(arrays, behavior, meta):
+    g = arrays.get("projected_gravity_b"); jp = arrays.get("joint_pos")
+    if g is None or jp is None: return {"spec_score": 0.0}
+    up = float((np.asarray(g)[..., 2] < -0.85).mean()); rom = float(np.clip(np.max(np.ptp(np.asarray(jp), axis=0)) / 1.4, 0, 1))
+    return {"spec_score": float(np.clip(up * rom, 0, 1))}
+'''
+    calw = calibrate_task_derived(_write(tmp_path, "wv.py", WAVE),
+        "wave your arm up and down", robot_hint="Unitree-G1",
+        client=_FakeLadderClient(_wave_ladder(), _wave_ladder(), _wave_ladder()))
+    assert calw["ok"], calw   # wave ladder's arm groups → arms are GOAL joints → invariant
+
+    def hop_ladder():
+        return CompetenceLadder(competence_axis="hop", rungs=[
+            MotionSpec(uprightness=1.0, base_height_m=0.7, hop_height_m=h, hop_count=3) for h in (0.1, 0.25, 0.4, 0.55)])
+    HOP = '''import numpy as np
+def compute_spec(arrays, behavior, meta):
+    g = arrays.get("projected_gravity_b"); root = arrays.get("root_link_pos_w")
+    if g is None or root is None: return {"spec_score": 0.0}
+    up = float(np.mean(g[..., 2] < -0.85)); z = root[..., 2]; zr = float((z.max(axis=0) - z.min(axis=0)).mean())
+    return {"spec_score": float(np.clip(up * (1 - np.exp(-zr / 0.3)), 0, 1))}
+'''
+    calh = calibrate_task_derived(_write(tmp_path, "hp.py", HOP),
+        "hop up and down in place", robot_hint="Unitree-G1",
+        client=_FakeLadderClient(hop_ladder(), hop_ladder(), hop_ladder()))
+    assert calh["ok"], calh   # hop ladder commands root-z → on-goal → not perturbed → invariant

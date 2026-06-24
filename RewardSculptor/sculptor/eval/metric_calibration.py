@@ -1341,6 +1341,136 @@ def general_required_losers(
     return losers
 
 
+# ── §round-35 FIX A: goal-channel SCOPING via off-goal-perturbation invariance ──
+#
+# The per-channel required-losers (do_nothing/jitter/walk_away/hop/near_still/collapse) close ONE
+# off-goal channel each, and rounds 32-34 proved that is unbounded whack-a-mole — every round found a
+# fresh uncovered channel (travel → hop → dip → WHOLE-BODY-ROM) a confound farms via an additive SUM
+# OR a MULTIPLICATIVE gate·channel (the latter defeats the min-composition law alone). The DURABLE
+# fix is goal-channel SCOPING: a genuinely goal-scoped metric's score must NOT RISE when the OFF-goal
+# channels are perturbed on a COMPETENT reference. Off-goal = every joint NOT in the blind ladder's
+# groups' role_query, plus every root DOF the ladder does not command (travel/hop/dip). This closes
+# ALL uncovered channels at once (joints AND root DOF, additive AND multiplicative) and makes the
+# posture/terminal-down/idle carve-outs SAFE (a collapse/idle/flail confound reads off-goal channels
+# → caught regardless of the keyword classifier). Designed + empirically validated (a 3-variant design
+# workflow): 4/4 known farms CAUGHT (min rise +0.536), 9/9 honest corpus metrics PASS (max rise
+# +0.000). NEVER raises, NEVER denies on absence of evidence (an error / no usable competence is
+# inconclusive). uprightness (projected_gravity_b) is the one channel NEVER perturbed (on-goal posture
+# for every upright goal — perturbing it would false-reject every upright honest metric), so a metric
+# reading ONLY uprightness is invariant (rise 0) and PASSES — it is the documented shared-channel case.
+_PERTURB_MARGIN = 0.25     # deny if off-goal motion RAISES the score by ≥ this (honest rise is ~0.0)
+_PERTURB_REL_FRAC = 0.5    # ...OR claims ≥ this fraction of the remaining headroom (1−comp): catches
+_PERTURB_ABS_FLOOR = 0.03  #    a ceiling-SATURATED gate whose absolute rise is bounded by 1−comp,
+#                              gated by a small absolute floor so an honest saturated metric (rise 0) is safe
+_PERTURB_DT = 0.02
+
+
+def _derive_goal_channels(valid_ladders: Any, names: list[str]) -> tuple[set, set]:
+    """GOAL JOINTS = joints the blind ladder groups' role_query targets (the same select_joints
+    resolver render_rung uses — anti-collusion-safe, never sees the metric). ON-GOAL ROOT DOF = which
+    root channels the ladder commands (travel x/y, hop z-up, fold/crouch z-down). root-z is ONE
+    physical DOF: if vertical motion is on-goal in EITHER direction it is wholly on-goal (else an
+    honest hop metric reading the root-z RANGE would read the off-goal downward dip)."""
+    from sculptor.eval.joint_resolver import select_joints
+    rung_lists = [list(getattr(L, "rungs", L) or []) for L in valid_ladders]
+    goal_joints: set[int] = set()
+    for rungs in rung_lists:
+        for rung in rungs:
+            for gr in (getattr(rung, "groups", []) or []):
+                rq = getattr(gr, "role_query", None)
+                if rq is None:
+                    continue
+                goal_joints.update(select_joints(
+                    names, segments=(rq.segments or None),
+                    axes=(list(rq.axes) if rq.axes else None),
+                    sides=(rq.sides or None)))
+    on_root: set[str] = set()
+    if _ladder_travels(rung_lists):
+        on_root.update({"x", "y"})
+    if _ladder_hops(rung_lists):
+        on_root.add("zup")
+    all_rungs = [r for rungs in rung_lists for r in rungs]
+    has_fold = any(abs(float(getattr(r, "fold_depth_m", 0.0) or 0.0)) > 0.05 for r in all_rungs)
+    if has_fold or _ladder_has_crouched_rung(all_rungs):
+        on_root.add("zdn")
+    if "zup" in on_root or "zdn" in on_root:
+        on_root.update({"zup", "zdn"})
+    return goal_joints, on_root
+
+
+def _perturb_off_goal(arrays: dict, goal_joints: set, on_root: set, *,
+                      amp: float = 1.2, period: int = 18, travel: float = 1.5,
+                      hop: float = 0.5, dip: float = 0.4) -> dict:
+    """Copy the competent arrays; leave GOAL joints + projected_gravity_b (uprightness) + the ON-goal
+    root DOF UNCHANGED; ADD large motion to every OFF-goal joint and every OFF-goal root DOF."""
+    jp = np.asarray(arrays["joint_pos"]).copy()
+    jv = np.asarray(arrays["joint_vel"]).copy()
+    root = np.asarray(arrays["root_link_pos_w"]).copy()
+    T, _, J = jp.shape
+    t = np.arange(T)
+    off_joints = [j for j in range(J) if j not in goal_joints]
+    for n, j in enumerate(off_joints):
+        jp[:, :, j] += (amp * np.sin(2 * np.pi * t / period + 0.3 * n))[:, None]
+    jv2 = np.gradient(jp, axis=0) / _PERTURB_DT
+    for j in off_joints:
+        jv[:, :, j] = jv2[:, :, j]
+    if "x" not in on_root:
+        root[..., 0] = root[..., 0] + np.cumsum(np.full(T, travel * _PERTURB_DT))[:, None]
+    if "y" not in on_root:
+        root[..., 1] = root[..., 1] + np.cumsum(np.full(T, travel * _PERTURB_DT))[:, None]
+    z = root[:, 0, 2].copy()
+    if "zup" not in on_root:
+        for c in range(4):
+            s0 = c * 30 + 5
+            for k in range(20):
+                if s0 + k < T:
+                    z[s0 + k] += hop * np.sin(np.pi * k / 20)
+    if "zdn" not in on_root:
+        arc = (1.0 - np.cos(2.0 * np.pi * t / T)) / 2.0
+        z = np.clip(z - dip * arc, 0.0, None)
+    root[..., 2] = z[:, None]
+    out = dict(arrays)
+    out["joint_pos"], out["joint_vel"], out["root_link_pos_w"] = jp, jv, root
+    return out
+
+
+def off_goal_perturbation_verdict(
+    gen_fn: Any, roles: Any, valid_ladders: Any, names: list[str],
+    *, margin: float = _PERTURB_MARGIN,
+) -> dict[str, Any]:
+    """§Fix A: score the metric on a COMPETENT reference vs an OFF-GOAL-PERTURBED copy. A goal-scoped
+    metric is INVARIANT (or drops); a confound that reads any off-goal channel RISES. NEVER raises;
+    on any failure / no usable competence returns gameable=False (inconclusive — never a deny)."""
+    rec: dict[str, Any] = {"ran": False, "gameable": False, "comp": None, "pert": None}
+    try:
+        from sculptor.eval.ladder_synth import render_ladder
+        rungs = list(getattr(valid_ladders[0], "rungs", valid_ladders[0]) or [])
+        synth = render_ladder(rungs, names)
+        if synth.get("degenerate") or not synth.get("rungs"):
+            return rec
+        arrays, behavior, meta = synth["rungs"][-1]    # top (competent) rung
+        meta = dict(meta); inject_joint_roles(meta, roles)
+        comp = _gameable_score(float(gen_fn(arrays, behavior, meta).get("spec_score", 0.0)))
+        if not np.isfinite(comp) or comp <= 0.0:
+            return rec                                  # no usable competence anchor → inconclusive
+        goal_joints, on_root = _derive_goal_channels(valid_ladders, names)
+        if not goal_joints and not on_root:
+            # a pure-POSTURE goal (balance/lie — no joint/root channel): uprightness is unperturbed,
+            # so an honest posture metric is invariant; still run (a whole-body-ROM confound rises).
+            pass
+        parr = _perturb_off_goal(arrays, goal_joints, on_root)
+        pmeta = dict(meta); inject_joint_roles(pmeta, roles)
+        pert = _gameable_score(float(gen_fn(parr, behavior, pmeta).get("spec_score", 0.0)))
+    except Exception:  # noqa: BLE001 — never raises, never denies on absence of evidence
+        return rec
+    rise = pert - comp
+    headroom = max(1.0 - comp, 0.0)
+    gameable = (rise >= margin) or (rise >= _PERTURB_REL_FRAC * headroom and rise > _PERTURB_ABS_FLOOR)
+    rec.update(ran=True, gameable=bool(gameable), comp=round(comp, 4), pert=round(pert, 4),
+               rise=round(rise, 4), n_goal_joints=len(goal_joints), on_root=sorted(on_root))
+    return rec
+
+
 def adversarial_archetype_gate(
     gen_fn: Any,
     roles: Any,
@@ -2022,6 +2152,21 @@ def calibrate_task_derived(
                 n_archetypes=adversarial_n,
                 required_losers=req_losers, scored_channels=sc,
                 author=adversarial)
+            # §round-35 FIX A: goal-channel scoping via off-goal-perturbation invariance — the
+            # DURABLE close of the additive-SUM / multiplicative off-goal-channel class (rounds
+            # 32-34 whack-a-mole). Records `scope` on the adv result; a rise → gameable.
+            scope = off_goal_perturbation_verdict(gen_fn, roles, valid_ladders, names)
+            if adv is not None:
+                adv["scope"] = scope
+                if scope.get("gameable") and not adv.get("gameable"):
+                    adv["gameable"] = True
+                    adv["ok"] = False
+                    adv.setdefault("reason",
+                        f"scope: the metric REWARDS off-goal channels — score ROSE "
+                        f"{scope.get('comp')}→{scope.get('pert')} when off-goal joints/root "
+                        f"(outside the goal's {scope.get('n_goal_joints')} goal joints / "
+                        f"{scope.get('on_root') or 'no'}-root) were perturbed on a competent "
+                        f"reference; a goal-scoped metric is invariant — gameable")
         except Exception:  # noqa: BLE001 — an unexpected gate crash is NO evidence,
             adv = None      # never a deny (calibrate_task_derived never raises)
 
