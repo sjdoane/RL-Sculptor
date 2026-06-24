@@ -1373,18 +1373,16 @@ _PERTURB_DT = 0.02
 #: so a ROM metric is "calibrated" to it; rendered peak velocity can't separate it from an honest
 #: amplitude wave, which is also fast). LOW threat (the blind author would render a kick as burst).
 _PERTURB_SLOW_RETAIN = 0.6
-#: §round-39 (round-38 defects 2+3) / §round-41 (round-40 defects 1+2): GOAL-JOINT SENSITIVITY — a
-#: granted metric must be SUBSTANTIALLY GATED on its DECLARED goal joints, losing ≥ this fraction of
-#: competence when they are STILLED, not just additively flavored by them. This is the MIN-COMPOSITION
-#: LAW: an honest metric is `completion_gate · min/product(channels)`, so zeroing ANY channel (incl the
-#: goal joints) collapses the score → drop ~1.0. A farm that ADDS its channels `α·goal_joint_term +
-#: (1−α)·root_bob` only drops ~α. §round-42: a FIXED threshold T<0.5 is a KNIFE-EDGE — the attacker
-#: splits at α=T so the dominant (1−α)≥0.5 root term still beats the ceiling (the round-41 0.4 bar fell
-#: to a 0.4·goal+0.6·root split). Set to 0.8 (enforce the product law within a 20% additive tolerance):
-#: a useful root farm needs (1−α)≥~0.5 → α≤0.5 → drop≤0.5 < 0.8 → FLAGGED; honest product/min metrics
-#: drop ~1.0 → pass; a metric with >20% non-goal-joint additive weight is gameable and flagged.
-#: Skipped for a pure-posture goal (no goal joints).
-_PERTURB_GOAL_DROP_MIN = 0.8
+#: §round-39…44: GOAL-JOINT SENSITIVITY (the MIN-COMPOSITION LAW) — a granted metric must read its
+#: DECLARED goal joints, not a root/posture proxy. An honest metric is `completion_gate·min/product
+#: (channels)`, so stilling the goal joints collapses the score; a farm `α·goal + (1−α)·root` retains
+#: ~(1−α). The verdict is CEILING-AWARE (§round-44): gameable iff the goal-joint-STILLED score `gneut`
+#: ≥ the gaming ceiling `min(_ADV_REL_CEIL·comp, _ADV_ABS_CEIL)` — i.e. "doing the on-goal root but
+#: NOT the goal joints still looks competent." This supersedes the round-41/42 fixed drop bar (0.4→0.8),
+#: which was a knife-edge (0.4 fell to a 0.4·goal+0.6·root split) AND double-counted an ON-goal root
+#: channel (false-rejecting an honest `0.7·legROM + 0.3·pelvis-descent` squat whose stilled residual
+#: 0.30 is sub-ceiling — round-43). A useful root farm (residual ≥ ceiling) is flagged; an honest
+#: metric whose non-goal residual is sub-ceiling passes. Skipped for a pure-posture goal (no goal joints).
 
 
 def _derive_goal_channels(valid_ladders: Any, names: list[str]) -> tuple[set, set]:
@@ -1609,9 +1607,17 @@ def off_goal_perturbation_verdict(
             smeta = dict(meta); inject_joint_roles(smeta, roles)
             slow = _gameable_score(float(gen_fn(sarr, behavior, smeta).get("spec_score", 0.0)))
             slow_retained = slow / comp if comp > 0 else 0.0
-        # §round-39 (round-38 defects 2+3): GOAL-JOINT SENSITIVITY — still the goal joints; if the
-        # score does not drop, the metric reads a root/posture channel instead of its goal joints.
+        # §round-39 (round-38 defects 2+3) / §round-44 (round-43 false-reject fix): GOAL-JOINT
+        # SENSITIVITY — still the goal joints (keep the ON-goal root + uprightness); the metric is
+        # gameable iff a goal-joint-stilled policy STILL scores in COMPETENT territory (gneut ≥ the
+        # gaming ceiling). This is CEILING-AWARE (replaces the round-42 fixed 0.8·comp drop bar, which
+        # double-counted an ON-goal root channel and false-rejected an honest additive squat
+        # `0.7·legROM + 0.3·pelvis-descent`: stilling the legs left the on-goal descent 0.30 — below
+        # the ceiling, NOT a useful farm). A token-split root farm leaves (1−α)≥0.5 ≥ ceiling → flagged;
+        # an honest metric whose on-goal-root residual is sub-ceiling passes. Semantics: "doing the
+        # on-goal root but NOT the goal joints must not look competent."
         goal_drop = None
+        gneut = None
         if goal_joints:
             garr = _neutralize_goal_joints(arrays, goal_joints)
             gmeta = dict(meta); inject_joint_roles(gmeta, roles)
@@ -1625,14 +1631,16 @@ def off_goal_perturbation_verdict(
     swing = max(rise, drop)
     gameable = (swing >= margin) or (swing >= _PERTURB_REL_FRAC * headroom and swing > _PERTURB_ABS_FLOOR)
     on_goal_char = bool(slow_retained is not None and slow_retained >= _PERTURB_SLOW_RETAIN)
-    goal_joint_insensitive = bool(goal_drop is not None and goal_drop < _PERTURB_GOAL_DROP_MIN * comp)
+    ceiling = min(_ADV_REL_CEIL * comp, _ADV_ABS_CEIL)
+    goal_joint_insensitive = bool(gneut is not None and gneut >= ceiling)
     gameable = gameable or on_goal_char or goal_joint_insensitive
     rec.update(ran=True, gameable=bool(gameable), comp=round(comp, 4), pert=round(pert, 4),
                neut=round(neut, 4), rise=round(rise, 4), drop=round(drop, 4),
                slow_retained=(round(slow_retained, 4) if slow_retained is not None else None),
                on_goal_char=on_goal_char,
                goal_drop=(round(goal_drop, 4) if goal_drop is not None else None),
-               goal_joint_insensitive=goal_joint_insensitive,
+               gneut=(round(gneut, 4) if gneut is not None else None),
+               ceiling=round(ceiling, 4), goal_joint_insensitive=goal_joint_insensitive,
                n_goal_joints=len(goal_joints), on_root=sorted(on_root))
     return rec
 
@@ -2332,11 +2340,12 @@ def calibrate_task_derived(
                     if not adv.get("reason"):
                         if scope.get("goal_joint_insensitive"):
                             adv["reason"] = (
-                                f"scope: the metric is INSENSITIVE to its goal joints — stilling the "
-                                f"goal's {scope.get('n_goal_joints')} joints barely changed the score "
-                                f"(drop {scope.get('goal_drop')} of comp {scope.get('comp')}); it reads "
-                                f"a root/posture channel ({scope.get('on_root') or 'no'}-root) instead "
-                                f"of the goal — a pelvis-bob/dip farm games it — gameable")
+                                f"scope: the metric is INSENSITIVE to its goal joints — a policy that "
+                                f"STILLS the goal's {scope.get('n_goal_joints')} joints (doing only the "
+                                f"on-goal root/posture {scope.get('on_root') or 'no'}-root) still scores "
+                                f"{scope.get('gneut')} ≥ the gaming ceiling {scope.get('ceiling')} "
+                                f"(comp {scope.get('comp')}); it reads a root/posture channel instead of "
+                                f"the goal — a pelvis-bob/dip farm games it — gameable")
                         elif scope.get("on_goal_char"):
                             adv["reason"] = (
                                 f"scope: the metric reads only the goal channel's RANGE, not its "

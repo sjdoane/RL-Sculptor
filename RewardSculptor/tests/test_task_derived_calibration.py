@@ -3150,14 +3150,18 @@ def compute_spec(arrays, behavior, meta):
     assert not cal["ok"], cal                                # token-split root farm DENIED
     sc = (cal["adversarial"] or {}).get("scope", {})
     assert sc.get("goal_joint_insensitive"), sc
-    # §round-42: the min-composition threshold (0.8) also catches the KNIFE-EDGE split that defeated
-    # the round-41 0.4 bar — a 0.5*goal + 0.5*root metric (the 0.5 root term still beats the ceiling):
-    SPLIT_50 = SPLIT.replace("0.25 * leg + 0.75 * bob", "0.5 * leg + 0.5 * bob")
-    cal50 = calibrate_task_derived(_write(tmp_path, "split50.py", SPLIT_50),
+    # §round-42/44: the CEILING-AWARE check also catches the KNIFE-EDGE split that defeated the
+    # round-41 fixed 0.4 bar — a 0.4*goal + 0.6*root metric: stilling the legs leaves the 0.6 root
+    # term (gneut ≥ the gaming ceiling) → flagged, where the old drop-ratio bar passed it at 0.42.
+    # (The exact α=0.5 boundary — a bobber at exactly the abs ceiling — is the firewall's inherent
+    # ceiling knife-edge and a documented marginal residual.)
+    SPLIT_40 = SPLIT.replace("0.25 * leg + 0.75 * bob", "0.4 * leg + 0.6 * bob")
+    cal40 = calibrate_task_derived(_write(tmp_path, "split40.py", SPLIT_40),
         "hop up and down repeatedly in place", robot_hint="Unitree-G1",
         client=_FakeLadderClient(hop_osc(), hop_osc(), hop_osc()))
-    assert not cal50["ok"], cal50
-    assert (cal50["adversarial"] or {}).get("scope", {}).get("goal_joint_insensitive"), cal50
+    assert not cal40["ok"], cal40
+    sc40 = (cal40["adversarial"] or {}).get("scope", {})
+    assert sc40.get("goal_joint_insensitive") and sc40.get("gneut") >= sc40.get("ceiling"), cal40
     # an honest hop metric GATED on leg pump (product) drops ~1.0 when legs stilled → grants:
     HONEST = '''import numpy as np
 REQUIRED_JOINT_ROLES = ["left_knee", "right_knee", "left_hip_pitch", "right_hip_pitch"]
@@ -3175,3 +3179,35 @@ def compute_spec(arrays, behavior, meta):
         client=_FakeLadderClient(hop_osc(), hop_osc(), hop_osc()))
     assert calh["ok"], calh
     assert not (calh["adversarial"] or {}).get("scope", {}).get("goal_joint_insensitive")
+
+
+def test_round44_honest_additive_squat_with_on_goal_descent_grants(tmp_path):
+    """§round-44 (round-43 false-reject fix): the goal-joint-sensitivity check is CEILING-AWARE — a
+    metric is gameable iff a goal-joint-STILLED policy still scores ≥ the gaming ceiling. The round-42
+    fixed 0.8 drop bar false-rejected an honest squat `0.7·legROM + 0.3·pelvis-descent` (an ADDITIVE
+    combination of the goal joints with the ON-GOAL root-z descent), because stilling the legs leaves
+    the 0.30 on-goal descent (drop 0.55 < 0.8·comp) — yet that 0.30 residual is BELOW the ceiling, so
+    nothing games it. Ceiling-aware: gneut 0.26 < ceiling 0.5 → GRANTS. A token-split root farm leaves
+    ≥0.5 ≥ ceiling → still flagged (test_round41)."""
+    SQUAT = '''import numpy as np
+REQUIRED_JOINT_ROLES = ["left_hip_pitch", "left_knee", "right_hip_pitch", "right_knee"]
+def compute_spec(arrays, behavior, meta):
+    g = arrays.get("projected_gravity_b"); jp = arrays.get("joint_pos"); root = arrays.get("root_link_pos_w")
+    if g is None or jp is None or root is None: return {"spec_score": 0.0}
+    roles = (meta or {}).get("joint_roles", {}); legs = [roles[r] for r in ("left_hip_pitch", "left_knee", "right_hip_pitch", "right_knee") if r in roles]
+    if not legs: return {"spec_score": 0.0}
+    up = float(np.mean(g[..., 2] < -0.85)); legrom = 1 - float(np.exp(-np.mean(jp[..., legs].max(0) - jp[..., legs].min(0)) / 0.6))
+    z = root[..., 2]; desc = 1 - float(np.exp(-(0.7 - z.mean()) / 0.2))
+    return {"spec_score": float(np.clip(up * (0.7 * legrom + 0.3 * desc), 0, 1))}
+'''
+    def crouch_ladder():   # an UPRIGHT controlled-crouch ladder (duck/squat-and-hold-low, torso up)
+        return CompetenceLadder(competence_axis="controlled crouch depth", rungs=[
+            MotionSpec(uprightness=1.0, base_height_m=h, groups=[_fold_group(a)])
+            for h, a in [(0.62, 0.4), (0.5, 0.7), (0.4, 1.0), (0.3, 1.25)]])
+    for nm, lad in [("crouch", crouch_ladder), ("fold", fold_ladder)]:
+        cal = calibrate_task_derived(_write(tmp_path, "sq.py", SQUAT),
+            "squat down into a controlled crouch", robot_hint="Unitree-G1",
+            client=_FakeLadderClient(lad(), lad(), lad()))
+        assert cal["ok"], (nm, cal)                          # honest additive squat GRANTS (was denied)
+        sc = (cal["adversarial"] or {}).get("scope", {})
+        assert not sc.get("goal_joint_insensitive") and sc.get("gneut") < sc.get("ceiling"), cal
