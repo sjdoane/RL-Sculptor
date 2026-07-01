@@ -107,6 +107,15 @@ class IterOutcome:
     #: N+1 reverted, iter N's edit was discarded and never measured, so its
     #: forward fitness delta must NOT be attributed (verdict stays 'unknown').
     reverted_to_best: bool = False
+    #: §Convergence (RL_SCULPTOR_AUDIT §4.1): DENSE sub-success progress in
+    #: [0,1] from the metric's optional `progress_score` key (min over the
+    #: same saturating channels WITHOUT the completion gate). Used ONLY to
+    #: RANK candidates below success — never granted as task success, never
+    #: shown as the fitness. None when the metric doesn't emit it.
+    progress: float | None = None
+    #: The naturalness-GATED progress (mirrors `steer_fitness` for the dense
+    #: channel) — an unnatural rollout cannot rank up via progress either.
+    steer_progress: float | None = None
 
 
 @dataclass
@@ -121,6 +130,13 @@ class SculptRunResult:
     fitness_history: list[float] = field(default_factory=list)
     best_fitness: float | None = None
     best_fitness_iter: int | None = None
+    #: §Convergence (RL_SCULPTOR_AUDIT §4.1): per-iter dense progress
+    #: (parallel to fitness_history; 0.0 when the metric emits none) and the
+    #: steer-progress of the best iter — the LEXICOGRAPHIC tie-break for
+    #: best-by-fitness selection when spec fitness ties (e.g. all-zero
+    #: below the completion gate).
+    progress_history: list[float] = field(default_factory=list)
+    best_progress: float | None = None
 
     @property
     def final_reward_path(self) -> Path | None:
@@ -1088,6 +1104,7 @@ def _run_one_iter(
     # (spec_metric) only when --fitness-in-loop is on; None keeps the
     # blind default. A crash here must never kill the iter — honest None.
     iter_fitness: float | None = None
+    iter_progress: float | None = None
     objective_progress: dict | None = None
     if fitness_fn is not None:
         # §Ship 36 (F2): prefer the `.detail` accessor (rides on the fitness
@@ -1100,6 +1117,13 @@ def _run_one_iter(
                 detail = detail_fn(iter_dir) or {}
                 iter_fitness = float(detail.get("spec_score", 0.0) or 0.0)
                 fitness_components = _fitness_components_for_prompt(detail)
+                # §Convergence (RL_SCULPTOR_AUDIT §4.1): the metric's OPTIONAL
+                # dense progress channel (min of pre-gate saturating channels).
+                # Advisory ranking signal only — absent/malformed → None.
+                pr = detail.get("progress_score")
+                if (isinstance(pr, (int, float)) and not isinstance(pr, bool)
+                        and math.isfinite(float(pr))):
+                    iter_progress = min(1.0, max(0.0, float(pr)))
             else:
                 iter_fitness = float(fitness_fn(iter_dir))
         except Exception as e:  # noqa: BLE001 — fitness is advisory, never fatal
@@ -1131,6 +1155,8 @@ def _run_one_iter(
                 "type": "iter_fitness",
                 "iter": iter_index,
                 "fitness": round(iter_fitness, 5),
+                "progress": (round(iter_progress, 5)
+                             if iter_progress is not None else None),
                 "best_so_far": progress["best_so_far"],
                 "delta_vs_previous": progress["delta"],
                 "observe_only": bool(fitness_observe_only),
@@ -1152,6 +1178,7 @@ def _run_one_iter(
     # the true fitness (byte-identical to the pre-LAW-7 loop).
     naturalness: dict[str, Any] | None = None
     iter_steer_fitness: float | None = iter_fitness
+    iter_steer_progress: float | None = iter_progress
     iter_naturalness_factor: float = 1.0   # §LAW 11: tracked for Goodhart-onset
     try:
         from sculptor.adapters.realism import (
@@ -1169,6 +1196,9 @@ def _run_one_iter(
         iter_naturalness_factor = float(naturalness.get("steer_factor", 1.0) or 1.0)
         if not fitness_observe_only:
             iter_steer_fitness = _steer_fitness(iter_fitness, naturalness)
+            # §Convergence: gate the dense progress channel identically — an
+            # unnatural rollout cannot rank up via progress either.
+            iter_steer_progress = _steer_fitness(iter_progress, naturalness)
         if objective_progress is not None:
             objective_progress["naturalness"] = naturalness
         (iter_dir / "realism_audit.json").write_text(
@@ -1419,6 +1449,8 @@ def _run_one_iter(
         naturalness_factor=iter_naturalness_factor,
         reward_path_trained=reward_path_trained,
         reverted_to_best=reverted_to_best,
+        progress=iter_progress,
+        steer_progress=iter_steer_progress,
     )
 
 
@@ -1788,9 +1820,12 @@ def sculpt_run(
             result.iterations_run += 1
 
             # §Ship 33: track objective fitness + best-by-fitness selection.
+            strictly_regressed = False
             if fitness_fn is not None:
                 fit = outcome.fitness if outcome.fitness is not None else 0.0
                 result.fitness_history.append(fit)   # TRUE task fitness (display / A-B)
+                result.progress_history.append(       # §Convergence: dense channel
+                    outcome.progress if outcome.progress is not None else 0.0)
                 naturalness_history.append(           # §LAW 11: aligned naturalness trend
                     outcome.naturalness_factor
                     if outcome.naturalness_factor is not None else 1.0)
@@ -1800,23 +1835,42 @@ def sculpt_run(
                 # checkpoint. The recorded history above stays the true score.
                 steer = (outcome.steer_fitness
                          if outcome.steer_fitness is not None else fit)
-                if result.best_fitness is None or steer > result.best_fitness:
+                # §Convergence (RL_SCULPTOR_AUDIT §4.1): LEXICOGRAPHIC key —
+                # spec fitness decides; the dense progress channel ONLY breaks
+                # ties. Below the completion gate (spec 0.0 everywhere, the
+                # tuck-jump failure) progress is the only ranking signal; the
+                # moment any iter clears the gate, spec dominates again.
+                sprog = (outcome.steer_progress
+                         if outcome.steer_progress is not None
+                         else (outcome.progress
+                               if outcome.progress is not None else 0.0))
+                cur_key = (steer, sprog)
+                best_key = ((result.best_fitness, result.best_progress or 0.0)
+                            if result.best_fitness is not None else None)
+                if best_key is None or cur_key > best_key:
                     result.best_fitness = steer
+                    result.best_progress = sprog
                     result.best_fitness_iter = outcome.iter_index
                     iters_since_best = 0
                 else:
                     iters_since_best += 1
+                    strictly_regressed = cur_key < best_key
 
             # §Ship 36 (F1): set the next iter's edit base. If this iter set a
             # new best, keep building forward (revert_base=None — the best IS
-            # the latest). If it regressed, point the next iter at the best-so-
-            # far reward so the search doesn't compound a bad edit. Steer mode
-            # only; observe-only never reverts (the signal stays passive).
+            # the latest). If it STRICTLY regressed, point the next iter at the
+            # best-so-far reward so the search doesn't compound a bad edit.
+            # §Convergence deadlock fix: a TIE with best (common when the
+            # metric reads 0.0 below its completion gate) is NOT a regression —
+            # reverting on ties pinned tuck-jump to v0 forever, retraining the
+            # same reward while every corrective edit was generated but never
+            # trained. Ties keep building forward; patience still counts them.
+            # Steer mode only; observe-only never reverts (signal stays passive).
             if (fitness_fn is not None and not fitness_observe_only
                     and fitness_revert):
                 revert_base = (
                     result.best_reward_path
-                    if iters_since_best >= 1 and result.best_reward_path is not None
+                    if strictly_regressed and result.best_reward_path is not None
                     else None
                 )
 
@@ -1952,6 +2006,8 @@ def sculpt_run(
                     "iter": int(result.best_fitness_iter),
                     "fitness": (round(result.best_fitness, 5)
                                 if result.best_fitness is not None else None),
+                    "progress": (round(result.best_progress, 5)
+                                 if result.best_progress is not None else None),
                     "reward": best_path.name,
                 })
             except Exception as e:  # noqa: BLE001 — selection is best-effort

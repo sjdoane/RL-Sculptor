@@ -307,3 +307,117 @@ def test_detect_goodhart_onset_silent_when_metric_not_rising():
 def test_detect_goodhart_onset_needs_enough_points():
     assert S.detect_goodhart_onset([0.2, 0.3], [1.0, 0.5]) is None
     assert S.detect_goodhart_onset([], []) is None
+
+
+# ── §Convergence (RL_SCULPTOR_AUDIT §4.1): dense progress channel ─────────
+# The tuck-jump deadlock: an all-or-nothing metric read 0.0 on every iter,
+# strict-> selection made every 0.0 TIE count as "no new best", the revert
+# fired every iter, and every corrective edit was generated but never
+# trained. These tests pin the fix: ties build forward; a dense
+# `progress_score` ranks sub-success iters; spec fitness still dominates.
+
+
+def _install_progress_fake(monkeypatch, fitness_by_iter, seen_revert,
+                           progress_by_iter=None):
+    """Recording fake that also stamps the dense `progress` channel."""
+    monkeypatch.setattr(S, "load_adapter", lambda _p: object())
+    monkeypatch.setattr("sculptor.run_context.capture_run_context",
+                        lambda *a, **k: {}, raising=True)
+    monkeypatch.setattr("sculptor.run_context.write_run_context",
+                        lambda *a, **k: Path("run_context.json"), raising=True)
+
+    def fake_iter(**kw):
+        seen_revert.append(kw.get("revert_base"))
+        i = kw["iter_index"]
+        rewards_dir = kw["rewards_dir"]
+        trained = rewards_dir / f"v{i}.py"
+        edit = rewards_dir / f"v{i + 1}.py"
+        edit.write_text(
+            "REWARD_SPEC = {}\ndef compute_reward(*a, **k):\n    return 0.0, {}\n",
+            encoding="utf-8",
+        )
+        S._write_current_reexport(rewards_dir, edit)
+        return S.IterOutcome(
+            iter_index=i, iter_dir=kw["runs_dir"] / f"iter_{i}",
+            reward_path_before=rewards_dir / "current.py",
+            reward_path_after=edit, primary_metric=0.0, behavior={},
+            failure_modes=[], edit_count=1, fitness=fitness_by_iter[i],
+            reward_path_trained=trained,
+            progress=(progress_by_iter or {}).get(i),
+        )
+
+    monkeypatch.setattr(S, "_run_one_iter", fake_iter)
+
+
+def test_fitness_tie_does_not_revert(tmp_path, monkeypatch):
+    """A tie with best (the all-zero-metric case) must NOT trigger a revert —
+    reverting on ties is the deadlock that pinned tuck-jump to v0."""
+    cfg_path = _make_project(tmp_path)
+    seen: list = []
+    _install_progress_fake(monkeypatch, {0: 0.0, 1: 0.0, 2: 0.0, 3: 0.0}, seen)
+    res = S.sculpt_run(
+        cfg_path, "goal", iterations=4, no_kg=True,
+        fitness_fn=lambda d: 0.0, fitness_patience=3,
+    )
+    # Every iter ties best (0.0, 0.0): the loop keeps building FORWARD so
+    # each new edit actually gets trained next iter.
+    assert all(s is None for s in seen), seen
+    # Patience still counts ties, so the plateau stop is unaffected.
+    assert res.early_stopped and "plateau" in res.early_stop_reason
+
+
+def test_progress_breaks_ties_in_best_selection(tmp_path, monkeypatch):
+    """Below the completion gate (spec 0.0 everywhere) the dense progress
+    channel is the ranking signal: best = highest progress."""
+    cfg_path = _make_project(tmp_path)
+    seen: list = []
+    _install_progress_fake(
+        monkeypatch, {0: 0.0, 1: 0.0, 2: 0.0, 3: 0.0}, seen,
+        progress_by_iter={0: 0.0, 1: 0.1, 2: 0.3, 3: 0.2},
+    )
+    res = S.sculpt_run(
+        cfg_path, "goal", iterations=4, no_kg=True,
+        fitness_fn=lambda d: 0.0, fitness_patience=3,
+    )
+    assert res.best_fitness_iter == 2
+    assert res.best_progress == pytest.approx(0.3)
+    assert res.progress_history == [0.0, 0.1, 0.3, 0.2]
+    # current.py re-exports the best-progress iter's TRAINED reward.
+    current = (cfg_path.parent / "rewards" / "current.py").read_text()
+    assert "v2" in current
+
+
+def test_progress_regression_reverts_to_best(tmp_path, monkeypatch):
+    """A STRICT drop on the tuple (spec tie, progress down) is a real
+    regression and must revert the edit base to the best-so-far reward."""
+    cfg_path = _make_project(tmp_path)
+    seen: list = []
+    _install_progress_fake(
+        monkeypatch, {0: 0.0, 1: 0.0, 2: 0.0}, seen,
+        progress_by_iter={0: 0.2, 1: 0.05, 2: 0.1},
+    )
+    S.sculpt_run(
+        cfg_path, "goal", iterations=3, no_kg=True,
+        fitness_fn=lambda d: 0.0, fitness_patience=5,
+    )
+    # iter 0 sets best; iter 1 strictly regresses on progress → iter 2 is
+    # handed iter 0's TRAINED reward (v0.py) as its edit base.
+    assert seen[0] is None and seen[1] is None
+    assert seen[2] is not None and seen[2].name == "v0.py"
+
+
+def test_spec_fitness_dominates_progress(tmp_path, monkeypatch):
+    """Lexicographic: any completion-gate success outranks ANY amount of
+    dense progress — progress can never outbid the real task score."""
+    cfg_path = _make_project(tmp_path)
+    seen: list = []
+    _install_progress_fake(
+        monkeypatch, {0: 0.0, 1: 0.5}, seen,
+        progress_by_iter={0: 0.9, 1: 0.0},
+    )
+    res = S.sculpt_run(
+        cfg_path, "goal", iterations=2, no_kg=True,
+        fitness_fn=lambda d: 0.0, fitness_patience=5,
+    )
+    assert res.best_fitness_iter == 1
+    assert res.best_fitness == pytest.approx(0.5)

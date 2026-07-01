@@ -93,7 +93,10 @@ _LENSES: dict[str, str] = {
         "FOCUS LENS: composition. Is the score EXACTLY a sharp completion gate times a "
         "min of saturating channels — with NO weighted sum, NO fractional partial-"
         "credit product, NO peak/median ratio, and NO unbounded/extremal term a single-"
-        "frame spike can inflate (LAW 1/8)? Reject any other composition.",
+        "frame spike can inflate (LAW 1/8)? Reject any other composition. (A SEPARATE "
+        "`progress_score` subcomponent — a min of the same channels WITHOUT the gate, "
+        "for search ranking only — is expected and fine UNLESS it feeds spec_score, "
+        "uses a non-min composition, or scores a dead-still policy above ~0.)",
     _VLM_LENS:
         "FOCUS LENS: naturalness & goal-match. From the KEYFRAMES, judge whether the "
         "depicted motion actually ACHIEVES the goal (goal-match) and is physically "

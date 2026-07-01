@@ -35,6 +35,12 @@ competent positive.
    peak/median (p95/p99-over-median) RATIO or other unbounded/extremal term a
    single-frame spike can inflate. The required form is a sharp completion gate
    times a `min` of saturating channels.
+   NOTE — a SEPARATE `progress_score` subcomponent is expected and is NOT a
+   violation: it is the dense search-ranking channel (a `min` of the same
+   saturating channels WITHOUT the completion gate, ramping from the noise
+   floor), consumed by the outer loop only to rank candidates below success.
+   REJECT it only if it feeds into spec_score, uses a sum/product/ratio
+   composition instead of a min, or scores a dead-still policy above ≈0.
 5. **Naturalness fused into correctness.** Smoothness/energy/jerk style terms
    are baked into the metric (they belong in the reward); or correctness and
    naturalness are collapsed into one gated scalar so a policy can trade one

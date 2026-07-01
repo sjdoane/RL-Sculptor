@@ -165,6 +165,22 @@ Any array may be ABSENT — always `arrays.get(k)` + guard for None.
    goal frame, each channel value, the completion gate, and any abstained
    check (for debugging and review).
 
+10. **ALSO return a dense `progress_score` — the search-ranking channel.**
+   Alongside (never inside) spec_score, return:
+       progress_score = min(dense_channel_1, dense_channel_2, ...)
+   where each `dense_channel_i` measures the SAME physical quantity as the
+   corresponding spec channel, in the same saturating [0,1] form, but ramps
+   SMOOTHLY from the sensor-noise floor instead of from the task threshold —
+   no completion gate, no hard amplitude floors. Its job is to let the outer
+   search RANK two both-failing policies (a 5 cm hop must outrank standing
+   still) — it is NEVER task success, never displayed as the score, and MUST
+   NOT feed into spec_score in any way. Keep the min composition (no sums,
+   no products): a policy must raise its WEAKEST requirement to rank up, so
+   farming one channel (e.g. tucking while lying on the ground scores zero
+   on the posture/landing channel and therefore zero progress) cannot climb.
+   A dead-still upright policy should score ≈0 on it (all motion channels at
+   the noise floor).
+
 Think about which physical signature DEFINITELY distinguishes success from the
 specific failure modes — wrong direction, incomplete/partial motion, tiny
 amplitude, balancing instead of acting, flailing instead of executing — then
