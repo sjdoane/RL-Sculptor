@@ -299,6 +299,58 @@ Format per entry: date — what changed (files:lines) — why — evidence
 - **E2E**: launched 13:33 local, iters 5–8, `--fitness-mode steer
   --fitness-patience 4 --steps-per-iter 1500`, gen_002 metric; log
   `runs/sculpt_loop2_1333.log`. ~45 min training per iter.
+- **Iter 5 datapoint (v5 trained for the first time)**: spec 0.0,
+  progress ~0 — but the BEHAVIOR moved decisively off the old
+  attractor: apex_gain 5.9 cm (was 2 cm standing), tuck_excess
+  0.72 rad (real knee flexion near apex), lateral drift 0.29 m (was
+  4.2 m walking). Bottleneck channel is c_returned ≈ 0: the policy
+  ends ~0.7 m below start height (kneels/sits after the dip-hop;
+  keyframes confirm). The dense channel breakdown now hands the
+  diagnoser the exact failing requirement instead of a blank 0.0.
+  Naturalness verdict ok (steer_factor 1.0).
+
+- **E2E COMPLETE (iters 5–8, ~4 h GPU) — loop pathologies fixed,
+  tuck-jump gate not yet cleared.** Full arc:
+  | iter | reward trained | behavior | spec/progress | loop action |
+  |---|---|---|---|---|
+  | 5 | v5 (1st time ever) | dip-hop + tuck 0.72 rad + kneel-end | 0.0 / 5.3e-23 | best; edit → v6 (diagnosed reward_hacking+static_eq) |
+  | 6 | v6 | INSTANT FALL (ep 16 steps) | 0.0 / — | STRICT regression → revert armed; edit → v7 |
+  | 7 | v5 (reverted) | reproduces iter 5 (hop 5.2 cm, tuck 0.74) | 0.0 / ~0 | edit → v8 (5 edits, knows v6 failed) |
+  | 8 | v8 | early fall (ep 18 steps) | 0.0 / — | regression; edit → v9 (untrained) |
+  Post-loop: `best_reward_selected` = iter 7 → current.py = v5. ✔
+  Every new edit TRAINED before judgment (old loop: never). ✔ Bad
+  edits could not compound (strict revert). ✔ Keep-best held v5. ✔
+  No v0 regression. ✘ spec/progress stayed 0: the min-composed
+  progress is bottlenecked by return-to-stance, and both diagnoser
+  edits over-corrected into instant-fall rewards. REMAINING GAP =
+  edit quality on hard skills + env misalignment (velocity task
+  termination/commands fight a standing jump) — §4.4.
+
+- **FITNESS-CLIMB PROOF (hand-authored ground truth).** Scoring every
+  rollout on the repo's own `spec_g1_jump` (saturating apex ×
+  completed launch-and-land cycles × uprightness — the Eureka-style
+  task fitness F):
+  | iter | 0 | 1 | 2 | 3 | 4 | **5** | 6 | **7** | 8 |
+  |---|---|---|---|---|---|---|---|---|---|
+  | spec_g1_jump | 0.0 | 0.020* | 0.0 | 0.0 | 0.0 | **0.258** | 0.0 | **0.250** | 0.0 |
+  (*iter 1 = supine hack, crushed by uprightness 0.074.) The fixed
+  loop's kept-best behavior scores 13× the old run's best and comes
+  with upright=1.0 + a completed launch/descent cycle + a real 0.72
+  rad knee tuck. Caveat, stated honestly: part of the apex half-range
+  credit comes from the stand→kneel height drop, so 0.26 is a partial
+  jump attempt, not a clean tuck-jump. The generated gen_002 metric
+  (stricter: min-composition incl. return-to-stance) correctly still
+  reads 0 — do NOT soften it; the missing piece is a landing/recovery
+  shaping term (§4.4), not more metric credit.
+
+- **Cartpole proxy (negative result, documented).** A 4-iter run on
+  `Mjlab-Cartpole-Balance` + built-in `cartpole_balance` spec:
+  fitness = 1.0 from iter 0 even under the constant v0 reward — the
+  env never terminates episodes early, so the episode-length spec is
+  degenerate (always cap). Useless as a convergence demo (it did
+  exercise tie-no-revert + keep-best at saturation correctly). Note
+  for future eval work: the cartpole benchmark's spec cannot show a
+  climb unless the env config terminates on pole fall.
 
 ### 2026-07-01 — loop 3: offline dead-reward pre-screen
 - **What**: `sculptor/edit.py` `_probe_reward_variance` + call in
