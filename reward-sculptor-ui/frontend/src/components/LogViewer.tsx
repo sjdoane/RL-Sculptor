@@ -134,7 +134,7 @@ function prettyLabel(ev: RunEvent): string {
     case "iter_completed": return `iter_completed${iter} metric=${fmtNum(ev.primary_metric)} Δ=${fmtNum(ev.metric_delta)} failure_modes=${JSON.stringify(ev.failure_modes ?? [])}`;
     case "metric_history": return `metric_history len=${Array.isArray(ev.history) ? (ev.history as unknown[]).length : "?"}`;
     // §Ship 34: objective fitness-in-the-loop.
-    case "iter_fitness": return `iter_fitness${iter} fitness=${fmtNum(ev.fitness)} best=${fmtNum(ev.best_so_far)} Δ=${fmtNum(ev.delta_vs_previous)}`;
+    case "iter_fitness": return `iter_fitness${iter} fitness=${fmtNum(ev.fitness)} prog=${fmtNum(ev.progress)} best=${fmtNum(ev.best_so_far)} Δ=${fmtNum(ev.delta_vs_previous)}`;
     case "best_reward_selected": return `best_reward_selected${iter} fitness=${fmtNum(ev.fitness)} reward=${String(ev.reward ?? "?")}`;
     case "fitness_metric_warning": return `⚠ fitness_metric_warning ${String(ev.message ?? "")}`;
     case "early_stop": return `early_stop at iter=${ev.at_iter ?? "?"} reason=${ev.reason ?? ""}`;

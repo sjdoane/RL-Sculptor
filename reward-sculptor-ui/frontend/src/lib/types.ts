@@ -507,6 +507,10 @@ export interface IterEventSummary {
   // runs (no --fitness-metric).
   fitness?: number | null;
   best_fitness?: number | null;
+  // §Convergence loop 1: dense sub-success progress (metric progress_score,
+  // 0-1) — ranks iterations below the completion gate. Undefined when the
+  // metric doesn't emit it.
+  progress?: number | null;
 }
 
 export interface RunSummary {

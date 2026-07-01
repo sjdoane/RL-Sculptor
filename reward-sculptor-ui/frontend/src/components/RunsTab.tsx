@@ -654,6 +654,12 @@ function IterationTimeline({ iters, selected, onSelect }: { iters: IterEventSumm
                 <span className="rs-num" title="objective fitness (spec_score, 0-1) — primary metric" style={{ fontSize: 15, fontWeight: 600, color: "#b9aef5" }}>
                   fit {it.fitness.toFixed(2)}{typeof it.best_fitness === "number" && it.best_fitness > it.fitness + 1e-9 ? ` (best ${it.best_fitness.toFixed(2)})` : ""}
                 </span>
+                {/* §Convergence loop 1: dense sub-success progress — the
+                    ranking signal below the completion gate. Shown only
+                    when the metric emits progress_score. */}
+                {typeof it.progress === "number" && (
+                  <span className="rs-num" title="dense progress (metric progress_score, 0-1) — ranks iterations below the success gate" style={{ fontSize: 11, color: "#8ec8a6" }}>prog {it.progress.toFixed(3)}</span>
+                )}
                 {it.primary_metric !== null && (
                   <span className="rs-num" title="reward metric (secondary)" style={{ fontSize: 11, color: "var(--rs-muted)" }}>r {it.primary_metric.toFixed(1)}</span>
                 )}
@@ -809,6 +815,7 @@ function _mergeIterSlot(prev: IterEventSummary | undefined, next: IterEventSumma
     // carry it (iter_fitness fires before iter_completed).
     fitness: winner.fitness ?? loser.fitness,
     best_fitness: winner.best_fitness ?? loser.best_fitness,
+    progress: winner.progress ?? loser.progress,
   };
 }
 
@@ -1020,6 +1027,7 @@ function useMergedIterations(rest: IterEventSummary[], events: RunEvent[]): Iter
       if (ev.type === "iter_fitness") {
         if (typeof ev.fitness === "number") slot.fitness = ev.fitness;
         if (typeof ev.best_so_far === "number") slot.best_fitness = ev.best_so_far;
+        if (typeof ev.progress === "number") slot.progress = ev.progress;
       }
       if (ev.type === "best_reward_selected") {
         if (typeof ev.fitness === "number") slot.best_fitness = ev.fitness;

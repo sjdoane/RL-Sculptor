@@ -218,6 +218,10 @@ class IterEventSummary(BaseModel):
     # runs. Populated from iter_fitness / best_reward_selected events.
     fitness: Optional[float] = None
     best_fitness: Optional[float] = None
+    # §Convergence loop 1: dense sub-success progress (the metric's
+    # progress_score — ranks iterations below the completion gate). None
+    # when the metric doesn't emit it.
+    progress: Optional[float] = None
 
 
 class ErrorClassification(BaseModel):

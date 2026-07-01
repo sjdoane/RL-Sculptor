@@ -1233,6 +1233,10 @@ def _iter_events(job: Job) -> list[dict[str, Any]]:
                 # §Ship 34: objective fitness-in-the-loop (None for blind runs).
                 "fitness": None,
                 "best_fitness": None,
+                # §Convergence loop 1: dense sub-success progress (ranking
+                # signal below the completion gate). None when the metric
+                # doesn't emit progress_score.
+                "progress": None,
             },
         )
         if etype == "iter_started":
@@ -1340,6 +1344,8 @@ def _iter_events(job: Job) -> list[dict[str, Any]]:
                 slot["fitness"] = float(ev.get("fitness"))
             if isinstance(ev.get("best_so_far"), (int, float)):
                 slot["best_fitness"] = float(ev.get("best_so_far"))
+            if isinstance(ev.get("progress"), (int, float)):
+                slot["progress"] = float(ev.get("progress"))
         elif etype == "best_reward_selected":
             if isinstance(ev.get("fitness"), (int, float)):
                 slot["best_fitness"] = float(ev.get("fitness"))
