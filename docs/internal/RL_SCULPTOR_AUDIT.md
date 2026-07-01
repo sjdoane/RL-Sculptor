@@ -189,10 +189,10 @@ treated as regressions.
 |---|---|---|---|---|
 | 1 | No sub-success gradient in selection signal | 1 | metric contract + `sculpt_run` selection key | **FIXED loop-side + prompt-side (loop 1)** |
 | 2 | Tie treated as regression → revert deadlock | 7 | `sculpt.py` revert decision | **FIXED (loop 1)** |
-| 3 | No population/best-of-N reward search in main loop | 2 | `_run_one_iter` / `eureka.py` | open (loop 3) |
-| 4 | Starter v0 is a constant alive-bonus (no gradient, high mean_return attractor) | 2/4 | project init template | open |
-| 5 | Env/task misalignment: walking task (velocity commands), 500-step cap, steps_per_iter=1500–2000 likely far too small to learn a jump | 6/8 | config + adapter task selection | open (verify units first) |
-| 6 | No offline pre-screen of reward candidates beyond compile/probe | 5 | `edit.py` post-flight | partially exists (validators); no cached-rollout scoring |
+| 3 | No population/best-of-N reward search in main loop | 2 | `_run_one_iter` / `eureka.py` | DECIDED: not merged (see §4.3) |
+| 4 | Starter v0 is a constant alive-bonus (no gradient, high mean_return attractor) | 2/4 | project init template | mitigated by dead-reward pre-screen for EDITS (loop 3); init template still open |
+| 5 | Env/task misalignment: walking task (velocity commands + fell_over termination + command curriculum fight the jump). NOTE: steps_per_iter for MjlabAdapter = PPO max_iterations (2000 ≈ full-scale, ~1 h/iter on the 5070) — training scale was NOT the problem | 6/8 | config + adapter task selection | open |
+| 6 | No offline pre-screen of reward candidates beyond compile/probe | 5 | `edit.py` post-flight | **FIXED (loop 3)**: dead-reward variance probe |
 | 7 | No RSI / curriculum for hard-to-reach phases | 6 | adapter/env | open, later |
 
 ## 4. Prioritized plan
@@ -223,15 +223,31 @@ treated as regressions.
   MjlabAdapter) and re-run tuck-jump short; success = progress > 0
   and climbing, robot visibly attempting a jump.
 
-### 4.3 Population / best-of-N + offline pre-screen (loop 3)
-- `candidates_per_iter` knob; K edit candidates per iter, offline
-  pre-screen (compile/probe/partition + cached-rollout sanity), train
-  survivors, select on the same lexicographic key; keep-best already
-  handles memory.
+### 4.3 Offline pre-screen (loop 3 — DONE); population search NOT merged
+- **Done**: dead-reward variance probe in `edit.py` post-flight
+  (`_probe_reward_variance`): 6 diverse deterministic input batteries
+  (incl. asymmetric state≠next_state so difference-only shaping isn't
+  false-rejected); a candidate whose total AND every component are
+  constant across all probes is rejected with actionable feedback —
+  the existing retry loop regenerates. Kills the v0-class constant
+  reward before it burns a GPU hour training "stand still".
+- **Decision — do NOT merge Eureka-style K-candidate population into
+  `sculpt_run`**: (a) `eval/eureka.py` deliberately exists as the
+  BASELINE condition of the project's A/B methodology (§Ship 28 / E3
+  campaign — sculptor navigates by diagnosis+KG, Eureka by
+  population); merging it into the treatment arm blurs the research
+  design; (b) at ~1 h per mjlab training, K>1 multiplies GPU cost
+  linearly for uncertain marginal gain now that keep-best + strict
+  revert + dense ranking exist; (c) revert-on-regression already
+  provides the elitism half of the evolutionary loop. Revisit only if
+  the fixed loop still fails to converge, as an explicit opt-in knob
+  and as its own reviewed increment.
 
 ### 4.4 Starter reward + env alignment (loop 4)
 - Goal-conditioned v0 generation at project init (not constant
-  alive-bonus); audit termination/init-pose/episode-length vs goal.
+  alive-bonus); audit termination/init-pose/episode-length vs goal
+  (fell_over termination + velocity-command curriculum actively fight
+  a jump on Mjlab-Velocity-Flat-Unitree-G1).
 
 ## 6. Residual risks / watch items
 - `progress_score` is a new steering surface. Mitigations in place:
@@ -265,3 +281,29 @@ Format per entry: date — what changed (files:lines) — why — evidence
   untouched; spec_score composition unchanged.
 - **Verified**: full suite 973 passed / 1 skipped (was 969/1 before
   the 4 new tests).
+
+### 2026-07-01 — loop 2: tuck-jump gen_002 metric + E2E re-run launched
+- **What**: hand-authored
+  `~/.local/share/reward-sculptor/projects/tuck-jump/metrics/gen_002/metric.py`
+  (outside the repo): spec_score logic byte-identical to gen_001 +
+  dense `progress_score` (min of noise-floor-ramped variants of the
+  same 4 channels, no gate); meta.json provenance. Repointed the
+  project's `rewards/current.py` at v5 — the corrective reward the
+  old deadlock generated but never trained.
+- **Verified**: `validate_generated_metric` ALL gates pass
+  (behavior_goal-anchored); spec parity + progress on all 5 archived
+  rollouts: standing iters progress ≈ 1e-4 (noise), iter_1 supine
+  tuck-farm hack progress = **exactly 0.0** (d_tuck and landing
+  channels 0 under min-composition) — the dense channel cannot be
+  climbed by the hack that fooled the reward.
+- **E2E**: launched 13:33 local, iters 5–8, `--fitness-mode steer
+  --fitness-patience 4 --steps-per-iter 1500`, gen_002 metric; log
+  `runs/sculpt_loop2_1333.log`. ~45 min training per iter.
+
+### 2026-07-01 — loop 3: offline dead-reward pre-screen
+- **What**: `sculptor/edit.py` `_probe_reward_variance` + call in
+  `_post_validate` after the batched probe; 5 new tests + 1 fixture
+  fix in `tests/test_edit.py`.
+- **Why**: gap #6 — v0-class constant rewards reached the GPU;
+  4 of 5 tuck-jump iterations trained a constant alive-bonus.
+- **Verified**: full suite 978 passed / 1 skipped.

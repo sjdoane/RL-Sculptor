@@ -779,7 +779,10 @@ REWARD_SPEC = {
     "grounding": {"w_u": "arXiv:1707.02286 Mnih survey"},
 }
 def compute_reward(state, action, next_state, info):
-    return 1.0, {"w_u": 1.0}
+    # State-dependent so the dead-reward variance pre-screen doesn't
+    # fire first — this test targets the grounding-vs-references check.
+    v = float(state[0]) + 1.0
+    return v, {"w_u": v}
 """
 
     # Build a contract that won't trip other validator checks.
@@ -1081,3 +1084,84 @@ def compute_reward(state, action, next_state, info):
     )
     user_msg = client.messages.calls[0]["messages"][0]["content"]
     assert "# TRAINING_FEEDBACK" not in user_msg
+
+
+# ── §Convergence (RL_SCULPTOR_AUDIT loop 3): dead-reward pre-screen ──────
+
+
+def _variance_probe_contract():
+    from sculptor.adapters.base import RewardContract
+    return RewardContract(
+        observation_space_spec=None,
+        action_space_spec=None,
+        expected_info_keys=["fallen", "base_height"],
+        expected_components=None,
+        supports_batched=False,
+        training_device="cpu",
+    )
+
+
+def test_variance_probe_rejects_constant_reward():
+    """The v0-class degenerate (constant alive-bonus) must be rejected
+    before it can burn a GPU iteration training 'stand still'."""
+    from types import SimpleNamespace
+    from sculptor.edit import EditValidationError, _probe_reward_variance
+
+    mod = SimpleNamespace(
+        compute_reward=lambda s, a, ns, info: (1.0, {"alive_bonus": 1.0}))
+    with pytest.raises(EditValidationError, match="state-independent"):
+        _probe_reward_variance(mod, _variance_probe_contract())
+
+
+def test_variance_probe_passes_state_dependent_reward():
+    from types import SimpleNamespace
+    from sculptor.edit import _probe_reward_variance
+
+    def _r(s, a, ns, info):
+        v = float(s[0])
+        return v, {"height": v, "alive": 1.0}
+
+    _probe_reward_variance(
+        SimpleNamespace(compute_reward=_r), _variance_probe_contract())
+
+
+def test_variance_probe_passes_difference_only_reward():
+    """A reward built purely of next-state-minus-state terms is state-
+    sensitive even though every UNIFORM fill zeroes it — the asymmetric
+    probes must save it from a false reject."""
+    from types import SimpleNamespace
+    from sculptor.edit import _probe_reward_variance
+
+    def _r(s, a, ns, info):
+        v = float(ns[0]) - float(s[0])
+        return v, {"ascent": v}
+
+    _probe_reward_variance(
+        SimpleNamespace(compute_reward=_r), _variance_probe_contract())
+
+
+def test_variance_probe_passes_info_gated_reward():
+    from types import SimpleNamespace
+    from sculptor.edit import _probe_reward_variance
+
+    def _r(s, a, ns, info):
+        v = 2.0 * float(info["base_height"])
+        return v, {"launch": v}
+
+    _probe_reward_variance(
+        SimpleNamespace(compute_reward=_r), _variance_probe_contract())
+
+
+def test_variance_probe_tolerates_crashing_probes():
+    """A reward that crashes on every non-zero fill leaves <2 surviving
+    probes — insufficient evidence must PASS, never false-reject."""
+    from types import SimpleNamespace
+    from sculptor.edit import _probe_reward_variance
+
+    def _r(s, a, ns, info):
+        if float(s[0]) != 0.0 or float(ns[0]) != 0.0:
+            raise ValueError("guarded")
+        return 1.0, {"c": 1.0}
+
+    _probe_reward_variance(
+        SimpleNamespace(compute_reward=_r), _variance_probe_contract())

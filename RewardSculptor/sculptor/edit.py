@@ -311,6 +311,97 @@ def _call_compute_reward(mod, contract) -> tuple[float, dict]:
     return reward_f, components
 
 
+def _probe_reward_variance(mod, contract) -> None:
+    """§Convergence (RL_SCULPTOR_AUDIT loop 3): offline dead-reward pre-screen.
+
+    Evaluate `compute_reward` over a battery of diverse deterministic
+    inputs (state/action/info all filled with each probe value); if the
+    TOTAL reward AND every component are constant across every probe,
+    the reward is state-independent — the v0-class degenerate (constant
+    alive-bonus) that gives PPO zero gradient and burns a full GPU
+    iteration training "stand still". Reject so the retry loop
+    regenerates with this feedback.
+
+    Deliberately conservative: a reward with even ONE state-sensitive
+    term passes; probes that crash are skipped (a reward may
+    legitimately guard exotic magnitudes — the zeros probe has already
+    validated); fewer than 2 surviving probes → pass (insufficient
+    evidence beats a false reject)."""
+    # (state, action, next_state, info) fill values per probe. The last
+    # two are ASYMMETRIC (state != next_state) so a reward built purely
+    # of difference terms (next_z - z, displacement shaping) still shows
+    # variance and is not false-rejected.
+    fills = (
+        (0.0, 0.0, 0.0, 0.0),
+        (0.5, 0.5, 0.5, 0.5),
+        (1.0, 1.0, 1.0, 1.0),
+        (-0.5, -0.5, -0.5, -0.5),
+        (0.0, 0.5, 1.0, 0.5),
+        (0.5, 1.0, 0.0, 1.0),
+    )
+    totals: list[float] = []
+    component_rows: list[dict[str, float]] = []
+    for bs, ba, bns, binfo in fills:
+        s, a, ns, info = _build_dummy_inputs(contract)
+
+        def _fill(x, b):
+            try:
+                import torch
+                if isinstance(x, torch.Tensor):
+                    return torch.full_like(x, float(b))
+            except Exception:  # noqa: BLE001 — torch absent → numpy path
+                pass
+            if isinstance(x, np.ndarray):
+                out = x.copy()
+                out.fill(b)
+                return out
+            if isinstance(x, dict):
+                return {k: _fill(v, b) for k, v in x.items()}
+            if isinstance(x, (int, float)):
+                return float(b)
+            return x
+
+        try:
+            out = mod.compute_reward(
+                _fill(s, bs), _fill(a, ba), _fill(ns, bns), _fill(info, binfo))
+            reward, components = out
+            row = {}
+            for k, v in dict(components).items():
+                try:
+                    row[str(k)] = float(v)
+                except Exception:  # noqa: BLE001 — non-scalar component
+                    continue
+            totals.append(float(reward))
+            component_rows.append(row)
+        except Exception:  # noqa: BLE001 — guarded reward → skip this probe
+            continue
+    if len(totals) < 2:
+        return
+    if any(not np.isfinite(t) for t in totals):
+        return  # finiteness is _call_compute_reward's job, not ours
+    tol = 1e-9
+    if max(totals) - min(totals) > tol:
+        return
+    shared = set(component_rows[0])
+    for row in component_rows[1:]:
+        shared &= set(row)
+    for k in shared:
+        vals = [row[k] for row in component_rows]
+        if max(vals) - min(vals) > tol:
+            return
+    raise EditValidationError(
+        "reward is state-independent: compute_reward returned the "
+        f"IDENTICAL total ({totals[0]!r}) and identical per-component "
+        f"values across {len(totals)} diverse input probes (varied "
+        "state/action/next_state/info fills, including asymmetric "
+        "state-vs-next_state). A constant reward gives PPO zero "
+        "gradient — the policy will learn to stand still. Every reward "
+        "must contain at least one term that responds to the physical "
+        "state (height, contacts, joint motion, velocity...) so "
+        "improving the behavior changes the reward."
+    )
+
+
 def _call_compute_reward_batched(mod, contract) -> None:
     """§Ship 31b: execute the BATCHED path pre-flight (N=2 zero
     tensors, runtime-faithful float info). The scalar probe runs pure
@@ -802,6 +893,10 @@ def _post_validate(new_source: str, *, contract, kg_store: SculptorKG,
         # §Ship 31b: also execute the BATCHED (training) path — the
         # scalar probe alone let tensor-only crashes reach the GPU.
         _call_compute_reward_batched(mod, contract)
+        # §Convergence (RL_SCULPTOR_AUDIT loop 3): dead-reward pre-screen —
+        # a state-independent (constant) reward is rejected BEFORE it can
+        # burn a GPU iteration training "stand still".
+        _probe_reward_variance(mod, contract)
 
         # expected_components subset check
         if contract.expected_components is not None:
