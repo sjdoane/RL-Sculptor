@@ -193,7 +193,7 @@ treated as regressions.
 | 4 | Starter v0 is a constant alive-bonus (no gradient, high mean_return attractor) | 2/4 | project init template | **FIXED (loop 4c)**: goal-conditioned seed at first run |
 | 5 | Env/task misalignment: walking task (velocity commands + fell_over termination + command curriculum fight the jump). NOTE: steps_per_iter for MjlabAdapter = PPO max_iterations (2000 ≈ full-scale, ~1 h/iter on the 5070) — training scale was NOT the problem | 6/8 | config + adapter task selection | **FIXED (loop 4a)**: `env_profile="jump"` |
 | 6 | No offline pre-screen of reward candidates beyond compile/probe | 5 | `edit.py` post-flight | **FIXED (loop 3)**: dead-reward variance probe |
-| 7 | No RSI / curriculum for hard-to-reach phases | 6 | adapter/env | open, later |
+| 7 | No RSI / curriculum for hard-to-reach phases | 6 | adapter/env (jump profile reset events) | **open — now THE blocker** (loop-4d E2E: all degenerate attractors priced out, but PPO never discovers the coordinated upright launch under live fall risk; warm-start from the tumble basin adapts into sit-bobbing instead) |
 
 ## 4. Prioritized plan
 
@@ -510,7 +510,70 @@ env profile active, v10 base, gen_002 steer, seed 42+i):
   crouch 0.15 < stand 0.20 < tumble-flight 0.62 ≪ upright-flight-tuck
   5.04/step; scalar/batched parity; probes + anti-collapse replay
   screens PASS on all three archived behavior classes (iters 10/11/12).
-- Run 2 (extension, iters 14-15, `runs/sculpt_loop4d_*.log`) trains v14.
+
+Runs 2-4 (iters 14-18; `sculpt_loop4d_*` / `sculpt_loop4e_*` /
+`sculpt_loop4f_warmstart_*` logs; ~9 GPU-h total this E2E):
+
+| iter | trained | behavior (measured) | gen_002 progress | g1_jump GT |
+|---|---|---|---|---|
+| 14 | v14 | stands very still (jv_p99 1.6); launch credit rose then DECAYED (0.009→0.001) as early jump attempts hit the now-live fall penalty | 0.0081 | 0.0 |
+| 15 | v15 (LLM: −stance_recovery, +threshold-free flight_bonus 0.3 — the dense on-ground→flight bridge; KEPT tuck gate citing the partition flag) | sit-and-lift farm: flight_bonus saturated 97 % of cap; launch/tuck credit GROWING (0.01→0.07 / 0→0.16) when run ended | 0.0 | 0.030 |
+| 16 | v14 again (run-boundary repoint — see BUG below) | standing | 0.0011 | 0.0 |
+| 17 | v17 (LLM: flight_bonus × base-height, drift 0.2→0.5) | SIT-BOB oscillator: median base 0.15 m, feet NEVER in contact, bobs to ~0.8 m, torso upright | 0.0 | **0.215 (GAMED)** |
+| 18 | v18 (LLM: base-lift gate on airborne bonus) WARM-STARTED from iter-12 tumble ckpt | tumbler adapted into upright sit-bobbing (median 0.19 m), not upright hops | 0.0 | 0.165 (gamed) |
+
+- **DISCOVERY — the hand-written ground truth is itself gameable.**
+  `spec_g1_jump` scored the iter-17 sit-bob 0.215 and iter-18 0.165:
+  its apex = p97.5−median half-range reads posture cycling as height,
+  its velocity-edge "launches" count sit↔rise cycles, and uprightness
+  is satisfied by an upright torso while sitting. Trajectory-verified:
+  feet never touch the ground in either rollout. RETROACTIVE: iter 5's
+  0.258 "kept-best" is the same family (sit-farm + height-drop
+  artifact — the loop-2 caveat, now confirmed as a full gaming class).
+  The generated gen_002 metric (contact-verified launch + min-
+  composition incl. return-to-stance + settle) correctly scores every
+  one of these 0. The E2E's success bar "beat 0.258 on spec_g1_jump"
+  is therefore partly a bar on a GAMED baseline; gen_002 progress is
+  the honest yardstick. Do NOT tune spec_g1_jump reactively — note it
+  as a benchmark-quality issue for the eval harness.
+- **What the E2E proved (all with event/trajectory evidence)**:
+  1. Dense progress channel ranks below the gate — 0.0196 (iter 10)
+     was the FIRST nonzero selection signal in project history; ties
+     no longer revert; keep-best + strict-revert + partition gate +
+     Goodhart machinery all exercised and correct.
+  2. Landing/return-to-stance credit works: c_returned 0 → 0.97-0.99,
+     upright_end 1.0, drift 4.2 m → 0.5 m; iter-10 keyframes visibly
+     confirm an upright stance start-to-end.
+  3. ZERO policy collapses in 8 trained iterations (was 2-of-2 edit
+     iters before the fixes); no edit was penalty-stacked; every LLM
+     edit was minimal, phase-directed, correctly diagnosed from the
+     component traces, and correctly deferred to the partition guard.
+     The v6/v8 failure class did not recur.
+  4. The env profile closed the termination-laundering corridor
+     (fallen now fires; falls accrue their penalty).
+- **What remains open — re-scoped gap #7.** The loop now reliably
+  prices out every degenerate attractor (stand-farm, sit-farm,
+  tumble-bounce, sit-and-lift, sit-bob) but PPO-from-scratch (or from
+  a tumble warm-start) does not DISCOVER the coordinated upright
+  launch-land cycle under a live fall penalty: exploration retreats to
+  the nearest safe/degenerate basin (measured: iter-14 launch credit
+  decay 0.009→0.001). This is no longer a reward/metric/loop-mechanics
+  gap. Next increment = reference-state initialization (DeepMimic RSI,
+  §1): initialize a fraction of episodes mid-flight/at-apex via the
+  env profile's reset events so the policy experiences
+  apex→descent→landing→stance BEFORE it can produce a launch, plus
+  optionally a crouch-impulse curriculum. The jump env profile is the
+  natural seam (reset_base pose/velocity ranges are already mutable
+  there).
+- **BUG (follow-up task spawned)**: `_run_one_iter` trains
+  `current.py`'s target but records `reward_path_trained =
+  latest_reward_file`; they diverge at run boundaries after
+  best-selection repoints (iter 16 trained v14 while events said v16).
+  Same-run iters are unaffected (revert_base handles that path).
+- **Final project state**: current.py → v14 (strongest validated
+  reward design: upright-gated flight credit + honest gates + stance
+  0.1); best-by-gen_002 behavior remains iter 10 (progress 0.0196);
+  rewards v15-v19 on disk with v16/v19 never trained.
 
 ### 2026-07-01 — loop 4c: goal-conditioned starter seed (gap #4)
 - **What**: `sculptor/sculpt.py` — `_is_pristine_starter_reward`
