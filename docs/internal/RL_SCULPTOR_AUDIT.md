@@ -190,7 +190,7 @@ treated as regressions.
 | 1 | No sub-success gradient in selection signal | 1 | metric contract + `sculpt_run` selection key | **FIXED loop-side + prompt-side (loop 1)** |
 | 2 | Tie treated as regression → revert deadlock | 7 | `sculpt.py` revert decision | **FIXED (loop 1)** |
 | 3 | No population/best-of-N reward search in main loop | 2 | `_run_one_iter` / `eureka.py` | DECIDED: not merged (see §4.3) |
-| 4 | Starter v0 is a constant alive-bonus (no gradient, high mean_return attractor) | 2/4 | project init template | mitigated by dead-reward pre-screen for EDITS (loop 3); init template still open |
+| 4 | Starter v0 is a constant alive-bonus (no gradient, high mean_return attractor) | 2/4 | project init template | **FIXED (loop 4c)**: goal-conditioned seed at first run |
 | 5 | Env/task misalignment: walking task (velocity commands + fell_over termination + command curriculum fight the jump). NOTE: steps_per_iter for MjlabAdapter = PPO max_iterations (2000 ≈ full-scale, ~1 h/iter on the 5070) — training scale was NOT the problem | 6/8 | config + adapter task selection | **FIXED (loop 4a)**: `env_profile="jump"` |
 | 6 | No offline pre-screen of reward candidates beyond compile/probe | 5 | `edit.py` post-flight | **FIXED (loop 3)**: dead-reward variance probe |
 | 7 | No RSI / curriculum for hard-to-reach phases | 6 | adapter/env | open, later |
@@ -475,3 +475,29 @@ laws + hand-authored v10 landing reward (gap: edit quality)
   baseline re-measured at 974 collected — the loop-3 "978" note counted
   a different collection; +22 new tests here: 10 env-profile [4a] + 12
   replay-screen [4b]).
+
+### 2026-07-01 — loop 4c: goal-conditioned starter seed (gap #4)
+- **What**: `sculptor/sculpt.py` — `_is_pristine_starter_reward`
+  (REWARD_SPEC-signature detection of the untouched `sculpt init`
+  template), `_seed_reward_prompt` (goal + iteration-0 design rules,
+  clipped under apply_prompt_edit's 2000-char ceiling),
+  `_maybe_seed_goal_reward` (generates v1 from the behavior goal via
+  `apply_prompt_edit` — full post-flight stack incl. the variance
+  pre-screen, which rejects a still-constant generation, and the
+  bounded 1-call+1-retry budget). Called at the top of `sculpt_run`
+  when start_iter==0, not dry-run, and behavior_goal is non-empty.
+  New `tests/test_seed_reward.py` (8 tests, stub LLM client).
+- **Design decision — seed at FIRST RUN, not at `sculpt init`**:
+  project creation must stay instant and API-key-free (the UI backend
+  scaffolds synchronously); the first run already spends LLM calls, so
+  the seed rides on it. Every failure path (no API key, network,
+  validation twice) logs + emits `seed_reward_failed` and proceeds on
+  the template — the loop never blocks on the seed. Emits
+  `seed_reward_started/generated` events for the UI stream.
+- **Cost bound**: exactly one LLM call (+1 internal retry) once per
+  project lifetime (only when v<latest> is still the pristine v0).
+- **Verified**: 8 new tests (template detection incl. both shipped
+  variants; generation happy path writes v1 + repoints current.py;
+  non-pristine and later-version skips never touch the LLM; failure
+  keeps the template; constant generation rejected on both attempts →
+  exactly 2 stub calls). Full offline suite 1004 passed / 1 skipped.

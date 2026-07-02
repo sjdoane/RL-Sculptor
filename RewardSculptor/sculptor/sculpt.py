@@ -52,6 +52,7 @@ from sculptor.edit import (
     EditValidationError,
     _write_current_reexport,
     apply_edits,
+    apply_prompt_edit,
 )
 
 
@@ -1822,6 +1823,18 @@ def sculpt_run(
     #: (captured at the interactive pause). None = no note this iter.
     pending_human_note: Optional[str] = None
     _control_path: Optional[Path] = Path(control_file) if control_file else None
+
+    # §RL_SCULPTOR_AUDIT §4.4 (loop 4c, gap #4): goal-conditioned starter.
+    # If iteration 0 is about to train the pristine `sculpt init` constant
+    # alive-bonus template and this run carries a behavior goal, generate a
+    # goal-conditioned v1 first (one bounded LLM call; every failure path
+    # keeps the template and proceeds). Skipped on resume (start_iter > 0
+    # implies real rewards exist) and in dry-run (no LLM).
+    if start_iter == 0 and not dry_run and str(behavior_goal or "").strip():
+        _maybe_seed_goal_reward(
+            rewards_dir=rewards_dir, behavior_goal=behavior_goal,
+            adapter=adapter, kg_store=kg_store)
+
     try:
         for i in range(start_iter, end_iter):
             t0 = time.time()
@@ -2214,6 +2227,117 @@ def _v0_template_for(adapter: str) -> str:
         if _adapter_needs_batched_template(adapter)
         else _V0_SCALAR_REWARD
     )
+
+
+def _is_pristine_starter_reward(reward_path: Path) -> bool:
+    """§RL_SCULPTOR_AUDIT §4.4 (loop 4c): True when `reward_path` is the
+    untouched `sculpt init` starter template — a constant alive-bonus.
+    Detected by its REWARD_SPEC signature (author 'human', version 'v0',
+    exactly one hyperparameter `alive_bonus`, 'Starter reward' in the
+    description) rather than byte comparison, so a template that merely
+    aged across sculptor versions still counts. Any real reward — human-
+    written or sculpted — fails at least one check. Unreadable/broken
+    module → False (never trigger generation on something we can't read)."""
+    try:
+        from sculptor.edit import _load_reward_module
+
+        spec = getattr(_load_reward_module(Path(reward_path)), "REWARD_SPEC", None)
+        if not isinstance(spec, dict):
+            return False
+        return (
+            str(spec.get("author", "")) == "human"
+            and str(spec.get("version", "")) == "v0"
+            and set((spec.get("hyperparameters") or {}).keys()) == {"alive_bonus"}
+            and "Starter reward" in str(spec.get("description", ""))
+        )
+    except Exception:  # noqa: BLE001
+        return False
+
+
+# Goal text is clipped to leave room for the fixed guidance inside
+# apply_prompt_edit's 2000-char prompt ceiling.
+_SEED_GOAL_CLIP = 900
+
+
+def _seed_reward_prompt(behavior_goal: str) -> str:
+    """User-prompt for the goal-conditioned starter generation. Carries
+    the goal + iteration-0 design rules; the edit_rewriter system prompt
+    (incl. the net-positive-living / progress-preservation laws) and the
+    reward contract ride along via apply_prompt_edit."""
+    goal = " ".join(str(behavior_goal).split())[:_SEED_GOAL_CLIP]
+    return (
+        f"GOAL-CONDITIONED STARTER. Behavior goal: {goal}\n"
+        "The current v0 is the scaffold placeholder — a constant "
+        "alive-bonus with zero gradient (policies trained on it stand "
+        "still and its high mean_return makes it an attractor). Replace "
+        "it with the INITIAL shaping reward for this goal, designed for "
+        "iteration-0 training from a randomly-initialized policy:\n"
+        "- decompose the goal into 2-4 physical phases and give EACH a "
+        "dense, bounded term (saturating ramps anchored at values a "
+        "fresh policy already reaches — no cliff thresholds above its "
+        "reach);\n"
+        "- keep a small alive bonus (~0.1) so shaping dominates, and "
+        "zero every bonus when info['fallen'] fires;\n"
+        "- keep the per-step total >= 0 in ordinary non-fallen poses;\n"
+        "- read ONLY the adapter's expected_info_keys / state schema."
+    )
+
+
+def _maybe_seed_goal_reward(
+    *,
+    rewards_dir: Path,
+    behavior_goal: str,
+    adapter: SculptorAdapter,
+    kg_store=None,
+    client=None,
+) -> Optional[Path]:
+    """§RL_SCULPTOR_AUDIT §4.4 (loop 4c, gap #4): goal-conditioned
+    starter. When the reward that iteration 0 would train is still the
+    pristine `sculpt init` constant-alive-bonus template and the run has
+    a behavior goal, generate `v1.py` from the goal via
+    `apply_prompt_edit` (full post-flight stack: probes, variance
+    pre-screen — which rejects a still-constant generation — and one
+    internal retry). Exactly one LLM call (+1 retry) once per project.
+
+    Deliberately NOT done at `sculpt init` time: project creation must
+    stay instant and API-key-free; the first run already spends LLM
+    calls, so the seed rides on it. ANY failure (validation, no API
+    key, network) logs + returns None and the run proceeds on the
+    template — the dead-reward pre-screen still guards later edits."""
+    latest_n, latest = _find_latest_reward_version(rewards_dir)
+    if latest_n != 0 or not _is_pristine_starter_reward(latest):
+        return None
+    _emit_event({
+        "type": "seed_reward_started",
+        "behavior_goal": str(behavior_goal)[:200],
+    })
+    try:
+        new_path = apply_prompt_edit(
+            current_reward_path=latest,
+            user_prompt=_seed_reward_prompt(behavior_goal),
+            new_iter_id="v1",
+            reward_contract=adapter.reward_contract(),
+            kg_store=kg_store,
+            client=client,
+        )
+    except Exception as e:  # noqa: BLE001 — seed is best-effort, run continues
+        sys.stderr.write(
+            f"[sculpt] goal-conditioned starter generation failed "
+            f"({type(e).__name__}: {e}) — iteration 0 trains the v0 "
+            f"template instead.\n")
+        _emit_event({
+            "type": "seed_reward_failed",
+            "error": f"{type(e).__name__}: {e}",
+        })
+        return None
+    _emit_event({
+        "type": "seed_reward_generated",
+        "reward": new_path.name,
+    })
+    print(f"[sculpt] goal-conditioned starter written: {new_path.name} "
+          f"(replaces the constant alive-bonus template for iter 0)",
+          flush=True)
+    return new_path
 
 _CONFIG_TEMPLATE = '''\
 [target]
