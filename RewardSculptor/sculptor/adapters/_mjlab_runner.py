@@ -449,6 +449,103 @@ def _build_sculptor_term_class(schema_keys: tuple[str, ...]):
     return SculptorRewardTerm
 
 
+def _apply_env_profile(env_cfg: Any, profile: str) -> None:
+    """§RL_SCULPTOR_AUDIT §4.4 gap #5: task-env alignment for jump-class
+    goals. The mjlab velocity tasks are WALKING environments; four of
+    their training mechanics actively fight a standing jump (evidence:
+    the tuck-jump E2E, iters 0-8):
+
+    profile == "jump" mutates the loaded cfg, before the env is built:
+
+      * commands: zero every `twist` velocity/heading range and put all
+        envs in the standing bucket. Random resampled commands (a) feed
+        command noise into the policy observation and (b) keep the 0.3×
+        track_linear_velocity floor paying for walking away — the v0
+        iters drifted 4.2-4.5 m per episode.
+      * curriculum: drop `command_vel` — it RE-WIDENS the command ranges
+        at 5k/10k steps, silently undoing the zeroed commands.
+      * events: drop `push_robot` — a random base kick every 1-3 s
+        (±0.4 m/s vertical, ±0.52 rad/s pitch/roll) is locomotion
+        robustness DR; it destroys launch/landing attempts.
+      * terminations: raise `fell_over` bad_orientation 70° → 120°.
+        At 70° the episode ends BEFORE projected gravity flips sign
+        (90°), so the reward-contract `fallen` signal could never fire
+        during training — every fall_penalty term in sculpted rewards
+        was structurally dead (tuck-jump iter 1). Worse, termination is
+        an ESCAPE: under a penalty-bearing reward the optimal policy
+        falls fast to reset away the pain (v6/v8 collapsed to 16-18-step
+        episodes). At 120° a fall accrues its penalty; only a truly
+        inverted, unrecoverable pose still terminates.
+      * episode_length_s → 10.0: matches the rollout eval horizon
+        (500 steps @ 50 Hz) and doubles launch-practice resets per
+        sample budget vs the walking default of 20 s.
+
+    Init pose (reset_base standing + small z jitter) is already right
+    for a jump and is left untouched. Unknown profile values are
+    rejected by MjlabAdapter before the subprocess spawns; here an
+    empty/None profile is a no-op. FULLY DEFENSIVE per-mutation: any
+    cfg-shape drift skips that mutation with a warning, never breaks
+    the run."""
+    if not profile or profile == "default":
+        return
+    if profile != "jump":
+        print(f"[runner] env-profile {profile!r} unknown — ignored",
+              file=sys.stderr, flush=True)
+        return
+    import math
+
+    applied: list[str] = []
+    try:
+        twist = (getattr(env_cfg, "commands", None) or {}).get("twist")
+        if twist is not None:
+            ranges = getattr(twist, "ranges", None)
+            for f in ("lin_vel_x", "lin_vel_y", "ang_vel_z", "heading"):
+                if ranges is not None and hasattr(ranges, f):
+                    setattr(ranges, f, (0.0, 0.0))
+            for f, v in (("rel_standing_envs", 1.0),
+                         ("rel_heading_envs", 0.0),
+                         ("rel_forward_envs", 0.0),
+                         ("heading_command", False)):
+                if hasattr(twist, f):
+                    setattr(twist, f, v)
+            applied.append("commands:twist→zero/standing")
+    except Exception as e:  # noqa: BLE001 — never break a run
+        print(f"[runner] env-profile jump: command zeroing skipped: "
+              f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
+    try:
+        cur = getattr(env_cfg, "curriculum", None)
+        if isinstance(cur, dict) and cur.pop("command_vel", None) is not None:
+            applied.append("curriculum:command_vel→removed")
+    except Exception as e:  # noqa: BLE001
+        print(f"[runner] env-profile jump: curriculum trim skipped: "
+              f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
+    try:
+        events = getattr(env_cfg, "events", None)
+        if isinstance(events, dict) and events.pop("push_robot", None) is not None:
+            applied.append("events:push_robot→removed")
+    except Exception as e:  # noqa: BLE001
+        print(f"[runner] env-profile jump: push_robot removal skipped: "
+              f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
+    try:
+        term = (getattr(env_cfg, "terminations", None) or {}).get("fell_over")
+        params = getattr(term, "params", None)
+        if isinstance(params, dict) and "limit_angle" in params:
+            params["limit_angle"] = math.radians(120.0)
+            applied.append("terminations:fell_over→120deg")
+    except Exception as e:  # noqa: BLE001
+        print(f"[runner] env-profile jump: fell_over relax skipped: "
+              f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
+    try:
+        if hasattr(env_cfg, "episode_length_s"):
+            env_cfg.episode_length_s = 10.0
+            applied.append("episode_length_s→10.0")
+    except Exception as e:  # noqa: BLE001
+        print(f"[runner] env-profile jump: episode length skipped: "
+              f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
+    print(f"[runner] env-profile jump applied: {applied}",
+          file=sys.stderr, flush=True)
+
+
 def _cmd_train(args: argparse.Namespace) -> None:
     # Lazy heavy imports — stay out of the module top.
     from mjlab.envs.manager_based_rl_env import ManagerBasedRlEnv
@@ -459,6 +556,8 @@ def _cmd_train(args: argparse.Namespace) -> None:
 
     env_cfg = load_env_cfg(args.task_id)
     env_cfg.scene.num_envs = args.num_envs
+    # §RL_SCULPTOR_AUDIT §4.4: goal-class env alignment (default "" → no-op).
+    _apply_env_profile(env_cfg, getattr(args, "env_profile", ""))
     # §actuator-limit enforcement — flag-gated (default OFF → no-op). MUST run on
     # the TRAIN env too (not just rollout) so the policy trains against the same
     # velocity-limited physics it is later evaluated under (no train/rollout mismatch).
@@ -997,6 +1096,10 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
 
     env_cfg = load_env_cfg(args.task_id)
     env_cfg.scene.num_envs = num_envs
+    # §RL_SCULPTOR_AUDIT §4.4: SAME profile as train — a policy trained with
+    # zero commands / no pushes must be evaluated under that distribution,
+    # and the metric arrays must see the un-truncated fall dynamics.
+    _apply_env_profile(env_cfg, getattr(args, "env_profile", ""))
     # §Ship 35: textured floor in the rendered rollout (cosmetic, guarded).
     _apply_ground_texture(env_cfg)
     # §actuator-limit enforcement — flag-gated (default OFF). Same swap as TRAIN so
@@ -1603,6 +1706,15 @@ def main() -> None:
     p_train.add_argument("--schema-keys", default="",
                          help="comma-separated override for the state-schema keys")
     p_train.add_argument(
+        "--env-profile", default="",
+        help=(
+            "§RL_SCULPTOR_AUDIT §4.4: goal-class env alignment applied to "
+            "the loaded task cfg before the env is built. '' = task "
+            "defaults; 'jump' = zero velocity commands, no push events, "
+            "fell_over at 120°, 10 s episodes."
+        ),
+    )
+    p_train.add_argument(
         "--load-pretrained-policy", default=None,
         help=(
             "§Ship 15: path to a prior rsl_rl checkpoint (e.g., "
@@ -1629,6 +1741,8 @@ def main() -> None:
     # §Ship-7: advanced override for frame decimation (1 = every step).
     # Default 0 means "pick automatically to cap at 500 captured frames".
     p_roll.add_argument("--render-every", type=int, default=0)
+    # §RL_SCULPTOR_AUDIT §4.4: must match the train-side profile.
+    p_roll.add_argument("--env-profile", default="")
 
     p_probe = sub.add_parser("vram-probe")
     p_probe.add_argument("--task-id", required=True)

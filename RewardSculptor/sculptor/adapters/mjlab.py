@@ -261,6 +261,13 @@ class MjlabAdapter(SculptorAdapter):
     device: str = "cuda:0"
     max_iterations: int = 1500
     seed: int = 1
+    # §RL_SCULPTOR_AUDIT §4.4: goal-class env alignment. "" (default) keeps
+    # the mjlab task cfg untouched; "jump" retargets the walking-task
+    # mechanics that fight a standing jump (zero velocity commands, no
+    # push events, fell_over at 120°, 10 s episodes — see
+    # `_mjlab_runner._apply_env_profile`). Applied to BOTH train and
+    # rollout so the policy is evaluated under its training distribution.
+    env_profile: str = ""
     rsl_rl_kwargs: dict[str, Any] = field(default_factory=dict)
     # Optional override for the schema keys emitted by the reward-term
     # state snapshot. If empty, derived from task_id via _schema_for_task.
@@ -296,6 +303,15 @@ class MjlabAdapter(SculptorAdapter):
             raise ValueError(
                 f"task_id={self.task_id!r} is not registered in mjlab; "
                 f"known tasks: {sorted(registered)}"
+            )
+
+        # §RL_SCULPTOR_AUDIT §4.4: fail fast on an unknown profile here
+        # (clear error at adapter construction) instead of a silent
+        # no-op warning buried in the training subprocess's stderr.
+        if self.env_profile not in ("", "default", "jump"):
+            raise ValueError(
+                f"env_profile={self.env_profile!r} is not supported; "
+                "known profiles: '' (task defaults), 'jump'."
             )
 
         # num_envs autocap on smaller VRAM. Skipped when remote dispatch
@@ -596,6 +612,8 @@ class MjlabAdapter(SculptorAdapter):
             else list(_schema_for_task(self.task_id).keys())
         )
         cmd += ["--schema-keys", ",".join(effective_schema_keys)]
+        if self.env_profile:
+            cmd += ["--env-profile", self.env_profile]
 
         executor = self._remote_executor()
         if executor is not None:
@@ -616,6 +634,8 @@ class MjlabAdapter(SculptorAdapter):
                 "--device": runner_device,
                 "--schema-keys": ",".join(effective_schema_keys),
             }
+            if self.env_profile:
+                options["--env-profile"] = self.env_profile
             input_paths: dict[str, Path] = {}
             aux_dirs: tuple[Path, ...] = ()
             if reward_module_path is not None:
@@ -743,6 +763,8 @@ class MjlabAdapter(SculptorAdapter):
             cmd += ["--render-every", str(int(render_every))]
         if fps is not None:
             cmd += ["--fps", str(float(fps))]
+        if self.env_profile:
+            cmd += ["--env-profile", self.env_profile]
 
         executor = self._remote_executor()
         if executor is not None and executor.cfg.rollout_remote:
@@ -766,6 +788,8 @@ class MjlabAdapter(SculptorAdapter):
                 options["--render-every"] = str(int(render_every))
             if fps is not None:
                 options["--fps"] = str(float(fps))
+            if self.env_profile:
+                options["--env-profile"] = self.env_profile
             job = RunnerJob(
                 subcommand="rollout",
                 options=options,

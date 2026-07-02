@@ -191,7 +191,7 @@ treated as regressions.
 | 2 | Tie treated as regression → revert deadlock | 7 | `sculpt.py` revert decision | **FIXED (loop 1)** |
 | 3 | No population/best-of-N reward search in main loop | 2 | `_run_one_iter` / `eureka.py` | DECIDED: not merged (see §4.3) |
 | 4 | Starter v0 is a constant alive-bonus (no gradient, high mean_return attractor) | 2/4 | project init template | mitigated by dead-reward pre-screen for EDITS (loop 3); init template still open |
-| 5 | Env/task misalignment: walking task (velocity commands + fell_over termination + command curriculum fight the jump). NOTE: steps_per_iter for MjlabAdapter = PPO max_iterations (2000 ≈ full-scale, ~1 h/iter on the 5070) — training scale was NOT the problem | 6/8 | config + adapter task selection | open |
+| 5 | Env/task misalignment: walking task (velocity commands + fell_over termination + command curriculum fight the jump). NOTE: steps_per_iter for MjlabAdapter = PPO max_iterations (2000 ≈ full-scale, ~1 h/iter on the 5070) — training scale was NOT the problem | 6/8 | config + adapter task selection | **FIXED (loop 4a)**: `env_profile="jump"` |
 | 6 | No offline pre-screen of reward candidates beyond compile/probe | 5 | `edit.py` post-flight | **FIXED (loop 3)**: dead-reward variance probe |
 | 7 | No RSI / curriculum for hard-to-reach phases | 6 | adapter/env | open, later |
 
@@ -359,3 +359,46 @@ Format per entry: date — what changed (files:lines) — why — evidence
 - **Why**: gap #6 — v0-class constant rewards reached the GPU;
   4 of 5 tuck-jump iterations trained a constant alive-bonus.
 - **Verified**: full suite 978 passed / 1 skipped.
+
+### 2026-07-01 — loop 4a: jump-class env profile (gap #5, env alignment)
+- **What**: `sculptor/adapters/_mjlab_runner.py` `_apply_env_profile`
+  (applied in BOTH `_cmd_train` and `_cmd_rollout`, before env build;
+  new `--env-profile` arg on both subcommands);
+  `sculptor/adapters/mjlab.py` `MjlabAdapter.env_profile` config field
+  (validated at __init__: only ''/'default'/'jump'), threaded into the
+  local + remote train/rollout command constructions; tuck-jump project
+  `config.toml` now sets `env_profile = "jump"`. New
+  `tests/test_env_profile.py` (10 tests).
+- **Audit findings** (mjlab `velocity_env_cfg.py` + G1 flat variant,
+  verified against the installed package):
+  * Commands: `twist` UniformVelocityCommand, lin ±1 m/s, resampled
+    every 3-8 s, only 10% standing envs → observation noise + the 0.3×
+    `track_linear_velocity` floor (effective weight 0.6) paid for
+    walking away (the 4.2-4.5 m/episode drift in iters 0-4).
+  * Curriculum `command_vel` re-widens ranges to (-2,3) m/s at
+    5k/10k steps — would silently undo zeroed commands.
+  * Event `push_robot`: random base kick every 1-3 s (±0.4 m/s
+    vertical, ±0.52 rad/s pitch/roll) — locomotion robustness DR that
+    destroys launch/landing attempts.
+  * Termination `fell_over` = bad_orientation(70°). KEY COUPLING: the
+    reward-contract `fallen` signal fires at projected-gravity flip
+    (90°), so at a 70° termination the signal was STRUCTURALLY DEAD in
+    training — every fall_penalty in v1..v9 never fired (explains the
+    iter-1 "fall_penalty DEAD" post-mortem note). Worse, termination is
+    an ESCAPE: under a penalty-bearing reward the optimal policy falls
+    fast to reset away the pain — the v6/v8 16-18-step collapse
+    mechanism (§4.4 edit-quality gap, same root).
+  * `episode_length_s` 20 s vs rollout eval horizon 10 s (500 steps).
+  * Init pose (standing + small z jitter) is already jump-appropriate —
+    left untouched.
+- **Profile "jump"**: zero all twist ranges + rel_standing_envs=1.0 +
+  heading_command=False; pop `command_vel` curriculum; pop `push_robot`;
+  `fell_over` 70°→120° (fall now accrues its penalty; only an
+  unrecoverable inversion terminates); episode_length_s=10.0. Verified
+  live against the real `Mjlab-Velocity-Flat-Unitree-G1` cfg. Default
+  '' profile is byte-identical CLI + cfg (existing projects untouched).
+- **Follow-up (UI)**: `env_profile` is editable only via config.toml for
+  now; a project-settings dropdown is a UI-side follow-up.
+- **Verified**: tests/test_env_profile.py 10 passed; adapter regression
+  set (test_mjlab_adapter, test_ground_texture, test_load_adapter,
+  test_adapter_contract) 49 passed.
