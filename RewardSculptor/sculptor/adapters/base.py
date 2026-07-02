@@ -196,6 +196,21 @@ class SculptorAdapter(ABC):
         """
         ...
 
+    def build_reward_replay(
+        self, rollout_dir: Path,
+    ) -> "tuple[Any, Any, Any, dict] | None":
+        """§RL_SCULPTOR_AUDIT §4.4 (edit quality): reconstruct a
+        `(state, action, next_state, info)` batch from an archived
+        rollout so edit.py can REPLAY a candidate reward on the actual
+        behavior it must not destroy (the anti-collapse screen).
+
+        Returns one batched tuple (leading dim = sampled frames, CPU
+        tensors/arrays in the same dtypes `compute_reward_batched`
+        receives) or None when the adapter can't reconstruct reward
+        inputs from its rollout artifacts. Default: None (screen is
+        skipped — behavior identical to pre-screen versions)."""
+        return None
+
     def reward_batched(
         self,
         reward_module_path: Path,

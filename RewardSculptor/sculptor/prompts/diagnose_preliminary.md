@@ -28,6 +28,16 @@ Patterns the block exposes:
   (increasing) or trained-into-static_equilibrium (decreasing toward 0).
 - **Flat low `episode_length`**: premature_termination hiding behind any
   component values.
+- **Reward suicide (collapse after an edit)**: `episode_length` crashed
+  to a small fraction of the horizon (e.g. <10 %) right after a version
+  that ADDED or ENLARGED penalty terms. Mechanism: the per-step total
+  went NEGATIVE in ordinary living states, so terminating (falling)
+  became the highest-return policy — the pain stops at reset. This is a
+  property of the REWARD BALANCE, not of the behavior: diagnose it as
+  premature_termination + component_imbalance and NAME the penalty
+  term(s) whose magnitude exceeds the achievable positive credit; the
+  fix is rebalancing (shrink the penalty / restore positive credit),
+  NOT more shaping.
 
 When `# TRAINING_FEEDBACK` is absent, fall back to metrics.json + keyframes
 as before — your failure-mode vocab is unchanged.

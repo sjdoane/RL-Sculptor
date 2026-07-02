@@ -64,5 +64,24 @@ Rules:
         The editor stage will skip these proposals and record them for the
         adapter author to act on.
   - Prefer 1-3 high-leverage edits over many small tweaks.
+  - HARD-SKILL EDIT POLICY (when `# OBJECTIVE_PROGRESS` is present):
+      * Target the WEAKEST fitness sub-channel (the bottleneck the
+        components block names, e.g. a dead return-to-stance channel)
+        with a DENSE term that pays from the currently-achieved level —
+        never propose credit gated at a level the policy has not yet
+        reached (a threshold above the current apex is a dead term on
+        arrival).
+      * When the progress data shows REAL partial progress (physical
+        deltas moved; not a pure hack), propose MINIMAL edits: preserve
+        the terms that produced the progress at their magnitudes; add
+        the missing-phase term; do not re-gate working phases.
+      * Penalty sizing: every proposed penalty must state in its
+        rationale which positive term outweighs it in ordinary living
+        states. A reward whose per-step total goes negative in
+        commonly-visited poses teaches the policy to terminate on
+        purpose (fall = reset = pain stops) — two such edits collapsed
+        policies to 16-18-step episodes. To suppress an exploit, prefer
+        capping/zeroing the exploited term under the exploit condition
+        over adding a new negative term.
   - Return strict JSON matching the schema. Float `suggested_value`s must
     be stringified (e.g., "0.25").

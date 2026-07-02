@@ -402,3 +402,76 @@ Format per entry: date — what changed (files:lines) — why — evidence
 - **Verified**: tests/test_env_profile.py 10 passed; adapter regression
   set (test_mjlab_adapter, test_ground_texture, test_load_adapter,
   test_adapter_contract) 49 passed.
+
+### 2026-07-01 — loop 4b: edit anti-collapse screen + hard-skill prompt
+laws + hand-authored v10 landing reward (gap: edit quality)
+- **Post-mortem of the v6/v8 collapses, measured (not guessed).**
+  Replaying the actual reward modules over the archived rollouts:
+  * iter_5 (v5, kept-best): the "kneel" is a FLOOR-SIT — base z ends at
+    0.145 m with BOTH feet off the ground 497/500 frames; the
+    sit-with-feet-up pose farms tuck_reward (mean 3.43/step) all
+    episode. Hop apex 0.92 m from a 0.78 m start.
+  * v6 on iter_5 frames: mean +0.52/step (seated_penalty −1.33 but the
+    kneel STILL earns tuck +1.73 — v6's both-feet-airborne gate did not
+    close the exploit: sitting has feet off the ground). v8: +0.28.
+    ⇒ the planned "reject if mean-negative on the best rollout" screen
+    would NOT have caught these two specific edits. Stated honestly.
+  * v6 on its OWN collapsed rollout (mean ep len 15.7): fallen_frac =
+    0.00 — the 70° fell_over terminated every fall BEFORE the 90°
+    `fallen` flip, and tuck_reward paid +1.4/step DURING the topple
+    (feet leave the ground). The collapse class is TERMINATION-
+    LAUNDERED FARMING: dive → collect airborne credit in the 70-90°
+    corridor → reset before any penalty accrues → repeat. v8 on its own
+    rollout: mean −0.19 while alive (drift −0.39) — the plain
+    suicide-by-termination variant. The loop-4a env profile (fell_over
+    → 120°) closes the corridor for BOTH: a fall now persists, `fallen`
+    fires, fall_penalty accrues, no quick reset.
+- **What shipped**:
+  1. `SculptorAdapter.build_reward_replay(rollout_dir)` (base: None) +
+     `MjlabAdapter` implementation — reconstructs a batched
+     (state, action, next_state, info) from `trajectory.npz` (exact:
+     qpos/qvel/gravity/action/contacts/base_height/fallen; approximated:
+     foot heights + finite-difference speeds; ≤4096 evenly-spaced
+     frames, deterministic).
+  2. `edit.py` `_replay_reward_summary` + `_screen_reward_on_replay` in
+     `_post_validate` (both attempts): reject when the candidate's mean
+     per-step total over NON-FALLEN frames < −0.05 on the protected
+     rollout; reject message carries per-component means + the parent's
+     baseline on the same frames (retry feedback names the offending
+     term). Guards the net-negative-living class (true suicide
+     attractor); does NOT claim to catch credit-starvation edits —
+     those are covered by the env fix + prompt laws below. <32
+     surviving frames → no evidence → pass.
+  3. `sculpt.py`: replay source = THIS iter's rollout, or the
+     best-so-far iter's rollout when this iter strictly regressed the
+     lexicographic key (a collapsed rollout is not the behavior to
+     protect); `prior_fitness` now carries best_progress +
+     best_iter_dir.
+  4. Prompt laws: `edit_rewriter.md` #10 net-positive-living
+     (machine-checked; penalties sized vs earned credit in EVERY
+     recoverable pose; exploits made relatively unprofitable, not
+     absolutely negative) and #11 progress-preservation (never gate
+     credit above the achieved level; ramp from achieved toward
+     target; add the missing phase, don't re-threshold working ones).
+     `diagnose_preliminary.md`: reward-suicide pattern (episode-length
+     crash after penalty-adding edit ⇒ rebalance, not more shaping).
+     `diagnose_grounded.md`: hard-skill edit policy (bottleneck-channel
+     targeting, minimal edits on real progress, penalty sizing must
+     name its offsetting positive term).
+  5. **v10 hand-authored** (project rewards/, outside repo;
+     current.py repointed v5 → v10): v5 + (a) smooth elevation gate on
+     tuck (ramp 0.55→0.65 m; sit at 0.145 m earns 0, every hop apex
+     0.90-0.94 m keeps full credit), (b) NEW `stance_recovery` =
+     upright × both-feet-contact × height-ramp(0.20→0.70 m) — the
+     dense return-to-stance credit the metric's bottleneck channel
+     (c_returned ≈ 0) demands. No new penalties. Verified pose
+     ordering: fallen ≪ sit-farm 0.10 < crouch 0.35 < stand 0.60 ≪
+     flight-tuck 4.45/step; scalar/batched parity ≤1e-5 on all four;
+     variance + batched + zero probes pass; anti-collapse screen pass
+     (mean +0.29 on iter_5 replay, sit-farm tuck credit 3.43 → 0.20).
+- **Firewall**: metric_calibration.py / metric_validate.py / gen_002
+  spec composition untouched.
+- **Verified**: full offline suite 996 passed / 1 skipped (pre-change
+  baseline re-measured at 974 collected — the loop-3 "978" note counted
+  a different collection; +22 new tests here: 10 env-profile [4a] + 12
+  replay-screen [4b]).

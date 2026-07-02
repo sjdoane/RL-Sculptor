@@ -1294,6 +1294,34 @@ def _run_one_iter(
             kg_store=kg_store,
         )
 
+    # §RL_SCULPTOR_AUDIT §4.4 (loop 4b): build the edit anti-collapse
+    # replay from the rollout whose behavior the next edit must refine —
+    # THIS iter's rollout by default; the best-so-far iter's rollout when
+    # this iter strictly regressed the lexicographic (steer, progress)
+    # key (a collapsed rollout is not the behavior to protect). Adapters
+    # without replay support return None → the screen is skipped.
+    replay_inputs = None
+    if not dry_run:
+        replay_dir = rollout_dir
+        pf = prior_fitness or {}
+        best_sf = pf.get("best_so_far")
+        best_dir = pf.get("best_iter_dir")
+        if best_sf is not None and best_dir:
+            cur_key = ((iter_steer_fitness
+                        if iter_steer_fitness is not None else 0.0),
+                       (iter_steer_progress
+                        if iter_steer_progress is not None else 0.0))
+            best_key = (best_sf, pf.get("best_progress") or 0.0)
+            cand = Path(best_dir) / "rollout"
+            if cur_key < best_key and cand.is_dir():
+                replay_dir = cand
+        try:
+            replay_inputs = adapter.build_reward_replay(replay_dir)
+        except Exception as e:  # noqa: BLE001 — screen is best-effort
+            sys.stderr.write(
+                f"[sculpt] iter {iter_index}: reward replay build skipped — "
+                f"{type(e).__name__}: {e}\n")
+
     # 4. Apply edits → v<n+1>.py
     new_iter_tag = f"v{latest_n + 1}"
     new_reward_path: Path | None = None
@@ -1321,6 +1349,8 @@ def _run_one_iter(
                 # no-ops, byte-identical.
                 metric_observables=getattr(
                     fitness_fn, "metric_observables", None),
+                # §RL_SCULPTOR_AUDIT §4.4 (loop 4b): anti-collapse replay.
+                replay_inputs=replay_inputs,
             )
     except EditValidationError as e:
         sys.stderr.write(
@@ -1805,6 +1835,14 @@ def sculpt_run(
                 fitness_fn=fitness_fn,
                 prior_fitness=(
                     {"best_so_far": result.best_fitness,
+                     # §RL_SCULPTOR_AUDIT §4.4 (loop 4b): best PROGRESS +
+                     # the best iter's dir so _run_one_iter can source the
+                     # edit anti-collapse replay from the best-so-far
+                     # rollout when this iter strictly regressed.
+                     "best_progress": result.best_progress,
+                     "best_iter_dir": (
+                         str(runs_dir / f"iter_{result.best_fitness_iter}")
+                         if result.best_fitness_iter is not None else None),
                      "last": (result.fitness_history[-1]
                               if result.fitness_history else None)}
                     if fitness_fn is not None else None

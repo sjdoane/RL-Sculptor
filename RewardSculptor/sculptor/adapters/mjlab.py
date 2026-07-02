@@ -818,6 +818,152 @@ class MjlabAdapter(SculptorAdapter):
             n_episodes=n_episodes,
         )
 
+    # ── Reward replay (edit anti-collapse screen) ───────────────────────────
+    # Cap on replayed frames — one batched compute_reward_batched call on
+    # CPU; 4096 frames × ~30 floats is milliseconds and plenty of episode
+    # coverage. Deterministic (evenly-spaced) subsample, never RNG.
+    _REPLAY_MAX_FRAMES = 4096
+
+    def build_reward_replay(
+        self, rollout_dir: Path,
+    ) -> "tuple[Any, Any, Any, dict] | None":
+        """§RL_SCULPTOR_AUDIT §4.4 (edit quality): reconstruct reward
+        inputs from `trajectory.npz` so edit.py can replay a CANDIDATE
+        reward over the archived behavior of the current policy.
+
+        Fidelity notes (vs the live `SculptorRewardTerm.__call__`):
+          * exact — qpos/qvel/actuator_force/projected_gravity_b/action,
+            info base_height, fallen, per-foot contacts;
+          * approximated — foot heights (root_z + pelvis-frame foot z;
+            exact only when upright), swing speeds + base_horizontal_speed
+            (finite-difference over step_dt), base_lin_vel_b (world-frame
+            finite difference; body≈world when upright);
+          * zero-filled — base_ang_vel_b, command_vel (the jump profile
+            zeroes commands anyway), terminated/time_outs.
+        Good enough for the screen's question — "does this reward make
+        the current behavior net-negative / zero-credit?" — which is
+        dominated by the exact channels. Returns None when the archive
+        lacks the core arrays (screen silently skipped)."""
+        import numpy as np
+        import torch
+
+        rollout_dir = Path(rollout_dir)
+        npz_path = rollout_dir / "trajectory.npz"
+        if not npz_path.is_file():
+            return None
+        try:
+            z = np.load(npz_path)
+        except Exception:  # noqa: BLE001 — unreadable archive → no screen
+            return None
+        files = set(z.files)
+        core = {"joint_pos", "joint_vel", "root_link_pos_w",
+                "projected_gravity_b", "action"}
+        if not core.issubset(files):
+            return None
+        jp = z["joint_pos"]
+        if jp.ndim != 3 or jp.shape[0] < 3:
+            return None
+        T, N = jp.shape[:2]
+
+        step_dt = 0.02
+        try:
+            behavior = json.loads((rollout_dir / "behavior.json").read_text())
+            step_dt = float(behavior.get("step_dt") or 0.02) or 0.02
+        except Exception:  # noqa: BLE001 — default 50 Hz
+            pass
+
+        def _np(key: str) -> "np.ndarray | None":
+            return z[key] if key in files else None
+
+        root = z["root_link_pos_w"].astype(np.float32)      # (T, N, 3)
+        pg = z["projected_gravity_b"].astype(np.float32)    # (T, N, 3)
+        jv = z["joint_vel"].astype(np.float32)
+        act = z["action"].astype(np.float32)
+        af = _np("actuator_force")
+        lfc, rfc = _np("left_foot_contact"), _np("right_foot_contact")
+        lfp, rfp = _np("left_foot_pos_b"), _np("right_foot_pos_b")
+
+        # Transitions t -> t+1; frames beyond the cap are subsampled
+        # evenly so the whole episode (launch, apex, landing, aftermath)
+        # stays represented.
+        n_trans = T - 1
+        flat_total = n_trans * N
+        n_keep = min(flat_total, self._REPLAY_MAX_FRAMES)
+        flat_idx = np.linspace(0, flat_total - 1, num=n_keep).astype(np.int64)
+        t_idx, env_idx = flat_idx // N, flat_idx % N
+
+        def _pick(arr: "np.ndarray", ts: "np.ndarray") -> "np.ndarray":
+            return arr[ts, env_idx]
+
+        # World-frame velocities by finite difference over the transition.
+        root_t, root_t1 = _pick(root, t_idx), _pick(root, t_idx + 1)
+        root_vel = (root_t1 - root_t) / step_dt                    # (F, 3)
+
+        def _foot_world_z(fp: "np.ndarray | None", ts: "np.ndarray") -> "np.ndarray":
+            if fp is None:
+                return np.zeros(len(ts), dtype=np.float32)
+            return np.maximum(
+                0.0, _pick(root, ts)[:, 2] + _pick(fp, ts)[:, 2])
+
+        def _foot_speed(fp: "np.ndarray | None") -> "np.ndarray":
+            if fp is None:
+                return np.zeros(n_keep, dtype=np.float32)
+            p0 = _pick(root, t_idx) + _pick(fp, t_idx)
+            p1 = _pick(root, t_idx + 1) + _pick(fp, t_idx + 1)
+            return np.linalg.norm((p1 - p0) / step_dt, axis=-1)
+
+        schema = _schema_for_task(self.task_id)
+
+        def _t(arr: "np.ndarray") -> "torch.Tensor":
+            return torch.from_numpy(np.ascontiguousarray(arr, dtype=np.float32))
+
+        def _state_at(ts: "np.ndarray") -> dict[str, "torch.Tensor"]:
+            out: dict[str, torch.Tensor] = {}
+            for key, shape in schema.items():
+                if key == "qpos":
+                    out[key] = _t(_pick(jp, ts))
+                elif key == "qvel":
+                    out[key] = _t(_pick(jv, ts))
+                elif key == "actuator_force" and af is not None:
+                    out[key] = _t(_pick(af, ts))
+                elif key == "projected_gravity_b":
+                    out[key] = _t(_pick(pg, ts))
+                elif key == "base_lin_vel_b":
+                    out[key] = _t(root_vel)
+                else:
+                    out[key] = torch.zeros((n_keep, *shape), dtype=torch.float32)
+            return out
+
+        state = _state_at(t_idx)
+        next_state = _state_at(t_idx + 1)
+        action = _t(_pick(act, t_idx))
+
+        pg_t1 = _pick(pg, t_idx + 1)
+        info: dict[str, torch.Tensor] = {
+            "episode_length": _t(t_idx.astype(np.float32)),
+            "terminated": torch.zeros(n_keep, dtype=torch.float32),
+            "time_outs": torch.zeros(n_keep, dtype=torch.float32),
+            "step_dt": torch.full((n_keep,), float(step_dt)),
+            "base_height": _t(root_t1[:, 2]),
+            "fallen": _t((pg_t1[:, 2] >= 0.0).astype(np.float32)),
+        }
+        if "G1" in self.task_id:
+            info.update({
+                "left_foot_contact": _t(
+                    _pick(lfc, t_idx + 1) if lfc is not None
+                    else np.zeros(n_keep, dtype=np.float32)),
+                "right_foot_contact": _t(
+                    _pick(rfc, t_idx + 1) if rfc is not None
+                    else np.zeros(n_keep, dtype=np.float32)),
+                "left_foot_height": _t(_foot_world_z(lfp, t_idx + 1)),
+                "right_foot_height": _t(_foot_world_z(rfp, t_idx + 1)),
+                "left_foot_swing_speed": _t(_foot_speed(lfp)),
+                "right_foot_swing_speed": _t(_foot_speed(rfp)),
+                "base_horizontal_speed": _t(
+                    np.linalg.norm(root_vel[:, :2], axis=-1)),
+            })
+        return state, action, next_state, info
+
     # ── Behavior metrics ────────────────────────────────────────────────────
     def compute_behavior_metrics(self, rollout: RolloutResult) -> dict[str, Any]:
         """Read behavior.json written by the rollout runner."""

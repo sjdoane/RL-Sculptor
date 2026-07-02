@@ -402,6 +402,109 @@ def _probe_reward_variance(mod, contract) -> None:
     )
 
 
+# §RL_SCULPTOR_AUDIT §4.4 (edit quality): reject floor for the replay
+# screen. A mean per-step total below this on the archived rollout's
+# NON-FALLEN frames means living costs more than terminating — with a
+# reachable termination the optimal policy ends episodes ASAP (the
+# v6/v8 instant-fall collapses). Slightly negative means (transient
+# action costs) are tolerated.
+_REPLAY_MEAN_FLOOR = -0.05
+# Fewer surviving (finite, non-fallen) frames than this → insufficient
+# evidence; pass rather than false-reject (mirrors _probe_reward_variance).
+_REPLAY_MIN_FRAMES = 32
+
+
+def _replay_reward_summary(mod, replay_inputs) -> "dict | None":
+    """Replay a reward module over archived rollout inputs (built by
+    `adapter.build_reward_replay`). Returns
+    `{mean_alive, n_alive, component_means}` or None when the module
+    can't be replayed (no batched path / crash / too few frames) —
+    callers treat None as "no evidence"."""
+    if not replay_inputs or not hasattr(mod, "compute_reward_batched"):
+        return None
+    try:
+        import torch
+
+        state, action, next_state, info = replay_inputs
+        with torch.no_grad():
+            out = mod.compute_reward_batched(state, action, next_state, info)
+        rewards, components = out
+        rewards = rewards.reshape(-1).float()
+        fallen = info.get("fallen")
+        alive = (
+            (fallen.reshape(-1) < 0.5)
+            if isinstance(fallen, torch.Tensor)
+            else torch.ones_like(rewards, dtype=torch.bool)
+        )
+        alive &= torch.isfinite(rewards)
+        n_alive = int(alive.sum().item())
+        if n_alive < _REPLAY_MIN_FRAMES:
+            return None
+        comp_means: dict[str, float] = {}
+        if isinstance(components, dict):
+            for k, v in components.items():
+                try:
+                    comp_means[str(k)] = float(
+                        v.reshape(-1).float()[alive].mean().item())
+                except Exception:  # noqa: BLE001 — non-tensor component
+                    continue
+        return {
+            "mean_alive": float(rewards[alive].mean().item()),
+            "n_alive": n_alive,
+            "component_means": comp_means,
+        }
+    except Exception:  # noqa: BLE001 — replay is advisory evidence
+        return None
+
+
+def _screen_reward_on_replay(mod, replay_inputs, parent_summary=None) -> None:
+    """§RL_SCULPTOR_AUDIT §4.4 (edit quality): anti-collapse screen.
+
+    Replays the CANDIDATE reward on the archived rollout of the policy
+    it will train (the current best behavior). Rejects when the mean
+    per-step total over non-fallen frames is meaningfully negative:
+    with a reachable episode termination, a net-negative living reward
+    makes immediate self-termination the optimum — both diagnoser edits
+    in the tuck-jump E2E (v6, v8-class) collapsed this way, burning a
+    GPU hour each. The reject message carries per-component means on
+    those frames so the retry can rebalance the exact offending terms."""
+    if not replay_inputs:
+        return
+    summary = _replay_reward_summary(mod, replay_inputs)
+    if summary is None:
+        return
+    mean_alive = summary["mean_alive"]
+    if mean_alive >= _REPLAY_MEAN_FLOOR:
+        return
+    comp_s = ", ".join(
+        f"{k}={v:+.3f}" for k, v in sorted(
+            summary["component_means"].items(), key=lambda kv: kv[1]))
+    parent_s = ""
+    if parent_summary is not None:
+        parent_s = (
+            f" The PARENT reward averages {parent_summary['mean_alive']:+.3f} "
+            f"on the same frames, so this is a property of your edit, not "
+            f"of the rollout."
+        )
+    raise EditValidationError(
+        "reward-collapse screen: replaying this module on the archived "
+        "rollout of the CURRENT policy (the behavior your edit must "
+        f"refine, not destroy) gives a mean per-step TOTAL of "
+        f"{mean_alive:+.3f} across {summary['n_alive']} non-fallen "
+        f"frames.{parent_s} A net-negative living reward with a "
+        "reachable episode termination teaches the policy to end "
+        "episodes as fast as possible (deliberate falling) — this "
+        "exact mechanism produced instant-fall policies twice. "
+        f"Per-component means on those frames: {comp_s or '(none)'}. "
+        "Rebalance so the per-step total stays >= 0 in commonly-visited "
+        "non-fallen states: shrink new penalties (aim <= ~0.1/step in "
+        "ordinary poses), keep paying for the partial behavior the "
+        "policy already achieves, and make an exploit UNPROFITABLE "
+        "relative to the intended behavior rather than absolutely "
+        "negative."
+    )
+
+
 def _call_compute_reward_batched(mod, contract) -> None:
     """§Ship 31b: execute the BATCHED path pre-flight (N=2 zero
     tensors, runtime-faithful float info). The scalar probe runs pure
@@ -847,7 +950,9 @@ def _post_validate(new_source: str, *, contract, kg_store: SculptorKG,
                    parent_hash: str, new_version: str,
                    write_to: Path,
                    parent_hparams: "dict[str, Any] | None" = None,
-                   metric_observables: "frozenset[str] | None" = None) -> Any:
+                   metric_observables: "frozenset[str] | None" = None,
+                   replay_inputs=None,
+                   replay_parent: "dict | None" = None) -> Any:
     """Write source, import, validate, return the imported module.
 
     Raises EditValidationError on any failure (caller decides whether to retry).
@@ -897,6 +1002,11 @@ def _post_validate(new_source: str, *, contract, kg_store: SculptorKG,
         # a state-independent (constant) reward is rejected BEFORE it can
         # burn a GPU iteration training "stand still".
         _probe_reward_variance(mod, contract)
+        # §RL_SCULPTOR_AUDIT §4.4 (loop 4b): anti-collapse screen — the
+        # candidate must not make the archived current-best behavior
+        # net-negative (suicide-by-termination attractor). No-op when the
+        # caller supplied no replay inputs.
+        _screen_reward_on_replay(mod, replay_inputs, replay_parent)
 
         # expected_components subset check
         if contract.expected_components is not None:
@@ -1017,10 +1127,18 @@ def apply_edits(
     on_event=None,
     iter_dir: Path | str | None = None,
     metric_observables: "frozenset[str] | None" = None,
+    replay_inputs=None,
 ) -> Path:
     """Produce a new reward module from `diagnosis` applied to
     `current_reward_path`. Writes `<rewards_dir>/<new_iter_id>.py` and
     rewrites `<rewards_dir>/current.py` to load that file by path.
+
+    `replay_inputs`: §RL_SCULPTOR_AUDIT §4.4 (loop 4b). Optional
+    `(state, action, next_state, info)` batch reconstructed from the
+    archived rollout the candidate must not destroy (built by
+    `adapter.build_reward_replay`). When supplied, post-flight replays
+    the candidate on it and rejects net-negative-living rewards (the
+    suicide-by-termination collapse); None (default) skips the screen.
 
     `on_event`: optional callable taking a dict. Called at load-bearing
     transitions (pre_validate start/done, LLM request start/response,
@@ -1058,6 +1176,13 @@ def apply_edits(
         parent_hparams = _current_reward_hparams(current_module)
         gate_parent_hparams = (
             parent_hparams if metric_observables else None)
+        # §RL_SCULPTOR_AUDIT §4.4 (loop 4b): the PARENT's replay summary —
+        # baseline for the anti-collapse screen's reject message ("the
+        # parent averages +X on the same frames"). None when replay is
+        # off or the parent itself can't be replayed.
+        replay_parent = (
+            _replay_reward_summary(current_module, replay_inputs)
+            if replay_inputs else None)
 
         # Pre-flight.
         if on_event is not None:
@@ -1192,6 +1317,8 @@ def apply_edits(
                 write_to=target_path,
                 parent_hparams=gate_parent_hparams,
                 metric_observables=metric_observables,
+                replay_inputs=replay_inputs,
+                replay_parent=replay_parent,
             )
         except EditValidationError as first_err:
             print(f"[edit] first attempt failed: {first_err}. Retrying once.",
@@ -1221,6 +1348,8 @@ def apply_edits(
                 write_to=target_path,
                 parent_hparams=gate_parent_hparams,
                 metric_observables=metric_observables,
+                replay_inputs=replay_inputs,
+                replay_parent=replay_parent,
             )
 
         _write_current_reexport(rewards_dir, target_path)

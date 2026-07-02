@@ -124,4 +124,37 @@ out of the grounding string entirely.
 
 9. No side effects on import. No print/logging at module scope.
 
+10. **Net-positive-living rule** (machine-checked). The loop replays
+   your module over the archived rollout of the CURRENT policy; if the
+   mean per-step TOTAL over non-fallen frames is meaningfully negative,
+   your module is rejected. Physics of the failure: when episodes can
+   terminate (fall detection), a sustained negative living reward makes
+   immediate self-termination the optimal policy — the agent learns to
+   fall on purpose to stop the pain (observed twice: penalty-heavy
+   edits collapsed to 16-18-step instant-fall episodes). Therefore:
+     - size every penalty so that `alive/base bonus + earned shaping ≥
+       total penalties` in EVERY commonly-visited, recoverable pose
+       (standing, crouch, kneel, mid-air), not just the ideal pose;
+     - to kill an exploit, make it earn LESS than the intended behavior
+       (relative disadvantage), not absolutely negative — cap or zero
+       the exploited term under the exploit condition instead of
+       stacking a new negative term on top.
+
+11. **Progress-preservation rule** (hard skills). When the DIAGNOSIS /
+   OBJECTIVE_PROGRESS shows the current policy makes REAL partial
+   progress (dense progress channels or physical behavior deltas moved
+   — e.g. genuine liftoff, knee flexion, reduced drift), your edit must
+   be MINIMAL and phase-directed:
+     - keep the terms AND magnitudes that pay for the achieved partial
+       behavior — do not zero, re-gate, or re-threshold them;
+     - NEVER gate credit at a level the policy has not yet reached
+       (e.g. requiring base_height above standing before ANY tuck credit
+       when the current apex is 5 cm) — ramp credit smoothly FROM the
+       currently-achieved value TOWARD the target instead;
+     - add credit for the MISSING phase named by the weakest fitness
+       sub-channel (e.g. landing / return-to-stance) rather than
+       re-shaping the phases that already work;
+     - prefer ONE new term + at most small (<20 %) weight adjustments
+       over broad rewrites.
+
 Return the new source now.
