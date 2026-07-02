@@ -476,6 +476,42 @@ laws + hand-authored v10 landing reward (gap: edit quality)
   a different collection; +22 new tests here: 10 env-profile [4a] + 12
   replay-screen [4b]).
 
+### 2026-07-01/02 — loop 4d: E2E re-run under the §4.4 fixes (iters 10-14)
+
+Run 1 (iters 10-12, `runs/sculpt_loop4_1959.log`, code b2846e3, jump
+env profile active, v10 base, gen_002 steer, seed 42+i):
+
+| iter | trained | behavior (measured) | gen_002 spec/progress | g1_jump GT |
+|---|---|---|---|---|
+| 10 | v10 | STANDS: c_returned 0.97, upright_end 1.0, drift 0.49 m (was 4.2) — but apex 3.8 cm, no tuck | 0.0 / **0.0196** (first nonzero progress ever) | 0.0005 |
+| 11 | v11 (LLM edit) | TUMBLE-BOUNCE: apex 0.56 m, frac_launched 1.0/env, uprightness 0.154 | 0.0 / 0.0 (upright/settle min→0) | 0.042 |
+| 12 | v10 (strict-revert ✓) | tumble again @seed 44: apex 0.49 m + REAL 0.96 rad tuck, uprightness 0.078 | 0.0 / 0.0 | 0.021 |
+
+- Loop mechanics all held: first-ever nonzero dense progress ranked
+  iter 10 best; iter 11's strict regression armed the revert; iter 12
+  trained the reverted best; `best_reward_selected` → v10. The
+  keyframes for iter 10 visibly confirm an upright stance start-to-end
+  (no sit, no fall) — the c_returned bottleneck from iter 5 is CLOSED.
+- The v11 LLM edit was exactly the shape the new laws demand (stance
+  0.5→0.1, launch 5→8, ZERO new penalties, honest env-extension
+  deferral) — the v6/v8 penalty-stacking class did not recur. The v13
+  edit (from the reverted iter-12 diagnosis) re-gated tuck above stand
+  height (0.75→0.85 m) — correct anti-crouch-farm, but blind to the
+  tumble lesson (its diagnosis iter never saw v11's rollout).
+- **Root structure now measured**: v10-family rewards oscillate between
+  stand-farm and tumble-bounce because flight credit paid regardless of
+  ORIENTATION. Every tuck-jump ingredient exists across rollouts
+  (0.5 m launches, 0.96 rad tucks, perfect return-to-stance) — never
+  simultaneously.
+- **v14 hand-authored** (parent v13): launch AND tuck multiplied by
+  uprightness = clamp(−proj_gravity_z, 0, 1) — tumbling flight earns
+  ~0.1×, upright flight ~1×, dense in orientation; keeps v13 tuck
+  gates + v11 weights. Verified: pose ordering fallen ≪ sit 0.10 <
+  crouch 0.15 < stand 0.20 < tumble-flight 0.62 ≪ upright-flight-tuck
+  5.04/step; scalar/batched parity; probes + anti-collapse replay
+  screens PASS on all three archived behavior classes (iters 10/11/12).
+- Run 2 (extension, iters 14-15, `runs/sculpt_loop4d_*.log`) trains v14.
+
 ### 2026-07-01 — loop 4c: goal-conditioned starter seed (gap #4)
 - **What**: `sculptor/sculpt.py` — `_is_pristine_starter_reward`
   (REWARD_SPEC-signature detection of the untouched `sculpt init`
