@@ -499,9 +499,14 @@ def _apply_env_profile(env_cfg: Any, profile: str) -> None:
         twist = (getattr(env_cfg, "commands", None) or {}).get("twist")
         if twist is not None:
             ranges = getattr(twist, "ranges", None)
-            for f in ("lin_vel_x", "lin_vel_y", "ang_vel_z", "heading"):
+            for f in ("lin_vel_x", "lin_vel_y", "ang_vel_z"):
                 if ranges is not None and hasattr(ranges, f):
                     setattr(ranges, f, (0.0, 0.0))
+            # heading must be None (not (0,0)) — UniformVelocityCommand
+            # rejects ANY truthy heading range when heading_command=False
+            # (caught live: first loop-4 E2E launch, 2026-07-01).
+            if ranges is not None and hasattr(ranges, "heading"):
+                ranges.heading = None
             for f, v in (("rel_standing_envs", 1.0),
                          ("rel_heading_envs", 0.0),
                          ("rel_forward_envs", 0.0),

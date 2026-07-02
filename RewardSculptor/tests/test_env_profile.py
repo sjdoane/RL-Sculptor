@@ -46,7 +46,9 @@ def test_jump_profile_zeroes_velocity_commands() -> None:
     assert twist.ranges.lin_vel_x == (0.0, 0.0)
     assert twist.ranges.lin_vel_y == (0.0, 0.0)
     assert twist.ranges.ang_vel_z == (0.0, 0.0)
-    assert twist.ranges.heading == (0.0, 0.0)
+    # None, NOT (0,0): UniformVelocityCommand.__init__ rejects any truthy
+    # heading range when heading_command=False (live failure 2026-07-01).
+    assert twist.ranges.heading is None
     assert twist.rel_standing_envs == 1.0
     assert twist.rel_heading_envs == 0.0
     assert twist.rel_forward_envs == 0.0
