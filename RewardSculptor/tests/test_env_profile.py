@@ -250,3 +250,19 @@ def test_rl_profile_doubles_entropy_for_jump_only() -> None:
     _mjlab_runner._apply_rl_profile(SimpleNamespace(), "jump")
     _mjlab_runner._apply_rl_profile(
         SimpleNamespace(algorithm=SimpleNamespace()), "jump")
+
+
+def test_jump_profile_adds_sunk_termination_in_train_only() -> None:
+    """RSI's other half (DeepMimic pairing): early termination off the
+    recoverable manifold. The floor-sit basin is orientation-UPRIGHT
+    (base 0.14 m, torso vertical) so only a height-based termination can
+    cut it. Train-only — evaluation keeps honest full episodes."""
+    pytest.importorskip("mjlab")
+    cfg = _fake_velocity_cfg()
+    _mjlab_runner._apply_env_profile(cfg, "jump", train=True)
+    assert "sunk" in cfg.terminations
+    assert cfg.terminations["sunk"].params["minimum_height"] == 0.30
+
+    cfg2 = _fake_velocity_cfg()
+    _mjlab_runner._apply_env_profile(cfg2, "jump", train=False)
+    assert "sunk" not in cfg2.terminations

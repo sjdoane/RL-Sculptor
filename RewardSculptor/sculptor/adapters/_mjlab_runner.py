@@ -578,6 +578,37 @@ def _apply_env_profile(env_cfg: Any, profile: str, *, train: bool = True) -> Non
         except Exception as e:  # noqa: BLE001
             print(f"[runner] env-profile jump: RSI reset skipped: "
                   f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
+        # RSI's other half — DeepMimic pairs reference-state starts with
+        # EARLY TERMINATION off the recoverable manifold, or the data
+        # distribution is dominated by wherever failed episodes settle.
+        # Measured (tuck-jump iters 19-20): every shaping term started
+        # strong under RSI starts and DECAYED to ~0 as PPO converged to
+        # a floor-SIT — an orientation-UPRIGHT basin no bad_orientation
+        # termination can cut (torso vertical while base sits at
+        # 0.14 m). Terminate on base height < 0.30 m instead: the
+        # sit/crash basin lives at 0.14-0.25 m, the deepest legitimate
+        # jump crouch stays above ~0.35 m, and a fall spends 1-2 s of
+        # live fall-penalty before sinking past it (the penalty signal
+        # still lands; the following 8 s of floor data no longer
+        # exists). TRAIN-ONLY like the RSI starts — evaluation keeps
+        # honest full episodes from standing.
+        try:
+            terms = getattr(env_cfg, "terminations", None)
+            if isinstance(terms, dict):
+                from mjlab.envs.mdp.terminations import (
+                    root_height_below_minimum,
+                )
+                from mjlab.managers.termination_manager import (
+                    TerminationTermCfg,
+                )
+                terms["sunk"] = TerminationTermCfg(
+                    func=root_height_below_minimum,
+                    params={"minimum_height": 0.30},
+                )
+                applied.append("terminations:+sunk(base<0.30m)")
+        except Exception as e:  # noqa: BLE001
+            print(f"[runner] env-profile jump: sunk termination skipped: "
+                  f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
     print(f"[runner] env-profile jump applied (train={train}): {applied}",
           file=sys.stderr, flush=True)
 
