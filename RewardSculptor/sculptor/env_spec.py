@@ -185,6 +185,29 @@ def validate_env_spec(spec: Any) -> list[str]:
             _check_range(f"train.{k}", train[k], envelope, errors)
     if "push_events" in train:
         _check_push("train.push_events", train["push_events"], errors)
+
+    # Cross-field invariant (MEASURED requirement, tuck-jump iters
+    # 19-20: RSI without early termination off the recoverable manifold
+    # REGRESSES — failed episodes' floor data dominates PPO's
+    # distribution): airborne/upward reference-state starts REQUIRE the
+    # min-base-height termination. Horizontal-only or downward-only
+    # reset jitter doesn't trigger it.
+    def _hi(v: Any) -> float:
+        try:
+            return float(v[1])
+        except (TypeError, ValueError, IndexError):
+            return 0.0
+
+    rsi_airborne = (_hi(train.get("reset_height_offset_m")) > 0.0
+                    or _hi(train.get("reset_vertical_velocity_mps")) > 0.0)
+    if rsi_airborne and not _is_num(
+            train.get("min_base_height_termination_m")):
+        errors.append(
+            "train: reset_height_offset_m / upward "
+            "reset_vertical_velocity_mps (reference-state initialization "
+            "into the air) REQUIRE train.min_base_height_termination_m — "
+            "measured: RSI without early termination off the recoverable "
+            "manifold regresses (floor data dominates training)")
     return errors
 
 
@@ -241,7 +264,12 @@ def write_env_spec_version(env_dir: Path, spec: dict) -> Path:
     env_dir.mkdir(parents=True, exist_ok=True)
     path = env_dir / f"v{n}.json"
     text = json.dumps(to_write, indent=2, sort_keys=True)
-    path.write_text(text, encoding="utf-8")
+    # tmp+replace for BOTH files — a crash mid-write must not leave a
+    # truncated version file (which would burn its number and fail any
+    # later revert onto it) any more than a truncated current.json.
+    tmp_v = env_dir / f"v{n}.json.tmp"
+    tmp_v.write_text(text, encoding="utf-8")
+    tmp_v.replace(path)
     tmp = env_dir / "current.json.tmp"
     tmp.write_text(text, encoding="utf-8")
     tmp.replace(env_dir / "current.json")

@@ -98,7 +98,7 @@ def _model_to_spec(m: _EnvSpecModel, *, behavior_goal: str) -> dict:
         "env_spec_version": ENV_SPEC_VERSION,
         "meta": {
             "source": "generated",
-            "behavior_goal": " ".join(str(behavior_goal).split())[:500],
+            "behavior_goal": " ".join(str(behavior_goal).split())[:900],
             "reasoning": str(m.reasoning)[:2000],
         },
         "shared": _clean(m.shared),
@@ -165,16 +165,21 @@ def generate_env_spec(
         return _model_to_spec(resp.parsed_output, behavior_goal=behavior_goal)
 
     # Attempt 1 → full-violation feedback → attempt 2 → raise.
+    call_failed = False
     try:
         spec = _one_call(user)
         errors = validate_env_spec(spec)
     except Exception as e:  # noqa: BLE001 — parse/API failure counts as attempt 1
-        spec, errors = None, [f"{type(e).__name__}: {e}"]
+        spec, errors, call_failed = None, [f"{type(e).__name__}: {e}"], True
     if not errors:
         return spec
+    preamble = (
+        "The previous attempt failed before producing a parseable spec"
+        if call_failed else
+        "Your previous spec failed validation — fix ALL of these")
     retry = (
-        f"{user}\n\nYour previous spec failed validation — fix ALL of "
-        "these and re-emit the full spec:\n  - " + "\n  - ".join(errors)
+        f"{user}\n\n{preamble} and re-emit the full spec:\n  - "
+        + "\n  - ".join(errors)
     )
     spec = _one_call(retry)
     errors = validate_env_spec(spec)

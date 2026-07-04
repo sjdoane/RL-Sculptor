@@ -154,6 +154,30 @@ def test_load_env_spec_raises_with_all_errors(tmp_path) -> None:
         es.load_env_spec(tmp_path / "junk.json")
 
 
+def test_rsi_requires_early_termination_pairing() -> None:
+    """MEASURED invariant (tuck-jump iters 19-20): airborne/upward RSI
+    starts without early termination off the recoverable manifold
+    regress — the validator enforces the pairing, not just the prompt."""
+    base = {"env_spec_version": 1}
+    # Airborne height offsets alone → rejected.
+    bad = {**base, "train": {"reset_height_offset_m": [0.0, 0.4]}}
+    assert any("min_base_height_termination_m" in e
+               for e in es.validate_env_spec(bad))
+    # Upward spawn velocity alone → rejected.
+    bad2 = {**base, "train": {"reset_vertical_velocity_mps": [-0.5, 2.0]}}
+    assert any("min_base_height_termination_m" in e
+               for e in es.validate_env_spec(bad2))
+    # Paired → valid.
+    ok = {**base, "train": {"reset_height_offset_m": [0.0, 0.4],
+                            "min_base_height_termination_m": 0.3}}
+    assert es.validate_env_spec(ok) == []
+    # Horizontal-only / downward-only jitter doesn't trigger it.
+    ok2 = {**base, "train": {"reset_horizontal_velocity_mps": [-1.0, 1.0]}}
+    assert es.validate_env_spec(ok2) == []
+    ok3 = {**base, "train": {"reset_vertical_velocity_mps": [-1.0, 0.0]}}
+    assert es.validate_env_spec(ok3) == []
+
+
 def test_iterable_train_keys_is_the_train_section() -> None:
     """The diagnoser's editable surface is exactly the train section's
     value keys — shared keys must never be iterable mid-run."""
@@ -305,6 +329,7 @@ def test_applier_tolerates_partial_cfg() -> None:
                        "episode_length_s": 8.0,
                        "push_events": {"enabled": False}},
             "train": {"reset_height_offset_m": [0.0, 0.2],
+                      "min_base_height_termination_m": 0.25,
                       "reset_joint_position_offset_rad": [-0.1, 0.1],
                       "friction_range": [0.4, 1.0],
                       "entropy_coef_scale": 1.5}}

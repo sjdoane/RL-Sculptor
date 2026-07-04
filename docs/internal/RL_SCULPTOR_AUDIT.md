@@ -411,7 +411,38 @@ environment between training iterations
   requires_env_extension regression; loop threading — env revert
   version on regression, end-of-run repoint; remote-dispatch sync pin
   from the increment-1 verifier finding). Full suite 1079 passed / 1
-  skipped.
+  skipped. Commit f00d5f4.
+
+### 2026-07-04 — env generalization 4/4: tuck-jump migrated to the
+general mechanism + verifier-hardening + E2E
+
+- **Increment-2 adversarial verification** (subagent, commit 907c92e):
+  pass-with-findings, no CRITICAL/HIGH. Folded here:
+  * MEDIUM → the RSI↔early-termination pairing is now a HARD
+    cross-field invariant in `validate_env_spec` (airborne height
+    offsets or upward spawn velocities REQUIRE
+    min_base_height_termination_m; horizontal/downward-only jitter
+    exempt) — the measured iters-19-20 lesson is enforced by the gate,
+    not just the prompt, and covers diagnoser edits too.
+  * LOW → v<N>.json written via tmp+replace (no truncated version
+    files); retry preamble distinguishes API failure from validation
+    failure; meta.behavior_goal clip aligned with the prompt clip
+    (900); pushes-in-train-only prompt guidance now spells out the
+    required shared disable; drift-guard test pins generator model
+    fields == schema key sets.
+- **Migration**: tuck-jump project (outside repo,
+  ~/.local/share/reward-sculptor/projects/tuck-jump) now carries
+  `env/v0.json` = the jump preset expressed as a per-project spec
+  (meta.source "migrated:preset:jump"); `env_profile = "jump"` REMOVED
+  from its config.toml — the project runs entirely on the general
+  mechanism. LIVE parity verified on the real loaded
+  Mjlab-Velocity-Flat-Unitree-G1 cfg (not the fake): all 10 mutation
+  surfaces byte-identical between `--env-spec` (migrated file) and the
+  retired `--env-profile jump`, incl. train-only RSI/sunk.
+- **E2E**: resumed sculpt run on tuck-jump (v22 base, gen_002 steer,
+  fitness-patience 4) under the migrated spec — the diagnoser now
+  holds the env-curriculum surface (# ENV_SPEC block) for the first
+  time. Evidence appended below as iterations complete.
 
 ### 2026-07-01 — loop 1: dense progress channel + tie-deadlock fix
 - **What**: `sculptor/sculpt.py` — `IterOutcome.progress/steer_progress`,

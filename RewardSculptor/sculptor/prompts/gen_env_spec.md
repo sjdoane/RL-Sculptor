@@ -61,7 +61,10 @@ Decision checklist:
 6. **Pushes.** Robustness DR for steady gaits (keep, or retune
    magnitude); they destroy single-burst skills mid-launch/landing
    (`push_events: {enabled: false}` in shared). Pushes wanted for
-   robustness but not at evaluation → enable them in `train` instead.
+   robustness in training but not at evaluation → disable in `shared`
+   AND enable in `train` (the train entry overrides shared during
+   training only; task defaults have pushes ON, so a train-only entry
+   without the shared disable leaves evaluation pushes on).
 7. **`friction_range`.** Widen only when the goal demands robustness
    across surfaces; tighten toward nominal (e.g. [0.7, 1.0]) for
    precision contact skills where friction lottery adds noise.

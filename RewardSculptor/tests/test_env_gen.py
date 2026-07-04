@@ -128,6 +128,17 @@ def test_generation_parse_error_counts_as_attempt() -> None:
     assert len(client.messages.calls) == 2
 
 
+def test_generator_models_cover_the_schema_exactly() -> None:
+    """Drift guard: every schema key must be emittable by the generator
+    models and vice versa — a field added to env_spec.py without a model
+    field would be silently un-generatable (increment-2 verifier)."""
+    from sculptor.env_gen import _SharedModel, _TrainModel
+    from sculptor.env_spec import _SHARED_KEYS, _TRAIN_KEYS
+
+    assert set(_SharedModel.model_fields) == _SHARED_KEYS
+    assert set(_TrainModel.model_fields) == _TRAIN_KEYS
+
+
 # ── Versioning helpers ─────────────────────────────────────────────────────
 def test_write_version_stamps_and_repoints_current(tmp_path) -> None:
     env_dir = tmp_path / "env"
