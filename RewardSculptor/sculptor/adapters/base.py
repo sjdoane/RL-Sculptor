@@ -352,6 +352,25 @@ def load_adapter(config_path: Path) -> SculptorAdapter:
         if "remote" in params:
             init_kwargs = {**init_kwargs, "remote": dict(remote_table)}
 
+    # §RL_SCULPTOR_AUDIT (env generalization): a project env spec at
+    # `env/current.json` (written by the goal-conditioned generator and
+    # iterated by the sculpt loop) activates by convention — injected
+    # into adapters that accept `env_spec_path`, unless the config set
+    # one explicitly. Signature-introspected like `remote` above so
+    # spec-unaware adapters (gym_sb3) are untouched.
+    if "env_spec_path" not in init_kwargs:
+        spec_file = config_path.parent / "env" / "current.json"
+        if spec_file.is_file():
+            import inspect
+
+            try:
+                params = inspect.signature(cls).parameters
+            except (TypeError, ValueError):
+                params = {}
+            if "env_spec_path" in params:
+                init_kwargs = {
+                    **init_kwargs, "env_spec_path": str(spec_file.resolve())}
+
     instance = cls(**init_kwargs)
     if not isinstance(instance, SculptorAdapter):
         raise TypeError(

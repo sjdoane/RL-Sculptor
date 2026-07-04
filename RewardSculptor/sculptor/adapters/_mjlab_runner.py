@@ -449,149 +449,203 @@ def _build_sculptor_term_class(schema_keys: tuple[str, ...]):
     return SculptorRewardTerm
 
 
-def _apply_env_profile(env_cfg: Any, profile: str, *, train: bool = True) -> None:
-    """§RL_SCULPTOR_AUDIT §4.4 gap #5: task-env alignment for jump-class
-    goals. The mjlab velocity tasks are WALKING environments; four of
-    their training mechanics actively fight a standing jump (evidence:
-    the tuck-jump E2E, iters 0-8):
+def _resolve_env_spec(args: argparse.Namespace) -> "dict | None":
+    """Resolve the effective env spec for a runner invocation.
 
-    profile == "jump" mutates the loaded cfg, before the env is built:
+    `--env-spec <path>` (a validated per-project JSON, see
+    `sculptor.env_spec`) wins; else `--env-profile <name>` names a
+    built-in preset expressed in the SAME schema; else None (task
+    defaults, byte-identical cfg). An invalid spec FILE fails the run
+    loudly — the adapter validates before spawning, so reaching that
+    branch means the file changed underneath us or a caller skipped
+    validation; training under a half-applied env is never acceptable.
+    An unknown profile NAME keeps the historical warn-and-ignore
+    contract."""
+    from sculptor.env_spec import jump_preset_spec, load_env_spec
 
-      * commands: zero every `twist` velocity/heading range and put all
-        envs in the standing bucket. Random resampled commands (a) feed
-        command noise into the policy observation and (b) keep the 0.3×
-        track_linear_velocity floor paying for walking away — the v0
-        iters drifted 4.2-4.5 m per episode.
-      * curriculum: drop `command_vel` — it RE-WIDENS the command ranges
-        at 5k/10k steps, silently undoing the zeroed commands.
-      * events: drop `push_robot` — a random base kick every 1-3 s
-        (±0.4 m/s vertical, ±0.52 rad/s pitch/roll) is locomotion
-        robustness DR; it destroys launch/landing attempts.
-      * terminations: raise `fell_over` bad_orientation 70° → 120°.
-        At 70° the episode ends BEFORE projected gravity flips sign
-        (90°), so the reward-contract `fallen` signal could never fire
-        during training — every fall_penalty term in sculpted rewards
-        was structurally dead (tuck-jump iter 1). Worse, termination is
-        an ESCAPE: under a penalty-bearing reward the optimal policy
-        falls fast to reset away the pain (v6/v8 collapsed to 16-18-step
-        episodes). At 120° a fall accrues its penalty; only a truly
-        inverted, unrecoverable pose still terminates.
-      * episode_length_s → 10.0: matches the rollout eval horizon
-        (500 steps @ 50 Hz) and doubles launch-practice resets per
-        sample budget vs the walking default of 20 s.
-
-    §RSI (2026-07-04, gap #7): when `train=True`, `reset_base` gains
-    reference-state initialization — episodes start uniformly between
-    stance height and +0.40 m with vertical velocity in [-0.5, +2.0]
-    m/s. Measured motivation (tuck-jump iters 10-18): PPO from
-    standing-only starts never DISCOVERS the launch-land cycle — every
-    naive jump attempt ends in a punished fall, so launch credit decays
-    (0.009 → 0.001 over iter 14's training) and the policy retreats to
-    a safe static/degenerate basin. DeepMimic-style RSI gives the policy
-    apex→descent→landing→stance experience it cannot yet produce:
-    +0.40 m ≈ 2.8 m/s landing impact (within the soft-landing shaping's
-    working range; the measured tumble apexes were 0.45-0.55 m), and
-    +2.0 m/s upward ≈ a +0.20 m ballistic rise — a real hop's flight,
-    experienced for free. ROLLOUT (`train=False`) keeps the standing
-    start: RSI is a TRAINING curriculum; the evaluated task — and the
-    metric's view of it (upright_start / return-to-start-height) — is
-    unchanged.
-
-    Unknown profile values are rejected by MjlabAdapter before the
-    subprocess spawns; here an empty/None profile is a no-op. FULLY
-    DEFENSIVE per-mutation: any cfg-shape drift skips that mutation
-    with a warning, never breaks the run."""
+    spec_path = getattr(args, "env_spec", "") or ""
+    if spec_path:
+        return load_env_spec(spec_path)   # raises on unreadable/invalid
+    profile = getattr(args, "env_profile", "") or ""
     if not profile or profile == "default":
-        return
+        return None
     if profile != "jump":
         print(f"[runner] env-profile {profile!r} unknown — ignored",
               file=sys.stderr, flush=True)
+        return None
+    return jump_preset_spec()
+
+
+def _apply_env_spec(env_cfg: Any, spec: "dict | None", *,
+                    train: bool = True) -> None:
+    """§RL_SCULPTOR_AUDIT (env generalization, 2026-07-04): apply a
+    validated env spec to the loaded task cfg, before the env is built.
+    General successor to the retired jump-only `_apply_env_profile` —
+    the spec's `shared` section applies to BOTH train and rollout (the
+    policy is evaluated under its training task); its `train` section
+    is TRAIN-ONLY curricula (RSI resets, sunk termination, domain
+    randomization) so rollout evaluation — and the metric's view of the
+    task — is never touched by them.
+
+    The measured rationale for the jump preset's values (dead `fallen`
+    signal at 70°, termination-as-escape, RSI/early-termination pairing,
+    command-curriculum re-widening) lives in the audit doc's loop-4a /
+    loop-6 entries; this function only maps schema semantics onto mjlab
+    cfg fields. FULLY DEFENSIVE per-mutation: any cfg-shape drift skips
+    that mutation with a warning, never breaks the run."""
+    if not spec:
         return
     import math
 
+    shared = spec.get("shared") or {}
+    train_sec = (spec.get("train") or {}) if train else {}
     applied: list[str] = []
-    try:
-        twist = (getattr(env_cfg, "commands", None) or {}).get("twist")
-        if twist is not None:
-            ranges = getattr(twist, "ranges", None)
-            for f in ("lin_vel_x", "lin_vel_y", "ang_vel_z"):
-                if ranges is not None and hasattr(ranges, f):
-                    setattr(ranges, f, (0.0, 0.0))
-            # heading must be None (not (0,0)) — UniformVelocityCommand
-            # rejects ANY truthy heading range when heading_command=False
-            # (caught live: first loop-4 E2E launch, 2026-07-01).
-            if ranges is not None and hasattr(ranges, "heading"):
-                ranges.heading = None
-            for f, v in (("rel_standing_envs", 1.0),
-                         ("rel_heading_envs", 0.0),
-                         ("rel_forward_envs", 0.0),
-                         ("heading_command", False)):
-                if hasattr(twist, f):
-                    setattr(twist, f, v)
-            applied.append("commands:twist→zero/standing")
-    except Exception as e:  # noqa: BLE001 — never break a run
-        print(f"[runner] env-profile jump: command zeroing skipped: "
+
+    def _skip(what: str, e: Exception) -> None:
+        print(f"[runner] env-spec: {what} skipped: "
               f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
-    try:
-        cur = getattr(env_cfg, "curriculum", None)
-        if isinstance(cur, dict) and cur.pop("command_vel", None) is not None:
-            applied.append("curriculum:command_vel→removed")
-    except Exception as e:  # noqa: BLE001
-        print(f"[runner] env-profile jump: curriculum trim skipped: "
-              f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
-    try:
-        events = getattr(env_cfg, "events", None)
-        if isinstance(events, dict) and events.pop("push_robot", None) is not None:
-            applied.append("events:push_robot→removed")
-    except Exception as e:  # noqa: BLE001
-        print(f"[runner] env-profile jump: push_robot removal skipped: "
-              f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
-    try:
-        term = (getattr(env_cfg, "terminations", None) or {}).get("fell_over")
-        params = getattr(term, "params", None)
-        if isinstance(params, dict) and "limit_angle" in params:
-            params["limit_angle"] = math.radians(120.0)
-            applied.append("terminations:fell_over→120deg")
-    except Exception as e:  # noqa: BLE001
-        print(f"[runner] env-profile jump: fell_over relax skipped: "
-              f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
-    try:
-        if hasattr(env_cfg, "episode_length_s"):
-            env_cfg.episode_length_s = 10.0
-            applied.append("episode_length_s→10.0")
-    except Exception as e:  # noqa: BLE001
-        print(f"[runner] env-profile jump: episode length skipped: "
-              f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
-    if train:
+
+    if shared.get("zero_velocity_commands"):
+        try:
+            twist = (getattr(env_cfg, "commands", None) or {}).get("twist")
+            if twist is not None:
+                ranges = getattr(twist, "ranges", None)
+                for f in ("lin_vel_x", "lin_vel_y", "ang_vel_z"):
+                    if ranges is not None and hasattr(ranges, f):
+                        setattr(ranges, f, (0.0, 0.0))
+                # heading must be None (not (0,0)) — UniformVelocityCommand
+                # rejects ANY truthy heading range when heading_command=False
+                # (caught live: first loop-4 E2E launch, 2026-07-01).
+                if ranges is not None and hasattr(ranges, "heading"):
+                    ranges.heading = None
+                for f, v in (("rel_standing_envs", 1.0),
+                             ("rel_heading_envs", 0.0),
+                             ("rel_forward_envs", 0.0),
+                             ("heading_command", False)):
+                    if hasattr(twist, f):
+                        setattr(twist, f, v)
+                applied.append("commands:twist→zero/standing")
+        except Exception as e:  # noqa: BLE001 — never break a run
+            _skip("command zeroing", e)
+        # Coupled by construction: the command curriculum RE-WIDENS the
+        # zeroed ranges mid-training, silently undoing the zeroing.
+        try:
+            cur = getattr(env_cfg, "curriculum", None)
+            if isinstance(cur, dict) and cur.pop("command_vel", None) is not None:
+                applied.append("curriculum:command_vel→removed")
+        except Exception as e:  # noqa: BLE001
+            _skip("curriculum trim", e)
+
+    # Push events: the train section may override the shared setting
+    # (e.g. robustness pushes during training only).
+    push = train_sec.get("push_events", shared.get("push_events"))
+    if isinstance(push, dict):
+        try:
+            events = getattr(env_cfg, "events", None)
+            if isinstance(events, dict) and "push_robot" in events:
+                if not push.get("enabled", True):
+                    events.pop("push_robot")
+                    applied.append("events:push_robot→removed")
+                else:
+                    term = events["push_robot"]
+                    iv = push.get("interval_s")
+                    if iv is not None and hasattr(term, "interval_range_s"):
+                        term.interval_range_s = (float(iv[0]), float(iv[1]))
+                    params = getattr(term, "params", None)
+                    vr = (params or {}).get("velocity_range")
+                    if isinstance(vr, dict):
+                        lin = push.get("linear_mps")
+                        if lin is not None:
+                            for ax in ("x", "y", "z"):
+                                if ax in vr:
+                                    vr[ax] = (-float(lin), float(lin))
+                        ang = push.get("angular_radps")
+                        if ang is not None:
+                            for ax in ("roll", "pitch", "yaw"):
+                                if ax in vr:
+                                    vr[ax] = (-float(ang), float(ang))
+                    applied.append("events:push_robot→retuned")
+        except Exception as e:  # noqa: BLE001
+            _skip("push_robot", e)
+
+    if shared.get("orientation_termination_deg") is not None:
+        try:
+            term = (getattr(env_cfg, "terminations", None) or {}).get("fell_over")
+            params = getattr(term, "params", None)
+            if isinstance(params, dict) and "limit_angle" in params:
+                deg = float(shared["orientation_termination_deg"])
+                params["limit_angle"] = math.radians(deg)
+                applied.append(f"terminations:fell_over→{deg:g}deg")
+        except Exception as e:  # noqa: BLE001
+            _skip("fell_over relax", e)
+
+    if shared.get("episode_length_s") is not None:
+        try:
+            if hasattr(env_cfg, "episode_length_s"):
+                env_cfg.episode_length_s = float(shared["episode_length_s"])
+                applied.append(f"episode_length_s→{env_cfg.episode_length_s:g}")
+        except Exception as e:  # noqa: BLE001
+            _skip("episode length", e)
+
+    # ── train-only curricula (skipped entirely when train=False) ──────
+    rsi_z = train_sec.get("reset_height_offset_m")
+    rsi_vz = train_sec.get("reset_vertical_velocity_mps")
+    rsi_vxy = train_sec.get("reset_horizontal_velocity_mps")
+    if rsi_z is not None or rsi_vz is not None or rsi_vxy is not None:
         try:
             reset = (getattr(env_cfg, "events", None) or {}).get("reset_base")
             params = getattr(reset, "params", None)
             if isinstance(params, dict) and isinstance(
                     params.get("pose_range"), dict):
-                params["pose_range"]["z"] = (0.0, 0.40)
-                vr = params.get("velocity_range")
-                if not isinstance(vr, dict):
-                    vr = {}
-                    params["velocity_range"] = vr
-                vr["z"] = (-0.5, 2.0)
-                applied.append("reset_base→RSI(z+0.0-0.40m, vz-0.5..+2.0)")
+                if rsi_z is not None:
+                    params["pose_range"]["z"] = (float(rsi_z[0]), float(rsi_z[1]))
+                if rsi_vz is not None or rsi_vxy is not None:
+                    vr = params.get("velocity_range")
+                    if not isinstance(vr, dict):
+                        vr = {}
+                        params["velocity_range"] = vr
+                    if rsi_vz is not None:
+                        vr["z"] = (float(rsi_vz[0]), float(rsi_vz[1]))
+                    if rsi_vxy is not None:
+                        vr["x"] = (float(rsi_vxy[0]), float(rsi_vxy[1]))
+                        vr["y"] = (float(rsi_vxy[0]), float(rsi_vxy[1]))
+                applied.append("reset_base→RSI")
         except Exception as e:  # noqa: BLE001
-            print(f"[runner] env-profile jump: RSI reset skipped: "
-                  f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
-        # RSI's other half — DeepMimic pairs reference-state starts with
-        # EARLY TERMINATION off the recoverable manifold, or the data
-        # distribution is dominated by wherever failed episodes settle.
-        # Measured (tuck-jump iters 19-20): every shaping term started
-        # strong under RSI starts and DECAYED to ~0 as PPO converged to
-        # a floor-SIT — an orientation-UPRIGHT basin no bad_orientation
-        # termination can cut (torso vertical while base sits at
-        # 0.14 m). Terminate on base height < 0.30 m instead: the
-        # sit/crash basin lives at 0.14-0.25 m, the deepest legitimate
-        # jump crouch stays above ~0.35 m, and a fall spends 1-2 s of
-        # live fall-penalty before sinking past it (the penalty signal
-        # still lands; the following 8 s of floor data no longer
-        # exists). TRAIN-ONLY like the RSI starts — evaluation keeps
-        # honest full episodes from standing.
+            _skip("RSI reset", e)
+
+    jp = train_sec.get("reset_joint_position_offset_rad")
+    jv = train_sec.get("reset_joint_velocity_radps")
+    if jp is not None or jv is not None:
+        try:
+            reset = (getattr(env_cfg, "events", None) or {}).get(
+                "reset_robot_joints")
+            params = getattr(reset, "params", None)
+            if isinstance(params, dict):
+                if jp is not None and "position_range" in params:
+                    params["position_range"] = (float(jp[0]), float(jp[1]))
+                if jv is not None and "velocity_range" in params:
+                    params["velocity_range"] = (float(jv[0]), float(jv[1]))
+                applied.append("reset_robot_joints→randomized")
+        except Exception as e:  # noqa: BLE001
+            _skip("joint reset", e)
+
+    fr = train_sec.get("friction_range")
+    if fr is not None:
+        try:
+            ev = (getattr(env_cfg, "events", None) or {}).get("foot_friction")
+            params = getattr(ev, "params", None)
+            if isinstance(params, dict) and "ranges" in params:
+                params["ranges"] = (float(fr[0]), float(fr[1]))
+                applied.append(f"events:foot_friction→({fr[0]:g},{fr[1]:g})")
+        except Exception as e:  # noqa: BLE001
+            _skip("friction randomization", e)
+
+    sunk = train_sec.get("min_base_height_termination_m")
+    if sunk is not None:
+        # Early termination off the recoverable manifold — RSI's required
+        # other half (DeepMimic pairing; measured tuck-jump iters 19-20:
+        # RSI without it converges to the floor basin). TRAIN-ONLY by
+        # schema position — evaluation keeps honest full episodes.
         try:
             terms = getattr(env_cfg, "terminations", None)
             if isinstance(terms, dict):
@@ -603,37 +657,62 @@ def _apply_env_profile(env_cfg: Any, profile: str, *, train: bool = True) -> Non
                 )
                 terms["sunk"] = TerminationTermCfg(
                     func=root_height_below_minimum,
-                    params={"minimum_height": 0.30},
+                    params={"minimum_height": float(sunk)},
                 )
-                applied.append("terminations:+sunk(base<0.30m)")
+                applied.append(f"terminations:+sunk(base<{float(sunk):g}m)")
         except Exception as e:  # noqa: BLE001
-            print(f"[runner] env-profile jump: sunk termination skipped: "
-                  f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
-    print(f"[runner] env-profile jump applied (train={train}): {applied}",
+            _skip("sunk termination", e)
+
+    print(f"[runner] env-spec applied (train={train}): {applied}",
           file=sys.stderr, flush=True)
 
 
-def _apply_rl_profile(rl_cfg: Any, profile: str) -> None:
-    """§RSI companion (2026-07-04): explosive-motion PPO adjustment for
-    the jump profile — entropy_coef ×2 (0.01 → 0.02 on the G1 task).
-    RL_SCULPTOR_AUDIT §1 (research foundations): explosive single-burst
-    skills need higher early exploration than walking defaults or the
-    policy collapses into the nearest safe basin before ever sampling a
-    launch; doubling the entropy bonus is the standard legged-gym-family
-    adjustment and stays well below destabilizing values (~0.05+).
-    Train-time only (the caller); defensive on cfg-shape drift."""
-    if profile != "jump":
+def _apply_rl_spec(rl_cfg: Any, spec: "dict | None") -> None:
+    """PPO exploration adjustment from the env spec's train section —
+    `entropy_coef_scale` multiplies the task's default entropy bonus
+    (explosive single-burst skills need higher early exploration than
+    walking defaults; see the audit doc §1). Train-time only (the
+    caller); defensive on cfg-shape drift."""
+    if not spec:
+        return
+    scale = (spec.get("train") or {}).get("entropy_coef_scale")
+    if scale is None:
         return
     try:
         algo = getattr(rl_cfg, "algorithm", None)
         cur = getattr(algo, "entropy_coef", None)
         if isinstance(cur, (int, float)) and cur > 0:
-            algo.entropy_coef = float(cur) * 2.0
-            print(f"[runner] rl-profile jump: entropy_coef {cur} → "
+            algo.entropy_coef = float(cur) * float(scale)
+            print(f"[runner] rl-spec: entropy_coef {cur} → "
                   f"{algo.entropy_coef}", file=sys.stderr, flush=True)
     except Exception as e:  # noqa: BLE001 — never break a run
-        print(f"[runner] rl-profile jump skipped: {type(e).__name__}: {e}",
+        print(f"[runner] rl-spec skipped: {type(e).__name__}: {e}",
               file=sys.stderr, flush=True)
+
+
+def _apply_env_profile(env_cfg: Any, profile: str, *, train: bool = True) -> None:
+    """Named-preset entry point: resolve `profile` to its env-spec
+    instance and route through the general applier. Kept as the seam
+    the profile tests pin — the jump preset MUST stay byte-equivalent
+    to the retired hardcoded implementation."""
+    if not profile or profile == "default":
+        return
+    if profile != "jump":
+        print(f"[runner] env-profile {profile!r} unknown — ignored",
+              file=sys.stderr, flush=True)
+        return
+    from sculptor.env_spec import jump_preset_spec
+
+    _apply_env_spec(env_cfg, jump_preset_spec(), train=train)
+
+
+def _apply_rl_profile(rl_cfg: Any, profile: str) -> None:
+    """Named-preset entry point for the PPO side — see _apply_env_profile."""
+    if profile != "jump":
+        return
+    from sculptor.env_spec import jump_preset_spec
+
+    _apply_rl_spec(rl_cfg, jump_preset_spec())
 
 
 def _cmd_train(args: argparse.Namespace) -> None:
@@ -646,9 +725,11 @@ def _cmd_train(args: argparse.Namespace) -> None:
 
     env_cfg = load_env_cfg(args.task_id)
     env_cfg.scene.num_envs = args.num_envs
-    # §RL_SCULPTOR_AUDIT §4.4: goal-class env alignment (default "" → no-op).
-    # train=True adds the RSI reset curriculum (§gap #7).
-    _apply_env_profile(env_cfg, getattr(args, "env_profile", ""), train=True)
+    # §RL_SCULPTOR_AUDIT: per-project env spec (--env-spec file wins over
+    # a named --env-profile preset; neither → task defaults, no-op).
+    # train=True additionally applies the train-only curricula section.
+    env_spec = _resolve_env_spec(args)
+    _apply_env_spec(env_cfg, env_spec, train=True)
     # §actuator-limit enforcement — flag-gated (default OFF → no-op). MUST run on
     # the TRAIN env too (not just rollout) so the policy trains against the same
     # velocity-limited physics it is later evaluated under (no train/rollout mismatch).
@@ -704,9 +785,9 @@ def _cmd_train(args: argparse.Namespace) -> None:
 
     rl_cfg = load_rl_cfg(args.task_id)
     rl_cfg.max_iterations = args.max_iterations
-    # §RSI companion: explosive-motion PPO adjustment (entropy ×2 for
-    # the jump profile). Train-time only — rollout never optimizes.
-    _apply_rl_profile(rl_cfg, getattr(args, "env_profile", ""))
+    # PPO exploration from the env spec's train section (e.g.
+    # entropy_coef_scale). Train-time only — rollout never optimizes.
+    _apply_rl_spec(rl_cfg, env_spec)
 
     agent_cfg_dict = _cfg_to_dict(rl_cfg)
 
@@ -1190,13 +1271,15 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
 
     env_cfg = load_env_cfg(args.task_id)
     env_cfg.scene.num_envs = num_envs
-    # §RL_SCULPTOR_AUDIT §4.4: SAME profile as train — a policy trained with
-    # zero commands / no pushes must be evaluated under that distribution,
-    # and the metric arrays must see the un-truncated fall dynamics.
-    # train=False: NO RSI here — evaluation starts from standing (the true
-    # task), or the metric's upright_start / return-to-start-height view
-    # would be corrupted by mid-air spawns.
-    _apply_env_profile(env_cfg, getattr(args, "env_profile", ""), train=False)
+    # §RL_SCULPTOR_AUDIT: SAME spec as train, SHARED section only — a
+    # policy trained with zero commands / no pushes must be evaluated
+    # under that distribution, and the metric arrays must see the
+    # un-truncated fall dynamics. train=False: the train-only curricula
+    # (RSI resets, sunk termination, domain randomization) NEVER apply
+    # here — evaluation starts from the honest task state, or the
+    # metric's view (upright_start / return-to-start-height) would be
+    # corrupted by mid-air spawns.
+    _apply_env_spec(env_cfg, _resolve_env_spec(args), train=False)
     # §Ship 35: textured floor in the rendered rollout (cosmetic, guarded).
     _apply_ground_texture(env_cfg)
     # §actuator-limit enforcement — flag-gated (default OFF). Same swap as TRAIN so
@@ -1812,6 +1895,14 @@ def main() -> None:
         ),
     )
     p_train.add_argument(
+        "--env-spec", default="",
+        help=(
+            "path to a per-project env spec JSON (sculptor.env_spec "
+            "schema). Wins over --env-profile. shared section applies "
+            "to train AND rollout; train section is train-only."
+        ),
+    )
+    p_train.add_argument(
         "--load-pretrained-policy", default=None,
         help=(
             "§Ship 15: path to a prior rsl_rl checkpoint (e.g., "
@@ -1838,8 +1929,9 @@ def main() -> None:
     # §Ship-7: advanced override for frame decimation (1 = every step).
     # Default 0 means "pick automatically to cap at 500 captured frames".
     p_roll.add_argument("--render-every", type=int, default=0)
-    # §RL_SCULPTOR_AUDIT §4.4: must match the train-side profile.
+    # §RL_SCULPTOR_AUDIT §4.4: must match the train-side spec/profile.
     p_roll.add_argument("--env-profile", default="")
+    p_roll.add_argument("--env-spec", default="")
 
     p_probe = sub.add_parser("vram-probe")
     p_probe.add_argument("--task-id", required=True)

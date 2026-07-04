@@ -268,6 +268,16 @@ class MjlabAdapter(SculptorAdapter):
     # `_mjlab_runner._apply_env_profile`). Applied to BOTH train and
     # rollout so the policy is evaluated under its training distribution.
     env_profile: str = ""
+    # §RL_SCULPTOR_AUDIT (env generalization): path to a per-project env
+    # spec JSON (sculptor.env_spec schema — the general successor to the
+    # named profiles). Wins over `env_profile` when both are set. The
+    # spec's `shared` section applies to BOTH train and rollout; its
+    # `train` section (RSI resets, sunk termination, domain
+    # randomization, PPO exploration) is train-only. Injected by
+    # `load_adapter` when the project has `env/current.json`; the FILE's
+    # content is re-read by each train/rollout subprocess, so the sculpt
+    # loop can iterate the train section between iterations.
+    env_spec_path: str = ""
     rsl_rl_kwargs: dict[str, Any] = field(default_factory=dict)
     # Optional override for the schema keys emitted by the reward-term
     # state snapshot. If empty, derived from task_id via _schema_for_task.
@@ -313,6 +323,15 @@ class MjlabAdapter(SculptorAdapter):
                 f"env_profile={self.env_profile!r} is not supported; "
                 "known profiles: '' (task defaults), 'jump'."
             )
+        # §env generalization: fail fast on a missing/invalid env spec —
+        # never spawn a GPU subprocess that would die (or half-apply)
+        # under a bad spec. Content is validated again at each
+        # subprocess spawn (the file is re-read so the loop can iterate
+        # it); this init check catches config errors at load time.
+        if self.env_spec_path:
+            from sculptor.env_spec import load_env_spec
+
+            load_env_spec(self.env_spec_path)  # raises ValueError
 
         # num_envs autocap on smaller VRAM. Skipped when remote dispatch
         # is enabled — the local VRAM probe measures the wrong GPU (the
@@ -612,7 +631,9 @@ class MjlabAdapter(SculptorAdapter):
             else list(_schema_for_task(self.task_id).keys())
         )
         cmd += ["--schema-keys", ",".join(effective_schema_keys)]
-        if self.env_profile:
+        if self.env_spec_path:
+            cmd += ["--env-spec", str(Path(self.env_spec_path).resolve())]
+        elif self.env_profile:
             cmd += ["--env-profile", self.env_profile]
 
         executor = self._remote_executor()
@@ -634,9 +655,12 @@ class MjlabAdapter(SculptorAdapter):
                 "--device": runner_device,
                 "--schema-keys": ",".join(effective_schema_keys),
             }
-            if self.env_profile:
+            if not self.env_spec_path and self.env_profile:
                 options["--env-profile"] = self.env_profile
             input_paths: dict[str, Path] = {}
+            if self.env_spec_path:
+                # File input → synced to the pod at its mirror path.
+                input_paths["--env-spec"] = Path(self.env_spec_path).resolve()
             aux_dirs: tuple[Path, ...] = ()
             if reward_module_path is not None:
                 input_paths["--reward-module-path"] = Path(reward_module_path)
@@ -763,7 +787,9 @@ class MjlabAdapter(SculptorAdapter):
             cmd += ["--render-every", str(int(render_every))]
         if fps is not None:
             cmd += ["--fps", str(float(fps))]
-        if self.env_profile:
+        if self.env_spec_path:
+            cmd += ["--env-spec", str(Path(self.env_spec_path).resolve())]
+        elif self.env_profile:
             cmd += ["--env-profile", self.env_profile]
 
         executor = self._remote_executor()
@@ -788,12 +814,16 @@ class MjlabAdapter(SculptorAdapter):
                 options["--render-every"] = str(int(render_every))
             if fps is not None:
                 options["--fps"] = str(float(fps))
-            if self.env_profile:
+            if not self.env_spec_path and self.env_profile:
                 options["--env-profile"] = self.env_profile
+            rollout_inputs: dict[str, Path] = {
+                "--checkpoint-path": checkpoint_path}
+            if self.env_spec_path:
+                rollout_inputs["--env-spec"] = Path(self.env_spec_path).resolve()
             job = RunnerJob(
                 subcommand="rollout",
                 options=options,
-                input_paths={"--checkpoint-path": checkpoint_path},
+                input_paths=rollout_inputs,
                 output_dir=output_dir,
                 # Ordered: rollout.mp4 last — sculpt.py's rollout-skip
                 # check requires all three non-empty, so a partial sync

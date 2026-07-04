@@ -264,6 +264,55 @@ treated as regressions.
 Format per entry: date — what changed (files:lines) — why — evidence
 (tests/smoke) — commit.
 
+### 2026-07-04 — env generalization 1/4: general per-project env spec
+(overnight loop, mandate: environment adapts itself to each prompt —
+no hand-picked presets)
+
+- **Plan for the arc (increments 1-4)**: (1) declarative validated
+  env-spec schema + general runner applier, jump profile becomes a
+  preset INSTANCE; (2) goal-conditioned spec generation at first run
+  (mirrors the loop-4c seed-reward pattern: bounded LLM calls, full
+  validation, safe fallback); (3) diagnoser proposes train-section
+  spec deltas between iterations (rides the existing grounded-diagnose
+  call; versioned env/v<N>.json + current.json, participates in
+  keep-best/revert); (4) tuck-jump migrated to the general mechanism +
+  E2E on GPU. Firm constraints honored throughout: firewall untouched
+  (metric_calibration.py / metric_validate.py / gate×min composition);
+  train-only curricula never touch rollout evaluation.
+- **What (increment 1)**: new `sculptor/env_spec.py` — schema v1 with
+  TWO SCOPES: `shared` (applied to train AND rollout, frozen per run:
+  command zeroing, orientation-termination angle, episode length, push
+  events) and `train` (train-only curricula, the diagnoser-iterable
+  surface: RSI reset height/velocity offsets, joint-reset ranges,
+  friction randomization, sunk-height termination, entropy scale, push
+  overrides). Strict validation: unknown keys REJECTED (a typo fails
+  loudly, not silently no-ops), hard per-field bounds, well-ordered
+  ranges, all violations reported at once (complete generator
+  feedback). `ITERABLE_TRAIN_KEYS` = the diagnoser's whole editable
+  surface — shared keys are structurally not iterable, which IS the
+  metric-comparability guarantee. `_mjlab_runner._apply_env_spec` +
+  `_apply_rl_spec`: general appliers replacing the hardcoded jump
+  body; `_apply_env_profile`/`_apply_rl_profile` remain as preset
+  resolvers routing "jump" → `jump_preset_spec()` → the general path
+  (byte-equivalent mutations, parity-tested). New `--env-spec <path>`
+  on both runner subcommands (wins over `--env-profile`); adapter
+  field `env_spec_path` (validated fail-fast at __init__, threaded
+  local + remote via RunnerJob input_paths for pod sync);
+  `load_adapter` injects `env/current.json` by convention when present
+  (signature-introspected like the `[remote]` plumb). Values are
+  robot-agnostic by construction: reset offsets are ADDED to the
+  robot's default reset state (mjlab reset_root_state_uniform
+  semantics); absolute thresholds (sunk height) are per-project DATA
+  chosen by the generator, bounded by the validator.
+- **Firewall**: metric_calibration.py / metric_validate.py untouched.
+  Rollout applies the shared section ONLY — RSI/sunk/DR structurally
+  cannot reach evaluation (schema-level section split + applier
+  train=False gate + tests pinning both).
+- **Verified**: new tests/test_env_spec.py (30) + existing
+  test_env_profile.py (10, unmodified — pins jump parity through the
+  general path). Full suite 1051 passed / 1 skipped (was 1021/1
+  baseline this session).
+
 ### 2026-07-01 — loop 1: dense progress channel + tie-deadlock fix
 - **What**: `sculptor/sculpt.py` — `IterOutcome.progress/steer_progress`,
   `SculptRunResult.progress_history/best_progress`, phase-3b extraction
