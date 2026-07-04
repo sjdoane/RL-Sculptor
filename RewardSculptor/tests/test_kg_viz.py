@@ -95,7 +95,7 @@ def test_build_kg_html_highlights_provenance_nodes(kg, tmp_path: Path):
     # The 'removed_term' entry has still_active=False, so it doesn't count.
     assert result.n_active_nodes == 2
     body = out.read_text(encoding="utf-8")
-    assert "2 node(s) highlighted in gold" in body
+    assert "2 node(s) in gold" in body
     # Active-reason text appears in the tooltip somewhere.
     assert "appears in provenance.json" in body
 
@@ -105,7 +105,7 @@ def test_build_kg_html_handles_empty_provenance(kg, tmp_path: Path):
     result = build_kg_html(kg, out, provenance={})
     assert result.n_active_nodes == 0
     body = out.read_text(encoding="utf-8")
-    assert "0 node(s) highlighted in gold" in body
+    assert "OWN run experience" in body   # zero-active note (html-escaped ')
 
 
 def test_build_kg_html_no_provenance_arg(kg, tmp_path: Path):
