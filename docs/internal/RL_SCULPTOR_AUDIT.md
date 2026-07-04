@@ -575,6 +575,55 @@ Runs 2-4 (iters 14-18; `sculpt_loop4d_*` / `sculpt_loop4e_*` /
   0.1); best-by-gen_002 behavior remains iter 10 (progress 0.0196);
   rewards v15-v19 on disk with v16/v19 never trained.
 
+### 2026-07-03 — loop 5: the KG actually learns from every run
+(commits ed70d76, 4ca55ae, f1a20f8, 99d0a2e)
+
+Full-system audit of the knowledge graph + run-learning memory, driven
+by the question "does every run make the system smarter?" Answer
+before this loop: NO, for three separately-measured reasons.
+
+- **5a — ONE graph (ed70d76).** `default_db_path()` preferred a
+  cwd-relative `kg/graph.db` when present. Measured harm: the entire
+  loop-4 E2E (launched from the repo dir) diagnosed against a
+  6-technique repo-local stub while the shared graph held 94 papers /
+  493 techniques, and recorded its run cases into that silo. Removed
+  the legacy preference (env overrides intact); new `sculpt kg merge`
+  (additive-only — a legacy stub can never clobber a richer shared
+  node; source renamed .merged); both strays on this box folded in →
+  shared graph 1523 nodes / 1608 edges / 546 embeddings. tests/conftest
+  now isolates every test onto a temp DB (previously a bare
+  `SculptorKG()` in a test could write the developer's real graph).
+- **5b — case memory with content (4ca55ae).** All 17 tuck-jump cases
+  were verdict-neutral/unknown noise: attribution used only the
+  completion-gated fitness (0.0 throughout) and recorded only "N
+  edit(s)". Now: lexicographic (fitness, dense-progress) attribution —
+  the same key the loop selects on, so "decrease stance_weight;
+  increase launch_weight → regressed (progress −0.0196)" is exactly
+  what the memory says; RunCase carries the applied-edit identities +
+  a ≤6-float behavior signature (apex/launch/return/upright/tuck/
+  drift) distinguishing stand-farm from tumble-bounce; the CASE MEMORY
+  block now ALSO feeds the edit REWRITER prompt (where magnitudes are
+  chosen); blind runs record too. The 17 thin cases were deleted and
+  re-recorded rich from on-disk artifacts (diagnosis.json + recomputed
+  gen_002 details, revert/run-boundary attribution respected).
+- **5c — the graph is worth looking at (f1a20f8).** RunCase nodes were
+  gray unlabeled blobs; now teal diamonds "iter N ✓/✗" with
+  verdict-colored borders + full tooltips. Scale-adaptive rendering
+  for the 1.5k-node unified graph: improvedLayout off (the quadratic
+  Kamada-Kawai placement froze the tab — caught live), edge labels →
+  hover tooltips, forceAtlas2, physics frozen after stabilization
+  (measured: 36.6 ms full redraw, zero idle). New in-page controls
+  (also in the UI GraphModal iframe): debounced search with animated
+  focus + Enter-cycling, per-kind visibility filters with counts,
+  re-run-layout button. Verified functionally in a live browser.
+- **5d — visible in the UI (99d0a2e).** KGStats models predate the
+  case memory; the Settings shared-KG card now shows "Run experience"
+  (run_cases) alongside papers/techniques.
+- **Verified**: sculptor suite 1013 passed / 1 skipped; UI backend 362
+  passed; frontend typecheck clean. Live retrieval check: a tuck-jump
+  query returns the rich cases at sim 0.72-0.86 with edit identities +
+  behavior signatures in the rendered prompt block.
+
 ### 2026-07-01 — loop 4c: goal-conditioned starter seed (gap #4)
 - **What**: `sculptor/sculpt.py` — `_is_pristine_starter_reward`
   (REWARD_SPEC-signature detection of the untouched `sculpt init`
