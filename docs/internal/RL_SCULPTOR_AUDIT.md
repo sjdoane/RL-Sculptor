@@ -311,7 +311,49 @@ no hand-picked presets)
 - **Verified**: new tests/test_env_spec.py (30) + existing
   test_env_profile.py (10, unmodified — pins jump parity through the
   general path). Full suite 1051 passed / 1 skipped (was 1021/1
-  baseline this session).
+  baseline this session). Commit 73c3adc.
+
+### 2026-07-04 — env generalization 2/4: goal-conditioned env-spec
+generation at first run
+
+- **What**: `sculptor/env_gen.py` + `sculptor/prompts/gen_env_spec.md`
+  — the behavior goal → validated env spec, mirroring the seed-reward
+  discipline: pydantic-constrained structured output
+  (`messages.parse`, same as diagnose), the REAL `validate_env_spec`
+  gate on the result, exactly ONE retry carrying the complete
+  violation list, hard bounds rendered into the prompt FROM THE
+  VALIDATOR'S OWN TABLES (single source of truth — prompt and gate
+  cannot drift). The prompt encodes the audit's measured task-env
+  lessons as a decision checklist (commands vs in-place skills; the
+  70°-termination dead-fallen-signal + termination-as-escape pair;
+  episode length ~ skill timescale; RSI **always paired** with
+  min-base-height termination — the iters-19-20 lesson; pushes vs
+  single-burst skills; friction; entropy for explosive skills) with
+  omit-means-default semantics, and states the metric-firewall
+  separation explicitly. Project-side versioning in `env_spec.py`:
+  `env/v<N>.json` + `current.json` (exact copy, identity in
+  meta.version — no symlinks; survives WSL/Windows + pod sync),
+  `write_env_spec_version` validates BEFORE persisting,
+  `repoint_env_current` for keep-best/revert (wired in 3/4).
+  `sculpt.py _maybe_seed_env_spec`: runs once per project at first
+  run, ONLY when no env spec exists AND config.toml made no explicit
+  env choice (env_profile / env_spec_path respected — tuck-jump's
+  `jump` profile is NOT silently overridden; its migration is
+  increment 4, deliberate); activates the spec for the current run by
+  setting adapter.env_spec_path (later runs pick it up via the
+  load_adapter convention). Every failure path (no key, network,
+  double validation failure) emits `env_spec_failed` and proceeds on
+  task defaults. Events: env_spec_started/generated/failed.
+- **Cost bound**: ≤2 LLM calls once per project lifetime; zero on
+  every subsequent run.
+- **Firewall**: metric files untouched; generation writes ONLY
+  `env/` — it cannot touch metrics, rewards, or the loop's selection
+  machinery.
+- **Verified**: tests/test_env_gen.py (15: happy path, omit-dropping,
+  retry-with-full-violations, double-failure raise, parse-error-as-
+  attempt, versioning stamps/repoints/refuses-invalid, seed wiring:
+  skip-when-exists / respect-explicit-config / failure-keeps-defaults
+  / stub-client E2E). Full suite 1066 passed / 1 skipped.
 
 ### 2026-07-01 — loop 1: dense progress channel + tie-deadlock fix
 - **What**: `sculptor/sculpt.py` — `IterOutcome.progress/steer_progress`,

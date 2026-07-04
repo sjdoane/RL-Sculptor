@@ -1915,6 +1915,11 @@ def sculpt_run(
     # keeps the template and proceeds). Skipped on resume (start_iter > 0
     # implies real rewards exist) and in dry-run (no LLM).
     if start_iter == 0 and not dry_run and str(behavior_goal or "").strip():
+        # §env generalization 2/4: goal-conditioned env spec first (the
+        # environment the seeded reward will train in), then the seeded
+        # reward. Both are bounded-LLM, once-per-project, fail-open.
+        _maybe_seed_env_spec(
+            project=project, behavior_goal=behavior_goal, adapter=adapter)
         _maybe_seed_goal_reward(
             rewards_dir=rewards_dir, behavior_goal=behavior_goal,
             adapter=adapter, kg_store=kg_store)
@@ -2423,6 +2428,73 @@ def _maybe_seed_goal_reward(
           f"(replaces the constant alive-bonus template for iter 0)",
           flush=True)
     return new_path
+
+def _maybe_seed_env_spec(
+    *,
+    project: Path,
+    behavior_goal: str,
+    adapter: SculptorAdapter,
+    client=None,
+) -> Optional[Path]:
+    """§RL_SCULPTOR_AUDIT (env generalization 2/4): goal-conditioned
+    environment adaptation at first run. When the project has no env
+    spec yet — and made no explicit env choice in config.toml (an
+    `env_profile` or `env_spec_path` there is respected, not
+    overridden) — generate one from the behavior goal via the bounded
+    `sculptor.env_gen` pipeline (≤2 LLM calls, full validate_env_spec
+    gate) and activate it for THIS run by pointing the already-built
+    adapter at `env/current.json`. Subsequent runs pick it up via the
+    `load_adapter` convention. ANY failure (no API key, network,
+    validation twice) logs + emits `env_spec_failed` and the run
+    proceeds on task defaults — never blocks.
+
+    Same rationale as `_maybe_seed_goal_reward` for running at first
+    run rather than `sculpt init`: project creation stays instant and
+    API-key-free; the first run already spends LLM calls."""
+    if not hasattr(adapter, "env_spec_path"):
+        return None   # adapter family without env-spec support (gym_sb3)
+    if getattr(adapter, "env_spec_path", "") or getattr(
+            adapter, "env_profile", ""):
+        return None   # explicit config choice stands
+    env_dir = project / "env"
+    if (env_dir / "current.json").is_file():
+        return None   # already generated (or hand-written)
+    task_id = str(getattr(adapter, "task_id", ""))
+    _emit_event({
+        "type": "env_spec_started",
+        "behavior_goal": str(behavior_goal)[:200],
+        "task_id": task_id,
+    })
+    try:
+        from sculptor.env_gen import generate_env_spec
+        from sculptor.env_spec import write_env_spec_version
+
+        spec = generate_env_spec(
+            behavior_goal=behavior_goal, task_id=task_id, client=client)
+        path = write_env_spec_version(env_dir, spec)
+    except Exception as e:  # noqa: BLE001 — generation is best-effort
+        sys.stderr.write(
+            f"[sculpt] env-spec generation failed "
+            f"({type(e).__name__}: {e}) — training on task defaults.\n")
+        _emit_event({
+            "type": "env_spec_failed",
+            "error": f"{type(e).__name__}: {e}",
+        })
+        return None
+    adapter.env_spec_path = str((env_dir / "current.json").resolve())
+    _emit_event({
+        "type": "env_spec_generated",
+        "version": path.stem,
+        "shared": spec.get("shared") or {},
+        "train": spec.get("train") or {},
+        "reasoning": (spec.get("meta") or {}).get("reasoning", "")[:500],
+    })
+    print(f"[sculpt] goal-conditioned env spec written: env/{path.name} "
+          f"(shared={sorted((spec.get('shared') or {}).keys())}, "
+          f"train={sorted((spec.get('train') or {}).keys())})",
+          flush=True)
+    return path
+
 
 _CONFIG_TEMPLATE = '''\
 [target]

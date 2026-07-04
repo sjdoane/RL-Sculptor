@@ -204,6 +204,73 @@ def load_env_spec(path: Path | str) -> dict:
     return spec
 
 
+# ── Project-side versioning ────────────────────────────────────────────────
+# A project's env specs live in `<project>/env/` as `v<N>.json` plus
+# `current.json` — an exact COPY of the active version (its identity is
+# `meta.version` inside the file; no symlinks, so the layout survives
+# Windows/WSL round-trips and remote pod sync). Mirrors the rewards/
+# convention: monotonic version numbers, current repointed by
+# keep-best/revert.
+
+def find_latest_env_version(env_dir: Path) -> int:
+    """Highest existing v<N>.json number, or -1 when none exist."""
+    latest = -1
+    if Path(env_dir).is_dir():
+        for p in Path(env_dir).glob("v*.json"):
+            stem = p.stem
+            if stem.startswith("v") and stem[1:].isdigit():
+                latest = max(latest, int(stem[1:]))
+    return latest
+
+
+def write_env_spec_version(env_dir: Path, spec: dict) -> Path:
+    """Persist `spec` as the next v<N>.json and repoint current.json at
+    it. Validates FIRST — an invalid spec is never written to disk.
+    `meta.version` is stamped into the file (the identity current.json
+    carries)."""
+    env_dir = Path(env_dir)
+    to_write = json.loads(json.dumps(spec))   # deep copy, JSON-clean
+    errors = validate_env_spec(to_write)
+    if errors:
+        raise ValueError(
+            "refusing to persist invalid env spec:\n  - "
+            + "\n  - ".join(errors))
+    n = find_latest_env_version(env_dir) + 1
+    meta = to_write.setdefault("meta", {})
+    meta["version"] = f"v{n}"
+    env_dir.mkdir(parents=True, exist_ok=True)
+    path = env_dir / f"v{n}.json"
+    text = json.dumps(to_write, indent=2, sort_keys=True)
+    path.write_text(text, encoding="utf-8")
+    tmp = env_dir / "current.json.tmp"
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(env_dir / "current.json")
+    return path
+
+
+def read_current_env_spec(env_dir: Path) -> "dict | None":
+    """The active spec (validated), or None when the project has no env
+    spec. An invalid current.json raises — never silently train under
+    a half-readable spec."""
+    p = Path(env_dir) / "current.json"
+    if not p.is_file():
+        return None
+    return load_env_spec(p)
+
+
+def repoint_env_current(env_dir: Path, version: str) -> Path:
+    """Repoint current.json at an existing v<N>.json (keep-best /
+    revert). Raises if the version file is missing or invalid."""
+    env_dir = Path(env_dir)
+    src = env_dir / f"{version}.json"
+    spec = load_env_spec(src)   # raises on missing/invalid
+    text = json.dumps(spec, indent=2, sort_keys=True)
+    tmp = env_dir / "current.json.tmp"
+    tmp.write_text(text, encoding="utf-8")
+    tmp.replace(env_dir / "current.json")
+    return env_dir / "current.json"
+
+
 def jump_preset_spec() -> dict:
     """The former hardcoded ``env_profile="jump"`` expressed as an
     instance of the general mechanism. Values byte-match the retired
