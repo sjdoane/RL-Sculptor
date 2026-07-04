@@ -20,6 +20,7 @@ build/
 
 # Sculptor local data
 kg/graph.db
+kg/graph.db.merged
 kg/pdfs/
 runs/
 
