@@ -217,6 +217,13 @@ def _current_reward_target(rewards_dir: Path) -> Optional[Path]:
     loop recorded reward_path_trained=v16 AND applied the diagnosis to
     v16's source — so keep-best then kept a never-trained file). Every
     consumer of "what trained this iter" must resolve through here.
+
+    Accepts BOTH generated formats — this module's
+    `_LATEST = _HERE / 'v<n>.py'` AND the UI backend's
+    `_TARGET = Path(__file__).resolve().parent / 'v<n>.py'`
+    (reward-sculptor-ui reward_store.py; ported from the parallel
+    worktree fix, which caught that a UI-rewritten current.py would
+    otherwise silently fall back to the buggy latest-version behavior).
     Returns None when current.py is missing or hand-edited into an
     unrecognizable shape (callers fall back to the latest version)."""
     current = rewards_dir / "current.py"
@@ -226,10 +233,10 @@ def _current_reward_target(rewards_dir: Path) -> Optional[Path]:
         text = current.read_text(encoding="utf-8")
     except OSError:
         return None
-    m = re.search(r"_LATEST\s*=\s*_HERE\s*/\s*['\"]([^'\"]+)['\"]", text)
+    m = re.search(r"/\s*(['\"])(v\d+\.py)\1", text)
     if not m:
         return None
-    target = rewards_dir / m.group(1)
+    target = rewards_dir / m.group(2)
     return target if target.is_file() else None
 
 
