@@ -583,6 +583,43 @@ Runs 2-4 (iters 14-18; `sculpt_loop4d_*` / `sculpt_loop4e_*` /
   0.1); best-by-gen_002 behavior remains iter 10 (progress 0.0196);
   rewards v15-v19 on disk with v16/v19 never trained.
 
+### 2026-07-04 — loop 6: gap #7 built — RSI + early termination +
+explosive-motion PPO (commits c645094, b882dbe; run-boundary fix
+23dd83f/cfd13c9 landed the same day)
+
+- **What shipped**: jump profile now adds, TRAIN-ONLY (rollout keeps
+  honest standing starts so the metric's view is unchanged):
+  (a) DeepMimic-style RSI resets — episodes start uniformly stance→
+  +0.40 m with vz ∈ [−0.5, +2.0] m/s (verified live: 66 % of envs
+  spawn airborne); (b) `sunk` termination at base < 0.30 m — RSI's
+  required other half: the floor-sit basin is orientation-UPRIGHT so
+  no bad_orientation cut can touch it, and without it ~9 s of every
+  crashed episode is floor data that dominates PPO's distribution
+  (measured iters 19-20: all shaping terms opened strong under RSI
+  then decayed to ~0 as the policy converged to the sit);
+  (c) entropy_coef ×2 (0.01→0.02) per §1's explosive-motion PPO note.
+  Plus `sculpt run --init-policy` (warm-start chaining on the CLI).
+- **E2E evidence (iters 19-22, ~4 GPU-h, all under the fixed
+  run-boundary bookkeeping — iter events now name the true trained
+  version)**:
+  | iter | trained | behavior | key numbers |
+  |---|---|---|---|
+  | 19 | v14 (RSI, no sunk) | floor-roll | upright 0.05, median z 0.14 |
+  | 20 | v20 (LLM: dense height term, stance ramp from floor) | floor-sit again | shaping terms 0.33-0.50 first window → decayed ~0 |
+  | 21 | v20 (RSI + sunk + entropy×2) | **FIRST CONTACT-VERIFIED FLIGHT in project history**: 3/6 envs, apexes 1.24-1.39 m, frac_launched 0.83, tuck 0.45 rad — but tumbling (upright 0.07) | flight frames [29,26,0,0,31,0]; GT g1_jump apex 0.60 m |
+  | 22 | v22 (LLM: tuck gated on both-feet-airborne — the dive-farm read straight off the sunk-termination episode stats) | upright DEEP CROUCH — the launch posture: median z 0.45, upright 1.00, tuck 0.70 rad, ends upright at start height | no flight this iter; c_upright_end 0.98 |
+- **Reading**: the degenerate attractors are being eliminated in
+  sequence (sit → roll → tumble → dive-farm), and the surviving
+  behaviors now live on the jump manifold (real 0.5 m flights at iter
+  21; the upright pre-jump crouch at iter 22). The remaining composition
+  problem — upright + flight + landing in ONE policy — is now a reward-
+  balance question the loop is actively iterating (v22's known hole:
+  height_progress pays tumbling flight; the case memory carries that
+  lesson). Dense progress is still gated at 0 by the min-composition
+  (correct: no single iter satisfies all requirements yet).
+- **Honest negative**: RSI WITHOUT the early termination made things
+  worse (iters 19-20) — recorded so the pairing is never split again.
+
 ### 2026-07-03 — loop 5: the KG actually learns from every run
 (commits ed70d76, 4ca55ae, f1a20f8, 99d0a2e)
 
