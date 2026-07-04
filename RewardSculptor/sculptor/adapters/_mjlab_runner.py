@@ -595,9 +595,11 @@ def _apply_env_spec(env_cfg: Any, spec: "dict | None", *,
         try:
             reset = (getattr(env_cfg, "events", None) or {}).get("reset_base")
             params = getattr(reset, "params", None)
-            if isinstance(params, dict) and isinstance(
-                    params.get("pose_range"), dict):
-                if rsi_z is not None:
+            if isinstance(params, dict):
+                # Height offset needs pose_range; the velocity keys only
+                # write velocity_range — don't couple them to it.
+                if rsi_z is not None and isinstance(
+                        params.get("pose_range"), dict):
                     params["pose_range"]["z"] = (float(rsi_z[0]), float(rsi_z[1]))
                 if rsi_vz is not None or rsi_vxy is not None:
                     vr = params.get("velocity_range")
@@ -663,7 +665,35 @@ def _apply_env_spec(env_cfg: Any, spec: "dict | None", *,
         except Exception as e:  # noqa: BLE001
             _skip("sunk termination", e)
 
-    print(f"[runner] env-spec applied (train={train}): {applied}",
+    # Dead-knob disclosure: a spec key this task's cfg can't honor is a
+    # silent no-op by the never-break-a-run contract — but the sculpt
+    # loop's diagnoser iterates on these knobs, so it must be able to
+    # SEE that one is dead (e.g. friction_range on a task without a
+    # foot_friction event) instead of retuning it blindly forever.
+    requested: list[str] = []
+    if shared.get("zero_velocity_commands"):
+        requested.append("commands:twist→zero/standing")
+    if isinstance(push, dict):
+        requested.append(
+            "events:push_robot→removed" if not push.get("enabled", True)
+            else "events:push_robot→retuned")
+    if shared.get("orientation_termination_deg") is not None:
+        requested.append("terminations:fell_over")
+    if shared.get("episode_length_s") is not None:
+        requested.append("episode_length_s")
+    if rsi_z is not None or rsi_vz is not None or rsi_vxy is not None:
+        requested.append("reset_base→RSI")
+    if jp is not None or jv is not None:
+        requested.append("reset_robot_joints→randomized")
+    if fr is not None:
+        requested.append("events:foot_friction")
+    if sunk is not None:
+        requested.append("terminations:+sunk")
+    dead = [r for r in requested
+            if not any(a.startswith(r.split("(")[0].split("→")[0])
+                       for a in applied)]
+    print(f"[runner] env-spec applied (train={train}): {applied}"
+          + (f"; NOT APPLICABLE on this task cfg: {dead}" if dead else ""),
           file=sys.stderr, flush=True)
 
 

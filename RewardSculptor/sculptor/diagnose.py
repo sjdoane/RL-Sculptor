@@ -109,8 +109,43 @@ class _ProposedEditModel(BaseModel):
     )
 
 
+#: §env generalization 3/4 — the diagnoser's env-adaptation surface is
+#: EXACTLY the env spec's train section (shared/eval keys are frozen per
+#: run and structurally absent here). Single-sourced from env_spec so
+#: the constraint can't drift.
+from sculptor.env_spec import ITERABLE_TRAIN_KEYS as _ENV_ITERABLE_KEYS
+
+_EnvParamLit = Literal[tuple(sorted(_ENV_ITERABLE_KEYS))]  # type: ignore[valid-type]
+
+
+class _ProposedEnvEditModel(BaseModel):
+    parameter: _EnvParamLit = Field(
+        description=(
+            "TRAIN-ONLY env-spec parameter to change (the # ENV_SPEC "
+            "block lists current values + hard bounds)."
+        )
+    )
+    new_value: str = Field(
+        description=(
+            "New value as stringified JSON matching the parameter's "
+            "shape: a number (e.g. \"0.25\") or a [lo, hi] pair "
+            "(e.g. \"[0.0, 0.4]\")."
+        )
+    )
+    rationale: str
+
+
 class _GroundedModel(BaseModel):
     proposed_edits: list[_ProposedEditModel] = Field(default_factory=list)
+    proposed_env_edits: list[_ProposedEnvEditModel] = Field(
+        default_factory=list,
+        description=(
+            "0-2 changes to the TRAINING-ONLY environment curriculum "
+            "(only when the user message contains an # ENV_SPEC block "
+            "and the diagnosed failure is a training-distribution "
+            "pathology; empty otherwise)."
+        ),
+    )
     confidence: float = Field(ge=0.0, le=1.0)
 
 
@@ -129,10 +164,26 @@ class ProposedEdit:
 
 
 @dataclass
+class ProposedEnvEdit:
+    """§env generalization 3/4: a diagnoser-proposed change to the env
+    spec's TRAIN section — the environment-curriculum counterpart of
+    ProposedEdit. Applied (validated + bounded) by
+    `env_spec.apply_env_edits`, takes effect the NEXT iteration."""
+
+    parameter: str
+    new_value: str
+    rationale: str
+
+    def to_dict(self) -> dict:
+        return dataclasses.asdict(self)
+
+
+@dataclass
 class Diagnosis:
     failure_modes: list[str]
     evidence: str
     proposed_edits: list[ProposedEdit] = field(default_factory=list)
+    proposed_env_edits: list[ProposedEnvEdit] = field(default_factory=list)
     literature_context: list[TechniqueMatch] = field(default_factory=list)
     confidence: float = 0.0
     iter_dir: str | None = None
@@ -143,6 +194,8 @@ class Diagnosis:
             "failure_modes": list(self.failure_modes),
             "evidence": self.evidence,
             "proposed_edits": [e.to_dict() for e in self.proposed_edits],
+            "proposed_env_edits": [
+                e.to_dict() for e in self.proposed_env_edits],
             "literature_context": [
                 {
                     "technique": m.technique.name,
@@ -496,6 +549,39 @@ def _build_preliminary_user_content(
     return content
 
 
+def _render_env_spec_block(env_spec: dict | None) -> str:
+    """§env generalization 3/4: the # ENV_SPEC block for the grounded
+    prompt — current train-section values, the editable parameter set
+    with hard bounds (single-sourced from the validator's tables), and
+    the frozen shared section for context. Empty string when no spec is
+    active (the model is instructed to emit no env edits then)."""
+    if not isinstance(env_spec, dict):
+        return ""
+    from sculptor.env_spec import _TRAIN_RANGES, _TRAIN_SCALARS
+
+    train = env_spec.get("train") or {}
+    shared = env_spec.get("shared") or {}
+    bounds_lines = [
+        f"  {k}: scalar within [{lo:g}, {hi:g}]"
+        for k, (lo, hi) in sorted(_TRAIN_SCALARS.items())
+    ] + [
+        f"  {k}: [lo, hi] pair, both within [{lo:g}, {hi:g}]"
+        for k, (lo, hi) in sorted(_TRAIN_RANGES.items())
+    ]
+    return (
+        "# ENV_SPEC\n"
+        "# The project's environment spec. `train` is the TRAINING-ONLY\n"
+        "# curriculum surface you may edit via proposed_env_edits (takes\n"
+        "# effect next iteration; evaluation rollouts NEVER see it).\n"
+        "# `shared` defines the evaluated task — frozen for this run.\n"
+        f"active version: {(env_spec.get('meta') or {}).get('version', '?')}\n"
+        f"train (editable): {json.dumps(train, sort_keys=True)}\n"
+        f"shared (frozen): {json.dumps(shared, sort_keys=True)}\n"
+        "editable parameters + hard bounds:\n"
+        + "\n".join(bounds_lines) + "\n\n"
+    )
+
+
 def _build_grounded_user_content(
     behavior_goal: str,
     reward_spec: dict,
@@ -506,6 +592,7 @@ def _build_grounded_user_content(
     kg_context: str,
     training_feedback: dict | None = None,
     realism_audit: dict | None = None,
+    env_spec: dict | None = None,
 ) -> str:
     feedback_block = ""
     formatted = _format_training_feedback(training_feedback or {})
@@ -532,6 +619,7 @@ def _build_grounded_user_content(
         f"# metrics.json\n{json.dumps(metrics, indent=2, sort_keys=True, default=str)}\n\n"
         f"{feedback_block}"
         f"{realism_block}"
+        f"{_render_env_spec_block(env_spec)}"
         f"# behavior.json\n{json.dumps(behavior, indent=2, sort_keys=True, default=str)}\n\n"
         f"# REWARD_CONTRACT\n{contract_text}\n\n"
         f"# PRELIMINARY DIAGNOSIS\n"
@@ -631,6 +719,21 @@ def diagnose(
     contract = adapter.reward_contract()
     contract_text = _render_reward_contract(contract)
 
+    # §env generalization 3/4: the active env spec (adapter carries the
+    # path — set explicitly in config.toml or injected by load_adapter
+    # from env/current.json). None → no # ENV_SPEC block, and any env
+    # edits the model hallucinates are dropped at packing below.
+    env_spec: dict | None = None
+    _env_spec_path = str(getattr(adapter, "env_spec_path", "") or "")
+    if _env_spec_path:
+        try:
+            from sculptor.env_spec import load_env_spec
+
+            env_spec = load_env_spec(_env_spec_path)
+        except Exception as e:  # noqa: BLE001 — context is advisory here
+            print(f"[diagnose] env spec unreadable ({e}) — no env-edit "
+                  "surface this iter.", file=sys.stderr, flush=True)
+
     # 3. Anthropic client.
     if client is None:
         import anthropic
@@ -728,6 +831,7 @@ def diagnose(
             ),
             training_feedback=training_feedback,
             realism_audit=realism_audit,
+            env_spec=env_spec,
         )
         grounded: _GroundedModel = _parse_with_retry(
             client, model_cls=_GroundedModel,
@@ -779,9 +883,31 @@ def diagnose(
                 rationale=e.rationale,
                 suggested_value=e.suggested_value,
                 paper_refs=list(e.paper_refs),
+                # BUG FIX (2026-07-04, found during env generalization
+                # 3/4): the flag was silently dropped here since Ship 48
+                # — deferred edits lost requires_env_extension on the
+                # REAL path, so apply_edits tried (and failed) their
+                # ungrounded formulas and the never-silent
+                # requires_env_extension event could not fire.
+                requires_env_extension=bool(e.requires_env_extension),
             )
             for e in grounded.proposed_edits
         ],
+        # §env generalization 3/4: env-curriculum proposals. Only
+        # meaningful when a spec is active — without one there is no
+        # # ENV_SPEC block, and anything the model emitted anyway is
+        # dropped here (no surface to apply it to).
+        proposed_env_edits=(
+            [
+                ProposedEnvEdit(
+                    parameter=str(e.parameter),
+                    new_value=str(e.new_value),
+                    rationale=e.rationale,
+                )
+                for e in grounded.proposed_env_edits
+            ]
+            if env_spec is not None else []
+        ),
         literature_context=kg_matches,
         confidence=min(preliminary.confidence, grounded.confidence),
         iter_dir=str(iter_dir),

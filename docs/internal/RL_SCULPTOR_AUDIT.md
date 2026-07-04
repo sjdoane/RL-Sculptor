@@ -354,6 +354,64 @@ generation at first run
   attempt, versioning stamps/repoints/refuses-invalid, seed wiring:
   skip-when-exists / respect-explicit-config / failure-keeps-defaults
   / stub-client E2E). Full suite 1066 passed / 1 skipped.
+  Commit 907c92e. Increment-1 adversarial verification (subagent):
+  pass-with-findings — EXECUTABLE byte-parity of retired profile vs
+  general path over 27 cfg shapes; no CRITICAL/HIGH. Actionable
+  findings folded into 3/4: remote threading test-pinned, dead-knob
+  disclosure, velocity-reset/pose_range decouple, env_spec_path
+  pinned absolute at adapter init.
+
+### 2026-07-04 — env generalization 3/4: the diagnoser iterates the
+environment between training iterations
+
+- **What**: the env spec's TRAIN section is now a first-class
+  iteration surface beside the reward, with the same loop mechanics:
+  * `diagnose.py`: `_ProposedEnvEditModel` — `parameter` is a pydantic
+    Literal over `ITERABLE_TRAIN_KEYS` (single-sourced from
+    env_spec.py, so the shared/eval section is UNREPRESENTABLE in the
+    model's output, enforced at parse time); grounded prompt gains an
+    `# ENV_SPEC` block (current train values + bounds from the
+    validator's own tables + frozen shared for context) only when a
+    spec is active; `Diagnosis.proposed_env_edits`; packing drops env
+    edits when no spec is active.
+  * `diagnose_grounded.md`: env-adaptation rules — 0-2 edits, only
+    for training-DISTRIBUTION pathologies (floor-data domination →
+    sunk height; unexperienced target phase → RSI ranges, always
+    paired; exploration collapse → entropy; surface overfit →
+    friction), explicit "training only — cannot make scoring easier".
+  * `env_spec.apply_env_edits`: per-edit gates (train-key allowlist →
+    JSON parse → full-spec validation with single-edit rollback);
+    valid edits persist as the next v<N>.json (meta: source=diagnoser,
+    parent, rationale), rejects carry reasons back to the event
+    stream. Applied AFTER this iter's reward edit in `_run_one_iter`;
+    takes effect NEXT iteration — exactly the reward-edit lifecycle.
+  * keep-best/revert now operates on the (reward, env) PAIR:
+    `IterOutcome.env_spec_trained` + `SculptRunResult.best_env_spec`;
+    on strict regression the next iter reverts env/current.json to the
+    best iter's version alongside the reward (`env_spec_reverted`
+    event); end-of-run best selection repoints both
+    (`best_env_spec_selected`). Env edits ride `applied_edits`
+    ("env: …") so KG case memory records environment lessons.
+  * Events: `env_spec_updated` (applied + rejected with reasons),
+    `env_spec_reverted`, `best_env_spec_selected`.
+- **BUG FIX (pre-existing, found here)**: since Ship 48,
+  `diagnose()`'s pydantic→dataclass packing DROPPED
+  `requires_env_extension` — on the real path every deferred edit lost
+  its flag, so apply_edits burned retries on ungrounded formulas and
+  the never-silent `requires_env_extension` event could not fire.
+  One-line fix + regression test through the real diagnose() path.
+- **Cost**: zero extra LLM calls — env edits ride the existing
+  grounded-diagnose call.
+- **Firewall**: metric files untouched. Env edits are structurally
+  train-only (Literal + allowlist + validator section split); eval env
+  frozen per run ⇒ metric comparability preserved.
+- **Verified**: tests/test_env_edits.py (13: apply gates incl.
+  shared-key rejection + mixed batches + dict edits; # ENV_SPEC block;
+  real-path packing with/without active spec; the
+  requires_env_extension regression; loop threading — env revert
+  version on regression, end-of-run repoint; remote-dispatch sync pin
+  from the increment-1 verifier finding). Full suite 1079 passed / 1
+  skipped.
 
 ### 2026-07-01 — loop 1: dense progress channel + tie-deadlock fix
 - **What**: `sculptor/sculpt.py` — `IterOutcome.progress/steer_progress`,

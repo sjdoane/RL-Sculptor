@@ -271,6 +271,78 @@ def repoint_env_current(env_dir: Path, version: str) -> Path:
     return env_dir / "current.json"
 
 
+def apply_env_edits(env_dir: Path, edits: list) -> dict:
+    """§env generalization 3/4: apply diagnoser-proposed TRAIN-section
+    edits to the project's active env spec — the environment counterpart
+    of reward apply_edits, with the same validation discipline.
+
+    Each edit is `{parameter, new_value, rationale}` (duck-typed:
+    attributes or dict keys). Per-edit gates: parameter must be in
+    ITERABLE_TRAIN_KEYS (the shared/eval section is structurally
+    unreachable), new_value must parse as JSON, and the spec must
+    validate AFTER the edit (bounds + shape) — a failing edit is
+    rejected with its reasons and the remaining edits still apply.
+    Net changes are persisted as the next v<N>.json (current.json
+    repointed); no valid edits → nothing written.
+
+    Returns {"applied": [...], "rejected": [(param, reason)], "new_version":
+    "v<N>" | None, "path": str | None}."""
+    result: dict[str, Any] = {
+        "applied": [], "rejected": [], "new_version": None, "path": None}
+
+    def _field(e: Any, name: str) -> Any:
+        if isinstance(e, dict):
+            return e.get(name)
+        return getattr(e, name, None)
+
+    spec = read_current_env_spec(env_dir)   # raises on invalid current
+    if spec is None:
+        for e in edits:
+            result["rejected"].append(
+                (str(_field(e, "parameter")), "no active env spec"))
+        return result
+
+    work = json.loads(json.dumps(spec))
+    changed = False
+    for e in edits:
+        param = str(_field(e, "parameter") or "")
+        raw = _field(e, "new_value")
+        if param not in ITERABLE_TRAIN_KEYS:
+            result["rejected"].append(
+                (param, f"not an iterable train-section parameter "
+                        f"(allowed: {sorted(ITERABLE_TRAIN_KEYS)})"))
+            continue
+        try:
+            value = json.loads(str(raw))
+        except (TypeError, ValueError):
+            result["rejected"].append(
+                (param, f"new_value {raw!r} is not valid JSON"))
+            continue
+        prev_train = json.loads(json.dumps(work.get("train") or {}))
+        work.setdefault("train", {})[param] = value
+        errors = validate_env_spec(work)
+        if errors:
+            work["train"] = prev_train   # revert just this edit
+            result["rejected"].append((param, "; ".join(errors)))
+            continue
+        result["applied"].append(f"{param}={json.dumps(value)}")
+        changed = True
+
+    if changed:
+        meta = work.setdefault("meta", {})
+        meta["source"] = "diagnoser"
+        meta["parent"] = (spec.get("meta") or {}).get("version")
+        rationales = [
+            " ".join(str(_field(e, "rationale") or "").split())[:200]
+            for e in edits
+        ]
+        meta["rationale"] = " | ".join(r for r in rationales if r)[:1000]
+        path = write_env_spec_version(env_dir, work)
+        result["new_version"] = path.stem
+        result["path"] = str(path)
+    return result
+
+
 def jump_preset_spec() -> dict:
     """The former hardcoded ``env_profile="jump"`` expressed as an
     instance of the general mechanism. Values byte-match the retired

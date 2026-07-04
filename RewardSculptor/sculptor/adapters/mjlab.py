@@ -332,6 +332,10 @@ class MjlabAdapter(SculptorAdapter):
             from sculptor.env_spec import load_env_spec
 
             load_env_spec(self.env_spec_path)  # raises ValueError
+            # Pin the path NOW — a relative path resolved again at
+            # spawn time (after a cwd change) could validate one file
+            # and hand the subprocess another.
+            self.env_spec_path = str(Path(self.env_spec_path).resolve())
 
         # num_envs autocap on smaller VRAM. Skipped when remote dispatch
         # is enabled — the local VRAM probe measures the wrong GPU (the

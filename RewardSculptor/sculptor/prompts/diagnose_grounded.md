@@ -83,5 +83,32 @@ Rules:
         policies to 16-18-step episodes. To suppress an exploit, prefer
         capping/zeroing the exploited term under the exploit condition
         over adding a new negative term.
+  - ENVIRONMENT ADAPTATION (`proposed_env_edits`): when the user message
+    contains an `# ENV_SPEC` block, you may ALSO propose 0-2 changes to
+    the TRAINING-ONLY environment curriculum — the same iteration surface
+    as reward edits, but for the training distribution itself. Use them
+    when the diagnosed failure is a training-DISTRIBUTION pathology
+    rather than a reward-shape one:
+      * episodes dominated by floor/crash aftermath data → raise
+        `min_base_height_termination_m` (early termination off the
+        recoverable manifold);
+      * the policy never experiences the target phase → widen
+        `reset_height_offset_m` / `reset_vertical_velocity_mps`
+        (reference-state initialization — ALWAYS paired with a
+        `min_base_height_termination_m`, or floor data dominates);
+      * exploration collapse on an explosive skill (shaping terms opened
+        then decayed to ~0) → raise `entropy_coef_scale`;
+      * overfit to one surface / friction lottery noise → widen or
+        tighten `friction_range`;
+      * the skill must work from varied poses → widen
+        `reset_joint_position_offset_rad`.
+    `new_value` is stringified JSON matching the parameter's shape (a
+    number like "0.3" or a pair like "[0.0, 0.4]") and must lie inside
+    the hard bounds the block lists — out-of-bounds edits are rejected
+    by the validator, wasting the proposal. These edits change TRAINING
+    ONLY: evaluation rollouts and the metric's view of the task are
+    frozen, so an env edit can never make scoring easier — do not
+    propose one for that purpose. When no `# ENV_SPEC` block is present,
+    emit an empty `proposed_env_edits` list.
   - Return strict JSON matching the schema. Float `suggested_value`s must
     be stringified (e.g., "0.25").

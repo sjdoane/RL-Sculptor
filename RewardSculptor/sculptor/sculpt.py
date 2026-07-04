@@ -124,6 +124,12 @@ class IterOutcome:
     #: The metric's physical component breakdown for this iter's rollout
     #: (same dict the diagnoser sees) — the case-memory behavior signature.
     fitness_components: dict[str, Any] | None = None
+    #: §env generalization 3/4: the env-spec version (e.g. "v2") ACTIVE
+    #: while this iter trained — the environment half of the (reward, env)
+    #: training config that `fitness` measured. None when the project has
+    #: no env spec. Keep-best/revert repoint env/current.json to the best
+    #: iter's version, exactly like the reward flow.
+    env_spec_trained: str | None = None
 
 
 @dataclass
@@ -145,6 +151,10 @@ class SculptRunResult:
     #: below the completion gate).
     progress_history: list[float] = field(default_factory=list)
     best_progress: float | None = None
+    #: §env generalization 3/4: env-spec version active at the best iter
+    #: (the environment half of what best_fitness measured); None when the
+    #: project has no env spec.
+    best_env_spec: str | None = None
 
     @property
     def final_reward_path(self) -> Path | None:
@@ -1028,6 +1038,7 @@ def _run_one_iter(
     prior_fitness: Optional[dict] = None,
     fitness_observe_only: bool = False,
     revert_base: Optional[Path] = None,
+    env_revert_version: Optional[str] = None,
     human_note: Optional[str] = None,
 ) -> IterOutcome:
     iter_cfg = cfg.get("iteration", {}) or {}
@@ -1102,6 +1113,48 @@ def _run_one_iter(
             "iter": iter_index,
             "reverted_to": Path(revert_base).name,
         })
+
+    # §env generalization 3/4: the environment half of the revert — when
+    # the prior iter strictly regressed, train under the env spec the
+    # best iter used, not a possibly-degraded diagnoser edit. Reverting
+    # only the reward while keeping a bad env change would attribute the
+    # env's damage to the reward. Best-effort: a missing/invalid target
+    # version logs and trains under the current spec.
+    env_dir = project / "env"
+    if revert_base is not None and env_revert_version:
+        try:
+            from sculptor.env_spec import (
+                read_current_env_spec, repoint_env_current)
+
+            _cur = read_current_env_spec(env_dir)
+            _cur_v = ((_cur.get("meta") or {}).get("version")
+                      if _cur else None)
+            if _cur_v != env_revert_version:
+                repoint_env_current(env_dir, env_revert_version)
+                _emit_event({
+                    "type": "env_spec_reverted",
+                    "iter": iter_index,
+                    "reverted_to": env_revert_version,
+                })
+        except Exception as e:  # noqa: BLE001 — revert is best-effort
+            sys.stderr.write(
+                f"[sculpt] iter {iter_index}: env-spec revert to "
+                f"{env_revert_version} failed ({type(e).__name__}: {e}) — "
+                f"training under the current spec\n")
+
+    # Record the env-spec version this iter actually trains under (the
+    # environment half of the training config; None = no spec/defaults).
+    env_spec_trained: Optional[str] = None
+    try:
+        from sculptor.env_spec import read_current_env_spec as _read_env
+
+        _cur_spec = _read_env(env_dir)
+        if _cur_spec:
+            env_spec_trained = (_cur_spec.get("meta") or {}).get("version")
+    except Exception as e:  # noqa: BLE001 — invalid spec fails later, loudly
+        sys.stderr.write(
+            f"[sculpt] iter {iter_index}: env spec unreadable "
+            f"({type(e).__name__}: {e})\n")
 
     # §2026-07-04: report the version that actually TRAINS this iter
     # (current.py's target / the revert base), not the disk maximum —
@@ -1431,6 +1484,34 @@ def _run_one_iter(
             f"[sculpt] iter {iter_index}: apply_edits skipped — "
             f"{type(e).__name__}: {e}\n")
 
+    # §env generalization 3/4: apply diagnoser-proposed env-curriculum
+    # edits (train section only, validated + bounded) — the environment
+    # counterpart of apply_edits above. The new spec version takes
+    # effect NEXT iter's training, exactly like the reward edit. Skipped
+    # in dry-run (no LLM ran) and when the diagnosis proposed none.
+    applied_env_edits: list[str] = []
+    if diagnosis.proposed_env_edits and not dry_run:
+        try:
+            from sculptor.env_spec import apply_env_edits
+
+            env_edit_result = apply_env_edits(
+                env_dir, diagnosis.proposed_env_edits)
+            applied_env_edits = list(env_edit_result.get("applied") or [])
+            _emit_event({
+                "type": "env_spec_updated",
+                "iter": iter_index,
+                "new_version": env_edit_result.get("new_version"),
+                "applied": applied_env_edits,
+                "rejected": [
+                    {"parameter": p, "reason": r[:300]}
+                    for p, r in (env_edit_result.get("rejected") or [])
+                ],
+            })
+        except Exception as e:  # noqa: BLE001 — env edits are advisory
+            sys.stderr.write(
+                f"[sculpt] iter {iter_index}: env-spec edits skipped — "
+                f"{type(e).__name__}: {e}\n")
+
     # §Ship 54-pre (#12): surface the partition-gate report (written by
     # apply_edits into iter_dir/partition_gate.json when a metric steers and
     # there is something to flag) on the loop path, which passes no on_event.
@@ -1564,8 +1645,13 @@ def _run_one_iter(
             f"{getattr(e, 'operation', '?')} {getattr(e, 'target_term', '?')}"
             for e in diagnosis.proposed_edits
             if not getattr(e, "requires_env_extension", False)
+        ] + [
+            # §env generalization 3/4: env-curriculum edits ride the same
+            # case-memory channel so the KG learns environment lessons too.
+            f"env: {a}" for a in applied_env_edits
         ],
         fitness_components=fitness_components,
+        env_spec_trained=env_spec_trained,
     )
 
 
@@ -1951,6 +2037,11 @@ def sculpt_run(
                 ),
                 fitness_observe_only=fitness_observe_only,
                 revert_base=revert_base,
+                # §env generalization 3/4: revert the env spec alongside
+                # the reward — the (reward, env) pair is the training
+                # config keep-best/revert operates on.
+                env_revert_version=(
+                    result.best_env_spec if revert_base is not None else None),
                 human_note=pending_human_note,
             )
             elapsed = time.time() - t0
@@ -1991,6 +2082,10 @@ def sculpt_run(
                     result.best_fitness = steer
                     result.best_progress = sprog
                     result.best_fitness_iter = outcome.iter_index
+                    # §env generalization 3/4: the env half of the best
+                    # (reward, env) training config — revert + end-of-run
+                    # selection restore BOTH together.
+                    result.best_env_spec = outcome.env_spec_trained
                     iters_since_best = 0
                 else:
                     iters_since_best += 1
@@ -2155,6 +2250,29 @@ def sculpt_run(
                     f"[sculpt] best-by-fitness current.py rewrite failed: "
                     f"{type(e).__name__}: {e}\n"
                 )
+        # §env generalization 3/4: keep the env half of the best training
+        # config too — repoint env/current.json at the best iter's spec
+        # version so the project resumes (and re-trains) under it.
+        if result.best_env_spec is not None:
+            try:
+                from sculptor.env_spec import (
+                    read_current_env_spec, repoint_env_current)
+
+                _env_dir = project / "env"
+                _cur = read_current_env_spec(_env_dir)
+                _cur_v = ((_cur.get("meta") or {}).get("version")
+                          if _cur else None)
+                if _cur_v != result.best_env_spec:
+                    repoint_env_current(_env_dir, result.best_env_spec)
+                    _emit_event({
+                        "type": "best_env_spec_selected",
+                        "iter": int(result.best_fitness_iter),
+                        "env_spec": result.best_env_spec,
+                    })
+            except Exception as e:  # noqa: BLE001 — selection is best-effort
+                sys.stderr.write(
+                    f"[sculpt] best env-spec repoint failed: "
+                    f"{type(e).__name__}: {e}\n")
 
     # §Ship 37: persist run-learnings to the KG case-memory so future
     # diagnoses can avoid repeating past mistakes ("the same failure can't
