@@ -332,6 +332,39 @@ def kg_stats(store: Optional[Path] = _STORE_OPT):
             typer.echo("    (none)")
 
 
+@kg_app.command("merge")
+def kg_merge(
+    source: Path = typer.Argument(
+        ..., exists=True, readable=True,
+        help="Path to a stray/legacy graph.db to merge INTO the shared KG."),
+    store: Optional[Path] = _STORE_OPT,
+    rename_source: bool = typer.Option(
+        True, "--rename-source/--keep-source",
+        help="After a successful merge, rename the source to "
+             "<name>.merged so it can never re-fragment the graph."),
+):
+    """Merge a stray per-directory KG into the shared graph (additive:
+    existing shared nodes are never overwritten; edges/embeddings dedupe).
+
+    Context: pre-2026-07-03 the default DB resolution preferred a
+    cwd-relative kg/graph.db, silently splitting papers/techniques/run
+    cases by launch directory. This command folds those strays back in.
+    """
+    from sculptor.kg.store import merge_stores
+
+    with _open_store(store) as kg:
+        counts = merge_stores(source, kg)
+    typer.echo(
+        f"merged {source} -> {kg.db_path}: "
+        f"+{counts['nodes']} nodes ({counts['nodes_skipped']} already "
+        f"present), +{counts['edges']} edges, "
+        f"+{counts['embeddings']} embeddings")
+    if rename_source:
+        target = source.with_suffix(source.suffix + ".merged")
+        source.rename(target)
+        typer.echo(f"source renamed to {target}")
+
+
 @kg_app.command("heal-stubs")
 def kg_heal_stubs(store: Optional[Path] = _STORE_OPT):
     """§7.7: re-ingest Paper nodes whose title is still `arxiv:XXXX.XXXXX`.

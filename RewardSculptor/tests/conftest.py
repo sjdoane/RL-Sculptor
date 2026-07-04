@@ -25,6 +25,23 @@ FIXTURES_DIR = Path(__file__).parent / "fixtures"
 GO1_CHECKPOINT_NAME = "go1_smoke_checkpoint.pt"
 
 
+@pytest.fixture(autouse=True)
+def _isolate_shared_kg(tmp_path_factory, monkeypatch):
+    """2026-07-03: the KG default is now ALWAYS the user-wide shared DB
+    (the cwd-legacy preference fragmented the graph and was removed).
+    Without isolation, any test that constructs `SculptorKG()` bare —
+    directly or via sculpt_run/diagnose — would read AND WRITE the
+    developer's real graph at ~/.local/share/sculptor/kg/graph.db.
+    Point every test at a per-test temp DB via the backend env alias;
+    tests that assert on env-resolution behavior delete these vars
+    themselves and are unaffected."""
+    monkeypatch.setenv(
+        "RS_KG_PATH",
+        str(tmp_path_factory.mktemp("kg_isolated") / "graph.db"),
+    )
+    monkeypatch.delenv("SCULPTOR_KG_PATH", raising=False)
+
+
 def pytest_addoption(parser: pytest.Parser) -> None:
     parser.addoption(
         "--regenerate-fixtures",

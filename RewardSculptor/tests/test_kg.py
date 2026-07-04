@@ -198,11 +198,13 @@ def test_default_db_path_respects_backend_alias(tmp_path, monkeypatch):
     assert default_db_path() == target.resolve()
 
 
-def test_default_db_path_prefers_legacy_cwd_db(tmp_path, monkeypatch):
-    """When no env var is set and a legacy <cwd>/kg/graph.db already
-    exists, default_db_path returns it (back-compat with pre-Phase-1
-    per-project DBs)."""
-    from sculptor.kg.store import default_db_path
+def test_default_db_path_ignores_legacy_cwd_db(tmp_path, monkeypatch, capsys):
+    """2026-07-03: a cwd-relative kg/graph.db is NO LONGER honored — the
+    back-compat preference fragmented the graph by launch directory (the
+    tuck-jump E2E diagnosed against a 6-technique stub while the shared
+    graph held 493 techniques). The shared path always wins; the stray
+    file just triggers a stderr pointer at `sculpt kg merge`."""
+    from sculptor.kg.store import default_db_path, shared_db_path
 
     monkeypatch.delenv("SCULPTOR_KG_PATH", raising=False)
     monkeypatch.delenv("RS_KG_PATH", raising=False)
@@ -212,7 +214,65 @@ def test_default_db_path_prefers_legacy_cwd_db(tmp_path, monkeypatch):
     legacy_db.write_bytes(b"SQLite format 3\x00" + b"\x00" * 100)
     monkeypatch.chdir(tmp_path)
 
-    assert default_db_path() == legacy_db.resolve()
+    assert default_db_path() == shared_db_path()
+    assert "sculpt kg merge" in capsys.readouterr().err
+
+
+def test_merge_stores_is_additive_and_never_clobbers(tmp_path):
+    """merge_stores copies missing nodes/edges/embeddings and NEVER
+    overwrites an existing destination node (a legacy stub must not
+    clobber the shared graph's richer node of the same id)."""
+    import numpy as np
+
+    from sculptor.kg.schema import Edge, FailureMode, Relation, RunCase
+    from sculptor.kg.store import SculptorKG, merge_stores
+
+    src = SculptorKG(tmp_path / "stray.db")
+    dst = SculptorKG(tmp_path / "shared.db")
+    try:
+        # dst holds the rich node; src holds a stub with the SAME id.
+        dst.add_node(FailureMode(
+            id="failure:static_equilibrium", name="static_equilibrium",
+            description="rich paper-derived description"))
+        src.add_node(FailureMode(
+            id="failure:static_equilibrium", name="static_equilibrium",
+            description="(diagnoser-flagged stub)"))
+        # src-only content.
+        case = RunCase(id="case:x", task="hop", symptom="stand-still")
+        src.add_node(case)
+        src.add_edge(Edge(src="case:x", dst="failure:static_equilibrium",
+                          relation=Relation.INSTANTIATES))
+        src.set_embedding("case:x", "test-model",
+                          np.ones(4, dtype=np.float32))
+        src.close()
+
+        counts = merge_stores(tmp_path / "stray.db", dst)
+        assert counts["nodes"] == 1                # only the case copied
+        assert counts["nodes_skipped"] == 1        # stub did NOT clobber
+        assert counts["edges"] == 1
+        assert counts["embeddings"] == 1
+        kept = dst.get_node("failure:static_equilibrium")
+        assert kept.description == "rich paper-derived description"
+        assert dst.has_node("case:x")
+        assert dst.has_embedding("case:x", "test-model")
+        # Idempotent: merging again adds nothing.
+        counts2 = merge_stores(tmp_path / "stray.db", dst)
+        assert counts2["nodes"] == 0 and counts2["edges"] == 0
+    finally:
+        dst.close()
+
+
+def test_merge_stores_rejects_self_merge(tmp_path):
+    import pytest as _pytest
+
+    from sculptor.kg.store import SculptorKG, merge_stores
+
+    dst = SculptorKG(tmp_path / "one.db")
+    try:
+        with _pytest.raises(ValueError, match="same database"):
+            merge_stores(tmp_path / "one.db", dst)
+    finally:
+        dst.close()
 
 
 def test_default_db_path_falls_back_to_shared(monkeypatch, tmp_path):

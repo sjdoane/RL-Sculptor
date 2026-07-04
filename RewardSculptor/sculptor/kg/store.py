@@ -66,18 +66,31 @@ def default_db_path() -> Path:
     Resolution order:
       1. `$SCULPTOR_KG_PATH` if set (legacy override).
       2. `$RS_KG_PATH` if set (backend alias used by the UI test harness).
-      3. A legacy `<cwd>/kg/graph.db` if one already exists on disk
-         (back-compat for users who ran pre-M7 `sculpt run` from inside
-         a project dir, which seeded a per-project DB).
-      4. The user-wide shared path: `~/.local/share/sculptor/kg/graph.db`.
+      3. The user-wide shared path: `~/.local/share/sculptor/kg/graph.db`.
+
+    A cwd-relative `<cwd>/kg/graph.db` is NO LONGER honored (removed
+    2026-07-03). The back-compat preference silently FRAGMENTED the
+    graph by launch directory: the 2026-07 tuck-jump E2E ran its
+    diagnoses against a 6-technique repo-local stub while the shared
+    graph held 493 techniques + the whole run-case memory — the
+    diagnoser was starved of 98 % of the KG and its cases were recorded
+    into a silo no other entry point would ever read. One graph, one
+    path; tests/CI isolate via the env vars.
     """
     env = os.environ.get(ENV_VAR) or os.environ.get(BACKEND_ENV_VAR)
     if env:
         return Path(env).expanduser().resolve()
     legacy = (Path.cwd() / DEFAULT_RELATIVE_DB_PATH).resolve()
-    if legacy.is_file():
-        return legacy
-    return shared_db_path()
+    shared = shared_db_path()
+    if legacy.is_file() and legacy != shared:
+        import sys
+        print(
+            f"[kg] ignoring legacy per-directory DB at {legacy} — using the "
+            f"shared graph at {shared}. Merge it with "
+            f"`sculpt kg merge {legacy}` (or delete it) to silence this.",
+            file=sys.stderr, flush=True,
+        )
+    return shared
 
 
 _SCHEMA_SQL = """
@@ -109,6 +122,61 @@ CREATE TABLE IF NOT EXISTS node_embeddings (
 );
 CREATE INDEX IF NOT EXISTS idx_embeddings_model ON node_embeddings(model);
 """
+
+
+def merge_stores(src_path: Path | str, dst: "SculptorKG") -> dict[str, int]:
+    """Merge a stray/legacy KG database INTO `dst` (the shared graph).
+
+    Additive-only, never destructive to `dst`:
+      * nodes copied ONLY when the id is absent in dst — a legacy stub
+        (e.g. a diagnoser-flagged FailureMode with a placeholder
+        description) must never clobber the shared graph's richer
+        paper-derived node of the same id;
+      * edges: INSERT OR IGNORE (composite PK dedupes);
+      * embeddings copied only when (node_id, model) is absent.
+
+    The source file is left untouched — the caller decides whether to
+    rename/delete it. Returns counts: {nodes, edges, embeddings,
+    nodes_skipped}."""
+    src_path = Path(src_path).expanduser().resolve()
+    if not src_path.is_file():
+        raise FileNotFoundError(src_path)
+    if src_path == dst.db_path:
+        raise ValueError("source and destination are the same database")
+    src = sqlite3.connect(str(src_path))
+    src.row_factory = sqlite3.Row
+    counts = {"nodes": 0, "edges": 0, "embeddings": 0, "nodes_skipped": 0}
+    try:
+        with dst._tx() as cx:
+            for row in src.execute("SELECT id, kind, data FROM nodes"):
+                cur = cx.execute(
+                    "INSERT OR IGNORE INTO nodes (id, kind, data) "
+                    "VALUES (?, ?, ?)",
+                    (row["id"], row["kind"], row["data"]))
+                if cur.rowcount:
+                    counts["nodes"] += 1
+                else:
+                    counts["nodes_skipped"] += 1
+            for row in src.execute(
+                    "SELECT src, dst, relation, data FROM edges"):
+                cur = cx.execute(
+                    "INSERT OR IGNORE INTO edges (src, dst, relation, data) "
+                    "VALUES (?, ?, ?, ?)",
+                    (row["src"], row["dst"], row["relation"], row["data"]))
+                counts["edges"] += int(cur.rowcount or 0)
+            for row in src.execute(
+                    "SELECT node_id, model, dim, vector, updated_at "
+                    "FROM node_embeddings"):
+                cur = cx.execute(
+                    "INSERT OR IGNORE INTO node_embeddings "
+                    "(node_id, model, dim, vector, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (row["node_id"], row["model"], row["dim"],
+                     row["vector"], row["updated_at"]))
+                counts["embeddings"] += int(cur.rowcount or 0)
+    finally:
+        src.close()
+    return counts
 
 
 class SculptorKG:
