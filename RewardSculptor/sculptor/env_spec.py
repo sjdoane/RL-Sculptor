@@ -332,6 +332,7 @@ def apply_env_edits(env_dir: Path, edits: list) -> dict:
 
     work = json.loads(json.dumps(spec))
     changed = False
+    applied_rationales: list[str] = []
     for e in edits:
         param = str(_field(e, "parameter") or "")
         raw = _field(e, "new_value")
@@ -346,7 +347,14 @@ def apply_env_edits(env_dir: Path, edits: list) -> dict:
             result["rejected"].append(
                 (param, f"new_value {raw!r} is not valid JSON"))
             continue
-        prev_train = json.loads(json.dumps(work.get("train") or {}))
+        train_now = work.get("train") or {}
+        if param in train_now and train_now[param] == value:
+            # A no-op must not burn a version number — and the diagnoser
+            # should hear that its edit changed nothing.
+            result["rejected"].append(
+                (param, f"no change — already {json.dumps(value)}"))
+            continue
+        prev_train = json.loads(json.dumps(train_now))
         work.setdefault("train", {})[param] = value
         errors = validate_env_spec(work)
         if errors:
@@ -354,17 +362,16 @@ def apply_env_edits(env_dir: Path, edits: list) -> dict:
             result["rejected"].append((param, "; ".join(errors)))
             continue
         result["applied"].append(f"{param}={json.dumps(value)}")
+        rationale = " ".join(str(_field(e, "rationale") or "").split())[:200]
+        if rationale:
+            applied_rationales.append(rationale)
         changed = True
 
     if changed:
         meta = work.setdefault("meta", {})
         meta["source"] = "diagnoser"
         meta["parent"] = (spec.get("meta") or {}).get("version")
-        rationales = [
-            " ".join(str(_field(e, "rationale") or "").split())[:200]
-            for e in edits
-        ]
-        meta["rationale"] = " | ".join(r for r in rationales if r)[:1000]
+        meta["rationale"] = " | ".join(applied_rationales)[:1000]
         path = write_env_spec_version(env_dir, work)
         result["new_version"] = path.stem
         result["path"] = str(path)

@@ -442,7 +442,35 @@ general mechanism + verifier-hardening + E2E
 - **E2E**: resumed sculpt run on tuck-jump (v22 base, gen_002 steer,
   fitness-patience 4) under the migrated spec — the diagnoser now
   holds the env-curriculum surface (# ENV_SPEC block) for the first
-  time. Evidence appended below as iterations complete.
+  time. Runner log iter 23 confirms the general path live:
+  `env-spec applied (train=True): [commands zeroing, curriculum pop,
+  push pop, fell_over 120°, ep 10 s, RSI, sunk 0.3 m]`. Evidence
+  appended below as iterations complete.
+- **Increment-3 adversarial verification** (subagent, commit f00d5f4):
+  pass-with-findings; BOTH firm constraints held against constructed
+  bypasses (injected-key JSON, 3-element ranges, Infinity, shared-key
+  edits — all rejected, nothing written; firewall diff empty). Fixed
+  from its findings (this commit):
+  * MEDIUM — dead-knob disclosure falsely marked RSI/joint-reset knobs
+    applied when the cfg couldn't honor them (my velocity-decouple had
+    loosened the gate): applied[] now tags per ACTUAL write
+    (`RSI(z,vz,vxy)` / `randomized(pos,vel)`); dead knobs land on the
+    NOT-APPLICABLE line the diagnoser can see.
+  * MEDIUM — explicit config env_spec_path pinned OUTSIDE
+    env/current.json desynced the diagnose surface from the apply
+    target: the loop now iterates ONLY the managed per-project spec —
+    unmanaged pins get no # ENV_SPEC block, no apply/revert/record,
+    and any stray proposals are rejected observably.
+  * LOW — no-op edits no longer burn a version (rejected with "no
+    change"); meta.rationale aggregates APPLIED edits only; invalid
+    current.json at apply now emits the rejected event rather than
+    stderr-only; `new_value` coerces bare numbers/pairs (saves a parse
+    retry); the real `_run_one_iter` env wiring (record + apply +
+    events) is now driven by an actual sculpt_run in tests via a
+    stubbed-LLM loop adapter.
+- **Verified**: tests/test_env_edits.py grew 13 → 19; full suite 1083
+  passed / 1 skipped / 4 gpu-marked deselected (they passed in the
+  pre-launch run; deselected only to keep VRAM free for the live E2E).
 
 ### 2026-07-01 — loop 1: dense progress channel + tie-deadlock fix
 - **What**: `sculptor/sculpt.py` — `IterOutcome.progress/steer_progress`,

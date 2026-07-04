@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from sculptor.adapters.base import load_adapter
 from sculptor.kg.query import TechniqueMatch, query_semantic, query_techniques
@@ -133,6 +133,15 @@ class _ProposedEnvEditModel(BaseModel):
         )
     )
     rationale: str
+
+    @field_validator("new_value", mode="before")
+    @classmethod
+    def _coerce_json_value(cls, v):  # noqa: ANN001, ANN205
+        """Accept a bare number / pair the model emitted unstringified —
+        coercing here saves a full parse-retry round-trip."""
+        if isinstance(v, (int, float, bool, list)):
+            return json.dumps(v)
+        return v
 
 
 class _GroundedModel(BaseModel):
@@ -719,20 +728,26 @@ def diagnose(
     contract = adapter.reward_contract()
     contract_text = _render_reward_contract(contract)
 
-    # §env generalization 3/4: the active env spec (adapter carries the
-    # path — set explicitly in config.toml or injected by load_adapter
-    # from env/current.json). None → no # ENV_SPEC block, and any env
-    # edits the model hallucinates are dropped at packing below.
+    # §env generalization 3/4: the active env spec — but ONLY when it is
+    # the loop-MANAGED per-project file (env/current.json next to the
+    # config), because that is the surface apply_env_edits writes to. An
+    # explicit config env_spec_path pinned elsewhere is static
+    # configuration: showing it as editable would invite proposals that
+    # can never land (or, worse, land on a file training doesn't read).
+    # None → no # ENV_SPEC block; any env edits the model hallucinates
+    # are dropped at packing below.
     env_spec: dict | None = None
     _env_spec_path = str(getattr(adapter, "env_spec_path", "") or "")
     if _env_spec_path:
-        try:
-            from sculptor.env_spec import load_env_spec
+        _managed_spec = Path(config).resolve().parent / "env" / "current.json"
+        if Path(_env_spec_path).resolve() == _managed_spec:
+            try:
+                from sculptor.env_spec import load_env_spec
 
-            env_spec = load_env_spec(_env_spec_path)
-        except Exception as e:  # noqa: BLE001 — context is advisory here
-            print(f"[diagnose] env spec unreadable ({e}) — no env-edit "
-                  "surface this iter.", file=sys.stderr, flush=True)
+                env_spec = load_env_spec(_env_spec_path)
+            except Exception as e:  # noqa: BLE001 — context is advisory here
+                print(f"[diagnose] env spec unreadable ({e}) — no env-edit "
+                      "surface this iter.", file=sys.stderr, flush=True)
 
     # 3. Anthropic client.
     if client is None:

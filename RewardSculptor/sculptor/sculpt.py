@@ -1120,8 +1120,22 @@ def _run_one_iter(
     # only the reward while keeping a bad env change would attribute the
     # env's damage to the reward. Best-effort: a missing/invalid target
     # version logs and trains under the current spec.
+    #
+    # The loop ITERATES only the MANAGED per-project spec — the one the
+    # adapter actually trains under AND that lives at env/current.json.
+    # An explicit config env_spec_path pointing anywhere else is static
+    # configuration: no revert, no version record, no diagnoser edits
+    # (otherwise apply/record would target project/env while training
+    # reads the pinned file — silent divergence).
     env_dir = project / "env"
-    if revert_base is not None and env_revert_version:
+    _active_spec_path = str(getattr(adapter, "env_spec_path", "") or "")
+    try:
+        env_managed = bool(_active_spec_path) and (
+            Path(_active_spec_path).resolve()
+            == (env_dir / "current.json").resolve())
+    except OSError:  # pragma: no cover — unresolvable path
+        env_managed = False
+    if env_managed and revert_base is not None and env_revert_version:
         try:
             from sculptor.env_spec import (
                 read_current_env_spec, repoint_env_current)
@@ -1143,18 +1157,20 @@ def _run_one_iter(
                 f"training under the current spec\n")
 
     # Record the env-spec version this iter actually trains under (the
-    # environment half of the training config; None = no spec/defaults).
+    # environment half of the training config; None = no spec/defaults
+    # or an unmanaged pinned spec).
     env_spec_trained: Optional[str] = None
-    try:
-        from sculptor.env_spec import read_current_env_spec as _read_env
+    if env_managed:
+        try:
+            from sculptor.env_spec import read_current_env_spec as _read_env
 
-        _cur_spec = _read_env(env_dir)
-        if _cur_spec:
-            env_spec_trained = (_cur_spec.get("meta") or {}).get("version")
-    except Exception as e:  # noqa: BLE001 — invalid spec fails later, loudly
-        sys.stderr.write(
-            f"[sculpt] iter {iter_index}: env spec unreadable "
-            f"({type(e).__name__}: {e})\n")
+            _cur_spec = _read_env(env_dir)
+            if _cur_spec:
+                env_spec_trained = (_cur_spec.get("meta") or {}).get("version")
+        except Exception as e:  # noqa: BLE001 — invalid spec fails later, loudly
+            sys.stderr.write(
+                f"[sculpt] iter {iter_index}: env spec unreadable "
+                f"({type(e).__name__}: {e})\n")
 
     # §2026-07-04: report the version that actually TRAINS this iter
     # (current.py's target / the revert base), not the disk maximum —
@@ -1491,26 +1507,51 @@ def _run_one_iter(
     # in dry-run (no LLM ran) and when the diagnosis proposed none.
     applied_env_edits: list[str] = []
     if diagnosis.proposed_env_edits and not dry_run:
-        try:
-            from sculptor.env_spec import apply_env_edits
-
-            env_edit_result = apply_env_edits(
-                env_dir, diagnosis.proposed_env_edits)
-            applied_env_edits = list(env_edit_result.get("applied") or [])
+        if not env_managed:
+            # Diagnose only shows the # ENV_SPEC surface for managed
+            # specs, so this is belt-and-braces — but never silent.
             _emit_event({
                 "type": "env_spec_updated",
                 "iter": iter_index,
-                "new_version": env_edit_result.get("new_version"),
-                "applied": applied_env_edits,
+                "new_version": None,
+                "applied": [],
                 "rejected": [
-                    {"parameter": p, "reason": r[:300]}
-                    for p, r in (env_edit_result.get("rejected") or [])
+                    {"parameter": getattr(e, "parameter", "?"),
+                     "reason": "env spec is not loop-managed "
+                               "(explicit env_spec_path)"}
+                    for e in diagnosis.proposed_env_edits
                 ],
             })
-        except Exception as e:  # noqa: BLE001 — env edits are advisory
-            sys.stderr.write(
-                f"[sculpt] iter {iter_index}: env-spec edits skipped — "
-                f"{type(e).__name__}: {e}\n")
+        else:
+            try:
+                from sculptor.env_spec import apply_env_edits
+
+                env_edit_result = apply_env_edits(
+                    env_dir, diagnosis.proposed_env_edits)
+                applied_env_edits = list(env_edit_result.get("applied") or [])
+                _emit_event({
+                    "type": "env_spec_updated",
+                    "iter": iter_index,
+                    "new_version": env_edit_result.get("new_version"),
+                    "applied": applied_env_edits,
+                    "rejected": [
+                        {"parameter": p, "reason": r[:300]}
+                        for p, r in (env_edit_result.get("rejected") or [])
+                    ],
+                })
+            except Exception as e:  # noqa: BLE001 — env edits are advisory
+                sys.stderr.write(
+                    f"[sculpt] iter {iter_index}: env-spec edits skipped — "
+                    f"{type(e).__name__}: {e}\n")
+                _emit_event({
+                    "type": "env_spec_updated",
+                    "iter": iter_index,
+                    "new_version": None,
+                    "applied": [],
+                    "rejected": [{
+                        "parameter": "*",
+                        "reason": f"{type(e).__name__}: {e}"[:300]}],
+                })
 
     # §Ship 54-pre (#12): surface the partition-gate report (written by
     # apply_edits into iter_dir/partition_gate.json when a metric steers and

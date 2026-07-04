@@ -239,6 +239,137 @@ def test_diagnose_env_block_and_edits_with_active_spec(
     assert "shared (frozen)" in grounded_prompt
 
 
+def test_apply_env_edits_noop_rejected_no_version_burn(tmp_path) -> None:
+    """A byte-identical edit must not burn a version number — and the
+    diagnoser hears that its edit changed nothing (increment-3 verifier)."""
+    env_dir = _seed_env(tmp_path)   # jump preset: entropy_coef_scale 2.0
+    res = es.apply_env_edits(env_dir, [
+        ProposedEnvEdit("entropy_coef_scale", "2.0", "same value")])
+    assert res["applied"] == [] and res["new_version"] is None
+    assert res["rejected"] == [
+        ("entropy_coef_scale", "no change — already 2.0")]
+    assert es.read_current_env_spec(env_dir)["meta"]["version"] == "v0"
+
+
+def test_apply_env_edits_rationale_from_applied_only(tmp_path) -> None:
+    env_dir = _seed_env(tmp_path)
+    res = es.apply_env_edits(env_dir, [
+        ProposedEnvEdit("entropy_coef_scale", "99.0", "REJECTED-RATIONALE"),
+        ProposedEnvEdit("friction_range", "[0.2, 1.4]", "APPLIED-RATIONALE"),
+    ])
+    assert res["new_version"] == "v1"
+    meta = es.read_current_env_spec(env_dir)["meta"]
+    assert "APPLIED-RATIONALE" in meta["rationale"]
+    assert "REJECTED-RATIONALE" not in meta["rationale"]
+
+
+def test_env_edit_model_coerces_bare_numbers() -> None:
+    """An unstringified number/pair from the model must not cost a parse
+    retry (increment-3 verifier)."""
+    m = _ProposedEnvEditModel(
+        parameter="entropy_coef_scale", new_value=1.5, rationale="r")
+    assert m.new_value == "1.5"
+    m2 = _ProposedEnvEditModel(
+        parameter="reset_height_offset_m", new_value=[0.0, 0.4],
+        rationale="r")
+    assert json.loads(m2.new_value) == [0.0, 0.4]
+
+
+def test_dead_knob_disclosure_accurate_for_rsi_and_joints(capsys) -> None:
+    """A spec key the task cfg can't honor must NOT read as applied
+    (increment-3 verifier: the velocity-decouple had loosened this).
+    Requires the paired sunk key to pass validation; the fake cfg has a
+    terminations dict, so sunk applies (with mjlab installed)."""
+    pytest.importorskip("mjlab")
+    from sculptor.adapters import _mjlab_runner
+
+    spec = {"env_spec_version": 1,
+            "train": {"reset_height_offset_m": [0.0, 0.4],
+                      "min_base_height_termination_m": 0.3,
+                      "reset_joint_position_offset_rad": [-0.2, 0.2]}}
+    assert es.validate_env_spec(spec) == []
+    # cfg whose reset_base lacks pose_range and whose reset_robot_joints
+    # lacks the range params — both knobs are DEAD here.
+    cfg = SimpleNamespace(
+        events={"reset_base": SimpleNamespace(params={}),
+                "reset_robot_joints": SimpleNamespace(params={})},
+        terminations={},
+    )
+    _mjlab_runner._apply_env_spec(cfg, spec, train=True)
+    err = capsys.readouterr().err
+    assert "reset_base→RSI" not in err.split("NOT APPLICABLE")[0] \
+        or "NOT APPLICABLE" in err
+    assert "NOT APPLICABLE" in err
+    assert "reset_base→RSI" in err.split("NOT APPLICABLE")[1]
+    assert "reset_robot_joints" in err.split("NOT APPLICABLE")[1]
+    # Partial application: velocity writes land even without pose_range,
+    # and the applied tag names exactly what was written.
+    spec2 = {"env_spec_version": 1,
+             "train": {"reset_vertical_velocity_mps": [-0.5, 2.0],
+                       "min_base_height_termination_m": 0.3}}
+    cfg2 = SimpleNamespace(
+        events={"reset_base": SimpleNamespace(params={})},
+        terminations={},
+    )
+    _mjlab_runner._apply_env_spec(cfg2, spec2, train=True)
+    err2 = capsys.readouterr().err
+    assert "reset_base→RSI(vz)" in err2
+    assert cfg2.events["reset_base"].params["velocity_range"]["z"] == (-0.5, 2.0)
+
+
+def test_diagnose_no_env_surface_for_unmanaged_spec(
+        tmp_path, monkeypatch) -> None:
+    """An explicit env_spec_path pinned OUTSIDE project env/current.json
+    is static config: no # ENV_SPEC block, env edits dropped
+    (increment-3 verifier: desync hazard)."""
+    import sys as _sys
+    sys_path_added = str(Path(__file__).parent)
+    if sys_path_added not in _sys.path:
+        _sys.path.insert(0, sys_path_added)
+    from test_diagnose import _StubClient as _DiagStubClient
+    from sculptor.diagnose import _PreliminaryModel, diagnose
+
+    iter_dir = tmp_path / "iter_0"
+    iter_dir.mkdir()
+    (iter_dir / "metrics.json").write_text(json.dumps({"metrics": {}}))
+    (iter_dir / "behavior.json").write_text(json.dumps({"mean_return": 0.0}))
+    (iter_dir / "reward_spec.json").write_text(json.dumps({"version": "v0"}))
+    # Valid spec at a NON-managed location.
+    pinned = tmp_path / "elsewhere" / "spec.json"
+    pinned.parent.mkdir()
+    pinned.write_text(json.dumps(es.jump_preset_spec()))
+    cfg_path = tmp_path / "config.toml"
+    cfg_path.write_text(
+        '[adapter]\n'
+        'class = "sculptor.adapters.gym_sb3.GymSB3Adapter"\n'
+        'config = { env_id = "Hopper-v4", n_envs = 1 }\n')
+
+    import sculptor.diagnose as D
+    real_load = D.load_adapter
+
+    def load_with_pinned(p):
+        a = real_load(p)
+        a.env_spec_path = str(pinned)
+        return a
+
+    monkeypatch.setattr(D, "load_adapter", load_with_pinned)
+    prelim = _PreliminaryModel(
+        failure_modes=["none"], evidence="e", confidence=0.5)
+    grounded = _GroundedModel(
+        proposed_env_edits=[
+            _ProposedEnvEditModel(
+                parameter="entropy_coef_scale", new_value="1.5",
+                rationale="r")],
+        confidence=0.5)
+    client = _DiagStubClient(prelim, grounded)
+    d = diagnose(
+        iter_dir=iter_dir, behavior_goal="jump", config=cfg_path,
+        client=client, skip_kg=True)
+    assert d.proposed_env_edits == []
+    grounded_prompt = client.messages.captured_prompts[1]["messages"][0]["content"]
+    assert "# ENV_SPEC" not in grounded_prompt
+
+
 # ── sculpt-loop threading (fake _run_one_iter, real sculpt_run) ────────────
 def _make_project(tmp_path: Path) -> Path:
     proj = tmp_path / "proj"
@@ -321,6 +452,149 @@ def test_best_env_spec_repointed_at_run_end(tmp_path, monkeypatch) -> None:
         fitness_fn=lambda p: 0.0, fitness_patience=10)
     assert res.best_env_spec == "v0"
     assert es.read_current_env_spec(env_dir)["meta"]["version"] == "v0"
+
+
+# ── real _run_one_iter env wiring (increment-3 verifier finding 4) ─────────
+from sculptor.adapters.base import SculptorAdapter as _BaseAdapter
+
+
+class _EnvSpecLoopAdapter(_BaseAdapter):
+    """Importable-by-dotted-path stub with env-spec support: fakes
+    train/rollout artifacts (test_sculpt._StubAdapter pattern) and
+    carries env_spec_path so load_adapter's convention injection fires."""
+
+    def __init__(self, env_spec_path: str = "", **_cfg):
+        self.env_spec_path = env_spec_path
+        self.env_profile = ""
+
+    def probe_component(self, reward_module_path):
+        from sculptor.adapters.base import ComponentProbe
+
+        return ComponentProbe(ok=True, components={}, total=0.0)
+
+    def compute_behavior_metrics(self, rollout):
+        return {"mean_return": 1.0, "mean_episode_length": 10.0,
+                "n_episodes": rollout.n_episodes}
+
+    def reward_contract(self):
+        from sculptor.adapters.base import RewardContract
+
+        return RewardContract(
+            observation_space_spec=None, action_space_spec=None,
+            expected_info_keys=["x_velocity"], expected_components=None)
+
+    def build_reward_replay(self, rollout_dir):
+        return None
+
+    def train(self, reward_module_path, output_dir, steps, seed,
+              init_policy_path=None):
+        from sculptor.adapters.base import TrainResult
+
+        output_dir = Path(output_dir)
+        (output_dir / "logs").mkdir(parents=True, exist_ok=True)
+        (output_dir / "checkpoint.zip").write_bytes(b"stub")
+        (output_dir / "metrics.json").write_text(json.dumps({
+            "metrics": {"mean_return": 1.0}, "components": {}}))
+        (output_dir / "reward_spec.json").write_text(json.dumps({
+            "version": "v0", "author": "human", "hyperparameters": {},
+            "references": [], "parent_hash": "", "description": "stub"}))
+        return TrainResult(
+            checkpoint_path=output_dir / "checkpoint.zip",
+            metrics_dict={"mean_return": 1.0}, component_means={},
+            logs_path=output_dir / "logs")
+
+    def rollout(self, checkpoint_path, output_dir, n_episodes, **_kw):
+        from sculptor.adapters.base import RolloutResult
+
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "keyframes").mkdir(exist_ok=True)
+        (output_dir / "rollout.mp4").write_bytes(b"v")
+        (output_dir / "trajectory.npz").write_bytes(b"z")
+        (output_dir / "behavior.json").write_text(json.dumps({
+            "n_episodes": n_episodes, "mean_return": 1.0,
+            "mean_episode_length": 10.0, "max_episode_length": 10}))
+        return RolloutResult(
+            video_path=output_dir / "rollout.mp4",
+            keyframes_dir=output_dir / "keyframes",
+            trajectory_path=output_dir / "trajectory.npz",
+            n_episodes=n_episodes)
+
+
+def test_run_one_iter_records_applies_and_events_env_spec(
+        tmp_path, monkeypatch, capsys) -> None:
+    """Drives the REAL _run_one_iter (via sculpt_run, non-dry-run) with
+    stubbed LLM stages: env_spec_trained recorded from the managed spec,
+    diagnoser env edits applied post-diagnose (valid → v1 + repoint,
+    invalid → rejected with reason), env_spec_updated event emitted,
+    case-memory applied_edits carries the env line."""
+    from sculptor.diagnose import Diagnosis
+
+    proj = tmp_path / "proj"
+    (proj / "rewards").mkdir(parents=True)
+    (proj / "runs").mkdir()
+    (proj / "reports").mkdir()
+    (proj / "rewards" / "__init__.py").write_text("")
+    (proj / "rewards" / "v0.py").write_text(
+        'REWARD_SPEC = {"version": "v0", "author": "human", '
+        '"hyperparameters": {}, "references": [], "parent_hash": "", '
+        '"description": "stub"}\n'
+        "def compute_reward(*a, **k):\n    return 0.0, {}\n")
+    (proj / "config.toml").write_text(
+        '[adapter]\n'
+        'class = "tests.test_env_edits._EnvSpecLoopAdapter"\n'
+        'config = { }\n'
+        '[iteration]\n'
+        'steps_per_iter = 10\n')
+    env_dir = _seed_env(proj)   # managed env/v0.json + current.json
+
+    fake_diag = Diagnosis(
+        failure_modes=["reward_hacking"], evidence="e",
+        proposed_edits=[],
+        proposed_env_edits=[
+            ProposedEnvEdit("entropy_coef_scale", "1.5", "exploration"),
+            ProposedEnvEdit("entropy_coef_scale", "99.0", "out of bounds"),
+        ])
+    monkeypatch.setattr(S, "run_diagnose", lambda **kw: fake_diag)
+
+    def fake_apply_edits(*, current_reward_path, new_iter_id, **kw):
+        p = current_reward_path.parent / f"{new_iter_id}.py"
+        p.write_text(current_reward_path.read_text())
+        return p
+
+    monkeypatch.setattr(S, "apply_edits", fake_apply_edits)
+    monkeypatch.setattr(S, "_git_add_commit", lambda *a, **k: True)
+    monkeypatch.setattr(
+        "sculptor.run_context.capture_run_context", lambda *a, **k: {})
+    monkeypatch.setattr(
+        "sculptor.run_context.write_run_context",
+        lambda *a, **k: Path("run_context.json"))
+
+    result = S.sculpt_run(
+        proj / "config.toml", behavior_goal="", iterations=1, no_kg=True)
+    (outcome,) = result.completed_iters
+
+    # env_spec_trained recorded from the managed spec.
+    assert outcome.env_spec_trained == "v0"
+    # Valid edit applied → v1 written + current repointed; invalid rejected.
+    cur = es.read_current_env_spec(env_dir)
+    assert cur["meta"]["version"] == "v1"
+    assert cur["train"]["entropy_coef_scale"] == 1.5
+    assert cur["meta"]["source"] == "diagnoser"
+    # Case memory carries the env line.
+    assert "env: entropy_coef_scale=1.5" in outcome.applied_edits
+    # env_spec_updated event with applied AND rejected reasons.
+    events = [
+        json.loads(line.split("[SCULPT-EVENT] ", 1)[1])
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("[SCULPT-EVENT] ")
+    ]
+    upd = [e for e in events if e["type"] == "env_spec_updated"]
+    assert len(upd) == 1
+    assert upd[0]["new_version"] == "v1"
+    assert upd[0]["applied"] == ["entropy_coef_scale=1.5"]
+    assert upd[0]["rejected"][0]["parameter"] == "entropy_coef_scale"
+    assert "hard bounds" in upd[0]["rejected"][0]["reason"]
 
 
 # ── remote-dispatch threading (increment-1 verifier finding) ───────────────

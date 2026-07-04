@@ -597,10 +597,15 @@ def _apply_env_spec(env_cfg: Any, spec: "dict | None", *,
             params = getattr(reset, "params", None)
             if isinstance(params, dict):
                 # Height offset needs pose_range; the velocity keys only
-                # write velocity_range — don't couple them to it.
+                # write velocity_range — don't couple them to it. Tag
+                # applied[] per ACTUAL write so a dead sub-knob is
+                # visible to the disclosure below (a spec key the cfg
+                # can't honor must never read as applied).
+                wrote: list[str] = []
                 if rsi_z is not None and isinstance(
                         params.get("pose_range"), dict):
                     params["pose_range"]["z"] = (float(rsi_z[0]), float(rsi_z[1]))
+                    wrote.append("z")
                 if rsi_vz is not None or rsi_vxy is not None:
                     vr = params.get("velocity_range")
                     if not isinstance(vr, dict):
@@ -608,10 +613,13 @@ def _apply_env_spec(env_cfg: Any, spec: "dict | None", *,
                         params["velocity_range"] = vr
                     if rsi_vz is not None:
                         vr["z"] = (float(rsi_vz[0]), float(rsi_vz[1]))
+                        wrote.append("vz")
                     if rsi_vxy is not None:
                         vr["x"] = (float(rsi_vxy[0]), float(rsi_vxy[1]))
                         vr["y"] = (float(rsi_vxy[0]), float(rsi_vxy[1]))
-                applied.append("reset_base→RSI")
+                        wrote.append("vxy")
+                if wrote:
+                    applied.append(f"reset_base→RSI({','.join(wrote)})")
         except Exception as e:  # noqa: BLE001
             _skip("RSI reset", e)
 
@@ -623,11 +631,16 @@ def _apply_env_spec(env_cfg: Any, spec: "dict | None", *,
                 "reset_robot_joints")
             params = getattr(reset, "params", None)
             if isinstance(params, dict):
+                wrote_j: list[str] = []
                 if jp is not None and "position_range" in params:
                     params["position_range"] = (float(jp[0]), float(jp[1]))
+                    wrote_j.append("pos")
                 if jv is not None and "velocity_range" in params:
                     params["velocity_range"] = (float(jv[0]), float(jv[1]))
-                applied.append("reset_robot_joints→randomized")
+                    wrote_j.append("vel")
+                if wrote_j:
+                    applied.append(
+                        f"reset_robot_joints→randomized({','.join(wrote_j)})")
         except Exception as e:  # noqa: BLE001
             _skip("joint reset", e)
 
