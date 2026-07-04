@@ -29,7 +29,16 @@ def _fake_velocity_cfg() -> SimpleNamespace:
     return SimpleNamespace(
         commands={"twist": twist},
         curriculum={"command_vel": object(), "terrain_levels": object()},
-        events={"push_robot": object(), "reset_base": object()},
+        events={
+            "push_robot": object(),
+            "reset_base": SimpleNamespace(params={
+                "pose_range": {
+                    "x": (-0.5, 0.5), "y": (-0.5, 0.5),
+                    "z": (0.01, 0.05), "yaw": (-3.14, 3.14),
+                },
+                "velocity_range": {},
+            }),
+        },
         terminations={
             "fell_over": SimpleNamespace(
                 params={"limit_angle": math.radians(70.0)}),
@@ -203,3 +212,41 @@ def test_default_adapter_omits_env_profile_flag(tmp_path) -> None:
         adapter.train(
             reward_module_path=None, output_dir=tmp_path, steps=1, seed=1)
     assert "--env-profile" not in captured["cmd"]
+
+
+# ── §2026-07-04: RSI reset curriculum + explosive-motion PPO profile ───────
+def test_jump_profile_adds_rsi_resets_in_train_only() -> None:
+    """Reference-state initialization (gap #7) applies to TRAINING resets
+    only: episodes start up to +0.40 m with vertical velocity in
+    [-0.5, +2.0] m/s so the policy experiences flight/landing it cannot
+    yet produce. Rollout keeps the standing start (the true task) — the
+    metric's upright_start / return-to-start-height view must not see
+    mid-air spawns."""
+    cfg = _fake_velocity_cfg()
+    _mjlab_runner._apply_env_profile(cfg, "jump", train=True)
+    params = cfg.events["reset_base"].params
+    assert params["pose_range"]["z"] == (0.0, 0.40)
+    assert params["velocity_range"]["z"] == (-0.5, 2.0)
+
+    cfg2 = _fake_velocity_cfg()
+    _mjlab_runner._apply_env_profile(cfg2, "jump", train=False)
+    params2 = cfg2.events["reset_base"].params
+    assert params2["pose_range"]["z"] == (0.01, 0.05)      # untouched
+    assert params2["velocity_range"] == {}                 # untouched
+    # Everything non-RSI still applies on the rollout side.
+    assert "push_robot" not in cfg2.events
+    assert cfg2.episode_length_s == 10.0
+
+
+def test_rl_profile_doubles_entropy_for_jump_only() -> None:
+    algo = SimpleNamespace(entropy_coef=0.01)
+    rl_cfg = SimpleNamespace(algorithm=algo)
+    _mjlab_runner._apply_rl_profile(rl_cfg, "jump")
+    assert algo.entropy_coef == pytest.approx(0.02)
+    # Non-jump profiles + missing fields are no-ops, never raises.
+    algo2 = SimpleNamespace(entropy_coef=0.01)
+    _mjlab_runner._apply_rl_profile(SimpleNamespace(algorithm=algo2), "")
+    assert algo2.entropy_coef == 0.01
+    _mjlab_runner._apply_rl_profile(SimpleNamespace(), "jump")
+    _mjlab_runner._apply_rl_profile(
+        SimpleNamespace(algorithm=SimpleNamespace()), "jump")

@@ -613,6 +613,15 @@ def run(
         help="Steer mode: on a fitness regression, revert the edit base to "
              "the best-so-far reward instead of compounding the bad edit. "
              "Default on; --no-fitness-revert restores the Ship-33 behavior."),
+    # §2026-07-04 (gap #7): warm-start chaining for complex motions —
+    # e.g. learn a hop, then start the tuck-jump run from that policy.
+    # Previously reachable only via the sculpt_run kwarg (the tuck-jump
+    # E2E needed a hand-written driver script to use it).
+    init_policy: Optional[Path] = typer.Option(
+        None, "--init-policy", exists=True, readable=True,
+        help="rsl_rl checkpoint to warm-start the FIRST iteration's "
+             "training from (actor+critic only; optimizer/iteration "
+             "state skipped). Task obs/action spaces must match."),
     # §Ship 39 (H1): interactive human-in-the-loop control.
     control_file: Optional[Path] = typer.Option(
         None, "--control-file",
@@ -655,6 +664,7 @@ def run(
         fitness_fn=fitness_fn,
         fitness_observe_only=(fitness_mode == "observe"),
         fitness_revert=fitness_revert,
+        init_policy_path=init_policy,
         control_file=control_file,
         feedback_timeout=feedback_timeout,
     )

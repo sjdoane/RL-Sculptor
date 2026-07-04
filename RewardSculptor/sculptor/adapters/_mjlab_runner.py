@@ -449,7 +449,7 @@ def _build_sculptor_term_class(schema_keys: tuple[str, ...]):
     return SculptorRewardTerm
 
 
-def _apply_env_profile(env_cfg: Any, profile: str) -> None:
+def _apply_env_profile(env_cfg: Any, profile: str, *, train: bool = True) -> None:
     """§RL_SCULPTOR_AUDIT §4.4 gap #5: task-env alignment for jump-class
     goals. The mjlab velocity tasks are WALKING environments; four of
     their training mechanics actively fight a standing jump (evidence:
@@ -480,12 +480,27 @@ def _apply_env_profile(env_cfg: Any, profile: str) -> None:
         (500 steps @ 50 Hz) and doubles launch-practice resets per
         sample budget vs the walking default of 20 s.
 
-    Init pose (reset_base standing + small z jitter) is already right
-    for a jump and is left untouched. Unknown profile values are
-    rejected by MjlabAdapter before the subprocess spawns; here an
-    empty/None profile is a no-op. FULLY DEFENSIVE per-mutation: any
-    cfg-shape drift skips that mutation with a warning, never breaks
-    the run."""
+    §RSI (2026-07-04, gap #7): when `train=True`, `reset_base` gains
+    reference-state initialization — episodes start uniformly between
+    stance height and +0.40 m with vertical velocity in [-0.5, +2.0]
+    m/s. Measured motivation (tuck-jump iters 10-18): PPO from
+    standing-only starts never DISCOVERS the launch-land cycle — every
+    naive jump attempt ends in a punished fall, so launch credit decays
+    (0.009 → 0.001 over iter 14's training) and the policy retreats to
+    a safe static/degenerate basin. DeepMimic-style RSI gives the policy
+    apex→descent→landing→stance experience it cannot yet produce:
+    +0.40 m ≈ 2.8 m/s landing impact (within the soft-landing shaping's
+    working range; the measured tumble apexes were 0.45-0.55 m), and
+    +2.0 m/s upward ≈ a +0.20 m ballistic rise — a real hop's flight,
+    experienced for free. ROLLOUT (`train=False`) keeps the standing
+    start: RSI is a TRAINING curriculum; the evaluated task — and the
+    metric's view of it (upright_start / return-to-start-height) — is
+    unchanged.
+
+    Unknown profile values are rejected by MjlabAdapter before the
+    subprocess spawns; here an empty/None profile is a no-op. FULLY
+    DEFENSIVE per-mutation: any cfg-shape drift skips that mutation
+    with a warning, never breaks the run."""
     if not profile or profile == "default":
         return
     if profile != "jump":
@@ -547,8 +562,47 @@ def _apply_env_profile(env_cfg: Any, profile: str) -> None:
     except Exception as e:  # noqa: BLE001
         print(f"[runner] env-profile jump: episode length skipped: "
               f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
-    print(f"[runner] env-profile jump applied: {applied}",
+    if train:
+        try:
+            reset = (getattr(env_cfg, "events", None) or {}).get("reset_base")
+            params = getattr(reset, "params", None)
+            if isinstance(params, dict) and isinstance(
+                    params.get("pose_range"), dict):
+                params["pose_range"]["z"] = (0.0, 0.40)
+                vr = params.get("velocity_range")
+                if not isinstance(vr, dict):
+                    vr = {}
+                    params["velocity_range"] = vr
+                vr["z"] = (-0.5, 2.0)
+                applied.append("reset_base→RSI(z+0.0-0.40m, vz-0.5..+2.0)")
+        except Exception as e:  # noqa: BLE001
+            print(f"[runner] env-profile jump: RSI reset skipped: "
+                  f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
+    print(f"[runner] env-profile jump applied (train={train}): {applied}",
           file=sys.stderr, flush=True)
+
+
+def _apply_rl_profile(rl_cfg: Any, profile: str) -> None:
+    """§RSI companion (2026-07-04): explosive-motion PPO adjustment for
+    the jump profile — entropy_coef ×2 (0.01 → 0.02 on the G1 task).
+    RL_SCULPTOR_AUDIT §1 (research foundations): explosive single-burst
+    skills need higher early exploration than walking defaults or the
+    policy collapses into the nearest safe basin before ever sampling a
+    launch; doubling the entropy bonus is the standard legged-gym-family
+    adjustment and stays well below destabilizing values (~0.05+).
+    Train-time only (the caller); defensive on cfg-shape drift."""
+    if profile != "jump":
+        return
+    try:
+        algo = getattr(rl_cfg, "algorithm", None)
+        cur = getattr(algo, "entropy_coef", None)
+        if isinstance(cur, (int, float)) and cur > 0:
+            algo.entropy_coef = float(cur) * 2.0
+            print(f"[runner] rl-profile jump: entropy_coef {cur} → "
+                  f"{algo.entropy_coef}", file=sys.stderr, flush=True)
+    except Exception as e:  # noqa: BLE001 — never break a run
+        print(f"[runner] rl-profile jump skipped: {type(e).__name__}: {e}",
+              file=sys.stderr, flush=True)
 
 
 def _cmd_train(args: argparse.Namespace) -> None:
@@ -562,7 +616,8 @@ def _cmd_train(args: argparse.Namespace) -> None:
     env_cfg = load_env_cfg(args.task_id)
     env_cfg.scene.num_envs = args.num_envs
     # §RL_SCULPTOR_AUDIT §4.4: goal-class env alignment (default "" → no-op).
-    _apply_env_profile(env_cfg, getattr(args, "env_profile", ""))
+    # train=True adds the RSI reset curriculum (§gap #7).
+    _apply_env_profile(env_cfg, getattr(args, "env_profile", ""), train=True)
     # §actuator-limit enforcement — flag-gated (default OFF → no-op). MUST run on
     # the TRAIN env too (not just rollout) so the policy trains against the same
     # velocity-limited physics it is later evaluated under (no train/rollout mismatch).
@@ -618,6 +673,9 @@ def _cmd_train(args: argparse.Namespace) -> None:
 
     rl_cfg = load_rl_cfg(args.task_id)
     rl_cfg.max_iterations = args.max_iterations
+    # §RSI companion: explosive-motion PPO adjustment (entropy ×2 for
+    # the jump profile). Train-time only — rollout never optimizes.
+    _apply_rl_profile(rl_cfg, getattr(args, "env_profile", ""))
 
     agent_cfg_dict = _cfg_to_dict(rl_cfg)
 
@@ -1104,7 +1162,10 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
     # §RL_SCULPTOR_AUDIT §4.4: SAME profile as train — a policy trained with
     # zero commands / no pushes must be evaluated under that distribution,
     # and the metric arrays must see the un-truncated fall dynamics.
-    _apply_env_profile(env_cfg, getattr(args, "env_profile", ""))
+    # train=False: NO RSI here — evaluation starts from standing (the true
+    # task), or the metric's upright_start / return-to-start-height view
+    # would be corrupted by mid-air spawns.
+    _apply_env_profile(env_cfg, getattr(args, "env_profile", ""), train=False)
     # §Ship 35: textured floor in the rendered rollout (cosmetic, guarded).
     _apply_ground_texture(env_cfg)
     # §actuator-limit enforcement — flag-gated (default OFF). Same swap as TRAIN so
