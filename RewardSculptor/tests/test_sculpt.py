@@ -802,3 +802,107 @@ def test_sculpt_run_ignores_legacy_early_stop_and_runs_full_budget(
     )
     assert result.iterations_run == 6
     assert result.early_stopped is False
+
+
+# ── §2026-07-04: run-boundary trained-reward resolution ────────────────────
+def test_current_reward_target_parses_reexport(tmp_path: Path):
+    from sculptor.sculpt import _current_reward_target, _write_current_reexport
+
+    rewards = tmp_path / "rewards"
+    rewards.mkdir()
+    (rewards / "v0.py").write_text("REWARD_SPEC = {}\n", encoding="utf-8")
+    (rewards / "v4.py").write_text("REWARD_SPEC = {}\n", encoding="utf-8")
+
+    # No current.py yet → None.
+    assert _current_reward_target(rewards) is None
+    # Re-export target resolves even when a HIGHER version exists on disk.
+    _write_current_reexport(rewards, rewards / "v0.py")
+    assert _current_reward_target(rewards) == rewards / "v0.py"
+    _write_current_reexport(rewards, rewards / "v4.py")
+    assert _current_reward_target(rewards) == rewards / "v4.py"
+    # Hand-edited/unrecognizable current.py → None (callers fall back).
+    (rewards / "current.py").write_text("from .v4 import *\n", encoding="utf-8")
+    assert _current_reward_target(rewards) is None
+    # Recognizable line but the target file is gone → None.
+    _write_current_reexport(rewards, rewards / "v0.py")
+    (rewards / "v0.py").unlink()
+    assert _current_reward_target(rewards) is None
+
+
+def test_run_boundary_trains_and_edits_current_target(
+        tmp_path: Path, capsys):
+    """§2026-07-04 regression (tuck-jump iter 16): when a previous run's
+    best-by-fitness selection repointed current.py at an OLDER version and
+    a new run resumes, the iter must (a) record that version as
+    reward_path_trained — keep-best must never keep a never-trained file,
+    (b) apply its diagnosis edit to THAT source, and (c) report that
+    version in the iter events — not the highest v<n>.py on disk."""
+    global _SCHEDULE
+    _SCHEDULE = [1.0]
+    proj = _write_minimal_project(tmp_path)
+    rewards = proj / "rewards"
+    # Simulate the previous run: a later edit v2 exists on disk with a
+    # DISTINCT hyperparameter value, but best-selection kept v0.
+    v2_src = (rewards / "v0.py").read_text(encoding="utf-8").replace(
+        '"version": "v0"', '"version": "v2"').replace(
+        '"alive_bonus": 1.0', '"alive_bonus": 7.0')
+    (rewards / "v2.py").write_text(v2_src, encoding="utf-8")
+    from sculptor.sculpt import _write_current_reexport
+    _write_current_reexport(rewards, rewards / "v0.py")
+
+    result = sculpt_run(
+        config_path=proj / "config.toml", behavior_goal="dummy goal",
+        iterations=1, resume=True, no_kg=True, dry_run=True,
+    )
+    (outcome,) = result.completed_iters
+    assert outcome.iter_index == 2               # resume starts at latest_n
+
+    # (a) the trained record follows current.py's re-export target.
+    assert outcome.reward_path_trained == rewards / "v0.py"
+
+    # (b) the new edit is still numbered v3 (monotonic) but its content
+    # derives from v0 (the dry-run canned edit bumps alive_bonus by 0.5:
+    # 1.0 → 1.5). Pre-fix it derived from v2 and read 7.5.
+    v3 = (rewards / "v3.py").read_text(encoding="utf-8")
+    assert '"alive_bonus": 1.5' in v3
+    assert '"alive_bonus": 7.5' not in v3
+
+    # (c) events report the version that actually trained.
+    events = [
+        json.loads(line.split("[SCULPT-EVENT] ", 1)[1])
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("[SCULPT-EVENT] ")
+    ]
+    started = [e for e in events if e["type"] == "iter_started"]
+    completed = [e for e in events if e["type"] == "iter_completed"]
+    assert started and started[0]["reward_version_before"] == 0
+    assert completed and completed[0]["reward_version_before"] == 0
+    assert completed[0]["reward_version_after"] == 3
+
+
+def test_dangling_current_reexport_is_repaired(tmp_path: Path):
+    """A generated current.py whose target v<n>.py was deleted would crash
+    mid-train on import; the iter must repair the re-export to the latest
+    version before training."""
+    global _SCHEDULE
+    _SCHEDULE = [1.0]
+    proj = _write_minimal_project(tmp_path)
+    rewards = proj / "rewards"
+    v1_src = (rewards / "v0.py").read_text(encoding="utf-8").replace(
+        '"version": "v0"', '"version": "v1"')
+    (rewards / "v1.py").write_text(v1_src, encoding="utf-8")
+    from sculptor.sculpt import _current_reward_target, _write_current_reexport
+    # current.py -> v0, then v0 vanishes (user cleanup).
+    _write_current_reexport(rewards, rewards / "v0.py")
+    (rewards / "v0.py").unlink()
+    assert _current_reward_target(rewards) is None
+
+    result = sculpt_run(
+        config_path=proj / "config.toml", behavior_goal="dummy goal",
+        iterations=1, resume=True, no_kg=True, dry_run=True,
+    )
+    (outcome,) = result.completed_iters
+    # Repaired: trained the latest surviving version, records agree.
+    assert outcome.reward_path_trained == rewards / "v1.py"
+    assert "v1.py" in (rewards / "current.py").read_text(encoding="utf-8") \
+        or "v2.py" in (rewards / "current.py").read_text(encoding="utf-8")

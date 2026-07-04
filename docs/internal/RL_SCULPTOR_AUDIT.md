@@ -565,11 +565,19 @@ Runs 2-4 (iters 14-18; `sculpt_loop4d_*` / `sculpt_loop4e_*` /
   optionally a crouch-impulse curriculum. The jump env profile is the
   natural seam (reset_base pose/velocity ranges are already mutable
   there).
-- **BUG (follow-up task spawned)**: `_run_one_iter` trains
-  `current.py`'s target but records `reward_path_trained =
-  latest_reward_file`; they diverge at run boundaries after
-  best-selection repoints (iter 16 trained v14 while events said v16).
-  Same-run iters are unaffected (revert_base handles that path).
+- **BUG — FIXED 2026-07-04**: `_run_one_iter` trained `current.py`'s
+  target but recorded `reward_path_trained = latest_reward_file` AND
+  used the latest file as the EDIT BASE; the three diverge at run
+  boundaries after best-selection repoints (iter 16 trained v14 while
+  events said v16, its diagnosis was applied to v16's source, and
+  keep-best then repointed current.py at v16 — a never-trained file).
+  Fix: `_current_reward_target()` parses current.py's re-export line;
+  the trained record, the edit base, and both iter events now follow
+  it (fallback: latest, with auto-repair when a generated current.py
+  dangles at a deleted file). Regression tests drive the real loop
+  through a simulated boundary (v3 derives from v0's source, not v2's;
+  events report v0). Same-run reverts were always correct
+  (revert_base sets all three explicitly).
 - **Final project state**: current.py → v14 (strongest validated
   reward design: upright-gated flight credit + honest gates + stance
   0.1); best-by-gen_002 behavior remains iter 10 (progress 0.0196);
