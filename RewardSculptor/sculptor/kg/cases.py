@@ -55,8 +55,44 @@ def _verdict(delta: float | None, eps: float = 1e-4) -> str:
 
 def _case_text(case: RunCase) -> str:
     """The text a case is embedded + matched on — task + symptom dominate so
-    retrieval keys on 'similar task with this failure', not on the verdict."""
-    return f"{case.task}. symptom: {case.symptom}. verdict: {case.verdict}".strip()
+    retrieval keys on 'similar task with this failure'; the edit identities
+    are included so 'similar edit under consideration' also matches."""
+    edits = f" edits: {', '.join(case.edits)}." if case.edits else ""
+    return (
+        f"{case.task}. symptom: {case.symptom}.{edits} "
+        f"verdict: {case.verdict}"
+    ).strip()
+
+
+# Behavior-signature keys worth carrying into a case, in priority order.
+# Metric-agnostic fallback: if none of these appear, the first few numeric
+# components are taken as-is.
+_SIGNATURE_PRIORITY = (
+    "progress_score", "apex_gain_m_mean", "frac_launched", "frac_returned",
+    "frac_upright_end", "tuck_excess_rad_mean", "max_lateral_drift_m_mean",
+)
+_SIGNATURE_MAX_KEYS = 6
+
+
+def _behavior_signature(components: dict | None) -> dict[str, float]:
+    """Distill the metric's component breakdown into ≤6 floats that
+    characterize WHAT the policy did (stand-farm vs tumble vs sit-bob),
+    priority keys first, then any other numerics up to the cap."""
+    if not isinstance(components, dict):
+        return {}
+    out: dict[str, float] = {}
+    for k in _SIGNATURE_PRIORITY:
+        v = components.get(k)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            out[k] = round(float(v), 4)
+    for k, v in components.items():
+        if len(out) >= _SIGNATURE_MAX_KEYS:
+            break
+        if k in out:
+            continue
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            out[k] = round(float(v), 4)
+    return out
 
 
 # ── write-back ────────────────────────────────────────────────────────────
@@ -69,20 +105,24 @@ def record_run_cases(
     nonce: str | None = None,
     eps: float = 1e-4,
 ) -> int:
-    """Materialize one `RunCase` per iteration of a fitness-tracked run and
-    link it to its failure-mode nodes (INSTANTIATES). Forward-attribution: the
-    edit made at iter N is judged by the fitness CHANGE measured at iter N+1.
+    """Materialize one `RunCase` per iteration of a run and link it to its
+    failure-mode nodes (INSTANTIATES). Forward-attribution: the edit made at
+    iter N is judged by the LEXICOGRAPHIC (fitness, dense-progress) change
+    measured at iter N+1 — the same key the loop selects on, so a run whose
+    completion-gated fitness is 0.0 throughout still yields real verdicts.
+    Blind runs (no fitness) record too: symptom + edit identities + behavior
+    signature, verdict 'unknown' — what was tried is itself memory.
 
     Best-effort and additive — callers wrap this so a logging failure can
     never affect a run. Returns the number of cases written."""
     nonce = nonce or uuid.uuid4().hex[:8]
     iters = list(getattr(result, "completed_iters", []) or [])
     fits = list(getattr(result, "fitness_history", []) or [])
+    progs = list(getattr(result, "progress_history", []) or [])
     written = 0
     for idx, outcome in enumerate(iters):
-        if idx >= len(fits):
-            break
-        cur = fits[idx]
+        cur = fits[idx] if idx < len(fits) else None
+        cur_p = progs[idx] if idx < len(progs) else None
         nxt_outcome = iters[idx + 1] if (idx + 1) < len(iters) else None
         # §Ship 37 review (HIGH): forward attribution only holds if iter N+1
         # actually TRAINED iter N's edit. With §Ship 36 revert-on-regression a
@@ -90,29 +130,57 @@ def record_run_cases(
         # reward; crediting that rebound to N's edit would record a regressing
         # edit as "helped" and recommend it to future runs. When N+1 reverted,
         # the edit's effect was never measured → leave the verdict 'unknown'.
-        nxt = (
-            fits[idx + 1]
-            if (idx + 1) < len(fits)
+        measured_next = (
+            nxt_outcome is not None
             and not bool(getattr(nxt_outcome, "reverted_to_best", False))
-            else None
         )
-        delta = (nxt - cur) if nxt is not None else None
+        nxt = fits[idx + 1] if measured_next and (idx + 1) < len(fits) else None
+        nxt_p = (progs[idx + 1]
+                 if measured_next and (idx + 1) < len(progs) else None)
+        delta = (nxt - cur) if (nxt is not None and cur is not None) else None
+        delta_p = ((nxt_p - cur_p)
+                   if (nxt_p is not None and cur_p is not None) else None)
         fms = [
             str(fm) for fm in (getattr(outcome, "failure_modes", []) or [])
             if fm and str(fm) != "none"
         ]
-        # Skip iterations that carry no learning at all (no failure flagged AND
-        # no measurable fitness change to attribute).
-        if not fms and delta is None:
+        edits = [str(e) for e in (getattr(outcome, "applied_edits", []) or [])]
+        # Skip iterations that carry no learning at all (no failure flagged,
+        # no edit identity, AND no measurable change to attribute).
+        if not fms and not edits and delta is None and delta_p is None:
             continue
-        verdict = _verdict(delta, eps)
+        # §2026-07-03: LEXICOGRAPHIC attribution — mirror the loop's own
+        # selection key (spec decides; dense progress breaks ties). The
+        # tuck-jump E2E recorded 12 straight 'neutral'/'unknown' cases
+        # because spec stayed 0.0 while the progress channel was doing
+        # ALL the ranking — a 0.0196 → 0.0 progress regression was
+        # invisible to the memory.
+        if delta is not None and abs(delta) > eps:
+            verdict = _verdict(delta, eps)
+            attributed = f"fitness {delta:+.4f}"
+        elif delta_p is not None and abs(delta_p) > eps:
+            verdict = _verdict(delta_p, eps)
+            attributed = f"progress {delta_p:+.4f}"
+        elif delta is not None or delta_p is not None:
+            verdict = "neutral"
+            attributed = "no measurable change"
+        else:
+            verdict = "unknown"
+            attributed = "effect never measured (reverted next / last iter)"
         symptom = ", ".join(fms) if fms else "no failure modes flagged"
-        edit_count = int(getattr(outcome, "edit_count", 0) or 0)
         iter_index = int(getattr(outcome, "iter_index", idx))
+        behavior = _behavior_signature(
+            getattr(outcome, "fitness_components", None))
+        behavior_s = (
+            " behavior: " + ", ".join(
+                f"{k}={v:g}" for k, v in behavior.items()) + "."
+            if behavior else ""
+        )
+        edits_s = "; ".join(edits) if edits else (
+            f"{int(getattr(outcome, 'edit_count', 0) or 0)} edit(s)")
         edit_summary = (
-            f"iter {iter_index}: responded to [{symptom}] with "
-            f"{edit_count} edit(s); objective fitness then {verdict}"
-            + (f" ({delta:+.4f})" if delta is not None else "")
+            f"iter {iter_index}: [{symptom}] → applied: {edits_s} → "
+            f"{verdict} ({attributed})." + behavior_s
         )
         case = RunCase(
             id=make_run_case_id(task, iter_index, nonce),
@@ -120,6 +188,10 @@ def record_run_cases(
             edit_summary=edit_summary,
             fitness_before=cur, fitness_after=nxt, fitness_delta=delta,
             verdict=verdict,
+            edits=edits,
+            progress_before=cur_p, progress_after=nxt_p,
+            progress_delta=delta_p,
+            behavior=behavior,
         )
         store.add_node(case)
         for fm in fms:

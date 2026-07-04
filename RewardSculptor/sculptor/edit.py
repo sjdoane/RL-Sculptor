@@ -764,6 +764,7 @@ def _build_user_prompt(
     training_feedback: dict | None = None,
     metric_observables: "frozenset[str] | None" = None,
     screen: Any = None,
+    case_context: str = "",
 ) -> str:
     edits_json = [
         {
@@ -859,11 +860,18 @@ def _build_user_prompt(
             screen if screen is not None else partition_gate.ScreenResult(),
         )
 
+    # §2026-07-03 case-memory upgrade: the REWRITER is where "don't repeat
+    # the same reward mistake" actually lands — the diagnoser proposes,
+    # but the rewriter picks formulas + magnitudes. Same block the
+    # diagnoser sees; empty string when no cases match / no KG.
+    case_block = f"{case_context}\n\n" if case_context else ""
+
     return (
         f"# NEW_VERSION\n{new_version}\n\n"
         f"# PARENT_VERSION\n{current_version}\n\n"
         f"# PARENT_HASH\n{parent_hash}\n\n"
         f"# BEHAVIOR_GOAL\n{diagnosis.behavior_goal or '(not supplied)'}\n\n"
+        f"{case_block}"
         f"# DIAGNOSIS\n"
         f"failure_modes: {diagnosis.failure_modes}\n"
         f"evidence: {diagnosis.evidence}\n"
@@ -1281,6 +1289,25 @@ def apply_edits(
             except Exception:  # noqa: BLE001 — never block edit on feedback load
                 training_feedback = {}
 
+        # §2026-07-03: recall this system's OWN past outcomes on similar
+        # tasks/failures into the rewrite prompt (the diagnoser already
+        # sees the same block). Advisory + best-effort: no KG / no model /
+        # no matches → empty block, prompt byte-identical.
+        case_context = ""
+        try:
+            from sculptor.kg.cases import _render_case_context, query_cases
+            from sculptor.kg.query import DEFAULT_MIN_PROMPT_SIMILARITY
+
+            _case_q = (diagnosis.behavior_goal or "") + " | " + ", ".join(
+                diagnosis.failure_modes or [])
+            if _case_q.strip(" |"):
+                case_context = _render_case_context(query_cases(
+                    _case_q, top_k=3, store=kg_store,
+                    min_similarity=DEFAULT_MIN_PROMPT_SIMILARITY))
+        except Exception as e:  # noqa: BLE001 — case memory is advisory
+            print(f"[edit] case-memory query failed ({e}) — skipped.",
+                  file=sys.stderr, flush=True)
+
         # Build prompt.
         user_prompt = _build_user_prompt(
             current_source=current_source,
@@ -1296,6 +1323,7 @@ def apply_edits(
             training_feedback=training_feedback,
             metric_observables=metric_observables,
             screen=plan.screen,
+            case_context=case_context,
         )
         if on_event is not None:
             on_event({

@@ -1165,3 +1165,91 @@ def test_variance_probe_tolerates_crashing_probes():
 
     _probe_reward_variance(
         SimpleNamespace(compute_reward=_r), _variance_probe_contract())
+
+
+def test_apply_edits_injects_case_memory_block(v0_path, kg, monkeypatch):
+    """§2026-07-03 case-memory upgrade: the rewrite prompt carries the same
+    CASE MEMORY block the diagnoser sees, so the rewriter doesn't re-make a
+    reward mistake a past run already measured as regressing."""
+    import hashlib
+
+    from sculptor.kg import cases as kg_cases
+    from sculptor.kg.query import cite
+    from sculptor.kg.schema import RunCase
+
+    parent_hash = hashlib.sha256(
+        v0_path.read_text(encoding="utf-8").encode("utf-8")).hexdigest()[:16]
+    source = _render_v1_source(parent_hash, cite("1801.00690", store=kg))
+    client = _StubClient(source)
+
+    past = kg_cases.CaseMatch(
+        case=RunCase(
+            id="case:past", task="run forward", symptom="component_imbalance",
+            verdict="regressed",
+            edits=["increase ctrl_cost_weight"],
+            edit_summary=("iter 3: [component_imbalance] → applied: increase "
+                          "ctrl_cost_weight → regressed (progress -0.0200)."),
+        ),
+        relevance_score=0.91,
+    )
+    captured_q: dict = {}
+
+    def fake_query_cases(text, top_k=3, *, store=None, min_similarity=0.0,
+                         model_name=None):
+        captured_q["text"] = text
+        return [past]
+
+    monkeypatch.setattr(kg_cases, "query_cases", fake_query_cases)
+
+    diagnosis = Diagnosis(
+        failure_modes=["component_imbalance"], evidence="",
+        proposed_edits=[ProposedEdit(
+            target_term="alive_bonus", operation="increase",
+            rationale="Raise alive bonus.", suggested_value="3.0",
+            paper_refs=["1801.00690"])],
+        confidence=0.9,
+        behavior_goal="run forward without falling",
+    )
+    apply_edits(
+        current_reward_path=v0_path, diagnosis=diagnosis,
+        new_iter_id="v1", reward_contract=_hopper_contract(),
+        kg_store=kg, client=client,
+    )
+    prompt = client.messages.calls[0]["messages"][0]["content"]
+    assert "# CASE MEMORY" in prompt
+    assert "increase ctrl_cost_weight" in prompt
+    assert "[-]" in prompt                       # regressed marker
+    # the query keyed on goal + failure modes.
+    assert "run forward" in captured_q["text"]
+    assert "component_imbalance" in captured_q["text"]
+
+
+def test_apply_edits_case_memory_failure_is_silent(v0_path, kg, monkeypatch):
+    """A broken case query must not block the edit (advisory only)."""
+    import hashlib
+
+    from sculptor.kg import cases as kg_cases
+    from sculptor.kg.query import cite
+
+    parent_hash = hashlib.sha256(
+        v0_path.read_text(encoding="utf-8").encode("utf-8")).hexdigest()[:16]
+    client = _StubClient(_render_v1_source(parent_hash, cite("1801.00690", store=kg)))
+    monkeypatch.setattr(
+        kg_cases, "query_cases",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("model missing")))
+
+    diagnosis = Diagnosis(
+        failure_modes=["component_imbalance"], evidence="",
+        proposed_edits=[ProposedEdit(
+            target_term="alive_bonus", operation="increase",
+            rationale="x", suggested_value="3.0",
+            paper_refs=["1801.00690"])],
+        confidence=0.9, behavior_goal="run",
+    )
+    out = apply_edits(
+        current_reward_path=v0_path, diagnosis=diagnosis,
+        new_iter_id="v1", reward_contract=_hopper_contract(),
+        kg_store=kg, client=client,
+    )
+    assert out.is_file()
+    assert "# CASE MEMORY" not in client.messages.calls[0]["messages"][0]["content"]

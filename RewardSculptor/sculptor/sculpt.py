@@ -117,6 +117,13 @@ class IterOutcome:
     #: The naturalness-GATED progress (mirrors `steer_fitness` for the dense
     #: channel) — an unnatural rollout cannot rank up via progress either.
     steer_progress: float | None = None
+    #: §2026-07-03 case-memory upgrade: compact identities of the edits
+    #: APPLIED this iter ("<operation> <target_term>", deferred excluded)
+    #: so the KG run-case records WHAT was tried, not just how many.
+    applied_edits: list[str] = field(default_factory=list)
+    #: The metric's physical component breakdown for this iter's rollout
+    #: (same dict the diagnoser sees) — the case-memory behavior signature.
+    fitness_components: dict[str, Any] | None = None
 
 
 @dataclass
@@ -1107,12 +1114,12 @@ def _run_one_iter(
     iter_fitness: float | None = None
     iter_progress: float | None = None
     objective_progress: dict | None = None
+    fitness_components: dict | None = None
     if fitness_fn is not None:
         # §Ship 36 (F2): prefer the `.detail` accessor (rides on the fitness
         # fn) to get the FULL component breakdown in one compute; fall back to
         # the plain float for callers that supply a bare fitness_fn.
         detail_fn = getattr(fitness_fn, "detail", None)
-        fitness_components: dict | None = None
         try:
             if detail_fn is not None:
                 detail = detail_fn(iter_dir) or {}
@@ -1482,6 +1489,14 @@ def _run_one_iter(
         reverted_to_best=reverted_to_best,
         progress=iter_progress,
         steer_progress=iter_steer_progress,
+        # §2026-07-03 case-memory upgrade: what was actually tried +
+        # the behavior signature, so the KG run-case is actionable.
+        applied_edits=[
+            f"{getattr(e, 'operation', '?')} {getattr(e, 'target_term', '?')}"
+            for e in diagnosis.proposed_edits
+            if not getattr(e, "requires_env_extension", False)
+        ],
+        fitness_components=fitness_components,
     )
 
 
@@ -2069,11 +2084,12 @@ def sculpt_run(
 
     # §Ship 37: persist run-learnings to the KG case-memory so future
     # diagnoses can avoid repeating past mistakes ("the same failure can't
-    # happen twice"). Guarded: only when a KG is in use (not --no-kg) AND
-    # fitness was tracked (so each case carries a verdict). Best-effort —
+    # happen twice"). §2026-07-03: EVERY run records now (was: fitness-
+    # tracked only) — a blind run's "what was tried" is itself memory;
+    # verdicts stay 'unknown' without a measurable signal. Best-effort —
     # reopens its own store (the loop's kg_store is closed in the finally
     # above) and never lets a logging failure affect the run.
-    if not no_kg and fitness_fn is not None and result.fitness_history:
+    if not no_kg and result.completed_iters:
         try:
             from sculptor.kg.cases import record_run_cases
             from sculptor.kg.store import SculptorKG

@@ -137,6 +137,24 @@ class RunCase:
     fitness_after: float | None = None
     fitness_delta: float | None = None
     verdict: str = "unknown"                   # helped|regressed|neutral|unknown
+    # §2026-07-03 case-content upgrade. The original case carried only
+    # "responded with N edit(s)" — a future diagnoser retrieving it
+    # learned nothing actionable (WHICH edit failed? WHAT was the
+    # behavior?). All optional so pre-upgrade rows load unchanged.
+    #: Compact applied-edit identities, e.g. ["decrease stance_weight",
+    #: "add flight_bonus"] — what a future run must not blindly repeat.
+    edits: list[str] = field(default_factory=list)
+    #: Dense sub-success progress (§Convergence): the channel that ranks
+    #: iters when the completion-gated fitness is 0.0 everywhere. Without
+    #: it, every case from a below-gate run was verdict-'neutral' noise.
+    progress_before: float | None = None
+    progress_after: float | None = None
+    progress_delta: float | None = None
+    #: Salient physical numbers from the metric's component breakdown
+    #: (e.g. apex_gain_m_mean, frac_launched) — the behavior signature
+    #: that lets retrieval + the prompt distinguish "stand-still farm"
+    #: from "tumble-bounce" instead of lumping both as reward_hacking.
+    behavior: dict[str, float] = field(default_factory=dict)
     created_at: float = field(default_factory=time.time)
 
 

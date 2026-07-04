@@ -157,3 +157,119 @@ def test_render_case_context_marks_verdicts() -> None:
     out = C._render_case_context(matches)
     assert "CASE MEMORY" in out and "[-]" in out and "iter 2" in out
     assert C._render_case_context([]) == ""
+
+
+# ── §2026-07-03 case-content upgrade ───────────────────────────────────────
+def _rich_outcome(i, fms, edits=(), components=None, reverted=False):
+    return types.SimpleNamespace(
+        iter_index=i, failure_modes=fms, edit_count=len(edits),
+        applied_edits=list(edits), fitness_components=components,
+        reverted_to_best=reverted,
+    )
+
+
+def test_progress_breaks_fitness_ties_in_attribution(tmp_path) -> None:
+    """Below the completion gate the spec fitness is 0.0 everywhere — the
+    dense progress channel must supply the verdict (the tuck-jump E2E
+    recorded 12 straight neutral/unknown cases without this)."""
+    store = SculptorKG(tmp_path / "kg.db")
+    result = types.SimpleNamespace(
+        completed_iters=[
+            _rich_outcome(10, ["reward_hacking"], ["decrease stance_weight"]),
+            _rich_outcome(11, ["component_imbalance"], ["increase launch_weight"]),
+            _rich_outcome(12, ["static_equilibrium"], ["add flight_bonus"]),
+        ],
+        fitness_history=[0.0, 0.0, 0.0],
+        progress_history=[0.0196, 0.0, 0.008],
+    )
+    C.record_run_cases(store, task="tuck jump", result=result, nonce="p1")
+    by_iter = {c.edit_summary.split(":")[0]: c
+               for c in store.find_nodes(kind=RunCase.kind)}
+    assert by_iter["iter 10"].verdict == "regressed"     # progress 0.0196→0.0
+    assert by_iter["iter 10"].progress_delta < 0
+    assert "progress" in by_iter["iter 10"].edit_summary
+    assert by_iter["iter 11"].verdict == "helped"        # progress 0.0→0.008
+    assert by_iter["iter 12"].verdict == "unknown"       # last iter
+    store.close()
+
+
+def test_fitness_still_dominates_progress_when_it_moves(tmp_path) -> None:
+    store = SculptorKG(tmp_path / "kg.db")
+    result = types.SimpleNamespace(
+        completed_iters=[_rich_outcome(0, ["x"], ["add a"]),
+                         _rich_outcome(1, [], ["add b"])],
+        fitness_history=[0.2, 0.5],
+        progress_history=[0.9, 0.1],   # progress fell, but fitness ROSE
+    )
+    C.record_run_cases(store, task="kick", result=result, nonce="p2")
+    cases = sorted(store.find_nodes(kind=RunCase.kind),
+                   key=lambda c: c.edit_summary)
+    assert cases[0].verdict == "helped"                  # fitness wins
+    assert "fitness" in cases[0].edit_summary
+    store.close()
+
+
+def test_case_records_edit_identities_and_behavior_signature(tmp_path) -> None:
+    store = SculptorKG(tmp_path / "kg.db")
+    comps = {"apex_gain_m_mean": 0.0381, "frac_launched": 0.0,
+             "c_returned": 0.9721, "note": "not-a-number",
+             "progress_score": 0.0196}
+    result = types.SimpleNamespace(
+        completed_iters=[
+            _rich_outcome(10, ["static_equilibrium"],
+                          ["decrease stance_weight", "increase launch_weight"],
+                          components=comps),
+        ],
+        fitness_history=[0.0],
+        progress_history=[0.0196],
+    )
+    C.record_run_cases(store, task="tuck jump", result=result, nonce="p3")
+    (case,) = store.find_nodes(kind=RunCase.kind)
+    assert case.edits == ["decrease stance_weight", "increase launch_weight"]
+    assert "decrease stance_weight" in case.edit_summary
+    assert case.behavior["apex_gain_m_mean"] == 0.0381
+    assert "note" not in case.behavior                   # non-numeric dropped
+    assert "apex_gain_m_mean=0.0381" in case.edit_summary
+    # the embedded/matched text carries the edit identities.
+    assert "decrease stance_weight" in C._case_text(case)
+    store.close()
+
+
+def test_blind_run_records_what_was_tried(tmp_path) -> None:
+    """No fitness_fn (blind loop): cases still record symptom + edits with
+    verdict 'unknown' — what was tried is itself memory."""
+    store = SculptorKG(tmp_path / "kg.db")
+    result = types.SimpleNamespace(
+        completed_iters=[_rich_outcome(0, ["reward_hacking"], ["clip tuck_reward"])],
+        fitness_history=[],
+        progress_history=[],
+    )
+    n = C.record_run_cases(store, task="hop", result=result, nonce="b1")
+    assert n == 1
+    (case,) = store.find_nodes(kind=RunCase.kind)
+    assert case.verdict == "unknown"
+    assert case.edits == ["clip tuck_reward"]
+    store.close()
+
+
+def test_pre_upgrade_rows_still_load(tmp_path) -> None:
+    """Old RunCase rows (no edits/progress/behavior keys) must round-trip
+    through the store with the new dataclass defaults."""
+    import json as _json
+    import sqlite3 as _sqlite3
+
+    store = SculptorKG(tmp_path / "kg.db")
+    old_blob = {"task": "kick", "robot": "", "symptom": "falls",
+                "failure_modes": ["x"], "edit_summary": "iter 1: old shape",
+                "fitness_before": 0.1, "fitness_after": 0.2,
+                "fitness_delta": 0.1, "verdict": "helped",
+                "created_at": 0.0}
+    conn = _sqlite3.connect(store.db_path)
+    conn.execute("INSERT INTO nodes (id, kind, data) VALUES (?, ?, ?)",
+                 ("case:old", "RunCase", _json.dumps(old_blob)))
+    conn.commit(); conn.close()
+    (case,) = store.find_nodes(kind=RunCase.kind)
+    assert case.verdict == "helped"
+    assert case.edits == [] and case.behavior == {}
+    assert case.progress_delta is None
+    store.close()
