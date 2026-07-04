@@ -149,5 +149,6 @@ class KGStats(BaseModel):
     reward_components: int = 0
     environments: int = 0
     results: int = 0
+    run_cases: int = 0
     edges: int = 0
     embeddings: int = 0

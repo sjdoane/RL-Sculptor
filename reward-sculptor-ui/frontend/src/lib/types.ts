@@ -269,6 +269,7 @@ export interface KGStats {
   reward_components: number;
   environments: number;
   results: number;
+  run_cases: number;
   edges: number;
   embeddings: number;
 }
@@ -648,6 +649,7 @@ export interface SystemKgStatsResponse {
   reward_components: number;
   environments: number;
   results: number;
+  run_cases: number;
   edges: number;
   embeddings: number;
 }

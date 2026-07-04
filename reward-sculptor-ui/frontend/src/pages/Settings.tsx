@@ -425,6 +425,7 @@ function SharedKgCard() {
               <KgStat label="Failure modes" value={data.failure_modes} />
               <KgStat label="Reward comps" value={data.reward_components} />
               <KgStat label="Environments" value={data.environments} />
+              <KgStat label="Run experience" value={data.run_cases} />
               <KgStat label="Edges" value={data.edges} />
             </div>
             <div className="rs-kv">

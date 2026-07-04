@@ -122,6 +122,7 @@ def get_shared_kg_stats() -> SystemKgStatsResponse:
         reward_components=int(nodes.get("RewardComponent", 0)),
         environments=int(nodes.get("Environment", 0)),
         results=int(nodes.get("Result", 0)),
+        run_cases=int(nodes.get("RunCase", 0)),
         edges=int(raw.get("total_edges", 0)),
         embeddings=int(raw.get("total_embeddings", 0)),
     )
