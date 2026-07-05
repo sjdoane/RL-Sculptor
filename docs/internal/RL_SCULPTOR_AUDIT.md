@@ -562,6 +562,21 @@ every archived rollout.
   edits. (4) the iter-24 evidence (launch fraction ×6 under the env
   change) is the first measured demonstration that the env surface
   has real behavioral leverage in this loop.
+- **Increment-5 adversarial verification** (subagent, commit 0d334fe):
+  pass-with-findings, all LOW/INFO; independently confirmed run-1 log
+  coherence (every env revert paired 1:1 with a reward revert; at most
+  one env_spec_updated per iter by construction; endpoint
+  traversal-safe; frontend guards present; typecheck exit 0). Fixed
+  (commit b349fd1): mixed-type dict keys made the validator's
+  unknown-key `sorted()` raise — now key=str + regression test; the
+  errors-never-raises contract holds over Any. Left documented, not
+  patched: per-GROUP (not per-sub-knob) applied disclosure for
+  commands/push (partially-writable cfg shapes don't occur on real
+  mjlab tasks; RSI — where sub-knobs genuinely vary — already
+  discloses per-knob); a pre-existing slug-shaped-traversal 500 in the
+  UI project store (spawned as a follow-up task chip, out of tonight's
+  scope). E2E run 2 (iters 29-34) launched 19:08 under the
+  fully-hardened code; evidence below when complete.
 
 ### 2026-07-01 — loop 1: dense progress channel + tie-deadlock fix
 - **What**: `sculptor/sculpt.py` — `IterOutcome.progress/steer_progress`,
