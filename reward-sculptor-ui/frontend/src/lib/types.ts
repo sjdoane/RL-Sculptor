@@ -494,6 +494,14 @@ export interface IterEventSummary {
   // §Ship 48: edits deferred for requires_env_extension this iter (the
   // diagnoser wants a field the adapter doesn't expose). null when none.
   env_extension_suggestion?: EnvExtensionSuggestionPayload | null;
+  // §env generalization: the diagnoser's env-curriculum change applied
+  // at this iter's boundary (takes effect NEXT iter's training). null
+  // until an iter proposes env edits.
+  env_spec_update?: {
+    new_version: string | null;
+    applied: string[];
+    rejected: Array<{ parameter: string; reason: string }>;
+  } | null;
   // Populated by `iter_progress` events emitted from inside the mjlab
   // training subprocess. Lets the Timeline panel render a live progress
   // bar for the running iter instead of a silent "running" spinner.

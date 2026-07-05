@@ -9,7 +9,9 @@ Contract references (API contract §3.1):
 
 from __future__ import annotations
 
+import json
 import re
+from pathlib import Path
 from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, Request, Response, status
@@ -17,6 +19,7 @@ from fastapi.responses import JSONResponse
 
 from backend.models.project import (
     CreateProjectRequest,
+    EnvSpecInfo,
     IterationSettings,
     ProblemDetail,
     ProjectDetail,
@@ -649,6 +652,47 @@ def delete_project(slug: str, store: ProjectStore = Depends(get_store)) -> Any:
             type_="/problems/not-found",
         )
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# ── §env generalization: read-only env-spec surface ────────────────────
+@router.get(
+    "/{slug}/env-spec",
+    response_model=EnvSpecInfo,
+    responses={404: {"model": ProblemDetail}},
+)
+def get_project_env_spec(
+    slug: str, store: ProjectStore = Depends(get_store),
+) -> Any:
+    """The project's environment-adaptation spec: the active
+    env/current.json (goal-conditioned, diagnoser-iterated) plus the
+    version list. `active=false` for projects on task defaults. Read-only
+    — the spec is generated and iterated by the sculpt loop; per-iter
+    changes ride the `env_spec_updated` run events."""
+    detail = store.get(slug)
+    if detail is None:
+        return _problem(
+            status.HTTP_404_NOT_FOUND, "project not found",
+            detail=f"no project with slug {slug!r}",
+            type_="/problems/not-found",
+        )
+    env_dir = Path(detail.project_dir) / "env"
+    current: Optional[dict] = None
+    cur_path = env_dir / "current.json"
+    if cur_path.is_file():
+        try:
+            loaded = json.loads(cur_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                current = loaded
+        except (OSError, ValueError):
+            current = None
+    versions: list[str] = []
+    if env_dir.is_dir():
+        for p in env_dir.glob("v*.json"):
+            if p.stem[1:].isdigit():
+                versions.append(p.stem)
+        versions.sort(key=lambda s: int(s[1:]))
+    return EnvSpecInfo(
+        active=current is not None, current=current, versions=versions)
 
 
 # ── §Ship-8: per-project settings (editable config.toml [iteration]) ───

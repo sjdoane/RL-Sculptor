@@ -1230,6 +1230,9 @@ def _iter_events(job: Job) -> list[dict[str, Any]]:
                 # because the adapter doesn't expose the needed field
                 # (requires_env_extension). None until an iter defers ≥1.
                 "env_extension_suggestion": None,
+                # §env generalization: env-curriculum change applied at
+                # this iter's boundary (None until env_spec_updated fires).
+                "env_spec_update": None,
                 # §Ship 34: objective fitness-in-the-loop (None for blind runs).
                 "fitness": None,
                 "best_fitness": None,
@@ -1349,6 +1352,14 @@ def _iter_events(job: Job) -> list[dict[str, Any]]:
         elif etype == "best_reward_selected":
             if isinstance(ev.get("fitness"), (int, float)):
                 slot["best_fitness"] = float(ev.get("fitness"))
+        elif etype == "env_spec_updated":
+            # §env generalization: the diagnoser's env-curriculum change
+            # (applied + rejected with reasons) for this iter's boundary.
+            slot["env_spec_update"] = {
+                "new_version": ev.get("new_version"),
+                "applied": list(ev.get("applied") or []),
+                "rejected": list(ev.get("rejected") or []),
+            }
 
     # §fix: a sequential sculpt loop runs ONE iter at a time, so only the
     # highest-started iter can still be running. A LOWER iter still marked

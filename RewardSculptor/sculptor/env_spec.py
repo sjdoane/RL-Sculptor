@@ -195,7 +195,10 @@ def validate_env_spec(spec: Any) -> list[str]:
     def _hi(v: Any) -> float:
         try:
             return float(v[1])
-        except (TypeError, ValueError, IndexError):
+        except (TypeError, ValueError, LookupError):
+            # LookupError covers KeyError too — a dict-valued "range"
+            # (e.g. {"lo":0,"hi":1} from an LLM edit) must land in the
+            # error list via the range checks above, not crash here.
             return 0.0
 
     rsi_airborne = (_hi(train.get("reset_height_offset_m")) > 0.0
@@ -333,6 +336,15 @@ def apply_env_edits(env_dir: Path, edits: list) -> dict:
     work = json.loads(json.dumps(spec))
     changed = False
     applied_rationales: list[str] = []
+    # Order-independence for the RSI↔early-termination pairing: apply
+    # min_base_height_termination_m FIRST so a batch proposing both the
+    # sunk key and RSI ranges succeeds regardless of emission order
+    # (validated after EACH edit, so RSI-before-sunk would otherwise
+    # reject the RSI half of a correct pair).
+    edits = sorted(
+        edits,
+        key=lambda e: 0 if str(_field(e, "parameter") or "")
+        == "min_base_height_termination_m" else 1)
     for e in edits:
         param = str(_field(e, "parameter") or "")
         raw = _field(e, "new_value")
@@ -348,7 +360,9 @@ def apply_env_edits(env_dir: Path, edits: list) -> dict:
                 (param, f"new_value {raw!r} is not valid JSON"))
             continue
         train_now = work.get("train") or {}
-        if param in train_now and train_now[param] == value:
+        if (param in train_now and train_now[param] == value
+                and isinstance(value, bool)
+                == isinstance(train_now[param], bool)):
             # A no-op must not burn a version number — and the diagnoser
             # should hear that its edit changed nothing.
             result["rejected"].append(

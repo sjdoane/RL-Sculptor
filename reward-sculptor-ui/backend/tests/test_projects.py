@@ -647,3 +647,55 @@ def test_patch_settings_no_trailing_newline(
     with config.open("rb") as f:
         parsed = tomllib.load(f)
     assert parsed["iteration"]["steps_per_iter"] == 123
+
+
+# ── §env generalization: read-only env-spec surface ─────────────────────
+def test_env_spec_endpoint_inactive_then_active(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    import json as _json
+
+    r = client.post("/projects", json={"name": "EnvSpec"})
+    assert r.status_code == 201
+    slug = r.json()["slug"]
+
+    # No env spec yet → inactive, no versions.
+    r = client.get(f"/projects/{slug}/env-spec")
+    assert r.status_code == 200, r.text
+    assert r.json() == {"active": False, "current": None, "versions": []}
+
+    # Materialize a spec the way the loop does (v<N>.json + current copy).
+    env_dir = tmp_projects_root / slug / "env"
+    env_dir.mkdir()
+    spec = {
+        "env_spec_version": 1,
+        "meta": {"version": "v0", "source": "generated"},
+        "shared": {"episode_length_s": 10.0},
+        "train": {"entropy_coef_scale": 2.0},
+    }
+    (env_dir / "v0.json").write_text(_json.dumps(spec))
+    spec2 = {**spec, "meta": {"version": "v1", "source": "diagnoser"}}
+    (env_dir / "v1.json").write_text(_json.dumps(spec2))
+    (env_dir / "current.json").write_text(_json.dumps(spec2))
+
+    r = client.get(f"/projects/{slug}/env-spec")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["active"] is True
+    assert body["versions"] == ["v0", "v1"]
+    assert body["current"]["meta"]["version"] == "v1"
+    assert body["current"]["train"]["entropy_coef_scale"] == 2.0
+
+    # Corrupt current.json degrades to inactive, versions still listed.
+    (env_dir / "current.json").write_text("{not json")
+    r = client.get(f"/projects/{slug}/env-spec")
+    assert r.status_code == 200
+    assert r.json()["active"] is False
+    assert r.json()["versions"] == ["v0", "v1"]
+
+
+def test_env_spec_endpoint_404_for_unknown_project(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    r = client.get("/projects/nope/env-spec")
+    assert r.status_code == 404

@@ -509,22 +509,27 @@ def _apply_env_spec(env_cfg: Any, spec: "dict | None", *,
         try:
             twist = (getattr(env_cfg, "commands", None) or {}).get("twist")
             if twist is not None:
+                wrote_c = False
                 ranges = getattr(twist, "ranges", None)
                 for f in ("lin_vel_x", "lin_vel_y", "ang_vel_z"):
                     if ranges is not None and hasattr(ranges, f):
                         setattr(ranges, f, (0.0, 0.0))
+                        wrote_c = True
                 # heading must be None (not (0,0)) — UniformVelocityCommand
                 # rejects ANY truthy heading range when heading_command=False
                 # (caught live: first loop-4 E2E launch, 2026-07-01).
                 if ranges is not None and hasattr(ranges, "heading"):
                     ranges.heading = None
+                    wrote_c = True
                 for f, v in (("rel_standing_envs", 1.0),
                              ("rel_heading_envs", 0.0),
                              ("rel_forward_envs", 0.0),
                              ("heading_command", False)):
                     if hasattr(twist, f):
                         setattr(twist, f, v)
-                applied.append("commands:twist→zero/standing")
+                        wrote_c = True
+                if wrote_c:
+                    applied.append("commands:twist→zero/standing")
         except Exception as e:  # noqa: BLE001 — never break a run
             _skip("command zeroing", e)
         # Coupled by construction: the command curriculum RE-WIDENS the
@@ -548,9 +553,11 @@ def _apply_env_spec(env_cfg: Any, spec: "dict | None", *,
                     applied.append("events:push_robot→removed")
                 else:
                     term = events["push_robot"]
+                    wrote_p = False
                     iv = push.get("interval_s")
                     if iv is not None and hasattr(term, "interval_range_s"):
                         term.interval_range_s = (float(iv[0]), float(iv[1]))
+                        wrote_p = True
                     params = getattr(term, "params", None)
                     vr = (params or {}).get("velocity_range")
                     if isinstance(vr, dict):
@@ -559,12 +566,15 @@ def _apply_env_spec(env_cfg: Any, spec: "dict | None", *,
                             for ax in ("x", "y", "z"):
                                 if ax in vr:
                                     vr[ax] = (-float(lin), float(lin))
+                                    wrote_p = True
                         ang = push.get("angular_radps")
                         if ang is not None:
                             for ax in ("roll", "pitch", "yaw"):
                                 if ax in vr:
                                     vr[ax] = (-float(ang), float(ang))
-                    applied.append("events:push_robot→retuned")
+                                    wrote_p = True
+                    if wrote_p:
+                        applied.append("events:push_robot→retuned")
         except Exception as e:  # noqa: BLE001
             _skip("push_robot", e)
 
@@ -687,9 +697,13 @@ def _apply_env_spec(env_cfg: Any, spec: "dict | None", *,
     if shared.get("zero_velocity_commands"):
         requested.append("commands:twist→zero/standing")
     if isinstance(push, dict):
-        requested.append(
-            "events:push_robot→removed" if not push.get("enabled", True)
-            else "events:push_robot→retuned")
+        if not push.get("enabled", True):
+            requested.append("events:push_robot→removed")
+        elif any(push.get(k) is not None
+                 for k in ("interval_s", "linear_mps", "angular_radps")):
+            # enabled=true with no retune values means "keep pushes" —
+            # honored by doing nothing, so it is never a dead knob.
+            requested.append("events:push_robot→retuned")
     if shared.get("orientation_termination_deg") is not None:
         requested.append("terminations:fell_over")
     if shared.get("episode_length_s") is not None:
@@ -728,6 +742,13 @@ def _apply_rl_spec(rl_cfg: Any, spec: "dict | None") -> None:
             algo.entropy_coef = float(cur) * float(scale)
             print(f"[runner] rl-spec: entropy_coef {cur} → "
                   f"{algo.entropy_coef}", file=sys.stderr, flush=True)
+        else:
+            # entropy_coef_scale IS diagnoser-iterable — a dead knob
+            # must be disclosed like the env-side ones, or the loop
+            # retunes it blindly forever.
+            print("[runner] rl-spec: entropy_coef_scale NOT APPLICABLE "
+                  "(task cfg exposes no positive algorithm.entropy_coef)",
+                  file=sys.stderr, flush=True)
     except Exception as e:  # noqa: BLE001 — never break a run
         print(f"[runner] rl-spec skipped: {type(e).__name__}: {e}",
               file=sys.stderr, flush=True)

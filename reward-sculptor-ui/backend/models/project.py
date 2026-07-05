@@ -150,6 +150,23 @@ class ProjectSettings(BaseModel):
     iteration: IterationSettings
 
 
+class EnvSpecInfo(BaseModel):
+    """§env generalization: the project's environment-adaptation spec —
+    the per-project, goal-conditioned env config the sculpt loop trains
+    under and whose train section the diagnoser iterates between
+    iterations. Read-only surface; the spec is generated and iterated
+    by the loop itself (env_spec_updated events carry the changes)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    #: False when the project has no env spec (task-default environment).
+    active: bool
+    #: The active spec (env/current.json content), None when inactive.
+    current: Optional[dict] = None
+    #: All version names on disk, numerically sorted ("v0", "v1", ...).
+    versions: list[str] = []
+
+
 class ProblemDetail(BaseModel):
     """RFC 7807 problem-details shape. Served with
     `application/problem+json` media type."""

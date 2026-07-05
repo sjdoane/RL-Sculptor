@@ -1818,3 +1818,38 @@ def test_control_endpoint_merges_mode_resume_and_stop(
         json={"mode": "auto"}).status_code == 404
 
     client.delete(f"/projects/{slug}/runs/{run_id}")
+
+
+def test_env_spec_update_surfaced_in_iter_summary() -> None:
+    """§env generalization: an `env_spec_updated` event lands in the iter
+    slot's `env_spec_update` field (applied + rejected with reasons — the
+    diagnoser's env-curriculum change); an iter without the event keeps
+    the field None."""
+    from backend.services.job_manager import Job
+    from backend.services.run_manager import build_iterations_summary
+
+    job = Job(job_id="t_envspec", kind="sculpt_run", project_slug="p",
+              status="completed")
+    job.events = [
+        {"type": "iter_started", "iter": 0},
+        {"type": "env_spec_updated", "iter": 0,
+         "new_version": "v1",
+         "applied": ["entropy_coef_scale=1.5"],
+         "rejected": [{"parameter": "entropy_coef_scale",
+                       "reason": "99.0 outside hard bounds [0.25, 4.0]"}]},
+        {"type": "iter_completed", "iter": 0, "failure_modes": [],
+         "edit_count": 0},
+        {"type": "iter_started", "iter": 1},
+        {"type": "iter_completed", "iter": 1, "failure_modes": [],
+         "edit_count": 1},
+    ]
+    iters = build_iterations_summary(job)
+    s0 = next(it for it in iters if it["iter_index"] == 0)
+    s1 = next(it for it in iters if it["iter_index"] == 1)
+    assert s0["env_spec_update"] == {
+        "new_version": "v1",
+        "applied": ["entropy_coef_scale=1.5"],
+        "rejected": [{"parameter": "entropy_coef_scale",
+                      "reason": "99.0 outside hard bounds [0.25, 4.0]"}],
+    }
+    assert s1["env_spec_update"] is None

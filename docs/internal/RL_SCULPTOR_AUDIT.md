@@ -471,6 +471,46 @@ general mechanism + verifier-hardening + E2E
 - **Verified**: tests/test_env_edits.py grew 13 → 19; full suite 1083
   passed / 1 skipped / 4 gpu-marked deselected (they passed in the
   pre-launch run; deselected only to keep VRAM free for the live E2E).
+  Commit 066c2e9.
+
+### 2026-07-04 — env generalization 5: 4a+4b verification fixes + the
+env-spec lifecycle visible in the UI
+
+- **Increments 4a+4b adversarial verification** (subagent, commits
+  9773563+066c2e9): pass-with-findings; migration confirmed live
+  (spec == jump_preset_spec() by dict equality; live run applying it,
+  0 tracebacks); invariant edge-probes green. Fixed here:
+  * MEDIUM — `validate_env_spec` raised KeyError on a dict-valued
+    range field (valid-JSON LLM edit like {"lo":0,"hi":0.4}), killing
+    a whole edit batch: `_hi` now catches LookupError; regression test
+    pins the innocent-bystander edit surviving.
+  * LOW — RSI+sunk proposed in one batch was order-dependent (per-edit
+    validation rejected RSI-before-sunk): apply_env_edits now applies
+    min_base_height_termination_m first; order-independence tested.
+  * LOW — symlinked env/ dir could split the diagnose surface from the
+    apply target (resolve() asymmetry): both sides now resolve fully.
+  * LOW — remaining false-applied branches gated per-write
+    (commands zeroing, push retune); enabled-true-no-values push spec
+    correctly not a dead knob; entropy_coef_scale (diagnoser-iterable)
+    now discloses NOT APPLICABLE when the task cfg lacks a positive
+    entropy_coef; bool-vs-number no-op comparison quirk closed.
+- **UI (memory rule: every feature UI-reachable)**: the env-spec
+  lifecycle is now visible end to end —
+  * backend: `IterEventSummary.env_spec_update` populated from
+    `env_spec_updated` events (REST timeline survives reload); new
+    read-only `GET /projects/{slug}/env-spec` (active/current/
+    versions; corrupt current.json degrades to inactive, versions
+    still listed).
+  * frontend: Runs-tab iteration card shows an `env → v<N>` chip
+    (tooltip: applied + rejected-with-reasons; "training-only, takes
+    effect next iteration"); iteration detail card lists applied
+    (tags) and rejected (struck-through, reason on hover) env edits;
+    live WS handler + slot merge + types extended.
+  The generated/failed/reverted/best-selected env events already
+  reach the UI through the generic typed-event stream + LogViewer.
+- **Verified**: sculptor env-layer 78 passed; UI backend suite + new
+  endpoint/timeline tests; `pnpm typecheck` clean (via WSL pnpm node —
+  Windows node cannot run tsc over UNC). Full-suite counts below.
 
 ### 2026-07-01 — loop 1: dense progress channel + tie-deadlock fix
 - **What**: `sculptor/sculpt.py` — `IterOutcome.progress/steer_progress`,

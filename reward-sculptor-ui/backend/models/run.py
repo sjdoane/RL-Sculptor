@@ -222,6 +222,12 @@ class IterEventSummary(BaseModel):
     # progress_score — ranks iterations below the completion gate). None
     # when the metric doesn't emit it.
     progress: Optional[float] = None
+    # §env generalization: diagnoser env-curriculum change applied at
+    # this iter's boundary (env_spec_updated event): {"new_version":
+    # "v2" | None, "applied": ["entropy_coef_scale=1.5", ...],
+    # "rejected": [{"parameter": ..., "reason": ...}]}. Takes effect the
+    # NEXT iteration's training. None until an iter proposes env edits.
+    env_spec_update: Optional[dict] = None
 
 
 class ErrorClassification(BaseModel):

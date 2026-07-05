@@ -685,6 +685,18 @@ function IterationTimeline({ iters, selected, onSelect }: { iters: IterEventSumm
               physics: {it.realism_audit.verdict}
             </span>
           )}
+          {it.env_spec_update && (it.env_spec_update.applied.length > 0 || it.env_spec_update.rejected.length > 0) && (
+            <span
+              className="rs-tag mono"
+              style={{ marginTop: 4, fontSize: 10, background: "var(--st-blue-bg)", color: "var(--st-blue-fg)", display: "inline-block" }}
+              title={[
+                ...it.env_spec_update.applied.map((a) => `applied: ${a}`),
+                ...it.env_spec_update.rejected.map((r) => `rejected ${r.parameter}: ${r.reason}`),
+              ].join("; ") + " | training-only env curriculum; takes effect next iteration"}
+            >
+              env {it.env_spec_update.new_version ? `→ ${it.env_spec_update.new_version}` : "edits rejected"}
+            </span>
+          )}
           {it.physics_edit_suggestion && it.physics_edit_suggestion.prompt && (() => {
             const state = it.physics_edit_suggestion.auto_apply_state;
             const disabled = state === "in_progress" || state === "applied";
@@ -771,6 +783,21 @@ function IterationDetailCard({ iter }: { iter: IterEventSummary | null }) {
           </div>
         )}
         {iter.edit_count !== null && <div className="rs-flex-between" style={{ fontSize: 12 }}><span className="rs-sub">edits</span><span className="rs-num">{iter.edit_count}</span></div>}
+        {iter.env_spec_update && (
+          <div>
+            <div className="rs-eyebrow" style={{ marginBottom: 4 }}>
+              env spec{iter.env_spec_update.new_version ? ` → ${iter.env_spec_update.new_version}` : ""}
+            </div>
+            <div className="rs-flex rs-wrap rs-gap-6">
+              {iter.env_spec_update.applied.map((a) => (
+                <span key={a} className="rs-tag mono" style={{ fontSize: 10 }} title="applied to the training-only env curriculum (next iteration)">{a}</span>
+              ))}
+              {iter.env_spec_update.rejected.map((r, i) => (
+                <span key={`rej-${i}`} className="rs-tag mono" style={{ fontSize: 10, opacity: 0.55, textDecoration: "line-through" }} title={r.reason}>{r.parameter}</span>
+              ))}
+            </div>
+          </div>
+        )}
         {iter.paper_refs.length > 0 && (
           <div>
             <div className="rs-eyebrow" style={{ marginBottom: 4 }}>paper refs</div>
@@ -816,6 +843,7 @@ function _mergeIterSlot(prev: IterEventSummary | undefined, next: IterEventSumma
     fitness: winner.fitness ?? loser.fitness,
     best_fitness: winner.best_fitness ?? loser.best_fitness,
     progress: winner.progress ?? loser.progress,
+    env_spec_update: winner.env_spec_update ?? loser.env_spec_update,
   };
 }
 
@@ -1031,6 +1059,14 @@ function useMergedIterations(rest: IterEventSummary[], events: RunEvent[]): Iter
       }
       if (ev.type === "best_reward_selected") {
         if (typeof ev.fitness === "number") slot.best_fitness = ev.fitness;
+      }
+      // §env generalization: the diagnoser's env-curriculum change.
+      if (ev.type === "env_spec_updated") {
+        slot.env_spec_update = {
+          new_version: typeof ev.new_version === "string" ? ev.new_version : null,
+          applied: Array.isArray(ev.applied) ? (ev.applied as string[]) : [],
+          rejected: Array.isArray(ev.rejected) ? (ev.rejected as Array<{ parameter: string; reason: string }>) : [],
+        };
       }
       eventSlots.set(iter, slot);
     }

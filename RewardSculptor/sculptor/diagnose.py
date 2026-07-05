@@ -739,7 +739,11 @@ def diagnose(
     env_spec: dict | None = None
     _env_spec_path = str(getattr(adapter, "env_spec_path", "") or "")
     if _env_spec_path:
-        _managed_spec = Path(config).resolve().parent / "env" / "current.json"
+        # Full-path resolve on BOTH sides (matches sculpt.py's condition
+        # exactly — a symlinked env/ dir must not split the surface from
+        # the apply target).
+        _managed_spec = (
+            Path(config).resolve().parent / "env" / "current.json").resolve()
         if Path(_env_spec_path).resolve() == _managed_spec:
             try:
                 from sculptor.env_spec import load_env_spec

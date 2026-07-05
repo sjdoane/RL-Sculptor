@@ -100,6 +100,42 @@ def test_apply_env_edits_no_active_spec(tmp_path) -> None:
     assert res["rejected"] == [("entropy_coef_scale", "no active env spec")]
 
 
+def test_apply_env_edits_dict_valued_range_rejected_not_crash(tmp_path) -> None:
+    """4a+4b verifier MEDIUM: a dict-valued 'range' from an LLM edit
+    ({'lo':0,'hi':0.4} is valid JSON) raised KeyError out of the pairing
+    invariant's _hi and killed the whole batch. Must reject per-edit."""
+    env_dir = _seed_env(tmp_path)
+    res = es.apply_env_edits(env_dir, [
+        ProposedEnvEdit("reset_height_offset_m",
+                        '{"lo": 0, "hi": 0.4}', "dict-shaped range"),
+        ProposedEnvEdit("entropy_coef_scale", "1.5", "innocent bystander"),
+    ])
+    assert res["applied"] == ["entropy_coef_scale=1.5"]   # bystander survives
+    assert any(p == "reset_height_offset_m" for p, _ in res["rejected"])
+    # And the validator itself returns errors, never raises.
+    errs = es.validate_env_spec({
+        "env_spec_version": 1,
+        "train": {"reset_height_offset_m": {"lo": 0, "hi": 1}}})
+    assert errs and any("reset_height_offset_m" in e for e in errs)
+
+
+def test_apply_env_edits_pairing_batch_order_independent(tmp_path) -> None:
+    """4a+4b verifier LOW: a batch proposing RSI ranges AND the sunk key
+    must succeed regardless of emission order (sunk applies first)."""
+    env_dir = tmp_path / "env"
+    es.write_env_spec_version(env_dir, {
+        "env_spec_version": 1, "meta": {}, "shared": {}, "train": {}})
+    res = es.apply_env_edits(env_dir, [
+        ProposedEnvEdit("reset_height_offset_m", "[0.0, 0.3]", "RSI"),
+        ProposedEnvEdit("min_base_height_termination_m", "0.25", "pairing"),
+    ])
+    assert res["rejected"] == []
+    assert sorted(res["applied"]) == [
+        "min_base_height_termination_m=0.25",
+        "reset_height_offset_m=[0.0, 0.3]",
+    ]
+
+
 def test_apply_env_edits_accepts_dict_edits(tmp_path) -> None:
     env_dir = _seed_env(tmp_path)
     res = es.apply_env_edits(env_dir, [
