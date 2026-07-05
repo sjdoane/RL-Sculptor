@@ -250,6 +250,13 @@ treated as regressions.
   a jump on Mjlab-Velocity-Flat-Unitree-G1).
 
 ## 6. Residual risks / watch items
+- **Noise-floor progress mints new bests (observed E2E run 1,
+  2026-07-04)**: progress_score values at the sensor-noise ramp's
+  bottom (1e-7..4e-6) differ seed-to-seed among behaviorally-identical
+  re-rolls, so "new bests" at noise level reset fitness_patience and
+  plateau early-stop may never fire. Harmless for fixed iteration
+  budgets; consider an epsilon on the lexicographic tie-break (loop-1
+  surface, NOT the env layer) if patience-based stopping matters.
 - `progress_score` is a new steering surface. Mitigations in place:
   min-composition, naturalness gating, lexicographic subordination to
   spec, Goodhart-onset stop. NOT yet covered: a metric whose dense

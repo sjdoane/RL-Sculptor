@@ -120,7 +120,7 @@ def _check_push(name: str, v: Any, errors: list[str]) -> None:
         return
     unknown = set(v) - _PUSH_KEYS
     if unknown:
-        errors.append(f"{name}: unknown keys {sorted(unknown)}")
+        errors.append(f"{name}: unknown keys {sorted(unknown, key=str)}")
     if "enabled" not in v or not isinstance(v["enabled"], bool):
         errors.append(f"{name}: requires boolean 'enabled'")
     if "interval_s" in v:
@@ -142,7 +142,7 @@ def validate_env_spec(spec: Any) -> list[str]:
         return [f"env spec must be a JSON object, got {type(spec).__name__}"]
     unknown = set(spec) - _TOP_KEYS
     if unknown:
-        errors.append(f"unknown top-level keys {sorted(unknown)}")
+        errors.append(f"unknown top-level keys {sorted(unknown, key=str)}")
     if spec.get("env_spec_version") != ENV_SPEC_VERSION:
         errors.append(
             f"env_spec_version must be {ENV_SPEC_VERSION}, "
@@ -157,7 +157,7 @@ def validate_env_spec(spec: Any) -> list[str]:
     unknown = set(shared) - _SHARED_KEYS
     if unknown:
         errors.append(
-            f"shared: unknown keys {sorted(unknown)} "
+            f"shared: unknown keys {sorted(unknown, key=str)} "
             f"(allowed: {sorted(_SHARED_KEYS)})")
     if ("zero_velocity_commands" in shared
             and not isinstance(shared["zero_velocity_commands"], bool)):
@@ -175,7 +175,7 @@ def validate_env_spec(spec: Any) -> list[str]:
     unknown = set(train) - _TRAIN_KEYS
     if unknown:
         errors.append(
-            f"train: unknown keys {sorted(unknown)} "
+            f"train: unknown keys {sorted(unknown, key=str)} "
             f"(allowed: {sorted(_TRAIN_KEYS)})")
     for k, bounds in _TRAIN_SCALARS.items():
         if k in train:

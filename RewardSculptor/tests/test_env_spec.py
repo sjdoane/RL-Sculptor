@@ -117,6 +117,19 @@ def test_non_finite_and_wrong_types_rejected() -> None:
     assert len(errors) >= 3
 
 
+def test_mixed_key_types_never_raise() -> None:
+    """Increment-5 verifier: mixed str+int dict keys made the
+    unknown-key `sorted()` raise TypeError. Contract: errors, never
+    raises, for ANY input shape."""
+    errs = es.validate_env_spec({
+        "env_spec_version": 1,
+        1: "int-keyed",
+        "shared": {2: "x", "episode_length_s": 10.0},
+        "train": {3: "y"},
+    })
+    assert errs and all(isinstance(e, str) for e in errs)
+
+
 def test_wrong_version_rejected() -> None:
     assert es.validate_env_spec({"env_spec_version": 2}) != []
     assert es.validate_env_spec({}) != []
