@@ -578,6 +578,48 @@ every archived rollout.
   scope). E2E run 2 (iters 29-34) launched 19:08 under the
   fully-hardened code; evidence below when complete.
 
+### 2026-07-04/05 — E2E run 2 (iters 29-34, ~5 GPU-h): first
+loop-discovered (reward, env) best pair
+
+Run under the fully-hardened code (0b31141-era; runner subprocesses
+picked up per-write disclosure — log shows `RSI(z,vz)` tags and the
+diagnoser's live sunk values `+sunk(base<0.5m)`).
+
+- **CUDA transient (not a code defect)**: iter 30's first attempt died
+  14 min in with an async `torch.AcceleratorError: CUDA error: unknown
+  error` (Warp error 999 on device-free) inside mjlab's OWN default
+  reward term — WSL2 GPU passthrough flake; iter 29 and the retry
+  trained fine under identical code. Resumed with `--resume`
+  (sculpt_envspec2b_2006.log); the interrupted (v30, v7) pair trained
+  exactly as the resume semantics intend. Watch item: long WSL2
+  sessions can drop CUDA; the loop's resume machinery absorbed it.
+- **Iteration table** (gen_002 full-precision recompute):
+  | iter | trained (reward, env) | env edit → version | outcome |
+  |---|---|---|---|
+  | 29 | v22, v0 | sunk 0.5 → v7 | 1.9e-7; upright crouch reproduced |
+  | 30 | v30, v7 | vz [0,0.5] → v8 | 0.0; apex 0.097, launched 0.09, upright lost |
+  | 31 | v31, v8 | sunk 0.6 → v9 | 9e-14 (new best by sub-display margin) |
+  | 32 | v32, v9 | sunk 0.4 + vz [0.5,2.5] → v10 | 0.0; sunk-0.6 killed everything (mean return −7.7, premature_termination) → PAIR revert |
+  | 33 | v31, v8 (revert ✓) | entropy 3.5 + vz [0,2.5] → v11 | **0.00765 — best dense progress of the RSI era** (returned 1.0, upright_end 1.0, settle > 0; tuck 0.03, apex 0.033 — a STABLE STANDER, all channels weakly nonzero) |
+  | 34 | v34, v11 | sunk 0.6 → v12 | 0.0; the most launch-oriented rollout of the run (launched 0.25, apex 0.109) but upright/returned 0 |
+- **Selected**: best_reward_selected → v31, best_env_spec_selected →
+  v8 (vz [0, 0.5], sunk 0.5, RSI heights [0, 0.4], entropy ×2) — the
+  FIRST time both halves of the project's kept-best training config
+  were discovered by the autonomous loop rather than hand-authored.
+  current.py + env/current.json verified on disk.
+- **Honest reads**: (1) iter 33's progress is real signal (3 orders
+  above the noise floor) but rewards the STABILITY half of the task —
+  min-composition scores a stable stander above a tumbling launcher
+  (iter 34: real jump attempts, zero score). The upright+flight+
+  landing composition problem remains THE open gap, unchanged from
+  loop 6. (2) The diagnoser explored the env surface systematically —
+  sunk 0.3→0.5→0.6→0.4→0.6 (found 0.6 kills training: measured, in
+  case memory now), spawn vz narrowed and widened, entropy raised —
+  12 env versions on disk, 5 trained, every change validated, applied,
+  attributed, and reverted-on-regression correctly. (3) Progress
+  values below display precision again decided two best-selections
+  (§6 watch item stands).
+
 ### 2026-07-01 — loop 1: dense progress channel + tie-deadlock fix
 - **What**: `sculptor/sculpt.py` — `IterOutcome.progress/steer_progress`,
   `SculptRunResult.progress_history/best_progress`, phase-3b extraction
