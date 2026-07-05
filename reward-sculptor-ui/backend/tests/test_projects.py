@@ -699,3 +699,36 @@ def test_env_spec_endpoint_404_for_unknown_project(
 ) -> None:
     r = client.get("/projects/nope/env-spec")
     assert r.status_code == 404
+
+
+# ── traversal-shaped slugs (regression: %2E%2E → 500) ──────────────────
+def test_traversal_slug_is_404_not_500(
+    client: TestClient, tmp_projects_root: Path
+) -> None:
+    import shutil
+
+    # Slug ".." resolves to the PARENT of the projects root. Plant a
+    # parseable metadata.json + config.toml there — before the slug guard
+    # in ProjectStore.get this parsed fine, then blew up constructing
+    # ProjectDetail(slug="..") with a pydantic ValidationError → HTTP 500.
+    r = client.post("/projects", json={"name": "Victim"})
+    assert r.status_code == 201
+    slug = r.json()["slug"]
+    parent = tmp_projects_root.parent
+    shutil.copy(tmp_projects_root / slug / "metadata.json", parent)
+    shutil.copy(tmp_projects_root / slug / "config.toml", parent)
+
+    # %2E%2E must stay percent-encoded on the wire — httpx collapses a
+    # literal "/../" client-side — so the route sees slug="..".
+    for path in ("/projects/%2E%2E/env-spec", "/projects/%2E%2E"):
+        r = client.get(path)
+        assert r.status_code == 404, f"{path}: {r.status_code} {r.text}"
+        assert r.json()["type"] == "/problems/not-found"
+
+
+def test_store_get_rejects_malformed_slugs(tmp_path: Path) -> None:
+    from backend.services.project_store import ProjectStore
+
+    store = ProjectStore(tmp_path / "projects")
+    for bad in ("..", ".", "a/b", "a\\b", "A", "-x", "x-", ""):
+        assert store.get(bad) is None, bad

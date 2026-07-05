@@ -14,10 +14,13 @@ from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 
 # Immutable directory name; used as project primary key in URLs.
+# Single source of truth for slug shape — the store's path construction
+# relies on this rejecting path separators and dot-segments.
+SLUG_PATTERN = r"^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$"
 SlugStr = Annotated[
     str,
     Field(
-        pattern=r"^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$",
+        pattern=SLUG_PATTERN,
         min_length=1,
         max_length=64,
     ),
