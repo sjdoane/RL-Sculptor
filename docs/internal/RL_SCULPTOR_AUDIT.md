@@ -510,7 +510,51 @@ env-spec lifecycle visible in the UI
   reach the UI through the generic typed-event stream + LogViewer.
 - **Verified**: sculptor env-layer 78 passed; UI backend suite + new
   endpoint/timeline tests; `pnpm typecheck` clean (via WSL pnpm node —
-  Windows node cannot run tsc over UNC). Full-suite counts below.
+  Windows node cannot run tsc over UNC). Sculptor full suite 1085
+  passed / 1 skipped / 4 gpu deselected; UI backend 365 passed.
+  Commit 0d334fe.
+
+### 2026-07-04 — E2E run 1 under the general env layer (iters 23-28,
+~4.5 GPU-h, code 9773563): every new mechanism exercised live
+
+First run in project history where the DIAGNOSER holds the
+environment surface. All events below verified from the run log
+(runs/sculpt_envspec_1455.log) + full-precision gen_002 recompute of
+every archived rollout.
+
+| iter | trained (reward, env) | diagnoser env edit → version | outcome (gen_002 full-precision progress; behavior) |
+|---|---|---|---|
+| 23 | v22, v0 | vz→[-0.5,3.0] + entropy 3.0 → **v1** | BEST (4.3e-7); upright crouch (upright 1.0, tuck 0.79, apex 5 cm) |
+| 24 | v24, v1 | min_base 0.45 → v2 | STRICT REGRESSION (0.0): highest apex of the run (0.108 m) + frac_launched 0.19 — the env lever visibly moved behavior toward launching — but upright_end 0.0 (paired reward edit lost the upright basin) |
+| 25 | v22, v0 (PAIR revert ✓) | vz→[0,3] → v3 | NEW BEST (3.6e-6); upright crouch reproduced |
+| 26 | v26, v3 | min_base 0.45 → v4 | STRICT REGRESSION (0.0): reward_hacking + premature_termination, mean_return −9.4 |
+| 27 | v22, v0 (PAIR revert ✓) | min_base 0.5 + vz [0.5,3] → v5 | regression (3.8e-11 < best) |
+| 28 | v22, v0 (PAIR revert ✓) | vz→[-0.5,3.0] → v6 | NEW BEST (4.1e-6) |
+
+- **What this proves (all machinery, live)**: goal-directed env
+  proposals generated + validated + applied every iteration (6/6
+  applied, 0 rejected — all within bounds incl. the RSI↔sunk pairing);
+  keep-best/revert moved the (reward, env) PAIR together on every
+  strict regression (3/3); end-of-run selection restored BOTH halves
+  (best_reward_selected → v22, best_env_spec_selected → v0;
+  current.py + env/current.json verified on disk); env edits recorded
+  into KG case memory (run_cases_recorded 6, edit identities incl.
+  "env: …"); the UI event stream carried env_spec_updated/reverted
+  end-to-end; zero tracebacks, zero policy collapses, naturalness ok
+  on all 6 iters.
+- **Honest reads**: (1) no candidate beat the incumbent this run — the
+  best "improvements" are noise-floor progress ties among v22 re-rolls
+  (1e-7..4e-6, sensor-noise-scale ramps; seed-to-seed noise, not real
+  progress); the composition problem (upright + flight + landing in
+  one policy) stands where loop 6 left it. (2) reward and env edits
+  land between the same iterations, so a regression cannot be
+  attributed to one half — the revert restores both (Eureka-style
+  joint move; both histories reach the diagnoser + case memory).
+  (3) env v5/v6 were written but never trained (superseded by
+  reverts/end-selection) — same disk semantics as untrained reward
+  edits. (4) the iter-24 evidence (launch fraction ×6 under the env
+  change) is the first measured demonstration that the env surface
+  has real behavioral leverage in this loop.
 
 ### 2026-07-01 — loop 1: dense progress channel + tie-deadlock fix
 - **What**: `sculptor/sculpt.py` — `IterOutcome.progress/steer_progress`,
