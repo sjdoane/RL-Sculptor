@@ -1367,6 +1367,68 @@ def export(
         typer.echo(f"[export] warning: {w}", err=True)
 
 
+@app.command()
+def heldout(
+    config: Path = typer.Option(
+        ..., "--config", "-c", exists=True, readable=True,
+        help="Project config.toml. Report lands in <project>/reports/heldout/."),
+    checkpoint: Path = typer.Option(
+        ..., "--checkpoint", exists=True, readable=True,
+        help="Trained checkpoint to evaluate (a kept-best policy)."),
+    metric: str = typer.Option(
+        ..., "--metric",
+        help="HAND spec-metric name (e.g. g1_jump). Generated metrics are "
+             "rejected — the battery exists to score OUTSIDE the loop."),
+    out: Optional[Path] = typer.Option(
+        None, "--out", help="Output dir (default <project>/reports/heldout)."),
+    push_levels: str = typer.Option(
+        "0,0.5,1.0,1.5", "--push-levels",
+        help="Comma-separated push magnitudes m/s (0 = unperturbed base)."),
+    seeds: str = typer.Option(
+        "70001,70002,70003", "--seeds",
+        help="Fresh rollout seeds (70k band — disjoint from the loop's "
+             "selection seeds by convention)."),
+    episodes: int = typer.Option(3, "--episodes"),
+):
+    """§RESEARCH_GAP_ANALYSIS §7.4: held-out evaluation battery.
+
+    Scores a kept policy on a push-perturbation grid over the frozen
+    shared env, with fresh seeds and hand spec metrics — numbers the
+    loop never optimized. Writes `heldout_report.json`.
+    """
+    import json as _json
+
+    from sculptor.adapters.base import load_adapter
+    from sculptor.env_spec import read_current_env_spec
+    from sculptor.eval.heldout import run_heldout_battery
+
+    project = config.resolve().parent
+    adapter = load_adapter(config)
+    base_spec = read_current_env_spec(project / "env")
+    out_dir = out if out is not None else project / "reports" / "heldout"
+    report = run_heldout_battery(
+        adapter=adapter,
+        checkpoint_path=checkpoint,
+        out_dir=out_dir,
+        metric=metric,
+        base_env_spec=base_spec,
+        push_levels=[float(x) for x in push_levels.split(",") if x.strip()],
+        seeds=[int(x) for x in seeds.split(",") if x.strip()],
+        n_episodes=episodes,
+        on_event=lambda ev: typer.echo(f"[heldout] {_json.dumps(ev)}"),
+    )
+    typer.echo(f"[heldout] report: {out_dir / 'heldout_report.json'}")
+    for row in report["levels"]:
+        typer.echo(
+            f"  push {row['push_mps']:>4g} m/s  "
+            f"median {row['median_score']:.3f}  "
+            f"degradation {row['degradation_vs_base']}")
+    if not report["env_spec_lever_available"]:
+        typer.echo(
+            "[heldout] WARNING: adapter has no env_spec lever — perturbed "
+            "cells ran UNPERTURBED (marked in report).", err=True)
+
+
 # ── sculpt reference: RSI curricula from reference clips ─────────────────
 reference_app = typer.Typer(
     help="Reference trajectories: derive RSI train-curricula from motion "
