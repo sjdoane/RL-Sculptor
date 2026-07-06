@@ -271,6 +271,40 @@ treated as regressions.
 Format per entry: date — what changed (files:lines) — why — evidence
 (tests/smoke) — commit.
 
+### 2026-07-05 — research-driven upgrades (gap analysis → three landed
+increments)
+
+- **Gap analysis**: `docs/internal/RESEARCH_GAP_ANALYSIS.md` (68fc775)
+  — full literature sweep (Eureka line successors, env/curriculum
+  design, machine-judge reliability, methodology standards, humanoid
+  agile SOTA) + roadmap §7. Key verdicts: trust-pipeline novelty
+  confirmed (nearest: CARD TPE, OMNI-EPIC 72.7% human agreement); NO
+  published from-scratch G1 standing jump exists (all ride retargeted
+  references); the compute-free missing paper is the metric-gaming
+  base-rate study (§7.1).
+- **Selection statistics** (4184f7b, roadmap §7.2): `eval_seeds` K-seed
+  median selection (per-seed dispersion to the diagnoser; naturalness =
+  MIN over seeds), `progress_epsilon` noise band (default 1e-5 —
+  noise-floor ticks are ties, not bests/regressions; the §6 watch item
+  closed), `fresh_eval_seeds` end-of-run re-roll of the kept best on
+  held-out seeds → `best_fitness_fresh` (report-of-max discipline);
+  rollout `--seed` threaded local+remote (0 = legacy). +8 tests.
+- **Hack-income regression screen** (787ce12; CARD arXiv:2410.14660
+  TPE adapted): candidates are replayed on archived reward_hacking
+  rollouts and rejected if they pay a caught exploit more than the
+  parent (abs 0.05/rel 10% tol) — caught hacks monotonically lose
+  income. `hack_income_screen=false` disables. +7 tests.
+- **Reference trajectories** (39a52a4, roadmap §7.6 infra):
+  `sculptor/reference.py` + `sculpt reference jump` — validated clip
+  format, analytic procedural jump, measured phase keyframes for
+  prompts, and DeepMimic-RSI derivation onto the EXISTING env-spec
+  TRAIN surface (bounds-clamped, RSI↔ET pairing always emitted;
+  0.64×stand reproduces the measured-good 0.5 m sunk on G1).
+  Train-only by construction — evaluation untouched. +9 tests.
+- **KG seeds**: `kg_seeds_research_2026-07.yml` — 17 sweep papers with
+  applicability rationales (extraction deliberate, costs LLM+PDF).
+- Suite: 1113 passed / 1 skipped after all three increments.
+
 ### 2026-07-04 — env generalization 1/4: general per-project env spec
 (overnight loop, mandate: environment adapts itself to each prompt —
 no hand-picked presets)

@@ -478,6 +478,11 @@ a time). All offline: rollouts are archived, metrics are cheap LLM
 calls, scoring is numpy.
 
 **7.2 (P0, cheap) Fix the loop's decision statistics.**
+**[SHIPPED 2026-07-05, commit 4184f7b — (a) `eval_seeds` multi-seed
+median selection + min-naturalness gating, (b) `progress_epsilon`
+noise band (default 1e-5), (c) paired eval seeds are deterministic per
+iter, (d) `fresh_eval_seeds` end-of-run re-eval → `best_fitness_fresh`.
+Training-seed pairing across iterations remains open.]**
 (a) Evaluate each iteration's policy on K≥5 rollout seeds (rollout is
 ~2 min vs ~1 h training — the cost is trivial); select on IQM of the
 lexicographic key. (b) Add the noise-band epsilon on progress
@@ -511,8 +516,14 @@ lose → the paper is 7.1's metric-trust result plus an honest
 budget" — which CARD/ProgressCounts make respectable (single-chain
 wins on manipulation, not yet on legged).
 
-**7.6 (P0, decision not code) The jump question.** Pick one, in
-writing: (a) *rescope the headline* to published-feasible reward-only
+**7.6 (P0, decision not code) The jump question.**
+**[PARTIAL 2026-07-05, commit 39a52a4 — option (c)-infrastructure:
+`sculptor/reference.py` + `sculpt reference jump` derive validated
+train-only RSI curricula from reference clips (procedural jump or
+converted mocap); real retargeted G1 clips documented (Unitree LAFAN1
+HF dataset, auth-gated; ASAP motions). The headline-rescope decision
+(a) and multi-critic/staged training (b) remain open.]**
+Pick one, in writing: (a) *rescope the headline* to published-feasible reward-only
 tasks (kick, trot, HoST-style stand-up — G1 stand-up from scratch is
 proven) and present the jump as the honest frontier case study; (b)
 *add the curriculum machinery the literature demands* — staged
