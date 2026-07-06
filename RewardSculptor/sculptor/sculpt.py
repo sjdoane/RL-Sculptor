@@ -888,6 +888,8 @@ def _rollout_or_resume(
     playback_speed: float | None = None,
     render_every: int | None = None,
     fps: float | None = None,
+    render_width: int | None = None,
+    render_height: int | None = None,
 ) -> None:
     """Skip `adapter.rollout` when the three artifacts it produces
     (`rollout.mp4` + `trajectory.npz` + `behavior.json`) are ALL on
@@ -920,6 +922,8 @@ def _rollout_or_resume(
         ("playback_speed", playback_speed),
         ("render_every", render_every),
         ("fps", fps),
+        ("render_width", render_width),
+        ("render_height", render_height),
     ):
         if value is not None and name in sig.parameters:
             extra[name] = value
@@ -1253,6 +1257,8 @@ def _run_one_iter(
         playback_speed=iter_cfg.get("playback_speed"),
         render_every=iter_cfg.get("render_every"),
         fps=iter_cfg.get("rollout_fps"),
+        render_width=iter_cfg.get("render_width"),
+        render_height=iter_cfg.get("render_height"),
     )
 
     # §Ship 33: objective task fitness on this rollout (ground truth,
@@ -1828,6 +1834,8 @@ def sculpt_run(
     playback_speed: Optional[float] = None,
     render_every: Optional[int] = None,
     rollout_fps: Optional[float] = None,
+    render_width: Optional[int] = None,
+    render_height: Optional[int] = None,
     rollout_episodes: Optional[int] = None,
     seed: Optional[int] = None,
     auto_adjust_physics: Optional[bool] = None,
@@ -1930,6 +1938,8 @@ def sculpt_run(
         ("playback_speed", playback_speed),
         ("render_every", render_every),
         ("rollout_fps", rollout_fps),
+        ("render_width", render_width),
+        ("render_height", render_height),
         ("rollout_episodes", rollout_episodes),
         ("seed", seed),
         ("auto_adjust_physics", auto_adjust_physics),

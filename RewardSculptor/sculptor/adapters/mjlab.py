@@ -754,6 +754,8 @@ class MjlabAdapter(SculptorAdapter):
         playback_speed: float | None = None,
         render_every: int | None = None,
         fps: float | None = None,
+        render_width: int | None = None,
+        render_height: int | None = None,
     ) -> RolloutResult:
         """§Ship-7: accept rollout-video knobs so the UI can drive them
         without config-file edits.
@@ -791,6 +793,10 @@ class MjlabAdapter(SculptorAdapter):
             cmd += ["--render-every", str(int(render_every))]
         if fps is not None:
             cmd += ["--fps", str(float(fps))]
+        if render_width is not None:
+            cmd += ["--render-width", str(int(render_width))]
+        if render_height is not None:
+            cmd += ["--render-height", str(int(render_height))]
         if self.env_spec_path:
             cmd += ["--env-spec", str(Path(self.env_spec_path).resolve())]
         elif self.env_profile:
@@ -818,6 +824,10 @@ class MjlabAdapter(SculptorAdapter):
                 options["--render-every"] = str(int(render_every))
             if fps is not None:
                 options["--fps"] = str(float(fps))
+            if render_width is not None:
+                options["--render-width"] = str(int(render_width))
+            if render_height is not None:
+                options["--render-height"] = str(int(render_height))
             if not self.env_spec_path and self.env_profile:
                 options["--env-profile"] = self.env_profile
             rollout_inputs: dict[str, Path] = {

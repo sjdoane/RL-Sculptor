@@ -80,6 +80,17 @@ class RunParams(BaseModel):
     ] = None
     """Hard override on playback fps. 0/None = derive from env.step_dt."""
 
+    render_width: Optional[
+        Annotated[int, Field(ge=64, le=3840)]
+    ] = None
+    """Rollout video width in px. None = runner default (1280).
+    Render cost is resolution-independent on this stack."""
+
+    render_height: Optional[
+        Annotated[int, Field(ge=64, le=2160)]
+    ] = None
+    """Rollout video height in px. None = runner default (720)."""
+
     rollout_episodes: Optional[
         Annotated[int, Field(ge=1, le=32)]
     ] = None

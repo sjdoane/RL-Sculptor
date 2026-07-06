@@ -336,6 +336,10 @@ export interface RunParamsPayload {
   playback_speed?: number | null;
   render_every?: number | null;
   rollout_fps?: number | null;
+  // Rollout video resolution; null = runner default (1280×720). Render
+  // cost is resolution-independent, so high-res is the sane default.
+  render_width?: number | null;
+  render_height?: number | null;
   rollout_episodes?: number | null;
   seed?: number | null;
   auto_adjust_physics?: boolean | null;

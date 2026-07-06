@@ -564,6 +564,13 @@ def run(
     rollout_fps: Optional[float] = typer.Option(
         None, "--rollout-fps",
         help="Hard override on playback fps (default: derive from step_dt)."),
+    render_width: Optional[int] = typer.Option(
+        None, "--render-width",
+        help="Rollout video width in px (default 1280; render cost is "
+             "resolution-independent on this stack)."),
+    render_height: Optional[int] = typer.Option(
+        None, "--render-height",
+        help="Rollout video height in px (default 720)."),
     rollout_episodes: Optional[int] = typer.Option(
         None, "--rollout-episodes",
         help="Override [iteration].rollout_episodes (default 6)."),
@@ -656,6 +663,8 @@ def run(
         playback_speed=playback_speed,
         render_every=render_every,
         rollout_fps=rollout_fps,
+        render_width=render_width,
+        render_height=render_height,
         rollout_episodes=rollout_episodes,
         seed=seed,
         auto_adjust_physics=auto_adjust_physics,

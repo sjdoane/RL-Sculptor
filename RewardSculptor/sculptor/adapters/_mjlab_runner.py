@@ -1115,6 +1115,42 @@ def _cmd_train(args: argparse.Namespace) -> None:
     print(json.dumps({"status": "ok", "checkpoint": str(ckpt_path)}))
 
 
+_RENDER_DEFAULT_W = 1280
+_RENDER_DEFAULT_H = 720
+
+
+def _configure_rollout_viewer(env_cfg: Any, args: Any) -> None:
+    """Rollout-video viewer settings. FULLY DEFENSIVE (same discipline as
+    `_apply_ground_texture`): any mjlab ViewerConfig drift no-ops rather
+    than break the rollout.
+
+    Two fixes over mjlab defaults:
+    * `max_extra_envs = 0` — the default (2) renders NEIGHBORING envs
+      behind the tracked one, and those neighbors keep auto-resetting
+      mid-episode, so ghost robots teleport around in the background of
+      every video (the guard at the render loop only stops recording at
+      env[0]'s OWN terminal; it never touched the neighbors).
+    * 1280x720 instead of 320x240 — render cost measured on the WSL2
+      path is resolution-independent (~200 ms/frame at both), so the
+      default was leaving quality on the table for free.
+    """
+    try:
+        viewer = getattr(env_cfg, "viewer", None)
+        if viewer is None:
+            return
+        w = int(getattr(args, "render_width", 0) or 0) or _RENDER_DEFAULT_W
+        h = int(getattr(args, "render_height", 0) or 0) or _RENDER_DEFAULT_H
+        if hasattr(viewer, "width"):
+            viewer.width = max(64, w)
+        if hasattr(viewer, "height"):
+            viewer.height = max(64, h)
+        if hasattr(viewer, "max_extra_envs"):
+            viewer.max_extra_envs = 0
+    except Exception as e:  # noqa: BLE001 — cosmetics must never kill a rollout
+        print(f"[runner] viewer config skipped: {type(e).__name__}: {e}",
+              file=sys.stderr, flush=True)
+
+
 def _apply_ground_texture(env_cfg: Any) -> None:
     """§Ship 35: give the rendered floor an IMAGE texture instead of the
     default solid/checker terrain. PURELY COSMETIC and rollout-render only.
@@ -1346,6 +1382,8 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
     _apply_env_spec(env_cfg, _resolve_env_spec(args), train=False)
     # §Ship 35: textured floor in the rendered rollout (cosmetic, guarded).
     _apply_ground_texture(env_cfg)
+    # 720p + no ghost neighbor envs in the background (cosmetic, guarded).
+    _configure_rollout_viewer(env_cfg, args)
     # §actuator-limit enforcement — flag-gated (default OFF). Same swap as TRAIN so
     # the rollout physics matches what the policy trained under.
     _enforce_actuator_limits(env_cfg)
@@ -1996,6 +2034,11 @@ def main() -> None:
     # §RL_SCULPTOR_AUDIT §4.4: must match the train-side spec/profile.
     p_roll.add_argument("--env-profile", default="")
     p_roll.add_argument("--env-spec", default="")
+    # Video resolution. 0 = the runner default (1280x720 — measured
+    # resolution-INDEPENDENT render cost on the WSL2 path: 320x240 and
+    # 1280x720 both ~200 ms/frame, so high-res is free).
+    p_roll.add_argument("--render-width", type=int, default=0)
+    p_roll.add_argument("--render-height", type=int, default=0)
 
     p_probe = sub.add_parser("vram-probe")
     p_probe.add_argument("--task-id", required=True)

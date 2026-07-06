@@ -418,6 +418,8 @@ def run_sculpt_job(
     playback_speed = run_params.get("playback_speed")
     render_every = run_params.get("render_every")
     rollout_fps = run_params.get("rollout_fps")
+    render_width = run_params.get("render_width")
+    render_height = run_params.get("render_height")
     rollout_episodes = run_params.get("rollout_episodes")
     seed = run_params.get("seed")
     auto_adjust_physics = run_params.get("auto_adjust_physics")
@@ -527,6 +529,10 @@ def run_sculpt_job(
             cmd += ["--render-every", str(int(render_every))]
         if rollout_fps is not None:
             cmd += ["--rollout-fps", str(float(rollout_fps))]
+        if render_width is not None:
+            cmd += ["--render-width", str(int(render_width))]
+        if render_height is not None:
+            cmd += ["--render-height", str(int(render_height))]
         if rollout_episodes is not None:
             cmd += ["--rollout-episodes", str(int(rollout_episodes))]
         if seed is not None:

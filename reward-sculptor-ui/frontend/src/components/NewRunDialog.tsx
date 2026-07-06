@@ -147,6 +147,7 @@ export function NewRunDialog({
   const isMjlab = defaults.kind.startsWith("mjlab");
 
   const [behavior, setBehavior] = useState("");
+  type RenderSize = "default" | "1920x1080" | "960x540" | "320x240";
   const [iterations, setIterations] = useState(defaults.iterations);
   const [trainingIters, setTrainingIters] = useState<number | "">(
     defaults.training_iterations,
@@ -165,6 +166,9 @@ export function NewRunDialog({
   const [playbackSpeed, setPlaybackSpeed] = useState<number | "">("");
   const [rolloutEpisodes, setRolloutEpisodes] = useState<number | "">("");
   const [seed, setSeed] = useState<number | "">("");
+  // Rollout video resolution. "default" = runner default (1280×720);
+  // render cost is resolution-independent so this is mostly a debug knob.
+  const [renderSize, setRenderSize] = useState<RenderSize>("default");
   const [autoAdjustPhysics, setAutoAdjustPhysics] = useState<boolean | null>(null);
   // §Ship 34/35: objective fitness. null = blind loop. A built-in spec
   // name OR a generated-metric ref ("gen:<id>").
@@ -245,6 +249,10 @@ export function NewRunDialog({
         typeof playbackSpeed === "number" ? playbackSpeed : null,
       rollout_episodes:
         typeof rolloutEpisodes === "number" ? rolloutEpisodes : null,
+      render_width:
+        renderSize === "default" ? null : Number(renderSize.split("x")[0]),
+      render_height:
+        renderSize === "default" ? null : Number(renderSize.split("x")[1]),
       seed: typeof seed === "number" ? seed : null,
       auto_adjust_physics: autoAdjustPhysics,
       // §Ship 34: null = blind loop; a spec name turns on fitness-guided
@@ -446,6 +454,23 @@ export function NewRunDialog({
                   <Field label="Seed" htmlFor="run-seed">
                     {numField(seed, setSeed, { id: "run-seed", min: 0, placeholder: "42" })}
                     <p className="rs-hintline">Base RNG seed; iter N uses seed + N.</p>
+                  </Field>
+                  <Field label="Video resolution" htmlFor="run-resolution">
+                    <div className="rs-select">
+                      <select
+                        id="run-resolution"
+                        value={renderSize}
+                        onChange={(e) => setRenderSize(e.target.value as RenderSize)}
+                        disabled={launch.isPending}
+                        aria-label="Rollout video resolution"
+                      >
+                        <option value="default">1280×720 (default)</option>
+                        <option value="1920x1080">1920×1080</option>
+                        <option value="960x540">960×540</option>
+                        <option value="320x240">320×240 (legacy)</option>
+                      </select>
+                    </div>
+                    <p className="rs-hintline">Render cost is resolution-independent — high-res is free.</p>
                   </Field>
                 </div>
               </div>
