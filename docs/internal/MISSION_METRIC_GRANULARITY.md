@@ -89,7 +89,9 @@ by `generate_objective_metric` per stage rather than left empty.
 
 - `sculptor/mission_metrics.py` — `generate_stage_metrics(mission, …)`:
   per pending stage without a `steering_metric`, generate into
-  `<mission_dir>/stages/<name>/metric/`, set `steering_metric` to the
+  `<mission_dir>/stage_metrics/<name>/` (NOT inside `stages/<name>/` —
+  the orchestrator's `sculpt_init` refuses a non-empty stage dir;
+  live-caught on g1-standing-jump), set `steering_metric` to the
   mission-dir-relative path on acceptance; record rejections in the
   return report and leave the stage on the fallback.
 - Stage-metric refs may be *mission-dir-relative* paths;

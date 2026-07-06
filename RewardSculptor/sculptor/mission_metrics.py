@@ -8,10 +8,19 @@ stages whose generated metric the pipeline rejects — the existing
 `steering_metric or fitness_metric` resolution is unchanged.
 
 Mechanically this populates the Ship-38 `Stage.steering_metric` slot
-with a *mission-dir-relative* path ("stages/<name>/metric/metric.py").
-Relative refs keep `mission.json` portable and inside the 128-char
-validator bound; `resolve_stage_metric_ref` anchors them at the mission
-dir before `resolve_fitness_fn`'s fail-fast resolution.
+with a *mission-dir-relative* path
+("stage_metrics/<name>/metric.py"). Relative refs keep `mission.json`
+portable and inside the 128-char validator bound;
+`resolve_stage_metric_ref` anchors them at the mission dir before
+`resolve_fitness_fn`'s fail-fast resolution.
+
+Metrics live under `<mission_dir>/stage_metrics/`, NOT inside
+`<mission_dir>/stages/<name>/` — the orchestrator scaffolds each
+`stages/<name>/` dir with `sculpt_init`, which (correctly) refuses a
+non-empty target. Generation happens at decompose time, long before
+scaffolding, so anything written inside a stage dir would brick the
+stage (live-caught: g1-standing-jump halted `scaffold_errored` on
+exactly this).
 """
 from __future__ import annotations
 
@@ -78,7 +87,7 @@ def generate_stage_metrics(
             report["skipped"].append(
                 {"stage": stage.name, "reason": "stage already succeeded"})
             continue
-        out_dir = mission_dir / "stages" / stage.name / "metric"
+        out_dir = mission_dir / "stage_metrics" / stage.name
         _emit({
             "type": "stage_metric_gen_started",
             "stage": stage.name,
@@ -106,7 +115,7 @@ def generate_stage_metrics(
             })
             continue
         if rec.get("accepted"):
-            rel = f"stages/{stage.name}/metric/metric.py"
+            rel = f"stage_metrics/{stage.name}/metric.py"
             stage.steering_metric = rel
             report["generated"].append({"stage": stage.name, "ref": rel})
             _emit({

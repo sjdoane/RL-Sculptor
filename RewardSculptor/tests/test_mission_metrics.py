@@ -48,8 +48,8 @@ def test_resolve_ref_absolute_path_passes_through(tmp_path):
 
 
 def test_resolve_ref_relative_py_is_anchored(tmp_path):
-    got = resolve_stage_metric_ref("stages/s0/metric/metric.py", tmp_path)
-    assert got == str(tmp_path / "stages/s0/metric/metric.py")
+    got = resolve_stage_metric_ref("stage_metrics/s0/metric.py", tmp_path)
+    assert got == str(tmp_path / "stage_metrics/s0/metric.py")
 
 
 # ── generate_stage_metrics ─────────────────────────────────────────────
@@ -66,13 +66,13 @@ def test_accepted_metric_sets_relative_ref(tmp_path, monkeypatch):
     m = _mk_mission(tmp_path, [_mk_stage("stand_tall")])
     report = generate_stage_metrics(m, robot_hint="Mjlab-…-G1")
     assert report["generated"] == [
-        {"stage": "stand_tall", "ref": "stages/stand_tall/metric/metric.py"}]
-    assert m.stages[0].steering_metric == "stages/stand_tall/metric/metric.py"
+        {"stage": "stand_tall", "ref": "stage_metrics/stand_tall/metric.py"}]
+    assert m.stages[0].steering_metric == "stage_metrics/stand_tall/metric.py"
     # ≤128 chars — inside the mission validator's steering_metric bound.
     assert len(m.stages[0].steering_metric) <= 128
     assert calls[0]["goal"] == "goal for stand_tall"
     assert calls[0]["out_dir"] == (
-        Path(m.mission_dir) / "stages" / "stand_tall" / "metric")
+        Path(m.mission_dir) / "stage_metrics" / "stand_tall")
     assert calls[0]["robot_hint"] == "Mjlab-…-G1"
 
 
