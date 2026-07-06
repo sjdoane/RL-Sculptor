@@ -89,6 +89,13 @@ class Stage:
     # the uniform mission metric. Backward-compatible: older mission.json
     # without it load with steering_metric=None via from_dict's filter.
     steering_metric: Optional[str] = None
+    # §JUMP_SCAFFOLD: DeepMimic-style reference-state initialization for
+    # hard-exploration stages (jump launch/flight/landing). When true the
+    # orchestrator derives a validated train-only RSI curriculum from a
+    # reference clip (project clip if present, procedural jump otherwise)
+    # and applies it to this stage's env spec before training. Backward-
+    # compatible: older mission.json load with False via from_dict.
+    needs_reference_rsi: bool = False
 
     # ── Runtime-populated by orchestrator ────────────────────────────
     status: StageStatus = "pending"

@@ -2687,3 +2687,74 @@ def test_mission_run_source_does_not_unlink_lock():
         "filelock release() handles cleanup, and unlink can fail "
         "silently on Windows/WSL. See Ship-16 audit fix."
     )
+
+
+# ── §JUMP_SCAFFOLD: needs_reference_rsi orchestrator hook ─────────────────
+def test_stage_reference_rsi_applied_when_flagged(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """A stage flagged `needs_reference_rsi` gets a validated train-only
+    RSI env-spec version (derived from the procedural jump clip when no
+    project clip exists) BEFORE training, and the event fires. Resume
+    idempotency: a second mission_run does not stack another version."""
+    import json as _json
+
+    from sculptor import sculpt as sculpt_mod
+
+    m = _make_mission(tmp_path, n_stages=1)
+    m.stages[0].needs_reference_rsi = True
+
+    fake = _fake_sculpt_run_factory(metric=0.9)
+    monkeypatch.setattr(sculpt_mod, "sculpt_run", fake)
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
+    )
+
+    events: list[dict] = []
+    result = sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab", kg_store=None, on_event=events.append,
+    )
+    assert result.completed is True
+    rsi_events = [e for e in events
+                  if e["type"] == "stage_reference_rsi_applied"]
+    assert len(rsi_events) == 1
+    assert rsi_events[0]["clip"] == "procedural:jump"
+
+    env_dir = Path(m.mission_dir) / "stages" / "stage_0" / "env"
+    versions = sorted(env_dir.glob("v*.json"))
+    assert len(versions) == 1
+    spec = _json.loads(versions[0].read_text())
+    assert spec["meta"]["source"].startswith("reference:")
+    train = spec["train"]
+    # DeepMimic RSI ↔ ET pairing: both emitted, always.
+    assert "reset_height_offset_m" in train
+    assert "reset_vertical_velocity_mps" in train
+    assert "min_base_height_termination_m" in train
+    # Shared/eval scope untouched — metric comparability by construction.
+    assert spec.get("shared") in ({}, None) or "reset_height_offset_m" \
+        not in (spec.get("shared") or {})
+
+    # Resume: run again; still exactly one env version (idempotent).
+    events2: list[dict] = []
+    m2_dir = Path(m.mission_dir)
+    from sculptor.mission import load_mission
+    m2 = load_mission(m2_dir)
+    m2.mission_dir = str(m2_dir)
+    sculpt_mod.mission_run(
+        m2, adapter_short_name="mjlab", kg_store=None,
+        on_event=events2.append,
+    )
+    assert len(sorted(env_dir.glob("v*.json"))) == 1
+    assert not [e for e in events2
+                if e["type"] == "stage_reference_rsi_applied"]
+
+
+def test_stage_reference_rsi_roundtrips_mission_json(tmp_path: Path):
+    """needs_reference_rsi survives save→load (backward-compatible field)."""
+    from sculptor.mission import load_mission, save_mission
+
+    m = _make_mission(tmp_path / "rt", n_stages=1)
+    m.stages[0].needs_reference_rsi = True
+    save_mission(m, Path(m.mission_dir))
+    m2 = load_mission(Path(m.mission_dir))
+    assert m2.stages[0].needs_reference_rsi is True

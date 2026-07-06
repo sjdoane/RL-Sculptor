@@ -33,7 +33,8 @@ and stages warm-start from previous stages where possible.
       "parent_stage":       <null or an earlier stage's name>,
       "reward_seed_prompt": "<NL reward spec for this stage, 3-2000 chars>",
       "kg_seed_papers":     ["<arxiv_id>", ...],
-      "init_skill_id":      <null or a skill_id from the SKILL_LIBRARY slice>
+      "init_skill_id":      <null or a skill_id from the SKILL_LIBRARY slice>,
+      "needs_reference_rsi": <true ONLY for ballistic/airborne stages — see rule 9>
     },
     ...
   ]
@@ -154,6 +155,23 @@ and stages warm-start from previous stages where possible.
    - Leave `init_skill_id: null` (or omit it) when no listed skill is
      a good match. It's better to cold-start than to load a
      mismatched policy.
+
+9. **Reference-state initialization for airborne stages.** Set
+    `needs_reference_rsi: true` on a stage ONLY when its core skill
+    involves ballistic/airborne states the policy cannot reach until it
+    has already learned the skill — jump launch, flight, landing,
+    aerial recovery. The orchestrator then starts a fraction of that
+    stage's TRAINING episodes inside those states (heights + vertical
+    velocities derived from a validated reference trajectory, paired
+    with the required sunk-height termination), so the policy
+    experiences apex → descent → touchdown long before it can produce a
+    launch. Evaluation rollouts are never affected. Keep it `false` for
+    grounded skills (standing, crouching, walking, kicking): needless
+    RSI wastes training resets on states the stage doesn't need. This
+    is DeepMimic's RSI result — without it, explosive skills are
+    unlearnable from shaping alone; with RSI but WITHOUT the paired
+    termination the policy exploits sunk postures (both are applied
+    together automatically).
 
 ## Stage-design guidance
 

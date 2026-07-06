@@ -4145,6 +4145,53 @@ def _run_one_stage(
                 f"{type(e).__name__}: {e}", emit,
             )
 
+    # 2.5 §JUMP_SCAFFOLD: decomposer-flagged reference-state
+    # initialization. Derive a validated TRAIN-ONLY RSI curriculum from
+    # a reference clip and persist it as this stage's next env-spec
+    # version before any training. Clip preference: a real (converted
+    # mocap) clip at <project>/reference/jump.npz when present, else the
+    # analytic procedural jump. Failure is non-fatal — RSI is curriculum
+    # assistance, not correctness; the stage trains without it.
+    if getattr(stage, "needs_reference_rsi", False):
+        try:
+            from sculptor.env_spec import read_current_env_spec
+            from sculptor.reference import (
+                apply_reference_rsi,
+                load_clip,
+                make_procedural_jump_clip,
+            )
+
+            stage_env_dir = stage_dir / "env"
+            current_spec = read_current_env_spec(stage_env_dir)
+            already = (
+                str(((current_spec or {}).get("meta") or {})
+                    .get("source", "")).startswith("reference:"))
+            if already:
+                # Resume idempotency: don't stack a new env version per
+                # resume — the reference curriculum is already in force.
+                pass
+            else:
+                project_root = mission_dir.parent.parent
+                clip_path = project_root / "reference" / "jump.npz"
+                if clip_path.is_file():
+                    clip, clip_src = load_clip(clip_path), str(clip_path)
+                else:
+                    clip, clip_src = (
+                        make_procedural_jump_clip(), "procedural:jump")
+                spec_path = apply_reference_rsi(stage_env_dir, clip)
+                emit({
+                    "type": "stage_reference_rsi_applied",
+                    "stage_name": stage.name,
+                    "clip": clip_src,
+                    "env_spec": str(spec_path),
+                })
+        except Exception as e:  # noqa: BLE001 — curriculum, not correctness
+            emit({
+                "type": "stage_reference_rsi_failed",
+                "stage_name": stage.name,
+                "error": f"{type(e).__name__}: {e}",
+            })
+
     # 3. Materialize v1 from the stage's reward_seed_prompt.
     try:
         from sculptor.edit import apply_prompt_edit

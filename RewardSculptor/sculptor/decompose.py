@@ -125,6 +125,27 @@ class _StageModel(BaseModel):
         ),
     )
 
+    # §JUMP_SCAFFOLD: DeepMimic-style reference-state initialization for
+    # hard-exploration stages. Every published G1 jump rides a reference
+    # motion (RESEARCH_GAP_ANALYSIS §4.5); RSI is the cheapest transfer —
+    # start a fraction of training episodes INSIDE the airborne/landing
+    # phase so the policy experiences apex → descent → touchdown long
+    # before it can produce a launch. When true, the orchestrator derives
+    # a validated train-only RSI curriculum from a reference clip
+    # (project clip if present, procedural jump otherwise) and applies it
+    # to THIS stage's env spec before training. Rollout evaluation is
+    # untouched (schema-level shared/train split).
+    needs_reference_rsi: bool = Field(
+        default=False,
+        description=(
+            "Set true ONLY for a stage whose core skill involves ballistic/"
+            "airborne states the robot cannot yet reach (jump launch, "
+            "flight, landing). Starts a fraction of training episodes in "
+            "those states via a validated reference curriculum. False for "
+            "grounded skills (standing, walking, crouching)."
+        ),
+    )
+
     @field_validator("init_skill_id", mode="before")
     @classmethod
     def _normalize_init_skill_id(cls, v: Any) -> Optional[str]:
@@ -243,11 +264,32 @@ def _render_contract(contract: Any) -> str:
         "OPEN (adapter does not constrain component names)"
         if components is None else sorted(components)
     )
+    # §criterion grounding (smoke-hop-stop finding, 2026-07-06): the
+    # decomposer wrote `trajectory['root_link_pos_w']` criteria for a
+    # gym Hopper project — that key exists only on mjlab articulated
+    # envs, so every criterion eval raises CriterionMissingKeyError and
+    # the stage can never early-stop. Tell the decomposer which
+    # trajectory keys THIS adapter actually persists. supports_batched
+    # is the honest available proxy for "mjlab articulated env".
+    if supports_batched:
+        traj_keys = sorted(
+            {"rewards", "episode_id", "joint_pos", "joint_vel", "action",
+             "actuator_force", "projected_gravity_b", "root_link_pos_w"})
+        traj_note = ""
+    else:
+        traj_keys = ["episode_id", "rewards"]
+        traj_note = (
+            "  (this adapter persists ONLY these — do NOT reference "
+            "joint_pos / root_link_pos_w / other articulated-env keys "
+            "in success criteria; use components/behavior instead)\n"
+        )
     return (
         "# REWARD_CONTRACT\n"
         f"expected_info_keys: {sorted(info_keys)}\n"
         f"expected_components: {components_text}\n"
         f"supports_batched:   {supports_batched}\n"
+        f"available_trajectory_keys: {traj_keys}\n"
+        f"{traj_note}"
     )
 
 
@@ -489,6 +531,7 @@ def _stages_from_model(stages_in: list[_StageModel]) -> list[Stage]:
             kg_seed_papers=list(s.kg_seed_papers or []),
             init_skill_id=s.init_skill_id,
             steering_metric=s.steering_metric,
+            needs_reference_rsi=bool(s.needs_reference_rsi),
         )
         for s in stages_in
     ]
@@ -886,6 +929,11 @@ def redecompose_stage(
             # §Ship 38: sub-stages inherit the failed stage's objective so a
             # re-decomposed phase keeps steering by the same metric.
             steering_metric=failed_stage.steering_metric,
+            # §JUMP_SCAFFOLD: sub-stages of an airborne stage keep RSI —
+            # the exploration problem doesn't vanish by splitting it.
+            needs_reference_rsi=bool(
+                getattr(model_stage, "needs_reference_rsi", False)
+                or failed_stage.needs_reference_rsi),
             redecomposition_attempts=1,  # bound at one level
         ))
 
