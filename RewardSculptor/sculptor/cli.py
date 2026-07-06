@@ -880,6 +880,14 @@ def mission_init(
         )
     )
 
+    # §llm provenance: archive the decompose call(s) to the mission dir
+    # (created up front — decompose_task itself never writes into it).
+    from sculptor.llm import set_llm_log_dir
+
+    mission_dir = missions_root / mission_slug
+    mission_dir.mkdir(parents=True, exist_ok=True)
+    set_llm_log_dir(mission_dir)
+
     # Open KG (optional).
     kg_store = None if no_kg else SculptorKG()
     try:
@@ -891,7 +899,6 @@ def mission_init(
         if kg_store is not None:
             kg_store.close()
 
-    mission_dir = missions_root / mission_slug
     mission.mission_dir = str(mission_dir.resolve())
     save_mission(mission, mission_dir)
 
@@ -899,10 +906,8 @@ def mission_init(
     # generated from each stage's own goal text. After save_mission so a
     # generation crash can never lose the decomposition; re-saved after.
     if stage_metrics:
-        from sculptor.llm import set_llm_log_dir
         from sculptor.mission_metrics import generate_stage_metrics
 
-        set_llm_log_dir(mission_dir)  # provenance for the metric-gen calls
         robot_hint = getattr(adapter, "task_id", None)
         report = generate_stage_metrics(mission, robot_hint=robot_hint)
         save_mission(mission, mission_dir)

@@ -256,25 +256,35 @@ def gate_threshold_regressions(
 ) -> RegressionResult:
     """Compare parent vs emitted REWARD_SPEC.hyperparameters for gate erosion.
 
-    HARD (caller raises): a hparam present in BOTH whose name is an unambiguous
-      completion gate (REJECT lexicon), whose parent value is POSITIVE, and whose
-      emitted value is numerically LOWER. This is the v5 whack-a-mole, and the
-      only case unambiguous enough to block.
+    HARD (caller raises):
+      * a hparam present in BOTH whose name is an unambiguous completion
+        gate (REJECT lexicon), whose parent value is POSITIVE, and whose
+        emitted value is numerically LOWER. This is the v5 whack-a-mole,
+        and the clearest case to block.
+      * §7.9 rename-bypass close: EXACTLY ONE positive reject-lexicon gate
+        was REMOVED and EXACTLY ONE reject-lexicon gate was ADDED, and the
+        added value is LOWER than the removed one — a rename+lower is the
+        same erosion wearing a new name. One-to-one pairing only: with
+        multiple removed/added candidates the mapping is ambiguous and it
+        stays advisory (a legitimate multi-gate refactor must not freeze
+        the loop).
     ADVISORY (caller warns, never raises):
       * a same-named lowering of a FLAG-lexicon (direction-ambiguous) gate;
-      * a REMOVED gate hparam — rename-vs-removal is offline-undecidable, so a
-        legitimate refactor (`kick_cycle_gate`→`kick_phase_gate`) must NOT freeze
-        the loop;
+      * a REMOVED gate hparam with no unambiguous rename pairing;
       * a sign-ambiguous (non-positive parent value) reject-lexicon lowering.
     """
     parent = dict(parent_hparams or {})
     new = dict(new_hparams or {})
     res = RegressionResult()
+    removed_reject: list[tuple[str, float]] = []
     for name, pval in parent.items():
         kind = gate_kind(name)
         if not kind:
             continue
         if name not in new:
+            pf = _parse_float(pval)
+            if kind == "reject" and pf is not None and pf > 0:
+                removed_reject.append((name, pf))
             res.advisory.append(f"{name!r} (gate hparam) removed in the new reward")
             continue
         pf = _parse_float(pval)
@@ -285,6 +295,23 @@ def gate_threshold_regressions(
             res.hard.append(f"{name!r} {pf:g}→{nf:g}")
         else:
             res.advisory.append(f"{name!r} {pf:g}→{nf:g} (ambiguous gate — lowered)")
+
+    # §7.9 rename-bypass: pair the single removed reject gate with the
+    # single added reject gate, compare values.
+    added_reject: list[tuple[str, float]] = []
+    for name, nval in new.items():
+        if name in parent or gate_kind(name) != "reject":
+            continue
+        nf = _parse_float(nval)
+        if nf is not None:
+            added_reject.append((name, nf))
+    if len(removed_reject) == 1 and len(added_reject) == 1:
+        (old_name, old_v), (new_name, new_v) = removed_reject[0], added_reject[0]
+        if new_v < old_v:
+            res.hard.append(
+                f"{old_name!r} {old_v:g} renamed to {new_name!r} {new_v:g} "
+                f"(removed+added completion gate pair with a LOWER value — "
+                f"rename does not launder gate erosion)")
     return res
 
 

@@ -471,3 +471,40 @@ def test_empty_observable_set_is_byte_identical(parent_path, kg):
     assert out.is_file()                                  # NOT rejected (no-op)
     prompt = client.messages.calls[0]["messages"][0]["content"]
     assert "# METRIC_PARTITION" not in prompt
+
+
+# ── §7.9 rename-bypass close ───────────────────────────────────────────────
+def test_renamed_and_lowered_reject_gate_is_hard():
+    """kick_cycle_gate 0.5 removed + kick_phase_gate 0.2 added → the same
+    erosion wearing a new name — HARD."""
+    from sculptor.eval.partition_gate import gate_threshold_regressions
+
+    res = gate_threshold_regressions(
+        {"kick_min_gate": 0.5, "w_forward": 1.0},
+        {"kick_phase_gate": 0.2, "w_forward": 1.0},
+    )
+    assert any("renamed" in h for h in res.hard)
+
+
+def test_renamed_gate_same_or_higher_value_is_not_hard():
+    from sculptor.eval.partition_gate import gate_threshold_regressions
+
+    res = gate_threshold_regressions(
+        {"kick_min_gate": 0.5},
+        {"kick_phase_gate": 0.5},
+    )
+    assert res.hard == []
+    # removal itself stays advisory
+    assert any("removed" in a for a in res.advisory)
+
+
+def test_ambiguous_multi_gate_refactor_stays_advisory():
+    """Two removed + one added (or any non-1:1 mapping) is offline-
+    undecidable — must NOT freeze the loop."""
+    from sculptor.eval.partition_gate import gate_threshold_regressions
+
+    res = gate_threshold_regressions(
+        {"kick_min_gate": 0.5, "launch_min_gate": 0.4},
+        {"phase_min_gate": 0.1},
+    )
+    assert not any("renamed" in h for h in res.hard)

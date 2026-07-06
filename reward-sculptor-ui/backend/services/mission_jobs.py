@@ -140,6 +140,7 @@ def run_mission_decompose_job(
             from sculptor.adapters.base import load_adapter
             from sculptor.decompose import decompose_task
             from sculptor.kg.store import SculptorKG
+            from sculptor.llm import set_llm_log_dir
             from sculptor.mission import save_mission
 
             config_path = project_dir / "config.toml"
@@ -150,6 +151,11 @@ def run_mission_decompose_job(
 
             adapter = load_adapter(config_path)
             reward_contract = adapter.reward_contract()
+
+            # §llm provenance: archive decompose calls to the mission dir.
+            _md = mission_store.mission_dir(project_dir, mission_slug)
+            _md.mkdir(parents=True, exist_ok=True)
+            set_llm_log_dir(_md)
 
             kg_store = None if no_kg else SculptorKG()
             try:
