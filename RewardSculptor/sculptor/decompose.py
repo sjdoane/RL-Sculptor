@@ -213,6 +213,12 @@ def _render_kg_context(
         matches = query_semantic(
             goal, top_k=top_k, store=kg_store,
             min_similarity=DEFAULT_MIN_PROMPT_SIMILARITY)
+        # §Agentic-data upgrade 3: retrieval trajectory log. No iter_dir
+        # context here (decompose runs before any iteration exists), so
+        # out_dir=None falls back to sculptor.llm.llm_log_dir().
+        from sculptor.kg.retrieval_log import log_retrieval
+
+        log_retrieval("decompose", goal, matches, out_dir=None)
     except Exception as e:  # noqa: BLE001
         print(
             f"[decompose] KG query failed ({type(e).__name__}: {e}) — "

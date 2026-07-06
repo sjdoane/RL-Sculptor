@@ -8,7 +8,16 @@ import types
 import numpy as np
 
 from sculptor.kg import cases as C
-from sculptor.kg.schema import Relation, RunCase, make_failure_mode_id
+from sculptor.kg.schema import (
+    Edge,
+    Paper,
+    Relation,
+    RunCase,
+    Technique,
+    make_failure_mode_id,
+    make_paper_id,
+    make_technique_id,
+)
 from sculptor.kg.store import SculptorKG
 
 
@@ -272,4 +281,235 @@ def test_pre_upgrade_rows_still_load(tmp_path) -> None:
     assert case.verdict == "helped"
     assert case.edits == [] and case.behavior == {}
     assert case.progress_delta is None
+    store.close()
+
+
+# ── §Agentic-data upgrade 1: provenance + evidence tag on cases ───────────
+def test_recorded_case_has_observed_run_provenance(tmp_path) -> None:
+    store = SculptorKG(tmp_path / "kg.db")
+    result = types.SimpleNamespace(
+        completed_iters=[_outcome(0, ["reward_hacking"])],
+        fitness_history=[0.2, 0.5],
+    )
+    C.record_run_cases(store, task="kick", result=result, nonce="prov1")
+    (case,) = store.find_nodes(kind=RunCase.kind)
+    assert case.provenance == "observed_run"
+    store.close()
+
+
+def test_render_case_context_includes_evidence_tag_and_header_rule() -> None:
+    matches = [C.CaseMatch(
+        case=RunCase(id="c", task="kick forward", verdict="helped",
+                     edit_summary="iter 2: did X; fitness then helped (+0.20)"),
+        relevance_score=0.81,
+    )]
+    out = C._render_case_context(matches)
+    assert "[evidence: observed in THIS project's own runs]" in out
+    assert "outrank paper claims" in out
+
+
+# ── §Agentic-data upgrade 2: usage-based enrichment ───────────────────────
+def _outcome_with_paths(i, fms, reward_path=None, env_spec=None):
+    return types.SimpleNamespace(
+        iter_index=i, failure_modes=fms, edit_count=0,
+        reward_path_trained=reward_path, env_spec_trained=env_spec,
+    )
+
+
+def test_helped_iter_with_references_increments_useful_citations(tmp_path) -> None:
+    """A 'helped' iteration whose kept reward cites an arxiv_id must
+    increment useful_citations on that paper's INTRODUCES-d techniques —
+    the run just showed the citation paid off, not merely that a paper
+    claims it works."""
+    store = SculptorKG(tmp_path / "kg.db")
+    paper = Paper(id=make_paper_id("1707.06347"), arxiv_id="1707.06347", title="PPO")
+    tech = Technique(id=make_technique_id("rsi"), name="rsi")
+    store.add_node(paper)
+    store.add_node(tech)
+    store.add_edge(Edge(src=paper.id, dst=tech.id, relation=Relation.INTRODUCES))
+
+    # Forward attribution needs a NEXT iteration to measure iter0's edit
+    # against (cases.py: verdict is judged by iter N+1's fitness) — a
+    # single-iter run always attributes 'unknown'.
+    result = types.SimpleNamespace(
+        completed_iters=[_outcome(0, ["reward_hacking"]), _outcome(1, [])],
+        fitness_history=[0.2, 0.5],  # iter0 delta +0.3 -> helped
+    )
+    n = C.record_run_cases(
+        store, task="kick", result=result, nonce="cite1",
+        iter_references={0: ["1707.06347"]},
+    )
+    assert n == 1
+    fetched = store.get_node(tech.id)
+    assert fetched.useful_citations == 1
+
+
+def test_regressed_iter_with_references_does_not_increment(tmp_path) -> None:
+    """Only 'helped' verdicts credit citations — a regressed iteration's
+    references must NOT bump useful_citations (it didn't pay off)."""
+    store = SculptorKG(tmp_path / "kg.db")
+    paper = Paper(id=make_paper_id("1707.06347"), arxiv_id="1707.06347", title="PPO")
+    tech = Technique(id=make_technique_id("rsi"), name="rsi")
+    store.add_node(paper)
+    store.add_node(tech)
+    store.add_edge(Edge(src=paper.id, dst=tech.id, relation=Relation.INTRODUCES))
+
+    result = types.SimpleNamespace(
+        completed_iters=[_outcome(0, ["reward_hacking"]), _outcome(1, [])],
+        fitness_history=[0.5, 0.2],  # iter0 delta -0.3 -> regressed
+    )
+    n = C.record_run_cases(
+        store, task="kick", result=result, nonce="cite2",
+        iter_references={0: ["1707.06347"]},
+    )
+    assert n == 1
+    (case,) = store.find_nodes(kind=RunCase.kind)
+    assert case.verdict == "regressed"  # sanity: the gate condition actually applies
+    fetched = store.get_node(tech.id)
+    assert fetched.useful_citations == 0
+
+
+def test_no_iter_references_leaves_useful_citations_untouched(tmp_path) -> None:
+    """Default call (no iter_references kwarg) must not touch
+    useful_citations at all — the sculpt.py call site is unchanged and a
+    follow-up wires the real value through."""
+    store = SculptorKG(tmp_path / "kg.db")
+    tech = Technique(id=make_technique_id("rsi"), name="rsi")
+    store.add_node(tech)
+    result = types.SimpleNamespace(
+        completed_iters=[_outcome(0, ["reward_hacking"])],
+        fitness_history=[0.2, 0.5],
+    )
+    C.record_run_cases(store, task="kick", result=result, nonce="cite3")
+    fetched = store.get_node(tech.id)
+    assert fetched.useful_citations == 0
+
+
+def test_useful_citations_increments_across_multiple_helped_iters(tmp_path) -> None:
+    store = SculptorKG(tmp_path / "kg.db")
+    paper = Paper(id=make_paper_id("2020.00001"), arxiv_id="2020.00001", title="Shaping")
+    tech = Technique(id=make_technique_id("shaping"), name="shaping")
+    store.add_node(paper)
+    store.add_node(tech)
+    store.add_edge(Edge(src=paper.id, dst=tech.id, relation=Relation.INTRODUCES))
+
+    # 3 iters so BOTH iter0 and iter1 have a next-iter measurement to be
+    # forward-attributed against (iter2 itself attributes 'unknown', which
+    # is fine — it isn't referenced in iter_references below).
+    result = types.SimpleNamespace(
+        completed_iters=[_outcome(0, ["x"]), _outcome(1, ["y"]), _outcome(2, [])],
+        fitness_history=[0.1, 0.4, 0.7, 1.0],  # iter0, iter1 both helped
+    )
+    C.record_run_cases(
+        store, task="kick", result=result, nonce="cite4",
+        iter_references={0: ["2020.00001"], 1: ["2020.00001"]},
+    )
+    fetched = store.get_node(tech.id)
+    assert fetched.useful_citations == 2
+
+
+# ── §Agentic-data upgrade 4: freshness metadata ───────────────────────────
+def test_reward_version_and_env_spec_version_populate_from_outcome(tmp_path) -> None:
+    from pathlib import Path as _Path
+
+    store = SculptorKG(tmp_path / "kg.db")
+    result = types.SimpleNamespace(
+        completed_iters=[
+            _outcome_with_paths(
+                0, ["x"],
+                reward_path=_Path("/proj/rewards/v3.py"),
+                env_spec="v2",
+            ),
+        ],
+        fitness_history=[0.1, 0.4],
+    )
+    C.record_run_cases(store, task="kick", result=result, nonce="fresh1")
+    (case,) = store.find_nodes(kind=RunCase.kind)
+    assert case.reward_version == "v3"
+    assert case.env_spec_version == "v2"
+    store.close()
+
+
+def test_reward_version_none_when_outcome_lacks_trained_path(tmp_path) -> None:
+    """Old-shape outcomes (no reward_path_trained/env_spec_trained
+    attrs, or None values) must leave the fields None — no call-site
+    changes required."""
+    store = SculptorKG(tmp_path / "kg.db")
+    result = types.SimpleNamespace(
+        completed_iters=[_outcome(0, ["x"])],  # plain _outcome has neither attr
+        fitness_history=[0.1, 0.4],
+    )
+    C.record_run_cases(store, task="kick", result=result, nonce="fresh2")
+    (case,) = store.find_nodes(kind=RunCase.kind)
+    assert case.reward_version is None
+    assert case.env_spec_version is None
+    store.close()
+
+
+def test_pre_upgrade_case_rows_load_without_freshness_fields(tmp_path) -> None:
+    """Old RunCase rows (no reward_version/env_spec_version keys) must
+    round-trip with None defaults."""
+    import json as _json
+    import sqlite3 as _sqlite3
+
+    store = SculptorKG(tmp_path / "kg.db")
+    old_blob = {"task": "kick", "symptom": "falls", "verdict": "helped"}
+    conn = _sqlite3.connect(store.db_path)
+    conn.execute("INSERT INTO nodes (id, kind, data) VALUES (?, ?, ?)",
+                 ("case:old2", "RunCase", _json.dumps(old_blob)))
+    conn.commit(); conn.close()
+    (case,) = store.find_nodes(kind=RunCase.kind)
+    assert case.reward_version is None
+    assert case.env_spec_version is None
+    assert case.provenance == "observed_run"
+    store.close()
+
+
+# ── §Agentic-data upgrade 4: recency tiebreak in query_cases ──────────────
+def test_query_cases_recency_tiebreak_within_gap(tmp_path, monkeypatch) -> None:
+    """Two cases within the 0.02 similarity gap: the more recently-created
+    one sorts first (stable-sort nudge, not a hard filter)."""
+    store = SculptorKG(tmp_path / "kg.db")
+    older = RunCase(id="case:older", task="kick", symptom="falls",
+                    verdict="helped", edit_summary="old case",
+                    created_at=100.0)
+    newer = RunCase(id="case:newer", task="kick", symptom="falls",
+                    verdict="helped", edit_summary="new case",
+                    created_at=200.0)
+    store.add_node(older)
+    store.add_node(newer)
+    # Nearly identical vectors -> similarities within the 0.02 gap.
+    store.set_embedding("case:older", C.EMBEDDING_MODEL,
+                       np.array([1.0, 0.0], np.float32))
+    store.set_embedding("case:newer", C.EMBEDDING_MODEL,
+                       np.array([0.9999, 0.0141], np.float32))
+    monkeypatch.setattr(C, "_embed_text",
+                        lambda text, model_name=None: np.array([1.0, 0.0], np.float32))
+
+    matches = C.query_cases("kick", top_k=2, store=store)
+    assert [m.case.id for m in matches] == ["case:newer", "case:older"]
+    store.close()
+
+
+def test_query_cases_recency_does_not_override_a_real_similarity_gap(tmp_path, monkeypatch) -> None:
+    """A genuinely closer OLD case still outranks a fresher but weaker
+    match — recency is a tiebreak, never a hard override."""
+    store = SculptorKG(tmp_path / "kg.db")
+    older_close = RunCase(id="case:older_close", task="kick", symptom="falls",
+                         verdict="helped", edit_summary="old but close",
+                         created_at=1.0)
+    newer_far = RunCase(id="case:newer_far", task="kick", symptom="falls",
+                       verdict="helped", edit_summary="new but far",
+                       created_at=999.0)
+    store.add_node(older_close)
+    store.add_node(newer_far)
+    store.set_embedding("case:older_close", C.EMBEDDING_MODEL,
+                       np.array([1.0, 0.0], np.float32))
+    store.set_embedding("case:newer_far", C.EMBEDDING_MODEL,
+                       np.array([0.0, 1.0], np.float32))
+    monkeypatch.setattr(C, "_embed_text",
+                        lambda text, model_name=None: np.array([1.0, 0.0], np.float32))
+
+    matches = C.query_cases("kick", top_k=2, store=store)
+    assert [m.case.id for m in matches] == ["case:older_close", "case:newer_far"]
     store.close()

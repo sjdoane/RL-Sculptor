@@ -2657,10 +2657,38 @@ def sculpt_run(
         try:
             from sculptor.kg.cases import record_run_cases
             from sculptor.kg.store import SculptorKG
+
+            # §usage-based enrichment: which papers each iteration's KEPT
+            # reward actually cited — "helped" verdicts bump the cited
+            # techniques' useful_citations (retrieval learns from what
+            # got accepted, not just what was retrieved). Best-effort:
+            # an unreadable reward file skips that iter's references.
+            _iter_refs: dict[int, list[str]] = {}
+            for _oc in result.completed_iters:
+                _rp = getattr(_oc, "reward_path_trained", None) or getattr(
+                    _oc, "reward_path_after", None)
+                if not _rp or not Path(_rp).is_file():
+                    continue
+                try:
+                    from sculptor.edit import (
+                        _current_reward_references,
+                        _load_reward_module,
+                    )
+                    _ids = [
+                        str(r.get("arxiv_id"))
+                        for r in _current_reward_references(
+                            _load_reward_module(Path(_rp)))
+                        if r.get("arxiv_id")]
+                    if _ids:
+                        _iter_refs[int(_oc.iter_index)] = _ids
+                except Exception:  # noqa: BLE001 — enrichment is advisory
+                    continue
+
             _cstore = SculptorKG()
             try:
                 _n_cases = record_run_cases(
-                    _cstore, task=behavior_goal, result=result)
+                    _cstore, task=behavior_goal, result=result,
+                    iter_references=_iter_refs or None)
                 if _n_cases:
                     _emit_event({"type": "run_cases_recorded", "count": _n_cases})
             finally:

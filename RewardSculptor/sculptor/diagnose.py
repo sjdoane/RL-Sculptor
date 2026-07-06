@@ -39,6 +39,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from sculptor.adapters.base import load_adapter
 from sculptor.kg.query import TechniqueMatch, query_semantic, query_techniques
+from sculptor.kg.schema import evidence_tag
 from sculptor.kg.store import SculptorKG
 from sculptor.llm import log_llm_call, model_for, response_text_blocks
 
@@ -422,11 +423,21 @@ def _render_reward_contract(contract) -> str:
 
 
 def _render_kg_context(matches: list[TechniqueMatch]) -> str:
+    """§Agentic-data upgrade 1: each technique gets a compact
+    `[evidence: ...]` provenance tag (techniques are paper_claim by
+    default — materialized from extraction) and the block's header states
+    the trust-tier rule so Claude weighs a conflicting case-memory
+    observation (rendered above this block, see diagnose()) correctly."""
     if not matches:
         return "(no matches from the knowledge graph)"
-    lines = ["# LITERATURE CONTEXT (top KG matches)", ""]
+    lines = [
+        "# LITERATURE CONTEXT (top KG matches)",
+        "# Observations from this system's own runs (CASE MEMORY, above) "
+        "outrank paper claims below when they conflict.",
+        "",
+    ]
     for m in matches:
-        lines.append(f"## {m.technique.name}")
+        lines.append(f"## {m.technique.name} {evidence_tag(m.technique.provenance)}")
         lines.append(f"- source: {m.paper_citation}")
         if m.matched_on:
             lines.append(f"- matched_on: {m.matched_on}")
@@ -851,6 +862,16 @@ def diagnose(
                 if len(kg_matches) >= KG_TOP_K:
                     break
 
+            # §Agentic-data upgrade 3: retrieval trajectory log — durable
+            # record of what the technique retrieval surfaced for this
+            # iter's failure/behavior query. `iter_dir` is already in
+            # scope here (this iteration's artifact directory) so it's
+            # passed explicitly rather than falling back to llm_log_dir().
+            from sculptor.kg.retrieval_log import log_retrieval
+
+            log_retrieval(
+                "diagnose", behavior_goal, kg_matches, out_dir=iter_dir)
+
             # §Ship 37: case-memory — this system's OWN past runs on similar
             # tasks/failures (what was tried + whether it helped), additive to
             # the literature context. Floored like the semantic query so only
@@ -862,8 +883,11 @@ def diagnose(
                 )
                 _case_q = behavior_goal + (
                     " | " + ", ".join(fm_keywords) if fm_keywords else "")
-                case_context = _render_case_context(query_cases(
-                    _case_q, top_k=3, store=store, min_similarity=_MIN_SIM))
+                _case_matches = query_cases(
+                    _case_q, top_k=3, store=store, min_similarity=_MIN_SIM)
+                log_retrieval(
+                    "diagnose", _case_q, _case_matches, out_dir=iter_dir)
+                case_context = _render_case_context(_case_matches)
             except Exception as e:  # noqa: BLE001 — case memory is advisory
                 print(f"[diagnose] case-memory query failed ({e}) — skipped.",
                       file=sys.stderr, flush=True)

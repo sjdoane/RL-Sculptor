@@ -15,10 +15,16 @@ from sculptor.kg.schema import (
     Environment,
     FailureMode,
     Paper,
+    PROVENANCE_LLM_EXTRACTION,
+    PROVENANCE_OBSERVED_RUN,
+    PROVENANCE_PAPER_CLAIM,
+    PROVENANCE_SEED,
     Relation,
     RewardComponent,
     Result,
+    RunCase,
     Technique,
+    evidence_tag,
     make_environment_id,
     make_failure_mode_id,
     make_paper_id,
@@ -454,3 +460,91 @@ def test_heal_stub_titles_reports_still_stubbed_when_retry_fails(
 
     results = ingest.heal_stub_titles(store=kg)
     assert results == {"9999.00099": "still_stubbed"}
+
+
+# ── §Agentic-data upgrade 1: provenance trust tiers ───────────────────────
+def test_provenance_defaults_per_node_type(kg):
+    """Each node kind gets its documented default provenance when the
+    field is omitted at construction."""
+    paper = Paper(id=make_paper_id("x"), arxiv_id="x", title="X")
+    tech = Technique(id=make_technique_id("t"), name="t")
+    fm = FailureMode(id=make_failure_mode_id("f"), name="f")
+    rc = RewardComponent(id=make_reward_component_id("c"), name="c")
+    case = RunCase(id="case:x", task="kick")
+
+    assert paper.provenance == PROVENANCE_SEED
+    assert tech.provenance == PROVENANCE_PAPER_CLAIM
+    assert fm.provenance == PROVENANCE_PAPER_CLAIM
+    assert rc.provenance == PROVENANCE_PAPER_CLAIM
+    assert case.provenance == PROVENANCE_OBSERVED_RUN
+
+    for node in (paper, tech, fm, rc, case):
+        kg.add_node(node)
+        fetched = kg.get_node(node.id)
+        assert fetched.provenance == node.provenance
+
+
+def test_provenance_explicit_override_roundtrips(kg):
+    tech = Technique(id=make_technique_id("t2"), name="t2",
+                     provenance=PROVENANCE_LLM_EXTRACTION)
+    kg.add_node(tech)
+    fetched = kg.get_node(tech.id)
+    assert fetched.provenance == PROVENANCE_LLM_EXTRACTION
+
+
+def test_old_format_row_loads_with_type_default_provenance(kg):
+    """A node serialized BEFORE the provenance field existed (no
+    'provenance' key in the JSON blob) must still load — `row_to_node`
+    calls `cls(id=node_id, **data)`, and a dataclass field with a default
+    is simply absent from `**data`, so the type's own default fires."""
+    import json as _json
+    import sqlite3 as _sqlite3
+
+    old_technique_blob = {"name": "old_tech", "description": "pre-upgrade row"}
+    conn = _sqlite3.connect(kg.db_path)
+    conn.execute(
+        "INSERT INTO nodes (id, kind, data) VALUES (?, ?, ?)",
+        (make_technique_id("old_tech"), "Technique", _json.dumps(old_technique_blob)),
+    )
+    conn.commit()
+    conn.close()
+
+    fetched = kg.get_node(make_technique_id("old_tech"))
+    assert fetched is not None
+    assert fetched.provenance == PROVENANCE_PAPER_CLAIM  # type default, not KeyError
+    assert fetched.useful_citations == 0
+
+    old_paper_blob = {"arxiv_id": "y", "title": "Old Paper"}
+    conn = _sqlite3.connect(kg.db_path)
+    conn.execute(
+        "INSERT INTO nodes (id, kind, data) VALUES (?, ?, ?)",
+        (make_paper_id("y"), "Paper", _json.dumps(old_paper_blob)),
+    )
+    conn.commit()
+    conn.close()
+    fetched_paper = kg.get_node(make_paper_id("y"))
+    assert fetched_paper.provenance == PROVENANCE_SEED
+
+
+def test_evidence_tag_covers_all_known_tiers():
+    assert "observed" in evidence_tag(PROVENANCE_OBSERVED_RUN).lower()
+    assert "paper" in evidence_tag(PROVENANCE_PAPER_CLAIM).lower()
+    assert "seed" in evidence_tag(PROVENANCE_SEED).lower()
+    assert "llm" in evidence_tag(PROVENANCE_LLM_EXTRACTION).lower()
+
+
+def test_evidence_tag_degrades_gracefully_on_unknown_value():
+    """Provenance is advisory rendering metadata — an unrecognized value
+    (e.g. a stray string, or None from a very old row) must never raise;
+    it degrades to the least-trusted tag."""
+    assert evidence_tag(None) == evidence_tag(PROVENANCE_LLM_EXTRACTION)
+    assert evidence_tag("some_future_tier") == evidence_tag(PROVENANCE_LLM_EXTRACTION)
+
+
+def test_useful_citations_defaults_to_zero_and_roundtrips(kg):
+    tech = Technique(id=make_technique_id("cited"), name="cited")
+    assert tech.useful_citations == 0
+    tech.useful_citations = 7
+    kg.add_node(tech)
+    fetched = kg.get_node(tech.id)
+    assert fetched.useful_citations == 7

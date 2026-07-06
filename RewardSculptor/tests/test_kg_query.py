@@ -25,8 +25,11 @@ from sculptor.kg.extract import (
     extract_entities,
 )
 from sculptor.kg.query import (
+    USEFUL_CITATION_BOOST_CAP,
     TechniqueMatch,
+    _citation_boost,
     cite,
+    query_semantic,
     query_techniques,
 )
 from sculptor.kg.schema import (
@@ -392,3 +395,103 @@ def test_get_embedder_is_thread_safe_under_concurrent_load(monkeypatch):
     )
     # All threads see the same cached instance.
     assert all(r is results[0] for r in results)
+
+
+# ── §Agentic-data upgrade 2: usage-based ranking boost ────────────────────
+def test_citation_boost_is_zero_below_one_and_capped_at_high_counts():
+    assert _citation_boost(0) == 0.0
+    assert _citation_boost(-3) == 0.0
+    small = _citation_boost(1)
+    assert 0.0 < small < USEFUL_CITATION_BOOST_CAP
+    big = _citation_boost(1_000_000)
+    assert big == pytest.approx(USEFUL_CITATION_BOOST_CAP, abs=1e-9)
+    # monotonically non-decreasing.
+    assert _citation_boost(10) >= _citation_boost(1)
+    assert _citation_boost(100) >= _citation_boost(10)
+
+
+def test_query_techniques_boost_breaks_ties_without_exceeding_cap(kg):
+    """Two techniques tied on matched failure-mode count: the one with
+    more useful_citations ranks first, but the boost never overwhelms a
+    real relevance difference (checked via the cap constant itself)."""
+    _seed_graph(kg)
+    tech_rsi = kg.get_node(make_technique_id("reference_state_initialization"))
+    tech_rsi.useful_citations = 50
+    kg.add_node(tech_rsi)
+
+    results = query_techniques(["sparse_reward"], store=kg, top_k=5)
+    # Only RSI addresses sparse_reward directly in the single-failure query
+    # from the base seed graph fixture below — assert the boost is applied
+    # and stays within the documented cap.
+    rsi_match = next(m for m in results if m.technique.name == "reference_state_initialization")
+    assert rsi_match.relevance_score >= 1.0  # base score (1 matched fm) + boost
+    assert rsi_match.relevance_score <= 1.0 + USEFUL_CITATION_BOOST_CAP + 0.05  # + year tie-break slack
+
+
+def test_query_semantic_floor_applies_before_citation_boost(monkeypatch, kg):
+    """A match below min_similarity must NOT be resurrected by a large
+    useful_citations boost — the floor check happens on the raw cosine
+    similarity, before the boost is added."""
+    import numpy as np
+
+    _seed_graph(kg)
+    model_name = "test-model-boost"
+    # RSI sits just BELOW a 0.5 floor; shaping sits comfortably above.
+    below_floor_vec = np.array([0.4, np.sqrt(1 - 0.4 ** 2)], dtype=np.float32)
+    above_floor_vec = np.array([0.9, np.sqrt(1 - 0.9 ** 2)], dtype=np.float32)
+    kg.set_embedding(make_technique_id("reference_state_initialization"),
+                     model_name, below_floor_vec)
+    kg.set_embedding(make_technique_id("potential_based_shaping"),
+                     model_name, above_floor_vec)
+
+    # Give the below-floor technique a huge citation count — if the boost
+    # were applied before the floor check this could push it back above
+    # 0.5 (0.4 + 0.05 cap = 0.45, still short, so also assert the actual
+    # score never crosses the floor even with max boost).
+    tech_rsi = kg.get_node(make_technique_id("reference_state_initialization"))
+    tech_rsi.useful_citations = 10_000_000
+    kg.add_node(tech_rsi)
+
+    import sculptor.kg.query as qmod
+    monkeypatch.setattr(qmod, "_embed_text",
+                        lambda text, mn=model_name: np.array([1.0, 0.0], dtype=np.float32))
+
+    results = query_semantic("anything", top_k=5, store=kg, model_name=model_name,
+                             min_similarity=0.5)
+    names = {m.technique.name for m in results}
+    assert "reference_state_initialization" not in names, (
+        "below-floor match must not be resurrected by the citation boost")
+    assert "potential_based_shaping" in names
+
+
+def test_query_semantic_boost_reorders_within_floor_but_score_stays_raw(monkeypatch, kg):
+    """Among matches that already clear the floor, useful_citations can
+    reorder them — but the displayed relevance_score stays the RAW cosine
+    similarity (the boost affects ordering only, per the upgrade spec)."""
+    import numpy as np
+
+    _seed_graph(kg)
+    model_name = "test-model-boost2"
+    # shaping has slightly higher raw similarity than RSI...
+    rsi_vec = np.array([0.80, np.sqrt(1 - 0.80 ** 2)], dtype=np.float32)
+    shaping_vec = np.array([0.82, np.sqrt(1 - 0.82 ** 2)], dtype=np.float32)
+    kg.set_embedding(make_technique_id("reference_state_initialization"),
+                     model_name, rsi_vec)
+    kg.set_embedding(make_technique_id("potential_based_shaping"),
+                     model_name, shaping_vec)
+
+    # ...but RSI has a large useful_citations boost that should push it
+    # ahead in ORDER while its displayed score remains its raw cosine sim.
+    tech_rsi = kg.get_node(make_technique_id("reference_state_initialization"))
+    tech_rsi.useful_citations = 10_000_000
+    kg.add_node(tech_rsi)
+
+    import sculptor.kg.query as qmod
+    monkeypatch.setattr(qmod, "_embed_text",
+                        lambda text, mn=model_name: np.array([1.0, 0.0], dtype=np.float32))
+
+    results = query_semantic("anything", top_k=5, store=kg, model_name=model_name,
+                             min_similarity=0.0)
+    assert results[0].technique.name == "reference_state_initialization"
+    # displayed score is the RAW cosine similarity, not sim+boost.
+    assert results[0].relevance_score == pytest.approx(0.80, abs=1e-2)

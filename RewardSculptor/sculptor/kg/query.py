@@ -21,6 +21,7 @@ sees a uniform shape regardless of which path produced the candidate.
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 from dataclasses import dataclass, field
@@ -48,6 +49,31 @@ EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 #: diagnose/decompose now share the same constant — an unfloored
 #: query_semantic is for exploration tools only, never for prompts.
 DEFAULT_MIN_PROMPT_SIMILARITY = 0.35
+
+#: §Agentic-data upgrade 2 (usage-based enrichment): cap on the
+#: useful_citations ranking boost. Retrieval must stay RELEVANCE-dominated
+#: — a technique cited in ten past "helped" edits is a mild tie-breaker
+#: signal, not grounds to outrank something the current failure/behavior
+#: text actually matches. 0.05 is small next to the ~0.35-1.0 range of a
+#: real relevance/similarity score, and log1p makes the boost diminish
+#: fast (citation count 1 -> ~0.007, 10 -> ~0.024, 100 -> ~0.046,
+#: asymptoting at the 0.05 cap) so no amount of accumulated usage can ever
+#: let a barely-relevant technique leapfrog a strongly-relevant one.
+USEFUL_CITATION_BOOST_CAP = 0.05
+_USEFUL_CITATION_BOOST_SCALE = 0.01
+
+
+def _citation_boost(useful_citations: int) -> float:
+    """CAPPED ranking boost from usage history. Applied to the score used
+    for ORDERING only — never to gate/floor thresholds, which must be
+    checked on the raw relevance/similarity score before this is added
+    (otherwise a below-floor match could be boosted back above it)."""
+    if not useful_citations or useful_citations <= 0:
+        return 0.0
+    return min(
+        USEFUL_CITATION_BOOST_CAP,
+        _USEFUL_CITATION_BOOST_SCALE * math.log1p(useful_citations),
+    )
 
 
 # ── Result shape ────────────────────────────────────────────────────────────
@@ -236,6 +262,11 @@ def query_techniques(
             if newest_paper and newest_paper.year:
                 # Tiny tie-breaker so newer papers rank higher at the same score.
                 score += min((newest_paper.year - 2000) / 1000.0, 0.05)
+            # §Agentic-data upgrade 2: capped usage-based boost, ORDERING only.
+            # query_techniques has no similarity floor to protect (the graph
+            # walk is a hard ADDRESSES-edge match, not a threshold), so the
+            # boost is simply added to the tie-break score here.
+            score += _citation_boost(tech.useful_citations)
 
             results.append(TechniqueMatch(
                 technique=tech,
@@ -432,16 +463,22 @@ def query_semantic(
             time.time() - _t0,
         )
         # Vectors are L2-normalized, so dot product == cosine similarity.
+        # §Agentic-data upgrade 2: the min_similarity FLOOR is checked on the
+        # raw cosine `sim` — BEFORE the usage-based boost is added — so a
+        # tangential match can never be resurrected above the floor by
+        # citation count. The boost only reorders among matches that
+        # already cleared the floor on relevance alone.
         scored = []
         for tech, v in pool:
             sim = float(np.dot(qv, v))
             if sim < min_similarity:
                 continue
-            scored.append((sim, tech))
+            ranked_score = sim + _citation_boost(tech.useful_citations)
+            scored.append((ranked_score, sim, tech))
         scored.sort(key=lambda x: -x[0])
 
         results: list[TechniqueMatch] = []
-        for sim, tech in scored[:top_k]:
+        for ranked_score, sim, tech in scored[:top_k]:
             intro_papers: list[Paper] = []
             evidence = ""
             for edge, paper_id in store.neighbors(

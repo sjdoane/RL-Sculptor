@@ -35,7 +35,10 @@ from sculptor.kg.schema import (
     FailureMode,
     Relation,
     RunCase,
+    Technique,
+    evidence_tag,
     make_failure_mode_id,
+    make_paper_id,
     make_run_case_id,
 )
 from sculptor.kg.store import SculptorKG
@@ -104,6 +107,7 @@ def record_run_cases(
     result,  # duck-typed SculptRunResult (avoids a sculpt<->kg import cycle)
     nonce: str | None = None,
     eps: float = 1e-4,
+    iter_references: dict[int, list[str]] | None = None,
 ) -> int:
     """Materialize one `RunCase` per iteration of a run and link it to its
     failure-mode nodes (INSTANTIATES). Forward-attribution: the edit made at
@@ -113,9 +117,25 @@ def record_run_cases(
     Blind runs (no fitness) record too: symptom + edit identities + behavior
     signature, verdict 'unknown' — what was tried is itself memory.
 
+    `iter_references` (§Agentic-data upgrade 2, optional): iter_index ->
+    cited arxiv_ids for the reward version KEPT at that iteration.
+    `sculpt.py`'s `IterOutcome`/`SculptRunResult` do not themselves carry a
+    reward file's `REWARD_SPEC.references` (that list lives in the reward
+    module's source, not the in-memory run record) — reading it would mean
+    this function opening and importing the kept reward file, which is out
+    of scope for a KG-side helper. Wiring a real value through is a
+    follow-up at the `sculpt.py` call site (untouched here, per scope);
+    until then this stays None and no useful_citations increment happens.
+    When present: for each iteration whose verdict is "helped", the cited
+    papers' INTRODUCES-d Techniques get `useful_citations` incremented by
+    1 — a coarse, best-effort signal that a technique's citation actually
+    paid off in THIS project's own run, feeding the capped ranking boost
+    in `query.py`.
+
     Best-effort and additive — callers wrap this so a logging failure can
     never affect a run. Returns the number of cases written."""
     nonce = nonce or uuid.uuid4().hex[:8]
+    iter_references = iter_references or {}
     iters = list(getattr(result, "completed_iters", []) or [])
     fits = list(getattr(result, "fitness_history", []) or [])
     progs = list(getattr(result, "progress_history", []) or [])
@@ -182,6 +202,14 @@ def record_run_cases(
             f"iter {iter_index}: [{symptom}] → applied: {edits_s} → "
             f"{verdict} ({attributed})." + behavior_s
         )
+        # §Agentic-data upgrade 4 (freshness metadata): the reward/env-spec
+        # version ACTIVE while this iter trained. `IterOutcome` already
+        # carries these (no sculpt.py call-site change needed) — reward as
+        # a Path to the v<n>.py file, env spec as a plain version string.
+        reward_path_trained = getattr(outcome, "reward_path_trained", None)
+        reward_version = (
+            str(reward_path_trained.stem) if reward_path_trained else None)
+        env_spec_version = getattr(outcome, "env_spec_trained", None)
         case = RunCase(
             id=make_run_case_id(task, iter_index, nonce),
             task=task, robot=robot, symptom=symptom, failure_modes=fms,
@@ -192,8 +220,25 @@ def record_run_cases(
             progress_before=cur_p, progress_after=nxt_p,
             progress_delta=delta_p,
             behavior=behavior,
+            reward_version=reward_version,
+            env_spec_version=env_spec_version,
         )
         store.add_node(case)
+        # §Agentic-data upgrade 2: usage-based enrichment. A "helped" iter
+        # with a known reference list credits each cited paper's
+        # INTRODUCES-d techniques — this project's own run just showed the
+        # citation paid off, not merely that a paper claims it works.
+        if verdict == "helped":
+            for arxiv_id in iter_references.get(iter_index, []) or []:
+                paper_id = make_paper_id(str(arxiv_id))
+                for _, tech_id in store.neighbors(
+                    paper_id, relation=Relation.INTRODUCES, direction="out"
+                ):
+                    tech = store.get_node(tech_id)
+                    if not isinstance(tech, Technique):
+                        continue
+                    tech.useful_citations = int(tech.useful_citations or 0) + 1
+                    store.add_node(tech)
         for fm in fms:
             fm_id = make_failure_mode_id(fm)
             # §KG integrity: the diagnoser can flag a failure mode that was never
@@ -245,6 +290,14 @@ def _ensure_case_embeddings(store: SculptorKG, model_name: str = EMBEDDING_MODEL
     return out
 
 
+#: §Agentic-data upgrade 4: similarity gap under which two cases are
+#: considered "tied" for ranking purposes — recency then breaks the tie.
+#: This is a SOFT preference (stable sort), never a hard filter: an old
+#: case that is genuinely more similar still outranks a fresher, weaker
+#: match by more than this gap.
+_RECENCY_TIEBREAK_GAP = 0.02
+
+
 def query_cases(
     text: str,
     top_k: int = 3,
@@ -255,7 +308,12 @@ def query_cases(
 ) -> list[CaseMatch]:
     """Rank RunCase nodes by cosine similarity between `text` (the current
     failure context) and each case's task+symptom. Mirrors `query_semantic`.
-    Returns [] when there are no cases yet (the common early state)."""
+    Returns [] when there are no cases yet (the common early state).
+
+    §Agentic-data upgrade 4: when two matches' similarities are within
+    `_RECENCY_TIEBREAK_GAP`, the more recently-created case sorts first —
+    a stable-sort nudge, not a hard filter (old-but-closer cases are never
+    dropped)."""
     import numpy as np
 
     owns = store is None
@@ -271,7 +329,17 @@ def query_cases(
             if sim < min_similarity:
                 continue
             scored.append((sim, case))
-        scored.sort(key=lambda x: -x[0])
+        # Bucket similarity into _RECENCY_TIEBREAK_GAP-wide bands so ties
+        # within the band sort by recency, while a genuinely closer match
+        # outside the band still wins outright. Primary key: the band
+        # (coarser -> preserves "more similar wins" at the band level).
+        # Secondary key: created_at (recency breaks within-band ties).
+        scored.sort(
+            key=lambda x: (
+                -round(x[0] / _RECENCY_TIEBREAK_GAP),
+                -x[1].created_at,
+            )
+        )
         return [CaseMatch(case=c, relevance_score=s) for s, c in scored[:top_k]]
     finally:
         if owns:
@@ -283,7 +351,13 @@ _VERDICT_MARK = {"helped": "[+]", "regressed": "[-]", "neutral": "[=]", "unknown
 
 def _render_case_context(matches: list[CaseMatch]) -> str:
     """Render retrieved cases as a prompt block. Empty string when none, so
-    the caller can prepend it unconditionally."""
+    the caller can prepend it unconditionally.
+
+    §Agentic-data upgrade 1: each case carries a compact `[evidence: ...]`
+    tag (cases are RunCase nodes, so this is always "observed in THIS
+    project's own runs") and the block's header states the trust-tier
+    rule: observations from this system's own runs outrank paper claims
+    when they conflict."""
     if not matches:
         return ""
     lines = [
@@ -291,11 +365,14 @@ def _render_case_context(matches: list[CaseMatch]) -> str:
         "# This system's OWN past runs on similar tasks/failures. Learn from "
         "them: prefer directions marked [+] (helped), and do NOT repeat ones "
         "marked [-] (regressed the objective).",
+        "# Observations from this system's own runs outrank paper claims "
+        "when they conflict.",
     ]
     for m in matches:
         c = m.case
         lines.append(
             f"- {_VERDICT_MARK.get(c.verdict, '[?]')} {c.edit_summary} "
-            f"(task: {c.task[:60]}; sim {m.relevance_score:.2f})"
+            f"(task: {c.task[:60]}; sim {m.relevance_score:.2f}) "
+            f"{evidence_tag(c.provenance)}"
         )
     return "\n".join(lines)
