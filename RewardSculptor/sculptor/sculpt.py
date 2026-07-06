@@ -54,6 +54,7 @@ from sculptor.edit import (
     apply_edits,
     apply_prompt_edit,
 )
+from sculptor.llm import set_llm_log_dir
 
 
 # ── Structured-event markers (additive; dual-write) ──────────────────────
@@ -1152,6 +1153,10 @@ def _run_one_iter(
 
     iter_dir = runs_dir / f"iter_{iter_index}"
     iter_dir.mkdir(parents=True, exist_ok=True)
+    # §llm provenance: every LLM call this iteration makes (diagnose /
+    # edit / env / physics) archives to iter_dir/llm_calls.jsonl. The
+    # contextvar is last-set-wins across the single-threaded pipeline.
+    set_llm_log_dir(iter_dir)
 
     reward_path_before = _ensure_current_py(rewards_dir)
     latest_n, latest_reward_file = _find_latest_reward_version(rewards_dir)
@@ -1724,6 +1729,10 @@ def _run_one_iter(
                 replay_inputs=replay_inputs,
                 # §Hack-income regression screen: caught exploits stay caught.
                 hack_replays=hack_replays or None,
+                # §best-of-K (RESEARCH_GAP_ANALYSIS §3.3): K framed candidate
+                # rewrites per diagnosis, offline-screened + margin-ranked;
+                # only the winner trains. 1 (default) = single-shot path.
+                n_candidates=int(iter_cfg.get("edit_candidates", 1)),
             )
     except EditValidationError as e:
         sys.stderr.write(
@@ -3417,6 +3426,10 @@ def mission_run(
     mission_dir = Path(mission.mission_dir).resolve()
     mission_dir.mkdir(parents=True, exist_ok=True)
     (mission_dir / "stages").mkdir(exist_ok=True)
+    # §llm provenance: decomposition-adjacent calls (redecompose, metric
+    # resolution) archive to the mission dir until a stage's iteration
+    # sink takes over in _run_one_iter (last-set-wins).
+    set_llm_log_dir(mission_dir)
 
     # §Ship 34/38: resolve objective fitness fns. The mission-level
     # `fitness_metric` is the default; §Ship 38 lets each Stage carry its own
@@ -3426,19 +3439,29 @@ def mission_run(
     # could not). Pre-resolve ALL distinct refs up front (fail-fast before any
     # GPU work) and cache them so a generated-metric module loads once.
     from sculptor.eval import resolve_fitness_fn as _resolve_fitness_fn
+    from sculptor.mission_metrics import resolve_stage_metric_ref
+
+    # §MISSION_METRIC_GRANULARITY: stage metrics generated at decompose
+    # time are stored as MISSION-DIR-RELATIVE paths (portable mission.json,
+    # inside the 128-char validator bound) — anchor them here before
+    # resolution. Spec names + absolute paths pass through untouched.
+    def _anchored(ref: Optional[str]) -> Optional[str]:
+        return resolve_stage_metric_ref(ref, mission_dir) if ref else ref
+
     _fitness_fn_cache: dict[str, Callable[[Path], float]] = {}
     # Skip already-succeeded stages (resume): they won't run, so don't let a
     # since-deleted generated-metric path on one of them fail-fast the whole
     # resumed mission (§Ship 38 review L2).
-    for _ref in [fitness_metric] + [
-        getattr(s, "steering_metric", None) for s in mission.stages
+    for _ref in [_anchored(fitness_metric)] + [
+        _anchored(getattr(s, "steering_metric", None)) for s in mission.stages
         if getattr(s, "status", None) != "succeeded"
     ]:
         if _ref and _ref not in _fitness_fn_cache:
             _fitness_fn_cache[_ref] = _resolve_fitness_fn(_ref)  # fail-fast on bad ref
 
     def _fitness_fn_for_stage(stage) -> Optional[Callable[[Path], float]]:
-        ref = getattr(stage, "steering_metric", None) or fitness_metric
+        ref = _anchored(
+            getattr(stage, "steering_metric", None) or fitness_metric)
         return _fitness_fn_cache.get(ref) if ref else None
 
     def _emit(payload: dict) -> None:

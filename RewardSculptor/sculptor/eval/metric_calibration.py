@@ -32,6 +32,7 @@ from sculptor.eval.generated_metric import (
     read_required_roles,
 )
 from sculptor.eval.spec_metrics import _SPEC_FNS
+from sculptor.llm import log_llm_call, model_for, response_text_blocks
 
 T, E, J = 120, 4, 12
 _NAMES_12 = [
@@ -223,7 +224,7 @@ _TD_K_SOURCES = 3
 _TD_MIN_VALID = 2
 _TD_SPREAD_MIN = 0.15            # author-fault: metric near-constant on the ladder
 _TD_SEPARATION_MIN = 0.2         # metric-fault: doesn't beat the degenerate anchor
-_TD_MODEL_ID = "claude-opus-4-7"
+_TD_MODEL_ID = model_for("calibration")
 
 #: Distinct authoring STYLES across the K sources — reduces correlated phrasing
 #: so the K ladders are genuinely independent (anti-collusion).
@@ -364,14 +365,23 @@ def _author_structured(client: Any, model: str, system_prompt: str,
         + "\n\nOUTPUT FORMAT: respond with ONLY a single JSON object (no prose, no "
           "markdown fence) that conforms to this JSON Schema:\n"
         + json.dumps(schema.model_json_schema(), separators=(",", ":")))
+    user_content = json.dumps(payload, indent=2, default=str)
     resp = client.messages.create(
         model=model,
         max_tokens=_AUTHOR_MAX_TOKENS,
         thinking={"type": "adaptive"},
         system=instr,
-        messages=[{"role": "user",
-                   "content": json.dumps(payload, indent=2, default=str)}],
+        messages=[{"role": "user", "content": user_content}],
     )
+    # Provenance BEFORE the truncation gate so truncated author responses are
+    # archived too (they explain a recorded skip).
+    log_llm_call(
+        "calibration", model, system=instr, user=user_content,
+        response_text=response_text_blocks(resp),
+        usage=getattr(resp, "usage", None),
+        meta={"artifact": {"CompetenceLadder": "ladder",
+                           "GamingArchetypeSet": "archetypes"}.get(
+            getattr(schema, "__name__", ""), getattr(schema, "__name__", ""))})
     if getattr(resp, "stop_reason", None) == "max_tokens":
         raise ValueError(
             f"author response truncated at max_tokens={_AUTHOR_MAX_TOKENS}")

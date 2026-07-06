@@ -55,6 +55,9 @@ _LLM_MODULES = (
     ("kg_research", "sculptor.kg.research", "_MODEL"),
     ("mjcf_editor", "sculptor.adapters.mjcf_editor", "_MODEL_ID"),
     ("eureka_baseline", "sculptor.eval.eureka", "MODEL_ID"),
+    ("env_gen", "sculptor.env_gen", "MODEL_ID"),
+    ("metric_gen", "sculptor.eval.metric_gen", "MODEL_ID"),
+    ("calibration", "sculptor.eval.metric_calibration", "_TD_MODEL_ID"),
 )
 
 

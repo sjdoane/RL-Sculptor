@@ -1,7 +1,8 @@
 """Prompt-time KG research.
 
 User types a topic in the UI ("SEA physics parameters", "quadruped
-jumping curriculum"); Claude Opus 4.7 returns 5-10 arXiv IDs directly
+jumping curriculum"); Claude (the registry's "kg_research" role,
+`sculptor.llm.model_for`) returns 5-10 arXiv IDs directly
 relevant to that topic. The IDs are then ingested + extracted into the
 shared KG so subsequent sculpt runs can cite the new papers.
 
@@ -30,12 +31,13 @@ from typing import Iterable, Optional
 from pydantic import BaseModel, ConfigDict, Field
 
 from sculptor.kg.store import SculptorKG
+from sculptor.llm import log_llm_call, model_for, response_text_blocks
 from sculptor.prompts import load_prompt
 
 
 log = logging.getLogger(__name__)
 
-_MODEL = "claude-opus-4-7"
+_MODEL = model_for("kg_research")
 _MAX_TOKENS = 2048
 
 # Bare arxiv IDs in YYMM.NNNNN form. No `arXiv:` prefix, no version
@@ -318,6 +320,10 @@ def research_topic(
         messages=[{"role": "user", "content": user_msg}],
         output_format=ResearchResponse,
     )
+    log_llm_call(
+        "kg_research", _MODEL, system=system, user=user_msg,
+        response_text=response_text_blocks(resp),
+        usage=getattr(resp, "usage", None))
     # `messages.parse` returns a ParsedMessage whose parsed payload lives
     # under `.parsed_output` (scans content blocks for the first parsed
     # text block). Previous `.output` was wrong — sibling call sites in

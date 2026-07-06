@@ -1,6 +1,7 @@
 """sculptor/kg/extract.py — LLM-powered entity extraction.
 
-For each Paper in the KG, ask Claude Opus 4.7 to extract:
+For each Paper in the KG, ask Claude (the registry's "kg_extract" role,
+`sculptor.llm.model_for`) to extract:
   * Techniques (named methods or design patterns)
   * Failure modes (training pathologies the paper discusses)
   * Reward components (reusable reward-shaping terms)
@@ -49,9 +50,10 @@ from sculptor.kg.schema import (
     make_technique_id,
 )
 from sculptor.kg.store import SculptorKG
+from sculptor.llm import log_llm_call, model_for, response_text_blocks
 
 
-MODEL_ID = "claude-opus-4-7"
+MODEL_ID = model_for("kg_extract")
 MAX_TOKENS = 8192
 MAX_EXCERPT_CHARS = 28_000    # ~7K tokens — enough for most papers' key sections
 MIN_EVIDENCE_CHARS = 20       # reject snippets that are just category names
@@ -191,13 +193,18 @@ def _call_claude(client, system_prompt: str, user_prompt: str) -> ExtractionPayl
             messages=[{"role": "user", "content": user_prompt}],
             output_format=ExtractionPayload,
         )
+        log_llm_call(
+            "kg_extract", MODEL_ID, system=system_prompt, user=user_prompt,
+            response_text=response_text_blocks(resp),
+            usage=getattr(resp, "usage", None), meta={"attempt": 1})
         return resp.parsed_output  # type: ignore[return-value]
     except Exception as first_err:
         # Retry once with a corrective reminder appended as a follow-up user turn.
+        retry_reminder = f"{RETRY_REMINDER} Error was: {first_err!s}"
         corrected_messages = [
             {"role": "user", "content": user_prompt},
             # 4.7 disallows assistant prefill; use a second user turn instead.
-            {"role": "user", "content": f"{RETRY_REMINDER} Error was: {first_err!s}"},
+            {"role": "user", "content": retry_reminder},
         ]
         # Second attempt: re-run with the nudge; propagate any failure.
         resp = client.messages.parse(
@@ -208,6 +215,11 @@ def _call_claude(client, system_prompt: str, user_prompt: str) -> ExtractionPayl
             messages=corrected_messages,
             output_format=ExtractionPayload,
         )
+        log_llm_call(
+            "kg_extract", MODEL_ID, system=system_prompt,
+            user=f"{user_prompt}\n\n{retry_reminder}",
+            response_text=response_text_blocks(resp),
+            usage=getattr(resp, "usage", None), meta={"attempt": 2})
         return resp.parsed_output  # type: ignore[return-value]
 
 

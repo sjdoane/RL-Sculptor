@@ -32,8 +32,9 @@ from sculptor.env_spec import (
     _TRAIN_SCALARS,
     validate_env_spec,
 )
+from sculptor.llm import log_llm_call, model_for, response_text_blocks
 
-MODEL_ID = "claude-opus-4-7"
+MODEL_ID = model_for("env_gen")
 MAX_TOKENS = 8192
 
 _PROMPT_PATH = Path(__file__).parent / "prompts" / "gen_env_spec.md"
@@ -162,6 +163,10 @@ def generate_env_spec(
             messages=[{"role": "user", "content": content}],
             output_format=_EnvSpecModel,
         )
+        log_llm_call(
+            "env_gen", MODEL_ID, system=system_prompt, user=content,
+            response_text=response_text_blocks(resp),
+            usage=getattr(resp, "usage", None))
         return _model_to_spec(resp.parsed_output, behavior_goal=behavior_goal)
 
     # Attempt 1 → full-violation feedback → attempt 2 → raise.

@@ -1253,3 +1253,194 @@ def test_apply_edits_case_memory_failure_is_silent(v0_path, kg, monkeypatch):
     )
     assert out.is_file()
     assert "# CASE MEMORY" not in client.messages.calls[0]["messages"][0]["content"]
+
+
+# ── §best-of-K candidate edits ────────────────────────────────────────────
+_VK_BATCHED_SOURCE = '''\
+"""v1 — best-of-K candidate (forward_weight __W__), with batched path."""
+from __future__ import annotations
+import numpy as np
+
+REWARD_SPEC = {
+    "version": "v1",
+    "description": "candidate forward_weight=__W__",
+    "author": "sculptor",
+    "parent_hash": "__PARENT_HASH__",
+    "hyperparameters": {
+        "forward_weight": __W__,
+        "alive_bonus": 1.0,
+        "ctrl_cost_weight": 1e-3,
+    },
+    "references": [
+        {
+            "arxiv_id": "1801.00690",
+            "citation": "__CITATION__",
+            "how_used": "forward-weight tuning per DM Control guidance",
+        }
+    ],
+}
+
+
+def compute_reward(state, action, next_state, info):
+    fwd = float(info.get("x_velocity", 0.0))
+    components = {
+        "forward_velocity": REWARD_SPEC["hyperparameters"]["forward_weight"] * fwd,
+        "alive_bonus": REWARD_SPEC["hyperparameters"]["alive_bonus"],
+    }
+    return components["forward_velocity"] + components["alive_bonus"], components
+
+
+def compute_reward_batched(state, action, next_state, info):
+    import torch
+    fwd = torch.as_tensor(info["x_velocity"]).reshape(-1).float()
+    w = REWARD_SPEC["hyperparameters"]["forward_weight"]
+    components = {
+        "forward_velocity": w * fwd,
+        "alive_bonus": torch.ones_like(fwd),
+    }
+    return components["forward_velocity"] + components["alive_bonus"], components
+'''
+
+
+def _render_vk_source(parent_hash: str, citation: str, weight: float) -> str:
+    return (
+        _VK_BATCHED_SOURCE
+        .replace("__PARENT_HASH__", parent_hash)
+        .replace("__CITATION__", citation)
+        .replace("__W__", repr(weight))
+    )
+
+
+def _replay_batch(x_vel: float, n: int = 64):
+    """Minimal (state, action, next_state, info) replay tuple — only
+    info matters to the candidate sources above."""
+    import torch
+
+    state = torch.zeros((n, 11), dtype=torch.float32)
+    action = torch.zeros((n, 3), dtype=torch.float32)
+    next_state = torch.zeros((n, 11), dtype=torch.float32)
+    info = {"x_velocity": torch.full((n,), float(x_vel))}
+    return (state, action, next_state, info)
+
+
+def _bok_diagnosis() -> Diagnosis:
+    return Diagnosis(
+        failure_modes=["component_imbalance"], evidence="",
+        proposed_edits=[
+            ProposedEdit(
+                target_term="alive_bonus", operation="increase",
+                rationale="grounded", suggested_value="3.0",
+                paper_refs=["1801.00690"],
+            ),
+        ],
+        confidence=0.9,
+        behavior_goal="run forward without falling",
+    )
+
+
+def test_apply_edits_best_of_k_selects_by_hack_margin(v0_path, kg, tmp_path):
+    """K=2 with replay evidence: the candidate whose reward separates the
+    archived honest rollout from the archived exploit MORE (larger
+    forward_weight → larger honest−hack margin) must win, even though it
+    is NOT the first valid candidate."""
+    import hashlib
+
+    from sculptor.kg.query import cite
+
+    parent_hash = hashlib.sha256(
+        v0_path.read_text(encoding="utf-8").encode("utf-8")).hexdigest()[:16]
+    citation = cite("1801.00690", store=kg)
+    # Candidate 0 (default framing): weak separation (w=0.1 → margin 0.3).
+    # Candidate 1 (MINIMAL-DIFF framing): strong separation (w=1.0 → 3.0).
+    weak = _render_vk_source(parent_hash, citation, 0.1)
+    strong = _render_vk_source(parent_hash, citation, 1.0)
+    client = _StubClient(weak, strong)
+
+    iter_dir = tmp_path / "iter_bok"
+    iter_dir.mkdir()
+    out_path = apply_edits(
+        current_reward_path=v0_path, diagnosis=_bok_diagnosis(),
+        new_iter_id="v1", reward_contract=_hopper_contract(),
+        kg_store=kg, client=client,
+        iter_dir=iter_dir,
+        replay_inputs=_replay_batch(2.0),
+        hack_replays=[{"label": "iter 3 (sit-farm)",
+                       "replay_inputs": _replay_batch(-1.0)}],
+        n_candidates=2,
+    )
+    assert out_path.is_file()
+    assert len(client.messages.calls) == 2
+    # The second call's prompt carries the framing directive.
+    assert "MINIMAL-DIFF" in client.messages.calls[1]["messages"][0]["content"]
+
+    spec = importlib.util.spec_from_file_location("v1_bok", out_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert mod.REWARD_SPEC["hyperparameters"]["forward_weight"] == 1.0
+
+    report = json.loads(
+        (iter_dir / "edit_candidates.json").read_text(encoding="utf-8"))
+    assert report["selected"] == 1
+    assert len(report["candidates"]) == 2
+    margins = [c["hack_margin"] for c in report["candidates"]]
+    assert margins[1] > margins[0]
+    assert (iter_dir / "edit_candidates" / "cand0.py").is_file()
+    assert (iter_dir / "edit_candidates" / "cand1.py").is_file()
+
+
+def test_apply_edits_best_of_k_no_replays_keeps_first_valid(v0_path, kg, tmp_path):
+    """No replay evidence → margins are all None → the DEFAULT framing
+    (candidate 0) wins on the lowest-index tiebreak."""
+    import hashlib
+
+    from sculptor.kg.query import cite
+
+    parent_hash = hashlib.sha256(
+        v0_path.read_text(encoding="utf-8").encode("utf-8")).hexdigest()[:16]
+    citation = cite("1801.00690", store=kg)
+    first = _render_vk_source(parent_hash, citation, 0.5)
+    second = _render_vk_source(parent_hash, citation, 2.0)
+    client = _StubClient(first, second)
+
+    iter_dir = tmp_path / "iter_bok2"
+    iter_dir.mkdir()
+    out_path = apply_edits(
+        current_reward_path=v0_path, diagnosis=_bok_diagnosis(),
+        new_iter_id="v1", reward_contract=_hopper_contract(),
+        kg_store=kg, client=client, iter_dir=iter_dir,
+        n_candidates=2,
+    )
+    assert out_path.is_file()
+    spec = importlib.util.spec_from_file_location("v1_bok2", out_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert mod.REWARD_SPEC["hyperparameters"]["forward_weight"] == 0.5
+    report = json.loads(
+        (iter_dir / "edit_candidates.json").read_text(encoding="utf-8"))
+    assert report["selected"] == 0
+
+
+def test_apply_edits_best_of_k_all_invalid_falls_back_to_retry(v0_path, kg):
+    """Every candidate fails validation → one repair retry (seeded with
+    the first candidate's error), same semantics as the K=1 attempt 2."""
+    import hashlib
+
+    from sculptor.kg.query import cite
+
+    parent_hash = hashlib.sha256(
+        v0_path.read_text(encoding="utf-8").encode("utf-8")).hexdigest()[:16]
+    citation = cite("1801.00690", store=kg)
+    broken = '"""broken — no REWARD_SPEC."""\ndef compute_reward(s, a, n, i):\n    return 0.0, {"a": 0.0}\n'
+    good = _render_v1_source(parent_hash, citation)
+    client = _StubClient(broken, broken, good)
+
+    out_path = apply_edits(
+        current_reward_path=v0_path, diagnosis=_bok_diagnosis(),
+        new_iter_id="v1", reward_contract=_hopper_contract(),
+        kg_store=kg, client=client,
+        n_candidates=2,
+    )
+    assert out_path.is_file()
+    assert len(client.messages.calls) == 3
+    retry_msg = client.messages.calls[2]["messages"][0]["content"]
+    assert "VALIDATION_ERRORS_ON_PREVIOUS_ATTEMPT" in retry_msg

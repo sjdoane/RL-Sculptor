@@ -12,8 +12,9 @@ Stage 2 ("grounded"):
     → proposed_edits. Every edit must cite paper_refs (arxiv_ids) when
     literature-grounded, or mark itself `novel.` and leave paper_refs empty.
 
-Both calls use claude-opus-4-7 with adaptive thinking, strict JSON via
-`messages.parse`, and one retry on parse/validation failure.
+Both calls use the registry model (`sculptor.llm.model_for("diagnose")`)
+with adaptive thinking, strict JSON via `messages.parse`, and one retry
+on parse/validation failure.
 
 The diagnoser is stack-agnostic: failure modes are the SAME six across RL
 domains (`reward_hacking`, `static_equilibrium`, `premature_termination`,
@@ -39,9 +40,10 @@ from pydantic import BaseModel, Field, field_validator
 from sculptor.adapters.base import load_adapter
 from sculptor.kg.query import TechniqueMatch, query_semantic, query_techniques
 from sculptor.kg.store import SculptorKG
+from sculptor.llm import log_llm_call, model_for, response_text_blocks
 
 
-MODEL_ID = "claude-opus-4-7"
+MODEL_ID = model_for("diagnose")
 MAX_TOKENS = 8192
 N_KEYFRAMES_SENT = 4         # the spec calls for exactly 4 keyframes per call
 KG_TOP_K = 6                 # union size of KG context shown to the grounded call
@@ -641,8 +643,26 @@ def _build_grounded_user_content(
 
 
 # ── LLM calls with one-retry parse ────────────────────────────────────────
-def _parse_with_retry(client, *, model_cls, system_prompt, user_content):
+def _log_user_text(user_content: Any) -> str:
+    """Text view of a user-content payload for the provenance archive.
+    Image blocks (base64 keyframes) are elided to a placeholder — they
+    would bloat llm_calls.jsonl by MBs per call without adding replay
+    value (the keyframe PNGs are already archived in the iter dir)."""
+    if isinstance(user_content, str):
+        return user_content
+    parts: list[str] = []
+    for blk in user_content or []:
+        if isinstance(blk, dict) and blk.get("type") == "text":
+            parts.append(str(blk.get("text", "")))
+        elif isinstance(blk, dict):
+            parts.append(f"[{blk.get('type', 'block')} block omitted]")
+    return "\n".join(parts)
+
+
+def _parse_with_retry(client, *, model_cls, system_prompt, user_content,
+                      stage: Optional[str] = None):
     """messages.parse with one retry on parse / validation failure."""
+    meta = {"stage": stage} if stage else None
     try:
         resp = client.messages.parse(
             model=MODEL_ID,
@@ -653,13 +673,19 @@ def _parse_with_retry(client, *, model_cls, system_prompt, user_content):
             messages=[{"role": "user", "content": user_content}],
             output_format=model_cls,
         )
+        log_llm_call(
+            "diagnose", MODEL_ID, system=system_prompt,
+            user=_log_user_text(user_content),
+            response_text=response_text_blocks(resp),
+            usage=getattr(resp, "usage", None),
+            meta={**(meta or {}), "attempt": 1})
         return resp.parsed_output
     except Exception as first_err:
         # 4.7 forbids assistant prefill — retry via a second user turn.
+        retry_reminder = f"{RETRY_REMINDER} Previous error: {first_err!s}"
         retry_messages = [
             {"role": "user", "content": user_content},
-            {"role": "user",
-             "content": f"{RETRY_REMINDER} Previous error: {first_err!s}"},
+            {"role": "user", "content": retry_reminder},
         ]
         resp = client.messages.parse(
             model=MODEL_ID,
@@ -669,6 +695,12 @@ def _parse_with_retry(client, *, model_cls, system_prompt, user_content):
             messages=retry_messages,
             output_format=model_cls,
         )
+        log_llm_call(
+            "diagnose", MODEL_ID, system=system_prompt,
+            user=f"{_log_user_text(user_content)}\n\n{retry_reminder}",
+            response_text=response_text_blocks(resp),
+            usage=getattr(resp, "usage", None),
+            meta={**(meta or {}), "attempt": 2})
         return resp.parsed_output
 
 
@@ -779,6 +811,7 @@ def diagnose(
     preliminary: _PreliminaryModel = _parse_with_retry(
         client, model_cls=_PreliminaryModel,
         system_prompt=_PRELIM_SYSTEM, user_content=prelim_user,
+        stage="preliminary",
     )
 
     # 5. KG retrieval — union of tag-based and semantic matches, deduped.
@@ -855,6 +888,7 @@ def diagnose(
         grounded: _GroundedModel = _parse_with_retry(
             client, model_cls=_GroundedModel,
             system_prompt=_GROUNDED_SYSTEM, user_content=grounded_user,
+            stage="grounded",
         )
 
         # §Ship 31 (anti-hallucination): verify citations at the SOURCE.

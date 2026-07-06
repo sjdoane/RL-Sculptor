@@ -41,6 +41,7 @@ from __future__ import annotations
 import ast
 import hashlib
 import importlib.util
+import itertools
 import json
 import re
 import sys
@@ -55,9 +56,10 @@ from sculptor.eval import partition_gate
 from sculptor.kg.query import cite
 from sculptor.kg.schema import make_paper_id
 from sculptor.kg.store import SculptorKG
+from sculptor.llm import log_llm_call, model_for
 
 
-MODEL_ID = "claude-opus-4-7"
+MODEL_ID = model_for("edit")
 MAX_TOKENS = 16000
 RETRY_REMINDER_PREFIX = (
     "Your previous response failed validation. Fix the following and return "
@@ -560,6 +562,83 @@ def _screen_hack_income(mod, hack_replays) -> None:
         )
 
 
+# ── §best-of-K candidate edits (RESEARCH_GAP_ANALYSIS §3.3 / COULD) ──────
+# One diagnosis → K candidate rewrites under DIVERSE STRATEGY FRAMINGS,
+# screened offline (the full _post_validate stack), ranked on replay
+# evidence, and only the winner trains. GPU cost is unchanged (still one
+# training per iteration); LLM cost is ×K on the edit call only. This is
+# the cheap form of best-of-K selection: the treatment arm's K candidates
+# come from ONE grounded diagnosis under different edit strategies, vs
+# Eureka's blind resampling. Framing (not model or temperature) carries
+# the diversity: the same strongest model explores distinct regions of
+# edit space, mirroring metric_gen's best-of-N FRAMING pattern.
+_EDIT_FRAMINGS: tuple[str, ...] = (
+    # Candidate 1: no suffix — byte-identical to the single-shot prompt.
+    "",
+    "\n\n# STRATEGY DIRECTIVE (candidate framing)\n"
+    "MINIMAL-DIFF: make the SMALLEST coherent change that addresses the "
+    "diagnosis. Prefer retuning existing magnitudes, thresholds and "
+    "gates over adding terms; add a new term only if the diagnosis "
+    "cannot be addressed without one. Keep the component structure "
+    "recognizably the parent's.",
+    "\n\n# STRATEGY DIRECTIVE (candidate framing)\n"
+    "STRUCTURAL: rethink the term structure around the diagnosis. "
+    "Consider phase decomposition (e.g. contact/launch/flight/landing "
+    "gating), removing dead or fighting terms, and re-staging credit so "
+    "each phase pays only when its preconditions hold. Stay within the "
+    "same contract and cited techniques; do not relax completion gates.",
+    "\n\n# STRATEGY DIRECTIVE (candidate framing)\n"
+    "EXPLORATION-FIRST: prioritize making the hard-to-reach states "
+    "reachable and worth visiting (shaping toward the diagnosis's "
+    "missing behavior) over polishing already-achieved behavior. Keep "
+    "already-earned credit intact so the policy does not abandon what "
+    "it can do.",
+    "\n\n# STRATEGY DIRECTIVE (candidate framing)\n"
+    "ROBUSTNESS: assume the policy will try to exploit any unguarded "
+    "credit. Audit every term for degenerate maximizers and gate them; "
+    "prefer bounded, saturating credit over unbounded linear credit.",
+)
+
+
+#: §best-of-K: monotonic staging-name counter — see the staging-name
+#: comment in `_post_validate` for why this must be unique per call.
+_STAGING_COUNTER = itertools.count()
+
+
+def _framing_name(index: int) -> str:
+    """Short label for a framing ("default", "MINIMAL-DIFF", …) for
+    logs + the candidate report."""
+    if index == 0:
+        return "default"
+    try:
+        # Framing shape: "\n\n# STRATEGY DIRECTIVE …\nNAME: directive…"
+        return _EDIT_FRAMINGS[index].strip().splitlines()[1].split(":")[0]
+    except Exception:  # noqa: BLE001 — label only
+        return f"framing_{index}"
+
+
+def _candidate_hack_margin(mod, replay_inputs, hack_replays) -> "float | None":
+    """Offline discrimination score for ranking valid candidates: the
+    WORST-CASE gap between what the candidate pays the archived honest
+    best rollout and what it pays each archived (diagnosed) exploit,
+    per step. Higher = sharper separation of honest behavior from known
+    gaming (CARD-TPE-style order preservation, arXiv:2410.14660, on
+    this project's own replay evidence). None = no evidence (no replays
+    / unreplayable candidate) — callers rank None below any float."""
+    if not replay_inputs or not hack_replays:
+        return None
+    honest = _replay_reward_summary(mod, replay_inputs)
+    if honest is None:
+        return None
+    margins: list[float] = []
+    for hr in hack_replays:
+        cand = _replay_reward_summary(mod, hr.get("replay_inputs"))
+        if cand is None:
+            continue
+        margins.append(float(honest["mean_alive"]) - float(cand["mean_alive"]))
+    return min(margins) if margins else None
+
+
 def _call_compute_reward_batched(mod, contract) -> None:
     """§Ship 31b: execute the BATCHED path pre-flight (N=2 zero
     tensors, runtime-faithful float info). The scalar probe runs pure
@@ -996,6 +1075,10 @@ def _call_llm(
     for block in resp.content:
         if getattr(block, "type", None) == "text":
             chunks.append(block.text)
+    log_llm_call(
+        "edit", MODEL_ID, system=system_prompt, user=user_content,
+        response_text="".join(chunks), usage=getattr(resp, "usage", None),
+        meta={"attempt": attempt})
     if not chunks:
         raise EditValidationError("LLM returned no text blocks")
     out = _strip_markdown_fence("".join(chunks))
@@ -1016,7 +1099,8 @@ def _post_validate(new_source: str, *, contract, kg_store: SculptorKG,
                    metric_observables: "frozenset[str] | None" = None,
                    replay_inputs=None,
                    replay_parent: "dict | None" = None,
-                   hack_replays: "list[dict] | None" = None) -> Any:
+                   hack_replays: "list[dict] | None" = None,
+                   promote: bool = True) -> Any:
     """Write source, import, validate, return the imported module.
 
     Raises EditValidationError on any failure (caller decides whether to retry).
@@ -1029,13 +1113,26 @@ def _post_validate(new_source: str, *, contract, kg_store: SculptorKG,
     showed a "reward rewrite failed" toast but subsequent loads read
     the polluted file. `_load_reward_module` imports by path, so the
     staging file is loadable even though its name isn't canonical.
+
+    `promote=False` (§best-of-K): run the FULL validation stack but
+    never touch `write_to` — the staging file is unlinked on success
+    too, and the imported module is returned for offline ranking. The
+    winner is re-validated with `promote=True`, so the on-disk invariant
+    ("v<n>.py == validated output") is enforced by the same code path
+    either way.
     """
     write_to.parent.mkdir(parents=True, exist_ok=True)
     # Staging filename MUST end in `.py` so `importlib.util.spec_from_
     # file_location` auto-detects a Python loader. Leading dot marks it
     # as a hidden file so `list_versions` glob `v*.py` ignores it.
-    # e.g. `v1.py` → `.v1.staging.py`.
-    staging = write_to.with_name(f".{write_to.stem}.staging.py")
+    # e.g. `v1.py` → `.v1.staging3.py`. The per-invocation counter is
+    # load-bearing (§best-of-K): candidates staged to the SAME filename
+    # can collide in CPython's mtime+size-keyed bytecode cache — two
+    # same-length sources written within mtime granularity execute the
+    # FIRST candidate's stale .pyc for the second candidate (observed:
+    # both candidates reported the first one's hack margin).
+    staging = write_to.with_name(
+        f".{write_to.stem}.staging{next(_STAGING_COUNTER)}.py")
     staging.write_text(new_source, encoding="utf-8")
     try:
         mod = _load_reward_module(staging, name_hint="_sculptor_new_reward")
@@ -1175,6 +1272,12 @@ def _post_validate(new_source: str, *, contract, kg_store: SculptorKG,
         staging.unlink(missing_ok=True)
         raise
 
+    # All checks passed. §best-of-K validation-only mode: discard the
+    # staging file, hand the module back for ranking; write_to untouched.
+    if not promote:
+        staging.unlink(missing_ok=True)
+        return mod
+
     # All checks passed — atomically promote staging to the target name
     # so `current.py` + the rewards list see the new version only after
     # full validation. `os.replace` is atomic on POSIX and Win32.
@@ -1197,10 +1300,23 @@ def apply_edits(
     metric_observables: "frozenset[str] | None" = None,
     replay_inputs=None,
     hack_replays: "list[dict] | None" = None,
+    n_candidates: int = 1,
 ) -> Path:
     """Produce a new reward module from `diagnosis` applied to
     `current_reward_path`. Writes `<rewards_dir>/<new_iter_id>.py` and
     rewrites `<rewards_dir>/current.py` to load that file by path.
+
+    `n_candidates`: §best-of-K (RESEARCH_GAP_ANALYSIS §3.3). 1 (default)
+    = the unchanged single-shot-with-retry path, byte-identical. K>1
+    samples K candidates under the `_EDIT_FRAMINGS` strategy directives,
+    validates each through the FULL post-flight stack (promote=False),
+    ranks the valid ones by `_candidate_hack_margin` (ties / no evidence
+    → lowest candidate index, i.e. the unbiased default framing), and
+    promotes only the winner. All-invalid falls back to the existing
+    one-retry repair on the first candidate's errors. A candidate report
+    (framings, verdicts, margins, source hashes) is persisted to
+    `<iter_dir>/edit_candidates.json` plus per-candidate sources under
+    `<iter_dir>/edit_candidates/` when `iter_dir` is given.
 
     `replay_inputs`: §RL_SCULPTOR_AUDIT §4.4 (loop 4b). Optional
     `(state, action, next_state, info)` batch reconstructed from the
@@ -1402,24 +1518,143 @@ def apply_edits(
                 "text": f"[edit] prompt built (chars={len(user_prompt)})",
             })
 
-        # Attempt 1.
+        # §best-of-K: sample K framed candidates, validate all, promote
+        # the best-ranked. Falls through to the single-shot path below
+        # when K<=1 (byte-identical) or when a winner was promoted.
+        winner_promoted = False
+        if n_candidates and n_candidates > 1:
+            k = min(int(n_candidates), len(_EDIT_FRAMINGS))
+            cand_records: list[dict[str, Any]] = []
+            first_error: EditValidationError | None = None
+            for ci in range(k):
+                framed_prompt = user_prompt + _EDIT_FRAMINGS[ci]
+                if on_event is not None:
+                    on_event({
+                        "type": "log_line",
+                        "text": f"[edit] candidate {ci + 1}/{k} "
+                                f"({_framing_name(ci)})",
+                    })
+                rec: dict[str, Any] = {"index": ci, "valid": False,
+                                       "hack_margin": None}
+                try:
+                    cand_source = _call_llm(
+                        client, _EDIT_SYSTEM, framed_prompt,
+                        on_event=on_event, attempt=1,
+                    )
+                    rec["source"] = cand_source
+                    rec["source_sha256"] = hashlib.sha256(
+                        cand_source.encode("utf-8")).hexdigest()[:16]
+                    cand_mod = _post_validate(
+                        cand_source, contract=reward_contract,
+                        kg_store=kg_store, parent_hash=parent_hash,
+                        new_version=new_iter_id, write_to=target_path,
+                        parent_hparams=gate_parent_hparams,
+                        metric_observables=metric_observables,
+                        replay_inputs=replay_inputs,
+                        replay_parent=replay_parent,
+                        hack_replays=hack_replays,
+                        promote=False,
+                    )
+                    rec["valid"] = True
+                    rec["hack_margin"] = _candidate_hack_margin(
+                        cand_mod, replay_inputs, hack_replays)
+                except EditValidationError as e:
+                    rec["error"] = str(e)
+                    if first_error is None:
+                        first_error = e
+                cand_records.append(rec)
+
+            valid = [r for r in cand_records if r["valid"]]
+            if valid:
+                # Rank: evidence beats no-evidence; larger margin beats
+                # smaller; ties keep the LOWEST index (default framing).
+                winner = max(
+                    valid,
+                    key=lambda r: (
+                        r["hack_margin"] is not None,
+                        r["hack_margin"] if r["hack_margin"] is not None
+                        else float("-inf"),
+                        -r["index"],
+                    ),
+                )
+                new_source = winner["source"]
+                _post_validate(
+                    new_source, contract=reward_contract, kg_store=kg_store,
+                    parent_hash=parent_hash, new_version=new_iter_id,
+                    write_to=target_path,
+                    parent_hparams=gate_parent_hparams,
+                    metric_observables=metric_observables,
+                    replay_inputs=replay_inputs,
+                    replay_parent=replay_parent,
+                    hack_replays=hack_replays,
+                )
+                winner_promoted = True
+                if on_event is not None:
+                    on_event({
+                        "type": "edit_candidates_ranked",
+                        "n": k,
+                        "valid": len(valid),
+                        "selected": winner["index"],
+                        "margins": [r["hack_margin"] for r in cand_records],
+                    })
+                _write_candidate_report(
+                    iter_dir, new_iter_id, cand_records, winner["index"])
+            else:
+                # Every candidate failed validation — fall through to the
+                # single-shot retry below, seeded with the first error
+                # (same repair semantics as the K=1 path's attempt 2).
+                _write_candidate_report(
+                    iter_dir, new_iter_id, cand_records, None)
+                if on_event is not None:
+                    on_event({
+                        "type": "log_line",
+                        "text": f"[edit] all {k} candidates rejected — "
+                                "falling back to repair retry",
+                    })
+                assert first_error is not None
+                raise_after_retry = first_error
+                retry_user = (
+                    user_prompt
+                    + "\n\n# RETRY\n"
+                    + RETRY_REMINDER_PREFIX
+                    + "\n\n## VALIDATION_ERRORS_ON_PREVIOUS_ATTEMPT\n"
+                    + str(raise_after_retry)
+                )
+                new_source = _call_llm(
+                    client, _EDIT_SYSTEM, retry_user,
+                    on_event=on_event, attempt=2,
+                )
+                _post_validate(
+                    new_source, contract=reward_contract, kg_store=kg_store,
+                    parent_hash=parent_hash, new_version=new_iter_id,
+                    write_to=target_path,
+                    parent_hparams=gate_parent_hparams,
+                    metric_observables=metric_observables,
+                    replay_inputs=replay_inputs,
+                    replay_parent=replay_parent,
+                    hack_replays=hack_replays,
+                )
+                winner_promoted = True
+
+        # Attempt 1 (single-shot path; skipped when best-of-K promoted).
         try:
-            new_source = _call_llm(
-                client, _EDIT_SYSTEM, user_prompt,
-                on_event=on_event, attempt=1,
-            )
-            if on_event is not None:
-                on_event({"type": "log_line", "text": "[edit] post-validate (attempt 1)"})
-            _post_validate(
-                new_source, contract=reward_contract, kg_store=kg_store,
-                parent_hash=parent_hash, new_version=new_iter_id,
-                write_to=target_path,
-                parent_hparams=gate_parent_hparams,
-                metric_observables=metric_observables,
-                replay_inputs=replay_inputs,
-                replay_parent=replay_parent,
-                hack_replays=hack_replays,
-            )
+            if not winner_promoted:
+                new_source = _call_llm(
+                    client, _EDIT_SYSTEM, user_prompt,
+                    on_event=on_event, attempt=1,
+                )
+                if on_event is not None:
+                    on_event({"type": "log_line", "text": "[edit] post-validate (attempt 1)"})
+                _post_validate(
+                    new_source, contract=reward_contract, kg_store=kg_store,
+                    parent_hash=parent_hash, new_version=new_iter_id,
+                    write_to=target_path,
+                    parent_hparams=gate_parent_hparams,
+                    metric_observables=metric_observables,
+                    replay_inputs=replay_inputs,
+                    replay_parent=replay_parent,
+                    hack_replays=hack_replays,
+                )
         except EditValidationError as first_err:
             print(f"[edit] first attempt failed: {first_err}. Retrying once.",
                   file=sys.stderr, flush=True)
@@ -1637,6 +1872,53 @@ def _write_partition_report(
             encoding="utf-8")
     except Exception as e:  # noqa: BLE001 — reporting is advisory, never fatal
         print(f"[edit] partition report write skipped: "
+              f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
+
+
+def _write_candidate_report(
+    iter_dir: Path | str | None,
+    new_iter_id: str,
+    cand_records: "list[dict[str, Any]]",
+    selected: "int | None",
+) -> None:
+    """§best-of-K: persist the candidate slate — every framing's verdict,
+    margin and source — to `<iter_dir>/edit_candidates.json` + the raw
+    candidate sources under `<iter_dir>/edit_candidates/`. This is the
+    per-iteration paper trail for "which strategies were considered and
+    why this one won" (provenance for the selection decision, not just
+    the winning artifact). Never raises."""
+    if iter_dir is None:
+        return
+    try:
+        d = Path(iter_dir)
+        if not d.is_dir():
+            return
+        src_dir = d / "edit_candidates"
+        src_dir.mkdir(exist_ok=True)
+        rows = []
+        for rec in cand_records:
+            source = rec.get("source")
+            if source:
+                (src_dir / f"cand{rec['index']}.py").write_text(
+                    source, encoding="utf-8")
+            rows.append({
+                "index": rec["index"],
+                "framing": _framing_name(rec["index"]),
+                "valid": rec["valid"],
+                "hack_margin": rec["hack_margin"],
+                "source_sha256": rec.get("source_sha256"),
+                "error": rec.get("error"),
+            })
+        report = {
+            "version": new_iter_id,
+            "selected": selected,
+            "candidates": rows,
+        }
+        (d / "edit_candidates.json").write_text(
+            json.dumps(report, indent=2, sort_keys=True, default=str),
+            encoding="utf-8")
+    except Exception as e:  # noqa: BLE001 — reporting is advisory, never fatal
+        print(f"[edit] candidate report write skipped: "
               f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
 
 

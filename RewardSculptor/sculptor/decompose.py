@@ -32,6 +32,7 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
+from sculptor.llm import log_llm_call, model_for, response_text_blocks
 from sculptor.mission import (
     MAX_SEED_PROMPT_CHARS,
     MIN_SEED_PROMPT_CHARS,
@@ -43,7 +44,7 @@ from sculptor.mission import (
 from sculptor.prompts import load_prompt
 
 
-MODEL_ID = "claude-opus-4-7"
+MODEL_ID = model_for("decompose")
 MAX_TOKENS = 8000
 # Cap on how many KG techniques we surface to the decomposer. Matches
 # the `KG_TOP_K` used in diagnose.py for symmetry — bigger slices add
@@ -405,18 +406,20 @@ def _parse_with_retry(
             messages=[{"role": "user", "content": user_content}],
             output_format=output_format,
         )
+        log_llm_call(
+            "decompose", model, system=system_prompt, user=user_content,
+            response_text=response_text_blocks(resp),
+            usage=getattr(resp, "usage", None), meta={"attempt": 1})
         return resp.parsed_output
     except Exception as first_err:  # noqa: BLE001
+        retry_reminder = (
+            "Previous response failed parse / validation: "
+            f"{first_err!s}. Emit ONLY the strict JSON matching "
+            "the schema — no prose, no markdown fences."
+        )
         retry_messages = [
             {"role": "user", "content": user_content},
-            {
-                "role": "user",
-                "content": (
-                    "Previous response failed parse / validation: "
-                    f"{first_err!s}. Emit ONLY the strict JSON matching "
-                    "the schema — no prose, no markdown fences."
-                ),
-            },
+            {"role": "user", "content": retry_reminder},
         ]
         resp = client.messages.parse(
             model=model,
@@ -426,6 +429,11 @@ def _parse_with_retry(
             messages=retry_messages,
             output_format=output_format,
         )
+        log_llm_call(
+            "decompose", model, system=system_prompt,
+            user=f"{user_content}\n\n{retry_reminder}",
+            response_text=response_text_blocks(resp),
+            usage=getattr(resp, "usage", None), meta={"attempt": 2})
         return resp.parsed_output
 
 
@@ -531,7 +539,8 @@ def decompose_task(
     client : optional Anthropic client (for testing / reuse). If None,
         constructs a client with max_retries=2 + timeout=240 s (same
         envelope as the post-Ship-13 edit path).
-    model : Anthropic model id. Defaults to claude-opus-4-7.
+    model : Anthropic model id. Defaults to the registry's "decompose"
+        role (`sculptor.llm.model_for`).
     skill_library_handle : optional `SkillLibraryHandle` (Ship 19).
         When provided, Claude sees up to 5 prior-mission skills
         compatible with the handle's (adapter_class, task_id) pair

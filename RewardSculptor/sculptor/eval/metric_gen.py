@@ -23,9 +23,17 @@ from pydantic import BaseModel
 
 from sculptor.eval.metric_validate import validate_generated_metric
 from sculptor.eval.robot_manifest import robot_joint_names
+from sculptor.llm import (
+    llm_log_dir,
+    log_llm_call,
+    model_for,
+    response_text_blocks,
+    review_panel_models,
+    set_llm_log_dir,
+)
 from sculptor.prompts import load_prompt
 
-MODEL_ID = "claude-opus-4-7"
+MODEL_ID = model_for("metric_gen")
 #: §truncation fix: adaptive THINKING shares this budget with the code output, and a
 #: hard metric's think can use 5-8k tokens — at the old 8000 cap that truncated the
 #: code (a confusing downstream "missing compute_spec"). 16000 leaves ample room for
@@ -53,12 +61,14 @@ class MetricReview(BaseModel):
 # ── §Metric-quality laws (LAW 9): VLM metric-review Panel A ───────────────
 #: The reviewer model pool — the repo's FIRST multi-model surface. Single vendor,
 #: so MODEL-ID diversity is the "cross-family" substitute (Verga PoLL 2404.18796:
-#: disjoint juries beat one judge with decorrelated error). All three are Active +
+#: disjoint juries beat one judge with decorrelated error). All are Active +
 #: vision-capable. The metric AUTHOR's exact id (`MODEL_ID`) is excluded from the
 #: roster (Panickssery NeurIPS 2024: a model self-prefers its own output).
-REVIEW_PANEL_MODELS = (
-    "claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5-20251001",
-)
+#: Sourced from the sculptor.llm registry (RS_MODEL_REVIEW_PANEL overrides);
+#: the defaults there are author-disjoint from model_for("metric_gen") by
+#: construction, and `_reviewers_from_models` re-excludes the ACTUAL author
+#: at call time as the runtime backstop.
+REVIEW_PANEL_MODELS = tuple(review_panel_models())
 DEFAULT_REVIEW_MODELS = REVIEW_PANEL_MODELS   # convenience alias for callers
 
 #: The lens that judges goal-match + naturalness from rollout KEYFRAMES via a VLM
@@ -162,6 +172,14 @@ def _review_one(
             model=model, max_tokens=4000, thinking={"type": "adaptive"},
             system=system, messages=[{"role": "user", "content": user_content}],
             output_format=MetricReview)
+        log_llm_call(
+            "metric_review", model,
+            system="\n\n".join(str(b.get("text", "")) for b in system),
+            user=payload,   # image blocks elided (keyframes live on disk)
+            response_text=response_text_blocks(resp),
+            usage=getattr(resp, "usage", None),
+            meta={"lens": lens, "juror": model,
+                  "n_keyframes": len(keyframes or []) if is_vlm else 0})
         r = resp.parsed_output
         approved = bool(r.approved)
         exploit = str(getattr(r, "gaming_exploit", "") or "")
@@ -252,6 +270,12 @@ def _sample_source(client: Any, system_prompt: str, user_content: str,
         system=system_prompt,
         messages=[{"role": "user", "content": user_content}],
     )
+    # Provenance BEFORE the truncation gate so truncated generations are
+    # archived too (they explain a failed attempt).
+    log_llm_call(
+        "metric_gen", model, system=system_prompt, user=user_content,
+        response_text=response_text_blocks(resp),
+        usage=getattr(resp, "usage", None))
     # A max_tokens-truncated response (adaptive thinking ate the budget) yields
     # INCOMPLETE code — surface it explicitly here so it fails as "truncated", not as
     # a baffling downstream "missing compute_spec", and so a retry can recover.
@@ -404,6 +428,10 @@ def _review_metric(
             messages=[{"role": "user", "content": user}],
             output_format=MetricReview,
         )
+        log_llm_call(
+            "metric_review", model, system=system_prompt, user=user,
+            response_text=response_text_blocks(resp),
+            usage=getattr(resp, "usage", None))
         r = resp.parsed_output
         approved = bool(r.approved)
         exploit = str(getattr(r, "gaming_exploit", "") or "")
@@ -463,214 +491,223 @@ def generate_objective_metric(
 
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    metric_path = out_dir / "metric.py"
-    # §Ship 49: the ACTUAL robot's joint_names (manifest, keyed by robot_hint)
-    # so the required-joint-roles gate can reject a metric whose declared roles
-    # don't exist on this robot — before any GPU run. None for an unknown robot
-    # (the runtime resolution is then the backstop).
-    robot_names = robot_joint_names(robot_hint)
-    system_prompt = load_prompt("gen_objective_metric")
-    base_user = json.dumps(
-        {"behavior_goal": behavior_goal, "robot_hint": robot_hint},
-        indent=2, default=str,
-    )
+    # §llm provenance: every generation/review call in this job archives to
+    # out_dir/llm_calls.jsonl. The contextvar is last-set-wins, so RESTORE the
+    # caller's sink on exit — a backend metric job must not redirect
+    # subsequent unrelated calls (sculpt iters keep their own iter_dir sink).
+    _prev_llm_log_dir = llm_log_dir()
+    set_llm_log_dir(out_dir)
+    try:
+        metric_path = out_dir / "metric.py"
+        # §Ship 49: the ACTUAL robot's joint_names (manifest, keyed by robot_hint)
+        # so the required-joint-roles gate can reject a metric whose declared roles
+        # don't exist on this robot — before any GPU run. None for an unknown robot
+        # (the runtime resolution is then the backstop).
+        robot_names = robot_joint_names(robot_hint)
+        system_prompt = load_prompt("gen_objective_metric")
+        base_user = json.dumps(
+            {"behavior_goal": behavior_goal, "robot_hint": robot_hint},
+            indent=2, default=str,
+        )
 
-    n_attempts = max(1, max_attempts)
-    attempts: list[dict[str, Any]] = []
-    source = ""
-    validation: Optional[dict[str, Any]] = None
+        n_attempts = max(1, max_attempts)
+        attempts: list[dict[str, Any]] = []
+        source = ""
+        validation: Optional[dict[str, Any]] = None
 
-    def _emit(ev: dict[str, Any]) -> None:
-        if on_event is not None:
-            try:
-                on_event(ev)
-            except Exception:  # noqa: BLE001 — progress is advisory, never fatal
-                pass
+        def _emit(ev: dict[str, Any]) -> None:
+            if on_event is not None:
+                try:
+                    on_event(ev)
+                except Exception:  # noqa: BLE001 — progress is advisory, never fatal
+                    pass
 
-    candidates: Optional[list[dict[str, Any]]] = None
-    selected_candidate: Optional[int] = None
-    ranked_valid: list[dict[str, Any]] = []
-    passed = False
+        candidates: Optional[list[dict[str, Any]]] = None
+        selected_candidate: Optional[int] = None
+        ranked_valid: list[dict[str, Any]] = []
+        passed = False
 
-    if n_candidates and n_candidates > 1:
-        # §best-of-N: sample N candidates and select the most-discriminating valid one.
-        passed, source, validation, candidates, selected_candidate, ranked_valid = _best_of_n(
-            client, system_prompt, base_user,
-            behavior_goal=behavior_goal, robot_hint=robot_hint,
-            robot_names=robot_names, out_dir=out_dir, metric_path=metric_path,
-            n=n_candidates, model=model, emit=_emit)
+        if n_candidates and n_candidates > 1:
+            # §best-of-N: sample N candidates and select the most-discriminating valid one.
+            passed, source, validation, candidates, selected_candidate, ranked_valid = _best_of_n(
+                client, system_prompt, base_user,
+                behavior_goal=behavior_goal, robot_hint=robot_hint,
+                robot_names=robot_names, out_dir=out_dir, metric_path=metric_path,
+                n=n_candidates, model=model, emit=_emit)
+            if not passed:
+                # best-of-N samples DIVERSE candidates but does NOT feed validation
+                # failures back; if NONE were valid, fall through to the retry-with-
+                # feedback loop below (seeded with the aggregated candidate reasons) so
+                # best-of-N is NEVER WORSE than single-shot — it adds diversity-selection
+                # on top of correction, instead of trading one for the other.
+                _emit({"stage": "regenerating", "max": n_attempts,
+                       "message": f"All {n_candidates} candidates failed — retrying with "
+                                  f"the gate feedback…"})
+
+        # The single-shot-with-feedback retry loop: the only path when n_candidates==1,
+        # AND the fallback when best-of-N found no valid candidate (passed is False).
         if not passed:
-            # best-of-N samples DIVERSE candidates but does NOT feed validation
-            # failures back; if NONE were valid, fall through to the retry-with-
-            # feedback loop below (seeded with the aggregated candidate reasons) so
-            # best-of-N is NEVER WORSE than single-shot — it adds diversity-selection
-            # on top of correction, instead of trading one for the other.
-            _emit({"stage": "regenerating", "max": n_attempts,
-                   "message": f"All {n_candidates} candidates failed — retrying with "
-                              f"the gate feedback…"})
+            for attempt in range(n_attempts):
+                _emit({"stage": "generating", "attempt": attempt + 1, "max": n_attempts,
+                       "message": f"Generating candidate metric "
+                                  f"(attempt {attempt + 1}/{n_attempts})…"})
+                user = base_user
+                # Feed back ANY prior failure's reasons (an earlier attempt OR, when
+                # best-of-N fell through, its aggregated candidate failures). Equivalent
+                # to `attempt > 0` for single-shot (validation is None at attempt 0).
+                if validation is not None and not validation.get("ok"):
+                    user = (
+                        base_user
+                        + "\n\nThe previous attempt FAILED these validation gates:\n"
+                        + json.dumps(validation.get("reasons") or [], indent=2)
+                        + "\nFix ALL of them. Output ONLY the corrected module."
+                    )
+                try:
+                    source = _sample_source(client, system_prompt, user, model=model)
+                except Exception as e:  # noqa: BLE001 — API failure = failed attempt
+                    attempts.append({"attempt": attempt,
+                                     "api_error": f"{type(e).__name__}: {e}"})
+                    if attempt + 1 < n_attempts:  # §Ship 40 review: only if a retry follows
+                        _emit({"stage": "retrying", "attempt": attempt + 1,
+                               "max": n_attempts,
+                               "message": f"Generation call failed (attempt "
+                                          f"{attempt + 1}); retrying…"})
+                    continue
+                metric_path.write_text(source, encoding="utf-8")
+                _emit({"stage": "validating", "attempt": attempt + 1, "max": n_attempts,
+                       "message": "Validating (safety / determinism / bounds / "
+                                  "non-degeneracy)…"})
+                validation = validate_generated_metric(
+                    source, metric_path,
+                    behavior_goal=behavior_goal, robot_hint=robot_hint,
+                    robot_joint_names=robot_names)
+                attempts.append({"attempt": attempt, "ok": validation["ok"],
+                                 "reasons": validation["reasons"]})
+                if validation["ok"]:
+                    break
+                if attempt + 1 < n_attempts:
+                    _emit({"stage": "regenerating", "attempt": attempt + 1,
+                           "max": n_attempts,
+                           "reasons": (validation.get("reasons") or [])[:2],
+                           "message": f"Attempt {attempt + 1} failed validation — "
+                                      f"regenerating with the gate feedback…"})
 
-    # The single-shot-with-feedback retry loop: the only path when n_candidates==1,
-    # AND the fallback when best-of-N found no valid candidate (passed is False).
-    if not passed:
-        for attempt in range(n_attempts):
-            _emit({"stage": "generating", "attempt": attempt + 1, "max": n_attempts,
-                   "message": f"Generating candidate metric "
-                              f"(attempt {attempt + 1}/{n_attempts})…"})
-            user = base_user
-            # Feed back ANY prior failure's reasons (an earlier attempt OR, when
-            # best-of-N fell through, its aggregated candidate failures). Equivalent
-            # to `attempt > 0` for single-shot (validation is None at attempt 0).
-            if validation is not None and not validation.get("ok"):
-                user = (
-                    base_user
-                    + "\n\nThe previous attempt FAILED these validation gates:\n"
-                    + json.dumps(validation.get("reasons") or [], indent=2)
-                    + "\nFix ALL of them. Output ONLY the corrected module."
-                )
+            passed = bool(validation and validation["ok"])
+        def _dispatch_review(src: str, val: Optional[dict[str, Any]], msg: str
+                             ) -> tuple[dict[str, Any], Optional[dict[str, Any]]]:
+            """Run the configured review (VLM Panel A when `review_models`, else the single
+            independent reviewer) on one source. `val` is that candidate's validation record;
+            on a NOVEL-goal vacuous pass its selectivity-probe scores are surfaced to the
+            reviewer (so it doesn't false-flag the all-zero fixed battery as near-constant).
+            Returns (review, review_panel)."""
+            val = val or {}
+            archetype_scores = val.get("archetype_scores", {})
+            selectivity = (val.get("selectivity_probe")
+                           if val.get("nondegeneracy_vacuous") else None)
+            _emit({"stage": "reviewing", "max": n_attempts, "message": msg})
+            if review_models:
+                reviewers = _reviewers_from_models(list(review_models), model)
+                panel = _review_metric_panel(
+                    client, behavior_goal, src, archetype_scores,
+                    reviewers=reviewers, keyframes=review_keyframes,
+                    selectivity=selectivity)
+                return panel["review"], {k: v for k, v in panel.items() if k != "review"}
+            return (_review_metric(client, model, behavior_goal, src, archetype_scores,
+                                   selectivity=selectivity), None)
+
+        review_out: Optional[dict[str, Any]] = None
+        review_panel: Optional[dict[str, Any]] = None
+        if passed and review:
+            if n_candidates and n_candidates > 1 and len(ranked_valid) > 1:
+                # §best-of-N review-in-order: the OFFLINE discriminator can't predict the LLM
+                # reviewer, so review the valid candidates best-first and accept the FIRST one
+                # the reviewer approves — promoting it to source/validation/metric.py. A flawed
+                # top candidate no longer sinks the run when a slightly less-discriminating
+                # sibling passes review. Stops at the first approval (≤ N reviews).
+                for k, cand in enumerate(ranked_valid):
+                    review_out, review_panel = _dispatch_review(
+                        cand["src"], cand["val"],
+                        f"Reviewing candidate {cand['candidate'] + 1} "
+                        f"({k + 1}/{len(ranked_valid)} by discrimination)…")
+                    if review_out and review_out.get("approved"):
+                        source, validation = cand["src"], cand["val"]
+                        selected_candidate = cand["candidate"]
+                        metric_path.write_text(source, encoding="utf-8")
+                        break
+                # none approved → review_out is the last (rejected) one; source/validation
+                # stay as the discrimination-winner (already on disk); accepted stays False.
+            else:
+                review_out, review_panel = _dispatch_review(
+                    source, validation,
+                    "Passed validation — running independent review…")
+
+        accepted = bool(passed and (review_out is None or review_out.get("approved")))
+
+        # §review-feedback retry: a metric that PASSED validation but the reviewer VETOED is
+        # otherwise a dead-end — the feedback-retry loop above fires only on a VALIDATION
+        # failure. Feed the reviewer's concerns back and regenerate (bounded) so a fixable
+        # objection (a missing signed-direction check, a too-soft gate) gets corrected
+        # instead of failing the run. Only runs with review on + a concrete veto.
+        rev_retry = 0
+        while (review and passed and not accepted
+               and review_out and not review_out.get("approved")
+               and rev_retry < _MAX_REVIEW_RETRIES):
+            rev_retry += 1
+            _emit({"stage": "regenerating", "max": _MAX_REVIEW_RETRIES,
+                   "message": f"Reviewer vetoed — regenerating with the review feedback "
+                              f"(retry {rev_retry}/{_MAX_REVIEW_RETRIES})…"})
+            user = (
+                base_user
+                + "\n\nThe previous metric PASSED validation but the REVIEWER REJECTED it "
+                + "for these concerns:\n"
+                + json.dumps(review_out.get("concerns") or [], indent=2)
+                + "\nRewrite the metric to FIX every concern (keep the sharp completion gate "
+                + "× min-of-saturating-channels form). Output ONLY the corrected module.")
             try:
                 source = _sample_source(client, system_prompt, user, model=model)
-            except Exception as e:  # noqa: BLE001 — API failure = failed attempt
-                attempts.append({"attempt": attempt,
+            except Exception as e:  # noqa: BLE001 — a failed retry call ends the retries
+                attempts.append({"review_retry": rev_retry,
                                  "api_error": f"{type(e).__name__}: {e}"})
-                if attempt + 1 < n_attempts:  # §Ship 40 review: only if a retry follows
-                    _emit({"stage": "retrying", "attempt": attempt + 1,
-                           "max": n_attempts,
-                           "message": f"Generation call failed (attempt "
-                                      f"{attempt + 1}); retrying…"})
-                continue
-            metric_path.write_text(source, encoding="utf-8")
-            _emit({"stage": "validating", "attempt": attempt + 1, "max": n_attempts,
-                   "message": "Validating (safety / determinism / bounds / "
-                              "non-degeneracy)…"})
-            validation = validate_generated_metric(
-                source, metric_path,
-                behavior_goal=behavior_goal, robot_hint=robot_hint,
-                robot_joint_names=robot_names)
-            attempts.append({"attempt": attempt, "ok": validation["ok"],
-                             "reasons": validation["reasons"]})
-            if validation["ok"]:
                 break
-            if attempt + 1 < n_attempts:
-                _emit({"stage": "regenerating", "attempt": attempt + 1,
-                       "max": n_attempts,
-                       "reasons": (validation.get("reasons") or [])[:2],
-                       "message": f"Attempt {attempt + 1} failed validation — "
-                                  f"regenerating with the gate feedback…"})
-
-        passed = bool(validation and validation["ok"])
-    def _dispatch_review(src: str, val: Optional[dict[str, Any]], msg: str
-                         ) -> tuple[dict[str, Any], Optional[dict[str, Any]]]:
-        """Run the configured review (VLM Panel A when `review_models`, else the single
-        independent reviewer) on one source. `val` is that candidate's validation record;
-        on a NOVEL-goal vacuous pass its selectivity-probe scores are surfaced to the
-        reviewer (so it doesn't false-flag the all-zero fixed battery as near-constant).
-        Returns (review, review_panel)."""
-        val = val or {}
-        archetype_scores = val.get("archetype_scores", {})
-        selectivity = (val.get("selectivity_probe")
-                       if val.get("nondegeneracy_vacuous") else None)
-        _emit({"stage": "reviewing", "max": n_attempts, "message": msg})
-        if review_models:
-            reviewers = _reviewers_from_models(list(review_models), model)
-            panel = _review_metric_panel(
-                client, behavior_goal, src, archetype_scores,
-                reviewers=reviewers, keyframes=review_keyframes,
-                selectivity=selectivity)
-            return panel["review"], {k: v for k, v in panel.items() if k != "review"}
-        return (_review_metric(client, model, behavior_goal, src, archetype_scores,
-                               selectivity=selectivity), None)
-
-    review_out: Optional[dict[str, Any]] = None
-    review_panel: Optional[dict[str, Any]] = None
-    if passed and review:
-        if n_candidates and n_candidates > 1 and len(ranked_valid) > 1:
-            # §best-of-N review-in-order: the OFFLINE discriminator can't predict the LLM
-            # reviewer, so review the valid candidates best-first and accept the FIRST one
-            # the reviewer approves — promoting it to source/validation/metric.py. A flawed
-            # top candidate no longer sinks the run when a slightly less-discriminating
-            # sibling passes review. Stops at the first approval (≤ N reviews).
-            for k, cand in enumerate(ranked_valid):
-                review_out, review_panel = _dispatch_review(
-                    cand["src"], cand["val"],
-                    f"Reviewing candidate {cand['candidate'] + 1} "
-                    f"({k + 1}/{len(ranked_valid)} by discrimination)…")
-                if review_out and review_out.get("approved"):
-                    source, validation = cand["src"], cand["val"]
-                    selected_candidate = cand["candidate"]
-                    metric_path.write_text(source, encoding="utf-8")
-                    break
-            # none approved → review_out is the last (rejected) one; source/validation
-            # stay as the discrimination-winner (already on disk); accepted stays False.
-        else:
+            selected_candidate = None        # the result is now a feedback-corrected retry,
+            metric_path.write_text(source, encoding="utf-8")   # not a best-of-N candidate
+            validation = validate_generated_metric(
+                source, metric_path, behavior_goal=behavior_goal, robot_hint=robot_hint,
+                robot_joint_names=robot_names)
+            attempts.append({"review_retry": rev_retry, "ok": validation["ok"],
+                             "reasons": validation["reasons"]})
+            passed = bool(validation["ok"])
+            if not passed:
+                break                        # the correction broke validation — stop thrashing
             review_out, review_panel = _dispatch_review(
                 source, validation,
-                "Passed validation — running independent review…")
+                f"Re-reviewing the corrected metric (retry {rev_retry})…")
+            accepted = bool(review_out and review_out.get("approved"))
 
-    accepted = bool(passed and (review_out is None or review_out.get("approved")))
-
-    # §review-feedback retry: a metric that PASSED validation but the reviewer VETOED is
-    # otherwise a dead-end — the feedback-retry loop above fires only on a VALIDATION
-    # failure. Feed the reviewer's concerns back and regenerate (bounded) so a fixable
-    # objection (a missing signed-direction check, a too-soft gate) gets corrected
-    # instead of failing the run. Only runs with review on + a concrete veto.
-    rev_retry = 0
-    while (review and passed and not accepted
-           and review_out and not review_out.get("approved")
-           and rev_retry < _MAX_REVIEW_RETRIES):
-        rev_retry += 1
-        _emit({"stage": "regenerating", "max": _MAX_REVIEW_RETRIES,
-               "message": f"Reviewer vetoed — regenerating with the review feedback "
-                          f"(retry {rev_retry}/{_MAX_REVIEW_RETRIES})…"})
-        user = (
-            base_user
-            + "\n\nThe previous metric PASSED validation but the REVIEWER REJECTED it "
-            + "for these concerns:\n"
-            + json.dumps(review_out.get("concerns") or [], indent=2)
-            + "\nRewrite the metric to FIX every concern (keep the sharp completion gate "
-            + "× min-of-saturating-channels form). Output ONLY the corrected module.")
-        try:
-            source = _sample_source(client, system_prompt, user, model=model)
-        except Exception as e:  # noqa: BLE001 — a failed retry call ends the retries
-            attempts.append({"review_retry": rev_retry,
-                             "api_error": f"{type(e).__name__}: {e}"})
-            break
-        selected_candidate = None        # the result is now a feedback-corrected retry,
-        metric_path.write_text(source, encoding="utf-8")   # not a best-of-N candidate
-        validation = validate_generated_metric(
-            source, metric_path, behavior_goal=behavior_goal, robot_hint=robot_hint,
-            robot_joint_names=robot_names)
-        attempts.append({"review_retry": rev_retry, "ok": validation["ok"],
-                         "reasons": validation["reasons"]})
-        passed = bool(validation["ok"])
-        if not passed:
-            break                        # the correction broke validation — stop thrashing
-        review_out, review_panel = _dispatch_review(
-            source, validation,
-            f"Re-reviewing the corrected metric (retry {rev_retry})…")
-        accepted = bool(review_out and review_out.get("approved"))
-
-    _emit({"stage": "done", "accepted": accepted,
-           "message": ("Metric accepted." if accepted
-                       else "Metric rejected — see reasons.")})
-    record = {
-        "accepted": accepted,
-        "validation_passed": passed,
-        "metric_path": str(metric_path),
-        "source": source,
-        "validation": validation,
-        "review": review_out,
-        "review_panel": review_panel,
-        "attempts": attempts,
-        "n_candidates": n_candidates,
-        "candidates": candidates,
-        "selected_candidate": selected_candidate,
-        "behavior_goal": behavior_goal,
-        "robot_hint": robot_hint,
-        "model": model,
-        # steer-rights are earned later via calibration; observe-only until then.
-        "calibrated": False,
-        "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-    }
-    (out_dir / "meta.json").write_text(
-        json.dumps(record, indent=2, default=str), encoding="utf-8")
-    return record
+        _emit({"stage": "done", "accepted": accepted,
+               "message": ("Metric accepted." if accepted
+                           else "Metric rejected — see reasons.")})
+        record = {
+            "accepted": accepted,
+            "validation_passed": passed,
+            "metric_path": str(metric_path),
+            "source": source,
+            "validation": validation,
+            "review": review_out,
+            "review_panel": review_panel,
+            "attempts": attempts,
+            "n_candidates": n_candidates,
+            "candidates": candidates,
+            "selected_candidate": selected_candidate,
+            "behavior_goal": behavior_goal,
+            "robot_hint": robot_hint,
+            "model": model,
+            # steer-rights are earned later via calibration; observe-only until then.
+            "calibrated": False,
+            "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        }
+        (out_dir / "meta.json").write_text(
+            json.dumps(record, indent=2, default=str), encoding="utf-8")
+        return record
+    finally:
+        set_llm_log_dir(_prev_llm_log_dir)

@@ -39,10 +39,12 @@ import tempfile
 from pathlib import Path
 from typing import Any, Optional
 
+from sculptor.llm import log_llm_call, model_for, response_text_blocks
+
 log = logging.getLogger(__name__)
 
 
-_MODEL_ID = "claude-opus-4-7"
+_MODEL_ID = model_for("mjcf_editor")
 _MAX_TOKENS = 16_000
 
 _SUMMARY_PI_RE = re.compile(r"<\?rs-summary\s+(.*?)\s*\?>", re.DOTALL)
@@ -214,10 +216,11 @@ def _call_claude(client, system_prompt: str, user_msg: str) -> str:
         system=system_prompt,
         messages=[{"role": "user", "content": user_msg}],
     )
-    return "".join(
-        block.text for block in resp.content
-        if getattr(block, "type", None) == "text"
-    )
+    text = response_text_blocks(resp)
+    log_llm_call(
+        "mjcf_editor", _MODEL_ID, system=system_prompt, user=user_msg,
+        response_text=text, usage=getattr(resp, "usage", None))
+    return text
 
 
 def apply_mjcf_edit(
