@@ -101,6 +101,7 @@ def run_mission_decompose_job(
     mission_slug: str,
     no_kg: bool = False,
     run_defaults: Optional[dict[str, Any]] = None,
+    gen_stage_metrics: bool = True,
 ) -> Callable[[Job, asyncio.Event], Awaitable[dict[str, Any]]]:
     """Async runner that calls `sculptor.decompose.decompose_task` and
     persists the resulting mission to `<project_dir>/.missions/
@@ -114,6 +115,10 @@ def run_mission_decompose_job(
     mission_slug : pre-resolved unique slug (caller derived via
         `mission_store.derive_unique_mission_slug`).
     no_kg : skip KG context to Claude (faster, less grounded).
+    gen_stage_metrics : §MISSION_METRIC_GRANULARITY — after decompose,
+        generate one trust-gated objective metric per stage from the
+        stage's own goal text (default ON). Rejected generations leave
+        the stage on the mission-level metric fallback.
     run_defaults : §Ship 21a — optional run-time defaults set up
         front via the NewMissionDialog Advanced tab. Persisted on the
         Mission so RunMissionDialog can pre-fill when the user later
@@ -170,6 +175,24 @@ def run_mission_decompose_job(
                 "decomposition_rationale": mission.decomposition_rationale,
             }
 
+        def _do_stage_metrics() -> dict[str, Any]:
+            # §MISSION_METRIC_GRANULARITY: second phase — one trust-gated
+            # metric per stage. Loads the just-saved mission so this phase
+            # is independent of the decompose closure's locals.
+            from sculptor.adapters.base import load_adapter
+            from sculptor.llm import set_llm_log_dir
+            from sculptor.mission import load_mission, save_mission
+            from sculptor.mission_metrics import generate_stage_metrics
+
+            md = mission_store.mission_dir(project_dir, mission_slug)
+            mission = load_mission(md)
+            adapter = load_adapter(project_dir / "config.toml")
+            set_llm_log_dir(md)  # provenance for the metric-gen calls
+            report = generate_stage_metrics(
+                mission, robot_hint=getattr(adapter, "task_id", None))
+            save_mission(mission, md)
+            return report
+
         try:
             result = await asyncio.to_thread(_do_decompose)
         except Exception as e:  # noqa: BLE001
@@ -182,6 +205,31 @@ def run_mission_decompose_job(
             # Re-raise so the JobManager marks the job errored with
             # this exception's text in `job.error`.
             raise
+
+        if gen_stage_metrics:
+            job.progress = 0.6
+            job.message = (
+                f"generating per-stage metrics "
+                f"({result['n_stages']} stages)")
+            job.emit({
+                "type": "mission_stage_metrics_started",
+                "mission_slug": mission_slug,
+                "n_stages": result["n_stages"],
+            })
+            try:
+                sm_report = await asyncio.to_thread(_do_stage_metrics)
+            except Exception as e:  # noqa: BLE001 — metrics are enhancement;
+                # the decomposed mission is already saved and runnable on
+                # the mission-level fallback. Report, don't fail the job.
+                sm_report = {"generated": [], "rejected": [],
+                             "skipped": [], "error": str(e)}
+            result["stage_metrics"] = sm_report
+            job.emit({
+                "type": "mission_stage_metrics_completed",
+                "mission_slug": mission_slug,
+                **{k: sm_report.get(k) for k in
+                   ("generated", "rejected", "skipped", "error")},
+            })
 
         job.progress = 1.0
         job.message = (

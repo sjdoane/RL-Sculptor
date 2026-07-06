@@ -127,6 +127,12 @@ class CreateMissionRequest(BaseModel):
     """Skip KG context to Claude during decompose. Faster (~10s) but
     Claude can't cite KG papers in stage seed prompts."""
 
+    gen_stage_metrics: bool = True
+    """§MISSION_METRIC_GRANULARITY: after decompose, generate one
+    trust-gated objective metric per stage from the stage's own goal
+    text. Rejected generations leave the stage on the mission-level
+    metric fallback. Default ON."""
+
     # §Ship 21a: optional run-time defaults set up front via the
     # NewMissionDialog Advanced tab. These are persisted on the
     # mission and pre-fill RunMissionDialog when the user later

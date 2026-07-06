@@ -822,6 +822,15 @@ def mission_init(
             "$SCULPTOR_SKILL_LIBRARY_ROOT or ~/.local/share/sculptor/skills/."
         ),
     ),
+    stage_metrics: bool = typer.Option(
+        True, "--stage-metrics/--no-stage-metrics",
+        help=(
+            "§MISSION_METRIC_GRANULARITY: generate one trust-gated "
+            "objective metric PER STAGE from the stage's goal text "
+            "(default ON). Rejected generations leave the stage on the "
+            "mission-level metric fallback."
+        ),
+    ),
 ):
     """Decompose a goal into a mission curriculum (Ship 14 + 17).
 
@@ -885,6 +894,36 @@ def mission_init(
     mission_dir = missions_root / mission_slug
     mission.mission_dir = str(mission_dir.resolve())
     save_mission(mission, mission_dir)
+
+    # §MISSION_METRIC_GRANULARITY: fresh trust-gated metric per stage,
+    # generated from each stage's own goal text. After save_mission so a
+    # generation crash can never lose the decomposition; re-saved after.
+    if stage_metrics:
+        from sculptor.llm import set_llm_log_dir
+        from sculptor.mission_metrics import generate_stage_metrics
+
+        set_llm_log_dir(mission_dir)  # provenance for the metric-gen calls
+        robot_hint = getattr(adapter, "task_id", None)
+        report = generate_stage_metrics(mission, robot_hint=robot_hint)
+        save_mission(mission, mission_dir)
+        typer.echo(
+            f"[mission-init] stage metrics: "
+            f"{len(report['generated'])} generated, "
+            f"{len(report['rejected'])} rejected (fallback), "
+            f"{len(report['skipped'])} skipped")
+        for row in report["rejected"]:
+            typer.echo(
+                f"[mission-init]   {row['stage']}: {row['reason']}",
+                err=True)
+        print(
+            "[SCULPT-EVENT] " + _json.dumps({
+                "type": "mission_stage_metrics",
+                "mission_slug": mission_slug,
+                "generated": report["generated"],
+                "rejected": report["rejected"],
+            }),
+            flush=True,
+        )
 
     print(
         "[SCULPT-EVENT] " + _json.dumps({
