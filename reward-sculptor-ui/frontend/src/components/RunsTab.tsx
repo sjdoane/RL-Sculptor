@@ -11,8 +11,9 @@ import { useSystemGpu } from "@/hooks/useLibrary";
 import { useRunEvents } from "@/hooks/useRunEvents";
 import { useMissions } from "@/hooks/useMissions";
 import { useRegenerateRewardTemplate, useRewards } from "@/hooks/useRewards";
+import { usePolicies } from "@/hooks/usePolicies";
 import { useControlRun, useKillRun, useRun, useRuns } from "@/hooks/useRuns";
-import { ApiError } from "@/lib/api";
+import { ApiError, policyExportUrl } from "@/lib/api";
 import { formatRelative } from "@/lib/utils";
 import type {
   ErrorClassification,
@@ -360,6 +361,27 @@ function RunDetailPane({ slug, runId, runs }: { slug: string; runId: string; run
   const stageRewardsScope = isStageRun && missionSlug && stageName ? `${missionSlug}/${stageName}` : null;
 
   const mergedIters = useMergedIterations(iters, events.events);
+
+  // Exportable trained checkpoints (disk-backed). Stage runs export from
+  // their own runs tree; plain sculpt runs share the project tree.
+  const policies = usePolicies(slug, isStageRun ? { runId } : undefined);
+  const exportRunId = isStageRun ? runId : undefined;
+  const exportableIters = useMemo(
+    () => new Set((policies.data ?? []).map((p) => p.iter_index)),
+    [policies.data],
+  );
+  // Latest exportable iter OF THIS RUN — iter dirs accumulate across runs
+  // in the project tree, so intersect with the run's own iterations.
+  const latestExportable = useMemo(() => {
+    const runIters = new Set(mergedIters.map((it) => it.iter_index));
+    let best: number | null = null;
+    for (const p of policies.data ?? []) {
+      if (runIters.has(p.iter_index) && (best === null || p.iter_index > best)) {
+        best = p.iter_index;
+      }
+    }
+    return best;
+  }, [policies.data, mergedIters]);
   const isPending = run.data?.status === "queued" && mergedIters.length === 0;
 
   // §Ship 35: fitness is the PRIMARY tracked metric when an objective
@@ -468,8 +490,35 @@ function RunDetailPane({ slug, runId, runs }: { slug: string; runId: string; run
           )}
         </div>
         {stageRewardsScope && <StageRewardsCard slug={slug} stage={stageRewardsScope} />}
+        {!isActive && latestExportable !== null && (
+          <div className="rs-card rs-card-pad">
+            <div className="rs-card-title" style={{ fontSize: 13, marginBottom: 8 }}>
+              <Icon name="package" size={15} />Deploy this policy
+            </div>
+            <p className="rs-sub" style={{ margin: "0 0 10px", fontSize: 12 }}>
+              Download iter {latestExportable}'s checkpoint bundled with its
+              reward, env spec, and an ONNX/TorchScript policy network.
+            </p>
+            <a
+              href={policyExportUrl(slug, latestExportable, exportRunId)}
+              download
+              className="rs-btn rs-btn-primary rs-btn-sm"
+            >
+              <Icon name="download" size={14} />Export policy bundle
+            </a>
+          </div>
+        )}
         {isActive && <RunGpuCard />}
-        {selectedIter !== null && <IterationDetailCard iter={mergedIters.find((it) => it.iter_index === selectedIter) ?? null} />}
+        {selectedIter !== null && (
+          <IterationDetailCard
+            iter={mergedIters.find((it) => it.iter_index === selectedIter) ?? null}
+            exportHref={
+              selectedIter !== null && exportableIters.has(selectedIter)
+                ? policyExportUrl(slug, selectedIter, exportRunId)
+                : null
+            }
+          />
+        )}
       </div>
     </div>
   );
@@ -770,12 +819,24 @@ function RunErrorCard({ slug, error, classification }: { slug: string; error: st
   );
 }
 
-function IterationDetailCard({ iter }: { iter: IterEventSummary | null }) {
+function IterationDetailCard({ iter, exportHref }: { iter: IterEventSummary | null; exportHref: string | null }) {
   if (!iter) return null;
   return (
     <div className="rs-card rs-card-pad">
       <div className="rs-card-title" style={{ fontSize: 13, marginBottom: 10 }}><Icon name="circle-dot" size={15} />Iter {iter.iter_index} · {iter.status}</div>
       <div className="rs-vgap-8">
+        {exportHref && (
+          <div>
+            <a
+              href={exportHref}
+              download
+              className="rs-btn rs-btn-ghost rs-btn-sm"
+              title="Download this iteration's checkpoint bundled with its reward, env spec, and ONNX/TorchScript policy"
+            >
+              <Icon name="download" size={14} />Export policy bundle
+            </a>
+          </div>
+        )}
         {iter.failure_modes.length > 0 && (
           <div>
             <div className="rs-eyebrow" style={{ marginBottom: 4 }}>failure modes</div>

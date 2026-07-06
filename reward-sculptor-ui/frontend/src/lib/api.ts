@@ -705,6 +705,29 @@ export function clipUrl(
   return `/api/projects/${slug}/runs/${runId}/clips/iter_${iterIndex}.mp4`;
 }
 
+// ── Policies (trained checkpoints + deployment-bundle export) ─────────
+import type { PolicySummary } from "./types";
+
+/** Disk-backed list of exportable trained iterations. Pass `runId` only
+ *  for mission stage runs (their iters live in the stage's own tree). */
+export async function listPolicies(
+  slug: string, runId?: string,
+): Promise<PolicySummary[]> {
+  const q = runId ? `?run_id=${encodeURIComponent(runId)}` : "";
+  return handle<PolicySummary[]>(
+    await fetch(`/api/projects/${slug}/policies${q}`),
+  );
+}
+
+/** Download URL for a policy deployment bundle (zip: checkpoint + ONNX/
+ *  TorchScript + reward/env-spec/config snapshots + DEPLOY.md). */
+export function policyExportUrl(
+  slug: string, iterIndex: number, runId?: string,
+): string {
+  const q = runId ? `?run_id=${encodeURIComponent(runId)}` : "";
+  return `/api/projects/${slug}/policies/${iterIndex}/export${q}`;
+}
+
 // ── Missions (Ship 18a) ──────────────────────────────────────────────
 import type {
   CreateMissionRequest,

@@ -39,6 +39,8 @@ export const qk = {
 
   runs: (slug: string) => ["runs", slug] as const,
   run: (slug: string, runId: string) => ["run", slug, runId] as const,
+  policies: (slug: string, runId?: string) =>
+    ["policies", slug, runId ?? "_project"] as const,
 
   missions: (slug: string) => ["missions", slug] as const,
   mission: (slug: string, missionSlug: string) =>

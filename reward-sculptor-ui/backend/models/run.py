@@ -287,6 +287,19 @@ class RunDetail(RunSummary):
     total_event_count: int                # events list size
 
 
+class PolicySummary(BaseModel):
+    """One exportable trained iteration (GET /projects/{slug}/policies).
+    Mirrors sculptor.export.list_exportable_iters — disk-backed, so the
+    list survives backend restarts."""
+
+    iter_index: int
+    checkpoint: str                       # "checkpoint.pt" | "checkpoint.zip"
+    checkpoint_bytes: int
+    primary_metric: Optional[float] = None
+    fitness: Optional[float] = None
+    reward_version: Optional[str] = None
+
+
 class RunWSMessage(BaseModel):
     """Envelope shape for `/ws/projects/{slug}/runs/{run_id}/events`.
     Frontend switches on `type`. See routes/ws_runs.py for the

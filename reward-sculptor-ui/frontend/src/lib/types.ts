@@ -560,6 +560,17 @@ export interface RunDetail extends RunSummary {
   total_event_count: number;
 }
 
+/** One exportable trained iteration (GET /projects/{slug}/policies).
+ *  Disk-backed — survives backend restarts, unlike RunSummary rows. */
+export interface PolicySummary {
+  iter_index: number;
+  checkpoint: string; // "checkpoint.pt" | "checkpoint.zip"
+  checkpoint_bytes: number;
+  primary_metric: number | null;
+  fitness: number | null;
+  reward_version: string | null;
+}
+
 /** Every event the WS stream emits. The frontend switches on
  *  `type` — other fields are payload extras. */
 export interface RunEvent {

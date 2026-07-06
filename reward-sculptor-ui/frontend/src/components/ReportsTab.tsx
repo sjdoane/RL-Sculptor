@@ -6,7 +6,8 @@ import { toast } from "sonner";
 import { ActuatorLimitsCard } from "@/components/ActuatorLimitsCard";
 import { Icon } from "@/components/rs/icon";
 import { Btn, EmptyState } from "@/components/rs/primitives";
-import { ApiError } from "@/lib/api";
+import { usePolicies } from "@/hooks/usePolicies";
+import { ApiError, policyExportUrl } from "@/lib/api";
 import { qk } from "@/lib/queryKeys";
 
 async function fetchReportMd(slug: string): Promise<string> {
@@ -136,6 +137,8 @@ export function ReportsTab({ slug }: { slug: string }) {
           </div>
         </div>
 
+        <PoliciesCard slug={slug} />
+
         <ActuatorLimitsCard slug={slug} />
 
         {(quality.data?.length ?? 0) > 0 && (
@@ -228,6 +231,97 @@ export function ReportsTab({ slug }: { slug: string }) {
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+// ── Trained policies (deployment-bundle export) ───────────────────────
+function fmtBytes(n: number): string {
+  if (n >= 1e9) return `${(n / 1e9).toFixed(1)} GB`;
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)} MB`;
+  return `${Math.max(1, Math.round(n / 1e3))} KB`;
+}
+
+function PoliciesCard({ slug }: { slug: string }) {
+  const policies = usePolicies(slug);
+  const rows = policies.data ?? [];
+  const best = rows.reduce<number | null>((acc, r) => {
+    const v = r.fitness ?? r.primary_metric;
+    if (v == null) return acc;
+    return acc == null || v > acc ? v : acc;
+  }, null);
+  return (
+    <div className="rs-card" style={{ marginBottom: 22 }}>
+      <div className="rs-card-head">
+        <div className="rs-card-title">
+          <Icon name="package" size={16} />Trained policies
+        </div>
+        <span className="rs-sub" style={{ fontSize: 12 }}>
+          self-contained bundles for sim-to-real deployment
+        </span>
+      </div>
+      {policies.isLoading ? (
+        <p className="rs-sub" style={{ padding: "12px 16px" }}>Loading…</p>
+      ) : rows.length === 0 ? (
+        <EmptyState
+          icon="package"
+          title="No trained checkpoints yet"
+          sub="Each completed training iteration leaves an exportable checkpoint here — bundle it with its reward, env spec, and an ONNX/TorchScript policy in one click."
+        />
+      ) : (
+        <div className="rs-card-pad rs-vgap-8">
+          {rows.map((p) => {
+            const metric = p.fitness ?? p.primary_metric;
+            const isBest = best != null && metric != null && metric >= best;
+            return (
+              <div
+                key={p.iter_index}
+                className="rs-flex rs-gap-12 rs-wrap"
+                style={{
+                  border: "1px solid var(--hairline)",
+                  borderRadius: "var(--radius-md)",
+                  padding: "10px 12px",
+                  background: "var(--canvas-soft)",
+                  alignItems: "center",
+                  fontSize: 12.5,
+                }}
+              >
+                <span style={{ fontWeight: 500, minWidth: 60 }}>iter {p.iter_index}</span>
+                {p.reward_version && (
+                  <span className="rs-tag mono" style={{ fontSize: 10 }}>
+                    reward {p.reward_version}
+                  </span>
+                )}
+                {p.fitness != null ? (
+                  <span className="rs-num" title="objective fitness (0-1)">
+                    fit {p.fitness.toFixed(2)}
+                  </span>
+                ) : p.primary_metric != null ? (
+                  <span className="rs-num" title="mean return">
+                    {p.primary_metric.toFixed(1)}
+                  </span>
+                ) : null}
+                {isBest && rows.length > 1 && (
+                  <span className="rs-tag" style={{ fontSize: 10, color: "var(--st-emerald)" }}>best</span>
+                )}
+                <span className="rs-sub rs-num" style={{ fontSize: 11 }}>
+                  {fmtBytes(p.checkpoint_bytes)}
+                </span>
+                <span style={{ marginLeft: "auto" }}>
+                  <a
+                    href={policyExportUrl(slug, p.iter_index)}
+                    download
+                    className="rs-btn rs-btn-ghost rs-btn-sm"
+                    title="Download a zip with the checkpoint, ONNX/TorchScript policy, reward + env spec snapshots, and a DEPLOY.md recipe"
+                  >
+                    <Icon name="download" size={14} />Export
+                  </a>
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }
