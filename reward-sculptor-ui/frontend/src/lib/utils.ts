@@ -1,12 +1,3 @@
-import { clsx, type ClassValue } from "clsx";
-import { twMerge } from "tailwind-merge";
-
-/** Shadcn-standard class merger. Combines clsx + tailwind-merge so
- *  later classes override earlier ones correctly. */
-export function cn(...inputs: ClassValue[]) {
-  return twMerge(clsx(inputs));
-}
-
 /** Compact RFC 3339 timestamp formatter — e.g. "2 min ago", "Apr 20".
  *  Used on ProjectCards where space is tight. */
 export function formatRelative(iso: string): string {

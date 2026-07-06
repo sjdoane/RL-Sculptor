@@ -1,5 +1,5 @@
-import { lazy, Suspense, useState } from "react";
-import { useNavigate, useParams } from "react-router-dom";
+import { lazy, Suspense } from "react";
+import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 
 import { Icon } from "@/components/rs/icon";
 import { Badge, Btn, FactChip } from "@/components/rs/primitives";
@@ -12,7 +12,9 @@ import { RobotConfig } from "@/components/RobotConfig";
 import { RobotViewer } from "@/components/RobotViewer";
 import { useLibraryRobot } from "@/hooks/useLibrary";
 import { usePhysics } from "@/hooks/usePhysics";
+import { usePolicies } from "@/hooks/usePolicies";
 import { useProject } from "@/hooks/useProjects";
+import { useRewards } from "@/hooks/useRewards";
 import { useRobot } from "@/hooks/useRobot";
 import { formatRelative } from "@/lib/utils";
 import type { ProjectDetail as ProjectDetailShape, RobotStateResponse } from "@/lib/types";
@@ -20,14 +22,31 @@ import type { ProjectDetail as ProjectDetailShape, RobotStateResponse } from "@/
 const RunsTabLazy = lazy(() => import("@/components/RunsTab"));
 const ReportsTabLazy = lazy(() => import("@/components/ReportsTab"));
 
+// Ordered as the workflow reads: set up → design the reward → train →
+// take the results. Values appear in the URL (?tab=) so keep them stable.
 const TABS = [
   { value: "overview", label: "Overview", icon: "gauge" },
   { value: "rewards", label: "Rewards", icon: "file-code" },
   { value: "physics", label: "Physics", icon: "cpu" },
-  { value: "kg", label: "Knowledge Graph", icon: "network" },
-  { value: "runs", label: "Runs", icon: "activity" },
-  { value: "reports", label: "Reports", icon: "file-text" },
+  { value: "knowledge", label: "Knowledge", icon: "network" },
+  { value: "training", label: "Training", icon: "activity" },
+  { value: "results", label: "Results", icon: "file-text" },
 ] as const;
+
+type TabValue = (typeof TABS)[number]["value"];
+
+// Old bookmark / in-app values from before the IA rename.
+const LEGACY_TABS: Record<string, TabValue> = {
+  kg: "knowledge",
+  runs: "training",
+  reports: "results",
+};
+
+function normalizeTab(raw: string | null): TabValue {
+  if (raw && raw in LEGACY_TABS) return LEGACY_TABS[raw];
+  if (raw && TABS.some((t) => t.value === raw)) return raw as TabValue;
+  return "overview";
+}
 
 function humanizeSlug(s: string | null | undefined): string {
   if (!s) return "";
@@ -40,8 +59,7 @@ function adapterShort(cls: string | null | undefined): string {
   return cls.split(".").pop() ?? cls;
 }
 
-// Generic padded scroll container for a tab's page content. Tabs not yet
-// reskinned (Physics/Rewards) render their existing components inside it.
+// Generic padded scroll container for a tab's page content.
 function ScrollPad({ children }: { children: React.ReactNode }) {
   return (
     <div className="rs-scroll">
@@ -98,7 +116,21 @@ export default function ProjectDetail() {
   const nav = useNavigate();
   const project = useProject(slug);
   const robot = useRobot(slug);
-  const [tab, setTab] = useState<string>("overview");
+  // Tab lives in the URL (?tab=training) so refresh keeps your place and
+  // any view is deep-linkable.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const tab = normalizeTab(searchParams.get("tab"));
+  const setTab = (value: TabValue) => {
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        if (value === "overview") next.delete("tab");
+        else next.set("tab", value);
+        return next;
+      },
+      { replace: false },
+    );
+  };
   const p = project.data;
   const canRun = !!p && !p.adapter_unavailable && p.ready_to_train !== false;
 
@@ -117,7 +149,7 @@ export default function ProjectDetail() {
         </div>
         <div className="rs-phead-spacer" />
         {p && <ProjectSettingsDialog project={p} />}
-        {p && canRun && <NewRunDialog slug={slug!} project={p} onLaunched={() => setTab("runs")} />}
+        {p && canRun && <NewRunDialog slug={slug!} project={p} onLaunched={() => setTab("training")} />}
       </div>
 
       {project.isLoading ? (
@@ -148,17 +180,19 @@ export default function ProjectDetail() {
             ))}
           </div>
 
-          {tab !== "runs" && <FactsBand project={p} />}
-          {tab !== "runs" && (p.adapter_unavailable || p.migration_warning) && <WarningBanners project={p} />}
+          {tab !== "training" && <FactsBand project={p} />}
+          {tab !== "training" && (p.adapter_unavailable || p.migration_warning) && <WarningBanners project={p} />}
 
-          {tab === "overview" && <OverviewTab slug={slug!} project={p} robot={robot.data} />}
+          {tab === "overview" && (
+            <OverviewTab slug={slug!} project={p} robot={robot.data} onGoTo={setTab} />
+          )}
           {tab === "rewards" && <ScrollPad><RewardsTab slug={slug!} project={p} /></ScrollPad>}
           {tab === "physics" && <ScrollPad><PhysicsTab slug={slug!} project={p} /></ScrollPad>}
-          {tab === "kg" && <KnowledgeGraphTab slug={slug!} />}
-          {tab === "runs" && (
+          {tab === "knowledge" && <KnowledgeGraphTab slug={slug!} />}
+          {tab === "training" && (
             <Suspense fallback={<TabFallback />}><RunsTabLazy slug={slug!} project={p} /></Suspense>
           )}
-          {tab === "reports" && (
+          {tab === "results" && (
             <Suspense fallback={<TabFallback />}><ReportsTabLazy slug={slug!} /></Suspense>
           )}
         </>
@@ -180,8 +214,13 @@ function TabFallback() {
 
 // ── Overview ──────────────────────────────────────────────────────────
 function OverviewTab({
-  slug, project, robot,
-}: { slug: string; project: ProjectDetailShape; robot: RobotStateResponse | undefined }) {
+  slug, project, robot, onGoTo,
+}: {
+  slug: string;
+  project: ProjectDetailShape;
+  robot: RobotStateResponse | undefined;
+  onGoTo: (tab: TabValue) => void;
+}) {
   const configured = isRobotConfigured(robot, project);
   const cfg = project.adapter_config || {};
   const taskId = typeof cfg.task_id === "string" ? cfg.task_id : null;
@@ -199,6 +238,12 @@ function OverviewTab({
         </div>
 
         <div className="rs-vgap-16">
+          <WorkflowCard
+            slug={slug}
+            project={project}
+            robotConfigured={configured}
+            onGoTo={onGoTo}
+          />
           <div className="rs-card">
             <div className="rs-card-head"><div className="rs-card-title"><Icon name="info" size={16} />Project facts</div></div>
             <div className="rs-kv">
@@ -218,6 +263,90 @@ function OverviewTab({
             <RobotLibraryCard slug={slug} librarySlug={(robot?.library_name ?? project.library_slug)!} />
           )}
         </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Getting-started workflow (first-time-user orientation) ────────────
+function WorkflowCard({
+  slug, project, robotConfigured, onGoTo,
+}: {
+  slug: string;
+  project: ProjectDetailShape;
+  robotConfigured: boolean;
+  onGoTo: (tab: TabValue) => void;
+}) {
+  const policies = usePolicies(slug);
+  const rewards = useRewards(slug);
+  const hasIters = project.n_iterations_completed > 0;
+  const hasPolicies = (policies.data?.length ?? 0) > 0;
+  const rewardShaped = (rewards.data?.length ?? 0) > 1 || hasIters;
+  const steps: Array<{
+    label: string; done: boolean; tab: TabValue; hint: string;
+  }> = [
+    {
+      label: "Configure the robot", done: robotConfigured, tab: "overview",
+      hint: "Pick a library robot or upload a URDF/MJCF.",
+    },
+    {
+      label: "Shape the reward", done: rewardShaped, tab: "rewards",
+      hint: "Review v0 or edit it — the sculptor iterates from here.",
+    },
+    {
+      label: "Train", done: hasIters, tab: "training",
+      hint: "Launch a run or decompose a goal into a mission.",
+    },
+    {
+      label: "Export the policy", done: hasPolicies && !!project.n_iterations_completed, tab: "results",
+      hint: "Download a deployment bundle for sim-to-real.",
+    },
+  ];
+  const next = steps.find((s) => !s.done);
+  // Everything done and exported → the checklist has served its purpose.
+  if (!next && hasPolicies) return null;
+  return (
+    <div className="rs-card">
+      <div className="rs-card-head">
+        <div className="rs-card-title"><Icon name="list" size={16} />Getting started</div>
+      </div>
+      <div className="rs-card-pad rs-vgap-8">
+        {steps.map((s, i) => {
+          const isNext = next === s;
+          return (
+            <button
+              key={s.label}
+              onClick={() => onGoTo(s.tab)}
+              className="rs-flex rs-gap-8"
+              style={{
+                background: "none", border: "none", padding: "4px 0",
+                cursor: "pointer", textAlign: "left", width: "100%",
+                alignItems: "flex-start", font: "inherit", color: "inherit",
+              }}
+              title={s.hint}
+            >
+              <Icon
+                name={s.done ? "check-circle" : "circle"}
+                size={15}
+                color={s.done ? "var(--st-emerald)" : isNext ? "var(--rs-primary)" : "var(--rs-muted)"}
+              />
+              <span style={{ minWidth: 0 }}>
+                <span style={{
+                  display: "block", fontSize: 13,
+                  fontWeight: isNext ? 600 : 400,
+                  color: s.done ? "var(--rs-muted)" : "var(--ink)",
+                }}>
+                  {i + 1}. {s.label}
+                </span>
+                {isNext && (
+                  <span className="rs-sub" style={{ display: "block", fontSize: 11.5, marginTop: 1 }}>
+                    {s.hint}
+                  </span>
+                )}
+              </span>
+            </button>
+          );
+        })}
       </div>
     </div>
   );

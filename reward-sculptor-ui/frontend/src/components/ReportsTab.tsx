@@ -105,8 +105,8 @@ export function ReportsTab({ slug }: { slug: string }) {
       <div className="rs-pad">
         <div className="rs-flex-between rs-wrap rs-gap-12" style={{ marginBottom: 22 }}>
           <div>
-            <div className="rs-eyebrow">final_report.md</div>
-            <h2 className="rs-h2" style={{ marginTop: 6 }}>Reports</h2>
+            <div className="rs-eyebrow">policies · report · actuator limits</div>
+            <h2 className="rs-h2" style={{ marginTop: 6 }}>Results</h2>
           </div>
           <div className="rs-flex rs-gap-8">
             {hasReport && (

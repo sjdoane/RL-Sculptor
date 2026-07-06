@@ -758,7 +758,7 @@ function IterationTimeline({ iters, selected, onSelect }: { iters: IterEventSumm
                   try { sessionStorage.setItem("pendingPhysicsPrompt", it.physics_edit_suggestion!.prompt); }
                   catch { void navigator.clipboard?.writeText(it.physics_edit_suggestion!.prompt); }
                   const match = window.location.pathname.match(/\/projects\/([^/]+)/);
-                  if (match) window.location.assign(`/projects/${match[1]}`);
+                  if (match) window.location.assign(`/projects/${match[1]}?tab=physics`);
                 }}
                 className="rs-tag"
                 style={{ marginTop: 4, fontSize: 10, cursor: disabled ? "default" : "pointer", background: state === "applied" ? "var(--st-emerald-bg)" : "var(--st-blue-bg)", color: state === "applied" ? "var(--st-emerald-fg)" : "var(--st-blue-fg)" }}

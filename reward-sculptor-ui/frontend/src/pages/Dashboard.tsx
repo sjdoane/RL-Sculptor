@@ -168,12 +168,20 @@ function SystemCard() {
   );
 }
 
+const RECENT_LIMIT = 6;
+
 export default function Dashboard() {
   const nav = useNavigate();
   const dash = useDashboard();
   const projects = useProjects();
   const active = dash.data?.active_jobs ?? [];
   const list = projects.data ?? [];
+  // Recent slice only — the Projects page owns the full list. Duplicating
+  // it here made the two pages compete for the same job.
+  const recent = [...list]
+    .sort((a, b) => (b.created_at ?? "").localeCompare(a.created_at ?? ""))
+    .slice(0, RECENT_LIMIT);
+  const firstRun = !projects.isLoading && !projects.error && list.length === 0;
 
   return (
     <div className="rs-scroll">
@@ -188,48 +196,75 @@ export default function Dashboard() {
           </Btn>
         </div>
 
-        {/* Active jobs */}
-        <section>
-          <div className="rs-flex rs-gap-8" style={{ marginBottom: 12 }}>
-            <span className={"rs-dot" + (active.length ? " live" : "")} style={active.length ? undefined : { background: "var(--st-slate)" }} />
-            <h2 className="rs-h3">Active jobs</h2>
-            <span className="rs-num" style={{ color: "var(--rs-muted)", fontSize: 13 }}>{active.length} running</span>
-          </div>
-          <div className="rs-card rs-jobs">
-            {active.length === 0 ? (
-              <div style={{ padding: 18 }}>
-                <EmptyState icon="activity" title="Nothing running" sub="Launched runs and missions appear here while they train." />
+        {firstRun ? (
+          /* First run: one clear action instead of three empty sections. */
+          <section>
+            <div className="rs-card">
+              <EmptyState
+                icon="library"
+                title="Welcome to RL Sculptor"
+                sub="Pick a robot from the library to scaffold your first project — it arrives with a reward template, physics, and knowledge-graph seeds, ready to train."
+                action={
+                  <Btn kind="primary" icon="library" onClick={() => nav("/library")}>
+                    Browse the robot library
+                  </Btn>
+                }
+              />
+            </div>
+          </section>
+        ) : (
+          <>
+            {/* Active jobs */}
+            <section>
+              <div className="rs-flex rs-gap-8" style={{ marginBottom: 12 }}>
+                <span className={"rs-dot" + (active.length ? " live" : "")} style={active.length ? undefined : { background: "var(--st-slate)" }} />
+                <h2 className="rs-h3">Active jobs</h2>
+                <span className="rs-num" style={{ color: "var(--rs-muted)", fontSize: 13 }}>{active.length} running</span>
               </div>
-            ) : (
-              active.map((j) => (
-                <ActiveJobRow key={j.job_id} job={j} onOpen={() => j.project_slug && nav(`/projects/${j.project_slug}`)} />
-              ))
-            )}
-          </div>
-        </section>
+              <div className="rs-card rs-jobs">
+                {active.length === 0 ? (
+                  <div style={{ padding: 18 }}>
+                    <EmptyState icon="activity" title="Nothing running" sub="Launched runs and missions appear here while they train." />
+                  </div>
+                ) : (
+                  active.map((j) => (
+                    <ActiveJobRow key={j.job_id} job={j} onOpen={() => j.project_slug && nav(`/projects/${j.project_slug}`)} />
+                  ))
+                )}
+              </div>
+            </section>
 
-        {/* Projects grid */}
-        <section>
-          <h2 className="rs-h3" style={{ marginBottom: 12 }}>Projects</h2>
-          {projects.isLoading ? (
-            <div className="rs-sub">Loading projects…</div>
-          ) : projects.error ? (
-            <div className="rs-banner err">
-              <Icon name="alert-triangle" size={17} />
-              <span className="rs-grow">Failed to load projects: {(projects.error as Error).message}</span>
-            </div>
-          ) : (
-            <div className="rs-grid-cards">
-              {list.map((p) => (
-                <ProjectCard key={p.slug} p={p} onOpen={() => nav(`/projects/${p.slug}`)} />
-              ))}
-              <button className="rs-newcard" onClick={() => nav("/library")}>
-                <Icon name="plus" size={22} />
-                <span style={{ fontSize: 14, fontWeight: 500 }}>New project</span>
-              </button>
-            </div>
-          )}
-        </section>
+            {/* Recent projects */}
+            <section>
+              <div className="rs-flex-between rs-wrap rs-gap-12" style={{ marginBottom: 12 }}>
+                <h2 className="rs-h3">Recent projects</h2>
+                {list.length > RECENT_LIMIT && (
+                  <Btn kind="ghost" size="sm" iconRight="arrow-right" onClick={() => nav("/projects")}>
+                    All {list.length} projects
+                  </Btn>
+                )}
+              </div>
+              {projects.isLoading ? (
+                <div className="rs-sub">Loading projects…</div>
+              ) : projects.error ? (
+                <div className="rs-banner err">
+                  <Icon name="alert-triangle" size={17} />
+                  <span className="rs-grow">Failed to load projects: {(projects.error as Error).message}</span>
+                </div>
+              ) : (
+                <div className="rs-grid-cards">
+                  {recent.map((p) => (
+                    <ProjectCard key={p.slug} p={p} onOpen={() => nav(`/projects/${p.slug}`)} />
+                  ))}
+                  <button className="rs-newcard" onClick={() => nav("/library")}>
+                    <Icon name="plus" size={22} />
+                    <span style={{ fontSize: 14, fontWeight: 500 }}>New project</span>
+                  </button>
+                </div>
+              )}
+            </section>
+          </>
+        )}
 
         {/* System */}
         <section>

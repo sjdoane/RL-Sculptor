@@ -1,8 +1,8 @@
 import { useQuery } from "@tanstack/react-query";
-import { Loader2, X } from "lucide-react";
 import { toast } from "sonner";
 
-import { Button } from "@/components/ui/button";
+import { Icon } from "@/components/rs/icon";
+import { IconBtn } from "@/components/rs/primitives";
 import { useStopJob } from "@/hooks/useJob";
 import { ApiError, listJobs } from "@/lib/api";
 import { qk } from "@/lib/queryKeys";
@@ -54,22 +54,24 @@ export function ActiveJobsIndicator({ slug }: { slug: string }) {
   };
 
   return (
-    <div className="flex items-center gap-2 rounded-md border border-amber-300/50 bg-amber-50 px-2 py-1 text-[11px] text-amber-900">
-      <Loader2 className="h-3 w-3 animate-spin" />
-      <span className="truncate">
+    <span
+      className="rs-badge amber"
+      style={{ maxWidth: 340, gap: 6 }}
+      title={head.message ?? head.kind}
+    >
+      <Icon name="loader" size={12} className="rs-spin" />
+      <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
         {active.length > 1 ? `${active.length} jobs · ` : ""}
         {head.message ?? head.kind}
       </span>
-      <Button
-        variant="ghost"
-        size="sm"
+      <IconBtn
+        icon="x"
+        size={12}
+        label={`Stop this ${head.kind} job`}
         onClick={onStop}
         disabled={stop.isPending}
-        className="ml-1 h-5 w-5 p-0 text-amber-900 hover:bg-amber-100 hover:text-amber-900"
-        title={`Stop this ${head.kind} job`}
-      >
-        <X className="h-3 w-3" />
-      </Button>
-    </div>
+        style={{ width: 18, height: 18 }}
+      />
+    </span>
   );
 }
