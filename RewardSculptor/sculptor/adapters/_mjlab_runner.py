@@ -1349,6 +1349,24 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
     # §actuator-limit enforcement — flag-gated (default OFF). Same swap as TRAIN so
     # the rollout physics matches what the policy trained under.
     _enforce_actuator_limits(env_cfg)
+    # §Selection statistics: deterministic eval seeding for repeat rollouts
+    # of the SAME checkpoint (multi-seed evaluation / fresh-seed re-eval of
+    # the kept best). --seed 0 (default) leaves the legacy RNG state
+    # untouched. Reset-event randomization draws from torch's global RNG;
+    # cfg.seed is additionally honored when the cfg exposes it.
+    _eval_seed = int(getattr(args, "seed", 0) or 0)
+    if _eval_seed:
+        try:
+            import torch
+            torch.manual_seed(_eval_seed)
+        except Exception:  # noqa: BLE001 — seeding is best-effort
+            pass
+        np.random.seed(_eval_seed % (2**32 - 1))
+        if hasattr(env_cfg, "seed"):
+            try:
+                env_cfg.seed = _eval_seed
+            except Exception:  # noqa: BLE001 — frozen cfg tolerated
+                pass
     env = ManagerBasedRlEnv(
         env_cfg, device=args.device, render_mode="rgb_array"
     )
@@ -1996,6 +2014,9 @@ def main() -> None:
     # §RL_SCULPTOR_AUDIT §4.4: must match the train-side spec/profile.
     p_roll.add_argument("--env-profile", default="")
     p_roll.add_argument("--env-spec", default="")
+    # §Selection statistics: deterministic eval seed for repeat rollouts
+    # of the same checkpoint. 0 (default) = legacy unseeded behavior.
+    p_roll.add_argument("--seed", type=int, default=0)
 
     p_probe = sub.add_parser("vram-probe")
     p_probe.add_argument("--task-id", required=True)

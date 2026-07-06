@@ -335,7 +335,17 @@ def make_generated_fitness_fn(module_path: Path | str) -> Callable[[Any], float]
         except Exception:  # noqa: BLE001 — breakdown is advisory, never fatal
             return {}
 
+    def _detail_dir(rollout_dir: Any) -> dict:
+        # §Selection statistics: score an ARBITRARY rollout dir (multi-seed
+        # evaluation rolls into `rollout_eval_<k>/` beside `rollout/`;
+        # fresh-seed re-eval into `rollout_fresh_<j>/`). Never raises.
+        try:
+            return compute_generated_metric(module_path, Path(rollout_dir))
+        except Exception:  # noqa: BLE001 — advisory, never fatal
+            return {}
+
     _fitness.detail = _detail  # type: ignore[attr-defined]
+    _fitness.detail_dir = _detail_dir  # type: ignore[attr-defined]
     # §Ship 54-pre (#12): the metric's held-out observable surface for the
     # shaping↔metric partition gate. Parse which ALLOWED_ARRAYS the module
     # actually references (precise flags); fall back to the full contract on any

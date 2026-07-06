@@ -421,3 +421,182 @@ def test_spec_fitness_dominates_progress(tmp_path, monkeypatch):
     )
     assert res.best_fitness_iter == 1
     assert res.best_fitness == pytest.approx(0.5)
+
+
+# ── §Selection statistics: noise-band epsilon + fresh-seed re-eval ───────
+
+
+def test_progress_noise_tick_is_tie_not_new_best(tmp_path, monkeypatch):
+    """A progress uptick INSIDE the measured noise band (default epsilon
+    1e-5, audit §6: seed noise spans 1e-7..4e-6) must NOT mint a new best —
+    noise-floor bests reset patience and made plateau-stop unreachable."""
+    cfg_path = _make_project(tmp_path)
+    seen: list = []
+    _install_progress_fake(
+        monkeypatch, {0: 0.0, 1: 0.0, 2: 0.0}, seen,
+        progress_by_iter={0: 1e-6, 1: 3e-6, 2: 2e-6},
+    )
+    res = S.sculpt_run(
+        cfg_path, "goal", iterations=3, no_kg=True,
+        fitness_fn=lambda d: 0.0, fitness_patience=2,
+    )
+    assert res.best_fitness_iter == 0          # 3e-6 did NOT dethrone 1e-6
+    assert all(s is None for s in seen), seen  # noise dips never revert
+    assert res.early_stopped                   # patience got to count ties
+
+
+def test_progress_above_epsilon_mints_best(tmp_path, monkeypatch):
+    """Real progress signal (≫ noise band) still mints a new best."""
+    cfg_path = _make_project(tmp_path)
+    seen: list = []
+    _install_progress_fake(
+        monkeypatch, {0: 0.0, 1: 0.0}, seen,
+        progress_by_iter={0: 1e-6, 1: 1e-3},
+    )
+    res = S.sculpt_run(
+        cfg_path, "goal", iterations=2, no_kg=True,
+        fitness_fn=lambda d: 0.0, fitness_patience=5,
+    )
+    assert res.best_fitness_iter == 1
+
+
+def test_progress_epsilon_zero_restores_strict_compare(tmp_path, monkeypatch):
+    """progress_epsilon=0.0 is the exact pre-epsilon strict-`>` behavior."""
+    cfg_path = _make_project(tmp_path)
+    seen: list = []
+    _install_progress_fake(
+        monkeypatch, {0: 0.0, 1: 0.0}, seen,
+        progress_by_iter={0: 1e-6, 1: 3e-6},
+    )
+    res = S.sculpt_run(
+        cfg_path, "goal", iterations=2, no_kg=True,
+        fitness_fn=lambda d: 0.0, fitness_patience=5,
+        progress_epsilon=0.0,
+    )
+    assert res.best_fitness_iter == 1
+
+
+def test_progress_big_dip_still_regresses(tmp_path, monkeypatch):
+    """The epsilon must not swallow REAL regressions: a progress drop far
+    outside the noise band still arms the best-first revert."""
+    cfg_path = _make_project(tmp_path)
+    seen: list = []
+    _install_progress_fake(
+        monkeypatch, {0: 0.0, 1: 0.0, 2: 0.0}, seen,
+        progress_by_iter={0: 1e-2, 1: 1e-6, 2: 5e-3},
+    )
+    S.sculpt_run(
+        cfg_path, "goal", iterations=3, no_kg=True,
+        fitness_fn=lambda d: 0.0, fitness_patience=5,
+    )
+    assert seen[2] is not None and seen[2].name == "v0.py"
+
+
+def test_median_helper():
+    assert S._median([]) is None
+    assert S._median([0.4]) == pytest.approx(0.4)
+    assert S._median([0.0, 0.4, 0.9]) == pytest.approx(0.4)
+    assert S._median([0.0, 1.0]) == pytest.approx(0.5)
+
+
+def test_rollout_or_resume_threads_seed_only_when_declared(tmp_path):
+    """`seed` reaches adapters that declare it; legacy signatures
+    (gym_sb3-shaped) are called without it — no TypeError."""
+    calls: list = []
+
+    class _SeedAdapter:
+        def rollout(self, checkpoint_path, output_dir, n_episodes, *,
+                    seed=None, **kw):
+            calls.append(seed)
+
+    class _LegacyAdapter:
+        def rollout(self, checkpoint_path, output_dir, n_episodes):
+            calls.append("legacy")
+
+    d1 = tmp_path / "r1"
+    d1.mkdir()
+    S._rollout_or_resume(
+        adapter=_SeedAdapter(), iter_index=0, rollout_dir=d1,
+        checkpoint_path=tmp_path / "ck.pt", n_episodes=2, seed=123)
+    d2 = tmp_path / "r2"
+    d2.mkdir()
+    S._rollout_or_resume(
+        adapter=_LegacyAdapter(), iter_index=0, rollout_dir=d2,
+        checkpoint_path=tmp_path / "ck.pt", n_episodes=2, seed=123)
+    assert calls == [123, "legacy"]
+
+
+def _fitness_fn_with_detail_dir(scores: list):
+    """Stub fitness fn exposing the `detail_dir` accessor (multi-seed /
+    fresh-eval contract); pops one queued spec score per call."""
+    def _fn(iter_dir):
+        return 0.0
+
+    def _detail_dir(rollout_dir):
+        return {"spec_score": scores.pop(0)} if scores else {}
+
+    _fn.detail_dir = _detail_dir  # type: ignore[attr-defined]
+    return _fn
+
+
+def test_fresh_seed_reeval_of_kept_best(tmp_path, monkeypatch):
+    """End-of-run: the kept best is re-rolled on held-out seeds and the
+    unbiased median lands in `best_fitness_fresh` beside the selected
+    (max-statistic) value. Selection itself is untouched."""
+    cfg_path = _make_project(tmp_path)
+    monkeypatch.setattr(S, "load_adapter", lambda _p: object())
+    monkeypatch.setattr("sculptor.run_context.capture_run_context",
+                        lambda *a, **k: {}, raising=True)
+    monkeypatch.setattr("sculptor.run_context.write_run_context",
+                        lambda *a, **k: Path("run_context.json"), raising=True)
+
+    def fake_iter(**kw):
+        i = kw["iter_index"]
+        rewards_dir = kw["rewards_dir"]
+        trained = rewards_dir / f"v{i}.py"
+        edit = rewards_dir / f"v{i + 1}.py"
+        edit.write_text(
+            "REWARD_SPEC = {}\ndef compute_reward(*a, **k):\n    return 0.0, {}\n",
+            encoding="utf-8")
+        S._write_current_reexport(rewards_dir, edit)
+        iter_dir = kw["runs_dir"] / f"iter_{i}"
+        iter_dir.mkdir(parents=True, exist_ok=True)
+        ckpt = iter_dir / "checkpoint.pt"
+        ckpt.write_text("x", encoding="utf-8")
+        # Pre-bake the fresh-eval rollout artifacts so _rollout_or_resume
+        # SKIPS the adapter call (the adapter here is a bare object()).
+        fresh = iter_dir / "rollout_fresh_0"
+        fresh.mkdir()
+        for name in ("rollout.mp4", "trajectory.npz", "behavior.json"):
+            (fresh / name).write_text("x", encoding="utf-8")
+        return S.IterOutcome(
+            iter_index=i, iter_dir=iter_dir,
+            reward_path_before=rewards_dir / "current.py",
+            reward_path_after=edit, primary_metric=0.0, behavior={},
+            failure_modes=[], edit_count=1, fitness={0: 0.2, 1: 0.7}[i],
+            reward_path_trained=trained, checkpoint_path=ckpt,
+        )
+
+    monkeypatch.setattr(S, "_run_one_iter", fake_iter)
+    fn = _fitness_fn_with_detail_dir([0.55])
+    res = S.sculpt_run(
+        cfg_path, "goal", iterations=2, no_kg=True,
+        fitness_fn=fn, fitness_patience=5,
+    )
+    assert res.best_fitness_iter == 1
+    assert res.best_fitness == pytest.approx(0.7)   # selection unchanged
+    assert res.best_fitness_fresh == pytest.approx(0.55)
+    assert res.fresh_fitness_per_seed == [pytest.approx(0.55)]
+
+
+def test_fresh_eval_disabled_by_zero(tmp_path, monkeypatch):
+    cfg_path = _make_project(tmp_path)
+    seen: list = []
+    _install_progress_fake(monkeypatch, {0: 0.2}, seen)
+    fn = _fitness_fn_with_detail_dir([0.99])
+    res = S.sculpt_run(
+        cfg_path, "goal", iterations=1, no_kg=True,
+        fitness_fn=fn, fitness_patience=5, fresh_eval_seeds=0,
+    )
+    assert res.best_fitness_fresh is None
+    assert res.fresh_fitness_per_seed == []
