@@ -128,7 +128,9 @@ export default function ProjectDetail() {
         else next.set("tab", value);
         return next;
       },
-      { replace: false },
+      // replace, not push: Back should leave the page, not unwind every
+      // tab click. Deep-linking only needs the URL set.
+      { replace: true },
     );
   };
   const p = project.data;
@@ -279,6 +281,11 @@ function WorkflowCard({
 }) {
   const policies = usePolicies(slug);
   const rewards = useRewards(slug);
+  // Don't flash a wrong checklist while the queries settle (or mislead
+  // forever if one errors) — the card is orientation, not status-critical.
+  if (policies.isLoading || rewards.isLoading || policies.error || rewards.error) {
+    return null;
+  }
   const hasIters = project.n_iterations_completed > 0;
   const hasPolicies = (policies.data?.length ?? 0) > 0;
   const rewardShaped = (rewards.data?.length ?? 0) > 1 || hasIters;

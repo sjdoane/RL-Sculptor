@@ -351,6 +351,26 @@ def test_known_obs_normalizer_is_baked_into_export(tmp_path):
         assert torch.allclose(ts(obs), ref_mlp(ref_norm(obs)), atol=1e-6)
 
 
+@pytest.mark.parametrize("bad_norm", [
+    True,                       # truthy non-dict
+    {},                         # present but empty
+    {"_mean": [0.0] * 48, "_std": [1.0] * 48},  # right keys, non-tensor values
+])
+def test_malformed_obs_norm_state_refuses(tmp_path, bad_norm):
+    """A present-but-unusable obs_norm_state_dict must refuse the network
+    export — falling through to a bare un-normalized MLP is silently wrong."""
+    torch = pytest.importorskip("torch")
+    project = _make_project(tmp_path, checkpoint=None)
+    ckpt = torch.load(GO1_CKPT, map_location="cpu", weights_only=False)
+    ckpt["obs_norm_state_dict"] = bad_norm
+    torch.save(ckpt, project / "runs" / "iter_0" / "checkpoint.pt")
+    res = export_policy_bundle(project)
+    assert res.manifest["network"] == {"obs_normalization": True}
+    with zipfile.ZipFile(res.bundle_path) as zf:
+        assert "policy.onnx" not in zf.namelist()
+        assert "policy_ts.pt" not in zf.namelist()
+
+
 def test_unknown_normalizer_refuses_network_export(tmp_path):
     """Normalizer-ish state the exporter doesn't recognise → raw-only, never
     a bare-MLP guess."""

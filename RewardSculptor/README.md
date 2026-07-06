@@ -123,6 +123,21 @@ with primary-metric burned in) and writes `reports/final_report.md` with
 top-3 impactful edits, a literature map grouped by reward component, and a
 summary table of citations added per iteration.
 
+To take a trained policy out for deployment (sim-to-real, another
+codebase, a robot):
+
+```bash
+uv run sculpt export --config examples/hopper/config.toml --list   # what's exportable
+uv run sculpt export --config examples/hopper/config.toml --iter 2
+```
+
+Writes `<project>/exports/policy_<name>_iter<N>.zip` — a self-contained
+bundle with the raw checkpoint, best-effort ONNX + TorchScript exports of
+the actor network (rsl_rl observation normalization baked in when the
+checkpoint carries it), the exact reward version + env spec the iteration
+trained under, the project config, metrics, and a `DEPLOY.md` loading
+recipe. The same bundles are downloadable from the UI's Results tab.
+
 ---
 
 ## Architecture

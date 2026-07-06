@@ -245,8 +245,13 @@ function fmtBytes(n: number): string {
 function PoliciesCard({ slug }: { slug: string }) {
   const policies = usePolicies(slug);
   const rows = policies.data ?? [];
+  // Rank on ONE scale: fitness (0-1) when any row has it, else the reward
+  // metric — mixing the two in a single max lands "best" on the wrong row.
+  const anyFitness = rows.some((r) => r.fitness != null);
+  const rankOf = (r: (typeof rows)[number]) =>
+    anyFitness ? r.fitness : r.primary_metric;
   const best = rows.reduce<number | null>((acc, r) => {
-    const v = r.fitness ?? r.primary_metric;
+    const v = rankOf(r);
     if (v == null) return acc;
     return acc == null || v > acc ? v : acc;
   }, null);
@@ -271,7 +276,7 @@ function PoliciesCard({ slug }: { slug: string }) {
       ) : (
         <div className="rs-card-pad rs-vgap-8">
           {rows.map((p) => {
-            const metric = p.fitness ?? p.primary_metric;
+            const metric = rankOf(p);
             const isBest = best != null && metric != null && metric >= best;
             return (
               <div

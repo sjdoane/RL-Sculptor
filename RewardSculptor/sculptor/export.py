@@ -493,7 +493,12 @@ def _extract_obs_normalizer(payload: dict, actor_sd: dict, warnings: list):
         if not set(embedded) <= known or not {"_mean", "_std"} <= set(embedded):
             return _refuse(f"obs_normalizer keys: {sorted(embedded)}")
         source = embedded
-    elif isinstance(payload_norm, dict) and payload_norm:
+    elif payload_norm is not None:
+        # Present but not a usable dict → refuse, never a bare-MLP export.
+        if not (isinstance(payload_norm, dict) and payload_norm):
+            return _refuse(
+                f"obs_norm_state_dict is {type(payload_norm).__name__}"
+                f"{' (empty)' if payload_norm == {} else ''}")
         stripped = {
             (k.removeprefix(known_prefix)
              if isinstance(k, str) else k): v
@@ -504,8 +509,11 @@ def _extract_obs_normalizer(payload: dict, actor_sd: dict, warnings: list):
         source = stripped
     if source is None:
         return None
-    mean = source["_mean"].reshape(-1).to(dtype=_f32())
-    std = source["_std"].reshape(-1).to(dtype=_f32())
+    try:
+        mean = source["_mean"].reshape(-1).to(dtype=_f32())
+        std = source["_std"].reshape(-1).to(dtype=_f32())
+    except Exception as e:  # noqa: BLE001 — non-tensor stats → raw-only
+        return _refuse(f"normalizer stats not tensors ({type(e).__name__}: {e})")
     return {"mean": mean, "std": std}
 
 
@@ -519,8 +527,10 @@ def _verify_normalizer_parity(
     model, norm: dict, obs_dim: int, warnings: list,
 ) -> bool:
     """When rsl_rl is importable, check the baked (x-mean)/(std+eps) against
-    the REAL EmpiricalNormalization loaded with the same stats. Guards the
-    one un-checkpointed assumption: eps."""
+    the REAL EmpiricalNormalization loaded with the same stats. Guards
+    against the installed rsl_rl's DEFAULT eps/formula differing from the
+    1e-2 baked here — a run trained with a non-default eps override is
+    undetectable (eps is a constructor arg, not checkpointed)."""
     import torch
 
     try:
@@ -784,7 +794,7 @@ def _render_deploy_md(manifest: dict[str, Any]) -> str:
         "`config.toml`, and the adapter's state schema.",
         "",
     ]
-    if net.get("obs_normalization_baked"):
+    if net.get("obs_normalization_baked") and net.get("exports"):
         lines += [
             "Observation normalization — `(x - mean) / (std + 0.01)`, the "
             "rsl_rl EmpiricalNormalization the policy trained with — is "

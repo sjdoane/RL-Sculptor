@@ -66,7 +66,7 @@ export default function RunsTab({ slug, project }: { slug: string; project: Proj
       <div className="rs-scroll">
         <div className="rs-pad">
           <div className="rs-flex-between rs-wrap rs-gap-12" style={{ marginBottom: 16 }}>
-            <h2 className="rs-h2">Runs</h2>
+            <h2 className="rs-h2">Training</h2>
             <div className="rs-flex rs-gap-8">
               <NewMissionDialog slug={slug} onCreated={(s) => setMissionDialogSlug(s)} />
               <NewRunDialog slug={slug} project={project} onLaunched={(id) => setSelectedRunId(id)} />
