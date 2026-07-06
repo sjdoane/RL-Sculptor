@@ -217,6 +217,12 @@ export interface IterationSettings {
   seed?: number | null;
   early_stop_enabled?: boolean | null;
   early_stop_patience?: number | null;
+  // §Selection statistics: multi-seed eval, progress-tie noise band,
+  // fresh-seed re-eval of the kept best, hack-income screen toggle.
+  eval_seeds?: number | null;
+  progress_epsilon?: number | null;
+  fresh_eval_seeds?: number | null;
+  hack_income_screen?: boolean | null;
 }
 
 export interface ProjectSettings {

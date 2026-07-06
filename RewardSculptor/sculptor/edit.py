@@ -505,6 +505,61 @@ def _screen_reward_on_replay(mod, replay_inputs, parent_summary=None) -> None:
     )
 
 
+# §Hack-income regression screen (RESEARCH_GAP_ANALYSIS §4.1; CARD's
+# Trajectory Preference Evaluation, arXiv:2410.14660, adapted to archived
+# exploits): once the diagnoser has CAUGHT a reward-hacking iteration,
+# that iteration's rollout is a standing demonstration of the exploit.
+# No future candidate may pay it meaningfully MORE per step than the
+# PARENT (edit base) does — a caught hack must become monotonically less
+# profitable across edits, never re-opened. Compared parent-vs-candidate
+# on the SAME frames, so honest credit that incidentally overlaps the
+# exploit (e.g. flight credit on a tumble) passes as long as the edit
+# didn't RAISE it; only the delta the edit introduced can reject.
+# Tolerance below absorbs float noise + incidental term coupling.
+_HACK_INCOME_ABS_TOL = 0.05
+_HACK_INCOME_REL_TOL = 0.10
+
+
+def _screen_hack_income(mod, hack_replays) -> None:
+    """Reject a candidate that raises the per-step income of a KNOWN
+    (diagnosed reward_hacking) archived exploit above its parent's.
+
+    `hack_replays`: list of `{label, replay_inputs, parent_summary}`
+    dicts (built in sculpt.py; parent summaries computed by apply_edits
+    with the same `_replay_reward_summary` the candidate is measured
+    with). Entries without a parent summary or an unreplayable candidate
+    are skipped — no evidence, no reject."""
+    for hr in hack_replays or []:
+        parent = hr.get("parent_summary")
+        if not parent:
+            continue
+        cand = _replay_reward_summary(mod, hr.get("replay_inputs"))
+        if cand is None:
+            continue
+        p_mean = float(parent["mean_alive"])
+        allowed = p_mean + max(_HACK_INCOME_ABS_TOL,
+                               _HACK_INCOME_REL_TOL * abs(p_mean))
+        if cand["mean_alive"] <= allowed:
+            continue
+        comp_s = ", ".join(
+            f"{k}={v:+.3f}" for k, v in sorted(
+                cand["component_means"].items(),
+                key=lambda kv: -kv[1])[:6])
+        raise EditValidationError(
+            f"hack-income screen: {hr.get('label', 'a prior iteration')} "
+            "was diagnosed as REWARD HACKING and its rollout is archived "
+            "as a known exploit. Replaying your candidate on those exact "
+            f"frames pays {cand['mean_alive']:+.3f}/step vs the parent "
+            f"reward's {p_mean:+.3f}/step — this edit makes a CAUGHT "
+            "exploit MORE profitable, re-opening it. Top-paying "
+            f"components on the exploit frames: {comp_s or '(none)'}. "
+            "Gate those terms on the requirement the exploit skips "
+            "(orientation / foot contact / height band) so the exploit "
+            "earns LESS than it did, while keeping the intended behavior "
+            "paid the same."
+        )
+
+
 def _call_compute_reward_batched(mod, contract) -> None:
     """§Ship 31b: execute the BATCHED path pre-flight (N=2 zero
     tensors, runtime-faithful float info). The scalar probe runs pure
@@ -960,7 +1015,8 @@ def _post_validate(new_source: str, *, contract, kg_store: SculptorKG,
                    parent_hparams: "dict[str, Any] | None" = None,
                    metric_observables: "frozenset[str] | None" = None,
                    replay_inputs=None,
-                   replay_parent: "dict | None" = None) -> Any:
+                   replay_parent: "dict | None" = None,
+                   hack_replays: "list[dict] | None" = None) -> Any:
     """Write source, import, validate, return the imported module.
 
     Raises EditValidationError on any failure (caller decides whether to retry).
@@ -1015,6 +1071,10 @@ def _post_validate(new_source: str, *, contract, kg_store: SculptorKG,
         # net-negative (suicide-by-termination attractor). No-op when the
         # caller supplied no replay inputs.
         _screen_reward_on_replay(mod, replay_inputs, replay_parent)
+        # §Hack-income regression screen: a caught exploit must never be
+        # made MORE profitable by an edit. No-op when no prior iteration
+        # was diagnosed reward_hacking (empty/None list).
+        _screen_hack_income(mod, hack_replays)
 
         # expected_components subset check
         if contract.expected_components is not None:
@@ -1136,6 +1196,7 @@ def apply_edits(
     iter_dir: Path | str | None = None,
     metric_observables: "frozenset[str] | None" = None,
     replay_inputs=None,
+    hack_replays: "list[dict] | None" = None,
 ) -> Path:
     """Produce a new reward module from `diagnosis` applied to
     `current_reward_path`. Writes `<rewards_dir>/<new_iter_id>.py` and
@@ -1191,6 +1252,16 @@ def apply_edits(
         replay_parent = (
             _replay_reward_summary(current_module, replay_inputs)
             if replay_inputs else None)
+        # §Hack-income regression screen: the PARENT's income on each
+        # archived exploit — the baseline the candidate must not exceed.
+        # Computed here (not in sculpt.py) so parent and candidate are
+        # measured by the exact same replay code path. An unreplayable
+        # parent leaves parent_summary None → that entry is skipped.
+        if hack_replays:
+            hack_replays = [dict(hr) for hr in hack_replays]
+            for hr in hack_replays:
+                hr["parent_summary"] = _replay_reward_summary(
+                    current_module, hr.get("replay_inputs"))
 
         # Pre-flight.
         if on_event is not None:
@@ -1347,6 +1418,7 @@ def apply_edits(
                 metric_observables=metric_observables,
                 replay_inputs=replay_inputs,
                 replay_parent=replay_parent,
+                hack_replays=hack_replays,
             )
         except EditValidationError as first_err:
             print(f"[edit] first attempt failed: {first_err}. Retrying once.",
@@ -1378,6 +1450,7 @@ def apply_edits(
                 metric_observables=metric_observables,
                 replay_inputs=replay_inputs,
                 replay_parent=replay_parent,
+                hack_replays=hack_replays,
             )
 
         _write_current_reexport(rewards_dir, target_path)

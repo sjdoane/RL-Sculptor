@@ -130,6 +130,11 @@ class IterOutcome:
     #: no env spec. Keep-best/revert repoint env/current.json to the best
     #: iter's version, exactly like the reward flow.
     env_spec_trained: str | None = None
+    #: §Selection statistics: the checkpoint this iter's rollout(s) were
+    #: evaluated from — retained so the end-of-run fresh-seed re-eval can
+    #: re-roll the KEPT best on seeds never used for selection (the
+    #: report-of-max discipline from Empirical Design in RL).
+    checkpoint_path: Path | None = None
 
 
 @dataclass
@@ -155,6 +160,12 @@ class SculptRunResult:
     #: (the environment half of what best_fitness measured); None when the
     #: project has no env spec.
     best_env_spec: str | None = None
+    #: §Selection statistics: the kept-best pair re-evaluated on FRESH
+    #: rollout seeds after the run (median / per-seed raw scores). The
+    #: selected `best_fitness` is a max statistic over the run; this is
+    #: the unbiased report number. None when fresh eval didn't run.
+    best_fitness_fresh: float | None = None
+    fresh_fitness_per_seed: list[float] = field(default_factory=list)
 
     @property
     def final_reward_path(self) -> Path | None:
@@ -175,6 +186,46 @@ class SculptRunResult:
                         and outcome.reward_path_trained):
                     return outcome.reward_path_trained
         return self.final_reward_path
+
+
+# ── Selection statistics ─────────────────────────────────────────────────
+# §RL_SCULPTOR_AUDIT §6 (noise-floor bests) + RESEARCH_GAP_ANALYSIS §7.2:
+# the lexicographic (steer_fitness, steer_progress) comparison used for
+# keep-best/revert is made on NOISY scalars. Measured on tuck-jump E2E
+# runs 1-2: behaviorally-identical re-rolls of the same reward differ by
+# 1e-7..4e-6 in progress (sensor-noise ramps), which minted "new bests"
+# below display precision, reset fitness_patience, and armed reverts on
+# noise-level dips. The epsilon makes a progress tie-break require
+# clearing that measured band; spec fitness comparisons are unchanged
+# (the completion gate is a sharp 0/positive signal, not a noise ramp).
+# progress_epsilon=0.0 restores the exact pre-epsilon behavior.
+def _lex_improved(cur: tuple, best: tuple, progress_epsilon: float) -> bool:
+    """New-best test: spec decides; progress breaks ties only when it
+    clears the noise band."""
+    if cur[0] != best[0]:
+        return cur[0] > best[0]
+    return cur[1] > best[1] + progress_epsilon
+
+
+def _lex_regressed(cur: tuple, best: tuple, progress_epsilon: float) -> bool:
+    """Strict-regression test (arms revert). Symmetric to `_lex_improved`:
+    a progress dip inside the noise band is a TIE (build forward, patience
+    counts), not a regression — reverting on seed noise re-trains the
+    incumbent and discards the corrective edit, the exact deadlock the
+    tie-no-revert fix (loop 1) removed."""
+    if cur[0] != best[0]:
+        return cur[0] < best[0]
+    return cur[1] < best[1] - progress_epsilon
+
+
+def _median(values: list[float]) -> float | None:
+    """Median over per-seed evaluation scores. Chosen over mean (one
+    diverged seed shouldn't drag the estimate) and over IQM (needs ≥4
+    samples to differ from the median; eval_seeds is typically 2-5)."""
+    if not values:
+        return None
+    import statistics
+    return float(statistics.median(values))
 
 
 # ── Config / paths ───────────────────────────────────────────────────────
@@ -890,6 +941,7 @@ def _rollout_or_resume(
     fps: float | None = None,
     render_width: int | None = None,
     render_height: int | None = None,
+    seed: int | None = None,
 ) -> None:
     """Skip `adapter.rollout` when the three artifacts it produces
     (`rollout.mp4` + `trajectory.npz` + `behavior.json`) are ALL on
@@ -924,6 +976,9 @@ def _rollout_or_resume(
         ("fps", fps),
         ("render_width", render_width),
         ("render_height", render_height),
+        # §Selection statistics: distinct eval seeds per repeat rollout —
+        # adapters that don't declare `seed` (gym_sb3) silently skip it.
+        ("seed", seed),
     ):
         if value is not None and name in sig.parameters:
             extra[name] = value
@@ -933,6 +988,49 @@ def _rollout_or_resume(
         n_episodes=n_episodes,
         **extra,
     )
+
+
+def _collect_hack_replays(adapter, runs_dir: Path, iter_index: int,
+                          limit: int = 2) -> list[dict]:
+    """§Hack-income regression screen (edit.py `_screen_hack_income`;
+    CARD arXiv:2410.14660 TPE adapted): archived exploit replays.
+
+    Scans PRIOR iteration dirs for a `reward_hacking` diagnosis whose
+    rollout is still on disk, newest first, and builds a reward replay
+    for each (≤ `limit` — replay construction is the expensive step).
+    Every failure path is skipped silently: the screen is advisory
+    hardening; a missing artifact must never block the edit."""
+    out: list[dict] = []
+    try:
+        candidates: list[tuple[int, Path]] = []
+        for d in Path(runs_dir).glob("iter_*"):
+            try:
+                k = int(d.name.split("_", 1)[1])
+            except (IndexError, ValueError):
+                continue
+            if k >= iter_index:
+                continue
+            diag = d / "diagnosis.json"
+            roll = d / "rollout"
+            if not diag.is_file() or not (roll / "trajectory.npz").is_file():
+                continue
+            try:
+                fm = (json.loads(diag.read_text(encoding="utf-8"))
+                      .get("failure_modes") or [])
+            except Exception:  # noqa: BLE001 — unreadable diagnosis skipped
+                continue
+            if "reward_hacking" in fm:
+                candidates.append((k, roll))
+        for k, roll in sorted(candidates, reverse=True)[:max(0, limit)]:
+            try:
+                replay = adapter.build_reward_replay(roll)
+            except Exception:  # noqa: BLE001 — per-replay best-effort
+                replay = None
+            if replay:
+                out.append({"label": f"iter {k}", "replay_inputs": replay})
+    except Exception:  # noqa: BLE001 — collection is best-effort
+        return out
+    return out
 
 
 # ── One iteration ────────────────────────────────────────────────────────
@@ -1270,6 +1368,13 @@ def _run_one_iter(
     iter_progress: float | None = None
     objective_progress: dict | None = None
     fitness_components: dict | None = None
+    # §Selection statistics: extra eval-rollout dirs (multi-seed) + the
+    # per-seed raw scores. Populated only when eval_seeds > 1 AND the
+    # fitness fn exposes `detail_dir`; the realism audit below extends
+    # its naturalness check over these dirs (min factor = safe direction).
+    extra_eval_dirs: list[Path] = []
+    fitness_per_seed: list[float] = []
+    progress_per_seed: list[float] = []
     if fitness_fn is not None:
         # §Ship 36 (F2): prefer the `.detail` accessor (rides on the fitness
         # fn) to get the FULL component breakdown in one compute; fall back to
@@ -1295,6 +1400,64 @@ def _run_one_iter(
                 f"{type(e).__name__}: {e} — treating as unavailable\n"
             )
             iter_fitness = None
+        # §Selection statistics (RESEARCH_GAP_ANALYSIS §7.2): the keep-best
+        # decision was previously made on ONE rollout batch — a noisy
+        # scalar compared with strict `>`. With `eval_seeds = K > 1` in
+        # [iteration], the same checkpoint is re-rolled K-1 more times on
+        # distinct seeds and the selection scores become the MEDIAN over
+        # seeds (robust to one diverged roll). The primary `rollout/` stays
+        # the diagnoser's view (keyframes / video / components); extras
+        # land in `rollout_eval_<k>/`. Each extra is best-effort: a failed
+        # re-roll is skipped, never fatal. Requires the fitness fn's
+        # `detail_dir` accessor (spec + generated metrics both have it).
+        _eval_seeds = 1
+        try:
+            _eval_seeds = max(1, int(iter_cfg.get("eval_seeds", 1) or 1))
+        except Exception:  # noqa: BLE001 — a malformed knob keeps N=1
+            _eval_seeds = 1
+        detail_dir_fn = getattr(fitness_fn, "detail_dir", None)
+        if (iter_fitness is not None and _eval_seeds > 1
+                and detail_dir_fn is not None):
+            fitness_per_seed = [float(iter_fitness)]
+            progress_per_seed = [float(iter_progress or 0.0)]
+            for k in range(1, _eval_seeds):
+                eval_dir = iter_dir / f"rollout_eval_{k}"
+                try:
+                    eval_dir.mkdir(exist_ok=True)
+                    _rollout_or_resume(
+                        adapter=adapter,
+                        iter_index=iter_index,
+                        rollout_dir=eval_dir,
+                        checkpoint_path=checkpoint_path,
+                        n_episodes=int(iter_cfg.get("rollout_episodes", 6)),
+                        max_episode_steps=iter_cfg.get("max_episode_steps"),
+                        playback_speed=iter_cfg.get("playback_speed"),
+                        render_every=iter_cfg.get("render_every"),
+                        fps=iter_cfg.get("rollout_fps"),
+                        # Deterministic, disjoint from training seeds
+                        # (config seed + iter) and the fresh-eval band
+                        # (90k+): reproducible re-rolls, distinct per k.
+                        seed=10_000 + iter_index * 100 + k,
+                    )
+                    d = detail_dir_fn(eval_dir) or {}
+                    fitness_per_seed.append(
+                        float(d.get("spec_score", 0.0) or 0.0))
+                    pr_k = d.get("progress_score")
+                    progress_per_seed.append(
+                        min(1.0, max(0.0, float(pr_k)))
+                        if (isinstance(pr_k, (int, float))
+                            and not isinstance(pr_k, bool)
+                            and math.isfinite(float(pr_k)))
+                        else 0.0)
+                    extra_eval_dirs.append(eval_dir)
+                except Exception as e:  # noqa: BLE001 — per-seed best-effort
+                    sys.stderr.write(
+                        f"[sculpt] iter {iter_index}: eval seed {k} "
+                        f"skipped — {type(e).__name__}: {e}\n")
+            if len(fitness_per_seed) > 1:
+                iter_fitness = _median(fitness_per_seed)
+                if iter_progress is not None:
+                    iter_progress = _median(progress_per_seed)
         if iter_fitness is not None:
             pf = prior_fitness or {}
             best_so_far = pf.get("best_so_far")
@@ -1313,6 +1476,13 @@ def _run_one_iter(
                 # and was reverted — so it proposes a DIFFERENT direction.
                 "reverted_to_best": reverted_to_best,
             }
+            # §Selection statistics: per-seed dispersion for the diagnoser —
+            # "fitness 0.4 (seeds: 0.0/0.4/0.9)" reads very differently from
+            # a stable 0.4; the LLM should know when behavior is bimodal.
+            if len(fitness_per_seed) > 1:
+                progress["eval_seeds"] = len(fitness_per_seed)
+                progress["fitness_per_seed"] = [
+                    round(v, 5) for v in fitness_per_seed]
             # Always emit for DISPLAY (chart/chip/A/B), even in observe mode.
             _emit_event({
                 "type": "iter_fitness",
@@ -1323,6 +1493,11 @@ def _run_one_iter(
                 "best_so_far": progress["best_so_far"],
                 "delta_vs_previous": progress["delta"],
                 "observe_only": bool(fitness_observe_only),
+                # §Selection statistics: null/absent when eval_seeds=1.
+                "eval_seeds": (len(fitness_per_seed)
+                               if len(fitness_per_seed) > 1 else None),
+                "fitness_per_seed": ([round(v, 5) for v in fitness_per_seed]
+                                     if len(fitness_per_seed) > 1 else None),
             })
             # §Ship 35: in observe mode the diagnoser must NOT see fitness —
             # the signal stays passive (no influence on the run).
@@ -1357,6 +1532,26 @@ def _run_one_iter(
         naturalness = naturalness_channel(audit_result)
         audit_result["naturalness"] = naturalness
         iter_naturalness_factor = float(naturalness.get("steer_factor", 1.0) or 1.0)
+        # §Selection statistics: when multi-seed eval ran, audit EVERY
+        # extra rollout and take the MINIMUM steer factor — the safe
+        # direction (an exploit visible on any seed earns no steer
+        # credit; median-ing naturalness would let a 1-in-K joint-limit
+        # exploit through). Best-effort per dir.
+        for _ed in extra_eval_dirs:
+            try:
+                _a = audit_rollout(
+                    trajectory_path=_ed / "trajectory.npz",
+                    limits_path=_ed / "mjcf_limits.json",
+                )
+                _f = float(
+                    naturalness_channel(_a).get("steer_factor", 1.0) or 1.0)
+                if _f < iter_naturalness_factor:
+                    iter_naturalness_factor = _f
+                    naturalness = dict(naturalness)
+                    naturalness["min_factor_source"] = _ed.name
+                    naturalness["steer_factor"] = _f
+            except Exception:  # noqa: BLE001 — extra audits advisory
+                pass
         if not fitness_observe_only:
             iter_steer_fitness = _steer_fitness(iter_fitness, naturalness)
             # §Convergence: gate the dense progress channel identically — an
@@ -1485,6 +1680,19 @@ def _run_one_iter(
                 f"[sculpt] iter {iter_index}: reward replay build skipped — "
                 f"{type(e).__name__}: {e}\n")
 
+    # §Hack-income regression screen: archived exploits (prior iters the
+    # diagnoser flagged reward_hacking) the candidate must not re-open.
+    # `hack_income_screen = false` in [iteration] disables.
+    hack_replays: list[dict] = []
+    if not dry_run and bool(iter_cfg.get("hack_income_screen", True)):
+        hack_replays = _collect_hack_replays(adapter, runs_dir, iter_index)
+        if hack_replays:
+            _emit_event({
+                "type": "hack_screen_active",
+                "iter": iter_index,
+                "exploits": [hr["label"] for hr in hack_replays],
+            })
+
     # 4. Apply edits → v<n+1>.py
     new_iter_tag = f"v{latest_n + 1}"
     new_reward_path: Path | None = None
@@ -1514,6 +1722,8 @@ def _run_one_iter(
                     fitness_fn, "metric_observables", None),
                 # §RL_SCULPTOR_AUDIT §4.4 (loop 4b): anti-collapse replay.
                 replay_inputs=replay_inputs,
+                # §Hack-income regression screen: caught exploits stay caught.
+                hack_replays=hack_replays or None,
             )
     except EditValidationError as e:
         sys.stderr.write(
@@ -1713,6 +1923,7 @@ def _run_one_iter(
         ],
         fitness_components=fitness_components,
         env_spec_trained=env_spec_trained,
+        checkpoint_path=checkpoint_path,
     )
 
 
@@ -1848,6 +2059,9 @@ def sculpt_run(
     fitness_target: Optional[float] = None,
     fitness_observe_only: bool = False,
     fitness_revert: bool = True,
+    eval_seeds: Optional[int] = None,
+    progress_epsilon: Optional[float] = None,
+    fresh_eval_seeds: Optional[int] = None,
     control_file: Optional[Path | str] = None,
     feedback_timeout: float = 3600.0,
     feedback_poll_interval: float = 2.0,
@@ -1943,6 +2157,12 @@ def sculpt_run(
         ("rollout_episodes", rollout_episodes),
         ("seed", seed),
         ("auto_adjust_physics", auto_adjust_physics),
+        # §Selection statistics: multi-seed eval + noise band + fresh
+        # re-eval of the kept best. config.toml [iteration] keys of the
+        # same names; None = config/default.
+        ("eval_seeds", eval_seeds),
+        ("progress_epsilon", progress_epsilon),
+        ("fresh_eval_seeds", fresh_eval_seeds),
     )
     # `early_stop_enabled` / `early_stop_patience` remain accepted by the
     # public function and CLI for compatibility, but metric-plateau auto-kill
@@ -1957,6 +2177,16 @@ def sculpt_run(
             f"[sculpt] CLI override: {key}={val!r}",
             file=sys.stderr, flush=True,
         )
+    # §Selection statistics: the progress-tie noise band for keep-best /
+    # revert (see `_lex_improved`/`_lex_regressed`). Default 1e-5 sits
+    # above the measured seed-noise ramp (1e-7..4e-6, audit §6) and well
+    # below every real progress signal seen (≥7.65e-3). 0.0 restores the
+    # exact strict-`>` behavior.
+    try:
+        _pe_raw = (cfg.get("iteration") or {}).get("progress_epsilon", 1e-5)
+        _progress_epsilon = max(0.0, float(1e-5 if _pe_raw is None else _pe_raw))
+    except Exception:  # noqa: BLE001 — malformed knob keeps the default
+        _progress_epsilon = 1e-5
     paths = _project_paths(config_path)
     project = paths["project"]
     rewards_dir = paths["rewards"]
@@ -2143,7 +2373,15 @@ def sculpt_run(
                 cur_key = (steer, sprog)
                 best_key = ((result.best_fitness, result.best_progress or 0.0)
                             if result.best_fitness is not None else None)
-                if best_key is None or cur_key > best_key:
+                # §Selection statistics: `progress_epsilon` (default 1e-5,
+                # config [iteration]) is the measured noise band of the
+                # dense channel — a tie-break must CLEAR it to mint a new
+                # best, and a dip inside it is a tie, not a regression
+                # (E2E run 2: two best-selections were decided by
+                # sub-display-precision seed noise; audit §6). Spec
+                # fitness comparisons are unaffected. 0.0 = old behavior.
+                if best_key is None or _lex_improved(
+                        cur_key, best_key, _progress_epsilon):
                     result.best_fitness = steer
                     result.best_progress = sprog
                     result.best_fitness_iter = outcome.iter_index
@@ -2154,7 +2392,8 @@ def sculpt_run(
                     iters_since_best = 0
                 else:
                     iters_since_best += 1
-                    strictly_regressed = cur_key < best_key
+                    strictly_regressed = _lex_regressed(
+                        cur_key, best_key, _progress_epsilon)
 
             # §Ship 36 (F1): set the next iter's edit base. If this iter set a
             # new best, keep building forward (revert_base=None — the best IS
@@ -2338,6 +2577,65 @@ def sculpt_run(
                 sys.stderr.write(
                     f"[sculpt] best env-spec repoint failed: "
                     f"{type(e).__name__}: {e}\n")
+
+    # §Selection statistics (RESEARCH_GAP_ANALYSIS §7.2d): re-evaluate the
+    # KEPT best on fresh rollout seeds never used for selection. The
+    # selected best_fitness is a max statistic over the run's evaluations
+    # (Empirical Design in RL flags report-of-max as a pitfall) — this
+    # records the unbiased number beside it. Advisory: never changes the
+    # selection, never raises; `fresh_eval_seeds = 0` disables.
+    if (fitness_fn is not None and not fitness_observe_only
+            and result.best_fitness_iter is not None):
+        try:
+            _fresh_raw = (cfg.get("iteration") or {}).get(
+                "fresh_eval_seeds", 1)
+            _fresh_n = max(0, int(1 if _fresh_raw is None else _fresh_raw))
+        except Exception:  # noqa: BLE001
+            _fresh_n = 1
+        _detail_dir_fn = getattr(fitness_fn, "detail_dir", None)
+        _best_out = next(
+            (o for o in result.completed_iters
+             if o.iter_index == result.best_fitness_iter), None)
+        if (_fresh_n > 0 and _detail_dir_fn is not None
+                and _best_out is not None
+                and _best_out.checkpoint_path is not None
+                and Path(_best_out.checkpoint_path).is_file()):
+            _fresh_scores: list[float] = []
+            for _j in range(_fresh_n):
+                _fresh_dir = _best_out.iter_dir / f"rollout_fresh_{_j}"
+                try:
+                    _fresh_dir.mkdir(exist_ok=True)
+                    _rollout_or_resume(
+                        adapter=adapter,
+                        iter_index=_best_out.iter_index,
+                        rollout_dir=_fresh_dir,
+                        checkpoint_path=Path(_best_out.checkpoint_path),
+                        n_episodes=int((cfg.get("iteration") or {}).get(
+                            "rollout_episodes", 6)),
+                        # Disjoint from training seeds and the in-loop
+                        # eval band (10k+): deterministic held-out seeds.
+                        seed=90_001 + 131 * _j,
+                    )
+                    _d = _detail_dir_fn(_fresh_dir) or {}
+                    _fresh_scores.append(
+                        float(_d.get("spec_score", 0.0) or 0.0))
+                except Exception as e:  # noqa: BLE001 — per-seed best-effort
+                    sys.stderr.write(
+                        f"[sculpt] fresh eval seed {_j} skipped — "
+                        f"{type(e).__name__}: {e}\n")
+            if _fresh_scores:
+                result.fresh_fitness_per_seed = _fresh_scores
+                result.best_fitness_fresh = _median(_fresh_scores)
+                _emit_event({
+                    "type": "best_fresh_eval",
+                    "iter": int(result.best_fitness_iter),
+                    "fitness_fresh": round(result.best_fitness_fresh, 5),
+                    "per_seed": [round(v, 5) for v in _fresh_scores],
+                    # Side-by-side: the (max-statistic) selected value.
+                    "selected_fitness": (
+                        round(result.best_fitness, 5)
+                        if result.best_fitness is not None else None),
+                })
 
     # §Ship 37: persist run-learnings to the KG case-memory so future
     # diagnoses can avoid repeating past mistakes ("the same failure can't

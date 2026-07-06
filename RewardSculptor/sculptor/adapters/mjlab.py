@@ -756,6 +756,7 @@ class MjlabAdapter(SculptorAdapter):
         fps: float | None = None,
         render_width: int | None = None,
         render_height: int | None = None,
+        seed: int | None = None,
     ) -> RolloutResult:
         """§Ship-7: accept rollout-video knobs so the UI can drive them
         without config-file edits.
@@ -767,6 +768,10 @@ class MjlabAdapter(SculptorAdapter):
           * `render_every` — capture every N-th step; 0/None = auto-cap.
           * `fps` — hard override on playback fps; 0/None = derive from
             env.step_dt * render_every / playback_speed.
+          * `seed` — §Selection statistics: deterministic eval seed so
+            repeat rollouts of the SAME checkpoint (multi-seed eval,
+            fresh-seed re-eval) sample distinct, reproducible resets.
+            None = legacy unseeded behavior.
         """
         checkpoint_path = Path(checkpoint_path).resolve()
         output_dir = Path(output_dir).resolve()
@@ -797,6 +802,8 @@ class MjlabAdapter(SculptorAdapter):
             cmd += ["--render-width", str(int(render_width))]
         if render_height is not None:
             cmd += ["--render-height", str(int(render_height))]
+        if seed is not None:
+            cmd += ["--seed", str(int(seed))]
         if self.env_spec_path:
             cmd += ["--env-spec", str(Path(self.env_spec_path).resolve())]
         elif self.env_profile:
@@ -828,6 +835,8 @@ class MjlabAdapter(SculptorAdapter):
                 options["--render-width"] = str(int(render_width))
             if render_height is not None:
                 options["--render-height"] = str(int(render_height))
+            if seed is not None:
+                options["--seed"] = str(int(seed))
             if not self.env_spec_path and self.env_profile:
                 options["--env-profile"] = self.env_profile
             rollout_inputs: dict[str, Path] = {

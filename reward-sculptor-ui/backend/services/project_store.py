@@ -27,9 +27,18 @@ from typing import Any, Iterator, Optional
 
 from filelock import FileLock, Timeout
 
-from backend.models.project import ProjectDetail, ProjectStatus, ProjectSummary
+from backend.models.project import (
+    SLUG_PATTERN,
+    ProjectDetail,
+    ProjectStatus,
+    ProjectSummary,
+)
 from backend.services import sculptor_bridge
 
+
+# Same shape the API layer enforces via SlugStr; checked here too so
+# store methods are safe against raw path-shaped input.
+_SLUG_RE = re.compile(SLUG_PATTERN)
 
 METADATA_FILE = "metadata.json"
 LOCK_FILE = ".sculptor-ui.lock"
@@ -178,6 +187,13 @@ class ProjectStore:
 
     # ── read ─────────────────────────────────────────────────────────────
     def get(self, slug: str) -> Optional[ProjectDetail]:
+        # Reject before touching the filesystem: a non-conforming slug
+        # ("..", "a/b") can never name a project, and building paths from
+        # it may land outside root — e.g. slug ".." hitting a parseable
+        # metadata.json at the parent used to raise a pydantic
+        # ValidationError (HTTP 500) instead of 404.
+        if not _SLUG_RE.fullmatch(slug):
+            return None
         metadata = self._read_metadata(slug)
         if metadata is None:
             return None

@@ -1323,5 +1323,64 @@ def export(
         typer.echo(f"[export] warning: {w}", err=True)
 
 
+# ── sculpt reference: RSI curricula from reference clips ─────────────────
+reference_app = typer.Typer(
+    help="Reference trajectories: derive RSI train-curricula from motion "
+         "clips (DeepMimic RSI; train-only, rollout evaluation untouched).")
+app.add_typer(reference_app, name="reference")
+
+
+@reference_app.command("jump")
+def reference_jump(
+    project: Path = typer.Option(
+        ..., "--project",
+        help="Project dir (clip → <project>/reference/, spec → <project>/env/)."),
+    stand_height: float = typer.Option(
+        0.78, "--stand-height", help="Standing base height in metres "
+        "(0.78 = Unitree G1)."),
+    apex_gain: float = typer.Option(
+        0.35, "--apex", help="Jump apex above standing, metres."),
+    crouch_frac: float = typer.Option(
+        0.62, "--crouch", help="Crouch depth as a fraction of stand."),
+    clip: Optional[Path] = typer.Option(
+        None, "--clip",
+        help="Existing clip .npz (e.g. converted retargeted mocap) instead "
+             "of the procedural jump."),
+    apply: bool = typer.Option(
+        True, "--apply/--no-apply",
+        help="Persist the derived RSI curriculum as the next validated "
+             "env-spec version (train scope only)."),
+) -> None:
+    """Generate (or load) a jump reference clip, print its measured phase
+    keyframes (crouch depth / takeoff vz / apex / flight time — prompt-
+    ready numbers instead of guessed thresholds), and derive a validated
+    RSI train-curriculum from its airborne states."""
+    import json as _json
+
+    from sculptor.reference import (
+        apply_reference_rsi, derive_rsi_train_keys, load_clip,
+        make_procedural_jump_clip, phase_keyframes, save_clip)
+
+    project = project.resolve()
+    if clip is not None:
+        c = load_clip(clip)
+        typer.echo(f"[reference] loaded clip: {clip}")
+    else:
+        c = make_procedural_jump_clip(
+            stand_height_m=stand_height, apex_gain_m=apex_gain,
+            crouch_frac=crouch_frac)
+        out = save_clip(project / "reference" / "jump.npz", c)
+        typer.echo(f"[reference] clip written: {out}")
+    typer.echo(_json.dumps(phase_keyframes(c), indent=2))
+    if apply:
+        path = apply_reference_rsi(project / "env", c)
+        typer.echo(
+            f"[reference] env spec written: {path} (train-only RSI + paired "
+            "sunk termination; rollout evaluation untouched)")
+    else:
+        typer.echo("[reference] derived train keys (not applied):")
+        typer.echo(_json.dumps(derive_rsi_train_keys(c), indent=2))
+
+
 if __name__ == "__main__":  # pragma: no cover
     app()

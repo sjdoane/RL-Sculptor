@@ -941,7 +941,18 @@ def make_spec_fitness_fn(spec_name: str) -> Callable[[Any], float]:
         except Exception:  # noqa: BLE001 — breakdown is advisory, never fatal
             return {}
 
+    def _detail_dir(rollout_dir: Any) -> dict:
+        # §Selection statistics: score an ARBITRARY rollout dir (multi-seed
+        # evaluation rolls into `rollout_eval_<k>/` beside the primary
+        # `rollout/`; fresh-seed re-eval into `rollout_fresh_<j>/`). Same
+        # computation as `_detail` minus the hardcoded subdir. Never raises.
+        try:
+            return compute_spec_metrics(spec_name, Path(rollout_dir))
+        except Exception:  # noqa: BLE001 — advisory, never fatal
+            return {}
+
     _fitness.detail = _detail  # type: ignore[attr-defined]
+    _fitness.detail_dir = _detail_dir  # type: ignore[attr-defined]
     # §Ship 54-pre (#12): expose the metric's held-out observable surface so the
     # sculpt loop can hand it to the shaping↔metric partition gate at the
     # reward-edit commit point (sculpt.py passes

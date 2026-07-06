@@ -102,6 +102,10 @@ function IterationSettingsSection({
     { key: "render_every", label: "render_every", type: "number", min: 1, max: 100, hint: "capture every Nth step (advanced)" },
     { key: "rollout_fps", label: "rollout_fps (override)", type: "number", step: 1, min: 1, max: 240, hint: "force playback fps (blank = auto)" },
     { key: "seed", label: "seed", type: "number", min: 0, hint: "base RNG seed; iter N uses seed + N" },
+    { key: "eval_seeds", label: "eval_seeds", type: "number", min: 1, max: 10, hint: "rollouts per iter; keep-best selects on the MEDIAN (1 = single-roll legacy)" },
+    { key: "progress_epsilon", label: "progress_epsilon", type: "number", step: 0.00001, min: 0, max: 0.1, hint: "noise band for progress tie-breaks (default 1e-5; 0 = strict)" },
+    { key: "fresh_eval_seeds", label: "fresh_eval_seeds", type: "number", min: 0, max: 10, hint: "end-of-run re-rolls of the kept best on held-out seeds (0 = off)" },
+    { key: "hack_income_screen", label: "hack_income_screen", type: "bool", hint: "reject edits that make a caught exploit MORE profitable" },
   ];
 
   const update = (key: keyof IterationSettings, raw: string | boolean) => {

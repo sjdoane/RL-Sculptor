@@ -14,10 +14,13 @@ from pydantic import AliasChoices, BaseModel, ConfigDict, Field
 
 
 # Immutable directory name; used as project primary key in URLs.
+# Single source of truth for slug shape — the store's path construction
+# relies on this rejecting path separators and dot-segments.
+SLUG_PATTERN = r"^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$"
 SlugStr = Annotated[
     str,
     Field(
-        pattern=r"^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$",
+        pattern=SLUG_PATTERN,
         min_length=1,
         max_length=64,
     ),
@@ -132,6 +135,13 @@ class IterationSettings(BaseModel):
     behavior_metrics: Optional[list[str]] = None
     rollout_episodes: Optional[Annotated[int, Field(ge=1, le=32)]] = None
     auto_adjust_physics: Optional[bool] = None
+    # §Selection statistics (RESEARCH_GAP_ANALYSIS §7.2): multi-seed
+    # evaluation, the progress-tie noise band, fresh-seed re-eval of the
+    # kept best, and the hack-income screen toggle.
+    eval_seeds: Optional[Annotated[int, Field(ge=1, le=10)]] = None
+    progress_epsilon: Optional[Annotated[float, Field(ge=0.0, le=0.1)]] = None
+    fresh_eval_seeds: Optional[Annotated[int, Field(ge=0, le=10)]] = None
+    hack_income_screen: Optional[bool] = None
     # Rollout video + RL knobs (mirror RunParams per-run overrides but
     # persisted at the project level).
     max_episode_steps: Optional[Annotated[int, Field(ge=50, le=5000)]] = None
