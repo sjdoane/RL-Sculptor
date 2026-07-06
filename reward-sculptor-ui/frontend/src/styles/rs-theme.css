@@ -298,8 +298,9 @@ input, textarea, select { font: inherit; color: inherit; }
 
 /* ---------- Runs ---------- */
 .rs-runs-layout { display: grid; grid-template-columns: minmax(208px, 264px) minmax(0, 1fr); gap: 0; height: 100%; }
-.rs-runs-side { border-right: 1px solid var(--hairline); overflow-y: auto; display: flex; flex-direction: column; }
-.rs-side-head { display: flex; align-items: center; justify-content: space-between; padding: 14px 16px; border-bottom: 1px solid var(--hairline); position: sticky; top: 0; background: var(--canvas); z-index: 2; }
+.rs-runs-side { border-right: 1px solid var(--hairline); overflow-y: auto; overflow-x: hidden; min-width: 0; display: flex; flex-direction: column; }
+/* wrap: the New mission + New run pair overflows the narrow sidebar otherwise */
+.rs-side-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px; padding: 12px 16px; border-bottom: 1px solid var(--hairline); position: sticky; top: 0; background: var(--canvas); z-index: 2; }
 .rs-side-group { font-size: 11px; font-weight: 600; letter-spacing: 0.7px; text-transform: uppercase; color: var(--rs-muted); padding: 14px 16px 6px; }
 .rs-runrow { display: flex; align-items: center; gap: 10px; padding: 10px 16px; border: 0; background: none; width: 100%; text-align: left; border-left: 2px solid transparent; }
 .rs-runrow:hover { background: var(--canvas-soft); }

@@ -226,6 +226,40 @@ export function NewRunDialog({
     }
   }, [open, project.description, defaults, behavior]);
 
+  // Single entry point for the Generate button AND the inline retry below,
+  // so the error affordance re-runs exactly what failed. The api call carries
+  // a client-side timeout scaled by n_candidates, so isPending ALWAYS
+  // resolves — no more frozen "Generating…" spinner on a dropped connection.
+  const runGenerate = () => {
+    genMetric.mutate(
+      { behavior_goal: behavior.trim(), n_candidates: metricCandidates },
+      {
+        onSuccess: (m) => {
+          if (m.accepted) {
+            setFitnessMetric(`gen:${m.id}`);
+            setFitnessMode("observe");
+            const pick = (m.n_candidates && m.n_candidates > 1
+              && m.selected_candidate != null)
+              ? ` — picked candidate ${m.selected_candidate + 1}/${m.n_candidates}`
+              : "";
+            toast.success(`Generated ${m.id} (observe-only until calibrated)${pick}`, {
+              description: m.review?.summary ?? "Validated + reviewed.",
+            });
+          } else {
+            const why = (m.reasons && m.reasons[0])
+              || (m.review?.concerns && m.review.concerns[0])
+              || "validation/review rejected it";
+            toast.error("Generated metric rejected", { description: why });
+          }
+        },
+        onError: (err) => {
+          const d = err instanceof ApiError ? err.problem.detail ?? err.problem.title : err.message;
+          toast.error("Could not generate metric", { description: d });
+        },
+      },
+    );
+  };
+
   const submit = () => {
     if (behavior.trim().length < 4) {
       toast.error("Behavior goal too short", { description: "At least 4 chars." });
@@ -308,7 +342,9 @@ export function NewRunDialog({
 
   return (
     <>
-      <Btn kind="primary" size="sm" icon="play" onClick={() => setOpen(true)}>New run</Btn>
+      {/* Reset any stale generate error from a previous open — the mutation
+          outlives the Modal (it's conditionally rendered below). */}
+      <Btn kind="primary" size="sm" icon="play" onClick={() => { genMetric.reset(); setOpen(true); }}>New run</Btn>
       {open && (
         <Modal
           title="Launch a sculpt run"
@@ -548,35 +584,7 @@ export function NewRunDialog({
                     title={metricCandidates > 1
                       ? `Sample ${metricCandidates} candidates and keep the most-discriminating one`
                       : "Auto-generate an objective metric from the behavior goal above"}
-                    onClick={() => {
-                      genMetric.mutate(
-                        { behavior_goal: behavior.trim(), n_candidates: metricCandidates },
-                        {
-                          onSuccess: (m) => {
-                            if (m.accepted) {
-                              setFitnessMetric(`gen:${m.id}`);
-                              setFitnessMode("observe");
-                              const pick = (m.n_candidates && m.n_candidates > 1
-                                && m.selected_candidate != null)
-                                ? ` — picked candidate ${m.selected_candidate + 1}/${m.n_candidates}`
-                                : "";
-                              toast.success(`Generated ${m.id} (observe-only until calibrated)${pick}`, {
-                                description: m.review?.summary ?? "Validated + reviewed.",
-                              });
-                            } else {
-                              const why = (m.reasons && m.reasons[0])
-                                || (m.review?.concerns && m.review.concerns[0])
-                                || "validation/review rejected it";
-                              toast.error("Generated metric rejected", { description: why });
-                            }
-                          },
-                          onError: (err) => {
-                            const d = err instanceof ApiError ? err.problem.detail ?? err.problem.title : err.message;
-                            toast.error("Could not generate metric", { description: d });
-                          },
-                        },
-                      );
-                    }}
+                    onClick={runGenerate}
                   >
                     {genMetric.isPending ? "Generating… (~1-2 min)" : "Generate from goal"}
                   </Btn>}
@@ -588,11 +596,36 @@ export function NewRunDialog({
                 </div>
 
                 {/* §Ship 40: live generation progress (generate → validate →
-                    regenerate-on-failure → review), polled from the backend. */}
+                    regenerate-on-failure → review), polled from the backend.
+                    Polling is keyed to isPending, so it stops the moment the
+                    mutation settles — success, error, or timeout. */}
                 {genMetric.isPending && (
                   <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, paddingLeft: 14, color: "var(--ink)" }}>
                     <Icon name="loader" size={13} />
                     <span>{genProgress.data?.message ?? "Starting generation…"}</span>
+                  </div>
+                )}
+
+                {/* A failed/timed-out generate must never strand the dialog:
+                    surface the error HERE (not just a transient toast) with a
+                    one-click retry. */}
+                {genMetric.isError && !genMetric.isPending && (
+                  <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap", fontSize: 12.5, paddingLeft: 14, color: "var(--st-rose-fg)" }}>
+                    <Icon name="alert-triangle" size={13} />
+                    <span style={{ flex: 1, minWidth: 180 }}>
+                      {genMetric.error?.name === "TimeoutError"
+                        ? "Metric generation timed out — the backend didn't respond. It may still be running; retry or pick a metric manually."
+                        : `Metric generation failed: ${genMetric.error?.message ?? "unknown error"}`}
+                    </span>
+                    <Btn
+                      kind="quiet"
+                      size="xs"
+                      icon="refresh-cw"
+                      disabled={behavior.trim().length < 4}
+                      onClick={runGenerate}
+                    >
+                      Retry
+                    </Btn>
                   </div>
                 )}
 

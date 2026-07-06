@@ -112,11 +112,20 @@ export function KnowledgeGraphTab({ slug }: { slug: string }) {
 
         <div style={{ display: "grid", gridTemplateColumns: "minmax(0,1.3fr) minmax(300px,1fr)", gap: 20, alignItems: "start" }}>
           <div className="rs-vgap-16">
-            {/* Papers */}
+            {/* Papers — title is the primary line; authors/year/arxiv-id fold
+                into one muted secondary line, and extracted-status reads as a
+                quiet badge instead of a bare icon. */}
             <div className="rs-card">
               <div className="rs-card-head">
-                <div className="rs-card-title"><Icon name="library" size={16} />Papers</div>
-                <div className="rs-flex rs-gap-8" style={{ background: "var(--canvas-soft)", border: "1px solid var(--hairline)", borderRadius: "var(--radius-md)", padding: "5px 10px", width: 230 }}>
+                <div className="rs-card-title">
+                  <Icon name="library" size={16} />Papers
+                  {paperList.length > 0 && (
+                    <span className="rs-num" style={{ color: "var(--rs-muted)", fontSize: 12, fontWeight: 400 }}>{paperList.length}</span>
+                  )}
+                </div>
+                {/* search styled to rs-input tokens (hairline-strong border,
+                    radius-md, 32px control height) */}
+                <div className="rs-flex rs-gap-8" style={{ background: "var(--canvas-soft)", border: "1px solid var(--hairline-strong)", borderRadius: "var(--radius-md)", padding: "0 11px", height: 32, width: 230, flexShrink: 0 }}>
                   <Icon name="search" size={14} color="var(--rs-muted)" />
                   <input
                     value={search}
@@ -139,20 +148,28 @@ export function KnowledgeGraphTab({ slug }: { slug: string }) {
                     key={p.id}
                     className="rs-paper"
                     onClick={() => setSelectedArxiv(p.arxiv_id)}
-                    style={{ width: "100%", textAlign: "left", background: selectedArxiv === p.arxiv_id ? "var(--surface-strong)" : "none", border: 0, borderBottom: "1px solid var(--hairline-soft)", cursor: "pointer" }}
+                    style={{ width: "100%", textAlign: "left", alignItems: "flex-start", background: selectedArxiv === p.arxiv_id ? "var(--surface-strong)" : "none", border: 0, borderBottom: "1px solid var(--hairline-soft)", cursor: "pointer" }}
                   >
-                    <span className="rs-paper-id">arXiv:<br />{p.arxiv_id}</span>
                     <div style={{ minWidth: 0, flex: 1 }}>
                       <p className="rs-paper-t">{p.title}</p>
                       <span className="rs-paper-a">
-                        {p.authors.slice(0, 3).join(", ")}{p.authors.length > 3 ? "…" : ""}{p.year ? ` · ${p.year}` : ""}
+                        {p.authors.slice(0, 3).join(", ")}{p.authors.length > 3 ? "…" : ""}
+                        {p.year ? ` · ${p.year}` : ""}
+                        {" · "}
+                        <span className="mono" style={{ color: "var(--st-blue)" }}>arXiv:{p.arxiv_id}</span>
                       </span>
                     </div>
-                    <Icon
-                      name={p.extracted ? "check-circle" : "circle"}
-                      size={15}
-                      color={p.extracted ? "var(--st-emerald)" : "var(--rs-muted-soft)"}
-                    />
+                    <span
+                      className="rs-tag"
+                      style={{ flexShrink: 0, fontSize: 10.5, ...(p.extracted
+                        ? { background: "var(--st-emerald-bg)", color: "var(--st-emerald-fg)" }
+                        : { color: "var(--rs-muted)" }) }}
+                      title={p.extracted
+                        ? "Techniques + failure modes extracted into the graph"
+                        : "Ingested — extraction hasn't run yet"}
+                    >
+                      {p.extracted ? "extracted" : "pending"}
+                    </span>
                   </button>
                 ))
               )}
@@ -172,7 +189,7 @@ export function KnowledgeGraphTab({ slug }: { slug: string }) {
                       {shown.length < techList.length ? `top ${shown.length} of ${techList.length}` : techList.length}
                     </span>
                   </div>
-                  <div style={{ padding: "12px 16px", display: "flex", gap: 8, flexWrap: "wrap", maxHeight: 240, overflowY: "auto" }}>
+                  <div style={{ padding: "16px 18px", display: "flex", gap: 9, flexWrap: "wrap", maxHeight: 240, overflowY: "auto" }}>
                     {shown.map((t) => (
                       <span key={t.id} className="rs-tag" title={t.description}>
                         {t.name}

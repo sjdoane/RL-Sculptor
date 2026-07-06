@@ -186,7 +186,9 @@ function RunSidebar({
     <div className="rs-runs-side">
       <div className="rs-side-head">
         <span className="rs-h3" style={{ fontSize: 15 }}>Runs</span>
-        <div className="rs-flex rs-gap-6">
+        {/* rs-wrap: in the narrow sidebar the pair drops to its own row
+            instead of forcing a horizontal scrollbar. */}
+        <div className="rs-flex rs-gap-6 rs-wrap">
           <NewMissionDialog slug={slug} onCreated={(s) => onOpenMissionDialog(s)} />
           <NewRunDialog slug={slug} project={project} onLaunched={onLaunchedRun} />
         </div>

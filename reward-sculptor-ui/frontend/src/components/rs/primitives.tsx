@@ -47,18 +47,23 @@ export function Badge({
 export function AuthorBadge({ author }: { author: string }) {
   const human = author === "human";
   return (
-    <span className={"rs-abadge " + (human ? "human" : "sculptor")}>
+    <span
+      className={"rs-abadge " + (human ? "human" : "sculptor")}
+      title={human
+        ? "Hand-written by a human (manual edit or saved draft)"
+        : "Written by the sculptor's diagnose-and-edit loop"}
+    >
       <Icon name={human ? "user" : "sparkles"} size={11} />
       {human ? "Human" : "Sculptor"}
     </span>
   );
 }
 
-export function Delta({ value, suffix }: { value: number | null | undefined; suffix?: string }) {
-  if (value == null) return <span className="rs-delta flat">—</span>;
+export function Delta({ value, suffix, title }: { value: number | null | undefined; suffix?: string; title?: string }) {
+  if (value == null) return <span className="rs-delta flat" title={title}>—</span>;
   const cls = value > 0 ? "up" : value < 0 ? "down" : "flat";
   const sign = value > 0 ? "+" : "";
-  return <span className={"rs-delta " + cls}>{sign}{value.toFixed(1)}{suffix ?? ""}</span>;
+  return <span className={"rs-delta " + cls} title={title}>{sign}{value.toFixed(1)}{suffix ?? ""}</span>;
 }
 
 export function FactChip({
@@ -329,6 +334,11 @@ export function Modal({
   footer?: ReactNode;
 }) {
   const ref = useRef<HTMLDivElement>(null);
+  // Scrim clicks only close when the pointer went DOWN on the scrim itself.
+  // Dragging a text selection out of the dialog and releasing on the scrim
+  // fires a click on the scrim (the common ancestor of down + up targets),
+  // which used to close every dialog app-wide mid-selection.
+  const scrimPointerDown = useRef(false);
   // Latest onClose via ref so the mount-once effect never re-binds (avoids
   // focus-thrash when the parent passes an inline arrow for onClose).
   const onCloseRef = useRef(onClose);
@@ -377,7 +387,15 @@ export function Modal({
     };
   }, []);
   return (
-    <div className="rs-scrim" onClick={onClose}>
+    <div
+      className="rs-scrim"
+      onPointerDown={(e) => { scrimPointerDown.current = e.target === e.currentTarget; }}
+      onClick={(e) => {
+        const armed = scrimPointerDown.current;
+        scrimPointerDown.current = false;
+        if (armed && e.target === e.currentTarget) onClose();
+      }}
+    >
       <div
         ref={ref}
         className={"rs-modal" + (wide ? " wide" : "") + (full ? " full" : "")}

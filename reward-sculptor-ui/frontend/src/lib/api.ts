@@ -850,11 +850,17 @@ export async function generateProjectMetric(
   body: { behavior_goal: string; review?: boolean; n_candidates?: number;
           calibrate_against?: string | null },
 ): Promise<MetricSummary> {
+  // Each candidate is a ~1-2 min LLM call plus validate/review/regenerate
+  // retries, so budget generously — but DO time out: a dropped connection or
+  // wedged backend used to leave this promise pending forever, freezing the
+  // "Generating…" spinner in NewRunDialog with no way out.
+  const timeoutMs = 5 * 60_000 * Math.max(1, body.n_candidates ?? 1);
   return handle<MetricSummary>(
     await fetch(`/api/projects/${slug}/metrics/generate`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
+      signal: AbortSignal.timeout(timeoutMs),
     }),
   );
 }

@@ -293,53 +293,38 @@ function RemoteGpuCard() {
             desc="Applies to new runs and mission stages; overrides any [remote] table in project config.toml. Rollouts stay local unless opted in below."
             label="Dispatch training remotely"
           />
-          <div className="rs-flex rs-gap-8 rs-wrap">
-            <div style={{ flex: "2 1 220px" }}>
-              <Field label="Host" htmlFor="rm-host">
-                <input id="rm-host" className="rs-input" placeholder="203.0.113.7" value={f.host}
-                  onChange={(e) => set({ host: e.target.value })} />
-              </Field>
-            </div>
-            <div style={{ flex: "0 1 110px" }}>
-              <Field label="Port" htmlFor="rm-port">
-                <input id="rm-port" className="rs-input" type="number" min={1} max={65535} value={f.port}
-                  onChange={(e) => set({ port: clampPort(e.target.value) })} />
-              </Field>
-            </div>
-            <div style={{ flex: "1 1 120px" }}>
-              <Field label="User" htmlFor="rm-user">
-                <input id="rm-user" className="rs-input" placeholder="root" value={f.user}
-                  onChange={(e) => set({ user: e.target.value })} />
-              </Field>
-            </div>
-          </div>
-          <div className="rs-flex rs-gap-8 rs-wrap">
-            <div style={{ flex: "1 1 220px" }}>
-              <Field label="SSH key path" htmlFor="rm-key">
-                <input id="rm-key" className="rs-input" placeholder="~/.ssh/id_ed25519" value={f.key_path}
-                  onChange={(e) => set({ key_path: e.target.value })} />
-              </Field>
-            </div>
-            <div style={{ flex: "1 1 220px" }}>
-              <Field label="Remote python" hint="printed by provision_remote.sh" htmlFor="rm-python">
-                <input id="rm-python" className="rs-input" value={f.remote_python}
-                  onChange={(e) => set({ remote_python: e.target.value })} />
-              </Field>
-            </div>
-          </div>
-          <div className="rs-flex rs-gap-8 rs-wrap">
-            <div style={{ flex: "1 1 220px" }}>
-              <Field label="Remote workdir" hint="/workspace/… on a network volume" htmlFor="rm-workdir">
-                <input id="rm-workdir" className="rs-input" value={f.remote_workdir}
-                  onChange={(e) => set({ remote_workdir: e.target.value })} />
-              </Field>
-            </div>
-            <div style={{ flex: "0 1 140px" }}>
-              <Field label="Pod device" hint="blank = cuda:0" htmlFor="rm-device">
-                <input id="rm-device" className="rs-input" placeholder="cuda:0" value={f.device}
-                  onChange={(e) => set({ device: e.target.value })} />
-              </Field>
-            </div>
+          {/* All connection fields share ONE grid so rows keep their columns
+              aligned when they wrap (the old per-row flex-basis mix left
+              ragged widths at narrow card sizes). */}
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(190px, 1fr))", gap: 12 }}>
+            <Field label="Host" htmlFor="rm-host">
+              <input id="rm-host" className="rs-input" placeholder="203.0.113.7" value={f.host}
+                onChange={(e) => set({ host: e.target.value })} />
+            </Field>
+            <Field label="Port" htmlFor="rm-port">
+              <input id="rm-port" className="rs-input" type="number" min={1} max={65535} value={f.port}
+                onChange={(e) => set({ port: clampPort(e.target.value) })} />
+            </Field>
+            <Field label="User" htmlFor="rm-user">
+              <input id="rm-user" className="rs-input" placeholder="root" value={f.user}
+                onChange={(e) => set({ user: e.target.value })} />
+            </Field>
+            <Field label="SSH key path" htmlFor="rm-key">
+              <input id="rm-key" className="rs-input" placeholder="~/.ssh/id_ed25519" value={f.key_path}
+                onChange={(e) => set({ key_path: e.target.value })} />
+            </Field>
+            <Field label="Remote python" hint="printed by provision_remote.sh" htmlFor="rm-python">
+              <input id="rm-python" className="rs-input" value={f.remote_python}
+                onChange={(e) => set({ remote_python: e.target.value })} />
+            </Field>
+            <Field label="Remote workdir" hint="/workspace/… on a network volume" htmlFor="rm-workdir">
+              <input id="rm-workdir" className="rs-input" value={f.remote_workdir}
+                onChange={(e) => set({ remote_workdir: e.target.value })} />
+            </Field>
+            <Field label="Pod device" hint="blank = cuda:0" htmlFor="rm-device">
+              <input id="rm-device" className="rs-input" placeholder="cuda:0" value={f.device}
+                onChange={(e) => set({ device: e.target.value })} />
+            </Field>
           </div>
           <ToggleRow
             on={f.rollout_remote}

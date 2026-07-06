@@ -28,6 +28,45 @@ import type {
 const SCULPT_LOCK_NOTE =
   "Sculpt run in progress — manual edits locked until the run completes or is stopped.";
 
+// What-is-this-page explainer for first-time users. Dismissal persists per
+// browser (localStorage), so it shows once and stays gone.
+const REWARDS_EXPLAINER_KEY = "rs.rewardsExplainer.dismissed";
+
+function RewardsExplainer() {
+  const [dismissed, setDismissed] = useState(() => {
+    try { return localStorage.getItem(REWARDS_EXPLAINER_KEY) === "1"; }
+    catch { return false; /* private mode */ }
+  });
+  if (dismissed) return null;
+  const dismiss = () => {
+    setDismissed(true);
+    try { localStorage.setItem(REWARDS_EXPLAINER_KEY, "1"); }
+    catch { /* private mode, ignore */ }
+  };
+  return (
+    <div className="rs-banner info" style={{ alignItems: "flex-start" }}>
+      <Icon name="info" size={17} />
+      <span className="rs-grow" style={{ lineHeight: 1.55 }}>
+        <b>How reward evolution works.</b> Each training iteration, the sculptor trains a policy
+        with the current reward, watches the rollout, diagnoses the failure, and writes the next
+        reward version. Versions that improve the tracked metric are kept; regressions are
+        reverted. The list below is that history — every version can be read, diffed against its
+        parent, and traced to the diagnosis that produced it. You can also fork any version by
+        hand, or ask Claude for a rewrite in the prompt box.
+      </span>
+      <button
+        className="rs-modal-x"
+        style={{ flexShrink: 0 }}
+        onClick={dismiss}
+        aria-label="Dismiss explainer"
+        title="Dismiss — won't show again"
+      >
+        <Icon name="x" size={15} />
+      </button>
+    </div>
+  );
+}
+
 export function RewardsTab({ slug, project }: { slug: string; project: ProjectDetail }) {
   // §Ship 21b/21d scope logic — preserved verbatim from the prior version.
   // When a mission_stage_run is active, the project's global rewards/v0.py
@@ -111,6 +150,7 @@ export function RewardsTab({ slug, project }: { slug: string; project: ProjectDe
   return (
     <div className="rs-scroll">
       <div className="rs-pad rs-vgap-16">
+        <RewardsExplainer />
         <PromptEditHero
           slug={slug}
           disabled={Boolean(project.adapter_unavailable) || project.ready_to_train === false}
@@ -388,10 +428,10 @@ function VersionRow({ v, selected, onSelect }: { v: RewardVersionSummary; select
     <button className={"rs-verrow" + (selected ? " on" : "")} onClick={onSelect}>
       <span className="vn">v{v.version}</span>
       <AuthorBadge author={v.author} />
-      <span className="vmetric">
+      <span className="vmetric" title="Primary metric this version's policy achieved">
         {v.primary_metric != null ? v.primary_metric.toFixed(1) : "—"}
         <br />
-        <Delta value={v.metric_delta} />
+        <Delta value={v.metric_delta} title="Metric change vs the previous version" />
       </span>
     </button>
   );
