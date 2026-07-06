@@ -612,6 +612,13 @@ def test_run_one_iter_records_applies_and_events_env_spec(
 
     # env_spec_trained recorded from the managed spec.
     assert outcome.env_spec_trained == "v0"
+    # Producer/consumer contract with sculptor.export: the exact trained
+    # spec is snapshotted into the iter dir under the name and shape
+    # list_exportable_iters / export_policy_bundle read back.
+    snap_path = proj / "runs" / "iter_0" / "env_spec.json"
+    assert snap_path.is_file()
+    snap = json.loads(snap_path.read_text())
+    assert snap["meta"]["version"] == "v0"
     # Valid edit applied → v1 written + current repointed; invalid rejected.
     cur = es.read_current_env_spec(env_dir)
     assert cur["meta"]["version"] == "v1"

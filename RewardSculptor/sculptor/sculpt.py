@@ -1167,6 +1167,20 @@ def _run_one_iter(
             _cur_spec = _read_env(env_dir)
             if _cur_spec:
                 env_spec_trained = (_cur_spec.get("meta") or {}).get("version")
+                # Snapshot the exact spec into the iter dir (parallel to
+                # reward_spec.json) so policy export / audits can recover
+                # the environment half of the training config even after
+                # the project's current.json has moved on. First write
+                # wins: on crash-resume, _train_or_resume reuses the
+                # already-trained checkpoint, and current.json may have
+                # been repointed by a later apply_env_edits — rewriting
+                # would pair the checkpoint with a spec it never saw.
+                _snap = iter_dir / "env_spec.json"
+                if not _snap.exists():
+                    _snap.write_text(
+                        json.dumps(_cur_spec, indent=2, sort_keys=True,
+                                   default=str),
+                        encoding="utf-8")
         except Exception as e:  # noqa: BLE001 — invalid spec fails later, loudly
             sys.stderr.write(
                 f"[sculpt] iter {iter_index}: env spec unreadable "

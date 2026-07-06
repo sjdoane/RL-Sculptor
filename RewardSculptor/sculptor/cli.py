@@ -1252,5 +1252,67 @@ def report(
             f"[report] panels from iters {result.selected_iter_indices}")
 
 
+@app.command()
+def export(
+    config: Path = typer.Option(
+        ..., "--config", "-c", exists=True, readable=True,
+        help="Project config.toml. The bundle lands in <project>/exports/."),
+    iter_index: Optional[int] = typer.Option(
+        None, "--iter", "-i",
+        help="Iteration to export (default: latest with a checkpoint)."),
+    out: Optional[Path] = typer.Option(
+        None, "--out", "-o",
+        help="Output zip path (default: <project>/exports/policy_<name>_iter<N>.zip)."),
+    runs_root: Optional[Path] = typer.Option(
+        None, "--runs-root",
+        help="Alternate runs/ tree, e.g. a mission stage's "
+             ".missions/<m>/stages/<s>/runs (default: <project>/runs)."),
+    list_only: bool = typer.Option(
+        False, "--list", help="List exportable iterations and exit."),
+):
+    """Export a trained policy as a self-contained deployment bundle.
+
+    The zip contains the raw checkpoint, best-effort ONNX + TorchScript
+    exports of the actor network, the exact reward version + env spec the
+    iteration trained under, the project config, metrics, and a DEPLOY.md
+    loading recipe — everything a sim-to-real pipeline needs in one file.
+    """
+    from sculptor.export import (
+        ExportError,
+        export_policy_bundle,
+        list_exportable_iters,
+    )
+
+    project = config.resolve().parent
+    root = runs_root if runs_root is not None else project / "runs"
+
+    if list_only:
+        rows = list_exportable_iters(root)
+        if not rows:
+            typer.echo(f"[export] no exportable iterations under {root}")
+            raise typer.Exit(1)
+        for r in rows:
+            metric = (
+                f"{r['primary_metric']:.2f}"
+                if r["primary_metric"] is not None else "—")
+            typer.echo(
+                f"  iter {r['iter_index']:>3}  {r['checkpoint']:<14} "
+                f"reward={r['reward_version'] or '—':<5} metric={metric}")
+        return
+
+    try:
+        result = export_policy_bundle(
+            project, iter_index=iter_index, runs_root=root, out_path=out)
+    except (ExportError, OSError) as e:
+        typer.echo(f"[export] {e}", err=True)
+        raise typer.Exit(1)
+    net = result.manifest.get("network") or {}
+    typer.echo(f"[export] wrote {result.bundle_path}")
+    if net.get("exports"):
+        typer.echo(f"[export] network exports: {', '.join(net['exports'])}")
+    for w in result.warnings:
+        typer.echo(f"[export] warning: {w}", err=True)
+
+
 if __name__ == "__main__":  # pragma: no cover
     app()
