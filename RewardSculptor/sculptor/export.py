@@ -307,25 +307,14 @@ def _export_rsl_rl_actor(
                         f"(keys: {sorted(payload)})")
         return {}
 
-    # Observation normalization is part of the policy function. If the
-    # checkpoint carries normalizer state (rsl_rl empirical_normalization),
-    # a bare-MLP export would take RAW observations where training used
-    # NORMALIZED ones — silently wrong. Refuse the nn export (safe
-    # direction) until baking the stats into the graph is implemented.
-    norm_keys = [
-        k for k in payload
-        if isinstance(k, str) and ("norm" in k.lower())
-    ] + [
-        k for k in actor_sd
-        if isinstance(k, str) and ("normalizer" in k.lower())
-    ]
-    if norm_keys:
-        warnings.append(
-            "checkpoint carries observation-normalizer state "
-            f"({sorted(set(norm_keys))}) — the ONNX/TorchScript export "
-            "would skip normalization and be numerically wrong, so only "
-            "the raw checkpoint is bundled. Apply the normalizer stats "
-            "before the MLP when deploying.")
+    # Observation normalization is part of the policy function. When the
+    # checkpoint carries rsl_rl EmpiricalNormalization state we BAKE it
+    # into the exported graph — y = (x - mean) / (std + eps), eps=1e-2,
+    # applied before the MLP exactly as rsl_rl's MLPModel does. Unknown
+    # normalizer shapes refuse the nn export (a bare-MLP export taking
+    # raw obs where training used normalized ones is silently wrong).
+    norm = _extract_obs_normalizer(payload, actor_sd, warnings)
+    if norm == "refuse":
         return {"obs_normalization": True}
 
     layers = _mlp_layers_from_state_dict(actor_sd)
@@ -355,18 +344,24 @@ def _export_rsl_rl_actor(
             "torch equivalent here — raw checkpoint only")
         return {}
 
-    model = _build_mlp(layers, activation)
+    model = _build_mlp(layers, activation, norm=norm)
     # Load only the mlp.* weights; distribution params are not part of the
     # deterministic deployment path (we export the mean action).
     mlp_sd = {k: v for k, v in actor_sd.items() if _MLP_KEY_RE.match(k)}
     try:
-        model.load_state_dict(mlp_sd, strict=True)
+        model.mlp.load_state_dict(
+            {k.removeprefix("mlp."): v for k, v in mlp_sd.items()},
+            strict=True)
     except Exception as e:  # noqa: BLE001 — degrade, never die
         warnings.append(
             f"actor weights did not load into the reconstructed MLP "
             f"({type(e).__name__}: {e}) — raw checkpoint only")
         return {}
     model.eval()
+
+    if norm is not None and not _verify_normalizer_parity(
+            model, norm, obs_dim, warnings):
+        return {"obs_normalization": True}
 
     meta: dict[str, Any] = {
         "obs_dim": obs_dim,
@@ -375,6 +370,7 @@ def _export_rsl_rl_actor(
         "activation": activation,
         "activation_assumed": activation_assumed,
         "output": "mean_action",
+        "obs_normalization_baked": norm is not None,
         "exports": [],
     }
 
@@ -451,9 +447,115 @@ _ACTIVATIONS = {
 }
 
 
-def _build_mlp(layers: list[tuple[int, int, int]], activation: str):
+_RSL_RL_NORM_EPS = 1e-2  # EmpiricalNormalization default (not in the sd)
+
+
+def _extract_obs_normalizer(payload: dict, actor_sd: dict, warnings: list):
+    """Observation-normalizer stats to bake into the export.
+
+    Returns None (no normalizer), a ``{"mean", "std"}`` dict of 1-D
+    tensors, or the string ``"refuse"`` when normalizer-ish state exists
+    but doesn't match the known rsl_rl EmpiricalNormalization shape —
+    exporting a bare MLP in that case would be silently wrong.
+    """
+    known_prefix = "obs_normalizer."
+    known = {"_mean", "_std", "_var", "count"}
+
+    embedded = {
+        k.removeprefix(known_prefix): v
+        for k, v in actor_sd.items()
+        if isinstance(k, str) and k.startswith(known_prefix)
+    }
+    payload_norm = payload.get("obs_norm_state_dict")
+    other_norm_keys = [
+        k for k in payload
+        if isinstance(k, str) and "norm" in k.lower()
+        and k != "obs_norm_state_dict"
+    ] + [
+        k for k in actor_sd
+        if isinstance(k, str) and "norm" in k.lower()
+        and not k.startswith(known_prefix)
+    ]
+
+    def _refuse(detail: str):
+        warnings.append(
+            f"checkpoint carries observation-normalizer state the exporter "
+            f"doesn't recognise ({detail}) — a bare-MLP export would be "
+            "numerically wrong, so only the raw checkpoint is bundled. "
+            "Apply the normalizer stats before the MLP when deploying.")
+        return "refuse"
+
+    if other_norm_keys:
+        return _refuse(f"keys: {sorted(set(other_norm_keys))}")
+
+    source = None
+    if embedded:
+        if not set(embedded) <= known or not {"_mean", "_std"} <= set(embedded):
+            return _refuse(f"obs_normalizer keys: {sorted(embedded)}")
+        source = embedded
+    elif isinstance(payload_norm, dict) and payload_norm:
+        stripped = {
+            (k.removeprefix(known_prefix)
+             if isinstance(k, str) else k): v
+            for k, v in payload_norm.items()
+        }
+        if not {"_mean", "_std"} <= set(stripped):
+            return _refuse(f"obs_norm_state_dict keys: {sorted(payload_norm)}")
+        source = stripped
+    if source is None:
+        return None
+    mean = source["_mean"].reshape(-1).to(dtype=_f32())
+    std = source["_std"].reshape(-1).to(dtype=_f32())
+    return {"mean": mean, "std": std}
+
+
+def _f32():
+    import torch
+
+    return torch.float32
+
+
+def _verify_normalizer_parity(
+    model, norm: dict, obs_dim: int, warnings: list,
+) -> bool:
+    """When rsl_rl is importable, check the baked (x-mean)/(std+eps) against
+    the REAL EmpiricalNormalization loaded with the same stats. Guards the
+    one un-checkpointed assumption: eps."""
+    import torch
+
+    try:
+        from rsl_rl.modules.normalization import EmpiricalNormalization
+    except ImportError:
+        warnings.append(
+            "rsl_rl not importable — baked obs normalization uses the "
+            f"documented default eps={_RSL_RL_NORM_EPS} unverified")
+        return True
+    try:
+        ref = EmpiricalNormalization(obs_dim)
+        ref._mean = norm["mean"].reshape(1, -1).clone()
+        ref._std = norm["std"].reshape(1, -1).clone()
+        x = torch.randn(4, obs_dim, generator=torch.Generator().manual_seed(1))
+        baked = (x - norm["mean"]) / (norm["std"] + _RSL_RL_NORM_EPS)
+        if not torch.allclose(ref(x), baked, atol=1e-6):
+            warnings.append(
+                "baked obs normalization disagrees with rsl_rl's "
+                "EmpiricalNormalization — raw checkpoint only")
+            return False
+    except Exception as e:  # noqa: BLE001 — parity check must not kill export
+        warnings.append(
+            f"obs-normalizer parity check errored ({type(e).__name__}: {e}) "
+            "— raw checkpoint only")
+        return False
+    return True
+
+
+def _build_mlp(
+    layers: list[tuple[int, int, int]], activation: str,
+    norm: "dict | None" = None,
+):
     """nn.Sequential whose child indices mirror the checkpoint's ``mlp.<i>``
-    keys, so ``load_state_dict`` maps 1:1 (activations occupy the gaps)."""
+    keys, so ``load_state_dict`` maps 1:1 (activations occupy the gaps).
+    ``norm`` bakes (x - mean) / (std + eps) in front of the MLP."""
     import torch.nn as nn
 
     act_cls = getattr(nn, _ACTIVATIONS.get(activation, "ELU"))
@@ -468,7 +570,7 @@ def _build_mlp(layers: list[tuple[int, int, int]], activation: str):
             mods.append(act_cls())
     model = nn.Sequential(*mods)
     # Wrap under attribute name "mlp" so keys line up.
-    return _Actor(model)
+    return _Actor(model, norm=norm)
 
 
 def _resolve_activation(project: Path, warnings: list[str]) -> tuple[str, bool]:
@@ -682,6 +784,15 @@ def _render_deploy_md(manifest: dict[str, Any]) -> str:
         "`config.toml`, and the adapter's state schema.",
         "",
     ]
+    if net.get("obs_normalization_baked"):
+        lines += [
+            "Observation normalization — `(x - mean) / (std + 0.01)`, the "
+            "rsl_rl EmpiricalNormalization the policy trained with — is "
+            "**baked into** `policy.onnx` / `policy_ts.pt`: feed them RAW "
+            "observations. The raw checkpoint keeps the normalizer as "
+            "separate state you must apply yourself.",
+            "",
+        ]
     if "policy.onnx" in (net.get("exports") or []):
         lines += [
             "## ONNX",
@@ -736,17 +847,30 @@ def _render_deploy_md(manifest: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _Actor(mlp):  # noqa: N802 — lazy-torch factory (module imports w/o torch)
+def _Actor(mlp, norm=None):  # noqa: N802 — lazy-torch factory
     """Deterministic actor head: obs -> mean action, weights under ``mlp``
-    so checkpoint keys (``mlp.<i>.weight``) load 1:1."""
+    so checkpoint keys (``mlp.<i>.weight``) load 1:1. When ``norm`` is
+    given, applies rsl_rl's (x - mean) / (std + eps) before the MLP."""
+    import torch
     import torch.nn as nn
 
     class Actor(nn.Module):
         def __init__(self, seq: nn.Sequential):
             super().__init__()
             self.mlp = seq
+            self.normalize = norm is not None
+            if norm is not None:
+                self.register_buffer("obs_mean", norm["mean"].clone())
+                self.register_buffer("obs_std", norm["std"].clone())
+            else:
+                # Registered regardless so TorchScript tracing sees stable
+                # attribute types; unused when normalize is False.
+                self.register_buffer("obs_mean", torch.zeros(1))
+                self.register_buffer("obs_std", torch.ones(1))
 
         def forward(self, obs):
+            if self.normalize:
+                obs = (obs - self.obs_mean) / (self.obs_std + _RSL_RL_NORM_EPS)
             return self.mlp(obs)
 
     return Actor(mlp)

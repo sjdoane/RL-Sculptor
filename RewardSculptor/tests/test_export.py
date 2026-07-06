@@ -305,13 +305,59 @@ def test_non_dict_payload_bundles_raw(tmp_path):
     assert res.manifest["network"] == {}
 
 
-def test_obs_normalizer_refuses_network_export(tmp_path):
-    """Normalizer state in the checkpoint means the bare MLP would take raw
-    obs where training used normalized ones — must refuse, not guess."""
+def test_known_obs_normalizer_is_baked_into_export(tmp_path):
+    """rsl_rl EmpiricalNormalization state embedded in the actor sd must be
+    BAKED into the exported graph: TS(raw obs) == MLP(normalizer(raw obs))
+    computed with the real rsl_rl module."""
+    torch = pytest.importorskip("torch")
+    rsl_norm = pytest.importorskip("rsl_rl.modules.normalization")
+    import torch.nn as nn
+
+    project = _make_project(tmp_path, checkpoint=None)
+    ckpt = torch.load(GO1_CKPT, map_location="cpu", weights_only=False)
+    gen = torch.Generator().manual_seed(7)
+    mean = torch.randn(48, generator=gen)
+    std = torch.rand(48, generator=gen) + 0.5
+    ckpt["actor_state_dict"] = dict(ckpt["actor_state_dict"])
+    ckpt["actor_state_dict"]["obs_normalizer._mean"] = mean.reshape(1, -1)
+    ckpt["actor_state_dict"]["obs_normalizer._std"] = std.reshape(1, -1)
+    ckpt["actor_state_dict"]["obs_normalizer._var"] = (std ** 2).reshape(1, -1)
+    ckpt["actor_state_dict"]["obs_normalizer.count"] = torch.tensor(100)
+    torch.save(ckpt, project / "runs" / "iter_0" / "checkpoint.pt")
+
+    res = export_policy_bundle(project)
+    assert res.manifest["network"]["obs_normalization_baked"] is True
+    with zipfile.ZipFile(res.bundle_path) as zf:
+        names = set(zf.namelist())
+        zf.extractall(tmp_path / "unpacked")
+    assert {"policy.onnx", "policy_ts.pt"} <= names
+
+    # Reference: REAL rsl_rl normalizer + hand-built MLP.
+    ref_norm = rsl_norm.EmpiricalNormalization(48)
+    ref_norm._mean = mean.reshape(1, -1).clone()
+    ref_norm._std = std.reshape(1, -1).clone()
+    ref_mlp = nn.Sequential(
+        nn.Linear(48, 512), nn.ELU(),
+        nn.Linear(512, 256), nn.ELU(),
+        nn.Linear(256, 128), nn.ELU(),
+        nn.Linear(128, 12))
+    ref_mlp.load_state_dict({
+        k.removeprefix("mlp."): v
+        for k, v in ckpt["actor_state_dict"].items()
+        if k.startswith("mlp.")})
+    ts = torch.jit.load(str(tmp_path / "unpacked" / "policy_ts.pt")).eval()
+    obs = torch.randn(8, 48, generator=torch.Generator().manual_seed(0))
+    with torch.no_grad():
+        assert torch.allclose(ts(obs), ref_mlp(ref_norm(obs)), atol=1e-6)
+
+
+def test_unknown_normalizer_refuses_network_export(tmp_path):
+    """Normalizer-ish state the exporter doesn't recognise → raw-only, never
+    a bare-MLP guess."""
     torch = pytest.importorskip("torch")
     project = _make_project(tmp_path, checkpoint=None)
     ckpt = torch.load(GO1_CKPT, map_location="cpu", weights_only=False)
-    ckpt["obs_norm_state_dict"] = {"mean": torch.zeros(48)}
+    ckpt["critic_obs_norm_stats"] = {"mean": torch.zeros(48)}
     torch.save(ckpt, project / "runs" / "iter_0" / "checkpoint.pt")
     res = export_policy_bundle(project)
     assert res.manifest["network"] == {"obs_normalization": True}
