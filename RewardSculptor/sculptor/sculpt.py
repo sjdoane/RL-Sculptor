@@ -986,6 +986,49 @@ def _rollout_or_resume(
     )
 
 
+def _collect_hack_replays(adapter, runs_dir: Path, iter_index: int,
+                          limit: int = 2) -> list[dict]:
+    """§Hack-income regression screen (edit.py `_screen_hack_income`;
+    CARD arXiv:2410.14660 TPE adapted): archived exploit replays.
+
+    Scans PRIOR iteration dirs for a `reward_hacking` diagnosis whose
+    rollout is still on disk, newest first, and builds a reward replay
+    for each (≤ `limit` — replay construction is the expensive step).
+    Every failure path is skipped silently: the screen is advisory
+    hardening; a missing artifact must never block the edit."""
+    out: list[dict] = []
+    try:
+        candidates: list[tuple[int, Path]] = []
+        for d in Path(runs_dir).glob("iter_*"):
+            try:
+                k = int(d.name.split("_", 1)[1])
+            except (IndexError, ValueError):
+                continue
+            if k >= iter_index:
+                continue
+            diag = d / "diagnosis.json"
+            roll = d / "rollout"
+            if not diag.is_file() or not (roll / "trajectory.npz").is_file():
+                continue
+            try:
+                fm = (json.loads(diag.read_text(encoding="utf-8"))
+                      .get("failure_modes") or [])
+            except Exception:  # noqa: BLE001 — unreadable diagnosis skipped
+                continue
+            if "reward_hacking" in fm:
+                candidates.append((k, roll))
+        for k, roll in sorted(candidates, reverse=True)[:max(0, limit)]:
+            try:
+                replay = adapter.build_reward_replay(roll)
+            except Exception:  # noqa: BLE001 — per-replay best-effort
+                replay = None
+            if replay:
+                out.append({"label": f"iter {k}", "replay_inputs": replay})
+    except Exception:  # noqa: BLE001 — collection is best-effort
+        return out
+    return out
+
+
 # ── One iteration ────────────────────────────────────────────────────────
 def _read_control_file(control_file: Optional[Path]) -> dict:
     """§Ship 39 (H1): read the interactive control sidecar (mode / resume /
@@ -1617,6 +1660,19 @@ def _run_one_iter(
                 f"[sculpt] iter {iter_index}: reward replay build skipped — "
                 f"{type(e).__name__}: {e}\n")
 
+    # §Hack-income regression screen: archived exploits (prior iters the
+    # diagnoser flagged reward_hacking) the candidate must not re-open.
+    # `hack_income_screen = false` in [iteration] disables.
+    hack_replays: list[dict] = []
+    if not dry_run and bool(iter_cfg.get("hack_income_screen", True)):
+        hack_replays = _collect_hack_replays(adapter, runs_dir, iter_index)
+        if hack_replays:
+            _emit_event({
+                "type": "hack_screen_active",
+                "iter": iter_index,
+                "exploits": [hr["label"] for hr in hack_replays],
+            })
+
     # 4. Apply edits → v<n+1>.py
     new_iter_tag = f"v{latest_n + 1}"
     new_reward_path: Path | None = None
@@ -1646,6 +1702,8 @@ def _run_one_iter(
                     fitness_fn, "metric_observables", None),
                 # §RL_SCULPTOR_AUDIT §4.4 (loop 4b): anti-collapse replay.
                 replay_inputs=replay_inputs,
+                # §Hack-income regression screen: caught exploits stay caught.
+                hack_replays=hack_replays or None,
             )
     except EditValidationError as e:
         sys.stderr.write(

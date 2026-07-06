@@ -207,3 +207,107 @@ def test_base_adapter_replay_defaults_to_none(tmp_path: Path) -> None:
 
     adapter = GymSB3Adapter(env_id="Hopper-v4", n_envs=1)
     assert adapter.build_reward_replay(tmp_path) is None
+
+
+# ── §Hack-income regression screen (_screen_hack_income) ──────────────────
+from sculptor.edit import _screen_hack_income  # noqa: E402
+
+
+def _exploit_paying(scale: float):
+    """Toy reward paying a flat `scale`/step on the exploit frames."""
+    def fn(state, action, next_state, info):
+        n = action.shape[0]
+        tuck = torch.full((n,), scale)
+        return tuck, {"tuck_reward": tuck}
+    return fn
+
+
+def _hack_entry(batch, parent_scale: float | None = 1.0, label="iter 1"):
+    parent = (
+        _replay_reward_summary(_module_with(_exploit_paying(parent_scale)), batch)
+        if parent_scale is not None else None)
+    return {"label": label, "replay_inputs": batch, "parent_summary": parent}
+
+
+def test_hack_screen_rejects_raised_exploit_income() -> None:
+    batch = _replay_batch()
+    with pytest.raises(EditValidationError, match="hack-income screen"):
+        _screen_hack_income(
+            _module_with(_exploit_paying(2.0)), [_hack_entry(batch)])
+
+
+def test_hack_screen_message_names_exploit_and_component() -> None:
+    batch = _replay_batch()
+    with pytest.raises(EditValidationError, match="iter 7"):
+        _screen_hack_income(
+            _module_with(_exploit_paying(2.0)),
+            [_hack_entry(batch, label="iter 7")])
+    with pytest.raises(EditValidationError, match="tuck_reward"):
+        _screen_hack_income(
+            _module_with(_exploit_paying(2.0)), [_hack_entry(batch)])
+
+
+def test_hack_screen_passes_equal_or_reduced_income() -> None:
+    batch = _replay_batch()
+    # Equal pay (within tolerance) and REDUCED pay both pass — the rule is
+    # "never make a caught exploit MORE profitable", not "starve it".
+    _screen_hack_income(_module_with(_exploit_paying(1.0)), [_hack_entry(batch)])
+    _screen_hack_income(_module_with(_exploit_paying(0.2)), [_hack_entry(batch)])
+
+
+def test_hack_screen_tolerance_band() -> None:
+    batch = _replay_batch()
+    # parent 1.0 → allowed = 1.0 + max(0.05, 0.10·1.0) = 1.10.
+    _screen_hack_income(_module_with(_exploit_paying(1.09)), [_hack_entry(batch)])
+    with pytest.raises(EditValidationError):
+        _screen_hack_income(
+            _module_with(_exploit_paying(1.2)), [_hack_entry(batch)])
+
+
+def test_hack_screen_no_evidence_paths_pass() -> None:
+    batch = _replay_batch()
+    mod = _module_with(_exploit_paying(9.0))
+    _screen_hack_income(mod, None)                        # screen off
+    _screen_hack_income(mod, [])                          # nothing caught
+    _screen_hack_income(mod, [_hack_entry(batch, parent_scale=None)])  # no parent
+    # Candidate without a batched path → unreplayable → no evidence → pass.
+    _screen_hack_income(types.ModuleType("empty"), [_hack_entry(batch)])
+
+
+# ── sculpt._collect_hack_replays ───────────────────────────────────────────
+def test_collect_hack_replays_selects_recent_prior_hacks(tmp_path: Path) -> None:
+    import json as _json
+
+    from sculptor.sculpt import _collect_hack_replays
+
+    runs = tmp_path / "runs"
+    def mk(i: int, modes: list, with_traj: bool = True) -> None:
+        d = runs / f"iter_{i}"
+        (d / "rollout").mkdir(parents=True)
+        (d / "diagnosis.json").write_text(
+            _json.dumps({"failure_modes": modes}), encoding="utf-8")
+        if with_traj:
+            (d / "rollout" / "trajectory.npz").write_text("x", encoding="utf-8")
+
+    mk(0, ["reward_hacking"])                       # oldest hack
+    mk(1, ["static_equilibrium"])                   # not a hack
+    mk(2, ["reward_hacking", "component_imbalance"])
+    mk(3, ["reward_hacking"], with_traj=False)      # rollout gone → skipped
+    mk(5, ["reward_hacking"])                       # >= current iter → excluded
+
+    class _Adapter:
+        def build_reward_replay(self, roll):
+            return ("s", "a", "n", {"src": str(roll)})
+
+    out = _collect_hack_replays(_Adapter(), runs, iter_index=4, limit=2)
+    assert [hr["label"] for hr in out] == ["iter 2", "iter 0"]
+
+    # limit=1 keeps only the newest caught exploit.
+    out1 = _collect_hack_replays(_Adapter(), runs, iter_index=4, limit=1)
+    assert [hr["label"] for hr in out1] == ["iter 2"]
+
+    class _NoReplayAdapter:
+        def build_reward_replay(self, roll):
+            return None
+
+    assert _collect_hack_replays(_NoReplayAdapter(), runs, iter_index=4) == []
