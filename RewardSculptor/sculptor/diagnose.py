@@ -437,7 +437,15 @@ def _render_kg_context(matches: list[TechniqueMatch]) -> str:
         "",
     ]
     for m in matches:
-        lines.append(f"## {m.technique.name} {evidence_tag(m.technique.provenance)}")
+        # `provenance` is a NEW field (agentic-data upgrade 1) — read it
+        # defensively so Technique-shaped objects that predate it (duck-
+        # typed fakes, older pickled rows) degrade to the least-trusted
+        # tag instead of crashing the whole diagnose context build
+        # (evidence_tag(None) → llm-inferred tier by design).
+        lines.append(
+            f"## {m.technique.name} "
+            f"{evidence_tag(getattr(m.technique, 'provenance', None))}"
+        )
         lines.append(f"- source: {m.paper_citation}")
         if m.matched_on:
             lines.append(f"- matched_on: {m.matched_on}")

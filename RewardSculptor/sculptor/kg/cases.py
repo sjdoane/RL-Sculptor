@@ -373,6 +373,10 @@ def _render_case_context(matches: list[CaseMatch]) -> str:
         lines.append(
             f"- {_VERDICT_MARK.get(c.verdict, '[?]')} {c.edit_summary} "
             f"(task: {c.task[:60]}; sim {m.relevance_score:.2f}) "
-            f"{evidence_tag(c.provenance)}"
+            # `provenance` is a NEW field (agentic-data upgrade 1) — same
+            # defensive getattr as diagnose._render_kg_context so a case
+            # object lacking it degrades to the least-trusted tag
+            # (evidence_tag(None) → llm-inferred tier) instead of crashing.
+            f"{evidence_tag(getattr(c, 'provenance', None))}"
         )
     return "\n".join(lines)
