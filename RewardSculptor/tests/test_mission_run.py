@@ -601,6 +601,128 @@ def test_mission_run_happy_path_two_stages_both_succeed(
     assert "stage_succeeded" in types
 
 
+def test_mission_run_forwards_per_launch_knobs_to_each_stage(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """§MISSION_RUN_PARITY: the NewRunDialog-parity knobs threaded through
+    mission_run reach EVERY stage's training:
+
+      * rollout-video knobs (rollout_episodes / max_episode_steps /
+        playback_speed / render_width / render_height) forward as
+        sculpt_run kwargs.
+      * edit_candidates is injected into the stage's
+        [iteration].edit_candidates (sculpt_run has no kwarg for it).
+      * num_envs / device are injected into [adapter].config.
+    """
+    from sculptor import sculpt as sculpt_mod
+
+    m = _make_mission(tmp_path, n_stages=2)
+
+    captured_kwargs: list[dict] = []
+    base_fake = _fake_sculpt_run_factory(metric=0.9)
+
+    def capturing_fake(**kw):
+        captured_kwargs.append(dict(kw))
+        return base_fake(**kw)
+
+    monkeypatch.setattr(sculpt_mod, "sculpt_run", capturing_fake)
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
+    )
+
+    events: list[dict] = []
+    result = sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab", kg_store=None, on_event=events.append,
+        edit_candidates=3,
+        rollout_episodes=8,
+        max_episode_steps=750,
+        playback_speed=0.5,
+        render_width=960,
+        render_height=540,
+        num_envs=1024,
+        device="cuda:1",
+    )
+    assert result.completed is True
+
+    # Both stages saw the video knobs as sculpt_run kwargs.
+    assert len(captured_kwargs) == 2
+    for kw in captured_kwargs:
+        assert kw["rollout_episodes"] == 8
+        assert kw["max_episode_steps"] == 750
+        assert kw["playback_speed"] == 0.5
+        assert kw["render_width"] == 960
+        assert kw["render_height"] == 540
+
+    # edit_candidates + num_envs/device injected into each stage config.
+    mission_dir = Path(m.mission_dir)
+    for stage in m.stages:
+        cfg_text = (
+            mission_dir / "stages" / stage.name / "config.toml"
+        ).read_text()
+        assert "edit_candidates = 3" in cfg_text
+        try:
+            import tomllib
+        except ModuleNotFoundError:  # pragma: no cover — py310
+            import tomli as tomllib  # type: ignore[no-redef]
+        cfg = tomllib.loads(cfg_text)
+        assert cfg["iteration"]["edit_candidates"] == 3
+        assert cfg["adapter"]["config"]["num_envs"] == 1024
+        assert cfg["adapter"]["config"]["device"] == "cuda:1"
+
+    # The override event fired per stage.
+    override_events = [
+        e for e in events if e["type"] == "stage_run_overrides_applied"
+    ]
+    assert len(override_events) == 2
+    assert override_events[0]["edit_candidates"] == 3
+
+
+def test_mission_run_per_launch_knobs_omitted_is_byte_identical(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """§MISSION_RUN_PARITY: with none of the new knobs set, the stage
+    config is untouched and sculpt_run sees None for every video knob —
+    a plain mission run must stay byte-identical to pre-parity behavior.
+    """
+    from sculptor import sculpt as sculpt_mod
+
+    m = _make_mission(tmp_path, n_stages=1)
+    mission_dir = Path(m.mission_dir)
+    cfg_path = mission_dir / "stages" / "stage_0" / "config.toml"
+    before = cfg_path.read_text()
+
+    captured_kwargs: list[dict] = []
+    base_fake = _fake_sculpt_run_factory(metric=0.9)
+
+    def capturing_fake(**kw):
+        captured_kwargs.append(dict(kw))
+        return base_fake(**kw)
+
+    monkeypatch.setattr(sculpt_mod, "sculpt_run", capturing_fake)
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
+    )
+
+    events: list[dict] = []
+    sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab", kg_store=None, on_event=events.append,
+    )
+
+    # Config untouched (byte-for-byte).
+    assert cfg_path.read_text() == before
+    # No override event.
+    assert not [
+        e for e in events if e["type"] == "stage_run_overrides_applied"
+    ]
+    # sculpt_run saw None for every parity video knob.
+    assert len(captured_kwargs) == 1
+    for key in (
+        "rollout_episodes", "max_episode_steps", "playback_speed",
+        "render_width", "render_height",
+    ):
+        assert captured_kwargs[0].get(key) is None
+
+
 def test_mission_run_per_stage_steering_metric(
     tmp_path: Path, monkeypatch, stub_adapter,
 ):

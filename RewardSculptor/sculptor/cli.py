@@ -1139,6 +1139,38 @@ def mission_run_cli(
             "Default 5%."
         ),
     ),
+    # §MISSION_RUN_PARITY: per-launch knobs mirrored from `sculpt run` so a
+    # mission reaches parity with a standalone run. Each applies uniformly
+    # to EVERY stage; None = the stage's inherited config value wins.
+    edit_candidates: Optional[int] = typer.Option(
+        None, "--edit-candidates", min=1, max=5,
+        help="Best-of-K framed reward-edit candidates per diagnosis, per "
+             "stage (offline-screened; only the winner trains). Injected "
+             "into each stage's [iteration].edit_candidates. Omit = 1."),
+    rollout_episodes: Optional[int] = typer.Option(
+        None, "--rollout-episodes", min=1, max=32,
+        help="Rollout episodes captured per iter for behavior metrics, "
+             "per stage. Omit = inherited [iteration] value (default 6)."),
+    max_episode_steps: Optional[int] = typer.Option(
+        None, "--max-episode-steps", min=50, max=5000,
+        help="Rollout env steps per episode, per stage. Omit = default 500."),
+    playback_speed: Optional[float] = typer.Option(
+        None, "--playback-speed", min=0.1, max=10.0,
+        help="Rollout video speed multiplier, per stage; 1.0 = real-time."),
+    render_width: Optional[int] = typer.Option(
+        None, "--render-width",
+        help="Rollout video width px, per stage (default 1280)."),
+    render_height: Optional[int] = typer.Option(
+        None, "--render-height",
+        help="Rollout video height px, per stage (default 720)."),
+    num_envs: Optional[int] = typer.Option(
+        None, "--num-envs", min=1, max=8192,
+        help="Override [adapter].config.num_envs for every stage (mjlab). "
+             "Drop if a stage OOMs. Omit = inherited value."),
+    device: Optional[str] = typer.Option(
+        None, "--device",
+        help="Override [adapter].config.device for every stage (mjlab), "
+             "e.g. cuda:0 / cpu. Omit = inherited value."),
     # §Ship 34: fitness-in-the-loop for every stage (uniform spec metric).
     fitness_metric: Optional[str] = typer.Option(
         None, "--fitness-metric",
@@ -1264,6 +1296,15 @@ def mission_run_cli(
             fitness_patience=fitness_patience,
             fitness_observe_only=(fitness_mode == "observe"),
             fitness_revert=fitness_revert,
+            # §MISSION_RUN_PARITY: per-launch knobs → every stage.
+            edit_candidates=edit_candidates,
+            rollout_episodes=rollout_episodes,
+            max_episode_steps=max_episode_steps,
+            playback_speed=playback_speed,
+            render_width=render_width,
+            render_height=render_height,
+            num_envs=num_envs,
+            device=device,
         )
     finally:
         kg_store.close()

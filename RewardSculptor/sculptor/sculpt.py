@@ -3190,6 +3190,115 @@ def _inherit_parent_adapter_config(
     return True
 
 
+def _toml_scalar(v: Any) -> str:
+    """Serialize a primitive/list as a TOML literal. Mirrors the
+    inline-table style `sculpt_init` / the backend's set_adapter_section
+    emit (sculptor deliberately avoids a `tomli_w` dependency; the
+    configs we touch are flat/inline-table only)."""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return str(v)
+    if isinstance(v, str):
+        return '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    if isinstance(v, list):
+        return "[" + ", ".join(_toml_scalar(x) for x in v) + "]"
+    if v is None:
+        return '""'
+    return _toml_scalar(str(v))
+
+
+def _apply_stage_run_overrides(
+    stage_config: Path,
+    *,
+    edit_candidates: Optional[int] = None,
+    num_envs: Optional[int] = None,
+    device: Optional[str] = None,
+) -> None:
+    """§MISSION_RUN_PARITY: inject per-launch knobs that have no
+    sculpt_run keyword into the stage's config.toml AFTER it's
+    scaffolded + inherited the parent's sections.
+
+      * `edit_candidates` → an `edit_candidates = N` line under
+        `[iteration]` (read by `_run_one_iter` via
+        `iter_cfg.get("edit_candidates", 1)`). Flat key, upserted.
+      * `num_envs` / `device` → the `[adapter].config` inline table
+        (mjlab reads these; they are NOT sculpt_run kwargs). Parsed via
+        tomllib + re-emitted so the mjlab inline-table form survives.
+
+    All-None is a no-op (a plain mission run stays byte-identical). Best
+    effort: a malformed config is left untouched — load_adapter surfaces
+    the original error downstream, exactly as before this override."""
+    if edit_candidates is None and num_envs is None and device is None:
+        return
+    if not stage_config.is_file():
+        return
+    try:
+        text = stage_config.read_text(encoding="utf-8")
+    except OSError:
+        return
+
+    # ── [iteration].edit_candidates (flat key upsert) ──
+    if edit_candidates is not None:
+        body = _extract_toml_section(text, "iteration")
+        if body is None:
+            # No [iteration] section (unusual — the template has one).
+            # Append a fresh one so the knob is honored.
+            text = (
+                text.rstrip("\n")
+                + f"\n\n[iteration]\nedit_candidates = {int(edit_candidates)}\n"
+            )
+        else:
+            line = f"edit_candidates = {int(edit_candidates)}\n"
+            pat = re.compile(r"^\s*edit_candidates\s*=.*$", re.MULTILINE)
+            if pat.search(body):
+                new_body = pat.sub(line.rstrip("\n"), body, count=1)
+            else:
+                new_body = body.rstrip("\n") + "\n" + line
+            text = _replace_toml_section(text, "iteration", new_body)
+
+    # ── [adapter].config.{num_envs,device} (inline-table re-emit) ──
+    if num_envs is not None or device is not None:
+        try:
+            try:
+                import tomllib
+            except ModuleNotFoundError:  # pragma: no cover — py310
+                import tomli as tomllib  # type: ignore[no-redef]
+            cfg = tomllib.loads(text)
+            adapter = cfg.get("adapter") or {}
+            adapter_class = adapter.get("class") or ""
+            inner = dict(adapter.get("config") or {})
+            if num_envs is not None:
+                inner["num_envs"] = int(num_envs)
+            if device is not None:
+                inner["device"] = str(device)
+            inline = (
+                "{ " + ", ".join(
+                    f"{k} = {_toml_scalar(v)}" for k, v in inner.items()
+                ) + " }"
+                if inner else "{}"
+            )
+            new_block = (
+                f'[adapter]\nclass = "{adapter_class}"\nconfig = {inline}\n'
+            )
+            # Replace the entire [adapter] section (header → next section
+            # header or EOF). Mirrors project_store.set_adapter_section.
+            pat = re.compile(
+                r"^\[adapter\].*?(?=^\[[^\]]+\]|\Z)",
+                re.MULTILINE | re.DOTALL,
+            )
+            text, n = pat.subn(new_block + "\n", text, count=1)
+            if n == 0:
+                text = text.rstrip() + "\n\n" + new_block
+        except Exception:  # noqa: BLE001 — malformed config: leave as-is.
+            pass
+
+    try:
+        stage_config.write_text(text, encoding="utf-8")
+    except OSError:
+        pass
+
+
 def sculpt_init(project_dir: Path | str, adapter: str) -> Path:
     """Scaffold a new Sculptor project. Returns the created project dir."""
     project_dir = Path(project_dir).resolve()
@@ -3355,6 +3464,17 @@ def mission_run(
     fitness_patience: int = 2,
     fitness_observe_only: bool = False,
     fitness_revert: bool = True,
+    # §MISSION_RUN_PARITY: per-launch knobs mirrored from NewRunDialog and
+    # applied uniformly to EVERY stage's training. All None = the stage's
+    # inherited config wins (a plain mission run stays byte-identical).
+    edit_candidates: Optional[int] = None,
+    rollout_episodes: Optional[int] = None,
+    max_episode_steps: Optional[int] = None,
+    playback_speed: Optional[float] = None,
+    render_width: Optional[int] = None,
+    render_height: Optional[int] = None,
+    num_envs: Optional[int] = None,
+    device: Optional[str] = None,
 ):
     """§Ship-19d Goals A + B: optional adaptive iteration control.
 
@@ -3620,6 +3740,15 @@ def mission_run(
                 fitness_patience=fitness_patience,
                 fitness_observe_only=fitness_observe_only,
                 fitness_revert=fitness_revert,
+                # §MISSION_RUN_PARITY: forward the per-launch knobs.
+                edit_candidates=edit_candidates,
+                rollout_episodes=rollout_episodes,
+                max_episode_steps=max_episode_steps,
+                playback_speed=playback_speed,
+                render_width=render_width,
+                render_height=render_height,
+                num_envs=num_envs,
+                device=device,
             )
             result.stage_results.append(stage_res)
 
@@ -4003,6 +4132,17 @@ def _run_one_stage(
     fitness_patience: int = 2,
     fitness_observe_only: bool = False,
     fitness_revert: bool = True,
+    # §MISSION_RUN_PARITY: per-launch knobs mirrored from NewRunDialog so
+    # a mission run reaches parity with a standalone sculpt run. All
+    # None = defer to the stage's inherited [iteration]/[adapter] config.
+    edit_candidates: Optional[int] = None,
+    rollout_episodes: Optional[int] = None,
+    max_episode_steps: Optional[int] = None,
+    playback_speed: Optional[float] = None,
+    render_width: Optional[int] = None,
+    render_height: Optional[int] = None,
+    num_envs: Optional[int] = None,
+    device: Optional[str] = None,
 ):
     """Helper called by `mission_run` per stage. Kept separate so the
     orchestrator stays readable — `mission_run` is about flow; this
@@ -4010,7 +4150,17 @@ def _run_one_stage(
 
     §Ship 34: `fitness_fn`/`fitness_target`/`fitness_patience` are
     forwarded verbatim to this stage's sculpt_run call(s) so the stage's
-    inner loop is fitness-guided (None = blind, unchanged)."""
+    inner loop is fitness-guided (None = blind, unchanged).
+
+    §MISSION_RUN_PARITY: the video/rollout knobs (`rollout_episodes`,
+    `max_episode_steps`, `playback_speed`, `render_width`,
+    `render_height`) are passed straight through to sculpt_run (which
+    merges them into [iteration]). `edit_candidates` (best-of-K edit
+    search) has no sculpt_run kwarg, so it is injected into the stage's
+    [iteration] config after scaffolding; `num_envs`/`device` are
+    injected into the stage's [adapter] config (they live there, not in
+    sculpt_run's signature). All None = the stage's inherited config
+    value wins, so a plain mission run is byte-identical."""
     from sculptor.mission_runtime import (
         CriterionEvalError,
         StageResult,
@@ -4172,6 +4322,25 @@ def _run_one_stage(
                 stage, "adapter_mismatch",
                 f"{type(e).__name__}: {e}", emit,
             )
+
+    # §MISSION_RUN_PARITY: inject per-launch knobs that sculpt_run has no
+    # kwarg for (edit_candidates → [iteration]; num_envs/device →
+    # [adapter].config). Runs on BOTH the fresh-scaffold and resume paths
+    # so a resumed stage still honors the override. All-None = no-op.
+    if edit_candidates is not None or num_envs is not None or device is not None:
+        _apply_stage_run_overrides(
+            stage_dir / "config.toml",
+            edit_candidates=edit_candidates,
+            num_envs=num_envs,
+            device=device,
+        )
+        emit({
+            "type": "stage_run_overrides_applied",
+            "stage_name": stage.name,
+            "edit_candidates": edit_candidates,
+            "num_envs": num_envs,
+            "device": device,
+        })
 
     # 2.5 §JUMP_SCAFFOLD: decomposer-flagged reference-state
     # initialization. Derive a validated TRAIN-ONLY RSI curriculum from
@@ -4335,6 +4504,14 @@ def _run_one_stage(
             iterations=max_iters,
             steps_per_iter=steps_per_iter,
             seed=seed,
+            # §MISSION_RUN_PARITY: rollout-video knobs forwarded straight
+            # through (sculpt_run merges them into [iteration]). None =
+            # inherited config wins.
+            max_episode_steps=max_episode_steps,
+            playback_speed=playback_speed,
+            render_width=render_width,
+            render_height=render_height,
+            rollout_episodes=rollout_episodes,
             init_policy_path=warm_start_path,
             per_iter_callback=per_iter_cb,
             fitness_fn=fitness_fn,
@@ -4437,6 +4614,13 @@ def _run_one_stage(
                 iterations=extra_iters,
                 steps_per_iter=steps_per_iter,
                 seed=seed,
+                # §MISSION_RUN_PARITY: same knobs on the Goal-B extension
+                # passes so extended iters render identically.
+                max_episode_steps=max_episode_steps,
+                playback_speed=playback_speed,
+                render_width=render_width,
+                render_height=render_height,
+                rollout_episodes=rollout_episodes,
                 init_policy_path=None,  # resume picks up from local ckpt
                 resume=True,
                 per_iter_callback=per_iter_cb,
