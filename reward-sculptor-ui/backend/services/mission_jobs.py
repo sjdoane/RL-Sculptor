@@ -199,9 +199,26 @@ def run_mission_decompose_job(
             mission = load_mission(md)
             adapter = load_adapter(project_dir / "config.toml")
             set_llm_log_dir(md)  # provenance for the metric-gen calls
+
+            # §MISSION_RUN_PARITY: forward the per-stage metric-gen events
+            # (stage_metric_gen_started/accepted/rejected/failed) to the
+            # mission WS so the live feed shows each stage's metric being
+            # built + trust-gated. ONLY typed events pass — the low-level
+            # generate_objective_metric progress dicts carry no `type`
+            # (pipeline stage names, not mission stages) and would flood
+            # the feed, so they're dropped. Mirrors the thread-safe
+            # `job.emit` use in the subprocess streamer below; never raises.
+            def _emit_metric_ev(ev: dict[str, Any]) -> None:
+                try:
+                    if isinstance(ev, dict) and ev.get("type"):
+                        job.emit({**ev, "mission_slug": mission_slug})
+                except Exception:  # noqa: BLE001 — progress is advisory
+                    pass
+
             report = generate_stage_metrics(
                 mission, robot_hint=getattr(adapter, "task_id", None),
-                n_candidates=stage_metric_candidates)
+                n_candidates=stage_metric_candidates,
+                on_event=_emit_metric_ev)
             save_mission(mission, md)
             return report
 
