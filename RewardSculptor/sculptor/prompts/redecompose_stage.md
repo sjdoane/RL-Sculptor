@@ -46,7 +46,8 @@ hopefully softened enough for it to succeed.
       "max_iterations":     <int 1..50>,
       "parent_stage":       <null or earlier sub-stage name>,
       "reward_seed_prompt": "<NL reward spec, 3-2000 chars>",
-      "kg_seed_papers":     ["<arxiv_id>", ...]
+      "kg_seed_papers":     ["<arxiv_id>", ...],
+      "needs_reference_rsi": <true ONLY for ballistic/airborne sub-stages — see rule 10>
     },
     ...
   ]
@@ -106,9 +107,12 @@ hopefully softened enough for it to succeed.
    re-validated — an out-of-contract key in ANY sub-stage's criterion
    rejects the whole redecomposition.
    - **`base_height`, `fallen`, and other runtime info-dict keys are NOT
-     persisted.** Derive base height from
-     `trajectory['root_link_pos_w'][..., 2]` and an upright/fallen proxy
-     from `trajectory['projected_gravity_b'][..., 2]` (≈ -1 = upright).
+     persisted.** For base/root HEIGHT use `trajectory['root_height']` (a
+     1-D per-step root z aligned with `rewards`) — NEVER
+     `root_link_pos_w[..., 2]`, which is the `(T, E)` grid over ALL envs and
+     makes `.any()` fire on transient auto-reset teleport spikes. Derive an
+     upright/fallen proxy from `trajectory['projected_gravity_b'][..., 2]`
+     (≈ -1 = upright).
    - **`components[<name>]` must be a term THIS sub-stage's
      `reward_seed_prompt` actually defines.** If unsure a component is
      emitted, use the soft form `components.get('<name>', 0.0)` so a
@@ -116,6 +120,22 @@ hopefully softened enough for it to succeed.
 
 9. **KG seed papers** restricted to the provided slice (same as
    decompose_task's hard rule 6).
+
+10. **Reference-state initialization (`needs_reference_rsi`).** Set
+    `needs_reference_rsi: true` on a sub-stage ONLY when ITS core skill
+    involves ballistic/airborne states the policy cannot reach until it
+    has already learned the skill — jump launch, flight, landing, aerial
+    recovery. The orchestrator then starts a fraction of that sub-stage's
+    TRAINING episodes inside those states (heights + vertical velocities
+    from a validated reference trajectory, paired with the required
+    sunk-height termination). Evaluation rollouts are never affected. Keep
+    it `false` for grounded sub-stages (standing, crouching, walking,
+    kicking): needless RSI wastes training resets on states the sub-stage
+    doesn't need. Decide PER SUB-STAGE — a re-decomposition typically
+    splits ONE hard airborne stage into a grounded precursor (RSI false)
+    plus a later airborne sub-stage (RSI true); do NOT blanket-inherit the
+    parent stage's value. This is DeepMimic's RSI result (same as
+    decompose_task rule 9).
 
 ## Strategy guidance
 

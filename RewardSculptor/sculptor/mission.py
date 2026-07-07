@@ -530,8 +530,8 @@ def _validate_success_criterion(stage: Stage, info_keys: set[str]) -> None:
             f"For numpy arrays use `.astype(float)` / `.mean()` / "
             f"`.any()` / `.all()` directly. A bool array's `.mean()` "
             f"already returns the fraction-True; no cast needed.\n"
-            f"  bad:  (trajectory['root_link_pos_w'][..., 2] > 0.65).float().mean()\n"
-            f"  good: (trajectory['root_link_pos_w'][..., 2] > 0.65).mean()"
+            f"  bad:  (trajectory['root_height'] > 0.65).float().mean()\n"
+            f"  good: (trajectory['root_height'] > 0.65).mean()"
         )
 
     # Map `container_name` → allowed-key set. Subscripts against

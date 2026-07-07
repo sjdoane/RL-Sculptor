@@ -69,6 +69,12 @@ PERSISTED_TRAJECTORY_KEYS: frozenset[str] = frozenset({
     # Cartpole). The evaluator handles missing keys with a clear error.
     "joint_pos", "joint_vel", "action",
     "actuator_force", "projected_gravity_b", "root_link_pos_w",
+    # §root-height channel (smoke-hop-stop finding, 2026-07-06): a
+    # DERIVED, unambiguous 1-D per-step root z, synthesized in
+    # `_load_trajectory_arrays` from `root_link_pos_w` (NOT a runner key).
+    # Whitelisted here so decompose-time validation accepts criteria
+    # that reference `trajectory['root_height']` / `info['root_height']`.
+    "root_height",
 })
 
 # Scalar fields persisted in behavior.json.
@@ -424,6 +430,55 @@ def _load_behavior_json(iter_dir: Path) -> dict[str, Any]:
     )
 
 
+def _derive_root_height(root_link_pos_w: Any) -> Any:
+    """§root-height channel (smoke-hop-stop finding, 2026-07-06).
+
+    Return an UNAMBIGUOUS 1-D per-step root z-height from the batched
+    `root_link_pos_w` array the mjlab runner persists.
+
+    Extraction is pinned against the WRITER in
+    `sculptor/adapters/_mjlab_runner.py` (search `root_link_pos_w_buf`):
+    each rollout step appends `data.root_link_pos_w` of shape `(E, 3)`
+    (E = num_envs), and the buffer is `np.stack(..., axis=0)`-ed at save
+    time, so the persisted array is `(T, E, 3)` — axis 0 = TIMESTEP,
+    axis 1 = ENV, axis 2 = xyz (z at index 2). This is the SAME layout
+    documented in `eval/spec_metrics.py` (`(T, E, 3)`).
+
+    The naive `root_link_pos_w[..., 2]` a criterion author reaches for
+    is therefore the full `(T, E)` grid across ALL envs and ALL steps —
+    NOT one robot's height. Aggregating it with `.any()` fires on ANY
+    env at ANY step, including the transient teleport spikes an
+    auto-reset warps an env to mid-rollout (documented in
+    `spec_metrics.horizontal_speed`, "auto-resets warp envs back to
+    spawn") — which is exactly how a naive `> 0.85 .any()` criterion
+    read an impossible 7.4 m root as a satisfied jump.
+
+    We extract env 0's per-step z (`root_link_pos_w[:, 0, 2]`), matching
+    the runner's own representative trace: `rewards` = `all_rewards` is
+    `float(rew[0])` per step (env 0 only), so `root_height` is aligned
+    step-for-step with `rewards` — one continuous robot rollout, the
+    thing a height criterion actually means. (`episode_id` is a SEPARATE
+    index space — a flat concat of every env's episode lengths — and is
+    NOT per-step-aligned with any array; it is metadata, not an index
+    into `root_height`.)
+
+    Returns `None` when the array is missing or not the expected
+    `(T, E, 3)` / `(T, E)` shape, so callers simply omit the key.
+    """
+    import numpy as np
+
+    if root_link_pos_w is None:
+        return None
+    arr = np.asarray(root_link_pos_w)
+    # (T, E, 3): world position → z at index 2, env 0 representative.
+    if arr.ndim == 3 and arr.shape[2] >= 3:
+        return np.ascontiguousarray(arr[:, 0, 2])
+    # Defensive: a hypothetical un-batched (T, 3) recording (num_envs==1).
+    if arr.ndim == 2 and arr.shape[1] >= 3:
+        return np.ascontiguousarray(arr[:, 2])
+    return None
+
+
 def _load_trajectory_arrays(
     iter_dir: Path,
 ) -> tuple[dict[str, Any], dict[str, float]]:
@@ -462,6 +517,16 @@ def _load_trajectory_arrays(
                     trajectory[key] = np.asarray(npz[key])
                 # other keys silently ignored — future adapter additions
                 # won't fail here; they just won't be exposed to criteria.
+            # §root-height channel: additive, backward-compatible derived
+            # 1-D per-step root z (env-0 representative). Synthesized from
+            # `root_link_pos_w` so height criteria have an UNAMBIGUOUS
+            # signal instead of the `(T, E)` grid the raw key exposes.
+            # Absent → key simply omitted (Cartpole etc.); never overrides
+            # a `root_height` a future runner might persist directly.
+            if "root_height" not in trajectory:
+                rh = _derive_root_height(trajectory.get("root_link_pos_w"))
+                if rh is not None:
+                    trajectory["root_height"] = rh
     except Exception as e:  # noqa: BLE001
         raise CriterionEvalError(
             f"failed to read trajectory.npz at {traj_path}: "

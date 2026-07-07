@@ -86,13 +86,21 @@ and stages warm-start from previous stages where possible.
      erroring.
    - `info[<key>]` / `trajectory[<key>]` — per-step numpy array persisted
      to rollout/trajectory.npz. Available keys: `rewards`, `episode_id`,
-     `joint_pos`, `joint_vel`, `action`, `actuator_force`,
+     `root_height`, `joint_pos`, `joint_vel`, `action`, `actuator_force`,
      `projected_gravity_b`, `root_link_pos_w`. (`info` is an alias for
      `trajectory` — both names work; prefer `trajectory` for clarity.)
      **NOTE**: `base_height`, `fallen`, and other RUNTIME info-dict keys
-     are NOT persisted — derive from `trajectory['root_link_pos_w'][...,2]`
-     for base height, or `trajectory['projected_gravity_b'][...,2]` as a
-     fallen proxy (vertical component near ±1 = upright, near 0 = prone).
+     are NOT persisted.
+     **BASE/ROOT HEIGHT — use `trajectory['root_height']`, NEVER
+     `root_link_pos_w[..., 2]`.** `root_height` is a 1-D per-step root z
+     (one representative robot, aligned with `rewards`). `root_link_pos_w`
+     is `(T, E, 3)` — batched over ALL envs — so `root_link_pos_w[..., 2]`
+     is the whole `(T, E)` grid and `(root_link_pos_w[..., 2] > h).any()`
+     fires on ANY env at ANY step, including the transient teleport spikes
+     an auto-reset warps an env to mid-rollout (this once read an impossible
+     7.4 m root as a satisfied jump). For a fallen proxy use
+     `trajectory['projected_gravity_b'][..., 2]` (vertical component near
+     ±1 = upright, near 0 = prone).
    - Math helpers: `abs`, `min`, `max`, `sum`, `len`, `round`, `float`,
      `int`, `bool`. Array methods (numpy): `.mean()`, `.max()`,
      `.min()`, `.std()`, `.sum()`, `.any()`, `.all()`, `.astype(...)`,
@@ -115,8 +123,8 @@ and stages warm-start from previous stages where possible.
      — sustained performance.
    - `components['support_phase'] > 0.4` — a specific reward component
      saturates above a threshold.
-   - `(trajectory['root_link_pos_w'][..., 2] > 0.6).mean() > 0.8`
-     — base height above 0.6 m for ≥ 80% of timesteps (derived).
+   - `(trajectory['root_height'] > 0.6).mean() > 0.8`
+     — base height above 0.6 m for ≥ 80% of timesteps.
      Note: `.mean()` directly on the bool array gives the fraction;
      do NOT write `(x > c).float().mean()` — `.float()` is torch-only.
    - `(trajectory['projected_gravity_b'][..., 2] < -0.95).mean() > 0.95`
@@ -213,13 +221,13 @@ EVERY reward and keep the robot up while it learns each phase.
       "success_criterion": "components.get('crouch_target', 0.0) > 0.4 and (trajectory['projected_gravity_b'][..., 2] < -0.9).mean() > 0.85",
       "max_iterations": 3,
       "parent_stage": null,
-      "reward_seed_prompt": "BASE STABILITY TERMS (carry these into every stage): alive_bonus (+0.1 while upright), upright (exp(-||base_ang_vel_b||^2)*0.3), action_rate_penalty (-0.03*||action-prev_action||^2); zero the whole reward when fallen. SKILL TERM crouch_target: exp(-((root_link_pos_w_z - 0.45)**2)/0.02) * 0.6 (root_link_pos_w z-component toward a 0.45 m target).",
+      "reward_seed_prompt": "BASE STABILITY TERMS (carry these into every stage): alive_bonus (+0.1 while upright), upright (exp(-||base_ang_vel_b||^2)*0.3), action_rate_penalty (-0.03*||action-prev_action||^2); zero the whole reward when fallen. SKILL TERM crouch_target: exp(-((base_height - 0.45)**2)/0.02) * 0.6 (base height toward a 0.45 m target).",
       "kg_seed_papers": ["2312.17507"]
     },
     {
       "name": "spring_up",
       "goal_text": "From the crouch, explosively extend the legs to launch the root link upward past ~0.75 m.",
-      "success_criterion": "(trajectory['root_link_pos_w'][..., 2] > 0.75).any() and components.get('upward_impulse', 0.0) > 0.3",
+      "success_criterion": "(trajectory['root_height'] > 0.75).any() and components.get('upward_impulse', 0.0) > 0.3",
       "max_iterations": 5,
       "parent_stage": "crouch_load",
       "reward_seed_prompt": "Keep the base stability terms + crouch_target. Add upward_impulse: reward positive root-link vertical velocity during the extension window, gated on having been crouched; cap it so it does not reward flailing.",
@@ -228,7 +236,7 @@ EVERY reward and keep the robot up while it learns each phase.
     {
       "name": "jump_and_land",
       "goal_text": "Chain crouch -> launch into a full ~30 cm jump and absorb the landing back to a stable upright stance.",
-      "success_criterion": "(trajectory['root_link_pos_w'][..., 2] > 0.95).any() and behavior['mean_episode_length'] > 450",
+      "success_criterion": "(trajectory['root_height'] > 0.95).any() and behavior['mean_episode_length'] > 450",
       "max_iterations": 6,
       "parent_stage": "spring_up",
       "reward_seed_prompt": "Keep all prior terms. Add soft_landing: penalize large root vertical acceleration / impact after the apex, and reward returning to a stable upright pose after touchdown.",

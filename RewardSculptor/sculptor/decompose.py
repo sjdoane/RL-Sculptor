@@ -278,10 +278,20 @@ def _render_contract(contract: Any) -> str:
     # trajectory keys THIS adapter actually persists. supports_batched
     # is the honest available proxy for "mjlab articulated env".
     if supports_batched:
+        # §root-height channel (smoke-hop-stop finding, 2026-07-06):
+        # `root_height` is a DERIVED, unambiguous 1-D per-step root z the
+        # runtime synthesizes from `root_link_pos_w`; criteria on base/root
+        # height MUST use it (raw `root_link_pos_w[..., 2]` is the full
+        # (T, E) grid across every env — `.any()` fires on teleport spikes).
         traj_keys = sorted(
             {"rewards", "episode_id", "joint_pos", "joint_vel", "action",
-             "actuator_force", "projected_gravity_b", "root_link_pos_w"})
-        traj_note = ""
+             "actuator_force", "projected_gravity_b", "root_link_pos_w",
+             "root_height"})
+        traj_note = (
+            "  (base/root-HEIGHT criteria MUST use trajectory['root_height'] "
+            "— a 1-D per-step root z; do NOT write root_link_pos_w[..., 2], "
+            "which is the (T, E) grid over ALL envs)\n"
+        )
     else:
         traj_keys = ["episode_id", "rewards"]
         traj_note = (
@@ -935,11 +945,16 @@ def redecompose_stage(
             # §Ship 38: sub-stages inherit the failed stage's objective so a
             # re-decomposed phase keeps steering by the same metric.
             steering_metric=failed_stage.steering_metric,
-            # §JUMP_SCAFFOLD: sub-stages of an airborne stage keep RSI —
-            # the exploration problem doesn't vanish by splitting it.
+            # §JUMP_SCAFFOLD refinement (2026-07-06): per-sub-stage RSI —
+            # the redecompose LLM decides each sub-stage's flag (rule 10),
+            # NOT force-inherit from the failed parent. Re-decomposition
+            # usually splits ONE airborne stage into a GROUNDED precursor
+            # (RSI false — else needless resets are wasted on states it
+            # doesn't need) plus a later airborne sub-stage (RSI true); a
+            # blanket `or failed_stage.needs_reference_rsi` denied the
+            # grounded precursors that gain.
             needs_reference_rsi=bool(
-                getattr(model_stage, "needs_reference_rsi", False)
-                or failed_stage.needs_reference_rsi),
+                getattr(model_stage, "needs_reference_rsi", False)),
             redecomposition_attempts=1,  # bound at one level
         ))
 
