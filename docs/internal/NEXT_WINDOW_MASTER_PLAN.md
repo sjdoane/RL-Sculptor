@@ -43,8 +43,24 @@ attempt. What happened, in order:
    real and remarkable at 600-step budgets; if trajectory.npz shows
    episodes STARTING above 0.85m, the eval path is leaking train RSI
    and that's a CRITICAL bug in the mjlab runner's spec handling.**
-3b. POST-SESSION CHECK (token-limited, inconclusive — FINISH THIS
-   FIRST): explosive_launch's rollout trajectory.npz has
+3b. RESOLVED (opus follow-up, commits ee54f5f/89c0475/48de66a): layout
+   is (T=500, E=64 envs, 3); correctly-extracted root z shows ALL 64
+   envs launched to 1.19-1.25 m apex from 0.79 m stands → the
+   explosive_launch PASS was REAL, the land-stable FAIL was real, and
+   rollout resets are RSI-clean (no leak). The .any()-over-grid surface
+   was a LATENT fail-open (auto-reset teleport spikes) — closed via a
+   derived trajectory['root_height'] channel + prompt rules forbidding
+   root_link_pos_w[...,2]; RSI force-inherit on redecompose removed.
+   FINAL SMOKE OUTCOME: mission halted criterion_not_met at
+   redecomposed sub-stage __r1_1 (r1_0 stand-stabilize SUCCEEDED first)
+   — expected at 2-iter/600-step budgets; the full-budget run (§2) is
+   the next attempt. VERIFICATION PASS OF RECORD: complete — 1 MEDIUM
+   confirmed (non-defensive provenance read, fixed 48de66a + sibling
+   sweep), all other checklist items satisfied; accepted limitations
+   documented (decoy-gate advisory, heldout level-0 push removal).
+   Gates at 48de66a: sculptor 1216 passed/1 skip, backend 376 passed.
+   ORIGINAL text of this item kept below for the reasoning record:
+   (token-limited, inconclusive — FINISH THIS FIRST): explosive_launch's rollout trajectory.npz has
    root_link_pos_w shape (500, 64, 3) against episode_id (3000,), and
    naive z-extraction gives values up to 7.4 m — impossible for a G1.
    Either the 64-axis is bodies/links (so the criterion's
