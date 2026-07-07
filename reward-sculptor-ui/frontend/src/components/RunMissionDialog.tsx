@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 
-import { MissionAdvanced } from "@/components/NewMissionDialog";
+import { MissionAdvanced, type MissionRenderSize } from "@/components/NewMissionDialog";
 import { Btn, Modal } from "@/components/rs/primitives";
 import { useRunMission, type RunMissionVariables } from "@/hooks/useMissions";
 import { useProjectMetrics } from "@/hooks/useMetrics";
@@ -57,9 +57,30 @@ export function RunMissionDialog({
   // string holds built-in names AND generated "gen:<id>" refs.
   const [fitnessMetric, setFitnessMetric] = useState<string | null>(null);
   const [fitnessMode, setFitnessMode] = useState<"observe" | "steer">("steer");
+  // §MISSION_RUN_PARITY: per-launch knobs mirrored from NewRunDialog.
+  const [editCandidates, setEditCandidates] = useState<number | "">("");
+  const [rolloutEpisodes, setRolloutEpisodes] = useState<number | "">("");
+  const [maxEpisodeSteps, setMaxEpisodeSteps] = useState<number | "">("");
+  const [playbackSpeed, setPlaybackSpeed] = useState<number | "">("");
+  const [renderSize, setRenderSize] = useState<MissionRenderSize>("default");
+  const [fitnessPatience, setFitnessPatience] = useState<number | "">("");
+  const [numEnvs, setNumEnvs] = useState<number | "">("");
+  const [device, setDevice] = useState<string>("");
   const projectMetrics = useProjectMetrics(slug, open);
 
   const run = useRunMission(slug);
+
+  // §MISSION_RUN_PARITY: bundle the parity knobs for the shared form.
+  const knobs = {
+    editCandidates, setEditCandidates,
+    rolloutEpisodes, setRolloutEpisodes,
+    maxEpisodeSteps, setMaxEpisodeSteps,
+    playbackSpeed, setPlaybackSpeed,
+    renderSize, setRenderSize,
+    fitnessPatience, setFitnessPatience,
+    numEnvs, setNumEnvs,
+    device, setDevice,
+  };
 
   // Pre-fill iteration override with the mission's max-stage iters
   // when first opening, so the default reflects what the user already
@@ -119,6 +140,22 @@ export function RunMissionDialog({
           setFitnessMode(rd.fitness_mode);
         }
       }
+      // §MISSION_RUN_PARITY: pre-fill the per-launch knobs too.
+      if (typeof rd.edit_candidates === "number") setEditCandidates(rd.edit_candidates);
+      if (typeof rd.rollout_episodes === "number") setRolloutEpisodes(rd.rollout_episodes);
+      if (typeof rd.max_episode_steps === "number") setMaxEpisodeSteps(rd.max_episode_steps);
+      if (typeof rd.playback_speed === "number") setPlaybackSpeed(rd.playback_speed);
+      if (typeof rd.fitness_patience === "number") setFitnessPatience(rd.fitness_patience);
+      if (typeof rd.num_envs_override === "number") setNumEnvs(rd.num_envs_override);
+      if (typeof rd.device_override === "string" && rd.device_override) {
+        setDevice(rd.device_override);
+      }
+      if (typeof rd.render_width === "number" && typeof rd.render_height === "number") {
+        const combo = `${rd.render_width}x${rd.render_height}`;
+        if (combo === "1920x1080" || combo === "960x540" || combo === "320x240") {
+          setRenderSize(combo);
+        }
+      }
       setAppliedDefaults(true);
       return;
     }
@@ -162,7 +199,20 @@ export function RunMissionDialog({
     if (fitnessMetric) {
       body.fitness_metric = fitnessMetric;
       body.fitness_mode = fitnessMode;
+      // §MISSION_RUN_PARITY: patience only meaningful with a metric set.
+      if (typeof fitnessPatience === "number") body.fitness_patience = fitnessPatience;
     }
+    // §MISSION_RUN_PARITY: per-launch knobs (blank = inherited config).
+    if (typeof editCandidates === "number") body.edit_candidates = editCandidates;
+    if (typeof rolloutEpisodes === "number") body.rollout_episodes = rolloutEpisodes;
+    if (typeof maxEpisodeSteps === "number") body.max_episode_steps = maxEpisodeSteps;
+    if (typeof playbackSpeed === "number") body.playback_speed = playbackSpeed;
+    if (renderSize !== "default") {
+      body.render_width = Number(renderSize.split("x")[0]);
+      body.render_height = Number(renderSize.split("x")[1]);
+    }
+    if (typeof numEnvs === "number") body.num_envs_override = numEnvs;
+    if (device.trim()) body.device_override = device.trim();
     const variables: RunMissionVariables = { missionSlug, body };
     run.mutate(variables, {
       onSuccess: () => {
@@ -231,6 +281,7 @@ export function RunMissionDialog({
             fitnessMode={fitnessMode} setFitnessMode={setFitnessMode}
             metrics={projectMetrics.data ?? []}
             showIterationsHint={suggestedIters?.toString() ?? "3"}
+            knobs={knobs}
           />
           {eta !== null && (
             <p className="rs-hintline" style={{ marginTop: 4 }}>

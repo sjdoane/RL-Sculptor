@@ -102,6 +102,7 @@ def run_mission_decompose_job(
     no_kg: bool = False,
     run_defaults: Optional[dict[str, Any]] = None,
     gen_stage_metrics: bool = True,
+    stage_metric_candidates: int = 1,
 ) -> Callable[[Job, asyncio.Event], Awaitable[dict[str, Any]]]:
     """Async runner that calls `sculptor.decompose.decompose_task` and
     persists the resulting mission to `<project_dir>/.missions/
@@ -119,6 +120,10 @@ def run_mission_decompose_job(
         generate one trust-gated objective metric per stage from the
         stage's own goal text (default ON). Rejected generations leave
         the stage on the mission-level metric fallback.
+    stage_metric_candidates : §MISSION_RUN_PARITY — best-of-N candidates
+        sampled per stage metric (1 = single-shot-with-retry). Forwarded
+        to `generate_stage_metrics(n_candidates=...)`. Only used when
+        `gen_stage_metrics` is True.
     run_defaults : §Ship 21a — optional run-time defaults set up
         front via the NewMissionDialog Advanced tab. Persisted on the
         Mission so RunMissionDialog can pre-fill when the user later
@@ -195,7 +200,8 @@ def run_mission_decompose_job(
             adapter = load_adapter(project_dir / "config.toml")
             set_llm_log_dir(md)  # provenance for the metric-gen calls
             report = generate_stage_metrics(
-                mission, robot_hint=getattr(adapter, "task_id", None))
+                mission, robot_hint=getattr(adapter, "task_id", None),
+                n_candidates=stage_metric_candidates)
             save_mission(mission, md)
             return report
 
@@ -266,6 +272,15 @@ def _build_mission_run_flags(
         ("seed", "--seed"),
         ("criterion_stability_window", "--criterion-stability-window"),
         ("max_extensions_per_stage", "--max-extensions-per-stage"),
+        # §MISSION_RUN_PARITY: per-launch knobs mirrored from NewRunDialog.
+        # Flag names MUST match sculptor/cli.py::mission_run_cli's Options.
+        ("edit_candidates", "--edit-candidates"),
+        ("rollout_episodes", "--rollout-episodes"),
+        ("max_episode_steps", "--max-episode-steps"),
+        ("render_width", "--render-width"),
+        ("render_height", "--render-height"),
+        ("fitness_patience", "--fitness-patience"),
+        ("num_envs_override", "--num-envs"),
     ]
     for key, flag in int_flags:
         v = run_kwargs.get(key)
@@ -275,11 +290,17 @@ def _build_mission_run_flags(
         ("extension_factor", "--extension-factor"),
         ("extension_improvement_threshold",
          "--extension-improvement-threshold"),
+        ("playback_speed", "--playback-speed"),
     ]
     for key, flag in float_flags:
         v = run_kwargs.get(key)
         if v is not None:
             flags += [flag, str(float(v))]
+    # §MISSION_RUN_PARITY: string device override (mjlab). Skip blanks so
+    # an empty string doesn't shadow the stage's inherited device.
+    device_override = run_kwargs.get("device_override")
+    if device_override not in (None, ""):
+        flags += ["--device", str(device_override)]
     bool_flags = [
         ("early_stop_on_criterion", "--early-stop-on-criterion"),
         ("extend_on_improvement", "--extend-on-improvement"),

@@ -202,6 +202,7 @@ def create_mission(
                 no_kg=body.no_kg,
                 run_defaults=run_defaults_dict,
                 gen_stage_metrics=body.gen_stage_metrics,
+                stage_metric_candidates=body.stage_metric_candidates,
             ),
             params={
                 "mission_slug": mission_slug,

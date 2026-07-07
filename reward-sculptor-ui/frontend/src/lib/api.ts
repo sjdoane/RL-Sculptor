@@ -785,6 +785,17 @@ export interface RunMissionRequestBody {
   // or "gen:<id>") + observe/steer mode.
   fitness_metric?: string | null;
   fitness_mode?: "observe" | "steer";
+  // §MISSION_RUN_PARITY: per-launch knobs mirrored from NewRunDialog,
+  // applied uniformly to every stage. blank/undefined = inherited config.
+  edit_candidates?: number | null;
+  rollout_episodes?: number | null;
+  max_episode_steps?: number | null;
+  playback_speed?: number | null;
+  render_width?: number | null;
+  render_height?: number | null;
+  fitness_patience?: number | null;
+  num_envs_override?: number | null;
+  device_override?: string | null;
 }
 
 export async function runMission(

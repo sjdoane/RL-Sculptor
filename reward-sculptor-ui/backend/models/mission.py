@@ -133,6 +133,14 @@ class CreateMissionRequest(BaseModel):
     text. Rejected generations leave the stage on the mission-level
     metric fallback. Default ON."""
 
+    stage_metric_candidates: Annotated[int, Field(ge=1, le=4)] = 1
+    """§MISSION_RUN_PARITY: best-of-N candidates sampled per stage metric
+    (1 = single-shot-with-retry). Only meaningful when
+    `gen_stage_metrics` is True; forwarded to
+    `generate_stage_metrics(n_candidates=...)`. Each candidate is a
+    ~1-2 min LLM call, so higher N trades wall-clock for a more-
+    discriminating metric."""
+
     # §Ship 21a: optional run-time defaults set up front via the
     # NewMissionDialog Advanced tab. These are persisted on the
     # mission and pre-fill RunMissionDialog when the user later
@@ -198,6 +206,47 @@ class RunMissionRequest(BaseModel):
     # §Ship 35: observe vs steer (see RunParams.fitness_mode).
     fitness_mode: Literal["observe", "steer"] = "steer"
     """How the fitness signal is used per stage. observe = display only."""
+
+    # §MISSION_RUN_PARITY: per-launch knobs mirrored from NewRunDialog's
+    # stage-applicable set. All Optional; None = defer to the stage's
+    # inherited config default. Forwarded as `sculpt mission-run` flags by
+    # _build_mission_run_flags and applied uniformly to every stage.
+    edit_candidates: Optional[Annotated[int, Field(ge=1, le=5)]] = None
+    """Best-of-K framed reward-edit candidates per diagnosis, per stage
+    (offline-screened; only the winner trains). None = 1."""
+
+    rollout_episodes: Optional[Annotated[int, Field(ge=1, le=32)]] = None
+    """Rollout episodes captured per iter for behavior metrics, per
+    stage. None = the inherited [iteration] value (default 6)."""
+
+    max_episode_steps: Optional[
+        Annotated[int, Field(ge=50, le=5000)]
+    ] = None
+    """Rollout env steps per episode, per stage. None = default 500."""
+
+    playback_speed: Optional[
+        Annotated[float, Field(ge=0.1, le=10.0)]
+    ] = None
+    """Rollout video speed multiplier, per stage; 1.0 = real-time."""
+
+    render_width: Optional[Annotated[int, Field(ge=1)]] = None
+    """Rollout video width px, per stage (default 1280). Paired with
+    render_height by the UI's resolution select."""
+
+    render_height: Optional[Annotated[int, Field(ge=1)]] = None
+    """Rollout video height px, per stage (default 720)."""
+
+    fitness_patience: Optional[Annotated[int, Field(ge=1, le=50)]] = None
+    """Iters with no new best fitness before a steered stage stops. Only
+    meaningful with a fitness_metric set. None = sculpt default (2)."""
+
+    num_envs_override: Optional[Annotated[int, Field(ge=1, le=8192)]] = None
+    """Override [adapter].config.num_envs for every stage (mjlab). Drop
+    if a stage OOMs. None = inherited value."""
+
+    device_override: Optional[str] = None
+    """Override [adapter].config.device for every stage (mjlab), e.g.
+    cuda:0 / cpu. None = inherited value."""
 
 
 # §Ship 21a: resolve the forward reference now that RunMissionRequest

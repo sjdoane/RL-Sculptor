@@ -406,6 +406,217 @@ def test_create_mission_response_includes_params_mission_slug(
     assert body["params"].get("goal") == "Hold cartpole upright"
 
 
+# ── §MISSION_RUN_PARITY: per-stage metric best-of-N ──────────────────
+def test_create_mission_forwards_stage_metric_candidates(
+    client: TestClient, tmp_projects_root: Path, monkeypatch,
+) -> None:
+    """§MISSION_RUN_PARITY: NewMissionDialog's Basic-tab best-of-N select
+    POSTs `stage_metric_candidates` alongside `gen_stage_metrics`. The
+    route must forward BOTH to the decompose runner factory (which passes
+    n_candidates into generate_stage_metrics as its second phase).
+    """
+    captured: dict[str, object] = {}
+
+    async def _stub_runner(job, cancel):
+        return {"mission_slug": "stubbed", "n_stages": 0}
+
+    def _factory(**kwargs):
+        captured["gen_stage_metrics"] = kwargs.get("gen_stage_metrics")
+        captured["stage_metric_candidates"] = kwargs.get(
+            "stage_metric_candidates")
+        return _stub_runner
+
+    monkeypatch.setattr(
+        "backend.routes.missions.run_mission_decompose_job", _factory,
+    )
+
+    slug = _make_project(client)
+    r = client.post(
+        f"/projects/{slug}/missions",
+        json={
+            "goal": "Squat then launch into a vertical jump and land",
+            "gen_stage_metrics": True,
+            "stage_metric_candidates": 3,
+        },
+    )
+    assert r.status_code == 202, r.text
+    assert captured["gen_stage_metrics"] is True
+    assert captured["stage_metric_candidates"] == 3
+
+
+def test_create_mission_stage_metric_candidates_defaults_to_one() -> None:
+    """CreateMissionRequest carries gen_stage_metrics=True +
+    stage_metric_candidates=1 by default (no body change needed for the
+    single-shot path), and validates the 1..4 bound."""
+    import pytest as _pytest
+    from pydantic import ValidationError
+
+    from backend.models.mission import CreateMissionRequest
+
+    req = CreateMissionRequest(goal="Stand on one leg without falling")
+    assert req.gen_stage_metrics is True
+    assert req.stage_metric_candidates == 1
+
+    req2 = CreateMissionRequest(
+        goal="Stand on one leg", gen_stage_metrics=False,
+        stage_metric_candidates=4,
+    )
+    assert req2.gen_stage_metrics is False
+    assert req2.stage_metric_candidates == 4
+
+    # Out-of-bound N is a 422 (Field ge=1, le=4).
+    with _pytest.raises(ValidationError):
+        CreateMissionRequest(goal="x" * 8, stage_metric_candidates=5)
+
+
+def test_decompose_job_passes_n_candidates_to_generate_stage_metrics(
+    tmp_projects_root: Path, monkeypatch,
+) -> None:
+    """§MISSION_RUN_PARITY: run_mission_decompose_job's stage-metrics
+    phase calls generate_stage_metrics(..., n_candidates=N). Mock the
+    generator + decompose so no Anthropic/GPU call fires; assert the
+    n_candidates kwarg threads all the way through.
+    """
+    import asyncio
+    import json
+
+    from backend.services import mission_jobs as mj_mod
+    from backend.services.job_manager import Job
+
+    # Build a real sculpt project so load_adapter + config.toml resolve.
+    project_dir = tmp_projects_root / "cand_proj"
+    from sculptor.sculpt import sculpt_init
+    sculpt_init(project_dir, "gym_sb3")
+    mission_slug = "cand-mission"
+
+    captured: dict[str, object] = {}
+
+    # Stub decompose_task so it writes a minimal 1-stage mission + returns.
+    def _fake_decompose_task(goal, reward_contract, *, kg_store=None):
+        from sculptor.mission import Mission, Stage
+        return Mission(
+            goal=goal,
+            stages=[Stage(
+                name="stage_0", goal_text="do the thing",
+                success_criterion="metric > 0.5", max_iterations=2,
+                parent_stage=None, reward_seed_prompt="seed",
+            )],
+            decomposition_model="stub",
+            decomposition_rationale="stub",
+        )
+
+    def _fake_generate_stage_metrics(mission, *, robot_hint=None,
+                                     n_candidates=1, **_kw):
+        captured["n_candidates"] = n_candidates
+        return {"generated": [], "rejected": [], "skipped": []}
+
+    # The freshly-scaffolded gym_sb3 config has env_id="CHANGE_ME", which a
+    # real load_adapter can't gym.make — stub it (the decompose + metrics
+    # phases only need reward_contract() + a task_id hint).
+    class _FakeContract:
+        expected_info_keys: list = []
+        expected_components = None
+
+    class _FakeAdapter:
+        task_id = None
+
+        def reward_contract(self):
+            return _FakeContract()
+
+    monkeypatch.setattr(
+        "sculptor.adapters.base.load_adapter", lambda _p: _FakeAdapter(),
+    )
+    monkeypatch.setattr(
+        "sculptor.decompose.decompose_task", _fake_decompose_task,
+    )
+    monkeypatch.setattr(
+        "sculptor.mission_metrics.generate_stage_metrics",
+        _fake_generate_stage_metrics,
+    )
+
+    runner = mj_mod.run_mission_decompose_job(
+        project_dir=project_dir,
+        project_slug="cand_proj",
+        goal="Squat then jump",
+        mission_slug=mission_slug,
+        no_kg=True,  # skip the shared KG DB in the test
+        gen_stage_metrics=True,
+        stage_metric_candidates=3,
+    )
+    job = Job(job_id="j1", kind="mission_decompose", project_slug="cand_proj")
+    result = asyncio.run(runner(job, asyncio.Event()))
+
+    assert result["n_stages"] == 1
+    assert captured["n_candidates"] == 3
+
+
+# ── §MISSION_RUN_PARITY: run-time knob → CLI flag translation ─────────
+def test_build_mission_run_flags_emits_parity_knobs(
+    tmp_path: Path,
+) -> None:
+    """§MISSION_RUN_PARITY: RunMissionRequest's per-launch knobs translate
+    into the matching `sculpt mission-run` flags. Names MUST match
+    sculptor/cli.py::mission_run_cli's typer Options. None-valued fields
+    are skipped (defer to the stage's inherited config).
+    """
+    from backend.models.mission import RunMissionRequest
+    from backend.services.mission_jobs import _build_mission_run_flags
+
+    body = RunMissionRequest(
+        edit_candidates=3,
+        rollout_episodes=8,
+        max_episode_steps=750,
+        playback_speed=0.5,
+        render_width=960,
+        render_height=540,
+        fitness_patience=4,
+        num_envs_override=1024,
+        device_override="cuda:1",
+    )
+    flags = _build_mission_run_flags(
+        body.model_dump(exclude_none=False), tmp_path,
+    )
+
+    # Adjacent flag+value pairs so we assert the exact value too.
+    def _val(flag: str) -> str:
+        i = flags.index(flag)
+        return flags[i + 1]
+
+    assert "--edit-candidates" in flags and _val("--edit-candidates") == "3"
+    assert "--render-width" in flags and _val("--render-width") == "960"
+    assert "--render-height" in flags and _val("--render-height") == "540"
+    assert "--rollout-episodes" in flags and _val("--rollout-episodes") == "8"
+    assert "--max-episode-steps" in flags
+    assert "--playback-speed" in flags and _val("--playback-speed") == "0.5"
+    assert "--fitness-patience" in flags and _val("--fitness-patience") == "4"
+    assert "--num-envs" in flags and _val("--num-envs") == "1024"
+    assert "--device" in flags and _val("--device") == "cuda:1"
+
+
+def test_build_mission_run_flags_skips_unset_parity_knobs(
+    tmp_path: Path,
+) -> None:
+    """§MISSION_RUN_PARITY: an empty RunMissionRequest emits none of the
+    parity flags, and a blank device_override string is skipped (must not
+    shadow the stage's inherited device with '')."""
+    from backend.models.mission import RunMissionRequest
+    from backend.services.mission_jobs import _build_mission_run_flags
+
+    flags = _build_mission_run_flags(
+        RunMissionRequest().model_dump(exclude_none=False), tmp_path,
+    )
+    for flag in (
+        "--edit-candidates", "--rollout-episodes", "--max-episode-steps",
+        "--playback-speed", "--render-width", "--render-height",
+        "--fitness-patience", "--num-envs", "--device",
+    ):
+        assert flag not in flags
+
+    # Blank device string is dropped even though it's not None.
+    flags2 = _build_mission_run_flags({"device_override": ""}, tmp_path)
+    assert "--device" not in flags2
+
+
 # ── Slug derivation ──────────────────────────────────────────────────
 def test_derive_unique_mission_slug_basic():
     from backend.services.mission_store import derive_unique_mission_slug

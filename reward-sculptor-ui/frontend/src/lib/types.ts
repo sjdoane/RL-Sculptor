@@ -969,12 +969,28 @@ export interface MissionRunDefaults {
   // or "gen:<id>") + observe/steer mode.
   fitness_metric?: string | null;
   fitness_mode?: "observe" | "steer";
+  // §MISSION_RUN_PARITY: per-launch knobs mirrored from NewRunDialog's
+  // stage-applicable set. All optional; blank = the stage's inherited
+  // config default. Applied uniformly to every stage.
+  edit_candidates?: number | null;
+  rollout_episodes?: number | null;
+  max_episode_steps?: number | null;
+  playback_speed?: number | null;
+  render_width?: number | null;
+  render_height?: number | null;
+  fitness_patience?: number | null;
+  num_envs_override?: number | null;
+  device_override?: string | null;
 }
 
 export interface CreateMissionRequest {
   goal: string;             // 8-2000 chars
   mission_slug?: string;    // optional override
   no_kg?: boolean;
+  // §MISSION_RUN_PARITY: per-stage trust-gated metric generation. Default
+  // ON; best-of-N candidates sampled per stage (1..4).
+  gen_stage_metrics?: boolean;
+  stage_metric_candidates?: number;
   // §Ship 21a: optional run-time defaults set via the NewMission
   // Dialog Advanced tab. Persisted on the mission so RunMissionDialog
   // can pre-fill on first open.
