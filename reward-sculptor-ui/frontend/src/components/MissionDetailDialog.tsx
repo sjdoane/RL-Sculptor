@@ -587,8 +587,12 @@ function WsStatusChip({
 // Map an event type to one of the rs status colors (decorative).
 function eventCat(type: string): "rose" | "amber" | "emerald" | "blue" | "slate" {
   if (/errored|failed|halted/.test(type)) return "rose";
-  if (/skipped|degraded/.test(type)) return "amber";
-  if (/completed|succeeded|materialized|scaffolded|warm_start_resolved/.test(type)) return "emerald";
+  // §Ship 20: a rejected stage-metric is a soft fall-back to the mission
+  // metric, not an error — amber like skipped/degraded.
+  if (/skipped|degraded|rejected/.test(type)) return "amber";
+  // §Ship 20: reference-RSI applied + an accepted stage-metric are
+  // positive milestones — emerald like scaffolded/materialized.
+  if (/completed|succeeded|materialized|scaffolded|warm_start_resolved|rsi_applied|accepted/.test(type)) return "emerald";
   if (/started|redecompos|criterion|training/.test(type)) return "blue";
   return "slate";
 }
@@ -675,6 +679,54 @@ function describeEvent(ev: MissionEvent): string {
   }
   if (type === "mission_decompose_errored" || type === "mission_execute_errored") {
     return (ev as { error?: string }).error ?? "";
+  }
+  // §Ship 20: DeepMimic reference-state-init curriculum for airborne
+  // stages. stage_name rides the row chip; describe the clip + spec here.
+  if (type === "stage_reference_rsi_applied") {
+    const clip = (ev as { clip?: string }).clip;
+    return `reference curriculum applied${clip ? ` (clip: ${clip})` : ""}`;
+  }
+  if (type === "stage_reference_rsi_failed") {
+    const err = (ev as { error?: string }).error ?? "";
+    return `reference curriculum failed${err ? `: ${err}` : ""}`;
+  }
+  // §Ship 20: per-stage trust-gated steering metrics. The bookends carry
+  // no stage; the per-stage gen events carry `stage` (not stage_name) so
+  // name it inline.
+  if (type === "mission_stage_metrics_started") {
+    const n = (ev as { n_stages?: number }).n_stages;
+    return `generating a trust-gated metric per stage${
+      typeof n === "number" ? ` (${n} stages)` : ""
+    }…`;
+  }
+  if (type === "mission_stage_metrics_completed") {
+    const gen = (ev as { generated?: unknown[] }).generated;
+    const rej = (ev as { rejected?: unknown[] }).rejected;
+    const nGen = Array.isArray(gen) ? gen.length : 0;
+    const nRej = Array.isArray(rej) ? rej.length : 0;
+    return `per-stage metrics: ${nGen} generated, ${nRej} fell back to mission metric`;
+  }
+  if (type === "stage_metric_gen_started") {
+    const st = (ev as { stage?: string }).stage;
+    return `stage ${st ?? "?"}: generating metric…`;
+  }
+  if (type === "stage_metric_gen_accepted") {
+    const st = (ev as { stage?: string }).stage;
+    return `stage ${st ?? "?"}: metric generated ✓`;
+  }
+  if (type === "stage_metric_gen_rejected") {
+    const st = (ev as { stage?: string }).stage;
+    const reason = (ev as { reason?: string }).reason ?? "";
+    return `stage ${st ?? "?"}: metric rejected — falls back to mission metric${
+      reason ? ` (${reason})` : ""
+    }`;
+  }
+  if (type === "stage_metric_gen_failed") {
+    const st = (ev as { stage?: string }).stage;
+    const reason = (ev as { reason?: string }).reason ?? "";
+    return `stage ${st ?? "?"}: metric generation failed${
+      reason ? `: ${reason}` : ""
+    }`;
   }
   return "";
 }

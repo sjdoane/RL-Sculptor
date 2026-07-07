@@ -136,6 +136,13 @@ function prettyLabel(ev: RunEvent): string {
     // §Ship 34: objective fitness-in-the-loop.
     case "iter_fitness": return `iter_fitness${iter} fitness=${fmtNum(ev.fitness)} prog=${fmtNum(ev.progress)} best=${fmtNum(ev.best_so_far)} Δ=${fmtNum(ev.delta_vs_previous)}`;
     case "best_reward_selected": return `best_reward_selected${iter} fitness=${fmtNum(ev.fitness)} reward=${String(ev.reward ?? "?")}`;
+    // §Ship 20: best-of-K reward edit. `selected` is a 0-based winner index.
+    case "edit_candidates_ranked": {
+      const n = (ev as { n?: number }).n;
+      const valid = (ev as { valid?: number }).valid;
+      const sel = (ev as { selected?: number }).selected;
+      return `best-of-K reward: evaluated ${n ?? "?"}, kept candidate ${typeof sel === "number" ? sel + 1 : "?"} (${valid ?? "?"} valid)`;
+    }
     case "fitness_metric_warning": return `⚠ fitness_metric_warning ${String(ev.message ?? "")}`;
     case "early_stop": return `early_stop at iter=${ev.at_iter ?? "?"} reason=${ev.reason ?? ""}`;
     case "run_started": return `run_started iterations=${ev.iterations} goal=${ev.behavior_goal ?? ""}`;
@@ -182,6 +189,8 @@ const BADGE_STYLES: Record<string, string> = {
   // for the best-by-fitness pick (matches run_completed's success green).
   iter_fitness: "#1e1b3a|#a99cf0",
   best_reward_selected: "#16302a|#5fd0a0",
+  // §Ship 20: best-of-K reward selection — teal like the other edit events.
+  edit_candidates_ranked: "#13302c|#5fd0c0",
   fitness_metric_warning: "#3a2c12|#f0b35a",
   // §Ship 23d: remote-dispatch lifecycle — teal for progress, amber for
   // degraded-but-recovering, rose for failures.
