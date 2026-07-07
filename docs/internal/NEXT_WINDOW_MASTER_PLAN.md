@@ -188,3 +188,25 @@ chip task task_b923f338 in another session — check its result).
   out-of-manifest metrics): ~/rs_smoke/hopmission.
 - NOT pushed to GitHub — push when ready:
   `git push origin ship-20-ux-revamp` (repo github.com/sjdoane/RL-Sculptor).
+
+## 7. UI PARITY + EVENT SURFACING (2026-07-07) — LANDED
+
+The master-plan capabilities were library/backend-complete but NOT
+UI-reachable. Closed this session (commits 361d272, d18f442, 2c792ad,
+5bdaf10):
+- New Mission dialog now at New Run parity: "auto-generate a trust-gated
+  metric per stage" toggle (default ON) + best-of-N; and Advanced adds
+  edit_candidates (best-of-K), rollout-video knobs (episode steps /
+  playback / episodes / resolution), fitness patience, num_envs/device
+  — threaded FE → backend RunMissionRequest → _build_mission_run_flags
+  → `sculpt mission-run` → mission_run → per-stage sculpt_run.
+- Live feeds now render: stage_reference_rsi_applied, per-stage
+  stage_metric_gen_* (now forwarded via on_event), mission_stage_metrics
+  bookends, and edit_candidates_ranked (best-of-K pick).
+- Reachability caveat: num_envs/device are injected into each stage's
+  [adapter].config (sculpt_run has no such param — same as standalone
+  runs). Video knobs + edit_candidates are read from iter_cfg (real).
+- Reference trajectories: procedural jump + RSI derivation
+  (sculptor/reference.py) auto-applied to airborne stages; jump-specific,
+  CLI/auto only, real-mocap ingestion documented. General auto-reference
+  = future work. Gates green: backend 381, sculptor 1218/1, FE build.
