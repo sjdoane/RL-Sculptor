@@ -362,6 +362,80 @@ def test_build_namespace_drops_unexpected_trajectory_keys(tmp_path: Path):
     assert "future_feature" not in ns["trajectory"]
 
 
+# ── §root-height channel (smoke-hop-stop finding, 2026-07-06) ─────────
+def _synthetic_batched_root(T: int = 500, E: int = 64) -> np.ndarray:
+    """A `root_link_pos_w` matching the TRUE writer layout in
+    `_mjlab_runner.py` — each step appends `data.root_link_pos_w` of
+    shape (E, 3) and the buffer is `np.stack(axis=0)`-ed → (T, E, 3),
+    axis 0 = timestep, axis 1 = env, axis 2 = xyz. env 0 is a standing
+    G1 (~0.74 m); env 12 gets one impossible 7.4 m teleport spike (the
+    auto-reset warp artifact that fooled a naive `[..., 2].any()`)."""
+    root = np.zeros((T, E, 3), dtype=np.float32)
+    root[..., 2] = 0.74  # standing pelvis height across all envs/steps
+    root[300, 12, 2] = 7.4  # auto-reset warp spike in a NON-zero env
+    return root
+
+
+def test_root_height_derived_channel_is_env0_1d_trace(tmp_path: Path):
+    """`trajectory['root_height']` is a 1-D per-step root z (env-0
+    representative), NOT the (T, E) grid — pinned to the writer layout."""
+    root = _synthetic_batched_root()
+    iter_dir = tmp_path / "iter_0"
+    _fabricate_rollout_artifacts(
+        iter_dir, trajectory={"root_link_pos_w": root},
+    )
+    ns = _build_criterion_namespace(iter_dir, primary_metric=0.0)
+    rh = ns["trajectory"]["root_height"]
+    assert rh.ndim == 1
+    assert rh.shape == (root.shape[0],)  # (T,), aligned with env-0 rewards
+    # env 0 never spiked → the impossible 7.4 m is absent from root_height.
+    assert float(rh.max()) < 1.0
+    assert abs(float(rh[0]) - 0.74) < 1e-5
+    # info alias exposes the same channel.
+    assert "root_height" in ns["info"]
+
+
+def test_root_height_avoids_teleport_artifact_that_fools_raw_key(
+    tmp_path: Path,
+):
+    """The core adjudication: the naive raw-key criterion is satisfied by
+    the teleport spike, but the root_height criterion is NOT — root_height
+    measures what the criterion claims (one robot genuinely above 0.85 m)."""
+    root = _synthetic_batched_root()
+    iter_dir = tmp_path / "iter_0"
+    _fabricate_rollout_artifacts(
+        iter_dir, trajectory={"root_link_pos_w": root},
+    )
+    ns = _build_criterion_namespace(iter_dir, primary_metric=0.0)
+
+    # Naive raw-key criterion (what the failed mission wrote): fires on the
+    # 7.4 m env-12 spike even though NO robot jumped.
+    naive = "(trajectory['root_link_pos_w'][..., 2] > 0.85).any()"
+    assert _evaluate_success_criterion(naive, ns) is True
+
+    # Unambiguous root_height criterion: correctly False (env 0 stayed ~0.74).
+    fixed = "(trajectory['root_height'] > 0.85).any()"
+    assert _evaluate_success_criterion(fixed, ns) is False
+
+
+def test_root_height_omitted_without_root_link_pos_w(tmp_path: Path):
+    """Cartpole-style rollout (no root_link_pos_w) → no root_height key;
+    additive channel never fabricates a signal out of nothing."""
+    iter_dir = tmp_path / "iter_0"
+    _fabricate_rollout_artifacts(
+        iter_dir, trajectory={"rewards": np.array([1.0, 0.9], dtype=np.float32)},
+    )
+    ns = _build_criterion_namespace(iter_dir, primary_metric=0.0)
+    assert "root_height" not in ns["trajectory"]
+
+
+def test_root_height_in_persisted_keys_for_validation():
+    """Decompose-time criterion validation must accept
+    `trajectory['root_height']` — it's whitelisted in the persisted set."""
+    from sculptor.mission_runtime import PERSISTED_TRAJECTORY_KEYS
+    assert "root_height" in PERSISTED_TRAJECTORY_KEYS
+
+
 # ── 4. Ship-16 mission_run orchestrator ─────────────────────────────
 def _make_mission(tmp_path: Path, n_stages: int = 2) -> Mission:
     """Build a Mission with N stages pre-saved to disk PLUS pre-
@@ -2758,3 +2832,87 @@ def test_stage_reference_rsi_roundtrips_mission_json(tmp_path: Path):
     save_mission(m, Path(m.mission_dir))
     m2 = load_mission(Path(m.mission_dir))
     assert m2.stages[0].needs_reference_rsi is True
+
+
+def test_redecompose_rsi_flag_per_substage_not_force_inherited(
+    tmp_path: Path, monkeypatch,
+):
+    """§JUMP_SCAFFOLD refinement (2026-07-06): a re-decomposed stage's
+    sub-stages take their OWN `needs_reference_rsi` from the redecompose
+    LLM — NOT a force-inherit of the failed parent's flag.
+
+    Failed parent is airborne (needs_reference_rsi=True). The LLM splits
+    it into a GROUNDED precursor (RSI false) + a later airborne sub-stage
+    (RSI true). The grounded precursor MUST stay False (the old
+    `or failed_stage.needs_reference_rsi` would have wrongly forced it
+    True, wasting resets), while the airborne one stays True.
+    """
+    from sculptor import decompose as dc
+    from sculptor.decompose import (
+        StageTrainingFeedback,
+        _RedecompositionModel,
+        _StageModel,
+    )
+
+    # Failed parent stage is airborne → RSI true.
+    m = _make_mission(tmp_path, n_stages=1)
+    failed = m.stages[0]
+    failed.needs_reference_rsi = True
+    failed.success_criterion = "metric > 0.5"
+
+    # LLM response: grounded precursor (False) then airborne last (True,
+    # byte-equal criterion to the parent's).
+    response = _RedecompositionModel(
+        decomposition_rationale="split airborne into grounded load + launch",
+        stages=[
+            _StageModel(
+                name=f"{failed.name}__r1_0",
+                goal_text="grounded crouch load from the default stance",
+                success_criterion="metric > 0.0",
+                max_iterations=2,
+                parent_stage=None,
+                reward_seed_prompt="grounded precursor: crouch only, no launch",
+                kg_seed_papers=[],
+                needs_reference_rsi=False,   # grounded — LLM keeps it False
+            ),
+            _StageModel(
+                name=f"{failed.name}__r1_1",
+                goal_text="explosive launch into flight",
+                success_criterion="metric > 0.5",  # byte-equal to parent
+                max_iterations=3,
+                parent_stage=f"{failed.name}__r1_0",
+                reward_seed_prompt="airborne launch phase",
+                kg_seed_papers=[],
+                needs_reference_rsi=True,    # airborne — LLM sets it True
+            ),
+        ],
+    )
+
+    def fake_parse(client, system_prompt, user_content, *,
+                   output_format=None, model=None, max_tokens=None):
+        return response
+
+    monkeypatch.setattr(dc, "_parse_with_retry", fake_parse)
+
+    feedback = StageTrainingFeedback(
+        final_reward_source="def compute_reward(s,a,n,i): return 0.0, {}\n",
+        last_iter_diagnosis={},
+        last_iter_namespace={"behavior": {}, "components": {}, "metric": 0.3},
+        metric_history=[0.3],
+        last_3_iter_components=[{}],
+        failure_reason="criterion_not_met",
+    )
+
+    sub_stages = dc.redecompose_stage(
+        m, 0, feedback=feedback, reward_contract=_FakeContract(),
+        kg_store=None, client=object(),
+    )
+
+    assert len(sub_stages) == 2
+    # Grounded precursor is NOT forced True by the airborne parent.
+    assert sub_stages[0].needs_reference_rsi is False, (
+        "grounded sub-stage must keep its own False flag; the parent's "
+        "needs_reference_rsi must NOT be force-inherited"
+    )
+    # The LLM can still set True on the airborne sub-stage.
+    assert sub_stages[1].needs_reference_rsi is True
