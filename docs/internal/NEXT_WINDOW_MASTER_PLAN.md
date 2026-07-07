@@ -43,6 +43,24 @@ attempt. What happened, in order:
    real and remarkable at 600-step budgets; if trajectory.npz shows
    episodes STARTING above 0.85m, the eval path is leaking train RSI
    and that's a CRITICAL bug in the mjlab runner's spec handling.**
+3b. POST-SESSION CHECK (token-limited, inconclusive — FINISH THIS
+   FIRST): explosive_launch's rollout trajectory.npz has
+   root_link_pos_w shape (500, 64, 3) against episode_id (3000,), and
+   naive z-extraction gives values up to 7.4 m — impossible for a G1.
+   Either the 64-axis is bodies/links (so the criterion's
+   `[..., 2] > 0.85 .any()` scans EVERY body's z — a raised HAND could
+   satisfy "flight"), or coordinates/episodes are laid out differently
+   than the criterion evaluator assumes. Resolution path: read
+   `_episodes_to_npz_dict` + the mjlab runner's trajectory writer to
+   pin the layout, cross-check `mission_runtime._build_criterion_
+   namespace`'s handling, and WATCH stages/explosive_launch/runs/
+   iter_1/rollout/rollout.mp4 (30-second human check). Until then,
+   treat BOTH airborne-stage criterion passes as UNVALIDATED, and
+   treat "criterion references multi-body arrays without an explicit
+   root index" as a decompose-prompt defect to fix (criteria should
+   use a defined root channel, not `[..., 2]` over an ambiguous
+   array). The stage-machinery verification (RSI applied, warm-start
+   chain, redecompose) stands regardless.
 4. jump_and_land_stable failed its (much harder, full-composition)
    criterion at the 2-iter budget — expected — and then AUTONOMOUSLY
    RE-DECOMPOSED itself (Ship 17) into sub-stages; the first sub-stage
