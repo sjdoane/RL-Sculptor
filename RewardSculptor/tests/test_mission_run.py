@@ -3038,3 +3038,113 @@ def test_redecompose_rsi_flag_per_substage_not_force_inherited(
     )
     # The LLM can still set True on the airborne sub-stage.
     assert sub_stages[1].needs_reference_rsi is True
+
+
+# ── §keep-best finalization (B1): the crown-jewel regression lock ──────────
+def test_keep_best_selects_passing_iter_over_late_regression(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """The jump-survives-a-collapse guarantee. A stage trains iter_1
+    (satisfies the criterion, high fitness — 'the jump') then iter_2
+    (regresses below the criterion — 'collapse to standing'). The stage
+    must SUCCEED and keep iter_1's policy, NOT finalize on the last iter.
+    """
+    from sculptor import sculpt as sculpt_mod
+    from sculptor.sculpt import IterOutcome, SculptRunResult
+
+    m = _make_mission(tmp_path, n_stages=1)
+    m.stages[0].success_criterion = "behavior['mean_return'] > 0.8"
+
+    def multi_iter_fake(*, config_path, behavior_goal, iterations=3, **_kw):
+        project = Path(config_path).parent
+        specs = [(1, 0.9, 5.0), (2, 0.3, 1.0)]  # (iter, mean_return, fitness)
+        outcomes = []
+        for idx, mret, fit in specs:
+            iter_dir = project / "runs" / f"iter_{idx}"
+            iter_dir.mkdir(parents=True, exist_ok=True)
+            (iter_dir / "checkpoint.pt").write_bytes(b"fake-ckpt")
+            _fabricate_rollout_artifacts(
+                iter_dir,
+                behavior={"n_episodes": 1, "mean_return": mret,
+                          "mean_episode_length": 400.0,
+                          "max_episode_length": 500},
+            )
+            outcomes.append(IterOutcome(
+                iter_index=idx, iter_dir=iter_dir,
+                reward_path_before=project / "rewards" / "v1.py",
+                reward_path_after=project / "rewards" / f"v{idx}.py",
+                primary_metric=mret, behavior={"mean_return": mret},
+                failure_modes=[], edit_count=0,
+                fitness=fit, steer_fitness=fit,
+            ))
+        return SculptRunResult(
+            iterations_run=2, completed_iters=outcomes,
+            primary_metric_history=[0.9, 0.3])
+
+    monkeypatch.setattr(sculpt_mod, "sculpt_run", multi_iter_fake)
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit)
+
+    events: list[dict] = []
+    result = sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab", on_event=events.append)
+
+    sr = result.stage_results[0]
+    assert sr.status == "succeeded"
+    assert sr.criterion_satisfied is True
+    # Kept the JUMPING iter (1), not the regressed last iter (2).
+    assert sr.selected_iter_index == 1
+    assert sr.selection_source == "criterion+fitness"
+    assert sr.final_policy_path.endswith("iter_1/checkpoint.pt")
+    sel = [e for e in events if e["type"] == "stage_final_selection"]
+    assert sel and sel[-1]["iter"] == 1 and sel[-1]["criterion_pass"] is True
+
+
+def test_keep_best_no_pass_keeps_strongest_for_warm_start(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """When NO iter satisfies the criterion, the stage fails
+    criterion_not_met BUT final_policy_path points at the best-fitness
+    iter (so warm-start / re-decompose inherit the strongest policy, not
+    the regressed last one)."""
+    from sculptor import sculpt as sculpt_mod
+    from sculptor.sculpt import IterOutcome, SculptRunResult
+
+    m = _make_mission(tmp_path, n_stages=1)
+    m.stages[0].success_criterion = "behavior['mean_return'] > 5.0"  # unreachable
+    m.stages[0].redecomposition_attempts = 1  # halt, don't redecompose
+
+    def multi_iter_fake(*, config_path, behavior_goal, iterations=3, **_kw):
+        project = Path(config_path).parent
+        specs = [(1, 0.9, 9.0), (2, 0.4, 2.0)]  # iter1 strongest
+        outcomes = []
+        for idx, mret, fit in specs:
+            iter_dir = project / "runs" / f"iter_{idx}"
+            iter_dir.mkdir(parents=True, exist_ok=True)
+            (iter_dir / "checkpoint.pt").write_bytes(b"fake-ckpt")
+            _fabricate_rollout_artifacts(
+                iter_dir,
+                behavior={"n_episodes": 1, "mean_return": mret,
+                          "mean_episode_length": 400.0,
+                          "max_episode_length": 500})
+            outcomes.append(IterOutcome(
+                iter_index=idx, iter_dir=iter_dir,
+                reward_path_before=project / "rewards" / "v1.py",
+                reward_path_after=project / "rewards" / f"v{idx}.py",
+                primary_metric=mret, behavior={"mean_return": mret},
+                failure_modes=[], edit_count=0, fitness=fit, steer_fitness=fit))
+        return SculptRunResult(
+            iterations_run=2, completed_iters=outcomes,
+            primary_metric_history=[0.9, 0.4])
+
+    monkeypatch.setattr(sculpt_mod, "sculpt_run", multi_iter_fake)
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit)
+
+    result = sculpt_mod.mission_run(m, adapter_short_name="mjlab")
+    sr = result.stage_results[0]
+    assert sr.status == "failed"
+    assert sr.failure_reason == "criterion_not_met"
+    assert sr.selected_iter_index == 1  # strongest, not the last
+    assert sr.final_policy_path.endswith("iter_1/checkpoint.pt")
+    assert sr.selection_source == "fitness_fallback"

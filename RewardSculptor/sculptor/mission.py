@@ -122,6 +122,16 @@ class Stage:
     # stages that haven't run yet; backward-compatible via Stage.from_
     # dict's filter-unknown-keys path.
     effective_max_iterations: Optional[int] = None
+    # §keep-best finalization (B1): which iteration this stage actually
+    # KEPT as its final policy, and why. The stage no longer finalizes on
+    # the LAST iter — it selects the best iter whose rollout satisfies the
+    # criterion (highest fitness), so a late regression (e.g. a jump stage
+    # that collapses to standing) can't discard the good policy. None on
+    # stages that predate this / haven't run. Backward-compatible via
+    # from_dict's filter-unknown-keys path.
+    selected_iter_index: Optional[int] = None
+    #: "criterion+fitness" | "criterion_newest" | "fitness_fallback" | "last"
+    selection_source: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
         return dataclasses.asdict(self)

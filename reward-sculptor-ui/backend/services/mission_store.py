@@ -148,6 +148,9 @@ def _stages_to_schema(stages: list) -> list[StageSchema]:
             started_at=s.started_at,
             finished_at=s.finished_at,
             redecomposition_attempts=s.redecomposition_attempts,
+            # §keep-best (B1): which iter the stage kept + why.
+            selected_iter_index=getattr(s, "selected_iter_index", None),
+            selection_source=getattr(s, "selection_source", None),
         ))
     return out
 

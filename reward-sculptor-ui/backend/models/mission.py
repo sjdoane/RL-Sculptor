@@ -53,6 +53,11 @@ class StageSchema(BaseModel):
     started_at: Optional[str] = None
     finished_at: Optional[str] = None
     redecomposition_attempts: int = 0
+    # §keep-best (B1): the iteration the stage kept as its final policy +
+    # why ("criterion+fitness" | "criterion_newest" | "fitness_fallback" |
+    # "last"). None on legacy missions / stages that haven't finalized.
+    selected_iter_index: Optional[int] = None
+    selection_source: Optional[str] = None
 
 
 # ── Mission summary / detail / create ────────────────────────────────

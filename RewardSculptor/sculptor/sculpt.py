@@ -3368,23 +3368,121 @@ def _is_stage_scaffolded(stage_dir: Path) -> bool:
     )
 
 
+def _iter_checkpoint(iter_dir: Path) -> Optional[Path]:
+    """The checkpoint file (mjlab `.pt` / gym_sb3 `.zip`) in an iter dir,
+    or None. Size>0 guarded (a half-written checkpoint is not warm-
+    startable)."""
+    for ext in ("pt", "zip"):
+        p = Path(iter_dir) / f"checkpoint.{ext}"
+        if p.is_file() and p.stat().st_size > 0:
+            return p
+    return None
+
+
 def _resolve_stage_final_checkpoint(
     sculpt_result: "SculptRunResult",
 ) -> Optional[Path]:
     """Pick the checkpoint path from the last completed iter.
 
-    mjlab writes `checkpoint.pt`, gym_sb3 writes `checkpoint.zip` — glob
-    for both. Returns None if no iter produced a checkpoint (caller
-    marks the stage failed).
+    mjlab writes `checkpoint.pt`, gym_sb3 writes `checkpoint.zip`. Returns
+    None if the last iter produced no checkpoint. Retained for callers
+    that still want the last-iter policy; stage finalization now uses
+    `_select_stage_final_iter` (keep-best) instead.
     """
     if not sculpt_result.completed_iters:
         return None
-    last_iter = sculpt_result.completed_iters[-1]
-    for ext in ("pt", "zip"):
-        p = last_iter.iter_dir / f"checkpoint.{ext}"
-        if p.is_file() and p.stat().st_size > 0:
-            return p
-    return None
+    return _iter_checkpoint(sculpt_result.completed_iters[-1].iter_dir)
+
+
+def _iter_fitness_key(o: "IterOutcome") -> tuple[float, float, float]:
+    """Lexicographic keep-best key for an iteration, mirroring the loop's
+    own `(steer_fitness, steer_progress)` selection with primary_metric as
+    the final tiebreak. Missing channels sort lowest."""
+    NEG = float("-inf")
+    sf = o.steer_fitness if o.steer_fitness is not None else (
+        o.fitness if o.fitness is not None else NEG)
+    sp = o.steer_progress if o.steer_progress is not None else (
+        o.progress if o.progress is not None else NEG)
+    pm = o.primary_metric if o.primary_metric is not None else NEG
+    return (sf, sp, pm)
+
+
+def _select_stage_final_iter(
+    candidates: "list[IterOutcome]",
+    stage,
+) -> "tuple[Optional[IterOutcome], bool, str, Optional[str], bool]":
+    """§keep-best finalization (B1). Choose the iteration a stage keeps as
+    its final policy, so a late regression can't discard a good one.
+
+    Returns `(selected, criterion_ok, source, criterion_error,
+    error_is_missing_key)`.
+
+    Rule: among candidates that have a checkpoint AND whose rollout
+    satisfies the stage criterion, keep the one with the highest fitness
+    key (ties → newest iter_index). If none pass, keep the
+    highest-fitness candidate that has a checkpoint anyway (so warm-start /
+    re-decomposition inherit the STRONGEST policy, not the last one) and
+    report criterion failure. A genuine criterion bug (unsafe AST / dtype)
+    raises the SAME error on every iter → no pass → surfaced as
+    `criterion_errored`; a missing-key (metric absent) is a plain
+    non-pass → `criterion_not_met`. Never raises mid-scan.
+    """
+    from sculptor.mission_runtime import (
+        CriterionEvalError,
+        CriterionMissingKeyError,
+        _build_criterion_namespace,
+        _evaluate_success_criterion,
+    )
+
+    # Dedup by iter_dir, keeping the latest occurrence (extension passes
+    # can re-report the same on-disk iter).
+    by_dir: "dict[str, IterOutcome]" = {}
+    for o in candidates:
+        by_dir[str(o.iter_dir)] = o
+    with_ckpt = [o for o in by_dir.values() if _iter_checkpoint(o.iter_dir)]
+    if not with_ckpt:
+        return (None, False, "last", None, False)
+
+    passing: "list[IterOutcome]" = []
+    had_fitness = False
+    last_error: Optional[str] = None   # any criterion error message seen
+    only_missing_key = True            # False once a genuine (bug) error seen
+    saw_any_error = False
+    for o in with_ckpt:
+        if o.steer_fitness is not None or o.fitness is not None:
+            had_fitness = True
+        try:
+            ns = _build_criterion_namespace(
+                iter_dir=Path(o.iter_dir), primary_metric=o.primary_metric)
+            if _evaluate_success_criterion(stage.success_criterion, ns):
+                passing.append(o)
+        except CriterionEvalError as e:
+            saw_any_error = True
+            last_error = str(e)
+            if not isinstance(e, CriterionMissingKeyError):
+                only_missing_key = False
+        except Exception:  # noqa: BLE001 — a flaky iter is a non-pass, not fatal
+            pass
+
+    if passing:
+        winner = max(
+            passing, key=lambda o: (_iter_fitness_key(o), o.iter_index))
+        source = "criterion+fitness" if had_fitness else "criterion_newest"
+        return (winner, True, source, None, False)
+
+    # Nobody passed — keep the strongest policy for the successor anyway.
+    winner = max(with_ckpt, key=lambda o: (_iter_fitness_key(o), o.iter_index))
+    # Preserve the genuine-bug vs missing-key/plain-fail distinction the
+    # old single-iter path drew: a broken criterion still surfaces as
+    # criterion_errored; a missing key carries its message through to the
+    # recoverable criterion_not_met so re-decompose feedback names the key.
+    if saw_any_error and not only_missing_key:
+        return (winner, False, "fitness_fallback", last_error, False)
+    if saw_any_error:  # only missing-key errors
+        return (winner, False, "fitness_fallback", last_error, True)
+    # Criterion evaluated cleanly to False on every iter — a plain miss,
+    # no missing key.
+    return (winner, False, "fitness_fallback", None, False)
 
 
 def _verify_stage_adapter_matches(
@@ -4531,6 +4629,12 @@ def _run_one_stage(
             emit,
         )
 
+    # §keep-best finalization (B1): accumulate EVERY pass's iters. Each
+    # Goal-B extension REPLACES `sculpt_result`, so the final result only
+    # holds the extension's iters — but the best (e.g. jumping) policy may
+    # live in an earlier pass. Union them so selection sees them all.
+    all_iters: "list[IterOutcome]" = list(sculpt_result.completed_iters or [])
+
     # §Ship-19d Goal B: extension loop. Only entered when (a) the
     # caller opted in, (b) Goal A's callback did NOT fire (criterion
     # not yet satisfied), (c) the metric trend looks promising, and
@@ -4641,6 +4745,9 @@ def _run_one_stage(
                 f"{type(e).__name__}: {e}",
                 emit,
             )
+        # §keep-best (B1): fold this extension pass's iters into the
+        # candidate pool.
+        all_iters.extend(sculpt_result.completed_iters or [])
 
     stage.iterations_used = sculpt_result.iterations_run
     emit({
@@ -4654,53 +4761,66 @@ def _run_one_stage(
         "effective_max_iterations": effective_max_iterations,
     })
 
-    # 5. Derive final_policy_path from the last iter's checkpoint.
-    final_ckpt = _resolve_stage_final_checkpoint(sculpt_result)
-    if final_ckpt is None:
+    # 5-6. §keep-best finalization (B1): select the BEST iter whose
+    # rollout satisfies the criterion (highest fitness) — NOT the last
+    # iter. This is what makes a jump stage survive a late collapse to
+    # standing: the jumping policy is kept, evaluated, and warm-started
+    # from, even when a later iter regressed. `all_iters` unions every
+    # training + extension pass.
+    if not all_iters:
         return _fail_stage(
             stage, "no_checkpoint",
-            "training completed but no checkpoint.pt / .zip was "
-            "produced in the last iter — successor stages can't "
-            "warm-start from a missing file.",
+            "training completed but produced no iterations.",
             emit,
         )
+    (selected, criterion_ok, selection_source,
+     criterion_error, err_missing_key) = _select_stage_final_iter(
+        all_iters, stage)
+    if selected is None:
+        return _fail_stage(
+            stage, "no_checkpoint",
+            "training completed but no iteration produced a "
+            "checkpoint.pt / .zip — successor stages can't warm-start "
+            "from a missing file.",
+            emit,
+        )
+    final_ckpt = _iter_checkpoint(selected.iter_dir)
     stage.final_policy_path = str(final_ckpt)
     stage.final_reward_path = (
         str(sculpt_result.final_reward_path)
         if sculpt_result.final_reward_path else None
     )
+    stage.best_metric = selected.primary_metric
+    stage.selected_iter_index = selected.iter_index
+    stage.selection_source = selection_source
+    emit({
+        "type": "stage_final_selection",
+        "stage_name": stage.name,
+        "iter": selected.iter_index,
+        "source": selection_source,
+        "criterion_pass": bool(criterion_ok),
+        "metric": selected.primary_metric,
+        "fitness": selected.steer_fitness if selected.steer_fitness is not None
+        else selected.fitness,
+        "n_candidates": len({str(o.iter_dir) for o in all_iters}),
+    })
 
-    # 6. Evaluate success criterion on the last iter's namespace.
-    last_iter = sculpt_result.completed_iters[-1]
-    stage.best_metric = last_iter.primary_metric
-    try:
-        namespace = _build_criterion_namespace(
-            iter_dir=last_iter.iter_dir,
-            primary_metric=last_iter.primary_metric,
-        )
-        criterion_ok = _evaluate_success_criterion(
-            stage.success_criterion, namespace,
-        )
-    except CriterionEvalError as e:
-        # A criterion that references a metric/component the reward never
-        # produced (KeyError → CriterionMissingKeyError) means the measured
-        # quantity is absent — i.e. the goal was NOT met, not that the
-        # criterion is broken. Route it to the recoverable, re-decomposable
-        # `criterion_not_met` so one early/typo'd key reference can't halt
-        # the whole mission. Genuine criterion bugs (syntax / unsafe AST /
-        # numpy-vs-torch dtype) stay `criterion_errored`.
-        missing_key = isinstance(e, CriterionMissingKeyError)
-        reason = "criterion_not_met" if missing_key else "criterion_errored"
+    # A genuine criterion bug (unsafe AST / dtype) raised on every iter →
+    # no pass with a real error surfaced → criterion_errored (unrecoverable,
+    # as before). A plain miss / missing-key stays the recoverable
+    # `criterion_not_met`. `final_policy_path` already points at the
+    # strongest policy either way, so warm-start / re-decompose inherit it.
+    if not criterion_ok and criterion_error is not None and not err_missing_key:
         emit({
             "type": "stage_criterion_evaluated",
             "stage_name": stage.name,
             "satisfied": False,
-            "error": str(e),
-            "missing_key": missing_key,
+            "error": criterion_error,
+            "missing_key": False,
         })
         return _fail_stage(
-            stage, reason, str(e), emit,
-            criterion_error=str(e),
+            stage, "criterion_errored", criterion_error, emit,
+            criterion_error=criterion_error,
         )
 
     emit({
@@ -4708,7 +4828,10 @@ def _run_one_stage(
         "stage_name": stage.name,
         "criterion": stage.success_criterion,
         "satisfied": bool(criterion_ok),
-        "last_iter_metric": last_iter.primary_metric,
+        "last_iter_metric": selected.primary_metric,
+        # True only when the miss was a missing key (recoverable, names the
+        # key for re-decompose feedback); False for a clean criterion-false.
+        "missing_key": err_missing_key,
     })
 
     if criterion_ok:
@@ -4755,13 +4878,19 @@ def _run_one_stage(
             final_reward_path=stage.final_reward_path,
             criterion_satisfied=True,
             last_iter_metric=stage.best_metric,
+            selected_iter_index=stage.selected_iter_index,
+            selection_source=stage.selection_source,
         )
 
     return _fail_stage(
         stage, "criterion_not_met",
-        f"success_criterion {stage.success_criterion!r} evaluated False "
-        f"on last iter (metric={last_iter.primary_metric}).",
+        f"success_criterion {stage.success_criterion!r} was not met by any "
+        f"trained iteration (kept iter {selected.iter_index}, "
+        f"metric={selected.primary_metric}).",
         emit,
+        # Preserve the missing-key detail (if any) so re-decompose feedback
+        # can point Claude at the real absent key.
+        criterion_error=criterion_error,
     )
 
 
@@ -4790,6 +4919,10 @@ def _fail_stage(
         criterion_error=criterion_error,
         last_iter_metric=stage.best_metric,
         failure_reason=reason,
+        # §keep-best (B1): carry the selection (None on pre-selection
+        # failures like training_errored / no_checkpoint).
+        selected_iter_index=getattr(stage, "selected_iter_index", None),
+        selection_source=getattr(stage, "selection_source", None),
     )
 
 

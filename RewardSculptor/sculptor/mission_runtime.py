@@ -146,6 +146,11 @@ class StageResult:
     # Free-form reason string when status == "failed" (e.g.,
     # "no_checkpoint", "criterion_not_met", "training_errored").
     failure_reason: Optional[str] = None
+    # §keep-best finalization (B1): the iteration index this stage kept as
+    # its final policy + why (see Stage.selection_source). None on the
+    # legacy last-iter path / stages that predate this.
+    selected_iter_index: Optional[int] = None
+    selection_source: Optional[str] = None
 
 
 @dataclass
