@@ -864,6 +864,25 @@ export function stageCheckpointUrl(
   return `/api/projects/${slug}/missions/${missionSlug}/stages/${encodeURIComponent(stageName)}/iterations/${iterIndex}/checkpoint`;
 }
 
+/** GET /projects/{slug}/iterations — disk-truth iteration list for the
+ *  PROJECT-level runs tree (plain sculpt runs). No JobManager entry
+ *  required, so it keeps working after a backend restart — the data
+ *  source for the synthetic "disk:project" run row. Same row shape as
+ *  the per-stage endpoint. */
+export async function getProjectIterations(
+  slug: string,
+): Promise<StageIteration[]> {
+  return handle<StageIteration[]>(
+    await fetch(`/api/projects/${slug}/iterations`),
+  );
+}
+
+/** Rollout mp4 URL for a project-level iteration (disk-truth; no
+ *  JobManager entry required, unlike iterRolloutUrl). */
+export function projectIterRolloutUrl(slug: string, iterIndex: number): string {
+  return `/api/projects/${slug}/iterations/${iterIndex}/rollout`;
+}
+
 /** GET .../stages/{stage}/env-spec — the applied env curriculum for a
  *  stage. `current.meta.source` starting "reference:" ⇒ RSI applied. */
 export async function getStageEnvSpec(

@@ -1,12 +1,13 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
-import { controlRun, getRun, killRun, launchRun, listRuns } from "@/lib/api";
+import { controlRun, getProjectIterations, getRun, killRun, launchRun, listRuns } from "@/lib/api";
 import { qk } from "@/lib/queryKeys";
 import type {
   RunControlState,
   RunDetail,
   RunParamsPayload,
   RunSummary,
+  StageIteration,
 } from "@/lib/types";
 
 const RUN_POLL_MS = 3000;
@@ -95,5 +96,20 @@ export function useControlRun(slug: string) {
     onSuccess: (_r, { runId }) => {
       qc.invalidateQueries({ queryKey: qk.run(slug, runId) });
     },
+  });
+}
+
+/** §increment 3: disk-truth iterations for the PROJECT-level runs tree
+ *  (plain sculpt runs) — the data source for the synthetic
+ *  "disk:project" run row, which has no JobManager entry to query.
+ *  Mirrors useStageIterations. */
+export function useProjectIterations(
+  slug: string | undefined,
+  opts?: { enabled?: boolean },
+) {
+  return useQuery<StageIteration[]>({
+    queryKey: slug ? qk.projectIters(slug) : ["projectIters", "_none"],
+    queryFn: () => getProjectIterations(slug!),
+    enabled: !!slug && (opts?.enabled ?? true),
   });
 }

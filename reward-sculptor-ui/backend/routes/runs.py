@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import re
 from pathlib import Path
 from typing import Any, Optional
@@ -28,6 +29,7 @@ from fastapi import (
 )
 from fastapi.responses import FileResponse, JSONResponse
 
+from backend.models.mission import StageIterationSummary
 from backend.models.project import ProblemDetail
 from backend.models.run import (
     IterEventSummary,
@@ -310,6 +312,146 @@ def _synthesize_disk_run_rows(
     return out
 
 
+# ── §mission-persistence increment 3: project-level disk run row ──────
+# Plain PROJECT-level runs (artifacts at `<project_dir>/runs/iter_*/`)
+# had the same restart gap the stage rows above closed: JobManager is
+# in-memory, so after a backend restart the Training sidebar's "Single
+# runs" section went empty even with dozens of trained iterations on
+# disk. Unlike mission stages there is no per-run record on disk —
+# iter dirs ACCUMULATE across every sculpt run of the project into one
+# shared tree — so we synthesize ONE row covering that whole tree.
+_ITER_DIR_RE = re.compile(r"^iter_(\d+)$")
+
+# The one well-known id for the synthetic project-level row. The
+# frontend routes it to a disk-truth pane; every _find_run-gated
+# endpoint 404s for it by construction (never a resident job id).
+PROJECT_DISK_RUN_ID = "disk:project"
+
+
+def _project_iter_dirs(runs_root: Path) -> list[tuple[int, Path]]:
+    """Sorted `(iter_index, dir)` pairs under a `runs/` tree."""
+    if not runs_root.is_dir():
+        return []
+    out: list[tuple[int, Path]] = []
+    for d in runs_root.iterdir():
+        m = _ITER_DIR_RE.match(d.name)
+        if m and d.is_dir():
+            out.append((int(m.group(1)), d))
+    out.sort(key=lambda t: t[0])
+    return out
+
+
+def _load_json_dict(p: Path) -> Optional[dict]:
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _read_project_metric_history(project_dir: Path) -> list[Optional[float]]:
+    """`reports/metric_history.json`, per-iter-index primary metrics.
+
+    The PROJECT-level file is a dict `{"primary_metric": <name>,
+    "history": [...]}` (the stage-level analog in routes/missions.py is
+    a bare list); accept both shapes so this helper stays correct if
+    the writer ever unifies them."""
+    path = project_dir / "reports" / "metric_history.json"
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    if isinstance(loaded, dict):
+        loaded = loaded.get("history")
+    if not isinstance(loaded, list):
+        return []
+    return [
+        float(v) if isinstance(v, (int, float)) else None for v in loaded
+    ]
+
+
+def _iter_looks_completed(iter_dir: Path) -> bool:
+    """An iteration that finished training leaves `metrics.json` (and
+    usually a checkpoint). Either marker counts — older iters may have
+    one without the other."""
+    if (iter_dir / "metrics.json").is_file():
+        return True
+    return _find_stage_checkpoint(iter_dir) is not None
+
+
+def _synthesize_project_disk_run_row(
+    project_dir: Path, project_slug: str, jobs: JobManager,
+) -> Optional[RunSummary]:
+    """One synthetic `sculpt_run` row when `<project_dir>/runs/iter_*`
+    exist but NO resident sculpt_run job covers them (backend restarted
+    since the run(s) ended). Mirrors `_synthesize_disk_run_rows` for
+    mission stages.
+
+    Dedup: ANY resident sculpt_run job for this project — running,
+    queued, or terminal — suppresses the synthetic row. Iter dirs are
+    one shared per-project tree accumulated across runs, so a resident
+    job's row already reaches these artifacts, and there is no per-run
+    partition on disk that would let us row-split honestly.
+
+    Status comes from the LAST iteration's disk state: a finished
+    marker (metrics.json / checkpoint) reads "completed"; a bare iter
+    dir means the process died mid-iteration → errored/"interrupted".
+    A run that ended between iterations is indistinguishable from a
+    clean finish on disk, so this is best-effort truth, not history.
+    """
+    if jobs.list(kind="sculpt_run", project_slug=project_slug):
+        return None
+    pairs = _project_iter_dirs(project_dir / "runs")
+    if not pairs:
+        return None
+
+    completed = sum(1 for _, d in pairs if _iter_looks_completed(d))
+    _, last_dir = pairs[-1]
+    if _iter_looks_completed(last_dir):
+        run_status = "completed"
+        error = None
+    else:
+        run_status = "errored"
+        error = "interrupted"
+
+    meta = _load_json_dict(project_dir / "metadata.json") or {}
+    goal = str(meta.get("behavior_goal") or "")
+
+    # Best-effort timestamps from iter-dir mtimes. NOTE: the row spans
+    # every past run of the project, so this reads as "first to last
+    # trained iteration", not one run's wall-clock duration.
+    from datetime import datetime as _dt, timezone as _tz
+
+    started_at = ended_at = None
+    try:
+        mtimes = [d.stat().st_mtime for _, d in pairs]
+        started_at = _dt.fromtimestamp(min(mtimes), tz=_tz.utc)
+        ended_at = _dt.fromtimestamp(max(mtimes), tz=_tz.utc)
+    except OSError:
+        pass
+
+    return RunSummary(
+        run_id=PROJECT_DISK_RUN_ID,
+        project_slug=project_slug,
+        status=run_status,  # type: ignore[arg-type]
+        behavior_goal=goal,
+        iterations_requested=0,  # unknown across runs → UI shows "?"
+        iterations_completed=completed,
+        current_iter_index=None,
+        primary_metric_history=_read_project_metric_history(project_dir),
+        fitness_history=[],
+        started_at=started_at,
+        ended_at=ended_at,
+        error=error,
+        kind="sculpt_run",
+        parent_id=None,
+        mission_slug=None,
+        stage_name=None,
+        stage_index=None,
+        mode=None,
+    )
+
+
 # ── POST /projects/{slug}/runs ────────────────────────────────────────
 @router.post(
     "/projects/{slug}/runs",
@@ -403,6 +545,14 @@ def list_runs(
     rows.extend(_synthesize_disk_run_rows(
         Path(detail.project_dir), slug, jobs,
     ))
+    # §increment 3: same treatment for plain project-level runs — one
+    # synthetic sculpt_run row when iter dirs exist on disk but no
+    # resident sculpt_run job covers them (see the dedup inside).
+    project_row = _synthesize_project_disk_run_row(
+        Path(detail.project_dir), slug, jobs,
+    )
+    if project_row is not None:
+        rows.append(project_row)
     return rows
 
 
@@ -815,3 +965,97 @@ def get_iter_rollout(
 
 
 _CLIP_NAME_RE = re.compile(r"^iter_\d+\.mp4$")
+
+
+# ── §increment 3: project-level disk-truth iteration endpoints ────────
+# Mirrors routes/missions.py's §C2 stage endpoints (list_stage_iterations
+# / get_stage_iter_rollout), but for the PROJECT runs tree — no
+# JobManager entry required, so the synthetic "disk:project" row's
+# detail pane keeps working after a backend restart.
+@router.get(
+    "/projects/{slug}/iterations",
+    response_model=list[StageIterationSummary],
+    responses={404: {"model": ProblemDetail}},
+)
+def list_project_iterations(
+    slug: str,
+    store: ProjectStore = Depends(get_store),
+) -> Any:
+    """Disk-truth iteration list for the project-level runs tree."""
+    detail = store.get(slug)
+    if detail is None:
+        return _problem(
+            status.HTTP_404_NOT_FOUND, "project not found",
+            detail=f"no project with slug {slug!r}", type_="/problems/not-found",
+        )
+    project_dir = Path(detail.project_dir)
+    metric_history = _read_project_metric_history(project_dir)
+
+    out: list[StageIterationSummary] = []
+    for iter_index, d in _project_iter_dirs(project_dir / "runs"):
+        primary_metric: Optional[float] = None
+        if 0 <= iter_index < len(metric_history):
+            primary_metric = metric_history[iter_index]
+        if primary_metric is None:
+            metrics = _load_json_dict(d / "metrics.json") or {}
+            mm = metrics.get("metrics")
+            if isinstance(mm, dict):
+                v = mm.get("mean_return")
+                if isinstance(v, (int, float)):
+                    primary_metric = float(v)
+
+        behavior = _load_json_dict(d / "rollout" / "behavior.json") or {}
+        fitness = behavior.get("fitness")
+
+        spec = _load_json_dict(d / "reward_spec.json") or {}
+        reward_version = spec.get("version")
+
+        rollout_path = d / "rollout" / "rollout.mp4"
+        out.append(StageIterationSummary(
+            iter_index=iter_index,
+            primary_metric=primary_metric,
+            fitness=fitness if isinstance(fitness, (int, float)) else None,
+            has_rollout=rollout_path.is_file() and rollout_path.stat().st_size > 0,
+            has_checkpoint=_find_stage_checkpoint(d) is not None,
+            reward_version=reward_version if isinstance(reward_version, str) else None,
+        ))
+    return out
+
+
+@router.get(
+    "/projects/{slug}/iterations/{iter_index}/rollout",
+    response_class=FileResponse,
+    responses={
+        200: {"content": {"video/mp4": {}}},
+        404: {"model": ProblemDetail},
+    },
+)
+def get_project_iter_rollout(
+    slug: str,
+    iter_index: int,
+    store: ProjectStore = Depends(get_store),
+) -> Any:
+    """Disk-truth rollout.mp4 for one project-level iteration — no
+    JobManager entry required. Same >2048-byte truncation guard as
+    `get_iter_rollout` / `get_stage_iter_rollout`."""
+    detail = store.get(slug)
+    if detail is None:
+        return _problem(
+            status.HTTP_404_NOT_FOUND, "project not found",
+            detail=f"no project with slug {slug!r}", type_="/problems/not-found",
+        )
+    path = (
+        Path(detail.project_dir) / "runs" / f"iter_{iter_index}"
+        / "rollout" / "rollout.mp4"
+    )
+    if not path.is_file() or path.stat().st_size < 2048:
+        return _problem(
+            status.HTTP_404_NOT_FOUND, "rollout not available",
+            detail=(
+                f"iter {iter_index} has no rollout.mp4 in the project "
+                "runs tree (either it never rendered or the iter "
+                "errored before rollout capture)"
+            ),
+            type_="/problems/not-found",
+        )
+    return FileResponse(path, media_type="video/mp4")

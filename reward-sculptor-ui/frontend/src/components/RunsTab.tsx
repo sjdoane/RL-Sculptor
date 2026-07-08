@@ -13,8 +13,8 @@ import { useRunEvents } from "@/hooks/useRunEvents";
 import { useMission, useMissions, useStageIterations } from "@/hooks/useMissions";
 import { useRegenerateRewardTemplate, useRewards } from "@/hooks/useRewards";
 import { usePolicies } from "@/hooks/usePolicies";
-import { useControlRun, useKillRun, useRun, useRuns } from "@/hooks/useRuns";
-import { ApiError, getMission, policyExportUrl, stageRolloutUrl } from "@/lib/api";
+import { useControlRun, useKillRun, useProjectIterations, useRun, useRuns } from "@/hooks/useRuns";
+import { ApiError, getMission, policyExportUrl, projectIterRolloutUrl, stageRolloutUrl } from "@/lib/api";
 import { qk } from "@/lib/queryKeys";
 import { failureReasonText, stageLabel, supersededText } from "@/lib/stageDisplay";
 import { formatRelative } from "@/lib/utils";
@@ -432,7 +432,13 @@ function RunSidebar({
 function RunRow({
   run: r, displayLabel = null, selected, onSelect, stageContext = false,
 }: { run: RunSummary; displayLabel?: string | null; selected: boolean; onSelect: () => void; stageContext?: boolean }) {
-  const titleText = stageContext ? r.stage_name ?? r.run_id.replace(/^job_/, "") : r.run_id.replace(/^job_/, "");
+  // §increment 3: the synthetic project-level disk row gets a human
+  // name — "disk:project" is an API id, not a label.
+  const titleText = stageContext
+    ? r.stage_name ?? r.run_id.replace(/^job_/, "")
+    : r.run_id === "disk:project"
+      ? "project runs (recovered)"
+      : r.run_id.replace(/^job_/, "");
   const itersDenom = r.iterations_requested || "?";
   // §Increment 4: prefer the server's hierarchical display_label ("1.2")
   // over stage_index+1 — falls back while the mission-detail label map is
@@ -493,6 +499,14 @@ function RunDetailPane({ slug, runId, runs }: { slug: string; runId: string; run
     // the common case of a freshly-launched stage.
     (missionDetail.isLoading && (summaryEarly?.status === "running" || summaryEarly?.status === "queued"));
   const useDiskTruth = isStageRunEarly && !isLiveStage;
+
+  // §increment 3: the synthetic project-level row (run_id "disk:project",
+  // synthesized by list_runs after a backend restart) has no JobManager
+  // entry — LiveRunDetailPane's useRun/useRunEvents would 404 on it.
+  // Route it to the project-scoped disk-truth pane instead.
+  if (summaryEarly?.run_id === "disk:project") {
+    return <ProjectDiskDetailPane slug={slug} summary={summaryEarly} />;
+  }
 
   return useDiskTruth && missionSlugEarly && stageNameEarly ? (
     <StageDetailPane
@@ -623,6 +637,120 @@ function StageDetailPane({
 
       <div className="rs-extra-col">
         {missionSlug && stageName && <StageRewardsCard slug={slug} stage={`${missionSlug}/${stageName}`} />}
+      </div>
+    </div>
+  );
+}
+
+// §increment 3: disk-truth PROJECT-level view — the detail pane for the
+// synthetic "disk:project" row. Mirrors StageDetailPane, but sources
+// iterations + rollout from the project-scoped endpoints
+// (useProjectIterations / projectIterRolloutUrl) instead of a
+// mission-stage's, since plain sculpt runs write straight into
+// <project_dir>/runs/iter_*/.
+function ProjectDiskDetailPane({
+  slug, summary,
+}: { slug: string; summary: RunSummary | null }) {
+  const iters = useProjectIterations(slug);
+  const rows = iters.data ?? [];
+
+  const [picked, setPicked] = useState<number | null>(null);
+  const defaultIter = useMemo(() => {
+    if (rows.length === 0) return null;
+    const newestWithRollout = [...rows].reverse().find((r) => r.has_rollout);
+    if (newestWithRollout) return newestWithRollout.iter_index;
+    return rows[rows.length - 1].iter_index;
+  }, [rows]);
+  const activeIter = picked ?? defaultIter;
+  const activeRow = rows.find((r) => r.iter_index === activeIter) ?? null;
+
+  return (
+    <div className="rs-runs-detail">
+      <div className="rs-iter-col">
+        <div className="rs-eyebrow" style={{ marginBottom: 12 }}>Iterations</div>
+        {iters.isLoading && <p className="rs-sub" style={{ fontSize: 11 }}>Loading…</p>}
+        {iters.error && <p style={{ fontSize: 11, color: "var(--st-rose)" }}>{(iters.error as Error).message}</p>}
+        {!iters.isLoading && rows.length === 0 && <p className="rs-sub" style={{ fontSize: 11 }}>No iterations on disk yet for this project.</p>}
+        {rows.map((r) => (
+          <StageIterCard
+            key={r.iter_index}
+            row={r}
+            selected={activeIter === r.iter_index}
+            kept={false}
+            onSelect={() => setPicked(r.iter_index)}
+          />
+        ))}
+      </div>
+
+      <div className="rs-mid-col">
+        <div className="rs-run-header">
+          <Icon name="activity" size={17} color="var(--rs-muted)" />
+          <span className="mono" style={{ fontSize: 14, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}>
+            project runs
+          </span>
+          {summary && <RunStatusBadge run={summary} />}
+          <span className="rs-grow" />
+          <span className="rs-eyebrow" style={{ flexShrink: 0 }}>disk-truth · recovered after restart</span>
+        </div>
+
+        {activeIter != null && activeRow?.has_rollout ? (
+          <div style={{ margin: "0 16px 12px", border: "1px solid var(--hairline)", borderRadius: "var(--radius-md)", overflow: "hidden" }}>
+            <div className="rs-log-bar" style={{ gap: 8 }}>
+              <Icon name="video" size={13} color="var(--rs-muted)" />
+              <span style={{ fontSize: 11.5, fontWeight: 600 }}>iter {activeIter} rollout</span>
+              <span className="rs-grow" />
+              <a
+                href={projectIterRolloutUrl(slug, activeIter)}
+                download={`${slug}_iter_${activeIter}.mp4`}
+                className="rs-btn rs-btn-quiet rs-btn-xs"
+              >
+                <Icon name="download" size={13} />MP4
+              </a>
+            </div>
+            <video
+              key={activeIter}
+              src={projectIterRolloutUrl(slug, activeIter)}
+              style={{ width: "100%", aspectRatio: "16/9", background: "#16150f", display: "block" }}
+              controls
+              playsInline
+              preload="metadata"
+            >
+              <track kind="captions" />
+            </video>
+          </div>
+        ) : activeIter != null ? (
+          <p className="rs-sub" style={{ margin: "0 16px 12px", fontSize: 11 }}>iter {activeIter} has no rollout video.</p>
+        ) : null}
+
+        <div style={{ padding: "0 16px" }}>
+          <p className="rs-sub" style={{ fontSize: 12, lineHeight: 1.6 }}>
+            The backend restarted since these runs ended, so their live logs are
+            gone — this view reads the trained iterations straight off disk.
+            Iterations accumulate here across every single run of the project.
+          </p>
+        </div>
+      </div>
+
+      <div className="rs-extra-col">
+        {activeIter != null && activeRow?.has_checkpoint && (
+          <div className="rs-card rs-card-pad">
+            <div className="rs-card-title" style={{ fontSize: 13, marginBottom: 8 }}>
+              <Icon name="package" size={15} />Deploy this policy
+            </div>
+            <p className="rs-sub" style={{ margin: "0 0 10px", fontSize: 12 }}>
+              Download iter {activeIter}'s checkpoint bundled with its
+              reward, env spec, and an ONNX/TorchScript policy network.
+            </p>
+            <a
+              href={policyExportUrl(slug, activeIter)}
+              download
+              className="rs-btn rs-btn-primary rs-btn-sm"
+            >
+              <Icon name="download" size={14} />Export policy bundle
+            </a>
+          </div>
+        )}
+        <StageRewardsCard slug={slug} stage={null} />
       </div>
     </div>
   );
@@ -931,11 +1059,14 @@ function StageContextCard({ run, displayLabel = null }: { run: RunSummary; displ
   );
 }
 
-function StageRewardsCard({ slug, stage }: { slug: string; stage: string }) {
+// `stage` null ⇒ the project-global reward versions (used by the
+// disk-truth project pane); a `<missionSlug>/<stageName>` string keeps
+// the original per-stage behavior.
+function StageRewardsCard({ slug, stage }: { slug: string; stage: string | null }) {
   const versions = useRewards(slug, stage);
   return (
     <div className="rs-card">
-      <div className="rs-card-head"><div className="rs-card-title" style={{ fontSize: 13 }}><Icon name="file-code" size={15} />Stage rewards</div></div>
+      <div className="rs-card-head"><div className="rs-card-title" style={{ fontSize: 13 }}><Icon name="file-code" size={15} />{stage ? "Stage rewards" : "Rewards"}</div></div>
       <div className="rs-verlist">
         {versions.isLoading && <p className="rs-sub" style={{ padding: "10px 14px", fontSize: 11 }}>Loading…</p>}
         {versions.error && <p style={{ padding: "10px 14px", fontSize: 11, color: "var(--st-rose)" }}>{(versions.error as Error).message}</p>}

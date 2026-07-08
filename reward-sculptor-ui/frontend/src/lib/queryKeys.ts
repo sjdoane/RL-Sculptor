@@ -48,6 +48,8 @@ export const qk = {
   // §Ship 20 (de-siloing): disk-truth stage iterations + env spec.
   stageIters: (slug: string, missionSlug: string, stageName: string) =>
     ["stageIters", slug, missionSlug, stageName] as const,
+  // §increment 3: disk-truth PROJECT-level iterations (plain runs).
+  projectIters: (slug: string) => ["projectIters", slug] as const,
   stageEnvSpec: (slug: string, missionSlug: string, stageName: string) =>
     ["stageEnvSpec", slug, missionSlug, stageName] as const,
 

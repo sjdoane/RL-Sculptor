@@ -7,7 +7,7 @@ import { useProjectPreview } from "@/hooks/useProjectPreview";
 import { useMission, useMissions, useStageIterations } from "@/hooks/useMissions";
 import { useRunEvents } from "@/hooks/useRunEvents";
 import { useRuns } from "@/hooks/useRuns";
-import { clipUrl, iterRolloutUrl, previewUrl, stageRolloutUrl } from "@/lib/api";
+import { clipUrl, iterRolloutUrl, previewUrl, projectIterRolloutUrl, stageRolloutUrl } from "@/lib/api";
 import { failureReasonText, stageLabel, supersededText } from "@/lib/stageDisplay";
 import type {
   CameraAngle, MissionSummary, RunSummary, SelectedStage, StageSchema,
@@ -594,8 +594,14 @@ function ReplayLayer({
 
   const src = useMemo(() => {
     if (!run || iter === null) return null;
-    if (isDiskRow && run.mission_slug && run.stage_name) {
-      return stageRolloutUrl(slug, run.mission_slug, run.stage_name, iter);
+    if (isDiskRow) {
+      if (run.mission_slug && run.stage_name) {
+        return stageRolloutUrl(slug, run.mission_slug, run.stage_name, iter);
+      }
+      // §increment 3: the project-level disk row ("disk:project") has
+      // no mission/stage — its rollouts come from the project-scoped
+      // disk-truth endpoint.
+      return projectIterRolloutUrl(slug, iter);
     }
     return iterRolloutUrl(slug, run.run_id, iter);
   }, [slug, run, iter, isDiskRow]);
@@ -613,7 +619,7 @@ function ReplayLayer({
       {src && (
         <a
           href={src}
-          download={`${isDiskRow ? (run.stage_name ?? "stage") : run.run_id}_iter_${iter}.mp4`}
+          download={`${isDiskRow ? (run.stage_name ?? "project") : run.run_id}_iter_${iter}.mp4`}
           className="rs-overlay"
           style={{ left: "auto", right: 12, textDecoration: "none", cursor: "pointer" }}
           onClick={(e) => e.stopPropagation()}
