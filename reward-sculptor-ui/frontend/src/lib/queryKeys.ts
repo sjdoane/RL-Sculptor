@@ -48,4 +48,7 @@ export const qk = {
 
   dashboard: () => ["dashboard"] as const,
   systemInfo: () => ["systemInfo"] as const,
+
+  // Recoverable-delete bin (Settings → Trash).
+  trash: () => ["trash"] as const,
 };

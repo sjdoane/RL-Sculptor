@@ -3,12 +3,14 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 
 import { Icon } from "@/components/rs/icon";
-import { Badge, Btn, Field, Segmented, ToggleRow } from "@/components/rs/primitives";
+import { Badge, Btn, EmptyState, Field, Segmented, ToggleRow } from "@/components/rs/primitives";
 import { useSystemInfo } from "@/hooks/useDashboard";
 import { useRemoteSettings, useSharedKgStats, useSystemGpu } from "@/hooks/useLibrary";
 import { useTheme } from "@/hooks/useTheme";
-import { putRemoteSettings, runRemoteDoctor } from "@/lib/api";
-import type { GpuDevice, RemoteDoctorResponse, RemoteSettings } from "@/lib/types";
+import { usePurgeTrash, useRestoreTrash, useTrash } from "@/hooks/useTrash";
+import { ApiError, putRemoteSettings, runRemoteDoctor } from "@/lib/api";
+import { formatRelative } from "@/lib/utils";
+import type { GpuDevice, RemoteDoctorResponse, RemoteSettings, TrashEntry } from "@/lib/types";
 
 export default function Settings() {
   const { data, isLoading, error } = useSystemInfo();
@@ -43,6 +45,7 @@ export default function Settings() {
         )}
 
         <ThemeCard />
+        <TrashCard />
         <ResetCacheCard />
       </div>
     </div>
@@ -478,6 +481,166 @@ function ThemeCard() {
           />
         </div>
       </div>
+    </div>
+  );
+}
+
+// ── trash (recoverable deletes) ───────────────────────────────────────
+function fmtTrashBytes(n: number): string {
+  if (n >= 1e9) return `${(n / 1e9).toFixed(1)} GB`;
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)} MB`;
+  if (n >= 1e3) return `${Math.max(1, Math.round(n / 1e3))} KB`;
+  return `${n} B`;
+}
+
+function TrashCard() {
+  const { data, isLoading, error } = useTrash();
+  const entries = data ?? [];
+  return (
+    <div className="rs-card">
+      <div className="rs-card-head">
+        <div className="rs-card-title"><Icon name="trash" size={16} />Trash</div>
+        <span className="rs-sub" style={{ fontSize: 12 }}>
+          {entries.length > 0 ? `${entries.length} recoverable` : "recoverable deletes"}
+        </span>
+      </div>
+      <div className="rs-card-pad rs-vgap-8">
+        <p className="rs-sub" style={{ margin: 0 }}>
+          Deleted projects and missions land here. Restore returns them to their
+          original location; purge removes them from disk permanently.
+        </p>
+        {isLoading && <p className="rs-sub">Loading trash…</p>}
+        {error && (
+          <div className="rs-banner err">
+            <Icon name="alert-triangle" size={17} />
+            <span className="rs-grow">Could not load trash: {(error as Error).message}</span>
+          </div>
+        )}
+        {!isLoading && !error && entries.length === 0 && (
+          <EmptyState
+            icon="trash"
+            title="Trash is empty"
+            sub="Deleting a project or mission moves it here so it can be recovered."
+          />
+        )}
+        {entries.map((e) => (
+          <TrashRow key={e.entry_id} entry={e} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function TrashRow({ entry }: { entry: TrashEntry }) {
+  const restore = useRestoreTrash();
+  const purge = usePurgeTrash();
+  const [confirm, setConfirm] = useState("");
+  const [purging, setPurging] = useState(false);
+  const matches = confirm.trim() === entry.entry_id;
+  const busy = restore.isPending || purge.isPending;
+
+  const onRestore = () => {
+    restore.mutate(entry.entry_id, {
+      onSuccess: () => toast.success("Restored", { description: `${entry.display_name} is back in place.` }),
+      onError: (err) => {
+        const msg = err instanceof ApiError ? err.problem.detail ?? err.problem.title : (err as Error).message;
+        toast.error("Could not restore", { description: msg });
+      },
+    });
+  };
+  const onPurge = () => {
+    if (!matches) return;
+    purge.mutate(entry.entry_id, {
+      onSuccess: () => {
+        toast.success("Purged", { description: `${entry.display_name} was permanently deleted.` });
+        setPurging(false);
+        setConfirm("");
+      },
+      onError: (err) => {
+        const msg = err instanceof ApiError ? err.problem.detail ?? err.problem.title : (err as Error).message;
+        toast.error("Could not purge", { description: msg });
+      },
+    });
+  };
+
+  return (
+    <div
+      style={{
+        border: "1px solid var(--hairline)",
+        borderRadius: "var(--radius-md)",
+        padding: "10px 12px",
+        background: "var(--canvas-soft)",
+      }}
+    >
+      <div className="rs-flex rs-gap-12 rs-wrap" style={{ alignItems: "center", fontSize: 12.5 }}>
+        <span className="rs-tag" style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: 0.3 }}>{entry.kind}</span>
+        <span style={{ fontWeight: 500, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={entry.slug}>
+          {entry.display_name}
+        </span>
+        <code className="mono rs-sub" style={{ fontSize: 11 }}>{entry.slug}</code>
+        {entry.unreadable && (
+          <span className="rs-badge amber" style={{ fontSize: 9.5 }}>
+            <Icon name="alert-triangle" size={11} />unreadable
+          </span>
+        )}
+        <span className="rs-num rs-sub" style={{ fontSize: 11 }}>{fmtTrashBytes(entry.size_bytes)}</span>
+        <span className="rs-sub" style={{ fontSize: 11 }}>{formatRelative(entry.deleted_at)}</span>
+        <span style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
+          <Btn
+            kind="ghost"
+            size="sm"
+            icon={restore.isPending ? "loader" : "refresh-cw"}
+            disabled={busy}
+            onClick={onRestore}
+          >
+            Restore
+          </Btn>
+          {!purging && (
+            <Btn kind="quiet" size="sm" icon="trash" disabled={busy} onClick={() => setPurging(true)}>
+              Purge
+            </Btn>
+          )}
+        </span>
+      </div>
+      {purging && (
+        <div
+          className="rs-vgap-8"
+          style={{
+            marginTop: 10,
+            paddingTop: 10,
+            borderTop: "1px solid color-mix(in srgb, var(--st-rose) 35%, transparent)",
+          }}
+        >
+          <p style={{ margin: 0, fontSize: 12, color: "var(--st-rose-fg)" }}>
+            Permanent — this cannot be undone. Type the entry id to confirm.
+          </p>
+          <Field label={<>Type <code className="mono">{entry.entry_id}</code></>} htmlFor={`purge-${entry.entry_id}`}>
+            <input
+              id={`purge-${entry.entry_id}`}
+              className="rs-input mono"
+              value={confirm}
+              onChange={(ev) => setConfirm(ev.target.value)}
+              placeholder={entry.entry_id}
+              disabled={purge.isPending}
+              autoComplete="off"
+            />
+          </Field>
+          <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
+            <Btn kind="quiet" size="sm" onClick={() => { setPurging(false); setConfirm(""); }} disabled={purge.isPending}>
+              Cancel
+            </Btn>
+            <Btn
+              kind="danger"
+              size="sm"
+              icon={purge.isPending ? "loader" : "trash"}
+              onClick={onPurge}
+              disabled={!matches || purge.isPending}
+            >
+              Purge permanently
+            </Btn>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

@@ -884,3 +884,29 @@ export async function calibrateProjectMetric(
       { method: "POST" }),
   );
 }
+
+// ── Trash (recoverable deletes) ───────────────────────────────────────
+import type { TrashEntry } from "./types";
+
+export async function listTrash(): Promise<TrashEntry[]> {
+  return handle<TrashEntry[]>(await fetch("/api/trash"));
+}
+
+export async function restoreTrash(entryId: string): Promise<void> {
+  await handle<void>(
+    await fetch(`/api/trash/${encodeURIComponent(entryId)}/restore`, {
+      method: "POST",
+    }),
+  );
+}
+
+/** Permanent delete. The backend requires `confirm` to equal the
+ *  entry_id as a fat-finger guard, so the UI echoes it. */
+export async function purgeTrash(entryId: string): Promise<void> {
+  await handle<void>(
+    await fetch(
+      `/api/trash/${encodeURIComponent(entryId)}?confirm=${encodeURIComponent(entryId)}`,
+      { method: "DELETE" },
+    ),
+  );
+}

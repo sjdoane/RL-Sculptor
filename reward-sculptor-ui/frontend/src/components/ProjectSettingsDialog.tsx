@@ -248,8 +248,8 @@ function DangerZone({
     if (!matches) return;
     del.mutate(project.slug, {
       onSuccess: () => {
-        toast.success("Project deleted", {
-          description: `Removed ${project.slug} + all runs.`,
+        toast.success("Moved to Trash", {
+          description: `${project.slug} is recoverable from Settings → Trash.`,
         });
         onDeleted();
         nav("/projects");
@@ -270,7 +270,7 @@ function DangerZone({
         <Icon name="trash" size={12} /> Danger zone
       </span>
       <p style={{ margin: "0 0 10px", fontSize: 12, color: "var(--rs-muted)" }}>
-        Deleting removes the project directory + all runs. The sculptor library source is untouched. Type the slug to confirm.
+        Moves the project directory + all runs to Trash — recoverable from Settings → Trash. The sculptor library source is untouched. Type the slug to confirm.
       </p>
       <Field label={<>Type <code className="mono">{project.slug}</code> to confirm</>} htmlFor="confirm-slug">
         <input
@@ -284,7 +284,7 @@ function DangerZone({
       </Field>
       <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 12 }}>
         <Btn kind="danger" size="sm" icon={del.isPending ? "loader" : "trash"} onClick={onDelete} disabled={!matches || del.isPending}>
-          Delete project
+          Move to Trash
         </Btn>
       </div>
     </section>

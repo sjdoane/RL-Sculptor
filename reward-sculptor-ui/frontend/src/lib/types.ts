@@ -1017,3 +1017,18 @@ export interface MissionEvent {
   //   stage_redecomposed: { original_stage_name, sub_stage_names, ... }
   [key: string]: unknown;
 }
+
+// ── Trash (recoverable deletes) ──────────────────────────────────────
+// GET /trash → list of soft-deleted entries. A delete moves the entry
+// into a trash dir; restore moves it back, purge removes it for good.
+export interface TrashEntry {
+  entry_id: string;
+  kind: string;            // e.g. "project" | "mission" | "saved"
+  slug: string;
+  deleted_at: string;      // ISO-8601
+  size_bytes: number;
+  display_name: string;
+  /** True when the on-disk entry couldn't be introspected (corrupt /
+   *  partial). Restore is still allowed; the UI flags it. */
+  unreadable?: boolean;
+}
