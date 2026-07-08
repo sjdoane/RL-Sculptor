@@ -133,9 +133,17 @@ export function RewardsTab({
   useEffect(() => {
     if (selectedStageScope !== lastPropScope) {
       setLastPropScope(selectedStageScope);
-      setScopeOverride(null);
+      // Only clear the local override when the shared prop transitions to a
+      // NEW non-null stage — that's the "external stage click should win"
+      // case. A transition to null (e.g. our own onChange below calling
+      // setSelectedStage(null) right before setScopeOverride(next)) must
+      // NOT clear it, or a manual "project" pick self-inflicts a clear one
+      // tick later and snaps back to the stage scope.
+      if (selectedStageScope !== null && selectedStageScope !== scopeOverride) {
+        setScopeOverride(null);
+      }
     }
-  }, [selectedStageScope, lastPropScope]);
+  }, [selectedStageScope, lastPropScope, scopeOverride]);
 
   // Precedence: explicit shared selectedStage prop > local manual override
   // (dropdown pick, only reachable when no setSelectedStage setter was
