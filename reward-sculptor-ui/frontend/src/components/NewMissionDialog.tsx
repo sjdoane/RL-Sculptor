@@ -29,6 +29,11 @@ export function NewMissionDialog({
   // ON; best-of-N candidates sampled per stage (shown when the toggle is on).
   const [genStageMetrics, setGenStageMetrics] = useState(true);
   const [stageMetricCandidates, setStageMetricCandidates] = useState(1);
+  // §mission-persistence increment 2: block `run` while any runnable
+  // stage lacks an accepted metric, unless the user proceeds blind
+  // per-launch. Default OFF — preserves the pre-existing best-effort
+  // behavior (a rejected stage metric silently falls back).
+  const [stageMetricRequired, setStageMetricRequired] = useState(false);
 
   const [iterations, setIterations] = useState<number | "">("");
   const [stepsPerIter, setStepsPerIter] = useState<number | "">("");
@@ -57,6 +62,7 @@ export function NewMissionDialog({
   const reset = () => {
     setGoal(""); setMissionSlug(""); setNoKg(false); setTab("basic");
     setGenStageMetrics(true); setStageMetricCandidates(1);
+    setStageMetricRequired(false);
     setIterations(""); setStepsPerIter(""); setSeed("");
     setEarlyStopOnCriterion(false); setStabilityWindow(1);
     setExtendOnImprovement(false); setMaxExtensions(1);
@@ -138,6 +144,9 @@ export function NewMissionDialog({
         // always (so an explicit OFF sticks) + best-of-N only when on.
         gen_stage_metrics: genStageMetrics,
         stage_metric_candidates: genStageMetrics ? stageMetricCandidates : undefined,
+        // §mission-persistence increment 2: only meaningful with
+        // per-stage generation on; the toggle hides otherwise.
+        stage_metric_required: genStageMetrics ? stageMetricRequired : undefined,
         run_defaults: runDefaults ?? undefined,
       },
       {
@@ -253,6 +262,14 @@ export function NewMissionDialog({
                   </div>
                 </Field>
               )}
+              {genStageMetrics && (
+                <ToggleRow
+                  on={stageMetricRequired} onChange={setStageMetricRequired}
+                  label="Require stage metrics"
+                  title="Require stage metrics"
+                  desc="Block mission runs while any runnable stage lacks an accepted metric — you choose per run to regenerate or proceed blind."
+                />
+              )}
             </>
           ) : (
             <MissionAdvanced
@@ -270,6 +287,7 @@ export function NewMissionDialog({
               fitnessMode={fitnessMode} setFitnessMode={setFitnessMode}
               metrics={projectMetrics.data ?? []}
               knobs={knobs}
+              stageMetricsMode={genStageMetrics ? "on" : "off"}
             />
           )}
         </Modal>
@@ -297,6 +315,26 @@ export interface MissionParityKnobs {
   device: string; setDevice: (v: string) => void;
 }
 
+// §mission-persistence increment 2: DERIVED consistency hint under the
+// Advanced tab's "Objective fitness metric" select — no new coupling,
+// just explains the interaction between per-stage generation (Basic
+// tab) and this mission-level fallback so a mission never runs "blind"
+// without the user knowing why. See NewMissionDialog's Basic-tab
+// ToggleRow desc for the matching framing.
+function stageMetricsHintText(
+  mode: "on" | "off",
+  fitnessMetric: string | null,
+): string {
+  if (mode === "on") {
+    return fitnessMetric
+      ? "Stages use auto-generated per-stage metrics. This mission-level metric is only the fallback when a per-stage metric is rejected."
+      : "Stages use auto-generated per-stage metrics. This mission-level metric is only the FALLBACK when a stage metric is rejected — currently none: a rejected stage metric falls back to a blind loop.";
+  }
+  return fitnessMetric
+    ? "No per-stage metrics — every stage uses this mission-level metric."
+    : "No objective metric — the loop runs blind.";
+}
+
 // Shared Advanced form — also used by RunMissionDialog (same MissionRunDefaults
 // fields). Exported so the two stay in lockstep.
 export function MissionAdvanced({
@@ -309,6 +347,7 @@ export function MissionAdvanced({
   metrics = [],
   showIterationsHint,
   knobs,
+  stageMetricsMode,
 }: {
   disabled: boolean;
   iterations: NumOr; setIterations: (v: NumOr) => void;
@@ -328,6 +367,12 @@ export function MissionAdvanced({
   // knobs" section + num_envs/device + fitness-patience row so a mission
   // run reaches NewRunDialog parity. Omit to hide (back-compat).
   knobs?: MissionParityKnobs;
+  // §mission-persistence increment 2: whether per-stage objective
+  // metrics are in play for this mission — "on" (NewMissionDialog's
+  // genStageMetrics toggle, or RunMissionDialog inferring from the
+  // mission's existing stages) or "off". Omit to hide the derived
+  // consistency hint under the fitness-metric select (back-compat).
+  stageMetricsMode?: "on" | "off";
 }) {
   // §Ship 35: generated metrics selectable here; an uncalibrated one is
   // observe-locked (force observe), mirroring NewRunDialog.
@@ -384,6 +429,9 @@ export function MissionAdvanced({
             )}
           </select>
         </div>
+        {stageMetricsMode && (
+          <p className="rs-hintline">{stageMetricsHintText(stageMetricsMode, fitnessMetric)}</p>
+        )}
       </Field>
 
       {/* §Ship 35: observe vs steer — only when a metric is chosen. */}

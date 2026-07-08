@@ -2,10 +2,17 @@ import { useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 
 import { MissionAdvanced, type MissionRenderSize } from "@/components/NewMissionDialog";
-import { Btn, Modal } from "@/components/rs/primitives";
-import { useRunMission, type RunMissionVariables } from "@/hooks/useMissions";
+import { Banner, Btn, Modal } from "@/components/rs/primitives";
+import {
+  useRegenerateStageMetric,
+  useRunMission,
+  type RunMissionVariables,
+} from "@/hooks/useMissions";
+import { useJob } from "@/hooks/useJob";
 import { useProjectMetrics } from "@/hooks/useMetrics";
 import { ApiError, type RunMissionRequestBody } from "@/lib/api";
+import { qk } from "@/lib/queryKeys";
+import { useQueryClient } from "@tanstack/react-query";
 import type { MissionDetail } from "@/lib/types";
 
 /** Per-launch configuration for a mission run.
@@ -69,6 +76,49 @@ export function RunMissionDialog({
   const projectMetrics = useProjectMetrics(slug, open);
 
   const run = useRunMission(slug);
+  const qc = useQueryClient();
+
+  // §mission-persistence increment 2: when POST .../run 409s with
+  // type "/problems/stage-metrics-missing", the backend names the
+  // offending stages in `missing_stages` (see run_mission in
+  // backend/routes/missions.py). Render an inline banner instead of
+  // just a toast so the user can act (regenerate or proceed blind)
+  // without leaving the dialog. Cleared on open/close and on the next
+  // successful or differently-typed submit.
+  const [missingStages, setMissingStages] = useState<string[] | null>(null);
+  const regen = useRegenerateStageMetric(slug);
+  const [regenStage, setRegenStage] = useState<string | null>(null);
+  const [regenJobId, setRegenJobId] = useState<string | null>(null);
+  useJob(regenJobId ?? undefined, {
+    enabled: regenJobId != null,
+    onTerminal: (job) => {
+      setRegenJobId(null);
+      setRegenStage(null);
+      qc.invalidateQueries({ queryKey: qk.mission(slug, missionSlug) });
+      if (job.status === "completed") {
+        toast.success("Metric regeneration finished");
+      } else if (job.status === "errored") {
+        toast.error("Metric regeneration failed");
+      }
+    },
+  });
+  const regenerateStage = (stageName: string) => {
+    setRegenStage(stageName);
+    regen.mutate(
+      { missionSlug, stageName },
+      {
+        onSuccess: (job) => {
+          setRegenJobId(job.job_id);
+          toast.success("Metric regeneration started", { description: `stage ${stageName}` });
+        },
+        onError: (err) => {
+          setRegenStage(null);
+          const detail = err instanceof ApiError ? err.problem.detail ?? err.problem.title : err.message;
+          toast.error("Could not regenerate metric", { description: detail });
+        },
+      },
+    );
+  };
 
   // §MISSION_RUN_PARITY: bundle the parity knobs for the shared form.
   const knobs = {
@@ -81,6 +131,15 @@ export function RunMissionDialog({
     numEnvs, setNumEnvs,
     device, setDevice,
   };
+
+  // Clear any stale 409 banner + in-flight regen tracking whenever the
+  // dialog opens or closes, so a re-open starts clean.
+  useEffect(() => {
+    setMissingStages(null);
+    setRegenStage(null);
+    setRegenJobId(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [open]);
 
   // Pre-fill iteration override with the mission's max-stage iters
   // when first opening, so the default reflects what the user already
@@ -167,7 +226,7 @@ export function RunMissionDialog({
     }
   }, [open, mission, suggestedIters, appliedDefaults, iterations]);
 
-  const submit = () => {
+  const buildBody = (): RunMissionRequestBody => {
     const body: RunMissionRequestBody = {};
     if (typeof iterations === "number" && iterations !== suggestedIters) {
       body.iterations_override = iterations;
@@ -213,10 +272,21 @@ export function RunMissionDialog({
     }
     if (typeof numEnvs === "number") body.num_envs_override = numEnvs;
     if (device.trim()) body.device_override = device.trim();
+    return body;
+  };
+
+  // §mission-persistence increment 2: `proceedBlind` re-submits the
+  // IDENTICAL run request with `proceed_blind: true` set, bypassing
+  // the stage_metric_required 409 guard for this one launch. Normal
+  // submits never set it.
+  const submit = (proceedBlind?: boolean) => {
+    const body = buildBody();
+    if (proceedBlind) body.proceed_blind = true;
     const variables: RunMissionVariables = { missionSlug, body };
     run.mutate(variables, {
       onSuccess: () => {
         setOpen(false);
+        setMissingStages(null);
         toast.success("Mission run queued", {
           description: Object.keys(body).length
             ? "Custom config applied; watch the live event stream."
@@ -224,6 +294,16 @@ export function RunMissionDialog({
         });
       },
       onError: (err) => {
+        if (
+          err instanceof ApiError &&
+          err.status === 409 &&
+          err.type === "/problems/stage-metrics-missing"
+        ) {
+          const stages = err.problem.missing_stages;
+          setMissingStages(Array.isArray(stages) ? stages.filter((s): s is string => typeof s === "string") : []);
+          return;
+        }
+        setMissingStages(null);
         const detail =
           err instanceof ApiError
             ? err.problem.detail ?? err.problem.title
@@ -241,6 +321,19 @@ export function RunMissionDialog({
       typeof iterations === "number" ? iterations : suggestedIters ?? 3;
     return itersPerStage * mission.stages.length;
   }, [iterations, mission, suggestedIters]);
+
+  // §mission-persistence increment 2: RunMissionDialog has no
+  // genStageMetrics toggle (the mission is already created) — derive
+  // the Advanced-tab consistency hint from whether any stage actually
+  // has a per-stage metric ref (accepted/rejected/inherited all count;
+  // only "none"/null means the stage never got one).
+  const stageMetricsMode = useMemo<"on" | "off">(() => {
+    const stages = mission?.stages ?? [];
+    const anyStageMetric = stages.some(
+      (s) => !!s.steering_metric || (s.metric_status && s.metric_status !== "none"),
+    );
+    return anyStageMetric ? "on" : "off";
+  }, [mission]);
 
   return (
     <>
@@ -260,12 +353,46 @@ export function RunMissionDialog({
           footer={
             <>
               <Btn kind="quiet" onClick={() => setOpen(false)} disabled={run.isPending}>Cancel</Btn>
-              <Btn kind="primary" icon={run.isPending ? "loader" : "play"} onClick={submit} disabled={run.isPending}>
+              <Btn kind="primary" icon={run.isPending ? "loader" : "play"} onClick={() => submit()} disabled={run.isPending}>
                 {run.isPending ? "Launching…" : "Launch"}
               </Btn>
             </>
           }
         >
+          {missingStages && missingStages.length > 0 && (
+            <Banner kind="warn" icon="alert-triangle">
+              <span style={{ fontWeight: 600, display: "block" }}>
+                Stage metrics missing — this mission requires them
+              </span>
+              <span style={{ fontSize: 12, display: "block", marginBottom: 8 }}>
+                The following runnable stage(s) have no accepted objective metric:{" "}
+                <code className="mono">{missingStages.join(", ")}</code>. Regenerate their
+                metrics, or proceed without per-stage steering for this launch.
+              </span>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 6, alignItems: "center" }}>
+                {missingStages.map((name) => {
+                  const busy = regenStage === name && (regen.isPending || regenJobId != null);
+                  return (
+                    <Btn
+                      key={name}
+                      kind="ghost" size="xs" icon={busy ? "loader" : "sparkles"}
+                      disabled={busy}
+                      onClick={() => regenerateStage(name)}
+                    >
+                      {busy ? `Regenerating ${name}…` : `Regenerate ${name}`}
+                    </Btn>
+                  );
+                })}
+                <Btn
+                  kind="quiet" size="xs" icon="play"
+                  disabled={run.isPending}
+                  onClick={() => submit(true)}
+                >
+                  Proceed blind anyway
+                </Btn>
+              </div>
+            </Banner>
+          )}
           <MissionAdvanced
             disabled={run.isPending}
             iterations={iterations} setIterations={setIterations}
@@ -282,6 +409,7 @@ export function RunMissionDialog({
             metrics={projectMetrics.data ?? []}
             showIterationsHint={suggestedIters?.toString() ?? "3"}
             knobs={knobs}
+            stageMetricsMode={stageMetricsMode}
           />
           {eta !== null && (
             <p className="rs-hintline" style={{ marginTop: 4 }}>

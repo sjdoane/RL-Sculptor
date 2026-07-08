@@ -1060,6 +1060,11 @@ export interface CreateMissionRequest {
   // ON; best-of-N candidates sampled per stage (1..4).
   gen_stage_metrics?: boolean;
   stage_metric_candidates?: number;
+  // §mission-persistence increment 2: when true, `POST .../run` 409s
+  // while any runnable stage lacks a steering metric, unless the run
+  // request sets `proceed_blind`. Persisted into `run_defaults` at
+  // creation time by the backend. Default false.
+  stage_metric_required?: boolean;
   // §Ship 21a: optional run-time defaults set via the NewMission
   // Dialog Advanced tab. Persisted on the mission so RunMissionDialog
   // can pre-fill on first open.

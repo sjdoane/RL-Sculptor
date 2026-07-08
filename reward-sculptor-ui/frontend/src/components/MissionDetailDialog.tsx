@@ -7,12 +7,16 @@ import { Badge, Banner, Btn, Modal } from "@/components/rs/primitives";
 import {
   useDeleteMission,
   useMission,
+  useRegenerateStageMetric,
   useStageEnvSpec,
   useStageIterations,
 } from "@/hooks/useMissions";
+import { useJob } from "@/hooks/useJob";
 import { RunMissionDialog } from "@/components/RunMissionDialog";
 import { useMissionEvents } from "@/hooks/useMissionEvents";
 import { ApiError, stageRolloutUrl } from "@/lib/api";
+import { qk } from "@/lib/queryKeys";
+import { useQueryClient } from "@tanstack/react-query";
 import { failureReasonText, stageLabel, supersededText } from "@/lib/stageDisplay";
 import { formatRelative } from "@/lib/utils";
 import type {
@@ -255,6 +259,8 @@ export function MissionDetailDialog({
               return (
                 <div key={s.name}>
                   <StageCard
+                    slug={slug}
+                    missionSlug={missionSlug}
                     stage={s}
                     fallbackNumber={idx + 1}
                     depth={stageDepths.get(s.name) ?? 0}
@@ -328,6 +334,45 @@ export function MissionLifecycleBadge({
 
 function StageStatusBadge({ status }: { status: StageStatus }) {
   return <Badge status={status} />;
+}
+
+// §mission-persistence increment 2: per-stage objective-metric
+// visibility — the whole point of this increment is that a rejected
+// stage metric (silently falling back to blind/mission-level) is no
+// longer invisible in the UI.
+function StageMetricChip({
+  status,
+  steeringMetric,
+}: {
+  status: StageSchema["metric_status"];
+  steeringMetric: StageSchema["steering_metric"];
+}) {
+  if (status === "accepted") {
+    return (
+      <span className="rs-badge emerald" style={{ fontSize: 9.5 }} title={steeringMetric ?? undefined}>
+        <Icon name="check" size={10} />metric ✓
+      </span>
+    );
+  }
+  if (status === "inherited") {
+    return (
+      <span className="rs-badge slate" style={{ fontSize: 9.5 }} title="Falls back to the mission-level fitness metric">
+        metric: inherited
+      </span>
+    );
+  }
+  if (status === "rejected") {
+    return (
+      <span className="rs-badge amber" style={{ fontSize: 9.5 }} title="Generated metric failed the trust gate — this stage falls back to the mission-level metric (or runs blind)">
+        <Icon name="alert-triangle" size={10} />metric rejected — blind fallback
+      </span>
+    );
+  }
+  return (
+    <span className="rs-badge slate" style={{ fontSize: 9.5 }}>
+      no metric
+    </span>
+  );
 }
 
 // ── stage tree depth (DFS, cycle-safe) ───────────────────────────────
@@ -469,6 +514,8 @@ function deriveStageEffectiveMaxIters(
 }
 
 function StageCard({
+  slug,
+  missionSlug,
   stage,
   fallbackNumber,
   depth,
@@ -478,6 +525,10 @@ function StageCard({
   selected,
   onToggle,
 }: {
+  /** §mission-persistence increment 2: needed for the per-stage
+   *  "Regenerate metric" mutation. */
+  slug: string;
+  missionSlug: string;
   stage: StageSchema;
   /** 1-based array position, used only while `stage.display_label` is
    *  absent (older missions predating the field). */
@@ -495,6 +546,37 @@ function StageCard({
   selected: boolean;
   onToggle: () => void;
 }) {
+  const qc = useQueryClient();
+  const regen = useRegenerateStageMetric(slug);
+  const [regenJobId, setRegenJobId] = useState<string | null>(null);
+  useJob(regenJobId ?? undefined, {
+    enabled: regenJobId != null,
+    onTerminal: (job) => {
+      setRegenJobId(null);
+      qc.invalidateQueries({ queryKey: qk.mission(slug, missionSlug) });
+      if (job.status === "completed") {
+        toast.success("Metric regeneration finished", { description: `stage ${stage.name}` });
+      } else if (job.status === "errored") {
+        toast.error("Metric regeneration failed", { description: `stage ${stage.name}` });
+      }
+    },
+  });
+  const regenerateMetric = () => {
+    regen.mutate(
+      { missionSlug, stageName: stage.name },
+      {
+        onSuccess: (job) => {
+          setRegenJobId(job.job_id);
+          toast.success("Metric regeneration started", { description: `stage ${stage.name}` });
+        },
+        onError: (err) => {
+          const detail = err instanceof ApiError ? err.problem.detail ?? err.problem.title : err.message;
+          toast.error("Could not regenerate metric", { description: detail });
+        },
+      },
+    );
+  };
+  const regenBusy = regen.isPending || regenJobId != null;
   const orphan = stage.parent_stage !== null && depth === 0;
   // §Ship 20a fallback chain:
   //   1. stage.effective_max_iterations (PERSISTED — source of truth
@@ -560,6 +642,7 @@ function StageCard({
             <Icon name="history" size={10} />recovered from disk
           </span>
         )}
+        <StageMetricChip status={stage.metric_status} steeringMetric={stage.steering_metric} />
       </button>
       {stage.status === "superseded" && (
         <p className="rs-sub" style={{ margin: "6px 0 0", fontSize: 11 }}>{supersededText(stage)}</p>
@@ -569,6 +652,23 @@ function StageCard({
           {failureReasonText(stage.failure_reason, stage.iterations_used)}
         </p>
       )}
+      {/* §mission-persistence increment 2: only offer regeneration for
+          stages that will actually run again (pending) and currently
+          lack a usable metric (rejected/none). A stage mid-training or
+          already succeeded/failed is exempt — the backend's own
+          regenerate route also 409s on a training stage. */}
+      {stage.status === "pending" &&
+        (stage.metric_status === "rejected" || stage.metric_status === "none" || stage.metric_status == null) && (
+          <div style={{ marginTop: 6 }}>
+            <Btn
+              kind="ghost" size="xs" icon={regenBusy ? "loader" : "sparkles"}
+              disabled={regenBusy}
+              onClick={(e) => { e.stopPropagation(); regenerateMetric(); }}
+            >
+              {regenBusy ? "Regenerating…" : "Regenerate metric"}
+            </Btn>
+          </div>
+        )}
       <p style={{ margin: "6px 0 0", fontSize: 11.5, lineHeight: 1.5 }}>{stage.goal_text}</p>
       <p className="mono" style={{ margin: "6px 0 0", wordBreak: "break-all", borderRadius: "var(--radius-sm)", background: "var(--canvas-soft)", border: "1px solid var(--hairline)", padding: "5px 8px", fontSize: 10.5, color: "var(--rs-muted)" }}>
         {stage.success_criterion}

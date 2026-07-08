@@ -7,6 +7,7 @@ import {
   getStageEnvSpec,
   getStageIterations,
   listMissions,
+  regenerateStageMetric,
   runMission,
   type RunMissionRequestBody,
 } from "@/lib/api";
@@ -14,6 +15,7 @@ import { qk } from "@/lib/queryKeys";
 import type {
   CreateMissionRequest,
   DeleteMissionResponse,
+  JobDetail,
   JobSummary,
   MissionDetail,
   MissionJobKind,
@@ -219,5 +221,26 @@ export function useDeleteMission(slug: string) {
       qc.invalidateQueries({ queryKey: qk.missions(slug) });
       qc.removeQueries({ queryKey: qk.mission(slug, missionSlug) });
     },
+  });
+}
+
+/** §mission-persistence increment 2: user-triggered regen of one
+ *  stage's steering metric. Note `active_job_kind` on the mission
+ *  summary/detail is strictly "mission_decompose" | "mission_execute"
+ *  on the backend — a `mission_stage_metric_regen` job never appears
+ *  there, so (unlike useCreateMission/useRunMission) this mutation
+ *  does NOT optimistically flip active_job_id to open the mission WS.
+ *  Callers should poll the returned job_id via useJob and invalidate
+ *  the mission query on terminal (see StageCard). */
+export interface RegenerateStageMetricVariables {
+  missionSlug: string;
+  stageName: string;
+  nCandidates?: number;
+}
+
+export function useRegenerateStageMetric(slug: string) {
+  return useMutation<JobDetail, Error, RegenerateStageMetricVariables>({
+    mutationFn: ({ missionSlug, stageName, nCandidates }) =>
+      regenerateStageMetric(slug, missionSlug, stageName, { nCandidates }),
   });
 }

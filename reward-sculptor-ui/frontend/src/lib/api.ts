@@ -796,6 +796,10 @@ export interface RunMissionRequestBody {
   fitness_patience?: number | null;
   num_envs_override?: number | null;
   device_override?: string | null;
+  // §mission-persistence increment 2: one-shot bypass of the
+  // `stage_metric_required` 409 guard for this launch only. Does not
+  // mutate the persisted run_defaults.
+  proceed_blind?: boolean;
 }
 
 export async function runMission(
@@ -868,6 +872,28 @@ export async function getStageEnvSpec(
   return handle<StageEnvSpec>(
     await fetch(
       `/api/projects/${slug}/missions/${missionSlug}/stages/${encodeURIComponent(stageName)}/env-spec`,
+    ),
+  );
+}
+
+/** POST .../stages/{stage}/metric/regenerate — user-triggered
+ *  regeneration of one stage's steering metric. 202 JobDetail; 409 if
+ *  the mission has any other active mission-scoped job (decompose,
+ *  execute, a per-stage run, or another regenerate) in flight. */
+export async function regenerateStageMetric(
+  slug: string, missionSlug: string, stageName: string,
+  opts?: { nCandidates?: number },
+): Promise<JobDetail> {
+  const body = opts?.nCandidates ? { n_candidates: opts.nCandidates } : undefined;
+  return handle<JobDetail>(
+    await fetch(
+      `/api/projects/${slug}/missions/${missionSlug}/stages/${encodeURIComponent(stageName)}/metric/regenerate`,
+      {
+        method: "POST",
+        ...(body
+          ? { headers: { "content-type": "application/json" }, body: JSON.stringify(body) }
+          : {}),
+      },
     ),
   );
 }
