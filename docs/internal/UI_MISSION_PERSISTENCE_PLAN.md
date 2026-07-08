@@ -115,3 +115,43 @@ Commits on ship-20-ux-revamp:
 Net: a mission now (a) can't be permanently deleted by accident, (b)
 auto-saves its footage as it trains, and (c) keeps the good policy even
 if a later round regresses. The re-record is durable + reliable.
+
+## 2026-07-08 — stage-persistence deep fix (SHIPPED, ship-20-ux-revamp)
+
+Root-caused and fixed the class of "stage vanishes / lies about status"
+bugs the plan above did not cover. Commits 29fc2f2, d6ba7d3, 30c83e5,
+d9d55c3, e938fbf, d56883c.
+
+1. Replan retention (sculpt.py:5350 was a destructive splice): a
+   redecomposed parent stays in mission.stages as status="superseded"
+   (new StageStatus), children insert after it; failure_reason/detail
+   now PERSIST on Stage; loop/resume never re-execute superseded.
+2. Disk-truth union: mission detail unions mission.stages with orphaned
+   stages/<name>/ dirs (restores pre-fix casualties, e.g. crouch_load),
+   enriches failure_reason from provenance.json, computes hierarchical
+   display_label ("1", "1.1", ... — truncation- and nesting-robust) and
+   per-stage metric_status (accepted/rejected/inherited/none).
+3. /runs survives backend restarts: mission stage rows are synthesized
+   from disk (run_id "disk:<mission>/<stage>") when JobManager is empty;
+   Replay + downloads for those rows use mission-stage endpoints.
+4. Honest statuses: criterion_not_met renders as amber "Criterion not
+   met (trained N iters)", mission-cancel collateral as "Stopped";
+   superseded gets a neutral badge + "Re-planned into sub-stages —
+   artifacts retained".
+5. Results tab: joins the shared ?stage= selection, defaults to the
+   viewed/running mission, per-stage disk-truth checkpoint list with
+   rollout links + NEW checkpoint download endpoint.
+6. Metric choice: stage_metric_required (create-time, blocks runs via
+   409 stage-metrics-missing unless proceed_blind), per-stage POST
+   .../metric/regenerate (409-guarded), metric chips in the mission
+   dialog, New-Mission Advanced hint now derives from the Basic
+   per-stage toggle (no more silent "none (blind loop)").
+
+KNOWN GAP (pre-existing, deliberate defer): plain PROJECT-level runs
+still have no disk-reconstructed Training-sidebar row after a backend
+restart (artifacts remain reachable via Results "Project runs" source).
+Needs a project-run disk pane + project-level rollout endpoint.
+Also deferred: /runs disk-scan does O(stages×iters) syscalls per GET —
+fine single-user, cache if it ever hurts. One pre-existing flaky test:
+test_create_mission_returns_202_with_jobsummary (lock-timeout race
+under full-suite load).
