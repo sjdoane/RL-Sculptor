@@ -107,13 +107,27 @@ export function RobotViewer({
   // final stage never blanks the viewer.
   useEffect(() => {
     if (selectedStage || !setSelectedStage) return;
-    if (missionActive) return;
     if (!missionDetail.data || missionDetail.data.active_job_id != null) return;
     const fallback = pickDefaultStage(missionDetail.data.stages);
     if (fallback) setSelectedStage({ missionSlug: missionDetail.data.mission_slug, stageName: fallback });
-  }, [selectedStage, setSelectedStage, missionActive, missionDetail.data]);
+  }, [selectedStage, setSelectedStage, missionDetail.data]);
 
   const showStagePicker = !!missionSlugForPicker && (missionDetail.data?.stages.length ?? 0) > 1;
+
+  // §Ship de-silo: an explicit stage selection always wins EXCEPT while
+  // that exact stage is the one actively training right now — in which
+  // case we keep the live run_id-scoped path so "watch it train" doesn't
+  // regress. This mirrors RunsTab's RunDetailPane `isLiveStage` check.
+  // Hoisted out of LiveLayer (was computed inside it) so the choice
+  // between <StageLayer/> and <LiveLayer/> happens as sibling top-level
+  // renders in RobotViewer, and LiveLayer never conditionally skips its
+  // own hooks (rules-of-hooks fix).
+  const selectionIsLiveStage =
+    missionActive &&
+    liveRun?.kind === "mission_stage_run" &&
+    liveRun.mission_slug === selectedStage?.missionSlug &&
+    liveRun.stage_name === selectedStage?.stageName;
+  const liveModeSelectsStage = !!selectedStage && !selectionIsLiveStage;
 
   return (
     <div className="rs-viewer">
@@ -139,13 +153,21 @@ export function RobotViewer({
       )}
       <div className="rs-viewer-stage" style={STAGE_STYLE}>
         {mode === "static" && <StaticLayer slug={slug} />}
-        {mode === "live" && (
+        {mode === "live" && liveModeSelectsStage && (
+          <StageLayer
+            slug={slug}
+            missionSlug={selectedStage!.missionSlug}
+            stageName={selectedStage!.stageName}
+          />
+        )}
+        {mode === "live" && !liveModeSelectsStage && liveRun?.kind === "mission_stage_run" && (
+          <LiveStageRollout slug={slug} runId={liveRunId} run={liveRun} />
+        )}
+        {mode === "live" && !liveModeSelectsStage && liveRun?.kind !== "mission_stage_run" && (
           <LiveLayer
             slug={slug}
             runId={liveRunId}
             run={liveRun}
-            selectedStage={selectedStage ?? null}
-            missionActive={missionActive}
           />
         )}
         {mode === "replay" && (
@@ -286,39 +308,20 @@ function StaticLayer({ slug }: { slug: string }) {
 }
 
 // ── Live layer ───────────────────────────────────────────────────────
+// §Ship de-silo: the caller (RobotViewer) decides whether an explicit
+// stage selection should render <StageLayer/> instead of this component
+// (see `liveModeSelectsStage`), and also whether a mission_stage_run
+// should render <LiveStageRollout/> instead — LiveLayer itself is only
+// ever mounted for the plain run_id-scoped live path, so it never needs
+// to conditionally bail before its own hooks run (rules-of-hooks fix for
+// #85ddd70).
 function LiveLayer({
-  slug, runId, run, selectedStage, missionActive,
+  slug, runId, run,
 }: {
   slug: string;
   runId: string | null;
   run: RunSummary | null;
-  selectedStage: SelectedStage | null;
-  missionActive: boolean;
 }) {
-  // §Ship de-silo: an explicit stage selection always wins EXCEPT while
-  // that exact stage is the one actively training right now — in which
-  // case we keep the live run_id-scoped path so "watch it train" doesn't
-  // regress. This mirrors RunsTab's RunDetailPane `isLiveStage` check.
-  const selectionIsLiveStage =
-    missionActive &&
-    run?.kind === "mission_stage_run" &&
-    run.mission_slug === selectedStage?.missionSlug &&
-    run.stage_name === selectedStage?.stageName;
-
-  if (selectedStage && !selectionIsLiveStage) {
-    return (
-      <StageLayer
-        slug={slug}
-        missionSlug={selectedStage.missionSlug}
-        stageName={selectedStage.stageName}
-      />
-    );
-  }
-
-  if (run?.kind === "mission_stage_run") {
-    return <LiveStageRollout slug={slug} runId={runId} run={run} />;
-  }
-
   const { clips, skipped, terminal } = useLiveClips(slug, runId ?? undefined);
   const latest = clips[clips.length - 1] ?? null;
   const [hasEverPlayed, setHasEverPlayed] = useState(false);

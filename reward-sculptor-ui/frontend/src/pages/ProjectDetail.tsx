@@ -1,4 +1,4 @@
-import { lazy, Suspense } from "react";
+import { lazy, Suspense, useCallback } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 
 import { Icon } from "@/components/rs/icon";
@@ -154,7 +154,7 @@ export default function ProjectDetail() {
   // Shared stage selection (Training tab consumes this increment;
   // Overview/Rewards get the plumbing now, wired up later).
   const selectedStage = parseStageParam(searchParams.get("stage"));
-  const setSelectedStage = (value: SelectedStage | null) => {
+  const setSelectedStage = useCallback((value: SelectedStage | null) => {
     setSearchParams(
       (prev) => {
         const next = new URLSearchParams(prev);
@@ -164,7 +164,7 @@ export default function ProjectDetail() {
       },
       { replace: true },
     );
-  };
+  }, [setSearchParams]);
   const p = project.data;
   const canRun = !!p && !p.adapter_unavailable && p.ready_to_train !== false;
 
