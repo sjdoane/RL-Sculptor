@@ -4534,6 +4534,33 @@ def _run_one_stage(
             })
 
     # 3. Materialize v1 from the stage's reward_seed_prompt.
+    #
+    # §edit-degrades-gracefully: `apply_prompt_edit` exhausts its repair
+    # retries (attempt 1 + `RS_EDIT_REPAIR_RETRIES`, see sculptor/edit.py)
+    # and raises `EditValidationError` when the LLM's generated reward
+    # module is invalid on every attempt (e.g. SyntaxError, then a module
+    # lacking `compute_reward` — a real incident, 2026-07-08). That is NOT
+    # transient (the LLM calls themselves succeeded) and is not
+    # recoverable by retrying `_run_one_stage` itself, so it's handled the
+    # same way as any other v1-materialization failure below: the stage
+    # (and ONLY this stage) is marked failed via `_fail_stage`, which
+    # returns a normal `StageResult` rather than letting the exception
+    # unwind past `_run_one_stage`. The caller (`mission_run`'s while-loop,
+    # sculpt.py ~L3848) appends that StageResult, persists mission.json,
+    # archives the mission snapshot, and writes the terminal
+    # `mission_halted_terminal` event — i.e. a clean failed-stage terminal
+    # state, not an uncaught-exception process crash. Earlier stages'
+    # on-disk artifacts (rewards/rollouts/checkpoints) and their
+    # `StageResult`s (already appended in prior loop iterations) are
+    # untouched by this branch — see the "earlier-stage data preserved"
+    # note at the top of `_run_one_stage` and `mission_run`'s per-stage
+    # loop (sculpt.py ~L3812-3897).
+    #
+    # `EditValidationError` is caught explicitly (not just via the
+    # `except Exception` below) so this specific, expected failure mode is
+    # self-documenting at the boundary; any OTHER exception from this
+    # block (adapter load errors, disk errors, etc.) still degrades the
+    # same way via the broader catch.
     try:
         from sculptor.edit import apply_prompt_edit
         latest_n, latest_reward_file = _find_latest_reward_version(
@@ -4567,6 +4594,12 @@ def _run_one_stage(
                 mission_dir=mission_dir,
                 emit=emit,
             )
+    except EditValidationError as e:
+        return _fail_stage(
+            stage, "v1_materialization_errored",
+            f"apply_prompt_edit failed: {type(e).__name__}: {e}",
+            emit,
+        )
     except Exception as e:  # noqa: BLE001
         return _fail_stage(
             stage, "v1_materialization_errored",

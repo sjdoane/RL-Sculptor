@@ -27,8 +27,17 @@ apply_edits() turns a Diagnosis into a new reward module:
        - REWARD_SPEC.references is a list of dicts with arxiv_id / citation /
          how_used, and every arxiv_id exists in the KG.
        - REWARD_SPEC.parent_hash is present and non-empty.
-     On failure: one retry with the validation errors appended to the prompt.
-     Second failure raises `EditValidationError`.
+     On failure: retry with the validation errors appended to the prompt, up
+     to `RS_EDIT_REPAIR_RETRIES` extra attempts (env var; default 1, i.e. 2
+     attempts total — unset reproduces the original single-retry behavior
+     exactly). If every attempt still fails post-flight validation, the
+     LAST attempt's `EditValidationError` is raised. Callers (sculpt.py's
+     stage-v1 materialization and per-iteration edit loop) already catch
+     `EditValidationError` at their boundary and degrade to a clean
+     stage/iteration failure rather than crashing the process — see
+     `sculpt.py::_run_one_stage` (v1_materialization_errored) and
+     `sculpt.py`'s per-iteration `apply_edits` call (edit skipped, iter
+     proceeds unmodified).
 
   4. Write to `<rewards_dir>/<new_iter_id>.py` (e.g. `…/v1.py`) and rewrite
      `<rewards_dir>/current.py` to load-by-path the new file.
@@ -43,6 +52,7 @@ import hashlib
 import importlib.util
 import itertools
 import json
+import os
 import re
 import sys
 from dataclasses import dataclass, field
@@ -66,6 +76,33 @@ RETRY_REMINDER_PREFIX = (
     "ONLY the complete new reward.py source as plain Python — no markdown "
     "fences, no commentary."
 )
+
+# §RS_EDIT_REPAIR_RETRIES: number of EXTRA repair attempts after attempt 1
+# when the LLM's generated reward module fails post-flight validation
+# (SyntaxError, missing compute_reward/REWARD_SPEC, etc — see
+# `_post_validate`). Default 1 (2 attempts total) reproduces the
+# long-standing behavior exactly. Raise via the env var when a
+# stage/project is hitting `v1_materialization_errored` /
+# `apply_edits skipped` from a persistently flaky prompt and a couple
+# more repair rounds are worth the extra API spend; the LAST attempt's
+# EditValidationError is always re-raised to the caller if every
+# attempt (1 + retries) fails post-flight validation.
+_DEFAULT_EDIT_REPAIR_RETRIES = 1
+
+
+def _edit_repair_retries() -> int:
+    """Read `RS_EDIT_REPAIR_RETRIES` (extra attempts beyond attempt 1).
+    Unset/invalid/negative → the default of 1. Read live (not cached) so
+    tests and callers can override per-process without reloading the
+    module."""
+    raw = os.environ.get("RS_EDIT_REPAIR_RETRIES")
+    if raw is None:
+        return _DEFAULT_EDIT_REPAIR_RETRIES
+    try:
+        n = int(raw)
+    except ValueError:
+        return _DEFAULT_EDIT_REPAIR_RETRIES
+    return n if n >= 0 else _DEFAULT_EDIT_REPAIR_RETRIES
 
 
 class EditValidationError(Exception):
@@ -1637,56 +1674,66 @@ def apply_edits(
                 winner_promoted = True
 
         # Attempt 1 (single-shot path; skipped when best-of-K promoted).
-        try:
-            if not winner_promoted:
-                new_source = _call_llm(
-                    client, _EDIT_SYSTEM, user_prompt,
-                    on_event=on_event, attempt=1,
-                )
-                if on_event is not None:
-                    on_event({"type": "log_line", "text": "[edit] post-validate (attempt 1)"})
-                _post_validate(
-                    new_source, contract=reward_contract, kg_store=kg_store,
-                    parent_hash=parent_hash, new_version=new_iter_id,
-                    write_to=target_path,
-                    parent_hparams=gate_parent_hparams,
-                    metric_observables=metric_observables,
-                    replay_inputs=replay_inputs,
-                    replay_parent=replay_parent,
-                    hack_replays=hack_replays,
-                )
-        except EditValidationError as first_err:
-            print(f"[edit] first attempt failed: {first_err}. Retrying once.",
-                  file=sys.stderr, flush=True)
-            if on_event is not None:
-                on_event({
-                    "type": "log_line",
-                    "text": f"[edit] attempt 1 rejected: {first_err}; retrying",
-                })
-            # Attempt 2.
-            retry_user = (
-                user_prompt
-                + "\n\n# RETRY\n"
-                + RETRY_REMINDER_PREFIX
-                + "\n\n## VALIDATION_ERRORS_ON_PREVIOUS_ATTEMPT\n"
-                + str(first_err)
-            )
-            new_source = _call_llm(
-                client, _EDIT_SYSTEM, retry_user,
-                on_event=on_event, attempt=2,
-            )
-            if on_event is not None:
-                on_event({"type": "log_line", "text": "[edit] post-validate (attempt 2)"})
-            _post_validate(
-                new_source, contract=reward_contract, kg_store=kg_store,
-                parent_hash=parent_hash, new_version=new_iter_id,
-                write_to=target_path,
-                parent_hparams=gate_parent_hparams,
-                metric_observables=metric_observables,
-                replay_inputs=replay_inputs,
-                replay_parent=replay_parent,
-                hack_replays=hack_replays,
-            )
+        # §RS_EDIT_REPAIR_RETRIES: bounded repair-retry loop. Attempt 1 is
+        # unconditional; on EditValidationError we re-prompt with the
+        # validation errors appended, up to `_edit_repair_retries()`
+        # additional attempts (default 1, i.e. 2 total attempts — byte-
+        # identical to the pre-knob behavior). The LAST attempt's
+        # EditValidationError is re-raised to the caller (sculpt.py /
+        # apply_prompt_edit callers already catch it and fail the stage
+        # cleanly rather than letting it crash the process).
+        if not winner_promoted:
+            max_retries = _edit_repair_retries()
+            last_err: EditValidationError | None = None
+            attempt_prompt = user_prompt
+            for attempt in range(1, max_retries + 2):
+                try:
+                    new_source = _call_llm(
+                        client, _EDIT_SYSTEM, attempt_prompt,
+                        on_event=on_event, attempt=attempt,
+                    )
+                    if on_event is not None:
+                        on_event({
+                            "type": "log_line",
+                            "text": f"[edit] post-validate (attempt {attempt})",
+                        })
+                    _post_validate(
+                        new_source, contract=reward_contract, kg_store=kg_store,
+                        parent_hash=parent_hash, new_version=new_iter_id,
+                        write_to=target_path,
+                        parent_hparams=gate_parent_hparams,
+                        metric_observables=metric_observables,
+                        replay_inputs=replay_inputs,
+                        replay_parent=replay_parent,
+                        hack_replays=hack_replays,
+                    )
+                    last_err = None
+                    break
+                except EditValidationError as err:
+                    last_err = err
+                    if attempt >= max_retries + 1:
+                        break
+                    print(
+                        f"[edit] attempt {attempt} failed: {err}. Retrying "
+                        f"({max_retries + 1 - attempt} attempt(s) left).",
+                        file=sys.stderr, flush=True)
+                    if on_event is not None:
+                        on_event({
+                            "type": "log_line",
+                            "text": (
+                                f"[edit] attempt {attempt} rejected: {err}; "
+                                "retrying"
+                            ),
+                        })
+                    attempt_prompt = (
+                        user_prompt
+                        + "\n\n# RETRY\n"
+                        + RETRY_REMINDER_PREFIX
+                        + "\n\n## VALIDATION_ERRORS_ON_PREVIOUS_ATTEMPT\n"
+                        + str(err)
+                    )
+            if last_err is not None:
+                raise last_err
 
         _write_current_reexport(rewards_dir, target_path)
         # §Ship 54-pre (#12): persist the partition-gate report next to the

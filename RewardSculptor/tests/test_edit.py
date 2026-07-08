@@ -503,6 +503,64 @@ def compute_reward(state, action, next_state, info):
         )
 
 
+def test_apply_edits_rs_edit_repair_retries_knob_extends_attempts(
+    v0_path, kg, monkeypatch,
+):
+    """§RS_EDIT_REPAIR_RETRIES: with the knob unset/at its default (1),
+    two straight failures exhaust the retry budget and raise (mirrors
+    `test_apply_edits_raises_on_second_failure`). Setting the env var to
+    2 grants ONE more attempt — the same two-failures-then-good sequence
+    that would previously raise now succeeds on attempt 3."""
+    import hashlib
+
+    from sculptor.kg.query import cite
+
+    parent_hash = hashlib.sha256(
+        v0_path.read_text(encoding="utf-8").encode("utf-8")).hexdigest()[:16]
+    citation = cite("1801.00690", store=kg)
+
+    broken = '''\
+"""still missing REWARD_SPEC."""
+def compute_reward(state, action, next_state, info):
+    return 0.0, {"a": 0.0}
+'''
+    good = _render_v1_source(parent_hash, citation)
+
+    diagnosis = Diagnosis(
+        failure_modes=["component_imbalance"], evidence="",
+        proposed_edits=[
+            ProposedEdit(
+                target_term="alive_bonus", operation="increase",
+                rationale="grounded", suggested_value="3.0",
+                paper_refs=["1801.00690"],
+            ),
+        ],
+        confidence=0.9,
+    )
+
+    # Default (unset) — 2 straight failures still raise (unchanged
+    # behavior; byte-identical to pre-knob).
+    client_default = _StubClient(broken, broken)
+    with pytest.raises(EditValidationError):
+        apply_edits(
+            current_reward_path=v0_path, diagnosis=diagnosis,
+            new_iter_id="v1", reward_contract=_hopper_contract(),
+            kg_store=kg, client=client_default,
+        )
+    assert len(client_default.messages.calls) == 2
+
+    # RS_EDIT_REPAIR_RETRIES=2 — a 3rd attempt is granted and succeeds.
+    monkeypatch.setenv("RS_EDIT_REPAIR_RETRIES", "2")
+    client_extended = _StubClient(broken, broken, good)
+    out_path = apply_edits(
+        current_reward_path=v0_path, diagnosis=diagnosis,
+        new_iter_id="v1", reward_contract=_hopper_contract(),
+        kg_store=kg, client=client_extended,
+    )
+    assert out_path.is_file()
+    assert len(client_extended.messages.calls) == 3
+
+
 def test_apply_edits_rejects_bad_reference_arxiv_id(v0_path, kg):
     """Generated module cites an arxiv_id that isn't in the KG."""
     import hashlib

@@ -1048,6 +1048,86 @@ def test_mission_run_skips_already_succeeded_stages(
     assert "stage_skipped" in types
 
 
+def test_mission_run_degrades_cleanly_on_exhausted_edit_repair_retries(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """Real incident (2026-07-08): a stage's v1 seed prompt fails
+    `apply_prompt_edit` twice in a row (attempt 1 SyntaxError, attempt 2
+    missing compute_reward) — `EditValidationError` exhausts every repair
+    retry and propagates out of `apply_prompt_edit`. This must NOT crash
+    `mission_run`: the failing stage is marked failed with the existing
+    `v1_materialization_errored` reason (sculpt.py's `_run_one_stage`
+    catches `EditValidationError` explicitly at the v1-materialization
+    boundary), and — critically — the EARLIER stage's succeeded
+    StageResult / on-disk artifacts (checkpoint, reward file) are
+    completely untouched by the later failure."""
+    from sculptor import sculpt as sculpt_mod
+    from sculptor.edit import EditValidationError as _EVE
+
+    m = _make_mission(tmp_path, n_stages=2)
+
+    fake = _fake_sculpt_run_factory(metric=0.9)  # stage_0 would succeed
+    monkeypatch.setattr(sculpt_mod, "sculpt_run", fake)
+
+    calls: list[str] = []
+
+    def _flaky_apply_prompt_edit(*_a, **kw):
+        # stage_0's v1 seed materializes fine; stage_1's exhausts its
+        # repair retries and raises — simulating both LLM attempts
+        # returning invalid modules.
+        new_iter = kw["new_iter_id"]
+        current = Path(kw["current_reward_path"])
+        calls.append(str(current))
+        if len(calls) >= 2:
+            raise _EVE(
+                "generated module lacks compute_reward (attempt 2, "
+                "repair retries exhausted)"
+            )
+        return _stub_apply_prompt_edit(*_a, **kw)
+
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _flaky_apply_prompt_edit,
+    )
+
+    events: list[dict] = []
+    result = sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab", on_event=events.append,
+    )
+
+    # Mission does NOT raise — it ends in a clean, terminal failed state.
+    assert result.completed is False
+    assert result.halted_at_stage == "stage_1"
+    assert result.halted_reason == "v1_materialization_errored"
+    assert len(result.stage_results) == 2
+
+    stage0_result, stage1_result = result.stage_results
+    assert stage0_result.status == "succeeded"
+    assert stage1_result.status == "failed"
+    assert stage1_result.failure_reason == "v1_materialization_errored"
+
+    # Terminal event fired (not an exception unwind) + telemetry attempted.
+    types = [e["type"] for e in events]
+    assert "stage_failed" in types
+    assert "mission_halted_terminal" in types
+    assert "mission_telemetry_written" in types or (
+        "mission_telemetry_failed" in types
+    )
+
+    # Earlier stage's on-disk artifacts are untouched by stage_1's failure.
+    mission_dir = Path(m.mission_dir)
+    stage0_dir = mission_dir / "stages" / "stage_0"
+    assert (stage0_dir / "rewards" / "v1.py").is_file()
+    stage0_iters = sorted((stage0_dir / "runs").glob("iter_*"))
+    assert stage0_iters, "stage_0's iter dir must survive stage_1's failure"
+    assert (stage0_iters[0] / "checkpoint.pt").is_file()
+
+    # mission.json on disk still records stage_0 as succeeded.
+    saved = json.loads((mission_dir / "mission.json").read_text())
+    saved_statuses = {s["name"]: s["status"] for s in saved["stages"]}
+    assert saved_statuses["stage_0"] == "succeeded"
+    assert saved_statuses["stage_1"] == "failed"
+
+
 def test_mission_run_rejects_mission_dir_none():
     """Mission without mission_dir raises before any side effects."""
     from sculptor import sculpt as sculpt_mod
