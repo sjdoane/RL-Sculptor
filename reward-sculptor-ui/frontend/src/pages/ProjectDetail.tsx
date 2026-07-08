@@ -250,7 +250,13 @@ export default function ProjectDetail() {
             </Suspense>
           )}
           {tab === "results" && (
-            <Suspense fallback={<TabFallback />}><ReportsTabLazy slug={slug!} /></Suspense>
+            <Suspense fallback={<TabFallback />}>
+              <ReportsTabLazy
+                slug={slug!}
+                selectedStage={selectedStage}
+                setSelectedStage={setSelectedStage}
+              />
+            </Suspense>
           )}
         </>
       )}

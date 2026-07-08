@@ -853,6 +853,13 @@ export function stageRolloutUrl(
   return `/api/projects/${slug}/missions/${missionSlug}/stages/${encodeURIComponent(stageName)}/iterations/${iterIndex}/rollout`;
 }
 
+/** Checkpoint download URL for a specific stage iteration. */
+export function stageCheckpointUrl(
+  slug: string, missionSlug: string, stageName: string, iterIndex: number,
+): string {
+  return `/api/projects/${slug}/missions/${missionSlug}/stages/${encodeURIComponent(stageName)}/iterations/${iterIndex}/checkpoint`;
+}
+
 /** GET .../stages/{stage}/env-spec — the applied env curriculum for a
  *  stage. `current.meta.source` starting "reference:" ⇒ RSI applied. */
 export async function getStageEnvSpec(

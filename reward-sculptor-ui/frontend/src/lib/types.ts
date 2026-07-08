@@ -893,7 +893,10 @@ export type StageStatus =
   | "training"
   | "succeeded"
   | "failed"
-  | "skipped";
+  | "skipped"
+  // §mission-persistence: replaced by redecomposition children; terminal,
+  // never runnable again, artifacts retained on disk.
+  | "superseded";
 
 export type MissionLifecycleStatus =
   | "ready"
@@ -938,6 +941,23 @@ export interface StageSchema {
     | "last"
     | string
     | null;
+  // §mission-persistence: why the stage ended non-successfully
+  // ("criterion_not_met", "training_errored", "no_checkpoint", ...).
+  // Persisted on the stage going forward; enriched from provenance.json
+  // for older missions. Null when the stage hasn't failed.
+  failure_reason?: string | null;
+  failure_detail?: string | null;
+  // Per-stage objective metric ref (spec name / gen:<id> / path), if any.
+  steering_metric?: string | null;
+  // Server-computed hierarchical number: "1", "1.1", "1.2", "2", ... —
+  // replan children get parentLabel.N. Use this instead of array index
+  // or RunSummary.stage_index for user-facing numbering.
+  display_label?: string;
+  // True for stages reconstructed from an orphaned stages/<name>/ dir
+  // on disk (pre-fix destructive replan) rather than mission.json.
+  on_disk_only?: boolean;
+  // How this stage got (or failed to get) its objective metric.
+  metric_status?: "accepted" | "rejected" | "inherited" | "none" | null;
 }
 
 // ── Stage iterations (disk-truth, de-siloed) ─────────────────────────

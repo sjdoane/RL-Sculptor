@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -6,10 +6,18 @@ import { toast } from "sonner";
 
 import { ActuatorLimitsCard } from "@/components/ActuatorLimitsCard";
 import { Icon } from "@/components/rs/icon";
-import { Btn, EmptyState } from "@/components/rs/primitives";
+import { Badge, Btn, EmptyState } from "@/components/rs/primitives";
+import { useMission, useMissions, useStageIterations } from "@/hooks/useMissions";
 import { usePolicies } from "@/hooks/usePolicies";
-import { ApiError, getReportsSources, policyExportUrl } from "@/lib/api";
+import {
+  ApiError,
+  getReportsSources,
+  policyExportUrl,
+  stageCheckpointUrl,
+  stageRolloutUrl,
+} from "@/lib/api";
 import { qk } from "@/lib/queryKeys";
+import type { SelectedStage, StageIteration, StageSchema } from "@/lib/types";
 
 /** A report source: the project's standalone runs, or one mission. */
 type ReportSource =
@@ -98,7 +106,18 @@ async function buildReport(slug: string, source: ReportSource): Promise<void> {
   }
 }
 
-export function ReportsTab({ slug }: { slug: string }) {
+export function ReportsTab({
+  slug, selectedStage, setSelectedStage,
+}: {
+  slug: string;
+  // §Ship de-silo: the shared cross-tab stage selection (owned by
+  // ProjectDetail, URL-synced as `?stage=missionSlug/stageName`). When
+  // present it takes precedence over this tab's own sticky source pick —
+  // see `sourceValue` effect below, mirrored from RewardsTab's scope
+  // precedence (commits b5c1d4f / 01b7df6).
+  selectedStage?: SelectedStage | null;
+  setSelectedStage?: (value: SelectedStage | null) => void;
+}) {
   const qc = useQueryClient();
 
   // §Ship 20: report source picker — the project's standalone runs, or
@@ -108,27 +127,100 @@ export function ReportsTab({ slug }: { slug: string }) {
     queryFn: () => getReportsSources(slug),
     staleTime: 10_000,
   });
-  const [sourceValue, setSourceValue] = useState<string>(PROJECT_SOURCE_VALUE);
-  // Auto-select the single mission when project runs is empty and exactly
-  // one mission exists — kills the "empty Results tab" confusion when all
-  // the work lives under a mission. Runs once, before the user picks.
-  const autoSelected = useRef(false);
+  const missions = useMissions(slug);
+
+  const selectedStageMission = selectedStage?.missionSlug ?? null;
+
+  // The "best default" mission when nothing has been explicitly picked:
+  // a running mission wins (that's what the user is watching), else the
+  // most recently created one. Only used before any user/prop pick lands.
+  const defaultMissionSlug = useMemo(() => {
+    const list = missions.data ?? [];
+    if (list.length === 0) return null;
+    const running = list.find((m) => m.lifecycle === "running");
+    if (running) return running.mission_slug;
+    return list.reduce((best, m) =>
+      new Date(m.created_at).getTime() > new Date(best.created_at).getTime() ? m : best,
+    ).mission_slug;
+  }, [missions.data]);
+
+  // Sticky manual/derived pick. `null` = "not decided yet" (falls through
+  // to the precedence below); PROJECT_SOURCE_VALUE = explicit project
+  // pick; anything else = a mission slug.
+  const [sourceValue, setSourceValueRaw] = useState<string | null>(null);
+  // Tracks the last selectedStageMission we reacted to, so a transition
+  // to a NEW non-null mission always wins over a stale local pick — same
+  // "external click should win" rule RewardsTab uses for scopeOverride,
+  // but a transition to null must NOT clear an explicit user pick.
+  const [lastPropMission, setLastPropMission] = useState<string | null>(null);
   useEffect(() => {
-    if (autoSelected.current || !sources.data) return;
-    const { project_runs, missions } = sources.data;
-    if (project_runs.n_iters === 0 && missions.length === 1) {
-      setSourceValue(missions[0].mission_slug);
+    if (selectedStageMission !== lastPropMission) {
+      setLastPropMission(selectedStageMission);
+      if (selectedStageMission !== null && selectedStageMission !== sourceValue) {
+        setSourceValueRaw(selectedStageMission);
+      }
     }
-    autoSelected.current = true;
-  }, [sources.data]);
+  }, [selectedStageMission, lastPropMission, sourceValue]);
+
+  const setSourceValue = (next: string) => {
+    // A user picking "Project runs" from the dropdown while a shared
+    // stage is selected should stick — clear the shared prop too, or the
+    // effect above would immediately snap back to the mission.
+    if (setSelectedStage && selectedStage) setSelectedStage(null);
+    setSourceValueRaw(next);
+  };
+
+  // Effective precedence: explicit shared selectedStage prop > sticky
+  // local pick (dropdown, incl. a prior prop-driven pick) > best-default
+  // mission > "Project runs" only when the project has no missions.
+  const effectiveSourceValue: string = useMemo(() => {
+    if (selectedStageMission !== null) return selectedStageMission;
+    if (sourceValue !== null) return sourceValue;
+    if (defaultMissionSlug !== null) return defaultMissionSlug;
+    return PROJECT_SOURCE_VALUE;
+  }, [selectedStageMission, sourceValue, defaultMissionSlug]);
 
   const source: ReportSource = useMemo(
     () =>
-      sourceValue === PROJECT_SOURCE_VALUE
+      effectiveSourceValue === PROJECT_SOURCE_VALUE
         ? { kind: "project" }
-        : { kind: "mission", missionSlug: sourceValue },
-    [sourceValue],
+        : { kind: "mission", missionSlug: effectiveSourceValue },
+    [effectiveSourceValue],
   );
+
+  // §Increment 3: which stage within the picked mission. Sticky local
+  // pick (cleared whenever the mission source changes so a stale stage
+  // name from a different mission can't leak); defaults to the shared
+  // selectedStage's stage when it belongs to this mission, else the
+  // mission's current stage.
+  const sourceMissionSlug = source.kind === "mission" ? source.missionSlug : null;
+  const missionDetail = useMission(slug, sourceMissionSlug ?? undefined);
+  const [stageOverride, setStageOverride] = useState<string | null>(null);
+  useEffect(() => {
+    setStageOverride(null);
+  }, [sourceMissionSlug]);
+
+  const stages = missionDetail.data?.stages ?? [];
+  const effectiveStageName: string | null = useMemo(() => {
+    if (sourceMissionSlug === null) return null;
+    if (stageOverride && stages.some((s) => s.name === stageOverride)) return stageOverride;
+    if (selectedStage && selectedStage.missionSlug === sourceMissionSlug
+        && stages.some((s) => s.name === selectedStage.stageName)) {
+      return selectedStage.stageName;
+    }
+    const current = missionDetail.data
+      ? stages[missionDetail.data.current_stage_idx]
+      : undefined;
+    if (current) return current.name;
+    return stages.length > 0 ? stages[stages.length - 1].name : null;
+  }, [sourceMissionSlug, stageOverride, selectedStage, stages, missionDetail.data]);
+
+  const onPickStage = (stageName: string) => {
+    setStageOverride(stageName);
+    if (setSelectedStage && sourceMissionSlug !== null) {
+      setSelectedStage({ missionSlug: sourceMissionSlug, stageName });
+    }
+  };
 
   const md = useQuery<string>({
     queryKey: [...qk.project(slug), "report", "md", sourceToValue(source)],
@@ -171,7 +263,7 @@ export function ReportsTab({ slug }: { slug: string }) {
             {missionList.length > 0 && (
               <div className="rs-select" style={{ display: "flex", alignItems: "center" }}>
                 <select
-                  value={sourceValue}
+                  value={effectiveSourceValue}
                   onChange={(e) => setSourceValue(e.target.value)}
                   aria-label="Report source"
                   title="Choose which run or mission to report on"
@@ -216,7 +308,24 @@ export function ReportsTab({ slug }: { slug: string }) {
           </div>
         </div>
 
-        <PoliciesCard slug={slug} />
+        {source.kind === "project" ? (
+          <PoliciesCard slug={slug} />
+        ) : (
+          <>
+            <StagePicker
+              stages={stages}
+              isLoading={missionDetail.isLoading}
+              selected={effectiveStageName}
+              onSelect={onPickStage}
+            />
+            <StageCheckpointsCard
+              slug={slug}
+              missionSlug={source.missionSlug}
+              stageName={effectiveStageName}
+              stage={stages.find((s) => s.name === effectiveStageName) ?? null}
+            />
+          </>
+        )}
 
         <ActuatorLimitsCard slug={slug} />
 
@@ -314,6 +423,175 @@ export function ReportsTab({ slug }: { slug: string }) {
           </div>
         )}
       </div>
+    </div>
+  );
+}
+
+// ── Stage picker (mission sources) ─────────────────────────────────────
+// Lists every stage the disk-union endpoint returns — including
+// superseded ones, since their checkpoints/rollouts still matter for a
+// report. Selecting a stage propagates through setSelectedStage so the
+// other tabs follow (mirrors RewardsTab's scope-selector onChange).
+function StagePicker({
+  stages, isLoading, selected, onSelect,
+}: {
+  stages: StageSchema[];
+  isLoading: boolean;
+  selected: string | null;
+  onSelect: (stageName: string) => void;
+}) {
+  if (isLoading) {
+    return (
+      <div className="rs-card rs-card-pad" style={{ marginBottom: 22 }}>
+        <p className="rs-sub" style={{ margin: 0 }}>Loading stages…</p>
+      </div>
+    );
+  }
+  if (stages.length === 0) return null;
+  return (
+    <div className="rs-card" style={{ marginBottom: 22 }}>
+      <div className="rs-card-head">
+        <div className="rs-card-title"><Icon name="list" size={16} />Stage</div>
+        <span className="rs-sub" style={{ fontSize: 12 }}>{stages.length} on disk</span>
+      </div>
+      <div className="rs-card-pad rs-flex rs-wrap rs-gap-8">
+        {stages.map((s) => {
+          const isSel = s.name === selected;
+          return (
+            <button
+              key={s.name}
+              onClick={() => onSelect(s.name)}
+              className="rs-flex rs-gap-8"
+              style={{
+                border: "1px solid " + (isSel ? "var(--rs-primary)" : "var(--hairline)"),
+                background: isSel ? "rgba(245,78,0,0.06)" : "var(--canvas-soft)",
+                borderRadius: "var(--radius-md)",
+                padding: "7px 11px",
+                cursor: "pointer",
+                fontSize: 12.5,
+                alignItems: "center",
+              }}
+              title={s.goal_text || s.name}
+            >
+              <span className="mono" style={{ fontWeight: 600 }}>{s.display_label ?? s.name}</span>
+              <span className="rs-sub" style={{ fontSize: 11.5 }}>{s.name}</span>
+              <Badge status={s.status} label={s.status === "superseded" ? "Superseded" : undefined} />
+              {s.on_disk_only && (
+                <span className="rs-tag" style={{ fontSize: 9.5 }} title="Reconstructed from disk, not mission.json">
+                  disk-only
+                </span>
+              )}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ── Per-stage checkpoints (mission sources) ──────────────────────────
+// Replaces the unscoped project-level PoliciesCard for mission sources:
+// the mission's per-stage checkpoints live under the stage's own runs
+// tree, served by the disk-truth iterations endpoint — not the
+// project's runs tree that usePolicies(slug) sees.
+function StageCheckpointsCard({
+  slug, missionSlug, stageName, stage,
+}: {
+  slug: string;
+  missionSlug: string;
+  stageName: string | null;
+  stage: StageSchema | null;
+}) {
+  const iters = useStageIterations(slug, missionSlug, stageName ?? undefined);
+  const rows: StageIteration[] = iters.data ?? [];
+  const selectedIter = stage?.selected_iter_index ?? null;
+
+  return (
+    <div className="rs-card" style={{ marginBottom: 22 }}>
+      <div className="rs-card-head">
+        <div className="rs-card-title">
+          <Icon name="package" size={16} />Stage checkpoints
+        </div>
+        <span className="rs-sub" style={{ fontSize: 12 }}>
+          {stageName ? <code className="mono">{stageName}</code> : "no stage"} · disk-truth iterations
+        </span>
+      </div>
+      {!stageName ? (
+        <EmptyState icon="package" title="No stage selected" sub="Pick a stage above to see its trained checkpoints." />
+      ) : iters.isLoading ? (
+        <p className="rs-sub" style={{ padding: "12px 16px" }}>Loading…</p>
+      ) : rows.length === 0 ? (
+        <EmptyState
+          icon="package"
+          title="No iterations on disk yet"
+          sub="This stage hasn't produced a training iteration yet."
+        />
+      ) : (
+        <div className="rs-card-pad rs-vgap-8">
+          {stage?.selection_source && selectedIter != null && (
+            <p className="rs-sub" style={{ margin: "0 0 4px", fontSize: 11.5 }}>
+              kept iter <b className="mono">{selectedIter}</b> as the stage's policy — {stage.selection_source}
+            </p>
+          )}
+          {rows.map((it) => {
+            const isSelected = selectedIter != null && it.iter_index === selectedIter;
+            return (
+              <div
+                key={it.iter_index}
+                className="rs-flex rs-gap-12 rs-wrap"
+                style={{
+                  border: "1px solid " + (isSelected ? "var(--rs-primary)" : "var(--hairline)"),
+                  borderRadius: "var(--radius-md)",
+                  padding: "10px 12px",
+                  background: isSelected ? "rgba(245,78,0,0.05)" : "var(--canvas-soft)",
+                  alignItems: "center",
+                  fontSize: 12.5,
+                }}
+              >
+                <span style={{ fontWeight: 500, minWidth: 60 }}>iter {it.iter_index}</span>
+                {it.reward_version && (
+                  <span className="rs-tag mono" style={{ fontSize: 10 }}>
+                    reward {it.reward_version}
+                  </span>
+                )}
+                {it.fitness != null ? (
+                  <span className="rs-num" title="objective fitness (0-1)">fit {it.fitness.toFixed(2)}</span>
+                ) : it.primary_metric != null ? (
+                  <span className="rs-num" title="mean return">{it.primary_metric.toFixed(1)}</span>
+                ) : null}
+                {isSelected && (
+                  <span className="rs-tag" style={{ fontSize: 10, color: "var(--st-emerald)" }} title={stage?.selection_source ?? undefined}>
+                    kept
+                  </span>
+                )}
+                <span style={{ marginLeft: "auto" }} className="rs-flex rs-gap-8">
+                  {it.has_rollout && (
+                    <a
+                      href={stageRolloutUrl(slug, missionSlug, stageName, it.iter_index)}
+                      target="_blank"
+                      rel="noreferrer noopener"
+                      className="rs-btn rs-btn-ghost rs-btn-sm"
+                      title="Open the rollout video"
+                    >
+                      <Icon name="video" size={14} />Rollout
+                    </a>
+                  )}
+                  {it.has_checkpoint && (
+                    <a
+                      href={stageCheckpointUrl(slug, missionSlug, stageName, it.iter_index)}
+                      download
+                      className="rs-btn rs-btn-ghost rs-btn-sm"
+                      title="Download the checkpoint file"
+                    >
+                      <Icon name="download" size={14} />Checkpoint
+                    </a>
+                  )}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }
