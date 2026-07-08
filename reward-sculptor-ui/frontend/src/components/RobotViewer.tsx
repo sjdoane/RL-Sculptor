@@ -8,7 +8,7 @@ import { useMissions } from "@/hooks/useMissions";
 import { useRunEvents } from "@/hooks/useRunEvents";
 import { useRuns } from "@/hooks/useRuns";
 import { clipUrl, iterRolloutUrl, previewUrl } from "@/lib/api";
-import type { CameraAngle, RunSummary } from "@/lib/types";
+import type { CameraAngle, RunSummary, SelectedStage } from "@/lib/types";
 import { CAMERA_ANGLES } from "@/lib/types";
 
 const ANGLE_LABEL: Record<CameraAngle, string> = {
@@ -36,7 +36,15 @@ type Mode = "static" | "live" | "replay";
  *    - Live does NOT auto-switch to Static when a run completes — it
  *      stays on the last clip with a "Run completed" overlay.
  */
-export function RobotViewer({ slug }: { slug: string }) {
+export function RobotViewer({
+  slug, selectedStage,
+}: {
+  slug: string;
+  // §Ship de-silo: not yet consumed (lands in a later increment that
+  // switches the live-video preview to a selected completed stage).
+  selectedStage?: SelectedStage | null;
+}) {
+  void selectedStage;
   // §Ship 21d: keep /runs polling through mission stage boundaries so
   // the live-video run selection doesn't freeze on a stale stage when
   // one completes and the next starts.

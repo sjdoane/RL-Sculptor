@@ -26,6 +26,7 @@ import type {
   RewardVersionDetail,
   RewardVersionSummary,
   RunSummary,
+  SelectedStage,
 } from "@/lib/types";
 
 const SCULPT_LOCK_NOTE =
@@ -70,7 +71,20 @@ function RewardsExplainer() {
   );
 }
 
-export function RewardsTab({ slug, project }: { slug: string; project: ProjectDetail }) {
+export function RewardsTab({
+  slug, project, selectedStage, setSelectedStage,
+}: {
+  slug: string;
+  project: ProjectDetail;
+  // §Ship de-silo: plumbed through now; this tab doesn't consume the
+  // shared stage selection yet (a later increment scopes the reward
+  // version list to the selected stage instead of the auto-detected
+  // active one).
+  selectedStage?: SelectedStage | null;
+  setSelectedStage?: (value: SelectedStage | null) => void;
+}) {
+  void selectedStage;
+  void setSelectedStage;
   // §Ship 21b/21d scope logic — preserved verbatim from the prior version.
   // When a mission_stage_run is active, the project's global rewards/v0.py
   // doesn't change; Claude's edits land in the STAGE's rewards dir. Auto-

@@ -1153,3 +1153,14 @@ export interface TrashEntry {
    *  partial). Restore is still allowed; the UI flags it. */
   unreadable?: boolean;
 }
+
+// ── Shared stage selection (de-silo, Ship 20+) ────────────────────────
+// A stage selection shared across the Overview / Rewards / Training tabs
+// on ProjectDetail, URL-synced as `?stage=missionSlug/stageName`. Lives
+// here (not in pages/ProjectDetail) so components like RobotViewer and
+// RunsTab can import the type without a circular import back into the
+// page module.
+export interface SelectedStage {
+  missionSlug: string;
+  stageName: string;
+}

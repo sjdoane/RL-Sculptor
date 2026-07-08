@@ -9,24 +9,34 @@ import { NewMissionDialog } from "@/components/NewMissionDialog";
 import { MissionDetailDialog } from "@/components/MissionDetailDialog";
 import { useSystemGpu } from "@/hooks/useLibrary";
 import { useRunEvents } from "@/hooks/useRunEvents";
-import { useMissions } from "@/hooks/useMissions";
+import { useMission, useMissions, useStageIterations } from "@/hooks/useMissions";
 import { useRegenerateRewardTemplate, useRewards } from "@/hooks/useRewards";
 import { usePolicies } from "@/hooks/usePolicies";
 import { useControlRun, useKillRun, useRun, useRuns } from "@/hooks/useRuns";
-import { ApiError, policyExportUrl } from "@/lib/api";
+import { ApiError, policyExportUrl, stageRolloutUrl } from "@/lib/api";
 import { formatRelative } from "@/lib/utils";
 import type {
   ErrorClassification,
   IterEventSummary,
+  MissionDetail,
   MissionSummary,
   ProjectDetail,
   RunDetail,
   RunEvent,
   RunSummary,
+  SelectedStage,
+  StageIteration,
 } from "@/lib/types";
 
 // ── public entry ──────────────────────────────────────────────────────
-export default function RunsTab({ slug, project }: { slug: string; project: ProjectDetail }) {
+export default function RunsTab({
+  slug, project, selectedStage, setSelectedStage,
+}: {
+  slug: string;
+  project: ProjectDetail;
+  selectedStage?: SelectedStage | null;
+  setSelectedStage?: (value: SelectedStage | null) => void;
+}) {
   const missions = useMissions(slug);
   // §Ship 21d: keep /runs polling through stage boundaries while a mission
   // is active (preserved verbatim).
@@ -50,7 +60,31 @@ export default function RunsTab({ slug, project }: { slug: string; project: Proj
     ],
     [sculptRuns, missionGroups],
   );
-  const selected = selectedRunId ?? allOrderedRunIds[0] ?? null;
+  // §Ship de-silo (Training tab): selecting a mission STAGE row now sets
+  // both the live run_id (best-effort, for the active stage) AND the
+  // shared cross-tab `selectedStage` (mission_slug/stage_name) — the
+  // latter is disk-truth and survives the run_id going stale when the
+  // stage is superseded or a later stage errors.
+  const selectStageRow = (run: RunSummary) => {
+    setSelectedRunId(run.run_id);
+    if (run.mission_slug && run.stage_name && setSelectedStage) {
+      setSelectedStage({ missionSlug: run.mission_slug, stageName: run.stage_name });
+    }
+  };
+  // Deep-linked `?stage=` (e.g. from the mission dialog's "view rewards
+  // for this stage" pattern, or a bookmark) with no in-tab click yet:
+  // resolve it to that stage's run_id so the detail pane opens on it
+  // instead of defaulting to the first run in the list.
+  const stageDeepLinkRunId = useMemo(() => {
+    if (!selectedStage) return null;
+    for (const g of missionGroups) {
+      if (g.missionSlug !== selectedStage.missionSlug) continue;
+      const row = g.stages.find((r) => r.stage_name === selectedStage.stageName);
+      if (row) return row.run_id;
+    }
+    return null;
+  }, [selectedStage, missionGroups]);
+  const selected = selectedRunId ?? stageDeepLinkRunId ?? allOrderedRunIds[0] ?? null;
   const missionDialogSummary =
     missionDialogSlug != null
       ? (missions.data ?? []).find((m) => m.mission_slug === missionDialogSlug) ?? null
@@ -94,7 +128,9 @@ export default function RunsTab({ slug, project }: { slug: string; project: Proj
           sculptRuns={sculptRuns}
           missionGroups={missionGroups}
           selected={selected}
+          selectedStage={selectedStage ?? null}
           onSelectRun={setSelectedRunId}
+          onSelectStageRow={selectStageRow}
           onOpenMissionDialog={setMissionDialogSlug}
           onLaunchedRun={(id) => setSelectedRunId(id)}
         />
@@ -148,12 +184,32 @@ function partitionRuns(runs: RunSummary[], missions: MissionSummary[]): { sculpt
   return { sculptRuns, missionGroups };
 }
 
-function missionRunStateLabel(m: MissionSummary): string {
-  const { current_stage_idx: i, n_stages: n, lifecycle } = m;
+// §Ship de-silo fix: `n` now prefers the REAL stage-run count seen on disk
+// (`knownStages`, from `missionGroups[].stages.length`) over the mission's
+// possibly-stale `n_stages` — for a terminal mission with a later stage
+// errored, `n_stages`/`current_stage_idx` can undercount or freeze on the
+// stage that was live when it errored, showing "Stage 1 of 3" forever.
+// `viewedStageIndex1based`, when given (the row the user is actually
+// looking at, from disk-truth `stage_index`), takes priority for the
+// "Stage N" part so switching stages updates the header immediately.
+function missionRunStateLabel(
+  m: MissionSummary,
+  knownStages: number,
+  viewedStageIndex1based?: number | null,
+): string {
+  const { current_stage_idx: i, n_stages, lifecycle } = m;
+  const n = Math.max(n_stages, knownStages);
   if (n === 0) return "Planning…";
-  if (lifecycle === "running") return `Stage ${Math.max(1, i + 1)} of ${n}`;
+  if (lifecycle === "running") {
+    const shown = viewedStageIndex1based ?? Math.max(1, i + 1);
+    return `Stage ${shown} of ${n}`;
+  }
   if (lifecycle === "ready") return `${n} stages planned`;
   if (lifecycle === "completed") return `${n} of ${n} stages complete`;
+  // Terminal (errored/halted) mission: show the stage being VIEWED, not
+  // the stale current_stage_idx from whichever stage was live when a
+  // later one errored.
+  if (viewedStageIndex1based != null) return `Stage ${viewedStageIndex1based} of ${n}`;
   return `${i} of ${n} stages complete`;
 }
 
@@ -168,14 +224,16 @@ function durationStr(start: string, end: string): string {
 
 // ── sidebar ───────────────────────────────────────────────────────────
 function RunSidebar({
-  slug, project, sculptRuns, missionGroups, selected, onSelectRun, onOpenMissionDialog, onLaunchedRun,
+  slug, project, sculptRuns, missionGroups, selected, selectedStage, onSelectRun, onSelectStageRow, onOpenMissionDialog, onLaunchedRun,
 }: {
   slug: string;
   project: ProjectDetail;
   sculptRuns: RunSummary[];
   missionGroups: MissionGroup[];
   selected: string | null;
+  selectedStage: SelectedStage | null;
   onSelectRun: (id: string) => void;
+  onSelectStageRow: (run: RunSummary) => void;
   onOpenMissionDialog: (missionSlug: string) => void;
   onLaunchedRun: (id: string) => void;
 }) {
@@ -197,8 +255,20 @@ function RunSidebar({
       {missionGroups.length > 0 && <div className="rs-side-group">Missions</div>}
       {missionGroups.map((g) => {
         const isCollapsed = collapsed[g.missionSlug] ?? false;
-        const selectedInGroup = g.stages.some((s) => s.run_id === selected);
+        // A row counts as "selected" either by live run_id (normal case)
+        // OR by the shared disk-truth selectedStage (keeps the group open
+        // and the row highlighted even after its run_id goes stale).
+        const isRowSelected = (s: RunSummary) =>
+          s.run_id === selected ||
+          (selectedStage != null && selectedStage.missionSlug === g.missionSlug && selectedStage.stageName === s.stage_name);
+        const selectedInGroup = g.stages.some(isRowSelected);
         const open = !isCollapsed || selectedInGroup;
+        // Which stage the user is actually looking at, for the header's
+        // "Stage N of M" — prefers the row matching selectedStage/selected
+        // over the mission's live (possibly stale) current_stage_idx.
+        const viewedRow = g.stages.find(isRowSelected);
+        const viewedStageIndex1based =
+          viewedRow && typeof viewedRow.stage_index === "number" ? viewedRow.stage_index + 1 : null;
         return (
           <div key={g.missionSlug} className="rs-mission">
             <div className="rs-mhead" role="button" tabIndex={0}
@@ -212,7 +282,7 @@ function RunSidebar({
                 <span style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
                   {g.mission && <Badge status={g.mission.lifecycle} label="" />}
                   <span style={{ fontWeight: 500, fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                    {g.mission ? missionRunStateLabel(g.mission) : g.missionSlug}
+                    {g.mission ? missionRunStateLabel(g.mission, g.stages.length, viewedStageIndex1based) : g.missionSlug}
                   </span>
                 </span>
                 {g.mission?.goal && (
@@ -231,8 +301,17 @@ function RunSidebar({
                 <Icon name="list" size={14} />
               </button>
             </div>
+            {/* §Ship de-silo: a visible divider under the mission head so
+                the full stage list reads as one clearly-grouped block. */}
+            {open && g.stages.length > 0 && <div className="rs-stage-divider" aria-hidden="true" />}
             {open && g.stages.map((r) => (
-              <RunRow key={r.run_id} run={r} selected={selected === r.run_id} onSelect={() => onSelectRun(r.run_id)} stageContext />
+              <RunRow
+                key={r.run_id}
+                run={r}
+                selected={isRowSelected(r)}
+                onSelect={() => onSelectStageRow(r)}
+                stageContext
+              />
             ))}
           </div>
         );
@@ -280,6 +359,186 @@ function RunRow({
 
 // ── detail pane ───────────────────────────────────────────────────────
 function RunDetailPane({ slug, runId, runs }: { slug: string; runId: string; runs: RunSummary[] }) {
+  const summaryEarly = useMemo(() => runs.find((r) => r.run_id === runId) ?? null, [runs, runId]);
+  const isStageRunEarly = summaryEarly?.kind === "mission_stage_run";
+  const missionSlugEarly = summaryEarly?.mission_slug ?? null;
+  const stageNameEarly = summaryEarly?.stage_name ?? null;
+
+  // §Ship de-silo: a mission stage row is only "live" (safe to source from
+  // the in-memory /runs+WS path) while it's the run the mission is
+  // ACTIVELY training right now. Any other stage — completed, superseded
+  // by a later stage starting, or left behind because a LATER stage
+  // errored — must read disk-truth instead, or its data disappears the
+  // moment the live run_id moves on. `useRun`/`iterRolloutUrl` are scoped
+  // to a single run_id and go stale/empty exactly in those cases; the
+  // mission detail tells us definitively whether this run is the one
+  // currently training.
+  const missionDetail = useMission(slug, missionSlugEarly ?? undefined, {
+    enabled: isStageRunEarly && !!missionSlugEarly,
+  });
+  const isLiveStage =
+    !isStageRunEarly ||
+    (missionDetail.data?.active_job_id != null &&
+      missionDetail.data.stages[missionDetail.data.current_stage_idx]?.name === stageNameEarly) ||
+    // Before the mission detail loads, assume live if the run itself is
+    // still running/queued — avoids a one-frame flash to disk-truth for
+    // the common case of a freshly-launched stage.
+    (missionDetail.isLoading && (summaryEarly?.status === "running" || summaryEarly?.status === "queued"));
+  const useDiskTruth = isStageRunEarly && !isLiveStage;
+
+  return useDiskTruth && missionSlugEarly && stageNameEarly ? (
+    <StageDetailPane
+      slug={slug}
+      missionSlug={missionSlugEarly}
+      stageName={stageNameEarly}
+      summary={summaryEarly}
+      mission={missionDetail.data ?? null}
+    />
+  ) : (
+    <LiveRunDetailPane slug={slug} runId={runId} runs={runs} />
+  );
+}
+
+// Disk-truth stage view: sources iterations + rollout from
+// `useStageIterations`/`stageRolloutUrl` (the same disk-truth path proven
+// by MissionDetailDialog's StagePanel) instead of the live `useRun` +
+// `iterRolloutUrl`, so a completed/superseded/left-behind stage keeps
+// showing its data no matter what the live job is doing now.
+function StageDetailPane({
+  slug, missionSlug, stageName, summary, mission,
+}: {
+  slug: string;
+  missionSlug: string;
+  stageName: string;
+  summary: RunSummary | null;
+  mission: MissionDetail | null;
+}) {
+  const stage = mission?.stages.find((s) => s.name === stageName) ?? null;
+  const iters = useStageIterations(slug, missionSlug, stageName);
+  const rows = iters.data ?? [];
+
+  const [picked, setPicked] = useState<number | null>(null);
+  const defaultIter = useMemo(() => {
+    if (rows.length === 0) return null;
+    const kept =
+      stage?.selected_iter_index != null
+        ? rows.find((r) => r.iter_index === stage.selected_iter_index)
+        : undefined;
+    if (kept?.has_rollout) return kept.iter_index;
+    const newestWithRollout = [...rows].reverse().find((r) => r.has_rollout);
+    if (newestWithRollout) return newestWithRollout.iter_index;
+    return rows[rows.length - 1].iter_index;
+  }, [rows, stage?.selected_iter_index]);
+  const activeIter = picked ?? defaultIter;
+  const activeRow = rows.find((r) => r.iter_index === activeIter) ?? null;
+
+  return (
+    <div className="rs-runs-detail">
+      <div className="rs-iter-col">
+        <div className="rs-eyebrow" style={{ marginBottom: 12 }}>Iterations</div>
+        {iters.isLoading && <p className="rs-sub" style={{ fontSize: 11 }}>Loading…</p>}
+        {iters.error && <p style={{ fontSize: 11, color: "var(--st-rose)" }}>{(iters.error as Error).message}</p>}
+        {!iters.isLoading && rows.length === 0 && <p className="rs-sub" style={{ fontSize: 11 }}>No iterations on disk yet for this stage.</p>}
+        {rows.map((r) => (
+          <StageIterCard
+            key={r.iter_index}
+            row={r}
+            selected={activeIter === r.iter_index}
+            kept={stage?.selected_iter_index === r.iter_index}
+            onSelect={() => setPicked(r.iter_index)}
+          />
+        ))}
+      </div>
+
+      <div className="rs-mid-col">
+        {summary && <StageContextCard run={summary} />}
+        <div className="rs-run-header">
+          <Icon name="activity" size={17} color="var(--rs-muted)" />
+          <span className="mono" style={{ fontSize: 14, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}>
+            {stageName}
+          </span>
+          {summary && <Badge status={summary.status} />}
+          <span className="rs-grow" />
+          <span className="rs-eyebrow" style={{ flexShrink: 0 }}>disk-truth · not the live job</span>
+        </div>
+
+        {/* Rollout player for the picked iter — same disk-truth source as
+            MissionDetailDialog's StagePanel, so it survives the run_id
+            going stale. */}
+        {activeIter != null && activeRow?.has_rollout ? (
+          <div style={{ margin: "0 16px 12px", border: "1px solid var(--hairline)", borderRadius: "var(--radius-md)", overflow: "hidden" }}>
+            <div className="rs-log-bar" style={{ gap: 8 }}>
+              <Icon name="video" size={13} color="var(--rs-muted)" />
+              <span style={{ fontSize: 11.5, fontWeight: 600 }}>iter {activeIter} rollout</span>
+              <span className="rs-grow" />
+              <a
+                href={stageRolloutUrl(slug, missionSlug, stageName, activeIter)}
+                download={`${stageName}_iter_${activeIter}.mp4`}
+                className="rs-btn rs-btn-quiet rs-btn-xs"
+              >
+                <Icon name="download" size={13} />MP4
+              </a>
+            </div>
+            <video
+              key={activeIter}
+              src={stageRolloutUrl(slug, missionSlug, stageName, activeIter)}
+              style={{ width: "100%", aspectRatio: "16/9", background: "#16150f", display: "block" }}
+              controls
+              playsInline
+              preload="metadata"
+            >
+              <track kind="captions" />
+            </video>
+          </div>
+        ) : activeIter != null ? (
+          <p className="rs-sub" style={{ margin: "0 16px 12px", fontSize: 11 }}>iter {activeIter} has no rollout video.</p>
+        ) : null}
+
+        <div style={{ padding: "0 16px" }}>
+          <p className="rs-sub" style={{ fontSize: 12, lineHeight: 1.6 }}>
+            This stage isn't the one currently training, so its data is read straight off
+            disk — it stays available even after a later stage supersedes or errors.
+          </p>
+        </div>
+      </div>
+
+      <div className="rs-extra-col">
+        {missionSlug && stageName && <StageRewardsCard slug={slug} stage={`${missionSlug}/${stageName}`} />}
+      </div>
+    </div>
+  );
+}
+
+function StageIterCard({
+  row, selected, kept, onSelect,
+}: { row: StageIteration; selected: boolean; kept: boolean; onSelect: () => void }) {
+  return (
+    <button
+      className={"rs-itercard" + (selected ? " on" : "")}
+      style={{ width: "100%", textAlign: "left", cursor: "pointer" }}
+      onClick={onSelect}
+    >
+      <div className="rs-itercard-top">
+        <span className="it">iter {row.iter_index}</span>
+        {typeof row.fitness === "number" ? (
+          <span className="rs-num" style={{ fontSize: 15, fontWeight: 600, color: "#b9aef5" }}>fit {row.fitness.toFixed(2)}</span>
+        ) : row.primary_metric !== null ? (
+          <span className="rs-num" style={{ fontSize: 13 }}>{row.primary_metric.toFixed(1)}</span>
+        ) : null}
+      </div>
+      <span className="rs-flex rs-gap-6" style={{ marginTop: 4 }}>
+        {row.has_rollout && <Icon name="video" size={11} color="var(--rs-muted)" />}
+        {row.reward_version && <span className="rs-sub" style={{ fontSize: 10.5 }}>reward {row.reward_version}</span>}
+        {kept && <span className="rs-badge emerald" style={{ fontSize: 8.5 }}><Icon name="check" size={9} />kept</span>}
+      </span>
+    </button>
+  );
+}
+
+// The original live-job detail pane (unchanged behavior) — used for
+// single sculpt runs and for whichever mission stage is the one
+// ACTIVELY training right now, so "watch it train live" keeps working.
+function LiveRunDetailPane({ slug, runId, runs }: { slug: string; runId: string; runs: RunSummary[] }) {
   const run = useRun(slug, runId);
   const events = useRunEvents(slug, runId);
   const kill = useKillRun(slug);

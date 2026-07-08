@@ -17,7 +17,7 @@ import { useProject } from "@/hooks/useProjects";
 import { useRewards } from "@/hooks/useRewards";
 import { useRobot } from "@/hooks/useRobot";
 import { formatRelative } from "@/lib/utils";
-import type { ProjectDetail as ProjectDetailShape, RobotStateResponse } from "@/lib/types";
+import type { ProjectDetail as ProjectDetailShape, RobotStateResponse, SelectedStage } from "@/lib/types";
 
 const RunsTabLazy = lazy(() => import("@/components/RunsTab"));
 const ReportsTabLazy = lazy(() => import("@/components/ReportsTab"));
@@ -46,6 +46,23 @@ function normalizeTab(raw: string | null): TabValue {
   if (raw && raw in LEGACY_TABS) return LEGACY_TABS[raw];
   if (raw && TABS.some((t) => t.value === raw)) return raw as TabValue;
   return "overview";
+}
+
+// A stage selection shared across tabs (currently consumed by Training;
+// Overview/Rewards receive the props so their wiring lands in a later
+// increment). URL-synced via `?stage=missionSlug/stageName` so the
+// selection survives refresh, mirroring the `?tab=` pattern above.
+// (SelectedStage itself is defined in lib/types.ts to avoid a circular
+// import back into this page module from RobotViewer/RunsTab.)
+function parseStageParam(raw: string | null): SelectedStage | null {
+  if (!raw) return null;
+  const idx = raw.indexOf("/");
+  if (idx <= 0 || idx === raw.length - 1) return null;
+  return { missionSlug: raw.slice(0, idx), stageName: raw.slice(idx + 1) };
+}
+
+function stageParam(s: SelectedStage): string {
+  return `${s.missionSlug}/${s.stageName}`;
 }
 
 function humanizeSlug(s: string | null | undefined): string {
@@ -133,6 +150,21 @@ export default function ProjectDetail() {
       { replace: true },
     );
   };
+
+  // Shared stage selection (Training tab consumes this increment;
+  // Overview/Rewards get the plumbing now, wired up later).
+  const selectedStage = parseStageParam(searchParams.get("stage"));
+  const setSelectedStage = (value: SelectedStage | null) => {
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        if (!value) next.delete("stage");
+        else next.set("stage", stageParam(value));
+        return next;
+      },
+      { replace: true },
+    );
+  };
   const p = project.data;
   const canRun = !!p && !p.adapter_unavailable && p.ready_to_train !== false;
 
@@ -186,13 +218,36 @@ export default function ProjectDetail() {
           {tab !== "training" && (p.adapter_unavailable || p.migration_warning) && <WarningBanners project={p} />}
 
           {tab === "overview" && (
-            <OverviewTab slug={slug!} project={p} robot={robot.data} onGoTo={setTab} />
+            <OverviewTab
+              slug={slug!}
+              project={p}
+              robot={robot.data}
+              onGoTo={setTab}
+              selectedStage={selectedStage}
+              setSelectedStage={setSelectedStage}
+            />
           )}
-          {tab === "rewards" && <ScrollPad><RewardsTab slug={slug!} project={p} /></ScrollPad>}
+          {tab === "rewards" && (
+            <ScrollPad>
+              <RewardsTab
+                slug={slug!}
+                project={p}
+                selectedStage={selectedStage}
+                setSelectedStage={setSelectedStage}
+              />
+            </ScrollPad>
+          )}
           {tab === "physics" && <ScrollPad><PhysicsTab slug={slug!} project={p} /></ScrollPad>}
           {tab === "knowledge" && <KnowledgeGraphTab slug={slug!} />}
           {tab === "training" && (
-            <Suspense fallback={<TabFallback />}><RunsTabLazy slug={slug!} project={p} /></Suspense>
+            <Suspense fallback={<TabFallback />}>
+              <RunsTabLazy
+                slug={slug!}
+                project={p}
+                selectedStage={selectedStage}
+                setSelectedStage={setSelectedStage}
+              />
+            </Suspense>
           )}
           {tab === "results" && (
             <Suspense fallback={<TabFallback />}><ReportsTabLazy slug={slug!} /></Suspense>
@@ -216,23 +271,28 @@ function TabFallback() {
 
 // ── Overview ──────────────────────────────────────────────────────────
 function OverviewTab({
-  slug, project, robot, onGoTo,
+  slug, project, robot, onGoTo, selectedStage, setSelectedStage,
 }: {
   slug: string;
   project: ProjectDetailShape;
   robot: RobotStateResponse | undefined;
   onGoTo: (tab: TabValue) => void;
+  selectedStage: SelectedStage | null;
+  setSelectedStage: (value: SelectedStage | null) => void;
 }) {
   const configured = isRobotConfigured(robot, project);
   const cfg = project.adapter_config || {};
   const taskId = typeof cfg.task_id === "string" ? cfg.task_id : null;
   const numEnvs = typeof cfg.num_envs === "number" ? cfg.num_envs : null;
   const device = typeof cfg.device === "string" ? cfg.device : null;
+  // §Ship de-silo: not yet consumed here (RobotViewer wiring lands in a
+  // later increment) — referenced so lint doesn't flag it as dead.
+  void setSelectedStage;
   return (
     <div className="rs-scroll">
       <div className="rs-pad" style={{ display: "grid", gridTemplateColumns: "minmax(0,1.6fr) minmax(300px,1fr)", gap: 22, alignItems: "start" }}>
         <div className="rs-vgap-16">
-          {configured ? <RobotViewer slug={slug} /> : <RobotConfig slug={slug} />}
+          {configured ? <RobotViewer slug={slug} selectedStage={selectedStage} /> : <RobotConfig slug={slug} />}
           <div className="rs-card rs-card-pad">
             <div className="rs-card-title" style={{ marginBottom: 10 }}><Icon name="flag" size={16} />What this project is</div>
             <p className="rs-sub" style={{ lineHeight: 1.6, margin: 0 }}>{project.description || "No description."}</p>

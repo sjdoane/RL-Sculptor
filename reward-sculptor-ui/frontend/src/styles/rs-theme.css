@@ -312,6 +312,10 @@ input, textarea, select { font: inherit; color: inherit; }
 .rs-mhead:hover { background: var(--canvas-soft); }
 .rs-stage { padding-left: 30px; }
 .rs-stage.on { background: var(--surface-strong); border-left-color: var(--rs-primary); }
+/* §Ship de-silo: visible divider between a mission's header and its full
+   stage list, so all stages read as one clearly-grouped block the user
+   can scan and click through. */
+.rs-stage-divider { height: 1px; margin: 0 14px; background: var(--hairline); }
 
 .rs-runs-detail { display: grid; grid-template-columns: minmax(180px, 220px) minmax(0, 1fr) minmax(248px, 292px); min-width: 0; overflow: hidden; }
 .rs-iter-col { border-right: 1px solid var(--hairline); overflow-y: auto; padding: 14px; }
