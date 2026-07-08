@@ -115,6 +115,9 @@ JobKind = Literal[
     # §Ship 21 — per-stage child job created on `stage_started` so
     # mission stage runs are first-class entries in /runs.
     "mission_stage_run",
+    # §chunk A4 — manual "save a copy now" action over the durable
+    # saved-missions archive (sculptor.archive.archive_mission).
+    "mission_save",
 ]
 JobStatus = Literal["queued", "running", "completed", "errored", "stopped"]
 
