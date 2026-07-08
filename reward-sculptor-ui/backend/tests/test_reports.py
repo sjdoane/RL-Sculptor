@@ -192,3 +192,225 @@ def test_final_report_200_when_file_exists(
     r = client.get(f"/projects/{slug}/reports/final_report.md")
     assert r.status_code == 200
     assert "final report" in r.text.lower()
+
+
+# ── §chunk C1: mission-aware report build / sources / mission routes ──
+def _write_mission_on_disk(
+    project_dir: Path, mission_slug: str, *,
+    stage_specs: list[tuple[str, int, list[float]]],
+) -> Path:
+    """Hand-build a mission tree on disk — same shape the mission
+    orchestrator would leave behind, without going through decompose
+    (which is an LLM call). `stage_specs` is `[(name, n_iters,
+    metric_history), ...]` in stage order. Returns the mission dir."""
+    from sculptor.mission import Mission, Stage, save_mission
+    from sculptor.sculpt import sculpt_init
+
+    from backend.services import mission_store
+
+    mdir = mission_store.mission_dir(project_dir, mission_slug)
+    stages: list[Stage] = []
+    for i, (name, n_iters, metric_history) in enumerate(stage_specs):
+        stage_dir = mdir / "stages" / name
+        sculpt_init(stage_dir, "gym_sb3")
+        for it in range(n_iters):
+            iter_dir = stage_dir / "runs" / f"iter_{it}"
+            (iter_dir / "rollout").mkdir(parents=True, exist_ok=True)
+            (iter_dir / "metrics.json").write_text(json.dumps(
+                {"metrics": {"mean_return": metric_history[it]}}))
+            (iter_dir / "rollout" / "behavior.json").write_text(json.dumps(
+                {"mean_return": metric_history[it]}))
+            (iter_dir / "diagnosis.json").write_text(json.dumps({
+                "failure_modes": [], "proposed_edits": [],
+                "confidence": 0.5, "behavior_goal": name,
+            }))
+        (stage_dir / "reports").mkdir(exist_ok=True)
+        (stage_dir / "reports" / "metric_history.json").write_text(json.dumps({
+            "primary_metric": "mean_return", "history": metric_history,
+        }))
+        stages.append(Stage(
+            name=name, goal_text=f"reach {name}",
+            success_criterion="behavior['mean_return'] > 0",
+            max_iterations=10, parent_stage=stage_specs[i - 1][0] if i > 0 else None,
+            reward_seed_prompt=f"reward {name}",
+            status="succeeded" if metric_history else "pending",
+            best_metric=metric_history[-1] if metric_history else None,
+            iterations_used=n_iters,
+        ))
+    mission = Mission(
+        goal="do a complex multi-stage behavior", stages=stages,
+        decomposition_model="claude-test",
+        decomposition_rationale="stand then walk",
+    )
+    save_mission(mission, mdir)
+    return mdir
+
+
+def test_build_report_with_mission_slug_writes_mission_report(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    slug = _make_project_with_library(client, "MissionBuild")
+    project_dir = tmp_projects_root / slug
+    _write_mission_on_disk(
+        project_dir, "walk-mission",
+        stage_specs=[("stand", 2, [3.0, 9.0]), ("walk", 2, [1.0, 15.0])],
+    )
+
+    r = client.post(
+        f"/projects/{slug}/reports/build",
+        json={"mission_slug": "walk-mission"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ok"] is True
+    assert body["mission_slug"] == "walk-mission"
+    assert body["final_report_md_path"]
+
+    md_path = project_dir / ".missions" / "walk-mission" / "reports" / "final_report.md"
+    assert md_path.is_file()
+    md = md_path.read_text(encoding="utf-8")
+    assert "# Sculpt Mission Report" in md
+    assert "## Stage: `stand`" in md
+    assert "## Stage: `walk`" in md
+
+
+def test_build_report_unknown_mission_slug_404(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    slug = _make_project_with_library(client, "MissionBuildBadSlug")
+    r = client.post(
+        f"/projects/{slug}/reports/build",
+        json={"mission_slug": "does-not-exist"},
+    )
+    assert r.status_code == 404
+    assert "mission not found" in r.json().get("title", "").lower()
+
+
+def test_build_report_no_body_still_uses_legacy_path(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    """§chunk C1 regression: POST with no body at all (not even `{}`)
+    must still hit the legacy project-runs build path unchanged."""
+    slug = _make_project_with_library(client, "MissionBuildLegacyNoBody")
+    project_dir = tmp_projects_root / slug
+    runs_dir = project_dir / "runs"
+    for i in range(2):
+        iter_dir = runs_dir / f"iter_{i}"
+        iter_dir.mkdir(parents=True)
+        (iter_dir / "diagnosis.json").write_text(json.dumps(
+            {"failure_modes": [], "confidence": 0.5}))
+        (iter_dir / "rollout").mkdir(exist_ok=True)
+    (project_dir / "reports").mkdir(exist_ok=True)
+    (project_dir / "reports" / "metric_history.json").write_text(json.dumps(
+        {"primary_metric": "mean_return", "history": [1.0, 2.0]}))
+
+    r = client.post(f"/projects/{slug}/reports/build")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ok"] is True
+    assert "mission_slug" not in body
+    assert (project_dir / "reports" / "final_report.md").is_file()
+
+
+def test_mission_report_md_and_mp4_routes(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    slug = _make_project_with_library(client, "MissionReportRoutes")
+    project_dir = tmp_projects_root / slug
+    _write_mission_on_disk(
+        project_dir, "jump-mission",
+        stage_specs=[("crouch", 1, [2.0])],
+    )
+    r = client.post(
+        f"/projects/{slug}/reports/build", json={"mission_slug": "jump-mission"})
+    assert r.status_code == 200, r.text
+
+    r_md = client.get(f"/projects/{slug}/missions/jump-mission/report/final_report.md")
+    assert r_md.status_code == 200
+    assert "Sculpt Mission Report" in r_md.text
+
+    r_mp4 = client.get(f"/projects/{slug}/missions/jump-mission/report/final.mp4")
+    # mp4 build may fail if ffmpeg can't stitch our placeholder rollout
+    # videos, but the route itself must resolve — 200 when final.mp4 was
+    # written, 404 "timelapse not built" otherwise. Never 500.
+    assert r_mp4.status_code in (200, 404)
+    if r_mp4.status_code == 404:
+        assert "timelapse not built" in r_mp4.json().get("title", "").lower()
+
+
+def test_mission_report_md_404_before_build(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    slug = _make_project_with_library(client, "MissionReportNoBuild")
+    project_dir = tmp_projects_root / slug
+    _write_mission_on_disk(
+        project_dir, "unbuilt-mission", stage_specs=[("crouch", 1, [2.0])])
+
+    r = client.get(f"/projects/{slug}/missions/unbuilt-mission/report/final_report.md")
+    assert r.status_code == 404
+    body = r.json()
+    assert body.get("n_completed_iters") == 1
+
+
+def test_mission_report_unknown_mission_slug_404(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    slug = _make_project_with_library(client, "MissionReportBadSlug")
+    r = client.get(f"/projects/{slug}/missions/nope-mission/report/final_report.md")
+    assert r.status_code == 404
+    r2 = client.get(f"/projects/{slug}/missions/nope-mission/report/final.mp4")
+    assert r2.status_code == 404
+
+
+def test_mission_report_path_traversal_guard(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    """A mission_slug with path-traversal characters is rejected before
+    it reaches the filesystem — mirrors routes/runs.py's segment guard."""
+    slug = _make_project_with_library(client, "MissionReportTraversal")
+    r = client.get(
+        f"/projects/{slug}/missions/..%2f..%2f..%2fetc/report/final_report.md")
+    assert r.status_code in (404, 422)
+
+
+def test_report_sources_lists_project_runs_and_missions(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    slug = _make_project_with_library(client, "SourcesPicker")
+    project_dir = tmp_projects_root / slug
+
+    r = client.get(f"/projects/{slug}/reports/sources")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["project_runs"] == {"n_iters": 0, "has_report": False}
+    assert body["missions"] == []
+
+    # Add two project-level iters + a final_report.md.
+    runs_dir = project_dir / "runs"
+    for i in range(2):
+        (runs_dir / f"iter_{i}").mkdir(parents=True)
+    (project_dir / "reports").mkdir(exist_ok=True)
+    (project_dir / "reports" / "final_report.md").write_text("# done")
+
+    # Add one mission with a built report + one without.
+    _write_mission_on_disk(
+        project_dir, "done-mission", stage_specs=[("crouch", 1, [2.0])])
+    client.post(
+        f"/projects/{slug}/reports/build", json={"mission_slug": "done-mission"})
+    _write_mission_on_disk(
+        project_dir, "pending-mission", stage_specs=[("crouch", 1, [2.0])])
+
+    r = client.get(f"/projects/{slug}/reports/sources")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["project_runs"] == {"n_iters": 2, "has_report": True}
+    by_slug = {m["mission_slug"]: m for m in body["missions"]}
+    assert by_slug["done-mission"]["has_report"] is True
+    assert by_slug["done-mission"]["goal"] == "do a complex multi-stage behavior"
+    assert by_slug["pending-mission"]["has_report"] is False
+    assert "lifecycle" in by_slug["done-mission"]
+
+
+def test_report_sources_unknown_project_404(client: TestClient) -> None:
+    r = client.get("/projects/nope-nope/reports/sources")
+    assert r.status_code == 404

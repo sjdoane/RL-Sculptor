@@ -3,7 +3,22 @@
   GET  /projects/{slug}/reports/final_report.md   — markdown text
   GET  /projects/{slug}/reports/final.mp4         — timelapse mp4
   GET  /projects/{slug}/reports/mission-quality   — §Ship 25b telemetry
-  POST /projects/{slug}/reports/build             — run `sculptor.timelapse.build_report`
+  GET  /projects/{slug}/reports/sources           — §chunk C1: what can be
+                                                     built into a report
+                                                     (project runs + every
+                                                     mission), for the
+                                                     frontend's source picker
+  POST /projects/{slug}/reports/build             — run `sculptor.timelapse.
+                                                     build_report` (legacy,
+                                                     no body / empty body) or
+                                                     `build_mission_report`
+                                                     (body `{"mission_slug"}`)
+
+  GET  /projects/{slug}/missions/{mission_slug}/report/final_report.md
+  GET  /projects/{slug}/missions/{mission_slug}/report/final.mp4
+                                                   — §chunk C1: mission-level
+                                                     report artifacts, mirror
+                                                     of the two routes above.
 
 The build endpoint is synchronous today — `build_report` completes in a
 few seconds for typical 3-10 iter runs. If it grows to minute-scale we
@@ -12,17 +27,38 @@ should move it behind JobManager. For now we keep the flow simple.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import APIRouter, Depends, Request, status
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
+from pydantic import BaseModel, ConfigDict
 
 from backend.models.project import ProblemDetail
+from backend.services import mission_store
 from backend.services.project_store import ProjectStore
 
 
 router = APIRouter(tags=["reports"])
+
+# §chunk C1: mirrors routes/runs.py's `_SAFE_PATH_SEGMENT` — mission_slug
+# (and any other segment we splice into a filesystem path) must be a
+# snake_case-ish identifier before it's used to build a FileResponse path.
+_SAFE_PATH_SEGMENT = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
+
+class BuildReportRequest(BaseModel):
+    """POST /projects/{slug}/reports/build body (optional).
+
+    Absent (or an empty `{}` body) → legacy project-runs report via
+    `sculptor.timelapse.build_report`, unchanged. `mission_slug` set →
+    mission-aware report via `sculptor.timelapse.build_mission_report`.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    mission_slug: Optional[str] = None
 
 
 def get_store(request: Request) -> ProjectStore:
@@ -101,6 +137,104 @@ def get_final_mp4(slug: str, store: ProjectStore = Depends(get_store)) -> Any:
         return _problem(
             404, "timelapse not built",
             detail="No final.mp4 yet. Build the report first.",
+            type="/problems/not-found",
+        )
+    return FileResponse(path, media_type="video/mp4")
+
+
+# ── §chunk C1: mission report artifacts ────────────────────────────────
+def _mission_dir_checked(
+    store: ProjectStore, slug: str, mission_slug: str,
+) -> tuple[Optional[Path], Optional[JSONResponse]]:
+    """Resolve `<project_dir>/.missions/<mission_slug>/`, validating both
+    the project slug and the mission slug. Returns `(mission_dir, None)`
+    on success or `(None, problem_response)` on any failure — the 404
+    shapes mirror `get_final_report`/`get_final_mp4`'s "project not
+    found" / "not found" pattern, plus a traversal guard (mirrors
+    routes/runs.py's `_SAFE_PATH_SEGMENT` discipline) before the slug
+    is used to build a filesystem path."""
+    pd = _project_dir(store, slug)
+    if pd is None:
+        return None, _problem(404, "project not found", type="/problems/not-found")
+    if not _SAFE_PATH_SEGMENT.match(mission_slug):
+        return None, _problem(
+            404, "mission not found",
+            detail=f"mission_slug={mission_slug!r} is not a valid slug.",
+            type="/problems/not-found",
+        )
+    if mission_slug not in mission_store.list_mission_slugs(pd):
+        return None, _problem(
+            404, "mission not found",
+            detail=f"no mission {mission_slug!r} under project {slug!r}.",
+            type="/problems/not-found",
+        )
+    return mission_store.mission_dir(pd, mission_slug), None
+
+
+@router.get(
+    "/projects/{slug}/missions/{mission_slug}/report/final_report.md",
+    response_class=PlainTextResponse,
+    responses={404: {"model": ProblemDetail}},
+)
+def get_mission_final_report(
+    slug: str, mission_slug: str, store: ProjectStore = Depends(get_store),
+) -> Any:
+    md, problem = _mission_dir_checked(store, slug, mission_slug)
+    if problem is not None:
+        return problem
+    path = md / "reports" / "final_report.md"
+    if not path.is_file():
+        # Mirror get_final_report's n_completed_iters signal, scoped to
+        # however many stages this mission has scaffolded runs for.
+        n_completed = 0
+        stages_dir = md / "stages"
+        if stages_dir.is_dir():
+            for stage_dir in stages_dir.iterdir():
+                runs_dir = stage_dir / "runs"
+                if not runs_dir.is_dir():
+                    continue
+                for d in runs_dir.iterdir():
+                    if d.is_dir() and (d / "diagnosis.json").is_file():
+                        n_completed += 1
+        if n_completed == 0:
+            detail = (
+                "No completed stage iters yet. Run the mission before "
+                "building a report."
+            )
+        else:
+            detail = (
+                f"No final_report.md (mission has {n_completed} completed "
+                f"stage iter{'s' if n_completed != 1 else ''} on disk). "
+                f"POST {{'mission_slug': {mission_slug!r}}} to "
+                f"/projects/{{slug}}/reports/build to build it."
+            )
+        return _problem(
+            404, "report not built",
+            detail=detail,
+            type="/problems/not-found",
+            n_completed_iters=n_completed,
+        )
+    return PlainTextResponse(
+        path.read_text(encoding="utf-8"), media_type="text/markdown"
+    )
+
+
+@router.get(
+    "/projects/{slug}/missions/{mission_slug}/report/final.mp4",
+    response_class=FileResponse,
+    responses={404: {"model": ProblemDetail}},
+)
+def get_mission_final_mp4(
+    slug: str, mission_slug: str, store: ProjectStore = Depends(get_store),
+) -> Any:
+    md, problem = _mission_dir_checked(store, slug, mission_slug)
+    if problem is not None:
+        return problem
+    path = md / "reports" / "final.mp4"
+    if not path.is_file():
+        return _problem(
+            404, "timelapse not built",
+            detail="No final.mp4 yet. Build the mission report first.",
             type="/problems/not-found",
         )
     return FileResponse(path, media_type="video/mp4")
@@ -187,11 +321,23 @@ def get_actuator_limits(
         500: {"model": ProblemDetail},
     },
 )
-def build_report(slug: str, store: ProjectStore = Depends(get_store)) -> Any:
+def build_report(
+    slug: str,
+    store: ProjectStore = Depends(get_store),
+    body: Optional[BuildReportRequest] = None,
+) -> Any:
     pd = _project_dir(store, slug)
     if pd is None:
         return _problem(404, "project not found", type="/problems/not-found")
 
+    mission_slug = body.mission_slug if body is not None else None
+    if mission_slug is not None:
+        return _build_mission_report_response(pd, slug, mission_slug)
+    return _build_project_report_response(pd)
+
+
+def _build_project_report_response(pd: Path) -> Any:
+    """Legacy project-runs report path, unchanged from before §chunk C1."""
     config_path = pd / "config.toml"
     if not config_path.is_file():
         return _problem(
@@ -229,4 +375,111 @@ def build_report(slug: str, store: ProjectStore = Depends(get_store)) -> Any:
         "selected_iter_indices": list(
             getattr(result, "selected_iter_indices", []) or []
         ),
+    }
+
+
+def _build_mission_report_response(pd: Path, slug: str, mission_slug: str) -> Any:
+    """§chunk C1: mission-aware report path. Validates `mission_slug`
+    against both the traversal guard AND the on-disk mission list
+    before touching the filesystem, mirroring `routes/missions.py`'s
+    404 shape for an unknown slug."""
+    if not _SAFE_PATH_SEGMENT.match(mission_slug):
+        return _problem(
+            404, "mission not found",
+            detail=f"mission_slug={mission_slug!r} is not a valid slug.",
+            type="/problems/not-found",
+        )
+    if mission_slug not in mission_store.list_mission_slugs(pd):
+        return _problem(
+            404, "mission not found",
+            detail=(
+                f"no mission {mission_slug!r} under this project. "
+                f"Available: {mission_store.list_mission_slugs(pd)}"
+            ),
+            type="/problems/not-found",
+        )
+
+    mission_dir_path = mission_store.mission_dir(pd, mission_slug)
+    if not (mission_dir_path / "mission.json").is_file():
+        return _problem(
+            409, "mission not decomposed yet",
+            detail=(
+                f"mission {mission_slug!r} has no mission.json (decompose "
+                f"still in flight or never completed) — nothing to report."
+            ),
+            type="/problems/state-conflict",
+        )
+
+    try:
+        from sculptor.timelapse import (  # type: ignore[import-untyped]
+            build_mission_report as _build_mission_report,
+        )
+    except Exception as e:  # noqa: BLE001
+        return _problem(
+            500, "sculptor unavailable",
+            detail=f"{type(e).__name__}: {e}",
+            type="/problems/sculptor-unavailable",
+        )
+
+    try:
+        result = _build_mission_report(
+            mission_dir=mission_dir_path,
+            out_mp4=mission_dir_path / "reports" / "final.mp4",
+        )
+    except Exception as e:  # noqa: BLE001
+        return _problem(
+            500, "report build failed",
+            detail=f"{type(e).__name__}: {e}",
+            type="/problems/preview-failed",
+        )
+
+    return {
+        "ok": True,
+        "mission_slug": mission_slug,
+        "final_report_md_path": str(getattr(result, "final_report_md_path", "")),
+        "final_mp4_path": str(getattr(result, "final_mp4_path", "")),
+        "final_mp4_ok": bool(getattr(result, "final_mp4_ok", False)),
+        "selected_iter_indices": list(
+            getattr(result, "selected_iter_indices", []) or []
+        ),
+    }
+
+
+# ── GET sources (§chunk C1: report-source picker) ──────────────────────
+@router.get(
+    "/projects/{slug}/reports/sources",
+    responses={404: {"model": ProblemDetail}},
+)
+def get_report_sources(slug: str, store: ProjectStore = Depends(get_store)) -> Any:
+    """Everything the frontend's Results-tab source picker needs in one
+    call: the project-level runs report state, plus one entry per
+    mission (goal, lifecycle, whether it already has a built report).
+    Never 404s beyond "project not found" — an empty/fresh project
+    still returns a valid (empty) shape."""
+    pd = _project_dir(store, slug)
+    if pd is None:
+        return _problem(404, "project not found", type="/problems/not-found")
+
+    runs_dir = pd / "runs"
+    n_iters = 0
+    if runs_dir.is_dir():
+        n_iters = sum(1 for d in runs_dir.iterdir() if d.is_dir() and d.name.startswith("iter_"))
+    project_has_report = (pd / "reports" / "final_report.md").is_file()
+
+    missions: list[dict[str, Any]] = []
+    for mission_slug in mission_store.list_mission_slugs(pd):
+        mdir = mission_store.mission_dir(pd, mission_slug)
+        summary = mission_store.load_mission_summary(pd, slug, mission_slug)
+        if summary is None:
+            continue
+        missions.append({
+            "mission_slug": mission_slug,
+            "goal": summary.goal,
+            "lifecycle": summary.lifecycle,
+            "has_report": (mdir / "reports" / "final_report.md").is_file(),
+        })
+
+    return {
+        "project_runs": {"n_iters": n_iters, "has_report": project_has_report},
+        "missions": missions,
     }
