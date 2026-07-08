@@ -168,6 +168,10 @@ def _stages_to_schema(stages: list) -> list[StageSchema]:
             failure_reason=getattr(s, "failure_reason", None),
             failure_detail=getattr(s, "failure_detail", None),
             steering_metric=getattr(s, "steering_metric", None),
+            # §Ship 20a: never mirrored before — rounds X/Y displays and
+            # disk-run synthesis want the enforced cap, not max_iterations.
+            effective_max_iterations=getattr(
+                s, "effective_max_iterations", None),
         ))
     return out
 
@@ -449,7 +453,9 @@ def _disk_union_stages(
         orphans.append(StageSchema(
             name=d.name,
             goal_text=goal_text,
-            success_criterion=success_criterion or "True",
+            # Empty, not a placeholder: the original criterion wasn't
+            # persisted anywhere recoverable. The UI hides an empty box.
+            success_criterion=success_criterion,
             max_iterations=max(1, iterations_used),
             parent_stage=None,
             reward_seed_prompt=reward_seed_prompt or "(recovered from disk; "

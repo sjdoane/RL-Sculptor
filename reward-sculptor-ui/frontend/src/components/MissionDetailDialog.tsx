@@ -670,9 +670,11 @@ function StageCard({
           </div>
         )}
       <p style={{ margin: "6px 0 0", fontSize: 11.5, lineHeight: 1.5 }}>{stage.goal_text}</p>
-      <p className="mono" style={{ margin: "6px 0 0", wordBreak: "break-all", borderRadius: "var(--radius-sm)", background: "var(--canvas-soft)", border: "1px solid var(--hairline)", padding: "5px 8px", fontSize: 10.5, color: "var(--rs-muted)" }}>
-        {stage.success_criterion}
-      </p>
+      {stage.success_criterion && (
+        <p className="mono" style={{ margin: "6px 0 0", wordBreak: "break-all", borderRadius: "var(--radius-sm)", background: "var(--canvas-soft)", border: "1px solid var(--hairline)", padding: "5px 8px", fontSize: 10.5, color: "var(--rs-muted)" }}>
+          {stage.success_criterion}
+        </p>
+      )}
       <div style={{ marginTop: 6, display: "flex", flexWrap: "wrap", columnGap: 12, rowGap: 2, fontSize: 10.5, color: "var(--rs-muted)" }}>
         <span
           title={itersTooltip}

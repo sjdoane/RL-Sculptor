@@ -290,7 +290,9 @@ def _synthesize_disk_run_rows(
                 project_slug=project_slug,
                 status=run_status,  # type: ignore[arg-type]
                 behavior_goal=s.goal_text,
-                iterations_requested=s.max_iterations or 0,
+                iterations_requested=(
+                    s.effective_max_iterations or s.max_iterations or 0
+                ),
                 iterations_completed=completed,
                 current_iter_index=None,
                 primary_metric_history=[],

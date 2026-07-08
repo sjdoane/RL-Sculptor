@@ -208,8 +208,12 @@ export function ReportsTab({
         && stages.some((s) => s.name === selectedStage.stageName)) {
       return selectedStage.stageName;
     }
+    // current_stage_idx indexes mission.json's own stages[] — synthetic
+    // on_disk_only entries are UNION insertions, so filter them out before
+    // indexing or the pointer lands on a recovered superseded parent.
+    const runnable = stages.filter((s) => !s.on_disk_only);
     const current = missionDetail.data
-      ? stages[missionDetail.data.current_stage_idx]
+      ? runnable[missionDetail.data.current_stage_idx]
       : undefined;
     if (current) return current.name;
     return stages.length > 0 ? stages[stages.length - 1].name : null;

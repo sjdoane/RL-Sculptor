@@ -575,7 +575,12 @@ function StagePicker({
 function ReplayLayer({
   slug, run, iter, onPickIter,
 }: { slug: string; run: RunSummary | null; iter: number | null; onPickIter: (n: number) => void }) {
-  const liveState = useLiveClips(slug, run?.run_id);
+  // Disk-reconstructed rows (run_id "disk:<mission>/<stage>", synthesized
+  // after a backend restart) have no JobManager entry: run-scoped clip/WS
+  // routes can't resolve them. Their rollouts live at the mission-stage
+  // disk-truth endpoint instead.
+  const isDiskRow = !!run && run.run_id.startsWith("disk:");
+  const liveState = useLiveClips(slug, isDiskRow ? undefined : run?.run_id);
   const availableIters = useMemo(() => {
     const set = new Set<number>();
     liveState.clips.forEach((c) => set.add(c.iter));
@@ -589,13 +594,16 @@ function ReplayLayer({
 
   const src = useMemo(() => {
     if (!run || iter === null) return null;
+    if (isDiskRow && run.mission_slug && run.stage_name) {
+      return stageRolloutUrl(slug, run.mission_slug, run.stage_name, iter);
+    }
     return iterRolloutUrl(slug, run.run_id, iter);
-  }, [slug, run, iter]);
+  }, [slug, run, iter, isDiskRow]);
 
   const clipSrc = useMemo(() => {
-    if (!run || iter === null) return null;
+    if (!run || iter === null || isDiskRow) return null;
     return clipUrl(slug, run.run_id, iter);
-  }, [slug, run, iter]);
+  }, [slug, run, iter, isDiskRow]);
 
   if (!run) return <EmptyOverlay title="No runs yet" />;
 
@@ -605,7 +613,7 @@ function ReplayLayer({
       {src && (
         <a
           href={src}
-          download={`${run.run_id}_iter_${iter}.mp4`}
+          download={`${isDiskRow ? (run.stage_name ?? "stage") : run.run_id}_iter_${iter}.mp4`}
           className="rs-overlay"
           style={{ left: "auto", right: 12, textDecoration: "none", cursor: "pointer" }}
           onClick={(e) => e.stopPropagation()}

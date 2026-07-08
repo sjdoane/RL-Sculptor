@@ -62,6 +62,11 @@ class StageSchema(BaseModel):
     # "last"). None on legacy missions / stages that haven't finalized.
     selected_iter_index: Optional[int] = None
     selection_source: Optional[str] = None
+    # §Ship 20a: the iteration cap actually enforced for the stage's last
+    # (or current) run — `iterations_override or max_iterations`. The
+    # frontend has typed this field since Ship 20a but the mirror never
+    # carried it; disk-run synthesis and `rounds X/Y` displays need it.
+    effective_max_iterations: Optional[int] = None
     # §mission-persistence increment 2: mirrors sculptor.mission.Stage's
     # failure_reason/failure_detail (increment 1) — the short reason
     # code + free-form detail for a failed/superseded stage. Filled
