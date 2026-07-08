@@ -885,6 +885,15 @@ export async function calibrateProjectMetric(
   );
 }
 
+// ── Reports (project-runs vs per-mission) ─────────────────────────────
+import type { ReportsSources } from "./types";
+
+export async function getReportsSources(slug: string): Promise<ReportsSources> {
+  return handle<ReportsSources>(
+    await fetch(`/api/projects/${slug}/reports/sources`),
+  );
+}
+
 // ── Trash (recoverable deletes) ───────────────────────────────────────
 import type { TrashEntry } from "./types";
 

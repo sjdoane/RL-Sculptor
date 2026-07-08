@@ -1,3 +1,4 @@
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -7,11 +8,30 @@ import { ActuatorLimitsCard } from "@/components/ActuatorLimitsCard";
 import { Icon } from "@/components/rs/icon";
 import { Btn, EmptyState } from "@/components/rs/primitives";
 import { usePolicies } from "@/hooks/usePolicies";
-import { ApiError, policyExportUrl } from "@/lib/api";
+import { ApiError, getReportsSources, policyExportUrl } from "@/lib/api";
 import { qk } from "@/lib/queryKeys";
 
-async function fetchReportMd(slug: string): Promise<string> {
-  const r = await fetch(`/api/projects/${slug}/reports/final_report.md`);
+/** A report source: the project's standalone runs, or one mission. */
+type ReportSource =
+  | { kind: "project" }
+  | { kind: "mission"; missionSlug: string };
+
+const PROJECT_SOURCE_VALUE = "__project__";
+
+function sourceToValue(s: ReportSource): string {
+  return s.kind === "project" ? PROJECT_SOURCE_VALUE : s.missionSlug;
+}
+
+/** URL bases differ per source: project reports live under /reports,
+ *  a mission's under /missions/{ms}/report. */
+function reportBase(slug: string, source: ReportSource): string {
+  return source.kind === "project"
+    ? `/api/projects/${slug}/reports`
+    : `/api/projects/${slug}/missions/${source.missionSlug}/report`;
+}
+
+async function fetchReportMd(slug: string, source: ReportSource): Promise<string> {
+  const r = await fetch(`${reportBase(slug, source)}/final_report.md`);
   if (r.status === 404) return ""; // "not built yet" signal
   if (!r.ok) {
     let body: Record<string, unknown> = {};
@@ -53,8 +73,15 @@ async function fetchMissionQuality(slug: string): Promise<MissionQualityRecord[]
   return body.missions ?? [];
 }
 
-async function buildReport(slug: string): Promise<void> {
-  const r = await fetch(`/api/projects/${slug}/reports/build`, { method: "POST" });
+async function buildReport(slug: string, source: ReportSource): Promise<void> {
+  // The build endpoint is always /reports/build; a mission build passes
+  // {mission_slug} in the body (empty body = project-runs build).
+  const init: RequestInit = { method: "POST" };
+  if (source.kind === "mission") {
+    init.headers = { "content-type": "application/json" };
+    init.body = JSON.stringify({ mission_slug: source.missionSlug });
+  }
+  const r = await fetch(`/api/projects/${slug}/reports/build`, init);
   if (!r.ok) {
     let body: Record<string, unknown> = {};
     try {
@@ -73,13 +100,43 @@ async function buildReport(slug: string): Promise<void> {
 
 export function ReportsTab({ slug }: { slug: string }) {
   const qc = useQueryClient();
+
+  // §Ship 20: report source picker — the project's standalone runs, or
+  // any mission. Fed by GET /reports/sources.
+  const sources = useQuery({
+    queryKey: [...qk.project(slug), "report", "sources"],
+    queryFn: () => getReportsSources(slug),
+    staleTime: 10_000,
+  });
+  const [sourceValue, setSourceValue] = useState<string>(PROJECT_SOURCE_VALUE);
+  // Auto-select the single mission when project runs is empty and exactly
+  // one mission exists — kills the "empty Results tab" confusion when all
+  // the work lives under a mission. Runs once, before the user picks.
+  const autoSelected = useRef(false);
+  useEffect(() => {
+    if (autoSelected.current || !sources.data) return;
+    const { project_runs, missions } = sources.data;
+    if (project_runs.n_iters === 0 && missions.length === 1) {
+      setSourceValue(missions[0].mission_slug);
+    }
+    autoSelected.current = true;
+  }, [sources.data]);
+
+  const source: ReportSource = useMemo(
+    () =>
+      sourceValue === PROJECT_SOURCE_VALUE
+        ? { kind: "project" }
+        : { kind: "mission", missionSlug: sourceValue },
+    [sourceValue],
+  );
+
   const md = useQuery<string>({
-    queryKey: [...qk.project(slug), "report", "md"],
-    queryFn: () => fetchReportMd(slug),
+    queryKey: [...qk.project(slug), "report", "md", sourceToValue(source)],
+    queryFn: () => fetchReportMd(slug, source),
     staleTime: 10_000,
   });
   const build = useMutation<void, Error, void>({
-    mutationFn: () => buildReport(slug),
+    mutationFn: () => buildReport(slug, source),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: [...qk.project(slug), "report"] });
       toast.success("Report built", { description: "final_report.md + final.mp4 regenerated" });
@@ -97,8 +154,10 @@ export function ReportsTab({ slug }: { slug: string }) {
   });
 
   const hasReport = (md.data ?? "").trim().length > 0;
-  const mp4Url = `/api/projects/${slug}/reports/final.mp4`;
-  const mdUrl = `/api/projects/${slug}/reports/final_report.md`;
+  const base = reportBase(slug, source);
+  const mp4Url = `${base}/final.mp4`;
+  const mdUrl = `${base}/final_report.md`;
+  const missionList = sources.data?.missions ?? [];
 
   return (
     <div className="rs-scroll">
@@ -109,6 +168,26 @@ export function ReportsTab({ slug }: { slug: string }) {
             <h2 className="rs-h2" style={{ marginTop: 6 }}>Results</h2>
           </div>
           <div className="rs-flex rs-gap-8">
+            {missionList.length > 0 && (
+              <div className="rs-select" style={{ display: "flex", alignItems: "center" }}>
+                <select
+                  value={sourceValue}
+                  onChange={(e) => setSourceValue(e.target.value)}
+                  aria-label="Report source"
+                  title="Choose which run or mission to report on"
+                >
+                  <option value={PROJECT_SOURCE_VALUE}>
+                    Project runs ({sources.data?.project_runs.n_iters ?? 0} iters)
+                  </option>
+                  {missionList.map((m) => (
+                    <option key={m.mission_slug} value={m.mission_slug}>
+                      Mission: {m.mission_slug}
+                      {m.has_report ? " ✓" : ""}
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
             {hasReport && (
               <Btn
                 kind="ghost"
@@ -209,7 +288,11 @@ export function ReportsTab({ slug }: { slug: string }) {
             <EmptyState
               icon="file-text"
               title="No report built yet"
-              sub="Complete a sculpt run, then click Build report to render final_report.md + the timelapse."
+              sub={
+                source.kind === "mission"
+                  ? `Build the report for mission ${source.missionSlug} to render its per-stage report + stitched timelapse.`
+                  : "Complete a sculpt run, then click Build report to render final_report.md + the timelapse."
+              }
             />
           </div>
         ) : (

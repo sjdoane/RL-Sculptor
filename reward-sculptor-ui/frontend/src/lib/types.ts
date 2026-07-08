@@ -1018,6 +1018,22 @@ export interface MissionEvent {
   [key: string]: unknown;
 }
 
+// ── Reports (project-runs vs per-mission) ────────────────────────────
+// GET /projects/{slug}/reports/sources → what can be built/viewed as a
+// report. `project_runs` is the standalone-run report; each mission is
+// its own buildable/viewable source.
+export interface ReportMissionSource {
+  mission_slug: string;
+  goal: string;
+  lifecycle: MissionLifecycleStatus;
+  has_report: boolean;
+}
+
+export interface ReportsSources {
+  project_runs: { n_iters: number; has_report: boolean };
+  missions: ReportMissionSource[];
+}
+
 // ── Trash (recoverable deletes) ──────────────────────────────────────
 // GET /trash → list of soft-deleted entries. A delete moves the entry
 // into a trash dir; restore moves it back, purge removes it for good.
