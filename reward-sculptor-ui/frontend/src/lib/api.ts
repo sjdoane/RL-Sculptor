@@ -928,6 +928,53 @@ export async function getReportsSources(slug: string): Promise<ReportsSources> {
   );
 }
 
+// ── Saved missions (durable disk archive) ─────────────────────────────
+import type { SavedEntryDetail, SavedEntrySummary } from "./types";
+
+export async function listSaved(): Promise<SavedEntrySummary[]> {
+  return handle<SavedEntrySummary[]>(await fetch("/api/saved"));
+}
+
+export async function getSaved(entryId: string): Promise<SavedEntryDetail> {
+  return handle<SavedEntryDetail>(
+    await fetch(`/api/saved/${encodeURIComponent(entryId)}`),
+  );
+}
+
+/** URL for an archived file (mp4 / md) under a saved entry. `relpath`
+ *  is a "/"-joined path from the manifest (e.g. a stage video); each
+ *  segment is encoded but the slashes are preserved. */
+export function savedFileUrl(entryId: string, relpath: string): string {
+  const encoded = relpath.split("/").map(encodeURIComponent).join("/");
+  return `/api/saved/${encodeURIComponent(entryId)}/file/${encoded}`;
+}
+
+/** DELETE /saved/{id} — moves the entry to Trash (kind="saved"),
+ *  recoverable from Settings → Trash. Returns 204. */
+export async function deleteSaved(entryId: string): Promise<void> {
+  await handle<void>(
+    await fetch(`/api/saved/${encodeURIComponent(entryId)}`, {
+      method: "DELETE",
+    }),
+  );
+}
+
+/** POST /projects/{slug}/missions/{ms}/save — schedule a mission_save
+ *  job (202 JobDetail). `pinned` maps stage name → iters to force-keep. */
+export async function saveMission(
+  slug: string, missionSlug: string,
+  body?: { pinned?: Record<string, number[]> },
+): Promise<JobDetail> {
+  const init: RequestInit = { method: "POST" };
+  if (body && body.pinned && Object.keys(body.pinned).length > 0) {
+    init.headers = { "content-type": "application/json" };
+    init.body = JSON.stringify({ pinned: body.pinned });
+  }
+  return handle<JobDetail>(
+    await fetch(`/api/projects/${slug}/missions/${missionSlug}/save`, init),
+  );
+}
+
 // ── Trash (recoverable deletes) ───────────────────────────────────────
 import type { TrashEntry } from "./types";
 

@@ -14,6 +14,8 @@ interface NavItem {
 const NAV_ITEMS: readonly NavItem[] = [
   { to: "/", label: "Dashboard", icon: "layout-grid" },
   { to: "/projects", label: "Projects", icon: "folder" },
+  // Durable mission archive — survives restarts + project deletes.
+  { to: "/saved", label: "Saved Missions", icon: "package" },
   // The library is the entry point for creating projects — every "New
   // project" button lands here, so it must be a first-class destination.
   { to: "/library", label: "Robot Library", icon: "library" },

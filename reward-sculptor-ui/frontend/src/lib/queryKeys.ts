@@ -56,4 +56,8 @@ export const qk = {
 
   // Recoverable-delete bin (Settings → Trash).
   trash: () => ["trash"] as const,
+
+  // Saved-missions library (durable disk archive).
+  saved: () => ["saved"] as const,
+  savedEntry: (entryId: string) => ["saved", entryId] as const,
 };

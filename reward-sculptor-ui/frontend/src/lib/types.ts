@@ -1067,6 +1067,62 @@ export interface MissionEvent {
   [key: string]: unknown;
 }
 
+// ── Saved missions (durable disk archive) ────────────────────────────
+// GET /saved → slim manifests; GET /saved/{id} → full manifest +
+// mission.json. Files (mp4 / md) are served from /saved/{id}/file/{relpath}.
+export interface SavedKeptCheckpoint {
+  iter: number;
+  bytes: number;
+  reason: string; // "best" | "final" | ...
+}
+
+/** Slim per-stage row in the /saved LIST projection. */
+export interface SavedStageSlim {
+  name: string;
+  status: string;
+  best_metric: number | null;
+  n_kept_checkpoints: number;
+}
+
+export interface SavedEntrySummary {
+  entry_id: string;
+  project_slug: string;
+  mission_slug: string;
+  goal: string;
+  created_at: string; // ISO-8601
+  stages: SavedStageSlim[];
+  total_bytes: number;
+  /** Relpath under the entry, served via /saved/{id}/file/{relpath}.
+   *  Often null. */
+  thumbnail_video: string | null;
+}
+
+/** Fuller per-stage section in the /saved/{id} DETAIL manifest. */
+export interface SavedStageDetail {
+  name: string;
+  status: string;
+  best_metric: number | null;
+  n_iters?: number;
+  /** Relpaths (served via the file endpoint), newest-last. */
+  videos: string[];
+  kept_checkpoints: SavedKeptCheckpoint[];
+}
+
+export interface SavedEntryDetail {
+  entry_id: string;
+  project_slug: string;
+  mission_slug: string;
+  goal: string;
+  created_at: string;
+  schema: number;
+  total_bytes: number;
+  dropped_bytes?: number;
+  source_mission_dir?: string;
+  stages: SavedStageDetail[];
+  // The archived mission.json (open shape; stages carry selection info).
+  mission_json?: Record<string, unknown>;
+}
+
 // ── Reports (project-runs vs per-mission) ────────────────────────────
 // GET /projects/{slug}/reports/sources → what can be built/viewed as a
 // report. `project_runs` is the standalone-run report; each mission is
