@@ -4,6 +4,8 @@ import {
   createMission,
   deleteMission,
   getMission,
+  getStageEnvSpec,
+  getStageIterations,
   listMissions,
   runMission,
   type RunMissionRequestBody,
@@ -17,6 +19,8 @@ import type {
   MissionJobKind,
   MissionLifecycleStatus,
   MissionSummary,
+  StageEnvSpec,
+  StageIteration,
 } from "@/lib/types";
 
 const MISSION_LIST_POLL_MS = 5000;
@@ -52,6 +56,53 @@ export function useMission(
         : ["mission", "_none"],
     queryFn: () => getMission(slug!, missionSlug!),
     enabled,
+  });
+}
+
+/** §Ship 20 (de-siloing): disk-truth iterations for ANY stage — not
+ *  just the live/current one. Optionally polls while the stage is
+ *  actively training so new iters surface. */
+export function useStageIterations(
+  slug: string | undefined,
+  missionSlug: string | undefined,
+  stageName: string | undefined,
+  opts?: { enabled?: boolean; refetchIntervalMs?: number | null },
+) {
+  const enabled =
+    !!slug && !!missionSlug && !!stageName && (opts?.enabled ?? true);
+  return useQuery<StageIteration[]>({
+    queryKey:
+      slug && missionSlug && stageName
+        ? qk.stageIters(slug, missionSlug, stageName)
+        : ["stageIters", "_none"],
+    queryFn: () => getStageIterations(slug!, missionSlug!, stageName!),
+    enabled,
+    refetchInterval:
+      typeof opts?.refetchIntervalMs === "number" && opts.refetchIntervalMs > 0
+        ? opts.refetchIntervalMs
+        : false,
+  });
+}
+
+/** §Ship 20 (de-siloing): the stage's applied env curriculum. Used to
+ *  detect reference-RSI (`current.meta.source` startsWith "reference:"). */
+export function useStageEnvSpec(
+  slug: string | undefined,
+  missionSlug: string | undefined,
+  stageName: string | undefined,
+  opts?: { enabled?: boolean },
+) {
+  const enabled =
+    !!slug && !!missionSlug && !!stageName && (opts?.enabled ?? true);
+  return useQuery<StageEnvSpec>({
+    queryKey:
+      slug && missionSlug && stageName
+        ? qk.stageEnvSpec(slug, missionSlug, stageName)
+        : ["stageEnvSpec", "_none"],
+    queryFn: () => getStageEnvSpec(slug!, missionSlug!, stageName!),
+    enabled,
+    staleTime: 30_000,
+    retry: false,
   });
 }
 

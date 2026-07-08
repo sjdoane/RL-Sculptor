@@ -927,6 +927,55 @@ export interface StageSchema {
   // display so it stays correct after the WS event window slides;
   // fall back to max_iterations only when null.
   effective_max_iterations: number | null;
+  // §Ship 20 (de-siloing): the iteration the stage actually KEPT as its
+  // policy, and why it was chosen. Both null until selection runs (a
+  // stage can be `succeeded` with these still null on older missions).
+  selected_iter_index?: number | null;
+  selection_source?:
+    | "criterion+fitness"
+    | "criterion_newest"
+    | "fitness_fallback"
+    | "last"
+    | string
+    | null;
+}
+
+// ── Stage iterations (disk-truth, de-siloed) ─────────────────────────
+// GET /projects/{slug}/missions/{ms}/stages/{stage}/iterations → every
+// iteration that landed on disk for that stage, independent of which
+// stage the live UI is scoped to. Metrics are null until they land.
+export interface StageIteration {
+  iter_index: number;
+  primary_metric: number | null;
+  fitness: number | null;
+  has_rollout: boolean;
+  has_checkpoint: boolean;
+  reward_version: string | null;
+}
+
+// GET .../stages/{stage}/env-spec → the stage's applied env curriculum.
+// `current.meta.source` starting with "reference:" means RSI (reference-
+// state-init) was applied for this stage.
+export interface StageEnvSpecMeta {
+  behavior_goal?: string | null;
+  reasoning?: string | null;
+  source?: string | null;
+  version?: string | null;
+  [key: string]: unknown;
+}
+
+export interface StageEnvSpecCurrent {
+  env_spec_version?: number;
+  meta?: StageEnvSpecMeta;
+  shared?: Record<string, unknown>;
+  train?: Record<string, unknown>;
+  [key: string]: unknown;
+}
+
+export interface StageEnvSpec {
+  active?: boolean;
+  current?: StageEnvSpecCurrent | null;
+  versions?: string[];
 }
 
 export interface MissionSummary {

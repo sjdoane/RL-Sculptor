@@ -45,6 +45,11 @@ export const qk = {
   missions: (slug: string) => ["missions", slug] as const,
   mission: (slug: string, missionSlug: string) =>
     ["mission", slug, missionSlug] as const,
+  // §Ship 20 (de-siloing): disk-truth stage iterations + env spec.
+  stageIters: (slug: string, missionSlug: string, stageName: string) =>
+    ["stageIters", slug, missionSlug, stageName] as const,
+  stageEnvSpec: (slug: string, missionSlug: string, stageName: string) =>
+    ["stageEnvSpec", slug, missionSlug, stageName] as const,
 
   dashboard: () => ["dashboard"] as const,
   systemInfo: () => ["systemInfo"] as const,

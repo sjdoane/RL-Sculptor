@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
-import { useQueryClient } from "@tanstack/react-query";
+import { useQueries, useQueryClient } from "@tanstack/react-query";
+import { useSearchParams } from "react-router-dom";
 import { toast } from "sonner";
 
 import { Icon } from "@/components/rs/icon";
@@ -16,9 +17,11 @@ import {
   useRewards,
   useSaveReward,
 } from "@/hooks/useRewards";
-import { ApiError } from "@/lib/api";
+import { ApiError, getMission } from "@/lib/api";
 import { qk } from "@/lib/queryKeys";
 import type {
+  MissionDetail,
+  MissionSummary,
   ProjectDetail,
   RewardVersionDetail,
   RewardVersionSummary,
@@ -99,7 +102,32 @@ export function RewardsTab({ slug, project }: { slug: string; project: ProjectDe
   }, [liveStageScope, stickyStageScope]);
   const stageScope = liveStageScope ?? stickyStageScope;
 
+  // §Ship 20 (de-siloing): a `?stage=<ms>/<stage>` URL param deep-links
+  // this tab scoped to a specific stage (from the mission detail dialog).
+  // It seeds the manual override once, then normal selection takes over.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const stageParam = searchParams.get("stage");
+
   const [scopeOverride, setScopeOverride] = useState<string | null>(null);
+  const seededFromParam = useState({ done: false })[0];
+  useEffect(() => {
+    if (seededFromParam.done) return;
+    if (stageParam) {
+      setScopeOverride(stageParam);
+      // Consume the param so a later manual switch isn't overridden and a
+      // refresh doesn't re-pin. Keep other params (e.g. tab) intact.
+      setSearchParams(
+        (prev) => {
+          const next = new URLSearchParams(prev);
+          next.delete("stage");
+          return next;
+        },
+        { replace: true },
+      );
+    }
+    seededFromParam.done = true;
+  }, [stageParam, seededFromParam, setSearchParams]);
+
   const effectiveScope: string | null = useMemo(() => {
     if (scopeOverride === "project") return null;
     if (scopeOverride && scopeOverride !== "project") return scopeOverride;
@@ -158,15 +186,15 @@ export function RewardsTab({ slug, project }: { slug: string; project: ProjectDe
           latestVersion={latestVersion}
         />
 
-        {(stageScope || scopeOverride) && (
-          <RewardsScopeSelector
-            activeStageRun={activeStageRun}
-            stageScope={stageScope}
-            scopeOverride={scopeOverride}
-            effectiveScope={effectiveScope}
-            onChange={setScopeOverride}
-          />
-        )}
+        <RewardsScopeSelector
+          slug={slug}
+          missions={missions.data ?? []}
+          activeStageRun={activeStageRun}
+          stageScope={stageScope}
+          scopeOverride={scopeOverride}
+          effectiveScope={effectiveScope}
+          onChange={setScopeOverride}
+        />
 
         <div className="rs-twocol">
           {/* Versions */}
@@ -244,49 +272,99 @@ export function RewardsTab({ slug, project }: { slug: string; project: ProjectDe
   );
 }
 
-// ── Scope selector (rs-seg) ──────────────────────────────────────────
+// ── Scope selector (dropdown: Project + every stage of every mission) ─
+// §Ship 20 (de-siloing): the old two-button Project/stage switch only
+// reached the LIVE stage. This dropdown enumerates every stage of every
+// mission (from each mission's detail) so any completed stage's reward
+// versions are reachable, while "Auto-follow live stage" stays the
+// default when a run is active.
+const AUTO_VALUE = "__auto__";
+const PROJECT_VALUE = "project";
+
 function RewardsScopeSelector({
-  activeStageRun, stageScope, scopeOverride, effectiveScope, onChange,
+  slug, missions, activeStageRun, stageScope, scopeOverride, effectiveScope, onChange,
 }: {
+  slug: string;
+  missions: MissionSummary[];
   activeStageRun: RunSummary | null;
   stageScope: string | null;
   scopeOverride: string | null;
   effectiveScope: string | null;
   onChange: (next: string | null) => void;
 }) {
+  // Fetch each mission's detail to enumerate its stages. Cheap + cached
+  // under the same keys the mission dialog uses.
+  const details = useQueries({
+    queries: missions.map((m) => ({
+      queryKey: qk.mission(slug, m.mission_slug),
+      queryFn: () => getMission(slug, m.mission_slug),
+      staleTime: 30_000,
+    })),
+  });
+  const missionStages = useMemo(() => {
+    return missions.map((m, i) => {
+      const d = details[i]?.data as MissionDetail | undefined;
+      return { mission: m, stages: d?.stages ?? [] };
+    });
+  }, [missions, details]);
+
+  const hasAnyStage = missionStages.some((ms) => ms.stages.length > 0);
+  // Nothing to scope to (no missions/stages, no live stage) → hide.
+  if (!hasAnyStage && !stageScope && !scopeOverride) return null;
+
+  // The <select> value: explicit override, else "auto" (follow live).
+  const value = scopeOverride ?? AUTO_VALUE;
   const isStage = effectiveScope !== null;
-  const stageLabel = activeStageRun
-    ? `Stage: ${activeStageRun.stage_name ?? "unknown"}`
-    : stageScope ? `Stage: ${stageScope.split("/")[1] ?? stageScope}` : "Stage";
+
   return (
     <div className="rs-flex-between rs-wrap rs-gap-12">
-      <div className="rs-seg" role="tablist">
-        <button role="tab" aria-selected={!isStage} className={!isStage ? "on" : ""} onClick={() => onChange("project")}>
-          <Icon name="folder" size={14} />Project
-        </button>
-        <button
-          role="tab"
-          aria-selected={isStage}
-          className={isStage ? "on" : ""}
-          disabled={!stageScope && !scopeOverride}
-          style={!stageScope && !scopeOverride ? { opacity: 0.4, cursor: "not-allowed" } : undefined}
-          onClick={() => onChange(stageScope ?? scopeOverride)}
-        >
-          <Icon name="layers" size={14} />{stageLabel}
-        </button>
+      <div className="rs-flex rs-gap-8" style={{ alignItems: "center", minWidth: 0 }}>
+        <span className="rs-eyebrow" style={{ whiteSpace: "nowrap" }}>Reward scope</span>
+        <div className="rs-select" style={{ display: "flex", alignItems: "center" }}>
+          <select
+            aria-label="Reward scope"
+            value={value}
+            onChange={(e) => {
+              const v = e.target.value;
+              onChange(v === AUTO_VALUE ? null : v);
+            }}
+          >
+            {/* Auto-follow only makes sense while a stage is live. */}
+            {stageScope && (
+              <option value={AUTO_VALUE}>
+                Auto-follow live stage{activeStageRun?.stage_name ? ` (${activeStageRun.stage_name})` : ""}
+              </option>
+            )}
+            <option value={PROJECT_VALUE}>Project (global rewards)</option>
+            {missionStages.map(({ mission, stages }) =>
+              stages.length > 0 ? (
+                <optgroup key={mission.mission_slug} label={mission.mission_slug}>
+                  {stages.map((s) => (
+                    <option
+                      key={`${mission.mission_slug}/${s.name}`}
+                      value={`${mission.mission_slug}/${s.name}`}
+                    >
+                      {s.name}
+                    </option>
+                  ))}
+                </optgroup>
+              ) : null,
+            )}
+          </select>
+        </div>
       </div>
       <div className="rs-flex rs-gap-12">
-        {scopeOverride && (
+        {scopeOverride && stageScope && (
           <button
             className="rs-sub"
             style={{ background: "none", border: 0, fontSize: 12, textDecoration: "underline", textUnderlineOffset: 2, color: "var(--rs-muted)" }}
             onClick={() => onChange(null)}
             title="Stop pinning; follow the active mission stage automatically"
           >
-            Unpin (auto-follow active stage)
+            Auto-follow live stage
           </button>
         )}
-        {isStage && activeStageRun && (
+        {isStage && activeStageRun && effectiveScope === stageScope && (
           <span className="rs-flex rs-gap-6 rs-sub" style={{ fontSize: 12.5 }}>
             <span className="rs-dot live" />live · polling every 3s
           </span>

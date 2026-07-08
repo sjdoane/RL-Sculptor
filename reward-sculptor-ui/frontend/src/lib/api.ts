@@ -831,6 +831,40 @@ export function missionEventsWsUrl(
   return `${scheme}://${window.location.host}/ws/projects/${slug}/missions/${missionSlug}/events`;
 }
 
+// ── Stage de-siloing (disk-truth iterations + env spec) ───────────────
+import type { StageEnvSpec, StageIteration } from "./types";
+
+/** GET .../stages/{stage}/iterations — every iteration on disk for a
+ *  stage, regardless of which stage the live UI is scoped to. */
+export async function getStageIterations(
+  slug: string, missionSlug: string, stageName: string,
+): Promise<StageIteration[]> {
+  return handle<StageIteration[]>(
+    await fetch(
+      `/api/projects/${slug}/missions/${missionSlug}/stages/${encodeURIComponent(stageName)}/iterations`,
+    ),
+  );
+}
+
+/** Rollout mp4 URL for a specific stage iteration. */
+export function stageRolloutUrl(
+  slug: string, missionSlug: string, stageName: string, iterIndex: number,
+): string {
+  return `/api/projects/${slug}/missions/${missionSlug}/stages/${encodeURIComponent(stageName)}/iterations/${iterIndex}/rollout`;
+}
+
+/** GET .../stages/{stage}/env-spec — the applied env curriculum for a
+ *  stage. `current.meta.source` starting "reference:" ⇒ RSI applied. */
+export async function getStageEnvSpec(
+  slug: string, missionSlug: string, stageName: string,
+): Promise<StageEnvSpec> {
+  return handle<StageEnvSpec>(
+    await fetch(
+      `/api/projects/${slug}/missions/${missionSlug}/stages/${encodeURIComponent(stageName)}/env-spec`,
+    ),
+  );
+}
+
 
 // ── Dashboard + System ───────────────────────────────────────────────
 import type { DashboardSummary, SystemInfo } from "./types";

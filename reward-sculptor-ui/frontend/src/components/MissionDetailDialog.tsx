@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 
 import { Icon } from "@/components/rs/icon";
@@ -6,10 +7,12 @@ import { Badge, Banner, Btn, Modal } from "@/components/rs/primitives";
 import {
   useDeleteMission,
   useMission,
+  useStageEnvSpec,
+  useStageIterations,
 } from "@/hooks/useMissions";
 import { RunMissionDialog } from "@/components/RunMissionDialog";
 import { useMissionEvents } from "@/hooks/useMissionEvents";
-import { ApiError } from "@/lib/api";
+import { ApiError, stageRolloutUrl } from "@/lib/api";
 import { formatRelative } from "@/lib/utils";
 import type {
   MissionEvent,
@@ -37,11 +40,31 @@ export function MissionDetailDialog({
   const detail = useMission(slug, missionSlug ?? undefined, {
     enabled: open,
   });
+  const navigate = useNavigate();
   // §Ship-19d: clicking "Run mission" now opens RunMissionDialog (a
   // separate Dialog component) so the user can configure iterations
   // / Goal A / Goal B per launch. The actual mutation is owned by
   // RunMissionDialog. We still keep `del` here for the Delete button.
   const del = useDeleteMission(slug);
+
+  // §Ship 20 (de-siloing): which stage's disk-truth iterations to show.
+  // null = the collapsed stage list; selecting a stage expands its panel.
+  const [selectedStage, setSelectedStage] = useState<string | null>(null);
+  // Reset the selection whenever the dialog closes or the mission changes,
+  // so re-opening starts from the stage list.
+  useEffect(() => {
+    if (!open) setSelectedStage(null);
+  }, [open]);
+  useEffect(() => {
+    setSelectedStage(null);
+  }, [missionSlug]);
+
+  // Deep-link the Rewards tab scoped to a stage, then close this dialog.
+  const viewStageRewards = (stageName: string) => {
+    if (!missionSlug) return;
+    onOpenChange(false);
+    navigate(`/projects/${slug}?tab=rewards&stage=${encodeURIComponent(`${missionSlug}/${stageName}`)}`);
+  };
 
   const mission = detail.data;
   const liveSummary = mission ?? summary;
@@ -221,20 +244,37 @@ export function MissionDetailDialog({
         </section>
       )}
 
-      {mission && mission.stages.length > 0 && (
+      {mission && mission.stages.length > 0 && missionSlug && (
         <section>
           <PHead>Stages ({mission.current_stage_idx}/{mission.n_stages})</PHead>
           <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
-            {mission.stages.map((s, idx) => (
-              <StageCard
-                key={s.name}
-                stage={s}
-                depth={stageDepths.get(s.name) ?? 0}
-                isCurrent={idx === mission.current_stage_idx}
-                iters={stageIters.get(s.name) ?? []}
-                effectiveMaxIters={stageEffectiveMaxIters.get(s.name) ?? null}
-              />
-            ))}
+            {mission.stages.map((s, idx) => {
+              const isCurrent = idx === mission.current_stage_idx;
+              const selected = selectedStage === s.name;
+              return (
+                <div key={s.name}>
+                  <StageCard
+                    stage={s}
+                    depth={stageDepths.get(s.name) ?? 0}
+                    isCurrent={isCurrent}
+                    iters={stageIters.get(s.name) ?? []}
+                    effectiveMaxIters={stageEffectiveMaxIters.get(s.name) ?? null}
+                    selected={selected}
+                    onToggle={() => setSelectedStage(selected ? null : s.name)}
+                  />
+                  {selected && (
+                    <StagePanel
+                      slug={slug}
+                      missionSlug={missionSlug}
+                      stage={s}
+                      depth={stageDepths.get(s.name) ?? 0}
+                      isActive={isCurrent && activeJobId != null}
+                      onViewRewards={() => viewStageRewards(s.name)}
+                    />
+                  )}
+                </div>
+              );
+            })}
           </div>
         </section>
       )}
@@ -432,6 +472,8 @@ function StageCard({
   isCurrent,
   iters,
   effectiveMaxIters,
+  selected,
+  onToggle,
 }: {
   stage: StageSchema;
   depth: number;
@@ -443,6 +485,9 @@ function StageCard({
    *  user is mid-launch). The persisted field is the source of truth
    *  once a run has started. */
   effectiveMaxIters: number | null;
+  /** §Ship 20 (de-siloing): whether this stage's disk panel is open. */
+  selected: boolean;
+  onToggle: () => void;
 }) {
   const orphan = stage.parent_stage !== null && depth === 0;
   // §Ship 20a fallback chain:
@@ -467,14 +512,25 @@ function StageCard({
     <div
       style={{
         marginLeft: depth * 16,
-        border: "1px solid " + (isCurrent ? "var(--rs-primary)" : "var(--hairline)"),
+        border: "1px solid " + (isCurrent || selected ? "var(--rs-primary)" : "var(--hairline)"),
         background: isCurrent ? "rgba(245,78,0,0.04)" : "var(--surface-strong)",
-        borderRadius: "var(--radius-md)",
+        borderRadius: selected ? "var(--radius-md) var(--radius-md) 0 0" : "var(--radius-md)",
         padding: "10px 12px",
         fontSize: 12,
       }}
     >
-      <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 8 }}>
+      <button
+        type="button"
+        onClick={onToggle}
+        aria-expanded={selected}
+        title={selected ? "Hide this stage's iterations" : "Show this stage's iterations, rollouts and RSI"}
+        style={{
+          display: "flex", flexWrap: "wrap", alignItems: "center", gap: 8, width: "100%",
+          background: "none", border: 0, padding: 0, margin: 0, cursor: "pointer",
+          textAlign: "left", font: "inherit", color: "inherit",
+        }}
+      >
+        <Icon name={selected ? "chevron-down" : "chevron-right"} size={14} color="var(--rs-muted)" />
         <StageStatusBadge status={stage.status} />
         <span className="mono" style={{ fontSize: 11.5, fontWeight: 600 }}>{stage.name}</span>
         {stage.parent_stage && (
@@ -486,7 +542,7 @@ function StageCard({
         {stage.redecomposition_attempts > 0 && (
           <span className="rs-badge slate" style={{ fontSize: 9.5 }}>replanned ×{stage.redecomposition_attempts}</span>
         )}
-      </div>
+      </button>
       <p style={{ margin: "6px 0 0", fontSize: 11.5, lineHeight: 1.5 }}>{stage.goal_text}</p>
       <p className="mono" style={{ margin: "6px 0 0", wordBreak: "break-all", borderRadius: "var(--radius-sm)", background: "var(--canvas-soft)", border: "1px solid var(--hairline)", padding: "5px 8px", fontSize: 10.5, color: "var(--rs-muted)" }}>
         {stage.success_criterion}
@@ -511,6 +567,193 @@ function StageCard({
         {stage.kg_seed_papers.length > 0 && <span>kg refs {stage.kg_seed_papers.length}</span>}
       </div>
       {iters.length > 0 && <IterRibbon iters={iters} />}
+    </div>
+  );
+}
+
+// ── Stage panel (de-siloed disk view) ────────────────────────────────
+// Labels for the KEPT iteration by how selection chose it.
+const SELECTION_LABEL: Record<string, string> = {
+  "criterion+fitness": "best passing iter",
+  criterion_newest: "newest passing iter",
+  fitness_fallback: "best fitness (criterion unmet)",
+  last: "last iter",
+};
+
+function selectionLabel(source: string | null | undefined): string {
+  if (!source) return "kept";
+  return `kept — ${SELECTION_LABEL[source] ?? source}`;
+}
+
+/** Expanded, disk-truth view of one stage: its iterations (independent
+ *  of live scope), a rollout player for the picked iter, an RSI chip
+ *  when reference-state-init was applied, and a deep-link to the stage's
+ *  reward versions. This is what de-silos completed stages. */
+function StagePanel({
+  slug, missionSlug, stage, depth, isActive, onViewRewards,
+}: {
+  slug: string;
+  missionSlug: string;
+  stage: StageSchema;
+  depth: number;
+  isActive: boolean;
+  onViewRewards: () => void;
+}) {
+  const iters = useStageIterations(slug, missionSlug, stage.name, {
+    refetchIntervalMs: isActive ? 4000 : null,
+  });
+  const envSpec = useStageEnvSpec(slug, missionSlug, stage.name);
+  const rows = iters.data ?? [];
+
+  // Which iteration's rollout to show. Prefer the kept iter, else the
+  // newest with a rollout, else the newest.
+  const [picked, setPicked] = useState<number | null>(null);
+  const defaultIter = useMemo(() => {
+    if (rows.length === 0) return null;
+    const kept =
+      stage.selected_iter_index != null
+        ? rows.find((r) => r.iter_index === stage.selected_iter_index)
+        : undefined;
+    if (kept?.has_rollout) return kept.iter_index;
+    const newestWithRollout = [...rows].reverse().find((r) => r.has_rollout);
+    if (newestWithRollout) return newestWithRollout.iter_index;
+    return rows[rows.length - 1].iter_index;
+  }, [rows, stage.selected_iter_index]);
+  const activeIter = picked ?? defaultIter;
+  const activeRow = rows.find((r) => r.iter_index === activeIter) ?? null;
+
+  const source = envSpec.data?.current?.meta?.source ?? null;
+  const rsiApplied = typeof source === "string" && source.startsWith("reference:");
+
+  return (
+    <div
+      style={{
+        marginLeft: depth * 16,
+        border: "1px solid var(--rs-primary)",
+        borderTop: "none",
+        borderRadius: "0 0 var(--radius-md) var(--radius-md)",
+        background: "var(--surface-card)",
+        padding: "10px 12px",
+        display: "flex",
+        flexDirection: "column",
+        gap: 10,
+      }}
+    >
+      <div className="rs-flex rs-wrap rs-gap-8" style={{ alignItems: "center" }}>
+        {rsiApplied && (
+          <span
+            className="rs-badge emerald"
+            style={{ fontSize: 9.5 }}
+            title={`Reference-state-init curriculum applied (${source})`}
+          >
+            <Icon name="sparkles" size={11} />RSI
+          </span>
+        )}
+        <Btn kind="ghost" size="xs" icon="file-code" onClick={onViewRewards}>
+          View rewards for this stage
+        </Btn>
+      </div>
+
+      {iters.isLoading && <p className="rs-sub" style={{ fontSize: 11, margin: 0 }}>Loading iterations…</p>}
+      {iters.error && (
+        <p style={{ fontSize: 11, margin: 0, color: "var(--st-rose)" }}>
+          {(iters.error as Error).message}
+        </p>
+      )}
+      {!iters.isLoading && !iters.error && rows.length === 0 && (
+        <p className="rs-sub" style={{ fontSize: 11, margin: 0 }}>
+          No iterations on disk yet for this stage.
+        </p>
+      )}
+
+      {rows.length > 0 && (
+        <>
+          {/* Rollout player for the picked iter. */}
+          {activeIter != null && activeRow?.has_rollout ? (
+            <div style={{ border: "1px solid var(--hairline)", borderRadius: "var(--radius-md)", overflow: "hidden" }}>
+              <div className="rs-log-bar" style={{ gap: 8 }}>
+                <Icon name="video" size={13} color="var(--rs-muted)" />
+                <span style={{ fontSize: 11.5, fontWeight: 600 }}>iter {activeIter} rollout</span>
+                <span className="rs-grow" />
+                <a
+                  href={stageRolloutUrl(slug, missionSlug, stage.name, activeIter)}
+                  download={`${stage.name}_iter_${activeIter}.mp4`}
+                  className="rs-btn rs-btn-quiet rs-btn-xs"
+                >
+                  <Icon name="download" size={13} />MP4
+                </a>
+              </div>
+              <video
+                key={activeIter}
+                src={stageRolloutUrl(slug, missionSlug, stage.name, activeIter)}
+                style={{ width: "100%", aspectRatio: "16/9", background: "#16150f", display: "block" }}
+                controls
+                playsInline
+                preload="metadata"
+              >
+                <track kind="captions" />
+              </video>
+            </div>
+          ) : activeIter != null ? (
+            <p className="rs-sub" style={{ fontSize: 11, margin: 0 }}>
+              iter {activeIter} has no rollout video.
+            </p>
+          ) : null}
+
+          {/* Iteration chips — click to switch the rollout; the kept one
+              carries a labelled badge. */}
+          <div role="list" aria-label="Stage iterations" className="rs-flex rs-wrap rs-gap-6">
+            {rows.map((r) => {
+              const isKept =
+                stage.selected_iter_index != null &&
+                r.iter_index === stage.selected_iter_index;
+              const isPicked = r.iter_index === activeIter;
+              return (
+                <button
+                  key={r.iter_index}
+                  role="listitem"
+                  type="button"
+                  onClick={() => setPicked(r.iter_index)}
+                  title={
+                    `iter ${r.iter_index}` +
+                    (r.reward_version ? ` · reward ${r.reward_version}` : "") +
+                    (r.has_rollout ? "" : " · no rollout") +
+                    (r.has_checkpoint ? " · checkpoint" : "")
+                  }
+                  className="mono"
+                  style={{
+                    display: "inline-flex", alignItems: "center", gap: 5,
+                    borderRadius: 5, padding: "3px 7px", fontSize: 10,
+                    cursor: "pointer",
+                    border: "1px solid " + (isPicked ? "var(--rs-primary)" : "var(--hairline)"),
+                    background: isPicked ? "rgba(245,78,0,0.08)" : "var(--canvas-soft)",
+                    color: "var(--ink)",
+                  }}
+                >
+                  <span style={{ fontWeight: 600 }}>iter {r.iter_index}</span>
+                  {r.fitness != null ? (
+                    <span style={{ color: "var(--rs-muted)" }} title="objective fitness (0-1)">fit {r.fitness.toFixed(2)}</span>
+                  ) : r.primary_metric != null ? (
+                    <span style={{ color: "var(--rs-muted)" }} title="primary metric">{r.primary_metric.toFixed(1)}</span>
+                  ) : (
+                    <span style={{ color: "var(--rs-muted)" }}>—</span>
+                  )}
+                  {r.has_rollout && <Icon name="video" size={10} color="var(--rs-muted)" />}
+                  {isKept && (
+                    <span
+                      className="rs-badge emerald"
+                      style={{ fontSize: 8.5, padding: "0 4px" }}
+                      title={selectionLabel(stage.selection_source)}
+                    >
+                      <Icon name="check" size={9} />{selectionLabel(stage.selection_source)}
+                    </span>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+        </>
+      )}
     </div>
   );
 }
@@ -590,9 +833,9 @@ function eventCat(type: string): "rose" | "amber" | "emerald" | "blue" | "slate"
   // §Ship 20: a rejected stage-metric is a soft fall-back to the mission
   // metric, not an error — amber like skipped/degraded.
   if (/skipped|degraded|rejected/.test(type)) return "amber";
-  // §Ship 20: reference-RSI applied + an accepted stage-metric are
-  // positive milestones — emerald like scaffolded/materialized.
-  if (/completed|succeeded|materialized|scaffolded|warm_start_resolved|rsi_applied|accepted/.test(type)) return "emerald";
+  // §Ship 20 (de-siloing): archive/save/final-selection are positive
+  // milestones — emerald alongside completed/accepted/rsi.
+  if (/completed|succeeded|materialized|scaffolded|warm_start_resolved|rsi_applied|accepted|archived|saved|final_selection/.test(type)) return "emerald";
   if (/started|redecompos|criterion|training/.test(type)) return "blue";
   return "slate";
 }
@@ -641,8 +884,38 @@ function StructuredEventRow({ event }: { event: MissionEvent }) {
   );
 }
 
+function fmtMB(bytes: unknown): string {
+  if (typeof bytes === "number" && Number.isFinite(bytes)) {
+    return `${(bytes / 1_048_576).toFixed(1)} MB`;
+  }
+  return "?";
+}
+
 function describeEvent(ev: MissionEvent): string {
   const type = ev.type;
+  // §Ship 20 (de-siloing): stage/mission persistence lifecycle.
+  if (type === "stage_final_selection") {
+    const iter = (ev as { iter?: number }).iter;
+    const src = (ev as { source?: string }).source;
+    const pass = (ev as { criterion_pass?: boolean }).criterion_pass;
+    const metric = (ev as { metric?: number | null }).metric;
+    return (
+      `Kept iter ${iter ?? "?"}` +
+      (src ? ` (${src})` : "") +
+      ` as the stage policy` +
+      (typeof pass === "boolean" ? ` — criterion ${pass ? "passed" : "unmet"}` : "") +
+      (metric != null ? `, metric ${fmtMetric(metric)}` : "")
+    );
+  }
+  if (type === "mission_stage_archived" || type === "mission_archived") {
+    return `Saved to archive (${fmtMB((ev as { total_bytes?: number }).total_bytes)})`;
+  }
+  if (type === "mission_archive_failed") {
+    return `Archive failed: ${(ev as { error?: string }).error ?? ""}`;
+  }
+  if (type === "mission_saved") {
+    return "Mission saved";
+  }
   if (type === "stage_criterion_evaluated") {
     const passed = (ev as { passed?: boolean }).passed;
     const metric = (ev as { metric?: number | null }).metric;
