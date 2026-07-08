@@ -2,7 +2,7 @@ import { useMemo, useRef, useState } from "react";
 import { toast } from "sonner";
 
 import { Icon } from "@/components/rs/icon";
-import { Badge, Btn, Delta, EmptyState, MetricChart, Sparkline } from "@/components/rs/primitives";
+import { Badge, Btn, Delta, EmptyState, MetricChart, Sparkline, STATUS_META } from "@/components/rs/primitives";
 import { LogViewer } from "@/components/LogViewer";
 import { NewRunDialog } from "@/components/NewRunDialog";
 import { NewMissionDialog } from "@/components/NewMissionDialog";
@@ -27,6 +27,49 @@ import type {
   SelectedStage,
   StageIteration,
 } from "@/lib/types";
+
+// ── benign-error display mapping ────────────────────────────────────────
+// Some RunSummary.error strings mark benign, designed-for outcomes rather
+// than real crashes — a stage that trained fine but missed its success
+// criterion (mission auto-replans it), or a stage run that was collateral
+// from the user cancelling the whole mission. Both should read as
+// something other than a red "Errored" badge. STATUS_META/Badge stay
+// generic (shared by many surfaces); this maps at the call site instead.
+const CRITERION_NOT_MET_ERROR = "criterion_not_met";
+const MISSION_TERMINATED_ERROR = "parent mission_execute terminated mid-stage";
+
+interface RunDisplayStatus {
+  label: string;
+  cls: "slate" | "blue" | "amber" | "emerald" | "rose";
+  icon: string;
+}
+
+/** Maps a run's raw status/error to a display descriptor for badges,
+ *  falling back to the shared STATUS_META lookup for everything else. */
+function runDisplayStatus(run: Pick<RunSummary, "status" | "error">): RunDisplayStatus {
+  if (run.error === CRITERION_NOT_MET_ERROR) {
+    return { label: "Criterion not met", cls: "amber", icon: "alert-circle" };
+  }
+  if (run.error === MISSION_TERMINATED_ERROR) {
+    return { label: "Stopped (mission cancelled)", cls: "slate", icon: "square" };
+  }
+  const m = STATUS_META[run.status] ?? STATUS_META.draft;
+  return { label: m.label, cls: m.cls, icon: m.icon };
+}
+
+/** Badge variant that honors the benign-error remap above; otherwise
+ *  identical to <Badge status={run.status} />. */
+function RunStatusBadge({
+  run, big, label,
+}: { run: Pick<RunSummary, "status" | "error">; big?: boolean; label?: string }) {
+  const d = runDisplayStatus(run);
+  return (
+    <span className={"rs-badge " + d.cls + (big ? " big" : "")}>
+      <Icon name={d.icon} size={12} />
+      {label !== undefined ? label : d.label}
+    </span>
+  );
+}
 
 // ── public entry ──────────────────────────────────────────────────────
 export default function RunsTab({
@@ -332,7 +375,7 @@ function RunRow({
   const itersDenom = r.iterations_requested || "?";
   return (
     <button className={"rs-runrow" + (selected ? " on" : "") + (stageContext ? " rs-stage" : "")} onClick={onSelect}>
-      <Badge status={r.status} label="" />
+      <RunStatusBadge run={r} label="" />
       <span style={{ minWidth: 0, flex: 1 }}>
         <span className="rid" style={{ display: "block", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
           {stageContext && typeof r.stage_index === "number" && <span style={{ color: "var(--rs-muted)" }}>{r.stage_index + 1}. </span>}
@@ -457,7 +500,7 @@ function StageDetailPane({
           <span className="mono" style={{ fontSize: 14, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}>
             {stageName}
           </span>
-          {summary && <Badge status={summary.status} />}
+          {summary && <RunStatusBadge run={summary} />}
           <span className="rs-grow" />
           <span className="rs-eyebrow" style={{ flexShrink: 0 }}>disk-truth · not the live job</span>
         </div>
@@ -724,7 +767,12 @@ function LiveRunDetailPane({ slug, runId, runs }: { slug: string; runId: string;
         )}
         {run.data?.error && (
           <div style={{ padding: "0 16px" }}>
-            <RunErrorCard slug={slug} error={run.data.error} classification={run.data.error_classification ?? null} />
+            <RunErrorCard
+              slug={slug}
+              error={run.data.error}
+              classification={run.data.error_classification ?? null}
+              iterationsCompleted={run.data.iterations_completed}
+            />
           </div>
         )}
         <LogViewer events={events.events} />
@@ -858,7 +906,7 @@ function RunHeader({ run, isActive, wsConnected, mode, onToggleMode, togglePendi
       <span className="mono" style={{ fontSize: 14, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}>
         {run ? run.run_id.replace(/^job_/, "") : "…"}
       </span>
-      {run && <Badge status={run.status} />}
+      {run && <RunStatusBadge run={run} />}
       {run && <span className="rs-sub" style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}>{run.behavior_goal}</span>}
       <span className="rs-grow" />
       <span className="rs-flex rs-gap-8 rs-eyebrow" style={{ flexShrink: 0 }}>
@@ -1051,9 +1099,43 @@ function IterationTimeline({ iters, selected, onSelect }: { iters: IterEventSumm
   );
 }
 
-function RunErrorCard({ slug, error, classification }: { slug: string; error: string; classification: ErrorClassification | null }) {
+function RunErrorCard({
+  slug, error, classification, iterationsCompleted,
+}: { slug: string; error: string; classification: ErrorClassification | null; iterationsCompleted?: number }) {
   const regen = useRegenerateRewardTemplate(slug);
   const isContractMismatch = classification?.kind === "reward_contract_mismatch" || classification?.action?.kind === "regenerate_reward_template";
+
+  // §Ship: these two error strings mark benign, designed-for outcomes, not
+  // crashes — render them as friendly non-alarming cards instead of the
+  // raw-string red error banner.
+  if (error === CRITERION_NOT_MET_ERROR) {
+    return (
+      <div className="rs-banner warn" style={{ flexDirection: "column", alignItems: "stretch", gap: 8 }}>
+        <div className="rs-flex rs-gap-8">
+          <Icon name="alert-circle" size={17} />
+          <span className="rs-grow"><b>Success criterion not met.</b></span>
+        </div>
+        <p style={{ margin: 0, fontSize: 12.5 }}>
+          Training completed {iterationsCompleted ?? "N"} iteration{iterationsCompleted === 1 ? "" : "s"} — the
+          stage's success criterion wasn't met, so the mission re-planned the stage.
+        </p>
+      </div>
+    );
+  }
+  if (error === MISSION_TERMINATED_ERROR) {
+    return (
+      <div className="rs-banner" style={{ flexDirection: "column", alignItems: "stretch", gap: 8, background: "var(--canvas-soft)" }}>
+        <div className="rs-flex rs-gap-8">
+          <Icon name="square" size={17} />
+          <span className="rs-grow"><b>Stopped — mission was cancelled.</b></span>
+        </div>
+        <p style={{ margin: 0, fontSize: 12.5, color: "var(--rs-muted)" }}>
+          This stage run was in progress when the mission was stopped; it did not fail on its own.
+        </p>
+      </div>
+    );
+  }
+
   const onRegenerate = () => {
     regen.mutate(undefined, {
       onSuccess: () => toast.success("Reward template regenerated", { description: "rewards/v0.py rewritten for this adapter." }),
