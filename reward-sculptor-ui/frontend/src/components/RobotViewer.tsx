@@ -107,10 +107,11 @@ export function RobotViewer({
   // final stage never blanks the viewer.
   useEffect(() => {
     if (selectedStage || !setSelectedStage) return;
+    if (missionActive) return;
     if (!missionDetail.data || missionDetail.data.active_job_id != null) return;
     const fallback = pickDefaultStage(missionDetail.data.stages);
     if (fallback) setSelectedStage({ missionSlug: missionDetail.data.mission_slug, stageName: fallback });
-  }, [selectedStage, setSelectedStage, missionDetail.data]);
+  }, [selectedStage, setSelectedStage, missionActive, missionDetail.data]);
 
   const showStagePicker = !!missionSlugForPicker && (missionDetail.data?.stages.length ?? 0) > 1;
 
