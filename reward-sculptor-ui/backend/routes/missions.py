@@ -14,6 +14,19 @@ Endpoints (all under `/projects/{slug}/missions`):
                                           → 200 + DeleteMissionResponse
                                           | 409 if active job
 
+  GET    /{mission_slug}/stages/{stage}/iterations
+                                        — disk-truth per-iter rows for
+                                          one stage (no job required)
+                                          → 200 + list[StageIterationSummary]
+  GET    /{mission_slug}/stages/{stage}/iterations/{i}/rollout
+                                        — disk-truth rollout.mp4 for one
+                                          stage iteration (no job required)
+                                          → 200 video/mp4 | 404
+  GET    /{mission_slug}/stages/{stage}/env-spec
+                                        — the stage's env-spec + version
+                                          list (no job required)
+                                          → 200 + StageEnvSpecInfo
+
   WS     /ws/projects/{slug}/missions/{mission_slug}/events
                                         — replay + tee the active
                                           decompose / execute job's events
@@ -22,12 +35,23 @@ Source-of-truth invariant (per Ship 18a plan-review):
   `mission.json` is canonical; GET handlers read it on every call via
   `mission_store.load_mission_*`. JobManager events overlay during in-
   flight jobs (active_job_id / active_job_kind on the response).
+
+§C2 stage de-siloing (this ship): the three `.../stages/{stage}/...`
+routes above read ONLY the filesystem — no JobManager lookup at all.
+`routes/runs.py`'s run/rollout endpoints require a live
+`mission_stage_run` Job (`_find_run`), so a completed stage becomes
+unreachable after a backend restart or once the mission has moved on
+to the next stage even though its `runs/iter_*/` artifacts are still
+on disk. These routes close that gap: any stage of any mission is
+viewable regardless of job liveness.
 """
 
 from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
+import re
 from pathlib import Path
 from typing import Any, Optional
 
@@ -39,7 +63,7 @@ from fastapi import (
     WebSocketDisconnect,
     status,
 )
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 
 from backend.models.kg import JobDetail, JobSummary
 from backend.models.mission import (
@@ -48,6 +72,8 @@ from backend.models.mission import (
     MissionDetail,
     MissionSummary,
     RunMissionRequest,
+    StageEnvSpecInfo,
+    StageIterationSummary,
 )
 from backend.models.project import ProblemDetail
 from backend.services import mission_store
@@ -57,6 +83,16 @@ from backend.services.mission_jobs import (
     run_mission_execute_job,
 )
 from backend.services.project_store import ProjectStore
+
+
+# §C2: same lowercase snake/kebab-case-ish segment guard routes/runs.py
+# applies to mission_slug / stage_name before they hit the filesystem.
+# Rejects "..", "/", "\\", uppercase, spaces — anything that isn't a
+# plain slug component. Mission slugs + stage names are both generated
+# from `_slugify` (models/mission.py's `mission_slug` pattern is
+# `^[a-z][a-z0-9_-]{0,63}$`), so this is not just defense-in-depth —
+# it's the actual production shape.
+_SAFE_PATH_SEGMENT = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 
 router = APIRouter(tags=["missions"])
@@ -436,6 +472,242 @@ def delete_mission(
     freed = mission_store.delete_mission(project_dir, mission_slug)
     return DeleteMissionResponse(
         mission_slug=mission_slug, freed_bytes=freed,
+    )
+
+
+# ── §C2 stage de-siloing: disk-truth stage-iteration endpoints ────────
+# Mission-stage iterations live at `<mission_dir>/stages/<stage>/runs/
+# iter_<N>/` regardless of whether a `mission_stage_run` JobManager
+# entry is still alive for them — the sculpt subprocess writes them to
+# disk exactly like a top-level run. Unlike `routes/runs.py`'s
+# `_find_run`-gated endpoints, everything below reads disk only, so a
+# completed stage stays viewable after a backend restart or once the
+# mission has moved on to a later stage.
+_ITER_DIR_RE = re.compile(r"^iter_(\d+)$")
+
+
+def _stage_dir_or_404(
+    store: ProjectStore, slug: str, mission_slug: str, stage: str,
+) -> "Path | JSONResponse":
+    """Resolve + validate `<mission_dir>/stages/<stage>/`, or a 404
+    JSONResponse explaining why. Shared by all three C2 routes so the
+    traversal guard + existence checks live in exactly one place."""
+    project_dir = _project_dir(store, slug)
+    if project_dir is None:
+        return _problem(
+            status.HTTP_404_NOT_FOUND,
+            "project not found",
+            detail=f"no project with slug {slug!r}",
+            type_="/problems/not-found",
+        )
+    if not _SAFE_PATH_SEGMENT.match(mission_slug) or not _SAFE_PATH_SEGMENT.match(stage):
+        return _problem(
+            status.HTTP_404_NOT_FOUND,
+            "invalid path segment",
+            detail=(
+                f"mission_slug={mission_slug!r} / stage={stage!r} must "
+                "each match a plain slug component"
+            ),
+            type_="/problems/not-found",
+        )
+    if mission_slug not in mission_store.list_mission_slugs(project_dir):
+        return _problem(
+            status.HTTP_404_NOT_FOUND,
+            "mission not found",
+            detail=f"no mission {mission_slug!r} under project {slug!r}",
+            type_="/problems/not-found",
+        )
+    stage_dir = mission_store.mission_dir(project_dir, mission_slug) / "stages" / stage
+    if not stage_dir.is_dir():
+        return _problem(
+            status.HTTP_404_NOT_FOUND,
+            "stage not found",
+            detail=(
+                f"no stage {stage!r} under mission {mission_slug!r} "
+                f"(project {slug!r})"
+            ),
+            type_="/problems/not-found",
+        )
+    return stage_dir
+
+
+# ── GET .../stages/{stage}/iterations ─────────────────────────────────
+@router.get(
+    "/projects/{slug}/missions/{mission_slug}/stages/{stage}/iterations",
+    response_model=list[StageIterationSummary],
+    responses={404: {"model": ProblemDetail}},
+)
+def list_stage_iterations(
+    slug: str,
+    mission_slug: str,
+    stage: str,
+    store: ProjectStore = Depends(get_store),
+) -> Any:
+    """Disk-truth iteration list for one stage — no JobManager entry
+    required. Mirrors `sculptor.export.list_exportable_iters` but does
+    NOT require a checkpoint (a rollout can exist without a saved
+    checkpoint and vice versa; the UI wants both rows)."""
+    resolved = _stage_dir_or_404(store, slug, mission_slug, stage)
+    if isinstance(resolved, JSONResponse):
+        return resolved
+    stage_dir = resolved
+
+    runs_root = stage_dir / "runs"
+    out: list[StageIterationSummary] = []
+    if not runs_root.is_dir():
+        return out
+
+    # metric_history.json (per-index list) is the stage's canonical
+    # primary-metric series when present; falls back to each iter's own
+    # metrics.json for older stages / gaps in the history file.
+    metric_history: Optional[list[Any]] = None
+    history_path = stage_dir / "reports" / "metric_history.json"
+    if history_path.is_file():
+        try:
+            loaded = json.loads(history_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, list):
+                metric_history = loaded
+        except (OSError, ValueError):
+            metric_history = None
+
+    for d in sorted(runs_root.iterdir()):
+        m = _ITER_DIR_RE.match(d.name)
+        if not m or not d.is_dir():
+            continue
+        iter_index = int(m.group(1))
+
+        primary_metric: Optional[float] = None
+        if metric_history is not None and 0 <= iter_index < len(metric_history):
+            v = metric_history[iter_index]
+            if isinstance(v, (int, float)):
+                primary_metric = float(v)
+        if primary_metric is None:
+            metrics = _load_json_dict(d / "metrics.json") or {}
+            mm = metrics.get("metrics")
+            if isinstance(mm, dict):
+                v = mm.get("mean_return")
+                if isinstance(v, (int, float)):
+                    primary_metric = float(v)
+
+        behavior = _load_json_dict(d / "rollout" / "behavior.json") or {}
+        fitness = behavior.get("fitness")
+
+        spec = _load_json_dict(d / "reward_spec.json") or {}
+        reward_version = spec.get("version")
+
+        rollout_path = d / "rollout" / "rollout.mp4"
+        checkpoint_path = _find_checkpoint(d)
+
+        out.append(StageIterationSummary(
+            iter_index=iter_index,
+            primary_metric=primary_metric,
+            fitness=fitness if isinstance(fitness, (int, float)) else None,
+            has_rollout=rollout_path.is_file() and rollout_path.stat().st_size > 0,
+            has_checkpoint=checkpoint_path is not None,
+            reward_version=reward_version if isinstance(reward_version, str) else None,
+        ))
+    out.sort(key=lambda r: r.iter_index)
+    return out
+
+
+def _load_json_dict(p: Path) -> Optional[dict]:
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _find_checkpoint(iter_dir: Path) -> Optional[Path]:
+    for name in ("checkpoint.pt", "checkpoint.zip"):
+        p = iter_dir / name
+        if p.is_file() and p.stat().st_size > 0:
+            return p
+    return None
+
+
+# ── GET .../stages/{stage}/iterations/{i}/rollout ─────────────────────
+@router.get(
+    "/projects/{slug}/missions/{mission_slug}/stages/{stage}/iterations/{i}/rollout",
+    response_class=FileResponse,
+    responses={
+        200: {"content": {"video/mp4": {}}},
+        404: {"model": ProblemDetail},
+    },
+)
+def get_stage_iter_rollout(
+    slug: str,
+    mission_slug: str,
+    stage: str,
+    i: int,
+    store: ProjectStore = Depends(get_store),
+) -> Any:
+    """Disk-truth rollout.mp4 for one stage iteration — no JobManager
+    entry required. Mirrors `routes/runs.py::get_iter_rollout`'s
+    >2048-byte guard (a truncated / still-rendering file must not be
+    served as if it were a finished clip)."""
+    resolved = _stage_dir_or_404(store, slug, mission_slug, stage)
+    if isinstance(resolved, JSONResponse):
+        return resolved
+    stage_dir = resolved
+
+    path = stage_dir / "runs" / f"iter_{i}" / "rollout" / "rollout.mp4"
+    if not path.is_file() or path.stat().st_size < 2048:
+        return _problem(
+            status.HTTP_404_NOT_FOUND,
+            "rollout not available",
+            detail=(
+                f"iter {i} of stage {stage!r} has no rollout.mp4 yet "
+                "(either still rendering or the iter errored before "
+                "rollout capture)"
+            ),
+            type_="/problems/not-found",
+        )
+    return FileResponse(path, media_type="video/mp4")
+
+
+# ── GET .../stages/{stage}/env-spec ────────────────────────────────────
+@router.get(
+    "/projects/{slug}/missions/{mission_slug}/stages/{stage}/env-spec",
+    response_model=StageEnvSpecInfo,
+    responses={404: {"model": ProblemDetail}},
+)
+def get_stage_env_spec(
+    slug: str,
+    mission_slug: str,
+    stage: str,
+    store: ProjectStore = Depends(get_store),
+) -> Any:
+    """The stage's environment-adaptation spec — mirrors
+    `routes/projects.py::get_project_env_spec` but scoped to
+    `<mission_dir>/stages/<stage>/env/`. A grounded stage (never ran
+    env-spec adaptation) has no `env/` dir; that's `{current: null,
+    versions: []}`, NOT a 404 — the stage itself is real, it just has
+    no spec to show.
+
+    `current.meta.source` starting `"reference:"` is the RSI
+    (reference-state-initialization) tell the UI surfaces as a chip.
+    """
+    resolved = _stage_dir_or_404(store, slug, mission_slug, stage)
+    if isinstance(resolved, JSONResponse):
+        return resolved
+    stage_dir = resolved
+
+    env_dir = stage_dir / "env"
+    current: Optional[dict] = None
+    cur_path = env_dir / "current.json"
+    if cur_path.is_file():
+        loaded = _load_json_dict(cur_path)
+        if loaded is not None:
+            current = loaded
+    versions: list[str] = []
+    if env_dir.is_dir():
+        for p in env_dir.glob("v*.json"):
+            if p.stem[1:].isdigit():
+                versions.append(p.stem)
+        versions.sort(key=lambda s: int(s[1:]))
+    return StageEnvSpecInfo(
+        active=current is not None, current=current, versions=versions,
     )
 
 

@@ -883,3 +883,312 @@ def test_load_mission_reconstructs_mission_dir_from_file_location(
     (dir_a / "mission.json").rename(dir_b / "mission.json")
     loaded = load_mission(dir_b)
     assert loaded.mission_dir == str(dir_b.resolve())
+
+
+# ── §C2 stage de-siloing: disk-truth stage-iteration endpoints ────────
+# Covers:
+#   - GET .../stages/{stage}/iterations — disk-truth iter rows, no job
+#     required (survives backend restart / stage-past-active).
+#   - GET .../stages/{stage}/iterations/{i}/rollout — FileResponse or
+#     404, same >2048-byte guard as routes/runs.py::get_iter_rollout.
+#   - GET .../stages/{stage}/env-spec — mirrors the project-level
+#     env-spec route, scoped to the stage's own env/ dir.
+#   - Path-traversal segments 404 rather than escaping the stage dir.
+def _seed_stage_dir(
+    project_dir: Path, mission_slug: str, stage: str,
+) -> Path:
+    """`<mission_dir>/stages/<stage>/` — bare dir (no runs/ yet). The
+    mission.json itself still needs `_seed_mission_on_disk`; this only
+    materializes the stage subtree the C2 routes read directly."""
+    stage_dir = (
+        project_dir / ".missions" / mission_slug / "stages" / stage
+    )
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    return stage_dir
+
+
+def _seed_stage_iter(
+    stage_dir: Path,
+    iter_index: int,
+    *,
+    with_rollout: bool = False,
+    with_checkpoint: bool = False,
+    primary_metric: float | None = None,
+    fitness: float | None = None,
+    reward_version: str | None = None,
+) -> Path:
+    """`<stage_dir>/runs/iter_<N>/` with the sidecar files the C2
+    iterations endpoint reads. `with_rollout=True` writes a >2048-byte
+    rollout.mp4 (the route's serve guard rejects smaller files, so the
+    fixture must clear it to exercise the 200 path)."""
+    iter_dir = stage_dir / "runs" / f"iter_{iter_index}"
+    iter_dir.mkdir(parents=True, exist_ok=True)
+    if with_rollout:
+        rollout_dir = iter_dir / "rollout"
+        rollout_dir.mkdir(parents=True, exist_ok=True)
+        (rollout_dir / "rollout.mp4").write_bytes(b"\x00" * 4096)
+        if fitness is not None:
+            (rollout_dir / "behavior.json").write_text(
+                json.dumps({"fitness": fitness})
+            )
+    if with_checkpoint:
+        (iter_dir / "checkpoint.pt").write_bytes(b"\x00" * 128)
+    if primary_metric is not None:
+        (iter_dir / "metrics.json").write_text(
+            json.dumps({"metrics": {"mean_return": primary_metric}})
+        )
+    if reward_version is not None:
+        (iter_dir / "reward_spec.json").write_text(
+            json.dumps({"version": reward_version})
+        )
+    return iter_dir
+
+
+def test_list_stage_iterations_reports_rollout_and_checkpoint_flags(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    stage_dir = _seed_stage_dir(project_dir, "alpha", "stage_0")
+
+    # iter_0: rollout + checkpoint + fitness + reward version.
+    _seed_stage_iter(
+        stage_dir, 0,
+        with_rollout=True, with_checkpoint=True,
+        primary_metric=0.42, fitness=0.9, reward_version="v2",
+    )
+    # iter_1: neither rollout nor checkpoint (still training / errored
+    # before capture) — the route must NOT require a checkpoint to list
+    # a row (unlike sculptor.export.list_exportable_iters).
+    _seed_stage_iter(stage_dir, 1)
+
+    r = client.get(
+        f"/projects/{slug}/missions/alpha/stages/stage_0/iterations",
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert len(body) == 2
+
+    row0 = next(row for row in body if row["iter_index"] == 0)
+    assert row0["has_rollout"] is True
+    assert row0["has_checkpoint"] is True
+    assert row0["primary_metric"] == 0.42
+    assert row0["fitness"] == 0.9
+    assert row0["reward_version"] == "v2"
+
+    row1 = next(row for row in body if row["iter_index"] == 1)
+    assert row1["has_rollout"] is False
+    assert row1["has_checkpoint"] is False
+    assert row1["primary_metric"] is None
+    assert row1["fitness"] is None
+    assert row1["reward_version"] is None
+
+
+def test_list_stage_iterations_uses_metric_history_by_index(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    """When `reports/metric_history.json` exists it is the canonical
+    per-index series — preferred over the iter's own metrics.json."""
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    stage_dir = _seed_stage_dir(project_dir, "alpha", "stage_0")
+
+    reports_dir = stage_dir / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    (reports_dir / "metric_history.json").write_text(json.dumps([0.1, 0.55]))
+
+    # iter_1's own metrics.json disagrees with the history — history wins.
+    _seed_stage_iter(stage_dir, 1, primary_metric=0.99)
+
+    r = client.get(
+        f"/projects/{slug}/missions/alpha/stages/stage_0/iterations",
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert len(body) == 1
+    assert body[0]["iter_index"] == 1
+    assert body[0]["primary_metric"] == 0.55
+
+
+def test_list_stage_iterations_404_unknown_mission_or_stage(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    slug = _make_project(client)
+    _seed_mission_on_disk(tmp_projects_root / slug, "alpha")
+
+    r = client.get(
+        f"/projects/{slug}/missions/no-such/stages/stage_0/iterations",
+    )
+    assert r.status_code == 404
+
+    r = client.get(
+        f"/projects/{slug}/missions/alpha/stages/no-such-stage/iterations",
+    )
+    assert r.status_code == 404
+
+
+def test_list_stage_iterations_empty_when_no_runs_dir(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    """A stage dir that exists but hasn't trained yet (no runs/ at
+    all) returns an empty list, not a 404 — the stage is real."""
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    _seed_stage_dir(project_dir, "alpha", "stage_0")
+
+    r = client.get(
+        f"/projects/{slug}/missions/alpha/stages/stage_0/iterations",
+    )
+    assert r.status_code == 200
+    assert r.json() == []
+
+
+def test_get_stage_iter_rollout_200_and_404(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    stage_dir = _seed_stage_dir(project_dir, "alpha", "stage_0")
+    _seed_stage_iter(stage_dir, 0, with_rollout=True)
+    _seed_stage_iter(stage_dir, 1)  # no rollout
+
+    r = client.get(
+        f"/projects/{slug}/missions/alpha/stages/stage_0/iterations/0/rollout",
+    )
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "video/mp4"
+    assert len(r.content) == 4096
+
+    r = client.get(
+        f"/projects/{slug}/missions/alpha/stages/stage_0/iterations/1/rollout",
+    )
+    assert r.status_code == 404
+
+
+def test_get_stage_iter_rollout_404_below_size_guard(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    """A truncated / still-being-written rollout.mp4 (<2048 bytes)
+    must 404 rather than serve a broken clip, mirroring
+    routes/runs.py::get_iter_rollout's guard."""
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    stage_dir = _seed_stage_dir(project_dir, "alpha", "stage_0")
+    rollout_dir = stage_dir / "runs" / "iter_0" / "rollout"
+    rollout_dir.mkdir(parents=True)
+    (rollout_dir / "rollout.mp4").write_bytes(b"\x00" * 100)
+
+    r = client.get(
+        f"/projects/{slug}/missions/alpha/stages/stage_0/iterations/0/rollout",
+    )
+    assert r.status_code == 404
+
+
+def test_stage_routes_404_on_traversal_segment(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    """A `..` (or any non-slug) component in `mission_slug` or `stage`
+    must 404, not escape the project dir. FastAPI's path routing
+    itself collapses a literal `..` segment before dispatch for some
+    of these, so we exercise both the router-level guard AND the
+    inner `_SAFE_PATH_SEGMENT` check via a would-be-valid-looking but
+    disallowed segment (uppercase / spaces), which the router does NOT
+    normalize away.
+    """
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    _seed_stage_dir(project_dir, "alpha", "stage_0")
+
+    for bad_mission, bad_stage in (
+        ("alpha", "Stage 0"),
+        ("alpha", "..%2Fescape"),
+        ("Alpha!!", "stage_0"),
+    ):
+        r = client.get(
+            f"/projects/{slug}/missions/{bad_mission}/stages/{bad_stage}/iterations",
+        )
+        assert r.status_code == 404, (bad_mission, bad_stage, r.text)
+
+    # A literal ".." path segment for `stage` — most HTTP clients /
+    # ASGI routers normalize this before it reaches our handler, so
+    # assert the net effect (never a 200, never data from outside the
+    # stage dir) rather than depending on FastAPI's exact behavior.
+    r = client.get(f"/projects/{slug}/missions/alpha/stages/../env-spec")
+    assert r.status_code != 200
+
+
+def test_get_stage_env_spec_no_env_dir_returns_null_not_404(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    """A grounded stage (never ran env-spec adaptation) has no env/
+    dir at all. That's `{current: null, versions: []}` — the stage
+    itself is real, so this must NOT 404."""
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    _seed_stage_dir(project_dir, "alpha", "stage_0")
+
+    r = client.get(
+        f"/projects/{slug}/missions/alpha/stages/stage_0/env-spec",
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["active"] is False
+    assert body["current"] is None
+    assert body["versions"] == []
+
+
+def test_get_stage_env_spec_surfaces_rsi_meta_source(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    """§RSI chip: `current.meta.source` starting `"reference:"` means
+    reference-state-initialization seeded the stage's train-side reset
+    ranges. The route must pass it through verbatim so the UI can
+    detect the prefix."""
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    stage_dir = _seed_stage_dir(project_dir, "alpha", "stage_0")
+
+    env_dir = stage_dir / "env"
+    env_dir.mkdir(parents=True)
+    spec = {
+        "env_spec_version": 1,
+        "meta": {"source": "reference:procedural:jump", "version": "v0"},
+        "shared": {},
+        "train": {},
+    }
+    (env_dir / "v0.json").write_text(json.dumps(spec))
+    (env_dir / "current.json").write_text(json.dumps(spec))
+
+    r = client.get(
+        f"/projects/{slug}/missions/alpha/stages/stage_0/env-spec",
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["active"] is True
+    assert body["current"]["meta"]["source"] == "reference:procedural:jump"
+    assert body["versions"] == ["v0"]
+
+
+def test_get_stage_env_spec_404_unknown_mission_or_stage(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    slug = _make_project(client)
+    _seed_mission_on_disk(tmp_projects_root / slug, "alpha")
+
+    r = client.get(
+        f"/projects/{slug}/missions/no-such/stages/stage_0/env-spec",
+    )
+    assert r.status_code == 404
+
+    r = client.get(
+        f"/projects/{slug}/missions/alpha/stages/no-such-stage/env-spec",
+    )
+    assert r.status_code == 404

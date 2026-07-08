@@ -291,3 +291,46 @@ class MissionEvent(BaseModel):
     stage_name: Optional[str] = None
     stage_index: Optional[int] = None
     ts: Optional[float] = None
+
+
+# ── §C2 stage de-siloing: disk-truth stage-iteration endpoints ────────
+# `mission_stage_run` artifacts (`<mission_dir>/stages/<stage>/runs/
+# iter_<N>/`) are unreachable via the in-memory job endpoints once the
+# backend restarts or training moves past that stage — `routes/runs.py`'s
+# `_find_run` requires a live JobManager entry. These models back
+# DISK-TRUTH endpoints in `routes/missions.py` that need no job at all,
+# so any stage of any mission stays viewable.
+class StageIterationSummary(BaseModel):
+    """One row of `GET .../stages/{stage}/iterations` — mirrors
+    `sculptor.export.list_exportable_iters` but does NOT require a
+    checkpoint (a stage iter can have a rollout with no saved
+    checkpoint, or vice versa; the UI wants to see both)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    iter_index: int
+    primary_metric: Optional[float] = None
+    fitness: Optional[float] = None
+    has_rollout: bool
+    has_checkpoint: bool
+    reward_version: Optional[str] = None
+
+
+class StageEnvSpecInfo(BaseModel):
+    """`GET .../stages/{stage}/env-spec` — mirrors `EnvSpecInfo`
+    (routes/projects.py's project-level env-spec surface) but scoped to
+    one stage's `<mission_dir>/stages/<stage>/env/` dir. A grounded
+    stage (no env-spec adaptation) has no `env/` dir at all, which is
+    NOT a 404 here — `current=None, versions=[]` is the honest answer.
+
+    `current.meta.source` is the RSI (reference-state-initialization)
+    tell: a value starting `"reference:"` means the spec's train-side
+    reset ranges were seeded from a reference clip rather than a
+    generator/diagnoser, which the UI surfaces as a chip.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    active: bool
+    current: Optional[dict[str, Any]] = None
+    versions: list[str] = []
