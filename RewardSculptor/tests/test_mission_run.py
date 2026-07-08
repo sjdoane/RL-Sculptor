@@ -49,6 +49,18 @@ from sculptor.mission_runtime import (
 
 
 # ── Helpers ──────────────────────────────────────────────────────────
+import pytest as _pytest
+
+
+@_pytest.fixture(autouse=True)
+def _redirect_saved_root(monkeypatch, tmp_path_factory):
+    """§A3: mission-run now auto-archives on every stage/mission end.
+    Redirect the archive to a throwaway dir so tests never pollute the
+    real ~/.local/share/reward-sculptor/saved/."""
+    monkeypatch.setenv(
+        "RS_SAVED_ROOT", str(tmp_path_factory.mktemp("saved_root")))
+
+
 def _fabricate_rollout_artifacts(
     iter_dir: Path,
     *,
@@ -3148,3 +3160,29 @@ def test_keep_best_no_pass_keeps_strongest_for_warm_start(
     assert sr.selected_iter_index == 1  # strongest, not the last
     assert sr.final_policy_path.endswith("iter_1/checkpoint.pt")
     assert sr.selection_source == "fitness_fallback"
+
+
+def test_mission_run_auto_archives(tmp_path, monkeypatch, stub_adapter):
+    """§A3: a completed mission leaves a durable archive entry + emits
+    mission_archived, without a manual save."""
+    import json as _json
+
+    from sculptor import sculpt as sculpt_mod
+    from sculptor.archive import list_saved
+
+    saved = tmp_path / "arch"
+    monkeypatch.setenv("RS_SAVED_ROOT", str(saved))
+    m = _make_mission(tmp_path, n_stages=1)
+    m.stages[0].success_criterion = "metric > 0.5"
+    monkeypatch.setattr(
+        sculpt_mod, "sculpt_run", _fake_sculpt_run_factory(metric=0.9))
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit)
+
+    events: list[dict] = []
+    sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab", on_event=events.append)
+    entries = list_saved(saved)
+    assert entries, "expected a durable archive entry after the mission"
+    assert any(e["type"] in ("mission_archived", "mission_stage_archived")
+               for e in events)

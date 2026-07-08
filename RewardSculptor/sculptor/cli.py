@@ -1031,6 +1031,46 @@ def _derive_mission_slug(goal: str, existing: set[str]) -> str:
     return candidate
 
 
+@app.command("mission-save")
+def mission_save_cli(
+    project_dir: Path = typer.Argument(
+        ..., exists=True, file_okay=False, dir_okay=True,
+    ),
+    mission_slug: str = typer.Argument(
+        ..., help="Mission slug under <project_dir>/.missions/."),
+    pin: list[str] = typer.Option(
+        [], "--pin",
+        help="Extra checkpoints to keep, 'stage:iter' (repeatable). "
+             "Best + final per stage are kept automatically."),
+) -> None:
+    """§durable auto-save: archive a mission into the restart-/delete-
+    proof `saved/` store (best+final+pinned checkpoints + all videos,
+    reports, reward code, metrics). Missions auto-archive as they run;
+    use this to (re-)save a pre-existing mission or add pins."""
+    from sculptor.archive import archive_mission, saved_root
+
+    mission_dir = (project_dir / ".missions" / mission_slug).resolve()
+    if not (mission_dir / "mission.json").is_file():
+        typer.echo(f"[mission-save] no mission at {mission_dir}", err=True)
+        raise typer.Exit(1)
+    pinned: dict[str, set[int]] = {}
+    for spec in pin:
+        try:
+            st, it = spec.split(":")
+            pinned.setdefault(st, set()).add(int(it))
+        except ValueError:
+            typer.echo(f"[mission-save] bad --pin {spec!r} (want stage:iter)",
+                       err=True)
+            raise typer.Exit(2)
+    res = archive_mission(
+        mission_dir, saved_root(), project_slug=project_dir.name,
+        pinned=pinned or None, incremental=False)
+    typer.echo(
+        f"[mission-save] archived → {res.entry_dir} "
+        f"({int(getattr(res, 'total_bytes', 0) or 0) // (1024*1024)} MB, "
+        f"dropped {int(getattr(res, 'dropped_bytes', 0) or 0) // (1024*1024)} MB)")
+
+
 @app.command("mission-run")
 def mission_run_cli(
     project_dir: Path = typer.Argument(

@@ -3541,6 +3541,38 @@ def _atomic_save_mission(mission, mission_dir: Path) -> None:
     _os.replace(tmp, mission_dir / "mission.json")
 
 
+def _archive_mission_snapshot(
+    mission_dir: Path, *, emit, final: bool = False,
+) -> None:
+    """§durable auto-save (A3): incrementally snapshot the mission into
+    the restart-/delete-proof `saved/` archive (best+final+pinned
+    checkpoints + every video/report/metric; heavy intermediates
+    dropped — see sculptor.archive). Set `RS_AUTO_ARCHIVE=0` to disable.
+    NEVER fatal — a failed archive emits an event and the mission
+    proceeds. project_slug is the dir two levels up
+    (`<project>/.missions/<mission>`)."""
+    import os as _os
+    if _os.environ.get("RS_AUTO_ARCHIVE", "1") != "1":
+        return
+    try:
+        from sculptor.archive import archive_mission, saved_root
+
+        project_slug = Path(mission_dir).parent.parent.name
+        res = archive_mission(
+            Path(mission_dir), saved_root(),
+            project_slug=project_slug, incremental=True)
+        emit({
+            "type": "mission_archived" if final else "mission_stage_archived",
+            "path": str(res.entry_dir),
+            "total_bytes": int(getattr(res, "total_bytes", 0) or 0),
+        })
+    except Exception as e:  # noqa: BLE001 — archiving must never break a run
+        emit({
+            "type": "mission_archive_failed",
+            "error": f"{type(e).__name__}: {e}",
+        })
+
+
 def mission_run(
     mission,
     *,
@@ -3854,6 +3886,14 @@ def mission_run(
             # resume sees the latest state.
             _atomic_save_mission(mission, mission_dir)
 
+            # §durable auto-save (A3): snapshot the mission into the
+            # restart-/delete-proof archive AS EACH STAGE FINISHES, so a
+            # user never loses footage to a later crash, regression, or
+            # an accidental project delete. Incremental → one entry per
+            # run. Retention (best+final+pinned checkpoints, all videos)
+            # lives in sculptor.archive. NEVER fatal to the mission.
+            _archive_mission_snapshot(mission_dir, emit=_emit)
+
             # §Ship 24 (R1): per-stage provenance record (never fatal,
             # but observable — warn ONCE per mission if records are
             # silently failing, e.g. a corrupted provenance.json).
@@ -3928,6 +3968,12 @@ def mission_run(
             redecompositions=_redecompositions,
             emit=_emit,
         )
+
+        # §durable auto-save (A3): final archive snapshot on BOTH the
+        # completed AND halted paths — a halted mission still has footage
+        # worth keeping (e.g. the jump succeeded but the landing stage
+        # didn't). Incremental → folds into the same run entry.
+        _archive_mission_snapshot(mission_dir, emit=_emit, final=True)
 
         _emit({
             "type": "mission_completed" if result.completed
