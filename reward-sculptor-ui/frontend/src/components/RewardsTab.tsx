@@ -1,6 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
 import { useQueries, useQueryClient } from "@tanstack/react-query";
-import { useSearchParams } from "react-router-dom";
 import { toast } from "sonner";
 
 import { Icon } from "@/components/rs/icon";
@@ -76,15 +75,13 @@ export function RewardsTab({
 }: {
   slug: string;
   project: ProjectDetail;
-  // §Ship de-silo: plumbed through now; this tab doesn't consume the
-  // shared stage selection yet (a later increment scopes the reward
-  // version list to the selected stage instead of the auto-detected
-  // active one).
+  // §Ship de-silo: the shared cross-tab stage selection (owned by
+  // ProjectDetail, URL-synced as `?stage=missionSlug/stageName`). When
+  // present it takes precedence over this tab's own live/sticky-stage
+  // auto-detection — see `effectiveScope` below.
   selectedStage?: SelectedStage | null;
   setSelectedStage?: (value: SelectedStage | null) => void;
 }) {
-  void selectedStage;
-  void setSelectedStage;
   // §Ship 21b/21d scope logic — preserved verbatim from the prior version.
   // When a mission_stage_run is active, the project's global rewards/v0.py
   // doesn't change; Claude's edits land in the STAGE's rewards dir. Auto-
@@ -116,37 +113,44 @@ export function RewardsTab({
   }, [liveStageScope, stickyStageScope]);
   const stageScope = liveStageScope ?? stickyStageScope;
 
-  // §Ship 20 (de-siloing): a `?stage=<ms>/<stage>` URL param deep-links
-  // this tab scoped to a specific stage (from the mission detail dialog).
-  // It seeds the manual override once, then normal selection takes over.
-  const [searchParams, setSearchParams] = useSearchParams();
-  const stageParam = searchParams.get("stage");
+  // §Ship de-silo: `?stage=` is now owned entirely by ProjectDetail, which
+  // parses it into the `selectedStage` prop and passes a setter back down.
+  // (Previously this tab also parsed/wrote `?stage=` itself as a one-shot
+  // seed for `scopeOverride` — that's removed: two components racing to
+  // read+rewrite the same URL param caused exactly the "double-parse"
+  // fight this increment closes. The prop now carries the same
+  // information, so nothing is lost.)
+  const selectedStageScope = selectedStage
+    ? `${selectedStage.missionSlug}/${selectedStage.stageName}`
+    : null;
 
+  // Manual dropdown pick, used only when there's no shared selection to
+  // route through (see RewardsScopeSelector's onChange below). Cleared
+  // whenever the shared prop changes to a new value, so a stage clicked
+  // in Training/Overview always wins over a stale local pick.
   const [scopeOverride, setScopeOverride] = useState<string | null>(null);
-  const seededFromParam = useState({ done: false })[0];
+  const [lastPropScope, setLastPropScope] = useState<string | null>(null);
   useEffect(() => {
-    if (seededFromParam.done) return;
-    if (stageParam) {
-      setScopeOverride(stageParam);
-      // Consume the param so a later manual switch isn't overridden and a
-      // refresh doesn't re-pin. Keep other params (e.g. tab) intact.
-      setSearchParams(
-        (prev) => {
-          const next = new URLSearchParams(prev);
-          next.delete("stage");
-          return next;
-        },
-        { replace: true },
-      );
+    if (selectedStageScope !== lastPropScope) {
+      setLastPropScope(selectedStageScope);
+      setScopeOverride(null);
     }
-    seededFromParam.done = true;
-  }, [stageParam, seededFromParam, setSearchParams]);
+  }, [selectedStageScope, lastPropScope]);
 
+  // Precedence: explicit shared selectedStage prop > local manual override
+  // (dropdown pick, only reachable when no setSelectedStage setter was
+  // given — see RewardsScopeSelector's onChange) > live stage > sticky
+  // stage. The prop sits above the manual override because a stage click
+  // in Training/Overview should win over a stale local pin; but when this
+  // tab's own dropdown IS the routing path (no setter provided), the
+  // override still needs to beat the live/sticky auto-scope, matching the
+  // pre-existing manual-pick-wins-over-auto-follow behavior.
   const effectiveScope: string | null = useMemo(() => {
+    if (selectedStageScope !== null) return selectedStageScope;
     if (scopeOverride === "project") return null;
-    if (scopeOverride && scopeOverride !== "project") return scopeOverride;
+    if (scopeOverride) return scopeOverride;
     return stageScope;
-  }, [scopeOverride, stageScope]);
+  }, [selectedStageScope, scopeOverride, stageScope]);
   const isStageScope = effectiveScope !== null;
   const pollMs = missionActive || liveStageScope != null ? 3000 : null;
 
@@ -207,7 +211,22 @@ export function RewardsTab({
           stageScope={stageScope}
           scopeOverride={scopeOverride}
           effectiveScope={effectiveScope}
-          onChange={setScopeOverride}
+          onChange={(next) => {
+            // "Auto-follow" (null) and "project" pins never correspond to a
+            // SelectedStage — always local. A stage pick routes through the
+            // shared setter when one exists, so picking a stage here also
+            // updates Training/Overview and the `?stage=` URL; otherwise it
+            // falls back to a local-only override.
+            if (next && next !== "project" && setSelectedStage) {
+              const idx = next.indexOf("/");
+              if (idx > 0) {
+                setSelectedStage({ missionSlug: next.slice(0, idx), stageName: next.slice(idx + 1) });
+                return;
+              }
+            }
+            if (setSelectedStage) setSelectedStage(null);
+            setScopeOverride(next);
+          }}
         />
 
         <div className="rs-twocol">
@@ -326,8 +345,10 @@ function RewardsScopeSelector({
   // Nothing to scope to (no missions/stages, no live stage) → hide.
   if (!hasAnyStage && !stageScope && !scopeOverride) return null;
 
-  // The <select> value: explicit override, else "auto" (follow live).
-  const value = scopeOverride ?? AUTO_VALUE;
+  // The <select> value: explicit local override, else whatever scope is
+  // actually in effect (e.g. driven by the shared selectedStage prop or
+  // the live/sticky stage), else "auto" (nothing pinned yet).
+  const value = scopeOverride ?? effectiveScope ?? AUTO_VALUE;
   const isStage = effectiveScope !== null;
 
   return (
