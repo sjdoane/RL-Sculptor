@@ -634,7 +634,29 @@ def get_project(slug: str, store: ProjectStore = Depends(get_store)) -> Any:
     response_model=None,
     responses={404: {"model": ProblemDetail}, 409: {"model": ProblemDetail}},
 )
-def delete_project(slug: str, store: ProjectStore = Depends(get_store)) -> Any:
+def delete_project(
+    slug: str,
+    store: ProjectStore = Depends(get_store),
+    jobs: JobManager = Depends(get_job_manager),
+) -> Any:
+    # Chunk A1: refuse to move a project into the trash while a job of
+    # ANY kind is still running/queued against it — an in-flight job
+    # may hold open file handles or be mid-write under the project
+    # dir, and a shutil.move racing that is unsafe on any platform,
+    # let alone Windows. Checked before store.delete so the caller
+    # gets a clean 409 instead of a partial move.
+    active = jobs.active_jobs_for_project(slug)
+    if active:
+        return _problem(
+            status.HTTP_409_CONFLICT,
+            "project has active jobs",
+            detail=(
+                f"project {slug!r} has {len(active)} active job(s); "
+                "stop them before deleting."
+            ),
+            type_="/problems/state-conflict",
+        )
+
     try:
         ok = store.delete(slug)
     except BusyError as e:

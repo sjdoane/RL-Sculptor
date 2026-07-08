@@ -278,6 +278,19 @@ class JobManager:
                 return True
         return False
 
+    def active_jobs_for_project(self, slug: str) -> list[Job]:
+        """Every job of ANY kind for this project in running / queued
+        state (chunk A1) — used by `DELETE /projects/{slug}` to refuse
+        moving a project into the trash out from under a live job
+        (sculpt_run, mission_decompose, mission_execute, kg jobs, …).
+        Unlike `has_active_sculpt_run` this isn't scoped to one kind,
+        since any in-flight job holding file handles / writing under
+        the project dir makes a concurrent move unsafe."""
+        return [
+            j for j in self.list(project_slug=slug)
+            if j.status in ("running", "queued")
+        ]
+
     def has_any_active_sculpt_run(self) -> bool:
         """True if ANY project has a sculpt_run in running / queued state.
         Used by the preview / reports routes to distinguish GPU-busy 503s

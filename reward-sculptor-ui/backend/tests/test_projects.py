@@ -142,6 +142,9 @@ def test_list_empty(client: TestClient) -> None:
 
 # ── delete ─────────────────────────────────────────────────────────────
 def test_delete_project(client: TestClient, tmp_projects_root: Path) -> None:
+    """Chunk A1: delete is a MOVE into the trash, not a hard delete —
+    the project dir must be gone from projects_root but the tree
+    (and its metadata.json) must still exist under `.trash/`."""
     r = client.post("/projects", json={"name": "ToDelete"})
     slug = r.json()["slug"]
     assert (tmp_projects_root / slug).is_dir()
@@ -150,7 +153,18 @@ def test_delete_project(client: TestClient, tmp_projects_root: Path) -> None:
     assert r.status_code == 204
     assert not (tmp_projects_root / slug).exists()
 
-    # Repeat delete should 404.
+    # Gone from the live listing too.
+    r = client.get("/projects")
+    assert slug not in {p["slug"] for p in r.json()}
+
+    # Recoverable: present in trash with the moved tree intact.
+    trash_root = tmp_projects_root.parent / ".trash"
+    entries = [d for d in trash_root.iterdir() if d.is_dir()]
+    assert len(entries) == 1
+    assert (entries[0] / "trash_meta.json").is_file()
+    assert (entries[0] / slug / "metadata.json").is_file()
+
+    # Repeat delete should 404 (already moved out of projects_root).
     r = client.delete(f"/projects/{slug}")
     assert r.status_code == 404
     assert r.json()["type"] == "/problems/not-found"

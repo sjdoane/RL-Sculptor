@@ -707,6 +707,8 @@ def test_run_mission_409_when_other_gpu_job_active(
 def test_delete_mission_returns_freed_bytes(
     client: TestClient, tmp_projects_root: Path,
 ) -> None:
+    """Chunk A1: delete is a MOVE into the trash — gone from
+    .missions/ but recoverable under `.trash/`."""
     slug = _make_project(client)
     md = _seed_mission_on_disk(tmp_projects_root / slug, "alpha")
     # Drop a non-trivial file in the mission so freed_bytes > 0.
@@ -718,6 +720,12 @@ def test_delete_mission_returns_freed_bytes(
     assert body["mission_slug"] == "alpha"
     assert body["freed_bytes"] >= 1024
     assert not md.exists()
+
+    trash_root = tmp_projects_root.parent / ".trash"
+    entries = [d for d in trash_root.iterdir() if d.is_dir()]
+    assert len(entries) == 1
+    assert (entries[0] / "trash_meta.json").is_file()
+    assert (entries[0] / "alpha" / "extra.bin").is_file()
 
 
 def test_delete_mission_409_when_active_job(

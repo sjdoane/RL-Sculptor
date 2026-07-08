@@ -370,7 +370,9 @@ def _dir_size_bytes(p: Path) -> int:
 def delete_mission(
     project_dir: Path, mission_slug: str,
 ) -> int:
-    """Hard-delete the mission directory. Returns freed bytes.
+    """Move the mission directory into the trash (chunk A1 — no
+    longer a hard delete; see `backend.services.trash`). Returns freed
+    bytes (measured before the move, same meaning as before).
 
     Caller MUST verify there's no active mission_decompose /
     mission_execute job for this slug before calling — this function
@@ -381,5 +383,9 @@ def delete_mission(
     if not target.is_dir():
         return 0
     freed = _dir_size_bytes(target)
-    shutil.rmtree(target, ignore_errors=False)
+    from backend.services import trash
+
+    trash.move_to_trash(
+        target, kind="mission", slug=mission_slug, origin=target,
+    )
     return freed

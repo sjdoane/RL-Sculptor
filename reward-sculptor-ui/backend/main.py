@@ -37,6 +37,7 @@ from backend.routes import robot as robot_routes
 from backend.routes import reports as reports_routes
 from backend.routes import runs as runs_routes
 from backend.routes import system as system_routes
+from backend.routes import trash as trash_routes
 from backend.services.job_manager import JobManager
 from backend.services import sculptor_bridge
 from backend.services.project_store import ProjectStore
@@ -208,6 +209,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     app.include_router(missions_routes.router)
     app.include_router(missions_routes.ws_router)
     app.include_router(metrics_routes.router)
+    app.include_router(trash_routes.router)
     return app
 
 
