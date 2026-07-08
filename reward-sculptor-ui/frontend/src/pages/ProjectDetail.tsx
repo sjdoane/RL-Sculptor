@@ -285,14 +285,15 @@ function OverviewTab({
   const taskId = typeof cfg.task_id === "string" ? cfg.task_id : null;
   const numEnvs = typeof cfg.num_envs === "number" ? cfg.num_envs : null;
   const device = typeof cfg.device === "string" ? cfg.device : null;
-  // §Ship de-silo: not yet consumed here (RobotViewer wiring lands in a
-  // later increment) — referenced so lint doesn't flag it as dead.
-  void setSelectedStage;
   return (
     <div className="rs-scroll">
       <div className="rs-pad" style={{ display: "grid", gridTemplateColumns: "minmax(0,1.6fr) minmax(300px,1fr)", gap: 22, alignItems: "start" }}>
         <div className="rs-vgap-16">
-          {configured ? <RobotViewer slug={slug} selectedStage={selectedStage} /> : <RobotConfig slug={slug} />}
+          {configured ? (
+            <RobotViewer slug={slug} selectedStage={selectedStage} setSelectedStage={setSelectedStage} />
+          ) : (
+            <RobotConfig slug={slug} />
+          )}
           <div className="rs-card rs-card-pad">
             <div className="rs-card-title" style={{ marginBottom: 10 }}><Icon name="flag" size={16} />What this project is</div>
             <p className="rs-sub" style={{ lineHeight: 1.6, margin: 0 }}>{project.description || "No description."}</p>

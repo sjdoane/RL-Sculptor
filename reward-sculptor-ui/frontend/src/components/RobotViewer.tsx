@@ -4,11 +4,13 @@ import { toast } from "sonner";
 import { Icon } from "@/components/rs/icon";
 import { useLiveClips } from "@/hooks/useLiveClips";
 import { useProjectPreview } from "@/hooks/useProjectPreview";
-import { useMissions } from "@/hooks/useMissions";
+import { useMission, useMissions, useStageIterations } from "@/hooks/useMissions";
 import { useRunEvents } from "@/hooks/useRunEvents";
 import { useRuns } from "@/hooks/useRuns";
-import { clipUrl, iterRolloutUrl, previewUrl } from "@/lib/api";
-import type { CameraAngle, RunSummary, SelectedStage } from "@/lib/types";
+import { clipUrl, iterRolloutUrl, previewUrl, stageRolloutUrl } from "@/lib/api";
+import type {
+  CameraAngle, MissionSummary, RunSummary, SelectedStage, StageSchema,
+} from "@/lib/types";
 import { CAMERA_ANGLES } from "@/lib/types";
 
 const ANGLE_LABEL: Record<CameraAngle, string> = {
@@ -35,16 +37,22 @@ type Mode = "static" | "live" | "replay";
  *    - Replay persists until the user explicitly leaves.
  *    - Live does NOT auto-switch to Static when a run completes — it
  *      stays on the last clip with a "Run completed" overlay.
+ *
+ * §Ship de-silo: when `selectedStage` names a mission stage, the Live
+ * layer sources that stage's rollout from disk-truth (useStageIterations
+ * + stageRolloutUrl, keyed by mission/stage — not run_id) so a stage
+ * stays reachable after a LATER stage supersedes or errors it. A stage
+ * picker (chips) lets the user jump between a mission's stages; picking
+ * one calls `setSelectedStage`, which is URL-synced (`?stage=`) by
+ * ProjectDetail and shared with RunsTab/RewardsTab.
  */
 export function RobotViewer({
-  slug, selectedStage,
+  slug, selectedStage, setSelectedStage,
 }: {
   slug: string;
-  // §Ship de-silo: not yet consumed (lands in a later increment that
-  // switches the live-video preview to a selected completed stage).
   selectedStage?: SelectedStage | null;
+  setSelectedStage?: (value: SelectedStage | null) => void;
 }) {
-  void selectedStage;
   // §Ship 21d: keep /runs polling through mission stage boundaries so
   // the live-video run selection doesn't freeze on a stale stage when
   // one completes and the next starts.
@@ -59,6 +67,16 @@ export function RobotViewer({
   const liveRun = activeRun ?? mostRecentRun;
   const liveRunId = liveRun?.run_id ?? null;
   const replayRun = activeRun ?? mostRecentRun;
+
+  // The mission that owns the currently live/most-recent run (if any),
+  // used to enumerate stages for the picker and to decide the terminal
+  // (no-active-job) default stage below.
+  const liveMissionSlug = liveRun?.kind === "mission_stage_run" ? liveRun.mission_slug ?? null : null;
+  const fallbackMissionSlug = useMemo(() => pickDefaultMissionSlug(missions.data ?? []), [missions.data]);
+  const missionSlugForPicker = selectedStage?.missionSlug ?? liveMissionSlug ?? fallbackMissionSlug;
+  const missionDetail = useMission(slug, missionSlugForPicker ?? undefined, {
+    enabled: !!missionSlugForPicker,
+  });
 
   const [mode, setMode] = useState<Mode>("static");
   const [userPicked, setUserPicked] = useState(false);
@@ -81,6 +99,22 @@ export function RobotViewer({
     setReplayIter(null);
   }, [replayRun?.run_id]);
 
+  // Foolproof default (req. 3): while a job is actively training and the
+  // user hasn't made an explicit stage pick, keep following the live run
+  // unchanged — don't fight the live auto-follow with a stage default.
+  // Once the mission is terminal (no active job), default to the most
+  // recent stage that actually has a rollout on disk, so an errored
+  // final stage never blanks the viewer.
+  useEffect(() => {
+    if (selectedStage || !setSelectedStage) return;
+    if (missionActive) return;
+    if (!missionDetail.data || missionDetail.data.active_job_id != null) return;
+    const fallback = pickDefaultStage(missionDetail.data.stages);
+    if (fallback) setSelectedStage({ missionSlug: missionDetail.data.mission_slug, stageName: fallback });
+  }, [selectedStage, setSelectedStage, missionActive, missionDetail.data]);
+
+  const showStagePicker = !!missionSlugForPicker && (missionDetail.data?.stages.length ?? 0) > 1;
+
   return (
     <div className="rs-viewer">
       <div className="rs-viewer-bar">
@@ -91,15 +125,60 @@ export function RobotViewer({
         </div>
         <ModeSwitcher mode={mode} onPick={pickMode} hasReplay={!!replayRun} hasLive={!!liveRunId} />
       </div>
+      {showStagePicker && setSelectedStage && mode === "live" && (
+        <>
+          <div className="rs-stage-divider" />
+          <StagePicker
+            missionSlug={missionSlugForPicker!}
+            stages={missionDetail.data?.stages ?? []}
+            selectedStageName={selectedStage?.missionSlug === missionSlugForPicker ? selectedStage.stageName : null}
+            liveStageName={missionActive ? liveRun?.stage_name ?? null : null}
+            onPick={(stageName) => setSelectedStage({ missionSlug: missionSlugForPicker!, stageName })}
+          />
+        </>
+      )}
       <div className="rs-viewer-stage" style={STAGE_STYLE}>
         {mode === "static" && <StaticLayer slug={slug} />}
-        {mode === "live" && <LiveLayer slug={slug} runId={liveRunId} run={liveRun} />}
+        {mode === "live" && (
+          <LiveLayer
+            slug={slug}
+            runId={liveRunId}
+            run={liveRun}
+            selectedStage={selectedStage ?? null}
+            missionActive={missionActive}
+          />
+        )}
         {mode === "replay" && (
           <ReplayLayer slug={slug} run={replayRun} iter={replayIter} onPickIter={setReplayIter} />
         )}
       </div>
     </div>
   );
+}
+
+/** Terminal-default helper: the newest mission with any job history,
+ *  used only as a last resort when there's no live/most-recent run to
+ *  anchor the picker to (e.g. static preview never having run yet). */
+function pickDefaultMissionSlug(missions: MissionSummary[]): string | null {
+  if (missions.length === 0) return null;
+  const sorted = [...missions].sort(
+    (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
+  );
+  return sorted[0].mission_slug;
+}
+
+/** req. 3: most recent stage that actually has a rollout on disk — never
+ *  an errored/pending stage with nothing to show. "Most recent" = highest
+ *  index among stages with `status !== "pending"`, since StageSchema
+ *  doesn't carry has_rollout itself (that's per-iteration); we fall back
+ *  through stages newest-first and let StageLayer's own disk-truth check
+ *  render the "no rollout" note if this stage turns out empty too. */
+function pickDefaultStage(stages: StageSchema[]): string | null {
+  const attempted = stages.filter((s) => s.status !== "pending");
+  if (attempted.length === 0) return null;
+  const succeeded = [...attempted].reverse().find((s) => s.status === "succeeded");
+  if (succeeded) return succeeded.name;
+  return attempted[attempted.length - 1].name;
 }
 
 function pickMostRecent(runs: RunSummary[]): RunSummary | null {
@@ -207,7 +286,35 @@ function StaticLayer({ slug }: { slug: string }) {
 }
 
 // ── Live layer ───────────────────────────────────────────────────────
-function LiveLayer({ slug, runId, run }: { slug: string; runId: string | null; run: RunSummary | null }) {
+function LiveLayer({
+  slug, runId, run, selectedStage, missionActive,
+}: {
+  slug: string;
+  runId: string | null;
+  run: RunSummary | null;
+  selectedStage: SelectedStage | null;
+  missionActive: boolean;
+}) {
+  // §Ship de-silo: an explicit stage selection always wins EXCEPT while
+  // that exact stage is the one actively training right now — in which
+  // case we keep the live run_id-scoped path so "watch it train" doesn't
+  // regress. This mirrors RunsTab's RunDetailPane `isLiveStage` check.
+  const selectionIsLiveStage =
+    missionActive &&
+    run?.kind === "mission_stage_run" &&
+    run.mission_slug === selectedStage?.missionSlug &&
+    run.stage_name === selectedStage?.stageName;
+
+  if (selectedStage && !selectionIsLiveStage) {
+    return (
+      <StageLayer
+        slug={slug}
+        missionSlug={selectedStage.missionSlug}
+        stageName={selectedStage.stageName}
+      />
+    );
+  }
+
   if (run?.kind === "mission_stage_run") {
     return <LiveStageRollout slug={slug} runId={runId} run={run} />;
   }
@@ -328,6 +435,123 @@ function LiveStageRollout({ slug, runId, run }: { slug: string; runId: string | 
       )}
       {events.terminal && <span className="sr-only">Terminal event received.</span>}
     </>
+  );
+}
+
+// ── Stage layer (disk-truth, de-siloed) — §Ship de-silo ──────────────
+// Sources a selected stage's rollout from useStageIterations +
+// stageRolloutUrl — keyed by (missionSlug, stageName), not run_id — so a
+// completed/errored/superseded stage keeps showing its video no matter
+// what the live job is doing now. Mirrors RunsTab's StageDetailPane and
+// MissionDetailDialog's StagePanel default-iter selection.
+function StageLayer({
+  slug, missionSlug, stageName,
+}: { slug: string; missionSlug: string; stageName: string }) {
+  const iters = useStageIterations(slug, missionSlug, stageName);
+  const rows = iters.data ?? [];
+  const videoRef = useRef<HTMLVideoElement>(null);
+
+  // Prefer the newest iteration that actually has a rollout — the
+  // "kept" iter (selected_iter_index) isn't available here without a
+  // second mission fetch, and newest-with-rollout is what StagePanel
+  // falls back to anyway when nothing is explicitly kept yet.
+  const defaultIter = useMemo(() => {
+    if (rows.length === 0) return null;
+    const newestWithRollout = [...rows].reverse().find((r) => r.has_rollout);
+    if (newestWithRollout) return newestWithRollout.iter_index;
+    return rows[rows.length - 1].iter_index;
+  }, [rows]);
+
+  const activeIter = defaultIter;
+  const activeRow = rows.find((r) => r.iter_index === activeIter) ?? null;
+  const src = activeIter != null && activeRow?.has_rollout
+    ? stageRolloutUrl(slug, missionSlug, stageName, activeIter)
+    : null;
+
+  useEffect(() => {
+    if (!src || !videoRef.current) return;
+    videoRef.current.load();
+    videoRef.current.play().catch(() => {});
+  }, [src]);
+
+  const noRolloutAtAll = !iters.isLoading && !iters.error && rows.length > 0 && rows.every((r) => !r.has_rollout);
+  const noIterationsAtAll = !iters.isLoading && !iters.error && rows.length === 0;
+
+  return (
+    <>
+      <div className="rs-overlay">
+        <Icon name="video" size={13} />
+        {stageName}{activeIter !== null ? ` · iter ${activeIter}` : ""}
+        <span style={{ opacity: 0.7 }}>· disk-truth</span>
+      </div>
+      {iters.isLoading && <Shimmer label="loading stage rollout…" />}
+      {iters.error && (
+        <EmptyOverlay title="Couldn't load this stage" error={(iters.error as Error).message} />
+      )}
+      {(noIterationsAtAll || noRolloutAtAll) && (
+        <EmptyOverlay title="Stage errored, no rollout" error="No rollout was rendered for this stage before it stopped." />
+      )}
+      {src && (
+        <video
+          ref={videoRef}
+          key={src}
+          src={src}
+          aria-label={`${stageName} rollout, iteration ${activeIter ?? 0}`}
+          style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "contain" }}
+          muted playsInline autoPlay loop
+        />
+      )}
+    </>
+  );
+}
+
+// ── Stage picker chips — §Ship de-silo ───────────────────────────────
+// Lists a mission's stages so the user can jump straight to any of them
+// (including an errored one, which still shows in the picker but renders
+// the "no rollout" note rather than breaking).
+function StagePicker({
+  missionSlug, stages, selectedStageName, liveStageName, onPick,
+}: {
+  missionSlug: string;
+  stages: StageSchema[];
+  selectedStageName: string | null;
+  liveStageName: string | null;
+  onPick: (stageName: string) => void;
+}) {
+  void missionSlug;
+  const attempted = stages.filter((s) => s.status !== "pending");
+  if (attempted.length === 0) return null;
+
+  return (
+    <div className="rs-flex rs-wrap rs-gap-6" style={{ padding: "8px 14px" }} role="list" aria-label="Mission stages">
+      {attempted.map((s) => {
+        const isSelected = selectedStageName === s.name || (selectedStageName === null && liveStageName === s.name);
+        const isErrored = s.status === "failed";
+        const isLive = liveStageName === s.name;
+        return (
+          <button
+            key={s.name}
+            type="button"
+            role="listitem"
+            onClick={() => onPick(s.name)}
+            title={isErrored ? `${s.name} — errored` : s.name}
+            className="mono"
+            style={{
+              display: "inline-flex", alignItems: "center", gap: 5,
+              borderRadius: 5, padding: "3px 8px", fontSize: 11,
+              cursor: "pointer",
+              border: "1px solid " + (isSelected ? "var(--rs-primary)" : "var(--hairline)"),
+              background: isSelected ? "rgba(245,78,0,0.08)" : "var(--canvas-soft)",
+              color: "var(--ink)",
+            }}
+          >
+            {isLive && <span className="rs-dot live" />}
+            <span style={{ fontWeight: 600 }}>{s.name}</span>
+            {isErrored && <Icon name="alert-circle" size={11} color="var(--st-rose-fg)" />}
+          </button>
+        );
+      })}
+    </div>
   );
 }
 
