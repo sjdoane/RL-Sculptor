@@ -30,6 +30,9 @@ export const STATUS_META: Record<string, StatusMeta> = {
   pending:    { label: "Pending",    cls: "slate",   icon: "circle" },
   skipped:    { label: "Skipped",    cls: "slate",   icon: "minus" },
   held:       { label: "Held",       cls: "slate",   icon: "minus" },
+  // §mission-persistence: replaced by redecomposition children; terminal,
+  // non-alarming (artifacts retained) — distinct from "failed".
+  superseded: { label: "Superseded", cls: "slate",   icon: "git-branch" },
 };
 
 export function Badge({

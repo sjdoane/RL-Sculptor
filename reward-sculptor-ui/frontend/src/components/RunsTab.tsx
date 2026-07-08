@@ -1,4 +1,5 @@
 import { useMemo, useRef, useState } from "react";
+import { useQueries } from "@tanstack/react-query";
 import { toast } from "sonner";
 
 import { Icon } from "@/components/rs/icon";
@@ -13,7 +14,9 @@ import { useMission, useMissions, useStageIterations } from "@/hooks/useMissions
 import { useRegenerateRewardTemplate, useRewards } from "@/hooks/useRewards";
 import { usePolicies } from "@/hooks/usePolicies";
 import { useControlRun, useKillRun, useRun, useRuns } from "@/hooks/useRuns";
-import { ApiError, policyExportUrl, stageRolloutUrl } from "@/lib/api";
+import { ApiError, getMission, policyExportUrl, stageRolloutUrl } from "@/lib/api";
+import { qk } from "@/lib/queryKeys";
+import { failureReasonText, stageLabel, supersededText } from "@/lib/stageDisplay";
 import { formatRelative } from "@/lib/utils";
 import type {
   ErrorClassification,
@@ -96,6 +99,11 @@ export default function RunsTab({
     () => partitionRuns(runs, missions.data ?? []),
     [runs, missions.data],
   );
+  // §Increment 4: display_label lookup (mission_slug -> stage_name ->
+  // {displayLabel, topLevelCount}) for every stage-numbering surface below.
+  // Called unconditionally, before the isLoading/empty early returns, so
+  // rules-of-hooks holds even though those branches don't render RunSidebar.
+  const stageLabels = useMissionStageLabels(slug, missions.data ?? []);
   const allOrderedRunIds = useMemo(
     () => [
       ...sculptRuns.map((r) => r.run_id),
@@ -170,6 +178,7 @@ export default function RunsTab({
           project={project}
           sculptRuns={sculptRuns}
           missionGroups={missionGroups}
+          stageLabels={stageLabels}
           selected={selected}
           selectedStage={selectedStage ?? null}
           onSelectRun={setSelectedRunId}
@@ -227,6 +236,44 @@ function partitionRuns(runs: RunSummary[], missions: MissionSummary[]): { sculpt
   return { sculptRuns, missionGroups };
 }
 
+// ── stage display-label plumbing (Increment 4) ───────────────────────
+// display_label ("1", "1.1", …) only lives on StageSchema (mission detail),
+// not on RunSummary rows — so every mission-scoped numbering surface in
+// this tab needs a mission_slug -> stage_name -> StageSchema lookup.
+// Mirrors RewardsTab's RewardsScopeSelector useQueries-per-mission pattern
+// (same query keys, so the cache is shared rather than duplicated).
+interface StageLabelInfo {
+  displayLabel: string;
+  topLevelCount: number;
+}
+
+function useMissionStageLabels(
+  slug: string,
+  missions: MissionSummary[],
+): Map<string, Map<string, StageLabelInfo>> {
+  const details = useQueries({
+    queries: missions.map((m) => ({
+      queryKey: qk.mission(slug, m.mission_slug),
+      queryFn: () => getMission(slug, m.mission_slug),
+      staleTime: 30_000,
+    })),
+  });
+  return useMemo(() => {
+    const out = new Map<string, Map<string, StageLabelInfo>>();
+    missions.forEach((m, i) => {
+      const d = details[i]?.data as MissionDetail | undefined;
+      if (!d) return;
+      const topLevelCount = d.stages.filter((s) => !(s.display_label ?? "").includes(".")).length;
+      const byName = new Map<string, StageLabelInfo>();
+      d.stages.forEach((s, idx) => {
+        byName.set(s.name, { displayLabel: stageLabel(s, idx + 1), topLevelCount });
+      });
+      out.set(m.mission_slug, byName);
+    });
+    return out;
+  }, [missions, details]);
+}
+
 // §Ship de-silo fix: `n` now prefers the REAL stage-run count seen on disk
 // (`knownStages`, from `missionGroups[].stages.length`) over the mission's
 // possibly-stale `n_stages` — for a terminal mission with a later stage
@@ -235,16 +282,24 @@ function partitionRuns(runs: RunSummary[], missions: MissionSummary[]): { sculpt
 // `viewedStageIndex1based`, when given (the row the user is actually
 // looking at, from disk-truth `stage_index`), takes priority for the
 // "Stage N" part so switching stages updates the header immediately.
+//
+// §Increment 4: "Stage N of M" now prefers display_label-derived values —
+// `viewedStageLabel` (e.g. "1.2") for N, and `topLevelCount` (labels with
+// no dot — replan children don't inflate M) for the denominator. Both fall
+// back to the pre-existing index/knownStages arithmetic while the mission
+// detail query (which carries display_label) is still loading.
 function missionRunStateLabel(
   m: MissionSummary,
   knownStages: number,
   viewedStageIndex1based?: number | null,
+  viewedStageLabel?: string | null,
+  topLevelCount?: number | null,
 ): string {
   const { current_stage_idx: i, n_stages, lifecycle } = m;
-  const n = Math.max(n_stages, knownStages);
+  const n = topLevelCount ?? Math.max(n_stages, knownStages);
   if (n === 0) return "Planning…";
   if (lifecycle === "running") {
-    const shown = viewedStageIndex1based ?? Math.max(1, i + 1);
+    const shown = viewedStageLabel ?? viewedStageIndex1based ?? Math.max(1, i + 1);
     return `Stage ${shown} of ${n}`;
   }
   if (lifecycle === "ready") return `${n} stages planned`;
@@ -252,6 +307,7 @@ function missionRunStateLabel(
   // Terminal (errored/halted) mission: show the stage being VIEWED, not
   // the stale current_stage_idx from whichever stage was live when a
   // later one errored.
+  if (viewedStageLabel != null) return `Stage ${viewedStageLabel} of ${n}`;
   if (viewedStageIndex1based != null) return `Stage ${viewedStageIndex1based} of ${n}`;
   return `${i} of ${n} stages complete`;
 }
@@ -267,12 +323,13 @@ function durationStr(start: string, end: string): string {
 
 // ── sidebar ───────────────────────────────────────────────────────────
 function RunSidebar({
-  slug, project, sculptRuns, missionGroups, selected, selectedStage, onSelectRun, onSelectStageRow, onOpenMissionDialog, onLaunchedRun,
+  slug, project, sculptRuns, missionGroups, stageLabels, selected, selectedStage, onSelectRun, onSelectStageRow, onOpenMissionDialog, onLaunchedRun,
 }: {
   slug: string;
   project: ProjectDetail;
   sculptRuns: RunSummary[];
   missionGroups: MissionGroup[];
+  stageLabels: Map<string, Map<string, StageLabelInfo>>;
   selected: string | null;
   selectedStage: SelectedStage | null;
   onSelectRun: (id: string) => void;
@@ -312,6 +369,9 @@ function RunSidebar({
         const viewedRow = g.stages.find(isRowSelected);
         const viewedStageIndex1based =
           viewedRow && typeof viewedRow.stage_index === "number" ? viewedRow.stage_index + 1 : null;
+        const groupLabels = stageLabels.get(g.missionSlug) ?? null;
+        const viewedStageLabel = viewedRow?.stage_name ? groupLabels?.get(viewedRow.stage_name)?.displayLabel ?? null : null;
+        const topLevelCount = groupLabels ? [...groupLabels.values()].reduce((max, v) => Math.max(max, v.topLevelCount), 0) || null : null;
         return (
           <div key={g.missionSlug} className="rs-mission">
             <div className="rs-mhead" role="button" tabIndex={0}
@@ -325,7 +385,7 @@ function RunSidebar({
                 <span style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
                   {g.mission && <Badge status={g.mission.lifecycle} label="" />}
                   <span style={{ fontWeight: 500, fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                    {g.mission ? missionRunStateLabel(g.mission, g.stages.length, viewedStageIndex1based) : g.missionSlug}
+                    {g.mission ? missionRunStateLabel(g.mission, g.stages.length, viewedStageIndex1based, viewedStageLabel, topLevelCount) : g.missionSlug}
                   </span>
                 </span>
                 {g.mission?.goal && (
@@ -351,6 +411,7 @@ function RunSidebar({
               <RunRow
                 key={r.run_id}
                 run={r}
+                displayLabel={r.stage_name ? groupLabels?.get(r.stage_name)?.displayLabel ?? null : null}
                 selected={isRowSelected(r)}
                 onSelect={() => onSelectStageRow(r)}
                 stageContext
@@ -369,16 +430,20 @@ function RunSidebar({
 }
 
 function RunRow({
-  run: r, selected, onSelect, stageContext = false,
-}: { run: RunSummary; selected: boolean; onSelect: () => void; stageContext?: boolean }) {
+  run: r, displayLabel = null, selected, onSelect, stageContext = false,
+}: { run: RunSummary; displayLabel?: string | null; selected: boolean; onSelect: () => void; stageContext?: boolean }) {
   const titleText = stageContext ? r.stage_name ?? r.run_id.replace(/^job_/, "") : r.run_id.replace(/^job_/, "");
   const itersDenom = r.iterations_requested || "?";
+  // §Increment 4: prefer the server's hierarchical display_label ("1.2")
+  // over stage_index+1 — falls back while the mission-detail label map is
+  // still loading (or for disk-reconstructed rows with no stage_index).
+  const numberLabel = displayLabel ?? (typeof r.stage_index === "number" ? String(r.stage_index + 1) : null);
   return (
     <button className={"rs-runrow" + (selected ? " on" : "") + (stageContext ? " rs-stage" : "")} onClick={onSelect}>
       <RunStatusBadge run={r} label="" />
       <span style={{ minWidth: 0, flex: 1 }}>
         <span className="rid" style={{ display: "block", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-          {stageContext && typeof r.stage_index === "number" && <span style={{ color: "var(--rs-muted)" }}>{r.stage_index + 1}. </span>}
+          {stageContext && numberLabel && <span style={{ color: "var(--rs-muted)" }}>{numberLabel}. </span>}
           {titleText}
         </span>
         <span className="rmeta" style={{ display: "block" }}>
@@ -438,7 +503,7 @@ function RunDetailPane({ slug, runId, runs }: { slug: string; runId: string; run
       mission={missionDetail.data ?? null}
     />
   ) : (
-    <LiveRunDetailPane slug={slug} runId={runId} runs={runs} />
+    <LiveRunDetailPane slug={slug} runId={runId} runs={runs} mission={isStageRunEarly ? missionDetail.data ?? null : null} />
   );
 }
 
@@ -494,7 +559,18 @@ function StageDetailPane({
       </div>
 
       <div className="rs-mid-col">
-        {summary && <StageContextCard run={summary} />}
+        {summary && <StageContextCard run={summary} displayLabel={stage?.display_label ?? null} />}
+        {stage?.status === "superseded" && (
+          <div className="rs-banner" style={{ margin: "0 16px 8px", background: "var(--canvas-soft)" }}>
+            <Icon name="git-branch" size={15} />
+            <span className="rs-grow" style={{ fontSize: 12 }}>{supersededText(stage)}</span>
+          </div>
+        )}
+        {stage?.status === "failed" && stage.failure_reason && (
+          <p className="rs-sub" style={{ margin: "0 16px 8px", fontSize: 11.5 }}>
+            {failureReasonText(stage.failure_reason, stage.iterations_used)}
+          </p>
+        )}
         <div className="rs-run-header">
           <Icon name="activity" size={17} color="var(--rs-muted)" />
           <span className="mono" style={{ fontSize: 14, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}>
@@ -581,7 +657,9 @@ function StageIterCard({
 // The original live-job detail pane (unchanged behavior) — used for
 // single sculpt runs and for whichever mission stage is the one
 // ACTIVELY training right now, so "watch it train live" keeps working.
-function LiveRunDetailPane({ slug, runId, runs }: { slug: string; runId: string; runs: RunSummary[] }) {
+function LiveRunDetailPane({
+  slug, runId, runs, mission,
+}: { slug: string; runId: string; runs: RunSummary[]; mission?: MissionDetail | null }) {
   const run = useRun(slug, runId);
   const events = useRunEvents(slug, runId);
   const kill = useKillRun(slug);
@@ -663,6 +741,7 @@ function LiveRunDetailPane({ slug, runId, runs }: { slug: string; runId: string;
   const missionSlug = summary?.mission_slug ?? run.data?.mission_slug ?? null;
   const stageName = summary?.stage_name ?? run.data?.stage_name ?? null;
   const stageRewardsScope = isStageRun && missionSlug && stageName ? `${missionSlug}/${stageName}` : null;
+  const liveStageLabel = mission?.stages.find((s) => s.name === stageName)?.display_label ?? null;
 
   const mergedIters = useMergedIterations(iters, events.events);
 
@@ -710,7 +789,7 @@ function LiveRunDetailPane({ slug, runId, runs }: { slug: string; runId: string;
       )}
 
       <div className="rs-mid-col">
-        {isStageRun && summary && <StageContextCard run={summary} />}
+        {isStageRun && summary && <StageContextCard run={summary} displayLabel={liveStageLabel} />}
         <RunHeader
           run={run.data}
           isActive={isActive}
@@ -833,13 +912,16 @@ function LiveRunDetailPane({ slug, runId, runs }: { slug: string; runId: string;
   );
 }
 
-function StageContextCard({ run }: { run: RunSummary }) {
+function StageContextCard({ run, displayLabel = null }: { run: RunSummary; displayLabel?: string | null }) {
+  // §Increment 4: prefer the server's display_label; fall back to
+  // stage_index+1 while the mission-detail lookup is loading (or absent).
+  const numberLabel = displayLabel ?? (typeof run.stage_index === "number" ? String(run.stage_index + 1) : null);
   return (
     <div className="rs-card rs-card-pad" style={{ marginBottom: 0 }}>
       <div className="rs-flex rs-wrap rs-gap-8" style={{ fontSize: 12 }}>
         <Icon name="sparkles" size={14} color="var(--rs-primary)" />
         <span style={{ fontWeight: 500 }}>
-          {typeof run.stage_index === "number" ? `Stage ${run.stage_index + 1}: ` : "Stage: "}
+          {numberLabel ? `Stage ${numberLabel}: ` : "Stage: "}
           <code className="mono">{run.stage_name ?? "(unnamed)"}</code>
         </span>
         <span style={{ color: "var(--rs-muted)" }}>mission <code className="mono">{run.mission_slug}</code></span>

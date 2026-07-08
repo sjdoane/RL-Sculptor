@@ -13,6 +13,7 @@ import {
 import { RunMissionDialog } from "@/components/RunMissionDialog";
 import { useMissionEvents } from "@/hooks/useMissionEvents";
 import { ApiError, stageRolloutUrl } from "@/lib/api";
+import { failureReasonText, stageLabel, supersededText } from "@/lib/stageDisplay";
 import { formatRelative } from "@/lib/utils";
 import type {
   MissionEvent,
@@ -255,6 +256,7 @@ export function MissionDetailDialog({
                 <div key={s.name}>
                   <StageCard
                     stage={s}
+                    fallbackNumber={idx + 1}
                     depth={stageDepths.get(s.name) ?? 0}
                     isCurrent={isCurrent}
                     iters={stageIters.get(s.name) ?? []}
@@ -468,6 +470,7 @@ function deriveStageEffectiveMaxIters(
 
 function StageCard({
   stage,
+  fallbackNumber,
   depth,
   isCurrent,
   iters,
@@ -476,6 +479,9 @@ function StageCard({
   onToggle,
 }: {
   stage: StageSchema;
+  /** 1-based array position, used only while `stage.display_label` is
+   *  absent (older missions predating the field). */
+  fallbackNumber: number;
   depth: number;
   isCurrent: boolean;
   iters: IterRow[];
@@ -531,6 +537,13 @@ function StageCard({
         }}
       >
         <Icon name={selected ? "chevron-down" : "chevron-right"} size={14} color="var(--rs-muted)" />
+        <span
+          className="mono rs-sub"
+          style={{ fontSize: 10.5, fontWeight: 600 }}
+          title={stage.on_disk_only ? "recovered from disk (not in mission.json)" : undefined}
+        >
+          {stageLabel(stage, fallbackNumber)}
+        </span>
         <StageStatusBadge status={stage.status} />
         <span className="mono" style={{ fontSize: 11.5, fontWeight: 600 }}>{stage.name}</span>
         {stage.parent_stage && (
@@ -542,7 +555,20 @@ function StageCard({
         {stage.redecomposition_attempts > 0 && (
           <span className="rs-badge slate" style={{ fontSize: 9.5 }}>replanned ×{stage.redecomposition_attempts}</span>
         )}
+        {stage.on_disk_only && (
+          <span className="rs-badge slate" style={{ fontSize: 9.5 }} title="Reconstructed from an on-disk stages/ directory (not in mission.json)">
+            <Icon name="history" size={10} />recovered from disk
+          </span>
+        )}
       </button>
+      {stage.status === "superseded" && (
+        <p className="rs-sub" style={{ margin: "6px 0 0", fontSize: 11 }}>{supersededText(stage)}</p>
+      )}
+      {stage.status === "failed" && stage.failure_reason && (
+        <p className="rs-sub" style={{ margin: "6px 0 0", fontSize: 11 }}>
+          {failureReasonText(stage.failure_reason, stage.iterations_used)}
+        </p>
+      )}
       <p style={{ margin: "6px 0 0", fontSize: 11.5, lineHeight: 1.5 }}>{stage.goal_text}</p>
       <p className="mono" style={{ margin: "6px 0 0", wordBreak: "break-all", borderRadius: "var(--radius-sm)", background: "var(--canvas-soft)", border: "1px solid var(--hairline)", padding: "5px 8px", fontSize: 10.5, color: "var(--rs-muted)" }}>
         {stage.success_criterion}

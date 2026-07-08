@@ -8,6 +8,7 @@ import { useMission, useMissions, useStageIterations } from "@/hooks/useMissions
 import { useRunEvents } from "@/hooks/useRunEvents";
 import { useRuns } from "@/hooks/useRuns";
 import { clipUrl, iterRolloutUrl, previewUrl, stageRolloutUrl } from "@/lib/api";
+import { failureReasonText, stageLabel, supersededText } from "@/lib/stageDisplay";
 import type {
   CameraAngle, MissionSummary, RunSummary, SelectedStage, StageSchema,
 } from "@/lib/types";
@@ -523,22 +524,31 @@ function StagePicker({
   onPick: (stageName: string) => void;
 }) {
   void missionSlug;
+  // §Increment 4: superseded stages stay listed/selectable (their rollouts
+  // are still on disk) — only genuinely untrained "pending" stages drop out.
   const attempted = stages.filter((s) => s.status !== "pending");
   if (attempted.length === 0) return null;
 
   return (
     <div className="rs-flex rs-wrap rs-gap-6" style={{ padding: "8px 14px" }} role="list" aria-label="Mission stages">
-      {attempted.map((s) => {
+      {attempted.map((s, idx) => {
         const isSelected = selectedStageName === s.name || (selectedStageName === null && liveStageName === s.name);
         const isErrored = s.status === "failed";
+        const isSuperseded = s.status === "superseded";
         const isLive = liveStageName === s.name;
+        const label = stageLabel(s, idx + 1);
+        const tooltip = isErrored
+          ? `${label}. ${s.name} — ${failureReasonText(s.failure_reason, s.iterations_used) ?? "errored"}`
+          : isSuperseded
+            ? `${label}. ${s.name} — ${supersededText(s)}`
+            : `${label}. ${s.name}`;
         return (
           <button
             key={s.name}
             type="button"
             role="listitem"
             onClick={() => onPick(s.name)}
-            title={isErrored ? `${s.name} — errored` : s.name}
+            title={tooltip}
             className="mono"
             style={{
               display: "inline-flex", alignItems: "center", gap: 5,
@@ -550,8 +560,10 @@ function StagePicker({
             }}
           >
             {isLive && <span className="rs-dot live" />}
+            <span style={{ color: "var(--rs-muted)" }}>{label}.</span>
             <span style={{ fontWeight: 600 }}>{s.name}</span>
             {isErrored && <Icon name="alert-circle" size={11} color="var(--st-rose-fg)" />}
+            {isSuperseded && <Icon name="git-branch" size={11} color="var(--rs-muted)" />}
           </button>
         );
       })}

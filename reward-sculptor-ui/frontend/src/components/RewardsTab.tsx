@@ -18,6 +18,7 @@ import {
 } from "@/hooks/useRewards";
 import { ApiError, getMission } from "@/lib/api";
 import { qk } from "@/lib/queryKeys";
+import { stageLabel } from "@/lib/stageDisplay";
 import type {
   MissionDetail,
   MissionSummary,
@@ -382,12 +383,12 @@ function RewardsScopeSelector({
             {missionStages.map(({ mission, stages }) =>
               stages.length > 0 ? (
                 <optgroup key={mission.mission_slug} label={mission.mission_slug}>
-                  {stages.map((s) => (
+                  {stages.map((s, idx) => (
                     <option
                       key={`${mission.mission_slug}/${s.name}`}
                       value={`${mission.mission_slug}/${s.name}`}
                     >
-                      {s.name}
+                      {stageLabel(s, idx + 1)}. {s.name}{s.status === "superseded" ? " (superseded)" : ""}
                     </option>
                   ))}
                 </optgroup>
