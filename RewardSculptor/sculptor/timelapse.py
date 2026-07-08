@@ -971,6 +971,15 @@ def build_mission_report(
     mission_dir = Path(mission_dir).resolve()
     mission = load_mission(mission_dir)
 
+    # §mission-persistence increment 1: this loop is status-agnostic by
+    # design — it walks EVERY entry in `mission.stages`, including ones
+    # marked "superseded" (retained after a redecomposition splice, see
+    # `sculpt._maybe_redecompose_and_splice`). A superseded stage has a
+    # real on-disk stage_dir with real trained iterations (that's the
+    # whole point of retaining it instead of discarding it), so
+    # `_collect_stage_data` picks up its footage/metrics the same as
+    # any other stage — no special-casing needed, and nothing here
+    # raises on a superseded stage's presence.
     stage_data: dict[str, _StageReportData] = {}
     for stage in mission.stages:
         try:

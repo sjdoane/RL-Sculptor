@@ -48,6 +48,7 @@ def generate_stage_metrics(
     client: Any = None,
     n_candidates: int = 1,
     on_event: Optional[Callable[[dict[str, Any]], None]] = None,
+    only_stages: Optional[list[str]] = None,
 ) -> dict[str, Any]:
     """Generate one objective metric per pending stage that has no
     `steering_metric` yet. Full trust pipeline per stage (L0 gates +
@@ -56,6 +57,22 @@ def generate_stage_metrics(
     mission-level fallback. Mutates `mission` in place; the caller
     re-saves. Never raises for a single stage's failure — the mission
     must stay runnable on fallbacks.
+
+    `only_stages` (§mission-persistence increment 1): when given, only
+    stages whose name is in the list are processed, and — for those
+    named stages ONLY — the "skip if steering_metric already set" guard
+    is BYPASSED, so a user can explicitly trigger regeneration of a
+    stage that already has a metric. The "skip if already succeeded"
+    guard still applies (never regenerate the metric a stage already
+    won on). Stages not named in `only_stages` are left untouched (not
+    even reported as "skipped" — they were never candidates).
+
+    When `only_stages` is None (the default, whole-mission pass),
+    "superseded" stages are also skipped — they are terminal and will
+    never train again, so generating a metric for one wastes an LLM
+    call. A user-targeted `only_stages` regenerate is still allowed to
+    hit a superseded stage (e.g. to refresh what a report shows), which
+    is why that check is IN the default branch, not a blanket guard.
 
     Returns `{"generated": [...], "rejected": [...], "skipped": [...]}`
     where each entry is `{stage, reason?}`.
@@ -78,11 +95,20 @@ def generate_stage_metrics(
     report: dict[str, list[dict[str, Any]]] = {
         "generated": [], "rejected": [], "skipped": [],
     }
+    only_set = set(only_stages) if only_stages is not None else None
     for stage in mission.stages:
-        if getattr(stage, "steering_metric", None):
-            report["skipped"].append(
-                {"stage": stage.name, "reason": "steering_metric already set"})
-            continue
+        if only_set is not None:
+            if stage.name not in only_set:
+                continue
+        else:
+            if getattr(stage, "steering_metric", None):
+                report["skipped"].append(
+                    {"stage": stage.name, "reason": "steering_metric already set"})
+                continue
+            if getattr(stage, "status", "pending") == "superseded":
+                report["skipped"].append(
+                    {"stage": stage.name, "reason": "stage superseded"})
+                continue
         if getattr(stage, "status", "pending") == "succeeded":
             report["skipped"].append(
                 {"stage": stage.name, "reason": "stage already succeeded"})

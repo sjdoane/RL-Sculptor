@@ -130,3 +130,78 @@ def test_missing_mission_dir_raises(tmp_path):
     m.mission_dir = None
     with pytest.raises(RuntimeError, match="mission_dir is None"):
         generate_stage_metrics(m)
+
+
+# ── §mission-persistence increment 1: only_stages ──────────────────────
+def test_only_stages_bypasses_existing_metric_guard_for_named_stage(
+    tmp_path, monkeypatch,
+):
+    """A user-triggered regenerate targeting a specific stage must
+    overwrite its EXISTING steering_metric (the normal whole-mission
+    pass would skip it) while leaving every other stage untouched —
+    not even reported as skipped, since it was never a candidate."""
+    calls: list[str] = []
+
+    def fake_gen(goal, out_dir, **kw):
+        calls.append(Path(out_dir).name)
+        return {"accepted": True}
+
+    import sculptor.eval as ev
+    monkeypatch.setattr(ev, "generate_objective_metric", fake_gen)
+
+    s1 = _mk_stage("has_metric", steering_metric="g1_kick")
+    s2 = _mk_stage("other_stage", steering_metric="g1_stand")
+    m = _mk_mission(tmp_path, [s1, s2])
+
+    report = generate_stage_metrics(m, only_stages=["has_metric"])
+
+    # Only the named stage was regenerated.
+    assert calls == ["has_metric"]
+    assert report["generated"] == [
+        {"stage": "has_metric", "ref": "stage_metrics/has_metric/metric.py"}]
+    assert m.stages[0].steering_metric == "stage_metrics/has_metric/metric.py"
+    # The un-named stage is completely untouched — not regenerated,
+    # not reported as skipped.
+    assert m.stages[1].steering_metric == "g1_stand"
+    assert report["skipped"] == []
+    assert report["rejected"] == []
+
+
+def test_only_stages_still_skips_succeeded_stage(tmp_path, monkeypatch):
+    """Even an explicit only_stages regenerate must not touch a stage
+    that already succeeded — that guard is never bypassed."""
+    def fake_gen(goal, out_dir, **kw):  # pragma: no cover — must not run
+        raise AssertionError("generation must not run for a succeeded stage")
+
+    import sculptor.eval as ev
+    monkeypatch.setattr(ev, "generate_objective_metric", fake_gen)
+
+    s1 = _mk_stage("done_stage", steering_metric="g1_kick")
+    s1.status = "succeeded"
+    m = _mk_mission(tmp_path, [s1])
+
+    report = generate_stage_metrics(m, only_stages=["done_stage"])
+    assert report["generated"] == []
+    assert report["skipped"] == [
+        {"stage": "done_stage", "reason": "stage already succeeded"}]
+    assert m.stages[0].steering_metric == "g1_kick"
+
+
+def test_default_pass_skips_superseded_stage(tmp_path, monkeypatch):
+    """The default whole-mission pass (only_stages=None) must skip a
+    superseded stage — it is terminal and will never train again, so
+    generating a metric for it wastes an LLM call."""
+    def fake_gen(goal, out_dir, **kw):  # pragma: no cover — must not run
+        raise AssertionError("generation must not run for a superseded stage")
+
+    import sculptor.eval as ev
+    monkeypatch.setattr(ev, "generate_objective_metric", fake_gen)
+
+    s1 = _mk_stage("old_parent")
+    s1.status = "superseded"
+    m = _mk_mission(tmp_path, [s1])
+
+    report = generate_stage_metrics(m)
+    assert report["generated"] == []
+    assert report["skipped"] == [
+        {"stage": "old_parent", "reason": "stage superseded"}]

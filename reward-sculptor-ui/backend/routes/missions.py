@@ -53,7 +53,7 @@ import contextlib
 import json
 import re
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Annotated, Awaitable, Callable, Optional
 
 from fastapi import (
     APIRouter,
@@ -64,6 +64,7 @@ from fastapi import (
     status,
 )
 from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel, ConfigDict, Field
 
 from backend.models.kg import JobDetail, JobSummary
 from backend.models.mission import (
@@ -227,6 +228,16 @@ def create_mission(
             body.run_defaults.model_dump(exclude_none=False)
             if body.run_defaults is not None else None
         )
+        # §mission-persistence increment 2: stage_metric_required lives
+        # on CreateMissionRequest (a mission-creation-time policy, not
+        # a per-launch RunMissionRequest knob), but `run_mission`'s 409
+        # guard reads it off `mission.run_defaults` — the one place
+        # already plumbed through to the persisted mission.json. Stash
+        # it there even when the caller didn't otherwise set any
+        # run_defaults.
+        if body.stage_metric_required:
+            run_defaults_dict = dict(run_defaults_dict or {})
+            run_defaults_dict["stage_metric_required"] = True
         job = jobs.submit(
             kind="mission_decompose",
             project_slug=slug,
@@ -373,15 +384,22 @@ def run_mission(
             type_="/problems/not-found",
         )
 
-    # Concurrent-mission guard: at most one active decompose/execute
-    # PER (project, mission) pair.
-    if jobs.active_mission_job(slug, mission_slug) is not None:
+    # Concurrent-mission guard: at most one active mission-scoped job
+    # (decompose, execute, a per-stage run, or a metric regenerate)
+    # PER (project, mission) pair. Widened from decompose/execute-only
+    # to also catch a live `mission_stage_metric_regen` for this
+    # mission — both it and `mission_execute` end in a non-atomic
+    # `save_mission` write to the same mission.json, so letting
+    # `mission_execute` start mid-regenerate risks a last-write-wins
+    # clobber of whichever one finishes first.
+    active_job = jobs.active_mission_scoped_job(slug, mission_slug)
+    if active_job is not None:
         return _problem(
             status.HTTP_409_CONFLICT,
             "mission has active job",
             detail=(
                 f"mission {mission_slug!r} already has an active "
-                f"decompose or execute job. Wait for it to finish "
+                f"{active_job.kind} job. Wait for it to finish "
                 f"or call POST /jobs/{{id}}/stop to cancel."
             ),
             type_="/problems/state-conflict",
@@ -409,6 +427,48 @@ def run_mission(
     if body is not None:
         # Pydantic model_dump excludes unset fields with exclude_none.
         run_kwargs = body.model_dump(exclude_none=False)
+
+    # §mission-persistence increment 2: stage_metric_required guard.
+    # Persisted at creation time onto mission.run_defaults (see
+    # create_mission). Blocks the run while any RUNNABLE stage
+    # (pending/training — the ones that will actually execute) has no
+    # steering_metric, unless this launch sets proceed_blind. A
+    # succeeded/failed/skipped/superseded stage is never going to run
+    # again, so it's exempt regardless of its metric.
+    proceed_blind = bool(body.proceed_blind) if body is not None else False
+    if not proceed_blind:
+        from sculptor.mission import load_mission, MissionValidationError
+
+        try:
+            mission = load_mission(
+                mission_store.mission_json_path(project_dir, mission_slug)
+            )
+        except (MissionValidationError, Exception):  # noqa: BLE001
+            mission = None
+        if mission is not None:
+            run_defaults = mission.run_defaults or {}
+            if run_defaults.get("stage_metric_required"):
+                missing = [
+                    s.name for s in mission.stages
+                    if s.status in ("pending", "training")
+                    and not getattr(s, "steering_metric", None)
+                ]
+                if missing:
+                    return _problem(
+                        status.HTTP_409_CONFLICT,
+                        "stage metrics missing",
+                        detail=(
+                            f"mission {mission_slug!r} was created with "
+                            f"stage_metric_required=True and the "
+                            f"following runnable stage(s) have no "
+                            f"steering metric: {missing}. Regenerate "
+                            f"their metrics, or resend this request "
+                            f"with proceed_blind=true to run without "
+                            f"per-stage metrics."
+                        ),
+                        type_="/problems/stage-metrics-missing",
+                        missing_stages=missing,
+                    )
 
     job = jobs.submit(
         kind="mission_execute",
@@ -709,6 +769,235 @@ def get_stage_env_spec(
     return StageEnvSpecInfo(
         active=current is not None, current=current, versions=versions,
     )
+
+
+# ── GET .../stages/{stage}/iterations/{i}/checkpoint ───────────────────
+# §mission-persistence increment 2: disk-truth checkpoint download,
+# same traversal guard as the rollout endpoint above (_stage_dir_or_404
+# validates slug/mission_slug/stage; `i` is a path int so FastAPI
+# already rejects non-integer segments before we see it).
+@router.get(
+    "/projects/{slug}/missions/{mission_slug}/stages/{stage}/iterations/{i}/checkpoint",
+    response_class=FileResponse,
+    responses={
+        200: {"content": {"application/octet-stream": {}}},
+        404: {"model": ProblemDetail},
+    },
+)
+def get_stage_iter_checkpoint(
+    slug: str,
+    mission_slug: str,
+    stage: str,
+    i: int,
+    store: ProjectStore = Depends(get_store),
+) -> Any:
+    """Disk-truth checkpoint download for one stage iteration — no
+    JobManager entry required. Mirrors `get_stage_iter_rollout`."""
+    resolved = _stage_dir_or_404(store, slug, mission_slug, stage)
+    if isinstance(resolved, JSONResponse):
+        return resolved
+    stage_dir = resolved
+
+    iter_dir = stage_dir / "runs" / f"iter_{i}"
+    checkpoint_path = _find_checkpoint(iter_dir)
+    if checkpoint_path is None:
+        return _problem(
+            status.HTTP_404_NOT_FOUND,
+            "checkpoint not available",
+            detail=(
+                f"iter {i} of stage {stage!r} has no checkpoint file "
+                "(training may not have reached a save point, or the "
+                "iter errored before saving)"
+            ),
+            type_="/problems/not-found",
+        )
+    download_name = (
+        f"{mission_slug}_{stage}_iter{i}_checkpoint{checkpoint_path.suffix}"
+    )
+    return FileResponse(
+        checkpoint_path,
+        media_type="application/octet-stream",
+        filename=download_name,
+    )
+
+
+# ── POST .../stages/{stage}/metric/regenerate ───────────────────────────
+class _RegenerateMetricBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    n_candidates: Annotated[int, Field(ge=1, le=4)] = 1
+
+
+@router.post(
+    "/projects/{slug}/missions/{mission_slug}/stages/{stage}/metric/regenerate",
+    response_model=JobDetail,
+    status_code=status.HTTP_202_ACCEPTED,
+    responses={
+        404: {"model": ProblemDetail},
+        409: {"model": ProblemDetail},
+    },
+)
+def regenerate_stage_metric(
+    slug: str,
+    mission_slug: str,
+    stage: str,
+    request: Request,
+    body: Optional[_RegenerateMetricBody] = None,
+    store: ProjectStore = Depends(get_store),
+) -> Any:
+    """User-triggered regeneration of ONE stage's steering metric.
+
+    409s if the mission has an active mission_execute / mission_decompose
+    job, OR if another mission_stage_metric_regen for this SAME mission
+    is already in flight (two overlapping regenerates both end in a
+    non-atomic `save_mission` write — the second clobbers the first),
+    OR if the named stage is currently the one training (a live
+    mission_stage_run child job for this (mission_slug, stage) pair) —
+    regenerating the metric out from under an in-flight stage would
+    race with the orchestrator's own read of `steering_metric`.
+
+    Runs in-process via `generate_stage_metrics(only_stages=[stage])`
+    (same call `_do_stage_metrics` makes at decompose time), which
+    BYPASSES the "skip if steering_metric already set" guard for this
+    one named stage — that's the whole point of a user-requested
+    regenerate. Emits the same `mission_stage_metrics_*` /
+    `stage_metric_gen_*` event types as the decompose-time pass so any
+    UI already listening on the mission WS for those types picks this
+    up too (job kind differs — mission_stage_metric_regen — so the UI
+    can also target this job specifically if it wants a dedicated
+    progress surface).
+    """
+    jobs: JobManager = request.app.state.job_manager
+    project_dir = _project_dir(store, slug)
+    if project_dir is None:
+        return _problem(
+            status.HTTP_404_NOT_FOUND,
+            "project not found",
+            detail=f"no project with slug {slug!r}",
+            type_="/problems/not-found",
+        )
+    resolved = _stage_dir_or_404(store, slug, mission_slug, stage)
+    if isinstance(resolved, JSONResponse):
+        return resolved
+
+    if jobs.active_mission_job(slug, mission_slug) is not None:
+        return _problem(
+            status.HTTP_409_CONFLICT,
+            "mission has active job",
+            detail=(
+                f"mission {mission_slug!r} has an active decompose or "
+                f"execute job; wait for it to finish before "
+                f"regenerating a stage metric."
+            ),
+            type_="/problems/state-conflict",
+        )
+    # Widened (previously unchecked): also 409 against another LIVE
+    # `mission_stage_metric_regen` for this same mission (even a
+    # different stage). Two concurrent regenerate calls both read+
+    # mutate the same in-memory `Mission` from `load_mission` and both
+    # end in a non-atomic `save_mission` write — the second writer
+    # silently clobbers the first's result.
+    other_regen = jobs.active_mission_metric_regen_job(slug, mission_slug)
+    if other_regen is not None:
+        return _problem(
+            status.HTTP_409_CONFLICT,
+            "mission has active job",
+            detail=(
+                f"mission {mission_slug!r} already has an active "
+                f"metric regenerate job (stage "
+                f"{other_regen.params.get('stage_name')!r}); wait for "
+                f"it to finish before starting another."
+            ),
+            type_="/problems/state-conflict",
+        )
+    # A live mission_stage_run child job for THIS stage means it's
+    # currently training — regenerating its metric mid-flight would
+    # race the orchestrator's read of steering_metric.
+    for j in jobs.list(kind="mission_stage_run", project_slug=slug):
+        if (
+            j.status in ("running", "queued")
+            and j.params.get("mission_slug") == mission_slug
+            and j.params.get("stage_name") == stage
+        ):
+            return _problem(
+                status.HTTP_409_CONFLICT,
+                "stage is training",
+                detail=(
+                    f"stage {stage!r} of mission {mission_slug!r} is "
+                    f"currently training; wait for it to finish before "
+                    f"regenerating its metric."
+                ),
+                type_="/problems/state-conflict",
+            )
+
+    n_candidates = body.n_candidates if body is not None else 1
+
+    def _do_regen() -> Callable[[Any, asyncio.Event], Awaitable[dict[str, Any]]]:
+        async def _runner(job: Any, cancel: asyncio.Event) -> dict[str, Any]:
+            from sculptor.adapters.base import load_adapter
+            from sculptor.llm import set_llm_log_dir
+            from sculptor.mission import load_mission, save_mission
+            from sculptor.mission_metrics import generate_stage_metrics
+
+            md = mission_store.mission_dir(project_dir, mission_slug)
+
+            def _emit_metric_ev(ev: dict[str, Any]) -> None:
+                try:
+                    if isinstance(ev, dict) and ev.get("type"):
+                        job.emit({**ev, "mission_slug": mission_slug})
+                except Exception:  # noqa: BLE001 — progress is advisory
+                    pass
+
+            def _do() -> dict[str, Any]:
+                mission = load_mission(md)
+                adapter = load_adapter(project_dir / "config.toml")
+                set_llm_log_dir(md)
+                report = generate_stage_metrics(
+                    mission,
+                    robot_hint=getattr(adapter, "task_id", None),
+                    n_candidates=n_candidates,
+                    on_event=_emit_metric_ev,
+                    only_stages=[stage],
+                )
+                # §step 4b: does generate_stage_metrics persist
+                # mission.json itself? No — it mutates `mission` in
+                # place and documents "the caller re-saves" (see its
+                # docstring). Mirror _do_stage_metrics's atomic-enough
+                # save (Mission.save_mission — same call the decompose
+                # path uses; not a tmp+rename atomic write, but this
+                # matches EVERY existing mission.json writer in this
+                # codebase, decompose included).
+                save_mission(mission, md)
+                return report
+
+            job.emit({
+                "type": "mission_stage_metrics_started",
+                "mission_slug": mission_slug,
+                "n_stages": 1,
+                "only_stages": [stage],
+            })
+            report = await asyncio.to_thread(_do)
+            job.emit({
+                "type": "mission_stage_metrics_completed",
+                "mission_slug": mission_slug,
+                **{k: report.get(k) for k in
+                   ("generated", "rejected", "skipped")},
+            })
+            return report
+
+        return _runner
+
+    job = jobs.submit(
+        kind="mission_stage_metric_regen",
+        project_slug=slug,
+        fn=_do_regen(),
+        params={
+            "mission_slug": mission_slug,
+            "stage_name": stage,
+            "n_candidates": n_candidates,
+        },
+    )
+    return job.to_detail()
 
 
 # ── WS /ws/projects/{slug}/missions/{mission_slug}/events ────────────

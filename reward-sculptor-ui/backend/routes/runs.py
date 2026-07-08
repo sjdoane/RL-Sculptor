@@ -37,6 +37,7 @@ from backend.models.run import (
     RunParams,
     RunSummary,
 )
+from backend.services import mission_store
 from backend.services.job_manager import Job, JobManager
 from backend.services.project_store import ProjectStore
 from backend.services.run_manager import (
@@ -189,6 +190,124 @@ def _run_summary(job: Job) -> RunSummary:
     )
 
 
+# ── §mission-persistence increment 2: disk-reconstructed run rows ─────
+def _find_stage_checkpoint(iter_dir: Path) -> Optional[Path]:
+    for name in ("checkpoint.pt", "checkpoint.zip"):
+        p = iter_dir / name
+        if p.is_file() and p.stat().st_size > 0:
+            return p
+    return None
+
+
+def _parse_iso_dt(s: Any) -> Optional[Any]:
+    if not isinstance(s, str) or not s:
+        return None
+    from datetime import datetime as _dt, timezone as _tz
+
+    try:
+        dt = _dt.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=_tz.utc)
+        return dt
+    except ValueError:
+        return None
+
+
+def _synthesize_disk_run_rows(
+    project_dir: Path, project_slug: str, jobs: JobManager,
+) -> list[RunSummary]:
+    """Reconstruct `RunSummary` rows for mission stages that have
+    trained iterations on disk but no LIVE `mission_stage_run` job —
+    the gap `routes/missions.py`'s module docstring calls out: a
+    completed/failed stage becomes unreachable via the in-memory job
+    endpoints after a backend restart (JobManager is purely in-memory;
+    `list_runs` previously returned NOTHING for such rows once the
+    process restarted, silently dropping the Training tab's history).
+
+    Reuses `mission_store.iter_unioned_stages_for_project` — the exact
+    same disk-union stage list `GET .../missions/{slug}` returns — so
+    a stage's position / display_label / failure_reason here always
+    agrees with the Missions tab.
+
+    Dedup: a stage with ANY resident `mission_stage_run` job — running,
+    queued, OR terminal (completed/errored/stopped) — is skipped. A
+    terminal job stays resident in JobManager until backend restart,
+    and `list_runs` already emits a row for it via the live-job branch
+    above (`stage_runs` / `_run_summary`); including the stage again
+    here via `_synthesize_disk_run_rows` would double it. Only a stage
+    with NO resident job at all for that (mission_slug, stage_name)
+    pair, but at least one `runs/iter_*` dir on disk, gets a synthetic
+    row with `run_id="disk:<mission_slug>/<stage_name>"`.
+    """
+    live_stage_keys: set[tuple[str, str]] = set()
+    for j in jobs.list(kind="mission_stage_run", project_slug=project_slug):
+        ms = j.params.get("mission_slug")
+        sn = j.params.get("stage_name")
+        if isinstance(ms, str) and isinstance(sn, str):
+            live_stage_keys.add((ms, sn))
+
+    out: list[RunSummary] = []
+    for mission_slug, mission, stages in mission_store.iter_unioned_stages_for_project(
+        project_dir,
+    ):
+        for idx, s in enumerate(stages):
+            if (mission_slug, s.name) in live_stage_keys:
+                continue
+            stage_dir = mission_store.mission_dir(project_dir, mission_slug) / "stages" / s.name
+            runs_root = stage_dir / "runs"
+            if not runs_root.is_dir():
+                continue
+            iter_dirs = sorted(
+                (d for d in runs_root.iterdir() if d.is_dir() and d.name.startswith("iter_")),
+                key=lambda d: d.name,
+            )
+            if not iter_dirs:
+                continue
+            completed = sum(1 for d in iter_dirs if _find_stage_checkpoint(d) is not None)
+
+            if s.status == "succeeded":
+                run_status = "completed"
+                error = None
+            elif s.status in ("failed", "superseded"):
+                run_status = "errored"
+                error = s.failure_reason
+            elif s.status == "training":
+                # Stage record claims "training" but there's no LIVE
+                # job for it — the backend restarted (or crashed) mid-
+                # stage. Honest answer: interrupted, not still running.
+                run_status = "errored"
+                error = "interrupted"
+            else:
+                # pending / skipped with disk artifacts (e.g. a
+                # redecomposed-away stage that got a few iters in
+                # before being superseded but somehow kept "pending" —
+                # defensive fallback, shouldn't normally happen).
+                run_status = "errored"
+                error = s.failure_reason or "interrupted"
+
+            out.append(RunSummary(
+                run_id=f"disk:{mission_slug}/{s.name}",
+                project_slug=project_slug,
+                status=run_status,  # type: ignore[arg-type]
+                behavior_goal=s.goal_text,
+                iterations_requested=s.max_iterations or 0,
+                iterations_completed=completed,
+                current_iter_index=None,
+                primary_metric_history=[],
+                fitness_history=[],
+                started_at=_parse_iso_dt(s.started_at),
+                ended_at=_parse_iso_dt(s.finished_at),
+                error=error,
+                kind="mission_stage_run",
+                parent_id=None,
+                mission_slug=mission_slug,
+                stage_name=s.name,
+                stage_index=idx,
+                mode=None,
+            ))
+    return out
+
+
 # ── POST /projects/{slug}/runs ────────────────────────────────────────
 @router.post(
     "/projects/{slug}/runs",
@@ -263,7 +382,8 @@ def list_runs(
     store: ProjectStore = Depends(get_store),
     jobs: JobManager = Depends(get_job_manager),
 ) -> Any:
-    if store.get(slug) is None:
+    detail = store.get(slug)
+    if detail is None:
         return _problem(
             status.HTTP_404_NOT_FOUND, "project not found",
             detail=f"no project with slug {slug!r}", type_="/problems/not-found",
@@ -273,7 +393,15 @@ def list_runs(
     # under their parent mission.
     sculpt_runs = jobs.list(kind="sculpt_run", project_slug=slug)
     stage_runs = jobs.list(kind="mission_stage_run", project_slug=slug)
-    return [_run_summary(j) for j in (*sculpt_runs, *stage_runs)]
+    rows = [_run_summary(j) for j in (*sculpt_runs, *stage_runs)]
+    # §mission-persistence increment 2: append disk-reconstructed rows
+    # for stages with trained iterations but no live JobManager entry
+    # (backend restart, or the mission moved past that stage). Purely
+    # additive — never replaces a live row (see the dedup inside).
+    rows.extend(_synthesize_disk_run_rows(
+        Path(detail.project_dir), slug, jobs,
+    ))
+    return rows
 
 
 # ── GET /projects/{slug}/runs/{run_id} ────────────────────────────────

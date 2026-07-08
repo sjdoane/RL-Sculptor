@@ -1851,8 +1851,12 @@ def test_redecompose_replaces_failed_stage_with_substages(
     tmp_path: Path, monkeypatch, stub_adapter,
 ):
     """Stage 0 fails criterion → Ship 17 splices 3 sub-stages in.
-    Verify `mission.stages` mutated correctly and the FIRST sub-stage
-    inherits the failed stage's parent."""
+
+    §mission-persistence increment 1: the splice RETAINS the failed
+    stage (marked "superseded") in place, with sub-stages inserted
+    immediately after it — it is no longer discarded. Verify
+    `mission.stages` reflects that shape and `current_stage_idx` lands
+    on the first sub-stage (one slot past the retained parent)."""
     from sculptor import sculpt as sculpt_mod
 
     m = _make_mission(tmp_path, n_stages=2)
@@ -1881,23 +1885,30 @@ def test_redecompose_replaces_failed_stage_with_substages(
         m, adapter_short_name="mjlab", on_event=events.append,
     )
 
-    # Mission completed: sub-stages 0,1,2 + original stage_1.
+    # Mission completed: retained (superseded) stage_0 + sub-stages
+    # 0,1,2 + original stage_1.
     assert result.completed is True, (
         f"expected mission to complete via sub-stages; halted_reason="
         f"{result.halted_reason!r}, halted_at={result.halted_at_stage!r}"
     )
-    # Mission.stages now has 3 sub-stages + stage_1 = 4.
+    # Mission.stages now has stage_0 (retained) + 3 sub-stages + stage_1 = 5.
     assert [s.name for s in m.stages] == [
+        "stage_0",
         "stage_0__r1_0", "stage_0__r1_1", "stage_0__r1_2", "stage_1",
     ]
+    # The retained parent is superseded, not discarded — and carries
+    # its failure reason.
+    assert m.stages[0].status == "superseded"
+    assert m.stages[0].failure_reason == "criterion_not_met"
+    assert m.stages[0].failure_detail
     # First sub-stage inherits stage_0's parent (None).
-    assert m.stages[0].parent_stage is None
+    assert m.stages[1].parent_stage is None
     # Linear parent chain inside the sub-stage block.
-    assert m.stages[1].parent_stage == "stage_0__r1_0"
-    assert m.stages[2].parent_stage == "stage_0__r1_1"
+    assert m.stages[2].parent_stage == "stage_0__r1_0"
+    assert m.stages[3].parent_stage == "stage_0__r1_1"
     # Downstream child (stage_1, formerly parent="stage_0") now points
     # at the LAST sub-stage.
-    assert m.stages[3].parent_stage == "stage_0__r1_2"
+    assert m.stages[4].parent_stage == "stage_0__r1_2"
 
 
 def test_redecompose_substages_have_attempts_set_to_1(
@@ -2296,6 +2307,133 @@ def test_redecompose_rolls_back_in_memory_on_save_failure(
     assert [s.name for s in m.stages] == ["stage_0", "stage_1"]
     # Original downstream child still points at the failed stage's name.
     assert m.stages[1].parent_stage == "stage_0"
+    # Retention-shape rollback: the failed stage's status flip to
+    # "superseded" is undone and the loop pointer is back on it.
+    assert m.stages[0].status == "failed"
+    assert m.current_stage_idx == 0
+
+
+def test_redecompose_metric_inheritance_fills_missing_child_metric(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """§mission-persistence increment 1: a sub-stage left without its
+    own `steering_metric` by the redecomposer inherits the superseded
+    parent's, and `stage_metric_inherited` fires naming the source
+    stage + every stage it filled in. A sub-stage that already has its
+    own metric is left alone."""
+    from sculptor import sculpt as sculpt_mod
+    from sculptor.decompose import _RedecompositionModel, _StageModel
+
+    m = _make_mission(tmp_path, n_stages=1)
+    m.stages[0].steering_metric = "g1_kick"
+    save_mission(m, Path(m.mission_dir))
+
+    call_count = {"n": 0}
+
+    def run(**kw):
+        call_count["n"] += 1
+        return _fake_sculpt_run_factory(
+            metric=0.3 if call_count["n"] == 1 else 0.9,
+        )(**kw)
+
+    monkeypatch.setattr(sculpt_mod, "sculpt_run", run)
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
+    )
+
+    # Build a redecompose response with 2 sub-stages; construct the Stage
+    # objects `redecompose_stage` will return directly so we can control
+    # steering_metric independent of the `_StageModel` inheritance done
+    # in decompose.py itself (that inheritance is unconditional and would
+    # mask the sculpt.py-level backstop this test targets).
+    response = _make_redecompose_response("stage_0", n_sub=2)
+
+    def fake_redecompose_stage(mission, idx, **kw):
+        from sculptor.mission import Stage as _Stage
+        failed = mission.stages[idx]
+        sub0 = _Stage(
+            name="stage_0__r1_0", goal_text="sub 0",
+            success_criterion="metric > 0.0", max_iterations=2,
+            parent_stage=failed.parent_stage,
+            reward_seed_prompt="seed 0",
+            steering_metric=None,  # missing — should inherit
+            redecomposition_attempts=1,
+        )
+        sub1 = _Stage(
+            name="stage_0__r1_1", goal_text="sub 1",
+            success_criterion="metric > 0.5", max_iterations=2,
+            parent_stage="stage_0__r1_0",
+            reward_seed_prompt="seed 1",
+            steering_metric="g1_stand",  # already set — must NOT change
+            redecomposition_attempts=1,
+        )
+        return [sub0, sub1]
+
+    # `_maybe_redecompose_and_splice` imports `redecompose_stage` locally
+    # from `sculptor.decompose` on every call — patch it at its source
+    # module (same pattern as `_stub_claude_redecompose` uses for
+    # `_parse_with_retry`), not on `sculptor.sculpt`.
+    import sculptor.decompose as dmod
+    monkeypatch.setattr(dmod, "redecompose_stage", fake_redecompose_stage)
+
+    events: list[dict] = []
+    result = sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab", on_event=events.append,
+    )
+
+    assert result.completed is True
+    inherited = [e for e in events if e.get("type") == "stage_metric_inherited"]
+    assert len(inherited) == 1
+    assert inherited[0]["from_stage"] == "stage_0"
+    assert inherited[0]["to_stages"] == ["stage_0__r1_0"]
+
+    sub0 = m.stage_by_name("stage_0__r1_0")
+    sub1 = m.stage_by_name("stage_0__r1_1")
+    assert sub0.steering_metric == "g1_kick"  # inherited
+    assert sub1.steering_metric == "g1_stand"  # untouched
+
+
+def test_mission_loop_skips_superseded_stage_at_resume(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """§mission-persistence increment 1 defensive guard: if
+    `current_stage_idx` lands on a superseded stage (e.g. a hand-edited
+    or stale mission.json), the while-loop advances past it without
+    executing `_run_one_stage` or recording a StageResult for it."""
+    from sculptor import sculpt as sculpt_mod
+
+    m = _make_mission(tmp_path, n_stages=2)
+    m.stages[0].status = "superseded"
+    m.stages[0].failure_reason = "criterion_not_met"
+    m.current_stage_idx = 0  # deliberately pointed AT the superseded stage
+    save_mission(m, Path(m.mission_dir))
+
+    run_calls: list[str] = []
+
+    def run(*, config_path, **kw):
+        run_calls.append(Path(config_path).parent.name)
+        return _fake_sculpt_run_factory(metric=0.9)(config_path=config_path, **kw)
+
+    monkeypatch.setattr(sculpt_mod, "sculpt_run", run)
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
+    )
+
+    events: list[dict] = []
+    result = sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab", on_event=events.append,
+    )
+
+    assert result.completed is True
+    # Only stage_1 actually trained — stage_0 (superseded) never ran.
+    assert run_calls == ["stage_1"]
+    assert [r.stage_name for r in result.stage_results] == ["stage_1"]
+    skip_events = [
+        e for e in events
+        if e.get("type") == "stage_skipped" and e.get("reason") == "superseded"
+    ]
+    assert len(skip_events) == 1
+    assert skip_events[0]["stage_name"] == "stage_0"
 
 
 def test_resolve_unique_name_caps_collision_loop():
@@ -2446,8 +2584,10 @@ def test_redecompose_persists_to_mission_json_atomically(
     tmp_path: Path, monkeypatch, stub_adapter,
 ):
     """After splice, mission.json on disk reflects the new stage list
-    with current_stage_idx pointing AT the first sub-stage (so a
-    crash-resume picks up correctly)."""
+    — RETAINED superseded parent + sub-stages (§mission-persistence
+    increment 1) — with current_stage_idx pointing AT the first
+    sub-stage (one slot past the retained parent) so a crash-resume
+    picks up correctly."""
     from sculptor import sculpt as sculpt_mod
 
     m = _make_mission(tmp_path, n_stages=1)
@@ -2481,11 +2621,13 @@ def test_redecompose_persists_to_mission_json_atomically(
 
     assert len(json_after_splice) == 1
     snapshot = json_after_splice[0]
-    # Stage list reflects the splice.
+    # Stage list reflects the splice: retained superseded parent + subs.
     names = [s["name"] for s in snapshot["stages"]]
-    assert names == ["stage_0__r1_0", "stage_0__r1_1"]
-    # current_stage_idx points at the first sub-stage (resume safety).
-    assert snapshot["current_stage_idx"] == 0
+    assert names == ["stage_0", "stage_0__r1_0", "stage_0__r1_1"]
+    assert snapshot["stages"][0]["status"] == "superseded"
+    # current_stage_idx points at the first sub-stage (one slot past the
+    # retained parent) — resume safety.
+    assert snapshot["current_stage_idx"] == 1
 
 
 # ── §Ship-19d Goal A + Goal B ────────────────────────────────────────
@@ -3046,6 +3188,60 @@ def test_stage_reference_rsi_roundtrips_mission_json(tmp_path: Path):
     save_mission(m, Path(m.mission_dir))
     m2 = load_mission(Path(m.mission_dir))
     assert m2.stages[0].needs_reference_rsi is True
+
+
+def test_stage_failure_reason_and_detail_roundtrip_mission_json(tmp_path: Path):
+    """§mission-persistence increment 1: failure_reason/failure_detail
+    survive save→load, same as any other Stage field."""
+    from sculptor.mission import load_mission, save_mission
+
+    m = _make_mission(tmp_path / "rt", n_stages=1)
+    m.stages[0].failure_reason = "criterion_not_met"
+    m.stages[0].failure_detail = "success_criterion 'metric > 0.5' not met"
+    save_mission(m, Path(m.mission_dir))
+    m2 = load_mission(Path(m.mission_dir))
+    assert m2.stages[0].failure_reason == "criterion_not_met"
+    assert m2.stages[0].failure_detail == (
+        "success_criterion 'metric > 0.5' not met")
+
+
+def test_stage_superseded_status_roundtrips_mission_json(tmp_path: Path):
+    """The "superseded" StageStatus persists through save→load like any
+    other status value."""
+    from sculptor.mission import load_mission, save_mission
+
+    m = _make_mission(tmp_path / "rt", n_stages=1)
+    m.stages[0].status = "superseded"
+    save_mission(m, Path(m.mission_dir))
+    m2 = load_mission(Path(m.mission_dir))
+    assert m2.stages[0].status == "superseded"
+
+
+def test_load_mission_json_without_new_fields_still_works(tmp_path: Path):
+    """§mission-persistence increment 1: an OLD mission.json written
+    before failure_reason/failure_detail existed (and therefore missing
+    those keys entirely) must still load cleanly, with both fields
+    defaulting to None — via `Stage.from_dict`'s filter-unknown/missing-
+    keys path, same guarantee `needs_reference_rsi` and
+    `effective_max_iterations` already rely on."""
+    import json as _json
+
+    from sculptor.mission import load_mission
+
+    m = _make_mission(tmp_path / "old_fmt", n_stages=1)
+    mission_path = Path(m.mission_dir) / "mission.json"
+    doc = _json.loads(mission_path.read_text(encoding="utf-8"))
+    # Simulate an old file: strip the new keys entirely (they wouldn't
+    # exist at all in a pre-increment-1 mission.json).
+    for stage_doc in doc["stages"]:
+        stage_doc.pop("failure_reason", None)
+        stage_doc.pop("failure_detail", None)
+    mission_path.write_text(_json.dumps(doc, indent=2), encoding="utf-8")
+
+    m2 = load_mission(Path(m.mission_dir))
+    assert m2.stages[0].failure_reason is None
+    assert m2.stages[0].failure_detail is None
+    assert m2.stages[0].status == "pending"
 
 
 def test_redecompose_rsi_flag_per_substage_not_force_inherited(

@@ -3727,12 +3727,12 @@ def mission_run(
         return resolve_stage_metric_ref(ref, mission_dir) if ref else ref
 
     _fitness_fn_cache: dict[str, Callable[[Path], float]] = {}
-    # Skip already-succeeded stages (resume): they won't run, so don't let a
-    # since-deleted generated-metric path on one of them fail-fast the whole
-    # resumed mission (§Ship 38 review L2).
+    # Skip terminal stages that will never run again (resume): succeeded and
+    # superseded — don't let a since-deleted generated-metric path on one of
+    # them fail-fast the whole resumed mission (§Ship 38 review L2).
     for _ref in [_anchored(fitness_metric)] + [
         _anchored(getattr(s, "steering_metric", None)) for s in mission.stages
-        if getattr(s, "status", None) != "succeeded"
+        if getattr(s, "status", None) not in ("succeeded", "superseded")
     ]:
         if _ref and _ref not in _fitness_fn_cache:
             _fitness_fn_cache[_ref] = _resolve_fitness_fn(_ref)  # fail-fast on bad ref
@@ -3828,6 +3828,26 @@ def mission_run(
                     criterion_satisfied=True,
                     last_iter_metric=stage.best_metric,
                 ))
+                mission.current_stage_idx += 1
+                continue
+
+            # §mission-persistence increment 1: defensive resume guard.
+            # By construction `current_stage_idx` is set to land on the
+            # first CHILD immediately after a splice (never on the
+            # retained, superseded parent itself), but a superseded
+            # stage is terminal and must never be executed — advance
+            # past it if somehow encountered (e.g. a hand-edited or
+            # older-format mission.json pointing current_stage_idx at
+            # it, or a future code path that doesn't maintain the
+            # invariant). No StageResult is recorded for it — it
+            # already got one (status="failed") on the run that
+            # superseded it.
+            if stage.status == "superseded":
+                _emit({
+                    "type": "stage_skipped",
+                    "stage_name": stage.name,
+                    "reason": "superseded",
+                })
                 mission.current_stage_idx += 1
                 continue
 
@@ -4983,6 +5003,12 @@ def _fail_stage(
 
     stage.status = "failed"
     stage.finished_at = _utc_now_iso()
+    # §mission-persistence increment 1: persist the failure onto the
+    # stage itself (mission.json), not just the ephemeral StageResult /
+    # provenance.json. Without this the reason was lost the moment the
+    # stage was superseded by redecomposition or the process exited.
+    stage.failure_reason = reason
+    stage.failure_detail = detail
     emit({
         "type": "stage_failed",
         "stage_name": stage.name,
@@ -5168,11 +5194,20 @@ def _maybe_redecompose_and_splice(
 
     Side effects on success:
       * `mission.stages[failed_stage_idx:failed_stage_idx+1]` replaced
-        by sub-stages.
+        by `[failed_stage] + sub_stages` — §mission-persistence
+        increment 1: the failed stage is RETAINED (marked
+        "superseded"), not discarded. Its trained iterations stay
+        visible in every UI view / report; only its runnable slot is
+        taken over by the children.
       * Downstream children's `parent_stage` references re-pointed
         from `failed.name` to the LAST sub-stage's name.
-      * `mission.current_stage_idx` set to `failed_stage_idx` so the
-        while-loop processes the first sub-stage next.
+      * `mission.current_stage_idx` set to `failed_stage_idx + 1` (the
+        first sub-stage now sits one slot AFTER the retained,
+        superseded failed stage) so the while-loop processes the first
+        sub-stage next.
+      * Any sub-stage lacking its own `steering_metric` inherits the
+        failed stage's (metric inheritance); `stage_metric_inherited`
+        emitted when this fires.
       * mission.json persisted atomically.
       * `stage_redecomposed` event emitted.
 
@@ -5346,11 +5381,25 @@ def _maybe_redecompose_and_splice(
             continue
 
         last_sub_name = sub_stages[-1].name
-        # Splice: replace the failed stage with sub-stages, repoint downstream.
-        mission.stages[failed_stage_idx:failed_stage_idx + 1] = sub_stages
+        # Splice: RETAIN the failed stage (in place, ahead of its
+        # children) and insert sub-stages immediately after it.
+        # §mission-persistence increment 1: previously this replaced
+        # the failed stage outright (`mission.stages[idx:idx+1] =
+        # sub_stages`), which discarded a stage that could carry many
+        # hours of trained iterations from every UI view / report the
+        # moment it failed. `failed_stage.status` is only flipped to
+        # "superseded" once the splice is confirmed valid (below) —
+        # NOT here — because `_restore_pre_splice` restores the
+        # ORIGINAL `Stage` objects by reference (`saved_stages =
+        # list(mission.stages)` copies the list, not the objects), so
+        # an in-place status mutation made before a failed validation
+        # attempt would survive the "rollback" and corrupt the retry.
+        mission.stages[failed_stage_idx:failed_stage_idx + 1] = (
+            [failed_stage] + sub_stages
+        )
         repointed = _repoint_downstream_children(
             mission.stages, failed_stage.name, last_sub_name,
-            slice_start=failed_stage_idx + len(sub_stages),
+            slice_start=failed_stage_idx + 1 + len(sub_stages),
         )
         # Validate the spliced mission. If invalid, restore the clean
         # pre-splice graph and retry with the error fed back.
@@ -5378,10 +5427,39 @@ def _maybe_redecompose_and_splice(
         })
         return False
 
+    # §mission-persistence increment 1: the splice validated cleanly —
+    # commit the failed stage to its terminal "superseded" state.
+    # failure_reason / failure_detail were already set by `_fail_stage`
+    # and are left untouched (that's the record of WHY it was
+    # superseded). Terminal + never re-entered by the while-loop.
+    failed_stage.status = "superseded"
+
+    # §mission-persistence increment 1: metric inheritance. A sub-stage
+    # the redecomposer left without its own `steering_metric` inherits
+    # the superseded parent's, so it keeps steering by the same
+    # objective rather than silently falling back to the mission-level
+    # default. (In practice `redecompose_stage` already sets every
+    # sub-stage's steering_metric = failed_stage.steering_metric
+    # unconditionally — see decompose.py — so this is a defense-in-
+    # depth backstop for that behavior changing, not the primary path.)
+    _inherited_to: list[str] = []
+    for _sub in sub_stages:
+        if not getattr(_sub, "steering_metric", None) and failed_stage.steering_metric:
+            _sub.steering_metric = failed_stage.steering_metric
+            _inherited_to.append(_sub.name)
+    if _inherited_to:
+        emit({
+            "type": "stage_metric_inherited",
+            "from_stage": failed_stage.name,
+            "to_stages": _inherited_to,
+        })
+
     # Reviewer-flagged: persist current_stage_idx BEFORE the splice so
     # a crash-resume starts at the first new sub-stage rather than
-    # skipping ahead.
-    mission.current_stage_idx = failed_stage_idx
+    # skipping ahead. §mission-persistence increment 1: the retained,
+    # superseded failed stage now occupies `failed_stage_idx`, so the
+    # first sub-stage is one slot later.
+    mission.current_stage_idx = failed_stage_idx + 1
 
     # Audit-fix (Ship 17 review, finding #A): if `_atomic_save_mission`
     # fails (disk full / permissions / EIO), the in-memory mission has
@@ -5393,8 +5471,14 @@ def _maybe_redecompose_and_splice(
     try:
         _atomic_save_mission(mission, mission_dir)
     except OSError as e:
-        # Roll back in-memory splice + parent re-pointing.
-        mission.stages[failed_stage_idx:failed_stage_idx + len(sub_stages)] = [failed_stage]
+        # Roll back in-memory splice + parent re-pointing + status +
+        # any inherited metric + current_stage_idx.
+        mission.stages[failed_stage_idx:failed_stage_idx + 1 + len(sub_stages)] = [failed_stage]
+        failed_stage.status = "failed"
+        for _sub in sub_stages:
+            if _sub.name in _inherited_to:
+                _sub.steering_metric = None
+        mission.current_stage_idx = failed_stage_idx
         # Restore downstream children's parent_stage to the failed name.
         for s in mission.stages[failed_stage_idx + 1:]:
             if s.parent_stage == last_sub_name:

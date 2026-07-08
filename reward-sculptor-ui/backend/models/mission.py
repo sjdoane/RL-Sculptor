@@ -21,8 +21,12 @@ from pydantic import BaseModel, ConfigDict, Field
 
 
 # ── Stage shape (mirrors sculptor.mission.Stage) ─────────────────────
+# §mission-persistence increment 1/2: "superseded" mirrors
+# sculptor.mission.StageStatus — a stage retained in mission.stages
+# after being replaced by re-decomposition children. Terminal, never
+# runnable.
 StageStatus = Literal[
-    "pending", "training", "succeeded", "failed", "skipped",
+    "pending", "training", "succeeded", "failed", "skipped", "superseded",
 ]
 
 
@@ -58,6 +62,36 @@ class StageSchema(BaseModel):
     # "last"). None on legacy missions / stages that haven't finalized.
     selected_iter_index: Optional[int] = None
     selection_source: Optional[str] = None
+    # §mission-persistence increment 2: mirrors sculptor.mission.Stage's
+    # failure_reason/failure_detail (increment 1) — the short reason
+    # code + free-form detail for a failed/superseded stage. Filled
+    # either from mission.json directly, or (for stages that predate
+    # increment 1, or synthetic on-disk-only stages) enriched from
+    # provenance.json by mission_store.load_mission_detail.
+    failure_reason: Optional[str] = None
+    failure_detail: Optional[str] = None
+    # Mirrors sculptor.mission.Stage.steering_metric — per-stage
+    # objective fitness metric override (a spec-metric name or a
+    # resolved generated-metric path). None = mission-level fallback.
+    steering_metric: Optional[str] = None
+    # §mission-persistence increment 2: human-facing position label
+    # computed by mission_store over the FINAL disk-union stage order —
+    # "1", "2", "2.1", "2.2", ... for replan children. Always set by
+    # load_mission_detail; "" only as the pydantic default before that
+    # pass runs (should never be visible on the wire).
+    display_label: str = ""
+    # True when this StageSchema was synthesized from an orphaned
+    # `<mission_dir>/stages/<name>/` directory that has no entry in
+    # mission.stages (old destructive-splice data). Such a stage is
+    # always status="superseded" and its Claude-authored fields
+    # (goal_text/success_criterion/reward_seed_prompt) are best-effort
+    # recovered from provenance.json, defaulting to "".
+    on_disk_only: bool = False
+    # §mission-persistence increment 2: whether this stage has a
+    # trust-gated steering metric on disk, derived from
+    # `<mission_dir>/stage_metrics/<name>/meta.json` +
+    # `steering_metric`. See mission_store._stage_metric_status.
+    metric_status: Optional[Literal["accepted", "rejected", "inherited", "none"]] = None
 
 
 # ── Mission summary / detail / create ────────────────────────────────
@@ -145,6 +179,16 @@ class CreateMissionRequest(BaseModel):
     `generate_stage_metrics(n_candidates=...)`. Each candidate is a
     ~1-2 min LLM call, so higher N trades wall-clock for a more-
     discriminating metric."""
+
+    stage_metric_required: bool = False
+    """§mission-persistence increment 2: when true, running this
+    mission is BLOCKED (409) while any runnable stage (status pending
+    or training) lacks a steering metric — unless the run request sets
+    `proceed_blind`. Persisted into the mission's `run_defaults` at
+    creation time; enforced by `POST .../run`. Default False preserves
+    the pre-existing behavior (metrics are best-effort; a rejected /
+    skipped generation silently falls back to the mission-level
+    metric)."""
 
     # §Ship 21a: optional run-time defaults set up front via the
     # NewMissionDialog Advanced tab. These are persisted on the
@@ -252,6 +296,14 @@ class RunMissionRequest(BaseModel):
     device_override: Optional[str] = None
     """Override [adapter].config.device for every stage (mjlab), e.g.
     cuda:0 / cpu. None = inherited value."""
+
+    proceed_blind: bool = False
+    """§mission-persistence increment 2: bypass the
+    `stage_metric_required` 409 guard for this launch — run every
+    runnable stage on whatever fallback metric it has (mission-level
+    fitness_metric, or the blind loop), even though the mission was
+    created with `stage_metric_required=True`. One-shot per request;
+    does not mutate the persisted `run_defaults`."""
 
 
 # §Ship 21a: resolve the forward reference now that RunMissionRequest

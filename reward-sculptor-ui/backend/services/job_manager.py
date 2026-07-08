@@ -323,10 +323,75 @@ class JobManager:
         `mission_execute` job for a specific (project, mission) pair,
         or None. Used by the routes layer to (a) refuse concurrent
         decompose/execute on the same mission, (b) attach
-        `active_job_id` to MissionSummary / MissionDetail responses.
+        `active_job_id` to MissionSummary / MissionDetail responses,
+        (c) pick the job whose events the mission WS route streams.
+
+        Deliberately narrow to these two kinds — callers (b) and (c)
+        need "the one job that represents the mission's own headline
+        lifecycle," not every job that happens to touch it. Use
+        `active_mission_scoped_job` for a broader "is ANY mission-
+        scoped job live" concurrency guard.
         """
         for j in self.list(project_slug=project_slug):
             if j.kind not in ("mission_decompose", "mission_execute"):
+                continue
+            if j.params.get("mission_slug") != mission_slug:
+                continue
+            if j.status in ("running", "queued"):
+                return j
+        return None
+
+    # Kinds whose params carry a `mission_slug` scoping them to one
+    # mission. Kept as one list so `active_mission_scoped_job` and any
+    # future caller stay in sync as new mission-scoped job kinds are
+    # added (e.g. a future per-stage job kind).
+    _MISSION_SCOPED_KINDS = (
+        "mission_decompose",
+        "mission_execute",
+        "mission_stage_run",
+        "mission_stage_metric_regen",
+    )
+
+    def active_mission_scoped_job(
+        self, project_slug: str, mission_slug: str,
+    ) -> Optional[Job]:
+        """The in-flight job of ANY mission-scoped kind — decompose,
+        execute, a per-stage run, or a metric regenerate — for a
+        specific (project, mission) pair, or None.
+
+        Broader than `active_mission_job`: used where the concurrency
+        hazard is "some write touching this mission's mission.json (or
+        a stage under it) is in flight," not just "the mission's own
+        headline decompose/execute lifecycle." `POST .../run` uses this
+        directly so it also refuses to start `mission_execute` while a
+        `mission_stage_metric_regen` for the SAME mission is mid-save
+        (both call `save_mission`, non-atomic last-write-wins).
+        """
+        for j in self.list(project_slug=project_slug):
+            if j.kind not in self._MISSION_SCOPED_KINDS:
+                continue
+            if j.params.get("mission_slug") != mission_slug:
+                continue
+            if j.status in ("running", "queued"):
+                return j
+        return None
+
+    def active_mission_metric_regen_job(
+        self, project_slug: str, mission_slug: str,
+    ) -> Optional[Job]:
+        """The in-flight `mission_stage_metric_regen` job for a
+        specific (project, mission) pair (any stage), or None.
+
+        Split out from `active_mission_scoped_job` because
+        `POST .../metric/regenerate` needs to distinguish "another
+        regen for this mission is running" (its own dedicated 409
+        message, naming the other stage) from "a mission_stage_run for
+        some OTHER stage happens to be live" (not a conflict for this
+        route — only a stage_run for THIS SAME stage is, handled
+        separately by that route's existing per-stage loop).
+        """
+        for j in self.list(project_slug=project_slug):
+            if j.kind != "mission_stage_metric_regen":
                 continue
             if j.params.get("mission_slug") != mission_slug:
                 continue

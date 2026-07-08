@@ -118,6 +118,11 @@ JobKind = Literal[
     # §chunk A4 — manual "save a copy now" action over the durable
     # saved-missions archive (sculptor.archive.archive_mission).
     "mission_save",
+    # §mission-persistence increment 2 — user-triggered regeneration of
+    # one stage's steering metric via POST .../stages/{stage}/metric/
+    # regenerate. In-process thread job (mirrors mission_decompose's
+    # strategy — a handful of LLM calls, no subprocess needed).
+    "mission_stage_metric_regen",
 ]
 JobStatus = Literal["queued", "running", "completed", "errored", "stopped"]
 

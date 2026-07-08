@@ -37,8 +37,16 @@ _STAGE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 # Stage lifecycle. "pending" = awaits orchestrator; "training" = sculpt_run
 # in-flight; "succeeded"/"failed" = terminal. "skipped" is reserved for
 # Ship 17's fail-through behavior (a failing stage whose successors still
-# try to run from scratch).
-StageStatus = Literal["pending", "training", "succeeded", "failed", "skipped"]
+# try to run from scratch). "superseded" (mission-persistence increment 1):
+# terminal, never runnable — the stage was replaced by re-decomposition
+# children but is RETAINED in `mission.stages` (rather than spliced out)
+# so its trained iterations stay visible in every UI view / report. A
+# superseded stage is permanently excluded from the runnable chain: the
+# orchestrator's while-loop never executes it, and downstream parent
+# references are always re-pointed past it to the last child.
+StageStatus = Literal[
+    "pending", "training", "succeeded", "failed", "skipped", "superseded",
+]
 
 # Matches the existing reward-prompt endpoint's char bounds so a stage's
 # seed prompt drops into `apply_prompt_edit` without adjustment.
@@ -132,6 +140,19 @@ class Stage:
     selected_iter_index: Optional[int] = None
     #: "criterion+fitness" | "criterion_newest" | "fitness_fallback" | "last"
     selection_source: Optional[str] = None
+    # §mission-persistence increment 1: the failure's short reason code
+    # (e.g. "criterion_not_met", "no_checkpoint", "training_errored" —
+    # same vocabulary as `StageResult.failure_reason` /
+    # `_REDECOMPOSABLE_REASONS` in sculpt.py) and its free-form detail
+    # message, persisted onto the stage itself. Previously this only
+    # lived in the ephemeral `StageResult` (mission_runtime.py) and in
+    # provenance.json — never in mission.json — so it was lost the
+    # moment a stage was superseded/spliced-out or the process exited.
+    # None on stages that never failed. Backward-compatible: older
+    # mission.json files without these keys load with None via
+    # `from_dict`'s filter-unknown-keys path.
+    failure_reason: Optional[str] = None
+    failure_detail: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
@@ -380,6 +401,23 @@ def validate_mission(
       * max_iterations ∈ [1, 50].
 
     `info_keys` is the adapter's `expected_info_keys` set.
+
+    §mission-persistence increment 1: a "superseded" stage (retained in
+    `mission.stages` after being replaced by re-decomposition children —
+    see `sculpt._maybe_redecompose_and_splice`) is validated exactly
+    like any other stage. None of the checks above branch on
+    `stage.status`; a superseded stage is structurally unchanged from
+    when it was authored (same name/prompt/criterion/parent), it is
+    simply excluded from the RUNNABLE chain at orchestration time. The
+    one topological rule that matters — no OTHER stage may declare a
+    superseded stage as its `parent_stage` — is enforced not here but
+    by construction: `_repoint_downstream_children` always re-points
+    downstream parents from the superseded name to its last child
+    before the splice is validated, so a lingering reference to a
+    superseded stage's name would already fail
+    `_validate_parent_reference`'s ordinary "must name an earlier
+    stage" check (the name still exists, just structurally orphaned —
+    no consumer is expected to reference it going forward).
     """
     if not mission.stages:
         raise MissionValidationError("mission has no stages")
