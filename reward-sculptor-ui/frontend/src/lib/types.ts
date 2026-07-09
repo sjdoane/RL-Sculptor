@@ -958,6 +958,14 @@ export interface StageSchema {
   on_disk_only?: boolean;
   // How this stage got (or failed to get) its objective metric.
   metric_status?: "accepted" | "rejected" | "inherited" | "none" | null;
+  // §R1 (reference library): attached reference clip, if any. Set via
+  // POST/DELETE .../stages/{stage}/reference (see lib/api.ts). tier and
+  // match_confidence are mirrored from the clip's provenance / the
+  // retrieval result at attach time — null when nothing is attached, or
+  // when attached without a confidence (deterministic-only match).
+  reference_clip_id?: string | null;
+  reference_tier?: string | null;
+  reference_match_confidence?: number | null;
 }
 
 // ── Stage iterations (disk-truth, de-siloed) ─────────────────────────
@@ -1228,4 +1236,46 @@ export interface TrashEntry {
 export interface SelectedStage {
   missionSlug: string;
   stageName: string;
+}
+
+// ── Reference library (R1) ───────────────────────────────────────────
+// GET /references?robot=&q=&k=&llm= — a retrieval search hit. Mirrors
+// sculptor's RefMatch dataclass (refs/retrieve.py) 1:1.
+export interface RefMatch {
+  clip_id: string;
+  text: string;
+  score: number;
+  /** 0-1 confidence from the optional LLM rerank pass; null when the
+   *  search ran deterministic-only (llm=0, the UI's as-you-type default,
+   *  or the LLM rerank failed and fell back). */
+  match_confidence: number | null;
+  /** One-line LLM rationale; null on the deterministic-only path. */
+  reason: string | null;
+  tier: string;
+  license: string;
+  n_frames: number;
+  fps: number;
+  duration_s: number;
+}
+
+// GET /references (no q) — slim index row. Also the shape of the
+// GET /references/{clip_id} detail's `index` field.
+export interface RefIndexRow {
+  clip_id: string;
+  robot: string;
+  text: string;
+  labels: string[];
+  tier: string;
+  license: string;
+  n_frames: number;
+  fps: number;
+  duration_s: number;
+  root_z_range: [number, number] | null;
+  has_preview: boolean;
+}
+
+// GET /references/{clip_id} — provenance.json content + the index row.
+export interface RefDetail {
+  index: RefIndexRow;
+  provenance: Record<string, unknown>;
 }

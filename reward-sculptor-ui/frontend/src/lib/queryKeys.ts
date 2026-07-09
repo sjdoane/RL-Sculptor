@@ -62,4 +62,9 @@ export const qk = {
   // Saved-missions library (durable disk archive).
   saved: () => ["saved"] as const,
   savedEntry: (entryId: string) => ["saved", entryId] as const,
+
+  // Reference library (R1): search results + slim index browse.
+  referenceSearch: (query: string, robot: string) =>
+    ["references", "search", robot, query] as const,
+  referenceIndex: (robot: string) => ["references", "index", robot] as const,
 };

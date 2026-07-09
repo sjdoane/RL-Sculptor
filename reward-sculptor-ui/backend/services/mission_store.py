@@ -172,6 +172,13 @@ def _stages_to_schema(stages: list) -> list[StageSchema]:
             # disk-run synthesis want the enforced cap, not max_iterations.
             effective_max_iterations=getattr(
                 s, "effective_max_iterations", None),
+            # §R1_BUILD_SPEC decision 10/11: mirrors Stage.reference_clip_id/
+            # reference_tier/reference_match_confidence, same drill as
+            # steering_metric above.
+            reference_clip_id=getattr(s, "reference_clip_id", None),
+            reference_tier=getattr(s, "reference_tier", None),
+            reference_match_confidence=getattr(
+                s, "reference_match_confidence", None),
         ))
     return out
 

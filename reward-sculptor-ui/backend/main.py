@@ -32,6 +32,7 @@ from backend.routes import missions as missions_routes
 from backend.routes import physics as physics_routes
 from backend.routes import policies as policies_routes
 from backend.routes import projects as projects_routes
+from backend.routes import references as references_routes
 from backend.routes import rewards as rewards_routes
 from backend.routes import robot as robot_routes
 from backend.routes import reports as reports_routes
@@ -212,6 +213,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     app.include_router(metrics_routes.router)
     app.include_router(trash_routes.router)
     app.include_router(saved_routes.router)
+    app.include_router(references_routes.router)
     return app
 
 

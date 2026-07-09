@@ -228,8 +228,11 @@ function partitionRuns(runs: RunSummary[], missions: MissionSummary[]): { sculpt
   const seen = new Set<string>();
   const missionGroups: MissionGroup[] = [];
   for (const m of missions) {
-    const stages = stagesByMission.get(m.mission_slug);
-    if (!stages || stages.length === 0) continue;
+    // Zero-run missions are still listed (stages: []) — a decomposed
+    // mission must be reachable (curriculum dialog, reference picker,
+    // per-stage metrics) BEFORE its first training run, or it stays
+    // invisible until trained (house rule: every feature UI-reachable).
+    const stages = stagesByMission.get(m.mission_slug) ?? [];
     seen.add(m.mission_slug);
     stages.sort((a, b) => (a.stage_index ?? 0) - (b.stage_index ?? 0) || a.run_id.localeCompare(b.run_id));
     missionGroups.push({ missionSlug: m.mission_slug, mission: m, stages });

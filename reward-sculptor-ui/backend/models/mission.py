@@ -97,6 +97,17 @@ class StageSchema(BaseModel):
     # `<mission_dir>/stage_metrics/<name>/meta.json` +
     # `steering_metric`. See mission_store._stage_metric_status.
     metric_status: Optional[Literal["accepted", "rejected", "inherited", "none"]] = None
+    # §R1_BUILD_SPEC decision 10/11: mirrors sculptor.mission.Stage's
+    # reference_clip_id/reference_tier/reference_match_confidence — the
+    # reference-library clip (if any) attached to this stage via
+    # `POST/DELETE .../stages/{stage}/reference`. None on stages with no
+    # reference attached (the overwhelming majority; back-compat with
+    # every mission.json that predates R1 is automatic via
+    # `Stage.from_dict`'s filter-unknown-keys path — same guarantee
+    # `steering_metric` already relies on).
+    reference_clip_id: Optional[str] = None
+    reference_tier: Optional[str] = None
+    reference_match_confidence: Optional[float] = None
 
 
 # ── Mission summary / detail / create ────────────────────────────────

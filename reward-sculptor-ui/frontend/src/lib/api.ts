@@ -1083,3 +1083,73 @@ export async function purgeTrash(entryId: string): Promise<void> {
     ),
   );
 }
+
+// ── Reference library (R1) ─────────────────────────────────────────────
+import type { RefDetail, RefIndexRow, RefMatch } from "./types";
+
+/** GET /references?robot=&q=&k=&llm= — search hits, ranked. `useLlm`
+ *  defaults to false: the UI's as-you-type path stays deterministic
+ *  (zero API cost, no rerank latency); pass true for an explicit
+ *  "rerank with Claude" affordance if one is ever added. */
+export async function searchReferences(
+  query: string,
+  opts?: { robot?: string; k?: number; useLlm?: boolean },
+): Promise<RefMatch[]> {
+  const u = new URL("/api/references", window.location.origin);
+  u.searchParams.set("q", query);
+  u.searchParams.set("robot", opts?.robot ?? "g1");
+  u.searchParams.set("k", String(opts?.k ?? 10));
+  u.searchParams.set("llm", opts?.useLlm ? "1" : "0");
+  return handle<RefMatch[]>(await fetch(u.pathname + u.search));
+}
+
+/** GET /references (no q) — the slim index listing. Used for the
+ *  picker's empty-query state ("browse everything"). */
+export async function listReferences(opts?: { robot?: string }): Promise<RefIndexRow[]> {
+  const u = new URL("/api/references", window.location.origin);
+  u.searchParams.set("robot", opts?.robot ?? "g1");
+  return handle<RefIndexRow[]>(await fetch(u.pathname + u.search));
+}
+
+export async function getReference(clipId: string): Promise<RefDetail> {
+  return handle<RefDetail>(
+    await fetch(`/api/references/${encodeURIComponent(clipId)}`),
+  );
+}
+
+/** Preview keyframe-strip PNG URL. No existence check here — the
+ *  backend 404s cleanly when a clip has no preview.png; callers should
+ *  hide the <img> on error (see ReferencePickerDialog). */
+export function getReferencePreviewUrl(clipId: string): string {
+  return `/api/references/${encodeURIComponent(clipId)}/preview`;
+}
+
+/** POST .../stages/{stage}/reference body {clip_id} — attach a
+ *  reference clip to a stage. 409 if mission-scoped jobs are live (same
+ *  guard family as regenerateStageMetric). Returns the updated mission. */
+export async function attachStageReference(
+  slug: string, missionSlug: string, stageName: string, clipId: string,
+): Promise<MissionDetail> {
+  return handle<MissionDetail>(
+    await fetch(
+      `/api/projects/${slug}/missions/${missionSlug}/stages/${encodeURIComponent(stageName)}/reference`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ clip_id: clipId }),
+      },
+    ),
+  );
+}
+
+/** DELETE .../stages/{stage}/reference — detach. Same 409 guard. */
+export async function detachStageReference(
+  slug: string, missionSlug: string, stageName: string,
+): Promise<MissionDetail> {
+  return handle<MissionDetail>(
+    await fetch(
+      `/api/projects/${slug}/missions/${missionSlug}/stages/${encodeURIComponent(stageName)}/reference`,
+      { method: "DELETE" },
+    ),
+  );
+}

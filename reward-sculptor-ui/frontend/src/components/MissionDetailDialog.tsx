@@ -11,8 +11,10 @@ import {
   useStageEnvSpec,
   useStageIterations,
 } from "@/hooks/useMissions";
+import { useDetachStageReference } from "@/hooks/useReferences";
 import { useJob } from "@/hooks/useJob";
 import { RunMissionDialog } from "@/components/RunMissionDialog";
+import { ReferencePickerDialog } from "@/components/ReferencePickerDialog";
 import { useMissionEvents } from "@/hooks/useMissionEvents";
 import { ApiError, stageRolloutUrl } from "@/lib/api";
 import { qk } from "@/lib/queryKeys";
@@ -375,6 +377,93 @@ function StageMetricChip({
   );
 }
 
+// §R1 (reference library): row after StageMetricChip showing the
+// attached reference clip (text + tier), or a ghost "Pick reference"
+// button that opens ReferencePickerDialog. Kept modest — this is the v1
+// approval surface, not a full library page (spec decision 12).
+function ReferenceRow({
+  slug,
+  missionSlug,
+  stage,
+}: {
+  slug: string;
+  missionSlug: string;
+  stage: StageSchema;
+}) {
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const detach = useDetachStageReference(slug);
+
+  const doDetach = () => {
+    detach.mutate(
+      { missionSlug, stageName: stage.name },
+      {
+        onSuccess: () => toast.success("Reference detached", { description: stage.name }),
+        onError: (err) => {
+          if (err instanceof ApiError && err.status === 409) {
+            toast.error("Mission is busy", {
+              description: "Wait for the running job to finish before detaching a reference.",
+            });
+            return;
+          }
+          const detail = err instanceof ApiError ? (err.problem.detail ?? err.problem.title) : err.message;
+          toast.error("Could not detach reference", { description: String(detail) });
+        },
+      },
+    );
+  };
+
+  return (
+    <div style={{ marginTop: 6, display: "flex", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
+      {stage.reference_clip_id ? (
+        <>
+          <span
+            className="rs-badge slate"
+            style={{ fontSize: 9.5 }}
+            title={
+              stage.reference_match_confidence != null
+                ? `match confidence ${stage.reference_match_confidence.toFixed(2)}`
+                : undefined
+            }
+          >
+            <Icon name="video" size={10} />
+            {stage.reference_clip_id}
+            {stage.reference_tier && <span style={{ opacity: 0.7 }}>&nbsp;· tier {stage.reference_tier}</span>}
+          </span>
+          <Btn
+            kind="ghost" size="xs" icon="pencil"
+            onClick={(e) => { e.stopPropagation(); setPickerOpen(true); }}
+          >
+            Change
+          </Btn>
+          <Btn
+            kind="ghost" size="xs" icon={detach.isPending ? "loader" : "x"}
+            disabled={detach.isPending}
+            onClick={(e) => { e.stopPropagation(); doDetach(); }}
+          >
+            {detach.isPending ? "Detaching…" : "Detach"}
+          </Btn>
+        </>
+      ) : (
+        <Btn
+          kind="ghost" size="xs" icon="video"
+          onClick={(e) => { e.stopPropagation(); setPickerOpen(true); }}
+        >
+          Pick reference
+        </Btn>
+      )}
+      {pickerOpen && (
+        <ReferencePickerDialog
+          slug={slug}
+          missionSlug={missionSlug}
+          stageName={stage.name}
+          currentClipId={stage.reference_clip_id}
+          onClose={() => setPickerOpen(false)}
+        />
+      )}
+    </div>
+  );
+}
+
 // ── stage tree depth (DFS, cycle-safe) ───────────────────────────────
 
 function computeStageDepths(stages: StageSchema[]): Map<string, number> {
@@ -644,6 +733,7 @@ function StageCard({
         )}
         <StageMetricChip status={stage.metric_status} steeringMetric={stage.steering_metric} />
       </button>
+      <ReferenceRow slug={slug} missionSlug={missionSlug} stage={stage} />
       {stage.status === "superseded" && (
         <p className="rs-sub" style={{ margin: "6px 0 0", fontSize: 11 }}>{supersededText(stage)}</p>
       )}
