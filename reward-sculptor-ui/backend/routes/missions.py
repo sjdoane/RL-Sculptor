@@ -77,6 +77,7 @@ from backend.models.mission import (
     StageIterationSummary,
     StageIterDetail,
     StageIterPaperRef,
+    StageMetricReference,
     StageObjectiveMetric,
 )
 from backend.models.project import ProblemDetail
@@ -1154,6 +1155,36 @@ def _stage_review_summary(meta: dict) -> Optional[str]:
     return None
 
 
+def _stage_metric_references(meta: dict) -> list[StageMetricReference]:
+    """Mirror `meta["validation"]["references"]` (written by
+    `sculptor.eval.metric_validate._validate_references`) into the
+    UI-facing `StageMetricReference` list — just `clip_id` + the three
+    gate verdicts, dropping the heavier `reasons`/`scores`/
+    `full_components` diagnostics that are already 4000-char-clipped
+    debugging aids, not UI content. Never raises: a malformed entry is
+    skipped rather than 500ing the whole metric card (same
+    degrade-gracefully posture as the rest of this route)."""
+    validation = meta.get("validation")
+    if not isinstance(validation, dict):
+        return []
+    refs = validation.get("references")
+    if not isinstance(refs, list):
+        return []
+    out: list[StageMetricReference] = []
+    for entry in refs:
+        if not isinstance(entry, dict):
+            continue
+        clip_id = entry.get("clip_id")
+        if not isinstance(clip_id, str) or not clip_id:
+            continue
+        gates = entry.get("gates")
+        gates_bool = {
+            k: v for k, v in gates.items() if isinstance(v, bool)
+        } if isinstance(gates, dict) else {}
+        out.append(StageMetricReference(clip_id=clip_id, gates=gates_bool))
+    return out
+
+
 @router.get(
     "/projects/{slug}/missions/{mission_slug}/stages/{stage}/metric",
     response_model=StageObjectiveMetric,
@@ -1219,6 +1250,7 @@ def get_stage_metric(
         review_summary=_stage_review_summary(meta),
         n_candidates=n_candidates if isinstance(n_candidates, int) else None,
         calibrated=calibrated if isinstance(calibrated, bool) else None,
+        references=_stage_metric_references(meta),
     )
 
 

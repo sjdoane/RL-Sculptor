@@ -421,6 +421,22 @@ class StageIterDetail(BaseModel):
     components: Optional[dict[str, float]] = None
 
 
+class StageMetricReference(BaseModel):
+    """One entry of `meta["validation"]["references"]` — a reference clip
+    the metric was certified against (§REFERENCE_TRAJECTORY_PLAN §5/§9).
+    `gates` carries the three per-reference gate verdicts (nondegeneracy /
+    monotonicity / negatives); a reference is "passed" iff all three are
+    true. Mirrors `sculptor.eval.metric_validate._validate_references`'s
+    per-entry dict shape — extra keys (`reasons`, `scores`,
+    `full_components`) are dropped rather than modeled since the UI only
+    needs the pass/fail summary."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    clip_id: str
+    gates: dict[str, bool] = {}
+
+
 class StageObjectiveMetric(BaseModel):
     """`GET .../stages/{stage}/metric` — the stage's objective (steering)
     metric record: what was generated under `stage_metrics/<stage>/` and
@@ -439,6 +455,12 @@ class StageObjectiveMetric(BaseModel):
     review_summary: Optional[str] = None
     n_candidates: Optional[int] = None
     calibrated: Optional[bool] = None
+    # §R1 remainder (plan §9): the reference clips this metric was
+    # certified against, mirrored from meta["validation"]["references"].
+    # [] when no references were attached (pre-R1 records and non-
+    # reference-anchored metrics alike) — never null, so the UI can
+    # unconditionally .length-check.
+    references: list[StageMetricReference] = []
 
 
 class StageEnvSpecInfo(BaseModel):

@@ -1417,6 +1417,91 @@ def test_get_stage_metric_accepted(
     assert body["calibrated"] is False
     assert body["review_summary"] == "Gate + min() of bounded channels."
     assert "def compute_spec" in body["metric_source"]
+    # §R1 remainder: no references attached -> [], never null.
+    assert body["references"] == []
+
+
+def test_get_stage_metric_with_references(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    """meta.json's `validation.references` (written by
+    `_validate_references`) mirrors into the route's `references` field
+    as `{clip_id, gates}`, dropping the heavier reasons/scores payload."""
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    _seed_stage_dir(project_dir, "alpha", "stage_0")
+
+    sm_dir = project_dir / ".missions" / "alpha" / "stage_metrics" / "stage_0"
+    sm_dir.mkdir(parents=True)
+    (sm_dir / "metric.py").write_text("def compute_spec(*a, **k): return {}\n")
+    (sm_dir / "meta.json").write_text(json.dumps({
+        "accepted": True,
+        "validation_passed": True,
+        "behavior_goal": "jump up and land",
+        "calibrated": False,
+        "validation": {
+            "gates": {"bounded": True},
+            "references": [
+                {
+                    "clip_id": "jump_demo_clip",
+                    "gates": {
+                        "reference_nondegeneracy": True,
+                        "reference_monotonicity": True,
+                        "reference_negatives": False,
+                    },
+                    "reasons": ["[reference:jump_demo_clip] negatives: ..."],
+                    "scores": {"full": 0.9},
+                },
+            ],
+        },
+    }))
+
+    r = client.get(f"/projects/{slug}/missions/alpha/stages/stage_0/metric")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["references"] == [{
+        "clip_id": "jump_demo_clip",
+        "gates": {
+            "reference_nondegeneracy": True,
+            "reference_monotonicity": True,
+            "reference_negatives": False,
+        },
+    }]
+
+
+def test_get_stage_metric_malformed_reference_entries_are_skipped(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    """A reference entry missing/mistyping `clip_id`, or a non-list
+    `references`/non-dict `validation`, degrades to an empty (or
+    partial) list rather than 500ing the whole metric card."""
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    _seed_stage_dir(project_dir, "alpha", "stage_0")
+
+    sm_dir = project_dir / ".missions" / "alpha" / "stage_metrics" / "stage_0"
+    sm_dir.mkdir(parents=True)
+    (sm_dir / "meta.json").write_text(json.dumps({
+        "accepted": True,
+        "validation": {
+            "references": [
+                {"clip_id": "good_clip", "gates": {"reference_negatives": True}},
+                {"gates": {"reference_negatives": True}},  # missing clip_id
+                "not-a-dict",
+                {"clip_id": "clip_with_bad_gates", "gates": "not-a-dict"},
+            ],
+        },
+    }))
+
+    r = client.get(f"/projects/{slug}/missions/alpha/stages/stage_0/metric")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["references"] == [
+        {"clip_id": "good_clip", "gates": {"reference_negatives": True}},
+        {"clip_id": "clip_with_bad_gates", "gates": {}},
+    ]
 
 
 def test_get_stage_metric_rejected(

@@ -1009,6 +1009,15 @@ export interface StageIterDetail {
   components: Record<string, number> | null;
 }
 
+// §R1 remainder (plan §9): one reference clip a stage's objective metric
+// was certified against. Mirrors backend/models/mission.py's
+// StageMetricReference — clip_id + the three per-reference gate verdicts
+// (reference_nondegeneracy / reference_monotonicity / reference_negatives).
+export interface StageMetricReference {
+  clip_id: string;
+  gates: Record<string, boolean>;
+}
+
 // GET .../stages/{stage}/metric → the stage's objective-metric record
 // (what was generated, whether the adversarial panel accepted it).
 export interface StageObjectiveMetric {
@@ -1019,6 +1028,7 @@ export interface StageObjectiveMetric {
   review_summary: string | null;
   n_candidates: number | null;
   calibrated: boolean | null;
+  references: StageMetricReference[];
 }
 
 // GET .../stages/{stage}/env-spec → the stage's applied env curriculum.

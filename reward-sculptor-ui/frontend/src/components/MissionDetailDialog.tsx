@@ -421,7 +421,7 @@ function ReferenceRow({
             style={{ fontSize: 9.5 }}
             title={
               stage.reference_match_confidence != null
-                ? `match confidence ${stage.reference_match_confidence.toFixed(2)}`
+                ? `auto-matched ${stage.reference_match_confidence.toFixed(2)}`
                 : undefined
             }
           >
@@ -444,12 +444,17 @@ function ReferenceRow({
           </Btn>
         </>
       ) : (
-        <Btn
-          kind="ghost" size="xs" icon="video"
-          onClick={(e) => { e.stopPropagation(); setPickerOpen(true); }}
-        >
-          Pick reference
-        </Btn>
+        <>
+          <span className="rs-sub" style={{ fontSize: 10.5 }}>
+            no reference matched —
+          </span>
+          <Btn
+            kind="ghost" size="xs" icon="video"
+            onClick={(e) => { e.stopPropagation(); setPickerOpen(true); }}
+          >
+            pick one
+          </Btn>
+        </>
       )}
       {pickerOpen && (
         <ReferencePickerDialog

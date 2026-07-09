@@ -11,6 +11,7 @@ import { MissionDetailDialog } from "@/components/MissionDetailDialog";
 import { useSystemGpu } from "@/hooks/useLibrary";
 import { useRunEvents } from "@/hooks/useRunEvents";
 import { useMission, useMissions, useStageIterations } from "@/hooks/useMissions";
+import { useReferenceIndex } from "@/hooks/useReferences";
 import { useRegenerateRewardTemplate, useRewards } from "@/hooks/useRewards";
 import { usePolicies } from "@/hooks/usePolicies";
 import { useControlRun, useKillRun, useProjectIterations, useRun, useRuns } from "@/hooks/useRuns";
@@ -34,6 +35,7 @@ import type {
   StageIterDetail,
   StageIterPaperRef,
   StageIteration,
+  StageMetricReference,
   StageObjectiveMetric,
 } from "@/lib/types";
 
@@ -700,6 +702,12 @@ const OBJECTIVE_METRIC_STATUS_META: Record<
  *  metric that steered training" panel a screen recording narrates. */
 function StageObjectiveMetricCard({ query }: { query: ReturnType<typeof useQuery<StageObjectiveMetric>> }) {
   const { data, isLoading, error } = query;
+  // §R1 remainder (plan §9): resolve clip_id -> text/tier for the
+  // "Certified against reference" row below. Only fetched when the
+  // metric actually carries references — the index call is cheap (one
+  // GET /references) but no need to fire it for the common no-reference
+  // case.
+  const refIndex = useReferenceIndex({ enabled: (data?.references.length ?? 0) > 0 });
   if (isLoading) {
     return <div className="rs-card rs-card-pad"><p className="rs-sub" style={{ fontSize: 11 }}>Loading objective metric…</p></div>;
   }
@@ -735,6 +743,20 @@ function StageObjectiveMetricCard({ query }: { query: ReturnType<typeof useQuery
       {data.review_summary && (
         <p className="rs-sub" style={{ margin: "8px 0 0", fontSize: 12, lineHeight: 1.5 }}>{data.review_summary}</p>
       )}
+      {data.references.length > 0 && (
+        <div style={{ marginTop: 10 }}>
+          <div className="rs-sub" style={{ fontSize: 10.5, marginBottom: 6 }}>Certified against reference</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            {data.references.map((reference) => (
+              <ReferenceCertificationRow
+                key={reference.clip_id}
+                reference={reference}
+                indexRow={refIndex.data?.find((r) => r.clip_id === reference.clip_id) ?? null}
+              />
+            ))}
+          </div>
+        </div>
+      )}
       {data.metric_source && (
         <details style={{ marginTop: 10 }}>
           <summary style={{ cursor: "pointer", fontSize: 11.5, color: "var(--rs-muted)", userSelect: "none" }}>
@@ -752,6 +774,61 @@ function StageObjectiveMetricCard({ query }: { query: ReturnType<typeof useQuery
             {data.metric_source}
           </pre>
         </details>
+      )}
+    </div>
+  );
+}
+
+// §R1 remainder (plan §9): the three §5 per-reference gates, short labels
+// for the pass/fail row. Order matches _validate_references's write order
+// (nondegeneracy, monotonicity, negatives).
+const REFERENCE_GATE_LABELS: Record<string, string> = {
+  reference_nondegeneracy: "nondegenerate",
+  reference_monotonicity: "monotonic",
+  reference_negatives: "rejects negatives",
+};
+
+/** One certified-reference row: clip text/id + tier badge (resolved from
+ *  the reference index when available, else bare clip_id) + a tiny
+ *  check/cross per gate. This is the "certified against reference" line
+ *  from plan §9 — it reuses the SAME gate keys `_validate_references`
+ *  writes, so it never drifts from what actually gated the metric. */
+function ReferenceCertificationRow({
+  reference, indexRow,
+}: {
+  reference: StageMetricReference;
+  indexRow: { text: string; tier: string } | null | undefined;
+}) {
+  const gateEntries = Object.entries(reference.gates);
+  return (
+    <div
+      style={{
+        display: "flex", flexWrap: "wrap", alignItems: "center", gap: 8,
+        padding: "6px 8px", fontSize: 11.5,
+        border: "1px solid var(--hairline)", borderRadius: "var(--radius-sm)",
+        background: "var(--canvas-soft)",
+      }}
+    >
+      <Icon name="video" size={12} color="var(--rs-muted)" />
+      <span style={{ fontWeight: 500, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 220 }}>
+        {indexRow?.text ?? reference.clip_id}
+      </span>
+      <span className="rs-badge slate" style={{ fontSize: 9 }}>
+        {indexRow?.tier ? `tier ${indexRow.tier}` : reference.clip_id}
+      </span>
+      {gateEntries.length > 0 && (
+        <span className="rs-flex rs-gap-8" style={{ marginLeft: "auto" }}>
+          {gateEntries.map(([gate, passed]) => (
+            <span
+              key={gate}
+              title={`${REFERENCE_GATE_LABELS[gate] ?? gate}: ${passed ? "passed" : "failed"}`}
+              style={{ display: "inline-flex", alignItems: "center", gap: 3, fontSize: 10, color: passed ? "var(--st-emerald-fg)" : "var(--st-rose)" }}
+            >
+              <Icon name={passed ? "check" : "x"} size={11} />
+              {REFERENCE_GATE_LABELS[gate] ?? gate}
+            </span>
+          ))}
+        </span>
       )}
     </div>
   );
