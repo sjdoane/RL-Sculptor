@@ -87,6 +87,9 @@ def test_truncate_lengths(frac):
 @pytest.mark.parametrize("factor", [0.25, 4.0])
 def test_speed_resampling_lengths(factor):
     clip = _clip(T=80)
+    # Give the source a velocity channel so the value assertion below
+    # actually exercises the recompute path (fixture omits it).
+    clip["root_vel_z"] = np.gradient(clip["root_pos_z"]) * clip["fps"]
     out = speed(clip, factor)
     assert validate_clip(out) == []
     expected = max(10, round(80 / factor))
@@ -95,6 +98,12 @@ def test_speed_resampling_lengths(factor):
     # Endpoints preserved (interpolation is exact at the boundaries).
     assert out["root_pos_z"][0] == pytest.approx(clip["root_pos_z"][0])
     assert out["root_pos_z"][-1] == pytest.approx(clip["root_pos_z"][-1])
+    # Velocity VALUES scale by `factor` (audit 2026-07-09: a dt_scale
+    # double-count once produced factor^2 speeds — 16.9 m/s at 4x).
+    if "root_vel_z" in out:
+        src_peak = float(np.abs(clip["root_vel_z"]).max())
+        out_peak = float(np.abs(out["root_vel_z"]).max())
+        assert out_peak == pytest.approx(src_peak * factor, rel=0.15)
 
 
 def test_speed_rejects_nonpositive_factor():

@@ -306,8 +306,9 @@ def _active_job_conflict(
     metric-regen) is live for this mission — same breadth as the
     regenerate-metric endpoint's guard (§decision 11: "same guard as
     the regenerate-metric endpoint"). Attaching/detaching a reference
-    mutates mission.json via the same non-atomic save_mission path
-    those jobs also write through."""
+    mutates mission.json via the same save_mission path those jobs
+    also write through (atomic tmp+rename per write, but concurrent
+    writers still race whole-file: last-write-wins)."""
     job = jobs.active_mission_scoped_job(slug, mission_slug)
     if job is not None:
         return _problem(

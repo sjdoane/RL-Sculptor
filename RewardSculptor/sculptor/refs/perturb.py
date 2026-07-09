@@ -134,14 +134,16 @@ def speed(clip: dict, factor: float) -> dict:
 
     out = _rebuild(clip, _resample)
     fps = float(clip["fps"])
-    # Recompute velocities from the resampled positions at the NEW implied
-    # dt (frame spacing changed relative to the original timeline), rather
-    # than naively rescaling the old velocity samples.
-    dt_scale = factor  # n_new ~ n/factor -> new frame spacing = factor * old
+    # Recompute velocities from the resampled positions. The resampled
+    # sequence covers the SAME displacement in n/factor frames at the same
+    # fps, so gradient(pos)*fps ALREADY yields factor-scaled velocities —
+    # an extra *factor here double-counts and produced factor^2 speeds
+    # (audit finding 2026-07-09: speed(clip,4) gave 16.9 m/s for a 1 m/s
+    # rise). gradient*fps is the whole story.
     if "root_vel_z" in out and "root_pos_z" in out:
-        out["root_vel_z"] = np.gradient(out["root_pos_z"]) * fps * dt_scale
+        out["root_vel_z"] = np.gradient(out["root_pos_z"]) * fps
     if "joint_vel" in out and "joint_pos" in out:
-        out["joint_vel"] = np.gradient(out["joint_pos"], axis=0) * fps * dt_scale
+        out["joint_vel"] = np.gradient(out["joint_pos"], axis=0) * fps
     return _validate_or_raise(out)
 
 
