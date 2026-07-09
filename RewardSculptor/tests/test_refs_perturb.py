@@ -1,0 +1,151 @@
+"""§REFERENCE_TRAJECTORY_PLAN §5.2/§6: `sculptor/refs/perturb.py` — hard
+negatives + calibration-ladder rungs derived from a reference clip.
+Offline, synthetic clip fixtures only."""
+from __future__ import annotations
+
+import numpy as np
+import pytest
+
+from sculptor.reference import validate_clip
+from sculptor.refs.perturb import (
+    degrade,
+    freeze_end,
+    freeze_start,
+    perturbation_suite,
+    segment_shuffle,
+    speed,
+    time_reverse,
+    truncate,
+)
+
+
+def _clip(T: int = 60, fps: float = 30.0) -> dict:
+    t = np.linspace(0.0, 1.0, T)
+    z = 0.1 + 0.65 * (1 - np.cos(np.pi * t)) / 2.0
+    jp = np.stack([np.linspace(0, 1.0, T), np.linspace(0, -0.5, T)], axis=1)
+    xy = np.stack([np.linspace(0, 2.0, T), np.zeros(T)], axis=1)
+    quat = np.zeros((T, 4)); quat[:, 0] = 1.0
+    return {
+        "root_pos_z": z, "fps": fps, "joint_pos": jp,
+        "joint_names": ["a", "b"], "root_pos_xy": xy, "root_quat_wxyz": quat,
+    }
+
+
+# ── every perturbation individually ───────────────────────────────────────
+def test_time_reverse_reverses_and_validates():
+    clip = _clip()
+    out = time_reverse(clip)
+    assert validate_clip(out) == []
+    np.testing.assert_allclose(out["root_pos_z"], clip["root_pos_z"][::-1])
+    np.testing.assert_allclose(out["joint_pos"], clip["joint_pos"][::-1])
+    assert out["fps"] == clip["fps"]
+    assert out["joint_names"] == clip["joint_names"]
+
+
+def test_freeze_start_holds_first_frame():
+    clip = _clip()
+    out = freeze_start(clip)
+    assert validate_clip(out) == []
+    assert np.all(out["root_pos_z"] == clip["root_pos_z"][0])
+    assert np.all(out["joint_pos"] == clip["joint_pos"][0])
+    assert out["root_pos_z"].shape == clip["root_pos_z"].shape
+
+
+def test_freeze_end_holds_last_frame():
+    clip = _clip()
+    out = freeze_end(clip)
+    assert validate_clip(out) == []
+    assert np.all(out["root_pos_z"] == clip["root_pos_z"][-1])
+    assert np.all(out["joint_pos"] == clip["joint_pos"][-1])
+
+
+def test_segment_shuffle_is_deterministic_per_seed_and_preserves_length():
+    clip = _clip()
+    a = segment_shuffle(clip, n_segments=6, seed=0)
+    b = segment_shuffle(clip, n_segments=6, seed=0)
+    c = segment_shuffle(clip, n_segments=6, seed=1)
+    assert validate_clip(a) == []
+    np.testing.assert_array_equal(a["root_pos_z"], b["root_pos_z"])
+    assert a["root_pos_z"].shape == clip["root_pos_z"].shape
+    # A different seed almost certainly gives a different order.
+    assert not np.array_equal(a["root_pos_z"], c["root_pos_z"])
+    # It's a REORDERING, not new data: same multiset of frame values.
+    np.testing.assert_allclose(
+        np.sort(a["root_pos_z"]), np.sort(clip["root_pos_z"]))
+
+
+@pytest.mark.parametrize("frac", [0.25, 0.5, 0.75])
+def test_truncate_lengths(frac):
+    clip = _clip(T=80)
+    out = truncate(clip, frac)
+    assert validate_clip(out) == []
+    expected = max(2, round(80 * frac))
+    assert out["root_pos_z"].shape[0] == expected
+    np.testing.assert_allclose(out["root_pos_z"], clip["root_pos_z"][:expected])
+
+
+@pytest.mark.parametrize("factor", [0.25, 4.0])
+def test_speed_resampling_lengths(factor):
+    clip = _clip(T=80)
+    out = speed(clip, factor)
+    assert validate_clip(out) == []
+    expected = max(10, round(80 / factor))
+    assert out["root_pos_z"].shape[0] == expected
+    assert out["fps"] == clip["fps"]
+    # Endpoints preserved (interpolation is exact at the boundaries).
+    assert out["root_pos_z"][0] == pytest.approx(clip["root_pos_z"][0])
+    assert out["root_pos_z"][-1] == pytest.approx(clip["root_pos_z"][-1])
+
+
+def test_speed_rejects_nonpositive_factor():
+    with pytest.raises(ValueError):
+        speed(_clip(), 0.0)
+
+
+def test_degrade_adds_joint_noise_and_damps_root():
+    clip = _clip()
+    out = degrade(clip, joint_noise_rad=0.1, root_damp=0.0, seed=1)
+    assert validate_clip(out) == []
+    # root_damp=0 freezes root motion at the start value.
+    np.testing.assert_allclose(out["root_pos_z"], clip["root_pos_z"][0], atol=1e-9)
+    np.testing.assert_allclose(
+        out["root_pos_xy"],
+        np.broadcast_to(clip["root_pos_xy"][0], out["root_pos_xy"].shape),
+        atol=1e-9)
+    # Joint noise perturbs joint_pos (not identical to the source).
+    assert not np.allclose(out["joint_pos"], clip["joint_pos"])
+
+
+def test_degrade_no_noise_no_damp_is_near_identity():
+    clip = _clip()
+    out = degrade(clip, joint_noise_rad=0.0, root_damp=1.0, seed=0)
+    assert validate_clip(out) == []
+    np.testing.assert_allclose(out["root_pos_z"], clip["root_pos_z"])
+    np.testing.assert_allclose(out["joint_pos"], clip["joint_pos"])
+
+
+def test_degrade_rejects_bad_params():
+    with pytest.raises(ValueError):
+        degrade(_clip(), root_damp=1.5)
+    with pytest.raises(ValueError):
+        degrade(_clip(), joint_noise_rad=-1.0)
+
+
+# ── the standard named suite ──────────────────────────────────────────────
+def test_perturbation_suite_has_the_standard_names_and_all_validate():
+    clip = _clip()
+    suite = perturbation_suite(clip)
+    assert set(suite) == {
+        "reversal", "freeze_start", "freeze_end", "shuffle",
+        "speed_slow", "speed_fast", "trunc_25", "trunc_50", "trunc_75",
+    }
+    for name, pclip in suite.items():
+        assert validate_clip(pclip) == [], (name, validate_clip(pclip))
+
+
+def test_perturbation_suite_is_deterministic():
+    clip = _clip()
+    a = perturbation_suite(clip)
+    b = perturbation_suite(clip)
+    for name in a:
+        np.testing.assert_array_equal(a[name]["root_pos_z"], b[name]["root_pos_z"])

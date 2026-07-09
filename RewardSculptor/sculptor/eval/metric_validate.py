@@ -1043,6 +1043,134 @@ def discrimination_of_metric(
     return graded_discrimination(fn, meta)
 
 
+# ── §REFERENCE_TRAJECTORY_PLAN §5: reference-anchored validation ────────
+
+
+def _score_reference_entry(
+    fn, clip: dict, required_roles: list[str],
+) -> tuple[float, dict[str, Any]]:
+    """`clip_to_arrays` + `inject_joint_roles` (lenient, on the reference's
+    OWN joint_names) + `_score` for one clip. Never raises: a crash scores
+    `nan` (the caller treats that as "no signal", mirroring `_score`'s
+    existing archetype error path — no bypass of the bounded/determinism
+    machinery)."""
+    from sculptor.refs.convert import clip_to_arrays
+
+    try:
+        arrays, meta = clip_to_arrays(clip)
+        inject_joint_roles(meta, required_roles, lenient=True)
+        return _score(fn, arrays, meta), meta
+    except Exception:  # noqa: BLE001 — "no signal", never raises out
+        return float("nan"), {}
+
+
+def _validate_references(
+    fn, references: list[tuple[str, dict]], required_roles: list[str],
+    *, spread_min: float, degenerate_anchor: float,
+) -> tuple[list[dict[str, Any]], dict[str, float]]:
+    """Score every reference (full clip + its `perturbation_suite`) and
+    apply the three §5 gates per reference:
+
+      1. `reference_nondegeneracy` — the full reference must score >= the
+         fixed battery's degenerate anchors (still/fallen/chaotic/
+         upright_flail) + `spread_min`. Replaces the vacuous-probe fallback
+         as the nondegeneracy signal when a reference is attached (wired by
+         the caller, which only reaches here for a family-None goal without
+         a battery positive OR always when references are given —
+         `validate_generated_metric` decides which; this function just
+         SCORES and gates).
+      2. `reference_monotonicity` — full > trunc_75 > trunc_50 > trunc_25
+         (each strictly, by >= 1e-6), and every truncation still >= the
+         degenerate anchor (a partial completion shouldn't score below
+         everything).
+      3. `reference_negatives` — none of reversal/freeze_start/freeze_end/
+         shuffle may score above `degenerate_anchor + spread_min`.
+
+    `speed_slow`/`speed_fast` are SCORED AND RECORDED but NOT gated: a
+    kinematic metric may legitimately score a time-scaled completion high
+    (it's still the same completed motion, just faster/slower), so gating
+    it would false-reject an honest metric. Revisit under the R5 adversarial
+    suite if a time-scaling exploit is ever observed in practice.
+
+    Returns `(per_reference_results, all_scores)` where `all_scores` keys
+    are `"reference:<id>"` / `"reference:<id>:<perturbation>"` for the
+    caller's `archetype_scores`."""
+    from sculptor.refs.perturb import perturbation_suite
+
+    results: list[dict[str, Any]] = []
+    all_scores: dict[str, float] = {}
+    for clip_id, clip in references:
+        full_score, _ = _score_reference_entry(fn, clip, required_roles)
+        all_scores[f"reference:{clip_id}"] = full_score
+
+        try:
+            suite = perturbation_suite(clip)
+        except Exception:  # noqa: BLE001 — a malformed clip fails gates below, not here
+            suite = {}
+        pert_scores: dict[str, float] = {}
+        for name, pclip in suite.items():
+            s, _ = _score_reference_entry(fn, pclip, required_roles)
+            pert_scores[name] = s
+            all_scores[f"reference:{clip_id}:{name}"] = s
+
+        ref_gates: dict[str, bool] = {}
+        ref_reasons: list[str] = []
+
+        finite_full = np.isfinite(full_score)
+        nondegen_ok = bool(
+            finite_full and full_score >= degenerate_anchor + spread_min)
+        ref_gates["reference_nondegeneracy"] = nondegen_ok
+        if not nondegen_ok:
+            ref_reasons.append(
+                f"[reference:{clip_id}] nondegeneracy: full-reference score "
+                f"{full_score:.3f} does not beat the battery degenerate "
+                f"anchor {degenerate_anchor:.3f} + spread_min {spread_min} "
+                f"— the metric does not clearly reward the reference motion")
+
+        t75 = pert_scores.get("trunc_75", float("nan"))
+        t50 = pert_scores.get("trunc_50", float("nan"))
+        t25 = pert_scores.get("trunc_25", float("nan"))
+        mono_terms = [full_score, t75, t50, t25]
+        mono_ok = all(np.isfinite(v) for v in mono_terms) and (
+            full_score >= t75 + 1e-6
+            and t75 >= t50 + 1e-6
+            and t50 >= t25 + 1e-6
+            and all(v >= degenerate_anchor for v in (t75, t50, t25)))
+        ref_gates["reference_monotonicity"] = mono_ok
+        if not mono_ok:
+            ref_reasons.append(
+                f"[reference:{clip_id}] monotonicity: expected full "
+                f"({full_score:.3f}) > trunc_75 ({t75:.3f}) > trunc_50 "
+                f"({t50:.3f}) > trunc_25 ({t25:.3f}), each strictly, and all "
+                f"truncations >= the degenerate anchor "
+                f"({degenerate_anchor:.3f}) — the metric does not grade "
+                f"partial completion of the reference monotonically")
+
+        neg_names = ("reversal", "freeze_start", "freeze_end", "shuffle")
+        neg_ceiling = degenerate_anchor + spread_min
+        offenders = [
+            n for n in neg_names
+            if np.isfinite(pert_scores.get(n, float("nan")))
+            and pert_scores[n] > neg_ceiling
+        ]
+        ref_gates["reference_negatives"] = not offenders
+        if offenders:
+            ref_reasons.append(
+                f"[reference:{clip_id}] negatives: {offenders} scored above "
+                f"the degenerate ceiling {neg_ceiling:.3f} "
+                f"({ {n: round(pert_scores[n], 3) for n in offenders} }) "
+                f"— gameable by a reversed/frozen/shuffled near-miss of the "
+                f"reference")
+
+        results.append({
+            "clip_id": clip_id,
+            "gates": ref_gates,
+            "reasons": ref_reasons,
+            "scores": {"full": full_score, **pert_scores},
+        })
+    return results, all_scores
+
+
 def validate_generated_metric(
     source: str,
     module_path: Path | str,
@@ -1052,6 +1180,7 @@ def validate_generated_metric(
     behavior_goal: Optional[str] = None,
     robot_hint: Optional[str] = None,
     robot_joint_names: Optional[Sequence[str]] = None,
+    references: Optional[list[tuple[str, dict]]] = None,
 ) -> dict[str, Any]:
     """Run all MUST-HAVE gates on a generated metric. `source` is the
     module text (for static gates); `module_path` is where it's been
@@ -1071,7 +1200,23 @@ def validate_generated_metric(
     THIS robot, or the metric is rejected pre-project. Plus two new gates that
     run regardless: a static ban on hard-coded integer joint indices and a
     permutation-robustness check (a metric that reads joints by index rather
-    than name swings when the joint axis is relabelled)."""
+    than name swings when the joint axis is relabelled).
+
+    §REFERENCE_TRAJECTORY_PLAN §5: `references` (optional — a list of
+    `(clip_id, loaded clip dict)` pairs) attaches reference-anchored
+    validation, ADDITIVE to everything above (nothing changes when
+    `references` is omitted). Each reference contributes THREE new gates
+    (`reference_nondegeneracy`, `reference_monotonicity`,
+    `reference_negatives` — see their per-function docstrings below) scored
+    with `sculptor.refs.convert.clip_to_arrays` + `sculptor.refs.perturb
+    .perturbation_suite`, using the reference's OWN meta (the fixed battery
+    keeps its own synthetic meta). When any reference is attached, it
+    REPLACES the goal-agnostic selectivity-probe fallback as the
+    nondegeneracy signal for a family-`None` goal (a real exemplar beats a
+    synthetic probe); the probe still runs when no reference is given. The
+    result gains a `"references"` key: a list of
+    `{"clip_id", "gates", "scores"}` per reference. Overall `ok` requires
+    every per-reference gate to pass too."""
     gates: dict[str, bool] = {}
     reasons: list[str] = []
     family = resolve_behavior_family(behavior_goal, robot_hint)
@@ -1106,7 +1251,7 @@ def validate_generated_metric(
     if not (gates["ast_safety"] and gates["defines_compute_spec"]):
         return {"ok": False, "gates": gates, "reasons": reasons,
                 "archetype_scores": {}, "family": family,
-                "required_roles": required_roles}
+                "required_roles": required_roles, "references": []}
 
     try:
         mod = load_generated_module(module_path)
@@ -1118,7 +1263,7 @@ def validate_generated_metric(
         reasons.append(f"[load] {type(e).__name__}: {e}")
         return {"ok": False, "gates": gates, "reasons": reasons,
                 "archetype_scores": {}, "family": family,
-                "required_roles": required_roles}
+                "required_roles": required_roles, "references": []}
     gates["loads"] = True
     required_roles = read_required_roles(mod)
 
@@ -1251,10 +1396,35 @@ def validate_generated_metric(
     if frame.get("goal_axis") != "+x" and "walker" in finite:
         neg_anchors["walker"] = finite["walker"]
     best_pos_battery = max(pos_finite) if pos_finite else 0.0
+    battery_spread = (
+        (max(finite.values()) - min(finite.values())) if len(finite) >= 3
+        else 0.0)
+    # §REFERENCE_TRAJECTORY_PLAN §5.1: an attached reference REPLACES the
+    # goal-agnostic probe/fixed-battery fallback as the nondegeneracy signal
+    # for a family-None goal — a real exemplar beats both a synthetic probe
+    # AND the fixed battery's own spread check (which has no positive
+    # exemplar for a genuinely novel motion, e.g. get-up: every archetype
+    # sits near a fixed standing/fallen height, so the battery is
+    # uninformative even though no single positive is exactly ~0). Deferred
+    # ENTIRELY to `_validate_references`'s three gates below; the fixed
+    # battery's own nondegeneracy check is skipped in this branch (both
+    # spread-based paths below), NOT run in addition to it.
+    reference_anchored = (
+        references and family is None and len(finite) >= 3
+        and (best_pos_battery <= _BATTERY_NEAR_ZERO
+             or battery_spread < spread_min))
     battery_uninformative = (
-        family is None and len(finite) >= 3
+        not references and family is None and len(finite) >= 3
         and best_pos_battery <= _BATTERY_NEAR_ZERO)
-    if battery_uninformative:
+    if reference_anchored:
+        reasons.append(
+            "[nondegeneracy] deferred to attached reference(s): the fixed "
+            f"archetype battery is uninformative for this novel goal "
+            f"(best positive {best_pos_battery:.3f}, spread "
+            f"{battery_spread:.3f} < {spread_min}) — nondegeneracy is "
+            "decided by the reference_nondegeneracy/monotonicity/negatives "
+            "gates below")
+    elif battery_uninformative:
         probe = _selectivity_probe(fn, meta)
         selectivity = probe
         anchors = {"probe_degenerate": probe["degenerate"], **neg_anchors}
@@ -1361,6 +1531,30 @@ def validate_generated_metric(
                         f"+ a completion gate + an amplitude floor")
     gates["nondegeneracy"] = nondegen
 
+    # §REFERENCE_TRAJECTORY_PLAN §5: reference-anchored validation — ADDITIVE,
+    # only runs when the caller attaches reference clip(s) and the metric
+    # loaded + ran cleanly (mirrors the axioms gate's guard below: nothing to
+    # anchor against if every archetype crashed).
+    reference_results: list[dict[str, Any]] = []
+    if references and gates.get("bounded") and gates.get("loads"):
+        # "the fixed battery's degenerate anchors" per §5.1 — max over
+        # still/fallen/chaotic/upright_flail, whichever scored finite (a
+        # metric that crashed on all four has no anchor to compare against,
+        # so the reference gates fall back to 0.0 — any finite positive
+        # reference score then clears the nondegeneracy bar on its own).
+        degenerate_anchor = max(
+            (finite[k] for k in ("still", "fallen", "chaotic", "upright_flail")
+             if k in finite), default=0.0)
+        reference_results, ref_scores = _validate_references(
+            fn, references, required_roles,
+            spread_min=spread_min, degenerate_anchor=degenerate_anchor)
+        scores.update(ref_scores)
+        for entry in reference_results:
+            for gate_name, gate_ok in entry["gates"].items():
+                key = f"{gate_name}:{entry['clip_id']}"
+                gates[key] = gate_ok
+            reasons += entry["reasons"]
+
     # §Ship 50: L1 task-agnostic axioms — controlled-perturbation invariants
     # (uprightness-monotone, no-reward-for-chaos, stationary-no-travel) that
     # harden EVERY metric beyond the L0 archetype comparison. Lazy import to
@@ -1382,4 +1576,5 @@ def validate_generated_metric(
             "archetype_scores": scores, "family": family,
             "goal_frame": frame, "nondegeneracy_vacuous": vacuous,
             "selectivity_probe": selectivity,
-            "required_roles": required_roles, "axioms": axioms}
+            "required_roles": required_roles, "axioms": axioms,
+            "references": reference_results}
