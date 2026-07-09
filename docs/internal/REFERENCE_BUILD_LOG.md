@@ -154,6 +154,44 @@ get-up the lying start is the TASK, not curriculum; if eval resets
 standing, the certified metric scores garbage on eval rollouts (scope
 design question, evidence being gathered).
 
+### D17. Stage-fixed eval reset for get-up stages (in flight)
+Eval-scope recon (D16 agent, evidence _mjlab_runner.py:1541): fitness
+rollouts apply shared scope ONLY — deliberate, so diagnoser-iterable
+train knobs can't make per-iteration fitness incomparable. But for
+get-up the lying start is the TASK, not curriculum: eval resetting
+standing means the certified metric scores rollouts that never lie
+down. Decision: stage-FIXED deterministic eval reset — derive_eval_reset
+(range midpoints, vz 0, joint noise 0, fell_over off) written ONCE at
+scaffold to <stage>/eval_reset.json, passed to the rollout path as an
+explicit override applied after the shared-only env-spec. Never touches
+the frozen shared scope; nothing the diagnoser can iterate; jump
+missions byte-identical (None for airborne). Rejected alternatives:
+reset keys in shared scope (breaks the frozen invariant with a
+sub-invariant), reading train scope at eval (diagnoser edits would
+shift eval conditions mid-mission).
+
+### D18. root_only hard negative closes the displacement-only gaming class
+Second Opus audit PROVED a pelvis-rise-only metric (time-height
+correlation of the base, zero posture dependence) passed all three
+reference gates — a levitating-supine policy would score 1.0. New
+perturbation `root_motion_only`: the clip's root trajectory with every
+posture channel frozen at frame 0. Gated in reference_negatives; present
+ONLY when the clip carries posture channels (else it equals the original
+and would falsely convict everything). Consequence, intended: height-only
+metrics are now convicted on posture-carrying clips — get-up metrics MUST
+read orientation. Universal rigor: gliding statues can't pass gait
+metrics, root-pop can't pass jump metrics.
+
+### Audit findings deferred (logged, not yet fixed)
+- Tier-D spoofing (LOW, latent): calibrate_metric_against_reference's
+  `tier` arg comes from caller/provenance (user-writable) — no production
+  caller yet; MUST be wired to require a verified track.py feasibility
+  certificate (tierD block + rollout hash) before §6 goes live in the
+  mission pipeline.
+- "fall down" retrieval quality (LOW): "fall" is concept-diluted inside
+  the 7-member get-up synonym group; rare modifier "down" wins. Optional
+  polish: own fall-group + regression test.
+
 ## Verified state after R1 + R2-a (2026-07-09)
 - Library: 301 g1 clips (LAFAN1 40 + segments; fleaven ACCAD slice), all
   with preview.png, 0 unexplained rejects (199 rejects all QC-reasoned,

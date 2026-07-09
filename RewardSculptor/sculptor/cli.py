@@ -1861,5 +1861,72 @@ def refs_resegment(
         typer.echo(f"  x rejected: {cand_id}: {reason}")
 
 
+@refs_app.command("track")
+def refs_track(
+    clip_id: str = typer.Option(
+        ..., "--clip-id", help="Tier-K clip_id to certify to Tier D."),
+    robot: str = typer.Option("g1", "--robot", help="Robot the clip belongs to."),
+    donor_project: Path = typer.Option(
+        ..., "--donor-project",
+        help="Path to an existing sculpt project whose config.toml "
+             "[adapter] table (class + config) is templated into the "
+             "throwaway tracking project."),
+    iterations: int = typer.Option(
+        3, "--iterations", help="Number of adapter.train() calls "
+        "(each warm-started from the prior checkpoint)."),
+    steps_per_iteration: int = typer.Option(
+        2000, "--steps-per-iteration", help="mjlab max_iterations per "
+        "adapter.train() call (see MjlabAdapter.train's docstring: "
+        "'steps' IS max_iterations, not raw env steps)."),
+    n_episodes: int = typer.Option(
+        2, "--n-episodes", help="Rollout episodes scored against the clip."),
+    seed: int = typer.Option(0, "--seed", help="Train/rollout seed."),
+    project_dir: Optional[Path] = typer.Option(
+        None, "--project-dir",
+        help="Throwaway project directory (default: "
+             "<clip_dir>/tierD_work)."),
+    dry_run: bool = typer.Option(
+        False, "--dry-run",
+        help="Build the throwaway project (config + tracking reward + "
+             "RSI/eval-reset env spec) and print the plan without "
+             "training."),
+) -> None:
+    """Tier-D certification (§REFERENCE_TRAJECTORY_PLAN §2.3, §11 R4):
+    physics-track a Tier-K clip in our own mjlab sim with a bounded
+    DeepMimic-style tracking run. Success within tolerance upgrades the
+    clip's provenance tier K -> D and copies the tracked rollout beside
+    the clip as `tierD_rollout.npz`; failure records
+    `tierD.feasible=false` (a useful verdict, not an error) and leaves
+    the tier unchanged. See `sculptor.refs.track` for the full pipeline."""
+    import json as _json
+
+    from sculptor.refs.track import TrackError, track_clip
+
+    try:
+        result = track_clip(
+            clip_id=clip_id, robot=robot, donor_project=donor_project,
+            iterations=iterations, steps_per_iteration=steps_per_iteration,
+            n_episodes=n_episodes, seed=seed, project_dir=project_dir,
+            dry_run=dry_run, progress=lambda msg: typer.echo(msg))
+    except TrackError as e:
+        typer.echo(f"[refs track] FAILED: {e}", err=True)
+        raise typer.Exit(code=1) from e
+
+    if result.dry_run:
+        typer.echo(
+            f"[refs track] dry-run plan: project_dir={result.plan.project_dir} "
+            f"reward={result.plan.reward_path} config={result.plan.config_path} "
+            f"iterations={result.plan.iterations} "
+            f"steps_per_iteration={result.plan.steps_per_iteration} "
+            f"n_episodes={result.plan.n_episodes} "
+            f"joint_names={result.plan.joint_names}")
+        return
+
+    assert result.errors is not None
+    verdict = "FEASIBLE (tier -> D)" if result.errors.feasible else "INFEASIBLE (tier stays K)"
+    typer.echo(f"[refs track] {clip_id}: {verdict}")
+    typer.echo(_json.dumps(result.errors.to_dict(), indent=2))
+
+
 if __name__ == "__main__":  # pragma: no cover
     app()
