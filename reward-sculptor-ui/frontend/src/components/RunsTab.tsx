@@ -1,5 +1,5 @@
 import { useMemo, useRef, useState } from "react";
-import { useQueries } from "@tanstack/react-query";
+import { useQueries, useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
 
 import { Icon } from "@/components/rs/icon";
@@ -14,7 +14,10 @@ import { useMission, useMissions, useStageIterations } from "@/hooks/useMissions
 import { useRegenerateRewardTemplate, useRewards } from "@/hooks/useRewards";
 import { usePolicies } from "@/hooks/usePolicies";
 import { useControlRun, useKillRun, useProjectIterations, useRun, useRuns } from "@/hooks/useRuns";
-import { ApiError, getMission, policyExportUrl, projectIterRolloutUrl, stageRolloutUrl } from "@/lib/api";
+import {
+  ApiError, getMission, getStageIterDetail, getStageObjectiveMetric,
+  policyExportUrl, projectIterRolloutUrl, stageRolloutUrl,
+} from "@/lib/api";
 import { qk } from "@/lib/queryKeys";
 import { failureReasonText, stageLabel, supersededText } from "@/lib/stageDisplay";
 import { formatRelative } from "@/lib/utils";
@@ -28,7 +31,10 @@ import type {
   RunEvent,
   RunSummary,
   SelectedStage,
+  StageIterDetail,
+  StageIterPaperRef,
   StageIteration,
+  StageObjectiveMetric,
 } from "@/lib/types";
 
 // ── benign-error display mapping ────────────────────────────────────────
@@ -554,6 +560,24 @@ function StageDetailPane({
   const activeIter = picked ?? defaultIter;
   const activeRow = rows.find((r) => r.iter_index === activeIter) ?? null;
 
+  // §narrate-completed-stage: the objective metric that guided this whole
+  // stage (once per stage, not per iteration).
+  const objectiveMetric = useQuery<StageObjectiveMetric>({
+    queryKey: ["stageObjectiveMetric", slug, missionSlug, stageName],
+    queryFn: () => getStageObjectiveMetric(slug, missionSlug, stageName),
+    enabled: !!slug && !!missionSlug && !!stageName,
+    staleTime: 30_000,
+  });
+
+  // §narrate-completed-stage: per-iteration reasoning (reward description,
+  // diagnosis evidence, cited papers, components) for the selected iter.
+  const iterDetail = useQuery<StageIterDetail>({
+    queryKey: ["stageIterDetail", slug, missionSlug, stageName, activeIter],
+    queryFn: () => getStageIterDetail(slug, missionSlug, stageName, activeIter as number),
+    enabled: !!slug && !!missionSlug && !!stageName && activeIter != null,
+    staleTime: 30_000,
+  });
+
   return (
     <div className="rs-runs-detail">
       <div className="rs-iter-col">
@@ -595,6 +619,12 @@ function StageDetailPane({
           <span className="rs-eyebrow" style={{ flexShrink: 0 }}>disk-truth · not the live job</span>
         </div>
 
+        {/* §narrate-completed-stage: the objective metric that steered
+            this stage — the thing the screen recording wants to point at. */}
+        <div style={{ padding: "0 16px 12px" }}>
+          <StageObjectiveMetricCard query={objectiveMetric} />
+        </div>
+
         {/* Rollout player for the picked iter — same disk-truth source as
             MissionDetailDialog's StagePanel, so it survives the run_id
             going stale. */}
@@ -627,6 +657,14 @@ function StageDetailPane({
           <p className="rs-sub" style={{ margin: "0 16px 12px", fontSize: 11 }}>iter {activeIter} has no rollout video.</p>
         ) : null}
 
+        {/* §narrate-completed-stage: per-iteration score/reasoning/papers
+            for whichever iter is selected on the left. */}
+        {activeIter != null && (
+          <div style={{ padding: "0 16px 12px" }}>
+            <StageIterDetailCard iterIndex={activeIter} query={iterDetail} />
+          </div>
+        )}
+
         <div style={{ padding: "0 16px" }}>
           <p className="rs-sub" style={{ fontSize: 12, lineHeight: 1.6 }}>
             This stage isn't the one currently training, so its data is read straight off
@@ -638,6 +676,241 @@ function StageDetailPane({
       <div className="rs-extra-col">
         {missionSlug && stageName && <StageRewardsCard slug={slug} stage={`${missionSlug}/${stageName}`} />}
       </div>
+    </div>
+  );
+}
+
+// §narrate-completed-stage: status → chip tone/label/icon for the stage
+// objective-metric card.
+const OBJECTIVE_METRIC_STATUS_META: Record<
+  StageObjectiveMetric["status"],
+  { label: string; cls: "slate" | "amber" | "emerald"; icon: string }
+> = {
+  accepted:  { label: "Objective metric ✓", cls: "emerald", icon: "check-circle" },
+  rejected:  { label: "Rejected — blind fallback", cls: "amber", icon: "alert-triangle" },
+  inherited: { label: "Inherited", cls: "slate", icon: "git-branch" },
+  none:      { label: "No objective metric", cls: "slate", icon: "minus" },
+};
+
+/** The objective metric that guided this stage — generated once at stage
+ *  launch, then used to score every iteration. This is the "here's the
+ *  metric that steered training" panel a screen recording narrates. */
+function StageObjectiveMetricCard({ query }: { query: ReturnType<typeof useQuery<StageObjectiveMetric>> }) {
+  const { data, isLoading, error } = query;
+  if (isLoading) {
+    return <div className="rs-card rs-card-pad"><p className="rs-sub" style={{ fontSize: 11 }}>Loading objective metric…</p></div>;
+  }
+  if (error) {
+    return <div className="rs-card rs-card-pad"><p className="rs-sub" style={{ fontSize: 11, color: "var(--st-rose)" }}>{(error as Error).message}</p></div>;
+  }
+  if (!data) return null;
+  const meta = OBJECTIVE_METRIC_STATUS_META[data.status] ?? OBJECTIVE_METRIC_STATUS_META.none;
+  return (
+    <div className="rs-card rs-card-pad">
+      <div className="rs-flex rs-gap-8" style={{ alignItems: "flex-start" }}>
+        <div className="rs-card-title" style={{ fontSize: 13, flex: 1, minWidth: 0 }}>
+          <Icon name="target" size={15} />Objective metric
+        </div>
+        <span className={"rs-badge " + meta.cls}><Icon name={meta.icon} size={12} />{meta.label}</span>
+      </div>
+      {data.behavior_goal && (
+        <p style={{ margin: "8px 0 0", fontSize: 12.5, lineHeight: 1.5 }}>
+          <span className="rs-sub">Generated from: </span>{data.behavior_goal}
+        </p>
+      )}
+      <div className="rs-flex rs-wrap rs-gap-8" style={{ marginTop: 8 }}>
+        {data.calibrated != null && (
+          <span className="rs-tag" style={{ fontSize: 10.5 }}>
+            <Icon name={data.calibrated ? "check" : "minus"} size={11} />
+            {data.calibrated ? "calibrated" : "not calibrated"}
+          </span>
+        )}
+        {typeof data.n_candidates === "number" && (
+          <span className="rs-tag" style={{ fontSize: 10.5 }}>{data.n_candidates} candidate{data.n_candidates === 1 ? "" : "s"} sampled</span>
+        )}
+      </div>
+      {data.review_summary && (
+        <p className="rs-sub" style={{ margin: "8px 0 0", fontSize: 12, lineHeight: 1.5 }}>{data.review_summary}</p>
+      )}
+      {data.metric_source && (
+        <details style={{ marginTop: 10 }}>
+          <summary style={{ cursor: "pointer", fontSize: 11.5, color: "var(--rs-muted)", userSelect: "none" }}>
+            View metric source (metric.py)
+          </summary>
+          <pre
+            className="mono"
+            style={{
+              margin: "8px 0 0", padding: 10, fontSize: 10.5, lineHeight: 1.5,
+              background: "var(--canvas-soft)", border: "1px solid var(--hairline)",
+              borderRadius: "var(--radius-sm)", overflow: "auto", maxHeight: 320,
+              whiteSpace: "pre",
+            }}
+          >
+            {data.metric_source}
+          </pre>
+        </details>
+      )}
+    </div>
+  );
+}
+
+/** Merges reward_references + literature_context into one paper-citation
+ *  list, deduping by arxiv_id/citation so the same paper isn't shown twice
+ *  when both fields happen to carry it. */
+function mergePaperRefs(a: StageIterPaperRef[], b: StageIterPaperRef[]): StageIterPaperRef[] {
+  const seen = new Set<string>();
+  const out: StageIterPaperRef[] = [];
+  for (const ref of [...a, ...b]) {
+    const key = (ref.arxiv_id ?? "") + "|" + (ref.citation ?? ref.description ?? "");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(ref);
+  }
+  return out;
+}
+
+/** Per-iteration reasoning: objective fitness / mean return, the reward's
+ *  own description, the diagnoser's evidence prose, failure-mode chips,
+ *  cited papers, and reward-component values. This is the "narrate the
+ *  loop's thinking" panel — every field is best-effort/nullable since
+ *  older iterations won't have all of them. */
+function StageIterDetailCard({ iterIndex, query }: { iterIndex: number; query: ReturnType<typeof useQuery<StageIterDetail>> }) {
+  const { data, isLoading, error } = query;
+  if (isLoading) {
+    return <div className="rs-card rs-card-pad"><p className="rs-sub" style={{ fontSize: 11 }}>Loading iteration detail…</p></div>;
+  }
+  if (error) {
+    return <div className="rs-card rs-card-pad"><p className="rs-sub" style={{ fontSize: 11, color: "var(--st-rose)" }}>{(error as Error).message}</p></div>;
+  }
+  if (!data) return null;
+
+  const failureModes = data.failure_modes.filter((f) => f && f !== "none");
+  const papers = mergePaperRefs(data.reward_references ?? [], data.literature_context ?? []);
+  const hasScores = data.objective_fitness != null || data.primary_metric != null || data.reward_version;
+  const componentEntries = data.components ? Object.entries(data.components) : [];
+  const maxComponentAbs = componentEntries.length
+    ? Math.max(...componentEntries.map(([, v]) => Math.abs(v)), 1e-9)
+    : 1;
+
+  return (
+    <div className="rs-card rs-card-pad">
+      <div className="rs-card-title" style={{ fontSize: 13, marginBottom: 10 }}>
+        <Icon name="circle-dot" size={15} />Iteration {iterIndex} reasoning
+      </div>
+
+      {hasScores && (
+        <div className="rs-flex rs-wrap rs-gap-16" style={{ marginBottom: 10 }}>
+          {data.objective_fitness != null ? (
+            <span title="objective fitness — the loop's steering score">
+              <span className="rs-sub" style={{ fontSize: 11 }}>objective fitness</span><br />
+              <span className="rs-num" style={{ fontSize: 17, fontWeight: 600, color: "#b9aef5" }}>{data.objective_fitness.toFixed(3)}</span>
+            </span>
+          ) : (
+            <span>
+              <span className="rs-sub" style={{ fontSize: 11 }}>objective fitness</span><br />
+              <span className="rs-sub" style={{ fontSize: 12 }}>not tracked this iter — see notes below</span>
+            </span>
+          )}
+          {data.primary_metric != null && (
+            <span title="mean return over the rollout">
+              <span className="rs-sub" style={{ fontSize: 11 }}>mean return</span><br />
+              <span className="rs-num" style={{ fontSize: 15 }}>{data.primary_metric.toFixed(2)}</span>
+            </span>
+          )}
+          {data.reward_version && (
+            <span>
+              <span className="rs-sub" style={{ fontSize: 11 }}>reward</span><br />
+              <span className="rs-num" style={{ fontSize: 15 }}>{data.reward_version}</span>
+            </span>
+          )}
+          {data.confidence != null && (
+            <span title="diagnoser's confidence in this analysis">
+              <span className="rs-sub" style={{ fontSize: 11 }}>confidence</span><br />
+              <span className="rs-num" style={{ fontSize: 15 }}>{(data.confidence * 100).toFixed(0)}%</span>
+            </span>
+          )}
+        </div>
+      )}
+
+      {data.reward_description && (
+        <div style={{ marginBottom: 10 }}>
+          <div className="rs-eyebrow" style={{ marginBottom: 4 }}>Reward reasoning</div>
+          <p style={{ margin: 0, fontSize: 12.5, lineHeight: 1.55 }}>{data.reward_description}</p>
+        </div>
+      )}
+
+      {data.evidence && (
+        <div style={{ marginBottom: 10 }}>
+          <div className="rs-eyebrow" style={{ marginBottom: 4 }}>Diagnosis</div>
+          <p style={{ margin: 0, fontSize: 12.5, lineHeight: 1.55, whiteSpace: "pre-wrap" }}>{data.evidence}</p>
+        </div>
+      )}
+
+      {failureModes.length > 0 && (
+        <div style={{ marginBottom: 10 }}>
+          <div className="rs-eyebrow" style={{ marginBottom: 4 }}>Failure modes</div>
+          <div className="rs-flex rs-wrap rs-gap-6">
+            {failureModes.map((f) => (
+              <span key={f} className="rs-tag mono" style={{ fontSize: 10 }}>{f}</span>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {papers.length > 0 && (
+        <div style={{ marginBottom: componentEntries.length > 0 ? 10 : 0 }}>
+          <div className="rs-eyebrow" style={{ marginBottom: 4 }}>Cited papers</div>
+          <div className="rs-vgap-8">
+            {papers.map((p, i) => (
+              <div key={i} style={{ fontSize: 12, lineHeight: 1.45 }}>
+                {p.arxiv_id && (
+                  <a
+                    href={`https://arxiv.org/abs/${p.arxiv_id}`}
+                    target="_blank"
+                    rel="noreferrer noopener"
+                    className="mono"
+                    style={{ color: "var(--rs-primary)", marginRight: 6 }}
+                  >
+                    {p.arxiv_id}
+                  </a>
+                )}
+                <span>{p.citation ?? p.description ?? "(untitled reference)"}</span>
+                {p.citation && p.description && p.description !== p.citation && (
+                  <span className="rs-sub" style={{ display: "block", fontSize: 11 }}>{p.description}</span>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {componentEntries.length > 0 && (
+        <div>
+          <div className="rs-eyebrow" style={{ marginBottom: 4 }}>Reward components (mean over rollout)</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            {componentEntries.map(([name, value]) => (
+              <div key={name} className="rs-flex rs-gap-8" style={{ alignItems: "center", fontSize: 11.5 }}>
+                <span className="mono rs-sub" style={{ width: 140, flexShrink: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={name}>{name}</span>
+                <span style={{ flex: 1, height: 6, background: "var(--canvas-soft)", borderRadius: 3, overflow: "hidden" }}>
+                  <span
+                    style={{
+                      display: "block", height: "100%",
+                      width: `${Math.min(100, (Math.abs(value) / maxComponentAbs) * 100)}%`,
+                      background: value < 0 ? "var(--st-rose)" : "var(--st-emerald)",
+                      marginLeft: value < 0 ? "auto" : 0,
+                    }}
+                  />
+                </span>
+                <span className="rs-num" style={{ width: 56, textAlign: "right", flexShrink: 0 }}>{value.toFixed(3)}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {!data.reward_description && !data.evidence && papers.length === 0 && componentEntries.length === 0 && !hasScores && (
+        <p className="rs-sub" style={{ fontSize: 11.5 }}>No reasoning recorded for this iteration.</p>
+      )}
     </div>
   );
 }
