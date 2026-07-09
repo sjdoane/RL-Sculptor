@@ -14,9 +14,11 @@ import {
   getReportsSources,
   policyExportUrl,
   stageCheckpointUrl,
+  stageExportUrl,
   stageRolloutUrl,
 } from "@/lib/api";
 import { qk } from "@/lib/queryKeys";
+import { stageLabel } from "@/lib/stageDisplay";
 import type { SelectedStage, StageIteration, StageSchema } from "@/lib/types";
 
 /** A report source: the project's standalone runs, or one mission. */
@@ -226,6 +228,38 @@ export function ReportsTab({
     }
   };
 
+  // §Problem 4b: the hero video is a CLEAN SINGLE-ROBOT playback of the
+  // mission's FINAL stage — the last entry in mission.stages — not the
+  // report's tiled final.mp4 and not necessarily the currently-selected
+  // stage above. Prefer the last non-superseded stage (a superseded
+  // parent's own rollout isn't the mission's final policy); fall back to
+  // the literal last entry if every stage is superseded (edge case).
+  const finalStage: StageSchema | null = useMemo(() => {
+    if (stages.length === 0) return null;
+    const notSuperseded = stages.filter((s) => s.status !== "superseded");
+    return notSuperseded.length > 0
+      ? notSuperseded[notSuperseded.length - 1]
+      : stages[stages.length - 1];
+  }, [stages]);
+  const finalStageIters = useStageIterations(
+    slug, sourceMissionSlug ?? undefined, finalStage?.name,
+  );
+  // Prefer the stage's KEPT (best) iter; fall back to the newest iter on
+  // disk that actually has a rollout (kept iter may predate a rollout,
+  // or selection may not have run yet).
+  const heroIterIndex: number | null = useMemo(() => {
+    const kept = finalStage?.selected_iter_index ?? null;
+    const rows = finalStageIters.data ?? [];
+    if (kept != null && rows.some((r) => r.iter_index === kept && r.has_rollout)) return kept;
+    const withRollout = rows.filter((r) => r.has_rollout);
+    if (withRollout.length === 0) return null;
+    return withRollout.reduce((best, r) => (r.iter_index > best.iter_index ? r : best)).iter_index;
+  }, [finalStage, finalStageIters.data]);
+  const heroVideoUrl: string | null =
+    sourceMissionSlug && finalStage && heroIterIndex != null
+      ? stageRolloutUrl(slug, sourceMissionSlug, finalStage.name, heroIterIndex)
+      : null;
+
   const md = useQuery<string>({
     queryKey: [...qk.project(slug), "report", "md", sourceToValue(source)],
     queryFn: () => fetchReportMd(slug, source),
@@ -331,7 +365,25 @@ export function ReportsTab({
           </>
         )}
 
-        <ActuatorLimitsCard slug={slug} />
+        {source.kind === "mission" ? (
+          <ActuatorLimitsCard
+            slug={slug}
+            missionSlug={source.missionSlug}
+            stageName={effectiveStageName}
+          />
+        ) : (
+          <ActuatorLimitsCard slug={slug} />
+        )}
+
+        {source.kind === "mission" && (
+          <HeroVideoCard
+            stage={finalStage}
+            stageIndex1Based={stages.length}
+            iterIndex={heroIterIndex}
+            videoUrl={heroVideoUrl}
+            isLoading={missionDetail.isLoading || finalStageIters.isLoading}
+          />
+        )}
 
         {(quality.data?.length ?? 0) > 0 && (
           <div className="rs-card" style={{ marginBottom: 22 }}>
@@ -410,20 +462,76 @@ export function ReportsTab({
           </div>
         ) : (
           <div className="rs-report rs-card rs-card-pad" style={{ padding: "32px 36px" }}>
-            <div className="rs-viewer" style={{ marginBottom: 24 }}>
-              <div className="rs-viewer-bar">
-                <div className="rs-card-title"><Icon name="video" size={16} />final.mp4</div>
-                <a href={mp4Url} download="final.mp4" className="rs-btn rs-btn-quiet rs-btn-sm">
-                  <Icon name="download" size={14} />MP4
-                </a>
-              </div>
-              <video src={mp4Url} className="rs-viewer-stage" style={{ width: "100%", aspectRatio: "16/9", background: "#16150f" }} controls playsInline preload="metadata">
-                <track kind="captions" />
-              </video>
+            <div className="rs-flex rs-gap-8" style={{ marginBottom: 20, alignItems: "center" }}>
+              <span className="rs-sub" style={{ fontSize: 11.5 }}>
+                Side-by-side timelapse of every stage, stitched into one clip:
+              </span>
+              <a href={mp4Url} download="final.mp4" className="rs-btn rs-btn-quiet rs-btn-sm">
+                <Icon name="video" size={13} />final.mp4
+                <Icon name="download" size={13} />
+              </a>
             </div>
             <div className="rs-md">
               <ReactMarkdown remarkPlugins={[remarkGfm]}>{md.data ?? ""}</ReactMarkdown>
             </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── Hero video (final policy, clean single view) ───────────────────────
+// §Problem 4b: the report's final.mp4 is a side-by-side timelapse the
+// backend TILES per stage — useful as an archive artifact but a bad
+// "here's the robot" clip. The hero is instead a single clean rollout
+// of the mission's FINAL stage at its kept (or newest-with-rollout)
+// iteration, sourced straight from the stage rollout endpoint.
+function HeroVideoCard({
+  stage, stageIndex1Based, iterIndex, videoUrl, isLoading,
+}: {
+  stage: StageSchema | null;
+  stageIndex1Based: number;
+  iterIndex: number | null;
+  videoUrl: string | null;
+  isLoading: boolean;
+}) {
+  const label = stage ? stageLabel(stage, stageIndex1Based) : null;
+  const displayName = stage?.display_label ?? stage?.name ?? null;
+  return (
+    <div className="rs-card" style={{ marginBottom: 22 }}>
+      <div className="rs-card-head">
+        <div className="rs-card-title">
+          <Icon name="video" size={16} />
+          Final policy{displayName ? ` — ${displayName}` : label ? ` — stage ${label}` : ""}
+          {iterIndex != null ? ` · iter ${iterIndex}` : ""}
+        </div>
+        <span className="rs-sub" style={{ fontSize: 12 }}>
+          clean single-robot rollout · last stage's kept checkpoint
+        </span>
+      </div>
+      <div className="rs-card-pad">
+        {isLoading ? (
+          <p className="rs-sub" style={{ margin: 0 }}>Loading…</p>
+        ) : !videoUrl ? (
+          <EmptyState
+            icon="video"
+            title="No rollout yet"
+            sub="The mission's final stage hasn't produced a rollout video yet."
+          />
+        ) : (
+          <div className="rs-viewer">
+            <video
+              key={videoUrl}
+              src={videoUrl}
+              className="rs-viewer-stage"
+              style={{ width: "100%", aspectRatio: "16/9", background: "#16150f" }}
+              controls
+              playsInline
+              preload="metadata"
+            >
+              <track kind="captions" />
+            </video>
           </div>
         )}
       </div>
@@ -568,7 +676,9 @@ function StageCheckpointsCard({
                     kept
                   </span>
                 )}
-                <span style={{ marginLeft: "auto" }} className="rs-flex rs-gap-8">
+                <span style={{ marginLeft: "auto" }} className="rs-flex rs-gap-8" title={
+                  it.has_checkpoint ? "Builds ONNX + TorchScript + reward/env spec + DEPLOY.md…" : undefined
+                }>
                   {it.has_rollout && (
                     <a
                       href={stageRolloutUrl(slug, missionSlug, stageName, it.iter_index)}
@@ -582,12 +692,22 @@ function StageCheckpointsCard({
                   )}
                   {it.has_checkpoint && (
                     <a
+                      href={stageExportUrl(slug, missionSlug, stageName, it.iter_index)}
+                      download
+                      className={"rs-btn rs-btn-sm " + (isSelected ? "rs-btn-primary" : "rs-btn-ghost")}
+                      title="Download the deployment bundle: checkpoint + ONNX + TorchScript + reward/env spec + DEPLOY.md (builds server-side, may take a moment)"
+                    >
+                      <Icon name="package" size={14} />Export bundle (.zip)
+                    </a>
+                  )}
+                  {it.has_checkpoint && (
+                    <a
                       href={stageCheckpointUrl(slug, missionSlug, stageName, it.iter_index)}
                       download
-                      className="rs-btn rs-btn-ghost rs-btn-sm"
-                      title="Download the checkpoint file"
+                      className="rs-btn rs-btn-quiet rs-btn-sm"
+                      title="Download the raw checkpoint file only"
                     >
-                      <Icon name="download" size={14} />Checkpoint
+                      <Icon name="download" size={14} />raw .pt
                     </a>
                   )}
                 </span>

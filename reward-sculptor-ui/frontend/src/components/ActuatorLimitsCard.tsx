@@ -42,9 +42,17 @@ interface ActuatorLimits {
 async function fetchActuatorLimits(
   slug: string,
   iter: number | null,
+  missionSlug?: string,
+  stageName?: string,
 ): Promise<ActuatorLimits> {
-  const q = iter != null ? `?iter=${iter}` : "";
-  const r = await fetch(`/api/projects/${slug}/reports/actuator-limits${q}`);
+  const params = new URLSearchParams();
+  if (iter != null) params.set("iter", String(iter));
+  if (missionSlug && stageName) {
+    params.set("mission_slug", missionSlug);
+    params.set("stage", stageName);
+  }
+  const qs = params.toString();
+  const r = await fetch(`/api/projects/${slug}/reports/actuator-limits${qs ? `?${qs}` : ""}`);
   if (!r.ok)
     return { schema: 1, ok: false, has_torque: false, available_iters: [], iter: null, motors: [] };
   return (await r.json()) as ActuatorLimits;
@@ -129,11 +137,22 @@ function UtilChart({ title, unit, data }: { title: string; unit: string; data: R
   );
 }
 
-export function ActuatorLimitsCard({ slug }: { slug: string }) {
+export function ActuatorLimitsCard({
+  slug, missionSlug, stageName,
+}: {
+  slug: string;
+  // §Problem 4a: when set, scopes the endpoint to a mission stage's
+  // per-iter mjcf_limits.json instead of the project runs tree — a
+  // mission-only project otherwise has an empty /reports/actuator-limits.
+  missionSlug?: string;
+  stageName?: string | null;
+}) {
   const [iter, setIter] = useState<number | null>(null);
   const q = useQuery<ActuatorLimits>({
-    queryKey: [...qk.project(slug), "report", "actuator-limits", iter],
-    queryFn: () => fetchActuatorLimits(slug, iter),
+    queryKey: [
+      ...qk.project(slug), "report", "actuator-limits", iter, missionSlug ?? null, stageName ?? null,
+    ],
+    queryFn: () => fetchActuatorLimits(slug, iter, missionSlug, stageName ?? undefined),
     staleTime: 10_000,
     // Keep the prior iteration's chart (and the <select>) mounted while a newly
     // selected iter loads — without this the iter-key change drops data to
