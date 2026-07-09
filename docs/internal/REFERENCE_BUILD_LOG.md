@@ -182,6 +182,18 @@ metrics are now convicted on posture-carrying clips — get-up metrics MUST
 read orientation. Universal rigor: gliding statues can't pass gait
 metrics, root-pop can't pass jump metrics.
 
+### D18 follow-through: certified-metric re-validation
+All four standing-test stage metrics were re-validated offline against
+the strengthened gate. torso_righting's certificate FAILED root_only
+(score 1.0 — displacement-influenced, Goodhart-able by pelvis-scooting;
+it was actively steering the running mission). Mission stopped, metric
+regenerated under the new gate (accepted, root_only 0.0), mission
+relaunched (job_975bda9d06226ced) — the definitive R2 acceptance run:
+lying RSI + posture event + fell_over removed + eval reset + all four
+metrics D18-certified. Ops rule while a mission runs: NO sculptor-package
+edits (iterations re-import the package; mid-run code drift corrupts the
+experiment) and no backend restarts (kills the job).
+
 ### Audit findings deferred (logged, not yet fixed)
 - Tier-D spoofing (LOW, latent): calibrate_metric_against_reference's
   `tier` arg comes from caller/provenance (user-writable) — no production
