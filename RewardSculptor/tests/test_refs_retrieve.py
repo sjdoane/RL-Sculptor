@@ -55,6 +55,34 @@ FIXTURE_ROWS = [
 ]
 
 
+#: §2026-07-09 concept-boost fixture: reproduces the two failure
+#: patterns an adversarial audit found against the real 301-clip
+#: index — a rare MODIFIER token (forward/high) out-weighing the
+#: motion-CONCEPT token it's attached to. Each block below mirrors one
+#: real clip family so the ordering assertions below exercise the same
+#: shape of index-wide IDF skew as production (many walk/run/lie/hop
+#: rows sharing the concept token so its IDF is modest, one-or-two rows
+#: carrying the rare modifier token so ITS IDF is large).
+CONCEPT_BOOST_ROWS = [
+    # walk family (concept token "walk" appears in 4 rows -> modest IDF)
+    _row("walk_a_subject1", ["walk", "subject", "1"]),
+    _row("walk_b_subject2", ["walk", "subject", "2"]),
+    _row("walk_c_subject3", ["walk", "turn", "left", "subject", "3"]),
+    _row("walk_d_subject4", ["walk", "with", "box", "subject", "4"]),
+    # the decoy: literal "forward" (appears in exactly ONE row -> very
+    # rare / high IDF) attached to a NON-walk-group concept ("crawl").
+    _row("crawl_forward_subject5", ["crawl", "forward", "subject", "5"]),
+    # jump/hop family (concept tokens "jump"/"hop" synonym-linked) —
+    # same df (2) as the "high" decoy below, so the two tokens' raw IDF
+    # weights are equal and the win comes purely from `_CONCEPT_BOOST`.
+    _row("hop_a_subject6", ["hop", "subject", "6"]),
+    _row("hop_b_subject7", ["hop", "subject", "7"]),
+    # the decoy: literal "high" attached to a non-jump concept.
+    _row("block_high_subject8", ["block", "high", "subject", "8"]),
+    _row("block_high2_subject9", ["block", "high", "subject", "9"]),
+]
+
+
 # ── tokenizer / synonym expansion ────────────────────────────────────────
 def test_tokenize_query_matches_ingest_tokenize_label_on_filename_stems() -> None:
     """For filename-SHAPED input (no whitespace — what ingest actually
@@ -140,6 +168,47 @@ def test_deterministic_rank_walk_query_prefers_walk_over_getup() -> None:
 
 def test_deterministic_rank_no_overlap_returns_empty() -> None:
     assert deterministic_rank("xyzzy plugh", FIXTURE_ROWS) == []
+
+
+# ── concept-boost regression: motion CONCEPT beats rare MODIFIER ─────────
+# §2026-07-09: an adversarial audit against the real 301-clip library
+# found that `_SYNONYM_MATCH_WEIGHT` alone (round 1) fixed "get up off
+# the ground" but broke other queries — a rare literal MODIFIER token
+# ("forward", "high") could out-weigh the motion-CONCEPT token it rides
+# with, because IDF only measures corpus rarity, not conceptual
+# relevance. `_CONCEPT_BOOST` fixes this by scaling every
+# `SYNONYM_GROUPS`-credited point (concept matches) above plain-literal
+# (modifier) matches. `CONCEPT_BOOST_ROWS` reproduces both failure
+# shapes at fixture scale: a walk-family sharing "walk" plus one decoy
+# row with the rare literal "forward" glued to an unrelated concept
+# ("crawl"); a hop-family sharing "hop" (synonym-linked to "jump") plus
+# decoy rows with the rare literal "high" glued to an unrelated concept
+# ("block").
+def test_deterministic_rank_walk_forward_prefers_walk_over_rare_modifier() -> None:
+    results = deterministic_rank("walk forward", CONCEPT_BOOST_ROWS, k=10)
+    assert results
+    assert results[0].clip_id.startswith("walk_")
+    walk_in_top5 = sum(
+        1 for m in results[:5] if m.clip_id.startswith("walk_"))
+    assert walk_in_top5 >= 3
+
+
+def test_deterministic_rank_jump_high_prefers_hop_over_rare_modifier() -> None:
+    results = deterministic_rank("jump high", CONCEPT_BOOST_ROWS, k=10)
+    assert results
+    top3 = results[:3]
+    hop_in_top3 = sum(1 for m in top3 if m.clip_id.startswith("hop_"))
+    assert hop_in_top3 >= 2
+
+
+def test_deterministic_rank_get_up_off_ground_still_locked_with_concept_boost() -> None:
+    """The original (round-1) acceptance query must keep passing under
+    the round-2 `_CONCEPT_BOOST` scoring — this is the LOCKED
+    requirement, not just a regression nice-to-have."""
+    results = deterministic_rank(
+        "get up off the ground", FIXTURE_ROWS, k=10)
+    assert results
+    assert all(m.clip_id.startswith("fallandgetup") for m in results[:2])
 
 
 def test_deterministic_rank_respects_k() -> None:

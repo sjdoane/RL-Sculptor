@@ -177,47 +177,97 @@ def _row_to_match(row: dict[str, Any], score: float) -> RefMatch:
     )
 
 
-#: Synonym-bridged matches count HALF a literal match. Rationale
+#: Synonym-bridged matches count HALF a literal match (within the
+#: concept component — see `_CONCEPT_BOOST` below). Rationale
 #: (2026-07-09, found against the real 301-row library): expanding BOTH
 #: sides and summing every overlapping token let one conceptual bridge
 #: ("ground"≈"lie") count as 4 rare tokens' worth of weight, so `lie*`
 #: clips outranked the fallAndGetUp segments for the literal acceptance
 #: query "get up off the ground". A synonym hit is one concept — count
-#: it once per group, discounted below any literal token the user
-#: actually typed.
+#: it once per group, discounted below a literal in-group match.
 _SYNONYM_MATCH_WEIGHT = 0.5
+
+#: Multiplier applied to the whole "concept component" of the score —
+#: i.e. everything credited via a `SYNONYM_GROUPS` match (literal
+#: in-group or synonym-bridged). Rationale (2026-07-09, found against
+#: the real 301-row library, round 2): `SYNONYM_GROUPS` IS the
+#: hand-curated motion-concept vocabulary (walk/run/jump/lie/crouch/...).
+#: Once the first fix (`_SYNONYM_MATCH_WEIGHT`) fixed "get up off the
+#: ground", a second failure mode showed up: a rare MODIFIER token that
+#: isn't a motion concept at all (e.g. "forward", "high", "down") can
+#: still carry a bigger raw IDF weight than the concept token itself,
+#: because it appears in fewer rows. "walk forward" then let
+#: crawl_forward/lie_forward clips (which share the literal "forward"
+#: token but no walk-group token) outrank actual walk clips; "jump
+#: high" let block_*_high clips (literal "high", no jump/hop token at
+#: all) outrank hop clips. Motion concept > modifier is the intended
+#: retrieval semantics, so every point earned through a
+#: `SYNONYM_GROUPS` hit — literal-in-group or synonym-bridged — is
+#: scaled up by this factor before non-group literal (modifier) tokens
+#: are added at their plain IDF weight. 2.0 was picked empirically: it
+#: is enough to make a single-concept-token match beat a single rare
+#: modifier token in every one of the 6 tuning queries, without being
+#: so large that a purely-modifier query (no concept token in the
+#: SYNONYM_GROUPS vocabulary at all) loses all discriminating power.
+_CONCEPT_BOOST = 2.2
 
 
 def deterministic_rank(
     query: str, rows: list[dict[str, Any]], *, k: int = 10,
 ) -> list[RefMatch]:
     """Score every row by rarity-weighted token overlap and return the
-    top `k`, best first. Literal query∩row tokens score full IDF
-    weight; a synonym group bridging the two sides with NO literal
-    overlap inside that group scores once (its strongest present
-    member) at `_SYNONYM_MATCH_WEIGHT`. Zero-scoring rows are excluded.
-    Deterministic, offline, never raises on well-formed input — this is
-    the §decision-7 "always on, zero API" floor."""
+    top `k`, best first.
+
+    The score has two components:
+
+    - **Concept component** (`_CONCEPT_BOOST`x): for each
+      `SYNONYM_GROUPS` group, if the query and row share a LITERAL
+      token in that group, credit the sum of the shared literal
+      members' IDF weights; otherwise, if the group only bridges the
+      two sides via synonym expansion (no literal overlap), credit
+      `_SYNONYM_MATCH_WEIGHT` x the strongest present member's weight.
+      The whole component is then scaled by `_CONCEPT_BOOST` — motion
+      CONCEPT tokens (walk/run/jump/lie/crouch/...) are the vocabulary
+      the caller actually cares about matching, and must outrank a
+      coincidental rare-modifier hit (see `_CONCEPT_BOOST`'s docstring).
+    - **Modifier component** (1x): literal query∩row tokens that are
+      NOT in any `SYNONYM_GROUPS` group, at plain IDF weight — e.g.
+      "forward"/"high"/"down"/"subject" style tokens that still add
+      useful discriminating signal between same-concept clips.
+
+    Zero-scoring rows are excluded. Deterministic, offline, never
+    raises on well-formed input — this is the §decision-7 "always on,
+    zero API" floor."""
     q_lit = set(tokenize_query(query))
     if not q_lit or not rows:
         return []
     q_all = expand_synonyms(sorted(q_lit))
     weights = _idf_weights(rows)
+    grouped_tokens: set[str] = set()
+    for group in SYNONYM_GROUPS:
+        grouped_tokens |= frozenset(group)
     scored: list[tuple[float, dict[str, Any]]] = []
     for row in rows:
         r_lit = set(_row_tokens(row))
         r_all = expand_synonyms(sorted(r_lit))
         literal = q_lit & r_lit
-        score = sum(weights.get(tok, 0.0) for tok in literal)
+
+        concept = 0.0
         for group in SYNONYM_GROUPS:
             gs = frozenset(group)
-            if literal & gs:
-                continue  # already credited at full literal weight
+            in_group_literal = literal & gs
+            if in_group_literal:
+                concept += sum(weights.get(tok, 0.0) for tok in in_group_literal)
+                continue
             if (q_all & gs) and (r_all & gs):
                 present = (q_all | r_all) & gs
-                score += _SYNONYM_MATCH_WEIGHT * max(
+                concept += _SYNONYM_MATCH_WEIGHT * max(
                     weights.get(tok, 0.0) for tok in present
                 )
+        modifier = sum(
+            weights.get(tok, 0.0) for tok in literal if tok not in grouped_tokens
+        )
+        score = _CONCEPT_BOOST * concept + modifier
         if score <= 0.0:
             continue
         scored.append((score, row))
