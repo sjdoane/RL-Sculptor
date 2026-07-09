@@ -4272,6 +4272,49 @@ def _parent_env_component_terms(mission, stage) -> set[str]:
         return set()
 
 
+#: Reference-library robot slugs the on-disk library is keyed by
+#: (`sculptor.refs.library.clip_dir(robot, clip_id)`). Mirrors
+#: `mission_metrics._ROBOT_SLUGS` — kept as a small local copy rather
+#: than an import since `mission_metrics.py` is a metric-generation
+#: module or this one has no other dependency on, and the mapping is a
+#: single-source-of-truth-worthy but tiny (3-entry) constant.
+_STAGE_REFERENCE_ROBOT_SLUGS: tuple[str, ...] = ("go2", "go1", "g1")
+
+
+def _stage_reference_robot_slug(*, stage_dir: Path, project_root: Path) -> str:
+    """Resolve the bare robot slug (`"g1"`, `"go1"`, ...) the reference
+    library keys clips by, from the stage's (or the project's, as a
+    fallback for a not-yet-scaffolded stage) `[adapter].config.task_id`
+    — the same adapter/task_id-shaped string used everywhere else
+    (`"Mjlab-Velocity-Flat-Unitree-G1"`). Unknown/unreadable/absent
+    always falls back to `"g1"` (the only populated library robot as of
+    §R1_BUILD_SPEC — mirrors `sculptor.refs`'s own `robot: str = "g1"`
+    default throughout)."""
+    task_id = ""
+    for config_path in (stage_dir / "config.toml", project_root / "config.toml"):
+        if not config_path.is_file():
+            continue
+        try:
+            try:
+                import tomllib
+            except ModuleNotFoundError:  # pragma: no cover
+                import tomli as tomllib  # type: ignore[no-redef]
+            with config_path.open("rb") as f:
+                cfg = tomllib.load(f)
+            task_id = str(
+                ((cfg.get("adapter") or {}).get("config") or {})
+                .get("task_id", "") or "")
+        except Exception:  # noqa: BLE001 — best-effort resolution only
+            task_id = ""
+        if task_id:
+            break
+    hint = task_id.lower()
+    for slug in _STAGE_REFERENCE_ROBOT_SLUGS:
+        if slug in hint:
+            return slug
+    return "g1"
+
+
 def _run_one_stage(
     *,
     mission,
@@ -4506,13 +4549,23 @@ def _run_one_stage(
             "device": device,
         })
 
-    # 2.5 §JUMP_SCAFFOLD: decomposer-flagged reference-state
-    # initialization. Derive a validated TRAIN-ONLY RSI curriculum from
-    # a reference clip and persist it as this stage's next env-spec
-    # version before any training. Clip preference: a real (converted
-    # mocap) clip at <project>/reference/jump.npz when present, else the
-    # analytic procedural jump. Failure is non-fatal — RSI is curriculum
-    # assistance, not correctness; the stage trains without it.
+    # 2.5 §JUMP_SCAFFOLD (generalized §REFERENCE_TRAJECTORY_PLAN §8 part
+    # 2): decomposer-flagged reference-state initialization. Derive a
+    # validated TRAIN-ONLY RSI curriculum from a reference clip and
+    # persist it as this stage's next env-spec version before any
+    # training. Clip preference, most to least specific:
+    #   1. `stage.reference_clip_id` — a library clip explicitly
+    #      ATTACHED to THIS stage (§R1_BUILD_SPEC decision 10; covers
+    #      get-up clips, not just jumps — the whole point of this
+    #      increment). Loaded from `sculptor.refs.library` the same way
+    #      `mission_metrics._load_stage_reference` already does for
+    #      metric generation.
+    #   2. a real (converted mocap) clip at <project>/reference/jump.npz
+    #      when present (pre-existing behavior, byte-identical).
+    #   3. the analytic procedural jump (final fallback, pre-existing).
+    # Failure at ANY step is non-fatal — RSI is curriculum assistance,
+    # not correctness; the stage trains without it (falls through to the
+    # next-lower-precedence source rather than aborting the stage).
     if getattr(stage, "needs_reference_rsi", False):
         try:
             from sculptor.env_spec import read_current_env_spec
@@ -4532,19 +4585,45 @@ def _run_one_stage(
                 # resume — the reference curriculum is already in force.
                 pass
             else:
-                project_root = mission_dir.parent.parent
-                clip_path = project_root / "reference" / "jump.npz"
-                if clip_path.is_file():
-                    clip, clip_src = load_clip(clip_path), str(clip_path)
-                else:
-                    clip, clip_src = (
-                        make_procedural_jump_clip(), "procedural:jump")
+                clip = None
+                clip_src = None
+                clip_load_error: Optional[str] = None
+                stage_clip_id = getattr(stage, "reference_clip_id", None)
+                if stage_clip_id:
+                    try:
+                        from sculptor.refs import library as refs_library
+
+                        robot = _stage_reference_robot_slug(
+                            stage_dir=stage_dir, project_root=(
+                                mission_dir.parent.parent))
+                        stage_clip_path = (
+                            refs_library.clip_dir(robot, stage_clip_id)
+                            / refs_library.CLIP_FILENAME)
+                        clip = load_clip(stage_clip_path)
+                        clip_src = f"library:{robot}/{stage_clip_id}"
+                    except Exception as e:  # noqa: BLE001 — fall back below
+                        clip_load_error = f"{type(e).__name__}: {e}"
+                        emit({
+                            "type": "stage_reference_clip_load_failed",
+                            "stage_name": stage.name,
+                            "reference_clip_id": stage_clip_id,
+                            "error": clip_load_error,
+                        })
+                if clip is None:
+                    project_root = mission_dir.parent.parent
+                    clip_path = project_root / "reference" / "jump.npz"
+                    if clip_path.is_file():
+                        clip, clip_src = load_clip(clip_path), str(clip_path)
+                    else:
+                        clip, clip_src = (
+                            make_procedural_jump_clip(), "procedural:jump")
                 spec_path = apply_reference_rsi(stage_env_dir, clip)
                 emit({
                     "type": "stage_reference_rsi_applied",
                     "stage_name": stage.name,
                     "clip": clip_src,
                     "env_spec": str(spec_path),
+                    "stage_clip_load_error": clip_load_error,
                 })
         except Exception as e:  # noqa: BLE001 — curriculum, not correctness
             emit({

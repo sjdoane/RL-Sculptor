@@ -50,10 +50,13 @@ from sculptor.reference import (
 
 
 # ── Synthetic clip builders ─────────────────────────────────────────────
-def _make_getup_clip(*, fps: float = 50.0, with_quat: bool = False) -> dict:
+def _make_getup_clip(
+    *, fps: float = 50.0, with_quat: bool = False, with_joints: bool = False,
+) -> dict:
     """z: 0.10 flat 0.5s -> ramp 1.0s -> 0.75 flat 0.5s. Optionally carries
     a `root_quat_wxyz` pitching from lying (pi/2) to upright (0) over the
-    same three phases."""
+    same three phases, and/or a `joint_pos` trace (3 synthetic joints,
+    bent during the lying phase, ~0 once standing)."""
     def seg(dur: float, fn):
         n = max(2, int(round(dur * fps)))
         return fn(np.linspace(0.0, 1.0, n, endpoint=False))
@@ -76,6 +79,17 @@ def _make_getup_clip(*, fps: float = 50.0, with_quat: bool = False) -> dict:
         stand_q = np.tile(quat_pitch(0.0), (stand.shape[0], 1))
         clip["root_quat_wxyz"] = np.concatenate(
             [lying_q, ramp_q, stand_q], axis=0)
+    if with_joints:
+        n = z.shape[0]
+        # 3 synthetic joints: bent ~1.0/-0.8/0.5 rad while lying, ~0 once
+        # standing (a crude knee/elbow-style "curled up" get-up posture).
+        lying_j = np.tile([1.0, -0.8, 0.5], (lying.shape[0], 1))
+        ramp_j = np.linspace(
+            lying_j[0], [0.0, 0.0, 0.0], ramp.shape[0])
+        stand_j = np.tile([0.0, 0.0, 0.0], (stand.shape[0], 1))
+        clip["joint_pos"] = np.concatenate(
+            [lying_j, ramp_j, stand_j], axis=0)
+        clip["joint_names"] = ["j0", "j1", "j2"]
     assert validate_clip(clip) == []
     return clip
 
@@ -170,41 +184,99 @@ def test_orientation_not_derived_for_airborne_clips_even_with_quat() -> None:
 
 
 def test_reset_pitch_offset_rad_within_hard_envelope() -> None:
-    """`reset_pitch_offset_rad` is NOT in `env_spec._TRAIN_RANGES` (fence
-    gap — see `derive_reference_reset`'s docstring: adding it requires a
-    matching `env_gen.py` model field, and `env_gen.py` is out of this
-    task's fence), so this checks the derivation's own hard envelope
-    (`reference._PITCH_OFFSET_ENVELOPE`) instead of the validator's
-    table."""
-    from sculptor.reference import _PITCH_OFFSET_ENVELOPE
+    """`reset_pitch_offset_rad` is now a real `env_spec._TRAIN_RANGES`
+    key (§8 part 2 — the prior fence gap is closed), so the derivation's
+    output must fall inside the VALIDATOR's own envelope, the single
+    source of truth."""
+    from sculptor.env_spec import _TRAIN_RANGES
 
     clip = _make_getup_clip(with_quat=True)
     derived = derive_reference_reset(clip)
     lo, hi = derived["reset_pitch_offset_rad"]
-    b_lo, b_hi = _PITCH_OFFSET_ENVELOPE
+    b_lo, b_hi = _TRAIN_RANGES["reset_pitch_offset_rad"]
     assert b_lo <= lo <= b_hi
     assert b_lo <= hi <= b_hi
 
 
-def test_apply_reference_rsi_does_not_persist_orientation_key(
+def test_apply_reference_rsi_persists_orientation_key(
     tmp_path: Path,
 ) -> None:
-    """§ fence gap: `apply_reference_rsi` must NOT write
-    `reset_pitch_offset_rad` into the env spec (it is not a key
-    `env_spec.validate_env_spec` accepts today — see
-    `derive_reference_reset`'s docstring) even though the clip carries
-    orientation data and `derive_reference_reset` computes it. Must not
-    crash either way."""
+    """§8 part 2: `apply_reference_rsi` now WRITES
+    `reset_pitch_offset_rad`/`reset_roll_offset_rad` into the env spec —
+    both are live `env_spec.validate_env_spec` keys as of the second
+    increment (env_gen.py's `_TrainModel` gained matching fields, so the
+    drift guard stays green)."""
     clip = _make_getup_clip(with_quat=True)
     env_dir = tmp_path / "env"
     path = apply_reference_rsi(env_dir, clip)
     spec = json.loads(path.read_text(encoding="utf-8"))
     assert validate_env_spec(spec) == []
-    assert "reset_pitch_offset_rad" not in spec["train"]
-    # The rationale still discloses the computed-but-not-persisted value
-    # so it isn't silently lost from the record.
-    assert "pitch offset" in spec["meta"]["rationale"]
-    assert "NOT persisted" in spec["meta"]["rationale"]
+    assert "reset_pitch_offset_rad" in spec["train"]
+    assert "reset_roll_offset_rad" in spec["train"]
+    assert "orientation offsets" in spec["meta"]["rationale"]
+
+
+# ── Per-joint reference posture derivation (§8 part 2) ───────────────────
+def test_getup_joint_target_derived_from_lying_joint_pos() -> None:
+    clip = _make_getup_clip(with_joints=True)
+    derived = derive_reference_reset(clip)
+    assert "reset_joint_pos_target" in derived
+    target = derived["reset_joint_pos_target"]
+    assert len(target) == 3
+    # Initial-window mean of the lying-phase joint_pos ([1.0, -0.8, 0.5]).
+    assert target[0] == pytest.approx(1.0, abs=0.05)
+    assert target[1] == pytest.approx(-0.8, abs=0.05)
+    assert target[2] == pytest.approx(0.5, abs=0.05)
+    assert "reset_joint_pos_noise_rad" in derived
+    assert derived["reset_joint_pos_noise_rad"] > 0.0
+
+
+def test_joint_target_not_derived_without_joint_pos() -> None:
+    clip = _make_getup_clip(with_joints=False)
+    derived = derive_reference_reset(clip)
+    assert "reset_joint_pos_target" not in derived
+    assert "reset_joint_pos_noise_rad" not in derived
+
+
+def test_joint_target_not_derived_for_airborne_clips_even_with_joint_pos() -> None:
+    """Same "only get-up-shaped clips get this" guard as orientation."""
+    from sculptor.reference import make_procedural_jump_clip
+
+    clip = make_procedural_jump_clip()
+    n = clip["root_pos_z"].shape[0]
+    clip["joint_pos"] = np.zeros((n, 2))
+    clip["joint_names"] = ["j0", "j1"]
+    derived = derive_reference_reset(clip)
+    assert "reset_joint_pos_target" not in derived
+
+
+def test_apply_reference_rsi_persists_joint_target(tmp_path: Path) -> None:
+    """§8 part 2: `apply_reference_rsi` writes `reset_joint_pos_target` +
+    `reset_joint_pos_noise_rad` into the env spec, and the persisted spec
+    validates clean end to end."""
+    clip = _make_getup_clip(with_joints=True)
+    env_dir = tmp_path / "env"
+    path = apply_reference_rsi(env_dir, clip)
+    spec = json.loads(path.read_text(encoding="utf-8"))
+    assert validate_env_spec(spec) == []
+    assert spec["train"]["reset_joint_pos_target"] == pytest.approx(
+        [1.0, -0.8, 0.5], abs=0.05)
+    assert spec["train"]["reset_joint_pos_noise_rad"] > 0.0
+    assert "per-joint reference posture" in spec["meta"]["rationale"]
+
+
+def test_joint_target_clamped_to_validator_element_bounds() -> None:
+    """A pathological clip with an out-of-envelope joint value must be
+    CLAMPED (never fail the gate) — same discipline as every other
+    derived key in this module."""
+    from sculptor.env_spec import _JOINT_TARGET_ELEMENT_BOUNDS
+
+    clip = _make_getup_clip(with_joints=True)
+    clip["joint_pos"] = clip["joint_pos"].copy()
+    clip["joint_pos"][:, 0] = 99.0   # wildly out of bounds throughout
+    derived = derive_reference_reset(clip)
+    lo, hi = _JOINT_TARGET_ELEMENT_BOUNDS
+    assert lo <= derived["reset_joint_pos_target"][0] <= hi
 
 
 # ── Never-rising, never-low clips: unchanged garbage-input behavior ──────

@@ -3179,6 +3179,122 @@ def test_stage_reference_rsi_applied_when_flagged(
                 if e["type"] == "stage_reference_rsi_applied"]
 
 
+def _write_library_clip(root: Path, robot: str, clip_id: str) -> None:
+    """Write a minimal valid get-up clip into a fake reference-library
+    root, in the on-disk shape `sculptor.refs.library` expects
+    (`<root>/<robot>/<clip_id>/clip.npz`)."""
+    import numpy as np
+
+    from sculptor.reference import save_clip
+
+    fps = 50.0
+    lying = np.full(30, 0.10)
+    ramp = np.linspace(0.10, 0.75, 50)
+    stand = np.full(30, 0.75)
+    z = np.concatenate([lying, ramp, stand])
+    clip_dir = root / robot / clip_id
+    save_clip(clip_dir / "clip.npz", {
+        "root_pos_z": z, "fps": fps,
+        "meta": {"source": f"library:{clip_id}"},
+    })
+
+
+def test_stage_reference_clip_id_wins_over_project_jump_clip(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """§REFERENCE_TRAJECTORY_PLAN §8 part 2 scaffold wiring: a stage with
+    BOTH `reference_clip_id` set AND a project-local reference/jump.npz
+    present must use the STAGE clip (highest precedence) — the get-up
+    curriculum, not the jump one."""
+    from sculptor import sculpt as sculpt_mod
+
+    lib_root = tmp_path / "reflib"
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(lib_root))
+    _write_library_clip(lib_root, "g1", "test_getup_clip")
+
+    m = _make_mission(tmp_path, n_stages=1)
+    m.stages[0].needs_reference_rsi = True
+    m.stages[0].reference_clip_id = "test_getup_clip"
+
+    # A project-local jump.npz that would otherwise win if the stage
+    # clip weren't wired — presence alone must not be picked over the
+    # stage's explicitly attached clip.
+    project_root = Path(m.mission_dir).parent.parent
+    from sculptor.reference import make_procedural_jump_clip, save_clip
+    save_clip(project_root / "reference" / "jump.npz",
+               make_procedural_jump_clip())
+
+    fake = _fake_sculpt_run_factory(metric=0.9)
+    monkeypatch.setattr(sculpt_mod, "sculpt_run", fake)
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
+    )
+
+    events: list[dict] = []
+    result = sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab", kg_store=None, on_event=events.append,
+    )
+    assert result.completed is True
+    rsi_events = [e for e in events
+                  if e["type"] == "stage_reference_rsi_applied"]
+    assert len(rsi_events) == 1
+    assert rsi_events[0]["clip"] == "library:g1/test_getup_clip"
+    assert rsi_events[0]["stage_clip_load_error"] is None
+
+    env_dir = Path(m.mission_dir) / "stages" / "stage_0" / "env"
+    spec = json.loads(sorted(env_dir.glob("v*.json"))[0].read_text())
+    # The get-up clip's own signature: a non-positive height offset —
+    # the jump clip's would be non-negative.
+    assert spec["train"]["reset_height_offset_m"][1] <= 0.0
+
+
+def test_stage_reference_clip_load_failure_falls_back_to_project_jump(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """A `reference_clip_id` that fails to load (missing from the
+    library on disk) must fall back to the next-lower-precedence
+    source — the project-local jump.npz — rather than aborting the
+    stage's RSI curriculum entirely. A `stage_reference_clip_load_failed`
+    event discloses the failure."""
+    from sculptor import sculpt as sculpt_mod
+
+    lib_root = tmp_path / "reflib_empty"
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(lib_root))
+    # Deliberately do NOT write the clip — library lookup will fail.
+
+    m = _make_mission(tmp_path, n_stages=1)
+    m.stages[0].needs_reference_rsi = True
+    m.stages[0].reference_clip_id = "does_not_exist_clip"
+
+    project_root = Path(m.mission_dir).parent.parent
+    from sculptor.reference import make_procedural_jump_clip, save_clip
+    save_clip(project_root / "reference" / "jump.npz",
+               make_procedural_jump_clip())
+
+    fake = _fake_sculpt_run_factory(metric=0.9)
+    monkeypatch.setattr(sculpt_mod, "sculpt_run", fake)
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
+    )
+
+    events: list[dict] = []
+    result = sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab", kg_store=None, on_event=events.append,
+    )
+    assert result.completed is True
+    load_fail_events = [
+        e for e in events if e["type"] == "stage_reference_clip_load_failed"]
+    assert len(load_fail_events) == 1
+    assert load_fail_events[0]["reference_clip_id"] == "does_not_exist_clip"
+
+    rsi_events = [e for e in events
+                  if e["type"] == "stage_reference_rsi_applied"]
+    assert len(rsi_events) == 1
+    # Fell back to the project jump.npz path (its str(Path) form).
+    assert rsi_events[0]["clip"].endswith("jump.npz")
+    assert rsi_events[0]["stage_clip_load_error"] is not None
+
+
 def test_stage_reference_rsi_roundtrips_mission_json(tmp_path: Path):
     """needs_reference_rsi survives save→load (backward-compatible field)."""
     from sculptor.mission import load_mission, save_mission

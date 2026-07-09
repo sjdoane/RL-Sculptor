@@ -476,8 +476,82 @@ def _resolve_env_spec(args: argparse.Namespace) -> "dict | None":
     return jump_preset_spec()
 
 
+def reset_joints_to_reference(
+    env: Any,
+    env_ids: Any,
+    joint_pos_target,  # noqa: ANN001 — torch.Tensor, mjlab-only at call time
+    joint_pos_noise: float = 0.0,
+    asset_cfg: Any = None,
+) -> None:
+    """Reset every selected joint to an EXPLICIT per-joint target (+ small
+    symmetric noise), rather than mjlab's shipped
+    `reset_joints_by_offset` (a single UNIFORM range added to the
+    STANDING default across ALL joints — confirmed by reading
+    `.venv/.../mjlab/envs/mdp/events.py` during recon; it has no
+    per-joint target/keyframe parameter at all).
+
+    §REFERENCE_TRAJECTORY_PLAN §8 part 2: a get-up clip's lying posture
+    (e.g. bent knees/elbows) is materially different PER JOINT from the
+    standing default, so it cannot be expressed as one shared offset.
+    This event is the missing mechanism — a genuinely new mjlab event
+    term, injected the same way `_apply_env_spec` already injects the
+    `sunk` termination term (mjlab's `events`/`terminations` dicts are
+    plain `dict[str, EventTermCfg]` / `dict[str, TerminationTermCfg]`
+    the adapter is free to add entries to; no mjlab fork required).
+
+    Mirrors `reset_joints_by_offset`'s own shape/clamp/write contract
+    (same `soft_joint_pos_limits` clamp, same `write_joint_state_to_sim`
+    call) so it composes with the rest of the reset pipeline identically
+    — only the "what value do we reset around" question changes (an
+    explicit target vector instead of the standing default + a random
+    offset).
+
+    `joint_pos_target` must already be a tensor on `env.device` with one
+    element per joint selected by `asset_cfg` (the caller — this
+    module's `_apply_env_spec` — resolves/validates that length against
+    the robot's actual joint count before injecting this event; a
+    mismatch is a clear `ValueError` there, never a silent
+    misassignment here).
+    """
+    import torch
+
+    from mjlab.managers.scene_entity_config import SceneEntityCfg
+    from mjlab.utils.lab_api.math import sample_uniform
+
+    if asset_cfg is None:
+        asset_cfg = SceneEntityCfg("robot")
+    if env_ids is None:
+        env_ids = torch.arange(env.num_envs, device=env.device, dtype=torch.int)
+
+    asset = env.scene[asset_cfg.name]
+    default_joint_vel = asset.data.default_joint_vel
+    soft_joint_pos_limits = asset.data.soft_joint_pos_limits
+
+    target = joint_pos_target.to(device=env.device, dtype=torch.float32)
+    joint_pos = target.unsqueeze(0).expand(len(env_ids), -1).clone()
+    if joint_pos_noise:
+        joint_pos = joint_pos + sample_uniform(
+            -float(joint_pos_noise), float(joint_pos_noise),
+            joint_pos.shape, env.device)
+    joint_pos_limits = soft_joint_pos_limits[env_ids][:, asset_cfg.joint_ids]
+    joint_pos = joint_pos.clamp_(joint_pos_limits[..., 0], joint_pos_limits[..., 1])
+
+    joint_vel = default_joint_vel[env_ids][:, asset_cfg.joint_ids].clone()
+
+    joint_ids = asset_cfg.joint_ids
+    if isinstance(joint_ids, list):
+        joint_ids = torch.tensor(joint_ids, device=env.device)
+
+    asset.write_joint_state_to_sim(
+        joint_pos.view(len(env_ids), -1),
+        joint_vel.view(len(env_ids), -1),
+        env_ids=env_ids,
+        joint_ids=joint_ids,
+    )
+
+
 def _apply_env_spec(env_cfg: Any, spec: "dict | None", *,
-                    train: bool = True) -> None:
+                    train: bool = True, task_id: str = "") -> None:
     """§RL_SCULPTOR_AUDIT (env generalization, 2026-07-04): apply a
     validated env spec to the loaded task cfg, before the env is built.
     General successor to the retired jump-only `_apply_env_profile` —
@@ -492,7 +566,17 @@ def _apply_env_spec(env_cfg: Any, spec: "dict | None", *,
     command-curriculum re-widening) lives in the audit doc's loop-4a /
     loop-6 entries; this function only maps schema semantics onto mjlab
     cfg fields. FULLY DEFENSIVE per-mutation: any cfg-shape drift skips
-    that mutation with a warning, never breaks the run."""
+    that mutation with a warning, never breaks the run.
+
+    `task_id` (the adapter's `--task-id`, e.g.
+    "Mjlab-Velocity-Flat-Unitree-G1") is ONLY used to resolve the robot's
+    canonical joint order for `train.reset_joint_pos_target`
+    (§REFERENCE_TRAJECTORY_PLAN §8 part 2) — the env isn't built yet at
+    this point, so the live `Entity.joint_names` isn't available; the
+    static manifest (`sculptor.eval.robot_manifest`) is the ground truth
+    used instead, same source the pre-run required-joint-roles gate
+    already trusts. Omitted only when the spec carries no joint-target
+    key (no behavior change for every existing caller)."""
     if not spec:
         return
     import math
@@ -601,21 +685,40 @@ def _apply_env_spec(env_cfg: Any, spec: "dict | None", *,
     rsi_z = train_sec.get("reset_height_offset_m")
     rsi_vz = train_sec.get("reset_vertical_velocity_mps")
     rsi_vxy = train_sec.get("reset_horizontal_velocity_mps")
-    if rsi_z is not None or rsi_vz is not None or rsi_vxy is not None:
+    rsi_pitch = train_sec.get("reset_pitch_offset_rad")
+    rsi_roll = train_sec.get("reset_roll_offset_rad")
+    if (rsi_z is not None or rsi_vz is not None or rsi_vxy is not None
+            or rsi_pitch is not None or rsi_roll is not None):
         try:
             reset = (getattr(env_cfg, "events", None) or {}).get("reset_base")
             params = getattr(reset, "params", None)
             if isinstance(params, dict):
-                # Height offset needs pose_range; the velocity keys only
-                # write velocity_range — don't couple them to it. Tag
-                # applied[] per ACTUAL write so a dead sub-knob is
-                # visible to the disclosure below (a spec key the cfg
-                # can't honor must never read as applied).
+                # Height/orientation offsets need pose_range; the
+                # velocity keys only write velocity_range — don't couple
+                # them to it. Tag applied[] per ACTUAL write so a dead
+                # sub-knob is visible to the disclosure below (a spec key
+                # the cfg can't honor must never read as applied).
                 wrote: list[str] = []
-                if rsi_z is not None and isinstance(
-                        params.get("pose_range"), dict):
-                    params["pose_range"]["z"] = (float(rsi_z[0]), float(rsi_z[1]))
-                    wrote.append("z")
+                pose_range = params.get("pose_range")
+                if isinstance(pose_range, dict):
+                    if rsi_z is not None:
+                        pose_range["z"] = (float(rsi_z[0]), float(rsi_z[1]))
+                        wrote.append("z")
+                    # §REFERENCE_TRAJECTORY_PLAN §8 part 1: mjlab's
+                    # reset_root_state_uniform natively reads
+                    # pose_range["pitch"]/["roll"] (radians, offset from
+                    # the entity's default orientation via quat_mul) —
+                    # confirmed in .venv/.../mjlab/envs/mdp/events.py.
+                    # A lying get-up start is exactly a large pitch (face
+                    # up/down) or roll (on-the-side) offset.
+                    if rsi_pitch is not None:
+                        pose_range["pitch"] = (
+                            float(rsi_pitch[0]), float(rsi_pitch[1]))
+                        wrote.append("pitch")
+                    if rsi_roll is not None:
+                        pose_range["roll"] = (
+                            float(rsi_roll[0]), float(rsi_roll[1]))
+                        wrote.append("roll")
                 if rsi_vz is not None or rsi_vxy is not None:
                     vr = params.get("velocity_range")
                     if not isinstance(vr, dict):
@@ -653,6 +756,59 @@ def _apply_env_spec(env_cfg: Any, spec: "dict | None", *,
                         f"reset_robot_joints→randomized({','.join(wrote_j)})")
         except Exception as e:  # noqa: BLE001
             _skip("joint reset", e)
+
+    # §REFERENCE_TRAJECTORY_PLAN §8 part 2: per-joint reference-posture
+    # reset. mjlab's shipped `reset_joints_by_offset` has NO per-joint
+    # target mechanism (a single uniform range from the STANDING
+    # default — confirmed by reading events.py during recon), so this
+    # injects a NEW event term (`reset_joints_to_reference`, defined
+    # above in this module) exactly like the `sunk` termination below is
+    # already injected into mjlab's plain `dict[str, ...]` managers.
+    # Length is validated against the robot's CANONICAL joint order
+    # (`sculptor.eval.robot_manifest`, resolved via `task_id`) here —
+    # the env isn't built yet, so this is the only ground truth
+    # available at cfg-mutation time. A mismatch is a CLEAR error (never
+    # a silent misassignment): the caller already validated the spec
+    # schema-wise, but "does this vector match THIS robot" is a
+    # robot-specific check the schema layer cannot make.
+    jpt = train_sec.get("reset_joint_pos_target")
+    jpt_noise = train_sec.get("reset_joint_pos_noise_rad")
+    if jpt is not None:
+        try:
+            from sculptor.eval.robot_manifest import robot_joint_names
+
+            canonical = robot_joint_names(task_id)
+            if canonical is not None and len(jpt) != len(canonical):
+                raise ValueError(
+                    f"reset_joint_pos_target has {len(jpt)} elements but "
+                    f"robot {task_id!r} has {len(canonical)} joints "
+                    f"({canonical[:3]}...) — refusing to apply a "
+                    f"mismatched per-joint reset (would silently "
+                    f"misassign joints)")
+            reset = getattr(env_cfg, "events", None)
+            if isinstance(reset, dict):
+                import torch
+
+                from mjlab.managers.event_manager import EventTermCfg
+                from mjlab.managers.scene_entity_config import SceneEntityCfg
+
+                target_t = torch.tensor(
+                    [float(x) for x in jpt], dtype=torch.float32)
+                reset["reset_robot_joints_to_reference"] = EventTermCfg(
+                    func=reset_joints_to_reference,
+                    mode="reset",
+                    params={
+                        "joint_pos_target": target_t,
+                        "joint_pos_noise": float(jpt_noise or 0.0),
+                        "asset_cfg": SceneEntityCfg(
+                            "robot", joint_names=(".*",)),
+                    },
+                )
+                applied.append(
+                    f"events:+reset_robot_joints_to_reference"
+                    f"({len(jpt)} joints)")
+        except Exception as e:  # noqa: BLE001
+            _skip("reference joint-posture reset", e)
 
     fr = train_sec.get("friction_range")
     if fr is not None:
@@ -708,10 +864,13 @@ def _apply_env_spec(env_cfg: Any, spec: "dict | None", *,
         requested.append("terminations:fell_over")
     if shared.get("episode_length_s") is not None:
         requested.append("episode_length_s")
-    if rsi_z is not None or rsi_vz is not None or rsi_vxy is not None:
+    if (rsi_z is not None or rsi_vz is not None or rsi_vxy is not None
+            or rsi_pitch is not None or rsi_roll is not None):
         requested.append("reset_base→RSI")
     if jp is not None or jv is not None:
         requested.append("reset_robot_joints→randomized")
+    if jpt is not None:
+        requested.append("events:+reset_robot_joints_to_reference")
     if fr is not None:
         requested.append("events:foot_friction")
     if sunk is not None:
@@ -793,7 +952,7 @@ def _cmd_train(args: argparse.Namespace) -> None:
     # a named --env-profile preset; neither → task defaults, no-op).
     # train=True additionally applies the train-only curricula section.
     env_spec = _resolve_env_spec(args)
-    _apply_env_spec(env_cfg, env_spec, train=True)
+    _apply_env_spec(env_cfg, env_spec, train=True, task_id=args.task_id)
     # §actuator-limit enforcement — flag-gated (default OFF → no-op). MUST run on
     # the TRAIN env too (not just rollout) so the policy trains against the same
     # velocity-limited physics it is later evaluated under (no train/rollout mismatch).
@@ -1379,7 +1538,8 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
     # here — evaluation starts from the honest task state, or the
     # metric's view (upright_start / return-to-start-height) would be
     # corrupted by mid-air spawns.
-    _apply_env_spec(env_cfg, _resolve_env_spec(args), train=False)
+    _apply_env_spec(
+        env_cfg, _resolve_env_spec(args), train=False, task_id=args.task_id)
     # §Ship 35: textured floor in the rendered rollout (cosmetic, guarded).
     _apply_ground_texture(env_cfg)
     # 720p + no ghost neighbor envs in the background (cosmetic, guarded).

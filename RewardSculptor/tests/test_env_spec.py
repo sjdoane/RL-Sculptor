@@ -281,6 +281,81 @@ def test_horizontal_reset_velocity_applies() -> None:
     assert vr["y"] == (-0.8, 0.8)
 
 
+def test_orientation_reset_ranges_apply_train_only() -> None:
+    """§REFERENCE_TRAJECTORY_PLAN §8 part 1: pitch/roll offsets write
+    mjlab's native `pose_range["pitch"/"roll"]` keys, train-only."""
+    spec = {"env_spec_version": 1,
+            "train": {"reset_pitch_offset_rad": [1.2, 1.6],
+                      "reset_roll_offset_rad": [-0.3, 0.3]}}
+    assert es.validate_env_spec(spec) == []
+    cfg = _fake_cfg_full()
+    _mjlab_runner._apply_env_spec(cfg, spec, train=True)
+    pr = cfg.events["reset_base"].params["pose_range"]
+    assert pr["pitch"] == (1.2, 1.6)
+    assert pr["roll"] == (-0.3, 0.3)
+    cfg2 = _fake_cfg_full()
+    _mjlab_runner._apply_env_spec(cfg2, spec, train=False)
+    assert "pitch" not in cfg2.events["reset_base"].params["pose_range"]
+    assert "roll" not in cfg2.events["reset_base"].params["pose_range"]
+
+
+def test_joint_pos_target_injects_new_reset_event() -> None:
+    """§8 part 2: `reset_joint_pos_target` injects a brand-new event term
+    (mjlab has no shipped per-joint-target reset) — this only needs the
+    real mjlab classes (`EventTermCfg`, `SceneEntityCfg`), not a full env
+    build, so it's skipped (not failed) when mjlab isn't installed."""
+    pytest.importorskip("mjlab")
+    spec = {"env_spec_version": 1,
+            "train": {"reset_joint_pos_target": [0.1, -0.2, 0.3],
+                      "reset_joint_pos_noise_rad": 0.05}}
+    assert es.validate_env_spec(spec) == []
+    cfg = _fake_cfg_full()
+    _mjlab_runner._apply_env_spec(
+        cfg, spec, train=True, task_id="Mjlab-Velocity-Flat-3dof-Testbot")
+    ev = cfg.events["reset_robot_joints_to_reference"]
+    assert ev.mode == "reset"
+    assert list(ev.params["joint_pos_target"].tolist()) == pytest.approx(
+        [0.1, -0.2, 0.3])
+    assert ev.params["joint_pos_noise"] == pytest.approx(0.05)
+    # Rollout (train=False) must NOT get the injected event.
+    cfg2 = _fake_cfg_full()
+    _mjlab_runner._apply_env_spec(cfg2, spec, train=False)
+    assert "reset_robot_joints_to_reference" not in cfg2.events
+
+
+def test_joint_pos_target_length_mismatch_is_a_clear_skip_not_silent() -> None:
+    """A target vector whose length disagrees with the robot's CANONICAL
+    joint count (resolved via `task_id` against
+    `sculptor.eval.robot_manifest`) must never be silently applied — the
+    mismatch is logged (defensive-skip contract: never break a run) and
+    the event is NOT injected, rather than writing a target that would
+    misassign joints."""
+    pytest.importorskip("mjlab")
+    spec = {"env_spec_version": 1,
+            # G1 has 29 joints; this target has 3 — a deliberate mismatch.
+            "train": {"reset_joint_pos_target": [0.1, -0.2, 0.3]}}
+    assert es.validate_env_spec(spec) == []
+    cfg = _fake_cfg_full()
+    _mjlab_runner._apply_env_spec(
+        cfg, spec, train=True, task_id="Mjlab-Velocity-Flat-Unitree-G1")
+    assert "reset_robot_joints_to_reference" not in cfg.events
+
+
+def test_joint_pos_target_unknown_robot_applies_without_validation() -> None:
+    """An unrecognized `task_id` (not in the static manifest) can't be
+    checked at all — `robot_joint_names` returns None, so the length
+    check is skipped and the event is applied on trust (same "can't
+    reject what we can't model" contract the manifest's own docstring
+    states for the pre-run gate)."""
+    pytest.importorskip("mjlab")
+    spec = {"env_spec_version": 1,
+            "train": {"reset_joint_pos_target": [0.1, -0.2, 0.3]}}
+    cfg = _fake_cfg_full()
+    _mjlab_runner._apply_env_spec(
+        cfg, spec, train=True, task_id="Mjlab-SomeUnknownRobot")
+    assert "reset_robot_joints_to_reference" in cfg.events
+
+
 def test_push_retune_and_train_override() -> None:
     # Shared retune: interval + magnitudes.
     spec = {"env_spec_version": 1,

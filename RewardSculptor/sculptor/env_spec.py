@@ -55,6 +55,13 @@ _SHARED_SCALARS: dict[str, tuple[float, float]] = {
 _TRAIN_SCALARS: dict[str, tuple[float, float]] = {
     "min_base_height_termination_m": (0.02, 1.0),
     "entropy_coef_scale": (0.25, 4.0),
+    # Uniform per-joint noise magnitude (radians) added on top of
+    # `reset_joint_pos_target` when present (§REFERENCE_TRAJECTORY_PLAN
+    # §8 part 2 — get-up posture resets need SOME variation per episode,
+    # same DeepMimic RSI rationale as the root-state ranges above, but a
+    # single non-negative magnitude rather than a [lo, hi] pair since
+    # it's applied symmetrically around each joint's target).
+    "reset_joint_pos_noise_rad": (0.0, 1.0),
 }
 _TRAIN_RANGES: dict[str, tuple[float, float]] = {
     # Offsets ADDED to the robot's default reset state (mjlab
@@ -72,39 +79,49 @@ _TRAIN_RANGES: dict[str, tuple[float, float]] = {
     "reset_joint_velocity_radps": (-10.0, 10.0),
     # Startup domain randomization of foot-geom friction.
     "friction_range": (0.05, 2.5),
-    # NOT ADDED: a root-orientation (pitch) reset key. mjlab's
-    # `reset_root_state_uniform` natively supports a `pose_range["pitch"]`
-    # offset (confirmed by reading
-    # .venv/lib/python3.13/site-packages/mjlab/envs/mdp/events.py during
-    # recon) — a get-up clip's lying start is exactly a large pitch
-    # offset from the standing default, so the MECHANISM exists. Adding
-    # the key here is schema-cheap, but `sculptor/env_gen.py`'s
-    # `_TrainModel` Pydantic model (the LLM-generation surface) has a
-    # test-enforced 1:1 field-parity guard against this table
-    # (`tests/test_env_gen.py::test_generator_models_cover_the_schema_
-    # exactly`) and `env_gen.py` is OUTSIDE this task's file fence
-    # (allow-list: reference.py, mission_runtime.py, env_spec.py,
-    # tests/). Landing the key here without the matching env_gen.py
-    # field change breaks that drift guard. `sculptor/reference.py`'s
-    # `derive_reference_reset` still COMPUTES the pitch-offset range
-    # (see `_quat_wxyz_to_pitch_rad`) so the derivation logic and its
-    # tests exist and are correct, but the value is not currently
-    # persistable into an env spec — flagged in the task report as a
-    # fence-limited gap, not built here.
+    # Root-orientation reset offsets (radians), mjlab
+    # `reset_root_state_uniform`'s `pose_range["roll"|"pitch"]` semantics
+    # — a get-up clip's lying start is exactly a large pitch (face-up/
+    # face-down) or roll (on-the-side) offset from the standing default.
+    # Full ±pi envelope: a lying start can be oriented anywhere from
+    # upright to fully inverted. §REFERENCE_TRAJECTORY_PLAN §8 part 1.
+    "reset_pitch_offset_rad": (-math.pi, math.pi),
+    "reset_roll_offset_rad": (-math.pi, math.pi),
 }
+#: Per-joint reference-posture reset target (§8 part 2): an explicit
+#: `[q_0, ..., q_{J-1}]` qpos vector (radians) the adapter writes at
+#: reset via a NEW custom event (`reset_joints_to_reference` — mjlab's
+#: shipped `reset_joints_by_offset` only supports a single UNIFORM
+#: offset range applied to every joint from the standing default, no
+#: per-joint target; see `_mjlab_runner.py`'s injection for the mjlab
+#: event-manager mechanism this rides). Length is validated against the
+#: robot's own joint count at APPLY time (the schema layer doesn't know
+#: the robot), so here only per-element bounds + a generous max-length
+#: safety rail are enforced. Absent == today's behavior (no per-joint
+#: reset). Paired scalar `reset_joint_pos_noise_rad` lives in
+#: `_TRAIN_SCALARS` above.
+_JOINT_TARGET_ELEMENT_BOUNDS = (-6.4, 6.4)   # generous; true joint limits
+                                              # are enforced by mjlab's
+                                              # own soft_joint_pos_limits
+                                              # clamp at apply time.
+_JOINT_TARGET_MAX_LEN = 64
+_TRAIN_JOINT_TARGET_KEYS = {"reset_joint_pos_target"}
 _PUSH_KEYS = {"enabled", "interval_s", "linear_mps", "angular_radps"}
 _PUSH_INTERVAL_ENVELOPE = (0.5, 30.0)
 _PUSH_LINEAR_MAX = 2.0
 _PUSH_ANGULAR_MAX = 3.0
 
 _SHARED_KEYS = set(_SHARED_SCALARS) | {"zero_velocity_commands", "push_events"}
-_TRAIN_KEYS = set(_TRAIN_SCALARS) | set(_TRAIN_RANGES) | {"push_events"}
+_TRAIN_KEYS = (
+    set(_TRAIN_SCALARS) | set(_TRAIN_RANGES) | _TRAIN_JOINT_TARGET_KEYS
+    | {"push_events"}
+)
 _TOP_KEYS = {"env_spec_version", "meta", "shared", "train"}
 
 #: Train-section keys the diagnoser may propose changes to between
 #: iterations (everything in ``train``; ``shared`` is frozen per run).
 ITERABLE_TRAIN_KEYS: frozenset[str] = frozenset(
-    set(_TRAIN_SCALARS) | set(_TRAIN_RANGES)
+    set(_TRAIN_SCALARS) | set(_TRAIN_RANGES) | _TRAIN_JOINT_TARGET_KEYS
 )
 
 
@@ -136,6 +153,27 @@ def _check_scalar(name: str, v: Any, bounds: tuple[float, float],
     if not (bounds[0] <= float(v) <= bounds[1]):
         errors.append(
             f"{name}: {v} outside hard bounds [{bounds[0]}, {bounds[1]}]")
+
+
+def _check_joint_target(name: str, v: Any, errors: list[str]) -> None:
+    """`reset_joint_pos_target`: a non-empty `[q_0, ..., q_{J-1}]` vector
+    of finite radians. J is robot-specific and unknown at this layer —
+    only per-element bounds and a generous max-length safety rail are
+    enforced here; the adapter validates J against the robot's actual
+    joint count (or resolves per-name) at apply time and raises a clear
+    error on mismatch rather than silently misassigning joints."""
+    if (not isinstance(v, (list, tuple)) or len(v) == 0
+            or len(v) > _JOINT_TARGET_MAX_LEN
+            or not all(_is_num(x) for x in v)):
+        errors.append(
+            f"{name}: must be a non-empty list of <= "
+            f"{_JOINT_TARGET_MAX_LEN} finite numbers, got {v!r}")
+        return
+    lo, hi = _JOINT_TARGET_ELEMENT_BOUNDS
+    for x in v:
+        if not (lo <= float(x) <= hi):
+            errors.append(
+                f"{name}: element {x} outside hard bounds [{lo}, {hi}]")
 
 
 def _check_push(name: str, v: Any, errors: list[str]) -> None:
@@ -207,6 +245,9 @@ def validate_env_spec(spec: Any) -> list[str]:
     for k, envelope in _TRAIN_RANGES.items():
         if k in train:
             _check_range(f"train.{k}", train[k], envelope, errors)
+    for k in _TRAIN_JOINT_TARGET_KEYS:
+        if k in train:
+            _check_joint_target(f"train.{k}", train[k], errors)
     if "push_events" in train:
         _check_push("train.push_events", train["push_events"], errors)
 

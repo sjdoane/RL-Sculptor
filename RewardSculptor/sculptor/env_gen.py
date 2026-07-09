@@ -68,6 +68,21 @@ class _TrainModel(BaseModel):
     reset_horizontal_velocity_mps: Optional[list[float]] = None
     reset_joint_position_offset_rad: Optional[list[float]] = None
     reset_joint_velocity_radps: Optional[list[float]] = None
+    # Root-orientation reset offsets (radians) — §REFERENCE_TRAJECTORY_PLAN
+    # §8 part 1. Not part of the original goal-conditioned generation
+    # prompt (a get-up/lying-start curriculum is reference-clip-derived,
+    # not something the LLM invents from a behavior goal alone), but the
+    # field must exist for schema field-parity
+    # (test_generator_models_cover_the_schema_exactly) and there is no
+    # harm in leaving it generator-reachable (omitted by the LLM in
+    # practice unless the prompt is later extended to mention it).
+    reset_pitch_offset_rad: Optional[list[float]] = None
+    reset_roll_offset_rad: Optional[list[float]] = None
+    # Per-joint reference-posture reset target + its noise magnitude —
+    # same rationale: schema field-parity only, reference-clip-derived
+    # in practice (see sculptor/reference.py), not LLM-generated today.
+    reset_joint_pos_target: Optional[list[float]] = None
+    reset_joint_pos_noise_rad: Optional[float] = None
     min_base_height_termination_m: Optional[float] = None
     friction_range: Optional[list[float]] = None
     entropy_coef_scale: Optional[float] = None

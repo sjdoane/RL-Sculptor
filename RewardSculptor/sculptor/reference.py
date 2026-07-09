@@ -24,12 +24,13 @@ This module makes that machinery available WITHOUT touching evaluation:
     `reset_vertical_velocity_mps`, paired
     `min_base_height_termination_m`), clamped to the validator's own
     bounds tables so the emitted values can never fail the gate;
-  * `derive_reference_reset` — `derive_rsi_train_keys` plus a COMPUTED
-    (not yet schema-persisted — see below) root-orientation
-    `reset_pitch_offset_rad` range when the clip carries
-    `root_quat_wxyz` and is get-up-shaped;
-  * `apply_reference_rsi` — persists the schema-expressible subset of
-    those values as the next validated env/v<N>.json via
+  * `derive_reference_reset` — `derive_rsi_train_keys` plus root-
+    orientation (`reset_pitch_offset_rad`/`reset_roll_offset_rad`) and
+    per-joint posture (`reset_joint_pos_target`/
+    `reset_joint_pos_noise_rad`) ranges when the clip carries
+    `root_quat_wxyz`/`joint_pos` and is get-up-shaped;
+  * `apply_reference_rsi` — persists EVERY key `derive_reference_reset`
+    returns as the next validated env/v<N>.json via
     `env_spec.write_env_spec_version` (train-only by construction:
     rollout evaluation NEVER sees RSI — the schema-level shared/train
     split guarantees metric comparability).
@@ -47,26 +48,32 @@ observed height (rather than the airborne path's fraction-of-standing
 rule) so early termination can never fire on the reference's own lying
 reset.
 
-TWO capabilities are computed but NOT yet persistable into a real env
-spec, both fence-limited (this task's file allow-list is reference.py,
-mission_runtime.py, env_spec.py, tests/):
-  * root orientation (`reset_pitch_offset_rad`) — the mjlab MECHANISM
-    exists (`reset_root_state_uniform`'s `pose_range["pitch"]`), but
-    `env_spec.py`'s `_TRAIN_RANGES` intentionally omits this key because
-    `env_gen.py` (the LLM env-spec generator, out of fence) has a
-    test-enforced 1:1 field-parity guard against that table
-    (`tests/test_env_gen.py::test_generator_models_cover_the_schema_
-    exactly` — adding the key without a matching `env_gen.py` model
-    field breaks it);
-  * per-joint lying POSTURE (e.g. bent knees/elbows while on the
-    ground) — NOT derivable through the current env-spec surface at
-    all: `reset_joint_position_offset_rad` is a single scalar range
-    applied as a UNIFORM random offset to every joint from the STANDING
-    default (`mjlab.envs.mdp.events.reset_joints_by_offset`), not a
-    per-joint target/keyframe. A real fix needs a NEW mjlab event plus
-    new `sculptor/adapters/_mjlab_runner.py` wiring, both outside this
-    task's fence.
-See `derive_reference_reset`'s docstring for the full detail on both.
+§8 part 2 (2026-07-09, second increment): BOTH capabilities that were
+previously computed-but-not-persistable are now fully wired end to end:
+  * root orientation — `env_spec.py`'s `_TRAIN_RANGES` now carries
+    `reset_pitch_offset_rad`/`reset_roll_offset_rad` (matching
+    `env_gen.py::_TrainModel` fields keep the drift guard green), and
+    `sculptor/adapters/_mjlab_runner.py::_apply_env_spec` writes them
+    into the reset event's `pose_range["pitch"/"roll"]` — the mjlab
+    MECHANISM (`reset_root_state_uniform`) already natively supported
+    this;
+  * per-joint lying POSTURE — mjlab's shipped `reset_joints_by_offset`
+    genuinely has no per-joint target mechanism (single scalar range
+    applied uniformly to every joint from the STANDING default), so
+    `_mjlab_runner.py` now injects a NEW event term
+    (`reset_joints_to_reference`, mirroring the shipped function's own
+    clamp/write contract) driven by the new `train.reset_joint_pos_target`
+    (list[float], clip joint order) + `train.reset_joint_pos_noise_rad`
+    schema keys. mjlab's `events`/`terminations` cfg fields are plain
+    dicts the adapter is already free to add entries to (see the
+    pre-existing `sunk` termination injection) — no mjlab fork needed.
+    Joint-count mismatches between the persisted target and the live
+    robot are caught with a clear `ValueError` at cfg-apply time
+    (`sculptor.eval.robot_manifest.robot_joint_names`), never silently
+    misassigned.
+See `derive_reference_reset`'s docstring for the full derivation detail
+and `_mjlab_runner.reset_joints_to_reference`'s docstring for the event
+mechanism.
 
 Real retargeted mocap: Unitree publishes a LAFAN1 dataset retargeted to
 G1/H1 (HuggingFace `unitreerobotics/LAFAN1_Retargeting_Dataset`,
@@ -86,6 +93,8 @@ import numpy as np
 
 from sculptor.env_spec import (
     ENV_SPEC_VERSION,
+    _JOINT_TARGET_ELEMENT_BOUNDS,
+    _JOINT_TARGET_MAX_LEN,
     _TRAIN_RANGES,
     _TRAIN_SCALARS,
     read_current_env_spec,
@@ -500,15 +509,6 @@ def derive_rsi_train_keys(clip: dict) -> dict:
     }
 
 
-#: Hard bounds for the (not-yet-schema) pitch-offset derivation — mirrors
-#: the shape of an `_TRAIN_RANGES` envelope entry without actually being
-#: one (see `derive_reference_reset`'s docstring for why: `env_spec.py`'s
-#: `_TRAIN_RANGES` intentionally does NOT carry a `reset_pitch_offset_rad`
-#: key, because `env_gen.py` — outside this task's file fence — has a
-#: test-enforced 1:1 field-parity guard against that table).
-_PITCH_OFFSET_ENVELOPE = (-3.2, 3.2)
-
-
 def _quat_wxyz_to_pitch_rad(q: np.ndarray) -> np.ndarray:
     """Standard aerospace-sequence pitch angle from a batch of unit
     quaternions `(N, 4)` in `[w, x, y, z]` order. Pitch alone is the
@@ -520,63 +520,84 @@ def _quat_wxyz_to_pitch_rad(q: np.ndarray) -> np.ndarray:
     return np.arcsin(sinp)
 
 
+def _quat_wxyz_to_roll_rad(q: np.ndarray) -> np.ndarray:
+    """Standard aerospace-sequence roll angle from a batch of unit
+    quaternions `(N, 4)` in `[w, x, y, z]` order — the axis that carries
+    "lying on the left/right side vs. standing upright," complementary
+    to pitch's "face-up/face-down." A get-up clip may need either or
+    both depending on how the motion begins."""
+    w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+    sinr_cosp = 2.0 * (w * x + y * z)
+    cosr_cosp = 1.0 - 2.0 * (x * x + y * y)
+    return np.arctan2(sinr_cosp, cosr_cosp)
+
+
 def derive_reference_reset(clip: dict) -> dict:
     """`derive_rsi_train_keys` plus, when the clip carries
-    `root_quat_wxyz` AND is get-up-shaped, an ADDITIONAL
-    `reset_pitch_offset_rad` range derived from the clip's initial-
-    window orientation relative to its own end-window (standing-like)
-    orientation — the root-orientation half of a lying start
-    (§REFERENCE_TRAJECTORY_PLAN §8's "PLUS ... initial joint posture
-    and root orientation" extension).
+    `root_quat_wxyz` AND is get-up-shaped, ADDITIONAL
+    `reset_pitch_offset_rad` / `reset_roll_offset_rad` ranges derived
+    from the clip's initial-window orientation relative to its own
+    end-window (standing-like) orientation, PLUS (when the clip carries
+    `joint_pos`) a `reset_joint_pos_target` vector — the root-
+    orientation and per-joint-posture halves of a lying start
+    (§REFERENCE_TRAJECTORY_PLAN §8's "PLUS ... initial joint posture and
+    root orientation" extension, now fully wired through
+    `env_spec.py`'s `_TRAIN_RANGES`/`_TRAIN_SCALARS` and
+    `sculptor/adapters/_mjlab_runner.py`'s `reset_joints_to_reference`
+    event — see that module for the mjlab event-injection mechanism).
 
-    FENCE-LIMITED GAP (reported, not built around): mjlab's
-    `reset_root_state_uniform` natively supports a `pose_range["pitch"]`
-    offset (confirmed by reading
-    `.venv/lib/python3.13/site-packages/mjlab/envs/mdp/events.py` during
-    recon) — the MECHANISM to apply this exists. But persisting
-    `reset_pitch_offset_rad` through `env_spec.py`'s `_TRAIN_RANGES`
-    would require a matching field on `env_gen.py::_TrainModel` (a
-    test-enforced 1:1 parity guard,
-    `tests/test_env_gen.py::test_generator_models_cover_the_schema_
-    exactly`), and `env_gen.py` is OUTSIDE this task's file fence
-    (allow-list: reference.py, mission_runtime.py, env_spec.py, tests/).
-    So this function COMPUTES the pitch-offset range (correct, tested)
-    but `apply_reference_rsi` below does NOT persist it into the env
-    spec — it would fail `validate_env_spec` as an unknown key. Callers
-    that need the value (e.g. a future orchestrator change with
-    `env_gen.py` in scope) can read it straight from this function's
-    return dict.
-
-    Joint posture (per-joint initial pose) is NOT emitted at all, for a
-    similar but harder reason: the env layer's
-    `reset_joint_position_offset_rad` is a single scalar range applied
-    as a UNIFORM random offset to every joint from the robot's DEFAULT
-    (standing) pose (`mjlab.envs.mdp.events.reset_joints_by_offset` —
-    confirmed by reading the adapter + mjlab source during recon), not
-    an explicit per-joint target/keyframe vector. A true lying joint
-    posture is materially different per-joint from standing, so it
-    cannot be expressed as one shared offset without either being a
-    no-op for most joints or corrupting the ones near their limits.
-    Wiring a real per-joint keyframe reset would require a NEW mjlab
-    event plus a new adapter branch in
-    `sculptor/adapters/_mjlab_runner.py` — both outside this task's file
-    fence.
+    `reset_joint_pos_target` is the clip's OWN initial-window mean
+    `joint_pos` (the get-up clip's lying posture), in the clip's
+    `joint_names` order — the adapter resolves/validates that order
+    against the robot's canonical joint order at apply time (a mismatch
+    is a clear error there, never a silent misassignment here; this
+    function has no robot context to check against). Clamped to
+    `env_spec`'s own `_JOINT_TARGET_ELEMENT_BOUNDS`/`_JOINT_TARGET_MAX_LEN`
+    so the emitted vector can never fail `validate_env_spec`. Absent
+    when the clip carries no `joint_pos` channel (procedural clips, or
+    real mocap without a retargeted joint trace) — the adapter's
+    existing scalar `reset_joint_position_offset_rad` remains the
+    fallback in that case.
     """
     derived = dict(derive_rsi_train_keys(clip))
+    is_getup = _archetype(clip) == "getup"
     quat = clip.get("root_quat_wxyz")
-    if quat is not None and _archetype(clip) == "getup":
+    if quat is not None and is_getup:
         fps = float(clip["fps"])
         nw = max(2, int(_ARCHETYPE_WINDOW_S * fps))
-        pitch = _quat_wxyz_to_pitch_rad(np.asarray(quat, dtype=np.float64))
-        pitch_start = pitch[:nw]
-        pitch_stand = float(np.median(pitch[-nw:]))
-        offset = pitch_start - pitch_stand
-        lo, hi = _PITCH_OFFSET_ENVELOPE
-        p_lo = min(max(float(offset.min()), lo), hi)
-        p_hi = min(max(float(offset.max()), lo), hi)
-        if p_hi < p_lo:
-            p_lo, p_hi = p_hi, p_lo
-        derived["reset_pitch_offset_rad"] = [round(p_lo, 4), round(p_hi, 4)]
+        quat_arr = np.asarray(quat, dtype=np.float64)
+        for key, fn in (
+                ("reset_pitch_offset_rad", _quat_wxyz_to_pitch_rad),
+                ("reset_roll_offset_rad", _quat_wxyz_to_roll_rad)):
+            angle = fn(quat_arr)
+            start = angle[:nw]
+            stand = float(np.median(angle[-nw:]))
+            offset = start - stand
+            lo, hi = _TRAIN_RANGES[key]
+            a_lo = min(max(float(offset.min()), lo), hi)
+            a_hi = min(max(float(offset.max()), lo), hi)
+            if a_hi < a_lo:
+                a_lo, a_hi = a_hi, a_lo
+            derived[key] = [round(a_lo, 4), round(a_hi, 4)]
+    joint_pos = clip.get("joint_pos")
+    if joint_pos is not None and is_getup:
+        fps = float(clip["fps"])
+        nw = max(2, int(_ARCHETYPE_WINDOW_S * fps))
+        jp_arr = np.asarray(joint_pos, dtype=np.float64)
+        target = np.median(jp_arr[:nw], axis=0)
+        n = min(target.shape[0], _JOINT_TARGET_MAX_LEN)
+        lo, hi = _JOINT_TARGET_ELEMENT_BOUNDS
+        clamped = np.clip(target[:n], lo, hi)
+        derived["reset_joint_pos_target"] = [
+            round(float(x), 4) for x in clamped]
+        # A conservative fixed noise magnitude — enough per-episode
+        # variation to avoid the policy overfitting to one exact pose,
+        # small enough to stay a recognizable get-up posture (mirrors
+        # the scale of `reset_joint_position_offset_rad`'s own typical
+        # tuning, not clip-derived — the clip's own joint variance
+        # within its initial window is a plausible alternative but
+        # would need a second empirical validation pass; deferred).
+        derived["reset_joint_pos_noise_rad"] = 0.05
     return derived
 
 
@@ -585,10 +606,12 @@ def apply_reference_rsi(env_dir: Path | str, clip: dict) -> Path:
     env-spec version (train scope only; the frozen shared/eval section
     is untouched, so metric comparability is preserved by construction).
     Builds on the project's current spec when one exists. Uses
-    `derive_reference_reset` for the derivation, but only persists the
-    subset of keys `env_spec.py`'s schema currently accepts —
-    `reset_pitch_offset_rad` is computed (see `derive_reference_reset`'s
-    docstring) but NOT written here; see that docstring for why."""
+    `derive_reference_reset` for the derivation and now persists EVERY
+    key it returns — `reset_pitch_offset_rad`/`reset_roll_offset_rad`/
+    `reset_joint_pos_target`/`reset_joint_pos_noise_rad` are all live
+    `env_spec.py` schema keys as of §REFERENCE_TRAJECTORY_PLAN §8 part
+    2 (previously computed but not persistable; see git history for the
+    prior fence-limited workaround, now removed)."""
     env_dir = Path(env_dir)
     spec = read_current_env_spec(env_dir) or {
         "env_spec_version": ENV_SPEC_VERSION,
@@ -599,25 +622,32 @@ def apply_reference_rsi(env_dir: Path | str, clip: dict) -> Path:
     spec = json.loads(json.dumps(spec))        # deep copy
     train = dict(spec.get("train") or {})
     full = derive_reference_reset(clip)
-    pitch = full.pop("reset_pitch_offset_rad", None)
     train.update(full)
     spec["train"] = train
     meta = dict(spec.get("meta") or {})
     src = (clip.get("meta") or {}).get("source", "clip")
     meta["source"] = f"reference:{src}"
-    orient_note = (
-        f", pitch offset {pitch} rad NOT persisted "
-        "(env-spec schema key unavailable in this build; see "
-        "reference.py::derive_reference_reset docstring)"
-        if pitch is not None else ""
-    )
+    orient_note = ""
+    if "reset_pitch_offset_rad" in full or "reset_roll_offset_rad" in full:
+        orient_note = (
+            f", orientation offsets pitch="
+            f"{full.get('reset_pitch_offset_rad')} rad roll="
+            f"{full.get('reset_roll_offset_rad')} rad"
+        )
+    posture_note = ""
+    if "reset_joint_pos_target" in full:
+        posture_note = (
+            f", per-joint reference posture "
+            f"({len(full['reset_joint_pos_target'])} joints, noise "
+            f"{full.get('reset_joint_pos_noise_rad')} rad)"
+        )
     meta["rationale"] = (
         "RSI ranges derived from a reference trajectory "
         f"({src}): height offset "
         f"{full['reset_height_offset_m']} m, vz "
         f"{full['reset_vertical_velocity_mps']} m/s, paired sunk "
         f"termination {full['min_base_height_termination_m']} m"
-        f"{orient_note} "
+        f"{orient_note}{posture_note} "
         "(DeepMimic RSI; validator RSI↔ET invariant)."
     )
     spec["meta"] = meta
