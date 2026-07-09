@@ -627,6 +627,36 @@ def test_regenerate_metric_404_unknown_stage(
     assert r.status_code == 404
 
 
+def test_regenerate_metric_pending_stage_without_training_dir(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    """A pending stage that has never trained has no stages/<stage>/
+    training dir, but its metric lives in stage_metrics/<stage>/ and is
+    regenerable. Regression: the route validated against the training
+    dir, so it 404'd every not-yet-trained stage — exactly the stages a
+    user clicks 'Regenerate metric' on. Prove validation now passes by
+    asserting it reaches the active-job 409 guard, not a 404 (deliberately
+    no stages/torso_righting/ dir is created)."""
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _write_mission(
+        project_dir, "m1", [_stage_dict("torso_righting", status="pending")],
+    )
+
+    app = client.app  # type: ignore[attr-defined]
+    jobs = app.state.job_manager
+    jobs.register_passive_job(
+        kind="mission_execute",
+        project_slug=slug,
+        params={"mission_slug": "m1"},
+    )
+
+    r = client.post(
+        f"/projects/{slug}/missions/m1/stages/torso_righting/metric/regenerate",
+    )
+    assert r.status_code == 409, r.text  # passed stage-validation → active-job guard
+
+
 def test_regenerate_metric_409_when_another_regen_live_same_mission(
     client: TestClient, tmp_projects_root: Path,
 ) -> None:

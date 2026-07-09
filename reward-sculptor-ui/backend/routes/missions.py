@@ -1277,9 +1277,43 @@ def regenerate_stage_metric(
             detail=f"no project with slug {slug!r}",
             type_="/problems/not-found",
         )
-    resolved = _stage_dir_or_404(store, slug, mission_slug, stage)
-    if isinstance(resolved, JSONResponse):
-        return resolved
+    # Validate the stage against mission.json's stage list, NOT the
+    # on-disk stages/<stage>/ TRAINING dir. A pending stage that hasn't
+    # trained yet has no training dir, but its metric lives in
+    # stage_metrics/<stage>/ and is fully regenerable — the old
+    # `_stage_dir_or_404` guard 404'd every not-yet-trained stage, which
+    # is exactly the stages a user wants to regenerate a metric for.
+    if (not _SAFE_PATH_SEGMENT.match(mission_slug)
+            or not _SAFE_PATH_SEGMENT.match(stage)):
+        return _problem(
+            status.HTTP_404_NOT_FOUND, "invalid path segment",
+            detail=(
+                f"mission_slug={mission_slug!r} / stage={stage!r} must "
+                "each be a plain slug component"
+            ),
+            type_="/problems/not-found",
+        )
+    if mission_slug not in mission_store.list_mission_slugs(project_dir):
+        return _problem(
+            status.HTTP_404_NOT_FOUND, "mission not found",
+            detail=f"no mission {mission_slug!r} under project {slug!r}",
+            type_="/problems/not-found",
+        )
+    from sculptor.mission import load_mission as _load_mission_for_check
+    _stage_names = {
+        s.name for s in _load_mission_for_check(
+            mission_store.mission_dir(project_dir, mission_slug)
+        ).stages
+    }
+    if stage not in _stage_names:
+        return _problem(
+            status.HTTP_404_NOT_FOUND, "stage not found",
+            detail=(
+                f"no stage {stage!r} in mission {mission_slug!r} "
+                f"(project {slug!r})"
+            ),
+            type_="/problems/not-found",
+        )
 
     if jobs.active_mission_job(slug, mission_slug) is not None:
         return _problem(
