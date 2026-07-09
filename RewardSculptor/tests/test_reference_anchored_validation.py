@@ -105,6 +105,38 @@ def test_honest_metric_clears_all_three_reference_gates(tmp_path):
     assert f"reference:getup1:trunc_50" in v["archetype_scores"]
 
 
+def _late_rising_clip() -> dict:
+    """Lies STILL for the first half, then rises — the real-mocap pacing
+    (fallAndGetUp segments) that broke the original strict-monotone gate:
+    an honest righting metric scores trunc_25 == trunc_50 == 0.0 (a
+    plateau, not an inversion). D8 in REFERENCE_BUILD_LOG."""
+    n_flat0 = _T // 2
+    n_ramp = _T // 4
+    n_flat1 = _T - n_flat0 - n_ramp
+    flat0 = np.full(n_flat0, 0.1)
+    s = np.linspace(0.0, 1.0, n_ramp)
+    ramp = 0.1 + 0.65 * (1 - np.cos(np.pi * s)) / 2.0
+    flat1 = np.full(n_flat1, 0.75)
+    z = np.concatenate([flat0, ramp, flat1])
+    return {"root_pos_z": z, "fps": _FPS}
+
+
+def test_honest_metric_passes_on_late_rising_clip_plateau(tmp_path):
+    # Regression pin for D8: uneven mocap pacing (long lying prefix)
+    # must NOT fail monotonicity — plateaus at zero are honest.
+    clip = _late_rising_clip()
+    p = _write(tmp_path, "honest_late.py", HONEST_GETUP)
+    v = validate_generated_metric(
+        HONEST_GETUP, p, references=[("getup_late", clip)])
+    assert v["gates"]["reference_monotonicity:getup_late"] is True, v["reasons"]
+    assert v["ok"] is True, v["reasons"]
+    sc = v["references"][0]["scores"]
+    # The pacing really does plateau: both early truncations tie.
+    assert sc["trunc_25"] == sc["trunc_50"]
+    # And full still discriminates clearly against the earliest prefix.
+    assert sc["full"] >= sc["trunc_25"] + 0.1
+
+
 def test_constant_metric_fails_reference_nondegeneracy(tmp_path):
     clip = _rising_clip()
     p = _write(tmp_path, "const.py", CONSTANT_METRIC)

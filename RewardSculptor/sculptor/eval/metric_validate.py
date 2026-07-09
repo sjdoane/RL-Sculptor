@@ -1079,10 +1079,15 @@ def _validate_references(
          a battery positive OR always when references are given —
          `validate_generated_metric` decides which; this function just
          SCORES and gates).
-      2. `reference_monotonicity` — full > trunc_75 > trunc_50 > trunc_25
-         (each strictly, by >= 1e-6), and every truncation still >= the
-         degenerate anchor (a partial completion shouldn't score below
-         everything).
+      2. `reference_monotonicity` — NON-INVERSION with plateau tolerance:
+         trunc_25 <= trunc_50 <= trunc_75 <= full (each within 1e-6), AND
+         discrimination: full >= trunc_25 + spread_min. Strict growth at
+         every quarter was WRONG for real mocap (found live 2026-07-09,
+         D8 in REFERENCE_BUILD_LOG): fall-and-get-up segments spend their
+         first half lying still, so an HONEST righting metric scores
+         trunc_25 == trunc_50 == 0.0 — a tie, not an inversion. Plateaus
+         are legitimate pacing; inversions (an earlier prefix scoring
+         HIGHER) and full==earliest (no discrimination) remain rejected.
       3. `reference_negatives` — none of reversal/freeze_start/freeze_end/
          shuffle may score above `degenerate_anchor + spread_min`.
 
@@ -1131,20 +1136,27 @@ def _validate_references(
         t50 = pert_scores.get("trunc_50", float("nan"))
         t25 = pert_scores.get("trunc_25", float("nan"))
         mono_terms = [full_score, t75, t50, t25]
+        # Non-inversion (plateaus allowed): a later prefix may TIE an
+        # earlier one (real mocap paces unevenly — a get-up segment can
+        # lie still for its whole first half, honestly scoring 0.0 at 25%
+        # AND 50%), but must never score LOWER. Discrimination: the full
+        # clip must clearly beat the earliest prefix, or the metric can't
+        # tell completion from onset (a constant metric dies here).
+        _eps = 1e-6
         mono_ok = all(np.isfinite(v) for v in mono_terms) and (
-            full_score >= t75 + 1e-6
-            and t75 >= t50 + 1e-6
-            and t50 >= t25 + 1e-6
-            and all(v >= degenerate_anchor for v in (t75, t50, t25)))
+            t25 <= t50 + _eps
+            and t50 <= t75 + _eps
+            and t75 <= full_score + _eps
+            and full_score >= t25 + spread_min)
         ref_gates["reference_monotonicity"] = mono_ok
         if not mono_ok:
             ref_reasons.append(
-                f"[reference:{clip_id}] monotonicity: expected full "
-                f"({full_score:.3f}) > trunc_75 ({t75:.3f}) > trunc_50 "
-                f"({t50:.3f}) > trunc_25 ({t25:.3f}), each strictly, and all "
-                f"truncations >= the degenerate anchor "
-                f"({degenerate_anchor:.3f}) — the metric does not grade "
-                f"partial completion of the reference monotonically")
+                f"[reference:{clip_id}] monotonicity: expected no inversion "
+                f"(trunc_25 {t25:.3f} <= trunc_50 {t50:.3f} <= trunc_75 "
+                f"{t75:.3f} <= full {full_score:.3f}, plateaus allowed) AND "
+                f"full >= trunc_25 + spread_min ({spread_min}) — the metric "
+                f"either inverts partial-completion order or cannot "
+                f"discriminate completion from onset")
 
         neg_names = ("reversal", "freeze_start", "freeze_end", "shuffle")
         neg_ceiling = degenerate_anchor + spread_min
