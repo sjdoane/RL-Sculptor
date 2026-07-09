@@ -19,22 +19,19 @@ the single place that answers two questions:
      → no-op; a failing sink NEVER raises into the pipeline (provenance
      is advisory, the loop is not).
 
-Role assignments (2026-07-06 upgrade pass — strongest appropriate model
-per role, not uniform top-tier):
+Role assignments (2026-07-09 pass — fable-5 across the board, one
+principled exception):
 
-  * fable-5 on every role whose output steers training: decomposition,
-    diagnosis, reward writing, metric authoring, env-spec generation.
-  * eureka_baseline ALSO fable-5 — the baseline arm must be model-matched
-    to the treatment arm or an E4-v2 comparison confounds search topology
-    with model strength.
-  * calibration (competence-ladder + gaming-archetype author) is
-    DELIBERATELY a different model (opus-4-8) from the metric author:
-    §RESEARCH_GAP_ANALYSIS §3.5 — if author and ladder share one model's
-    blind spot, L2 agreement passes without catching it. Keep these
-    model-disjoint.
-  * kg_extract / kg_research / mjcf_editor are high-volume structured
-    extraction or mechanical rewriting — sonnet-5 is the strongest fit
-    (opus-class reasoning buys nothing measurable there).
+  * fable-5 on EVERY in-system role: decomposition, diagnosis, reward
+    writing, metric authoring/review, env-spec generation, KG extraction/
+    research, MJCF editing, reference reranking, eureka baseline (the
+    baseline arm must be model-matched to the treatment arm or an E4-v2
+    comparison confounds search topology with model strength).
+  * calibration (competence-ladder + gaming-archetype author) is the ONE
+    exception — DELIBERATELY a different model (opus-4-8) from the metric
+    author: §RESEARCH_GAP_ANALYSIS §3.5 — if author and ladder share one
+    model's blind spot, L2 agreement passes without catching it. Keep
+    these model-disjoint.
 """
 from __future__ import annotations
 
@@ -54,18 +51,21 @@ ROLE_DEFAULTS: dict[str, str] = {
     "edit": "claude-fable-5",
     "metric_gen": "claude-fable-5",
     "metric_review": "claude-fable-5",
+    # calibration is the ONE deliberate exception to the all-fable-5
+    # policy (2026-07-09): §RESEARCH_GAP_ANALYSIS §3.5 requires the
+    # ladder/archetype author to be model-DISJOINT from metric_gen so a
+    # shared blind spot can't pass L2 agreement — metric_gen is fable-5,
+    # so calibration must not be.
     "calibration": "claude-opus-4-8",
     "eureka_baseline": "claude-fable-5",
     "env_gen": "claude-fable-5",
-    "kg_extract": "claude-sonnet-5",
-    "kg_research": "claude-sonnet-5",
-    "mjcf_editor": "claude-sonnet-5",
-    # §R1_BUILD_SPEC decision 7: reference-clip retrieval reranking is a
-    # bounded, cheap classification task (rerank <=20 deterministic
-    # candidates against a goal string) — sonnet-5 is the right cost/
-    # quality point; this role is entirely OPTIONAL (retrieve.py's
-    # deterministic layer is always-on and never blocked by this call).
-    "reference_rerank": "claude-sonnet-5",
+    "kg_extract": "claude-fable-5",
+    "kg_research": "claude-fable-5",
+    "mjcf_editor": "claude-fable-5",
+    # reference-clip retrieval reranking (§R1_BUILD_SPEC decision 7):
+    # OPTIONAL role — retrieve.py's deterministic layer is always-on and
+    # never blocked by this call.
+    "reference_rerank": "claude-fable-5",
 }
 
 #: §LAW 9 review panel: author-DISJOINT by construction — none of these
