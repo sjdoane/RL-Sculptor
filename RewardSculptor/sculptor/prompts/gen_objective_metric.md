@@ -203,3 +203,21 @@ score near 1.0 (their range, not just one clip's exact numbers). The
 signature is grounding, not a literal replay target — still obey every HARD
 RULE above (signed direction, amplitude floor, gate × min composition, no
 peak/ratio terms).
+
+Your metric will be SCORED on the full reference clip and its truncations/
+perturbations before acceptance — if the full clip does not clearly beat the
+degenerate anchors, you are rejected, so a threshold the reference itself
+cannot pass is an automatic self-rejection.
+
+## TIME-SERIES HYGIENE (hard-won rejection causes)
+
+- NEVER smooth with zero-padded boundaries (`np.convolve(..., mode="same")`
+  zero-pads: a rising signal's smoothed tail collapses toward half its true
+  value, which can make the FINAL frames of a successful episode classify as
+  its starting state and zero a completion gate). Use edge-padded smoothing
+  (`np.pad(x, (k//2, k-1-k//2), mode="edge")` then `mode="valid"`), a cumsum
+  window over valid interior only, or simply window MEANS over explicit
+  index ranges.
+- Episode boundaries are where success lives (the end state IS the goal) —
+  any operation with boundary artifacts (convolve/filtfilt padding, gradient
+  endpoints) corrupts exactly the frames your completion gate reads.

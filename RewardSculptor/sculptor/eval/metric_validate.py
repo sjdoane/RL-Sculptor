@@ -1064,6 +1064,36 @@ def _score_reference_entry(
         return float("nan"), {}
 
 
+def _reference_components(fn, clip: dict, required_roles: list[str]) -> dict:
+    """The metric's FULL output dict on a clip (not just spec_score) — the
+    named sub-channels a generated metric returns are the only diagnostic
+    window into WHY a reference scored the way it did. Fed into gate-failure
+    reasons so the authoring retry loop sees e.g. `completion_gate: 0.0,
+    progress_score: 0.93` instead of a bare `full 0.000` (a real fable-5
+    metric died 3 straight retries on an invisible np.convolve boundary
+    artifact before this existed — D12). Numeric values only, rounded;
+    never raises."""
+    from sculptor.refs.convert import clip_to_arrays
+
+    try:
+        arrays, meta = clip_to_arrays(clip)
+        inject_joint_roles(meta, required_roles, lenient=True)
+        T = next(iter(arrays.values())).shape[0]
+        E = next(iter(arrays.values())).shape[1]
+        out = fn(arrays, {"max_episode_steps": T, "rollout_num_envs": E,
+                          "step_dt": 0.02}, meta)
+        comp: dict[str, Any] = {}
+        for k, v in (out or {}).items():
+            try:
+                fv = float(v)
+                comp[k] = round(fv, 4) if np.isfinite(fv) else str(fv)
+            except (TypeError, ValueError):
+                comp[k] = str(v)[:60]
+        return comp
+    except Exception:  # noqa: BLE001 — diagnostics only, never raises out
+        return {}
+
+
 def _validate_references(
     fn, references: list[tuple[str, dict]], required_roles: list[str],
     *, spread_min: float, degenerate_anchor: float,
@@ -1174,12 +1204,25 @@ def _validate_references(
                 f"— gameable by a reversed/frozen/shuffled near-miss of the "
                 f"reference")
 
-        results.append({
+        entry: dict[str, Any] = {
             "clip_id": clip_id,
             "gates": ref_gates,
             "reasons": ref_reasons,
             "scores": {"full": full_score, **pert_scores},
-        })
+        }
+        if not all(ref_gates.values()):
+            # Diagnostic window for the authoring retry loop (D12): the
+            # metric's OWN named sub-channels on the full reference tell
+            # the author WHY it failed (e.g. completion_gate 0.0 while
+            # progress 0.93 = a gating/boundary bug, not a wrong signal).
+            comp = _reference_components(fn, clip, required_roles)
+            if comp:
+                entry["full_components"] = comp
+                ref_reasons.append(
+                    f"[reference:{clip_id}] full-reference sub-components "
+                    f"(the metric's own outputs on the real exemplar — "
+                    f"diagnose which channel/gate zeroed it): {comp}")
+        results.append(entry)
     return results, all_scores
 
 
