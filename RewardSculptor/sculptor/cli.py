@@ -1599,21 +1599,16 @@ def refs_ingest(
     dataset (plain HTTPS, ungated). Idempotent: re-running skips clips
     whose content hash is already indexed. Rejects are never fatal —
     logged to `index_rejects.jsonl` with a reason; see that file for
-    anything skipped this run."""
+    anything skipped this run. Unless `--no-preview`, a best-effort
+    `preview.png` keyframe strip is rendered per accepted clip/segment
+    (§decision 8) — a missing preview module or GL/EGL context is
+    logged per-clip and never fails the ingest."""
     from sculptor.refs.ingest import ingest_source
     from sculptor.refs.library import rebuild_index
 
     summary = ingest_source(
         source, filter_glob=filter_glob, limit=limit, no_preview=no_preview,
         progress=lambda msg: typer.echo(msg))
-
-    if not no_preview:
-        try:
-            import sculptor.refs.preview  # noqa: F401
-        except ModuleNotFoundError:
-            typer.echo(
-                "[refs ingest] preview module not available yet — "
-                "continuing without previews (never blocks ingest)")
 
     rows = rebuild_index()
     typer.echo(
@@ -1663,6 +1658,65 @@ def refs_list(
             f"fps={row.get('fps', '?'):<6} "
             f"dur={row.get('duration_s', '?')}s "
             f"[{preview}]  {row.get('text', '')}")
+
+
+@refs_app.command("search")
+def refs_search(
+    query: str = typer.Argument(..., help="Free-text goal, e.g. "
+        "'get up off the ground'."),
+    robot: str = typer.Option("g1", "--robot", help="Robot to search."),
+    k: int = typer.Option(10, "--k", help="Max results to print."),
+    no_llm: bool = typer.Option(
+        False, "--no-llm", help="Skip the optional LLM rerank layer "
+        "(deterministic token-overlap ranking only)."),
+) -> None:
+    """Rank indexed clips against a free-text query (§decision 7).
+    Deterministic token-overlap + synonym-expanded scoring always runs;
+    unless `--no-llm`, the top candidates are reranked by
+    `reference_rerank` with a match_confidence + reason — any failure
+    there (no key, network, parse) silently falls back to the
+    deterministic ranking, never raises."""
+    from sculptor.refs.retrieve import search
+
+    results = search(query, robot=robot, k=k, use_llm=not no_llm)
+    if not results:
+        typer.echo(f"[refs search] no matches for {query!r} (robot={robot})")
+        return
+    for m in results:
+        conf = f"{m.match_confidence:.2f}" if m.match_confidence is not None else "  - "
+        typer.echo(
+            f"{m.clip_id:<40} score={m.score:>8.3f} conf={conf} "
+            f"tier={m.tier or '?':<3} dur={m.duration_s or '?'}s "
+            f"[{m.rerank}]  {m.text}")
+        if m.reason:
+            typer.echo(f"    reason: {m.reason}")
+
+
+@refs_app.command("preview")
+def refs_preview(
+    clip_id: str = typer.Argument(..., help="Clip id to render/re-render."),
+    robot: str = typer.Option("g1", "--robot", help="Robot the clip belongs to."),
+) -> None:
+    """Render (or re-render) a single clip's `preview.png` keyframe
+    strip on demand. Skips cleanly (non-zero exit, actionable message)
+    if `sculptor.refs.preview` can't create a GL/EGL context in this
+    environment — never a stack trace."""
+    from sculptor.reference import load_clip
+    from sculptor.refs import library
+    from sculptor.refs.preview import PreviewUnavailable, render_preview_png
+
+    clip_path = library.clip_dir(robot, clip_id) / library.CLIP_FILENAME
+    if not clip_path.is_file():
+        typer.echo(f"[refs preview] no such clip: {robot}/{clip_id}", err=True)
+        raise typer.Exit(code=1)
+    clip = load_clip(clip_path)
+    out_path = library.clip_dir(robot, clip_id) / library.PREVIEW_FILENAME
+    try:
+        render_preview_png(clip, out_path)
+    except PreviewUnavailable as e:
+        typer.echo(f"[refs preview] unavailable in this environment: {e}", err=True)
+        raise typer.Exit(code=1) from e
+    typer.echo(f"[refs preview] wrote {out_path}")
 
 
 if __name__ == "__main__":  # pragma: no cover

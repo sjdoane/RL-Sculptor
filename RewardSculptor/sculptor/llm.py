@@ -60,6 +60,12 @@ ROLE_DEFAULTS: dict[str, str] = {
     "kg_extract": "claude-sonnet-5",
     "kg_research": "claude-sonnet-5",
     "mjcf_editor": "claude-sonnet-5",
+    # §R1_BUILD_SPEC decision 7: reference-clip retrieval reranking is a
+    # bounded, cheap classification task (rerank <=20 deterministic
+    # candidates against a goal string) — sonnet-5 is the right cost/
+    # quality point; this role is entirely OPTIONAL (retrieve.py's
+    # deterministic layer is always-on and never blocked by this call).
+    "reference_rerank": "claude-sonnet-5",
 }
 
 #: §LAW 9 review panel: author-DISJOINT by construction — none of these

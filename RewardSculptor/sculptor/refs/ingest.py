@@ -129,6 +129,35 @@ def tokenize_label(stem: str) -> list[str]:
 _MAX_JOINT_ANGLE_RAD = 2.0 * np.pi
 _MAX_JOINT_DELTA_RAD_AT_30FPS = 0.5
 
+#: §R1_BUILD_SPEC W2 item 0 (orchestrator ruling on W1's escalation):
+#: real fleaven floor-contact clips have `root_pos_z` dipping slightly
+#: negative (observed min -3.85 mm) — retargeting float noise, not a
+#: real below-ground pose. `sculptor.reference.validate_clip` requires
+#: `root_pos_z` strictly positive (that invariant is NOT touched here),
+#: so a clip in this noise band would otherwise hard-reject on schema
+#: validation despite being a legitimate floor-contact motion. Anything
+#: past this floor is NOT noise — reject it (§decision 5's root-z gate
+#: still owns the general (0, 2.5) m bound; this clamp only covers the
+#: narrow noise band immediately below zero).
+_ROOT_Z_CLAMP_NOISE_FLOOR_M = -0.05
+_ROOT_Z_CLAMP_TARGET_M = 1e-4
+
+
+def _clamp_root_z_noise(root_pos: np.ndarray) -> Optional[dict[str, Any]]:
+    """Clamp `root_pos[:, 2]` in place when its minimum is within the
+    retargeting-noise band `[-0.05, 0]` m, returning a qc-block entry
+    describing what happened (or None if no clamp was needed). Does NOT
+    reject — a min below -0.05 m is handled by the caller as a hard
+    reject (`root_z_below_ground`), separate from this clamp path."""
+    z = root_pos[:, 2]
+    z_min = float(z.min())
+    if not (_ROOT_Z_CLAMP_NOISE_FLOOR_M <= z_min <= 0.0):
+        return None
+    mask = z < _ROOT_Z_CLAMP_TARGET_M
+    n_frames = int(mask.sum())
+    root_pos[:, 2] = np.maximum(z, _ROOT_Z_CLAMP_TARGET_M)
+    return {"n_frames": n_frames, "min_before": round(z_min, 6)}
+
 
 def _plausibility_checks(
     root_pos: np.ndarray, joint_pos: np.ndarray, fps: float,
@@ -216,6 +245,21 @@ def _run_qc_gates(
     if not all_finite:
         raise ClipRejected("non-finite values in root pos/quat/joint arrays")
 
+    # §R1_BUILD_SPEC W2 item 0: clamp retargeting float noise BEFORE the
+    # (0, 2.5) m plausibility gate and BEFORE `validate_clip`'s strictly-
+    # positive check would otherwise hard-reject a legitimate
+    # floor-contact clip. A min below the -0.05 m noise floor is a real
+    # below-ground pose, not noise — hard-reject it explicitly (distinct
+    # reason from the general root-z-out-of-range plausibility fail).
+    z0 = float(root_pos[:, 2].min())
+    if z0 < _ROOT_Z_CLAMP_NOISE_FLOOR_M:
+        raise ClipRejected(
+            f"root_z_below_ground: min={z0:.6f} < "
+            f"{_ROOT_Z_CLAMP_NOISE_FLOOR_M} m noise floor")
+    root_z_clamped = _clamp_root_z_noise(root_pos)
+    if root_z_clamped is not None:
+        checks.append("root_z_clamp")
+
     checks.append("joint_mapping")
     # 1) Column-count contract: the sliced joint block must be exactly as
     #    wide as G1_29 — HARD-FAILS (raises) on any width mismatch, which
@@ -248,13 +292,16 @@ def _run_qc_gates(
         raise ClipRejected(mc_reason)
 
     z = root_pos[:, 2]
-    return {
+    qc_out: dict[str, Any] = {
         "duration_s": round(n / float(fps), 4),
         "root_z_range": [round(float(z.min()), 4), round(float(z.max()), 4)],
         "n_frames": n,
         "checks": checks,
         "flags": flags,
     }
+    if root_z_clamped is not None:
+        qc_out["root_z_clamped"] = root_z_clamped
+    return qc_out
 
 
 # ── shared: raw (T, 36) array -> validated library clip ─────────────────
@@ -425,9 +472,11 @@ def ingest_source(
 ) -> IngestSummary:
     """Download + ingest a batch from one dataset source (§decision 9).
     The single network-reaching entry point workers/CLI should call.
-    `no_preview` is accepted for CLI symmetry with §decision 8's preview
-    step (a later worker) — R1 W1 never attempts preview generation
-    regardless of this flag."""
+    `no_preview=False` (default) attempts a best-effort `preview.png`
+    render per accepted clip/segment via `sculptor.refs.preview`
+    (§decision 8) — never blocks or fails ingest; `no_preview=True`
+    skips preview generation entirely (also the automatic fallback when
+    the preview module isn't importable or GL/EGL is unavailable)."""
     if source not in _SOURCES:
         raise ValueError(f"unknown source {source!r}; expected one of {_SOURCES}")
     log = progress or (lambda _msg: None)
@@ -470,7 +519,7 @@ def ingest_source(
         try:
             result = ingest_clip_bytes(
                 raw, source=source, repo=repo, rel_path=rel_path, stem=stem,
-                robot=robot, root=root)
+                robot=robot, root=root, no_preview=no_preview, progress=log)
         except (DatasetFormatError, ClipRejected) as e:
             reason = e.reason if isinstance(e, ClipRejected) else str(e)
             summary.rejected.append((stem, reason))
@@ -486,15 +535,44 @@ def ingest_source(
     return summary
 
 
+def _try_render_preview(
+    clip: dict, robot: str, clip_id: str, *, root: Optional[Path],
+    progress: Optional[Callable[[str], None]] = None,
+) -> None:
+    """Best-effort preview.png generation for one library clip. Never
+    raises: `sculptor.refs.preview` may not be importable yet (an
+    earlier worker stage) or GL/EGL may be unavailable in this
+    environment (§decision 8) — either way this logs (via `progress`,
+    if given) and returns, leaving the clip valid with no preview.png."""
+    log = progress or (lambda _msg: None)
+    try:
+        from sculptor.refs.preview import PreviewUnavailable, render_preview_png
+    except ModuleNotFoundError:
+        log(f"[refs ingest] preview module not available — skipping "
+            f"preview for {clip_id}")
+        return
+    out_path = library.clip_dir(robot, clip_id, root=root) / library.PREVIEW_FILENAME
+    try:
+        render_preview_png(clip, out_path)
+    except PreviewUnavailable as e:
+        log(f"[refs ingest] preview unavailable for {clip_id}: {e}")
+    except Exception as e:  # noqa: BLE001 — preview must never block ingest
+        log(f"[refs ingest] preview failed for {clip_id}: "
+            f"{type(e).__name__}: {e}")
+
+
 def ingest_clip_bytes(
     raw: bytes, *, source: str, repo: str, rel_path: str, stem: str,
-    robot: str = "g1", root: Optional[Path] = None,
+    robot: str = "g1", root: Optional[Path] = None, no_preview: bool = False,
+    progress: Optional[Callable[[str], None]] = None,
 ) -> "library.LibraryClip":
     """Parse + QC + persist ONE clip's raw bytes (CSV or npy, dispatched
     by `source`). Also runs the §decision-6 segmentation for clips whose
     tokens match fall/getup, persisting each segment as a derived clip.
     Shared by `ingest_source` and tests (which call this directly on
-    synthetic bytes — no network)."""
+    synthetic bytes — no network). `no_preview=False` (default) attempts
+    a best-effort `preview.png` render for the clip and each of its
+    segments via `_try_render_preview` — never blocks/fails ingest."""
     from sculptor.refs.segment import segment_clip
 
     if source == "lafan1-g1":
@@ -531,6 +609,8 @@ def ingest_clip_bytes(
     result = library.LibraryClip(
         robot=robot, clip_id=clip_id, clip_path=d / library.CLIP_FILENAME,
         provenance_path=prov_path, provenance=prov)
+    if not no_preview:
+        _try_render_preview(clip, robot, clip_id, root=root, progress=progress)
 
     # §decision 6: segment fall/getup clips at ingest time.
     if any(t in ("fall", "getup") for t in tokens):
@@ -563,5 +643,8 @@ def ingest_clip_bytes(
             seg_d = library.clip_dir(robot, seg_clip_id, root=root)
             save_clip(seg_d / library.CLIP_FILENAME, seg_clip)
             library.write_provenance(robot, seg_clip_id, seg_prov, root=root)
+            if not no_preview:
+                _try_render_preview(
+                    seg_clip, robot, seg_clip_id, root=root, progress=progress)
 
     return result

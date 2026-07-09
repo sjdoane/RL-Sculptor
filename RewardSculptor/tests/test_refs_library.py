@@ -301,6 +301,50 @@ def test_qc_flags_large_joint_delta_without_rejecting() -> None:
     assert any("delta" in f for f in qc["flags"])
 
 
+# ── root_z retargeting-noise clamp (§R1_BUILD_SPEC W2 item 0) ─────────────
+def test_qc_clamps_small_negative_root_z_noise_and_records_qc() -> None:
+    """A real fleaven-style floor-contact clip with root_z dipping to
+    -3.85 mm (retargeting float noise, within the [-0.05, 0] m band) is
+    clamped to a small positive floor instead of hard-rejecting, and the
+    clamp is recorded in the qc block."""
+    n = 50
+    z = np.full(n, 0.78)
+    z[10] = -0.00385
+    z[11] = -0.001
+    rows = _neutral_rows(n, z=z)
+    raw = _rows_to_csv_bytes(rows)
+    clip, qc = parse_lafan1_csv(raw, stem="ground2_subject1")
+    assert validate_clip(clip) == []
+    assert (clip["root_pos_z"] > 0).all()
+    assert "root_z_clamped" in qc
+    assert qc["root_z_clamped"]["n_frames"] == 2
+    assert qc["root_z_clamped"]["min_before"] == pytest.approx(-0.00385, abs=1e-9)
+    assert "root_z_clamp" in qc["checks"]
+
+
+def test_qc_rejects_root_z_below_noise_floor() -> None:
+    """A min(root_z) below -0.05 m is a real below-ground pose, not
+    retargeting noise — hard-reject with the `root_z_below_ground`
+    reason, distinct from the general out-of-range plausibility fail."""
+    n = 50
+    z = np.full(n, 0.78)
+    z[10] = -0.2  # well past the -0.05 m noise floor
+    rows = _neutral_rows(n, z=z)
+    raw = _rows_to_csv_bytes(rows)
+    with pytest.raises(ClipRejected, match="root_z_below_ground"):
+        parse_lafan1_csv(raw, stem="ground3_subject1")
+
+
+def test_qc_leaves_all_positive_root_z_untouched_no_qc_entry() -> None:
+    """An all-positive clip is not touched by the clamp path and carries
+    no `root_z_clamped` qc entry."""
+    rows = _neutral_rows(50)  # z is a flat 0.78, all positive
+    raw = _rows_to_csv_bytes(rows)
+    clip, qc = parse_lafan1_csv(raw, stem="ground4_subject1")
+    assert "root_z_clamped" not in qc
+    assert "root_z_clamp" not in qc["checks"]
+
+
 # ── tokenize_label ────────────────────────────────────────────────────────
 def test_tokenize_label_splits_camel_digits_underscore() -> None:
     assert tokenize_label("fallAndGetUp1_subject1") == [
@@ -464,7 +508,7 @@ def test_ingest_clip_bytes_persists_clip_and_provenance(tmp_path: Path) -> None:
     result = ingest_clip_bytes(
         raw, source="lafan1-g1", repo="lvhaidong/LAFAN1_Retargeting_Dataset",
         rel_path="g1/dance1-2_subject3.csv", stem="dance1-2_subject3",
-        robot="g1", root=tmp_path)
+        robot="g1", root=tmp_path, no_preview=True)
     assert result.clip_path.is_file()
     assert result.provenance_path.is_file()
     loaded = load_clip(result.clip_path)
@@ -487,7 +531,7 @@ def test_ingest_clip_bytes_fall_getup_produces_segments(tmp_path: Path) -> None:
     ingest_clip_bytes(
         raw, source="lafan1-g1", repo="lvhaidong/LAFAN1_Retargeting_Dataset",
         rel_path="g1/fallAndGetUp1_subject1.csv", stem="fallAndGetUp1_subject1",
-        robot="g1", root=tmp_path)
+        robot="g1", root=tmp_path, no_preview=True)
     rows_idx = library.rebuild_index(root=tmp_path)
     seg_rows = [r for r in rows_idx if r["clip_id"].startswith("fallandgetup1_subject1--seg")]
     assert len(seg_rows) >= 2   # >= 2 segments per the spec's data-run acceptance bar
@@ -518,11 +562,11 @@ def test_ingest_source_idempotent_on_second_run(tmp_path: Path, monkeypatch: pyt
     monkeypatch.setattr("sculptor.refs.ingest._hf_list_files", fake_list_files)
     monkeypatch.setattr("sculptor.refs.ingest._http_get_bytes", fake_get_bytes)
 
-    summary1 = ingest_source("lafan1-g1", root=tmp_path)
+    summary1 = ingest_source("lafan1-g1", root=tmp_path, no_preview=True)
     assert summary1.accepted == ["dance1_2_subject3"]
     assert summary1.skipped_existing == []
 
-    summary2 = ingest_source("lafan1-g1", root=tmp_path)
+    summary2 = ingest_source("lafan1-g1", root=tmp_path, no_preview=True)
     assert summary2.accepted == []
     assert summary2.skipped_existing == ["dance1_2_subject3"]
 
@@ -540,7 +584,7 @@ def test_ingest_source_rejects_are_logged_not_fatal(tmp_path: Path, monkeypatch:
     monkeypatch.setattr("sculptor.refs.ingest._hf_list_files", fake_list_files)
     monkeypatch.setattr("sculptor.refs.ingest._http_get_bytes", fake_get_bytes)
 
-    summary = ingest_source("lafan1-g1", root=tmp_path)
+    summary = ingest_source("lafan1-g1", root=tmp_path, no_preview=True)
     assert summary.accepted == ["dance1_1_subject1"]
     assert len(summary.rejected) == 1
     assert summary.rejected[0][0] == "dance2-1_subject1"

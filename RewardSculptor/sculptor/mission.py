@@ -104,6 +104,24 @@ class Stage:
     # and applies it to this stage's env spec before training. Backward-
     # compatible: older mission.json load with False via from_dict.
     needs_reference_rsi: bool = False
+    # §R1_BUILD_SPEC decision 10: the reference-library clip (if any)
+    # ATTACHED to this stage via `POST .../stages/{stage}/reference` —
+    # distinct from `needs_reference_rsi` (which only says the stage
+    # WANTS an RSI curriculum; the orchestrator falls back to the
+    # procedural jump clip when no library clip is attached).
+    # `reference_clip_id` is the library clip id (`sculptor.refs.library`
+    # clip_id charset); `reference_tier` mirrors that clip's provenance
+    # `tier` at attach time (cheap display without a second lookup);
+    # `reference_match_confidence` carries the retrieval match_confidence
+    # from `refs.retrieve.search` when the clip was attached via a
+    # search result (None for a manual/direct attach, or when the
+    # deterministic-only layer produced the match). None on stages with
+    # no reference attached. Backward-compatible: older mission.json
+    # without these keys load with None via from_dict's filter-unknown-
+    # keys path, same guarantee `needs_reference_rsi` already relies on.
+    reference_clip_id: Optional[str] = None
+    reference_tier: Optional[str] = None
+    reference_match_confidence: Optional[float] = None
 
     # ── Runtime-populated by orchestrator ────────────────────────────
     status: StageStatus = "pending"

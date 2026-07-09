@@ -3244,6 +3244,65 @@ def test_load_mission_json_without_new_fields_still_works(tmp_path: Path):
     assert m2.stages[0].status == "pending"
 
 
+def test_stage_reference_fields_roundtrip_mission_json(tmp_path: Path):
+    """§R1_BUILD_SPEC decision 10: reference_clip_id/reference_tier/
+    reference_match_confidence survive save->load, same as any other
+    Stage field (mirrors the failure_reason/failure_detail roundtrip
+    test above)."""
+    from sculptor.mission import load_mission, save_mission
+
+    m = _make_mission(tmp_path / "rt", n_stages=1)
+    m.stages[0].reference_clip_id = "fallandgetup1_subject1--seg00"
+    m.stages[0].reference_tier = "K"
+    m.stages[0].reference_match_confidence = 0.87
+    save_mission(m, Path(m.mission_dir))
+    m2 = load_mission(Path(m.mission_dir))
+    assert m2.stages[0].reference_clip_id == "fallandgetup1_subject1--seg00"
+    assert m2.stages[0].reference_tier == "K"
+    assert m2.stages[0].reference_match_confidence == pytest.approx(0.87)
+
+
+def test_stage_reference_fields_default_none(tmp_path: Path):
+    """A stage with no reference attached round-trips all three fields
+    as None (the default) — the common case."""
+    from sculptor.mission import load_mission, save_mission
+
+    m = _make_mission(tmp_path / "rt_none", n_stages=1)
+    save_mission(m, Path(m.mission_dir))
+    m2 = load_mission(Path(m.mission_dir))
+    assert m2.stages[0].reference_clip_id is None
+    assert m2.stages[0].reference_tier is None
+    assert m2.stages[0].reference_match_confidence is None
+
+
+def test_load_mission_json_without_reference_fields_still_works(tmp_path: Path):
+    """§R1_BUILD_SPEC decision 10 back-compat: an OLD mission.json
+    written before the reference fields existed (and therefore missing
+    those keys entirely) must still load cleanly, with all three
+    defaulting to None — via `Stage.from_dict`'s filter-unknown/missing-
+    keys path, same guarantee failure_reason/needs_reference_rsi already
+    rely on (mirrors
+    test_load_mission_json_without_new_fields_still_works above)."""
+    import json as _json
+
+    from sculptor.mission import load_mission
+
+    m = _make_mission(tmp_path / "old_fmt_ref", n_stages=1)
+    mission_path = Path(m.mission_dir) / "mission.json"
+    doc = _json.loads(mission_path.read_text(encoding="utf-8"))
+    for stage_doc in doc["stages"]:
+        stage_doc.pop("reference_clip_id", None)
+        stage_doc.pop("reference_tier", None)
+        stage_doc.pop("reference_match_confidence", None)
+    mission_path.write_text(_json.dumps(doc, indent=2), encoding="utf-8")
+
+    m2 = load_mission(Path(m.mission_dir))
+    assert m2.stages[0].reference_clip_id is None
+    assert m2.stages[0].reference_tier is None
+    assert m2.stages[0].reference_match_confidence is None
+    assert m2.stages[0].status == "pending"
+
+
 def test_redecompose_rsi_flag_per_substage_not_force_inherited(
     tmp_path: Path, monkeypatch,
 ):
