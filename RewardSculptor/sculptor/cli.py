@@ -1799,5 +1799,48 @@ def refs_retarget(
     typer.echo(f"[refs retarget] index_rows={len(rows)}")
 
 
+@refs_app.command("resegment")
+def refs_resegment(
+    parent: str = typer.Option(
+        ..., "--parent", help="clip_id of the parent clip to re-segment "
+        "(the un-suffixed clip, not one of its `--segNN` children)."),
+    robot: str = typer.Option("g1", "--robot", help="Robot the parent clip belongs to."),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Print what would change without "
+        "writing or deleting anything."),
+    no_preview: bool = typer.Option(
+        False, "--no-preview", help="Skip preview.png re-render for the "
+        "new segments."),
+) -> None:
+    """Re-run segmentation for one already-indexed parent clip using the
+    current `sculptor.refs.segment` rules (2026-07-09 settled-start
+    fix), replacing its existing derived `--segNN` segments. Only clips
+    whose provenance `parent_clip_id` matches `--parent` are touched —
+    the rest of the library is untouched. QC-rejected candidates are
+    logged (never written) via the same rejects mechanism ingest uses."""
+    from sculptor.refs.ingest import ResegmentError, resegment_clip
+
+    try:
+        summary = resegment_clip(
+            parent, robot=robot, dry_run=dry_run, no_preview=no_preview,
+            progress=lambda msg: typer.echo(msg))
+    except ResegmentError as e:
+        typer.echo(f"[refs resegment] FAILED: {e}", err=True)
+        raise typer.Exit(code=1) from e
+
+    verb = "would remove" if dry_run else "removed"
+    add_verb = "would add" if dry_run else "added"
+    typer.echo(
+        f"[refs resegment] parent={summary.parent_clip_id} "
+        f"{verb}={len(summary.removed)} {add_verb}={len(summary.added)} "
+        f"rejected={len(summary.rejected)}")
+    for seg_id in summary.removed:
+        typer.echo(f"  - {verb}: {seg_id}")
+    for seg_id in summary.added:
+        typer.echo(f"  + {add_verb}: {seg_id}")
+    for cand_id, reason in summary.rejected:
+        typer.echo(f"  x rejected: {cand_id}: {reason}")
+
+
 if __name__ == "__main__":  # pragma: no cover
     app()

@@ -22,15 +22,26 @@ from sculptor.refs.ingest import (
     ClipRejected,
     DatasetFormatError,
     N_COLS,
+    ResegmentError,
     _hf_resolve_url,
+    find_derived_segments,
     ingest_clip_bytes,
     ingest_source,
     parse_fleaven_npy,
     parse_lafan1_csv,
+    resegment_clip,
     tokenize_label,
     xyzw_to_wxyz,
 )
-from sculptor.refs.segment import Segment, segment_by_root_z, segment_clip
+from sculptor.refs.segment import (
+    DOWN_Z,
+    Segment,
+    STANDING_Z,
+    segment_by_root_z,
+    segment_by_root_z_full,
+    segment_clip,
+    segment_clip_full,
+)
 
 N_JOINTS = len(G1_29)
 
@@ -429,12 +440,42 @@ def test_indexed_content_hashes_reads_from_provenance(tmp_path: Path) -> None:
 # ── segmentation (§decision 6) ────────────────────────────────────────────
 def _synthetic_z_profile(fps: float, n_cycles: int = 3) -> np.ndarray:
     """Builds a z-trace with `n_cycles` clean down-up repetitions:
-    standing (>0.6, 1.5s) -> down (<0.35, 1.0s) -> standing (>0.6, 1.5s), repeated."""
+    standing (>0.6, 2.5s) -> down (<0.35, 1.0s) -> standing (>0.6, 2.0s)
+    -> single-frame wobble (0.58) -> standing (>0.6, 1.0s), repeated.
+
+    2026-07-09 fix: the original fixture used a flat 1.5s standing hold
+    on both sides of each fall with no gap between one cycle's recovery
+    and the next cycle's pre-fall stand. Two adjacent cycles' standing
+    holds then merge into ONE continuous sustained-standing run (this
+    cycle's recovery + the next cycle's pre-fall stand, back to back),
+    so `nxt[1]` (the end of that merged run, per `segment_by_root_z`) sits
+    EXACTLY at the next down-run's start — the trailing +0.5s pad then
+    always rolls into the next fall, regardless of how long the standing
+    hold is (lengthening the hold just shifts the merge point, it never
+    creates a gap). The new hard start/end QC gate (build spec item 2)
+    correctly rejects a segment whose padded tail lands back below the
+    end-standing bar — this was a latent bug in the fixture (unrelated
+    to the get-up-start fix), just never previously asserted on since
+    the old tests only checked count/ordering/min-length, not segment
+    content.
+
+    Fix: insert a single-frame dip to 0.58 (below STANDING_Z=0.60, so it
+    breaks the `_sustained_runs` mask and ends the standing run there;
+    above DOWN_Z=0.35 and above the end-QC bar 0.55, so it's not a real
+    down transition and doesn't fail QC on its own) partway through each
+    recovery hold, with >= PAD_S of genuine >0.6 standing on both sides
+    of it. This gives the trailing pad real "still standing" frames to
+    land in, matching what an actual recovered-standing hold with a
+    brief mocap wobble looks like, without changing what the fixture is
+    testing (three clean, independent down->recover cycles).
+    """
     segs = []
     for _ in range(n_cycles):
-        segs.append(np.full(int(1.5 * fps), 0.75))   # standing
+        segs.append(np.full(int(2.5 * fps), 0.75))   # standing (pre-fall)
         segs.append(np.full(int(1.0 * fps), 0.10))   # down
-        segs.append(np.full(int(1.5 * fps), 0.75))   # standing (recovered)
+        segs.append(np.full(int(2.0 * fps), 0.75))   # standing (recovered)
+        segs.append(np.full(1, 0.58))                 # brief sub-threshold wobble
+        segs.append(np.full(int(1.0 * fps), 0.75))   # standing (still recovered)
     return np.concatenate(segs)
 
 
@@ -501,6 +542,190 @@ def test_segment_clip_rejects_invalid_clip() -> None:
         segment_clip({"root_pos_z": np.array([-1.0] * 40), "fps": 30.0})
 
 
+# ── settled-start fix (2026-07-09) ────────────────────────────────────────
+def _stand_fall_settle_rise_stand_profile(fps: float) -> np.ndarray:
+    """Explicit stand -> fall -> settle -> rise -> stand shape, built to
+    make the bug this fix targets unmissable: a real fall is NOT a step
+    function. The subject stands, then DESCENDS gradually through the
+    down threshold (a genuine fall, several tenths of a second), settles
+    at a fully-prone height and holds it, then rises back up to standing
+    and holds that.
+
+    The old rule took `down_run_start - 0.5s pad` as the segment start —
+    landing back up in the pre-fall standing plateau, INCLUDING the
+    falling motion in the segment. The fix must start the segment at the
+    settled-lying frame instead.
+    """
+    stand1 = np.full(int(1.0 * fps), 0.75)                       # standing
+    n_fall = int(0.6 * fps)
+    fall = np.linspace(0.75, 0.05, n_fall)                        # gradual fall
+    settle = np.full(int(1.0 * fps), 0.05)                        # settled, at rest
+    n_rise = int(0.6 * fps)
+    rise = np.linspace(0.05, 0.75, n_rise)                        # gradual rise
+    stand2 = np.full(int(1.5 * fps), 0.75)                        # standing (recovered)
+    return np.concatenate([stand1, fall, settle, rise, stand2])
+
+
+def test_settled_start_excludes_leading_fall_and_prefall_standing() -> None:
+    """The core regression this fix targets: the segment must start at
+    the settled lying point, NOT at the pre-fall standing plateau and
+    NOT partway down the fall."""
+    fps = 30.0
+    z = _stand_fall_settle_rise_stand_profile(fps)
+    segs = segment_by_root_z(z, fps)
+    assert len(segs) == 1
+    seg = segs[0]
+    # The settle plateau is constant 0.05 — the start frame's z must be
+    # in that plateau (not the 0.75 pre-fall stand, not a mid-fall value
+    # somewhere on the linspace between 0.75 and 0.05).
+    assert z[seg.start] == pytest.approx(0.05, abs=1e-9)
+    # The whole leading pre-fall stand (constant 0.75, first int(1.0*fps)
+    # frames) must be excluded from the segment.
+    assert seg.start >= int(1.0 * fps)
+    # The fall itself (the linspace descent) must also be excluded —
+    # every frame from seg.start onward should already be at/near the
+    # settled floor, not still descending.
+    fall_end = int(1.0 * fps) + int(0.6 * fps)
+    assert seg.start >= fall_end - 1
+
+
+def test_settled_start_no_leading_pad_before_settled_frame() -> None:
+    """No standing padding before the start (build spec item 1): the
+    pre-fall standing plateau must be entirely excluded, unlike the old
+    `d_start - PAD_S` rule which pulled 0.5s of standing into the
+    segment."""
+    fps = 30.0
+    z = _stand_fall_settle_rise_stand_profile(fps)
+    segs = segment_by_root_z(z, fps)
+    assert len(segs) == 1
+    seg = segs[0]
+    n_prefall_stand = int(1.0 * fps)
+    # None of the pre-fall standing plateau's frame indices are included
+    # in the segment — the old `d_start - PAD_S` rule would have pulled
+    # the last ~15 of these 30 frames (0.5s pad) into the segment.
+    assert seg.start >= n_prefall_stand
+    # And the segment's own start frame is at the settled floor value,
+    # not some intermediate/standing value.
+    assert z[seg.start] == pytest.approx(0.05, abs=1e-9)
+
+
+def test_find_settled_start_falls_back_to_argmin_when_never_settled() -> None:
+    """If the subject bounces straight back up without ever holding
+    still (no settled frame), the fallback is the down-interval's
+    z-argmin frame — still a far better "start lying down" proxy than
+    the old pre-fall standing pad."""
+    fps = 30.0
+    stand1 = np.full(int(1.0 * fps), 0.75)
+    # A "V"-shaped bounce: continuously moving the whole time below
+    # DOWN_Z, never still for a full SETTLE_WINDOW_S — down_min is 0.5s
+    # (15 frames @30fps) so this interval must sustain z < DOWN_Z for at
+    # least that long to even register as a down-run.
+    n_down = int(1.0 * fps)
+    down = np.concatenate([
+        np.linspace(0.30, 0.05, n_down // 2),
+        np.linspace(0.05, 0.30, n_down - n_down // 2),
+    ])
+    stand2 = np.full(int(1.5 * fps), 0.75)
+    z = np.concatenate([stand1, down, stand2])
+    segs = segment_by_root_z(z, fps)
+    # This profile may or may not pass QC (its "settled" point is a
+    # single instantaneous minimum, not a real hold) — assert on the
+    # underlying start selection directly via the full-result API
+    # regardless of accept/reject, since that's what this test targets.
+    result = segment_by_root_z_full(z, fps)
+    candidates = result.segments + [
+        Segment(r.start, r.end) for r in result.rejected]
+    assert len(candidates) == 1
+    seg = candidates[0]
+    down_start = int(1.0 * fps)
+    down_end = down_start + n_down
+    expected_start = down_start + int(np.argmin(z[down_start:down_end]))
+    assert seg.start == expected_start
+
+
+# ── QC gate (build spec item 2) ───────────────────────────────────────────
+def test_qc_rejects_fall_only_interval_that_never_recovers_to_end_standing() -> None:
+    """A down-interval whose padded tail rolls back into ANOTHER fall
+    (rather than a genuine standing recovery) must be rejected with a
+    reason, not silently accepted. Reuses the exact latent-bug shape
+    documented on `_synthetic_z_profile` above (short standing hold with
+    no real gap before the next fall) as a direct, minimal repro."""
+    fps = 30.0
+    z = np.concatenate([
+        np.full(int(1.5 * fps), 0.75),   # standing
+        np.full(int(1.0 * fps), 0.10),   # down (fall 1, settled the whole time)
+        np.full(int(1.5 * fps), 0.75),   # standing recovery -- too short: recovery
+                                          # (1.0s) + PAD_S (0.5s) == 1.5s exactly, so
+                                          # the pad rolls straight into fall 2.
+        np.full(int(1.0 * fps), 0.10),   # down (fall 2)
+        np.full(int(1.5 * fps), 0.75),   # standing
+    ])
+    result = segment_by_root_z_full(z, fps)
+    assert len(result.rejected) >= 1
+    rej = result.rejected[0]
+    assert "end standing" in rej.reason
+    assert rej.start < rej.end
+
+
+def test_qc_segment_rejects_start_window_that_is_not_lying() -> None:
+    """Direct unit test of the start-side QC gate (`_qc_segment`, the
+    engine behind `segment_by_root_z_full`'s item-2 gate). Architectural
+    note: given a valid down-run (every frame strictly < DOWN_Z for the
+    sustain duration) and the settled-start selection (which always
+    picks a frame with z < DOWN_Z, settled or argmin-fallback), a
+    start-side rejection is very hard to trigger through the public
+    `segment_by_root_z_full` pipeline end-to-end — the settled-start fix
+    makes it a defensive backstop rather than a commonly-hit path. This
+    test instead exercises the gate function directly (it's the
+    documented contract of build spec item 2) on a hand-built z-array
+    whose first-10%-window mean sits above QC_START_MAX_MEAN_Z."""
+    from sculptor.refs.segment import _qc_segment
+
+    n = 100
+    z = np.full(n, 0.75)
+    z[:10] = 0.50   # start window (first 10%) mean = 0.50 >= 0.35: fails "start lying"
+    z[-10:] = 0.75  # end window mean = 0.75 > 0.55: would pass "end standing"
+    reason = _qc_segment(z, 0, n)
+    assert reason is not None
+    assert "start" in reason and "lying" in reason
+
+
+def test_qc_segment_accepts_a_genuine_start_lying_end_standing_segment() -> None:
+    from sculptor.refs.segment import _qc_segment
+
+    n = 100
+    z = np.linspace(0.10, 0.75, n)
+    z[:10] = 0.10   # start window mean well under 0.35
+    z[-10:] = 0.75  # end window mean well over 0.55
+    assert _qc_segment(z, 0, n) is None
+
+
+# ── frame_range / provenance preserved through the new start rule ────────
+def test_segment_frame_range_and_provenance_shape_intact(tmp_path: Path) -> None:
+    fps = 30.0
+    z = _stand_fall_settle_rise_stand_profile(fps)
+    n = z.shape[0]
+    clip = {
+        "root_pos_z": z,
+        "fps": fps,
+        "root_pos_xy": np.zeros((n, 2)),
+        "joint_pos": np.zeros((n, 4)),
+        "joint_names": ["a", "b", "c", "d"],
+        "meta": {"source": "test"},
+    }
+    result = segment_clip_full(clip)
+    assert len(result.segments) == 1
+    s = result.segments[0]
+    frange = s["_segment_frame_range"]
+    assert isinstance(frange, list) and len(frange) == 2
+    length = frange[1] - frange[0]
+    assert s["root_pos_z"].shape[0] == length
+    assert s["root_pos_xy"].shape[0] == length
+    assert s["joint_pos"].shape[0] == length
+    assert s["joint_names"] == ["a", "b", "c", "d"]
+    assert s["fps"] == fps
+
+
 # ── ingest_clip_bytes: end-to-end persist + provenance + segmentation ────
 def test_ingest_clip_bytes_persists_clip_and_provenance(tmp_path: Path) -> None:
     rows = _neutral_rows(50)
@@ -546,6 +771,204 @@ def test_ingest_clip_bytes_rejects_bad_source() -> None:
     with pytest.raises(ValueError, match="unknown source"):
         ingest_clip_bytes(
             b"", source="bogus", repo="r", rel_path="p", stem="s")
+
+
+# ── `sculpt refs resegment` CLI / resegment_clip (build spec item 4) ─────
+def _ingest_fake_fall_getup_parent(
+    tmp_path: Path, *, stem: str = "fallAndGetUp1_subject1",
+) -> str:
+    """Ingests one synthetic fall/getup parent clip (using the OLD
+    `_synthetic_z_profile` multi-cycle shape, which now produces 3
+    settled-start segments under the current rules) under `tmp_path`,
+    returning its clip_id. Used as the "stale old segments" fixture for
+    resegment tests."""
+    fps = 30.0
+    z = _synthetic_z_profile(fps, n_cycles=3)
+    n = z.shape[0]
+    xy = np.zeros((n, 2))
+    quat = _identity_quat_xyzw(n)
+    joints = np.zeros((n, N_JOINTS))
+    rows = np.concatenate([xy, z[:, None], quat, joints], axis=1)
+    raw = _rows_to_csv_bytes(rows)
+    result = ingest_clip_bytes(
+        raw, source="lafan1-g1", repo="lvhaidong/LAFAN1_Retargeting_Dataset",
+        rel_path=f"g1/{stem}.csv", stem=stem,
+        robot="g1", root=tmp_path, no_preview=True)
+    return result.clip_id
+
+
+def test_find_derived_segments_matches_only_this_parent(tmp_path: Path) -> None:
+    parent_id = _ingest_fake_fall_getup_parent(tmp_path, stem="fallAndGetUp1_subject1")
+    other_id = _ingest_fake_fall_getup_parent(tmp_path, stem="fallAndGetUp2_subject2")
+    library.rebuild_index(root=tmp_path)
+
+    segs = find_derived_segments("g1", parent_id, root=tmp_path)
+    assert len(segs) == 3
+    assert all(s.startswith(f"{parent_id}--seg") for s in segs)
+    other_segs = find_derived_segments("g1", other_id, root=tmp_path)
+    assert len(other_segs) == 3
+    assert set(segs).isdisjoint(other_segs)
+
+
+def test_resegment_dry_run_reports_without_writing(tmp_path: Path) -> None:
+    parent_id = _ingest_fake_fall_getup_parent(tmp_path)
+    library.rebuild_index(root=tmp_path)
+    before = set(find_derived_segments("g1", parent_id, root=tmp_path))
+    assert len(before) == 3
+
+    summary = resegment_clip(parent_id, robot="g1", root=tmp_path, dry_run=True)
+    assert summary.dry_run is True
+    assert set(summary.removed) == before
+    assert len(summary.added) == 3  # same synthetic shape -> same 3 segments
+
+    # Nothing on disk changed.
+    after = set(find_derived_segments("g1", parent_id, root=tmp_path))
+    assert after == before
+    for seg_id in before:
+        assert (library.clip_dir("g1", seg_id, root=tmp_path)
+                / library.CLIP_FILENAME).is_file()
+
+
+def test_resegment_replaces_old_segments_and_rebuilds_index(tmp_path: Path) -> None:
+    parent_id = _ingest_fake_fall_getup_parent(tmp_path, stem="fallAndGetUp1_subject1")
+    unrelated_id = _ingest_fake_fall_getup_parent(tmp_path, stem="fallAndGetUp2_subject2")
+    library.rebuild_index(root=tmp_path)
+
+    old_segs = set(find_derived_segments("g1", parent_id, root=tmp_path))
+    unrelated_segs_before = set(find_derived_segments("g1", unrelated_id, root=tmp_path))
+    assert len(old_segs) == 3
+
+    # Simulate "old rule" staleness: hand-corrupt one old segment's
+    # frame_range so it's unambiguously distinguishable from a freshly
+    # regenerated one, then resegment and confirm it's gone.
+    stale_seg_id = sorted(old_segs)[0]
+    stale_prov = library.read_provenance("g1", stale_seg_id, root=tmp_path)
+    stale_prov["frame_range"] = [0, 1]  # obviously-wrong marker value
+    library.write_provenance("g1", stale_seg_id, stale_prov, root=tmp_path)
+
+    summary = resegment_clip(parent_id, robot="g1", root=tmp_path, no_preview=True)
+    assert summary.dry_run is False
+    assert set(summary.removed) == old_segs
+    assert len(summary.added) == 3
+
+    new_segs = set(find_derived_segments("g1", parent_id, root=tmp_path))
+    assert len(new_segs) == 3
+    # The stale marker is gone — `stale_seg_id`'s clip_id is reused by a
+    # freshly regenerated segment (deterministic segNN naming), but its
+    # provenance no longer carries the hand-corrupted frame_range.
+    assert stale_seg_id in new_segs
+    fresh_prov = library.read_provenance("g1", stale_seg_id, root=tmp_path)
+    assert fresh_prov["frame_range"] != [0, 1]
+    for seg_id in new_segs:
+        prov = library.read_provenance("g1", seg_id, root=tmp_path)
+        assert prov["frame_range"] != [0, 1]
+        assert prov["parent_clip_id"] == parent_id
+
+    # Unrelated parent's segments are completely untouched.
+    unrelated_segs_after = set(find_derived_segments("g1", unrelated_id, root=tmp_path))
+    assert unrelated_segs_after == unrelated_segs_before
+
+    # index.jsonl reflects the new (fresh, non-stale) segments, rebuilt
+    # automatically by `resegment_clip`.
+    index_rows = library.read_index(root=tmp_path)
+    index_ids = {r["clip_id"] for r in index_rows}
+    assert new_segs <= index_ids
+
+
+def test_resegment_logs_qc_rejects(tmp_path: Path) -> None:
+    """A parent whose current segmentation includes a QC-rejected
+    candidate must have that rejection logged via
+    `library.append_reject` (same mechanism ingest uses), not silently
+    dropped."""
+    fps = 30.0
+    # Latent-bug shape from test_qc_rejects_fall_only_interval_...: the
+    # first cycle's padded tail rolls into the second fall and gets
+    # rejected; the final cycle recovers cleanly and is accepted.
+    z = np.concatenate([
+        np.full(int(1.5 * fps), 0.75),
+        np.full(int(1.0 * fps), 0.10),
+        np.full(int(1.5 * fps), 0.75),   # too-short recovery -> rejected
+        np.full(int(1.0 * fps), 0.10),
+        np.full(int(1.5 * fps), 0.75),
+    ])
+    n = z.shape[0]
+    xy = np.zeros((n, 2))
+    quat = _identity_quat_xyzw(n)
+    joints = np.zeros((n, N_JOINTS))
+    rows = np.concatenate([xy, z[:, None], quat, joints], axis=1)
+    raw = _rows_to_csv_bytes(rows)
+    result = ingest_clip_bytes(
+        raw, source="lafan1-g1", repo="lvhaidong/LAFAN1_Retargeting_Dataset",
+        rel_path="g1/fallAndGetUp3_subject3.csv", stem="fallAndGetUp3_subject3",
+        robot="g1", root=tmp_path, no_preview=True)
+
+    rejects_path = library.rejects_path(root=tmp_path)
+    assert rejects_path.is_file()
+    reject_lines = [
+        json.loads(line) for line in rejects_path.read_text().splitlines() if line]
+    assert any(r["reason"] == "segment_qc_failed" for r in reject_lines)
+
+    # Now call resegment directly on the parent: it must log the SAME
+    # rejection again (current rules re-evaluated from scratch), and
+    # still leave the accepted segment intact.
+    n_reject_lines_before = len(reject_lines)
+    resegment_clip(result.clip_id, robot="g1", root=tmp_path, no_preview=True)
+    reject_lines_after = [
+        json.loads(line) for line in rejects_path.read_text().splitlines() if line]
+    assert len(reject_lines_after) > n_reject_lines_before
+    assert any(
+        r["reason"] == "segment_qc_failed" and r.get("parent_clip_id") == result.clip_id
+        for r in reject_lines_after)
+
+
+def test_resegment_raises_for_unknown_parent(tmp_path: Path) -> None:
+    with pytest.raises(ResegmentError, match="no such parent clip"):
+        resegment_clip("does-not-exist", robot="g1", root=tmp_path)
+
+
+def test_resegment_cli_command_end_to_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Exercises the actual `sculpt refs resegment` typer command (build
+    spec item 4), via typer's CliRunner, against a tmp RS_REFERENCE_ROOT
+    library — not just the underlying `resegment_clip` function."""
+    from typer.testing import CliRunner
+
+    from sculptor.cli import app
+
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(tmp_path))
+    parent_id = _ingest_fake_fall_getup_parent(tmp_path)
+    library.rebuild_index(root=tmp_path)
+    before = set(find_derived_segments("g1", parent_id, root=tmp_path))
+    assert len(before) == 3
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["refs", "resegment", "--parent", parent_id, "--no-preview"])
+    assert result.exit_code == 0, result.output
+    assert "removed=3" in result.output
+    assert "added=3" in result.output
+
+    after = set(find_derived_segments("g1", parent_id, root=tmp_path))
+    assert len(after) == 3
+
+
+def test_resegment_cli_dry_run_flag(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from typer.testing import CliRunner
+
+    from sculptor.cli import app
+
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(tmp_path))
+    parent_id = _ingest_fake_fall_getup_parent(tmp_path)
+    library.rebuild_index(root=tmp_path)
+    before = set(find_derived_segments("g1", parent_id, root=tmp_path))
+
+    runner = CliRunner()
+    result = runner.invoke(
+        app, ["refs", "resegment", "--parent", parent_id, "--dry-run"])
+    assert result.exit_code == 0, result.output
+    assert "would remove=3" in result.output
+    assert "would add=3" in result.output
+
+    after = set(find_derived_segments("g1", parent_id, root=tmp_path))
+    assert after == before
 
 
 # ── ingest_source idempotency (monkeypatched network) ─────────────────────

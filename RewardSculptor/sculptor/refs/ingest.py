@@ -561,6 +561,71 @@ def _try_render_preview(
             f"{type(e).__name__}: {e}")
 
 
+def persist_segments(
+    clip: dict, *, clip_id: str, robot: str, source: dict[str, Any],
+    license_: str, attribution: str, fps_source: float, tokens: list[str],
+    parent_qc: dict[str, Any], root: Optional[Path] = None,
+    no_preview: bool = False,
+    progress: Optional[Callable[[str], None]] = None,
+) -> list["library.LibraryClip"]:
+    """Segment `clip` (§decision 6, 2026-07-09 settled-start fix) and
+    persist each accepted segment as a derived library clip
+    (`<clip_id>--segNN`), logging QC-rejected candidates via
+    `library.append_reject`. Shared by `ingest_clip_bytes` (segmenting a
+    freshly-ingested parent) and `resegment_clip` (re-segmenting an
+    already-indexed parent with the current rules) so both paths persist
+    segments identically. Returns the list of persisted `LibraryClip`s in
+    segment order."""
+    from sculptor.reference import save_clip
+    from sculptor.refs.segment import segment_clip_full
+
+    seg_result = segment_clip_full(clip)
+    for rej in seg_result.rejected:
+        library.append_reject(
+            "segment_qc_failed",
+            {"clip_id": f"{clip_id}--seg??", "parent_clip_id": clip_id,
+             "frame_range": [rej.start, rej.end], "detail": rej.reason},
+            root=root)
+
+    results: list[library.LibraryClip] = []
+    for i, seg_clip in enumerate(seg_result.segments):
+        frame_range = seg_clip.pop("_segment_frame_range")
+        # §decision 4: clip_id = slugified source name + literal `--segNN`
+        # suffix. `clip_id` is already a valid slug and `-` is a legal
+        # clip_id character, so the separator is appended directly rather
+        # than run through `slugify` again (which would collapse `--`
+        # into a single `_` and lose it).
+        seg_clip_id = f"{clip_id}--seg{i:02d}"
+        library.validate_clip_id(seg_clip_id)
+        seg_qc = dict(parent_qc)
+        z = seg_clip["root_pos_z"]
+        seg_qc["duration_s"] = round(z.shape[0] / float(clip["fps"]), 4)
+        seg_qc["root_z_range"] = [round(float(z.min()), 4), round(float(z.max()), 4)]
+        seg_qc["n_frames"] = int(z.shape[0])
+        seg_labels = tokens + ["segment"]
+        seg_prov = library.make_provenance(
+            clip_id=seg_clip_id, robot=robot,
+            source=source, license=license_, attribution=attribution,
+            content_sha256_=library.content_sha256(
+                seg_clip["root_pos_z"].tobytes()),
+            tier="K", fps_source=fps_source,
+            parent_clip_id=clip_id, frame_range=list(frame_range),
+            joint_mapping={"identity": True}, labels=seg_labels,
+            text=" ".join(seg_labels), qc=seg_qc,
+        )
+        seg_d = library.clip_dir(robot, seg_clip_id, root=root)
+        save_clip(seg_d / library.CLIP_FILENAME, seg_clip)
+        seg_prov_path = library.write_provenance(robot, seg_clip_id, seg_prov, root=root)
+        results.append(library.LibraryClip(
+            robot=robot, clip_id=seg_clip_id,
+            clip_path=seg_d / library.CLIP_FILENAME,
+            provenance_path=seg_prov_path, provenance=seg_prov))
+        if not no_preview:
+            _try_render_preview(
+                seg_clip, robot, seg_clip_id, root=root, progress=progress)
+    return results
+
+
 def ingest_clip_bytes(
     raw: bytes, *, source: str, repo: str, rel_path: str, stem: str,
     robot: str = "g1", root: Optional[Path] = None, no_preview: bool = False,
@@ -573,8 +638,6 @@ def ingest_clip_bytes(
     synthetic bytes — no network). `no_preview=False` (default) attempts
     a best-effort `preview.png` render for the clip and each of its
     segments via `_try_render_preview` — never blocks/fails ingest."""
-    from sculptor.refs.segment import segment_clip
-
     if source == "lafan1-g1":
         clip, qc = parse_lafan1_csv(raw, stem=stem)
         license_ = "CC BY-NC-ND 4.0"
@@ -612,39 +675,135 @@ def ingest_clip_bytes(
     if not no_preview:
         _try_render_preview(clip, robot, clip_id, root=root, progress=progress)
 
-    # §decision 6: segment fall/getup clips at ingest time.
+    # §decision 6: segment fall/getup clips at ingest time. QC-rejected
+    # candidates (2026-07-09 fix) are logged to the same
+    # `index_rejects.jsonl` mechanism as every other ingest rejection,
+    # rather than silently vanishing — see `persist_segments`.
     if any(t in ("fall", "getup") for t in tokens):
-        segments = segment_clip(clip)
-        for i, seg_clip in enumerate(segments):
-            frame_range = seg_clip.pop("_segment_frame_range")
-            # §decision 4: clip_id = slugified source name + literal
-            # `--segNN` suffix. `clip_id` is already a valid slug and `-`
-            # is a legal clip_id character, so the separator is appended
-            # directly rather than run through `slugify` again (which
-            # would collapse `--` into a single `_` and lose it).
-            seg_clip_id = f"{clip_id}--seg{i:02d}"
-            library.validate_clip_id(seg_clip_id)
-            seg_qc = dict(qc)
-            z = seg_clip["root_pos_z"]
-            seg_qc["duration_s"] = round(z.shape[0] / float(clip["fps"]), 4)
-            seg_qc["root_z_range"] = [round(float(z.min()), 4), round(float(z.max()), 4)]
-            seg_qc["n_frames"] = int(z.shape[0])
-            seg_labels = tokens + ["segment"]
-            seg_prov = library.make_provenance(
-                clip_id=seg_clip_id, robot=robot,
-                source=prov["source"], license=license_, attribution=attribution,
-                content_sha256_=library.content_sha256(
-                    seg_clip["root_pos_z"].tobytes()),
-                tier="K", fps_source=fps_source,
-                parent_clip_id=clip_id, frame_range=list(frame_range),
-                joint_mapping={"identity": True}, labels=seg_labels,
-                text=" ".join(seg_labels), qc=seg_qc,
-            )
-            seg_d = library.clip_dir(robot, seg_clip_id, root=root)
-            save_clip(seg_d / library.CLIP_FILENAME, seg_clip)
-            library.write_provenance(robot, seg_clip_id, seg_prov, root=root)
-            if not no_preview:
-                _try_render_preview(
-                    seg_clip, robot, seg_clip_id, root=root, progress=progress)
+        persist_segments(
+            clip, clip_id=clip_id, robot=robot, source=prov["source"],
+            license_=license_, attribution=attribution, fps_source=fps_source,
+            tokens=tokens, parent_qc=qc, root=root, no_preview=no_preview,
+            progress=progress)
 
     return result
+
+
+class ResegmentError(ValueError):
+    """Raised when `resegment_clip` can't find the requested parent clip,
+    or the parent's provenance is missing the fields needed to rebuild
+    segment provenance (§Hard rules: fail loudly, never improvise)."""
+
+
+@dataclass
+class ResegmentSummary:
+    parent_clip_id: str
+    robot: str
+    removed: list[str]
+    added: list[str]
+    rejected: list[tuple[str, str]]  # (would-be clip_id, reason)
+    dry_run: bool
+
+
+def find_derived_segments(
+    robot: str, parent_clip_id: str, *, root: Optional[Path] = None,
+) -> list[str]:
+    """Every indexed clip_id under `robot` whose provenance
+    `parent_clip_id` matches `parent_clip_id`, scanned from disk (not the
+    possibly-stale index) — mirrors `library.rebuild_index`'s own
+    disk-scan approach. Sorted for determinism."""
+    r = root or library.references_root()
+    robot_d = library.robot_dir(robot, root=r)
+    if not robot_d.is_dir():
+        return []
+    out: list[str] = []
+    for clip_d in sorted(p for p in robot_d.iterdir() if p.is_dir()):
+        prov_path = clip_d / library.PROVENANCE_FILENAME
+        if not prov_path.is_file():
+            continue
+        try:
+            prov = json.loads(prov_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        if prov.get("parent_clip_id") == parent_clip_id:
+            out.append(clip_d.name)
+    return out
+
+
+def resegment_clip(
+    parent_clip_id: str, *, robot: str = "g1", root: Optional[Path] = None,
+    dry_run: bool = False, no_preview: bool = False,
+    progress: Optional[Callable[[str], None]] = None,
+) -> ResegmentSummary:
+    """Re-run segmentation for an already-indexed parent clip using the
+    CURRENT segmentation rules (`sculptor.refs.segment`), replacing its
+    existing derived segments. Only clips whose provenance
+    `parent_clip_id` matches `parent_clip_id` are touched — everything
+    else in the library is untouched. `dry_run=True` computes and
+    reports what would change without writing or deleting anything.
+    Rebuilds `index.jsonl` after writing (skipped in dry-run)."""
+    import shutil
+
+    from sculptor.reference import load_clip
+
+    log = progress or (lambda _msg: None)
+    r = root or library.references_root()
+
+    parent_dir = library.clip_dir(robot, parent_clip_id, root=r)
+    parent_clip_path = parent_dir / library.CLIP_FILENAME
+    parent_prov_path = parent_dir / library.PROVENANCE_FILENAME
+    if not parent_clip_path.is_file() or not parent_prov_path.is_file():
+        raise ResegmentError(
+            f"no such parent clip in the library: robot={robot!r} "
+            f"clip_id={parent_clip_id!r} (looked under {parent_dir})")
+
+    parent_clip = load_clip(parent_clip_path)
+    parent_prov = library.read_provenance(robot, parent_clip_id, root=r)
+    for field_name in ("source", "license", "attribution", "fps_source", "labels"):
+        if parent_prov.get(field_name) in (None, ""):
+            raise ResegmentError(
+                f"parent clip {parent_clip_id!r} provenance is missing "
+                f"required field {field_name!r} — refusing to resegment")
+
+    tokens = list(parent_prov["labels"])
+    qc = dict(parent_prov.get("qc") or {})
+
+    existing = find_derived_segments(robot, parent_clip_id, root=r)
+    log(f"[refs resegment] parent={parent_clip_id} existing_segments={len(existing)}")
+
+    # Compute the new segmentation BEFORE deleting anything, so a
+    # dry-run (or a crash) never leaves the library without its old
+    # segments and without new ones.
+    from sculptor.refs.segment import segment_clip_full
+
+    seg_result = segment_clip_full(parent_clip)
+    would_add = [f"{parent_clip_id}--seg{i:02d}" for i in range(len(seg_result.segments))]
+    rejected = [
+        (f"{parent_clip_id}--seg??[{rej.start}:{rej.end}]", rej.reason)
+        for rej in seg_result.rejected]
+
+    if dry_run:
+        log(f"[refs resegment] DRY RUN: would remove {len(existing)}, "
+            f"add {len(would_add)}, reject {len(rejected)}")
+        return ResegmentSummary(
+            parent_clip_id=parent_clip_id, robot=robot, removed=existing,
+            added=would_add, rejected=rejected, dry_run=True)
+
+    for seg_clip_id in existing:
+        shutil.rmtree(library.clip_dir(robot, seg_clip_id, root=r), ignore_errors=True)
+        log(f"[refs resegment] removed {seg_clip_id}")
+
+    persisted = persist_segments(
+        parent_clip, clip_id=parent_clip_id, robot=robot,
+        source=parent_prov["source"], license_=parent_prov["license"],
+        attribution=parent_prov["attribution"],
+        fps_source=parent_prov["fps_source"], tokens=tokens, parent_qc=qc,
+        root=r, no_preview=no_preview, progress=progress)
+    added = [lc.clip_id for lc in persisted]
+
+    library.rebuild_index(root=r)
+    log(f"[refs resegment] removed={len(existing)} added={len(added)} "
+        f"rejected={len(rejected)}")
+    return ResegmentSummary(
+        parent_clip_id=parent_clip_id, robot=robot, removed=existing,
+        added=added, rejected=rejected, dry_run=False)
