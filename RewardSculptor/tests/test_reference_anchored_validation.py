@@ -137,8 +137,111 @@ def test_honest_metric_passes_on_late_rising_clip_plateau(tmp_path):
     assert sc["full"] >= sc["trunc_25"] + 0.1
 
 
-def test_constant_metric_fails_reference_nondegeneracy(tmp_path):
+# The Opus-audit gaming metric (D18): rewards time-height correlation of
+# the BASE only — steady pelvis rise, zero dependence on posture. Before
+# the root_only negative existed this passed ALL reference gates (proven
+# live): a policy levitating its pelvis while staying supine earned 1.0.
+PELVIS_RISE_METRIC = '''import numpy as np
+def compute_spec(arrays, behavior, meta):
+    root = arrays.get("root_link_pos_w")
+    if root is None:
+        return {"spec_score": 0.0}
+    z = root[..., 2]
+    n = z.shape[0]
+    t = np.linspace(0.0, 1.0, n).reshape(n, 1)
+    zc = z - z.mean(axis=0, keepdims=True)
+    tc = t - 0.5
+    denom = np.sqrt((zc ** 2).sum(axis=0) * (tc ** 2).sum(axis=0)) + 1e-9
+    corr = (zc * tc).sum(axis=0) / denom
+    rise = np.clip(z[-max(1, n // 10):].mean(axis=0) - z[:max(1, n // 10)].mean(axis=0), 0.0, None)
+    val = float(np.clip(corr.mean(), 0.0, 1.0) * np.clip(rise.mean() / 0.3, 0.0, 1.0))
+    return {"spec_score": val}
+'''
+
+
+def _clip_with_posture() -> dict:
+    """Rising clip that ALSO carries orientation + joints, so root_only
+    has posture channels to freeze."""
     clip = _rising_clip()
+    n = clip["root_pos_z"].shape[0]
+    t = np.linspace(0.0, 1.0, n)
+    # supine (pitch -pi/2-ish) -> upright: quat about y from -1.5 to 0
+    ang = -1.5 * (1.0 - t)
+    quat = np.stack([np.cos(ang / 2), np.zeros(n), np.sin(ang / 2),
+                     np.zeros(n)], axis=1)
+    clip["root_quat_wxyz"] = quat / np.linalg.norm(quat, axis=1, keepdims=True)
+    clip["joint_pos"] = np.stack([np.linspace(1.2, 0.0, n),
+                                  np.linspace(-0.8, 0.1, n)], axis=1)
+    clip["joint_names"] = ["a", "b"]
+    return clip
+
+
+def test_pelvis_rise_gaming_metric_fails_root_only_negative(tmp_path):
+    # D18 regression pin: displacement-only metrics die on root_only.
+    clip = _clip_with_posture()
+    p = _write(tmp_path, "pelvis.py", PELVIS_RISE_METRIC)
+    v = validate_generated_metric(
+        PELVIS_RISE_METRIC, p, references=[("getup1", clip)])
+    assert v["ok"] is False
+    assert v["gates"]["reference_negatives:getup1"] is False, v["reasons"]
+    sc = v["references"][0]["scores"]
+    # root_only carries the same root trajectory -> the gamer scores it
+    # like the real thing; that similarity is exactly what convicts it.
+    assert sc["root_only"] > 0.5
+
+
+# Posture-AWARE honest metric: height rise x ends-upright (body-frame
+# gravity-z near -1 at the end). This is what D18 forces get-up metrics
+# to be — a height-only metric (even an "honest" one) is now correctly
+# convicted by root_only on posture-carrying clips.
+HONEST_GETUP_POSTURE = '''import numpy as np
+def compute_spec(arrays, behavior, meta):
+    root = arrays.get("root_link_pos_w")
+    g = arrays.get("projected_gravity_b")
+    if root is None or g is None:
+        return {"spec_score": 0.0}
+    z = root[..., 2]
+    n = z.shape[0]
+    q = max(1, n // 4)
+    rise = np.clip(z[-q:].mean() - z[:q].mean(), 0.0, None)
+    gz = g[..., 2] / np.maximum(np.linalg.norm(g, axis=-1), 1e-9)
+    upright_end = np.clip((-gz[-q:].mean() - 0.3) / 0.6, 0.0, 1.0)
+    val = float(np.clip(rise / 0.4, 0.0, 1.0) * upright_end)
+    return {"spec_score": val}
+'''
+
+
+def test_posture_aware_honest_metric_passes_with_root_only(tmp_path):
+    clip = _clip_with_posture()
+    p = _write(tmp_path, "honest_posture.py", HONEST_GETUP_POSTURE)
+    v = validate_generated_metric(
+        HONEST_GETUP_POSTURE, p, references=[("getup1", clip)])
+    assert v["ok"] is True, v["reasons"]
+    sc = v["references"][0]["scores"]
+    # root_only holds the SUPINE start orientation while the root rises:
+    # the posture-aware metric sees no uprightness and scores it low.
+    assert sc["root_only"] < sc["full"] - 0.3
+
+
+def test_height_only_metric_convicted_on_posture_clip(tmp_path):
+    # The old "honest" height-only fixture is now correctly rejected on
+    # posture-carrying clips — get-up metrics MUST read orientation.
+    clip = _clip_with_posture()
+    p = _write(tmp_path, "height_only.py", HONEST_GETUP)
+    v = validate_generated_metric(
+        HONEST_GETUP, p, references=[("getup1", clip)])
+    assert v["gates"]["reference_negatives:getup1"] is False
+
+
+def test_posture_less_clip_has_no_root_only_entry(tmp_path):
+    # For root-channels-only clips root_only would equal the original —
+    # it must be absent, not a universal conviction.
+    clip = _rising_clip()
+    p = _write(tmp_path, "honest3.py", HONEST_GETUP)
+    v = validate_generated_metric(
+        HONEST_GETUP, p, references=[("getup1", clip)])
+    assert "root_only" not in v["references"][0]["scores"]
+    assert v["ok"] is True, v["reasons"]
     p = _write(tmp_path, "const.py", CONSTANT_METRIC)
     v = validate_generated_metric(
         CONSTANT_METRIC, p, references=[("getup1", clip)])

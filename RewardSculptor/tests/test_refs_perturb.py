@@ -12,6 +12,7 @@ from sculptor.refs.perturb import (
     freeze_end,
     freeze_start,
     perturbation_suite,
+    root_motion_only,
     segment_shuffle,
     speed,
     time_reverse,
@@ -159,14 +160,32 @@ def test_degrade_rejects_bad_params():
 
 # ── the standard named suite ──────────────────────────────────────────────
 def test_perturbation_suite_has_the_standard_names_and_all_validate():
-    clip = _clip()
+    clip = _clip()  # carries joint_pos + root_quat_wxyz -> root_only present
     suite = perturbation_suite(clip)
     assert set(suite) == {
-        "reversal", "freeze_start", "freeze_end", "shuffle",
+        "reversal", "freeze_start", "freeze_end", "shuffle", "root_only",
         "speed_slow", "speed_fast", "trunc_25", "trunc_50", "trunc_75",
     }
     for name, pclip in suite.items():
         assert validate_clip(pclip) == [], (name, validate_clip(pclip))
+
+
+def test_perturbation_suite_omits_root_only_without_posture_channels():
+    # D18 guard: for a root-channels-only clip root_only would EQUAL the
+    # original clip and falsely convict every metric.
+    clip = {"root_pos_z": _clip()["root_pos_z"], "fps": 30.0}
+    suite = perturbation_suite(clip)
+    assert "root_only" not in suite
+
+
+def test_root_motion_only_freezes_posture_keeps_root():
+    clip = _clip(T=60)
+    out = root_motion_only(clip)
+    assert validate_clip(out) == []
+    np.testing.assert_allclose(out["root_pos_z"], clip["root_pos_z"])
+    # posture frozen at frame 0
+    assert np.allclose(out["joint_pos"], clip["joint_pos"][0])
+    assert np.allclose(out["root_quat_wxyz"], clip["root_quat_wxyz"][0])
 
 
 def test_perturbation_suite_is_deterministic():

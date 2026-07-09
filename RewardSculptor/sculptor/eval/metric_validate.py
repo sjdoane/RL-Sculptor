@@ -1151,6 +1151,11 @@ def _validate_references(
                 ("freeze_start", lambda c: _pt.freeze_start(c)),
                 ("freeze_end", lambda c: _pt.freeze_end(c)),
                 ("shuffle", lambda c: _pt.segment_shuffle(c)),
+                # root_only only when posture channels exist (else it
+                # equals the original clip — false-convicts everything).
+                ("root_only", lambda c: _pt.root_motion_only(c)
+                    if ("joint_pos" in c or "root_quat_wxyz" in c)
+                    else (_ for _ in ()).throw(ValueError("no posture"))),
                 ("speed_slow", lambda c: _pt.speed(c, 0.25)),
                 ("speed_fast", lambda c: _pt.speed(c, 4.0)),
                 ("trunc_25", lambda c: _pt.truncate(c, 0.25)),
@@ -1207,7 +1212,12 @@ def _validate_references(
                 f"either inverts partial-completion order or cannot "
                 f"discriminate completion from onset")
 
-        neg_names = ("reversal", "freeze_start", "freeze_end", "shuffle")
+        # root_only (D18, audit-proven): the clip's root trajectory with
+        # posture frozen at frame 0 — a displacement-only metric scores
+        # it like the real motion and dies here; the honest metric sees
+        # no posture change and scores it degenerate.
+        neg_names = ("reversal", "freeze_start", "freeze_end", "shuffle",
+                     "root_only")
         neg_ceiling = degenerate_anchor + spread_min
         offenders = [
             n for n in neg_names

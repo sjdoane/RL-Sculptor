@@ -206,10 +206,36 @@ def degrade(
     return _validate_or_raise(out)
 
 
+def root_motion_only(clip: dict) -> dict:
+    """The clip's ROOT trajectory with every other channel frozen at
+    frame 0 — locomotion-by-levitation. An Opus audit (2026-07-09, D18)
+    PROVED a pelvis-rise-only metric passed all three reference gates:
+    it rewarded base height climbing over time with zero dependence on
+    posture, so a policy that scoots its pelvis upward while staying
+    supine would earn full reward. This negative is the counterexample
+    made flesh: right root motion, zero posture change. Any metric that
+    scores it near the full reference is rewarding displacement, not the
+    motion — gated in `reference_negatives`. Universal, not
+    get-up-specific (a gliding statue must not pass a gait metric; a
+    root-only pop must not pass a jump metric)."""
+    n = _time_len(clip)
+    out = _rebuild(clip, lambda v: np.repeat(
+        np.asarray(v)[:1].copy(), n, axis=0))
+    for key in ("root_pos_z", "root_pos_xy"):
+        if key in clip:
+            out[key] = np.asarray(clip[key]).copy()
+    fps = float(clip["fps"])
+    if "root_vel_z" in out and "root_pos_z" in out:
+        out["root_vel_z"] = np.gradient(out["root_pos_z"]) * fps
+    if "joint_vel" in out and "joint_pos" in out:
+        out["joint_vel"] = np.zeros_like(out["joint_pos"])
+    return _validate_or_raise(out)
+
+
 def perturbation_suite(clip: dict) -> dict[str, dict]:
     """The standard named perturbation set consumed by
     `metric_validate.py`'s reference-anchored gates."""
-    return {
+    suite = {
         "reversal": time_reverse(clip),
         "freeze_start": freeze_start(clip),
         "freeze_end": freeze_end(clip),
@@ -220,3 +246,11 @@ def perturbation_suite(clip: dict) -> dict[str, dict]:
         "trunc_50": truncate(clip, 0.50),
         "trunc_75": truncate(clip, 0.75),
     }
+    # root_only (D18) exists ONLY when the clip carries posture channels
+    # (joint_pos or root_quat_wxyz). For a root-channels-only clip the
+    # perturbation would equal the original clip — every metric would
+    # score it identically to the full reference and be convicted, which
+    # is a false reject, not rigor.
+    if "joint_pos" in clip or "root_quat_wxyz" in clip:
+        suite["root_only"] = root_motion_only(clip)
+    return suite
