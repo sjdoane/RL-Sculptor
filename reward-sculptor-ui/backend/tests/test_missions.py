@@ -1192,3 +1192,516 @@ def test_get_stage_env_spec_404_unknown_mission_or_stage(
         f"/projects/{slug}/missions/alpha/stages/no-such-stage/env-spec",
     )
     assert r.status_code == 404
+
+
+# ── §completed-mission review: metric_history object-shape parse ─────
+def test_list_stage_iterations_metric_history_object_shape(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    """The real on-disk shape is `{"primary_metric": "mean_return",
+    "history": [...]}`, NOT a bare list — the route must read `.history`,
+    not fall through to treating the whole object as falsy/wrong-shaped."""
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    stage_dir = _seed_stage_dir(project_dir, "alpha", "stage_0")
+
+    reports_dir = stage_dir / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    (reports_dir / "metric_history.json").write_text(json.dumps({
+        "primary_metric": "mean_return",
+        "history": [43.49194463094076, 42.68934631347656, 43.27508099873861],
+    }))
+    _seed_stage_iter(stage_dir, 0)
+    _seed_stage_iter(stage_dir, 1)
+    _seed_stage_iter(stage_dir, 2)
+
+    r = client.get(
+        f"/projects/{slug}/missions/alpha/stages/stage_0/iterations",
+    )
+    assert r.status_code == 200, r.text
+    body = {row["iter_index"]: row for row in r.json()}
+    assert body[0]["primary_metric"] == pytest.approx(43.49194463094076)
+    assert body[1]["primary_metric"] == pytest.approx(42.68934631347656)
+    assert body[2]["primary_metric"] == pytest.approx(43.27508099873861)
+
+
+# ── §completed-mission review: GET .../iterations/{i}/detail ─────────
+def _seed_full_iter_detail(stage_dir: Path, iter_index: int) -> Path:
+    """A stage iter with reward_spec.json (description + references),
+    diagnosis.json (evidence with the leading-number fallback phrasing +
+    literature_context), and reward_trajectory.json (mixed __-prefixed
+    and real components) — the full set `get_stage_iter_detail` reads."""
+    iter_dir = stage_dir / "runs" / f"iter_{iter_index}"
+    iter_dir.mkdir(parents=True, exist_ok=True)
+    (iter_dir / "reward_spec.json").write_text(json.dumps({
+        "version": "v2",
+        "description": "Crouch skill objective plus base stability terms.",
+        "references": [
+            {
+                "arxiv_id": "2010.11251",
+                "citation": "Lee et al. (2020). arXiv:2010.11251",
+                "how_used": "Smooth Gaussian kernel technique.",
+            },
+        ],
+    }))
+    (iter_dir / "diagnosis.json").write_text(json.dumps({
+        "evidence": "The run is largely healthy: objective fitness is 0.99963 and stable.",
+        "confidence": 0.7,
+        "failure_modes": ["reward_saturation"],
+        "literature_context": [
+            {
+                "paper_citation": "He et al. (2024). arXiv:2406.08858",
+                "description": "Stable standing bias augmentation.",
+            },
+        ],
+    }))
+    (iter_dir / "reward_trajectory.json").write_text(json.dumps({
+        "__episode_length": [17, 18, 19],
+        "__terminated": [0, 0, 0],
+        "alive_bonus": [0.1, 0.1, 0.1],
+        "crouch_depth": [0.2, 0.4, 0.6],
+    }))
+    (iter_dir / "metrics.json").write_text(
+        json.dumps({"metrics": {"mean_return": 43.49}})
+    )
+    return iter_dir
+
+
+def test_get_stage_iter_detail_assembles_all_fields(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    stage_dir = _seed_stage_dir(project_dir, "alpha", "stage_0")
+    _seed_full_iter_detail(stage_dir, 0)
+
+    r = client.get(
+        f"/projects/{slug}/missions/alpha/stages/stage_0/iterations/0/detail",
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["iter_index"] == 0
+    assert body["reward_version"] == "v2"
+    assert body["reward_description"] == "Crouch skill objective plus base stability terms."
+    assert body["reward_references"] == [{
+        "arxiv_id": "2010.11251",
+        "citation": "Lee et al. (2020). arXiv:2010.11251",
+        "description": "Smooth Gaussian kernel technique.",
+    }]
+    assert body["primary_metric"] == pytest.approx(43.49)
+    # No structured objective_fitness anywhere on disk -> regex fallback
+    # pulls the leading number out of the evidence prose.
+    assert body["objective_fitness"] == pytest.approx(0.99963)
+    assert "objective fitness is 0.99963" in body["evidence"]
+    assert body["confidence"] == pytest.approx(0.7)
+    assert body["failure_modes"] == ["reward_saturation"]
+    assert body["literature_context"] == [{
+        "arxiv_id": None,
+        "citation": "He et al. (2024). arXiv:2406.08858",
+        "description": "Stable standing bias augmentation.",
+    }]
+    # __-prefixed bookkeeping keys excluded; real components meaned.
+    assert body["components"] == {
+        "alive_bonus": 0.1,
+        "crouch_depth": pytest.approx(0.4),
+    }
+
+
+def test_get_stage_iter_detail_structured_objective_fitness_wins(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    """When reward_spec.json carries a structured `objective_fitness`,
+    it's used directly rather than falling through to the evidence
+    regex."""
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    stage_dir = _seed_stage_dir(project_dir, "alpha", "stage_0")
+    iter_dir = stage_dir / "runs" / "iter_0"
+    iter_dir.mkdir(parents=True)
+    (iter_dir / "reward_spec.json").write_text(json.dumps({
+        "version": "v0", "objective_fitness": 0.5,
+    }))
+    (iter_dir / "diagnosis.json").write_text(json.dumps({
+        "evidence": "Objective fitness is 0.9 per the prose.",
+    }))
+
+    r = client.get(
+        f"/projects/{slug}/missions/alpha/stages/stage_0/iterations/0/detail",
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["objective_fitness"] == pytest.approx(0.5)
+
+
+def test_get_stage_iter_detail_tolerates_all_files_missing(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    """An iter dir with none of the sidecar files present must return
+    200 with every optional field null/[], never a 500."""
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    stage_dir = _seed_stage_dir(project_dir, "alpha", "stage_0")
+    (stage_dir / "runs" / "iter_0").mkdir(parents=True)
+
+    r = client.get(
+        f"/projects/{slug}/missions/alpha/stages/stage_0/iterations/0/detail",
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body == {
+        "iter_index": 0,
+        "reward_version": None,
+        "reward_description": None,
+        "reward_references": [],
+        "primary_metric": None,
+        "objective_fitness": None,
+        "evidence": None,
+        "confidence": None,
+        "failure_modes": [],
+        "literature_context": [],
+        "components": None,
+    }
+
+
+def test_get_stage_iter_detail_404_unknown_stage_or_iter(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    stage_dir = _seed_stage_dir(project_dir, "alpha", "stage_0")
+    _seed_stage_iter(stage_dir, 0)
+
+    r = client.get(
+        f"/projects/{slug}/missions/alpha/stages/no-such/iterations/0/detail",
+    )
+    assert r.status_code == 404
+
+    r = client.get(
+        f"/projects/{slug}/missions/alpha/stages/stage_0/iterations/9/detail",
+    )
+    assert r.status_code == 404
+
+
+# ── §completed-mission review: GET .../stages/{stage}/metric ─────────
+def test_get_stage_metric_accepted(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    _seed_stage_dir(project_dir, "alpha", "stage_0")
+
+    sm_dir = project_dir / ".missions" / "alpha" / "stage_metrics" / "stage_0"
+    sm_dir.mkdir(parents=True)
+    (sm_dir / "metric.py").write_text("def compute_spec(*a, **k): return {}\n")
+    (sm_dir / "meta.json").write_text(json.dumps({
+        "accepted": True,
+        "validation_passed": True,
+        "behavior_goal": "crouch and hold",
+        "n_candidates": 3,
+        "calibrated": False,
+        "review": {"approved": True, "summary": "Gate + min() of bounded channels."},
+    }))
+
+    r = client.get(f"/projects/{slug}/missions/alpha/stages/stage_0/metric")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "accepted"
+    assert body["behavior_goal"] == "crouch and hold"
+    assert body["validation_passed"] is True
+    assert body["n_candidates"] == 3
+    assert body["calibrated"] is False
+    assert body["review_summary"] == "Gate + min() of bounded channels."
+    assert "def compute_spec" in body["metric_source"]
+
+
+def test_get_stage_metric_rejected(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    _seed_stage_dir(project_dir, "alpha", "stage_0")
+
+    sm_dir = project_dir / ".missions" / "alpha" / "stage_metrics" / "stage_0"
+    sm_dir.mkdir(parents=True)
+    (sm_dir / "meta.json").write_text(json.dumps({
+        "accepted": False,
+        "validation_passed": False,
+    }))
+
+    r = client.get(f"/projects/{slug}/missions/alpha/stages/stage_0/metric")
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "rejected"
+
+
+def test_get_stage_metric_inherited(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    """No stage_metrics dir at all, but the stage's mission.json carries
+    a `steering_metric` -> "inherited"."""
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    md = project_dir / ".missions" / "alpha"
+    md.mkdir(parents=True)
+    payload = {
+        "schema_version": 1,
+        "goal": "test mission",
+        "decomposition_model": "claude-opus-4-7",
+        "decomposition_rationale": "test",
+        "created_at": "2026-04-24T00:00:00+00:00",
+        "current_stage_idx": 0,
+        "stages": [{
+            "name": "stage_0",
+            "goal_text": "step 0",
+            "success_criterion": "metric > 0.5",
+            "max_iterations": 2,
+            "parent_stage": None,
+            "reward_seed_prompt": "seed",
+            "kg_seed_papers": [],
+            "status": "pending",
+            "final_policy_path": None,
+            "final_reward_path": None,
+            "best_metric": None,
+            "iterations_used": 0,
+            "started_at": None,
+            "finished_at": None,
+            "redecomposition_attempts": 0,
+            "steering_metric": "some_inherited_metric",
+        }],
+    }
+    (md / "mission.json").write_text(json.dumps(payload))
+    _seed_stage_dir(project_dir, "alpha", "stage_0")
+
+    r = client.get(f"/projects/{slug}/missions/alpha/stages/stage_0/metric")
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "inherited"
+
+
+def test_get_stage_metric_none(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    _seed_stage_dir(project_dir, "alpha", "stage_0")
+
+    r = client.get(f"/projects/{slug}/missions/alpha/stages/stage_0/metric")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "none"
+    assert body["behavior_goal"] is None
+    assert body["metric_source"] is None
+
+
+def test_get_stage_metric_malformed_meta_never_500s(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    _seed_stage_dir(project_dir, "alpha", "stage_0")
+
+    sm_dir = project_dir / ".missions" / "alpha" / "stage_metrics" / "stage_0"
+    sm_dir.mkdir(parents=True)
+    (sm_dir / "meta.json").write_text("{not valid json")
+
+    r = client.get(f"/projects/{slug}/missions/alpha/stages/stage_0/metric")
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "rejected"
+
+
+def test_get_stage_metric_404_unknown_mission_or_stage(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    slug = _make_project(client)
+    _seed_mission_on_disk(tmp_projects_root / slug, "alpha")
+
+    r = client.get(f"/projects/{slug}/missions/no-such/stages/stage_0/metric")
+    assert r.status_code == 404
+
+    r = client.get(f"/projects/{slug}/missions/alpha/stages/no-such-stage/metric")
+    assert r.status_code == 404
+
+
+# ── §completed-mission review: actuator-limits mission/stage scope ───
+def test_actuator_limits_mission_stage_scope(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    import numpy as np
+
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    stage_dir = _seed_stage_dir(project_dir, "alpha", "stage_0")
+
+    rd = stage_dir / "runs" / "iter_0" / "rollout"
+    rd.mkdir(parents=True)
+    T, E = 12, 4
+    jv = np.zeros((T, E, 2))
+    jt = np.zeros((T, E, 2))
+    jv[..., 0] = 10.0
+    jt[..., 0] = 100.0
+    jv[..., 1] = 5.0
+    jt[..., 1] = 20.0
+    np.savez(
+        rd / "trajectory.npz", joint_vel=jv, joint_torque=jt,
+        projected_gravity_b=np.zeros((T, E, 3)),
+    )
+    (rd / "mjcf_limits.json").write_text(
+        json.dumps({"joint_names": ["left_knee_joint", "left_ankle_pitch_joint"]})
+    )
+
+    r = client.get(
+        f"/projects/{slug}/reports/actuator-limits"
+        f"?mission_slug=alpha&stage=stage_0"
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ok"] is True
+    assert body["available_iters"] == [0]
+    assert len(body["motors"]) == 2
+
+    # Project-level scope (no params) must be unaffected — no rollouts
+    # on the project's own runs/ tree.
+    r2 = client.get(f"/projects/{slug}/reports/actuator-limits")
+    assert r2.status_code == 200
+    assert r2.json()["ok"] is False
+
+
+def test_actuator_limits_mission_stage_404_unknown(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    slug = _make_project(client)
+    _seed_mission_on_disk(tmp_projects_root / slug, "alpha")
+
+    r = client.get(
+        f"/projects/{slug}/reports/actuator-limits"
+        f"?mission_slug=no-such&stage=stage_0"
+    )
+    assert r.status_code == 404
+
+    r = client.get(
+        f"/projects/{slug}/reports/actuator-limits"
+        f"?mission_slug=alpha&stage=no-such-stage"
+    )
+    assert r.status_code == 404
+
+
+# ── §completed-mission review: GET .../iterations/{i}/export ─────────
+def _plant_stage_checkpoint(stage_dir: Path, iter_index: int) -> Path:
+    torch = pytest.importorskip("torch")
+    it = stage_dir / "runs" / f"iter_{iter_index}"
+    it.mkdir(parents=True, exist_ok=True)
+    sd = {
+        "mlp.0.weight": torch.zeros(8, 4), "mlp.0.bias": torch.zeros(8),
+        "mlp.2.weight": torch.zeros(2, 8), "mlp.2.bias": torch.zeros(2),
+        "distribution.std_param": torch.zeros(2),
+    }
+    torch.save({"actor_state_dict": sd, "iter": 5}, it / "checkpoint.pt")
+    (it / "reward_spec.json").write_text(json.dumps({"version": "v0"}))
+    return it
+
+
+def test_get_stage_iter_export_downloads_zip_bundle(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    import io
+    import zipfile
+
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    stage_dir = _seed_stage_dir(project_dir, "alpha", "stage_0")
+    _plant_stage_checkpoint(stage_dir, 1)
+
+    r = client.get(
+        f"/projects/{slug}/missions/alpha/stages/stage_0/iterations/1/export",
+    )
+    assert r.status_code == 200, r.text
+    assert r.headers["content-type"] == "application/zip"
+    assert "alpha_stage_0_iter1_policy.zip" in r.headers.get("content-disposition", "")
+    with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
+        names = set(zf.namelist())
+        manifest = json.loads(zf.read("manifest.json"))
+    assert {"manifest.json", "checkpoint.pt", "DEPLOY.md"} <= names
+    assert manifest["iter_index"] == 1
+
+
+def test_get_stage_iter_export_404_no_checkpoint(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    stage_dir = _seed_stage_dir(project_dir, "alpha", "stage_0")
+    _seed_stage_iter(stage_dir, 0)  # no checkpoint
+
+    r = client.get(
+        f"/projects/{slug}/missions/alpha/stages/stage_0/iterations/0/export",
+    )
+    assert r.status_code == 404
+    assert "no exportable" in r.json()["detail"]
+
+
+def test_get_stage_iter_export_wires_stage_runs_root(
+    client: TestClient, tmp_projects_root: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Route-wiring check: `export_policy_bundle` must be called with
+    `runs_root` pointed at THIS stage's own runs tree, not the
+    project-level runs/ dir — proven by monkeypatching the sculptor call
+    and asserting on the `runs_root` it received."""
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    stage_dir = _seed_stage_dir(project_dir, "alpha", "stage_0")
+    (stage_dir / "runs" / "iter_2").mkdir(parents=True)
+
+    calls: list[dict] = []
+
+    class _FakeResult:
+        bundle_path = None
+
+    def _fake_export_policy_bundle(
+        project_dir_arg, *, iter_index, runs_root, out_path=None,
+    ):
+        calls.append({
+            "project_dir": project_dir_arg,
+            "iter_index": iter_index,
+            "runs_root": runs_root,
+            "out_path": out_path,
+        })
+        # Write a tiny real zip so FileResponse has something to serve.
+        import zipfile as zf_mod
+
+        bundle_dir = project_dir_arg / "exports"
+        bundle_dir.mkdir(parents=True, exist_ok=True)
+        bundle_path = bundle_dir / "fake.zip"
+        with zf_mod.ZipFile(bundle_path, "w") as zf:
+            zf.writestr("manifest.json", json.dumps({"iter_index": iter_index}))
+        result = _FakeResult()
+        result.bundle_path = bundle_path
+        return result
+
+    import sculptor.export as sculptor_export
+
+    monkeypatch.setattr(
+        sculptor_export, "export_policy_bundle", _fake_export_policy_bundle,
+    )
+
+    r = client.get(
+        f"/projects/{slug}/missions/alpha/stages/stage_0/iterations/2/export",
+    )
+    assert r.status_code == 200, r.text
+    assert len(calls) == 1
+    assert calls[0]["iter_index"] == 2
+    assert calls[0]["runs_root"] == stage_dir / "runs"
+    # Stage-scoped out_path so two stages sharing an iter index don't
+    # collide on one project-level bundle file.
+    assert calls[0]["out_path"] == (
+        project_dir / "exports" / "policy_alpha_stage_0_iter2.zip"
+    )

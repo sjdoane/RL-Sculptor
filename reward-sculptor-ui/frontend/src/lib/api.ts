@@ -864,6 +864,37 @@ export function stageCheckpointUrl(
   return `/api/projects/${slug}/missions/${missionSlug}/stages/${encodeURIComponent(stageName)}/iterations/${iterIndex}/checkpoint`;
 }
 
+/** Deployment-bundle (.zip) download URL for a stage iteration — the
+ *  checkpoint + ONNX + TorchScript + reward/env spec + DEPLOY.md. */
+export function stageExportUrl(
+  slug: string, missionSlug: string, stageName: string, iterIndex: number,
+): string {
+  return `/api/projects/${slug}/missions/${missionSlug}/stages/${encodeURIComponent(stageName)}/iterations/${iterIndex}/export`;
+}
+
+/** GET .../stages/{stage}/iterations/{i}/detail — reasoning behind a
+ *  finished iteration (diagnosis, cited papers, reward summary). */
+export async function getStageIterDetail(
+  slug: string, missionSlug: string, stageName: string, iterIndex: number,
+): Promise<import("./types").StageIterDetail> {
+  return handle(
+    await fetch(
+      `/api/projects/${slug}/missions/${missionSlug}/stages/${encodeURIComponent(stageName)}/iterations/${iterIndex}/detail`,
+    ),
+  );
+}
+
+/** GET .../stages/{stage}/metric — the stage's objective-metric record. */
+export async function getStageObjectiveMetric(
+  slug: string, missionSlug: string, stageName: string,
+): Promise<import("./types").StageObjectiveMetric> {
+  return handle(
+    await fetch(
+      `/api/projects/${slug}/missions/${missionSlug}/stages/${encodeURIComponent(stageName)}/metric`,
+    ),
+  );
+}
+
 /** GET /projects/{slug}/iterations — disk-truth iteration list for the
  *  PROJECT-level runs tree (plain sculpt runs). No JobManager entry
  *  required, so it keeps working after a backend restart — the data

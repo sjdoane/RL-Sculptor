@@ -373,6 +373,63 @@ class StageIterationSummary(BaseModel):
     reward_version: Optional[str] = None
 
 
+class StageIterPaperRef(BaseModel):
+    """One citation/grounding entry — shared shape for
+    `StageIterDetail.reward_references` (sourced from `reward_spec.json`'s
+    `references`/`grounding`) and `.literature_context` (sourced verbatim
+    from `diagnosis.json`'s `literature_context`)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    arxiv_id: Optional[str] = None
+    citation: Optional[str] = None
+    description: Optional[str] = None
+
+
+class StageIterDetail(BaseModel):
+    """`GET .../stages/{stage}/iterations/{i}/detail` — the reasoning
+    behind one finished stage iteration (diagnosis, cited papers, reward
+    summary, component means), assembled disk-truth from the iter dir.
+    Every field is best-effort: a missing/unreadable source file yields
+    null/[] for the fields it would have populated, never a 500. 404 is
+    reserved for an unknown stage or iter dir (see `_stage_dir_or_404`
+    and the iter-dir existence check in the route)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    iter_index: int
+    reward_version: Optional[str] = None
+    reward_description: Optional[str] = None
+    reward_references: list[StageIterPaperRef] = []
+    primary_metric: Optional[float] = None
+    objective_fitness: Optional[float] = None
+    evidence: Optional[str] = None
+    confidence: Optional[float] = None
+    failure_modes: list[str] = []
+    literature_context: list[StageIterPaperRef] = []
+    components: Optional[dict[str, float]] = None
+
+
+class StageObjectiveMetric(BaseModel):
+    """`GET .../stages/{stage}/metric` — the stage's objective (steering)
+    metric record: what was generated under `stage_metrics/<stage>/` and
+    whether the adversarial panel accepted it. `status` reuses the same
+    accepted/rejected/inherited/none derivation as
+    `StageSchema.metric_status` (see `mission_store._stage_metric_status`,
+    which this route's helper mirrors so the two surfaces never
+    disagree)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: Literal["accepted", "rejected", "inherited", "none"]
+    behavior_goal: Optional[str] = None
+    metric_source: Optional[str] = None
+    validation_passed: Optional[bool] = None
+    review_summary: Optional[str] = None
+    n_candidates: Optional[int] = None
+    calibrated: Optional[bool] = None
+
+
 class StageEnvSpecInfo(BaseModel):
     """`GET .../stages/{stage}/env-spec` — mirrors `EnvSpecInfo`
     (routes/projects.py's project-level env-spec surface) but scoped to

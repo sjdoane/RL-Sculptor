@@ -75,6 +75,9 @@ from backend.models.mission import (
     RunMissionRequest,
     StageEnvSpecInfo,
     StageIterationSummary,
+    StageIterDetail,
+    StageIterPaperRef,
+    StageObjectiveMetric,
 )
 from backend.models.project import ProblemDetail
 from backend.services import mission_store
@@ -617,18 +620,10 @@ def list_stage_iterations(
     if not runs_root.is_dir():
         return out
 
-    # metric_history.json (per-index list) is the stage's canonical
-    # primary-metric series when present; falls back to each iter's own
-    # metrics.json for older stages / gaps in the history file.
-    metric_history: Optional[list[Any]] = None
-    history_path = stage_dir / "reports" / "metric_history.json"
-    if history_path.is_file():
-        try:
-            loaded = json.loads(history_path.read_text(encoding="utf-8"))
-            if isinstance(loaded, list):
-                metric_history = loaded
-        except (OSError, ValueError):
-            metric_history = None
+    # metric_history.json is the stage's canonical primary-metric series
+    # when present; falls back to each iter's own metrics.json for older
+    # stages / gaps in the history file.
+    metric_history = _load_metric_history(stage_dir)
 
     for d in sorted(runs_root.iterdir()):
         m = _ITER_DIR_RE.match(d.name)
@@ -676,6 +671,27 @@ def _load_json_dict(p: Path) -> Optional[dict]:
         return data if isinstance(data, dict) else None
     except (OSError, ValueError):
         return None
+
+
+def _load_metric_history(stage_dir: Path) -> Optional[list[Any]]:
+    """`<stage_dir>/reports/metric_history.json` in EITHER shape on disk:
+    a bare `[43.49, 42.68, ...]` list (older stages) or the current
+    `{"primary_metric": "mean_return", "history": [...]}` object — in
+    which case `.history` is the per-index series. Returns None when the
+    file is absent/corrupt/an unrecognized shape (callers then fall back
+    to each iter's own metrics.json)."""
+    history_path = stage_dir / "reports" / "metric_history.json"
+    if not history_path.is_file():
+        return None
+    try:
+        loaded = json.loads(history_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if isinstance(loaded, list):
+        return loaded
+    if isinstance(loaded, dict) and isinstance(loaded.get("history"), list):
+        return loaded["history"]
+    return None
 
 
 def _find_checkpoint(iter_dir: Path) -> Optional[Path]:
@@ -818,6 +834,391 @@ def get_stage_iter_checkpoint(
         checkpoint_path,
         media_type="application/octet-stream",
         filename=download_name,
+    )
+
+
+# ── GET .../stages/{stage}/iterations/{i}/export ────────────────────────
+@router.get(
+    "/projects/{slug}/missions/{mission_slug}/stages/{stage}/iterations/{i}/export",
+    response_class=FileResponse,
+    responses={
+        200: {"content": {"application/zip": {}}},
+        404: {"model": ProblemDetail},
+        500: {"model": ProblemDetail},
+        503: {"model": ProblemDetail},
+    },
+)
+def get_stage_iter_export(
+    slug: str,
+    mission_slug: str,
+    stage: str,
+    i: int,
+    store: ProjectStore = Depends(get_store),
+) -> Any:
+    """Disk-truth deployment-bundle (.zip) download for one stage
+    iteration — checkpoint + ONNX + TorchScript + reward/env spec +
+    DEPLOY.md, via `sculptor.export.export_policy_bundle` pointed at this
+    stage's own runs tree (`<mission_dir>/stages/<stage>/runs`). Mirrors
+    `get_stage_iter_checkpoint`'s traversal guard (`_stage_dir_or_404`)
+    and `routes/policies.py::export_policy`'s error handling: 404 when
+    there's no exportable checkpoint for this iter, 503 if `sculptor` is
+    unavailable, 500 (with detail, never a blank crash) on any other
+    export failure."""
+    resolved = _stage_dir_or_404(store, slug, mission_slug, stage)
+    if isinstance(resolved, JSONResponse):
+        return resolved
+    stage_dir = resolved
+
+    project_dir = _project_dir(store, slug)
+    assert project_dir is not None  # _stage_dir_or_404 already validated this
+
+    try:
+        from sculptor.export import ExportError, export_policy_bundle
+    except Exception as e:  # noqa: BLE001
+        return _problem(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "sculptor unavailable",
+            detail=f"{type(e).__name__}: {e}",
+            type_="/problems/sculptor-unavailable",
+        )
+
+    try:
+        # Stage-scoped out_path: the default bundle name is keyed only by
+        # project + iter, so two stages that each have iter_0 would collide
+        # on one file (and could race under concurrent exports). Key it by
+        # mission + stage + iter so every stage gets its own artifact.
+        out_path = (
+            project_dir / "exports"
+            / f"policy_{mission_slug}_{stage}_iter{i}.zip"
+        )
+        result = export_policy_bundle(
+            project_dir, iter_index=i, runs_root=stage_dir / "runs",
+            out_path=out_path,
+        )
+    except ExportError as e:
+        return _problem(
+            status.HTTP_404_NOT_FOUND,
+            "no exportable checkpoint",
+            detail=str(e),
+            type_="/problems/not-found",
+        )
+    except Exception as e:  # noqa: BLE001 — degrade loudly, never 500-blank
+        return _problem(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "export failed",
+            detail=f"{type(e).__name__}: {e}",
+            type_="/problems/export-failed",
+        )
+
+    download_name = f"{mission_slug}_{stage}_iter{i}_policy.zip"
+    return FileResponse(
+        result.bundle_path,
+        media_type="application/zip",
+        filename=download_name,
+    )
+
+
+# ── GET .../stages/{stage}/iterations/{i}/detail ───────────────────────
+# Strict fallback regex for `objective_fitness` when no structured value
+# is available anywhere: diagnosis.json's `evidence` prose always leads
+# with this exact phrasing (see recon on the live g1-jump-demo-lokesh
+# mission) when a task-derived metric backed the run.
+_OBJECTIVE_FITNESS_RE = re.compile(r"[Oo]bjective fitness is ([0-9.]+)")
+
+
+def _extract_reward_description(iter_dir: Path, stage_dir: Path, spec: dict) -> Optional[str]:
+    """`reward_spec.json`'s own `description` field wins; else fall back
+    to the module docstring of `<stage_dir>/rewards/v{version}.py`."""
+    desc = spec.get("description")
+    if isinstance(desc, str) and desc.strip():
+        return desc
+    version = spec.get("version")
+    if isinstance(version, str) and version.strip():
+        reward_path = stage_dir / "rewards" / f"{version}.py"
+        if reward_path.is_file():
+            try:
+                import ast
+
+                tree = ast.parse(reward_path.read_text(encoding="utf-8"))
+                doc = ast.get_docstring(tree)
+                if doc:
+                    return doc.strip()
+            except (OSError, SyntaxError, ValueError):
+                pass
+    return None
+
+
+def _extract_reward_references(spec: dict) -> list[StageIterPaperRef]:
+    """`reward_spec.json.references` (list of {arxiv_id, citation,
+    how_used, ...}) mapped onto the shared paper-ref shape; falls back to
+    `grounding` (a dict of hyperparameter -> free-text rationale, no
+    structured citations) only when `references` is absent — in that
+    case each grounding note becomes a description-only ref."""
+    out: list[StageIterPaperRef] = []
+    refs = spec.get("references")
+    if isinstance(refs, list):
+        for r in refs:
+            if not isinstance(r, dict):
+                continue
+            out.append(StageIterPaperRef(
+                arxiv_id=r.get("arxiv_id") if isinstance(r.get("arxiv_id"), str) else None,
+                citation=r.get("citation") if isinstance(r.get("citation"), str) else None,
+                description=r.get("how_used") if isinstance(r.get("how_used"), str) else r.get("description"),
+            ))
+        if out:
+            return out
+    grounding = spec.get("grounding")
+    if isinstance(grounding, dict):
+        for key, note in grounding.items():
+            if isinstance(note, str) and note.strip():
+                out.append(StageIterPaperRef(
+                    arxiv_id=None, citation=None,
+                    description=f"{key}: {note}",
+                ))
+    return out
+
+
+def _extract_objective_fitness(iter_dir: Path, spec: dict, evidence: Optional[str]) -> Optional[float]:
+    """Structured value first (reward_spec.json / a dedicated fitness
+    json / behavior.json's `objective_fitness`/`fitness`), else a strict
+    regex pull of the leading number out of diagnosis.json's `evidence`
+    prose (`"Objective fitness is 0.99963 ..."`), else None. This is a
+    best-effort disk scrape — no structured `objective_fitness` field is
+    guaranteed to exist on any given iter."""
+    for key in ("objective_fitness", "fitness"):
+        v = spec.get(key)
+        if isinstance(v, (int, float)):
+            return float(v)
+    fitness_doc = _load_json_dict(iter_dir / "fitness.json")
+    if fitness_doc is not None:
+        for key in ("objective_fitness", "fitness", "value"):
+            v = fitness_doc.get(key)
+            if isinstance(v, (int, float)):
+                return float(v)
+    behavior = _load_json_dict(iter_dir / "rollout" / "behavior.json") or {}
+    for key in ("objective_fitness", "fitness"):
+        v = behavior.get(key)
+        if isinstance(v, (int, float)):
+            return float(v)
+    if evidence:
+        m = _OBJECTIVE_FITNESS_RE.search(evidence)
+        if m:
+            try:
+                return float(m.group(1))
+            except ValueError:
+                return None
+    return None
+
+
+def _mean_reward_components(iter_dir: Path) -> Optional[dict[str, float]]:
+    """Mean over the rollout of each non-`__`-prefixed component in
+    `reward_trajectory.json` (the `__`-prefixed keys — `__episode_length`,
+    `__terminated`, `__time_outs` — are bookkeeping, not reward terms).
+    Tries `<iter_dir>/reward_trajectory.json` first, then the rollout-
+    scoped copy, since both have been observed on disk."""
+    traj = None
+    for candidate in (
+        iter_dir / "reward_trajectory.json",
+        iter_dir / "rollout" / "reward_trajectory.json",
+    ):
+        if candidate.is_file():
+            traj = _load_json_dict(candidate)
+            if traj is not None:
+                break
+    if not traj:
+        return None
+    out: dict[str, float] = {}
+    for key, values in traj.items():
+        if key.startswith("__") or not isinstance(values, list) or not values:
+            continue
+        nums = [v for v in values if isinstance(v, (int, float))]
+        if not nums:
+            continue
+        out[key] = round(sum(nums) / len(nums), 6)
+    return out or None
+
+
+@router.get(
+    "/projects/{slug}/missions/{mission_slug}/stages/{stage}/iterations/{i}/detail",
+    response_model=StageIterDetail,
+    responses={404: {"model": ProblemDetail}},
+)
+def get_stage_iter_detail(
+    slug: str,
+    mission_slug: str,
+    stage: str,
+    i: int,
+    store: ProjectStore = Depends(get_store),
+) -> Any:
+    """Disk-truth reasoning behind one finished stage iteration: reward
+    spec description/citations, the objective fitness the loop optimized,
+    the diagnoser's evidence/confidence/failure-modes/literature, and
+    mean reward-component values over the rollout. Every field is best-
+    effort — a missing/malformed source file degrades that field to
+    null/[] rather than 404ing or 500ing. 404 only when the stage dir or
+    the iteration dir itself doesn't exist."""
+    resolved = _stage_dir_or_404(store, slug, mission_slug, stage)
+    if isinstance(resolved, JSONResponse):
+        return resolved
+    stage_dir = resolved
+
+    iter_dir = stage_dir / "runs" / f"iter_{i}"
+    if not iter_dir.is_dir():
+        return _problem(
+            status.HTTP_404_NOT_FOUND,
+            "iteration not found",
+            detail=f"no iteration {i} under stage {stage!r} (mission {mission_slug!r})",
+            type_="/problems/not-found",
+        )
+
+    spec = _load_json_dict(iter_dir / "reward_spec.json") or {}
+    reward_version = spec.get("version") if isinstance(spec.get("version"), str) else None
+    reward_description = _extract_reward_description(iter_dir, stage_dir, spec)
+    reward_references = _extract_reward_references(spec)
+
+    metric_history = _load_metric_history(stage_dir)
+    primary_metric: Optional[float] = None
+    if metric_history is not None and 0 <= i < len(metric_history):
+        v = metric_history[i]
+        if isinstance(v, (int, float)):
+            primary_metric = float(v)
+    if primary_metric is None:
+        metrics = _load_json_dict(iter_dir / "metrics.json") or {}
+        mm = metrics.get("metrics")
+        if isinstance(mm, dict):
+            v = mm.get("mean_return")
+            if isinstance(v, (int, float)):
+                primary_metric = float(v)
+
+    diagnosis = _load_json_dict(iter_dir / "diagnosis.json") or {}
+    evidence = diagnosis.get("evidence") if isinstance(diagnosis.get("evidence"), str) else None
+    confidence = diagnosis.get("confidence") if isinstance(diagnosis.get("confidence"), (int, float)) else None
+    failure_modes_raw = diagnosis.get("failure_modes")
+    failure_modes = (
+        [x for x in failure_modes_raw if isinstance(x, str)]
+        if isinstance(failure_modes_raw, list) else []
+    )
+    literature_raw = diagnosis.get("literature_context")
+    literature_context: list[StageIterPaperRef] = []
+    if isinstance(literature_raw, list):
+        for entry in literature_raw:
+            if not isinstance(entry, dict):
+                continue
+            literature_context.append(StageIterPaperRef(
+                arxiv_id=entry.get("arxiv_id") if isinstance(entry.get("arxiv_id"), str) else None,
+                citation=(
+                    entry.get("citation")
+                    if isinstance(entry.get("citation"), str)
+                    else entry.get("paper_citation") if isinstance(entry.get("paper_citation"), str) else None
+                ),
+                description=entry.get("description") if isinstance(entry.get("description"), str) else None,
+            ))
+
+    objective_fitness = _extract_objective_fitness(iter_dir, spec, evidence)
+    components = _mean_reward_components(iter_dir)
+
+    return StageIterDetail(
+        iter_index=i,
+        reward_version=reward_version,
+        reward_description=reward_description,
+        reward_references=reward_references,
+        primary_metric=primary_metric,
+        objective_fitness=objective_fitness,
+        evidence=evidence,
+        confidence=float(confidence) if confidence is not None else None,
+        failure_modes=failure_modes,
+        literature_context=literature_context,
+        components=components,
+    )
+
+
+# ── GET .../stages/{stage}/metric ───────────────────────────────────────
+def _stage_review_summary(meta: dict) -> Optional[str]:
+    """Short human-readable verdict pulled from `meta.review`/
+    `meta.review_panel` — prefers a `summary` field (review.summary on
+    the live g1-jump-demo-lokesh mission), else falls back to an
+    `approved`/`verdict` flag rendered as a one-line sentence."""
+    for key in ("review", "review_panel"):
+        block = meta.get(key)
+        if not isinstance(block, dict):
+            continue
+        summary = block.get("summary")
+        if isinstance(summary, str) and summary.strip():
+            return summary
+        verdict = block.get("verdict")
+        if isinstance(verdict, str) and verdict.strip():
+            return verdict
+        approved = block.get("approved")
+        if isinstance(approved, bool):
+            return "Approved by review." if approved else "Not approved by review."
+    return None
+
+
+@router.get(
+    "/projects/{slug}/missions/{mission_slug}/stages/{stage}/metric",
+    response_model=StageObjectiveMetric,
+    responses={404: {"model": ProblemDetail}},
+)
+def get_stage_metric(
+    slug: str,
+    mission_slug: str,
+    stage: str,
+    store: ProjectStore = Depends(get_store),
+) -> Any:
+    """The stage's objective (steering) metric record: what was
+    generated under `<mission_dir>/stage_metrics/<stage>/` and whether
+    the adversarial panel accepted it. `status` mirrors
+    `StageSchema.metric_status` exactly (reads the SAME mission detail
+    the stages list uses, so the two surfaces never disagree). Never
+    500s on a missing/malformed `meta.json` — that degrades to
+    `status="rejected"` (a dir with no readable verdict) or the other
+    fields going null, per `mission_store._stage_metric_status`."""
+    resolved = _stage_dir_or_404(store, slug, mission_slug, stage)
+    if isinstance(resolved, JSONResponse):
+        return resolved
+
+    project_dir = _project_dir(store, slug)
+    assert project_dir is not None  # _stage_dir_or_404 already validated this
+
+    detail = mission_store.load_mission_detail(project_dir, slug, mission_slug)
+    status_value = "none"
+    if detail is not None:
+        for s in detail.stages:
+            if s.name == stage:
+                status_value = s.metric_status or "none"
+                break
+
+    mission_dir_path = mission_store.mission_dir(project_dir, mission_slug)
+    meta_path = mission_dir_path / "stage_metrics" / stage / "meta.json"
+    meta = _load_json_dict(meta_path) or {}
+
+    metric_source: Optional[str] = None
+    metric_py_path = mission_dir_path / "stage_metrics" / stage / "metric.py"
+    if metric_py_path.is_file():
+        try:
+            # UnicodeDecodeError is a ValueError subclass — catch it so a
+            # hand-corrupted/binary metric.py degrades to null, not a 500.
+            metric_source = metric_py_path.read_text(encoding="utf-8")[:4000]
+        except (OSError, ValueError):
+            metric_source = None
+    if metric_source is None:
+        mp = meta.get("metric_path")
+        if isinstance(mp, str) and mp.strip():
+            metric_source = mp
+
+    validation_passed = meta.get("validation_passed")
+    behavior_goal = meta.get("behavior_goal")
+    n_candidates = meta.get("n_candidates")
+    calibrated = meta.get("calibrated")
+
+    return StageObjectiveMetric(
+        status=status_value,  # type: ignore[arg-type]
+        behavior_goal=behavior_goal if isinstance(behavior_goal, str) else None,
+        metric_source=metric_source,
+        validation_passed=validation_passed if isinstance(validation_passed, bool) else None,
+        review_summary=_stage_review_summary(meta),
+        n_candidates=n_candidates if isinstance(n_candidates, int) else None,
+        calibrated=calibrated if isinstance(calibrated, bool) else None,
     )
 
 

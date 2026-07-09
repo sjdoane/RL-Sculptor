@@ -973,6 +973,46 @@ export interface StageIteration {
   reward_version: string | null;
 }
 
+// ── Completed-stage per-iteration detail (disk-truth) ────────────────
+// GET .../stages/{stage}/iterations/{i}/detail → the reasoning behind a
+// finished iteration (diagnosis, cited papers, reward summary, component
+// values) so the Training tab's disk-truth pane is as rich as the live
+// pane. All fields best-effort from the iter dir; any may be null.
+export interface StageIterPaperRef {
+  arxiv_id?: string | null;
+  citation?: string | null;
+  description?: string | null;
+}
+export interface StageIterDetail {
+  iter_index: number;
+  reward_version: string | null;
+  reward_description: string | null;
+  reward_references: StageIterPaperRef[];
+  primary_metric: number | null;
+  // Objective (steering) fitness the loop optimized this iter, if the
+  // metric wrote a structured value; otherwise null and the prose in
+  // `evidence` states it.
+  objective_fitness: number | null;
+  evidence: string | null;
+  confidence: number | null;
+  failure_modes: string[];
+  literature_context: StageIterPaperRef[];
+  // Mean value per reward component over the rollout, if available.
+  components: Record<string, number> | null;
+}
+
+// GET .../stages/{stage}/metric → the stage's objective-metric record
+// (what was generated, whether the adversarial panel accepted it).
+export interface StageObjectiveMetric {
+  status: "accepted" | "rejected" | "inherited" | "none";
+  behavior_goal: string | null;
+  metric_source: string | null;
+  validation_passed: boolean | null;
+  review_summary: string | null;
+  n_candidates: number | null;
+  calibrated: boolean | null;
+}
+
 // GET .../stages/{stage}/env-spec → the stage's applied env curriculum.
 // `current.meta.source` starting with "reference:" means RSI (reference-
 // state-init) was applied for this stage.

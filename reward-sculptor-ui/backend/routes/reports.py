@@ -268,22 +268,14 @@ def get_mission_quality(slug: str, store: ProjectStore = Depends(get_store)) -> 
     return doc
 
 
-# ── GET actuator-limits (§reports: per-motor torque/speed vs limits) ──
-@router.get(
-    "/projects/{slug}/reports/actuator-limits",
-    responses={404: {"model": ProblemDetail}},
-)
-def get_actuator_limits(
-    slug: str, iter: int | None = None, store: ProjectStore = Depends(get_store)
-) -> Any:
-    """Per-motor SPEED-vs-no-load-speed and TORQUE-vs-effort-limit utilization for
-    one rollout iteration — the charts that visually confirm a policy respects the
-    real actuator envelope. `iter` selects the iteration (default: the latest with
-    rollout data). Empty state (not 404) when no rollout has trajectory data yet."""
-    pd = _project_dir(store, slug)
-    if pd is None:
-        return _problem(404, "project not found", type="/problems/not-found")
-    runs = pd / "runs"
+def _actuator_limits_from_runs(runs: Path, iter: int | None) -> Any:
+    """Shared computation: given a `runs/` dir (either a project's own
+    `<project_dir>/runs` or a mission stage's `<mission_dir>/stages/
+    <stage>/runs`), find iterations with rollout trajectory data and
+    build the per-motor speed/torque utilization report for the
+    selected (or latest) one. Never raises — degrades to an empty/ok:
+    False state on any error, same contract as the project-scoped path
+    had before this helper was factored out."""
     avail: list[int] = []
     if runs.is_dir():
         for d in sorted(runs.glob("iter_*")):
@@ -309,6 +301,61 @@ def get_actuator_limits(
                "reason": f"{type(e).__name__}: {e}", "motors": []}
     rep.update({"schema": 1, "available_iters": avail, "iter": sel})
     return rep
+
+
+# ── GET actuator-limits (§reports: per-motor torque/speed vs limits) ──
+@router.get(
+    "/projects/{slug}/reports/actuator-limits",
+    responses={404: {"model": ProblemDetail}},
+)
+def get_actuator_limits(
+    slug: str,
+    iter: int | None = None,
+    mission_slug: str | None = None,
+    stage: str | None = None,
+    store: ProjectStore = Depends(get_store),
+) -> Any:
+    """Per-motor SPEED-vs-no-load-speed and TORQUE-vs-effort-limit utilization for
+    one rollout iteration — the charts that visually confirm a policy respects the
+    real actuator envelope. `iter` selects the iteration (default: the latest with
+    rollout data). Empty state (not 404) when no rollout has trajectory data yet.
+
+    When `mission_slug` AND `stage` are BOTH given, the report is built from
+    that stage's own runs tree (`<mission_dir>/stages/<stage>/runs`) instead
+    of the project-level `runs/` — same response shape, mission-scoped data.
+    Project-scoped behavior (both params omitted) is unchanged. Either param
+    alone is ignored (falls back to project scope) since a lone `stage` name
+    is ambiguous across missions."""
+    pd = _project_dir(store, slug)
+    if pd is None:
+        return _problem(404, "project not found", type="/problems/not-found")
+
+    if mission_slug is not None and stage is not None:
+        if not _SAFE_PATH_SEGMENT.match(mission_slug) or not _SAFE_PATH_SEGMENT.match(stage):
+            return _problem(
+                404, "invalid path segment",
+                detail=(
+                    f"mission_slug={mission_slug!r} / stage={stage!r} must "
+                    "each match a plain slug component"
+                ),
+                type="/problems/not-found",
+            )
+        if mission_slug not in mission_store.list_mission_slugs(pd):
+            return _problem(
+                404, "mission not found",
+                detail=f"no mission {mission_slug!r} under project {slug!r}",
+                type="/problems/not-found",
+            )
+        stage_dir = mission_store.mission_dir(pd, mission_slug) / "stages" / stage
+        if not stage_dir.is_dir():
+            return _problem(
+                404, "stage not found",
+                detail=f"no stage {stage!r} under mission {mission_slug!r}",
+                type="/problems/not-found",
+            )
+        return _actuator_limits_from_runs(stage_dir / "runs", iter)
+
+    return _actuator_limits_from_runs(pd / "runs", iter)
 
 
 # ── POST build ────────────────────────────────────────────────────────
