@@ -14,6 +14,7 @@ import pytest
 from sculptor.env_spec import validate_env_spec
 from sculptor.reference import (
     apply_reference_rsi,
+    derive_reference_reset,
     derive_rsi_train_keys,
     load_clip,
     make_procedural_jump_clip,
@@ -166,6 +167,23 @@ def test_apply_reference_rsi_writes_valid_versioned_spec(tmp_path: Path) -> None
     # current.json repointed at the new version.
     cur = json.loads((env_dir / "current.json").read_text(encoding="utf-8"))
     assert cur["meta"]["version"] == spec["meta"]["version"]
+
+
+def test_derive_reference_reset_byte_identical_to_rsi_keys_for_jump_clip() -> None:
+    """§REFERENCE_TRAJECTORY_PLAN §8 generalization regression pin: the
+    procedural jump clip's derivation must be UNCHANGED — same keys,
+    same values — through the generalized `derive_reference_reset`
+    entry point `apply_reference_rsi` now calls."""
+    clip = make_procedural_jump_clip(apex_gain_m=0.35)
+    pinned = derive_rsi_train_keys(clip)
+    assert pinned == {
+        "reset_height_offset_m": [0.0, 0.3495],
+        "reset_vertical_velocity_mps": [-2.4005, 2.4005],
+        "min_base_height_termination_m": 0.5,
+    }
+    general = derive_reference_reset(clip)
+    assert general == pinned
+    assert "reset_pitch_offset_rad" not in general
 
 
 def test_apply_reference_rsi_builds_on_existing_spec(tmp_path: Path) -> None:

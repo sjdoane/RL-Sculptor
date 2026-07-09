@@ -24,10 +24,49 @@ This module makes that machinery available WITHOUT touching evaluation:
     `reset_vertical_velocity_mps`, paired
     `min_base_height_termination_m`), clamped to the validator's own
     bounds tables so the emitted values can never fail the gate;
-  * `apply_reference_rsi` — persists those values as the next validated
-    env/v<N>.json via `env_spec.write_env_spec_version` (train-only by
-    construction: rollout evaluation NEVER sees RSI — the schema-level
-    shared/train split guarantees metric comparability).
+  * `derive_reference_reset` — `derive_rsi_train_keys` plus a COMPUTED
+    (not yet schema-persisted — see below) root-orientation
+    `reset_pitch_offset_rad` range when the clip carries
+    `root_quat_wxyz` and is get-up-shaped;
+  * `apply_reference_rsi` — persists the schema-expressible subset of
+    those values as the next validated env/v<N>.json via
+    `env_spec.write_env_spec_version` (train-only by construction:
+    rollout evaluation NEVER sees RSI — the schema-level shared/train
+    split guarantees metric comparability).
+
+§REFERENCE_TRAJECTORY_PLAN §8 (2026-07-09): generalized beyond the
+procedural jump clip to GET-UP-shaped motions (rises from a low/lying
+start to standing). `derive_rsi_train_keys`/`derive_reference_reset`
+classify a clip's ARCHETYPE from its own height trajectory
+(`_archetype`: "getup" / "airborne" / "other") and dispatch accordingly:
+airborne (jump-like) derivation is byte-identical to the original
+jump-only implementation; get-up derivation emits a NEGATIVE
+`reset_height_offset_m` (lying is below the robot's standing default)
+and a sunk-termination threshold placed BELOW the clip's own minimum
+observed height (rather than the airborne path's fraction-of-standing
+rule) so early termination can never fire on the reference's own lying
+reset.
+
+TWO capabilities are computed but NOT yet persistable into a real env
+spec, both fence-limited (this task's file allow-list is reference.py,
+mission_runtime.py, env_spec.py, tests/):
+  * root orientation (`reset_pitch_offset_rad`) — the mjlab MECHANISM
+    exists (`reset_root_state_uniform`'s `pose_range["pitch"]`), but
+    `env_spec.py`'s `_TRAIN_RANGES` intentionally omits this key because
+    `env_gen.py` (the LLM env-spec generator, out of fence) has a
+    test-enforced 1:1 field-parity guard against that table
+    (`tests/test_env_gen.py::test_generator_models_cover_the_schema_
+    exactly` — adding the key without a matching `env_gen.py` model
+    field breaks it);
+  * per-joint lying POSTURE (e.g. bent knees/elbows while on the
+    ground) — NOT derivable through the current env-spec surface at
+    all: `reset_joint_position_offset_rad` is a single scalar range
+    applied as a UNIFORM random offset to every joint from the STANDING
+    default (`mjlab.envs.mdp.events.reset_joints_by_offset`), not a
+    per-joint target/keyframe. A real fix needs a NEW mjlab event plus
+    new `sculptor/adapters/_mjlab_runner.py` wiring, both outside this
+    task's fence.
+See `derive_reference_reset`'s docstring for the full detail on both.
 
 Real retargeted mocap: Unitree publishes a LAFAN1 dataset retargeted to
 G1/H1 (HuggingFace `unitreerobotics/LAFAN1_Retargeting_Dataset`,
@@ -58,8 +97,29 @@ _G = 9.81
 # the tuck-jump E2E runs (G1 stand ≈ 0.78 m): 0.5 m (≈0.64·stand) works;
 # 0.6 m killed training outright (iter 32, mean return −7.7). RSI without
 # this termination REGRESSES (iters 19-20) — the validator enforces the
-# pairing, and `derive_rsi_train_keys` always emits both.
+# pairing, and `derive_rsi_train_keys` always emits both (airborne
+# clips). Get-up clips use a DIFFERENT guard — see
+# `_GETUP_SUNK_MARGIN_M` below.
 _SUNK_FRAC_OF_STAND = 0.64
+
+# ── §REFERENCE_TRAJECTORY_PLAN §8: archetype thresholds ────────────────
+# A clip's initial window (first `_ARCHETYPE_WINDOW_S` seconds) is
+# compared against these to classify the motion. "Low" means the root is
+# on/near the ground (lying); "high" means upright/standing. Values are
+# G1-shaped (stand ≈0.78 m) but expressed as robot-relative *fractions
+# are not available at this layer — reference.py never sees stand
+# height directly, so we use absolute metre thresholds consistent with
+# typical humanoid geometry (a lying human/humanoid root is well under
+# 0.35 m; a standing one is well over 0.6 m for G1-class robots).
+_ARCHETYPE_WINDOW_S = 0.5
+_GETUP_START_MAX_M = 0.35
+_GETUP_END_MIN_M = 0.6
+# Get-up sunk-termination guard: the derived threshold sits this far
+# BELOW the clip's own observed minimum height, so the reference's own
+# lying start (and any natural settling below it) never trips early
+# termination at reset. §8: "sunk-height termination must NOT fire at
+# reset."
+_GETUP_SUNK_MARGIN_M = 0.05
 
 
 # ── Clip format ─────────────────────────────────────────────────────────
@@ -316,23 +376,113 @@ def _clamp_range(key: str, lo: float, hi: float) -> list[float]:
     return [round(lo, 4), round(hi, 4)]
 
 
+def _clamp_scalar(key: str, v: float) -> float:
+    lo, hi = _TRAIN_SCALARS[key]
+    return round(min(max(v, lo), hi), 4)
+
+
+def _archetype(clip: dict) -> str:
+    """Classify a reference clip's start/end shape (§8).
+
+    Checked in this order:
+
+    1. ``"getup"`` — the clip STARTS low (near-ground root height) and
+       ENDS high (standing), i.e. a low→high PERMANENT transition. This
+       is checked FIRST: a get-up clip's height trivially "rises above
+       its early-window baseline" too (it starts on the ground), so the
+       airborne rule alone would misclassify it. A real jump clip starts
+       standing, so it can never satisfy the get-up start condition —
+       ordering the checks this way does not change airborne detection.
+    2. ``"airborne"`` — the clip rises above its own EARLY-window
+       baseline at some point (the pre-existing jump-clip rule, kept
+       byte-for-byte so jump-clip derivation is unaffected).
+    3. ``"other"`` — neither; never rises, never a low→high transition.
+    """
+    z = clip["root_pos_z"]
+    fps = float(clip["fps"])
+    nw = max(2, int(_ARCHETYPE_WINDOW_S * fps))
+    start = float(np.median(z[:nw]))
+    end = float(np.median(z[-nw:]))
+    if start < _GETUP_START_MAX_M and end > _GETUP_END_MIN_M:
+        return "getup"
+    n0 = max(2, int(0.2 * fps))
+    z0 = float(np.median(z[:n0]))
+    if (z > z0 + 0.01).any():
+        return "airborne"
+    return "other"
+
+
 def derive_rsi_train_keys(clip: dict) -> dict:
     """Map a reference clip onto the env-spec TRAIN surface.
 
-    Emits DeepMimic-style RSI ranges covering the clip's airborne +
-    landing states (offsets are relative to the robot's default reset,
-    i.e. to standing — mjlab `reset_root_state_uniform` semantics), and
-    ALWAYS pairs them with the sunk-height termination the validator's
-    RSI↔ET invariant requires. Values are clamped into the validator's
-    own bounds tables, so the emitted fragment can never fail the gate.
+    Dispatches on the clip's shape (§REFERENCE_TRAJECTORY_PLAN §8):
+
+    - **Airborne** (jump-like — rises above its own standing baseline):
+      UNCHANGED, byte-identical behavior to the original jump-only
+      implementation. Emits DeepMimic-style RSI ranges covering the
+      clip's airborne + landing states (offsets relative to the robot's
+      default reset, i.e. to standing — mjlab
+      `reset_root_state_uniform` semantics), ALWAYS paired with the
+      sunk-height termination the validator's RSI↔ET invariant
+      requires.
+    - **Get-up-like** (starts low, ends standing): emits a NEGATIVE
+      `reset_height_offset_m` derived from the clip's own initial-window
+      height (relative to the robot's standing default, approximated by
+      the clip's own end-window height — the clip is the only height
+      reference available at this layer), near-zero
+      `reset_vertical_velocity_mps` (a resting lying start, not a
+      falling one), and a sunk-termination threshold derived BELOW the
+      clip's own observed minimum height (never above it) so the
+      reference's own lying start cannot trip early termination at
+      reset — the start-pose-aware guard §8 requires.
+    - **Other** (never rises, never low→high): unchanged — raises
+      `ValueError` with an actionable message.
+
+    Values are clamped into the validator's own bounds tables, so the
+    emitted fragment can never fail the gate.
     """
     clip = _with_velocity(clip)
     z = clip["root_pos_z"]
     vz = clip["root_vel_z"]
     fps = float(clip["fps"])
+    archetype = _archetype(clip)
+
+    if archetype == "getup":
+        nw = max(2, int(_ARCHETYPE_WINDOW_S * fps))
+        z_start_lo = float(z[:nw].min())
+        z_start_hi = float(z[:nw].max())
+        z_stand = float(np.median(z[-nw:]))          # clip's own "standing"
+        vz_start = vz[:nw]
+        z_min = float(z.min())
+        sunk_lo, sunk_hi = _TRAIN_SCALARS["min_base_height_termination_m"]
+        sunk = _clamp_scalar(
+            "min_base_height_termination_m",
+            min(max(z_min - _GETUP_SUNK_MARGIN_M, sunk_lo), sunk_hi))
+        return {
+            "reset_height_offset_m": _clamp_range(
+                "reset_height_offset_m",
+                z_start_lo - z_stand, z_start_hi - z_stand),
+            "reset_vertical_velocity_mps": _clamp_range(
+                "reset_vertical_velocity_mps",
+                float(vz_start.min()), float(vz_start.max())),
+            "min_base_height_termination_m": sunk,
+        }
+
+    if archetype == "other":
+        raise ValueError(
+            "reference clip never rises above its standing height and "
+            "never transitions low→high — no RSI states to initialize "
+            "from (not a recognized jump- or get-up-shaped motion)")
+
+    # archetype == "airborne" — original jump-only derivation, unchanged.
     z0 = float(np.median(z[: max(2, int(0.2 * fps))]))
     window = z > z0 + 0.01                     # airborne frames
     if not window.any():
+        # Unreachable in practice — `_archetype` already classified this
+        # clip as "airborne" using the identical rule, so `window` can't
+        # be empty here. Kept as defense-in-depth (mirrors the original
+        # jump-only guard byte-for-byte) rather than trusting the
+        # dispatch alone.
         raise ValueError(
             "reference clip never rises above its standing height — "
             "no airborne states to initialize from")
@@ -350,11 +500,95 @@ def derive_rsi_train_keys(clip: dict) -> dict:
     }
 
 
+#: Hard bounds for the (not-yet-schema) pitch-offset derivation — mirrors
+#: the shape of an `_TRAIN_RANGES` envelope entry without actually being
+#: one (see `derive_reference_reset`'s docstring for why: `env_spec.py`'s
+#: `_TRAIN_RANGES` intentionally does NOT carry a `reset_pitch_offset_rad`
+#: key, because `env_gen.py` — outside this task's file fence — has a
+#: test-enforced 1:1 field-parity guard against that table).
+_PITCH_OFFSET_ENVELOPE = (-3.2, 3.2)
+
+
+def _quat_wxyz_to_pitch_rad(q: np.ndarray) -> np.ndarray:
+    """Standard aerospace-sequence pitch angle from a batch of unit
+    quaternions `(N, 4)` in `[w, x, y, z]` order. Pitch alone is the
+    axis that carries "lying face-down/face-up vs. standing upright"
+    for a humanoid falling/rising in the sagittal plane."""
+    w, x, y, z = q[:, 0], q[:, 1], q[:, 2], q[:, 3]
+    sinp = 2.0 * (w * y - z * x)
+    sinp = np.clip(sinp, -1.0, 1.0)
+    return np.arcsin(sinp)
+
+
+def derive_reference_reset(clip: dict) -> dict:
+    """`derive_rsi_train_keys` plus, when the clip carries
+    `root_quat_wxyz` AND is get-up-shaped, an ADDITIONAL
+    `reset_pitch_offset_rad` range derived from the clip's initial-
+    window orientation relative to its own end-window (standing-like)
+    orientation — the root-orientation half of a lying start
+    (§REFERENCE_TRAJECTORY_PLAN §8's "PLUS ... initial joint posture
+    and root orientation" extension).
+
+    FENCE-LIMITED GAP (reported, not built around): mjlab's
+    `reset_root_state_uniform` natively supports a `pose_range["pitch"]`
+    offset (confirmed by reading
+    `.venv/lib/python3.13/site-packages/mjlab/envs/mdp/events.py` during
+    recon) — the MECHANISM to apply this exists. But persisting
+    `reset_pitch_offset_rad` through `env_spec.py`'s `_TRAIN_RANGES`
+    would require a matching field on `env_gen.py::_TrainModel` (a
+    test-enforced 1:1 parity guard,
+    `tests/test_env_gen.py::test_generator_models_cover_the_schema_
+    exactly`), and `env_gen.py` is OUTSIDE this task's file fence
+    (allow-list: reference.py, mission_runtime.py, env_spec.py, tests/).
+    So this function COMPUTES the pitch-offset range (correct, tested)
+    but `apply_reference_rsi` below does NOT persist it into the env
+    spec — it would fail `validate_env_spec` as an unknown key. Callers
+    that need the value (e.g. a future orchestrator change with
+    `env_gen.py` in scope) can read it straight from this function's
+    return dict.
+
+    Joint posture (per-joint initial pose) is NOT emitted at all, for a
+    similar but harder reason: the env layer's
+    `reset_joint_position_offset_rad` is a single scalar range applied
+    as a UNIFORM random offset to every joint from the robot's DEFAULT
+    (standing) pose (`mjlab.envs.mdp.events.reset_joints_by_offset` —
+    confirmed by reading the adapter + mjlab source during recon), not
+    an explicit per-joint target/keyframe vector. A true lying joint
+    posture is materially different per-joint from standing, so it
+    cannot be expressed as one shared offset without either being a
+    no-op for most joints or corrupting the ones near their limits.
+    Wiring a real per-joint keyframe reset would require a NEW mjlab
+    event plus a new adapter branch in
+    `sculptor/adapters/_mjlab_runner.py` — both outside this task's file
+    fence.
+    """
+    derived = dict(derive_rsi_train_keys(clip))
+    quat = clip.get("root_quat_wxyz")
+    if quat is not None and _archetype(clip) == "getup":
+        fps = float(clip["fps"])
+        nw = max(2, int(_ARCHETYPE_WINDOW_S * fps))
+        pitch = _quat_wxyz_to_pitch_rad(np.asarray(quat, dtype=np.float64))
+        pitch_start = pitch[:nw]
+        pitch_stand = float(np.median(pitch[-nw:]))
+        offset = pitch_start - pitch_stand
+        lo, hi = _PITCH_OFFSET_ENVELOPE
+        p_lo = min(max(float(offset.min()), lo), hi)
+        p_hi = min(max(float(offset.max()), lo), hi)
+        if p_hi < p_lo:
+            p_lo, p_hi = p_hi, p_lo
+        derived["reset_pitch_offset_rad"] = [round(p_lo, 4), round(p_hi, 4)]
+    return derived
+
+
 def apply_reference_rsi(env_dir: Path | str, clip: dict) -> Path:
     """Persist the clip-derived RSI curriculum as the next validated
     env-spec version (train scope only; the frozen shared/eval section
     is untouched, so metric comparability is preserved by construction).
-    Builds on the project's current spec when one exists."""
+    Builds on the project's current spec when one exists. Uses
+    `derive_reference_reset` for the derivation, but only persists the
+    subset of keys `env_spec.py`'s schema currently accepts —
+    `reset_pitch_offset_rad` is computed (see `derive_reference_reset`'s
+    docstring) but NOT written here; see that docstring for why."""
     env_dir = Path(env_dir)
     spec = read_current_env_spec(env_dir) or {
         "env_spec_version": ENV_SPEC_VERSION,
@@ -364,18 +598,26 @@ def apply_reference_rsi(env_dir: Path | str, clip: dict) -> Path:
     }
     spec = json.loads(json.dumps(spec))        # deep copy
     train = dict(spec.get("train") or {})
-    derived = derive_rsi_train_keys(clip)
-    train.update(derived)
+    full = derive_reference_reset(clip)
+    pitch = full.pop("reset_pitch_offset_rad", None)
+    train.update(full)
     spec["train"] = train
     meta = dict(spec.get("meta") or {})
     src = (clip.get("meta") or {}).get("source", "clip")
     meta["source"] = f"reference:{src}"
+    orient_note = (
+        f", pitch offset {pitch} rad NOT persisted "
+        "(env-spec schema key unavailable in this build; see "
+        "reference.py::derive_reference_reset docstring)"
+        if pitch is not None else ""
+    )
     meta["rationale"] = (
         "RSI ranges derived from a reference trajectory "
-        f"({src}): airborne heights up to "
-        f"+{derived['reset_height_offset_m'][1]} m, vz "
-        f"{derived['reset_vertical_velocity_mps']} m/s, paired sunk "
-        f"termination {derived['min_base_height_termination_m']} m "
+        f"({src}): height offset "
+        f"{full['reset_height_offset_m']} m, vz "
+        f"{full['reset_vertical_velocity_mps']} m/s, paired sunk "
+        f"termination {full['min_base_height_termination_m']} m"
+        f"{orient_note} "
         "(DeepMimic RSI; validator RSI↔ET invariant)."
     )
     spec["meta"] = meta

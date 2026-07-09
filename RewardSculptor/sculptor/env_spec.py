@@ -59,7 +59,12 @@ _TRAIN_SCALARS: dict[str, tuple[float, float]] = {
 _TRAIN_RANGES: dict[str, tuple[float, float]] = {
     # Offsets ADDED to the robot's default reset state (mjlab
     # reset_root_state_uniform semantics), so they are robot-relative.
-    "reset_height_offset_m": (0.0, 1.5),
+    # Envelope covers BOTH directions: positive for airborne/jump-style
+    # RSI (above standing) and negative for get-up-style RSI (a lying
+    # start is well below the standing default root height — G1 standing
+    # ≈0.78 m, lying ≈0.1 m, so an offset near -0.7 m must be
+    # expressible). §REFERENCE_TRAJECTORY_PLAN §8.
+    "reset_height_offset_m": (-1.0, 1.5),
     "reset_vertical_velocity_mps": (-3.0, 4.0),
     "reset_horizontal_velocity_mps": (-3.0, 3.0),
     # Joint-space reset offsets (radians / rad/s) around defaults.
@@ -67,6 +72,25 @@ _TRAIN_RANGES: dict[str, tuple[float, float]] = {
     "reset_joint_velocity_radps": (-10.0, 10.0),
     # Startup domain randomization of foot-geom friction.
     "friction_range": (0.05, 2.5),
+    # NOT ADDED: a root-orientation (pitch) reset key. mjlab's
+    # `reset_root_state_uniform` natively supports a `pose_range["pitch"]`
+    # offset (confirmed by reading
+    # .venv/lib/python3.13/site-packages/mjlab/envs/mdp/events.py during
+    # recon) — a get-up clip's lying start is exactly a large pitch
+    # offset from the standing default, so the MECHANISM exists. Adding
+    # the key here is schema-cheap, but `sculptor/env_gen.py`'s
+    # `_TrainModel` Pydantic model (the LLM-generation surface) has a
+    # test-enforced 1:1 field-parity guard against this table
+    # (`tests/test_env_gen.py::test_generator_models_cover_the_schema_
+    # exactly`) and `env_gen.py` is OUTSIDE this task's file fence
+    # (allow-list: reference.py, mission_runtime.py, env_spec.py,
+    # tests/). Landing the key here without the matching env_gen.py
+    # field change breaks that drift guard. `sculptor/reference.py`'s
+    # `derive_reference_reset` still COMPUTES the pitch-offset range
+    # (see `_quat_wxyz_to_pitch_rad`) so the derivation logic and its
+    # tests exist and are correct, but the value is not currently
+    # persistable into an env spec — flagged in the task report as a
+    # fence-limited gap, not built here.
 }
 _PUSH_KEYS = {"enabled", "interval_s", "linear_mps", "angular_radps"}
 _PUSH_INTERVAL_ENVELOPE = (0.5, 30.0)
