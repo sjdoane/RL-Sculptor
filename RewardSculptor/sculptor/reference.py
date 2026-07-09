@@ -122,7 +122,7 @@ _SUNK_FRAC_OF_STAND = 0.64
 # 0.35 m; a standing one is well over 0.6 m for G1-class robots).
 _ARCHETYPE_WINDOW_S = 0.5
 _GETUP_START_MAX_M = 0.35
-_GETUP_END_MIN_M = 0.6
+_GETUP_END_MIN_M = 0.55  # aligned with refs/segment.py QC_END_MIN_MEAN_Z (D15)
 # Get-up sunk-termination guard: the derived threshold sits this far
 # BELOW the clip's own observed minimum height, so the reference's own
 # lying start (and any natural settling below it) never trips early
@@ -409,9 +409,16 @@ def _archetype(clip: dict) -> str:
     """
     z = clip["root_pos_z"]
     fps = float(clip["fps"])
-    nw = max(2, int(_ARCHETYPE_WINDOW_S * fps))
-    start = float(np.median(z[:nw]))
-    end = float(np.median(z[-nw:]))
+    # Start/end windows: the LARGER of 0.5 s and 10% of the clip, MEAN
+    # aggregation — aligned with refs/segment.py's per-segment QC windows.
+    # A 0.5 s end-MEDIAN misclassified a real QC-passing get-up segment
+    # as airborne (the final instant dips to 0.52 m as the subject
+    # settles after standing; the last-10% mean is 0.64 m) — so the
+    # training env got jump-style RSI instead of a lying reset (found
+    # live in the first get-up mission run, D15).
+    nw = max(2, int(_ARCHETYPE_WINDOW_S * fps), int(0.1 * len(z)))
+    start = float(np.mean(z[:nw]))
+    end = float(np.mean(z[-nw:]))
     if start < _GETUP_START_MAX_M and end > _GETUP_END_MIN_M:
         return "getup"
     n0 = max(2, int(0.2 * fps))
