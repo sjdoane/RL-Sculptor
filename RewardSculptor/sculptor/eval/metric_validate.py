@@ -1140,8 +1140,27 @@ def _validate_references(
 
         try:
             suite = perturbation_suite(clip)
-        except Exception:  # noqa: BLE001 — a malformed clip fails gates below, not here
+        except Exception:  # noqa: BLE001 — build per-entry instead: ONE
+            # failing perturbation must not blank all nine (a quat edge
+            # case in speed() once nan'd every truncation, making
+            # monotonicity unpassable for the whole clip — D14).
+            from sculptor.refs import perturb as _pt
             suite = {}
+            for _name, _fn in (
+                ("reversal", lambda c: _pt.time_reverse(c)),
+                ("freeze_start", lambda c: _pt.freeze_start(c)),
+                ("freeze_end", lambda c: _pt.freeze_end(c)),
+                ("shuffle", lambda c: _pt.segment_shuffle(c)),
+                ("speed_slow", lambda c: _pt.speed(c, 0.25)),
+                ("speed_fast", lambda c: _pt.speed(c, 4.0)),
+                ("trunc_25", lambda c: _pt.truncate(c, 0.25)),
+                ("trunc_50", lambda c: _pt.truncate(c, 0.5)),
+                ("trunc_75", lambda c: _pt.truncate(c, 0.75)),
+            ):
+                try:
+                    suite[_name] = _fn(clip)
+                except Exception:  # noqa: BLE001 — that entry scores nan
+                    continue
         pert_scores: dict[str, float] = {}
         for name, pclip in suite.items():
             s, _ = _score_reference_entry(fn, pclip, required_roles)

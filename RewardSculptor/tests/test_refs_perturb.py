@@ -111,6 +111,23 @@ def test_speed_rejects_nonpositive_factor():
         speed(_clip(), 0.0)
 
 
+@pytest.mark.parametrize("factor", [0.25, 4.0])
+def test_speed_survives_quat_hemisphere_flips(factor):
+    # Retargeted clips carry q/-q sign flips between frames (same rotation,
+    # opposite hemisphere). Raw component-wise lerp across a flip passes
+    # near zero norm and failed validate_clip, which blanked the ENTIRE
+    # perturbation suite on a real fleaven clip (D14). speed() must
+    # hemisphere-align + renormalize.
+    clip = _clip(T=80)
+    q = clip["root_quat_wxyz"].copy()
+    q[1::2] *= -1.0  # alternate hemispheres every other frame
+    clip["root_quat_wxyz"] = q
+    out = speed(clip, factor)
+    assert validate_clip(out) == []
+    norms = np.linalg.norm(out["root_quat_wxyz"], axis=-1)
+    np.testing.assert_allclose(norms, 1.0, atol=1e-6)
+
+
 def test_degrade_adds_joint_noise_and_damps_root():
     clip = _clip()
     out = degrade(clip, joint_noise_rad=0.1, root_damp=0.0, seed=1)

@@ -134,6 +134,21 @@ def speed(clip: dict, factor: float) -> dict:
 
     out = _rebuild(clip, _resample)
     fps = float(clip["fps"])
+    # Quaternions cannot be component-wise lerped raw: retargeted clips
+    # carry hemisphere sign-flips (q and -q encode the same rotation), and
+    # interpolating across a flip passes near zero norm — validate_clip's
+    # unit-norm check then kills the ENTIRE perturbation suite (found live
+    # 2026-07-09 on a fleaven clip: every truncation scored nan and no
+    # metric could ever pass monotonicity). Hemisphere-align the source
+    # first, lerp, then renormalize (nlerp — fine at mocap frame spacing).
+    if "root_quat_wxyz" in clip:
+        q = np.asarray(clip["root_quat_wxyz"], dtype=np.float64).copy()
+        for i in range(1, q.shape[0]):
+            if np.dot(q[i], q[i - 1]) < 0.0:
+                q[i] = -q[i]
+        q_new = _resample(q)
+        norms = np.linalg.norm(q_new, axis=-1, keepdims=True)
+        out["root_quat_wxyz"] = q_new / np.maximum(norms, 1e-9)
     # Recompute velocities from the resampled positions. The resampled
     # sequence covers the SAME displacement in n/factor frames at the same
     # fps, so gradient(pos)*fps ALREADY yields factor-scaled velocities —
