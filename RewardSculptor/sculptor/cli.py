@@ -1594,6 +1594,23 @@ def refs_ingest(
              "when the preview module/GL context is unavailable)."),
     limit: Optional[int] = typer.Option(
         None, "--limit", help="Cap number of source files fetched this run."),
+    all_: bool = typer.Option(
+        False, "--all",
+        help="fleaven-g1 only: walk the FULL g1/**/*.npy tree (every "
+             "page of the HF tree API) instead of the default single-"
+             "page listing. Default off — without this flag, behavior "
+             "is unchanged from before this flag existed."),
+    manifest_out: Optional[Path] = typer.Option(
+        None, "--manifest-out",
+        help="With --all: write/reuse the enumerated file list (path+"
+             "size) as JSON at this path, so a full-tree run can be "
+             "resumed/audited. If the file exists and is < 1 day old, "
+             "it is reused instead of re-enumerating (see "
+             "--refresh-manifest)."),
+    refresh_manifest: bool = typer.Option(
+        False, "--refresh-manifest",
+        help="With --all --manifest-out: force re-enumeration even if "
+             "an existing manifest at that path looks fresh."),
 ) -> None:
     """Download + validate + index a batch of clips from a public HF
     dataset (plain HTTPS, ungated). Idempotent: re-running skips clips
@@ -1608,6 +1625,8 @@ def refs_ingest(
 
     summary = ingest_source(
         source, filter_glob=filter_glob, limit=limit, no_preview=no_preview,
+        full_tree=all_, manifest_path=manifest_out,
+        refresh_manifest=refresh_manifest,
         progress=lambda msg: typer.echo(msg))
 
     rows = rebuild_index()

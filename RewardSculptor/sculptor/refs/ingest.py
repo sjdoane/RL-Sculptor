@@ -13,8 +13,18 @@ than silently reordering (§Hard rules).
 
 Downloads happen only when a CLI command actually runs `ingest_source`;
 nothing in this module is imported or called by the test suite in a way
-that reaches the network (`_http_get_bytes` / `_hf_list_files` are the
-only network call sites, both leaves called solely from `ingest_source`).
+that reaches the network (`_http_get_bytes` / `_hf_list_files` /
+`_hf_list_files_all_pages` are the only network call sites, all leaves
+called solely from `ingest_source` / `enumerate_fleaven_g1_all`).
+
+Full-tree fleaven-g1 enumeration (2026-07-09): the HF tree API
+(`.../tree/main/<path>?recursive=true`) is PAGINATED — 1000 entries per
+page, next-page URL in the `Link: <url>; rel="next"` response header
+(RFC 5988 style, verified empirically against the live dataset: 19
+pages, 17769 files, ~6.95 GB under `g1/`). `_hf_list_files` (single
+page, used by the default/slice path) is UNCHANGED and stays
+byte-identical for backward compatibility — `--all` routes through the
+new `_hf_list_files_all_pages` walker instead.
 """
 from __future__ import annotations
 
@@ -23,6 +33,7 @@ import io
 import json
 import re
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -439,7 +450,12 @@ def _http_get_bytes(url: str, *, timeout_s: float = 120.0) -> bytes:
 
 def _hf_list_files(repo: str, path: str, *, timeout_s: float = 30.0) -> list[str]:
     """List file paths under `path` in a HuggingFace dataset repo via the
-    public (ungated) tree API. Returns repo-relative paths."""
+    public (ungated) tree API. Returns repo-relative paths.
+
+    NOTE: this only fetches the FIRST page (≤1000 entries) of the tree
+    API — the API is paginated (see `_hf_list_files_all_pages`) and this
+    function's single-page behavior is intentionally left unchanged for
+    backward compatibility with the existing (non `--all`) ingest path."""
     url = _hf_tree_api_url(repo, path)
     req = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
     with urllib.request.urlopen(req, timeout=timeout_s) as resp:
@@ -448,6 +464,200 @@ def _hf_list_files(repo: str, path: str, *, timeout_s: float = 30.0) -> list[str
         entry["path"] for entry in payload
         if entry.get("type") == "file"
     ]
+
+
+#: RFC 5988-style `Link` header, e.g.
+#: `<https://.../tree/main/g1?...&cursor=XYZ>; rel="next"`. HF's tree API
+#: emits exactly this shape (verified empirically 2026-07-09: `curl -D -`
+#: against the live fleaven-g1 tree endpoint) — one `Link` header, one
+#: `rel="next"` entry, absent entirely on the last page.
+_LINK_NEXT_RE = re.compile(r'<([^>]+)>\s*;\s*rel="next"')
+
+
+def _parse_link_next(link_header: Optional[str]) -> Optional[str]:
+    if not link_header:
+        return None
+    m = _LINK_NEXT_RE.search(link_header)
+    return m.group(1) if m else None
+
+
+def _http_get_json_with_retries(
+    url: str, *, timeout_s: float, max_attempts: int, retry_delay_s: float,
+    progress: Optional[Callable[[str], None]] = None,
+) -> tuple[Optional[list[dict[str, Any]]], Optional[str]]:
+    """GET `url`, parse the JSON array body, and return `(payload,
+    next_url)`. Transient failures (`URLError`/`OSError`/bad JSON) are
+    retried up to `max_attempts` times with a flat `retry_delay_s` pause;
+    after the last attempt fails this returns `(None, None)` and logs via
+    `progress` rather than raising — callers skip-and-log the page
+    (§task: "transient HTTP failures retried a few times, then
+    skip-and-log"), they do not abort the whole enumeration."""
+    log = progress or (lambda _msg: None)
+    req = urllib.request.Request(url, headers={"User-Agent": _USER_AGENT})
+    last_err: Optional[BaseException] = None
+    for attempt in range(1, max_attempts + 1):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+                body = resp.read().decode("utf-8")
+                next_url = _parse_link_next(resp.headers.get("Link"))
+            payload = json.loads(body)
+            return payload, next_url
+        except (urllib.error.URLError, OSError, json.JSONDecodeError, TimeoutError) as e:
+            last_err = e
+            log(f"[refs enumerate] page fetch failed (attempt {attempt}/"
+                f"{max_attempts}) for {url}: {type(e).__name__}: {e}")
+            if attempt < max_attempts:
+                time.sleep(retry_delay_s)
+    log(f"[refs enumerate] giving up on page after {max_attempts} attempts: "
+        f"{url} ({type(last_err).__name__ if last_err else 'unknown'}: {last_err})")
+    return None, None
+
+
+def _hf_list_files_all_pages(
+    repo: str, path: str, *, timeout_s: float = 30.0, max_attempts: int = 3,
+    retry_delay_s: float = 1.0, max_pages: int = 10_000,
+    progress: Optional[Callable[[str], None]] = None,
+) -> list[dict[str, Any]]:
+    """Walk EVERY page of the HF tree API's recursive listing under
+    `path`, following the `Link: rel="next"` cursor until it's absent.
+    Returns file entries only (`type == "file"`), each as
+    `{"path": ..., "size": ...}`. A page that fails after retries is
+    skipped (logged via `progress`) rather than aborting the whole walk
+    — an incomplete listing is preferable to no listing (§task: "skip-
+    and-log"); callers that need a complete listing should check log
+    output / reconcile against the manifest.
+
+    `max_pages` is a sanity backstop (repo has 19 pages today at 1000
+    entries/page) — not expected to bind in practice."""
+    log = progress or (lambda _msg: None)
+    url: Optional[str] = _hf_tree_api_url(repo, path)
+    out: list[dict[str, Any]] = []
+    page = 0
+    while url is not None and page < max_pages:
+        page += 1
+        payload, next_url = _http_get_json_with_retries(
+            url, timeout_s=timeout_s, max_attempts=max_attempts,
+            retry_delay_s=retry_delay_s, progress=progress)
+        if payload is None:
+            # Page permanently failed after retries. We cannot know its
+            # `next` cursor (the failed request never returned one), so
+            # the walk must stop here — everything after this page is
+            # unreachable. Log loudly and return what we have so far.
+            log(f"[refs enumerate] page {page} unrecoverable — stopping "
+                f"walk early; {len(out)} file(s) enumerated before the gap")
+            break
+        for entry in payload:
+            if entry.get("type") == "file":
+                out.append({
+                    "path": entry["path"],
+                    "size": int(entry.get("size", 0)),
+                })
+        log(f"[refs enumerate] page {page}: +{sum(1 for e in payload if e.get('type') == 'file')} "
+            f"file(s), {len(out)} total so far")
+        url = next_url
+    return out
+
+
+def enumerate_fleaven_g1_all(
+    *, timeout_s: float = 30.0, max_attempts: int = 3, retry_delay_s: float = 1.0,
+    progress: Optional[Callable[[str], None]] = None,
+) -> list[dict[str, Any]]:
+    """Full-tree enumeration of every file under `g1/` in the fleaven-g1
+    HF dataset repo, across ALL pages (not just the first 1000 entries).
+    Returns `[{"path": ..., "size": ...}, ...]` filtered to `.npy` files
+    (the repo also carries a handful of `.txt`/`.bib`/`.md`/`.py`
+    metadata files scattered in the tree — verified empirically
+    2026-07-09 — which are not motion clips and are excluded here so the
+    manifest only ever lists ingestible files)."""
+    entries = _hf_list_files_all_pages(
+        FLEAVEN_REPO, "g1", timeout_s=timeout_s, max_attempts=max_attempts,
+        retry_delay_s=retry_delay_s, progress=progress)
+    return [e for e in entries if e["path"].endswith(".npy")]
+
+
+# ── full-tree manifest (audit / resume) ──────────────────────────────────
+_MANIFEST_MAX_AGE_S = 24 * 60 * 60  # 1 day (§task: "fresh (< 1 day)")
+
+
+def write_fleaven_manifest(
+    manifest_path: Path, entries: list[dict[str, Any]], *, source: str = "fleaven-g1",
+) -> Path:
+    """Write the enumerated file list as JSON: `{"source", "generated_at",
+    "n_files", "total_bytes", "files": [{"path","size"}, ...]}`. Written
+    atomically (temp file + rename) so a crash mid-write never leaves a
+    corrupt manifest that `read_fleaven_manifest` would fail to parse."""
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "source": source,
+        "generated_at": _utc_now_iso(),
+        "n_files": len(entries),
+        "total_bytes": sum(int(e.get("size", 0)) for e in entries),
+        "files": entries,
+    }
+    tmp = manifest_path.with_suffix(manifest_path.suffix + ".tmp")
+    tmp.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    tmp.replace(manifest_path)
+    return manifest_path
+
+
+def _utc_now_iso() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).isoformat()
+
+
+def manifest_is_fresh(manifest_path: Path, *, max_age_s: float = _MANIFEST_MAX_AGE_S) -> bool:
+    """True iff `manifest_path` exists, parses, and its `generated_at`
+    timestamp is within `max_age_s` of now (§task: "fresh (< 1 day)").
+    Any read/parse error is treated as NOT fresh (fail open to
+    re-enumerating rather than trusting a corrupt manifest)."""
+    if not manifest_path.is_file():
+        return False
+    try:
+        from datetime import datetime
+
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+        generated_at = datetime.fromisoformat(payload["generated_at"])
+        now = datetime.fromisoformat(_utc_now_iso())
+        age_s = (now - generated_at).total_seconds()
+        return 0 <= age_s <= max_age_s
+    except (OSError, json.JSONDecodeError, KeyError, ValueError):
+        return False
+
+
+def read_fleaven_manifest(manifest_path: Path) -> list[dict[str, Any]]:
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    return list(payload["files"])
+
+
+def load_or_build_fleaven_manifest(
+    manifest_path: Optional[Path], *, refresh: bool = False,
+    timeout_s: float = 30.0, max_attempts: int = 3, retry_delay_s: float = 1.0,
+    progress: Optional[Callable[[str], None]] = None,
+) -> list[dict[str, Any]]:
+    """Resolve the full `g1/**/*.npy` file list for `--all` ingest: reuse
+    an existing fresh manifest unless `refresh` is set or none exists /
+    it's stale, otherwise enumerate for real and (if `manifest_path` is
+    given) persist the result for next time (§task item 3)."""
+    log = progress or (lambda _msg: None)
+    if manifest_path is not None and not refresh and manifest_is_fresh(manifest_path):
+        entries = read_fleaven_manifest(manifest_path)
+        log(f"[refs ingest] reusing fresh manifest {manifest_path} "
+            f"({len(entries)} files)")
+        return entries
+
+    log("[refs ingest] enumerating full fleaven-g1 tree (this walks every "
+        "page of the HF tree API — may take a while)")
+    entries = enumerate_fleaven_g1_all(
+        timeout_s=timeout_s, max_attempts=max_attempts,
+        retry_delay_s=retry_delay_s, progress=progress)
+    total_bytes = sum(int(e.get("size", 0)) for e in entries)
+    log(f"[refs ingest] enumerated {len(entries)} file(s), "
+        f"{total_bytes} bytes ({total_bytes / 1e9:.2f} GB)")
+    if manifest_path is not None:
+        write_fleaven_manifest(manifest_path, entries)
+        log(f"[refs ingest] manifest written: {manifest_path}")
+    return entries
 
 
 @dataclass
@@ -468,6 +678,9 @@ def ingest_source(
     no_preview: bool = False,
     root: Optional[Path] = None,
     robot: str = "g1",
+    full_tree: bool = False,
+    manifest_path: Optional[Path] = None,
+    refresh_manifest: bool = False,
     progress: Optional[Callable[[str], None]] = None,
 ) -> IngestSummary:
     """Download + ingest a batch from one dataset source (§decision 9).
@@ -476,17 +689,34 @@ def ingest_source(
     render per accepted clip/segment via `sculptor.refs.preview`
     (§decision 8) — never blocks or fails ingest; `no_preview=True`
     skips preview generation entirely (also the automatic fallback when
-    the preview module isn't importable or GL/EGL is unavailable)."""
+    the preview module isn't importable or GL/EGL is unavailable).
+
+    `full_tree=False` (default) is BYTE-IDENTICAL to the pre-existing
+    behavior: a single-page `_hf_list_files` listing. `full_tree=True`
+    (fleaven-g1 only) instead walks every page of the HF tree API via
+    `load_or_build_fleaven_manifest` — the complete `g1/**/*.npy` file
+    list — optionally reusing/writing a manifest at `manifest_path`.
+    `filter_glob`/`limit` apply identically on top of either file list."""
     if source not in _SOURCES:
         raise ValueError(f"unknown source {source!r}; expected one of {_SOURCES}")
     log = progress or (lambda _msg: None)
     repo = LAFAN1_REPO if source == "lafan1-g1" else FLEAVEN_REPO
-    listing_path = "g1"
-    files = _hf_list_files(repo, listing_path)
-    if source == "lafan1-g1":
-        files = [f for f in files if f.endswith(".csv")]
+
+    if full_tree:
+        if source != "fleaven-g1":
+            raise ValueError(
+                f"full_tree=True is only supported for source='fleaven-g1' "
+                f"(got {source!r})")
+        entries = load_or_build_fleaven_manifest(
+            manifest_path, refresh=refresh_manifest, progress=progress)
+        files = [e["path"] for e in entries]
     else:
-        files = [f for f in files if f.endswith(".npy")]
+        listing_path = "g1"
+        files = _hf_list_files(repo, listing_path)
+        if source == "lafan1-g1":
+            files = [f for f in files if f.endswith(".csv")]
+        else:
+            files = [f for f in files if f.endswith(".npy")]
     if filter_glob:
         import fnmatch
 
