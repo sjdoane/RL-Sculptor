@@ -620,6 +620,62 @@ def derive_reference_reset(clip: dict) -> dict:
     return derived
 
 
+def derive_eval_reset(clip: dict) -> dict | None:
+    """Stage-FIXED, deterministic eval-rollout reset override for
+    get-up-archetype clips (§REFERENCE_TRAJECTORY_PLAN §8, D17).
+
+    `derive_reference_reset` (above) produces TRAIN-only RSI *ranges* —
+    curriculum the diagnoser may iterate between iterations, applied via
+    `_apply_env_spec(..., train=True, ...)` and deliberately NEVER seen
+    by rollout evaluation (`_cmd_rollout` calls `_apply_env_spec(...,
+    train=False, ...)` on purpose — diagnoser-iterable train knobs must
+    not leak into eval or per-iteration fitness becomes incomparable
+    across iterations).
+
+    For a get-up stage this creates a real gap: eval rollouts fall back
+    to the task's default (standing) reset, so the certified lying-start
+    metric ends up scoring rollouts that never actually lie down — the
+    reset the metric was written to measure recovery FROM never happens
+    in evaluation. For a get-up task, the lying start IS the task
+    definition, not curriculum, so it belongs in eval too — but as a
+    single FIXED reset, decoupled from the diagnoser-iterable train
+    ranges, so per-iteration fitness stays comparable (nothing here is
+    something the diagnoser can move).
+
+    Returns a deterministic payload — the MIDPOINT of each derived reset
+    range (height offset, pitch, roll), zero vertical velocity (a
+    resting lying start, not a falling one), the clip's own
+    `reset_joint_pos_target` unchanged when present, zero joint-pos
+    noise (no per-episode variation — eval must be reproducible), and
+    `fell_over_termination: False` (the lying start would otherwise trip
+    it, exactly as it does in train). `None` for non-get-up archetypes
+    (airborne/other) — jump and other eval stays standing-start,
+    unchanged behavior; a jump task's evaluation start was never in
+    question.
+    """
+    if _archetype(clip) != "getup":
+        return None
+    full = derive_reference_reset(clip)
+
+    def _mid(key: str) -> float:
+        lo, hi = full[key]
+        return round((float(lo) + float(hi)) / 2.0, 4)
+
+    payload: dict[str, Any] = {
+        "reset_height_offset_m": _mid("reset_height_offset_m"),
+        "reset_vertical_velocity_mps": 0.0,
+        "fell_over_termination": False,
+    }
+    if "reset_pitch_offset_rad" in full:
+        payload["reset_pitch_offset_rad"] = _mid("reset_pitch_offset_rad")
+    if "reset_roll_offset_rad" in full:
+        payload["reset_roll_offset_rad"] = _mid("reset_roll_offset_rad")
+    if "reset_joint_pos_target" in full:
+        payload["reset_joint_pos_target"] = list(full["reset_joint_pos_target"])
+        payload["reset_joint_pos_noise_rad"] = 0.0
+    return payload
+
+
 def apply_reference_rsi(env_dir: Path | str, clip: dict) -> Path:
     """Persist the clip-derived RSI curriculum as the next validated
     env-spec version (train scope only; the frozen shared/eval section

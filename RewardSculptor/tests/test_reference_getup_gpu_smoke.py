@@ -173,3 +173,95 @@ def test_getup_rsi_env_reset_is_actually_lying(tmp_path: Path) -> None:
             "termination) is still firing on the reference reset itself")
     finally:
         env.close()
+
+
+@pytest.mark.gpu
+def test_getup_eval_reset_env_reset_is_lying_and_deterministic(
+    tmp_path: Path,
+) -> None:
+    """§D17: the EVAL-side path — build the env the way `_cmd_rollout`
+    does (shared-only `_apply_env_spec(train=False)`, which on its own
+    would reset STANDING for a get-up stage) then layer
+    `_apply_eval_reset` with `derive_eval_reset`'s payload on top, and
+    confirm the OBSERVED reset is actually lying — closing the exact
+    gap D17 exists to fix (eval previously never saw the get-up start
+    at all). Also confirms determinism: two resets of the same env
+    produce the SAME root height/orientation (no per-episode noise —
+    `derive_eval_reset` forces `reset_joint_pos_noise_rad: 0.0` and a
+    single-point pose_range), within a small numerical tolerance."""
+    import torch
+
+    from mjlab.envs.manager_based_rl_env import ManagerBasedRlEnv
+    from mjlab.tasks.registry import load_env_cfg
+
+    from sculptor.adapters._mjlab_runner import _apply_env_spec, _apply_eval_reset
+    from sculptor.reference import derive_eval_reset
+
+    task_id = "Mjlab-Velocity-Flat-Unitree-G1"
+    clip = _make_synthetic_getup_clip()
+    eval_reset = derive_eval_reset(clip)
+    assert eval_reset is not None
+    assert eval_reset["reset_joint_pos_noise_rad"] == 0.0
+
+    env_cfg = load_env_cfg(task_id)
+    env_cfg.scene.num_envs = 4
+    # Shared-only base — exactly `_cmd_rollout`'s call, spec=None means
+    # task defaults (standing-start) with nothing get-up-shaped in it.
+    _apply_env_spec(env_cfg, None, train=False, task_id=task_id)
+    _apply_eval_reset(env_cfg, eval_reset, task_id=task_id)
+    assert "fell_over" not in env_cfg.terminations, (
+        "fell_over termination still present after eval-reset override — "
+        "the lying start would trip it at reset")
+
+    env = ManagerBasedRlEnv(cfg=env_cfg, device="cuda:0")
+    try:
+        heights_by_reset = []
+        quats_by_reset = []
+        for _ in range(2):
+            env.reset()
+            asset = env.scene["robot"]
+            root_state = asset.data.root_link_pose_w
+            heights_by_reset.append(
+                root_state[:, 2].detach().cpu().numpy().copy())
+            quats_by_reset.append(
+                root_state[:, 3:7].detach().cpu().numpy().copy())
+
+        for heights in heights_by_reset:
+            assert (heights < 0.35).all(), (
+                f"eval reset root height not low enough for a lying "
+                f"get-up start: {heights}")
+        for quats in quats_by_reset:
+            pitches = [abs(_quat_wxyz_to_pitch_rad(q)) for q in quats]
+            assert all(p > 1.0 for p in pitches), (
+                f"eval reset pitch magnitude not large enough for a "
+                f"lying get-up start: {pitches}")
+
+        # Determinism: same fixed reset every time, zero noise — height
+        # and PITCH (the get-up-relevant axis this override actually
+        # fixes) must agree within a tight numerical tolerance across
+        # resets. Yaw is deliberately NOT part of the eval-reset payload
+        # (derive_eval_reset only ever emits pitch/roll — a get-up
+        # start's defining axes) — mjlab's default reset_base still
+        # randomizes it, so raw quaternion equality is the wrong check
+        # here; comparing the derived pitch angle isolates the axis this
+        # override actually controls.
+        np.testing.assert_allclose(
+            heights_by_reset[0], heights_by_reset[1], atol=1e-4,
+            err_msg="eval reset height not deterministic across resets")
+        pitches_0 = [abs(_quat_wxyz_to_pitch_rad(q)) for q in quats_by_reset[0]]
+        pitches_1 = [abs(_quat_wxyz_to_pitch_rad(q)) for q in quats_by_reset[1]]
+        np.testing.assert_allclose(
+            pitches_0, pitches_1, atol=1e-2,
+            err_msg="eval reset pitch not deterministic across resets")
+
+        # §step-0 sanity: zero-action step must not terminate every env
+        # (same LIVE-FAILURE guard as the train-side test above).
+        n_actions = env.action_manager.total_action_dim
+        zero_action = torch.zeros(
+            (env_cfg.scene.num_envs, n_actions), device=env.device)
+        _obs, _rew, terminated, _truncated, _extras = env.step(zero_action)
+        assert not bool(terminated.all()), (
+            "all environments terminated on the very first eval step "
+            "from a get-up lying reset")
+    finally:
+        env.close()

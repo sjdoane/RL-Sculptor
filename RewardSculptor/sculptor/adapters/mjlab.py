@@ -278,6 +278,19 @@ class MjlabAdapter(SculptorAdapter):
     # content is re-read by each train/rollout subprocess, so the sculpt
     # loop can iterate the train section between iterations.
     env_spec_path: str = ""
+    # §D17: path to a stage-FIXED eval-rollout reset override JSON
+    # (`sculptor.reference.derive_eval_reset`'s payload, written once at
+    # stage-scaffold time to `env/eval_reset.json`). Applied ONLY to
+    # rollout evaluation, AFTER the existing shared-only `_apply_env_spec`
+    # — a small allowlisted set of reset keys (height/pitch/roll collapsed
+    # to a single deterministic value, zero reset velocity/noise,
+    # fell_over_termination popped), NEVER the diagnoser-iterable
+    # `env_spec_path` train section. Injected by `load_adapter` when the
+    # project has `env/eval_reset.json`, same convention as
+    # `env_spec_path` above. Empty (default) = today's behavior, byte-
+    # identical (eval resets standing-start on every task, get-up stages
+    # included).
+    eval_reset_path: str = ""
     rsl_rl_kwargs: dict[str, Any] = field(default_factory=dict)
     # Optional override for the schema keys emitted by the reward-term
     # state snapshot. If empty, derived from task_id via _schema_for_task.
@@ -336,6 +349,31 @@ class MjlabAdapter(SculptorAdapter):
             # spawn time (after a cwd change) could validate one file
             # and hand the subprocess another.
             self.env_spec_path = str(Path(self.env_spec_path).resolve())
+
+        # §D17: fail fast on a missing/invalid eval-reset override — same
+        # discipline as env_spec_path above. This file is a plain JSON
+        # dict of allowlisted reset keys (not an env-spec document), so
+        # validation here is just "readable, parses as a JSON object";
+        # the runner validates individual key shapes when it applies them.
+        if self.eval_reset_path:
+            p = Path(self.eval_reset_path)
+            try:
+                payload = json.loads(p.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as e:
+                raise ValueError(
+                    f"eval_reset_path unreadable at "
+                    f"{self.eval_reset_path!r}: {type(e).__name__}: {e}"
+                ) from e
+            if not isinstance(payload, dict):
+                raise ValueError(
+                    f"eval_reset_path={self.eval_reset_path!r} must "
+                    f"contain a JSON object, got {type(payload).__name__}"
+                )
+            # Pin the path NOW — same rationale as env_spec_path (a
+            # relative path resolved again at spawn time, after a cwd
+            # change, could validate one file and hand the subprocess
+            # another).
+            self.eval_reset_path = str(p.resolve())
 
         # num_envs autocap on smaller VRAM. Skipped when remote dispatch
         # is enabled — the local VRAM probe measures the wrong GPU (the
@@ -808,6 +846,8 @@ class MjlabAdapter(SculptorAdapter):
             cmd += ["--env-spec", str(Path(self.env_spec_path).resolve())]
         elif self.env_profile:
             cmd += ["--env-profile", self.env_profile]
+        if self.eval_reset_path:
+            cmd += ["--eval-reset", str(Path(self.eval_reset_path).resolve())]
 
         executor = self._remote_executor()
         if executor is not None and executor.cfg.rollout_remote:
@@ -843,6 +883,8 @@ class MjlabAdapter(SculptorAdapter):
                 "--checkpoint-path": checkpoint_path}
             if self.env_spec_path:
                 rollout_inputs["--env-spec"] = Path(self.env_spec_path).resolve()
+            if self.eval_reset_path:
+                rollout_inputs["--eval-reset"] = Path(self.eval_reset_path).resolve()
             job = RunnerJob(
                 subcommand="rollout",
                 options=options,

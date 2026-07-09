@@ -4625,6 +4625,41 @@ def _run_one_stage(
                     "env_spec": str(spec_path),
                     "stage_clip_load_error": clip_load_error,
                 })
+                # §D17: stage-FIXED eval-rollout reset override, written
+                # ONCE at scaffold time (same point as the train-only RSI
+                # above), decoupled from the diagnoser-iterable env-spec
+                # train section — see `reference.derive_eval_reset`'s
+                # docstring for the full rationale. Non-None only for
+                # get-up-archetype clips; jump/other stages get None and
+                # this is a pure no-op (eval stays standing-start,
+                # unchanged behavior). Failure here is non-fatal — the
+                # RSI curriculum above already applied; a missing
+                # eval_reset.json just means eval falls back to today's
+                # standing-start behavior for this stage.
+                try:
+                    from sculptor.reference import derive_eval_reset
+
+                    eval_reset = derive_eval_reset(clip)
+                    if eval_reset is not None:
+                        eval_reset_path = stage_env_dir / "eval_reset.json"
+                        stage_env_dir.mkdir(parents=True, exist_ok=True)
+                        eval_reset_path.write_text(
+                            json.dumps(eval_reset, indent=2, sort_keys=True),
+                            encoding="utf-8",
+                        )
+                        emit({
+                            "type": "stage_eval_reset_written",
+                            "stage_name": stage.name,
+                            "clip": clip_src,
+                            "eval_reset": eval_reset,
+                            "path": str(eval_reset_path),
+                        })
+                except Exception as e:  # noqa: BLE001 — advisory, never fatal
+                    emit({
+                        "type": "stage_eval_reset_failed",
+                        "stage_name": stage.name,
+                        "error": f"{type(e).__name__}: {e}",
+                    })
         except Exception as e:  # noqa: BLE001 — curriculum, not correctness
             emit({
                 "type": "stage_reference_rsi_failed",

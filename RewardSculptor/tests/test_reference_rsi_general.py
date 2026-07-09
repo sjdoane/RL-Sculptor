@@ -41,6 +41,7 @@ import pytest
 from sculptor.env_spec import validate_env_spec
 from sculptor.reference import (
     apply_reference_rsi,
+    derive_eval_reset,
     derive_reference_reset,
     derive_rsi_train_keys,
     load_clip,
@@ -334,6 +335,74 @@ def test_apply_reference_rsi_airborne_omits_fell_over_termination(
     spec = json.loads(path.read_text(encoding="utf-8"))
     assert validate_env_spec(spec) == []
     assert "fell_over_termination" not in spec["train"]
+
+
+# ── §D17: derive_eval_reset — stage-fixed, deterministic eval override ──
+def test_derive_eval_reset_getup_returns_midpoint_payload() -> None:
+    """A minimal (no quat/joints) get-up clip: height offset is the
+    MIDPOINT of the train-side range, vertical velocity is exactly
+    zero (not just near-zero — eval must be deterministic), and
+    fell_over_termination is disabled (the fixed lying start would
+    otherwise trip it, exactly as it does in train)."""
+    clip = _make_getup_clip()
+    full = derive_reference_reset(clip)
+    eval_reset = derive_eval_reset(clip)
+    assert eval_reset is not None
+    lo, hi = full["reset_height_offset_m"]
+    assert eval_reset["reset_height_offset_m"] == round((lo + hi) / 2.0, 4)
+    assert eval_reset["reset_vertical_velocity_mps"] == 0.0
+    assert eval_reset["fell_over_termination"] is False
+    # No orientation/joint keys — the clip carries no quat/joint_pos.
+    assert "reset_pitch_offset_rad" not in eval_reset
+    assert "reset_joint_pos_target" not in eval_reset
+
+
+def test_derive_eval_reset_getup_with_quat_and_joints() -> None:
+    """Full-channel get-up clip: pitch/roll collapse to their train-side
+    midpoints, the joint target is passed through UNCHANGED (the clip's
+    own reference posture — nothing to average, it's already a single
+    vector), and joint-pos noise is forced to exactly zero (eval must be
+    reproducible across resets, no per-episode variation)."""
+    clip = _make_getup_clip(with_quat=True, with_joints=True)
+    full = derive_reference_reset(clip)
+    eval_reset = derive_eval_reset(clip)
+    assert eval_reset is not None
+    p_lo, p_hi = full["reset_pitch_offset_rad"]
+    assert eval_reset["reset_pitch_offset_rad"] == round(
+        (p_lo + p_hi) / 2.0, 4)
+    r_lo, r_hi = full["reset_roll_offset_rad"]
+    assert eval_reset["reset_roll_offset_rad"] == round(
+        (r_lo + r_hi) / 2.0, 4)
+    assert eval_reset["reset_joint_pos_target"] == full["reset_joint_pos_target"]
+    assert eval_reset["reset_joint_pos_noise_rad"] == 0.0
+
+
+def test_derive_eval_reset_airborne_clip_returns_none() -> None:
+    """Jump eval must stay standing-start — unchanged behavior. A jump
+    (or any non-get-up) clip's task definition is not "start airborne";
+    the lying-start override is get-up-specific."""
+    from sculptor.reference import make_procedural_jump_clip
+
+    clip = make_procedural_jump_clip()
+    assert derive_eval_reset(clip) is None
+
+
+def test_derive_eval_reset_other_clip_returns_none() -> None:
+    """A clip that is neither jump- nor get-up-shaped: no eval override
+    (mirrors derive_rsi_train_keys's "other" archetype — no RSI states
+    to initialize from at all, so certainly no eval override either)."""
+    clip = _make_never_rising_never_low_clip()
+    assert derive_eval_reset(clip) is None
+
+
+def test_derive_eval_reset_deterministic_across_calls() -> None:
+    """Same clip in, same payload out, every call — the whole point of a
+    stage-FIXED override (§D17: "same payload every iteration of the
+    stage by construction")."""
+    clip = _make_getup_clip(with_quat=True, with_joints=True)
+    a = derive_eval_reset(clip)
+    b = derive_eval_reset(clip)
+    assert a == b
 
 
 # ── Never-rising, never-low clips: unchanged garbage-input behavior ──────

@@ -507,6 +507,92 @@ def test_applier_tolerates_partial_cfg() -> None:
         SimpleNamespace(commands={}, terminations={}), full, train=True)
 
 
+# ── §D17: _apply_eval_reset — stage-fixed eval-rollout reset override ──────
+def test_apply_eval_reset_writes_midpoint_pose_range() -> None:
+    """Height/pitch/roll each collapse to a SINGLE deterministic
+    (lo, hi) == (v, v) pair — not a train-style range — and vertical
+    velocity is likewise pinned to exactly zero."""
+    cfg = _fake_cfg_full()
+    payload = {
+        "reset_height_offset_m": -0.65,
+        "reset_vertical_velocity_mps": 0.0,
+        "reset_pitch_offset_rad": 1.5708,
+        "reset_roll_offset_rad": 0.0,
+    }
+    _mjlab_runner._apply_eval_reset(cfg, payload)
+    pose_range = cfg.events["reset_base"].params["pose_range"]
+    assert pose_range["z"] == (-0.65, -0.65)
+    assert pose_range["pitch"] == pytest.approx((1.5708, 1.5708))
+    assert pose_range["roll"] == (0.0, 0.0)
+    vr = cfg.events["reset_base"].params["velocity_range"]
+    assert vr["z"] == (0.0, 0.0)
+
+
+def test_apply_eval_reset_injects_joint_target_with_zero_noise() -> None:
+    """The joint-posture reset event is injected exactly like the train
+    path's, but with `joint_pos_noise` forced to whatever the payload
+    says (derive_eval_reset always emits 0.0 — reproducible eval)."""
+    pytest.importorskip("mjlab")
+    cfg = _fake_cfg_full()
+    payload = {
+        "reset_joint_pos_target": [0.1, -0.2, 0.3],
+        "reset_joint_pos_noise_rad": 0.0,
+    }
+    _mjlab_runner._apply_eval_reset(
+        cfg, payload, task_id="Mjlab-Velocity-Flat-3dof-Testbot")
+    ev = cfg.events["reset_robot_joints_to_reference"]
+    assert ev.mode == "reset"
+    assert list(ev.params["joint_pos_target"].tolist()) == pytest.approx(
+        [0.1, -0.2, 0.3])
+    assert ev.params["joint_pos_noise"] == pytest.approx(0.0)
+
+
+def test_apply_eval_reset_joint_target_length_mismatch_skips() -> None:
+    """Same defensive contract as the train-side joint-target injection:
+    a length mismatch against the robot's canonical joint count is a
+    clear skip, never a silent misassignment."""
+    pytest.importorskip("mjlab")
+    cfg = _fake_cfg_full()
+    payload = {"reset_joint_pos_target": [0.1, -0.2, 0.3]}
+    _mjlab_runner._apply_eval_reset(
+        cfg, payload, task_id="Mjlab-Velocity-Flat-Unitree-G1")
+    assert "reset_robot_joints_to_reference" not in cfg.events
+
+
+def test_apply_eval_reset_removes_fell_over_termination() -> None:
+    cfg = _fake_cfg_full()
+    _mjlab_runner._apply_eval_reset(
+        cfg, {"fell_over_termination": False})
+    assert "fell_over" not in cfg.terminations
+
+
+def test_apply_eval_reset_absent_payload_is_byte_identical_noop() -> None:
+    """None and {} must leave the cfg completely untouched — the default
+    (every non-get-up stage) and the documented no-arg contract."""
+    for payload in (None, {}):
+        cfg = _fake_cfg_full()
+        before_pose = dict(cfg.events["reset_base"].params["pose_range"])
+        before_terms = dict(cfg.terminations)
+        _mjlab_runner._apply_eval_reset(cfg, payload)
+        assert cfg.events["reset_base"].params["pose_range"] == before_pose
+        assert cfg.terminations.keys() == before_terms.keys()
+        assert "reset_robot_joints_to_reference" not in cfg.events
+
+
+def test_apply_eval_reset_tolerates_partial_cfg() -> None:
+    """Defensive per-mutation contract, same as `_apply_env_spec` —
+    a cfg missing every touched surface must not raise."""
+    payload = {
+        "reset_height_offset_m": -0.5,
+        "reset_pitch_offset_rad": 1.2,
+        "reset_joint_pos_target": [0.1, 0.2],
+        "fell_over_termination": False,
+    }
+    _mjlab_runner._apply_eval_reset(SimpleNamespace(), payload)
+    _mjlab_runner._apply_eval_reset(
+        SimpleNamespace(events={}, terminations={}), payload)
+
+
 # ── Runner-side resolution ─────────────────────────────────────────────────
 def _args(**kw) -> argparse.Namespace:
     return argparse.Namespace(**{"env_spec": "", "env_profile": "", **kw})
@@ -621,3 +707,78 @@ def test_load_adapter_injects_project_env_spec(tmp_path) -> None:
     (tmp_path / "env" / "current.json").unlink()
     adapter2 = load_adapter(tmp_path / "config.toml")
     assert adapter2.env_spec_path == ""
+
+
+# ── §D17: eval_reset_path threading (adapter cmd + loader convention) ──────
+def _write_valid_eval_reset(path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "reset_height_offset_m": -0.65,
+        "reset_vertical_velocity_mps": 0.0,
+        "fell_over_termination": False,
+    }))
+
+
+def test_adapter_rejects_invalid_eval_reset_at_init(tmp_path) -> None:
+    pytest.importorskip("mjlab")
+    from sculptor.adapters.mjlab import MjlabAdapter
+
+    bad = tmp_path / "bad.json"
+    bad.write_text("not json{{{")
+    with pytest.raises(ValueError, match="unreadable"):
+        MjlabAdapter(task_id="Mjlab-Velocity-Flat-Unitree-Go1",
+                     eval_reset_path=str(bad))
+    with pytest.raises(ValueError, match="unreadable"):
+        MjlabAdapter(task_id="Mjlab-Velocity-Flat-Unitree-Go1",
+                     eval_reset_path=str(tmp_path / "missing.json"))
+    not_obj = tmp_path / "list.json"
+    not_obj.write_text(json.dumps([1, 2, 3]))
+    with pytest.raises(ValueError, match="JSON object"):
+        MjlabAdapter(task_id="Mjlab-Velocity-Flat-Unitree-Go1",
+                     eval_reset_path=str(not_obj))
+
+
+def test_rollout_passes_eval_reset_flag(tmp_path) -> None:
+    """`--eval-reset` is only ever passed to ROLLOUT (there is no train
+    equivalent — this is an eval-only override by construction)."""
+    pytest.importorskip("mjlab")
+    reset_path = tmp_path / "eval_reset.json"
+    _write_valid_eval_reset(reset_path)
+    cmd = _spawn_capture(
+        {"eval_reset_path": str(reset_path)}, tmp_path, mode="rollout")
+    assert "--eval-reset" in cmd
+    assert cmd[cmd.index("--eval-reset") + 1] == str(reset_path.resolve())
+
+
+def test_train_never_receives_eval_reset_flag(tmp_path) -> None:
+    pytest.importorskip("mjlab")
+    reset_path = tmp_path / "eval_reset.json"
+    _write_valid_eval_reset(reset_path)
+    cmd = _spawn_capture(
+        {"eval_reset_path": str(reset_path)}, tmp_path, mode="train")
+    assert "--eval-reset" not in cmd
+
+
+def test_rollout_without_eval_reset_path_omits_flag(tmp_path) -> None:
+    pytest.importorskip("mjlab")
+    cmd = _spawn_capture({}, tmp_path, mode="rollout")
+    assert "--eval-reset" not in cmd
+
+
+def test_load_adapter_injects_project_eval_reset(tmp_path) -> None:
+    pytest.importorskip("mjlab")
+    from sculptor.adapters.base import load_adapter
+
+    (tmp_path / "config.toml").write_text(
+        '[adapter]\n'
+        'class = "sculptor.adapters.mjlab.MjlabAdapter"\n'
+        'config = { task_id = "Mjlab-Velocity-Flat-Unitree-Go1", '
+        'num_envs = 64 }\n')
+    _write_valid_eval_reset(tmp_path / "env" / "eval_reset.json")
+    adapter = load_adapter(tmp_path / "config.toml")
+    assert adapter.eval_reset_path == str(
+        (tmp_path / "env" / "eval_reset.json").resolve())
+    # Without the file: nothing injected (byte-identical old behavior).
+    (tmp_path / "env" / "eval_reset.json").unlink()
+    adapter2 = load_adapter(tmp_path / "config.toml")
+    assert adapter2.eval_reset_path == ""

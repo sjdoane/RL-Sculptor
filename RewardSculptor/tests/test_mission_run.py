@@ -3164,6 +3164,14 @@ def test_stage_reference_rsi_applied_when_flagged(
     assert spec.get("shared") in ({}, None) or "reset_height_offset_m" \
         not in (spec.get("shared") or {})
 
+    # §D17: the procedural jump clip is AIRBORNE-archetype, not get-up —
+    # derive_eval_reset returns None for it, so no eval_reset.json and
+    # no stage_eval_reset_written event. Eval stays standing-start,
+    # unchanged behavior for jump stages.
+    assert not (env_dir / "eval_reset.json").is_file()
+    assert not [e for e in events
+                if e["type"] == "stage_eval_reset_written"]
+
     # Resume: run again; still exactly one env version (idempotent).
     events2: list[dict] = []
     m2_dir = Path(m.mission_dir)
@@ -3246,6 +3254,71 @@ def test_stage_reference_clip_id_wins_over_project_jump_clip(
     # The get-up clip's own signature: a non-positive height offset —
     # the jump clip's would be non-negative.
     assert spec["train"]["reset_height_offset_m"][1] <= 0.0
+
+
+def test_stage_eval_reset_written_for_getup_stage(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """§D17: a get-up stage's scaffold ALSO writes a stage-fixed
+    `env/eval_reset.json` (the reference-derived lying start, decoupled
+    from the diagnoser-iterable train section) and emits
+    `stage_eval_reset_written` — same scaffold point as
+    `stage_reference_rsi_applied`, exactly once (resume-idempotent via
+    the same `already`-source guard)."""
+    from sculptor import sculpt as sculpt_mod
+
+    lib_root = tmp_path / "reflib"
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(lib_root))
+    _write_library_clip(lib_root, "g1", "test_getup_clip")
+
+    m = _make_mission(tmp_path, n_stages=1)
+    m.stages[0].needs_reference_rsi = True
+    m.stages[0].reference_clip_id = "test_getup_clip"
+
+    fake = _fake_sculpt_run_factory(metric=0.9)
+    monkeypatch.setattr(sculpt_mod, "sculpt_run", fake)
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
+    )
+
+    events: list[dict] = []
+    result = sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab", kg_store=None, on_event=events.append,
+    )
+    assert result.completed is True
+
+    written_events = [e for e in events
+                       if e["type"] == "stage_eval_reset_written"]
+    assert len(written_events) == 1
+    assert written_events[0]["clip"] == "library:g1/test_getup_clip"
+
+    env_dir = Path(m.mission_dir) / "stages" / "stage_0" / "env"
+    eval_reset_path = env_dir / "eval_reset.json"
+    assert eval_reset_path.is_file()
+    payload = json.loads(eval_reset_path.read_text())
+    assert payload["reset_vertical_velocity_mps"] == 0.0
+    assert payload["fell_over_termination"] is False
+    assert "reset_height_offset_m" in payload
+    # Deterministic single value (a midpoint), not a [lo, hi] range —
+    # the whole point of decoupling this from the train-iterable spec.
+    assert isinstance(payload["reset_height_offset_m"], (int, float))
+    assert written_events[0]["path"] == str(eval_reset_path.resolve())
+
+    # Resume: run again; the file is not rewritten and the event does
+    # not re-fire (same `already`-source idempotency as the RSI apply).
+    events2: list[dict] = []
+    m2_dir = Path(m.mission_dir)
+    from sculptor.mission import load_mission
+    m2 = load_mission(m2_dir)
+    m2.mission_dir = str(m2_dir)
+    mtime_before = eval_reset_path.stat().st_mtime_ns
+    sculpt_mod.mission_run(
+        m2, adapter_short_name="mjlab", kg_store=None,
+        on_event=events2.append,
+    )
+    assert eval_reset_path.stat().st_mtime_ns == mtime_before
+    assert not [e for e in events2
+                if e["type"] == "stage_eval_reset_written"]
 
 
 def test_stage_reference_clip_load_failure_falls_back_to_project_jump(

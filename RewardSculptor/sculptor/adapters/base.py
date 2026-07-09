@@ -371,6 +371,26 @@ def load_adapter(config_path: Path) -> SculptorAdapter:
                 init_kwargs = {
                     **init_kwargs, "env_spec_path": str(spec_file.resolve())}
 
+    # §D17: a stage-FIXED eval-rollout reset override at
+    # `env/eval_reset.json` (written once at stage-scaffold time by
+    # `sculpt.py`'s §JUMP_SCAFFOLD block via
+    # `sculptor.reference.derive_eval_reset`) activates by the SAME
+    # convention as env_spec_path above — injected into adapters that
+    # accept `eval_reset_path`, unless the config set one explicitly.
+    if "eval_reset_path" not in init_kwargs:
+        reset_file = config_path.parent / "env" / "eval_reset.json"
+        if reset_file.is_file():
+            import inspect
+
+            try:
+                params = inspect.signature(cls).parameters
+            except (TypeError, ValueError):
+                params = {}
+            if "eval_reset_path" in params:
+                init_kwargs = {
+                    **init_kwargs,
+                    "eval_reset_path": str(reset_file.resolve())}
+
     instance = cls(**init_kwargs)
     if not isinstance(instance, SculptorAdapter):
         raise TypeError(

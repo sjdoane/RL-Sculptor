@@ -904,6 +904,121 @@ def _apply_env_spec(env_cfg: Any, spec: "dict | None", *,
           file=sys.stderr, flush=True)
 
 
+def _apply_eval_reset(env_cfg: Any, payload: "dict | None", *,
+                       task_id: str = "") -> None:
+    """§D17: apply a stage-FIXED eval-rollout reset override — a small
+    ALLOWLISTED subset of `sculptor.reference.derive_eval_reset`'s
+    payload (single deterministic values, not train-iterable ranges).
+
+    Called from `_cmd_rollout` AFTER the existing shared-only
+    `_apply_env_spec(..., train=False, ...)` call, so it only ever adds
+    a fixed lying-start reset on top of the honest shared/eval task cfg
+    — it never reads or is influenced by the diagnoser-iterable
+    `env_spec.py` train section. Reuses the SAME cfg-mutation mechanisms
+    `_apply_env_spec` uses for train (pose_range height/pitch/roll,
+    the injected `reset_joints_to_reference` event, the `fell_over`
+    termination pop) so eval genuinely resets the way the derivation
+    promises — same code path, just fed a single midpoint value instead
+    of a [lo, hi] range. `None`/empty payload is a pure no-op (today's
+    standing-start behavior, byte-identical) — the common case for every
+    non-get-up stage.
+
+    Every mutation is defensive per-key (mirrors `_apply_env_spec`): a
+    cfg-shape drift skips that key with a warning, never breaks the
+    rollout. Announces what it actually wrote so the runner log makes a
+    reference-derived lying-start eval visible, not silent."""
+    if not payload:
+        return
+
+    def _skip(what: str, e: Exception) -> None:
+        print(f"[runner] eval-reset: {what} skipped: "
+              f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
+
+    applied: list[str] = []
+
+    z = payload.get("reset_height_offset_m")
+    vz = payload.get("reset_vertical_velocity_mps")
+    pitch = payload.get("reset_pitch_offset_rad")
+    roll = payload.get("reset_roll_offset_rad")
+    if z is not None or vz is not None or pitch is not None or roll is not None:
+        try:
+            reset = (getattr(env_cfg, "events", None) or {}).get("reset_base")
+            params = getattr(reset, "params", None)
+            if isinstance(params, dict):
+                wrote: list[str] = []
+                pose_range = params.get("pose_range")
+                if isinstance(pose_range, dict):
+                    if z is not None:
+                        pose_range["z"] = (float(z), float(z))
+                        wrote.append("z")
+                    if pitch is not None:
+                        pose_range["pitch"] = (float(pitch), float(pitch))
+                        wrote.append("pitch")
+                    if roll is not None:
+                        pose_range["roll"] = (float(roll), float(roll))
+                        wrote.append("roll")
+                if vz is not None:
+                    vr = params.get("velocity_range")
+                    if not isinstance(vr, dict):
+                        vr = {}
+                        params["velocity_range"] = vr
+                    vr["z"] = (float(vz), float(vz))
+                    wrote.append("vz")
+                if wrote:
+                    applied.append(f"reset_base→eval_reset({','.join(wrote)})")
+        except Exception as e:  # noqa: BLE001
+            _skip("eval reset pose/velocity", e)
+
+    jpt = payload.get("reset_joint_pos_target")
+    jpt_noise = payload.get("reset_joint_pos_noise_rad")
+    if jpt is not None:
+        try:
+            from sculptor.eval.robot_manifest import robot_joint_names
+
+            canonical = robot_joint_names(task_id)
+            if canonical is not None and len(jpt) != len(canonical):
+                raise ValueError(
+                    f"eval-reset reset_joint_pos_target has {len(jpt)} "
+                    f"elements but robot {task_id!r} has "
+                    f"{len(canonical)} joints ({canonical[:3]}...) — "
+                    f"refusing to apply a mismatched per-joint reset")
+            events = getattr(env_cfg, "events", None)
+            if isinstance(events, dict):
+                import torch
+
+                from mjlab.managers.event_manager import EventTermCfg
+                from mjlab.managers.scene_entity_config import SceneEntityCfg
+
+                target_t = torch.tensor(
+                    [float(x) for x in jpt], dtype=torch.float32)
+                events["reset_robot_joints_to_reference"] = EventTermCfg(
+                    func=reset_joints_to_reference,
+                    mode="reset",
+                    params={
+                        "joint_pos_target": target_t,
+                        "joint_pos_noise": float(jpt_noise or 0.0),
+                        "asset_cfg": SceneEntityCfg(
+                            "robot", joint_names=(".*",)),
+                    },
+                )
+                applied.append(
+                    f"events:+reset_robot_joints_to_reference"
+                    f"({len(jpt)} joints)")
+        except Exception as e:  # noqa: BLE001
+            _skip("eval reference joint-posture reset", e)
+
+    if payload.get("fell_over_termination") is False:
+        try:
+            terms = getattr(env_cfg, "terminations", None)
+            if isinstance(terms, dict) and terms.pop("fell_over", None) is not None:
+                applied.append("terminations:fell_over→removed")
+        except Exception as e:  # noqa: BLE001
+            _skip("eval fell_over removal", e)
+
+    print(f"[runner] eval reset: reference-derived lying start "
+          f"(stage-fixed): {applied}", file=sys.stderr, flush=True)
+
+
 def _apply_rl_spec(rl_cfg: Any, spec: "dict | None") -> None:
     """PPO exploration adjustment from the env spec's train section —
     `entropy_coef_scale` multiplies the task's default entropy bonus
@@ -1561,6 +1676,24 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
     # corrupted by mid-air spawns.
     _apply_env_spec(
         env_cfg, _resolve_env_spec(args), train=False, task_id=args.task_id)
+    # §D17: stage-FIXED eval-reset override — reference-derived lying
+    # start for get-up stages, applied ONLY here (never to training),
+    # AFTER the shared-only env-spec above and strictly ADDITIVE to it.
+    # Absent --eval-reset (the default, and every non-get-up stage) is a
+    # byte-identical no-op. See `_apply_eval_reset`'s docstring and
+    # `sculptor.reference.derive_eval_reset` for the full rationale.
+    _eval_reset_arg = getattr(args, "eval_reset", "") or ""
+    if _eval_reset_arg:
+        try:
+            _eval_reset_payload = json.loads(
+                Path(_eval_reset_arg).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            print(f"[runner] --eval-reset {_eval_reset_arg!r} unreadable "
+                  f"({type(e).__name__}: {e}) — ignored", file=sys.stderr,
+                  flush=True)
+            _eval_reset_payload = None
+        _apply_eval_reset(
+            env_cfg, _eval_reset_payload, task_id=args.task_id)
     # §Ship 35: textured floor in the rendered rollout (cosmetic, guarded).
     _apply_ground_texture(env_cfg)
     # 720p + no ghost neighbor envs in the background (cosmetic, guarded).
@@ -2233,6 +2366,21 @@ def main() -> None:
     # §RL_SCULPTOR_AUDIT §4.4: must match the train-side spec/profile.
     p_roll.add_argument("--env-profile", default="")
     p_roll.add_argument("--env-spec", default="")
+    # §D17: stage-FIXED eval-rollout reset override (a small allowlisted
+    # subset of reset keys — height/pitch/roll collapsed to a single
+    # deterministic midpoint value, zero reset velocity/noise,
+    # fell_over_termination popped). Applied AFTER the existing
+    # shared-only --env-spec (which never carries train-only RSI ranges
+    # into rollout). Absent (default) = today's behavior, byte-identical.
+    p_roll.add_argument(
+        "--eval-reset", default="",
+        help=(
+            "path to a JSON object of allowlisted eval-reset keys "
+            "(sculptor.reference.derive_eval_reset output). Applied to "
+            "rollout only, after --env-spec/--env-profile; never affects "
+            "training."
+        ),
+    )
     # Video resolution. 0 = the runner default (1280x720 — measured
     # resolution-INDEPENDENT render cost on the WSL2 path: 320x240 and
     # 1280x720 both ~200 ms/frame, so high-res is free).
