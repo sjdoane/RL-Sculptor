@@ -1719,5 +1719,85 @@ def refs_preview(
     typer.echo(f"[refs preview] wrote {out_path}")
 
 
+@refs_app.command("retarget")
+def refs_retarget(
+    source: Path = typer.Option(
+        ..., "--source", help="Motion source file (BVH or SMPL-X npz)."),
+    format_: str = typer.Option(
+        "bvh", "--format", help="Source format: bvh | smplx."),
+    robot: list[str] = typer.Option(
+        ..., "--robot",
+        help="Target robot library slug (repeatable), e.g. --robot g1 "
+             "--robot t1. See sculptor.refs.retarget.GMR_ROBOT_IDS for "
+             "the supported slugs."),
+    bvh_format: str = typer.Option(
+        "lafan1", "--bvh-format",
+        help="BVH bone-naming convention: lafan1 | nokov (bvh source only)."),
+    license_: str = typer.Option(
+        ..., "--license", help="License tag for the source clip (provenance)."),
+    attribution: str = typer.Option(
+        ..., "--attribution", help="Attribution string for the source clip."),
+    text: str = typer.Option("", "--text", help="Free-text label for retrieval."),
+    labels: Optional[str] = typer.Option(
+        None, "--labels", help="Comma-separated labels."),
+    roles: Optional[str] = typer.Option(
+        None, "--roles",
+        help="Comma-separated joint roles to verify resolution for (e.g. "
+             "'left_hip_pitch,right_hip_pitch'). Skipped if omitted."),
+    gmr_python: Optional[Path] = typer.Option(
+        None, "--gmr-python",
+        help="Path to GMR's venv python (default: ~/tools/GMR/.venv/bin/python)."),
+) -> None:
+    """Retarget ONE source motion clip to one or more robots via GMR
+    (cross-venv subprocess — see sculptor.refs.retarget), registering
+    each result in the reference library with retarget provenance. Also
+    attempts a best-effort preview render per clip (G1-only today —
+    sculptor.refs.preview resolves a G1 MJCF specifically; any other
+    robot logs a skip, never fails the run)."""
+    from sculptor.refs.retarget import (
+        RetargetError, attach_role_resolution_qc, retarget_and_register)
+    from sculptor.refs import library
+
+    label_list = [s.strip() for s in labels.split(",") if s.strip()] if labels else []
+    role_list = [s.strip() for s in roles.split(",") if s.strip()] if roles else []
+
+    for r in robot:
+        typer.echo(f"[refs retarget] {source} -> robot={r} (format={format_})")
+        try:
+            lc = retarget_and_register(
+                source, format_, r,
+                license_=license_, attribution=attribution, text=text,
+                labels=label_list, gmr_python=gmr_python, bvh_format=bvh_format)
+        except RetargetError as e:
+            typer.echo(f"[refs retarget] FAILED for robot={r}: {e}", err=True)
+            continue
+        typer.echo(
+            f"[refs retarget] registered {lc.clip_id} "
+            f"(robot={lc.robot}, npz={lc.clip_path})")
+
+        if role_list:
+            summary = attach_role_resolution_qc(r, lc.clip_id, role_list)
+            status = "OK" if summary["ok"] else "FAILED"
+            typer.echo(f"[refs retarget] role resolution {status}: {summary}")
+
+        try:
+            from sculptor.reference import load_clip
+            from sculptor.refs.preview import PreviewUnavailable, render_preview_png
+
+            clip = load_clip(lc.clip_path)
+            out_path = library.clip_dir(r, lc.clip_id) / library.PREVIEW_FILENAME
+            render_preview_png(clip, out_path)
+            typer.echo(f"[refs retarget] preview written: {out_path}")
+        except PreviewUnavailable as e:
+            typer.echo(f"[refs retarget] preview unavailable for robot={r}: {e}")
+        except Exception as e:  # noqa: BLE001 — preview must never fail the run
+            typer.echo(
+                f"[refs retarget] preview skipped for robot={r}: "
+                f"{type(e).__name__}: {e}")
+
+    rows = library.rebuild_index()
+    typer.echo(f"[refs retarget] index_rows={len(rows)}")
+
+
 if __name__ == "__main__":  # pragma: no cover
     app()
