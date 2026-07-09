@@ -821,6 +821,25 @@ def _apply_env_spec(env_cfg: Any, spec: "dict | None", *,
         except Exception as e:  # noqa: BLE001
             _skip("friction randomization", e)
 
+    # §get-up RSI fix (2026-07-09): a lying-start reset (large pitch/roll
+    # offset from upright) trips the task's own fell-over/bad-orientation
+    # termination on the reset itself — observed live: ALL envs terminate
+    # at step 0 (Episode_Termination/fell_over = num_envs), so get-up
+    # training never runs. `fell_over_termination: False` removes that
+    # term for TRAIN only; the sunk-height termination + episode time_out
+    # remain the episode enders. Term-name confirmed at the
+    # `orientation_termination_deg` site above ("fell_over"); mjlab's
+    # `terminations` cfg is a plain dict (same mechanism the `sunk`
+    # injection below relies on), so removal is a plain `.pop()`.
+    fell_over_off = train_sec.get("fell_over_termination") is False
+    if fell_over_off:
+        try:
+            terms = getattr(env_cfg, "terminations", None)
+            if isinstance(terms, dict) and terms.pop("fell_over", None) is not None:
+                applied.append("terminations:fell_over→removed")
+        except Exception as e:  # noqa: BLE001
+            _skip("fell_over removal", e)
+
     sunk = train_sec.get("min_base_height_termination_m")
     if sunk is not None:
         # Early termination off the recoverable manifold — RSI's required
@@ -873,6 +892,8 @@ def _apply_env_spec(env_cfg: Any, spec: "dict | None", *,
         requested.append("events:+reset_robot_joints_to_reference")
     if fr is not None:
         requested.append("events:foot_friction")
+    if fell_over_off:
+        requested.append("terminations:fell_over→removed")
     if sunk is not None:
         requested.append("terminations:+sunk")
     dead = [r for r in requested

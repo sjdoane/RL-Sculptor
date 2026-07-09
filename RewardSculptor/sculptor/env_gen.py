@@ -83,6 +83,14 @@ class _TrainModel(BaseModel):
     # in practice (see sculptor/reference.py), not LLM-generated today.
     reset_joint_pos_target: Optional[list[float]] = None
     reset_joint_pos_noise_rad: Optional[float] = None
+    # Disables the task's standard fell-over/bad-orientation termination
+    # for TRAIN only (§ get-up RSI fix, 2026-07-09) — a lying-start
+    # reset trips that termination on itself, killing get-up training
+    # before it can begin. Schema field-parity only (like the orientation
+    # keys above): reference-clip-derived in practice (see
+    # sculptor/reference.py's get-up branch), not something the LLM
+    # invents from a behavior goal alone.
+    fell_over_termination: Optional[bool] = None
     min_base_height_termination_m: Optional[float] = None
     friction_range: Optional[list[float]] = None
     entropy_coef_scale: Optional[float] = None

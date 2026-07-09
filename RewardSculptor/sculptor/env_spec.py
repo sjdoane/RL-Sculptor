@@ -106,6 +106,20 @@ _JOINT_TARGET_ELEMENT_BOUNDS = (-6.4, 6.4)   # generous; true joint limits
                                               # clamp at apply time.
 _JOINT_TARGET_MAX_LEN = 64
 _TRAIN_JOINT_TARGET_KEYS = {"reset_joint_pos_target"}
+#: Boolean train-only switches. `fell_over_termination` (default True =
+#: today's behavior, i.e. the task's standard orientation/bad-pose
+#: termination stays active) — a GET-UP stage's lying reset (root
+#: pitched/rolled far from upright, e.g. |pitch| ~ pi/2) IS exactly what
+#: that termination is designed to detect as "fallen," so it fires on
+#: every env at reset and the episode never runs (observed live:
+#: Episode_Termination/fell_over = 2048.0 with all 2048 envs terminating
+#: at step 0). Setting this False lets the adapter remove that term for
+#: TRAIN only — rollout evaluation is unaffected (this key lives in
+#: `train`, never `shared`), and the sunk-height termination + episode
+#: time_out remain the episode enders. See
+#: `_mjlab_runner._apply_env_spec` for the removal mechanism and
+#: `reference.py`'s get-up branch for where this is derived.
+_TRAIN_BOOLS = {"fell_over_termination"}
 _PUSH_KEYS = {"enabled", "interval_s", "linear_mps", "angular_radps"}
 _PUSH_INTERVAL_ENVELOPE = (0.5, 30.0)
 _PUSH_LINEAR_MAX = 2.0
@@ -114,7 +128,7 @@ _PUSH_ANGULAR_MAX = 3.0
 _SHARED_KEYS = set(_SHARED_SCALARS) | {"zero_velocity_commands", "push_events"}
 _TRAIN_KEYS = (
     set(_TRAIN_SCALARS) | set(_TRAIN_RANGES) | _TRAIN_JOINT_TARGET_KEYS
-    | {"push_events"}
+    | _TRAIN_BOOLS | {"push_events"}
 )
 _TOP_KEYS = {"env_spec_version", "meta", "shared", "train"}
 
@@ -122,6 +136,7 @@ _TOP_KEYS = {"env_spec_version", "meta", "shared", "train"}
 #: iterations (everything in ``train``; ``shared`` is frozen per run).
 ITERABLE_TRAIN_KEYS: frozenset[str] = frozenset(
     set(_TRAIN_SCALARS) | set(_TRAIN_RANGES) | _TRAIN_JOINT_TARGET_KEYS
+    | _TRAIN_BOOLS
 )
 
 
@@ -248,6 +263,9 @@ def validate_env_spec(spec: Any) -> list[str]:
     for k in _TRAIN_JOINT_TARGET_KEYS:
         if k in train:
             _check_joint_target(f"train.{k}", train[k], errors)
+    for k in _TRAIN_BOOLS:
+        if k in train and not isinstance(train[k], bool):
+            errors.append(f"train.{k}: must be a boolean, got {train[k]!r}")
     if "push_events" in train:
         _check_push("train.push_events", train["push_events"], errors)
 

@@ -279,6 +279,63 @@ def test_joint_target_clamped_to_validator_element_bounds() -> None:
     assert lo <= derived["reset_joint_pos_target"][0] <= hi
 
 
+# ── fell_over_termination (§get-up RSI fix, 2026-07-09) ──────────────────
+def test_getup_derivation_disables_fell_over_termination() -> None:
+    """A get-up clip's lying start would trip the task's own
+    fell-over/bad-orientation termination on the reset itself — the
+    get-up branch must emit `fell_over_termination: False` regardless of
+    whether the clip also carries orientation/joint_pos channels (the
+    reset-height-offset alone is already lying-shaped)."""
+    clip = _make_getup_clip()   # no quat, no joints — minimal getup clip
+    derived = derive_reference_reset(clip)
+    assert derived["fell_over_termination"] is False
+
+
+def test_getup_derivation_disables_fell_over_termination_with_full_channels() -> None:
+    clip = _make_getup_clip(with_quat=True, with_joints=True)
+    derived = derive_reference_reset(clip)
+    assert derived["fell_over_termination"] is False
+
+
+def test_airborne_derivation_does_not_touch_fell_over_termination() -> None:
+    """Jump/airborne behavior must be byte-unchanged — no
+    `fell_over_termination` key at all (not even `True`), since the
+    validator's default (term stays active) is exactly what jump
+    training already relies on."""
+    from sculptor.reference import make_procedural_jump_clip
+
+    clip = make_procedural_jump_clip()
+    derived = derive_reference_reset(clip)
+    assert "fell_over_termination" not in derived
+    keys = derive_rsi_train_keys(clip)
+    assert "fell_over_termination" not in keys
+
+
+def test_apply_reference_rsi_persists_fell_over_termination_for_getup(
+    tmp_path: Path,
+) -> None:
+    clip = _make_getup_clip()
+    env_dir = tmp_path / "env"
+    path = apply_reference_rsi(env_dir, clip)
+    spec = json.loads(path.read_text(encoding="utf-8"))
+    assert validate_env_spec(spec) == []
+    assert spec["train"]["fell_over_termination"] is False
+    assert "fell_over termination disabled" in spec["meta"]["rationale"]
+
+
+def test_apply_reference_rsi_airborne_omits_fell_over_termination(
+    tmp_path: Path,
+) -> None:
+    from sculptor.reference import make_procedural_jump_clip
+
+    clip = make_procedural_jump_clip()
+    env_dir = tmp_path / "env"
+    path = apply_reference_rsi(env_dir, clip)
+    spec = json.loads(path.read_text(encoding="utf-8"))
+    assert validate_env_spec(spec) == []
+    assert "fell_over_termination" not in spec["train"]
+
+
 # ── Never-rising, never-low clips: unchanged garbage-input behavior ──────
 def test_never_rising_never_low_clip_raises_actionable_error() -> None:
     clip = _make_never_rising_never_low_clip()

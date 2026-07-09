@@ -89,7 +89,18 @@ def _quat_wxyz_to_pitch_rad(q: np.ndarray) -> float:
 def test_getup_rsi_env_reset_is_actually_lying(tmp_path: Path) -> None:
     """End-to-end: synthetic get-up clip -> apply_reference_rsi ->
     _apply_env_spec -> real ManagerBasedRlEnv(device="cuda:0") -> reset
-    -> observed root height < 0.35 m and |pitch| > 1.0 rad."""
+    -> observed root height < 0.35 m and |pitch| > 1.0 rad.
+
+    §get-up RSI fix (2026-07-09): also asserts the built env carries NO
+    fell_over termination term (the fix's cfg-level effect) and that a
+    reset does NOT terminate at step 0 (the LIVE FAILURE this fix
+    closes — the lying reset itself used to trip the standard
+    fell-over/bad-orientation termination on every env, so training
+    never ran; stepping once with zero actions and checking `terminated`
+    is the closest thing to reproducing the original symptom without a
+    full training loop)."""
+    import torch
+
     from mjlab.envs.manager_based_rl_env import ManagerBasedRlEnv
     from mjlab.tasks.registry import load_env_cfg
 
@@ -104,17 +115,22 @@ def test_getup_rsi_env_reset_is_actually_lying(tmp_path: Path) -> None:
     spec = read_current_env_spec(env_dir)
 
     # Sanity on the spec itself before spending GPU time — all four new
-    # keys must be present (the whole point of this increment).
+    # keys must be present (the whole point of this increment), plus the
+    # fell_over_termination fix.
     train = spec["train"]
     assert "reset_pitch_offset_rad" in train
     assert "reset_joint_pos_target" in train
     assert len(train["reset_joint_pos_target"]) == len(_G1_JOINTS)
+    assert train["fell_over_termination"] is False
 
     env_cfg = load_env_cfg(task_id)
     # Smallest num_envs the adapter/mjlab stack tolerates for a
     # construction smoke — this test only needs a reset, not throughput.
     env_cfg.scene.num_envs = 2
     _apply_env_spec(env_cfg, spec, train=True, task_id=task_id)
+    assert "fell_over" not in env_cfg.terminations, (
+        "fell_over termination term still present in the built cfg — "
+        "the get-up lying reset would trip it at reset")
 
     env = ManagerBasedRlEnv(cfg=env_cfg, device="cuda:0")
     try:
@@ -141,5 +157,19 @@ def test_getup_rsi_env_reset_is_actually_lying(tmp_path: Path) -> None:
         assert np.abs(joint_pos - target[None, :]).max() < 0.3, (
             "reset joint_pos does not resemble the reference posture "
             "target — reset_joints_to_reference may not have fired")
+
+        # §LIVE FAILURE repro/close: step once with zero actions from the
+        # lying reset and confirm the episode does NOT terminate at
+        # step 0. Before this fix, the lying reset's own orientation
+        # tripped fell_over on every env — `terminated` would be
+        # all-True right after the very first step.
+        n_actions = env.action_manager.total_action_dim
+        zero_action = torch.zeros(
+            (env_cfg.scene.num_envs, n_actions), device=env.device)
+        _obs, _rew, terminated, _truncated, _extras = env.step(zero_action)
+        assert not bool(terminated.all()), (
+            "all environments terminated on the very first step from a "
+            "get-up lying reset — fell_over (or an equivalent "
+            "termination) is still firing on the reference reset itself")
     finally:
         env.close()

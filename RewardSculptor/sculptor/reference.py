@@ -568,6 +568,18 @@ def derive_reference_reset(clip: dict) -> dict:
     """
     derived = dict(derive_rsi_train_keys(clip))
     is_getup = _archetype(clip) == "getup"
+    if is_getup:
+        # §get-up RSI fix (2026-07-09): a lying start (large reset-height
+        # offset below standing, and/or a large pitch/roll offset when
+        # orientation is derived below) IS exactly what the task's
+        # standard fell-over/bad-orientation termination is designed to
+        # catch — observed live, it fires on every env at reset and the
+        # episode never runs. The sunk-height guard above (derived BELOW
+        # the clip's own minimum height) plus episode time_out remain
+        # the episode enders; a get-up policy falling again mid-episode
+        # after standing up is legitimate retry experience, not a
+        # failure state that needs early termination.
+        derived["fell_over_termination"] = False
     quat = clip.get("root_quat_wxyz")
     if quat is not None and is_getup:
         fps = float(clip["fps"])
@@ -648,13 +660,19 @@ def apply_reference_rsi(env_dir: Path | str, clip: dict) -> Path:
             f"({len(full['reset_joint_pos_target'])} joints, noise "
             f"{full.get('reset_joint_pos_noise_rad')} rad)"
         )
+    fell_over_note = ""
+    if full.get("fell_over_termination") is False:
+        fell_over_note = (
+            ", fell_over termination disabled (lying start would "
+            "otherwise trip it at reset)"
+        )
     meta["rationale"] = (
         "RSI ranges derived from a reference trajectory "
         f"({src}): height offset "
         f"{full['reset_height_offset_m']} m, vz "
         f"{full['reset_vertical_velocity_mps']} m/s, paired sunk "
         f"termination {full['min_base_height_termination_m']} m"
-        f"{orient_note}{posture_note} "
+        f"{orient_note}{posture_note}{fell_over_note} "
         "(DeepMimic RSI; validator RSI↔ET invariant)."
     )
     spec["meta"] = meta

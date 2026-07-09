@@ -191,6 +191,28 @@ def test_rsi_requires_early_termination_pairing() -> None:
     assert es.validate_env_spec(ok3) == []
 
 
+def test_fell_over_termination_bool_validated() -> None:
+    """`fell_over_termination` must be a real boolean — not truthy/falsy
+    junk — and belongs to train only (a shared-section fell_over switch
+    would leak into rollout evaluation)."""
+    assert es.validate_env_spec(
+        {"env_spec_version": 1, "train": {"fell_over_termination": False}}
+    ) == []
+    assert es.validate_env_spec(
+        {"env_spec_version": 1, "train": {"fell_over_termination": True}}
+    ) == []
+    errors = es.validate_env_spec(
+        {"env_spec_version": 1, "train": {"fell_over_termination": "off"}})
+    assert any("fell_over_termination" in e for e in errors)
+    errors = es.validate_env_spec(
+        {"env_spec_version": 1, "shared": {"fell_over_termination": False}})
+    assert any("fell_over_termination" in e for e in errors)
+
+
+def test_fell_over_termination_is_iterable() -> None:
+    assert "fell_over_termination" in es.ITERABLE_TRAIN_KEYS
+
+
 def test_iterable_train_keys_is_the_train_section() -> None:
     """The diagnoser's editable surface is exactly the train section's
     value keys — shared keys must never be iterable mid-run."""
@@ -297,6 +319,64 @@ def test_orientation_reset_ranges_apply_train_only() -> None:
     _mjlab_runner._apply_env_spec(cfg2, spec, train=False)
     assert "pitch" not in cfg2.events["reset_base"].params["pose_range"]
     assert "roll" not in cfg2.events["reset_base"].params["pose_range"]
+
+
+def test_fell_over_termination_false_removes_the_term() -> None:
+    """§get-up RSI fix: `fell_over_termination: False` pops mjlab's
+    `terminations["fell_over"]` entry for TRAIN only — a lying-start
+    reset trips that termination on itself (root pitch/roll far from
+    upright reads as "fallen"), so get-up training never runs unless it
+    is removed."""
+    spec = {"env_spec_version": 1,
+            "train": {"fell_over_termination": False}}
+    assert es.validate_env_spec(spec) == []
+    cfg = _fake_cfg_full()
+    assert "fell_over" in cfg.terminations
+    _mjlab_runner._apply_env_spec(cfg, spec, train=True)
+    assert "fell_over" not in cfg.terminations
+    # time_out (and any sunk termination) must be untouched.
+    assert "time_out" in cfg.terminations
+
+
+def test_fell_over_termination_true_or_absent_leaves_the_term() -> None:
+    """Default behavior (today's) is preserved: explicit True and an
+    absent key must both leave `fell_over` in place."""
+    spec_true = {"env_spec_version": 1,
+                 "train": {"fell_over_termination": True}}
+    cfg = _fake_cfg_full()
+    _mjlab_runner._apply_env_spec(cfg, spec_true, train=True)
+    assert "fell_over" in cfg.terminations
+
+    spec_absent = {"env_spec_version": 1, "train": {}}
+    cfg2 = _fake_cfg_full()
+    _mjlab_runner._apply_env_spec(cfg2, spec_absent, train=True)
+    assert "fell_over" in cfg2.terminations
+
+
+def test_fell_over_termination_false_is_train_only() -> None:
+    """`fell_over_termination` lives in `train` and is never read when
+    `train=False` (rollout evaluation) — the key isn't even a valid
+    `shared` key (see test_fell_over_termination_bool_validated), but
+    this pins the ADAPTER side of that isolation too: even if a caller
+    passed train=False with a spec carrying the key in train, it must
+    not be applied."""
+    spec = {"env_spec_version": 1,
+            "train": {"fell_over_termination": False}}
+    cfg = _fake_cfg_full()
+    _mjlab_runner._apply_env_spec(cfg, spec, train=False)
+    assert "fell_over" in cfg.terminations
+
+
+def test_fell_over_termination_absent_from_cfg_is_a_clean_noop() -> None:
+    """Term absent from the task cfg → clean no-op, never a crash (the
+    defensive per-mutation contract every other knob in this function
+    follows)."""
+    spec = {"env_spec_version": 1,
+            "train": {"fell_over_termination": False}}
+    cfg = _fake_cfg_full()
+    del cfg.terminations["fell_over"]
+    _mjlab_runner._apply_env_spec(cfg, spec, train=True)   # must not raise
+    assert "fell_over" not in cfg.terminations
 
 
 def test_joint_pos_target_injects_new_reset_event() -> None:
