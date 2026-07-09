@@ -3,6 +3,11 @@
 Per-stage objective-metric generation at decomposition time. No live
 LLM calls: `generate_objective_metric` is monkeypatched at its import
 site inside `sculptor.eval`.
+
+§REFERENCE_TRAJECTORY_PLAN §7: the reference-clip-loading tests below use
+a tmp `RS_REFERENCE_ROOT` library fixture (built via `sculptor.refs.library`
++ `sculptor.reference.save_clip`, same conventions as `test_refs_library.py`)
+— no network, no real Anthropic calls.
 """
 from __future__ import annotations
 
@@ -205,3 +210,101 @@ def test_default_pass_skips_superseded_stage(tmp_path, monkeypatch):
     assert report["generated"] == []
     assert report["skipped"] == [
         {"stage": "old_parent", "reason": "stage superseded"}]
+
+
+# ── §REFERENCE_TRAJECTORY_PLAN §7: per-stage reference loading ─────────
+def _write_fixture_clip(tmp_path: Path, robot: str, clip_id: str) -> Path:
+    """Build a minimal valid on-disk library clip (provenance + clip.npz)
+    under a tmp `RS_REFERENCE_ROOT`-shaped root, mirroring
+    `test_refs_library.py`'s conventions. Returns the root."""
+    from sculptor.reference import make_procedural_jump_clip, save_clip
+    from sculptor.refs import library
+
+    root = tmp_path / "refs_root"
+    clip = make_procedural_jump_clip()
+    save_clip(library.clip_dir(robot, clip_id, root=root) / library.CLIP_FILENAME, clip)
+    prov = library.make_provenance(
+        clip_id=clip_id, robot=robot,
+        source={"kind": "procedural"}, license="internal",
+        attribution="test-fixture", content_sha256_="a" * 64)
+    library.write_provenance(robot, clip_id, prov, root=root)
+    return root
+
+
+def test_generate_stage_metrics_loads_and_passes_reference(
+    tmp_path, monkeypatch,
+):
+    """A stage with `reference_clip_id` set gets the clip loaded from the
+    library and threaded through `generate_objective_metric(references=...)`."""
+    root = _write_fixture_clip(tmp_path, "g1", "getup_demo_clip")
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(root))
+
+    calls: list[dict] = []
+
+    def fake_gen(goal, out_dir, **kw):
+        calls.append(kw)
+        return {"accepted": True}
+
+    import sculptor.eval as ev
+    monkeypatch.setattr(ev, "generate_objective_metric", fake_gen)
+
+    s1 = _mk_stage("get_up", reference_clip_id="getup_demo_clip")
+    m = _mk_mission(tmp_path, [s1])
+    report = generate_stage_metrics(m, robot_hint="Mjlab-Velocity-Flat-Unitree-G1")
+
+    assert report["generated"] == [
+        {"stage": "get_up", "ref": "stage_metrics/get_up/metric.py"}]
+    assert len(calls) == 1
+    refs = calls[0]["references"]
+    assert refs is not None and len(refs) == 1
+    clip_id, clip = refs[0]
+    assert clip_id == "getup_demo_clip"
+    assert "root_pos_z" in clip
+
+
+def test_generate_stage_metrics_no_reference_clip_id_passes_none(
+    tmp_path, monkeypatch,
+):
+    """A stage with no reference attached must pass references=None —
+    byte-identical to the pre-existing call shape."""
+    calls: list[dict] = []
+
+    def fake_gen(goal, out_dir, **kw):
+        calls.append(kw)
+        return {"accepted": True}
+
+    import sculptor.eval as ev
+    monkeypatch.setattr(ev, "generate_objective_metric", fake_gen)
+
+    m = _mk_mission(tmp_path, [_mk_stage("plain_stage")])
+    generate_stage_metrics(m)
+    assert calls[0]["references"] is None
+
+
+def test_generate_stage_metrics_reference_load_error_proceeds_without(
+    tmp_path, monkeypatch,
+):
+    """A stage referencing a clip_id that doesn't exist on disk must NOT
+    crash the pipeline — it proceeds with references=None and records
+    `reference_load_error` on the report entry."""
+    root = tmp_path / "empty_refs_root"
+    root.mkdir()
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(root))
+
+    calls: list[dict] = []
+
+    def fake_gen(goal, out_dir, **kw):
+        calls.append(kw)
+        return {"accepted": True}
+
+    import sculptor.eval as ev
+    monkeypatch.setattr(ev, "generate_objective_metric", fake_gen)
+
+    s1 = _mk_stage("get_up", reference_clip_id="nonexistent_clip")
+    m = _mk_mission(tmp_path, [s1])
+    report = generate_stage_metrics(m)
+
+    assert calls[0]["references"] is None
+    assert len(report["generated"]) == 1
+    assert "reference_load_error" in report["generated"][0]
+    assert report["generated"][0]["reference_load_error"]

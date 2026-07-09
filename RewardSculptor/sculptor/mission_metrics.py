@@ -31,6 +31,57 @@ from typing import Any, Callable, Optional
 from sculptor.mission import Mission
 
 
+#: §REFERENCE_TRAJECTORY_PLAN §2.4: the reference library keys clips by a
+#: bare robot slug ("g1", "go1", ...), while `robot_hint` here is the
+#: adapter/task_id-shaped string used everywhere else in this module
+#: (e.g. "Mjlab-Velocity-Flat-Unitree-G1"). Same substring-match idea as
+#: `sculptor.eval.robot_manifest.robot_joint_names`; unknown/absent hints
+#: default to "g1" (the only populated library robot today — mirrors the
+#: `robot: str = "g1"` default already used throughout `sculptor.refs`).
+_ROBOT_SLUGS: tuple[str, ...] = ("go2", "go1", "g1")
+
+
+def _robot_slug(robot_hint: Optional[str]) -> str:
+    h = str(robot_hint or "").lower()
+    for slug in _ROBOT_SLUGS:
+        if slug in h:
+            return slug
+    return "g1"
+
+
+def _load_stage_reference(
+    stage: Any, robot_hint: Optional[str],
+) -> tuple[Optional[list[tuple[str, dict]]], Optional[str]]:
+    """Load the clip attached to `stage.reference_clip_id` from the
+    on-disk reference library, if any. Returns
+    `(references_kwarg_value, reference_load_error)` — `references_kwarg_value`
+    is `[(clip_id, clip_dict)]` on success, `None` when the stage has no
+    reference attached OR the clip failed to load (log-and-proceed WITHOUT
+    references per §REFERENCE_TRAJECTORY_PLAN §7 — a missing/corrupt clip
+    on disk must never crash the metric-generation pipeline).
+    `reference_load_error` is a short string recorded on the stage's
+    report entry, only set on a load failure."""
+    clip_id = getattr(stage, "reference_clip_id", None)
+    if not clip_id:
+        return None, None
+    try:
+        from sculptor.reference import load_clip
+        from sculptor.refs import library
+
+        robot = _robot_slug(robot_hint)
+        clip_path = library.clip_dir(robot, clip_id) / library.CLIP_FILENAME
+        clip = load_clip(clip_path)
+        return [(clip_id, clip)], None
+    except Exception as e:  # noqa: BLE001 — never crash the metric pipeline
+        error = f"{type(e).__name__}: {e}"
+        print(
+            f"[mission-metrics] stage {getattr(stage, 'name', '?')!r}: "
+            f"failed to load reference clip {clip_id!r} ({error}) — "
+            "proceeding WITHOUT reference grounding.",
+            file=sys.stderr, flush=True)
+        return None, error
+
+
 def resolve_stage_metric_ref(ref: str, mission_dir: Path | str) -> str:
     """Anchor a mission-dir-relative generated-metric ref at the mission
     dir. Spec-metric names ("g1_kick") and absolute paths pass through
@@ -119,21 +170,32 @@ def generate_stage_metrics(
             "stage": stage.name,
             "goal_text": stage.goal_text[:200],
         })
+        # §REFERENCE_TRAJECTORY_PLAN §7: a stage with an attached library
+        # reference gets it loaded + threaded through generation for
+        # kinematic grounding + reference-anchored validation. No
+        # auto-retrieval here (out of scope — human attaches via UI); a
+        # missing/corrupt clip degrades to no-reference rather than
+        # failing the stage.
+        references, reference_load_error = _load_stage_reference(
+            stage, robot_hint)
         try:
             rec = generate_objective_metric(
                 stage.goal_text, out_dir,
                 robot_hint=robot_hint, client=client,
                 n_candidates=n_candidates,
                 on_event=on_event,
+                references=references,
             )
         except Exception as e:  # noqa: BLE001 — stage falls back, mission runs
             print(
                 f"[mission-metrics] stage {stage.name!r}: generation "
                 f"crashed ({type(e).__name__}: {e}) — stage falls back to "
                 f"the mission-level metric.", file=sys.stderr, flush=True)
-            report["rejected"].append(
-                {"stage": stage.name,
-                 "reason": f"{type(e).__name__}: {e}"})
+            reject_entry = {"stage": stage.name,
+                            "reason": f"{type(e).__name__}: {e}"}
+            if reference_load_error:
+                reject_entry["reference_load_error"] = reference_load_error
+            report["rejected"].append(reject_entry)
             _emit({
                 "type": "stage_metric_gen_failed",
                 "stage": stage.name,
@@ -143,7 +205,10 @@ def generate_stage_metrics(
         if rec.get("accepted"):
             rel = f"stage_metrics/{stage.name}/metric.py"
             stage.steering_metric = rel
-            report["generated"].append({"stage": stage.name, "ref": rel})
+            gen_entry = {"stage": stage.name, "ref": rel}
+            if reference_load_error:
+                gen_entry["reference_load_error"] = reference_load_error
+            report["generated"].append(gen_entry)
             _emit({
                 "type": "stage_metric_gen_accepted",
                 "stage": stage.name,
@@ -155,8 +220,10 @@ def generate_stage_metrics(
             reasons = rec.get("validation") or {}
             reason = "; ".join(
                 (reasons.get("reasons") or ["review rejected"])[:3])
-            report["rejected"].append(
-                {"stage": stage.name, "reason": reason})
+            reject_entry = {"stage": stage.name, "reason": reason}
+            if reference_load_error:
+                reject_entry["reference_load_error"] = reference_load_error
+            report["rejected"].append(reject_entry)
             _emit({
                 "type": "stage_metric_gen_rejected",
                 "stage": stage.name,

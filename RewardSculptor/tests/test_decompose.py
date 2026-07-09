@@ -719,3 +719,195 @@ def test_decompose_task_prompt_contains_hard_rules():
     assert "expected_info_keys" in p
     # Strict JSON instruction at the end.
     assert "JSON" in p
+
+
+def test_needs_reference_rsi_description_covers_non_standing_start():
+    """§REFERENCE_TRAJECTORY_PLAN §7/§9: the flag must ALSO cover a
+    non-standing start state (get-up's first stage), not just
+    ballistic/airborne states — both the prompt and the pydantic field
+    description."""
+    from sculptor.prompts import load_prompt
+
+    p = load_prompt("decompose_task")
+    assert "lying" in p.lower()
+    assert "standing reset" in p.lower()
+
+    field_desc = _StageModel.model_fields["needs_reference_rsi"].description
+    assert "lying" in field_desc.lower() or "standing reset" in field_desc.lower()
+
+
+# ── 6. §REFERENCE_TRAJECTORY_PLAN §4/§7: retrieval + attachment ──────
+@dataclass
+class _FakeMatch:
+    clip_id: str
+    text: str = ""
+    score: float = 1.0
+    match_confidence: "float | None" = None
+    reason: "str | None" = None
+    tier: "str | None" = "K"
+    license: "str | None" = "internal"
+    n_frames: "int | None" = 50
+    fps: "float | None" = 30.0
+    duration_s: "float | None" = 2.0
+    rerank: str = "deterministic-only"
+
+
+def _touch_index(tmp_path: Path, monkeypatch) -> Path:
+    """§`_retrieve_mission_references`/`_attach_stage_references` both
+    early-return when no index.jsonl exists on disk — create an empty one
+    under a tmp RS_REFERENCE_ROOT so the retrieval path actually runs."""
+    root = tmp_path / "refs_root"
+    root.mkdir()
+    (root / "index.jsonl").write_text("", encoding="utf-8")
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(root))
+    return root
+
+
+def _mk_clip_for_signature():
+    from sculptor.reference import make_procedural_jump_clip
+
+    return make_procedural_jump_clip()
+
+
+def test_attach_references_true_picks_top_match_above_threshold(
+    tmp_path, monkeypatch,
+):
+    """A stage whose retrieval top match has match_confidence >= 0.8 gets
+    its reference_clip_id/tier/match_confidence set."""
+    _touch_index(tmp_path, monkeypatch)
+    clip = _mk_clip_for_signature()
+    monkeypatch.setattr(
+        "sculptor.reference.load_clip", lambda path: clip)
+
+    def fake_search(query, robot="g1", k=10, **kw):
+        return [_FakeMatch(clip_id="getup_high_conf", match_confidence=0.92,
+                            tier="D")]
+
+    monkeypatch.setattr("sculptor.refs.retrieve.search", fake_search)
+
+    client = _StubClient(_good_decomp_model())
+    mission = decompose_task(
+        "Stand on one leg and kick", _default_contract(),
+        kg_store=None, client=client, attach_references=True,
+    )
+    for stage in mission.stages:
+        assert stage.reference_clip_id == "getup_high_conf"
+        assert stage.reference_tier == "D"
+        assert stage.reference_match_confidence == pytest.approx(0.92)
+
+
+def test_attach_references_true_leaves_none_below_threshold(
+    tmp_path, monkeypatch,
+):
+    """A low-confidence, non-standout match must NOT be auto-attached —
+    the UI picker remains the approval surface."""
+    _touch_index(tmp_path, monkeypatch)
+    clip = _mk_clip_for_signature()
+    monkeypatch.setattr("sculptor.reference.load_clip", lambda path: clip)
+
+    def fake_search(query, robot="g1", k=10, **kw):
+        # Two close-scoring candidates, low LLM confidence: neither the
+        # confidence bar nor the "clear standout" fallback should fire.
+        return [
+            _FakeMatch(clip_id="maybe_a", match_confidence=0.4, score=1.0),
+            _FakeMatch(clip_id="maybe_b", match_confidence=0.35, score=0.9),
+        ]
+
+    monkeypatch.setattr("sculptor.refs.retrieve.search", fake_search)
+
+    client = _StubClient(_good_decomp_model())
+    mission = decompose_task(
+        "Stand on one leg and kick", _default_contract(),
+        kg_store=None, client=client, attach_references=True,
+    )
+    for stage in mission.stages:
+        assert stage.reference_clip_id is None
+        assert stage.reference_tier is None
+        assert stage.reference_match_confidence is None
+
+
+def test_attach_references_false_leaves_stages_untouched(tmp_path, monkeypatch):
+    """`attach_references=False` must skip retrieval entirely — even a
+    high-confidence match must not be attached, and search() must not
+    even be called."""
+    _touch_index(tmp_path, monkeypatch)
+    called = {"search": False}
+
+    def fake_search(query, robot="g1", k=10, **kw):
+        called["search"] = True
+        return [_FakeMatch(clip_id="should_not_attach", match_confidence=0.99)]
+
+    monkeypatch.setattr("sculptor.refs.retrieve.search", fake_search)
+
+    client = _StubClient(_good_decomp_model())
+    mission = decompose_task(
+        "Stand on one leg and kick", _default_contract(),
+        kg_store=None, client=client, attach_references=False,
+    )
+    assert called["search"] is False
+    for stage in mission.stages:
+        assert stage.reference_clip_id is None
+
+
+def test_attach_references_injects_signature_into_decompose_prompt(
+    tmp_path, monkeypatch,
+):
+    """§7: the mission-goal-level retrieval + signature injection happens
+    in the SAME decompose call (decompose has no separate criterion-
+    authoring call) — assert the rendered user_content carries the
+    REFERENCE MOTION SIGNATURES block with real numeric fields."""
+    _touch_index(tmp_path, monkeypatch)
+    clip = _mk_clip_for_signature()
+    monkeypatch.setattr("sculptor.reference.load_clip", lambda path: clip)
+
+    def fake_search(query, robot="g1", k=10, **kw):
+        return [_FakeMatch(clip_id="jump_ref_clip", match_confidence=0.9)]
+
+    monkeypatch.setattr("sculptor.refs.retrieve.search", fake_search)
+
+    client = _StubClient(_good_decomp_model())
+    decompose_task(
+        "Stand on one leg and kick", _default_contract(),
+        kg_store=None, client=client, attach_references=True,
+    )
+    user_content = client.messages.calls[0]["messages"][0]["content"]
+    assert "REFERENCE MOTION SIGNATURES" in user_content
+    assert "jump_ref_clip" in user_content
+    assert "duration_s" in user_content
+    assert "ground" in user_content.lower()
+
+
+def test_attach_references_no_index_on_disk_is_a_noop(tmp_path, monkeypatch):
+    """No `index.jsonl` on disk at all (fresh RS_REFERENCE_ROOT, never
+    ingested) must never raise and must never attach anything — the
+    §build-brief guard on `library.index_path().is_file()`."""
+    root = tmp_path / "empty_refs_root"
+    root.mkdir()
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(root))
+
+    client = _StubClient(_good_decomp_model())
+    mission = decompose_task(
+        "Stand on one leg and kick", _default_contract(),
+        kg_store=None, client=client, attach_references=True,
+    )
+    for stage in mission.stages:
+        assert stage.reference_clip_id is None
+
+
+def test_attach_references_retrieval_exception_never_raises(tmp_path, monkeypatch):
+    """Any retrieval-layer exception (index corrupt, search() bug, etc.)
+    must degrade to "no references" rather than fail decompose_task."""
+    _touch_index(tmp_path, monkeypatch)
+
+    def broken_search(query, robot="g1", k=10, **kw):
+        raise RuntimeError("simulated retrieval failure")
+
+    monkeypatch.setattr("sculptor.refs.retrieve.search", broken_search)
+
+    client = _StubClient(_good_decomp_model())
+    mission = decompose_task(
+        "Stand on one leg and kick", _default_contract(),
+        kg_store=None, client=client, attach_references=True,
+    )
+    for stage in mission.stages:
+        assert stage.reference_clip_id is None

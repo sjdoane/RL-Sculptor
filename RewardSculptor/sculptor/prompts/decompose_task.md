@@ -18,6 +18,16 @@ and stages warm-start from previous stages where possible.
     compatible with the target adapter + task. When present, you MAY
     reference one in any stage's `init_skill_id` to warm-start that
     stage from a learned policy. Validation rejects unknown ids.
+  * (Optional) A REFERENCE MOTION SIGNATURES block — compact numeric
+    summaries (duration, root-height extrema and when they occur, phase
+    segmentation, orientation, contact schedule) of real mocap/retargeted
+    clips retrieved for this goal. When present, GROUND every numeric
+    success_criterion threshold (heights, durations, velocities) in these
+    real values instead of guessing — e.g. if a signature's `root_z.max`
+    is 0.72 m, a completion criterion should target near 0.72 m, not an
+    invented round number. Also use the signature's orientation/phase data
+    to judge whether a stage's START state is far from the robot's default
+    standing reset (see rule 9).
 
 ## Output schema (strict JSON)
 
@@ -34,7 +44,7 @@ and stages warm-start from previous stages where possible.
       "reward_seed_prompt": "<NL reward spec for this stage, 3-2000 chars>",
       "kg_seed_papers":     ["<arxiv_id>", ...],
       "init_skill_id":      <null or a skill_id from the SKILL_LIBRARY slice>,
-      "needs_reference_rsi": <true ONLY for ballistic/airborne stages — see rule 9>
+      "needs_reference_rsi": <true for ballistic/airborne stages OR a non-standing start state — see rule 9>
     },
     ...
   ]
@@ -164,22 +174,31 @@ and stages warm-start from previous stages where possible.
      a good match. It's better to cold-start than to load a
      mismatched policy.
 
-9. **Reference-state initialization for airborne stages.** Set
-    `needs_reference_rsi: true` on a stage ONLY when its core skill
-    involves ballistic/airborne states the policy cannot reach until it
-    has already learned the skill — jump launch, flight, landing,
-    aerial recovery. The orchestrator then starts a fraction of that
-    stage's TRAINING episodes inside those states (heights + vertical
-    velocities derived from a validated reference trajectory, paired
-    with the required sunk-height termination), so the policy
-    experiences apex → descent → touchdown long before it can produce a
-    launch. Evaluation rollouts are never affected. Keep it `false` for
-    grounded skills (standing, crouching, walking, kicking): needless
-    RSI wastes training resets on states the stage doesn't need. This
-    is DeepMimic's RSI result — without it, explosive skills are
-    unlearnable from shaping alone; with RSI but WITHOUT the paired
-    termination the policy exploits sunk postures (both are applied
-    together automatically).
+9. **Reference-state initialization for airborne OR non-standing-start
+   stages.** Set `needs_reference_rsi: true` on a stage in EITHER of two
+   cases:
+   - its core skill involves ballistic/airborne states the policy cannot
+     reach until it has already learned the skill — jump launch, flight,
+     landing, aerial recovery; OR
+   - its START state is far from the robot's default standing reset —
+     lying, sitting, crouched, or otherwise fallen. The env resets
+     STANDING by default, so a stage whose goal begins from the ground
+     (e.g. the FIRST stage of a "get up off the floor" mission) is
+     UNTRAINABLE without a reference-derived initial state no matter how
+     good its reward/metric is — this case is NOT optional.
+   The orchestrator then starts a fraction of that stage's TRAINING
+   episodes inside those states (heights + vertical velocities / postures
+   derived from a validated reference trajectory, paired with the
+   required sunk-height termination), so the policy experiences the
+   target regime (apex → descent → touchdown, or lying → rising) long
+   before it can produce it unaided. Evaluation rollouts are never
+   affected. Keep it `false` for grounded skills that start from the
+   default standing pose (standing, crouching, walking, kicking):
+   needless RSI wastes training resets on states the stage doesn't need.
+   This is DeepMimic's RSI result — without it, explosive or far-from-
+   reset skills are unlearnable from shaping alone; with RSI but WITHOUT
+   the paired termination the policy exploits sunk postures (both are
+   applied together automatically).
 
 ## Stage-design guidance
 

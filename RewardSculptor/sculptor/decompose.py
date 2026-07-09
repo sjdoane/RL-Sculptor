@@ -138,11 +138,16 @@ class _StageModel(BaseModel):
     needs_reference_rsi: bool = Field(
         default=False,
         description=(
-            "Set true ONLY for a stage whose core skill involves ballistic/"
+            "Set true for a stage whose core skill involves ballistic/"
             "airborne states the robot cannot yet reach (jump launch, "
-            "flight, landing). Starts a fraction of training episodes in "
-            "those states via a validated reference curriculum. False for "
-            "grounded skills (standing, walking, crouching)."
+            "flight, landing), OR whose START state is far from the "
+            "robot's default standing reset (lying, sitting, crouched, "
+            "fallen) — e.g. a get-up mission's first stage MUST set this, "
+            "since the env resets standing and the stage is otherwise "
+            "untrainable. Starts a fraction of training episodes in those "
+            "states via a validated reference curriculum. False for "
+            "grounded skills that start from the default standing pose "
+            "(standing, walking, crouching)."
         ),
     )
 
@@ -315,19 +320,137 @@ def _build_user_content(
     kg_context: str,
     skill_context: str = "",
     fitness_metrics_block: str = "",
+    reference_context: str = "",
 ) -> str:
     skill_block = f"{skill_context}\n\n" if skill_context else ""
     metrics_block = f"{fitness_metrics_block}\n\n" if fitness_metrics_block else ""
+    reference_block = f"{reference_context}\n\n" if reference_context else ""
     return (
         f"# BEHAVIOR_GOAL\n{goal}\n\n"
         f"{_render_contract(contract)}\n"
         f"{kg_context}\n\n"
         f"{metrics_block}"
         f"{skill_block}"
+        f"{reference_block}"
         "Emit the decomposition JSON now. Ordered stages only, "
         "topologically valid parent_stage refs, final stage must satisfy "
         "the behavior goal end-to-end."
     )
+
+
+# ── §REFERENCE_TRAJECTORY_PLAN §3/§4/§7: mission-goal-level retrieval ────
+#: Retrieval-confidence floor for AUTO-attaching a match to a stage
+#: without human review (§4.3's "auto-accept only above a high confidence
+#: bar" + §7's build brief's ">= 0.8"). Below this, a match is surfaced in
+#: the prompt context for GROUNDING only — the stage fields stay None so
+#: the UI picker remains the approval surface for anything less certain.
+REFERENCE_ATTACH_CONFIDENCE = 0.8
+#: How many mission-goal-level matches to retrieve for prompt grounding.
+_REFERENCE_RETRIEVE_K = 3
+
+
+def _retrieve_mission_references(
+    goal: str, robot_hint: Optional[str],
+) -> list[Any]:
+    """§decompose_task's single LLM call drafts `success_criterion`
+    alongside `goal_text`/etc in the SAME `_DecompositionModel` parse
+    (see module docstring) — there is no separate later call to ground.
+    So retrieval happens ONCE, up front, against the MISSION's
+    `goal_text` (not per-stage — stages don't exist yet), and the top
+    matches' kinematic signatures are injected into the SAME decompose
+    prompt with instructions to ground stage criteria in them.
+
+    Returns `[]` on ANY failure (no library index on disk, retrieval
+    exception, import failure) — reference grounding is a strict
+    ADDITION, never a decompose blocker. Never raises."""
+    try:
+        from sculptor.refs import library, retrieve
+
+        robot = _reference_robot_slug(robot_hint)
+        if not library.index_path().is_file():
+            return []  # §build brief: only retrieve when an index exists on disk
+        matches = retrieve.search(goal, robot=robot, k=_REFERENCE_RETRIEVE_K)
+        return list(matches or [])
+    except Exception as e:  # noqa: BLE001 — retrieval must never block decompose
+        print(
+            f"[decompose] reference retrieval failed "
+            f"({type(e).__name__}: {e}) — decomposer proceeds without "
+            "reference grounding.", file=sys.stderr, flush=True,
+        )
+        return []
+
+
+#: Same robot-hint -> library-slug convention as `mission_metrics._robot_slug`
+#: (kept local — decompose.py must not import mission_metrics, which would
+#: create a cycle back through sculptor.mission). Default "g1" mirrors the
+#: `robot: str = "g1"` default used throughout `sculptor.refs`.
+_REFERENCE_ROBOT_SLUGS: tuple[str, ...] = ("go2", "go1", "g1")
+
+
+def _reference_robot_slug(robot_hint: Optional[str]) -> str:
+    h = str(robot_hint or "").lower()
+    for slug in _REFERENCE_ROBOT_SLUGS:
+        if slug in h:
+            return slug
+    return "g1"
+
+
+def _load_reference_clip(clip_id: str, robot: str) -> Optional[dict]:
+    """Load one library clip by id, or None on any failure (missing/
+    corrupt clip on disk must never crash decompose)."""
+    try:
+        from sculptor.reference import load_clip
+        from sculptor.refs import library
+
+        path = library.clip_dir(robot, clip_id) / library.CLIP_FILENAME
+        return load_clip(path)
+    except Exception:  # noqa: BLE001 — a bad clip degrades to no signature
+        return None
+
+
+def _render_reference_context(matches: list[Any], robot: str) -> str:
+    """Render retrieved reference matches into a `REFERENCE MOTION
+    SIGNATURES` block: kinematic signatures for grounding stage
+    success_criterion thresholds (§7), plus each match's retrieval
+    metadata (clip_id, match_confidence, tier) so the decomposer can see
+    WHICH clips are confident enough to be worth grounding against.
+    Empty string when there are no matches or nothing loads."""
+    if not matches:
+        return ""
+    from sculptor.refs.convert import kinematic_signature
+
+    lines = [
+        "# REFERENCE MOTION SIGNATURES",
+        "Real mocap/retargeted clips retrieved for this goal. GROUND every "
+        "numeric success_criterion threshold (heights, durations, "
+        "velocities) that corresponds to one of these clips' motion in its "
+        "actual signature values instead of guessing. Also use a "
+        "signature's orientation/phase data to judge whether a stage's "
+        "START state is far from the robot's default standing reset — see "
+        "the needs_reference_rsi rule.",
+        "",
+    ]
+    rendered_any = False
+    for m in matches:
+        clip_id = getattr(m, "clip_id", None)
+        if not clip_id:
+            continue
+        clip = _load_reference_clip(clip_id, robot)
+        if clip is None:
+            continue
+        try:
+            sig = kinematic_signature(clip)
+        except Exception:  # noqa: BLE001 — one bad clip must not block others
+            continue
+        rendered_any = True
+        lines.append(
+            f"## clip_id: {clip_id} "
+            f"(match_confidence={getattr(m, 'match_confidence', None)}, "
+            f"tier={getattr(m, 'tier', None)})"
+        )
+        lines.append(json.dumps(sig, indent=2, default=str))
+        lines.append("")
+    return "\n".join(lines) if rendered_any else ""
 
 
 def _render_fitness_metrics_block() -> str:
@@ -574,6 +697,50 @@ def _validate_steering_metrics(stages: list[Stage]) -> None:
         )
 
 
+def _attach_stage_references(stages: list[Stage], robot: str) -> None:
+    """§REFERENCE_TRAJECTORY_PLAN §4/§7/§9: for each drafted stage, run
+    refs retrieval against ITS OWN `goal_text` and attach the top match's
+    fields (`reference_clip_id`/`tier`/`match_confidence`) ONLY when
+    `match_confidence` is not None and >= `REFERENCE_ATTACH_CONFIDENCE`,
+    OR when the deterministic-only layer's top score is a clear standout
+    (>= 2x the second-place score, mirroring the "clear standout" build
+    brief — a single strong deterministic hit with no close competitor is
+    trustworthy even without an LLM confidence number). Otherwise the
+    stage's reference fields stay None — the UI picker remains the
+    approval surface for anything less certain.
+
+    Runs AFTER stages are drafted+parsed (so it sees the LLM's actual
+    per-stage goal_text), mutates `stages` in place. Any retrieval
+    failure for a stage (or globally, e.g. no library index) leaves that
+    stage's fields untouched — never raises."""
+    for stage in stages:
+        try:
+            from sculptor.refs import library, retrieve
+
+            if not library.index_path().is_file():
+                return  # no library at all — skip every remaining stage too
+            matches = retrieve.search(
+                stage.goal_text, robot=robot, k=2)
+        except Exception:  # noqa: BLE001 — retrieval must never block decompose
+            continue
+        if not matches:
+            continue
+        top = matches[0]
+        confidence = getattr(top, "match_confidence", None)
+        is_clear_standout = False
+        if confidence is None and len(matches) >= 2:
+            second_score = getattr(matches[1], "score", 0.0) or 0.0
+            top_score = getattr(top, "score", 0.0) or 0.0
+            is_clear_standout = second_score > 0 and top_score >= 2 * second_score
+        elif confidence is None:
+            is_clear_standout = True  # only one candidate at all — no competitor to beat
+        if (confidence is not None and confidence >= REFERENCE_ATTACH_CONFIDENCE) or (
+                confidence is None and is_clear_standout):
+            stage.reference_clip_id = getattr(top, "clip_id", None)
+            stage.reference_tier = getattr(top, "tier", None)
+            stage.reference_match_confidence = confidence
+
+
 # ── Public entry ─────────────────────────────────────────────────────
 def decompose_task(
     goal: str,
@@ -583,6 +750,8 @@ def decompose_task(
     client: Any = None,
     model: str = MODEL_ID,
     skill_library_handle: Any = None,
+    robot_hint: Optional[str] = None,
+    attach_references: bool = True,
 ) -> Mission:
     """Ask Claude to decompose `goal` into a Mission curriculum.
 
@@ -605,6 +774,26 @@ def decompose_task(
         compatible with the handle's (adapter_class, task_id) pair
         and may set a stage's `init_skill_id` to warm-start from one.
         Unknown ids are rejected at validation time.
+    robot_hint : optional adapter/task_id-shaped robot hint (e.g.
+        "Mjlab-Velocity-Flat-Unitree-G1"), used ONLY to resolve which
+        reference-library robot slug to query (§REFERENCE_TRAJECTORY_PLAN
+        §4); mapped via the same substring convention as
+        `sculptor.eval.robot_manifest.robot_joint_names`, defaulting to
+        "g1". Unrelated to the LLM call itself.
+    attach_references : (default True) §REFERENCE_TRAJECTORY_PLAN §4/§7.
+        When True: (a) retrieves top mission-goal-level reference matches
+        UP FRONT and injects their kinematic signatures into THIS SAME
+        decompose call's prompt so `success_criterion` thresholds can be
+        grounded in real numbers (decompose's stage-drafting and
+        criterion-authoring happen in ONE `_DecompositionModel` parse —
+        there is no separate later call to ground); (b) AFTER stages are
+        drafted, retrieves per-stage and attaches
+        `reference_clip_id`/`reference_tier`/`reference_match_confidence`
+        to a stage only on a high-confidence or clear-standout match
+        (`_attach_stage_references`). Set False to disable both (e.g. in
+        tests, or when the caller wants a bare decomposition). A missing
+        library index or any retrieval failure is always a no-op, never
+        an error, regardless of this flag.
 
     Returns
     -------
@@ -630,9 +819,15 @@ def decompose_task(
     skill_context, available_skill_ids = _render_skill_library_context(
         skill_library_handle,
     )
+    robot = _reference_robot_slug(robot_hint)
+    reference_context = ""
+    if attach_references:
+        mission_matches = _retrieve_mission_references(goal, robot_hint)
+        reference_context = _render_reference_context(mission_matches, robot)
     user_content = _build_user_content(
         goal, reward_contract, kg_context, skill_context=skill_context,
         fitness_metrics_block=_render_fitness_metrics_block(),
+        reference_context=reference_context,
     )
 
     parsed = _parse_with_retry(
@@ -640,6 +835,8 @@ def decompose_task(
     )
 
     stages = _stages_from_model(parsed.stages)
+    if attach_references:
+        _attach_stage_references(stages, robot)
     mission = Mission(
         goal=goal,
         stages=stages,

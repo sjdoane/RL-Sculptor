@@ -185,3 +185,21 @@ Think about which physical signature DEFINITELY distinguishes success from the
 specific failure modes — wrong direction, incomplete/partial motion, tiny
 amplitude, balancing instead of acting, flailing instead of executing — then
 encode exactly that as the gate × min(channels). Output ONLY the Python module.
+
+## REFERENCE MOTION SIGNATURE (when provided)
+
+If the user content includes a `REFERENCE MOTION SIGNATURE` block, it is a
+compact numeric summary — duration, root-height extrema and WHEN they occur,
+phase segmentation, root-velocity range, orientation (gravity-z in the body
+frame), a contact schedule, and per-phase joint-motion energy — extracted from
+a REAL competent demonstration of this exact behavior on this robot. The
+competent motion looks like THIS: write a metric that scores THESE numbers
+high. Ground every threshold (amplitude floors, height targets, phase
+durations, completion windows) in the signature's actual values instead of
+guessing — e.g. if `root_z.max` is 0.72 m at `max_t` 1.1 s, a height-based
+completion channel should saturate near 0.72 m, not an invented round number.
+When multiple references are given, ground thresholds so ALL of them would
+score near 1.0 (their range, not just one clip's exact numbers). The
+signature is grounding, not a literal replay target — still obey every HARD
+RULE above (signed direction, amplitude floor, gate × min composition, no
+peak/ratio terms).

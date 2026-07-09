@@ -33,6 +33,42 @@ from sculptor.llm import (
 )
 from sculptor.prompts import load_prompt
 
+def _build_reference_signature_block(
+    references: list[tuple[str, dict]],
+) -> tuple[str, dict[str, Any]]:
+    """§REFERENCE_TRAJECTORY_PLAN §7: render `references` (a list of
+    `(clip_id, loaded clip dict)` pairs) into a `REFERENCE MOTION
+    SIGNATURE` markdown block for the authoring prompt, plus the raw
+    `{clip_id: signature}` dict recorded on the result.
+
+    A single reference whose `kinematic_signature` call raises (a
+    corrupt/invalid clip slipping past the caller) is skipped with its
+    error recorded under `"_error"` in the returned dict — never lets a
+    bad reference crash generation; the block still renders every clip
+    that DID summarize successfully."""
+    from sculptor.refs.convert import kinematic_signature
+
+    signatures: dict[str, Any] = {}
+    lines = [
+        "# REFERENCE MOTION SIGNATURE",
+        "The competent motion looks like THIS — write a metric scoring "
+        "these numbers high; ground thresholds in these real values, do "
+        "not guess.",
+        "",
+    ]
+    for clip_id, clip in references:
+        try:
+            sig = kinematic_signature(clip)
+        except Exception as e:  # noqa: BLE001 — one bad clip must not crash gen
+            signatures[clip_id] = {"_error": f"{type(e).__name__}: {e}"}
+            continue
+        signatures[clip_id] = sig
+        lines.append(f"## clip_id: {clip_id}")
+        lines.append(json.dumps(sig, indent=2, default=str))
+        lines.append("")
+    return "\n".join(lines), signatures
+
+
 MODEL_ID = model_for("metric_gen")
 #: §truncation fix: adaptive THINKING shares this budget with the code output, and a
 #: hard metric's think can use 5-8k tokens — at the old 8000 cap that truncated the
@@ -311,6 +347,7 @@ def _best_of_n(
     behavior_goal: str, robot_hint: Optional[str], robot_names: Optional[list],
     out_dir: Path, metric_path: Path, n: int, model: str,
     emit: Callable[[dict[str, Any]], None],
+    references: Optional[list[tuple[str, dict]]] = None,
 ) -> tuple[bool, str, Optional[dict[str, Any]], list[dict[str, Any]], Optional[int]]:
     """Sample `n` candidate metrics (decorrelated by FRAMING — temperature stays 1.0,
     required by the generator's extended thinking), validate each, and
@@ -341,7 +378,7 @@ def _best_of_n(
               "message": f"Validating candidate {i + 1}/{n}…"})
         val = validate_generated_metric(
             src, cpath, behavior_goal=behavior_goal, robot_hint=robot_hint,
-            robot_joint_names=robot_names)
+            robot_joint_names=robot_names, references=references)
         rec: dict[str, Any] = {"candidate": i, "ok": bool(val["ok"]),
                                "reasons": val["reasons"], "_src": src, "_val": val}
         if val["ok"]:
@@ -460,6 +497,7 @@ def generate_objective_metric(
     review_models: Optional[list[str]] = None,
     review_keyframes: Optional[list] = None,
     on_event: Optional[Callable[[dict[str, Any]], None]] = None,
+    references: Optional[list[tuple[str, dict]]] = None,
 ) -> dict[str, Any]:
     """Generate, validate, (regenerate on failure,) and review an objective
     metric for `behavior_goal`. Writes `metric.py` + `meta.json` to
@@ -483,7 +521,22 @@ def generate_objective_metric(
     VALID one with the highest OFFLINE discrimination (`graded_discrimination` — a
     deterministic graded competence ladder); ties keep the first valid; all-invalid
     rejects (run stays blind), as today. The selected candidate then goes through the
-    SAME review. Records `n_candidates`, `candidates`, `selected_candidate`."""
+    SAME review. Records `n_candidates`, `candidates`, `selected_candidate`.
+
+    §REFERENCE_TRAJECTORY_PLAN §7: `references` (optional — a list of
+    `(clip_id, loaded clip dict)` pairs, default None → BYTE-IDENTICAL
+    behavior) grounds generation in real kinematic data. When present: (a)
+    a `REFERENCE MOTION SIGNATURE` block (§7 kinematic_signature per clip)
+    is injected into the authoring prompt telling the model to ground
+    thresholds in these real numbers instead of guessing; (b) it is passed
+    through to `validate_generated_metric` so every candidate also
+    certifies against the reference-anchored gates (§5); (c) a
+    reference-gate failure feeds back into the retry loop's prompt exactly
+    like any other validation failure; (d) the result records
+    `"references_used"` (the clip ids) and `"reference_signatures"` (the
+    rendered signature dict, keyed by clip id — a clip whose signature
+    extraction raised records `{"_error": ...}` instead of crashing the
+    run)."""
     if client is None:
         import anthropic
 
@@ -509,6 +562,13 @@ def generate_objective_metric(
             {"behavior_goal": behavior_goal, "robot_hint": robot_hint},
             indent=2, default=str,
         )
+        references_used: list[str] = []
+        reference_signatures: dict[str, Any] = {}
+        if references:
+            sig_block, reference_signatures = _build_reference_signature_block(
+                list(references))
+            references_used = [clip_id for clip_id, _clip in references]
+            base_user = base_user + "\n\n" + sig_block
 
         n_attempts = max(1, max_attempts)
         attempts: list[dict[str, Any]] = []
@@ -533,7 +593,7 @@ def generate_objective_metric(
                 client, system_prompt, base_user,
                 behavior_goal=behavior_goal, robot_hint=robot_hint,
                 robot_names=robot_names, out_dir=out_dir, metric_path=metric_path,
-                n=n_candidates, model=model, emit=_emit)
+                n=n_candidates, model=model, emit=_emit, references=references)
             if not passed:
                 # best-of-N samples DIVERSE candidates but does NOT feed validation
                 # failures back; if NONE were valid, fall through to the retry-with-
@@ -580,7 +640,7 @@ def generate_objective_metric(
                 validation = validate_generated_metric(
                     source, metric_path,
                     behavior_goal=behavior_goal, robot_hint=robot_hint,
-                    robot_joint_names=robot_names)
+                    robot_joint_names=robot_names, references=references)
                 attempts.append({"attempt": attempt, "ok": validation["ok"],
                                  "reasons": validation["reasons"]})
                 if validation["ok"]:
@@ -673,7 +733,7 @@ def generate_objective_metric(
             metric_path.write_text(source, encoding="utf-8")   # not a best-of-N candidate
             validation = validate_generated_metric(
                 source, metric_path, behavior_goal=behavior_goal, robot_hint=robot_hint,
-                robot_joint_names=robot_names)
+                robot_joint_names=robot_names, references=references)
             attempts.append({"review_retry": rev_retry, "ok": validation["ok"],
                              "reasons": validation["reasons"]})
             passed = bool(validation["ok"])
@@ -705,6 +765,11 @@ def generate_objective_metric(
             # steer-rights are earned later via calibration; observe-only until then.
             "calibrated": False,
             "recorded_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+            # §REFERENCE_TRAJECTORY_PLAN §7: [] / {} (not None) when no references
+            # were attached, matching the "default None -> byte-identical" contract
+            # at the field-VALUE level (json round-trips [] the same either way).
+            "references_used": references_used,
+            "reference_signatures": reference_signatures,
         }
         (out_dir / "meta.json").write_text(
             json.dumps(record, indent=2, default=str), encoding="utf-8")
