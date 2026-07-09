@@ -177,24 +177,49 @@ def _row_to_match(row: dict[str, Any], score: float) -> RefMatch:
     )
 
 
+#: Synonym-bridged matches count HALF a literal match. Rationale
+#: (2026-07-09, found against the real 301-row library): expanding BOTH
+#: sides and summing every overlapping token let one conceptual bridge
+#: ("ground"≈"lie") count as 4 rare tokens' worth of weight, so `lie*`
+#: clips outranked the fallAndGetUp segments for the literal acceptance
+#: query "get up off the ground". A synonym hit is one concept — count
+#: it once per group, discounted below any literal token the user
+#: actually typed.
+_SYNONYM_MATCH_WEIGHT = 0.5
+
+
 def deterministic_rank(
     query: str, rows: list[dict[str, Any]], *, k: int = 10,
 ) -> list[RefMatch]:
-    """Score every row by rarity-weighted synonym-expanded token
-    overlap and return the top `k`, best first. Zero-scoring rows are
-    excluded. Deterministic, offline, never raises on well-formed
-    input — this is the §decision-7 "always on, zero API" floor."""
-    q_tokens = expand_synonyms(tokenize_query(query))
-    if not q_tokens or not rows:
+    """Score every row by rarity-weighted token overlap and return the
+    top `k`, best first. Literal query∩row tokens score full IDF
+    weight; a synonym group bridging the two sides with NO literal
+    overlap inside that group scores once (its strongest present
+    member) at `_SYNONYM_MATCH_WEIGHT`. Zero-scoring rows are excluded.
+    Deterministic, offline, never raises on well-formed input — this is
+    the §decision-7 "always on, zero API" floor."""
+    q_lit = set(tokenize_query(query))
+    if not q_lit or not rows:
         return []
+    q_all = expand_synonyms(sorted(q_lit))
     weights = _idf_weights(rows)
     scored: list[tuple[float, dict[str, Any]]] = []
     for row in rows:
-        r_tokens = expand_synonyms(_row_tokens(row))
-        overlap = q_tokens & r_tokens
-        if not overlap:
+        r_lit = set(_row_tokens(row))
+        r_all = expand_synonyms(sorted(r_lit))
+        literal = q_lit & r_lit
+        score = sum(weights.get(tok, 0.0) for tok in literal)
+        for group in SYNONYM_GROUPS:
+            gs = frozenset(group)
+            if literal & gs:
+                continue  # already credited at full literal weight
+            if (q_all & gs) and (r_all & gs):
+                present = (q_all | r_all) & gs
+                score += _SYNONYM_MATCH_WEIGHT * max(
+                    weights.get(tok, 0.0) for tok in present
+                )
+        if score <= 0.0:
             continue
-        score = sum(weights.get(tok, 0.0) for tok in overlap)
         scored.append((score, row))
     # Stable secondary sort by clip_id keeps ties deterministic across
     # runs/platforms (dict/set iteration order is not a ranking input).
