@@ -167,6 +167,9 @@ export function RewardsTab({
   const [selectedVersion, setSelectedVersion] = useState<number | null>(null);
   const [draftSource, setDraftSource] = useState<string | null>(null);
   const [draftParentVersion, setDraftParentVersion] = useState<number | null>(null);
+  // Watermark for the live auto-follow effect below — declared here so the
+  // scope-reset effect can clear it without a forward reference.
+  const [lastSeenNewest, setLastSeenNewest] = useState<number | null>(null);
 
   useEffect(() => {
     if (selectedVersion === null && list.data && list.data.length > 0) {
@@ -178,15 +181,25 @@ export function RewardsTab({
     setSelectedVersion(null);
     setDraftSource(null);
     setDraftParentVersion(null);
+    setLastSeenNewest(null);
   }, [effectiveScope]);
 
+  // Live auto-follow: while a stage is actively polling (a mission_stage_run
+  // is running), snap the view to a freshly-materialized version so the
+  // user watches Claude iterate in real time. This must NOT fire just
+  // because the user clicked an older version in (read-only) history —
+  // only when `newest` itself has advanced past the last-seen newest do we
+  // treat it as "a new version landed." Track that watermark separately
+  // from `selectedVersion` so manual older-version picks are never
+  // overridden.
   useEffect(() => {
-    if (!isStageScope || !list.data || list.data.length === 0) return;
+    if (!isStageScope || pollMs == null || !list.data || list.data.length === 0) return;
     const newest = list.data[0].version;
-    if (selectedVersion !== null && newest > selectedVersion && draftSource === null) {
+    if (lastSeenNewest !== null && newest > lastSeenNewest && draftSource === null) {
       setSelectedVersion(newest);
     }
-  }, [list.data, isStageScope, selectedVersion, draftSource]);
+    if (newest !== lastSeenNewest) setLastSeenNewest(newest);
+  }, [list.data, isStageScope, pollMs, lastSeenNewest, draftSource]);
 
   const detail = useReward(slug, selectedVersion ?? undefined, effectiveScope, pollMs);
 
