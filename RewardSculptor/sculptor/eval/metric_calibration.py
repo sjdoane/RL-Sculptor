@@ -211,6 +211,209 @@ def calibrate_metric(
     }
 
 
+# ── §REFERENCE_TRAJECTORY_PLAN §6: reference-derived calibration ladders ──
+#
+# Steer-rights for a NOVEL motion (no built-in ground truth, no LLM call)
+# by ranking a competence-ordered ladder built FROM a single attached
+# reference clip: two `degrade()` rungs (noise-injected joints + damped
+# root motion), three `truncate()` rungs (25/50/75%), and the full clip —
+# on top of the SAME degenerate-battery anchor `_validate_references` uses
+# as rung 0. Acceptance is the SAME statistic + threshold discipline as
+# `calibrate_metric` (plain-argsort `spearman`, threshold default 0.7 — a
+# 7-rung ladder has no ties by construction, so the tie-averaged
+# `spearman_midrank` used by the K-source task-derived path is unnecessary
+# here). The result dict is a `calibrate_task_derived`-compatible superset
+# (same `ok`/`rho_min`/`spearman`/`agreement_fraction`/`method` keys) so
+# `compute_trust`/`grant_decision` consume it unchanged.
+def _ref_ladder_spec():
+    """`(rung name, intended_rank, builder)` tuples — `builder(clip) ->
+    perturbed clip`, or `None` for the battery degenerate anchor (rung 0)
+    and the full clip (top rung), both handled specially by the caller.
+    Lazy import (avoids a module-load-time dependency on `sculptor.refs`
+    from `sculptor.eval`)."""
+    from sculptor.refs.perturb import degrade, truncate
+
+    return (
+        ("degenerate_battery", 0, None),
+        ("degrade_heavy", 1, lambda c: degrade(
+            c, joint_noise_rad=0.35, root_damp=0.3, seed=0)),
+        ("degrade_light", 2, lambda c: degrade(
+            c, joint_noise_rad=0.15, root_damp=0.6, seed=0)),
+        ("truncate_25", 3, lambda c: truncate(c, 0.25)),
+        ("truncate_50", 4, lambda c: truncate(c, 0.50)),
+        ("truncate_75", 5, lambda c: truncate(c, 0.75)),
+        ("full_clip", 6, None),
+    )
+
+#: Same nondegeneracy margin discipline as `_validate_references` — the full
+#: reference must clear the battery degenerate anchor by this margin (the
+#: firewall: a metric that can't tell the real reference from a synthetic
+#: still/fallen/chaotic/flail negative earns nothing).
+_REF_SPREAD_MIN = 0.1
+
+
+def calibrate_metric_against_reference(
+    module_path_or_source: Path | str,
+    clip_id: str,
+    clip: dict,
+    *,
+    tier: str,
+    source_kind: str,
+    threshold: float = 0.7,
+    n_envs: int = 4,
+) -> dict[str, Any]:
+    """§REFERENCE_TRAJECTORY_PLAN §6: earn steer/observe rights for a NOVEL
+    motion by ranking a competence ladder built FROM a single reference
+    clip — no LLM call, fully deterministic.
+
+    Ladder (low -> high competence), each rung converted via
+    `sculptor.refs.convert.clip_to_arrays` and scored with the SAME
+    `_score(fn, arrays, meta)` convention `metric_validate` uses for
+    references:
+      0. the fixed synthetic battery's degenerate anchor (max of
+         still/fallen/chaotic/upright_flail on the 12-joint body) — the
+         SAME anchor `_validate_references` computes, so a metric that
+         cannot beat the generic battery negatives never earns rights on a
+         reference either (one firewall, two call sites).
+      1. `degrade(clip, joint_noise_rad=0.35, root_damp=0.3)` — heavily
+         degraded.
+      2. `degrade(clip, joint_noise_rad=0.15, root_damp=0.6)` — lightly
+         degraded.
+      3-5. `truncate(clip, 0.25/0.50/0.75)` — partial completions.
+      6. the full clip.
+
+    Acceptance: Spearman rho over (intended_rank, score) >= `threshold`
+    (default 0.7 — same statistic + threshold as `calibrate_metric`'s
+    builtin-ladder path). `ok=True` iff rho >= threshold AND the firewall
+    passes (rung 0 individually scores below the full-clip score by
+    `_REF_SPREAD_MIN`, mirroring `_validate_references`'
+    `reference_nondegeneracy` gate).
+
+    Rights (§10): `"steer"` iff `tier == "D"` and `ok`; `"observe"` iff
+    `tier == "K"` and `ok`; `"none"` otherwise.
+
+    Never raises: a load failure or a rung that can't be built/scored is
+    recorded as a failed gate, not an exception."""
+    from sculptor.eval.metric_validate import _archetypes, _NAMES_12
+    from sculptor.refs.convert import clip_to_arrays
+
+    trust_tier = f"reference:{tier}:{source_kind}"
+
+    def _record(ok: bool, rho: float, *, ladder=None, reason=None,
+                error=None) -> dict[str, Any]:
+        return {
+            "ok": bool(ok), "method": "reference",
+            "spearman": round(float(rho), 4),
+            "rho_min": round(float(rho), 4),
+            "agreement_fraction": 1.0 if ok else 0.0,
+            "threshold": threshold,
+            "clip_id": clip_id, "tier": tier, "source_kind": source_kind,
+            "trust_tier": trust_tier,
+            "ladder": ladder or [],
+            "rights": ("steer" if (ok and tier == "D")
+                       else "observe" if (ok and tier == "K")
+                       else "none"),
+            "reason": reason, "error": error,
+        }
+
+    # Load the metric (a load failure is a hard, specific deny — mirrors
+    # calibrate_metric's try/except contract).
+    try:
+        gen_module = load_generated_module(module_path_or_source)
+        gen_fn = getattr(gen_module, GENERATED_FN_NAME, None)
+        if not callable(gen_fn):
+            raise ValueError(f"metric lacks a callable {GENERATED_FN_NAME}()")
+        roles = read_required_roles(gen_module)
+    except Exception as e:  # noqa: BLE001
+        return _record(False, 0.0,
+                       reason=f"metric failed to load: {type(e).__name__}: {e}",
+                       error=f"{type(e).__name__}: {e}")
+
+    # Rung 0: the fixed synthetic battery's degenerate anchor — SAME
+    # convention as `_validate_references`' `degenerate_anchor` (max over
+    # still/fallen/chaotic/upright_flail on the 12-joint synthetic body).
+    try:
+        batt_meta = {"joint_names": list(_NAMES_12)}
+        inject_joint_roles(batt_meta, roles, lenient=True)
+        arche = _archetypes()
+        degenerate_anchor = max(
+            (s for s in (
+                _try_score(gen_fn, arche[k], batt_meta)
+                for k in ("still", "fallen", "chaotic", "upright_flail")
+                if k in arche
+            ) if np.isfinite(s)),
+            default=0.0,
+        )
+    except Exception as e:  # noqa: BLE001 — no anchor available = 0.0 (never blocks)
+        degenerate_anchor = 0.0
+
+    ladder: list[dict[str, Any]] = [{
+        "rung": "degenerate_battery", "intended_rank": 0,
+        "score": round(float(degenerate_anchor), 4),
+    }]
+    scores = [degenerate_anchor]
+
+    for name, rank, builder in _ref_ladder_spec()[1:-1]:
+        try:
+            pclip = builder(clip)
+            arrays, meta = clip_to_arrays(pclip, n_envs=n_envs)
+            inject_joint_roles(meta, roles, lenient=True)
+            s = _try_score(gen_fn, arrays, meta)
+        except Exception:  # noqa: BLE001 — a rung that can't be built/scored = 0
+            s = 0.0
+        s = s if np.isfinite(s) else 0.0
+        ladder.append({"rung": name, "intended_rank": rank, "score": round(float(s), 4)})
+        scores.append(s)
+
+    # Top rung: the full clip.
+    try:
+        arrays, meta = clip_to_arrays(clip, n_envs=n_envs)
+        inject_joint_roles(meta, roles, lenient=True)
+        full_score = _try_score(gen_fn, arrays, meta)
+    except Exception:  # noqa: BLE001
+        full_score = 0.0
+    full_score = full_score if np.isfinite(full_score) else 0.0
+    ladder.append({"rung": "full_clip", "intended_rank": 6, "score": round(float(full_score), 4)})
+    scores.append(full_score)
+
+    ranks = [rung["intended_rank"] for rung in ladder]
+    rho = spearman(ranks, scores)
+
+    # Firewall (mirrors `_validate_references`' `reference_nondegeneracy`
+    # gate): the battery degenerate anchor must ALSO individually score
+    # below the full-reference score by >= `_REF_SPREAD_MIN` — a metric
+    # that ranks the ladder monotonically by coincidence but can't
+    # separate the real reference from a generic negative earns nothing.
+    firewall_ok = bool(
+        np.isfinite(full_score) and np.isfinite(degenerate_anchor)
+        and full_score >= degenerate_anchor + _REF_SPREAD_MIN)
+
+    ok = bool(rho >= threshold) and firewall_ok
+    if ok:
+        reason = None
+    elif not firewall_ok:
+        reason = (f"reference:{clip_id}: full-clip score {full_score:.3f} does "
+                  f"not beat the battery degenerate anchor {degenerate_anchor:.3f} "
+                  f"+ spread_min {_REF_SPREAD_MIN} — gameable by a generic "
+                  f"still/fallen/chaotic/flail negative")
+    else:
+        reason = (f"reference:{clip_id}: ladder rank-correlation rho={rho:.3f} "
+                  f"< threshold {threshold} — the metric does not grade "
+                  f"reference competence monotonically")
+
+    return _record(ok, rho, ladder=ladder, reason=reason)
+
+
+def _try_score(fn, arrays: dict, meta: dict) -> float:
+    """`_score`-equivalent that never raises (a crashing metric scores 0.0
+    on that rung, mirroring `calibrate_metric`'s per-rung crash handling)."""
+    try:
+        out = fn(arrays, _BEHAVIOR, meta)
+        return float(out.get("spec_score", 0.0))
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
 # ── §Ship 51: L2 task-derived calibration (the novel-task unblocker) ──────
 
 #: Gate constants (auditable, byte-stable; kwargs-overridable in tests). The
