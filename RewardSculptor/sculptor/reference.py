@@ -94,16 +94,50 @@ def validate_clip(clip: dict) -> list[str]:
         names = clip.get("joint_names") or []
         if jp.ndim == 2 and len(names) != jp.shape[1]:
             errors.append("joint_names length must equal joint_pos J")
+    # ── R1 optional keys (schema-reserved / library ingest) ─────────────
+    xy = clip.get("root_pos_xy")
+    if xy is not None and (
+            not isinstance(xy, np.ndarray) or xy.shape != (z.shape[0], 2)
+            or not np.isfinite(xy).all()):
+        errors.append("root_pos_xy must be finite with shape [T, 2]")
+    quat = clip.get("root_quat_wxyz")
+    if quat is not None:
+        if (not isinstance(quat, np.ndarray) or quat.shape != (z.shape[0], 4)
+                or not np.isfinite(quat).all()):
+            errors.append("root_quat_wxyz must be finite with shape [T, 4]")
+        else:
+            norms = np.linalg.norm(quat, axis=1)
+            if not np.allclose(norms, 1.0, atol=1e-3):
+                errors.append(
+                    "root_quat_wxyz rows must be unit-norm (within 1e-3)")
+    jv = clip.get("joint_vel")
+    if jv is not None:
+        if (not isinstance(jv, np.ndarray) or jv.ndim != 2
+                or jv.shape[0] != z.shape[0] or not np.isfinite(jv).all()):
+            errors.append("joint_vel must be finite with shape [T, J]")
+        elif jp is not None and isinstance(jp, np.ndarray) and jv.shape != jp.shape:
+            errors.append("joint_vel shape must match joint_pos shape [T, J]")
+    for key in ("contact_left_foot", "contact_right_foot"):
+        c = clip.get(key)
+        if c is not None and (
+                not isinstance(c, np.ndarray) or c.shape != (z.shape[0],)
+                or not np.isfinite(c).all()):
+            errors.append(f"{key} must be finite with shape [T]")
     return errors
 
 
 def _with_velocity(clip: dict) -> dict:
     """Return the clip with `root_vel_z` present (finite-difference when
-    the source didn't carry velocities)."""
+    the source didn't carry velocities), and likewise `joint_vel` backfilled
+    by finite difference when `joint_pos` is present but `joint_vel` isn't."""
     if clip.get("root_vel_z") is None:
         clip = dict(clip)
         clip["root_vel_z"] = np.gradient(
             clip["root_pos_z"]) * float(clip["fps"])
+    if clip.get("joint_pos") is not None and clip.get("joint_vel") is None:
+        clip = dict(clip)
+        clip["joint_vel"] = np.gradient(
+            clip["joint_pos"], axis=0) * float(clip["fps"])
     return clip
 
 
@@ -120,7 +154,9 @@ def save_clip(path: Path | str, clip: dict) -> Path:
         "fps": np.float32(clip["fps"]),
         "meta_json": np.bytes_(json.dumps(clip.get("meta") or {}).encode()),
     }
-    for opt in ("root_vel_z", "joint_pos"):
+    for opt in (
+            "root_vel_z", "joint_pos", "root_pos_xy", "root_quat_wxyz",
+            "joint_vel", "contact_left_foot", "contact_right_foot"):
         if clip.get(opt) is not None:
             payload[opt] = clip[opt].astype(np.float32)
     if clip.get("joint_names"):
@@ -140,6 +176,11 @@ def load_clip(path: Path | str) -> dict:
             clip["root_vel_z"] = z["root_vel_z"].astype(np.float64)
         if "joint_pos" in z.files:
             clip["joint_pos"] = z["joint_pos"].astype(np.float64)
+        for opt in (
+                "root_pos_xy", "root_quat_wxyz", "joint_vel",
+                "contact_left_foot", "contact_right_foot"):
+            if opt in z.files:
+                clip[opt] = z[opt].astype(np.float64)
         if "joint_names" in z.files:
             clip["joint_names"] = [str(n) for n in z["joint_names"]]
         if "meta_json" in z.files:

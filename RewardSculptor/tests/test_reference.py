@@ -89,6 +89,47 @@ def test_save_refuses_invalid_and_load_derives_velocity(tmp_path: Path) -> None:
     assert float(loaded["root_vel_z"].max()) > 1.0    # real takeoff spike
 
 
+# ── §R1_BUILD_SPEC decision 2: optional library-clip keys ────────────────
+def test_optional_library_keys_absent_by_default() -> None:
+    """A clip with none of the R1 keys still validates clean — they are
+    schema-RESERVED, not required (§decision 2)."""
+    clip = make_procedural_jump_clip()
+    assert validate_clip(clip) == []
+    for key in ("root_pos_xy", "root_quat_wxyz", "joint_vel",
+                "contact_left_foot", "contact_right_foot"):
+        assert key not in clip
+
+
+def test_joint_vel_backfilled_alongside_root_vel_z(tmp_path: Path) -> None:
+    """`_with_velocity`'s finite-diff backfill pattern extended to
+    `joint_vel`: present after load whenever `joint_pos` is present,
+    even if the saved clip never carried it."""
+    clip = make_procedural_jump_clip()
+    clip = {k: v for k, v in clip.items()
+            if k not in ("root_vel_z", "joint_vel")}
+    p = save_clip(tmp_path / "no_vel.npz", clip)
+    loaded = load_clip(p)
+    assert "joint_vel" in loaded
+    assert loaded["joint_vel"].shape == loaded["joint_pos"].shape
+    assert np.isfinite(loaded["joint_vel"]).all()
+
+
+def test_root_quat_wxyz_unit_norm_gate() -> None:
+    n = 20
+    ok_quat = np.zeros((n, 4))
+    ok_quat[:, 0] = 1.0
+    clip_ok = {"root_pos_z": np.full(n, 0.78), "fps": 30.0,
+               "root_quat_wxyz": ok_quat}
+    assert validate_clip(clip_ok) == []
+
+    bad_quat = ok_quat.copy()
+    bad_quat[0, 0] = 5.0  # not unit-norm
+    clip_bad = {"root_pos_z": np.full(n, 0.78), "fps": 30.0,
+                "root_quat_wxyz": bad_quat}
+    errors = validate_clip(clip_bad)
+    assert any("unit-norm" in e for e in errors)
+
+
 # ── RSI derivation ──────────────────────────────────────────────────────
 def test_derive_rsi_keys_within_validator_bounds() -> None:
     clip = make_procedural_jump_clip(apex_gain_m=0.35)

@@ -1569,5 +1569,101 @@ def reference_jump(
         typer.echo(_json.dumps(derive_rsi_train_keys(c), indent=2))
 
 
+# ── sculpt refs: reference motion library (§R1_BUILD_SPEC) ──────────────
+refs_app = typer.Typer(
+    name="refs",
+    help="Reference motion library: ingest/index/list retargeted mocap "
+         "clips (LAFAN1-g1, fleaven-g1) for RSI. `refs search` lands in a "
+         "later worker.",
+    no_args_is_help=True,
+)
+app.add_typer(refs_app, name="refs")
+
+
+@refs_app.command("ingest")
+def refs_ingest(
+    source: str = typer.Option(
+        ..., "--source",
+        help="Dataset source: lafan1-g1 | fleaven-g1."),
+    filter_glob: Optional[str] = typer.Option(
+        None, "--filter", help="fnmatch glob over source filenames, "
+        "e.g. '*fallAndGetUp*'."),
+    no_preview: bool = typer.Option(
+        False, "--no-preview",
+        help="Skip preview.png generation (also the automatic fallback "
+             "when the preview module/GL context is unavailable)."),
+    limit: Optional[int] = typer.Option(
+        None, "--limit", help="Cap number of source files fetched this run."),
+) -> None:
+    """Download + validate + index a batch of clips from a public HF
+    dataset (plain HTTPS, ungated). Idempotent: re-running skips clips
+    whose content hash is already indexed. Rejects are never fatal —
+    logged to `index_rejects.jsonl` with a reason; see that file for
+    anything skipped this run."""
+    from sculptor.refs.ingest import ingest_source
+    from sculptor.refs.library import rebuild_index
+
+    summary = ingest_source(
+        source, filter_glob=filter_glob, limit=limit, no_preview=no_preview,
+        progress=lambda msg: typer.echo(msg))
+
+    if not no_preview:
+        try:
+            import sculptor.refs.preview  # noqa: F401
+        except ModuleNotFoundError:
+            typer.echo(
+                "[refs ingest] preview module not available yet — "
+                "continuing without previews (never blocks ingest)")
+
+    rows = rebuild_index()
+    typer.echo(
+        f"[refs ingest] accepted={len(summary.accepted)} "
+        f"rejected={len(summary.rejected)} "
+        f"skipped_existing={len(summary.skipped_existing)} "
+        f"index_rows={len(rows)}")
+    if summary.rejected:
+        typer.echo("[refs ingest] rejected clips:")
+        for clip_id, reason in summary.rejected:
+            typer.echo(f"  - {clip_id}: {reason}")
+
+
+@refs_app.command("index")
+def refs_index() -> None:
+    """Rebuild `index.jsonl` from every `<robot>/<clip_id>/provenance.json`
+    on disk. The index is a cache — provenance is truth — so this is safe
+    to run any time (e.g. after a manual edit or a partial ingest)."""
+    from sculptor.refs.library import rebuild_index
+
+    rows = rebuild_index()
+    typer.echo(f"[refs index] rebuilt {len(rows)} row(s)")
+
+
+@refs_app.command("list")
+def refs_list(
+    robot: Optional[str] = typer.Option(
+        None, "--robot", help="Filter to one robot (default: all)."),
+) -> None:
+    """List indexed clips (reads index.jsonl; run `sculpt refs index` first
+    if it's missing or stale)."""
+    from sculptor.refs.library import read_index
+
+    rows = read_index()
+    if robot:
+        rows = [r for r in rows if r.get("robot") == robot]
+    if not rows:
+        typer.echo("[refs list] no clips indexed (run `sculpt refs ingest` "
+                    "then `sculpt refs index`)")
+        return
+    for row in rows:
+        preview = "preview" if row.get("has_preview") else "no-preview"
+        typer.echo(
+            f"{row['clip_id']:<40} robot={row['robot']:<6} "
+            f"tier={row.get('tier', '?'):<3} "
+            f"frames={row.get('n_frames', '?'):<6} "
+            f"fps={row.get('fps', '?'):<6} "
+            f"dur={row.get('duration_s', '?')}s "
+            f"[{preview}]  {row.get('text', '')}")
+
+
 if __name__ == "__main__":  # pragma: no cover
     app()
