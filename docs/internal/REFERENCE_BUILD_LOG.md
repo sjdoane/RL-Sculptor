@@ -194,6 +194,24 @@ metrics D18-certified. Ops rule while a mission runs: NO sculptor-package
 edits (iterations re-import the package; mid-run code drift corrupts the
 experiment) and no backend restarts (kills the job).
 
+### D19. Archetype is START-STATE only; reset anchor is absolute (live find #6)
+Stage 1 (torso_righting) PASSED its success criterion from the lying
+reset — first stage of the get-up mission trained and certified end to
+end. Stage 2 then exposed two coupled defects: (a) its lie-to-crouch
+reference (z 0.00→0.28, never stands) failed the getup end-condition and
+misrouted to airborne — jump RSI, fell_over armed, NO eval reset (eval
+resets standing ⇒ the certified started-low metric could never score);
+(b) the getup offset anchored on the CLIP'S OWN END as "standing", so
+even correctly-routed lie-to-crouch clips derived a crouch-height reset.
+Fixes: archetype = start-window only (jumps start standing — that alone
+separates them; documented gap: mid-height starts like crouch-to-stand
+need a future mid_start class); offset anchored on absolute G1-class
+standing 0.74 m (same-robot retargets transfer metres) with a 0.10 m
+floor for ground-clamped source data. All four stage clips now derive
+lying resets 0.10-0.24 m. Meta-rule (now thrice-earned): every
+assumption about clip SHAPE must live in exactly one classifier with QC
+enforcement, or the next clip shape silently breaks a consumer.
+
 ### Audit findings deferred (logged, not yet fixed)
 - Tier-D spoofing (LOW, latent): calibrate_metric_against_reference's
   `tier` arg comes from caller/provenance (user-writable) — no production

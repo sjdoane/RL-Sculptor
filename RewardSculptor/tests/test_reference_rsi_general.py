@@ -493,3 +493,27 @@ def test_getup_clip_saved_and_loaded_via_library_roundtrip_still_derives(
     assert "reset_pitch_offset_rad" in derived
     z_min = float(loaded["root_pos_z"].min())
     assert derived["min_base_height_termination_m"] < z_min
+
+
+def test_lie_to_crouch_clip_derives_lying_reset_d19():
+    """D19 regression pin: a low-start clip that ends in a CROUCH (never
+    stands) must classify getup and derive a LYING reset anchored on the
+    absolute G1-class standing height — the old clip-end anchor produced
+    a ~0.56 m reset (a crouch) for exactly this shape, and no eval reset
+    at all (airborne misroute) while a real mission was training."""
+    import numpy as np
+    from sculptor.reference import (
+        _archetype, derive_eval_reset, derive_reference_reset)
+    T, fps = 240, 30.0
+    t = np.linspace(0.0, 1.0, T)
+    z = 0.02 + 0.24 * np.clip((t - 0.3) / 0.5, 0.0, 1.0)  # 0.02 -> 0.26 crouch
+    clip = {"root_pos_z": z, "fps": fps}
+    assert _archetype(clip) == "getup"
+    r = derive_reference_reset(clip)
+    lo, hi = r["reset_height_offset_m"]
+    # floor clamp: ground-clamped 0.02 m start must not go below 0.10 m
+    assert 0.74 + lo >= 0.10 - 1e-9
+    assert 0.74 + hi <= 0.35  # genuinely lying, never a crouch-height reset
+    assert r["fell_over_termination"] is False
+    e = derive_eval_reset(clip)
+    assert e is not None and e["fell_over_termination"] is False

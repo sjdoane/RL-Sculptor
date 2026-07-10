@@ -129,6 +129,15 @@ _GETUP_END_MIN_M = 0.55  # aligned with refs/segment.py QC_END_MIN_MEAN_Z (D15)
 # termination at reset. §8: "sunk-height termination must NOT fire at
 # reset."
 _GETUP_SUNK_MARGIN_M = 0.05
+# D19: absolute anchor for low-start reset offsets. Clips are same-robot
+# retargets, so their metre heights transfer directly; the env-spec
+# offset is relative to the task's default (standing) reset, for which
+# this G1-class constant is the module's working assumption (same basis
+# as the archetype thresholds). _MIN_RESET_Z_M floors the requested
+# reset height: ground-clamped source data (root z = 0.00 while lying)
+# must not put the pelvis inside the floor at reset.
+_G1_CLASS_STAND_M = 0.74
+_MIN_RESET_Z_M = 0.10
 
 
 # ── Clip format ─────────────────────────────────────────────────────────
@@ -391,35 +400,38 @@ def _clamp_scalar(key: str, v: float) -> float:
 
 
 def _archetype(clip: dict) -> str:
-    """Classify a reference clip's start/end shape (§8).
+    """Classify a reference clip's shape (§8).
 
     Checked in this order:
 
-    1. ``"getup"`` — the clip STARTS low (near-ground root height) and
-       ENDS high (standing), i.e. a low→high PERMANENT transition. This
-       is checked FIRST: a get-up clip's height trivially "rises above
-       its early-window baseline" too (it starts on the ground), so the
-       airborne rule alone would misclassify it. A real jump clip starts
-       standing, so it can never satisfy the get-up start condition —
-       ordering the checks this way does not change airborne detection.
-    2. ``"airborne"`` — the clip rises above its own EARLY-window
-       baseline at some point (the pre-existing jump-clip rule, kept
-       byte-for-byte so jump-clip derivation is unaffected).
-    3. ``"other"`` — neither; never rises, never a low→high transition.
+    1. ``"getup"`` — the clip STARTS low (near-ground root height).
+       D19: the classification is START-STATE ONLY. It originally also
+       required a standing END, which misrouted a real lie-to-crouch
+       reference (z 0.00→0.28) to the airborne branch mid-mission: the
+       stage got jump-style RSI, fell_over stayed armed, and NO eval
+       reset was derived — eval rollouts reset standing, so the stage's
+       certified started-low metric could never score above zero.
+       Reset derivation only cares where the motion BEGINS: every
+       low-start clip (get-up, lie-to-crouch, crawl, lying-hold) wants
+       the same low reset semantics — initial-window pose, orientation,
+       posture target, fell_over disabled, sunk guard below the clip's
+       own minimum. A real jump clip starts STANDING, so the start
+       condition alone still cleanly separates airborne clips.
+    2. ``"airborne"`` — starts high and rises above its own EARLY-window
+       baseline (the pre-existing jump-clip rule, byte-identical).
+    3. ``"other"`` — neither. (Known gap, documented not solved: a
+       mid-height start like crouch-to-stand at z≈0.4 routes to
+       airborne/other; add a "mid_start" class when a real mission
+       needs one.)
     """
     z = clip["root_pos_z"]
     fps = float(clip["fps"])
-    # Start/end windows: the LARGER of 0.5 s and 10% of the clip, MEAN
-    # aggregation — aligned with refs/segment.py's per-segment QC windows.
-    # A 0.5 s end-MEDIAN misclassified a real QC-passing get-up segment
-    # as airborne (the final instant dips to 0.52 m as the subject
-    # settles after standing; the last-10% mean is 0.64 m) — so the
-    # training env got jump-style RSI instead of a lying reset (found
-    # live in the first get-up mission run, D15).
+    # Start window: the LARGER of 0.5 s and 10% of the clip, MEAN
+    # aggregation — aligned with refs/segment.py's per-segment QC windows
+    # (a 0.5 s end-MEDIAN once misclassified a QC-passing segment, D15).
     nw = max(2, int(_ARCHETYPE_WINDOW_S * fps), int(0.1 * len(z)))
     start = float(np.mean(z[:nw]))
-    end = float(np.mean(z[-nw:]))
-    if start < _GETUP_START_MAX_M and end > _GETUP_END_MIN_M:
+    if start < _GETUP_START_MAX_M:
         return "getup"
     n0 = max(2, int(0.2 * fps))
     z0 = float(np.median(z[:n0]))
@@ -467,17 +479,29 @@ def derive_rsi_train_keys(clip: dict) -> dict:
         nw = max(2, int(_ARCHETYPE_WINDOW_S * fps))
         z_start_lo = float(z[:nw].min())
         z_start_hi = float(z[:nw].max())
-        z_stand = float(np.median(z[-nw:]))          # clip's own "standing"
         vz_start = vz[:nw]
         z_min = float(z.min())
         sunk_lo, sunk_hi = _TRAIN_SCALARS["min_base_height_termination_m"]
         sunk = _clamp_scalar(
             "min_base_height_termination_m",
             min(max(z_min - _GETUP_SUNK_MARGIN_M, sunk_lo), sunk_hi))
+        # D19 follow-through: the offset anchor was `z_stand = clip's own
+        # END-window median` — valid ONLY while every low-start clip
+        # ended standing. A real lie-to-crouch reference (end 0.22 m)
+        # made the "offset" -0.22, i.e. a reset at ~0.56 m: a CROUCH,
+        # not the clip's lying start. Clips in this library are
+        # same-robot retargets, so absolute heights transfer: anchor on
+        # the G1-class standing height constant (same geometry basis as
+        # the archetype thresholds above), with a physical floor so
+        # ground-clamped source data (z=0.00 lying) can't request a
+        # reset inside the floor.
+        lo = max(z_start_lo - _G1_CLASS_STAND_M,
+                 _MIN_RESET_Z_M - _G1_CLASS_STAND_M)
+        hi = max(z_start_hi - _G1_CLASS_STAND_M,
+                 _MIN_RESET_Z_M - _G1_CLASS_STAND_M)
         return {
             "reset_height_offset_m": _clamp_range(
-                "reset_height_offset_m",
-                z_start_lo - z_stand, z_start_hi - z_stand),
+                "reset_height_offset_m", lo, hi),
             "reset_vertical_velocity_mps": _clamp_range(
                 "reset_vertical_velocity_mps",
                 float(vz_start.min()), float(vz_start.max())),
