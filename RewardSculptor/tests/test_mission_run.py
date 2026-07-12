@@ -3793,6 +3793,51 @@ def test_reference_signature_written_when_needs_rsi_false(
     assert sig_path.is_file()
 
 
+def test_reference_signature_span_key_and_cropped_duration(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """§D24 F1 item 5: a stage carrying persisted reference span fields
+    writes `reference_signature.json` with the additive `"span"` key AND
+    a `signature.duration_s` matching the CROPPED window, not the full
+    clip's — the scaffold-level proof that `sculpt.py`'s block 2.6
+    resolves through the one loader (`load_stage_reference_clip`)
+    instead of loading the full clip independently."""
+    from sculptor import sculpt as sculpt_mod
+
+    lib_root = tmp_path / "reflib"
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(lib_root))
+    _write_library_clip(lib_root, "g1", "test_getup_clip")  # ~2.2s @ 50fps
+
+    m = _make_mission(tmp_path, n_stages=1)
+    m.stages[0].needs_reference_rsi = False
+    m.stages[0].reference_clip_id = "test_getup_clip"
+    m.stages[0].reference_tier = "K"
+    m.stages[0].reference_span_start_s = 0.0
+    m.stages[0].reference_span_end_s = 1.0
+    m.stages[0].reference_span_confidence = 0.83
+    m.stages[0].reference_span_method = "llm+snap+qc"
+
+    fake = _fake_sculpt_run_factory(metric=0.9)
+    monkeypatch.setattr(sculpt_mod, "sculpt_run", fake)
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
+    )
+
+    events: list[dict] = []
+    result = sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab", kg_store=None, on_event=events.append,
+    )
+    assert result.completed is True
+
+    sig_path = Path(m.mission_dir) / "stages" / "stage_0" / "reference_signature.json"
+    payload = json.loads(sig_path.read_text())
+    assert payload["span"] == {
+        "t_start_s": 0.0, "t_end_s": 1.0,
+        "confidence": 0.83, "method": "llm+snap+qc",
+    }
+    assert payload["signature"]["duration_s"] == pytest.approx(1.0, abs=1e-3)
+
+
 def test_reference_signature_text_from_provenance(
     tmp_path: Path, monkeypatch, stub_adapter,
 ):
@@ -4455,6 +4500,15 @@ def test_redecompose_inherits_reference_binding_and_forces_rsi_with_eval_reset(
         _StageModel,
     )
 
+    # §D24 F1 item 4b: `redecompose_stage` now runs per-sub-stage span
+    # selection for an inherited clip — stub it out so this test (about
+    # reference-BINDING inheritance, not span selection) never risks a
+    # real LLM call even if "fallandgetup1_subject1--seg00" happens to
+    # resolve on this machine's real reference library.
+    monkeypatch.setattr(
+        "sculptor.refs.spans.select_reference_span",
+        lambda *a, **kw: (None, "test-no-network"))
+
     m = _make_mission(tmp_path, n_stages=1)
     failed = m.stages[0]
     failed.needs_reference_rsi = True
@@ -4549,6 +4603,11 @@ def test_redecompose_inherits_reference_binding_without_forcing_rsi(
         _StageModel,
     )
 
+    # §D24 F1 item 4b: stub span selection — see the sibling test above.
+    monkeypatch.setattr(
+        "sculptor.refs.spans.select_reference_span",
+        lambda *a, **kw: (None, "test-no-network"))
+
     m = _make_mission(tmp_path, n_stages=1)
     failed = m.stages[0]
     failed.needs_reference_rsi = True
@@ -4617,6 +4676,72 @@ def test_redecompose_inherits_reference_binding_without_forcing_rsi(
         assert sub.reference_match_confidence == pytest.approx(0.6)
 
 
+# ── §D24 F1 item 4b: redecompose inherits the CLIP but never the SPAN ──────
+def test_redecompose_inherits_clip_but_not_span(tmp_path: Path, monkeypatch):
+    """§D24 F1 (docs/internal/REFERENCE_BUILD_LOG.md D23/D24): every
+    sub-stage unconditionally inherits the failed stage's
+    reference_clip_id/tier/match_confidence (D21, unchanged) but NEVER
+    its reference_span_* fields — a new sub-goal needs its OWN span,
+    freshly re-selected. Proven here by giving the FAILED stage a
+    (fake, pre-existing) span and a span selector that DECLINES for
+    every sub-stage: if inheritance were happening, the sub-stages
+    would show the failed stage's stale span values instead of None."""
+    from sculptor import decompose as dc
+    from sculptor.decompose import StageTrainingFeedback
+
+    monkeypatch.setattr(
+        "sculptor.refs.spans.select_reference_span",
+        lambda *a, **kw: (None, "test-declined"))
+
+    m = _make_mission(tmp_path, n_stages=1)
+    failed = m.stages[0]
+    failed.needs_reference_rsi = True
+    failed.success_criterion = "metric > 0.5"
+    failed.reference_clip_id = "some_jump_clip"
+    failed.reference_tier = "B"
+    failed.reference_match_confidence = 0.6
+    # A stale pre-existing span on the FAILED stage — must never leak
+    # onto the sub-stages via a naive field copy.
+    failed.reference_span_start_s = 2.0
+    failed.reference_span_end_s = 5.0
+    failed.reference_span_confidence = 0.99
+    failed.reference_span_method = "llm+snap+qc"
+
+    response = _make_redecompose_response("stage_0", n_sub=2)
+
+    def fake_parse(client, system_prompt, user_content, *,
+                   output_format=None, model=None, max_tokens=None):
+        return response
+
+    monkeypatch.setattr(dc, "_parse_with_retry", fake_parse)
+
+    feedback = StageTrainingFeedback(
+        final_reward_source="def compute_reward(s,a,n,i): return 0.0, {}\n",
+        last_iter_diagnosis={},
+        last_iter_namespace={"behavior": {}, "components": {}, "metric": 0.3},
+        metric_history=[0.3],
+        last_3_iter_components=[{}],
+        failure_reason="criterion_not_met",
+    )
+
+    sub_stages = dc.redecompose_stage(
+        m, 0, feedback=feedback, reward_contract=_FakeContract(),
+        kg_store=None, client=object(),
+    )
+
+    assert len(sub_stages) == 2
+    for sub in sub_stages:
+        # Clip binding IS inherited (D21, unchanged).
+        assert sub.reference_clip_id == "some_jump_clip"
+        assert sub.reference_tier == "B"
+        # Span fields are NOT — every one is None, never the failed
+        # stage's stale 2.0/5.0/0.99/"llm+snap+qc" values.
+        assert sub.reference_span_start_s is None
+        assert sub.reference_span_end_s is None
+        assert sub.reference_span_confidence is None
+        assert sub.reference_span_method is None
+
+
 def test_redecompose_reference_dir_lookup_degrades_gracefully(
     tmp_path: Path, monkeypatch,
 ):
@@ -4675,6 +4800,12 @@ def test_redecomposition_reference_inherited_event(
     redecomposition, carrying the inherited clip id and whether the
     forced-RSI override fired."""
     from sculptor import sculpt as sculpt_mod
+
+    # §D24 F1 item 4b: stub span selection — see the redecompose tests
+    # above; this test goes through `mission_run`'s real redecompose path.
+    monkeypatch.setattr(
+        "sculptor.refs.spans.select_reference_span",
+        lambda *a, **kw: (None, "test-no-network"))
 
     m = _make_mission(tmp_path, n_stages=1)
     m.stages[0].reference_clip_id = "fallandgetup1_subject1--seg00"

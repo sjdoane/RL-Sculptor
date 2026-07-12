@@ -4694,25 +4694,40 @@ def _resolve_stage_rsi_clip(
     proceed) when it is not None. Cases 2/3 never set it — a missing
     jump.npz is precedence falling through to the always-available
     procedural clip, not an error condition.
+
+    §D24 F1 item 5 (docs/internal/REFERENCE_BUILD_LOG.md D19/D23/D24):
+    case 1 resolves through `sculptor.mission_metrics.
+    load_stage_reference_clip` (the ONE loader) so a stage carrying a
+    persisted reference span gets the CROPPED clip here too — RSI and
+    eval-reset derivation must agree with what certification scored
+    (§D19's "every clip-shape assumption in ONE place" rule; D23's
+    root-cause chain was exactly cert/RSI/eval-reset disagreeing about
+    what the stage's motion IS). `clip_src` gains a `[t0-t1s]` suffix
+    only when a span applied — byte-identical to before for every
+    stage without one (existing event-payload assertions rely on this).
     """
-    from sculptor.reference import load_clip, make_procedural_jump_clip
+    from sculptor.reference import make_procedural_jump_clip
+    from sculptor.reference import load_clip as _load_clip_fallback
 
     stage_clip_id = getattr(stage, "reference_clip_id", None)
     if stage_clip_id:
         try:
-            from sculptor.refs import library as refs_library
+            from sculptor.mission_metrics import load_stage_reference_clip
 
-            stage_clip_path = (
-                refs_library.clip_dir(robot, stage_clip_id)
-                / refs_library.CLIP_FILENAME)
-            clip = load_clip(stage_clip_path)
-            return clip, f"library:{robot}/{stage_clip_id}", None
+            loaded = load_stage_reference_clip(stage, robot)
+            # `stage_clip_id` truthy just above guarantees `loaded` is not
+            # None — the loader only returns None for a falsy clip id.
+            _clip_id, clip, span_meta = loaded
+            src = f"library:{robot}/{stage_clip_id}"
+            if span_meta is not None:
+                src += f"[{span_meta['t_start_s']:.2f}-{span_meta['t_end_s']:.2f}s]"
+            return clip, src, None
         except Exception as e:  # noqa: BLE001 — fatal for this stage; no fallback
             return None, None, f"{type(e).__name__}: {e}"
 
     clip_path = project_root / "reference" / "jump.npz"
     if clip_path.is_file():
-        return load_clip(clip_path), str(clip_path), None
+        return _load_clip_fallback(clip_path), str(clip_path), None
     return make_procedural_jump_clip(), "procedural:jump", None
 
 
@@ -5258,17 +5273,21 @@ def _run_one_stage(
     stage_reference_clip_id = getattr(stage, "reference_clip_id", None)
     if stage_reference_clip_id and not (
             stage_dir / "reference_signature.json").is_file():
+        sig_span_meta: Optional[dict] = None
         try:
             project_root = mission_dir.parent.parent
             sig_robot = _stage_reference_robot_slug(
                 stage_dir=stage_dir, project_root=project_root)
             from sculptor.refs import library as refs_library
-            from sculptor.reference import load_clip
+            # §D24 F1 item 5: the ONE loader — a persisted reference span
+            # crops the signature clip here too, so the LOCKED
+            # reference_signature.json a sibling worker's diagnose/edit
+            # prompts consume verbatim reflects the SAME motion
+            # certification scored, not the full clip.
+            from sculptor.mission_metrics import load_stage_reference_clip
 
-            sig_clip_path = (
-                refs_library.clip_dir(sig_robot, stage_reference_clip_id)
-                / refs_library.CLIP_FILENAME)
-            sig_clip = load_clip(sig_clip_path)
+            loaded = load_stage_reference_clip(stage, sig_robot)
+            _sig_clip_id, sig_clip, sig_span_meta = loaded
         except Exception as e:  # noqa: BLE001 — non-fatal (item 6)
             sig_clip = None
             emit({
@@ -5318,6 +5337,17 @@ def _run_one_stage(
                     "text": sig_text,
                     "signature": kinematic_signature(sig_clip),
                 }
+                # §D24 F1 item 5: optional, additive key — schema stays 1
+                # (reference_context.load_reference_signature ignores
+                # unknown keys). Present only when the stage carries a
+                # persisted reference span.
+                if sig_span_meta is not None:
+                    signature_payload["span"] = {
+                        "t_start_s": sig_span_meta["t_start_s"],
+                        "t_end_s": sig_span_meta["t_end_s"],
+                        "confidence": sig_span_meta["confidence"],
+                        "method": sig_span_meta["method"],
+                    }
                 sig_path = stage_dir / "reference_signature.json"
                 sig_path.write_text(
                     json.dumps(
@@ -6163,6 +6193,11 @@ def _maybe_redecompose_and_splice(
                 reward_contract=reward_contract,
                 kg_store=kg_store,
                 prior_attempt_error=prior_error,
+                # §D24 F1 item 4b: resolves the reference-library robot
+                # slug for per-sub-stage span selection — same hint the
+                # adapter already exposes (mirrors mission_jobs.py's
+                # `robot_hint=getattr(adapter, "task_id", None)`).
+                robot_hint=getattr(adapter, "task_id", None),
             )
         except (MissionValidationError, DecompositionError) as e:
             last_reason, last_detail = "validation_failed", f"{type(e).__name__}: {e}"

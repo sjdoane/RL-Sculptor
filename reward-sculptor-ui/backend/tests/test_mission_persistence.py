@@ -41,6 +41,13 @@ def _stage_dict(
     failure_reason: str | None = None,
     failure_detail: str | None = None,
     start_pose: str | None = None,
+    reference_clip_id: str | None = None,
+    reference_tier: str | None = None,
+    reference_match_confidence: float | None = None,
+    reference_span_start_s: float | None = None,
+    reference_span_end_s: float | None = None,
+    reference_span_confidence: float | None = None,
+    reference_span_method: str | None = None,
 ) -> dict:
     return {
         "name": name,
@@ -62,6 +69,13 @@ def _stage_dict(
         "failure_reason": failure_reason,
         "failure_detail": failure_detail,
         "start_pose": start_pose,
+        "reference_clip_id": reference_clip_id,
+        "reference_tier": reference_tier,
+        "reference_match_confidence": reference_match_confidence,
+        "reference_span_start_s": reference_span_start_s,
+        "reference_span_end_s": reference_span_end_s,
+        "reference_span_confidence": reference_span_confidence,
+        "reference_span_method": reference_span_method,
     }
 
 
@@ -263,6 +277,45 @@ def test_start_pose_mirrors_through_to_api(
     stages = {s["name"]: s for s in r.json()["stages"]}
     assert stages["a"]["start_pose"] == "supine"
     assert stages["b"]["start_pose"] is None
+
+
+def test_reference_span_mirrors_through_to_api(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    """§D24 F1: mirrors sculptor.mission.Stage.reference_span_start_s/
+    _end_s/_confidence/_method through `_stages_to_schema` onto the GET
+    .../missions/{ms} wire response, same drill as start_pose /
+    reference_clip_id above. A stage with a clip but no span (or no
+    clip at all) mirrors all four as null."""
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _write_mission(project_dir, "m1", [
+        _stage_dict(
+            "a", reference_clip_id="getup_demo_clip", reference_tier="K",
+            reference_match_confidence=0.9,
+            reference_span_start_s=0.0, reference_span_end_s=8.5,
+            reference_span_confidence=0.83,
+            reference_span_method="llm+snap+qc",
+        ),
+        _stage_dict(
+            "b", parent_stage="a", reference_clip_id="getup_demo_clip",
+        ),
+        _stage_dict("c", parent_stage="a"),  # no reference at all
+    ])
+
+    r = client.get(f"/projects/{slug}/missions/m1")
+    stages = {s["name"]: s for s in r.json()["stages"]}
+
+    assert stages["a"]["reference_span_start_s"] == pytest.approx(0.0)
+    assert stages["a"]["reference_span_end_s"] == pytest.approx(8.5)
+    assert stages["a"]["reference_span_confidence"] == pytest.approx(0.83)
+    assert stages["a"]["reference_span_method"] == "llm+snap+qc"
+
+    for name in ("b", "c"):
+        assert stages[name]["reference_span_start_s"] is None
+        assert stages[name]["reference_span_end_s"] is None
+        assert stages[name]["reference_span_confidence"] is None
+        assert stages[name]["reference_span_method"] is None
 
 
 def test_display_labels_parent_and_replan_children(

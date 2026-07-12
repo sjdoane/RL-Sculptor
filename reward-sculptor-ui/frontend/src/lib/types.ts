@@ -966,6 +966,15 @@ export interface StageSchema {
   reference_clip_id?: string | null;
   reference_tier?: string | null;
   reference_match_confidence?: number | null;
+  // §D24 F1: the goal-aligned sub-span of reference_clip_id, when one
+  // was selected (docs/internal/REFERENCE_BUILD_LOG.md D23/D24). All
+  // four null together when no span applies (no clip attached, the
+  // goal covers the whole clip, or selection was declined) — the stage
+  // then certifies/trains against the FULL clip.
+  reference_span_start_s?: number | null;
+  reference_span_end_s?: number | null;
+  reference_span_confidence?: number | null;
+  reference_span_method?: string | null;
   // §start_pose: the physical configuration the robot is in at THIS
   // stage's episode start. null = unspecified (legacy missions, or a
   // decomposer that omitted the field — NOT the same as "standing").

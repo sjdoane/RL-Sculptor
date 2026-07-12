@@ -737,6 +737,61 @@ def _validate_steering_metrics(stages: list[Stage]) -> None:
         )
 
 
+def _select_and_attach_span(stage: Stage, robot: str) -> None:
+    """§D24 F1 item 4 (docs/internal/REFERENCE_BUILD_LOG.md D23/D24):
+    right after a reference clip is attached to `stage` (`decompose_task`'s
+    `_attach_stage_references`, or `redecompose_stage`'s per-sub-stage
+    inheritance below), propose + QC the goal-aligned SUB-SPAN
+    (`sculptor.refs.spans.select_reference_span`) and persist it on the
+    stage. Every downstream consumer of `stage.reference_clip_id` (metric
+    generation, RSI/eval-reset derivation, `reference_signature.json`)
+    resolves the clip through the ONE loader
+    (`sculptor.mission_metrics.load_stage_reference_clip`), so this crop
+    applies everywhere without a second full-clip pass or an independent
+    crop assumption (§D19).
+
+    This makes ONE real LLM call (the `span_select` registry role,
+    production by default — see `select_reference_span`'s docstring; note
+    `decompose_task`/`redecompose_stage` have no `llm_call` override
+    parameter of their own, so tests MUST monkeypatch
+    `sculptor.refs.spans.select_reference_span` directly, same as every
+    other network-touching call in this module's test suite).
+
+    Never raises: any failure (clip fails to load, selection declines)
+    just leaves the four span fields at their default None (full-clip
+    fallback) and logs why — same non-fatal-by-design contract as
+    `_attach_stage_references`'s own retrieval failures."""
+    clip_id = stage.reference_clip_id
+    if not clip_id:
+        return
+    clip = _load_reference_clip(clip_id, robot)
+    if clip is None:
+        print(
+            f"[decompose] stage {stage.name!r}: reference clip "
+            f"{clip_id!r} failed to load for span selection — "
+            "proceeding without a span (full clip).",
+            file=sys.stderr, flush=True,
+        )
+        return
+
+    from sculptor.refs.spans import select_reference_span
+
+    span, reason = select_reference_span(
+        clip, goal_text=stage.goal_text, start_pose=stage.start_pose,
+    )
+    if span is None:
+        print(
+            f"[decompose] stage {stage.name!r}: reference span selection "
+            f"declined ({reason}) — using the full clip.",
+            file=sys.stderr, flush=True,
+        )
+        return
+    stage.reference_span_start_s = span["t_start_s"]
+    stage.reference_span_end_s = span["t_end_s"]
+    stage.reference_span_confidence = span["confidence"]
+    stage.reference_span_method = span["method"]
+
+
 def _attach_stage_references(stages: list[Stage], robot: str) -> None:
     """§REFERENCE_TRAJECTORY_PLAN §4/§7/§9: for each drafted stage, run
     refs retrieval against ITS OWN `goal_text` and attach the top match's
@@ -779,6 +834,9 @@ def _attach_stage_references(stages: list[Stage], robot: str) -> None:
             stage.reference_clip_id = getattr(top, "clip_id", None)
             stage.reference_tier = getattr(top, "tier", None)
             stage.reference_match_confidence = confidence
+            # §D24 F1 item 4a: select the goal-aligned sub-span right
+            # after attach — see `_select_and_attach_span`'s docstring.
+            _select_and_attach_span(stage, robot)
 
 
 # ── Public entry ─────────────────────────────────────────────────────
@@ -1055,6 +1113,7 @@ def redecompose_stage(
     client: Any = None,
     model: str = MODEL_ID,
     prior_attempt_error: Optional[str] = None,
+    robot_hint: Optional[str] = None,
 ) -> list[Stage]:
     """Ask Claude to split a failed stage into 2-8 simpler sub-stages.
 
@@ -1097,6 +1156,16 @@ def redecompose_stage(
     typically splits ONE airborne stage into a grounded precursor plus a
     later airborne sub-stage, and a blanket force would deny the
     grounded precursor's correctly-False flag).
+
+    §D24 F1 item 4b: every sub-stage inherits the failed stage's
+    `reference_clip_id`/`_tier`/`_match_confidence` (D21, unconditional,
+    unchanged) but NOT its span fields — each sub-stage is a phase of a
+    DIFFERENT (smaller) sub-goal and needs its OWN span, freshly selected
+    against its own `goal_text`/`start_pose` via `_select_and_attach_span`
+    (same helper `decompose_task`'s attach path uses). `robot_hint` (the
+    adapter/task_id-shaped hint, same convention as `decompose_task`'s
+    parameter) resolves which library robot slug to query when running
+    that selection; unrelated to the LLM call itself.
 
     Raises `MissionValidationError` on any violation. Caller halts the
     mission on failure (do NOT retry Claude — same envelope as
@@ -1260,6 +1329,13 @@ def redecompose_stage(
             reference_match_confidence=failed_stage.reference_match_confidence,
             redecomposition_attempts=1,  # bound at one level
         ))
+
+    # §D24 F1 item 4b: fresh per-sub-stage span selection (clip inherited
+    # above, span never inherited — see this function's docstring).
+    if failed_stage.reference_clip_id:
+        robot = _reference_robot_slug(robot_hint)
+        for sub_stage in sub_stages:
+            _select_and_attach_span(sub_stage, robot)
 
     # KG citation verification (same as decompose_task).
     _validate_kg_seed_papers(sub_stages, set(available_arxiv_ids), kg_store)

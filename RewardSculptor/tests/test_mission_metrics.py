@@ -18,8 +18,25 @@ import pytest
 from sculptor.mission import Mission, Stage
 from sculptor.mission_metrics import (
     generate_stage_metrics,
+    load_stage_reference_clip,
     resolve_stage_metric_ref,
 )
+
+
+def _no_span(*a, **kw):
+    """§D24 F1: `generate_stage_metrics` now runs the lazy span-backfill
+    (`_backfill_stage_reference_span`) for any stage with a
+    `reference_clip_id` and no span fields — which calls
+    `sculptor.refs.spans.select_reference_span`, which by default makes a
+    REAL Anthropic call. Every test in this module that attaches a
+    reference clip WITHOUT itself testing the backfill must monkeypatch
+    this in to keep the whole suite offline/deterministic (mirrors the
+    `generate_objective_metric` stub pattern already used everywhere
+    else here). Returns `(None, None)` — no span, no reason — so it is a
+    byte-identical no-op for tests that don't care about the backfill at
+    all (no `reference_span_backfill_reason` key gets added to report
+    entries, no backfill event fires)."""
+    return None, None
 
 
 def _mk_stage(name: str, **kw) -> Stage:
@@ -238,6 +255,96 @@ def _write_fixture_clip(tmp_path: Path, robot: str, clip_id: str) -> Path:
     return root
 
 
+# ── §D24 F1 item 5: load_stage_reference_clip (the one loader) ─────────
+def test_load_stage_reference_clip_none_without_clip_id(tmp_path):
+    s = _mk_stage("plain")
+    assert load_stage_reference_clip(s, "g1") is None
+
+
+def test_load_stage_reference_clip_full_clip_without_span(tmp_path, monkeypatch):
+    """No span fields on the stage -> the FULL clip comes back unchanged,
+    and `span_meta` is None (the explicit "no span applies" contract)."""
+    root = _write_fixture_clip(tmp_path, "g1", "getup_demo_clip")
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(root))
+    from sculptor.reference import make_procedural_jump_clip
+
+    full_n = make_procedural_jump_clip()["root_pos_z"].shape[0]
+
+    s = _mk_stage("get_up", reference_clip_id="getup_demo_clip")
+    loaded = load_stage_reference_clip(s, "g1")
+    assert loaded is not None
+    clip_id, clip, span_meta = loaded
+    assert clip_id == "getup_demo_clip"
+    assert clip["root_pos_z"].shape[0] == full_n
+    assert span_meta is None
+
+
+def test_load_stage_reference_clip_crops_when_span_set(tmp_path, monkeypatch):
+    """Span fields present -> the returned clip is CROPPED to them and
+    `span_meta` mirrors the stage's persisted span."""
+    root = _write_fixture_clip(tmp_path, "g1", "getup_demo_clip")
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(root))
+
+    s = _mk_stage(
+        "get_up", reference_clip_id="getup_demo_clip",
+        reference_span_start_s=0.0, reference_span_end_s=1.0,
+        reference_span_confidence=0.82, reference_span_method="llm+snap+qc")
+    loaded = load_stage_reference_clip(s, "g1")
+    assert loaded is not None
+    clip_id, clip, span_meta = loaded
+    assert clip_id == "getup_demo_clip"
+    n = clip["root_pos_z"].shape[0]
+    fps = float(clip["fps"])
+    assert n / fps == pytest.approx(1.0, abs=1e-6)
+    assert span_meta == {
+        "t_start_s": 0.0, "t_end_s": 1.0,
+        "confidence": 0.82, "method": "llm+snap+qc",
+    }
+
+
+def test_stage_reference_span_grounds_metric_gen_prompt_in_cropped_signature(
+    tmp_path, monkeypatch,
+):
+    """§D24 F1: the metric-authoring prompt (`metric_gen._build_reference_
+    signature_block`, threaded through `generate_stage_metrics`'s
+    `references=` kwarg via the one loader) must be grounded in the
+    CROPPED clip's signature when a stage carries a span, not the full
+    clip's — this is what "the success-criterion authoring prompt is
+    grounded in the CROPPED signature" cashes out to in this codebase
+    (the generated metric is the trust-gated objective the stage
+    actually steers by; see docs/internal/REFERENCE_BUILD_LOG.md D24)."""
+    from sculptor.eval.metric_gen import _build_reference_signature_block
+
+    root = _write_fixture_clip(tmp_path, "g1", "getup_demo_clip")
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(root))
+
+    s_full = _mk_stage("get_up_full", reference_clip_id="getup_demo_clip")
+    s_span = _mk_stage(
+        "get_up_span", reference_clip_id="getup_demo_clip",
+        reference_span_start_s=0.0, reference_span_end_s=1.0,
+        reference_span_confidence=0.8, reference_span_method="llm+snap+qc")
+
+    _, clip_full, span_meta_full = load_stage_reference_clip(s_full, "g1")
+    _, clip_span, span_meta_span = load_stage_reference_clip(s_span, "g1")
+    assert span_meta_full is None
+    assert span_meta_span is not None
+
+    block_full, sig_full = _build_reference_signature_block(
+        [("getup_demo_clip", clip_full)])
+    block_span, sig_span = _build_reference_signature_block(
+        [("getup_demo_clip", clip_span)])
+
+    full_duration = sig_full["getup_demo_clip"]["duration_s"]
+    span_duration = sig_span["getup_demo_clip"]["duration_s"]
+    assert span_duration == pytest.approx(1.0, abs=1e-3)
+    assert full_duration > span_duration + 0.1
+    # The rendered prompt block itself carries the CROPPED duration, and
+    # must not still carry the full clip's (distinguishable since they
+    # differ by > 0.1s per the assertion above).
+    assert str(span_duration) in block_span
+    assert str(full_duration) not in block_span
+
+
 def test_generate_stage_metrics_loads_and_passes_reference(
     tmp_path, monkeypatch,
 ):
@@ -248,6 +355,7 @@ def test_generate_stage_metrics_loads_and_passes_reference(
     loading/threading only."""
     root = _write_fixture_clip(tmp_path, "g1", "getup_demo_clip")
     monkeypatch.setenv("RS_REFERENCE_ROOT", str(root))
+    monkeypatch.setattr("sculptor.refs.spans.select_reference_span", _no_span)
 
     calls: list[dict] = []
 
@@ -324,6 +432,155 @@ def test_generate_stage_metrics_reference_load_error_proceeds_without(
     assert report["generated"][0]["reference_load_error"]
 
 
+# ── §D24 F1 item 4c: lazy span backfill ─────────────────────────────────
+_FAKE_SPAN = {
+    "t_start_s": 0.0, "t_end_s": 1.0, "confidence": 0.82,
+    "rationale": "test span", "method": "llm+snap+qc",
+}
+
+
+def test_generate_stage_metrics_backfills_span_once_and_persists(
+    tmp_path, monkeypatch,
+):
+    """A stage with `reference_clip_id` but no span fields gets ONE
+    `select_reference_span` call; the four span fields land on the
+    stage (mutated in place), the loader threads the CROPPED clip into
+    `generate_objective_metric(references=...)`, and — mirroring how
+    every real caller of `generate_stage_metrics` re-saves mission.json
+    right after (see `sculptor.mission.save_mission`) — the fields
+    survive a save/reload round-trip. A second pass over the same
+    (already-backfilled) stage must NOT call selection again."""
+    from sculptor.mission import load_mission, save_mission
+
+    root = _write_fixture_clip(tmp_path, "g1", "getup_demo_clip")
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(root))
+
+    span_calls: list[dict] = []
+
+    def fake_select(clip, *, goal_text, start_pose=None, llm_call=None):
+        span_calls.append({"goal_text": goal_text, "start_pose": start_pose})
+        return dict(_FAKE_SPAN), None
+
+    monkeypatch.setattr("sculptor.refs.spans.select_reference_span", fake_select)
+
+    calls: list[dict] = []
+
+    def fake_gen(goal, out_dir, **kw):
+        calls.append(kw)
+        return {"accepted": True}
+
+    import sculptor.eval as ev
+    monkeypatch.setattr(ev, "generate_objective_metric", fake_gen)
+
+    import sculptor.eval.metric_calibration as mc
+    monkeypatch.setattr(
+        mc, "calibrate_metric_against_reference", lambda *a, **kw: None)
+
+    s1 = _mk_stage("get_up", reference_clip_id="getup_demo_clip")
+    m = _mk_mission(tmp_path, [s1])
+    report = generate_stage_metrics(m, robot_hint="Mjlab-Velocity-Flat-Unitree-G1")
+
+    assert len(span_calls) == 1
+    assert m.stages[0].reference_span_start_s == pytest.approx(0.0)
+    assert m.stages[0].reference_span_end_s == pytest.approx(1.0)
+    assert m.stages[0].reference_span_confidence == pytest.approx(0.82)
+    assert m.stages[0].reference_span_method == "llm+snap+qc"
+
+    # The threaded clip is the CROPPED one (~1.0s @ 50fps = ~50 frames),
+    # not the full ~1.96s procedural clip (~98 frames).
+    clip_id, cropped_clip = calls[0]["references"][0]
+    assert clip_id == "getup_demo_clip"
+    assert cropped_clip["root_pos_z"].shape[0] < 90
+
+    # Mirrors the real caller contract: mutate in place, caller re-saves.
+    save_mission(m, m.mission_dir)
+    reloaded = load_mission(m.mission_dir)
+    assert reloaded.stages[0].reference_span_start_s == pytest.approx(0.0)
+    assert reloaded.stages[0].reference_span_end_s == pytest.approx(1.0)
+
+    # Re-running must NOT re-select — the stage already has a span.
+    report2 = generate_stage_metrics(
+        reloaded, robot_hint="Mjlab-Velocity-Flat-Unitree-G1",
+        only_stages=["get_up"])
+    assert len(span_calls) == 1
+    assert "reference_span_backfill_reason" not in report2["generated"][0]
+    assert "reference_span_backfill_reason" not in report["generated"][0]
+
+
+def test_generate_stage_metrics_backfill_declined_proceeds_full_clip(
+    tmp_path, monkeypatch,
+):
+    """When span selection declines (low confidence, QC reject, ...) the
+    reason is recorded on the report entry and generation proceeds with
+    the FULL (uncropped) clip — never a partial/garbage crop."""
+    root = _write_fixture_clip(tmp_path, "g1", "getup_demo_clip")
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(root))
+
+    def fake_select(clip, *, goal_text, start_pose=None, llm_call=None):
+        return None, "low_confidence:0.42"
+
+    monkeypatch.setattr("sculptor.refs.spans.select_reference_span", fake_select)
+
+    calls: list[dict] = []
+
+    def fake_gen(goal, out_dir, **kw):
+        calls.append(kw)
+        return {"accepted": True}
+
+    import sculptor.eval as ev
+    monkeypatch.setattr(ev, "generate_objective_metric", fake_gen)
+
+    import sculptor.eval.metric_calibration as mc
+    monkeypatch.setattr(
+        mc, "calibrate_metric_against_reference", lambda *a, **kw: None)
+
+    s1 = _mk_stage("get_up", reference_clip_id="getup_demo_clip")
+    m = _mk_mission(tmp_path, [s1])
+    report = generate_stage_metrics(m)
+
+    assert m.stages[0].reference_span_start_s is None
+    entry = report["generated"][0]
+    assert entry["reference_span_backfill_reason"] == "low_confidence:0.42"
+
+    from sculptor.reference import make_procedural_jump_clip
+
+    full_n = make_procedural_jump_clip()["root_pos_z"].shape[0]
+    clip_id, clip = calls[0]["references"][0]
+    assert clip["root_pos_z"].shape[0] == full_n
+
+
+def test_generate_stage_metrics_backfill_skipped_when_span_already_set(
+    tmp_path, monkeypatch,
+):
+    """A stage that already carries span fields (e.g. set at decompose
+    time) must never re-trigger selection during backfill."""
+    root = _write_fixture_clip(tmp_path, "g1", "getup_demo_clip")
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(root))
+
+    def boom(*a, **kw):  # pragma: no cover — must not run
+        raise AssertionError("selection must not run when a span already exists")
+
+    monkeypatch.setattr("sculptor.refs.spans.select_reference_span", boom)
+
+    def fake_gen(goal, out_dir, **kw):
+        return {"accepted": True}
+
+    import sculptor.eval as ev
+    monkeypatch.setattr(ev, "generate_objective_metric", fake_gen)
+
+    import sculptor.eval.metric_calibration as mc
+    monkeypatch.setattr(
+        mc, "calibrate_metric_against_reference", lambda *a, **kw: None)
+
+    s1 = _mk_stage(
+        "get_up", reference_clip_id="getup_demo_clip",
+        reference_span_start_s=0.0, reference_span_end_s=1.0,
+        reference_span_confidence=0.9, reference_span_method="llm+snap+qc")
+    m = _mk_mission(tmp_path, [s1])
+    report = generate_stage_metrics(m)  # must not raise
+    assert "reference_span_backfill_reason" not in report["generated"][0]
+
+
 # ── §REFERENCE_TRAJECTORY_PLAN §6 audit-finding close: calibration wiring ──
 #
 # `generate_stage_metrics` invokes `calibrate_metric_against_reference`
@@ -342,6 +599,7 @@ def test_stage_with_reference_triggers_calibration_with_resolved_tier(
     report entry and an emitted event."""
     root = _write_fixture_clip(tmp_path, "g1", "getup_demo_clip")
     monkeypatch.setenv("RS_REFERENCE_ROOT", str(root))
+    monkeypatch.setattr("sculptor.refs.spans.select_reference_span", _no_span)
 
     def fake_gen(goal, out_dir, **kw):
         out_dir = Path(out_dir)
@@ -423,6 +681,7 @@ def test_calibration_raising_never_breaks_metric_acceptance(tmp_path, monkeypatc
     calibrated` event fires."""
     root = _write_fixture_clip(tmp_path, "g1", "getup_demo_clip")
     monkeypatch.setenv("RS_REFERENCE_ROOT", str(root))
+    monkeypatch.setattr("sculptor.refs.spans.select_reference_span", _no_span)
 
     def fake_gen(goal, out_dir, **kw):
         return {"accepted": True}
@@ -461,6 +720,7 @@ def test_calibration_wiring_end_to_end_resolves_tier_d_from_real_cert(
 
     root = _write_fixture_clip(tmp_path, "g1", "getup_demo_clip")
     monkeypatch.setenv("RS_REFERENCE_ROOT", str(root))
+    monkeypatch.setattr("sculptor.refs.spans.select_reference_span", _no_span)
 
     # §F7: rollout_path must resolve INSIDE the library root — mirrors
     # `track_clip`'s own `clip_d / "tierD_rollout.npz"` convention.

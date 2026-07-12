@@ -131,6 +131,38 @@ class Stage:
     reference_clip_id: Optional[str] = None
     reference_tier: Optional[str] = None
     reference_match_confidence: Optional[float] = None
+    # §D24 F1 (docs/internal/REFERENCE_BUILD_LOG.md D23/D24): the goal-
+    # aligned SUB-SPAN of `reference_clip_id`, selected by
+    # `sculptor.refs.spans.select_reference_span`. D23 diagnosed a live
+    # zero-fitness regression when a stage's goal is a strict sub-phase
+    # of a longer attached clip (e.g. "sit up" is a sub-phase of a full
+    # lying-to-standing get-up) and certification/RSI/eval-reset all ran
+    # against the FULL clip — a physically correct sit-up scored zero
+    # because passing certification against the full clip's own
+    # truncation negatives REQUIRED zeroing exactly that motion.
+    # `reference_span_start_s`/`_end_s` are the snapped-and-QC'd crop
+    # window (seconds, clip-relative); `reference_span_confidence` is
+    # the LLM's reported confidence in [0, 1]; `reference_span_method`
+    # is `"llm+snap+qc"` (see `select_reference_span`'s docstring) or
+    # None. All four are None together whenever no span applies: no
+    # `reference_clip_id` attached, the goal covers the whole clip, or
+    # selection was declined (low confidence / failed mechanical or
+    # end-state QC / LLM unavailable) — a None span means "use the FULL
+    # clip", never a partial/garbage crop. Every consumer of
+    # `reference_clip_id` MUST resolve it through
+    # `sculptor.mission_metrics.load_stage_reference_clip` (the one
+    # loader) rather than cropping independently — §D19's "every
+    # clip-shape assumption in ONE place" rule. Redecompose sub-stages
+    # unconditionally inherit `reference_clip_id`/`_tier`/
+    # `_match_confidence` from the failed stage (D21) but NEVER these
+    # four fields — a new sub-goal needs its own span, freshly
+    # (re-)selected against ITS OWN goal text. Backward-compatible:
+    # older mission.json files load with all four None via
+    # `from_dict`'s filter-unknown-keys path.
+    reference_span_start_s: Optional[float] = None
+    reference_span_end_s: Optional[float] = None
+    reference_span_confidence: Optional[float] = None
+    reference_span_method: Optional[str] = None
     # §start_pose: the physical configuration the robot is in at THIS
     # stage's episode start. One of `START_POSE_VALUES` (supine, prone,
     # sitting, crouched, standing), or None (unspecified — legacy

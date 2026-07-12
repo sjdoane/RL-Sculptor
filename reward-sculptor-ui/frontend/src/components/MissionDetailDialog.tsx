@@ -437,6 +437,11 @@ function ReferenceRow({
           >
             <Icon name="video" size={10} />
             {stage.reference_clip_id}
+            {stage.reference_span_start_s != null && stage.reference_span_end_s != null && (
+              <span style={{ opacity: 0.7 }}>
+                &nbsp;· {stage.reference_span_start_s.toFixed(1)}-{stage.reference_span_end_s.toFixed(1)}s
+              </span>
+            )}
             {stage.reference_tier && <span style={{ opacity: 0.7 }}>&nbsp;· tier {stage.reference_tier}</span>}
           </span>
           <Btn

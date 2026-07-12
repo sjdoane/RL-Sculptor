@@ -66,6 +66,32 @@ def test_crop_span_torso_righting_sub_span(satup_clip):
     assert g_z_change >= 0.15
 
 
+def test_cropped_span_yields_different_eval_reset_than_full_clip(satup_clip):
+    """§D24 F1 (docs/internal/REFERENCE_BUILD_LOG.md): every consumer of
+    a stage's reference clip (RSI derivation, eval-reset) MUST resolve
+    the persisted SPAN, never derive against the full clip independently
+    — proven here because the two measurably DIFFER on the real fixture.
+    `derive_reference_reset`'s reset_pitch_offset_rad/roll are computed
+    as `start_window - end_window` (`sculptor.reference.
+    derive_reference_reset`): the FULL clip's end window is its own true
+    standing finish (~14.27s), while the [0, 8.5]s span's end window is
+    still mid-recovery (torso righted, not yet standing — the exact
+    D23/D24 scope mismatch this whole program exists to fix), so the two
+    derivations cannot agree."""
+    from sculptor.reference import derive_eval_reset
+
+    full_reset = derive_eval_reset(satup_clip)
+    cropped = crop_span(satup_clip, 0.0, 8.5)
+    span_reset = derive_eval_reset(cropped)
+
+    assert full_reset is not None
+    assert span_reset is not None
+    assert "reset_pitch_offset_rad" in full_reset
+    assert "reset_pitch_offset_rad" in span_reset
+    assert full_reset["reset_pitch_offset_rad"] != pytest.approx(
+        span_reset["reset_pitch_offset_rad"], abs=1e-3)
+
+
 @pytest.mark.parametrize("t_start,t_end", [
     (5.0, 2.0),      # inverted range
     (0.0, 100.0),    # beyond the clip's own duration
@@ -168,11 +194,22 @@ def _mock(text: str):
     return lambda prompt: text
 
 
-def _good_payload(t_start=0.0, t_end=8.5, confidence=0.9):
+#: The fixture's torso-righting sub-span [0, 8.5]s ends low (z ~0.14-0.16)
+#: with the torso RIGHTED (g_z rights toward upright over the span) —
+#: see test_crop_span_torso_righting_sub_span for the measured numbers.
+#: Every mock payload below must carry a `expected_end` consistent with
+#: whatever span it proposes (§F1 addendum).
+_SATUP_EXPECTED_END = {"z_band": [0.10, 0.20], "g_z_more_upright": True}
+
+
+def _good_payload(
+    t_start=0.0, t_end=8.5, confidence=0.9, expected_end=None,
+):
     return json.dumps({
         "t_start_s": t_start, "t_end_s": t_end, "confidence": confidence,
         "rationale": "sit-up phase: torso rights while pelvis stays low",
         "whole_clip": False,
+        "expected_end": expected_end or _SATUP_EXPECTED_END,
     })
 
 
@@ -202,6 +239,7 @@ def test_select_reference_span_whole_clip_rejected(satup_clip):
     payload = json.dumps({
         "t_start_s": 0.0, "t_end_s": n / fps, "confidence": 0.95,
         "rationale": "full get-up", "whole_clip": True,
+        "expected_end": {"z_band": [0.70, 0.80], "g_z_more_upright": True},
     })
     span, reason = select_reference_span(
         satup_clip, goal_text="x", llm_call=_mock(payload))
@@ -214,6 +252,76 @@ def test_select_reference_span_garbage_response_rejected(satup_clip):
         satup_clip, goal_text="x", llm_call=_mock("not json { at all"))
     assert span is None
     assert reason is not None and reason.startswith("parse_error")
+
+
+# ── §F1 addendum: end-state self-consistency QC ─────────────────────────
+def test_select_reference_span_missing_expected_end_is_parse_error(satup_clip):
+    """`expected_end` is a required key (§F1 addendum) — an older-shaped
+    response missing it must be treated exactly like any other malformed
+    response: `parse_error`, never a silent default."""
+    payload = json.dumps({
+        "t_start_s": 0.0, "t_end_s": 8.5, "confidence": 0.9,
+        "rationale": "sit-up phase", "whole_clip": False,
+    })
+    span, reason = select_reference_span(
+        satup_clip, goal_text="x", llm_call=_mock(payload))
+    assert span is None
+    assert reason is not None and reason.startswith("parse_error")
+
+
+def test_select_reference_span_end_state_consistent_accepted(satup_clip):
+    """A span whose `expected_end` correctly describes its own measured
+    end window (low z, rights toward upright) passes."""
+    span, reason = select_reference_span(
+        satup_clip, goal_text="right the torso to a seated position",
+        llm_call=_mock(_good_payload(
+            expected_end={"z_band": [0.10, 0.20], "g_z_more_upright": True})))
+    assert reason is None
+    assert span is not None
+
+
+def test_select_reference_span_end_state_wrong_z_band_rejected(satup_clip):
+    """The correct [0, 8.5]s span, but a self-inconsistent `expected_end`
+    claiming a STANDING z_band — must be rejected even though the span
+    itself and its start-state are otherwise clean."""
+    payload = _good_payload(
+        t_start=0.0, t_end=8.5,
+        expected_end={"z_band": [0.70, 0.80], "g_z_more_upright": True})
+    span, reason = select_reference_span(
+        satup_clip, goal_text="right the torso to a seated position",
+        llm_call=_mock(payload))
+    assert span is None
+    assert reason is not None and reason.startswith("qc_reject:end_state")
+
+
+def test_select_reference_span_end_state_wrong_direction_rejected(satup_clip):
+    """Correct z_band but a false directional claim (says the span does
+    NOT become more upright when it measurably does) must also reject."""
+    payload = _good_payload(
+        t_start=0.0, t_end=8.5,
+        expected_end={"z_band": [0.10, 0.20], "g_z_more_upright": False})
+    span, reason = select_reference_span(
+        satup_clip, goal_text="right the torso to a seated position",
+        llm_call=_mock(payload))
+    assert span is None
+    assert reason is not None and reason.startswith("qc_reject:end_state")
+
+
+def test_select_reference_span_qc_rejects_over_extended_span(satup_clip):
+    """§F1 addendum's motivating exploit: an OVER-EXTENDED span (0 ->
+    11.1s, reaching the clip's own standing end per REFERENCE_BUILD_LOG.md
+    D24_SPEC's measured numbers: z reaches ~0.78 by t=11.1s) whose
+    `expected_end` still claims the true sit-up's LOW end state.
+    `_span_qc`'s start-only checks would pass this identically to the
+    correct [0, 8.5]s span (same start, same start_pose, real motion
+    throughout) — only the end-state check catches it."""
+    payload = _good_payload(
+        t_start=0.0, t_end=11.1,
+        expected_end={"z_band": [0.10, 0.20], "g_z_more_upright": True})
+    span, reason = select_reference_span(
+        satup_clip, goal_text="sit up", llm_call=_mock(payload))
+    assert span is None
+    assert reason is not None and reason.startswith("qc_reject:end_state")
 
 
 def test_select_reference_span_qc_rejects_too_short_span(satup_clip):

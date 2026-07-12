@@ -47,6 +47,24 @@ _MIN_SPAN_DURATION_S = 1.0
 _MOTION_FLOOR_Z_M = 0.03
 _MOTION_FLOOR_GZ = 0.10
 
+#: §F1 addendum (from the b14708a verification pass) — END-state
+#: self-consistency QC (`_end_state_qc`). `_span_qc` only guards the
+#: START of a proposed span (archetype/start_pose are start-window
+#: classifiers); an OVER-EXTENDED span (e.g. the full 0->11.1s get-up
+#: passed for a "sit up" goal whose correct span is 0->8.5s) would sail
+#: through unchanged and recreate D23. These constants gate the
+#: SNAPPED span's actual end-window (last `_END_WINDOW_S` seconds,
+#: averaged) against what the LLM's `expected_end` claimed.
+_END_WINDOW_S = 0.5
+#: z-band tolerance either side of the LLM-stated `expected_end.z_band`.
+_END_Z_BAND_TOLERANCE_M = 0.05
+#: Minimum |end-window g_z mean - start-window g_z mean| required to
+#: count as "the span's ending orientation is more upright than its
+#: start" — same RELATIVE-change convention as `_MOTION_FLOOR_GZ`
+#: (D23: absolute g_z is retarget-convention dependent; only the CHANGE
+#: is ever used as a signal).
+_END_STATE_GZ_TOLERANCE = 0.05
+
 #: Stage goal text is dataset/LLM-authored free text threaded into ANOTHER
 #: LLM prompt — capped + fenced as untrusted data, same convention as
 #: `reference_context.py`'s `_cap_untrusted_text` (§D22 audit finding: clip
@@ -218,6 +236,92 @@ def _span_qc(
     return None
 
 
+def _window_mean_z(clip: dict, *, from_start: bool, window_s: float) -> float:
+    """Mean `root_pos_z` over the first (`from_start=True`) or last
+    (`from_start=False`) `window_s` seconds of `clip`. Clamped to the
+    clip's own length (a span shorter than `window_s` uses its whole
+    duration) — `_span_qc`'s `_MIN_SPAN_DURATION_S` floor guarantees at
+    least 1.0s exists, so this never sees a degenerate 0-frame window."""
+    z = np.asarray(clip["root_pos_z"])
+    fps = float(clip["fps"])
+    n = z.shape[0]
+    w = max(1, min(n, int(round(window_s * fps))))
+    return float(np.mean(z[:w])) if from_start else float(np.mean(z[-w:]))
+
+
+def _window_mean_gz(
+    clip: dict, *, from_start: bool, window_s: float,
+) -> Optional[float]:
+    """Mean body-frame projected-gravity-z over the first/last
+    `window_s` seconds, or `None` when `clip` carries no orientation
+    (mirrors every other orientation-gated computation in this
+    module — the caller must degrade gracefully, never fabricate)."""
+    quat = clip.get("root_quat_wxyz")
+    if quat is None:
+        return None
+    from sculptor.refs.convert import _projected_gravity_b
+
+    quat = np.asarray(quat)
+    fps = float(clip["fps"])
+    n = quat.shape[0]
+    w = max(1, min(n, int(round(window_s * fps))))
+    window_quat = quat[:w] if from_start else quat[-w:]
+    g_b = _projected_gravity_b(window_quat)
+    return float(np.mean(g_b[:, 2]))
+
+
+def _end_state_qc(
+    cropped: dict, expected_end: dict[str, Any],
+) -> Optional[str]:
+    """§F1 addendum (end-state self-consistency QC, from the b14708a
+    verification pass): verifies the SNAPPED `cropped` span's actual
+    end-window (last `_END_WINDOW_S` seconds, averaged) against the
+    LLM's own `expected_end` claim — catches "rationale says sit-up,
+    span ends standing" self-inconsistency (an over-extended span that
+    `_span_qc`'s start-only checks cannot see). Returns `None` when the
+    claim and the measured span agree; otherwise a short reason (the
+    caller prefixes it `qc_reject:end_state:`).
+
+    Checks:
+      * z-band — the end-window mean `root_pos_z` must fall within
+        `expected_end["z_band"]` (a `[lo, hi]` pair, meters) widened by
+        `_END_Z_BAND_TOLERANCE_M` on each side.
+      * orientation direction — when the clip carries `root_quat_wxyz`,
+        the end-window mean g_z minus the start-window mean g_z (both
+        `_END_WINDOW_S`-second means, RELATIVE change only — same D23
+        convention as `_span_qc`'s motion floor) must be `<=
+        -_END_STATE_GZ_TOLERANCE` (more upright) when
+        `expected_end["g_z_more_upright"]` is `True`, and must NOT be
+        that negative when it is `False`. Skipped entirely (never
+        rejects) when the clip has no orientation channel — there is
+        nothing to check.
+    """
+    z_band = expected_end["z_band"]
+    lo, hi = float(z_band[0]), float(z_band[1])
+    z_end = _window_mean_z(cropped, from_start=False, window_s=_END_WINDOW_S)
+    if not (lo - _END_Z_BAND_TOLERANCE_M <= z_end <= hi + _END_Z_BAND_TOLERANCE_M):
+        return (
+            f"z_end={z_end:.3f} outside expected_end.z_band "
+            f"[{lo:.3f}, {hi:.3f}] (+/-{_END_Z_BAND_TOLERANCE_M})")
+
+    gz_end = _window_mean_gz(cropped, from_start=False, window_s=_END_WINDOW_S)
+    gz_start = _window_mean_gz(cropped, from_start=True, window_s=_END_WINDOW_S)
+    if gz_end is not None and gz_start is not None:
+        delta = gz_end - gz_start  # negative = more upright
+        more_upright = delta <= -_END_STATE_GZ_TOLERANCE
+        claimed_more_upright = bool(expected_end["g_z_more_upright"])
+        if claimed_more_upright and not more_upright:
+            return (
+                f"expected_end.g_z_more_upright=True but g_z changed by "
+                f"{delta:+.3f} over the span (< {_END_STATE_GZ_TOLERANCE} "
+                f"required to count as more upright)")
+        if not claimed_more_upright and more_upright:
+            return (
+                f"expected_end.g_z_more_upright=False but g_z became "
+                f"more upright by {delta:+.3f} over the span")
+    return None
+
+
 # ── LLM span proposal ───────────────────────────────────────────────────
 _SYSTEM_PROMPT = (
     "You select the sub-span of a motion-capture reference clip that "
@@ -229,9 +333,19 @@ _SYSTEM_PROMPT = (
     "the whole clip. Respond with STRICT JSON and nothing else — no "
     "markdown code fences, no prose outside the object — containing "
     "exactly these keys: t_start_s (number, seconds), t_end_s (number, "
-    "seconds), confidence (number in [0, 1]), rationale (string), and "
+    "seconds), confidence (number in [0, 1]), rationale (string), "
     "whole_clip (boolean, true when the goal covers the entire clip; "
-    "when true, still set t_start_s=0 and t_end_s=the clip duration)."
+    "when true, still set t_start_s=0 and t_end_s=the clip duration), "
+    "and expected_end (object with two keys: z_band — a [lo, hi] pair "
+    "in METERS, grounded in the signature's root_z numbers, giving the "
+    "root-height range you expect the span's FINAL ~0.5s to sit in "
+    "(NOT the full clip's end — the goal's OWN end state); and "
+    "g_z_more_upright — boolean, whether the span's ending orientation "
+    "is MORE upright (more negative gravity_z_b in the signature's "
+    "orientation.timeline) than its own starting orientation). "
+    "expected_end is checked against the span you propose after "
+    "snapping — state it honestly, not aspirationally: a 'sit up' goal "
+    "whose correct span stays low must NOT claim a standing z_band."
 )
 
 
@@ -267,17 +381,48 @@ def _is_strict_number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
+def _parse_expected_end(raw_end: Any) -> dict[str, Any]:
+    """Strict parse of the `expected_end` sub-object (§F1 addendum).
+    Raises `ValueError` on ANY malformed shape — folded by the caller
+    into the same `parse_error` treatment as every other field."""
+    if not isinstance(raw_end, dict):
+        raise ValueError(f"expected_end must be a JSON object: {raw_end!r}")
+
+    z_band = raw_end.get("z_band")
+    if (not isinstance(z_band, (list, tuple)) or len(z_band) != 2
+            or not all(_is_strict_number(v) for v in z_band)):
+        raise ValueError(
+            f"expected_end.z_band must be a [lo, hi] number pair: {z_band!r}")
+    lo, hi = float(z_band[0]), float(z_band[1])
+    if lo > hi:
+        raise ValueError(f"expected_end.z_band lo > hi: {z_band!r}")
+
+    if "g_z_more_upright" not in raw_end or not isinstance(
+            raw_end["g_z_more_upright"], bool):
+        raise ValueError(
+            "expected_end.g_z_more_upright must be a boolean: "
+            f"{raw_end.get('g_z_more_upright')!r}")
+
+    return {
+        "z_band": [lo, hi],
+        "g_z_more_upright": bool(raw_end["g_z_more_upright"]),
+    }
+
+
 def _parse_span_response(raw: str) -> dict[str, Any]:
     """Strict parse of the LLM's proposed span. Raises `ValueError` on ANY
     malformed input (non-JSON text, missing keys, wrong types, confidence
-    outside `[0, 1]`) — the caller treats any exception here as a
-    `parse_error` and returns `None`."""
+    outside `[0, 1]`, malformed `expected_end`) — the caller treats any
+    exception here as a `parse_error` and returns `None`."""
     text = _strip_fences(raw)
     payload = json.loads(text)
     if not isinstance(payload, dict):
         raise ValueError(f"response is not a JSON object: {type(payload).__name__}")
 
-    required = ("t_start_s", "t_end_s", "confidence", "rationale", "whole_clip")
+    required = (
+        "t_start_s", "t_end_s", "confidence", "rationale", "whole_clip",
+        "expected_end",
+    )
     missing = [k for k in required if k not in payload]
     if missing:
         raise ValueError(f"missing required keys: {missing}")
@@ -295,6 +440,7 @@ def _parse_span_response(raw: str) -> dict[str, Any]:
         raise ValueError(f"whole_clip must be a boolean: {payload['whole_clip']!r}")
     if not isinstance(payload["rationale"], str):
         raise ValueError(f"rationale must be a string: {payload['rationale']!r}")
+    expected_end = _parse_expected_end(payload["expected_end"])
 
     return {
         "t_start_s": float(payload["t_start_s"]),
@@ -302,6 +448,7 @@ def _parse_span_response(raw: str) -> dict[str, Any]:
         "confidence": confidence,
         "rationale": payload["rationale"],
         "whole_clip": payload["whole_clip"],
+        "expected_end": expected_end,
     }
 
 
@@ -345,9 +492,12 @@ def select_reference_span(
         back to the FULL clip when `span` is `None`.
       * `reason` is a short, machine-readable string explaining a `None`
         span (e.g. `"whole_clip"`, `"low_confidence:0.42"`,
-        `"qc_reject:duration<1.0s:0.300"`, `"parse_error:..."`,
-        `"llm_unavailable:..."`, `"invalid_clip:..."`); `None` whenever
-        `span` is not `None`.
+        `"qc_reject:duration<1.0s:0.300"`,
+        `"qc_reject:end_state:z_end=0.780 outside expected_end.z_band
+        [0.100, 0.200] (+/-0.05)"` (§F1 addendum — the span's own
+        end-window disagrees with the LLM's `expected_end` claim),
+        `"parse_error:..."`, `"llm_unavailable:..."`,
+        `"invalid_clip:..."`); `None` whenever `span` is not `None`.
 
     `llm_call` (callable `prompt: str -> response_text: str`) overrides
     the registry call for tests — it is ALWAYS used verbatim when
@@ -407,6 +557,16 @@ def select_reference_span(
     if qc_reason is not None:
         logger.info("select_reference_span: qc_reject: %s", qc_reason)
         return None, f"qc_reject:{qc_reason}"
+
+    # §F1 addendum (b14708a verification pass): the checks above only
+    # guard the START of the span — verify the LLM's own claim about
+    # where the span ENDS before trusting it (catches an over-extended
+    # span that would otherwise recreate D23).
+    end_state_reason = _end_state_qc(cropped, parsed["expected_end"])
+    if end_state_reason is not None:
+        logger.info(
+            "select_reference_span: qc_reject:end_state: %s", end_state_reason)
+        return None, f"qc_reject:end_state:{end_state_reason}"
 
     return {
         "t_start_s": round(float(t_start), 3),

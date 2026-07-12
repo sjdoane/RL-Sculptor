@@ -179,6 +179,13 @@ def _stages_to_schema(stages: list) -> list[StageSchema]:
             reference_tier=getattr(s, "reference_tier", None),
             reference_match_confidence=getattr(
                 s, "reference_match_confidence", None),
+            # §D24 F1: mirrors Stage.reference_span_start_s/_end_s/
+            # _confidence/_method, same drill as reference_clip_id above.
+            reference_span_start_s=getattr(s, "reference_span_start_s", None),
+            reference_span_end_s=getattr(s, "reference_span_end_s", None),
+            reference_span_confidence=getattr(
+                s, "reference_span_confidence", None),
+            reference_span_method=getattr(s, "reference_span_method", None),
             # §start_pose: mirrors Stage.start_pose, same drill as
             # reference_clip_id above.
             start_pose=getattr(s, "start_pose", None),

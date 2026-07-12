@@ -49,29 +49,85 @@ def _robot_slug(robot_hint: Optional[str]) -> str:
     return "g1"
 
 
+def load_stage_reference_clip(
+    stage: Any, robot: str,
+) -> Optional[tuple[str, dict, Optional[dict[str, Any]]]]:
+    """§D24 F1 (docs/internal/REFERENCE_BUILD_LOG.md D19/D23/D24): THE ONE
+    loader every consumer of `stage.reference_clip_id` MUST go through —
+    D19's "every clip-shape assumption in ONE place" rule, now extended to
+    goal-aligned SUB-SPANS. Loads the library clip and, when the stage
+    carries a persisted `reference_span_start_s`/`_end_s` (set by
+    `sculptor.decompose`'s attach/redecompose paths or this module's lazy
+    backfill — see `select_reference_span`), crops it via
+    `sculptor.refs.spans.crop_span` before returning it. A stage with no
+    span fields gets the FULL clip back, unchanged — that is the explicit
+    "no span applies" contract (see `Stage.reference_span_start_s`'s
+    docstring).
+
+    Returns `None` when `stage.reference_clip_id` is falsy (nothing to
+    load). Otherwise returns `(clip_id, clip, span_meta)` where `clip` is
+    the (possibly cropped) clip dict and `span_meta` is
+    `{"t_start_s", "t_end_s", "confidence", "method"}` when a span was
+    applied, else `None`.
+
+    Raises on a load or crop failure — this function does NOT catch
+    exceptions (unlike the rest of this module's non-fatal-by-design
+    helpers), because callers have GENUINELY DIFFERENT failure policies
+    for the same failure: an attached-but-unloadable clip is FATAL for
+    `sculpt.py`'s RSI scaffold (§D21 Fix 2 — never silently substitute a
+    different task class) but non-fatal for metric generation/calibration
+    and the reference_signature.json write (§7 — degrade to no
+    reference). Each caller wraps this in its own try/except.
+    """
+    clip_id = getattr(stage, "reference_clip_id", None)
+    if not clip_id:
+        return None
+
+    from sculptor.reference import load_clip
+    from sculptor.refs import library
+
+    clip_path = library.clip_dir(robot, clip_id) / library.CLIP_FILENAME
+    clip = load_clip(clip_path)
+
+    t_start = getattr(stage, "reference_span_start_s", None)
+    t_end = getattr(stage, "reference_span_end_s", None)
+    span_meta: Optional[dict[str, Any]] = None
+    if t_start is not None and t_end is not None:
+        from sculptor.refs.spans import crop_span
+
+        clip = crop_span(clip, t_start, t_end)
+        span_meta = {
+            "t_start_s": t_start,
+            "t_end_s": t_end,
+            "confidence": getattr(stage, "reference_span_confidence", None),
+            "method": getattr(stage, "reference_span_method", None),
+        }
+    return clip_id, clip, span_meta
+
+
 def _load_stage_reference(
     stage: Any, robot_hint: Optional[str],
 ) -> tuple[Optional[list[tuple[str, dict]]], Optional[str]]:
     """Load the clip attached to `stage.reference_clip_id` from the
-    on-disk reference library, if any. Returns
-    `(references_kwarg_value, reference_load_error)` — `references_kwarg_value`
-    is `[(clip_id, clip_dict)]` on success, `None` when the stage has no
-    reference attached OR the clip failed to load (log-and-proceed WITHOUT
-    references per §REFERENCE_TRAJECTORY_PLAN §7 — a missing/corrupt clip
-    on disk must never crash the metric-generation pipeline).
-    `reference_load_error` is a short string recorded on the stage's
-    report entry, only set on a load failure."""
+    on-disk reference library (cropped to the stage's reference span,
+    when one is persisted — via `load_stage_reference_clip`, the ONE
+    loader). Returns `(references_kwarg_value, reference_load_error)` —
+    `references_kwarg_value` is `[(clip_id, clip_dict)]` on success,
+    `None` when the stage has no reference attached OR the clip failed to
+    load (log-and-proceed WITHOUT references per §REFERENCE_TRAJECTORY_PLAN
+    §7 — a missing/corrupt clip on disk must never crash the
+    metric-generation pipeline). `reference_load_error` is a short string
+    recorded on the stage's report entry, only set on a load failure."""
     clip_id = getattr(stage, "reference_clip_id", None)
     if not clip_id:
         return None, None
     try:
-        from sculptor.reference import load_clip
-        from sculptor.refs import library
-
         robot = _robot_slug(robot_hint)
-        clip_path = library.clip_dir(robot, clip_id) / library.CLIP_FILENAME
-        clip = load_clip(clip_path)
-        return [(clip_id, clip)], None
+        loaded = load_stage_reference_clip(stage, robot)
+        if loaded is None:  # pragma: no cover — clip_id truthy just above
+            return None, None
+        loaded_clip_id, clip, _span_meta = loaded
+        return [(loaded_clip_id, clip)], None
     except Exception as e:  # noqa: BLE001 — never crash the metric pipeline
         error = f"{type(e).__name__}: {e}"
         print(
@@ -130,6 +186,58 @@ def _calibrate_stage_reference(
             f"failed ({type(e).__name__}: {e}) — leaving trust unchanged.",
             file=sys.stderr, flush=True)
         return None
+
+
+def _backfill_stage_reference_span(
+    stage: Any, robot_hint: Optional[str],
+) -> Optional[str]:
+    """§D24 F1 item 4c (lazy backfill): a stage with `reference_clip_id`
+    set but no `reference_span_*` fields — either decomposed before span
+    selection existed, or whose decompose-time selection call was
+    declined/never ran — gets ONE selection attempt here. This is how an
+    EXISTING mission (already decomposed) gets a span without a full
+    re-decomposition.
+
+    Mutates `stage` in place on success; persistence rides the existing
+    "caller re-saves mission.json via `save_mission(mission, md)`"
+    contract every `generate_stage_metrics` caller already follows (see
+    this module's docstring + `docs/internal/REFERENCE_BUILD_LOG.md`
+    D24) — no separate write happens here, same as every other stage
+    mutation `generate_stage_metrics` makes (`steering_metric`, etc.).
+
+    Returns `None` when no backfill was needed (no clip attached, or a
+    span already exists) or the backfill succeeded; otherwise a short
+    reason string (mirrors `reference_load_error`) for the caller to
+    record on the stage's report entry. Never raises."""
+    if not getattr(stage, "reference_clip_id", None):
+        return None
+    if getattr(stage, "reference_span_start_s", None) is not None:
+        return None  # already selected (or a prior attempt already ran)
+
+    try:
+        from sculptor.reference import load_clip
+        from sculptor.refs import library
+        from sculptor.refs.spans import select_reference_span
+
+        robot = _robot_slug(robot_hint)
+        clip_path = (
+            library.clip_dir(robot, stage.reference_clip_id)
+            / library.CLIP_FILENAME)
+        clip = load_clip(clip_path)
+    except Exception as e:  # noqa: BLE001 — backfill is best-effort
+        return f"{type(e).__name__}: {e}"
+
+    span, reason = select_reference_span(
+        clip, goal_text=stage.goal_text,
+        start_pose=getattr(stage, "start_pose", None))
+    if span is None:
+        return reason
+
+    stage.reference_span_start_s = span["t_start_s"]
+    stage.reference_span_end_s = span["t_end_s"]
+    stage.reference_span_confidence = span["confidence"]
+    stage.reference_span_method = span["method"]
+    return None
 
 
 def resolve_stage_metric_ref(ref: str, mission_dir: Path | str) -> str:
@@ -226,6 +334,36 @@ def generate_stage_metrics(
         # auto-retrieval here (out of scope — human attaches via UI); a
         # missing/corrupt clip degrades to no-reference rather than
         # failing the stage.
+        #
+        # §D24 F1 item 4c: lazy span backfill runs FIRST — a stage
+        # decomposed before span selection existed (e.g. the live
+        # g1-standing mission) has `reference_clip_id` set but no span
+        # fields; this is the one-time selection that fixes it, without
+        # a full re-decomposition. Must run BEFORE `_load_stage_reference`
+        # so the freshly-persisted span is what gets loaded+cropped for
+        # THIS generation pass.
+        had_span_before_backfill = (
+            getattr(stage, "reference_span_start_s", None) is not None)
+        span_backfill_reason = _backfill_stage_reference_span(stage, robot_hint)
+        backfilled_now = (
+            not had_span_before_backfill
+            and span_backfill_reason is None
+            and getattr(stage, "reference_span_start_s", None) is not None)
+        if backfilled_now:
+            _emit({
+                "type": "stage_reference_span_backfilled",
+                "stage": stage.name,
+                "clip_id": stage.reference_clip_id,
+                "t_start_s": stage.reference_span_start_s,
+                "t_end_s": stage.reference_span_end_s,
+            })
+        elif span_backfill_reason is not None:
+            _emit({
+                "type": "stage_reference_span_backfill_skipped",
+                "stage": stage.name,
+                "clip_id": stage.reference_clip_id,
+                "reason": span_backfill_reason,
+            })
         references, reference_load_error = _load_stage_reference(
             stage, robot_hint)
         try:
@@ -245,6 +383,8 @@ def generate_stage_metrics(
                             "reason": f"{type(e).__name__}: {e}"}
             if reference_load_error:
                 reject_entry["reference_load_error"] = reference_load_error
+            if span_backfill_reason:
+                reject_entry["reference_span_backfill_reason"] = span_backfill_reason
             report["rejected"].append(reject_entry)
             _emit({
                 "type": "stage_metric_gen_failed",
@@ -258,6 +398,8 @@ def generate_stage_metrics(
             gen_entry = {"stage": stage.name, "ref": rel}
             if reference_load_error:
                 gen_entry["reference_load_error"] = reference_load_error
+            if span_backfill_reason:
+                gen_entry["reference_span_backfill_reason"] = span_backfill_reason
             report["generated"].append(gen_entry)
             _emit({
                 "type": "stage_metric_gen_accepted",
@@ -300,6 +442,8 @@ def generate_stage_metrics(
             reject_entry = {"stage": stage.name, "reason": reason}
             if reference_load_error:
                 reject_entry["reference_load_error"] = reference_load_error
+            if span_backfill_reason:
+                reject_entry["reference_span_backfill_reason"] = span_backfill_reason
             report["rejected"].append(reject_entry)
             _emit({
                 "type": "stage_metric_gen_rejected",

@@ -354,6 +354,67 @@ Golden fixture: the live sat-up rollout is preserved at
 tests/fixtures/torso_righting_satup/ and must score well above zero under the
 fixed metric class (regression test).
 
+### D24 W4: F1 wiring — reference sub-spans consumed everywhere
+Built on the landed F1 core (spans.py's `crop_span`/`select_reference_span`,
+commit b14708a) and its end-state-QC addendum (`_end_state_qc`, checking the
+SNAPPED span's own end-window z-band + orientation-direction claim against
+`expected_end` — new required LLM-response key; catches an over-extended span
+that `_span_qc`'s start-only checks pass identically to a correct one).
+
+Persistence: `Stage` gains `reference_span_start_s`/`_end_s`/`_confidence`/
+`_method` (mission.py), auto-serialized like every other Stage field;
+redecompose sub-stages inherit the clip (D21, unchanged) but never these four
+— span re-selected per sub-goal.
+
+Selection sites (all real LLM calls by default, `span_select` role):
+decompose.py's `_attach_stage_references` (right after a clip attaches,
+`_select_and_attach_span` helper) and `redecompose_stage` (per sub-stage,
+new `robot_hint` param, wired from sculpt.py's redecompose call site); lazy
+backfill in `mission_metrics.generate_stage_metrics`
+(`_backfill_stage_reference_span`, runs once, reason recorded on the report
+entry like `reference_load_error`) — this is how the existing g1-standing
+mission gets a span without redecomposition.
+
+One loader (D19 rule): `mission_metrics.load_stage_reference_clip(stage,
+robot) -> (clip_id, clip, span_meta) | None` — crops via `crop_span` when
+span fields are persisted, else returns the full clip unchanged.
+`_load_stage_reference` now routes through it (fixes cert + calibration +
+the metric-authoring prompt's REFERENCE MOTION SIGNATURE block in one
+place); sculpt.py's `_resolve_stage_rsi_clip` (RSI/eval-reset derivation)
+and the reference_signature.json write (block 2.6, gains an optional
+`"span"` key) do too. Proven to matter on the real torso_righting_satup
+fixture: `derive_reference_reset`'s pitch/roll offset is `start_window -
+end_window`, and the [0, 8.5]s span's end window (mid-recovery) measurably
+disagrees with the full clip's (true standing) — RSI/eval-reset derived
+from the wrong one would silently diverge from what certification scored.
+
+Live-mission repair (backfill + criterion re-authoring for the existing
+g1-standing mission) and the free-text `Stage.success_criterion` field
+itself are explicitly NOT re-grounded by this increment — the criterion
+Python boolean is authored in the SAME LLM call as goal_text, before any
+per-stage clip is known, so it can't be retroactively grounded without a
+decompose architecture change; the trust-gated generated METRIC (which
+`generate_stage_metrics` now grounds in the cropped signature) is the
+channel this increment makes span-aware, per the D24 spec's explicit
+"criterion re-authoring rides decompose only ... else record as manual
+TODO for next mission."
+
+Verification hazard found and fixed live: `decompose_task`'s default
+`attach_references=True` resolves the REAL on-disk reference library when
+a test doesn't override `RS_REFERENCE_ROOT` — pre-existing, but harmless
+before this increment (no LLM call downstream of retrieval). Wiring span
+selection in made it a genuine live-network hazard: an actual outbound
+HTTPS connection was caught mid-test-run. Fixed with a module-scoped
+autouse fixture in test_decompose.py isolating `RS_REFERENCE_ROOT` by
+default (mirrors conftest.py's `_isolate_shared_kg` for the KG graph),
+plus explicit `select_reference_span` stubs in the handful of
+test_mission_run.py/test_mission_metrics.py tests that set
+`reference_clip_id` directly.
+
+Gates: sculptor 1798 passed / 2 skipped (both pre-existing/expected — jax
+unavailable, the sibling F2/F3/F4 worker's not-yet-landed golden metric
+snapshot); backend 519 passed; frontend typecheck+build green.
+
 ### Deferred findings (logged, not yet fixed)
 - Steer ENFORCEMENT unification: reference-calibration trust is computed
   and event-recorded in mission_metrics, but the live steer/observe gate

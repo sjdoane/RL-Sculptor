@@ -30,6 +30,32 @@ from sculptor.decompose import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_reference_library(tmp_path_factory, monkeypatch):
+    """This module's docstring promises "no real Anthropic or sentence-
+    transformers calls" — but `decompose_task(attach_references=True)`
+    (the default) resolves `sculptor.refs.library.references_root()`,
+    which falls back to the DEVELOPER'S REAL on-disk reference library
+    (`~/.local/share/reward-sculptor/reference`, a genuinely populated
+    multi-thousand-clip index per docs/internal/REFERENCE_BUILD_LOG.md)
+    whenever a test doesn't explicitly override `RS_REFERENCE_ROOT`.
+    §D24 F1 made this a LIVE hazard, not just a slow/flaky one: an
+    attached stage now also triggers `sculptor.refs.spans.
+    select_reference_span`, a REAL Anthropic call, the moment a real
+    retrieval match clears the confidence bar — caught live during this
+    increment's own verification (a genuine outbound HTTPS connection
+    from a supposedly-offline test run). Point every test in this file
+    at a per-test empty tmp dir by default (mirrors conftest.py's
+    `_isolate_shared_kg` for the exact same class of hazard on the KG
+    graph); tests that want a populated index call `_touch_index` (or
+    their own `monkeypatch.setenv("RS_REFERENCE_ROOT", ...)`) which
+    simply overrides this value for the rest of that test."""
+    monkeypatch.setenv(
+        "RS_REFERENCE_ROOT",
+        str(tmp_path_factory.mktemp("refs_isolated_default")),
+    )
+
+
 # ── Minimal RewardContract stub ───────────────────────────────────────
 @dataclass
 class _FakeContract:
@@ -957,6 +983,12 @@ def test_attach_references_true_picks_top_match_above_threshold(
     clip = _mk_clip_for_signature()
     monkeypatch.setattr(
         "sculptor.reference.load_clip", lambda path: clip)
+    # §D24 F1 item 4a: attach now also runs span selection — stub it so
+    # this test (about the confidence-gate wiring, not span selection)
+    # never makes a real Anthropic call.
+    monkeypatch.setattr(
+        "sculptor.refs.spans.select_reference_span",
+        lambda *a, **kw: (None, "test-no-network"))
 
     def fake_search(query, robot="g1", k=10, **kw):
         return [_FakeMatch(clip_id="getup_high_conf", match_confidence=0.92,
@@ -1001,8 +1033,88 @@ def test_attach_references_true_leaves_none_below_threshold(
     )
     for stage in mission.stages:
         assert stage.reference_clip_id is None
-        assert stage.reference_tier is None
-        assert stage.reference_match_confidence is None
+
+
+# ── §D24 F1 item 4a: span selection right after attach ─────────────────
+_FAKE_SPAN = {
+    "t_start_s": 0.0, "t_end_s": 1.5, "confidence": 0.83,
+    "rationale": "test span", "method": "llm+snap+qc",
+}
+
+
+def test_attach_references_selects_and_persists_span(tmp_path, monkeypatch):
+    """Right after a stage's reference clip is attached (confidence
+    above threshold), `select_reference_span` is called once per
+    attached stage and the four span fields are persisted on it — the
+    same stage a `generate_stage_metrics` pass later reads via
+    `load_stage_reference_clip` (the one loader)."""
+    _touch_index(tmp_path, monkeypatch)
+    clip = _mk_clip_for_signature()
+    monkeypatch.setattr("sculptor.reference.load_clip", lambda path: clip)
+
+    span_calls: list[dict] = []
+
+    def fake_select(clip_arg, *, goal_text, start_pose=None, llm_call=None):
+        span_calls.append({"goal_text": goal_text, "start_pose": start_pose})
+        return dict(_FAKE_SPAN), None
+
+    monkeypatch.setattr("sculptor.refs.spans.select_reference_span", fake_select)
+
+    def fake_search(query, robot="g1", k=10, **kw):
+        return [_FakeMatch(clip_id="getup_high_conf", match_confidence=0.92,
+                            tier="D")]
+
+    monkeypatch.setattr("sculptor.refs.retrieve.search", fake_search)
+
+    client = _StubClient(_good_decomp_model())
+    mission = decompose_task(
+        "Stand on one leg and kick", _default_contract(),
+        kg_store=None, client=client, attach_references=True,
+    )
+    # _good_decomp_model has 3 stages, every one gets the same top match.
+    assert len(span_calls) == 3
+    for stage in mission.stages:
+        assert stage.reference_clip_id == "getup_high_conf"
+        assert stage.reference_span_start_s == pytest.approx(0.0)
+        assert stage.reference_span_end_s == pytest.approx(1.5)
+        assert stage.reference_span_confidence == pytest.approx(0.83)
+        assert stage.reference_span_method == "llm+snap+qc"
+
+    # Round-trips through mission.json like every other Stage field.
+    save_mission(mission, tmp_path / "m")
+    reloaded = load_mission(tmp_path / "m")
+    assert reloaded.stages[0].reference_span_start_s == pytest.approx(0.0)
+    assert reloaded.stages[0].reference_span_end_s == pytest.approx(1.5)
+
+
+def test_attach_references_span_declined_leaves_fields_none(tmp_path, monkeypatch):
+    """A stage whose clip gets attached but whose span selection is
+    declined (low confidence / QC reject / whatever reason) keeps all
+    four span fields at None — the explicit "use the full clip"
+    contract — rather than a partial/garbage value."""
+    _touch_index(tmp_path, monkeypatch)
+    clip = _mk_clip_for_signature()
+    monkeypatch.setattr("sculptor.reference.load_clip", lambda path: clip)
+    monkeypatch.setattr(
+        "sculptor.refs.spans.select_reference_span",
+        lambda *a, **kw: (None, "low_confidence:0.4"))
+
+    def fake_search(query, robot="g1", k=10, **kw):
+        return [_FakeMatch(clip_id="getup_high_conf", match_confidence=0.92)]
+
+    monkeypatch.setattr("sculptor.refs.retrieve.search", fake_search)
+
+    client = _StubClient(_good_decomp_model())
+    mission = decompose_task(
+        "Stand on one leg and kick", _default_contract(),
+        kg_store=None, client=client, attach_references=True,
+    )
+    for stage in mission.stages:
+        assert stage.reference_clip_id == "getup_high_conf"
+        assert stage.reference_span_start_s is None
+        assert stage.reference_span_end_s is None
+        assert stage.reference_span_confidence is None
+        assert stage.reference_span_method is None
 
 
 def test_attach_references_false_leaves_stages_untouched(tmp_path, monkeypatch):
@@ -1038,6 +1150,9 @@ def test_attach_references_injects_signature_into_decompose_prompt(
     _touch_index(tmp_path, monkeypatch)
     clip = _mk_clip_for_signature()
     monkeypatch.setattr("sculptor.reference.load_clip", lambda path: clip)
+    monkeypatch.setattr(
+        "sculptor.refs.spans.select_reference_span",
+        lambda *a, **kw: (None, "test-no-network"))
 
     def fake_search(query, robot="g1", k=10, **kw):
         return [_FakeMatch(clip_id="jump_ref_clip", match_confidence=0.9)]

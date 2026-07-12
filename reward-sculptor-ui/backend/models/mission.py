@@ -108,6 +108,20 @@ class StageSchema(BaseModel):
     reference_clip_id: Optional[str] = None
     reference_tier: Optional[str] = None
     reference_match_confidence: Optional[float] = None
+    # §D24 F1: mirrors sculptor.mission.Stage's reference_span_start_s/
+    # _end_s/_confidence/_method — the goal-aligned SUB-SPAN of
+    # `reference_clip_id` selected by `sculptor.refs.spans.
+    # select_reference_span` (docs/internal/REFERENCE_BUILD_LOG.md
+    # D23/D24). All four None when no span applies (no clip attached,
+    # goal covers the whole clip, or selection was declined) — the
+    # stage's certification/RSI/eval-reset then use the FULL clip.
+    # Back-compat with every mission.json that predates this field is
+    # automatic via `Stage.from_dict`'s filter-unknown-keys path, same
+    # guarantee `reference_clip_id` already relies on.
+    reference_span_start_s: Optional[float] = None
+    reference_span_end_s: Optional[float] = None
+    reference_span_confidence: Optional[float] = None
+    reference_span_method: Optional[str] = None
     # §start_pose: mirrors sculptor.mission.Stage.start_pose — the
     # physical configuration the robot is in at THIS stage's episode
     # start ("supine" | "prone" | "sitting" | "crouched" | "standing"),
