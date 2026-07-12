@@ -1191,13 +1191,28 @@ def _validate_references(
         # it separately here. Recorded in `archetype_scores` regardless of
         # pass/fail (a crash scores nan — "no signal", the same convention
         # every other reference score uses).
+        # Scored at TWO hold ratios: x1 (hold as long as the motion) and x4
+        # (hold dominates, ~80% of the padded trajectory — the realistic D23
+        # live shape: a brief transition inside a long fixed episode). A
+        # verification pass proved a single-ratio gate is narrowly passable
+        # by fraction-of-episode-length window reads (forbidden by the
+        # RELATIVE-TIME authoring rule) that collapse at longer holds — the
+        # exact defect class this gate exists to kill. Both must clear.
         try:
             cth_clip = complete_then_hold(clip)
             cth_score, _ = _score_reference_entry(fn, cth_clip, required_roles)
         except Exception:  # noqa: BLE001 — never let one clip's perturbation crash validation
             cth_score = float("nan")
+        try:
+            cth_x4_clip = complete_then_hold(clip, hold_frac=4.0)
+            cth_x4_score, _ = _score_reference_entry(
+                fn, cth_x4_clip, required_roles)
+        except Exception:  # noqa: BLE001 — same convention as above
+            cth_x4_score = float("nan")
         pert_scores["complete_then_hold"] = cth_score
         all_scores[f"reference:{clip_id}:complete_then_hold"] = cth_score
+        pert_scores["complete_then_hold_x4"] = cth_x4_score
+        all_scores[f"reference:{clip_id}:complete_then_hold_x4"] = cth_x4_score
 
         ref_gates: dict[str, bool] = {}
         ref_reasons: list[str] = []
@@ -1269,17 +1284,21 @@ def _validate_references(
         cth_threshold = max(0.5, 0.8 * full_score) if finite_full else float("inf")
         cth_ok = bool(
             finite_full and np.isfinite(cth_score)
-            and cth_score >= cth_threshold - 1e-9)
+            and np.isfinite(cth_x4_score)
+            and cth_score >= cth_threshold - 1e-9
+            and cth_x4_score >= cth_threshold - 1e-9)
         ref_gates["reference_complete_then_hold"] = cth_ok
         if not cth_ok:
             ref_reasons.append(
-                f"[reference:{clip_id}] complete_then_hold: score "
-                f"{cth_score:.3f} does not reach the required "
+                f"[reference:{clip_id}] complete_then_hold: scores x1 "
+                f"{cth_score:.3f} / x4 {cth_x4_score:.3f} must BOTH reach "
                 f"{cth_threshold:.3f} (max(0.5, 0.8 * full {full_score:.3f})) "
                 f"— the metric does not score a reach-then-hold completion "
                 f"of the reference as the positive exemplar it is (D23: this "
                 f"is the exact shape of a live rollout that reaches the goal "
-                f"early and holds it, which scored spec 0.0)")
+                f"early and holds it, which scored spec 0.0; the x4 ratio "
+                f"kills fraction-of-episode window reads that only survive "
+                f"short holds)")
 
         entry: dict[str, Any] = {
             "clip_id": clip_id,
