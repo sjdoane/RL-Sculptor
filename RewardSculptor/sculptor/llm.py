@@ -72,6 +72,12 @@ ROLE_DEFAULTS: dict[str, str] = {
     # — this role is not the metric author/ladder pair D1 keeps
     # model-disjoint, so no exception applies.
     "span_select": "claude-fable-5",
+    # §D24 F2 (docs/internal/REFERENCE_BUILD_LOG.md D23/D24): re-grounds a
+    # stage's blind-authored `success_criterion` in the CROPPED reference
+    # clip's real kinematic signature, right after a span attaches
+    # (`sculptor.decompose.ground_stage_criterion`). Same D1 all-fable-5
+    # default — not the metric author/ladder pair kept model-disjoint.
+    "criterion_ground": "claude-fable-5",
 }
 
 #: §LAW 9 review panel: author-DISJOINT by construction — none of these

@@ -99,6 +99,51 @@ def _cap_untrusted_text(value: Any, max_chars: int) -> str:
     return s
 
 
+def _render_eval_reset_section(eval_reset: Any) -> str:
+    """§D24 F2: render an `# EVAL START STATE` section from the OPTIONAL
+    `"eval_reset"` key a `reference_signature.json` payload may carry
+    (sculpt.py's scaffold copies `env/eval_reset.json`'s contents there,
+    or the freshly-derived-but-unsettled result when that file doesn't
+    exist yet — see the scaffold's own comment). Schema stays 1 (the
+    reader already ignores unknown keys); this is purely additive.
+
+    Shape expected: `{"scalars": {"reset_height_offset_m": ..., ...},
+    "settled": bool | None}` — same `scalars`/`settled` convention
+    `mission_metrics._compute_eval_reset_preview` and `metric_gen
+    ._build_eval_reset_block` use. Returns `""` for anything absent or
+    malformed (defensive — a renderer must never be the thing that
+    crashes a prompt build, and older/missing payloads must render
+    exactly as before this key existed)."""
+    if not isinstance(eval_reset, dict):
+        return ""
+    scalars = eval_reset.get("scalars")
+    if not isinstance(scalars, dict) or "reset_height_offset_m" not in scalars:
+        return ""
+    try:
+        from sculptor.reference import G1_CLASS_STAND_M
+
+        root_z = round(
+            G1_CLASS_STAND_M + float(scalars["reset_height_offset_m"]), 4)
+    except Exception:  # noqa: BLE001 — never crash a prompt build
+        return ""
+    payload = {
+        "root_z_m": root_z,
+        "pitch_rad": scalars.get("reset_pitch_offset_rad"),
+        "roll_rad": scalars.get("reset_roll_offset_rad"),
+        "settled": eval_reset.get("settled"),
+    }
+    return "\n".join([
+        "",
+        "# EVAL START STATE",
+        "Every certified rollout's EPISODE BEGINS HERE (a stage-fixed "
+        "eval-rollout reset) — NOT at the reference clip's own frame 0. "
+        "A \"started low\" / \"started away from the goal\" assumption "
+        "must accept THIS start state.",
+        "",
+        json.dumps(payload, indent=2, sort_keys=True, default=str),
+    ])
+
+
 def render_reference_signature_block(sig: dict[str, Any]) -> str:
     """Render a `# REFERENCE MOTION SIGNATURE` prompt block from a payload
     returned by `load_reference_signature` — same rendering STYLE as
@@ -150,4 +195,7 @@ def render_reference_signature_block(sig: dict[str, Any]) -> str:
             f"\"{capped_text}\""
         )
     lines.append(json.dumps(signature, indent=2, sort_keys=True, default=str))
+    eval_reset_section = _render_eval_reset_section(sig.get("eval_reset"))
+    if eval_reset_section:
+        lines.append(eval_reset_section)
     return "\n".join(lines)

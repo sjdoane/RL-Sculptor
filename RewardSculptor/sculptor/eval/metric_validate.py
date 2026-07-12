@@ -1097,6 +1097,7 @@ def _reference_components(fn, clip: dict, required_roles: list[str]) -> dict:
 def _validate_references(
     fn, references: list[tuple[str, dict]], required_roles: list[str],
     *, spread_min: float, degenerate_anchor: float,
+    eval_reset: Optional[dict[str, Any]] = None,
 ) -> tuple[list[dict[str, Any]], dict[str, float]]:
     """Score every reference (full clip + its `perturbation_suite`) and
     apply the three §5 gates per reference:
@@ -1133,6 +1134,33 @@ def _validate_references(
          `freeze_end` (never transitions) and `complete_then_hold` (transitions
          then holds) must coexist: the former stays a rejected negative, the
          latter is a required positive, on the same honest metric.
+
+    `speed_slow`/`speed_fast` are SCORED AND RECORDED but NOT gated: a
+    kinematic metric may legitimately score a time-scaled completion high
+    (it's still the same completed motion, just faster/slower), so gating
+    it would false-reject an honest metric. Revisit under the R5 adversarial
+    suite if a time-scaling exploit is ever observed in practice.
+
+      5. `reference_settled_start` (§D24 F2) — a POSITIVE gate, present
+         ONLY when the caller supplies `eval_reset` (the stage's
+         certified eval-reset preview — `mission_metrics._compute_
+         eval_reset_preview`, threaded from `validate_generated_metric`):
+         a variant built by `sculptor.refs.perturb.settled_start_hold`
+         (~0.5s prepend of frame 0, root height — and orientation when
+         cheaply constructible — replaced by the SETTLED eval-reset
+         scalars, velocities zero in the prepend) must score
+         `>= max(0.5, 0.8 * full_score)`, the same threshold family as
+         `reference_complete_then_hold`. This kills the H2 class (D23,
+         excluded there but observed live elsewhere on g1-standing
+         feet_under_crouch): a start-window gate implicitly calibrated to
+         the clip's own frame 0 that silently disagrees with the ACTUAL
+         certified rollout start. When `eval_reset` is `None` (no settle
+         preview available — e.g. a standing-start goal that never
+         derives one, or settling was unavailable at cert time) the gate
+         is OMITTED from `ref_gates` entirely (never scored as a pass OR
+         a fail) and the entry instead carries
+         `"settled_start_abstained": True` — an explicit, never-silent
+         abstain distinguishable from a real pass.
 
     `speed_slow`/`speed_fast` are SCORED AND RECORDED but NOT gated: a
     kinematic metric may legitimately score a time-scaled completion high
@@ -1306,12 +1334,65 @@ def _validate_references(
                 f"realistic episode/motion hold ratio, so window reads scaled "
                 f"to episode length cannot survive it)")
 
+        # §D24 F2: `reference_settled_start` — see this function's
+        # docstring for the full rationale. `eval_reset` carries the
+        # SETTLED (or best-effort unsettled) scalars from `mission_
+        # metrics._compute_eval_reset_preview`; absence means abstain,
+        # never a silent pass/fail.
+        settled_scalars = (eval_reset or {}).get("scalars") if eval_reset else None
+        settled_start_abstained = not settled_scalars
+        settled_start_orientation_adjusted: Optional[bool] = None
+        if settled_scalars:
+            ss_build_error: Optional[str] = None
+            try:
+                from sculptor.reference import G1_CLASS_STAND_M
+                from sculptor.refs.perturb import settled_start_hold
+
+                settled_z = G1_CLASS_STAND_M + float(
+                    settled_scalars.get("reset_height_offset_m", 0.0))
+                ss_clip, settled_start_orientation_adjusted = settled_start_hold(
+                    clip, z=settled_z,
+                    pitch=settled_scalars.get("reset_pitch_offset_rad"),
+                    roll=settled_scalars.get("reset_roll_offset_rad"))
+                ss_score, _ = _score_reference_entry(
+                    fn, ss_clip, required_roles)
+            except Exception as e:  # noqa: BLE001 — never crash validation
+                ss_score = float("nan")
+                settled_start_orientation_adjusted = False
+                ss_build_error = f"{type(e).__name__}: {e}"
+
+            ss_threshold = (
+                max(0.5, 0.8 * full_score) if finite_full else float("inf"))
+            ss_ok = bool(
+                finite_full and np.isfinite(ss_score)
+                and ss_score >= ss_threshold - 1e-9)
+            ref_gates["reference_settled_start"] = ss_ok
+            pert_scores["settled_start"] = ss_score
+            all_scores[f"reference:{clip_id}:settled_start"] = ss_score
+            if not ss_ok:
+                extra = f" (build error: {ss_build_error})" if ss_build_error else ""
+                ref_reasons.append(
+                    f"[reference:{clip_id}] settled_start: score "
+                    f"{ss_score:.3f} must reach {ss_threshold:.3f} "
+                    f"(max(0.5, 0.8 * full {full_score:.3f})){extra} — the "
+                    f"metric does not score the reference motion starting "
+                    f"from the stage's ACTUAL certified eval-reset state as "
+                    f"highly as the reference itself (H2/D23: a start-"
+                    f"window gate calibrated to the clip's own frame 0 can "
+                    f"silently mis-score a rollout that actually begins "
+                    f"from the settled reset)")
+
         entry: dict[str, Any] = {
             "clip_id": clip_id,
             "gates": ref_gates,
             "reasons": ref_reasons,
             "scores": {"full": full_score, **pert_scores},
         }
+        if settled_start_abstained:
+            entry["settled_start_abstained"] = True
+        else:
+            entry["settled_start_orientation_adjusted"] = (
+                settled_start_orientation_adjusted)
         if not all(ref_gates.values()):
             # Diagnostic window for the authoring retry loop (D12): the
             # metric's OWN named sub-channels on the full reference tell
@@ -1338,6 +1419,7 @@ def validate_generated_metric(
     robot_hint: Optional[str] = None,
     robot_joint_names: Optional[Sequence[str]] = None,
     references: Optional[list[tuple[str, dict]]] = None,
+    eval_reset: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Run all MUST-HAVE gates on a generated metric. `source` is the
     module text (for static gates); `module_path` is where it's been
@@ -1375,7 +1457,17 @@ def validate_generated_metric(
     synthetic probe); the probe still runs when no reference is given. The
     result gains a `"references"` key: a list of
     `{"clip_id", "gates", "scores"}` per reference. Overall `ok` requires
-    every per-reference gate to pass too."""
+    every per-reference gate to pass too.
+
+    §D24 F2: `eval_reset` (optional — the stage's certified eval-reset
+    preview, `mission_metrics._compute_eval_reset_preview`'s return
+    value, shape `{"scalars": {...}, "settled": bool, "reason": ...}`)
+    ADDS a fifth per-reference gate, `reference_settled_start` (see
+    `_validate_references`'s docstring). `None` (the default) → each
+    reference's entry instead carries `"settled_start_abstained": True`
+    and NO `reference_settled_start` key lands in `gates` — never a
+    silent pass or fail, and byte-identical to pre-F2 behavior when this
+    argument is omitted entirely (aside from that one advisory key)."""
     gates: dict[str, bool] = {}
     reasons: list[str] = []
     family = resolve_behavior_family(behavior_goal, robot_hint)
@@ -1706,7 +1798,8 @@ def validate_generated_metric(
              if k in finite), default=0.0)
         reference_results, ref_scores = _validate_references(
             fn, references, required_roles,
-            spread_min=spread_min, degenerate_anchor=degenerate_anchor)
+            spread_min=spread_min, degenerate_anchor=degenerate_anchor,
+            eval_reset=eval_reset)
         scores.update(ref_scores)
         for entry in reference_results:
             for gate_name, gate_ok in entry["gates"].items():

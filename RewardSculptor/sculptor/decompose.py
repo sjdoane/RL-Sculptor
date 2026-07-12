@@ -760,10 +760,33 @@ def _select_and_attach_span(stage: Stage, robot: str) -> None:
     Never raises: any failure (clip fails to load, selection declines)
     just leaves the four span fields at their default None (full-clip
     fallback) and logs why — same non-fatal-by-design contract as
-    `_attach_stage_references`'s own retrieval failures."""
+    `_attach_stage_references`'s own retrieval failures.
+
+    §D24 W5 hardening: a stage whose `reference_span_method` already
+    carries a `"declined:<reason>"` marker (`sculptor.refs.spans.
+    is_span_declined`) was ALREADY attempted and semantically declined —
+    skip re-attempting (defensive symmetry with `mission_metrics
+    ._backfill_stage_reference_span`'s own guard; in normal operation
+    this function only runs once per freshly-attached stage, so this
+    guard is belt-and-suspenders, not the primary fix). A FRESH semantic
+    decline here persists the same marker so the later lazy backfill
+    (which resolves this stage from a saved mission.json) never
+    re-fires the call either.
+
+    §D24 F2: right after a span is successfully persisted, this ALSO
+    re-grounds the stage's `success_criterion` in the CROPPED clip's real
+    signature (`ground_stage_criterion`) — the stage contract (goal text,
+    criterion, metric) no longer has to inherit the FULL clip's numbers
+    just because the criterion was authored before any clip was known."""
     clip_id = stage.reference_clip_id
     if not clip_id:
         return
+
+    from sculptor.refs.spans import is_span_declined
+
+    if is_span_declined(stage):
+        return
+
     clip = _load_reference_clip(clip_id, robot)
     if clip is None:
         print(
@@ -780,6 +803,10 @@ def _select_and_attach_span(stage: Stage, robot: str) -> None:
         clip, goal_text=stage.goal_text, start_pose=stage.start_pose,
     )
     if span is None:
+        from sculptor.refs.spans import is_semantic_decline
+
+        if is_semantic_decline(reason):
+            stage.reference_span_method = f"declined:{reason}"
         print(
             f"[decompose] stage {stage.name!r}: reference span selection "
             f"declined ({reason}) — using the full clip.",
@@ -790,6 +817,18 @@ def _select_and_attach_span(stage: Stage, robot: str) -> None:
     stage.reference_span_end_s = span["t_end_s"]
     stage.reference_span_confidence = span["confidence"]
     stage.reference_span_method = span["method"]
+
+    try:
+        from sculptor.refs.spans import crop_span
+
+        cropped = crop_span(clip, span["t_start_s"], span["t_end_s"])
+        ground_stage_criterion(stage, cropped)
+    except Exception as e:  # noqa: BLE001 — criterion re-grounding is best-effort
+        print(
+            f"[decompose] stage {stage.name!r}: criterion re-grounding "
+            f"skipped ({type(e).__name__}: {e}) — keeping the original "
+            "criterion.", file=sys.stderr, flush=True,
+        )
 
 
 def _attach_stage_references(stages: list[Stage], robot: str) -> None:
@@ -1475,3 +1514,337 @@ def reconcile_criterion(
         f"reconcile_criterion: rewrite failed validation twice; "
         f"last error: {last_error}"
     )
+
+
+# ── §D24 F2: blind-authored criterion re-grounding ───────────────────
+#: D23 (docs/internal/REFERENCE_BUILD_LOG.md) root-cause chain, step 2:
+#: `success_criterion` is authored in the SAME LLM call as `goal_text`,
+#: BEFORE any per-stage reference clip is known — so it can bake in a
+#: number (e.g. `root_height > 0.35`) that the stage's ACTUAL
+#: goal-aligned motion (a sub-phase of a longer clip) never reaches.
+#: `ground_stage_criterion` closes that gap AFTER a span attaches, by
+#: asking Claude to re-derive the criterion's thresholds from the
+#: CROPPED clip's real kinematic signature, then MECHANICALLY verifying
+#: the rewrite against that same clip before ever adopting it.
+class _CriterionGroundModel(BaseModel):
+    """Claude's response schema for a criterion re-grounding rewrite."""
+
+    rationale: str
+    success_criterion: str
+
+
+def _split_top_level_and(tree: Any) -> list[Any]:
+    """AST-split `tree.body` (an `ast.Expression`) on a top-level `and` —
+    a bare `BoolOp(And, ...)` at the root yields its operands (each
+    independently checkable); anything else (a single comparison, an
+    `or`, ...) is one conjunct: the whole expression. Mirrors reading
+    `"A and B and C"` as three separate claims."""
+    import ast
+
+    body = tree.body
+    if isinstance(body, ast.BoolOp) and isinstance(body.op, ast.And):
+        return list(body.values)
+    return [body]
+
+
+def _conjunct_is_component_free(node: Any) -> bool:
+    """True when `node`'s subtree references NO `components` name
+    anywhere — the mechanically VERIFIABLE half of a criterion (a
+    `components[...]`/`components.get(...)` conjunct can't be checked
+    here: no reward has run against a bare reference clip, so there is
+    no `components` dict to evaluate)."""
+    import ast
+
+    return not any(
+        isinstance(n, ast.Name) and n.id == "components"
+        for n in ast.walk(node)
+    )
+
+
+def _clip_to_trajectory_namespace(clip: dict) -> dict[str, Any]:
+    """Build the SAME flat namespace `_evaluate_success_criterion`
+    (`sculptor.mission_runtime`) evaluates a criterion against — but
+    sourced from a REFERENCE CLIP instead of a rollout's trajectory.npz +
+    behavior.json:
+
+      * `trajectory['root_height']` / `info['root_height']` — the clip's
+        own `root_pos_z` (1-D, matches `_derive_root_height`'s
+        env-0-representative shape convention).
+      * `trajectory['projected_gravity_b']` — `sculptor.refs.convert.
+        _projected_gravity_b(root_quat_wxyz)` when the clip carries
+        orientation; absent otherwise (exactly like a real trajectory
+        missing that key — callers must `.get()`-guard).
+      * `joint_pos`/`joint_vel` pass through when present.
+      * `components` is deliberately an EMPTY dict and `behavior` an
+        empty dict — a criterion conjunct that references either is
+        UNVERIFIABLE against a bare clip (no reward/rollout has run) and
+        must be excluded by the caller (`_conjunct_is_component_free`)
+        before ever reaching this namespace; a lookup that slips through
+        anyway KeyErrors/NameErrors like a real missing key would.
+
+    Never raises — a clip missing a channel just omits that key, same
+    as the real namespace builder."""
+    import numpy as np
+
+    trajectory: dict[str, Any] = {}
+    z = clip.get("root_pos_z")
+    if z is not None:
+        trajectory["root_height"] = np.asarray(z)
+    quat = clip.get("root_quat_wxyz")
+    if quat is not None:
+        from sculptor.refs.convert import _projected_gravity_b
+
+        trajectory["projected_gravity_b"] = _projected_gravity_b(
+            np.asarray(quat, dtype=np.float64))
+    for key in ("joint_pos", "joint_vel"):
+        v = clip.get(key)
+        if v is not None:
+            trajectory[key] = np.asarray(v)
+
+    namespace: dict[str, Any] = {
+        "metric": None,
+        "behavior": {},
+        "components": {},
+        "trajectory": trajectory,
+        "info": trajectory,  # alias, matches the real namespace builder
+    }
+    namespace.update({
+        "abs": abs, "min": min, "max": max, "sum": sum, "len": len,
+        "round": round, "float": float, "int": int, "bool": bool,
+    })
+    return namespace
+
+
+def _mechanically_verify_criterion_on_clip(
+    criterion: str, clip: dict,
+) -> Optional[str]:
+    """§D24 F2 mechanical acceptance gate: AST-split `criterion` on
+    top-level `and`; every conjunct that is `_conjunct_is_component_free`
+    (references only `trajectory`/`info`/`behavior`, no `components`)
+    MUST evaluate `True` against the CROPPED reference clip's own
+    kinematic data (`_clip_to_trajectory_namespace`) — a criterion whose
+    mechanically-checkable half fails on the very exemplar it is meant
+    to certify is exactly the D23 defect (`root_height > 0.35` on a span
+    that never exceeds ~0.16 m) reproduced by a re-grounding call that
+    didn't actually fix anything. `components`-referencing conjuncts are
+    SKIPPED (unverifiable — no reward has run against this clip; a WRONG
+    components-only rewrite is a pre-existing risk `reconcile_criterion`
+    already owns, out of scope here).
+
+    This is the guard that makes a WRONG re-grounded criterion STRICTLY
+    HARDER to adopt than the status quo: the status quo (the original,
+    blind-authored criterion) is kept on ANY failure below.
+
+    Returns `None` when every checkable conjunct passes (including the
+    vacuous case: no checkable conjunct exists, e.g. an all-`components`
+    criterion — nothing to mechanically verify, so it is accepted on
+    trust, same as `reconcile_criterion`'s own components-only
+    tolerance); otherwise a short reason naming the failing conjunct.
+    Never raises — any exception during parse/eval IS the failure
+    reason.
+
+    SAFETY PRECONDITION: this function `eval()`s each checkable conjunct
+    with real `__builtins__` (same convention `_evaluate_success_
+    criterion` documents — numpy's own methods need them, so the AST
+    walker is the ONLY safety layer, not an empty builtins dict). The
+    caller MUST run the static safety gates
+    (`_validate_success_criterion` + `mission_runtime
+    ._validate_criterion_ast`) on `criterion` FIRST and reject before
+    ever calling this — `ground_stage_criterion` does exactly that
+    ordering. This function does NOT re-run those gates itself."""
+    import ast
+
+    try:
+        tree = ast.parse(criterion.strip(), mode="eval")
+    except SyntaxError as e:
+        return f"unparseable: {type(e).__name__}: {e}"
+
+    try:
+        namespace = _clip_to_trajectory_namespace(clip)
+    except Exception as e:  # noqa: BLE001 — no exemplar to check against
+        return f"failed to build the clip namespace: {type(e).__name__}: {e}"
+
+    for conjunct in _split_top_level_and(tree):
+        if not _conjunct_is_component_free(conjunct):
+            continue  # unverifiable at cert time — skipped, not evaluated
+        expr = ast.fix_missing_locations(ast.Expression(body=conjunct))
+        try:
+            compiled = compile(expr, "<criterion-conjunct>", "eval")
+            result = eval(  # noqa: S307 — same trusted-namespace contract
+                compiled, {"__builtins__": __builtins__}, namespace)
+        except Exception as e:  # noqa: BLE001 — a raising conjunct fails verification
+            try:
+                rendered = ast.unparse(conjunct)
+            except Exception:  # noqa: BLE001 — rendering itself must never crash
+                rendered = "<unparseable conjunct>"
+            return (
+                f"conjunct raised on the reference clip "
+                f"({type(e).__name__}: {e}): {rendered}")
+        if not bool(result):
+            try:
+                rendered = ast.unparse(conjunct)
+            except Exception:  # noqa: BLE001
+                rendered = "<unparseable conjunct>"
+            return f"conjunct evaluates False on the reference clip: {rendered}"
+    return None
+
+
+def ground_stage_criterion(
+    stage: Stage,
+    cropped_clip: dict,
+    *,
+    client: Any = None,
+    model: str = MODEL_ID,
+) -> dict[str, Any]:
+    """§D24 F2 (docs/internal/REFERENCE_BUILD_LOG.md D23/D24): re-ground
+    `stage.success_criterion` in the CROPPED reference clip's real
+    kinematic signature, right after a span attaches
+    (`_select_and_attach_span`, both the decompose and redecompose
+    paths) and in `mission_metrics`'s lazy span-backfill path (the
+    channel that fixes an EXISTING mission's criterion, e.g.
+    g1-standing's torso_righting, without a full re-decomposition).
+
+    D23's root cause chain started upstream of certification:
+    `success_criterion` is authored BLIND (in the SAME LLM call as
+    `goal_text`, before any per-stage clip is known), so it can demand a
+    number a sub-phase goal can never satisfy (`root_height > 0.35` on a
+    stage whose goal keeps the pelvis at ~0.14 m). This closes that gap
+    for every stage whose criterion is re-groundable after the fact.
+
+    ONE LLM call (`criterion_ground` role, via `_parse_with_retry` — a
+    schema-repair retry on a malformed RESPONSE only, no outer
+    gate-feedback retry loop like `reconcile_criterion`'s two-attempt
+    scheme): a wrong re-grounding is worse than doing nothing, so this
+    function KEEPS the original criterion on ANY failure (API error,
+    unparseable/empty response, the STATIC safety gates
+    `_validate_success_criterion`/`_validate_criterion_ast` — run FIRST,
+    exactly like `_gate_reconciled_criterion` — or, only once the rewrite
+    is already known SAFE, the MECHANICAL acceptance check
+    `_mechanically_verify_criterion_on_clip`) rather than burning more
+    calls chasing a fix. That mechanical check makes a WRONG re-grounded
+    criterion strictly HARDER to adopt than the status quo: every
+    `trajectory`/`behavior`-only conjunct in the rewrite must evaluate
+    `True` on the cropped reference clip's own data (`components`-
+    referencing conjuncts are unverifiable here and skipped) — a
+    criterion that fails its own reference exemplar is exactly the D23
+    defect this increment exists to close, so it is REJECTED, never
+    adopted.
+
+    Mutates `stage.success_criterion` in place ONLY on acceptance.
+    Returns `{"adopted": bool, "rationale": <str>}` ALWAYS (never
+    raises) — `rationale` is Claude's stated rationale when adopted, or
+    a short reason naming why the original was kept otherwise. The
+    caller decides whether/how to surface this (e.g. onto a report
+    entry); this function's own non-adoption paths are also logged to
+    stderr (never silent), mirroring `_select_and_attach_span`'s
+    declined-span logging."""
+    original = stage.success_criterion
+
+    try:
+        from sculptor.refs.convert import kinematic_signature
+
+        signature = kinematic_signature(cropped_clip)
+    except Exception as e:  # noqa: BLE001 — grounding is best-effort
+        reason = f"signature computation failed: {type(e).__name__}: {e}"
+        print(f"[decompose] stage {stage.name!r}: criterion re-grounding "
+              f"skipped ({reason}) — keeping the original criterion.",
+              file=sys.stderr, flush=True)
+        return {"adopted": False, "rationale": reason}
+
+    eval_reset: Optional[dict] = None
+    try:
+        from sculptor.reference import derive_eval_reset
+
+        eval_reset = derive_eval_reset(cropped_clip)
+    except Exception:  # noqa: BLE001 — advisory context only, never blocks
+        eval_reset = None
+
+    if client is None:
+        import anthropic
+
+        client = anthropic.Anthropic(max_retries=2, timeout=240.0)
+
+    system_prompt = load_prompt("criterion_ground")
+    payload: dict[str, Any] = {
+        "stage_name": stage.name,
+        "stage_goal": stage.goal_text,
+        "original_criterion": original,
+        "signature": signature,
+    }
+    if eval_reset is not None:
+        payload["eval_reset"] = eval_reset
+
+    try:
+        parsed = _parse_with_retry(
+            client, system_prompt, json.dumps(payload, indent=2, default=str),
+            output_format=_CriterionGroundModel, model=model,
+        )
+    except Exception as e:  # noqa: BLE001 — a failed call keeps the original
+        reason = f"LLM call failed: {type(e).__name__}: {e}"
+        print(f"[decompose] stage {stage.name!r}: criterion re-grounding "
+              f"{reason} — keeping the original criterion.",
+              file=sys.stderr, flush=True)
+        return {"adopted": False, "rationale": reason}
+
+    new_criterion = (parsed.success_criterion or "").strip()
+    if not new_criterion or new_criterion == original.strip():
+        reason = (parsed.rationale or "no change needed").strip() or (
+            "no change needed")
+        return {"adopted": False, "rationale": reason}
+
+    # Static SAFETY gates FIRST (mirrors `_gate_reconciled_criterion`'s own
+    # discipline, and MUST run before `_mechanically_verify_criterion_on_
+    # clip` below): that function's `eval()` trusts the AST walker as its
+    # ONLY safety layer (same convention `_evaluate_success_criterion`
+    # documents — real `__builtins__` are passed through because numpy's
+    # own methods need them), so a Lambda/unsafe-Call rewrite MUST be
+    # rejected here, before it is ever `eval`'d against the clip.
+    from dataclasses import replace as _dc_replace
+
+    from sculptor.mission import _validate_success_criterion
+
+    candidate = _dc_replace(stage, success_criterion=new_criterion)
+    try:
+        _validate_success_criterion(candidate, set())
+    except MissionValidationError as e:
+        reason = f"failed static validation: {e}"
+        print(f"[decompose] stage {stage.name!r}: re-grounded criterion "
+              f"REJECTED ({reason}) — keeping the original criterion.",
+              file=sys.stderr, flush=True)
+        return {"adopted": False, "rationale": reason}
+
+    import ast as _ast
+
+    from sculptor.mission_runtime import (
+        BARE_IDENTIFIERS,
+        CriterionEvalError,
+        _validate_criterion_ast,
+    )
+
+    try:
+        _validate_criterion_ast(
+            _ast.parse(new_criterion, mode="eval"),
+            namespace_keys=set(BARE_IDENTIFIERS) | {
+                "behavior", "components", "trajectory", "info",
+            },
+        )
+    except (CriterionEvalError, SyntaxError) as e:
+        reason = f"failed the runtime safety gate: {e}"
+        print(f"[decompose] stage {stage.name!r}: re-grounded criterion "
+              f"REJECTED ({reason}) — keeping the original criterion.",
+              file=sys.stderr, flush=True)
+        return {"adopted": False, "rationale": reason}
+
+    # ONLY NOW is it safe to mechanically evaluate the rewrite's
+    # trajectory/behavior-only conjuncts against the cropped clip.
+    fail_reason = _mechanically_verify_criterion_on_clip(
+        new_criterion, cropped_clip)
+    if fail_reason is not None:
+        reason = f"mechanical verification failed: {fail_reason}"
+        print(f"[decompose] stage {stage.name!r}: re-grounded criterion "
+              f"REJECTED ({reason}) — keeping the original criterion "
+              f"{original!r}.", file=sys.stderr, flush=True)
+        return {"adopted": False, "rationale": reason}
+
+    stage.success_criterion = new_criterion
+    return {"adopted": True, "rationale": parsed.rationale}

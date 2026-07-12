@@ -1059,6 +1059,16 @@ def test_attach_references_selects_and_persists_span(tmp_path, monkeypatch):
         return dict(_FAKE_SPAN), None
 
     monkeypatch.setattr("sculptor.refs.spans.select_reference_span", fake_select)
+    # §D24 F2: a successfully-attached span now ALSO triggers criterion
+    # re-grounding (`ground_stage_criterion`), a REAL Anthropic call by
+    # default — this test is about span attach/persist, not grounding,
+    # so stub it out (mirrors this file's own `select_reference_span`
+    # stubbing discipline for exactly the same class of hazard).
+    ground_calls: list[dict] = []
+    monkeypatch.setattr(
+        "sculptor.decompose.ground_stage_criterion",
+        lambda stage, clip, **kw: ground_calls.append(
+            {"stage": stage.name}) or {"adopted": False, "rationale": "stubbed"})
 
     def fake_search(query, robot="g1", k=10, **kw):
         return [_FakeMatch(clip_id="getup_high_conf", match_confidence=0.92,
@@ -1073,6 +1083,9 @@ def test_attach_references_selects_and_persists_span(tmp_path, monkeypatch):
     )
     # _good_decomp_model has 3 stages, every one gets the same top match.
     assert len(span_calls) == 3
+    # §D24 F2: criterion re-grounding fires once per stage whose span
+    # attached successfully — same cadence as span selection itself.
+    assert len(ground_calls) == 3
     for stage in mission.stages:
         assert stage.reference_clip_id == "getup_high_conf"
         assert stage.reference_span_start_s == pytest.approx(0.0)
@@ -1089,9 +1102,15 @@ def test_attach_references_selects_and_persists_span(tmp_path, monkeypatch):
 
 def test_attach_references_span_declined_leaves_fields_none(tmp_path, monkeypatch):
     """A stage whose clip gets attached but whose span selection is
-    declined (low confidence / QC reject / whatever reason) keeps all
-    four span fields at None — the explicit "use the full clip"
-    contract — rather than a partial/garbage value."""
+    declined (low confidence / QC reject / whatever reason) keeps
+    start/end/confidence at None — the explicit "use the full clip"
+    contract — rather than a partial/garbage value.
+
+    §D24 W5 hardening: a SEMANTIC decline (this one: low_confidence) now
+    persists a `"declined:<reason>"` marker in `reference_span_method`
+    (the ONE field that deliberately breaks the old "all four None
+    together" invariant) so span selection is never re-attempted for
+    this stage — see `sculptor.refs.spans.is_semantic_decline`."""
     _touch_index(tmp_path, monkeypatch)
     clip = _mk_clip_for_signature()
     monkeypatch.setattr("sculptor.reference.load_clip", lambda path: clip)
@@ -1114,6 +1133,38 @@ def test_attach_references_span_declined_leaves_fields_none(tmp_path, monkeypatc
         assert stage.reference_span_start_s is None
         assert stage.reference_span_end_s is None
         assert stage.reference_span_confidence is None
+        assert stage.reference_span_method == "declined:low_confidence:0.4"
+
+
+def test_attach_references_span_infra_failure_leaves_method_none(
+    tmp_path, monkeypatch,
+):
+    """An INFRA failure (llm_unavailable/parse_error/invalid_clip/
+    signature_error — as opposed to a semantic verdict) must NOT persist
+    a declined marker — `reference_span_method` stays at the true "all
+    four None" state so the NEXT attempt (decompose-time re-run, or the
+    mission_metrics lazy backfill) retries selection instead of treating
+    a transient outage as a standing decision."""
+    _touch_index(tmp_path, monkeypatch)
+    clip = _mk_clip_for_signature()
+    monkeypatch.setattr("sculptor.reference.load_clip", lambda path: clip)
+    monkeypatch.setattr(
+        "sculptor.refs.spans.select_reference_span",
+        lambda *a, **kw: (None, "llm_unavailable:APIConnectionError: timeout"))
+
+    def fake_search(query, robot="g1", k=10, **kw):
+        return [_FakeMatch(clip_id="getup_high_conf", match_confidence=0.92)]
+
+    monkeypatch.setattr("sculptor.refs.retrieve.search", fake_search)
+
+    client = _StubClient(_good_decomp_model())
+    mission = decompose_task(
+        "Stand on one leg and kick", _default_contract(),
+        kg_store=None, client=client, attach_references=True,
+    )
+    for stage in mission.stages:
+        assert stage.reference_clip_id == "getup_high_conf"
+        assert stage.reference_span_start_s is None
         assert stage.reference_span_method is None
 
 

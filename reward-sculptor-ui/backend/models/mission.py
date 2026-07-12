@@ -121,6 +121,12 @@ class StageSchema(BaseModel):
     reference_span_start_s: Optional[float] = None
     reference_span_end_s: Optional[float] = None
     reference_span_confidence: Optional[float] = None
+    # §D24 W5 hardening: `reference_span_method` may also be
+    # `"declined:<reason>"` (start/end/confidence stay None) — a
+    # SEMANTIC decline (whole_clip/low_confidence/qc_reject) that was
+    # already attempted, so the backfill/attach path never re-fires a
+    # real LLM call for this stage. Plain `Optional[str]`, no length/
+    # enum constraint, so this passes through unchanged.
     reference_span_method: Optional[str] = None
     # §start_pose: mirrors sculptor.mission.Stage.start_pose — the
     # physical configuration the robot is in at THIS stage's episode

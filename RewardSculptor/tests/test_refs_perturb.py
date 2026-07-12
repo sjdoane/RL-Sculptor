@@ -15,6 +15,7 @@ from sculptor.refs.perturb import (
     perturbation_suite,
     root_motion_only,
     segment_shuffle,
+    settled_start_hold,
     speed,
     time_reverse,
     truncate,
@@ -118,6 +119,84 @@ def test_complete_then_hold_not_in_perturbation_suite():
     clip = _clip()
     suite = perturbation_suite(clip)
     assert "complete_then_hold" not in suite
+
+
+# ── §D24 F2: settled_start_hold ─────────────────────────────────────────
+def test_settled_start_hold_prepends_settled_z_and_preserves_the_rest():
+    clip = _clip(T=60)
+    out, adjusted = settled_start_hold(clip, z=0.05, hold_s=0.5)  # 15 frames @30fps
+    assert validate_clip(out) == []
+    assert adjusted is False  # no pitch/roll given -> z-only
+    hold_n = 15
+    assert out["root_pos_z"].shape[0] == 60 + hold_n
+    assert np.all(out["root_pos_z"][:hold_n] == pytest.approx(0.05))
+    # Everything AFTER the prepend is the clip UNCHANGED.
+    np.testing.assert_allclose(out["root_pos_z"][hold_n:], clip["root_pos_z"])
+    np.testing.assert_allclose(out["joint_pos"][hold_n:], clip["joint_pos"])
+
+
+def test_settled_start_hold_velocities_zero_in_prepend():
+    clip = _clip(T=60)
+    clip["root_vel_z"] = np.gradient(clip["root_pos_z"]) * clip["fps"]
+    clip["joint_vel"] = np.gradient(clip["joint_pos"], axis=0) * clip["fps"]
+    out, _ = settled_start_hold(clip, z=0.05, hold_s=0.5)
+    hold_n = 15
+    assert np.all(out["root_vel_z"][:hold_n] == 0.0)
+    assert np.all(out["joint_vel"][:hold_n] == 0.0)
+    # Original portion untouched.
+    np.testing.assert_allclose(out["root_vel_z"][hold_n:], clip["root_vel_z"])
+
+
+def test_settled_start_hold_z_only_leaves_orientation_at_frame_zero():
+    """No pitch/roll given -> the prepend's orientation stays frame 0's
+    own value (still a valid, if less complete, variant)."""
+    clip = _clip(T=60)
+    out, adjusted = settled_start_hold(clip, z=0.05)
+    assert adjusted is False
+    hold_n = 15
+    assert np.all(out["root_quat_wxyz"][:hold_n] == clip["root_quat_wxyz"][0])
+
+
+def test_settled_start_hold_with_pitch_roll_adjusts_orientation():
+    from sculptor.reference import _quat_from_pitch_roll
+
+    clip = _clip(T=60)
+    out, adjusted = settled_start_hold(clip, z=0.05, pitch=0.3, roll=0.1)
+    assert adjusted is True
+    hold_n = 15
+    expected_q = _quat_from_pitch_roll(0.3, 0.1)
+    np.testing.assert_allclose(out["root_quat_wxyz"][0], expected_q)
+    # NOT the clip's own frame-0 quat (identity here) — genuinely adjusted.
+    assert not np.allclose(out["root_quat_wxyz"][0], clip["root_quat_wxyz"][0])
+    # Original portion (after the prepend) is untouched.
+    np.testing.assert_allclose(
+        out["root_quat_wxyz"][hold_n:], clip["root_quat_wxyz"])
+
+
+def test_settled_start_hold_missing_pitch_or_roll_is_z_only():
+    """BOTH pitch and roll must be given — a partial pair also falls
+    back to z-only (never guesses the missing half)."""
+    clip = _clip(T=60)
+    out, adjusted = settled_start_hold(clip, z=0.05, pitch=0.3, roll=None)
+    assert adjusted is False
+    hold_n = 15
+    assert np.all(out["root_quat_wxyz"][:hold_n] == clip["root_quat_wxyz"][0])
+
+
+def test_settled_start_hold_no_quat_channel_is_z_only():
+    clip = {"root_pos_z": np.linspace(0.1, 0.7, 60), "fps": 30.0}
+    out, adjusted = settled_start_hold(clip, z=0.05, pitch=0.3, roll=0.1)
+    assert adjusted is False
+    assert "root_quat_wxyz" not in out
+
+
+def test_settled_start_hold_is_a_positive_exemplar_not_a_perturbation():
+    """Not added to `perturbation_suite()` — it's a caller-constructed
+    positive exemplar, same convention as `complete_then_hold`."""
+    clip = _clip()
+    suite = perturbation_suite(clip)
+    assert "settled_start" not in suite
+    assert "settled_start_hold" not in suite
 
 
 def test_segment_shuffle_is_deterministic_per_seed_and_preserves_length():

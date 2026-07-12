@@ -148,7 +148,21 @@ class Stage:
     # `reference_clip_id` attached, the goal covers the whole clip, or
     # selection was declined (low confidence / failed mechanical or
     # end-state QC / LLM unavailable) — a None span means "use the FULL
-    # clip", never a partial/garbage crop. Every consumer of
+    # clip", never a partial/garbage crop.
+    # §D24 W5 hardening (docs/internal/REFERENCE_BUILD_LOG.md): ONE
+    # narrow exception to "all four None together" — when selection was
+    # ATTEMPTED and SEMANTICALLY declined (whole_clip / low_confidence /
+    # qc_reject — see `sculptor.refs.spans.is_semantic_decline`),
+    # `reference_span_method` alone is set to `"declined:<reason>"`
+    # (start/end/confidence stay None) so the decompose-time attach path
+    # and `mission_metrics`'s lazy backfill never re-fire a real LLM call
+    # on a stage that already reached this verdict. An INFRA failure
+    # (llm_unavailable/parse_error/invalid_clip/signature_error) leaves
+    # `reference_span_method` at None (the true "all four None" case) so
+    # a transient failure IS retried on the next pass. Consumers that
+    # need "does a span apply" must keep checking `reference_span_start_s
+    # is not None` (unaffected — `load_stage_reference_clip` only ever
+    # crops when the start/end fields are set). Every consumer of
     # `reference_clip_id` MUST resolve it through
     # `sculptor.mission_metrics.load_stage_reference_clip` (the one
     # loader) rather than cropping independently — §D19's "every

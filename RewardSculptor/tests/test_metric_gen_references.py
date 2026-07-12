@@ -210,3 +210,81 @@ def test_retry_loop_feeds_back_validation_reasons_with_references(
     # The reference block is still present on the retry (base_user carries it).
     assert "jump_demo_clip" in second_prompt
     assert rec["accepted"] is False
+
+
+# ── §D24 F2: EVAL START STATE block (eval_reset= kwarg) ────────────────
+_EVAL_RESET = {
+    "scalars": {
+        "reset_height_offset_m": -0.6644,
+        "reset_pitch_offset_rad": -1.3348,
+    },
+    "settled": True,
+    "reason": None,
+}
+
+
+def test_eval_reset_none_omits_eval_start_state_block(tmp_path: Path):
+    client = _CapturingClient()
+    generate_objective_metric(
+        "stand up", tmp_path, client=client, max_attempts=1, review=False)
+    assert "EVAL START STATE" not in _user_content(client.calls[0])
+
+
+def test_eval_reset_present_injects_eval_start_state_block(tmp_path: Path):
+    client = _CapturingClient()
+    rec = generate_objective_metric(
+        "right the torso to sitting", tmp_path, client=client,
+        max_attempts=1, review=False, eval_reset=_EVAL_RESET,
+    )
+    content = _user_content(client.calls[0])
+    assert "EVAL START STATE" in content
+    assert "0.0756" in content  # G1_CLASS_STAND_M(0.74) + offset(-0.6644)
+    assert '"settled": true' in content
+    assert "BEGINS HERE" in content
+    assert rec["eval_reset_preview"] == _EVAL_RESET
+
+
+def test_eval_reset_and_references_coexist_in_the_same_prompt(tmp_path: Path):
+    """Both blocks are additive — a stage with a reference clip AND an
+    eval-reset preview must see both, reference block first."""
+    clip = _mk_clip()
+    client = _CapturingClient()
+    generate_objective_metric(
+        "jump up and land", tmp_path, client=client,
+        max_attempts=1, review=False,
+        references=[("jump_demo_clip", clip)], eval_reset=_EVAL_RESET,
+    )
+    content = _user_content(client.calls[0])
+    assert "REFERENCE MOTION SIGNATURE" in content
+    assert "EVAL START STATE" in content
+    assert content.index("REFERENCE MOTION SIGNATURE") < content.index(
+        "EVAL START STATE")
+
+
+def test_eval_reset_unsettled_notes_the_reason(tmp_path: Path):
+    client = _CapturingClient()
+    generate_objective_metric(
+        "right the torso to sitting", tmp_path, client=client,
+        max_attempts=1, review=False,
+        eval_reset={
+            "scalars": {"reset_height_offset_m": -0.6644},
+            "settled": False, "reason": "SettleUnavailable: no mujoco",
+        },
+    )
+    content = _user_content(client.calls[0])
+    assert '"settled": false' in content
+    assert "UNSETTLED" in content
+    assert "SettleUnavailable" in content
+
+
+def test_eval_reset_malformed_payload_never_crashes_generation(tmp_path: Path):
+    """A malformed/incomplete `eval_reset` (no usable height offset) must
+    never crash generation — the block is simply omitted."""
+    client = _CapturingClient()
+    for bad in ({}, {"scalars": {}}, {"scalars": None}, None):
+        generate_objective_metric(
+            "stand up", tmp_path, client=client, max_attempts=1,
+            review=False, eval_reset=bad,
+        )
+    assert all(
+        "EVAL START STATE" not in _user_content(c) for c in client.calls)

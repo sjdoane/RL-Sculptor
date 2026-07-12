@@ -24,6 +24,8 @@ exactly this).
 """
 from __future__ import annotations
 
+import json
+import os
 import sys
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -188,6 +190,73 @@ def _calibrate_stage_reference(
         return None
 
 
+def _compute_eval_reset_preview(
+    clip: dict, *, robot: str,
+) -> Optional[dict[str, Any]]:
+    """§D24 F2 item 1 (docs/internal/REFERENCE_BUILD_LOG.md D17/D20a/D23):
+    at cert time, compute the stage's expected EVAL-ROLLOUT START state —
+    `derive_eval_reset(clip)` run through the exact SAME settle path
+    `sculpt.py`'s scaffold block 2.5 uses (`sculptor.reference.
+    settle_reset`, called with the identical args:
+    `settle_reset(pre, joint_names=clip.get("joint_names"), robot=robot)`)
+    — so these numbers and the ones the scaffold LATER writes to
+    `env/eval_reset.json` agree BY CONSTRUCTION, not by coincidence
+    (§D19's "one loader/one derivation path" rule, extended to this new
+    consumer).
+
+    Returns `None` when `clip` is not a low-start archetype
+    (`derive_eval_reset` returns `None` — a jump/standing-start clip has
+    no non-default eval-rollout start to preview, exactly like the
+    scaffold writes no `eval_reset.json` for those). Otherwise returns
+    `{"scalars": <reset scalars>, "settled": bool, "reason":
+    Optional[str]}`:
+
+      * settling SUCCEEDED — `scalars` are the SETTLED values,
+        `settled=True`, `reason=None` (plus `delta_z_m`/`converged` for
+        diagnostics).
+      * settling is unavailable/disabled/raised — `scalars` are the RAW
+        (unsettled) `derive_eval_reset` output, `settled=False`, and
+        `reason` names why. `RS_SETTLE_RESET=0` (same escape hatch the
+        scaffold honors) and any `SettleUnavailable`/other exception both
+        land here.
+
+    Never raises — this is advisory authoring/validation context, never
+    a stage-blocking dependency (mirrors `settle_reset`'s own §5
+    contract: settling is a REFINEMENT, never required)."""
+    from sculptor.reference import derive_eval_reset
+
+    try:
+        pre = derive_eval_reset(clip)
+    except Exception as e:  # noqa: BLE001 — preview is advisory, never fatal
+        return {
+            "scalars": None, "settled": False,
+            "reason": f"derive_eval_reset failed: {type(e).__name__}: {e}",
+        }
+    if pre is None:
+        return None
+
+    if os.environ.get("RS_SETTLE_RESET", "1") == "0":
+        return {"scalars": pre, "settled": False, "reason": "RS_SETTLE_RESET=0"}
+
+    try:
+        from sculptor.reference import settle_reset
+
+        settle_result = settle_reset(
+            pre, joint_names=clip.get("joint_names"), robot=robot)
+        return {
+            "scalars": settle_result["scalars"],
+            "settled": True,
+            "reason": None,
+            "delta_z_m": settle_result["delta_z_m"],
+            "converged": settle_result["converged"],
+        }
+    except Exception as e:  # noqa: BLE001 — settling is a refinement, never fatal
+        return {
+            "scalars": pre, "settled": False,
+            "reason": f"{type(e).__name__}: {e}",
+        }
+
+
 def _backfill_stage_reference_span(
     stage: Any, robot_hint: Optional[str],
 ) -> Optional[str]:
@@ -205,14 +274,34 @@ def _backfill_stage_reference_span(
     D24) — no separate write happens here, same as every other stage
     mutation `generate_stage_metrics` makes (`steering_metric`, etc.).
 
-    Returns `None` when no backfill was needed (no clip attached, or a
-    span already exists) or the backfill succeeded; otherwise a short
-    reason string (mirrors `reference_load_error`) for the caller to
-    record on the stage's report entry. Never raises."""
+    Returns `None` when no backfill was needed (no clip attached, a span
+    already exists, or a prior attempt already SEMANTICALLY declined —
+    see below) or the backfill succeeded; otherwise a short reason string
+    (mirrors `reference_load_error`) for the caller to record on the
+    stage's report entry. Never raises.
+
+    §D24 W5 hardening (live-confirmed defect, 2026-07-12): this used to
+    guard ONLY on `reference_span_start_s is not None` (the success
+    marker) — a stage whose selection SEMANTICALLY declines (whole_clip /
+    low_confidence / qc_reject) has all four span fields at None, so
+    every subsequent `generate_stage_metrics` pass over that stage (e.g.
+    the default whole-mission pass re-visiting a stage whose metric keeps
+    getting rejected) re-fired a REAL `span_select` LLM call. Now checks
+    `sculptor.refs.spans.is_span_declined(stage)` too, and — on a fresh
+    decline — persists the `"declined:<reason>"` marker
+    (`is_semantic_decline`) so the SAME semantic verdict is never
+    re-attempted. An INFRA failure (llm_unavailable/parse_error/
+    invalid_clip/signature_error, or a clip-load exception) persists
+    NOTHING, so a transient outage is retried on the next pass."""
     if not getattr(stage, "reference_clip_id", None):
         return None
     if getattr(stage, "reference_span_start_s", None) is not None:
         return None  # already selected (or a prior attempt already ran)
+
+    from sculptor.refs.spans import is_span_declined
+
+    if is_span_declined(stage):
+        return None  # already attempted and semantically declined
 
     try:
         from sculptor.reference import load_clip
@@ -231,6 +320,10 @@ def _backfill_stage_reference_span(
         clip, goal_text=stage.goal_text,
         start_pose=getattr(stage, "start_pose", None))
     if span is None:
+        from sculptor.refs.spans import is_semantic_decline
+
+        if is_semantic_decline(reason):
+            stage.reference_span_method = f"declined:{reason}"
         return reason
 
     stage.reference_span_start_s = span["t_start_s"]
@@ -366,6 +459,63 @@ def generate_stage_metrics(
             })
         references, reference_load_error = _load_stage_reference(
             stage, robot_hint)
+
+        # §D24 F2 item 1: compute the stage's certified eval-reset preview
+        # from the SAME (possibly cropped) clip just loaded for
+        # `references` — persisted next to `meta.json` and threaded into
+        # generation (authoring context) + validation (the
+        # `reference_settled_start` gate). None whenever there is no
+        # reference (or it isn't a low-start archetype) — never fatal.
+        eval_reset_preview: Optional[dict[str, Any]] = None
+        if references:
+            ref_clip_id_for_reset, ref_clip_for_reset = references[0]
+            eval_reset_robot = _robot_slug(robot_hint)
+            try:
+                eval_reset_preview = _compute_eval_reset_preview(
+                    ref_clip_for_reset, robot=eval_reset_robot)
+            except Exception as e:  # noqa: BLE001 — preview is advisory
+                print(
+                    f"[mission-metrics] stage {stage.name!r}: eval-reset "
+                    f"preview computation failed ({type(e).__name__}: "
+                    f"{e}) — proceeding without it.",
+                    file=sys.stderr, flush=True)
+                eval_reset_preview = None
+            if eval_reset_preview is not None:
+                try:
+                    out_dir.mkdir(parents=True, exist_ok=True)
+                    (out_dir / "eval_reset_preview.json").write_text(
+                        json.dumps(eval_reset_preview, indent=2, default=str),
+                        encoding="utf-8")
+                except Exception as e:  # noqa: BLE001 — persistence is advisory
+                    print(
+                        f"[mission-metrics] stage {stage.name!r}: failed "
+                        f"to write eval_reset_preview.json "
+                        f"({type(e).__name__}: {e}).",
+                        file=sys.stderr, flush=True)
+
+            # §D24 F2 (D deliverable): re-ground the stage's blind-authored
+            # success_criterion in the CROPPED clip's real signature — the
+            # SAME lazy mechanism that fixes an EXISTING mission (e.g.
+            # g1-standing's torso_righting) without a full re-decomposition.
+            # Gated on `backfilled_now` (the span was JUST discovered by
+            # THIS call) so this real LLM call fires exactly once per span
+            # discovery, never on every subsequent pass over a stage whose
+            # metric keeps getting rejected (same repeat-call discipline
+            # the span-backfill declined-marker fix above enforces).
+            # Stages whose span already existed from decompose time were
+            # already re-grounded there (`_select_and_attach_span`).
+            if backfilled_now:
+                try:
+                    from sculptor.decompose import ground_stage_criterion
+
+                    ground_stage_criterion(stage, ref_clip_for_reset)
+                except Exception as e:  # noqa: BLE001 — never fatal
+                    print(
+                        f"[mission-metrics] stage {stage.name!r}: "
+                        f"criterion re-grounding crashed "
+                        f"({type(e).__name__}: {e}) — keeping the "
+                        f"original criterion.", file=sys.stderr, flush=True)
+
         try:
             rec = generate_objective_metric(
                 stage.goal_text, out_dir,
@@ -373,6 +523,7 @@ def generate_stage_metrics(
                 n_candidates=n_candidates,
                 on_event=on_event,
                 references=references,
+                eval_reset=eval_reset_preview,
             )
         except Exception as e:  # noqa: BLE001 — stage falls back, mission runs
             print(

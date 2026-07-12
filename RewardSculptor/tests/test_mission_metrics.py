@@ -11,12 +11,14 @@ a tmp `RS_REFERENCE_ROOT` library fixture (built via `sculptor.refs.library`
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
 
 from sculptor.mission import Mission, Stage
 from sculptor.mission_metrics import (
+    _compute_eval_reset_preview,
     generate_stage_metrics,
     load_stage_reference_clip,
     resolve_stage_metric_ref,
@@ -255,6 +257,304 @@ def _write_fixture_clip(tmp_path: Path, robot: str, clip_id: str) -> Path:
     return root
 
 
+# ── §D24 F2: getup-shaped fixture clip (eval_reset_preview needs a
+#    low-start archetype — the jump clip above derives no eval reset
+#    at all) — mirrors test_start_pose_qc_settle.py's `_getup_clip`
+#    (duplicated locally, same convention that file's own docstring
+#    documents for cross-test-file synthetic clip builders). ─────────
+def _getup_clip() -> dict:
+    import numpy as np
+
+    fps = 50.0
+
+    def seg(dur, fn):
+        n = max(2, int(round(dur * fps)))
+        return fn(np.linspace(0.0, 1.0, n, endpoint=False))
+
+    lying = seg(0.5, lambda s: np.full_like(s, 0.10))
+    ramp = seg(1.0, lambda s: 0.10 + (0.75 - 0.10) * s)
+    stand = seg(0.5, lambda s: np.full_like(s, 0.75))
+    z = np.concatenate([lying, ramp, stand])
+    return {"root_pos_z": z, "fps": fps}
+
+
+def _write_getup_fixture_clip(tmp_path: Path, robot: str, clip_id: str) -> Path:
+    from sculptor.reference import save_clip
+    from sculptor.refs import library
+
+    root = tmp_path / "refs_root_getup"
+    clip = _getup_clip()
+    clip_path = library.clip_dir(robot, clip_id, root=root) / library.CLIP_FILENAME
+    save_clip(clip_path, clip)
+    content_sha = library.content_sha256(clip_path.read_bytes())
+    prov = library.make_provenance(
+        clip_id=clip_id, robot=robot,
+        source={"kind": "procedural"}, license="internal",
+        attribution="test-fixture", content_sha256_=content_sha)
+    library.write_provenance(robot, clip_id, prov, root=root)
+    return root
+
+
+# ── §D24 F2 item 1: _compute_eval_reset_preview (unit-level) ────────────
+def test_compute_eval_reset_preview_none_for_non_getup_archetype():
+    from sculptor.reference import make_procedural_jump_clip
+
+    assert _compute_eval_reset_preview(
+        make_procedural_jump_clip(), robot="g1") is None
+
+
+def test_compute_eval_reset_preview_settled_success(monkeypatch):
+    settled_scalars = {"reset_height_offset_m": -0.3}
+
+    def fake_settle(pre, *, joint_names=None, robot="g1"):
+        return {"scalars": settled_scalars, "delta_z_m": -0.02, "steps": 10,
+                "converged": True, "duration_s": 0.2}
+
+    monkeypatch.setattr("sculptor.reference.settle_reset", fake_settle)
+    out = _compute_eval_reset_preview(_getup_clip(), robot="g1")
+    assert out is not None
+    assert out["settled"] is True
+    assert out["reason"] is None
+    assert out["scalars"] == settled_scalars
+    assert out["delta_z_m"] == pytest.approx(-0.02)
+
+
+def test_compute_eval_reset_preview_settle_unavailable_falls_back_unsettled(
+    monkeypatch,
+):
+    from sculptor.reference import SettleUnavailable
+
+    def raising_settle(pre, *, joint_names=None, robot="g1"):
+        raise SettleUnavailable("mujoco unavailable in test")
+
+    monkeypatch.setattr("sculptor.reference.settle_reset", raising_settle)
+    out = _compute_eval_reset_preview(_getup_clip(), robot="g1")
+    assert out is not None
+    assert out["settled"] is False
+    assert "mujoco unavailable" in out["reason"]
+    assert out["scalars"] is not None  # the raw derive_eval_reset output
+
+
+def test_compute_eval_reset_preview_rs_settle_reset_disabled(monkeypatch):
+    monkeypatch.setenv("RS_SETTLE_RESET", "0")
+
+    def boom(*a, **kw):  # pragma: no cover — must not run
+        raise AssertionError("settle_reset must not be called when disabled")
+
+    monkeypatch.setattr("sculptor.reference.settle_reset", boom)
+    out = _compute_eval_reset_preview(_getup_clip(), robot="g1")
+    assert out is not None
+    assert out["settled"] is False
+    assert out["reason"] == "RS_SETTLE_RESET=0"
+
+
+def test_compute_eval_reset_preview_derive_failure_never_raises(monkeypatch):
+    monkeypatch.setattr(
+        "sculptor.reference.derive_eval_reset",
+        lambda clip: (_ for _ in ()).throw(RuntimeError("boom")))
+    out = _compute_eval_reset_preview(_getup_clip(), robot="g1")
+    assert out is not None
+    assert out["settled"] is False
+    assert out["scalars"] is None
+    assert "boom" in out["reason"]
+
+
+# ── §D24 F2 item 1: wiring into generate_stage_metrics ──────────────────
+def test_eval_reset_preview_persisted_next_to_meta_json(tmp_path, monkeypatch):
+    """A getup-archetype stage's cert-time eval-reset preview is computed
+    via the SAME settle path the scaffold uses and persisted as
+    `stage_metrics/<stage>/eval_reset_preview.json` — the same dir as
+    `meta.json`."""
+    root = _write_getup_fixture_clip(tmp_path, "g1", "getup_demo_clip")
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(root))
+    monkeypatch.setattr("sculptor.refs.spans.select_reference_span", _no_span)
+
+    settled_scalars = {"reset_height_offset_m": -0.3, "reset_pitch_offset_rad": 0.1}
+
+    def fake_settle(pre, *, joint_names=None, robot="g1"):
+        return {"scalars": settled_scalars, "delta_z_m": -0.02, "steps": 10,
+                "converged": True, "duration_s": 0.2}
+
+    monkeypatch.setattr("sculptor.reference.settle_reset", fake_settle)
+
+    def fake_gen(goal, out_dir, **kw):
+        return {"accepted": True}
+
+    import sculptor.eval as ev
+    monkeypatch.setattr(ev, "generate_objective_metric", fake_gen)
+
+    import sculptor.eval.metric_calibration as mc
+    monkeypatch.setattr(
+        mc, "calibrate_metric_against_reference", lambda *a, **kw: None)
+
+    s1 = _mk_stage("get_up", reference_clip_id="getup_demo_clip")
+    m = _mk_mission(tmp_path, [s1])
+    generate_stage_metrics(m, robot_hint="Mjlab-Velocity-Flat-Unitree-G1")
+
+    preview_path = (
+        Path(m.mission_dir) / "stage_metrics" / "get_up"
+        / "eval_reset_preview.json")
+    assert preview_path.is_file()
+    payload = json.loads(preview_path.read_text())
+    assert payload["settled"] is True
+    assert payload["scalars"]["reset_height_offset_m"] == pytest.approx(-0.3)
+
+
+def test_eval_reset_preview_settle_unavailable_persists_unsettled(
+    tmp_path, monkeypatch,
+):
+    """The settle-unavailable path (monkeypatched to raise) still
+    persists a preview — the UNSETTLED `derive_eval_reset` output, with
+    `settled: false` and a reason — never fatal, never silent."""
+    root = _write_getup_fixture_clip(tmp_path, "g1", "getup_demo_clip")
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(root))
+    monkeypatch.setattr("sculptor.refs.spans.select_reference_span", _no_span)
+
+    from sculptor.reference import SettleUnavailable
+
+    def raising_settle(pre, *, joint_names=None, robot="g1"):
+        raise SettleUnavailable("mujoco unavailable in test")
+
+    monkeypatch.setattr("sculptor.reference.settle_reset", raising_settle)
+
+    def fake_gen(goal, out_dir, **kw):
+        return {"accepted": True}
+
+    import sculptor.eval as ev
+    monkeypatch.setattr(ev, "generate_objective_metric", fake_gen)
+
+    import sculptor.eval.metric_calibration as mc
+    monkeypatch.setattr(
+        mc, "calibrate_metric_against_reference", lambda *a, **kw: None)
+
+    s1 = _mk_stage("get_up", reference_clip_id="getup_demo_clip")
+    m = _mk_mission(tmp_path, [s1])
+    generate_stage_metrics(m, robot_hint="Mjlab-Velocity-Flat-Unitree-G1")
+
+    preview_path = (
+        Path(m.mission_dir) / "stage_metrics" / "get_up"
+        / "eval_reset_preview.json")
+    assert preview_path.is_file()
+    payload = json.loads(preview_path.read_text())
+    assert payload["settled"] is False
+    assert "SettleUnavailable" in payload["reason"] or "mujoco" in payload["reason"]
+    assert payload["scalars"] is not None
+
+
+def test_generate_stage_metrics_threads_eval_reset_into_generation(
+    tmp_path, monkeypatch,
+):
+    root = _write_getup_fixture_clip(tmp_path, "g1", "getup_demo_clip")
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(root))
+    monkeypatch.setattr("sculptor.refs.spans.select_reference_span", _no_span)
+    monkeypatch.setenv("RS_SETTLE_RESET", "0")  # keep this test physics-free
+
+    calls: list[dict] = []
+
+    def fake_gen(goal, out_dir, **kw):
+        calls.append(kw)
+        return {"accepted": True}
+
+    import sculptor.eval as ev
+    monkeypatch.setattr(ev, "generate_objective_metric", fake_gen)
+
+    import sculptor.eval.metric_calibration as mc
+    monkeypatch.setattr(
+        mc, "calibrate_metric_against_reference", lambda *a, **kw: None)
+
+    s1 = _mk_stage("get_up", reference_clip_id="getup_demo_clip")
+    m = _mk_mission(tmp_path, [s1])
+    generate_stage_metrics(m, robot_hint="Mjlab-Velocity-Flat-Unitree-G1")
+
+    assert calls[0]["eval_reset"] is not None
+    assert calls[0]["eval_reset"]["scalars"] is not None
+    assert calls[0]["eval_reset"]["settled"] is False
+
+
+def test_generate_stage_metrics_no_eval_reset_for_non_getup_clip(
+    tmp_path, monkeypatch,
+):
+    """A jump-archetype (or any non-low-start) reference never produces
+    an eval-reset preview — no file written, `eval_reset=None` passed
+    through unchanged (byte-identical to pre-F2 behavior)."""
+    root = _write_fixture_clip(tmp_path, "g1", "getup_demo_clip")
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(root))
+    monkeypatch.setattr("sculptor.refs.spans.select_reference_span", _no_span)
+
+    calls: list[dict] = []
+
+    def fake_gen(goal, out_dir, **kw):
+        calls.append(kw)
+        return {"accepted": True}
+
+    import sculptor.eval as ev
+    monkeypatch.setattr(ev, "generate_objective_metric", fake_gen)
+
+    import sculptor.eval.metric_calibration as mc
+    monkeypatch.setattr(
+        mc, "calibrate_metric_against_reference", lambda *a, **kw: None)
+
+    s1 = _mk_stage("get_up", reference_clip_id="getup_demo_clip")
+    m = _mk_mission(tmp_path, [s1])
+    generate_stage_metrics(m, robot_hint="Mjlab-Velocity-Flat-Unitree-G1")
+
+    assert calls[0]["eval_reset"] is None
+    preview_path = (
+        Path(m.mission_dir) / "stage_metrics" / "get_up"
+        / "eval_reset_preview.json")
+    assert not preview_path.is_file()
+
+
+# ── §D24 F2 (D deliverable): criterion re-grounding wiring ──────────────
+def test_generate_stage_metrics_regrounds_criterion_on_fresh_backfill(
+    tmp_path, monkeypatch,
+):
+    """The lazy backfill mechanism that fixes an EXISTING mission's
+    criterion (e.g. g1-standing's torso_righting) without a full
+    re-decomposition: `ground_stage_criterion` is invoked with the
+    CROPPED clip exactly once, when the span is FRESHLY discovered."""
+    root = _write_fixture_clip(tmp_path, "g1", "getup_demo_clip")
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(root))
+
+    def fake_select(clip, *, goal_text, start_pose=None, llm_call=None):
+        return dict(_FAKE_SPAN), None
+
+    monkeypatch.setattr("sculptor.refs.spans.select_reference_span", fake_select)
+
+    ground_calls: list[dict] = []
+
+    def fake_ground(stage, clip, **kw):
+        ground_calls.append({"stage": stage.name, "n_frames": clip["root_pos_z"].shape[0]})
+        stage.success_criterion = "metric > 0.9"
+        return {"adopted": True, "rationale": "test"}
+
+    monkeypatch.setattr("sculptor.decompose.ground_stage_criterion", fake_ground)
+
+    def fake_gen(goal, out_dir, **kw):
+        return {"accepted": True}
+
+    import sculptor.eval as ev
+    monkeypatch.setattr(ev, "generate_objective_metric", fake_gen)
+
+    import sculptor.eval.metric_calibration as mc
+    monkeypatch.setattr(
+        mc, "calibrate_metric_against_reference", lambda *a, **kw: None)
+
+    s1 = _mk_stage("get_up", reference_clip_id="getup_demo_clip")
+    m = _mk_mission(tmp_path, [s1])
+    generate_stage_metrics(m, robot_hint="Mjlab-Velocity-Flat-Unitree-G1")
+
+    assert len(ground_calls) == 1
+    # The threaded clip is the CROPPED one (span [0.0, 1.0]s @ 50fps).
+    assert ground_calls[0]["n_frames"] < 90
+    assert m.stages[0].success_criterion == "metric > 0.9"
+
+    # A SECOND pass (span already exists) must NOT re-ground.
+    generate_stage_metrics(m, robot_hint="Mjlab-Velocity-Flat-Unitree-G1",
+                            only_stages=["get_up"])
+    assert len(ground_calls) == 1
+
+
 # ── §D24 F1 item 5: load_stage_reference_clip (the one loader) ─────────
 def test_load_stage_reference_clip_none_without_clip_id(tmp_path):
     s = _mk_stage("plain")
@@ -463,6 +763,16 @@ def test_generate_stage_metrics_backfills_span_once_and_persists(
 
     monkeypatch.setattr("sculptor.refs.spans.select_reference_span", fake_select)
 
+    # §D24 F2: a FRESH span backfill also triggers criterion re-grounding
+    # (a real Anthropic call by default) — stub it, this test is about
+    # span backfill, not grounding (see test_criterion_ground.py /
+    # the dedicated backfill-wiring test below for that).
+    ground_calls: list[dict] = []
+    monkeypatch.setattr(
+        "sculptor.decompose.ground_stage_criterion",
+        lambda stage, clip, **kw: ground_calls.append(
+            {"stage": stage.name}) or {"adopted": False, "rationale": "stubbed"})
+
     calls: list[dict] = []
 
     def fake_gen(goal, out_dir, **kw):
@@ -481,6 +791,7 @@ def test_generate_stage_metrics_backfills_span_once_and_persists(
     report = generate_stage_metrics(m, robot_hint="Mjlab-Velocity-Flat-Unitree-G1")
 
     assert len(span_calls) == 1
+    assert len(ground_calls) == 1
     assert m.stages[0].reference_span_start_s == pytest.approx(0.0)
     assert m.stages[0].reference_span_end_s == pytest.approx(1.0)
     assert m.stages[0].reference_span_confidence == pytest.approx(0.82)
@@ -503,6 +814,9 @@ def test_generate_stage_metrics_backfills_span_once_and_persists(
         reloaded, robot_hint="Mjlab-Velocity-Flat-Unitree-G1",
         only_stages=["get_up"])
     assert len(span_calls) == 1
+    # §D24 F2: nor must it re-ground the criterion — that's gated on THIS
+    # call being the one that freshly discovered the span.
+    assert len(ground_calls) == 1
     assert "reference_span_backfill_reason" not in report2["generated"][0]
     assert "reference_span_backfill_reason" not in report["generated"][0]
 
@@ -512,11 +826,18 @@ def test_generate_stage_metrics_backfill_declined_proceeds_full_clip(
 ):
     """When span selection declines (low confidence, QC reject, ...) the
     reason is recorded on the report entry and generation proceeds with
-    the FULL (uncropped) clip — never a partial/garbage crop."""
+    the FULL (uncropped) clip — never a partial/garbage crop.
+
+    §D24 W5 hardening: a SEMANTIC decline (low_confidence) also persists
+    a `"declined:<reason>"` marker so the backfill never re-attempts
+    selection on a later pass — see the dedicated retry tests below."""
     root = _write_fixture_clip(tmp_path, "g1", "getup_demo_clip")
     monkeypatch.setenv("RS_REFERENCE_ROOT", str(root))
 
+    select_calls: list[int] = []
+
     def fake_select(clip, *, goal_text, start_pose=None, llm_call=None):
+        select_calls.append(1)
         return None, "low_confidence:0.42"
 
     monkeypatch.setattr("sculptor.refs.spans.select_reference_span", fake_select)
@@ -539,6 +860,7 @@ def test_generate_stage_metrics_backfill_declined_proceeds_full_clip(
     report = generate_stage_metrics(m)
 
     assert m.stages[0].reference_span_start_s is None
+    assert m.stages[0].reference_span_method == "declined:low_confidence:0.42"
     entry = report["generated"][0]
     assert entry["reference_span_backfill_reason"] == "low_confidence:0.42"
 
@@ -547,6 +869,81 @@ def test_generate_stage_metrics_backfill_declined_proceeds_full_clip(
     full_n = make_procedural_jump_clip()["root_pos_z"].shape[0]
     clip_id, clip = calls[0]["references"][0]
     assert clip["root_pos_z"].shape[0] == full_n
+
+    # §D24 W5 hardening: THE regression this fix exists for — a second
+    # `generate_stage_metrics` pass over the SAME (still-rejected, since
+    # `fake_gen` always accepts here — use only_stages to force a revisit
+    # of an accepted stage) must make ZERO further `select_reference_span`
+    # calls; the declined marker is a standing verdict, not a retry
+    # target.
+    generate_stage_metrics(m, only_stages=["get_up"])
+    assert len(select_calls) == 1
+
+
+def test_backfill_llm_unavailable_persists_no_marker_and_is_retried(
+    tmp_path, monkeypatch,
+):
+    """§D24 W5 hardening: an INFRA failure (llm_unavailable/parse_error/
+    invalid_clip/signature_error) is NOT a standing verdict — no marker
+    is persisted, so the VERY NEXT `generate_stage_metrics` pass retries
+    selection (as opposed to the semantic-decline case above, which
+    never retries)."""
+    root = _write_fixture_clip(tmp_path, "g1", "getup_demo_clip")
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(root))
+
+    select_calls: list[int] = []
+
+    def fake_select(clip, *, goal_text, start_pose=None, llm_call=None):
+        select_calls.append(1)
+        return None, "llm_unavailable:APIConnectionError: timeout"
+
+    monkeypatch.setattr("sculptor.refs.spans.select_reference_span", fake_select)
+
+    def fake_gen(goal, out_dir, **kw):
+        return {"accepted": True}
+
+    import sculptor.eval as ev
+    monkeypatch.setattr(ev, "generate_objective_metric", fake_gen)
+
+    import sculptor.eval.metric_calibration as mc
+    monkeypatch.setattr(
+        mc, "calibrate_metric_against_reference", lambda *a, **kw: None)
+
+    s1 = _mk_stage("get_up", reference_clip_id="getup_demo_clip")
+    m = _mk_mission(tmp_path, [s1])
+    generate_stage_metrics(m)
+    assert m.stages[0].reference_span_start_s is None
+    assert m.stages[0].reference_span_method is None
+    assert len(select_calls) == 1
+
+    generate_stage_metrics(m, only_stages=["get_up"])
+    assert len(select_calls) == 2  # retried — no standing marker blocked it
+
+
+def test_declined_marker_stage_still_certifies_against_full_clip(
+    tmp_path, monkeypatch,
+):
+    """A stage carrying a `"declined:<reason>"` marker (start/end/
+    confidence None) must resolve to the FULL clip through the ONE
+    loader — the marker changes retry behavior, never the "no span
+    applies" semantics `load_stage_reference_clip` already implements
+    off of `reference_span_start_s`."""
+    root = _write_fixture_clip(tmp_path, "g1", "getup_demo_clip")
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(root))
+
+    from sculptor.reference import make_procedural_jump_clip
+
+    full_n = make_procedural_jump_clip()["root_pos_z"].shape[0]
+
+    s = _mk_stage(
+        "get_up", reference_clip_id="getup_demo_clip",
+        reference_span_method="declined:whole_clip")
+    loaded = load_stage_reference_clip(s, "g1")
+    assert loaded is not None
+    clip_id, clip, span_meta = loaded
+    assert clip_id == "getup_demo_clip"
+    assert clip["root_pos_z"].shape[0] == full_n
+    assert span_meta is None
 
 
 def test_generate_stage_metrics_backfill_skipped_when_span_already_set(

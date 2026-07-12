@@ -16,7 +16,7 @@ the degenerate anchors and the full reference (the calibration ladder).
 """
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 
@@ -136,6 +136,79 @@ def complete_then_hold(clip: dict, hold_frac: float = 1.0) -> dict:
             v[n:] = 0
             out[vk] = v
     return _validate_or_raise(out)
+
+
+def settled_start_hold(
+    clip: dict, *, z: float, pitch: Optional[float] = None,
+    roll: Optional[float] = None, hold_s: float = 0.5,
+) -> tuple[dict, bool]:
+    """§D24 F2 (docs/internal/REFERENCE_BUILD_LOG.md D17/D23):
+    PREPEND a `hold_s`-second hold of frame 0 to `clip`, with the
+    PREPENDED frames' root height (and, when cheaply constructible,
+    orientation) replaced by the stage's ACTUAL settled eval-reset start
+    state — the shape of a live rollout whose episode actually BEGINS at
+    the certified eval reset, not at the clip's own frame 0 (D17: get-up
+    stages get a stage-FIXED eval reset, derived+settled independently of
+    the clip; D23/H2: a metric implicitly calibrated to the clip's own
+    frame-0 numbers can silently mis-score every rollout from iteration
+    one if the two disagree). Velocities are zero throughout the
+    prepend, same convention as every other hold in this module.
+
+    Everything AFTER the prepend is `clip` UNCHANGED — this is a
+    POSITIVE exemplar (the real reference motion, preceded by its real
+    certified start), not a perturbation of the motion itself.
+
+    Parameters
+    ----------
+    z : the settled ABSOLUTE root height (meters) to hold during the
+        prepend.
+    pitch, roll : optional settled orientation offsets (radians, same
+        convention as `sculptor.reference._quat_from_pitch_roll`). Both
+        must be given (and `clip` must carry `root_quat_wxyz`) for
+        orientation to be adjusted — a `None` either, or no orientation
+        channel on the clip, leaves the prepend's orientation at frame
+        0's own value (z-only adjustment).
+    hold_s : prepend duration in seconds (default 0.5s, D17's own
+        convention).
+
+    Returns
+    -------
+    `(clip, orientation_adjusted)` — `orientation_adjusted` is `True`
+    only when both `pitch` and `roll` were given AND `clip` carries
+    `root_quat_wxyz` (the prepend's orientation was ALSO corrected, not
+    just height); `False` means the prepend used frame 0's own
+    orientation unchanged (a still-valid, if less complete, variant —
+    the caller records this rather than silently claiming full
+    correction).
+    """
+    fps = float(clip["fps"])
+    hold_n = max(2, int(round(hold_s * fps)))
+    n = _time_len(clip)
+    idx = np.concatenate([np.zeros(hold_n, dtype=int), np.arange(n)])
+    out = _rebuild(clip, idx)
+
+    if "root_pos_z" in out:
+        zarr = np.array(out["root_pos_z"], copy=True)
+        zarr[:hold_n] = float(z)
+        out["root_pos_z"] = zarr
+
+    orientation_adjusted = False
+    if (out.get("root_quat_wxyz") is not None
+            and pitch is not None and roll is not None):
+        from sculptor.reference import _quat_from_pitch_roll
+
+        q = np.array(out["root_quat_wxyz"], copy=True)
+        q[:hold_n] = _quat_from_pitch_roll(float(pitch), float(roll))
+        out["root_quat_wxyz"] = q
+        orientation_adjusted = True
+
+    for vk in ("root_vel_z", "joint_vel"):
+        if vk in out:
+            v = np.array(out[vk], copy=True)
+            v[:hold_n] = 0
+            out[vk] = v
+
+    return _validate_or_raise(out), orientation_adjusted
 
 
 def segment_shuffle(clip: dict, n_segments: int = 6, seed: int = 0) -> dict:

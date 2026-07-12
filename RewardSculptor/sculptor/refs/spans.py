@@ -24,6 +24,55 @@ from typing import Any, Callable, Optional
 
 import numpy as np
 
+# ── §D24 W5 hardening: don't retry a SEMANTICALLY declined span forever ──
+#: `reason` prefixes (the second element of `select_reference_span`'s
+#: return tuple) that represent a SEMANTIC verdict — the pipeline actually
+#: ran (LLM responded, mechanical QC evaluated) and reached a real
+#: conclusion — as opposed to an INFRA failure (`llm_unavailable`,
+#: `parse_error`, `invalid_clip`, `signature_error`) that must be retried
+#: on the next attempt, never treated as a standing decision. Found live
+#: (2026-07-12): `_backfill_stage_reference_span` only guards on
+#: `reference_span_start_s is not None` (a SUCCESS marker), so a stage
+#: whose selection semantically declines (whole_clip / low_confidence /
+#: qc_reject) re-fires a REAL `span_select` LLM call on every subsequent
+#: `generate_stage_metrics` pass over that stage (e.g. every time its
+#: metric generation is rejected and the default whole-mission pass
+#: revisits it).
+_SEMANTIC_DECLINE_PREFIXES = ("whole_clip", "low_confidence", "qc_reject")
+
+#: Prefix `Stage.reference_span_method` carries when selection was
+#: ATTEMPTED and semantically declined (see `is_semantic_decline`) — the
+#: four span fields stay at their normal "no span" values (start/end/
+#: confidence None) EXCEPT this one, which records "we tried, and
+#: correctly concluded no crop applies" so callers never re-attempt.
+#: This is a deliberate, narrow exception to the field's own docstring
+#: ("all four are None together whenever no span applies") — see
+#: `Stage.reference_span_method`'s docstring for the full contract.
+DECLINED_METHOD_PREFIX = "declined:"
+
+
+def is_semantic_decline(reason: Optional[str]) -> bool:
+    """True when `reason` (from `select_reference_span`'s `(span, reason)`
+    return) represents a SEMANTIC verdict the selection pipeline actually
+    reached — as opposed to an INFRA failure that must be retried. Callers
+    persist a `DECLINED_METHOD_PREFIX` marker (in `reference_span_method`)
+    ONLY when this returns True, so a transient outage (llm_unavailable),
+    a malformed response (parse_error), or an unreadable clip
+    (invalid_clip/signature_error) never permanently blocks span
+    selection for a stage."""
+    return bool(reason) and str(reason).startswith(_SEMANTIC_DECLINE_PREFIXES)
+
+
+def is_span_declined(stage: Any) -> bool:
+    """True when `stage.reference_span_method` already carries a
+    `DECLINED_METHOD_PREFIX` marker — span selection was attempted once
+    for this stage and semantically declined. Callers (the decompose-time
+    attach path and `mission_metrics`'s lazy backfill) must NOT
+    re-attempt selection when this is True, exactly like they already
+    skip when `reference_span_start_s is not None` (the success case)."""
+    return str(getattr(stage, "reference_span_method", "") or "").startswith(
+        DECLINED_METHOD_PREFIX)
+
 from sculptor.llm import log_llm_call, model_for, response_text_blocks
 
 logger = logging.getLogger(__name__)

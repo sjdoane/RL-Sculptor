@@ -5329,6 +5329,41 @@ def _run_one_stage(
                         sig_robot, stage_reference_clip_id).get("text")
                 except Exception:  # noqa: BLE001 — provenance is advisory
                     sig_text = None
+
+                # §D24 F2 item B2: optional "eval_reset" key — the
+                # stage's certified eval-rollout START state, threaded
+                # into the diagnose/edit prompt via
+                # reference_context.render_reference_signature_block.
+                # Prefer `env/eval_reset.json` when it's already on disk
+                # (block 2.5 above wrote it this pass, or an earlier
+                # scaffold pass did — that's the number every eval
+                # rollout ACTUALLY uses, settled or not); only when it
+                # doesn't exist yet (e.g. this stage never entered the
+                # needs_reference_rsi/non_standing block above) fall back
+                # to a fresh, UNSETTLED derivation from `sig_clip` itself
+                # — cheap (no CPU-MuJoCo settle attempt here), advisory,
+                # never fatal (item 6, same non-fatal contract as the
+                # rest of this block).
+                sig_eval_reset: Optional[dict] = None
+                try:
+                    eval_reset_json_path = stage_dir / "env" / "eval_reset.json"
+                    if eval_reset_json_path.is_file():
+                        sig_eval_reset = {
+                            "scalars": json.loads(
+                                eval_reset_json_path.read_text(
+                                    encoding="utf-8")),
+                            "settled": None,
+                        }
+                    else:
+                        from sculptor.reference import derive_eval_reset
+
+                        derived = derive_eval_reset(sig_clip)
+                        if derived is not None:
+                            sig_eval_reset = {
+                                "scalars": derived, "settled": False}
+                except Exception:  # noqa: BLE001 — advisory only (item 6)
+                    sig_eval_reset = None
+
                 signature_payload = {
                     "schema": 1,
                     "clip_id": stage_reference_clip_id,
@@ -5348,6 +5383,10 @@ def _run_one_stage(
                         "confidence": sig_span_meta["confidence"],
                         "method": sig_span_meta["method"],
                     }
+                # §D24 F2 item B2: optional, additive key — schema stays 1
+                # (same contract as "span" above).
+                if sig_eval_reset is not None:
+                    signature_payload["eval_reset"] = sig_eval_reset
                 sig_path = stage_dir / "reference_signature.json"
                 sig_path.write_text(
                     json.dumps(

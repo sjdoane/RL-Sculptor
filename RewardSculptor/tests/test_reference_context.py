@@ -220,3 +220,54 @@ def test_render_reference_signature_block_short_text_unchanged_besides_fence():
     assert '"Reference standing long jump."' in block
     assert "0.72" in block
     assert "root_z" in block
+
+
+# ── §D24 F2: optional "eval_reset" key -> EVAL START STATE section ─────
+def test_render_reference_signature_block_includes_eval_reset_section_when_present():
+    payload = dict(_VALID_PAYLOAD, eval_reset={
+        "scalars": {
+            "reset_height_offset_m": -0.6644,
+            "reset_pitch_offset_rad": -1.3348,
+        },
+        "settled": True,
+    })
+    block = render_reference_signature_block(payload)
+    assert "# EVAL START STATE" in block
+    assert "0.0756" in block  # G1_CLASS_STAND_M (0.74) + offset
+    assert '"settled": true' in block
+    # The base signature rendering is unaffected.
+    assert "0.72" in block
+    assert "root_z" in block
+
+
+def test_render_reference_signature_block_omits_eval_reset_section_when_absent():
+    """No `eval_reset` key at all (the pre-F2 schema, or a stage whose
+    goal has no non-standing eval reset) — no section rendered, and
+    every OTHER test in this file (which never sets this key) must keep
+    passing unchanged."""
+    block = render_reference_signature_block(_VALID_PAYLOAD)
+    assert "EVAL START STATE" not in block
+
+
+def test_render_reference_signature_block_tolerates_malformed_eval_reset():
+    """A malformed/incomplete `eval_reset` value must never crash
+    rendering — it's simply omitted, same defensive contract as every
+    other optional field in this module."""
+    for bad in (None, "", {}, {"scalars": "not a dict"}, {"scalars": {}},
+                {"scalars": {"reset_pitch_offset_rad": 0.1}}):  # no height key
+        payload = dict(_VALID_PAYLOAD, eval_reset=bad)
+        block = render_reference_signature_block(payload)
+        assert "EVAL START STATE" not in block
+        assert "g1_jump_ref_01" in block  # rest of the block still renders
+
+
+def test_render_reference_signature_block_eval_reset_round_trip(tmp_path: Path):
+    payload = dict(_VALID_PAYLOAD, eval_reset={
+        "scalars": {"reset_height_offset_m": -0.1}, "settled": False,
+    })
+    _write(tmp_path, payload)
+    loaded = load_reference_signature(tmp_path)
+    assert loaded is not None
+    block = render_reference_signature_block(loaded)
+    assert "EVAL START STATE" in block
+    assert '"settled": false' in block

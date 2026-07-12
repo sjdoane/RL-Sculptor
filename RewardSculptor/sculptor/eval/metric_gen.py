@@ -99,6 +99,60 @@ def _build_reference_signature_block(
     return "\n".join(lines), signatures
 
 
+def _build_eval_reset_block(eval_reset: dict[str, Any]) -> str:
+    """§D24 F2: render the stage's ACTUAL certified eval-rollout START
+    state (§D17 stage-fixed eval reset, settled via §D20a's
+    settle-then-rederive) into a `# EVAL START STATE` authoring block —
+    `eval_reset` is the `{"scalars": ..., "settled": bool, "reason":
+    ...}` payload `mission_metrics._compute_eval_reset_preview` returns.
+
+    Every certified rollout's episode BEGINS at these numbers, NOT at the
+    reference clip's own frame 0 (D23/H2 class: a metric that implicitly
+    calibrates a "started low"/"started away from the goal" gate to the
+    clip's own initial frame can silently mis-score every rollout from
+    iteration one if the two disagree — the exact failure the
+    `reference_settled_start` validation gate exists to catch
+    mechanically; this block is the authoring-side half of the same fix).
+
+    Returns `""` for a falsy/malformed payload (defensive — this is
+    advisory context that must never crash generation) or one whose
+    `scalars` carry no usable height offset."""
+    scalars = (eval_reset or {}).get("scalars")
+    if not isinstance(scalars, dict) or "reset_height_offset_m" not in scalars:
+        return ""
+    from sculptor.reference import G1_CLASS_STAND_M
+
+    root_z = round(
+        G1_CLASS_STAND_M + float(scalars["reset_height_offset_m"]), 4)
+    settled = bool(eval_reset.get("settled"))
+    payload = {
+        "root_z_m": root_z,
+        "pitch_rad": scalars.get("reset_pitch_offset_rad"),
+        "roll_rad": scalars.get("reset_roll_offset_rad"),
+        "settled": settled,
+    }
+    lines = [
+        "# EVAL START STATE",
+        "Every certified rollout's EPISODE BEGINS HERE (a stage-fixed "
+        "eval-rollout reset) — NOT at the reference clip's own frame 0. "
+        "A \"started low\" / \"started away from the goal\" gate MUST "
+        "accept THIS start state; do not calibrate a start-window "
+        "threshold against the clip's own initial frame if it disagrees "
+        "with these numbers — a metric that does will be scored on "
+        "exactly this mismatch and rejected.",
+        "",
+        json.dumps(payload, indent=2, default=str),
+    ]
+    if not settled:
+        reason = eval_reset.get("reason")
+        lines.append(
+            "(settled=false: physical settling was unavailable at "
+            "generation time" + (f" ({reason})" if reason else "") +
+            " — these are the derived, UNSETTLED numbers; treat them as "
+            "approximate.)")
+    return "\n".join(lines)
+
+
 MODEL_ID = model_for("metric_gen")
 #: §truncation fix: adaptive THINKING shares this budget with the code output, and a
 #: hard metric's think can use 5-8k tokens — at the old 8000 cap that truncated the
@@ -378,6 +432,7 @@ def _best_of_n(
     out_dir: Path, metric_path: Path, n: int, model: str,
     emit: Callable[[dict[str, Any]], None],
     references: Optional[list[tuple[str, dict]]] = None,
+    eval_reset: Optional[dict[str, Any]] = None,
 ) -> tuple[bool, str, Optional[dict[str, Any]], list[dict[str, Any]], Optional[int]]:
     """Sample `n` candidate metrics (decorrelated by FRAMING — temperature stays 1.0,
     required by the generator's extended thinking), validate each, and
@@ -408,7 +463,8 @@ def _best_of_n(
               "message": f"Validating candidate {i + 1}/{n}…"})
         val = validate_generated_metric(
             src, cpath, behavior_goal=behavior_goal, robot_hint=robot_hint,
-            robot_joint_names=robot_names, references=references)
+            robot_joint_names=robot_names, references=references,
+            eval_reset=eval_reset)
         rec: dict[str, Any] = {"candidate": i, "ok": bool(val["ok"]),
                                "reasons": val["reasons"], "_src": src, "_val": val}
         if val["ok"]:
@@ -528,6 +584,7 @@ def generate_objective_metric(
     review_keyframes: Optional[list] = None,
     on_event: Optional[Callable[[dict[str, Any]], None]] = None,
     references: Optional[list[tuple[str, dict]]] = None,
+    eval_reset: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Generate, validate, (regenerate on failure,) and review an objective
     metric for `behavior_goal`. Writes `metric.py` + `meta.json` to
@@ -566,7 +623,18 @@ def generate_objective_metric(
     `"references_used"` (the clip ids) and `"reference_signatures"` (the
     rendered signature dict, keyed by clip id — a clip whose signature
     extraction raised records `{"_error": ...}` instead of crashing the
-    run)."""
+    run).
+
+    §D24 F2: `eval_reset` (optional — the stage's certified eval-reset
+    preview, `mission_metrics._compute_eval_reset_preview`'s return
+    value; default None → BYTE-IDENTICAL behavior) grounds authoring AND
+    validation in the ACTUAL eval-rollout start state (not the reference
+    clip's own frame 0): (a) a `# EVAL START STATE` block
+    (`_build_eval_reset_block`) is appended to the authoring prompt; (b)
+    it is passed through to `validate_generated_metric` on every attempt/
+    candidate so the `reference_settled_start` gate (§5) can score a
+    settled-start variant; (c) the result records `"eval_reset_preview"`
+    verbatim for observability."""
     if client is None:
         import anthropic
 
@@ -599,6 +667,10 @@ def generate_objective_metric(
                 list(references))
             references_used = [clip_id for clip_id, _clip in references]
             base_user = base_user + "\n\n" + sig_block
+        if eval_reset:
+            eval_reset_block = _build_eval_reset_block(eval_reset)
+            if eval_reset_block:
+                base_user = base_user + "\n\n" + eval_reset_block
 
         n_attempts = max(1, max_attempts)
         attempts: list[dict[str, Any]] = []
@@ -623,7 +695,8 @@ def generate_objective_metric(
                 client, system_prompt, base_user,
                 behavior_goal=behavior_goal, robot_hint=robot_hint,
                 robot_names=robot_names, out_dir=out_dir, metric_path=metric_path,
-                n=n_candidates, model=model, emit=_emit, references=references)
+                n=n_candidates, model=model, emit=_emit, references=references,
+                eval_reset=eval_reset)
             if not passed:
                 # best-of-N samples DIVERSE candidates but does NOT feed validation
                 # failures back; if NONE were valid, fall through to the retry-with-
@@ -670,7 +743,8 @@ def generate_objective_metric(
                 validation = validate_generated_metric(
                     source, metric_path,
                     behavior_goal=behavior_goal, robot_hint=robot_hint,
-                    robot_joint_names=robot_names, references=references)
+                    robot_joint_names=robot_names, references=references,
+                    eval_reset=eval_reset)
                 attempts.append({"attempt": attempt, "ok": validation["ok"],
                                  "reasons": validation["reasons"]})
                 if validation["ok"]:
@@ -763,7 +837,8 @@ def generate_objective_metric(
             metric_path.write_text(source, encoding="utf-8")   # not a best-of-N candidate
             validation = validate_generated_metric(
                 source, metric_path, behavior_goal=behavior_goal, robot_hint=robot_hint,
-                robot_joint_names=robot_names, references=references)
+                robot_joint_names=robot_names, references=references,
+                eval_reset=eval_reset)
             attempts.append({"review_retry": rev_retry, "ok": validation["ok"],
                              "reasons": validation["reasons"]})
             passed = bool(validation["ok"])
@@ -800,6 +875,11 @@ def generate_objective_metric(
             # at the field-VALUE level (json round-trips [] the same either way).
             "references_used": references_used,
             "reference_signatures": reference_signatures,
+            # §D24 F2: the eval-reset preview (None when omitted — the
+            # same "default None -> byte-identical" convention as
+            # references_used/reference_signatures above, at the
+            # field-VALUE level).
+            "eval_reset_preview": eval_reset,
         }
         (out_dir / "meta.json").write_text(
             json.dumps(record, indent=2, default=str), encoding="utf-8")

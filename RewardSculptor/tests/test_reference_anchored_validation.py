@@ -514,3 +514,158 @@ def test_freeze_end_rejected_and_complete_then_hold_passes_together(tmp_path):
     # ...while complete_then_hold (transition, then hold) scores high.
     assert sc["complete_then_hold"] >= 0.5
     assert v["ok"] is True, v["reasons"]
+
+
+# ── §D24 F2: `reference_settled_start` — a POSITIVE gate requiring the
+# metric to score a variant STARTING from the stage's ACTUAL certified
+# eval-reset state (not the clip's own frame 0) at least as well as the
+# full reference. Uses the REAL torso_righting fixture (the exact clip
+# D23 diagnosed), cropped to the canonical [0, 8.5]s span
+# (test_reference_spans.py's own convention) — the shipped
+# eval_reset.json's height offset (-0.6644, absolute z 0.0756) genuinely
+# differs from the clip's own frame-0 root_pos_z (0.1613).
+FIXTURE_CLIP_PATH = (
+    Path(__file__).parent / "fixtures" / "torso_righting_satup" / "reference_clip.npz"
+)
+
+
+@pytest.fixture(scope="module")
+def torso_righting_span() -> dict:
+    from sculptor.reference import load_clip
+    from sculptor.refs.spans import crop_span
+
+    clip = load_clip(FIXTURE_CLIP_PATH)
+    return crop_span(clip, 0.0, 8.5)
+
+
+#: `{"scalars": ..., "settled": bool, "reason": ...}` — the shape
+#: `mission_metrics._compute_eval_reset_preview` returns. Z-only
+#: (no pitch/roll) deliberately — exercises `settled_start_hold`'s
+#: z-only fallback path (`orientation_adjusted: False`).
+_EVAL_RESET_PREVIEW = {
+    "scalars": {"reset_height_offset_m": -0.6644},
+    "settled": True,
+    "reason": None,
+}
+
+#: An HONEST started-low-tolerant metric: height gate accepts a WIDE
+#: band (both the clip's own frame-0 z=0.161 and the settled z=0.076
+#: clear it), the real signal is the g_z uprightness change.
+HONEST_TORSO_RIGHT = '''import numpy as np
+def compute_spec(arrays, behavior, meta):
+    root = arrays.get("root_link_pos_w")
+    g = arrays.get("projected_gravity_b")
+    if root is None or g is None:
+        return {"spec_score": 0.0}
+    z = root[..., 2]
+    gz = g[..., 2]
+    n = z.shape[0]
+    q = min(10, n)
+    started_low = float(np.clip((0.30 - z[:q].mean()) / 0.20, 0.0, 1.0))
+    rights = float(np.clip((gz[:q].mean() - gz[-q:].mean()) / 0.15, 0.0, 1.0))
+    val = float(np.clip(started_low * rights, 0.0, 1.0))
+    return {"spec_score": val}
+'''
+
+#: The H2 defect (D23 class): hard-gates the start window to be CLOSE to
+#: the clip's OWN frame-0 height (narrow band around 0.1429, the
+#: cropped span's first-10-frame mean) — silently mis-scores a rollout
+#: that actually starts from the settled eval-reset (0.076 m, outside
+#: the band).
+NARROW_START_METRIC = '''import numpy as np
+def compute_spec(arrays, behavior, meta):
+    root = arrays.get("root_link_pos_w")
+    g = arrays.get("projected_gravity_b")
+    if root is None or g is None:
+        return {"spec_score": 0.0}
+    z = root[..., 2]
+    gz = g[..., 2]
+    n = z.shape[0]
+    q = min(10, n)
+    start_match = float(abs(z[:q].mean() - 0.1429) < 0.03)
+    rights = float(np.clip((gz[:q].mean() - gz[-q:].mean()) / 0.15, 0.0, 1.0))
+    val = float(np.clip(start_match * rights, 0.0, 1.0))
+    return {"spec_score": val}
+'''
+
+
+def test_honest_started_low_tolerant_metric_passes_settled_start_gate(
+    tmp_path, torso_righting_span,
+):
+    p = _write(tmp_path, "honest_torso.py", HONEST_TORSO_RIGHT)
+    v = validate_generated_metric(
+        HONEST_TORSO_RIGHT, p, references=[("torso", torso_righting_span)],
+        eval_reset=_EVAL_RESET_PREVIEW)
+    assert v["gates"]["reference_settled_start:torso"] is True, v["reasons"]
+    assert v["ok"] is True, v["reasons"]
+
+    ref_result = v["references"][0]
+    assert ref_result.get("settled_start_abstained") is None
+    assert ref_result["settled_start_orientation_adjusted"] is False
+    full = ref_result["scores"]["full"]
+    ss = ref_result["scores"]["settled_start"]
+    assert ss >= max(0.5, 0.8 * full) - 1e-9
+    assert "reference:torso:settled_start" in v["archetype_scores"]
+
+
+def test_frame0_calibrated_metric_fails_settled_start_gate_with_scores_in_reason(
+    tmp_path, torso_righting_span,
+):
+    """The H2 defect made concrete: a metric that hard-gates the start
+    window to the CLIP'S OWN frame-0 numbers fails when the rollout
+    actually starts from a measurably different settled state."""
+    p = _write(tmp_path, "narrow_start.py", NARROW_START_METRIC)
+    v = validate_generated_metric(
+        NARROW_START_METRIC, p, references=[("torso", torso_righting_span)],
+        eval_reset=_EVAL_RESET_PREVIEW)
+    assert v["gates"]["reference_settled_start:torso"] is False, v["reasons"]
+    assert v["ok"] is False
+
+    ref_result = v["references"][0]
+    full = ref_result["scores"]["full"]
+    ss = ref_result["scores"]["settled_start"]
+    assert ss < max(0.5, 0.8 * full)
+    # D12 idiom: the named numbers ride the failure reason.
+    reason = next(r for r in ref_result["reasons"] if "settled_start" in r)
+    assert f"{ss:.3f}" in reason
+    assert "certified eval-reset" in reason
+
+
+def test_no_eval_reset_preview_abstains_never_silently_passes_or_fails(
+    tmp_path, torso_righting_span,
+):
+    """When the caller supplies no `eval_reset` (the default), the gate
+    is OMITTED from `gates` entirely — never a silent pass, never a
+    silent fail — and `ok` is unaffected (byte-identical to pre-F2
+    behavior)."""
+    p = _write(tmp_path, "honest_torso2.py", HONEST_TORSO_RIGHT)
+    v_with = validate_generated_metric(
+        HONEST_TORSO_RIGHT, p, references=[("torso", torso_righting_span)],
+        eval_reset=_EVAL_RESET_PREVIEW)
+    v_without = validate_generated_metric(
+        HONEST_TORSO_RIGHT, p, references=[("torso", torso_righting_span)])
+
+    assert "reference_settled_start:torso" not in v_without["gates"]
+    assert v_without["references"][0]["settled_start_abstained"] is True
+    assert "settled_start" not in v_without["references"][0]["scores"]
+    assert v_without["ok"] == v_with["ok"] is True
+
+
+def test_settled_start_with_orientation_records_adjustment(tmp_path):
+    """When the eval-reset preview carries pitch AND roll, and the clip
+    carries `root_quat_wxyz`, the prepend's orientation is ALSO
+    corrected — `settled_start_orientation_adjusted` records True."""
+    clip = _clip_with_posture()
+    p = _write(tmp_path, "posture_honest.py", HONEST_GETUP_POSTURE)
+    eval_reset = {
+        "scalars": {
+            "reset_height_offset_m": -0.65,
+            "reset_pitch_offset_rad": 0.3,
+            "reset_roll_offset_rad": 0.0,
+        },
+        "settled": True, "reason": None,
+    }
+    v = validate_generated_metric(
+        HONEST_GETUP_POSTURE, p, references=[("getup1", clip)],
+        eval_reset=eval_reset)
+    assert v["references"][0]["settled_start_orientation_adjusted"] is True
