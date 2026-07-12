@@ -294,11 +294,23 @@ def deterministic_rank(
         score = _CONCEPT_BOOST * concept + modifier
         if score <= 0.0:
             continue
-        scored.append((score, row))
-    # Stable secondary sort by clip_id keeps ties deterministic across
-    # runs/platforms (dict/set iteration order is not a ranking input).
-    scored.sort(key=lambda sr: (-sr[0], sr[1]["clip_id"]))
-    return [_row_to_match(row, score) for score, row in scored[:k]]
+        scored.append((score, len(r_lit), row))
+    # Tie-break (2026-07-11, found against the real index after the
+    # stageii ingest recovered MOYO yoga clips): rows that EXACTLY tie on
+    # score are ordered by match DENSITY — fewer distinct row tokens
+    # first — before the final clip_id key. Rationale: a 1-token overlap
+    # against a 4-token label ("dance 1 subject 5") is a tighter match
+    # than the same 1-token overlap against a 15-token label ("220926
+    # yogi body hands ... lord of the dance pose or natarajasana ..."),
+    # but both carry the identical IDF score, and the old clip_id-only
+    # tie-break put the yoga clip first purely because "2..." sorts
+    # before "d...". Density only ever reorders EXACT score ties, so no
+    # non-tied ranking (including every locked acceptance ordering) can
+    # change. clip_id stays as the last key so ties remain deterministic
+    # across runs/platforms (dict/set iteration order is not a ranking
+    # input).
+    scored.sort(key=lambda sr: (-sr[0], sr[1], sr[2]["clip_id"]))
+    return [_row_to_match(row, score) for score, _n_tokens, row in scored[:k]]
 
 
 # ── LLM rerank (§decision 7, optional) ──────────────────────────────────

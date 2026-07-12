@@ -20,7 +20,7 @@ and log — the clip stays valid, it just has no preview.png.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 
@@ -73,6 +73,90 @@ def resolve_g1_mjcf() -> Path:
     raise PreviewUnavailable(
         f"could not find a G1 MJCF under {pkg_dir} "
         "(expected asset_zoo/robots/unitree_g1/xmls/g1.xml)")
+
+
+# ── T1 MJCF resolution (§Problem 2, 2026-07-11) ──────────────────────────
+#: Default GMR checkout root — kept as an independent constant (not
+#: imported from `sculptor.refs.retarget.DEFAULT_GMR_ROOT`) so this
+#: module has no import-time dependency on the retarget module, mirroring
+#: `_build_fit_camera`'s "kept independent/duplicated rather than
+#: imported" precedent above. Same value either way: `~/tools/GMR`.
+_DEFAULT_GMR_ROOT = Path.home() / "tools" / "GMR"
+
+
+def resolve_t1_mjcf(*, gmr_root: Optional[Path] = None) -> Path:
+    """Locate the Booster T1 (29dof) MJCF that GMR itself retargets
+    against — R3's cross-robot proof used this exact asset.
+
+    Unlike G1, mjlab ships NO Booster T1 asset at all: verified
+    empirically against the installed package, `mjlab.asset_zoo.robots`
+    contains only `unitree_g1`, `unitree_go1`, `i2rt_yam` — no t1/booster
+    entry — so there is no mjlab-internal MJCF to fall back to. The only
+    verified source is the GMR checkout itself (`~/tools/GMR`, the same
+    tree `sculptor.refs.retarget` shells out to for the actual
+    retargeting): its `general_motion_retargeting/params.py` defines
+    `ROBOT_XML_DICT["booster_t1_29dof"] = ASSET_ROOT /
+    "booster_t1_29dof" / "t1_mocap.xml"` (`ASSET_ROOT = <gmr_root>/
+    assets`) — read directly off that file during this build (never
+    imported: GMR is a separate py3.10 venv/package the sculptor py3.13
+    venv does not, and per `retarget.py`'s module docstring must not,
+    co-install). Verified against the real checkout on this box: the
+    file exists, loads under `mujoco.MjModel.from_xml_path` with exactly
+    28 joints (1 free joint + 27 named hinges — matches our T1 clips'
+    `joint_names` count exactly; a naive text grep for `joint name="..."`
+    over-counts to 29 because the XML also has 2 commented-out
+    alternate-range `<!-- <joint name="..."/> -->` lines for the two
+    Elbow_Yaw joints, which `mujoco.MjModel.from_xml_path` correctly
+    ignores), and its named joints are exactly the set our T1 clips use
+    (see `_gmr_driver.py:_robot_joint_names`).
+
+    Raises `PreviewUnavailable` (never blocks ingest/retarget) if no GMR
+    checkout is found at `gmr_root` (default `~/tools/GMR`) — this is a
+    local-dev-machine dependency, not something every environment has."""
+    root = gmr_root or _DEFAULT_GMR_ROOT
+    candidate = root / "assets" / "booster_t1_29dof" / "t1_mocap.xml"
+    if candidate.is_file():
+        return candidate
+    raise PreviewUnavailable(
+        f"could not find the Booster T1 MJCF at {candidate} — expected a "
+        f"GMR checkout under {root} (general_motion_retargeting/assets/"
+        f"booster_t1_29dof/t1_mocap.xml); mjlab ships no T1 asset at all "
+        f"so there is no fallback search location")
+
+
+#: robot slug -> zero-arg MJCF resolver. `"g1_hands"` intentionally maps
+#: to the plain G1 resolver (pre-existing behavior, unchanged by this
+#: fix — mjlab's asset_zoo has no separate with-hands G1 asset either,
+#: so there is nothing better to resolve to yet; a future fix would add
+#: its own entry here rather than touch this dict's shape) so this dict
+#: only changes behavior for `"t1"`, which previously silently fell
+#: through to `resolve_g1_mjcf()` too (posing T1 joint angles on a G1
+#: skeleton — always failed, just with an opaque MuJoCo joint-lookup
+#: error instead of an actionable one).
+_MJCF_RESOLVERS: dict[str, Callable[[], Path]] = {
+    "g1": resolve_g1_mjcf,
+    "g1_hands": resolve_g1_mjcf,
+    "t1": resolve_t1_mjcf,
+}
+
+
+def resolve_mjcf_for_robot(robot: str) -> Path:
+    """Resolve the MJCF to pose `robot`'s clips for preview rendering.
+    Robot-symmetric dispatch (§Problem 2): every caller that used to
+    unconditionally default to `resolve_g1_mjcf()` regardless of which
+    robot the clip actually belongs to should call this instead.
+
+    A robot with no registered resolver raises `PreviewUnavailable` with
+    a precise, actionable reason — never silently falls back to G1 (that
+    would pose the wrong skeleton's joint angles and either crash with a
+    confusing MuJoCo error or, worse, mis-render)."""
+    resolver = _MJCF_RESOLVERS.get(robot)
+    if resolver is None:
+        raise PreviewUnavailable(
+            f"no MJCF resolver registered for robot={robot!r} — preview "
+            f"skipped (clip remains valid with no preview.png); known "
+            f"robots: {sorted(_MJCF_RESOLVERS)}")
+    return resolver()
 
 
 # ── qpos assembly (pure — unit-testable without a GL context) ───────────

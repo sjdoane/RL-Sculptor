@@ -240,6 +240,12 @@ def test_parse_fleaven_npy_accepts_and_reads_fps_from_filename() -> None:
         raw, stem="ACCAD_subject1_lie_to_crouch_poses_120_jpos")
     assert clip["fps"] == pytest.approx(120.0)
     assert validate_clip(clip) == []
+    # Known-good "poses" pattern: fps_provenance records it as not-recovered.
+    assert qc["fps_provenance"] == {
+        "pattern": "poses", "recovered": False,
+        "note": "fps encoded via the known-good "
+                "'..._poses_{fps}_jpos' filename pattern",
+    }
 
 
 def test_parse_fleaven_npy_missing_fps_suffix_raises() -> None:
@@ -247,6 +253,48 @@ def test_parse_fleaven_npy_missing_fps_suffix_raises() -> None:
     raw = _rows_to_npy_bytes(rows)
     with pytest.raises(DatasetFormatError, match="fps"):
         parse_fleaven_npy(raw, stem="no_fps_suffix_here")
+
+
+# ── fleaven npy: "stageii" fps recovery (§Problem 1, 2026-07-11) ─────────
+def test_parse_fleaven_npy_stageii_known_subset_recovers_fps() -> None:
+    """SMPL-X stageii filenames (GRAB/CNRS/SOMA/WEIZMANN/MOYO subsets)
+    encode fps as the digits before '_jpos', not '_poses_{fps}_jpos' —
+    verified against the dataset's own g1/visualize.py:read_rtj()."""
+    rows = _neutral_rows(50)
+    raw = _rows_to_npy_bytes(rows)
+    clip, qc = parse_fleaven_npy(
+        raw, stem="airplane_fly_1_stageii_120_jpos")
+    assert clip["fps"] == pytest.approx(120.0)
+    assert validate_clip(clip) == []
+    prov = qc["fps_provenance"]
+    assert prov["pattern"] == "stageii"
+    assert prov["recovered"] is True
+    assert prov["source"] == (
+        "https://huggingface.co/datasets/fleaven/Retargeted_AMASS_for_robotics/"
+        "blob/main/g1/visualize.py")
+
+
+def test_parse_fleaven_npy_stageii_two_digit_fps_recovers() -> None:
+    """MOYO subset uses fps=60 (2 digits, not 3) — the recovered regex
+    must not assume a fixed digit width."""
+    rows = _neutral_rows(50)
+    raw = _rows_to_npy_bytes(rows)
+    clip, qc = parse_fleaven_npy(
+        raw,
+        stem="220923_yogi_body_hands_03596_Boat_Pose_or_Paripurna_"
+             "Navasana_-a_stageii_60_jpos")
+    assert clip["fps"] == pytest.approx(60.0)
+    assert qc["fps_provenance"]["recovered"] is True
+
+
+def test_parse_fleaven_npy_unknown_marker_still_rejected_with_reason() -> None:
+    """A marker word that isn't 'poses' or the verified 'stageii' must
+    still hard-reject (never silently guess an unverified fps) — with a
+    reason that distinguishes it from a plain missing-fps filename."""
+    rows = _neutral_rows(50)
+    raw = _rows_to_npy_bytes(rows)
+    with pytest.raises(DatasetFormatError, match="recognized pattern"):
+        parse_fleaven_npy(raw, stem="some_clip_unknownmarker_120_jpos")
 
 
 # ── QC gates: motion-class content checks (§decision 5) ─────────────────
@@ -426,6 +474,42 @@ def test_rebuild_index_skips_missing_or_invalid_provenance(tmp_path: Path) -> No
     (bad_dir / "provenance.json").write_text(json.dumps({"schema": 1}))
     rows = library.rebuild_index(root=tmp_path)
     assert rows == []
+
+
+def test_rebuild_index_is_robot_symmetric(tmp_path: Path) -> None:
+    """§Problem 2: `rebuild_index` must scan every `<robot>/` dir
+    identically — a g1 clip and a t1 clip in the SAME library must both
+    survive the rebuild, each tagged with its own `robot`, and per-robot
+    disk lookups (`clip_dir`) must resolve each to its own directory."""
+    prov_g1 = library.make_provenance(
+        clip_id="walk1", robot="g1",
+        source={"kind": "hf_dataset", "repo": "r", "path": "p", "url": "u"},
+        license="cc-by-4.0", attribution="a", content_sha256_="a" * 64,
+        labels=["walk"], text="walk",
+        qc={"duration_s": 1.0, "root_z_range": [0.1, 0.8], "n_frames": 50})
+    library.write_provenance("g1", "walk1", prov_g1, root=tmp_path)
+
+    prov_t1 = library.make_provenance(
+        clip_id="walk1", robot="t1",
+        source={"kind": "retarget", "repo": "gmr", "path": "p", "url": "u"},
+        license="cc-by-4.0", attribution="a", content_sha256_="b" * 64,
+        labels=["walk"], text="walk",
+        qc={"duration_s": 1.0, "root_z_range": [0.1, 0.8], "n_frames": 50})
+    library.write_provenance("t1", "walk1", prov_t1, root=tmp_path)
+
+    rows = library.rebuild_index(root=tmp_path)
+    assert len(rows) == 2
+    by_robot = {r["robot"]: r for r in rows}
+    assert set(by_robot) == {"g1", "t1"}
+    assert by_robot["g1"]["clip_id"] == by_robot["t1"]["clip_id"] == "walk1"
+
+    # Same clip_id, different robot -> distinct on-disk directories, no
+    # collision (both sides of §Problem 2's "no shared g1 literal" ask).
+    g1_dir = library.clip_dir("g1", "walk1", root=tmp_path)
+    t1_dir = library.clip_dir("t1", "walk1", root=tmp_path)
+    assert g1_dir != t1_dir
+    assert library.read_provenance("g1", "walk1", root=tmp_path)["robot"] == "g1"
+    assert library.read_provenance("t1", "walk1", root=tmp_path)["robot"] == "t1"
 
 
 def test_indexed_content_hashes_reads_from_provenance(tmp_path: Path) -> None:
@@ -1022,3 +1106,14 @@ def test_ingest_source_rejects_are_logged_not_fatal(tmp_path: Path, monkeypatch:
 def test_ingest_source_unknown_raises() -> None:
     with pytest.raises(ValueError, match="unknown source"):
         ingest_source("not-a-real-source")
+
+
+def test_ingest_source_rejects_robot_mismatch(tmp_path: Path) -> None:
+    """§Problem 2: fleaven-g1/lafan1-g1 rows are hardwired to G1_29 joint
+    order regardless of the `robot` kwarg — registering them under a
+    different robot slug would silently mislabel G1-schema data.
+    `ingest_source` must refuse rather than allow that mislabeling."""
+    with pytest.raises(ValueError, match="inherently robot='g1'"):
+        ingest_source("lafan1-g1", root=tmp_path, robot="t1")
+    with pytest.raises(ValueError, match="inherently robot='g1'"):
+        ingest_source("fleaven-g1", root=tmp_path, robot="t1")

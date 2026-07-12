@@ -109,6 +109,27 @@ def _seed_library(
     library.rebuild_index(root=root)
 
 
+def _seed_t1_clip(root: Path, *, with_preview: bool = False) -> None:
+    """§Problem 2 (2026-07-11): one t1 clip, deliberately given the SAME
+    text/labels as `fallandgetup1_subject1` (the g1 clip `_seed_library`
+    writes) so a robot-filter bug — e.g. accidentally pooling every
+    robot's rows, or hardcoding "g1" somewhere in the route layer —
+    would be caught by a query that should hit only one of the two."""
+    from sculptor.refs import library
+
+    clip_id = "fallandgetup1_subject1_t1"
+    clip_dir = library.clip_dir("t1", clip_id, root=root)
+    clip_dir.mkdir(parents=True, exist_ok=True)
+    _write_clip_npz(clip_dir)
+    _write_provenance(
+        clip_dir, clip_id=clip_id, robot="t1",
+        text="fall and get up (subject 1)",
+        labels=["fall", "and", "get", "up", "subject1"], tier="K")
+    if with_preview:
+        _write_preview(clip_dir)
+    library.rebuild_index(root=root)
+
+
 @pytest.fixture
 def refs_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     root = tmp_path / "references"
@@ -225,6 +246,47 @@ def test_search_never_calls_llm_by_default(
     assert r.status_code == 200, r.text
 
 
+# ── robot symmetry (§Problem 2, 2026-07-11) ─────────────────────────────
+def test_list_references_t1_clip_listed_symmetrically_with_g1(
+    client: TestClient, refs_root: Path,
+) -> None:
+    """A t1 clip must be listable exactly like a g1 clip — `robot` is a
+    real filter over whatever robots the index carries, not a g1-only
+    special case (v1's "g1-only" API note is about not exposing a robot
+    PATH segment, not about the query param only working for g1)."""
+    _seed_library(refs_root)
+    _seed_t1_clip(refs_root)
+
+    r_g1 = client.get("/references", params={"robot": "g1"})
+    assert r_g1.status_code == 200, r_g1.text
+    assert {row["clip_id"] for row in r_g1.json()} == {
+        "fallandgetup1_subject1", "walk1_subject2"}
+
+    r_t1 = client.get("/references", params={"robot": "t1"})
+    assert r_t1.status_code == 200, r_t1.text
+    t1_rows = r_t1.json()
+    assert {row["clip_id"] for row in t1_rows} == {"fallandgetup1_subject1_t1"}
+    assert t1_rows[0]["robot"] == "t1"
+
+
+def test_search_t1_clip_found_only_under_t1_robot(
+    client: TestClient, refs_root: Path,
+) -> None:
+    """Same acceptance query as
+    `test_search_deterministic_ranks_getup_top_for_acceptance_query`,
+    scoped to `robot=t1` — the t1 clip (identical text to the g1 one)
+    must rank top, and the g1 clip must not leak into t1's results."""
+    _seed_library(refs_root)
+    _seed_t1_clip(refs_root)
+
+    r = client.get(
+        "/references", params={"q": "get up off the ground", "robot": "t1"})
+    assert r.status_code == 200, r.text
+    matches = r.json()
+    assert matches, "expected at least one deterministic match for robot=t1"
+    assert matches[0]["clip_id"] == "fallandgetup1_subject1_t1"
+
+
 # ── GET /references/{clip_id} ────────────────────────────────────────
 def test_get_reference_detail(client: TestClient, refs_root: Path) -> None:
     _seed_library(refs_root)
@@ -298,6 +360,32 @@ def test_download_clip_file_traversal_rejected(
     assert r.status_code in (404, 307, 308)
 
 
+def test_get_reference_detail_preview_and_download_resolve_t1_clip(
+    client: TestClient, refs_root: Path,
+) -> None:
+    """The single-clip routes (detail/preview/file) carry no `robot`
+    param at all — robot is resolved by looking the clip_id up in the
+    index (§decision 11's design). A t1 clip_id must resolve through
+    every one of them exactly like a g1 clip_id does."""
+    _seed_library(refs_root)
+    _seed_t1_clip(refs_root, with_preview=True)
+    clip_id = "fallandgetup1_subject1_t1"
+
+    r = client.get(f"/references/{clip_id}")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["index_row"]["robot"] == "t1"
+    assert body["provenance"]["robot"] == "t1"
+
+    r2 = client.get(f"/references/{clip_id}/preview")
+    assert r2.status_code == 200, r2.text
+    assert r2.headers["content-type"] == "image/png"
+
+    r3 = client.get(f"/references/{clip_id}/file/clip.npz")
+    assert r3.status_code == 200, r3.text
+    assert len(r3.content) > 0
+
+
 # ── attach / detach ─────────────────────────────────────────────────
 def test_attach_reference_sets_stage_fields(
     client: TestClient, refs_root: Path, tmp_projects_root: Path,
@@ -330,6 +418,33 @@ def test_attach_reference_sets_stage_fields(
     stage2 = r2.json()["stages"][0]
     assert stage2["reference_clip_id"] == "fallandgetup1_subject1"
     assert stage2["reference_tier"] == "K"
+
+
+def test_attach_reference_t1_clip(
+    client: TestClient, refs_root: Path, tmp_projects_root: Path,
+) -> None:
+    """Attaching a t1 clip_id to a stage works identically to a g1 clip
+    — the attach endpoint doesn't take a `robot` param at all, so this
+    is really testing that `_find_index_row` (the clip_id -> row lookup
+    every mutating route depends on) isn't secretly g1-only."""
+    _seed_library(refs_root)
+    _seed_t1_clip(refs_root)
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _write_mission(project_dir, "m1", [_stage_dict("a")])
+
+    r = client.post(
+        f"/projects/{slug}/missions/m1/stages/a/reference",
+        json={"clip_id": "fallandgetup1_subject1_t1"},
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["reference_clip_id"] == "fallandgetup1_subject1_t1"
+    assert body["reference_tier"] == "K"
+
+    mission_json = json.loads((project_dir / ".missions" / "m1" / "mission.json").read_text())
+    stage = mission_json["stages"][0]
+    assert stage["reference_clip_id"] == "fallandgetup1_subject1_t1"
 
 
 def test_attach_reference_pending_stage_without_training_dir(

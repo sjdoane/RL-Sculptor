@@ -218,6 +218,33 @@ def test_deterministic_rank_no_overlap_returns_empty() -> None:
     assert deterministic_rank("xyzzy plugh", FIXTURE_ROWS) == []
 
 
+def test_deterministic_rank_score_tie_prefers_denser_match() -> None:
+    """§2026-07-11 regression (found against the real index after the
+    stageii ingest recovered the MOYO yoga clips): a verbose yoga-pose
+    label containing the literal token "dance" ("lord of the dance pose
+    or natarajasana") EXACTLY ties a real dance clip on IDF score for
+    the query "dance", and the old clip_id-only tie-break put the yoga
+    clip first purely because its id starts with a digit. Equal-score
+    ties must now prefer the row with FEWER distinct tokens (tighter
+    match density) — and the tie-break must not disturb any non-tied
+    ordering."""
+    rows = [
+        _row("220926_yogi_lord_of_the_dance_pose_natarajasana",
+             ["220926", "yogi", "body", "hands", "lord", "of", "the",
+              "dance", "pose", "or", "natarajasana", "stageii", "60",
+              "jpos"]),
+        _row("dance1_subject5", ["dance", "1", "subject", "5"]),
+    ]
+    results = deterministic_rank("dance", rows, k=5)
+    assert [m.clip_id for m in results][0] == "dance1_subject5"
+    # Both still returned (the yoga clip is a legitimate weaker hit).
+    assert {m.clip_id for m in results} == {
+        "dance1_subject5", "220926_yogi_lord_of_the_dance_pose_natarajasana"}
+    # Sanity: scores actually tied — this test exercises the tie-break,
+    # not some scoring difference that could silently vanish later.
+    assert results[0].score == pytest.approx(results[1].score)
+
+
 # ── concept-boost regression: motion CONCEPT beats rare MODIFIER ─────────
 # §2026-07-09: an adversarial audit against the real 301-clip library
 # found that `_SYNONYM_MATCH_WEIGHT` alone (round 1) fixed "get up off

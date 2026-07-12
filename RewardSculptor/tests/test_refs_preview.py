@@ -25,6 +25,8 @@ from sculptor.refs.preview import (
     render_keyframe_strip,
     render_preview_png,
     resolve_g1_mjcf,
+    resolve_mjcf_for_robot,
+    resolve_t1_mjcf,
 )
 
 mujoco = pytest.importorskip("mujoco")
@@ -131,6 +133,91 @@ def test_resolve_g1_mjcf_finds_a_real_file() -> None:
     assert joint_names[1:] == list(G1_29)
     for offset, name in enumerate(G1_29):
         assert int(model.joint(name).qposadr[0]) == 7 + offset
+
+
+# ── T1 MJCF resolution + robot dispatch (§Problem 2, 2026-07-11) ────────
+def test_resolve_t1_mjcf_finds_a_real_file_or_documented_skip() -> None:
+    """Unlike G1, the T1 MJCF is NOT shipped inside mjlab — it only
+    exists in a local GMR checkout (`~/tools/GMR`). On a box without
+    that checkout this must raise the documented `PreviewUnavailable`
+    (never a bare FileNotFoundError); on this dev box the checkout is
+    present, so assert a real resolved, loadable file."""
+    try:
+        path = resolve_t1_mjcf()
+    except PreviewUnavailable as e:
+        pytest.skip(f"no local GMR checkout in this environment: {e}")
+        return
+    assert path.is_file()
+    assert path.name == "t1_mocap.xml"
+    model = mujoco.MjModel.from_xml_path(str(path))
+    joint_names = {
+        mujoco.mj_id2name(model, mujoco.mjtObj.mjOBJ_JOINT, i)
+        for i in range(model.njnt)
+    }
+    # Every name our T1 clips actually use must resolve in this MJCF —
+    # the real regression this resolver exists to prevent (posing T1
+    # joint angles on the wrong/no skeleton).
+    t1_clip_joint_names = [
+        "Left_Hip_Pitch", "Left_Hip_Roll", "Left_Hip_Yaw", "Left_Knee_Pitch",
+        "Left_Ankle_Pitch", "Left_Ankle_Roll", "Right_Hip_Pitch",
+        "Right_Hip_Roll", "Right_Hip_Yaw", "Right_Knee_Pitch",
+        "Right_Ankle_Pitch", "Right_Ankle_Roll", "Waist",
+        "Left_Shoulder_Pitch", "Left_Shoulder_Roll", "Left_Elbow_Pitch",
+        "Left_Elbow_Yaw", "Left_Wrist_Pitch", "Left_Wrist_Yaw",
+        "Left_Hand_Roll", "Right_Shoulder_Pitch", "Right_Shoulder_Roll",
+        "Right_Elbow_Pitch", "Right_Elbow_Yaw", "Right_Wrist_Pitch",
+        "Right_Wrist_Yaw", "Right_Hand_Roll",
+    ]
+    for name in t1_clip_joint_names:
+        assert name in joint_names, f"{name!r} missing from T1 MJCF"
+
+
+def test_resolve_t1_mjcf_missing_checkout_raises_preview_unavailable(
+    tmp_path: Path,
+) -> None:
+    """A `gmr_root` with no `assets/booster_t1_29dof/t1_mocap.xml` under
+    it must fail with the typed, actionable exception — not a bare
+    filesystem error — regardless of what's actually installed on this
+    box (this test never touches the real `~/tools/GMR`)."""
+    with pytest.raises(PreviewUnavailable, match="Booster T1 MJCF"):
+        resolve_t1_mjcf(gmr_root=tmp_path)
+
+
+def test_resolve_mjcf_for_robot_dispatches_g1_and_t1(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`resolve_mjcf_for_robot` must route to the matching per-robot
+    resolver — the regression this whole dispatcher exists to prevent is
+    every robot silently getting the G1 MJCF."""
+    import sculptor.refs.preview as preview_mod
+
+    calls: list[str] = []
+    monkeypatch.setattr(
+        preview_mod, "resolve_g1_mjcf",
+        lambda: (calls.append("g1"), Path("/fake/g1.xml"))[1])
+    monkeypatch.setattr(
+        preview_mod, "resolve_t1_mjcf",
+        lambda **kw: (calls.append("t1"), Path("/fake/t1.xml"))[1])
+    # Re-register the dispatch table against the monkeypatched functions
+    # (the module-level dict captured the ORIGINAL function objects at
+    # import time).
+    monkeypatch.setitem(
+        preview_mod._MJCF_RESOLVERS, "g1", preview_mod.resolve_g1_mjcf)
+    monkeypatch.setitem(
+        preview_mod._MJCF_RESOLVERS, "t1", preview_mod.resolve_t1_mjcf)
+
+    assert preview_mod.resolve_mjcf_for_robot("g1") == Path("/fake/g1.xml")
+    assert preview_mod.resolve_mjcf_for_robot("t1") == Path("/fake/t1.xml")
+    assert calls == ["g1", "t1"]
+
+
+def test_resolve_mjcf_for_robot_unknown_robot_raises_with_reason() -> None:
+    """A robot with no registered resolver must fail loudly and
+    specifically — never silently fall back to posing its joints on the
+    G1 skeleton (that either crashes with a confusing MuJoCo lookup
+    error or, worse, mis-renders)."""
+    with pytest.raises(PreviewUnavailable, match="no MJCF resolver registered"):
+        resolve_mjcf_for_robot("some_future_robot")
 
 
 # ── real end-to-end render — skip gracefully, don't fail, if no GL ──────

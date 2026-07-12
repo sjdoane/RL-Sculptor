@@ -16,10 +16,16 @@ attach/detach pair.
   DELETE /projects/{slug}/missions/{ms}/stages/{stage}/reference
                                                      — clear it
 
-v1 is g1-only (§decision 11: "no robot path segment in v1 API" — the
-`robot` query param on GET /references is a FILTER, not a path
-segment; robot for the single-clip routes is resolved by looking the
-clip_id up in the index).
+v1 has "no robot path segment in v1 API" (§decision 11) — the `robot`
+query param on GET /references is a FILTER (default "g1", the only
+robot v1 originally shipped with), not a path segment; robot for the
+single-clip routes is resolved by looking the clip_id up in the index,
+never hardcoded. Neither of those is actually g1-specific: `robot` is a
+real filter over whatever robots `sculptor.refs.library`'s index
+carries (verified against a t1 clip — §Problem 2, 2026-07-11), so a
+second robot (e.g. t1, populated via `sculptor.refs.retarget`'s GMR
+pipeline) is already listable/searchable/attachable today through this
+same v1 surface, just by passing `?robot=t1` — no route change needed.
 """
 
 from __future__ import annotations

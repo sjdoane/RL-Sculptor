@@ -382,25 +382,83 @@ def parse_lafan1_csv(raw: bytes, *, stem: str, fps: float = LAFAN1_FPS) -> tuple
 FLEAVEN_REPO = "fleaven/Retargeted_AMASS_for_robotics"
 _FLEAVEN_FPS_RE = re.compile(r"_poses_(\d+)_jpos$")
 
+#: SMPL-X "stageii" fits (GRAB, CNRS, SOMA, WEIZMANN, MOYO_smplh_gendered —
+#: 3929 clips, verified 2026-07-11 against index_rejects.jsonl) name files
+#: `..._stageii_{fps}_jpos.npy` instead of `..._poses_{fps}_jpos.npy`: the
+#: fps digits ARE present, just not preceded by the literal "poses" token
+#: the original regex required.
+#:
+#: Authoritative source: the dataset's OWN reader, `g1/visualize.py`
+#: (hosted in this same HF repo —
+#: https://huggingface.co/datasets/fleaven/Retargeted_AMASS_for_robotics/
+#: blob/main/g1/visualize.py), function `read_rtj()`:
+#:     #get frame rate from file name
+#:     fr = fpath[-12:-9]
+#:     fr = int(fr[1:]) if fr[0]=='_' else int(fr)
+#: i.e. the author's own convention is "fps = the digits immediately
+#: preceding '_jpos' in the filename", independent of the marker word
+#: before it. Cross-checked against the full-tree manifest
+#: (`.fleaven_g1_all_manifest.json`, 17717 files, generated 2026-07-09):
+#: exactly two marker words appear anywhere in the repo — "poses" (13788
+#: files) and "stageii" (3929 files) — and EVERY file matches a generic
+#: `_(\d+)_jpos$` pattern (0 unmatched). Within "stageii", the recovered
+#: fps token is constant per subset directory (GRAB=120, CNRS=120,
+#: SOMA=120, WEIZMANN=120, MOYO_smplh_gendered=60 — one value per subset,
+#: never mixed), consistent with a per-subset AMASS capture rate rather
+#: than a per-clip/session id.
+_FLEAVEN_FPS_STAGEII_RE = re.compile(r"_stageii_(\d+)_jpos$")
+_FLEAVEN_VISUALIZE_PY_URL = (
+    "https://huggingface.co/datasets/fleaven/Retargeted_AMASS_for_robotics/"
+    "blob/main/g1/visualize.py"
+)
 
-def _fleaven_fps_from_filename(stem: str) -> float:
+
+def _fleaven_fps_from_filename(stem: str) -> tuple[float, dict[str, Any]]:
+    """Returns `(fps, fps_provenance)`. `fps_provenance` is a small dict
+    recorded into the clip's `qc` (and thus its provenance.json) so a
+    recovered fps is always traceable back to its source — never a bare
+    unattributed number."""
     m = _FLEAVEN_FPS_RE.search(stem)
-    if not m:
-        raise DatasetFormatError(
-            f"fleaven filename does not encode fps (expected "
-            f"'..._poses_{{fps}}_jpos'): {stem}")
-    return float(m.group(1))
+    if m:
+        return float(m.group(1)), {
+            "pattern": "poses", "recovered": False,
+            "note": "fps encoded via the known-good "
+                    "'..._poses_{fps}_jpos' filename pattern",
+        }
+    m = _FLEAVEN_FPS_STAGEII_RE.search(stem)
+    if m:
+        return float(m.group(1)), {
+            "pattern": "stageii", "recovered": True,
+            "source": _FLEAVEN_VISUALIZE_PY_URL,
+            "note": (
+                "fps recovered from the '..._stageii_{fps}_jpos' filename "
+                "token per the dataset author's own g1/visualize.py "
+                "read_rtj() convention: fps = digits immediately "
+                "preceding '_jpos', independent of the marker word before "
+                "it. Cross-checked against the full-tree manifest: fps is "
+                "constant per subset directory."),
+        }
+    raise DatasetFormatError(
+        f"fleaven filename does not encode fps via a recognized pattern "
+        f"(expected '..._poses_{{fps}}_jpos' or "
+        f"'..._stageii_{{fps}}_jpos', and no other marker word has been "
+        f"verified against an authoritative fps source): {stem}")
 
 
 def parse_fleaven_npy(raw: bytes, *, stem: str) -> tuple[dict, dict]:
-    """fleaven-g1: one (T, 36) float64 .npy per clip; fps from filename."""
+    """fleaven-g1: one (T, 36) float64 .npy per clip; fps from filename.
+    `qc["fps_provenance"]` always records which filename pattern supplied
+    the fps and, for a recovered ("stageii") pattern, the authoritative
+    source it was verified against — see `_fleaven_fps_from_filename`."""
     try:
         rows = np.load(io.BytesIO(raw), allow_pickle=False)
     except Exception as e:  # noqa: BLE001 — surfaced as a format error
         raise DatasetFormatError(f"could not load npy {stem}: {e}") from e
-    fps = _fleaven_fps_from_filename(stem)
+    fps, fps_provenance = _fleaven_fps_from_filename(stem)
     tokens = tokenize_label(stem)
-    return _rows_to_clip(np.asarray(rows, dtype=np.float64), fps=fps, tokens=tokens)
+    clip, qc = _rows_to_clip(np.asarray(rows, dtype=np.float64), fps=fps, tokens=tokens)
+    qc["fps_provenance"] = fps_provenance
+    return clip, qc
 
 
 # ── HTTP (network call sites — never reached by tests) ───────────────────
@@ -669,6 +727,21 @@ class IngestSummary:
 
 _SOURCES = ("lafan1-g1", "fleaven-g1")
 
+#: §Problem 2 (2026-07-11): both current `ingest_source` datasets are
+#: INHERENTLY g1-only — their raw 36-col rows are hardwired to the
+#: `G1_29` joint order (`_run_qc_gates` asserts this at parse time via
+#: `assert_name_axis_contract`/`resolve_joint_roles`, unconditionally,
+#: regardless of the `robot` argument), and their source names say so
+#: explicitly (`"lafan1-g1"`, `"fleaven-g1"`). This map makes that fact
+#: machine-checked rather than merely implied by naming convention —
+#: `ingest_source` refuses to register g1-schema data under a different
+#: robot slug (which would silently mislabel it: a T1 clip whose actual
+#: numbers are G1 joint angles). Other robots (e.g. `t1`) are ingested
+#: through an entirely separate, already robot-generic pipeline —
+#: `sculptor.refs.retarget.retarget_and_register` — which reads
+#: `joint_names` from GMR's own output rather than assuming G1_29.
+_SOURCE_ROBOT: dict[str, str] = {"lafan1-g1": "g1", "fleaven-g1": "g1"}
+
 
 def ingest_source(
     source: str,
@@ -699,6 +772,14 @@ def ingest_source(
     `filter_glob`/`limit` apply identically on top of either file list."""
     if source not in _SOURCES:
         raise ValueError(f"unknown source {source!r}; expected one of {_SOURCES}")
+    expected_robot = _SOURCE_ROBOT[source]
+    if robot != expected_robot:
+        raise ValueError(
+            f"source {source!r} is inherently robot={expected_robot!r} "
+            f"(its raw rows are hardwired to that robot's joint order — "
+            f"see `_SOURCE_ROBOT`'s docstring); refusing to register it "
+            f"under robot={robot!r}, which would silently mislabel "
+            f"{expected_robot}-schema data as a different robot")
     log = progress or (lambda _msg: None)
     repo = LAFAN1_REPO if source == "lafan1-g1" else FLEAVEN_REPO
 
@@ -773,17 +854,25 @@ def _try_render_preview(
     raises: `sculptor.refs.preview` may not be importable yet (an
     earlier worker stage) or GL/EGL may be unavailable in this
     environment (§decision 8) — either way this logs (via `progress`,
-    if given) and returns, leaving the clip valid with no preview.png."""
+    if given) and returns, leaving the clip valid with no preview.png.
+
+    §Problem 2 (2026-07-11): the MJCF is resolved BY `robot` via
+    `preview.resolve_mjcf_for_robot` — this used to unconditionally
+    default to the G1 MJCF regardless of which robot the clip actually
+    belongs to (invisible for fleaven/lafan1 ingest, both g1-only
+    sources, but wrong in general)."""
     log = progress or (lambda _msg: None)
     try:
-        from sculptor.refs.preview import PreviewUnavailable, render_preview_png
+        from sculptor.refs.preview import (
+            PreviewUnavailable, render_preview_png, resolve_mjcf_for_robot)
     except ModuleNotFoundError:
         log(f"[refs ingest] preview module not available — skipping "
             f"preview for {clip_id}")
         return
     out_path = library.clip_dir(robot, clip_id, root=root) / library.PREVIEW_FILENAME
     try:
-        render_preview_png(clip, out_path)
+        mjcf_path = resolve_mjcf_for_robot(robot)
+        render_preview_png(clip, out_path, mjcf_path=mjcf_path)
     except PreviewUnavailable as e:
         log(f"[refs ingest] preview unavailable for {clip_id}: {e}")
     except Exception as e:  # noqa: BLE001 — preview must never block ingest

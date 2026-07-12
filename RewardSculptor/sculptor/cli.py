@@ -1722,7 +1722,8 @@ def refs_preview(
     environment — never a stack trace."""
     from sculptor.reference import load_clip
     from sculptor.refs import library
-    from sculptor.refs.preview import PreviewUnavailable, render_preview_png
+    from sculptor.refs.preview import (
+        PreviewUnavailable, render_preview_png, resolve_mjcf_for_robot)
 
     clip_path = library.clip_dir(robot, clip_id) / library.CLIP_FILENAME
     if not clip_path.is_file():
@@ -1731,7 +1732,8 @@ def refs_preview(
     clip = load_clip(clip_path)
     out_path = library.clip_dir(robot, clip_id) / library.PREVIEW_FILENAME
     try:
-        render_preview_png(clip, out_path)
+        mjcf_path = resolve_mjcf_for_robot(robot)
+        render_preview_png(clip, out_path, mjcf_path=mjcf_path)
     except PreviewUnavailable as e:
         typer.echo(f"[refs preview] unavailable in this environment: {e}", err=True)
         raise typer.Exit(code=1) from e
@@ -1770,9 +1772,11 @@ def refs_retarget(
     """Retarget ONE source motion clip to one or more robots via GMR
     (cross-venv subprocess — see sculptor.refs.retarget), registering
     each result in the reference library with retarget provenance. Also
-    attempts a best-effort preview render per clip (G1-only today —
-    sculptor.refs.preview resolves a G1 MJCF specifically; any other
-    robot logs a skip, never fails the run)."""
+    attempts a best-effort preview render per clip — MJCF resolved BY
+    ROBOT via sculptor.refs.preview.resolve_mjcf_for_robot (g1 from the
+    installed mjlab package, t1 from a local GMR checkout's own asset
+    tree; a robot with no registered resolver logs a skip and never
+    fails the run — the clip stays valid with no preview.png)."""
     from sculptor.refs.retarget import (
         RetargetError, attach_role_resolution_qc, retarget_and_register)
     from sculptor.refs import library
@@ -1801,11 +1805,13 @@ def refs_retarget(
 
         try:
             from sculptor.reference import load_clip
-            from sculptor.refs.preview import PreviewUnavailable, render_preview_png
+            from sculptor.refs.preview import (
+                PreviewUnavailable, render_preview_png, resolve_mjcf_for_robot)
 
             clip = load_clip(lc.clip_path)
             out_path = library.clip_dir(r, lc.clip_id) / library.PREVIEW_FILENAME
-            render_preview_png(clip, out_path)
+            mjcf_path = resolve_mjcf_for_robot(r)
+            render_preview_png(clip, out_path, mjcf_path=mjcf_path)
             typer.echo(f"[refs retarget] preview written: {out_path}")
         except PreviewUnavailable as e:
             typer.echo(f"[refs retarget] preview unavailable for robot={r}: {e}")
