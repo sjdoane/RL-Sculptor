@@ -266,7 +266,6 @@ def calibrate_metric_against_reference(
     source_kind: str,
     threshold: float = 0.7,
     n_envs: int = 4,
-    tierd_cert: Optional["TierDCertificate"] = None,
     library_root: Optional[Path] = None,
 ) -> dict[str, Any]:
     """§REFERENCE_TRAJECTORY_PLAN §6: earn steer/observe rights for a NOVEL
@@ -297,21 +296,23 @@ def calibrate_metric_against_reference(
     `reference_nondegeneracy` gate).
 
     §audit-finding close (REFERENCE_BUILD_LOG.md "Audit findings
-    deferred" — Tier-D spoofing): this function used to take a bare
-    `tier: str` straight from the caller, so anyone could pass `tier="D"`
-    and earn steer-rights for a clip that was never tracked. There is no
-    caller-supplied tier anymore. The EFFECTIVE tier is derived here:
-      - if `tierd_cert` is given, it is trusted ONLY when its
-        `(robot, clip_id)` match this call's — a cert for a different
-        clip is ignored, not silently accepted;
-      - else, `sculptor.refs.track.verify_tierd_certificate(robot,
-        clip_id, root=library_root)` is consulted (re-derives the
-        verdict from the on-disk provenance/rollout artifact chain);
+    deferred" — Tier-D spoofing; §F5 follow-up): this function used to
+    take a bare `tier: str` straight from the caller, so anyone could
+    pass `tier="D"` and earn steer-rights for a clip that was never
+    tracked. A later revision replaced that with a caller-supplied
+    `tierd_cert: TierDCertificate` kwarg — narrower, but still a caller-
+    controlled bypass: any caller (including a future one, or a test
+    that wasn't careful) could construct/monkeypatch a matching
+    certificate object and skip re-verification entirely. There is now
+    NO caller-supplied trust input of any kind. The EFFECTIVE tier is
+    ALWAYS derived by calling `sculptor.refs.track.verify_tierd_
+    certificate(robot, clip_id, root=library_root)` here, which
+    re-derives the verdict from the on-disk provenance/rollout artifact
+    chain on every call:
       - `effective_tier` is `"D"` iff a verified certificate resolves,
-        else `"K"`. There is no way to reach `"D"`/steer by passing a
-        string — only a real `TierDCertificate` (verified by
-        `verify_tierd_certificate`, never constructed by this module)
-        does it.
+        else `"K"`. There is no way to reach `"D"`/steer without a real,
+        freshly-verified `TierDCertificate` — this function has no
+        parameter through which one could be substituted.
     `trust_tier` (§10) is recorded as `f"reference:{effective_tier}:
     {source_kind}"` — this is what a caller should persist/log, NOT a
     self-reported string.
@@ -327,21 +328,16 @@ def calibrate_metric_against_reference(
     from sculptor.eval.metric_validate import _archetypes, _NAMES_12
     from sculptor.refs.convert import clip_to_arrays
 
-    cert = tierd_cert
-    if cert is not None and (cert.robot != robot or cert.clip_id != clip_id):
-        # A certificate for a DIFFERENT clip/robot proves nothing here —
-        # ignore it rather than trust it, and fall through to resolving
-        # our own (never silently widen what a mismatched cert can vouch for).
-        cert = None
+    # §F5: always re-verify — no caller-supplied cert of any kind.
+    cert: Optional["TierDCertificate"] = None
     cert_reason: Optional[str] = None
-    if cert is None:
-        try:
-            from sculptor.refs.track import verify_tierd_certificate
-            cert, cert_reason = verify_tierd_certificate(
-                robot, clip_id, root=library_root)
-        except Exception as e:  # noqa: BLE001 — cert resolution never blocks; denies to K
-            cert = None
-            cert_reason = f"cert resolution failed: {type(e).__name__}: {e}"
+    try:
+        from sculptor.refs.track import verify_tierd_certificate
+        cert, cert_reason = verify_tierd_certificate(
+            robot, clip_id, root=library_root)
+    except Exception as e:  # noqa: BLE001 — cert resolution never blocks; denies to K
+        cert = None
+        cert_reason = f"cert resolution failed: {type(e).__name__}: {e}"
 
     effective_tier = "D" if cert is not None else "K"
     trust_tier = f"reference:{effective_tier}:{source_kind}"

@@ -4,14 +4,17 @@ single attached reference clip. Fully offline/deterministic: no LLM call,
 no network dependency.
 
 §audit-finding close (REFERENCE_BUILD_LOG.md "Audit findings deferred" —
-Tier-D spoofing): `calibrate_metric_against_reference` no longer takes a
-caller-supplied `tier: str`. The effective tier is derived from a verified
-`sculptor.refs.track.TierDCertificate` — either passed in directly
-(`tierd_cert=`, already-resolved by the caller) or auto-resolved from disk
-via `verify_tierd_certificate(robot, clip_id, root=library_root)`. Most
-tests below use an in-memory fixture cert (fast, no disk I/O); one test
-exercises the real auto-resolve path end to end against a tracked on-disk
-clip.
+Tier-D spoofing) + §F5 follow-up: `calibrate_metric_against_reference` no
+longer takes a caller-supplied `tier: str`, NOR a caller-supplied
+`tierd_cert: TierDCertificate` (an earlier revision's narrower but still
+caller-controlled bypass). There is now NO trust input the caller can hand
+in at all — the effective tier is ALWAYS derived by calling
+`sculptor.refs.track.verify_tierd_certificate(robot, clip_id,
+root=library_root)` internally, which re-derives the verdict from disk on
+every call. Tests that need Tier-D rights build a REAL, verified
+certificate on disk first (`_seed_real_tierd_cert`, mirroring
+`sculptor.refs.track.track_clip`'s own on-disk artifact chain) rather than
+constructing/injecting one.
 """
 from __future__ import annotations
 
@@ -23,8 +26,9 @@ from sculptor.eval.metric_calibration import (
     calibrate_metric_against_reference,
     compute_trust,
 )
+from sculptor.reference import save_clip
 from sculptor.refs import library
-from sculptor.refs.track import TierDCertificate, TrackingErrors, update_provenance_tier_d
+from sculptor.refs.track import TrackingErrors, update_provenance_tier_d
 
 # ── fixtures ────────────────────────────────────────────────────────────
 
@@ -49,18 +53,38 @@ def _rising_clip() -> dict:
     }
 
 
-def _fake_cert(clip_id: str = "rise_clip", robot: str = "g1") -> TierDCertificate:
-    """A `TierDCertificate` constructed directly, standing in for one a
-    caller already resolved+verified (e.g. `mission_metrics.py` calling
-    `verify_tierd_certificate` once and forwarding the result). Only its
-    `robot`/`clip_id` fields are load-bearing for `calibrate_metric_
-    against_reference`'s trust decision — the rest are plausible filler."""
-    return TierDCertificate(
-        robot=robot, clip_id=clip_id, tracked_at="2026-01-01T00:00:00Z",
-        iterations=2, mean_joint_err_rad=0.05, max_joint_err_rad=0.1,
-        root_z_rmse_m=0.02, rollout_path=Path("/nonexistent/rollout.npz"),
-        rollout_sha256="a" * 64, clip_content_sha256="b" * 64,
-    )
+def _seed_real_tierd_cert(
+    root: Path, clip: dict, *, clip_id: str = "rise_clip", robot: str = "g1",
+) -> None:
+    """Write a REAL, on-disk, internally-consistent Tier-D certificate for
+    `(robot, clip_id)` at `root`: clip.npz + provenance with a genuine
+    content_sha256 (computed from the written bytes, not a placeholder —
+    §F7 hardened `verify_tierd_certificate` recomputes this from disk),
+    a rollout artifact INSIDE `root` (§F7 containment check), and
+    tracking errors that clear track.py's feasibility thresholds. §F5:
+    `calibrate_metric_against_reference` no longer accepts a caller-
+    supplied `tierd_cert=`, so a test that needs Tier-D rights must earn
+    a real certificate on disk, exactly like a production `track_clip`
+    run would, and let `verify_tierd_certificate` resolve it itself."""
+    d = library.clip_dir(robot, clip_id, root=root)
+    clip_path = d / library.CLIP_FILENAME
+    save_clip(clip_path, clip)
+    content_sha = library.content_sha256(clip_path.read_bytes())
+    prov = library.make_provenance(
+        clip_id=clip_id, robot=robot, source={"kind": "hf_dataset"},
+        license="MIT", attribution="x", content_sha256_=content_sha, tier="K")
+    library.write_provenance(robot, clip_id, prov, root=root)
+    library.rebuild_index(root=root)
+
+    rollout_path = d / "tierD_rollout.npz"
+    rollout_path.write_bytes(b"a real tracking rollout")
+    errs = TrackingErrors(
+        mean_joint_err_rad=0.05, max_joint_err_rad=0.1, root_z_rmse_m=0.02,
+        duration_coverage=1.0, common_joint_names=["j0"], n_common_joints=1)
+    assert errs.feasible  # sanity: fixture stats are within threshold
+    update_provenance_tier_d(
+        robot=robot, clip_id=clip_id, errors=errs, iterations=1,
+        rollout_path=rollout_path, root=root)
 
 
 #: An honest metric: final-decile mean root height, normalized. Monotone in
@@ -144,12 +168,13 @@ def _base_kwargs(tmp_path: Path, source_kind: str = "hf_dataset") -> dict:
 
 
 def test_honest_metric_grants_steer_with_verified_cert(tmp_path):
-    """'with valid cert fixture -> D/steer' (the presented-cert path)."""
+    """A REAL on-disk Tier-D certificate (§F5: no caller-supplied
+    `tierd_cert=` exists anymore) -> D/steer."""
     clip = _rising_clip()
     p = _write(tmp_path, "honest.py", _HONEST_HEIGHT)
-    res = calibrate_metric_against_reference(
-        p, "rise_clip", clip, tierd_cert=_fake_cert(),
-        **_base_kwargs(tmp_path))
+    kwargs = _base_kwargs(tmp_path)
+    _seed_real_tierd_cert(kwargs["library_root"], clip)
+    res = calibrate_metric_against_reference(p, "rise_clip", clip, **kwargs)
 
     assert res["ok"] is True
     assert res["method"] == "reference"
@@ -180,17 +205,17 @@ def test_honest_metric_grants_observe_without_cert(tmp_path):
     assert res["cert_reason"] is not None
 
 
-def test_spoofed_tier_claim_without_cert_is_downgraded_to_observe(tmp_path):
-    """The exact audit finding: there is no `tier` string parameter left to
-    spoof, but confirm the closest legacy-shaped attempt (an unrelated /
-    mismatched certificate) is IGNORED, not trusted — the metric still only
-    earns observe, never steer, without a certificate that actually names
-    THIS clip."""
+def test_unrelated_on_disk_cert_does_not_grant_rights_for_this_clip(tmp_path):
+    """The exact audit finding, restated for §F5: there is no caller-
+    supplied cert parameter left to spoof at all — confirm the auto-
+    resolve path is scoped per (robot, clip_id) too. A genuine, verified
+    Tier-D certificate for a DIFFERENT clip_id must not vouch for THIS
+    one — the metric still only earns observe, never steer."""
     clip = _rising_clip()
     p = _write(tmp_path, "honest.py", _HONEST_HEIGHT)
-    mismatched = _fake_cert(clip_id="some_other_clip")
-    res = calibrate_metric_against_reference(
-        p, "rise_clip", clip, tierd_cert=mismatched, **_base_kwargs(tmp_path))
+    kwargs = _base_kwargs(tmp_path)
+    _seed_real_tierd_cert(kwargs["library_root"], clip, clip_id="some_other_clip")
+    res = calibrate_metric_against_reference(p, "rise_clip", clip, **kwargs)
 
     assert res["ok"] is True
     assert res["rights"] == "observe"
@@ -199,32 +224,15 @@ def test_spoofed_tier_claim_without_cert_is_downgraded_to_observe(tmp_path):
 
 
 def test_calibration_auto_resolves_tierd_cert_from_disk(tmp_path):
-    """The 'or resolvable' half: no `tierd_cert` is passed at all, but a
-    REAL, verifiable Tier-D certificate sits on disk for this exact
-    clip_id/robot (built via `update_provenance_tier_d`, the same seam
-    `sculptor.refs.track.track_clip` uses) — `calibrate_metric_against_
-    reference` must find it itself via `verify_tierd_certificate` and grant
-    steer."""
+    """A REAL, verifiable Tier-D certificate sits on disk for this exact
+    clip_id/robot (`_seed_real_tierd_cert`, the same on-disk artifact
+    chain `sculptor.refs.track.track_clip` produces) —
+    `calibrate_metric_against_reference` must find it itself via
+    `verify_tierd_certificate` (there is no other way in — §F5) and
+    grant steer."""
     root = tmp_path / "lib"
     clip = _rising_clip()
-    d = library.clip_dir("g1", "rise_clip", root=root)
-    from sculptor.reference import save_clip
-
-    save_clip(d / library.CLIP_FILENAME, clip)
-    prov = library.make_provenance(
-        clip_id="rise_clip", robot="g1", source={"kind": "hf_dataset"},
-        license="MIT", attribution="x", content_sha256_="c" * 64, tier="K")
-    library.write_provenance("g1", "rise_clip", prov, root=root)
-    library.rebuild_index(root=root)
-
-    rollout_path = tmp_path / "rollout.npz"
-    rollout_path.write_bytes(b"a real tracking rollout")
-    errs = TrackingErrors(
-        mean_joint_err_rad=0.05, max_joint_err_rad=0.1, root_z_rmse_m=0.02,
-        duration_coverage=1.0, common_joint_names=["j0"], n_common_joints=1)
-    update_provenance_tier_d(
-        robot="g1", clip_id="rise_clip", errors=errs, iterations=1,
-        rollout_path=rollout_path, root=root)
+    _seed_real_tierd_cert(root, clip)
 
     p = _write(tmp_path, "honest.py", _HONEST_HEIGHT)
     res = calibrate_metric_against_reference(
@@ -268,7 +276,7 @@ def test_ladder_order_recorded_correctly(tmp_path):
     clip = _rising_clip()
     p = _write(tmp_path, "honest.py", _HONEST_HEIGHT)
     res = calibrate_metric_against_reference(
-        p, "rise_clip", clip, tierd_cert=_fake_cert(), **_base_kwargs(tmp_path))
+        p, "rise_clip", clip, **_base_kwargs(tmp_path))
 
     ladder = res["ladder"]
     names = [r["rung"] for r in ladder]
@@ -287,7 +295,7 @@ def test_constant_metric_denied(tmp_path):
     clip = _rising_clip()
     p = _write(tmp_path, "const.py", _CONSTANT)
     res = calibrate_metric_against_reference(
-        p, "rise_clip", clip, tierd_cert=_fake_cert(), **_base_kwargs(tmp_path))
+        p, "rise_clip", clip, **_base_kwargs(tmp_path))
 
     assert res["ok"] is False
     assert res["rights"] == "none"
@@ -298,7 +306,7 @@ def test_reversed_metric_denied(tmp_path):
     clip = _rising_clip()
     p = _write(tmp_path, "reversed.py", _REVERSED_HEIGHT)
     res = calibrate_metric_against_reference(
-        p, "rise_clip", clip, tierd_cert=_fake_cert(), **_base_kwargs(tmp_path))
+        p, "rise_clip", clip, **_base_kwargs(tmp_path))
 
     assert res["ok"] is False
     assert res["rights"] == "none"
@@ -312,7 +320,7 @@ def test_firewall_denies_degenerate_battery_gaming(tmp_path):
     clip = _rising_clip()
     p = _write(tmp_path, "gameable.py", _FIREWALL_GAMEABLE)
     res = calibrate_metric_against_reference(
-        p, "rise_clip", clip, tierd_cert=_fake_cert(), **_base_kwargs(tmp_path))
+        p, "rise_clip", clip, **_base_kwargs(tmp_path))
 
     assert res["ok"] is False
     assert res["rights"] == "none"
@@ -324,25 +332,38 @@ def test_firewall_denies_degenerate_battery_gaming(tmp_path):
 
 
 def test_trust_tier_string_exact(tmp_path):
+    """§F5: tier can no longer be toggled per-call via a caller-supplied
+    cert — it is purely a function of on-disk state. Use a fresh library
+    root per case, seeding a real Tier-D cert only where D is expected."""
     clip = _rising_clip()
     p = _write(tmp_path, "honest.py", _HONEST_HEIGHT)
-    for cert, source_kind, expect_tier in (
-        (_fake_cert(), "hf_dataset", "D"),
-        (None, "video", "K"),
-        (_fake_cert(), "generated", "D"),
-    ):
+    for i, (want_d, source_kind, expect_tier) in enumerate((
+        (True, "hf_dataset", "D"),
+        (False, "video", "K"),
+        (True, "generated", "D"),
+    )):
+        root = tmp_path / f"lib_{i}"
+        if want_d:
+            _seed_real_tierd_cert(root, clip)
         res = calibrate_metric_against_reference(
-            p, "rise_clip", clip, tierd_cert=cert,
-            **_base_kwargs(tmp_path, source_kind=source_kind))
+            p, "rise_clip", clip, robot="g1", library_root=root,
+            source_kind=source_kind)
         assert res["trust_tier"] == f"reference:{expect_tier}:{source_kind}"
 
 
 def test_rights_none_when_not_ok(tmp_path):
+    """Rights are "none" whenever `ok` is False, REGARDLESS of tier — a
+    Tier-D-eligible clip still earns nothing from a denied (constant)
+    metric."""
     clip = _rising_clip()
     p = _write(tmp_path, "const.py", _CONSTANT)
-    for cert in (_fake_cert(), None):
+    for i, want_d in enumerate((True, False)):
+        root = tmp_path / f"lib_{i}"
+        if want_d:
+            _seed_real_tierd_cert(root, clip)
         res = calibrate_metric_against_reference(
-            p, "rise_clip", clip, tierd_cert=cert, **_base_kwargs(tmp_path))
+            p, "rise_clip", clip, robot="g1", library_root=root,
+            source_kind="hf_dataset")
         assert res["rights"] == "none"
 
 
@@ -350,7 +371,7 @@ def test_compute_trust_consumes_reference_result_without_error(tmp_path):
     clip = _rising_clip()
     p = _write(tmp_path, "honest.py", _HONEST_HEIGHT)
     res = calibrate_metric_against_reference(
-        p, "rise_clip", clip, tierd_cert=_fake_cert(), **_base_kwargs(tmp_path))
+        p, "rise_clip", clip, **_base_kwargs(tmp_path))
 
     trust = compute_trust(res)
     assert "trust" in trust
@@ -364,7 +385,7 @@ def test_compute_trust_consumes_denied_reference_result_without_error(tmp_path):
     clip = _rising_clip()
     p = _write(tmp_path, "const.py", _CONSTANT)
     res = calibrate_metric_against_reference(
-        p, "rise_clip", clip, tierd_cert=_fake_cert(), **_base_kwargs(tmp_path))
+        p, "rise_clip", clip, **_base_kwargs(tmp_path))
 
     trust = compute_trust(res)
     assert "trust" in trust
@@ -376,7 +397,7 @@ def test_load_failure_never_raises(tmp_path):
     p.write_text("this is not ( valid python", encoding="utf-8")
     clip = _rising_clip()
     res = calibrate_metric_against_reference(
-        p, "rise_clip", clip, tierd_cert=_fake_cert(), **_base_kwargs(tmp_path))
+        p, "rise_clip", clip, **_base_kwargs(tmp_path))
 
     assert res["ok"] is False
     assert res["rights"] == "none"
@@ -405,9 +426,9 @@ def test_determinism(tmp_path):
     clip = _rising_clip()
     p = _write(tmp_path, "honest.py", _HONEST_HEIGHT)
     res1 = calibrate_metric_against_reference(
-        p, "rise_clip", clip, tierd_cert=_fake_cert(), **_base_kwargs(tmp_path))
+        p, "rise_clip", clip, **_base_kwargs(tmp_path))
     res2 = calibrate_metric_against_reference(
-        p, "rise_clip", clip, tierd_cert=_fake_cert(), **_base_kwargs(tmp_path))
+        p, "rise_clip", clip, **_base_kwargs(tmp_path))
 
     assert res1["ladder"] == res2["ladder"]
     assert res1["spearman"] == res2["spearman"]

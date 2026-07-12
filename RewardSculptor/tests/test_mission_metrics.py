@@ -216,17 +216,24 @@ def test_default_pass_skips_superseded_stage(tmp_path, monkeypatch):
 def _write_fixture_clip(tmp_path: Path, robot: str, clip_id: str) -> Path:
     """Build a minimal valid on-disk library clip (provenance + clip.npz)
     under a tmp `RS_REFERENCE_ROOT`-shaped root, mirroring
-    `test_refs_library.py`'s conventions. Returns the root."""
+    `test_refs_library.py`'s conventions. Returns the root.
+
+    §F7: `content_sha256` is the REAL sha256 of the written clip.npz
+    bytes (not a placeholder) — `verify_tierd_certificate` now
+    recomputes this from disk, so a fake hash here would make the
+    end-to-end real-cert wiring test deny for the wrong reason."""
     from sculptor.reference import make_procedural_jump_clip, save_clip
     from sculptor.refs import library
 
     root = tmp_path / "refs_root"
     clip = make_procedural_jump_clip()
-    save_clip(library.clip_dir(robot, clip_id, root=root) / library.CLIP_FILENAME, clip)
+    clip_path = library.clip_dir(robot, clip_id, root=root) / library.CLIP_FILENAME
+    save_clip(clip_path, clip)
+    content_sha = library.content_sha256(clip_path.read_bytes())
     prov = library.make_provenance(
         clip_id=clip_id, robot=robot,
         source={"kind": "procedural"}, license="internal",
-        attribution="test-fixture", content_sha256_="a" * 64)
+        attribution="test-fixture", content_sha256_=content_sha)
     library.write_provenance(robot, clip_id, prov, root=root)
     return root
 
@@ -449,12 +456,17 @@ def test_calibration_wiring_end_to_end_resolves_tier_d_from_real_cert(
     chain — mission_metrics -> calibrate_metric_against_reference ->
     verify_tierd_certificate — with no explicit tier ever passed by
     mission_metrics.py."""
+    from sculptor.refs import library
     from sculptor.refs.track import TrackingErrors, update_provenance_tier_d
 
     root = _write_fixture_clip(tmp_path, "g1", "getup_demo_clip")
     monkeypatch.setenv("RS_REFERENCE_ROOT", str(root))
 
-    rollout_path = tmp_path / "rollout.npz"
+    # §F7: rollout_path must resolve INSIDE the library root — mirrors
+    # `track_clip`'s own `clip_d / "tierD_rollout.npz"` convention.
+    rollout_path = (
+        library.clip_dir("g1", "getup_demo_clip", root=root)
+        / "tierD_rollout.npz")
     rollout_path.write_bytes(b"a real tracking rollout for the wiring test")
     errs = TrackingErrors(
         mean_joint_err_rad=0.05, max_joint_err_rad=0.1, root_z_rmse_m=0.02,

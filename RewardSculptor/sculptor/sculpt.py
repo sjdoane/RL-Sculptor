@@ -3426,7 +3426,28 @@ def _evaluate_start_state_gate(
       measured_z  = mean over envs of `root_link_pos_w[0, :, 2]`
       measured_pg = mean over envs of `projected_gravity_b[0, :, 2]`
       match iff |measured_z - expected_z| <= 0.15 AND
-                |measured_pg - expected_pg| <= 0.30
+                |measured_pg - expected_pg| <= 0.30 AND
+                (posture check skipped OR joint_err <= 0.45)
+
+    §F1 posture check (adversarial-audit finding, docs/internal
+    REFERENCE_BUILD_LOG.md D19-D21 context): the z+pg tolerances alone
+    are wide enough that a STANDING rollout (z≈0.74, pg_z≈-1.0) can pass
+    whenever `expected_z >= 0.59` and the reset is near-upright — and a
+    shallow sitting/crouch reset can legitimately land in that band too.
+    When `eval_reset.json` carries `reset_joint_pos_target` (length-J
+    clip-order joint targets) AND the candidate's trajectory carries a
+    `joint_pos` array whose last dimension equals J, this additionally
+    computes:
+
+      measured_q0 = mean over envs of `joint_pos[0, :, :]`   (shape [J])
+      joint_err   = mean over joints of |measured_q0 - reset_joint_pos_target|
+
+    and requires `joint_err <= 0.45` (radians) for a match. Missing
+    `reset_joint_pos_target`, missing `joint_pos`, or a joint-count
+    mismatch SKIPS the posture check for that candidate (z+pg alone
+    still gate it) — it does not fail the candidate outright. (When
+    every candidate lacks well-shaped root/pg arrays, `_select_stage_
+    final_iter` separately fails the stage — see §F6 there.)
 
     The caller (`_select_stage_final_iter`) excludes gate-MISMATCHED
     iterations from criterion-passing consideration.
@@ -3452,6 +3473,10 @@ def _evaluate_start_state_gate(
       example_measured_z / example_measured_pg_z: one representative
         measurement (prefers a mismatched example when any exist, else
         the first checked iter's) — for the event / failure detail.
+      example_measured_joint_err: the same representative candidate's
+        mean per-joint posture error (radians), or None when the
+        posture check was skipped for it (no target / no joint_pos /
+        dimension mismatch).
     """
     result: dict = {
         "skipped": False,
@@ -3462,6 +3487,7 @@ def _evaluate_start_state_gate(
         "mismatched_count": 0,
         "example_measured_z": None,
         "example_measured_pg_z": None,
+        "example_measured_joint_err": None,
     }
     if stage_dir is None:
         return None
@@ -3487,10 +3513,24 @@ def _evaluate_start_state_gate(
     result["expected_z"] = expected_z
     result["expected_pg_z"] = expected_pg
 
+    # §F1 posture target: only present for get-up-shaped stages (D19).
+    # A missing/malformed target simply disables the posture check below
+    # (z+pg tolerances alone still gate); it does not skip the gate.
+    joint_target = eval_reset.get("reset_joint_pos_target")
+    joint_target_arr = None
+    if joint_target:
+        try:
+            import numpy as np
+            _cand = np.asarray(joint_target, dtype=float)
+            if _cand.ndim == 1 and _cand.shape[0] > 0:
+                joint_target_arr = _cand
+        except Exception:  # noqa: BLE001 — malformed target: posture skipped
+            joint_target_arr = None
+
     from sculptor.mission_runtime import _load_trajectory_arrays
 
-    example_z = example_pg = None
-    mismatch_example_z = mismatch_example_pg = None
+    example_z = example_pg = example_joint_err = None
+    mismatch_example_z = mismatch_example_pg = mismatch_example_joint_err = None
     for o in with_ckpt:
         try:
             import numpy as np
@@ -3513,25 +3553,49 @@ def _evaluate_start_state_gate(
         except Exception:  # noqa: BLE001 — this iter's data unusable: skip it
             continue
 
+        # §F1 posture check: independent try/except so a missing/malformed
+        # `joint_pos` array (or joint-count mismatch) merely SKIPS the
+        # posture term for this candidate — it never drops the candidate
+        # from `checked` or forces a z/pg-only failure.
+        joint_err = None
+        if joint_target_arr is not None:
+            try:
+                joint_pos = trajectory.get("joint_pos")
+                if joint_pos is not None:
+                    joint_arr = np.asarray(joint_pos)
+                    if (joint_arr.ndim == 3 and joint_arr.shape[0] >= 1
+                            and joint_arr.shape[1] >= 1
+                            and joint_arr.shape[2] == joint_target_arr.shape[0]):
+                        measured_q0 = np.mean(joint_arr[0, :, :], axis=0)
+                        joint_err = float(
+                            np.mean(np.abs(measured_q0 - joint_target_arr)))
+            except Exception:  # noqa: BLE001 — posture unreadable: skip it
+                joint_err = None
+
         result["checked"] += 1
         if example_z is None:
-            example_z, example_pg = measured_z, measured_pg
+            example_z, example_pg, example_joint_err = (
+                measured_z, measured_pg, joint_err)
         matched = (
             abs(measured_z - expected_z) <= 0.15
             and abs(measured_pg - expected_pg) <= 0.30
+            and (joint_err is None or joint_err <= 0.45)
         )
         if not matched:
             result["mismatched"][str(o.iter_dir)] = True
             if mismatch_example_z is None:
-                mismatch_example_z, mismatch_example_pg = measured_z, measured_pg
+                mismatch_example_z, mismatch_example_pg, mismatch_example_joint_err = (
+                    measured_z, measured_pg, joint_err)
 
     result["mismatched_count"] = len(result["mismatched"])
     if mismatch_example_z is not None:
         result["example_measured_z"] = mismatch_example_z
         result["example_measured_pg_z"] = mismatch_example_pg
+        result["example_measured_joint_err"] = mismatch_example_joint_err
     else:
         result["example_measured_z"] = example_z
         result["example_measured_pg_z"] = example_pg
+        result["example_measured_joint_err"] = example_joint_err
     return result
 
 
@@ -3569,6 +3633,17 @@ def _select_stage_final_iter(
     None) instead of the usual `None` — the caller must surface this as
     a DISTINCT, non-redecomposable failure reason
     (`"start_state_mismatch"`), not the generic `criterion_not_met`.
+
+    §F6 (fail-closed on zero verifiable candidates): when
+    `eval_reset.json` exists but the gate could not well-shape ANY
+    candidate's root/pg trajectory arrays (`gate["checked"] == 0`), the
+    gate has no evidence either way — treating that as an implicit pass
+    would let malformed/missing trajectory data silently defeat the
+    whole start-state check. Any criterion-passing candidate is instead
+    treated as gate-mismatched (excluded from `passing`), and the
+    `start_state_mismatch_detail` names the verification failure
+    directly rather than claiming a wrong-state match. `eval_reset.json`
+    absent (gate skipped) is unaffected — that path never gated at all.
     """
     from sculptor.mission_runtime import (
         CriterionEvalError,
@@ -3597,9 +3672,16 @@ def _select_stage_final_iter(
             "expected_pg_z": gate["expected_pg_z"],
             "example_measured_z": gate["example_measured_z"],
             "example_measured_pg_z": gate["example_measured_pg_z"],
+            "example_measured_joint_err": gate["example_measured_joint_err"],
             "skipped": gate["skipped"],
         })
     gate_mismatched = gate["mismatched"] if gate is not None else {}
+    # §F6: eval_reset.json present (gate ran, not skipped) but not a
+    # single candidate had well-shaped trajectory arrays to check —
+    # fail closed instead of letting every criterion-passer through.
+    gate_unverified = bool(
+        gate is not None and not gate["skipped"] and gate["checked"] == 0
+    )
 
     passing: "list[IterOutcome]" = []
     raw_passing: "list[IterOutcome]" = []
@@ -3617,8 +3699,10 @@ def _select_stage_final_iter(
                 raw_passing.append(o)
                 # §D21 Fix 3: a gate-mismatched iter does NOT count as
                 # criterion-satisfying, regardless of what the criterion
-                # expression itself evaluated to.
-                if not gate_mismatched.get(str(o.iter_dir), False):
+                # expression itself evaluated to. §F6: nor does one when
+                # the gate never verified ANY candidate at all.
+                if (not gate_mismatched.get(str(o.iter_dir), False)
+                        and not gate_unverified):
                     passing.append(o)
         except CriterionEvalError as e:
             saw_any_error = True
@@ -3643,16 +3727,25 @@ def _select_stage_final_iter(
     # stage with a non-redecomposable reason (re-authoring the criterion
     # / reward can't fix a scaffold that started from the wrong state).
     if raw_passing:
-        detail = (
-            f"{len(raw_passing)} iteration(s) satisfied "
-            f"{stage.success_criterion!r} but ALL started from the wrong "
-            f"state per env/eval_reset.json (expected root z="
-            f"{gate['expected_z']!r}, projected-gravity z="
-            f"{gate['expected_pg_z']!r}; example measured z="
-            f"{gate['example_measured_z']!r}, projected-gravity z="
-            f"{gate['example_measured_pg_z']!r}). The scaffold likely "
-            f"fell back to the wrong RSI/reset class."
-        )
+        if gate_unverified:
+            # §F6: distinct from a measured mismatch — the gate simply
+            # had nothing to measure.
+            detail = (
+                "start-state gate could not verify any candidate "
+                "(missing/malformed trajectory arrays)"
+            )
+        else:
+            detail = (
+                f"{len(raw_passing)} iteration(s) satisfied "
+                f"{stage.success_criterion!r} but ALL started from the wrong "
+                f"state per env/eval_reset.json (expected root z="
+                f"{gate['expected_z']!r}, projected-gravity z="
+                f"{gate['expected_pg_z']!r}; example measured z="
+                f"{gate['example_measured_z']!r}, projected-gravity z="
+                f"{gate['example_measured_pg_z']!r}, mean joint error="
+                f"{gate['example_measured_joint_err']!r}). The scaffold "
+                f"likely fell back to the wrong RSI/reset class."
+            )
         return (winner, False, "fitness_fallback", None, False, detail)
 
     # Preserve the genuine-bug vs missing-key/plain-fail distinction the
@@ -4784,6 +4877,21 @@ def _run_one_stage(
             "device": device,
         })
 
+    # §F2 (adversarial-audit finding): mission.py's validate_mission
+    # FORCES needs_reference_rsi=True for a non-standing start_pose, but
+    # that force only fires at validate_mission() call time — a
+    # persisted mission.json reaching here via Mission.from_json (hand-
+    # edit, legacy file, a future non-validating writer) is never
+    # re-validated. Trusting the persisted `needs_reference_rsi` flag
+    # alone would let start_pose="supine" + needs_reference_rsi=False
+    # skip the ENTIRE scaffold block below un-forced: no eval_reset.json,
+    # gate returns skipped — the exact D20 hollow-success hole. Recompute
+    # the force-rule's condition independently here so the scaffold never
+    # trusts the flag in isolation.
+    non_standing = getattr(stage, "start_pose", None) in {
+        "supine", "prone", "sitting", "crouched",
+    }
+
     # 2.5 §JUMP_SCAFFOLD (generalized §REFERENCE_TRAJECTORY_PLAN §8 part
     # 2): decomposer-flagged reference-state initialization. Derive a
     # validated TRAIN-ONLY RSI curriculum from a reference clip and
@@ -4794,8 +4902,10 @@ def _run_one_stage(
     # RSI is curriculum assistance, not correctness; the stage trains
     # without it. A clip resolution `fatal_error`, however, DOES fail the
     # stage (§D21 Fix 2, below) — an attached-but-unloadable clip must
-    # never silently substitute a different task class.
-    if getattr(stage, "needs_reference_rsi", False):
+    # never silently substitute a different task class. §F2: a
+    # non-standing start_pose ALSO enters this block even when the
+    # persisted needs_reference_rsi is (incorrectly) False.
+    if getattr(stage, "needs_reference_rsi", False) or non_standing:
         stage_env_dir = stage_dir / "env"
         # Default True (= skip) on a read failure — preserves the
         # pre-D21 behavior of the whole block degrading to a no-op
@@ -5031,6 +5141,34 @@ def _run_one_stage(
                         ),
                         emit,
                     )
+
+    # §F2 part (b): a non-standing start_pose MUST have produced
+    # env/eval_reset.json by this point — either freshly written by the
+    # block above, or already present from an earlier scaffold pass
+    # (resume idempotency: `already=True` skips re-applying RSI, but the
+    # file from that earlier pass is still on disk, so this check still
+    # passes). Every early-return above treats scaffold failure as
+    # non-fatal by default (curriculum assistance, not correctness) —
+    # but for a non-standing stage the eval-reset override IS the
+    # correctness mechanism (§D17/§D19/§D20); a missing file here means
+    # the block was entered (or skipped un-forced) without ever writing
+    # one, e.g. because the clip carried no posture channels or
+    # `derive_eval_reset` returned None. Fail rather than silently
+    # falling back to a standing-default reset — the exact D20 hollow-
+    # success hole this whole program exists to close.
+    if non_standing and not (stage_dir / "env" / "eval_reset.json").is_file():
+        return _fail_stage(
+            stage, "reference_scaffold_failed",
+            (
+                f"stage {stage.name!r} has start_pose="
+                f"{getattr(stage, 'start_pose', None)!r} (non-standing) "
+                f"but no env/eval_reset.json was produced by the "
+                f"reference-RSI scaffold. A non-standing start is the "
+                f"task, not curriculum — refusing to silently train or "
+                f"evaluate from a standing-default reset."
+            ),
+            emit,
+        )
 
     # 2.6 §reference_signature (item 6): whenever a reference clip is
     # ATTACHED to this stage (stage.reference_clip_id set), INDEPENDENT

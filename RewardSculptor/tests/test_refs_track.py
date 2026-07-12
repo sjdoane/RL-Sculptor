@@ -53,14 +53,23 @@ def _make_getup_clip(n: int = 40) -> dict:
 
 
 def _register_clip(root: Path, clip: dict, *, clip_id: str = "getup1",
-                    robot: str = "g1", tier: str = "K") -> None:
+                    robot: str = "g1", tier: str = "K") -> str:
+    """Write clip.npz + provenance whose `content_sha256` is the REAL
+    sha256 of the on-disk clip.npz bytes. §F7: `verify_tierd_certificate`
+    now recomputes this hash from disk, so a placeholder fixture value
+    (the historical `"0" * 64`) would make every certificate in this
+    suite deny for the wrong reason. Returns the computed hash so
+    callers can assert against it."""
     d = library.clip_dir(robot, clip_id, root=root)
-    save_clip(d / library.CLIP_FILENAME, clip)
+    clip_path = d / library.CLIP_FILENAME
+    save_clip(clip_path, clip)
+    content_sha = library.content_sha256(clip_path.read_bytes())
     prov = library.make_provenance(
         clip_id=clip_id, robot=robot, source={"kind": "test"},
-        license="MIT", attribution="x", content_sha256_="0" * 64, tier=tier)
+        license="MIT", attribution="x", content_sha256_=content_sha, tier=tier)
     library.write_provenance(robot, clip_id, prov, root=root)
     library.rebuild_index(root=root)
+    return content_sha
 
 
 def _write_donor_project(path: Path) -> Path:
@@ -368,7 +377,7 @@ def test_build_track_project_rejects_clip_without_joint_pos(tmp_path: Path):
 def test_update_provenance_tier_d_feasible_upgrades_tier(tmp_path: Path):
     root = tmp_path / "lib"
     clip = _make_getup_clip()
-    _register_clip(root, clip, tier="K")
+    content_sha = _register_clip(root, clip, tier="K")
 
     errs = TrackingErrors(
         mean_joint_err_rad=0.1, max_joint_err_rad=0.2, root_z_rmse_m=0.05,
@@ -388,7 +397,7 @@ def test_update_provenance_tier_d_feasible_upgrades_tier(tmp_path: Path):
     # §audit-finding close: the tierD block now also records the rollout's
     # sha256 and a copy of the clip's content_sha256 at tracking time.
     assert prov["tierD"]["rollout_sha256"] == library.content_sha256(rollout_bytes)
-    assert prov["tierD"]["clip_content_sha256"] == "0" * 64  # _register_clip's fixture hash
+    assert prov["tierD"]["clip_content_sha256"] == content_sha  # _register_clip's real hash
 
     # Persisted to disk, index rebuilt.
     reloaded = library.read_provenance("g1", "getup1", root=root)
@@ -550,12 +559,14 @@ _ROLLOUT_BYTES = b"legit tracking rollout npz bytes"
 def _certify_valid_tier_d(tmp_path: Path, root: Path, *,
                            clip_id: str = "getup1", robot: str = "g1") -> dict:
     """Build a clip whose provenance carries a REAL, internally-consistent
-    Tier-D certificate: a rollout file actually on disk, its sha256
-    recorded correctly, and the clip content hash matching. Returns the
-    written provenance dict."""
+    Tier-D certificate: a rollout file actually on disk INSIDE the
+    library root (§F7 containment check — mirrors `track_clip`'s own
+    `clip_d / "tierD_rollout.npz"` convention), its sha256 recorded
+    correctly, and the clip content hash matching the real clip.npz
+    bytes (§F7). Returns the written provenance dict."""
     clip = _make_getup_clip()
     _register_clip(root, clip, clip_id=clip_id, robot=robot, tier="K")
-    rollout_path = tmp_path / f"{clip_id}_rollout.npz"
+    rollout_path = library.clip_dir(robot, clip_id, root=root) / "tierD_rollout.npz"
     rollout_path.write_bytes(_ROLLOUT_BYTES)
     errs = TrackingErrors(
         mean_joint_err_rad=0.05, max_joint_err_rad=0.1, root_z_rmse_m=0.02,
@@ -569,7 +580,7 @@ def _certify_valid_tier_d(tmp_path: Path, root: Path, *,
 
 def test_verify_tierd_certificate_valid_fixture_returns_certificate(tmp_path: Path):
     root = tmp_path / "lib"
-    _certify_valid_tier_d(tmp_path, root)
+    prov = _certify_valid_tier_d(tmp_path, root)
 
     cert, reason = verify_tierd_certificate("g1", "getup1", root=root)
 
@@ -580,14 +591,16 @@ def test_verify_tierd_certificate_valid_fixture_returns_certificate(tmp_path: Pa
     assert cert.mean_joint_err_rad == pytest.approx(0.05)
     assert cert.root_z_rmse_m == pytest.approx(0.02)
     assert cert.rollout_sha256 == library.content_sha256(_ROLLOUT_BYTES)
-    assert cert.clip_content_sha256 == "0" * 64
+    assert cert.clip_content_sha256 == prov["content_sha256"]
     assert cert.rollout_path.is_file()
 
 
 def test_verify_tierd_certificate_frozen_dataclass(tmp_path: Path):
     root = tmp_path / "lib"
     _certify_valid_tier_d(tmp_path, root)
-    cert, _reason = verify_tierd_certificate("g1", "getup1", root=root)
+    cert, reason = verify_tierd_certificate("g1", "getup1", root=root)
+    assert reason is None
+    assert cert is not None
     with pytest.raises(Exception):  # noqa: PT011 — frozen dataclass raises FrozenInstanceError
         cert.robot = "go1"  # type: ignore[misc]
 
@@ -694,6 +707,56 @@ def test_verify_tierd_certificate_tamper_wrong_clip_hash_denied(tmp_path: Path):
     cert, reason = verify_tierd_certificate("g1", "getup1", root=root)
     assert cert is None
     assert "hash drift" in reason
+
+
+def test_verify_tierd_certificate_tamper_swapped_clip_bytes_denied(tmp_path: Path):
+    """§F7: the pre-existing check 5 only compares
+    `tierD.clip_content_sha256` against `provenance.content_sha256` —
+    two fields of the SAME provenance.json. A hand-edited file could
+    keep both mutually consistent (both wrong) without ever touching
+    clip.npz. Swap the clip.npz bytes WITHOUT touching either hash
+    field: the two-field comparison still agrees with itself, but the
+    hash recomputed from the real file on disk must not."""
+    root = tmp_path / "lib"
+    _certify_valid_tier_d(tmp_path, root)
+    clip_path = library.clip_dir("g1", "getup1", root=root) / library.CLIP_FILENAME
+    clip_path.write_bytes(b"swapped clip.npz payload, not the certified clip")
+
+    cert, reason = verify_tierd_certificate("g1", "getup1", root=root)
+    assert cert is None
+    assert "on-disk bytes do not match" in reason
+
+
+def test_verify_tierd_certificate_missing_clip_file_denied(tmp_path: Path):
+    """§F7: a vanished clip.npz (e.g. a partially-deleted library entry)
+    must deny with a distinct reason, never crash."""
+    root = tmp_path / "lib"
+    _certify_valid_tier_d(tmp_path, root)
+    clip_path = library.clip_dir("g1", "getup1", root=root) / library.CLIP_FILENAME
+    clip_path.unlink()
+
+    cert, reason = verify_tierd_certificate("g1", "getup1", root=root)
+    assert cert is None
+    assert "cannot read clip.npz" in reason
+
+
+def test_verify_tierd_certificate_rollout_path_escapes_root_denied(tmp_path: Path):
+    """§F7 containment: a `tierD.rollout_path` pointing OUTSIDE the
+    library root must be rejected even when its bytes hash correctly —
+    a hand-edited provenance.json must not be able to point this at an
+    arbitrary file elsewhere on disk."""
+    root = tmp_path / "lib"
+    _certify_valid_tier_d(tmp_path, root)
+
+    escaped = tmp_path / "outside_root_rollout.npz"
+    escaped.write_bytes(_ROLLOUT_BYTES)  # same bytes/hash as the real one
+    _mutate_provenance(root, "g1", "getup1", lambda p: p["tierD"].update({
+        "rollout_path": str(escaped),
+    }))
+
+    cert, reason = verify_tierd_certificate("g1", "getup1", root=root)
+    assert cert is None
+    assert "resolves outside the library root" in reason
 
 
 def test_verify_tierd_certificate_tamper_missing_rollout_sha_denied(tmp_path: Path):

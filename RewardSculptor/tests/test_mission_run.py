@@ -526,13 +526,54 @@ def stub_adapter(monkeypatch):
     )
 
 
+def _trajectory_matching_eval_reset(stage_dir: Path):
+    """§F6 test-fixture helper: read `env/eval_reset.json` (written by
+    the scaffold BEFORE `sculpt_run` is ever invoked — see the
+    `stage_reference_rsi_applied`/`stage_eval_reset_written` events
+    always preceding `stage_completed_training`) and build a trajectory
+    dict whose frame-0 `root_link_pos_w`/`projected_gravity_b` (and
+    `joint_pos`, when the eval reset carries `reset_joint_pos_target`)
+    EXACTLY match it. Returns `None` when there is no eval_reset.json
+    (jump/standing stages — unaffected, gate stays skipped).
+
+    Needed because §F6 hardened the §D21 start-state gate to fail
+    CLOSED when it can't verify any candidate at all (`checked == 0`,
+    e.g. a fabricated rollout with no root/pg arrays) — tests in this
+    module that scaffold a get-up-archetype stage but aren't actually
+    ABOUT the gate need a trajectory the gate can genuinely verify as
+    matching, or they now trip start_state_mismatch incidentally."""
+    import math
+
+    eval_reset_path = stage_dir / "env" / "eval_reset.json"
+    if not eval_reset_path.is_file():
+        return None
+    payload = json.loads(eval_reset_path.read_text())
+    from sculptor.reference import G1_CLASS_STAND_M
+
+    offset = float(payload.get("reset_height_offset_m", 0.0) or 0.0)
+    pitch = float(payload.get("reset_pitch_offset_rad", 0.0) or 0.0)
+    roll = float(payload.get("reset_roll_offset_rad", 0.0) or 0.0)
+    z0 = G1_CLASS_STAND_M + offset
+    pg0 = -math.cos(pitch) * math.cos(roll)
+    joint_target = payload.get("reset_joint_pos_target")
+    return _make_pose_trajectory(z0=z0, pg_z0=pg0, joint_pos0=joint_target)
+
+
 def _fake_sculpt_run_factory(
     *, metric: float, write_ckpt: bool = True,
     write_trajectory: bool = True,
+    match_eval_reset: bool = False,
 ):
     """Build a fake `sculpt_run` that writes the artifacts
     `_run_one_stage` looks for post-training (checkpoint, behavior.json,
     trajectory.npz) to a per-call iter_dir.
+
+    §F6: `match_eval_reset=True` fabricates a trajectory whose frame-0
+    state matches the stage's OWN `env/eval_reset.json` (via
+    `_trajectory_matching_eval_reset`), so a get-up-archetype stage's
+    §D21/§F6 start-state gate genuinely passes instead of failing
+    closed on zero verifiable candidates — for tests where the gate is
+    incidental, not the thing under test.
     """
     def fake(*, config_path, behavior_goal, iterations=3, steps_per_iter=None,
              seed=None, init_policy_path=None, **_kw):
@@ -542,11 +583,15 @@ def _fake_sculpt_run_factory(
         if write_ckpt:
             (iter_dir / "checkpoint.pt").write_bytes(b"fake-ckpt")
         if write_trajectory:
+            trajectory = (
+                _trajectory_matching_eval_reset(project)
+                if match_eval_reset else None)
             _fabricate_rollout_artifacts(
                 iter_dir,
                 behavior={"n_episodes": 1, "mean_return": metric,
                           "mean_episode_length": 400.0,
                           "max_episode_length": 500},
+                trajectory=trajectory,
             )
         # Return a SculptRunResult-shaped object.
         from sculptor.sculpt import IterOutcome, SculptRunResult
@@ -3232,7 +3277,11 @@ def test_stage_reference_clip_id_wins_over_project_jump_clip(
     save_clip(project_root / "reference" / "jump.npz",
                make_procedural_jump_clip())
 
-    fake = _fake_sculpt_run_factory(metric=0.9)
+    # §F6: this get-up clip's derived eval_reset.json means the §D21/§F6
+    # start-state gate now runs for real — match_eval_reset=True fabricates
+    # a rollout the gate genuinely verifies, since this test is about
+    # clip-precedence wiring, not the gate.
+    fake = _fake_sculpt_run_factory(metric=0.9, match_eval_reset=True)
     monkeypatch.setattr(sculpt_mod, "sculpt_run", fake)
     monkeypatch.setattr(
         "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
@@ -3275,7 +3324,10 @@ def test_stage_eval_reset_written_for_getup_stage(
     m.stages[0].needs_reference_rsi = True
     m.stages[0].reference_clip_id = "test_getup_clip"
 
-    fake = _fake_sculpt_run_factory(metric=0.9)
+    # §F6: match_eval_reset=True so the newly-real §D21/§F6 start-state
+    # gate passes — this test is about the eval_reset.json write, not
+    # the gate.
+    fake = _fake_sculpt_run_factory(metric=0.9, match_eval_reset=True)
     monkeypatch.setattr(sculpt_mod, "sculpt_run", fake)
     monkeypatch.setattr(
         "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
@@ -3549,7 +3601,9 @@ def test_stage_start_pose_compatible_clip_scaffolds_normally(
     m.stages[0].reference_clip_id = "test_getup_clip"
     m.stages[0].start_pose = "supine"
 
-    fake = _fake_sculpt_run_factory(metric=0.9)
+    # §F6: match_eval_reset=True so the §D21/§F6 start-state gate passes
+    # for real — this test is about start_pose QC, not the gate.
+    fake = _fake_sculpt_run_factory(metric=0.9, match_eval_reset=True)
     monkeypatch.setattr(sculpt_mod, "sculpt_run", fake)
     monkeypatch.setattr(
         "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
@@ -3562,6 +3616,103 @@ def test_stage_start_pose_compatible_clip_scaffolds_normally(
     assert result.completed is True
     assert not [e for e in events if e["type"] == "stage_start_pose_mismatch"]
     assert [e for e in events if e["type"] == "stage_reference_rsi_applied"]
+
+
+# ── §F2 (adversarial-audit finding): the force-rule must not be trusted
+#    from the persisted flag alone ───────────────────────────────────────
+def test_persisted_needs_rsi_false_with_non_standing_pose_still_scaffolds(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """§F2: mission.py's `validate_mission()` FORCES needs_reference_rsi
+    True for a non-standing start_pose, but that force only fires at
+    validate_mission() call time — a persisted mission.json reaching the
+    scaffold via `Mission.from_json` (hand-edit, legacy file, a future
+    non-validating writer) is never re-validated. A stage with the
+    PERSISTED flag `needs_reference_rsi=False` but `start_pose="supine"`
+    must still get the reference-RSI scaffold: RSI applies and
+    `env/eval_reset.json` gets written, exactly as if the flag had been
+    True (the fix recomputes the force-rule's condition independently in
+    `_run_one_stage`, never trusting the flag in isolation)."""
+    from sculptor import sculpt as sculpt_mod
+
+    lib_root = tmp_path / "reflib"
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(lib_root))
+    _write_library_clip(lib_root, "g1", "test_getup_clip")
+
+    m = _make_mission(tmp_path, n_stages=1)
+    m.stages[0].needs_reference_rsi = False  # the persisted (wrong) flag
+    m.stages[0].reference_clip_id = "test_getup_clip"
+    m.stages[0].start_pose = "supine"
+
+    fake = _fake_sculpt_run_factory(metric=0.9, match_eval_reset=True)
+    monkeypatch.setattr(sculpt_mod, "sculpt_run", fake)
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
+    )
+
+    events: list[dict] = []
+    result = sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab", kg_store=None, on_event=events.append,
+    )
+    assert result.completed is True
+    assert not [e for e in events if e["type"] == "stage_start_pose_mismatch"]
+
+    rsi_events = [e for e in events if e["type"] == "stage_reference_rsi_applied"]
+    assert len(rsi_events) == 1
+    assert rsi_events[0]["clip"] == "library:g1/test_getup_clip"
+
+    eval_reset_path = (
+        Path(m.mission_dir) / "stages" / "stage_0" / "env" / "eval_reset.json")
+    assert eval_reset_path.is_file()
+    written = [e for e in events if e["type"] == "stage_eval_reset_written"]
+    assert len(written) == 1
+
+
+def test_persisted_needs_rsi_false_with_non_standing_pose_and_no_clip_fails_stage(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """§F2 counterpart: same persisted-flag-False + `start_pose="supine"`
+    scenario, but no clip resolves at all — falls back to the procedural
+    jump clip (archetype airborne). Pre-F2 this reached scaffold un-
+    forced (the whole block skipped since needs_reference_rsi was
+    False): no eval_reset.json, gate returns skipped — the exact D20
+    hollow-success hole. Post-F2 the block still runs (forced by the
+    non-standing start_pose), the existing start_pose QC catches the
+    archetype mismatch, and the stage fails `reference_scaffold_failed`
+    — never a silent standing success."""
+    from sculptor import sculpt as sculpt_mod
+
+    m = _make_mission(tmp_path, n_stages=1)
+    m.stages[0].needs_reference_rsi = False  # the persisted (wrong) flag
+    m.stages[0].start_pose = "supine"
+    m.stages[0].redecomposition_attempts = 1  # halt, don't redecompose
+
+    fake = _fake_sculpt_run_factory(metric=0.9)
+    monkeypatch.setattr(sculpt_mod, "sculpt_run", fake)
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
+    )
+
+    events: list[dict] = []
+    result = sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab", kg_store=None, on_event=events.append,
+    )
+    assert result.completed is False
+    assert result.halted_reason == "reference_scaffold_failed"
+
+    failed_events = [e for e in events if e["type"] == "stage_failed"]
+    assert len(failed_events) == 1
+    assert failed_events[0]["reason"] == "reference_scaffold_failed"
+
+    # Proof the scaffold block genuinely ran (F2 fix) rather than being
+    # skipped un-forced: the start_pose QC mismatch fired.
+    mismatch_events = [
+        e for e in events if e["type"] == "stage_start_pose_mismatch"]
+    assert len(mismatch_events) == 1
+
+    eval_reset_path = (
+        Path(m.mission_dir) / "stages" / "stage_0" / "env" / "eval_reset.json")
+    assert not eval_reset_path.is_file()
 
 
 # ── §start_pose: reference_signature.json (item 6, LOCKED schema) ────────
@@ -3579,7 +3730,10 @@ def test_reference_signature_written_when_needs_rsi_true(
     m.stages[0].reference_clip_id = "test_getup_clip"
     m.stages[0].reference_tier = "K"
 
-    fake = _fake_sculpt_run_factory(metric=0.9)
+    # §F6: match_eval_reset=True so the §D21/§F6 start-state gate passes
+    # for real — this test is about the reference_signature.json write,
+    # not the gate.
+    fake = _fake_sculpt_run_factory(metric=0.9, match_eval_reset=True)
     monkeypatch.setattr(sculpt_mod, "sculpt_run", fake)
     monkeypatch.setattr(
         "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
@@ -3736,7 +3890,10 @@ def test_settle_reset_env_var_escape_hatch_skips_settling(
     m.stages[0].needs_reference_rsi = True
     m.stages[0].reference_clip_id = "test_getup_clip"
 
-    fake = _fake_sculpt_run_factory(metric=0.9)
+    # §F6: match_eval_reset=True so the §D21/§F6 start-state gate passes
+    # for real — this test is about the settle-reset escape hatch, not
+    # the gate.
+    fake = _fake_sculpt_run_factory(metric=0.9, match_eval_reset=True)
     monkeypatch.setattr(sculpt_mod, "sculpt_run", fake)
     monkeypatch.setattr(
         "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
@@ -3770,7 +3927,9 @@ def test_settle_reset_success_recenters_ranges_and_writes_settled_eval_reset(
     m.stages[0].needs_reference_rsi = True
     m.stages[0].reference_clip_id = "test_getup_clip"
 
-    fake = _fake_sculpt_run_factory(metric=0.9)
+    # §F6: match_eval_reset=True so the §D21/§F6 start-state gate passes
+    # for real — this test is about settle-then-rederive, not the gate.
+    fake = _fake_sculpt_run_factory(metric=0.9, match_eval_reset=True)
     monkeypatch.setattr(sculpt_mod, "sculpt_run", fake)
     monkeypatch.setattr(
         "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
@@ -3822,7 +3981,10 @@ def test_settle_reset_failure_is_non_fatal_falls_back_to_unsettled(
     m.stages[0].needs_reference_rsi = True
     m.stages[0].reference_clip_id = "test_getup_clip"
 
-    fake = _fake_sculpt_run_factory(metric=0.9)
+    # §F6: match_eval_reset=True so the §D21/§F6 start-state gate passes
+    # for real — this test is about the settle-failure fallback, not the
+    # gate.
+    fake = _fake_sculpt_run_factory(metric=0.9, match_eval_reset=True)
     monkeypatch.setattr(sculpt_mod, "sculpt_run", fake)
     monkeypatch.setattr(
         "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
@@ -4718,20 +4880,29 @@ def _write_eval_reset(stage_dir: Path, **overrides) -> None:
 
 def _make_pose_trajectory(
     z0: float, pg_z0: float, n_steps: int = 3, n_envs: int = 2,
+    joint_pos0=None,
 ) -> dict:
     """A minimal (T, E, 3) root_link_pos_w / projected_gravity_b pair
     with a fixed frame-0 z / projected-gravity-z (constant across the
     rest of the rollout — irrelevant to the gate, which only reads
-    frame 0)."""
+    frame 0). §F1: `joint_pos0` (list[float], length J) optionally adds
+    a (T, E, J) `joint_pos` array, constant at that value across every
+    frame/env — feeds the posture-check half of the gate."""
     root = np.zeros((n_steps, n_envs, 3), dtype=np.float32)
     root[:, :, 2] = z0
     pg = np.zeros((n_steps, n_envs, 3), dtype=np.float32)
     pg[:, :, 2] = pg_z0
-    return {"root_link_pos_w": root, "projected_gravity_b": pg}
+    out = {"root_link_pos_w": root, "projected_gravity_b": pg}
+    if joint_pos0 is not None:
+        j = np.zeros((n_steps, n_envs, len(joint_pos0)), dtype=np.float32)
+        j[:, :, :] = np.asarray(joint_pos0, dtype=np.float32)
+        out["joint_pos"] = j
+    return out
 
 
 def _single_iter_sculpt_run(
     *, z0: float, pg_z0: float, mean_return: float = 0.9, fitness: float = 5.0,
+    joint_pos0=None,
 ):
     """Build a `sculpt_run` stand-in that produces exactly one
     checkpointed iteration whose rollout has the given frame-0 pose."""
@@ -4748,7 +4919,8 @@ def _single_iter_sculpt_run(
                 "n_episodes": 1, "mean_return": mean_return,
                 "mean_episode_length": 400.0, "max_episode_length": 500,
             },
-            trajectory=_make_pose_trajectory(z0=z0, pg_z0=pg_z0),
+            trajectory=_make_pose_trajectory(
+                z0=z0, pg_z0=pg_z0, joint_pos0=joint_pos0),
         )
         outcome = IterOutcome(
             iter_index=1, iter_dir=iter_dir,
@@ -4897,6 +5069,183 @@ def test_start_state_gate_noop_when_eval_reset_absent(
     assert gate_events[0]["skipped"] is True
     assert gate_events[0]["expected_z"] is None
     assert gate_events[0]["expected_pg_z"] is None
+
+
+# ── §F1 (adversarial-audit finding): posture check near standing height ──
+def test_start_state_gate_posture_check_rejects_standing_joints(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """§F1: a STANDING-joints rollout whose z/pg alone sit inside the old
+    tolerances (expected_z 0.60, near-upright pg) must now be caught by
+    the posture check when the stage's eval_reset carries a crouch-shaped
+    `reset_joint_pos_target`. Straight-leg joints (near 0) vs a deep
+    crouch target ([0.8, -0.6, 0.5]) give a mean joint error of ~0.63 rad,
+    comfortably over the 0.45 rad tolerance."""
+    from sculptor import sculpt as sculpt_mod
+
+    m = _make_mission(tmp_path, n_stages=1)
+    m.stages[0].success_criterion = "behavior['mean_return'] > 0.8"
+    _write_eval_reset(
+        m.stage_dir("stage_0"),
+        reset_height_offset_m=-0.14,   # expected_z = 0.74 - 0.14 = 0.60
+        reset_pitch_offset_rad=0.0,
+        reset_roll_offset_rad=0.0,     # expected_pg_z = -1.0 (upright)
+        reset_joint_pos_target=[0.8, -0.6, 0.5],
+    )
+
+    monkeypatch.setattr(
+        sculpt_mod, "sculpt_run",
+        _single_iter_sculpt_run(
+            z0=0.60, pg_z0=-0.95,      # z/pg alone WOULD pass
+            joint_pos0=[0.0, 0.0, 0.0],  # straight-leg/standing joints
+        ),
+    )
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit)
+
+    def fake_parse(*a, **kw):
+        raise AssertionError(
+            "redecompose_stage must NOT fire for start_state_mismatch")
+    import sculptor.decompose as dmod
+    monkeypatch.setattr(dmod, "_parse_with_retry", fake_parse)
+
+    events: list[dict] = []
+    result = sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab", on_event=events.append)
+
+    sr = result.stage_results[0]
+    assert sr.status == "failed"
+    assert sr.failure_reason == "start_state_mismatch"
+
+    gate_events = [e for e in events if e["type"] == "stage_start_state_gate"]
+    assert len(gate_events) == 1
+    assert gate_events[0]["checked"] == 1
+    assert gate_events[0]["mismatched"] == 1
+    assert gate_events[0]["example_measured_joint_err"] == pytest.approx(
+        0.6333, abs=1e-3)
+
+    failed_events = [e for e in events if e["type"] == "stage_failed"]
+    assert "mean joint error" in failed_events[0]["detail"]
+
+
+def test_start_state_gate_posture_check_passes_matching_joints(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """§F1 counterpart: the SAME expected_z/pg and crouch
+    `reset_joint_pos_target`, but the candidate's joints actually match
+    the crouch target — the posture check passes and the stage
+    succeeds normally."""
+    from sculptor import sculpt as sculpt_mod
+
+    m = _make_mission(tmp_path, n_stages=1)
+    m.stages[0].success_criterion = "behavior['mean_return'] > 0.8"
+    _write_eval_reset(
+        m.stage_dir("stage_0"),
+        reset_height_offset_m=-0.14,
+        reset_pitch_offset_rad=0.0,
+        reset_roll_offset_rad=0.0,
+        reset_joint_pos_target=[0.8, -0.6, 0.5],
+    )
+
+    monkeypatch.setattr(
+        sculpt_mod, "sculpt_run",
+        _single_iter_sculpt_run(
+            z0=0.60, pg_z0=-0.95,
+            joint_pos0=[0.8, -0.6, 0.5],  # matches the crouch target
+        ),
+    )
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit)
+
+    events: list[dict] = []
+    result = sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab", on_event=events.append)
+
+    sr = result.stage_results[0]
+    assert sr.status == "succeeded"
+    assert sr.criterion_satisfied is True
+
+    gate_events = [e for e in events if e["type"] == "stage_start_state_gate"]
+    assert len(gate_events) == 1
+    assert gate_events[0]["checked"] == 1
+    assert gate_events[0]["mismatched"] == 0
+    assert gate_events[0]["example_measured_joint_err"] == pytest.approx(
+        0.0, abs=1e-6)
+
+
+# ── §F6 (adversarial-audit finding): gate fails open on zero candidates ──
+def test_start_state_gate_fails_closed_when_no_candidate_verifiable(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """§F6: `eval_reset.json` exists, but the only checkpointed
+    candidate's trajectory has no `root_link_pos_w`/`projected_gravity_b`
+    at all (e.g. a fixed-base/Cartpole-shaped rollout, or a genuinely
+    malformed npz) — the gate's `checked` stays 0. A criterion-passing
+    candidate the gate could never actually verify must NOT be treated
+    as a match (the pre-fix fail-open behavior) — the stage fails
+    `start_state_mismatch` instead of trivially succeeding."""
+    from sculptor import sculpt as sculpt_mod
+    from sculptor.sculpt import IterOutcome, SculptRunResult
+
+    m = _make_mission(tmp_path, n_stages=1)
+    m.stages[0].success_criterion = "behavior['mean_return'] > 0.8"
+    _write_eval_reset(m.stage_dir("stage_0"))
+
+    def fake(*, config_path, behavior_goal, iterations=3, **_kw):
+        project = Path(config_path).parent
+        iter_dir = project / "runs" / "iter_1"
+        iter_dir.mkdir(parents=True, exist_ok=True)
+        (iter_dir / "checkpoint.pt").write_bytes(b"fake-ckpt")
+        _fabricate_rollout_artifacts(
+            iter_dir,
+            behavior={
+                "n_episodes": 1, "mean_return": 0.9,
+                "mean_episode_length": 400.0, "max_episode_length": 500,
+            },
+            # No root_link_pos_w / projected_gravity_b at all — the gate
+            # cannot check this candidate; `checked` stays 0.
+            trajectory={"rewards": np.array([1.0, 2.0, 3.0], dtype=np.float32)},
+        )
+        outcome = IterOutcome(
+            iter_index=1, iter_dir=iter_dir,
+            reward_path_before=project / "rewards" / "v1.py",
+            reward_path_after=project / "rewards" / "v2.py",
+            primary_metric=0.9, behavior={"mean_return": 0.9},
+            failure_modes=[], edit_count=0, fitness=5.0, steer_fitness=5.0,
+        )
+        return SculptRunResult(
+            iterations_run=1, completed_iters=[outcome],
+            primary_metric_history=[0.9],
+        )
+
+    monkeypatch.setattr(sculpt_mod, "sculpt_run", fake)
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit)
+
+    def fake_parse(*a, **kw):
+        raise AssertionError(
+            "redecompose_stage must NOT fire for start_state_mismatch")
+    import sculptor.decompose as dmod
+    monkeypatch.setattr(dmod, "_parse_with_retry", fake_parse)
+
+    events: list[dict] = []
+    result = sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab", on_event=events.append)
+
+    sr = result.stage_results[0]
+    assert sr.status == "failed"
+    assert sr.failure_reason == "start_state_mismatch"
+    assert sr.criterion_satisfied is False
+
+    gate_events = [e for e in events if e["type"] == "stage_start_state_gate"]
+    assert len(gate_events) == 1
+    assert gate_events[0]["checked"] == 0
+    assert gate_events[0]["skipped"] is False
+
+    failed_events = [e for e in events if e["type"] == "stage_failed"]
+    assert len(failed_events) == 1
+    assert failed_events[0]["reason"] == "start_state_mismatch"
+    assert "could not verify any candidate" in failed_events[0]["detail"]
 
 
 def test_evaluate_start_state_gate_corrupt_json_is_noop(tmp_path: Path):

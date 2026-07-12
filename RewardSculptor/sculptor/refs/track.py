@@ -792,12 +792,25 @@ def verify_tierd_certificate(
          edited/hand-set `tier="D"` with stale or absent stats fails
          this check).
       3. `provenance.tier == "D"`.
-      4. `tierD.rollout_path` is set AND the file exists on disk AND its
-         SHA-256 matches `tierD.rollout_sha256` — the tracking-rollout
-         artifact is what it claims to be.
+      4. `tierD.rollout_path` RESOLVES INSIDE the library root (`root`,
+         defaulting to `library.references_root()`) — rejects a
+         hand-edited provenance.json that points the artifact at an
+         arbitrary path elsewhere on disk (§F7) — AND the file exists
+         on disk AND its SHA-256 matches `tierD.rollout_sha256` — the
+         tracking-rollout artifact is what it claims to be.
       5. `tierD.clip_content_sha256` (recorded at tracking time) matches
          the clip's CURRENT `provenance.content_sha256` — the clip was
          not re-ingested/edited after certification without re-tracking.
+      6. §F7 (adversarial-audit finding): checks 5 above only compares
+         two FIELDS of the SAME provenance.json — a provenance.json
+         hand-edited to carry matching-but-wrong hashes in both fields
+         would sail through it. This additionally recomputes the
+         sha256 of the CURRENT `clip.npz` bytes on disk and requires it
+         to equal `tierD.clip_content_sha256` (which, having passed
+         check 5, also equals `provenance.content_sha256`) — binding
+         the claim to the real clip bytes, not just internally
+         self-consistent metadata. A missing/unreadable clip.npz is a
+         distinct denial reason, not a crash.
 
     See `TierDCertificate`'s docstring for the residual trust assumption
     this does and does not cover."""
@@ -844,6 +857,25 @@ def verify_tierd_certificate(
     if not rollout_path_str:
         return None, f"{prefix}: tierD block has no rollout_path recorded"
     rollout_path = Path(rollout_path_str)
+
+    # §F7 containment check: `rollout_path` must resolve INSIDE the
+    # library root — reject a hand-edited provenance.json that points
+    # this at an arbitrary file elsewhere on disk (path traversal via
+    # `../`, an absolute path outside root, or a symlink escape).
+    # Resolution (not just string prefixing) so `..` segments and
+    # symlinks are normalized before the containment check.
+    effective_root = Path(root) if root is not None else library.references_root()
+    try:
+        resolved_root = effective_root.resolve()
+        resolved_rollout = rollout_path.resolve()
+    except OSError as e:
+        return None, f"{prefix}: cannot resolve rollout_path/library root: {e}"
+    if resolved_rollout != resolved_root and not resolved_rollout.is_relative_to(
+            resolved_root):
+        return None, (
+            f"{prefix}: tierD.rollout_path {rollout_path} resolves outside "
+            f"the library root {effective_root} — refusing (path traversal)")
+
     if not rollout_path.is_file():
         return None, (
             f"{prefix}: tracking-rollout artifact missing on disk: "
@@ -872,6 +904,25 @@ def verify_tierd_certificate(
             f"at tracking time ({recorded_clip_sha[:12]}…); the clip was "
             "likely re-ingested/edited after certification without "
             "re-tracking")
+
+    # Check 6 (§F7): re-derive from the REAL clip.npz bytes on disk —
+    # checks above only compared two fields of the same provenance.json,
+    # which a hand-edited file could keep mutually consistent (both
+    # wrong) without ever touching the clip. This closes the loop to
+    # ground truth.
+    clip_path = library.clip_dir(robot, clip_id, root=root) / library.CLIP_FILENAME
+    try:
+        actual_clip_sha = library.content_sha256(clip_path.read_bytes())
+    except OSError as e:
+        return None, (
+            f"{prefix}: cannot read clip.npz to verify content hash: "
+            f"{type(e).__name__}: {e}")
+    if actual_clip_sha != recorded_clip_sha:
+        return None, (
+            f"{prefix}: clip.npz on-disk bytes do not match the recorded "
+            f"content hash (recorded {recorded_clip_sha[:12]}…, actual "
+            f"{actual_clip_sha[:12]}…) — the clip file was modified after "
+            "certification without re-tracking")
 
     cert = TierDCertificate(
         robot=robot,
