@@ -48,10 +48,33 @@ def compute_spec(arrays, behavior, meta):
         return {"spec_score": 0.0}
     z = root[..., 2]
     n = z.shape[0]
-    w = min(15, n)
-    first_w = z[:w].mean()
-    final_w = z[-w:].mean()
+    # start read: EARLIEST frames only (FAST-COMPLETION rule — a policy can
+    # finish the whole transition inside any wide start window); min() is a
+    # robust floor read. End read: a wide window is safe (held terminal).
+    first_w = z[:min(5, n)].min()
+    final_w = z[-min(15, n):].mean()
     rise = np.clip(final_w - first_w, 0.0, None)
+    val = float(np.clip(final_w * rise / 0.75, 0.0, 1.0))
+    return {"spec_score": val}
+'''
+
+# The live D24 defect shape, pinned: a metric whose started-away read is a
+# WIDE start-window MEAN. It passes every hold gate (prefix reads are
+# hold-invariant) but a 16x fast completion finishes INSIDE the window —
+# the completed state leaks in, the gate zeroes, reproducing the third
+# live zero-on-correct-behavior.
+WIDE_START_WINDOW_METRIC = '''import numpy as np
+def compute_spec(arrays, behavior, meta):
+    root = arrays.get("root_link_pos_w")
+    if root is None:
+        return {"spec_score": 0.0}
+    z = root[..., 2]
+    n = z.shape[0]
+    started_low = z[:min(20, n)].mean() <= 0.2
+    final_w = z[-min(15, n):].mean()
+    rise = np.clip(final_w - z[:min(20, n)].mean(), 0.0, None)
+    if not started_low or rise < 0.3:
+        return {"spec_score": 0.0}
     val = float(np.clip(final_w * rise / 0.75, 0.0, 1.0))
     return {"spec_score": val}
 '''
@@ -121,11 +144,13 @@ def test_honest_metric_clears_all_four_reference_gates(tmp_path):
 
     ref_result = v["references"][0]
     assert ref_result["clip_id"] == "getup1"
+    # _rising_clip ends settled (flat tail) -> fast_completion is GATED.
     assert ref_result["gates"] == {
         "reference_nondegeneracy": True,
         "reference_monotonicity": True,
         "reference_negatives": True,
         "reference_complete_then_hold": True,
+        "reference_fast_completion": True,
     }
     # speed_slow/speed_fast are scored + recorded but not gate keys.
     assert "speed_slow" in ref_result["scores"]
@@ -479,6 +504,43 @@ def test_fraction_window_metric_family_fails_complete_then_hold(tmp_path, k):
     reason = next(
         r for r in v["references"][0]["reasons"] if "complete_then_hold" in r)
     assert "x24" in reason
+
+
+def test_wide_start_window_metric_fails_fast_completion(tmp_path):
+    """THIRD live zero-on-correct-behavior (D24): a freshly certified
+    metric read its started-away state as a 0.5 s window MEAN; the policy
+    completed the 8.1 s righting span in ~0.5 s, the completed state
+    leaked into the window, gate zeroed a perfect rollout. The 16x
+    fast_completion positive convicts that read at certification."""
+    clip = _rising_clip()
+    p = _write(tmp_path, "wide_window.py", WIDE_START_WINDOW_METRIC)
+    v = validate_generated_metric(
+        WIDE_START_WINDOW_METRIC, p, references=[("getup1", clip)])
+    assert v["gates"]["reference_fast_completion:getup1"] is False, v["reasons"]
+    assert v["ok"] is False
+    assert "reference:getup1:fast_completion" in v["archetype_scores"]
+    reason = next(
+        r for r in v["references"][0]["reasons"] if "fast_completion" in r)
+    assert "start" in reason.lower()
+
+
+def test_fast_completion_abstains_for_non_settled_end(tmp_path):
+    """A clip still MOVING at its end (gait/rhythm shaped) must NOT gate
+    fast_completion (D3: a 16x-sped gait is a different motion; convicting
+    an honest pace-sensitive metric would be a false reject) — recorded
+    with an explicit abstain marker instead."""
+    n = _T
+    z = np.concatenate([np.full(n // 4, 0.1),
+                        0.1 + 0.65 * np.linspace(0.0, 1.0, n - n // 4)])
+    clip = {"root_pos_z": z, "fps": _FPS}  # rising to the very last frame
+    p = _write(tmp_path, "honest_moving_end.py", HONEST_GETUP)
+    v = validate_generated_metric(
+        HONEST_GETUP, p, references=[("moving_end", clip)])
+    gates = v["references"][0]["gates"]
+    assert "reference_fast_completion" not in gates
+    sc = v["references"][0]["scores"]
+    assert "fast_completion" in sc
+    assert sc.get("fast_completion_abstained") is True
 
 
 def test_hold_invariant_metric_passes_all_hold_ratios(tmp_path):

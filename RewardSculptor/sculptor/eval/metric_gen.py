@@ -96,6 +96,22 @@ def _build_reference_signature_block(
         "to one that actually achieved it — the metric must distinguish "
         "'reached the goal' from 'was already there'.")
     lines.append("")
+    lines.append("## FAST-COMPLETION RULE (hard-won rejection cause)")
+    lines.append(
+        "- The policy may complete the transition MUCH FASTER than the "
+        "reference — a real rollout finished an 8.1 s human righting span "
+        "in ~0.5 s (16x) and a certified metric zeroed it because its "
+        "start-state read was a 0.5 s WINDOW MEAN: the completed state "
+        "leaked into the 'start' window, killing both the started-away "
+        "gate and the change-amplitude floor. Start-state reads must use "
+        "the EARLIEST frames only (first 2-5 frames / <= 0.1 s) or, "
+        "better, compare against the EVAL START STATE numbers directly — "
+        "the episode is GUARANTEED to begin there; measuring 'did it "
+        "start away from the goal' over a window the policy can finish "
+        "inside is a self-zeroing bug. The metric will be scored on a "
+        "16x-sped-then-held variant of the reference and rejected if it "
+        "does not rank it with the reference (for reach-and-hold goals).")
+    lines.append("")
     return "\n".join(lines), signatures
 
 

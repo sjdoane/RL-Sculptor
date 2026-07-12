@@ -1171,7 +1171,12 @@ def _validate_references(
     Returns `(per_reference_results, all_scores)` where `all_scores` keys
     are `"reference:<id>"` / `"reference:<id>:<perturbation>"` for the
     caller's `archetype_scores`."""
-    from sculptor.refs.perturb import complete_then_hold, perturbation_suite
+    from sculptor.refs.perturb import (
+        complete_then_hold,
+        ends_settled,
+        fast_completion,
+        perturbation_suite,
+    )
 
     results: list[dict[str, Any]] = []
     all_scores: dict[str, float] = {}
@@ -1247,6 +1252,27 @@ def _validate_references(
         all_scores[f"reference:{clip_id}:complete_then_hold"] = cth_score
         pert_scores["complete_then_hold_x24"] = cth_x24_score
         all_scores[f"reference:{clip_id}:complete_then_hold_x24"] = cth_x24_score
+
+        # §D24 live finding #3: `fast_completion` — the reference sped 16x
+        # then held (motion ~5% of the trajectory). A real policy completed
+        # the 8.1 s torso-righting span in ~0.5 s and a freshly certified
+        # metric zeroed it: its start-state read was a 0.5 s WINDOW MEAN,
+        # so the completed state leaked into the "start" window. Scored for
+        # every reference; GATED only when the reference itself is
+        # reach-and-hold shaped (`ends_settled`) — pace-sensitive motions
+        # (gait/rhythm) stay record-only, preserving D3's false-reject
+        # protection in the one place it actually binds.
+        try:
+            fc_clip = fast_completion(clip)
+            fc_score, _ = _score_reference_entry(fn, fc_clip, required_roles)
+        except Exception:  # noqa: BLE001 — same convention as above
+            fc_score = float("nan")
+        try:
+            fc_gated = bool(ends_settled(clip))
+        except Exception:  # noqa: BLE001 — an unclassifiable clip abstains
+            fc_gated = False
+        pert_scores["fast_completion"] = fc_score
+        all_scores[f"reference:{clip_id}:fast_completion"] = fc_score
 
         ref_gates: dict[str, bool] = {}
         ref_reasons: list[str] = []
@@ -1333,6 +1359,31 @@ def _validate_references(
                 f"early and holds it, which scored spec 0.0; x24 exceeds the "
                 f"realistic episode/motion hold ratio, so window reads scaled "
                 f"to episode length cannot survive it)")
+
+        # §D24 live finding #3: `reference_fast_completion` — REQUIRED-HIGH
+        # positive, but ONLY for reach-and-hold-shaped references
+        # (`ends_settled`); otherwise recorded with an explicit abstain
+        # marker (D3: convicting a pace-sensitive metric on a 16x-sped
+        # gait clip would be a false reject). Threshold family identical
+        # to complete_then_hold.
+        if fc_gated:
+            fc_ok = bool(
+                finite_full and np.isfinite(fc_score)
+                and fc_score >= cth_threshold - 1e-9)
+            ref_gates["reference_fast_completion"] = fc_ok
+            if not fc_ok:
+                ref_reasons.append(
+                    f"[reference:{clip_id}] fast_completion: score "
+                    f"{fc_score:.3f} must reach {cth_threshold:.3f} "
+                    f"(max(0.5, 0.8 * full {full_score:.3f})) — the policy "
+                    f"may complete the transition MUCH faster than the "
+                    f"reference (a live rollout finished an 8.1 s righting "
+                    f"span in ~0.5 s and was zeroed): start-state reads "
+                    f"must use the EARLIEST frames or the EVAL START STATE "
+                    f"numbers, never a wide start-window mean that a fast "
+                    f"completion finishes inside")
+        else:
+            pert_scores["fast_completion_abstained"] = True
 
         # §D24 F2: `reference_settled_start` — see this function's
         # docstring for the full rationale. `eval_reset` carries the

@@ -333,3 +333,32 @@ def test_perturbation_suite_is_deterministic():
     b = perturbation_suite(clip)
     for name in a:
         np.testing.assert_array_equal(a[name]["root_pos_z"], b[name]["root_pos_z"])
+
+
+def test_fast_completion_shape_and_defaults():
+    """16x speed + 19x hold: motion ~5% of the padded trajectory — the
+    exact live D24 rollout profile (0.5 s righting in a 10 s episode)."""
+    from sculptor.refs.perturb import fast_completion, speed
+
+    clip = _clip()
+    out = fast_completion(clip)
+    sped = speed(clip, 16.0)
+    n_motion = len(sped["root_pos_z"])
+    assert len(out["root_pos_z"]) == n_motion + max(2, int(round(n_motion * 19.0)))
+    # hold frames pinned at the sped clip's final value, velocities zero
+    import numpy as np
+    assert np.allclose(out["root_pos_z"][n_motion:], sped["root_pos_z"][-1])
+    if "root_vel_z" in out:
+        assert np.allclose(out["root_vel_z"][n_motion:], 0.0)
+
+
+def test_ends_settled_classifier():
+    import numpy as np
+    from sculptor.refs.perturb import ends_settled
+
+    fps = 30.0
+    still_tail = {"root_pos_z": np.concatenate(
+        [np.linspace(0.1, 0.7, 60), np.full(30, 0.7)]), "fps": fps}
+    moving_tail = {"root_pos_z": np.linspace(0.1, 0.7, 90), "fps": fps}
+    assert ends_settled(still_tail) is True
+    assert ends_settled(moving_tail) is False

@@ -138,6 +138,63 @@ def complete_then_hold(clip: dict, hold_frac: float = 1.0) -> dict:
     return _validate_or_raise(out)
 
 
+def fast_completion(
+    clip: dict, speed_factor: float = 16.0, hold_frac: float = 19.0,
+) -> dict:
+    """The clip played at `speed_factor`x speed, then its terminal state
+    HELD for `hold_frac` times the sped motion's length — the THIRD
+    positive-exemplar shape, earned live (D24): a trained policy completed
+    an 8.1 s human torso-righting span in ~0.5 s (16x) and then held, and
+    a freshly certified metric zeroed it because its start-state read was
+    a 0.5 s WINDOW MEAN — the completed state leaked into the "start"
+    window. The defaults reproduce that live shape: 16x speed, hold 19x
+    the motion (motion ~5% of the trajectory, exactly the D23/D24 rollout
+    profile). A start read robust to this (earliest frames, or the EVAL
+    START STATE numbers) scores it like the reference; a wide-window read
+    cannot.
+
+    D3 discipline is preserved: speed variants remain UNGATED as
+    negatives (a fast completion is not a fault). This positive is gated
+    (`reference_fast_completion`) ONLY for reach-and-hold-shaped
+    references (`ends_settled`) — pace-sensitive motions (gait, rhythm)
+    are recorded, never convicted, for scoring a sped-up clip low."""
+    return complete_then_hold(speed(clip, speed_factor), hold_frac=hold_frac)
+
+
+#: `ends_settled` thresholds: the span's LAST window must be near-still in
+#: root height and (when orientation exists) in gravity_z_b. One classifier
+#: for the "reach-a-state-and-hold goal" shape assumption (D19 meta-rule).
+_ENDS_SETTLED_WINDOW_S = 0.5
+_ENDS_SETTLED_Z_RANGE_M = 0.03
+_ENDS_SETTLED_GZ_RANGE = 0.06
+
+
+def ends_settled(clip: dict) -> bool:
+    """True when the clip's final `_ENDS_SETTLED_WINDOW_S` is near-still —
+    the motion REACHES a state and stays there (get-up spans, sit-up
+    spans, reach-and-hold goals). This is the mechanical discriminator
+    that decides whether `fast_completion` is a REQUIRED positive (a
+    reach-goal completed faster is still completed) or record-only (a
+    gait/rhythm clip sped 16x is a different motion — convicting an
+    honest pace-sensitive metric on it would be the false-reject class
+    D3 exists to prevent)."""
+    z = np.asarray(clip["root_pos_z"], dtype=np.float64)
+    fps = float(clip["fps"])
+    w = max(2, int(round(_ENDS_SETTLED_WINDOW_S * fps)))
+    w = min(w, z.shape[0])
+    tail_z = z[-w:]
+    if float(tail_z.max() - tail_z.min()) > _ENDS_SETTLED_Z_RANGE_M:
+        return False
+    quat = clip.get("root_quat_wxyz")
+    if quat is not None:
+        from sculptor.refs.convert import _projected_gravity_b
+
+        g_z = _projected_gravity_b(np.asarray(quat))[-w:, 2]
+        if float(g_z.max() - g_z.min()) > _ENDS_SETTLED_GZ_RANGE:
+            return False
+    return True
+
+
 def settled_start_hold(
     clip: dict, *, z: float, pitch: Optional[float] = None,
     roll: Optional[float] = None, hold_s: float = 0.5,
