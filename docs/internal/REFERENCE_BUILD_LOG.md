@@ -548,6 +548,20 @@ pointers cleared in mission.json. Note: the whole-mission pass's
 metrics — only the per-stage regen path re-evaluates; deferred below.
 
 ### Deferred findings (logged, not yet fixed)
+- D27 live findings (first user-driven decompose, g1-standing-up
+  2026-07-12): (a) retrieval auto-attached a PRONE-start clip
+  (a10_lie_to_crouch, start-window g_x +0.955) to a SUPINE stage — the
+  clip-pose QC correctly refuses every span; the fix is a clip swap, not
+  regeneration (same retrieval-quality family as above; consider a
+  start-pose filter in retrieval itself). (b) GRAB "poses_120" clips
+  carry NORMALIZED root heights (d13_crouch_to_ready: crouch start
+  z=0.0, standing plateau 0.39 vs real 0.47->0.78) — span selection now
+  handles it (no-headroom guard, 6a50cdb) and criterion re-grounding
+  produced direction-safe numbers, but the metric author failed
+  monotonicity+settled_start twice against the normalized signature;
+  ingest should either denormalize (absolute-anchor like D19's offset
+  math) or stamp a `heights_normalized` flag into the signature so
+  authors are warned.
 - D26a follow-ups: feet_under_crouch needs a better reference binding
   (its lie-to-crouch clip never reaches the stage's height band — same
   family as the auto-retrieval-quality item below); drive_to_stand needs
