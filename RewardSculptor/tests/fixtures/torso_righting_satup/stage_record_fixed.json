@@ -1,0 +1,9 @@
+{
+  "goal_text": "Starting supine (lying flat on the back), rotate and push the torso up off the ground into an upright-torso floor-sitting posture: the chest turns upright while the pelvis stays near the ground. This stage does NOT rise toward a crouch or standing - raising the root belongs to the later stages.",
+  "success_criterion": "(trajectory['root_height'] > 0.12).mean() > 0.25 and (trajectory['projected_gravity_b'][..., 2] < -0.5).mean() > 0.25 and components.get('righting_progress', 0.0) > 0.2",
+  "reference_clip_id": "fallandgetup2_subject3--seg00",
+  "reference_span_start_s": 0.0,
+  "reference_span_end_s": 8.1,
+  "reference_span_confidence": 0.85,
+  "reference_span_method": "llm+snap+qc"
+}

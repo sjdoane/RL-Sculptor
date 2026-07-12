@@ -415,6 +415,62 @@ Gates: sculptor 1798 passed / 2 skipped (both pre-existing/expected — jax
 unavailable, the sibling F2/F3/F4 worker's not-yet-landed golden metric
 snapshot); backend 519 passed; frontend typecheck+build green.
 
+### D25. Live repair of torso_righting: four regen runs, three NEW classes closed, spec 0.0 -> 1.0
+Running the D24 pipeline against the real g1-standing mission was itself
+the decisive test — each regen run exposed a class no offline test had:
+
+1. **Regen #1 — empty LLM response** (06b09c2): span_select's 1024-token
+   budget was consumed ENTIRELY by fable-5's thinking block (usage showed
+   output_tokens == 1024, zero text blocks) -> '' -> cryptic
+   parse_error:JSONDecodeError char 0, silent full-clip fallback. Budget
+   -> 4096 (sized like retrieve 2048 / decompose 8000); empty text is now
+   its own retryable `empty_response` infra reason, pinned by test.
+2. **Regen #2 — coherently-wrong span from contaminated goal_text**
+   (d6c5cec): the selector picked the RISE phase (5.3-9.77 s, conf 0.72)
+   for the sit-up goal because the stage's own goal_text contains the
+   blind-decompose invention "raising the root above ~0.35 m" — the
+   end-state self-consistency QC passed (the LLM honestly described the
+   span it chose; it chose from a defective description). ALSO: the
+   criterion re-grounding returned components.get('righting_progress',
+   1.0) — a FAIL-OPEN default vacuously deleting a criterion leg; the
+   mechanical check now evaluates every components conjunct with an
+   EMPTY components dict and rejects if it passes. Systemic fixes:
+   decompose rule 11 / redecompose rule 6 — goal_text is QUALITATIVE (no
+   invented numbers; numbers only if copied from a reference signature;
+   state what the stage does NOT do). Live mission's goal_text repaired
+   in place (original in mission.json.pre_d24_repair.bak).
+3. **Regen #3 — fast completion vs start-window reads** (15a27f3): with
+   the CORRECT span (0-8.1 s, conf 0.85), grounded thresholds, and the
+   eval-start numbers in context, the freshly certified metric STILL
+   zeroed the live rollout (progress 0.96, spec 0.0): its started-away
+   read was a 0.5 s window MEAN and the policy completes the 8.1 s human
+   righting span in ~0.5 s (16x) — the completed state leaked into the
+   "start" window. New positive `fast_completion` (speed x16 then hold
+   x19: motion ~5% of trajectory, the exact live profile), REQUIRED gate
+   `reference_fast_completion` ONLY for reach-and-hold-shaped references
+   (`ends_settled`, one classifier per D19); pace-sensitive clips stay
+   record-only with an explicit abstain (D3's false-reject protection
+   preserved where it binds). FAST-COMPLETION authoring rule: start
+   reads = earliest frames or the EVAL START STATE numbers.
+4. **Regen #4 — CLOSED.** Metric accepted with ALL SIX reference gates
+   green (nondegeneracy, monotonicity, negatives, complete_then_hold
+   x1+x24, settled_start, fast_completion — every positive at 1.0);
+   criterion re-grounded to achievable numbers (root_height > 0.12,
+   fail-closed component default); span 0-8.1 s persisted. The metric
+   scores the live sat-up rollouts **spec 1.0 / progress 1.0** (iter_0
+   fixture AND iter_1 full 64-env) — 0.0 this morning. Golden regression
+   active: tests/test_torso_righting_regression.py pins as-shipped 0.0
+   AND fixed >= 0.5 (metric_fixed.py + meta_fixed.json +
+   stage_record_fixed.json snapshotted in the fixture).
+
+Meta-lesson (fourth-earned): synthetic batteries converge only when
+their variants BRACKET the live operating envelope — hold length (x24 >
+realistic 19x), completion speed (x16 = observed), start state (settled
+scalars) — envelope-bounded gates, not arms races. And offline-green is
+not live-green: every one of the three classes above shipped through a
+fully green suite and was caught only by running the real pipeline
+against the real mission.
+
 ### Deferred findings (logged, not yet fixed)
 - Steer ENFORCEMENT unification: reference-calibration trust is computed
   and event-recorded in mission_metrics, but the live steer/observe gate
