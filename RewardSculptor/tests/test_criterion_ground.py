@@ -91,10 +91,37 @@ def test_corrected_criterion_passes_mechanical_verification(cropped_clip):
 
 def test_components_only_criterion_is_vacuously_accepted(cropped_clip):
     """No mechanically-checkable conjunct exists (the whole expression is
-    a single `components...` clause) — accepted on trust, nothing to
-    verify."""
+    a single fail-closed `components...` clause) — accepted on trust,
+    nothing to verify."""
     reason = _mechanically_verify_criterion_on_clip(
         "components.get('righting_progress', 0.0) > 0.2", cropped_clip)
+    assert reason is None
+
+
+def test_fail_open_components_default_is_rejected(cropped_clip):
+    """LIVE FINDING (first real criterion_ground call): the rewrite came
+    back with `components.get('righting_progress', 1.0) > 0.2` — a
+    default that makes the conjunct vacuously True whenever the
+    component is missing, silently deleting one leg of the criterion.
+    Components conjuncts must be FAIL-CLOSED: evaluated with an empty
+    components dict they must NOT pass."""
+    reason = _mechanically_verify_criterion_on_clip(
+        "components.get('righting_progress', 1.0) > 0.2", cropped_clip)
+    assert reason is not None
+    assert "FAIL-OPEN" in reason
+
+    # Mixed criterion: a healthy trajectory conjunct does not rescue a
+    # fail-open components conjunct.
+    reason = _mechanically_verify_criterion_on_clip(
+        "(trajectory['root_height'] > 0.05).mean() > 0.1 and "
+        "components.get('x', 2.0) > 1.0",
+        cropped_clip)
+    assert reason is not None
+    assert "FAIL-OPEN" in reason
+
+    # components['x'] raises on missing — fail-closed, still skipped.
+    reason = _mechanically_verify_criterion_on_clip(
+        "components['righting_progress'] > 0.2", cropped_clip)
     assert reason is None
 
 

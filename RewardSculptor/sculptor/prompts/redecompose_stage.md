@@ -88,6 +88,13 @@ hopefully softened enough for it to succeed.
 6. **Last sub-stage's goal_text** should clearly accomplish the
    original goal (use similar verbs and domain nouns). It does NOT
    need to be byte-identical — Claude may reword for clarity.
+   **No invented numeric thresholds in any sub-stage's `goal_text`**
+   (same rule as decompose rule 11): describe behavior qualitatively
+   and say what the sub-stage does NOT do; a guessed number propagates
+   into the criterion, metric, and reference-span selection (live D23:
+   an invented "root above ~0.35 m" made a correct floor-sit score
+   zero by construction). Numbers only if copied from a provided
+   reference signature for the motion THIS sub-stage covers.
 
 7. **Each sub-stage's `reward_seed_prompt`** must describe a reward
    that is EXPLICITLY SIMPLER than the failed stage's reward. State

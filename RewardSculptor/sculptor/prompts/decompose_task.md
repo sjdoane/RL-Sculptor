@@ -234,6 +234,23 @@ and stages warm-start from previous stages where possible.
       signature whose `root_z.start` is well below standing height is
       evidence for a lying/crouched `start_pose`, not `"standing"`.
 
+11. **No invented numeric thresholds in `goal_text`.** Describe each
+    stage's behavior QUALITATIVELY (poses, motion, what changes, what
+    stays put). Do NOT put guessed numbers ("raising the root above
+    ~0.35 m") into `goal_text`: a wrong guess propagates into the
+    success criterion, the certified metric, and the reference span
+    selection, and a physically correct rollout then scores zero
+    (live D23 failure: a floor-sit keeps the pelvis at ~0.14 m — the
+    invented 0.35 made a perfect sit-up unpassable by construction).
+    Numbers enter later, grounded against the stage's reference clip
+    (criterion re-grounding + metric certification). The ONLY numbers
+    allowed in `goal_text` are ones copied verbatim from a provided
+    REFERENCE MOTION SIGNATURES block, and only for the span of motion
+    THIS stage actually covers. State clearly what the stage does NOT
+    do (e.g. "the pelvis stays near the ground; rising toward crouch
+    or standing belongs to a later stage") — downstream consumers use
+    that to pick the right reference sub-span.
+
 ## Stage-design guidance
 
   * **Never spend a stage on standing / staying upright.** The robot already

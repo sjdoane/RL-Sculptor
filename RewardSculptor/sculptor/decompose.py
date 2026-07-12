@@ -1666,7 +1666,35 @@ def _mechanically_verify_criterion_on_clip(
 
     for conjunct in _split_top_level_and(tree):
         if not _conjunct_is_component_free(conjunct):
-            continue  # unverifiable at cert time — skipped, not evaluated
+            # Unverifiable at cert time (no reward has run against this
+            # clip) — but it must still be FAIL-CLOSED: evaluated with an
+            # EMPTY components dict, the conjunct must NOT pass. A live
+            # re-grounding call produced `components.get('x', 1.0) > 0.2`
+            # — a default that makes the conjunct vacuously True whenever
+            # the component is missing, silently deleting one leg of the
+            # success criterion. Fail-closed defaults (the 0.0 the
+            # original blind-authored criteria use) evaluate False here
+            # and are skipped as before; raising (components['x']) is
+            # also fail-closed and fine.
+            expr = ast.fix_missing_locations(ast.Expression(body=conjunct))
+            try:
+                compiled = compile(expr, "<criterion-conjunct>", "eval")
+                empty_ns = dict(namespace)
+                empty_ns["components"] = {}
+                vacuous = bool(eval(  # noqa: S307 — same trusted-namespace contract
+                    compiled, {"__builtins__": __builtins__}, empty_ns))
+            except Exception:  # noqa: BLE001 — raising on missing = fail-closed
+                vacuous = False
+            if vacuous:
+                try:
+                    rendered = ast.unparse(conjunct)
+                except Exception:  # noqa: BLE001
+                    rendered = "<unparseable conjunct>"
+                return (
+                    "components conjunct is FAIL-OPEN (evaluates True with "
+                    f"no components at all — its default vacuously passes): "
+                    f"{rendered}")
+            continue
         expr = ast.fix_missing_locations(ast.Expression(body=conjunct))
         try:
             compiled = compile(expr, "<criterion-conjunct>", "eval")
