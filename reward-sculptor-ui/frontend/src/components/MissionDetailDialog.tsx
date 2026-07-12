@@ -472,6 +472,7 @@ function ReferenceRow({
           missionSlug={missionSlug}
           stageName={stage.name}
           currentClipId={stage.reference_clip_id}
+          initialQuery={stage.goal_text}
           onClose={() => setPickerOpen(false)}
         />
       )}

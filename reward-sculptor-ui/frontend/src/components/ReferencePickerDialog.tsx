@@ -104,6 +104,7 @@ export function ReferencePickerDialog({
   missionSlug,
   stageName,
   currentClipId,
+  initialQuery,
   onClose,
 }: {
   slug: string;
@@ -112,10 +113,15 @@ export function ReferencePickerDialog({
   /** Currently attached clip, if any — pre-selects it so re-opening the
    *  picker on an already-attached stage shows the existing choice. */
   currentClipId?: string | null;
+  /** Stage goal text used to seed the search on open. With a 6k-clip
+   *  library, the no-query browse listing leads with alphabetical
+   *  noise (0000_motorcycle…) — opening pre-searched on the stage's
+   *  own goal surfaces relevant clips immediately. */
+  initialQuery?: string;
   onClose: () => void;
 }) {
-  const [queryInput, setQueryInput] = useState("");
-  const [debouncedQuery, setDebouncedQuery] = useState("");
+  const [queryInput, setQueryInput] = useState(initialQuery ?? "");
+  const [debouncedQuery, setDebouncedQuery] = useState(initialQuery ?? "");
   useEffect(() => {
     const id = setTimeout(() => setDebouncedQuery(queryInput), SEARCH_DEBOUNCE_MS);
     return () => clearTimeout(id);
