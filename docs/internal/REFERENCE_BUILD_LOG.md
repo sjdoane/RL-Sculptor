@@ -212,6 +212,53 @@ lying resets 0.10-0.24 m. Meta-rule (now thrice-earned): every
 assumption about clip SHAPE must live in exactly one classifier with QC
 enforcement, or the next clip shape silently breaks a consumer.
 
+### D20. Overnight mission post-mortem: redecomposition drops the reference binding (job_2b0265c81e5c83b0)
+
+Observed: the get-up mission "completed" with stage_success_rate 1.0, but
+late iterations show the robot STARTING STANDING (root_h 0.79 m, pg_z −1.0
+at frame 0), sometimes hopping. Reconstruction from the 176 MB execute log
++ per-stage env artifacts + rollout trajectories:
+
+1. **The D17/D19 fixes WORKED.** Job started 2026-07-09 20:11 (after
+   a9cb73a 19:18). Original stages 2-4 each scaffolded correct lying RSI
+   from their attached clips (v0.json: negative height offsets to
+   0.10-0.24 m absolute, pitch/roll offsets, 29-joint posture, fell_over
+   removed, low sunk) AND stage-fixed eval resets (eval_reset.json
+   written; runner logged "eval reset: reference-derived lying start").
+   Trajectory frame-0 root_h 0.13-0.31 m on train AND eval. Verified.
+2. **Stages 2-4 honestly FAILED their criteria** (criterion_not_met after
+   3-5 iters each) — getting up is hard; that is the real research signal.
+3. **Each failure triggered redecomposition, and `redecompose_stage`
+   builds sub-stages with NO reference binding** (decompose.py ~1130: the
+   Stage() call sets steering_metric + LLM-chosen needs_reference_rsi but
+   never reference_clip_id/tier/confidence, and redecompose runs no
+   retrieval pass — unlike decompose_task, which attaches refs).
+4. **The scaffold fallback silently substituted the wrong task class**:
+   needs_reference_rsi=True + reference_clip_id=None fell through the
+   precedence chain (stage clip → project jump.npz → procedural jump,
+   sculpt.py ~4590) to `procedural:jump` — reset offsets [0, +0.35] m
+   ABOVE standing, vz ±2.4 m/s, sunk 0.5 m. That IS the observed
+   "starts standing, hops". derive_eval_reset(jump) = None → no
+   eval_reset.json → eval also standing. feet_under_crouch__r1_* got
+   needs_reference_rsi=False from the LLM → no env spec at all → default
+   standing reset.
+5. **The last line of defense saw it and was overruled**: the certified
+   reference-anchored metrics scored fitness 0.0 on every standing
+   rollout (start-low gates working as designed), but stage success used
+   the LLM trajectory criterion (root_height/upright/episode-length — no
+   start-state clause), trivially satisfied from standing.
+   stage_final_selection: criterion_pass=true, fitness=0.0 → "succeeded"
+   ×9. Hollow mission "success".
+
+Root cause: stage↔reference binding is not preserved across
+redecomposition, and two silent fallbacks (procedural-jump RSI, default
+standing reset) plus start-state-blind criteria let the wrong start
+state masquerade as success. Fixes (D21): (a) sub-stages inherit the
+failed stage's reference binding; (b) needs_reference_rsi with no
+resolvable clip must not silently fall back across task class; (c) a
+MECHANICAL start-state gate — when a stage has eval_reset.json, success
+requires the eval rollout's frame-0 state to match it within tolerance.
+
 ### Audit findings deferred (logged, not yet fixed)
 - Tier-D spoofing (LOW, latent): calibrate_metric_against_reference's
   `tier` arg comes from caller/provenance (user-writable) — no production
