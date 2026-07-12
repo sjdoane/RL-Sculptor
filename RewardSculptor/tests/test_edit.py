@@ -1502,3 +1502,154 @@ def test_apply_edits_best_of_k_all_invalid_falls_back_to_retry(v0_path, kg):
     assert len(client.messages.calls) == 3
     retry_msg = client.messages.calls[2]["messages"][0]["content"]
     assert "VALIDATION_ERRORS_ON_PREVIOUS_ATTEMPT" in retry_msg
+
+
+# ── §reference-grounded edit: REFERENCE MOTION SIGNATURE block ────────────
+def _write_reference_signature(stage_dir: Path, **overrides) -> None:
+    payload = {
+        "schema": 1,
+        "clip_id": "g1_jump_ref_01",
+        "robot": "g1",
+        "tier": "K",
+        "text": "Reference standing long jump.",
+        "signature": {
+            "duration_s": 1.8,
+            "fps": 30.0,
+            "n_frames": 54,
+            "root_z": {
+                "start": 0.1, "end": 0.72, "min": 0.1, "min_t": 0.0,
+                "max": 0.72, "max_t": 1.5,
+            },
+            "root_velocity_mps": {"min": -0.2, "max": 1.4},
+            "phases": [
+                {"phase": "rising", "t_start": 0.0, "t_end": 1.5,
+                 "z_start": 0.1, "z_end": 0.72},
+            ],
+        },
+    }
+    payload.update(overrides)
+    (stage_dir / "reference_signature.json").write_text(
+        json.dumps(payload), encoding="utf-8")
+
+
+def test_apply_edits_injects_reference_signature_when_stage_dir_has_file(
+    v0_path, kg,
+):
+    """`<stage_dir>/reference_signature.json` (stage_dir = v0_path's
+    grandparent, i.e. `rewards/`'s parent) present -> the edit_rewriter
+    prompt must carry a `# REFERENCE MOTION SIGNATURE` block with the
+    real clip numbers."""
+    stage_dir = v0_path.parents[1]
+    _write_reference_signature(stage_dir)
+
+    import hashlib
+
+    from sculptor.kg.query import cite
+
+    parent_hash = hashlib.sha256(
+        v0_path.read_text(encoding="utf-8").encode("utf-8")).hexdigest()[:16]
+    citation = cite("1801.00690", store=kg)
+    good = _render_v1_source(parent_hash, citation)
+    client = _StubClient(good)
+
+    apply_edits(
+        current_reward_path=v0_path, diagnosis=_bok_diagnosis(),
+        new_iter_id="v1", reward_contract=_hopper_contract(),
+        kg_store=kg, client=client,
+    )
+
+    user_msg = client.messages.calls[0]["messages"][0]["content"]
+    assert "# REFERENCE MOTION SIGNATURE" in user_msg
+    assert "g1_jump_ref_01" in user_msg
+    assert "0.72" in user_msg  # root_z.max flows through verbatim
+
+
+def test_apply_edits_omits_reference_signature_when_file_missing(v0_path, kg):
+    """No reference_signature.json (plain runs, no reference attached) —
+    the block must be absent, prompt shape unchanged from before."""
+    import hashlib
+
+    from sculptor.kg.query import cite
+
+    parent_hash = hashlib.sha256(
+        v0_path.read_text(encoding="utf-8").encode("utf-8")).hexdigest()[:16]
+    citation = cite("1801.00690", store=kg)
+    good = _render_v1_source(parent_hash, citation)
+    client = _StubClient(good)
+
+    apply_edits(
+        current_reward_path=v0_path, diagnosis=_bok_diagnosis(),
+        new_iter_id="v1", reward_contract=_hopper_contract(),
+        kg_store=kg, client=client,
+    )
+
+    user_msg = client.messages.calls[0]["messages"][0]["content"]
+    assert "# REFERENCE MOTION SIGNATURE" not in user_msg
+
+
+def test_apply_edits_omits_reference_signature_when_corrupt(v0_path, kg):
+    """A corrupt/wrong-schema reference_signature.json must silently
+    no-op — never crash apply_edits(), never inject a partial block."""
+    stage_dir = v0_path.parents[1]
+    (stage_dir / "reference_signature.json").write_text(
+        "{not valid json", encoding="utf-8")
+
+    import hashlib
+
+    from sculptor.kg.query import cite
+
+    parent_hash = hashlib.sha256(
+        v0_path.read_text(encoding="utf-8").encode("utf-8")).hexdigest()[:16]
+    citation = cite("1801.00690", store=kg)
+    good = _render_v1_source(parent_hash, citation)
+    client = _StubClient(good)
+
+    out_path = apply_edits(
+        current_reward_path=v0_path, diagnosis=_bok_diagnosis(),
+        new_iter_id="v1", reward_contract=_hopper_contract(),
+        kg_store=kg, client=client,
+    )
+    assert out_path.is_file()
+
+    user_msg = client.messages.calls[0]["messages"][0]["content"]
+    assert "# REFERENCE MOTION SIGNATURE" not in user_msg
+
+
+def test_apply_prompt_edit_injects_reference_signature_when_stage_dir_has_file(
+    tmp_path, kg,
+):
+    """`apply_prompt_edit` (the Rewards-tab one-shot-prompt / v1-seed path)
+    routes through `apply_edits`, so it must inherit the same reference
+    grounding — verified end-to-end (not stubbing `apply_edits`) so this
+    catches a regression in either function."""
+    from sculptor.edit import apply_prompt_edit
+
+    rewards = tmp_path / "rewards"
+    rewards.mkdir()
+    v0 = rewards / "v0.py"
+    v0.write_text(V0_REWARD_SOURCE, encoding="utf-8")
+    (rewards / "__init__.py").write_text("", encoding="utf-8")
+    _write_reference_signature(tmp_path)
+
+    client = _StubClient(
+        "REWARD_SPEC = {}\n"
+        "def compute_reward(s, a, n, i): return 1.0, {'alive': 1.0}\n"
+    )
+
+    try:
+        apply_prompt_edit(
+            current_reward_path=v0,
+            user_prompt="add an action-rate penalty to smooth gait",
+            new_iter_id="v1",
+            reward_contract=_hopper_contract(),
+            kg_store=kg,
+            client=client,
+        )
+    except Exception:  # noqa: BLE001 — the stub response fails post-flight
+        # validation; irrelevant here, we only care what was SENT.
+        pass
+
+    assert client.messages.calls, "edit_rewriter was never called"
+    user_msg = client.messages.calls[0]["messages"][0]["content"]
+    assert "# REFERENCE MOTION SIGNATURE" in user_msg
+    assert "g1_jump_ref_01" in user_msg

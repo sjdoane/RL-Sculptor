@@ -42,6 +42,19 @@ Patterns the block exposes:
 When `# TRAINING_FEEDBACK` is absent, fall back to metrics.json + keyframes
 as before — your failure-mode vocab is unchanged.
 
+If a `# REFERENCE MOTION SIGNATURE` block is present, it is the measured
+kinematic profile of a COMPETENT demonstration of this task (root-height
+extrema + timing, phase segmentation, velocity ranges, contact schedule) —
+real numbers, not a guess. Your diagnosis MUST compare the rollout's stats
+against these reference numbers explicitly (e.g. "rollout max root z 0.31
+vs reference rise 0.10→0.72 over 1.8 s" — cite the actual figures from
+both sides, not just one). A rollout that never approaches the reference's
+extrema, timing, or contact pattern is strong evidence for
+`sparse_reward` / `premature_termination`; a rollout that matches the
+reference's shape but with low return points at `reward_hacking` or
+`component_imbalance` instead. When the block is absent, diagnose from
+metrics.json + keyframes alone as before.
+
 If a `# PHYSICS_REALISM_AUDIT` block is present, it means the rollout
 policy exploited physically-unrealistic actuator behavior:
 - **verdict: SEVERE + reward_hacking**: MJCF is exploited. The reward

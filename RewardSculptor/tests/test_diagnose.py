@@ -565,3 +565,109 @@ def test_diagnose_prefers_training_side_trajectory_over_rollout_side(
     )
     assert "from_training:" in prelim_text
     assert "from_rollout:" not in prelim_text
+
+
+# ── §reference-grounded diagnose: REFERENCE MOTION SIGNATURE block ────────
+def _write_reference_signature(stage_dir: Path, **overrides) -> None:
+    payload = {
+        "schema": 1,
+        "clip_id": "g1_jump_ref_01",
+        "robot": "g1",
+        "tier": "K",
+        "text": "Reference standing long jump.",
+        "signature": {
+            "duration_s": 1.8,
+            "fps": 30.0,
+            "n_frames": 54,
+            "root_z": {
+                "start": 0.1, "end": 0.72, "min": 0.1, "min_t": 0.0,
+                "max": 0.72, "max_t": 1.5,
+            },
+            "root_velocity_mps": {"min": -0.2, "max": 1.4},
+            "phases": [
+                {"phase": "rising", "t_start": 0.0, "t_end": 1.5,
+                 "z_start": 0.1, "z_end": 0.72},
+            ],
+        },
+    }
+    payload.update(overrides)
+    (stage_dir / "reference_signature.json").write_text(
+        json.dumps(payload), encoding="utf-8")
+
+
+def test_diagnose_injects_reference_signature_block(
+    iter_dir, config, kg_with_locomotion_tech, monkeypatch,
+):
+    """When `<stage_dir>/reference_signature.json` is present (stage_dir =
+    config.parent), both preliminary and grounded prompts must carry a
+    `# REFERENCE MOTION SIGNATURE` block with the real clip numbers."""
+    monkeypatch.setattr("sculptor.diagnose.query_semantic", lambda *a, **kw: [])
+    _write_reference_signature(config.parent)
+
+    prelim = _PreliminaryModel(
+        failure_modes=["sparse_reward"], evidence="stub", confidence=0.8)
+    grounded = _GroundedModel(proposed_edits=[], confidence=0.7)
+    client = _StubClient(prelim, grounded)
+
+    diagnose(iter_dir=iter_dir, behavior_goal="test",
+             config=config, store=kg_with_locomotion_tech, client=client)
+
+    prelim_text = "\n".join(
+        c["text"] for c in client.messages.captured_prompts[0]["messages"][0]["content"]
+        if c.get("type") == "text"
+    )
+    assert "# REFERENCE MOTION SIGNATURE" in prelim_text
+    assert "g1_jump_ref_01" in prelim_text
+    assert "0.72" in prelim_text  # root_z.max flows through verbatim
+
+    grounded_text = client.messages.captured_prompts[1]["messages"][0]["content"]
+    assert "# REFERENCE MOTION SIGNATURE" in grounded_text
+    assert "g1_jump_ref_01" in grounded_text
+
+
+def test_diagnose_omits_reference_signature_block_when_file_missing(
+    iter_dir, config, kg_with_locomotion_tech, monkeypatch,
+):
+    """No reference_signature.json (plain runs, no reference attached) —
+    the block must be absent, prompt shape unchanged from before."""
+    monkeypatch.setattr("sculptor.diagnose.query_semantic", lambda *a, **kw: [])
+    # Deliberately do NOT write reference_signature.json.
+
+    prelim = _PreliminaryModel(failure_modes=[], evidence="stub", confidence=0.5)
+    grounded = _GroundedModel(proposed_edits=[], confidence=0.5)
+    client = _StubClient(prelim, grounded)
+
+    diagnose(iter_dir=iter_dir, behavior_goal="test",
+             config=config, store=kg_with_locomotion_tech, client=client)
+
+    prelim_text = "\n".join(
+        c["text"] for c in client.messages.captured_prompts[0]["messages"][0]["content"]
+        if c.get("type") == "text"
+    )
+    assert "# REFERENCE MOTION SIGNATURE" not in prelim_text
+    grounded_text = client.messages.captured_prompts[1]["messages"][0]["content"]
+    assert "# REFERENCE MOTION SIGNATURE" not in grounded_text
+
+
+def test_diagnose_omits_reference_signature_block_when_corrupt(
+    iter_dir, config, kg_with_locomotion_tech, monkeypatch,
+):
+    """A corrupt/wrong-schema reference_signature.json must silently
+    no-op — never crash diagnose(), never inject a partial block."""
+    monkeypatch.setattr("sculptor.diagnose.query_semantic", lambda *a, **kw: [])
+    (config.parent / "reference_signature.json").write_text(
+        "{not valid json", encoding="utf-8")
+
+    prelim = _PreliminaryModel(failure_modes=[], evidence="stub", confidence=0.5)
+    grounded = _GroundedModel(proposed_edits=[], confidence=0.5)
+    client = _StubClient(prelim, grounded)
+
+    d = diagnose(iter_dir=iter_dir, behavior_goal="test",
+                 config=config, store=kg_with_locomotion_tech, client=client)
+    assert d is not None
+
+    prelim_text = "\n".join(
+        c["text"] for c in client.messages.captured_prompts[0]["messages"][0]["content"]
+        if c.get("type") == "text"
+    )
+    assert "# REFERENCE MOTION SIGNATURE" not in prelim_text

@@ -58,6 +58,30 @@ mismatches. If you want to note a citation in grounding, mirror it in
 references; if you prefer pure physics justification, leave arxiv_ids
 out of the grounding string entirely.
 
+## REFERENCE-GROUNDING (when a `# REFERENCE MOTION SIGNATURE` block is present)
+
+The block is the measured kinematic profile of a COMPETENT demonstration
+of this task — real numbers (root-height extrema + WHEN they occur, phase
+segmentation, velocity ranges, contact schedule), not a guess. When it is
+present:
+  - Numeric reward-spec fields that describe a target height, phase
+    timing, velocity scale, or gate threshold MUST be grounded in these
+    reference numbers where the reference exposes the corresponding
+    quantity (e.g. a standing-height target near `reference.root_z.max`,
+    a liftoff/landing gate timed near the matching `phases[i]` entry, a
+    velocity scale near `reference.root_velocity_mps`) rather than an
+    invented round number.
+  - `REWARD_SPEC["grounding"]` for such a field should reference the
+    specific reference figure (e.g. `"reference root_z.max=0.72 @ t=1.5s"`)
+    alongside — or instead of — an arxiv citation; this satisfies
+    requirement 3's grounding rule just as a physics-first-principles
+    justification would.
+  - When the reference doesn't cover a given quantity (e.g. it has no
+    orientation data), fall back to citations / physics first-principles
+    as usual for that field.
+When no such block is present, ground reward-spec numbers exactly as
+before (citations / physics first-principles) — this section is a no-op.
+
 ## REQUIREMENTS (all mandatory)
 
 1. Return the COMPLETE new Python module source. No markdown fences, no

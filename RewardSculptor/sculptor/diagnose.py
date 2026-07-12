@@ -472,6 +472,7 @@ def _build_preliminary_user_content(
     realism_audit: dict | None = None,
     objective_progress: dict | None = None,
     human_note: str | None = None,
+    reference_signature: dict | None = None,
 ) -> list[dict]:
     # §Ship 33: optional OBJECTIVE TASK PROGRESS block — a held-out,
     # ground-truth fitness scalar (higher = better) for THIS iter's
@@ -559,6 +560,20 @@ def _build_preliminary_user_content(
             "evidence so the physics-edit step can address it.\n"
             f"{realism_text}\n\n"
         )
+    # §reference-grounded diagnose: when the stage has a resolved reference
+    # clip, the mission scaffold wrote its kinematic signature to
+    # `<stage_dir>/reference_signature.json`. Rendered here (right next to
+    # the training/behavior stats) so the model can compare rollout numbers
+    # against the competent-motion numbers side by side instead of
+    # inventing targets. Absent reference_signature -> "" -> byte-identical
+    # to pre-this-change prompts.
+    reference_block = ""
+    if reference_signature:
+        from sculptor.reference_context import render_reference_signature_block
+
+        rendered = render_reference_signature_block(reference_signature)
+        if rendered:
+            reference_block = f"{rendered}\n\n"
     header = (
         f"# BEHAVIOR GOAL\n{behavior_goal}\n\n"
         f"{human_block}"
@@ -567,6 +582,7 @@ def _build_preliminary_user_content(
         f"{objective_block}"
         f"{feedback_block}"
         f"{realism_block}"
+        f"{reference_block}"
         f"# ADAPTER BEHAVIOR METRIC VOCABULARY\n{behavior_metric_names}\n\n"
         f"# behavior.json\n{json.dumps(behavior, indent=2, sort_keys=True, default=str)}\n\n"
         f"# REWARD_CONTRACT\n{contract_text}\n\n"
@@ -623,6 +639,7 @@ def _build_grounded_user_content(
     training_feedback: dict | None = None,
     realism_audit: dict | None = None,
     env_spec: dict | None = None,
+    reference_signature: dict | None = None,
 ) -> str:
     feedback_block = ""
     formatted = _format_training_feedback(training_feedback or {})
@@ -643,12 +660,24 @@ def _build_grounded_user_content(
             "means MJCF is likely exploited; mild means reward shape can fix it.\n"
             f"{realism_text}\n\n"
         )
+    # §reference-grounded diagnose: same block the preliminary call sees
+    # (see _build_preliminary_user_content) — the grounded call proposes
+    # edits, so it needs the same measured-vs-reference numbers to derive
+    # targets/thresholds from rather than inventing them.
+    reference_block = ""
+    if reference_signature:
+        from sculptor.reference_context import render_reference_signature_block
+
+        rendered = render_reference_signature_block(reference_signature)
+        if rendered:
+            reference_block = f"{rendered}\n\n"
     return (
         f"# BEHAVIOR GOAL\n{behavior_goal}\n\n"
         f"# REWARD_SPEC\n{json.dumps(reward_spec, indent=2, sort_keys=True, default=str)}\n\n"
         f"# metrics.json\n{json.dumps(metrics, indent=2, sort_keys=True, default=str)}\n\n"
         f"{feedback_block}"
         f"{realism_block}"
+        f"{reference_block}"
         f"{_render_env_spec_block(env_spec)}"
         f"# behavior.json\n{json.dumps(behavior, indent=2, sort_keys=True, default=str)}\n\n"
         f"# REWARD_CONTRACT\n{contract_text}\n\n"
@@ -768,6 +797,17 @@ def diagnose(
     keyframes = _pick_keyframes(iter_dir, N_KEYFRAMES_SENT)
     behavior_metric_names = _behavior_metrics_from_config(cfg)
     env_tag = _env_tag_from_config(cfg)
+    # §reference-grounded diagnose: the stage dir is the config file's
+    # parent directory. The mission scaffold writes
+    # <stage_dir>/reference_signature.json for every stage whose reference
+    # clip resolves; a plain (non-mission) run or a stage with no reference
+    # attached simply has no file, and `load_reference_signature` returns
+    # None on any problem (missing/corrupt/wrong schema) — never raises.
+    reference_signature: dict | None = None
+    if not isinstance(config, dict):
+        from sculptor.reference_context import load_reference_signature
+
+        reference_signature = load_reference_signature(Path(config))
 
     # 2. Load the adapter to get the reward_contract.
     adapter = load_adapter(Path(config)) if not isinstance(config, dict) else None
@@ -826,6 +866,7 @@ def diagnose(
         realism_audit=realism_audit,
         objective_progress=objective_progress,
         human_note=human_note,
+        reference_signature=reference_signature,
     )
     preliminary: _PreliminaryModel = _parse_with_retry(
         client, model_cls=_PreliminaryModel,
@@ -916,6 +957,7 @@ def diagnose(
             training_feedback=training_feedback,
             realism_audit=realism_audit,
             env_spec=env_spec,
+            reference_signature=reference_signature,
         )
         grounded: _GroundedModel = _parse_with_retry(
             client, model_cls=_GroundedModel,

@@ -936,6 +936,7 @@ def _build_user_prompt(
     metric_observables: "frozenset[str] | None" = None,
     screen: Any = None,
     case_context: str = "",
+    reference_signature: dict | None = None,
 ) -> str:
     edits_json = [
         {
@@ -1037,6 +1038,19 @@ def _build_user_prompt(
     # diagnoser sees; empty string when no cases match / no KG.
     case_block = f"{case_context}\n\n" if case_context else ""
 
+    # §reference-grounded edit: same "REFERENCE MOTION SIGNATURE" block
+    # diagnose.py now shows — the rewriter is where numeric targets/
+    # thresholds actually get written into code, so it needs the real
+    # competent-motion numbers too, not just the diagnosis's prose.
+    # Absent (no reference clip for this stage) → "" → byte-identical.
+    reference_block = ""
+    if reference_signature:
+        from sculptor.reference_context import render_reference_signature_block
+
+        rendered = render_reference_signature_block(reference_signature)
+        if rendered:
+            reference_block = f"{rendered}\n\n"
+
     return (
         f"# NEW_VERSION\n{new_version}\n\n"
         f"# PARENT_VERSION\n{current_version}\n\n"
@@ -1048,6 +1062,7 @@ def _build_user_prompt(
         f"evidence: {diagnosis.evidence}\n"
         f"confidence: {diagnosis.confidence:.2f}\n\n"
         f"{feedback_block}"
+        f"{reference_block}"
         f"# REWARD_CONTRACT\n"
         f"observation_space: {contract.observation_space_spec}\n"
         f"action_space:      {contract.action_space_spec}\n"
@@ -1532,6 +1547,22 @@ def apply_edits(
             print(f"[edit] case-memory query failed ({e}) — skipped.",
                   file=sys.stderr, flush=True)
 
+        # §reference-grounded edit: `<stage_dir>/rewards/vN.py` is
+        # `current_reward_path`, so the stage dir is `parents[1]`. Resolved
+        # defensively — a layout that doesn't match (no rewards/ parent, or
+        # no reference file) just leaves this None and the prompt is
+        # byte-identical to before this change. `load_reference_signature`
+        # itself never raises, but the `.parents[1]` index lookup can on a
+        # pathological short path, hence the broad except here too.
+        reference_signature: dict | None = None
+        try:
+            from sculptor.reference_context import load_reference_signature
+
+            reference_signature = load_reference_signature(
+                current_reward_path.parents[1])
+        except Exception:  # noqa: BLE001 — advisory context, never blocks an edit
+            reference_signature = None
+
         # Build prompt.
         user_prompt = _build_user_prompt(
             current_source=current_source,
@@ -1548,6 +1579,7 @@ def apply_edits(
             metric_observables=metric_observables,
             screen=plan.screen,
             case_context=case_context,
+            reference_signature=reference_signature,
         )
         if on_event is not None:
             on_event({

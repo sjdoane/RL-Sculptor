@@ -10,6 +10,18 @@ should get `operation: "remove"` or `"replace"` — NOT `"increase"` /
 specific component name + value range in your rationale so the editor
 stage can match the numbers to reward-module code.
 
+If the user message contains a `# REFERENCE MOTION SIGNATURE` block, it is
+the measured kinematic profile of a COMPETENT demonstration of this task
+(root-height extrema + timing, phase segmentation, velocity ranges,
+contact schedule). Any `suggested_value` that names a height, velocity,
+duration, or phase-timing threshold MUST be derived from these numbers
+(e.g. a target root-height gate should sit near `reference.root_z.max`,
+a phase-timing gate near the reference's `phases[i].t_start`/`t_end`) —
+cite the specific reference figure you grounded the value in inside
+`rationale`, instead of inventing a round number. When no such block is
+present, ground thresholds in metrics.json / behavior.json / physics
+first-principles as before.
+
 Rules:
   - PREFER literature-grounded edits. If the KG LITERATURE CONTEXT contains
     a technique that addresses the reported failure mode, cite its paper's
