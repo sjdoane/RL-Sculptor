@@ -4993,6 +4993,34 @@ def _run_one_stage(
     # never silently substitute a different task class. §F2: a
     # non-standing start_pose ALSO enters this block even when the
     # persisted needs_reference_rsi is (incorrectly) False.
+    # §H3 audit fix (docs/internal/REFERENCE_BUILD_LOG.md D23/D24/D25,
+    # fresh-context Opus adversarial audit): the span-derived reset
+    # numbers this scaffold writes depend on WHICH span the stage
+    # currently carries — a stale artifact derived from a DIFFERENT (or
+    # no) span must not be trusted forever just because a
+    # "reference:"-sourced env spec is already in force. Both idempotency
+    # guards below (this one and the reference_signature.json one further
+    # down) compare against a persisted span STAMP and re-derive on a
+    # mismatch. "Both None" (no span, no stamp) counts as a match — the
+    # common case for missions that never use spans at all, unchanged
+    # behavior.
+    _stage_span_stamp = {
+        "t_start_s": getattr(stage, "reference_span_start_s", None),
+        "t_end_s": getattr(stage, "reference_span_end_s", None),
+    }
+
+    def _stamped_span_matches(stamped: Optional[dict]) -> bool:
+        # A missing/absent stamp (pre-fix on-disk artifact, or a spec
+        # with no meta at all) is treated as "derived from no span" —
+        # this only produces a "mismatch" (forcing a re-derive) when the
+        # stage DOES currently carry a span, which errs toward the safe
+        # direction (a spurious but harmless re-derive) over risking a
+        # silently stale artifact.
+        s = stamped or {"t_start_s": None, "t_end_s": None}
+        return (
+            s.get("t_start_s") == _stage_span_stamp["t_start_s"]
+            and s.get("t_end_s") == _stage_span_stamp["t_end_s"])
+
     if getattr(stage, "needs_reference_rsi", False) or non_standing:
         stage_env_dir = stage_dir / "env"
         # Default True (= skip) on a read failure — preserves the
@@ -5004,9 +5032,18 @@ def _run_one_stage(
             from sculptor.env_spec import read_current_env_spec
 
             current_spec = read_current_env_spec(stage_env_dir)
-            already = (
-                str(((current_spec or {}).get("meta") or {})
-                    .get("source", "")).startswith("reference:"))
+            current_meta = (current_spec or {}).get("meta") or {}
+            already = str(current_meta.get("source", "")).startswith(
+                "reference:")
+            if already and not _stamped_span_matches(
+                    current_meta.get("derived_from_span")):
+                already = False
+                emit({
+                    "type": "stage_reference_rsi_span_changed",
+                    "stage_name": stage.name,
+                    "stamped_span": current_meta.get("derived_from_span"),
+                    "current_span": _stage_span_stamp,
+                })
         except Exception as e:  # noqa: BLE001 — curriculum, not correctness
             emit({
                 "type": "stage_reference_rsi_failed",
@@ -5014,7 +5051,8 @@ def _run_one_stage(
                 "error": f"{type(e).__name__}: {e}",
             })
         # Resume idempotency: don't stack a new env version per resume —
-        # the reference curriculum is already in force.
+        # the reference curriculum is already in force AND derived from
+        # the stage's CURRENT span (see `_stamped_span_matches` above).
         if not already:
             project_root = mission_dir.parent.parent
             robot = _stage_reference_robot_slug(
@@ -5146,6 +5184,37 @@ def _run_one_stage(
 
                 spec_path = apply_reference_rsi(
                     stage_env_dir, clip, settled_centers=settled_centers)
+                # §H3 audit fix: stamp the DERIVING span onto both the
+                # versioned spec and the `current.json` pointer
+                # `apply_reference_rsi` just wrote (env_spec.py's
+                # `write_env_spec_version` keeps them an exact copy of
+                # each other — patch both to preserve that invariant).
+                # `meta`'s inner keys are UNCONSTRAINED by
+                # `validate_env_spec` (only the top-level env-spec keys
+                # and `shared`/`train`'s inner keys are schema-checked —
+                # see `env_spec.py`'s `_TOP_KEYS`/`_SHARED_KEYS`/
+                # `_TRAIN_KEYS` allowlists), so this additive key is
+                # safe. Best-effort: a failure here only means the NEXT
+                # scaffold pass can't detect a span change for this
+                # stage and conservatively re-derives (see
+                # `_stamped_span_matches` above) — never fatal, and
+                # never touches iteration dirs or rewards.
+                try:
+                    for _p in (spec_path, stage_env_dir / "current.json"):
+                        _on_disk = json.loads(
+                            _p.read_text(encoding="utf-8"))
+                        _on_disk.setdefault("meta", {})[
+                            "derived_from_span"] = _stage_span_stamp
+                        _p.write_text(
+                            json.dumps(
+                                _on_disk, indent=2, sort_keys=True),
+                            encoding="utf-8")
+                except Exception as e:  # noqa: BLE001 — advisory bookkeeping
+                    emit({
+                        "type": "stage_reference_rsi_span_stamp_failed",
+                        "stage_name": stage.name,
+                        "error": f"{type(e).__name__}: {e}",
+                    })
                 emit({
                     "type": "stage_reference_rsi_applied",
                     "stage_name": stage.name,
@@ -5269,10 +5338,24 @@ def _run_one_stage(
     # with no RSI curriculum requested at all. Failure to resolve the
     # clip or write the file is NON-FATAL (log only) — this is
     # observability/context for a downstream consumer, never
-    # correctness. Idempotent: skipped entirely once the file exists.
+    # correctness. Idempotent: skipped once the file exists AND its
+    # persisted "span" key still matches the stage's CURRENT span
+    # fields (§H3 audit fix — a stale signature from a since-changed
+    # span must not be trusted just because a file is already there;
+    # see `_stamped_span_matches` above, same "both-None counts as
+    # match" convention).
     stage_reference_clip_id = getattr(stage, "reference_clip_id", None)
-    if stage_reference_clip_id and not (
-            stage_dir / "reference_signature.json").is_file():
+    _sig_path = stage_dir / "reference_signature.json"
+    _sig_rewrite_reason: Optional[str] = None
+    if stage_reference_clip_id and _sig_path.is_file():
+        try:
+            _existing_sig = json.loads(_sig_path.read_text(encoding="utf-8"))
+            if not _stamped_span_matches(_existing_sig.get("span")):
+                _sig_rewrite_reason = "span_changed"
+        except Exception:  # noqa: BLE001 — unreadable: rewrite, don't trust it
+            _sig_rewrite_reason = "existing_signature_unreadable"
+    if stage_reference_clip_id and (
+            not _sig_path.is_file() or _sig_rewrite_reason is not None):
         sig_span_meta: Optional[dict] = None
         try:
             project_root = mission_dir.parent.parent
@@ -5398,6 +5481,8 @@ def _run_one_stage(
                     "type": "stage_reference_signature_written",
                     "stage_name": stage.name,
                     "path": str(sig_path),
+                    **({"reason": _sig_rewrite_reason}
+                       if _sig_rewrite_reason else {}),
                 })
             except Exception as e:  # noqa: BLE001 — non-fatal (item 6)
                 emit({

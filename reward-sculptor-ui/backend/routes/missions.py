@@ -1432,6 +1432,34 @@ def regenerate_stage_metric(
                 mission = load_mission(md)
                 adapter = load_adapter(project_dir / "config.toml")
                 set_llm_log_dir(md)
+                # §H2 audit fix (docs/internal/REFERENCE_BUILD_LOG.md
+                # D23/D24/D25, fresh-context Opus adversarial audit): a
+                # user hitting "regenerate" for this stage is an
+                # EXPLICIT request for a fresh answer — clear a standing
+                # `declined:<reason>` span-selection marker
+                # (`sculptor.refs.spans.is_span_declined`) so
+                # `generate_stage_metrics`'s lazy backfill re-runs
+                # `select_reference_span` instead of treating the prior
+                # verdict as permanent. This ALSO clears
+                # `declined:whole_clip` (unlike the automatic backfill
+                # path, which never re-attempts a semantic decline) —
+                # a user manually regenerating wants a fresh look, not
+                # the frozen answer, even when that answer was "the
+                # whole clip". Persistence rides the `save_mission`
+                # call below (same discipline every other mutation this
+                # runner makes follows) — this write happens here,
+                # before `generate_stage_metrics`, rather than at
+                # enqueue time, so it stays inside the same in-process
+                # load→mutate→save sequence and never race a concurrent
+                # writer.
+                for _stage in mission.stages:
+                    if _stage.name != stage:
+                        continue
+                    _method = str(
+                        getattr(_stage, "reference_span_method", "") or "")
+                    if _method.startswith("declined:"):
+                        _stage.reference_span_method = None
+                    break
                 report = generate_stage_metrics(
                     mission,
                     robot_hint=getattr(adapter, "task_id", None),

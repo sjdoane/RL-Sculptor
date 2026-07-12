@@ -333,6 +333,37 @@ def _backfill_stage_reference_span(
     return None
 
 
+def _unresolved_span_decline_reason(stage: Any) -> Optional[str]:
+    """§H2 audit fix (docs/internal/REFERENCE_BUILD_LOG.md D23/D24/D25,
+    fresh-context Opus adversarial audit of the D24/D25 batch): every
+    span-selection decline used to funnel to full-clip certification —
+    the EXACT D23 configuration (a sub-phase stage goal certified
+    against its clip's full motion, zeroing a physically correct
+    rollout) — because `load_stage_reference_clip` returns the full clip
+    whenever no span is persisted, and a `declined:*` marker
+    (`sculptor.refs.spans.is_span_declined`) permanently blocks retry.
+
+    Returns the bare decline reason (e.g. `"low_confidence:0.42"`,
+    `"qc_reject:crop_error:..."`) when the stage's persisted
+    `reference_span_method` is a decline marker whose sub-span question
+    is UNRESOLVED — i.e. every semantic decline EXCEPT `whole_clip`.
+    `declined:whole_clip` means the LLM affirmatively judged the goal
+    covers the clip's ENTIRE motion — full-clip certification is the
+    CORRECT behavior there, so this returns `None` for it (same as "no
+    decline at all"), and the caller proceeds exactly as before.
+
+    Never raises."""
+    from sculptor.refs.spans import DECLINED_METHOD_PREFIX, is_span_declined
+
+    if not is_span_declined(stage):
+        return None
+    method = str(getattr(stage, "reference_span_method", "") or "")
+    reason = method[len(DECLINED_METHOD_PREFIX):]
+    if reason == "whole_clip":
+        return None
+    return reason
+
+
 def resolve_stage_metric_ref(ref: str, mission_dir: Path | str) -> str:
     """Anchor a mission-dir-relative generated-metric ref at the mission
     dir. Spec-metric names ("g1_kick") and absolute paths pass through
@@ -457,8 +488,77 @@ def generate_stage_metrics(
                 "clip_id": stage.reference_clip_id,
                 "reason": span_backfill_reason,
             })
+
+        # §H2 audit fix (docs/internal/REFERENCE_BUILD_LOG.md D23/D24/D25):
+        # an UNRESOLVED span decline (anything but `declined:whole_clip`)
+        # means the sub-span question was never answered — certifying
+        # against the full clip here would reproduce the exact D23 class
+        # (a sub-phase goal certified against the wrong-scope clip,
+        # zeroing a physically correct rollout). Skip generation entirely
+        # for this stage; it falls back to the mission-level
+        # `fitness_metric` (§MISSION_METRIC_GRANULARITY's existing
+        # `steering_metric or fitness_metric` resolution in sculpt.py) —
+        # criterion + start-state gate enforcement are UNAFFECTED (they
+        # never route through `steering_metric`). A user can retry via
+        # the per-stage regenerate endpoint, which clears the marker
+        # (see `reward-sculptor-ui/backend/routes/missions.py`
+        # `regenerate_stage_metric`).
+        unresolved_decline_reason = _unresolved_span_decline_reason(stage)
+        if unresolved_decline_reason is not None:
+            reject_reason = (
+                "reference span selection declined "
+                f"({unresolved_decline_reason}); refusing full-clip "
+                "certification for a possibly sub-phase goal (D23 "
+                "class); the stage will use the mission-level fallback "
+                "— re-run per-stage metric regeneration to retry span "
+                "selection"
+            )
+            reject_entry: dict[str, Any] = {
+                "stage": stage.name, "reason": reject_reason}
+            if span_backfill_reason:
+                reject_entry["reference_span_backfill_reason"] = span_backfill_reason
+            report["rejected"].append(reject_entry)
+            _emit({
+                "type": "stage_metric_gen_rejected",
+                "stage": stage.name,
+                "reason": reject_reason,
+            })
+            continue
+
         references, reference_load_error = _load_stage_reference(
             stage, robot_hint)
+
+        # §M3 audit fix (docs/internal/REFERENCE_BUILD_LOG.md, fresh-
+        # context Opus adversarial audit): an ATTACHED clip
+        # (`reference_clip_id` set) that fails to load/crop must NOT
+        # silently downgrade to an UNGATED, no-reference metric
+        # acceptance — `_load_stage_reference` catches every load/crop
+        # exception, and validation would otherwise run with zero
+        # reference gates, accepting a metric the author never intended
+        # to ship without its exemplar. A stage with NO
+        # `reference_clip_id` at all is unaffected — no-reference
+        # validation is legitimate for it (this only fires when a clip
+        # WAS attached and the load genuinely failed, i.e.
+        # `reference_load_error` is set).
+        if getattr(stage, "reference_clip_id", None) and reference_load_error is not None:
+            reject_reason = (
+                "attached reference failed to load "
+                f"({reference_load_error}); refusing certification "
+                "without its intended exemplar"
+            )
+            reject_entry = {
+                "stage": stage.name, "reason": reject_reason,
+                "reference_load_error": reference_load_error,
+            }
+            if span_backfill_reason:
+                reject_entry["reference_span_backfill_reason"] = span_backfill_reason
+            report["rejected"].append(reject_entry)
+            _emit({
+                "type": "stage_metric_gen_rejected",
+                "stage": stage.name,
+                "reason": reject_reason,
+            })
+            continue
 
         # §D24 F2 item 1: compute the stage's certified eval-reset preview
         # from the SAME (possibly cropped) clip just loaded for

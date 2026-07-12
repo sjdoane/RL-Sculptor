@@ -3373,6 +3373,145 @@ def test_stage_eval_reset_written_for_getup_stage(
                 if e["type"] == "stage_eval_reset_written"]
 
 
+def _events_of(events: list[dict], type_name: str) -> list[dict]:
+    return [e for e in events if e.get("type") == type_name]
+
+
+def test_stage_reference_rsi_rederives_when_span_changes(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """§H3 audit fix (docs/internal/REFERENCE_BUILD_LOG.md D23/D24/D25,
+    fresh-context Opus adversarial audit): the `already`/idempotency
+    guards that skip re-deriving the RSI env-spec and
+    `reference_signature.json` used to key ONLY on "is a reference
+    source already in force" / "does the file already exist" — a
+    resumed scaffold pass would keep a STALE artifact derived from a
+    span that has since changed underneath it (e.g. a span repair via
+    the per-stage regenerate endpoint). This proves the fix: a scaffold
+    pass with span A, then the SAME (still-pending) stage's span
+    changed to B, then a second scaffold pass — the env-spec version is
+    RE-STACKED, `eval_reset.json` is rewritten with the new span's
+    numbers, and `reference_signature.json` is rewritten with a
+    `"reason": "span_changed"` disclosure — never touching iteration
+    dirs or rewards.
+
+    Forces a genuine re-entry into `_run_one_stage` for the SAME stage
+    (not the trivial "succeeded stages are skipped" resume path) by
+    failing the stage's criterion on the first run — with
+    `redecomposition_attempts` pre-exhausted, `mission_run` halts
+    cleanly WITHOUT advancing `current_stage_idx`, so calling it again
+    re-scaffolds this exact stage (mirrors
+    `test_stage_reference_clip_load_failure_fails_stage`'s use of the
+    same halt-without-redecompose pattern)."""
+    from sculptor import sculpt as sculpt_mod
+    from sculptor.mission import load_mission, save_mission
+
+    lib_root = tmp_path / "reflib"
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(lib_root))
+    _write_library_clip(lib_root, "g1", "test_getup_clip")
+
+    m = _make_mission(tmp_path, n_stages=1)
+    m.stages[0].needs_reference_rsi = True
+    m.stages[0].reference_clip_id = "test_getup_clip"
+    m.stages[0].reference_span_start_s = 0.0
+    m.stages[0].reference_span_end_s = 0.5
+    m.stages[0].reference_span_confidence = 0.9
+    m.stages[0].reference_span_method = "llm+snap+qc"
+    m.stages[0].redecomposition_attempts = 1  # halt, don't redecompose
+
+    # metric below the "metric > 0.5" criterion — the stage FAILS
+    # without succeeding, so `current_stage_idx` never advances and a
+    # second `mission_run` call genuinely re-enters this stage's
+    # scaffold (a succeeded stage would be skipped entirely on resume,
+    # never re-testing the "already" guard at all).
+    fake = _fake_sculpt_run_factory(metric=0.1, match_eval_reset=True)
+    monkeypatch.setattr(sculpt_mod, "sculpt_run", fake)
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
+    )
+
+    events: list[dict] = []
+    result = sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab", kg_store=None, on_event=events.append,
+    )
+    assert result.completed is False
+    assert result.halted_reason == "criterion_not_met"
+
+    stage_dir = Path(m.mission_dir) / "stages" / "stage_0"
+    env_dir = stage_dir / "env"
+    versions_before = sorted(env_dir.glob("v*.json"))
+    assert len(versions_before) == 1
+    eval_reset_path = env_dir / "eval_reset.json"
+    assert eval_reset_path.is_file()
+
+    sig_path = stage_dir / "reference_signature.json"
+    assert sig_path.is_file()
+    sig_before = json.loads(sig_path.read_text())
+    assert sig_before["span"]["t_start_s"] == pytest.approx(0.0)
+    assert sig_before["span"]["t_end_s"] == pytest.approx(0.5)
+    assert "reason" not in _events_of(
+        events, "stage_reference_signature_written")[0]
+
+    # Repair the span (as a real per-stage metric regenerate would) and
+    # re-run — current_stage_idx still points at stage_0, so this is a
+    # genuine resume of the SAME stage, not a fresh mission.
+    m2 = load_mission(Path(m.mission_dir))
+    m2.mission_dir = str(Path(m.mission_dir))
+    m2.stages[0].reference_span_start_s = 0.2
+    m2.stages[0].reference_span_end_s = 0.5
+    save_mission(m2, Path(m.mission_dir))
+
+    events2: list[dict] = []
+    fake2 = _fake_sculpt_run_factory(metric=0.9, match_eval_reset=True)
+    monkeypatch.setattr(sculpt_mod, "sculpt_run", fake2)
+    result2 = sculpt_mod.mission_run(
+        m2, adapter_short_name="mjlab", kg_store=None, on_event=events2.append,
+    )
+    assert result2.completed is True
+
+    # RSI env-spec: the span mismatch must flip the `already` guard
+    # False, forcing a fresh `apply_reference_rsi` — a NEW version is
+    # stacked (never deleting the old one) and the event re-fires.
+    versions_after = sorted(env_dir.glob("v*.json"))
+    assert len(versions_after) == 2
+    span_changed_events = _events_of(
+        events2, "stage_reference_rsi_span_changed")
+    assert len(span_changed_events) == 1
+    assert span_changed_events[0]["stamped_span"] == {
+        "t_start_s": 0.0, "t_end_s": 0.5}
+    assert span_changed_events[0]["current_span"] == {
+        "t_start_s": 0.2, "t_end_s": 0.5}
+    assert len(_events_of(events2, "stage_reference_rsi_applied")) == 1
+
+    # The new version's meta carries the fresh span stamp (both the
+    # versioned file and current.json — the "exact copy" invariant).
+    new_version_path = [p for p in versions_after if p not in versions_before][0]
+    new_spec = json.loads(new_version_path.read_text())
+    assert new_spec["meta"]["derived_from_span"] == {
+        "t_start_s": 0.2, "t_end_s": 0.5}
+    current_spec = json.loads((env_dir / "current.json").read_text())
+    assert current_spec["meta"]["derived_from_span"] == {
+        "t_start_s": 0.2, "t_end_s": 0.5}
+
+    # eval_reset.json is genuinely REWRITTEN (not just left stale) —
+    # the write event re-fires. The two synthetic spans here both fall
+    # inside the fixture clip's constant-height "lying" phase, so the
+    # derived NUMBERS may legitimately coincide; the re-derivation
+    # itself (not a numeric delta) is what this proves.
+    _ = json.loads(eval_reset_path.read_text())  # still valid JSON
+    assert len(_events_of(events2, "stage_eval_reset_written")) == 1
+
+    # reference_signature.json rewritten with the NEW span AND a
+    # "span_changed" reason disclosed on the write event.
+    sig_after = json.loads(sig_path.read_text())
+    assert sig_after["span"]["t_start_s"] == pytest.approx(0.2)
+    assert sig_after["span"]["t_end_s"] == pytest.approx(0.5)
+    sig_written_events2 = _events_of(
+        events2, "stage_reference_signature_written")
+    assert len(sig_written_events2) == 1
+    assert sig_written_events2[0].get("reason") == "span_changed"
+
+
 def test_stage_reference_clip_load_failure_fails_stage(
     tmp_path: Path, monkeypatch, stub_adapter,
 ):

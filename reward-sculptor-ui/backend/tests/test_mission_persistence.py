@@ -19,6 +19,7 @@ Covers:
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 import pytest
@@ -800,6 +801,131 @@ def test_regenerate_metric_allowed_when_regen_live_different_mission(
         f"/projects/{slug}/missions/m1/stages/a/metric/regenerate",
     )
     assert r.status_code == 202, r.text
+
+
+def test_regenerate_metric_clears_declined_marker_before_generation(
+    client: TestClient, tmp_projects_root: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """§H2 audit fix (docs/internal/REFERENCE_BUILD_LOG.md D23/D24/D25,
+    fresh-context Opus adversarial audit): a user hitting "regenerate"
+    for a stage carrying a standing `declined:<reason>` span-selection
+    marker (`sculptor.refs.spans.is_span_declined`) is an EXPLICIT
+    request for a fresh answer — the marker must be cleared BEFORE
+    `generate_stage_metrics` runs, so its lazy backfill re-attempts
+    `select_reference_span` instead of treating the prior semantic
+    decline as permanent (the automatic backfill path never re-attempts
+    a decline; this manual endpoint is the escape hatch). Proven by
+    stubbing `generate_stage_metrics` and observing the `Mission` object
+    it receives has already had the marker cleared, and that the clear
+    is persisted to mission.json (rides the existing `save_mission`
+    call)."""
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _write_mission(project_dir, "m1", [
+        _stage_dict(
+            "torso_righting", status="pending",
+            reference_clip_id="some_clip",
+            reference_span_method="declined:low_confidence:0.42"),
+    ])
+
+    seen_methods: list[object] = []
+
+    def _fake_generate_stage_metrics(mission, **kwargs):
+        seen_methods.append(mission.stages[0].reference_span_method)
+        return {"generated": [], "rejected": [], "skipped": []}
+
+    class _FakeAdapter:
+        task_id = None
+
+    # No real config.toml is scaffolded for this project — stub
+    # load_adapter (mirrors test_missions.py's
+    # test_decompose_job_passes_n_candidates_to_generate_stage_metrics)
+    # so the job body's `load_adapter(...)` call doesn't need one; this
+    # test is about the declined-marker clear, not adapter resolution.
+    monkeypatch.setattr(
+        "sculptor.adapters.base.load_adapter", lambda _p: _FakeAdapter(),
+    )
+    monkeypatch.setattr(
+        "sculptor.mission_metrics.generate_stage_metrics",
+        _fake_generate_stage_metrics,
+    )
+
+    r = client.post(
+        f"/projects/{slug}/missions/m1/stages/torso_righting/metric/regenerate",
+    )
+    assert r.status_code == 202, r.text
+    job_id = r.json()["job_id"]
+
+    deadline = time.time() + 15
+    body: dict = {}
+    while time.time() < deadline:
+        jr = client.get(f"/jobs/{job_id}")
+        assert jr.status_code == 200
+        body = jr.json()
+        if body["status"] in ("completed", "errored", "stopped"):
+            break
+        time.sleep(0.05)
+    assert body.get("status") == "completed", body
+
+    assert seen_methods == [None]
+
+    mission_json = json.loads(
+        (project_dir / ".missions" / "m1" / "mission.json").read_text())
+    assert mission_json["stages"][0]["reference_span_method"] is None
+
+
+def test_regenerate_metric_leaves_non_declined_method_untouched(
+    client: TestClient, tmp_projects_root: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stage whose `reference_span_method` is a SUCCESS marker (a real
+    span already selected, e.g. `"llm+snap+qc"`) must NOT be cleared by
+    the regenerate endpoint — only a standing `declined:*` marker is."""
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _write_mission(project_dir, "m1", [
+        _stage_dict(
+            "torso_righting", status="pending",
+            reference_clip_id="some_clip",
+            reference_span_start_s=0.0, reference_span_end_s=8.1,
+            reference_span_confidence=0.85,
+            reference_span_method="llm+snap+qc"),
+    ])
+
+    seen_methods: list[object] = []
+
+    def _fake_generate_stage_metrics(mission, **kwargs):
+        seen_methods.append(mission.stages[0].reference_span_method)
+        return {"generated": [], "rejected": [], "skipped": []}
+
+    class _FakeAdapter:
+        task_id = None
+
+    monkeypatch.setattr(
+        "sculptor.adapters.base.load_adapter", lambda _p: _FakeAdapter(),
+    )
+    monkeypatch.setattr(
+        "sculptor.mission_metrics.generate_stage_metrics",
+        _fake_generate_stage_metrics,
+    )
+
+    r = client.post(
+        f"/projects/{slug}/missions/m1/stages/torso_righting/metric/regenerate",
+    )
+    assert r.status_code == 202, r.text
+    job_id = r.json()["job_id"]
+
+    deadline = time.time() + 15
+    body: dict = {}
+    while time.time() < deadline:
+        jr = client.get(f"/jobs/{job_id}")
+        assert jr.status_code == 200
+        body = jr.json()
+        if body["status"] in ("completed", "errored", "stopped"):
+            break
+        time.sleep(0.05)
+    assert body.get("status") == "completed", body
+
+    assert seen_methods == ["llm+snap+qc"]
 
 
 def test_run_mission_409_when_metric_regen_live_same_mission(

@@ -703,19 +703,23 @@ def test_generate_stage_metrics_no_reference_clip_id_passes_none(
     assert calls[0]["references"] is None
 
 
-def test_generate_stage_metrics_reference_load_error_proceeds_without(
+def test_generate_stage_metrics_reference_load_error_rejects_stage(
     tmp_path, monkeypatch,
 ):
-    """A stage referencing a clip_id that doesn't exist on disk must NOT
-    crash the pipeline — it proceeds with references=None and records
-    `reference_load_error` on the report entry."""
+    """§M3 audit fix (docs/internal/REFERENCE_BUILD_LOG.md, fresh-context
+    Opus adversarial audit): a stage referencing a clip_id that doesn't
+    exist on disk must NOT silently downgrade to an UNGATED, no-
+    reference metric acceptance — it must be REJECTED (never generated),
+    `generate_objective_metric` must never be called for it, and the
+    load error is surfaced on the reject entry's `reference_load_error`
+    plus a loud `reason`."""
     root = tmp_path / "empty_refs_root"
     root.mkdir()
     monkeypatch.setenv("RS_REFERENCE_ROOT", str(root))
 
     calls: list[dict] = []
 
-    def fake_gen(goal, out_dir, **kw):
+    def fake_gen(goal, out_dir, **kw):  # pragma: no cover — must not run
         calls.append(kw)
         return {"accepted": True}
 
@@ -726,10 +730,48 @@ def test_generate_stage_metrics_reference_load_error_proceeds_without(
     m = _mk_mission(tmp_path, [s1])
     report = generate_stage_metrics(m)
 
-    assert calls[0]["references"] is None
-    assert len(report["generated"]) == 1
-    assert "reference_load_error" in report["generated"][0]
-    assert report["generated"][0]["reference_load_error"]
+    assert calls == []
+    assert report["generated"] == []
+    assert len(report["rejected"]) == 1
+    entry = report["rejected"][0]
+    assert entry["stage"] == "get_up"
+    assert "reference_load_error" in entry
+    assert entry["reference_load_error"]
+    assert "attached reference failed to load" in entry["reason"]
+    assert "refusing certification without its intended exemplar" in entry["reason"]
+
+
+def test_generate_stage_metrics_reference_crop_failure_rejects_stage(
+    tmp_path, monkeypatch,
+):
+    """§M3: a clip that LOADS fine but fails to CROP (an out-of-range
+    persisted span) is the same failure class as an unloadable clip on
+    disk — must reject, never fall through to an ungated acceptance."""
+    root = _write_fixture_clip(tmp_path, "g1", "getup_demo_clip")
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(root))
+
+    calls: list[dict] = []
+
+    def fake_gen(goal, out_dir, **kw):  # pragma: no cover — must not run
+        calls.append(kw)
+        return {"accepted": True}
+
+    import sculptor.eval as ev
+    monkeypatch.setattr(ev, "generate_objective_metric", fake_gen)
+
+    s1 = _mk_stage(
+        "get_up", reference_clip_id="getup_demo_clip",
+        reference_span_start_s=9999.0, reference_span_end_s=10000.0,
+        reference_span_confidence=0.9, reference_span_method="llm+snap+qc")
+    m = _mk_mission(tmp_path, [s1])
+    report = generate_stage_metrics(m)
+
+    assert calls == []
+    assert report["generated"] == []
+    assert len(report["rejected"]) == 1
+    entry = report["rejected"][0]
+    assert "reference_load_error" in entry
+    assert "attached reference failed to load" in entry["reason"]
 
 
 # ── §D24 F1 item 4c: lazy span backfill ─────────────────────────────────
@@ -821,15 +863,20 @@ def test_generate_stage_metrics_backfills_span_once_and_persists(
     assert "reference_span_backfill_reason" not in report["generated"][0]
 
 
-def test_generate_stage_metrics_backfill_declined_proceeds_full_clip(
+def test_generate_stage_metrics_backfill_declined_skips_full_clip_certification(
     tmp_path, monkeypatch,
 ):
-    """When span selection declines (low confidence, QC reject, ...) the
-    reason is recorded on the report entry and generation proceeds with
-    the FULL (uncropped) clip — never a partial/garbage crop.
+    """§H2 audit fix (docs/internal/REFERENCE_BUILD_LOG.md D23/D24/D25,
+    fresh-context Opus adversarial audit): when span selection declines
+    for a reason OTHER than `whole_clip` (low confidence, QC reject,
+    ...) the sub-span question is UNRESOLVED — certifying against the
+    full clip would reproduce the exact D23 class (a sub-phase goal
+    certified against the wrong-scope clip). `generate_objective_metric`
+    must NEVER be called; the stage is REJECTED with a loud reason
+    naming the decline and falls back to the mission-level metric.
 
-    §D24 W5 hardening: a SEMANTIC decline (low_confidence) also persists
-    a `"declined:<reason>"` marker so the backfill never re-attempts
+    §D24 W5 hardening (still in force): the SEMANTIC decline persists a
+    `"declined:<reason>"` marker so the backfill never re-attempts
     selection on a later pass — see the dedicated retry tests below."""
     root = _write_fixture_clip(tmp_path, "g1", "getup_demo_clip")
     monkeypatch.setenv("RS_REFERENCE_ROOT", str(root))
@@ -839,6 +886,60 @@ def test_generate_stage_metrics_backfill_declined_proceeds_full_clip(
     def fake_select(clip, *, goal_text, start_pose=None, llm_call=None):
         select_calls.append(1)
         return None, "low_confidence:0.42"
+
+    monkeypatch.setattr("sculptor.refs.spans.select_reference_span", fake_select)
+
+    calls: list[dict] = []
+
+    def fake_gen(goal, out_dir, **kw):  # pragma: no cover — must not run
+        calls.append(kw)
+        return {"accepted": True}
+
+    import sculptor.eval as ev
+    monkeypatch.setattr(ev, "generate_objective_metric", fake_gen)
+
+    import sculptor.eval.metric_calibration as mc
+    monkeypatch.setattr(
+        mc, "calibrate_metric_against_reference", lambda *a, **kw: None)
+
+    s1 = _mk_stage("get_up", reference_clip_id="getup_demo_clip")
+    m = _mk_mission(tmp_path, [s1])
+    report = generate_stage_metrics(m)
+
+    assert m.stages[0].reference_span_start_s is None
+    assert m.stages[0].reference_span_method == "declined:low_confidence:0.42"
+    assert calls == []  # full-clip certification must NEVER run
+    assert report["generated"] == []
+    assert len(report["rejected"]) == 1
+    entry = report["rejected"][0]
+    assert entry["stage"] == "get_up"
+    assert entry["reference_span_backfill_reason"] == "low_confidence:0.42"
+    assert (
+        "reference span selection declined (low_confidence:0.42)"
+        in entry["reason"])
+    assert "D23 class" in entry["reason"]
+    assert "mission-level fallback" in entry["reason"]
+
+    # §D24 W5 hardening: THE regression this fix exists for — a second
+    # `generate_stage_metrics` pass over the SAME (still-rejected) stage
+    # must make ZERO further `select_reference_span` calls; the declined
+    # marker is a standing verdict, not a retry target.
+    generate_stage_metrics(m, only_stages=["get_up"])
+    assert len(select_calls) == 1
+
+
+def test_generate_stage_metrics_whole_clip_decline_still_certifies_full_clip(
+    tmp_path, monkeypatch,
+):
+    """§H2: `declined:whole_clip` means the LLM affirmatively judged the
+    goal covers the clip's ENTIRE motion — full-clip certification is
+    CORRECT there (unlike every other decline reason) and must proceed
+    exactly as before this fix."""
+    root = _write_fixture_clip(tmp_path, "g1", "getup_demo_clip")
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(root))
+
+    def fake_select(clip, *, goal_text, start_pose=None, llm_call=None):
+        return None, "whole_clip"
 
     monkeypatch.setattr("sculptor.refs.spans.select_reference_span", fake_select)
 
@@ -859,10 +960,10 @@ def test_generate_stage_metrics_backfill_declined_proceeds_full_clip(
     m = _mk_mission(tmp_path, [s1])
     report = generate_stage_metrics(m)
 
-    assert m.stages[0].reference_span_start_s is None
-    assert m.stages[0].reference_span_method == "declined:low_confidence:0.42"
-    entry = report["generated"][0]
-    assert entry["reference_span_backfill_reason"] == "low_confidence:0.42"
+    assert m.stages[0].reference_span_method == "declined:whole_clip"
+    assert len(calls) == 1  # full-clip certification DID run
+    assert len(report["generated"]) == 1
+    assert report["rejected"] == []
 
     from sculptor.reference import make_procedural_jump_clip
 
@@ -870,14 +971,62 @@ def test_generate_stage_metrics_backfill_declined_proceeds_full_clip(
     clip_id, clip = calls[0]["references"][0]
     assert clip["root_pos_z"].shape[0] == full_n
 
-    # §D24 W5 hardening: THE regression this fix exists for — a second
-    # `generate_stage_metrics` pass over the SAME (still-rejected, since
-    # `fake_gen` always accepts here — use only_stages to force a revisit
-    # of an accepted stage) must make ZERO further `select_reference_span`
-    # calls; the declined marker is a standing verdict, not a retry
-    # target.
-    generate_stage_metrics(m, only_stages=["get_up"])
-    assert len(select_calls) == 1
+
+def test_generate_stage_metrics_preexisting_declined_marker_skips_generation(
+    tmp_path, monkeypatch,
+):
+    """§H2: a stage that ALREADY carries an unresolved `declined:<reason>`
+    marker (e.g. set at decompose time by `_select_and_attach_span`, not
+    via this module's own backfill) must be rejected the same way on its
+    very FIRST `generate_stage_metrics` pass — never certifying against
+    the full clip, and never re-attempting selection."""
+    root = _write_fixture_clip(tmp_path, "g1", "getup_demo_clip")
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(root))
+
+    def boom(*a, **kw):  # pragma: no cover — must not run
+        raise AssertionError("selection must not run — already declined")
+
+    monkeypatch.setattr("sculptor.refs.spans.select_reference_span", boom)
+
+    def fake_gen(goal, out_dir, **kw):  # pragma: no cover — must not run
+        raise AssertionError(
+            "generation must not run for an unresolved decline")
+
+    import sculptor.eval as ev
+    monkeypatch.setattr(ev, "generate_objective_metric", fake_gen)
+
+    s1 = _mk_stage(
+        "get_up", reference_clip_id="getup_demo_clip",
+        reference_span_method="declined:qc_reject:duration<1.0s:0.300")
+    m = _mk_mission(tmp_path, [s1])
+    report = generate_stage_metrics(m)
+
+    assert report["generated"] == []
+    assert len(report["rejected"]) == 1
+    assert "qc_reject:duration<1.0s:0.300" in report["rejected"][0]["reason"]
+
+
+def test_unresolved_span_decline_reason_none_absent_and_whole_clip():
+    """Direct unit coverage of `_unresolved_span_decline_reason`: no
+    marker or a whole_clip marker -> None (proceed normally); every other
+    decline -> the bare reason string; a SUCCESS method (not a decline
+    marker at all) -> None."""
+    from sculptor.mission_metrics import _unresolved_span_decline_reason
+
+    s = _mk_stage("s")
+    assert _unresolved_span_decline_reason(s) is None
+
+    s.reference_span_method = "declined:whole_clip"
+    assert _unresolved_span_decline_reason(s) is None
+
+    s.reference_span_method = "declined:low_confidence:0.42"
+    assert _unresolved_span_decline_reason(s) == "low_confidence:0.42"
+
+    s.reference_span_method = "declined:qc_reject:crop_error:boom"
+    assert _unresolved_span_decline_reason(s) == "qc_reject:crop_error:boom"
+
+    s.reference_span_method = "llm+snap+qc"  # a SUCCESS marker, not a decline
+    assert _unresolved_span_decline_reason(s) is None
 
 
 def test_backfill_llm_unavailable_persists_no_marker_and_is_retried(
