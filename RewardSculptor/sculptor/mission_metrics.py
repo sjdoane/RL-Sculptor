@@ -333,6 +333,33 @@ def _backfill_stage_reference_span(
     return None
 
 
+def _clear_stale_steering_metric(
+    stage: Any, reject_entry: dict[str, Any], emit,
+) -> None:
+    """A stage whose metric generation was just REJECTED must not keep
+    steering through a stale `steering_metric` pointer. Two live-found
+    ways that happens: (a) a regen over a previously-accepted stage
+    OVERWRITES metric.py/meta.json with the rejected candidate, so the
+    pointer now names a metric whose meta says accepted:false
+    (drive_to_stand, 2026-07-12); (b) the fail-closed span policy (H2)
+    refuses full-clip certification, but a GRANDFATHERED pre-D24
+    full-clip metric still sits behind the pointer (feet_under_crouch).
+    The runtime resolves `steering_metric or fitness_metric` without
+    re-checking acceptance, so clearing here is what actually makes the
+    stage fall back to the mission-level metric. Mutates in place; the
+    caller's save persists it (same contract as every other stage
+    mutation in this module)."""
+    old = getattr(stage, "steering_metric", None)
+    if old:
+        stage.steering_metric = None
+        reject_entry["steering_metric_cleared"] = old
+        emit({
+            "type": "stage_steering_metric_cleared",
+            "stage": stage.name,
+            "was": old,
+        })
+
+
 def _unresolved_span_decline_reason(stage: Any) -> Optional[str]:
     """§H2 audit fix (docs/internal/REFERENCE_BUILD_LOG.md D23/D24/D25,
     fresh-context Opus adversarial audit of the D24/D25 batch): every
@@ -517,6 +544,7 @@ def generate_stage_metrics(
                 "stage": stage.name, "reason": reject_reason}
             if span_backfill_reason:
                 reject_entry["reference_span_backfill_reason"] = span_backfill_reason
+            _clear_stale_steering_metric(stage, reject_entry, _emit)
             report["rejected"].append(reject_entry)
             _emit({
                 "type": "stage_metric_gen_rejected",
@@ -552,6 +580,7 @@ def generate_stage_metrics(
             }
             if span_backfill_reason:
                 reject_entry["reference_span_backfill_reason"] = span_backfill_reason
+            _clear_stale_steering_metric(stage, reject_entry, _emit)
             report["rejected"].append(reject_entry)
             _emit({
                 "type": "stage_metric_gen_rejected",
@@ -636,6 +665,7 @@ def generate_stage_metrics(
                 reject_entry["reference_load_error"] = reference_load_error
             if span_backfill_reason:
                 reject_entry["reference_span_backfill_reason"] = span_backfill_reason
+            _clear_stale_steering_metric(stage, reject_entry, _emit)
             report["rejected"].append(reject_entry)
             _emit({
                 "type": "stage_metric_gen_failed",
@@ -695,6 +725,7 @@ def generate_stage_metrics(
                 reject_entry["reference_load_error"] = reference_load_error
             if span_backfill_reason:
                 reject_entry["reference_span_backfill_reason"] = span_backfill_reason
+            _clear_stale_steering_metric(stage, reject_entry, _emit)
             report["rejected"].append(reject_entry)
             _emit({
                 "type": "stage_metric_gen_rejected",

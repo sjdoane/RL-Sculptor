@@ -519,7 +519,42 @@ D23 configuration the batch exists to eliminate. Findings and fixes:
   or intermediate-speed short-hold shapes — the surface where a fifth
   class would live; no constructive exploit found.
 
+### D26a. Stages 2-4 regenerated under the fixed pipeline; rejection paths now clear stale steering pointers
+Full-mission repair status after regenerating every stage's metric:
+- torso_righting: span 0-8.1 s, six gates green, spec 1.0 on the live
+  rollouts (D25).
+- supine_getup_and_hold: span 1.1-16.37 s (the full get-up + hold — the
+  correct scope for the final chain-everything stage), six gates green,
+  accepted.
+- feet_under_crouch: span DECLINED twice (LLM proposes out-of-bounds
+  spans, e.g. [2.408, 4.742] on a shorter clip) — fail-closed to the
+  mission-level fallback. Root cause is upstream: its a10_lie_to_crouch
+  binding never reaches the criterion's 0.4 m (D19 noted z 0.00->0.28)
+  — the D22-deferred auto-retrieval-quality item, not a span bug.
+- drive_to_stand: span 8.433-11.0 s selected consistently across two
+  runs, but the AUTHORED metric failed certification both times
+  (nondegeneracy 0 on its own exemplar) — fail-closed; needs an author
+  retry with a larger candidate budget.
+NEW GAP found while verifying fail-closed was real: the runtime resolves
+`steering_metric or fitness_metric` WITHOUT re-checking acceptance, and
+two live states bypassed the policy — a grandfathered pre-D24 full-clip
+metric behind an unresolved decline (feet_under_crouch), and a regen
+that overwrote an accepted metric.py with the REJECTED candidate while
+the pointer survived (drive_to_stand). Every rejection path in
+generate_stage_metrics now clears a stale steering_metric
+(stage_steering_metric_cleared event; pinned by test); both live stages'
+pointers cleared in mission.json. Note: the whole-mission pass's
+"steering_metric already set" skip guard still grandfathers stale
+metrics — only the per-stage regen path re-evaluates; deferred below.
+
 ### Deferred findings (logged, not yet fixed)
+- D26a follow-ups: feet_under_crouch needs a better reference binding
+  (its lie-to-crouch clip never reaches the stage's height band — same
+  family as the auto-retrieval-quality item below); drive_to_stand needs
+  a metric-author retry with n_candidates>1; the whole-mission
+  "steering_metric already set" skip guard grandfathers pre-D24 metrics
+  (only per-stage regen re-evaluates them) — consider a mission-wide
+  re-certification sweep command.
 - Steer ENFORCEMENT unification: reference-calibration trust is computed
   and event-recorded in mission_metrics, but the live steer/observe gate
   lives in backend run_manager.py on a different data model (gen:<id> +

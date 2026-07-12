@@ -1301,3 +1301,30 @@ def test_calibration_wiring_end_to_end_resolves_tier_d_from_real_cert(
     # (rights depends on the trivial constant metric clearing the ladder
     # gate, which it won't — the load-bearing assertion here is that the
     # TIER resolved to D through the real cert chain, not steer/observe.)
+
+
+def test_rejected_stage_clears_stale_steering_metric(tmp_path, monkeypatch):
+    """LIVE FINDING (2026-07-12, post-audit): the runtime resolves
+    `steering_metric or fitness_metric` WITHOUT re-checking acceptance,
+    so a rejection must clear a stale pointer or the stage keeps
+    steering by it — seen live twice: a grandfathered pre-D24 full-clip
+    metric behind an unresolved span decline (feet_under_crouch), and a
+    regen that overwrote an accepted metric.py with the REJECTED
+    candidate while the pointer survived (drive_to_stand)."""
+    root = _write_fixture_clip(tmp_path, "g1", "getup_demo_clip")
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(root))
+
+    s1 = _mk_stage(
+        "get_up", reference_clip_id="getup_demo_clip",
+        reference_span_method="declined:low_confidence:0.42")
+    s1.steering_metric = "stage_metrics/get_up/metric.py"
+    m = _mk_mission(tmp_path, [s1])
+    # only_stages mirrors the per-stage regen endpoint - the one
+    # path that bypasses the 'steering_metric already set'
+    # whole-mission skip guard, and the path both live cases used.
+    report = generate_stage_metrics(m, only_stages=["get_up"])
+
+    assert len(report["rejected"]) == 1
+    entry = report["rejected"][0]
+    assert entry["steering_metric_cleared"] == "stage_metrics/get_up/metric.py"
+    assert s1.steering_metric is None
