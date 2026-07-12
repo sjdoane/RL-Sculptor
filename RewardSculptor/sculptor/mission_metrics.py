@@ -391,6 +391,191 @@ def _unresolved_span_decline_reason(stage: Any) -> Optional[str]:
     return reason
 
 
+def _attempt_synthetic_certification(
+    stage: Any, robot: str, out_dir: Path, *,
+    client: Any = None, n_candidates: int = 1,
+    on_event: Optional[Callable[[dict[str, Any]], None]] = None,
+) -> Optional[dict[str, Any]]:
+    """§D28 F-SYNTH (docs/internal/REFERENCE_BUILD_LOG.md D28 spec): the
+    LAST-RESORT certification tier, attempted only when this stage would
+    otherwise end THIS `generate_stage_metrics` pass with NO accepted
+    metric — no reference at all, an unresolved span decline (H2), a
+    failed clip load (M3), or a real-reference certification that was
+    attempted this pass and rejected. Never steer-grade on its own: the
+    trust tier recorded is `"reference:S:synthetic"` (extends the §10
+    taxonomy — "S" = synthetic). Only the EXISTING task-derived
+    calibration path (L2, `RS_TASK_DERIVED_CALIBRATION`) can ever
+    upgrade it later — this function does not touch that machinery and
+    wires no new steer rights anywhere.
+
+    Flow: (1) collect ANALOGOUS kinematic signatures — the stage's own
+    attached clip, loaded FULL (span ignored — a mismatched clip's real
+    numbers are still a numbers donor) via `load_stage_reference_clip`
+    (the one loader), degrading to zero signatures on any failure, never
+    fatal; (2) one LLM call via `sculptor.refs.synth.
+    synthesize_reference_clip`; a decline is recorded and returned, never
+    fatal; (3) on a sketch, certify a metric against the SYNTHETIC clip
+    exactly like a real reference (`generate_objective_metric(
+    references=[("synthetic:<stage>", synth_clip)], ...)` — the SAME
+    six-gate reference battery runs UNCHANGED); (4) on acceptance,
+    persist `synthetic_signature.json` + `synthetic_exemplar.npz` beside
+    `meta.json`, stamp an `"exemplar"` block into `meta.json`, and set
+    `stage.steering_metric` (mutated in place — caller re-saves, same
+    contract as every other stage mutation this module makes).
+
+    The synthetic clip NEVER enters the reference library, is NEVER used
+    for RSI/eval-reset scaffold derivation (`sculpt.py` untouched), and
+    carries its provenance in-file (`clip["meta"]`) + `meta.json` + the
+    returned report entry.
+
+    Gated on `RS_SYNTHETIC_EXEMPLAR` (default "1" — "0" disables; logged
+    when disabled). Returns `None` when disabled. Otherwise returns
+    `{"accepted": bool, "reason": Optional[str] (decline reason when not
+    accepted), "ref": Optional[str], "gen_entry": Optional[dict]}`.
+    Never raises."""
+
+    def _emit(ev: dict[str, Any]) -> None:
+        if on_event is not None:
+            try:
+                on_event(ev)
+            except Exception:  # noqa: BLE001 — progress is advisory
+                pass
+
+    if os.environ.get("RS_SYNTHETIC_EXEMPLAR", "1") == "0":
+        print(
+            f"[mission-metrics] stage {stage.name!r}: synthetic-exemplar "
+            "certification disabled (RS_SYNTHETIC_EXEMPLAR=0) — stage "
+            "stays without an accepted metric.", file=sys.stderr, flush=True)
+        _emit({
+            "type": "stage_synthetic_exemplar_skipped", "stage": stage.name,
+            "reason": "RS_SYNTHETIC_EXEMPLAR=0",
+        })
+        return None
+
+    from sculptor.refs.convert import kinematic_signature
+    from sculptor.refs.synth import synthesize_reference_clip
+
+    analogous_signatures: list[dict[str, Any]] = []
+    grounded_on: list[str] = []
+    clip_id = getattr(stage, "reference_clip_id", None)
+    if clip_id:
+        try:
+            import dataclasses as _dc
+
+            donor_stage = _dc.replace(
+                stage, reference_span_start_s=None, reference_span_end_s=None)
+            loaded = load_stage_reference_clip(donor_stage, robot)
+            if loaded is not None:
+                _loaded_id, donor_clip, _span_meta = loaded
+                analogous_signatures.append(kinematic_signature(donor_clip))
+                grounded_on.append(clip_id)
+        except Exception as e:  # noqa: BLE001 — donor signature is best-effort
+            print(
+                f"[mission-metrics] stage {stage.name!r}: synthetic-exemplar "
+                f"donor signature unavailable ({type(e).__name__}: {e}) — "
+                "proceeding with fewer signatures.", file=sys.stderr, flush=True)
+
+    synth_clip, decline_reason = synthesize_reference_clip(
+        stage.goal_text, start_pose=getattr(stage, "start_pose", None),
+        analogous_signatures=analogous_signatures or None, robot=robot)
+    if synth_clip is None:
+        _emit({
+            "type": "stage_synthetic_exemplar_declined", "stage": stage.name,
+            "reason": decline_reason,
+        })
+        return {"accepted": False, "reason": decline_reason}
+
+    eval_reset_preview: Optional[dict[str, Any]] = None
+    try:
+        eval_reset_preview = _compute_eval_reset_preview(synth_clip, robot=robot)
+    except Exception as e:  # noqa: BLE001 — preview is advisory, never fatal
+        print(
+            f"[mission-metrics] stage {stage.name!r}: synthetic-exemplar "
+            f"eval-reset preview failed ({type(e).__name__}: {e}) — "
+            "proceeding without it.", file=sys.stderr, flush=True)
+        eval_reset_preview = None
+
+    from sculptor.eval import generate_objective_metric
+
+    synthetic_clip_id = f"synthetic:{stage.name}"
+    try:
+        rec = generate_objective_metric(
+            stage.goal_text, out_dir, robot_hint=robot, client=client,
+            n_candidates=n_candidates, on_event=on_event,
+            references=[(synthetic_clip_id, synth_clip)],
+            eval_reset=eval_reset_preview)
+    except Exception as e:  # noqa: BLE001 — stage falls back, mission runs
+        reason = f"synthetic generation crashed: {type(e).__name__}: {e}"
+        _emit({
+            "type": "stage_synthetic_exemplar_declined", "stage": stage.name,
+            "reason": reason,
+        })
+        return {"accepted": False, "reason": reason}
+
+    if not rec.get("accepted"):
+        reasons = rec.get("validation") or {}
+        reason = "; ".join(
+            (reasons.get("reasons") or ["synthetic metric rejected"])[:3])
+        _emit({
+            "type": "stage_synthetic_exemplar_declined", "stage": stage.name,
+            "reason": reason,
+        })
+        return {"accepted": False, "reason": reason}
+
+    confidence = (synth_clip.get("meta") or {}).get("confidence")
+    exemplar_block = {
+        "kind": "synthetic",
+        "confidence": confidence,
+        "grounded_on": grounded_on,
+        "trust_tier": "reference:S:synthetic",
+    }
+
+    try:
+        sig = kinematic_signature(synth_clip)
+    except Exception as e:  # noqa: BLE001 — signature is advisory
+        sig = {"_error": f"{type(e).__name__}: {e}"}
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "synthetic_signature.json").write_text(
+            json.dumps({
+                "schema": 1, "clip_id": synthetic_clip_id, "tier": "S",
+                "signature": sig, "eval_reset": eval_reset_preview,
+            }, indent=2, default=str), encoding="utf-8")
+    except Exception as e:  # noqa: BLE001 — persistence is advisory
+        print(
+            f"[mission-metrics] stage {stage.name!r}: failed to write "
+            f"synthetic_signature.json ({type(e).__name__}: {e}).",
+            file=sys.stderr, flush=True)
+    try:
+        from sculptor.reference import save_clip
+
+        save_clip(out_dir / "synthetic_exemplar.npz", synth_clip)
+    except Exception as e:  # noqa: BLE001 — persistence is advisory
+        print(
+            f"[mission-metrics] stage {stage.name!r}: failed to persist "
+            f"synthetic_exemplar.npz ({type(e).__name__}: {e}).",
+            file=sys.stderr, flush=True)
+    try:
+        meta_path = out_dir / "meta.json"
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        meta["exemplar"] = exemplar_block
+        meta_path.write_text(
+            json.dumps(meta, indent=2, default=str), encoding="utf-8")
+    except Exception as e:  # noqa: BLE001 — meta.json augmentation is advisory
+        print(
+            f"[mission-metrics] stage {stage.name!r}: failed to stamp "
+            f"exemplar provenance into meta.json ({type(e).__name__}: "
+            f"{e}).", file=sys.stderr, flush=True)
+
+    rel = f"stage_metrics/{stage.name}/metric.py"
+    stage.steering_metric = rel
+    _emit({
+        "type": "stage_synthetic_exemplar_accepted", "stage": stage.name,
+        "ref": rel, **exemplar_block,
+    })
+    return {"accepted": True, "ref": rel, "gen_entry": {"exemplar": exemplar_block}}
+
+
 def resolve_stage_metric_ref(ref: str, mission_dir: Path | str) -> str:
     """Anchor a mission-dir-relative generated-metric ref at the mission
     dir. Spec-metric names ("g1_kick") and absolute paths pass through
@@ -479,6 +664,27 @@ def generate_stage_metrics(
             "stage": stage.name,
             "goal_text": stage.goal_text[:200],
         })
+
+        # §D28 F-SYNTH: last-resort synthetic-exemplar certification,
+        # attempted whenever this stage's pass would otherwise end with
+        # NO accepted metric (see `_attempt_synthetic_certification`'s
+        # docstring for the four trigger cases). Keeps the existing
+        # reject_entry AND records the synthetic outcome on it —
+        # mutating reject_entry in place reflects into report["rejected"]
+        # (already appended by reference) whether the synthetic attempt
+        # declines too or succeeds (a NEW report["generated"] entry).
+        def _try_synthetic(reject_entry: dict[str, Any]) -> None:
+            synth_result = _attempt_synthetic_certification(
+                stage, _robot_slug(robot_hint), out_dir,
+                client=client, n_candidates=n_candidates, on_event=on_event)
+            if synth_result is None:
+                return
+            if synth_result.get("accepted"):
+                synth_gen_entry = {"stage": stage.name, "ref": synth_result["ref"]}
+                synth_gen_entry.update(synth_result.get("gen_entry") or {})
+                report["generated"].append(synth_gen_entry)
+            else:
+                reject_entry["synthetic_exemplar_declined"] = synth_result.get("reason")
         # §REFERENCE_TRAJECTORY_PLAN §7: a stage with an attached library
         # reference gets it loaded + threaded through generation for
         # kinematic grounding + reference-anchored validation. No
@@ -551,6 +757,7 @@ def generate_stage_metrics(
                 "stage": stage.name,
                 "reason": reject_reason,
             })
+            _try_synthetic(reject_entry)
             continue
 
         references, reference_load_error = _load_stage_reference(
@@ -587,6 +794,7 @@ def generate_stage_metrics(
                 "stage": stage.name,
                 "reason": reject_reason,
             })
+            _try_synthetic(reject_entry)
             continue
 
         # §D24 F2 item 1: compute the stage's certified eval-reset preview
@@ -732,4 +940,5 @@ def generate_stage_metrics(
                 "stage": stage.name,
                 "reason": reason,
             })
+            _try_synthetic(reject_entry)
     return report

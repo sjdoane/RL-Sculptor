@@ -97,6 +97,18 @@ class StageSchema(BaseModel):
     # `<mission_dir>/stage_metrics/<name>/meta.json` +
     # `steering_metric`. See mission_store._stage_metric_status.
     metric_status: Optional[Literal["accepted", "rejected", "inherited", "none"]] = None
+    # §D28 F-SYNTH: NOT mirrored from sculptor.mission.Stage — a DERIVED
+    # field (same convention as `metric_status` above), computed fresh
+    # each request from `<mission_dir>/stage_metrics/<name>/meta.json`'s
+    # `exemplar.kind` (stamped there by `sculptor.mission_metrics.
+    # _attempt_synthetic_certification` on a synthetic-exemplar
+    # acceptance). "synthetic" when the accepted metric was certified
+    # against a last-resort synthesized exemplar (never steer-grade on
+    # its own — observe until task-derived calibration); "reference"
+    # when a real reference_clip_id is attached (regardless of whether
+    # its metric is calibrated); `None` for a plain/unreferenced metric
+    # or no metric at all. See mission_store._stage_exemplar_kind.
+    exemplar_kind: Optional[Literal["reference", "synthetic"]] = None
     # §R1_BUILD_SPEC decision 10/11: mirrors sculptor.mission.Stage's
     # reference_clip_id/reference_tier/reference_match_confidence — the
     # reference-library clip (if any) attached to this stage via

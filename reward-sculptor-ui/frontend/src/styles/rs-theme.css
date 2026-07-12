@@ -11,6 +11,10 @@
   --st-rose-bg:#fadce3; --st-rose-fg:#a01437; --st-rose:#cf2d56;
   --st-slate-bg:#e8e7e1; --st-slate-fg:#5a5852; --st-slate:#807d72;
   --st-blue-bg:#dae8f6; --st-blue-fg:#1d4e7a; --st-blue:#2a6b9f;
+  /* §D28 F-SYNTH: synthetic-exemplar chip — visually distinct from the
+     blue/slate/amber/emerald metric states (this is neither an error
+     nor a success, it's an observe-grade fallback tier). */
+  --st-violet-bg:#e8def8; --st-violet-fg:#5b3a9e; --st-violet:#7c4fc9;
   --rail-w:228px;
   --scrim:rgba(38,37,30,0.34);
 }
@@ -36,6 +40,7 @@
   --st-rose-bg:#3a1620; --st-rose-fg:#f08aa6; --st-rose:#e85d82;
   --st-slate-bg:#2c2a20; --st-slate-fg:#aaa698; --st-slate:#8d8979;
   --st-blue-bg:#152836; --st-blue-fg:#86b7e6; --st-blue:#5b9bd6;
+  --st-violet-bg:#2c2140; --st-violet-fg:#c3a6f0; --st-violet:#a37bdb;
   --scrim:rgba(0,0,0,0.55);
 }
 
@@ -123,6 +128,7 @@ input, textarea, select { font: inherit; color: inherit; }
 .rs-badge.rose    { background: var(--st-rose-bg); color: var(--st-rose-fg); }
 .rs-badge.slate   { background: var(--st-slate-bg); color: var(--st-slate-fg); }
 .rs-badge.blue    { background: var(--st-blue-bg); color: var(--st-blue-fg); }
+.rs-badge.violet  { background: var(--st-violet-bg); color: var(--st-violet-fg); }
 .rs-badge.big { height: 26px; padding: 0 11px; font-size: 12px; }
 
 /* author badges */

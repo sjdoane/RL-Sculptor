@@ -651,6 +651,40 @@ def _stage_metric_status(
     return "none"
 
 
+def _stage_exemplar_kind(
+    mission_dir_path: Path, stage: StageSchema,
+) -> Optional[str]:
+    """§D28 F-SYNTH: derive `exemplar_kind` for one stage — same
+    meta.json-read pattern as `_stage_metric_status` above, but a
+    DERIVED field, not mirrored from `sculptor.mission.Stage`.
+
+      "synthetic" — `stage_metrics/<name>/meta.json` exists and its
+                    `exemplar.kind == "synthetic"` (stamped by
+                    `sculptor.mission_metrics.
+                    _attempt_synthetic_certification` on a last-resort
+                    synthetic-exemplar acceptance — see
+                    docs/internal/REFERENCE_BUILD_LOG.md D28). Never
+                    steer-grade on its own.
+      "reference" — no synthetic exemplar, but the stage carries a real
+                    `reference_clip_id` (a real clip WAS attached, even
+                    if its metric was never calibrated).
+      None        — a plain/unreferenced metric, or no metric at all.
+
+    Never raises — an unreadable/malformed meta.json degrades to
+    checking `reference_clip_id` alone, same "silent-none, not a
+    crash" contract as `_stage_metric_status`."""
+    meta_path = mission_dir_path / "stage_metrics" / stage.name / "meta.json"
+    if meta_path.is_file():
+        meta = _load_json_dict(meta_path)
+        if meta is not None:
+            exemplar = meta.get("exemplar")
+            if isinstance(exemplar, dict) and exemplar.get("kind") == "synthetic":
+                return "synthetic"
+    if stage.reference_clip_id:
+        return "reference"
+    return None
+
+
 def load_mission_detail(
     project_dir: Path,
     project_slug: str,
@@ -742,6 +776,7 @@ def build_unioned_stage_schemas(
     _assign_display_labels(stages)
     for s in stages:
         s.metric_status = _stage_metric_status(mission_dir_path, s)  # type: ignore[assignment]
+        s.exemplar_kind = _stage_exemplar_kind(mission_dir_path, s)  # type: ignore[assignment]
     return stages
 
 

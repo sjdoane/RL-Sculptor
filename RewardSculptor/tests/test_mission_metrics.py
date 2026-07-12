@@ -25,6 +25,32 @@ from sculptor.mission_metrics import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_synthetic_exemplar(monkeypatch):
+    """§D28 F-SYNTH: EVERY rejection path in `generate_stage_metrics`
+    (H2 span decline, M3 load failure, real-cert rejection) now attempts
+    a last-resort synthetic-exemplar certification
+    (`sculptor.refs.synth.synthesize_reference_clip`) — a REAL Anthropic
+    call by default. Live-caught while adding the D28 trigger-matrix
+    tests: every PRE-EXISTING test in this file that exercises a
+    rejection path (most of them) silently started making real network
+    calls, some of which then went on to ACCEPT a real synthetic metric
+    and quietly change `steering_metric`/`calls` assertions written
+    before D28 existed. Mirrors `test_decompose.py`'s
+    `_isolate_reference_library` fixture for the EXACT same class of
+    hazard (D24 F1's span_select call): stub the network-facing entry
+    point closed by default for every test in this module; the handful
+    of tests that specifically exercise the synthetic path override
+    this within their own `monkeypatch.setattr(...)` call (same
+    monkeypatch instance, last-write-wins, no conflict)."""
+    import sculptor.refs.synth as synth_mod
+
+    def _decline(*a, **kw):
+        return None, "test-isolation-stub:no llm calls in this test module by default"
+
+    monkeypatch.setattr(synth_mod, "synthesize_reference_clip", _decline)
+
+
 def _no_span(*a, **kw):
     """§D24 F1: `generate_stage_metrics` now runs the lazy span-backfill
     (`_backfill_stage_reference_span`) for any stage with a
@@ -112,8 +138,14 @@ def test_rejected_metric_leaves_fallback_and_reports(tmp_path, monkeypatch):
     report = generate_stage_metrics(m)
     assert m.stages[0].steering_metric is None
     assert report["generated"] == []
-    assert report["rejected"] == [
-        {"stage": "crouch_launch", "reason": "degenerate: constant output"}]
+    # §D28 F-SYNTH: the reject entry ALSO records the (stubbed-declined,
+    # per this file's autouse isolation fixture) synthetic-exemplar
+    # attempt — "keep the existing reject entry AND record both".
+    assert report["rejected"] == [{
+        "stage": "crouch_launch", "reason": "degenerate: constant output",
+        "synthetic_exemplar_declined": (
+            "test-isolation-stub:no llm calls in this test module by default"),
+    }]
 
 
 def test_existing_steering_metric_and_succeeded_stage_are_skipped(
@@ -1328,3 +1360,239 @@ def test_rejected_stage_clears_stale_steering_metric(tmp_path, monkeypatch):
     entry = report["rejected"][0]
     assert entry["steering_metric_cleared"] == "stage_metrics/get_up/metric.py"
     assert s1.steering_metric is None
+
+
+# ── §D28 F-SYNTH: last-resort synthetic-exemplar certification ─────────
+def _synth_clip() -> dict:
+    """A tiny valid `sculptor.reference`-format clip — stands in for
+    whatever `sculptor.refs.synth.synthesize_reference_clip` would
+    mechanically synthesize; this module's tests stub that function
+    directly (its own decline/QC/interpolation behavior is covered by
+    tests/test_refs_synth.py), so any validate_clip-clean array works
+    here."""
+    import numpy as np
+
+    n = 60
+    z = 0.15 + (0.74 - 0.15) * np.linspace(0.0, 1.0, n)
+    return {"root_pos_z": z, "fps": 30.0}
+
+
+def _fake_gen_accepts_only_with_references(goal, out_dir, *, references=None, **kw):
+    """Mirrors `generate_objective_metric`'s real contract (always
+    writes metric.py + meta.json; the record's `accepted` flag decides
+    what `generate_stage_metrics` does) — accepted ONLY when a
+    reference is attached, so the trigger-matrix tests below can tell
+    the plain-goal generation attempt (rejected) apart from the
+    synthetic-exemplar attempt (accepted) purely by the `references`
+    kwarg, exactly like the real pipeline's certification depends on
+    what it's certifying against."""
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    accepted = bool(references)
+    (out_dir / "metric.py").write_text(
+        "def compute_spec(a, b, c):\n    return {'spec_score': 0.0}\n",
+        encoding="utf-8")
+    (out_dir / "meta.json").write_text(
+        json.dumps({"accepted": accepted}), encoding="utf-8")
+    if accepted:
+        return {"accepted": True}
+    return {"accepted": False, "validation": {"reasons": ["degenerate: constant output"]}}
+
+
+def test_no_reference_clip_triggers_synthetic_and_records_full_provenance(
+    tmp_path, monkeypatch,
+):
+    """(a) no reference_clip_id at all -> the plain-goal generation is
+    rejected (no accepted metric this pass), so the synthetic path is
+    attempted; (d) acceptance -> steering_metric set + provenance lands
+    in the report entry ("stage record"), meta.json, and on disk
+    (synthetic_exemplar.npz + synthetic_signature.json)."""
+    import sculptor.eval as ev
+    monkeypatch.setattr(ev, "generate_objective_metric", _fake_gen_accepts_only_with_references)
+
+    def fake_synth(goal_text, *, start_pose=None, analogous_signatures=None,
+                   robot="g1", llm_call=None):
+        return _synth_clip(), None
+
+    import sculptor.refs.synth as synth_mod
+    monkeypatch.setattr(synth_mod, "synthesize_reference_clip", fake_synth)
+
+    m = _mk_mission(tmp_path, [_mk_stage("plain_stage")])
+    report = generate_stage_metrics(m)
+
+    # Both the original rejection AND the synthetic success are recorded.
+    assert len(report["rejected"]) == 1
+    assert report["rejected"][0]["stage"] == "plain_stage"
+    assert len(report["generated"]) == 1
+    gen = report["generated"][0]
+    assert gen["stage"] == "plain_stage"
+    assert gen["ref"] == "stage_metrics/plain_stage/metric.py"
+    assert gen["exemplar"]["kind"] == "synthetic"
+    assert gen["exemplar"]["trust_tier"] == "reference:S:synthetic"
+    assert gen["exemplar"]["grounded_on"] == []  # no clip attached -> no donor
+
+    assert m.stages[0].steering_metric == "stage_metrics/plain_stage/metric.py"
+
+    stage_dir = Path(m.mission_dir) / "stage_metrics" / "plain_stage"
+    meta = json.loads((stage_dir / "meta.json").read_text())
+    assert meta["accepted"] is True
+    assert meta["exemplar"]["kind"] == "synthetic"
+    assert meta["exemplar"]["trust_tier"] == "reference:S:synthetic"
+
+    sig = json.loads((stage_dir / "synthetic_signature.json").read_text())
+    assert sig["tier"] == "S"
+    assert sig["clip_id"] == "synthetic:plain_stage"
+
+    from sculptor.reference import load_clip
+
+    npz_path = stage_dir / "synthetic_exemplar.npz"
+    assert npz_path.is_file()
+    reloaded = load_clip(npz_path)
+    assert reloaded["fps"] == pytest.approx(30.0)
+
+
+def test_unresolved_span_decline_also_attempts_synthetic(tmp_path, monkeypatch):
+    """(b) unresolved span decline (H2 reject path) -> the existing
+    reject entry is kept AND the synthetic pass is attempted; on
+    success the stage still gets an accepted metric this pass."""
+    root = _write_fixture_clip(tmp_path, "g1", "getup_demo_clip")
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(root))
+
+    def fake_select(clip, *, goal_text, start_pose=None, llm_call=None):
+        return None, "low_confidence:0.42"
+
+    monkeypatch.setattr("sculptor.refs.spans.select_reference_span", fake_select)
+
+    import sculptor.eval as ev
+    monkeypatch.setattr(ev, "generate_objective_metric", _fake_gen_accepts_only_with_references)
+
+    def fake_synth(goal_text, *, start_pose=None, analogous_signatures=None,
+                   robot="g1", llm_call=None):
+        return _synth_clip(), None
+
+    import sculptor.refs.synth as synth_mod
+    monkeypatch.setattr(synth_mod, "synthesize_reference_clip", fake_synth)
+
+    s1 = _mk_stage("get_up", reference_clip_id="getup_demo_clip")
+    m = _mk_mission(tmp_path, [s1])
+    report = generate_stage_metrics(m)
+
+    assert len(report["rejected"]) == 1
+    assert "D23 class" in report["rejected"][0]["reason"]
+    assert len(report["generated"]) == 1
+    gen_entry = report["generated"][0]
+    assert gen_entry["exemplar"]["kind"] == "synthetic"
+    # The stage's own (mismatched-scope) clip is still a numbers donor.
+    assert gen_entry["exemplar"]["grounded_on"] == ["getup_demo_clip"]
+    assert m.stages[0].steering_metric == "stage_metrics/get_up/metric.py"
+
+
+def test_reference_load_error_also_attempts_synthetic(tmp_path, monkeypatch):
+    """(c) attached clip failed to load (M3 reject path) -> the existing
+    reject entry is kept AND the synthetic pass is attempted."""
+    root = tmp_path / "empty_refs_root"
+    root.mkdir()
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(root))
+
+    import sculptor.eval as ev
+    monkeypatch.setattr(ev, "generate_objective_metric", _fake_gen_accepts_only_with_references)
+
+    def fake_synth(goal_text, *, start_pose=None, analogous_signatures=None,
+                   robot="g1", llm_call=None):
+        return _synth_clip(), None
+
+    import sculptor.refs.synth as synth_mod
+    monkeypatch.setattr(synth_mod, "synthesize_reference_clip", fake_synth)
+
+    s1 = _mk_stage("get_up", reference_clip_id="nonexistent_clip")
+    m = _mk_mission(tmp_path, [s1])
+    report = generate_stage_metrics(m)
+
+    assert len(report["rejected"]) == 1
+    assert "attached reference failed to load" in report["rejected"][0]["reason"]
+    assert len(report["generated"]) == 1
+    assert report["generated"][0]["exemplar"]["kind"] == "synthetic"
+    # The donor clip failed to load too -> no signatures, but synthesis
+    # is still attempted (grounded on robot constants alone).
+    assert report["generated"][0]["exemplar"]["grounded_on"] == []
+    assert m.stages[0].steering_metric == "stage_metrics/get_up/metric.py"
+
+
+def test_synthetic_decline_recorded_and_stage_stays_rejected(tmp_path, monkeypatch):
+    """(c) synth decline -> recorded on the reject entry, stage ends
+    rejected exactly as it would have without the synthetic path."""
+    def fake_gen(goal, out_dir, **kw):
+        return {"accepted": False, "validation": {"reasons": ["degenerate"]}}
+
+    import sculptor.eval as ev
+    monkeypatch.setattr(ev, "generate_objective_metric", fake_gen)
+
+    def fake_synth(goal_text, **kw):
+        return None, "low_confidence:0.40"
+
+    import sculptor.refs.synth as synth_mod
+    monkeypatch.setattr(synth_mod, "synthesize_reference_clip", fake_synth)
+
+    m = _mk_mission(tmp_path, [_mk_stage("plain_stage")])
+    report = generate_stage_metrics(m)
+
+    assert report["generated"] == []
+    assert len(report["rejected"]) == 1
+    entry = report["rejected"][0]
+    assert entry["synthetic_exemplar_declined"] == "low_confidence:0.40"
+    assert m.stages[0].steering_metric is None
+
+
+def test_synthetic_exemplar_disabled_via_env_skips_path(tmp_path, monkeypatch):
+    """(e) RS_SYNTHETIC_EXEMPLAR=0 -> the synthetic path is skipped
+    entirely (never even calls `synthesize_reference_clip`), and the
+    stage is left exactly as it would have been pre-D28."""
+    monkeypatch.setenv("RS_SYNTHETIC_EXEMPLAR", "0")
+
+    def fake_gen(goal, out_dir, **kw):
+        return {"accepted": False, "validation": {"reasons": ["degenerate"]}}
+
+    import sculptor.eval as ev
+    monkeypatch.setattr(ev, "generate_objective_metric", fake_gen)
+
+    def boom(*a, **kw):  # pragma: no cover — must not run
+        raise AssertionError(
+            "synthesize_reference_clip must not be called when disabled")
+
+    import sculptor.refs.synth as synth_mod
+    monkeypatch.setattr(synth_mod, "synthesize_reference_clip", boom)
+
+    m = _mk_mission(tmp_path, [_mk_stage("plain_stage")])
+    report = generate_stage_metrics(m)
+
+    assert report["generated"] == []
+    assert len(report["rejected"]) == 1
+    assert "synthetic_exemplar_declined" not in report["rejected"][0]
+    assert m.stages[0].steering_metric is None
+
+
+def test_synthetic_certification_crash_never_raises(tmp_path, monkeypatch):
+    """A crash inside the synthetic generation call must not break the
+    stage's fallback contract — recorded as a decline reason, never
+    propagated."""
+    def fake_gen_plain(goal, out_dir, *, references=None, **kw):
+        if references:
+            raise RuntimeError("GPU exploded mid-synthetic-cert")
+        return {"accepted": False, "validation": {"reasons": ["degenerate"]}}
+
+    import sculptor.eval as ev
+    monkeypatch.setattr(ev, "generate_objective_metric", fake_gen_plain)
+
+    def fake_synth(goal_text, **kw):
+        return _synth_clip(), None
+
+    import sculptor.refs.synth as synth_mod
+    monkeypatch.setattr(synth_mod, "synthesize_reference_clip", fake_synth)
+
+    m = _mk_mission(tmp_path, [_mk_stage("plain_stage")])
+    report = generate_stage_metrics(m)  # must not raise
+
+    assert report["generated"] == []
+    entry = report["rejected"][0]
+    assert "GPU exploded" in entry["synthetic_exemplar_declined"]
+    assert m.stages[0].steering_metric is None

@@ -377,6 +377,24 @@ function StageMetricChip({
   );
 }
 
+// §D28 F-SYNTH: no matching reference clip existed for this stage's
+// goal, so the accepted metric was certified against a last-resort
+// SYNTHESIZED exemplar (sculptor.refs.synth) instead of a real one.
+// Observe-grade only — never steer-grade until task-derived
+// calibration upgrades it (see docs/internal/REFERENCE_BUILD_LOG.md D28).
+function SyntheticExemplarChip({ kind }: { kind: StageSchema["exemplar_kind"] }) {
+  if (kind !== "synthetic") return null;
+  return (
+    <span
+      className="rs-badge violet"
+      style={{ fontSize: 9.5, cursor: "help" }}
+      title="No matching reference clip — the metric was certified against a synthesized exemplar grounded on analogous clip data. Observe-grade until task-derived calibration; attach a matching clip and Regenerate for reference-anchored certification."
+    >
+      <Icon name="sparkles" size={10} />synthetic exemplar
+    </span>
+  );
+}
+
 // §R1 (reference library): row after StageMetricChip showing the
 // attached reference clip (text + tier), or a ghost "Pick reference"
 // button that opens ReferencePickerDialog. Kept modest — this is the v1
@@ -767,6 +785,7 @@ function StageCard({
           </span>
         )}
         <StageMetricChip status={stage.metric_status} steeringMetric={stage.steering_metric} />
+        <SyntheticExemplarChip kind={stage.exemplar_kind} />
       </button>
       <ReferenceRow slug={slug} missionSlug={missionSlug} stage={stage} />
       {stage.status === "superseded" && (

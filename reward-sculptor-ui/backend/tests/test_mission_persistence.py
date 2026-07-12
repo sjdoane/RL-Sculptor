@@ -126,11 +126,15 @@ def _write_provenance(mission_dir_path: Path, stage_records: list[dict]) -> None
 
 
 def _write_stage_metric_meta(
-    mission_dir_path: Path, stage_name: str, *, accepted: bool,
+    mission_dir_path: Path, stage_name: str, *,
+    accepted: bool, exemplar: dict | None = None,
 ) -> None:
     d = mission_dir_path / "stage_metrics" / stage_name
     d.mkdir(parents=True, exist_ok=True)
-    (d / "meta.json").write_text(json.dumps({"accepted": accepted}))
+    payload: dict = {"accepted": accepted}
+    if exemplar is not None:
+        payload["exemplar"] = exemplar
+    (d / "meta.json").write_text(json.dumps(payload))
 
 
 # ── mission_store unit-level coverage (via GET /missions/{slug}) ─────
@@ -446,6 +450,40 @@ def test_metric_status_all_four_values(
         "rejected_stage": "rejected",
         "inherited_stage": "inherited",
         "none_stage": "none",
+    }
+
+
+def test_exemplar_kind_synthetic_reference_and_none(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    """§D28 F-SYNTH: `exemplar_kind` is a DERIVED field (not mirrored
+    from sculptor.mission.Stage) — "synthetic" when the accepted
+    metric's meta.json carries an `exemplar.kind == "synthetic"` block,
+    "reference" when a real reference_clip_id is attached with no
+    synthetic exemplar, None otherwise."""
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    md = _write_mission(project_dir, "m1", [
+        _stage_dict("synthetic_stage", status="pending"),
+        _stage_dict(
+            "reference_stage", status="pending",
+            reference_clip_id="some_clip"),
+        _stage_dict("plain_stage", status="pending"),
+    ])
+    _write_stage_metric_meta(
+        md, "synthetic_stage", accepted=True,
+        exemplar={
+            "kind": "synthetic", "confidence": 0.8, "grounded_on": [],
+            "trust_tier": "reference:S:synthetic",
+        })
+    _write_stage_metric_meta(md, "reference_stage", accepted=True)
+
+    r = client.get(f"/projects/{slug}/missions/m1")
+    kind_by_name = {s["name"]: s["exemplar_kind"] for s in r.json()["stages"]}
+    assert kind_by_name == {
+        "synthetic_stage": "synthetic",
+        "reference_stage": "reference",
+        "plain_stage": None,
     }
 
 

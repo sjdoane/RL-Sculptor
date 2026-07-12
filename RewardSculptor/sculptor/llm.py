@@ -78,6 +78,12 @@ ROLE_DEFAULTS: dict[str, str] = {
     # (`sculptor.decompose.ground_stage_criterion`). Same D1 all-fable-5
     # default — not the metric author/ladder pair kept model-disjoint.
     "criterion_ground": "claude-fable-5",
+    # §D28 F-SYNTH (docs/internal/REFERENCE_BUILD_LOG.md D28): sketches a
+    # LAST-RESORT synthetic exemplar (`sculptor.refs.synth.
+    # synthesize_reference_clip`) when no real reference clip matches a
+    # stage's goal closely enough to certify against. Same D1 all-fable-5
+    # default — not the metric author/ladder pair kept model-disjoint.
+    "exemplar_synth": "claude-fable-5",
 }
 
 #: §LAW 9 review panel: author-DISJOINT by construction — none of these

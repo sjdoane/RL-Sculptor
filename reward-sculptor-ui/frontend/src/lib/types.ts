@@ -958,6 +958,13 @@ export interface StageSchema {
   on_disk_only?: boolean;
   // How this stage got (or failed to get) its objective metric.
   metric_status?: "accepted" | "rejected" | "inherited" | "none" | null;
+  // §D28 F-SYNTH: derived (not mirrored from sculptor.mission.Stage) —
+  // "synthetic" when the accepted metric was certified against a
+  // last-resort synthesized exemplar (no matching reference clip;
+  // never steer-grade on its own — observe-grade until task-derived
+  // calibration), "reference" when a real reference_clip_id is
+  // attached with no synthetic exemplar, null otherwise.
+  exemplar_kind?: "reference" | "synthetic" | null;
   // §R1 (reference library): attached reference clip, if any. Set via
   // POST/DELETE .../stages/{stage}/reference (see lib/api.ts). tier and
   // match_confidence are mirrored from the clip's provenance / the
