@@ -471,6 +471,54 @@ not live-green: every one of the three classes above shipped through a
 fully green suite and was caught only by running the real pipeline
 against the real mission.
 
+### D26. Fresh-context Opus audit of the D24/D25 batch: 6 confirmed findings, all fixed same-session
+The audit's headline: the individual gates were strong, but EVERY span-
+selection failure mode funneled to full-clip certification — the exact
+D23 configuration the batch exists to eliminate. Findings and fixes:
+- **H1 (proven exploit)**: the end-state QC was vacuously satisfied by a
+  loose z_band ([0.05,0.80] and [0,1] both ACCEPTED the over-extended
+  0->11.2 s span). Fix: band width capped at max(0.15 m, 35% of the
+  clip's z-range) — an uncommitted claim is a rejection; audit's exact
+  table pinned (f0c5905).
+- **H2**: unresolved span declines (low_confidence/qc_reject/crop_error)
+  fell back to full-clip certification AND the declined marker pinned it
+  permanently. Fix: fail CLOSED — reject the stage's metric generation
+  loudly (stage uses the mission-level fallback; criterion + start-state
+  gate verified unaffected); only the LLM's affirmative whole_clip
+  verdict certifies full-clip; the explicit per-stage regen endpoint
+  clears declined markers so a user retry re-runs selection.
+- **H3 (proven live)**: scaffold idempotency guards reused STALE
+  full-clip artifacts after the span changed — the repaired stage's
+  on-disk eval_reset had a SIGN-FLIPPED roll offset vs the span-derived
+  preview (+1.265 vs -0.370), and the stale reference_signature would
+  have steered the diagnoser toward standing on resume. (The orchestra-
+  tor's own "span starts at 0 so reset is equivalent" assumption was
+  WRONG — end-window-dependent derivation.) Fix: span stamped into the
+  RSI env-spec meta (derived_from_span) + signature; guards re-derive on
+  mismatch with span_changed events; live stage's derived env lineage
+  cleared with backups (.pre_d24_repair_backup/).
+- **M1 (proven)**: _phase_segments' 3-decimal rounding emitted an end
+  boundary ~0.4 ms past the true duration — legitimate reaches-the-end
+  spans died as crop errors. Fix: half-frame clamp.
+- **M2**: ends_settled's range-over-0.5s read flipped non-monotonically
+  on mocap wiggle — the REQUIRED fast_completion gate could silently
+  fail OPEN on a near-boundary span. Fix: least-squares trend over
+  min(1.0 s, 25% of duration); live verdicts preserved.
+- **M3**: an ATTACHED clip that failed to load silently downgraded to
+  ungated no-reference acceptance. Fix: fail closed (reject with the
+  load error); clipless stages unchanged.
+- **L1 (accepted, documented)**: the golden regression pins the
+  snapshotted ARTIFACT, not the pipeline — reframed honestly in the test
+  docstring; the pipeline itself is pinned by the spans/gates/criterion
+  test files.
+- **Clean bills** (audit genuinely tried): criterion-grounding eval
+  safety (allowlist AST gate ordering verified — materially stronger
+  than the denylist history), F4 NaN/serialization, declined-marker
+  consumer confusion, snap-collision handling.
+- **L2 residual (open)**: positives don't bracket overshoot-then-settle
+  or intermediate-speed short-hold shapes — the surface where a fifth
+  class would live; no constructive exploit found.
+
 ### Deferred findings (logged, not yet fixed)
 - Steer ENFORCEMENT unification: reference-calibration trust is computed
   and event-recorded in mission_metrics, but the live steer/observe gate
