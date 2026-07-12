@@ -1191,28 +1191,34 @@ def _validate_references(
         # it separately here. Recorded in `archetype_scores` regardless of
         # pass/fail (a crash scores nan — "no signal", the same convention
         # every other reference score uses).
-        # Scored at TWO hold ratios: x1 (hold as long as the motion) and x4
-        # (hold dominates, ~80% of the padded trajectory — the realistic D23
-        # live shape: a brief transition inside a long fixed episode). A
-        # verification pass proved a single-ratio gate is narrowly passable
-        # by fraction-of-episode-length window reads (forbidden by the
-        # RELATIVE-TIME authoring rule) that collapse at longer holds — the
-        # exact defect class this gate exists to kill. Both must clear.
+        # Scored at TWO hold ratios: x1 (hold as long as the motion) and x24.
+        # The second ratio is chosen from the OPERATING ENVELOPE, not
+        # arbitrarily: max episode (~500 frames) / fastest plausible
+        # completion (~25 frames, the D23 live sit-up) ≈ 20, so x24 exceeds
+        # every realistic hold ratio — a metric that clears it is
+        # hold-invariant over the whole regime. Two verification passes
+        # earned this: a single-ratio gate was narrowly passable by
+        # fraction-of-episode-length window reads (forbidden by the
+        # RELATIVE-TIME rule), and a x4 second ratio was still evadable by
+        # denominators k in [5, 20) that collapse at the realistic 19x hold.
+        # Fraction windows with k > 25 technically evade x24 too but are
+        # benign at real episode shapes (their window is already smaller
+        # than the motion itself) — envelope-bounded, not an arms race.
         try:
             cth_clip = complete_then_hold(clip)
             cth_score, _ = _score_reference_entry(fn, cth_clip, required_roles)
         except Exception:  # noqa: BLE001 — never let one clip's perturbation crash validation
             cth_score = float("nan")
         try:
-            cth_x4_clip = complete_then_hold(clip, hold_frac=4.0)
-            cth_x4_score, _ = _score_reference_entry(
-                fn, cth_x4_clip, required_roles)
+            cth_x24_clip = complete_then_hold(clip, hold_frac=24.0)
+            cth_x24_score, _ = _score_reference_entry(
+                fn, cth_x24_clip, required_roles)
         except Exception:  # noqa: BLE001 — same convention as above
-            cth_x4_score = float("nan")
+            cth_x24_score = float("nan")
         pert_scores["complete_then_hold"] = cth_score
         all_scores[f"reference:{clip_id}:complete_then_hold"] = cth_score
-        pert_scores["complete_then_hold_x4"] = cth_x4_score
-        all_scores[f"reference:{clip_id}:complete_then_hold_x4"] = cth_x4_score
+        pert_scores["complete_then_hold_x24"] = cth_x24_score
+        all_scores[f"reference:{clip_id}:complete_then_hold_x24"] = cth_x24_score
 
         ref_gates: dict[str, bool] = {}
         ref_reasons: list[str] = []
@@ -1284,21 +1290,21 @@ def _validate_references(
         cth_threshold = max(0.5, 0.8 * full_score) if finite_full else float("inf")
         cth_ok = bool(
             finite_full and np.isfinite(cth_score)
-            and np.isfinite(cth_x4_score)
+            and np.isfinite(cth_x24_score)
             and cth_score >= cth_threshold - 1e-9
-            and cth_x4_score >= cth_threshold - 1e-9)
+            and cth_x24_score >= cth_threshold - 1e-9)
         ref_gates["reference_complete_then_hold"] = cth_ok
         if not cth_ok:
             ref_reasons.append(
                 f"[reference:{clip_id}] complete_then_hold: scores x1 "
-                f"{cth_score:.3f} / x4 {cth_x4_score:.3f} must BOTH reach "
+                f"{cth_score:.3f} / x24 {cth_x24_score:.3f} must BOTH reach "
                 f"{cth_threshold:.3f} (max(0.5, 0.8 * full {full_score:.3f})) "
                 f"— the metric does not score a reach-then-hold completion "
                 f"of the reference as the positive exemplar it is (D23: this "
                 f"is the exact shape of a live rollout that reaches the goal "
-                f"early and holds it, which scored spec 0.0; the x4 ratio "
-                f"kills fraction-of-episode window reads that only survive "
-                f"short holds)")
+                f"early and holds it, which scored spec 0.0; x24 exceeds the "
+                f"realistic episode/motion hold ratio, so window reads scaled "
+                f"to episode length cannot survive it)")
 
         entry: dict[str, Any] = {
             "clip_id": clip_id,

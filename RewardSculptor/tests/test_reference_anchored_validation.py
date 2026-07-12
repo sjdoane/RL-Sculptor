@@ -39,7 +39,7 @@ def _rising_clip() -> dict:
 # by "hold the end pose the whole time" (freeze_end), which the
 # reference_negatives gate is specifically built to catch. Windows are
 # FIXED-SIZE (hold-invariant): fraction-of-episode windows violate the
-# RELATIVE-TIME authoring rule and die on complete_then_hold_x4 — that
+# RELATIVE-TIME authoring rule and die on complete_then_hold_x24 — that
 # defect is pinned separately by FRACTION_WINDOW_METRIC below.
 HONEST_GETUP = '''import numpy as np
 def compute_spec(arrays, behavior, meta):
@@ -56,23 +56,27 @@ def compute_spec(arrays, behavior, meta):
     return {"spec_score": val}
 '''
 
-# The pre-D24 "honest" fixture, kept verbatim as a PINNED EXPLOIT: its
-# fraction-of-episode windows (first/last quarter of n) read held terminal
-# frames into the START window once a long hold is appended, so it narrowly
-# clears complete_then_hold at x1 but collapses at x4 — the exact D23 live
-# shape (brief transition, long hold). Must FAIL the gate.
-FRACTION_WINDOW_METRIC = '''import numpy as np
+# The pre-D24 "honest" fixture shape, kept as a PINNED EXPLOIT FAMILY:
+# fraction-of-episode windows (first/last n/k frames) read held terminal
+# frames into the START window once the appended hold exceeds k-1 times the
+# motion, so they clear complete_then_hold at small hold ratios but collapse
+# at the realistic one (D23 live shape: ~0.5 s motion, 9.5 s hold, ~19x).
+# A second verification pass proved k in [5, 20) also evaded a x4 second
+# ratio — hence the gate's x24, which exceeds the whole realistic envelope.
+# Every k here must FAIL the gate.
+def _fraction_window_metric(k: int) -> str:
+    return f'''import numpy as np
 def compute_spec(arrays, behavior, meta):
     root = arrays.get("root_link_pos_w")
     if root is None:
-        return {"spec_score": 0.0}
+        return {{"spec_score": 0.0}}
     z = root[..., 2]
     n = z.shape[0]
-    first_q = z[:max(1, int(0.25 * n))].mean()
-    final_q = z[int(0.75 * n):].mean()
+    first_q = z[:max(1, n // {k})].mean()
+    final_q = z[n - max(1, n // {k}):].mean()
     rise = np.clip(final_q - first_q, 0.0, None)
     val = float(np.clip(final_q * rise / 0.75, 0.0, 1.0))
-    return {"spec_score": val}
+    return {{"spec_score": val}}
 '''
 
 # A DEGENERATE metric: constant output regardless of input.
@@ -450,29 +454,44 @@ def test_punish_end_stillness_metric_fails_complete_then_hold_with_scores_in_rea
     assert f"{full:.3f}" in reason
 
 
-def test_fraction_window_metric_fails_complete_then_hold_at_x4(tmp_path):
-    """PINNED EXPLOIT (found by the D24 F3 verification pass): a metric
-    reading fraction-of-episode-length windows survives the x1 hold ratio
-    by a narrow margin but collapses when the hold dominates — appending a
-    long hold drags held terminal frames into its "start" window and kills
-    the rise term, reproducing the D23 zero on a correct completion. The
-    x4 ratio exists precisely to convict this class; a single-ratio gate
-    let it through."""
+@pytest.mark.parametrize("k", [4, 10, 15, 20])
+def test_fraction_window_metric_family_fails_complete_then_hold(tmp_path, k):
+    """PINNED EXPLOIT FAMILY (two D24 verification passes): metrics reading
+    first/last n/k windows survive small hold ratios but collapse once the
+    appended hold exceeds k-1 times the motion — held terminal frames leak
+    into the "start" window and kill the rise term, reproducing the D23
+    zero on a correct completion. k=4 fell to the original x4 gate; k in
+    [5, 20) evaded x4 while failing the realistic 19x live shape — the x24
+    ratio convicts the whole family up to the operating envelope."""
     clip = _rising_clip()
-    p = _write(tmp_path, "fraction_window.py", FRACTION_WINDOW_METRIC)
-    v = validate_generated_metric(
-        FRACTION_WINDOW_METRIC, p, references=[("getup1", clip)])
-    assert v["gates"]["reference_complete_then_hold:getup1"] is False, v["reasons"]
+    src = _fraction_window_metric(k)
+    p = _write(tmp_path, f"fraction_window_{k}.py", src)
+    v = validate_generated_metric(src, p, references=[("getup1", clip)])
+    assert v["gates"]["reference_complete_then_hold:getup1"] is False, (
+        k, v["reasons"])
     assert v["ok"] is False
     sc = v["references"][0]["scores"]
     threshold = max(0.5, 0.8 * sc["full"])
-    # x1 narrowly clears the bar (the exploit) — x4 collapses (the conviction).
-    assert sc["complete_then_hold"] >= threshold - 1e-9
-    assert sc["complete_then_hold_x4"] < threshold
-    assert "reference:getup1:complete_then_hold_x4" in v["archetype_scores"]
+    # x1 clears the bar (the evasion) — x24 collapses (the conviction).
+    assert sc["complete_then_hold"] >= threshold - 1e-9, (k, sc)
+    assert sc["complete_then_hold_x24"] < threshold, (k, sc)
+    assert "reference:getup1:complete_then_hold_x24" in v["archetype_scores"]
     reason = next(
         r for r in v["references"][0]["reasons"] if "complete_then_hold" in r)
-    assert "x4" in reason
+    assert "x24" in reason
+
+
+def test_hold_invariant_metric_passes_all_hold_ratios(tmp_path):
+    """The gate's intent is achievable: a fixed-size-window (hold-invariant)
+    metric scores identically at every hold ratio and passes."""
+    clip = _rising_clip()
+    p = _write(tmp_path, "hold_invariant.py", HONEST_GETUP)
+    v = validate_generated_metric(
+        HONEST_GETUP, p, references=[("getup1", clip)])
+    assert v["gates"]["reference_complete_then_hold:getup1"] is True, v["reasons"]
+    sc = v["references"][0]["scores"]
+    assert sc["complete_then_hold_x24"] == pytest.approx(
+        sc["complete_then_hold"], abs=1e-6)
 
 
 def test_freeze_end_rejected_and_complete_then_hold_passes_together(tmp_path):
