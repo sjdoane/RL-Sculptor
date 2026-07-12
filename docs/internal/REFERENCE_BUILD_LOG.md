@@ -259,6 +259,20 @@ resolvable clip must not silently fall back across task class; (c) a
 MECHANICAL start-state gate — when a stage has eval_reset.json, success
 requires the eval rollout's frame-0 state to match it within tolerance.
 
+### D20a. GPU reset probe: two of four derived lying resets are PROPPED (scripts/probe_start_pose.py)
+2-env CUDA probe, 25 zero-action settle steps, per-stage renders
+(reports/start_pose_probe/). feet_under_crouch and drive_to_stand rest
+stably from frame 0 (z drop ≤ 0.01 m). torso_righting resets in a
+partial-inversion pose (legs cocked in the air) and collapses 0.234 m
+while settling; getup_and_hold resets in a bridge pose and collapses
+0.132 m. The derivation copies the clip's start-window pose verbatim;
+mocap start frames can be mid-roll/unsettled even after segment QC
+(z-stillness ≠ whole-body rest). Fix chosen (D21 batch): settle-then-
+rederive at scaffold — run the derived midpoint pose ~0.5 s on CPU
+MuJoCo, re-read (z, pitch, roll, joints) from the settled state, keep
+range widths/noise; eval_reset gets the settled scalars. Every derived
+reset becomes physically resting by construction.
+
 ### Audit findings deferred (logged, not yet fixed)
 - Tier-D spoofing (LOW, latent): calibrate_metric_against_reference's
   `tier` arg comes from caller/provenance (user-writable) — no production
