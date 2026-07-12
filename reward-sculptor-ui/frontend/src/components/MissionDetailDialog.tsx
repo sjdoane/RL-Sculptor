@@ -444,6 +444,20 @@ function ReferenceRow({
             )}
             {stage.reference_tier && <span style={{ opacity: 0.7 }}>&nbsp;· tier {stage.reference_tier}</span>}
           </span>
+          {stage.reference_span_method?.startsWith("declined:") && (
+            // A declined sub-span selection fails CLOSED: the stage refuses
+            // full-clip certification (D23 class) and runs on the mission
+            // fallback. Without this badge the only trace was the regen
+            // job's result payload — a click that "did nothing".
+            <span
+              className="rs-badge amber"
+              style={{ fontSize: 9.5, cursor: "help" }}
+              title={`Reference sub-span selection declined — the stage refuses full-clip certification and uses the mission-level fallback metric.\n\n${stage.reference_span_method.slice("declined:".length)}\n\nFix the cause (usually the attached clip), then Regenerate metric.`}
+            >
+              <Icon name="alert-triangle" size={10} />
+              span declined
+            </span>
+          )}
           <Btn
             kind="ghost" size="xs" icon="pencil"
             onClick={(e) => { e.stopPropagation(); setPickerOpen(true); }}

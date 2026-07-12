@@ -111,6 +111,10 @@ _MOTION_FLOOR_GZ = 0.10
 _END_WINDOW_S = 0.5
 #: z-band tolerance either side of the LLM-stated `expected_end.z_band`.
 _END_Z_BAND_TOLERANCE_M = 0.05
+#: Below this span-START g_z (pelvis already near-upright), the
+#: "g_z_more_upright" direction question has no headroom and is skipped —
+#: see the NO-HEADROOM guard in `_end_state_qc`.
+_GZ_NO_HEADROOM_START = -0.75
 #: Minimum |end-window g_z mean - start-window g_z mean| required to
 #: count as "the span's ending orientation is more upright than its
 #: start" — same RELATIVE-change convention as `_MOTION_FLOOR_GZ`
@@ -387,6 +391,17 @@ def _end_state_qc(
     gz_end = _window_mean_gz(cropped, from_start=False, window_s=_END_WINDOW_S)
     gz_start = _window_mean_gz(cropped, from_start=True, window_s=_END_WINDOW_S)
     if gz_end is not None and gz_start is not None:
+        # NO-HEADROOM guard (live false-reject, g1-standing-up 2026-07-12):
+        # a crouch->stand clip's PELVIS is near-upright the whole time
+        # (d13_crouch_to_ready: g_z -0.996 -> -0.995), so "does the span
+        # end MORE upright" has no headroom — the honest claim can never
+        # clear the +/-0.05 direction threshold and the stage was pinned
+        # to a declined marker. When the span already STARTS near-upright
+        # in the pelvis frame, the direction question is meaningless in
+        # either polarity: skip it and let the z-band commitment (checked
+        # above) carry the end-state claim alone.
+        if gz_start <= _GZ_NO_HEADROOM_START:
+            return None
         delta = gz_end - gz_start  # negative = more upright
         more_upright = delta <= -_END_STATE_GZ_TOLERANCE
         claimed_more_upright = bool(expected_end["g_z_more_upright"])

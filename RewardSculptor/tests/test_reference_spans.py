@@ -444,3 +444,47 @@ def test_live_span_is_fast_completion_gated():
     assert ends_settled(crop_span(clip, 0.0, 8.1)) is True
     assert ends_settled(crop_span(clip, 0.0, 9.0)) is False
     assert ends_settled(clip) is False
+
+
+def test_end_state_direction_skipped_when_no_headroom():
+    """LIVE FALSE-REJECT (g1-standing-up drive_to_stand, 2026-07-12): a
+    crouch->stand clip's PELVIS is near-upright for the whole motion
+    (d13_crouch_to_ready: g_z -0.996 -> -0.995), so no honest answer to
+    "does the span end more upright" can clear the direction threshold —
+    the stage was pinned to a declined marker after one click. When the
+    span STARTS near-upright (g_z <= -0.75) the direction question is
+    skipped in either polarity; the z-band commitment still binds."""
+    import numpy as np
+    from sculptor.refs.spans import select_reference_span
+
+    # Synthetic crouch->rise clip: pelvis upright throughout (identity
+    # quat => g_z = -1), z rises 0.1 -> 0.4 then holds.
+    n, fps = 120, 30.0
+    z = np.concatenate([np.full(30, 0.10), np.linspace(0.10, 0.40, 60),
+                        np.full(30, 0.40)])
+    quat = np.tile([1.0, 0.0, 0.0, 0.0], (n, 1))
+    clip = {"root_pos_z": z, "fps": fps, "root_quat_wxyz": quat}
+
+    def call(up):
+        import json as _json
+        return lambda p: _json.dumps({
+            "t_start_s": 0.0, "t_end_s": 4.0, "confidence": 0.9,
+            "rationale": "x", "whole_clip": False,
+            "expected_end": {"z_band": [0.35, 0.45], "g_z_more_upright": up}})
+
+    # BOTH polarities of the vacuous claim are accepted when the z-band
+    # commitment holds — the direction question has no headroom here.
+    for up in (True, False):
+        span, reason = select_reference_span(
+            clip, goal_text="drive up to ready", llm_call=call(up))
+        assert span is not None, (up, reason)
+    # ... and the z-band still convicts a wrong end-height claim.
+    import json as _json
+    bad = lambda p: _json.dumps({
+        "t_start_s": 0.0, "t_end_s": 4.0, "confidence": 0.9,
+        "rationale": "x", "whole_clip": False,
+        "expected_end": {"z_band": [0.05, 0.15], "g_z_more_upright": True}})
+    span, reason = select_reference_span(
+        clip, goal_text="drive up to ready", llm_call=bad)
+    assert span is None
+    assert "outside expected_end.z_band" in reason
