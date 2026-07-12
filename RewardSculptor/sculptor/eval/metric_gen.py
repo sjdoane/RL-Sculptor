@@ -66,6 +66,36 @@ def _build_reference_signature_block(
         lines.append(f"## clip_id: {clip_id}")
         lines.append(json.dumps(sig, indent=2, default=str))
         lines.append("")
+    # §D24 F3: two authoring rules closing the D23/D22 reference-anchored
+    # failure classes, in the same "hard-won rejection cause" style as the
+    # base prompt's TIME-SERIES HYGIENE section (D12). Scoped to the
+    # reference block (rendered only when references are attached) since
+    # both rules are specifically about scoring a REFERENCE completion
+    # correctly regardless of when/how it is held.
+    lines.append("## RELATIVE-TIME RULE (hard-won rejection cause)")
+    lines.append(
+        "- NEVER assume absolute frame counts, absolute timestamps, or that "
+        "the goal occurs at a fixed FRACTION of the episode length. A "
+        "rollout may reach the goal EARLY and hold it there for the rest of "
+        "the episode — the metric MUST score a reference-prefix-then-hold "
+        "trajectory (the goal reached, then the terminal state sustained) "
+        "AS HIGHLY as the reference itself. End-window reads (\"is the LAST "
+        "N frames' state near the goal\") are fine; \"the transition must "
+        "happen at t=X\" or \"phase Y occupies frames [a, b)\" is not — a "
+        "metric will be scored on exactly this reach-then-hold shape and "
+        "rejected if it does not rank it with the reference.")
+    lines.append("")
+    lines.append("## HOLD-GOAL RULE (hard-won rejection cause)")
+    lines.append(
+        "- When the goal includes HOLDING a terminal state (a stand, a sit, "
+        "a balance), the completion gate MUST ALSO require the START of the "
+        "scored window to be AWAY FROM / BELOW that terminal state — never "
+        "satisfied by a clip that is already in the goal state from frame 0. "
+        "Without this, a rollout that starts (or resets) already in the "
+        "terminal pose and never performs the transition scores identically "
+        "to one that actually achieved it — the metric must distinguish "
+        "'reached the goal' from 'was already there'.")
+    lines.append("")
     return "\n".join(lines), signatures
 
 

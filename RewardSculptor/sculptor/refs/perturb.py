@@ -98,6 +98,46 @@ def freeze_end(clip: dict) -> dict:
     return _validate_or_raise(out)
 
 
+def complete_then_hold(clip: dict, hold_frac: float = 1.0) -> dict:
+    """The FULL clip followed by `max(2, int(round(T*hold_frac)))` appended
+    frames holding the LAST frame — a completed motion whose terminal state
+    is then HELD (velocities zero throughout the hold; every posture/root/
+    contact channel stays pinned at the clip's final values, same as
+    `freeze_end` holds its frame).
+
+    This is a POSITIVE exemplar, not a negative: the goal WAS achieved (the
+    clip's transition happened in full) and the terminal state is simply
+    sustained afterward — exactly the shape of a live rollout that reaches
+    the goal early and holds it for the remainder of the episode (D23: the
+    real `torso_righting` rollout that scored spec 0.0 despite a perfect
+    sit-up looked exactly like this). A metric MUST score this AT LEAST AS
+    well as the reference itself (gated in `metric_validate.py`'s
+    `reference_complete_then_hold`); a metric that penalizes stillness after
+    completion would wrongly punish an early, successful finish.
+
+    This is the exact OPPOSITE of `freeze_end`, which never performs the
+    transition at all (it holds the clip's LAST frame for the clip's FULL
+    original duration, with no preceding motion) and stays a hard NEGATIVE —
+    the two must coexist: `complete_then_hold` scores high, `freeze_end`
+    scores degenerate, on the same honest metric.
+
+    NOT added to `perturbation_suite()` (that dict is consumed as negatives
+    / the calibration ladder); call this directly where a positive-hold
+    exemplar is needed."""
+    if hold_frac < 0.0:
+        raise ValueError(f"hold_frac must be >= 0: {hold_frac}")
+    n = _time_len(clip)
+    hold_n = max(2, int(round(n * hold_frac)))
+    idx = np.concatenate([np.arange(n), np.full(hold_n, n - 1, dtype=int)])
+    out = _rebuild(clip, idx)
+    for vk in ("root_vel_z", "joint_vel"):
+        if vk in out:
+            v = np.array(out[vk], copy=True)
+            v[n:] = 0
+            out[vk] = v
+    return _validate_or_raise(out)
+
+
 def segment_shuffle(clip: dict, n_segments: int = 6, seed: int = 0) -> dict:
     """Chop the clip into `n_segments` contiguous chunks and shuffle their
     ORDER (deterministic given `seed`) — right poses, wrong order."""

@@ -81,7 +81,7 @@ def _write(tmp_path: Path, name: str, src: str) -> Path:
     return p
 
 
-def test_honest_metric_clears_all_three_reference_gates(tmp_path):
+def test_honest_metric_clears_all_four_reference_gates(tmp_path):
     clip = _rising_clip()
     p = _write(tmp_path, "honest.py", HONEST_GETUP)
     v = validate_generated_metric(
@@ -89,6 +89,7 @@ def test_honest_metric_clears_all_three_reference_gates(tmp_path):
     assert v["gates"]["reference_nondegeneracy:getup1"] is True, v["reasons"]
     assert v["gates"]["reference_monotonicity:getup1"] is True, v["reasons"]
     assert v["gates"]["reference_negatives:getup1"] is True, v["reasons"]
+    assert v["gates"]["reference_complete_then_hold:getup1"] is True, v["reasons"]
     assert v["ok"] is True, v["reasons"]
 
     ref_result = v["references"][0]
@@ -97,12 +98,15 @@ def test_honest_metric_clears_all_three_reference_gates(tmp_path):
         "reference_nondegeneracy": True,
         "reference_monotonicity": True,
         "reference_negatives": True,
+        "reference_complete_then_hold": True,
     }
     # speed_slow/speed_fast are scored + recorded but not gate keys.
     assert "speed_slow" in ref_result["scores"]
     assert "speed_fast" in ref_result["scores"]
+    assert "complete_then_hold" in ref_result["scores"]
     assert f"reference:getup1" in v["archetype_scores"]
     assert f"reference:getup1:trunc_50" in v["archetype_scores"]
+    assert f"reference:getup1:complete_then_hold" in v["archetype_scores"]
 
 
 def _late_rising_clip() -> dict:
@@ -333,3 +337,113 @@ def test_score_reference_entry_never_raises_on_a_crashing_metric():
     clip = _rising_clip()
     score, _meta = _score_reference_entry(crashy_fn, clip, [])
     assert np.isnan(score)
+
+
+# ── §D24 F3: `reference_complete_then_hold` — REQUIRED-HIGH positive gate ──
+def test_honest_completion_style_metric_passes_complete_then_hold_gate(tmp_path):
+    """A correct completion-style metric (started low, reached the goal,
+    tolerant of an end-window hold) must score
+    `complete_then_hold(reference)` at least `max(0.5, 0.8 * full)` — the
+    HONEST_GETUP fixture is exactly this shape (started-low first-quarter
+    read, reached-goal final-quarter read, no penalty for the final quarter
+    staying flat)."""
+    clip = _rising_clip()
+    p = _write(tmp_path, "honest.py", HONEST_GETUP)
+    v = validate_generated_metric(
+        HONEST_GETUP, p, references=[("getup1", clip)])
+    assert v["gates"]["reference_complete_then_hold:getup1"] is True, v["reasons"]
+    ref_result = v["references"][0]
+    full = ref_result["scores"]["full"]
+    cth = ref_result["scores"]["complete_then_hold"]
+    assert cth >= max(0.5, 0.8 * full) - 1e-9
+
+
+def _end_motion_clip() -> dict:
+    """Continues rising gently through its LAST quarter (unlike
+    `_rising_clip`'s dead-flat tail) — a clip an "the end must still be
+    changing" metric legitimately certifies on the FULL reference, so a
+    failure on `complete_then_hold` below isolates THAT metric's own defect
+    rather than one already caught by nondegeneracy/monotonicity."""
+    n_flat0, n_ramp, n_tail = 20, 40, 20
+    flat0 = np.full(n_flat0, 0.1)
+    s = np.linspace(0.0, 1.0, n_ramp)
+    ramp = 0.1 + 0.6 * (1 - np.cos(np.pi * s)) / 2.0   # 0.1 -> 0.70
+    tail = np.linspace(0.70, 0.75, n_tail)              # still slowly rising
+    z = np.concatenate([flat0, ramp, tail])
+    return {"root_pos_z": z, "fps": _FPS}
+
+
+# An H2-class defect (D24 F3): in ADDITION to an honest rise/completion
+# read, this metric requires the height to still be CHANGING in the final
+# window. A rollout that reaches the goal and then HOLDS it (exactly what
+# `complete_then_hold` constructs) reads as "stopped acting" and scores 0,
+# even though it passes nondegeneracy/monotonicity/negatives cleanly on the
+# still-drifting `_end_motion_clip` reference.
+PUNISH_END_STILLNESS_METRIC = '''import numpy as np
+def compute_spec(arrays, behavior, meta):
+    root = arrays.get("root_link_pos_w")
+    if root is None:
+        return {"spec_score": 0.0}
+    z = root[..., 2]
+    n = z.shape[0]
+    q = max(2, n // 4)
+    first_q = z[:q].mean()
+    final_q = z[-q:].mean()
+    rise = np.clip(final_q - first_q, 0.0, None)
+    completion = float(final_q >= 0.5)
+    end_motion = np.abs(np.diff(z[-q:], axis=0)).mean()
+    motion_gate = float(np.clip(end_motion / 0.002, 0.0, 1.0))
+    val = float(np.clip(completion * np.clip(rise / 0.5, 0.0, 1.0) * motion_gate, 0.0, 1.0))
+    return {"spec_score": val, "motion_gate": motion_gate}
+'''
+
+
+def test_punish_end_stillness_metric_fails_complete_then_hold_with_scores_in_reason(
+    tmp_path,
+):
+    clip = _end_motion_clip()
+    p = _write(tmp_path, "punish_stillness.py", PUNISH_END_STILLNESS_METRIC)
+    v = validate_generated_metric(
+        PUNISH_END_STILLNESS_METRIC, p, references=[("getup1", clip)])
+    # The other three reference gates are clean — this metric's ONLY defect
+    # is punishing a held completion.
+    assert v["gates"]["reference_nondegeneracy:getup1"] is True, v["reasons"]
+    assert v["gates"]["reference_monotonicity:getup1"] is True, v["reasons"]
+    assert v["gates"]["reference_negatives:getup1"] is True, v["reasons"]
+    assert v["gates"]["reference_complete_then_hold:getup1"] is False, v["reasons"]
+    assert v["ok"] is False
+
+    ref_result = v["references"][0]
+    full = ref_result["scores"]["full"]
+    cth = ref_result["scores"]["complete_then_hold"]
+    assert cth < max(0.5, 0.8 * full)
+    # archetype_scores carries the complete_then_hold entry regardless of
+    # pass/fail.
+    assert "reference:getup1:complete_then_hold" in v["archetype_scores"]
+    assert v["archetype_scores"]["reference:getup1:complete_then_hold"] == pytest.approx(cth)
+    # D12 idiom: the named numbers ride the failure reason.
+    reason = next(r for r in ref_result["reasons"] if "complete_then_hold" in r)
+    assert f"{cth:.3f}" in reason
+    assert f"{full:.3f}" in reason
+
+
+def test_freeze_end_rejected_and_complete_then_hold_passes_together(tmp_path):
+    """The two gates have OPPOSITE polarity and must coexist on the same
+    honest metric: `freeze_end` (never transitions, start == end) stays a
+    rejected negative, while `complete_then_hold` (transitions, then holds
+    the end) is a required positive — proving a hold-tolerant metric that
+    also gates on the start being AWAY FROM the goal (HONEST_GETUP's
+    `rise = final_q - first_q` factor) is not forced to choose between
+    them."""
+    clip = _rising_clip()
+    p = _write(tmp_path, "honest.py", HONEST_GETUP)
+    v = validate_generated_metric(
+        HONEST_GETUP, p, references=[("getup1", clip)])
+    assert v["gates"]["reference_negatives:getup1"] is True, v["reasons"]
+    assert v["gates"]["reference_complete_then_hold:getup1"] is True, v["reasons"]
+    sc = v["references"][0]["scores"]
+    # freeze_end (start-from-goal, no transition) scores degenerate...
+    assert sc["freeze_end"] < 0.1
+    # ...while complete_then_hold (transition, then hold) scores high.
+    assert sc["complete_then_hold"] >= 0.5
+    assert v["ok"] is True, v["reasons"]

@@ -8,6 +8,7 @@ import pytest
 
 from sculptor.reference import validate_clip
 from sculptor.refs.perturb import (
+    complete_then_hold,
     degrade,
     freeze_end,
     freeze_start,
@@ -58,6 +59,65 @@ def test_freeze_end_holds_last_frame():
     assert validate_clip(out) == []
     assert np.all(out["root_pos_z"] == clip["root_pos_z"][-1])
     assert np.all(out["joint_pos"] == clip["joint_pos"][-1])
+
+
+def test_complete_then_hold_length_and_hold_frames():
+    clip = _clip(T=60)
+    out = complete_then_hold(clip)  # hold_frac=1.0 -> hold_n == T
+    assert validate_clip(out) == []
+    assert out["root_pos_z"].shape[0] == 60 + 60
+    # The first T frames are the original clip, verbatim.
+    np.testing.assert_allclose(out["root_pos_z"][:60], clip["root_pos_z"])
+    np.testing.assert_allclose(out["joint_pos"][:60], clip["joint_pos"])
+    # The appended hold frames all equal the clip's LAST frame.
+    assert np.all(out["root_pos_z"][60:] == clip["root_pos_z"][-1])
+    assert np.all(out["joint_pos"][60:] == clip["joint_pos"][-1])
+    assert np.all(out["root_quat_wxyz"][60:] == clip["root_quat_wxyz"][-1])
+
+
+def test_complete_then_hold_velocities_zero_in_hold():
+    clip = _clip(T=60)
+    clip["root_vel_z"] = np.gradient(clip["root_pos_z"]) * clip["fps"]
+    clip["joint_vel"] = np.gradient(clip["joint_pos"], axis=0) * clip["fps"]
+    out = complete_then_hold(clip)
+    assert validate_clip(out) == []
+    # Original portion is untouched.
+    np.testing.assert_allclose(out["root_vel_z"][:60], clip["root_vel_z"])
+    np.testing.assert_allclose(out["joint_vel"][:60], clip["joint_vel"])
+    # Hold portion is exactly zero, not the last frame's (possibly nonzero)
+    # velocity — a held terminal state is not still moving.
+    assert np.all(out["root_vel_z"][60:] == 0.0)
+    assert np.all(out["joint_vel"][60:] == 0.0)
+
+
+def test_complete_then_hold_frac_half():
+    clip = _clip(T=60)
+    out = complete_then_hold(clip, hold_frac=0.5)
+    assert validate_clip(out) == []
+    assert out["root_pos_z"].shape[0] == 60 + 30
+    assert np.all(out["root_pos_z"][60:] == clip["root_pos_z"][-1])
+
+
+def test_complete_then_hold_distinct_from_freeze_end():
+    clip = _clip(T=60)
+    cth = complete_then_hold(clip)
+    fe = freeze_end(clip)
+    # Different lengths (cth = 2T, freeze_end = T) and different content:
+    # complete_then_hold performs the transition first, freeze_end never
+    # transitions at all.
+    assert cth["root_pos_z"].shape[0] != fe["root_pos_z"].shape[0]
+    assert not np.allclose(cth["root_pos_z"][0], fe["root_pos_z"][0]) or (
+        clip["root_pos_z"][0] == clip["root_pos_z"][-1])
+    # cth starts at the clip's FIRST frame value; freeze_end starts at the
+    # clip's LAST frame value (assuming the clip actually transitions).
+    assert cth["root_pos_z"][0] == pytest.approx(clip["root_pos_z"][0])
+    assert fe["root_pos_z"][0] == pytest.approx(clip["root_pos_z"][-1])
+
+
+def test_complete_then_hold_not_in_perturbation_suite():
+    clip = _clip()
+    suite = perturbation_suite(clip)
+    assert "complete_then_hold" not in suite
 
 
 def test_segment_shuffle_is_deterministic_per_seed_and_preserves_length():

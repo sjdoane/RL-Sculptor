@@ -99,6 +99,35 @@ def test_references_present_injects_signature_block_with_clip_id_and_numbers(
     assert "duration_s" in rec["reference_signatures"]["jump_demo_clip"]
 
 
+def test_reference_signature_block_includes_relative_time_and_hold_goal_rules(
+    tmp_path: Path,
+):
+    """§D24 F3: the two authoring rules closing the D23/D22 reference-
+    anchored failure classes must ride the SAME reference-signature block
+    the kinematic numbers do (only rendered when a reference is attached)."""
+    clip = _mk_clip()
+    client = _CapturingClient()
+    generate_objective_metric(
+        "jump up and land", tmp_path, client=client,
+        max_attempts=1, review=False,
+        references=[("jump_demo_clip", clip)],
+    )
+    content = _user_content(client.calls[0])
+    assert "RELATIVE-TIME RULE" in content
+    assert "reach" in content.lower() and "hold" in content.lower()
+    assert "HOLD-GOAL RULE" in content
+    assert "away from" in content.lower() or "below" in content.lower()
+
+
+def test_relative_time_and_hold_goal_rules_absent_without_references(tmp_path: Path):
+    client = _CapturingClient()
+    generate_objective_metric(
+        "stand up", tmp_path, client=client, max_attempts=1, review=False)
+    content = _user_content(client.calls[0])
+    assert "RELATIVE-TIME RULE" not in content
+    assert "HOLD-GOAL RULE" not in content
+
+
 def test_multiple_references_all_rendered(tmp_path: Path):
     clip_a = _mk_clip()
     clip_b = make_procedural_jump_clip(apex_gain_m=0.1)

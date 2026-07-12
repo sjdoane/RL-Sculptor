@@ -1120,6 +1120,19 @@ def _validate_references(
          HIGHER) and full==earliest (no discrimination) remain rejected.
       3. `reference_negatives` — none of reversal/freeze_start/freeze_end/
          shuffle may score above `degenerate_anchor + spread_min`.
+      4. `reference_complete_then_hold` — a REQUIRED-HIGH positive gate
+         (§D24 F3, closes the D23 diagnosis): `perturb.complete_then_hold`
+         (the full clip plus an appended hold of its LAST frame — a
+         completed motion whose terminal state is then sustained, NOT added
+         to `perturbation_suite` since it is a positive exemplar, not a
+         negative/ladder rung) must score >= `max(0.5, 0.8 * full_score)`.
+         This is the exact shape of a live rollout that reaches the goal
+         EARLY and holds it — a metric that only recognizes completion
+         within a fixed absolute window, or that punishes post-completion
+         stillness, fails here even though it passes the other three gates.
+         `freeze_end` (never transitions) and `complete_then_hold` (transitions
+         then holds) must coexist: the former stays a rejected negative, the
+         latter is a required positive, on the same honest metric.
 
     `speed_slow`/`speed_fast` are SCORED AND RECORDED but NOT gated: a
     kinematic metric may legitimately score a time-scaled completion high
@@ -1130,7 +1143,7 @@ def _validate_references(
     Returns `(per_reference_results, all_scores)` where `all_scores` keys
     are `"reference:<id>"` / `"reference:<id>:<perturbation>"` for the
     caller's `archetype_scores`."""
-    from sculptor.refs.perturb import perturbation_suite
+    from sculptor.refs.perturb import complete_then_hold, perturbation_suite
 
     results: list[dict[str, Any]] = []
     all_scores: dict[str, float] = {}
@@ -1171,6 +1184,20 @@ def _validate_references(
             s, _ = _score_reference_entry(fn, pclip, required_roles)
             pert_scores[name] = s
             all_scores[f"reference:{clip_id}:{name}"] = s
+
+        # §D24 F3: `complete_then_hold` is a POSITIVE exemplar (the reference
+        # completed, terminal state then held), NOT a member of
+        # `perturbation_suite` (which is negatives/ladder rungs only) — score
+        # it separately here. Recorded in `archetype_scores` regardless of
+        # pass/fail (a crash scores nan — "no signal", the same convention
+        # every other reference score uses).
+        try:
+            cth_clip = complete_then_hold(clip)
+            cth_score, _ = _score_reference_entry(fn, cth_clip, required_roles)
+        except Exception:  # noqa: BLE001 — never let one clip's perturbation crash validation
+            cth_score = float("nan")
+        pert_scores["complete_then_hold"] = cth_score
+        all_scores[f"reference:{clip_id}:complete_then_hold"] = cth_score
 
         ref_gates: dict[str, bool] = {}
         ref_reasons: list[str] = []
@@ -1233,6 +1260,27 @@ def _validate_references(
                 f"— gameable by a reversed/frozen/shuffled near-miss of the "
                 f"reference")
 
+        # §D24 F3: `reference_complete_then_hold` — a REQUIRED-HIGH positive
+        # gate (the opposite polarity of `reference_negatives` above): the
+        # reference completed then held its terminal state must score >=
+        # max(0.5, 0.8 * full_score). Named numbers ride the failure reason
+        # (D12 idiom) so the authoring retry loop sees exactly what fell
+        # short instead of a bare fail.
+        cth_threshold = max(0.5, 0.8 * full_score) if finite_full else float("inf")
+        cth_ok = bool(
+            finite_full and np.isfinite(cth_score)
+            and cth_score >= cth_threshold - 1e-9)
+        ref_gates["reference_complete_then_hold"] = cth_ok
+        if not cth_ok:
+            ref_reasons.append(
+                f"[reference:{clip_id}] complete_then_hold: score "
+                f"{cth_score:.3f} does not reach the required "
+                f"{cth_threshold:.3f} (max(0.5, 0.8 * full {full_score:.3f})) "
+                f"— the metric does not score a reach-then-hold completion "
+                f"of the reference as the positive exemplar it is (D23: this "
+                f"is the exact shape of a live rollout that reaches the goal "
+                f"early and holds it, which scored spec 0.0)")
+
         entry: dict[str, Any] = {
             "clip_id": clip_id,
             "gates": ref_gates,
@@ -1289,11 +1337,13 @@ def validate_generated_metric(
     §REFERENCE_TRAJECTORY_PLAN §5: `references` (optional — a list of
     `(clip_id, loaded clip dict)` pairs) attaches reference-anchored
     validation, ADDITIVE to everything above (nothing changes when
-    `references` is omitted). Each reference contributes THREE new gates
+    `references` is omitted). Each reference contributes FOUR new gates
     (`reference_nondegeneracy`, `reference_monotonicity`,
-    `reference_negatives` — see their per-function docstrings below) scored
-    with `sculptor.refs.convert.clip_to_arrays` + `sculptor.refs.perturb
-    .perturbation_suite`, using the reference's OWN meta (the fixed battery
+    `reference_negatives`, `reference_complete_then_hold` — see their
+    per-function docstrings below) scored with `sculptor.refs.convert
+    .clip_to_arrays` + `sculptor.refs.perturb.perturbation_suite`
+    (`complete_then_hold` scored separately — it is a positive exemplar, not
+    a perturbation-suite member), using the reference's OWN meta (the fixed battery
     keeps its own synthetic meta). When any reference is attached, it
     REPLACES the goal-agnostic selectivity-probe fallback as the
     nondegeneracy signal for a family-`None` goal (a real exemplar beats a
