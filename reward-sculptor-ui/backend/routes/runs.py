@@ -1011,6 +1011,11 @@ def list_project_iterations(
         reward_version = spec.get("version")
 
         rollout_path = d / "rollout" / "rollout.mp4"
+        # §D24 (F4): plain project-level runs never go through mission
+        # stage selection, so this file won't exist here today — read it
+        # anyway for symmetry with `list_stage_iterations` (same model,
+        # same on-disk convention) rather than hardcoding False.
+        contradiction = _load_json_dict(d / "fitness_contradiction.json")
         out.append(StageIterationSummary(
             iter_index=iter_index,
             primary_metric=primary_metric,
@@ -1018,6 +1023,11 @@ def list_project_iterations(
             has_rollout=rollout_path.is_file() and rollout_path.stat().st_size > 0,
             has_checkpoint=_find_stage_checkpoint(d) is not None,
             reward_version=reward_version if isinstance(reward_version, str) else None,
+            fitness_contradiction=contradiction is not None,
+            fitness_components=(
+                contradiction.get("components")
+                if isinstance(contradiction, dict) else None
+            ),
         ))
     return out
 

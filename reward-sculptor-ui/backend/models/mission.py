@@ -390,6 +390,14 @@ class StageIterationSummary(BaseModel):
     has_rollout: bool
     has_checkpoint: bool
     reward_version: Optional[str] = None
+    # §D24 (F4): true when `<iter_dir>/fitness_contradiction.json` exists —
+    # the stage's success criterion evaluated True on this iter while the
+    # objective fitness was at/near zero (the D20 hollow-success / D23
+    # exemplar-scope-mismatch pattern). `fitness_components` passes
+    # through the flag file's per-channel breakdown so the UI can show
+    # WHICH channel zeroed the fitness without a second request.
+    fitness_contradiction: bool = False
+    fitness_components: Optional[dict] = None
 
 
 class StageIterPaperRef(BaseModel):

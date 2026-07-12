@@ -654,6 +654,14 @@ def list_stage_iterations(
         rollout_path = d / "rollout" / "rollout.mp4"
         checkpoint_path = _find_checkpoint(d)
 
+        # §D24 (F4): durable runtime contradiction flag — sculpt.py's
+        # `_maybe_emit_fitness_contradiction` writes this next to the
+        # iter's other artifacts when the stage criterion passed here
+        # while the objective fitness was at/near zero. Presence alone
+        # is the flag; malformed/missing file reads as "no contradiction"
+        # rather than raising.
+        contradiction = _load_json_dict(d / "fitness_contradiction.json")
+
         out.append(StageIterationSummary(
             iter_index=iter_index,
             primary_metric=primary_metric,
@@ -661,6 +669,11 @@ def list_stage_iterations(
             has_rollout=rollout_path.is_file() and rollout_path.stat().st_size > 0,
             has_checkpoint=checkpoint_path is not None,
             reward_version=reward_version if isinstance(reward_version, str) else None,
+            fitness_contradiction=contradiction is not None,
+            fitness_components=(
+                contradiction.get("components")
+                if isinstance(contradiction, dict) else None
+            ),
         ))
     out.sort(key=lambda r: r.iter_index)
     return out

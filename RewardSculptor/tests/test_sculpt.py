@@ -880,6 +880,75 @@ def test_run_boundary_trains_and_edits_current_target(
     assert completed[0]["reward_version_after"] == 3
 
 
+def test_iter_fitness_event_carries_components_dict(
+        tmp_path: Path, capsys):
+    """§D24 (F4): the `iter_fitness` SCULPT-EVENT must carry the same
+    per-channel component breakdown the diagnoser sees, not scalars only.
+    Before this, the D20/D23 hollow-success class (criterion reads
+    'satisfied' while the certified fitness is ~0) was invisible in the
+    live event stream — recovering WHICH channel zeroed the fitness
+    required an offline recompute of the metric."""
+    global _SCHEDULE
+    _SCHEDULE = [1.0]
+    proj = _write_minimal_project(tmp_path)
+
+    class _DetailFitnessFn:
+        """Fake fitness_fn exposing the `.detail` accessor (see
+        `sculptor.eval.spec_metrics.make_spec_fitness_fn`) so the iter's
+        detail path runs without needing a real metric/rollout shape."""
+
+        def __call__(self, iter_dir):
+            return 0.0
+
+        def detail(self, iter_dir):
+            return {
+                "spec_score": 0.0, "spec_name": "torso_righting",
+                "gate_upright_frac": 1.0, "gate_reached_035": 0.0,
+                "error": None,
+            }
+
+    sculpt_run(
+        config_path=proj / "config.toml", behavior_goal="dummy goal",
+        iterations=1, no_kg=True, dry_run=True,
+        fitness_fn=_DetailFitnessFn(),
+    )
+    events = [
+        json.loads(line.split("[SCULPT-EVENT] ", 1)[1])
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("[SCULPT-EVENT] ")
+    ]
+    fitness_events = [e for e in events if e["type"] == "iter_fitness"]
+    assert fitness_events, events
+    assert fitness_events[0]["components"] == {
+        "gate_upright_frac": 1.0, "gate_reached_035": 0.0,
+    }
+
+
+def test_iter_fitness_event_components_null_on_plain_float_fallback(
+        tmp_path: Path, capsys):
+    """A `fitness_fn` with no `.detail` accessor (the plain-float
+    fallback path) must carry `"components": None` on the event — never
+    a crash, never a stale/empty dict masquerading as real data."""
+    global _SCHEDULE
+    _SCHEDULE = [1.0]
+    proj = _write_minimal_project(tmp_path)
+
+    sculpt_run(
+        config_path=proj / "config.toml", behavior_goal="dummy goal",
+        iterations=1, no_kg=True, dry_run=True,
+        fitness_fn=lambda iter_dir: 0.42,
+    )
+    events = [
+        json.loads(line.split("[SCULPT-EVENT] ", 1)[1])
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("[SCULPT-EVENT] ")
+    ]
+    fitness_events = [e for e in events if e["type"] == "iter_fitness"]
+    assert fitness_events, events
+    assert fitness_events[0]["fitness"] == pytest.approx(0.42)
+    assert fitness_events[0]["components"] is None
+
+
 def test_dangling_current_reexport_is_repaired(tmp_path: Path):
     """A generated current.py whose target v<n>.py was deleted would crash
     mid-train on import; the iter must repair the re-export to the latest

@@ -916,11 +916,19 @@ def _seed_stage_iter(
     primary_metric: float | None = None,
     fitness: float | None = None,
     reward_version: str | None = None,
+    fitness_contradiction: dict | None = None,
 ) -> Path:
     """`<stage_dir>/runs/iter_<N>/` with the sidecar files the C2
     iterations endpoint reads. `with_rollout=True` writes a >2048-byte
     rollout.mp4 (the route's serve guard rejects smaller files, so the
-    fixture must clear it to exercise the 200 path)."""
+    fixture must clear it to exercise the 200 path).
+
+    `fitness_contradiction` (§D24 F4): when given, writes
+    `fitness_contradiction.json` with that payload — the durable flag
+    `sculpt.py`'s `_maybe_emit_fitness_contradiction` drops when a
+    stage's success criterion passed on this iter while the objective
+    fitness was at/near zero.
+    """
     iter_dir = stage_dir / "runs" / f"iter_{iter_index}"
     iter_dir.mkdir(parents=True, exist_ok=True)
     if with_rollout:
@@ -940,6 +948,10 @@ def _seed_stage_iter(
     if reward_version is not None:
         (iter_dir / "reward_spec.json").write_text(
             json.dumps({"version": reward_version})
+        )
+    if fitness_contradiction is not None:
+        (iter_dir / "fitness_contradiction.json").write_text(
+            json.dumps(fitness_contradiction)
         )
     return iter_dir
 
@@ -983,6 +995,56 @@ def test_list_stage_iterations_reports_rollout_and_checkpoint_flags(
     assert row1["primary_metric"] is None
     assert row1["fitness"] is None
     assert row1["reward_version"] is None
+    # §D24 (F4): no flag file for either row → both default to no
+    # contradiction, not a crash on the absent file.
+    assert row0["fitness_contradiction"] is False
+    assert row0["fitness_components"] is None
+    assert row1["fitness_contradiction"] is False
+    assert row1["fitness_components"] is None
+
+
+def test_list_stage_iterations_reports_fitness_contradiction_flag(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    """§D24 (F4): a run-dir fixture with `fitness_contradiction.json` ->
+    the iteration row flags it True and passes through the components
+    breakdown; a sibling iter with no such file -> False/None."""
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    stage_dir = _seed_stage_dir(project_dir, "alpha", "stage_0")
+
+    _seed_stage_iter(
+        stage_dir, 0,
+        with_rollout=True, fitness=0.0,
+        fitness_contradiction={
+            "type": "fitness_contradiction",
+            "stage_name": "stage_0",
+            "iter": 0,
+            "fitness": 0.0,
+            "criterion": "root_height > 0.35",
+            "components": {
+                "gate_upright_frac": 1.0, "gate_reached_035": 0.0,
+            },
+        },
+    )
+    _seed_stage_iter(stage_dir, 1, with_rollout=True, fitness=0.8)
+
+    r = client.get(
+        f"/projects/{slug}/missions/alpha/stages/stage_0/iterations",
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+
+    row0 = next(row for row in body if row["iter_index"] == 0)
+    assert row0["fitness_contradiction"] is True
+    assert row0["fitness_components"] == {
+        "gate_upright_frac": 1.0, "gate_reached_035": 0.0,
+    }
+
+    row1 = next(row for row in body if row["iter_index"] == 1)
+    assert row1["fitness_contradiction"] is False
+    assert row1["fitness_components"] is None
 
 
 def test_list_stage_iterations_uses_metric_history_by_index(

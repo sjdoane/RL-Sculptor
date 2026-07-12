@@ -1122,6 +1122,27 @@ def _fitness_components_for_prompt(detail: dict | None) -> dict | None:
     return out or None
 
 
+# §D24 (F4): the D20 hollow-success / D23 exemplar-scope-mismatch class in
+# one number — a success criterion that reads "satisfied" while the
+# certified objective fitness is at/near zero. 0.05 (not a strict >0.0
+# check) so a near-zero float noise floor still counts as a contradiction
+# rather than a technically-nonzero pass.
+FITNESS_CONTRADICTION_EPS = 0.05
+
+
+def _is_fitness_contradiction(
+    criterion_passed: bool, fitness: float | None,
+) -> bool:
+    """True iff `criterion_passed` while `fitness` is at/near zero.
+    `fitness is None` (no fitness_fn wired for this stage) never
+    contradicts — there is nothing to contradict against."""
+    return (
+        bool(criterion_passed)
+        and fitness is not None
+        and fitness <= FITNESS_CONTRADICTION_EPS
+    )
+
+
 def _run_one_iter(
     *,
     iter_index: int,
@@ -1503,6 +1524,13 @@ def _run_one_iter(
                                if len(fitness_per_seed) > 1 else None),
                 "fitness_per_seed": ([round(v, 5) for v in fitness_per_seed]
                                      if len(fitness_per_seed) > 1 else None),
+                # §D24 (F4): the same physical sub-component breakdown the
+                # diagnoser sees (`progress["components"]` above) — the
+                # live event previously carried scalars only, so a runtime
+                # zero-fitness contradiction (D20/D23) was invisible without
+                # an offline recompute. None when the detail path didn't
+                # run (plain-float fitness_fn fallback).
+                "components": fitness_components,
             })
             # §Ship 35: in observe mode the diagnoser must NOT see fitness —
             # the signal stays passive (no influence on the run).
@@ -3599,6 +3627,45 @@ def _evaluate_start_state_gate(
     return result
 
 
+def _maybe_emit_fitness_contradiction(
+    *, stage, outcome: "IterOutcome", emit: Optional[Any],
+) -> None:
+    """§D24 (F4): called once per candidate iteration whose success
+    criterion just evaluated True (see `_select_stage_final_iter` below,
+    where this fires for every criterion-passing iter — not only the one
+    ultimately selected — so the D20 hollow-success pattern is caught
+    regardless of the start-state gate outcome). When the same iteration's
+    objective fitness is at/near zero (`_is_fitness_contradiction`), emits
+    a `fitness_contradiction` SCULPT-EVENT and drops a durable
+    `<iter_dir>/fitness_contradiction.json` flag the backend/UI read —
+    the event stream alone is not durable across a restarted backend.
+
+    Never raises: a serialization hiccup degrades to a stderr line, not a
+    failed stage-selection pass (mirrors the fitness-is-advisory idiom
+    used for `fitness_fn` itself above)."""
+    if not _is_fitness_contradiction(True, outcome.fitness):
+        return
+    try:
+        payload = {
+            "type": "fitness_contradiction",
+            "stage_name": getattr(stage, "name", None),
+            "iter": outcome.iter_index,
+            "fitness": round(float(outcome.fitness), 5),
+            "criterion": getattr(stage, "success_criterion", None),
+            "components": outcome.fitness_components,
+        }
+        if emit is not None:
+            emit(payload)
+        (Path(outcome.iter_dir) / "fitness_contradiction.json").write_text(
+            json.dumps(payload, indent=2))
+    except Exception as e:  # noqa: BLE001 — detector is advisory, never fatal
+        sys.stderr.write(
+            f"[sculpt] stage {getattr(stage, 'name', '?')} iter "
+            f"{getattr(outcome, 'iter_index', '?')}: fitness_contradiction "
+            f"emission failed — {type(e).__name__}: {e}\n"
+        )
+
+
 def _select_stage_final_iter(
     candidates: "list[IterOutcome]",
     stage,
@@ -3697,6 +3764,12 @@ def _select_stage_final_iter(
                 iter_dir=Path(o.iter_dir), primary_metric=o.primary_metric)
             if _evaluate_success_criterion(stage.success_criterion, ns):
                 raw_passing.append(o)
+                # §D24 (F4): the criterion just read this iter as a
+                # success — check it against the objective fitness BEFORE
+                # the start-state gate below, so a gate-mismatched
+                # "success" (D20's exact hollow pattern) is flagged too.
+                _maybe_emit_fitness_contradiction(
+                    stage=stage, outcome=o, emit=emit)
                 # §D21 Fix 3: a gate-mismatched iter does NOT count as
                 # criterion-satisfying, regardless of what the criterion
                 # expression itself evaluated to. §F6: nor does one when

@@ -6,6 +6,7 @@ test only the loop-level fitness logic and the prompt block.
 """
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -221,6 +222,151 @@ def test_fitness_components_for_prompt_filters():
         "burst_p95": 4.2, "leg_subset": 1.0, "bad": float("nan"),
     })
     assert out == {"uprightness": 0.99, "burst_p95": 4.2, "leg_subset": 1.0}
+
+
+# ── §D24 (F4): runtime fitness/criterion contradiction detector ──────────
+
+
+def test_is_fitness_contradiction_true_false_none_and_eps_edge():
+    from sculptor.sculpt import (
+        FITNESS_CONTRADICTION_EPS,
+        _is_fitness_contradiction,
+    )
+
+    assert FITNESS_CONTRADICTION_EPS == 0.05
+    # criterion passed + fitness at/near zero → contradiction.
+    assert _is_fitness_contradiction(True, 0.0) is True
+    # eps boundary is inclusive (<=), not a strict <.
+    assert _is_fitness_contradiction(True, FITNESS_CONTRADICTION_EPS) is True
+    # just above eps → no longer a contradiction.
+    assert _is_fitness_contradiction(
+        True, FITNESS_CONTRADICTION_EPS + 1e-6) is False
+    # a genuinely good fitness never contradicts.
+    assert _is_fitness_contradiction(True, 0.9) is False
+    # criterion did not pass → never a contradiction, whatever the fitness.
+    assert _is_fitness_contradiction(False, 0.0) is False
+    assert _is_fitness_contradiction(False, None) is False
+    # no fitness_fn wired (None) → nothing to contradict against.
+    assert _is_fitness_contradiction(True, None) is False
+
+
+def _make_iter_outcome_with_rollout(
+    tmp_path, *, iter_index, fitness, components=None, mean_return=0.9,
+):
+    """Minimal on-disk iter dir (checkpoint + rollout/behavior.json) plus
+    the matching in-memory IterOutcome, so `_select_stage_final_iter` can
+    both evaluate the criterion (reads behavior.json) and see `.fitness`/
+    `.fitness_components` (carried on the outcome, exactly like the real
+    loop populates them at ~1392)."""
+    from sculptor.sculpt import IterOutcome
+
+    iter_dir = tmp_path / f"iter_{iter_index}"
+    (iter_dir / "rollout").mkdir(parents=True)
+    (iter_dir / "checkpoint.pt").write_bytes(b"fake-ckpt")
+    (iter_dir / "rollout" / "behavior.json").write_text(
+        json.dumps({"mean_return": mean_return}))
+    return IterOutcome(
+        iter_index=iter_index,
+        iter_dir=iter_dir,
+        reward_path_before=tmp_path / "rewards" / "current.py",
+        reward_path_after=None,
+        primary_metric=mean_return,
+        behavior={"mean_return": mean_return},
+        failure_modes=[],
+        edit_count=0,
+        fitness=fitness,
+        fitness_components=components,
+    )
+
+
+def test_select_stage_final_iter_emits_fitness_contradiction(tmp_path):
+    """§D24 (F4) / D20 hollow-success: a candidate whose criterion passes
+    (mean_return > 0.5) but whose objective fitness is ~0 must (a) emit a
+    `fitness_contradiction` SCULPT-EVENT via the caller's `emit` sink and
+    (b) drop a durable `fitness_contradiction.json` flag in THAT iter's
+    own directory — not the stage dir, not the winner's dir if a
+    different iter is selected."""
+    from sculptor.sculpt import _select_stage_final_iter
+
+    class _Stage:
+        name = "torso_righting"
+        success_criterion = "metric > 0.5"
+
+    hollow = _make_iter_outcome_with_rollout(
+        tmp_path, iter_index=0, fitness=0.0,
+        components={"gate_upright_frac": 1.0, "gate_reached_035": 0.0},
+        mean_return=0.9,
+    )
+    seen_events: list = []
+    selected, criterion_ok, source, _err, _missing, _mismatch = (
+        _select_stage_final_iter(
+            [hollow], _Stage(), stage_dir=None, emit=seen_events.append,
+        )
+    )
+    assert selected is hollow
+    assert criterion_ok is True  # the hollow "success" the detector traps
+
+    contradiction_events = [
+        e for e in seen_events if e.get("type") == "fitness_contradiction"
+    ]
+    assert len(contradiction_events) == 1, seen_events
+    ev = contradiction_events[0]
+    assert ev["stage_name"] == "torso_righting"
+    assert ev["iter"] == 0
+    assert ev["fitness"] == 0.0
+    assert ev["criterion"] == "metric > 0.5"
+    assert ev["components"] == {
+        "gate_upright_frac": 1.0, "gate_reached_035": 0.0,
+    }
+
+    flag_path = hollow.iter_dir / "fitness_contradiction.json"
+    assert flag_path.is_file()
+    assert json.loads(flag_path.read_text()) == ev
+
+
+def test_select_stage_final_iter_no_contradiction_on_healthy_fitness(
+        tmp_path):
+    """The same criterion-passing iter, but with a healthy (non-zero)
+    fitness, must NOT be flagged — the detector traps the D20 pattern
+    specifically, not every criterion pass."""
+    from sculptor.sculpt import _select_stage_final_iter
+
+    class _Stage:
+        name = "torso_righting"
+        success_criterion = "metric > 0.5"
+
+    healthy = _make_iter_outcome_with_rollout(
+        tmp_path, iter_index=0, fitness=0.8, mean_return=0.9,
+    )
+    seen_events: list = []
+    _select_stage_final_iter(
+        [healthy], _Stage(), stage_dir=None, emit=seen_events.append,
+    )
+    assert not any(
+        e.get("type") == "fitness_contradiction" for e in seen_events)
+    assert not (healthy.iter_dir / "fitness_contradiction.json").is_file()
+
+
+def test_select_stage_final_iter_no_contradiction_when_fitness_none(
+        tmp_path):
+    """No fitness_fn wired for the stage (`fitness=None`) — nothing to
+    contradict the criterion against, so the detector stays silent."""
+    from sculptor.sculpt import _select_stage_final_iter
+
+    class _Stage:
+        name = "torso_righting"
+        success_criterion = "metric > 0.5"
+
+    blind = _make_iter_outcome_with_rollout(
+        tmp_path, iter_index=0, fitness=None, mean_return=0.9,
+    )
+    seen_events: list = []
+    _select_stage_final_iter(
+        [blind], _Stage(), stage_dir=None, emit=seen_events.append,
+    )
+    assert not any(
+        e.get("type") == "fitness_contradiction" for e in seen_events)
+    assert not (blind.iter_dir / "fitness_contradiction.json").is_file()
 
 
 def test_diagnose_objective_progress_renders_components_and_revert():

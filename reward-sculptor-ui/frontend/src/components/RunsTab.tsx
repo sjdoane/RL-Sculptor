@@ -1109,6 +1109,20 @@ function ProjectDiskDetailPane({
   );
 }
 
+/** §D24 (F4): render the top few `fitness_components` entries as a plain
+ *  "name: value" tooltip string for the contradiction badge — no charts,
+ *  just enough to localize which channel zeroed the fitness at a glance. */
+function formatContradictionTooltip(
+  components: Record<string, number | boolean> | null,
+): string {
+  const header = "criterion passed but objective fitness ~0";
+  if (!components) return header;
+  const entries = Object.entries(components).slice(0, 6).map(([name, value]) =>
+    `${name}: ${typeof value === "number" ? value.toFixed(3) : String(value)}`
+  );
+  return entries.length ? `${header}\n${entries.join("\n")}` : header;
+}
+
 function StageIterCard({
   row, selected, kept, onSelect,
 }: { row: StageIteration; selected: boolean; kept: boolean; onSelect: () => void }) {
@@ -1130,6 +1144,15 @@ function StageIterCard({
         {row.has_rollout && <Icon name="video" size={11} color="var(--rs-muted)" />}
         {row.reward_version && <span className="rs-sub" style={{ fontSize: 10.5 }}>reward {row.reward_version}</span>}
         {kept && <span className="rs-badge emerald" style={{ fontSize: 8.5 }}><Icon name="check" size={9} />kept</span>}
+        {row.fitness_contradiction && (
+          <span
+            className="rs-badge rose"
+            style={{ fontSize: 8.5 }}
+            title={formatContradictionTooltip(row.fitness_components)}
+          >
+            <Icon name="alert-triangle" size={9} />criterion✓ fitness 0
+          </span>
+        )}
       </span>
     </button>
   );

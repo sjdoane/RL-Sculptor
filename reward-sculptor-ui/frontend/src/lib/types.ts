@@ -990,6 +990,13 @@ export interface StageIteration {
   has_rollout: boolean;
   has_checkpoint: boolean;
   reward_version: string | null;
+  // §D24 (F4): true when `<iter_dir>/fitness_contradiction.json` exists —
+  // this iter's success criterion evaluated True while the objective
+  // fitness was at/near zero (the D20 hollow-success / D23 exemplar-
+  // scope-mismatch pattern). `fitness_components` is the per-channel
+  // breakdown from that same flag file, for the badge's tooltip.
+  fitness_contradiction: boolean;
+  fitness_components: Record<string, number | boolean> | null;
 }
 
 // ── Completed-stage per-iteration detail (disk-truth) ────────────────

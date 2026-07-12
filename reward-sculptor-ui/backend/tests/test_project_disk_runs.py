@@ -39,6 +39,7 @@ def _seed_project_iter(
     mean_return: float | None = None,
     fitness: float | None = None,
     reward_version: str | None = None,
+    fitness_contradiction: dict | None = None,
 ) -> Path:
     iter_dir = project_dir / "runs" / f"iter_{i}"
     iter_dir.mkdir(parents=True, exist_ok=True)
@@ -60,6 +61,12 @@ def _seed_project_iter(
     if reward_version is not None:
         (iter_dir / "reward_spec.json").write_text(
             json.dumps({"version": reward_version})
+        )
+    if fitness_contradiction is not None:
+        # §D24 (F4): the durable flag `_maybe_emit_fitness_contradiction`
+        # writes next to an iter's other artifacts.
+        (iter_dir / "fitness_contradiction.json").write_text(
+            json.dumps(fitness_contradiction)
         )
     return iter_dir
 
@@ -205,6 +212,41 @@ def test_list_project_iterations(
     assert rows[0]["reward_version"] == "v3"
     assert rows[1]["has_rollout"] is False
     assert rows[1]["has_checkpoint"] is False
+    # §D24 (F4): no flag file seeded for either row → default False/None.
+    assert rows[0]["fitness_contradiction"] is False
+    assert rows[0]["fitness_components"] is None
+
+
+def test_list_project_iterations_reports_fitness_contradiction_flag(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    """§D24 (F4): a run-dir fixture with `fitness_contradiction.json` ->
+    payload flag true + components passthrough; absent -> false/None."""
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_project_iter(
+        project_dir, 0, with_rollout=True, fitness=0.0,
+        fitness_contradiction={
+            "type": "fitness_contradiction",
+            "stage_name": None,
+            "iter": 0,
+            "fitness": 0.0,
+            "criterion": "metric > 0.5",
+            "components": {"gate_upright_frac": 1.0},
+        },
+    )
+    _seed_project_iter(project_dir, 1, with_rollout=True, fitness=0.8)
+
+    r = client.get(f"/projects/{slug}/iterations")
+    assert r.status_code == 200, r.text
+    rows = r.json()
+    row0 = next(row for row in rows if row["iter_index"] == 0)
+    assert row0["fitness_contradiction"] is True
+    assert row0["fitness_components"] == {"gate_upright_frac": 1.0}
+
+    row1 = next(row for row in rows if row["iter_index"] == 1)
+    assert row1["fitness_contradiction"] is False
+    assert row1["fitness_components"] is None
 
 
 def test_list_project_iterations_prefers_metric_history(
