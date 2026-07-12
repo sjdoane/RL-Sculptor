@@ -66,6 +66,12 @@ ROLE_DEFAULTS: dict[str, str] = {
     # OPTIONAL role — retrieve.py's deterministic layer is always-on and
     # never blocked by this call.
     "reference_rerank": "claude-fable-5",
+    # §D24 F1 (docs/internal/REFERENCE_BUILD_LOG.md D23/D24): proposes
+    # the goal-aligned SUB-SPAN of a reference clip (`sculptor.refs.
+    # spans.select_reference_span`). Follows the D1 all-fable-5 default
+    # — this role is not the metric author/ladder pair D1 keeps
+    # model-disjoint, so no exception applies.
+    "span_select": "claude-fable-5",
 }
 
 #: §LAW 9 review panel: author-DISJOINT by construction — none of these

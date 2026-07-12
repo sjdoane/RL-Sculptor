@@ -265,6 +265,46 @@ def _smoothed_velocity(z: np.ndarray, fps: float, window: int = 5) -> np.ndarray
     return np.convolve(vz, kernel, mode="same")
 
 
+#: §D24 F1: number of evenly-spaced orientation knots recorded in
+#: `kinematic_signature`'s `orientation.timeline` (below). ~12 is enough
+#: resolution for an LLM to locate a phase-boundary-adjacent orientation
+#: change without ballooning the prompt payload.
+_ORIENTATION_TIMELINE_KNOTS = 12
+
+
+def _orientation_timeline(clip: dict) -> list[dict[str, Any]]:
+    """`~_ORIENTATION_TIMELINE_KNOTS` evenly spaced `{t, z, g_z}` knots
+    spanning `clip` start to end (frame 0 and the last frame are ALWAYS
+    included — `np.linspace(..., endpoint=True)` guarantees both
+    endpoints exactly). Requires `root_quat_wxyz`; callers must guard on
+    its presence (mirrors every other orientation-derived value in this
+    module). `g_z` is the same body-frame projected-gravity-z convention
+    as `orientation.initial_gravity_z_b`/`final_gravity_z_b` (near -1.0 =
+    upright; near 0 or positive = lying/inverted).
+
+    §D24 (docs/internal/REFERENCE_BUILD_LOG.md D23/D24): this timeline
+    is what lets `sculptor.refs.spans` locate goal-aligned sub-span
+    boundaries and measure RELATIVE orientation change within a
+    candidate span — absolute g_z values are retarget-convention
+    dependent (D23 found a real clip's "lying" g_z at -0.65, not the ~0
+    a different pipeline might emit), so only the CHANGE across knots is
+    ever used as a motion signal, never an absolute threshold.
+    """
+    quat = clip["root_quat_wxyz"]
+    z = clip["root_pos_z"]
+    fps = float(clip["fps"])
+    T = int(np.asarray(z).shape[0])
+    g_b = _projected_gravity_b(quat)
+    n_knots = max(2, min(_ORIENTATION_TIMELINE_KNOTS, T))
+    idx = np.unique(np.round(np.linspace(0, T - 1, n_knots)).astype(int))
+    return [
+        {"t": round(float(i) / fps, 3),
+         "z": round(float(z[i]), 3),
+         "g_z": round(float(g_b[i, 2]), 3)}
+        for i in idx
+    ]
+
+
 def _phase_segments(z: np.ndarray, fps: float) -> list[dict]:
     """Rising/falling/still phase segmentation from smoothed root_z
     velocity — a compact motion outline for prompts."""
@@ -338,6 +378,11 @@ def kinematic_signature(clip: dict) -> dict[str, Any]:
             "note": (
                 "gravity_z_b near -1.0 = upright; near 0 or positive = "
                 "lying/inverted"),
+            # §D24 F1: additive-only key (schema-compatible — readers
+            # ignore unknown keys, see reference_context.py's docstring).
+            # Lets a stage-goal-aligned sub-span be located/measured
+            # (sculptor.refs.spans) without a second full-clip pass.
+            "timeline": _orientation_timeline(clip),
         }
 
     contacts: dict[str, np.ndarray] = {}
