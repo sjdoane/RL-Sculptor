@@ -87,7 +87,7 @@ from __future__ import annotations
 import json
 import math
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 
@@ -424,12 +424,36 @@ def _archetype(clip: dict) -> str:
        posture target, fell_over disabled, sunk guard below the clip's
        own minimum. A real jump clip starts STANDING, so the start
        condition alone still cleanly separates airborne clips.
-    2. ``"airborne"`` — starts high and rises above its own EARLY-window
-       baseline (the pre-existing jump-clip rule, byte-identical).
-    3. ``"other"`` — neither. (Known gap, documented not solved: a
-       mid-height start like crouch-to-stand at z≈0.4 routes to
-       airborne/other; add a "mid_start" class when a real mission
-       needs one.)
+    2. ``"mid_start"`` — the clip starts at a MID height (neither lying
+       nor clearly upright): `_GETUP_START_MAX_M` (0.35 m) <= start <
+       `_GETUP_END_MIN_M` (0.55 m, the SAME "clearly upright" line the
+       get-up segment QC uses for its END threshold — reused
+       deliberately rather than a third independent constant, per the
+       one-classifier-per-shape-assumption meta-rule below). §start_pose
+       CLOSES the D19-documented gap: a crouch-to-stand reference (or
+       any stage whose `start_pose` is "sitting"/"crouched") starts here
+       — not lying flat, but not upright either. Handled identically to
+       `"getup"` by `derive_rsi_train_keys`/`derive_reference_reset`
+       (same absolute-anchored offset math — see D19's note there — and
+       the same sunk-guard/orientation/posture derivation), EXCEPT
+       `fell_over_termination` stays disabled for the SAME conservative
+       reason get-up gets it (D16: even a bent crouch pose can trip
+       orientation-based fall termination at reset) and
+       `derive_eval_reset` still returns a non-None override (D17: a
+       non-standing start IS the task, whether it's flat-on-the-ground
+       or mid-crouch).
+    3. ``"airborne"`` — starts high (>= `_GETUP_END_MIN_M`) and rises
+       above its own EARLY-window baseline (the pre-existing jump-clip
+       rule, byte-identical for clips that reach this branch).
+    4. ``"other"`` — starts high but never rises. (mid_start above closes
+       the D19-documented "crouch-to-stand starts at z≈0.4" gap; there is
+       no more OPEN gap in this classifier as of §start_pose.)
+
+    Meta-rule (thrice-earned, D19): every assumption about clip SHAPE
+    must live in exactly one classifier with QC enforcement — see
+    `check_start_pose_compatibility`, the QC gate that gets a
+    stage-authored `start_pose` to agree with what THIS function
+    measures.
     """
     z = clip["root_pos_z"]
     fps = float(clip["fps"])
@@ -440,6 +464,8 @@ def _archetype(clip: dict) -> str:
     start = float(np.mean(z[:nw]))
     if start < _GETUP_START_MAX_M:
         return "getup"
+    if start < _GETUP_END_MIN_M:
+        return "mid_start"
     n0 = max(2, int(0.2 * fps))
     z0 = float(np.median(z[:n0]))
     if (z > z0 + 0.01).any():
@@ -460,16 +486,19 @@ def derive_rsi_train_keys(clip: dict) -> dict:
       `reset_root_state_uniform` semantics), ALWAYS paired with the
       sunk-height termination the validator's RSI↔ET invariant
       requires.
-    - **Get-up-like** (starts low, ends standing): emits a NEGATIVE
+    - **Get-up-like** (starts low, ends standing) OR **mid_start**
+      (starts at a mid height — neither lying nor upright, e.g. a
+      crouch-to-stand reference, or any "sitting"/"crouched"
+      `start_pose` stage's attached clip): emits a NEGATIVE
       `reset_height_offset_m` derived from the clip's own initial-window
-      height (relative to the robot's standing default, approximated by
-      the clip's own end-window height — the clip is the only height
-      reference available at this layer), near-zero
-      `reset_vertical_velocity_mps` (a resting lying start, not a
-      falling one), and a sunk-termination threshold derived BELOW the
-      clip's own observed minimum height (never above it) so the
-      reference's own lying start cannot trip early termination at
-      reset — the start-pose-aware guard §8 requires.
+      height (anchored on the ABSOLUTE G1-class standing height, D19 —
+      same math for both archetypes, they only differ in how far below
+      standing the start window sits), near-zero
+      `reset_vertical_velocity_mps` (a resting start, not a falling
+      one), and a sunk-termination threshold derived BELOW the clip's
+      own observed minimum height (never above it) so the reference's
+      own start cannot trip early termination at reset — the
+      start-pose-aware guard §8 requires.
     - **Other** (never rises, never low→high): unchanged — raises
       `ValueError` with an actionable message.
 
@@ -482,7 +511,7 @@ def derive_rsi_train_keys(clip: dict) -> dict:
     fps = float(clip["fps"])
     archetype = _archetype(clip)
 
-    if archetype == "getup":
+    if archetype in ("getup", "mid_start"):
         nw = max(2, int(_ARCHETYPE_WINDOW_S * fps))
         z_start_lo = float(z[:nw].min())
         z_start_hi = float(z[:nw].max())
@@ -572,12 +601,12 @@ def _quat_wxyz_to_roll_rad(q: np.ndarray) -> np.ndarray:
 
 def derive_reference_reset(clip: dict) -> dict:
     """`derive_rsi_train_keys` plus, when the clip carries
-    `root_quat_wxyz` AND is get-up-shaped, ADDITIONAL
-    `reset_pitch_offset_rad` / `reset_roll_offset_rad` ranges derived
-    from the clip's initial-window orientation relative to its own
-    end-window (standing-like) orientation, PLUS (when the clip carries
-    `joint_pos`) a `reset_joint_pos_target` vector — the root-
-    orientation and per-joint-posture halves of a lying start
+    `root_quat_wxyz` AND is get-up-shaped (getup OR mid_start — §D19
+    closure), ADDITIONAL `reset_pitch_offset_rad` / `reset_roll_offset_rad`
+    ranges derived from the clip's initial-window orientation relative to
+    its own end-window (standing-like) orientation, PLUS (when the clip
+    carries `joint_pos`) a `reset_joint_pos_target` vector — the root-
+    orientation and per-joint-posture halves of a low/mid start
     (§REFERENCE_TRAJECTORY_PLAN §8's "PLUS ... initial joint posture and
     root orientation" extension, now fully wired through
     `env_spec.py`'s `_TRAIN_RANGES`/`_TRAIN_SCALARS` and
@@ -585,7 +614,7 @@ def derive_reference_reset(clip: dict) -> dict:
     event — see that module for the mjlab event-injection mechanism).
 
     `reset_joint_pos_target` is the clip's OWN initial-window mean
-    `joint_pos` (the get-up clip's lying posture), in the clip's
+    `joint_pos` (the clip's lying/crouched posture), in the clip's
     `joint_names` order — the adapter resolves/validates that order
     against the robot's canonical joint order at apply time (a mismatch
     is a clear error there, never a silent misassignment here; this
@@ -598,21 +627,24 @@ def derive_reference_reset(clip: dict) -> dict:
     fallback in that case.
     """
     derived = dict(derive_rsi_train_keys(clip))
-    is_getup = _archetype(clip) == "getup"
-    if is_getup:
-        # §get-up RSI fix (2026-07-09): a lying start (large reset-height
-        # offset below standing, and/or a large pitch/roll offset when
-        # orientation is derived below) IS exactly what the task's
-        # standard fell-over/bad-orientation termination is designed to
-        # catch — observed live, it fires on every env at reset and the
-        # episode never runs. The sunk-height guard above (derived BELOW
-        # the clip's own minimum height) plus episode time_out remain
-        # the episode enders; a get-up policy falling again mid-episode
-        # after standing up is legitimate retry experience, not a
-        # failure state that needs early termination.
+    is_low_start = _archetype(clip) in ("getup", "mid_start")
+    if is_low_start:
+        # §get-up RSI fix (2026-07-09): a lying/crouched start (large
+        # reset-height offset below standing, and/or a large pitch/roll
+        # offset when orientation is derived below) IS exactly what the
+        # task's standard fell-over/bad-orientation termination is
+        # designed to catch — observed live, it fires on every env at
+        # reset and the episode never runs. The sunk-height guard above
+        # (derived BELOW the clip's own minimum height) plus episode
+        # time_out remain the episode enders; a get-up/crouch policy
+        # falling again mid-episode after standing up is legitimate
+        # retry experience, not a failure state that needs early
+        # termination. mid_start gets the SAME conservative treatment
+        # (D16 lesson): even a bent crouch pose can trip orientation-
+        # based fall termination at reset.
         derived["fell_over_termination"] = False
     quat = clip.get("root_quat_wxyz")
-    if quat is not None and is_getup:
+    if quat is not None and is_low_start:
         fps = float(clip["fps"])
         nw = max(2, int(_ARCHETYPE_WINDOW_S * fps))
         quat_arr = np.asarray(quat, dtype=np.float64)
@@ -630,7 +662,7 @@ def derive_reference_reset(clip: dict) -> dict:
                 a_lo, a_hi = a_hi, a_lo
             derived[key] = [round(a_lo, 4), round(a_hi, 4)]
     joint_pos = clip.get("joint_pos")
-    if joint_pos is not None and is_getup:
+    if joint_pos is not None and is_low_start:
         fps = float(clip["fps"])
         nw = max(2, int(_ARCHETYPE_WINDOW_S * fps))
         jp_arr = np.asarray(joint_pos, dtype=np.float64)
@@ -653,7 +685,9 @@ def derive_reference_reset(clip: dict) -> dict:
 
 def derive_eval_reset(clip: dict) -> dict | None:
     """Stage-FIXED, deterministic eval-rollout reset override for
-    get-up-archetype clips (§REFERENCE_TRAJECTORY_PLAN §8, D17).
+    get-up/mid_start-archetype clips (§REFERENCE_TRAJECTORY_PLAN §8, D17;
+    mid_start closes the D19-documented gap — a non-standing start is
+    the task whether it's flat-on-the-ground or mid-crouch).
 
     `derive_reference_reset` (above) produces TRAIN-only RSI *ranges* —
     curriculum the diagnoser may iterate between iterations, applied via
@@ -663,28 +697,28 @@ def derive_eval_reset(clip: dict) -> dict | None:
     not leak into eval or per-iteration fitness becomes incomparable
     across iterations).
 
-    For a get-up stage this creates a real gap: eval rollouts fall back
-    to the task's default (standing) reset, so the certified lying-start
-    metric ends up scoring rollouts that never actually lie down — the
-    reset the metric was written to measure recovery FROM never happens
-    in evaluation. For a get-up task, the lying start IS the task
-    definition, not curriculum, so it belongs in eval too — but as a
-    single FIXED reset, decoupled from the diagnoser-iterable train
-    ranges, so per-iteration fitness stays comparable (nothing here is
-    something the diagnoser can move).
+    For a get-up/mid_start stage this creates a real gap: eval rollouts
+    fall back to the task's default (standing) reset, so the certified
+    lying/crouched-start metric ends up scoring rollouts that never
+    actually start there — the reset the metric was written to measure
+    recovery FROM never happens in evaluation. For such a task the
+    non-standing start IS the task definition, not curriculum, so it
+    belongs in eval too — but as a single FIXED reset, decoupled from
+    the diagnoser-iterable train ranges, so per-iteration fitness stays
+    comparable (nothing here is something the diagnoser can move).
 
     Returns a deterministic payload — the MIDPOINT of each derived reset
     range (height offset, pitch, roll), zero vertical velocity (a
-    resting lying start, not a falling one), the clip's own
+    resting start, not a falling one), the clip's own
     `reset_joint_pos_target` unchanged when present, zero joint-pos
     noise (no per-episode variation — eval must be reproducible), and
-    `fell_over_termination: False` (the lying start would otherwise trip
-    it, exactly as it does in train). `None` for non-get-up archetypes
-    (airborne/other) — jump and other eval stays standing-start,
-    unchanged behavior; a jump task's evaluation start was never in
-    question.
+    `fell_over_termination: False` (the low/mid start would otherwise
+    trip it, exactly as it does in train). `None` for non-low-start
+    archetypes (airborne/other) — jump and other eval stays
+    standing-start, unchanged behavior; a jump task's evaluation start
+    was never in question.
     """
-    if _archetype(clip) != "getup":
+    if _archetype(clip) not in ("getup", "mid_start"):
         return None
     full = derive_reference_reset(clip)
 
@@ -707,7 +741,202 @@ def derive_eval_reset(clip: dict) -> dict | None:
     return payload
 
 
-def apply_reference_rsi(env_dir: Path | str, clip: dict) -> Path:
+# ── §start_pose: clip-shape ↔ authored-start_pose consistency QC ────────
+# D19's meta-rule, thrice-earned: every assumption about clip SHAPE must
+# be enforced by exactly one classifier, or the next mismatch silently
+# breaks a consumer. `start_pose` is a NEW field authored by Claude
+# (decompose/redecompose) that makes an assumption about clip shape —
+# this is that classifier's enforcement point.
+_SUPINE_PRONE_POSES: frozenset[str] = frozenset({"supine", "prone"})
+_SIT_CROUCH_POSES: frozenset[str] = frozenset({"sitting", "crouched"})
+
+
+def _start_window_quat(clip: dict) -> Optional[np.ndarray]:
+    """Approximate mean orientation over the clip's start window, as a
+    unit `[w, x, y, z]` quaternion, or `None` when the clip carries no
+    `root_quat_wxyz`. Component-wise mean + renormalize — a cheap
+    approximation that is only ever used to classify a START POSE from a
+    SHORT (`_ARCHETYPE_WINDOW_S`), largely-static window (the robot is
+    lying/sitting/crouched at rest, not mid-rotation), so it is not the
+    general-purpose quaternion-averaging problem (which needs an
+    eigenvector solve for well-separated rotations)."""
+    quat = clip.get("root_quat_wxyz")
+    if quat is None:
+        return None
+    fps = float(clip["fps"])
+    nw = max(2, int(_ARCHETYPE_WINDOW_S * fps))
+    q = np.asarray(quat[:nw], dtype=np.float64).mean(axis=0)
+    norm = float(np.linalg.norm(q))
+    if norm < 1e-9:
+        return None
+    return q / norm
+
+
+def _body_frame_gravity_x(q: np.ndarray) -> float:
+    """Horizontal (local +X / "forward") component of gravity expressed
+    in the body frame, for a single unit quaternion `(4,)` in
+    `[w, x, y, z]` order.
+
+    Standing (identity quat): gravity is purely local -Z (down), so this
+    is ~0. Convention used throughout this codebase and the G1 MJCF
+    (`sculptor/refs/preview.py`'s `resolve_g1_mjcf`: the pelvis body
+    carries no `quat` attribute, i.e. its LOCAL frame equals WORLD at
+    the identity/standing pose) is local +X = forward/face direction.
+
+    A humanoid pitched flat onto its FRONT (chest/face toward the
+    ground — PRONE) has its local +X axis tipped toward world -Z, which
+    rotates world gravity `(0, 0, -1)` into a POSITIVE local-X
+    component; pitched flat onto its BACK (SUPINE) is the mirror image
+    (NEGATIVE local-X component). Hand-verified numerically: a pure
+    pitch=+pi/2 quat (which rotates local +X to world -Z, i.e. face-down
+    = prone) yields gravity_body_x=+1.0; pitch=-pi/2 (local +X to world
+    +Z, face-up = supine) yields gravity_body_x=-1.0. See
+    `test_body_frame_gravity_x_prone_vs_supine` for the pinned check.
+    """
+    q = np.asarray(q, dtype=np.float64)
+    norm = float(np.linalg.norm(q))
+    if norm < 1e-9:
+        return 0.0
+    w, x, y, z = (q / norm).tolist()
+    qc = np.array([w, -x, -y, -z])
+    g_world = np.array([0.0, 0.0, 0.0, -1.0])   # pure quat: world gravity dir
+
+    def _ham(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+        aw, ax, ay, az = a
+        bw, bx, by, bz = b
+        return np.array([
+            aw * bw - ax * bx - ay * by - az * bz,
+            aw * bx + ax * bw + ay * bz - az * by,
+            aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw,
+        ])
+
+    g_body = _ham(_ham(qc, g_world), np.array([w, x, y, z]))
+    return float(g_body[1])
+
+
+def check_start_pose_compatibility(
+    clip: dict, start_pose: Optional[str], *, clip_id: str = "<clip>",
+) -> None:
+    """QC gate: does `clip`'s MEASURED start-state shape agree with a
+    stage-authored `start_pose`?
+
+    Rules (archetype from `_archetype`; mid_start closes the D19 gap):
+      * `start_pose` in {"supine", "prone"} requires archetype ==
+        "getup" — a lying-flat pose is a LOW start, not a mid-height
+        crouch/sit.
+      * `start_pose` in {"sitting", "crouched"} requires archetype in
+        {"getup", "mid_start"} — real clips vary in exactly how low a
+        "sit"/"crouch" reads at frame 0, so either low-start class is
+        plausible.
+      * `start_pose == "standing"` requires archetype NOT IN
+        {"getup", "mid_start"} — a standing stage must not be pointed at
+        a clip that measurably starts low or mid-height.
+      * `start_pose is None`: no-op — nothing authored to check.
+
+    When the clip carries `root_quat_wxyz` AND `start_pose` is "supine"
+    or "prone", the start-window MEAN orientation is ALSO checked
+    against the requested pose (on-back vs on-front) via the sign of
+    `_body_frame_gravity_x` — see that function's docstring for the
+    derivation/sign convention. A clip with no `root_quat_wxyz` accepts
+    either supine or prone (orientation is simply unknown; the archetype
+    check above still applies) — same "accept when we can't tell"
+    posture the rest of this module takes (e.g. `derive_reference_reset`
+    only derives orientation when a quat is present at all).
+
+    Raises `ValueError` with an ACTIONABLE message (states the measured
+    mismatch AND both plausible causes — wrong clip vs wrong
+    `start_pose`) on any violation. Raises `ValueError` for an
+    unrecognized `start_pose` string too (defense in depth — callers
+    should already be passing a `mission.START_POSE_VALUES` member).
+    Never raises for `start_pose=None`.
+    """
+    if start_pose is None:
+        return
+    archetype = _archetype(clip)
+    z = clip["root_pos_z"]
+    fps = float(clip["fps"])
+    nw = max(2, int(_ARCHETYPE_WINDOW_S * fps), int(0.1 * len(z)))
+    start_z = float(np.mean(z[:nw]))
+
+    if start_pose in _SUPINE_PRONE_POSES:
+        if archetype != "getup":
+            raise ValueError(
+                f"stage start_pose={start_pose!r} but clip {clip_id!r} "
+                f"does not measure as a lying start (archetype="
+                f"{archetype!r}, start-window mean z={start_z:.3f} m; a "
+                f"lying start needs < {_GETUP_START_MAX_M} m): wrong "
+                f"clip attached or wrong start_pose."
+            )
+        q = _start_window_quat(clip)
+        if q is not None:
+            gx = _body_frame_gravity_x(q)
+            measured = "prone" if gx > 0.0 else (
+                "supine" if gx < 0.0 else None)
+            if measured is not None and measured != start_pose:
+                raise ValueError(
+                    f"stage start_pose={start_pose!r} but clip "
+                    f"{clip_id!r}'s start-window orientation measures as "
+                    f"{measured!r} (body-frame gravity x={gx:.3f}): "
+                    f"wrong clip attached or wrong start_pose."
+                )
+    elif start_pose in _SIT_CROUCH_POSES:
+        if archetype not in ("getup", "mid_start"):
+            raise ValueError(
+                f"stage start_pose={start_pose!r} but clip {clip_id!r} "
+                f"measures archetype={archetype!r} (start-window mean "
+                f"z={start_z:.3f} m) — a sitting/crouched start needs a "
+                f"low or mid-height clip start (< {_GETUP_END_MIN_M} m): "
+                f"wrong clip attached or wrong start_pose."
+            )
+    elif start_pose == "standing":
+        if archetype in ("getup", "mid_start"):
+            raise ValueError(
+                f"stage start_pose='standing' but clip {clip_id!r} "
+                f"measures a lying/crouched start (archetype="
+                f"{archetype!r}, start-window mean z={start_z:.3f} m): "
+                f"wrong clip attached or wrong start_pose."
+            )
+    else:
+        raise ValueError(
+            f"start_pose={start_pose!r} is not a recognized value "
+            f"(expected one of 'supine', 'prone', 'sitting', 'crouched', "
+            f"'standing', or None)"
+        )
+
+
+def _recenter_train_ranges_on_settled(full: dict, settled: dict) -> dict:
+    """§D20a settle-then-rederive: re-center TRAIN-side `[lo, hi]` ranges
+    on SETTLED eval scalars, keeping each range's ORIGINAL WIDTH (never
+    widened/narrowed here — settling only tells us where physical rest
+    actually is, not how much curriculum spread the stage should have),
+    then re-clamp through the SAME validator bounds tables every other
+    derived range goes through. `reset_joint_pos_target` has no width
+    concept (a point target, not a range) — the settled joint angles
+    simply REPLACE the derived ones, re-clamped to the same element
+    bounds. Any key present in `full` but absent from `settled` (e.g.
+    `settled` came from a clip with no `joint_pos`/`root_quat_wxyz`) is
+    left untouched."""
+    out = dict(full)
+    for key in ("reset_height_offset_m", "reset_pitch_offset_rad",
+                "reset_roll_offset_rad"):
+        if key not in out or key not in settled:
+            continue
+        lo, hi = out[key]
+        width = float(hi) - float(lo)
+        center = float(settled[key])
+        out[key] = _clamp_range(key, center - width / 2.0, center + width / 2.0)
+    if "reset_joint_pos_target" in out and "reset_joint_pos_target" in settled:
+        lo, hi = _JOINT_TARGET_ELEMENT_BOUNDS
+        out["reset_joint_pos_target"] = [
+            round(min(max(float(x), lo), hi), 4)
+            for x in settled["reset_joint_pos_target"]]
+    return out
+
+
+def apply_reference_rsi(
+    env_dir: Path | str, clip: dict, *, settled_centers: Optional[dict] = None,
+) -> Path:
     """Persist the clip-derived RSI curriculum as the next validated
     env-spec version (train scope only; the frozen shared/eval section
     is untouched, so metric comparability is preserved by construction).
@@ -717,7 +946,14 @@ def apply_reference_rsi(env_dir: Path | str, clip: dict) -> Path:
     `reset_joint_pos_target`/`reset_joint_pos_noise_rad` are all live
     `env_spec.py` schema keys as of §REFERENCE_TRAJECTORY_PLAN §8 part
     2 (previously computed but not persistable; see git history for the
-    prior fence-limited workaround, now removed)."""
+    prior fence-limited workaround, now removed).
+
+    `settled_centers` (§D20a, optional): the `scalars` dict a
+    `settle_reset` call returned for this SAME clip's derived EVAL
+    reset. When provided, the derived TRAIN ranges are re-centered onto
+    it via `_recenter_train_ranges_on_settled` before being persisted —
+    see that function's docstring. `None` (default) is byte-identical to
+    pre-§D20a behavior."""
     env_dir = Path(env_dir)
     spec = read_current_env_spec(env_dir) or {
         "env_spec_version": ENV_SPEC_VERSION,
@@ -728,6 +964,8 @@ def apply_reference_rsi(env_dir: Path | str, clip: dict) -> Path:
     spec = json.loads(json.dumps(spec))        # deep copy
     train = dict(spec.get("train") or {})
     full = derive_reference_reset(clip)
+    if settled_centers:
+        full = _recenter_train_ranges_on_settled(full, settled_centers)
     train.update(full)
     spec["train"] = train
     meta = dict(spec.get("meta") or {})
@@ -753,14 +991,319 @@ def apply_reference_rsi(env_dir: Path | str, clip: dict) -> Path:
             ", fell_over termination disabled (lying start would "
             "otherwise trip it at reset)"
         )
+    settle_note = ""
+    if settled_centers:
+        settle_note = (
+            f", TRAIN ranges re-centered on a physically-settled pose "
+            f"(§D20a settle-then-rederive; settled height offset "
+            f"{settled_centers.get('reset_height_offset_m')} m)"
+        )
     meta["rationale"] = (
         "RSI ranges derived from a reference trajectory "
         f"({src}): height offset "
         f"{full['reset_height_offset_m']} m, vz "
         f"{full['reset_vertical_velocity_mps']} m/s, paired sunk "
         f"termination {full['min_base_height_termination_m']} m"
-        f"{orient_note}{posture_note}{fell_over_note} "
+        f"{orient_note}{posture_note}{fell_over_note}{settle_note} "
         "(DeepMimic RSI; validator RSI↔ET invariant)."
     )
     spec["meta"] = meta
     return write_env_spec_version(env_dir, spec)
+
+
+# ── §D20a: settle-then-rederive (physically-resting reset poses) ────────
+class SettleUnavailable(Exception):
+    """Physical settling could not run in this environment: MJCF
+    unresolvable, `mujoco` import/model-load failure, or a physics step
+    itself raised. Callers (the `sculpt.py` scaffold path) catch this and
+    proceed with the UNSETTLED reset scalars — settling is a REFINEMENT
+    of a derived reset, never a stage-blocking dependency (mirrors
+    `sculptor.refs.preview.PreviewUnavailable`'s "never blocks the
+    caller" contract)."""
+
+
+#: Consecutive settle steps that must ALL measure max|qvel| under this
+#: threshold before the pose is declared at rest. A single-step check is
+#: NOT sufficient: starting from qvel=0, one gravity-only mj_step only
+#: accelerates each DOF by ~g*dt (~0.02 m/s at dt=0.002s) — comfortably
+#: under 0.1 on the VERY FIRST step regardless of how far the pose
+#: actually is from physical rest, so a 1-step check would report
+#: "converged" immediately, before anything has had time to fall/settle.
+#: Requiring a SUSTAINED low-velocity window (not just a momentary dip
+#: mid-fall) is what makes this a genuine rest detector.
+_SETTLE_QVEL_STOP_THRESH = 0.1
+_SETTLE_CONSECUTIVE_STEPS = 25
+#: DOF damping floor applied for the duration of the settle only (§5):
+#: the raw G1 MJCF (as loaded by `resolve_mjcf_for_robot`, the same
+#: unconstrained asset `refs/preview.py` renders with) carries `nu=0`
+#: actuators and zero `dof_damping` everywhere — verified directly
+#: against the installed asset — so without an elevated floor here a
+#: released pose has NOTHING damping its motion except contacts, and
+#: oscillates/bounces rather than settling cleanly.
+_SETTLE_MIN_DOF_DAMPING = 2.0
+#: Largest PHYSICALLY PLAUSIBLE height change during a settle. A
+#: get-up/mid_start pose's own root-height derivation is anchored on
+#: `_G1_CLASS_STAND_M` (0.74 m), so no legitimate settle can move the
+#: pelvis by more than about one standing-height's worth. Found
+#: empirically while building this function: a get-up clip with NO
+#: `joint_pos` channel (so every joint defaults to its straight-leg
+#: zero angle) combined with a large lying pitch/height offset can
+#: interpenetrate the floor badly enough to trigger a MuJoCo contact-
+#: force explosion — a FINITE but wildly implausible result (a real
+#: observed case: settled 5.08 m ABOVE the requested height in under a
+#: second), not a `mj_step` exception the ordinary except-block would
+#: catch. This guard converts that silent-garbage failure mode into an
+#: explicit `SettleUnavailable`.
+_SETTLE_MAX_PLAUSIBLE_DELTA_M = 1.5
+
+
+def _resolve_settle_model(mjcf_path: Path):
+    """Compile the robot MJCF for settling — WITH a ground plane.
+
+    `sculptor/refs/preview.py`'s resolvers (reused by `settle_reset` for
+    MJCF path lookup) point at the RAW per-robot asset, which — verified
+    directly against the installed G1 MJCF — carries `ngeom` robot
+    geoms and ZERO ground-plane geoms (fine for `preview.py`'s use, a
+    single `mj_forward` pose with no dynamics stepping; fatal for
+    physics settling, where an ungrounded model free-falls forever
+    under gravity with nothing to catch it — caught empirically while
+    building this function: an unmodified raw-asset settle measured a
+    ~4.8 m drop in 1 s of sim time, matching free-fall, not a settle).
+    Uses `mujoco.MjSpec` to inject a `mjGEOM_PLANE` at the world origin
+    ONLY when the compiled model doesn't already have one (a future
+    robot asset that DOES ship its own floor is left untouched)."""
+    import mujoco
+
+    spec = mujoco.MjSpec.from_file(str(mjcf_path))
+    model = spec.compile()
+    has_floor = bool(np.any(
+        np.asarray(model.geom_type) == int(mujoco.mjtGeom.mjGEOM_PLANE)))
+    if not has_floor:
+        floor = spec.worldbody.add_geom()
+        floor.type = mujoco.mjtGeom.mjGEOM_PLANE
+        floor.size = [0.0, 0.0, 0.05]
+        floor.pos = [0.0, 0.0, 0.0]
+        floor.contype = 1
+        floor.conaffinity = 1
+        model = spec.compile()
+    return model
+
+
+def _quat_from_pitch_roll(pitch: float, roll: float) -> np.ndarray:
+    """Forward direction of `_quat_wxyz_to_pitch_rad`/
+    `_quat_wxyz_to_roll_rad`: build the wxyz unit quaternion mjlab's
+    `reset_root_state_uniform` produces when it applies a
+    `pose_range["pitch"/"roll"]` OFFSET (yaw=0) against the G1 entity's
+    DEFAULT orientation (verified against `mjlab.envs.mdp.events
+    .reset_root_state_uniform` and `.utils.lab_api.math
+    .quat_from_euler_xyz`/`.quat_mul`: `orientations = quat_mul(
+    default_quat, quat_from_euler_xyz(roll, pitch, yaw))`). The G1 MJCF's
+    pelvis body carries no `quat` attribute — i.e. an IDENTITY default
+    orientation — so `quat_mul(identity, delta)` reduces to `delta`
+    itself; this function returns exactly that `delta` (yaw=0).
+
+    Round-trips exactly through `_quat_wxyz_to_pitch_rad`/
+    `_quat_wxyz_to_roll_rad` for the (roll, pitch) domain those two
+    functions are valid over — hand-verified numerically for several
+    (roll, pitch) pairs spanning +-pi; see
+    `test_quat_from_pitch_roll_roundtrips_through_extraction`.
+    """
+    cr, sr = math.cos(roll / 2.0), math.sin(roll / 2.0)
+    cp, sp = math.cos(pitch / 2.0), math.sin(pitch / 2.0)
+    return np.array([cr * cp, sr * cp, cr * sp, -sr * sp])
+
+
+def settle_reset(
+    reset_scalars: dict,
+    *,
+    joint_names: Optional[list] = None,
+    robot: str = "g1",
+    settle_time_s: float = 0.75,
+) -> dict:
+    """Run a derived EVAL reset pose to physical rest on CPU MuJoCo and
+    re-derive its scalars from the settled state (§D20a).
+
+    D20a's GPU probe found that derived lying resets can be PROPPED —
+    the derivation copies the clip's start-window pose verbatim, and
+    mocap start frames can be mid-roll/unsettled even after segment QC
+    (z-stillness ≠ whole-body rest); two of four real stage resets
+    collapsed 0.13-0.23 m during a 0.5 s zero-action settle. This
+    function makes every derived reset physically resting BY
+    CONSTRUCTION instead: build the exact qpos the derived scalars
+    describe, drop it onto the real robot MJCF with elevated joint
+    damping (so limbs sag to rest instead of oscillating — the raw asset
+    has zero damping, see `_SETTLE_MIN_DOF_DAMPING`), step physics with
+    zero control until velocity stays low for a sustained window (or
+    `settle_time_s` elapses), and read the new (z, pitch, roll, joint
+    angles) back off the settled state.
+
+    This intentionally mimics "find the resting configuration for this
+    posture" — it does NOT reproduce the training runner's exact reset
+    mechanics (no domain randomization, no PD control, and the
+    `reset_joints_to_reference` event's own soft-limit clamp is not
+    replicated here since the raw MJCF has no actuators to clamp
+    against).
+
+    Parameters
+    ----------
+    reset_scalars : a flat SCALAR reset payload — the shape
+        `derive_eval_reset` returns (`reset_height_offset_m` required;
+        `reset_pitch_offset_rad`/`reset_roll_offset_rad`/
+        `reset_joint_pos_target` optional). Any OTHER key (e.g.
+        `reset_vertical_velocity_mps`, `reset_joint_pos_noise_rad`,
+        `fell_over_termination`) is copied through UNCHANGED into the
+        returned scalars — settling only touches pose, never velocity/
+        noise/termination knobs.
+    joint_names : the clip's `joint_names`, same order as
+        `reset_scalars["reset_joint_pos_target"]` — REQUIRED to place a
+        joint target (each one is resolved BY NAME via `model.joint
+        (name)`, never by index; an unresolvable name is skipped, not
+        fatal — mirrors `refs/preview.py`'s per-frame posing
+        discipline). Ignored (with no target applied) if `None` or if
+        `reset_scalars` carries no `reset_joint_pos_target`.
+    robot : resolved to an MJCF via `sculptor.refs.preview
+        .resolve_mjcf_for_robot` — reused rather than re-implemented, the
+        SAME resolver `refs/preview.py`'s clip-preview rendering uses.
+    settle_time_s : maximum sim time to step before giving up on
+        convergence (the settled-but-not-yet-`_SETTLE_CONSECUTIVE_STEPS`
+        -confirmed state is still returned — see `converged` below).
+
+    Returns
+    -------
+    dict with keys:
+      "scalars": a COPY of `reset_scalars` with `reset_height_offset_m`
+        (always), and `reset_pitch_offset_rad`/`reset_roll_offset_rad`/
+        `reset_joint_pos_target` (only the ones that were present in the
+        input) replaced by their settled-state re-derivation.
+      "delta_z_m": settled z minus the REQUESTED z (negative = sagged
+        down during settling — the D20a "propped" signature).
+      "steps": number of `mj_step` calls actually taken.
+      "converged": whether `_SETTLE_CONSECUTIVE_STEPS` consecutive steps
+        measured max|qvel| under `_SETTLE_QVEL_STOP_THRESH` before
+        `settle_time_s` ran out.
+      "duration_s": `steps * model.opt.timestep`.
+
+    Raises
+    ------
+    `SettleUnavailable` on ANY failure to resolve the MJCF, load the
+    model, or step physics. Never raises for a merely non-converged
+    settle (that's `converged: False` in a normal return) — only for a
+    genuine failure to run the simulation at all.
+    """
+    from sculptor.refs.preview import resolve_mjcf_for_robot
+
+    try:
+        import mujoco
+    except Exception as e:  # noqa: BLE001
+        raise SettleUnavailable(
+            f"mujoco import failed: {type(e).__name__}: {e}") from e
+
+    try:
+        mjcf_path = resolve_mjcf_for_robot(robot)
+    except Exception as e:  # noqa: BLE001 — PreviewUnavailable or anything else
+        raise SettleUnavailable(
+            f"MJCF resolution failed for robot={robot!r}: "
+            f"{type(e).__name__}: {e}") from e
+
+    try:
+        model = _resolve_settle_model(mjcf_path)
+        data = mujoco.MjData(model)
+    except Exception as e:  # noqa: BLE001
+        raise SettleUnavailable(
+            f"MuJoCo failed to load {mjcf_path}: {type(e).__name__}: "
+            f"{e}") from e
+
+    height_offset = float(reset_scalars.get("reset_height_offset_m", 0.0))
+    pitch = float(reset_scalars.get("reset_pitch_offset_rad") or 0.0)
+    roll = float(reset_scalars.get("reset_roll_offset_rad") or 0.0)
+    joint_target = reset_scalars.get("reset_joint_pos_target")
+    requested_z = _G1_CLASS_STAND_M + height_offset
+
+    qpos0 = np.zeros(model.nq, dtype=np.float64)
+    qpos0[2] = requested_z
+    qpos0[3:7] = _quat_from_pitch_roll(pitch, roll)
+    if joint_target and joint_names:
+        for name, angle in zip(joint_names, joint_target):
+            try:
+                adr = int(model.joint(str(name)).qposadr[0])
+            except Exception:  # noqa: BLE001 — unknown joint name for this MJCF
+                continue
+            qpos0[adr] = float(angle)
+
+    data.qpos[:] = qpos0
+    data.qvel[:] = 0.0
+    original_damping = model.dof_damping.copy()
+    model.dof_damping[:] = np.maximum(
+        original_damping, _SETTLE_MIN_DOF_DAMPING)
+
+    dt = float(model.opt.timestep)
+    max_steps = max(1, int(round(settle_time_s / dt)))
+    steps = 0
+    converged = False
+    try:
+        mujoco.mj_forward(model, data)
+        consecutive = 0
+        for i in range(1, max_steps + 1):
+            data.ctrl[:] = 0.0
+            mujoco.mj_step(model, data)
+            steps = i
+            if not (np.all(np.isfinite(data.qpos))
+                    and np.all(np.isfinite(data.qvel))):
+                raise SettleUnavailable(
+                    f"physics settle diverged (non-finite state) at "
+                    f"step {steps}")
+            if float(np.max(np.abs(data.qvel))) < _SETTLE_QVEL_STOP_THRESH:
+                consecutive += 1
+                if consecutive >= _SETTLE_CONSECUTIVE_STEPS:
+                    converged = True
+                    break
+            else:
+                consecutive = 0
+    except SettleUnavailable:
+        raise
+    except Exception as e:  # noqa: BLE001 — non-convergence / step failure
+        raise SettleUnavailable(
+            f"physics settle step failed after {steps} steps: "
+            f"{type(e).__name__}: {e}") from e
+    finally:
+        model.dof_damping[:] = original_damping
+
+    settled_z = float(data.qpos[2])
+    settled_quat = np.asarray(data.qpos[3:7], dtype=np.float64)
+    if abs(settled_z - requested_z) > _SETTLE_MAX_PLAUSIBLE_DELTA_M:
+        raise SettleUnavailable(
+            f"physics settle produced an implausible height change "
+            f"({settled_z - requested_z:+.3f} m over {steps} steps, "
+            f"exceeds the {_SETTLE_MAX_PLAUSIBLE_DELTA_M} m plausibility "
+            f"bound) — likely a contact-force explosion from joint/"
+            f"orientation interpenetration (e.g. a lying pitch/height "
+            f"offset with no reset_joint_pos_target, so every joint sits "
+            f"at its straight-leg default), not a genuine settle."
+        )
+
+    new_scalars = dict(reset_scalars)
+    new_scalars["reset_height_offset_m"] = round(
+        settled_z - _G1_CLASS_STAND_M, 4)
+    if "reset_pitch_offset_rad" in reset_scalars:
+        new_scalars["reset_pitch_offset_rad"] = round(
+            float(_quat_wxyz_to_pitch_rad(settled_quat[None, :])[0]), 4)
+    if "reset_roll_offset_rad" in reset_scalars:
+        new_scalars["reset_roll_offset_rad"] = round(
+            float(_quat_wxyz_to_roll_rad(settled_quat[None, :])[0]), 4)
+    if joint_target and joint_names:
+        new_target = []
+        for name, orig in zip(joint_names, joint_target):
+            try:
+                adr = int(model.joint(str(name)).qposadr[0])
+                new_target.append(round(float(data.qpos[adr]), 4))
+            except Exception:  # noqa: BLE001 — unresolved name: pass through
+                new_target.append(float(orig))
+        new_scalars["reset_joint_pos_target"] = new_target
+
+    return {
+        "scalars": new_scalars,
+        "delta_z_m": round(settled_z - requested_z, 4),
+        "steps": steps,
+        "converged": converged,
+        "duration_s": round(steps * dt, 4),
+    }

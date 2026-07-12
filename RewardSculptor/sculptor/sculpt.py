@@ -4862,55 +4862,266 @@ def _run_one_stage(
                     "clip": clip_src,
                 })
 
-            try:
-                from sculptor.reference import apply_reference_rsi
+            # §start_pose QC (item 4): does the RESOLVED clip's measured
+            # shape agree with the stage-authored start_pose? Runs
+            # against WHATEVER clip actually resolved above — attached,
+            # project jump.npz, or procedural fallback — since a
+            # mismatch matters regardless of clip provenance (a
+            # start_pose="supine" stage training from a standing-ish
+            # procedural jump clip is exactly the D20 "silent wrong task
+            # class" failure mode this closes). No-op when
+            # stage.start_pose is None.
+            stage_start_pose = getattr(stage, "start_pose", None)
+            non_standing_start = stage_start_pose not in (None, "standing")
+            if stage_start_pose is not None:
+                try:
+                    from sculptor.reference import (
+                        check_start_pose_compatibility,
+                    )
 
-                spec_path = apply_reference_rsi(stage_env_dir, clip)
+                    check_start_pose_compatibility(
+                        clip, stage_start_pose, clip_id=clip_src,
+                    )
+                except ValueError as e:
+                    emit({
+                        "type": "stage_start_pose_mismatch",
+                        "stage_name": stage.name,
+                        "start_pose": stage_start_pose,
+                        "clip": clip_src,
+                        "error": str(e),
+                    })
+                    return _fail_stage(
+                        stage, "reference_scaffold_failed", str(e), emit,
+                    )
+
+            try:
+                from sculptor.reference import (
+                    apply_reference_rsi, derive_eval_reset,
+                )
+
+                # §D20a settle-then-rederive: derive the pre-settle EVAL
+                # reset FIRST (None for airborne/other clips — pure
+                # no-op, unchanged behavior), settle it to physical rest
+                # on CPU MuJoCo when possible, and feed the settled
+                # centers into `apply_reference_rsi` so the persisted
+                # TRAIN ranges re-center on them too (same width, just
+                # re-anchored — never widened/narrowed here).
+                # RS_SETTLE_RESET=0 is the escape hatch (default on).
+                # Settle failure is NEVER fatal (§5) — proceed with the
+                # UNSETTLED values, but disclose the attempt/outcome in
+                # both the env-spec meta rationale (inside
+                # apply_reference_rsi) and the emitted events below.
+                import os as _os
+
+                eval_reset_pre = derive_eval_reset(clip)
+                settled_centers: Optional[dict] = None
+                settle_info: Optional[dict] = None
+                if eval_reset_pre is not None:
+                    if _os.environ.get("RS_SETTLE_RESET", "1") != "0":
+                        try:
+                            from sculptor.reference import settle_reset
+
+                            settle_result = settle_reset(
+                                eval_reset_pre,
+                                joint_names=clip.get("joint_names"),
+                                robot=robot,
+                            )
+                            settled_centers = settle_result["scalars"]
+                            settle_info = {
+                                "attempted": True,
+                                "succeeded": True,
+                                "delta_z_m": settle_result["delta_z_m"],
+                                "steps": settle_result["steps"],
+                                "converged": settle_result["converged"],
+                                "duration_s": settle_result["duration_s"],
+                            }
+                        except Exception as e:  # noqa: BLE001 — §5: never fatal
+                            settle_info = {
+                                "attempted": True,
+                                "succeeded": False,
+                                "error": f"{type(e).__name__}: {e}",
+                            }
+                    else:
+                        settle_info = {
+                            "attempted": False, "reason": "RS_SETTLE_RESET=0",
+                        }
+
+                spec_path = apply_reference_rsi(
+                    stage_env_dir, clip, settled_centers=settled_centers)
                 emit({
                     "type": "stage_reference_rsi_applied",
                     "stage_name": stage.name,
                     "clip": clip_src,
                     "env_spec": str(spec_path),
                     "stage_clip_load_error": None,
+                    "settle": settle_info,
                 })
                 # §D17: stage-FIXED eval-rollout reset override, written
                 # ONCE at scaffold time (same point as the train-only RSI
                 # above), decoupled from the diagnoser-iterable env-spec
                 # train section — see `reference.derive_eval_reset`'s
                 # docstring for the full rationale. Non-None only for
-                # get-up-archetype clips; jump/other stages get None and
-                # this is a pure no-op (eval stays standing-start,
-                # unchanged behavior). Failure here is non-fatal — the
-                # RSI curriculum above already applied; a missing
-                # eval_reset.json just means eval falls back to today's
-                # standing-start behavior for this stage.
+                # get-up/mid_start-archetype clips; jump/other stages get
+                # None and this is a pure no-op (eval stays
+                # standing-start, unchanged behavior). §5: EVAL reset
+                # scalars get the settled values EXACTLY when settling
+                # succeeded (falls back to the unsettled derivation
+                # otherwise). Failure here is non-fatal for a
+                # standing-start stage (the RSI curriculum above already
+                # applied; a missing eval_reset.json just means eval
+                # falls back to today's standing-start behavior) but IS
+                # fatal for a non-standing `start_pose` stage (§4: that
+                # start state IS the task — silently continuing with a
+                # standing-default eval reset would reproduce the exact
+                # D20 hollow-mission failure).
                 try:
-                    from sculptor.reference import derive_eval_reset
-
-                    eval_reset = derive_eval_reset(clip)
-                    if eval_reset is not None:
+                    final_eval_reset = (
+                        settled_centers if settled_centers is not None
+                        else eval_reset_pre)
+                    if final_eval_reset is not None:
                         eval_reset_path = stage_env_dir / "eval_reset.json"
                         stage_env_dir.mkdir(parents=True, exist_ok=True)
                         eval_reset_path.write_text(
-                            json.dumps(eval_reset, indent=2, sort_keys=True),
+                            json.dumps(
+                                final_eval_reset, indent=2, sort_keys=True),
                             encoding="utf-8",
                         )
                         emit({
                             "type": "stage_eval_reset_written",
                             "stage_name": stage.name,
                             "clip": clip_src,
-                            "eval_reset": eval_reset,
+                            "eval_reset": final_eval_reset,
                             "path": str(eval_reset_path),
+                            "settle": settle_info,
                         })
-                except Exception as e:  # noqa: BLE001 — advisory, never fatal
+                except Exception as e:  # noqa: BLE001 — see fatal branch below
                     emit({
                         "type": "stage_eval_reset_failed",
                         "stage_name": stage.name,
                         "error": f"{type(e).__name__}: {e}",
                     })
-            except Exception as e:  # noqa: BLE001 — curriculum, not correctness
+                    if non_standing_start:
+                        return _fail_stage(
+                            stage, "reference_scaffold_failed",
+                            (
+                                f"eval-reset application failed for "
+                                f"start_pose={stage_start_pose!r} stage "
+                                f"{stage.name!r}: {type(e).__name__}: {e}. "
+                                f"A non-standing start is the task, not "
+                                f"curriculum — refusing to silently train "
+                                f"from a standing-default eval reset."
+                            ),
+                            emit,
+                        )
+            except Exception as e:  # noqa: BLE001 — see fatal branch below
                 emit({
                     "type": "stage_reference_rsi_failed",
+                    "stage_name": stage.name,
+                    "error": f"{type(e).__name__}: {e}",
+                })
+                if non_standing_start:
+                    return _fail_stage(
+                        stage, "reference_scaffold_failed",
+                        (
+                            f"RSI application failed for "
+                            f"start_pose={stage_start_pose!r} stage "
+                            f"{stage.name!r}: {type(e).__name__}: {e}. "
+                            f"Refusing to silently train from a "
+                            f"standing default."
+                        ),
+                        emit,
+                    )
+
+    # 2.6 §reference_signature (item 6): whenever a reference clip is
+    # ATTACHED to this stage (stage.reference_clip_id set), INDEPENDENT
+    # of needs_reference_rsi, write `<stage_dir>/reference_signature.json`
+    # — a LOCKED schema a sibling worker's diagnose/edit prompts consume
+    # verbatim, so its shape must not deviate. Also QCs start_pose here
+    # for the needs_reference_rsi=False case (2.5 above already QC'd it
+    # when that block ran) — e.g. a `start_pose="standing"` stage
+    # accidentally pointed at a lying clip via the reference picker,
+    # with no RSI curriculum requested at all. Failure to resolve the
+    # clip or write the file is NON-FATAL (log only) — this is
+    # observability/context for a downstream consumer, never
+    # correctness. Idempotent: skipped entirely once the file exists.
+    stage_reference_clip_id = getattr(stage, "reference_clip_id", None)
+    if stage_reference_clip_id and not (
+            stage_dir / "reference_signature.json").is_file():
+        try:
+            project_root = mission_dir.parent.parent
+            sig_robot = _stage_reference_robot_slug(
+                stage_dir=stage_dir, project_root=project_root)
+            from sculptor.refs import library as refs_library
+            from sculptor.reference import load_clip
+
+            sig_clip_path = (
+                refs_library.clip_dir(sig_robot, stage_reference_clip_id)
+                / refs_library.CLIP_FILENAME)
+            sig_clip = load_clip(sig_clip_path)
+        except Exception as e:  # noqa: BLE001 — non-fatal (item 6)
+            sig_clip = None
+            emit({
+                "type": "stage_reference_signature_failed",
+                "stage_name": stage.name,
+                "error": f"{type(e).__name__}: {e}",
+            })
+
+        if sig_clip is not None:
+            sig_start_pose = getattr(stage, "start_pose", None)
+            if sig_start_pose is not None and not getattr(
+                    stage, "needs_reference_rsi", False):
+                try:
+                    from sculptor.reference import (
+                        check_start_pose_compatibility,
+                    )
+
+                    check_start_pose_compatibility(
+                        sig_clip, sig_start_pose,
+                        clip_id=f"library:{sig_robot}/{stage_reference_clip_id}",
+                    )
+                except ValueError as e:
+                    emit({
+                        "type": "stage_start_pose_mismatch",
+                        "stage_name": stage.name,
+                        "start_pose": sig_start_pose,
+                        "clip": f"library:{sig_robot}/{stage_reference_clip_id}",
+                        "error": str(e),
+                    })
+                    return _fail_stage(
+                        stage, "reference_scaffold_failed", str(e), emit,
+                    )
+
+            try:
+                from sculptor.refs.convert import kinematic_signature
+
+                try:
+                    sig_text = refs_library.read_provenance(
+                        sig_robot, stage_reference_clip_id).get("text")
+                except Exception:  # noqa: BLE001 — provenance is advisory
+                    sig_text = None
+                signature_payload = {
+                    "schema": 1,
+                    "clip_id": stage_reference_clip_id,
+                    "robot": sig_robot,
+                    "tier": getattr(stage, "reference_tier", None),
+                    "text": sig_text,
+                    "signature": kinematic_signature(sig_clip),
+                }
+                sig_path = stage_dir / "reference_signature.json"
+                sig_path.write_text(
+                    json.dumps(
+                        signature_payload, indent=2, sort_keys=True,
+                        default=str),
+                    encoding="utf-8",
+                )
+                emit({
+                    "type": "stage_reference_signature_written",
+                    "stage_name": stage.name,
+                    "path": str(sig_path),
+                })
+            except Exception as e:  # noqa: BLE001 — non-fatal (item 6)
+                emit({
+                    "type": "stage_reference_signature_failed",
                     "stage_name": stage.name,
                     "error": f"{type(e).__name__}: {e}",
                 })

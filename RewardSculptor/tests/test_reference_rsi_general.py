@@ -101,6 +101,143 @@ def _make_never_rising_never_low_clip(*, fps: float = 50.0) -> dict:
     return {"root_pos_z": np.full(120, 0.78), "fps": fps}
 
 
+def _make_mid_start_clip(
+    *, fps: float = 50.0, with_quat: bool = False, with_joints: bool = False,
+) -> dict:
+    """z: 0.42 flat 0.5s (mid-height — a crouch-to-stand start, D19's
+    documented gap) -> ramp 1.0s -> 0.75 flat 0.5s. Same optional
+    quat/joint_pos shape as `_make_getup_clip`."""
+    def seg(dur: float, fn):
+        n = max(2, int(round(dur * fps)))
+        return fn(np.linspace(0.0, 1.0, n, endpoint=False))
+
+    crouch = seg(0.5, lambda s: np.full_like(s, 0.42))
+    ramp = seg(1.0, lambda s: 0.42 + (0.75 - 0.42) * s)
+    stand = seg(0.5, lambda s: np.full_like(s, 0.75))
+    z = np.concatenate([crouch, ramp, stand])
+    clip: dict = {"root_pos_z": z, "fps": fps,
+                  "meta": {"source": "synthetic:mid_start"}}
+    if with_quat:
+        def quat_pitch(theta: float) -> np.ndarray:
+            return np.array(
+                [np.cos(theta / 2), 0.0, np.sin(theta / 2), 0.0])
+
+        crouch_q = np.tile(quat_pitch(np.pi / 6), (crouch.shape[0], 1))
+        ramp_s = np.linspace(0.0, 1.0, ramp.shape[0], endpoint=False)
+        ramp_q = np.stack(
+            [quat_pitch(np.pi / 6 * (1 - s)) for s in ramp_s])
+        stand_q = np.tile(quat_pitch(0.0), (stand.shape[0], 1))
+        clip["root_quat_wxyz"] = np.concatenate(
+            [crouch_q, ramp_q, stand_q], axis=0)
+    if with_joints:
+        n = z.shape[0]
+        crouch_j = np.tile([0.6, -0.4], (crouch.shape[0], 1))
+        ramp_j = np.linspace(crouch_j[0], [0.0, 0.0], ramp.shape[0])
+        stand_j = np.tile([0.0, 0.0], (stand.shape[0], 1))
+        clip["joint_pos"] = np.concatenate(
+            [crouch_j, ramp_j, stand_j], axis=0)
+        clip["joint_names"] = ["knee", "hip"]
+    assert validate_clip(clip) == []
+    return clip
+
+
+# ── §start_pose mid_start archetype (D19 closure) ────────────────────────
+def test_mid_start_archetype_classified_between_getup_and_airborne() -> None:
+    from sculptor.reference import _archetype
+
+    clip = _make_mid_start_clip()
+    assert _archetype(clip) == "mid_start"
+
+
+def test_mid_start_derives_negative_height_offset_anchored_absolute() -> None:
+    """Same absolute-anchor math as getup (D19): a 0.42 m mid-height
+    start derives an offset well below zero but not as deep as a true
+    lying (getup) start."""
+    clip = _make_mid_start_clip()
+    keys = derive_rsi_train_keys(clip)
+    lo, hi = keys["reset_height_offset_m"]
+    assert lo < 0.0 and hi < 0.0
+    assert lo <= hi
+    # Sanity: 0.74 (G1_CLASS_STAND_M) + offset ~= the clip's own
+    # start-window height (0.42), well above a true lying floor.
+    from sculptor.reference import G1_CLASS_STAND_M
+
+    assert 0.30 <= G1_CLASS_STAND_M + hi <= 0.50
+
+
+def test_mid_start_sunk_termination_guard_below_clip_minimum() -> None:
+    clip = _make_mid_start_clip()
+    keys = derive_rsi_train_keys(clip)
+    z_min = float(clip["root_pos_z"].min())
+    sunk = keys["min_base_height_termination_m"]
+    assert sunk < z_min
+
+
+def test_mid_start_disables_fell_over_termination() -> None:
+    """§D16 conservative lesson, extended to mid_start: even a bent
+    crouch pose can trip orientation-based fall termination at reset."""
+    clip = _make_mid_start_clip()
+    derived = derive_reference_reset(clip)
+    assert derived["fell_over_termination"] is False
+
+
+def test_mid_start_derives_orientation_and_joint_target_when_present() -> None:
+    clip = _make_mid_start_clip(with_quat=True, with_joints=True)
+    derived = derive_reference_reset(clip)
+    assert "reset_pitch_offset_rad" in derived
+    assert "reset_joint_pos_target" in derived
+    assert len(derived["reset_joint_pos_target"]) == 2
+
+
+def test_mid_start_eval_reset_is_non_none() -> None:
+    """§D17 extended to mid_start: a non-standing start IS the task,
+    whether it's flat-on-the-ground or mid-crouch."""
+    clip = _make_mid_start_clip()
+    eval_reset = derive_eval_reset(clip)
+    assert eval_reset is not None
+    assert eval_reset["fell_over_termination"] is False
+    assert eval_reset["reset_vertical_velocity_mps"] == 0.0
+
+
+def test_mid_start_apply_reference_rsi_passes_env_spec_gate(
+    tmp_path: Path,
+) -> None:
+    clip = _make_mid_start_clip()
+    env_dir = tmp_path / "env"
+    path = apply_reference_rsi(env_dir, clip)
+    spec = json.loads(path.read_text(encoding="utf-8"))
+    assert validate_env_spec(spec) == []
+    assert spec["train"]["reset_height_offset_m"][1] <= 0.0
+    assert spec["train"]["fell_over_termination"] is False
+
+
+def test_archetype_boundary_getup_vs_mid_start() -> None:
+    """The 0.35 m boundary: just under is getup, just at/over is
+    mid_start (aligned with `_GETUP_START_MAX_M`)."""
+    from sculptor.reference import _archetype
+
+    fps = 50.0
+    below = {"root_pos_z": np.full(60, 0.30), "fps": fps}
+    at_or_above = {"root_pos_z": np.full(60, 0.40), "fps": fps}
+    assert _archetype(below) == "getup"
+    assert _archetype(at_or_above) == "mid_start"
+
+
+def test_archetype_boundary_mid_start_vs_airborne() -> None:
+    """The 0.55 m boundary (`_GETUP_END_MIN_M`, reused deliberately):
+    a flat clip just under never counts as airborne/other since it
+    never rises — but a RISING clip starting just at/over 0.55 m
+    classifies airborne, matching pre-mid_start behavior exactly."""
+    from sculptor.reference import _archetype
+
+    fps = 50.0
+    n = 60
+    # Starts at 0.60 (>= 0.55) and rises above its own baseline -> airborne.
+    z = np.concatenate([np.full(30, 0.60), np.full(30, 0.90)])
+    clip = {"root_pos_z": z, "fps": fps}
+    assert _archetype(clip) == "airborne"
+
+
 # ── Get-up archetype: RSI ranges ────────────────────────────────────────
 def test_getup_clip_derives_lying_reset_height() -> None:
     clip = _make_getup_clip()

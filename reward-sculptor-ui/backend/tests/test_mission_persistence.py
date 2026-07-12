@@ -40,6 +40,7 @@ def _stage_dict(
     steering_metric: str | None = None,
     failure_reason: str | None = None,
     failure_detail: str | None = None,
+    start_pose: str | None = None,
 ) -> dict:
     return {
         "name": name,
@@ -60,6 +61,7 @@ def _stage_dict(
         "steering_metric": steering_metric,
         "failure_reason": failure_reason,
         "failure_detail": failure_detail,
+        "start_pose": start_pose,
     }
 
 
@@ -242,6 +244,25 @@ def test_provenance_enrichment_does_not_override_persisted_value(
     stage = r.json()["stages"][0]
     assert stage["failure_reason"] == "no_checkpoint"
     assert stage["failure_detail"] == "already set"
+
+
+def test_start_pose_mirrors_through_to_api(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    """§start_pose: mirrors sculptor.mission.Stage.start_pose through
+    `_stages_to_schema` onto the GET .../missions/{ms} wire response,
+    same drill as reference_clip_id / steering_metric."""
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _write_mission(project_dir, "m1", [
+        _stage_dict("a", start_pose="supine"),
+        _stage_dict("b", parent_stage="a"),  # start_pose omitted -> None
+    ])
+
+    r = client.get(f"/projects/{slug}/missions/m1")
+    stages = {s["name"]: s for s in r.json()["stages"]}
+    assert stages["a"]["start_pose"] == "supine"
+    assert stages["b"]["start_pose"] is None
 
 
 def test_display_labels_parent_and_replan_children(

@@ -22,12 +22,21 @@ import dataclasses
 import datetime as _dt
 import json
 import re
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Optional
 
 
 SCHEMA_VERSION = 1
+
+# §start_pose: the physical configuration the robot is in at a stage's
+# episode start. None = legacy/unspecified (older mission.json files, or
+# a decomposer that omitted the field) — treated as "no opinion", NOT as
+# "standing"; the force-rule below only fires on an EXPLICIT non-standing
+# value, never on None.
+START_POSE_VALUES: frozenset[str] = frozenset(
+    {"supine", "prone", "sitting", "crouched", "standing"})
 
 # Valid Stage names: snake_case identifier, ≤ 32 chars. Used as the
 # reward-component-namespace prefix, on-disk subdirectory name, and
@@ -122,6 +131,28 @@ class Stage:
     reference_clip_id: Optional[str] = None
     reference_tier: Optional[str] = None
     reference_match_confidence: Optional[float] = None
+    # §start_pose: the physical configuration the robot is in at THIS
+    # stage's episode start. One of `START_POSE_VALUES` (supine, prone,
+    # sitting, crouched, standing), or None (unspecified — legacy
+    # missions / a decomposer that omitted the field; NOT the same as
+    # "standing", just "no opinion recorded"). Claude sets this in
+    # `decompose_task`/`redecompose_stage` from the mission goal + this
+    # stage's semantics; sub-stages of the SAME mission may carry
+    # DIFFERENT start poses as a get-up motion progresses (e.g.
+    # supine -> crouched -> standing across stages). `validate_mission`
+    # enforces the DETERMINISTIC FORCE RULE: any non-"standing"
+    # start_pose forces `needs_reference_rsi=True` regardless of what
+    # was authored — a non-standing episode start is untrainable
+    # without a reference-derived reset, and prompt compliance on
+    # `needs_reference_rsi` is not trusted on its own (§sculpt.py's
+    # scaffold additionally QCs the ATTACHED CLIP's measured shape
+    # against this value via `sculptor.reference
+    # .check_start_pose_compatibility` — this field only says what the
+    # stage WANTS, not that a compatible clip is actually attached).
+    # Backward-compatible: older mission.json files without this key
+    # load with start_pose=None via `from_dict`'s filter-unknown-keys
+    # path.
+    start_pose: Optional[str] = None
 
     # ── Runtime-populated by orchestrator ────────────────────────────
     status: StageStatus = "pending"
@@ -487,6 +518,35 @@ def _validate_stage_structure(
                 f"≤128 chars (a spec-metric name or generated-metric path); "
                 f"got {stage.steering_metric!r}"
             )
+    # §start_pose: unknown values are a hard validation error (typos /
+    # LLM drift must not silently pass through as "no opinion" — that
+    # would be indistinguishable from None). A valid, non-"standing"
+    # value that arrives with `needs_reference_rsi=False` is NOT an
+    # error — it is FORCED true here (mutating the stage in place) since
+    # prompt compliance on that separate boolean field is not trusted;
+    # the force is disclosed via `warnings.warn` (this module has no
+    # existing structured-notice channel — `warnings` is the standard
+    # library's own "log/warn without changing the return contract"
+    # mechanism, and `validate_mission` must keep returning None / raise
+    # for every OTHER violation).
+    if stage.start_pose is not None:
+        if stage.start_pose not in START_POSE_VALUES:
+            raise MissionValidationError(
+                f"stage[{idx}].start_pose={stage.start_pose!r} must be "
+                f"one of {sorted(START_POSE_VALUES)} or None"
+            )
+        if stage.start_pose != "standing" and not stage.needs_reference_rsi:
+            warnings.warn(
+                f"stage {stage.name!r} has start_pose="
+                f"{stage.start_pose!r} (non-standing) but "
+                f"needs_reference_rsi=False — forcing "
+                f"needs_reference_rsi=True at validation. A non-standing "
+                f"episode start is untrainable without a reference-"
+                f"derived reset; prompt compliance on needs_reference_rsi "
+                f"is not trusted on its own.",
+                stacklevel=2,
+            )
+            stage.needs_reference_rsi = True
 
 
 def _validate_parent_reference(

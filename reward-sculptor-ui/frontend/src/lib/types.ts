@@ -966,6 +966,17 @@ export interface StageSchema {
   reference_clip_id?: string | null;
   reference_tier?: string | null;
   reference_match_confidence?: number | null;
+  // §start_pose: the physical configuration the robot is in at THIS
+  // stage's episode start. null = unspecified (legacy missions, or a
+  // decomposer that omitted the field — NOT the same as "standing").
+  start_pose?:
+    | "supine"
+    | "prone"
+    | "sitting"
+    | "crouched"
+    | "standing"
+    | string
+    | null;
 }
 
 // ── Stage iterations (disk-truth, de-siloed) ─────────────────────────

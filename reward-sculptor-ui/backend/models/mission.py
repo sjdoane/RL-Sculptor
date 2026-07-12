@@ -108,6 +108,14 @@ class StageSchema(BaseModel):
     reference_clip_id: Optional[str] = None
     reference_tier: Optional[str] = None
     reference_match_confidence: Optional[float] = None
+    # §start_pose: mirrors sculptor.mission.Stage.start_pose — the
+    # physical configuration the robot is in at THIS stage's episode
+    # start ("supine" | "prone" | "sitting" | "crouched" | "standing"),
+    # or None (unspecified). Back-compat with every mission.json that
+    # predates this field is automatic via `Stage.from_dict`'s
+    # filter-unknown-keys path — same guarantee `reference_clip_id`
+    # already relies on.
+    start_pose: Optional[str] = None
 
 
 # ── Mission summary / detail / create ────────────────────────────────

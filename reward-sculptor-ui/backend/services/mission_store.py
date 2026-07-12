@@ -179,6 +179,9 @@ def _stages_to_schema(stages: list) -> list[StageSchema]:
             reference_tier=getattr(s, "reference_tier", None),
             reference_match_confidence=getattr(
                 s, "reference_match_confidence", None),
+            # §start_pose: mirrors Stage.start_pose, same drill as
+            # reference_clip_id above.
+            start_pose=getattr(s, "start_pose", None),
         ))
     return out
 

@@ -205,6 +205,39 @@ def test_stage_from_dict_drops_unknown_keys():
     assert s.name == "s1"
 
 
+# ── 1b. §start_pose — Stage field round-trip + defaults ─────────────
+def test_stage_start_pose_defaults_none():
+    s = Stage(
+        name="s1", goal_text="x", success_criterion="True",
+        max_iterations=2, parent_stage=None, reward_seed_prompt="alive",
+    )
+    assert s.start_pose is None
+
+
+def test_stage_start_pose_roundtrips_through_dict():
+    s = Stage(
+        name="s1", goal_text="x", success_criterion="True",
+        max_iterations=2, parent_stage=None, reward_seed_prompt="alive",
+        start_pose="supine",
+    )
+    d = s.to_dict()
+    assert d["start_pose"] == "supine"
+    s2 = Stage.from_dict(d)
+    assert s2.start_pose == "supine"
+
+
+def test_stage_start_pose_older_mission_json_loads_none():
+    """Back-compat: a mission.json predating start_pose loads with None
+    via from_dict's filter-unknown-keys path (no `start_pose` key at
+    all in the payload)."""
+    s = Stage.from_dict({
+        "name": "s1", "goal_text": "x", "success_criterion": "True",
+        "max_iterations": 2, "parent_stage": None,
+        "reward_seed_prompt": "alive",
+    })
+    assert s.start_pose is None
+
+
 # ── 2. validate_mission — structural rules ──────────────────────────
 def test_validate_rejects_empty_stages():
     m = Mission(
@@ -502,6 +535,79 @@ def test_validate_rejects_reward_seed_prompt_outside_char_bounds():
         validate_mission(m2, info_keys=set())
 
 
+# ── 2b. §start_pose — validation + the deterministic force rule ─────
+def _stage_with_start_pose(start_pose, needs_reference_rsi=False) -> Stage:
+    return Stage(
+        name="s1", goal_text="x", success_criterion="True",
+        max_iterations=2, parent_stage=None, reward_seed_prompt="alive",
+        start_pose=start_pose, needs_reference_rsi=needs_reference_rsi,
+    )
+
+
+def test_validate_rejects_unknown_start_pose_value():
+    m = Mission(
+        goal="g", stages=[_stage_with_start_pose("levitating")],
+        decomposition_model="x", decomposition_rationale="",
+    )
+    with pytest.raises(MissionValidationError, match="start_pose"):
+        validate_mission(m, info_keys=set())
+
+
+@pytest.mark.parametrize(
+    "pose", ["supine", "prone", "sitting", "crouched"],
+)
+def test_validate_forces_needs_reference_rsi_for_non_standing_start_pose(pose):
+    """The DETERMINISTIC FORCE RULE: any non-'standing' start_pose with
+    needs_reference_rsi=False gets FORCED True at validation — prompt
+    compliance on the separate boolean is not trusted. A warning
+    discloses the force (this module's log/warn channel; see
+    `_validate_stage_structure`)."""
+    stage = _stage_with_start_pose(pose, needs_reference_rsi=False)
+    m = Mission(
+        goal="g", stages=[stage],
+        decomposition_model="x", decomposition_rationale="",
+    )
+    assert stage.needs_reference_rsi is False
+    with pytest.warns(UserWarning, match="needs_reference_rsi"):
+        validate_mission(m, info_keys=set())
+    assert stage.needs_reference_rsi is True
+
+
+def test_validate_standing_start_pose_does_not_force_rsi():
+    stage = _stage_with_start_pose("standing", needs_reference_rsi=False)
+    m = Mission(
+        goal="g", stages=[stage],
+        decomposition_model="x", decomposition_rationale="",
+    )
+    validate_mission(m, info_keys=set())
+    assert stage.needs_reference_rsi is False
+
+
+def test_validate_none_start_pose_does_not_force_rsi():
+    stage = _stage_with_start_pose(None, needs_reference_rsi=False)
+    m = Mission(
+        goal="g", stages=[stage],
+        decomposition_model="x", decomposition_rationale="",
+    )
+    validate_mission(m, info_keys=set())
+    assert stage.needs_reference_rsi is False
+
+
+def test_validate_non_standing_start_pose_already_true_does_not_warn(
+    recwarn,
+):
+    """No force needed (and no warning) when the stage already carries
+    needs_reference_rsi=True alongside a non-standing start_pose."""
+    stage = _stage_with_start_pose("crouched", needs_reference_rsi=True)
+    m = Mission(
+        goal="g", stages=[stage],
+        decomposition_model="x", decomposition_rationale="",
+    )
+    validate_mission(m, info_keys=set())
+    assert stage.needs_reference_rsi is True
+    assert len(recwarn) == 0
+
+
 # ── 3. decompose_task — happy path with stubbed Claude ───────────────
 def test_decompose_happy_path_no_kg(monkeypatch):
     client = _StubClient(_good_decomp_model())
@@ -734,6 +840,79 @@ def test_needs_reference_rsi_description_covers_non_standing_start():
 
     field_desc = _StageModel.model_fields["needs_reference_rsi"].description
     assert "lying" in field_desc.lower() or "standing reset" in field_desc.lower()
+
+
+# ── §start_pose: _StageModel field + decompose parsing ────────────────
+def test_stage_model_start_pose_defaults_none():
+    sm = _StageModel(
+        name="s1", goal_text="x", success_criterion="True",
+        max_iterations=2, parent_stage=None, reward_seed_prompt="alive",
+    )
+    assert sm.start_pose is None
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [("Supine", "supine"), (" prone ", "prone"), ("", None), (None, None)],
+)
+def test_stage_model_normalizes_start_pose(raw, expected):
+    sm = _StageModel(
+        name="s1", goal_text="x", success_criterion="True",
+        max_iterations=2, parent_stage=None, reward_seed_prompt="alive",
+        start_pose=raw,
+    )
+    assert sm.start_pose == expected
+
+
+def test_decompose_task_prompt_contains_start_pose_rule():
+    """Guard against accidental prompt edits dropping the start_pose
+    section — both the JSON schema block and the vocabulary."""
+    from sculptor.prompts import load_prompt
+
+    p = load_prompt("decompose_task")
+    assert "start_pose" in p
+    assert "supine" in p.lower() and "prone" in p.lower()
+    assert "crouched" in p.lower()
+
+
+def test_redecompose_prompt_contains_start_pose_rule():
+    from sculptor.prompts import load_prompt
+
+    p = load_prompt("redecompose_stage")
+    assert "start_pose" in p
+    assert "supine" in p.lower() and "prone" in p.lower()
+
+
+def test_decompose_parses_start_pose_from_claude(monkeypatch):
+    """A stage-level start_pose Claude emits flows through
+    decompose_task into the resulting Mission's Stage — including the
+    coherent needs_reference_rsi:true a get-up first stage requires."""
+    model = _DecompositionModel(
+        decomposition_rationale=(
+            "One stage: rise from lying on the back to standing."
+        ),
+        stages=[
+            _StageModel(
+                name="stand_up",
+                goal_text="From lying on your back, rise to standing.",
+                success_criterion="behavior['mean_return'] > 0.3",
+                max_iterations=4,
+                parent_stage=None,
+                reward_seed_prompt="alive_bonus + upright + rise_progress",
+                kg_seed_papers=[],
+                needs_reference_rsi=True,
+                start_pose="supine",
+            ),
+        ],
+    )
+    client = _StubClient(model)
+    mission = decompose_task(
+        "Get up off the ground from lying on your back",
+        _default_contract(), kg_store=None, client=client,
+        attach_references=False,
+    )
+    assert mission.stages[0].start_pose == "supine"
+    assert mission.stages[0].needs_reference_rsi is True
 
 
 # ── 6. §REFERENCE_TRAJECTORY_PLAN §4/§7: retrieval + attachment ──────

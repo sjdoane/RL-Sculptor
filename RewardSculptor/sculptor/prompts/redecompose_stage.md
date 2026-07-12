@@ -47,7 +47,8 @@ hopefully softened enough for it to succeed.
       "parent_stage":       <null or earlier sub-stage name>,
       "reward_seed_prompt": "<NL reward spec, 3-2000 chars>",
       "kg_seed_papers":     ["<arxiv_id>", ...],
-      "needs_reference_rsi": <true ONLY for ballistic/airborne sub-stages — see rule 10>
+      "needs_reference_rsi": <true for ballistic/airborne sub-stages OR a non-standing start state — see rule 10>,
+      "start_pose":         <"supine" | "prone" | "sitting" | "crouched" | "standing" | null — see rule 11>
     },
     ...
   ]
@@ -122,20 +123,52 @@ hopefully softened enough for it to succeed.
    decompose_task's hard rule 6).
 
 10. **Reference-state initialization (`needs_reference_rsi`).** Set
-    `needs_reference_rsi: true` on a sub-stage ONLY when ITS core skill
-    involves ballistic/airborne states the policy cannot reach until it
-    has already learned the skill — jump launch, flight, landing, aerial
-    recovery. The orchestrator then starts a fraction of that sub-stage's
-    TRAINING episodes inside those states (heights + vertical velocities
-    from a validated reference trajectory, paired with the required
-    sunk-height termination). Evaluation rollouts are never affected. Keep
-    it `false` for grounded sub-stages (standing, crouching, walking,
-    kicking): needless RSI wastes training resets on states the sub-stage
-    doesn't need. Decide PER SUB-STAGE — a re-decomposition typically
-    splits ONE hard airborne stage into a grounded precursor (RSI false)
-    plus a later airborne sub-stage (RSI true); do NOT blanket-inherit the
-    parent stage's value. This is DeepMimic's RSI result (same as
-    decompose_task rule 9).
+    `needs_reference_rsi: true` on a sub-stage in EITHER of two cases —
+    ITS core skill involves ballistic/airborne states the policy cannot
+    reach until it has already learned the skill (jump launch, flight,
+    landing, aerial recovery), OR ITS `start_pose` (rule 11) is anything
+    other than `"standing"` (a lying/sitting/crouched episode start is
+    UNTRAINABLE from the env's default standing reset, same as
+    decompose_task rule 9's non-standing case). The orchestrator then
+    starts a fraction of that sub-stage's TRAINING episodes inside those
+    states (heights + vertical velocities / postures from a validated
+    reference trajectory, paired with the required sunk-height
+    termination). Evaluation rollouts are never affected. Keep it
+    `false` for grounded, standing-start sub-stages (standing, crouching-
+    while-upright, walking, kicking): needless RSI wastes training
+    resets on states the sub-stage doesn't need. Decide PER SUB-STAGE —
+    a re-decomposition of an airborne stage typically splits ONE hard
+    stage into a grounded precursor (RSI false) plus a later airborne
+    sub-stage (RSI true); a re-decomposition of a get-up stage typically
+    keeps RSI true across every sub-stage (each is still a non-standing
+    start, just progressively closer to upright) — do NOT blanket-
+    inherit the parent stage's value either way, decide from each
+    sub-stage's own `goal_text`/`start_pose`. This is DeepMimic's RSI
+    result (same as decompose_task rule 9). NOTE: if the ORIGINAL failed
+    stage had a stage-fixed eval reset on disk (a non-standing start WAS
+    already the task), the orchestrator OVERRIDES whatever you set here
+    and forces every sub-stage's `needs_reference_rsi: true` regardless
+    — a get-up sub-stage must never silently revert to a standing
+    default reset.
+
+11. **`start_pose` — the physical configuration THIS SUB-STAGE's episode
+    begins from.** One of `"supine"` (lying on back, face up), `"prone"`
+    (lying on front, face down), `"sitting"`, `"crouched"`, `"standing"`,
+    or `null`. Same vocabulary and derivation rule as `decompose_task`
+    rule 9/10: read it off THIS sub-stage's `goal_text`, not the
+    original failed stage's. **Sub-stages of a re-decomposed get-up
+    stage usually progress through DIFFERENT start poses** as the
+    softened curriculum works its way up — e.g. redecomposing a failed
+    `feet_under_crouch` stage might yield
+    `feet_under_crouch__r1_0` (`start_pose: "supine"`, a more forgiving
+    lower starting point) -> `feet_under_crouch__r1_1`
+    (`start_pose: "crouched"`) -> `feet_under_crouch__r1_2`
+    (`start_pose: "crouched"`, matching the original failed stage's
+    start so the byte-identical final `success_criterion` is evaluated
+    from the SAME start state it originally failed from). Decide PER
+    SUB-STAGE from that sub-stage's own `goal_text` — do NOT
+    blanket-copy the failed stage's `start_pose` onto every sub-stage
+    unless each sub-stage's goal genuinely begins there.
 
 ## Strategy guidance
 

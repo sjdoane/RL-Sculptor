@@ -3431,6 +3431,504 @@ def test_stage_reference_clip_id_none_emits_fallback_event(
     assert rsi_events[0]["stage_clip_load_error"] is None
 
 
+def _write_library_clip_with_g1_joints(
+    root: Path, robot: str, clip_id: str, *, crouch: bool = True,
+) -> None:
+    """Like `_write_library_clip` but carries `root_quat_wxyz` +
+    `joint_pos` in the REAL G1 canonical joint order (a physically
+    plausible crouch-forward posture — matches every real reference
+    clip in the library, and stays inside `settle_reset`'s
+    `_SETTLE_MAX_PLAUSIBLE_DELTA_M` divergence guard so the settle
+    tests below get a deterministic SUCCESS)."""
+    import numpy as np
+
+    from sculptor.eval.robot_manifest import robot_joint_names
+    from sculptor.reference import save_clip
+
+    names = robot_joint_names("Mjlab-Velocity-Flat-Unitree-G1")
+    fps = 50.0
+    lying = np.full(30, 0.10)
+    ramp = np.linspace(0.10, 0.75, 50)
+    stand = np.full(30, 0.75)
+    z = np.concatenate([lying, ramp, stand])
+    n = z.shape[0]
+
+    def quat_pitch(theta: float) -> np.ndarray:
+        return np.array([np.cos(theta / 2), 0.0, np.sin(theta / 2), 0.0])
+
+    # A near-full pitch (close to pi/2) + relaxed (not crouched) limbs
+    # is what a genuinely FLAT lying pose looks like — empirically
+    # verified stable under `settle_reset` (delta_z well under the
+    # `_SETTLE_MAX_PLAUSIBLE_DELTA_M` divergence guard); a moderate
+    # pitch combined with a CROUCHED joint target at this same low
+    # z (~0.10 m, this clip's own lying height) interpenetrates the
+    # floor and trips the guard — the two must be physically coherent.
+    pitch_lying, pitch_stand = 1.4, 0.0
+    lying_q = np.tile(quat_pitch(pitch_lying), (lying.shape[0], 1))
+    ramp_s = np.linspace(0.0, 1.0, ramp.shape[0], endpoint=False)
+    ramp_q = np.stack(
+        [quat_pitch(pitch_lying * (1 - s)) for s in ramp_s])
+    stand_q = np.tile(quat_pitch(pitch_stand), (stand.shape[0], 1))
+    quat = np.concatenate([lying_q, ramp_q, stand_q], axis=0)
+
+    target = {jn: 0.0 for jn in names}
+    if crouch:
+        target["left_knee_joint"] = 0.3
+        target["right_knee_joint"] = 0.3
+        target["left_hip_pitch_joint"] = -0.15
+        target["right_hip_pitch_joint"] = -0.15
+    lying_j = np.tile([target[jn] for jn in names], (lying.shape[0], 1))
+    ramp_j = np.linspace(lying_j[0], np.zeros(len(names)), ramp.shape[0])
+    stand_j = np.tile(np.zeros(len(names)), (stand.shape[0], 1))
+    joint_pos = np.concatenate([lying_j, ramp_j, stand_j], axis=0)
+
+    clip_dir = root / robot / clip_id
+    save_clip(clip_dir / "clip.npz", {
+        "root_pos_z": z, "fps": fps, "root_quat_wxyz": quat,
+        "joint_pos": joint_pos, "joint_names": names,
+        "meta": {"source": f"library:{clip_id}"},
+    })
+
+
+# ── §start_pose: QC gate + signature file + settle wiring ────────────────
+def test_stage_start_pose_mismatch_fails_stage(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """§start_pose item 4: a stage authored `start_pose="supine"` with
+    NO reference_clip_id attached falls back to the procedural jump
+    clip (archetype airborne) — QC catches the mismatch and fails the
+    stage via `reference_scaffold_failed`, rather than silently
+    training a get-up-labeled stage from a standing/airborne default."""
+    from sculptor import sculpt as sculpt_mod
+
+    m = _make_mission(tmp_path, n_stages=1)
+    m.stages[0].needs_reference_rsi = True
+    m.stages[0].start_pose = "supine"
+    m.stages[0].redecomposition_attempts = 1  # halt, don't redecompose
+
+    fake = _fake_sculpt_run_factory(metric=0.9)
+    monkeypatch.setattr(sculpt_mod, "sculpt_run", fake)
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
+    )
+
+    events: list[dict] = []
+    result = sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab", kg_store=None, on_event=events.append,
+    )
+    assert result.completed is False
+    assert result.halted_reason == "reference_scaffold_failed"
+
+    mismatch_events = [
+        e for e in events if e["type"] == "stage_start_pose_mismatch"]
+    assert len(mismatch_events) == 1
+    assert mismatch_events[0]["start_pose"] == "supine"
+    assert "wrong clip attached or wrong start_pose" in mismatch_events[0]["error"]
+
+    failed_events = [e for e in events if e["type"] == "stage_failed"]
+    assert len(failed_events) == 1
+    assert failed_events[0]["reason"] == "reference_scaffold_failed"
+
+    # Never applied ANY RSI curriculum — QC fails BEFORE apply_reference_rsi.
+    assert not [e for e in events if e["type"] == "stage_reference_rsi_applied"]
+
+
+def test_stage_start_pose_compatible_clip_scaffolds_normally(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """The positive case: start_pose matches the attached clip's
+    measured archetype — no QC failure, normal RSI scaffold."""
+    from sculptor import sculpt as sculpt_mod
+
+    lib_root = tmp_path / "reflib"
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(lib_root))
+    _write_library_clip(lib_root, "g1", "test_getup_clip")
+
+    m = _make_mission(tmp_path, n_stages=1)
+    m.stages[0].needs_reference_rsi = True
+    m.stages[0].reference_clip_id = "test_getup_clip"
+    m.stages[0].start_pose = "supine"
+
+    fake = _fake_sculpt_run_factory(metric=0.9)
+    monkeypatch.setattr(sculpt_mod, "sculpt_run", fake)
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
+    )
+
+    events: list[dict] = []
+    result = sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab", kg_store=None, on_event=events.append,
+    )
+    assert result.completed is True
+    assert not [e for e in events if e["type"] == "stage_start_pose_mismatch"]
+    assert [e for e in events if e["type"] == "stage_reference_rsi_applied"]
+
+
+# ── §start_pose: reference_signature.json (item 6, LOCKED schema) ────────
+def test_reference_signature_written_when_needs_rsi_true(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    from sculptor import sculpt as sculpt_mod
+
+    lib_root = tmp_path / "reflib"
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(lib_root))
+    _write_library_clip(lib_root, "g1", "test_getup_clip")
+
+    m = _make_mission(tmp_path, n_stages=1)
+    m.stages[0].needs_reference_rsi = True
+    m.stages[0].reference_clip_id = "test_getup_clip"
+    m.stages[0].reference_tier = "K"
+
+    fake = _fake_sculpt_run_factory(metric=0.9)
+    monkeypatch.setattr(sculpt_mod, "sculpt_run", fake)
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
+    )
+
+    events: list[dict] = []
+    result = sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab", kg_store=None, on_event=events.append,
+    )
+    assert result.completed is True
+
+    sig_path = Path(m.mission_dir) / "stages" / "stage_0" / "reference_signature.json"
+    assert sig_path.is_file()
+    payload = json.loads(sig_path.read_text())
+    assert payload["schema"] == 1
+    assert payload["clip_id"] == "test_getup_clip"
+    assert payload["robot"] == "g1"
+    assert payload["tier"] == "K"
+    assert "signature" in payload and "duration_s" in payload["signature"]
+
+    written = [e for e in events if e["type"] == "stage_reference_signature_written"]
+    assert len(written) == 1
+
+
+def test_reference_signature_written_when_needs_rsi_false(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """§start_pose item 6: "whenever the stage's reference clip
+    resolves (even if needs_reference_rsi is False)" — a stage with an
+    ATTACHED clip but no RSI curriculum requested still gets a
+    signature file."""
+    from sculptor import sculpt as sculpt_mod
+
+    lib_root = tmp_path / "reflib"
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(lib_root))
+    _write_library_clip(lib_root, "g1", "test_getup_clip")
+
+    m = _make_mission(tmp_path, n_stages=1)
+    m.stages[0].needs_reference_rsi = False
+    m.stages[0].reference_clip_id = "test_getup_clip"
+
+    fake = _fake_sculpt_run_factory(metric=0.9)
+    monkeypatch.setattr(sculpt_mod, "sculpt_run", fake)
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
+    )
+
+    events: list[dict] = []
+    result = sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab", kg_store=None, on_event=events.append,
+    )
+    assert result.completed is True
+    # No RSI curriculum applied at all (needs_reference_rsi is False)...
+    assert not [e for e in events if e["type"] == "stage_reference_rsi_applied"]
+    # ...but the signature file was still written.
+    sig_path = Path(m.mission_dir) / "stages" / "stage_0" / "reference_signature.json"
+    assert sig_path.is_file()
+
+
+def test_reference_signature_text_from_provenance(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    from sculptor import sculpt as sculpt_mod
+    from sculptor.refs import library as refs_library
+
+    lib_root = tmp_path / "reflib"
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(lib_root))
+    _write_library_clip(lib_root, "g1", "test_getup_clip")
+    refs_library.write_provenance(
+        "g1", "test_getup_clip",
+        refs_library.make_provenance(
+            clip_id="test_getup_clip", robot="g1",
+            text="a subject rises from lying to standing",
+            source={"dataset": "unit-test"}, license="internal",
+            attribution="unit-test fixture", content_sha256_="0" * 64,
+        ),
+        root=lib_root,
+    )
+
+    m = _make_mission(tmp_path, n_stages=1)
+    m.stages[0].needs_reference_rsi = True
+    m.stages[0].reference_clip_id = "test_getup_clip"
+
+    fake = _fake_sculpt_run_factory(metric=0.9)
+    monkeypatch.setattr(sculpt_mod, "sculpt_run", fake)
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
+    )
+
+    events: list[dict] = []
+    sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab", kg_store=None, on_event=events.append,
+    )
+    sig_path = Path(m.mission_dir) / "stages" / "stage_0" / "reference_signature.json"
+    payload = json.loads(sig_path.read_text())
+    assert payload["text"] == "a subject rises from lying to standing"
+
+
+def test_reference_signature_failure_is_non_fatal(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """A reference_clip_id that fails to load, on a stage that does NOT
+    need RSI (so nothing else fails the stage either), must degrade to
+    a logged event — never fail the stage. Mirrors item 6's "non-fatal
+    (log only)" contract."""
+    from sculptor import sculpt as sculpt_mod
+
+    lib_root = tmp_path / "reflib_empty"
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(lib_root))
+
+    m = _make_mission(tmp_path, n_stages=1)
+    m.stages[0].needs_reference_rsi = False
+    m.stages[0].reference_clip_id = "does_not_exist_clip"
+
+    fake = _fake_sculpt_run_factory(metric=0.9)
+    monkeypatch.setattr(sculpt_mod, "sculpt_run", fake)
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
+    )
+
+    events: list[dict] = []
+    result = sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab", kg_store=None, on_event=events.append,
+    )
+    assert result.completed is True
+    failed = [e for e in events if e["type"] == "stage_reference_signature_failed"]
+    assert len(failed) == 1
+    sig_path = Path(m.mission_dir) / "stages" / "stage_0" / "reference_signature.json"
+    assert not sig_path.is_file()
+
+
+# ── §start_pose: settle-then-rederive wiring (item 5) ─────────────────
+def test_settle_reset_env_var_escape_hatch_skips_settling(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    from sculptor import sculpt as sculpt_mod
+
+    monkeypatch.setenv("RS_SETTLE_RESET", "0")
+    lib_root = tmp_path / "reflib"
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(lib_root))
+    _write_library_clip_with_g1_joints(lib_root, "g1", "test_getup_clip")
+
+    called = {"n": 0}
+    import sculptor.reference as reference_mod
+    real_settle = reference_mod.settle_reset
+
+    def spy(*a, **kw):
+        called["n"] += 1
+        return real_settle(*a, **kw)
+
+    monkeypatch.setattr(reference_mod, "settle_reset", spy)
+
+    m = _make_mission(tmp_path, n_stages=1)
+    m.stages[0].needs_reference_rsi = True
+    m.stages[0].reference_clip_id = "test_getup_clip"
+
+    fake = _fake_sculpt_run_factory(metric=0.9)
+    monkeypatch.setattr(sculpt_mod, "sculpt_run", fake)
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
+    )
+
+    events: list[dict] = []
+    result = sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab", kg_store=None, on_event=events.append,
+    )
+    assert result.completed is True
+    assert called["n"] == 0, "RS_SETTLE_RESET=0 must skip settle_reset entirely"
+
+    applied = [e for e in events if e["type"] == "stage_reference_rsi_applied"]
+    assert applied[0]["settle"] == {"attempted": False, "reason": "RS_SETTLE_RESET=0"}
+    written = [e for e in events if e["type"] == "stage_eval_reset_written"]
+    assert written[0]["settle"] == {"attempted": False, "reason": "RS_SETTLE_RESET=0"}
+
+
+def test_settle_reset_success_recenters_ranges_and_writes_settled_eval_reset(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """§D20a: EVAL reset scalars get settled EXACTLY; TRAIN ranges are
+    re-centered on the settled values keeping their original widths."""
+    from sculptor import sculpt as sculpt_mod
+
+    lib_root = tmp_path / "reflib"
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(lib_root))
+    _write_library_clip_with_g1_joints(lib_root, "g1", "test_getup_clip")
+
+    m = _make_mission(tmp_path, n_stages=1)
+    m.stages[0].needs_reference_rsi = True
+    m.stages[0].reference_clip_id = "test_getup_clip"
+
+    fake = _fake_sculpt_run_factory(metric=0.9)
+    monkeypatch.setattr(sculpt_mod, "sculpt_run", fake)
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
+    )
+
+    events: list[dict] = []
+    result = sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab", kg_store=None, on_event=events.append,
+    )
+    assert result.completed is True
+
+    applied = [e for e in events if e["type"] == "stage_reference_rsi_applied"]
+    assert applied[0]["settle"]["attempted"] is True
+    assert applied[0]["settle"]["succeeded"] is True
+    assert "delta_z_m" in applied[0]["settle"]
+
+    written = [e for e in events if e["type"] == "stage_eval_reset_written"]
+    assert written[0]["settle"]["succeeded"] is True
+    disk_payload = json.loads(
+        (Path(m.mission_dir) / "stages" / "stage_0" / "env" / "eval_reset.json")
+        .read_text())
+    assert disk_payload == written[0]["eval_reset"]
+
+    env_dir = Path(m.mission_dir) / "stages" / "stage_0" / "env"
+    spec = json.loads(sorted(env_dir.glob("v*.json"))[0].read_text())
+    lo, hi = spec["train"]["reset_height_offset_m"]
+    settled_center = disk_payload["reset_height_offset_m"]
+    assert (lo + hi) / 2.0 == pytest.approx(settled_center, abs=1e-3)
+    assert "settled" in spec["meta"]["rationale"]
+
+
+def test_settle_reset_failure_is_non_fatal_falls_back_to_unsettled(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    from sculptor import sculpt as sculpt_mod
+    import sculptor.reference as reference_mod
+    from sculptor.reference import SettleUnavailable
+
+    lib_root = tmp_path / "reflib"
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(lib_root))
+    _write_library_clip(lib_root, "g1", "test_getup_clip")  # no quat/joints
+
+    def fake_settle(*a, **kw):
+        raise SettleUnavailable("simulated settle failure")
+
+    monkeypatch.setattr(reference_mod, "settle_reset", fake_settle)
+
+    m = _make_mission(tmp_path, n_stages=1)
+    m.stages[0].needs_reference_rsi = True
+    m.stages[0].reference_clip_id = "test_getup_clip"
+
+    fake = _fake_sculpt_run_factory(metric=0.9)
+    monkeypatch.setattr(sculpt_mod, "sculpt_run", fake)
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
+    )
+
+    events: list[dict] = []
+    result = sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab", kg_store=None, on_event=events.append,
+    )
+    assert result.completed is True, "settle failure must never fail the stage"
+
+    applied = [e for e in events if e["type"] == "stage_reference_rsi_applied"]
+    assert applied[0]["settle"]["attempted"] is True
+    assert applied[0]["settle"]["succeeded"] is False
+    assert "simulated settle failure" in applied[0]["settle"]["error"]
+
+    written = [e for e in events if e["type"] == "stage_eval_reset_written"]
+    assert written[0]["settle"]["succeeded"] is False
+    # Eval reset written from the UNSETTLED derivation (not a settled one).
+    from sculptor.reference import derive_eval_reset, load_clip
+    from sculptor.refs import library as refs_library
+
+    clip = load_clip(refs_library.clip_dir("g1", "test_getup_clip") / refs_library.CLIP_FILENAME)
+    expected_unsettled = derive_eval_reset(clip)
+    assert written[0]["eval_reset"] == expected_unsettled
+
+
+# ── §start_pose item 4: RSI/eval-reset failure is FATAL only for a
+#    non-standing start_pose ────────────────────────────────────────────
+def test_non_standing_start_pose_rsi_apply_failure_fails_stage(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    from sculptor import sculpt as sculpt_mod
+    import sculptor.reference as reference_mod
+
+    lib_root = tmp_path / "reflib"
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(lib_root))
+    _write_library_clip(lib_root, "g1", "test_getup_clip")
+
+    def fake_apply(*a, **kw):
+        raise RuntimeError("simulated apply_reference_rsi failure")
+
+    monkeypatch.setattr(reference_mod, "apply_reference_rsi", fake_apply)
+
+    m = _make_mission(tmp_path, n_stages=1)
+    m.stages[0].needs_reference_rsi = True
+    m.stages[0].reference_clip_id = "test_getup_clip"
+    m.stages[0].start_pose = "supine"  # non-standing -> failure is FATAL
+    m.stages[0].redecomposition_attempts = 1  # halt, don't redecompose
+
+    fake = _fake_sculpt_run_factory(metric=0.9)
+    monkeypatch.setattr(sculpt_mod, "sculpt_run", fake)
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
+    )
+
+    events: list[dict] = []
+    result = sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab", kg_store=None, on_event=events.append,
+    )
+    assert result.completed is False
+    assert result.halted_reason == "reference_scaffold_failed"
+    failed = [e for e in events if e["type"] == "stage_failed"]
+    assert len(failed) == 1
+    assert "simulated apply_reference_rsi failure" in failed[0]["detail"]
+
+
+def test_standing_start_pose_rsi_apply_failure_stays_non_fatal(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """Pre-existing behavior preserved: a standing/None start_pose
+    stage's RSI application failure degrades to a logged event, the
+    stage still trains and the mission still completes."""
+    from sculptor import sculpt as sculpt_mod
+    import sculptor.reference as reference_mod
+
+    lib_root = tmp_path / "reflib"
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(lib_root))
+    _write_library_clip(lib_root, "g1", "test_getup_clip")
+
+    def fake_apply(*a, **kw):
+        raise RuntimeError("simulated apply_reference_rsi failure")
+
+    monkeypatch.setattr(reference_mod, "apply_reference_rsi", fake_apply)
+
+    m = _make_mission(tmp_path, n_stages=1)
+    m.stages[0].needs_reference_rsi = True
+    m.stages[0].reference_clip_id = "test_getup_clip"
+    assert m.stages[0].start_pose is None
+
+    fake = _fake_sculpt_run_factory(metric=0.9)
+    monkeypatch.setattr(sculpt_mod, "sculpt_run", fake)
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
+    )
+
+    events: list[dict] = []
+    result = sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab", kg_store=None, on_event=events.append,
+    )
+    assert result.completed is True
+    failed_rsi = [e for e in events if e["type"] == "stage_reference_rsi_failed"]
+    assert len(failed_rsi) == 1
+    assert not [e for e in events if e["type"] == "stage_failed"]
+
+
 def test_stage_reference_rsi_roundtrips_mission_json(tmp_path: Path):
     """needs_reference_rsi survives save→load (backward-compatible field)."""
     from sculptor.mission import load_mission, save_mission
@@ -3637,6 +4135,144 @@ def test_redecompose_rsi_flag_per_substage_not_force_inherited(
     )
     # The LLM can still set True on the airborne sub-stage.
     assert sub_stages[1].needs_reference_rsi is True
+
+
+# ── §start_pose: redecompose per-sub-stage (not force-inherited) ──────────
+def test_redecompose_start_pose_per_substage_not_force_inherited(
+    tmp_path: Path, monkeypatch,
+):
+    """§start_pose item 2: sub-stages of a redecomposed get-up stage
+    progress through DIFFERENT start poses as the softened curriculum
+    works its way up — the model chooses PER sub-stage from its own
+    goal_text, not a blanket copy of the failed parent's start_pose."""
+    from sculptor import decompose as dc
+    from sculptor.decompose import (
+        StageTrainingFeedback,
+        _RedecompositionModel,
+        _StageModel,
+    )
+
+    m = _make_mission(tmp_path, n_stages=1)
+    failed = m.stages[0]
+    failed.start_pose = "crouched"
+    failed.needs_reference_rsi = True
+    failed.success_criterion = "metric > 0.5"
+
+    response = _RedecompositionModel(
+        decomposition_rationale="split crouch-to-stand into a lower start + the original crouch start",
+        stages=[
+            _StageModel(
+                name=f"{failed.name}__r1_0",
+                goal_text="from lying on your back, rise to a crouch",
+                success_criterion="metric > 0.0",
+                max_iterations=2,
+                parent_stage=None,
+                reward_seed_prompt="lower, more forgiving starting point",
+                kg_seed_papers=[],
+                needs_reference_rsi=True,
+                start_pose="supine",
+            ),
+            _StageModel(
+                name=f"{failed.name}__r1_1",
+                goal_text="from a crouch, rise to standing",
+                success_criterion="metric > 0.5",  # byte-equal to parent
+                max_iterations=3,
+                parent_stage=f"{failed.name}__r1_0",
+                reward_seed_prompt="matches the original failed stage's start",
+                kg_seed_papers=[],
+                needs_reference_rsi=True,
+                start_pose="crouched",
+            ),
+        ],
+    )
+
+    def fake_parse(client, system_prompt, user_content, *,
+                   output_format=None, model=None, max_tokens=None):
+        return response
+
+    monkeypatch.setattr(dc, "_parse_with_retry", fake_parse)
+
+    feedback = StageTrainingFeedback(
+        final_reward_source="def compute_reward(s,a,n,i): return 0.0, {}\n",
+        last_iter_diagnosis={},
+        last_iter_namespace={"behavior": {}, "components": {}, "metric": 0.3},
+        metric_history=[0.3],
+        last_3_iter_components=[{}],
+        failure_reason="criterion_not_met",
+    )
+
+    sub_stages = dc.redecompose_stage(
+        m, 0, feedback=feedback, reward_contract=_FakeContract(),
+        kg_store=None, client=object(),
+    )
+
+    assert len(sub_stages) == 2
+    assert sub_stages[0].start_pose == "supine"
+    assert sub_stages[1].start_pose == "crouched"
+    # Neither sub-stage's start_pose is a blanket copy of the failed
+    # parent's ("crouched") — sub_stages[0] genuinely differs.
+    assert sub_stages[0].start_pose != failed.start_pose
+
+
+def test_redecompose_start_pose_absent_defaults_none(tmp_path: Path, monkeypatch):
+    """A redecompose LLM response that omits start_pose on a sub-stage
+    yields None (same "unspecified, not standing" semantics as
+    decompose_task) rather than crashing or silently inheriting."""
+    from sculptor import decompose as dc
+    from sculptor.decompose import (
+        StageTrainingFeedback,
+        _RedecompositionModel,
+        _StageModel,
+    )
+
+    m = _make_mission(tmp_path, n_stages=1)
+    failed = m.stages[0]
+    failed.success_criterion = "metric > 0.5"
+
+    response = _RedecompositionModel(
+        decomposition_rationale="simplify",
+        stages=[
+            _StageModel(
+                name=f"{failed.name}__r1_0",
+                goal_text="grounded precursor",
+                success_criterion="metric > 0.0",
+                max_iterations=2,
+                parent_stage=None,
+                reward_seed_prompt="simplified reward",
+                kg_seed_papers=[],
+            ),
+            _StageModel(
+                name=f"{failed.name}__r1_1",
+                goal_text="the original goal, simplified reward",
+                success_criterion="metric > 0.5",  # byte-equal to parent
+                max_iterations=3,
+                parent_stage=f"{failed.name}__r1_0",
+                reward_seed_prompt="matches the original failed stage",
+                kg_seed_papers=[],
+            ),
+        ],
+    )
+
+    def fake_parse(client, system_prompt, user_content, *,
+                   output_format=None, model=None, max_tokens=None):
+        return response
+
+    monkeypatch.setattr(dc, "_parse_with_retry", fake_parse)
+
+    feedback = StageTrainingFeedback(
+        final_reward_source="def compute_reward(s,a,n,i): return 0.0, {}\n",
+        last_iter_diagnosis={},
+        last_iter_namespace={"behavior": {}, "components": {}, "metric": 0.3},
+        metric_history=[0.3],
+        last_3_iter_components=[{}],
+        failure_reason="criterion_not_met",
+    )
+
+    sub_stages = dc.redecompose_stage(
+        m, 0, feedback=feedback, reward_contract=_FakeContract(),
+        kg_store=None, client=object(),
+    )
+    assert sub_stages[0].start_pose is None
 
 
 # ── §D21 Fix 1: redecompose inherits the reference binding ─────────────────

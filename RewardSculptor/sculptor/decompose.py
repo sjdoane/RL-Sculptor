@@ -147,7 +147,38 @@ class _StageModel(BaseModel):
             "untrainable. Starts a fraction of training episodes in those "
             "states via a validated reference curriculum. False for "
             "grounded skills that start from the default standing pose "
-            "(standing, walking, crouching)."
+            "(standing, walking, crouching). MUST be true whenever "
+            "`start_pose` below is anything other than 'standing' — "
+            "validation forces it true even if you leave it false, so set "
+            "it explicitly for consistency."
+        ),
+    )
+
+    # §start_pose: the physical configuration the robot is in at THIS
+    # stage's episode start. Locked-vocabulary companion to
+    # `needs_reference_rsi` — see that field's updated description.
+    start_pose: Optional[str] = Field(
+        default=None,
+        description=(
+            "The physical configuration the robot is in at THIS stage's "
+            "episode start. One of 'supine' (lying on back, face up), "
+            "'prone' (lying on front, face down), 'sitting', 'crouched', "
+            "'standing', or null (defaults to standing behavior at "
+            "validation, but prefer 'standing' explicitly when you know "
+            "it). Derive this from the MISSION GOAL and THIS STAGE's "
+            "semantics — phrases like 'starting prone', 'from a seated "
+            "position', 'get up off the ground', 'lying on your back' "
+            "must flow into the matching stage's start_pose. Standing "
+            "unless the mission or stage goal says otherwise. A "
+            "MULTI-STAGE get-up curriculum's sub-goals often have "
+            "DIFFERENT start poses as the motion progresses stage to "
+            "stage (e.g. stage 1 supine -> stage 2 crouched -> stage 3 "
+            "standing) — set EACH stage's start_pose to what THAT "
+            "stage's episode actually begins from, not the mission's "
+            "overall starting pose. Any value other than 'standing' "
+            "means this stage is untrainable from the env's default "
+            "reset and REQUIRES needs_reference_rsi=true (see that "
+            "field)."
         ),
     )
 
@@ -165,6 +196,14 @@ class _StageModel(BaseModel):
         if v is None:
             return None
         s = str(v).strip()
+        return s or None
+
+    @field_validator("start_pose", mode="before")
+    @classmethod
+    def _normalize_start_pose(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        s = str(v).strip().lower()
         return s or None
 
 
@@ -671,6 +710,7 @@ def _stages_from_model(stages_in: list[_StageModel]) -> list[Stage]:
             init_skill_id=s.init_skill_id,
             steering_metric=s.steering_metric,
             needs_reference_rsi=bool(s.needs_reference_rsi),
+            start_pose=s.start_pose,
         )
         for s in stages_in
     ]
@@ -1202,6 +1242,16 @@ def redecompose_stage(
                 True if force_reference_rsi else bool(
                     getattr(model_stage, "needs_reference_rsi", False))
             ),
+            # §start_pose: PER-SUB-STAGE, model-chosen — unlike the
+            # reference-clip fields below, start_pose is NOT force-
+            # inherited from the failed parent. Sub-stages of a
+            # redecomposed get-up stage typically progress through
+            # DIFFERENT physical configurations (e.g. r1_0 supine ->
+            # r1_2 crouched), so the model picks each one; the D21
+            # force-rule above (and `validate_mission`'s force-rule on
+            # start_pose != "standing") still applies per sub-stage
+            # regardless of what the model set here.
+            start_pose=getattr(model_stage, "start_pose", None),
             # §D21 Fix 1: unconditional inheritance — sub-stages are
             # phases of the SAME motion the failed stage was attempting,
             # and stage-metric generation reads this same clip.

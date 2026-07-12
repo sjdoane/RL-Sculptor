@@ -44,7 +44,8 @@ and stages warm-start from previous stages where possible.
       "reward_seed_prompt": "<NL reward spec for this stage, 3-2000 chars>",
       "kg_seed_papers":     ["<arxiv_id>", ...],
       "init_skill_id":      <null or a skill_id from the SKILL_LIBRARY slice>,
-      "needs_reference_rsi": <true for ballistic/airborne stages OR a non-standing start state — see rule 9>
+      "needs_reference_rsi": <true for ballistic/airborne stages OR a non-standing start state — see rule 9>,
+      "start_pose":         <"supine" | "prone" | "sitting" | "crouched" | "standing" | null — see rule 10>
     },
     ...
   ]
@@ -200,6 +201,39 @@ and stages warm-start from previous stages where possible.
    the paired termination the policy exploits sunk postures (both are
    applied together automatically).
 
+10. **`start_pose` — the physical configuration THIS stage's episode
+    begins from.** One of `"supine"` (lying on back, face up), `"prone"`
+    (lying on front, face down), `"sitting"`, `"crouched"`, `"standing"`,
+    or `null`. Derive it from the MISSION GOAL and THIS STAGE's own
+    `goal_text` — phrases like "starting prone", "from a seated
+    position", "get up off the ground", "lying on your back", "on all
+    fours" must flow into the matching stage's `start_pose`. Default to
+    `"standing"` unless the goal says otherwise; leave `null` only when
+    you genuinely can't tell (validation treats `null` as "no opinion",
+    not as standing).
+    - **A MULTI-STAGE get-up curriculum's stages usually have DIFFERENT
+      start poses as the motion progresses** — set EACH stage's
+      `start_pose` to what THAT stage's episode actually begins from,
+      not the mission's overall starting pose. Example: a "get up from
+      lying on your back and stand" mission might decompose into
+      `torso_righting` (`start_pose: "supine"`) -> `feet_under_crouch`
+      (`start_pose: "crouched"`, roughly midway up) ->
+      `drive_to_stand` (`start_pose: "crouched"`) ->
+      `stabilize_standing` (`start_pose: "standing"`).
+    - **Coherence with rule 9:** any `start_pose` other than `"standing"`
+      is, BY DEFINITION, a non-standing start — set
+      `needs_reference_rsi: true` on that stage too (validation forces
+      this even if you forget, but set it explicitly). Conversely,
+      `start_pose: "standing"` does NOT by itself mean
+      `needs_reference_rsi: false` — a stage can still need RSI for
+      airborne/ballistic reasons (rule 9's OTHER case) while starting
+      standing (e.g. a jump stage's episode begins standing but still
+      wants airborne-state RSI).
+    - Use the REFERENCE MOTION SIGNATURES block (when provided) to
+      judge a candidate stage's start shape from real data — a
+      signature whose `root_z.start` is well below standing height is
+      evidence for a lying/crouched `start_pose`, not `"standing"`.
+
 ## Stage-design guidance
 
   * **Never spend a stage on standing / staying upright.** The robot already
@@ -241,7 +275,9 @@ EVERY reward and keep the robot up while it learns each phase.
       "max_iterations": 3,
       "parent_stage": null,
       "reward_seed_prompt": "BASE STABILITY TERMS (carry these into every stage): alive_bonus (+0.1 while upright), upright (exp(-||base_ang_vel_b||^2)*0.3), action_rate_penalty (-0.03*||action-prev_action||^2); zero the whole reward when fallen. SKILL TERM crouch_target: exp(-((base_height - 0.45)**2)/0.02) * 0.6 (base height toward a 0.45 m target).",
-      "kg_seed_papers": ["2312.17507"]
+      "kg_seed_papers": ["2312.17507"],
+      "needs_reference_rsi": false,
+      "start_pose": "standing"
     },
     {
       "name": "spring_up",
@@ -250,7 +286,9 @@ EVERY reward and keep the robot up while it learns each phase.
       "max_iterations": 5,
       "parent_stage": "crouch_load",
       "reward_seed_prompt": "Keep the base stability terms + crouch_target. Add upward_impulse: reward positive root-link vertical velocity during the extension window, gated on having been crouched; cap it so it does not reward flailing.",
-      "kg_seed_papers": []
+      "kg_seed_papers": [],
+      "needs_reference_rsi": true,
+      "start_pose": "standing"
     },
     {
       "name": "jump_and_land",
@@ -259,7 +297,9 @@ EVERY reward and keep the robot up while it learns each phase.
       "max_iterations": 6,
       "parent_stage": "spring_up",
       "reward_seed_prompt": "Keep all prior terms. Add soft_landing: penalize large root vertical acceleration / impact after the apex, and reward returning to a stable upright pose after touchdown.",
-      "kg_seed_papers": []
+      "kg_seed_papers": [],
+      "needs_reference_rsi": true,
+      "start_pose": "standing"
     }
   ]
 }

@@ -414,6 +414,16 @@ function ReferenceRow({
 
   return (
     <div style={{ marginTop: 6, display: "flex", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
+      {stage.start_pose && (
+        <span
+          className="rs-badge slate"
+          style={{ fontSize: 9.5 }}
+          title="Physical configuration the robot is in at this stage's episode start"
+        >
+          <Icon name="user" size={10} />
+          start: {stage.start_pose}
+        </span>
+      )}
       {stage.reference_clip_id ? (
         <>
           <span
