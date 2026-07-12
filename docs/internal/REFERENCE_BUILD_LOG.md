@@ -273,15 +273,55 @@ MuJoCo, re-read (z, pitch, roll, joints) from the settled state, keep
 range widths/noise; eval_reset gets the settled scalars. Every derived
 reset becomes physically resting by construction.
 
-### Audit findings deferred (logged, not yet fixed)
-- Tier-D spoofing (LOW, latent): calibrate_metric_against_reference's
-  `tier` arg comes from caller/provenance (user-writable) — no production
-  caller yet; MUST be wired to require a verified track.py feasibility
-  certificate (tierD block + rollout hash) before §6 goes live in the
-  mission pipeline.
-- "fall down" retrieval quality (LOW): "fall" is concept-diluted inside
-  the 7-member get-up synonym group; rare modifier "down" wins. Optional
-  polish: own fall-group + regression test.
+### D22. Hardening sprint close-out (2026-07-11, commits ec38efc..c3e8e53)
+Both prior deferred findings CLOSED: Tier-D steer rights now require a
+verified track.py certificate (rollout+live-clip sha256 chain, containment
+check, tier resolved internally — spoofed provenance downgrades to
+K/observe; wired into stage-metric acceptance non-fatally); "fall" got its
+own synonym group (root cause: IDF dilution by common "up" in the shared
+group) + a 20-query golden acceptance suite (fixture + real-index layers).
+Also landed: D21 fixes (redecompose binding inheritance, fatal clip-load,
+mechanical start-state gate); first-class promptable start_pose with
+mid_start archetype, clip↔pose QC, settle-then-rederive (CPU MuJoCo,
+floor-injected, divergence-guarded); reference signatures threaded into
+diagnose+edit prompts; stageii fps recovery (+3303 clips, index 6014
+rows) + multi-robot preview/ingest symmetry (T1 MJCF via GMR checkout);
+match-density tie-break (recovered "lord of the dance pose" clips tied
+real dance clips and won on id sort). Fresh-context Opus audit over the
+batch: core math/logic verified clean; 7 findings, 6 fixed same-day
+(posture check closes the near-standing gate blind spot; gate fails
+CLOSED on unverifiable trajectories; scaffold enforces non-standing
+start_pose independent of the persisted RSI flag; clip text fenced+capped
+in LLM prompts; tierd_cert bypass kwarg removed; live-bytes staleness +
+rollout containment), 1 fixed by the density tie-break.
+
+### Deferred findings (logged, not yet fixed)
+- Steer ENFORCEMENT unification: reference-calibration trust is computed
+  and event-recorded in mission_metrics, but the live steer/observe gate
+  lives in backend run_manager.py on a different data model (gen:<id> +
+  calibrated bool) — wiring reference:<tier>:<source> labels into the
+  actual training steer decision is its own reviewed increment.
+- clip_id collisions at ingest (MEDIUM data-quality): slugify(stem)
+  ignores the directory; GRAB's 10 subject dirs share filenames → 3929
+  stageii files yielded 1220 unique ids, last-write-wins. Follow-up:
+  prefix subject/subset into clip_id (pre-existing design, not new).
+- UI robot asymmetries (5, from the ingest worker's recon): useReferences
+  defaults robot="g1" with no caller override; picker has no robot
+  selector (needs project→robot plumbing); attach endpoint doesn't
+  cross-check clip robot vs project robot; convert.py foot-contact
+  inference is G1-hardcoded (t1 degrades gracefully); g1_hands preview
+  reuses plain-G1 MJCF.
+- Stopword IDF (LOW): common words ("on","the") can carry high IDF and
+  swamp real matches ("lying on the ground" → running_on_the_spot).
+- Sit-content gap: zero sit/chair clips in the index; golden queries for
+  sit categories are fixture-only until such clips are ingested.
+- QC fps backstop is one-sided: the per-frame delta check catches an fps
+  assumed 2x too LOW but not 2x too HIGH (and it flags, not rejects) —
+  the per-subset-constant + dataset-author-code cross-check is the real
+  safeguard.
+- settle_reset convergence flag: max|qvel| criterion never reports
+  converged=True within the 0.75 s budget on the real stages (residual
+  limb oscillation); diagnostic-only, z stabilizes.
 
 ## Verified state after R1 + R2-a (2026-07-09)
 - Library: 301 g1 clips (LAFAN1 40 + segments; fleaven ACCAD slice), all
