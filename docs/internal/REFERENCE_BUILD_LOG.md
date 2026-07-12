@@ -547,6 +547,47 @@ pointers cleared in mission.json. Note: the whole-mission pass's
 "steering_metric already set" skip guard still grandfathers stale
 metrics — only the per-stage regen path re-evaluates; deferred below.
 
+### D28. Prone-mission triage: three pipeline bugs + the synthetic-exemplar tier (Sam's reference-as-guide design)
+Sam's prone get-up decompose left 3 of 4 stages metric-less; triage found
+three distinct causes, all fixed same-session (d26962f):
+1. **Bounds rounding, third occurrence of the class**: _phase_segments'
+   3-decimal boundary sat 0.4 ms past the true duration; crop_span clamped
+   but _span_qc's unclamped re-check rejected, AND the success dict's own
+   round() re-planted the out-of-bounds value into persistence. Clamped
+   ONCE post-snap; persisted spans in-bounds by construction.
+2. **Keyword-family blocked the reference defer**: 'drive up ... keep
+   balance' routed get-up goals to jump/cartpole families whose battery
+   scores every archetype 0.000; the D4 defer's 'family is None' term then
+   let the uninformative battery reject metrics that had passed ALL SIX
+   reference gates. Defer now fires whenever the battery is uninformative
+   and references are attached.
+3. **Author forbidden-name loop**: getattr rejected 5 retries straight —
+   HARD RULE 11 now states the AST allowlist's allowed surface in the
+   authoring prompt; UI Regenerate sends n_candidates=2.
+**F-SYNTH (bacd1b1)**: the synthetic-exemplar last-resort tier — when no
+clip matches (no binding, unresolved decline, load failure, or all
+candidates rejected), one exemplar_synth LLM call sketches the goal
+motion's keyframes GROUNDED on analogous clip signatures + robot
+constants; mechanical synthesis + QC (commitment bands, width cap,
+no-headroom, start-pose compat) produce a clip the UNCHANGED six-gate
+battery certifies against. Trust reference:S:synthetic at every layer,
+never steer-grade alone, never in the library, never RSI. UI: violet
+'synthetic exemplar' chip; RS_SYNTHETIC_EXEMPLAR=0 disables.
+**Live validation (all four prone stages now accepted)**: feet_under_crouch
+certified against the exact clip-end span the bounds bug killed (persisted
+t_end = the clamped duration); drive_to_stand landed with n=2 candidates;
+prone_getup_and_hold — whose goal (stand and hold) exceeds every attached
+clip (a10 max z 0.22) — fell through real-reference rejection to the
+SYNTHETIC tier, which sketched a physically sensible prone-to-stand-hold
+exemplar (z 0.12->0.74 by t=6 of 8s, g_z +0.24->-0.995, grounded_on a10,
+confidence 0.72) and certified with all six gates green: the first live
+proof of the reference-as-guide design. Also: while-agents-edit backend
+jobs die on uvicorn auto-reload (three regen jobs lost mid-run) — sequence
+job-driving AFTER code settles; ops note for future sessions.
+Follow-ups deferred: synthetic_signature.json into diagnose/edit context;
+real-LLM span/synth calls under sustained load; GRAB normalized heights
+(D27) still worth an ingest fix.
+
 ### Deferred findings (logged, not yet fixed)
 - D27 live findings (first user-driven decompose, g1-standing-up
   2026-07-12): (a) retrieval auto-attached a PRONE-start clip
