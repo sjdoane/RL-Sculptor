@@ -20,7 +20,7 @@ import json
 import re
 import time
 from pathlib import Path
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import numpy as np
 
@@ -33,6 +33,11 @@ from sculptor.eval.generated_metric import (
 )
 from sculptor.eval.spec_metrics import _SPEC_FNS
 from sculptor.llm import log_llm_call, model_for, response_text_blocks
+
+if TYPE_CHECKING:  # pragma: no cover — type-only, avoids a runtime
+    # sculptor.eval -> sculptor.refs import at module load (this module
+    # otherwise only imports sculptor.refs.* lazily, inside functions).
+    from sculptor.refs.track import TierDCertificate
 
 T, E, J = 120, 4, 12
 _NAMES_12 = [
@@ -257,10 +262,12 @@ def calibrate_metric_against_reference(
     clip_id: str,
     clip: dict,
     *,
-    tier: str,
+    robot: str,
     source_kind: str,
     threshold: float = 0.7,
     n_envs: int = 4,
+    tierd_cert: Optional["TierDCertificate"] = None,
+    library_root: Optional[Path] = None,
 ) -> dict[str, Any]:
     """§REFERENCE_TRAJECTORY_PLAN §6: earn steer/observe rights for a NOVEL
     motion by ranking a competence ladder built FROM a single reference
@@ -289,15 +296,55 @@ def calibrate_metric_against_reference(
     `_REF_SPREAD_MIN`, mirroring `_validate_references`'
     `reference_nondegeneracy` gate).
 
-    Rights (§10): `"steer"` iff `tier == "D"` and `ok`; `"observe"` iff
-    `tier == "K"` and `ok`; `"none"` otherwise.
+    §audit-finding close (REFERENCE_BUILD_LOG.md "Audit findings
+    deferred" — Tier-D spoofing): this function used to take a bare
+    `tier: str` straight from the caller, so anyone could pass `tier="D"`
+    and earn steer-rights for a clip that was never tracked. There is no
+    caller-supplied tier anymore. The EFFECTIVE tier is derived here:
+      - if `tierd_cert` is given, it is trusted ONLY when its
+        `(robot, clip_id)` match this call's — a cert for a different
+        clip is ignored, not silently accepted;
+      - else, `sculptor.refs.track.verify_tierd_certificate(robot,
+        clip_id, root=library_root)` is consulted (re-derives the
+        verdict from the on-disk provenance/rollout artifact chain);
+      - `effective_tier` is `"D"` iff a verified certificate resolves,
+        else `"K"`. There is no way to reach `"D"`/steer by passing a
+        string — only a real `TierDCertificate` (verified by
+        `verify_tierd_certificate`, never constructed by this module)
+        does it.
+    `trust_tier` (§10) is recorded as `f"reference:{effective_tier}:
+    {source_kind}"` — this is what a caller should persist/log, NOT a
+    self-reported string.
 
-    Never raises: a load failure or a rung that can't be built/scored is
-    recorded as a failed gate, not an exception."""
+    Rights (§10): `"steer"` iff `effective_tier == "D"` and `ok`;
+    `"observe"` iff `effective_tier == "K"` and `ok`; `"none"` otherwise.
+    Tier-K-only calibration always grants at most observe; Tier-D
+    (verified) is required for steer.
+
+    Never raises: a load failure, a cert-resolution failure, or a rung
+    that can't be built/scored is recorded as a failed/downgraded gate,
+    not an exception."""
     from sculptor.eval.metric_validate import _archetypes, _NAMES_12
     from sculptor.refs.convert import clip_to_arrays
 
-    trust_tier = f"reference:{tier}:{source_kind}"
+    cert = tierd_cert
+    if cert is not None and (cert.robot != robot or cert.clip_id != clip_id):
+        # A certificate for a DIFFERENT clip/robot proves nothing here —
+        # ignore it rather than trust it, and fall through to resolving
+        # our own (never silently widen what a mismatched cert can vouch for).
+        cert = None
+    cert_reason: Optional[str] = None
+    if cert is None:
+        try:
+            from sculptor.refs.track import verify_tierd_certificate
+            cert, cert_reason = verify_tierd_certificate(
+                robot, clip_id, root=library_root)
+        except Exception as e:  # noqa: BLE001 — cert resolution never blocks; denies to K
+            cert = None
+            cert_reason = f"cert resolution failed: {type(e).__name__}: {e}"
+
+    effective_tier = "D" if cert is not None else "K"
+    trust_tier = f"reference:{effective_tier}:{source_kind}"
 
     def _record(ok: bool, rho: float, *, ladder=None, reason=None,
                 error=None) -> dict[str, Any]:
@@ -307,11 +354,14 @@ def calibrate_metric_against_reference(
             "rho_min": round(float(rho), 4),
             "agreement_fraction": 1.0 if ok else 0.0,
             "threshold": threshold,
-            "clip_id": clip_id, "tier": tier, "source_kind": source_kind,
+            "clip_id": clip_id, "robot": robot, "tier": effective_tier,
+            "source_kind": source_kind,
             "trust_tier": trust_tier,
+            "cert_verified": cert is not None,
+            "cert_reason": cert_reason,
             "ladder": ladder or [],
-            "rights": ("steer" if (ok and tier == "D")
-                       else "observe" if (ok and tier == "K")
+            "rights": ("steer" if (ok and effective_tier == "D")
+                       else "observe" if (ok and effective_tier == "K")
                        else "none"),
             "reason": reason, "error": error,
         }

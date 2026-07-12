@@ -546,7 +546,21 @@ def update_provenance_tier_d(
     tier stays whatever it was (K), `tierD.feasible=False` recorded.
     Rebuilds the library index for this clip afterward. Uses only the
     EXISTING `library.read_provenance`/`write_provenance` seam — no new
-    library helper needed."""
+    library helper needed.
+
+    §audit-finding close (REFERENCE_BUILD_LOG.md "Audit findings
+    deferred" — Tier-D spoofing): the `tierD` block also records
+    `clip_content_sha256` (a copy of THIS provenance's `content_sha256`
+    at tracking time) and, when feasible, `rollout_sha256` (sha256 of the
+    copied rollout artifact's bytes). Together these let
+    `verify_tierd_certificate` bind a later "tier D" claim to a
+    consistent on-disk artifact chain instead of trusting the `tier`
+    field or `tierD.errors.feasible` bool in isolation. Hashing the
+    rollout is best-effort (`OSError` -> `rollout_sha256` omitted, never
+    raised) so a caller that passes a `rollout_path` which doesn't
+    actually exist on disk (e.g. an offline unit test) still gets a
+    recorded verdict — `verify_tierd_certificate` treats a missing hash
+    as an unverifiable (not fatally-erroring) certificate."""
     from sculptor.refs import library
 
     prov = library.read_provenance(robot, clip_id, root=root)
@@ -554,11 +568,17 @@ def update_provenance_tier_d(
         "tracked_at": library._utc_now_iso(),
         "iterations": iterations,
         "errors": errors.to_dict(),
+        "clip_content_sha256": prov.get("content_sha256"),
     }
     if errors.feasible:
         prov["tier"] = "D"
         if rollout_path is not None:
             tier_d_block["rollout_path"] = str(rollout_path)
+            try:
+                tier_d_block["rollout_sha256"] = library.content_sha256(
+                    Path(rollout_path).read_bytes())
+            except OSError:
+                pass  # artifact unreadable — verify_tierd_certificate will deny cleanly
     else:
         tier_d_block["feasible"] = False
     prov["tierD"] = tier_d_block
@@ -705,3 +725,164 @@ def track_clip(
         root=library_root)
 
     return TrackResult(plan=plan, errors=errors, provenance=prov, dry_run=False)
+
+
+# ── §REFERENCE_TRAJECTORY_PLAN §6/§10 audit-finding close: verified certs ──
+#
+# REFERENCE_BUILD_LOG.md "Audit findings deferred": `calibrate_metric_
+# against_reference`'s `tier` argument used to come straight from the
+# caller (user-writable) — nothing stopped a caller from claiming
+# `tier="D"` for a clip that was never tracked. `verify_tierd_certificate`
+# is the single choke point that re-derives "is this REALLY Tier D" from
+# disk, so a caller can never manufacture steer-rights by passing a
+# string.
+@dataclass(frozen=True)
+class TierDCertificate:
+    """The verified facts backing a Tier-D claim for one library clip —
+    returned ONLY by `verify_tierd_certificate` after every check in its
+    docstring passes. Downstream code (`calibrate_metric_against_
+    reference`) may treat the mere EXISTENCE of one of these as "this
+    clip is genuinely Tier D"; it must never construct one itself.
+
+    Residual trust assumption (state this honestly, do not oversell it):
+    this binds the D-claim to a CONSISTENT on-disk artifact chain
+    (provenance.tierD block + a rollout file whose bytes hash to the
+    recorded value + a clip content hash that hasn't drifted since
+    tracking) — it does NOT cryptographically prevent a determined local
+    attacker who can edit provenance.json AND replace the rollout file
+    AND recompute matching hashes by hand. That is an ACCEPTABLE gap: the
+    threat model here is accidental/stale/hand-edited provenance (e.g. a
+    clip re-ingested after certification without re-tracking, or a
+    hopeful caller typing `tier="D"`), not an adversary with local disk
+    write access and the will to forge a hash chain."""
+
+    robot: str
+    clip_id: str
+    tracked_at: str
+    iterations: int
+    mean_joint_err_rad: float
+    max_joint_err_rad: float
+    root_z_rmse_m: float
+    rollout_path: Path
+    rollout_sha256: str
+    clip_content_sha256: str
+
+
+def verify_tierd_certificate(
+    robot: str,
+    clip_id: str,
+    *,
+    root: Optional[Path] = None,
+) -> tuple[Optional[TierDCertificate], Optional[str]]:
+    """Re-derive, from disk, whether `robot/clip_id` genuinely earned
+    Tier D — never trust a caller-supplied tier string or an in-memory
+    claim. Returns `(certificate, None)` when EVERY check below passes,
+    else `(None, reason)` with a short human-readable reason (never
+    raises — a missing/corrupt/tampered clip is a normal "not
+    certified" verdict, exactly like `track_clip`'s own philosophy that
+    an infeasible tracking run is a verdict, not an error).
+
+    Checks (ALL required):
+      1. `provenance.json` has a `tierD` block with numeric
+         `errors.mean_joint_err_rad` / `errors.root_z_rmse_m`.
+      2. Those RAW recorded stats are within track.py's OWN feasibility
+         thresholds (`MEAN_JOINT_ERR_THRESHOLD_RAD`, `ROOT_Z_RMSE_
+         THRESHOLD_M`) — recomputed here, never trusting a stored
+         `feasible` bool or the top-level `tier` field in isolation (an
+         edited/hand-set `tier="D"` with stale or absent stats fails
+         this check).
+      3. `provenance.tier == "D"`.
+      4. `tierD.rollout_path` is set AND the file exists on disk AND its
+         SHA-256 matches `tierD.rollout_sha256` — the tracking-rollout
+         artifact is what it claims to be.
+      5. `tierD.clip_content_sha256` (recorded at tracking time) matches
+         the clip's CURRENT `provenance.content_sha256` — the clip was
+         not re-ingested/edited after certification without re-tracking.
+
+    See `TierDCertificate`'s docstring for the residual trust assumption
+    this does and does not cover."""
+    from sculptor.refs import library
+
+    prefix = f"{robot}/{clip_id}"
+    try:
+        prov = library.read_provenance(robot, clip_id, root=root)
+    except (OSError, ValueError, json.JSONDecodeError) as e:
+        return None, f"{prefix}: cannot read provenance: {type(e).__name__}: {e}"
+
+    tier_d = prov.get("tierD")
+    if not isinstance(tier_d, dict):
+        return None, f"{prefix}: provenance has no tierD block (never tracked)"
+
+    errors_block = tier_d.get("errors")
+    if not isinstance(errors_block, dict):
+        return None, f"{prefix}: tierD block has no errors stats"
+    try:
+        mean_joint_err = float(errors_block["mean_joint_err_rad"])
+        max_joint_err = float(errors_block.get("max_joint_err_rad", mean_joint_err))
+        root_z_rmse = float(errors_block["root_z_rmse_m"])
+    except (KeyError, TypeError, ValueError) as e:
+        return None, f"{prefix}: tierD.errors missing/invalid numeric stats: {e}"
+
+    # Check 2: recompute feasibility from the RAW stats — never trust a
+    # stored `feasible` bool, which could be hand-edited independent of
+    # the underlying numbers ("edited tier" tamper).
+    if not (mean_joint_err < MEAN_JOINT_ERR_THRESHOLD_RAD
+            and root_z_rmse < ROOT_Z_RMSE_THRESHOLD_M):
+        return None, (
+            f"{prefix}: recorded tracking error is out of tolerance "
+            f"(mean_joint_err_rad={mean_joint_err} >= "
+            f"{MEAN_JOINT_ERR_THRESHOLD_RAD}? "
+            f"{mean_joint_err >= MEAN_JOINT_ERR_THRESHOLD_RAD}; "
+            f"root_z_rmse_m={root_z_rmse} >= {ROOT_Z_RMSE_THRESHOLD_M}? "
+            f"{root_z_rmse >= ROOT_Z_RMSE_THRESHOLD_M}) — not a valid "
+            "Tier-D certificate")
+
+    if prov.get("tier") != "D":
+        return None, f"{prefix}: provenance.tier is {prov.get('tier')!r}, not 'D'"
+
+    rollout_path_str = tier_d.get("rollout_path")
+    if not rollout_path_str:
+        return None, f"{prefix}: tierD block has no rollout_path recorded"
+    rollout_path = Path(rollout_path_str)
+    if not rollout_path.is_file():
+        return None, (
+            f"{prefix}: tracking-rollout artifact missing on disk: "
+            f"{rollout_path}")
+
+    recorded_rollout_sha = tier_d.get("rollout_sha256")
+    if not recorded_rollout_sha:
+        return None, f"{prefix}: tierD block has no rollout_sha256 recorded"
+    try:
+        actual_rollout_sha = library.content_sha256(rollout_path.read_bytes())
+    except OSError as e:
+        return None, f"{prefix}: cannot read rollout artifact: {e}"
+    if actual_rollout_sha != recorded_rollout_sha:
+        return None, (
+            f"{prefix}: rollout artifact sha256 mismatch (recorded "
+            f"{recorded_rollout_sha[:12]}…, actual {actual_rollout_sha[:12]}…)")
+
+    recorded_clip_sha = tier_d.get("clip_content_sha256")
+    current_clip_sha = prov.get("content_sha256")
+    if not recorded_clip_sha or not current_clip_sha:
+        return None, f"{prefix}: missing clip content hash for staleness check"
+    if recorded_clip_sha != current_clip_sha:
+        return None, (
+            f"{prefix}: clip content hash drift — provenance.content_sha256 "
+            f"({current_clip_sha[:12]}…) does not match the hash recorded "
+            f"at tracking time ({recorded_clip_sha[:12]}…); the clip was "
+            "likely re-ingested/edited after certification without "
+            "re-tracking")
+
+    cert = TierDCertificate(
+        robot=robot,
+        clip_id=clip_id,
+        tracked_at=str(tier_d.get("tracked_at", "")),
+        iterations=int(tier_d.get("iterations", 0) or 0),
+        mean_joint_err_rad=mean_joint_err,
+        max_joint_err_rad=max_joint_err,
+        root_z_rmse_m=root_z_rmse,
+        rollout_path=rollout_path,
+        rollout_sha256=actual_rollout_sha,
+        clip_content_sha256=current_clip_sha,
+    )
+    return cert, None

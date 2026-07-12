@@ -235,7 +235,10 @@ def test_generate_stage_metrics_loads_and_passes_reference(
     tmp_path, monkeypatch,
 ):
     """A stage with `reference_clip_id` set gets the clip loaded from the
-    library and threaded through `generate_objective_metric(references=...)`."""
+    library and threaded through `generate_objective_metric(references=...)`.
+    Reference-CALIBRATION wiring is a separate concern (see the dedicated
+    tests below) — stubbed out here so this test stays about reference
+    loading/threading only."""
     root = _write_fixture_clip(tmp_path, "g1", "getup_demo_clip")
     monkeypatch.setenv("RS_REFERENCE_ROOT", str(root))
 
@@ -247,6 +250,10 @@ def test_generate_stage_metrics_loads_and_passes_reference(
 
     import sculptor.eval as ev
     monkeypatch.setattr(ev, "generate_objective_metric", fake_gen)
+
+    import sculptor.eval.metric_calibration as mc
+    monkeypatch.setattr(
+        mc, "calibrate_metric_against_reference", lambda *a, **kw: None)
 
     s1 = _mk_stage("get_up", reference_clip_id="getup_demo_clip")
     m = _mk_mission(tmp_path, [s1])
@@ -308,3 +315,171 @@ def test_generate_stage_metrics_reference_load_error_proceeds_without(
     assert len(report["generated"]) == 1
     assert "reference_load_error" in report["generated"][0]
     assert report["generated"][0]["reference_load_error"]
+
+
+# ── §REFERENCE_TRAJECTORY_PLAN §6 audit-finding close: calibration wiring ──
+#
+# `generate_stage_metrics` invokes `calibrate_metric_against_reference`
+# right after an accepted stage metric's reference gets loaded — but ONLY
+# for stages that actually have one. `calibrate_metric_against_reference`
+# itself resolves the effective tier (never a caller-supplied string, see
+# tests/test_reference_calibration.py); these tests check the PIPELINE
+# seam: is it called with the right args, is it skipped when there's no
+# reference, and does it crashing leave metric acceptance untouched.
+def test_stage_with_reference_triggers_calibration_with_resolved_tier(
+    tmp_path, monkeypatch,
+):
+    """A stage with a reference gets calibration invoked with the SAME
+    (metric_path, clip_id, clip, robot) the reference-loading seam
+    resolved — and the resolved tier/rights it returns land in both the
+    report entry and an emitted event."""
+    root = _write_fixture_clip(tmp_path, "g1", "getup_demo_clip")
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(root))
+
+    def fake_gen(goal, out_dir, **kw):
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "metric.py").write_text("def compute_spec(a, b, c): return {}")
+        return {"accepted": True}
+
+    import sculptor.eval as ev
+    monkeypatch.setattr(ev, "generate_objective_metric", fake_gen)
+
+    cal_calls: list[dict] = []
+
+    def fake_calibrate(module_path_or_source, clip_id, clip, **kw):
+        cal_calls.append({"module_path_or_source": module_path_or_source,
+                           "clip_id": clip_id, "clip": clip, **kw})
+        return {"ok": True, "trust_tier": "reference:D:procedural",
+                "rights": "steer", "cert_verified": True, "cert_reason": None}
+
+    import sculptor.eval.metric_calibration as mc
+    monkeypatch.setattr(mc, "calibrate_metric_against_reference", fake_calibrate)
+
+    events: list[dict] = []
+    s1 = _mk_stage("get_up", reference_clip_id="getup_demo_clip")
+    m = _mk_mission(tmp_path, [s1])
+    report = generate_stage_metrics(
+        m, robot_hint="Mjlab-Velocity-Flat-Unitree-G1",
+        on_event=events.append)
+
+    assert len(cal_calls) == 1
+    call = cal_calls[0]
+    assert call["clip_id"] == "getup_demo_clip"
+    assert call["robot"] == "g1"
+    assert Path(call["module_path_or_source"]) == (
+        Path(m.mission_dir) / "stage_metrics" / "get_up" / "metric.py")
+    assert "root_pos_z" in call["clip"]
+
+    entry = report["generated"][0]
+    assert entry["reference_calibration"] == {
+        "clip_id": "getup_demo_clip", "robot": "g1",
+        "trust_tier": "reference:D:procedural", "rights": "steer",
+        "ok": True, "cert_verified": True, "cert_reason": None,
+    }
+    cal_events = [e for e in events if e["type"] == "stage_metric_reference_calibrated"]
+    assert len(cal_events) == 1
+    assert cal_events[0]["stage"] == "get_up"
+    assert cal_events[0]["trust_tier"] == "reference:D:procedural"
+    assert cal_events[0]["rights"] == "steer"
+    assert cal_events[0]["cert_verified"] is True
+
+
+def test_stage_without_reference_never_calls_calibration(tmp_path, monkeypatch):
+    """Byte-level no-op for a stage with no attached reference: calibration
+    must not even be imported/called, and no `reference_calibration` key
+    appears on the report entry."""
+    def fake_gen(goal, out_dir, **kw):
+        return {"accepted": True}
+
+    import sculptor.eval as ev
+    monkeypatch.setattr(ev, "generate_objective_metric", fake_gen)
+
+    def fake_calibrate(*a, **kw):  # pragma: no cover — must not run
+        raise AssertionError("calibration must not run for a stage without a reference")
+
+    import sculptor.eval.metric_calibration as mc
+    monkeypatch.setattr(mc, "calibrate_metric_against_reference", fake_calibrate)
+
+    m = _mk_mission(tmp_path, [_mk_stage("plain_stage")])
+    report = generate_stage_metrics(m)
+
+    assert report["generated"] == [
+        {"stage": "plain_stage", "ref": "stage_metrics/plain_stage/metric.py"}]
+    assert "reference_calibration" not in report["generated"][0]
+
+
+def test_calibration_raising_never_breaks_metric_acceptance(tmp_path, monkeypatch):
+    """A calibration crash is swallowed — the stage's metric is still
+    accepted (steering_metric set, reported as generated), just without a
+    `reference_calibration` entry, and no `stage_metric_reference_
+    calibrated` event fires."""
+    root = _write_fixture_clip(tmp_path, "g1", "getup_demo_clip")
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(root))
+
+    def fake_gen(goal, out_dir, **kw):
+        return {"accepted": True}
+
+    import sculptor.eval as ev
+    monkeypatch.setattr(ev, "generate_objective_metric", fake_gen)
+
+    def fake_calibrate(*a, **kw):
+        raise RuntimeError("calibration blew up")
+
+    import sculptor.eval.metric_calibration as mc
+    monkeypatch.setattr(mc, "calibrate_metric_against_reference", fake_calibrate)
+
+    events: list[dict] = []
+    s1 = _mk_stage("get_up", reference_clip_id="getup_demo_clip")
+    m = _mk_mission(tmp_path, [s1])
+    report = generate_stage_metrics(m, on_event=events.append)  # must not raise
+
+    assert report["generated"] == [
+        {"stage": "get_up", "ref": "stage_metrics/get_up/metric.py"}]
+    assert m.stages[0].steering_metric == "stage_metrics/get_up/metric.py"
+    assert "reference_calibration" not in report["generated"][0]
+    assert not any(e["type"] == "stage_metric_reference_calibrated" for e in events)
+
+
+def test_calibration_wiring_end_to_end_resolves_tier_d_from_real_cert(
+    tmp_path, monkeypatch,
+):
+    """Full integration (no mocked calibration): a clip that genuinely has
+    a verified Tier-D certificate on disk earns steer through the WHOLE
+    chain — mission_metrics -> calibrate_metric_against_reference ->
+    verify_tierd_certificate — with no explicit tier ever passed by
+    mission_metrics.py."""
+    from sculptor.refs.track import TrackingErrors, update_provenance_tier_d
+
+    root = _write_fixture_clip(tmp_path, "g1", "getup_demo_clip")
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(root))
+
+    rollout_path = tmp_path / "rollout.npz"
+    rollout_path.write_bytes(b"a real tracking rollout for the wiring test")
+    errs = TrackingErrors(
+        mean_joint_err_rad=0.05, max_joint_err_rad=0.1, root_z_rmse_m=0.02,
+        duration_coverage=1.0, common_joint_names=[], n_common_joints=0)
+    update_provenance_tier_d(
+        robot="g1", clip_id="getup_demo_clip", errors=errs, iterations=1,
+        rollout_path=rollout_path, root=root)
+
+    def fake_gen(goal, out_dir, **kw):
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "metric.py").write_text(
+            "def compute_spec(a, b, c): return {'spec_score': 0.0}")
+        return {"accepted": True}
+
+    import sculptor.eval as ev
+    monkeypatch.setattr(ev, "generate_objective_metric", fake_gen)
+
+    s1 = _mk_stage("get_up", reference_clip_id="getup_demo_clip")
+    m = _mk_mission(tmp_path, [s1])
+    report = generate_stage_metrics(m)
+
+    cal = report["generated"][0]["reference_calibration"]
+    assert cal["cert_verified"] is True
+    assert cal["trust_tier"] == "reference:D:procedural"
+    # (rights depends on the trivial constant metric clearing the ladder
+    # gate, which it won't — the load-bearing assertion here is that the
+    # TIER resolved to D through the real cert chain, not steer/observe.)

@@ -82,6 +82,56 @@ def _load_stage_reference(
         return None, error
 
 
+def _reference_source_kind(robot: str, clip_id: str) -> str:
+    """Best-effort lookup of the clip's provenance `source.kind` (e.g.
+    "hf_dataset", "retarget") — the trailing segment of the `trust_tier`
+    label (§REFERENCE_TRAJECTORY_PLAN §10, `"reference:<K|D>:<source>"`).
+    Never raises; an unreadable/missing provenance record degrades to
+    `"unknown"` rather than blocking calibration."""
+    try:
+        from sculptor.refs import library
+
+        prov = library.read_provenance(robot, clip_id)
+        return str((prov.get("source") or {}).get("kind") or "unknown")
+    except Exception:  # noqa: BLE001
+        return "unknown"
+
+
+def _calibrate_stage_reference(
+    *, metric_path: Path, clip_id: str, clip: dict, robot: str,
+) -> Optional[dict[str, Any]]:
+    """§REFERENCE_TRAJECTORY_PLAN §6, wired behind the verified-cert gate.
+
+    REFERENCE_BUILD_LOG.md "Audit findings deferred" (Tier-D spoofing):
+    `calibrate_metric_against_reference` no longer accepts a caller-
+    supplied tier string — it derives the effective tier itself via
+    `sculptor.refs.track.verify_tierd_certificate`, so this call cannot
+    manufacture steer-rights. Tier-K ladder calibration runs
+    unconditionally here (grants observe when it passes); Tier-D (steer)
+    is granted ONLY when a verified on-disk tracking certificate resolves
+    for this exact clip. This function never CREATES a certificate (no
+    GPU tracking happens here) — it only consumes one if `sculptor.refs.
+    track.track_clip` already produced it.
+
+    Non-fatal by design: any error here is caught, logged, and returns
+    `None` — the stage's metric acceptance (already recorded by the
+    caller) and its pre-existing trust are left exactly as they were."""
+    try:
+        from sculptor.eval.metric_calibration import (
+            calibrate_metric_against_reference,
+        )
+
+        source_kind = _reference_source_kind(robot, clip_id)
+        return calibrate_metric_against_reference(
+            metric_path, clip_id, clip, robot=robot, source_kind=source_kind)
+    except Exception as e:  # noqa: BLE001 — calibration must never break stage metric acceptance
+        print(
+            f"[mission-metrics] reference calibration for clip {clip_id!r} "
+            f"failed ({type(e).__name__}: {e}) — leaving trust unchanged.",
+            file=sys.stderr, flush=True)
+        return None
+
+
 def resolve_stage_metric_ref(ref: str, mission_dir: Path | str) -> str:
     """Anchor a mission-dir-relative generated-metric ref at the mission
     dir. Spec-metric names ("g1_kick") and absolute paths pass through
@@ -214,6 +264,33 @@ def generate_stage_metrics(
                 "stage": stage.name,
                 "ref": rel,
             })
+            # §REFERENCE_TRAJECTORY_PLAN §6, wired behind the verified-cert
+            # gate (audit-finding close): a stage whose metric was just
+            # certified/accepted against an attached reference also earns
+            # reference-derived calibration trust here. Byte-level no-op
+            # for stages without a reference (`references` is None/empty).
+            if references:
+                ref_clip_id, ref_clip = references[0]
+                ref_robot = _robot_slug(robot_hint)
+                cal = _calibrate_stage_reference(
+                    metric_path=out_dir / "metric.py", clip_id=ref_clip_id,
+                    clip=ref_clip, robot=ref_robot)
+                if cal is not None:
+                    cal_summary = {
+                        "clip_id": ref_clip_id,
+                        "robot": ref_robot,
+                        "trust_tier": cal.get("trust_tier"),
+                        "rights": cal.get("rights"),
+                        "ok": cal.get("ok"),
+                        "cert_verified": cal.get("cert_verified"),
+                        "cert_reason": cal.get("cert_reason"),
+                    }
+                    gen_entry["reference_calibration"] = cal_summary
+                    _emit({
+                        "type": "stage_metric_reference_calibrated",
+                        "stage": stage.name,
+                        **cal_summary,
+                    })
         else:
             # generate_objective_metric never raises on a bad candidate —
             # rejection reasons live in the record it wrote to meta.json.

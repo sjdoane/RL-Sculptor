@@ -15,4 +15,12 @@ Layout:
     segment.py — root_z hysteresis segmentation for multi-rep clips
                  (e.g. fallAndGetUp) into derived per-segment clips.
     retrieve.py, preview.py — later workers (W2); not present in R1 W1.
+    track.py   — Tier-D tracking certification + `verify_tierd_
+                 certificate` (§REFERENCE_TRAJECTORY_PLAN §6/§10 audit-
+                 finding close): the ONLY way to turn a caller's "this is
+                 Tier D" claim into a verified `TierDCertificate`.
 """
+
+from sculptor.refs.track import TierDCertificate, verify_tierd_certificate
+
+__all__ = ["TierDCertificate", "verify_tierd_certificate"]

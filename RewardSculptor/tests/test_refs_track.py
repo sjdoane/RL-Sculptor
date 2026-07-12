@@ -22,6 +22,7 @@ from sculptor.refs.track import (
     DEFAULT_ITERATIONS,
     MEAN_JOINT_ERR_THRESHOLD_RAD,
     ROOT_Z_RMSE_THRESHOLD_M,
+    TierDCertificate,
     TrackError,
     TrackingErrors,
     build_track_project,
@@ -31,6 +32,7 @@ from sculptor.refs.track import (
     read_donor_adapter_config,
     track_clip,
     update_provenance_tier_d,
+    verify_tierd_certificate,
     write_project_config_toml,
 )
 
@@ -373,6 +375,8 @@ def test_update_provenance_tier_d_feasible_upgrades_tier(tmp_path: Path):
         duration_coverage=1.0, common_joint_names=["left_hip_pitch_joint"],
         n_common_joints=1)
     rollout_path = tmp_path / "fake_rollout.npz"
+    rollout_bytes = b"fake npz payload for hashing"
+    rollout_path.write_bytes(rollout_bytes)
     prov = update_provenance_tier_d(
         robot="g1", clip_id="getup1", errors=errs, iterations=2,
         rollout_path=rollout_path, root=root)
@@ -381,12 +385,40 @@ def test_update_provenance_tier_d_feasible_upgrades_tier(tmp_path: Path):
     assert prov["tierD"]["iterations"] == 2
     assert prov["tierD"]["rollout_path"] == str(rollout_path)
     assert prov["tierD"]["errors"]["feasible"] is True
+    # §audit-finding close: the tierD block now also records the rollout's
+    # sha256 and a copy of the clip's content_sha256 at tracking time.
+    assert prov["tierD"]["rollout_sha256"] == library.content_sha256(rollout_bytes)
+    assert prov["tierD"]["clip_content_sha256"] == "0" * 64  # _register_clip's fixture hash
 
     # Persisted to disk, index rebuilt.
     reloaded = library.read_provenance("g1", "getup1", root=root)
     assert reloaded["tier"] == "D"
     rows = library.read_index(root=root)
     assert any(r["clip_id"] == "getup1" and r["tier"] == "D" for r in rows)
+
+
+def test_update_provenance_tier_d_feasible_missing_rollout_file_omits_hash(
+    tmp_path: Path,
+):
+    """A `rollout_path` that doesn't actually exist on disk (e.g. a caller
+    error) must not crash provenance bookkeeping — `rollout_sha256` is
+    just omitted, best-effort, and `verify_tierd_certificate` denies
+    cleanly later."""
+    root = tmp_path / "lib"
+    clip = _make_getup_clip()
+    _register_clip(root, clip, tier="K")
+
+    errs = TrackingErrors(
+        mean_joint_err_rad=0.1, max_joint_err_rad=0.2, root_z_rmse_m=0.05,
+        duration_coverage=1.0, common_joint_names=["left_hip_pitch_joint"],
+        n_common_joints=1)
+    rollout_path = tmp_path / "never_written.npz"
+    prov = update_provenance_tier_d(
+        robot="g1", clip_id="getup1", errors=errs, iterations=2,
+        rollout_path=rollout_path, root=root)
+
+    assert prov["tier"] == "D"
+    assert "rollout_sha256" not in prov["tierD"]
 
 
 def test_update_provenance_tier_d_infeasible_keeps_tier_k(tmp_path: Path):
@@ -503,3 +535,206 @@ def test_cli_refs_track_help_lists_key_options():
     assert result.exit_code == 0
     for opt in ("--clip-id", "--donor-project", "--iterations", "--dry-run"):
         assert opt in result.output
+
+
+# ── §audit-finding close: verify_tierd_certificate ─────────────────────────
+#
+# REFERENCE_BUILD_LOG.md "Audit findings deferred" (Tier-D spoofing): a
+# caller-claimed `tier="D"` string must never be trusted; only a
+# certificate this module verifies from disk counts. Every check in
+# `verify_tierd_certificate`'s docstring gets its own tamper test below —
+# each mutates exactly ONE thing off the otherwise-valid fixture.
+_ROLLOUT_BYTES = b"legit tracking rollout npz bytes"
+
+
+def _certify_valid_tier_d(tmp_path: Path, root: Path, *,
+                           clip_id: str = "getup1", robot: str = "g1") -> dict:
+    """Build a clip whose provenance carries a REAL, internally-consistent
+    Tier-D certificate: a rollout file actually on disk, its sha256
+    recorded correctly, and the clip content hash matching. Returns the
+    written provenance dict."""
+    clip = _make_getup_clip()
+    _register_clip(root, clip, clip_id=clip_id, robot=robot, tier="K")
+    rollout_path = tmp_path / f"{clip_id}_rollout.npz"
+    rollout_path.write_bytes(_ROLLOUT_BYTES)
+    errs = TrackingErrors(
+        mean_joint_err_rad=0.05, max_joint_err_rad=0.1, root_z_rmse_m=0.02,
+        duration_coverage=1.0, common_joint_names=["left_hip_pitch_joint"],
+        n_common_joints=1)
+    assert errs.feasible  # sanity: fixture stats are within threshold
+    return update_provenance_tier_d(
+        robot=robot, clip_id=clip_id, errors=errs, iterations=2,
+        rollout_path=rollout_path, root=root)
+
+
+def test_verify_tierd_certificate_valid_fixture_returns_certificate(tmp_path: Path):
+    root = tmp_path / "lib"
+    _certify_valid_tier_d(tmp_path, root)
+
+    cert, reason = verify_tierd_certificate("g1", "getup1", root=root)
+
+    assert reason is None
+    assert isinstance(cert, TierDCertificate)
+    assert cert.robot == "g1"
+    assert cert.clip_id == "getup1"
+    assert cert.mean_joint_err_rad == pytest.approx(0.05)
+    assert cert.root_z_rmse_m == pytest.approx(0.02)
+    assert cert.rollout_sha256 == library.content_sha256(_ROLLOUT_BYTES)
+    assert cert.clip_content_sha256 == "0" * 64
+    assert cert.rollout_path.is_file()
+
+
+def test_verify_tierd_certificate_frozen_dataclass(tmp_path: Path):
+    root = tmp_path / "lib"
+    _certify_valid_tier_d(tmp_path, root)
+    cert, _reason = verify_tierd_certificate("g1", "getup1", root=root)
+    with pytest.raises(Exception):  # noqa: PT011 — frozen dataclass raises FrozenInstanceError
+        cert.robot = "go1"  # type: ignore[misc]
+
+
+def test_verify_tierd_certificate_no_tierd_block_denied(tmp_path: Path):
+    root = tmp_path / "lib"
+    clip = _make_getup_clip()
+    _register_clip(root, clip, tier="K")  # never tracked — no tierD block at all
+
+    cert, reason = verify_tierd_certificate("g1", "getup1", root=root)
+    assert cert is None
+    assert "no tierD block" in reason
+
+
+def test_verify_tierd_certificate_missing_clip_denied(tmp_path: Path):
+    root = tmp_path / "lib"
+    cert, reason = verify_tierd_certificate("g1", "nonexistent", root=root)
+    assert cert is None
+    assert reason is not None
+
+
+def test_verify_tierd_certificate_infeasible_run_denied(tmp_path: Path):
+    """A clip that was tracked but stayed infeasible (tier never left K)
+    must not verify, even though a tierD block exists."""
+    root = tmp_path / "lib"
+    clip = _make_getup_clip()
+    _register_clip(root, clip, tier="K")
+    errs = TrackingErrors(
+        mean_joint_err_rad=1.0, max_joint_err_rad=2.0, root_z_rmse_m=0.5,
+        duration_coverage=1.0, common_joint_names=[], n_common_joints=0)
+    update_provenance_tier_d(
+        robot="g1", clip_id="getup1", errors=errs, iterations=2, root=root)
+
+    cert, reason = verify_tierd_certificate("g1", "getup1", root=root)
+    assert cert is None
+    assert "out of tolerance" in reason
+
+
+def _mutate_provenance(root: Path, robot: str, clip_id: str, fn) -> None:
+    prov = library.read_provenance(robot, clip_id, root=root)
+    fn(prov)
+    library.write_provenance(robot, clip_id, prov, root=root)
+
+
+def test_verify_tierd_certificate_tamper_edited_tier_without_stats_denied(
+    tmp_path: Path,
+):
+    """The 'edited tier' tamper: someone hand-sets provenance.tier="D" and
+    tierD.errors.feasible=True but the RAW stats are still bad. The
+    recomputed-feasibility check (never trust the stored bool) must catch
+    this."""
+    root = tmp_path / "lib"
+    clip = _make_getup_clip()
+    _register_clip(root, clip, tier="K")
+    # A clip that was never actually tracked: hand-fabricate a tierD block
+    # with a "feasible": True LIE over bad stats.
+    _mutate_provenance(root, "g1", "getup1", lambda p: p.update({
+        "tier": "D",
+        "tierD": {
+            "tracked_at": "2026-01-01T00:00:00Z", "iterations": 1,
+            "errors": {"mean_joint_err_rad": 1.5, "root_z_rmse_m": 0.9,
+                       "feasible": True},
+            "clip_content_sha256": p["content_sha256"],
+            "rollout_path": str(tmp_path / "nope.npz"),
+            "rollout_sha256": "0" * 64,
+        },
+    }))
+
+    cert, reason = verify_tierd_certificate("g1", "getup1", root=root)
+    assert cert is None
+    assert "out of tolerance" in reason
+
+
+def test_verify_tierd_certificate_tamper_missing_rollout_file_denied(tmp_path: Path):
+    root = tmp_path / "lib"
+    prov = _certify_valid_tier_d(tmp_path, root)
+    rollout_path = Path(prov["tierD"]["rollout_path"])
+    rollout_path.unlink()  # the artifact vanishes after certification
+
+    cert, reason = verify_tierd_certificate("g1", "getup1", root=root)
+    assert cert is None
+    assert "missing on disk" in reason
+
+
+def test_verify_tierd_certificate_tamper_wrong_rollout_hash_denied(tmp_path: Path):
+    root = tmp_path / "lib"
+    prov = _certify_valid_tier_d(tmp_path, root)
+    rollout_path = Path(prov["tierD"]["rollout_path"])
+    rollout_path.write_bytes(b"a different payload entirely")  # swapped file
+
+    cert, reason = verify_tierd_certificate("g1", "getup1", root=root)
+    assert cert is None
+    assert "sha256 mismatch" in reason
+
+
+def test_verify_tierd_certificate_tamper_wrong_clip_hash_denied(tmp_path: Path):
+    """Simulates the clip being re-ingested/edited after certification: the
+    top-level content_sha256 drifts away from what tierD recorded."""
+    root = tmp_path / "lib"
+    _certify_valid_tier_d(tmp_path, root)
+    _mutate_provenance(root, "g1", "getup1",
+                        lambda p: p.update({"content_sha256": "f" * 64}))
+
+    cert, reason = verify_tierd_certificate("g1", "getup1", root=root)
+    assert cert is None
+    assert "hash drift" in reason
+
+
+def test_verify_tierd_certificate_tamper_missing_rollout_sha_denied(tmp_path: Path):
+    """A tierD block with a rollout_path but no recorded hash at all (e.g.
+    the best-effort hashing in `update_provenance_tier_d` failed) must
+    deny cleanly rather than silently trusting an unhashed artifact."""
+    root = tmp_path / "lib"
+    prov = _certify_valid_tier_d(tmp_path, root)
+    _mutate_provenance(root, "g1", "getup1", lambda p: p["tierD"].pop("rollout_sha256"))
+
+    cert, reason = verify_tierd_certificate("g1", "getup1", root=root)
+    assert cert is None
+    assert "no rollout_sha256" in reason
+
+
+def test_verify_tierd_certificate_out_of_tolerance_boundary(tmp_path: Path):
+    """Threshold is a strict `<`, matching `TrackingErrors.feasible` — a
+    stat sitting exactly AT the threshold is out of tolerance."""
+    root = tmp_path / "lib"
+    clip = _make_getup_clip()
+    _register_clip(root, clip, tier="K")
+    errs = TrackingErrors(
+        mean_joint_err_rad=MEAN_JOINT_ERR_THRESHOLD_RAD, max_joint_err_rad=0.4,
+        root_z_rmse_m=0.02, duration_coverage=1.0,
+        common_joint_names=["left_hip_pitch_joint"], n_common_joints=1)
+    assert not errs.feasible
+    update_provenance_tier_d(
+        robot="g1", clip_id="getup1", errors=errs, iterations=1, root=root)
+
+    cert, reason = verify_tierd_certificate("g1", "getup1", root=root)
+    assert cert is None
+    assert "out of tolerance" in reason
+
+
+def test_verify_tierd_certificate_never_raises_on_corrupt_provenance(tmp_path: Path):
+    root = tmp_path / "lib"
+    clip = _make_getup_clip()
+    _register_clip(root, clip, tier="K")
+    prov_path = library.clip_dir("g1", "getup1", root=root) / library.PROVENANCE_FILENAME
+    prov_path.write_text("{not valid json", encoding="utf-8")
+
+    cert, reason = verify_tierd_certificate("g1", "getup1", root=root)
+    assert cert is None
+    assert reason is not None
