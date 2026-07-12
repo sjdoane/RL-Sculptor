@@ -112,7 +112,26 @@ def test_expand_synonyms_pulls_in_getup_group() -> None:
     assert "getup" in expanded
     assert "stand" in expanded
     assert "rise" in expanded
-    assert "fall" in expanded  # get up off the ground <-> fall and get up
+    # §2026-07-11 (build-log D2 follow-up): "fall" was deliberately moved
+    # OUT of the get-up group into its own group (see `SYNONYM_GROUPS`'s
+    # docstring) — folding it into "up"'s group diluted "fall"'s corpus
+    # rarity down to "up"'s (very common), which let unrelated up/down
+    # clips outrank real fallAndGetUp clips for queries like "fall down".
+    # "get up off the ground" still ranks fallAndGetUp top via literal
+    # "get"/"up" overlap alone (see `test_deterministic_rank_fall_down_...
+    # ranks_fallandgetup_first` below) — it never depended on this
+    # cross-group link.
+    assert "fall" not in expanded
+
+
+def test_expand_synonyms_pulls_in_fall_group() -> None:
+    """"fall" now has its own group, separate from get-up (§2026-07-11)."""
+    expanded = expand_synonyms(["fall"])
+    assert "falling" in expanded
+    assert "collapse" in expanded
+    assert "tumble" in expanded
+    assert "get" not in expanded
+    assert "up" not in expanded
 
 
 def test_expand_synonyms_leaves_unknown_tokens_alone() -> None:
@@ -158,6 +177,35 @@ def test_search_public_api_reads_disk_index(tmp_path: Path) -> None:
 def test_search_unknown_robot_returns_empty(tmp_path: Path) -> None:
     library.rebuild_index(root=tmp_path)  # empty library
     assert search("anything", robot="g1", root=tmp_path, use_llm=False) == []
+
+
+def test_search_filters_by_robot_symmetrically(tmp_path: Path) -> None:
+    """§Problem 2: a g1 clip and a t1 clip carrying the IDENTICAL text/
+    labels must each be found ONLY under their own robot — `search()`'s
+    robot filter is not a g1-specific special case, it treats every
+    robot slug the same way."""
+    for robot in ("g1", "t1"):
+        prov = library.make_provenance(
+            clip_id=f"fallandgetup1_subject1--{robot}", robot=robot,
+            source={"kind": "hf_dataset", "repo": "r",
+                    "path": "p", "url": "u"},
+            license="cc-by-4.0", attribution="a",
+            content_sha256_=f"{robot}".ljust(64, "0"),
+            labels=["fall", "and", "get", "up", "1", "subject", "1"],
+            text="fall and get up 1 subject 1",
+            qc={"duration_s": 5.0, "n_frames": 150, "root_z_range": [0.1, 0.8]})
+        library.write_provenance(robot, prov["clip_id"], prov, root=tmp_path)
+    library.rebuild_index(root=tmp_path)
+
+    g1_results = search(
+        "get up off the ground", robot="g1", k=5, use_llm=False, root=tmp_path)
+    t1_results = search(
+        "get up off the ground", robot="t1", k=5, use_llm=False, root=tmp_path)
+
+    assert len(g1_results) == 1
+    assert g1_results[0].clip_id == "fallandgetup1_subject1--g1"
+    assert len(t1_results) == 1
+    assert t1_results[0].clip_id == "fallandgetup1_subject1--t1"
 
 
 def test_deterministic_rank_walk_query_prefers_walk_over_getup() -> None:
@@ -209,6 +257,24 @@ def test_deterministic_rank_get_up_off_ground_still_locked_with_concept_boost() 
         "get up off the ground", FIXTURE_ROWS, k=10)
     assert results
     assert all(m.clip_id.startswith("fallandgetup") for m in results[:2])
+
+
+def test_deterministic_rank_fall_down_ranks_fallandgetup_first() -> None:
+    """§2026-07-11 defect regression (deferred audit finding, build-log D2
+    follow-up): "fall" no longer shares a synonym group with "up" (see
+    `SYNONYM_GROUPS`'s docstring for the mechanism) — folding it into the
+    get-up group diluted "fall"'s corpus rarity down to "up"'s (common
+    across the real 5040-clip library: any *_up/*up_down/direction-style
+    clip), which let an unrelated clip that only shared the common word
+    "up" (bridged) plus the rare literal modifier "down" outrank the
+    actual fallAndGetUp clips for the query "fall down". Full
+    before/after top-5 against the real library is in
+    `tests/test_refs_golden_queries.py` / `tests/data/golden_queries.yml`
+    ("fall down" entry); this is the fixture-scale version of the same
+    regression."""
+    results = deterministic_rank("fall down", FIXTURE_ROWS, k=10)
+    assert results
+    assert results[0].clip_id.startswith("fallandgetup")
 
 
 def test_deterministic_rank_respects_k() -> None:

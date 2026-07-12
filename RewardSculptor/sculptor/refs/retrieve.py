@@ -68,8 +68,32 @@ def tokenize_query(text: str) -> list[str]:
 #: tokenizer-normalized (lowercase, already-split words); membership in
 #: the same set is symmetric — every token in a group expands to every
 #: other token in that group.
+#: §2026-07-11 (deferred audit finding, build-log D2 follow-up): "fall"
+#: used to live INSIDE the get-up group (`get≈up≈getup≈stand≈rise≈fall
+#: ≈and`). That's correct for the PHRASE "fall and get up" (both
+#: concepts co-occur literally on every fallAndGetUp clip, so it always
+#: scored a full literal in-group hit regardless of grouping) but wrong
+#: for the single token "fall" in isolation: `_idf_weights` computes a
+#: token's rarity from its EXPANDED per-row token set (§`_idf_weights`
+#: docstring), so every group member shares one corpus-wide weight. "up"
+#: is an extremely common word across this library (direction/pose
+#: modifiers like "wrists up down", "look up", any *_up clip) — folding
+#: "fall" into the same group as "up" dragged "fall"'s own rarity down
+#: to "up"'s near-zero IDF, so a query like "fall down" let an unrelated
+#: clip that only shares the common word "up" (bridging through the
+#: group) and the rare literal modifier "down" outscore the actual
+#: fallAndGetUp clips — the literal "fall" match on the correct clips
+#: was scored at that same diluted group weight. Splitting "fall" into
+#: its own group restores its true (much higher) corpus rarity, and
+#: since "fall and get up" clips still contain LITERAL "get"/"up" tokens
+#: in the get-up group (and now also a literal "fall" in its own group,
+#: each scored via `in_group_literal` — a full, undiscounted hit per
+#: §D2), the "get up off the ground" LOCKED acceptance behavior is
+#: unaffected: it never depended on "fall" being a member of the get-up
+#: group, only on literal "get"/"up" overlap.
 SYNONYM_GROUPS: tuple[tuple[str, ...], ...] = (
-    ("get", "up", "getup", "stand", "rise", "fall", "and"),
+    ("get", "up", "getup", "stand", "rise", "and"),
+    ("fall", "falling", "collapse", "tumble"),
     ("jump", "leap", "hop"),
     ("walk", "locomotion", "gait"),
     ("run", "sprint", "jog"),
