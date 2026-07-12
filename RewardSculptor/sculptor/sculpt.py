@@ -3407,15 +3407,146 @@ def _iter_fitness_key(o: "IterOutcome") -> tuple[float, float, float]:
     return (sf, sp, pm)
 
 
+def _evaluate_start_state_gate(
+    with_ckpt: "list[IterOutcome]", stage_dir: Optional[Path],
+) -> Optional[dict]:
+    """§D21 Fix 3 (post-mortem D20): mechanical start-state gate for
+    stages with a stage-FIXED eval reset (`env/eval_reset.json` — §D17
+    get-up-archetype stages).
+
+    D20 root cause: a stage's `success_criterion` (root_height / upright
+    / episode-length) has no start-state clause, so a STANDING rollout
+    can trivially satisfy a get-up criterion when the scaffold silently
+    fell back to the wrong RSI class. This computes, PER CANDIDATE
+    ITERATION, whether its rollout's FRAME-0 state matches the stage's
+    fixed eval reset within tolerance:
+
+      expected_z  = `reference.G1_CLASS_STAND_M` + `reset_height_offset_m`
+      expected_pg = -cos(reset_pitch_offset_rad) * cos(reset_roll_offset_rad)
+      measured_z  = mean over envs of `root_link_pos_w[0, :, 2]`
+      measured_pg = mean over envs of `projected_gravity_b[0, :, 2]`
+      match iff |measured_z - expected_z| <= 0.15 AND
+                |measured_pg - expected_pg| <= 0.30
+
+    The caller (`_select_stage_final_iter`) excludes gate-MISMATCHED
+    iterations from criterion-passing consideration.
+
+    Returns `None` when `stage_dir` is not supplied (opt-out, e.g. a
+    direct unit-test call bypassing the gate entirely). Otherwise ALWAYS
+    returns a dict — the gate "ran" — even when `eval_reset.json` is
+    absent/corrupt or an iter's trajectory arrays are missing/malformed;
+    those cases are folded into `skipped` / simply excluded from
+    `checked` rather than raising. This function must NEVER crash stage
+    selection.
+
+    Dict keys:
+      skipped: True when `eval_reset.json` is absent or unparseable —
+        no expected state to check against; the gate is a pure no-op.
+      expected_z / expected_pg_z: the derived expected frame-0 values,
+        or None when `skipped`.
+      checked: count of candidates the gate could actually evaluate
+        (trajectory arrays present, well-shaped).
+      mismatched: dict[str(iter_dir) -> True] — present only for
+        iterations that FAILED the tolerance check.
+      mismatched_count: len(mismatched).
+      example_measured_z / example_measured_pg_z: one representative
+        measurement (prefers a mismatched example when any exist, else
+        the first checked iter's) — for the event / failure detail.
+    """
+    result: dict = {
+        "skipped": False,
+        "expected_z": None,
+        "expected_pg_z": None,
+        "checked": 0,
+        "mismatched": {},
+        "mismatched_count": 0,
+        "example_measured_z": None,
+        "example_measured_pg_z": None,
+    }
+    if stage_dir is None:
+        return None
+
+    eval_reset_path = Path(stage_dir) / "env" / "eval_reset.json"
+    if not eval_reset_path.is_file():
+        result["skipped"] = True
+        return result
+
+    try:
+        eval_reset = json.loads(eval_reset_path.read_text(encoding="utf-8"))
+        from sculptor.reference import G1_CLASS_STAND_M
+
+        offset = float(eval_reset["reset_height_offset_m"])
+        pitch = float(eval_reset.get("reset_pitch_offset_rad", 0.0) or 0.0)
+        roll = float(eval_reset.get("reset_roll_offset_rad", 0.0) or 0.0)
+        expected_z = G1_CLASS_STAND_M + offset
+        expected_pg = -math.cos(pitch) * math.cos(roll)
+    except Exception:  # noqa: BLE001 — corrupt eval_reset.json: no-op gate
+        result["skipped"] = True
+        return result
+
+    result["expected_z"] = expected_z
+    result["expected_pg_z"] = expected_pg
+
+    from sculptor.mission_runtime import _load_trajectory_arrays
+
+    example_z = example_pg = None
+    mismatch_example_z = mismatch_example_pg = None
+    for o in with_ckpt:
+        try:
+            import numpy as np
+
+            trajectory, _ = _load_trajectory_arrays(Path(o.iter_dir))
+            root_pos = trajectory.get("root_link_pos_w")
+            pg = trajectory.get("projected_gravity_b")
+            if root_pos is None or pg is None:
+                continue
+            root_arr = np.asarray(root_pos)
+            pg_arr = np.asarray(pg)
+            if (root_arr.ndim != 3 or root_arr.shape[2] < 3
+                    or root_arr.shape[0] < 1 or root_arr.shape[1] < 1):
+                continue
+            if (pg_arr.ndim != 3 or pg_arr.shape[2] < 3
+                    or pg_arr.shape[0] < 1 or pg_arr.shape[1] < 1):
+                continue
+            measured_z = float(np.mean(root_arr[0, :, 2]))
+            measured_pg = float(np.mean(pg_arr[0, :, 2]))
+        except Exception:  # noqa: BLE001 — this iter's data unusable: skip it
+            continue
+
+        result["checked"] += 1
+        if example_z is None:
+            example_z, example_pg = measured_z, measured_pg
+        matched = (
+            abs(measured_z - expected_z) <= 0.15
+            and abs(measured_pg - expected_pg) <= 0.30
+        )
+        if not matched:
+            result["mismatched"][str(o.iter_dir)] = True
+            if mismatch_example_z is None:
+                mismatch_example_z, mismatch_example_pg = measured_z, measured_pg
+
+    result["mismatched_count"] = len(result["mismatched"])
+    if mismatch_example_z is not None:
+        result["example_measured_z"] = mismatch_example_z
+        result["example_measured_pg_z"] = mismatch_example_pg
+    else:
+        result["example_measured_z"] = example_z
+        result["example_measured_pg_z"] = example_pg
+    return result
+
+
 def _select_stage_final_iter(
     candidates: "list[IterOutcome]",
     stage,
-) -> "tuple[Optional[IterOutcome], bool, str, Optional[str], bool]":
+    *,
+    stage_dir: Optional[Path] = None,
+    emit: Optional[Any] = None,
+) -> "tuple[Optional[IterOutcome], bool, str, Optional[str], bool, Optional[str]]":
     """§keep-best finalization (B1). Choose the iteration a stage keeps as
     its final policy, so a late regression can't discard a good one.
 
     Returns `(selected, criterion_ok, source, criterion_error,
-    error_is_missing_key)`.
+    error_is_missing_key, start_state_mismatch_detail)`.
 
     Rule: among candidates that have a checkpoint AND whose rollout
     satisfies the stage criterion, keep the one with the highest fitness
@@ -3426,6 +3557,18 @@ def _select_stage_final_iter(
     raises the SAME error on every iter → no pass → surfaced as
     `criterion_errored`; a missing-key (metric absent) is a plain
     non-pass → `criterion_not_met`. Never raises mid-scan.
+
+    §D21 Fix 3: when `stage_dir` is supplied, `_evaluate_start_state_gate`
+    checks every checkpointed candidate's rollout frame-0 state against
+    the stage's `env/eval_reset.json` (if any — a no-op otherwise). A
+    gate-MISMATCHED iteration is excluded from `passing` even when its
+    criterion evaluated True (D20: a standing rollout can trivially
+    satisfy a start-state-blind get-up criterion). If criterion-passing
+    candidates existed but EVERY one of them was gate-mismatched,
+    `start_state_mismatch_detail` is set to an actionable message (not
+    None) instead of the usual `None` — the caller must surface this as
+    a DISTINCT, non-redecomposable failure reason
+    (`"start_state_mismatch"`), not the generic `criterion_not_met`.
     """
     from sculptor.mission_runtime import (
         CriterionEvalError,
@@ -3441,9 +3584,25 @@ def _select_stage_final_iter(
         by_dir[str(o.iter_dir)] = o
     with_ckpt = [o for o in by_dir.values() if _iter_checkpoint(o.iter_dir)]
     if not with_ckpt:
-        return (None, False, "last", None, False)
+        return (None, False, "last", None, False, None)
+
+    gate = _evaluate_start_state_gate(with_ckpt, stage_dir)
+    if emit is not None and gate is not None:
+        emit({
+            "type": "stage_start_state_gate",
+            "stage_name": stage.name,
+            "checked": gate["checked"],
+            "mismatched": gate["mismatched_count"],
+            "expected_z": gate["expected_z"],
+            "expected_pg_z": gate["expected_pg_z"],
+            "example_measured_z": gate["example_measured_z"],
+            "example_measured_pg_z": gate["example_measured_pg_z"],
+            "skipped": gate["skipped"],
+        })
+    gate_mismatched = gate["mismatched"] if gate is not None else {}
 
     passing: "list[IterOutcome]" = []
+    raw_passing: "list[IterOutcome]" = []
     had_fitness = False
     last_error: Optional[str] = None   # any criterion error message seen
     only_missing_key = True            # False once a genuine (bug) error seen
@@ -3455,7 +3614,12 @@ def _select_stage_final_iter(
             ns = _build_criterion_namespace(
                 iter_dir=Path(o.iter_dir), primary_metric=o.primary_metric)
             if _evaluate_success_criterion(stage.success_criterion, ns):
-                passing.append(o)
+                raw_passing.append(o)
+                # §D21 Fix 3: a gate-mismatched iter does NOT count as
+                # criterion-satisfying, regardless of what the criterion
+                # expression itself evaluated to.
+                if not gate_mismatched.get(str(o.iter_dir), False):
+                    passing.append(o)
         except CriterionEvalError as e:
             saw_any_error = True
             last_error = str(e)
@@ -3468,21 +3632,40 @@ def _select_stage_final_iter(
         winner = max(
             passing, key=lambda o: (_iter_fitness_key(o), o.iter_index))
         source = "criterion+fitness" if had_fitness else "criterion_newest"
-        return (winner, True, source, None, False)
+        return (winner, True, source, None, False, None)
 
     # Nobody passed — keep the strongest policy for the successor anyway.
     winner = max(with_ckpt, key=lambda o: (_iter_fitness_key(o), o.iter_index))
+
+    # §D21 Fix 3: at least one iter satisfied the criterion, but the gate
+    # rejected EVERY one of them — this is a start-state mismatch, not a
+    # plain criterion miss. Surfaced distinctly so the caller fails the
+    # stage with a non-redecomposable reason (re-authoring the criterion
+    # / reward can't fix a scaffold that started from the wrong state).
+    if raw_passing:
+        detail = (
+            f"{len(raw_passing)} iteration(s) satisfied "
+            f"{stage.success_criterion!r} but ALL started from the wrong "
+            f"state per env/eval_reset.json (expected root z="
+            f"{gate['expected_z']!r}, projected-gravity z="
+            f"{gate['expected_pg_z']!r}; example measured z="
+            f"{gate['example_measured_z']!r}, projected-gravity z="
+            f"{gate['example_measured_pg_z']!r}). The scaffold likely "
+            f"fell back to the wrong RSI/reset class."
+        )
+        return (winner, False, "fitness_fallback", None, False, detail)
+
     # Preserve the genuine-bug vs missing-key/plain-fail distinction the
     # old single-iter path drew: a broken criterion still surfaces as
     # criterion_errored; a missing key carries its message through to the
     # recoverable criterion_not_met so re-decompose feedback names the key.
     if saw_any_error and not only_missing_key:
-        return (winner, False, "fitness_fallback", last_error, False)
+        return (winner, False, "fitness_fallback", last_error, False, None)
     if saw_any_error:  # only missing-key errors
-        return (winner, False, "fitness_fallback", last_error, True)
+        return (winner, False, "fitness_fallback", last_error, True, None)
     # Criterion evaluated cleanly to False on every iter — a plain miss,
     # no missing key.
-    return (winner, False, "fitness_fallback", None, False)
+    return (winner, False, "fitness_fallback", None, False, None)
 
 
 def _verify_stage_adapter_matches(
@@ -4315,6 +4498,58 @@ def _stage_reference_robot_slug(*, stage_dir: Path, project_root: Path) -> str:
     return "g1"
 
 
+def _resolve_stage_rsi_clip(
+    stage, robot: str, *, project_root: Path,
+) -> "tuple[Optional[dict], Optional[str], Optional[str]]":
+    """Resolve the reference clip for a stage's RSI curriculum.
+
+    §D21 Fix 2 (post-mortem D20, docs/internal/REFERENCE_BUILD_LOG.md):
+    precedence is
+
+      1. `stage.reference_clip_id` — a library clip explicitly ATTACHED
+         to THIS stage (§R1_BUILD_SPEC decision 10; covers get-up clips,
+         not just jumps). When set, this is the ONLY acceptable source —
+         a load failure here is FATAL (returned as `fatal_error`), never
+         silently substituted by a lower-precedence clip. Pre-D21 a set-
+         but-unloadable `reference_clip_id` fell through to jump.npz /
+         the procedural jump clip, silently swapping the task class the
+         stage's certified metric was generated against (the D20
+         incident: a get-up mission scaffolded standing/hopping jump
+         RSI when its attached clip failed to load).
+      2. a real (converted mocap) clip at `<project_root>/reference/
+         jump.npz` when present (legacy jump missions, byte-identical
+         behavior — no `reference_clip_id` means no attached-clip
+         contract to honor, so falling through here is not a silent
+         task-class swap, it's the documented default).
+      3. the analytic procedural jump clip (final fallback).
+
+    Returns `(clip, clip_src, fatal_error)`. `fatal_error` is set ONLY
+    for case 1's load failure — callers MUST fail the stage (not
+    proceed) when it is not None. Cases 2/3 never set it — a missing
+    jump.npz is precedence falling through to the always-available
+    procedural clip, not an error condition.
+    """
+    from sculptor.reference import load_clip, make_procedural_jump_clip
+
+    stage_clip_id = getattr(stage, "reference_clip_id", None)
+    if stage_clip_id:
+        try:
+            from sculptor.refs import library as refs_library
+
+            stage_clip_path = (
+                refs_library.clip_dir(robot, stage_clip_id)
+                / refs_library.CLIP_FILENAME)
+            clip = load_clip(stage_clip_path)
+            return clip, f"library:{robot}/{stage_clip_id}", None
+        except Exception as e:  # noqa: BLE001 — fatal for this stage; no fallback
+            return None, None, f"{type(e).__name__}: {e}"
+
+    clip_path = project_root / "reference" / "jump.npz"
+    if clip_path.is_file():
+        return load_clip(clip_path), str(clip_path), None
+    return make_procedural_jump_clip(), "procedural:jump", None
+
+
 def _run_one_stage(
     *,
     mission,
@@ -4553,77 +4788,90 @@ def _run_one_stage(
     # 2): decomposer-flagged reference-state initialization. Derive a
     # validated TRAIN-ONLY RSI curriculum from a reference clip and
     # persist it as this stage's next env-spec version before any
-    # training. Clip preference, most to least specific:
-    #   1. `stage.reference_clip_id` — a library clip explicitly
-    #      ATTACHED to THIS stage (§R1_BUILD_SPEC decision 10; covers
-    #      get-up clips, not just jumps — the whole point of this
-    #      increment). Loaded from `sculptor.refs.library` the same way
-    #      `mission_metrics._load_stage_reference` already does for
-    #      metric generation.
-    #   2. a real (converted mocap) clip at <project>/reference/jump.npz
-    #      when present (pre-existing behavior, byte-identical).
-    #   3. the analytic procedural jump (final fallback, pre-existing).
-    # Failure at ANY step is non-fatal — RSI is curriculum assistance,
-    # not correctness; the stage trains without it (falls through to the
-    # next-lower-precedence source rather than aborting the stage).
+    # training. Clip resolution (precedence + the D21 fatal-vs-fallback
+    # split) lives in `_resolve_stage_rsi_clip` — see its docstring.
+    # Failure resolving the env-spec ITSELF (not the clip) is non-fatal —
+    # RSI is curriculum assistance, not correctness; the stage trains
+    # without it. A clip resolution `fatal_error`, however, DOES fail the
+    # stage (§D21 Fix 2, below) — an attached-but-unloadable clip must
+    # never silently substitute a different task class.
     if getattr(stage, "needs_reference_rsi", False):
+        stage_env_dir = stage_dir / "env"
+        # Default True (= skip) on a read failure — preserves the
+        # pre-D21 behavior of the whole block degrading to a no-op
+        # rather than risking a duplicate env-spec version stacked on
+        # top of an unreadable-but-possibly-already-applied one.
+        already = True
         try:
             from sculptor.env_spec import read_current_env_spec
-            from sculptor.reference import (
-                apply_reference_rsi,
-                load_clip,
-                make_procedural_jump_clip,
-            )
 
-            stage_env_dir = stage_dir / "env"
             current_spec = read_current_env_spec(stage_env_dir)
             already = (
                 str(((current_spec or {}).get("meta") or {})
                     .get("source", "")).startswith("reference:"))
-            if already:
-                # Resume idempotency: don't stack a new env version per
-                # resume — the reference curriculum is already in force.
-                pass
-            else:
-                clip = None
-                clip_src = None
-                clip_load_error: Optional[str] = None
-                stage_clip_id = getattr(stage, "reference_clip_id", None)
-                if stage_clip_id:
-                    try:
-                        from sculptor.refs import library as refs_library
+        except Exception as e:  # noqa: BLE001 — curriculum, not correctness
+            emit({
+                "type": "stage_reference_rsi_failed",
+                "stage_name": stage.name,
+                "error": f"{type(e).__name__}: {e}",
+            })
+        # Resume idempotency: don't stack a new env version per resume —
+        # the reference curriculum is already in force.
+        if not already:
+            project_root = mission_dir.parent.parent
+            robot = _stage_reference_robot_slug(
+                stage_dir=stage_dir, project_root=project_root)
+            clip, clip_src, fatal_error = _resolve_stage_rsi_clip(
+                stage, robot, project_root=project_root)
 
-                        robot = _stage_reference_robot_slug(
-                            stage_dir=stage_dir, project_root=(
-                                mission_dir.parent.parent))
-                        stage_clip_path = (
-                            refs_library.clip_dir(robot, stage_clip_id)
-                            / refs_library.CLIP_FILENAME)
-                        clip = load_clip(stage_clip_path)
-                        clip_src = f"library:{robot}/{stage_clip_id}"
-                    except Exception as e:  # noqa: BLE001 — fall back below
-                        clip_load_error = f"{type(e).__name__}: {e}"
-                        emit({
-                            "type": "stage_reference_clip_load_failed",
-                            "stage_name": stage.name,
-                            "reference_clip_id": stage_clip_id,
-                            "error": clip_load_error,
-                        })
-                if clip is None:
-                    project_root = mission_dir.parent.parent
-                    clip_path = project_root / "reference" / "jump.npz"
-                    if clip_path.is_file():
-                        clip, clip_src = load_clip(clip_path), str(clip_path)
-                    else:
-                        clip, clip_src = (
-                            make_procedural_jump_clip(), "procedural:jump")
+            # §D21 Fix 2: an ATTACHED clip (`reference_clip_id` set) that
+            # fails to load is FATAL — fail the stage rather than
+            # silently fall through to jump.npz / procedural jump, which
+            # would swap the task class the stage's certified metric was
+            # generated against out from under it (the D20 incident).
+            if fatal_error is not None:
+                emit({
+                    "type": "stage_reference_clip_load_failed",
+                    "stage_name": stage.name,
+                    "reference_clip_id": stage.reference_clip_id,
+                    "error": fatal_error,
+                })
+                return _fail_stage(
+                    stage, "reference_scaffold_failed",
+                    (
+                        f"reference clip {stage.reference_clip_id!r} "
+                        f"attached to this stage failed to load: "
+                        f"{fatal_error}. Refusing to silently fall back "
+                        f"to a different task class (jump RSI) — fix the "
+                        f"clip on disk or detach it from the stage and "
+                        f"re-run."
+                    ),
+                    emit,
+                )
+
+            # §D21 Fix 2: observability for the legacy no-clip-attached
+            # fallback (jump.npz / procedural jump). Behavior is byte-
+            # identical to before — this only discloses which source
+            # fired, for missions that never expected reference RSI to
+            # matter (e.g. a plain jump stage falling back to the
+            # procedural clip).
+            if getattr(stage, "reference_clip_id", None) is None:
+                emit({
+                    "type": "stage_reference_rsi_fallback",
+                    "stage_name": stage.name,
+                    "clip": clip_src,
+                })
+
+            try:
+                from sculptor.reference import apply_reference_rsi
+
                 spec_path = apply_reference_rsi(stage_env_dir, clip)
                 emit({
                     "type": "stage_reference_rsi_applied",
                     "stage_name": stage.name,
                     "clip": clip_src,
                     "env_spec": str(spec_path),
-                    "stage_clip_load_error": clip_load_error,
+                    "stage_clip_load_error": None,
                 })
                 # §D17: stage-FIXED eval-rollout reset override, written
                 # ONCE at scaffold time (same point as the train-only RSI
@@ -4660,12 +4908,12 @@ def _run_one_stage(
                         "stage_name": stage.name,
                         "error": f"{type(e).__name__}: {e}",
                     })
-        except Exception as e:  # noqa: BLE001 — curriculum, not correctness
-            emit({
-                "type": "stage_reference_rsi_failed",
-                "stage_name": stage.name,
-                "error": f"{type(e).__name__}: {e}",
-            })
+            except Exception as e:  # noqa: BLE001 — curriculum, not correctness
+                emit({
+                    "type": "stage_reference_rsi_failed",
+                    "stage_name": stage.name,
+                    "error": f"{type(e).__name__}: {e}",
+                })
 
     # 3. Materialize v1 from the stage's reward_seed_prompt.
     #
@@ -4987,8 +5235,9 @@ def _run_one_stage(
             emit,
         )
     (selected, criterion_ok, selection_source,
-     criterion_error, err_missing_key) = _select_stage_final_iter(
-        all_iters, stage)
+     criterion_error, err_missing_key,
+     start_state_mismatch) = _select_stage_final_iter(
+        all_iters, stage, stage_dir=stage_dir, emit=emit)
     if selected is None:
         return _fail_stage(
             stage, "no_checkpoint",
@@ -5034,6 +5283,25 @@ def _run_one_stage(
         return _fail_stage(
             stage, "criterion_errored", criterion_error, emit,
             criterion_error=criterion_error,
+        )
+
+    # §D21 Fix 3: every criterion-passing iter was rejected by the
+    # mechanical start-state gate (env/eval_reset.json frame-0 mismatch —
+    # D20's "hollow success"). Distinct, NON-redecomposable reason: the
+    # scaffold started from the wrong state, which re-authoring the
+    # criterion or reward can't fix.
+    if not criterion_ok and start_state_mismatch is not None:
+        emit({
+            "type": "stage_criterion_evaluated",
+            "stage_name": stage.name,
+            "criterion": stage.success_criterion,
+            "satisfied": False,
+            "last_iter_metric": selected.primary_metric,
+            "missing_key": False,
+            "start_state_mismatch": True,
+        })
+        return _fail_stage(
+            stage, "start_state_mismatch", start_state_mismatch, emit,
         )
 
     emit({
@@ -5609,6 +5877,23 @@ def _maybe_redecompose_and_splice(
             ),
         })
         return False
+
+    # §D21 Fix 1: make the reference-binding inheritance (decompose.py
+    # `redecompose_stage`) observable in logs — every sub-stage carries
+    # the failed stage's reference_clip_id unconditionally; whether the
+    # forced-RSI override fired depends on the failed stage's own
+    # env/eval_reset.json (§D17), recomputed here the same way
+    # `redecompose_stage` did (best-effort — never fatal post-splice).
+    try:
+        forced_reference_rsi = (stage_dir / "env" / "eval_reset.json").is_file()
+    except Exception:  # noqa: BLE001
+        forced_reference_rsi = False
+    emit({
+        "type": "redecomposition_reference_inherited",
+        "stage_name": failed_stage.name,
+        "reference_clip_id": failed_stage.reference_clip_id,
+        "forced_reference_rsi": bool(forced_reference_rsi),
+    })
 
     emit({
         "type": "stage_redecomposed",

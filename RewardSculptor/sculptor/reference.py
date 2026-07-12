@@ -138,6 +138,13 @@ _GETUP_SUNK_MARGIN_M = 0.05
 # must not put the pelvis inside the floor at reset.
 _G1_CLASS_STAND_M = 0.74
 _MIN_RESET_Z_M = 0.10
+# §D21 Fix 3: public alias — the mechanical start-state gate in
+# sculpt.py (`_evaluate_start_state_gate`) needs this SAME anchor to
+# recompute an eval_reset.json's expected absolute frame-0 root z
+# (`G1_CLASS_STAND_M + reset_height_offset_m`), a module boundary away.
+# Kept as a plain re-export (not a rename) so every existing in-module
+# reference to `_G1_CLASS_STAND_M` stays untouched.
+G1_CLASS_STAND_M = _G1_CLASS_STAND_M
 
 
 # ── Clip format ─────────────────────────────────────────────────────────

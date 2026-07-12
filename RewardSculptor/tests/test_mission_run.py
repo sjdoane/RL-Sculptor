@@ -3321,14 +3321,16 @@ def test_stage_eval_reset_written_for_getup_stage(
                 if e["type"] == "stage_eval_reset_written"]
 
 
-def test_stage_reference_clip_load_failure_falls_back_to_project_jump(
+def test_stage_reference_clip_load_failure_fails_stage(
     tmp_path: Path, monkeypatch, stub_adapter,
 ):
-    """A `reference_clip_id` that fails to load (missing from the
-    library on disk) must fall back to the next-lower-precedence
-    source — the project-local jump.npz — rather than aborting the
-    stage's RSI curriculum entirely. A `stage_reference_clip_load_failed`
-    event discloses the failure."""
+    """§D21 Fix 2 (post-mortem D20): a `reference_clip_id` that fails to
+    load (missing from the library on disk) must FAIL THE STAGE with
+    reason `reference_scaffold_failed` — NOT silently fall back to the
+    project-local jump.npz. Pre-D21 this silently swapped the task class
+    (a get-up mission scaffolding jump RSI) when the attached clip failed
+    to load; a `stage_reference_clip_load_failed` event still discloses
+    the underlying load error before the stage fails."""
     from sculptor import sculpt as sculpt_mod
 
     lib_root = tmp_path / "reflib_empty"
@@ -3338,7 +3340,10 @@ def test_stage_reference_clip_load_failure_falls_back_to_project_jump(
     m = _make_mission(tmp_path, n_stages=1)
     m.stages[0].needs_reference_rsi = True
     m.stages[0].reference_clip_id = "does_not_exist_clip"
+    m.stages[0].redecomposition_attempts = 1  # halt, don't redecompose
 
+    # A project-local jump.npz is present — proving it is NOT used as a
+    # fallback anymore (that would silently swap the task class).
     project_root = Path(m.mission_dir).parent.parent
     from sculptor.reference import make_procedural_jump_clip, save_clip
     save_clip(project_root / "reference" / "jump.npz",
@@ -3354,18 +3359,76 @@ def test_stage_reference_clip_load_failure_falls_back_to_project_jump(
     result = sculpt_mod.mission_run(
         m, adapter_short_name="mjlab", kg_store=None, on_event=events.append,
     )
-    assert result.completed is True
+    assert result.completed is False
+    assert result.halted_reason == "reference_scaffold_failed"
+
     load_fail_events = [
         e for e in events if e["type"] == "stage_reference_clip_load_failed"]
     assert len(load_fail_events) == 1
     assert load_fail_events[0]["reference_clip_id"] == "does_not_exist_clip"
 
+    failed_events = [e for e in events if e["type"] == "stage_failed"]
+    assert len(failed_events) == 1
+    assert failed_events[0]["reason"] == "reference_scaffold_failed"
+    assert "does_not_exist_clip" in failed_events[0]["detail"]
+
+    # Never applied ANY RSI curriculum — the jump.npz fallback did NOT fire.
+    assert not [e for e in events if e["type"] == "stage_reference_rsi_applied"]
+    assert not [e for e in events if e["type"] == "stage_reference_rsi_fallback"]
+
+    # `reference_scaffold_failed` must never be treated as a curriculum
+    # mismatch re-decomposition could fix — assert it's excluded from the
+    # redecomposable set (independent of the redecomposition_attempts=1
+    # guard set above; this is the actual reason-classification contract).
+    assert "reference_scaffold_failed" not in sculpt_mod._REDECOMPOSABLE_REASONS
+
+
+def test_stage_reference_clip_id_none_emits_fallback_event(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """§D21 Fix 2 observability: a stage with NO `reference_clip_id`
+    attached still falls back to the project jump.npz / procedural jump
+    clip byte-identically — but now discloses which source fired via
+    `stage_reference_rsi_fallback`."""
+    from sculptor import sculpt as sculpt_mod
+
+    m = _make_mission(tmp_path, n_stages=1)
+    m.stages[0].needs_reference_rsi = True
+    assert m.stages[0].reference_clip_id is None
+
+    # `project_root` here is `mission_dir.parent.parent` — pytest's
+    # per-RUN `tmp_path` base, shared across every test in this module
+    # (NOT unique per test function). A sibling test may have already
+    # written a `reference/jump.npz` there; scrub it so this test
+    # deterministically exercises the "no clip attached at all" path
+    # (procedural jump), regardless of test execution order.
+    project_root = Path(m.mission_dir).parent.parent
+    stray_jump_npz = project_root / "reference" / "jump.npz"
+    if stray_jump_npz.exists():
+        stray_jump_npz.unlink()
+
+    fake = _fake_sculpt_run_factory(metric=0.9)
+    monkeypatch.setattr(sculpt_mod, "sculpt_run", fake)
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
+    )
+
+    events: list[dict] = []
+    result = sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab", kg_store=None, on_event=events.append,
+    )
+    assert result.completed is True
+
+    fallback_events = [
+        e for e in events if e["type"] == "stage_reference_rsi_fallback"]
+    assert len(fallback_events) == 1
+    assert fallback_events[0]["clip"] == "procedural:jump"
+
     rsi_events = [e for e in events
                   if e["type"] == "stage_reference_rsi_applied"]
     assert len(rsi_events) == 1
-    # Fell back to the project jump.npz path (its str(Path) form).
-    assert rsi_events[0]["clip"].endswith("jump.npz")
-    assert rsi_events[0]["stage_clip_load_error"] is not None
+    assert rsi_events[0]["clip"] == "procedural:jump"
+    assert rsi_events[0]["stage_clip_load_error"] is None
 
 
 def test_stage_reference_rsi_roundtrips_mission_json(tmp_path: Path):
@@ -3576,6 +3639,292 @@ def test_redecompose_rsi_flag_per_substage_not_force_inherited(
     assert sub_stages[1].needs_reference_rsi is True
 
 
+# ── §D21 Fix 1: redecompose inherits the reference binding ─────────────────
+def test_redecompose_inherits_reference_binding_and_forces_rsi_with_eval_reset(
+    tmp_path: Path, monkeypatch,
+):
+    """§D21 Fix 1 (post-mortem D20): every sub-stage UNCONDITIONALLY
+    inherits the failed stage's reference_clip_id/tier/match_confidence.
+    When the failed stage's on-disk dir carries `env/eval_reset.json`
+    (§D17 — a non-standing eval start means the start state IS the
+    task), `needs_reference_rsi` is FORCED True on every sub-stage,
+    overriding the LLM's per-sub-stage choice (both sub-stages below ask
+    for False and must come back True)."""
+    from sculptor import decompose as dc
+    from sculptor.decompose import (
+        StageTrainingFeedback,
+        _RedecompositionModel,
+        _StageModel,
+    )
+
+    m = _make_mission(tmp_path, n_stages=1)
+    failed = m.stages[0]
+    failed.needs_reference_rsi = True
+    failed.success_criterion = "metric > 0.5"
+    failed.reference_clip_id = "fallandgetup1_subject1--seg00"
+    failed.reference_tier = "K"
+    failed.reference_match_confidence = 0.87
+
+    # The failed stage's on-disk dir carries a stage-fixed eval reset.
+    stage_dir = m.stage_dir(failed.name)
+    env_dir = stage_dir / "env"
+    env_dir.mkdir(parents=True, exist_ok=True)
+    (env_dir / "eval_reset.json").write_text(json.dumps({
+        "reset_height_offset_m": -0.5929,
+        "reset_pitch_offset_rad": 0.636,
+        "reset_roll_offset_rad": 1.4228,
+        "reset_vertical_velocity_mps": 0.0,
+        "fell_over_termination": False,
+    }))
+
+    response = _RedecompositionModel(
+        decomposition_rationale="split get-up into phases",
+        stages=[
+            _StageModel(
+                name=f"{failed.name}__r1_0",
+                goal_text="phase 0: roll to prone",
+                success_criterion="metric > 0.0",
+                max_iterations=2,
+                parent_stage=None,
+                reward_seed_prompt="phase 0 reward",
+                kg_seed_papers=[],
+                needs_reference_rsi=False,  # LLM says False — must be FORCED True
+            ),
+            _StageModel(
+                name=f"{failed.name}__r1_1",
+                goal_text="phase 1: push up to standing",
+                success_criterion="metric > 0.5",  # byte-equal to parent
+                max_iterations=3,
+                parent_stage=f"{failed.name}__r1_0",
+                reward_seed_prompt="phase 1 reward",
+                kg_seed_papers=[],
+                needs_reference_rsi=False,  # also FORCED True
+            ),
+        ],
+    )
+
+    def fake_parse(client, system_prompt, user_content, *,
+                   output_format=None, model=None, max_tokens=None):
+        return response
+
+    monkeypatch.setattr(dc, "_parse_with_retry", fake_parse)
+
+    feedback = StageTrainingFeedback(
+        final_reward_source="def compute_reward(s,a,n,i): return 0.0, {}\n",
+        last_iter_diagnosis={},
+        last_iter_namespace={"behavior": {}, "components": {}, "metric": 0.3},
+        metric_history=[0.3],
+        last_3_iter_components=[{}],
+        failure_reason="criterion_not_met",
+    )
+
+    sub_stages = dc.redecompose_stage(
+        m, 0, feedback=feedback, reward_contract=_FakeContract(),
+        kg_store=None, client=object(),
+    )
+
+    assert len(sub_stages) == 2
+    for sub in sub_stages:
+        assert sub.reference_clip_id == "fallandgetup1_subject1--seg00"
+        assert sub.reference_tier == "K"
+        assert sub.reference_match_confidence == pytest.approx(0.87)
+        assert sub.needs_reference_rsi is True, (
+            f"{sub.name}: eval_reset.json on the failed stage means the "
+            "start state IS the task — every sub-stage must scaffold "
+            "with reference RSI, overriding the LLM's per-sub-stage False"
+        )
+
+
+def test_redecompose_inherits_reference_binding_without_forcing_rsi(
+    tmp_path: Path, monkeypatch,
+):
+    """§D21 Fix 1: the reference binding inherits unconditionally EVEN
+    WHEN there is no `env/eval_reset.json` (the classic airborne/jump
+    decomposition case) — but `needs_reference_rsi` still follows the
+    LLM's per-sub-stage choice, unforced (mirrors
+    test_redecompose_rsi_flag_per_substage_not_force_inherited, plus the
+    reference-field inheritance assertions)."""
+    from sculptor import decompose as dc
+    from sculptor.decompose import (
+        StageTrainingFeedback,
+        _RedecompositionModel,
+        _StageModel,
+    )
+
+    m = _make_mission(tmp_path, n_stages=1)
+    failed = m.stages[0]
+    failed.needs_reference_rsi = True
+    failed.success_criterion = "metric > 0.5"
+    failed.reference_clip_id = "some_jump_clip"
+    failed.reference_tier = "B"
+    failed.reference_match_confidence = 0.6
+    # No env/eval_reset.json written — mission.stage_dir(failed.name)
+    # resolves fine, but the file itself is absent.
+
+    response = _RedecompositionModel(
+        decomposition_rationale="split airborne into grounded load + launch",
+        stages=[
+            _StageModel(
+                name=f"{failed.name}__r1_0",
+                goal_text="grounded crouch load from the default stance",
+                success_criterion="metric > 0.0",
+                max_iterations=2,
+                parent_stage=None,
+                reward_seed_prompt="grounded precursor: crouch only, no launch",
+                kg_seed_papers=[],
+                needs_reference_rsi=False,   # grounded — LLM keeps it False
+            ),
+            _StageModel(
+                name=f"{failed.name}__r1_1",
+                goal_text="explosive launch into flight",
+                success_criterion="metric > 0.5",  # byte-equal to parent
+                max_iterations=3,
+                parent_stage=f"{failed.name}__r1_0",
+                reward_seed_prompt="airborne launch phase",
+                kg_seed_papers=[],
+                needs_reference_rsi=True,    # airborne — LLM sets it True
+            ),
+        ],
+    )
+
+    def fake_parse(client, system_prompt, user_content, *,
+                   output_format=None, model=None, max_tokens=None):
+        return response
+
+    monkeypatch.setattr(dc, "_parse_with_retry", fake_parse)
+
+    feedback = StageTrainingFeedback(
+        final_reward_source="def compute_reward(s,a,n,i): return 0.0, {}\n",
+        last_iter_diagnosis={},
+        last_iter_namespace={"behavior": {}, "components": {}, "metric": 0.3},
+        metric_history=[0.3],
+        last_3_iter_components=[{}],
+        failure_reason="criterion_not_met",
+    )
+
+    sub_stages = dc.redecompose_stage(
+        m, 0, feedback=feedback, reward_contract=_FakeContract(),
+        kg_store=None, client=object(),
+    )
+
+    assert len(sub_stages) == 2
+    assert sub_stages[0].needs_reference_rsi is False, (
+        "no eval_reset.json — the LLM's per-sub-stage flag must be "
+        "respected, not forced"
+    )
+    assert sub_stages[1].needs_reference_rsi is True
+    for sub in sub_stages:
+        assert sub.reference_clip_id == "some_jump_clip"
+        assert sub.reference_tier == "B"
+        assert sub.reference_match_confidence == pytest.approx(0.6)
+
+
+def test_redecompose_reference_dir_lookup_degrades_gracefully(
+    tmp_path: Path, monkeypatch,
+):
+    """§D21 Fix 1: if `mission.stage_dir(...)` can't be resolved (mission
+    never saved, `mission_dir` is None), the eval_reset.json probe must
+    degrade to "don't force" rather than crash the redecomposition."""
+    from sculptor import decompose as dc
+    from sculptor.decompose import StageTrainingFeedback
+    from sculptor.mission import Mission, Stage
+
+    failed = Stage(
+        name="stage_0", goal_text="do it", success_criterion="metric > 0.5",
+        max_iterations=2, parent_stage=None, reward_seed_prompt="seed",
+    )
+    m = Mission(
+        goal="test", stages=[failed],
+        decomposition_model="claude-opus-4-7", decomposition_rationale="test",
+    )
+    assert m.mission_dir is None  # never saved — stage_dir() will raise
+
+    response = _make_redecompose_response("stage_0", n_sub=2)
+
+    def fake_parse(client, system_prompt, user_content, *,
+                   output_format=None, model=None, max_tokens=None):
+        return response
+
+    monkeypatch.setattr(dc, "_parse_with_retry", fake_parse)
+
+    feedback = StageTrainingFeedback(
+        final_reward_source="def compute_reward(s,a,n,i): return 0.0, {}\n",
+        last_iter_diagnosis={},
+        last_iter_namespace={"behavior": {}, "components": {}, "metric": 0.3},
+        metric_history=[0.3],
+        last_3_iter_components=[{}],
+        failure_reason="criterion_not_met",
+    )
+
+    # Must not raise despite mission.stage_dir() being unresolvable.
+    sub_stages = dc.redecompose_stage(
+        m, 0, feedback=feedback, reward_contract=_FakeContract(),
+        kg_store=None, client=object(),
+    )
+    assert len(sub_stages) == 2
+    # No binding to inherit (failed stage had none) and no force (lookup
+    # failed) — sub-stages keep the canned response's own False default.
+    for sub in sub_stages:
+        assert sub.reference_clip_id is None
+        assert sub.needs_reference_rsi is False
+
+
+def test_redecomposition_reference_inherited_event(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """§D21 Fix 1: `_maybe_redecompose_and_splice` emits
+    `redecomposition_reference_inherited` once per successful
+    redecomposition, carrying the inherited clip id and whether the
+    forced-RSI override fired."""
+    from sculptor import sculpt as sculpt_mod
+
+    m = _make_mission(tmp_path, n_stages=1)
+    m.stages[0].reference_clip_id = "fallandgetup1_subject1--seg00"
+    m.stages[0].reference_tier = "K"
+    # Failed stage's dir carries eval_reset.json → forced_reference_rsi True.
+    stage_dir = m.stage_dir("stage_0")
+    env_dir = stage_dir / "env"
+    env_dir.mkdir(parents=True, exist_ok=True)
+    (env_dir / "eval_reset.json").write_text(json.dumps({
+        "reset_height_offset_m": -0.5929,
+    }))
+
+    call_count = {"n": 0}
+
+    def run(**kw):
+        call_count["n"] += 1
+        return _fake_sculpt_run_factory(
+            metric=0.3 if call_count["n"] == 1 else 0.9,
+        )(**kw)
+
+    monkeypatch.setattr(sculpt_mod, "sculpt_run", run)
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
+    )
+    _stub_claude_redecompose(
+        monkeypatch, _make_redecompose_response("stage_0", n_sub=2),
+    )
+
+    events: list[dict] = []
+    sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab", on_event=events.append,
+    )
+
+    inherited = [
+        e for e in events if e.get("type") == "redecomposition_reference_inherited"]
+    assert len(inherited) == 1
+    assert inherited[0]["stage_name"] == "stage_0"
+    assert inherited[0]["reference_clip_id"] == "fallandgetup1_subject1--seg00"
+    assert inherited[0]["forced_reference_rsi"] is True
+
+    # And the spliced sub-stages actually carry the binding + forced flag.
+    sub_stages = [s for s in m.stages if "__r1_" in s.name]
+    assert len(sub_stages) == 2
+    for sub in sub_stages:
+        assert sub.reference_clip_id == "fallandgetup1_subject1--seg00"
+        assert sub.needs_reference_rsi is True
+
+
 # ── §keep-best finalization (B1): the crown-jewel regression lock ──────────
 def test_keep_best_selects_passing_iter_over_late_regression(
     tmp_path: Path, monkeypatch, stub_adapter,
@@ -3710,3 +4059,280 @@ def test_mission_run_auto_archives(tmp_path, monkeypatch, stub_adapter):
     assert entries, "expected a durable archive entry after the mission"
     assert any(e["type"] in ("mission_archived", "mission_stage_archived")
                for e in events)
+
+
+# ── §D21 Fix 3: mechanical start-state gate ─────────────────────────────
+def _write_eval_reset(stage_dir: Path, **overrides) -> None:
+    """The real drive_to_stand fixture values (D21 spec's sanity
+    numbers): offset -0.5929, pitch 0.636, roll 1.4228 → expected root
+    z ≈ 0.147, expected projected-gravity z ≈ -0.119 (G1_CLASS_STAND_M
+    0.74 - 0.5929)."""
+    payload = {
+        "reset_height_offset_m": -0.5929,
+        "reset_pitch_offset_rad": 0.636,
+        "reset_roll_offset_rad": 1.4228,
+        "reset_vertical_velocity_mps": 0.0,
+        "fell_over_termination": False,
+    }
+    payload.update(overrides)
+    env_dir = stage_dir / "env"
+    env_dir.mkdir(parents=True, exist_ok=True)
+    (env_dir / "eval_reset.json").write_text(json.dumps(payload))
+
+
+def _make_pose_trajectory(
+    z0: float, pg_z0: float, n_steps: int = 3, n_envs: int = 2,
+) -> dict:
+    """A minimal (T, E, 3) root_link_pos_w / projected_gravity_b pair
+    with a fixed frame-0 z / projected-gravity-z (constant across the
+    rest of the rollout — irrelevant to the gate, which only reads
+    frame 0)."""
+    root = np.zeros((n_steps, n_envs, 3), dtype=np.float32)
+    root[:, :, 2] = z0
+    pg = np.zeros((n_steps, n_envs, 3), dtype=np.float32)
+    pg[:, :, 2] = pg_z0
+    return {"root_link_pos_w": root, "projected_gravity_b": pg}
+
+
+def _single_iter_sculpt_run(
+    *, z0: float, pg_z0: float, mean_return: float = 0.9, fitness: float = 5.0,
+):
+    """Build a `sculpt_run` stand-in that produces exactly one
+    checkpointed iteration whose rollout has the given frame-0 pose."""
+    from sculptor.sculpt import IterOutcome, SculptRunResult
+
+    def fake(*, config_path, behavior_goal, iterations=3, **_kw):
+        project = Path(config_path).parent
+        iter_dir = project / "runs" / "iter_1"
+        iter_dir.mkdir(parents=True, exist_ok=True)
+        (iter_dir / "checkpoint.pt").write_bytes(b"fake-ckpt")
+        _fabricate_rollout_artifacts(
+            iter_dir,
+            behavior={
+                "n_episodes": 1, "mean_return": mean_return,
+                "mean_episode_length": 400.0, "max_episode_length": 500,
+            },
+            trajectory=_make_pose_trajectory(z0=z0, pg_z0=pg_z0),
+        )
+        outcome = IterOutcome(
+            iter_index=1, iter_dir=iter_dir,
+            reward_path_before=project / "rewards" / "v1.py",
+            reward_path_after=project / "rewards" / "v2.py",
+            primary_metric=mean_return, behavior={"mean_return": mean_return},
+            failure_modes=[], edit_count=0, fitness=fitness, steer_fitness=fitness,
+        )
+        return SculptRunResult(
+            iterations_run=1, completed_iters=[outcome],
+            primary_metric_history=[mean_return],
+        )
+    return fake
+
+
+def test_start_state_gate_passes_matching_frame0(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """§D21 Fix 3: a rollout whose frame-0 state matches the stage's
+    fixed eval reset within tolerance passes the gate — criterion
+    selection proceeds exactly as it would without the gate. Uses the
+    real drive_to_stand measured range (z 0.176-0.188, pg_z -0.087..
+    -0.137) against the real expected values (z≈0.147, pg_z≈-0.119)."""
+    from sculptor import sculpt as sculpt_mod
+
+    m = _make_mission(tmp_path, n_stages=1)
+    m.stages[0].success_criterion = "behavior['mean_return'] > 0.8"
+    _write_eval_reset(m.stage_dir("stage_0"))
+
+    monkeypatch.setattr(
+        sculpt_mod, "sculpt_run",
+        _single_iter_sculpt_run(z0=0.18, pg_z0=-0.10),
+    )
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit)
+
+    events: list[dict] = []
+    result = sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab", on_event=events.append)
+
+    sr = result.stage_results[0]
+    assert sr.status == "succeeded"
+    assert sr.criterion_satisfied is True
+
+    gate_events = [e for e in events if e["type"] == "stage_start_state_gate"]
+    assert len(gate_events) == 1
+    assert gate_events[0]["checked"] == 1
+    assert gate_events[0]["mismatched"] == 0
+    assert gate_events[0]["skipped"] is False
+    assert gate_events[0]["expected_z"] == pytest.approx(0.1471, abs=1e-3)
+    assert gate_events[0]["expected_pg_z"] == pytest.approx(-0.1188, abs=1e-3)
+
+
+def test_start_state_gate_rejects_standing_rollout(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """§D21 Fix 3 / the D20 defect itself: a rollout that STARTS
+    STANDING (root_h ≈ 0.79, pg_z ≈ -1.0 — the exact numbers from the
+    D20 post-mortem's bogus r1 sub-stages) trivially satisfies a
+    start-state-blind criterion. The gate must reject it: the stage
+    fails with the distinct, NON-redecomposable `start_state_mismatch`
+    reason, not a plain `criterion_not_met` — and re-decomposition must
+    NEVER be attempted for it (asserted by making a redecompose call an
+    AssertionError, mirroring test_redecompose_does_not_fire_for_infra_
+    failures)."""
+    from sculptor import sculpt as sculpt_mod
+
+    m = _make_mission(tmp_path, n_stages=1)
+    m.stages[0].success_criterion = "behavior['mean_return'] > 0.8"
+    _write_eval_reset(m.stage_dir("stage_0"))
+
+    monkeypatch.setattr(
+        sculpt_mod, "sculpt_run",
+        _single_iter_sculpt_run(z0=0.79, pg_z0=-1.0),
+    )
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit)
+
+    def fake_parse(*a, **kw):
+        raise AssertionError(
+            "redecompose_stage must NOT fire for start_state_mismatch"
+        )
+    import sculptor.decompose as dmod
+    monkeypatch.setattr(dmod, "_parse_with_retry", fake_parse)
+
+    events: list[dict] = []
+    result = sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab", on_event=events.append)
+
+    sr = result.stage_results[0]
+    assert sr.status == "failed"
+    assert sr.failure_reason == "start_state_mismatch"
+    assert sr.criterion_satisfied is False
+
+    gate_events = [e for e in events if e["type"] == "stage_start_state_gate"]
+    assert len(gate_events) == 1
+    assert gate_events[0]["checked"] == 1
+    assert gate_events[0]["mismatched"] == 1
+    assert gate_events[0]["skipped"] is False
+
+    failed_events = [e for e in events if e["type"] == "stage_failed"]
+    assert len(failed_events) == 1
+    assert failed_events[0]["reason"] == "start_state_mismatch"
+    assert failed_events[0]["detail"]  # actionable, non-empty detail
+
+    skipped = [
+        e for e in events
+        if e.get("type") == "redecomposition_skipped"
+        and e.get("reason") == "non_curriculum_failure"
+    ]
+    assert len(skipped) == 1
+    assert "start_state_mismatch" not in sculpt_mod._REDECOMPOSABLE_REASONS
+
+
+def test_start_state_gate_noop_when_eval_reset_absent(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """§D21 Fix 3: with no `env/eval_reset.json`, the gate is a pure
+    no-op — a standing-start rollout satisfies the criterion exactly as
+    it would have pre-D21 (byte-identical legacy behavior for stages
+    that never got a stage-fixed eval reset, e.g. plain jump stages).
+    The gate event still fires (observability), flagged `skipped`."""
+    from sculptor import sculpt as sculpt_mod
+
+    m = _make_mission(tmp_path, n_stages=1)
+    m.stages[0].success_criterion = "behavior['mean_return'] > 0.8"
+    # No env/eval_reset.json written.
+
+    monkeypatch.setattr(
+        sculpt_mod, "sculpt_run",
+        _single_iter_sculpt_run(z0=0.79, pg_z0=-1.0),  # would mismatch IF gated
+    )
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit)
+
+    events: list[dict] = []
+    result = sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab", on_event=events.append)
+
+    sr = result.stage_results[0]
+    assert sr.status == "succeeded"
+    assert sr.criterion_satisfied is True
+
+    gate_events = [e for e in events if e["type"] == "stage_start_state_gate"]
+    assert len(gate_events) == 1
+    assert gate_events[0]["skipped"] is True
+    assert gate_events[0]["expected_z"] is None
+    assert gate_events[0]["expected_pg_z"] is None
+
+
+def test_evaluate_start_state_gate_corrupt_json_is_noop(tmp_path: Path):
+    """§D21 Fix 3 unit test: a corrupt/unparseable eval_reset.json never
+    crashes the gate — it degrades to `skipped=True`, `checked=0`."""
+    from sculptor.sculpt import IterOutcome, _evaluate_start_state_gate
+
+    stage_dir = tmp_path / "stage"
+    env_dir = stage_dir / "env"
+    env_dir.mkdir(parents=True)
+    (env_dir / "eval_reset.json").write_text("{not valid json")
+
+    iter_dir = stage_dir / "runs" / "iter_1"
+    iter_dir.mkdir(parents=True)
+    (iter_dir / "checkpoint.pt").write_bytes(b"x")
+    outcome = IterOutcome(
+        iter_index=1, iter_dir=iter_dir,
+        reward_path_before=stage_dir / "rewards" / "v1.py",
+        reward_path_after=None, primary_metric=0.9, behavior={},
+        failure_modes=[], edit_count=0,
+    )
+
+    result = _evaluate_start_state_gate([outcome], stage_dir)
+    assert result["skipped"] is True
+    assert result["checked"] == 0
+    assert result["expected_z"] is None
+    assert result["expected_pg_z"] is None
+
+
+def test_evaluate_start_state_gate_missing_trajectory_is_noop(tmp_path: Path):
+    """§D21 Fix 3 unit test: eval_reset.json parses fine but the
+    candidate iter has no trajectory.npz (or missing keys) at all — the
+    gate never crashes; that iter is simply excluded from `checked`."""
+    from sculptor.sculpt import IterOutcome, _evaluate_start_state_gate
+
+    stage_dir = tmp_path / "stage"
+    env_dir = stage_dir / "env"
+    env_dir.mkdir(parents=True)
+    (env_dir / "eval_reset.json").write_text(json.dumps({
+        "reset_height_offset_m": -0.5929,
+        "reset_pitch_offset_rad": 0.636,
+        "reset_roll_offset_rad": 1.4228,
+    }))
+
+    iter_dir = stage_dir / "runs" / "iter_1"
+    (iter_dir / "rollout").mkdir(parents=True)
+    (iter_dir / "checkpoint.pt").write_bytes(b"x")
+    (iter_dir / "rollout" / "behavior.json").write_text(json.dumps({
+        "n_episodes": 1, "mean_return": 0.9,
+        "mean_episode_length": 1.0, "max_episode_length": 1,
+    }))
+    # No trajectory.npz written at all.
+    outcome = IterOutcome(
+        iter_index=1, iter_dir=iter_dir,
+        reward_path_before=stage_dir / "rewards" / "v1.py",
+        reward_path_after=None, primary_metric=0.9, behavior={},
+        failure_modes=[], edit_count=0,
+    )
+
+    result = _evaluate_start_state_gate([outcome], stage_dir)
+    assert result["skipped"] is False       # eval_reset.json parsed fine
+    assert result["checked"] == 0           # but no usable trajectory data
+    assert result["mismatched_count"] == 0
+    assert result["expected_z"] is not None  # still computed from the file
+
+
+def test_new_d21_failure_reasons_not_redecomposable():
+    """§D21 Fixes 2+3: both new failure reasons signal a scaffold/start-
+    state defect, not a curriculum mismatch — re-decomposition (re-
+    authoring criteria/rewards) can't fix either, so neither may ever be
+    added to `_REDECOMPOSABLE_REASONS`."""
+    from sculptor import sculpt as sculpt_mod
+
+    assert "reference_scaffold_failed" not in sculpt_mod._REDECOMPOSABLE_REASONS
+    assert "start_state_mismatch" not in sculpt_mod._REDECOMPOSABLE_REASONS

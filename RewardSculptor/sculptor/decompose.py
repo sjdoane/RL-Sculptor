@@ -1032,11 +1032,53 @@ def redecompose_stage(
       * Last sub-stage's `success_criterion == failed.success_criterion`
         (byte-equal after `.strip()`).
 
+    §D21 Fix 1 (post-mortem D20, docs/internal/REFERENCE_BUILD_LOG.md):
+    every sub-stage UNCONDITIONALLY inherits the failed stage's
+    `reference_clip_id`/`reference_tier`/`reference_match_confidence` —
+    the sub-stages are phases of the SAME motion the failed stage was
+    attempting, and the clip is also what stage-metric generation reads.
+    Pre-D21, `redecompose_stage` dropped the binding entirely (no
+    retrieval pass, unlike `decompose_task`), so a sub-stage with
+    `needs_reference_rsi=True` and no clip fell through the scaffold's
+    precedence chain to the WRONG task class (procedural jump RSI on a
+    get-up mission — the D20 incident).
+
+    Additionally: when the failed stage's on-disk stage dir contains
+    `env/eval_reset.json` (§D17 — a non-standing eval start means THE
+    START STATE IS THE TASK), every sub-stage's `needs_reference_rsi` is
+    FORCED to True, overriding the LLM's per-sub-stage choice — a
+    get-up sub-stage that scaffolds without RSI silently reverts to the
+    default standing reset, which is exactly the defect this fix closes.
+    The stage-dir lookup degrades gracefully (no force, no crash) if
+    `mission.stage_dir` raises or the dir doesn't exist. When NO
+    eval_reset.json exists, the LLM decides each sub-stage's flag as
+    before (see the comment on the `needs_reference_rsi=` line below —
+    that rule exists for jump decompositions, where a redecomposition
+    typically splits ONE airborne stage into a grounded precursor plus a
+    later airborne sub-stage, and a blanket force would deny the
+    grounded precursor's correctly-False flag).
+
     Raises `MissionValidationError` on any violation. Caller halts the
     mission on failure (do NOT retry Claude — same envelope as
     `decompose_task`).
     """
     failed_stage: Stage = mission.stages[failed_stage_idx]
+
+    # §D21 Fix 1: does the failed stage have a stage-FIXED eval reset
+    # (§D17 get-up archetype)? If so, the start state IS the task, and
+    # every sub-stage MUST scaffold with reference RSI regardless of
+    # what the redecompose LLM chose per sub-stage. Best-effort: any
+    # failure resolving the stage dir (mission_dir unset, dir missing,
+    # ...) just leaves this False — the LLM's per-sub-stage choice wins,
+    # same as today.
+    force_reference_rsi = False
+    try:
+        _failed_stage_dir = mission.stage_dir(failed_stage.name)
+        force_reference_rsi = (
+            _failed_stage_dir / "env" / "eval_reset.json"
+        ).is_file()
+    except Exception:  # noqa: BLE001 — degrade gracefully, never crash
+        force_reference_rsi = False
 
     if client is None:
         import anthropic
@@ -1150,8 +1192,22 @@ def redecompose_stage(
             # doesn't need) plus a later airborne sub-stage (RSI true); a
             # blanket `or failed_stage.needs_reference_rsi` denied the
             # grounded precursors that gain.
-            needs_reference_rsi=bool(
-                getattr(model_stage, "needs_reference_rsi", False)),
+            #
+            # §D21 Fix 1: EXCEPT when the failed stage had a stage-fixed
+            # eval reset (§D17 — the lying/low start IS the task, not
+            # curriculum). In that case every sub-stage MUST scaffold
+            # with reference RSI or it silently reverts to a standing
+            # default reset (the D20 incident) — override the LLM here.
+            needs_reference_rsi=(
+                True if force_reference_rsi else bool(
+                    getattr(model_stage, "needs_reference_rsi", False))
+            ),
+            # §D21 Fix 1: unconditional inheritance — sub-stages are
+            # phases of the SAME motion the failed stage was attempting,
+            # and stage-metric generation reads this same clip.
+            reference_clip_id=failed_stage.reference_clip_id,
+            reference_tier=failed_stage.reference_tier,
+            reference_match_confidence=failed_stage.reference_match_confidence,
             redecomposition_attempts=1,  # bound at one level
         ))
 
