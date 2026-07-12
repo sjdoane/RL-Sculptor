@@ -361,3 +361,19 @@ def test_select_reference_span_deterministic(satup_clip):
         satup_clip, goal_text="right the torso to a seated position", llm_call=call)
     assert span_a == span_b
     assert reason_a == reason_b
+
+
+def test_select_reference_span_empty_response_is_infra_not_semantic():
+    """Live finding: fable-5 exhausted a 1024-token budget entirely on its
+    thinking block and returned zero text blocks — the reason must be the
+    diagnosable 'empty_response' (retryable infra), never a semantic
+    decline that would persist a 'declined:' marker."""
+    from sculptor.reference import load_clip
+    from sculptor.refs.spans import is_semantic_decline, select_reference_span
+
+    clip = load_clip(FIXTURE_CLIP)
+    span, reason = select_reference_span(
+        clip, goal_text="right the torso to sitting", llm_call=lambda p: "")
+    assert span is None
+    assert reason.startswith("empty_response:")
+    assert is_semantic_decline(reason) is False

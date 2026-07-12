@@ -78,7 +78,11 @@ from sculptor.llm import log_llm_call, model_for, response_text_blocks
 logger = logging.getLogger(__name__)
 
 MODEL_ID = model_for("span_select")
-_MAX_TOKENS = 1024
+# 1024 was exhausted ENTIRELY by fable-5's thinking block on the first live
+# call (usage showed output_tokens == 1024 with zero text emitted -> empty
+# response -> parse_error). Sized like the other reasoning-role calls
+# (retrieve 2048, decompose 8000): thinking + the small JSON both fit.
+_MAX_TOKENS = 4096
 
 #: Below this LLM-reported confidence, a proposed span is discarded (the
 #: caller falls back to the full clip) — same "don't trust a shaky call"
@@ -577,6 +581,15 @@ def select_reference_span(
     except Exception as e:  # noqa: BLE001 — LLM layer must never raise out
         logger.info("select_reference_span: llm_unavailable: %s", e)
         return None, f"llm_unavailable:{type(e).__name__}: {e}"
+
+    if not (raw or "").strip():
+        # Distinct from parse_error: an empty response is an INFRA symptom
+        # (seen live on the first span_select call — max_tokens exhausted
+        # by the thinking block before any text block was emitted), so it
+        # must stay retryable (no declined marker) and diagnosable at a
+        # glance instead of surfacing as a cryptic JSONDecodeError.
+        logger.info("select_reference_span: empty_response")
+        return None, "empty_response:llm returned no text blocks"
 
     try:
         parsed = _parse_span_response(raw)
