@@ -1,0 +1,9 @@
+{
+  "n_episodes": 6,
+  "mean_return": 25.94629700978597,
+  "mean_episode_length": 500.0,
+  "max_episode_length": 500,
+  "step_dt": 0.02,
+  "max_episode_steps": 500,
+  "rollout_num_envs": 64
+}

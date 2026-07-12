@@ -1,0 +1,818 @@
+{
+  "accepted": true,
+  "validation_passed": true,
+  "metric_path": "/home/samjd/.local/share/reward-sculptor/projects/g1-standing/.missions/starting-from-lying-flat-on-its/stage_metrics/torso_righting/metric.py",
+  "source": "import numpy as np\n\n# We aggregate over ALL joints (no specific column is indexed), so no specific\n# roles are required.  Frame checks that need unavailable signals ABSTAIN.\nREQUIRED_JOINT_ROLES = []\n\n\ndef _roll_mean_t(x, k):\n    \"\"\"Edge-padded rolling mean along axis 0 for (T, ...) arrays. No zero-padding.\"\"\"\n    k = int(max(1, k))\n    if x.shape[0] < 1:\n        return x\n    if k == 1:\n        return x.copy()\n    pad_lo = k // 2\n    pad_hi = k - 1 - pad_lo\n    pad_width = [(pad_lo, pad_hi)] + [(0, 0)] * (x.ndim - 1)\n    xp = np.pad(x, pad_width, mode=\"edge\")\n    c = np.cumsum(xp, axis=0, dtype=np.float64)\n    zero = np.zeros((1,) + xp.shape[1:], dtype=np.float64)\n    c = np.concatenate([zero, c], axis=0)\n    out = (c[k:] - c[:-k]) / float(k)\n    return out\n\n\ndef _clip01(x):\n    return float(np.clip(x, 0.0, 1.0))\n\n\ndef compute_spec(arrays, behavior, meta):\n    out = {\n        \"spec_score\": 0.0,\n        \"progress_score\": 0.0,\n        # ---- resolved goal frame ----\n        \"frame_goal_axis\": \"world+z_root_rise\",\n        \"frame_support_mode_abstained\": 1.0,   # get-up transition: support schedule unspecified -> abstain\n        \"frame_torso_target\": \"upright_sitting(g_z_end<=-0.25)\",\n    }\n\n    root = arrays.get(\"root_link_pos_w\")\n    if root is None or root.ndim != 3 or root.shape[0] < 8:\n        return out\n    root = np.asarray(root, dtype=np.float64)\n    T, E = root.shape[0], root.shape[1]\n\n    dt = float((behavior or {}).get(\"step_dt\", 1.0 / 30.0))\n    if not np.isfinite(dt) or dt <= 0:\n        dt = 1.0 / 30.0\n\n    z = root[:, :, 2]                                # (T, E)\n    z = np.where(np.isfinite(z), z, 0.0)\n\n    # smoothing / window sizes (spike-robust: everything below reads window MEANS)\n    k_sm = max(1, int(round(0.30 / dt)))             # ~0.3 s smoothing\n    k_start = max(2, int(round(0.50 / dt)))          # first 0.5 s\n    k_end = max(2, int(round(0.70 / dt)))            # last 0.7 s\n    k_start = min(k_start, T)\n    k_end = min(k_end, T)\n\n    z_s = _roll_mean_t(z, k_sm)                      # (T, E) smoothed height\n\n    z_start = np.mean(z[:k_start, :], axis=0)        # (E,)\n    z_end = np.mean(z[T - k_end:, :], axis=0)        # (E,)\n    z_min = np.min(z_s, axis=0)                      # (E,) smoothed minimum (no single-frame dips)\n    rise = z_end - z_min                             # (E,) SIGNED rise along world +z (goal_axis)\n\n    # ---------------- orientation (torso turning upright) ----------------\n    grav = arrays.get(\"projected_gravity_b\")\n    grav_ok = grav is not None and grav.ndim == 3 and grav.shape[0] == T and grav.shape[2] >= 3\n    if grav_ok:\n        g_z = np.asarray(grav[:, :, 2], dtype=np.float64)\n        g_z = np.where(np.isfinite(g_z), g_z, 0.0)\n        g_end = np.mean(g_z[T - k_end:, :], axis=0)  # (E,) window mean, boundary-safe\n    else:\n        g_end = None\n\n    # NOTE: the reference clip starts at gravity_z_b = -0.649 (NOT near 0), so a\n    # \"must start supine by gravity\" gate would false-reject the real exemplar.\n    # The started-low condition is carried by root height instead; the initial-\n    # orientation gate ABSTAINS.\n    out[\"initial_orientation_gate_abstained\"] = 1.0\n\n    # ---------------- joint articulation (anti root-only replay) ----------------\n    # A rollout whose root rises while every joint is frozen is a replay/hack,\n    # not a get-up: the body cannot push itself off the ground without moving\n    # its joints.  Reference mean |joint_vel| during activity ~0.35-1.1 rad/s.\n    jv = arrays.get(\"joint_vel\")\n    jp = arrays.get(\"joint_pos\")\n    mav = None  # per-env mean |joint_vel| over the episode\n    if jv is not None and jv.ndim == 3 and jv.shape[0] == T:\n        jv = np.asarray(jv, dtype=np.float64)\n        jv = np.where(np.isfinite(jv), jv, 0.0)\n        speed = np.mean(np.abs(jv), axis=2)          # (T, E)\n        speed = _roll_mean_t(speed, k_sm)            # smooth: single-frame spikes barely count\n        mav = np.mean(speed, axis=0)                 # (E,)\n    elif jp is not None and jp.ndim == 3 and jp.shape[0] >= 3:\n        jp = np.asarray(jp, dtype=np.float64)\n        jp = np.where(np.isfinite(jp), jp, 0.0)\n        djp = np.abs(jp[1:] - jp[:-1]) / dt          # finite-difference velocity\n        speed = np.mean(djp, axis=2)                 # (T-1, E)\n        speed = _roll_mean_t(speed, k_sm)\n        mav = np.mean(speed, axis=0)                 # (E,)\n    joint_abstain = mav is None\n    out[\"joint_motion_abstained\"] = 1.0 if joint_abstain else 0.0\n\n    # ---------------- completion gate (per env, 0/1) ----------------\n    # started low (lying: reference start 0.13-0.16 m)\n    g_low = (z_start <= 0.25).astype(np.float64)\n    # reached the goal height band and HELD it at the end (sitting/crouched >= 0.35 m)\n    g_high = (z_end >= 0.35).astype(np.float64)\n    # signed rise floor along +z (amplitude floor; reference rise ~0.49 m)\n    g_rise = (rise >= 0.20).astype(np.float64)\n    # chest turned upright at the end (reference end-window g_z ~ -0.46 .. -0.55)\n    if g_end is not None:\n        g_up = (g_end <= -0.25).astype(np.float64)\n        up_abstain = False\n    else:\n        g_up = np.ones(E, dtype=np.float64)\n        up_abstain = True\n    out[\"upright_abstained\"] = 1.0 if up_abstain else 0.0\n    # joints actually articulated (veto root-only replay / frozen-joint hover)\n    if not joint_abstain:\n        g_joint = (mav >= 0.08).astype(np.float64)\n    else:\n        g_joint = np.ones(E, dtype=np.float64)\n\n    gate = g_low * g_high * g_rise * g_up * g_joint  # (E,) each in {0,1}\n\n    # ---------------- saturating channels (each [0,1], independent) ----------------\n    # height held at the end: ramps 0.30 -> 0.50 m (reference end-window ~0.55)\n    ch_height = np.clip((z_end - 0.30) / 0.20, 0.0, 1.0)\n    # signed rise amplitude: ramps 0.15 -> 0.35 m (reference ~0.49)\n    ch_rise = np.clip((rise - 0.15) / 0.20, 0.0, 1.0)\n    # uprightness at the end: ramps g_z -0.25 -> -0.45 (reference ~ -0.46 => 1.0)\n    if g_end is not None:\n        ch_up = np.clip((-g_end - 0.25) / 0.20, 0.0, 1.0)\n    else:\n        ch_up = np.ones(E, dtype=np.float64)         # abstain (flagged above)\n    # joint articulation: ramps 0 -> 0.30 rad/s mean (reference ~0.45)\n    if not joint_abstain:\n        ch_joint = np.clip(mav / 0.30, 0.0, 1.0)\n    else:\n        ch_joint = np.ones(E, dtype=np.float64)      # abstain (flagged above)\n\n    ch_min = np.minimum(np.minimum(ch_height, ch_rise), np.minimum(ch_up, ch_joint))\n    per_env = gate * ch_min\n    spec = float(np.clip(np.mean(per_env), 0.0, 1.0))\n\n    # ---------------- dense progress (ranking only; never feeds spec) ----------------\n    # same physical quantities, smooth from the noise floor, no gate / hard floors\n    d_rise = np.clip(rise / 0.35, 0.0, 1.0)                       # any rise counts\n    d_height = np.clip((z_end - 0.12) / 0.38, 0.0, 1.0)           # from lying baseline\n    if g_end is not None:\n        d_up = np.clip((-g_end + 0.10) / 0.60, 0.0, 1.0)          # supine ~0 -> ~0.17, upright -> 1\n    else:\n        d_up = np.ones(E, dtype=np.float64)\n    if not joint_abstain:\n        d_joint = 1.0 - np.exp(-mav / 0.20)\n    else:\n        d_joint = np.ones(E, dtype=np.float64)\n    prog = np.minimum(np.minimum(d_rise, d_height), np.minimum(d_up, d_joint))\n    progress = float(np.clip(np.mean(prog), 0.0, 1.0))\n\n    if not np.isfinite(spec):\n        spec = 0.0\n    if not np.isfinite(progress):\n        progress = 0.0\n\n    out.update({\n        \"spec_score\": spec,\n        \"progress_score\": progress,\n        \"completion_gate_mean\": float(np.mean(gate)),\n        \"gate_started_low_frac\": float(np.mean(g_low)),\n        \"gate_reached_035_frac\": float(np.mean(g_high)),\n        \"gate_rise_floor_frac\": float(np.mean(g_rise)),\n        \"gate_upright_frac\": float(np.mean(g_up)),\n        \"gate_joint_motion_frac\": float(np.mean(g_joint)),\n        \"ch_height_end\": float(np.mean(ch_height)),\n        \"ch_rise_signed\": float(np.mean(ch_rise)),\n        \"ch_upright_end\": float(np.mean(ch_up)),\n        \"ch_joint_motion\": float(np.mean(ch_joint)),\n        \"z_start_mean\": float(np.mean(z_start)),\n        \"z_end_mean\": float(np.mean(z_end)),\n        \"z_min_mean\": float(np.mean(z_min)),\n        \"rise_mean\": float(np.mean(rise)),\n        \"gravity_z_end_mean\": float(np.mean(g_end)) if g_end is not None else 0.0,\n        \"mean_abs_joint_vel\": float(np.mean(mav)) if mav is not None else 0.0,\n    })\n    return out\n",
+  "validation": {
+    "ok": true,
+    "gates": {
+      "ast_safety": true,
+      "defines_compute_spec": true,
+      "array_contract": true,
+      "no_raw_joint_index": true,
+      "loads": true,
+      "determinism": true,
+      "bounded": true,
+      "joint_index_robust": true,
+      "nondegeneracy": true,
+      "reference_nondegeneracy:fallandgetup2_subject3--seg00": true,
+      "reference_monotonicity:fallandgetup2_subject3--seg00": true,
+      "reference_negatives:fallandgetup2_subject3--seg00": true,
+      "axioms": true
+    },
+    "reasons": [
+      "[nondegeneracy] deferred to attached reference(s): the fixed archetype battery is uninformative for this novel goal (best positive 0.000, spread 0.000 < 0.1) \u2014 nondegeneracy is decided by the reference_nondegeneracy/monotonicity/negatives gates below"
+    ],
+    "archetype_scores": {
+      "still": 0.0,
+      "fallen": 0.0,
+      "chaotic": 0.0,
+      "active": 0.0,
+      "upright_flail": 0.0,
+      "active_kick": 0.0,
+      "active_floss": 0.0,
+      "active_jump": 0.0,
+      "walker": 0.0,
+      "active_kick_behind": 0.0,
+      "one_leg_balance": 0.0,
+      "partial_kick": 0.0,
+      "reference:fallandgetup2_subject3--seg00": 1.0,
+      "reference:fallandgetup2_subject3--seg00:reversal": 0.0,
+      "reference:fallandgetup2_subject3--seg00:freeze_start": 0.0,
+      "reference:fallandgetup2_subject3--seg00:freeze_end": 0.0,
+      "reference:fallandgetup2_subject3--seg00:shuffle": 0.0,
+      "reference:fallandgetup2_subject3--seg00:speed_slow": 0.3917482109921199,
+      "reference:fallandgetup2_subject3--seg00:speed_fast": 1.0,
+      "reference:fallandgetup2_subject3--seg00:trunc_25": 0.0,
+      "reference:fallandgetup2_subject3--seg00:trunc_50": 0.0,
+      "reference:fallandgetup2_subject3--seg00:trunc_75": 0.8481671384402684,
+      "reference:fallandgetup2_subject3--seg00:root_only": 0.0
+    },
+    "family": null,
+    "goal_frame": {
+      "goal_axis": null,
+      "support_mode": "double",
+      "torso_target": "upright"
+    },
+    "nondegeneracy_vacuous": false,
+    "selectivity_probe": null,
+    "required_roles": [],
+    "axioms": {
+      "ok": true,
+      "axioms": {
+        "translation_invariant": true,
+        "gravity_scale_invariant": true,
+        "yaw_rotation_invariant": true,
+        "uprightness_monotone": true,
+        "no_reward_for_chaos": true
+      },
+      "reasons": [],
+      "details": {
+        "positive_scores": {
+          "active": 0.0,
+          "active_kick": 0.0,
+          "active_floss": 0.0,
+          "active_jump": 0.0
+        },
+        "operating_point": "active",
+        "operating_score": 0.0,
+        "translation_invariant_delta": 0.0,
+        "gravity_scale_invariant_delta": 0.0,
+        "yaw_rotation_invariant_delta": 0.0,
+        "uprightness_sweep": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "chaos_delta": 0.0
+      }
+    },
+    "references": [
+      {
+        "clip_id": "fallandgetup2_subject3--seg00",
+        "gates": {
+          "reference_nondegeneracy": true,
+          "reference_monotonicity": true,
+          "reference_negatives": true
+        },
+        "reasons": [],
+        "scores": {
+          "full": 1.0,
+          "reversal": 0.0,
+          "freeze_start": 0.0,
+          "freeze_end": 0.0,
+          "shuffle": 0.0,
+          "speed_slow": 0.3917482109921199,
+          "speed_fast": 1.0,
+          "trunc_25": 0.0,
+          "trunc_50": 0.0,
+          "trunc_75": 0.8481671384402684,
+          "root_only": 0.0
+        }
+      }
+    ]
+  },
+  "review": {
+    "approved": true,
+    "concerns": [
+      "If `projected_gravity_b` is absent the uprightness gate abstains (passes everyone); this is flagged via `upright_abstained` but a downstream consumer must check that flag, otherwise a lying-to-high-hips bridge pose without chest rotation could pass in that degraded mode.",
+      "Similarly, if both `joint_vel` and `joint_pos` are absent the anti-replay joint-articulation veto abstains (flagged); the metric relies on the flag being respected.",
+      "The goal band (root >= 0.35 m held, chest g_z <= -0.25) is coarse: a policy that ends in a low crouch on knees rather than a clean sit would score 1.0 \u2014 acceptable given the goal text explicitly allows 'sitting/crouched', but worth noting."
+    ],
+    "summary": "The metric is a sharp per-env completion gate (started low z_start<=0.25, end height held >=0.35 over a 0.7 s window mean, SIGNED rise z_end - smoothed z_min >= 0.20, end uprightness g_z <= -0.25, joint articulation >= 0.08 rad/s mean) multiplied by a min of four independent saturating channels over the same quantities. Per-channel gaming policies: (height) a standing-start policy that is simply already high \u2014 vetoed by the started-low gate (still/walker/one-leg-balance all score 0); (rise) a single-frame z spike \u2014 defeated because z_min is a smoothed rolling-mean minimum and z_end is a window mean, so spikes cannot fake rise or held height; (uprightness) a frozen tilted pose \u2014 vetoed by rise, height, and joint-motion gates; (joint motion) a lying thrash \u2014 vetoed by height/rise/upright gates, and mav is a smoothed episode mean so spikes barely count. Wrong-direction is handled by the signed rise (reversal archetype scores 0), root-only replay is vetoed by the articulation gate (root_only scores 0), and partial attempts are floored (trunc_25/50, freeze variants, shuffle all 0). The initial-orientation gate deliberately abstains with a documented reason (the reference exemplar starts at g_z=-0.649, not near 0), carrying the supine condition via root height instead \u2014 a correct abstention rather than a false-rejecting frame default. Progress score is a separate ungated min of smooth ramps of the same physical quantities, scores a dead-still policy ~0 (rise=0 => d_rise=0), and never feeds spec_score. Composition is the required gate-times-min form with no sums, fractional products, or peak/median ratios; no naturalness/energy terms are fused in. All degenerate archetypes score exactly 0, the competent reference scores 1.0, and ordering is monotone with competence (speed_slow 0.39, trunc_75 0.85 as near-complete). Depends only on root_link_pos_w, projected_gravity_b, joint_vel/joint_pos, and step_dt."
+  },
+  "review_panel": null,
+  "attempts": [
+    {
+      "attempt": 0,
+      "ok": false,
+      "reasons": [
+        "[nondegeneracy] deferred to attached reference(s): the fixed archetype battery is uninformative for this novel goal (best positive 0.000, spread 0.000 < 0.1) \u2014 nondegeneracy is decided by the reference_nondegeneracy/monotonicity/negatives gates below",
+        "[reference:fallandgetup2_subject3--seg00] negatives: ['root_only'] scored above the degenerate ceiling 0.100 ({'root_only': 1.0}) \u2014 gameable by a reversed/frozen/shuffled near-miss of the reference",
+        "[reference:fallandgetup2_subject3--seg00] full-reference sub-components (the metric's own outputs on the real exemplar \u2014 diagnose which channel/gate zeroed it): {'spec_score': 0.821, 'progress_score': 0.844, 'frame_goal_axis': 'world+z_root_rise', 'frame_support_mode_abstained': 1.0, 'frame_torso_target': 'upright_sitting(g_z<=-0.50)', 'initial_orientation_gate_abstained': 1.0, 'upright_abstained': 0.0, 'completion_gate_mean': 1.0, 'gate_started_low_frac': 1.0, 'gate_reached_035_frac': 1.0, 'gate_rise_floor_frac': 1.0, 'ch_height_end': 1.0, 'ch_rise_signed': 1.0, 'ch_upright_end': 0.821, 'z_start_mean': 0.1299, 'z_end_mean': 0.5915, 'z_min_mean': 0.1045, 'rise_mean': 0.4871, 'gravity_z_end_mean': -0.4642}"
+      ]
+    },
+    {
+      "attempt": 1,
+      "ok": true,
+      "reasons": [
+        "[nondegeneracy] deferred to attached reference(s): the fixed archetype battery is uninformative for this novel goal (best positive 0.000, spread 0.000 < 0.1) \u2014 nondegeneracy is decided by the reference_nondegeneracy/monotonicity/negatives gates below"
+      ]
+    }
+  ],
+  "n_candidates": 1,
+  "candidates": null,
+  "selected_candidate": null,
+  "behavior_goal": "Starting supine (lying flat on the back, root z ~0.08-0.15 m, gravity_z_b near 0/positive), rotate and push the torso up off the ground toward a sitting/crouched configuration, raising the root above ~0.35 m with the chest turning upright.",
+  "robot_hint": "Mjlab-Velocity-Flat-Unitree-G1",
+  "model": "claude-fable-5",
+  "calibrated": false,
+  "recorded_at": "2026-07-12T00:12:07-0700",
+  "references_used": [
+    "fallandgetup2_subject3--seg00"
+  ],
+  "reference_signatures": {
+    "fallandgetup2_subject3--seg00": {
+      "duration_s": 14.267,
+      "fps": 30.0,
+      "n_frames": 428,
+      "root_z": {
+        "start": 0.161,
+        "end": 0.515,
+        "min": 0.098,
+        "min_t": 3.7,
+        "max": 0.782,
+        "max_t": 12.5
+      },
+      "root_velocity_mps": {
+        "min": -0.375,
+        "max": 0.838
+      },
+      "phases": [
+        {
+          "phase": "falling",
+          "t_start": 0.0,
+          "t_end": 0.433,
+          "z_start": 0.161,
+          "z_end": 0.119
+        },
+        {
+          "phase": "still",
+          "t_start": 0.433,
+          "t_end": 0.5,
+          "z_start": 0.117,
+          "z_end": 0.117
+        },
+        {
+          "phase": "rising",
+          "t_start": 0.5,
+          "t_end": 0.6,
+          "z_start": 0.121,
+          "z_end": 0.123
+        },
+        {
+          "phase": "still",
+          "t_start": 0.6,
+          "t_end": 0.833,
+          "z_start": 0.123,
+          "z_end": 0.12
+        },
+        {
+          "phase": "falling",
+          "t_start": 0.833,
+          "t_end": 1.067,
+          "z_start": 0.12,
+          "z_end": 0.108
+        },
+        {
+          "phase": "still",
+          "t_start": 1.067,
+          "t_end": 1.133,
+          "z_start": 0.108,
+          "z_end": 0.109
+        },
+        {
+          "phase": "rising",
+          "t_start": 1.133,
+          "t_end": 1.233,
+          "z_start": 0.11,
+          "z_end": 0.112
+        },
+        {
+          "phase": "still",
+          "t_start": 1.233,
+          "t_end": 3.1,
+          "z_start": 0.112,
+          "z_end": 0.117
+        },
+        {
+          "phase": "falling",
+          "t_start": 3.1,
+          "t_end": 3.267,
+          "z_start": 0.116,
+          "z_end": 0.11
+        },
+        {
+          "phase": "still",
+          "t_start": 3.267,
+          "t_end": 3.333,
+          "z_start": 0.109,
+          "z_end": 0.111
+        },
+        {
+          "phase": "falling",
+          "t_start": 3.333,
+          "t_end": 3.667,
+          "z_start": 0.111,
+          "z_end": 0.1
+        },
+        {
+          "phase": "still",
+          "t_start": 3.667,
+          "t_end": 3.7,
+          "z_start": 0.099,
+          "z_end": 0.099
+        },
+        {
+          "phase": "rising",
+          "t_start": 3.7,
+          "t_end": 3.867,
+          "z_start": 0.098,
+          "z_end": 0.107
+        },
+        {
+          "phase": "still",
+          "t_start": 3.867,
+          "t_end": 4.133,
+          "z_start": 0.107,
+          "z_end": 0.105
+        },
+        {
+          "phase": "rising",
+          "t_start": 4.133,
+          "t_end": 4.367,
+          "z_start": 0.106,
+          "z_end": 0.114
+        },
+        {
+          "phase": "still",
+          "t_start": 4.367,
+          "t_end": 5.3,
+          "z_start": 0.114,
+          "z_end": 0.117
+        },
+        {
+          "phase": "rising",
+          "t_start": 5.3,
+          "t_end": 5.733,
+          "z_start": 0.118,
+          "z_end": 0.147
+        },
+        {
+          "phase": "still",
+          "t_start": 5.733,
+          "t_end": 5.8,
+          "z_start": 0.148,
+          "z_end": 0.148
+        },
+        {
+          "phase": "falling",
+          "t_start": 5.8,
+          "t_end": 6.067,
+          "z_start": 0.148,
+          "z_end": 0.124
+        },
+        {
+          "phase": "still",
+          "t_start": 6.067,
+          "t_end": 6.233,
+          "z_start": 0.124,
+          "z_end": 0.125
+        },
+        {
+          "phase": "rising",
+          "t_start": 6.233,
+          "t_end": 6.467,
+          "z_start": 0.126,
+          "z_end": 0.14
+        },
+        {
+          "phase": "still",
+          "t_start": 6.467,
+          "t_end": 6.533,
+          "z_start": 0.142,
+          "z_end": 0.143
+        },
+        {
+          "phase": "falling",
+          "t_start": 6.533,
+          "t_end": 6.667,
+          "z_start": 0.143,
+          "z_end": 0.136
+        },
+        {
+          "phase": "still",
+          "t_start": 6.667,
+          "t_end": 6.7,
+          "z_start": 0.135,
+          "z_end": 0.135
+        },
+        {
+          "phase": "rising",
+          "t_start": 6.7,
+          "t_end": 6.833,
+          "z_start": 0.136,
+          "z_end": 0.145
+        },
+        {
+          "phase": "still",
+          "t_start": 6.833,
+          "t_end": 6.933,
+          "z_start": 0.145,
+          "z_end": 0.141
+        },
+        {
+          "phase": "rising",
+          "t_start": 6.933,
+          "t_end": 7.167,
+          "z_start": 0.142,
+          "z_end": 0.155
+        },
+        {
+          "phase": "still",
+          "t_start": 7.167,
+          "t_end": 7.267,
+          "z_start": 0.156,
+          "z_end": 0.157
+        },
+        {
+          "phase": "falling",
+          "t_start": 7.267,
+          "t_end": 7.4,
+          "z_start": 0.157,
+          "z_end": 0.152
+        },
+        {
+          "phase": "still",
+          "t_start": 7.4,
+          "t_end": 7.5,
+          "z_start": 0.152,
+          "z_end": 0.152
+        },
+        {
+          "phase": "rising",
+          "t_start": 7.5,
+          "t_end": 7.767,
+          "z_start": 0.153,
+          "z_end": 0.163
+        },
+        {
+          "phase": "still",
+          "t_start": 7.767,
+          "t_end": 7.867,
+          "z_start": 0.164,
+          "z_end": 0.163
+        },
+        {
+          "phase": "falling",
+          "t_start": 7.867,
+          "t_end": 8.033,
+          "z_start": 0.163,
+          "z_end": 0.155
+        },
+        {
+          "phase": "still",
+          "t_start": 8.033,
+          "t_end": 8.1,
+          "z_start": 0.152,
+          "z_end": 0.153
+        },
+        {
+          "phase": "rising",
+          "t_start": 8.1,
+          "t_end": 9.733,
+          "z_start": 0.154,
+          "z_end": 0.506
+        },
+        {
+          "phase": "still",
+          "t_start": 9.733,
+          "t_end": 9.767,
+          "z_start": 0.507,
+          "z_end": 0.507
+        },
+        {
+          "phase": "falling",
+          "t_start": 9.767,
+          "t_end": 10.4,
+          "z_start": 0.506,
+          "z_end": 0.373
+        },
+        {
+          "phase": "rising",
+          "t_start": 10.4,
+          "t_end": 11.133,
+          "z_start": 0.377,
+          "z_end": 0.779
+        },
+        {
+          "phase": "still",
+          "t_start": 11.133,
+          "t_end": 11.2,
+          "z_start": 0.779,
+          "z_end": 0.776
+        },
+        {
+          "phase": "falling",
+          "t_start": 11.2,
+          "t_end": 11.233,
+          "z_start": 0.775,
+          "z_end": 0.775
+        },
+        {
+          "phase": "still",
+          "t_start": 11.233,
+          "t_end": 11.6,
+          "z_start": 0.775,
+          "z_end": 0.776
+        },
+        {
+          "phase": "rising",
+          "t_start": 11.6,
+          "t_end": 11.667,
+          "z_start": 0.777,
+          "z_end": 0.778
+        },
+        {
+          "phase": "still",
+          "t_start": 11.667,
+          "t_end": 12.333,
+          "z_start": 0.779,
+          "z_end": 0.779
+        },
+        {
+          "phase": "rising",
+          "t_start": 12.333,
+          "t_end": 12.367,
+          "z_start": 0.78,
+          "z_end": 0.78
+        },
+        {
+          "phase": "still",
+          "t_start": 12.367,
+          "t_end": 12.6,
+          "z_start": 0.781,
+          "z_end": 0.782
+        },
+        {
+          "phase": "falling",
+          "t_start": 12.6,
+          "t_end": 13.8,
+          "z_start": 0.781,
+          "z_end": 0.6
+        },
+        {
+          "phase": "still",
+          "t_start": 13.8,
+          "t_end": 13.9,
+          "z_start": 0.599,
+          "z_end": 0.598
+        },
+        {
+          "phase": "falling",
+          "t_start": 13.9,
+          "t_end": 14.267,
+          "z_start": 0.599,
+          "z_end": 0.515
+        }
+      ],
+      "orientation": {
+        "initial_gravity_z_b": -0.649,
+        "final_gravity_z_b": -0.554,
+        "note": "gravity_z_b near -1.0 = upright; near 0 or positive = lying/inverted"
+      },
+      "contact_inferred": true,
+      "contact_schedule": {
+        "left_foot": {
+          "contact_fraction": 0.577
+        },
+        "right_foot": {
+          "contact_fraction": 0.617
+        }
+      },
+      "joint_motion_energy_by_phase": [
+        {
+          "phase": "falling",
+          "t_start": 0.0,
+          "t_end": 0.433,
+          "mean_abs_joint_vel": 0.528
+        },
+        {
+          "phase": "still",
+          "t_start": 0.433,
+          "t_end": 0.5,
+          "mean_abs_joint_vel": 0.298
+        },
+        {
+          "phase": "rising",
+          "t_start": 0.5,
+          "t_end": 0.6,
+          "mean_abs_joint_vel": 0.299
+        },
+        {
+          "phase": "still",
+          "t_start": 0.6,
+          "t_end": 0.833,
+          "mean_abs_joint_vel": 0.443
+        },
+        {
+          "phase": "falling",
+          "t_start": 0.833,
+          "t_end": 1.067,
+          "mean_abs_joint_vel": 0.556
+        },
+        {
+          "phase": "still",
+          "t_start": 1.067,
+          "t_end": 1.133,
+          "mean_abs_joint_vel": 0.473
+        },
+        {
+          "phase": "rising",
+          "t_start": 1.133,
+          "t_end": 1.233,
+          "mean_abs_joint_vel": 0.524
+        },
+        {
+          "phase": "still",
+          "t_start": 1.233,
+          "t_end": 3.1,
+          "mean_abs_joint_vel": 0.168
+        },
+        {
+          "phase": "falling",
+          "t_start": 3.1,
+          "t_end": 3.267,
+          "mean_abs_joint_vel": 0.349
+        },
+        {
+          "phase": "still",
+          "t_start": 3.267,
+          "t_end": 3.333,
+          "mean_abs_joint_vel": 0.418
+        },
+        {
+          "phase": "falling",
+          "t_start": 3.333,
+          "t_end": 3.667,
+          "mean_abs_joint_vel": 0.433
+        },
+        {
+          "phase": "still",
+          "t_start": 3.667,
+          "t_end": 3.7,
+          "mean_abs_joint_vel": 0.23
+        },
+        {
+          "phase": "rising",
+          "t_start": 3.7,
+          "t_end": 3.867,
+          "mean_abs_joint_vel": 0.27
+        },
+        {
+          "phase": "still",
+          "t_start": 3.867,
+          "t_end": 4.133,
+          "mean_abs_joint_vel": 0.43
+        },
+        {
+          "phase": "rising",
+          "t_start": 4.133,
+          "t_end": 4.367,
+          "mean_abs_joint_vel": 0.436
+        },
+        {
+          "phase": "still",
+          "t_start": 4.367,
+          "t_end": 5.3,
+          "mean_abs_joint_vel": 0.235
+        },
+        {
+          "phase": "rising",
+          "t_start": 5.3,
+          "t_end": 5.733,
+          "mean_abs_joint_vel": 0.639
+        },
+        {
+          "phase": "still",
+          "t_start": 5.733,
+          "t_end": 5.8,
+          "mean_abs_joint_vel": 1.006
+        },
+        {
+          "phase": "falling",
+          "t_start": 5.8,
+          "t_end": 6.067,
+          "mean_abs_joint_vel": 0.801
+        },
+        {
+          "phase": "still",
+          "t_start": 6.067,
+          "t_end": 6.233,
+          "mean_abs_joint_vel": 0.421
+        },
+        {
+          "phase": "rising",
+          "t_start": 6.233,
+          "t_end": 6.467,
+          "mean_abs_joint_vel": 0.49
+        },
+        {
+          "phase": "still",
+          "t_start": 6.467,
+          "t_end": 6.533,
+          "mean_abs_joint_vel": 0.818
+        },
+        {
+          "phase": "falling",
+          "t_start": 6.533,
+          "t_end": 6.667,
+          "mean_abs_joint_vel": 0.685
+        },
+        {
+          "phase": "still",
+          "t_start": 6.667,
+          "t_end": 6.7,
+          "mean_abs_joint_vel": 0.618
+        },
+        {
+          "phase": "rising",
+          "t_start": 6.7,
+          "t_end": 6.833,
+          "mean_abs_joint_vel": 0.387
+        },
+        {
+          "phase": "still",
+          "t_start": 6.833,
+          "t_end": 6.933,
+          "mean_abs_joint_vel": 0.422
+        },
+        {
+          "phase": "rising",
+          "t_start": 6.933,
+          "t_end": 7.167,
+          "mean_abs_joint_vel": 0.792
+        },
+        {
+          "phase": "still",
+          "t_start": 7.167,
+          "t_end": 7.267,
+          "mean_abs_joint_vel": 0.592
+        },
+        {
+          "phase": "falling",
+          "t_start": 7.267,
+          "t_end": 7.4,
+          "mean_abs_joint_vel": 0.701
+        },
+        {
+          "phase": "still",
+          "t_start": 7.4,
+          "t_end": 7.5,
+          "mean_abs_joint_vel": 0.706
+        },
+        {
+          "phase": "rising",
+          "t_start": 7.5,
+          "t_end": 7.767,
+          "mean_abs_joint_vel": 0.491
+        },
+        {
+          "phase": "still",
+          "t_start": 7.767,
+          "t_end": 7.867,
+          "mean_abs_joint_vel": 0.433
+        },
+        {
+          "phase": "falling",
+          "t_start": 7.867,
+          "t_end": 8.033,
+          "mean_abs_joint_vel": 0.432
+        },
+        {
+          "phase": "still",
+          "t_start": 8.033,
+          "t_end": 8.1,
+          "mean_abs_joint_vel": 0.49
+        },
+        {
+          "phase": "rising",
+          "t_start": 8.1,
+          "t_end": 9.733,
+          "mean_abs_joint_vel": 0.456
+        },
+        {
+          "phase": "still",
+          "t_start": 9.733,
+          "t_end": 9.767,
+          "mean_abs_joint_vel": 0.65
+        },
+        {
+          "phase": "falling",
+          "t_start": 9.767,
+          "t_end": 10.4,
+          "mean_abs_joint_vel": 0.659
+        },
+        {
+          "phase": "rising",
+          "t_start": 10.4,
+          "t_end": 11.133,
+          "mean_abs_joint_vel": 1.119
+        },
+        {
+          "phase": "still",
+          "t_start": 11.133,
+          "t_end": 11.2,
+          "mean_abs_joint_vel": 0.589
+        },
+        {
+          "phase": "falling",
+          "t_start": 11.2,
+          "t_end": 11.233,
+          "mean_abs_joint_vel": 0.723
+        },
+        {
+          "phase": "still",
+          "t_start": 11.233,
+          "t_end": 11.6,
+          "mean_abs_joint_vel": 0.561
+        },
+        {
+          "phase": "rising",
+          "t_start": 11.6,
+          "t_end": 11.667,
+          "mean_abs_joint_vel": 0.39
+        },
+        {
+          "phase": "still",
+          "t_start": 11.667,
+          "t_end": 12.333,
+          "mean_abs_joint_vel": 0.351
+        },
+        {
+          "phase": "rising",
+          "t_start": 12.333,
+          "t_end": 12.367,
+          "mean_abs_joint_vel": 0.245
+        },
+        {
+          "phase": "still",
+          "t_start": 12.367,
+          "t_end": 12.6,
+          "mean_abs_joint_vel": 0.255
+        },
+        {
+          "phase": "falling",
+          "t_start": 12.6,
+          "t_end": 13.8,
+          "mean_abs_joint_vel": 0.429
+        },
+        {
+          "phase": "still",
+          "t_start": 13.8,
+          "t_end": 13.9,
+          "mean_abs_joint_vel": 0.273
+        },
+        {
+          "phase": "falling",
+          "t_start": 13.9,
+          "t_end": 14.267,
+          "mean_abs_joint_vel": 0.456
+        }
+      ]
+    }
+  }
+}

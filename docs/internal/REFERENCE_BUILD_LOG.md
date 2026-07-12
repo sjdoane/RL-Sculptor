@@ -295,6 +295,65 @@ start_pose independent of the persisted RSI flag; clip text fenced+capped
 in LLM prompts; tierd_cert bypass kwarg removed; live-bytes staleness +
 rollout containment), 1 fixed by the density tie-break.
 
+### D23. Live zero-fitness on a CORRECT sit-up: exemplar-scope mismatch, certified in (H1 confirmed)
+Observed (g1-standing / starting-from-lying-flat-on-its, torso_righting iter 0,
+job_c75bf9d56f091262): the policy rights the torso cleanly from the settled
+supine reset; objective fitness 0.0. Offline recompute of the certified metric
+on the rollout trajectory.npz reproduces the live event exactly (spec 0.0,
+progress 0.0609). Per-channel: gate_upright_frac 1.0 with gravity_z_end −0.917
+(more upright than the reference clip's own end window −0.46), started-low 1.0
+(z_start 0.137), joint-motion 1.0 (0.33 rad/s). The zero comes ONLY from the two
+height channels: gate_reached_035 = 0 (z_end 0.143 m < 0.35) and gate_rise_floor
+= 0 (rise 0.035 m < 0.20), which also zero ch_height/ch_rise, so
+per_env = gate x ch_min = 0 on every env.
+
+Hypothesis outcomes: H1 CONFIRMED. H2 (settled-start mismatch) excluded — the
+start gate passed from the settled reset (the authored metric abstains on
+initial orientation and carries started-low via root height). H3 (time-locked
+assumptions) excluded — this metric is window-based, no absolute-time terms.
+H4 (plumbing) excluded — the metric computed cleanly offline; the runtime event
+carried no per-channel components (iter_fitness has only scalar fitness), which
+is a visibility gap (F4), not the cause of the zero.
+
+Root-cause chain:
+1. The stage goal (right the torso to sitting) is a SUB-PHASE of its attached
+   clip fallandgetup2_subject3--seg00, a full lying-to-standing get-up
+   (z 0.13 -> 0.55). In the clip itself the root stays ~0.15 m during the
+   torso-righting phase; the rise to 0.5 m happens in the final ~1.6 s
+   (drive-to-stand). A physically correct sit-up keeps the pelvis at ~0.14 m.
+2. The mismatch entered UPSTREAM at decomposition: the stage's behavior_goal
+   text already bakes in the full-clip number ("raising the root above
+   ~0.35 m"), and the success_criterion demands (root_height > 0.35).mean()
+   > 0.25 — both unmeetable by the goal behavior. The whole stage contract
+   (goal text, criterion, metric) inherited full-clip scope.
+3. Certification then LOCKED it in: reference gates score the FULL get-up as
+   the positive and REQUIRE trunc_25/50 to score ~0 (reference_negatives) —
+   and a sit-up is kinematically a truncation of the full clip. Under these
+   gates, zeroing a perfect sit-up is not an authoring bug; it is the only
+   way to PASS certification. The metric did what its exemplar told it.
+
+Class statement: whenever stage_goal is a strict sub-phase of clip scope,
+certifying against the full clip guarantees a correct stage rollout scores
+like a punished truncation. Same family as the D22 deferred hold-goal /
+freeze_end finding — both are "the stage's motion is not the clip's motion"
+scope errors. Consequence for the live mission: stage 1 could never pass its
+criterion honestly; every iteration steers blind (fitness pinned 0, dense
+progress noise-floor) while the diagnoser chases the dead height kernel.
+
+Fix plan (D24 batch): F1 phase-cropped stage references — select the
+goal-aligned sub-span, certify the metric against the SUB-SPAN, derive RSI +
+eval reset from the same sub-span (reset/cert/scoring agree on what the stage
+motion IS); F2 certification scores the stage's ACTUAL settled eval start and
+the authoring context carries eval_reset numbers; F3 completion-then-hold
+synthetic positive (goal reached early, terminal state held — the exact live
+rollout shape) gated MUST-SCORE-HIGH + no-absolute-time authoring rule;
+F4 runtime contradiction detector (criterion-pass x near-zero fitness -> loud
+event + UI flag) and fitness events always carry per-channel components (the
+gate_upright 1.0 / gate_height 0.0 split makes this class visible at a glance).
+Golden fixture: the live sat-up rollout is preserved at
+tests/fixtures/torso_righting_satup/ and must score well above zero under the
+fixed metric class (regression test).
+
 ### Deferred findings (logged, not yet fixed)
 - Steer ENFORCEMENT unification: reference-calibration trust is computed
   and event-recorded in mission_metrics, but the live steer/observe gate
