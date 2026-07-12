@@ -322,6 +322,27 @@ rollout containment), 1 fixed by the density tie-break.
 - settle_reset convergence flag: max|qvel| criterion never reports
   converged=True within the 0.75 s budget on the real stages (residual
   limb oscillation); diagnostic-only, z stabilizes.
+- Hold-goal stages vs freeze_end negative (structural, found live on
+  g1-standing feet_under_crouch 2026-07-12): a stage whose goal is
+  "reach X and HOLD it" keeps authoring hold-rewarding metrics; the
+  freeze_end perturbation (already-in-end-pose-from-frame-0) then
+  correctly scores 1.0 and the gate rejects — twice in a row, with the
+  failure reason in the retry context. The gate is RIGHT (the metric
+  must also require the reach); the AUTHORING prompt needs an explicit
+  hold-goal rule: "when the goal includes holding a terminal state, the
+  metric MUST gate on the start state being below/away from it".
+  Designed fallback (stage steers by mission-level metric; criterion +
+  start-state gate still enforced) is acceptable meanwhile.
+- Decompose-time job hang (ops, 2026-07-12): a mission_decompose job
+  hung 9 h at "generating per-stage metrics" (last LLM call 23:39, no
+  timeout fired); jobs/stop cleared it and per-stage regenerate
+  recovered. Follow-up: per-call timeout + job-level watchdog in the
+  metric-generation loop.
+- Decompose auto-retrieval quality at 6k clips: stage 1 attached NO
+  clip and stage 4 attached the 168 s standing-start PARENT clip
+  (segment-preference + confidence gating needed); verbose goal-text
+  queries rank push-recovery clips over get-up clips (stopword/common-
+  token weakness, same family as the stopword IDF item).
 
 ## Verified state after R1 + R2-a (2026-07-09)
 - Library: 301 g1 clips (LAFAN1 40 + segments; fleaven ACCAD slice), all
