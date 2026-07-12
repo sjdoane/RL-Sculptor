@@ -377,3 +377,70 @@ def test_select_reference_span_empty_response_is_infra_not_semantic():
     assert span is None
     assert reason.startswith("empty_response:")
     assert is_semantic_decline(reason) is False
+
+
+def _mock_span_call(t0, t1, band, up=True, conf=0.9):
+    import json as _json
+    return lambda p: _json.dumps({
+        "t_start_s": t0, "t_end_s": t1, "confidence": conf,
+        "rationale": "x", "whole_clip": False,
+        "expected_end": {"z_band": band, "g_z_more_upright": up}})
+
+
+def test_loose_z_band_rejected_as_uncommitted():
+    """Opus audit H1 (PROVEN exploit): the end-state QC was vacuously
+    satisfied by a wide z_band — the over-extended D23 span (0->11.2 s,
+    ends standing) was ACCEPTED with z_band [0.05,0.80] or [0,1]. A band
+    wider than max(0.15 m, 35% of the clip's z-range) is now rejected as
+    an uncommitted claim; the honest tight band still accepts the honest
+    span and still convicts the over-extended one."""
+    from sculptor.reference import load_clip
+    from sculptor.refs.spans import select_reference_span
+
+    clip = load_clip(FIXTURE_CLIP)
+    for band in ([0.05, 0.80], [0.0, 1.0], [0.10, 0.60]):
+        span, reason = select_reference_span(
+            clip, goal_text="sit up", llm_call=_mock_span_call(0.0, 11.2, band))
+        assert span is None, band
+        assert reason.startswith("qc_reject:end_state:"), reason
+        assert "too wide" in reason
+    # honest tight claim over the honest span: accepted
+    span, reason = select_reference_span(
+        clip, goal_text="sit up", llm_call=_mock_span_call(0.0, 8.4, [0.10, 0.20]))
+    assert span is not None, reason
+    # honest tight claim over the OVER-EXTENDED span: end-state mismatch
+    span, reason = select_reference_span(
+        clip, goal_text="sit up", llm_call=_mock_span_call(0.0, 11.2, [0.10, 0.20]))
+    assert span is None
+    assert "outside expected_end.z_band" in reason
+
+
+def test_crop_span_clamps_rounded_end_boundary():
+    """Opus audit M1 (PROVEN): _phase_segments rounds boundary times to
+    3 decimals, so span_boundaries can emit an end time ~0.4 ms past the
+    true duration (14.267 vs 14.2666...) — a legitimate reaches-the-end
+    span then died with 'out of bounds' and fell back to the full clip.
+    Rounding-scale overshoot now clamps; real overshoot still raises."""
+    import pytest as _pytest
+    from sculptor.reference import load_clip
+    from sculptor.refs.spans import crop_span
+
+    clip = load_clip(FIXTURE_CLIP)
+    c = crop_span(clip, 3.0, 14.267)  # 0.4 ms past the true 14.2667 s end
+    assert len(c["root_pos_z"]) == 338
+    with _pytest.raises(ValueError):
+        crop_span(clip, 0.0, 15.5)
+
+
+def test_live_span_is_fast_completion_gated():
+    """The accepted live span (0->8.1 s) must classify as reach-and-hold
+    (ends_settled True) so reference_fast_completion is REQUIRED for it;
+    clips still rising at their end (0->9.0, full clip) must not."""
+    from sculptor.reference import load_clip
+    from sculptor.refs.perturb import ends_settled
+    from sculptor.refs.spans import crop_span
+
+    clip = load_clip(FIXTURE_CLIP)
+    assert ends_settled(crop_span(clip, 0.0, 8.1)) is True
+    assert ends_settled(crop_span(clip, 0.0, 9.0)) is False
+    assert ends_settled(clip) is False

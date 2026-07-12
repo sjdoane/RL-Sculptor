@@ -157,6 +157,18 @@ def crop_span(clip: dict, t_start_s: float, t_end_s: float) -> dict:
     n = _time_len(clip)
     fps = float(clip["fps"])
     duration_s = n / fps
+    # Opus audit M1 (PROVEN): `_phase_segments` rounds its boundary times
+    # to 3 decimals, so `span_boundaries` can emit an end time a fraction
+    # of a millisecond PAST the true duration (14.267 vs 14.2666…) — a
+    # legitimate reaches-the-end span then snapped onto it and died here
+    # with "out of bounds", silently falling back to the full clip.
+    # Rounding-scale overshoot (up to half a frame) clamps to the end;
+    # anything larger is still a real error.
+    clamp_tol = max(1e-3, 0.5 / fps)
+    if duration_s < t_end_s <= duration_s + clamp_tol:
+        t_end_s = duration_s
+    if -clamp_tol <= t_start_s < 0.0:
+        t_start_s = 0.0
     if t_start_s < -1e-6 or t_end_s > duration_s + 1e-6:
         raise ValueError(
             f"span [{t_start_s}, {t_end_s}] s is outside the clip's own "
@@ -324,7 +336,7 @@ def _window_mean_gz(
 
 
 def _end_state_qc(
-    cropped: dict, expected_end: dict[str, Any],
+    clip: dict, cropped: dict, expected_end: dict[str, Any],
 ) -> Optional[str]:
     """§F1 addendum (end-state self-consistency QC, from the b14708a
     verification pass): verifies the SNAPPED `cropped` span's actual
@@ -351,6 +363,21 @@ def _end_state_qc(
     """
     z_band = expected_end["z_band"]
     lo, hi = float(z_band[0]), float(z_band[1])
+    # Width sanity (Opus audit H1, PROVEN): a LOOSE band is vacuously
+    # satisfied — the over-extended D23 span (0->11.2 s, ends standing at
+    # z 0.725) was ACCEPTED with z_band [0.05, 0.80] or [0, 1] while the
+    # honest tight band rejected it. The claim must commit to a state:
+    # cap the band width at max(0.15 m, 35% of the FULL clip's own
+    # z-range) — an uncommitted band is a rejection, not a free pass.
+    full_z = np.asarray(clip["root_pos_z"], dtype=np.float64)
+    z_range = float(full_z.max() - full_z.min())
+    max_width = max(0.15, 0.35 * z_range)
+    if (hi - lo) > max_width:
+        return (
+            f"z_band [{lo:.3f}, {hi:.3f}] is too wide to be a commitment "
+            f"(width {hi - lo:.3f} > {max_width:.3f} = max(0.15, 0.35 x "
+            f"clip z-range {z_range:.3f})) — state the end height the "
+            f"goal actually produces")
     z_end = _window_mean_z(cropped, from_start=False, window_s=_END_WINDOW_S)
     if not (lo - _END_Z_BAND_TOLERANCE_M <= z_end <= hi + _END_Z_BAND_TOLERANCE_M):
         return (
@@ -392,7 +419,9 @@ _SYSTEM_PROMPT = (
     "and expected_end (object with two keys: z_band — a [lo, hi] pair "
     "in METERS, grounded in the signature's root_z numbers, giving the "
     "root-height range you expect the span's FINAL ~0.5s to sit in "
-    "(NOT the full clip's end — the goal's OWN end state); and "
+    "(NOT the full clip's end — the goal's OWN end state); the band "
+    "must be a TIGHT commitment, roughly 0.1-0.2 m wide — a loose "
+    "band that spans most of the clip's height range is rejected; and "
     "g_z_more_upright — boolean, whether the span's ending orientation "
     "is MORE upright (more negative gravity_z_b in the signature's "
     "orientation.timeline) than its own starting orientation). "
@@ -624,7 +653,7 @@ def select_reference_span(
     # guard the START of the span — verify the LLM's own claim about
     # where the span ENDS before trusting it (catches an over-extended
     # span that would otherwise recreate D23).
-    end_state_reason = _end_state_qc(cropped, parsed["expected_end"])
+    end_state_reason = _end_state_qc(clip, cropped, parsed["expected_end"])
     if end_state_reason is not None:
         logger.info(
             "select_reference_span: qc_reject:end_state: %s", end_state_reason)

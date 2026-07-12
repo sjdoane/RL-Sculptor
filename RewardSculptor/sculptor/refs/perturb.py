@@ -161,36 +161,50 @@ def fast_completion(
     return complete_then_hold(speed(clip, speed_factor), hold_frac=hold_frac)
 
 
-#: `ends_settled` thresholds: the span's LAST window must be near-still in
-#: root height and (when orientation exists) in gravity_z_b. One classifier
-#: for the "reach-a-state-and-hold goal" shape assumption (D19 meta-rule).
-_ENDS_SETTLED_WINDOW_S = 0.5
-_ENDS_SETTLED_Z_RANGE_M = 0.03
-_ENDS_SETTLED_GZ_RANGE = 0.06
+#: `ends_settled` thresholds: the span's LAST window must show no real
+#: TREND in root height or (when orientation exists) gravity_z_b. One
+#: classifier for the "reach-a-state-and-hold goal" shape assumption
+#: (D19 meta-rule). Trend (linear-fit slope over 1.0 s), not range: an
+#: Opus audit proved range-over-0.5s flips non-monotonically on ordinary
+#: mocap wiggle (fixture spans 7.5s True / 7.8s False / 8.1s True...),
+#: and a flip on the chosen endpoint silently drops the REQUIRED
+#: fast_completion gate to record-only — a gate failing OPEN.
+_ENDS_SETTLED_WINDOW_S = 1.0
+_ENDS_SETTLED_Z_SLOPE_MPS = 0.05
+_ENDS_SETTLED_GZ_SLOPE_PS = 0.15
 
 
 def ends_settled(clip: dict) -> bool:
-    """True when the clip's final `_ENDS_SETTLED_WINDOW_S` is near-still —
-    the motion REACHES a state and stays there (get-up spans, sit-up
-    spans, reach-and-hold goals). This is the mechanical discriminator
-    that decides whether `fast_completion` is a REQUIRED positive (a
-    reach-goal completed faster is still completed) or record-only (a
-    gait/rhythm clip sped 16x is a different motion — convicting an
-    honest pace-sensitive metric on it would be the false-reject class
-    D3 exists to prevent)."""
+    """True when the clip's final `_ENDS_SETTLED_WINDOW_S` shows no real
+    trend — the motion REACHES a state and stays there (get-up spans,
+    sit-up spans, reach-and-hold goals). This is the mechanical
+    discriminator that decides whether `fast_completion` is a REQUIRED
+    positive (a reach-goal completed faster is still completed) or
+    record-only (a gait/rhythm clip sped 16x is a different motion —
+    convicting an honest pace-sensitive metric on it would be the
+    false-reject class D3 exists to prevent). Slope is a least-squares
+    fit, robust to single-frame mocap noise that a min/max range read
+    amplifies."""
     z = np.asarray(clip["root_pos_z"], dtype=np.float64)
     fps = float(clip["fps"])
-    w = max(2, int(round(_ENDS_SETTLED_WINDOW_S * fps)))
+    # Window scales with the clip: a short clip's hold tail can be
+    # shorter than a fixed 1.0 s window, and a trend fitted across the
+    # transition itself would misread reach-and-hold as still-moving.
+    duration_s = z.shape[0] / fps
+    w_s = max(0.3, min(_ENDS_SETTLED_WINDOW_S, 0.25 * duration_s))
+    w = max(3, int(round(w_s * fps)))
     w = min(w, z.shape[0])
-    tail_z = z[-w:]
-    if float(tail_z.max() - tail_z.min()) > _ENDS_SETTLED_Z_RANGE_M:
+    t = np.arange(w, dtype=np.float64) / fps
+    z_slope = float(np.polyfit(t, z[-w:], 1)[0])
+    if abs(z_slope) > _ENDS_SETTLED_Z_SLOPE_MPS:
         return False
     quat = clip.get("root_quat_wxyz")
     if quat is not None:
         from sculptor.refs.convert import _projected_gravity_b
 
         g_z = _projected_gravity_b(np.asarray(quat))[-w:, 2]
-        if float(g_z.max() - g_z.min()) > _ENDS_SETTLED_GZ_RANGE:
+        gz_slope = float(np.polyfit(t, g_z, 1)[0])
+        if abs(gz_slope) > _ENDS_SETTLED_GZ_SLOPE_PS:
             return False
     return True
 

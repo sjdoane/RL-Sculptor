@@ -258,8 +258,9 @@ def compute_spec(arrays, behavior, meta):
         return {"spec_score": 0.0}
     z = root[..., 2]
     n = z.shape[0]
+    # start read: EARLIEST frames (FAST-COMPLETION rule); end reads wide.
     q = min(15, n)
-    rise = np.clip(z[-q:].mean() - z[:q].mean(), 0.0, None)
+    rise = np.clip(z[-q:].mean() - z[:min(5, n)].min(), 0.0, None)
     gz = g[..., 2] / np.maximum(np.linalg.norm(g, axis=-1), 1e-9)
     upright_end = np.clip((-gz[-q:].mean() - 0.3) / 0.6, 0.0, 1.0)
     val = float(np.clip(rise / 0.4, 0.0, 1.0) * upright_end)

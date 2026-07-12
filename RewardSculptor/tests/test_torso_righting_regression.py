@@ -89,10 +89,18 @@ def test_fixture_rollout_is_a_genuine_situp(satup_arrays):
 def test_fixed_metric_scores_the_situp_well_above_zero(
     satup_arrays, satup_behavior,
 ):
-    """THE regression gate for D24: the repaired torso_righting metric
-    (certified against the goal-aligned sub-span of the clip) must score
-    the same rollout well above zero. Skips until the fixed metric is
-    snapshotted into the fixture as metric_fixed.py."""
+    """The repaired torso_righting metric (certified against the
+    goal-aligned 0-8.1 s sub-span; live regen 2026-07-12, all six
+    reference gates green) scores the same rollout 1.0.
+
+    Honest scope (Opus audit L1): this pins the snapshotted ARTIFACT
+    (metric_fixed.py), not the pipeline — it would still pass if the
+    span/validation code regressed. The pipeline behavior itself is
+    pinned by test_reference_spans.py (selection + QC),
+    test_reference_anchored_validation.py (the six gates and their
+    exploit families), and test_criterion_ground.py (criterion
+    re-grounding); together with this file the class is covered from
+    both ends."""
     fixed = FIXTURE_DIR / "metric_fixed.py"
     if not fixed.is_file():
         pytest.skip("metric_fixed.py not yet snapshotted (D24 in flight)")
