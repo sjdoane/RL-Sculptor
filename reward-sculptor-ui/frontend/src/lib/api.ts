@@ -934,7 +934,11 @@ export async function regenerateStageMetric(
   slug: string, missionSlug: string, stageName: string,
   opts?: { nCandidates?: number },
 ): Promise<JobDetail> {
-  const body = opts?.nCandidates ? { n_candidates: opts.nCandidates } : undefined;
+  // Default 2 candidates: a user clicking Regenerate is paying attention
+  // and wants it to LAND — live evidence (D28): single-candidate regens
+  // failed repeatedly on author-quality rolls (near-constant metric, then
+  // a forbidden-name loop) where a second candidate would have covered.
+  const body = { n_candidates: opts?.nCandidates ?? 2 };
   return handle<JobDetail>(
     await fetch(
       `/api/projects/${slug}/missions/${missionSlug}/stages/${encodeURIComponent(stageName)}/metric/regenerate`,

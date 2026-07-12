@@ -181,6 +181,19 @@ Any array may be ABSENT — always `arrays.get(k)` + guard for None.
    A dead-still upright policy should score ≈0 on it (all motion channels at
    the noise floor).
 
+11. **ALLOWED CODE SURFACE (an AST allowlist rejects everything else — one
+    forbidden name anywhere rejects the whole metric, and retrying with the
+    same name burns the attempt).** Use ONLY: `import numpy as np` (plus
+    `math`), plain arithmetic/comparisons, `dict.get` (e.g. `arrays.get(...)`,
+    `behavior.get(...)`), indexing/slicing, and numpy's public array API.
+    FORBIDDEN names include: `getattr`, `setattr`, `delattr`, `eval`, `exec`,
+    `compile`, `open`, `__import__`, `globals`, `locals`, `vars`, `input`,
+    any dunder (`__...__`), any single-underscore-private attribute, and any
+    module other than numpy/math. There is NEVER a reason for `getattr` in a
+    physical-quantity metric — `meta.get("key")` / `arrays.get("key")` is
+    always the right spelling (a live metric was rejected five retries in a
+    row for `getattr(meta, ...)`).
+
 Think about which physical signature DEFINITELY distinguishes success from the
 specific failure modes — wrong direction, incomplete/partial motion, tiny
 amplitude, balancing instead of acting, flailing instead of executing — then

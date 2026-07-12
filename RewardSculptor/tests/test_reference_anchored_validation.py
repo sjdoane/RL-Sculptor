@@ -732,3 +732,32 @@ def test_settled_start_with_orientation_records_adjustment(tmp_path):
         HONEST_GETUP_POSTURE, p, references=[("getup1", clip)],
         eval_reset=eval_reset)
     assert v["references"][0]["settled_start_orientation_adjusted"] is True
+
+
+def test_keyword_family_does_not_block_reference_defer(tmp_path):
+    """LIVE D28 FINDING (g1-standing prone mission): family inference is a
+    keyword guess — 'drive up ... keep balance' routed two GET-UP stage
+    goals to a builtin family (jump / cartpole depending on phrasing) whose
+    archetype battery scores every entry 0.000 for a get-up metric. The old
+    `family is None` term then blocked the D4 reference-defer and the
+    uninformative battery rejected metrics that had passed ALL SIX
+    reference gates as 'near-constant'. The defer now fires whenever the
+    battery is uninformative and references are attached, family or not."""
+    from sculptor.eval.metric_validate import resolve_behavior_family
+
+    live_goal = (
+        "From a low crouch with both feet planted and bearing weight, "
+        "drive up through the legs, extending hips and knees to raise "
+        "the pelvis to full standing height while bringing the torso "
+        "fully upright, then keep balance briefly at the top.")
+    # Precondition of the bug: the goal DOES resolve to a builtin family.
+    assert resolve_behavior_family(live_goal, None) is not None
+
+    clip = _rising_clip()
+    p = _write(tmp_path, "honest_family.py", HONEST_GETUP)
+    v = validate_generated_metric(
+        HONEST_GETUP, p, references=[("getup1", clip)],
+        behavior_goal=live_goal)
+    assert v["ok"] is True, v["reasons"]
+    assert v["gates"]["nondegeneracy"] is True
+    assert any("deferred to attached reference" in r for r in v["reasons"])

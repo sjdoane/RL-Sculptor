@@ -653,6 +653,24 @@ def select_reference_span(
     t_start = _snap(parsed["t_start_s"], boundaries, _SNAP_TOLERANCE_S)
     t_end = _snap(parsed["t_end_s"], boundaries, _SNAP_TOLERANCE_S)
 
+    # Clamp ONCE at the source (live D28 finding, second occurrence of the
+    # M1 rounding class): `_phase_segments` rounds boundary times to 3
+    # decimals, so a snap target can sit ~0.4 ms PAST the true duration
+    # (4.742 vs 4.741667 on the a10 clip). crop_span already clamps
+    # internally, but _span_qc re-checked the UNCLAMPED values with a 1e-6
+    # tolerance and rejected, and the PERSISTED span fields would have
+    # carried the out-of-bounds number too. One clamp here means crop, QC,
+    # and persistence all see the same in-bounds span. Same half-frame
+    # tolerance as crop_span; real overshoot still fails QC below.
+    from sculptor.refs.perturb import _time_len
+
+    _dur = _time_len(clip) / float(clip["fps"])
+    _tol = max(1e-3, 0.5 / float(clip["fps"]))
+    if _dur < t_end <= _dur + _tol:
+        t_end = _dur
+    if -_tol <= t_start < 0.0:
+        t_start = 0.0
+
     try:
         cropped = crop_span(clip, t_start, t_end)
     except ValueError as e:
@@ -674,9 +692,15 @@ def select_reference_span(
             "select_reference_span: qc_reject:end_state: %s", end_state_reason)
         return None, f"qc_reject:end_state:{end_state_reason}"
 
+    # THIRD occurrence of the 3-decimal rounding class (M1, then the QC
+    # bounds re-check, now here): rounding the CLAMPED end time for
+    # persistence can push it back past the true duration (14.2666... ->
+    # 14.267), re-planting the out-of-bounds value every consumer must then
+    # tolerate. Round for readability, then re-clamp — persisted spans are
+    # in-bounds BY CONSTRUCTION.
     return {
-        "t_start_s": round(float(t_start), 3),
-        "t_end_s": round(float(t_end), 3),
+        "t_start_s": max(0.0, round(float(t_start), 3)),
+        "t_end_s": min(round(float(t_end), 3), _dur),
         "confidence": round(float(parsed["confidence"]), 3),
         "rationale": str(parsed["rationale"])[:280],
         "method": "llm+snap+qc",

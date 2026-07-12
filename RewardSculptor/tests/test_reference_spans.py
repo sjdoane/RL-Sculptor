@@ -488,3 +488,24 @@ def test_end_state_direction_skipped_when_no_headroom():
         clip, goal_text="drive up to ready", llm_call=bad)
     assert span is None
     assert "outside expected_end.z_band" in reason
+
+
+def test_snapped_end_boundary_past_duration_is_clamped_and_accepted():
+    """LIVE D28 FINDING (second occurrence of the M1 rounding class): a
+    span proposal snapped onto a phase boundary that _phase_segments had
+    ROUNDED past the true clip duration (4.742 vs 4.741667 on the a10
+    clip) was rejected by _span_qc's own unclamped bounds re-check even
+    though crop_span clamps — and the persisted span fields would have
+    carried the out-of-bounds number. The clamp now happens ONCE at the
+    source (post-snap), so crop, QC, and persistence agree."""
+    from sculptor.reference import load_clip
+    from sculptor.refs.spans import select_reference_span
+
+    clip = load_clip(FIXTURE_CLIP)
+    duration = len(clip["root_pos_z"]) / float(clip["fps"])  # 14.26667
+    # _phase_segments' final rounded boundary sits just PAST duration.
+    span, reason = select_reference_span(
+        clip, goal_text="drive up to standing and settle",
+        llm_call=_mock_span_call(8.1, 14.267, [0.45, 0.60], up=True))
+    assert span is not None, reason
+    assert span["t_end_s"] <= duration + 1e-9

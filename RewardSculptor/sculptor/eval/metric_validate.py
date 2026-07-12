@@ -1711,21 +1711,34 @@ def validate_generated_metric(
     # ENTIRELY to `_validate_references`'s three gates below; the fixed
     # battery's own nondegeneracy check is skipped in this branch (both
     # spread-based paths below), NOT run in addition to it.
+    # NOT gated on `family is None` (live D28 finding, g1-standing prone
+    # mission): family inference is a keyword guess, and "drives up through
+    # the legs ... keep balance" routed two GET-UP stages to family "jump",
+    # whose battery scored every archetype 0.000 — uninformative — while
+    # ALL SIX reference gates passed. The old `family is None` term then
+    # blocked this defer and the uninformative battery rejected a
+    # reference-clean metric as "near-constant". A real exemplar beats a
+    # keyword-guessed family battery WHENEVER that battery carries no
+    # signal; when the family battery IS informative (spread >= spread_min
+    # and a real positive), nothing defers and family discipline holds.
     reference_anchored = (
-        references and family is None and len(finite) >= 3
+        references and len(finite) >= 3
         and (best_pos_battery <= _BATTERY_NEAR_ZERO
              or battery_spread < spread_min))
     battery_uninformative = (
         not references and family is None and len(finite) >= 3
         and best_pos_battery <= _BATTERY_NEAR_ZERO)
     if reference_anchored:
+        _fam_note = (
+            f" (keyword-inferred family {family!r} carries no battery "
+            f"signal for this goal — exemplar wins)" if family else "")
         reasons.append(
             "[nondegeneracy] deferred to attached reference(s): the fixed "
             f"archetype battery is uninformative for this novel goal "
             f"(best positive {best_pos_battery:.3f}, spread "
-            f"{battery_spread:.3f} < {spread_min}) — nondegeneracy is "
-            "decided by the reference_nondegeneracy/monotonicity/negatives "
-            "gates below")
+            f"{battery_spread:.3f} < {spread_min}){_fam_note} — "
+            "nondegeneracy is decided by the reference_nondegeneracy/"
+            "monotonicity/negatives gates below")
     elif battery_uninformative:
         probe = _selectivity_probe(fn, meta)
         selectivity = probe
