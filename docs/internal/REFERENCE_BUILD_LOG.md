@@ -656,6 +656,31 @@ of this entry (fitness 0.93/0.97 with all gates green at iters 1-2) —
 the run is not wasted; stage 1's archived 'success' and its final
 policy are garbage and stage 1 must be re-run after fixes 1-2 land.
 
+### D30. LIVE (run still untouched): redecompose sub-stages INHERIT the parent's steering_metric — D23 scope mismatch reborn one level down
+Sam watched prone_getup_and_hold__r1_0 iteration 2 stand up cleanly and
+read fitness 0.0. Events (components made this a 2-minute read-only
+diagnosis — F4 paying rent): rollouts start CROUCHED (start z 0.26,
+g_z -0.66 — exactly the sub-stage's own goal + RSI), end STANDING
+(z 0.78, g_z -0.999); the sole zeroing channel is gate_started_prone.
+Mission.json confirms all four r1_N sub-stages carry
+steering=stage_metrics/prone_getup_and_hold/metric.py — the PARENT's
+synthetic-exemplar metric, which demands a prone start the sub-stages
+are DESIGNED not to have. The span machinery DID select correct
+sub-spans for them (r1_0: 2.408-4.3 s = the crouch-to-stand tail), but
+the inherited steering_metric pointer trips generate_stage_metrics'
+"already set" skip guard (the D26a grandfathering gap, now
+twice-earned), so no sub-stage ever got its own metric.
+FIX (queued with D29; sculptor edit — forbidden while the run lives):
+redecompose must NOT copy steering_metric into sub-stages (D21
+inherited the reference BINDING deliberately; the metric pointer came
+along by accident) — leave it None so the existing lazy generation
+certifies each sub-stage against its own already-selected span; plus
+the D26a re-certification sweep for existing missions.
+Also noted for the same batch: the Results/mission-quality panel shows
+the HALTED first launch's aggregate ("reference scaffold failed",
+0/1 0%) while the relaunched run is live — the report is overwritten
+only at run end; needs per-run keying or a live refresh.
+
 ### Deferred findings (logged, not yet fixed)
 - D27 live findings (first user-driven decompose, g1-standing-up
   2026-07-12): (a) retrieval auto-attached a PRONE-start clip
