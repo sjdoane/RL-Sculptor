@@ -85,6 +85,18 @@ hopefully softened enough for it to succeed.
    original criterion. Don't soften the final criterion — soften the
    PATH to it.
 
+5b. **Sub-stages must be pairwise DISTINCT and must not re-learn a
+   sibling.** Each sub-stage must differ from every other sub-stage (and
+   from every already-SUCCEEDED mission stage) in its start state or its
+   end state — never emit two sub-stages whose descriptions could apply
+   to the same rollout. If an already-succeeded stage covers a
+   sub-skill (e.g. drive-to-stand already trained), do NOT emit a
+   sub-stage that re-learns it: warm-start from it via `parent_stage`
+   and extend. Prefer the MINIMUM ladder — live feedback (2026-07-13):
+   a 4-rung redecomposition contained two near-identical crouch-to-stand
+   rungs plus a rung duplicating a succeeded sibling, tripling the
+   training cost of one sub-skill.
+
 6. **Last sub-stage's goal_text** should clearly accomplish the
    original goal (use similar verbs and domain nouns). It does NOT
    need to be byte-identical — Claude may reword for clarity.

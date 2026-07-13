@@ -111,6 +111,16 @@ _NAT_MILD_STEER_FACTOR = 0.75     # §kick-fix: 'mild' now also down-weights (wa
 _ROOT_LAUNCH_START_MAX_M = 0.35
 _ROOT_LAUNCH_WINDOW_S = 0.5
 _ROOT_LAUNCH_RISE_M = 0.4
+#   * BALLISTIC evidence (live false-flag, 2026-07-13): a fast low-start
+#     rise ALONE is also the shape of a legitimate explosive
+#     crouch-to-stand leg drive (r1_0's own goal: 0.25 -> 0.78 m at
+#     1.9 m/s was flagged and steer zeroed, blinding keep-best/selection
+#     to the two genuine successes). An explosion is BALLISTIC — it
+#     overshoots any plausible standing height and/or moves implausibly
+#     fast (the live catapult: 2.34 m at ~6 m/s). One of these must ALSO
+#     hold before the flag fires.
+_ROOT_LAUNCH_OVERSHOOT_Z_M = 1.0
+_ROOT_LAUNCH_SPEED_MPS = 3.5
 
 
 def joint_velocity_limit(name: str) -> float:
@@ -253,9 +263,19 @@ def _root_kinematics(
         end = min(T, window_steps + 1)
         start_z = float(z_mean[0])
         peak_z = float(z_mean[:end].max())
+        # Fast low-start rise + BALLISTIC evidence (see the constants'
+        # comment): overshoot past plausible standing OR implausible root
+        # speed. Without the ballistic leg this flag convicted the stage's
+        # own explosive crouch-to-stand goal behavior (live, 2026-07-13).
+        ballistic = bool(
+            max_root_z > _ROOT_LAUNCH_OVERSHOOT_Z_M
+            or (max_root_speed is not None
+                and max_root_speed > _ROOT_LAUNCH_SPEED_MPS)
+        )
         reset_launch_detected = bool(
             start_z < _ROOT_LAUNCH_START_MAX_M
             and (peak_z - start_z) > _ROOT_LAUNCH_RISE_M
+            and ballistic
         )
 
     return {

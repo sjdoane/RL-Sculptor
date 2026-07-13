@@ -624,3 +624,34 @@ def test_naturalness_channel_reset_launch_false_does_not_reject() -> None:
     assert nat["hard_reject"] is False
     assert nat["steer_factor"] == 1.0
     assert nat["flag"] is None
+
+
+def test_root_kinematics_does_not_flag_explosive_leg_drive(tmp_path: Path) -> None:
+    """LIVE FALSE-FLAG (2026-07-13, prone_getup_and_hold__r1_0): the
+    stage's OWN goal behavior — an explosive crouch-to-stand leg drive,
+    z 0.25 -> 0.78 m inside the 0.5 s window at ~1.9 m/s peak — was
+    flagged reset_launch_explosion, its steer fitness zeroed, and
+    keep-best/selection went blind to the two genuine successes while a
+    never-stands iteration was kept on a mean-return tiebreak. A fast
+    low-start rise alone is NOT an explosion: it must also be BALLISTIC
+    (overshoot past plausible standing, or implausible root speed)."""
+    T = 100  # 50 fps -> 2 s
+    z = np.full(T, 0.78, dtype=np.float64)
+    # rise 0.25 -> 0.78 over 20 frames (0.4 s): peak speed ~1.3 m/s
+    z[:20] = np.linspace(0.25, 0.78, 20)
+    traj, limits = _write_root_trajectory(tmp_path, z)
+    out = audit_rollout(traj, limits)
+    rk = out["root_kinematics"]
+    assert rk is not None
+    assert rk["reset_launch_detected"] is False, rk
+    assert rk["max_root_z"] == pytest.approx(0.78, abs=1e-2)
+
+    # The SAME rise shape overshooting to 2.3 m (the real catapult's
+    # apex) IS ballistic and must still flag.
+    z2 = np.full(T, 2.3, dtype=np.float64)
+    z2[:20] = np.linspace(0.25, 2.3, 20)
+    sub = tmp_path / "explosion"
+    sub.mkdir()
+    traj2, limits2 = _write_root_trajectory(sub, z2)
+    out2 = audit_rollout(traj2, limits2)
+    assert out2["root_kinematics"]["reset_launch_detected"] is True
