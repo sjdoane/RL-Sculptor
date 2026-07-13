@@ -712,3 +712,154 @@ def test_prone_pi_roll_offset_survives_rounding_and_validates() -> None:
     problems = validate_env_spec(spec)
     bound_problems = [p for p in problems if "outside hard bounds" in p]
     assert bound_problems == [], bound_problems
+
+
+# ── §D29-1: analytic pitch/roll derivation FROM body-frame gravity ─────
+# D29 live disaster: the PRIOR derivation (raw per-axis Euler angles at
+# the clip's start window MINUS the clip's own end/"standing" window)
+# derived (pitch=-0.05, roll=pi) for a clip whose true start body-frame
+# gravity was (0.96, -0.12, 0.24) — reconstructing as (0, 0, +1),
+# UPSIDE-DOWN. The fix derives (pitch, roll) directly from the MEASURED
+# start-window gravity (no cross-window subtraction, no dependence on
+# the clip's own end pose) and mechanically gates the result. These
+# tests use an INDEPENDENT oracle (`_oracle_gravity_from_quat`, a
+# Hamilton-product quaternion rotation — the same style as reference.py's
+# own `_body_frame_gravity_x`, pinned by
+# `test_body_frame_gravity_x_prone_vs_supine` in
+# tests/test_start_pose_qc_settle.py) rather than importing the module's
+# new `_quat_wxyz_to_gravity_b` closed form, so the checks below don't
+# just re-assert the implementation against itself.
+def _oracle_gravity_from_quat(q: np.ndarray) -> np.ndarray:
+    """Independent reference implementation of body-frame gravity
+    (`R(q)^T @ (0, 0, -1)`) from a `[w, x, y, z]` unit quaternion, via
+    the raw Hamilton product — NOT the closed-form `_quat_wxyz_to_
+    gravity_b` under test."""
+    w, x, y, z = (float(v) for v in q)
+    qc = np.array([w, -x, -y, -z])
+    g_world = np.array([0.0, 0.0, 0.0, -1.0])
+
+    def _ham(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+        aw, ax, ay, az = a
+        bw, bx, by, bz = b
+        return np.array([
+            aw * bw - ax * bx - ay * by - az * bz,
+            aw * bx + ax * bw + ay * bz - az * by,
+            aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw,
+        ])
+
+    g_body = _ham(_ham(qc, g_world), np.array([w, x, y, z]))
+    return g_body[1:]
+
+
+def test_prone_gravity_case_derives_not_upside_down() -> None:
+    """(a) The LIVE D29 prone case: a clip whose start-window gravity
+    measures (0.96, -0.12, 0.24) — true prone — must derive orientation
+    offsets whose reconstructed gravity is within the 0.35 rad gate of
+    the measured vector, and must NOT reconstruct as upside-down
+    (0, 0, 1) (the live failure: (pitch=-0.05, roll=pi) -> (0, 0, +1),
+    1.38 rad off)."""
+    from sculptor.reference import _quat_from_pitch_roll
+
+    target_g = np.array([0.96, -0.12, 0.24])
+    target_g = target_g / np.linalg.norm(target_g)
+    # Independently invert (not via the code under test) to build a
+    # synthetic mocap quat measuring this gravity.
+    pitch = float(np.arcsin(np.clip(target_g[0], -1.0, 1.0)))
+    roll = float(np.arctan2(-target_g[1], -target_g[2]))
+    start_quat = _quat_from_pitch_roll(pitch, roll)
+    assert _oracle_gravity_from_quat(start_quat) == pytest.approx(
+        target_g, abs=1e-6)
+
+    clip = _make_getup_clip(with_quat=False)
+    fps = float(clip["fps"])
+    n = clip["root_pos_z"].shape[0]
+    nw = max(2, int(round(0.5 * fps)))
+    quat = np.tile(np.array([1.0, 0.0, 0.0, 0.0]), (n, 1))
+    quat[:nw] = start_quat
+    clip["root_quat_wxyz"] = quat
+    assert validate_clip(clip) == []
+
+    derived = derive_reference_reset(clip)   # must NOT raise
+    lo_p, hi_p = derived["reset_pitch_offset_rad"]
+    lo_r, hi_r = derived["reset_roll_offset_rad"]
+    mid_pitch = (lo_p + hi_p) / 2.0
+    mid_roll = (lo_r + hi_r) / 2.0
+
+    recon_g = _oracle_gravity_from_quat(
+        _quat_from_pitch_roll(mid_pitch, mid_roll))
+    cos_ang = float(np.clip(np.dot(recon_g, target_g), -1.0, 1.0))
+    angle = float(np.arccos(cos_ang))
+    assert angle < 0.35, (recon_g, target_g, angle)
+    assert not np.allclose(recon_g, [0.0, 0.0, 1.0], atol=0.3), recon_g
+
+
+def test_supine_fixture_clip_derives_reconstructable_offsets() -> None:
+    """(b) Supine regression guard: fixing prone must not break supine.
+    The live sit-up fixture clip
+    (tests/fixtures/torso_righting_satup/reference_clip.npz) must still
+    derive an orientation reconstructing its own measured start-window
+    gravity within the gate tolerance."""
+    fixture = (Path(__file__).parent / "fixtures" / "torso_righting_satup"
+               / "reference_clip.npz")
+    clip = load_clip(fixture)
+    assert clip.get("root_quat_wxyz") is not None
+
+    quat = np.asarray(clip["root_quat_wxyz"], dtype=np.float64)
+    fps = float(clip["fps"])
+    nw = max(2, int(0.5 * fps))
+    g_frames = np.stack(
+        [_oracle_gravity_from_quat(q) for q in quat[:nw]])
+    g_mean = g_frames.mean(axis=0)
+    g_mean = g_mean / np.linalg.norm(g_mean)
+    # Sanity: this fixture really is supine-shaped (measurably NOT
+    # upright — a nonzero angle from (0, 0, -1)).
+    assert g_mean[2] > -0.95
+
+    from sculptor.reference import _quat_from_pitch_roll
+
+    derived = derive_reference_reset(clip)   # must NOT raise
+    lo_p, hi_p = derived["reset_pitch_offset_rad"]
+    lo_r, hi_r = derived["reset_roll_offset_rad"]
+    mid_pitch = (lo_p + hi_p) / 2.0
+    mid_roll = (lo_r + hi_r) / 2.0
+    recon_g = _oracle_gravity_from_quat(
+        _quat_from_pitch_roll(mid_pitch, mid_roll))
+    cos_ang = float(np.clip(np.dot(recon_g, g_mean), -1.0, 1.0))
+    angle = float(np.arccos(cos_ang))
+    assert angle < 0.35, (recon_g, g_mean, angle)
+
+
+def test_low_start_upright_torso_derives_near_zero_orientation() -> None:
+    """(c) A low-start (getup-archetype BY HEIGHT) clip whose torso is
+    already upright at the start window (identity quat throughout) must
+    derive near-zero pitch/roll offsets — height alone triggers a low
+    start; there is no orientation correction to make."""
+    clip = _make_getup_clip(with_quat=False)
+    n = clip["root_pos_z"].shape[0]
+    clip["root_quat_wxyz"] = np.tile([1.0, 0.0, 0.0, 0.0], (n, 1))
+    assert validate_clip(clip) == []
+
+    derived = derive_reference_reset(clip)
+    lo_p, hi_p = derived["reset_pitch_offset_rad"]
+    lo_r, hi_r = derived["reset_roll_offset_rad"]
+    assert abs(lo_p) < 1e-6 and abs(hi_p) < 1e-6
+    assert abs(lo_r) < 1e-6 and abs(hi_r) < 1e-6
+
+
+def test_orientation_gate_raises_on_forced_inconsistent_reconstruction(
+    monkeypatch,
+) -> None:
+    """(e) THE GATE: forced-inconsistent reconstruction (monkeypatched)
+    must raise — the honest math never hits this in practice; this
+    proves the safety net actually fires when the reconstruction step
+    disagrees with the measured gravity."""
+    import sculptor.reference as reference_mod
+
+    monkeypatch.setattr(
+        reference_mod, "_quat_from_pitch_roll",
+        lambda pitch, roll: np.array([1.0, 0.0, 0.0, 0.0]),  # always identity
+    )
+    clip = _make_getup_clip(with_quat=True)   # lying ~ pi/2 pitch start
+    with pytest.raises(ValueError, match="self-consistency gate"):
+        derive_reference_reset(clip)

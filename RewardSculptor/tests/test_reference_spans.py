@@ -66,18 +66,35 @@ def test_crop_span_torso_righting_sub_span(satup_clip):
     assert g_z_change >= 0.15
 
 
-def test_cropped_span_yields_different_eval_reset_than_full_clip(satup_clip):
-    """§D24 F1 (docs/internal/REFERENCE_BUILD_LOG.md): every consumer of
-    a stage's reference clip (RSI derivation, eval-reset) MUST resolve
-    the persisted SPAN, never derive against the full clip independently
-    — proven here because the two measurably DIFFER on the real fixture.
-    `derive_reference_reset`'s reset_pitch_offset_rad/roll are computed
-    as `start_window - end_window` (`sculptor.reference.
-    derive_reference_reset`): the FULL clip's end window is its own true
-    standing finish (~14.27s), while the [0, 8.5]s span's end window is
-    still mid-recovery (torso righted, not yet standing — the exact
-    D23/D24 scope mismatch this whole program exists to fix), so the two
-    derivations cannot agree."""
+def test_cropped_span_and_full_clip_agree_on_eval_reset(satup_clip):
+    """§D29-1 (docs/internal/REFERENCE_BUILD_LOG.md) supersedes this
+    test's original D24 F1 claim. PRE-§D29-1, `derive_reference_reset`'s
+    reset_pitch_offset_rad/roll were computed as `start_window -
+    end_window` — the clip's own END window leaked into the derivation,
+    so a [0, 8.5]s span (whose end is still mid-recovery) measurably
+    disagreed with the full clip (whose end is the true standing
+    finish). §D29-1 replaced that cross-window subtraction with an
+    analytic derivation FROM the START window's measured body-frame
+    gravity alone (the D29 live disaster: subtracting a clip-relative
+    "standing" reference produced an UPSIDE-DOWN prone reset) — the SAME
+    fix D19 already made for `reset_height_offset_m` (anchored on the
+    absolute G1-class standing constant, not the clip's own end). Both
+    the full clip and the [0, 8.5]s span share the IDENTICAL start
+    window (span cropping only moves the END), so every RSI/eval-reset
+    key is now — correctly — BYTE-IDENTICAL between them; numerically
+    confirmed on this fixture (both derive reset_pitch_offset_rad=
+    -0.8825, reset_roll_offset_rad=0.037, reset_height_offset_m=-0.601).
+
+    Phase-cropped SPANS still matter — for CERTIFICATION (a stage's
+    metric must be certified against its own sub-phase, not the full
+    clip's — D23/D24's actual motivating bug) and for the sunk-height
+    termination guard (`min_base_height_termination_m`, `derive_rsi_
+    train_keys`, anchored on `z.min()` over WHATEVER clip/span is
+    passed in — see `test_crop_span_torso_righting_sub_span` above and
+    `sculptor/refs/spans.py`/`mission_metrics.py` for the certification
+    side) — RSI/eval-reset derivation specifically is just no longer one
+    of the places that dependency shows up, now that BOTH its height and
+    orientation channels are purely start-window-anchored."""
     from sculptor.reference import derive_eval_reset
 
     full_reset = derive_eval_reset(satup_clip)
@@ -88,8 +105,7 @@ def test_cropped_span_yields_different_eval_reset_than_full_clip(satup_clip):
     assert span_reset is not None
     assert "reset_pitch_offset_rad" in full_reset
     assert "reset_pitch_offset_rad" in span_reset
-    assert full_reset["reset_pitch_offset_rad"] != pytest.approx(
-        span_reset["reset_pitch_offset_rad"], abs=1e-3)
+    assert full_reset == span_reset
 
 
 @pytest.mark.parametrize("t_start,t_end", [

@@ -19,6 +19,17 @@ the rollout runner in §7.1), compute three headline metrics:
     usually a reward-hacking signal — the default reward terms clip
     at limits; the policy is finding a way past them.
 
+§D29-3: a FOURTH, independent block — **root_kinematics** — computed
+from `root_link_pos_w` (when present). The three metrics above are all
+JOINT-space; none of them look at ROOT position, so a reset-time
+contact-force explosion (a low start that rockets upward in the
+episode's first instant — the live D29 disaster: a mis-derived prone
+reset spawned interpenetrating the floor and launched to z=2.34 m) was
+invisible to this audit even at verdict='ok'. `root_kinematics.
+reset_launch_detected` closes that gap and feeds `naturalness_channel`'s
+hard-reject path exactly like a joint-limit violation does — see that
+function's docstring.
+
 The audit returns a verdict in `{"ok", "mild", "severe", "unknown"}`
 that downstream consumers (diagnose prompt, UI chip, §7.4 auto-adjust
 trigger) can switch on. `unknown` is returned when inputs are missing
@@ -76,6 +87,30 @@ _MILD_VEL_LIMIT_RATIO = 1.0    # at/above a real no-load speed → mild
 _NAT_LIMIT_VIOLATION_FRAC = 0.01  # any real breach past the joint stops = exploit
 _NAT_SEVERE_STEER_FACTOR = 0.5    # down-weight a 'severe' (vel/torque) rollout's steer credit
 _NAT_MILD_STEER_FACTOR = 0.75     # §kick-fix: 'mild' now also down-weights (was 1.0)
+
+# §D29-3: root-kinematics channel. The live D29 disaster (a PRONE reset
+# derived upside-down — see reference.py's §D29-1 fix — spawned the robot
+# interpenetrating the floor) had realism verdict='ok' steer_factor=1.0 on
+# a rollout that launched the pelvis from a sub-0.35 m reset to z=2.34 m
+# within a fraction of a second: every channel above audits JOINT space
+# only (torque/velocity/limits) and never looks at ROOT position at all,
+# so a reset-time contact explosion is invisible to it. Deliberately
+# narrow / conservative by design — flags ONLY the reset-launch pattern
+# (a low start that rockets upward in the FIRST instant of the episode),
+# never general fast motion, a real jump's flight phase, or a get-up's
+# later multi-second rise:
+#   * _ROOT_LAUNCH_START_MAX_M: a start below this counts as "low" (the
+#     same reference-derived lying/crouched-start band as reference.py's
+#     `_GETUP_START_MAX_M`) — a real jump task starts near G1-class
+#     standing (~0.74 m; reference.py's `G1_CLASS_STAND_M`), so a
+#     legitimate launch never starts this low.
+#   * _ROOT_LAUNCH_WINDOW_S: how quickly the rise must happen to be
+#     reset-time (not a genuine, gradual get-up).
+#   * _ROOT_LAUNCH_RISE_M: how far MEAN root z (averaged across envs, so
+#     one noisy env can't trip it alone) must rise within that window.
+_ROOT_LAUNCH_START_MAX_M = 0.35
+_ROOT_LAUNCH_WINDOW_S = 0.5
+_ROOT_LAUNCH_RISE_M = 0.4
 
 
 def joint_velocity_limit(name: str) -> float:
@@ -174,6 +209,61 @@ def _per_joint_limit_violation(
     # (T, N, J) → (T, N, J) booleans.
     out_of_range = (joint_pos < lo) | (joint_pos > hi)
     return out_of_range.mean(axis=(0, 1)).astype(np.float64)
+
+
+def _root_kinematics(
+    traj: dict[str, np.ndarray], step_dt: "float | None",
+) -> dict[str, Any] | None:
+    """§D29-3: the root-space companion to the joint-space channels above
+    (see the module-level `_ROOT_LAUNCH_*` comment for the full
+    rationale). Computed from `root_link_pos_w`, shape `(T, N, 3)`.
+
+    Returns `None` when `root_link_pos_w` is absent/malformed (older
+    trajectories, or a fixed-base task) — never raises. `step_dt`
+    unknown (`None` or `<= 0`) still returns `max_root_z`; the
+    time-windowed `reset_launch_detected` and dt-normalized
+    `max_root_speed_mps` fall back to `False`/`None` respectively (fails
+    toward NOT flagging, same "degrade rather than guess" discipline as
+    every other verdict-affecting computation in this module)."""
+    root = traj.get("root_link_pos_w")
+    if root is None:
+        return None
+    root = np.asarray(root)
+    if (root.ndim != 3 or root.shape[2] < 3
+            or root.shape[0] < 1 or root.shape[1] < 1):
+        return None
+
+    z = root[..., 2].astype(np.float64)   # (T, N)
+    max_root_z = float(z.max())
+
+    max_root_speed: "float | None" = None
+    reset_launch_detected = False
+    T = root.shape[0]
+    if step_dt is not None and step_dt > 0:
+        if T >= 2:
+            disp = (root[1:].astype(np.float64)
+                    - root[:-1].astype(np.float64))         # (T-1, N, 3)
+            speed = np.linalg.norm(disp, axis=-1) / float(step_dt)
+            if speed.size:
+                max_root_speed = float(speed.max())
+        # Mean across envs (one noisy env can't trip this alone), first
+        # `_ROOT_LAUNCH_WINDOW_S` seconds of the episode.
+        z_mean = z.mean(axis=1)                              # (T,)
+        window_steps = max(1, int(round(_ROOT_LAUNCH_WINDOW_S / step_dt)))
+        end = min(T, window_steps + 1)
+        start_z = float(z_mean[0])
+        peak_z = float(z_mean[:end].max())
+        reset_launch_detected = bool(
+            start_z < _ROOT_LAUNCH_START_MAX_M
+            and (peak_z - start_z) > _ROOT_LAUNCH_RISE_M
+        )
+
+    return {
+        "reset_launch_detected": reset_launch_detected,
+        "max_root_speed_mps": (
+            round(max_root_speed, 4) if max_root_speed is not None else None),
+        "max_root_z": round(max_root_z, 4),
+    }
 
 
 def _verdict(
@@ -330,6 +420,24 @@ def audit_rollout(
     verdict = _verdict(overall_sat, any_joint_sat, vel_multiplier,
                        vel_limit_max_ratio)
 
+    # §D29-3: root-kinematics channel — independent of the joint-space
+    # metrics above, so computed even when this rollout's root data is
+    # absent/malformed (`_root_kinematics` degrades to `None`, never
+    # affecting `verdict`). `step_dt` is read best-effort from the
+    # `behavior.json` the SAME rollout runner writes as a sibling of
+    # `trajectory_path`/`limits_path` in the rollout dir (`_mjlab_runner
+    # .py`'s `output_dir` — all three land together); missing/unreadable
+    # just means the time-windowed `reset_launch_detected` can't be
+    # computed (see `_root_kinematics`'s docstring).
+    step_dt: "float | None" = None
+    behavior = _safe_load_json(Path(trajectory_path).parent / "behavior.json")
+    if behavior:
+        try:
+            step_dt = float(behavior.get("step_dt") or 0.0) or None
+        except Exception:  # noqa: BLE001
+            step_dt = None
+    root_kinematics = _root_kinematics(traj, step_dt)
+
     return {
         "verdict": verdict,
         "torque_saturation_frac": round(overall_sat, 4),
@@ -345,6 +453,7 @@ def audit_rollout(
         "n_actuators": int(A),
         "n_joints": int(J),
         "n_steps": int(T),
+        "root_kinematics": root_kinematics,
     }
 
 
@@ -422,6 +531,13 @@ def naturalness_channel(audit: dict[str, Any] | None) -> dict[str, Any]:
       * HARD-REJECT only on a genuine joint-LIMIT violation (the policy is
         exploiting PAST the joint stops — an unambiguous physics exploit): the
         iteration earns NO steer credit (`steer_factor=0.0`).
+      * HARD-REJECT also on a reset-time root LAUNCH (§D29-3: `audit.
+        root_kinematics.reset_launch_detected` — a low reset that rockets
+        upward in the episode's first instant, e.g. a floor-interpenetration
+        contact explosion) — the SAME unambiguous-exploit category as a
+        joint-limit violation, just detected in ROOT space instead of
+        joint space (the D29 live rollout that motivated this had
+        verdict='ok' with none of the joint-space channels tripping).
       * a `"severe"` verdict WITHOUT a limit violation (an 18 rad/s whip /
         torque saturation) is DOWN-WEIGHTED + flagged, NOT rejected — a
         genuinely aggressive-but-valid kick legitimately has a high vel-p99.
@@ -434,6 +550,30 @@ def naturalness_channel(audit: dict[str, Any] | None) -> dict[str, Any]:
         return {"verdict": "unknown", "hard_reject": False,
                 "steer_factor": 1.0, "flag": None, "reason": "no audit"}
     verdict = str(audit.get("verdict", "unknown"))
+    # §D29-3: reset-time root LAUNCH is checked before every joint-space
+    # channel below — it's the same "unambiguous exploit, no legitimate
+    # task does this" category as a joint-limit violation (the D29 live
+    # rollout that motivated this had verdict='ok' with none of the
+    # joint-space channels below tripping at all). Same hard-reject
+    # machinery (`hard_reject=True`, `steer_factor=0.0`) as the existing
+    # joint-limit-exploit reject, just a DIFFERENT flag name — consumers
+    # already read `flag`/`hard_reject` via `.get(...)` with no fixed
+    # enum (`sculpt.py`'s `naturalness_flag`/`naturalness_hard_reject`
+    # event fields, checked before this change), so a new flag value
+    # cannot crash an existing reader.
+    root_kin = audit.get("root_kinematics") or {}
+    if bool(root_kin.get("reset_launch_detected")):
+        return {
+            "verdict": verdict, "hard_reject": True, "steer_factor": 0.0,
+            "flag": "reset_launch_explosion",
+            "reason": (
+                f"reset-time root launch detected — mean root height rose "
+                f"> {_ROOT_LAUNCH_RISE_M} m within {_ROOT_LAUNCH_WINDOW_S} s "
+                f"from a sub-{_ROOT_LAUNCH_START_MAX_M} m start (max root "
+                f"z={root_kin.get('max_root_z')} m) — a reset-time contact-"
+                f"force explosion (§D29), not legitimate motion; no steer "
+                f"credit (hard reject)"),
+        }
     # §kick-fix: threshold the WORST joint (joint_limit_violation_max), not the
     # J-averaged mean — a single-joint limit exploit on a high-DOF robot dilutes
     # under the gate in the mean. Fall back to the mean key for older audit dicts

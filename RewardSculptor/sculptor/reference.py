@@ -609,13 +609,104 @@ def _quat_wxyz_to_roll_rad(q: np.ndarray) -> np.ndarray:
     return np.arctan2(sinr_cosp, cosr_cosp)
 
 
+# ── §D29-1: analytic pitch/roll derivation FROM body-frame gravity ─────
+# D29 root cause: the prior derivation extracted RAW per-axis Euler
+# angles at the clip's start window AND its own end/"standing" window,
+# then SUBTRACTED them (`offset = start - stand`) to get a delta applied
+# at reset. That subtraction silently assumed the clip's own end window
+# equals the ROBOT's actual default (identity) orientation — untrue for
+# real mocap (residual yaw/lean/noise) — and Euler-angle subtraction is
+# not equivalent to relative-rotation composition at large angles /
+# branch boundaries. A true-prone clip (start body-frame gravity
+# (0.96, -0.12, 0.24)) derived (pitch=-0.05, roll=pi), whose body gravity
+# is (0, 0, +1) — UPSIDE-DOWN (angle error 1.38 rad from the measured
+# vector) — the robot spawned interpenetrating the floor and
+# contact-exploded to z 2.34 m.
+#
+# The fix derives directly from MEASURED body-frame gravity instead:
+# `reset_root_state_uniform` (mjlab `envs/mdp/events.py`, confirmed by
+# reading the installed package) composes
+# `orientations = quat_mul(default_quat, quat_from_euler_xyz(roll, pitch,
+# yaw=0))`, and the G1 pelvis carries no MJCF `quat` attribute — i.e.
+# `default_quat` is IDENTITY (already established by `_quat_from_pitch_
+# roll`'s docstring/tests below). With an identity default, world gravity
+# `g_world=(0,0,-1)` rotated into the body frame by the resulting
+# orientation is, for `yaw=0` (yaw is unobservable from gravity — a
+# rotation about world +z leaves `(0,0,-1)` unchanged before the
+# body-frame projection, so it is legitimately dropped, never guessed):
+#     gx = sin(pitch)
+#     gy = -sin(roll) * cos(pitch)
+#     gz = -cos(roll) * cos(pitch)
+# which inverts in closed form (pitch in [-pi/2, pi/2], cos(pitch) >= 0
+# so the shared positive scale factor drops out of atan2):
+#     pitch = arcsin(gx)
+#     roll  = atan2(-gy, -gz)
+# Numerically verified against mjlab's OWN `quat_mul`/`quat_from_euler_
+# xyz`/`quat_apply_inverse` (the exact functions `reset_root_state_
+# uniform` and `EntityData.projected_gravity_b` use) over 2000 random
+# (pitch, roll) pairs: max reconstruction error ~5e-7 (float32-scale
+# torch noise). On the live D29 gravity vector this closed form derives
+# pitch=1.2982 rad, roll=2.6779 rad, reconstructing (0.9631, -0.1204,
+# 0.2408) — the measured vector exactly (angle error 0.0), not upside
+# down. `_quat_wxyz_to_gravity_b`'s gx/gy component formulas are
+# algebraically identical to `_quat_wxyz_to_pitch_rad`/`_quat_wxyz_to_
+# roll_rad` above (gravity is exactly what those two Euler angles
+# encode) — the bug was never the per-axis trig, only the cross-window
+# subtraction this replaces.
+_ORIENTATION_GATE_MAX_RAD = 0.35
+
+
+def _quat_wxyz_to_gravity_b(q: np.ndarray) -> np.ndarray:
+    """Body-frame gravity DIRECTION for a batch of unit quaternions
+    `(..., 4)` in `[w, x, y, z]` order — world gravity `(0, 0, -1)`
+    rotated into the body frame (`R(q)^T @ (0, 0, -1)`), matching
+    mjlab's `EntityData.projected_gravity_b` convention exactly
+    (`quat_apply_inverse(root_link_quat_w, gravity_vec_w)` with
+    `gravity_vec_w = (0, 0, -1)` — confirmed by reading `mjlab/entity/
+    entity.py` and `mjlab/entity/data.py`). Returns `(..., 3)`, matching
+    `q`'s leading shape. Pure function of `q` — no default-orientation
+    assumption is baked in here (that only enters via `_gravity_to_
+    pitch_roll`'s use at yaw=0 for the RESET composition, below)."""
+    w, x, y, z = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
+    gx = 2.0 * (w * y - x * z)
+    gy = -2.0 * (y * z + w * x)
+    gz = 2.0 * (x * x + y * y) - 1.0
+    return np.stack([gx, gy, gz], axis=-1)
+
+
+def _gravity_to_pitch_roll(g: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Inverse of the reset composition's forward direction (`_quat_
+    from_pitch_roll`, defined below): the `(pitch, roll)` pair (yaw
+    dropped — unobservable from gravity) whose `_quat_from_pitch_roll`
+    quaternion reproduces body-frame gravity `g` (shape `(..., 3)`,
+    NOT required to be exactly unit-norm — only its direction is used).
+    Gimbal-locked at `|gx| == 1` (pitch = +-pi/2): `roll` is genuinely
+    unobservable there (both `gy` and `gz` collapse to 0 regardless of
+    roll) and `np.arctan2(0, 0)` returns `0.0`, a harmless, self-
+    consistent choice (the self-consistency gate below still passes,
+    since roll=0 reconstructs the SAME degenerate gravity)."""
+    gx, gy, gz = g[..., 0], g[..., 1], g[..., 2]
+    pitch = np.arcsin(np.clip(gx, -1.0, 1.0))
+    roll = np.arctan2(-gy, -gz)
+    return pitch, roll
+
+
 def derive_reference_reset(clip: dict) -> dict:
     """`derive_rsi_train_keys` plus, when the clip carries
     `root_quat_wxyz` AND is get-up-shaped (getup OR mid_start — §D19
     closure), ADDITIONAL `reset_pitch_offset_rad` / `reset_roll_offset_rad`
-    ranges derived from the clip's initial-window orientation relative to
-    its own end-window (standing-like) orientation, PLUS (when the clip
-    carries `joint_pos`) a `reset_joint_pos_target` vector — the root-
+    ranges derived ANALYTICALLY from the clip's initial-window MEASURED
+    body-frame gravity (§D29-1 — see `_quat_wxyz_to_gravity_b`/
+    `_gravity_to_pitch_roll`'s module-level comment for the full closed-
+    form derivation and its mjlab-composition proof; NOT relative to the
+    clip's own end window any more — that cross-window subtraction was
+    the D29 upside-down-prone-reset root cause), gated by a mechanical
+    self-consistency check (reconstruct the reset orientation from the
+    derived midpoint and require its body gravity to land back within
+    `_ORIENTATION_GATE_MAX_RAD` of the measured vector — raises
+    `ValueError` naming both vectors on failure, fail-closed rather than
+    scaffold a wrong pose), PLUS (when the clip carries `joint_pos`) a
+    `reset_joint_pos_target` vector — the root-
     orientation and per-joint-posture halves of a low/mid start
     (§REFERENCE_TRAJECTORY_PLAN §8's "PLUS ... initial joint posture and
     root orientation" extension, now fully wired through
@@ -658,26 +749,74 @@ def derive_reference_reset(clip: dict) -> dict:
         fps = float(clip["fps"])
         nw = max(2, int(_ARCHETYPE_WINDOW_S * fps))
         quat_arr = np.asarray(quat, dtype=np.float64)
-        for key, fn in (
-                ("reset_pitch_offset_rad", _quat_wxyz_to_pitch_rad),
-                ("reset_roll_offset_rad", _quat_wxyz_to_roll_rad)):
-            angle = fn(quat_arr)
-            start = angle[:nw]
-            stand = float(np.median(angle[-nw:]))
-            offset = start - stand
-            lo, hi = _TRAIN_RANGES[key]
-            a_lo = min(max(float(offset.min()), lo), hi)
-            a_hi = min(max(float(offset.max()), lo), hi)
-            if a_hi < a_lo:
-                a_lo, a_hi = a_hi, a_lo
-            # Round-then-RE-CLAMP: a prone clip's roll offset is exactly
-            # pi and round(pi, 4) = 3.1416 > pi — this exact line produced
-            # the live reference_scaffold_failed (env-spec hard-bound
-            # reject) on the first prone mission, 2026-07-13.
-            derived[key] = [
-                min(max(round(a_lo, 4), lo), hi),
-                min(max(round(a_hi, 4), lo), hi),
-            ]
+        start_quat = quat_arr[:nw]
+        # §D29-1: per-frame MEASURED body-frame gravity over the start
+        # window — no cross-window subtraction, no "standing" reference
+        # window at all (the reset's actual base is the ROBOT's own
+        # identity default, not this clip's own end pose).
+        g_frames = _quat_wxyz_to_gravity_b(start_quat)   # (nw, 3)
+        g_mean = g_frames.mean(axis=0)
+        g_mean_norm = float(np.linalg.norm(g_mean))
+        if g_mean_norm < 1e-6:
+            raise ValueError(
+                "reference clip start window produced a degenerate "
+                "(near-zero-norm) mean body-frame gravity vector — "
+                "cannot derive a reset orientation from it (orientation "
+                "frames may be corrupt or cancel out over the window)"
+            )
+        g_mean_unit = g_mean / g_mean_norm
+        pitch_mid, roll_mid = _gravity_to_pitch_roll(g_mean_unit)
+        pitch_mid = float(pitch_mid)
+        roll_mid = float(roll_mid)
+
+        # §D29-1 THE GATE: reconstruct the reset orientation from the
+        # derived midpoints using the EXACT composition `reset_root_
+        # state_uniform` applies (`_quat_from_pitch_roll` — proven
+        # against mjlab's own quat_mul/quat_from_euler_xyz below), then
+        # require its body gravity to land back within
+        # `_ORIENTATION_GATE_MAX_RAD` of the clip's measured gravity.
+        # The live D29 upside-down derivation ((pitch=-0.05, roll=pi) vs
+        # measured (0.96,-0.12,0.24)) fails this by ~1.38 rad — fails
+        # the stage CLOSED (via the caller's reference_scaffold_failed
+        # path) rather than spawn a wrong pose again.
+        recon_quat = _quat_from_pitch_roll(pitch_mid, roll_mid)
+        recon_g = _quat_wxyz_to_gravity_b(recon_quat[None, :])[0]
+        recon_norm = float(np.linalg.norm(recon_g))
+        cos_ang = float(np.clip(
+            float(np.dot(recon_g, g_mean_unit)) / max(recon_norm, 1e-12),
+            -1.0, 1.0))
+        gate_angle = math.acos(cos_ang)
+        if gate_angle > _ORIENTATION_GATE_MAX_RAD:
+            raise ValueError(
+                "reference orientation derivation failed its self-"
+                "consistency gate: reconstructed body-frame gravity "
+                f"{tuple(round(float(v), 4) for v in recon_g)} from "
+                f"derived pitch={pitch_mid:.4f} rad roll={roll_mid:.4f} "
+                f"rad is {gate_angle:.3f} rad from the clip's own "
+                f"measured start-window gravity "
+                f"{tuple(round(float(v), 4) for v in g_mean_unit)} "
+                f"(gate: {_ORIENTATION_GATE_MAX_RAD} rad) — refusing to "
+                f"scaffold a reset that would reproduce the wrong pose "
+                f"(§D29: an upside-down prone reset from exactly this "
+                f"failure class caused a floor-interpenetration contact "
+                f"explosion)."
+            )
+
+        # Range: the SAME analytic derivation applied per-frame across
+        # the start window, min/max'd — structurally identical to the
+        # prior per-axis-then-minmax range derivation, just correctly
+        # targeted (no subtraction against a clip-relative "standing"
+        # window).
+        pitch_frames, roll_frames = _gravity_to_pitch_roll(g_frames)
+        for key, frames in (
+                ("reset_pitch_offset_rad", pitch_frames),
+                ("reset_roll_offset_rad", roll_frames)):
+            # Round-then-RE-CLAMP: a prone clip's roll offset can land
+            # exactly at pi and round(pi, 4) = 3.1416 > pi — this exact
+            # class produced the live reference_scaffold_failed (env-spec
+            # hard-bound reject) on the first prone mission, 2026-07-13.
+            derived[key] = _clamp_range(
+                key, float(frames.min()), float(frames.max()))
     joint_pos = clip.get("joint_pos")
     if joint_pos is not None and is_low_start:
         fps = float(clip["fps"])
@@ -1044,6 +1183,22 @@ class SettleUnavailable(Exception):
     caller" contract)."""
 
 
+class SettleExplosion(SettleUnavailable):
+    """§D29-2: the SPECIFIC settle-failure subclass that means the
+    DERIVED POSE ITSELF is physically invalid (a contact-force explosion
+    from joint/orientation floor-interpenetration, caught by the
+    post-settle plausibility-bound check below) — as opposed to mere
+    settle-infrastructure unavailability (MJCF/model/mujoco-import
+    failure, a generic `mj_step` exception) or ordinary non-convergence
+    (`converged: False`, which never raises at all). A plain `except
+    SettleUnavailable` still catches this (subclass), so every existing
+    caller/test is unaffected; `sculpt.py`'s scaffold path (§D29-2)
+    catches this DISTINCTLY and fails a reference-derived stage closed
+    rather than silently proceeding with the exploding unsettled reset —
+    the exact live D29 disaster (a prone reset settled to z 2.34 m,
+    logged as a warning, and trained on anyway)."""
+
+
 #: Consecutive settle steps that must ALL measure max|qvel| under this
 #: threshold before the pose is declared at rest. A single-step check is
 #: NOT sufficient: starting from qvel=0, one gravity-only mj_step only
@@ -1293,7 +1448,13 @@ def settle_reset(
     settled_z = float(data.qpos[2])
     settled_quat = np.asarray(data.qpos[3:7], dtype=np.float64)
     if abs(settled_z - requested_z) > _SETTLE_MAX_PLAUSIBLE_DELTA_M:
-        raise SettleUnavailable(
+        # §D29-2: this specific branch is THE explosion-class failure —
+        # the derived pose itself is invalid, not settle infrastructure
+        # being unavailable. `SettleExplosion` (a `SettleUnavailable`
+        # subclass) lets `sculpt.py`'s scaffold path fail the stage
+        # closed for a reference-derived reset instead of silently
+        # training from the exploding unsettled pose (§D29 live).
+        raise SettleExplosion(
             f"physics settle produced an implausible height change "
             f"({settled_z - requested_z:+.3f} m over {steps} steps, "
             f"exceeds the {_SETTLE_MAX_PLAUSIBLE_DELTA_M} m plausibility "

@@ -5155,7 +5155,9 @@ def _run_one_stage(
                 if eval_reset_pre is not None:
                     if _os.environ.get("RS_SETTLE_RESET", "1") != "0":
                         try:
-                            from sculptor.reference import settle_reset
+                            from sculptor.reference import (
+                                SettleExplosion, settle_reset,
+                            )
 
                             settle_result = settle_reset(
                                 eval_reset_pre,
@@ -5171,6 +5173,48 @@ def _run_one_stage(
                                 "converged": settle_result["converged"],
                                 "duration_s": settle_result["duration_s"],
                             }
+                        except SettleExplosion as e:
+                            # §D29-2: an EXPLOSION-class settle failure (the
+                            # plausibility-bound branch — distinct from mere
+                            # non-convergence, which stays non-fatal) means
+                            # the DERIVED reset pose itself is invalid, not
+                            # settle infrastructure being unavailable.
+                            # Proceeding with the unsettled (exploding)
+                            # reset was the live D29 disaster: a prone reset
+                            # settled to z 2.34 m, logged as a warning, and
+                            # trained on anyway. Fail the stage CLOSED — same
+                            # discipline D21 uses for clip-load failure —
+                            # unless the escape hatch is set.
+                            settle_info = {
+                                "attempted": True,
+                                "succeeded": False,
+                                "error": f"{type(e).__name__}: {e}",
+                                "explosion": True,
+                            }
+                            emit({
+                                "type": "stage_settle_explosion",
+                                "stage_name": stage.name,
+                                "clip": clip_src,
+                                "error": str(e),
+                            })
+                            if _os.environ.get(
+                                    "RS_SETTLE_EXPLOSION_FATAL", "1") != "0":
+                                return _fail_stage(
+                                    stage, "reference_scaffold_failed",
+                                    (
+                                        f"settling the reference-derived "
+                                        f"reset for stage {stage.name!r} "
+                                        f"produced a physically implausible "
+                                        f"result (contact-force explosion "
+                                        f"— the derived pose itself is "
+                                        f"invalid): {e}. Refusing to train "
+                                        f"from an unsettled, exploding "
+                                        f"reset (§D29). Set "
+                                        f"RS_SETTLE_EXPLOSION_FATAL=0 to "
+                                        f"override."
+                                    ),
+                                    emit,
+                                )
                         except Exception as e:  # noqa: BLE001 — §5: never fatal
                             settle_info = {
                                 "attempted": True,
@@ -5891,6 +5935,61 @@ def _run_one_stage(
         "missing_key": err_missing_key,
     })
 
+    # §D29-5: a unanimous certified-zero fitness VETOES criterion success.
+    # D29 live: a chaos/explosion rollout satisfied a bare `.any()`
+    # criterion on EVERY iteration while the six-gate certified metric
+    # scored 0.0 on EVERY one of them (started-low gate saw z_start 0.45
+    # mid-air; no-lunge gate saw 2.4 m travel) — criterion_pass=true,
+    # fitness=0.0 minted "success" under D20's "criterion is the sole
+    # authority" semantics. When the stage HAS a steering metric that
+    # produced FINITE fitness for its candidates, a unanimous certified-
+    # zero (max fitness across every checkpointed candidate <= the SAME
+    # `FITNESS_CONTRADICTION_EPS` F4 uses) means either the rollout
+    # behavior is not what it looks like or the metric is out of scope
+    # for this stage — the loop/diagnoser sorts out which, exactly what
+    # D20 wanted and D29 proved. Resolves as `criterion_pass_fitness_
+    # zero`, which behaves like `criterion_not_met` for redecomposition
+    # (`_REDECOMPOSABLE_REASONS`, below). Stages with NO metric (every
+    # candidate's `.fitness is None`) keep today's criterion-only
+    # behavior, untouched. `RS_FITNESS_VETO=0` disables (default ON).
+    if criterion_ok:
+        import os as _os
+
+        if _os.environ.get("RS_FITNESS_VETO", "1") != "0":
+            _by_dir: dict[str, IterOutcome] = {}
+            for _o in all_iters:
+                _by_dir[str(_o.iter_dir)] = _o
+            _fitness_vals = [
+                _o.fitness for _o in _by_dir.values()
+                if _iter_checkpoint(_o.iter_dir) and _o.fitness is not None
+            ]
+            if _fitness_vals:
+                _max_fitness = max(_fitness_vals)
+                if _max_fitness <= FITNESS_CONTRADICTION_EPS:
+                    emit({
+                        "type": "stage_criterion_fitness_veto",
+                        "stage_name": stage.name,
+                        "max_fitness": round(_max_fitness, 5),
+                        "n_candidates": len(_fitness_vals),
+                        "criterion": stage.success_criterion,
+                    })
+                    return _fail_stage(
+                        stage, "criterion_pass_fitness_zero",
+                        (
+                            f"success_criterion {stage.success_criterion!r} "
+                            f"was satisfied, but the stage's steering "
+                            f"metric produced a UNANIMOUS certified-zero "
+                            f"fitness (max={_max_fitness:.4f} across "
+                            f"{len(_fitness_vals)} candidate iteration(s), "
+                            f"threshold {FITNESS_CONTRADICTION_EPS}) — the "
+                            f"rollout behavior may not be what it looks "
+                            f"like, or the metric is out of scope for this "
+                            f"stage (§D29). Refusing to mint a hollow "
+                            f"success; set RS_FITNESS_VETO=0 to override."
+                        ),
+                        emit,
+                    )
+
     if criterion_ok:
         stage.status = "succeeded"
         stage.finished_at = _utc_now_iso()
@@ -6004,14 +6103,21 @@ def _utc_now_iso() -> str:
 #   - criterion_errored:  the criterion itself was malformed (bad dtype,
 #     unsafe AST) and slipped past decompose-time validation; a rewrite
 #     can correct it.
-# Both are bounded by the 1-attempt redecomposition cap, so a persistently
-# broken/unmet stage still halts after ONE recovery try rather than wasting
-# the whole multi-hour mission on the first stumble. Infrastructure-class
-# failures (training_errored, no_checkpoint, adapter_mismatch,
-# scaffold_errored, v1_materialization_errored) signal env / code issues
-# re-decomposition can't fix and are deliberately excluded.
+#   - criterion_pass_fitness_zero (§D29-5): the criterion read "satisfied"
+#     but the stage's own certified steering metric scored a unanimous
+#     zero on every candidate — behaves like criterion_not_met for
+#     redecomposition purposes (a re-authored criterion/goal, or a
+#     re-scoped metric, can both plausibly fix this; which one is exactly
+#     what redecomposition + the diagnoser sort out).
+# All three are bounded by the 1-attempt redecomposition cap, so a
+# persistently broken/unmet stage still halts after ONE recovery try
+# rather than wasting the whole multi-hour mission on the first stumble.
+# Infrastructure-class failures (training_errored, no_checkpoint,
+# adapter_mismatch, scaffold_errored, v1_materialization_errored) signal
+# env / code issues re-decomposition can't fix and are deliberately
+# excluded.
 _REDECOMPOSABLE_REASONS: frozenset[str] = frozenset(
-    {"criterion_not_met", "criterion_errored"}
+    {"criterion_not_met", "criterion_errored", "criterion_pass_fitness_zero"}
 )
 
 # Ship 22r: within a single stage's ONE redecomposition (the per-stage cap
@@ -6163,9 +6269,14 @@ def _maybe_redecompose_and_splice(
         first sub-stage now sits one slot AFTER the retained,
         superseded failed stage) so the while-loop processes the first
         sub-stage next.
-      * Any sub-stage lacking its own `steering_metric` inherits the
-        failed stage's (metric inheritance); `stage_metric_inherited`
-        emitted when this fires.
+      * `steering_metric` is left exactly as `redecompose_stage`
+        (decompose.py) set it — `None` unless a sub-stage's own draft
+        named one — so the existing LAZY metric generation certifies
+        each sub-stage against its OWN span (§D30: a "defense-in-depth"
+        backstop that used to copy the FAILED stage's steering_metric
+        into any sub-stage lacking one was removed here — it was
+        reproducing D30's wrong-scope-metric hollow-zero bug through a
+        second path once decompose.py stopped inheriting it).
       * mission.json persisted atomically.
       * `stage_redecomposed` event emitted.
 
@@ -6397,25 +6508,29 @@ def _maybe_redecompose_and_splice(
     # superseded). Terminal + never re-entered by the while-loop.
     failed_stage.status = "superseded"
 
-    # §mission-persistence increment 1: metric inheritance. A sub-stage
-    # the redecomposer left without its own `steering_metric` inherits
-    # the superseded parent's, so it keeps steering by the same
-    # objective rather than silently falling back to the mission-level
-    # default. (In practice `redecompose_stage` already sets every
-    # sub-stage's steering_metric = failed_stage.steering_metric
-    # unconditionally — see decompose.py — so this is a defense-in-
-    # depth backstop for that behavior changing, not the primary path.)
-    _inherited_to: list[str] = []
-    for _sub in sub_stages:
-        if not getattr(_sub, "steering_metric", None) and failed_stage.steering_metric:
-            _sub.steering_metric = failed_stage.steering_metric
-            _inherited_to.append(_sub.name)
-    if _inherited_to:
-        emit({
-            "type": "stage_metric_inherited",
-            "from_stage": failed_stage.name,
-            "to_stages": _inherited_to,
-        })
+    # §D30 (docs/internal/REFERENCE_BUILD_LOG.md): a §mission-persistence
+    # increment-1 "defense-in-depth backstop" USED to live here — any
+    # sub-stage the redecomposer left without its own `steering_metric`
+    # copied in the superseded parent's. Its own comment assumed
+    # `redecompose_stage` already did this unconditionally (see
+    # decompose.py) and called itself redundant. D30 (live, 2026-07-13):
+    # a sub-stage's span machinery correctly selected its OWN sub-span
+    # (e.g. the crouch-to-stand tail of a prone-getup clip), but the
+    # inherited metric POINTER carried the PARENT's synthetic-exemplar
+    # metric along with it — which demands a PRONE start the sub-stage is
+    # designed NOT to have. A perfectly correct crouch-to-stand rollout
+    # scored fitness 0.0 under the wrong-scope inherited metric (the
+    # exact D23 exemplar-scope-mismatch class, reborn one level down via
+    # redecomposition instead of decomposition). `decompose.py`'s
+    # `redecompose_stage` was fixed to leave sub-stages' `steering_metric`
+    # `None` (D21 inherited the reference BINDING deliberately; the
+    # metric pointer came along by accident) so the existing LAZY metric
+    # generation (`mission_metrics.generate_stage_metrics`) certifies
+    # each sub-stage against its OWN already-selected span. This backstop
+    # — now the ONLY thing that still copied the parent metric in — was
+    # therefore reproducing D30 through a second path and is REMOVED:
+    # sub-stages simply keep `steering_metric=None` from `redecompose_
+    # stage`, same as every other Stage field that gets lazily generated.
 
     # Reviewer-flagged: persist current_stage_idx BEFORE the splice so
     # a crash-resume starts at the first new sub-stage rather than
@@ -6435,12 +6550,11 @@ def _maybe_redecompose_and_splice(
         _atomic_save_mission(mission, mission_dir)
     except OSError as e:
         # Roll back in-memory splice + parent re-pointing + status +
-        # any inherited metric + current_stage_idx.
+        # current_stage_idx. (§D30: no metric-inheritance state to roll
+        # back any more — sub-stages' `steering_metric` was never
+        # mutated here, see the removed backstop's comment above.)
         mission.stages[failed_stage_idx:failed_stage_idx + 1 + len(sub_stages)] = [failed_stage]
         failed_stage.status = "failed"
-        for _sub in sub_stages:
-            if _sub.name in _inherited_to:
-                _sub.steering_metric = None
         mission.current_stage_idx = failed_stage_idx
         # Restore downstream children's parent_stage to the failed name.
         for s in mission.stages[failed_stage_idx + 1:]:

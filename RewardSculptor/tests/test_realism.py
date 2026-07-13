@@ -453,3 +453,174 @@ def test_verdict_per_joint_velocity_limit_term_byte_identical_without_real_limit
     # and the new term independently escalates when a real limit IS exceeded
     assert _verdict(0.0, 0.0, 0.0, 1.6) == "severe"   # ≥1.5× a no-load speed
     assert _verdict(0.0, 0.0, 0.0, 1.1) == "mild"     # ≥1.0×
+
+
+# ── §D29-3: root_kinematics channel (reset-launch detection) ──────────────
+def _write_root_trajectory(
+    tmp_path: Path, z_trace: np.ndarray, *, N: int = 2, step_dt: float = 0.02,
+) -> tuple[Path, Path]:
+    """Minimal trajectory + limits + sibling behavior.json (step_dt) —
+    joint-space fields are trivial (1 joint, all zero) so `verdict='ok'`
+    and the audit reaches the root_kinematics computation; `z_trace`
+    (shape (T,)) is broadcast identically across `N` envs."""
+    T = z_trace.shape[0]
+    traj_path = tmp_path / "trajectory.npz"
+    limits_path = tmp_path / "mjcf_limits.json"
+    root = np.zeros((T, N, 3), dtype=np.float32)
+    root[..., 2] = z_trace.astype(np.float32)[:, None]
+    payload = {
+        "actuator_force": np.zeros((T, N, 1), dtype=np.float32),
+        "joint_pos": np.zeros((T, N, 1), dtype=np.float32),
+        "joint_vel": np.zeros((T, N, 1), dtype=np.float32),
+        "root_link_pos_w": root,
+        "rewards": np.zeros(T, dtype=np.float32),
+        "episode_id": np.zeros(T, dtype=np.int32),
+    }
+    np.savez_compressed(traj_path, **payload)
+    _write_limits(
+        limits_path, forceranges=[[-50, 50]], joint_ranges=[[-1, 1]])
+    (tmp_path / "behavior.json").write_text(json.dumps({"step_dt": step_dt}))
+    return traj_path, limits_path
+
+
+def test_root_kinematics_flags_reset_launch(tmp_path: Path) -> None:
+    """§D29-3 core / live D29 regression: a reset-time launch (z 0.22 ->
+    0.81 within 5 of 50 fps frames, i.e. 0.1 s < the 0.5 s window) from a
+    sub-0.35 m start must flag `reset_launch_detected`."""
+    T = 100
+    z = np.full(T, 0.81, dtype=np.float64)
+    z[:5] = np.linspace(0.22, 0.81, 5)
+    traj, limits = _write_root_trajectory(tmp_path, z)
+    out = audit_rollout(traj, limits)
+    rk = out["root_kinematics"]
+    assert rk is not None
+    assert rk["reset_launch_detected"] is True
+    assert rk["max_root_z"] == pytest.approx(0.81, abs=1e-2)
+
+
+def test_root_kinematics_does_not_flag_normal_getup(tmp_path: Path) -> None:
+    """A REAL get-up: low start (0.15 m), but the rise to standing
+    happens over 1.5 s — well past the 0.5 s reset-launch window — must
+    NOT flag. Conservative-by-design: general (slow) low-start motion is
+    not reset-launch."""
+    T = 150
+    z = np.empty(T, dtype=np.float64)
+    z[:50] = 0.15                              # lying, first 1.0 s
+    z[50:125] = np.linspace(0.15, 0.74, 75)    # rise over 1.5 s
+    z[125:] = 0.74
+    traj, limits = _write_root_trajectory(tmp_path, z)
+    out = audit_rollout(traj, limits)
+    rk = out["root_kinematics"]
+    assert rk is not None
+    assert rk["reset_launch_detected"] is False
+
+
+def test_root_kinematics_does_not_flag_jump_from_standing(tmp_path: Path) -> None:
+    """A real jump: starts at ~G1-class standing height (0.74 m — NOT
+    sub-0.35 m) then rises further during flight — must NOT flag no
+    matter how fast the flight rise is (the START band gate, not the
+    rise alone, is what makes this a floor-task-only signal)."""
+    T = 100
+    z = np.full(T, 0.74, dtype=np.float64)
+    z[10:30] = np.linspace(0.74, 1.1, 20)      # flight rise
+    z[30:60] = np.linspace(1.1, 0.74, 30)
+    traj, limits = _write_root_trajectory(tmp_path, z)
+    out = audit_rollout(traj, limits)
+    rk = out["root_kinematics"]
+    assert rk is not None
+    assert rk["reset_launch_detected"] is False
+
+
+def test_root_kinematics_absent_without_root_link_pos_w(tmp_path: Path) -> None:
+    """Older trajectories with no `root_link_pos_w` at all — the audit
+    still runs (joint-space verdict unaffected), `root_kinematics` is
+    simply `None`, never a crash."""
+    T, N, A = 20, 2, 2
+    traj = tmp_path / "trajectory.npz"
+    limits = tmp_path / "mjcf_limits.json"
+    _write_trajectory(
+        traj, np.zeros((T, N, A)), np.zeros((T, N, A)),
+        np.full((T, N, A), 2.0),
+    )
+    _write_limits(
+        limits, forceranges=[[-50, 50]] * A, joint_ranges=[[-1, 1]] * A)
+    out = audit_rollout(traj, limits)
+    assert out["verdict"] == "ok"
+    assert out.get("root_kinematics") is None
+
+
+def test_root_kinematics_no_step_dt_skips_launch_detection_not_flag(
+    tmp_path: Path,
+) -> None:
+    """No `behavior.json` (so `step_dt` is unknown) — degrades toward
+    NOT flagging (never guesses a dt), `max_root_z` still computed."""
+    T = 20
+    z = np.full(T, 0.81, dtype=np.float64)
+    z[0] = 0.22
+    traj_path = tmp_path / "trajectory.npz"
+    limits_path = tmp_path / "mjcf_limits.json"
+    root = np.zeros((T, 2, 3), dtype=np.float32)
+    root[..., 2] = z.astype(np.float32)[:, None]
+    np.savez_compressed(
+        traj_path,
+        actuator_force=np.zeros((T, 2, 1), dtype=np.float32),
+        joint_pos=np.zeros((T, 2, 1), dtype=np.float32),
+        joint_vel=np.zeros((T, 2, 1), dtype=np.float32),
+        root_link_pos_w=root,
+        rewards=np.zeros(T, dtype=np.float32),
+        episode_id=np.zeros(T, dtype=np.int32),
+    )
+    _write_limits(
+        limits_path, forceranges=[[-50, 50]], joint_ranges=[[-1, 1]])
+    # Deliberately no behavior.json written.
+    out = audit_rollout(traj_path, limits_path)
+    rk = out["root_kinematics"]
+    assert rk is not None
+    assert rk["reset_launch_detected"] is False
+    assert rk["max_root_speed_mps"] is None
+    assert rk["max_root_z"] == pytest.approx(0.81, abs=1e-2)
+
+
+def test_naturalness_channel_hard_rejects_reset_launch() -> None:
+    """§D29-3: `reset_launch_detected` hard-rejects with its OWN flag —
+    same machinery (hard_reject=True, steer_factor=0.0) as the existing
+    joint-limit-exploit reject, distinct flag name, and fires even on an
+    otherwise-'ok' joint-space verdict — the exact live D29 shape
+    (verdict='ok', steer_factor=1.0, on a rollout that launched 2.34 m
+    airborne from rest)."""
+    audit = {
+        "verdict": "ok",
+        "joint_limit_violation_frac": 0.0,
+        "root_kinematics": {
+            "reset_launch_detected": True,
+            "max_root_z": 2.34,
+            "max_root_speed_mps": 12.0,
+        },
+    }
+    nat = naturalness_channel(audit)
+    assert nat["hard_reject"] is True
+    assert nat["steer_factor"] == 0.0
+    assert nat["flag"] == "reset_launch_explosion"
+
+
+def test_naturalness_channel_root_kinematics_absent_is_no_op() -> None:
+    """No `root_kinematics` key at all (older audit dict, or a rollout
+    without `root_link_pos_w`) — never crashes, never flags."""
+    nat = naturalness_channel(
+        {"verdict": "ok", "joint_limit_violation_frac": 0.0})
+    assert nat["hard_reject"] is False
+    assert nat["flag"] is None
+
+
+def test_naturalness_channel_reset_launch_false_does_not_reject() -> None:
+    """`reset_launch_detected: False` (the common case) is a pure no-op —
+    falls through to the ordinary verdict-based branches unchanged."""
+    audit = {
+        "verdict": "ok",
+        "joint_limit_violation_frac": 0.0,
+        "root_kinematics": {"reset_launch_detected": False},
+    }
+    nat = naturalness_channel(audit)
+    assert nat["hard_reject"] is False
+    assert nat["steer_factor"] == 1.0
+    assert nat["flag"] is None
