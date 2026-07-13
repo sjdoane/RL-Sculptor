@@ -588,6 +588,74 @@ Follow-ups deferred: synthetic_signature.json into diagnose/edit context;
 real-LLM span/synth calls under sustained load; GRAB normalized heights
 (D27) still worth an ingest fix.
 
+### D29. LIVE (mission running, NOT yet fixed — logged per Sam): prone reset derived UPSIDE-DOWN; explosion rollouts satisfied an .any() criterion; stage 1 hollow-succeeded
+Observed by Sam watching prone_pushup iteration videos (2026-07-13, run
+job_a4c55c66da377a22): robot spawns with its lower body INSIDE the floor,
+head-down, then catapults into the air; fitness 0.0 on every iteration;
+stage stopped after 3/4 iterations and declared SUCCESS. Forensics (all
+on-disk, run untouched):
+
+CHAIN OF FIVE DEFECTS (fix directions logged; DO NOT patch while the
+mission is live — sculptor edits reload uvicorn and kill the run):
+1. **Orientation extraction picked a wrong Euler branch for prone.** The
+   a10 clip's start quat has body-frame gravity (0.96, -0.12, +0.24) —
+   gravity along +x = anterior axis down = TRUE PRONE. The derivation
+   emitted (pitch -0.05, roll pi), whose body gravity is (0, 0, +1) —
+   UPSIDE-DOWN. Frame-0 truth: pg (-0.24, 0.03, +0.97), z 0.224, legs
+   interpenetrating the floor -> contact explosion, z 0.22->0.81 in 5
+   frames, max 2.34 m. Supine missions worked by branch luck. FIX: derive
+   pitch/roll analytically FROM the gravity vector (pitch=f(g_x),
+   roll=f(g_y,g_z)) + a mechanical SELF-CONSISTENCY gate: reconstruct the
+   quat from the derived offsets and require its body-gravity to match
+   the clip's frame-0 gravity within tolerance (same commitment-check
+   pattern as expected_end/synth).
+2. **The settle guard SAW it and was overruled.** Scaffold logged
+   SettleUnavailable: '+1.820 m height change ... contact-force
+   explosion from joint/orientation interpenetration' — then proceeded
+   with the unsettled (exploding) reset as a warning. For
+   reference-derived resets a settle EXPLOSION (vs mere non-convergence)
+   is diagnostic of an invalid pose. FIX: implausible-settle on a
+   derived reset fails the stage CLOSED (reference_scaffold_failed),
+   same discipline as D21's clip-load failure.
+3. **Realism audit is blind to root kinematics.** verdict 'ok',
+   steer_factor 1.0, on rollouts that launch 2.3 m airborne from rest in
+   a floor task — it audits JOINT-space only (saturation/limits/vel).
+   FIX: add a root-kinematics channel (reset interpenetration, ballistic
+   launch from rest, |v_root| implausibility) with hard-flag rights.
+4. **.any()-shaped criteria are chaos-satisfiable.** The re-grounded
+   criterion — (root_height > 0.15).any() and (pg_z < -0.2).any() and
+   mean_episode_length > 100 — is trivially satisfied by an explosion
+   that tumbles through every height and orientation (fell_over is off
+   for get-up stages, so episodes run full length). The re-grounding
+   mechanical check verifies conjuncts on the HONEST exemplar (where
+   .any() also passes) and cannot see this. FIX: criteria need the same
+   adversarial discipline metrics got — authoring rule (reach clauses
+   must pair a start-away/sustained condition; bare .any() reachability
+   forbidden) + mechanical anti-chaos check: the criterion must FAIL on
+   the existing chaos/explosion gaming archetypes evaluated in the
+   criterion namespace.
+5. **Success authority ignores a unanimous certified metric.** Final
+   selection: criterion_pass=true, fitness=0.0 -> stage_succeeded (D20
+   semantics: criterion is the authority). But this time EVERYTHING
+   downstream worked: the six-gate certified metric scored 0.0 on all 3
+   iterations (started-low gate saw z_start 0.45 mid-air; no-lunge gate
+   saw 2.4 m travel), and F4 fired fitness_contradiction on EVERY
+   iteration (events + on-disk flags + UI badges all present). The D21
+   start-state gate passed correctly — frame-0 MATCHED eval_reset.json;
+   it guards drift-from-reset, not wrong-by-construction resets. OPEN
+   DESIGN QUESTION (the real D20 lesson finishing its arc): when a
+   steer-grade certified metric reads 0.0 on every iteration AND the
+   contradiction detector fires on every iteration, criterion-pass alone
+   must not mint success — proposal: such stages resolve
+   criterion_pass_fitness_zero -> treated as NOT succeeded (hold for
+   redecompose/human), configurable.
+Also: early-stop was fitness_patience (best 0.0 at iter 0, no new best
+in 2) — 3/4 iterations is working-as-designed given the pinned-zero
+fitness, not a bug. Stage 2 (feet_under_crouch) is training HEALTHY as
+of this entry (fitness 0.93/0.97 with all gates green at iters 1-2) —
+the run is not wasted; stage 1's archived 'success' and its final
+policy are garbage and stage 1 must be re-run after fixes 1-2 land.
+
 ### Deferred findings (logged, not yet fixed)
 - D27 live findings (first user-driven decompose, g1-standing-up
   2026-07-12): (a) retrieval auto-attached a PRONE-start clip
