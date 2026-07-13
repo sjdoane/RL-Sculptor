@@ -654,3 +654,61 @@ def test_lie_to_crouch_clip_derives_lying_reset_d19():
     assert r["fell_over_termination"] is False
     e = derive_eval_reset(clip)
     assert e is not None and e["fell_over_termination"] is False
+
+
+def test_prone_pi_roll_offset_survives_rounding_and_validates() -> None:
+    """LIVE SCAFFOLD FAILURE (first prone mission, 2026-07-13): a
+    face-down clip's derived roll offset is exactly pi, and every
+    persist site rounded to 4 decimals — round(pi, 4) = 3.1416 > pi —
+    so the env-spec validator's own [-pi, pi] hard bound rejected the
+    spec and the stage died reference_scaffold_failed at launch.
+    Readability rounding must never push a value back out of the bound
+    it was just clamped into (fourth occurrence of the rounding class:
+    span persistence, QC bounds, span_boundaries, now reset offsets)."""
+    fps = 50.0
+
+    def quat_roll(theta: float) -> np.ndarray:
+        return np.array([np.cos(theta / 2), np.sin(theta / 2), 0.0, 0.0])
+
+    def seg(dur: float, fn):
+        n = max(2, int(round(dur * fps)))
+        return fn(np.linspace(0.0, 1.0, n, endpoint=False))
+
+    lying = seg(0.5, lambda s: np.full_like(s, 0.10))
+    ramp = seg(1.0, lambda s: 0.10 + (0.75 - 0.10) * s)
+    stand = seg(0.5, lambda s: np.full_like(s, 0.75))
+    z = np.concatenate([lying, ramp, stand])
+    # Face-down start: roll exactly pi, unrolling to 0 while rising.
+    lying_q = np.tile(quat_roll(np.pi), (lying.shape[0], 1))
+    ramp_s = np.linspace(0.0, 1.0, ramp.shape[0], endpoint=False)
+    ramp_q = np.stack([quat_roll(np.pi * (1 - s)) for s in ramp_s])
+    stand_q = np.tile(quat_roll(0.0), (stand.shape[0], 1))
+    clip = {
+        "root_pos_z": z, "fps": fps,
+        "root_quat_wxyz": np.concatenate([lying_q, ramp_q, stand_q], axis=0),
+        "meta": {"source": "synthetic:prone-getup"},
+    }
+    assert validate_clip(clip) == []
+
+    full = derive_reference_reset(clip)
+    lo_b, hi_b = -np.pi, np.pi
+    for key in ("reset_roll_offset_rad", "reset_pitch_offset_rad"):
+        if key in full:
+            a_lo, a_hi = full[key]
+            assert lo_b <= a_lo <= hi_b, (key, a_lo)
+            assert lo_b <= a_hi <= hi_b, (key, a_hi)
+
+    ev = derive_eval_reset(clip)
+    assert ev is not None
+    for key in ("reset_roll_offset_rad", "reset_pitch_offset_rad"):
+        if key in ev:
+            assert lo_b <= ev[key] <= hi_b, (key, ev[key])
+
+    # The end-to-end contract that failed live: the derived TRAIN keys
+    # must survive the env-spec validator's hard bounds.
+    train = derive_rsi_train_keys(clip)
+    spec = {"schema_version": 1, "shared": {}, "train": train,
+            "meta": {"source": "reference:test"}}
+    problems = validate_env_spec(spec)
+    bound_problems = [p for p in problems if "outside hard bounds" in p]
+    assert bound_problems == [], bound_problems

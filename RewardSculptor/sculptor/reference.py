@@ -393,17 +393,27 @@ def phase_keyframes(clip: dict, n: int = 8) -> dict:
 
 
 def _clamp_range(key: str, lo: float, hi: float) -> list[float]:
+    # Round-then-RE-CLAMP (fourth occurrence of the rounding class,
+    # 2026-07-13): a PRONE clip's derived roll offset is exactly pi, and
+    # round(pi, 4) = 3.1416 > pi — the persisted value then failed the
+    # env-spec validator's own [-pi, pi] hard bound and killed the first
+    # prone mission at scaffold (reference_scaffold_failed). Readability
+    # rounding must never push a value back OUT of the bound it was just
+    # clamped into.
     b_lo, b_hi = _TRAIN_RANGES[key]
     lo = min(max(lo, b_lo), b_hi)
     hi = min(max(hi, b_lo), b_hi)
     if hi < lo:
         lo, hi = hi, lo
-    return [round(lo, 4), round(hi, 4)]
+    lo = min(max(round(lo, 4), b_lo), b_hi)
+    hi = min(max(round(hi, 4), b_lo), b_hi)
+    return [lo, hi]
 
 
 def _clamp_scalar(key: str, v: float) -> float:
     lo, hi = _TRAIN_SCALARS[key]
-    return round(min(max(v, lo), hi), 4)
+    # Same round-then-re-clamp as _clamp_range (round(pi, 4) > pi).
+    return min(max(round(min(max(v, lo), hi), 4), lo), hi)
 
 
 def _archetype(clip: dict) -> str:
@@ -660,7 +670,14 @@ def derive_reference_reset(clip: dict) -> dict:
             a_hi = min(max(float(offset.max()), lo), hi)
             if a_hi < a_lo:
                 a_lo, a_hi = a_hi, a_lo
-            derived[key] = [round(a_lo, 4), round(a_hi, 4)]
+            # Round-then-RE-CLAMP: a prone clip's roll offset is exactly
+            # pi and round(pi, 4) = 3.1416 > pi — this exact line produced
+            # the live reference_scaffold_failed (env-spec hard-bound
+            # reject) on the first prone mission, 2026-07-13.
+            derived[key] = [
+                min(max(round(a_lo, 4), lo), hi),
+                min(max(round(a_hi, 4), lo), hi),
+            ]
     joint_pos = clip.get("joint_pos")
     if joint_pos is not None and is_low_start:
         fps = float(clip["fps"])
@@ -670,8 +687,9 @@ def derive_reference_reset(clip: dict) -> dict:
         n = min(target.shape[0], _JOINT_TARGET_MAX_LEN)
         lo, hi = _JOINT_TARGET_ELEMENT_BOUNDS
         clamped = np.clip(target[:n], lo, hi)
+        # Same round-then-re-clamp as the orientation ranges above.
         derived["reset_joint_pos_target"] = [
-            round(float(x), 4) for x in clamped]
+            min(max(round(float(x), 4), lo), hi) for x in clamped]
         # A conservative fixed noise magnitude — enough per-episode
         # variation to avoid the policy overfitting to one exact pose,
         # small enough to stay a recognizable get-up posture (mirrors
@@ -724,7 +742,11 @@ def derive_eval_reset(clip: dict) -> dict | None:
 
     def _mid(key: str) -> float:
         lo, hi = full[key]
-        return round((float(lo) + float(hi)) / 2.0, 4)
+        # Round-then-re-clamp into the SOURCE range: the midpoint of a
+        # range whose ends sit at a hard bound (prone roll: [pi, pi])
+        # rounds to 3.1416 > pi — same class as the scaffold failure.
+        mid = round((float(lo) + float(hi)) / 2.0, 4)
+        return min(max(mid, float(lo)), float(hi))
 
     payload: dict[str, Any] = {
         "reset_height_offset_m": _mid("reset_height_offset_m"),
