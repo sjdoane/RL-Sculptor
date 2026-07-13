@@ -21,7 +21,7 @@ import {
 } from "@/lib/api";
 import { qk } from "@/lib/queryKeys";
 import { failureReasonText, stageLabel, supersededText } from "@/lib/stageDisplay";
-import { formatRelative } from "@/lib/utils";
+import { formatRelative, sanitizeConsoleText } from "@/lib/utils";
 import type {
   ErrorClassification,
   IterEventSummary,
@@ -583,6 +583,45 @@ function StageDetailPane({
     staleTime: 30_000,
   });
 
+  // §UX polish (fitness backfill): the disk-truth list endpoint
+  // (`useStageIterations` above) reads `fitness` from only
+  // `rollout/behavior.json`'s bare `fitness` key, which is empty for
+  // every stage on this deployment (active or not) — so the iteration
+  // list showed an objective-fitness badge ONLY for the live-training
+  // stage, which sources it from in-memory run events instead. The
+  // per-iteration `/detail` endpoint extracts the same value more
+  // thoroughly (reward_spec.json / a dedicated fitness json / a regex
+  // fallback off the diagnoser evidence prose) and already succeeds
+  // where the list endpoint returns null — see `_extract_objective_fitness`
+  // in backend/routes/missions.py. Backfill from there per row so
+  // previous stages' iterations show their fitness too. Shares the exact
+  // query key `iterDetail` above uses for `activeIter`, so selecting that
+  // iter never double-fetches. A real backend fix would teach
+  // `list_stage_iterations` to call `_extract_objective_fitness` instead
+  // of the narrow `behavior.get("fitness")` read — out of scope here
+  // (backend is off-limits while a mission is training).
+  const missingFitnessRows = useMemo(() => rows.filter((r) => r.fitness == null), [rows]);
+  const fitnessBackfill = useQueries({
+    queries: missingFitnessRows.map((r) => ({
+      queryKey: ["stageIterDetail", slug, missionSlug, stageName, r.iter_index],
+      queryFn: () => getStageIterDetail(slug, missionSlug, stageName, r.iter_index),
+      enabled: !!slug && !!missionSlug && !!stageName,
+      staleTime: 30_000,
+    })),
+  });
+  const rowsWithFitness = useMemo(() => {
+    if (missingFitnessRows.length === 0) return rows;
+    const byIter = new Map<number, number | undefined>();
+    missingFitnessRows.forEach((r, i) => {
+      const detail = fitnessBackfill[i]?.data as StageIterDetail | undefined;
+      byIter.set(r.iter_index, detail?.objective_fitness ?? undefined);
+    });
+    return rows.map((r) => {
+      const backfilled = byIter.get(r.iter_index);
+      return backfilled != null ? { ...r, fitness: backfilled } : r;
+    });
+  }, [rows, missingFitnessRows, fitnessBackfill]);
+
   return (
     <div className="rs-runs-detail">
       <div className="rs-iter-col">
@@ -590,7 +629,7 @@ function StageDetailPane({
         {iters.isLoading && <p className="rs-sub" style={{ fontSize: 11 }}>Loading…</p>}
         {iters.error && <p style={{ fontSize: 11, color: "var(--st-rose)" }}>{(iters.error as Error).message}</p>}
         {!iters.isLoading && rows.length === 0 && <p className="rs-sub" style={{ fontSize: 11 }}>No iterations on disk yet for this stage.</p>}
-        {rows.map((r) => (
+        {rowsWithFitness.map((r) => (
           <StageIterCard
             key={r.iter_index}
             row={r}
@@ -601,7 +640,13 @@ function StageDetailPane({
         ))}
       </div>
 
-      <div className="rs-mid-col">
+      {/* §UX polish: this column stacks the objective-metric card, rollout
+          player, and per-iteration reasoning panel with no internal
+          self-scrolling child (unlike LiveRunDetailPane's mid-col, whose
+          LogViewer scrolls itself) — override the shared `.rs-mid-col`
+          `overflow: hidden` so long diagnoser evidence/reward-component
+          text stays reachable instead of clipping silently. */}
+      <div className="rs-mid-col" style={{ overflowY: "auto" }}>
         {summary && <StageContextCard run={summary} displayLabel={stage?.display_label ?? null} />}
         {stage?.status === "superseded" && (
           <div className="rs-banner" style={{ margin: "0 16px 8px", background: "var(--canvas-soft)" }}>
@@ -915,14 +960,14 @@ function StageIterDetailCard({ iterIndex, query }: { iterIndex: number; query: R
       {data.reward_description && (
         <div style={{ marginBottom: 10 }}>
           <div className="rs-eyebrow" style={{ marginBottom: 4 }}>Reward reasoning</div>
-          <p style={{ margin: 0, fontSize: 12.5, lineHeight: 1.55 }}>{data.reward_description}</p>
+          <p style={{ margin: 0, fontSize: 12.5, lineHeight: 1.55 }}>{sanitizeConsoleText(data.reward_description)}</p>
         </div>
       )}
 
       {data.evidence && (
         <div style={{ marginBottom: 10 }}>
           <div className="rs-eyebrow" style={{ marginBottom: 4 }}>Diagnosis</div>
-          <p style={{ margin: 0, fontSize: 12.5, lineHeight: 1.55, whiteSpace: "pre-wrap" }}>{data.evidence}</p>
+          <p style={{ margin: 0, fontSize: 12.5, lineHeight: 1.55, whiteSpace: "pre-wrap" }}>{sanitizeConsoleText(data.evidence)}</p>
         </div>
       )}
 
@@ -1035,7 +1080,9 @@ function ProjectDiskDetailPane({
         ))}
       </div>
 
-      <div className="rs-mid-col">
+      {/* Same clipped-overflow defect as StageDetailPane's mid-col — no
+          self-scrolling child here either, so it needs its own scroll. */}
+      <div className="rs-mid-col" style={{ overflowY: "auto" }}>
         <div className="rs-run-header">
           <Icon name="activity" size={17} color="var(--rs-muted)" />
           <span className="mono" style={{ fontSize: 14, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}>

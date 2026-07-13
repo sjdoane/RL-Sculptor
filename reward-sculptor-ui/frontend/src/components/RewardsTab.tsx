@@ -19,6 +19,7 @@ import {
 import { ApiError, getMission } from "@/lib/api";
 import { qk } from "@/lib/queryKeys";
 import { stageLabel } from "@/lib/stageDisplay";
+import { sanitizeConsoleText } from "@/lib/utils";
 import type {
   MissionDetail,
   MissionSummary,
@@ -678,7 +679,7 @@ function WhyThisEditPanel({ slug, version, stageScope }: { slug: string; version
               {diag.data.evidence && (
                 <div>
                   <div className="rs-eyebrow" style={{ marginBottom: 6 }}>Evidence</div>
-                  <p className="rs-sub" style={{ lineHeight: 1.6, margin: 0, whiteSpace: "pre-wrap" }}>{diag.data.evidence}</p>
+                  <p className="rs-sub" style={{ lineHeight: 1.6, margin: 0, whiteSpace: "pre-wrap" }}>{sanitizeConsoleText(diag.data.evidence)}</p>
                 </div>
               )}
               {diag.data.proposed_edits && diag.data.proposed_edits.length > 0 && (
