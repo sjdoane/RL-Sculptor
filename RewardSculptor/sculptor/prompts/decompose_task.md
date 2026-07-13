@@ -143,6 +143,32 @@ and stages warm-start from previous stages where possible.
    - If you need an explicit cast: `(x > c).astype(float).mean()` —
      numpy's `.astype` works in place of torch's `.float()`.
 
+   **Anti-chaos: a bare reach clause is not a success criterion.** A
+   documented real failure (D29): a re-grounded criterion using
+   `(trajectory['root_height'] > 0.15).any() and
+   (trajectory['projected_gravity_b'][..., 2] < -0.2).any() and
+   behavior['mean_episode_length'] > 100` was satisfied by a physics
+   EXPLOSION rollout that tumbled through every height and orientation
+   on its way — a chaotic/tumbling trajectory passes through EVERY
+   height and EVERY orientation at some point, so a bare `.any()` reach
+   clause is trivially chaos-satisfiable; it is not evidence of a
+   deliberate, controlled reach. Pair every `.any()`-shaped reach
+   clause with EITHER a **sustained** condition (prefer
+   `(trajectory['root_height'] > 0.15).mean() > 0.3` over
+   `(trajectory['root_height'] > 0.15).any()`) OR an explicit
+   **start-away** condition (also require e.g.
+   `trajectory['root_height'][0] < <below-target>`, so reaching the
+   band is a change of state). A criterion whose ONLY discriminating
+   conjunct is a bare `.any()` reach is mechanically rejected at
+   re-grounding time — "a criterion an explosion can satisfy is not a
+   success criterion." Also: `behavior['mean_episode_length'] > <n>`
+   is NOT evidence of success on a stage whose `start_pose` is
+   non-standing (get-up / lying / crouched starts train WITHOUT
+   fall-termination, so the episode runs full length regardless of
+   what happens, including an explosion that never recovers) — only
+   treat episode length as a success signal for standing-start stages
+   where fall-termination is active.
+
 5. **Reward seed prompt grounding.** Every field referenced inside a
    `reward_seed_prompt` that represents runtime data (not just prose)
    MUST be in `expected_info_keys` or be a new component the prompt
@@ -299,7 +325,7 @@ EVERY reward and keep the robot up while it learns each phase.
     {
       "name": "spring_up",
       "goal_text": "From the crouch, explosively extend the legs to launch the root link upward past ~0.75 m.",
-      "success_criterion": "(trajectory['root_height'] > 0.75).any() and components.get('upward_impulse', 0.0) > 0.3",
+      "success_criterion": "trajectory['root_height'][0] < 0.55 and (trajectory['root_height'] > 0.75).any() and components.get('upward_impulse', 0.0) > 0.3",
       "max_iterations": 5,
       "parent_stage": "crouch_load",
       "reward_seed_prompt": "Keep the base stability terms + crouch_target. Add upward_impulse: reward positive root-link vertical velocity during the extension window, gated on having been crouched; cap it so it does not reward flailing.",
@@ -310,7 +336,7 @@ EVERY reward and keep the robot up while it learns each phase.
     {
       "name": "jump_and_land",
       "goal_text": "Chain crouch -> launch into a full ~30 cm jump and absorb the landing back to a stable upright stance.",
-      "success_criterion": "(trajectory['root_height'] > 0.95).any() and behavior['mean_episode_length'] > 450",
+      "success_criterion": "trajectory['root_height'][0] < 0.55 and (trajectory['root_height'] > 0.95).any() and behavior['mean_episode_length'] > 450",
       "max_iterations": 6,
       "parent_stage": "spring_up",
       "reward_seed_prompt": "Keep all prior terms. Add soft_landing: penalize large root vertical acceleration / impact after the apex, and reward returning to a stable upright pose after touchdown.",

@@ -1206,6 +1206,15 @@ def redecompose_stage(
     parameter) resolves which library robot slug to query when running
     that selection; unrelated to the LLM call itself.
 
+    §D30 fix: every sub-stage's `steering_metric` is left `None` (NOT
+    inherited from the failed stage) — see the inline comment at the
+    `Stage(...)` construction below for the full rationale. This is
+    deliberately asymmetric with the reference-clip inheritance above:
+    the clip identifies the underlying MOTION (shared across sub-stages
+    by construction), while `steering_metric` is a certified pointer
+    scoped to the exact goal/span it was generated against, which is
+    the parent stage's — not any sub-stage's.
+
     Raises `MissionValidationError` on any violation. Caller halts the
     mission on failure (do NOT retry Claude — same envelope as
     `decompose_task`).
@@ -1329,9 +1338,31 @@ def redecompose_stage(
             ),
             reward_seed_prompt=model_stage.reward_seed_prompt,
             kg_seed_papers=list(model_stage.kg_seed_papers or []),
-            # §Ship 38: sub-stages inherit the failed stage's objective so a
-            # re-decomposed phase keeps steering by the same metric.
-            steering_metric=failed_stage.steering_metric,
+            # §D30 fix (docs/internal/REFERENCE_BUILD_LOG.md): do NOT
+            # inherit the failed stage's `steering_metric` here. Unlike
+            # the reference-clip binding (D21, deliberate — sub-stages
+            # are phases of the SAME motion), the parent's steering
+            # metric was authored/certified against the PARENT stage's
+            # goal and span. Copying the pointer trips
+            # `generate_stage_metrics`'s "already set" skip guard, so
+            # no sub-stage ever gets its own metric — it silently steers
+            # by an objective built for a different (usually broader or
+            # differently-scoped) goal. Live: prone_getup_and_hold's
+            # crouch-to-stand sub-stages inherited the parent's
+            # prone-start synthetic-exemplar metric and scored a
+            # PERFECT crouch-to-stand rollout 0.0 on gate_started_prone
+            # even though `_select_and_attach_span` below had already
+            # picked each sub-stage's own correct span. Leaving this
+            # None lets the existing lazy metric-generation path
+            # certify each sub-stage against ITS OWN already-selected
+            # span the next time `generate_stage_metrics` runs over the
+            # mission. `model_stage.steering_metric` is never read here
+            # either — the redecompose LLM is not shown a
+            # `steering_metric` field in its output schema (see
+            # prompts/redecompose_stage.md), so it is always None on
+            # the parsed model; this omission is just explicit about
+            # not resurrecting it from the failed stage.
+            steering_metric=None,
             # §JUMP_SCAFFOLD refinement (2026-07-06): per-sub-stage RSI —
             # the redecompose LLM decides each sub-stage's flag (rule 10),
             # NOT force-inherit from the failed parent. Re-decomposition
@@ -1717,6 +1748,174 @@ def _mechanically_verify_criterion_on_clip(
     return None
 
 
+# ── §D29-4: anti-chaos discipline for re-grounded criteria ───────────
+#: D29 (docs/internal/REFERENCE_BUILD_LOG.md) live finding: the
+#: re-grounded criterion
+#: `(trajectory['root_height'] > 0.15).any() and
+#:  (trajectory['projected_gravity_b'][..., 2] < -0.2).any() and
+#:  behavior['mean_episode_length'] > 100`
+#: was satisfied by a physics-EXPLOSION rollout that tumbled through
+#: every height and orientation (fall-termination is off for get-up
+#: stages, so episode length is always full). `_mechanically_verify_
+#: criterion_on_clip` above only proves the rewrite passes on the
+#: HONEST exemplar — it cannot see that the same bare `.any()`
+#: reachability is trivially satisfied by chaos too. This is the
+#: complementary NEGATIVE check: the rewrite must also FAIL on
+#: synthetic chaos-shaped trajectories, mechanically constructed (no
+#: LLM), before it is trusted.
+_CHAOS_T_STEPS = 500
+
+
+def _chaos_trajectory_namespace(
+    root_height: Any, pg_z: Any, t_steps: int,
+) -> dict[str, Any]:
+    """Build a criterion-eval namespace from raw `root_height`/`pg_z`
+    arrays, in the SAME shape `_clip_to_trajectory_namespace` produces
+    from a real clip: `trajectory['root_height']` is `(T,)`,
+    `trajectory['projected_gravity_b']` is `(T, 3)` (only z, index 2,
+    varies — x/y are 0.0; every criterion this gate has seen only ever
+    reads `[..., 2]`). Unlike the on-exemplar namespace, `behavior` is
+    POPULATED here (`mean_episode_length=t_steps`) — the live D29
+    criterion's third conjunct reads `behavior['mean_episode_length']`,
+    and the whole point of this battery is to reproduce "fall-
+    termination off -> episode always runs full length" exactly."""
+    import numpy as np
+
+    root_height = np.asarray(root_height, dtype=np.float64)
+    pg_z = np.asarray(pg_z, dtype=np.float64)
+    zeros = np.zeros_like(pg_z)
+    trajectory: dict[str, Any] = {
+        "root_height": root_height,
+        "projected_gravity_b": np.stack([zeros, zeros, pg_z], axis=-1),
+    }
+    namespace: dict[str, Any] = {
+        "metric": None,
+        "behavior": {"mean_episode_length": t_steps},
+        "components": {},
+        "trajectory": trajectory,
+        "info": trajectory,
+    }
+    namespace.update({
+        "abs": abs, "min": min, "max": max, "sum": sum, "len": len,
+        "round": round, "float": float, "int": int, "bool": bool,
+    })
+    return namespace
+
+
+def _chaos_trajectory_namespaces(
+    t_steps: int = _CHAOS_T_STEPS,
+) -> list[tuple[str, dict[str, Any]]]:
+    """Two deterministic, mechanically-constructed chaos archetypes
+    (seeded RNG — same battery every call, so this gate never flakes):
+
+      * **explosion** — root height rockets 0.1 -> 2.5 m in a brief
+        ballistic spike (~8% of the episode) then rests low for the
+        remainder (a contact-force explosion that launches once and
+        collapses); orientation tumbles continuously — `pg_z` sweeps
+        -1..1 sinusoidally (~3 full tumbles across the episode).
+      * **chaotic_flail** — root height jitters in a low resting band
+        MOST of the time, with a sparse ~15%-of-frames burst into the
+        0.1-0.9 m band (uniform); `pg_z` is uniform in [-1, 1] on
+        EVERY frame (no coherent orientation at all).
+
+    Tuning note (measured, see REFERENCE_BUILD_LOG.md D29-4): a fully
+    literal "root height uniform in [0.1, 0.9] on EVERY frame" flail
+    (no duty-cycling) puts ~95% of frames above the live criterion's
+    0.15 m gate — comfortably ABOVE the 30% band a legitimate SUSTAINED
+    criterion uses, which would make this battery reject an honest
+    criterion too (a false positive). Duty-cycling the height burst to
+    ~15% of frames keeps both archetypes' height-band residency well
+    under 30% (empirically ~7.6% / ~11-14%) while still touching the
+    band at least once per episode — enough to trip a bare `.any()`
+    reachability clause, not enough to trip a `.mean() > 0.3` sustained
+    one. `pg_z` residency below -0.2 lands ~40-46% in both archetypes
+    (ungated, matching the literal "uniform in [-1, 1]" spec) — this is
+    fine because the paired/sustained example criterion is a
+    conjunction: its height half already reads False on both
+    archetypes, so the whole `and` stays False regardless of the pg_z
+    fraction.
+    """
+    import numpy as np
+
+    namespaces: list[tuple[str, dict[str, Any]]] = []
+
+    # (i) explosion.
+    rng = np.random.default_rng(1729)
+    t = np.linspace(0.0, 1.0, t_steps)
+    n_spike = max(2, int(round(t_steps * 0.08)))
+    z = rng.uniform(0.02, 0.08, size=t_steps)
+    ramp_len = n_spike // 2
+    fall_len = n_spike - ramp_len
+    spike = np.concatenate([
+        np.linspace(0.1, 2.5, ramp_len),
+        np.linspace(2.5, 0.08, fall_len),
+    ])
+    z[:n_spike] = spike[:n_spike]
+    pg_z = np.sin(2.0 * np.pi * 3.0 * t)  # ~3 tumbles across the episode
+    namespaces.append((
+        "explosion",
+        _chaos_trajectory_namespace(z, pg_z, t_steps),
+    ))
+
+    # (ii) chaotic flail.
+    rng = np.random.default_rng(4104)
+    active = rng.random(t_steps) < 0.15
+    z = np.where(
+        active,
+        rng.uniform(0.1, 0.9, size=t_steps),
+        rng.uniform(0.02, 0.08, size=t_steps),
+    )
+    pg_z = rng.uniform(-1.0, 1.0, size=t_steps)
+    namespaces.append((
+        "chaotic_flail",
+        _chaos_trajectory_namespace(z, pg_z, t_steps),
+    ))
+
+    return namespaces
+
+
+def _criterion_trips_on_chaos(criterion: str, namespace: dict[str, Any]) -> bool:
+    """True iff `criterion` (the FULL expression, not conjunct-split —
+    unlike `_mechanically_verify_criterion_on_clip`, which only checks
+    trajectory/behavior-only conjuncts in isolation) evaluates truthy
+    against a chaos namespace. `components` is the empty dict here
+    (same fail-closed convention as `_clip_to_trajectory_namespace`):
+    a `components.get('x', 0.0) > 0.2`-shaped conjunct reads its
+    fail-closed default and evaluates False, so a criterion whose ONLY
+    discriminating conjunct is a `components` lookup vacuously does
+    NOT trip chaos — safe (it also can't mechanically prove itself
+    non-gameable via `components`, but that is a pre-existing,
+    documented limit of this whole certification path, not something
+    this gate can close).
+
+    Never raises: a parse error, an unsafe construct that somehow
+    reached this point, or a runtime error (missing key, type error)
+    all mean "does not trip" — the SAFE direction (an exception is not
+    a satisfied criterion)."""
+    import ast
+
+    try:
+        tree = ast.parse(criterion.strip(), mode="eval")
+        compiled = compile(tree, "<criterion-chaos>", "eval")
+        result = eval(  # noqa: S307 — same trusted-namespace contract as the on-exemplar check
+            compiled, {"__builtins__": __builtins__}, namespace)
+    except Exception:  # noqa: BLE001 — raising = does not trip = safe
+        return False
+    return bool(result)
+
+
+def _chaos_gate_reject_reason(criterion: str) -> Optional[str]:
+    """§D29-4 acceptance gate: `None` when `criterion` evaluates False
+    on EVERY chaos archetype (safe to adopt); otherwise the name of the
+    first archetype that satisfied it (chaos-gameable — must be
+    rejected). Mirrors `_mechanically_verify_criterion_on_clip`'s
+    contract: never raises, deterministic, caller-owns-the-decision."""
+    for name, namespace in _chaos_trajectory_namespaces():
+        if _criterion_trips_on_chaos(criterion, namespace):
+            return name
+    return None
+
+
 def ground_stage_criterion(
     stage: Stage,
     cropped_clip: dict,
@@ -1748,15 +1947,23 @@ def ground_stage_criterion(
     `_validate_success_criterion`/`_validate_criterion_ast` — run FIRST,
     exactly like `_gate_reconciled_criterion` — or, only once the rewrite
     is already known SAFE, the MECHANICAL acceptance check
-    `_mechanically_verify_criterion_on_clip`) rather than burning more
-    calls chasing a fix. That mechanical check makes a WRONG re-grounded
-    criterion strictly HARDER to adopt than the status quo: every
-    `trajectory`/`behavior`-only conjunct in the rewrite must evaluate
-    `True` on the cropped reference clip's own data (`components`-
-    referencing conjuncts are unverifiable here and skipped) — a
-    criterion that fails its own reference exemplar is exactly the D23
-    defect this increment exists to close, so it is REJECTED, never
-    adopted.
+    `_mechanically_verify_criterion_on_clip`, or (§D29-4, run right
+    after that check) the ANTI-CHAOS check `_chaos_gate_reject_reason`)
+    rather than burning more calls chasing a fix. The on-exemplar
+    mechanical check makes a WRONG re-grounded criterion strictly HARDER
+    to adopt than the status quo: every `trajectory`/`behavior`-only
+    conjunct in the rewrite must evaluate `True` on the cropped
+    reference clip's own data (`components`-referencing conjuncts are
+    unverifiable here and skipped) — a criterion that fails its own
+    reference exemplar is exactly the D23 defect this increment exists
+    to close, so it is REJECTED, never adopted. The anti-chaos check is
+    its NEGATIVE complement (§D29-4, docs/internal/REFERENCE_BUILD_LOG.md
+    D29 finding 4): the on-exemplar check alone cannot see that a bare
+    `.any()`-shaped reach clause is ALSO trivially satisfied by a
+    tumbling/exploding rollout (fall-termination is off for get-up
+    stages, so a chaos rollout runs the full episode length too) — the
+    rewrite must evaluate False against every synthetic chaos archetype
+    in `_chaos_trajectory_namespaces` or it is rejected the same way.
 
     Mutates `stage.success_criterion` in place ONLY on acceptance.
     Returns `{"adopted": bool, "rationale": <str>}` ALWAYS (never
@@ -1869,6 +2076,21 @@ def ground_stage_criterion(
         new_criterion, cropped_clip)
     if fail_reason is not None:
         reason = f"mechanical verification failed: {fail_reason}"
+        print(f"[decompose] stage {stage.name!r}: re-grounded criterion "
+              f"REJECTED ({reason}) — keeping the original criterion "
+              f"{original!r}.", file=sys.stderr, flush=True)
+        return {"adopted": False, "rationale": reason}
+
+    # §D29-4 anti-chaos check: the on-exemplar check above only proves
+    # the rewrite passes on HONEST motion — it says nothing about
+    # whether a chaos/explosion rollout also satisfies it (the live
+    # D29 defect: a bare `.any()`-shaped reach clause is trivially
+    # satisfied by a tumbling explosion). Run AFTER the on-exemplar
+    # check (so a criterion that fails its own exemplar is rejected for
+    # THAT reason first) but still before ever adopting the rewrite.
+    chaos_hit = _chaos_gate_reject_reason(new_criterion)
+    if chaos_hit is not None:
+        reason = f"criterion satisfied by chaos trajectory: {chaos_hit}"
         print(f"[decompose] stage {stage.name!r}: re-grounded criterion "
               f"REJECTED ({reason}) — keeping the original criterion "
               f"{original!r}.", file=sys.stderr, flush=True)

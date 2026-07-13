@@ -645,11 +645,24 @@ def list_stage_iterations(
                 if isinstance(v, (int, float)):
                     primary_metric = float(v)
 
-        behavior = _load_json_dict(d / "rollout" / "behavior.json") or {}
-        fitness = behavior.get("fitness")
-
         spec = _load_json_dict(d / "reward_spec.json") or {}
         reward_version = spec.get("version")
+
+        # §list/detail fitness parity: this used to bare-read
+        # `behavior.json`'s `fitness` key, which is null for any
+        # iteration whose objective fitness only landed in
+        # `reward_spec.json` / a dedicated `fitness.json` / the
+        # diagnoser's `evidence` prose — exactly what
+        # `_extract_objective_fitness` (the SAME helper
+        # `get_stage_iter_detail` uses) already recovers. Share it so
+        # the list and detail views never disagree about whether a
+        # given iteration "has" a fitness value.
+        diagnosis = _load_json_dict(d / "diagnosis.json") or {}
+        evidence = (
+            diagnosis.get("evidence")
+            if isinstance(diagnosis.get("evidence"), str) else None
+        )
+        fitness = _extract_objective_fitness(d, spec, evidence)
 
         rollout_path = d / "rollout" / "rollout.mp4"
         checkpoint_path = _find_checkpoint(d)
@@ -665,7 +678,7 @@ def list_stage_iterations(
         out.append(StageIterationSummary(
             iter_index=iter_index,
             primary_metric=primary_metric,
-            fitness=fitness if isinstance(fitness, (int, float)) else None,
+            fitness=fitness,
             has_rollout=rollout_path.is_file() and rollout_path.stat().st_size > 0,
             has_checkpoint=checkpoint_path is not None,
             reward_version=reward_version if isinstance(reward_version, str) else None,
@@ -713,6 +726,59 @@ def _find_checkpoint(iter_dir: Path) -> Optional[Path]:
         p = iter_dir / name
         if p.is_file() and p.stat().st_size > 0:
             return p
+    return None
+
+
+# §list/detail fitness parity (UI item 8): strict fallback regex for
+# `objective_fitness` when no structured value is available anywhere —
+# diagnosis.json's `evidence` prose always leads with this exact
+# phrasing (see recon on the live g1-jump-demo-lokesh mission) when a
+# task-derived metric backed the run.
+_OBJECTIVE_FITNESS_RE = re.compile(r"[Oo]bjective fitness is ([0-9.]+)")
+
+
+def _extract_objective_fitness(
+    iter_dir: Path, spec: dict, evidence: Optional[str],
+) -> Optional[float]:
+    """Structured value first (reward_spec.json / a dedicated fitness
+    json / behavior.json's `objective_fitness`/`fitness`), else a strict
+    regex pull of the leading number out of diagnosis.json's `evidence`
+    prose (`"Objective fitness is 0.99963 ..."`), else None. This is a
+    best-effort disk scrape — no structured `objective_fitness` field is
+    guaranteed to exist on any given iter.
+
+    §list/detail fitness parity (UI item 8): this is the ONE fitness
+    extraction path — `get_stage_iter_detail` (below), `list_stage_
+    iterations` (above), and `routes/runs.py::list_project_iterations`
+    (imports this function directly — no duplicate logic) all call
+    THIS, so the list and detail views can never disagree about
+    whether a given iteration "has" a fitness value. Before this, both
+    LIST endpoints bare-read `behavior.json['fitness']` — null for any
+    iteration whose objective fitness only ever landed in
+    `reward_spec.json` / `fitness.json` / the diagnoser's `evidence`
+    prose, which is exactly what this helper recovers."""
+    for key in ("objective_fitness", "fitness"):
+        v = spec.get(key)
+        if isinstance(v, (int, float)):
+            return float(v)
+    fitness_doc = _load_json_dict(iter_dir / "fitness.json")
+    if fitness_doc is not None:
+        for key in ("objective_fitness", "fitness", "value"):
+            v = fitness_doc.get(key)
+            if isinstance(v, (int, float)):
+                return float(v)
+    behavior = _load_json_dict(iter_dir / "rollout" / "behavior.json") or {}
+    for key in ("objective_fitness", "fitness"):
+        v = behavior.get(key)
+        if isinstance(v, (int, float)):
+            return float(v)
+    if evidence:
+        m = _OBJECTIVE_FITNESS_RE.search(evidence)
+        if m:
+            try:
+                return float(m.group(1))
+            except ValueError:
+                return None
     return None
 
 
@@ -933,13 +999,6 @@ def get_stage_iter_export(
 
 
 # ── GET .../stages/{stage}/iterations/{i}/detail ───────────────────────
-# Strict fallback regex for `objective_fitness` when no structured value
-# is available anywhere: diagnosis.json's `evidence` prose always leads
-# with this exact phrasing (see recon on the live g1-jump-demo-lokesh
-# mission) when a task-derived metric backed the run.
-_OBJECTIVE_FITNESS_RE = re.compile(r"[Oo]bjective fitness is ([0-9.]+)")
-
-
 def _extract_reward_description(iter_dir: Path, stage_dir: Path, spec: dict) -> Optional[str]:
     """`reward_spec.json`'s own `description` field wins; else fall back
     to the module docstring of `<stage_dir>/rewards/v{version}.py`."""
@@ -990,38 +1049,6 @@ def _extract_reward_references(spec: dict) -> list[StageIterPaperRef]:
                     description=f"{key}: {note}",
                 ))
     return out
-
-
-def _extract_objective_fitness(iter_dir: Path, spec: dict, evidence: Optional[str]) -> Optional[float]:
-    """Structured value first (reward_spec.json / a dedicated fitness
-    json / behavior.json's `objective_fitness`/`fitness`), else a strict
-    regex pull of the leading number out of diagnosis.json's `evidence`
-    prose (`"Objective fitness is 0.99963 ..."`), else None. This is a
-    best-effort disk scrape — no structured `objective_fitness` field is
-    guaranteed to exist on any given iter."""
-    for key in ("objective_fitness", "fitness"):
-        v = spec.get(key)
-        if isinstance(v, (int, float)):
-            return float(v)
-    fitness_doc = _load_json_dict(iter_dir / "fitness.json")
-    if fitness_doc is not None:
-        for key in ("objective_fitness", "fitness", "value"):
-            v = fitness_doc.get(key)
-            if isinstance(v, (int, float)):
-                return float(v)
-    behavior = _load_json_dict(iter_dir / "rollout" / "behavior.json") or {}
-    for key in ("objective_fitness", "fitness"):
-        v = behavior.get(key)
-        if isinstance(v, (int, float)):
-            return float(v)
-    if evidence:
-        m = _OBJECTIVE_FITNESS_RE.search(evidence)
-        if m:
-            try:
-                return float(m.group(1))
-            except ValueError:
-                return None
-    return None
 
 
 def _mean_reward_components(iter_dir: Path) -> Optional[dict[str, float]]:

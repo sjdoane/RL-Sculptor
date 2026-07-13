@@ -2358,16 +2358,27 @@ def test_redecompose_rolls_back_in_memory_on_save_failure(
     assert m.current_stage_idx == 0
 
 
-def test_redecompose_metric_inheritance_fills_missing_child_metric(
+def test_redecompose_no_longer_inherits_parent_steering_metric(
     tmp_path: Path, monkeypatch, stub_adapter,
 ):
-    """§mission-persistence increment 1: a sub-stage left without its
-    own `steering_metric` by the redecomposer inherits the superseded
-    parent's, and `stage_metric_inherited` fires naming the source
-    stage + every stage it filled in. A sub-stage that already has its
-    own metric is left alone."""
+    """§D30 (docs/internal/REFERENCE_BUILD_LOG.md): a sub-stage left
+    without its own `steering_metric` by the redecomposer must STAY
+    `None` — `_maybe_redecompose_and_splice`'s old "defense-in-depth"
+    backstop (that copied the superseded parent's `steering_metric` into
+    any sub-stage lacking one) is REMOVED. D30 live: the span machinery
+    correctly selected each sub-stage's own sub-span, but the inherited
+    metric POINTER carried the PARENT's synthetic-exemplar metric along
+    with it — which demanded a start state the sub-stage was designed
+    NOT to have, scoring a perfectly correct rollout fitness 0.0 (the
+    D23 exemplar-scope-mismatch class, reborn one level down). Leaving
+    `steering_metric=None` lets the existing LAZY metric generation
+    certify each sub-stage against its OWN span instead. A sub-stage
+    that already carries its OWN metric is untouched either way — this
+    was never about that case. (Formerly
+    `test_redecompose_metric_inheritance_fills_missing_child_metric`,
+    which pinned the now-removed inheritance behavior; the corresponding
+    `stage_metric_inherited` event no longer fires at all.)"""
     from sculptor import sculpt as sculpt_mod
-    from sculptor.decompose import _RedecompositionModel, _StageModel
 
     m = _make_mission(tmp_path, n_stages=1)
     m.stages[0].steering_metric = "g1_kick"
@@ -2389,22 +2400,18 @@ def test_redecompose_metric_inheritance_fills_missing_child_metric(
     # Build a redecompose response with 2 sub-stages; construct the Stage
     # objects `redecompose_stage` will return directly so we can control
     # steering_metric independent of the `_StageModel` inheritance done
-    # in decompose.py itself (that inheritance is unconditional and would
-    # mask the sculpt.py-level backstop this test targets).
-    response = _make_redecompose_response("stage_0", n_sub=2)
-
+    # in decompose.py itself.
     def fake_redecompose_stage(mission, idx, **kw):
-        from sculptor.mission import Stage as _Stage
         failed = mission.stages[idx]
-        sub0 = _Stage(
+        sub0 = Stage(
             name="stage_0__r1_0", goal_text="sub 0",
             success_criterion="metric > 0.0", max_iterations=2,
             parent_stage=failed.parent_stage,
             reward_seed_prompt="seed 0",
-            steering_metric=None,  # missing — should inherit
+            steering_metric=None,  # missing — must STAY None (§D30)
             redecomposition_attempts=1,
         )
-        sub1 = _Stage(
+        sub1 = Stage(
             name="stage_0__r1_1", goal_text="sub 1",
             success_criterion="metric > 0.5", max_iterations=2,
             parent_stage="stage_0__r1_0",
@@ -2427,15 +2434,13 @@ def test_redecompose_metric_inheritance_fills_missing_child_metric(
     )
 
     assert result.completed is True
-    inherited = [e for e in events if e.get("type") == "stage_metric_inherited"]
-    assert len(inherited) == 1
-    assert inherited[0]["from_stage"] == "stage_0"
-    assert inherited[0]["to_stages"] == ["stage_0__r1_0"]
+    # The event this backstop used to emit must never fire again.
+    assert not [e for e in events if e.get("type") == "stage_metric_inherited"]
 
     sub0 = m.stage_by_name("stage_0__r1_0")
     sub1 = m.stage_by_name("stage_0__r1_1")
-    assert sub0.steering_metric == "g1_kick"  # inherited
-    assert sub1.steering_metric == "g1_stand"  # untouched
+    assert sub0.steering_metric is None        # NOT inherited (§D30 fix)
+    assert sub1.steering_metric == "g1_stand"  # untouched either way
 
 
 def test_mission_loop_skips_superseded_stage_at_resume(
@@ -3263,6 +3268,11 @@ def test_stage_reference_clip_id_wins_over_project_jump_clip(
 
     lib_root = tmp_path / "reflib"
     monkeypatch.setenv("RS_REFERENCE_ROOT", str(lib_root))
+    # §D29-2: this test is about clip-precedence wiring, not settle
+    # physics — the bare/no-quat/no-joint_pos test clip has no plausible
+    # settle target and correctly explodes under REAL settling now that
+    # §D29-2 makes that fatal by default; skip settling here.
+    monkeypatch.setenv("RS_SETTLE_RESET", "0")
     _write_library_clip(lib_root, "g1", "test_getup_clip")
 
     m = _make_mission(tmp_path, n_stages=1)
@@ -3318,6 +3328,10 @@ def test_stage_eval_reset_written_for_getup_stage(
 
     lib_root = tmp_path / "reflib"
     monkeypatch.setenv("RS_REFERENCE_ROOT", str(lib_root))
+    # §D29-2: this test is about the eval_reset.json write, not settle
+    # physics — skip settling (see the identical note on the clip-
+    # precedence test above).
+    monkeypatch.setenv("RS_SETTLE_RESET", "0")
     _write_library_clip(lib_root, "g1", "test_getup_clip")
 
     m = _make_mission(tmp_path, n_stages=1)
@@ -3408,6 +3422,10 @@ def test_stage_reference_rsi_rederives_when_span_changes(
 
     lib_root = tmp_path / "reflib"
     monkeypatch.setenv("RS_REFERENCE_ROOT", str(lib_root))
+    # §D29-2: this test is about span-change re-derivation, not settle
+    # physics — skip settling (see the identical note earlier in this
+    # file).
+    monkeypatch.setenv("RS_SETTLE_RESET", "0")
     _write_library_clip(lib_root, "g1", "test_getup_clip")
 
     m = _make_mission(tmp_path, n_stages=1)
@@ -3733,6 +3751,11 @@ def test_stage_start_pose_compatible_clip_scaffolds_normally(
 
     lib_root = tmp_path / "reflib"
     monkeypatch.setenv("RS_REFERENCE_ROOT", str(lib_root))
+    # §D29-2: this test is about start_pose QC, not settle physics — the
+    # bare/no-quat fixture has no orientation data (accepts either
+    # supine/prone at the QC layer) and no plausible settle target;
+    # skip settling so it isn't masked by an unrelated explosion.
+    monkeypatch.setenv("RS_SETTLE_RESET", "0")
     _write_library_clip(lib_root, "g1", "test_getup_clip")
 
     m = _make_mission(tmp_path, n_stages=1)
@@ -3776,6 +3799,10 @@ def test_persisted_needs_rsi_false_with_non_standing_pose_still_scaffolds(
 
     lib_root = tmp_path / "reflib"
     monkeypatch.setenv("RS_REFERENCE_ROOT", str(lib_root))
+    # §D29-2: this test is about the force-rule recompute, not settle
+    # physics — skip settling (see the identical note on the start_pose
+    # QC test above).
+    monkeypatch.setenv("RS_SETTLE_RESET", "0")
     _write_library_clip(lib_root, "g1", "test_getup_clip")
 
     m = _make_mission(tmp_path, n_stages=1)
@@ -3862,6 +3889,10 @@ def test_reference_signature_written_when_needs_rsi_true(
 
     lib_root = tmp_path / "reflib"
     monkeypatch.setenv("RS_REFERENCE_ROOT", str(lib_root))
+    # §D29-2: this test is about the reference_signature.json write, not
+    # settle physics — skip settling (see the identical note earlier in
+    # this file).
+    monkeypatch.setenv("RS_SETTLE_RESET", "0")
     _write_library_clip(lib_root, "g1", "test_getup_clip")
 
     m = _make_mission(tmp_path, n_stages=1)
@@ -3985,6 +4016,10 @@ def test_reference_signature_text_from_provenance(
 
     lib_root = tmp_path / "reflib"
     monkeypatch.setenv("RS_REFERENCE_ROOT", str(lib_root))
+    # §D29-2: this test is about the signature text/provenance, not
+    # settle physics — skip settling (see the identical note earlier in
+    # this file).
+    monkeypatch.setenv("RS_SETTLE_RESET", "0")
     _write_library_clip(lib_root, "g1", "test_getup_clip")
     refs_library.write_provenance(
         "g1", "test_getup_clip",
@@ -4206,6 +4241,11 @@ def test_non_standing_start_pose_rsi_apply_failure_fails_stage(
 
     lib_root = tmp_path / "reflib"
     monkeypatch.setenv("RS_REFERENCE_ROOT", str(lib_root))
+    # §D29-2: this test is about the apply_reference_rsi failure path
+    # (simulated below), not settle physics — the bare/no-quat fixture
+    # has no plausible settle target; skip settling so the intended
+    # simulated failure isn't masked by an unrelated settle explosion.
+    monkeypatch.setenv("RS_SETTLE_RESET", "0")
     _write_library_clip(lib_root, "g1", "test_getup_clip")
 
     def fake_apply(*a, **kw):
@@ -4247,6 +4287,10 @@ def test_standing_start_pose_rsi_apply_failure_stays_non_fatal(
 
     lib_root = tmp_path / "reflib"
     monkeypatch.setenv("RS_REFERENCE_ROOT", str(lib_root))
+    # §D29-2: this test is about the apply_reference_rsi failure path
+    # (simulated below), not settle physics — skip settling (see the
+    # identical note on the non-standing variant of this test above).
+    monkeypatch.setenv("RS_SETTLE_RESET", "0")
     _write_library_clip(lib_root, "g1", "test_getup_clip")
 
     def fake_apply(*a, **kw):
@@ -4816,6 +4860,7 @@ def test_redecompose_inherits_reference_binding_without_forcing_rsi(
 
 
 # ── §D24 F1 item 4b: redecompose inherits the CLIP but never the SPAN ──────
+# ── §D30: redecompose inherits the CLIP but never the steering_metric ──────
 def test_redecompose_inherits_clip_but_not_span(tmp_path: Path, monkeypatch):
     """§D24 F1 (docs/internal/REFERENCE_BUILD_LOG.md D23/D24): every
     sub-stage unconditionally inherits the failed stage's
@@ -4824,7 +4869,15 @@ def test_redecompose_inherits_clip_but_not_span(tmp_path: Path, monkeypatch):
     freshly re-selected. Proven here by giving the FAILED stage a
     (fake, pre-existing) span and a span selector that DECLINES for
     every sub-stage: if inheritance were happening, the sub-stages
-    would show the failed stage's stale span values instead of None."""
+    would show the failed stage's stale span values instead of None.
+
+    §D30 (same build-log doc): the failed stage's `steering_metric` must
+    ALSO NOT be inherited — copying that pointer trips
+    `generate_stage_metrics`'s "already set" skip guard, so a sub-stage
+    silently steers by a metric certified against the PARENT's (wrong)
+    goal/span forever. Proven here the same way as the span fields: the
+    failed stage carries a pre-existing `steering_metric` and every
+    sub-stage must come back None, never the parent's stale pointer."""
     from sculptor import decompose as dc
     from sculptor.decompose import StageTrainingFeedback
 
@@ -4845,6 +4898,9 @@ def test_redecompose_inherits_clip_but_not_span(tmp_path: Path, monkeypatch):
     failed.reference_span_end_s = 5.0
     failed.reference_span_confidence = 0.99
     failed.reference_span_method = "llm+snap+qc"
+    # §D30: a stale pre-existing steering_metric on the FAILED stage —
+    # must never leak onto the sub-stages either.
+    failed.steering_metric = "stage_metrics/stage_0/metric.py"
 
     response = _make_redecompose_response("stage_0", n_sub=2)
 
@@ -4879,6 +4935,10 @@ def test_redecompose_inherits_clip_but_not_span(tmp_path: Path, monkeypatch):
         assert sub.reference_span_end_s is None
         assert sub.reference_span_confidence is None
         assert sub.reference_span_method is None
+        # §D30: steering_metric is NOT inherited either — every
+        # sub-stage's own metric will be lazily (re-)generated against
+        # its own already-selected span, not the parent's stale pointer.
+        assert sub.steering_metric is None
 
 
 def test_redecompose_reference_dir_lookup_degrades_gracefully(
@@ -5591,3 +5651,316 @@ def test_new_d21_failure_reasons_not_redecomposable():
 
     assert "reference_scaffold_failed" not in sculpt_mod._REDECOMPOSABLE_REASONS
     assert "start_state_mismatch" not in sculpt_mod._REDECOMPOSABLE_REASONS
+
+
+# ── §D29-2: explosion-class settle failure fails the stage closed ──────
+def test_stage_settle_explosion_fails_stage_closed(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """§D29-2 (live D29 disaster): a settle failure from the
+    PLAUSIBILITY-BOUND branch (`SettleExplosion`, the "implausible
+    height change ... contact-force explosion" diagnostic) means the
+    reference-DERIVED reset pose itself is invalid. Proceeding with the
+    unsettled (exploding) reset was the D29 live disaster — this must
+    fail the stage CLOSED with `reference_scaffold_failed` (default
+    `RS_SETTLE_EXPLOSION_FATAL` unset == fatal), same discipline D21
+    uses for clip-load failure, and must NEVER reach
+    `stage_reference_rsi_applied` (the exploding reset never gets
+    persisted)."""
+    from sculptor import sculpt as sculpt_mod
+    from sculptor.reference import SettleExplosion
+
+    lib_root = tmp_path / "reflib"
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(lib_root))
+    _write_library_clip(lib_root, "g1", "test_getup_clip")
+
+    m = _make_mission(tmp_path, n_stages=1)
+    m.stages[0].needs_reference_rsi = True
+    m.stages[0].reference_clip_id = "test_getup_clip"
+    m.stages[0].redecomposition_attempts = 1  # halt, don't redecompose
+
+    def _boom(*_a, **_kw):
+        raise SettleExplosion(
+            "physics settle produced an implausible height change "
+            "(+1.820 m over 40 steps, exceeds the 1.5 m plausibility "
+            "bound) — likely a contact-force explosion from joint/"
+            "orientation interpenetration"
+        )
+
+    monkeypatch.setattr("sculptor.reference.settle_reset", _boom)
+
+    fake = _fake_sculpt_run_factory(metric=0.9)
+    monkeypatch.setattr(sculpt_mod, "sculpt_run", fake)
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
+    )
+
+    events: list[dict] = []
+    result = sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab", kg_store=None, on_event=events.append,
+    )
+    assert result.completed is False
+    assert result.halted_reason == "reference_scaffold_failed"
+
+    explosion_events = [
+        e for e in events if e["type"] == "stage_settle_explosion"]
+    assert len(explosion_events) == 1
+    assert "implausible" in explosion_events[0]["error"]
+
+    failed_events = [e for e in events if e["type"] == "stage_failed"]
+    assert len(failed_events) == 1
+    assert failed_events[0]["reason"] == "reference_scaffold_failed"
+    assert "implausible" in failed_events[0]["detail"]
+
+    # Never persisted the exploding reset — RSI apply never reached.
+    assert not [e for e in events if e["type"] == "stage_reference_rsi_applied"]
+    assert not [e for e in events if e["type"] == "stage_eval_reset_written"]
+
+
+def test_stage_settle_non_explosion_failure_stays_non_fatal(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """A NON-explosion settle failure (settle infrastructure unavailable
+    — MJCF/model/mujoco-import failure, or a generic step exception) is
+    a DIFFERENT class from §D29-2's explosion branch: §5's original
+    "never a stage-blocking dependency" discipline is unchanged — the
+    scaffold proceeds with the unsettled reset exactly like before this
+    fix."""
+    from sculptor import sculpt as sculpt_mod
+    from sculptor.reference import SettleUnavailable
+
+    lib_root = tmp_path / "reflib"
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(lib_root))
+    _write_library_clip(lib_root, "g1", "test_getup_clip")
+
+    m = _make_mission(tmp_path, n_stages=1)
+    m.stages[0].needs_reference_rsi = True
+    m.stages[0].reference_clip_id = "test_getup_clip"
+
+    def _boom(*_a, **_kw):
+        raise SettleUnavailable(
+            "mujoco import failed: ImportError: no module named mujoco")
+
+    monkeypatch.setattr("sculptor.reference.settle_reset", _boom)
+
+    fake = _fake_sculpt_run_factory(metric=0.9, match_eval_reset=True)
+    monkeypatch.setattr(sculpt_mod, "sculpt_run", fake)
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
+    )
+
+    events: list[dict] = []
+    result = sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab", kg_store=None, on_event=events.append,
+    )
+    assert result.completed is True
+    assert not [e for e in events if e["type"] == "stage_settle_explosion"]
+    rsi_events = [
+        e for e in events if e["type"] == "stage_reference_rsi_applied"]
+    assert len(rsi_events) == 1
+
+
+def test_stage_settle_explosion_escape_hatch_reverts_to_warn(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """`RS_SETTLE_EXPLOSION_FATAL=0` reverts §D29-2 to the pre-fix warn-
+    and-proceed behavior — the explosion is still disclosed via the
+    event, but the stage is not failed."""
+    from sculptor import sculpt as sculpt_mod
+    from sculptor.reference import SettleExplosion
+
+    monkeypatch.setenv("RS_SETTLE_EXPLOSION_FATAL", "0")
+
+    lib_root = tmp_path / "reflib"
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(lib_root))
+    _write_library_clip(lib_root, "g1", "test_getup_clip")
+
+    m = _make_mission(tmp_path, n_stages=1)
+    m.stages[0].needs_reference_rsi = True
+    m.stages[0].reference_clip_id = "test_getup_clip"
+
+    def _boom(*_a, **_kw):
+        raise SettleExplosion("physics settle produced an implausible height change")
+
+    monkeypatch.setattr("sculptor.reference.settle_reset", _boom)
+
+    fake = _fake_sculpt_run_factory(metric=0.9, match_eval_reset=True)
+    monkeypatch.setattr(sculpt_mod, "sculpt_run", fake)
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
+    )
+
+    events: list[dict] = []
+    result = sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab", kg_store=None, on_event=events.append,
+    )
+    assert result.completed is True
+    explosion_events = [
+        e for e in events if e["type"] == "stage_settle_explosion"]
+    assert len(explosion_events) == 1
+    rsi_events = [
+        e for e in events if e["type"] == "stage_reference_rsi_applied"]
+    assert len(rsi_events) == 1
+
+
+# ── §D29-5: a unanimous certified-zero fitness vetoes criterion success ──
+def _fake_sculpt_run_with_fitness(
+    *, metric: float, fitness: "float | None", match_eval_reset: bool = False,
+):
+    """Mirrors `_fake_sculpt_run_factory` but also sets `.fitness` on the
+    returned `IterOutcome` — the real loop populates this from a wired
+    `fitness_fn`'s objective score (§Ship 33); `_fake_sculpt_run_factory`
+    leaves it `None` (no fitness_fn stubbed), which is exactly the "no
+    metric" carve-out §D29-5 must leave untouched."""
+    def fake(*, config_path, behavior_goal, iterations=3, steps_per_iter=None,
+              seed=None, init_policy_path=None, **_kw):
+        project = Path(config_path).parent
+        iter_dir = project / "runs" / f"iter_{iterations}"
+        iter_dir.mkdir(parents=True, exist_ok=True)
+        (iter_dir / "checkpoint.pt").write_bytes(b"fake-ckpt")
+        trajectory = (
+            _trajectory_matching_eval_reset(project)
+            if match_eval_reset else None)
+        _fabricate_rollout_artifacts(
+            iter_dir,
+            behavior={"n_episodes": 1, "mean_return": metric,
+                      "mean_episode_length": 400.0, "max_episode_length": 500},
+            trajectory=trajectory,
+        )
+        from sculptor.sculpt import IterOutcome, SculptRunResult
+        outcome = IterOutcome(
+            iter_index=iterations,
+            iter_dir=iter_dir,
+            reward_path_before=project / "rewards" / "v1.py",
+            reward_path_after=project / "rewards" / f"v{iterations}.py",
+            primary_metric=metric,
+            behavior={"mean_return": metric},
+            failure_modes=[],
+            edit_count=0,
+            fitness=fitness,
+        )
+        return SculptRunResult(
+            iterations_run=iterations,
+            completed_iters=[outcome],
+            primary_metric_history=[metric],
+        )
+    return fake
+
+
+def test_fitness_veto_blocks_success_on_unanimous_zero(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """§D29-5 core: criterion PASSES (metric 0.9 > 0.5) but the stage's
+    steering metric produced a certified-zero fitness on the (unanimous,
+    single) candidate — must NOT mint success. Resolves as
+    `criterion_pass_fitness_zero`, which is redecomposable (behaves like
+    `criterion_not_met`)."""
+    from sculptor import sculpt as sculpt_mod
+
+    m = _make_mission(tmp_path, n_stages=1)
+    m.stages[0].redecomposition_attempts = 1  # halt, don't redecompose
+
+    fake = _fake_sculpt_run_with_fitness(metric=0.9, fitness=0.0)
+    monkeypatch.setattr(sculpt_mod, "sculpt_run", fake)
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
+    )
+
+    events: list[dict] = []
+    result = sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab", kg_store=None, on_event=events.append,
+    )
+    assert result.completed is False
+    assert result.halted_reason == "criterion_pass_fitness_zero"
+
+    veto_events = [
+        e for e in events if e["type"] == "stage_criterion_fitness_veto"]
+    assert len(veto_events) == 1
+    assert veto_events[0]["max_fitness"] == pytest.approx(0.0)
+    assert veto_events[0]["n_candidates"] == 1
+    assert veto_events[0]["criterion"] == "metric > 0.5"
+
+    failed_events = [e for e in events if e["type"] == "stage_failed"]
+    assert len(failed_events) == 1
+    assert failed_events[0]["reason"] == "criterion_pass_fitness_zero"
+
+    assert "criterion_pass_fitness_zero" in sculpt_mod._REDECOMPOSABLE_REASONS
+    # criterion_pass=True was still reported at selection time (the
+    # criterion genuinely evaluated True — the veto is a SEPARATE,
+    # downstream decision).
+    selection_events = [
+        e for e in events if e["type"] == "stage_final_selection"]
+    assert selection_events[0]["criterion_pass"] is True
+
+
+def test_fitness_veto_does_not_block_healthy_fitness(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """The same criterion pass, but with healthy (non-zero) fitness —
+    must succeed normally, no veto."""
+    from sculptor import sculpt as sculpt_mod
+
+    m = _make_mission(tmp_path, n_stages=1)
+    fake = _fake_sculpt_run_with_fitness(metric=0.9, fitness=0.9)
+    monkeypatch.setattr(sculpt_mod, "sculpt_run", fake)
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
+    )
+
+    events: list[dict] = []
+    result = sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab", kg_store=None, on_event=events.append,
+    )
+    assert result.completed is True
+    assert not [e for e in events
+                if e["type"] == "stage_criterion_fitness_veto"]
+    succeeded_events = [e for e in events if e["type"] == "stage_succeeded"]
+    assert len(succeeded_events) >= 1
+
+
+def test_fitness_veto_no_op_for_metricless_stage(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """A stage with NO steering metric wired (every candidate's
+    `.fitness is None`, `_fake_sculpt_run_factory`'s default) keeps
+    today's criterion-only behavior — the veto never even evaluates."""
+    from sculptor import sculpt as sculpt_mod
+
+    m = _make_mission(tmp_path, n_stages=1)
+    fake = _fake_sculpt_run_factory(metric=0.9)  # fitness stays None
+    monkeypatch.setattr(sculpt_mod, "sculpt_run", fake)
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
+    )
+
+    events: list[dict] = []
+    result = sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab", kg_store=None, on_event=events.append,
+    )
+    assert result.completed is True
+    assert not [e for e in events
+                if e["type"] == "stage_criterion_fitness_veto"]
+
+
+def test_fitness_veto_disabled_by_env_flag(
+    tmp_path: Path, monkeypatch, stub_adapter,
+):
+    """`RS_FITNESS_VETO=0` reverts to the pre-§D29-5 behavior: a
+    unanimous certified-zero fitness no longer blocks success."""
+    from sculptor import sculpt as sculpt_mod
+
+    monkeypatch.setenv("RS_FITNESS_VETO", "0")
+    m = _make_mission(tmp_path, n_stages=1)
+    fake = _fake_sculpt_run_with_fitness(metric=0.9, fitness=0.0)
+    monkeypatch.setattr(sculpt_mod, "sculpt_run", fake)
+    monkeypatch.setattr(
+        "sculptor.edit.apply_prompt_edit", _stub_apply_prompt_edit,
+    )
+
+    events: list[dict] = []
+    result = sculpt_mod.mission_run(
+        m, adapter_short_name="mjlab", kg_store=None, on_event=events.append,
+    )
+    assert result.completed is True
+    assert not [e for e in events
+                if e["type"] == "stage_criterion_fitness_veto"]

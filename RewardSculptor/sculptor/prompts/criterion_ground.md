@@ -57,6 +57,44 @@ criterion in the REAL numbers that span actually measures.
    already consistent with the signature, return it UNCHANGED (verbatim)
    with a rationale explaining why no change was needed, rather than
    inventing a cosmetic edit.
+6. **Anti-chaos: a bare reach clause is not a success criterion.** A
+   documented real failure: the re-grounded criterion
+   `(trajectory['root_height'] > 0.15).any() and
+   (trajectory['projected_gravity_b'][..., 2] < -0.2).any() and
+   behavior['mean_episode_length'] > 100` was satisfied by a physics
+   EXPLOSION — a rollout that launched airborne and tumbled through
+   every height and orientation band on its way. A tumbling/exploding
+   trajectory passes through EVERY height and EVERY orientation at
+   some point, so a bare `.any()` reach clause (`(trajectory[...] >
+   threshold).any()`) is trivially satisfied by chaos — it is not
+   evidence the robot deliberately reached and controlled that state.
+   **Every reach clause you write MUST pair with either**:
+   - a **sustained** condition instead of a momentary one — prefer
+     `(trajectory['root_height'] > 0.15).mean() > 0.3` (in the target
+     band for a real fraction of the episode) over
+     `(trajectory['root_height'] > 0.15).any()` (true if it passes
+     through even once); or
+   - an explicit **start-away** condition — e.g. also requiring
+     `trajectory['root_height'][0] < <below-target>` — so reaching the
+     target band is a change of state, not a state the episode began
+     in or an explosion instantly reaches.
+   A rewrite whose ONLY discriminating conjunct is a bare `.any()`
+   reachability check will be MECHANICALLY REJECTED even if it passes
+   the on-exemplar signature check — "a criterion an explosion can
+   satisfy is not a success criterion."
+7. **Episode length is not evidence of success when fall-termination is
+   disabled.** Get-up / non-standing-start stages run WITHOUT
+   fall-termination (the robot starts fallen — terminating on "fallen"
+   would end the episode at frame 0). For those stages a rollout runs
+   the FULL episode length regardless of what happens — including an
+   explosion that never recovers. Do NOT treat
+   `behavior['mean_episode_length'] > <n>` as evidence the robot
+   succeeded, held a pose, or avoided falling on a stage where
+   fall-termination is off; it only ever measures whether the episode
+   was cut short, which for these stages it structurally cannot be. It
+   remains a meaningful signal ONLY for stages where fall-termination
+   is active (grounded, standing-start stages where "survived the full
+   episode" means "didn't fall").
 
 ## Output schema (strict JSON)
 

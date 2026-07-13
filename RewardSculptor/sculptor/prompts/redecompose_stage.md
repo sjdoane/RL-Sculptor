@@ -125,6 +125,26 @@ hopefully softened enough for it to succeed.
      `reward_seed_prompt` actually defines.** If unsure a component is
      emitted, use the soft form `components.get('<name>', 0.0)` so a
      missing term reads as "not satisfied" rather than failing the stage.
+   - **Anti-chaos: a bare reach clause is not a success criterion.** A
+     documented real failure (D29): a criterion using
+     `(trajectory['root_height'] > 0.15).any() and
+     (trajectory['projected_gravity_b'][..., 2] < -0.2).any() and
+     behavior['mean_episode_length'] > 100` was satisfied by a physics
+     EXPLOSION that tumbled through every height and orientation on its
+     way — a chaotic/tumbling rollout passes through EVERY height and
+     EVERY orientation at some point, so a bare `.any()` reach clause
+     is trivially chaos-satisfiable. Pair every `.any()`-shaped reach
+     clause with EITHER a **sustained** condition (`.mean() > <frac>`
+     instead of `.any()`) OR an explicit **start-away** condition
+     (also require e.g. `trajectory['root_height'][0] < <below-
+     target>`, so reaching the band is a change of state, not where
+     the sub-stage began). "A criterion an explosion can satisfy is
+     not a success criterion." Also: `behavior['mean_episode_length']
+     > <n>` is NOT evidence of success on a sub-stage whose
+     `start_pose` (rule 11) is non-standing — those sub-stages train
+     WITHOUT fall-termination, so the episode runs full length
+     regardless of what happens, including an explosion that never
+     recovers.
 
 9. **KG seed papers** restricted to the provided slice (same as
    decompose_task's hard rule 6).

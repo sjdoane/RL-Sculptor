@@ -39,6 +39,13 @@ from backend.models.run import (
     RunParams,
     RunSummary,
 )
+# §list/detail fitness parity (UI item 8): the SAME disk-scrape helper
+# `routes/missions.py::get_stage_iter_detail` and
+# `list_stage_iterations` use — shared rather than re-implemented here,
+# so this project-level list can never disagree with the stage-level
+# one about whether a given iteration "has" a fitness value. No import
+# cycle: `routes/missions.py` never imports from `routes/runs.py`.
+from backend.routes.missions import _extract_objective_fitness
 from backend.services import mission_store
 from backend.services.job_manager import Job, JobManager
 from backend.services.project_store import ProjectStore
@@ -1004,11 +1011,21 @@ def list_project_iterations(
                 if isinstance(v, (int, float)):
                     primary_metric = float(v)
 
-        behavior = _load_json_dict(d / "rollout" / "behavior.json") or {}
-        fitness = behavior.get("fitness")
-
         spec = _load_json_dict(d / "reward_spec.json") or {}
         reward_version = spec.get("version")
+
+        # §list/detail fitness parity (UI item 8): was a bare
+        # `behavior.json['fitness']` read (null for any iteration whose
+        # objective fitness only landed in reward_spec.json /
+        # fitness.json / the diagnoser's evidence prose) — now shares
+        # `routes/missions.py`'s `_extract_objective_fitness`, the same
+        # helper `get_stage_iter_detail` uses.
+        diagnosis = _load_json_dict(d / "diagnosis.json") or {}
+        evidence = (
+            diagnosis.get("evidence")
+            if isinstance(diagnosis.get("evidence"), str) else None
+        )
+        fitness = _extract_objective_fitness(d, spec, evidence)
 
         rollout_path = d / "rollout" / "rollout.mp4"
         # §D24 (F4): plain project-level runs never go through mission
@@ -1019,7 +1036,7 @@ def list_project_iterations(
         out.append(StageIterationSummary(
             iter_index=iter_index,
             primary_metric=primary_metric,
-            fitness=fitness if isinstance(fitness, (int, float)) else None,
+            fitness=fitness,
             has_rollout=rollout_path.is_file() and rollout_path.stat().st_size > 0,
             has_checkpoint=_find_stage_checkpoint(d) is not None,
             reward_version=reward_version if isinstance(reward_version, str) else None,

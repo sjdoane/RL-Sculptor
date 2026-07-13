@@ -22,9 +22,13 @@ from pathlib import Path
 import pytest
 
 from sculptor.decompose import (
+    _CHAOS_T_STEPS,
     _CriterionGroundModel,
+    _chaos_gate_reject_reason,
+    _chaos_trajectory_namespaces,
     _clip_to_trajectory_namespace,
     _conjunct_is_component_free,
+    _criterion_trips_on_chaos,
     _mechanically_verify_criterion_on_clip,
     _split_top_level_and,
     ground_stage_criterion,
@@ -290,3 +294,175 @@ def test_ground_stage_criterion_signature_failure_keeps_original():
     assert result["adopted"] is False
     assert stage.success_criterion == original
     assert client.messages.calls == []  # never reached the LLM call
+
+
+# ── §D29-4: anti-chaos discipline ───────────────────────────────────────
+#: The EXACT live criterion (docs/internal/REFERENCE_BUILD_LOG.md D29
+#: finding 4): a physics-explosion rollout tumbled through every height
+#: and orientation and satisfied it — bare `.any()` reachability, no
+#: sustained/start-away pairing.
+LIVE_D29_CRITERION = (
+    "(trajectory['root_height'] > 0.15).any() and "
+    "(trajectory['projected_gravity_b'][..., 2] < -0.2).any() and "
+    "behavior['mean_episode_length'] > 100"
+)
+
+#: A paired/SUSTAINED rewrite of the same physical claim — must NOT be
+#: satisfiable by chaos (chaos spends well under 30% of frames in
+#: either band; see the margins pinned in
+#: test_chaos_battery_margins_stay_well_under_30_percent below).
+PAIRED_SUSTAINED_CRITERION = (
+    "(trajectory['root_height'] > 0.15).mean() > 0.3 and "
+    "(trajectory['projected_gravity_b'][..., 2] < -0.2).mean() > 0.3"
+)
+
+
+def test_chaos_gate_rejects_live_d29_criterion():
+    """The exact live D29 criterion IS chaos-satisfiable — the gate must
+    name which archetype tripped it."""
+    reason = _chaos_gate_reject_reason(LIVE_D29_CRITERION)
+    assert reason in ("explosion", "chaotic_flail")
+
+
+def test_chaos_gate_accepts_paired_sustained_criterion():
+    """The sustained rewrite of the same claim is NOT chaos-satisfiable —
+    `_chaos_gate_reject_reason` must return None (safe to adopt)."""
+    assert _chaos_gate_reject_reason(PAIRED_SUSTAINED_CRITERION) is None
+
+
+def test_chaos_battery_has_two_archetypes_named_explosion_and_flail():
+    names = [name for name, _ns in _chaos_trajectory_namespaces()]
+    assert names == ["explosion", "chaotic_flail"]
+
+
+def test_chaos_battery_margins_stay_well_under_30_percent():
+    """Pins the measured chaos-battery margins (§D29-4 tuning note in
+    decompose.py): both archetypes must touch the height/orientation
+    bands at least once (so a bare `.any()` reach clause still trips
+    them) while residing there for WELL under 30% of frames (so a
+    `.mean() > 0.3` sustained clause never does). Measured at authoring
+    time: explosion frac_h=0.076, frac_pg=0.436; chaotic_flail
+    frac_h=0.126, frac_pg=0.376 — both height fractions comfortably
+    below the 0.3 gate (worst case 0.126, less than half the
+    threshold); this test pins those numbers as a regression guard."""
+    import numpy as np
+
+    for name, ns in _chaos_trajectory_namespaces():
+        rh = ns["trajectory"]["root_height"]
+        pg_z = ns["trajectory"]["projected_gravity_b"][..., 2]
+        frac_h = float((rh > 0.15).mean())
+        frac_pg = float((pg_z < -0.2).mean())
+        # Touches the band at least once (trips a bare `.any()` clause).
+        assert bool((rh > 0.15).any()), f"{name}: never reaches height band"
+        assert bool((pg_z < -0.2).any()), f"{name}: never reaches gravity band"
+        # But resides there well under the 30% sustained gate.
+        assert frac_h < 0.2, f"{name}: height residency {frac_h:.3f} too high"
+        assert ns["behavior"]["mean_episode_length"] == _CHAOS_T_STEPS
+        assert rh.shape == (_CHAOS_T_STEPS,)
+        assert ns["trajectory"]["projected_gravity_b"].shape == (
+            _CHAOS_T_STEPS, 3)
+
+
+def test_chaos_battery_is_deterministic():
+    """Same battery every call — this gate must never flake in CI."""
+    import numpy as np
+
+    first = _chaos_trajectory_namespaces()
+    second = _chaos_trajectory_namespaces()
+    assert [n for n, _ in first] == [n for n, _ in second]
+    for (_, ns1), (_, ns2) in zip(first, second):
+        assert np.array_equal(
+            ns1["trajectory"]["root_height"], ns2["trajectory"]["root_height"])
+        assert np.array_equal(
+            ns1["trajectory"]["projected_gravity_b"],
+            ns2["trajectory"]["projected_gravity_b"])
+
+
+def test_criterion_trips_on_chaos_never_raises_on_malformed_criterion():
+    """An unparseable / unsafe-looking criterion must not crash the
+    gate — raising is treated as 'does not trip' (the safe direction),
+    mirroring `_mechanically_verify_criterion_on_clip`'s own
+    never-raises contract."""
+    _, namespace = _chaos_trajectory_namespaces()[0]
+    assert _criterion_trips_on_chaos("(((", namespace) is False
+    assert _criterion_trips_on_chaos(
+        "trajectory['does_not_exist'] > 0.1", namespace) is False
+
+
+def test_criterion_trips_on_chaos_components_only_is_vacuously_false():
+    """A criterion whose ONLY discriminating conjunct is a `components`
+    lookup reads the fail-closed default (empty dict here too, same
+    convention as `_clip_to_trajectory_namespace`) and evaluates False
+    — it cannot be proven non-gameable via `components` by this gate,
+    but it is at least never a FALSE POSITIVE rejection."""
+    _, namespace = _chaos_trajectory_namespaces()[0]
+    assert _criterion_trips_on_chaos(
+        "components.get('x', 0.0) > 0.2", namespace) is False
+
+
+# ── ground_stage_criterion integration: the acceptance path wires the
+# chaos gate in AFTER the on-exemplar mechanical check ─────────────────
+#: Same physical claim as LIVE_D29_CRITERION but without the
+#: `behavior[...]` conjunct — `_clip_to_trajectory_namespace`'s
+#: `behavior` dict is deliberately empty (no reward has run against a
+#: bare clip), so a `behavior[...]` conjunct always raises there and
+#: would be rejected by the PRE-EXISTING on-exemplar check for that
+#: reason alone. Dropping it isolates the NEW anti-chaos gate: both
+#: remaining conjuncts pass on-exemplar (verified against the real
+#: fixture clip below) so the rewrite reaches the chaos gate, which
+#: must then reject it.
+CHAOS_SATISFIABLE_REWRITE = (
+    "(trajectory['root_height'] > 0.15).any() and "
+    "(trajectory['projected_gravity_b'][..., 2] < -0.2).any()"
+)
+
+#: A sustained rewrite of the same claim, tuned against BOTH the real
+#: fixture clip's own numbers (measured: frac_h=0.188, frac_pg=1.0 over
+#: the [0, 8.5]s span) and the chaos battery's measured max residency
+#: (frac_h<=0.126, frac_pg<=0.436) — comfortably clears the exemplar
+#: while staying out of reach of either chaos archetype.
+CHAOS_SAFE_SUSTAINED_REWRITE = (
+    "(trajectory['root_height'] > 0.15).mean() > 0.05 and "
+    "(trajectory['projected_gravity_b'][..., 2] < -0.2).mean() > 0.5"
+)
+
+
+def test_exemplar_clip_passes_on_chaos_test_rewrites_precondition(cropped_clip):
+    """Precondition check for the two integration tests below: both
+    rewrites must pass the PRE-EXISTING on-exemplar mechanical check
+    against the real fixture clip, so any rejection in the integration
+    tests is attributable to the NEW chaos gate, not the old one."""
+    assert _mechanically_verify_criterion_on_clip(
+        CHAOS_SATISFIABLE_REWRITE, cropped_clip) is None
+    assert _mechanically_verify_criterion_on_clip(
+        CHAOS_SAFE_SUSTAINED_REWRITE, cropped_clip) is None
+
+
+def test_ground_stage_criterion_rejects_chaos_satisfiable_rewrite(cropped_clip):
+    """§D29-4: a rewrite that passes the on-exemplar check but is
+    chaos-satisfiable must still be REJECTED — the original criterion
+    is kept and the rationale names the chaos archetype."""
+    stage = _stage()
+    original = stage.success_criterion
+    client = _StubClient(_CriterionGroundModel(
+        rationale="reach the get-up height and become upright",
+        success_criterion=CHAOS_SATISFIABLE_REWRITE,
+    ))
+    result = ground_stage_criterion(stage, cropped_clip, client=client)
+    assert result["adopted"] is False
+    assert "chaos trajectory" in result["rationale"]
+    assert stage.success_criterion == original  # untouched
+
+
+def test_ground_stage_criterion_adopts_chaos_safe_sustained_rewrite(cropped_clip):
+    """§D29-4: a sustained rewrite of the same physical claim that is
+    NOT chaos-satisfiable clears both the on-exemplar check and the new
+    chaos gate — adopted normally."""
+    stage = _stage()
+    client = _StubClient(_CriterionGroundModel(
+        rationale="sustained uprightness, not a momentary spike",
+        success_criterion=CHAOS_SAFE_SUSTAINED_REWRITE,
+    ))
+    result = ground_stage_criterion(stage, cropped_clip, client=client)
+    assert result["adopted"] is True
+    assert stage.success_criterion == CHAOS_SAFE_SUSTAINED_REWRITE

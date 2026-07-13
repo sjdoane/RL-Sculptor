@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 
@@ -247,6 +248,45 @@ def test_list_project_iterations_reports_fitness_contradiction_flag(
     row1 = next(row for row in rows if row["iter_index"] == 1)
     assert row1["fitness_contradiction"] is False
     assert row1["fitness_components"] is None
+
+
+def test_list_project_iterations_recovers_fitness_from_reward_spec_and_evidence(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    """§list/detail fitness parity (UI item 8): this LIST endpoint used
+    to bare-read `behavior.json['fitness']` only — null for any
+    iteration whose objective fitness landed elsewhere on disk. It now
+    shares `routes/missions.py::_extract_objective_fitness` (the same
+    helper the stage-level detail endpoint uses), so it must also
+    recover fitness from `reward_spec.json` and from `diagnosis.json`'s
+    evidence prose."""
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+
+    # iter_0: fitness ONLY in reward_spec.json — no behavior.json at all.
+    iter0 = _seed_project_iter(project_dir, 0, with_rollout=True)
+    (iter0 / "reward_spec.json").write_text(
+        json.dumps({"version": "v3", "objective_fitness": 0.87})
+    )
+
+    # iter_1: fitness ONLY recoverable from diagnosis.json's evidence
+    # prose — no behavior.json, no structured reward_spec fitness field.
+    iter1 = _seed_project_iter(project_dir, 1, with_rollout=True)
+    (iter1 / "diagnosis.json").write_text(
+        json.dumps({
+            "evidence": "Objective fitness is 0.64123 on this rollout.",
+        })
+    )
+
+    r = client.get(f"/projects/{slug}/iterations")
+    assert r.status_code == 200, r.text
+    rows = r.json()
+
+    row0 = next(row for row in rows if row["iter_index"] == 0)
+    assert row0["fitness"] == pytest.approx(0.87)
+
+    row1 = next(row for row in rows if row["iter_index"] == 1)
+    assert row1["fitness"] == pytest.approx(0.64123)
 
 
 def test_list_project_iterations_prefers_metric_history(
