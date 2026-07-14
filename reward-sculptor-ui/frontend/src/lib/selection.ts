@@ -56,3 +56,36 @@ export function formatIterMetrics(
       : "reward (mean return) — reward-version scale, not comparable across stages";
   return { fitnessText, rewardText, rewardTitle };
 }
+
+/** Tooltip body for the `fitness_contradiction` chip — the D20 hollow-
+ *  success / D23 exemplar-scope-mismatch pattern (criterion passed but
+ *  objective fitness landed at/near zero). Shared so RunsTab and
+ *  MissionDetailDialog render the exact same wording instead of drifting. */
+export function formatContradictionTooltip(
+  components: Record<string, number | boolean> | null,
+): string {
+  const header = "criterion passed but objective fitness ~0";
+  if (!components) return header;
+  const entries = Object.entries(components).slice(0, 6).map(([name, value]) =>
+    `${name}: ${typeof value === "number" ? value.toFixed(3) : String(value)}`
+  );
+  return entries.length ? `${header}\n${entries.join("\n")}` : header;
+}
+
+/** Short label + tooltip for a naturalness/realism-audit chip, or null
+ *  when the iteration wasn't flagged. `hardReject` escalates the tooltip
+ *  wording (the caller decides the badge color — rose for hard-reject,
+ *  amber for a soft flag) since a hard reject zeroed out steering credit
+ *  outright rather than merely discounting it. */
+export function naturalnessChipText(
+  flag: string | null | undefined,
+  hardReject: boolean,
+): { label: string; title: string } | null {
+  if (!flag) return null;
+  return {
+    label: `realism: ${flag}`,
+    title: hardReject
+      ? "realism audit HARD-REJECTED this iteration's steering credit"
+      : "realism audit gated this iteration's steering credit",
+  };
+}

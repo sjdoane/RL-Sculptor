@@ -19,7 +19,9 @@ import { useMissionEvents } from "@/hooks/useMissionEvents";
 import { ApiError, stageCheckpointUrl, stageExportUrl, stageRolloutUrl } from "@/lib/api";
 import { qk } from "@/lib/queryKeys";
 import { useQueryClient } from "@tanstack/react-query";
-import { formatIterMetrics, selectionLabel, selectionSentence } from "@/lib/selection";
+import {
+  formatContradictionTooltip, formatIterMetrics, naturalnessChipText, selectionLabel, selectionSentence,
+} from "@/lib/selection";
 import { failureReasonText, stageLabel, supersededText } from "@/lib/stageDisplay";
 import { formatRelative } from "@/lib/utils";
 import type {
@@ -1082,6 +1084,28 @@ function StagePanel({
                       <Icon name="check" size={9} />kept — {selectionLabel(stage.selection_source)}
                     </span>
                   )}
+                  {r.fitness_contradiction && (
+                    <span
+                      className="rs-badge rose"
+                      style={{ fontSize: 8.5, padding: "0 4px" }}
+                      title={formatContradictionTooltip(r.fitness_components)}
+                    >
+                      <Icon name="alert-triangle" size={9} />criterion✓ fitness 0
+                    </span>
+                  )}
+                  {(() => {
+                    const nat = naturalnessChipText(r.naturalness_flag, r.naturalness_hard_reject);
+                    if (!nat) return null;
+                    return (
+                      <span
+                        className={"rs-badge " + (r.naturalness_hard_reject ? "rose" : "amber")}
+                        style={{ fontSize: 8.5, padding: "0 4px" }}
+                        title={nat.title}
+                      >
+                        <Icon name="alert-triangle" size={9} />{nat.label}
+                      </span>
+                    );
+                  })()}
                 </button>
               );
             })}

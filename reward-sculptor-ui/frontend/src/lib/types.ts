@@ -1013,6 +1013,72 @@ export interface StageIteration {
   // breakdown from that same flag file, for the badge's tooltip.
   fitness_contradiction: boolean;
   fitness_components: Record<string, number | boolean> | null;
+  // §selection-report UI: the loop's OWN steering score for this iter —
+  // `fitness` above is the plain objective fitness; `steer_fitness` is
+  // what actually drove keep-best when a realism/naturalness gate could
+  // veto credit (they diverge when the gate fired). `progress` is the
+  // dense per-iter progress signal (not the same scale as fitness).
+  steer_fitness: number | null;
+  progress: number | null;
+  // Naturalness/realism audit outcome for this iter, if the audit ran —
+  // e.g. "reset_launch_explosion". null when the audit didn't flag
+  // anything (or didn't run). `naturalness_hard_reject` is true when the
+  // flag was severe enough to zero out steering credit outright.
+  naturalness_flag: string | null;
+  naturalness_hard_reject: boolean;
+  // Where `fitness`/`steer_fitness` came from: "live" when the run wrote
+  // it directly, "log_backfill" when a later backfill pass recovered it
+  // from run logs after the fact, null when neither ran.
+  fitness_source: "live" | "log_backfill" | null;
+}
+
+// GET .../stages/{stage}/selection — the stage's keep-best decision
+// report, disk-truth. When `synthesized` is true, the report was
+// reconstructed from mission.json (older stages that predate live
+// selection.json writing) — `candidates[].criterion_pass` is always null
+// in that case since only the live writer knows what the criterion
+// evaluated to per-candidate at selection time. The backend model is
+// deliberately loose (`extra=allow`), so treat unlisted keys as possible.
+export interface StageSelectionCandidate {
+  iter_index: number;
+  criterion_pass: boolean | null;
+  criterion_error: string | null;
+  gate_mismatched: boolean;
+  fitness: number | null;
+  steer_fitness: number | null;
+  progress: number | null;
+  steer_progress: number | null;
+  primary_metric: number | null;
+  selected: boolean;
+}
+
+export interface StageSelectionReport {
+  synthesized: boolean;
+  schema: number;
+  stage: string;
+  recorded_at: string | null;
+  selected_iter_index: number | null;
+  selection_source: string | null;
+  criterion_ok: boolean | null;
+  criterion: string | null;
+  criterion_error: string | null;
+  start_state_mismatch: string | null;
+  failure_reason?: string | null;
+  failure_detail?: string | null;
+  gate: { skipped: boolean; checked: number; mismatched_count: number } | null;
+  candidates: StageSelectionCandidate[];
+}
+
+// POST .../missions/{mission_slug}/backfill-fitness → summary of a
+// disk-log fitness recovery pass. `stages` maps stage name to the count
+// of fitness.json files written for that stage this call — stages with
+// nothing to backfill are absent, not zero-valued. 409s while a mission
+// job is live.
+export interface BackfillFitnessResponse {
+  written: number;
+  skipped_existing: number;
+  no_iter_dir: number;
+  stages: Record<string, number>;
 }
 
 // ── Completed-stage per-iteration detail (disk-truth) ────────────────

@@ -895,6 +895,33 @@ export async function getStageObjectiveMetric(
   );
 }
 
+/** GET .../stages/{stage}/selection — the stage's keep-best decision
+ *  report (disk-truth; synthesized from mission.json for stages that
+ *  predate live selection.json writing). */
+export async function getStageSelection(
+  slug: string, missionSlug: string, stageName: string,
+): Promise<import("./types").StageSelectionReport> {
+  return handle(
+    await fetch(
+      `/api/projects/${slug}/missions/${missionSlug}/stages/${encodeURIComponent(stageName)}/selection`,
+    ),
+  );
+}
+
+/** POST .../missions/{mission_slug}/backfill-fitness — recover fitness
+ *  from run logs for every iteration on disk that's missing it. 409s
+ *  while a mission job is live (see ApiError.status). */
+export async function postBackfillFitness(
+  slug: string, missionSlug: string,
+): Promise<import("./types").BackfillFitnessResponse> {
+  return handle(
+    await fetch(
+      `/api/projects/${slug}/missions/${missionSlug}/backfill-fitness`,
+      { method: "POST" },
+    ),
+  );
+}
+
 /** GET /projects/{slug}/iterations — disk-truth iteration list for the
  *  PROJECT-level runs tree (plain sculpt runs). No JobManager entry
  *  required, so it keeps working after a backend restart — the data

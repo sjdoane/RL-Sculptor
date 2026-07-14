@@ -10,7 +10,9 @@ import { NewMissionDialog } from "@/components/NewMissionDialog";
 import { MissionDetailDialog } from "@/components/MissionDetailDialog";
 import { useSystemGpu } from "@/hooks/useLibrary";
 import { useRunEvents } from "@/hooks/useRunEvents";
-import { useMission, useMissions, useStageIterations } from "@/hooks/useMissions";
+import {
+  useBackfillFitness, useMission, useMissions, useStageIterations, useStageSelection,
+} from "@/hooks/useMissions";
 import { useReferenceIndex } from "@/hooks/useReferences";
 import { useRegenerateRewardTemplate, useRewards } from "@/hooks/useRewards";
 import { usePolicies } from "@/hooks/usePolicies";
@@ -21,7 +23,9 @@ import {
   stageRolloutUrl,
 } from "@/lib/api";
 import { qk } from "@/lib/queryKeys";
-import { formatIterMetrics, selectionLabel, selectionSentence } from "@/lib/selection";
+import {
+  formatContradictionTooltip, formatIterMetrics, naturalnessChipText, selectionLabel, selectionSentence,
+} from "@/lib/selection";
 import { failureReasonText, stageLabel, supersededText } from "@/lib/stageDisplay";
 import { formatRelative, sanitizeConsoleText } from "@/lib/utils";
 import type {
@@ -39,6 +43,8 @@ import type {
   StageIteration,
   StageMetricReference,
   StageObjectiveMetric,
+  StageSelectionCandidate,
+  StageSelectionReport,
 } from "@/lib/types";
 
 // ── benign-error display mapping ────────────────────────────────────────
@@ -576,6 +582,39 @@ function StageDetailPane({
     staleTime: 30_000,
   });
 
+  // §selection-report UI: the keep-decision report ("why this iteration
+  // was kept") — synthesized from mission.json for stages that predate
+  // live selection.json writing.
+  const selection = useStageSelection(slug, missionSlug, stageName);
+
+  // §selection-report UI: recover on-disk fitness from run logs, for
+  // stages that finished before objective fitness was recorded live.
+  // Gated on the MISSION (not just this stage) not being live — the
+  // backend 409s regardless of which stage is asked about while any job
+  // for this mission is running.
+  const backfillFitness = useBackfillFitness(slug);
+  const [backfillNote, setBackfillNote] = useState<string | null>(null);
+  const missionRunning = mission?.active_job_id != null;
+  const handleBackfillFitness = () => {
+    setBackfillNote(null);
+    backfillFitness.mutate(missionSlug, {
+      onSuccess: (res) => {
+        const inStage = res.stages[stageName] ?? 0;
+        setBackfillNote(
+          `recovered fitness for ${res.written} iteration${res.written === 1 ? "" : "s"} across the mission` +
+          (inStage > 0 ? ` (${inStage} in this stage)` : ""),
+        );
+      },
+      onError: (err) => {
+        setBackfillNote(
+          err instanceof ApiError && err.status === 409
+            ? "a run is live — try after it finishes"
+            : err.message,
+        );
+      },
+    });
+  };
+
   // §narrate-completed-stage: per-iteration reasoning (reward description,
   // diagnosis evidence, cited papers, components) for the selected iter.
   const iterDetail = useQuery<StageIterDetail>({
@@ -623,6 +662,14 @@ function StageDetailPane({
       return backfilled != null ? { ...r, fitness: backfilled } : r;
     });
   }, [rows, missingFitnessRows, fitnessBackfill]);
+
+  // §selection-report UI (E): the row-level fitness/steer/progress/
+  // fitness_source fields for the currently-selected iter, so the
+  // reasoning card can show the real values instead of "not tracked".
+  const activeRowForDetail = useMemo(
+    () => rowsWithFitness.find((r) => r.iter_index === activeIter) ?? activeRow,
+    [rowsWithFitness, activeIter, activeRow],
+  );
 
   return (
     <div className="rs-runs-detail">
@@ -676,6 +723,21 @@ function StageDetailPane({
             this stage — the thing the screen recording wants to point at. */}
         <div style={{ padding: "0 16px 12px" }}>
           <StageObjectiveMetricCard query={objectiveMetric} />
+        </div>
+
+        {/* §selection-report UI: the keep-decision report — which iter
+            was kept and why, the per-candidate ranking, and (when this
+            stage still has un-recovered fitness on disk) a button to
+            pull it from run logs. */}
+        <div style={{ padding: "0 16px 12px" }}>
+          <StageSelectionCard
+            query={selection}
+            missingFitnessCount={missingFitnessRows.length}
+            missionRunning={missionRunning}
+            onBackfill={handleBackfillFitness}
+            backfillPending={backfillFitness.isPending}
+            backfillNote={backfillNote}
+          />
         </div>
 
         {/* Rollout player for the picked iter — same disk-truth source as
@@ -737,7 +799,7 @@ function StageDetailPane({
             for whichever iter is selected on the left. */}
         {activeIter != null && (
           <div style={{ padding: "0 16px 12px" }}>
-            <StageIterDetailCard iterIndex={activeIter} query={iterDetail} />
+            <StageIterDetailCard iterIndex={activeIter} query={iterDetail} row={activeRowForDetail ?? null} />
           </div>
         )}
 
@@ -850,6 +912,198 @@ function StageObjectiveMetricCard({ query }: { query: ReturnType<typeof useQuery
   );
 }
 
+function fmtScore(v: number | null | undefined, digits = 3): string {
+  return typeof v === "number" ? v.toFixed(digits) : "—";
+}
+
+/** §selection-report UI: status meta for the keep-decision headline —
+ *  emerald when a criterion-backed pick was kept, amber when it's a
+ *  fitness-only fallback (criterion unmet), slate when nothing was kept
+ *  at all. */
+function selectionHeadlineMeta(
+  data: StageSelectionReport,
+): { icon: string; cls: "slate" | "amber" | "emerald" } {
+  if (data.selected_iter_index == null) return { icon: "minus", cls: "slate" };
+  if (data.selection_source === "fitness_fallback") return { icon: "alert-triangle", cls: "amber" };
+  return { icon: "check-circle", cls: "emerald" };
+}
+
+/** §selection-report UI: "why this iteration was kept" — the keep-best
+ *  decision (headline + criterion text + per-candidate ranking table),
+ *  plus (when this stage still has un-recovered on-disk fitness) a
+ *  quiet button to pull it from run logs. This is the panel that turns
+ *  "iter 3 got kept" into "iter 3 got kept BECAUSE...". */
+function StageSelectionCard({
+  query, missingFitnessCount, missionRunning, onBackfill, backfillPending, backfillNote,
+}: {
+  query: ReturnType<typeof useStageSelection>;
+  missingFitnessCount: number;
+  missionRunning: boolean;
+  onBackfill: () => void;
+  backfillPending: boolean;
+  backfillNote: string | null;
+}) {
+  const { data, isLoading, error } = query;
+  if (isLoading) {
+    return <div className="rs-card rs-card-pad"><p className="rs-sub" style={{ fontSize: 11 }}>Loading keep-decision…</p></div>;
+  }
+  if (error) {
+    return <div className="rs-card rs-card-pad"><p className="rs-sub" style={{ fontSize: 11, color: "var(--st-rose)" }}>{(error as Error).message}</p></div>;
+  }
+  if (!data) return null;
+
+  const meta = selectionHeadlineMeta(data);
+  const candidates = data.candidates ?? [];
+  const noteText = data.start_state_mismatch || data.criterion_error || data.failure_detail;
+
+  return (
+    <div className="rs-card rs-card-pad">
+      <div className="rs-flex rs-gap-8" style={{ alignItems: "flex-start" }}>
+        <div className="rs-card-title" style={{ fontSize: 13, flex: 1, minWidth: 0 }}>
+          <Icon name="flag" size={15} />Why this iteration was kept
+        </div>
+        <span className={"rs-badge " + meta.cls}>
+          <Icon name={meta.icon} size={12} />
+          {data.selected_iter_index != null ? `Kept iter ${data.selected_iter_index}` : "No iteration kept"}
+        </span>
+      </div>
+      <p style={{ margin: "8px 0 0", fontSize: 12.5, lineHeight: 1.5 }} title={selectionSentence(data.selection_source)}>
+        {data.selected_iter_index != null ? (
+          <>
+            <span className="rs-sub">{selectionLabel(data.selection_source)} — </span>
+            {selectionSentence(data.selection_source)}
+          </>
+        ) : (
+          "No iteration was kept for this stage."
+        )}
+      </p>
+
+      {data.criterion && (
+        <div style={{ marginTop: 8 }}>
+          <div className="rs-eyebrow" style={{ marginBottom: 4 }}>Success criterion</div>
+          <p
+            className="mono"
+            style={{
+              margin: 0, wordBreak: "break-all", borderRadius: "var(--radius-sm)",
+              background: "var(--canvas-soft)", border: "1px solid var(--hairline)",
+              padding: "5px 8px", fontSize: 10.5, color: "var(--rs-muted)",
+            }}
+          >
+            {data.criterion}
+          </p>
+        </div>
+      )}
+
+      {noteText && (
+        <div
+          style={{
+            marginTop: 8, padding: "6px 8px", borderRadius: "var(--radius-sm)",
+            background: "var(--st-rose-bg)", color: "var(--st-rose-fg)", fontSize: 11.5, lineHeight: 1.5,
+          }}
+        >
+          {data.start_state_mismatch && <p style={{ margin: 0 }}>Start-state mismatch: {data.start_state_mismatch}</p>}
+          {data.criterion_error && (
+            <p style={{ margin: data.start_state_mismatch ? "4px 0 0" : 0 }}>Criterion error: {data.criterion_error}</p>
+          )}
+          {data.failure_detail && (
+            <p style={{ margin: (data.start_state_mismatch || data.criterion_error) ? "4px 0 0" : 0 }}>
+              {data.failure_reason ? `${data.failure_reason}: ` : ""}{data.failure_detail}
+            </p>
+          )}
+        </div>
+      )}
+
+      {candidates.length > 0 && (
+        <details style={{ marginTop: 10 }} open={candidates.length <= 6}>
+          <summary style={{ cursor: "pointer", fontSize: 11.5, color: "var(--rs-muted)", userSelect: "none" }}>
+            Candidates ({candidates.length})
+          </summary>
+          <div style={{ overflowX: "auto", marginTop: 8 }}>
+            <table className="mono" style={{ width: "100%", borderCollapse: "collapse", fontSize: 10.5 }}>
+              <thead>
+                <tr style={{ textAlign: "left", color: "var(--rs-muted)" }}>
+                  <th style={{ padding: "3px 6px" }}>iter</th>
+                  <th style={{ padding: "3px 6px" }}>criterion</th>
+                  <th style={{ padding: "3px 6px" }}>fit</th>
+                  <th style={{ padding: "3px 6px" }}>steer</th>
+                  <th style={{ padding: "3px 6px" }}>prog</th>
+                  <th style={{ padding: "3px 6px" }}>r</th>
+                  <th style={{ padding: "3px 6px" }} />
+                </tr>
+              </thead>
+              <tbody>
+                {candidates.map((c: StageSelectionCandidate) => {
+                  const gated =
+                    c.fitness != null && c.steer_fitness != null &&
+                    Math.abs(c.fitness - c.steer_fitness) > 1e-6;
+                  return (
+                    <tr
+                      key={c.iter_index}
+                      style={{ background: c.selected ? "var(--st-emerald-bg)" : undefined }}
+                    >
+                      <td style={{ padding: "3px 6px", fontWeight: c.selected ? 600 : 400 }}>{c.iter_index}</td>
+                      <td
+                        style={{ padding: "3px 6px" }}
+                        title={
+                          c.criterion_pass == null
+                            ? "not evaluated / unknown"
+                            : (c.criterion_error ?? undefined)
+                        }
+                      >
+                        {c.criterion_pass == null ? "—" : c.criterion_pass ? "✓" : "✗"}
+                        {c.gate_mismatched && (
+                          <span title="start-state gate mismatch" style={{ marginLeft: 4, color: "var(--st-amber-fg)" }}>⚠</span>
+                        )}
+                      </td>
+                      <td style={{ padding: "3px 6px" }} title={gated ? "realism-gated" : undefined}>{fmtScore(c.fitness)}</td>
+                      <td
+                        style={{ padding: "3px 6px", color: gated ? "var(--st-amber-fg)" : undefined }}
+                        title={gated ? "realism-gated" : undefined}
+                      >
+                        {fmtScore(c.steer_fitness)}
+                      </td>
+                      <td style={{ padding: "3px 6px" }}>{fmtScore(c.progress)}</td>
+                      <td style={{ padding: "3px 6px" }}>{fmtScore(c.primary_metric, 2)}</td>
+                      <td style={{ padding: "3px 6px" }}>
+                        {c.selected && <span className="rs-badge emerald" style={{ fontSize: 8 }}><Icon name="check" size={9} />kept</span>}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </details>
+      )}
+
+      {data.synthesized && (
+        <p className="rs-sub" style={{ margin: "8px 0 0", fontSize: 10.5, fontStyle: "italic" }}>
+          reconstructed from disk — this stage ran before selection recording existed; criterion column unknown
+        </p>
+      )}
+
+      {missingFitnessCount > 0 && (
+        <div style={{ marginTop: 10 }}>
+          {missionRunning ? (
+            <p className="rs-sub" style={{ margin: 0, fontSize: 10.5 }}>a run is live — try after it finishes</p>
+          ) : (
+            <button
+              type="button"
+              className="rs-btn rs-btn-quiet rs-btn-xs"
+              disabled={backfillPending}
+              onClick={onBackfill}
+            >
+              <Icon name={backfillPending ? "loader" : "refresh-cw"} size={13} className={backfillPending ? "rs-spin" : undefined} />
+              {backfillPending ? "Recovering…" : "Recover fitness from run logs"}
+            </button>
+          )}
+          {backfillNote && <p className="rs-sub" style={{ margin: "6px 0 0", fontSize: 10.5 }}>{backfillNote}</p>}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // §R1 remainder (plan §9): the three §5 per-reference gates, short labels
 // for the pass/fail row. Order matches _validate_references's write order
 // (nondegeneracy, monotonicity, negatives).
@@ -925,7 +1179,18 @@ function mergePaperRefs(a: StageIterPaperRef[], b: StageIterPaperRef[]): StageIt
  *  cited papers, and reward-component values. This is the "narrate the
  *  loop's thinking" panel — every field is best-effort/nullable since
  *  older iterations won't have all of them. */
-function StageIterDetailCard({ iterIndex, query }: { iterIndex: number; query: ReturnType<typeof useQuery<StageIterDetail>> }) {
+function StageIterDetailCard({
+  iterIndex, query, row,
+}: {
+  iterIndex: number;
+  query: ReturnType<typeof useQuery<StageIterDetail>>;
+  /** §selection-report UI (E): the matching disk-truth iteration row —
+   *  carries fitness/steer_fitness/progress/fitness_source, which the
+   *  /detail endpoint's `objective_fitness` doesn't always have. The
+   *  /detail value still wins when present (it's the more thoroughly
+   *  extracted one); this only fills gaps. */
+  row?: StageIteration | null;
+}) {
   const { data, isLoading, error } = query;
   if (isLoading) {
     return <div className="rs-card rs-card-pad"><p className="rs-sub" style={{ fontSize: 11 }}>Loading iteration detail…</p></div>;
@@ -937,7 +1202,16 @@ function StageIterDetailCard({ iterIndex, query }: { iterIndex: number; query: R
 
   const failureModes = data.failure_modes.filter((f) => f && f !== "none");
   const papers = mergePaperRefs(data.reward_references ?? [], data.literature_context ?? []);
-  const hasScores = data.objective_fitness != null || data.primary_metric != null || data.reward_version;
+  // §selection-report UI (E): /detail's own objective_fitness takes
+  // precedence (more thorough extraction); fall back to the row's
+  // disk-truth fitness (possibly log-backfilled) when /detail has none.
+  const objectiveFitness = data.objective_fitness ?? row?.fitness ?? null;
+  const steerFitness = row?.steer_fitness ?? null;
+  const steerDiffers =
+    steerFitness != null && objectiveFitness != null && Math.abs(steerFitness - objectiveFitness) > 1e-6;
+  const denseProgress = row?.progress ?? null;
+  const recoveredFromLogs = row?.fitness_source === "log_backfill";
+  const hasScores = objectiveFitness != null || data.primary_metric != null || data.reward_version;
   const componentEntries = data.components ? Object.entries(data.components) : [];
   const maxComponentAbs = componentEntries.length
     ? Math.max(...componentEntries.map(([, v]) => Math.abs(v)), 1e-9)
@@ -951,10 +1225,27 @@ function StageIterDetailCard({ iterIndex, query }: { iterIndex: number; query: R
 
       {hasScores && (
         <div className="rs-flex rs-wrap rs-gap-16" style={{ marginBottom: 10 }}>
-          {data.objective_fitness != null ? (
+          {objectiveFitness != null ? (
             <span title="objective fitness — the loop's steering score">
               <span className="rs-sub" style={{ fontSize: 11 }}>objective fitness</span><br />
-              <span className="rs-num" style={{ fontSize: 17, fontWeight: 600, color: "#b9aef5" }}>{data.objective_fitness.toFixed(3)}</span>
+              <span className="rs-num" style={{ fontSize: 17, fontWeight: 600, color: "#b9aef5" }}>
+                {objectiveFitness.toFixed(3)}
+              </span>
+              {steerDiffers && (
+                <span className="rs-sub" style={{ fontSize: 10.5, marginLeft: 5 }} title="realism-gated — differs from the plain objective fitness above">
+                  steer {steerFitness!.toFixed(3)}
+                </span>
+              )}
+              {denseProgress != null && (
+                <span className="rs-sub" style={{ display: "block", fontSize: 10.5 }} title="dense per-iter progress signal — not the same scale as fitness">
+                  dense progress {denseProgress.toFixed(3)}
+                </span>
+              )}
+              {recoveredFromLogs && (
+                <span className="rs-sub" style={{ display: "block", fontSize: 10, fontStyle: "italic" }}>
+                  (recovered from run logs)
+                </span>
+              )}
             </span>
           ) : (
             <span>
@@ -1185,17 +1476,6 @@ function ProjectDiskDetailPane({
 /** §D24 (F4): render the top few `fitness_components` entries as a plain
  *  "name: value" tooltip string for the contradiction badge — no charts,
  *  just enough to localize which channel zeroed the fitness at a glance. */
-function formatContradictionTooltip(
-  components: Record<string, number | boolean> | null,
-): string {
-  const header = "criterion passed but objective fitness ~0";
-  if (!components) return header;
-  const entries = Object.entries(components).slice(0, 6).map(([name, value]) =>
-    `${name}: ${typeof value === "number" ? value.toFixed(3) : String(value)}`
-  );
-  return entries.length ? `${header}\n${entries.join("\n")}` : header;
-}
-
 function StageIterCard({
   row, selected, kept, selectionSource, onSelect,
 }: {
@@ -1242,6 +1522,19 @@ function StageIterCard({
             <Icon name="alert-triangle" size={9} />criterion✓ fitness 0
           </span>
         )}
+        {(() => {
+          const nat = naturalnessChipText(row.naturalness_flag, row.naturalness_hard_reject);
+          if (!nat) return null;
+          return (
+            <span
+              className={"rs-badge " + (row.naturalness_hard_reject ? "rose" : "amber")}
+              style={{ fontSize: 8.5 }}
+              title={nat.title}
+            >
+              <Icon name="alert-triangle" size={9} />{nat.label}
+            </span>
+          );
+        })()}
       </span>
     </button>
   );

@@ -52,6 +52,9 @@ export const qk = {
   projectIters: (slug: string) => ["projectIters", slug] as const,
   stageEnvSpec: (slug: string, missionSlug: string, stageName: string) =>
     ["stageEnvSpec", slug, missionSlug, stageName] as const,
+  // §selection-report UI: the stage's keep-best decision report.
+  stageSelection: (slug: string, missionSlug: string, stageName: string) =>
+    ["stageSelection", slug, missionSlug, stageName] as const,
 
   dashboard: () => ["dashboard"] as const,
   systemInfo: () => ["systemInfo"] as const,

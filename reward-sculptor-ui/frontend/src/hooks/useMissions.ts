@@ -6,13 +6,16 @@ import {
   getMission,
   getStageEnvSpec,
   getStageIterations,
+  getStageSelection,
   listMissions,
+  postBackfillFitness,
   regenerateStageMetric,
   runMission,
   type RunMissionRequestBody,
 } from "@/lib/api";
 import { qk } from "@/lib/queryKeys";
 import type {
+  BackfillFitnessResponse,
   CreateMissionRequest,
   DeleteMissionResponse,
   JobDetail,
@@ -23,6 +26,7 @@ import type {
   MissionSummary,
   StageEnvSpec,
   StageIteration,
+  StageSelectionReport,
 } from "@/lib/types";
 
 const MISSION_LIST_POLL_MS = 5000;
@@ -105,6 +109,47 @@ export function useStageEnvSpec(
     enabled,
     staleTime: 30_000,
     retry: false,
+  });
+}
+
+/** §selection-report UI: the stage's keep-best decision report — why
+ *  this iteration (or none) got kept, and the per-candidate ranking
+ *  that led there. Cheap disk read; staleTime matches useStageEnvSpec. */
+export function useStageSelection(
+  slug: string | undefined,
+  missionSlug: string | undefined,
+  stageName: string | undefined,
+  opts?: { enabled?: boolean },
+) {
+  const enabled =
+    !!slug && !!missionSlug && !!stageName && (opts?.enabled ?? true);
+  return useQuery<StageSelectionReport>({
+    queryKey:
+      slug && missionSlug && stageName
+        ? qk.stageSelection(slug, missionSlug, stageName)
+        : ["stageSelection", "_none"],
+    queryFn: () => getStageSelection(slug!, missionSlug!, stageName!),
+    enabled,
+    staleTime: 30_000,
+    retry: false,
+  });
+}
+
+/** §selection-report UI: recover fitness from run logs for every
+ *  iteration on disk missing it (a stage that finished before objective
+ *  fitness was recorded live). 409s while a mission job is running —
+ *  callers should catch `ApiError` and check `.status === 409`.
+ *  Invalidates every stage's iterations + selection report for this
+ *  mission on success, since backfill can touch more than one stage. */
+export function useBackfillFitness(slug: string) {
+  const qc = useQueryClient();
+  return useMutation<BackfillFitnessResponse, Error, string>({
+    mutationFn: (missionSlug) => postBackfillFitness(slug, missionSlug),
+    onSuccess: (_result, missionSlug) => {
+      qc.invalidateQueries({ queryKey: ["stageIters", slug, missionSlug] });
+      qc.invalidateQueries({ queryKey: ["stageSelection", slug, missionSlug] });
+      qc.invalidateQueries({ queryKey: qk.projectIters(slug) });
+    },
   });
 }
 
