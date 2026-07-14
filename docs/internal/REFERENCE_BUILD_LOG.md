@@ -681,6 +681,56 @@ the HALTED first launch's aggregate ("reference scaffold failed",
 0/1 0%) while the relaunched run is live — the report is overwritten
 only at run end; needs per-run keying or a live refresh.
 
+### D32. Mission-review UX sprint: fitness becomes disk-truth, keep decisions become legible (2026-07-13/14)
+Driver: Sam stopped recording his demo video — a finished mission could not
+explain itself. Root causes found by walking the real g1-standing mission:
+1. **Per-iteration objective fitness was never persisted.** It lived only
+   in `iter_fitness` events inside the job stdout log; the disk-truth list
+   endpoints could recover a value only when the diagnoser happened to
+   quote "Objective fitness is N" in prose — hence Sam's "fit shows for
+   one or two iterations, never the kept one". Fix: `_run_one_iter` writes
+   `<iter_dir>/fitness.json` (fitness/progress/steer values/naturalness
+   flag/per-seed stats/F4 components) after the realism audit settles —
+   the exact file the backend already probed; plus a backend
+   `POST .../backfill-fitness` that replays the mission's
+   `_execute_*.log` events into fitness.json for pre-existing iterations
+   (steer recomputed under CURRENT post-D31 realism rules from
+   trajectory.npz — so the old false-launch zeroing does not resurface in
+   display). Run against the live mission: 20 files, 4 stages;
+   feet_under_crouch now reads 0.0/0.933/0.966/0.980(kept)/0.958 — the
+   keep decision was RIGHT all along, just invisible.
+2. **The keep decision's reasoning was computed then discarded.**
+   `_select_stage_final_iter` now writes `<stage>/reports/selection.json`
+   (per-candidate criterion pass/error, gate mismatch, fitness/steer/
+   progress/primary_metric, selected flag, source) on every return path;
+   new GET `.../stages/{stage}/selection` serves it (synthesized from
+   mission.json for pre-recording stages) and the Training tab renders a
+   "why this iteration was kept" card. NOTE for readers of old records:
+   `Stage.best_metric` is the kept iter's PRIMARY METRIC (mean return),
+   not the fitness that chose it.
+3. **UI clarity batch** (frontend-only): every per-iteration number is
+   labeled (`fit X` vs muted `r Y` — a reward is never dressed as a
+   score); kept badges carry the humanized selection_source; export
+   bundle/raw-checkpoint links appear wherever an iteration with a
+   checkpoint renders (dialog, Training pane, Overview viewer — endpoint
+   existed since ship-20, UI never offered it outside Results); Replay
+   mode is stage-navigable with disabled-not-hidden no-rollout stages;
+   Results' Mission-quality panel names its staleness while a run is
+   live (the D30 note); "best metric" → "best reward" + non-comparability
+   tooltip; pending stages with leftover rounds say "(from a previous
+   attempt)".
+4. **Saved-library hygiene**: both test suites leaked auto-archives into
+   the real `RS_SAVED_ROOT` — 97 `pytest-*` entries buried the 6 real
+   missions in the Saved Missions page. Autouse isolation fixtures added
+   (sculptor + backend conftest); existing junk moved to
+   `.trash/saved-pytest-cleanup-20260713/` (reversible).
+Sam's third observation (sub-stage "succeeded in iter 2 but kept iter 1")
+confirmed as the recorded pre-D31 artifact: r1_0's iter-2 stand scored
+0.515 but its steer was zeroed by the false launch conviction, and its
+checkpoint was later lost between attempts (ckpt=False on disk) — the
+post-fix re-run must retrain it; the D31 detector itself verified fixed
+(fresh recompute leaves iter 2 unflagged).
+
 ### Deferred findings (logged, not yet fixed)
 - D27 live findings (first user-driven decompose, g1-standing-up
   2026-07-12): (a) retrieval auto-attached a PRONE-start clip
