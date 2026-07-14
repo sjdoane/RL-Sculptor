@@ -1113,7 +1113,7 @@ function IterChip({ row }: { row: IterRow }) {
   let bg: string, fg: string, metricStr: string, pulse = false;
   if (row.completed) {
     bg = "var(--st-emerald-bg)"; fg = "var(--st-emerald-fg)";
-    metricStr = row.primary_metric != null ? row.primary_metric.toFixed(3) : "—";
+    metricStr = row.primary_metric != null ? `r ${row.primary_metric.toFixed(3)}` : "—";
   } else if (row.rollout_done) {
     bg = "rgba(245,78,0,0.10)"; fg = "var(--rs-primary)";
     metricStr = "rollout";

@@ -808,8 +808,11 @@ function PoliciesCard({ slug }: { slug: string }) {
                     fit {p.fitness.toFixed(2)}
                   </span>
                 ) : p.primary_metric != null ? (
-                  <span className="rs-num" title="mean return">
-                    {p.primary_metric.toFixed(1)}
+                  <span
+                    className="rs-num"
+                    title="reward (mean return) — objective fitness was not recorded for this iteration"
+                  >
+                    r {p.primary_metric.toFixed(1)}
                   </span>
                 ) : null}
                 {isBest && rows.length > 1 && (
