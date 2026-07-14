@@ -45,7 +45,10 @@ from backend.models.run import (
 # so this project-level list can never disagree with the stage-level
 # one about whether a given iteration "has" a fitness value. No import
 # cycle: `routes/missions.py` never imports from `routes/runs.py`.
-from backend.routes.missions import _extract_objective_fitness
+from backend.routes.missions import (
+    _extract_objective_fitness,
+    _read_fitness_and_naturalness,
+)
 from backend.services import mission_store
 from backend.services.job_manager import Job, JobManager
 from backend.services.project_store import ProjectStore
@@ -1033,6 +1036,21 @@ def list_project_iterations(
         # anyway for symmetry with `list_stage_iterations` (same model,
         # same on-disk convention) rather than hardcoding False.
         contradiction = _load_json_dict(d / "fitness_contradiction.json")
+
+        # §fitness.json/selection.json backend increment (commit f1c339d
+        # follow-up): same disk-truth fitness.json-first read the mission
+        # C2 endpoint uses (`routes/missions.py::_read_fitness_and_
+        # naturalness`) — kept in ONE place so the project-level and
+        # stage-level iteration lists never disagree about steer_fitness/
+        # progress/naturalness for the same on-disk iter.
+        steer_fitness, progress, naturalness_flag, naturalness_hard_reject, \
+            fitness_source = _read_fitness_and_naturalness(d)
+        if fitness_source is not None:
+            fitness_doc = _load_json_dict(d / "fitness.json") or {}
+            v = fitness_doc.get("fitness")
+            if isinstance(v, (int, float)):
+                fitness = float(v)
+
         out.append(StageIterationSummary(
             iter_index=iter_index,
             primary_metric=primary_metric,
@@ -1045,6 +1063,11 @@ def list_project_iterations(
                 contradiction.get("components")
                 if isinstance(contradiction, dict) else None
             ),
+            steer_fitness=steer_fitness,
+            progress=progress,
+            naturalness_flag=naturalness_flag,
+            naturalness_hard_reject=naturalness_hard_reject,
+            fitness_source=fitness_source,
         ))
     return out
 

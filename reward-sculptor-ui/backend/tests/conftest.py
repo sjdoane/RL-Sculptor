@@ -29,6 +29,27 @@ def _disable_network_adversarial(monkeypatch: pytest.MonkeyPatch):
         pass
 
 
+@pytest.fixture(autouse=True)
+def _isolate_saved_root(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Defense-in-depth: `sculptor.archive.saved_root()` has NO derivation
+    from `RS_PROJECTS_ROOT` (unlike `Settings.resolved_trash_root`, which
+    already safely falls back to a sibling of `projects_root` — itself
+    tmp'd per test by `tmp_projects_root` below, so `RS_TRASH_ROOT` is
+    deliberately left alone here; several existing tests assert against
+    that derived default and pinning it would break them). With
+    `RS_SAVED_ROOT` unset, `saved_root()` resolves straight to the real
+    `~/.local/share/reward-sculptor/saved/`. Pin it into this test's own
+    tmp dir up front so any test that exercises a save/archive code path
+    — today's or a future one — can never write into the developer's
+    real saved-missions library, even if it forgets its own override.
+    `test_saved.py`'s own `saved_root` fixture still works fine on top
+    of this — it just re-points to a different tmp dir, which is
+    harmless."""
+    monkeypatch.setenv("RS_SAVED_ROOT", str(tmp_path / "saved"))
+
+
 @pytest.fixture
 def tmp_projects_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     root = tmp_path / "projects"

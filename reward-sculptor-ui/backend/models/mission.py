@@ -379,6 +379,21 @@ class DeleteMissionResponse(BaseModel):
     freed_bytes: int
 
 
+class BackfillFitnessResponse(BaseModel):
+    """200 response for `POST .../missions/{mission_slug}/backfill-fitness`
+    — `backend.services.fitness_backfill.backfill_mission_fitness`'s
+    summary verbatim. `stages` maps stage name to the count of
+    `fitness.json` files written for that stage this call (stages with
+    nothing to backfill are simply absent, not zero-valued)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    written: int
+    skipped_existing: int
+    no_iter_dir: int
+    stages: dict[str, int]
+
+
 # ── WebSocket event payloads ─────────────────────────────────────────
 # Per Ship 18a plan-review: mirror runs.py WS pattern. Validate the
 # discriminator + envelope; leave per-event payload as `dict[str, Any]`.
@@ -430,6 +445,24 @@ class StageIterationSummary(BaseModel):
     # WHICH channel zeroed the fitness without a second request.
     fitness_contradiction: bool = False
     fitness_components: Optional[dict] = None
+    # §fitness.json/selection.json backend increment (commit f1c339d
+    # follow-up): the naturalness-GATED steer value + dense progress
+    # channel the loop actually used for keep-best selection, sourced from
+    # `<iter_dir>/fitness.json` when present (LIVE or `log_backfill`); None
+    # for iters that predate that file and haven't been backfilled.
+    steer_fitness: Optional[float] = None
+    progress: Optional[float] = None
+    # naturalness_flag/naturalness_hard_reject: fitness.json's own values
+    # when present, else a best-effort read of `realism_audit.json`'s
+    # `naturalness` dict — never a crash on a missing/malformed source,
+    # just null/False.
+    naturalness_flag: Optional[str] = None
+    naturalness_hard_reject: bool = False
+    # "live" (sculpt.py wrote it in-loop) | "log_backfill" (recovered from
+    # an `_execute_*.log`'s `iter_fitness` SCULPT-EVENT after the fact) |
+    # None when `fitness` came from the legacy `_extract_objective_fitness`
+    # scrape (no fitness.json at all for this iter).
+    fitness_source: Optional[str] = None
 
 
 class StageIterPaperRef(BaseModel):
@@ -509,6 +542,29 @@ class StageObjectiveMetric(BaseModel):
     # reference-anchored metrics alike) — never null, so the UI can
     # unconditionally .length-check.
     references: list[StageMetricReference] = []
+
+
+class StageSelectionInfo(BaseModel):
+    """`GET .../stages/{stage}/selection` — the stage's keep-best decision,
+    disk-truth. `<stage_dir>/reports/selection.json` (written live by
+    `sculpt.py` as of commit f1c339d) is returned VERBATIM plus
+    `synthesized: false` when present. Every stage that predates that write
+    gets an equivalent document SYNTHESIZED from mission.json's stage
+    record (`selected_iter_index`/`selection_source`/`success_criterion`/
+    `failure_reason`/`failure_detail`) plus a best-effort per-iter
+    candidate list built off `runs/iter_N/` — `synthesized: true,
+    schema: 0`. `candidates[].criterion_pass` is always null in the
+    synthesized form: only the LIVE selection.json writer knows what the
+    criterion actually evaluated to per-candidate at selection time.
+
+    Deliberately loose (`extra="allow"`): `selection.json`'s shape is
+    free to grow on the sculptor side, and passing an unrecognized key
+    through untouched is the whole point of a disk-truth passthrough
+    endpoint — only `synthesized` is pinned down as a real field."""
+
+    model_config = ConfigDict(extra="allow")
+
+    synthesized: bool
 
 
 class StageEnvSpecInfo(BaseModel):

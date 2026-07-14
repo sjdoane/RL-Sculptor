@@ -68,6 +68,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from backend.models.kg import JobDetail, JobSummary
 from backend.models.mission import (
+    BackfillFitnessResponse,
     CreateMissionRequest,
     DeleteMissionResponse,
     MissionDetail,
@@ -79,6 +80,8 @@ from backend.models.mission import (
     StageIterPaperRef,
     StageMetricReference,
     StageObjectiveMetric,
+    StageSchema,
+    StageSelectionInfo,
 )
 from backend.models.project import ProblemDetail
 from backend.services import mission_store
@@ -539,6 +542,82 @@ def delete_mission(
     )
 
 
+# ── POST /projects/{slug}/missions/{mission_slug}/backfill-fitness ───
+# §fitness.json/selection.json backend increment (commit f1c339d
+# follow-up): missions run BEFORE that commit have no `fitness.json` on
+# any iter — this reconstructs one from the mission's own
+# `_execute_*.log` files (the sculpt CLI's `[SCULPT-EVENT] {"type":
+# "iter_fitness", ...}` markers survive there even though nothing ever
+# replayed them onto disk). See `backend/services/fitness_backfill.py`
+# for the scan + recompute logic; this route is just the guard rails
+# (mission must exist, no live decompose/execute job, sculptor
+# importable) around a synchronous call.
+@router.post(
+    "/projects/{slug}/missions/{mission_slug}/backfill-fitness",
+    response_model=BackfillFitnessResponse,
+    responses={
+        404: {"model": ProblemDetail},
+        409: {"model": ProblemDetail},
+        503: {"model": ProblemDetail},
+    },
+)
+def backfill_mission_fitness_route(
+    slug: str,
+    mission_slug: str,
+    request: Request,
+    store: ProjectStore = Depends(get_store),
+) -> Any:
+    jobs: JobManager = request.app.state.job_manager
+    project_dir = _project_dir(store, slug)
+    if project_dir is None:
+        return _problem(
+            status.HTTP_404_NOT_FOUND,
+            "project not found",
+            detail=f"no project with slug {slug!r}",
+            type_="/problems/not-found",
+        )
+
+    if not mission_store.mission_dir(project_dir, mission_slug).is_dir():
+        return _problem(
+            status.HTTP_404_NOT_FOUND,
+            "mission not found",
+            detail=f"no mission {mission_slug!r} under project {slug!r}",
+            type_="/problems/not-found",
+        )
+
+    # Same guard `run_mission`/`delete_mission` use: a live decompose or
+    # execute job for THIS mission means its `_execute_*.log` may still be
+    # growing (or mission.json may still be mid-write) — refuse rather
+    # than race a half-written log / a mission still training.
+    if jobs.active_mission_job(slug, mission_slug) is not None:
+        return _problem(
+            status.HTTP_409_CONFLICT,
+            "mission has active job",
+            detail=(
+                f"mission {mission_slug!r} has an active decompose or "
+                f"execute job; wait for it to finish before backfilling "
+                f"fitness."
+            ),
+            type_="/problems/state-conflict",
+        )
+
+    try:
+        import sculptor  # noqa: F401 — availability probe
+    except Exception as e:  # noqa: BLE001
+        return _problem(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "sculptor unavailable",
+            detail=f"{type(e).__name__}: {e}",
+            type_="/problems/sculptor-unavailable",
+        )
+
+    from backend.services.fitness_backfill import backfill_mission_fitness
+
+    mission_dir = mission_store.mission_dir(project_dir, mission_slug)
+    result = backfill_mission_fitness(mission_dir)
+    return result
+
+
 # ── §C2 stage de-siloing: disk-truth stage-iteration endpoints ────────
 # Mission-stage iterations live at `<mission_dir>/stages/<stage>/runs/
 # iter_<N>/` regardless of whether a `mission_stage_run` JobManager
@@ -675,6 +754,23 @@ def list_stage_iterations(
         # rather than raising.
         contradiction = _load_json_dict(d / "fitness_contradiction.json")
 
+        # §fitness.json/selection.json backend increment (commit f1c339d
+        # follow-up): `<iter_dir>/fitness.json` is the disk-truth per-iter
+        # record — read it FIRST. When present its fitness/progress/
+        # steer_fitness + naturalness flags win outright (and `fitness`
+        # above is overridden so list/detail never disagree with the file
+        # that's now the primary source); when absent, keep the legacy
+        # `_extract_objective_fitness` value for `fitness` and fall back to
+        # `realism_audit.json`'s `naturalness` dict for the flags — never a
+        # crash on a missing/malformed source, just null/False.
+        steer_fitness, progress, naturalness_flag, naturalness_hard_reject, \
+            fitness_source = _read_fitness_and_naturalness(d)
+        if fitness_source is not None:
+            fitness_doc = _load_json_dict(d / "fitness.json") or {}
+            v = fitness_doc.get("fitness")
+            if isinstance(v, (int, float)):
+                fitness = float(v)
+
         out.append(StageIterationSummary(
             iter_index=iter_index,
             primary_metric=primary_metric,
@@ -687,9 +783,53 @@ def list_stage_iterations(
                 contradiction.get("components")
                 if isinstance(contradiction, dict) else None
             ),
+            steer_fitness=steer_fitness,
+            progress=progress,
+            naturalness_flag=naturalness_flag,
+            naturalness_hard_reject=naturalness_hard_reject,
+            fitness_source=fitness_source,
         ))
     out.sort(key=lambda r: r.iter_index)
     return out
+
+
+def _read_fitness_and_naturalness(
+    iter_dir: Path,
+) -> tuple[Optional[float], Optional[float], Optional[str], bool, Optional[str]]:
+    """Shared by `list_stage_iterations` and `routes/runs.py::
+    list_project_iterations`: `<iter_dir>/fitness.json` first (steer_
+    fitness/progress/naturalness_flag/naturalness_hard_reject/source, all
+    from the SAME file so they never disagree with each other); when it's
+    absent, `naturalness_flag`/`naturalness_hard_reject` fall back to
+    `realism_audit.json`'s `naturalness` dict and steer_fitness/progress/
+    source stay None (no fitness.json means no steer-selection record for
+    this iter yet). Never raises — a missing/malformed source degrades to
+    null/False, matching every other best-effort reader in this module.
+
+    Returns `(steer_fitness, progress, naturalness_flag,
+    naturalness_hard_reject, fitness_source)`.
+    """
+    fitness_doc = _load_json_dict(iter_dir / "fitness.json")
+    if fitness_doc is not None:
+        steer_fitness = fitness_doc.get("steer_fitness")
+        progress = fitness_doc.get("progress")
+        naturalness_flag = fitness_doc.get("naturalness_flag")
+        return (
+            float(steer_fitness) if isinstance(steer_fitness, (int, float)) else None,
+            float(progress) if isinstance(progress, (int, float)) else None,
+            naturalness_flag if isinstance(naturalness_flag, str) else None,
+            bool(fitness_doc.get("naturalness_hard_reject", False)),
+            fitness_doc.get("source") if isinstance(fitness_doc.get("source"), str) else "live",
+        )
+    audit = _load_json_dict(iter_dir / "realism_audit.json") or {}
+    naturalness = audit.get("naturalness")
+    naturalness_flag = None
+    naturalness_hard_reject = False
+    if isinstance(naturalness, dict):
+        flag = naturalness.get("flag")
+        naturalness_flag = flag if isinstance(flag, str) else None
+        naturalness_hard_reject = bool(naturalness.get("hard_reject", False))
+    return None, None, naturalness_flag, naturalness_hard_reject, None
 
 
 def _load_json_dict(p: Path) -> Optional[dict]:
@@ -820,6 +960,115 @@ def get_stage_iter_rollout(
             type_="/problems/not-found",
         )
     return FileResponse(path, media_type="video/mp4")
+
+
+# ── GET .../stages/{stage}/selection ───────────────────────────────────
+@router.get(
+    "/projects/{slug}/missions/{mission_slug}/stages/{stage}/selection",
+    response_model=StageSelectionInfo,
+    responses={404: {"model": ProblemDetail}},
+)
+def get_stage_selection(
+    slug: str,
+    mission_slug: str,
+    stage: str,
+    store: ProjectStore = Depends(get_store),
+) -> Any:
+    """Disk-truth keep-best decision for one stage — no JobManager entry
+    required. `<stage_dir>/reports/selection.json` (§commit f1c339d: the
+    keep decision becomes disk-truth) is returned verbatim when present.
+    Every stage that predates that write (or hasn't finalized yet) gets an
+    equivalent document SYNTHESIZED from mission.json's stage record plus
+    each iter's own `fitness.json`/`fitness_contradiction.json`/
+    `realism_audit.json` — never a 404 just because the stage is old or
+    still training."""
+    resolved = _stage_dir_or_404(store, slug, mission_slug, stage)
+    if isinstance(resolved, JSONResponse):
+        return resolved
+    stage_dir = resolved
+
+    selection_path = stage_dir / "reports" / "selection.json"
+    loaded = _load_json_dict(selection_path)
+    if loaded is not None:
+        return {**loaded, "synthesized": False}
+
+    project_dir = _project_dir(store, slug)
+    assert project_dir is not None  # _stage_dir_or_404 already validated this
+
+    detail = mission_store.load_mission_detail(project_dir, slug, mission_slug)
+    stage_schema: Optional[StageSchema] = None
+    if detail is not None:
+        for s in detail.stages:
+            if s.name == stage:
+                stage_schema = s
+                break
+
+    metric_history = _load_metric_history(stage_dir)
+    candidates: list[dict[str, Any]] = []
+    runs_root = stage_dir / "runs"
+    if runs_root.is_dir():
+        for d in sorted(runs_root.iterdir()):
+            m = _ITER_DIR_RE.match(d.name)
+            if not m or not d.is_dir():
+                continue
+            iter_index = int(m.group(1))
+
+            spec = _load_json_dict(d / "reward_spec.json") or {}
+            diagnosis = _load_json_dict(d / "diagnosis.json") or {}
+            evidence = (
+                diagnosis.get("evidence")
+                if isinstance(diagnosis.get("evidence"), str) else None
+            )
+            fitness = _extract_objective_fitness(d, spec, evidence)
+            steer_fitness, progress, _flag, _hard_reject, fitness_source = (
+                _read_fitness_and_naturalness(d)
+            )
+            if fitness_source is not None:
+                fitness_doc = _load_json_dict(d / "fitness.json") or {}
+                v = fitness_doc.get("fitness")
+                if isinstance(v, (int, float)):
+                    fitness = float(v)
+
+            primary_metric: Optional[float] = None
+            if metric_history is not None and 0 <= iter_index < len(metric_history):
+                v = metric_history[iter_index]
+                if isinstance(v, (int, float)):
+                    primary_metric = float(v)
+
+            contradiction = _load_json_dict(d / "fitness_contradiction.json")
+
+            candidates.append({
+                "iter_index": iter_index,
+                "criterion_pass": None,
+                "criterion_error": None,
+                "gate_mismatched": contradiction is not None,
+                "fitness": fitness,
+                "steer_fitness": steer_fitness,
+                "progress": progress,
+                "steer_progress": None,
+                "primary_metric": primary_metric,
+                "selected": bool(
+                    stage_schema is not None
+                    and stage_schema.selected_iter_index == iter_index
+                ),
+            })
+
+    return {
+        "schema": 0,
+        "stage": stage,
+        "recorded_at": None,
+        "selected_iter_index": stage_schema.selected_iter_index if stage_schema else None,
+        "selection_source": stage_schema.selection_source if stage_schema else None,
+        "criterion_ok": None,
+        "criterion": stage_schema.success_criterion if stage_schema else None,
+        "criterion_error": None,
+        "start_state_mismatch": None,
+        "failure_reason": stage_schema.failure_reason if stage_schema else None,
+        "failure_detail": stage_schema.failure_detail if stage_schema else None,
+        "gate": None,
+        "candidates": candidates,
+        "synthesized": True,
+    }
 
 
 # ── GET .../stages/{stage}/env-spec ────────────────────────────────────

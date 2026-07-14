@@ -1047,6 +1047,48 @@ def test_list_stage_iterations_reports_fitness_contradiction_flag(
     assert row1["fitness_components"] is None
 
 
+def test_list_stage_iterations_recovers_fitness_from_reward_spec_and_evidence(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    """§list/detail fitness parity (UI item 8): before this fix, the LIST
+    endpoint bare-read `behavior.json['fitness']` only — null for any
+    iteration whose objective fitness landed elsewhere. The DETAIL
+    endpoint's `_extract_objective_fitness` already recovered these via
+    `reward_spec.json` / `diagnosis.json`'s evidence prose; the LIST
+    endpoint now shares that same helper and must recover them too."""
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    stage_dir = _seed_stage_dir(project_dir, "alpha", "stage_0")
+
+    # iter_0: fitness ONLY in reward_spec.json — no behavior.json at all.
+    iter0 = _seed_stage_iter(stage_dir, 0, with_rollout=True)
+    (iter0 / "reward_spec.json").write_text(
+        json.dumps({"version": "v3", "objective_fitness": 0.87})
+    )
+
+    # iter_1: fitness ONLY recoverable from diagnosis.json's evidence
+    # prose — no behavior.json, no structured reward_spec/fitness.json.
+    iter1 = _seed_stage_iter(stage_dir, 1, with_rollout=True)
+    (iter1 / "diagnosis.json").write_text(
+        json.dumps({
+            "evidence": "Objective fitness is 0.64123 on this rollout.",
+        })
+    )
+
+    r = client.get(
+        f"/projects/{slug}/missions/alpha/stages/stage_0/iterations",
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+
+    row0 = next(row for row in body if row["iter_index"] == 0)
+    assert row0["fitness"] == pytest.approx(0.87)
+
+    row1 = next(row for row in body if row["iter_index"] == 1)
+    assert row1["fitness"] == pytest.approx(0.64123)
+
+
 def test_list_stage_iterations_uses_metric_history_by_index(
     client: TestClient, tmp_projects_root: Path,
 ) -> None:
@@ -1254,6 +1296,222 @@ def test_get_stage_env_spec_404_unknown_mission_or_stage(
         f"/projects/{slug}/missions/alpha/stages/no-such-stage/env-spec",
     )
     assert r.status_code == 404
+
+
+# ── §fitness.json/selection.json backend increment (commit f1c339d
+# follow-up): richer iteration rows + the selection endpoint + the log
+# backfill ────────────────────────────────────────────────────────────
+def test_list_stage_iterations_reads_fitness_json_when_present(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    """An iter with `fitness.json` (the sculptor loop now persists this
+    LIVE as of commit f1c339d) carries fitness/steer_fitness/progress/
+    naturalness_flag/fitness_source straight from that file; a sibling
+    iter with no fitness.json falls back to the pre-existing legacy
+    extraction, with the new fields staying null/False."""
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    stage_dir = _seed_stage_dir(project_dir, "alpha", "stage_0")
+
+    iter0 = _seed_stage_iter(stage_dir, 0, with_rollout=True)
+    (iter0 / "fitness.json").write_text(json.dumps({
+        "schema": 1, "iter": 0,
+        "fitness": 0.91, "progress": 0.75,
+        "steer_fitness": 0.85, "steer_progress": 0.7,
+        "naturalness_factor": 0.9, "naturalness_flag": "severe_no_reject",
+        "naturalness_hard_reject": False,
+        "observe_only": False, "eval_seeds": None, "fitness_per_seed": None,
+        "components": None, "source": "live",
+        "recorded_at": "2026-07-13T00:00:00+00:00",
+    }))
+
+    # iter_1: legacy shape only — fitness recoverable via reward_spec.json,
+    # no fitness.json at all.
+    iter1 = _seed_stage_iter(stage_dir, 1, with_rollout=True)
+    (iter1 / "reward_spec.json").write_text(
+        json.dumps({"version": "v1", "objective_fitness": 0.42})
+    )
+
+    r = client.get(
+        f"/projects/{slug}/missions/alpha/stages/stage_0/iterations",
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+
+    row0 = next(row for row in body if row["iter_index"] == 0)
+    assert row0["fitness"] == pytest.approx(0.91)
+    assert row0["steer_fitness"] == pytest.approx(0.85)
+    assert row0["progress"] == pytest.approx(0.75)
+    assert row0["naturalness_flag"] == "severe_no_reject"
+    assert row0["naturalness_hard_reject"] is False
+    assert row0["fitness_source"] == "live"
+
+    row1 = next(row for row in body if row["iter_index"] == 1)
+    assert row1["fitness"] == pytest.approx(0.42)
+    assert row1["steer_fitness"] is None
+    assert row1["progress"] is None
+    assert row1["naturalness_flag"] is None
+    assert row1["naturalness_hard_reject"] is False
+    assert row1["fitness_source"] is None
+
+
+def test_get_stage_selection_returns_verbatim_when_file_present(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    stage_dir = _seed_stage_dir(project_dir, "alpha", "stage_0")
+    reports_dir = stage_dir / "reports"
+    reports_dir.mkdir(parents=True)
+    payload = {
+        "schema": 1, "stage": "stage_0",
+        "recorded_at": "2026-07-13T00:00:00+00:00",
+        "selected_iter_index": 1, "selection_source": "criterion+fitness",
+        "criterion_ok": True, "criterion": "root_height > 0.5",
+        "criterion_error": None, "start_state_mismatch": None,
+        "gate": {"skipped": False, "checked": 2, "mismatched_count": 0},
+        "candidates": [
+            {"iter_index": 0, "criterion_pass": False, "criterion_error": None,
+             "gate_mismatched": False, "fitness": 0.1, "steer_fitness": 0.1,
+             "progress": 0.2, "steer_progress": 0.2, "primary_metric": 1.0,
+             "selected": False},
+            {"iter_index": 1, "criterion_pass": True, "criterion_error": None,
+             "gate_mismatched": False, "fitness": 0.9, "steer_fitness": 0.9,
+             "progress": 0.95, "steer_progress": 0.95, "primary_metric": 2.0,
+             "selected": True},
+        ],
+    }
+    (reports_dir / "selection.json").write_text(json.dumps(payload))
+
+    r = client.get(
+        f"/projects/{slug}/missions/alpha/stages/stage_0/selection",
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["synthesized"] is False
+    assert body["schema"] == 1
+    assert body["selected_iter_index"] == 1
+    assert body["selection_source"] == "criterion+fitness"
+    assert len(body["candidates"]) == 2
+    assert body["candidates"][1]["selected"] is True
+
+
+def test_get_stage_selection_synthesizes_when_file_absent(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    """No `reports/selection.json` (every stage that predates commit
+    f1c339d) — the endpoint must still answer, synthesized from
+    mission.json's stage record + each iter's own on-disk fitness."""
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    stage_dir = _seed_stage_dir(project_dir, "alpha", "stage_0")
+    _seed_stage_iter(stage_dir, 0, with_rollout=True, fitness=0.2)
+    _seed_stage_iter(stage_dir, 1, with_rollout=True, fitness=0.8)
+
+    mission_path = project_dir / ".missions" / "alpha" / "mission.json"
+    mission = json.loads(mission_path.read_text())
+    mission["stages"][0]["status"] = "succeeded"
+    mission["stages"][0]["selected_iter_index"] = 1
+    mission["stages"][0]["selection_source"] = "fitness_fallback"
+    mission_path.write_text(json.dumps(mission))
+
+    r = client.get(
+        f"/projects/{slug}/missions/alpha/stages/stage_0/selection",
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["synthesized"] is True
+    assert body["schema"] == 0
+    assert body["selected_iter_index"] == 1
+    assert body["selection_source"] == "fitness_fallback"
+    assert body["criterion"] == "metric > 0.5"
+
+    candidates = {c["iter_index"]: c for c in body["candidates"]}
+    assert candidates[0]["fitness"] == pytest.approx(0.2)
+    assert candidates[0]["selected"] is False
+    assert candidates[0]["criterion_pass"] is None
+    assert candidates[1]["fitness"] == pytest.approx(0.8)
+    assert candidates[1]["selected"] is True
+
+
+def test_backfill_mission_fitness_writes_missing_and_skips_existing(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    """A fake `_execute_*.log` with a `stage_started` + two `iter_fitness`
+    SCULPT-EVENT markers — one iter dir exists with no fitness.json (gets
+    backfilled), one iter dir doesn't exist at all (counted, not written).
+    No trajectory.npz/mjcf_limits.json on the existing iter, so the
+    steer recompute exercises the recorded-`realism_audit.json` fallback
+    path (seeded with a `naturalness` dict) rather than a fresh audit."""
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    stage_dir = _seed_stage_dir(project_dir, "alpha", "stage_0")
+
+    iter0 = _seed_stage_iter(stage_dir, 0)  # exists, no fitness.json yet
+    (iter0 / "realism_audit.json").write_text(json.dumps({
+        "verdict": "severe",
+        "naturalness": {
+            "verdict": "severe", "hard_reject": False,
+            "steer_factor": 0.5, "flag": "severe_no_reject",
+            "reason": "vel p99 high",
+        },
+    }))
+
+    mission_dir = project_dir / ".missions" / "alpha"
+    log_lines = [
+        "[sculpt] starting stage_0",
+        json.dumps({
+            "type": "stage_started", "stage_name": "stage_0",
+            "stage_index": 0,
+        }),
+        json.dumps({
+            "type": "iter_fitness", "iter": 0, "fitness": 0.8,
+            "progress": 0.6, "observe_only": False,
+        }),
+        # iter 1 has no runs/iter_1 dir at all — must be counted
+        # no_iter_dir, never written.
+        json.dumps({
+            "type": "iter_fitness", "iter": 1, "fitness": 0.9,
+            "progress": 0.7, "observe_only": False,
+        }),
+    ]
+    (mission_dir / "_execute_fake123.log").write_text(
+        "\n".join(
+            f"[SCULPT-EVENT] {line}" if line.startswith("{") else line
+            for line in log_lines
+        ) + "\n",
+    )
+
+    r = client.post(f"/projects/{slug}/missions/alpha/backfill-fitness")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["written"] == 1
+    assert body["skipped_existing"] == 0
+    assert body["no_iter_dir"] == 1
+    assert body["stages"] == {"stage_0": 1}
+
+    written = json.loads((iter0 / "fitness.json").read_text())
+    assert written["schema"] == 1
+    assert written["iter"] == 0
+    assert written["fitness"] == pytest.approx(0.8)
+    assert written["progress"] == pytest.approx(0.6)
+    assert written["source"] == "log_backfill"
+    # No trajectory files → fell back to the recorded realism_audit.json's
+    # naturalness dict for the steer recompute.
+    assert written["naturalness_flag"] == "severe_no_reject"
+    assert written["naturalness_hard_reject"] is False
+    assert written["steer_fitness"] == pytest.approx(0.4)  # 0.8 * 0.5
+    assert written["steer_progress"] == pytest.approx(0.3)  # 0.6 * 0.5
+
+    # A second call must NOT overwrite the file just written.
+    r2 = client.post(f"/projects/{slug}/missions/alpha/backfill-fitness")
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["skipped_existing"] == 1
+    assert r2.json()["written"] == 0
 
 
 # ── §completed-mission review: metric_history object-shape parse ─────
