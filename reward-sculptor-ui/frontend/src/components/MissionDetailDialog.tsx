@@ -181,7 +181,7 @@ export function MissionDetailDialog({
             {liveSummary
               ? `${liveSummary.mission_slug} · ${
                   stageCounts
-                    ? `${stageCounts.succeeded}/${stageCounts.total} stages succeeded`
+                    ? `${stageCounts.succeeded}/${stageCounts.total} stages succeeded${stageCounts.superseded > 0 ? ` · ${stageCounts.superseded} superseded` : ""}`
                     : `${liveSummary.current_stage_idx}/${liveSummary.n_stages} stages`
                 } · created ${formatRelative(liveSummary.created_at)}`
               : "Loading…"}
@@ -286,7 +286,7 @@ export function MissionDetailDialog({
 
       {mission && mission.stages.length > 0 && missionSlug && (
         <section>
-          <PHead>Stages ({mission.current_stage_idx}/{mission.n_stages})</PHead>
+          <PHead>Stages ({mission.stages.length})</PHead>
           <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
             {mission.stages.map((s, idx) => {
               const isCurrent = idx === mission.current_stage_idx;

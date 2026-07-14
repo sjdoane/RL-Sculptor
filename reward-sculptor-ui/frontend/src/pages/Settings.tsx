@@ -573,11 +573,13 @@ function TrashRow({ entry }: { entry: TrashEntry }) {
       }}
     >
       <div className="rs-flex rs-gap-12 rs-wrap" style={{ alignItems: "center", fontSize: 12.5 }}>
-        <span className="rs-tag" style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: 0.3 }}>{entry.kind}</span>
+        <span className="rs-tag" style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: 0.3 }}>{entry.kind || "unknown"}</span>
         <span style={{ fontWeight: 500, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={entry.slug}>
           {entry.display_name}
         </span>
-        <code className="mono rs-sub" style={{ fontSize: 11 }}>{entry.slug}</code>
+        {entry.slug !== entry.display_name && (
+          <code className="mono rs-sub" style={{ fontSize: 11 }}>{entry.slug}</code>
+        )}
         {entry.unreadable && (
           <span className="rs-badge amber" style={{ fontSize: 9.5 }}>
             <Icon name="alert-triangle" size={11} />unreadable

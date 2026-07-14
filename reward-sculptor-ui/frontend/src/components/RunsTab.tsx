@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useQueries, useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
 
@@ -559,6 +559,12 @@ function StageDetailPane({
   const rows = iters.data ?? [];
 
   const [picked, setPicked] = useState<number | null>(null);
+  // A picked iteration is meaningful only within the stage it was picked
+  // in — switching stages must fall back to the new stage's own kept/
+  // default iteration, not carry iter N across.
+  useEffect(() => {
+    setPicked(null);
+  }, [missionSlug, stageName]);
   const defaultIter = useMemo(() => {
     if (rows.length === 0) return null;
     const kept =
@@ -1024,10 +1030,10 @@ function StageSelectionCard({
                 <tr style={{ textAlign: "left", color: "var(--rs-muted)" }}>
                   <th style={{ padding: "3px 6px" }}>iter</th>
                   <th style={{ padding: "3px 6px" }}>criterion</th>
-                  <th style={{ padding: "3px 6px" }}>fit</th>
-                  <th style={{ padding: "3px 6px" }}>steer</th>
-                  <th style={{ padding: "3px 6px" }}>prog</th>
-                  <th style={{ padding: "3px 6px" }}>r</th>
+                  <th style={{ padding: "3px 6px", textAlign: "right" }}>fit</th>
+                  <th style={{ padding: "3px 6px", textAlign: "right" }}>steer</th>
+                  <th style={{ padding: "3px 6px", textAlign: "right" }}>prog</th>
+                  <th style={{ padding: "3px 6px", textAlign: "right" }}>r</th>
                   <th style={{ padding: "3px 6px" }} />
                 </tr>
               </thead>
@@ -1055,15 +1061,15 @@ function StageSelectionCard({
                           <span title="start-state gate mismatch" style={{ marginLeft: 4, color: "var(--st-amber-fg)" }}>⚠</span>
                         )}
                       </td>
-                      <td style={{ padding: "3px 6px" }} title={gated ? "realism-gated" : undefined}>{fmtScore(c.fitness)}</td>
+                      <td style={{ padding: "3px 6px", textAlign: "right" }} title={gated ? "realism-gated" : undefined}>{fmtScore(c.fitness)}</td>
                       <td
-                        style={{ padding: "3px 6px", color: gated ? "var(--st-amber-fg)" : undefined }}
+                        style={{ padding: "3px 6px", textAlign: "right", color: gated ? "var(--st-amber-fg)" : undefined }}
                         title={gated ? "realism-gated" : undefined}
                       >
                         {fmtScore(c.steer_fitness)}
                       </td>
-                      <td style={{ padding: "3px 6px" }}>{fmtScore(c.progress)}</td>
-                      <td style={{ padding: "3px 6px" }}>{fmtScore(c.primary_metric, 2)}</td>
+                      <td style={{ padding: "3px 6px", textAlign: "right" }}>{fmtScore(c.progress)}</td>
+                      <td style={{ padding: "3px 6px", textAlign: "right" }}>{fmtScore(c.primary_metric, 2)}</td>
                       <td style={{ padding: "3px 6px" }}>
                         {c.selected && <span className="rs-badge emerald" style={{ fontSize: 8 }}><Icon name="check" size={9} />kept</span>}
                       </td>
@@ -2009,7 +2015,7 @@ function IterationTimeline({ iters, selected, onSelect }: { iters: IterEventSumm
             </div>
           )}
           {it.failure_modes.length > 0 && !(it.failure_modes.length === 1 && it.failure_modes[0] === "none") && (
-            <span className="ver" style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", display: "block" }}>{it.failure_modes.join(", ")}</span>
+            <span className="ver" style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", display: "block" }} title={it.failure_modes.join(", ")}>{it.failure_modes.join(", ")}</span>
           )}
           {it.realism_audit && typeof it.realism_audit.verdict === "string" && it.realism_audit.verdict !== "ok" && it.realism_audit.verdict !== "unknown" && (
             <span className="rs-tag" style={{ marginTop: 4, fontSize: 10, background: it.realism_audit.verdict === "severe" ? "var(--st-rose-bg)" : "var(--st-amber-bg)", color: it.realism_audit.verdict === "severe" ? "var(--st-rose-fg)" : "var(--st-amber-fg)" }}>

@@ -237,8 +237,14 @@ function SavedStageSection({
       <div className="rs-flex rs-wrap rs-gap-8" style={{ alignItems: "center", marginBottom: 10 }}>
         <Badge status={stage.status} />
         <span className="mono" style={{ fontSize: 12, fontWeight: 600 }}>{stage.name}</span>
-        {stage.best_metric != null && (
-          <span className="rs-sub rs-num" style={{ fontSize: 11.5 }}>best {stage.best_metric.toFixed(3)}</span>
+        {stage.best_metric != null && (stage.n_iters ?? 0) > 0 && (
+          <span
+            className="rs-sub rs-num"
+            style={{ fontSize: 11.5 }}
+            title="best reward (mean return) among this stage's archived iterations"
+          >
+            best {stage.best_metric.toFixed(3)}
+          </span>
         )}
         {typeof stage.n_iters === "number" && (
           <span className="rs-sub" style={{ fontSize: 11.5 }}>{stage.n_iters} iter{stage.n_iters === 1 ? "" : "s"}</span>
