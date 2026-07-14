@@ -731,6 +731,48 @@ checkpoint was later lost between attempts (ckpt=False on disk) — the
 post-fix re-run must retrain it; the D31 detector itself verified fixed
 (fresh recompute leaves iter 2 unflagged).
 
+### D33. KG retrieval was static — evidence-anchored queries, descriptor matching, grounding, staleness, outcome stats (2026-07-14, bb41396 + 2a79593)
+Sam noticed every iteration's Knowledge citations collapse to the same
+failure modes/papers. Forensics over the mission's 72 retrieval events
+PROVED it: query texts byte-identical across iterations (semantic query =
+static behavior_goal; tag query = the fixed 6-label enum dominated by
+reward_hacking/static_equilibrium), literature_context papers 100%
+overlapping across every iteration of both stages examined; one edit
+citation (1804.02717) appeared every iteration yet was never retrieved
+(existence-only verification). The July-6 "KG restructure" (provenance/
+enrichment/logging/case-scope) had all landed but none of it touched the
+retrieval INPUTS. Six fixes:
+1. evidence-anchored second semantic query (preliminary evidence prose,
+   ~400 chars + labels), merged evidence-first, KG_TOP_K unchanged,
+   logged decision=diagnose_evidence; empty evidence byte-identical.
+2. preliminary diagnosis emits free-text failure_descriptors (enum kept
+   as the coarse label); resolve_failure_modes_semantic embeds them
+   against FailureMode nodes (new embedding backfill, floor 0.45) and
+   query_techniques merges the resolved ids with the fuzzy enum path.
+3. staleness rotation: fitness delta <= 0 AND previous iteration's shown-
+   but-uncited techniques -> excluded from this iteration's merge with
+   refill (fetch top_k+len(excluded)); >=2-results floor; logged
+   decision=diagnose_stale_rotate; literature entries persist
+   technique_id/source_paper_ids to make prior-iteration reads cheap.
+4. outcome stats: helped/regressed RunCase verdicts tally per-(technique,
+   failure-mode) counters on Technique nodes; query_techniques ordering
+   gets clamp(0.03*(helped-regressed), +/-0.15) over the QUERIED failure
+   modes — first real learning signal (useful_citations 0.05 tiebreak
+   unchanged; semantic floors untouched).
+5. citation grounding: literature_context entries grounded:true; each
+   proposed edit gains paper_refs_grounded {arxiv_id: bool} (retrieved
+   THIS iteration vs model-recalled); backend passes grounded through
+   StageIterPaperRef; UI shows an amber "model-recalled" chip.
+6. hygiene: Knowledge tab pending-seeds banner + Ingest-now button (the
+   pending list existed but was unactionable); empty per-project kg/
+   scaffold kept deliberately (test-pinned UI contract, all readers
+   tolerate absence).
+Gates: sculptor 1961/1 skip, backend 529, frontend typecheck+build.
+Effect to expect on the next mission: retrieval logs show three decisions
+per iteration (diagnose, diagnose_evidence, diagnose_descriptors), paper
+sets vary with observed behavior, stale literature rotates when fitness
+is flat, and Technique nodes accumulate outcome_stats.
+
 ### Deferred findings (logged, not yet fixed)
 - D27 live findings (first user-driven decompose, g1-standing-up
   2026-07-12): (a) retrieval auto-attached a PRONE-start clip
