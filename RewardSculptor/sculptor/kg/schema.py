@@ -129,6 +129,15 @@ class Technique:
     #: proposed. See query.py's ranking boost for the (deliberately small)
     #: cap rationale.
     useful_citations: int = 0
+    #: §KG-retrieval fix 4 (outcome-stats ranking): per-FailureMode
+    #: helped/regressed tallies from this project's OWN RunCase verdicts —
+    #: `{<failure_mode_node_id>: {"helped": int, "regressed": int}}`.
+    #: Written by `kg.cases.record_run_cases`, read by
+    #: `kg.query.query_techniques`'s ordering boost. Unlike
+    #: `useful_citations` (any "helped" iteration citing this technique's
+    #: paper) this is scoped PER failure mode, so a technique that helps
+    #: with one failure but regresses another doesn't wash out.
+    outcome_stats: dict[str, dict[str, int]] = field(default_factory=dict)
 
 
 @dataclass

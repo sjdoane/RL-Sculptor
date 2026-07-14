@@ -53,7 +53,7 @@ from pydantic import BaseModel, Field, field_validator
 
 from sculptor.adapters.base import load_adapter
 from sculptor.kg.query import TechniqueMatch, query_semantic, query_techniques
-from sculptor.kg.schema import evidence_tag
+from sculptor.kg.schema import evidence_tag, make_paper_id
 from sculptor.kg.store import SculptorKG
 from sculptor.llm import log_llm_call, model_for, response_text_blocks
 
@@ -251,6 +251,14 @@ class Diagnosis:
             "literature_context": [
                 {
                     "technique": m.technique.name,
+                    # §Fix 3 (staleness rotation): the technique's node id
+                    # and its introducing papers' node ids, so a LATER
+                    # iteration's diagnose() can tell whether THIS iter's
+                    # shown-but-uncited techniques should be rotated out
+                    # without re-querying the KG. Additive fields — no
+                    # existing consumer indexes this dict by exact key set.
+                    "technique_id": m.technique.id,
+                    "source_paper_ids": list(m.source_paper_ids),
                     "description": m.description,
                     "paper_citation": m.paper_citation,
                     "evidence": m.evidence,
@@ -504,6 +512,70 @@ def _render_kg_context(matches: list[TechniqueMatch]) -> str:
             lines.append(f"- evidence: {ev}")
         lines.append("")
     return "\n".join(lines)
+
+
+def _stale_uncited_technique_ids(
+    iter_dir: Path, objective_progress: dict | None,
+) -> set[str]:
+    """§Fix 3 (staleness rotation): when the diagnoser is STUCK (this
+    iter's fitness delta-vs-previous is <=0), find technique ids the
+    PREVIOUS iteration's literature block showed but whose papers no
+    proposed edit actually cited — re-showing uncited literature to a
+    stuck diagnoser is dead weight.
+
+    Inert (returns an empty set) whenever:
+      * `objective_progress` is None/empty, or its `delta` is None or > 0
+        (no regression signal, or nothing to compare against yet);
+      * `iter_dir`'s name isn't the `iter_<N>` convention, or N == 0
+        (no previous iteration can exist);
+      * the previous iteration's `diagnosis.json` is missing or
+        unparseable (best-effort — never raises).
+    """
+    if not objective_progress:
+        return set()
+    delta = objective_progress.get("delta")
+    if delta is None or delta > 0:
+        return set()
+    name = iter_dir.name
+    if not name.startswith("iter_"):
+        return set()
+    try:
+        idx = int(name[len("iter_"):])
+    except ValueError:
+        return set()
+    if idx <= 0:
+        return set()
+    prev_path = iter_dir.parent / f"iter_{idx - 1}" / "diagnosis.json"
+    if not prev_path.is_file():
+        return set()
+    try:
+        prev = json.loads(prev_path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001 — malformed prior diagnosis: rule inert
+        return set()
+    if not isinstance(prev, dict):
+        return set()
+    shown = prev.get("literature_context")
+    if not isinstance(shown, list) or not shown:
+        return set()
+
+    cited_paper_ids: set[str] = set()
+    for e in (prev.get("proposed_edits") or []):
+        if not isinstance(e, dict):
+            continue
+        for aid in (e.get("paper_refs") or []):
+            cited_paper_ids.add(make_paper_id(str(aid)))
+
+    excluded: set[str] = set()
+    for entry in shown:
+        if not isinstance(entry, dict):
+            continue
+        tid = entry.get("technique_id")
+        if not tid:
+            continue
+        src_ids = entry.get("source_paper_ids") or []
+        if not any(pid in cited_paper_ids for pid in src_ids):
+            excluded.add(tid)
+    return excluded
 
 
 def _build_preliminary_user_content(
@@ -931,6 +1003,16 @@ def diagnose(
         else:
             from sculptor.kg.query import DEFAULT_MIN_PROMPT_SIMILARITY
 
+            # §Fix 3 (staleness rotation): when stuck, the excluded set is
+            # ADDED to each source query's top_k so the merge below can
+            # refill from the next-ranked results and still reach
+            # KG_TOP_K where the underlying pool allows it. Empty set
+            # (the common case, and always the case when not stuck) keeps
+            # this byte-identical to KG_TOP_K.
+            _stale_exclude_ids = _stale_uncited_technique_ids(
+                iter_dir, objective_progress)
+            _kg_fetch_top_k = KG_TOP_K + len(_stale_exclude_ids)
+
             fm_keywords = [fm for fm in preliminary.failure_modes if fm != "none"]
 
             # §KG-retrieval fix 2: resolve this iter's free-text
@@ -954,15 +1036,15 @@ def diagnose(
                     extra_failure_ids = []
 
             tag_matches = query_techniques(
-                fm_keywords, domain_filter=env_tag, top_k=KG_TOP_K, store=store,
-                extra_failure_node_ids=extra_failure_ids,
+                fm_keywords, domain_filter=env_tag, top_k=_kg_fetch_top_k,
+                store=store, extra_failure_node_ids=extra_failure_ids,
             ) if (fm_keywords or extra_failure_ids) else []
             try:
                 # §Ship 31: floored — an unfloored semantic slice feeds
                 # tangential techniques into the grounded prompt and
                 # Claude dutifully cites them (Issue G).
                 sem_matches = query_semantic(
-                    behavior_goal, top_k=KG_TOP_K, store=store,
+                    behavior_goal, top_k=_kg_fetch_top_k, store=store,
                     min_similarity=DEFAULT_MIN_PROMPT_SIMILARITY)
             except Exception as e:  # noqa: BLE001
                 print(f"[diagnose] semantic query failed ({e}) — tag-only context.",
@@ -987,7 +1069,7 @@ def diagnose(
                     _evidence_query += " | " + ", ".join(fm_keywords)
                 try:
                     evidence_matches = query_semantic(
-                        _evidence_query, top_k=KG_TOP_K, store=store,
+                        _evidence_query, top_k=_kg_fetch_top_k, store=store,
                         min_similarity=DEFAULT_MIN_PROMPT_SIMILARITY)
                     for m in evidence_matches:
                         # Distinguishes these hits from the static goal
@@ -1003,16 +1085,43 @@ def diagnose(
             # Merge order: EVIDENCE-QUERY HITS FIRST (this iter's specific
             # failure), then tag hits (enum + descriptor FailureModes),
             # then the static goal hits — deduped by technique id,
-            # truncated to KG_TOP_K total (unchanged).
+            # truncated to KG_TOP_K total (unchanged). §Fix 3: a technique
+            # id in `_stale_exclude_ids` is skipped here (not counted
+            # toward KG_TOP_K) so the next-ranked match refills its slot;
+            # skipped hits are kept in `_stale_excluded_hits` so the
+            # ≥2-result floor below can re-admit them if exclusion would
+            # otherwise starve the block.
             seen: set[str] = set()
             kg_matches = []
+            _stale_excluded_hits: list[TechniqueMatch] = []
+            _stale_excluded_seen: set[str] = set()
             for m in evidence_matches + tag_matches + sem_matches:
                 if m.technique.id in seen:
+                    continue
+                if m.technique.id in _stale_exclude_ids:
+                    if m.technique.id not in _stale_excluded_seen:
+                        _stale_excluded_seen.add(m.technique.id)
+                        _stale_excluded_hits.append(m)
                     continue
                 seen.add(m.technique.id)
                 kg_matches.append(m)
                 if len(kg_matches) >= KG_TOP_K:
                     break
+
+            # §Fix 3 floor: NEVER let staleness rotation exclude so much
+            # that fewer than 2 literature matches remain — re-admit
+            # excluded hits (original evidence>tag>goal priority order)
+            # until the floor is met, and drop the re-admitted ids from
+            # the exclusion set actually reported below.
+            if _stale_exclude_ids and len(kg_matches) < 2:
+                for m in _stale_excluded_hits:
+                    if len(kg_matches) >= 2:
+                        break
+                    if m.technique.id in seen:
+                        continue
+                    kg_matches.append(m)
+                    seen.add(m.technique.id)
+                    _stale_exclude_ids.discard(m.technique.id)
 
             # §Agentic-data upgrade 3: retrieval trajectory log — durable
             # record of what the technique retrieval surfaced for this
@@ -1023,6 +1132,19 @@ def diagnose(
 
             log_retrieval(
                 "diagnose", behavior_goal, kg_matches, out_dir=iter_dir)
+            if _stale_exclude_ids:
+                # §Fix 3: fires once per stuck iteration that actually had
+                # >=1 shown-uncited technique to rotate out.
+                log_retrieval(
+                    decision="diagnose_stale_rotate",
+                    query=",".join(sorted(_stale_exclude_ids)),
+                    matches=kg_matches, out_dir=iter_dir)
+                print(
+                    f"[diagnose] stale-rotation: excluded "
+                    f"{len(_stale_exclude_ids)} uncited technique(s) from "
+                    "the prior iteration's literature block (stuck, "
+                    "delta<=0) and refilled from next-ranked matches.",
+                    file=sys.stderr, flush=True)
             if _evidence_text:
                 log_retrieval(
                     decision="diagnose_evidence", query=_evidence_query,

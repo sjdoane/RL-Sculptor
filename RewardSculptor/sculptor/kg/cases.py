@@ -228,7 +228,16 @@ def record_run_cases(
         # with a known reference list credits each cited paper's
         # INTRODUCES-d techniques — this project's own run just showed the
         # citation paid off, not merely that a paper claims it works.
-        if verdict == "helped":
+        #
+        # §KG-retrieval fix 4 (outcome-stats ranking): additionally, for
+        # BOTH "helped" and "regressed" iterations, tally a per-FailureMode
+        # helped/regressed count on each cited technique — a real, scoped
+        # learning signal `query_techniques` can rank on (a technique that
+        # helped THIS failure mode outranks one that only ever regressed
+        # it, independent of the unscoped `useful_citations` count above).
+        # "unknown"/"neutral" iterations touch neither counter.
+        if verdict in ("helped", "regressed"):
+            fm_ids_for_stats = [make_failure_mode_id(fm) for fm in fms]
             for arxiv_id in iter_references.get(iter_index, []) or []:
                 paper_id = make_paper_id(str(arxiv_id))
                 for _, tech_id in store.neighbors(
@@ -237,8 +246,25 @@ def record_run_cases(
                     tech = store.get_node(tech_id)
                     if not isinstance(tech, Technique):
                         continue
-                    tech.useful_citations = int(tech.useful_citations or 0) + 1
-                    store.add_node(tech)
+                    changed = False
+                    if verdict == "helped":
+                        tech.useful_citations = (
+                            int(tech.useful_citations or 0) + 1)
+                        changed = True
+                    if fm_ids_for_stats:
+                        stats = {
+                            k: dict(v) for k, v in (tech.outcome_stats or {}).items()
+                        }
+                        for fm_id in fm_ids_for_stats:
+                            entry = dict(stats.get(fm_id) or {})
+                            entry["helped"] = int(entry.get("helped", 0))
+                            entry["regressed"] = int(entry.get("regressed", 0))
+                            entry[verdict] += 1
+                            stats[fm_id] = entry
+                        tech.outcome_stats = stats
+                        changed = True
+                    if changed:
+                        store.add_node(tech)
         for fm in fms:
             fm_id = make_failure_mode_id(fm)
             # §KG integrity: the diagnoser can flag a failure mode that was never

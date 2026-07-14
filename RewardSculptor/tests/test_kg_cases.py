@@ -512,4 +512,122 @@ def test_query_cases_recency_does_not_override_a_real_similarity_gap(tmp_path, m
 
     matches = C.query_cases("kick", top_k=2, store=store)
     assert [m.case.id for m in matches] == ["case:older_close", "case:newer_far"]
+
+
+# ── §KG-retrieval fix 4: outcome-stats ranking ────────────────────────────
+def test_helped_iter_increments_outcome_stats_for_its_failure_mode(tmp_path) -> None:
+    """A 'helped' iteration that cites a paper via iter_references must tally
+    a per-FailureMode helped count on that paper's INTRODUCES-d technique,
+    scoped to the failure mode(s) THIS iteration actually flagged."""
+    store = SculptorKG(tmp_path / "kg.db")
+    paper = Paper(id=make_paper_id("1707.06347"), arxiv_id="1707.06347", title="PPO")
+    tech = Technique(id=make_technique_id("rsi"), name="rsi")
+    store.add_node(paper)
+    store.add_node(tech)
+    store.add_edge(Edge(src=paper.id, dst=tech.id, relation=Relation.INTRODUCES))
+
+    result = types.SimpleNamespace(
+        completed_iters=[_outcome(0, ["reward_hacking"]), _outcome(1, [])],
+        fitness_history=[0.2, 0.5],  # iter0 delta +0.3 -> helped
+    )
+    C.record_run_cases(
+        store, task="kick", result=result, nonce="stats1",
+        iter_references={0: ["1707.06347"]},
+    )
+    fetched = store.get_node(tech.id)
+    fm_id = make_failure_mode_id("reward_hacking")
+    assert fetched.outcome_stats == {fm_id: {"helped": 1, "regressed": 0}}
+    # useful_citations still increments too — outcome_stats is additive,
+    # not a replacement for the existing signal.
+    assert fetched.useful_citations == 1
+
+
+def test_regressed_iter_increments_outcome_stats_but_not_useful_citations(
+    tmp_path,
+) -> None:
+    """A 'regressed' iteration must bump the regressed counter on
+    outcome_stats (a real, negative learning signal) while leaving
+    useful_citations untouched (that field is 'helped'-only)."""
+    store = SculptorKG(tmp_path / "kg.db")
+    paper = Paper(id=make_paper_id("1707.06347"), arxiv_id="1707.06347", title="PPO")
+    tech = Technique(id=make_technique_id("rsi"), name="rsi")
+    store.add_node(paper)
+    store.add_node(tech)
+    store.add_edge(Edge(src=paper.id, dst=tech.id, relation=Relation.INTRODUCES))
+
+    result = types.SimpleNamespace(
+        completed_iters=[_outcome(0, ["reward_hacking"]), _outcome(1, [])],
+        fitness_history=[0.5, 0.2],  # iter0 delta -0.3 -> regressed
+    )
+    C.record_run_cases(
+        store, task="kick", result=result, nonce="stats2",
+        iter_references={0: ["1707.06347"]},
+    )
+    fetched = store.get_node(tech.id)
+    fm_id = make_failure_mode_id("reward_hacking")
+    assert fetched.outcome_stats == {fm_id: {"helped": 0, "regressed": 1}}
+    assert fetched.useful_citations == 0
+
+
+def test_outcome_stats_accumulate_across_helped_and_regressed_iters(
+    tmp_path,
+) -> None:
+    """Repeated (helped, regressed) verdicts on the same (technique,
+    failure-mode) pair both accumulate in the same counter dict, and a
+    verdict on a DIFFERENT failure mode gets its own entry."""
+    store = SculptorKG(tmp_path / "kg.db")
+    paper = Paper(id=make_paper_id("2020.00001"), arxiv_id="2020.00001", title="Shaping")
+    tech = Technique(id=make_technique_id("shaping"), name="shaping")
+    store.add_node(paper)
+    store.add_node(tech)
+    store.add_edge(Edge(src=paper.id, dst=tech.id, relation=Relation.INTRODUCES))
+
+    result = types.SimpleNamespace(
+        completed_iters=[
+            _outcome(0, ["reward_hacking"]),
+            _outcome(1, ["reward_hacking"]),
+            _outcome(2, ["sparse_reward"]),
+            _outcome(3, []),
+        ],
+        # iter0 delta +0.3 helped, iter1 delta -0.2 regressed,
+        # iter2 delta +0.1 helped.
+        fitness_history=[0.1, 0.4, 0.2, 0.3, 1.0],
+    )
+    C.record_run_cases(
+        store, task="kick", result=result, nonce="stats3",
+        iter_references={0: ["2020.00001"], 1: ["2020.00001"], 2: ["2020.00001"]},
+    )
+    fetched = store.get_node(tech.id)
+    hack_id = make_failure_mode_id("reward_hacking")
+    sparse_id = make_failure_mode_id("sparse_reward")
+    assert fetched.outcome_stats[hack_id] == {"helped": 1, "regressed": 1}
+    assert fetched.outcome_stats[sparse_id] == {"helped": 1, "regressed": 0}
+
+
+def test_no_failure_modes_flagged_leaves_outcome_stats_untouched(tmp_path) -> None:
+    """A 'helped' iteration with no failure_modes flagged has nothing to
+    scope a per-failure-mode tally to — outcome_stats stays empty even
+    though useful_citations still increments."""
+    store = SculptorKG(tmp_path / "kg.db")
+    paper = Paper(id=make_paper_id("1707.06347"), arxiv_id="1707.06347", title="PPO")
+    tech = Technique(id=make_technique_id("rsi"), name="rsi")
+    store.add_node(paper)
+    store.add_node(tech)
+    store.add_edge(Edge(src=paper.id, dst=tech.id, relation=Relation.INTRODUCES))
+
+    result = types.SimpleNamespace(
+        completed_iters=[_outcome(0, []), _outcome(1, [])],
+        # delta +0.3 with no failure modes still passes record_run_cases's
+        # skip gate (a measurable fitness change alone is enough to record
+        # the row) — see the `if not fms and not edits and delta is None
+        # and delta_p is None: continue` condition in cases.py.
+        fitness_history=[0.2, 0.5],
+    )
+    C.record_run_cases(
+        store, task="kick", result=result, nonce="stats4",
+        iter_references={0: ["1707.06347"]},
+    )
+    fetched = store.get_node(tech.id)
+    assert fetched.outcome_stats == {}
+    assert fetched.useful_citations == 1
     store.close()

@@ -88,6 +88,39 @@ def _citation_boost(useful_citations: int) -> float:
     )
 
 
+#: §KG-retrieval fix 4 (outcome-stats ranking): cap on the per-FailureMode
+#: helped/regressed ranking adjustment — same "small, ORDERING-only tie-
+#: breaker" contract as `USEFUL_CITATION_BOOST_CAP` above, deliberately
+#: scaled a bit larger (0.15 vs 0.05) because this signal is SCOPED to the
+#: queried failure mode(s) rather than a global usage count, so it is a
+#: more targeted (and thus more trustworthy) tie-breaker.
+OUTCOME_STATS_ADJUSTMENT_CAP = 0.15
+_OUTCOME_STATS_ADJUSTMENT_SCALE = 0.03
+
+
+def _outcome_stats_adjustment(
+    outcome_stats: dict | None, queried_failure_mode_ids: set[str],
+) -> float:
+    """Net helped-minus-regressed signal from THIS project's own RunCase
+    verdicts, restricted to the failure mode(s) actually being queried
+    (`query_techniques`'s enum-resolved + `extra_failure_node_ids`).
+    Applied to the ORDERING score only, alongside `_citation_boost` — never
+    to a similarity floor. Deterministic: a technique with no recorded
+    stats for the queried failure modes returns 0.0 (no behavior change)."""
+    if not outcome_stats or not queried_failure_mode_ids:
+        return 0.0
+    net = 0
+    for fm_id in queried_failure_mode_ids:
+        entry = outcome_stats.get(fm_id)
+        if not entry:
+            continue
+        net += int(entry.get("helped", 0) or 0) - int(entry.get("regressed", 0) or 0)
+    return max(
+        -OUTCOME_STATS_ADJUSTMENT_CAP,
+        min(OUTCOME_STATS_ADJUSTMENT_CAP, _OUTCOME_STATS_ADJUSTMENT_SCALE * net),
+    )
+
+
 # ── Result shape ────────────────────────────────────────────────────────────
 @dataclass
 class TechniqueMatch:
@@ -232,6 +265,12 @@ def query_techniques(
                     existing_ids.add(node_id)
         if not fm_map:
             return []
+        # §KG-retrieval fix 4: the full set of FailureMode ids this call is
+        # querying for (enum-resolved ∪ extra_failure_node_ids) — used
+        # below to scope the outcome-stats ranking adjustment to what was
+        # actually asked about, not a technique's stats against every
+        # failure mode it has ever touched.
+        queried_fm_ids = {fm.id for fm in fm_map.values()}
 
         # For each FailureMode, find all Techniques with ADDRESSES edges into it.
         # (Edge direction: Technique -> FailureMode.)
@@ -297,6 +336,10 @@ def query_techniques(
             # walk is a hard ADDRESSES-edge match, not a threshold), so the
             # boost is simply added to the tie-break score here.
             score += _citation_boost(tech.useful_citations)
+            # §KG-retrieval fix 4: capped outcome-stats adjustment, ORDERING
+            # only — same rationale as the citation boost above.
+            score += _outcome_stats_adjustment(
+                getattr(tech, "outcome_stats", None), queried_fm_ids)
 
             results.append(TechniqueMatch(
                 technique=tech,

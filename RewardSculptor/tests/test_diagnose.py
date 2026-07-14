@@ -959,3 +959,270 @@ def test_diagnose_grounded_flag_reflects_this_iters_retrieval(
     assert all(m["grounded"] is True for m in dumped["literature_context"])
     edit_dump = next(e for e in dumped["proposed_edits"] if e["target_term"] == "forward_weight")
     assert edit_dump["paper_refs_grounded"] == {"1111.11111": True}
+
+
+# ── Fix 3: staleness rotation ───────────────────────────────────────────────
+def _build_iter_dir(base: Path, name: str) -> Path:
+    """Same artifact shape as the `iter_dir` fixture above, parameterized by
+    directory name so a test can build an `iter_<N-1>` / `iter_<N>` pair."""
+    d = base / name
+    d.mkdir()
+    (d / "metrics.json").write_text(json.dumps({
+        "metrics": {"mean_return": 71.1, "std_return": 0.8,
+                    "n_eval_episodes": 5, "training_steps": 20000,
+                    "n_envs": 4, "seed": 42},
+        "components": {"alive_bonus": 1.0,
+                       "forward_velocity": 0.12,
+                       "ctrl_cost": -0.0015}
+    }, sort_keys=True))
+    (d / "behavior.json").write_text(json.dumps({
+        "n_episodes": 6,
+        "mean_return": 70.5,
+        "max_episode_length": 43,
+        "mean_episode_length": 42.0,
+        "fall_rate": 1.0,
+        "mean_forward_velocity": 0.68,
+        "termination_reason_counts": {"terminated": 6, "truncated": 0}
+    }, sort_keys=True))
+    (d / "reward_spec.json").write_text(json.dumps({
+        "version": "v0",
+        "author": "human",
+        "parent_hash": None,
+        "description": "Canonical Hopper-v4 reward.",
+        "hyperparameters": {"forward_weight": 1.0, "alive_bonus": 1.0,
+                            "ctrl_cost_weight": 0.001},
+        "references": []
+    }, sort_keys=True))
+    kdir = d / "keyframes"
+    kdir.mkdir()
+    png = _png_1x1()
+    for i in range(4):
+        (kdir / f"frame_{i:02d}.png").write_bytes(png)
+    return d
+
+
+def _stale_pool(names: list[str]):
+    from sculptor.kg.query import TechniqueMatch
+    from sculptor.kg.schema import Technique
+
+    return [
+        TechniqueMatch(
+            technique=Technique(id=f"technique:{name}", name=name),
+            description="d", paper_citation="c", evidence="e",
+            relevance_score=1.0 - i * 0.01,
+        )
+        for i, name in enumerate(names)
+    ]
+
+
+_STALE_POOL_NAMES = [
+    "tech_a", "tech_b", "tech_c", "tech_d", "tech_e", "tech_f", "tech_g", "tech_h",
+]
+
+
+def _write_prev_diagnosis(
+    prev_dir: Path, *, shown: list[tuple[str, str]], cited_arxiv_ids: list[str],
+) -> None:
+    """`shown`: [(technique_name, source_arxiv_id), ...] — mirrors the real
+    `technique_id`/`source_paper_ids` fields Diagnosis.to_dict() persists.
+
+    Uses the raw `technique:{name}` id form (matching `_stale_pool`'s
+    hand-built `Technique(id=f"technique:{name}", ...)`) rather than
+    `make_technique_id`, which additionally slugifies (e.g. "tech_a" ->
+    "technique:tech-a") — real ingest-populated KG techniques go through
+    that slugification, but this fixture bypasses ingest entirely, so its
+    ids must match what it actually assigns the stub technique objects."""
+    from sculptor.kg.schema import make_paper_id
+
+    (prev_dir / "diagnosis.json").write_text(json.dumps({
+        "failure_modes": ["sparse_reward"],
+        "evidence": "prior evidence",
+        "proposed_edits": [{
+            "target_term": "forward_weight", "operation": "decrease",
+            "rationale": "r", "suggested_value": "0.5",
+            "paper_refs": list(cited_arxiv_ids),
+            "paper_refs_grounded": {}, "requires_env_extension": False,
+        }] if cited_arxiv_ids else [],
+        "proposed_env_edits": [],
+        "literature_context": [
+            {
+                "technique": name,
+                "technique_id": f"technique:{name}",
+                "source_paper_ids": [make_paper_id(arxiv_id)],
+                "description": "d", "paper_citation": "c", "evidence": "e",
+                "relevance_score": 0.9, "matched_on": ["semantic"],
+                "grounded": True,
+            }
+            for name, arxiv_id in shown
+        ],
+        "confidence": 0.5,
+        "iter_dir": str(prev_dir),
+        "behavior_goal": "run forward",
+    }))
+
+
+def test_diagnose_stale_rotation_excludes_uncited_and_refills(
+    config, kg_with_locomotion_tech, tmp_path, monkeypatch,
+):
+    """Stuck iteration (delta<=0): 3 techniques shown last iter, only 1
+    cited by a proposed edit -> the 2 uncited ones are excluded from THIS
+    iteration's merged retrieval, and the block refills from next-ranked
+    matches back up to KG_TOP_K."""
+    prev_dir = _build_iter_dir(tmp_path, "iter_0")
+    _write_prev_diagnosis(
+        prev_dir,
+        shown=[("tech_a", "1111.11111"), ("tech_b", "2222.22222"),
+               ("tech_c", "3333.33333")],
+        cited_arxiv_ids=["1111.11111"],  # only tech_a's paper was cited
+    )
+    cur_dir = _build_iter_dir(tmp_path, "iter_1")
+
+    def _stub_query_semantic(text, top_k=6, store=None, min_similarity=0.0):
+        return _stale_pool(_STALE_POOL_NAMES[:top_k])
+
+    def _stub_query_techniques(failure_modes, domain_filter=None, top_k=5,
+                                store=None, extra_failure_node_ids=None):
+        return _stale_pool(_STALE_POOL_NAMES[:top_k])
+
+    monkeypatch.setattr("sculptor.diagnose.query_semantic", _stub_query_semantic)
+    monkeypatch.setattr("sculptor.diagnose.query_techniques", _stub_query_techniques)
+
+    prelim = _PreliminaryModel(
+        failure_modes=["sparse_reward"], evidence="still stuck", confidence=0.6)
+    grounded = _GroundedModel(proposed_edits=[], confidence=0.5)
+    client = _StubClient(prelim, grounded)
+
+    d = diagnose(
+        iter_dir=cur_dir, behavior_goal="run forward", config=config,
+        store=kg_with_locomotion_tech, client=client,
+        objective_progress={"current": 0.3, "best_so_far": 0.3, "last": 0.31,
+                            "delta": -0.01},
+    )
+
+    names = {m.technique.name for m in d.literature_context}
+    assert "tech_b" not in names, "shown-uncited technique must be excluded"
+    assert "tech_c" not in names, "shown-uncited technique must be excluded"
+    assert "tech_a" in names, "the CITED technique must not be excluded"
+    # refilled back up to KG_TOP_K from the enlarged fetch (tech_g/tech_h
+    # only appear because the fetch top_k grew to make room for exclusion).
+    assert len(d.literature_context) == KG_TOP_K
+    assert {"tech_g", "tech_h"} <= names
+
+    log_path = cur_dir / "kg_retrievals.jsonl"
+    records = [json.loads(l) for l in log_path.read_text(encoding="utf-8").splitlines()]
+    rotate_rec = next(r for r in records if r["decision"] == "diagnose_stale_rotate")
+    assert "technique:tech_b" in rotate_rec["query"]
+    assert "technique:tech_c" in rotate_rec["query"]
+    assert "technique:tech_a" not in rotate_rec["query"]
+
+
+def test_diagnose_stale_rotation_inert_when_delta_positive(
+    config, kg_with_locomotion_tech, tmp_path, monkeypatch,
+):
+    """A previous iteration with shown-uncited techniques must NOT trigger
+    exclusion when this iteration's delta is positive — merge stays
+    byte-identical to the no-objective_progress case."""
+    prev_dir = _build_iter_dir(tmp_path, "iter_0")
+    _write_prev_diagnosis(
+        prev_dir,
+        shown=[("tech_a", "1111.11111"), ("tech_b", "2222.22222"),
+               ("tech_c", "3333.33333")],
+        cited_arxiv_ids=["1111.11111"],
+    )
+    cur_dir = _build_iter_dir(tmp_path, "iter_1")
+
+    def _stub_query_semantic(text, top_k=6, store=None, min_similarity=0.0):
+        return _stale_pool(_STALE_POOL_NAMES[:top_k])
+
+    def _stub_query_techniques(failure_modes, domain_filter=None, top_k=5,
+                                store=None, extra_failure_node_ids=None):
+        return _stale_pool(_STALE_POOL_NAMES[:top_k])
+
+    monkeypatch.setattr("sculptor.diagnose.query_semantic", _stub_query_semantic)
+    monkeypatch.setattr("sculptor.diagnose.query_techniques", _stub_query_techniques)
+
+    prelim = _PreliminaryModel(
+        failure_modes=["sparse_reward"], evidence="improving", confidence=0.6)
+    grounded = _GroundedModel(proposed_edits=[], confidence=0.5)
+    client = _StubClient(prelim, grounded)
+
+    d_positive = diagnose(
+        iter_dir=cur_dir, behavior_goal="run forward", config=config,
+        store=kg_with_locomotion_tech, client=client,
+        objective_progress={"current": 0.4, "best_so_far": 0.4, "last": 0.3,
+                            "delta": 0.1},
+    )
+    names_positive = [m.technique.name for m in d_positive.literature_context]
+
+    cur_dir2 = _build_iter_dir(tmp_path, "iter_2")
+    d_none = diagnose(
+        iter_dir=cur_dir2, behavior_goal="run forward", config=config,
+        store=kg_with_locomotion_tech, client=client,
+        objective_progress=None,
+    )
+    names_none = [m.technique.name for m in d_none.literature_context]
+
+    assert names_positive == names_none == ["tech_a", "tech_b", "tech_c",
+                                            "tech_d", "tech_e", "tech_f"]
+
+    log_path = cur_dir / "kg_retrievals.jsonl"
+    records = [json.loads(l) for l in log_path.read_text(encoding="utf-8").splitlines()]
+    assert "diagnose_stale_rotate" not in [r["decision"] for r in records]
+
+
+def test_diagnose_stale_rotation_never_drops_below_two_results(
+    config, kg_with_locomotion_tech, tmp_path, monkeypatch,
+):
+    """When the retrievable pool IS the shown-uncited set (excluding all of
+    it would starve the block below 2 matches), the floor re-admits enough
+    of them — in original priority order — to keep >=2 results."""
+    prev_dir = _build_iter_dir(tmp_path, "iter_0")
+    _write_prev_diagnosis(
+        prev_dir,
+        shown=[("tech_a", "1111.11111"), ("tech_b", "2222.22222"),
+               ("tech_c", "3333.33333")],
+        cited_arxiv_ids=["1111.11111"],  # only tech_a cited -> b, c uncited
+    )
+    cur_dir = _build_iter_dir(tmp_path, "iter_1")
+
+    # Unlike the refill test above, this store only ever has 3 techniques
+    # total (a, b, c) regardless of the requested top_k — there is nothing
+    # to refill from.
+    def _stub_query_semantic(text, top_k=6, store=None, min_similarity=0.0):
+        return _stale_pool(["tech_a", "tech_b", "tech_c"])
+
+    def _stub_query_techniques(failure_modes, domain_filter=None, top_k=5,
+                                store=None, extra_failure_node_ids=None):
+        return _stale_pool(["tech_a", "tech_b", "tech_c"])
+
+    monkeypatch.setattr("sculptor.diagnose.query_semantic", _stub_query_semantic)
+    monkeypatch.setattr("sculptor.diagnose.query_techniques", _stub_query_techniques)
+
+    prelim = _PreliminaryModel(
+        failure_modes=["sparse_reward"], evidence="still stuck", confidence=0.6)
+    grounded = _GroundedModel(proposed_edits=[], confidence=0.5)
+    client = _StubClient(prelim, grounded)
+
+    d = diagnose(
+        iter_dir=cur_dir, behavior_goal="run forward", config=config,
+        store=kg_with_locomotion_tech, client=client,
+        objective_progress={"current": 0.3, "best_so_far": 0.3, "last": 0.31,
+                            "delta": -0.01},
+    )
+
+    names = [m.technique.name for m in d.literature_context]
+    assert len(names) >= 2, "the floor must never let the block drop below 2"
+    assert "tech_a" in names, "the cited technique is never excluded"
+    # exactly one of {tech_b, tech_c} was re-admitted to meet the floor —
+    # evidence_matches is scanned first, so tech_b (encountered before
+    # tech_c in that pass) is the one re-admitted.
+    assert "tech_b" in names
+    assert "tech_c" not in names
+
+    log_path = cur_dir / "kg_retrievals.jsonl"
+    records = [json.loads(l) for l in log_path.read_text(encoding="utf-8").splitlines()]
+    rotate_rec = next(r for r in records if r["decision"] == "diagnose_stale_rotate")
+    # only the ACTUALLY-applied exclusion (tech_c) is reported — tech_b was
+    # re-admitted by the floor and must not appear as "excluded".
+    assert "technique:tech_c" in rotate_rec["query"]
+    assert "technique:tech_b" not in rotate_rec["query"]

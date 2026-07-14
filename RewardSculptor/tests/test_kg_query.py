@@ -639,3 +639,78 @@ def test_query_techniques_extra_failure_node_ids_dedupes_with_enum_resolved(kg):
         extra_failure_node_ids=[sparse_id])
     assert [m.technique.name for m in r_plain] == [m.technique.name for m in r_dup]
     assert [m.relevance_score for m in r_plain] == [m.relevance_score for m in r_dup]
+
+
+# ── §KG-retrieval fix 4: outcome-stats ranking ────────────────────────────
+def test_outcome_stats_adjustment_scoped_scaled_and_clamped():
+    from sculptor.kg.query import (
+        OUTCOME_STATS_ADJUSTMENT_CAP,
+        _outcome_stats_adjustment,
+    )
+
+    assert _outcome_stats_adjustment(None, {"failure:x"}) == 0.0
+    assert _outcome_stats_adjustment({}, {"failure:x"}) == 0.0
+
+    stats = {"failure:x": {"helped": 2, "regressed": 0}}
+    # net=2 -> 0.03 * 2 = 0.06, well under the cap.
+    assert _outcome_stats_adjustment(stats, {"failure:x"}) == pytest.approx(0.06)
+
+    # A failure mode NOT in the queried set contributes nothing, even
+    # though the technique has stats for it.
+    assert _outcome_stats_adjustment(stats, {"failure:other"}) == 0.0
+
+    # Clamped at +/- the cap regardless of how lopsided the tally is.
+    huge_helped = {"failure:x": {"helped": 1000, "regressed": 0}}
+    assert _outcome_stats_adjustment(huge_helped, {"failure:x"}) == pytest.approx(
+        OUTCOME_STATS_ADJUSTMENT_CAP)
+    huge_regressed = {"failure:x": {"helped": 0, "regressed": 1000}}
+    assert _outcome_stats_adjustment(huge_regressed, {"failure:x"}) == pytest.approx(
+        -OUTCOME_STATS_ADJUSTMENT_CAP)
+
+
+def test_query_techniques_outcome_stats_reorders_equal_rank_ties(kg):
+    """Two techniques tied on matched-FM count (the seed graph's
+    sparse_reward query) reorder by outcome_stats when one has a
+    helped-dominant record for the QUERIED failure mode and the other's
+    record is for a DIFFERENT failure mode (must not count against/for it)."""
+    _seed_graph(kg)
+    sparse_id = make_failure_mode_id("sparse_reward")
+    hack_id = make_failure_mode_id("reward_hacking")
+
+    # Baseline: with no outcome_stats, alphabetical tie-break sorts
+    # potential_based_shaping before reference_state_initialization.
+    baseline = query_techniques(["sparse_reward"], store=kg, top_k=5)
+    assert [m.technique.name for m in baseline] == [
+        "potential_based_shaping", "reference_state_initialization"]
+
+    tech_rsi = kg.get_node(make_technique_id("reference_state_initialization"))
+    tech_rsi.outcome_stats = {sparse_id: {"helped": 5, "regressed": 0}}
+    kg.add_node(tech_rsi)
+
+    tech_shaping = kg.get_node(make_technique_id("potential_based_shaping"))
+    # Regressed, but on reward_hacking — NOT the queried failure mode below
+    # — so it must not drag potential_based_shaping down for this query.
+    tech_shaping.outcome_stats = {hack_id: {"helped": 0, "regressed": 5}}
+    kg.add_node(tech_shaping)
+
+    results = query_techniques(["sparse_reward"], store=kg, top_k=5)
+    assert results[0].technique.name == "reference_state_initialization"
+    assert results[1].technique.name == "potential_based_shaping"
+
+
+def test_query_techniques_outcome_stats_capped_relative_to_relevance(kg):
+    """The outcome-stats adjustment never exceeds its documented cap, even
+    with an enormous helped/regressed imbalance — same 'small tie-breaker,
+    never overwhelms real relevance' contract as the citation boost."""
+    from sculptor.kg.query import OUTCOME_STATS_ADJUSTMENT_CAP
+
+    _seed_graph(kg)
+    sparse_id = make_failure_mode_id("sparse_reward")
+    tech_rsi = kg.get_node(make_technique_id("reference_state_initialization"))
+    tech_rsi.outcome_stats = {sparse_id: {"helped": 10_000, "regressed": 0}}
+    kg.add_node(tech_rsi)
+
+    results = query_techniques(["sparse_reward"], store=kg, top_k=5)
+    rsi_match = next(
+        m for m in results if m.technique.name == "reference_state_initialization")
+    assert rsi_match.relevance_score <= 1.0 + OUTCOME_STATS_ADJUSTMENT_CAP + 0.05
