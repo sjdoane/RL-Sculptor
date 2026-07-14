@@ -1,8 +1,11 @@
 """sculptor/kg/query.py — the KG read surface the diagnoser/editor consumes.
 
-Three entry points:
-  * query_techniques(failure_modes, domain_filter=None, top_k=5)
-      Graph walk. For each named failure mode, list techniques that ADDRESS it
+Entry points:
+  * query_techniques(failure_modes, domain_filter=None, top_k=5,
+                      extra_failure_node_ids=None)
+      Graph walk. For each named failure mode (plus any already-resolved
+      FailureMode node ids passed via `extra_failure_node_ids` — e.g. from
+      `resolve_failure_modes_semantic`), list techniques that ADDRESS it
       (optionally restricted to techniques whose papers EVALUATE_ON an env
       whose tags include `domain_filter`).
 
@@ -11,11 +14,20 @@ Three entry points:
       description embeddings. Embeddings are populated lazily and persisted
       via `SculptorKG.set_embedding`.
 
+  * resolve_failure_modes_semantic(store, descriptors, top_k_per=2,
+                                    min_similarity=0.45)
+      Sentence-transformer cosine similarity between free-text failure
+      descriptors and cached FailureMode name+description embeddings —
+      the semantic counterpart to `_resolve_failure_modes`'s fixed-enum
+      fuzzy resolution. Returns FailureMode node ids for use as
+      `query_techniques`'s `extra_failure_node_ids`.
+
   * cite(arxiv_id) -> str
       Short human-facing citation string.
 
-All three return / use `TechniqueMatch` dataclasses so the downstream editor
-sees a uniform shape regardless of which path produced the candidate.
+`query_techniques` / `query_semantic` return `TechniqueMatch` dataclasses so
+the downstream editor sees a uniform shape regardless of which path
+produced the candidate.
 """
 
 from __future__ import annotations
@@ -189,9 +201,18 @@ def query_techniques(
     top_k: int = 5,
     *,
     store: SculptorKG | None = None,
+    extra_failure_node_ids: list[str] | None = None,
 ) -> list[TechniqueMatch]:
     """Techniques that ADDRESS any of `failure_modes`, optionally filtered by
     the domain tag of the introducing paper's evaluation environment.
+
+    `extra_failure_node_ids`: additional FailureMode node ids (already
+    resolved — e.g. via `resolve_failure_modes_semantic` matching free-text
+    failure descriptors) merged in alongside the enum-resolved nodes from
+    `failure_modes`, before the ADDRESSES walk below. Deduped by node id;
+    unknown / non-FailureMode ids are silently skipped. Ranking is
+    otherwise unchanged — a technique simply gets credit for however many
+    FailureMode nodes it addresses, enum- or descriptor-resolved alike.
 
     Ranking: more matched failure modes first, then introducing paper's year
     (newer first), then technique name.
@@ -200,6 +221,15 @@ def query_techniques(
     store = store or SculptorKG()
     try:
         fm_map = _resolve_failure_modes(store, failure_modes)
+        if extra_failure_node_ids:
+            existing_ids = {fm.id for fm in fm_map.values()}
+            for node_id in extra_failure_node_ids:
+                if not node_id or node_id in existing_ids:
+                    continue
+                node = store.get_node(node_id)
+                if isinstance(node, FailureMode):
+                    fm_map[node_id] = node
+                    existing_ids.add(node_id)
         if not fm_map:
             return []
 
@@ -420,6 +450,125 @@ def _ensure_technique_embeddings(
         "kg.query: loaded %d embeddings in %.2fs",
         len(out), time.time() - _t0,
     )
+    return out
+
+
+def _ensure_failure_mode_embeddings(
+    store: SculptorKG, model_name: str = EMBEDDING_MODEL
+) -> list[tuple[FailureMode, Any]]:
+    """Embed every FailureMode name+description that doesn't have a cached
+    embedding yet, return (failure_mode, vector) for all failure modes.
+
+    Mirrors `_ensure_technique_embeddings` exactly, over FailureMode nodes
+    instead of Technique nodes — §KG-retrieval fix 2's embedding-matched
+    free-text failure descriptors (`resolve_failure_modes_semantic`) needs
+    the same lazy-embed-then-cache pool, just against a different node kind.
+    """
+    import numpy as np
+
+    _t0 = time.time()
+    modes: list[FailureMode] = store.find_nodes(kind=FailureMode.kind)  # type: ignore[assignment]
+    log.info(
+        "kg.query: fetched %d FailureMode nodes in %.2fs",
+        len(modes), time.time() - _t0,
+    )
+    _t0 = time.time()
+    need: list[FailureMode] = [
+        m for m in modes
+        if not store.has_embedding(m.id, model_name) and (m.description or m.name)
+    ]
+    log.info(
+        "kg.query: has_embedding scan (FailureMode): %d of %d missing in %.2fs",
+        len(need), len(modes), time.time() - _t0,
+    )
+    if need:
+        log.info(
+            "kg.query: backfilling %d failure-mode embeddings (first "
+            "descriptor-resolution call after ingest)",
+            len(need),
+        )
+        embedder = _get_embedder(model_name)
+        texts = [f"{m.name}. {m.description}".strip(". ") for m in need]
+        _t0 = time.time()
+        vecs = embedder.encode(texts, normalize_embeddings=True)
+        log.info(
+            "kg.query: embedder.encode(%d texts) took %.2fs",
+            len(texts), time.time() - _t0,
+        )
+        vecs = np.asarray(vecs, dtype=np.float32)
+        for m, v in zip(need, vecs):
+            store.set_embedding(m.id, model_name, v)
+
+    _t0 = time.time()
+    out: list[tuple[FailureMode, Any]] = []
+    for m in modes:
+        v = store.get_embedding(m.id, model_name)
+        if v is not None:
+            out.append((m, v))
+    log.info(
+        "kg.query: loaded %d FailureMode embeddings in %.2fs",
+        len(out), time.time() - _t0,
+    )
+    return out
+
+
+#: Default cosine floor for descriptor->FailureMode resolution
+#: (§KG-retrieval fix 2). Higher than DEFAULT_MIN_PROMPT_SIMILARITY
+#: (0.35) because a false-positive FailureMode match feeds
+#: query_techniques's ADDRESSES walk and can pull in unrelated
+#: techniques — descriptor resolution should stay conservative.
+DEFAULT_MIN_DESCRIPTOR_SIMILARITY = 0.45
+
+
+def resolve_failure_modes_semantic(
+    store: SculptorKG,
+    descriptors: list[str],
+    *,
+    top_k_per: int = 2,
+    min_similarity: float = DEFAULT_MIN_DESCRIPTOR_SIMILARITY,
+    model_name: str = EMBEDDING_MODEL,
+) -> list[str]:
+    """Embedding-match free-text failure descriptors onto FailureMode node
+    ids — the semantic counterpart to `_resolve_failure_modes`'s fixed-enum
+    fuzzy resolution.
+
+    For each descriptor, ranks all FailureModes by cosine similarity
+    between the descriptor text and `"{name}. {description}"`, keeping up
+    to `top_k_per` above `min_similarity`. Results across all descriptors
+    are deduped by node id (first-seen order). Returns `[]` when
+    `descriptors` is empty, the KG has no FailureMode embeddings, or
+    nothing clears the floor — the same best-effort, never-internally-
+    guarded shape as `query_semantic` (a broken/missing embedder raises
+    through to the caller, which is expected to guard it exactly like it
+    guards `query_semantic`).
+    """
+    import numpy as np
+
+    if not descriptors:
+        return []
+    pool = _ensure_failure_mode_embeddings(store, model_name)
+    if not pool:
+        return []
+
+    seen: set[str] = set()
+    out: list[str] = []
+    for desc in descriptors:
+        text = str(desc or "").strip()
+        if not text:
+            continue
+        qv = _embed_text(text, model_name)
+        scored = []
+        for fm, v in pool:
+            sim = float(np.dot(qv, v))
+            if sim < min_similarity:
+                continue
+            scored.append((sim, fm))
+        scored.sort(key=lambda x: -x[0])
+        for _, fm in scored[:top_k_per]:
+            if fm.id in seen:
+                continue
+            seen.add(fm.id)
+            out.append(fm.id)
     return out
 
 

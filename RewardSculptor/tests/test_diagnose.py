@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 
 from sculptor.diagnose import (
+    KG_TOP_K,
     Diagnosis,
     ProposedEdit,
     _GroundedModel,
@@ -671,3 +672,290 @@ def test_diagnose_omits_reference_signature_block_when_corrupt(
         if c.get("type") == "text"
     )
     assert "# REFERENCE MOTION SIGNATURE" not in prelim_text
+
+
+# ── KG-retrieval fix 1: evidence-anchored semantic retrieval ──────────────
+def test_diagnose_evidence_anchored_query_merges_first_and_logs(
+    iter_dir, config, kg_with_locomotion_tech, monkeypatch,
+):
+    """When preliminary evidence is present, a SECOND semantic query
+    anchored on that evidence text must run, its hits must be merged
+    BEFORE the tag/goal hits (deduped, capped at KG_TOP_K), and it must
+    be logged under decision="diagnose_evidence"."""
+    from sculptor.kg.query import TechniqueMatch
+    from sculptor.kg.schema import Technique
+
+    calls: list[str] = []
+
+    def _stub_query_semantic(text, top_k=6, store=None, min_similarity=0.0):
+        calls.append(text)
+        if "leg drive" in text:
+            return [TechniqueMatch(
+                technique=Technique(id="technique:evidence_hit", name="evidence_hit"),
+                description="d", paper_citation="c", evidence="e",
+                relevance_score=0.9)]
+        return [TechniqueMatch(
+            technique=Technique(id="technique:goal_hit", name="goal_hit"),
+            description="d", paper_citation="c", evidence="e",
+            relevance_score=0.5)]
+
+    monkeypatch.setattr("sculptor.diagnose.query_semantic", _stub_query_semantic)
+
+    prelim = _PreliminaryModel(
+        failure_modes=["sparse_reward"],
+        evidence="The hopper planks on forearms without leg drive, failing "
+                  "to push off before falling.",
+        confidence=0.7,
+    )
+    grounded = _GroundedModel(proposed_edits=[], confidence=0.6)
+    client = _StubClient(prelim, grounded)
+
+    d = diagnose(iter_dir=iter_dir, behavior_goal="run forward",
+                 config=config, store=kg_with_locomotion_tech, client=client)
+
+    # Both the goal query and the evidence query ran.
+    assert "run forward" in calls
+    assert any("leg drive" in c for c in calls)
+
+    names = [m.technique.name for m in d.literature_context]
+    assert "evidence_hit" in names
+    assert "goal_hit" in names
+    assert names.index("evidence_hit") < names.index("goal_hit")
+    assert len(d.literature_context) <= KG_TOP_K
+
+    log_path = iter_dir / "kg_retrievals.jsonl"
+    assert log_path.is_file()
+    records = [json.loads(l) for l in log_path.read_text(encoding="utf-8").splitlines()]
+    decisions = [r["decision"] for r in records]
+    assert "diagnose_evidence" in decisions
+    ev_rec = next(r for r in records if r["decision"] == "diagnose_evidence")
+    assert "leg drive" in ev_rec["query"]
+    assert "technique:evidence_hit" in ev_rec["node_ids"]
+
+
+def test_diagnose_no_evidence_skips_evidence_query_byte_identical(
+    iter_dir, config, kg_with_locomotion_tech, monkeypatch,
+):
+    """Empty/whitespace-only preliminary evidence must NOT trigger the
+    evidence-anchored query or its log record — behavior stays identical
+    to before this fix (single semantic call, on the goal text only)."""
+    calls: list[str] = []
+
+    def _stub_query_semantic(text, top_k=6, store=None, min_similarity=0.0):
+        calls.append(text)
+        return []
+
+    monkeypatch.setattr("sculptor.diagnose.query_semantic", _stub_query_semantic)
+
+    prelim = _PreliminaryModel(
+        failure_modes=["sparse_reward"], evidence="   ", confidence=0.5)
+    grounded = _GroundedModel(proposed_edits=[], confidence=0.5)
+    client = _StubClient(prelim, grounded)
+
+    diagnose(iter_dir=iter_dir, behavior_goal="run forward",
+             config=config, store=kg_with_locomotion_tech, client=client)
+
+    # Exactly one semantic call — the static goal query — was made.
+    assert calls == ["run forward"]
+
+    log_path = iter_dir / "kg_retrievals.jsonl"
+    records = [json.loads(l) for l in log_path.read_text(encoding="utf-8").splitlines()]
+    decisions = [r["decision"] for r in records]
+    assert "diagnose_evidence" not in decisions
+
+
+# ── KG-retrieval fix 2: free-text failure_descriptors ──────────────────────
+def test_preliminary_model_failure_descriptors_absent_defaults_empty():
+    p = _PreliminaryModel(failure_modes=["sparse_reward"], evidence="e", confidence=0.5)
+    assert p.failure_descriptors == []
+
+
+def test_preliminary_model_failure_descriptors_round_trip():
+    p = _PreliminaryModel(
+        failure_modes=["sparse_reward"], evidence="e", confidence=0.5,
+        failure_descriptors=["planks on forearms without leg drive", "no hip extension"])
+    assert p.failure_descriptors == [
+        "planks on forearms without leg drive", "no hip extension"]
+
+
+def test_preliminary_model_failure_descriptors_malformed_coerces_to_empty():
+    """Old cached/replayed preliminary responses predate this field —
+    malformed input must coerce to `[]`, never raise."""
+    p = _PreliminaryModel(failure_modes=[], evidence="e", confidence=0.5,
+                          failure_descriptors="not a list")
+    assert p.failure_descriptors == []
+
+    p2 = _PreliminaryModel(failure_modes=[], evidence="e", confidence=0.5,
+                           failure_descriptors=[123, None, "", "   ", "ok phrase"])
+    assert p2.failure_descriptors == ["123", "ok phrase"]
+
+
+def test_diagnose_uses_descriptor_resolved_failure_modes_for_tag_query(
+    iter_dir, config, tmp_path, monkeypatch,
+):
+    """A failure_descriptor must pull in an ADDITIONAL technique via
+    query_techniques's extra_failure_node_ids, even when that technique's
+    FailureMode isn't reachable through the enum-resolved failure_modes."""
+    from sculptor.kg.schema import (
+        Edge, Environment, FailureMode, Paper, Relation, Technique,
+        make_environment_id, make_failure_mode_id, make_paper_id, make_technique_id,
+    )
+    from sculptor.kg.store import SculptorKG
+
+    store = SculptorKG(tmp_path / "kg_descriptors.db")
+    paper = Paper(id=make_paper_id("2099.00001"), arxiv_id="2099.00001",
+                  title="Descriptor Paper", year=2022)
+    store.add_node(paper)
+    # A FailureMode NOT among the fixed six — only reachable via a
+    # descriptor-resolved node id, never via `_resolve_failure_modes`.
+    fm_niche = FailureMode(
+        id=make_failure_mode_id("forearm_planking"),
+        name="forearm_planking",
+        description="Robot supports weight on forearms instead of extending legs.")
+    store.add_node(fm_niche)
+    tech = Technique(
+        id=make_technique_id("leg_extension_bonus"),
+        name="leg_extension_bonus",
+        description="Reward term rewarding knee/hip extension at touchdown.")
+    store.add_node(tech)
+    env = Environment(id=make_environment_id("Hopper-v4"), name="Hopper-v4",
+                      description="MuJoCo Hopper", tags=["continuous_locomotion"])
+    store.add_node(env)
+    store.add_edge(Edge(src=paper.id, dst=tech.id, relation=Relation.INTRODUCES,
+                        data={"evidence": "introduces leg extension bonus"}))
+    store.add_edge(Edge(src=tech.id, dst=fm_niche.id, relation=Relation.ADDRESSES,
+                        data={"evidence": "fixes forearm planking",
+                              "source_paper_id": paper.id}))
+    store.add_edge(Edge(src=paper.id, dst=env.id, relation=Relation.EVALUATES_ON))
+
+    monkeypatch.setattr("sculptor.diagnose.query_semantic", lambda *a, **kw: [])
+    monkeypatch.setattr(
+        "sculptor.kg.query.resolve_failure_modes_semantic",
+        lambda store, descriptors, **kw: [fm_niche.id],
+    )
+
+    prelim = _PreliminaryModel(
+        failure_modes=["premature_termination"],  # does NOT resolve to fm_niche
+        evidence="planks on forearms instead of extending the legs",
+        failure_descriptors=["planks on forearms without leg drive"],
+        confidence=0.6,
+    )
+    grounded = _GroundedModel(proposed_edits=[], confidence=0.5)
+    client = _StubClient(prelim, grounded)
+
+    d = diagnose(iter_dir=iter_dir, behavior_goal="jump forward",
+                 config=config, store=store, client=client)
+
+    names = [m.technique.name for m in d.literature_context]
+    assert "leg_extension_bonus" in names
+
+    log_path = iter_dir / "kg_retrievals.jsonl"
+    records = [json.loads(l) for l in log_path.read_text(encoding="utf-8").splitlines()]
+    desc_rec = next(r for r in records if r["decision"] == "diagnose_descriptors")
+    assert "planks on forearms without leg drive" in desc_rec["query"]
+    assert fm_niche.id in desc_rec["node_ids"]
+
+
+def test_diagnose_no_descriptors_skips_descriptor_resolution(
+    iter_dir, config, kg_with_locomotion_tech, monkeypatch,
+):
+    """No failure_descriptors → resolve_failure_modes_semantic is never
+    called and no `diagnose_descriptors` log record is written."""
+    called = []
+    monkeypatch.setattr("sculptor.diagnose.query_semantic", lambda *a, **kw: [])
+    monkeypatch.setattr(
+        "sculptor.kg.query.resolve_failure_modes_semantic",
+        lambda *a, **kw: called.append(1) or [],
+    )
+
+    prelim = _PreliminaryModel(
+        failure_modes=["sparse_reward"], evidence="stub", confidence=0.5)
+    grounded = _GroundedModel(proposed_edits=[], confidence=0.5)
+    client = _StubClient(prelim, grounded)
+
+    diagnose(iter_dir=iter_dir, behavior_goal="t",
+             config=config, store=kg_with_locomotion_tech, client=client)
+
+    assert called == []
+    log_path = iter_dir / "kg_retrievals.jsonl"
+    records = [json.loads(l) for l in log_path.read_text(encoding="utf-8").splitlines()]
+    assert "diagnose_descriptors" not in [r["decision"] for r in records]
+
+
+# ── KG-retrieval fix 5: citation grounding annotation ──────────────────────
+def test_diagnose_grounded_flag_reflects_this_iters_retrieval(
+    iter_dir, config, tmp_path, monkeypatch,
+):
+    """paper_refs_grounded[aid] is True iff `aid` was among the papers
+    THIS iteration's literature_context actually retrieved; existing-
+    but-unretrieved refs are kept with grounded=False; nonexistent refs
+    are still dropped entirely (pre-existing behavior, unchanged)."""
+    from sculptor.kg.schema import (
+        Edge, Environment, FailureMode, Paper, Relation, Technique,
+        make_environment_id, make_failure_mode_id, make_paper_id, make_technique_id,
+    )
+    from sculptor.kg.store import SculptorKG
+
+    store = SculptorKG(tmp_path / "kg_grounding.db")
+    paper_retrieved = Paper(id=make_paper_id("1111.11111"), arxiv_id="1111.11111",
+                            title="Retrieved Paper", year=2019)
+    paper_unretrieved = Paper(id=make_paper_id("2222.22222"), arxiv_id="2222.22222",
+                              title="Unretrieved Paper", year=2020)
+    store.add_node(paper_retrieved)
+    store.add_node(paper_unretrieved)
+
+    tech = Technique(id=make_technique_id("tag_tech"), name="tag_tech",
+                     description="Addresses sparse reward.")
+    store.add_node(tech)
+    fm = FailureMode(id=make_failure_mode_id("sparse_reward"), name="sparse_reward",
+                     description="Sparse reward")
+    store.add_node(fm)
+    env = Environment(id=make_environment_id("Hopper-v4"), name="Hopper-v4",
+                      description="Hopper", tags=["continuous_locomotion"])
+    store.add_node(env)
+    store.add_edge(Edge(src=paper_retrieved.id, dst=tech.id, relation=Relation.INTRODUCES))
+    store.add_edge(Edge(src=tech.id, dst=fm.id, relation=Relation.ADDRESSES,
+                        data={"source_paper_id": paper_retrieved.id}))
+    store.add_edge(Edge(src=paper_retrieved.id, dst=env.id, relation=Relation.EVALUATES_ON))
+
+    monkeypatch.setattr("sculptor.diagnose.query_semantic", lambda *a, **kw: [])
+
+    prelim = _PreliminaryModel(
+        failure_modes=["sparse_reward"], evidence="stub", confidence=0.6)
+    grounded = _GroundedModel(
+        proposed_edits=[
+            _ProposedEditModel(
+                target_term="forward_weight", operation="decrease",
+                rationale="grounded ref", suggested_value="0.5",
+                paper_refs=["1111.11111"]),
+            _ProposedEditModel(
+                target_term="ctrl_cost_weight", operation="increase",
+                rationale="recalled ref, not shown this iter",
+                suggested_value="0.01", paper_refs=["2222.22222"]),
+            _ProposedEditModel(
+                target_term="alive_bonus", operation="increase",
+                rationale="fabricated ref", suggested_value="1.0",
+                paper_refs=["9999.99999"]),
+        ],
+        confidence=0.6,
+    )
+    client = _StubClient(prelim, grounded)
+
+    d = diagnose(iter_dir=iter_dir, behavior_goal="run",
+                 config=config, store=store, client=client)
+
+    by_term = {e.target_term: e for e in d.proposed_edits}
+    assert by_term["forward_weight"].paper_refs == ["1111.11111"]
+    assert by_term["forward_weight"].paper_refs_grounded == {"1111.11111": True}
+
+    assert by_term["ctrl_cost_weight"].paper_refs == ["2222.22222"]
+    assert by_term["ctrl_cost_weight"].paper_refs_grounded == {"2222.22222": False}
+
+    assert by_term["alive_bonus"].paper_refs == []
+    assert by_term["alive_bonus"].paper_refs_grounded == {}
+
+    dumped = json.loads((iter_dir / "diagnosis.json").read_text())
+    assert dumped["literature_context"], "expected at least one retrieved technique"
+    assert all(m["grounded"] is True for m in dumped["literature_context"])
+    edit_dump = next(e for e in dumped["proposed_edits"] if e["target_term"] == "forward_weight")
+    assert edit_dump["paper_refs_grounded"] == {"1111.11111": True}

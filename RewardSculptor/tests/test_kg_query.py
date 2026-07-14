@@ -495,3 +495,147 @@ def test_query_semantic_boost_reorders_within_floor_but_score_stays_raw(monkeypa
     assert results[0].technique.name == "reference_state_initialization"
     # displayed score is the RAW cosine similarity, not sim+boost.
     assert results[0].relevance_score == pytest.approx(0.80, abs=1e-2)
+
+
+# ── §KG-retrieval fix 2: resolve_failure_modes_semantic ────────────────────
+def test_resolve_failure_modes_semantic_matches_descriptor_to_failure_mode(monkeypatch, kg):
+    """A free-text descriptor resolves (via embedding similarity) to the
+    right FailureMode node id — the semantic counterpart to
+    `_resolve_failure_modes`'s fixed-enum fuzzy resolution."""
+    import numpy as np
+
+    from sculptor.kg.query import resolve_failure_modes_semantic
+    from sculptor.kg.schema import FailureMode, make_failure_mode_id
+
+    fm_a = FailureMode(id=make_failure_mode_id("forearm_planking"),
+                       name="forearm_planking",
+                       description="Robot supports weight on forearms instead "
+                                   "of extending its legs.")
+    fm_b = FailureMode(id=make_failure_mode_id("hip_lockout"),
+                       name="hip_lockout",
+                       description="Hip joints stay locked at full extension.")
+    kg.add_node(fm_a)
+    kg.add_node(fm_b)
+
+    model_name = "test-model-fm"
+    vec_a = np.array([1.0, 0.0], dtype=np.float32)
+    vec_b = np.array([0.0, 1.0], dtype=np.float32)
+    kg.set_embedding(fm_a.id, model_name, vec_a)
+    kg.set_embedding(fm_b.id, model_name, vec_b)
+
+    def _should_not_load(*args, **kwargs):  # pragma: no cover - failure path
+        raise RuntimeError("SentenceTransformer should not have been loaded")
+
+    import sculptor.kg.query as qmod
+    monkeypatch.setattr(qmod, "_get_embedder", _should_not_load)
+    monkeypatch.setattr(qmod, "_embed_text", lambda text, mn=model_name: vec_a)
+
+    ids = resolve_failure_modes_semantic(
+        kg, ["planks on forearms without leg drive"], model_name=model_name)
+    assert ids == [fm_a.id]
+
+
+def test_resolve_failure_modes_semantic_floors_below_min_similarity(monkeypatch, kg):
+    import numpy as np
+
+    from sculptor.kg.query import resolve_failure_modes_semantic
+    from sculptor.kg.schema import FailureMode, make_failure_mode_id
+
+    fm_a = FailureMode(id=make_failure_mode_id("far_mode"), name="far_mode",
+                       description="Something else entirely.")
+    kg.add_node(fm_a)
+    model_name = "test-model-fm-floor"
+    kg.set_embedding(fm_a.id, model_name, np.array([1.0, 0.0], dtype=np.float32))
+
+    import sculptor.kg.query as qmod
+    monkeypatch.setattr(
+        qmod, "_embed_text",
+        lambda text, mn=model_name: np.array([0.0, 1.0], dtype=np.float32))
+
+    ids = resolve_failure_modes_semantic(
+        kg, ["totally unrelated phrase"], model_name=model_name, min_similarity=0.45)
+    assert ids == []
+
+
+def test_resolve_failure_modes_semantic_empty_descriptors_returns_empty(kg):
+    from sculptor.kg.query import resolve_failure_modes_semantic
+    assert resolve_failure_modes_semantic(kg, []) == []
+
+
+def test_resolve_failure_modes_semantic_dedupes_and_respects_top_k_per(monkeypatch, kg):
+    """Two descriptors resolving to the SAME node dedupe to one entry;
+    `top_k_per` caps how many nodes a single descriptor can contribute."""
+    import numpy as np
+
+    from sculptor.kg.query import resolve_failure_modes_semantic
+    from sculptor.kg.schema import FailureMode, make_failure_mode_id
+
+    fm_a = FailureMode(id=make_failure_mode_id("mode_a"), name="mode_a", description="a")
+    fm_b = FailureMode(id=make_failure_mode_id("mode_b"), name="mode_b", description="b")
+    kg.add_node(fm_a)
+    kg.add_node(fm_b)
+    model_name = "test-model-fm-dedupe"
+    kg.set_embedding(fm_a.id, model_name, np.array([1.0, 0.0], dtype=np.float32))
+    kg.set_embedding(fm_b.id, model_name, np.array([0.9, np.sqrt(1 - 0.9 ** 2)], dtype=np.float32))
+
+    import sculptor.kg.query as qmod
+    monkeypatch.setattr(
+        qmod, "_embed_text",
+        lambda text, mn=model_name: np.array([1.0, 0.0], dtype=np.float32))
+
+    # Same descriptor text twice -> both resolve to the same top matches;
+    # dedup keeps each node id once.
+    ids = resolve_failure_modes_semantic(
+        kg, ["desc one", "desc two"], model_name=model_name,
+        top_k_per=1, min_similarity=0.5)
+    assert ids == [fm_a.id]
+
+
+# ── §KG-retrieval fix 2: query_techniques(extra_failure_node_ids=...) ──────
+def test_query_techniques_honors_extra_failure_node_ids(kg):
+    """A FailureMode reachable ONLY via `extra_failure_node_ids` (not the
+    enum-resolved `failure_modes` list) still pulls in its technique, and
+    an unknown extra id is silently skipped rather than erroring."""
+    from sculptor.kg.schema import (
+        Edge, FailureMode, Relation, Technique,
+        make_failure_mode_id, make_technique_id,
+    )
+
+    p1, _p2 = _seed_graph(kg)
+
+    fm_niche = FailureMode(id=make_failure_mode_id("niche_failure"),
+                           name="niche_failure", description="A niche failure.")
+    kg.add_node(fm_niche)
+    tech_niche = Technique(id=make_technique_id("niche_fix"),
+                           name="niche_fix", description="Fixes the niche failure.")
+    kg.add_node(tech_niche)
+    kg.add_edge(Edge(src=p1.id, dst=tech_niche.id, relation=Relation.INTRODUCES))
+    kg.add_edge(Edge(src=tech_niche.id, dst=fm_niche.id, relation=Relation.ADDRESSES,
+                     data={"source_paper_id": p1.id}))
+
+    # `failure_modes` alone doesn't resolve to anything real.
+    r = query_techniques(["nonexistent_xyz"], store=kg,
+                         extra_failure_node_ids=[fm_niche.id])
+    names = {m.technique.name for m in r}
+    assert "niche_fix" in names
+
+    # Unknown extra id -> skipped, not an error, not a false match.
+    r2 = query_techniques(["nonexistent_xyz"], store=kg,
+                          extra_failure_node_ids=["failure:does-not-exist"])
+    assert r2 == []
+
+
+def test_query_techniques_extra_failure_node_ids_dedupes_with_enum_resolved(kg):
+    """When the SAME FailureMode is reachable via both the enum-resolved
+    `failure_modes` and `extra_failure_node_ids`, ranking is unaffected —
+    the technique is counted once, not double-credited."""
+    _seed_graph(kg)
+    from sculptor.kg.schema import make_failure_mode_id
+
+    sparse_id = make_failure_mode_id("sparse_reward")
+    r_plain = query_techniques(["sparse_reward"], store=kg, top_k=5)
+    r_dup = query_techniques(
+        ["sparse_reward"], store=kg, top_k=5,
+        extra_failure_node_ids=[sparse_id])
+    assert [m.technique.name for m in r_plain] == [m.technique.name for m in r_dup]
+    assert [m.relevance_score for m in r_plain] == [m.relevance_score for m in r_dup]

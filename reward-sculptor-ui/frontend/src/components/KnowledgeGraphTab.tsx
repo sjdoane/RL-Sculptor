@@ -9,7 +9,7 @@ import { GraphModal } from "@/components/GraphModal";
 import { PaperDetailModal } from "@/components/PaperDetailModal";
 import { Icon } from "@/components/rs/icon";
 import { Badge, Btn, EmptyState } from "@/components/rs/primitives";
-import { usePapers, usePendingSeeds, useTechniques } from "@/hooks/useKG";
+import { useAddSeeds, usePapers, usePendingSeeds, useTechniques } from "@/hooks/useKG";
 import { ApiError, healStubTitles, ingestGlobalKgSeeds } from "@/lib/api";
 import type { JobSummary } from "@/lib/types";
 
@@ -56,6 +56,35 @@ export function KnowledgeGraphTab({ slug }: { slug: string }) {
   const pendingList = pending.data?.pending ?? [];
   const techList = techniques.data ?? [];
 
+  // Ingest the seeds already sitting in kg_seeds.yml (queued by a mission
+  // or a prior partial run) but not yet in the graph — same job pattern
+  // AddSeedsDialog uses (POST /kg/seeds → job handle → onJobSubmitted
+  // hands it to PendingSeedJobWatcher for progress/completion toast), so
+  // there's no second ingest code path to keep in sync.
+  const ingestPending = useAddSeeds(slug);
+  const ingestPendingSeeds = () => {
+    ingestPending.mutate(
+      { seeds: pendingList.map((s) => ({ arxiv_id: s.arxiv_id })), auto_extract: true },
+      {
+        onSuccess: (j) => {
+          onJobSubmitted(j);
+          toast.message("Ingest queued", {
+            description: `${pendingList.length} pending seed(s) — you can close this and come back.`,
+          });
+        },
+        onError: (err) => {
+          if (err instanceof ApiError && err.status === 409) {
+            toast.error("KG job already running", {
+              description: "Wait for the current ingest/extract to finish before retrying.",
+            });
+            return;
+          }
+          toast.error("Could not queue pending seeds", { description: err.message });
+        },
+      },
+    );
+  };
+
   return (
     <div className="rs-scroll">
       <div className="rs-pad rs-vgap-16">
@@ -101,12 +130,22 @@ export function KnowledgeGraphTab({ slug }: { slug: string }) {
             </span>
           </div>
         )}
-        {paperList.length === 0 && pendingList.length > 0 && (
+        {pendingList.length > 0 && (
           <div className="rs-banner warn">
             <Icon name="clock" size={17} />
             <span className="rs-grow">
-              {pendingList.length} seed{pendingList.length === 1 ? "" : "s"} pending — ingest may still be running, or it failed.
+              {pendingList.length} seed paper{pendingList.length === 1 ? "" : "s"} from kg_seeds.yml {pendingList.length === 1 ? "is" : "are"} not in the knowledge graph yet.
             </span>
+            <Btn
+              kind="ghost"
+              size="sm"
+              icon={ingestPending.isPending ? "loader" : "download"}
+              disabled={ingestPending.isPending}
+              onClick={ingestPendingSeeds}
+              title="Ingest the pending kg_seeds.yml papers now"
+            >
+              {ingestPending.isPending ? "Queueing…" : "Ingest now"}
+            </Btn>
           </div>
         )}
 

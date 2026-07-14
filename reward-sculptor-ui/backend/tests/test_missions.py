@@ -1609,6 +1609,7 @@ def test_get_stage_iter_detail_assembles_all_fields(
         "arxiv_id": "2010.11251",
         "citation": "Lee et al. (2020). arXiv:2010.11251",
         "description": "Smooth Gaussian kernel technique.",
+        "grounded": None,
     }]
     assert body["primary_metric"] == pytest.approx(43.49)
     # No structured objective_fitness anywhere on disk -> regex fallback
@@ -1621,12 +1622,68 @@ def test_get_stage_iter_detail_assembles_all_fields(
         "arxiv_id": None,
         "citation": "He et al. (2024). arXiv:2406.08858",
         "description": "Stable standing bias augmentation.",
+        "grounded": None,
     }]
     # __-prefixed bookkeeping keys excluded; real components meaned.
     assert body["components"] == {
         "alive_bonus": 0.1,
         "crouch_depth": pytest.approx(0.4),
     }
+
+
+def test_get_stage_iter_detail_grounded_true_false_absent(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    """The diagnoser tags each cited paper `grounded: true` (retrieved
+    from the KG this iteration) or `grounded: false` (recalled by the
+    model, not retrieved). Both `reward_spec.json.references` and
+    `diagnosis.json.literature_context` entries carry the tag and it
+    must pass through untouched; an entry with no `grounded` key at all
+    (old diagnosis.json files predate the tag) must come through as
+    `None`, not `False`."""
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    stage_dir = _seed_stage_dir(project_dir, "alpha", "stage_0")
+    iter_dir = stage_dir / "runs" / "iter_0"
+    iter_dir.mkdir(parents=True)
+    (iter_dir / "reward_spec.json").write_text(json.dumps({
+        "version": "v1",
+        "references": [
+            {
+                "arxiv_id": "1111.11111",
+                "citation": "Retrieved et al.",
+                "how_used": "retrieved this iter",
+                "grounded": True,
+            },
+            {
+                "arxiv_id": "2222.22222",
+                "citation": "Recalled et al.",
+                "how_used": "recalled from training",
+                "grounded": False,
+            },
+            {
+                "arxiv_id": "3333.33333",
+                "citation": "Legacy et al.",
+                "how_used": "no grounded tag on disk",
+            },
+        ],
+    }))
+    (iter_dir / "diagnosis.json").write_text(json.dumps({
+        "literature_context": [
+            {"paper_citation": "Retrieved Lit.", "grounded": True},
+            {"paper_citation": "Recalled Lit.", "grounded": False},
+            {"paper_citation": "Legacy Lit."},
+        ],
+    }))
+
+    r = client.get(
+        f"/projects/{slug}/missions/alpha/stages/stage_0/iterations/0/detail",
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert [ref["grounded"] for ref in body["reward_references"]] == [True, False, None]
+    assert [ref["grounded"] for ref in body["literature_context"]] == [True, False, None]
 
 
 def test_get_stage_iter_detail_structured_objective_fitness_wins(

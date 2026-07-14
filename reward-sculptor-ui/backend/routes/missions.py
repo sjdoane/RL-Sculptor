@@ -1286,6 +1286,7 @@ def _extract_reward_references(spec: dict) -> list[StageIterPaperRef]:
                 arxiv_id=r.get("arxiv_id") if isinstance(r.get("arxiv_id"), str) else None,
                 citation=r.get("citation") if isinstance(r.get("citation"), str) else None,
                 description=r.get("how_used") if isinstance(r.get("how_used"), str) else r.get("description"),
+                grounded=r.get("grounded") if isinstance(r.get("grounded"), bool) else None,
             ))
         if out:
             return out
@@ -1402,6 +1403,7 @@ def get_stage_iter_detail(
                     else entry.get("paper_citation") if isinstance(entry.get("paper_citation"), str) else None
                 ),
                 description=entry.get("description") if isinstance(entry.get("description"), str) else None,
+                grounded=entry.get("grounded") if isinstance(entry.get("grounded"), bool) else None,
             ))
 
     objective_fitness = _extract_objective_fitness(iter_dir, spec, evidence)

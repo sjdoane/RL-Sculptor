@@ -3,14 +3,28 @@
 Stage 1 ("preliminary"):
     behavior_goal + current REWARD_SPEC + metrics.json + behavior.json +
     4 keyframe PNGs + reward_contract + the adapter's behavior-metric vocab
-    → failure_modes (from a fixed enum), evidence, confidence.
+    → failure_modes (from a fixed enum), evidence, confidence,
+    failure_descriptors (free-text, optional — see below).
 
 Stage 2 ("grounded"):
-    preliminary result + KG context (top-6 union of
-    query_techniques(failure_modes, domain_filter=config.kg.environment_tag)
-    and query_semantic(behavior_goal)) + original inputs + reward_contract
-    → proposed_edits. Every edit must cite paper_refs (arxiv_ids) when
-    literature-grounded, or mark itself `novel.` and leave paper_refs empty.
+    preliminary result + KG context (top-KG_TOP_K union of
+    query_techniques(failure_modes ∪ descriptor-resolved FailureMode ids,
+    domain_filter=config.kg.environment_tag), an EVIDENCE-anchored
+    query_semantic(preliminary.evidence) when evidence is non-empty, and
+    the STATIC query_semantic(behavior_goal)) + original inputs +
+    reward_contract → proposed_edits. Every edit must cite paper_refs
+    (arxiv_ids) when literature-grounded, or mark itself `novel.` and
+    leave paper_refs empty. Kept refs are additionally annotated
+    `grounded=True/False`: True iff the arxiv_id was among the papers
+    THIS iteration's retrieved literature_context actually showed Claude
+    (vs. merely existing somewhere in the KG — the existence check alone
+    doesn't distinguish "shown" from "recalled").
+
+    NOTE on `query_semantic(behavior_goal)`: this query is STATIC per
+    stage (behavior_goal never changes across a stage's iterations), so
+    on its own it retrieves identical literature every call. The
+    evidence-anchored query above is what makes retrieval track what's
+    actually going wrong THIS iteration.
 
 Both calls use the registry model (`sculptor.llm.model_for("diagnose")`)
 with adaptive thinking, strict JSON via `messages.parse`, and one retry
@@ -72,6 +86,21 @@ class _PreliminaryModel(BaseModel):
     failure_modes: list[FailureModeLit] = Field(default_factory=list)
     evidence: str
     confidence: float = Field(ge=0.0, le=1.0)
+    #: §KG-retrieval fix 2: 2-4 short FREE-TEXT phrases naming the SPECIFIC
+    #: observed failure (e.g. "planks on forearms without leg drive") —
+    #: additive detail alongside `failure_modes`, which stays restricted to
+    #: the fixed six-plus-none vocabulary. Optional: absent or malformed
+    #: input (not a list, non-string entries, etc.) coerces to `[]` rather
+    #: than raising, so old cached/replayed preliminary responses (recorded
+    #: before this field existed) still parse.
+    failure_descriptors: list[str] = Field(default_factory=list)
+
+    @field_validator("failure_descriptors", mode="before")
+    @classmethod
+    def _coerce_failure_descriptors(cls, v):  # noqa: ANN001, ANN205
+        if not isinstance(v, list):
+            return []
+        return [str(x).strip() for x in v if isinstance(x, (str, int, float)) and str(x).strip()]
 
 
 class _ProposedEditModel(BaseModel):
@@ -169,6 +198,17 @@ class ProposedEdit:
     rationale: str
     suggested_value: str | None
     paper_refs: list[str] = field(default_factory=list)
+    #: §KG-retrieval fix 5: per-arxiv_id grounding annotation for the KEPT
+    #: `paper_refs` above — True iff that arxiv_id was among the papers
+    #: THIS iteration's retrieved literature_context actually showed
+    #: Claude, False if it's cited-and-exists-in-the-KG but wasn't shown
+    #: (Claude recalled it rather than being grounded on it this iter).
+    #: A separate dict (not a paper_refs shape change) because paper_refs
+    #: is consumed as a flat `list[str]` throughout edit.py/sculpt.py/
+    #: timelapse.py (KG-existence validation, citation joins, provenance
+    #: tracking) — changing its element type would ripple across all of
+    #: them for no behavioral gain.
+    paper_refs_grounded: dict[str, bool] = field(default_factory=dict)
     requires_env_extension: bool = False
 
     def to_dict(self) -> dict:
@@ -216,6 +256,12 @@ class Diagnosis:
                     "evidence": m.evidence,
                     "relevance_score": m.relevance_score,
                     "matched_on": m.matched_on,
+                    # §KG-retrieval fix 5: literature_context entries are,
+                    # by definition, RETRIEVED (shown to Claude this
+                    # iteration) — the uniform `grounded` field lets
+                    # downstream consumers treat this list and
+                    # proposed_edits[].paper_refs_grounded consistently.
+                    "grounded": True,
                 }
                 for m in self.literature_context
             ],
@@ -883,16 +929,38 @@ def diagnose(
             kg_matches: list[TechniqueMatch] = []
             case_context = ""
         else:
+            from sculptor.kg.query import DEFAULT_MIN_PROMPT_SIMILARITY
+
             fm_keywords = [fm for fm in preliminary.failure_modes if fm != "none"]
+
+            # §KG-retrieval fix 2: resolve this iter's free-text
+            # `failure_descriptors` onto FailureMode nodes via embedding
+            # similarity (complementing the fixed 6-value enum fuzzy
+            # resolution `_resolve_failure_modes` already does for
+            # `fm_keywords`). Guarded exactly like the semantic query
+            # below — a broken/missing embedder degrades to enum-only
+            # tag context, never fails the diagnose call.
+            extra_failure_ids: list[str] = []
+            if preliminary.failure_descriptors:
+                try:
+                    from sculptor.kg.query import resolve_failure_modes_semantic
+
+                    extra_failure_ids = resolve_failure_modes_semantic(
+                        store, preliminary.failure_descriptors)
+                except Exception as e:  # noqa: BLE001
+                    print(f"[diagnose] descriptor FailureMode resolution "
+                          f"failed ({e}) — enum-only tag context.",
+                          file=sys.stderr, flush=True)
+                    extra_failure_ids = []
+
             tag_matches = query_techniques(
                 fm_keywords, domain_filter=env_tag, top_k=KG_TOP_K, store=store,
-            ) if fm_keywords else []
+                extra_failure_node_ids=extra_failure_ids,
+            ) if (fm_keywords or extra_failure_ids) else []
             try:
                 # §Ship 31: floored — an unfloored semantic slice feeds
                 # tangential techniques into the grounded prompt and
                 # Claude dutifully cites them (Issue G).
-                from sculptor.kg.query import DEFAULT_MIN_PROMPT_SIMILARITY
-
                 sem_matches = query_semantic(
                     behavior_goal, top_k=KG_TOP_K, store=store,
                     min_similarity=DEFAULT_MIN_PROMPT_SIMILARITY)
@@ -901,9 +969,44 @@ def diagnose(
                       file=sys.stderr, flush=True)
                 sem_matches = []
 
+            # §KG-retrieval fix 1: the goal-anchored `sem_matches` query
+            # above is STATIC per stage (behavior_goal never changes
+            # across a stage's iterations), so on its own it retrieves
+            # identical literature every call. When stage-1 produced
+            # actual evidence prose, ALSO run a semantic query anchored
+            # on THIS iteration's evidence (+ failure-mode labels) so
+            # retrieval tracks what's actually going wrong this iter.
+            # Empty/whitespace evidence keeps behavior byte-identical to
+            # before this fix (no extra query, no extra log record).
+            evidence_matches: list[TechniqueMatch] = []
+            _evidence_text = (preliminary.evidence or "").strip()
+            _evidence_query = ""
+            if _evidence_text:
+                _evidence_query = _evidence_text[:400]
+                if fm_keywords:
+                    _evidence_query += " | " + ", ".join(fm_keywords)
+                try:
+                    evidence_matches = query_semantic(
+                        _evidence_query, top_k=KG_TOP_K, store=store,
+                        min_similarity=DEFAULT_MIN_PROMPT_SIMILARITY)
+                    for m in evidence_matches:
+                        # Distinguishes these hits from the static goal
+                        # query in the rendered prompt / retrieval log —
+                        # ranking/merge logic doesn't depend on this tag.
+                        m.matched_on = ["semantic_evidence"]
+                except Exception as e:  # noqa: BLE001
+                    print(f"[diagnose] evidence-anchored semantic query "
+                          f"failed ({e}) — goal/tag context only.",
+                          file=sys.stderr, flush=True)
+                    evidence_matches = []
+
+            # Merge order: EVIDENCE-QUERY HITS FIRST (this iter's specific
+            # failure), then tag hits (enum + descriptor FailureModes),
+            # then the static goal hits — deduped by technique id,
+            # truncated to KG_TOP_K total (unchanged).
             seen: set[str] = set()
             kg_matches = []
-            for m in tag_matches + sem_matches:
+            for m in evidence_matches + tag_matches + sem_matches:
                 if m.technique.id in seen:
                     continue
                 seen.add(m.technique.id)
@@ -920,6 +1023,23 @@ def diagnose(
 
             log_retrieval(
                 "diagnose", behavior_goal, kg_matches, out_dir=iter_dir)
+            if _evidence_text:
+                log_retrieval(
+                    decision="diagnose_evidence", query=_evidence_query,
+                    matches=evidence_matches, out_dir=iter_dir)
+            if extra_failure_ids:
+                # Records the descriptor text as the query and the
+                # resolved FailureMode NODES as matches (log_retrieval's
+                # `_extract_match` falls back to `.id` for anything
+                # without `.technique`/`.case`, which a FailureMode has).
+                _fm_nodes = [
+                    n for n in (store.get_node(nid) for nid in extra_failure_ids)
+                    if n is not None
+                ]
+                log_retrieval(
+                    decision="diagnose_descriptors",
+                    query=" | ".join(preliminary.failure_descriptors),
+                    matches=_fm_nodes, out_dir=iter_dir)
 
             # §Ship 37: case-memory — this system's OWN past runs on similar
             # tasks/failures (what was tried + whether it helped), additive to
@@ -995,6 +1115,18 @@ def diagnose(
                 "dropped": _dropped_refs,
                 "reason": "cited arxiv_id not present in the KG",
             }, default=str), flush=True)
+
+        # §KG-retrieval fix 5: citation grounding annotation. A KEPT
+        # paper_ref (survived the existence check above) is `grounded`
+        # iff its arxiv_id is among the papers THIS iteration's retrieved
+        # literature_context (`kg_matches`) actually showed Claude —
+        # False means it exists in the KG but Claude recalled it rather
+        # than being shown it (still a valid, kept citation).
+        _retrieved_arxiv_ids: set[str] = set()
+        for m in kg_matches:
+            for pid in (m.source_paper_ids or []):
+                if isinstance(pid, str) and pid.startswith("paper:"):
+                    _retrieved_arxiv_ids.add(pid[len("paper:"):])
     finally:
         if owns_store and store is not None:
             store.close()
@@ -1010,6 +1142,9 @@ def diagnose(
                 rationale=e.rationale,
                 suggested_value=e.suggested_value,
                 paper_refs=list(e.paper_refs),
+                paper_refs_grounded={
+                    aid: (aid in _retrieved_arxiv_ids) for aid in e.paper_refs
+                },
                 # BUG FIX (2026-07-04, found during env generalization
                 # 3/4): the flag was silently dropped here since Ship 48
                 # — deferred edits lost requires_env_extension on the

@@ -476,6 +476,11 @@ class StageIterPaperRef(BaseModel):
     arxiv_id: Optional[str] = None
     citation: Optional[str] = None
     description: Optional[str] = None
+    # True: retrieved from the KG this iteration. False: the diagnoser
+    # cited it from recall (it exists in the KG but wasn't fetched this
+    # iter). None: unknown — either the diagnoser didn't tag it, or this
+    # is an old diagnosis.json written before grounding tags existed.
+    grounded: Optional[bool] = None
 
 
 class StageIterDetail(BaseModel):

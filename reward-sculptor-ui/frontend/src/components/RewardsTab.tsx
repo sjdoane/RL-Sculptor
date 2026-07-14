@@ -695,11 +695,22 @@ function WhyThisEditPanel({ slug, version, stageScope }: { slug: string; version
                         </div>
                         <p className="rs-sub" style={{ margin: "6px 0 0", lineHeight: 1.5, fontSize: 12.5 }}>{e.rationale}</p>
                         {e.paper_refs && e.paper_refs.length > 0 && (
-                          <div className="rs-flex rs-wrap rs-gap-6" style={{ marginTop: 6 }}>
+                          <div className="rs-flex rs-wrap rs-gap-6" style={{ marginTop: 6, alignItems: "center" }}>
                             {e.paper_refs.map((aid) => (
-                              <a key={aid} href={`https://arxiv.org/abs/${aid}`} target="_blank" rel="noreferrer noopener" className="rs-tag mono" style={{ fontSize: 10, color: "var(--ink)" }}>
-                                {aid}<Icon name="external" size={11} />
-                              </a>
+                              <span key={aid} className="rs-flex rs-gap-4" style={{ alignItems: "center" }}>
+                                <a href={`https://arxiv.org/abs/${aid}`} target="_blank" rel="noreferrer noopener" className="rs-tag mono" style={{ fontSize: 10, color: "var(--ink)" }}>
+                                  {aid}<Icon name="external" size={11} />
+                                </a>
+                                {e.paper_refs_grounded?.[aid] === false && (
+                                  <span
+                                    className="rs-badge amber"
+                                    style={{ fontSize: 9.5 }}
+                                    title="cited by the model but not retrieved from the knowledge graph this iteration"
+                                  >
+                                    model-recalled
+                                  </span>
+                                )}
+                              </span>
                             ))}
                           </div>
                         )}

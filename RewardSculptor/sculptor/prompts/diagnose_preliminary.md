@@ -73,9 +73,20 @@ Identify failure modes from this FIXED vocabulary:
   - component_imbalance   — components fight: one term's optimum hurts another
   - none                  — no diagnosable pathology
 
+The `failure_modes` list above MUST stay restricted to this fixed
+six-plus-none vocabulary — it feeds a graph-walk query that only knows
+these labels. Separately, also fill `failure_descriptors`: 2-4 SHORT
+free-text phrases naming the SPECIFIC observed failure in your own words
+(e.g. "planks on forearms without leg drive", "hops sideways instead of
+forward"). These are additional detail, not a replacement for the coarse
+vocab above — they let literature retrieval find techniques matched to
+what's actually happening this iteration, not just the coarse category.
+
 Return strict JSON matching the provided schema:
   { "failure_modes": [<one or more strings from the vocab>],
     "evidence": "<2-4 sentences citing specific numbers from the inputs>",
+    "failure_descriptors": [<2-4 short free-text phrases naming the
+      SPECIFIC observed failure — NOT vocab words, see above>],
     "confidence": <float in [0, 1]> }
 
 No prose outside JSON. If multiple failure modes apply, list the strongest

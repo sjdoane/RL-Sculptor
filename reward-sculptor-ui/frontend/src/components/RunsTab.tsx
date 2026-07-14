@@ -1323,6 +1323,15 @@ function StageIterDetailCard({
                   </a>
                 )}
                 <span>{p.citation ?? p.description ?? "(untitled reference)"}</span>
+                {p.grounded === false && (
+                  <span
+                    className="rs-badge amber"
+                    style={{ fontSize: 9.5, marginLeft: 6 }}
+                    title="cited by the model but not retrieved from the knowledge graph this iteration"
+                  >
+                    model-recalled
+                  </span>
+                )}
                 {p.citation && p.description && p.description !== p.citation && (
                   <span className="rs-sub" style={{ display: "block", fontSize: 11 }}>{p.description}</span>
                 )}

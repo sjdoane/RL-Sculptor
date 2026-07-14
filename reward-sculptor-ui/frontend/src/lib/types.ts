@@ -718,6 +718,12 @@ export interface RewardDiagnosisPayload {
     rationale: string;
     suggested_value?: string | null;
     paper_refs?: string[];
+    // Per-arxiv_id grounding for `paper_refs` above: true if the KG
+    // actually showed that paper to the diagnoser this iteration,
+    // false if it was cited from recall (exists in the KG, not
+    // retrieved this iter). A key missing from this map (including on
+    // diagnosis.json files predating the tag) means unknown, not false.
+    paper_refs_grounded?: Record<string, boolean> | null;
     requires_env_extension?: boolean;
   }>;
   literature_context?: Array<{
@@ -725,6 +731,10 @@ export interface RewardDiagnosisPayload {
     description: string;
     paper_citation: string;
     relevance_score: number;
+    // literature_context is, by construction, what the KG retrieved and
+    // showed the diagnoser this iteration — true for current writers;
+    // absent on diagnoses predating the tag.
+    grounded?: boolean;
   }>;
   confidence?: number;
   iter_dir?: string | null;
@@ -1090,6 +1100,10 @@ export interface StageIterPaperRef {
   arxiv_id?: string | null;
   citation?: string | null;
   description?: string | null;
+  // true: retrieved from the KG this iteration. false: cited by the
+  // diagnoser from recall (exists in the KG but wasn't retrieved this
+  // iter). null/undefined: unknown, or predates the grounding tag.
+  grounded?: boolean | null;
 }
 export interface StageIterDetail {
   iter_index: number;
