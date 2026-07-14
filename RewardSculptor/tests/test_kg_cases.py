@@ -542,6 +542,48 @@ def test_helped_iter_increments_outcome_stats_for_its_failure_mode(tmp_path) -> 
     assert fetched.useful_citations == 1
 
 
+def test_record_run_cases_rerun_does_not_double_count(tmp_path) -> None:
+    """§KG-retrieval fix 4 idempotency: a resumed/re-run stage re-reports the
+    same physical iterations through record_run_cases. The case node is
+    upserted, but the cumulative counters (outcome_stats, useful_citations)
+    must fire exactly once per case id — both with an explicit nonce and
+    with the iter_dir-derived deterministic nonce."""
+    store = SculptorKG(tmp_path / "kg.db")
+    paper = Paper(id=make_paper_id("1707.06347"), arxiv_id="1707.06347", title="PPO")
+    tech = Technique(id=make_technique_id("rsi"), name="rsi")
+    store.add_node(paper)
+    store.add_node(tech)
+    store.add_edge(Edge(src=paper.id, dst=tech.id, relation=Relation.INTRODUCES))
+
+    runs_root = tmp_path / "runs"
+    o0 = _outcome(0, ["reward_hacking"])
+    o0.iter_dir = runs_root / "iter_0"
+    o1 = _outcome(1, [])
+    o1.iter_dir = runs_root / "iter_1"
+    result = types.SimpleNamespace(
+        completed_iters=[o0, o1],
+        fitness_history=[0.2, 0.5],  # iter0 delta +0.3 -> helped
+    )
+    refs = {0: ["1707.06347"]}
+    fm_id = make_failure_mode_id("reward_hacking")
+
+    # No explicit nonce: derived from the runs root, so both calls agree.
+    C.record_run_cases(store, task="kick", result=result, iter_references=refs)
+    C.record_run_cases(store, task="kick", result=result, iter_references=refs)
+    fetched = store.get_node(tech.id)
+    assert fetched.outcome_stats == {fm_id: {"helped": 1, "regressed": 0}}
+    assert fetched.useful_citations == 1
+
+    # Explicit nonce re-run over the same ids: still counted once.
+    C.record_run_cases(
+        store, task="kick2", result=result, nonce="fixed", iter_references=refs)
+    C.record_run_cases(
+        store, task="kick2", result=result, nonce="fixed", iter_references=refs)
+    fetched = store.get_node(tech.id)
+    assert fetched.outcome_stats == {fm_id: {"helped": 2, "regressed": 0}}
+    assert fetched.useful_citations == 2
+
+
 def test_regressed_iter_increments_outcome_stats_but_not_useful_citations(
     tmp_path,
 ) -> None:

@@ -26,8 +26,10 @@ generic JSON and the embedding table already exists.
 
 from __future__ import annotations
 
+import hashlib
 import uuid
 from dataclasses import dataclass
+from pathlib import Path
 
 from sculptor.kg.query import EMBEDDING_MODEL, _embed_text, _get_embedder
 from sculptor.kg.schema import (
@@ -134,9 +136,22 @@ def record_run_cases(
 
     Best-effort and additive — callers wrap this so a logging failure can
     never affect a run. Returns the number of cases written."""
-    nonce = nonce or uuid.uuid4().hex[:8]
     iter_references = iter_references or {}
     iters = list(getattr(result, "completed_iters", []) or [])
+    # §KG-retrieval fix 4 idempotency: a resumed/re-run stage re-reports the
+    # SAME physical iter dirs through this tail; a random nonce would mint a
+    # new case id each time and the cumulative counters below would
+    # double-count. Derive the nonce from the run's on-disk identity (the
+    # runs root) so the same physical iteration always maps to the same
+    # case id, and gate the counter increments on that id not existing yet.
+    if nonce is None:
+        _first_dir = getattr(iters[0], "iter_dir", None) if iters else None
+        if _first_dir is not None:
+            nonce = hashlib.sha1(
+                str(Path(_first_dir).resolve().parent).encode("utf-8")
+            ).hexdigest()[:8]
+        else:
+            nonce = uuid.uuid4().hex[:8]
     fits = list(getattr(result, "fitness_history", []) or [])
     progs = list(getattr(result, "progress_history", []) or [])
     written = 0
@@ -210,8 +225,12 @@ def record_run_cases(
         reward_version = (
             str(reward_path_trained.stem) if reward_path_trained else None)
         env_spec_version = getattr(outcome, "env_spec_trained", None)
+        case_id = make_run_case_id(task, iter_index, nonce)
+        # Counters below are cumulative — they must fire exactly once per
+        # case id; the node itself is upserted (refresh) either way.
+        already_recorded = store.has_node(case_id)
         case = RunCase(
-            id=make_run_case_id(task, iter_index, nonce),
+            id=case_id,
             task=task, robot=robot, symptom=symptom, failure_modes=fms,
             edit_summary=edit_summary,
             fitness_before=cur, fitness_after=nxt, fitness_delta=delta,
@@ -236,7 +255,7 @@ def record_run_cases(
         # helped THIS failure mode outranks one that only ever regressed
         # it, independent of the unscoped `useful_citations` count above).
         # "unknown"/"neutral" iterations touch neither counter.
-        if verdict in ("helped", "regressed"):
+        if verdict in ("helped", "regressed") and not already_recorded:
             fm_ids_for_stats = [make_failure_mode_id(fm) for fm in fms]
             for arxiv_id in iter_references.get(iter_index, []) or []:
                 paper_id = make_paper_id(str(arxiv_id))

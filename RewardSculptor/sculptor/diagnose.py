@@ -534,7 +534,9 @@ def _stale_uncited_technique_ids(
     if not objective_progress:
         return set()
     delta = objective_progress.get("delta")
-    if delta is None or delta > 0:
+    # Non-numeric delta (malformed progress dict) must read as "not stuck",
+    # not raise out of the unguarded diagnose call.
+    if not isinstance(delta, (int, float)) or isinstance(delta, bool) or delta > 0:
         return set()
     name = iter_dir.name
     if not name.startswith("iter_"):
