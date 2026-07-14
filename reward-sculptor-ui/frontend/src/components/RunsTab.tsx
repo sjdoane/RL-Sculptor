@@ -17,9 +17,11 @@ import { usePolicies } from "@/hooks/usePolicies";
 import { useControlRun, useKillRun, useProjectIterations, useRun, useRuns } from "@/hooks/useRuns";
 import {
   ApiError, getMission, getStageIterDetail, getStageObjectiveMetric,
-  policyExportUrl, projectIterRolloutUrl, stageRolloutUrl,
+  policyExportUrl, projectIterRolloutUrl, stageCheckpointUrl, stageExportUrl,
+  stageRolloutUrl,
 } from "@/lib/api";
 import { qk } from "@/lib/queryKeys";
+import { formatIterMetrics, selectionLabel, selectionSentence } from "@/lib/selection";
 import { failureReasonText, stageLabel, supersededText } from "@/lib/stageDisplay";
 import { formatRelative, sanitizeConsoleText } from "@/lib/utils";
 import type {
@@ -635,6 +637,7 @@ function StageDetailPane({
             row={r}
             selected={activeIter === r.iter_index}
             kept={stage?.selected_iter_index === r.iter_index}
+            selectionSource={stage?.selection_source}
             onSelect={() => setPicked(r.iter_index)}
           />
         ))}
@@ -706,6 +709,29 @@ function StageDetailPane({
         ) : activeIter != null ? (
           <p className="rs-sub" style={{ margin: "0 16px 12px", fontSize: 11 }}>iter {activeIter} has no rollout video.</p>
         ) : null}
+
+        {/* §UX honesty pass: export reachable whenever the selected
+            iteration has a checkpoint — independent of has_rollout. */}
+        {activeIter != null && activeRow?.has_checkpoint && (
+          <div className="rs-flex rs-gap-8" style={{ margin: "0 16px 12px" }}>
+            <a
+              href={stageExportUrl(slug, missionSlug, stageName, activeIter)}
+              download
+              className="rs-btn rs-btn-quiet rs-btn-xs"
+              title="Download the deployment bundle: checkpoint + ONNX + TorchScript + reward/env spec + DEPLOY.md (builds server-side, may take a moment)"
+            >
+              <Icon name="package" size={13} />Export bundle
+            </a>
+            <a
+              href={stageCheckpointUrl(slug, missionSlug, stageName, activeIter)}
+              download
+              className="rs-btn rs-btn-quiet rs-btn-xs"
+              title="Download the raw checkpoint file only"
+            >
+              <Icon name="download" size={13} />raw .pt
+            </a>
+          </div>
+        )}
 
         {/* §narrate-completed-stage: per-iteration score/reasoning/papers
             for whichever iter is selected on the left. */}
@@ -1171,8 +1197,17 @@ function formatContradictionTooltip(
 }
 
 function StageIterCard({
-  row, selected, kept, onSelect,
-}: { row: StageIteration; selected: boolean; kept: boolean; onSelect: () => void }) {
+  row, selected, kept, selectionSource, onSelect,
+}: {
+  row: StageIteration;
+  selected: boolean;
+  kept: boolean;
+  /** §UX honesty pass: `stage.selection_source` — carries WHY this
+   *  iteration was kept, so the badge isn't a bare unexplained "kept". */
+  selectionSource?: string | null;
+  onSelect: () => void;
+}) {
+  const m = formatIterMetrics(row);
   return (
     <button
       className={"rs-itercard" + (selected ? " on" : "")}
@@ -1181,16 +1216,23 @@ function StageIterCard({
     >
       <div className="rs-itercard-top">
         <span className="it">iter {row.iter_index}</span>
-        {typeof row.fitness === "number" ? (
-          <span className="rs-num" style={{ fontSize: 15, fontWeight: 600, color: "#b9aef5" }}>fit {row.fitness.toFixed(2)}</span>
-        ) : row.primary_metric !== null ? (
-          <span className="rs-num" style={{ fontSize: 13 }}>{row.primary_metric.toFixed(1)}</span>
-        ) : null}
+        <span style={{ display: "flex", alignItems: "baseline", gap: 6 }}>
+          {m.fitnessText && (
+            <span className="rs-num" style={{ fontSize: 15, fontWeight: 600, color: "#b9aef5" }}>{m.fitnessText}</span>
+          )}
+          {m.rewardText && (
+            <span className="rs-num" style={{ fontSize: m.fitnessText ? 11 : 13, color: m.fitnessText ? "var(--rs-muted)" : undefined }} title={m.rewardTitle}>{m.rewardText}</span>
+          )}
+        </span>
       </div>
       <span className="rs-flex rs-gap-6" style={{ marginTop: 4 }}>
         {row.has_rollout && <Icon name="video" size={11} color="var(--rs-muted)" />}
         {row.reward_version && <span className="rs-sub" style={{ fontSize: 10.5 }}>reward {row.reward_version}</span>}
-        {kept && <span className="rs-badge emerald" style={{ fontSize: 8.5 }}><Icon name="check" size={9} />kept</span>}
+        {kept && (
+          <span className="rs-badge emerald" style={{ fontSize: 8.5 }} title={selectionSentence(selectionSource)}>
+            <Icon name="check" size={9} />kept · {selectionLabel(selectionSource)}
+          </span>
+        )}
         {row.fitness_contradiction && (
           <span
             className="rs-badge rose"
@@ -1659,7 +1701,9 @@ function IterationTimeline({ iters, selected, onSelect }: { iters: IterEventSumm
                 )}
               </span>
             ) : (
-              it.primary_metric !== null && <span className="rs-num" style={{ fontSize: 13 }}>{it.primary_metric.toFixed(1)}</span>
+              it.primary_metric !== null && (
+                <span className="rs-num" title="reward metric — no objective fitness tracked this iter" style={{ fontSize: 13 }}>r {it.primary_metric.toFixed(1)}</span>
+              )
             )}
           </div>
           {it.status === "running" && typeof it.rl_total === "number" && it.rl_total > 0 && (

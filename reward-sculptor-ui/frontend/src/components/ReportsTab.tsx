@@ -18,6 +18,7 @@ import {
   stageRolloutUrl,
 } from "@/lib/api";
 import { qk } from "@/lib/queryKeys";
+import { formatIterMetrics, selectionLabel, selectionSentence } from "@/lib/selection";
 import { stageLabel } from "@/lib/stageDisplay";
 import type { SelectedStage, StageIteration, StageSchema } from "@/lib/types";
 
@@ -283,6 +284,17 @@ export function ReportsTab({
     staleTime: 10_000,
   });
 
+  // §UX honesty pass: mission-quality telemetry is only overwritten when a
+  // mission run ENDS (see MissionQualityRecord's recorded_at) — while a
+  // mission is actively training, these numbers are silently stale from
+  // its previous run. Surface that instead of letting a live badge read
+  // as current.
+  const liveQualityMissionSlugs = useMemo(
+    () => new Set((missions.data ?? []).filter((m) => m.lifecycle === "running").map((m) => m.mission_slug)),
+    [missions.data],
+  );
+  const qualityHasLiveMission = (quality.data ?? []).some((m) => liveQualityMissionSlugs.has(m.mission_slug));
+
   const hasReport = (md.data ?? "").trim().length > 0;
   const base = reportBase(slug, source);
   const mp4Url = `${base}/final.mp4`;
@@ -395,6 +407,11 @@ export function ReportsTab({
                 decomposition telemetry
               </span>
             </div>
+            {qualityHasLiveMission && (
+              <p className="rs-sub" style={{ margin: 0, padding: "8px 16px 0", fontSize: 11.5 }}>
+                A run is live — these numbers are from the previous run and refresh when the run ends.
+              </p>
+            )}
             <div className="rs-card-pad rs-vgap-8">
               {quality.data!.map((m) => (
                 <div
@@ -641,8 +658,8 @@ function StageCheckpointsCard({
       ) : (
         <div className="rs-card-pad rs-vgap-8">
           {stage?.selection_source && selectedIter != null && (
-            <p className="rs-sub" style={{ margin: "0 0 4px", fontSize: 11.5 }}>
-              kept iter <b className="mono">{selectedIter}</b> as the stage's policy — {stage.selection_source}
+            <p className="rs-sub" style={{ margin: "0 0 4px", fontSize: 11.5 }} title={selectionSentence(stage.selection_source)}>
+              kept iter <b className="mono">{selectedIter}</b> as the stage's policy — {selectionLabel(stage.selection_source)}
             </p>
           )}
           {rows.map((it) => {
@@ -666,14 +683,18 @@ function StageCheckpointsCard({
                     reward {it.reward_version}
                   </span>
                 )}
-                {it.fitness != null ? (
-                  <span className="rs-num" title="objective fitness (0-1)">fit {it.fitness.toFixed(2)}</span>
-                ) : it.primary_metric != null ? (
-                  <span className="rs-num" title="mean return">{it.primary_metric.toFixed(1)}</span>
-                ) : null}
+                {(() => {
+                  const m = formatIterMetrics(it);
+                  return (
+                    <>
+                      {m.fitnessText && <span className="rs-num" title="objective fitness (0-1)">{m.fitnessText}</span>}
+                      {m.rewardText && <span className="rs-num" style={{ opacity: m.fitnessText ? 0.7 : 1 }} title={m.rewardTitle}>{m.rewardText}</span>}
+                    </>
+                  );
+                })()}
                 {isSelected && (
-                  <span className="rs-tag" style={{ fontSize: 10, color: "var(--st-emerald)" }} title={stage?.selection_source ?? undefined}>
-                    kept
+                  <span className="rs-tag" style={{ fontSize: 10, color: "var(--st-emerald)" }} title={selectionSentence(stage?.selection_source)}>
+                    kept · {selectionLabel(stage?.selection_source)}
                   </span>
                 )}
                 <span style={{ marginLeft: "auto" }} className="rs-flex rs-gap-8" title={

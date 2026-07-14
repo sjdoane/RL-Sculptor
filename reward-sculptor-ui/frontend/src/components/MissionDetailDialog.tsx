@@ -16,9 +16,10 @@ import { useJob } from "@/hooks/useJob";
 import { RunMissionDialog } from "@/components/RunMissionDialog";
 import { ReferencePickerDialog } from "@/components/ReferencePickerDialog";
 import { useMissionEvents } from "@/hooks/useMissionEvents";
-import { ApiError, stageRolloutUrl } from "@/lib/api";
+import { ApiError, stageCheckpointUrl, stageExportUrl, stageRolloutUrl } from "@/lib/api";
 import { qk } from "@/lib/queryKeys";
 import { useQueryClient } from "@tanstack/react-query";
+import { formatIterMetrics, selectionLabel, selectionSentence } from "@/lib/selection";
 import { failureReasonText, stageLabel, supersededText } from "@/lib/stageDisplay";
 import { formatRelative } from "@/lib/utils";
 import type {
@@ -104,6 +105,25 @@ export function MissionDetailDialog({
     [mission?.stages],
   );
 
+  // §UX honesty pass: "N/M stages" in the header used to mean current_
+  // stage_idx/n_stages — a live-run pointer, not a completion count, so a
+  // mission with 5 stages and 1 failure read as "5/5 stages" once the
+  // pointer walked off the end. Derive an actual succeeded/total count
+  // from stage statuses instead. Superseded stages (replanned away) are
+  // excluded from the denominator; sub-stages are counted (mission.stages
+  // already includes them, unfiltered). null until the detail loads.
+  const stageCounts = useMemo(() => {
+    if (!mission?.stages) return null;
+    let succeeded = 0, pending = 0, failed = 0, superseded = 0;
+    for (const s of mission.stages) {
+      if (s.status === "succeeded") succeeded++;
+      else if (s.status === "failed") failed++;
+      else if (s.status === "superseded") superseded++;
+      else pending++; // pending | training | skipped
+    }
+    return { succeeded, pending, failed, superseded, total: succeeded + pending + failed };
+  }, [mission?.stages]);
+
   // §Ship-19c: derive per-stage iter history from the WS structured-
   // event stream. iter_started / iter_completed / rollout_done events
   // fire from inside each stage's sculpt_run subprocess; they don't
@@ -148,9 +168,20 @@ export function MissionDetailDialog({
       title={liveSummary?.goal ?? "Mission"}
       subtitle={
         <span style={{ display: "inline-flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-          <span className="mono">
+          <span
+            className="mono"
+            title={
+              stageCounts
+                ? `succeeded ${stageCounts.succeeded} · pending ${stageCounts.pending} · failed ${stageCounts.failed} · superseded ${stageCounts.superseded}`
+                : undefined
+            }
+          >
             {liveSummary
-              ? `${liveSummary.mission_slug} · ${liveSummary.current_stage_idx}/${liveSummary.n_stages} stages · created ${formatRelative(liveSummary.created_at)}`
+              ? `${liveSummary.mission_slug} · ${
+                  stageCounts
+                    ? `${stageCounts.succeeded}/${stageCounts.total} stages succeeded`
+                    : `${liveSummary.current_stage_idx}/${liveSummary.n_stages} stages`
+                } · created ${formatRelative(liveSummary.created_at)}`
               : "Loading…"}
           </span>
           {liveSummary && <MissionLifecycleBadge lifecycle={liveSummary.lifecycle} />}
@@ -738,6 +769,11 @@ function StageCard({
   const itersTooltip = overrideActive
     ? `Claude allocated ${stage.max_iterations} rounds; this run capped at ${effective}.`
     : undefined;
+  // §UX honesty pass: a stage reset to "pending" for redecomposition/
+  // re-run still carries its PRIOR attempt's rounds/best_metric until
+  // the next run overwrites them — without a marker it reads as "half
+  // trained then abandoned" instead of "about to run again".
+  const isStaleAttempt = stage.status === "pending" && stage.iterations_used > 0;
   return (
     <div
       style={{
@@ -834,8 +870,14 @@ function StageCard({
           {overrideActive && (
             <span aria-hidden="true" style={{ marginLeft: 2, color: "var(--st-amber)" }}>*</span>
           )}
+          {isStaleAttempt && <span style={{ fontStyle: "italic", opacity: 0.8 }}> (from a previous attempt)</span>}
         </span>
-        {stage.best_metric != null && <span>best metric {stage.best_metric.toFixed(3)}</span>}
+        {stage.best_metric != null && (
+          <span title="mean return under this stage's own reward — scales are not comparable across stages; see objective fitness for cross-stage comparison">
+            best reward {stage.best_metric.toFixed(3)}
+            {isStaleAttempt && <span style={{ fontStyle: "italic", opacity: 0.8 }}> (from a previous attempt)</span>}
+          </span>
+        )}
         {stage.kg_seed_papers.length > 0 && <span>kg refs {stage.kg_seed_papers.length}</span>}
       </div>
       {iters.length > 0 && <IterRibbon iters={iters} />}
@@ -844,19 +886,6 @@ function StageCard({
 }
 
 // ── Stage panel (de-siloed disk view) ────────────────────────────────
-// Labels for the KEPT iteration by how selection chose it.
-const SELECTION_LABEL: Record<string, string> = {
-  "criterion+fitness": "best passing iter",
-  criterion_newest: "newest passing iter",
-  fitness_fallback: "best fitness (criterion unmet)",
-  last: "last iter",
-};
-
-function selectionLabel(source: string | null | undefined): string {
-  if (!source) return "kept";
-  return `kept — ${SELECTION_LABEL[source] ?? source}`;
-}
-
 /** Expanded, disk-truth view of one stage: its iterations (independent
  *  of live scope), a rollout player for the picked iter, an RSI chip
  *  when reference-state-init was applied, and a deep-link to the stage's
@@ -972,6 +1001,30 @@ function StagePanel({
             </p>
           ) : null}
 
+          {/* §UX honesty pass: export reachable whenever the picked
+              iteration has a checkpoint — independent of whether a
+              rollout exists (a checkpoint can land before/without one). */}
+          {activeIter != null && activeRow?.has_checkpoint && (
+            <div className="rs-flex rs-gap-8">
+              <a
+                href={stageExportUrl(slug, missionSlug, stage.name, activeIter)}
+                download
+                className="rs-btn rs-btn-quiet rs-btn-xs"
+                title="Download the deployment bundle: checkpoint + ONNX + TorchScript + reward/env spec + DEPLOY.md (builds server-side, may take a moment)"
+              >
+                <Icon name="package" size={13} />Export bundle
+              </a>
+              <a
+                href={stageCheckpointUrl(slug, missionSlug, stage.name, activeIter)}
+                download
+                className="rs-btn rs-btn-quiet rs-btn-xs"
+                title="Download the raw checkpoint file only"
+              >
+                <Icon name="download" size={13} />raw .pt
+              </a>
+            </div>
+          )}
+
           {/* Iteration chips — click to switch the rollout; the kept one
               carries a labelled badge. */}
           <div role="list" aria-label="Stage iterations" className="rs-flex rs-wrap rs-gap-6">
@@ -1003,21 +1056,30 @@ function StagePanel({
                   }}
                 >
                   <span style={{ fontWeight: 600 }}>iter {r.iter_index}</span>
-                  {r.fitness != null ? (
-                    <span style={{ color: "var(--rs-muted)" }} title="objective fitness (0-1)">fit {r.fitness.toFixed(2)}</span>
-                  ) : r.primary_metric != null ? (
-                    <span style={{ color: "var(--rs-muted)" }} title="primary metric">{r.primary_metric.toFixed(1)}</span>
-                  ) : (
-                    <span style={{ color: "var(--rs-muted)" }}>—</span>
-                  )}
+                  {(() => {
+                    const m = formatIterMetrics(r);
+                    if (!m.fitnessText && !m.rewardText) {
+                      return <span style={{ color: "var(--rs-muted)" }}>—</span>;
+                    }
+                    return (
+                      <>
+                        {m.fitnessText && (
+                          <span style={{ color: "var(--rs-muted)" }} title="objective fitness (0-1)">{m.fitnessText}</span>
+                        )}
+                        {m.rewardText && (
+                          <span style={{ color: "var(--rs-muted)", opacity: m.fitnessText ? 0.7 : 1 }} title={m.rewardTitle}>{m.rewardText}</span>
+                        )}
+                      </>
+                    );
+                  })()}
                   {r.has_rollout && <Icon name="video" size={10} color="var(--rs-muted)" />}
                   {isKept && (
                     <span
                       className="rs-badge emerald"
                       style={{ fontSize: 8.5, padding: "0 4px" }}
-                      title={selectionLabel(stage.selection_source)}
+                      title={selectionSentence(stage.selection_source)}
                     >
-                      <Icon name="check" size={9} />{selectionLabel(stage.selection_source)}
+                      <Icon name="check" size={9} />kept — {selectionLabel(stage.selection_source)}
                     </span>
                   )}
                 </button>

@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useQueries } from "@tanstack/react-query";
 import { toast } from "sonner";
 
 import { Icon } from "@/components/rs/icon";
@@ -7,10 +8,14 @@ import { useProjectPreview } from "@/hooks/useProjectPreview";
 import { useMission, useMissions, useStageIterations } from "@/hooks/useMissions";
 import { useRunEvents } from "@/hooks/useRunEvents";
 import { useRuns } from "@/hooks/useRuns";
-import { clipUrl, iterRolloutUrl, previewUrl, projectIterRolloutUrl, stageRolloutUrl } from "@/lib/api";
+import {
+  clipUrl, getStageIterations, iterRolloutUrl, previewUrl, projectIterRolloutUrl,
+  stageExportUrl, stageRolloutUrl,
+} from "@/lib/api";
+import { qk } from "@/lib/queryKeys";
 import { failureReasonText, stageLabel, supersededText } from "@/lib/stageDisplay";
 import type {
-  CameraAngle, MissionSummary, RunSummary, SelectedStage, StageSchema,
+  CameraAngle, MissionSummary, RunSummary, SelectedStage, StageIteration, StageSchema,
 } from "@/lib/types";
 import { CAMERA_ANGLES } from "@/lib/types";
 
@@ -115,6 +120,16 @@ export function RobotViewer({
   }, [selectedStage, setSelectedStage, missionActive, missionDetail.data]);
 
   const showStagePicker = !!missionSlugForPicker && (missionDetail.data?.stages.length ?? 0) > 1;
+  // §UX honesty pass (Replay stage nav): whether ANY iteration has a
+  // rollout on disk, per stage — used to disable (not hide) picker chips
+  // for stages that haven't produced a rollout yet, instead of omitting
+  // them (a stage with zero runs is still real curriculum the user should
+  // be able to see and pick, just not play). Shares the useStageIterations
+  // query cache/key, so this doesn't duplicate the fetch for whichever
+  // stage is already the active selection.
+  const rolloutAvailability = useStageRolloutAvailability(
+    slug, missionSlugForPicker, missionDetail.data?.stages ?? [],
+  );
 
   // §Ship de-silo: an explicit stage selection always wins EXCEPT while
   // that exact stage is the one actively training right now — in which
@@ -130,6 +145,13 @@ export function RobotViewer({
     liveRun.mission_slug === selectedStage?.missionSlug &&
     liveRun.stage_name === selectedStage?.stageName;
   const liveModeSelectsStage = !!selectedStage && !selectionIsLiveStage;
+  // §UX honesty pass (Replay stage nav): Replay becomes stage-navigable
+  // under the same "does this project have mission stages" condition Live
+  // uses (`showStagePicker`) — plain (non-mission) projects keep the
+  // original ReplayLayer, scoped to the most recent/active run.
+  const replayModeSelectsStage =
+    mode === "replay" && showStagePicker && !!selectedStage &&
+    selectedStage.missionSlug === missionSlugForPicker;
 
   return (
     <div className="rs-viewer">
@@ -141,7 +163,7 @@ export function RobotViewer({
         </div>
         <ModeSwitcher mode={mode} onPick={pickMode} hasReplay={!!replayRun} hasLive={!!liveRunId} />
       </div>
-      {showStagePicker && setSelectedStage && mode === "live" && (
+      {showStagePicker && setSelectedStage && (mode === "live" || mode === "replay") && (
         <>
           <div className="rs-stage-divider" />
           <StagePicker
@@ -149,6 +171,7 @@ export function RobotViewer({
             stages={missionDetail.data?.stages ?? []}
             selectedStageName={selectedStage?.missionSlug === missionSlugForPicker ? selectedStage.stageName : null}
             liveStageName={missionActive ? liveRun?.stage_name ?? null : null}
+            rolloutAvailability={rolloutAvailability}
             onPick={(stageName) => setSelectedStage({ missionSlug: missionSlugForPicker!, stageName })}
           />
         </>
@@ -172,12 +195,47 @@ export function RobotViewer({
             run={liveRun}
           />
         )}
-        {mode === "replay" && (
+        {mode === "replay" && replayModeSelectsStage && (
+          <StageReplayLayer
+            slug={slug}
+            missionSlug={selectedStage!.missionSlug}
+            stageName={selectedStage!.stageName}
+          />
+        )}
+        {mode === "replay" && !replayModeSelectsStage && (
           <ReplayLayer slug={slug} run={replayRun} iter={replayIter} onPickIter={setReplayIter} />
         )}
       </div>
     </div>
   );
+}
+
+/** §UX honesty pass (Replay stage nav): bulk has-any-rollout per stage,
+ *  for the picker's disable/tooltip logic. Query key matches
+ *  `useStageIterations`'s (`qk.stageIters`), so React Query dedupes this
+ *  against whichever stage is already fetched for the active selection —
+ *  no extra network traffic for that one. */
+function useStageRolloutAvailability(
+  slug: string,
+  missionSlug: string | null,
+  stages: StageSchema[],
+): Map<string, boolean> {
+  const results = useQueries({
+    queries: stages.map((s) => ({
+      queryKey: missionSlug ? qk.stageIters(slug, missionSlug, s.name) : ["stageIters", "_none", s.name],
+      queryFn: () => getStageIterations(slug, missionSlug as string, s.name),
+      enabled: !!missionSlug,
+      staleTime: 30_000,
+    })),
+  });
+  return useMemo(() => {
+    const out = new Map<string, boolean>();
+    stages.forEach((s, i) => {
+      const rows = results[i]?.data as StageIteration[] | undefined;
+      out.set(s.name, !!rows && rows.some((r) => r.has_rollout));
+    });
+    return out;
+  }, [stages, results]);
 }
 
 /** Terminal-default helper: the newest mission with any job history,
@@ -506,6 +564,123 @@ function StageLayer({
           muted playsInline autoPlay loop
         />
       )}
+      {/* §UX honesty pass: export reachable wherever an iteration with a
+          checkpoint is shown, independent of whether it has a rollout. */}
+      {activeRow?.has_checkpoint && activeIter != null && (
+        <a
+          href={stageExportUrl(slug, missionSlug, stageName, activeIter)}
+          download
+          className="rs-overlay"
+          style={{ left: "auto", right: 12, top: "auto", bottom: 12, textDecoration: "none", cursor: "pointer" }}
+          title="Download the deployment bundle: checkpoint + ONNX + TorchScript + reward/env spec + DEPLOY.md"
+        >
+          <Icon name="package" size={13} />Export bundle
+        </a>
+      )}
+    </>
+  );
+}
+
+// ── Stage-scoped replay layer — §UX honesty pass (Replay stage nav) ────
+// Reuses StageLayer's disk-truth data source (useStageIterations +
+// stageRolloutUrl) but gives it Replay's UX: pick ANY iteration with a
+// rollout on disk via a scrubber row, not just the newest.
+function StageReplayLayer({
+  slug, missionSlug, stageName,
+}: { slug: string; missionSlug: string; stageName: string }) {
+  const iters = useStageIterations(slug, missionSlug, stageName);
+  const rows = iters.data ?? [];
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const [picked, setPicked] = useState<number | null>(null);
+
+  useEffect(() => {
+    setPicked(null);
+  }, [missionSlug, stageName]);
+
+  const rowsWithRollout = useMemo(() => rows.filter((r) => r.has_rollout), [rows]);
+  const defaultIter = rowsWithRollout.length > 0
+    ? rowsWithRollout[rowsWithRollout.length - 1].iter_index
+    : null;
+  const activeIter = picked ?? defaultIter;
+  const activeRow = rows.find((r) => r.iter_index === activeIter) ?? null;
+  const src = activeIter != null && activeRow?.has_rollout
+    ? stageRolloutUrl(slug, missionSlug, stageName, activeIter)
+    : null;
+
+  useEffect(() => {
+    if (!src || !videoRef.current) return;
+    videoRef.current.load();
+  }, [src]);
+
+  const noRolloutAtAll = !iters.isLoading && !iters.error && rowsWithRollout.length === 0;
+
+  return (
+    <>
+      <div className="rs-overlay">
+        <Icon name="history" size={13} />
+        replay · {stageName}{activeIter !== null ? ` · iter ${activeIter}` : ""}
+      </div>
+      {(src || activeRow?.has_checkpoint) && (
+        <div className="rs-overlay" style={{ left: "auto", right: 12, gap: 10 }}>
+          {src && (
+            <a
+              href={src}
+              download={`${stageName}_iter_${activeIter}.mp4`}
+              style={{ display: "inline-flex", alignItems: "center", gap: 4, textDecoration: "none", cursor: "pointer", color: "inherit" }}
+              onClick={(e) => e.stopPropagation()}
+            >
+              <Icon name="download" size={13} />Download
+            </a>
+          )}
+          {activeRow?.has_checkpoint && activeIter != null && (
+            <a
+              href={stageExportUrl(slug, missionSlug, stageName, activeIter)}
+              download
+              style={{ display: "inline-flex", alignItems: "center", gap: 4, textDecoration: "none", cursor: "pointer", color: "inherit" }}
+              title="Download the deployment bundle: checkpoint + ONNX + TorchScript + reward/env spec + DEPLOY.md"
+            >
+              <Icon name="package" size={13} />Export
+            </a>
+          )}
+        </div>
+      )}
+      {iters.isLoading && <Shimmer label="loading stage rollouts…" />}
+      {iters.error && (
+        <EmptyOverlay title="Couldn't load this stage" error={(iters.error as Error).message} />
+      )}
+      {noRolloutAtAll && (
+        <EmptyOverlay title="No rollouts recorded" error="This stage hasn't produced a rollout video yet." />
+      )}
+      {src && activeIter !== null && (
+        <video
+          ref={videoRef}
+          key={src}
+          src={src}
+          aria-label={`${stageName} rollout, iteration ${activeIter}`}
+          style={{ position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "contain" }}
+          controls
+          playsInline
+        />
+      )}
+      {rowsWithRollout.length > 0 && (
+        <div className="rs-scrub" style={{ position: "absolute", insetInline: 0, bottom: 0, background: "rgba(20,19,13,0.82)", padding: "8px 10px" }}>
+          {rowsWithRollout.map((r) => (
+            <button
+              key={r.iter_index}
+              type="button"
+              onClick={() => setPicked(r.iter_index)}
+              className="rs-btn rs-btn-xs"
+              style={
+                r.iter_index === activeIter
+                  ? { background: "var(--rs-primary)", color: "#fff", borderColor: "var(--rs-primary)" }
+                  : { background: "rgba(255,255,255,0.06)", color: "#cfcdc4", borderColor: "rgba(255,255,255,0.16)" }
+              }
+            >
+              iter {r.iter_index}
+            </button>
+          ))}
+        </div>
+      )}
     </>
   );
 }
@@ -515,45 +690,56 @@ function StageLayer({
 // (including an errored one, which still shows in the picker but renders
 // the "no rollout" note rather than breaking).
 function StagePicker({
-  missionSlug, stages, selectedStageName, liveStageName, onPick,
+  missionSlug, stages, selectedStageName, liveStageName, rolloutAvailability, onPick,
 }: {
   missionSlug: string;
   stages: StageSchema[];
   selectedStageName: string | null;
   liveStageName: string | null;
+  /** §UX honesty pass: has-any-rollout per stage name, from
+   *  `useStageRolloutAvailability`. Missing entries (not yet fetched) are
+   *  treated as no-rollout — the chip disables until the query resolves. */
+  rolloutAvailability: Map<string, boolean>;
   onPick: (stageName: string) => void;
 }) {
   void missionSlug;
-  // §Increment 4: superseded stages stay listed/selectable (their rollouts
-  // are still on disk) — only genuinely untrained "pending" stages drop out.
-  const attempted = stages.filter((s) => s.status !== "pending");
-  if (attempted.length === 0) return null;
+  // §UX honesty pass: list EVERY stage in mission order — including
+  // untrained "pending" stages and not-yet-run sub-stages, which used to
+  // be silently dropped from this picker. They're disabled (not hidden)
+  // below instead, via `rolloutAvailability`.
+  if (stages.length === 0) return null;
 
   return (
     <div className="rs-flex rs-wrap rs-gap-6" style={{ padding: "8px 14px" }} role="list" aria-label="Mission stages">
-      {attempted.map((s, idx) => {
+      {stages.map((s, idx) => {
         const isSelected = selectedStageName === s.name || (selectedStageName === null && liveStageName === s.name);
         const isErrored = s.status === "failed";
         const isSuperseded = s.status === "superseded";
         const isLive = liveStageName === s.name;
+        const hasRollout = rolloutAvailability.get(s.name) ?? false;
+        const isDisabled = !hasRollout && !isLive;
         const label = stageLabel(s, idx + 1);
         const tooltip = isErrored
           ? `${label}. ${s.name} — ${failureReasonText(s.failure_reason, s.iterations_used) ?? "errored"}`
           : isSuperseded
             ? `${label}. ${s.name} — ${supersededText(s)}`
-            : `${label}. ${s.name}`;
+            : isDisabled
+              ? `${label}. ${s.name} — no rollouts recorded`
+              : `${label}. ${s.name}`;
         return (
           <button
             key={s.name}
             type="button"
             role="listitem"
+            disabled={isDisabled}
             onClick={() => onPick(s.name)}
             title={tooltip}
             className="mono"
             style={{
               display: "inline-flex", alignItems: "center", gap: 5,
               borderRadius: 5, padding: "3px 8px", fontSize: 11,
-              cursor: "pointer",
+              cursor: isDisabled ? "not-allowed" : "pointer",
+              opacity: isDisabled ? 0.45 : 1,
               border: "1px solid " + (isSelected ? "var(--rs-primary)" : "var(--hairline)"),
               background: isSelected ? "rgba(245,78,0,0.08)" : "var(--canvas-soft)",
               color: "var(--ink)",
