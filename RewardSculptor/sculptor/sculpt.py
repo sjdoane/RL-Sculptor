@@ -1616,6 +1616,54 @@ def _run_one_iter(
             f"{type(e).__name__}: {e}\n"
         )
 
+    # §Ship-56 (persistence increment): mirror the `iter_fitness` event to
+    # disk so a FINISHED stage's per-iteration fitness survives past the
+    # live job log (the UI already probes `<iter_dir>/fitness.json` for
+    # keys objective_fitness/fitness/value — nothing wrote it before this).
+    # Guard matches the compute guard above: only when a fitness_fn ran AND
+    # produced a value (fitness_fn is not None and iter_fitness is not
+    # None) — never write a stale/empty file in the blind default. Best-
+    # effort, same discipline as the realism-audit write just above.
+    if fitness_fn is not None and iter_fitness is not None:
+        try:
+            _fitness_record = {
+                "schema": 1,
+                "iter": iter_index,
+                "fitness": round(iter_fitness, 5),
+                "progress": (round(iter_progress, 5)
+                             if iter_progress is not None else None),
+                "steer_fitness": (round(iter_steer_fitness, 5)
+                                  if iter_steer_fitness is not None else None),
+                "steer_progress": (round(iter_steer_progress, 5)
+                                   if iter_steer_progress is not None else None),
+                "naturalness_factor": iter_naturalness_factor,
+                "naturalness_flag": (
+                    naturalness.get("flag") if naturalness is not None else None
+                ),
+                "naturalness_hard_reject": bool(
+                    naturalness.get("hard_reject") if naturalness is not None
+                    else False
+                ),
+                "observe_only": bool(fitness_observe_only),
+                "eval_seeds": (len(fitness_per_seed)
+                               if len(fitness_per_seed) > 1 else None),
+                "fitness_per_seed": ([round(v, 5) for v in fitness_per_seed]
+                                     if len(fitness_per_seed) > 1 else None),
+                "components": fitness_components,
+                "source": "live",
+                "recorded_at": _utc_now_iso(),
+            }
+            (iter_dir / "fitness.json").write_text(
+                json.dumps(_fitness_record, indent=2, sort_keys=True,
+                           default=str),
+                encoding="utf-8",
+            )
+        except Exception as e:  # noqa: BLE001 — recording must not block the loop
+            sys.stderr.write(
+                f"[sculpt] iter {iter_index}: fitness.json write skipped — "
+                f"{type(e).__name__}: {e}\n"
+            )
+
     # §7.4 / §Ship-8b: compute + emit the auto-physics SUGGESTION here
     # (UI surfaces the chip ASAP, before diagnose finishes). The actual
     # apply happens AFTER diagnose (see below) so Claude's reward
@@ -3719,6 +3767,63 @@ def _select_stage_final_iter(
         _evaluate_success_criterion,
     )
 
+    # §Ship-56 (persistence increment): record the scan + final keep-decision
+    # to `<stage_dir>/reports/selection.json` so the UI can show WHY this
+    # iter was kept after the mission ends (today it only sees
+    # selected_iter_index/selection_source on mission.json — the per-
+    # candidate reasoning was computed then discarded). Every return point
+    # below routes through `_finalize` so this is a pure recording
+    # addition — the returned tuple is byte-identical to before this
+    # change. `gate` and `rows` are populated by the scan further down;
+    # this helper closes over them by reference (rebound as the scan
+    # proceeds — Python closures read the current value at call time).
+    gate: Optional[dict] = None
+    rows: "list[dict[str, Any]]" = []
+
+    def _finalize(
+        result: "tuple[Optional[IterOutcome], bool, str, Optional[str], bool, Optional[str]]",
+    ) -> "tuple[Optional[IterOutcome], bool, str, Optional[str], bool, Optional[str]]":
+        selected, criterion_ok, source, criterion_error, _missing_key, mismatch = result
+        if stage_dir is not None:
+            try:
+                selected_index = (
+                    selected.iter_index if selected is not None else None)
+                for row in rows:
+                    row["selected"] = (
+                        selected_index is not None
+                        and row["iter_index"] == selected_index)
+                record = {
+                    "schema": 1,
+                    "stage": stage.name,
+                    "recorded_at": _utc_now_iso(),
+                    "selected_iter_index": selected_index,
+                    "selection_source": source,
+                    "criterion_ok": criterion_ok,
+                    "criterion": stage.success_criterion,
+                    "criterion_error": criterion_error,
+                    "start_state_mismatch": mismatch,
+                    "gate": (
+                        {
+                            "skipped": gate["skipped"],
+                            "checked": gate["checked"],
+                            "mismatched_count": gate["mismatched_count"],
+                        } if gate is not None else None
+                    ),
+                    "candidates": rows,
+                }
+                reports_dir = Path(stage_dir) / "reports"
+                reports_dir.mkdir(parents=True, exist_ok=True)
+                (reports_dir / "selection.json").write_text(
+                    json.dumps(record, indent=2, sort_keys=True, default=str),
+                    encoding="utf-8",
+                )
+            except Exception as e:  # noqa: BLE001 — recording is best-effort
+                sys.stderr.write(
+                    f"[sculpt] stage {stage.name}: selection.json write "
+                    f"skipped — {type(e).__name__}: {e}\n"
+                )
+        return result
+
     # Dedup by iter_dir, keeping the latest occurrence (extension passes
     # can re-report the same on-disk iter).
     by_dir: "dict[str, IterOutcome]" = {}
@@ -3726,7 +3831,7 @@ def _select_stage_final_iter(
         by_dir[str(o.iter_dir)] = o
     with_ckpt = [o for o in by_dir.values() if _iter_checkpoint(o.iter_dir)]
     if not with_ckpt:
-        return (None, False, "last", None, False, None)
+        return _finalize((None, False, "last", None, False, None))
 
     gate = _evaluate_start_state_gate(with_ckpt, stage_dir)
     if emit is not None and gate is not None:
@@ -3759,10 +3864,13 @@ def _select_stage_final_iter(
     for o in with_ckpt:
         if o.steer_fitness is not None or o.fitness is not None:
             had_fitness = True
+        crit_pass: Optional[bool] = None
+        crit_err: Optional[str] = None
         try:
             ns = _build_criterion_namespace(
                 iter_dir=Path(o.iter_dir), primary_metric=o.primary_metric)
             if _evaluate_success_criterion(stage.success_criterion, ns):
+                crit_pass = True
                 raw_passing.append(o)
                 # §D24 (F4): the criterion just read this iter as a
                 # success — check it against the objective fitness BEFORE
@@ -3777,19 +3885,39 @@ def _select_stage_final_iter(
                 if (not gate_mismatched.get(str(o.iter_dir), False)
                         and not gate_unverified):
                     passing.append(o)
+            else:
+                crit_pass = False
         except CriterionEvalError as e:
             saw_any_error = True
             last_error = str(e)
+            crit_err = str(e)
             if not isinstance(e, CriterionMissingKeyError):
                 only_missing_key = False
         except Exception:  # noqa: BLE001 — a flaky iter is a non-pass, not fatal
-            pass
+            crit_pass = False
+        rows.append({
+            "iter_index": o.iter_index,
+            "criterion_pass": crit_pass,
+            "criterion_error": crit_err,
+            "gate_mismatched": bool(
+                gate_mismatched.get(str(o.iter_dir), False)),
+            "fitness": (round(o.fitness, 5) if o.fitness is not None else None),
+            "steer_fitness": (round(o.steer_fitness, 5)
+                              if o.steer_fitness is not None else None),
+            "progress": (round(o.progress, 5)
+                        if o.progress is not None else None),
+            "steer_progress": (round(o.steer_progress, 5)
+                               if o.steer_progress is not None else None),
+            "primary_metric": (round(o.primary_metric, 5)
+                               if o.primary_metric is not None else None),
+            "selected": False,
+        })
 
     if passing:
         winner = max(
             passing, key=lambda o: (_iter_fitness_key(o), o.iter_index))
         source = "criterion+fitness" if had_fitness else "criterion_newest"
-        return (winner, True, source, None, False, None)
+        return _finalize((winner, True, source, None, False, None))
 
     # Nobody passed — keep the strongest policy for the successor anyway.
     winner = max(with_ckpt, key=lambda o: (_iter_fitness_key(o), o.iter_index))
@@ -3819,19 +3947,21 @@ def _select_stage_final_iter(
                 f"{gate['example_measured_joint_err']!r}). The scaffold "
                 f"likely fell back to the wrong RSI/reset class."
             )
-        return (winner, False, "fitness_fallback", None, False, detail)
+        return _finalize((winner, False, "fitness_fallback", None, False, detail))
 
     # Preserve the genuine-bug vs missing-key/plain-fail distinction the
     # old single-iter path drew: a broken criterion still surfaces as
     # criterion_errored; a missing key carries its message through to the
     # recoverable criterion_not_met so re-decompose feedback names the key.
     if saw_any_error and not only_missing_key:
-        return (winner, False, "fitness_fallback", last_error, False, None)
+        return _finalize(
+            (winner, False, "fitness_fallback", last_error, False, None))
     if saw_any_error:  # only missing-key errors
-        return (winner, False, "fitness_fallback", last_error, True, None)
+        return _finalize(
+            (winner, False, "fitness_fallback", last_error, True, None))
     # Criterion evaluated cleanly to False on every iter — a plain miss,
     # no missing key.
-    return (winner, False, "fitness_fallback", None, False, None)
+    return _finalize((winner, False, "fitness_fallback", None, False, None))
 
 
 def _verify_stage_adapter_matches(

@@ -140,6 +140,19 @@ def test_saved_root_env_override(monkeypatch, tmp_path):
     assert saved_root() == override
 
 
+def test_saved_root_isolated_by_autouse_fixture(tmp_path_factory):
+    """The autouse `_isolate_saved_root` fixture in tests/conftest.py must
+    point every test at a per-test temp dir, never the developer's real
+    `~/.local/share/reward-sculptor/saved/` — ~95 `pytest-*--mission--*`
+    entries had accumulated there before this fixture existed. Doesn't
+    monkeypatch anything itself (would mask the fixture under test); just
+    asserts the ambient env state this test was collected under."""
+    real_default = Path.home() / ".local" / "share" / "reward-sculptor" / "saved"
+    assert saved_root() != real_default
+    # Lives under pytest's own basetemp, not anywhere in the real home tree.
+    assert str(tmp_path_factory.getbasetemp()) in str(saved_root())
+
+
 # ── archive_mission: basic structure ─────────────────────────────────────
 def test_archive_mission_raises_without_mission_json(tmp_path):
     not_a_mission = tmp_path / "not_a_mission"

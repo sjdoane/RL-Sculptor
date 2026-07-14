@@ -369,6 +369,62 @@ def test_select_stage_final_iter_no_contradiction_when_fitness_none(
     assert not (blind.iter_dir / "fitness_contradiction.json").is_file()
 
 
+def test_select_stage_final_iter_writes_selection_json(tmp_path):
+    """§Ship-56 (persistence increment): the per-candidate scan + final
+    keep-decision must be recorded to `<stage_dir>/reports/selection.json`
+    (previously computed then discarded — only selected_iter_index/
+    selection_source landed in mission.json), byte-identical returned
+    tuple."""
+    from sculptor.sculpt import _select_stage_final_iter
+
+    class _Stage:
+        name = "torso_righting"
+        success_criterion = "metric > 0.5"
+
+    stage_dir = tmp_path / "stage_dir"
+    stage_dir.mkdir()
+
+    weak_pass = _make_iter_outcome_with_rollout(
+        tmp_path, iter_index=0, fitness=0.3, mean_return=0.9)
+    strong_pass = _make_iter_outcome_with_rollout(
+        tmp_path, iter_index=1, fitness=0.8, mean_return=0.9)
+    fails = _make_iter_outcome_with_rollout(
+        tmp_path, iter_index=2, fitness=None, mean_return=0.1)
+
+    result = _select_stage_final_iter(
+        [weak_pass, strong_pass, fails], _Stage(), stage_dir=stage_dir,
+    )
+    selected, criterion_ok, source, err, missing, mismatch = result
+    assert selected is strong_pass       # higher fitness among passers
+    assert criterion_ok is True
+    assert source == "criterion+fitness"
+    assert err is None and missing is False and mismatch is None
+
+    record = json.loads(
+        (stage_dir / "reports" / "selection.json").read_text())
+    assert record["stage"] == "torso_righting"
+    assert record["selected_iter_index"] == 1
+    assert record["selection_source"] == "criterion+fitness"
+    assert record["criterion_ok"] is True
+    assert record["criterion"] == "metric > 0.5"
+    assert record["criterion_error"] is None
+    assert record["start_state_mismatch"] is None
+    assert record["gate"] == {
+        "skipped": True, "checked": 0, "mismatched_count": 0,
+    }
+    rows_by_iter = {r["iter_index"]: r for r in record["candidates"]}
+    assert set(rows_by_iter) == {0, 1, 2}
+    assert rows_by_iter[0]["criterion_pass"] is True
+    assert rows_by_iter[0]["fitness"] == 0.3
+    assert rows_by_iter[0]["selected"] is False
+    assert rows_by_iter[1]["criterion_pass"] is True
+    assert rows_by_iter[1]["fitness"] == 0.8
+    assert rows_by_iter[1]["selected"] is True
+    assert rows_by_iter[2]["criterion_pass"] is False
+    assert rows_by_iter[2]["fitness"] is None
+    assert rows_by_iter[2]["selected"] is False
+
+
 def test_diagnose_objective_progress_renders_components_and_revert():
     base = dict(
         behavior_goal="kick", reward_spec={}, metrics={}, behavior={},

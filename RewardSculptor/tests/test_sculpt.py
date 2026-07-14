@@ -907,7 +907,7 @@ def test_iter_fitness_event_carries_components_dict(
                 "error": None,
             }
 
-    sculpt_run(
+    result = sculpt_run(
         config_path=proj / "config.toml", behavior_goal="dummy goal",
         iterations=1, no_kg=True, dry_run=True,
         fitness_fn=_DetailFitnessFn(),
@@ -922,6 +922,39 @@ def test_iter_fitness_event_carries_components_dict(
     assert fitness_events[0]["components"] == {
         "gate_upright_frac": 1.0, "gate_reached_035": 0.0,
     }
+
+    # §Ship-56: the live `iter_fitness` event must also be MIRRORED to
+    # `<iter_dir>/fitness.json` so a finished stage's per-iteration
+    # fitness survives past the job log (the UI probes this file).
+    (outcome,) = result.completed_iters
+    fitness_json = Path(outcome.iter_dir) / "fitness.json"
+    assert fitness_json.is_file()
+    record = json.loads(fitness_json.read_text(encoding="utf-8"))
+    assert record["iter"] == outcome.iter_index
+    assert record["fitness"] == pytest.approx(0.0)
+    assert record["components"] == {
+        "gate_upright_frac": 1.0, "gate_reached_035": 0.0,
+    }
+    assert record["source"] == "live"
+    assert record["observe_only"] is False
+    assert "recorded_at" in record
+
+
+def test_no_fitness_json_written_when_fitness_fn_is_none(
+        tmp_path: Path, capsys):
+    """The blind default (`fitness_fn=None`) never runs the fitness detail
+    path — `fitness.json` must not appear in the iter dir at all, not an
+    empty/stale placeholder."""
+    global _SCHEDULE
+    _SCHEDULE = [1.0]
+    proj = _write_minimal_project(tmp_path)
+
+    result = sculpt_run(
+        config_path=proj / "config.toml", behavior_goal="dummy goal",
+        iterations=1, no_kg=True, dry_run=True,
+    )
+    (outcome,) = result.completed_iters
+    assert not (Path(outcome.iter_dir) / "fitness.json").exists()
 
 
 def test_iter_fitness_event_components_null_on_plain_float_fallback(
