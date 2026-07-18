@@ -295,8 +295,9 @@ full_text_path sidecars). Confirmed defects fixed:
    vectors forever after text changed (extraction enriches
    descriptions; resumed runs re-attribute case verdicts, and
    `_case_text` embeds the verdict). `node_embeddings` gains
-   `text_hash` (additive in-place migration); the three `_ensure_*`
-   pools share one staleness-aware `ensure_embeddings` (missing/stale
+   `text_hash` (additive in-place migration); all four semantic pools
+   (Paper, Technique, FailureMode, RunCase) share one staleness-aware
+   `ensure_embeddings` (missing/stale
    re-embed; pre-hash rows trusted once + hash-stamped).
 3. **Forward-compat (MED)**: `row_to_node` now drops unknown data
    keys (newer-schema rows no longer TypeError older readers; unknown
@@ -315,13 +316,75 @@ full_text_path sidecars). Confirmed defects fixed:
    always the shared path (once-per-file warning → `sculpt kg merge`);
    backend `pdfs_dir` follows the resolved DB (has_pdf flags were
    always False against the shared graph).
-6. **`sculpt kg doctor`** (new `sculptor/kg/doctor.py`): one-pass
+6. **`sculpt kg doctor`** (new `sculptor/kg/doctor.py`): pre/post-fix
    integrity report (dangling edges, orphan embeddings, unknown
    kinds/relations, stub titles, dead text paths, missing/stale/
    unhashed embeddings) + `--fix` mechanical repairs +
    `--reembed-all`; `heal_dead_text_paths` re-ingests the /tmp-era
    papers. Doc/help staleness fixed (CLI `--store` text, store.py
-   header, docs/knowledge_graph.md legacy-path + research sections).
+  header, docs/knowledge_graph.md legacy-path + research sections).
+7. **Store consolidation safety**: merging now copies only text-hashed
+   vectors whose nodes are safe to copy, skips unknowable unhashed legacy
+   vectors, and unions paper-level `supports` when the same claim exists in
+   multiple databases. Concurrent PDF downloads use unique same-directory
+   partial files instead of one fixed temporary name.
+8. **Evidence/citation alignment**: shared Technique→FailureMode and
+   Technique→RewardComponent claims retain every corroborating paper. Both
+   tag and semantic retrieval choose evidence from the paper they actually
+   cite; free-form tags normalize across hierarchical campaign aliases.
+9. **Case-memory accounting**: case retrieval includes project and robot
+   scope; persisted references make re-recording delta-based and idempotent.
+   A one-time `attribution_version` migration prevents the 194 legacy cases
+   from double-crediting already-counted citations. Reference attribution
+   now records the reward that trained the measured policy, not the edit
+   written afterward.
+10. **Campaign controls**: structured Paper metadata (`tier`, `tags`,
+    `rationale`, `source_url`) survives idempotent ingest. Exact seed/tier/tag
+    extraction normalizes arXiv versions and fails loudly when selected
+    papers are absent. Paper nodes now have their own semantic retrieval API.
+11. **Final live verification**: after exact S-tier extraction and a full
+    rebuild, the shared graph has 1,962 nodes, 2,107 edges, and 1,335
+    embeddings. Doctor reports zero dangling/orphan/unknown-schema issues,
+    zero stubs or dead text paths, and zero missing/stale/unhashed vectors.
+    The remaining 49 unextracted A/B papers are the deliberate metadata tier
+    of the hybrid policy. Independent Phase-0 red-team: pass. Repository
+    validation with `MUJOCO_GL=egl`: RewardSculptor 1,994 passed / 1 optional
+    JAX test skipped; UI backend 531 passed.
+
+### 2026-07-18 — environment-authoring research corpus
+
+- Added `RewardSculptor/kg_seeds_env_authoring_2026-07.yml`: 89 verified
+  papers with applicability rationales and structured domain tags; tiers are
+  S=33, A=41, B=15. All 89 PDFs, nonempty text sidecars, metadata records,
+  and source URLs are present in the shared graph.
+- Hybrid extraction is complete by policy: all 33 S papers are extracted
+  (40/89 overall including seven previously extracted A/B papers). Every S
+  paper produced graph artifacts; 123 INTRODUCES and 111 EVALUATES_ON edges
+  have nonempty evidence. The 49 A/B holdbacks remain searchable as embedded
+  Paper nodes and can be promoted selectively without another corpus search.
+- Real MiniLM smoke queries retrieved the intended literature across LLM
+  terrain generation, object goals, simulator frameworks, and UED/regret.
+  Exact campaign selection is idempotent and all title/metadata checks pass.
+
+### 2026-07-18 — prompt-driven environment-authoring architecture
+
+- Added `docs/internal/ENV_AUTHORING_ARCHITECTURE.md`, the normative design
+  for mission prompting, capability negotiation, clarification/default
+  provenance, versioned WorldSpec/TaskSpec artifacts, frozen evaluation
+  manifests, simulator validation gates, channel-catalog threading, honest
+  reward/metric access, diagnoser feedback, curriculum policy, and KG memory.
+- The design explicitly covers uneven-terrain locomotion, ball-to-goal
+  interaction, and gripper-capable humanoid tasks without task-name
+  hardcoding. Train variation is separated into compiled generator
+  parameters, expandable model fields, and reset state; structural mutations
+  require a new compiled lineage.
+- Added `RewardSculptor/scripts/world_schema_poc.py`. Against installed
+  mjlab 1.3.0 / MuJoCo 3.7.0 it compiles the normative schema into a scene
+  with 5 bodies, 17 geoms, and 3 heightfields, validates a clean settle, and
+  rejects a deliberately overlapping spawn at 13.5 cm penetration. It is a
+  schema/compiler smoke test, not the production implementation.
+- Independent architecture red-team: all blockers closed. Implementation
+  remains deliberately staged behind the documented P1–P5 gates.
 
 ### 2026-07-05 — research-driven upgrades (gap analysis → three landed
 increments)
