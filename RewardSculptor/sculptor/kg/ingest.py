@@ -148,6 +148,40 @@ def _download_pdf_with_timeout(url: str, dest: Path, *, timeout_s: float) -> Non
     partial.replace(dest)
 
 
+def make_arxiv_client(
+    *,
+    page_size: int,
+    delay_seconds: float,
+    num_retries: int,
+    timeout_s: float,
+):
+    """Build an `arxiv.Client` whose HTTP timeout is scoped to ITS OWN
+    requests session.
+
+    §Phase-0 hardening 2026-07-18: the old approach set
+    `socket.setdefaulttimeout(timeout_s)` around the call — a
+    process-GLOBAL mutation. The UI backend runs ingest/research inside
+    worker threads of a live uvicorn server, so any socket created by
+    ANOTHER thread during that window (a websocket, a long-poll response)
+    silently inherited a 30s timeout and could die mid-stream. The arxiv
+    package keeps a `requests.Session` at `client._session`; wrapping its
+    `request` with a default timeout confines the bound to arxiv traffic.
+    Fallback: if a future arxiv version drops `_session`, the client is
+    returned un-bounded (requests' default) rather than reintroducing the
+    global mutation."""
+    import arxiv
+
+    client = arxiv.Client(
+        page_size=page_size, delay_seconds=delay_seconds,
+        num_retries=num_retries)
+    sess = getattr(client, "_session", None)
+    if sess is not None and hasattr(sess, "request"):
+        import functools
+
+        sess.request = functools.partial(sess.request, timeout=timeout_s)
+    return client
+
+
 # ── Public API ──────────────────────────────────────────────────────────────
 ARXIV_PDF_URL_FMT = "https://arxiv.org/pdf/{arxiv_id}.pdf"
 
@@ -196,16 +230,13 @@ def _fetch_arxiv_metadata(
             )
             sleep(delay)
         try:
+            client = make_arxiv_client(
+                page_size=1, delay_seconds=1.0, num_retries=1,
+                timeout_s=timeout_s)
             import arxiv
-            import socket
 
-            socket.setdefaulttimeout(timeout_s)
-            try:
-                client = arxiv.Client(page_size=1, delay_seconds=1.0, num_retries=1)
-                search = arxiv.Search(id_list=[arxiv_id])
-                result = next(client.results(search))
-            finally:
-                socket.setdefaulttimeout(None)
+            search = arxiv.Search(id_list=[arxiv_id])
+            result = next(client.results(search))
 
             return {
                 "title": str(result.title).strip(),
@@ -276,6 +307,57 @@ def heal_stub_titles(
                 print(
                     f"[heal]   {aid}: error {e}", file=sys.stderr, flush=True,
                 )
+    finally:
+        if owns_store:
+            store.close()
+    return results
+
+
+def heal_dead_text_paths(
+    store: SculptorKG | None = None,
+    *,
+    force: bool = True,
+) -> dict[str, str]:
+    """Repair Paper nodes whose `full_text_path` no longer exists on disk.
+
+    §Phase-0 hardening 2026-07-18: papers ingested while the KG was rooted
+    somewhere transient (measured live: 20 papers pointing at a wiped
+    `/tmp/pdfs/`) keep a dead sidecar path. Nothing breaks until the next
+    `extract --force`, which then silently loses the BODY_EXCERPT and
+    extracts from abstract+conclusion alone — a quality regression with no
+    error. Re-running `ingest_arxiv(force=True)` re-downloads the PDF into
+    THIS store's pdfs dir, rewrites the sidecar, and preserves the
+    `extracted` flag. Returns `{arxiv_id: "healed" | "still_dead" |
+    "error: ..."}`; papers with a live path are untouched."""
+    owns_store = store is None
+    store = store or SculptorKG()
+    results: dict[str, str] = {}
+    try:
+        dead: list[str] = []
+        for node in store.find_nodes(kind="Paper"):
+            path = getattr(node, "full_text_path", None)
+            if path and not Path(path).is_file():
+                aid = getattr(node, "arxiv_id", "")
+                if aid:
+                    dead.append(str(aid))
+        if not dead:
+            return results
+        print(f"[heal] found {len(dead)} paper(s) with dead full_text_path",
+              flush=True)
+        for aid in dead:
+            try:
+                paper = ingest_arxiv(aid, store=store, force=force)
+                new_path = getattr(paper, "full_text_path", None)
+                if new_path and Path(new_path).is_file():
+                    results[aid] = "healed"
+                    print(f"[heal]   {aid}: -> {new_path}", flush=True)
+                else:
+                    results[aid] = "still_dead"
+                    print(f"[heal]   {aid}: still dead", flush=True)
+            except Exception as e:  # noqa: BLE001
+                results[aid] = f"error: {type(e).__name__}: {e}"
+                print(f"[heal]   {aid}: error {e}", file=sys.stderr,
+                      flush=True)
     finally:
         if owns_store:
             store.close()
@@ -435,7 +517,9 @@ def _build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--arxiv", action="append", default=[],
                     help="Directly ingest an arxiv id. Can repeat.")
     ap.add_argument("--store", type=Path, default=None,
-                    help="Override KG DB path (default: $SCULPTOR_KG_PATH or ./kg/graph.db).")
+                    help="Override KG DB path (default: $SCULPTOR_KG_PATH / "
+                         "$RS_KG_PATH, else the shared "
+                         "~/.local/share/sculptor/kg/graph.db).")
     ap.add_argument("--force", action="store_true",
                     help="Re-download even if the paper is already ingested.")
     return ap

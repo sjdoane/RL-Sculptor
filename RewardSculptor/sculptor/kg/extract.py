@@ -25,6 +25,7 @@ CLI:
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import sys
@@ -40,6 +41,7 @@ from sculptor.kg.schema import (
     Environment,
     FailureMode,
     Paper,
+    PROVENANCE_PAPER_CLAIM,
     Relation,
     RewardComponent,
     Technique,
@@ -48,6 +50,7 @@ from sculptor.kg.schema import (
     make_paper_id,
     make_reward_component_id,
     make_technique_id,
+    merge_provenance,
 )
 from sculptor.kg.store import SculptorKG
 from sculptor.llm import log_llm_call, model_for, response_text_blocks
@@ -236,20 +239,37 @@ def _materialize(
         return isinstance(ev, str) and len(ev.strip()) >= MIN_EVIDENCE_CHARS
 
     # 1. Techniques
+    #
+    # MERGE DISCIPLINE (§Phase-0 hardening 2026-07-18): when the node
+    # already exists, mutate it with dataclasses.replace so every field
+    # this payload does NOT speak to survives. The old rebuild-from-
+    # scratch merge silently reset `useful_citations` and `outcome_stats`
+    # — the run-learned ranking signals cases.record_run_cases spends
+    # whole GPU runs accumulating — to 0/{} on every re-extraction that
+    # mentioned the same technique. Provenance merges by trust tier
+    # (a paper attestation upgrades an llm-inferred stub, never the
+    # reverse). Same pattern for FailureMode/RewardComponent/Environment.
     technique_name_to_id: dict[str, str] = {}
     for t in payload.techniques:
         if not _good_evidence(t.evidence):
             continue
         tid = make_technique_id(t.name)
         existing = store.get_node(tid)
-        # Merge tags / description if already present; prefer richer text.
         if isinstance(existing, Technique):
-            tags = sorted(set(existing.tags) | set(t.tags))
-            description = existing.description if len(existing.description) > len(t.description) else t.description
+            node = dataclasses.replace(
+                existing,
+                description=(existing.description
+                             if len(existing.description) > len(t.description)
+                             else t.description),
+                tags=sorted(set(existing.tags) | set(t.tags)),
+                provenance=merge_provenance(
+                    existing.provenance, PROVENANCE_PAPER_CLAIM),
+            )
         else:
-            tags = sorted(set(t.tags))
-            description = t.description
-        store.add_node(Technique(id=tid, name=t.name, description=description, tags=tags))
+            node = Technique(
+                id=tid, name=t.name, description=t.description,
+                tags=sorted(set(t.tags)))
+        store.add_node(node)
         technique_name_to_id[t.name] = tid
         created_node_ids.append(tid)
 
@@ -261,16 +281,25 @@ def _materialize(
         fid = make_failure_mode_id(f.name)
         existing = store.get_node(fid)
         if isinstance(existing, FailureMode):
-            symptoms = sorted(set(existing.symptoms) | set(f.symptoms))
-            description = existing.description if len(existing.description) > len(f.description) else f.description
-            env_tag = existing.environment_tag or f.environment_tag
+            # A diagnoser-flagged stub carries the placeholder description;
+            # a real paper description (even a shorter one) beats it.
+            _stub = existing.description.startswith("(diagnoser-flagged")
+            node = dataclasses.replace(
+                existing,
+                description=(f.description if _stub or
+                             len(f.description) > len(existing.description)
+                             else existing.description),
+                symptoms=sorted(set(existing.symptoms) | set(f.symptoms)),
+                environment_tag=existing.environment_tag or f.environment_tag,
+                provenance=merge_provenance(
+                    existing.provenance, PROVENANCE_PAPER_CLAIM),
+            )
         else:
-            symptoms = sorted(set(f.symptoms))
-            description = f.description
-            env_tag = f.environment_tag
-        store.add_node(FailureMode(
-            id=fid, name=f.name, description=description,
-            symptoms=symptoms, environment_tag=env_tag))
+            node = FailureMode(
+                id=fid, name=f.name, description=f.description,
+                symptoms=sorted(set(f.symptoms)),
+                environment_tag=f.environment_tag)
+        store.add_node(node)
         failure_name_to_id[f.name] = fid
         created_node_ids.append(fid)
 
@@ -282,16 +311,22 @@ def _materialize(
         rid = make_reward_component_id(r.name)
         existing = store.get_node(rid)
         if isinstance(existing, RewardComponent):
-            hparams = {**existing.hyperparameters, **r.hyperparameters}
-            description = existing.description if len(existing.description) > len(r.description) else r.description
-            formula = existing.formula or r.formula
+            node = dataclasses.replace(
+                existing,
+                description=(existing.description
+                             if len(existing.description) > len(r.description)
+                             else r.description),
+                formula=existing.formula or r.formula,
+                hyperparameters={**existing.hyperparameters,
+                                 **r.hyperparameters},
+                provenance=merge_provenance(
+                    existing.provenance, PROVENANCE_PAPER_CLAIM),
+            )
         else:
-            hparams = dict(r.hyperparameters)
-            description = r.description
-            formula = r.formula
-        store.add_node(RewardComponent(
-            id=rid, name=r.name, description=description,
-            formula=formula, hyperparameters=hparams))
+            node = RewardComponent(
+                id=rid, name=r.name, description=r.description,
+                formula=r.formula, hyperparameters=dict(r.hyperparameters))
+        store.add_node(node)
         reward_component_name_to_id[r.name] = rid
         created_node_ids.append(rid)
 
@@ -303,12 +338,18 @@ def _materialize(
         eid = make_environment_id(e.name)
         existing = store.get_node(eid)
         if isinstance(existing, Environment):
-            tags = sorted(set(existing.tags) | set(e.tags))
-            description = existing.description if len(existing.description) > len(e.description) else e.description
+            node = dataclasses.replace(
+                existing,
+                description=(existing.description
+                             if len(existing.description) > len(e.description)
+                             else e.description),
+                tags=sorted(set(existing.tags) | set(e.tags)),
+            )
         else:
-            tags = sorted(set(e.tags))
-            description = e.description
-        store.add_node(Environment(id=eid, name=e.name, description=description, tags=tags))
+            node = Environment(
+                id=eid, name=e.name, description=e.description,
+                tags=sorted(set(e.tags)))
+        store.add_node(node)
         environment_name_to_id[e.name] = eid
         created_node_ids.append(eid)
 

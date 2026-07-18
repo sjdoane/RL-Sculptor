@@ -142,27 +142,27 @@ def _fetch_arxiv_metadata_batch(
         return out
     try:
         import arxiv
-        import socket
 
-        socket.setdefaulttimeout(timeout_s)
-        try:
-            client = arxiv.Client(
-                page_size=max(len(arxiv_ids), 1),
-                delay_seconds=3.0, num_retries=1,
-            )
-            search = arxiv.Search(id_list=list(arxiv_ids))
-            for result in client.results(search):
-                entry_id = str(result.entry_id or "")
-                # entry_id looks like `http://arxiv.org/abs/2407.14795v1`
-                aid = entry_id.rsplit("/", 1)[-1]
-                aid = re.sub(r"v\d+$", "", aid, flags=re.IGNORECASE)
-                if aid in out:
-                    out[aid] = {
-                        "title": str(result.title or "").strip(),
-                        "abstract": str(result.summary or "").strip(),
-                    }
-        finally:
-            socket.setdefaulttimeout(None)
+        from sculptor.kg.ingest import make_arxiv_client
+
+        # Session-scoped timeout (make_arxiv_client) — this runs inside a
+        # live uvicorn worker thread; a global socket.setdefaulttimeout
+        # here would leak a 30s timeout onto unrelated server sockets.
+        client = make_arxiv_client(
+            page_size=max(len(arxiv_ids), 1),
+            delay_seconds=3.0, num_retries=1, timeout_s=timeout_s,
+        )
+        search = arxiv.Search(id_list=list(arxiv_ids))
+        for result in client.results(search):
+            entry_id = str(result.entry_id or "")
+            # entry_id looks like `http://arxiv.org/abs/2407.14795v1`
+            aid = entry_id.rsplit("/", 1)[-1]
+            aid = re.sub(r"v\d+$", "", aid, flags=re.IGNORECASE)
+            if aid in out:
+                out[aid] = {
+                    "title": str(result.title or "").strip(),
+                    "abstract": str(result.summary or "").strip(),
+                }
     except Exception as e:  # noqa: BLE001 — arxiv rate-limits are common; don't hard-fail research
         log.warning(
             "research_topic: arxiv batch metadata fetch failed "

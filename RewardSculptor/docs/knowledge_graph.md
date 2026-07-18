@@ -26,12 +26,14 @@ day one.
 
 **Overrides** (highest precedence first):
 
+- `$SCULPTOR_KG_PATH` — wins when both are set.
 - `$RS_KG_PATH` — UI-facing override. Used by the backend test suite to
   redirect to a per-test tmp DB.
-- `$SCULPTOR_KG_PATH` — legacy alias. Either env var wins.
-- Legacy per-project DB at `<project>/kg/graph.db` — if one already
-  exists on disk (e.g. from a pre-Phase-1 project), the backend uses it
-  in place. No silent migration.
+- Legacy per-project / per-directory DBs (`<cwd>/kg/graph.db`,
+  `<project>/kg/graph.db`) are **no longer honored anywhere**
+  (sculptor side removed 2026-07-03 loop 5a; UI backend aligned
+  2026-07-18 Phase-0 hardening). A leftover legacy file only triggers a
+  warning pointing at `sculpt kg merge <path>` — one graph, one path.
 
 **First-start bootstrap**: when the backend boots and finds no shared
 DB, it copies the bundled pre-extracted sqlite from
@@ -129,9 +131,28 @@ Go to any project's **KG tab** → `Add seeds`. Paste an arxiv ID
 (`2401.16337`) or a full URL (`https://arxiv.org/abs/2401.16337`).
 Check `auto extract` to trigger extraction immediately after ingest.
 
-## Proposed follow-up: prompt-time research
+## Integrity: `sculpt kg doctor`
 
-**Not yet implemented** — this is the next KG milestone. The intent:
+The shared graph accretes from many writers (seed ingest, extraction,
+run-case memory, UI research jobs, legacy merges). `sculpt kg doctor`
+reports every silent-degradation class in one pass — dangling edges,
+orphan embeddings, stub-titled papers, dead `full_text_path` sidecars,
+missing/stale embeddings (embeddings carry a `text_hash` of the exact
+embedded text since 2026-07-18, so a description enriched by a later
+extraction re-embeds instead of serving stale geometry) — and
+`--fix` repairs the mechanical ones (`--reembed-all` for a full
+embedding rebuild, `--no-network` to skip the two arxiv-touching heals).
+Read-only without `--fix`; exits 1 when unfixed issues remain.
+
+## Prompt-time research — implemented
+
+Implemented as `sculptor/kg/research.py` (`research_topic`) + the UI
+backend's `POST /projects/{slug}/kg/research` job: Claude proposes
+arxiv IDs for a topic, IDs are normalized + deduped against the KG,
+each surviving ID's REAL title/abstract is fetched from arxiv and
+embedding-checked against the topic (hallucinated-ID guard,
+threshold 0.15), then ingest + extract run. The original design sketch
+below is kept for history:
 
 1. When the user types a behavior goal ("jump 30 cm vertically with a
    pogo-stick SEA"), sculptor's diagnoser queries the KG for relevant

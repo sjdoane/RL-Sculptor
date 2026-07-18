@@ -14,14 +14,29 @@ a unique constraint.
 
 Path discovery
 --------------
-Default DB path: `<cwd>/kg/graph.db`. Override per call via the constructor,
-or globally via the `SCULPTOR_KG_PATH` environment variable. The parent
-directory is created on first use.
+Default DB path: the user-wide shared graph at
+`~/.local/share/sculptor/kg/graph.db` (see `default_db_path`). Override per
+call via the constructor, or globally via `SCULPTOR_KG_PATH` / `RS_KG_PATH`.
+The parent directory is created on first use.
+
+Embedding freshness (§Phase-0 hardening 2026-07-18)
+---------------------------------------------------
+`node_embeddings` carries a `text_hash` of the EXACT text that was embedded.
+Callers that maintain lazy embedding pools (kg/query.py, kg/cases.py) pass
+the canonical text into `set_embedding` and use `embedding_status` to detect
+when a node's text changed after its vector was cached (extraction merges
+enrich descriptions; case verdicts are re-attributed on resume) — a stale
+vector is re-embedded instead of silently serving the old text's geometry.
+Legacy rows (hash NULL) are trusted once and backfilled via
+`backfill_embedding_hash`; `sculpt kg doctor --reembed-all` forces a full
+refresh when that one-time trust is not wanted.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import os
 import sqlite3
 import time
@@ -42,6 +57,8 @@ from sculptor.kg.schema import (
     row_to_node,
 )
 
+
+log = logging.getLogger(__name__)
 
 DEFAULT_RELATIVE_DB_PATH = Path("kg") / "graph.db"
 ENV_VAR = "SCULPTOR_KG_PATH"
@@ -118,10 +135,16 @@ CREATE TABLE IF NOT EXISTS node_embeddings (
     dim        INTEGER NOT NULL,
     vector     BLOB NOT NULL,
     updated_at REAL NOT NULL,
+    text_hash  TEXT,
     PRIMARY KEY (node_id, model)
 );
 CREATE INDEX IF NOT EXISTS idx_embeddings_model ON node_embeddings(model);
 """
+
+
+def embedding_text_hash(text: str) -> str:
+    """Canonical hash of the exact text a vector was computed from."""
+    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
 
 
 def merge_stores(src_path: Path | str, dst: "SculptorKG") -> dict[str, int]:
@@ -189,7 +212,21 @@ class SculptorKG:
         self._conn = sqlite3.connect(str(self.db_path))
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA_SQL)
+        self._migrate()
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        """In-place additive migrations for DBs created before a column
+        existed. CREATE TABLE IF NOT EXISTS never alters an existing
+        table, so new columns must be added here. Additive-only — never
+        drops or rewrites data."""
+        cols = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(node_embeddings)")
+        }
+        if "text_hash" not in cols:
+            self._conn.execute(
+                "ALTER TABLE node_embeddings ADD COLUMN text_hash TEXT")
 
     # ── lifecycle ───────────────────────────────────────────────────────────
     def close(self) -> None:
@@ -313,7 +350,9 @@ class SculptorKG:
 
         out: list[tuple[Edge, str]] = []
         for row in self._conn.execute(sql, args).fetchall():
-            edge = row_to_edge(row["src"], row["dst"], row["relation"], json.loads(row["data"]))
+            edge = self._row_to_edge_tolerant(row)
+            if edge is None:
+                continue
             other = edge.dst if edge.src == node_id else edge.src
             out.append((edge, other))
         return out
@@ -323,9 +362,34 @@ class SculptorKG:
         rows = self._conn.execute(
             "SELECT src, dst, relation, data FROM edges").fetchall()
         for row in rows:
-            yield row_to_edge(
+            edge = self._row_to_edge_tolerant(row)
+            if edge is not None:
+                yield edge
+
+    def _row_to_edge_tolerant(self, row: sqlite3.Row) -> Edge | None:
+        """Deserialize one edge row; skip (with a once-per-relation warning)
+        rows whose relation string is unknown to this code version instead
+        of letting ONE such row abort a whole neighbors()/all_edges() scan.
+        A newer schema writing a new Relation must not brick older readers'
+        retrieval — the unknown edges are simply invisible to them."""
+        try:
+            return row_to_edge(
                 row["src"], row["dst"], row["relation"],
                 json.loads(row["data"]))
+        except Exception:
+            rel = str(row["relation"])
+            warned = getattr(self, "_warned_relations_seen", None)
+            if warned is None:
+                warned = set()
+                self._warned_relations_seen = warned
+            if rel not in warned:
+                warned.add(rel)
+                log.warning(
+                    "kg.store: skipping edge(s) with unknown/undecodable "
+                    "relation %r (src=%r) — written by a newer schema or "
+                    "corrupt; run `sculpt kg doctor` to enumerate",
+                    rel, str(row["src"]))
+            return None
 
     # ── counts / stats ──────────────────────────────────────────────────────
     def count_nodes(self, kind: str | None = None) -> int:
@@ -346,17 +410,64 @@ class SculptorKG:
         return int(r[0])
 
     # ── embeddings ──────────────────────────────────────────────────────────
-    def set_embedding(self, node_id: str, model: str, vector: "np.ndarray") -> None:
-        """Store (or replace) a node's embedding for a given model."""
+    def set_embedding(
+        self,
+        node_id: str,
+        model: str,
+        vector: "np.ndarray",
+        *,
+        text: str | None = None,
+    ) -> None:
+        """Store (or replace) a node's embedding for a given model.
+
+        `text`: the EXACT text the vector was computed from. When given,
+        its hash is stored alongside so `embedding_status` can detect
+        staleness after the node's text changes. Omitting it (legacy
+        callers, tests seeding synthetic vectors) stores a NULL hash —
+        treated as trusted-once by `embedding_status`."""
         import numpy as np
 
         v = np.asarray(vector, dtype=np.float32).ravel()
         blob = v.tobytes()
+        th = embedding_text_hash(text) if text is not None else None
         with self._tx() as cx:
             cx.execute(
                 "INSERT OR REPLACE INTO node_embeddings "
-                "(node_id, model, dim, vector, updated_at) VALUES (?, ?, ?, ?, ?)",
-                (node_id, model, int(v.shape[0]), blob, time.time()),
+                "(node_id, model, dim, vector, updated_at, text_hash) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (node_id, model, int(v.shape[0]), blob, time.time(), th),
+            )
+
+    def embedding_status(self, node_id: str, model: str, text: str) -> str:
+        """Freshness of a cached embedding vs `text` (the node's CURRENT
+        canonical embed-text). One of:
+          * "missing"  — no cached vector;
+          * "fresh"    — cached hash matches `text`'s hash;
+          * "stale"    — cached hash present and DIFFERENT (text changed);
+          * "unhashed" — cached vector from before hash tracking (or
+            seeded without text). Callers should `backfill_embedding_hash`
+            (trust-once) or re-embed, per their policy."""
+        row = self._conn.execute(
+            "SELECT text_hash FROM node_embeddings "
+            "WHERE node_id = ? AND model = ?",
+            (node_id, model),
+        ).fetchone()
+        if row is None:
+            return "missing"
+        if row["text_hash"] is None:
+            return "unhashed"
+        return "fresh" if row["text_hash"] == embedding_text_hash(text) else "stale"
+
+    def backfill_embedding_hash(self, node_id: str, model: str, text: str) -> None:
+        """Stamp `text`'s hash onto an existing embedding row WITHOUT
+        re-embedding — the trust-once migration for pre-hash rows (we
+        cannot know what text produced the old vector; from this point on
+        changes are tracked). No-op when the row is absent."""
+        with self._tx() as cx:
+            cx.execute(
+                "UPDATE node_embeddings SET text_hash = ? "
+                "WHERE node_id = ? AND model = ? AND text_hash IS NULL",
+                (embedding_text_hash(text), node_id, model),
             )
 
     def get_embedding(self, node_id: str, model: str) -> "np.ndarray | None":

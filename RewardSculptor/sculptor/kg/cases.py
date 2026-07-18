@@ -35,6 +35,7 @@ from sculptor.kg.query import EMBEDDING_MODEL, _embed_text, _get_embedder
 from sculptor.kg.schema import (
     Edge,
     FailureMode,
+    PROVENANCE_LLM_EXTRACTION,
     Relation,
     RunCase,
     Technique,
@@ -295,6 +296,11 @@ def record_run_cases(
                 store.add_node(FailureMode(
                     id=fm_id, name=str(fm),
                     description="(diagnoser-flagged failure mode; not paper-derived)",
+                    # Not paper-derived: the type default (paper_claim) would
+                    # over-trust a diagnoser inference. A later paper
+                    # extraction that attests this failure mode upgrades it
+                    # via schema.merge_provenance (extract._materialize).
+                    provenance=PROVENANCE_LLM_EXTRACTION,
                 ))
             store.add_edge(Edge(
                 src=case.id, dst=fm_id,
@@ -313,26 +319,16 @@ class CaseMatch:
 
 
 def _ensure_case_embeddings(store: SculptorKG, model_name: str = EMBEDDING_MODEL):
-    """Embed every RunCase that lacks a cached vector (lazy backfill, same
-    pattern as Technique embeddings), return [(case, vector), ...]."""
-    import numpy as np
+    """Staleness-aware RunCase embedding pool (kg.query.ensure_embeddings).
+    Matters here specifically: a resumed run re-records the same case id
+    with a possibly UPDATED verdict/edit summary (`record_run_cases`
+    upserts), and `_case_text` embeds the verdict — the old
+    has_embedding-only check kept serving the pre-resume vector."""
+    from sculptor.kg.query import ensure_embeddings
 
     cases = store.find_nodes(kind=RunCase.kind)
-    need = [c for c in cases if not store.has_embedding(c.id, model_name)]
-    if need:
-        embedder = _get_embedder(model_name)
-        vecs = np.asarray(
-            embedder.encode([_case_text(c) for c in need], normalize_embeddings=True),
-            dtype=np.float32,
-        )
-        for c, v in zip(need, vecs):
-            store.set_embedding(c.id, model_name, v)
-    out = []
-    for c in cases:
-        v = store.get_embedding(c.id, model_name)
-        if v is not None:
-            out.append((c, v))
-    return out
+    return ensure_embeddings(
+        store, cases, _case_text, model_name, label="RunCase")
 
 
 #: §Agentic-data upgrade 4: similarity gap under which two cases are

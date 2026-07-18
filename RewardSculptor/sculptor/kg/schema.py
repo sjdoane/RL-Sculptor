@@ -80,6 +80,26 @@ def evidence_tag(provenance: str | None) -> str:
         provenance or "", _EVIDENCE_TAGS[PROVENANCE_LLM_EXTRACTION])
 
 
+#: Trust ranking for provenance merges (higher = more trusted). Unknown
+#: values rank lowest, same as the rendering fallback above.
+_PROVENANCE_TRUST: dict[str, int] = {
+    PROVENANCE_OBSERVED_RUN: 3,
+    PROVENANCE_PAPER_CLAIM: 2,
+    PROVENANCE_SEED: 1,
+    PROVENANCE_LLM_EXTRACTION: 0,
+}
+
+
+def merge_provenance(existing: str | None, incoming: str | None) -> str:
+    """Pick the MORE-trusted of two provenance values when merging node
+    data (e.g. a diagnoser-flagged FailureMode stub later attested by a
+    paper extraction upgrades llm_extraction -> paper_claim; the reverse
+    never downgrades). None/unknown values rank as least-trusted."""
+    e = existing or PROVENANCE_LLM_EXTRACTION
+    i = incoming or PROVENANCE_LLM_EXTRACTION
+    return e if _PROVENANCE_TRUST.get(e, 0) >= _PROVENANCE_TRUST.get(i, 0) else i
+
+
 # ── Relation enum ───────────────────────────────────────────────────────────
 class Relation(str, enum.Enum):
     CITES          = "CITES"
@@ -323,10 +343,21 @@ def node_to_row(node: Any) -> tuple[str, str, dict[str, Any]]:
 
 
 def row_to_node(node_id: str, kind: str, data: dict[str, Any]) -> Any:
-    """Inverse of `node_to_row`. Looks up the dataclass type by `kind`."""
+    """Inverse of `node_to_row`. Looks up the dataclass type by `kind`.
+
+    Forward-compatible on FIELDS: keys in `data` that this code version's
+    dataclass doesn't know are DROPPED (a row written by a newer schema
+    must not make older readers' `get_node` raise TypeError — symmetric
+    with the backward-compat direction, where a missing key falls back to
+    the field default). Unknown KINDS still raise: a whole node type this
+    code can't represent is not safely partial-readable."""
     cls = NODE_TYPES.get(kind)
     if cls is None:
         raise ValueError(f"unknown node kind: {kind!r}")
+    known = {f.name for f in dataclasses.fields(cls)} - {"id"}
+    extra = data.keys() - known
+    if extra:
+        data = {k: v for k, v in data.items() if k in known}
     return cls(id=node_id, **data)
 
 

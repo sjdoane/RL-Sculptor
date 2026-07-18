@@ -271,6 +271,58 @@ treated as regressions.
 Format per entry: date — what changed (files:lines) — why — evidence
 (tests/smoke) — commit.
 
+### 2026-07-18 — KG Phase-0 audit + hardening (substrate for the
+env-authoring milestone)
+
+Full audit of sculptor/kg/* (ingestion, extraction, embeddings,
+semantic + tag retrieval, run-case memory, shared-DB path resolution)
+before the env-authoring research corpus lands. Live shared-graph
+integrity measured first (1,662 nodes / 1,908 edges / 1,024 embeddings:
+0 dangling edges, 0 orphan embeddings, 0 stubs, 100 % of the three
+semantic pools embedded — but 20 papers with dead `/tmp/pdfs/*`
+full_text_path sidecars). Confirmed defects fixed:
+
+1. **Extraction merge data-loss (HIGH)**: `extract._materialize`
+   rebuilt existing Technique/FailureMode/RewardComponent/Environment
+   nodes from the payload subset — re-extraction reset
+   `useful_citations`/`outcome_stats` (whole-GPU-run learning signals)
+   to 0/{} and clobbered provenance. Now `dataclasses.replace` merges:
+   unspoken fields survive; provenance upgrades by trust tier only
+   (new `schema.merge_provenance`; diagnoser-flagged FailureMode stubs
+   created as `llm_extraction`, upgraded to `paper_claim` when a paper
+   attests them, never downgraded).
+2. **Stale embeddings (MED)**: `has_embedding`-only pools served old
+   vectors forever after text changed (extraction enriches
+   descriptions; resumed runs re-attribute case verdicts, and
+   `_case_text` embeds the verdict). `node_embeddings` gains
+   `text_hash` (additive in-place migration); the three `_ensure_*`
+   pools share one staleness-aware `ensure_embeddings` (missing/stale
+   re-embed; pre-hash rows trusted once + hash-stamped).
+3. **Forward-compat (MED)**: `row_to_node` now drops unknown data
+   keys (newer-schema rows no longer TypeError older readers; unknown
+   KINDS still raise); `neighbors()`/`all_edges()` skip
+   unknown-relation rows with a once-per-relation warning instead of
+   aborting the whole scan.
+4. **Global socket timeout (MED)**: ingest/research wrapped arxiv
+   calls in `socket.setdefaulttimeout` — process-global; inside the
+   live uvicorn backend any socket created by another thread in the
+   window inherited a 30 s timeout. New `make_arxiv_client` binds the
+   timeout to the arxiv client's own requests session.
+5. **UI-side graph fragmentation (MED)**: backend
+   `project_kg_db_path` still preferred a legacy `<project>/kg/graph.db`
+   — the exact silo bug loop 5a removed sculptor-side, and run_manager
+   exports the result as `SCULPTOR_KG_PATH` to training runs. Now
+   always the shared path (once-per-file warning → `sculpt kg merge`);
+   backend `pdfs_dir` follows the resolved DB (has_pdf flags were
+   always False against the shared graph).
+6. **`sculpt kg doctor`** (new `sculptor/kg/doctor.py`): one-pass
+   integrity report (dangling edges, orphan embeddings, unknown
+   kinds/relations, stub titles, dead text paths, missing/stale/
+   unhashed embeddings) + `--fix` mechanical repairs +
+   `--reembed-all`; `heal_dead_text_paths` re-ingests the /tmp-era
+   papers. Doc/help staleness fixed (CLI `--store` text, store.py
+   header, docs/knowledge_graph.md legacy-path + research sections).
+
 ### 2026-07-05 — research-driven upgrades (gap analysis → three landed
 increments)
 

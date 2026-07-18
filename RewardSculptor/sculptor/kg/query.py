@@ -444,115 +444,92 @@ def _embed_text(text: str, model_name: str = EMBEDDING_MODEL):
     return np.asarray(vec, dtype=np.float32)
 
 
-def _ensure_technique_embeddings(
-    store: SculptorKG, model_name: str = EMBEDDING_MODEL
-) -> list[tuple[Technique, Any]]:
-    """Embed every Technique description that doesn't have a cached embedding
-    yet, return (technique, vector) for all techniques."""
+def technique_embed_text(t: Technique) -> str:
+    """Canonical embed-text for a Technique — the SINGLE definition both
+    the embedding writer and the staleness check hash against."""
+    return f"{t.name}. {t.description}".strip(". ")
+
+
+def failure_mode_embed_text(m: FailureMode) -> str:
+    """Canonical embed-text for a FailureMode (see technique_embed_text)."""
+    return f"{m.name}. {m.description}".strip(". ")
+
+
+def ensure_embeddings(
+    store: SculptorKG,
+    nodes: list[Any],
+    text_fn,
+    model_name: str = EMBEDDING_MODEL,
+    *,
+    label: str = "node",
+) -> list[tuple[Any, Any]]:
+    """Shared lazy embedding pool: embed nodes whose vector is MISSING or
+    STALE (text changed since the vector was cached — extraction merges
+    enrich descriptions, case verdicts are re-attributed on resume), stamp
+    trust-once hashes onto pre-hash rows, return (node, vector) for every
+    node with a vector.
+
+    §Phase-0 hardening 2026-07-18: replaces the three copy-pasted
+    `_ensure_*_embeddings` bodies whose `has_embedding`-only check served
+    stale geometry forever after a node's text changed."""
     import numpy as np
 
     _t0 = time.time()
-    techniques: list[Technique] = store.find_nodes(kind=Technique.kind)  # type: ignore[assignment]
+    need: list[tuple[Any, str]] = []
+    for n in nodes:
+        text = text_fn(n)
+        if not text:
+            continue
+        status = store.embedding_status(n.id, model_name, text)
+        if status == "unhashed":
+            # Pre-hash row: trust the cached vector once, start tracking.
+            store.backfill_embedding_hash(n.id, model_name, text)
+        elif status in ("missing", "stale"):
+            need.append((n, text))
     log.info(
-        "kg.query: fetched %d Technique nodes in %.2fs",
-        len(techniques), time.time() - _t0,
-    )
-    _t0 = time.time()
-    need: list[Technique] = [
-        t for t in techniques
-        if not store.has_embedding(t.id, model_name) and (t.description or t.name)
-    ]
-    log.info(
-        "kg.query: has_embedding scan: %d of %d missing in %.2fs",
-        len(need), len(techniques), time.time() - _t0,
+        "kg.query: embedding scan (%s): %d of %d to (re)embed in %.2fs",
+        label, len(need), len(nodes), time.time() - _t0,
     )
     if need:
-        log.info(
-            "kg.query: backfilling %d technique embeddings (first query after ingest)",
-            len(need),
-        )
         embedder = _get_embedder(model_name)
-        texts = [f"{t.name}. {t.description}".strip(". ") for t in need]
         _t0 = time.time()
-        vecs = embedder.encode(texts, normalize_embeddings=True)
-        log.info(
-            "kg.query: embedder.encode(%d texts) took %.2fs",
-            len(texts), time.time() - _t0,
+        vecs = np.asarray(
+            embedder.encode([t for _, t in need], normalize_embeddings=True),
+            dtype=np.float32,
         )
-        vecs = np.asarray(vecs, dtype=np.float32)
-        for t, v in zip(need, vecs):
-            store.set_embedding(t.id, model_name, v)
+        log.info(
+            "kg.query: embedder.encode(%d %s texts) took %.2fs",
+            len(need), label, time.time() - _t0,
+        )
+        for (n, text), v in zip(need, vecs):
+            store.set_embedding(n.id, model_name, v, text=text)
 
-    _t0 = time.time()
-    out: list[tuple[Technique, Any]] = []
-    for t in techniques:
-        v = store.get_embedding(t.id, model_name)
+    out: list[tuple[Any, Any]] = []
+    for n in nodes:
+        v = store.get_embedding(n.id, model_name)
         if v is not None:
-            out.append((t, v))
-    log.info(
-        "kg.query: loaded %d embeddings in %.2fs",
-        len(out), time.time() - _t0,
-    )
+            out.append((n, v))
     return out
+
+
+def _ensure_technique_embeddings(
+    store: SculptorKG, model_name: str = EMBEDDING_MODEL
+) -> list[tuple[Technique, Any]]:
+    """Staleness-aware Technique embedding pool (see ensure_embeddings)."""
+    techniques: list[Technique] = store.find_nodes(kind=Technique.kind)  # type: ignore[assignment]
+    return ensure_embeddings(
+        store, techniques, technique_embed_text, model_name,
+        label="Technique")
 
 
 def _ensure_failure_mode_embeddings(
     store: SculptorKG, model_name: str = EMBEDDING_MODEL
 ) -> list[tuple[FailureMode, Any]]:
-    """Embed every FailureMode name+description that doesn't have a cached
-    embedding yet, return (failure_mode, vector) for all failure modes.
-
-    Mirrors `_ensure_technique_embeddings` exactly, over FailureMode nodes
-    instead of Technique nodes — §KG-retrieval fix 2's embedding-matched
-    free-text failure descriptors (`resolve_failure_modes_semantic`) needs
-    the same lazy-embed-then-cache pool, just against a different node kind.
-    """
-    import numpy as np
-
-    _t0 = time.time()
+    """Staleness-aware FailureMode embedding pool (see ensure_embeddings)."""
     modes: list[FailureMode] = store.find_nodes(kind=FailureMode.kind)  # type: ignore[assignment]
-    log.info(
-        "kg.query: fetched %d FailureMode nodes in %.2fs",
-        len(modes), time.time() - _t0,
-    )
-    _t0 = time.time()
-    need: list[FailureMode] = [
-        m for m in modes
-        if not store.has_embedding(m.id, model_name) and (m.description or m.name)
-    ]
-    log.info(
-        "kg.query: has_embedding scan (FailureMode): %d of %d missing in %.2fs",
-        len(need), len(modes), time.time() - _t0,
-    )
-    if need:
-        log.info(
-            "kg.query: backfilling %d failure-mode embeddings (first "
-            "descriptor-resolution call after ingest)",
-            len(need),
-        )
-        embedder = _get_embedder(model_name)
-        texts = [f"{m.name}. {m.description}".strip(". ") for m in need]
-        _t0 = time.time()
-        vecs = embedder.encode(texts, normalize_embeddings=True)
-        log.info(
-            "kg.query: embedder.encode(%d texts) took %.2fs",
-            len(texts), time.time() - _t0,
-        )
-        vecs = np.asarray(vecs, dtype=np.float32)
-        for m, v in zip(need, vecs):
-            store.set_embedding(m.id, model_name, v)
-
-    _t0 = time.time()
-    out: list[tuple[FailureMode, Any]] = []
-    for m in modes:
-        v = store.get_embedding(m.id, model_name)
-        if v is not None:
-            out.append((m, v))
-    log.info(
-        "kg.query: loaded %d FailureMode embeddings in %.2fs",
-        len(out), time.time() - _t0,
-    )
-    return out
+    return ensure_embeddings(
+        store, modes, failure_mode_embed_text, model_name,
+        label="FailureMode")
 
 
 #: Default cosine floor for descriptor->FailureMode resolution

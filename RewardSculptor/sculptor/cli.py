@@ -264,7 +264,8 @@ def eval_list():
 _STORE_OPT = typer.Option(
     None,
     "--store",
-    help="Path to the KG DB (default: $SCULPTOR_KG_PATH or ./kg/graph.db).",
+    help="Path to the KG DB (default: $SCULPTOR_KG_PATH / $RS_KG_PATH, else "
+         "the shared ~/.local/share/sculptor/kg/graph.db).",
 )
 
 
@@ -394,6 +395,44 @@ def kg_heal_stubs(store: Optional[Path] = _STORE_OPT):
                 "  tip: still-stubbed papers probably hit arxiv rate-limit; "
                 "re-run after ~2 min"
             )
+
+
+@kg_app.command("doctor")
+def kg_doctor(
+    store: Optional[Path] = _STORE_OPT,
+    fix: bool = typer.Option(
+        False, "--fix",
+        help="Repair mechanical issues: delete orphan embeddings + dangling "
+             "edges, re-embed missing/stale vectors, heal stub titles and "
+             "dead full_text_path sidecars (the last two need network)."),
+    reembed_all: bool = typer.Option(
+        False, "--reembed-all",
+        help="With --fix: drop and rebuild EVERY semantic-pool embedding "
+             "(Technique/FailureMode/RunCase) — the escape hatch for "
+             "pre-hash vectors whose staleness is unknowable."),
+    no_network: bool = typer.Option(
+        False, "--no-network",
+        help="With --fix: skip the two repairs that hit arxiv."),
+):
+    """§Phase-0 hardening: full KG integrity report (referential slack,
+    stub/dead papers, missing + stale embeddings), optionally repaired.
+
+    Read-only without --fix. Exit code 1 when unfixed issues remain."""
+    from sculptor.kg.doctor import format_report, run_doctor
+
+    with _open_store(store) as kg:
+        report = run_doctor(
+            kg, fix=fix, reembed_all=reembed_all, network=not no_network)
+        typer.echo(format_report(report))
+        dirty = bool(
+            report["dangling_edges"] or report["orphan_embeddings"]
+            or report["unknown_kind_nodes"]
+            or report["unknown_relation_edges"]
+            or report["stub_titled_papers"] or report["dead_text_paths"]
+            or any(c["missing"] or c["stale"]
+                   for c in report["embedding_pools"].values()))
+        if dirty and not fix:
+            raise typer.Exit(code=1)
 
 
 @kg_app.command("viz")
