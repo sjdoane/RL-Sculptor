@@ -27,6 +27,7 @@ generic JSON and the embedding table already exists.
 from __future__ import annotations
 
 import hashlib
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -64,8 +65,13 @@ def _case_text(case: RunCase) -> str:
     retrieval keys on 'similar task with this failure'; the edit identities
     are included so 'similar edit under consideration' also matches."""
     edits = f" edits: {', '.join(case.edits)}." if case.edits else ""
+    scope = " ".join(
+        part for part in (
+            f"project: {case.project}." if case.project else "",
+            f"robot: {case.robot}." if case.robot else "",
+        ) if part)
     return (
-        f"{case.task}. symptom: {case.symptom}.{edits} "
+        f"{case.task}. {scope} symptom: {case.symptom}.{edits} "
         f"verdict: {case.verdict}"
     ).strip()
 
@@ -107,6 +113,7 @@ def record_run_cases(
     *,
     task: str,
     robot: str = "",
+    project: str = "",
     result,  # duck-typed SculptRunResult (avoids a sculpt<->kg import cycle)
     nonce: str | None = None,
     eps: float = 1e-4,
@@ -155,6 +162,16 @@ def record_run_cases(
             nonce = uuid.uuid4().hex[:8]
     fits = list(getattr(result, "fitness_history", []) or [])
     progs = list(getattr(result, "progress_history", []) or [])
+    def _technique_ids(references: list[str]) -> set[str]:
+        out: set[str] = set()
+        for arxiv_id in references:
+            for _, tech_id in store.neighbors(
+                    make_paper_id(str(arxiv_id)),
+                    relation=Relation.INTRODUCES, direction="out"):
+                if isinstance(store.get_node(tech_id), Technique):
+                    out.add(tech_id)
+        return out
+
     written = 0
     for idx, outcome in enumerate(iters):
         cur = fits[idx] if idx < len(fits) else None
@@ -227,19 +244,27 @@ def record_run_cases(
             str(reward_path_trained.stem) if reward_path_trained else None)
         env_spec_version = getattr(outcome, "env_spec_trained", None)
         case_id = make_run_case_id(task, iter_index, nonce)
-        # Counters below are cumulative — they must fire exactly once per
-        # case id; the node itself is upserted (refresh) either way.
-        already_recorded = store.has_node(case_id)
+        old_case = store.get_node(case_id)
+        old_case = old_case if isinstance(old_case, RunCase) else None
+        incoming_refs = sorted(set(
+            str(r) for r in (iter_references.get(iter_index, []) or []) if r))
+        # A transient unreadable reward artifact on resume must not erase
+        # references that were already persisted with this physical case.
+        case_refs = incoming_refs or (
+            list(old_case.references) if old_case is not None else [])
         case = RunCase(
             id=case_id,
-            task=task, robot=robot, symptom=symptom, failure_modes=fms,
+            task=task, robot=robot, project=project,
+            symptom=symptom, failure_modes=fms,
             edit_summary=edit_summary,
             fitness_before=cur, fitness_after=nxt, fitness_delta=delta,
             verdict=verdict,
-            edits=edits,
+            edits=edits, references=case_refs, attribution_version=1,
             progress_before=cur_p, progress_after=nxt_p,
             progress_delta=delta_p,
             behavior=behavior,
+            created_at=(old_case.created_at if old_case is not None
+                        else time.time()),
             reward_version=reward_version,
             env_spec_version=env_spec_version,
         )
@@ -255,36 +280,62 @@ def record_run_cases(
         # learning signal `query_techniques` can rank on (a technique that
         # helped THIS failure mode outranks one that only ever regressed
         # it, independent of the unscoped `useful_citations` count above).
-        # "unknown"/"neutral" iterations touch neither counter.
-        if verdict in ("helped", "regressed") and not already_recorded:
-            fm_ids_for_stats = [make_failure_mode_id(fm) for fm in fms]
-            for arxiv_id in iter_references.get(iter_index, []) or []:
-                paper_id = make_paper_id(str(arxiv_id))
-                for _, tech_id in store.neighbors(
-                    paper_id, relation=Relation.INTRODUCES, direction="out"
-                ):
-                    tech = store.get_node(tech_id)
-                    if not isinstance(tech, Technique):
-                        continue
-                    changed = False
-                    if verdict == "helped":
-                        tech.useful_citations = (
-                            int(tech.useful_citations or 0) + 1)
-                        changed = True
-                    if fm_ids_for_stats:
-                        stats = {
-                            k: dict(v) for k, v in (tech.outcome_stats or {}).items()
-                        }
-                        for fm_id in fm_ids_for_stats:
-                            entry = dict(stats.get(fm_id) or {})
-                            entry["helped"] = int(entry.get("helped", 0))
-                            entry["regressed"] = int(entry.get("regressed", 0))
-                            entry[verdict] += 1
-                            stats[fm_id] = entry
-                        tech.outcome_stats = stats
-                        changed = True
-                    if changed:
-                        store.add_node(tech)
+        # "unknown"/"neutral" iterations contribute zero. Re-recording is
+        # delta-based: unknown→helped adds once; helped→helped is a no-op;
+        # helped→regressed reverses the old contribution then adds the new.
+        old_verdict = old_case.verdict if old_case is not None else "unknown"
+        old_fm_ids = {
+            make_failure_mode_id(fm)
+            for fm in (old_case.failure_modes if old_case is not None else [])
+        }
+        new_fm_ids = {make_failure_mode_id(fm) for fm in fms}
+        old_references = (
+            list(old_case.references) if old_case is not None else [])
+        if (old_case is not None
+                and int(old_case.attribution_version or 0) < 1
+                and not old_references):
+            # Pre-reference rows may already have credited their papers, but
+            # did not persist which ones. On the first post-upgrade re-record,
+            # conservatively treat the supplied references as the old basis.
+            # This prevents live helped cases from being credited twice while
+            # still allowing unknown→helped to add its first contribution.
+            old_references = list(case_refs)
+        old_tech_ids = _technique_ids(old_references)
+        new_tech_ids = _technique_ids(case_refs)
+        for tech_id in old_tech_ids | new_tech_ids:
+            tech = store.get_node(tech_id)
+            if not isinstance(tech, Technique):
+                continue
+            old_active = tech_id in old_tech_ids
+            new_active = tech_id in new_tech_ids
+            useful_delta = (
+                int(new_active and verdict == "helped")
+                - int(old_active and old_verdict == "helped"))
+            if useful_delta:
+                tech.useful_citations = max(
+                    0, int(tech.useful_citations or 0) + useful_delta)
+            stats = {k: dict(v) for k, v in (tech.outcome_stats or {}).items()}
+            stats_changed = False
+            for fm_id in old_fm_ids | new_fm_ids:
+                entry = dict(stats.get(fm_id) or {})
+                entry["helped"] = int(entry.get("helped", 0))
+                entry["regressed"] = int(entry.get("regressed", 0))
+                for label in ("helped", "regressed"):
+                    delta_count = (
+                        int(new_active and fm_id in new_fm_ids
+                            and verdict == label)
+                        - int(old_active and fm_id in old_fm_ids
+                              and old_verdict == label))
+                    if delta_count:
+                        entry[label] = max(0, entry[label] + delta_count)
+                        stats_changed = True
+                if entry["helped"] or entry["regressed"]:
+                    stats[fm_id] = entry
+                else:
+                    stats.pop(fm_id, None)
+            if useful_delta or stats_changed:
+                tech.outcome_stats = stats
+                store.add_node(tech)
         for fm in fms:
             fm_id = make_failure_mode_id(fm)
             # §KG integrity: the diagnoser can flag a failure mode that was never
@@ -395,25 +446,26 @@ def _render_case_context(matches: list[CaseMatch]) -> str:
     the caller can prepend it unconditionally.
 
     §Agentic-data upgrade 1: each case carries a compact `[evidence: ...]`
-    tag (cases are RunCase nodes, so this is always "observed in THIS
-    project's own runs") and the block's header states the trust-tier
+    tag (cases are RunCase nodes, so this is always an observed run) and
+    the block's header states the trust-tier
     rule: observations from this system's own runs outrank paper claims
     when they conflict."""
     if not matches:
         return ""
     lines = [
         "# CASE MEMORY",
-        "# This system's OWN past runs on similar tasks/failures. Learn from "
+        "# This system's observed past runs on similar tasks/failures. Learn from "
         "them: prefer directions marked [+] (helped), and do NOT repeat ones "
         "marked [-] (regressed the objective).",
-        "# Observations from this system's own runs outrank paper claims "
+        "# Observed runs outrank paper claims "
         "when they conflict.",
     ]
     for m in matches:
         c = m.case
         lines.append(
             f"- {_VERDICT_MARK.get(c.verdict, '[?]')} {c.edit_summary} "
-            f"(task: {c.task[:60]}; sim {m.relevance_score:.2f}) "
+            f"(task: {c.task[:60]}; project: {c.project or 'unknown'}; "
+            f"robot: {c.robot or 'unknown'}; sim {m.relevance_score:.2f}) "
             # `provenance` is a NEW field (agentic-data upgrade 1) — same
             # defensive getattr as diagnose._render_kg_context so a case
             # object lacking it degrades to the least-trusted tag

@@ -224,6 +224,16 @@ def test_default_db_path_ignores_legacy_cwd_db(tmp_path, monkeypatch, capsys):
     assert "sculpt kg merge" in capsys.readouterr().err
 
 
+def test_default_db_path_alias_precedence_matches_ui(tmp_path, monkeypatch):
+    from sculptor.kg.store import default_db_path
+
+    rs_path = tmp_path / "rs.db"
+    sculptor_path = tmp_path / "sculptor.db"
+    monkeypatch.setenv("RS_KG_PATH", str(rs_path))
+    monkeypatch.setenv("SCULPTOR_KG_PATH", str(sculptor_path))
+    assert default_db_path() == rs_path.resolve()
+
+
 def test_merge_stores_is_additive_and_never_clobbers(tmp_path):
     """merge_stores copies missing nodes/edges/embeddings and NEVER
     overwrites an existing destination node (a legacy stub must not
@@ -243,17 +253,26 @@ def test_merge_stores_is_additive_and_never_clobbers(tmp_path):
         src.add_node(FailureMode(
             id="failure:static_equilibrium", name="static_equilibrium",
             description="(diagnoser-flagged stub)"))
+        # A vector for the poorer same-id source node must NOT be copied onto
+        # the richer destination node and later trust-stamped as fresh.
+        src.set_embedding(
+            "failure:static_equilibrium", "test-model",
+            np.zeros(4, dtype=np.float32), text="stub text")
         # src-only content.
         case = RunCase(id="case:x", task="hop", symptom="stand-still")
         src.add_node(case)
         src.add_edge(Edge(src="case:x", dst="failure:static_equilibrium",
                           relation=Relation.INSTANTIATES))
         src.set_embedding("case:x", "test-model",
-                          np.ones(4, dtype=np.float32))
+                          np.ones(4, dtype=np.float32), text="known source text")
+        legacy_case = RunCase(id="case:legacy", task="hop", symptom="old")
+        src.add_node(legacy_case)
+        src.set_embedding("case:legacy", "test-model",
+                          np.full(4, 2, dtype=np.float32))
         src.close()
 
         counts = merge_stores(tmp_path / "stray.db", dst)
-        assert counts["nodes"] == 1                # only the case copied
+        assert counts["nodes"] == 2                # both cases copied
         assert counts["nodes_skipped"] == 1        # stub did NOT clobber
         assert counts["edges"] == 1
         assert counts["embeddings"] == 1
@@ -261,9 +280,49 @@ def test_merge_stores_is_additive_and_never_clobbers(tmp_path):
         assert kept.description == "rich paper-derived description"
         assert dst.has_node("case:x")
         assert dst.has_embedding("case:x", "test-model")
+        assert dst.has_node("case:legacy")
+        assert not dst.has_embedding("case:legacy", "test-model")
+        assert not dst.has_embedding(
+            "failure:static_equilibrium", "test-model")
         # Idempotent: merging again adds nothing.
         counts2 = merge_stores(tmp_path / "stray.db", dst)
         assert counts2["nodes"] == 0 and counts2["edges"] == 0
+    finally:
+        dst.close()
+
+
+def test_merge_stores_unions_corroborating_edge_supports(tmp_path):
+    from sculptor.kg.schema import Edge, FailureMode, Relation, Technique
+    from sculptor.kg.store import SculptorKG, merge_stores
+
+    src = SculptorKG(tmp_path / "stray.db")
+    dst = SculptorKG(tmp_path / "shared.db")
+    tech = Technique(id="technique:rsi", name="rsi")
+    failure = FailureMode(id="failure:stuck", name="stuck")
+    for store in (src, dst):
+        store.add_node(tech)
+        store.add_node(failure)
+    dst.add_edge(Edge(
+        src=tech.id, dst=failure.id, relation=Relation.ADDRESSES,
+        data={"source_paper_id": "paper:dst", "evidence": "dst evidence",
+              "supports": [{"source_paper_id": "paper:dst",
+                            "evidence": "dst evidence"}]}))
+    src.add_edge(Edge(
+        src=tech.id, dst=failure.id, relation=Relation.ADDRESSES,
+        data={"source_paper_id": "paper:src", "evidence": "src evidence",
+              "supports": [{"source_paper_id": "paper:src",
+                            "evidence": "src evidence"}]}))
+    src.close()
+    try:
+        counts = merge_stores(tmp_path / "stray.db", dst)
+        assert counts["edges"] == 1
+        edge = dst.neighbors(
+            tech.id, relation=Relation.ADDRESSES, direction="out")[0][0]
+        assert edge.data["supports"] == [
+            {"source_paper_id": "paper:dst", "evidence": "dst evidence"},
+            {"source_paper_id": "paper:src", "evidence": "src evidence"},
+        ]
+        assert merge_stores(tmp_path / "stray.db", dst)["edges"] == 0
     finally:
         dst.close()
 

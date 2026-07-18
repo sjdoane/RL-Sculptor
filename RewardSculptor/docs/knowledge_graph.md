@@ -24,11 +24,11 @@ longer triggers a fresh Claude extract — the new project sees the
 existing 46 seed papers (plus any you added via "Research a topic") from
 day one.
 
-**Overrides** (highest precedence first):
+**Overrides** (highest precedence first, identical in the UI and core):
 
-- `$SCULPTOR_KG_PATH` — wins when both are set.
-- `$RS_KG_PATH` — UI-facing override. Used by the backend test suite to
+- `$RS_KG_PATH` — application/UI-facing override. Used by the backend test suite to
   redirect to a per-test tmp DB.
+- `$SCULPTOR_KG_PATH` — legacy sculptor-side alias.
 - Legacy per-project / per-directory DBs (`<cwd>/kg/graph.db`,
   `<project>/kg/graph.db`) are **no longer honored anywhere**
   (sculptor side removed 2026-07-03 loop 5a; UI backend aligned
@@ -89,7 +89,7 @@ Ingest into any existing project:
 cd ~/.local/share/reward-sculptor/projects/<slug>
 
 # Call sculpt's CLI against the global seeds file:
-uv run --project ~/projects/RewardSculptor sculpt kg ingest \
+uv run --project ~/projects/RewardSculptor python -m sculptor.kg.ingest \
     ~/projects/RewardSculptor/examples/kg_seeds_global.yml
 
 # Then extract entities (Techniques / FailureModes / RewardComponents
@@ -97,7 +97,8 @@ uv run --project ~/projects/RewardSculptor sculpt kg ingest \
 uv run --project ~/projects/RewardSculptor sculpt kg extract --all
 ```
 
-Expected: ~50 papers ingested (PDFs cached at `kg/pdfs/`), ~100+
+Expected: ~50 papers ingested (PDFs cached beside the shared DB at
+`~/.local/share/sculptor/kg/pdfs/`), ~100+
 Techniques / FailureModes / RewardComponents extracted. First ingest
 is slow (~2-5 minutes on cold arxiv cache); subsequent runs are
 idempotent.
@@ -142,7 +143,29 @@ embedded text since 2026-07-18, so a description enriched by a later
 extraction re-embeds instead of serving stale geometry) — and
 `--fix` repairs the mechanical ones (`--reembed-all` for a full
 embedding rebuild, `--no-network` to skip the two arxiv-touching heals).
-Read-only without `--fix`; exits 1 when unfixed issues remain.
+Paper applicability metadata is also embedded. Read-only without `--fix`;
+after `--fix` it performs a second audit and exits 1 if any issue remains.
+
+## Structured research campaigns and hybrid extraction
+
+Campaign seed entries may include `tier`, `tags`, `rationale`, and
+`source_url`. Ingestion persists them on the Paper node instead of using the
+rationale only for console output. `query_papers(...)` combines semantic
+similarity with tier/tag filters, so metadata-only A/B papers remain useful
+before entity extraction.
+
+For a hybrid campaign, select the exact high-priority tier rather than using
+an ID-sorted `--limit` or extracting the entire graph:
+
+```bash
+uv run sculpt kg extract \
+  --seeds kg_seeds_env_authoring_2026-07.yml \
+  --tier S
+```
+
+`--tag` can further restrict a campaign. Extraction edges retain a support
+list when multiple papers corroborate the same technique/failure claim, and
+retrieval renders evidence beside a citation from that same source.
 
 ## Prompt-time research — implemented
 

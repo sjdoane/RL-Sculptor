@@ -382,6 +382,48 @@ def _materialize(
     # Edge construction — evidence carried in the edge's data blob.
     edge_count = 0
 
+    def _add_supported_edge(
+        src: str, dst: str, relation: Relation, evidence: str,
+    ) -> None:
+        """Upsert a many-paper claim without erasing corroboration.
+
+        The edge table intentionally has one row per (src, dst, relation),
+        so claim-level provenance belongs in a `supports` list inside the
+        data blob. Legacy single-source fields remain mirrored for older
+        readers, while new readers can keep citation and evidence aligned.
+        """
+        existing_data: dict[str, Any] = {}
+        for old_edge, other in store.neighbors(
+                src, relation=relation, direction="out"):
+            if other == dst:
+                existing_data = dict(old_edge.data or {})
+                break
+        by_paper: dict[str, str] = {}
+        for support in existing_data.get("supports", []) or []:
+            if not isinstance(support, dict):
+                continue
+            pid = str(support.get("source_paper_id") or "")
+            if pid:
+                by_paper[pid] = str(support.get("evidence") or "")
+        legacy_pid = str(existing_data.get("source_paper_id") or "")
+        if legacy_pid:
+            by_paper.setdefault(
+                legacy_pid, str(existing_data.get("evidence") or ""))
+        if evidence or paper.id not in by_paper:
+            by_paper[paper.id] = evidence
+        supports = [
+            {"source_paper_id": pid, "evidence": ev}
+            for pid, ev in sorted(by_paper.items())
+        ]
+        store.add_edge(Edge(
+            src=src, dst=dst, relation=relation,
+            data={
+                "evidence": by_paper.get(paper.id, evidence),
+                "source_paper_id": paper.id,
+                "supports": supports,
+            },
+        ))
+
     # Paper INTRODUCES Technique
     technique_evidence = {t.name: t.evidence for t in payload.techniques if _good_evidence(t.evidence)}
     for rel in payload.paper_to_technique:
@@ -401,11 +443,9 @@ def _materialize(
         fid = _lookup_failure_mode(rel.failure_mode)
         if not (tid and fid):
             continue
-        store.add_edge(Edge(
-            src=tid, dst=fid, relation=Relation.ADDRESSES,
-            data={"evidence": failure_evidence.get(rel.failure_mode, ""),
-                  "source_paper_id": paper.id},
-        ))
+        _add_supported_edge(
+            tid, fid, Relation.ADDRESSES,
+            failure_evidence.get(rel.failure_mode, ""))
         edge_count += 1
 
     # Technique USES RewardComponent
@@ -415,11 +455,9 @@ def _materialize(
         rid = _lookup_reward_component(rel.reward_component)
         if not (tid and rid):
             continue
-        store.add_edge(Edge(
-            src=tid, dst=rid, relation=Relation.USES,
-            data={"evidence": rc_evidence.get(rel.reward_component, ""),
-                  "source_paper_id": paper.id},
-        ))
+        _add_supported_edge(
+            tid, rid, Relation.USES,
+            rc_evidence.get(rel.reward_component, ""))
         edge_count += 1
 
     # Paper EVALUATES_ON Environment
@@ -494,6 +532,9 @@ def extract_all(
     store: SculptorKG | None = None,
     force: bool = False,
     limit: int | None = None,
+    paper_ids: set[str] | None = None,
+    tier: str | None = None,
+    tags: set[str] | None = None,
     progress_cb: "Callable[[int, int, str], None] | None" = None,
 ) -> list[ExtractionResult]:
     """Run extraction over every Paper in the store.
@@ -511,16 +552,21 @@ def extract_all(
     store = store or SculptorKG()
     results: list[ExtractionResult] = []
     try:
-        try:
-            import anthropic
-            client = anthropic.Anthropic()
-        except Exception as e:
-            raise RuntimeError(
-                "anthropic client failed to initialize — set ANTHROPIC_API_KEY "
-                f"or install `anthropic`. ({type(e).__name__}: {e})"
-            ) from e
-
         papers: list[Paper] = store.find_nodes(kind=Paper.kind)  # type: ignore[assignment]
+        if paper_ids is not None:
+            present_ids = {p.id for p in papers}
+            for missing_id in sorted(paper_ids - present_ids):
+                results.append(ExtractionResult(
+                    paper_id=missing_id,
+                    error="selected campaign Paper is absent from this store"))
+            papers = [p for p in papers if p.id in paper_ids]
+        if tier:
+            papers = [p for p in papers
+                      if (p.tier or "").upper() == tier.upper()]
+        if tags:
+            wanted = {t.strip().lower() for t in tags if t.strip()}
+            papers = [p for p in papers
+                      if wanted.issubset({t.lower() for t in p.tags})]
         # Extract unextracted first, then (if force) re-extract already-extracted.
         papers.sort(key=lambda p: (p.extracted, p.arxiv_id))
 
@@ -536,6 +582,18 @@ def extract_all(
         skipped_before = [p for p in papers if not (force or not p.extracted)]
         for p in skipped_before:
             results.append(ExtractionResult(paper_id=p.id, skipped=True))
+
+        client = None
+        if work_queue:
+            try:
+                import anthropic
+                client = anthropic.Anthropic()
+            except Exception as e:
+                raise RuntimeError(
+                    "anthropic client failed to initialize — set "
+                    "ANTHROPIC_API_KEY or install `anthropic`. "
+                    f"({type(e).__name__}: {e})"
+                ) from e
 
         done = 0
         for p in work_queue:
@@ -563,10 +621,56 @@ def extract_all(
 
 
 # ── CLI entry (invoked via `sculpt kg extract --all`) ───────────────────────
-def cli_extract_all(store_path: Path | None, force: bool, limit: int | None, print_one: bool) -> int:
+def paper_ids_from_seeds(
+    seeds_path: Path | str,
+    *,
+    tier: str | None = None,
+    tag: str | None = None,
+) -> set[str]:
+    """Select exact Paper IDs from a structured campaign seeds file."""
+    import yaml
+    from sculptor.kg.ingest import _normalize_arxiv_id
+
+    doc = yaml.safe_load(Path(seeds_path).read_text(encoding="utf-8")) or {}
+    entries = doc.get("papers") or []
+    if not isinstance(entries, list):
+        raise ValueError("seeds `papers` must be a list")
+    wanted_tier = tier.upper() if tier else None
+    wanted_tag = tag.lower() if tag else None
+    out: set[str] = set()
+    for entry in entries:
+        if isinstance(entry, str):
+            if not wanted_tier and not wanted_tag:
+                out.add(make_paper_id(_normalize_arxiv_id(entry)))
+            continue
+        if not isinstance(entry, dict):
+            continue
+        if wanted_tier and str(entry.get("tier") or "").upper() != wanted_tier:
+            continue
+        entry_tags = {str(t).lower() for t in (entry.get("tags") or [])}
+        if wanted_tag and wanted_tag not in entry_tags:
+            continue
+        aid = entry.get("arxiv_id") or entry.get("id")
+        if aid:
+            out.add(make_paper_id(_normalize_arxiv_id(str(aid))))
+    return out
+
+
+def cli_extract_all(
+    store_path: Path | None,
+    force: bool,
+    limit: int | None,
+    print_one: bool,
+    *,
+    paper_ids: set[str] | None = None,
+    tier: str | None = None,
+    tags: set[str] | None = None,
+) -> int:
     store = SculptorKG(store_path) if store_path else SculptorKG()
     try:
-        results = extract_all(store=store, force=force, limit=limit)
+        results = extract_all(
+            store=store, force=force, limit=limit,
+            paper_ids=paper_ids, tier=tier, tags=tags)
     finally:
         store.close()
 

@@ -14,14 +14,14 @@ CLI:  sculpt kg doctor [--fix] [--reembed-all] [--no-network]
 Repairs under `fix=True`:
   * delete embedding rows whose node no longer exists (orphans);
   * delete edges whose src/dst node no longer exists (dangling);
-  * re-embed MISSING + STALE vectors for the three semantic pools
-    (Technique / FailureMode / RunCase) and stamp trust-once hashes on
+  * re-embed MISSING + STALE vectors for the four semantic pools
+    (Paper / Technique / FailureMode / RunCase) and stamp trust-once hashes on
     pre-hash rows — via kg.query.ensure_embeddings;
   * (network) heal stub-titled papers (`ingest.heal_stub_titles`);
   * (network) heal dead full_text_path sidecars
     (`ingest.heal_dead_text_paths`).
 
-`reembed_all=True` additionally drops every cached vector for the three
+`reembed_all=True` additionally drops every cached vector for the four
 pools first — the escape hatch for embeddings whose pre-hash staleness is
 unknowable (hash tracking only starts at the first post-upgrade scan).
 
@@ -42,15 +42,17 @@ def _known_relations() -> set[str]:
 
 
 def _semantic_pools(store: SculptorKG):
-    """The three (kind, nodes, text_fn) semantic-retrieval pools, using the
+    """The semantic-retrieval pools, using the
     SAME canonical text builders the live query paths embed with."""
     from sculptor.kg.cases import _case_text
     from sculptor.kg.query import (
         failure_mode_embed_text,
+        paper_embed_text,
         technique_embed_text,
     )
 
     return [
+        ("Paper", store.find_nodes(kind="Paper"), paper_embed_text),
         ("Technique",
          store.find_nodes(kind="Technique"), technique_embed_text),
         ("FailureMode",
@@ -182,6 +184,22 @@ def run_doctor(
                     " WHERE s.id IS NULL OR d.id IS NULL)")
             fixes["dangling_edges_deleted"] = len(report["dangling_edges"])
 
+        # Heal text-bearing Paper fields before embedding. Otherwise the same
+        # doctor invocation can cache a vector for the stub title, replace the
+        # title, and immediately report its freshly written vector as stale.
+        if network and report["stub_titled_papers"]:
+            from sculptor.kg.ingest import heal_stub_titles
+
+            fixes["stub_titles"] = heal_stub_titles(store=store)
+        if network and report["dead_text_paths"]:
+            from sculptor.kg.ingest import heal_dead_text_paths
+
+            fixes["dead_text_paths"] = heal_dead_text_paths(store=store)
+
+        # Network repairs upsert Paper nodes, so reload every pool before
+        # computing hashes or rebuilding vectors.
+        pool_specs = _semantic_pools(store)
+
         if reembed_all:
             pool_ids = [
                 n.id for _, nodes, _ in pool_specs for n in nodes]
@@ -202,14 +220,12 @@ def run_doctor(
             reembedded[kind] = store.count_embeddings(model) - before
         fixes["embeddings_added_by_kind"] = reembedded
 
-        if network and report["stub_titled_papers"]:
-            from sculptor.kg.ingest import heal_stub_titles
-
-            fixes["stub_titles"] = heal_stub_titles(store=store)
-        if network and report["dead_text_paths"]:
-            from sculptor.kg.ingest import heal_dead_text_paths
-
-            fixes["dead_text_paths"] = heal_dead_text_paths(store=store)
+        # A repair command must report the state AFTER repair, not merely the
+        # pre-fix findings plus optimistic action counts. Network healing can
+        # fail or leave a stub, and those residual issues must remain visible
+        # to the CLI exit status.
+        report["post_fix"] = run_doctor(
+            store, fix=False, model_name=model, network=False)
 
         return report
     finally:
@@ -255,4 +271,8 @@ def format_report(report: dict[str, Any]) -> str:
         lines.append("  fixes applied:")
         for k, v in report["fixes"].items():
             lines.append(f"    {k}: {v}")
+    if "post_fix" in report:
+        lines.append("  post-fix verification:")
+        rendered = format_report(report["post_fix"]).splitlines()[1:]
+        lines.extend(f"  {line}" for line in rendered)
     return "\n".join(lines)

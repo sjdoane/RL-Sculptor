@@ -353,16 +353,16 @@ def test_run_sculpt_job_exports_shared_kg_path_for_new_project(
     )
 
 
-def test_run_sculpt_job_honors_existing_legacy_kg(
+def test_run_sculpt_job_ignores_existing_legacy_kg(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Opposite case: if a project DOES have a pre-existing legacy
-    `<project>/kg/graph.db`, `run_sculpt_job` keeps pointing at it (no
-    silent migration to shared, per `project_kg_db_path`'s contract)."""
+    """A legacy project-local graph must never fragment spawned training
+    away from the shared graph; the resolver warns and exports shared."""
     import asyncio
 
     from backend.services import run_manager
     from backend.services.job_manager import Job
+    from backend.services.kg_store import shared_kg_db_path
 
     project_dir = tmp_path / "legacy-proj"
     (project_dir / "kg").mkdir(parents=True)
@@ -389,7 +389,8 @@ def test_run_sculpt_job_honors_existing_legacy_kg(
     with pytest.raises(_Sentinel):
         asyncio.run(runner(job, job._cancel))
 
-    assert captured["env"]["SCULPTOR_KG_PATH"] == str(legacy_db)
+    assert captured["env"]["SCULPTOR_KG_PATH"] == str(shared_kg_db_path())
+    assert captured["env"]["SCULPTOR_KG_PATH"] != str(legacy_db)
 
 
 # ── Test 1 follow-up (Issue C): training_iterations plumbing ─────────

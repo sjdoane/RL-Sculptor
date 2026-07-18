@@ -29,6 +29,8 @@ from sculptor.kg.query import (
     TechniqueMatch,
     _citation_boost,
     cite,
+    paper_embed_text,
+    query_papers,
     query_semantic,
     query_techniques,
 )
@@ -261,6 +263,68 @@ def test_query_techniques_domain_filter(kg):
     dc = query_techniques(
         ["sparse_reward"], domain_filter="discrete_control", store=kg)
     assert [m.technique.name for m in dc] == ["potential_based_shaping"]
+
+    # Normalized hierarchical tags: a broad `locomotion` tag and the
+    # scaffold's qualified `continuous_locomotion` query interoperate.
+    broad = query_techniques(
+        ["sparse_reward"], domain_filter="locomotion", store=kg)
+    assert [m.technique.name for m in broad] == ["reference_state_initialization"]
+
+
+def test_query_citation_and_evidence_use_same_supporting_paper(kg):
+    from sculptor.kg.schema import (
+        Edge, FailureMode, Paper, Relation, Technique,
+        make_failure_mode_id, make_paper_id, make_technique_id,
+    )
+
+    old = Paper(id=make_paper_id("2000.00001"), arxiv_id="2000.00001",
+                title="Claim Source", authors=["Old Author"], year=2020)
+    unrelated = Paper(id=make_paper_id("2500.00001"),
+                      arxiv_id="2500.00001", title="Newer Intro Only",
+                      authors=["New Author"], year=2025)
+    tech = Technique(id=make_technique_id("method"), name="method")
+    fm = FailureMode(id=make_failure_mode_id("failure"), name="failure")
+    for node in (old, unrelated, tech, fm):
+        kg.add_node(node)
+    kg.add_edge(Edge(src=old.id, dst=tech.id, relation=Relation.INTRODUCES))
+    kg.add_edge(Edge(
+        src=unrelated.id, dst=tech.id, relation=Relation.INTRODUCES))
+    kg.add_edge(Edge(
+        src=tech.id, dst=fm.id, relation=Relation.ADDRESSES,
+        data={"source_paper_id": old.id, "evidence": "old paper evidence"}))
+
+    match = query_techniques(["failure"], store=kg, top_k=1)[0]
+    assert "Claim Source" in match.paper_citation
+    assert "Newer Intro Only" not in match.paper_citation
+    assert match.evidence == "old paper evidence"
+
+
+def test_query_papers_combines_semantic_tier_and_normalized_tag_filters(
+        kg, monkeypatch):
+    import numpy as np
+    import sculptor.kg.query as qmod
+
+    p1 = Paper(
+        id=make_paper_id("2400.00001"), arxiv_id="2400.00001",
+        title="Terrain Curricula", abstract="rough terrain locomotion",
+        rationale="author uneven worlds", tags=["continuous_locomotion", "terrain"],
+        tier="S")
+    p2 = Paper(
+        id=make_paper_id("2400.00002"), arxiv_id="2400.00002",
+        title="Kitchen Objects", abstract="object manipulation",
+        rationale="author object tasks", tags=["objects"], tier="A")
+    for p, vec in ((p1, np.array([1.0, 0.0], np.float32)),
+                   (p2, np.array([0.0, 1.0], np.float32))):
+        kg.add_node(p)
+        kg.set_embedding(
+            p.id, "paper-test", vec, text=paper_embed_text(p))
+    monkeypatch.setattr(
+        qmod, "_embed_text",
+        lambda text, model_name=None: np.array([1.0, 0.0], np.float32))
+    hits = query_papers(
+        "rough walking", tags=["locomotion"], tier="s", store=kg,
+        model_name="paper-test", min_similarity=0.5)
+    assert [h.paper.id for h in hits] == [p1.id]
 
 
 def test_query_techniques_unknown_failure_returns_empty(kg):

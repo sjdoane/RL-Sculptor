@@ -2,8 +2,9 @@
 
 Covers:
   - `shared_kg_db_path()` resolution precedence (RS_KG_PATH > SCULPTOR_KG_PATH > default).
-  - `project_kg_db_path()` returns the shared path for new projects but
-    preserves legacy per-project DBs in place.
+  - `project_kg_db_path()` always returns the shared path; a leftover
+    legacy per-project DB is ignored with a once-per-file warning
+    (§Phase-0 hardening 2026-07-18 — no more graph fragmentation).
   - Bootstrap hook in main.py copies a bundled pre-extracted DB into
     the shared path on cold start when absent.
   - `GET /system/kg/stats` returns aggregate counts, or a zero-filled
@@ -78,15 +79,20 @@ def test_project_kg_db_path_routes_new_projects_to_shared(
     assert resolved == override.resolve()
 
 
-def test_project_kg_db_path_preserves_legacy_per_project_db(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_project_kg_db_path_ignores_legacy_per_project_db(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
-    """When <project>/kg/graph.db already exists (pre-Phase-1 project),
-    `project_kg_db_path` returns the legacy path — no silent migration."""
+    """§Phase-0 hardening 2026-07-18: a leftover <project>/kg/graph.db is
+    NEVER opened — it silently fragmented the graph (project diagnoses +
+    run-case writes siloed away from the shared DB, and run_manager
+    propagated the split to spawned training runs via SCULPTOR_KG_PATH).
+    The resolver now always returns the shared path and warns ONCE per
+    legacy file, pointing at `sculpt kg merge`."""
+    import logging
+
     from backend.services import kg_store
 
-    # Env override still points at the shared path — the legacy check
-    # must win over the env so existing projects aren't disrupted.
     override = tmp_path / "shared.db"
     monkeypatch.setenv("RS_KG_PATH", str(override))
 
@@ -95,8 +101,40 @@ def test_project_kg_db_path_preserves_legacy_per_project_db(
     legacy_db = project_dir / "kg" / "graph.db"
     legacy_db.write_bytes(b"SQLite format 3\x00" + b"\x00" * 100)
 
-    resolved = kg_store.project_kg_db_path(project_dir)
-    assert resolved == legacy_db
+    monkeypatch.setattr(kg_store, "_warned_legacy_dbs", set())
+    with caplog.at_level(logging.WARNING, logger=kg_store.log.name):
+        resolved = kg_store.project_kg_db_path(project_dir)
+        assert resolved == override.resolve()
+        assert any("sculpt kg merge" in r.message for r in caplog.records)
+        n_warn = len(caplog.records)
+        # once per legacy file, not per request
+        assert kg_store.project_kg_db_path(project_dir) == override.resolve()
+        assert len(caplog.records) == n_warn
+
+
+def test_pdfs_dir_follows_resolved_db(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PDF cache lives next to the RESOLVED DB (ingest writes pdfs at
+    `store.db_path.parent / "pdfs"`), not under the project dir."""
+    from backend.services import kg_store
+
+    override = tmp_path / "kgroot" / "shared.db"
+    monkeypatch.setenv("RS_KG_PATH", str(override))
+    project_dir = tmp_path / "proj"
+    project_dir.mkdir()
+    assert kg_store.pdfs_dir(project_dir) == override.resolve().parent / "pdfs"
+
+
+def test_old_style_arxiv_pdf_name_is_sanitized(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from backend.services import kg_store
+
+    override = tmp_path / "shared.db"
+    monkeypatch.setenv("RS_KG_PATH", str(override))
+    path = kg_store._paper_pdf_path(tmp_path / "proj", "hep-th/9901001")
+    assert path == override.resolve().parent / "pdfs" / "hep-th_9901001.pdf"
 
 
 # ── /system/kg/stats endpoint ────────────────────────────────────────

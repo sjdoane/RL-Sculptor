@@ -63,7 +63,7 @@ PROVENANCE_SEED = "seed"
 #: see the header line each renderer prepends: observations outrank paper
 #: claims when they conflict.
 _EVIDENCE_TAGS: dict[str, str] = {
-    PROVENANCE_OBSERVED_RUN: "[evidence: observed in THIS project's own runs]",
+    PROVENANCE_OBSERVED_RUN: "[evidence: observed run]",
     PROVENANCE_PAPER_CLAIM: "[evidence: paper]",
     PROVENANCE_SEED: "[evidence: seed]",
     PROVENANCE_LLM_EXTRACTION: "[evidence: llm-inferred]",
@@ -123,6 +123,13 @@ class Paper:
     year: int | None = None
     abstract: str = ""
     conclusion_text: str = ""
+    #: Campaign curation metadata. Unlike PDF-derived claims, these fields
+    #: record why the human/system chose this source and make unextracted
+    #: hybrid-corpus papers retrievable by domain.
+    rationale: str = ""
+    tags: list[str] = field(default_factory=list)
+    tier: str | None = None
+    source_url: str = ""
     full_text_path: str | None = None
     ingested_at: float = field(default_factory=time.time)
     extracted: bool = False  # set True after LLM extraction lands in a later prompt
@@ -227,6 +234,7 @@ class RunCase:
     id: str
     task: str                                  # the behavior goal
     robot: str = ""                            # env / robot tag (optional)
+    project: str = ""                          # project/stage scope (optional)
     symptom: str = ""                          # short failure description
     failure_modes: list[str] = field(default_factory=list)
     edit_summary: str = ""                     # what was changed in response
@@ -241,6 +249,13 @@ class RunCase:
     #: Compact applied-edit identities, e.g. ["decrease stance_weight",
     #: "add flight_bonus"] — what a future run must not blindly repeat.
     edits: list[str] = field(default_factory=list)
+    #: Paper references credited by this case. Persisted so a resumed run
+    #: can update/reverse counters when an unknown verdict becomes measured,
+    #: without double-counting an idempotent re-record.
+    references: list[str] = field(default_factory=list)
+    #: Attribution accounting schema. Rows written before references were
+    #: persisted load as 0, allowing one conservative migration on re-record.
+    attribution_version: int = 0
     #: Dense sub-success progress (§Convergence): the channel that ranks
     #: iters when the completion-gated fitness is 0.0 everywhere. Without
     #: it, every case from a below-gate run was verdict-'neutral' noise.

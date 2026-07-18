@@ -304,7 +304,7 @@ def test_render_case_context_includes_evidence_tag_and_header_rule() -> None:
         relevance_score=0.81,
     )]
     out = C._render_case_context(matches)
-    assert "[evidence: observed in THIS project's own runs]" in out
+    assert "[evidence: observed run]" in out
     assert "outrank paper claims" in out
 
 
@@ -582,6 +582,79 @@ def test_record_run_cases_rerun_does_not_double_count(tmp_path) -> None:
     fetched = store.get_node(tech.id)
     assert fetched.outcome_stats == {fm_id: {"helped": 2, "regressed": 0}}
     assert fetched.useful_citations == 2
+
+
+def test_rerecord_unknown_to_helped_updates_counters_once(tmp_path) -> None:
+    """A last iteration can be unknown on the first write, then acquire a
+    measured next iteration on resume. Its persisted case and counters must
+    move together, exactly once."""
+    store = SculptorKG(tmp_path / "kg.db")
+    paper = Paper(id=make_paper_id("1707.06347"),
+                  arxiv_id="1707.06347", title="PPO")
+    tech = Technique(id=make_technique_id("rsi"), name="rsi")
+    store.add_node(paper)
+    store.add_node(tech)
+    store.add_edge(Edge(src=paper.id, dst=tech.id,
+                        relation=Relation.INTRODUCES))
+    refs = {0: ["1707.06347"]}
+    first = types.SimpleNamespace(
+        completed_iters=[_outcome(0, ["reward_hacking"])],
+        fitness_history=[0.2])
+    C.record_run_cases(
+        store, task="kick", result=first, nonce="resume", iter_references=refs)
+    assert store.get_node(tech.id).useful_citations == 0
+
+    resumed = types.SimpleNamespace(
+        completed_iters=[_outcome(0, ["reward_hacking"]), _outcome(1, [])],
+        fitness_history=[0.2, 0.5])
+    C.record_run_cases(
+        store, task="kick", result=resumed, nonce="resume",
+        iter_references=refs)
+    C.record_run_cases(
+        store, task="kick", result=resumed, nonce="resume",
+        iter_references=refs)
+    fetched = store.get_node(tech.id)
+    fm_id = make_failure_mode_id("reward_hacking")
+    assert fetched.useful_citations == 1
+    assert fetched.outcome_stats == {
+        fm_id: {"helped": 1, "regressed": 0}}
+
+
+def test_legacy_helped_case_does_not_double_count_on_reference_migration(
+    tmp_path,
+) -> None:
+    """Pre-reference live rows already affected aggregate counters. Their
+    first upgraded re-record persists references without crediting twice."""
+    store = SculptorKG(tmp_path / "kg.db")
+    paper = Paper(id=make_paper_id("1707.06347"),
+                  arxiv_id="1707.06347", title="PPO")
+    fm_id = make_failure_mode_id("reward_hacking")
+    tech = Technique(
+        id=make_technique_id("rsi"), name="rsi", useful_citations=1,
+        outcome_stats={fm_id: {"helped": 1, "regressed": 0}})
+    store.add_node(paper)
+    store.add_node(tech)
+    store.add_edge(Edge(src=paper.id, dst=tech.id,
+                        relation=Relation.INTRODUCES))
+    store.add_node(RunCase(
+        id=C.make_run_case_id("kick", 0, "legacy"),
+        task="kick", symptom="reward_hacking",
+        failure_modes=["reward_hacking"], verdict="helped"))
+
+    result = types.SimpleNamespace(
+        completed_iters=[_outcome(0, ["reward_hacking"]), _outcome(1, [])],
+        fitness_history=[0.2, 0.5])
+    C.record_run_cases(
+        store, task="kick", result=result, nonce="legacy",
+        iter_references={0: ["1707.06347"]})
+
+    fetched = store.get_node(tech.id)
+    assert fetched.useful_citations == 1
+    assert fetched.outcome_stats == {
+        fm_id: {"helped": 1, "regressed": 0}}
+    migrated = store.get_node(C.make_run_case_id("kick", 0, "legacy"))
+    assert migrated.references == ["1707.06347"]
+    assert migrated.attribution_version == 1
 
 
 def test_regressed_iter_increments_outcome_stats_but_not_useful_citations(

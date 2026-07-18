@@ -81,8 +81,8 @@ def default_db_path() -> Path:
     """Resolve the default KG path.
 
     Resolution order:
-      1. `$SCULPTOR_KG_PATH` if set (legacy override).
-      2. `$RS_KG_PATH` if set (backend alias used by the UI test harness).
+      1. `$RS_KG_PATH` if set (application-wide/backend override).
+      2. `$SCULPTOR_KG_PATH` if set (legacy sculptor-side alias).
       3. The user-wide shared path: `~/.local/share/sculptor/kg/graph.db`.
 
     A cwd-relative `<cwd>/kg/graph.db` is NO LONGER honored (removed
@@ -94,7 +94,10 @@ def default_db_path() -> Path:
     into a silo no other entry point would ever read. One graph, one
     path; tests/CI isolate via the env vars.
     """
-    env = os.environ.get(ENV_VAR) or os.environ.get(BACKEND_ENV_VAR)
+    # Keep this order identical to reward-sculptor-ui's resolver. If both
+    # aliases are present, disagreeing precedence would make in-process UI
+    # reads and default SculptorKG() writers open different databases.
+    env = os.environ.get(BACKEND_ENV_VAR) or os.environ.get(ENV_VAR)
     if env:
         return Path(env).expanduser().resolve()
     legacy = (Path.cwd() / DEFAULT_RELATIVE_DB_PATH).resolve()
@@ -147,6 +150,60 @@ def embedding_text_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
 
 
+def _merge_corroborating_edge_data(
+    destination_raw: str, source_raw: str,
+) -> str | None:
+    """Union paper-level claim supports without overwriting destination data.
+
+    Edge JSON has an outer serialization envelope (``data`` +
+    ``created_at``). Only claim provenance inside the nested data mapping is
+    merged. Non-claim collisions remain destination-wins.
+    """
+    try:
+        destination = json.loads(destination_raw)
+        source = json.loads(source_raw)
+    except (TypeError, ValueError):
+        return None
+    dst_data = destination.get("data")
+    src_data = source.get("data")
+    if not isinstance(dst_data, dict) or not isinstance(src_data, dict):
+        return None
+
+    def supports(data: dict[str, Any]) -> dict[str, str]:
+        out: dict[str, str] = {}
+        for item in data.get("supports", []) or []:
+            if not isinstance(item, dict):
+                continue
+            paper_id = str(item.get("source_paper_id") or "")
+            if paper_id:
+                out[paper_id] = str(item.get("evidence") or "")
+        paper_id = str(data.get("source_paper_id") or "")
+        if paper_id:
+            out.setdefault(paper_id, str(data.get("evidence") or ""))
+        return out
+
+    dst_supports = supports(dst_data)
+    src_supports = supports(src_data)
+    if not dst_supports and not src_supports:
+        return None
+    combined = dict(dst_supports)
+    for paper_id, evidence in src_supports.items():
+        if paper_id not in combined or (not combined[paper_id] and evidence):
+            combined[paper_id] = evidence
+    merged_data = dict(dst_data)
+    merged_data["supports"] = [
+        {"source_paper_id": paper_id, "evidence": evidence}
+        for paper_id, evidence in sorted(combined.items())
+    ]
+    if not merged_data.get("source_paper_id") and src_data.get("source_paper_id"):
+        merged_data["source_paper_id"] = src_data["source_paper_id"]
+        merged_data["evidence"] = src_data.get("evidence", "")
+    if merged_data == dst_data:
+        return None
+    destination["data"] = merged_data
+    return json.dumps(destination, default=str)
+
+
 def merge_stores(src_path: Path | str, dst: "SculptorKG") -> dict[str, int]:
     """Merge a stray/legacy KG database INTO `dst` (the shared graph).
 
@@ -155,8 +212,11 @@ def merge_stores(src_path: Path | str, dst: "SculptorKG") -> dict[str, int]:
         (e.g. a diagnoser-flagged FailureMode with a placeholder
         description) must never clobber the shared graph's richer
         paper-derived node of the same id;
-      * edges: INSERT OR IGNORE (composite PK dedupes);
-      * embeddings copied only when (node_id, model) is absent.
+      * edges: new claims are inserted and corroborating paper supports are
+        unioned on composite-key collisions;
+      * embeddings copied only when (node_id, model) is absent and the source
+        row carries a text hash. Unhashed legacy vectors are never portable:
+        their source text is unknowable, so lazy embedding must rebuild them.
 
     The source file is left untouched — the caller decides whether to
     rename/delete it. Returns counts: {nodes, edges, embeddings,
@@ -169,34 +229,76 @@ def merge_stores(src_path: Path | str, dst: "SculptorKG") -> dict[str, int]:
     src = sqlite3.connect(str(src_path))
     src.row_factory = sqlite3.Row
     counts = {"nodes": 0, "edges": 0, "embeddings": 0, "nodes_skipped": 0}
+    # An embedding can be copied safely only when the destination node is
+    # byte-identical to the source node (including a newly copied node).
+    # Copying a legacy vector onto a richer same-id destination node and then
+    # trust-once stamping its NULL hash permanently mislabeled stale geometry
+    # as fresh in the live graph.
+    embedding_eligible_ids: set[str] = set()
     try:
+        src_embedding_cols = {
+            row["name"]
+            for row in src.execute("PRAGMA table_info(node_embeddings)")
+        }
+        has_text_hash = "text_hash" in src_embedding_cols
         with dst._tx() as cx:
             for row in src.execute("SELECT id, kind, data FROM nodes"):
+                existing = cx.execute(
+                    "SELECT kind, data FROM nodes WHERE id = ?", (row["id"],)
+                ).fetchone()
                 cur = cx.execute(
                     "INSERT OR IGNORE INTO nodes (id, kind, data) "
                     "VALUES (?, ?, ?)",
                     (row["id"], row["kind"], row["data"]))
                 if cur.rowcount:
                     counts["nodes"] += 1
+                    embedding_eligible_ids.add(row["id"])
                 else:
                     counts["nodes_skipped"] += 1
+                    if (existing is not None
+                            and existing["kind"] == row["kind"]
+                            and existing["data"] == row["data"]):
+                        embedding_eligible_ids.add(row["id"])
             for row in src.execute(
                     "SELECT src, dst, relation, data FROM edges"):
-                cur = cx.execute(
-                    "INSERT OR IGNORE INTO edges (src, dst, relation, data) "
-                    "VALUES (?, ?, ?, ?)",
-                    (row["src"], row["dst"], row["relation"], row["data"]))
-                counts["edges"] += int(cur.rowcount or 0)
-            for row in src.execute(
-                    "SELECT node_id, model, dim, vector, updated_at "
-                    "FROM node_embeddings"):
-                cur = cx.execute(
-                    "INSERT OR IGNORE INTO node_embeddings "
-                    "(node_id, model, dim, vector, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (row["node_id"], row["model"], row["dim"],
-                     row["vector"], row["updated_at"]))
-                counts["embeddings"] += int(cur.rowcount or 0)
+                existing_edge = cx.execute(
+                    "SELECT data FROM edges "
+                    "WHERE src = ? AND dst = ? AND relation = ?",
+                    (row["src"], row["dst"], row["relation"]),
+                ).fetchone()
+                if existing_edge is None:
+                    cx.execute(
+                        "INSERT INTO edges (src, dst, relation, data) "
+                        "VALUES (?, ?, ?, ?)",
+                        (row["src"], row["dst"], row["relation"], row["data"]))
+                    counts["edges"] += 1
+                else:
+                    merged = _merge_corroborating_edge_data(
+                        existing_edge["data"], row["data"])
+                    if merged is not None:
+                        cx.execute(
+                            "UPDATE edges SET data = ? "
+                            "WHERE src = ? AND dst = ? AND relation = ?",
+                            (merged, row["src"], row["dst"], row["relation"]))
+                        counts["edges"] += 1
+            if src_embedding_cols:  # very old stores may predate this table
+                emb_sql = (
+                    "SELECT node_id, model, dim, vector, updated_at, text_hash "
+                    "FROM node_embeddings" if has_text_hash else
+                    "SELECT node_id, model, dim, vector, updated_at, "
+                    "NULL AS text_hash FROM node_embeddings"
+                )
+                for row in src.execute(emb_sql):
+                    if (row["node_id"] not in embedding_eligible_ids
+                            or not row["text_hash"]):
+                        continue
+                    cur = cx.execute(
+                        "INSERT OR IGNORE INTO node_embeddings "
+                        "(node_id, model, dim, vector, updated_at, text_hash) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (row["node_id"], row["model"], row["dim"],
+                         row["vector"], row["updated_at"], row["text_hash"]))
+                    counts["embeddings"] += int(cur.rowcount or 0)
     finally:
         src.close()
     return counts

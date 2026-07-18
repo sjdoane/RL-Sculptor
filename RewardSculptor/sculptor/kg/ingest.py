@@ -32,6 +32,7 @@ Seeds format (see examples/hopper/kg_seeds.yml):
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import re
 import sys
 import time
@@ -133,19 +134,31 @@ def _download_pdf_with_timeout(url: str, dest: Path, *, timeout_s: float) -> Non
     interrupted download never leaves a partial `.pdf` that the idempotency
     check would later mistake for a successful ingest.
     """
+    import tempfile
     import urllib.request
 
-    partial = dest.with_suffix(dest.suffix + ".partial")
+    # A fixed `<paper>.pdf.partial` races when two UI/research workers ingest
+    # the same paper concurrently: one worker can rename the other worker's
+    # file, leaving its final replace with FileNotFoundError. Use a unique
+    # same-directory temporary file; os.replace remains atomic at commit.
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = tempfile.NamedTemporaryFile(
+        mode="wb", prefix=f".{dest.name}.", suffix=".partial",
+        dir=dest.parent, delete=False)
+    partial = Path(tmp.name)
     req = urllib.request.Request(
         url, headers={"User-Agent": "Reward-Sculptor/0.1 (arxiv ingest)"})
-    # Use socket-level timeout for the initial connect + idle reads.
-    with urllib.request.urlopen(req, timeout=timeout_s) as resp, partial.open("wb") as out:
-        while True:
-            chunk = resp.read(1 << 16)
-            if not chunk:
-                break
-            out.write(chunk)
-    partial.replace(dest)
+    try:
+        # Use socket-level timeout for the initial connect + idle reads.
+        with tmp, urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            while True:
+                chunk = resp.read(1 << 16)
+                if not chunk:
+                    break
+                tmp.write(chunk)
+        partial.replace(dest)
+    finally:
+        partial.unlink(missing_ok=True)
 
 
 def make_arxiv_client(
@@ -396,11 +409,26 @@ def ingest_arxiv(
         if meta is None:
             fm = fallback_metadata or {}
             meta = {
-                "title": fm.get("title", f"arxiv:{arxiv_id}"),
-                "authors": fm.get("authors", []) or [],
-                "year": fm.get("year"),
-                "abstract": fm.get("abstract", "") or "",
+                "title": (fm.get("title")
+                          or (existing.title if isinstance(existing, Paper)
+                              else f"arxiv:{arxiv_id}")),
+                "authors": (fm.get("authors")
+                            or (existing.authors if isinstance(existing, Paper)
+                                else []) or []),
+                "year": (fm.get("year")
+                         or (existing.year if isinstance(existing, Paper)
+                             else None)),
+                "abstract": (fm.get("abstract")
+                             or (existing.abstract
+                                 if isinstance(existing, Paper) else "") or ""),
             }
+        elif isinstance(existing, Paper):
+            # Even a successful metadata response may omit a field. Healing a
+            # dead sidecar must never downgrade unrelated rich metadata.
+            meta["title"] = meta.get("title") or existing.title
+            meta["authors"] = meta.get("authors") or existing.authors
+            meta["year"] = meta.get("year") or existing.year
+            meta["abstract"] = meta.get("abstract") or existing.abstract
 
         # ── PDF download (direct CDN URL, not API) ────────────────────────
         if not pdf_path.exists() or force:
@@ -412,6 +440,9 @@ def ingest_arxiv(
         text_path = _save_full_text_sidecar(_pdfs_dir(store), arxiv_id, full_text)
         conclusion = _extract_conclusion(full_text)
 
+        fm = fallback_metadata or {}
+        old_tags = list(existing.tags) if isinstance(existing, Paper) else []
+        incoming_tags = [str(t) for t in (fm.get("tags") or []) if t]
         paper = Paper(
             id=paper_id,
             arxiv_id=arxiv_id,
@@ -419,10 +450,24 @@ def ingest_arxiv(
             authors=list(meta["authors"]),
             year=meta["year"],
             abstract=meta["abstract"],
-            conclusion_text=conclusion,
+            conclusion_text=(conclusion or
+                             (existing.conclusion_text
+                              if isinstance(existing, Paper) else "")),
+            rationale=(str(fm.get("rationale") or "") or
+                       (existing.rationale
+                        if isinstance(existing, Paper) else "")),
+            tags=sorted(set(old_tags) | set(incoming_tags)),
+            tier=(str(fm.get("tier") or "").upper() or
+                  (existing.tier if isinstance(existing, Paper) else None)),
+            source_url=(str(fm.get("source_url") or "") or
+                        (existing.source_url
+                         if isinstance(existing, Paper) else "") or
+                        f"https://arxiv.org/abs/{arxiv_id}"),
             full_text_path=str(text_path),
             ingested_at=time.time(),
             extracted=existing.extracted if isinstance(existing, Paper) else False,
+            provenance=(existing.provenance
+                        if isinstance(existing, Paper) else "seed"),
         )
         store.add_node(paper, upsert=True)
         return paper
@@ -472,9 +517,19 @@ def ingest_from_seeds(
                     results["<missing arxiv_id>"] = "error: missing arxiv_id field"
                     continue
                 # Forward any fields the user provided as metadata fallback.
-                for k in ("title", "authors", "year", "abstract"):
+                for k in (
+                    "title", "authors", "year", "abstract", "rationale",
+                    "tags", "tier", "source_url",
+                ):
                     if entry.get(k):
                         fallback[k] = entry[k]
+                if not fallback.get("tags") and rationale:
+                    # Backward compatibility for older campaigns whose domain
+                    # tags lived only in a `[a+b+c]` rationale prefix.
+                    m = re.match(r"^\[([^]]+)\]", rationale.strip())
+                    if m:
+                        fallback["tags"] = [
+                            t.strip() for t in m.group(1).split("+") if t.strip()]
             else:
                 results[str(entry)] = f"error: unsupported entry type {type(entry).__name__}"
                 continue
@@ -485,6 +540,21 @@ def ingest_from_seeds(
                 _pdfs_dir(store) / _safe_pdf_name(_normalize_arxiv_id(arxiv_id))
             ).exists()
             if existing is not None and pdf_present and not force:
+                if isinstance(existing, Paper):
+                    enriched = dataclasses.replace(
+                        existing,
+                        rationale=(str(fallback.get("rationale") or "")
+                                   or existing.rationale),
+                        tags=sorted(set(existing.tags) | {
+                            str(t) for t in (fallback.get("tags") or []) if t}),
+                        tier=(str(fallback.get("tier") or "").upper()
+                              or existing.tier),
+                        source_url=(str(fallback.get("source_url") or "")
+                                    or existing.source_url
+                                    or f"https://arxiv.org/abs/{_normalize_arxiv_id(arxiv_id)}"),
+                    )
+                    if enriched != existing:
+                        store.add_node(enriched)
                 print(f"[ingest]   skip {arxiv_id} — already present", flush=True)
                 results[arxiv_id] = "already_present"
                 continue

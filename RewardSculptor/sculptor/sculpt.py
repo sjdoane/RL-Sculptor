@@ -2734,15 +2734,18 @@ def sculpt_run(
             from sculptor.kg.cases import record_run_cases
             from sculptor.kg.store import SculptorKG
 
-            # §usage-based enrichment: which papers each iteration's KEPT
+            # §usage-based enrichment: which papers each iteration's EDITED
             # reward actually cited — "helped" verdicts bump the cited
             # techniques' useful_citations (retrieval learns from what
             # got accepted, not just what was retrieved). Best-effort:
             # an unreadable reward file skips that iter's references.
             _iter_refs: dict[int, list[str]] = {}
             for _oc in result.completed_iters:
-                _rp = getattr(_oc, "reward_path_trained", None) or getattr(
-                    _oc, "reward_path_after", None)
+                # Iter N's edit is measured by iter N+1, so credit the reward
+                # produced AFTER N. The previous trained-first order credited
+                # the parent reward that the edit was changing.
+                _rp = getattr(_oc, "reward_path_after", None) or getattr(
+                    _oc, "reward_path_trained", None)
                 if not _rp or not Path(_rp).is_file():
                     continue
                 try:
@@ -2762,8 +2765,13 @@ def sculpt_run(
 
             _cstore = SculptorKG()
             try:
+                _adapter_cfg = (cfg.get("adapter") or {}).get("config") or {}
+                _robot = str(
+                    _adapter_cfg.get("task_id")
+                    or _adapter_cfg.get("env_id") or "")
                 _n_cases = record_run_cases(
-                    _cstore, task=behavior_goal, result=result,
+                    _cstore, task=behavior_goal, robot=_robot,
+                    project=config_path.parent.name, result=result,
                     iter_references=_iter_refs or None)
                 if _n_cases:
                     _emit_event({"type": "run_cases_recorded", "count": _n_cases})

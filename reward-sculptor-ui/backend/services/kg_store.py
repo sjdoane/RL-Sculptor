@@ -4,22 +4,35 @@ Everything here opens a fresh SculptorKG against the resolved KG path
 — the UI must never share a store handle across requests (sqlite's
 default threading mode is single-threaded per connection).
 
-**M7 Phase 1**: the default KG path is now user-wide shared at
+**M7 Phase 1**: the default KG path is user-wide shared at
 `~/.local/share/sculptor/kg/graph.db`, seeded once via the bundled
-pre-extracted DB. Pre-existing per-project `<project>/kg/graph.db`
-files are preserved in place (legacy fallback) so a user who had
-iterated on a project-local KG before Phase 1 keeps seeing the same
-graph. New projects default to the shared DB. Override globally via
-the `RS_KG_PATH` env var.
+pre-extracted DB. Override globally via the `RS_KG_PATH` env var.
+
+**§Phase-0 hardening 2026-07-18**: the legacy per-project
+`<project>/kg/graph.db` fallback is GONE — it was the same silent
+graph-fragmentation trap sculptor's `default_db_path` removed on
+2026-07-03 (loop 5a): a leftover project-local DB siloed that
+project's diagnoses AND its run-case writes away from the shared
+graph, and because `run_manager` exports this resolution as
+`SCULPTOR_KG_PATH` to spawned runs, the split propagated to training.
+A leftover legacy file now only triggers a once-per-project warning
+pointing at `sculpt kg merge`.
 
 Used by routes/kg.py.
 """
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 from typing import Any, Optional
+
+log = logging.getLogger(__name__)
+
+#: Legacy per-project DBs we already warned about this process — the
+#: resolver runs on every request; one log line per project is enough.
+_warned_legacy_dbs: set[Path] = set()
 
 from backend.models.kg import (
     KGEntitySummary,
@@ -52,22 +65,22 @@ def shared_kg_db_path() -> Path:
 
 
 def project_kg_db_path(project_dir: Path) -> Path:
-    """Resolve the KG DB path for a given project.
+    """Resolve the KG DB path for a given project: ALWAYS the shared
+    graph (or its env override) — one graph, one path, same contract as
+    `sculptor.kg.store.default_db_path()`.
 
-    Precedence (highest first):
-      1. `shared_kg_db_path()` when a legacy per-project DB is ABSENT
-         (the Phase-1 default — one graph per user).
-      2. Legacy `<project>/kg/graph.db` if it already exists on disk
-         (back-compat for pre-Phase-1 projects).
-
-    Env-var overrides are folded into `shared_kg_db_path()`, so
-    setting `RS_KG_PATH` redirects all projects at once — including
-    newly-created ones.
+    A leftover legacy `<project>/kg/graph.db` is never opened; it gets
+    a once-per-project warning pointing at `sculpt kg merge <path>`
+    (additive-only — nothing in it can clobber the shared graph).
     """
-    legacy = project_dir / "kg" / "graph.db"
-    if legacy.is_file():
-        return legacy
+    legacy = (project_dir / "kg" / "graph.db").resolve()
     shared = shared_kg_db_path()
+    if legacy.is_file() and legacy != shared and legacy not in _warned_legacy_dbs:
+        _warned_legacy_dbs.add(legacy)
+        log.warning(
+            "ignoring legacy per-project KG at %s — using the shared graph "
+            "at %s. Merge it with `sculpt kg merge %s` (or delete it) to "
+            "silence this.", legacy, shared, legacy)
     shared.parent.mkdir(parents=True, exist_ok=True)
     return shared
 
@@ -82,11 +95,17 @@ def _open_store(project_dir: Path):
 
 
 def pdfs_dir(project_dir: Path) -> Path:
-    return project_dir / "kg" / "pdfs"
+    """PDF cache next to the RESOLVED DB (matching `ingest._pdfs_dir`,
+    which roots pdfs at `store.db_path.parent / "pdfs"`). The old
+    `<project>/kg/pdfs` return value pointed at a directory the shared
+    ingest never writes, so every `has_pdf` flag rendered False."""
+    return project_kg_db_path(project_dir).parent / "pdfs"
 
 
 def _paper_pdf_path(project_dir: Path, arxiv_id: str) -> Path:
-    return pdfs_dir(project_dir) / f"{arxiv_id}.pdf"
+    # Match sculptor.kg.ingest._safe_pdf_name for old-style IDs such as
+    # hep-th/9901001; treating the slash as a directory made has_pdf false.
+    return pdfs_dir(project_dir) / f"{arxiv_id.replace('/', '_')}.pdf"
 
 
 # ── reads ─────────────────────────────────────────────────────────────

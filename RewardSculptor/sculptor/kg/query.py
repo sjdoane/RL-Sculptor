@@ -133,6 +133,12 @@ class TechniqueMatch:
     source_paper_ids: list[str] = field(default_factory=list)
 
 
+@dataclass
+class PaperMatch:
+    paper: Paper
+    relevance_score: float
+
+
 # ── cite() ──────────────────────────────────────────────────────────────────
 def cite(arxiv_id: str, *, store: SculptorKG | None = None) -> str:
     """Short human-facing citation string for a paper by arxiv_id.
@@ -210,6 +216,18 @@ def _resolve_failure_modes(
     return out
 
 
+def _normalize_domain_tag(value: str) -> str:
+    import re
+    return re.sub(r"_+", "_", re.sub(
+        r"[^a-z0-9]+", "_", value.strip().lower())).strip("_")
+
+
+def _domain_tags_compatible(a: str, b: str) -> bool:
+    # Normalize spaces/hyphens/underscores and allow a taxonomy's qualified
+    # child (`continuous_locomotion`) to match its head tag (`locomotion`).
+    return (a == b or a.endswith("_" + b) or b.endswith("_" + a))
+
+
 def _paper_touches_domain(
     store: SculptorKG, paper_id: str, domain: str
 ) -> bool:
@@ -217,15 +235,31 @@ def _paper_touches_domain(
     include the domain string (case-insensitive)."""
     if not domain:
         return True
-    target = domain.strip().lower()
+    target = _normalize_domain_tag(domain)
     for _, env_id in store.neighbors(paper_id, relation=Relation.EVALUATES_ON, direction="out"):
         env = store.get_node(env_id)
         if isinstance(env, Environment):
-            tags = [t.lower() for t in env.tags]
-            name = env.name.lower()
-            if target in tags or target in name:
+            tags = [_normalize_domain_tag(t) for t in env.tags]
+            name = _normalize_domain_tag(env.name)
+            if any(_domain_tags_compatible(target, tag) for tag in tags) or target in name:
                 return True
     return False
+
+
+def _edge_supports(data: dict[str, Any] | None) -> dict[str, str]:
+    """Normalize legacy single-source and new corroborating edge data."""
+    data = data or {}
+    out: dict[str, str] = {}
+    for support in data.get("supports", []) or []:
+        if not isinstance(support, dict):
+            continue
+        pid = str(support.get("source_paper_id") or "")
+        if pid:
+            out[pid] = str(support.get("evidence") or "")
+    legacy_pid = str(data.get("source_paper_id") or "")
+    if legacy_pid:
+        out.setdefault(legacy_pid, str(data.get("evidence") or ""))
+    return out
 
 
 def query_techniques(
@@ -288,14 +322,17 @@ def query_techniques(
                     "matched_fms": set(),
                     "evidence": "",
                     "source_paper_ids": set(),
+                    "support_by_paper": {},
                 })
                 bucket["matched_raw"].add(raw)
                 bucket["matched_fms"].add(fm.name)
                 if not bucket["evidence"] and edge.data.get("evidence"):
                     bucket["evidence"] = edge.data["evidence"]
-                src = edge.data.get("source_paper_id")
-                if src:
+                for src, evidence in _edge_supports(edge.data).items():
                     bucket["source_paper_ids"].add(src)
+                    old = bucket["support_by_paper"].get(src, "")
+                    if len(evidence) > len(old):
+                        bucket["support_by_paper"][src] = evidence
 
         # Resolve introducing paper(s) via INTRODUCES inbound edges; fall back
         # to whichever paper provided the ADDRESSES edge.
@@ -315,17 +352,30 @@ def query_techniques(
                     if isinstance(p, Paper):
                         intro_papers.append(p)
 
+            support_papers: list[Paper] = []
+            for pid in bucket["source_paper_ids"]:
+                p = store.get_node(pid)
+                if isinstance(p, Paper):
+                    support_papers.append(p)
+            citation_candidates = support_papers or intro_papers
             if domain_filter:
-                keep = any(
-                    _paper_touches_domain(store, p.id, domain_filter)
-                    for p in intro_papers
-                )
-                if not keep:
+                citation_candidates = [
+                    p for p in citation_candidates
+                    if _paper_touches_domain(store, p.id, domain_filter)
+                ]
+                if not citation_candidates:
                     continue
 
+            # Citation and evidence MUST come from the same supporting paper.
+            # The former newest-introducing-paper rule could put a 2025
+            # citation beside a claim/evidence recorded from a 2020 paper.
             newest_paper = max(
-                intro_papers, key=lambda p: (p.year or 0, p.arxiv_id), default=None)
+                citation_candidates,
+                key=lambda p: (p.year or 0, p.arxiv_id), default=None)
             citation = cite(newest_paper.arxiv_id, store=store) if newest_paper else "(unknown paper)"
+            evidence = (
+                bucket["support_by_paper"].get(newest_paper.id, "")
+                if newest_paper else "") or bucket["evidence"]
 
             score = float(len(bucket["matched_fms"]))
             if newest_paper and newest_paper.year:
@@ -345,7 +395,7 @@ def query_techniques(
                 technique=tech,
                 description=tech.description,
                 paper_citation=citation,
-                evidence=bucket["evidence"],
+                evidence=evidence,
                 relevance_score=score,
                 matched_on=sorted(bucket["matched_fms"]),
                 source_paper_ids=sorted(bucket["source_paper_ids"]),
@@ -453,6 +503,22 @@ def technique_embed_text(t: Technique) -> str:
 def failure_mode_embed_text(m: FailureMode) -> str:
     """Canonical embed-text for a FailureMode (see technique_embed_text)."""
     return f"{m.name}. {m.description}".strip(". ")
+
+
+def paper_embed_text(p: Paper) -> str:
+    """Canonical authoring/research retrieval text for a Paper."""
+    tags = ", ".join(p.tags)
+    return (
+        f"{p.title}. {p.abstract} Applicability: {p.rationale}. Tags: {tags}"
+    ).strip(". ")
+
+
+def _ensure_paper_embeddings(
+    store: SculptorKG, model_name: str = EMBEDDING_MODEL,
+) -> list[tuple[Paper, Any]]:
+    papers: list[Paper] = store.find_nodes(kind=Paper.kind)  # type: ignore[assignment]
+    return ensure_embeddings(
+        store, papers, paper_embed_text, model_name, label="Paper")
 
 
 def ensure_embeddings(
@@ -649,18 +715,18 @@ def query_semantic(
         results: list[TechniqueMatch] = []
         for ranked_score, sim, tech in scored[:top_k]:
             intro_papers: list[Paper] = []
-            evidence = ""
+            intro_evidence: dict[str, str] = {}
             for edge, paper_id in store.neighbors(
                 tech.id, relation=Relation.INTRODUCES, direction="in"
             ):
                 p = store.get_node(paper_id)
                 if isinstance(p, Paper):
                     intro_papers.append(p)
-                    if not evidence and edge.data.get("evidence"):
-                        evidence = edge.data["evidence"]
+                    intro_evidence[p.id] = str(edge.data.get("evidence") or "")
             newest = max(
                 intro_papers, key=lambda p: (p.year or 0, p.arxiv_id), default=None)
             citation = cite(newest.arxiv_id, store=store) if newest else "(unknown paper)"
+            evidence = intro_evidence.get(newest.id, "") if newest else ""
 
             results.append(TechniqueMatch(
                 technique=tech,
@@ -672,6 +738,59 @@ def query_semantic(
                 source_paper_ids=[p.id for p in intro_papers],
             ))
         return results
+    finally:
+        if owns_store:
+            store.close()
+
+
+def query_papers(
+    text: str,
+    top_k: int = 5,
+    *,
+    tags: list[str] | None = None,
+    tier: str | None = None,
+    store: SculptorKG | None = None,
+    model_name: str = EMBEDDING_MODEL,
+    min_similarity: float = 0.0,
+) -> list[PaperMatch]:
+    """Semantic Paper retrieval with exact structured campaign filters.
+
+    Every requested tag must match one paper tag after separator and
+    qualified-taxonomy normalization (`locomotion` matches
+    `continuous_locomotion`). Tier is case-insensitive. Unlike Technique
+    retrieval, this makes metadata-only A/B papers useful before extraction.
+    """
+    import numpy as np
+
+    owns_store = store is None
+    store = store or SculptorKG()
+    try:
+        requested = [str(t) for t in (tags or []) if str(t).strip()]
+        candidates: list[Paper] = store.find_nodes(kind=Paper.kind)  # type: ignore[assignment]
+        if tier:
+            wanted_tier = str(tier).upper()
+            candidates = [p for p in candidates if (p.tier or "").upper() == wanted_tier]
+        if requested:
+            candidates = [
+                p for p in candidates
+                if all(any(
+                    _domain_tags_compatible(_normalize_domain_tag(want),
+                                            _normalize_domain_tag(have))
+                    for have in p.tags)
+                    for want in requested)
+            ]
+        if not candidates:
+            return []
+        pool = ensure_embeddings(
+            store, candidates, paper_embed_text, model_name, label="Paper")
+        qv = _embed_text(text, model_name)
+        scored = [
+            (float(np.dot(qv, vec)), paper) for paper, vec in pool
+        ]
+        scored = [row for row in scored if row[0] >= min_similarity]
+        scored.sort(key=lambda row: (-row[0], row[1].arxiv_id))
+        return [PaperMatch(paper=p, relevance_score=score)
+                for score, p in scored[:top_k]]
     finally:
         if owns_store:
             store.close()

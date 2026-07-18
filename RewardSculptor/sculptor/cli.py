@@ -408,7 +408,7 @@ def kg_doctor(
     reembed_all: bool = typer.Option(
         False, "--reembed-all",
         help="With --fix: drop and rebuild EVERY semantic-pool embedding "
-             "(Technique/FailureMode/RunCase) — the escape hatch for "
+             "(Paper/Technique/FailureMode/RunCase) — the escape hatch for "
              "pre-hash vectors whose staleness is unknowable."),
     no_network: bool = typer.Option(
         False, "--no-network",
@@ -424,14 +424,15 @@ def kg_doctor(
         report = run_doctor(
             kg, fix=fix, reembed_all=reembed_all, network=not no_network)
         typer.echo(format_report(report))
+        effective = report.get("post_fix", report)
         dirty = bool(
-            report["dangling_edges"] or report["orphan_embeddings"]
-            or report["unknown_kind_nodes"]
-            or report["unknown_relation_edges"]
-            or report["stub_titled_papers"] or report["dead_text_paths"]
+            effective["dangling_edges"] or effective["orphan_embeddings"]
+            or effective["unknown_kind_nodes"]
+            or effective["unknown_relation_edges"]
+            or effective["stub_titled_papers"] or effective["dead_text_paths"]
             or any(c["missing"] or c["stale"]
-                   for c in report["embedding_pools"].values()))
-        if dirty and not fix:
+                   for c in effective["embedding_pools"].values()))
+        if dirty:
             raise typer.Exit(code=1)
 
 
@@ -485,6 +486,13 @@ def kg_extract(
         False, "--force", help="Re-extract papers even if already marked extracted."),
     limit: Optional[int] = typer.Option(
         None, "--limit", help="Cap number of papers processed this run."),
+    seeds: Optional[Path] = typer.Option(
+        None, "--seeds", exists=True, readable=True,
+        help="Restrict extraction to Paper IDs in this campaign seeds YAML."),
+    tier: Optional[str] = typer.Option(
+        None, "--tier", help="Restrict to a structured tier (for example S)."),
+    tag: Optional[str] = typer.Option(
+        None, "--tag", help="Restrict to one structured campaign tag."),
     print_one: bool = typer.Option(
         True, "--print-one/--no-print-one",
         help="Dump the first successful payload as JSON for inspection."),
@@ -495,12 +503,20 @@ def kg_extract(
     Requires `ANTHROPIC_API_KEY` in the environment. Creates Technique,
     FailureMode, RewardComponent, Environment nodes and their edges.
     """
-    from sculptor.kg.extract import cli_extract_all
+    from sculptor.kg.extract import cli_extract_all, paper_ids_from_seeds
 
-    if not (all_ or force):
-        typer.echo("specify --all to extract every unextracted paper")
+    if not (all_ or force or seeds or tier or tag):
+        typer.echo("specify --all, --seeds, --tier, or --tag")
         raise typer.Exit(code=2)
-    raise typer.Exit(code=cli_extract_all(store, force=force, limit=limit, print_one=print_one))
+    paper_ids = (
+        paper_ids_from_seeds(seeds, tier=tier, tag=tag) if seeds else None)
+    if seeds and not paper_ids:
+        typer.echo("selection matched no papers")
+        raise typer.Exit(code=2)
+    raise typer.Exit(code=cli_extract_all(
+        store, force=force, limit=limit, print_one=print_one,
+        paper_ids=paper_ids, tier=(None if seeds else tier),
+        tags=({tag} if tag and not seeds else None)))
 
 
 @app.command()
