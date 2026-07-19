@@ -746,3 +746,60 @@ def test_no_failure_modes_flagged_leaves_outcome_stats_untouched(tmp_path) -> No
     assert fetched.outcome_stats == {}
     assert fetched.useful_citations == 1
     store.close()
+
+
+# ── §Env-authoring §10: world-tuple identity ──────────────────────────────
+def _outcome_with_world(i, fms, *, sel_hash=None, sel_path=None):
+    return types.SimpleNamespace(
+        iter_index=i, failure_modes=fms, edit_count=0,
+        world_selection_hash=sel_hash, world_selection_path=sel_path,
+    )
+
+
+def test_world_identity_populates_from_pinned_selection(tmp_path) -> None:
+    import json
+
+    sel = tmp_path / "selection_v5.json"
+    sel.write_text(json.dumps({
+        "selection_version": 5,
+        "refs": {"world": {"version": 3}, "task": {"version": 1}},
+        "tuple_hash": "abc123",
+    }))
+    store = SculptorKG(tmp_path / "kg.db")
+    result = types.SimpleNamespace(
+        completed_iters=[_outcome_with_world(
+            0, ["x"], sel_hash="abc123", sel_path=str(sel))],
+        fitness_history=[0.1, 0.4],
+    )
+    C.record_run_cases(store, task="kick", result=result, nonce="w1")
+    (case,) = store.find_nodes(kind=RunCase.kind)
+    assert case.world_tuple_hash == "abc123"
+    assert case.world_version == 3
+    assert case.task_version == 1
+    store.close()
+
+
+def test_world_identity_fail_soft_on_legacy_and_dead_path(tmp_path) -> None:
+    """Legacy outcomes (no world attrs) and a dead selection path must
+    record None identity fields, never raise — world identity is
+    freshness evidence, not a record blocker."""
+    store = SculptorKG(tmp_path / "kg.db")
+    result = types.SimpleNamespace(
+        completed_iters=[
+            _outcome(0, ["x"]),
+            _outcome_with_world(
+                1, ["y"], sel_hash="livehash",
+                sel_path=str(tmp_path / "missing.json")),
+            _outcome(2, []),
+        ],
+        fitness_history=[0.1, 0.4, 0.5, 0.6],
+    )
+    n = C.record_run_cases(store, task="kick", result=result, nonce="w2")
+    assert n == 2  # the trailing no-failure iter records nothing
+    cases = list(store.find_nodes(kind=RunCase.kind))
+    legacy = [c for c in cases if c.world_tuple_hash is None]
+    dead = [c for c in cases if c.world_tuple_hash == "livehash"]
+    assert len(legacy) == 1 and len(dead) == 1
+    assert dead[0].world_version is None
+    assert dead[0].task_version is None
+    store.close()

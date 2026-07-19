@@ -27,6 +27,7 @@ generic JSON and the embedding table already exists.
 from __future__ import annotations
 
 import hashlib
+import json
 import time
 import uuid
 from dataclasses import dataclass
@@ -74,6 +75,27 @@ def _case_text(case: RunCase) -> str:
         f"{case.task}. {scope} symptom: {case.symptom}.{edits} "
         f"verdict: {case.verdict}"
     ).strip()
+
+
+def _world_identity(outcome) -> tuple[str | None, int | None, int | None]:
+    """(tuple_hash, world_version, task_version) of the atomic selection
+    this iteration trained under (env-authoring §10). ``IterOutcome``
+    already carries the pinned selection hash/path, so no sculpt.py
+    call-site change is needed. Fail-soft by contract: legacy runs and
+    any read/parse failure return (None, None, None) — world identity is
+    freshness evidence, never a record blocker."""
+    tuple_hash = str(getattr(outcome, "world_selection_hash", "") or "") or None
+    world_v: int | None = None
+    task_v: int | None = None
+    path = getattr(outcome, "world_selection_path", None)
+    if path:
+        try:
+            refs = json.loads(Path(path).read_text())["refs"]
+            world_v = int(refs["world"]["version"])
+            task_v = int(refs["task"]["version"])
+        except Exception:  # noqa: BLE001 — fail-soft freshness metadata
+            pass
+    return tuple_hash, world_v, task_v
 
 
 # Behavior-signature keys worth carrying into a case, in priority order.
@@ -243,6 +265,7 @@ def record_run_cases(
         reward_version = (
             str(reward_path_trained.stem) if reward_path_trained else None)
         env_spec_version = getattr(outcome, "env_spec_trained", None)
+        world_tuple_hash, world_version, task_version = _world_identity(outcome)
         case_id = make_run_case_id(task, iter_index, nonce)
         old_case = store.get_node(case_id)
         old_case = old_case if isinstance(old_case, RunCase) else None
@@ -267,6 +290,9 @@ def record_run_cases(
                         else time.time()),
             reward_version=reward_version,
             env_spec_version=env_spec_version,
+            world_tuple_hash=world_tuple_hash,
+            world_version=world_version,
+            task_version=task_version,
         )
         store.add_node(case)
         # §Agentic-data upgrade 2: usage-based enrichment. A "helped" iter

@@ -280,6 +280,16 @@ class RunCase:
     #: with no trained-reward path recorded).
     reward_version: str | None = None
     env_spec_version: str | None = None
+    #: §Env-authoring §10 (world-tuple identity): the atomic selection's
+    #: tuple_hash plus the world/task artifact versions ACTIVE while this
+    #: iteration trained. Lets retrieval and humans judge how stale a case
+    #: is relative to the project's current authored world, and ties the
+    #: measured outcome to one exact evaluation lineage. Read fail-soft
+    #: from the iteration's pinned selection file; None for legacy
+    #: (non-authored) runs and pre-upgrade rows.
+    world_tuple_hash: str | None = None
+    world_version: int | None = None
+    task_version: int | None = None
 
 
 @dataclass
