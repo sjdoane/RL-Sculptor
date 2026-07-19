@@ -138,6 +138,18 @@ The diagnoser world-edit surface and world keep/revert are also complete:
   hallucinated edits dropped without a surface; base_selection revert
   restores the complete world half with preserved lineage).
 
+Adversarial verification of the item-4 slices (subagent, per the
+every-phase mandate): claims 2-4 CONFIRMED; claim 1 REFUTED and fixed —
+`_world_identity` parsed ArtifactRef versions with `int("v1")` (always
+swallowed → None in every authored run) and the original test masked it
+with an integer-version fixture the store never emits. Fixed with
+`_artifact_version_int` ("v<N>" + bare-int tolerated), the fixture now
+uses the real string format, and the production path was empirically
+re-probed (returns real versions). Also fixed the verifier's TOCTOU
+finding: `apply_world_variation_edits` now holds the store lock across
+read-edit-admit (FileLock is reentrant) so a concurrent UI promotion
+cannot be clobbered by a train edit applied to a stale parent.
+
 Still open in item 4:
 
 - promotion statistics for the diagnoser (per-difficulty-level success /

@@ -760,9 +760,12 @@ def test_world_identity_populates_from_pinned_selection(tmp_path) -> None:
     import json
 
     sel = tmp_path / "selection_v5.json"
+    # The REAL store serializes ArtifactRef versions as "v<N>" strings
+    # (verifier finding: an integer-version fixture passed while
+    # production silently recorded None).
     sel.write_text(json.dumps({
         "selection_version": 5,
-        "refs": {"world": {"version": 3}, "task": {"version": 1}},
+        "refs": {"world": {"version": "v3"}, "task": {"version": "v1"}},
         "tuple_hash": "abc123",
     }))
     store = SculptorKG(tmp_path / "kg.db")

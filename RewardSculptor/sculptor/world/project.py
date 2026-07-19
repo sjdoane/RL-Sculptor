@@ -361,6 +361,19 @@ def apply_world_variation_edits(
     applied (the authoritative selection is untouched).
     """
     service = service or WorldProjectService(project_dir)
+    # Hold the store lock across read-edit-admit so a concurrent promotion
+    # (e.g. UI re-authoring during a run) cannot land between the bundle
+    # read and this promotion and be silently clobbered by a train edit
+    # applied to its stale parent. The store's FileLock is reentrant, so
+    # admit_and_promote's own locked() below nests safely.
+    with service.store.locked():
+        return _apply_world_variation_edits_locked(service, edits)
+
+
+def _apply_world_variation_edits_locked(
+    service: WorldProjectService,
+    edits: Iterable[WorldVariationEdit],
+) -> dict[str, Any]:
     bundle = service.current_bundle()
     if not bundle:
         raise WorldPromotionError(

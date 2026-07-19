@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import time
 import uuid
 from dataclasses import dataclass
@@ -77,6 +78,13 @@ def _case_text(case: RunCase) -> str:
     ).strip()
 
 
+def _artifact_version_int(raw) -> int | None:
+    """Parse an ArtifactRef version — the store serializes them as
+    ``"v<N>"`` strings (artifacts.ArtifactRef), bare ints tolerated."""
+    match = re.fullmatch(r"v?([0-9]+)", str(raw).strip())
+    return int(match.group(1)) if match else None
+
+
 def _world_identity(outcome) -> tuple[str | None, int | None, int | None]:
     """(tuple_hash, world_version, task_version) of the atomic selection
     this iteration trained under (env-authoring §10). ``IterOutcome``
@@ -91,8 +99,8 @@ def _world_identity(outcome) -> tuple[str | None, int | None, int | None]:
     if path:
         try:
             refs = json.loads(Path(path).read_text())["refs"]
-            world_v = int(refs["world"]["version"])
-            task_v = int(refs["task"]["version"])
+            world_v = _artifact_version_int(refs["world"]["version"])
+            task_v = _artifact_version_int(refs["task"]["version"])
         except Exception:  # noqa: BLE001 — fail-soft freshness metadata
             pass
     return tuple_hash, world_v, task_v
