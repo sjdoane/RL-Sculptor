@@ -2384,6 +2384,17 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
         "mean_return": float(np.mean(ep_returns)) if ep_returns else 0.0,
         "mean_episode_length": float(np.mean(ep_lengths)) if ep_lengths else 0.0,
         "max_episode_length": int(max(ep_lengths)) if ep_lengths else 0,
+        # §2026-07-19 (after Prompt2Policy's percentile-selected judge
+        # videos): the video/keyframes record env[0]'s FIRST episode — an
+        # arbitrary draw, not the best. Record its return and where it
+        # sits in this rollout's return distribution (inclusive CDF) so
+        # the diagnoser can weigh the frames' representativeness instead
+        # of assuming them typical.
+        "rendered_episode_return": (
+            float(ep_returns[0]) if ep_returns else None),
+        "rendered_episode_percentile": (
+            float(np.mean([r <= ep_returns[0] for r in ep_returns]))
+            if ep_returns else None),
         # §Ship 26 (E1/M1): capture settings are load-bearing for spec
         # metrics (frequency bands are in cycles/FRAME; episode-length
         # normalization needs the cap). Persisting them lets the eval

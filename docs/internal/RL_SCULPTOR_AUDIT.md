@@ -271,6 +271,33 @@ treated as regressions.
 Format per entry: date — what changed (files:lines) — why — evidence
 (tests/smoke) — commit.
 
+### 2026-07-19 — P2P-informed upgrades shipped: training guardrails +
+honest keyframe framing
+
+- **What**: `diagnose.py` `_training_guardrails` — two deterministic
+  screens over the per-component training series, rendered as explicit
+  GUARDRAIL lines in BOTH diagnose prompts (after Prompt2Policy
+  `analysis/guardrails.py`): single-term dominance (>90% of summed mean
+  |reward| → the classic hacking shape) and training plateau (<1%
+  relative improvement between the halves of the recorded windows →
+  "change the shape, not the budget"). Aux `__` signals excluded;
+  advisory prompt context only — never a gate or fitness input.
+  `_mjlab_runner.py` now records `rendered_episode_return` /
+  `rendered_episode_percentile` in behavior.json (the video/keyframes
+  capture env[0]'s FIRST episode — an arbitrary draw), and the diagnose
+  keyframe header discloses that percentile instead of the previously
+  FALSE "from the best eval episode" framing (after P2P's
+  percentile-selected judge videos).
+- **Deliberately NOT adopted**: P2P's single-VLM criteria self-review
+  loop for metric generation — our multi-model, multi-lens reviewer
+  panel with bounded veto-regeneration already exceeds it. True
+  percentile VIDEO selection (p10/median/p90 clips) deferred to the
+  video-judge future direction below: mjlab renders one env's scene, so
+  tail-episode clips need live multi-env capture.
+- **Verified**: 8 new tests (dominance/plateau/aux-exclusion/junk,
+  both-prompt rendering, percentile note); diagnose + guardrail suites
+  green.
+
 ### 2026-07-19 — FUTURE DIRECTION (not implemented): grounded, unbiased
 video judge (Sam's ask, informed by Prompt2Policy's implementation)
 

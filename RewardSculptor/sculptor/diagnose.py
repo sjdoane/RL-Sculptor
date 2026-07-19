@@ -471,6 +471,89 @@ def _load_training_feedback(iter_dir: Path) -> dict:
     return {}
 
 
+def _rendered_episode_note(behavior: dict) -> str:
+    """§2026-07-19 (after Prompt2Policy's percentile-selected judge
+    videos): the rendered episode is env[0]'s FIRST — an arbitrary draw,
+    previously mislabeled "the best eval episode". When the runner
+    recorded its return percentile, disclose it so the model weighs the
+    frames' representativeness; otherwise just drop the false "best"
+    framing."""
+    try:
+        pct = behavior.get("rendered_episode_percentile")
+        if pct is None:
+            return " — an arbitrary draw, NOT selected as best"
+        return (
+            f" at the {float(pct):.0%} percentile of this rollout's "
+            "episode returns — weigh representativeness accordingly"
+        )
+    except Exception:  # noqa: BLE001 — prompt annotation only
+        return ""
+
+
+def _training_guardrails(data: dict) -> list[str]:
+    """§2026-07-19 (after Prompt2Policy `analysis/guardrails.py`): cheap
+    deterministic screens over the per-component training series,
+    surfaced as explicit GUARDRAIL lines the diagnoser must address.
+
+    - single-term dominance: one reward component's mean |value| is >90%
+      of the summed mean magnitudes — the classic reward-hacking shape
+      (every other term is noise to the optimizer);
+    - plateau: the summed per-window reward improves <1% (relative)
+      between the first and second half of the recorded windows — more
+      steps will not fix this reward; the shape itself must change.
+
+    Aux ``__``-prefixed signals (episode length, termination flags) are
+    excluded from both screens. Advisory prompt context only — never a
+    gate, never a fitness input.
+    """
+    if not isinstance(data, dict) or not data:
+        return []
+    series: dict[str, list[float]] = {}
+    for name, raw in data.items():
+        if not isinstance(name, str) or name.startswith("__"):
+            continue
+        if not isinstance(raw, list) or not raw:
+            continue
+        try:
+            series[name] = [float(v) for v in raw]
+        except (TypeError, ValueError):
+            continue
+    warnings: list[str] = []
+    if len(series) >= 2:
+        magnitudes = {
+            name: sum(abs(v) for v in vals) / len(vals)
+            for name, vals in series.items()
+        }
+        total = sum(magnitudes.values())
+        if total > 0:
+            top_name, top_mag = max(magnitudes.items(), key=lambda kv: kv[1])
+            share = top_mag / total
+            if share > 0.9:
+                warnings.append(
+                    f"GUARDRAIL reward-term dominance: {top_name!r} is "
+                    f"{share:.0%} of total mean |reward| — every other term "
+                    "is noise to the optimizer; rebalance or gate it."
+                )
+    n_windows = min((len(vals) for vals in series.values()), default=0)
+    if n_windows >= 4:
+        totals = [
+            sum(vals[i] for vals in series.values()) for i in range(n_windows)
+        ]
+        mid = n_windows // 2
+        first = sum(totals[:mid]) / mid
+        second = sum(totals[mid:]) / (n_windows - mid)
+        improvement = second - first
+        scale = max(abs(first), 1e-9)
+        if improvement / scale < 0.01:
+            warnings.append(
+                "GUARDRAIL training plateau: summed reward improved "
+                f"{improvement / scale:+.1%} between the first and second "
+                "half of training — more steps will not fix this reward; "
+                "change the shape, not the budget."
+            )
+    return warnings
+
+
 def _format_training_feedback(data: dict) -> str:
     """Render a `{component: [v0, v1, ...]}` dict in Eureka Appendix F
     format — one line per key, values list followed by Max/Mean/Min.
@@ -708,6 +791,9 @@ def _build_preliminary_user_content(
     feedback_block = ""
     formatted = _format_training_feedback(training_feedback or {})
     if formatted:
+        guardrail_lines = _training_guardrails(training_feedback or {})
+        guardrail_text = (
+            "\n".join(guardrail_lines) + "\n" if guardrail_lines else "")
         feedback_block = (
             "# TRAINING_FEEDBACK\n"
             "# Per-component + success/episode-length time-series across "
@@ -715,7 +801,7 @@ def _build_preliminary_user_content(
             "spot dead components (max - min < 5% of max → cannot be "
             "optimized by RL) and component imbalance (one term's Max "
             "dwarfs everything else).\n"
-            f"{formatted}\n\n"
+            f"{formatted}\n{guardrail_text}\n"
         )
     # §7.3: physics-realism audit — only emitted on mild/severe verdicts
     # so healthy runs don't dilute the prompt.
@@ -757,7 +843,8 @@ def _build_preliminary_user_content(
         f"# ADAPTER BEHAVIOR METRIC VOCABULARY\n{behavior_metric_names}\n\n"
         f"# behavior.json\n{json.dumps(behavior, indent=2, sort_keys=True, default=str)}\n\n"
         f"# REWARD_CONTRACT\n{contract_text}\n\n"
-        f"# KEYFRAMES ({len(keyframes)} evenly-spaced frames from the best eval episode)\n"
+        f"# KEYFRAMES ({len(keyframes)} evenly-spaced frames from ONE "
+        f"rollout episode{_rendered_episode_note(behavior)})\n"
     )
     content: list[dict] = [{"type": "text", "text": header}]
     for kf in keyframes:
@@ -875,12 +962,15 @@ def _build_grounded_user_content(
     feedback_block = ""
     formatted = _format_training_feedback(training_feedback or {})
     if formatted:
+        guardrail_lines = _training_guardrails(training_feedback or {})
+        guardrail_text = (
+            "\n".join(guardrail_lines) + "\n" if guardrail_lines else "")
         feedback_block = (
             "# TRAINING_FEEDBACK\n"
             "# Per-component time-series across training. Dead components "
             "(near-constant values) and component imbalance (one term's Max "
             "dominates) are the two patterns to ground edits against.\n"
-            f"{formatted}\n\n"
+            f"{formatted}\n{guardrail_text}\n"
         )
     realism_block = ""
     realism_text = _format_realism_audit(realism_audit or {})
