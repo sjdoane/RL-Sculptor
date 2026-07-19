@@ -258,3 +258,56 @@ def test_immutable_selection_applies_materialized_eval_without_regeneration(
     assert replay_model.nhfield == compiled._model.nhfield
     np.testing.assert_array_equal(
         replay_model.hfield_data, compiled._model.hfield_data)
+
+
+# ── env-authoring §10.1: train-time terrain difficulty span ───────────────
+def _span_world(rng, *, kind="generator", mode="curriculum_grid"):
+    return {
+        "shared": {"terrain": {"kind": kind, "layout": {"mode": mode}}},
+        "train": {"curriculum": {"difficulty_range": rng}},
+    }
+
+
+def test_train_difficulty_span_well_formed_and_degenerate():
+    from sculptor.world.compiler import train_difficulty_span
+
+    assert train_difficulty_span(_span_world([0.1, 0.9])) == (0.1, 0.9)
+    assert train_difficulty_span(_span_world([0.5, 0.5])) is None
+    assert train_difficulty_span(_span_world([0.9, 0.1])) is None
+    assert train_difficulty_span(_span_world([-0.1, 0.9])) is None
+    assert train_difficulty_span(_span_world([0.1, 1.1])) is None
+    assert train_difficulty_span(_span_world("bad")) is None
+    assert train_difficulty_span(_span_world([0.1, 0.9], kind="plane")) is None
+    assert train_difficulty_span(
+        _span_world([0.1, 0.9], mode="sampled_grid")) is None
+
+
+def test_expand_train_terrain_difficulty_mutates_only_train_scene():
+    import types as _types
+
+    from sculptor.world.compiler import expand_train_terrain_difficulty
+
+    generator = _types.SimpleNamespace(difficulty_range=(0.45, 0.45))
+    compiled = _types.SimpleNamespace(scene_cfg=_types.SimpleNamespace(
+        terrain=_types.SimpleNamespace(terrain_generator=generator)))
+    assert expand_train_terrain_difficulty(
+        compiled, _span_world([0.0, 1.0])) is True
+    assert generator.difficulty_range == (0.0, 1.0)
+
+    # plane / missing generator: untouched, reported False
+    flat = _types.SimpleNamespace(scene_cfg=_types.SimpleNamespace(
+        terrain=_types.SimpleNamespace(terrain_generator=None)))
+    assert expand_train_terrain_difficulty(
+        flat, _span_world([0.0, 1.0])) is False
+
+
+def test_authored_uneven_world_declares_full_span():
+    """The offline uneven author's train.curriculum must produce a real
+    span (this is what apply_world_selection(train=True) will widen to)."""
+    from sculptor.world.author import author_environment
+    from sculptor.world.compiler import train_difficulty_span
+
+    draft = author_environment(
+        "stay stable and walk on uneven rough terrain",
+        robot_capability_id="unitree_g1:base")
+    assert train_difficulty_span(draft.world_spec) == (0.0, 1.0)

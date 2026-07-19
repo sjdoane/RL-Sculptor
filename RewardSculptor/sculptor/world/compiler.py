@@ -1136,6 +1136,59 @@ def apply_compiled_world(env_cfg: Any, compiled: CompiledWorld) -> None:
     scene_cfg.sensors = tuple(existing_sensors.values())
 
 
+def train_difficulty_span(world: Mapping[str, Any]) -> tuple[float, float] | None:
+    """The train-time terrain difficulty span, or None to keep the pinned
+    evaluation difficulty.
+
+    Env-authoring §10.1: the within-run mjlab curriculum trains across
+    ``train.curriculum.difficulty_range`` (curriculum_grid rows ARE the
+    difficulty axis), while evaluation always replays the materialized
+    manifest at the single nominal difficulty. Only a well-formed,
+    non-degenerate ``[lo, hi]`` on generator terrain in curriculum_grid
+    mode yields a span — everything else trains exactly like evaluation.
+    """
+    terrain = world.get("shared", {}).get("terrain", {})
+    if terrain.get("kind") != "generator":
+        return None
+    if terrain.get("layout", {}).get("mode") != "curriculum_grid":
+        return None
+    rng = world.get("train", {}).get("curriculum", {}).get("difficulty_range")
+    if not isinstance(rng, (list, tuple)) or len(rng) != 2:
+        return None
+    try:
+        lo, hi = float(rng[0]), float(rng[1])
+    except (TypeError, ValueError):
+        return None
+    if not (0.0 <= lo < hi <= 1.0):
+        return None
+    return lo, hi
+
+
+def expand_train_terrain_difficulty(
+    compiled: CompiledWorld, world: Mapping[str, Any],
+) -> bool:
+    """Widen the TRAIN scene's generator difficulty to the curriculum span.
+
+    Mutates only the in-memory train scene cfg after ``compile_world`` —
+    the evaluation manifest, its materialized assets, and every recorded
+    hash were computed from the pinned nominal difficulty and stay
+    untouched. Returns True when a span was applied. Under mjlab's
+    curriculum mode the atlas rows then interpolate lo→hi and the base
+    task's terrain-levels curriculum term promotes/demotes environment
+    origins within the run (update_env_origins); evaluation rollouts load
+    the frozen materialized terrain, where origin promotion is a no-op.
+    """
+    span = train_difficulty_span(world)
+    if span is None:
+        return False
+    terrain_cfg = getattr(compiled.scene_cfg, "terrain", None)
+    generator = getattr(terrain_cfg, "terrain_generator", None)
+    if generator is None:
+        return False
+    generator.difficulty_range = span
+    return True
+
+
 def _apply_scene_and_runtime(
     env_cfg: Any, authored_scene: Any, runtime: TaskRuntimePlan,
 ) -> None:
@@ -1238,6 +1291,7 @@ def apply_world_selection(
 
     if train:
         compiled = compile_world(world, task)
+        expand_train_terrain_difficulty(compiled, world)
         apply_compiled_world(env_cfg, compiled)
     else:
         authored_scene, _, _ = compile_scene_cfg(world)
