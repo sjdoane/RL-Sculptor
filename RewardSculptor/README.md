@@ -78,6 +78,13 @@ Humanoid) + 52 `preview_only` (available to render, training gated
 until an mjlab task lands). See
 [`docs/robot_library.md`](docs/robot_library.md) for how to add more.
 
+For research campaigns, `sculpt eval run` freezes a tamper-evident campaign
+charter before any training begins. The evaluator/human calibration workflow
+is documented in the [metric gauntlet protocol](docs/metric_gauntlet.md).
+Objective success predicates earn authority through the
+[adversarial spec-audit protocol](docs/spec_audit.md); capability-described
+external suite entries can be loaded with `--benchmark-manifest`.
+
 ---
 
 ## One-command demo

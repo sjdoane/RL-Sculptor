@@ -19,6 +19,14 @@ from sculptor.adapters.base import (
     TrainResult,
 )
 from sculptor.eval import CampaignConfig, aggregate, iqm, run_campaign
+from sculptor.eval.charter import (
+    CharterIntegrityError,
+    CharterMismatchError,
+    UncharteredCampaignError,
+    freeze_or_verify_campaign_charter,
+)
+from sculptor.eval.benchmarks import BENCHMARKS
+from sculptor.eval.harness import CONDITIONS
 from sculptor.eval.stats import stratified_bootstrap_ci
 
 # ── stats ────────────────────────────────────────────────────────────
@@ -161,6 +169,8 @@ def test_campaign_train_only_end_to_end(tmp_path: Path, capsys) -> None:
     report = run_campaign(_cfg(tmp_path))
     # 2 conditions × 2 seeds = 4 jobs.
     assert len(report["jobs"]) == 4
+    assert len(report["authority_warnings"]) == 1
+    assert "legacy_provisional" in report["authority_warnings"][0]
     # plain_ppo trains with NO reward module; seed_only with the shared v0.
     rewards = {(c["reward"] is None) for c in _EvalStubAdapter.train_calls}
     assert rewards == {True, False}
@@ -181,6 +191,17 @@ def test_campaign_train_only_end_to_end(tmp_path: Path, capsys) -> None:
     assert report["aggregates"]["capture_parity_warnings"] == []
 
     out = tmp_path / "campaign"
+    charter = json.loads(
+        (out / "campaign_charter.json").read_text(encoding="utf-8")
+    )
+    assert charter["status"] == "frozen"
+    assert len(charter["design_sha256"]) == 64
+    assert len(charter["document_sha256"]) == 64
+    assert report["charter"]["design_sha256"] == charter["design_sha256"]
+    assert all(
+        job["charter_design_sha256"] == charter["design_sha256"]
+        for job in report["jobs"]
+    )
     assert (out / "campaign_report.json").is_file()
     html = (out / "report.html").read_text(encoding="utf-8")
     assert "cartpole_balance" in html and "plain_ppo" in html
@@ -202,6 +223,124 @@ def test_campaign_resumes_from_result_json(tmp_path: Path) -> None:
     report2 = run_campaign(cfg)
     assert len(_EvalStubAdapter.train_calls) == first_calls, "must not retrain"
     assert all(j.get("cached") for j in report2["jobs"])
+
+
+def test_campaign_rejects_design_change_before_training(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path, conditions=["plain_ppo"])
+    run_campaign(cfg)
+    calls_before = len(_EvalStubAdapter.train_calls)
+
+    changed = _cfg(
+        tmp_path, conditions=["plain_ppo"], steps_per_iter=11,
+    )
+    with pytest.raises(CharterMismatchError, match="steps_per_iter"):
+        run_campaign(changed)
+    assert len(_EvalStubAdapter.train_calls) == calls_before
+
+
+def test_campaign_rejects_tampered_charter(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path, conditions=["plain_ppo"])
+    run_campaign(cfg)
+    charter_path = tmp_path / "campaign" / "campaign_charter.json"
+    charter = json.loads(charter_path.read_text(encoding="utf-8"))
+    charter["design"]["campaign"]["steps_per_iter"] = 999
+    charter_path.write_text(json.dumps(charter), encoding="utf-8")
+
+    with pytest.raises(CharterIntegrityError, match="document hash mismatch"):
+        run_campaign(cfg)
+
+
+def test_campaign_refuses_retroactive_charter(tmp_path: Path) -> None:
+    cfg = _cfg(tmp_path, conditions=["plain_ppo"])
+    result = (
+        tmp_path / "campaign" / "cartpole_balance" / "plain_ppo"
+        / "seed_1000" / "result.json"
+    )
+    result.parent.mkdir(parents=True)
+    result.write_text("{}", encoding="utf-8")
+
+    with pytest.raises(UncharteredCampaignError, match="retroactively"):
+        freeze_or_verify_campaign_charter(
+            cfg, benchmarks=BENCHMARKS, conditions=CONDITIONS,
+        )
+
+
+def test_external_benchmark_is_executed_and_frozen_in_charter(
+    tmp_path: Path,
+) -> None:
+    from sculptor.eval.spec_audit import ATTACK_CLASSES, run_spec_audit
+
+    audit_cases = []
+    for index, attack_class in enumerate(sorted(ATTACK_CLASSES)):
+        rollout = tmp_path / "audit_evidence" / str(index)
+        rollout.mkdir(parents=True)
+        positive = attack_class == "competent_positive"
+        (rollout / "behavior.json").write_text(json.dumps({
+            "mean_episode_length": 500 if positive else 0,
+            "max_episode_steps": 500,
+        }))
+        audit_cases.append({
+            "case_id": f"case_{index}",
+            "attack_class": attack_class,
+            "rollout_dir": str(rollout),
+            "expectation": (
+                {"min_score": 0.9} if positive else {"max_score": 0.1}
+            ),
+        })
+    audit_manifest = tmp_path / "spec_audit.json"
+    audit_manifest.write_text(json.dumps({
+        "schema_version": 1,
+        "audit_id": "external-cartpole-a4",
+        "spec_name": "cartpole_balance",
+        "authority_target": "A4_reporting",
+        "cases": audit_cases,
+    }), encoding="utf-8")
+    run_spec_audit(audit_manifest, tmp_path / "spec_certificate")
+    certificate = (
+        tmp_path / "spec_certificate" / "spec_audit_certificate.json"
+    )
+    manifest = tmp_path / "external_suite.json"
+    manifest.write_text(json.dumps({
+        "schema_version": 1,
+        "suite_id": "external-cartpole-suite",
+        "suite_version": "1.0.0",
+        "benchmarks": [{
+            "name": "external_cartpole",
+            "task_id": "Mjlab-Cartpole-Balance",
+            "behavior_goal": "balance a held-out cartpole variant",
+            "spec_metric": "cartpole_balance",
+            "adapter": "mjlab",
+            "adapter_config": {"num_envs": 32},
+            "robot_id": "cartpole_variant",
+            "embodiment_family": "underactuated_system",
+            "task_family": "control_sanity",
+            "required_capabilities": ["balance"],
+            "evaluation_tier": "rollout_artifact",
+            "campaign_ready": True,
+            "spec_authority": "A4_reporting",
+            "spec_audit_certificate": str(certificate),
+            "known_limitations": [],
+            "notes": "test entry"
+        }]
+    }), encoding="utf-8")
+    cfg = _cfg(
+        tmp_path,
+        benchmarks=["external_cartpole"],
+        conditions=["plain_ppo"],
+        seeds=[1000],
+        benchmark_manifests=[manifest],
+    )
+    report = run_campaign(cfg)
+    assert report["jobs"][0]["benchmark"] == "external_cartpole"
+    assert report["authority_warnings"] == []
+    charter = json.loads((
+        tmp_path / "campaign" / "campaign_charter.json"
+    ).read_text(encoding="utf-8"))
+    frozen = charter["design"]["benchmarks"][0]
+    assert frozen["robot_id"] == "cartpole_variant"
+    assert frozen["required_capabilities"] == ["balance"]
+    assert frozen["spec_authority"] == "A4_reporting"
+    assert len(frozen["spec_audit_certificate_sha256"]) == 64
 
 
 def test_failed_job_is_honest_zero(tmp_path: Path) -> None:
@@ -259,6 +398,59 @@ def test_sculpt_mode_passes_condition_knobs(tmp_path: Path, monkeypatch) -> None
     assert job["final_spec_score"] == pytest.approx(0.6)
     assert job["iters_to_threshold"] == 2
     assert job["iterations_completed"] == 2
+
+
+def test_kg_enabled_jobs_use_independent_frozen_copies(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    """Paired KG jobs must not learn from an earlier job's writes."""
+    import os
+    import sqlite3
+
+    shared_kg = tmp_path / "shared" / "graph.db"
+    monkeypatch.setenv("RS_KG_PATH", str(shared_kg))
+    seen: list[dict[str, Any]] = []
+
+    def fake_sculpt_run(*, config_path, seed, **kw):
+        job_kg = Path(os.environ["RS_KG_PATH"])
+        with sqlite3.connect(job_kg) as connection:
+            connection.execute(
+                "CREATE TABLE IF NOT EXISTS eval_marker (seed INTEGER)"
+            )
+            prior = connection.execute(
+                "SELECT COUNT(*) FROM eval_marker"
+            ).fetchone()[0]
+            connection.execute("INSERT INTO eval_marker VALUES (?)", (seed,))
+            connection.commit()
+        seen.append({"seed": seed, "path": job_kg, "prior": prior})
+        rollout = Path(config_path).parent / "runs" / "iter_0" / "rollout"
+        rollout.mkdir(parents=True, exist_ok=True)
+        (rollout / "behavior.json").write_text(json.dumps({
+            "mean_episode_length": 250,
+            "max_episode_length": 500,
+            "max_episode_steps": 500,
+            "step_dt": 0.02,
+            "rollout_num_envs": 64,
+        }))
+
+    monkeypatch.setattr("sculptor.sculpt.sculpt_run", fake_sculpt_run)
+    report = run_campaign(_cfg(
+        tmp_path, conditions=["full"], seeds=[1000, 1017], iterations=1,
+    ))
+
+    assert [entry["prior"] for entry in seen] == [0, 0]
+    assert len({entry["path"] for entry in seen}) == 2
+    assert all("/inputs/kg.db" in entry["path"].as_posix() for entry in seen)
+    assert os.environ["RS_KG_PATH"] == str(shared_kg)
+    kg_input = report["campaign_inputs"]["knowledge_graph"]
+    assert len(kg_input["sha256"]) == 64
+    assert report["charter"]["design_sha256"]
+    for seed in (1000, 1017):
+        origin = json.loads((
+            tmp_path / "campaign" / "cartpole_balance" / "full"
+            / f"seed_{seed}" / "inputs" / "kg_origin.json"
+        ).read_text(encoding="utf-8"))
+        assert origin["base_sha256"] == kg_input["sha256"]
 
 
 def test_compute_matched_condition_scales_steps(tmp_path: Path) -> None:

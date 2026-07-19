@@ -399,6 +399,10 @@ def eval_run(
         ..., "--benchmark", "-b",
         help="Benchmark name (repeatable). See `sculpt eval list`.",
     ),
+    benchmark_manifest: list[Path] = typer.Option(
+        [], "--benchmark-manifest",
+        help="Strict external benchmark-suite JSON (repeatable).",
+    ),
     condition: list[str] = typer.Option(
         ..., "--condition", "-c",
         help="Condition name (repeatable): full | no_kg | plain_ppo | seed_only.",
@@ -470,6 +474,7 @@ def eval_run(
         benchmarks=list(benchmark),
         conditions=list(condition),
         seeds=[1000 + 17 * i for i in range(int(seeds))],
+        benchmark_manifests=list(benchmark_manifest),
         iterations=iterations,
         steps_per_iter=steps_per_iter,
         rollout_episodes=rollout_episodes,
@@ -482,6 +487,8 @@ def eval_run(
     typer.echo(f"html:   {Path(out) / 'report.html'}")
     for w in report["aggregates"]["capture_parity_warnings"]:
         typer.echo(f"WARNING: {w}", err=True)
+    for w in report.get("authority_warnings", []):
+        typer.echo(f"WARNING: {w}", err=True)
 
 
 @eval_app.command("report")
@@ -493,6 +500,12 @@ def eval_report(
     import json as _json
 
     from sculptor.eval import CampaignConfig, run_campaign  # noqa: F401
+    from sculptor.eval.charter import (
+        CHARTER_FILENAME,
+        CharterError,
+        load_and_verify_charter,
+        verify_result_lineage,
+    )
     from sculptor.eval.harness import _report_html, aggregate
     from sculptor.run_context import write_json_atomic
 
@@ -502,6 +515,13 @@ def eval_report(
     if not results:
         typer.echo(f"no result.json files under {out}", err=True)
         raise typer.Exit(1)
+    charter_path = Path(out) / CHARTER_FILENAME
+    try:
+        charter = load_and_verify_charter(charter_path)
+        verify_result_lineage(results, charter)
+    except CharterError as exc:
+        typer.echo(f"campaign integrity check failed: {exc}", err=True)
+        raise typer.Exit(2) from exc
     report_path = Path(out) / "campaign_report.json"
     try:
         prior = _json.loads(report_path.read_text(encoding="utf-8"))
@@ -521,14 +541,188 @@ def eval_report(
     typer.echo(f"re-aggregated {len(results)} jobs -> {report_path}")
 
 
+@eval_app.command("charter")
+def eval_charter(
+    out: Path = typer.Argument(..., help="Campaign directory to verify."),
+):
+    """Verify and summarize a frozen campaign charter and result lineage."""
+    import json as _json
+
+    from sculptor.eval.charter import (
+        CHARTER_FILENAME,
+        CharterError,
+        load_and_verify_charter,
+        verify_result_lineage,
+    )
+
+    charter_path = Path(out) / CHARTER_FILENAME
+    try:
+        charter = load_and_verify_charter(charter_path)
+        results = [
+            _json.loads(path.read_text(encoding="utf-8"))
+            for path in sorted(Path(out).glob("*/*/seed_*/result.json"))
+        ]
+        verify_result_lineage(results, charter)
+    except (CharterError, OSError, _json.JSONDecodeError) as exc:
+        typer.echo(f"campaign integrity check failed: {exc}", err=True)
+        raise typer.Exit(2) from exc
+
+    campaign = charter["design"]["campaign"]
+    typer.echo("campaign charter: VERIFIED")
+    typer.echo(f"  path:        {charter_path}")
+    typer.echo(f"  campaign:    {campaign['name']}")
+    typer.echo(f"  created:     {charter['created_at']}")
+    typer.echo(f"  design hash: {charter['design_sha256']}")
+    typer.echo(f"  source hash: "
+               f"{charter['design']['runtime_identity']['source_tree_sha256']}")
+    typer.echo(f"  results:     {len(results)} verified")
+
+
+@eval_app.command("spec-audit")
+def eval_spec_audit(
+    manifest: Path = typer.Argument(
+        ..., help="Frozen adversarial spec-audit manifest JSON.",
+    ),
+    out: Path = typer.Option(..., "--out", help="Fresh certificate output dir."),
+):
+    """Run an adversarial evidence battery for one objective spec metric."""
+    import json as _json
+
+    from sculptor.eval.spec_audit import SpecAuditError, run_spec_audit
+
+    try:
+        certificate = run_spec_audit(manifest, out)
+    except SpecAuditError as exc:
+        typer.echo(f"spec audit failed: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    typer.echo(_json.dumps({
+        "audit_id": certificate["audit_id"],
+        "spec_name": certificate["spec_name"],
+        "passed": certificate["passed"],
+        "authority_decision": certificate["authority_decision"],
+        "coverage": certificate["coverage"],
+        "summary": certificate["summary"],
+        "certificate_sha256": certificate["certificate_sha256"],
+        "report": str(Path(out) / "spec_audit_report.md"),
+    }, indent=2))
+    if not certificate["passed"]:
+        raise typer.Exit(1)
+
+
+gauntlet_app = typer.Typer(
+    name="gauntlet",
+    help="Build and analyze blinded evaluator/human-anchor studies.",
+    no_args_is_help=True,
+)
+eval_app.add_typer(gauntlet_app, name="gauntlet")
+
+
+@gauntlet_app.command("build")
+def eval_gauntlet_build(
+    manifest: Path = typer.Argument(
+        ..., help="Private labeled source-manifest JSON.",
+    ),
+    out: Path = typer.Option(..., "--out", help="Fresh study output directory."),
+    seed: int = typer.Option(0, "--seed", help="Frozen pairing/randomization seed."),
+    forms: int = typer.Option(
+        2, "--forms", min=1, max=2,
+        help="One randomized form or two counterbalanced forms.",
+    ),
+    max_pairs_per_group: int = typer.Option(
+        50, "--max-pairs-per-group", min=1,
+        help="Balanced cap within each comparison group.",
+    ),
+    reliability_repeats: int = typer.Option(
+        0, "--reliability-repeats", min=0,
+        help="Hidden repeated pairs used to estimate rater self-consistency.",
+    ),
+    evaluator_tie_band: float = typer.Option(
+        0.0, "--evaluator-tie-band", min=0.0,
+        help="Absolute score difference treated as an evaluator tie.",
+    ),
+):
+    """Build anonymized media packets plus a separate private study key."""
+    import json as _json
+
+    from sculptor.eval.gauntlet import GauntletError, build_blind_study
+
+    try:
+        summary = build_blind_study(
+            manifest, out,
+            seed=seed,
+            forms=forms,
+            max_pairs_per_group=max_pairs_per_group,
+            reliability_repeats=reliability_repeats,
+            evaluator_tie_band=evaluator_tie_band,
+        )
+    except GauntletError as exc:
+        typer.echo(f"gauntlet build failed: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    typer.echo(_json.dumps(summary, indent=2))
+    typer.echo(
+        "Keep study_key.json private until labels are frozen; distribute only "
+        "one study_packet_form_*.json and its referenced assets per rater."
+    )
+
+
+@gauntlet_app.command("analyze")
+def eval_gauntlet_analyze(
+    study_key: Path = typer.Argument(..., help="Private study_key.json."),
+    responses: Path = typer.Argument(..., help="Completed JSONL responses."),
+    out: Path = typer.Option(..., "--out", help="Analysis output directory."),
+):
+    """Validate frozen responses and analyze evaluator-human agreement."""
+    import json as _json
+
+    from sculptor.eval.gauntlet import GauntletError, analyze_blind_study
+
+    try:
+        analysis = analyze_blind_study(study_key, responses, out)
+    except (GauntletError, OSError) as exc:
+        typer.echo(f"gauntlet analysis failed: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    typer.echo(_json.dumps({
+        "study_id": analysis["study_id"],
+        "analysis_sha256": analysis["analysis_sha256"],
+        "counts": analysis["counts"],
+        "human_pair_accuracy": analysis["human"][
+            "pair_majority_accuracy_vs_expected"
+        ],
+        "evaluator_human_alignment": analysis["evaluator"][
+            "pair_accuracy_vs_human_majority"
+        ],
+        "report": str(Path(out) / "gauntlet_analysis.md"),
+    }, indent=2))
+
+
 @eval_app.command("list")
-def eval_list():
+def eval_list(
+    benchmark_manifest: list[Path] = typer.Option(
+        [], "--benchmark-manifest",
+        help="Include a strict external benchmark-suite JSON (repeatable).",
+    ),
+):
     """List benchmarks + conditions."""
-    from sculptor.eval import BENCHMARKS, CONDITIONS
+    from sculptor.eval import CONDITIONS
+    from sculptor.eval.benchmarks import (
+        BenchmarkManifestError,
+        benchmark_registry,
+    )
+
+    try:
+        benchmarks = benchmark_registry(benchmark_manifest)
+    except BenchmarkManifestError as exc:
+        typer.echo(f"benchmark manifest invalid: {exc}", err=True)
+        raise typer.Exit(2) from exc
 
     typer.echo("benchmarks:")
-    for b in BENCHMARKS.values():
-        typer.echo(f"  {b.name:18s} {b.task_id:35s} spec={b.spec_metric}")
+    for b in benchmarks.values():
+        readiness = "ready" if b.campaign_ready else b.evaluation_tier
+        typer.echo(
+            f"  {b.name:22s} {b.embodiment_family:18s} "
+            f"{readiness:16s} authority={b.spec_authority:18s} "
+            f"spec={b.spec_metric or '-'} task={b.task_id}"
+        )
     typer.echo("conditions:")
     for c in CONDITIONS.values():
         typer.echo(f"  {c.name:12s} mode={c.mode:11s} {c.notes}")

@@ -20,6 +20,32 @@ Primary comparisons (paired-difference CIs, Ship-27 machinery):
 curriculum question), `mission − eureka` (the literature question),
 each read against `total_rl_iterations`.
 
+## Current campaign-integrity rules
+
+`sculpt eval run` now freezes `campaign_charter.json` before the first
+training job. The charter pins the effective campaign config, exact benchmark
+and condition definitions, analysis/failure policy, executable source tree,
+dependency lock, and frozen KG input hash. Every `result.json` and report is
+bound to that design hash. A changed seed, budget, source file, task spec,
+condition, or analysis rule requires a fresh `--out` directory.
+
+KG-enabled conditions do not read or write the live shared KG during the
+campaign. The runner makes one transactionally consistent
+`campaign_inputs/kg_base.db` snapshot, then initializes a private writable KG
+copy for every `(benchmark, condition, seed)` job. A crash-resume reuses only
+that job's copy; no later paired arm can inherit cases learned by an earlier
+job.
+
+Output directories containing legacy results but no charter are intentionally
+rejected. They may still be inspected as historical artifacts, but cannot be
+retroactively represented as pre-registered runs.
+
+The four built-in specs predate the adversarial certificate workflow and are
+now surfaced as `legacy_provisional` in events, JSON, CLI warnings, and HTML.
+This keeps old smoke campaigns usable without presenting them as A4 reporting
+authority. New external campaign entries must carry a verified passing A4
+certificate; see `docs/spec_audit.md` and `docs/benchmarks/README.md`.
+
 ## Budget (measured 5090 numbers: 0.65 s/iter G1@4096; ~60 s dispatch overhead; ~2 min local rollout; ~2 min LLM per loop-iter)
 
 Per G1-class benchmark, minutes/job × 5 seeds:
@@ -41,10 +67,16 @@ GPU** (3 × 5090 @ $0.69/hr ≈ 29 h wall ≈ 1.2 days) + **~$50–90 LLM**
 Trim lever if needed: drop `plain_ppo` (unmatched) and `mission_no_kg`
 from one heavy benchmark each (−~10 h).
 
-## Sharding (3 × 5090 pods)
+## Sharding (historical plan; blocked pending charter-aware coordination)
 
-One harness process per pod, each with its own `SCULPTOR_REMOTE_*`
-env; jobs are disjoint by benchmark so the out-dirs merge trivially.
+Do **not** launch the commands below against one shared output directory. They
+use different benchmark lists and therefore describe different frozen
+designs; the charter now rejects that unsafe merge. The current supported
+path is one harness process per output directory, routed to one remote GPU.
+Multi-pod execution needs an explicit coordinator that freezes one global job
+matrix and gives workers operational shards without changing the scientific
+design. Until that exists, separate shard reports must not be merged into one
+headline campaign after the fact.
 
 ```bash
 # pod A                                   # pod B                       # pod C
@@ -53,10 +85,9 @@ sculpt eval run --out ~/rs_campaign \
   --seeds 5 --iterations 4 --steps-per-iter 600 --name e4-campaign
 ```
 
-All shards write into the SAME `--out` tree (disjoint job dirs);
-afterwards `sculpt eval report ~/rs_campaign` re-aggregates everything
-into one `campaign_report.json` + `report.html`. Every job is
-resumable (`result.json` keys); pod restarts only change host/port env.
+The command sketch is retained only as the original budget allocation, not as
+an executable launch recipe. Every job remains resumable inside its own
+chartered output directory.
 
 Launch detached on Windows (WSL kills `setsid` children when the last
 client exits): `Start-Process -WindowStyle Hidden wsl 'bash -c "…"'`.
