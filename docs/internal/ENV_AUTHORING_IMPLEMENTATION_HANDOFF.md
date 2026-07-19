@@ -58,11 +58,39 @@ the three acceptance compiles plus genericity assertion passed in 4.37s; the
 CLI author/show/validate E2E passed in 3.37s. All tests are CPU/headless and
 well below the one-hour cap.
 
+The third slice — KG grounding for the author — is complete:
+
+- `sculptor/world/grounding.py`: retrieval-only, fail-soft bridge from the
+  shared knowledge graph to authoring. `gather_grounding(prompt)` returns
+  Technique/FailureMode/Paper `GroundingItem`s (semantic retrieval at the
+  0.35 prompt-time floor; papers additionally filtered by the author-intent
+  tag map terrain/parkour/objects). Any retrieval failure degrades to
+  ungrounded authoring with one warning — it can never block the author.
+- `author.py`: `grounding_context` param; the model request gains a
+  `kg_grounding` evidence block (input-only — the model's output key set
+  stays closed), and the retrieved node IDs are re-injected into
+  `meta.grounding` when a model omits or clears the ledger.
+- `cli.py world author`: `--kg-grounding/--no-kg-grounding` (default on),
+  node IDs surface in the JSON result and the human summary.
+- `tests/test_world_grounding.py`: 7 tests — three-kind retrieval, intent
+  tag filter, broken-embedder and empty-store fail-soft (embedder must not
+  even load on an empty store), offline + model ledger paths, CLI default
+  and disable flag. Live smoke against the shared graph: terrain prompt →
+  fractal-terrain-training + risky-terrain papers at sim 0.56-0.67;
+  ball-into-goal prompt → humanoid-soccer papers.
+
+Also in the graph since the second slice: ENPIRE (`paper:2606.19980`) and
+KRAFTON Prompt2Policy (`paper:krafton-p2p-2026`, first non-arxiv Paper
+node), both LLM-extracted; four candidate roadmap items are recorded in
+`RL_SCULPTOR_AUDIT.md` (VLM advisory judge, multi-seed training,
+branch-parallel edits, behavioral milestones — none may weaken the
+metric firewall).
+
 The active plan is:
 
 1. capability descriptors plus strict WorldSpec/TaskSpec and persistence (done);
 2. real mjlab compiler, admission gates, eval manifest, ChannelCatalog (done);
-3. prompt author/clarifier (done) and KG grounding (pending);
+3. prompt author/clarifier (done) and KG grounding (done);
 4. reward/metric/atomic-selection integration (mostly done), then finish
    diagnoser/curriculum/run-memory integration;
 5. backend/UI authoring, clarification, preview, and lineage workflows;

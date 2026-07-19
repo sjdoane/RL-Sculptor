@@ -65,6 +65,10 @@ def world_author(
     timeout_defaults: bool = typer.Option(
         False, "--timeout-defaults",
         help="Select defaults and record timeout_default provenance."),
+    kg_grounding: bool = typer.Option(
+        True, "--kg-grounding/--no-kg-grounding",
+        help=("Ground authoring in the shared knowledge graph "
+              "(best-effort retrieval; never blocks authoring).")),
     json_out: bool = typer.Option(
         False, "--json", help="Emit the promoted result as JSON."),
 ):
@@ -79,12 +83,20 @@ def world_author(
         author_environment,
         default_clarification_submission,
     )
+    from sculptor.world.grounding import (
+        gather_grounding,
+        grounding_context,
+        grounding_ids,
+    )
     from sculptor.world.project import WorldProjectService
 
     try:
+        grounding_items = gather_grounding(prompt) if kg_grounding else ()
         draft = author_environment(
             prompt, robot_capability_id=robot,
-            robot_descriptor_paths=robot_descriptor)
+            robot_descriptor_paths=robot_descriptor,
+            grounding=grounding_ids(grounding_items),
+            grounding_context=grounding_context(grounding_items))
         import sys
 
         should_prompt = (
@@ -166,6 +178,7 @@ def world_author(
         "asset_dir": str(admitted.asset_dir),
         "clarification_answers": len(
             applied.clarification_ledger.get("answers", [])),
+        "kg_grounding": grounding_ids(grounding_items),
     }
     if json_out:
         typer.echo(_json.dumps(result, indent=2, sort_keys=True))
@@ -180,6 +193,8 @@ def world_author(
         typer.echo(f"  eval assets: {admitted.asset_dir}")
         typer.echo(
             f"  gates:       {len(admitted.admission['gates'])} passed")
+        typer.echo(
+            f"  grounding:   {len(grounding_items)} KG nodes")
 
 
 def _world_selection_path(project_dir: Path, selection: Optional[Path]) -> Path:

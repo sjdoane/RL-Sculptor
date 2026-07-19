@@ -1247,12 +1247,14 @@ class WorldAuthor:
         robot_descriptor_paths: Iterable[Path | str] = (),
         version: str = "v1", parent: str | None = None,
         grounding: Iterable[str] = (),
+        grounding_context: Iterable[Mapping[str, Any]] = (),
     ) -> AuthoringDraft:
         if not isinstance(prompt, str) or not prompt.strip():
             raise AuthoringError("prompt must be a non-empty string")
         prompt = prompt.strip()
         paths = tuple(robot_descriptor_paths)
         grounding_items = tuple(grounding)
+        grounding_evidence = tuple(dict(entry) for entry in grounding_context)
         cap, candidates, capability_source = _resolve_capability(
             prompt, robot_capability_id, paths,
         )
@@ -1285,6 +1287,12 @@ class WorldAuthor:
                     ],
                 },
             }
+            if grounding_evidence:
+                # Retrieval-only KG evidence (technique/failure-mode/paper
+                # summaries with node IDs). Input context only: the model's
+                # OUTPUT key set stays closed, and the meta.grounding ledger
+                # is written locally below from the retrieved node IDs.
+                request["kg_grounding"] = list(grounding_evidence)
             try:
                 generated = self._model.generate_authoring(request)
             except Exception as exc:
@@ -1310,6 +1318,13 @@ class WorldAuthor:
                 raise AuthoringError(
                     "author model must return world_spec and task_spec objects"
                 )
+            if grounding_items:
+                # The provenance ledger records which KG nodes informed this
+                # draft even when the model omits or clears meta.grounding.
+                for spec in (world, task):
+                    meta = spec.get("meta")
+                    if isinstance(meta, dict) and not meta.get("grounding"):
+                        meta["grounding"] = list(grounding_items)
             robot = world.get("shared", {}).get("robot", {})
             if robot.get("capability_id") != cap.capability_id:
                 raise AuthoringError(
@@ -1345,12 +1360,14 @@ def author_environment(
     robot_descriptor_paths: Iterable[Path | str] = (),
     version: str = "v1", parent: str | None = None,
     grounding: Iterable[str] = (),
+    grounding_context: Iterable[Mapping[str, Any]] = (),
 ) -> AuthoringDraft:
     """Convenience wrapper around :class:`WorldAuthor`."""
     return WorldAuthor(model).author(
         prompt, robot_capability_id=robot_capability_id,
         robot_descriptor_paths=robot_descriptor_paths, version=version,
         parent=parent, grounding=grounding,
+        grounding_context=grounding_context,
     )
 
 
