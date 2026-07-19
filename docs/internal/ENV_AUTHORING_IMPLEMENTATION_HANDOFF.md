@@ -182,10 +182,20 @@ Item 5 (backend) — the authoring API is complete in
   disclosed system-default options, full author→apply→selection→lineage
   round-trip, 404/422 contracts, ungroundable-prompt 422.
 
-Still open in item 5: the frontend slice — `lib/api.ts` + `lib/types.ts`
-wrappers, `hooks/useWorlds.ts`, an authoring dialog under `components/`
-(paginated questions, each with its system-default option), and
-selection/lineage display in `pages/ProjectDetail.tsx`. Also note
+The item-5 frontend slice is also complete: `lib/types.ts` + `lib/api.ts`
+Worlds sections, `qk.worldSelection/worldLineage`, `hooks/useWorlds.ts`
+(selection/lineage queries with `retry:false` for the 404-before-first-
+authoring case; author/apply mutations invalidating both keys + the
+project), `components/AuthorWorldDialog.tsx` (prompt → draft → paginated
+clarification pages, every question rendered with its choices AND the
+disclosed "System decides" default; unanswered = system default;
+ApiError problem.detail surfaced via toasts), `components/WorldTab.tsx`
+(authoritative-tuple card + train variations + immutable selection
+lineage), and a `world` tab in `pages/ProjectDetail.tsx`. Verified:
+`tsc -b --noEmit` clean + `vite build` clean.
+
+Still open in item 5: a visual scene preview of the authored world (the
+existing RobotViewer/preview seam is the likely host). Also note
 `services/project_store.py:548` still keys `_compute_status` on the
 legacy per-project `kg/graph.db`.
 

@@ -10,6 +10,7 @@ import { NewRunDialog } from "@/components/NewRunDialog";
 import { RewardsTab } from "@/components/RewardsTab";
 import { RobotConfig } from "@/components/RobotConfig";
 import { RobotViewer } from "@/components/RobotViewer";
+import WorldTab from "@/components/WorldTab";
 import { useLibraryRobot } from "@/hooks/useLibrary";
 import { usePhysics } from "@/hooks/usePhysics";
 import { usePolicies } from "@/hooks/usePolicies";
@@ -27,6 +28,7 @@ const ReportsTabLazy = lazy(() => import("@/components/ReportsTab"));
 const TABS = [
   { value: "overview", label: "Overview", icon: "gauge" },
   { value: "rewards", label: "Rewards", icon: "file-code" },
+  { value: "world", label: "World", icon: "globe" },
   { value: "physics", label: "Physics", icon: "cpu" },
   { value: "knowledge", label: "Knowledge", icon: "network" },
   { value: "training", label: "Training", icon: "activity" },
@@ -237,6 +239,7 @@ export default function ProjectDetail() {
               />
             </ScrollPad>
           )}
+          {tab === "world" && <ScrollPad><WorldTab slug={slug!} /></ScrollPad>}
           {tab === "physics" && <ScrollPad><PhysicsTab slug={slug!} project={p} /></ScrollPad>}
           {tab === "knowledge" && <KnowledgeGraphTab slug={slug!} />}
           {tab === "training" && (

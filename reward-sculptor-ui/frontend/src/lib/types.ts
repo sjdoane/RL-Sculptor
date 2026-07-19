@@ -1403,3 +1403,103 @@ export interface RefDetail {
   index: RefIndexRow;
   provenance: Record<string, unknown>;
 }
+
+// ── Worlds (environment authoring, item 5) ─────────────────────────────
+export interface WorldClarificationChoice {
+  choice_id: string;
+  label: string;
+  [extra: string]: unknown;
+}
+
+export interface WorldSystemDefault {
+  choice_id: "system_default";
+  resolves_to: string;
+  label: string;
+  reason: string;
+}
+
+export interface WorldClarificationQuestion {
+  question_id: string;
+  parameter_path: string;
+  prompt: string;
+  choices: WorldClarificationChoice[];
+  default_choice_id: string;
+  default_reason: string;
+  system_default: WorldSystemDefault;
+}
+
+export interface WorldClarificationPage {
+  page: number;
+  questions: WorldClarificationQuestion[];
+}
+
+export interface WorldClarificationPlan {
+  version: number;
+  draft_hash: string;
+  question_set_hash: string;
+  pages: WorldClarificationPage[];
+}
+
+export interface WorldAuthorRequest {
+  prompt: string;
+  robot_capability_id?: string | null;
+  kg_grounding?: boolean;
+}
+
+export interface WorldAuthorResponse {
+  session_id: string;
+  draft_hash: string;
+  capability_id: string;
+  clarification_plan: WorldClarificationPlan;
+  underspecification_report: {
+    defaulted_load_bearing_paths: string[];
+    [extra: string]: unknown;
+  };
+  kg_grounding: string[];
+}
+
+export interface WorldApplyRequest {
+  session_id: string;
+  answers: { question_id: string; choice_id: string }[];
+}
+
+export interface WorldApplyResponse {
+  ok: boolean;
+  session_id: string;
+  capability_id: string;
+  result_hash: string;
+  evaluation_lineage: string;
+  selection: { selection_version: number; tuple_hash: string;
+    [extra: string]: unknown };
+  admission: { ok: boolean; [extra: string]: unknown };
+  clarification_answers: number;
+  [extra: string]: unknown;
+}
+
+export interface WorldSelection {
+  selection: { selection_version: number; tuple_hash: string;
+    evaluation_lineage: string; [extra: string]: unknown };
+  world_meta: { version?: string; parent?: string | null; prompt?: string;
+    grounding?: string[]; [extra: string]: unknown };
+  task_meta: { [extra: string]: unknown };
+  shared_summary: {
+    terrain_kind: string | null;
+    objects: string[];
+    zones: string[];
+    course_elements: number;
+    robot: string | null;
+  };
+  goal: { [extra: string]: unknown };
+  train_variations: {
+    id: string; target: string; class: string;
+    distribution: { [extra: string]: unknown };
+  }[];
+}
+
+export interface WorldLineageEntry {
+  selection_version: number;
+  created_at: number;
+  tuple_hash: string;
+  evaluation_lineage: string;
+  refs: Record<string, { version: string | number | null }>;
+}

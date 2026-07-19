@@ -70,4 +70,9 @@ export const qk = {
   referenceSearch: (query: string, robot: string) =>
     ["references", "search", robot, query] as const,
   referenceIndex: (robot: string) => ["references", "index", robot] as const,
+
+  // Environment authoring (env-authoring item 5): the promoted world
+  // tuple + its immutable selection history.
+  worldSelection: (slug: string) => ["worldSelection", slug] as const,
+  worldLineage: (slug: string) => ["worldLineage", slug] as const,
 };

@@ -1184,3 +1184,51 @@ export async function detachStageReference(
     ),
   );
 }
+
+// ── Worlds (environment authoring, item 5) ─────────────────────────────
+import type {
+  WorldApplyRequest,
+  WorldApplyResponse,
+  WorldAuthorRequest,
+  WorldAuthorResponse,
+  WorldLineageEntry,
+  WorldSelection,
+} from "./types";
+
+export async function authorWorld(
+  slug: string, body: WorldAuthorRequest,
+): Promise<WorldAuthorResponse> {
+  return handle<WorldAuthorResponse>(
+    await fetch(`/api/projects/${slug}/worlds/author`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  );
+}
+
+export async function applyWorldAuthor(
+  slug: string, body: WorldApplyRequest,
+): Promise<WorldApplyResponse> {
+  return handle<WorldApplyResponse>(
+    await fetch(`/api/projects/${slug}/worlds/author/apply`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  );
+}
+
+export async function getWorldSelection(slug: string): Promise<WorldSelection> {
+  return handle<WorldSelection>(
+    await fetch(`/api/projects/${slug}/worlds/selection`),
+  );
+}
+
+export async function getWorldLineage(
+  slug: string,
+): Promise<WorldLineageEntry[]> {
+  return handle<WorldLineageEntry[]>(
+    await fetch(`/api/projects/${slug}/worlds/lineage`),
+  );
+}
