@@ -62,12 +62,22 @@ def _asset_signature(materialized: Mapping[str, Any] | None) -> list[tuple[str, 
     return signature
 
 
+def _canonical_json(value: Any) -> str:
+    """Type-stable comparison form. The stored manifest arrives as parsed
+    JSON (lists) while a fresh compile carries dataclass tuples — Python
+    `!=` sees a container-type difference where the evaluation content is
+    byte-identical, which falsely rejected every train-only edit on a
+    course world. Real drift still differs canonically."""
+    return json.dumps(value, sort_keys=True, default=str)
+
+
 def _eval_invariance_errors(
     old: Mapping[str, Any], new: Mapping[str, Any],
 ) -> list[str]:
     errors = [
         f"evaluation field {key!r} changed"
-        for key in _EVAL_INVARIANT_KEYS if old.get(key) != new.get(key)
+        for key in _EVAL_INVARIANT_KEYS
+        if _canonical_json(old.get(key)) != _canonical_json(new.get(key))
     ]
     if _asset_signature(old.get("materialized_assets")) != _asset_signature(
             new.get("materialized_assets")):
