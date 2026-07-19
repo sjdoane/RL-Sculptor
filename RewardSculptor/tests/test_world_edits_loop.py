@@ -174,3 +174,48 @@ def test_promote_iteration_selection_base_selection_reverts_world(
     assert reverted["evaluation_lineage"] == "eval-variation-test"
     # the adapter now points at the reverted pin for the next train step
     assert adapter.world_selection_path == str(reverted_pin.resolve())
+
+
+def test_write_world_curriculum_stats_histogram_and_fail_soft(tmp_path) -> None:
+    """§10: the runner exports the terrain-level histogram after training;
+    envs without a terrain curriculum write nothing and never raise."""
+    import torch
+
+    from sculptor.adapters._mjlab_runner import _write_world_curriculum_stats
+
+    terrain = SimpleNamespace(
+        terrain_levels=torch.tensor([0, 0, 1, 2, 2, 2]), max_terrain_level=6)
+    env = SimpleNamespace(unwrapped=SimpleNamespace(
+        scene=SimpleNamespace(terrain=terrain)))
+    _write_world_curriculum_stats(env, tmp_path)
+    stats = json.loads((tmp_path / "world_curriculum_stats.json").read_text())
+    assert stats["num_envs"] == 6
+    assert stats["max_level"] == 6
+    assert stats["histogram"] == {"0": 2, "1": 1, "2": 3}
+    assert abs(stats["mean_level"] - 7 / 6) < 1e-3
+
+    # plane / legacy env: no terrain_levels -> no file, no exception
+    bare = SimpleNamespace(unwrapped=SimpleNamespace(
+        scene=SimpleNamespace(terrain=None)))
+    out2 = tmp_path / "bare"
+    out2.mkdir()
+    _write_world_curriculum_stats(bare, out2)
+    assert not (out2 / "world_curriculum_stats.json").exists()
+
+
+def test_world_block_renders_curriculum_stats(tmp_path) -> None:
+    from sculptor.diagnose import _render_world_variations_block
+
+    variations = [{"id": "ball_mass", "target": "/t", "class": "model_field",
+                   "distribution": {"kind": "uniform", "low": 0.1,
+                                     "high": 0.2}}]
+    stats = {"num_envs": 4, "mean_level": 1.5, "max_level": 6,
+             "histogram": {"1": 2, "2": 2}}
+    block = _render_world_variations_block(variations, stats)
+    assert "terrain curriculum after this iteration" in block
+    assert '"mean_level": 1.5' in block
+    # stats alone (no registered variations) must not create a surface
+    assert _render_world_variations_block([], stats) == ""
+    # variations without stats render the block without the stats section
+    no_stats = _render_world_variations_block(variations, {})
+    assert "terrain curriculum" not in no_stats

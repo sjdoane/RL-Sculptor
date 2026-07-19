@@ -799,14 +799,30 @@ def _render_env_spec_block(env_spec: dict | None) -> str:
     )
 
 
+def _load_world_curriculum_stats(iter_dir: Path) -> dict:
+    """§env-authoring §10: the per-difficulty traversal summary the train
+    runner writes (`world_curriculum_stats.json` — terrain-level
+    histogram after mjlab's promote/demote curriculum). `{}` when absent
+    (plane terrain, non-curriculum grid, legacy env), keeping the
+    renderer a no-op."""
+    path = iter_dir / "world_curriculum_stats.json"
+    if not path.is_file():
+        return {}
+    payload = _load_json(path)
+    return payload if isinstance(payload, dict) else {}
+
+
 def _render_world_variations_block(
     world_variations: list[dict] | None,
+    curriculum_stats: dict | None = None,
 ) -> str:
     """§env-authoring §10.2: the # WORLD_VARIATIONS block — every
     registered train-only variation of the authored world with its stable
-    ID, target pointer, class, and current distribution. Empty string
-    when the project has no authored world or it registers no variations
-    (the model is instructed to emit no world edits then)."""
+    ID, target pointer, class, and current distribution, plus (when the
+    runner exported one) the per-difficulty terrain-level summary from
+    this iteration's training. Empty string when the project has no
+    authored world or it registers no variations (the model is
+    instructed to emit no world edits then)."""
     if not world_variations:
         return ""
     lines = [
@@ -821,6 +837,14 @@ def _render_world_variations_block(
         )
         for entry in world_variations
     ]
+    stats_block = ""
+    if curriculum_stats:
+        stats_block = (
+            "# terrain curriculum after this iteration's training\n"
+            "# (per-env difficulty level; promotion = traversal success at\n"
+            "# that level, mass pinned at level 0 = easiest row still fails):\n"
+            f"{json.dumps(curriculum_stats, sort_keys=True)}\n"
+        )
     return (
         "# WORLD_VARIATIONS\n"
         "# Registered TRAIN-ONLY variations of the authored world. You may\n"
@@ -828,7 +852,8 @@ def _render_world_variations_block(
         "# COMPLETE new_distribution; takes effect next iteration after\n"
         "# full re-admission). The evaluation world is frozen and\n"
         "# byte-verified — a train edit can never change what is scored.\n"
-        + "\n".join(lines) + "\n\n"
+        + "\n".join(lines) + "\n"
+        + stats_block + "\n"
     )
 
 
@@ -844,6 +869,7 @@ def _build_grounded_user_content(
     realism_audit: dict | None = None,
     env_spec: dict | None = None,
     world_variations: list[dict] | None = None,
+    world_curriculum_stats: dict | None = None,
     reference_signature: dict | None = None,
 ) -> str:
     feedback_block = ""
@@ -884,7 +910,7 @@ def _build_grounded_user_content(
         f"{realism_block}"
         f"{reference_block}"
         f"{_render_env_spec_block(env_spec)}"
-        f"{_render_world_variations_block(world_variations)}"
+        f"{_render_world_variations_block(world_variations, world_curriculum_stats)}"
         f"# behavior.json\n{json.dumps(behavior, indent=2, sort_keys=True, default=str)}\n\n"
         f"# REWARD_CONTRACT\n{contract_text}\n\n"
         f"# PRELIMINARY DIAGNOSIS\n"
@@ -1070,6 +1096,8 @@ def diagnose(
             print(f"[diagnose] world selection unreadable ({e}) — no "
                   "world-edit surface this iter.", file=sys.stderr,
                   flush=True)
+    world_curriculum_stats = (
+        _load_world_curriculum_stats(iter_dir) if world_variations else {})
 
     # 3. Anthropic client.
     if client is None:
@@ -1309,6 +1337,7 @@ def diagnose(
             realism_audit=realism_audit,
             env_spec=env_spec,
             world_variations=world_variations,
+            world_curriculum_stats=world_curriculum_stats,
             reference_signature=reference_signature,
         )
         grounded: _GroundedModel = _parse_with_retry(

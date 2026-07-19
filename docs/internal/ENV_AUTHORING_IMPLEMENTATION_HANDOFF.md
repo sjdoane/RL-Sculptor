@@ -150,10 +150,14 @@ finding: `apply_world_variation_edits` now holds the store lock across
 read-edit-admit (FileLock is reentrant) so a concurrent UI promotion
 cannot be clobbered by a train edit applied to a stale parent.
 
-Still open in item 4:
-
-- promotion statistics for the diagnoser (per-difficulty-level success /
-  traversal stats, §10) are not yet exported from training.
+Item 4 is complete. Per-difficulty promotion statistics now flow to the
+diagnoser: `_write_world_curriculum_stats` in `_mjlab_runner.py` exports
+the end-of-training terrain-level histogram (mjlab promotes
+`terrain_levels` on traversal success, so the level distribution IS the
+per-difficulty success summary) to `<iter_dir>/world_curriculum_stats.json`,
+fail-soft for plane/non-curriculum/legacy envs; `diagnose.py` loads it
+best-effort and renders it inside the `# WORLD_VARIATIONS` block —
+stats without registered variations create no edit surface.
 
 The active plan is:
 

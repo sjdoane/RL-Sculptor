@@ -1495,8 +1495,47 @@ def _cmd_train(args: argparse.Namespace) -> None:
     }
     (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
 
+    _write_world_curriculum_stats(env, output_dir)
     env.close()
     print(json.dumps({"status": "ok", "checkpoint": str(ckpt_path)}))
+
+
+def _write_world_curriculum_stats(env: Any, output_dir: Path) -> None:
+    """§env-authoring §10: per-difficulty traversal statistics for the
+    diagnoser. mjlab's terrain curriculum promotes each env's row
+    (`terrain_levels`) on traversal success, so the end-of-training level
+    distribution IS the per-difficulty success summary: mass at high
+    levels = the policy earned promotion; mass pinned at level 0 = the
+    easiest difficulty is still failing. Fail-soft by contract — plane
+    terrain, non-curriculum grids, and legacy envs write nothing."""
+    try:
+        scene = getattr(getattr(env, "unwrapped", env), "scene", None)
+        terrain = getattr(scene, "terrain", None)
+        levels_t = getattr(terrain, "terrain_levels", None)
+        if levels_t is None:
+            return
+        levels = [int(v) for v in levels_t.detach().cpu().tolist()]
+        if not levels:
+            return
+        from collections import Counter
+
+        histogram = Counter(levels)
+        max_level = getattr(terrain, "max_terrain_level", None)
+        stats = {
+            "version": 1,
+            "num_envs": len(levels),
+            "mean_level": round(sum(levels) / len(levels), 3),
+            "max_level": int(max_level) if max_level is not None else None,
+            "histogram": {str(k): int(v) for k, v in sorted(histogram.items())},
+        }
+        (output_dir / "world_curriculum_stats.json").write_text(
+            json.dumps(stats, indent=2, sort_keys=True), encoding="utf-8")
+    except Exception as e:  # noqa: BLE001 — stats are advisory, never fatal
+        print(
+            f"[runner] warning: world curriculum stats skipped: "
+            f"{type(e).__name__}: {e}",
+            file=sys.stderr, flush=True,
+        )
 
 
 _RENDER_DEFAULT_W = 1280
