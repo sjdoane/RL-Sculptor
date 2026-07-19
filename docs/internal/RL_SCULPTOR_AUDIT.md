@@ -271,6 +271,67 @@ treated as regressions.
 Format per entry: date — what changed (files:lines) — why — evidence
 (tests/smoke) — commit.
 
+### 2026-07-19 — FUTURE DIRECTION (not implemented): grounded, unbiased
+video judge (Sam's ask, informed by Prompt2Policy's implementation)
+
+Sam's framing after watching the Prompt2Policy demo: the video judge is
+imperative to judging success; ours should "use the systems to best let
+it fully and completely understand the actions of the robot and be able
+to score in an unbiased way." Design direction, recorded for a later
+increment. Evidence base: KRAFTON Prompt2Policy source
+(`src/p2p/agents/judge_agent.py`, `prompts/judge_agent.py`,
+`inference/vlm.py`, `analysis/guardrails.py` — MIT).
+
+**What Prompt2Policy actually does (verified in source):**
+- **Two-turn judging as agreement-bias mitigation**: Turn 1 makes the
+  VLM pre-commit 3-5 observable visual success criteria BEFORE seeing
+  any rollout (grounded on the intent + the episode's first frame +
+  injected camera-orientation and joint-rotation conventions), then a
+  self-review loop (≤3 rounds) refines them; criteria are cached per
+  session and frozen for all Turn 2 scoring calls.
+- **Physics cross-reference**: prompts explicitly warn that VLMs cannot
+  reliably judge rotation direction from video; a final LLM synthesis
+  stage merges the VLM critique with the code judge and per-term reward
+  telemetry into pass/fail.
+- **Distributional inputs**: judged videos are percentile-selected
+  (p10 / median / p90) from parallel evals, not cherry-picked; a
+  StreamingJudge overlaps VLM inference with PPO training.
+- **Guardrails**: single-reward-term dominance (>90% of magnitude →
+  reward-hacking warning) and plateau detection feed the revise loop.
+
+**How OUR judge goes further — grounded in system assets:**
+1. **Criteria from the authored TaskSpec, not VLM priors**: generate the
+   Turn-1 rubric from the goal type, success predicates, zones, and
+   contact spec of the promoted tuple; freeze the rubric per evaluation
+   lineage (mirrors the metric-freeze discipline).
+2. **Full action understanding**: render eval rollouts from the
+   materialized scene at multiple camera angles with a synchronized
+   telemetry strip (per-frame success-predicate state, contact events,
+   waypoint/traversal progress from the world channel recorder) — the
+   VLM sees ground-truth physics beside pixels instead of guessing at
+   them, and the synthesis stage cross-references trajectory.npz +
+   metric components rather than raw reward terms.
+3. **Reference anchoring**: pairwise comparison against reference/demo
+   keyframes and against the best-so-far rollout, order-randomized —
+   relative judgments over absolute scores.
+4. **Bias controls**: blind judging (no reward code, edit history,
+   iteration index, or prior scores in context); ensemble over seeds and
+   judge samples with the score DISTRIBUTION reported, not a point
+   estimate; periodic calibration of judge scores against the calibrated
+   objective metric (Spearman, reusing metric_calibration) — the judge
+   is trusted only within its measured agreement band.
+5. **Firewall (non-negotiable)**: the video judge is ADVISORY — a
+   diagnoser input and a human-facing report, never fitness, never
+   keep/revert. Judge-vs-metric disagreement is surfaced as a diagnoser
+   signal (possible metric gaming OR judge bias), never auto-resolved.
+   Verdicts land in run-case memory as observations so judge drift is
+   itself measurable.
+
+**Cheap near-term adoptions (independent of the VLM judge):** the
+single-term-dominance guardrail over our component breakdowns; plateau
+detection over training feedback; criteria-self-review as a pattern for
+our metric generator's review stage.
+
 ### 2026-07-18 — external corpus additions from USC robotics contact
 (Lokesh Krishna) + roadmap candidates
 

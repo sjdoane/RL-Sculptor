@@ -194,10 +194,14 @@ ApiError problem.detail surfaced via toasts), `components/WorldTab.tsx`
 lineage), and a `world` tab in `pages/ProjectDetail.tsx`. Verified:
 `tsc -b --noEmit` clean + `vite build` clean.
 
-Still open in item 5: a visual scene preview of the authored world (the
-existing RobotViewer/preview seam is the likely host). Also note
-`services/project_store.py:548` still keys `_compute_status` on the
-legacy per-project `kg/graph.db`.
+The scene preview and the legacy status-key fix both landed
+(`GET /projects/{slug}/worlds/preview` renders the materialized
+evaluation MJB, cached per selection version + angle; `_compute_status`
+now resolves the shared KG path). One recorded FUTURE direction (not
+implemented, per Sam): a grounded, unbiased VLM video judge — full
+design + Prompt2Policy source evidence in `RL_SCULPTOR_AUDIT.md`
+(2026-07-19 entry). Advisory only; the metric firewall stays
+authoritative.
 
 The active plan is:
 
