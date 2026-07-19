@@ -86,6 +86,47 @@ node), both LLM-extracted; four candidate roadmap items are recorded in
 branch-parallel edits, behavioral milestones — none may weaken the
 metric firewall).
 
+Plan item 4 (diagnoser/curriculum/run-memory) is now partially complete —
+three committed increments:
+
+- **World-aware run cases** (`dc8c87a`): `RunCase` records
+  `world_tuple_hash` / `world_version` / `task_version`, read fail-soft
+  from the iteration's pinned selection file (`_world_identity` in
+  `kg/cases.py`; `IterOutcome` already carried hash+path).
+- **Within-run terrain curriculum** (`bdc0c94`):
+  `apply_world_selection(train=True)` widens the compiled generator
+  difficulty from the pinned nominal to
+  `train.curriculum.difficulty_range` (curriculum_grid + generator only;
+  `train_difficulty_span` / `expand_train_terrain_difficulty` in
+  `world/compiler.py`). mjlab rows interpolate lo→hi and the base task's
+  terrain-levels term promotes/demotes origins. Eval manifests, assets,
+  and hashes stay computed from the pinned difficulty.
+- **Train-variation edit application** (`world/project.py`):
+  `WorldVariationEdit` + `apply_world_variation_edits(project_dir, edits)`
+  — resolves registered `train.variations` by stable ID, per-edit
+  rollback on validation failure, `meta.version` bump (parent-linked),
+  full re-admission, and atomic promotion with the EXISTING evaluation
+  lineage. `admit_and_promote` gained `require_eval_invariance_with`: the
+  recompiled evaluation must match the prior manifest in every
+  evaluation-defining field and materialized asset byte, so a train-only
+  edit provably cannot move the baseline (§6.1). Rejections land in
+  `env/rejected` with `eval_invariance_violations`.
+
+Still open in item 4 (the next coherent slice):
+
+- diagnoser surface: `_render_world_block` + `proposed_world_edits`
+  (mirror `_render_env_spec_block` / `_ProposedEnvEditModel` in
+  `diagnose.py:718/148/181`, resolution beside `:950`), plumb the world
+  bundle into `diagnose()`, and call `apply_world_variation_edits` from
+  `_run_one_iter` beside the env-edit apply (`sculpt.py:1900-1951`);
+- keep-best/revert must then carry the world ref version per iteration
+  (today `_promote_iteration_selection` rebinds only reward+env_spec and
+  holds world immutable — extend it with the world version trained, and
+  restore the best world version at end of run beside
+  `best_env_spec_selected`);
+- promotion statistics for the diagnoser (per-difficulty-level success /
+  traversal stats, §10) are not yet exported from training.
+
 The active plan is:
 
 1. capability descriptors plus strict WorldSpec/TaskSpec and persistence (done);

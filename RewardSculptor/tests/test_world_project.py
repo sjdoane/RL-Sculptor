@@ -143,3 +143,98 @@ def test_admission_materializes_then_atomically_promotes(tmp_path: Path) -> None
         f"selection_v{admitted.promoted.selection.selection_version}.json")
     assert selection.evaluation_lineage == "eval-admitted"
     assert bundle["resolved_eval"]["admission"]["ok"] is True
+
+
+# ── env-authoring §10.2: train-variation edits on the atomic tuple ────────
+def _admitted_with_variation(tmp_path: Path):
+    from sculptor.world.project import apply_world_variation_edits  # noqa: F401
+
+    project = _project(tmp_path)
+    world, task = _admissible_world_task()
+    world["shared"]["objects"]["ball"]["nominal"]["mass_kg"] = 0.2
+    world["train"]["variations"] = [{
+        "id": "ball_mass",
+        "target": "/shared/objects/ball/nominal/mass_kg",
+        "class": "model_field",
+        "distribution": {"kind": "uniform", "low": 0.15, "high": 0.25},
+    }]
+    service = WorldProjectService(project)
+    admitted = service.admit_and_promote(
+        world=world, task=task,
+        clarifications={"questions": [], "answers": []},
+        evaluation_lineage="eval-variation-test")
+    return project, service, admitted
+
+
+def test_variation_edit_promotes_new_tuple_and_freezes_eval(tmp_path: Path) -> None:
+    from sculptor.world.project import (
+        WorldVariationEdit,
+        apply_world_variation_edits,
+    )
+
+    project, service, admitted = _admitted_with_variation(tmp_path)
+    old_selection = admitted.promoted.selection
+    old_eval = service.current_bundle()["resolved_eval"]
+
+    result = apply_world_variation_edits(project, [WorldVariationEdit(
+        variation_id="ball_mass",
+        new_distribution={"kind": "uniform", "low": 0.10, "high": 0.30},
+        rationale="widen mass randomization",
+    )], service=service)
+
+    assert [e["variation_id"] for e in result["applied"]] == ["ball_mass"]
+    assert result["rejected"] == []
+    selection = result["selection"]
+    assert selection["selection_version"] > old_selection.selection_version
+    assert selection["evaluation_lineage"] == "eval-variation-test"
+
+    bundle = service.current_bundle()
+    world = bundle["world"]
+    assert world["meta"]["version"] == "v2"
+    assert world["meta"]["parent"] == "v1"
+    (variation,) = world["train"]["variations"]
+    assert variation["distribution"]["low"] == 0.10
+    # evaluation identity is untouched by a train-only edit
+    new_eval = bundle["resolved_eval"]
+    for key in ("eval_seed", "compiled_model_hash", "terrain", "course",
+                "objects", "zones"):
+        assert new_eval[key] == old_eval[key], key
+    # the promoted tuple loads + verifies end to end
+    load_selected_world(project / "env" / "selection_current.json")
+
+
+def test_variation_edit_rejections_leave_selection_untouched(tmp_path: Path) -> None:
+    from sculptor.world.project import (
+        WorldVariationEdit,
+        apply_world_variation_edits,
+    )
+
+    project, service, admitted = _admitted_with_variation(tmp_path)
+    result = apply_world_variation_edits(project, [
+        WorldVariationEdit("nonexistent", {"kind": "uniform",
+                                            "low": 0.1, "high": 0.2}),
+        WorldVariationEdit("ball_mass", {"kind": "uniform",
+                                          "low": 0.15, "high": 0.25}),
+        WorldVariationEdit("ball_mass", {"kind": "nonsense"}),
+    ], service=service)
+
+    assert result["applied"] == []
+    assert result["selection"] is None
+    reasons = {r["variation_id"]: r["reason"] for r in result["rejected"]}
+    assert "unknown variation id" in reasons["nonexistent"]
+    assert len(result["rejected"]) == 3
+    current = service.store.read_selection()
+    assert current.tuple_hash == admitted.promoted.selection.tuple_hash
+
+
+def test_eval_invariance_guard_rejects_before_promotion(tmp_path: Path) -> None:
+    project, service, admitted = _admitted_with_variation(tmp_path)
+    bundle = service.current_bundle()
+    with pytest.raises(WorldPromotionError, match="moved evaluation"):
+        service.admit_and_promote(
+            world=bundle["world"], task=bundle["task"],
+            clarifications={}, evaluation_lineage="eval-variation-test",
+            require_eval_invariance_with={"eval_seed": -12345},
+        )
+    current = service.store.read_selection()
+    assert current.tuple_hash == admitted.promoted.selection.tuple_hash

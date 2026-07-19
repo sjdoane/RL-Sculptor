@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import re
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Iterable, Mapping
 
 from sculptor.env_spec import (
     read_current_env_spec,
@@ -26,6 +27,58 @@ from sculptor.world.world_spec import validate_world_spec
 
 class WorldPromotionError(ValueError):
     """An authored bundle is incomplete or failed a promotion invariant."""
+
+
+@dataclass(frozen=True)
+class WorldVariationEdit:
+    """One diagnoser-scale edit: retarget a registered ``train.variations``
+    entry (by stable ID — env-authoring §10.2) to a new distribution."""
+
+    variation_id: str
+    new_distribution: Mapping[str, Any]
+    rationale: str = ""
+
+
+#: ResolvedEvaluation fields that define what evaluation *is*. A train-only
+#: variation edit re-admits the tuple, and every one of these must come out
+#: identical — world/task/catalog hashes legitimately change, evaluation
+#: must not (§6.1: only a shared-field change may move the baseline).
+_EVAL_INVARIANT_KEYS = (
+    "eval_seed", "terrain", "course", "objects", "zones", "task_shared",
+    "robot_asset_hash", "compiled_model_hash",
+)
+
+
+def _asset_signature(materialized: Mapping[str, Any] | None) -> list[tuple[str, str]]:
+    """(basename, sha256) pairs — asset dirs are versioned, bytes must not be."""
+    materialized = materialized or {}
+    signature = sorted(
+        (Path(str(record.get("path", ""))).name, str(record.get("sha256", "")))
+        for record in materialized.get("files", ())
+    )
+    signature.append(
+        ("evaluation_mjb", str(materialized.get("evaluation_mjb_sha256", ""))))
+    return signature
+
+
+def _eval_invariance_errors(
+    old: Mapping[str, Any], new: Mapping[str, Any],
+) -> list[str]:
+    errors = [
+        f"evaluation field {key!r} changed"
+        for key in _EVAL_INVARIANT_KEYS if old.get(key) != new.get(key)
+    ]
+    if _asset_signature(old.get("materialized_assets")) != _asset_signature(
+            new.get("materialized_assets")):
+        errors.append("materialized evaluation asset bytes changed")
+    return errors
+
+
+def _bump_meta_version(meta: dict[str, Any]) -> None:
+    old = str(meta.get("version") or "v1")
+    match = re.fullmatch(r"v([0-9]+)", old)
+    meta["parent"] = old
+    meta["version"] = f"v{int(match.group(1)) + 1}" if match else "v2"
 
 
 @dataclass(frozen=True)
@@ -153,11 +206,19 @@ class WorldProjectService:
         self, *, world: Mapping[str, Any], task: Mapping[str, Any],
         clarifications: Mapping[str, Any], evaluation_lineage: str,
         rejected_session_id: str | None = None,
+        require_eval_invariance_with: Mapping[str, Any] | None = None,
     ) -> AdmittedWorld:
         """Run all CPU gates, freeze eval assets, then commit one tuple.
 
         A failed gate cannot alter the authoritative selection.  Its complete
         report and declarative inputs are retained under ``env/rejected``.
+
+        ``require_eval_invariance_with``: a prior ResolvedEvaluation dict.
+        When given, the freshly compiled evaluation must be identical in
+        every evaluation-defining field and materialized asset byte —
+        the guard that makes train-only edits provably unable to move the
+        evaluation baseline (§6.1). Drift rejects the whole admission
+        before anything is promoted.
         """
         from sculptor.world.gates import run_admission_gates
 
@@ -166,7 +227,13 @@ class WorldProjectService:
             report, compiled = run_admission_gates(
                 world, task, materialize_dir=asset_dir,
                 runtime_task_id=self._runtime_task_id())
-            if not report.ok or compiled is None:
+            drift: list[str] = []
+            if (report.ok and compiled is not None
+                    and require_eval_invariance_with is not None):
+                drift = _eval_invariance_errors(
+                    dict(require_eval_invariance_with),
+                    compiled.resolved_eval.to_dict())
+            if not report.ok or compiled is None or drift:
                 session_id = rejected_session_id or (
                     "admission-" + re.sub(
                         r"[^a-zA-Z0-9_-]", "-", evaluation_lineage)[:48])
@@ -175,7 +242,11 @@ class WorldProjectService:
                     "clarifications": dict(clarifications),
                     "admission": report.to_dict(),
                     "evaluation_lineage": evaluation_lineage,
+                    "eval_invariance_violations": drift,
                 })
+                if drift:
+                    raise WorldPromotionError(
+                        "train-only edit moved evaluation: " + "; ".join(drift))
                 summary = "; ".join(
                     f"{item.gate}/{item.code}: {item.message}"
                     for item in report.violations)
@@ -262,6 +333,98 @@ class WorldProjectService:
                 resolved_eval_ref=eval_ref,
                 channel_catalog_ref=catalog_ref,
                 clarifications_ref=clarification_ref)
+
+
+def apply_world_variation_edits(
+    project_dir: Path | str,
+    edits: Iterable[WorldVariationEdit],
+    *,
+    service: WorldProjectService | None = None,
+) -> dict[str, Any]:
+    """Apply diagnoser-scale edits to registered ``train.variations`` by
+    stable ID (env-authoring §10.2) and re-promote one atomic tuple.
+
+    Contract, mirroring the legacy ``apply_env_edits``:
+      - each edit resolves its variation by ID, is rejected on unknown ID
+        or no-op, and is individually rolled back when the edited world
+        fails schema/task validation — later edits still get their try;
+      - a net change bumps ``meta.version`` (parent-linked), re-runs the
+        FULL admission gate chain, and promotes with the EXISTING
+        evaluation lineage — train-only edits never reset the fitness
+        baseline;
+      - the re-compiled evaluation is hard-verified identical to the
+        current one (``require_eval_invariance_with``): an edit that
+        somehow moves evaluation rejects the whole promotion.
+
+    Returns ``{"applied": [...], "rejected": [...], "selection": dict|None,
+    "world_version": str|None}``; ``selection`` is None when nothing
+    applied (the authoritative selection is untouched).
+    """
+    service = service or WorldProjectService(project_dir)
+    bundle = service.current_bundle()
+    if not bundle:
+        raise WorldPromotionError(
+            "no authored world selection exists; run sculpt world author")
+    world = copy.deepcopy(bundle["world"])
+    task = bundle["task"]
+    applied: list[dict[str, Any]] = []
+    rejected: list[dict[str, Any]] = []
+
+    for edit in edits:
+        variation_id = str(edit.variation_id)
+        new_distribution = copy.deepcopy(dict(edit.new_distribution))
+        candidate = copy.deepcopy(world)
+        variations = candidate.get("train", {}).get("variations", [])
+        target = next(
+            (entry for entry in variations
+             if str(entry.get("id")) == variation_id), None)
+        if target is None:
+            known = sorted(str(entry.get("id")) for entry in variations)
+            rejected.append({
+                "variation_id": variation_id,
+                "reason": f"unknown variation id (registered: {known})"})
+            continue
+        old_distribution = copy.deepcopy(target.get("distribution"))
+        if new_distribution == old_distribution:
+            rejected.append({
+                "variation_id": variation_id,
+                "reason": "no-op: distribution unchanged"})
+            continue
+        target["distribution"] = new_distribution
+        errors = validate_world_spec(candidate)
+        errors.extend(validate_task_spec(dict(task), world=candidate))
+        if errors:
+            rejected.append({
+                "variation_id": variation_id,
+                "reason": "; ".join(errors)})
+            continue
+        world = candidate
+        applied.append({
+            "variation_id": variation_id,
+            "old_distribution": old_distribution,
+            "new_distribution": new_distribution,
+            "rationale": str(edit.rationale or ""),
+        })
+
+    if not applied:
+        return {"applied": [], "rejected": rejected,
+                "selection": None, "world_version": None}
+
+    _bump_meta_version(world.setdefault("meta", {}))
+    selection_info = bundle.get("selection") or {}
+    lineage = str(selection_info.get("evaluation_lineage") or "")
+    admitted = service.admit_and_promote(
+        world=world, task=task,
+        clarifications=bundle.get("clarifications") or {},
+        evaluation_lineage=lineage,
+        rejected_session_id="world-variation-edit",
+        require_eval_invariance_with=bundle.get("resolved_eval") or {},
+    )
+    return {
+        "applied": applied, "rejected": rejected,
+        "selection": admitted.promoted.selection.to_dict(),
+        "world_version": admitted.promoted.world_ref.version,
+    }
 
 
 def load_selected_world(
