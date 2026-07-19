@@ -278,6 +278,10 @@ class MjlabAdapter(SculptorAdapter):
     # content is re-read by each train/rollout subprocess, so the sculpt
     # loop can iterate the train section between iterations.
     env_spec_path: str = ""
+    # Atomic prompt-authored world/task/evaluation/channel tuple. This is
+    # separate from env_spec_path by design: the latter remains the legacy
+    # diagnoser-managed reset/randomization/optimizer surface.
+    world_selection_path: str = ""
     # §D17: path to a stage-FIXED eval-rollout reset override JSON
     # (`sculptor.reference.derive_eval_reset`'s payload, written once at
     # stage-scaffold time to `env/eval_reset.json`). Applied ONLY to
@@ -304,6 +308,8 @@ class MjlabAdapter(SculptorAdapter):
     # Populated by __post_init__.
     _validated: bool = field(default=False, init=False, repr=False)
     _remote_exec: Any = field(default=None, init=False, repr=False)
+    _world_bundle: Optional[dict[str, Any]] = field(
+        default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         # Lazy import — keeps non-mjlab adapters and UI health check
@@ -349,6 +355,37 @@ class MjlabAdapter(SculptorAdapter):
             # spawn time (after a cwd change) could validate one file
             # and hand the subprocess another.
             self.env_spec_path = str(Path(self.env_spec_path).resolve())
+
+        if self.world_selection_path:
+            from sculptor.world.artifacts import WorldArtifactStore
+            from sculptor.world.task_spec import validate_task_spec
+            from sculptor.world.world_spec import validate_world_spec
+
+            selection_path = Path(self.world_selection_path).resolve()
+            store = WorldArtifactStore(selection_path.parent.parent)
+            selection = store.read_selection(selection_path)
+            if selection is None:  # defensive: explicit path must exist
+                raise ValueError(
+                    f"world_selection_path not found: {selection_path}")
+            world = store.load_json_ref(selection.refs["world"])
+            task = store.load_json_ref(selection.refs["task"])
+            world_errors = validate_world_spec(world)
+            task_errors = validate_task_spec(task, world=world)
+            if world_errors or task_errors:
+                details = "; ".join(world_errors + task_errors)
+                raise ValueError(
+                    f"world selection {selection.tuple_hash[:12]} invalid: "
+                    f"{details}")
+            self._world_bundle = {
+                "selection": selection.to_dict(),
+                "world": world,
+                "task": task,
+                "resolved_eval": store.load_json_ref(
+                    selection.refs["resolved_eval"]),
+                "channel_catalog": store.load_json_ref(
+                    selection.refs["channel_catalog"]),
+            }
+            self.world_selection_path = str(selection_path)
 
         # §D17: fail fast on a missing/invalid eval-reset override — same
         # discipline as env_spec_path above. This file is a plain JSON
@@ -455,10 +492,35 @@ class MjlabAdapter(SculptorAdapter):
 
     # ── Contract ────────────────────────────────────────────────────────────
     def reward_contract(self) -> RewardContract:
+        state_schema = _schema_for_task(self.task_id)
+        info_keys = _info_keys_for_task(self.task_id)
+        channel_catalog = None
+        if self._world_bundle is not None:
+            from sculptor.world.capabilities import resolve_robot_capability
+
+            robot = self._world_bundle["world"]["shared"]["robot"]
+            cap = resolve_robot_capability(
+                robot["capability_id"],
+                required=robot.get("required_capabilities", []),
+                extra_paths=([robot["descriptor_path"]]
+                             if robot.get("descriptor_path") else []),
+            )
+            # Authored projects are descriptor-driven. Legacy projects retain
+            # their existing task-family compatibility mapping.
+            if cap.reward_state_schema:
+                state_schema = dict(cap.reward_state_schema)
+            channel_catalog = dict(self._world_bundle["channel_catalog"])
+            shared_names = [
+                str(channel["name"])
+                for channel in channel_catalog.get("channels", [])
+                if channel.get("access") == "shared_shaping"
+            ]
+            info_keys = list(dict.fromkeys(
+                list(_INFO_KEYS) + list(cap.reward_info_keys) + shared_names))
         return RewardContract(
             observation_space_spec=None,
             action_space_spec=None,
-            expected_info_keys=_info_keys_for_task(self.task_id),
+            expected_info_keys=info_keys,
             expected_components=None,
             supports_batched=True,
             training_device="gpu",
@@ -467,7 +529,8 @@ class MjlabAdapter(SculptorAdapter):
             # override could live in a follow-up when VRAM probe data is
             # in hand (MJLAB_PIVOT_DESIGN §3.3).
             min_gpu_memory_gb=6.0 if "G1" in self.task_id else 4.0,
-            state_schema=_schema_for_task(self.task_id),
+            state_schema=state_schema,
+            channel_catalog=channel_catalog,
         )
 
     # ── Component probe (scalar, subprocess-isolated, mjlab-shaped) ─────────
@@ -481,7 +544,8 @@ class MjlabAdapter(SculptorAdapter):
         """
         import textwrap
 
-        schema = _schema_for_task(self.task_id)
+        contract = self.reward_contract()
+        schema = contract.state_schema or _schema_for_task(self.task_id)
         action_dim = schema.get("actuator_force", (12,))[0]
         path = Path(reward_module_path).resolve()
 
@@ -528,7 +592,7 @@ class MjlabAdapter(SculptorAdapter):
         )
 
         schema_json = json.dumps({k: list(v) for k, v in schema.items()})
-        info_keys_json = json.dumps(_info_keys_for_task(self.task_id))
+        info_keys_json = json.dumps(contract.expected_info_keys)
 
         try:
             proc = subprocess.run(
@@ -670,13 +734,19 @@ class MjlabAdapter(SculptorAdapter):
         # override from the user still wins if provided.
         effective_schema_keys = (
             list(self.schema_keys) if self.schema_keys
-            else list(_schema_for_task(self.task_id).keys())
+            else list((self.reward_contract().state_schema
+                       or _schema_for_task(self.task_id)).keys())
         )
         cmd += ["--schema-keys", ",".join(effective_schema_keys)]
         if self.env_spec_path:
             cmd += ["--env-spec", str(Path(self.env_spec_path).resolve())]
         elif self.env_profile:
             cmd += ["--env-profile", self.env_profile]
+        if self.world_selection_path:
+            cmd += [
+                "--world-selection",
+                str(Path(self.world_selection_path).resolve()),
+            ]
 
         executor = self._remote_executor()
         if executor is not None:
@@ -700,16 +770,22 @@ class MjlabAdapter(SculptorAdapter):
             if not self.env_spec_path and self.env_profile:
                 options["--env-profile"] = self.env_profile
             input_paths: dict[str, Path] = {}
+            aux_dir_list: list[Path] = []
             if self.env_spec_path:
                 # File input → synced to the pod at its mirror path.
                 input_paths["--env-spec"] = Path(self.env_spec_path).resolve()
-            aux_dirs: tuple[Path, ...] = ()
+            if self.world_selection_path:
+                selection_path = Path(self.world_selection_path).resolve()
+                input_paths["--world-selection"] = selection_path
+                # Selection refs and materialized terrain assets are relative
+                # to env/. Mirror the complete immutable artifact directory.
+                aux_dir_list.append(selection_path.parent)
             if reward_module_path is not None:
                 input_paths["--reward-module-path"] = Path(reward_module_path)
                 # sculpt passes rewards/current.py — a shim that loads
                 # its sibling v<N>.py at import time, so the whole
                 # rewards/ dir must exist at its mirror path on the pod.
-                aux_dirs = (Path(reward_module_path).resolve().parent,)
+                aux_dir_list.append(Path(reward_module_path).resolve().parent)
             if init_policy_path is not None:
                 input_paths["--load-pretrained-policy"] = Path(init_policy_path).resolve()
             job = RunnerJob(
@@ -721,7 +797,7 @@ class MjlabAdapter(SculptorAdapter):
                 # sculpt.py's resume key) is promoted last.
                 required_artifacts=("metrics.json", "checkpoint.pt"),
                 remote_env=remote_env,
-                aux_dirs=aux_dirs,
+                aux_dirs=tuple(dict.fromkeys(aux_dir_list)),
             )
             proc = executor.execute(job)
         else:
@@ -848,6 +924,11 @@ class MjlabAdapter(SculptorAdapter):
             cmd += ["--env-profile", self.env_profile]
         if self.eval_reset_path:
             cmd += ["--eval-reset", str(Path(self.eval_reset_path).resolve())]
+        if self.world_selection_path:
+            cmd += [
+                "--world-selection",
+                str(Path(self.world_selection_path).resolve()),
+            ]
 
         executor = self._remote_executor()
         if executor is not None and executor.cfg.rollout_remote:
@@ -885,6 +966,11 @@ class MjlabAdapter(SculptorAdapter):
                 rollout_inputs["--env-spec"] = Path(self.env_spec_path).resolve()
             if self.eval_reset_path:
                 rollout_inputs["--eval-reset"] = Path(self.eval_reset_path).resolve()
+            rollout_aux_dirs: tuple[Path, ...] = ()
+            if self.world_selection_path:
+                selection_path = Path(self.world_selection_path).resolve()
+                rollout_inputs["--world-selection"] = selection_path
+                rollout_aux_dirs = (selection_path.parent,)
             job = RunnerJob(
                 subcommand="rollout",
                 options=options,
@@ -895,6 +981,7 @@ class MjlabAdapter(SculptorAdapter):
                 # can never present as a finished rollout.
                 required_artifacts=("behavior.json", "trajectory.npz", "rollout.mp4"),
                 remote_env=remote_env,
+                aux_dirs=rollout_aux_dirs,
             )
             proc = executor.execute(job)
         else:

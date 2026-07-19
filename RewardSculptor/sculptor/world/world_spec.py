@@ -275,12 +275,17 @@ def _validate_terrain(
 
 def _validate_obstacles(obstacles: Any, errors: list[str]) -> None:
     obstacles = _strict(
-        obstacles, "shared.obstacles", {"course", "layout", "waypoints"},
+        obstacles, "shared.obstacles",
+        {"course", "layout", "waypoints", "start_offset_m"},
         errors)
     if obstacles.get("layout", "linear") not in {"linear"}:
         errors.append("shared.obstacles.layout: only linear is supported")
     if obstacles.get("waypoints", "auto") not in {"auto", "none"}:
         errors.append("shared.obstacles.waypoints: must be auto or none")
+    if "start_offset_m" in obstacles:
+        _number(
+            obstacles["start_offset_m"],
+            "shared.obstacles.start_offset_m", errors, lo=0.0, hi=20.0)
     course = obstacles.get("course", [])
     if not isinstance(course, list):
         errors.append("shared.obstacles.course: must be a list")

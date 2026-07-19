@@ -20,7 +20,7 @@ import json
 import re
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Mapping, Optional
 
 import numpy as np
 
@@ -33,6 +33,11 @@ from sculptor.eval.generated_metric import (
 )
 from sculptor.eval.spec_metrics import _SPEC_FNS
 from sculptor.llm import log_llm_call, model_for, response_text_blocks
+from sculptor.world.channels import (
+    ChannelCatalog,
+    catalog_fixture_arrays,
+    resolve_channel_catalog,
+)
 
 if TYPE_CHECKING:  # pragma: no cover — type-only, avoids a runtime
     # sculptor.eval -> sculptor.refs import at module load (this module
@@ -46,6 +51,25 @@ _NAMES_12 = [
     "left_elbow", "right_elbow", "torso", "neck",
 ]
 _BEHAVIOR = {"max_episode_steps": T, "rollout_num_envs": E, "step_dt": 0.02}
+
+
+def _with_catalog_competence(
+    arrays: dict, catalog: ChannelCatalog | None, level: float,
+) -> dict:
+    if catalog is None:
+        return arrays
+    first = next(iter(arrays.values()))
+    case = (
+        "far_idle" if level <= 0.05
+        else "edge_camping" if level < 0.45
+        else "contact_flicker" if level < 0.95
+        else "competent"
+    )
+    merged = dict(arrays)
+    merged.update(catalog_fixture_arrays(
+        catalog, time_steps=int(first.shape[0]),
+        num_envs=int(first.shape[1]), case=case))
+    return merged
 
 
 def spearman(a: list[float], b: list[float]) -> float:
@@ -170,12 +194,21 @@ def calibrate_metric(
     builtin_name: str,
     *,
     threshold: float = 0.7,
+    channel_catalog: (
+        ChannelCatalog | Mapping[str, Any] | Path | str | None
+    ) = None,
 ) -> dict[str, Any]:
     """Compute Spearman rank-correlation between a generated metric and a
     built-in ground-truth metric over the latter's competence ladder.
     `ok=True` (steer-rights earned) iff rho ≥ threshold. Never raises."""
     if builtin_name not in _SPEC_FNS:
         raise KeyError(f"unknown built-in metric {builtin_name!r}")
+    try:
+        catalog = resolve_channel_catalog(channel_catalog)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "spearman": 0.0, "threshold": threshold,
+                "builtin": builtin_name,
+                "error": f"invalid channel catalog: {type(e).__name__}: {e}"}
     # §round-11: load ONCE (a single gated exec) and derive both the compute fn
     # AND the roles from the loaded MODULE — read_required_roles(mod) does NOT
     # re-load. This keeps the whole load inside the try (the round-10 loader can
@@ -196,7 +229,9 @@ def calibrate_metric(
     builtin_fn = _SPEC_FNS[builtin_name]
     ladder = _ladder(builtin_name)
     gen_scores, builtin_scores = [], []
-    for arrays, behavior, meta in ladder:
+    denominator = max(1, len(ladder) - 1)
+    for index, (arrays, behavior, meta) in enumerate(ladder):
+        arrays = _with_catalog_competence(arrays, catalog, index / denominator)
         inject_joint_roles(meta, roles, lenient=True)
         try:
             s = float(gen_fn(arrays, behavior, meta).get("spec_score", 0.0))
@@ -213,6 +248,7 @@ def calibrate_metric(
         "n": len(ladder),
         "gen_scores": [round(s, 4) for s in gen_scores],
         "builtin_scores": [round(s, 4) for s in builtin_scores],
+        "channel_catalog_hash": catalog.catalog_hash if catalog else None,
     }
 
 
@@ -267,6 +303,9 @@ def calibrate_metric_against_reference(
     threshold: float = 0.7,
     n_envs: int = 4,
     library_root: Optional[Path] = None,
+    channel_catalog: (
+        ChannelCatalog | Mapping[str, Any] | Path | str | None
+    ) = None,
 ) -> dict[str, Any]:
     """§REFERENCE_TRAJECTORY_PLAN §6: earn steer/observe rights for a NOVEL
     motion by ranking a competence ladder built FROM a single reference
@@ -328,6 +367,12 @@ def calibrate_metric_against_reference(
     from sculptor.eval.metric_validate import _archetypes, _NAMES_12
     from sculptor.refs.convert import clip_to_arrays
 
+    try:
+        catalog = resolve_channel_catalog(channel_catalog)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "rights": "none", "spearman": 0.0,
+                "error": f"invalid channel catalog: {type(e).__name__}: {e}"}
+
     # §F5: always re-verify — no caller-supplied cert of any kind.
     cert: Optional["TierDCertificate"] = None
     cert_reason: Optional[str] = None
@@ -355,6 +400,7 @@ def calibrate_metric_against_reference(
             "trust_tier": trust_tier,
             "cert_verified": cert is not None,
             "cert_reason": cert_reason,
+            "channel_catalog_hash": catalog.catalog_hash if catalog else None,
             "ladder": ladder or [],
             "rights": ("steer" if (ok and effective_tier == "D")
                        else "observe" if (ok and effective_tier == "K")
@@ -384,7 +430,10 @@ def calibrate_metric_against_reference(
         arche = _archetypes()
         degenerate_anchor = max(
             (s for s in (
-                _try_score(gen_fn, arche[k], batt_meta)
+                _try_score(
+                    gen_fn,
+                    _with_catalog_competence(arche[k], catalog, 0.0),
+                    batt_meta)
                 for k in ("still", "fallen", "chaotic", "upright_flail")
                 if k in arche
             ) if np.isfinite(s)),
@@ -403,6 +452,7 @@ def calibrate_metric_against_reference(
         try:
             pclip = builder(clip)
             arrays, meta = clip_to_arrays(pclip, n_envs=n_envs)
+            arrays = _with_catalog_competence(arrays, catalog, rank / 6.0)
             inject_joint_roles(meta, roles, lenient=True)
             s = _try_score(gen_fn, arrays, meta)
         except Exception:  # noqa: BLE001 — a rung that can't be built/scored = 0
@@ -414,6 +464,7 @@ def calibrate_metric_against_reference(
     # Top rung: the full clip.
     try:
         arrays, meta = clip_to_arrays(clip, n_envs=n_envs)
+        arrays = _with_catalog_competence(arrays, catalog, 1.0)
         inject_joint_roles(meta, roles, lenient=True)
         full_score = _try_score(gen_fn, arrays, meta)
     except Exception:  # noqa: BLE001
@@ -2308,6 +2359,9 @@ def calibrate_task_derived(
     adversarial: bool = False,
     adversarial_n: int = _ADV_N,
     adversarial_required_losers: bool = False,
+    channel_catalog: (
+        ChannelCatalog | Mapping[str, Any] | Path | str | None
+    ) = None,
 ) -> dict[str, Any]:
     """§Ship 51: earn steer-rights on a NOVEL task (no built-in ground truth)
     by ranking K INDEPENDENTLY-authored competence ladders. Each of K sources
@@ -2330,6 +2384,16 @@ def calibrate_task_derived(
     from sculptor.eval.ladder_synth import render_ladder
     from sculptor.eval.robot_manifest import robot_joint_names as _manifest
 
+    try:
+        catalog = resolve_channel_catalog(channel_catalog)
+    except Exception as e:  # noqa: BLE001
+        return {
+            "ok": False, "method": "task_derived", "spearman": 0.0,
+            "rho_min": 0.0, "agreement_fraction": 0.0,
+            "reason": f"invalid channel catalog: {type(e).__name__}: {e}",
+            "channel_catalog_hash": None,
+        }
+
     def _record(ok, rho_min, agreement, sources, *, degenerate=False,
                 reason=None, n_valid=0, error=None, adversarial=None) -> dict[str, Any]:
         return {
@@ -2343,6 +2407,7 @@ def calibrate_task_derived(
             "behavior_goal": behavior_goal, "robot_hint": robot_hint,
             "degenerate": bool(degenerate), "reason": reason, "error": error,
             "adversarial": adversarial, "sources": sources,
+            "channel_catalog_hash": catalog.catalog_hash if catalog else None,
         }
 
     # Load the metric (a load failure is a hard, specific deny).
@@ -2425,7 +2490,11 @@ def calibrate_task_derived(
             continue
 
         gen_scores = []
-        for arrays, behavior, meta in synth["rungs"]:
+        rung_count = len(synth["rungs"])
+        denominator = max(1, rung_count - 1)
+        for rung_index, (arrays, behavior, meta) in enumerate(synth["rungs"]):
+            arrays = _with_catalog_competence(
+                arrays, catalog, rung_index / denominator)
             inject_joint_roles(meta, roles)
             try:
                 s = float(gen_fn(arrays, behavior, meta).get("spec_score", 0.0))

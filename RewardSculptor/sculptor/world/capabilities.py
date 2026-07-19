@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import importlib
 import importlib.metadata
 import json
 from dataclasses import dataclass, field
@@ -42,8 +43,13 @@ class RobotCapability:
     geometry: RobotGeometry
     supported_commands: frozenset[str]
     supported_observations: frozenset[str]
+    reward_state_schema: dict[str, tuple[int, ...]] = field(
+        default_factory=dict)
+    reward_state_sources: dict[str, str] = field(default_factory=dict)
+    reward_info_keys: tuple[str, ...] = ()
     contact_capacity: int = 24
     augmentation: str | None = None
+    asset_factory: str | None = None
 
     def resolve_role(self, role: str) -> tuple[str, ...]:
         names = self.body_roles.get(role, ())
@@ -93,7 +99,33 @@ class RobotCapability:
         data["supported_observations"] = sorted(self.supported_observations)
         data["body_roles"] = {k: list(v) for k, v in self.body_roles.items()}
         data["site_roles"] = {k: list(v) for k, v in self.site_roles.items()}
+        data["reward_state_schema"] = {
+            k: list(v) for k, v in self.reward_state_schema.items()}
+        data["reward_state_sources"] = dict(self.reward_state_sources)
+        data["reward_info_keys"] = list(self.reward_info_keys)
         return data
+
+
+def build_robot_entity_cfg(capability: RobotCapability) -> Any:
+    """Instantiate the robot asset declared by a capability descriptor."""
+    target = capability.asset_factory
+    if not target or ":" not in target:
+        raise CapabilityError(
+            f"{capability.capability_id}: descriptor has no importable "
+            "asset_factory; exact composed admission is unavailable")
+    module_name, attribute = target.split(":", 1)
+    try:
+        factory = getattr(importlib.import_module(module_name), attribute)
+        cfg = factory()
+    except Exception as exc:
+        raise CapabilityError(
+            f"{capability.capability_id}: asset_factory {target!r} failed: "
+            f"{exc}") from exc
+    if not hasattr(cfg, "build"):
+        raise CapabilityError(
+            f"{capability.capability_id}: asset_factory {target!r} did not "
+            "return an EntityCfg")
+    return cfg
 
 
 @dataclass(frozen=True)
@@ -166,6 +198,7 @@ def _builtin_robots() -> dict[str, RobotCapability]:
         capability_id="unitree_g1:base",
         asset_id="unitree_g1",
         asset_hash="mjlab:g1",
+        asset_factory="mjlab.asset_zoo.robots:get_g1_robot_cfg",
         root_body="pelvis",
         body_roles={
             "pelvis": ("pelvis",), "torso": ("torso_link",),
@@ -187,10 +220,22 @@ def _builtin_robots() -> dict[str, RobotCapability]:
         supported_observations=frozenset(
             {"proprioception", "height_scan", "object_relative",
              "region_relative"}),
+        reward_state_schema={
+            "qpos": (29,), "qvel": (29,), "base_lin_vel_b": (3,),
+            "base_ang_vel_b": (3,), "projected_gravity_b": (3,),
+            "actuator_force": (29,), "command_vel": (3,),
+        },
+        reward_info_keys=(
+            "left_foot_contact", "right_foot_contact",
+            "left_foot_swing_speed", "right_foot_swing_speed",
+            "left_foot_height", "right_foot_height",
+            "base_horizontal_speed",
+        ),
     )
     go1 = RobotCapability(
         capability_id="unitree_go1:base", asset_id="unitree_go1",
         asset_hash="mjlab:go1", root_body="trunk",
+        asset_factory="mjlab.asset_zoo.robots:get_go1_robot_cfg",
         body_roles={
             "torso": ("trunk",),
             "front_left_foot": ("FL_calf",),
@@ -209,10 +254,16 @@ def _builtin_robots() -> dict[str, RobotCapability]:
         supported_observations=frozenset(
             {"proprioception", "height_scan", "object_relative",
              "region_relative"}),
+        reward_state_schema={
+            "qpos": (12,), "qvel": (12,), "base_lin_vel_b": (3,),
+            "base_ang_vel_b": (3,), "projected_gravity_b": (3,),
+            "actuator_force": (12,), "command_vel": (3,),
+        },
     )
     yam = RobotCapability(
         capability_id="yam:parallel_gripper", asset_id="yam",
         asset_hash="mjlab:yam", root_body="arm",
+        asset_factory="mjlab.asset_zoo.robots:get_yam_robot_cfg",
         body_roles={
             "base": ("arm",), "wrist": ("link_6",),
             "left_finger": ("link_left_finger", "lf_rot", "lf_down"),
@@ -233,6 +284,13 @@ def _builtin_robots() -> dict[str, RobotCapability]:
         supported_observations=frozenset(
             {"proprioception", "object_relative", "region_relative",
              "end_effector_relative"}),
+        reward_state_schema={
+            "qpos": (8,), "qvel": (8,), "actuator_force": (7,),
+            "end_effector_pos_w": (3,),
+        },
+        reward_state_sources={
+            "end_effector_pos_w": "site:tool_center",
+        },
         contact_capacity=32,
     )
     # Do not advertise a synthetic G1 gripper variant here. A capability is
@@ -254,6 +312,13 @@ def _load_robot_file(path: Path) -> RobotCapability:
         supported_commands=frozenset(data.pop("supported_commands", [])),
         supported_observations=frozenset(
             data.pop("supported_observations", [])),
+        reward_state_schema={
+            k: tuple(v) for k, v in
+            data.pop("reward_state_schema", {}).items()},
+        reward_state_sources={
+            str(k): str(v) for k, v in
+            data.pop("reward_state_sources", {}).items()},
+        reward_info_keys=tuple(data.pop("reward_info_keys", [])),
         **data,
     )
 

@@ -158,6 +158,10 @@ class RewardContract:
     # The reward module's compute_reward_batched receives dict[str, Tensor]
     # where tensor.shape == (num_envs, *state_schema[k]).
     state_schema: Optional[dict[str, tuple[int, ...]]] = None
+    # Optional resolved WorldSpec channel contract. It is represented as
+    # JSON-compatible data here to avoid coupling adapter contributors to a
+    # particular compiler class. Authored runners verify its content hash.
+    channel_catalog: Optional[dict[str, Any]] = None
 
 
 class SculptorAdapter(ABC):
@@ -370,6 +374,25 @@ def load_adapter(config_path: Path) -> SculptorAdapter:
             if "env_spec_path" in params:
                 init_kwargs = {
                     **init_kwargs, "env_spec_path": str(spec_file.resolve())}
+
+    # Prompt-authored worlds use one hash-verified atomic selection pointer.
+    # This is deliberately separate from legacy env/current.json: WorldSpec
+    # controls geometry/task semantics, while EnvSpec remains the diagnoser's
+    # reset/randomization/optimizer surface.
+    if "world_selection_path" not in init_kwargs:
+        selection_file = config_path.parent / "env" / "selection_current.json"
+        if selection_file.is_file():
+            import inspect
+
+            try:
+                params = inspect.signature(cls).parameters
+            except (TypeError, ValueError):
+                params = {}
+            if "world_selection_path" in params:
+                init_kwargs = {
+                    **init_kwargs,
+                    "world_selection_path": str(selection_file.resolve()),
+                }
 
     # §D17: a stage-FIXED eval-rollout reset override at
     # `env/eval_reset.json` (written once at stage-scaffold time by

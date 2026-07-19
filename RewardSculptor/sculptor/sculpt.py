@@ -136,6 +136,10 @@ class IterOutcome:
     #: re-roll the KEPT best on seeds never used for selection (the
     #: report-of-max discipline from Empirical Design in RL).
     checkpoint_path: Path | None = None
+    #: Atomic authored artifact tuple used by both train and rollout. None
+    #: preserves legacy projects that have no WorldSpec selection.
+    world_selection_hash: str | None = None
+    world_selection_path: Path | None = None
 
 
 @dataclass
@@ -167,6 +171,7 @@ class SculptRunResult:
     #: the unbiased report number. None when fresh eval didn't run.
     best_fitness_fresh: float | None = None
     fresh_fitness_per_seed: list[float] = field(default_factory=list)
+    best_world_selection_hash: str | None = None
 
     @property
     def final_reward_path(self) -> Path | None:
@@ -309,6 +314,63 @@ def _ensure_current_py(rewards_dir: Path) -> Path:
     if not current.is_file():
         _write_current_reexport(rewards_dir, latest)
     return current
+
+
+def _pin_authored_selection(adapter: Any, project: Path) -> str | None:
+    """Pin selection_current to an immutable selection_vN for this run."""
+    raw = str(getattr(adapter, "world_selection_path", "") or "")
+    if not raw:
+        return None
+    from sculptor.world.artifacts import WorldArtifactStore
+
+    path = Path(raw).resolve()
+    store = WorldArtifactStore(project)
+    selection = store.read_selection(path)
+    if selection is None:
+        raise ValueError(f"authored world selection missing: {path}")
+    pinned = store.env_dir / f"selection_v{selection.selection_version}.json"
+    if not pinned.is_file():
+        raise ValueError(f"immutable authored selection missing: {pinned}")
+    adapter.world_selection_path = str(pinned.resolve())
+    return selection.tuple_hash
+
+
+def _promote_iteration_selection(
+    adapter: Any, project: Path, *, reward_path: Path,
+    env_spec_version: str | None,
+) -> tuple[str | None, Path | None]:
+    """Atomically bind the iter's reward/env versions to its authored world.
+
+    World/task/evaluation/catalog/clarification refs stay immutable. Only the
+    reward and legacy EnvSpec refs change as the existing loop searches. One
+    selection replace is the commit point, so train and rollout can never see
+    a mixed tuple after a crash.
+    """
+    raw = str(getattr(adapter, "world_selection_path", "") or "")
+    if not raw:
+        return None, None
+    from sculptor.world.artifacts import ArtifactRef, WorldArtifactStore
+
+    store = WorldArtifactStore(project)
+    current = store.read_selection(Path(raw).resolve())
+    if current is None:
+        raise ValueError(f"authored world selection missing: {raw}")
+    refs = dict(current.refs)
+    reward = Path(reward_path).resolve()
+    refs["reward"] = ArtifactRef.from_path(
+        "reward", reward.stem, reward, base=project)
+    if env_spec_version:
+        env_path = project / "env" / f"{env_spec_version}.json"
+        if not env_path.is_file():
+            raise ValueError(
+                f"EnvSpec {env_spec_version} missing for authored tuple")
+        refs["env_spec"] = ArtifactRef.from_path(
+            "env_spec", env_spec_version, env_path, base=project)
+    promoted = store.promote(
+        refs, evaluation_lineage=current.evaluation_lineage)
+    pinned = store.env_dir / f"selection_v{promoted.selection_version}.json"
+    adapter.world_selection_path = str(pinned.resolve())
+    return promoted.tuple_hash, pinned
 
 
 # ── Git helpers (optional) ───────────────────────────────────────────────
@@ -1314,6 +1376,26 @@ def _run_one_iter(
                 f"[sculpt] iter {iter_index}: env spec unreadable "
                 f"({type(e).__name__}: {e})\n")
 
+    # Authored projects promote the complete reward/env/world/task/eval/
+    # catalog/clarification tuple before any GPU work. The adapter is then
+    # pointed at the immutable selection_vN snapshot for both train and
+    # rollout. Legacy projects take the no-op path.
+    world_selection_hash, world_selection_path = (
+        _promote_iteration_selection(
+            adapter, project, reward_path=Path(reward_path_trained),
+            env_spec_version=env_spec_trained)
+    )
+    if world_selection_path is not None:
+        tuple_snapshot = iter_dir / "artifact_tuple.json"
+        if not tuple_snapshot.exists():
+            tuple_snapshot.write_bytes(world_selection_path.read_bytes())
+        _emit_event({
+            "type": "artifact_tuple_pinned",
+            "iter": iter_index,
+            "tuple_hash": world_selection_hash,
+            "selection": world_selection_path.name,
+        })
+
     # §2026-07-04: report the version that actually TRAINS this iter
     # (current.py's target / the revert base), not the disk maximum —
     # the two diverge at run boundaries after best-selection.
@@ -2009,6 +2091,8 @@ def _run_one_iter(
         fitness_components=fitness_components,
         env_spec_trained=env_spec_trained,
         checkpoint_path=checkpoint_path,
+        world_selection_hash=world_selection_hash,
+        world_selection_path=world_selection_path,
     )
 
 
@@ -2283,6 +2367,13 @@ def sculpt_run(
             f"no rewards/ dir in {project} — run `sculpt init` first.")
 
     adapter = load_adapter(config_path)
+    authored_tuple_hash = _pin_authored_selection(adapter, project)
+    if authored_tuple_hash:
+        _emit_event({
+            "type": "authored_world_pinned",
+            "tuple_hash": authored_tuple_hash,
+            "selection": Path(adapter.world_selection_path).name,
+        })
 
     # Resolve KG store once (shared across iterations). Skip entirely in
     # --no-kg to avoid side-effects on an absent/empty DB.
@@ -2470,6 +2561,8 @@ def sculpt_run(
                     result.best_fitness = steer
                     result.best_progress = sprog
                     result.best_fitness_iter = outcome.iter_index
+                    result.best_world_selection_hash = (
+                        outcome.world_selection_hash)
                     # §env generalization 3/4: the env half of the best
                     # (reward, env) training config — revert + end-of-run
                     # selection restore BOTH together.
@@ -2662,6 +2755,28 @@ def sculpt_run(
                 sys.stderr.write(
                     f"[sculpt] best env-spec repoint failed: "
                     f"{type(e).__name__}: {e}\n")
+
+        # Commit reward + EnvSpec + authored world/task/eval/catalog as one
+        # selection after keep-best. Fresh evaluation below therefore uses
+        # the exact tuple whose checkpoint and fitness won.
+        if best_path is not None and best_path.is_file():
+            try:
+                best_hash, best_selection = _promote_iteration_selection(
+                    adapter, project, reward_path=best_path,
+                    env_spec_version=result.best_env_spec)
+                if best_hash:
+                    result.best_world_selection_hash = best_hash
+                    _emit_event({
+                        "type": "best_artifact_tuple_selected",
+                        "iter": int(result.best_fitness_iter),
+                        "tuple_hash": best_hash,
+                        "selection": (best_selection.name
+                                      if best_selection else None),
+                    })
+            except Exception as e:  # noqa: BLE001
+                raise RuntimeError(
+                    "failed to atomically select best authored tuple: "
+                    f"{type(e).__name__}: {e}") from e
 
     # §Selection statistics (RESEARCH_GAP_ANALYSIS §7.2d): re-evaluate the
     # KEPT best on fresh rollout seeds never used for selection. The
@@ -4092,6 +4207,7 @@ def mission_run(
     render_height: Optional[int] = None,
     num_envs: Optional[int] = None,
     device: Optional[str] = None,
+    channel_catalog: Optional[Any] = None,
 ):
     """§Ship-19d Goals A + B: optional adaptive iteration control.
 
@@ -4196,6 +4312,16 @@ def mission_run(
     # sink takes over in _run_one_iter (last-set-wins).
     set_llm_log_dir(mission_dir)
 
+    from sculptor.world.channels import (
+        load_project_channel_catalog,
+        resolve_channel_catalog,
+    )
+
+    if channel_catalog is None and mission_dir.parent.name == ".missions":
+        channel_catalog = load_project_channel_catalog(
+            mission_dir.parent.parent)
+    channel_catalog = resolve_channel_catalog(channel_catalog)
+
     # §Ship 34/38: resolve objective fitness fns. The mission-level
     # `fitness_metric` is the default; §Ship 38 lets each Stage carry its own
     # `steering_metric` that OVERRIDES it for that stage — what makes a true
@@ -4222,7 +4348,8 @@ def mission_run(
         if getattr(s, "status", None) not in ("succeeded", "superseded")
     ]:
         if _ref and _ref not in _fitness_fn_cache:
-            _fitness_fn_cache[_ref] = _resolve_fitness_fn(_ref)  # fail-fast on bad ref
+            _fitness_fn_cache[_ref] = _resolve_fitness_fn(
+                _ref, channel_catalog=channel_catalog)  # fail-fast on bad ref
 
     def _fitness_fn_for_stage(stage) -> Optional[Callable[[Path], float]]:
         ref = _anchored(

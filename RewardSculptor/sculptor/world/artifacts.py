@@ -8,9 +8,12 @@ import os
 import re
 import tempfile
 import time
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Mapping
+
+from filelock import FileLock
 
 _VERSION_RE = re.compile(
     r"^(world|task|resolved_eval|channel_catalog|clarifications|selection)_v(\d+)\.json$")
@@ -51,6 +54,28 @@ def _atomic_write(path: Path, data: bytes) -> None:
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+def _atomic_create(path: Path, data: bytes) -> None:
+    """Atomically create an immutable file and refuse every overwrite."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, raw_tmp = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    tmp = Path(raw_tmp)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(tmp, path)
+        except FileExistsError as exc:
+            raise FileExistsError(
+                f"immutable artifact already exists: {path}") from exc
+        finally:
+            tmp.unlink(missing_ok=True)
     finally:
         tmp.unlink(missing_ok=True)
 
@@ -105,6 +130,13 @@ class WorldArtifactStore:
         self.project_dir = Path(project_dir).expanduser().resolve()
         self.env_dir = self.project_dir / "env"
         self.env_dir.mkdir(parents=True, exist_ok=True)
+        self._lock = FileLock(str(self.env_dir / ".artifact-store.lock"))
+
+    @contextmanager
+    def locked(self):
+        """Serialize version allocation and tuple promotion per project."""
+        with self._lock:
+            yield
 
     @property
     def selection_path(self) -> Path:
@@ -123,13 +155,14 @@ class WorldArtifactStore:
 
     def write_json(self, kind: str, payload: Mapping[str, Any]) -> ArtifactRef:
         """Write a new immutable canonical JSON artifact."""
-        version_number = self._next_version(kind)
-        version = f"v{version_number}"
-        path = self.env_dir / f"{kind}_{version}.json"
-        data = canonical_json_bytes(dict(payload))
-        _atomic_write(path, data)
-        return ArtifactRef.from_path(
-            kind, version, path, base=self.project_dir)
+        with self.locked():
+            version_number = self._next_version(kind)
+            version = f"v{version_number}"
+            path = self.env_dir / f"{kind}_{version}.json"
+            data = canonical_json_bytes(dict(payload))
+            _atomic_create(path, data)
+            return ArtifactRef.from_path(
+                kind, version, path, base=self.project_dir)
 
     def write_rejected_draft(
         self, session_id: str, payload: Mapping[str, Any],
@@ -137,8 +170,9 @@ class WorldArtifactStore:
         if not re.fullmatch(r"[a-zA-Z0-9_-]{1,80}", session_id):
             raise ValueError("invalid author session id")
         path = self.env_dir / "rejected" / f"{session_id}.json"
-        _atomic_write(path, canonical_json_bytes(dict(payload)))
-        return path
+        with self.locked():
+            _atomic_create(path, canonical_json_bytes(dict(payload)))
+            return path
 
     def resolve_ref(self, ref: ArtifactRef) -> Path:
         path = Path(ref.path)
@@ -171,33 +205,53 @@ class WorldArtifactStore:
         *, evaluation_lineage: str,
     ) -> ArtifactSelection:
         """Atomically promote a complete, verified artifact tuple."""
-        missing = _REQUIRED_SELECTION_REFS - set(refs)
-        if missing:
-            raise ValueError(f"selection missing required refs {sorted(missing)}")
-        normalized = {key: self._coerce_ref(key, value)
-                      for key, value in refs.items()}
-        for ref in normalized.values():
-            self.resolve_ref(ref)
-        tuple_payload = {k: asdict(v) for k, v in sorted(normalized.items())}
-        tuple_hash = sha256_bytes(canonical_json_bytes(tuple_payload))
-        number = self._next_version("selection")
-        selection = ArtifactSelection(
-            selection_version=number, created_at=time.time(),
-            refs=normalized, tuple_hash=tuple_hash,
-            evaluation_lineage=evaluation_lineage,
-        )
-        data = canonical_json_bytes(selection.to_dict())
-        immutable = self.env_dir / f"selection_v{number}.json"
-        _atomic_write(immutable, data)
-        # This single replace is the commit point. Either the previous tuple
-        # or this fully verified tuple is authoritative after interruption.
-        _atomic_write(self.selection_path, data)
-        return selection
+        with self.locked():
+            missing = _REQUIRED_SELECTION_REFS - set(refs)
+            if missing:
+                raise ValueError(
+                    f"selection missing required refs {sorted(missing)}")
+            normalized = {key: self._coerce_ref(key, value)
+                          for key, value in refs.items()}
+            for ref in normalized.values():
+                self.resolve_ref(ref)
+            tuple_payload = {
+                k: asdict(v) for k, v in sorted(normalized.items())}
+            tuple_hash = sha256_bytes(canonical_json_bytes(tuple_payload))
+            number = self._next_version("selection")
+            selection = ArtifactSelection(
+                selection_version=number, created_at=time.time(),
+                refs=normalized, tuple_hash=tuple_hash,
+                evaluation_lineage=evaluation_lineage,
+            )
+            data = canonical_json_bytes(selection.to_dict())
+            immutable = self.env_dir / f"selection_v{number}.json"
+            _atomic_create(immutable, data)
+            # This single replace is the commit point. Either the previous
+            # tuple or this fully verified tuple is authoritative.
+            _atomic_write(self.selection_path, data)
+            return selection
 
-    def read_selection(self) -> ArtifactSelection | None:
-        if not self.selection_path.is_file():
+    def read_selection(
+        self, path: Path | str | None = None,
+    ) -> ArtifactSelection | None:
+        """Read and verify an atomic selection snapshot.
+
+        ``path=None`` resolves the current commit point.  Supplying an
+        immutable ``selection_vN.json`` lets a run pin one exact tuple even
+        if authoring promotes a newer current selection later.
+        """
+        selection_path = (Path(path).expanduser().resolve()
+                          if path is not None else self.selection_path)
+        if not selection_path.is_file():
             return None
-        data = json.loads(self.selection_path.read_text(encoding="utf-8"))
+        if selection_path.parent != self.env_dir:
+            raise ValueError(
+                f"selection must live in {self.env_dir}, got {selection_path}")
+        if (selection_path.name != "selection_current.json"
+                and not re.fullmatch(r"selection_v[1-9][0-9]*\.json",
+                                     selection_path.name)):
+            raise ValueError(f"invalid selection filename {selection_path.name!r}")
+        data = json.loads(selection_path.read_text(encoding="utf-8"))
         refs = {key: ArtifactRef(**value)
                 for key, value in data["refs"].items()}
         missing = _REQUIRED_SELECTION_REFS - set(refs)

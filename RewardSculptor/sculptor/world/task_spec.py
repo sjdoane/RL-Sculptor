@@ -243,6 +243,32 @@ def _validate_observations(
             if missing:
                 errors.append(
                     f"shared.observations.{key}: unknown names {missing}")
+    end_effector = value.get("end_effector_relative", [])
+    if end_effector:
+        if "end_effector_relative" not in cap.supported_observations:
+            errors.append(
+                "shared.observations.end_effector_relative: robot "
+                "capability unavailable")
+        if "end_effector_relative" not in sim.observation_adapters:
+            errors.append(
+                "shared.observations.end_effector_relative: simulator "
+                "adapter unavailable")
+        roles = (["end_effector"] if end_effector is True
+                 or end_effector == "auto"
+                 else end_effector)
+        if not isinstance(roles, list) or not all(
+                isinstance(role, str) and role for role in roles):
+            errors.append(
+                "shared.observations.end_effector_relative: must be a "
+                "role list, true, false, or auto")
+        else:
+            for role in roles:
+                try:
+                    cap.resolve_semantic_role(role)
+                except CapabilityError as exc:
+                    errors.append(
+                        "shared.observations.end_effector_relative: "
+                        f"{exc}")
 
 
 def _validate_train(value: Any, world: dict[str, Any], errors: list[str]) -> None:

@@ -272,6 +272,30 @@ def test_stock_g1_cannot_be_mislabeled_as_a_gripper() -> None:
                for error in errors)
 
 
+def test_arm_gripper_uses_the_same_generic_capability_contract() -> None:
+    cap = resolve_robot_capability(
+        "yam:parallel_gripper", required=["manipulation", "grasp"])
+    assert cap.resolve_role("gripper") == ("lf_down", "rf_down")
+    assert cap.resolve_semantic_role("grasp") == (
+        "site", ("grasp_site",))
+    assert cap.reward_state_schema["end_effector_pos_w"] == (3,)
+
+    world = _world()
+    world["shared"]["robot"] = {
+        "capability_id": "yam:parallel_gripper",
+        "required_capabilities": ["manipulation", "grasp"],
+    }
+    task = _task()
+    task["shared"]["contacts"] = {
+        "desired": [["robot:gripper", "object:ball"]],
+        "forbidden": [],
+        "terminate_on": [],
+    }
+    task["shared"]["observations"]["end_effector_relative"] = ["grasp"]
+    assert validate_world_spec(world) == []
+    assert validate_task_spec(task, world=world) == []
+
+
 def test_required_capability_failure_is_precise() -> None:
     with pytest.raises(CapabilityError) as exc:
         resolve_robot_capability(
@@ -444,6 +468,22 @@ def test_selected_artifact_hash_mismatch_is_rejected(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="selected world hash mismatch"):
         store.read_selection()
+
+
+def test_immutable_selection_snapshot_can_be_pinned(tmp_path: Path) -> None:
+    project = tmp_path / "project"
+    store = WorldArtifactStore(project)
+    first = store.promote(
+        _complete_refs(store, project), evaluation_lineage="eval-a")
+    pinned = store.env_dir / f"selection_v{first.selection_version}.json"
+
+    second_refs = dict(first.refs)
+    second_refs["world"] = store.write_json(
+        "world", {"kind": "world", "version": 2})
+    second = store.promote(second_refs, evaluation_lineage="eval-b")
+
+    assert store.read_selection().tuple_hash == second.tuple_hash
+    assert store.read_selection(pinned).tuple_hash == first.tuple_hash
 
 
 def test_incomplete_selection_is_rejected_on_write_and_read(tmp_path: Path) -> None:

@@ -46,7 +46,10 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
+
+from sculptor.world.channels import ChannelCatalog, resolve_channel_catalog
 
 
 # ── Reward-side name → metric observable it reads ────────────────────────────
@@ -103,6 +106,8 @@ class ScreenResult:
     flag_reasons: list[str] = field(default_factory=list)
     held_out: list[str] = field(default_factory=list)       # reward names touched
     gate_hparams: list[str] = field(default_factory=list)   # current gate hparams
+    metric_only: list[str] = field(default_factory=list)    # never reward-readable
+    channel_catalog_hash: Optional[str] = None
 
 
 @dataclass
@@ -196,14 +201,25 @@ def screen_edits(
     *,
     metric_observables: Iterable[str],
     current_hparams: Optional[Mapping[str, Any]] = None,
+    channel_catalog: (
+        ChannelCatalog | Mapping[str, Any] | Path | str | None
+    ) = None,
 ) -> ScreenResult:
     """Flag proposed edits that (a) touch a held-out metric observable, or
     (b) lower/remove a completion/qualification gate. NON-BLOCKING: the flagged
     edits stay applicable; the report drives the editor-prompt warning and the
     changelog. The single hard gate is `gate_threshold_regressions`, post-LLM."""
+    catalog = resolve_channel_catalog(channel_catalog)
     mo = frozenset(metric_observables or ())
+    if catalog is not None:
+        mo &= frozenset(catalog.allowed_metric_arrays())
     hparams = dict(current_hparams or {})
     res = ScreenResult()
+    if catalog is not None:
+        res.channel_catalog_hash = catalog.catalog_hash
+        res.metric_only = sorted(
+            channel.name for channel in catalog.channels
+            if channel.access == "metric_only" and channel.name in mo)
     res.gate_hparams = sorted(h for h in hparams if gate_kind(h))
     held: set[str] = set()
 
@@ -319,15 +335,31 @@ def gate_threshold_regressions(
 def build_partition_prompt_block(
     metric_observables: Iterable[str],
     screen: ScreenResult,
+    *,
+    channel_catalog: (
+        ChannelCatalog | Mapping[str, Any] | Path | str | None
+    ) = None,
 ) -> str:
     """The `# METRIC_PARTITION` user-prompt block (self-contained — carries its
     own instructions so the shared system prompt stays unchanged, keeping the
     no-metric path byte-identical). Empty string only when there is nothing to
     say (never on the metric-steered path, which always lists observables)."""
-    mo = sorted(frozenset(metric_observables or ()))
+    catalog = resolve_channel_catalog(channel_catalog)
+    mo_set = frozenset(metric_observables or ())
+    if catalog is not None:
+        mo_set &= frozenset(catalog.allowed_metric_arrays())
+    mo = sorted(mo_set)
     if not mo:
         return ""
-    held = held_out_channels(mo)
+    metric_only = list(screen.metric_only)
+    if catalog is not None and not metric_only:
+        metric_only = sorted(
+            channel.name for channel in catalog.channels
+            if channel.access == "metric_only" and channel.name in mo_set)
+    held = [
+        name for name in held_out_channels(mo)
+        if name not in set(metric_only)
+    ]
     lines: list[str] = [
         "# METRIC_PARTITION (objective-metric integrity — read before editing)",
         "An objective metric SCORES this run as a HELD-OUT judge. Keep the reward "
@@ -338,11 +370,21 @@ def build_partition_prompt_block(
         "",
         "The metric SCORES these physical observables (the held-out surface):",
         "  " + ", ".join(mo),
-        "These reward-side channels read the SAME observables — use them as "
-        "PROXIES (instantaneous physical shaping) only, do NOT mirror the "
-        "metric's gates/composition:",
-        "  " + ", ".join(held),
     ]
+    if held:
+        lines += [
+            "These reward-side channels read the SAME observables — use them "
+            "as PROXIES (instantaneous physical shaping) only, do NOT mirror "
+            "the metric's gates/composition:",
+            "  " + ", ".join(held),
+        ]
+    if metric_only:
+        lines += [
+            "",
+            "These metric_only channels are reserved for the held-out judge. "
+            "The reward must not read or reconstruct them:",
+            "  " + ", ".join(metric_only),
+        ]
     if screen.gate_hparams:
         lines += [
             "",

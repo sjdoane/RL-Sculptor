@@ -19,8 +19,7 @@ Baseline verification: RewardSculptor 1,994 passed / 1 optional-JAX skip;
 UI backend 531 passed with `MUJOCO_GL=egl`; the PoC passes against mjlab 1.3.0
 and MuJoCo 3.7.0.
 
-The first implementation slice is complete (commit pending at the time this
-line was written):
+The first implementation slice is complete in commit `f217753`:
 
 - `sculptor/world/capabilities.py`: immutable, extensible robot/simulator
   descriptors. Semantic body and site roles are data-resolved. Stock G1 does
@@ -36,12 +35,34 @@ line was written):
 - `tests/test_world_foundation.py`: 11 adversarial contract tests, all passing
   in 1.28 seconds.
 
+The next coherent implementation slice is complete in the working tree and
+awaiting its commit hash:
+
+- robot-agnostic prompt author + fully paginated clarification/default ledger;
+- deterministic mjlab compiler, complete admission gates, exact materialized
+  evaluation terrain replay, and immutable selection loading;
+- generic task runtime bindings for contacts, height scans, observations,
+  reset/goal/termination semantics;
+- ChannelCatalog threaded through metric generation, validation, calibration,
+  runtime, and the metric-only/shared-shaping firewall;
+- GPU-native reward-visible channel production plus strict rollout recording;
+- atomic project admission/promotion, per-iteration tuple rebinding, remote
+  world-selection dispatch, and `sculpt world author|show|validate`;
+- capability-matrix acceptance tests: G1 rough terrain, Go1 box parkour, and
+  Yam arm/gripper object-to-region all pass the same author/compiler/gate flow.
+
+Verification for this slice: 569 affected regression tests passed in 18.16s;
+the three acceptance compiles plus genericity assertion passed in 4.37s; the
+CLI author/show/validate E2E passed in 3.37s. All tests are CPU/headless and
+well below the one-hour cap.
+
 The active plan is:
 
-1. capability descriptors plus strict WorldSpec/TaskSpec and persistence;
-2. real mjlab compiler, admission gates, eval manifest, ChannelCatalog;
-3. prompt author/clarifier and KG grounding;
-4. reward/metric/diagnoser/curriculum/atomic-selection integration;
+1. capability descriptors plus strict WorldSpec/TaskSpec and persistence (done);
+2. real mjlab compiler, admission gates, eval manifest, ChannelCatalog (done);
+3. prompt author/clarifier (done) and KG grounding (pending);
+4. reward/metric/atomic-selection integration (mostly done), then finish
+   diagnoser/curriculum/run-memory integration;
 5. backend/UI authoring, clarification, preview, and lineage workflows;
 6. bounded tests, adversarial review, docs, and an incremental commit per
    coherent slice.

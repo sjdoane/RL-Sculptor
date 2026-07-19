@@ -395,6 +395,7 @@ def _attempt_synthetic_certification(
     stage: Any, robot: str, out_dir: Path, *,
     client: Any = None, n_candidates: int = 1,
     on_event: Optional[Callable[[dict[str, Any]], None]] = None,
+    channel_catalog: Any = None,
 ) -> Optional[dict[str, Any]]:
     """§D28 F-SYNTH (docs/internal/REFERENCE_BUILD_LOG.md D28 spec): the
     LAST-RESORT certification tier, attempted only when this stage would
@@ -499,11 +500,15 @@ def _attempt_synthetic_certification(
 
     synthetic_clip_id = f"synthetic:{stage.name}"
     try:
+        catalog_kwargs = (
+            {"channel_catalog": channel_catalog}
+            if channel_catalog is not None else {}
+        )
         rec = generate_objective_metric(
             stage.goal_text, out_dir, robot_hint=robot, client=client,
             n_candidates=n_candidates, on_event=on_event,
             references=[(synthetic_clip_id, synth_clip)],
-            eval_reset=eval_reset_preview)
+            eval_reset=eval_reset_preview, **catalog_kwargs)
     except Exception as e:  # noqa: BLE001 — stage falls back, mission runs
         reason = f"synthetic generation crashed: {type(e).__name__}: {e}"
         _emit({
@@ -594,6 +599,7 @@ def generate_stage_metrics(
     n_candidates: int = 1,
     on_event: Optional[Callable[[dict[str, Any]], None]] = None,
     only_stages: Optional[list[str]] = None,
+    channel_catalog: Any = None,
 ) -> dict[str, Any]:
     """Generate one objective metric per pending stage that has no
     `steering_metric` yet. Full trust pipeline per stage (L0 gates +
@@ -676,7 +682,8 @@ def generate_stage_metrics(
         def _try_synthetic(reject_entry: dict[str, Any]) -> None:
             synth_result = _attempt_synthetic_certification(
                 stage, _robot_slug(robot_hint), out_dir,
-                client=client, n_candidates=n_candidates, on_event=on_event)
+                client=client, n_candidates=n_candidates, on_event=on_event,
+                channel_catalog=channel_catalog)
             if synth_result is None:
                 return
             if synth_result.get("accepted"):
@@ -854,6 +861,10 @@ def generate_stage_metrics(
                         f"original criterion.", file=sys.stderr, flush=True)
 
         try:
+            catalog_kwargs = (
+                {"channel_catalog": channel_catalog}
+                if channel_catalog is not None else {}
+            )
             rec = generate_objective_metric(
                 stage.goal_text, out_dir,
                 robot_hint=robot_hint, client=client,
@@ -861,6 +872,7 @@ def generate_stage_metrics(
                 on_event=on_event,
                 references=references,
                 eval_reset=eval_reset_preview,
+                **catalog_kwargs,
             )
         except Exception as e:  # noqa: BLE001 — stage falls back, mission runs
             print(

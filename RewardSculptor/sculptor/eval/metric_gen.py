@@ -17,7 +17,7 @@ import json
 import re
 import time
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Mapping, Optional
 
 from pydantic import BaseModel
 
@@ -32,6 +32,7 @@ from sculptor.llm import (
     set_llm_log_dir,
 )
 from sculptor.prompts import load_prompt
+from sculptor.world.channels import ChannelCatalog, resolve_channel_catalog
 
 def _build_reference_signature_block(
     references: list[tuple[str, dict]],
@@ -449,6 +450,7 @@ def _best_of_n(
     emit: Callable[[dict[str, Any]], None],
     references: Optional[list[tuple[str, dict]]] = None,
     eval_reset: Optional[dict[str, Any]] = None,
+    channel_catalog: ChannelCatalog | None = None,
 ) -> tuple[bool, str, Optional[dict[str, Any]], list[dict[str, Any]], Optional[int]]:
     """Sample `n` candidate metrics (decorrelated by FRAMING — temperature stays 1.0,
     required by the generator's extended thinking), validate each, and
@@ -480,11 +482,13 @@ def _best_of_n(
         val = validate_generated_metric(
             src, cpath, behavior_goal=behavior_goal, robot_hint=robot_hint,
             robot_joint_names=robot_names, references=references,
-            eval_reset=eval_reset)
+            eval_reset=eval_reset, channel_catalog=channel_catalog)
         rec: dict[str, Any] = {"candidate": i, "ok": bool(val["ok"]),
                                "reasons": val["reasons"], "_src": src, "_val": val}
         if val["ok"]:
-            disc = discrimination_of_metric(cpath, val.get("required_roles") or [])
+            disc = discrimination_of_metric(
+                cpath, val.get("required_roles") or [],
+                channel_catalog=channel_catalog)
             rec["discrimination"] = float(disc.get("score", 0.0))
             rec["discrimination_detail"] = disc
         cands.append(rec)
@@ -601,6 +605,9 @@ def generate_objective_metric(
     on_event: Optional[Callable[[dict[str, Any]], None]] = None,
     references: Optional[list[tuple[str, dict]]] = None,
     eval_reset: Optional[dict[str, Any]] = None,
+    channel_catalog: (
+        ChannelCatalog | Mapping[str, Any] | Path | str | None
+    ) = None,
 ) -> dict[str, Any]:
     """Generate, validate, (regenerate on failure,) and review an objective
     metric for `behavior_goal`. Writes `metric.py` + `meta.json` to
@@ -656,6 +663,8 @@ def generate_objective_metric(
 
         client = anthropic.Anthropic(max_retries=2, timeout=240.0)
 
+    catalog = resolve_channel_catalog(channel_catalog)
+
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     # §llm provenance: every generation/review call in this job archives to
@@ -676,6 +685,19 @@ def generate_objective_metric(
             {"behavior_goal": behavior_goal, "robot_hint": robot_hint},
             indent=2, default=str,
         )
+        if catalog is not None:
+            catalog_context = {
+                "channel_catalog_hash": catalog.catalog_hash,
+                "allowed_arrays": list(catalog.allowed_metric_arrays()),
+                "channel_catalog": catalog.to_dict(),
+                "channel_access_rule": (
+                    "The objective metric may read every listed channel. "
+                    "metric_only channels are held out from reward shaping; "
+                    "shared_shaping channels may also inform dense rewards."
+                ),
+            }
+            base_user += "\n\n# EXACT CHANNEL CATALOG\n" + json.dumps(
+                catalog_context, indent=2, default=str)
         references_used: list[str] = []
         reference_signatures: dict[str, Any] = {}
         if references:
@@ -712,7 +734,7 @@ def generate_objective_metric(
                 behavior_goal=behavior_goal, robot_hint=robot_hint,
                 robot_names=robot_names, out_dir=out_dir, metric_path=metric_path,
                 n=n_candidates, model=model, emit=_emit, references=references,
-                eval_reset=eval_reset)
+                eval_reset=eval_reset, channel_catalog=catalog)
             if not passed:
                 # best-of-N samples DIVERSE candidates but does NOT feed validation
                 # failures back; if NONE were valid, fall through to the retry-with-
@@ -760,7 +782,7 @@ def generate_objective_metric(
                     source, metric_path,
                     behavior_goal=behavior_goal, robot_hint=robot_hint,
                     robot_joint_names=robot_names, references=references,
-                    eval_reset=eval_reset)
+                    eval_reset=eval_reset, channel_catalog=catalog)
                 attempts.append({"attempt": attempt, "ok": validation["ok"],
                                  "reasons": validation["reasons"]})
                 if validation["ok"]:
@@ -854,7 +876,7 @@ def generate_objective_metric(
             validation = validate_generated_metric(
                 source, metric_path, behavior_goal=behavior_goal, robot_hint=robot_hint,
                 robot_joint_names=robot_names, references=references,
-                eval_reset=eval_reset)
+                eval_reset=eval_reset, channel_catalog=catalog)
             attempts.append({"review_retry": rev_retry, "ok": validation["ok"],
                              "reasons": validation["reasons"]})
             passed = bool(validation["ok"])
@@ -896,6 +918,8 @@ def generate_objective_metric(
             # references_used/reference_signatures above, at the
             # field-VALUE level).
             "eval_reset_preview": eval_reset,
+            "channel_catalog_hash": (
+                catalog.catalog_hash if catalog is not None else None),
         }
         (out_dir / "meta.json").write_text(
             json.dumps(record, indent=2, default=str), encoding="utf-8")

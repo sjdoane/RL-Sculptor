@@ -165,7 +165,10 @@ _DEFAULT_SCHEMA_KEYS = (
 )
 
 
-def _build_sculptor_term_class(schema_keys: tuple[str, ...]):
+def _build_sculptor_term_class(
+    schema_keys: tuple[str, ...], robot_capability: Any | None = None,
+    world_bundle: Any | None = None,
+):
     """Factory for the reward-term class. Kept inside the function so
     heavy imports (mjlab, torch) only happen when the runner is actually
     invoked with --reward-module-path."""
@@ -186,6 +189,7 @@ def _build_sculptor_term_class(schema_keys: tuple[str, ...]):
         def __init__(self, cfg, env):  # type: ignore[no-untyped-def]
             path = cfg.params["reward_module_path"]
             self._schema_keys = schema_keys
+            self._robot_capability = robot_capability
             mod = _load_reward_module(path)
             if not hasattr(mod, "compute_reward_batched"):
                 raise AttributeError(
@@ -195,6 +199,13 @@ def _build_sculptor_term_class(schema_keys: tuple[str, ...]):
                     "batched entry point)."
                 )
             self._mod = mod
+            self._world_reward_runtime = None
+            if world_bundle is not None:
+                from sculptor.world.runtime import TorchWorldRewardRuntime
+
+                self._world_reward_runtime = TorchWorldRewardRuntime(
+                    env, catalog=world_bundle.channel_catalog,
+                    manifest=world_bundle.manifest)
             self._prev = self._snapshot(env)
 
         @staticmethod
@@ -291,6 +302,33 @@ def _build_sculptor_term_class(schema_keys: tuple[str, ...]):
                     # any non-locomotion task). Don't let a None leak into
                     # `self._prev` — reset() would crash indexing into it.
                     out[k] = v if v is not None else _zeros(3)
+                elif (self._robot_capability is not None
+                      and k in self._robot_capability.reward_state_sources):
+                    source = self._robot_capability.reward_state_sources[k]
+                    namespace, _, role = source.partition(":")
+                    try:
+                        if namespace == "site":
+                            concrete = self._robot_capability.resolve_site_role(
+                                role)
+                            indices = {
+                                name: index for index, name in
+                                enumerate(tuple(robot.site_names))}
+                            selected = [indices[name] for name in concrete]
+                            values = _get("site_pos_w", 3)[:, selected, :]
+                        elif namespace == "body":
+                            concrete = self._robot_capability.resolve_role(role)
+                            indices = {
+                                name: index for index, name in
+                                enumerate(tuple(robot.body_names))}
+                            selected = [indices[name] for name in concrete]
+                            values = _get("body_link_pos_w", 3)[:, selected, :]
+                        else:
+                            raise KeyError(namespace)
+                        out[k] = values.mean(dim=1)
+                    except Exception:  # noqa: BLE001
+                        shape = self._robot_capability.reward_state_schema.get(
+                            k, (1,))
+                        out[k] = _zeros(int(shape[-1]))
                 else:
                     # Unknown schema key — zero-fill rather than silently
                     # skipping, so `self._prev.keys()` matches the schema
@@ -431,6 +469,10 @@ def _build_sculptor_term_class(schema_keys: tuple[str, ...]):
             # height) + base horizontal speed, so a sculpted reward can
             # shape a single-leg kick. Zero-filled on non-biped tasks.
             info.update(self._foot_info(env, robot, action.dtype))
+            if self._world_reward_runtime is not None:
+                # The runtime object exposes only base/shared_shaping catalog
+                # entries; metric_only success truth has no reward-side API.
+                info.update(self._world_reward_runtime.sample())
             rewards, _components = self._mod.compute_reward_batched(
                 self._prev, action, state, info
             )
@@ -445,6 +487,8 @@ def _build_sculptor_term_class(schema_keys: tuple[str, ...]):
         def reset(self, env_ids):  # type: ignore[no-untyped-def]
             for k in list(self._prev.keys()):
                 self._prev[k][env_ids] = 0.0
+            if self._world_reward_runtime is not None:
+                self._world_reward_runtime.reset(env_ids)
 
     return SculptorRewardTerm
 
@@ -547,6 +591,41 @@ def reset_joints_to_reference(
         joint_vel.view(len(env_ids), -1),
         env_ids=env_ids,
         joint_ids=joint_ids,
+    )
+
+
+def _apply_world_selection(
+    env_cfg: Any, selection_path: str, *, train: bool,
+    task_id: str | None = None,
+) -> Any | None:
+    """Resolve and apply one immutable prompt-authored world tuple.
+
+    Heavy simulator imports remain inside the compiler. An explicit authored
+    selection is fail-closed: any hash, schema, capability, or materialized
+    evaluation mismatch aborts before the environment or GPU runner exists.
+    """
+    if not selection_path:
+        return None
+    from sculptor.world.compiler import apply_world_selection
+
+    return apply_world_selection(
+        env_cfg, Path(selection_path).resolve(), train=train,
+        runtime_task_id=task_id)
+
+
+def _load_authored_robot_capability(selection_path: str) -> Any | None:
+    if not selection_path:
+        return None
+    from sculptor.world.capabilities import resolve_robot_capability
+    from sculptor.world.project import load_selected_world
+
+    _store, _selection, bundle = load_selected_world(selection_path)
+    robot = bundle["world"]["shared"]["robot"]
+    return resolve_robot_capability(
+        robot["capability_id"],
+        required=robot.get("required_capabilities", []),
+        extra_paths=([robot["descriptor_path"]]
+                     if robot.get("descriptor_path") else []),
     )
 
 
@@ -1084,6 +1163,11 @@ def _cmd_train(args: argparse.Namespace) -> None:
 
     env_cfg = load_env_cfg(args.task_id)
     env_cfg.scene.num_envs = args.num_envs
+    # Authored geometry/task semantics are applied first. Legacy EnvSpec then
+    # overlays only its separate reset/randomization/optimizer surface.
+    world_bundle = _apply_world_selection(
+        env_cfg, getattr(args, "world_selection", ""), train=True,
+        task_id=args.task_id)
     # §RL_SCULPTOR_AUDIT: per-project env spec (--env-spec file wins over
     # a named --env-profile preset; neither → task defaults, no-op).
     # train=True additionally applies the train-only curricula section.
@@ -1124,7 +1208,12 @@ def _cmd_train(args: argparse.Namespace) -> None:
             env_cfg.rewards = {}
 
         schema_keys = tuple(args.schema_keys.split(",")) if args.schema_keys else _DEFAULT_SCHEMA_KEYS
-        SculptorRewardTerm = _build_sculptor_term_class(schema_keys)
+        SculptorRewardTerm = _build_sculptor_term_class(
+            schema_keys,
+            _load_authored_robot_capability(
+                getattr(args, "world_selection", "")),
+            world_bundle,
+        )
         env_cfg.rewards["sculptor_primary"] = RewardTermCfg(
             func=SculptorRewardTerm,
             weight=1.0,
@@ -1666,6 +1755,11 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
 
     env_cfg = load_env_cfg(args.task_id)
     env_cfg.scene.num_envs = num_envs
+    # Rollout loads the materialized evaluation artifact from the selected
+    # tuple; it never re-samples WorldSpec generators from a seed.
+    world_bundle = _apply_world_selection(
+        env_cfg, getattr(args, "world_selection", ""), train=False,
+        task_id=args.task_id)
     # §RL_SCULPTOR_AUDIT: SAME spec as train, SHARED section only — a
     # policy trained with zero commands / no pushes must be evaluated
     # under that distribution, and the metric arrays must see the
@@ -1722,6 +1816,16 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
     env = ManagerBasedRlEnv(
         env_cfg, device=args.device, render_mode="rgb_array"
     )
+    world_channel_recorder = None
+    if world_bundle is not None:
+        from sculptor.world.runtime import (
+            WorldChannelRecorder,
+            WorldChannelRuntime,
+        )
+
+        world_channel_recorder = WorldChannelRecorder(WorldChannelRuntime(
+            env, catalog=world_bundle.channel_catalog,
+            manifest=world_bundle.manifest))
 
     # §7.3: snapshot the mujoco model's actuator forceranges + joint
     # ranges. Downstream `sculptor.adapters.realism.audit_rollout` reads
@@ -1969,6 +2073,11 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
         with torch.inference_mode():
             action = policy(obs)
         obs, rew, dones, _extras = wrapped.step(action)
+        if world_channel_recorder is not None:
+            # Sample every catalogued task observable at the same cadence as
+            # base trajectory state. Missing/malformed producers fail the
+            # authored rollout instead of silently emitting a partial NPZ.
+            world_channel_recorder.append()
         # Freeze cumulative return/length on the first `done` per env.
         active = (~ep_done).float()
         ep_return += rew * active
@@ -2208,6 +2317,8 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
         stacked = _stack_if_consistent(arrs)
         if stacked is not None:
             trajectory[f"reward_term__{name}"] = stacked
+    if world_channel_recorder is not None:
+        trajectory.update(world_channel_recorder.finalize())
     np.savez_compressed(output_dir / "trajectory.npz", **trajectory)
 
     # §7.1 / §7.2: per-term time-series as JSON (Eureka Appendix F shape).
@@ -2337,6 +2448,13 @@ def main() -> None:
         ),
     )
     p_train.add_argument(
+        "--world-selection", default="",
+        help=(
+            "path to a hash-verified prompt-authored selection JSON. "
+            "Applies world/task semantics before legacy --env-spec."
+        ),
+    )
+    p_train.add_argument(
         "--load-pretrained-policy", default=None,
         help=(
             "§Ship 15: path to a prior rsl_rl checkpoint (e.g., "
@@ -2366,6 +2484,7 @@ def main() -> None:
     # §RL_SCULPTOR_AUDIT §4.4: must match the train-side spec/profile.
     p_roll.add_argument("--env-profile", default="")
     p_roll.add_argument("--env-spec", default="")
+    p_roll.add_argument("--world-selection", default="")
     # §D17: stage-FIXED eval-rollout reset override (a small allowlisted
     # subset of reset keys — height/pitch/roll collapsed to a single
     # deterministic midpoint value, zero reset velocity/noise,

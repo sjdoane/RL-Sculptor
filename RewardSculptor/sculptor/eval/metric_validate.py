@@ -23,7 +23,7 @@ from __future__ import annotations
 import ast
 import re
 from pathlib import Path
-from typing import Any, Optional, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
 import numpy as np
 
@@ -35,6 +35,11 @@ from sculptor.eval.generated_metric import (
     read_required_roles,
 )
 from sculptor.eval.joint_resolver import resolve_joint_roles
+from sculptor.world.channels import (
+    ChannelCatalog,
+    catalog_fixture_arrays,
+    resolve_channel_catalog,
+)
 
 #: Modules a generated metric may import (numpy only — it is a pure
 #: physical-quantity function).
@@ -364,6 +369,26 @@ def _ast_safety(source: str) -> list[str]:
         tree = ast.parse(source)
     except SyntaxError as e:
         return [f"syntax error: {e}"]
+    # Catalog names intentionally use a double-underscore namespace. Permit
+    # that token only in the literal node directly used as an arrays key; the
+    # same text anywhere else remains blocked by the reflection defense.
+    safe_array_literals: set[int] = set()
+    for parent in ast.walk(tree):
+        if (isinstance(parent, ast.Subscript)
+                and isinstance(parent.value, ast.Name)
+                and parent.value.id == "arrays"
+                and isinstance(parent.slice, ast.Constant)
+                and isinstance(parent.slice.value, str)):
+            safe_array_literals.add(id(parent.slice))
+        elif (isinstance(parent, ast.Call)
+                and isinstance(parent.func, ast.Attribute)
+                and parent.func.attr == "get"
+                and isinstance(parent.func.value, ast.Name)
+                and parent.func.value.id == "arrays"
+                and parent.args
+                and isinstance(parent.args[0], ast.Constant)
+                and isinstance(parent.args[0].value, str)):
+            safe_array_literals.add(id(parent.args[0]))
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for a in node.names:
@@ -424,7 +449,7 @@ def _ast_safety(source: str) -> list[str]:
         elif isinstance(node, ast.Constant) and isinstance(node.value, (str, bytes)):
             text = (node.value if isinstance(node.value, str)
                     else node.value.decode("latin-1", "ignore"))
-            if "__" in text:    # a dunder token in a string literal → .format/.format_map reflection
+            if "__" in text and id(node) not in safe_array_literals:
                 problems.append("forbidden dunder token in string literal")
     return problems
 
@@ -456,6 +481,44 @@ def _referenced_array_keys(source: str) -> set[str]:
                 and isinstance(node.args[0].value, str)):
             keys.add(node.args[0].value)
     return keys
+
+
+def _catalog_array_access_violations(source: str) -> list[str]:
+    """Reject non-literal access to a catalog-backed arrays mapping.
+
+    Exact allowlisting and observable partitioning require every generated
+    metric access to be statically attributable to one declared name.  Aliases,
+    iteration, and computed keys would make that proof impossible even though
+    the runtime still drops undeclared NPZ members.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+    parents: dict[ast.AST, ast.AST] = {
+        child: parent for parent in ast.walk(tree)
+        for child in ast.iter_child_nodes(parent)
+    }
+    violations: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Name) or node.id != "arrays":
+            continue
+        parent = parents.get(node)
+        if (isinstance(parent, ast.Subscript) and parent.value is node
+                and isinstance(parent.slice, ast.Constant)
+                and isinstance(parent.slice.value, str)):
+            continue
+        if (isinstance(parent, ast.Attribute) and parent.value is node
+                and parent.attr == "get"):
+            call = parents.get(parent)
+            if (isinstance(call, ast.Call) and call.func is parent
+                    and call.args and isinstance(call.args[0], ast.Constant)
+                    and isinstance(call.args[0].value, str)):
+                continue
+        violations.append(
+            f"line {getattr(node, 'lineno', '?')}: arrays must be accessed "
+            "only with a literal declared key")
+    return violations
 
 
 def _is_int_const(node: ast.AST) -> bool:
@@ -961,7 +1024,9 @@ def _graded_posture_rung(tilt: float, rom: float) -> dict:
             "projected_gravity_b": g, "root_link_pos_w": root}
 
 
-def graded_discrimination(fn, meta) -> dict[str, Any]:
+def graded_discrimination(
+    fn, meta, *, channel_catalog: ChannelCatalog | None = None,
+) -> dict[str, Any]:
     """Deterministic, OFFLINE discrimination score for best-of-N candidate selection
     (§best-of-N): how SHARPLY + MONOTONICALLY does `fn` grade competence on a GRADED
     competence ladder (degenerate → partial → good → ideal)? Extends the goal-agnostic
@@ -988,9 +1053,19 @@ def graded_discrimination(fn, meta) -> dict[str, Any]:
     fallen = {"joint_pos": jp0, "joint_vel": jp0,
               "projected_gravity_b": gf, "root_link_pos_w": rootf}
 
-    def _s(a) -> float:
+    def _with_case(a: dict, case: str) -> dict:
+        if channel_catalog is None:
+            return a
+        merged = dict(a)
+        first = next(iter(a.values()))
+        merged.update(catalog_fixture_arrays(
+            channel_catalog, time_steps=int(first.shape[0]),
+            num_envs=int(first.shape[1]), case=case))
+        return merged
+
+    def _s(a, case: str = "competent") -> float:
         try:
-            v = _score(fn, a, meta)
+            v = _score(fn, _with_case(a, case), meta)
             # CLAMP to the spec_score [0,1] contract: separation is then bounded
             # [−1,1] and co-scale with monotonicity, so a high-AMPLITUDE coarse metric
             # (a binary gate that returns, say, 5.0) saturates to 1.0 and cannot
@@ -1000,7 +1075,8 @@ def graded_discrimination(fn, meta) -> dict[str, Any]:
         except Exception:  # noqa: BLE001 — a rung crash is "no signal", never raises
             return 0.0
 
-    degen = max(_s(still), _s(fallen))
+    degen_case = "far_idle" if channel_catalog is not None else "competent"
+    degen = max(_s(still, degen_case), _s(fallen, degen_case))
 
     def _axis(rungs: list) -> dict:
         scores = [_s(r) for r in rungs]                 # partial → good → ideal
@@ -1018,13 +1094,35 @@ def graded_discrimination(fn, meta) -> dict[str, Any]:
     posture_axis = _axis([_graded_posture_rung(0.50, 0.70),
                           _graded_posture_rung(0.75, 0.90),
                           _graded_posture_rung(1.00, 1.10)])
-    score = max(fold_axis["disc"], posture_axis["disc"])
+    catalog_axis = None
+    if channel_catalog is not None:
+        catalog_scores = [
+            _s(still, "far_idle"),
+            _s(still, "edge_camping"),
+            _s(still, "contact_flicker"),
+            _s(still, "competent"),
+        ]
+        separation = catalog_scores[-1] - max(catalog_scores[:-1])
+        steps = sum(
+            1 for a, b in zip(catalog_scores, catalog_scores[1:])
+            if b > a + 1e-4)
+        catalog_axis = {
+            "scores": [round(s, 4) for s in catalog_scores],
+            "separation": round(separation, 4),
+            "monotonicity": round(steps / 3.0, 4),
+            "disc": round(separation + steps / 3.0, 4),
+        }
+    score = max(
+        fold_axis["disc"], posture_axis["disc"],
+        catalog_axis["disc"] if catalog_axis is not None else float("-inf"))
     return {"score": round(float(score), 4), "degenerate": round(degen, 4),
-            "fold_axis": fold_axis, "posture_axis": posture_axis}
+            "fold_axis": fold_axis, "posture_axis": posture_axis,
+            "catalog_axis": catalog_axis}
 
 
 def discrimination_of_metric(
     module_path: Path | str, required_roles: Optional[Sequence[str]] = None,
+    *, channel_catalog: ChannelCatalog | Mapping[str, Any] | Path | str | None = None,
 ) -> dict[str, Any]:
     """Load a generated metric module and score it on the offline `graded_discrimination`
     ladder — the best-of-N candidate selector. Builds the same synthetic 12-joint meta +
@@ -1040,7 +1138,11 @@ def discrimination_of_metric(
         return {"score": 0.0, "error": f"{type(e).__name__}: {e}"}
     meta = {"joint_names": list(_NAMES_12)}
     inject_joint_roles(meta, list(required_roles or []), lenient=True)
-    return graded_discrimination(fn, meta)
+    try:
+        catalog = resolve_channel_catalog(channel_catalog)
+    except Exception as e:  # noqa: BLE001
+        return {"score": 0.0, "error": f"invalid catalog: {type(e).__name__}: {e}"}
+    return graded_discrimination(fn, meta, channel_catalog=catalog)
 
 
 # ── §REFERENCE_TRAJECTORY_PLAN §5: reference-anchored validation ────────
@@ -1471,6 +1573,7 @@ def validate_generated_metric(
     robot_joint_names: Optional[Sequence[str]] = None,
     references: Optional[list[tuple[str, dict]]] = None,
     eval_reset: Optional[dict[str, Any]] = None,
+    channel_catalog: ChannelCatalog | Mapping[str, Any] | Path | str | None = None,
 ) -> dict[str, Any]:
     """Run all MUST-HAVE gates on a generated metric. `source` is the
     module text (for static gates); `module_path` is where it's been
@@ -1521,6 +1624,21 @@ def validate_generated_metric(
     argument is omitted entirely (aside from that one advisory key)."""
     gates: dict[str, bool] = {}
     reasons: list[str] = []
+    try:
+        catalog = resolve_channel_catalog(channel_catalog)
+    except Exception as e:  # noqa: BLE001 - invalid artifact is a hard contract fail
+        return {
+            "ok": False,
+            "gates": {"channel_catalog": False},
+            "reasons": [f"[channel-catalog] {type(e).__name__}: {e}"],
+            "archetype_scores": {},
+            "family": resolve_behavior_family(behavior_goal, robot_hint),
+            "required_roles": [],
+            "references": [],
+            "channel_catalog_hash": None,
+        }
+    if catalog is not None:
+        gates["channel_catalog"] = True
     family = resolve_behavior_family(behavior_goal, robot_hint)
     # §LAW 0: the goal frame scopes the directional / support gates so a novel
     # rearward / single-support / non-upright task is never false-rejected.
@@ -1538,11 +1656,34 @@ def validate_generated_metric(
         reasons.append(f"[contract] missing def {GENERATED_FN_NAME}(arrays, behavior, meta)")
 
     # 2. Array-contract
-    bad_keys = _referenced_array_keys(source) - set(ALLOWED_ARRAYS)
+    referenced_keys = _referenced_array_keys(source)
+    allowed_arrays = set(ALLOWED_ARRAYS)
+    if catalog is not None:
+        allowed_arrays.update(catalog.names())
+    bad_keys = referenced_keys - allowed_arrays
     gates["array_contract"] = not bad_keys
     if bad_keys:
         reasons.append(f"[contract] references unavailable arrays: {sorted(bad_keys)} "
-                       f"(allowed: {list(ALLOWED_ARRAYS)})")
+                       f"(allowed: {sorted(allowed_arrays)})")
+
+    # Authored task metrics must consume the compiler's hold-qualified success
+    # channel when one exists.  Distance/inside alone admit the two canonical
+    # hacks: camping on the region boundary and transient predicate flicker.
+    if catalog is not None:
+        success_names = {
+            channel.name for channel in catalog.channels
+            if channel.producer == "success_hold"
+        }
+        completion_ok = not success_names or bool(referenced_keys & success_names)
+        gates["catalog_completion_channel"] = completion_ok
+        if not completion_ok:
+            reasons.append(
+                "[channel-catalog] metric does not reference a hold-qualified "
+                f"success channel; expected one of {sorted(success_names)}")
+        dynamic_access = _catalog_array_access_violations(source)
+        gates["catalog_literal_array_access"] = not dynamic_access
+        reasons.extend(
+            f"[channel-catalog] {problem}" for problem in dynamic_access)
 
     # §Ship 49: static ban on hard-coded integer joint indices.
     raw_idx = _raw_joint_index_violations(source)
@@ -1553,7 +1694,9 @@ def validate_generated_metric(
     if not (gates["ast_safety"] and gates["defines_compute_spec"]):
         return {"ok": False, "gates": gates, "reasons": reasons,
                 "archetype_scores": {}, "family": family,
-                "required_roles": required_roles, "references": []}
+                "required_roles": required_roles, "references": [],
+                "channel_catalog_hash": (
+                    catalog.catalog_hash if catalog is not None else None)}
 
     try:
         mod = load_generated_module(module_path)
@@ -1565,7 +1708,9 @@ def validate_generated_metric(
         reasons.append(f"[load] {type(e).__name__}: {e}")
         return {"ok": False, "gates": gates, "reasons": reasons,
                 "archetype_scores": {}, "family": family,
-                "required_roles": required_roles, "references": []}
+                "required_roles": required_roles, "references": [],
+                "channel_catalog_hash": (
+                    catalog.catalog_hash if catalog is not None else None)}
     gates["loads"] = True
     required_roles = read_required_roles(mod)
 
@@ -1588,6 +1733,33 @@ def validate_generated_metric(
     meta = {"joint_names": list(_NAMES_12)}
     inject_joint_roles(meta, required_roles, lenient=True)
     arche = _archetypes()
+    catalog_cases: dict[str, str] = {}
+    if catalog is not None:
+        catalog_cases = {
+            "catalog_far_idle": "far_idle",
+            "catalog_edge_camping": "edge_camping",
+            "catalog_contact_flicker": "contact_flicker",
+            "catalog_forbidden_contact": "forbidden_contact",
+            "catalog_competent": "competent",
+        }
+        # Base archetypes keep their physical diversity while carrying a
+        # deterministic task state.  Positives represent a completed authored
+        # task; negatives represent no progress.  The named catalog fixtures
+        # below isolate the authored-channel failure modes directly.
+        for name, arrays in arche.items():
+            case = ("competent" if name in {
+                "active", "active_kick", "active_floss", "active_jump"
+            } else "far_idle")
+            arrays.update(catalog_fixture_arrays(
+                catalog, time_steps=T, num_envs=E, case=case))
+        for name, case in catalog_cases.items():
+            fixture_base = {
+                key: value.copy() for key, value in arche["still"].items()
+                if key in ALLOWED_ARRAYS
+            }
+            fixture_base.update(catalog_fixture_arrays(
+                catalog, time_steps=T, num_envs=E, case=case))
+            arche[name] = fixture_base
     scores: dict[str, float] = {}
 
     # 3 + 4: determinism + bounded/finite, over every archetype.
@@ -1846,6 +2018,23 @@ def validate_generated_metric(
                         f"+ a completion gate + an amplitude floor")
     gates["nondegeneracy"] = nondegen
 
+    if catalog is not None:
+        competent_score = scores.get("catalog_competent", float("nan"))
+        catalog_degenerate_ok = np.isfinite(competent_score)
+        for name in (
+            "catalog_far_idle", "catalog_edge_camping",
+            "catalog_contact_flicker", "catalog_forbidden_contact",
+        ):
+            degenerate_score = scores.get(name, float("nan"))
+            if (not np.isfinite(degenerate_score)
+                    or competent_score - degenerate_score < spread_min):
+                catalog_degenerate_ok = False
+                reasons.append(
+                    f"[channel-catalog] {name} scored {degenerate_score:.3f} "
+                    f"vs competent {competent_score:.3f}; require separation "
+                    f">= {spread_min:.3f}")
+        gates["catalog_degenerate_fixtures"] = catalog_degenerate_ok
+
     # §REFERENCE_TRAJECTORY_PLAN §5: reference-anchored validation — ADDITIVE,
     # only runs when the caller attaches reference clip(s) and the metric
     # loaded + ran cleanly (mirrors the axioms gate's guard below: nothing to
@@ -1881,8 +2070,18 @@ def validate_generated_metric(
     if gates.get("bounded") and gates.get("loads"):
         from sculptor.eval.metric_axioms import check_metric_axioms
 
+        axiom_fn = fn
+        if catalog is not None:
+            def axiom_fn(arrays, behavior, meta):  # type: ignore[no-redef]
+                merged = dict(arrays)
+                first = next(iter(arrays.values()))
+                merged.update(catalog_fixture_arrays(
+                    catalog, time_steps=int(first.shape[0]),
+                    num_envs=int(first.shape[1]), case="competent"))
+                return fn(merged, behavior, meta)
+
         axioms = check_metric_axioms(
-            fn, family=family, required_roles=required_roles,
+            axiom_fn, family=family, required_roles=required_roles,
             torso_target=frame["torso_target"])
         gates["axioms"] = bool(axioms["ok"])
         reasons += axioms["reasons"]
@@ -1893,4 +2092,6 @@ def validate_generated_metric(
             "goal_frame": frame, "nondegeneracy_vacuous": vacuous,
             "selectivity_probe": selectivity,
             "required_roles": required_roles, "axioms": axioms,
-            "references": reference_results}
+            "references": reference_results,
+            "channel_catalog_hash": (
+                catalog.catalog_hash if catalog is not None else None)}

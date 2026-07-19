@@ -793,7 +793,7 @@ def test_mission_run_per_stage_steering_metric(
     m.stages[0].steering_metric = "g1_kick"      # per-stage override
     m.stages[1].steering_metric = None           # → mission-level metric
 
-    def fake_resolve(ref):
+    def fake_resolve(ref, *, channel_catalog=None):
         def fn(_iter_dir):
             return 0.0
         fn._metric_ref = ref

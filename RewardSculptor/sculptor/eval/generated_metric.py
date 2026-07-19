@@ -62,6 +62,12 @@ from sculptor.eval.joint_resolver import (
     resolve_joint_roles,
 )
 from sculptor.eval.spec_metrics import _CAPTURE_KEYS, _SPEC_FNS, make_spec_fitness_fn
+from sculptor.world.channels import (
+    BASE_METRIC_ARRAYS,
+    ChannelCatalog,
+    resolve_channel_catalog,
+    validate_trajectory_channels,
+)
 
 #: The function a generated metric module must define.
 GENERATED_FN_NAME = "compute_spec"
@@ -79,7 +85,7 @@ REQUIRED_ROLES_ATTR = "REQUIRED_JOINT_ROLES"
 #: the validator enforces a metric references only these). Mirrors the
 #: spec_metrics.py array contract; kept here as the single allow-list a
 #: generated metric is constrained to.
-ALLOWED_ARRAYS = (
+_LEGACY_ALLOWED_ARRAYS = (
     "joint_pos",
     "joint_vel",
     "projected_gravity_b",
@@ -95,6 +101,30 @@ ALLOWED_ARRAYS = (
     "left_foot_pos_b",
     "right_foot_pos_b",
 )
+# Guard the externally-visible legacy tuple while moving its canonical
+# definition to the catalog module shared by compiler and runtime.
+assert _LEGACY_ALLOWED_ARRAYS == BASE_METRIC_ARRAYS
+ALLOWED_ARRAYS = BASE_METRIC_ARRAYS
+
+
+def resolved_allowed_arrays(
+    channel_catalog: ChannelCatalog | dict[str, Any] | Path | str | None = None,
+) -> tuple[str, ...]:
+    """Resolve the exact base-plus-project metric surface."""
+    catalog = resolve_channel_catalog(channel_catalog)
+    return catalog.allowed_metric_arrays() if catalog else ALLOWED_ARRAYS
+
+
+def _catalog_hash_from_npz(npz: Any) -> str | None:
+    if "channel_catalog_hash" not in npz.files:
+        return None
+    raw = np.asarray(npz["channel_catalog_hash"])
+    if raw.size != 1:
+        raise ValueError("channel_catalog_hash must be a scalar")
+    value = raw.reshape(()).item()
+    if isinstance(value, bytes):
+        value = value.decode("ascii", "strict")
+    return str(value)
 
 
 def load_generated_module(module_path: Path | str):
@@ -236,6 +266,7 @@ def compute_generated_metric(
     rollout_dir: Path | str,
     *,
     behavior: Optional[dict] = None,
+    channel_catalog: ChannelCatalog | dict[str, Any] | Path | str | None = None,
 ) -> dict[str, Any]:
     """Run a generated metric on a rollout dir. Mirrors
     `compute_spec_metrics`' defensive loading: NEVER raises — a bad/missing
@@ -243,6 +274,7 @@ def compute_generated_metric(
     so the loop aggregates an honest zero instead of dying."""
     rollout_dir = Path(rollout_dir)
     try:
+        catalog = resolve_channel_catalog(channel_catalog)
         if behavior is None:
             bpath = rollout_dir / "behavior.json"
             behavior = (
@@ -263,12 +295,35 @@ def compute_generated_metric(
         npz_path = rollout_dir / "trajectory.npz"
         if npz_path.is_file():
             with np.load(npz_path) as z:
+                trajectory_catalog_hash = _catalog_hash_from_npz(z)
+                if catalog is not None:
+                    if trajectory_catalog_hash is None:
+                        raise ValueError(
+                            "trajectory is missing channel_catalog_hash for "
+                            f"catalog {catalog.catalog_hash}")
+                    if trajectory_catalog_hash != catalog.catalog_hash:
+                        raise ValueError(
+                            "trajectory channel catalog hash mismatch: "
+                            f"{trajectory_catalog_hash} != {catalog.catalog_hash}")
                 # Load every ALLOWED array that's present — the generated
                 # metric may use any subset; missing ones simply aren't
                 # there (the validator forbids referencing absent arrays).
-                for k in ALLOWED_ARRAYS:
+                for k in resolved_allowed_arrays(catalog):
                     if k in z.files:
                         arrays[k] = z[k]
+                if catalog is not None:
+                    project_arrays = {
+                        name: arrays[name] for name in catalog.names()
+                        if name in arrays
+                    }
+                    channel_errors = validate_trajectory_channels(
+                        project_arrays, catalog,
+                        catalog_hash=trajectory_catalog_hash,
+                        strict_unknown=True, require_all=True)
+                    if channel_errors:
+                        raise ValueError(
+                            "invalid catalog trajectory channels: "
+                            + "; ".join(channel_errors))
         mod = load_generated_module(module_path)
         fn = getattr(mod, GENERATED_FN_NAME, None)
         if not callable(fn):
@@ -318,20 +373,28 @@ def compute_generated_metric(
         return {"spec_score": 0.0, "error": f"{type(e).__name__}: {e}"}
 
 
-def make_generated_fitness_fn(module_path: Path | str) -> Callable[[Any], float]:
+def make_generated_fitness_fn(
+    module_path: Path | str,
+    *,
+    channel_catalog: ChannelCatalog | dict[str, Any] | Path | str | None = None,
+) -> Callable[[Any], float]:
     """`fitness_fn(iter_dir) -> float` for a generated metric module —
     scores `iter_dir/rollout` (0.0 on any failure)."""
     module_path = Path(module_path)
 
     def _fitness(iter_dir: Any) -> float:
-        result = compute_generated_metric(module_path, Path(iter_dir) / "rollout")
+        result = compute_generated_metric(
+            module_path, Path(iter_dir) / "rollout",
+            channel_catalog=channel_catalog)
         return float(result.get("spec_score", 0.0) or 0.0)
 
     def _detail(iter_dir: Any) -> dict:
         # §Ship 36 (F2): full component breakdown for the diagnoser. Rides
         # on the fitness fn (no new threaded param). Never raises.
         try:
-            return compute_generated_metric(module_path, Path(iter_dir) / "rollout")
+            return compute_generated_metric(
+                module_path, Path(iter_dir) / "rollout",
+                channel_catalog=channel_catalog)
         except Exception:  # noqa: BLE001 — breakdown is advisory, never fatal
             return {}
 
@@ -340,7 +403,9 @@ def make_generated_fitness_fn(module_path: Path | str) -> Callable[[Any], float]
         # evaluation rolls into `rollout_eval_<k>/` beside `rollout/`;
         # fresh-seed re-eval into `rollout_fresh_<j>/`). Never raises.
         try:
-            return compute_generated_metric(module_path, Path(rollout_dir))
+            return compute_generated_metric(
+                module_path, Path(rollout_dir),
+                channel_catalog=channel_catalog)
         except Exception:  # noqa: BLE001 — advisory, never fatal
             return {}
 
@@ -350,11 +415,19 @@ def make_generated_fitness_fn(module_path: Path | str) -> Callable[[Any], float]
     # shaping↔metric partition gate. Parse which ALLOWED_ARRAYS the module
     # actually references (precise flags); fall back to the full contract on any
     # read failure. Never raises — attribute is advisory.
-    _fitness.metric_observables = _generated_metric_observables(module_path)  # type: ignore[attr-defined]
+    _fitness.metric_observables = _generated_metric_observables(  # type: ignore[attr-defined]
+        module_path, channel_catalog=channel_catalog)
+    catalog = resolve_channel_catalog(channel_catalog)
+    _fitness.channel_catalog_hash = (  # type: ignore[attr-defined]
+        catalog.catalog_hash if catalog else None)
     return _fitness
 
 
-def _generated_metric_observables(module_path: Path | str) -> frozenset[str]:
+def _generated_metric_observables(
+    module_path: Path | str,
+    *,
+    channel_catalog: ChannelCatalog | dict[str, Any] | Path | str | None = None,
+) -> frozenset[str]:
     """The subset of `ALLOWED_ARRAYS` a generated metric's source references —
     its held-out surface for the partition gate. Conservative: on any read
     failure, return the full `ALLOWED_ARRAYS` contract (the metric is permitted
@@ -362,12 +435,17 @@ def _generated_metric_observables(module_path: Path | str) -> frozenset[str]:
     try:
         src = Path(module_path).read_text(encoding="utf-8")
     except Exception:  # noqa: BLE001 — fall back to the full contract
-        return frozenset(ALLOWED_ARRAYS)
-    referenced = frozenset(a for a in ALLOWED_ARRAYS if a in src)
-    return referenced or frozenset(ALLOWED_ARRAYS)
+        return frozenset(resolved_allowed_arrays(channel_catalog))
+    allowed = resolved_allowed_arrays(channel_catalog)
+    referenced = frozenset(a for a in allowed if a in src)
+    return referenced or frozenset(allowed)
 
 
-def resolve_fitness_fn(spec: str) -> Callable[[Any], float]:
+def resolve_fitness_fn(
+    spec: str,
+    *,
+    channel_catalog: ChannelCatalog | dict[str, Any] | Path | str | None = None,
+) -> Callable[[Any], float]:
     """Resolve a fitness spec to a `fitness_fn(iter_dir) -> float`. `spec`
     is either a built-in spec-metric name (e.g. "go1_trot") or a filesystem
     path to a generated-metric .py module. Raises on anything else (fail
@@ -376,7 +454,7 @@ def resolve_fitness_fn(spec: str) -> Callable[[Any], float]:
         return make_spec_fitness_fn(spec)
     p = Path(spec)
     if p.suffix == ".py" and p.is_file():
-        return make_generated_fitness_fn(p)
+        return make_generated_fitness_fn(p, channel_catalog=channel_catalog)
     raise KeyError(
         f"unknown fitness metric {spec!r}: not a built-in "
         f"{sorted(_SPEC_FNS)} and not a generated-metric .py path that exists"

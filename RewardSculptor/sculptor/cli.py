@@ -36,6 +36,261 @@ kg_app = typer.Typer(
 app.add_typer(kg_app, name="kg")
 
 
+world_app = typer.Typer(
+    name="world",
+    help="Author, inspect, and validate prompt-driven robot environments.",
+    no_args_is_help=True,
+)
+app.add_typer(world_app, name="world")
+
+
+@world_app.command("author")
+def world_author(
+    prompt: str = typer.Argument(
+        ..., help="Natural-language environment and task description."),
+    project_dir: Path = typer.Option(
+        ..., "--project", "-p", help="Initialized Sculptor project."),
+    robot: Optional[str] = typer.Option(
+        None, "--robot", help="Robot capability ID; auto-select when omitted."),
+    robot_descriptor: list[Path] = typer.Option(
+        [], "--robot-descriptor",
+        help="External RobotCapability JSON (repeatable)."),
+    yes: bool = typer.Option(
+        False, "--yes", "-y",
+        help="Select every disclosed system default without prompting."),
+    interactive: Optional[bool] = typer.Option(
+        None, "--interactive/--no-interactive",
+        help=("Force clarification prompts or select disclosed defaults "
+              "headlessly. By default, terminal input is detected.")),
+    timeout_defaults: bool = typer.Option(
+        False, "--timeout-defaults",
+        help="Select defaults and record timeout_default provenance."),
+    json_out: bool = typer.Option(
+        False, "--json", help="Emit the promoted result as JSON."),
+):
+    """Author, clarify, gate, materialize, and atomically promote a world."""
+    import json as _json
+
+    from sculptor.world.author import (
+        CLARIFICATION_VERSION,
+        ClarificationAnswer,
+        ClarificationSubmission,
+        apply_clarifications,
+        author_environment,
+        default_clarification_submission,
+    )
+    from sculptor.world.project import WorldProjectService
+
+    try:
+        draft = author_environment(
+            prompt, robot_capability_id=robot,
+            robot_descriptor_paths=robot_descriptor)
+        import sys
+
+        should_prompt = (
+            interactive if interactive is not None else sys.stdin.isatty()
+        )
+        if yes or timeout_defaults or not should_prompt:
+            if (not yes and not timeout_defaults and not should_prompt):
+                typer.echo(
+                    "[sculpt world] non-interactive input; selecting every "
+                    "disclosed system default",
+                    err=True,
+                )
+            submission = default_clarification_submission(
+                draft, timeout=timeout_defaults)
+        else:
+            answers: list[ClarificationAnswer] = []
+            total_pages = len(draft.clarification_plan.pages)
+            for page in draft.clarification_plan.pages:
+                typer.echo(
+                    f"Clarification {page.page}/{total_pages} "
+                    f"({len(page.questions)} questions)", err=json_out)
+                for question in page.questions:
+                    typer.echo(f"\n{question.prompt}", err=json_out)
+                    choices = list(question.choices)
+                    for index, choice in enumerate(choices, 1):
+                        typer.echo(
+                            f"  {index}. {choice.label}", err=json_out)
+                    default_index = len(choices) + 1
+                    typer.echo(
+                        f"  {default_index}. {question.system_default_label}",
+                        err=json_out,
+                    )
+                    while True:
+                        selected = typer.prompt(
+                            "Select", type=int, default=default_index,
+                            err=json_out)
+                        if 1 <= selected <= default_index:
+                            break
+                        typer.echo(
+                            f"Select a number from 1 to {default_index}.",
+                            err=True,
+                        )
+                    if selected == default_index:
+                        answers.append(ClarificationAnswer(
+                            question.question_id, "system_default",
+                            source="default"))
+                    else:
+                        answers.append(ClarificationAnswer(
+                            question.question_id,
+                            choices[selected - 1].choice_id,
+                            source="user"))
+            submission = ClarificationSubmission(
+                version=CLARIFICATION_VERSION,
+                draft_hash=draft.draft_hash,
+                question_set_hash=(
+                    draft.clarification_plan.question_set_hash),
+                answers=tuple(answers),
+            )
+        applied = apply_clarifications(draft, submission)
+        lineage = f"world-{applied.result_hash[:24]}"
+        admitted = WorldProjectService(project_dir).admit_and_promote(
+            world=applied.world_spec, task=applied.task_spec,
+            clarifications=applied.clarification_ledger,
+            evaluation_lineage=lineage,
+            rejected_session_id=f"draft-{draft.draft_hash[:24]}",
+        )
+    except Exception as exc:
+        typer.echo(f"world author failed: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+    result = {
+        "ok": True,
+        "selection": admitted.promoted.selection.to_dict(),
+        "capability_id": draft.capability_id,
+        "draft_hash": draft.draft_hash,
+        "result_hash": applied.result_hash,
+        "evaluation_lineage": lineage,
+        "admission": admitted.admission,
+        "asset_dir": str(admitted.asset_dir),
+        "clarification_answers": len(
+            applied.clarification_ledger.get("answers", [])),
+    }
+    if json_out:
+        typer.echo(_json.dumps(result, indent=2, sort_keys=True))
+    else:
+        selection_result = admitted.promoted.selection
+        typer.echo(
+            f"[sculpt world] promoted selection_v"
+            f"{selection_result.selection_version} "
+            f"({selection_result.tuple_hash[:12]})")
+        typer.echo(f"  robot:       {draft.capability_id}")
+        typer.echo(f"  lineage:     {lineage}")
+        typer.echo(f"  eval assets: {admitted.asset_dir}")
+        typer.echo(
+            f"  gates:       {len(admitted.admission['gates'])} passed")
+
+
+def _world_selection_path(project_dir: Path, selection: Optional[Path]) -> Path:
+    if selection is not None:
+        return selection.expanduser().resolve()
+    return (project_dir.expanduser().resolve() /
+            "env" / "selection_current.json")
+
+
+@world_app.command("show")
+def world_show(
+    project_dir: Path = typer.Option(
+        ..., "--project", "-p", help="Sculptor project."),
+    selection: Optional[Path] = typer.Option(
+        None, "--selection", help="Pinned selection_vN.json; default current."),
+    json_out: bool = typer.Option(
+        False, "--json", help="Emit the complete selected bundle."),
+):
+    """Show the exact authoritative world/task/evaluation tuple."""
+    import json as _json
+
+    from sculptor.world.project import load_selected_world
+
+    path = _world_selection_path(project_dir, selection)
+    try:
+        _store, selected, bundle = load_selected_world(path)
+    except Exception as exc:
+        typer.echo(f"world show failed: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    if json_out:
+        typer.echo(_json.dumps(bundle, indent=2, sort_keys=True))
+        return
+    world = bundle["world"]
+    task = bundle["task"]
+    shared = world["shared"]
+    goal = task["shared"]["goal"]
+    typer.echo(
+        f"selection_v{selected.selection_version} "
+        f"{selected.tuple_hash[:12]}  lineage={selected.evaluation_lineage}")
+    typer.echo(
+        f"robot:   {shared['robot']['capability_id']} "
+        f"requires={shared['robot'].get('required_capabilities', [])}")
+    typer.echo(
+        f"terrain: {shared['terrain']['kind']}  "
+        f"objects={len(shared.get('objects', {}))}  "
+        f"course={len(shared.get('obstacles', {}).get('course', []))}")
+    typer.echo(
+        f"goal:    {goal['type']} ({goal['id']})  "
+        f"admission={bundle['resolved_eval']['admission']['ok']}")
+
+
+@world_app.command("validate")
+def world_validate(
+    project_dir: Path = typer.Option(
+        ..., "--project", "-p", help="Sculptor project."),
+    selection: Optional[Path] = typer.Option(
+        None, "--selection", help="Pinned selection_vN.json; default current."),
+    json_out: bool = typer.Option(
+        False, "--json", help="Emit the complete gate report."),
+):
+    """Verify the immutable tuple, frozen assets, and runtime fingerprints."""
+    import json as _json
+
+    from sculptor.world.compiler import (
+        ResolvedEvaluation,
+        verify_resolved_evaluation,
+    )
+    from sculptor.world.gates import AdmissionReport
+    from sculptor.world.project import load_selected_world
+
+    path = _world_selection_path(project_dir, selection)
+    try:
+        store, selected, bundle = load_selected_world(path)
+        manifest = ResolvedEvaluation.from_dict(bundle["resolved_eval"])
+        verify_resolved_evaluation(
+            bundle["world"], bundle["task"], bundle["channel_catalog"],
+            manifest,
+            asset_base=store.resolve_ref(
+                selected.refs["resolved_eval"]).parent,
+        )
+        report = AdmissionReport.from_dict(manifest.admission)
+        model_match = True
+        ok = report.ok
+    except Exception as exc:
+        typer.echo(f"world validate failed: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    result = {
+        "ok": ok,
+        "selection_version": selected.selection_version,
+        "tuple_hash": selected.tuple_hash,
+        "evaluation_lineage": selected.evaluation_lineage,
+        "model_hash_match": model_match,
+        "admission": report.to_dict(),
+    }
+    if json_out:
+        typer.echo(_json.dumps(result, indent=2, sort_keys=True))
+    else:
+        typer.echo(
+            f"world validation {'passed' if ok else 'FAILED'}: "
+            f"selection_v{selected.selection_version}")
+        typer.echo(f"  tuple hash: {selected.tuple_hash}")
+        typer.echo(f"  compiled model hash match: {model_match}")
+        for gate in report.gates:
+            typer.echo(
+                f"  [{'ok' if gate.ok else 'FAIL'}] {gate.gate}"
+                + (f" ({len(gate.violations)} violations)"
+                   if gate.violations else ""))
+    if not ok:
+        raise typer.Exit(1)
+
+
 # ── Remote sub-app (§Ship 23) ────────────────────────────────────────────────
 remote_app = typer.Typer(
     name="remote",
@@ -707,7 +962,11 @@ def run(
     fitness_fn = None
     if fitness_metric:
         from sculptor.eval import resolve_fitness_fn
-        fitness_fn = resolve_fitness_fn(fitness_metric)
+        from sculptor.world.channels import load_project_channel_catalog
+
+        channel_catalog = load_project_channel_catalog(config.parent)
+        fitness_fn = resolve_fitness_fn(
+            fitness_metric, channel_catalog=channel_catalog)
         _warn_fitness_metric_mismatch(config, fitness_metric)
 
     _sculpt_kwargs = dict(
@@ -776,6 +1035,7 @@ def gen_metric(
     from sculptor.eval import calibrate_metric, generate_objective_metric
 
     robot_hint: Optional[str] = None
+    channel_catalog = None
     if config is not None:
         try:
             try:
@@ -785,11 +1045,19 @@ def gen_metric(
             with open(config, "rb") as f:
                 cfg = tomllib.load(f)
             robot_hint = ((cfg.get("adapter") or {}).get("config") or {}).get("task_id")
+            from sculptor.world.channels import load_project_channel_catalog
+
+            channel_catalog = load_project_channel_catalog(config.parent)
         except Exception:  # noqa: BLE001 — hint is best-effort
             robot_hint = None
 
+    metric_kwargs = (
+        {"channel_catalog": channel_catalog}
+        if channel_catalog is not None else {}
+    )
     result = generate_objective_metric(
-        goal, out, robot_hint=robot_hint, review=not no_review)
+        goal, out, robot_hint=robot_hint, review=not no_review,
+        **metric_kwargs)
     typer.echo(f"[gen-metric] accepted={result['accepted']} "
                f"(validation_passed={result['validation_passed']})")
     typer.echo(f"[gen-metric] metric: {result['metric_path']}")
@@ -801,7 +1069,8 @@ def gen_metric(
         for c in rev.get("concerns", []):
             typer.echo(f"  - [review] {c}", err=True)
     if calibrate_against and result["accepted"]:
-        cal = calibrate_metric(result["metric_path"], calibrate_against)
+        cal = calibrate_metric(
+            result["metric_path"], calibrate_against, **metric_kwargs)
         typer.echo(f"[gen-metric] calibration vs {calibrate_against}: "
                    f"spearman={cal.get('spearman')} ok={cal.get('ok')}")
 
@@ -964,7 +1233,12 @@ def mission_init(
         from sculptor.mission_metrics import generate_stage_metrics
 
         robot_hint = getattr(adapter, "task_id", None)
-        report = generate_stage_metrics(mission, robot_hint=robot_hint)
+        metric_kwargs = (
+            {"channel_catalog": reward_contract.channel_catalog}
+            if reward_contract.channel_catalog is not None else {}
+        )
+        report = generate_stage_metrics(
+            mission, robot_hint=robot_hint, **metric_kwargs)
         save_mission(mission, mission_dir)
         typer.echo(
             f"[mission-init] stage metrics: "
@@ -1372,6 +1646,8 @@ def mission_run_cli(
 
     kg_store = SculptorKG()
     try:
+        from sculptor.world.channels import load_project_channel_catalog
+
         result = mission_run(
             mission,
             adapter_short_name=short_name,
@@ -1400,6 +1676,7 @@ def mission_run_cli(
             render_height=render_height,
             num_envs=num_envs,
             device=device,
+            channel_catalog=load_project_channel_catalog(project_dir),
         )
     finally:
         kg_store.close()
