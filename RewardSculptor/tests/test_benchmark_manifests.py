@@ -93,7 +93,15 @@ def test_frontier_manifest_exposes_real_arm_tasks_without_false_readiness() -> N
     assert lift.spec_metric is None
     assert not lift.campaign_ready
     assert lift.spec_authority == "A0_rejected"
-    assert any("object pose" in limitation for limitation in lift.known_limitations)
+    # The telemetry contract is closed (generic rollout persistence), but
+    # honesty demands the remaining evaluator gaps stay declared until an
+    # A4-audited spec + frozen split exist.
+    assert any("manipulation_telemetry" in limitation
+               for limitation in lift.known_limitations)
+    assert any("adversarial audit battery" in limitation
+               for limitation in lift.known_limitations)
+    assert any("frozen evaluation seed" in limitation
+               for limitation in lift.known_limitations)
 
 
 def test_compile_only_frontier_cannot_enter_campaign() -> None:

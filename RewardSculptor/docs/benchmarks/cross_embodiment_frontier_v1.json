@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "suite_id": "rewardsculptor-cross-embodiment-frontier",
-  "suite_version": "1.0.0",
+  "suite_version": "1.1.0",
   "benchmarks": [
     {
       "name": "yam_lift_cube",
@@ -25,7 +25,7 @@
       "spec_authority": "A0_rejected",
       "spec_audit_certificate": null,
       "known_limitations": [
-        "the mjlab rollout archive does not yet persist end-effector pose, object pose, gripper contact, or grasp state",
+        "rollouts persist end-effector pose, object pose/velocity, per-finger gripper contact, bilateral-contact grasp evidence, and the lift target (generic capability-discovered telemetry; sidecar manipulation_telemetry.json), but no success specification consumes them yet",
         "no hand-authored held-out lift-and-hold success specification has passed the adversarial audit battery",
         "no frozen evaluation seed/world split exists for this task"
       ],
@@ -54,8 +54,8 @@
       "spec_authority": "A0_rejected",
       "spec_audit_certificate": null,
       "known_limitations": [
-        "the selected target identity and all cube poses are absent from the generic rollout artifact contract",
-        "the current metric interface cannot distinguish target-cube success from lifting a distractor",
+        "rollouts persist all cube poses/velocities and the per-step selected target identity (target_object_index, remapped to the discovered object order; sidecar manipulation_telemetry.json), but no audited success specification consumes them yet",
+        "the generated-metric interface cannot reference these arrays without a channel catalog, so target-vs-distractor discrimination exists only for hand-authored spec metrics",
         "no disturbance predicate or held-out object-layout split is frozen"
       ],
       "notes": "Longer-horizon multi-object arm frontier. Do not replace the missing object semantics with mean return or generic joint-motion proxies."

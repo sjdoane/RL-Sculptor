@@ -1852,6 +1852,29 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
                 env_cfg.seed = _eval_seed
             except Exception:  # noqa: BLE001 — frozen cfg tolerated
                 pass
+    # §manipulation telemetry: registered (non-authored) tasks get generic
+    # object/end-effector/contact/target channels discovered from the scene
+    # cfg + capability descriptors — the artifact contract the YAM
+    # benchmark manifests name as their first known limitation. Authored
+    # runs are excluded: their ChannelCatalog recorder is the authoritative
+    # channel contract and the two must never double-write. Contact-sensor
+    # injection must precede env construction; every step is fail-soft.
+    manip_discovery = None
+    if world_bundle is None:
+        try:
+            from sculptor.adapters.manipulation_telemetry import (
+                discover_from_cfg,
+                inject_contact_sensors,
+            )
+
+            manip_discovery = discover_from_cfg(env_cfg)
+            if manip_discovery is not None:
+                manip_discovery = inject_contact_sensors(
+                    env_cfg, manip_discovery)
+        except Exception as e:  # noqa: BLE001 — telemetry must never block
+            print(f"[runner] manipulation-telemetry discovery skipped: "
+                  f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
+            manip_discovery = None
     env = ManagerBasedRlEnv(
         env_cfg, device=args.device, render_mode="rgb_array"
     )
@@ -1865,6 +1888,27 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
         world_channel_recorder = WorldChannelRecorder(WorldChannelRuntime(
             env, catalog=world_bundle.channel_catalog,
             manifest=world_bundle.manifest))
+    manip_recorder = None
+    if manip_discovery is not None:
+        try:
+            from sculptor.adapters.manipulation_telemetry import (
+                ManipulationRecorder,
+            )
+
+            manip_recorder = ManipulationRecorder(env, manip_discovery)
+            print("[SCULPT-EVENT] " + json.dumps({
+                "type": "manipulation_telemetry_discovered",
+                "capability_id": manip_discovery.capability_id,
+                "objects": list(manip_discovery.object_names),
+                "ee_site": manip_discovery.ee_site,
+                "finger_groups": sorted(manip_discovery.finger_groups),
+                "grasp_capable": manip_discovery.grasp_capable,
+                "contact_sensors": list(manip_discovery.sensor_names),
+            }), flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[runner] manipulation-telemetry recorder skipped: "
+                  f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
+            manip_recorder = None
 
     # §7.3: snapshot the mujoco model's actuator forceranges + joint
     # ranges. Downstream `sculptor.adapters.realism.audit_rollout` reads
@@ -2117,6 +2161,15 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
             # base trajectory state. Missing/malformed producers fail the
             # authored rollout instead of silently emitting a partial NPZ.
             world_channel_recorder.append()
+        if manip_recorder is not None:
+            # Registered-task manipulation channels; internally per-channel
+            # fail-soft, and belt-and-braces guarded here so no derived
+            # combination (e.g. bilateral grasp) can ever end the rollout.
+            try:
+                manip_recorder.append()
+            except Exception as e:  # noqa: BLE001
+                print(f"[runner] manipulation-telemetry step skipped: "
+                      f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
         # Freeze cumulative return/length on the first `done` per env.
         active = (~ep_done).float()
         ep_return += rew * active
@@ -2358,6 +2411,18 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
             trajectory[f"reward_term__{name}"] = stacked
     if world_channel_recorder is not None:
         trajectory.update(world_channel_recorder.finalize())
+    if manip_recorder is not None:
+        try:
+            manip_arrays = {
+                key: value
+                for key, value in manip_recorder.finalize().items()
+                if key not in trajectory  # existing contract always wins
+            }
+            trajectory.update(manip_arrays)
+            manip_recorder.write_manifest(output_dir, manip_arrays)
+        except Exception as e:  # noqa: BLE001
+            print(f"[runner] manipulation-telemetry finalize skipped: "
+                  f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
     np.savez_compressed(output_dir / "trajectory.npz", **trajectory)
 
     # §7.1 / §7.2: per-term time-series as JSON (Eureka Appendix F shape).

@@ -92,6 +92,61 @@ Do not delete or stage the pre-existing untracked `.fleaven*`, `.ingest*`,
 `.metric*`, or `.pytest*` artifacts in `RewardSculptor/`. The roadmap document
 and this handoff are also untracked new work. No commit was made.
 
+## Continued 2026-07-19 (Claude): generic manipulation telemetry
+
+The first paragraph of the "best next implementation target" below is now
+implemented (`sculptor/adapters/manipulation_telemetry.py`, wired into
+the rollout path of `_mjlab_runner.py`):
+
+- **Discovery is purely semantic.** The robot is the scene entity whose
+  cfg declares actuators; objects are the passive entities; the
+  end-effector site/body, left/right finger groups, and grasp
+  eligibility come from the installed capability descriptors matched by
+  role-name sets against a CPU compile of the robot asset. Zero robot or
+  task name strings; a future arm inherits everything by registering a
+  descriptor. Ambiguity (no robot, two actuated entities) records
+  nothing rather than guessing.
+- **Channels** (feature-detected per step, dropped when absent, authored
+  ChannelCatalog vocabulary): `ee_pos_w`, `ee_quat_w`,
+  `object__<name>__{pos_w,quat_w,lin_vel_w,ang_vel_w}` for EVERY
+  embodiment (non-prehensile tasks included),
+  `contact__{left,right,gripper}__<object>` from contact sensors
+  injected pre-construction (primary = capability finger-group subtree,
+  secondary = the object entity), `grasp__<object>` = bilateral finger
+  contact (explicitly documented as a mechanical proxy, not
+  force-closure), `target__pos_w` + per-step `target_object_index`
+  (duck-typed from the command term: `target_selection`/`entity_names`
+  for multi-object commands, static `entity_name` otherwise, remapped to
+  the discovered object order). A sidecar
+  `manipulation_telemetry.json` records provenance, channel shapes, and
+  every derivation so the future lift spec and A4 audit consume declared
+  semantics rather than guessed arrays.
+- Authored runs are excluded (their catalog recorder is authoritative;
+  no double-writing); the whole path is fail-soft and event-logged
+  (`manipulation_telemetry_discovered`).
+- The frontier manifest is updated to the new truth (suite_version
+  1.1.0): the telemetry limitation is closed, the missing-A4-spec and
+  frozen-split limitations remain, tier stays `compile_only` and
+  authority stays `A0_rejected` — no false readiness.
+- Tests: `tests/test_manipulation_telemetry.py` (7) — role-name
+  capability matching (complete/incomplete), REAL registered YAM lift +
+  multi-cube cfg discovery and idempotent sensor injection (CPU spec
+  compile only), classification refusals, and recorder semantics on a
+  fake env (bilateral grasp, target remapping, manifest content).
+- **Observed end-to-end on GPU**, not only mechanism-verified: a
+  3-iteration train + real rollout of `Mjlab-Lift-Cube-Yam` produced all
+  11 channels in `trajectory.npz` (T=100, N=64) plus the sidecar
+  manifest — capability matched `yam:parallel_gripper`, cube z within
+  its spawn range, EE pose sane, and contacts/grasp honestly all-false
+  for an untrained policy. Adversarially verified by a subagent
+  (mutation test confirmed the target-remap test kills an identity-remap
+  bug; all claims CONFIRMED).
+
+Still open from the list below: the temporal lift-clear-and-hold spec,
+genuinely held-out A4 evidence across the ten attack classes, the YAM
+manifest promotion to campaign-ready, the real gauntlet manifest from
+archived rollouts, and the charter-aware global-matrix coordinator.
+
 ## Best next implementation target
 
 Continue the concrete YAM path rather than adding more placeholder task names:
