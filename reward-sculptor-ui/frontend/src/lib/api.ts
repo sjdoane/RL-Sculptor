@@ -1232,3 +1232,19 @@ export async function getWorldLineage(
     await fetch(`/api/projects/${slug}/worlds/lineage`),
   );
 }
+
+export async function getWorldValidate(
+  slug: string,
+): Promise<import("./types").WorldValidateResult> {
+  return handle<import("./types").WorldValidateResult>(
+    await fetch(`/api/projects/${slug}/worlds/validate`),
+  );
+}
+
+export async function getWorldCurriculum(
+  slug: string,
+): Promise<import("./types").WorldCurriculum> {
+  return handle<import("./types").WorldCurriculum>(
+    await fetch(`/api/projects/${slug}/worlds/curriculum`),
+  );
+}

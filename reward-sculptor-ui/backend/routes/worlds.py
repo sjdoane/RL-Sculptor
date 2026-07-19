@@ -130,6 +130,35 @@ async def world_lineage(
         world_store.lineage, Path(detail.project_dir))
 
 
+@router.get("/projects/{slug}/worlds/validate")
+async def world_validate(
+    slug: str, store: ProjectStore = Depends(get_store),
+):
+    """Integrity check: tuple hash, per-artifact byte hashes (tamper
+    evidence), and schema re-validation of the authoritative selection."""
+    detail = store.get(slug)
+    if detail is None:
+        return _problem(status.HTTP_404_NOT_FOUND, "Project not found")
+    try:
+        return await run_in_threadpool(
+            world_store.validate, Path(detail.project_dir))
+    except FileNotFoundError as exc:
+        return _problem(status.HTTP_404_NOT_FOUND, "No authored world",
+                        str(exc))
+
+
+@router.get("/projects/{slug}/worlds/curriculum")
+async def world_curriculum(
+    slug: str, store: ProjectStore = Depends(get_store),
+):
+    """Terrain-curriculum progression of the most recent run."""
+    detail = store.get(slug)
+    if detail is None:
+        return _problem(status.HTTP_404_NOT_FOUND, "Project not found")
+    return await run_in_threadpool(
+        world_store.curriculum, Path(detail.project_dir))
+
+
 @router.get("/projects/{slug}/worlds/preview")
 async def world_preview(
     slug: str, angle: str = "iso", regenerate: bool = False,

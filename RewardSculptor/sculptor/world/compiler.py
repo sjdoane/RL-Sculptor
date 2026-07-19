@@ -94,7 +94,19 @@ class ResolvedEvaluation:
             for item in payload.get("course", ())
         ]
         manifest_hash = sha256_bytes(canonical_json_bytes(payload))
-        values["course"] = tuple(values.get("course", ()))
+        # Normalize course items to ResolvedPrimitive on EVERY construction
+        # path. `with_admission` round-trips through to_dict (course →
+        # plain dicts) and previously left them as dicts, so the NEXT
+        # to_dict crashed — but only for course-bearing worlds, which no
+        # admission test covered until the live parkour authoring hit it.
+        values["course"] = tuple(
+            item if isinstance(item, ResolvedPrimitive)
+            else ResolvedPrimitive(**{
+                key: (tuple(value) if isinstance(value, list) else value)
+                for key, value in dict(item).items()
+            })
+            for item in values.get("course", ())
+        )
         return cls(manifest_version=1, manifest_hash=manifest_hash, **values)
 
     @classmethod

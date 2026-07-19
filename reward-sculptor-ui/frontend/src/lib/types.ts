@@ -1494,6 +1494,16 @@ export interface WorldSelection {
     id: string; target: string; class: string;
     distribution: { [extra: string]: unknown };
   }[];
+  clarifications: {
+    answer_sources: Record<string, number>;
+    answers: {
+      question_id: string | null;
+      parameter_path: string | null;
+      choice_id: string | null;
+      source: string | null;
+      value: unknown;
+    }[];
+  };
 }
 
 export interface WorldLineageEntry {
@@ -1502,4 +1512,25 @@ export interface WorldLineageEntry {
   tuple_hash: string;
   evaluation_lineage: string;
   refs: Record<string, { version: string | number | null }>;
+  eval_model_hash: string | null;
+}
+
+export interface WorldValidateResult {
+  ok: boolean;
+  selection_version: number | null;
+  tuple_hash: string | null;
+  errors: string[];
+}
+
+export interface WorldCurriculumIteration {
+  iter: number;
+  mean_level: number | null;
+  max_level: number | null;
+  num_envs: number | null;
+  histogram: Record<string, number> | null;
+}
+
+export interface WorldCurriculum {
+  run: string | null;
+  iterations: WorldCurriculumIteration[];
 }

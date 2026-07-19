@@ -10,9 +10,11 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   applyWorldAuthor,
   authorWorld,
+  getWorldCurriculum,
   getWorldLineage,
   getWorldSelection,
 } from "@/lib/api";
+import type { WorldCurriculum } from "@/lib/types";
 import { qk } from "@/lib/queryKeys";
 import type {
   WorldApplyRequest,
@@ -37,6 +39,16 @@ export function useWorldLineage(slug: string | undefined) {
   return useQuery<WorldLineageEntry[]>({
     queryKey: slug ? qk.worldLineage(slug) : ["worldLineage", "_none"],
     queryFn: () => getWorldLineage(slug!),
+    enabled: !!slug,
+    staleTime: 30_000,
+    retry: false,
+  });
+}
+
+export function useWorldCurriculum(slug: string | undefined) {
+  return useQuery<WorldCurriculum>({
+    queryKey: slug ? qk.worldCurriculum(slug) : ["worldCurriculum", "_none"],
+    queryFn: () => getWorldCurriculum(slug!),
     enabled: !!slug,
     staleTime: 30_000,
     retry: false,

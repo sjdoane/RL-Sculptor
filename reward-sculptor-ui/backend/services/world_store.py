@@ -258,7 +258,118 @@ def selection(project_dir: Path) -> dict[str, Any] | None:
              "class": v.get("class"), "distribution": v.get("distribution")}
             for v in (world.get("train") or {}).get("variations") or []
         ],
+        "clarifications": _clarification_summary(
+            bundle.get("clarifications") or {}),
     }
+
+
+def _clarification_summary(ledger: Mapping[str, Any]) -> dict[str, Any]:
+    """Provenance ledger shaped for display: who decided every
+    load-bearing parameter — the user or the disclosed system default."""
+    answers = [a for a in (ledger.get("answers") or []) if isinstance(a, dict)]
+    by_source: dict[str, int] = {}
+    for answer in answers:
+        source = str(answer.get("source") or "unknown")
+        by_source[source] = by_source.get(source, 0) + 1
+    return {
+        "answer_sources": by_source,
+        "answers": [
+            {
+                "question_id": answer.get("question_id"),
+                "parameter_path": answer.get("parameter_path"),
+                "choice_id": answer.get("choice_id"),
+                "source": answer.get("source"),
+                "value": answer.get("value"),
+            }
+            for answer in answers
+        ],
+    }
+
+
+def validate(project_dir: Path) -> dict[str, Any]:
+    """Integrity check of the authoritative tuple, UI-triggerable.
+
+    Re-verifies the selection's tuple hash, every artifact's recorded
+    sha256 against the bytes on disk (tamper evidence — the artifacts
+    are immutable by contract), and re-runs WorldSpec/TaskSpec schema
+    validation on the loaded bundle."""
+    from sculptor.world.artifacts import file_sha256
+    from sculptor.world.project import load_selected_world
+    from sculptor.world.task_spec import validate_task_spec
+    from sculptor.world.world_spec import validate_world_spec
+
+    path = Path(project_dir) / "env" / "selection_current.json"
+    if not path.is_file():
+        raise FileNotFoundError("project has no authored world selection")
+    try:
+        store, selected, bundle = load_selected_world(path)
+    except Exception as exc:  # noqa: BLE001 — corruption is the finding
+        return {"ok": False, "selection_version": None, "tuple_hash": None,
+                "errors": [f"{type(exc).__name__}: {exc}"]}
+    errors: list[str] = []
+    for kind, ref in sorted(selected.refs.items()):
+        try:
+            actual = file_sha256(store.resolve_ref(ref))
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{kind}: unreadable ({type(exc).__name__}: {exc})")
+            continue
+        if actual != ref.sha256:
+            errors.append(
+                f"{kind}: artifact bytes do not match the recorded hash "
+                "(tampered or corrupted)")
+    errors.extend(
+        f"WorldSpec: {e}" for e in validate_world_spec(bundle["world"]))
+    errors.extend(
+        f"TaskSpec: {e}"
+        for e in validate_task_spec(bundle["task"], world=bundle["world"]))
+    return {
+        "ok": not errors,
+        "selection_version": selected.selection_version,
+        "tuple_hash": selected.tuple_hash,
+        "errors": errors,
+    }
+
+
+def curriculum(project_dir: Path) -> dict[str, Any]:
+    """Terrain-curriculum progression of the most recent run — one entry
+    per iteration that exported world_curriculum_stats.json (mean level
+    rising across iterations = the policy earning promotion)."""
+    import re as _re
+
+    runs_root = Path(project_dir) / "runs"
+    if not runs_root.is_dir():
+        return {"run": None, "iterations": []}
+    stats_files = list(
+        runs_root.glob("**/iter_*/world_curriculum_stats.json"))
+    if not stats_files:
+        return {"run": None, "iterations": []}
+
+    def _run_dir(stats_path: Path) -> Path:
+        return stats_path.parent.parent
+
+    latest_run = max(
+        {_run_dir(p) for p in stats_files},
+        key=lambda d: d.stat().st_mtime)
+    iterations: list[dict[str, Any]] = []
+    for stats_path in stats_files:
+        if _run_dir(stats_path) != latest_run:
+            continue
+        match = _re.fullmatch(r"iter_([0-9]+)", stats_path.parent.name)
+        if not match:
+            continue
+        try:
+            data = json.loads(stats_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        iterations.append({
+            "iter": int(match.group(1)),
+            "mean_level": data.get("mean_level"),
+            "max_level": data.get("max_level"),
+            "num_envs": data.get("num_envs"),
+            "histogram": data.get("histogram"),
+        })
+    iterations.sort(key=lambda entry: entry["iter"])
+    return {"run": latest_run.name, "iterations": iterations}
 
 
 def preview(
@@ -317,5 +428,31 @@ def lineage(project_dir: Path) -> list[dict[str, Any]]:
                 kind: {"version": ref.get("version")}
                 for kind, ref in (data.get("refs") or {}).items()
             },
+            # The Act-III proof surfaced in the UI: identical across every
+            # entry unless a SHARED design field changed.
+            "eval_model_hash": _eval_model_hash(
+                env_dir, (data.get("refs") or {}).get("resolved_eval")),
         }))
     return [entry for _, entry in sorted(entries, key=lambda item: item[0])]
+
+
+def _eval_model_hash(
+    env_dir: Path, eval_ref: Mapping[str, Any] | None,
+) -> str | None:
+    """compiled_model_hash from a selection's resolved-eval manifest;
+    fail-soft None (lineage listing must never break on one bad file)."""
+    if not eval_ref:
+        return None
+    relative = str(eval_ref.get("path") or "")
+    if not relative:
+        return None
+    # ArtifactRef paths may be recorded relative to the env dir or the
+    # project dir depending on the writing base — accept either.
+    for candidate in (env_dir / relative, env_dir.parent / relative):
+        try:
+            manifest = json.loads(candidate.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        value = manifest.get("compiled_model_hash")
+        return str(value) if value else None
+    return None

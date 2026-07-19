@@ -2,13 +2,37 @@
  *  immutable selection lineage, with the authoring dialog as entry point.
  *  The selection endpoint 404s before the first authoring — that renders
  *  as the empty state, with the dialog as the action. */
+import { toast } from "sonner";
+
 import AuthorWorldDialog from "@/components/AuthorWorldDialog";
-import { Badge, EmptyState } from "@/components/rs/primitives";
-import { useWorldLineage, useWorldSelection } from "@/hooks/useWorlds";
+import { Badge, Btn, EmptyState } from "@/components/rs/primitives";
+import {
+  useWorldCurriculum,
+  useWorldLineage,
+  useWorldSelection,
+} from "@/hooks/useWorlds";
+import { getWorldValidate } from "@/lib/api";
+
+async function runIntegrityCheck(slug: string) {
+  try {
+    const result = await getWorldValidate(slug);
+    if (result.ok) {
+      toast.success(
+        `Integrity verified: selection v${result.selection_version}, ` +
+        "every artifact hash matches",
+      );
+    } else {
+      toast.error(`Integrity FAILED: ${result.errors.join("; ")}`);
+    }
+  } catch (err) {
+    toast.error(err instanceof Error ? err.message : String(err));
+  }
+}
 
 export default function WorldTab({ slug }: { slug: string }) {
   const selection = useWorldSelection(slug);
   const lineage = useWorldLineage(slug);
+  const curriculum = useWorldCurriculum(slug);
 
   if (selection.isLoading) return null;
 
@@ -33,7 +57,13 @@ export default function WorldTab({ slug }: { slug: string }) {
       <div className="rs-card">
         <div className="rs-card-head">
           <div className="rs-card-title">Authoritative world tuple</div>
-          <AuthorWorldDialog slug={slug} />
+          <div style={{ display: "flex", gap: 8 }}>
+            <Btn icon="shield-check" size="sm"
+                 onClick={() => void runIntegrityCheck(slug)}>
+              Verify integrity
+            </Btn>
+            <AuthorWorldDialog slug={slug} />
+          </div>
         </div>
         <div className="rs-card-pad">
           <div className="rs-kv">
@@ -57,6 +87,12 @@ export default function WorldTab({ slug }: { slug: string }) {
             <span className="mono">{String(s.goal["type"] ?? "—")}</span>
             <span>Prompt</span>
             <span>{s.world_meta.prompt ?? "—"}</span>
+            <span>Clarifications</span>
+            <span>
+              {Object.entries(s.clarifications?.answer_sources ?? {})
+                .map(([source, count]) => `${count} ${source}`)
+                .join(" · ") || "—"}
+            </span>
           </div>
           {s.train_variations.length > 0 && (
             <>
@@ -73,6 +109,39 @@ export default function WorldTab({ slug }: { slug: string }) {
           )}
         </div>
       </div>
+
+      {(curriculum.data?.iterations?.length ?? 0) > 0 && (
+        <div className="rs-card">
+          <div className="rs-card-head">
+            <div className="rs-card-title">
+              Terrain curriculum — {curriculum.data!.run}
+            </div>
+          </div>
+          <div className="rs-card-pad">
+            <div className="rs-hintline">
+              Mean difficulty level per iteration (rising = the policy is
+              earning promotion to harder terrain rows).
+            </div>
+            {curriculum.data!.iterations.map((entry) => (
+              <div key={entry.iter}
+                   style={{ display: "flex", gap: 10, alignItems: "baseline",
+                            padding: "2px 0" }}>
+                <span className="mono" style={{ width: 56 }}>
+                  iter {entry.iter}
+                </span>
+                <span className="mono">
+                  mean {entry.mean_level ?? "?"} / max {entry.max_level ?? "?"}
+                </span>
+                <span className="rs-hintline">
+                  {Object.entries(entry.histogram ?? {})
+                    .map(([level, count]) => `L${level}:${count}`)
+                    .join(" ")}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       <div className="rs-card">
         <div className="rs-card-head">
@@ -112,10 +181,15 @@ export default function WorldTab({ slug }: { slug: string }) {
                 {entry.tuple_hash.slice(0, 12)}
               </span>
               <span className="rs-hintline" style={{ flex: 1 }}>
-                world v{String(entry.refs["world"]?.version ?? "?")} · task v
+                world {String(entry.refs["world"]?.version ?? "?")} · task{" "}
                 {String(entry.refs["task"]?.version ?? "?")} · reward{" "}
-                {String(entry.refs["reward"]?.version ?? "?")} ·{" "}
-                {entry.evaluation_lineage}
+                {String(entry.refs["reward"]?.version ?? "?")} · eval{" "}
+                <span className="mono">
+                  {entry.eval_model_hash
+                    ? entry.eval_model_hash.replace("sha256:", "").slice(0, 12)
+                    : "?"}
+                </span>{" "}
+                · {entry.evaluation_lineage}
               </span>
               <span className="rs-hintline">
                 {new Date(entry.created_at * 1000).toLocaleString()}

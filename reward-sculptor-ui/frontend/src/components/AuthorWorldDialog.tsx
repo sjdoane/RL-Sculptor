@@ -162,7 +162,8 @@ export default function AuthorWorldDialog({
           ) : (
             <div>
               <div className="rs-hintline">
-                Page {page + 1} / {pages.length}
+                Page {page + 1} / {pages.length} · draft{" "}
+                <span className="mono">{draft.draft_hash.slice(0, 12)}</span>
                 {draft.kg_grounding.length > 0 &&
                   ` — grounded on ${draft.kg_grounding.length} knowledge-graph node(s)`}
               </div>

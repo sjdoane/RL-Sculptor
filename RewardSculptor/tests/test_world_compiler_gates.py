@@ -311,3 +311,26 @@ def test_authored_uneven_world_declares_full_span():
         "stay stable and walk on uneven rough terrain",
         robot_capability_id="unitree_g1:base")
     assert train_difficulty_span(draft.world_spec) == (0.0, 1.0)
+
+
+def test_resolved_evaluation_with_admission_round_trips_course():
+    """Live-UI regression: with_admission -> to_dict on a COURSE-BEARING
+    manifest crashed ('dict' has no to_dict) because build left round-
+    tripped course dicts unconverted; empty-course tests never tripped it."""
+    from sculptor.world.compiler import ResolvedEvaluation, ResolvedPrimitive
+
+    prim = ResolvedPrimitive(
+        primitive_id="b__platform", source_id="b", shape="box",
+        position_m=(1.0, 0.0, 0.1), size_m=(1.0, 1.2, 0.2))
+    manifest = ResolvedEvaluation.build(
+        world_hash="w", task_hash="t", compiler_hash="c",
+        robot_capability_hash="rc", robot_asset_hash="ra",
+        simulator_capability_hash="s", dependency_versions={},
+        runtime_task_id=None, eval_seed=1, terrain={}, course=[prim],
+        objects={}, zones={}, task_shared={}, channel_catalog_hash="cc",
+        compiled_model_hash="cm", materialized_assets={}, admission={})
+    stamped = manifest.with_admission({"ok": True})
+    payload = stamped.to_dict()  # crashed before the fix
+    assert payload["course"][0]["primitive_id"] == "b__platform"
+    again = stamped.with_admission({"ok": False}).to_dict()
+    assert again["course"] == payload["course"]
