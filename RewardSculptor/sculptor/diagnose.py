@@ -176,6 +176,29 @@ class _ProposedEnvEditModel(BaseModel):
         return v
 
 
+class _ProposedWorldEditModel(BaseModel):
+    """§env-authoring §10.2 — a retarget of one REGISTERED train-only
+    world variation. Unlike env-spec parameters (a static key enum), the
+    registered variation IDs are per-world data, so membership is
+    validated at packing time against the # WORLD_VARIATIONS block."""
+
+    variation_id: str = Field(
+        description=(
+            "Registered train-variation ID to retarget (the "
+            "# WORLD_VARIATIONS block lists each with its current "
+            "distribution)."
+        )
+    )
+    new_distribution: dict = Field(
+        description=(
+            "COMPLETE replacement distribution object with the same "
+            "shape as the current one, e.g. "
+            "{\"kind\": \"uniform\", \"low\": 0.1, \"high\": 0.3}."
+        )
+    )
+    rationale: str
+
+
 class _GroundedModel(BaseModel):
     proposed_edits: list[_ProposedEditModel] = Field(default_factory=list)
     proposed_env_edits: list[_ProposedEnvEditModel] = Field(
@@ -185,6 +208,15 @@ class _GroundedModel(BaseModel):
             "(only when the user message contains an # ENV_SPEC block "
             "and the diagnosed failure is a training-distribution "
             "pathology; empty otherwise)."
+        ),
+    )
+    proposed_world_edits: list[_ProposedWorldEditModel] = Field(
+        default_factory=list,
+        description=(
+            "0-2 retargets of registered TRAIN-ONLY world variations "
+            "(only when the user message contains a # WORLD_VARIATIONS "
+            "block and the diagnosed failure is a training-distribution "
+            "pathology in the authored world; empty otherwise)."
         ),
     )
     confidence: float = Field(ge=0.0, le=1.0)
@@ -231,11 +263,28 @@ class ProposedEnvEdit:
 
 
 @dataclass
+class ProposedWorldEdit:
+    """§env-authoring §10.2: a diagnoser-proposed retarget of one
+    registered train-only world variation. Applied by
+    `world.project.apply_world_variation_edits` (per-edit validation
+    rollback, full re-admission, evaluation byte-invariance guard),
+    takes effect the NEXT iteration's tuple."""
+
+    variation_id: str
+    new_distribution: dict
+    rationale: str
+
+    def to_dict(self) -> dict:
+        return dataclasses.asdict(self)
+
+
+@dataclass
 class Diagnosis:
     failure_modes: list[str]
     evidence: str
     proposed_edits: list[ProposedEdit] = field(default_factory=list)
     proposed_env_edits: list[ProposedEnvEdit] = field(default_factory=list)
+    proposed_world_edits: list[ProposedWorldEdit] = field(default_factory=list)
     literature_context: list[TechniqueMatch] = field(default_factory=list)
     confidence: float = 0.0
     iter_dir: str | None = None
@@ -248,6 +297,8 @@ class Diagnosis:
             "proposed_edits": [e.to_dict() for e in self.proposed_edits],
             "proposed_env_edits": [
                 e.to_dict() for e in self.proposed_env_edits],
+            "proposed_world_edits": [
+                e.to_dict() for e in self.proposed_world_edits],
             "literature_context": [
                 {
                     "technique": m.technique.name,
@@ -748,6 +799,39 @@ def _render_env_spec_block(env_spec: dict | None) -> str:
     )
 
 
+def _render_world_variations_block(
+    world_variations: list[dict] | None,
+) -> str:
+    """§env-authoring §10.2: the # WORLD_VARIATIONS block — every
+    registered train-only variation of the authored world with its stable
+    ID, target pointer, class, and current distribution. Empty string
+    when the project has no authored world or it registers no variations
+    (the model is instructed to emit no world edits then)."""
+    if not world_variations:
+        return ""
+    lines = [
+        json.dumps(
+            {
+                "id": entry.get("id"),
+                "target": entry.get("target"),
+                "class": entry.get("class"),
+                "distribution": entry.get("distribution"),
+            },
+            sort_keys=True,
+        )
+        for entry in world_variations
+    ]
+    return (
+        "# WORLD_VARIATIONS\n"
+        "# Registered TRAIN-ONLY variations of the authored world. You may\n"
+        "# retarget any of them via proposed_world_edits (variation_id +\n"
+        "# COMPLETE new_distribution; takes effect next iteration after\n"
+        "# full re-admission). The evaluation world is frozen and\n"
+        "# byte-verified — a train edit can never change what is scored.\n"
+        + "\n".join(lines) + "\n\n"
+    )
+
+
 def _build_grounded_user_content(
     behavior_goal: str,
     reward_spec: dict,
@@ -759,6 +843,7 @@ def _build_grounded_user_content(
     training_feedback: dict | None = None,
     realism_audit: dict | None = None,
     env_spec: dict | None = None,
+    world_variations: list[dict] | None = None,
     reference_signature: dict | None = None,
 ) -> str:
     feedback_block = ""
@@ -799,6 +884,7 @@ def _build_grounded_user_content(
         f"{realism_block}"
         f"{reference_block}"
         f"{_render_env_spec_block(env_spec)}"
+        f"{_render_world_variations_block(world_variations)}"
         f"# behavior.json\n{json.dumps(behavior, indent=2, sort_keys=True, default=str)}\n\n"
         f"# REWARD_CONTRACT\n{contract_text}\n\n"
         f"# PRELIMINARY DIAGNOSIS\n"
@@ -963,6 +1049,27 @@ def diagnose(
             except Exception as e:  # noqa: BLE001 — context is advisory here
                 print(f"[diagnose] env spec unreadable ({e}) — no env-edit "
                       "surface this iter.", file=sys.stderr, flush=True)
+
+    # §env-authoring §10.2: the authored world's registered train
+    # variations — the world-edit surface. Resolved from the adapter's
+    # pinned selection (the same tuple training reads), best-effort: an
+    # unreadable selection just means no # WORLD_VARIATIONS block, and
+    # any world edits the model hallucinates are dropped at packing.
+    world_variations: list[dict] | None = None
+    _world_sel = str(getattr(adapter, "world_selection_path", "") or "")
+    if _world_sel:
+        try:
+            from sculptor.world.project import load_selected_world
+
+            _, _, _world_bundle = load_selected_world(_world_sel)
+            _registered = (
+                (_world_bundle["world"].get("train") or {})
+                .get("variations") or [])
+            world_variations = [dict(v) for v in _registered] or None
+        except Exception as e:  # noqa: BLE001 — context is advisory here
+            print(f"[diagnose] world selection unreadable ({e}) — no "
+                  "world-edit surface this iter.", file=sys.stderr,
+                  flush=True)
 
     # 3. Anthropic client.
     if client is None:
@@ -1201,6 +1308,7 @@ def diagnose(
             training_feedback=training_feedback,
             realism_audit=realism_audit,
             env_spec=env_spec,
+            world_variations=world_variations,
             reference_signature=reference_signature,
         )
         grounded: _GroundedModel = _parse_with_retry(
@@ -1293,6 +1401,24 @@ def diagnose(
                 for e in grounded.proposed_env_edits
             ]
             if env_spec is not None else []
+        ),
+        # §env-authoring §10.2: world-variation proposals. Registered-ID
+        # membership is the packing gate (the IDs are per-world data, not
+        # a static enum) — without a # WORLD_VARIATIONS surface, or for
+        # an unregistered ID, there is nothing to apply to and the edit
+        # is dropped here.
+        proposed_world_edits=(
+            [
+                ProposedWorldEdit(
+                    variation_id=str(e.variation_id),
+                    new_distribution=dict(e.new_distribution),
+                    rationale=e.rationale,
+                )
+                for e in grounded.proposed_world_edits
+                if str(e.variation_id) in {
+                    str(v.get("id")) for v in world_variations}
+            ]
+            if world_variations else []
         ),
         literature_context=kg_matches,
         confidence=min(preliminary.confidence, grounded.confidence),

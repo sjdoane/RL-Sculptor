@@ -112,18 +112,34 @@ three committed increments:
   edit provably cannot move the baseline (§6.1). Rejections land in
   `env/rejected` with `eval_invariance_violations`.
 
-Still open in item 4 (the next coherent slice):
+The diagnoser world-edit surface and world keep/revert are also complete:
 
-- diagnoser surface: `_render_world_block` + `proposed_world_edits`
-  (mirror `_render_env_spec_block` / `_ProposedEnvEditModel` in
-  `diagnose.py:718/148/181`, resolution beside `:950`), plumb the world
-  bundle into `diagnose()`, and call `apply_world_variation_edits` from
-  `_run_one_iter` beside the env-edit apply (`sculpt.py:1900-1951`);
-- keep-best/revert must then carry the world ref version per iteration
-  (today `_promote_iteration_selection` rebinds only reward+env_spec and
-  holds world immutable — extend it with the world version trained, and
-  restore the best world version at end of run beside
-  `best_env_spec_selected`);
+- `diagnose.py`: `# WORLD_VARIATIONS` block (`_render_world_variations_block`)
+  renders the authored world's registered train variations, resolved
+  best-effort from `adapter.world_selection_path` via
+  `load_selected_world`; `_ProposedWorldEditModel` (variation_id +
+  COMPLETE new_distribution — membership validated at packing, since IDs
+  are per-world data, not a static enum); `Diagnosis.proposed_world_edits`
+  persisted in diagnosis.json.
+- `sculpt.py`: `_run_one_iter` applies world edits after the env edits via
+  `apply_world_variation_edits` (advisory — failures emit
+  `world_variations_updated` with rejections and the loop continues),
+  repointing the adapter at the newly promoted pin so the NEXT iteration
+  trains under it. `_promote_iteration_selection` gained
+  `base_selection`: keep-best records
+  `result.best_world_selection_path` and both the regression revert and
+  the end-of-run best-tuple commit source the five immutable world-half
+  refs from the best iteration's pinned selection — the tuple moves as
+  one, and a post-best world edit can never pair with the winning
+  reward. Events: `world_selection_reverted`, `world_variations_updated`;
+  applied edits ride case memory as `world: <id>`.
+- `tests/test_world_edits_loop.py`: 4 tests (render block; packing gated
+  on surface + registered-ID membership through a stubbed diagnose;
+  hallucinated edits dropped without a surface; base_selection revert
+  restores the complete world half with preserved lineage).
+
+Still open in item 4:
+
 - promotion statistics for the diagnoser (per-difficulty-level success /
   traversal stats, §10) are not yet exported from training.
 

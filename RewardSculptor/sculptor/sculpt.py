@@ -172,6 +172,12 @@ class SculptRunResult:
     best_fitness_fresh: float | None = None
     fresh_fitness_per_seed: list[float] = field(default_factory=list)
     best_world_selection_hash: str | None = None
+    #: §env-authoring §10.2: the best iteration's PINNED selection file —
+    #: the world half of the winning training config. World revert and the
+    #: end-of-run best-tuple commit source their five immutable refs
+    #: (world/task/eval/catalog/clarifications) from THIS selection, so a
+    #: later diagnoser world edit can never be paired with the best reward.
+    best_world_selection_path: str | None = None
 
     @property
     def final_reward_path(self) -> Path | None:
@@ -338,13 +344,19 @@ def _pin_authored_selection(adapter: Any, project: Path) -> str | None:
 def _promote_iteration_selection(
     adapter: Any, project: Path, *, reward_path: Path,
     env_spec_version: str | None,
+    base_selection: Path | None = None,
 ) -> tuple[str | None, Path | None]:
     """Atomically bind the iter's reward/env versions to its authored world.
 
-    World/task/evaluation/catalog/clarification refs stay immutable. Only the
-    reward and legacy EnvSpec refs change as the existing loop searches. One
-    selection replace is the commit point, so train and rollout can never see
-    a mixed tuple after a crash.
+    World/task/evaluation/catalog/clarification refs stay immutable within
+    this promotion. Only the reward and legacy EnvSpec refs change as the
+    existing loop searches. One selection replace is the commit point, so
+    train and rollout can never see a mixed tuple after a crash.
+
+    ``base_selection``: source the five immutable refs from THIS pinned
+    selection instead of the adapter's current pointer — the world-half
+    revert/keep-best primitive (§10: revert restores the tuple, never one
+    file in isolation). Reward/env refs still come from the arguments.
     """
     raw = str(getattr(adapter, "world_selection_path", "") or "")
     if not raw:
@@ -352,9 +364,11 @@ def _promote_iteration_selection(
     from sculptor.world.artifacts import ArtifactRef, WorldArtifactStore
 
     store = WorldArtifactStore(project)
-    current = store.read_selection(Path(raw).resolve())
+    source = Path(base_selection).resolve() if base_selection else (
+        Path(raw).resolve())
+    current = store.read_selection(source)
     if current is None:
-        raise ValueError(f"authored world selection missing: {raw}")
+        raise ValueError(f"authored world selection missing: {source}")
     refs = dict(current.refs)
     reward = Path(reward_path).resolve()
     refs["reward"] = ArtifactRef.from_path(
@@ -1225,6 +1239,7 @@ def _run_one_iter(
     fitness_observe_only: bool = False,
     revert_base: Optional[Path] = None,
     env_revert_version: Optional[str] = None,
+    world_revert_selection: Optional[Path] = None,
     human_note: Optional[str] = None,
 ) -> IterOutcome:
     iter_cfg = cfg.get("iteration", {}) or {}
@@ -1380,10 +1395,27 @@ def _run_one_iter(
     # catalog/clarification tuple before any GPU work. The adapter is then
     # pointed at the immutable selection_vN snapshot for both train and
     # rollout. Legacy projects take the no-op path.
+    #
+    # §env-authoring §10.2: when the prior iteration strictly regressed
+    # after a diagnoser world edit, `world_revert_selection` sources the
+    # five immutable world-half refs from the best iteration's pinned
+    # selection — the world reverts in lockstep with the reward/env pair,
+    # as one tuple. No-op when the world never changed (the refs are
+    # identical) or for legacy projects.
+    _adapter_sel = str(getattr(adapter, "world_selection_path", "") or "")
+    if (world_revert_selection is not None and _adapter_sel
+            and Path(world_revert_selection).resolve()
+            != Path(_adapter_sel).resolve()):
+        _emit_event({
+            "type": "world_selection_reverted",
+            "iter": iter_index,
+            "reverted_to": Path(world_revert_selection).name,
+        })
     world_selection_hash, world_selection_path = (
         _promote_iteration_selection(
             adapter, project, reward_path=Path(reward_path_trained),
-            env_spec_version=env_spec_trained)
+            env_spec_version=env_spec_trained,
+            base_selection=world_revert_selection)
     )
     if world_selection_path is not None:
         tuple_snapshot = iter_dir / "artifact_tuple.json"
@@ -1950,6 +1982,85 @@ def _run_one_iter(
                         "reason": f"{type(e).__name__}: {e}"[:300]}],
                 })
 
+    # §env-authoring §10.2: apply diagnoser-proposed world-variation
+    # retargets — the authored-world counterpart of the env edits above.
+    # apply_world_variation_edits validates per edit, re-runs the full
+    # admission gate chain, hard-verifies evaluation byte-invariance, and
+    # promotes one atomic tuple with the existing lineage; the adapter is
+    # then repointed so the NEXT iteration trains under it. Advisory:
+    # any failure logs + emits and the loop continues on the current world.
+    applied_world_edits: list[str] = []
+    if getattr(diagnosis, "proposed_world_edits", None) and not dry_run:
+        _world_pin = str(getattr(adapter, "world_selection_path", "") or "")
+        if not _world_pin:
+            # Diagnose only shows # WORLD_VARIATIONS for authored
+            # projects, so this is belt-and-braces — but never silent.
+            _emit_event({
+                "type": "world_variations_updated",
+                "iter": iter_index,
+                "world_version": None,
+                "applied": [],
+                "rejected": [
+                    {"variation_id": getattr(e, "variation_id", "?"),
+                     "reason": "project has no authored world selection"}
+                    for e in diagnosis.proposed_world_edits
+                ],
+            })
+        else:
+            try:
+                from sculptor.world.project import (
+                    WorldVariationEdit,
+                    apply_world_variation_edits,
+                )
+
+                world_edit_result = apply_world_variation_edits(project, [
+                    WorldVariationEdit(
+                        variation_id=e.variation_id,
+                        new_distribution=e.new_distribution,
+                        rationale=e.rationale,
+                    )
+                    for e in diagnosis.proposed_world_edits
+                ])
+                applied_world_edits = [
+                    a["variation_id"]
+                    for a in (world_edit_result.get("applied") or [])]
+                _new_selection = world_edit_result.get("selection")
+                if _new_selection:
+                    _new_pin = (
+                        project / "env" /
+                        f"selection_v{_new_selection['selection_version']}"
+                        ".json")
+                    adapter.world_selection_path = str(_new_pin.resolve())
+                _emit_event({
+                    "type": "world_variations_updated",
+                    "iter": iter_index,
+                    "world_version": world_edit_result.get("world_version"),
+                    "applied": [
+                        {"variation_id": a["variation_id"],
+                         "old_distribution": a["old_distribution"],
+                         "new_distribution": a["new_distribution"]}
+                        for a in (world_edit_result.get("applied") or [])
+                    ],
+                    "rejected": [
+                        {"variation_id": r.get("variation_id", "?"),
+                         "reason": str(r.get("reason", ""))[:300]}
+                        for r in (world_edit_result.get("rejected") or [])
+                    ],
+                })
+            except Exception as e:  # noqa: BLE001 — world edits are advisory
+                sys.stderr.write(
+                    f"[sculpt] iter {iter_index}: world-variation edits "
+                    f"skipped — {type(e).__name__}: {e}\n")
+                _emit_event({
+                    "type": "world_variations_updated",
+                    "iter": iter_index,
+                    "world_version": None,
+                    "applied": [],
+                    "rejected": [{
+                        "variation_id": "*",
+                        "reason": f"{type(e).__name__}: {e}"[:300]}],
+                })
+
     # §Ship 54-pre (#12): surface the partition-gate report (written by
     # apply_edits into iter_dir/partition_gate.json when a metric steers and
     # there is something to flag) on the loop path, which passes no on_event.
@@ -2087,6 +2198,9 @@ def _run_one_iter(
             # §env generalization 3/4: env-curriculum edits ride the same
             # case-memory channel so the KG learns environment lessons too.
             f"env: {a}" for a in applied_env_edits
+        ] + [
+            # §env-authoring §10.2: world-variation retargets ride it too.
+            f"world: {a}" for a in applied_world_edits
         ],
         fitness_components=fitness_components,
         env_spec_trained=env_spec_trained,
@@ -2513,6 +2627,14 @@ def sculpt_run(
                 # config keep-best/revert operates on.
                 env_revert_version=(
                     result.best_env_spec if revert_base is not None else None),
+                # §env-authoring §10.2: the world half reverts with the
+                # same trigger — the tuple moves as one.
+                world_revert_selection=(
+                    Path(result.best_world_selection_path)
+                    if (revert_base is not None
+                        and result.best_world_selection_path
+                        and Path(result.best_world_selection_path).is_file())
+                    else None),
                 human_note=pending_human_note,
             )
             elapsed = time.time() - t0
@@ -2563,6 +2685,12 @@ def sculpt_run(
                     result.best_fitness_iter = outcome.iter_index
                     result.best_world_selection_hash = (
                         outcome.world_selection_hash)
+                    # §env-authoring §10.2: the best iter's pinned
+                    # selection — world revert + the end-of-run tuple
+                    # commit source their world-half refs from it.
+                    result.best_world_selection_path = (
+                        str(outcome.world_selection_path)
+                        if outcome.world_selection_path else None)
                     # §env generalization 3/4: the env half of the best
                     # (reward, env) training config — revert + end-of-run
                     # selection restore BOTH together.
@@ -2761,9 +2889,19 @@ def sculpt_run(
         # the exact tuple whose checkpoint and fitness won.
         if best_path is not None and best_path.is_file():
             try:
+                # §env-authoring §10.2: source the world-half refs from
+                # the BEST iteration's pinned selection — a diagnoser
+                # world edit after the best iter must not be paired with
+                # the winning reward.
+                _best_base = (
+                    Path(result.best_world_selection_path)
+                    if (result.best_world_selection_path
+                        and Path(result.best_world_selection_path).is_file())
+                    else None)
                 best_hash, best_selection = _promote_iteration_selection(
                     adapter, project, reward_path=best_path,
-                    env_spec_version=result.best_env_spec)
+                    env_spec_version=result.best_env_spec,
+                    base_selection=_best_base)
                 if best_hash:
                     result.best_world_selection_hash = best_hash
                     _emit_event({
