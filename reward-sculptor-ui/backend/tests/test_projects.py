@@ -47,7 +47,11 @@ def test_create_then_get_project(
     slug = body["slug"]
     assert slug == "test-quadruped"
     assert body["display_name"] == "Test Quadruped"
-    assert body["status"] in ("draft", "configured")
+    # "ready" once the user-wide shared KG exists (bootstrap creates it);
+    # "configured" only when KG resolution finds nothing (legacy fix:
+    # the per-project kg/graph.db is never created anymore and used to
+    # pin every project at "configured" forever).
+    assert body["status"] in ("draft", "configured", "ready")
     assert body["adapter_class"] == "sculptor.adapters.gym_sb3.GymSB3Adapter"
 
     # Filesystem: sculpt_init outputs + UI-only dirs.

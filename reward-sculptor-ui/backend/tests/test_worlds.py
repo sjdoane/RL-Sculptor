@@ -141,3 +141,29 @@ def test_ungroundable_prompt_is_422(client: TestClient):
         json={"prompt": "do fifty backflips through a wormhole"},
     )
     assert r.status_code == 422, r.text
+
+
+def test_world_preview_renders_materialized_scene(client: TestClient):
+    """The preview endpoint renders the promoted selection's materialized
+    evaluation MJB (real offscreen MuJoCo render) and caches per
+    selection version + angle."""
+    slug = _make_project(client)
+    assert client.get(f"/projects/{slug}/worlds/preview").status_code == 404
+
+    draft = _author(client, slug)
+    r = client.post(
+        f"/projects/{slug}/worlds/author/apply",
+        json={"session_id": draft["session_id"], "answers": []},
+    )
+    assert r.status_code == 200, r.text
+
+    r = client.get(f"/projects/{slug}/worlds/preview")
+    assert r.status_code == 200, r.text
+    assert r.headers["content-type"] == "image/png"
+    assert r.content[:8] == b"\x89PNG\r\n\x1a\n"
+    # cached: second call byte-identical
+    again = client.get(f"/projects/{slug}/worlds/preview")
+    assert again.content == r.content
+
+    bad = client.get(f"/projects/{slug}/worlds/preview?angle=bogus")
+    assert bad.status_code == 422

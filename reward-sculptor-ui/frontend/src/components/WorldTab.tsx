@@ -76,6 +76,23 @@ export default function WorldTab({ slug }: { slug: string }) {
 
       <div className="rs-card">
         <div className="rs-card-head">
+          <div className="rs-card-title">Evaluation scene</div>
+        </div>
+        <div className="rs-card-pad">
+          <img
+            src={`/api/projects/${slug}/worlds/preview?v=${s.selection.selection_version}`}
+            alt="Materialized evaluation scene"
+            style={{ width: "100%", borderRadius: 8, display: "block" }}
+          />
+          <div className="rs-hintline" style={{ marginTop: 6 }}>
+            Rendered from the materialized evaluation model — exactly the
+            scene fitness is scored on.
+          </div>
+        </div>
+      </div>
+
+      <div className="rs-card">
+        <div className="rs-card-head">
           <div className="rs-card-title">Selection lineage</div>
         </div>
         <div className="rs-card-pad">

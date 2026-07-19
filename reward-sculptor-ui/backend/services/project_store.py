@@ -545,7 +545,17 @@ def _compute_status(project_dir: Path, metadata: dict, n_iters: int) -> ProjectS
         txt = config_path.read_text(encoding="utf-8", errors="replace")
         if "CHANGE_ME" in txt:
             return "draft"
-    kg_db = project_dir / "kg" / "graph.db"
+    # The KG moved to one user-wide shared store (M7 Phase 1); the legacy
+    # per-project kg/graph.db is never created anymore, which pinned every
+    # project at "configured" forever. Resolve through the same helper the
+    # KG routes use (it always returns the shared path) and fall back to
+    # the legacy file only if resolution itself fails.
+    try:
+        from backend.services.kg_store import project_kg_db_path
+
+        kg_db = project_kg_db_path(project_dir)
+    except Exception:  # noqa: BLE001 — status must never raise
+        kg_db = project_dir / "kg" / "graph.db"
     if not kg_db.is_file():
         return "configured"
     if n_iters == 0:

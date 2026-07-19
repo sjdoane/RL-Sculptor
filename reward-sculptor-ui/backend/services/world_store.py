@@ -261,6 +261,36 @@ def selection(project_dir: Path) -> dict[str, Any] | None:
     }
 
 
+def preview(
+    project_dir: Path,
+    *,
+    angle: str = "iso",
+    regenerate: bool = False,
+) -> Path:
+    """Render (and cache) the current selection's materialized evaluation
+    scene. The MJB is the exact compiled model evaluation replays —
+    what you see is what fitness is scored on. Cached per selection
+    version + angle; a new promotion naturally gets a fresh render."""
+    from backend.services.preview_renderer import render_model_preview
+    from sculptor.world.project import load_selected_world
+
+    env_dir = Path(project_dir) / "env"
+    selection_path = env_dir / "selection_current.json"
+    if not selection_path.is_file():
+        raise FileNotFoundError("project has no authored world selection")
+    _store, selected, bundle = load_selected_world(selection_path)
+    manifest = bundle["resolved_eval"]
+    mjb_relative = (manifest.get("materialized_assets") or {}).get(
+        "evaluation_mjb")
+    if not mjb_relative:
+        raise FileNotFoundError(
+            "selection has no materialized evaluation model")
+    out = env_dir / f"world_preview_v{selected.selection_version}_{angle}.png"
+    if out.is_file() and not regenerate:
+        return out
+    return render_model_preview(env_dir / mjb_relative, out, angle)
+
+
 def lineage(project_dir: Path) -> list[dict[str, Any]]:
     """Every immutable promoted selection, oldest first — the CAD-style
     version history of the project's world tuple."""
