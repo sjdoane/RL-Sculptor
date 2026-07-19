@@ -35,8 +35,10 @@ The first implementation slice is complete in commit `f217753`:
 - `tests/test_world_foundation.py`: 11 adversarial contract tests, all passing
   in 1.28 seconds.
 
-The next coherent implementation slice is complete in the working tree and
-awaiting its commit hash:
+The next coherent implementation slice is committed as `82bf032` (also
+fixes the stale `fake_resolve` stub in `test_mission_run.py` for the new
+`channel_catalog` kwarg; full suite re-verified at 2,043 passed / 1
+optional-JAX skip):
 
 - robot-agnostic prompt author + fully paginated clarification/default ledger;
 - deterministic mjlab compiler, complete admission gates, exact materialized

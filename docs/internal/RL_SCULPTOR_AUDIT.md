@@ -271,6 +271,51 @@ treated as regressions.
 Format per entry: date — what changed (files:lines) — why — evidence
 (tests/smoke) — commit.
 
+### 2026-07-18 — external corpus additions from USC robotics contact
+(Lokesh Krishna) + roadmap candidates
+
+Two S-tier works shared by Lokesh Krishna (USC robotics lab) ingested
+into the shared graph with full LLM extraction (doctor clean after:
+2,006 nodes / 2,140 edges / 1,365 embeddings, all pools fresh):
+
+- `paper:2606.19980` — **ENPIRE: Agentic Robot Policy Self-Improvement
+  in the Real World** (NVIDIA GEAR/CMU/Berkeley). Coding agents run a
+  reset→execute→verify→refine loop on physical robots; an Evolution
+  module compares algorithmic branches, reuses successful recipes, and
+  prunes failed hypotheses; 99% pass@8 on real manipulation. 24 nodes /
+  17 edges extracted. This is the hardware analog of the sculpt loop —
+  primary reference for a future hardware deployment path.
+- `paper:krafton-p2p-2026` — **Prompt-to-Policy: Agentic Engineering
+  for RL** (KRAFTON; blog + MIT-licensed repo, no arxiv — ingested from
+  blog + README text sidecar, first non-arxiv Paper node). Pipeline:
+  Intent Elicitor → Reward Author + Judge Author → Code Review →
+  multi-seed×config PPO → Code Judge ∥ VLM video judge → Synthesizer.
+  Independent convergence on the RewardSculptor design; their Intent
+  Elicitor stage independently validates our clarifier protocol.
+  20 nodes / 16 edges extracted.
+
+Candidate roadmap items harvested (NOT implemented — recorded for
+prioritization; none may weaken the metric firewall):
+
+1. **VLM rollout-video judge as an advisory diagnoser input** (P2P):
+   a video-level "does this look like the requested behavior" signal
+   feeding the diagnoser's edit reasoning only — never fitness, never
+   keep/revert, which stay with the calibrated metric firewall.
+2. **Multi-seed × multi-config training per iteration** (P2P): variance
+   over seeds separates reward-design failures from training noise
+   before the diagnoser attributes blame.
+3. **Branch-parallel edit exploration with recipe reuse** (ENPIRE
+   Evolution): explore 2-3 competing edit hypotheses per iteration and
+   prune, rather than the current linear keep-best; successful edit
+   recipes are already partially captured by run-case memory —
+   promotion into reusable "recipes" is the delta.
+4. **Stage-wise behavioral milestones + pass@k** (ENPIRE): first-move /
+   range-satisfaction / first-success milestones as diagnoser
+   observables, and pass@k emergent-retry as an eval-only statistic.
+
+Evidence: `.lokesh_ingest.py` run (transient, deleted after landing);
+`sculpt kg doctor` clean. Commit: this docs commit.
+
 ### 2026-07-18 — KG Phase-0 audit + hardening (substrate for the
 env-authoring milestone)
 
