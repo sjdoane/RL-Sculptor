@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import re
 import tomllib
@@ -72,6 +73,26 @@ def _eval_invariance_errors(
             new.get("materialized_assets")):
         errors.append("materialized evaluation asset bytes changed")
     return errors
+
+
+def evaluation_lineage_for(
+    world: Mapping[str, Any], task: Mapping[str, Any],
+) -> str:
+    """Baseline identity per §6.1: keyed on the SHARED evaluation design
+    only. Train-section, meta, and provenance changes therefore preserve
+    the lineage (and the fitness baseline), while any shared-field change
+    starts a new one. Verifier finding on the earlier
+    ``world-<result_hash>`` keying: result_hash covered train + provenance
+    too, so answering a question explicitly with the default's own value
+    minted a new lineage for a byte-identical evaluation."""
+    payload = json.dumps(
+        {
+            "world_shared": dict((world or {}).get("shared") or {}),
+            "task_shared": dict((task or {}).get("shared") or {}),
+        },
+        sort_keys=True, separators=(",", ":"), default=str,
+    ).encode("utf-8")
+    return "world-" + hashlib.sha256(payload).hexdigest()[:24]
 
 
 def _bump_meta_version(meta: dict[str, Any]) -> None:

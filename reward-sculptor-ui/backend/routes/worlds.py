@@ -71,15 +71,17 @@ async def apply_world(
     slug: str, body: ApplyWorldRequest,
     store: ProjectStore = Depends(get_store),
 ):
-    from sculptor.world.author import AuthoringError, StaleClarificationError
-    from sculptor.world.project import WorldPromotionError
-
     detail = store.get(slug)
     if detail is None:
         return _problem(status.HTTP_404_NOT_FOUND, "Project not found")
     if not sculptor_bridge.sculptor_ok():
         return _problem(status.HTTP_503_SERVICE_UNAVAILABLE,
                         "Sculptor unavailable", sculptor_bridge.sculptor_error())
+    # Sculptor imports only after the availability guard — an unimportable
+    # sculptor must surface as the 503 above, not an ImportError 500.
+    from sculptor.world.author import AuthoringError, StaleClarificationError
+    from sculptor.world.project import WorldPromotionError
+
     try:
         lock = store.acquire_lock(slug)
     except BusyError as exc:

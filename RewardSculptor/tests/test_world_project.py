@@ -238,3 +238,27 @@ def test_eval_invariance_guard_rejects_before_promotion(tmp_path: Path) -> None:
         )
     current = service.store.read_selection()
     assert current.tuple_hash == admitted.promoted.selection.tuple_hash
+
+
+def test_evaluation_lineage_keys_on_shared_design_only() -> None:
+    """§6.1 (verifier finding): lineage must ignore train/meta/provenance
+    so a re-author with identical evaluation design preserves the fitness
+    baseline, while any shared-field change starts a new one."""
+    from sculptor.world.project import evaluation_lineage_for
+
+    world, task = _admissible_world_task()
+    base = evaluation_lineage_for(world, task)
+    assert base.startswith("world-") and len(base) == len("world-") + 24
+
+    import copy as _copy
+
+    trained = _copy.deepcopy(world)
+    trained["train"]["variations"] = [{"id": "x", "target": "/t",
+                                        "class": "state",
+                                        "distribution": {}}]
+    trained["meta"]["parameter_provenance"] = {"/a": "user"}
+    assert evaluation_lineage_for(trained, task) == base
+
+    shared_change = _copy.deepcopy(world)
+    shared_change["shared"]["eval_seed"] = 9999
+    assert evaluation_lineage_for(shared_change, task) != base

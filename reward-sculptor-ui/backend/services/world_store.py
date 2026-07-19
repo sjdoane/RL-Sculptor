@@ -25,6 +25,9 @@ from typing import Any, Iterable, Mapping
 
 _SESSIONS_DIRNAME = "worlds"
 
+#: Abandoned drafts are pruned on the next author() call once this old.
+_SESSION_TTL_S = 14 * 24 * 3600.0
+
 
 class StaleDraftError(RuntimeError):
     """The re-authored draft no longer matches the persisted session."""
@@ -52,6 +55,25 @@ def _session_path(project_dir: Path, session_id: str) -> Path:
     return _sessions_dir(project_dir) / safe / "session.json"
 
 
+def _prune_stale_sessions(project_dir: Path) -> None:
+    """Best-effort TTL prune of abandoned authoring sessions (verifier
+    finding: nothing else ever removed them). Applied sessions carry an
+    applied.json but are pruned too — the promoted tuple in env/ is the
+    durable record; the session dir is only working state."""
+    import shutil
+
+    root = _sessions_dir(project_dir)
+    if not root.is_dir():
+        return
+    cutoff = time.time() - _SESSION_TTL_S
+    for entry in root.iterdir():
+        try:
+            if entry.is_dir() and entry.stat().st_mtime < cutoff:
+                shutil.rmtree(entry, ignore_errors=True)
+        except OSError:  # pragma: no cover — prune must never block authoring
+            continue
+
+
 def author(
     project_dir: Path,
     prompt: str,
@@ -67,6 +89,7 @@ def author(
         grounding_ids,
     )
 
+    _prune_stale_sessions(project_dir)
     items = gather_grounding(prompt) if kg_grounding else ()
     ids = grounding_ids(items)
     context = grounding_context(items)
@@ -140,7 +163,10 @@ def apply(
         ClarificationSubmission,
         apply_clarifications,
     )
-    from sculptor.world.project import WorldProjectService
+    from sculptor.world.project import (
+        WorldProjectService,
+        evaluation_lineage_for,
+    )
 
     session = _load_session(project_dir, session_id)
     draft = _reauthor(session)
@@ -149,7 +175,13 @@ def apply(
             "authored draft no longer reproduces this session (capability "
             "descriptors or author contract changed); re-author first")
 
-    chosen = {str(a["question_id"]): str(a["choice_id"]) for a in answers}
+    chosen: dict[str, str] = {}
+    for entry in answers:
+        question_id = str(entry["question_id"])
+        if question_id in chosen:
+            raise ValueError(
+                f"duplicate answer for clarification question {question_id!r}")
+        chosen[question_id] = str(entry["choice_id"])
     built: list[ClarificationAnswer] = []
     for question in draft.clarification_plan.questions:
         choice_id = chosen.pop(question.question_id, None)
@@ -170,7 +202,9 @@ def apply(
         answers=tuple(built),
     )
     applied = apply_clarifications(draft, submission)
-    lineage = f"world-{applied.result_hash[:24]}"
+    # §6.1: lineage keys on the SHARED evaluation design only — train /
+    # meta / provenance differences preserve the fitness baseline.
+    lineage = evaluation_lineage_for(applied.world_spec, applied.task_spec)
     admitted = WorldProjectService(project_dir).admit_and_promote(
         world=applied.world_spec, task=applied.task_spec,
         clarifications=applied.clarification_ledger,

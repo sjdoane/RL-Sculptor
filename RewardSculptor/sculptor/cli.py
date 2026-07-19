@@ -156,7 +156,10 @@ def world_author(
                 answers=tuple(answers),
             )
         applied = apply_clarifications(draft, submission)
-        lineage = f"world-{applied.result_hash[:24]}"
+        from sculptor.world.project import evaluation_lineage_for
+
+        lineage = evaluation_lineage_for(
+            applied.world_spec, applied.task_spec)
         admitted = WorldProjectService(project_dir).admit_and_promote(
             world=applied.world_spec, task=applied.task_spec,
             clarifications=applied.clarification_ledger,
