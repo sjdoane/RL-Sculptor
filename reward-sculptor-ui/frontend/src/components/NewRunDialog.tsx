@@ -3,8 +3,10 @@ import { toast } from "sonner";
 
 import { Icon } from "@/components/rs/icon";
 import { Btn, Field, Modal, ToggleRow } from "@/components/rs/primitives";
+import { courseBreakdownText } from "@/components/WorldTab";
 import { useCalibrateMetric, useGenerateMetric, useMetricGenProgress, useProjectMetrics } from "@/hooks/useMetrics";
 import { useLaunchRun } from "@/hooks/useRuns";
+import { useWorldSelection } from "@/hooks/useWorlds";
 import { ApiError } from "@/lib/api";
 import type { ProjectDetail } from "@/lib/types";
 import { SPEC_METRIC_NAMES } from "@/lib/types";
@@ -180,6 +182,10 @@ export function NewRunDialog({
   // gets room to escape a local optimum; "" → sculpt default.
   const [fitnessPatience, setFitnessPatience] = useState<number | "">(4);
   const launch = useLaunchRun(slug);
+  // §env-authoring: the authored world this run will train under (404 →
+  // undefined for legacy projects; the atomic selection file drives the
+  // adapter, so this is disclosure, not configuration).
+  const worldSel = useWorldSelection(open ? slug : undefined);
   // §Ship 35: per-project generated metrics + the generate action.
   const projectMetrics = useProjectMetrics(slug, open);
   const genMetric = useGenerateMetric(slug);
@@ -401,6 +407,43 @@ export function NewRunDialog({
               </div>
             )}
           </div>
+
+          {/* §env-authoring: which world this run trains under. Only shown
+              when the project has a promoted authored selection — legacy
+              projects train the config.toml task on the default scene. */}
+          {worldSel.data && (
+            <div
+              style={{
+                display: "flex", flexDirection: "column", gap: 4,
+                borderRadius: "var(--radius-md)", padding: "10px 13px", fontSize: 12,
+                border: "1px solid var(--hairline)", background: "var(--surface-strong)",
+                color: "var(--rs-muted)",
+              }}
+            >
+              <div style={{ display: "flex", alignItems: "center", gap: 7, fontWeight: 600 }}>
+                <Icon name="globe" size={14} />
+                <span>
+                  Training world: authored selection{" "}
+                  <strong>v{worldSel.data.selection.selection_version}</strong>
+                  {" · "}{worldSel.data.shared_summary.robot ?? "—"}
+                  {" · "}{worldSel.data.shared_summary.terrain_kind ?? "plane"}
+                  {" · "}
+                  {courseBreakdownText(
+                    worldSel.data.shared_summary.course_breakdown,
+                    worldSel.data.shared_summary.course_elements,
+                  )}
+                </span>
+              </div>
+              {worldSel.data.shared_summary.robot_matches_project === false && (
+                <div style={{ fontSize: 11, lineHeight: 1.45, color: "var(--st-amber-fg)" }}>
+                  This world&apos;s robot differs from the project robot
+                  ({worldSel.data.shared_summary.project_capability_id}) — the run
+                  trains the authored world&apos;s robot. Re-author from the World
+                  tab if that is unintended.
+                </div>
+              )}
+            </div>
+          )}
 
           <div className="rs-mtabs">
             <button className={tab === "basic" ? "on" : ""} onClick={() => setTab("basic")}>Basic</button>

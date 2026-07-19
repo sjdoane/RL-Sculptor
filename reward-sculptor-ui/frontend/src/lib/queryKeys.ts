@@ -76,4 +76,5 @@ export const qk = {
   worldSelection: (slug: string) => ["worldSelection", slug] as const,
   worldLineage: (slug: string) => ["worldLineage", slug] as const,
   worldCurriculum: (slug: string) => ["worldCurriculum", slug] as const,
+  worldScene: (slug: string) => ["worldScene", slug] as const,
 };

@@ -10,9 +10,12 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   applyWorldAuthor,
   authorWorld,
+  editWorldVariations,
   getWorldCurriculum,
   getWorldLineage,
+  getWorldScene,
   getWorldSelection,
+  previewWorldDraft,
 } from "@/lib/api";
 import type { WorldCurriculum } from "@/lib/types";
 import { qk } from "@/lib/queryKeys";
@@ -21,7 +24,9 @@ import type {
   WorldApplyResponse,
   WorldAuthorRequest,
   WorldAuthorResponse,
+  WorldDraftPreview,
   WorldLineageEntry,
+  WorldScene,
   WorldSelection,
 } from "@/lib/types";
 
@@ -55,6 +60,45 @@ export function useWorldCurriculum(slug: string | undefined) {
   });
 }
 
+export function useWorldScene(slug: string | undefined, enabled = true) {
+  return useQuery<WorldScene>({
+    queryKey: slug ? qk.worldScene(slug) : ["worldScene", "_none"],
+    queryFn: () => getWorldScene(slug!),
+    enabled: !!slug && enabled,
+    // The scene is immutable per selection version; invalidation on
+    // promote (below) is the only refresh that matters.
+    staleTime: Infinity,
+    retry: false,
+  });
+}
+
+/** Gated dry-run for the build loop — returns the admission report +
+ *  compiled draft scene without promoting anything. */
+export function usePreviewWorldDraft(slug: string) {
+  return useMutation<WorldDraftPreview, Error, WorldApplyRequest>({
+    mutationFn: (body) => previewWorldDraft(slug, body),
+  });
+}
+
+/** Train-variation edits on the promoted world (tweak-a-dimension loop).
+ *  Promotes a new selection version under the same evaluation lineage,
+ *  so every world query refreshes. */
+export function useEditWorldVariations(slug: string) {
+  const qc = useQueryClient();
+  return useMutation<
+    import("@/lib/types").WorldVariationEditResult,
+    Error,
+    Parameters<typeof editWorldVariations>[1]
+  >({
+    mutationFn: (body) => editWorldVariations(slug, body),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: qk.worldSelection(slug) });
+      qc.invalidateQueries({ queryKey: qk.worldLineage(slug) });
+      qc.invalidateQueries({ queryKey: qk.worldScene(slug) });
+    },
+  });
+}
+
 export function useAuthorWorld(slug: string) {
   return useMutation<WorldAuthorResponse, Error, WorldAuthorRequest>({
     mutationFn: (body) => authorWorld(slug, body),
@@ -68,6 +112,7 @@ export function useApplyWorldAuthor(slug: string) {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: qk.worldSelection(slug) });
       qc.invalidateQueries({ queryKey: qk.worldLineage(slug) });
+      qc.invalidateQueries({ queryKey: qk.worldScene(slug) });
       qc.invalidateQueries({ queryKey: qk.project(slug) });
     },
   });

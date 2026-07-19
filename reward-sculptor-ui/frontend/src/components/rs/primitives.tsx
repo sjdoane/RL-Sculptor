@@ -33,6 +33,10 @@ export const STATUS_META: Record<string, StatusMeta> = {
   // §mission-persistence: replaced by redecomposition children; terminal,
   // non-alarming (artifacts retained) — distinct from "failed".
   superseded: { label: "Superseded", cls: "slate",   icon: "git-branch" },
+  // §env-authoring: a promoted world selection — terminal + healthy. NOT
+  // "running": lineage entries are immutable history, and a spinner there
+  // reads as a stuck load.
+  promoted:   { label: "Promoted",   cls: "emerald", icon: "check-circle" },
 };
 
 export function Badge({

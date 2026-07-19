@@ -1248,3 +1248,42 @@ export async function getWorldCurriculum(
     await fetch(`/api/projects/${slug}/worlds/curriculum`),
   );
 }
+
+export async function getWorldScene(
+  slug: string,
+): Promise<import("./types").WorldScene> {
+  return handle<import("./types").WorldScene>(
+    await fetch(`/api/projects/${slug}/worlds/scene`),
+  );
+}
+
+export async function editWorldVariations(
+  slug: string,
+  body: { edits: { variation_id: string;
+    distribution: Record<string, unknown>; rationale?: string }[] },
+): Promise<import("./types").WorldVariationEditResult> {
+  return handle<import("./types").WorldVariationEditResult>(
+    await fetch(`/api/projects/${slug}/worlds/variations`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(120_000),
+    }),
+  );
+}
+
+/** Gated dry-run of an authoring session (build loop). The gate chain
+ *  runs a real MuJoCo compile server-side — allow it a generous client
+ *  timeout rather than failing a slow first compile. */
+export async function previewWorldDraft(
+  slug: string, body: WorldApplyRequest,
+): Promise<import("./types").WorldDraftPreview> {
+  return handle<import("./types").WorldDraftPreview>(
+    await fetch(`/api/projects/${slug}/worlds/author/preview`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(120_000),
+    }),
+  );
+}

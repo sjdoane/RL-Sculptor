@@ -22,6 +22,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from backend.models.world import (
     ApplyWorldRequest,
     AuthorWorldRequest,
+    EditVariationsRequest,
     WorldApplySummary,
     WorldDraftSummary,
 )
@@ -102,6 +103,93 @@ async def apply_world(
                         "World not admitted", f"{type(exc).__name__}: {exc}")
     finally:
         lock.release()
+
+
+@router.post("/projects/{slug}/worlds/author/preview")
+async def preview_world_draft(
+    slug: str, body: ApplyWorldRequest,
+    store: ProjectStore = Depends(get_store),
+):
+    """Gated dry-run of an authoring session (the iterative build loop):
+    apply the answers, run the full admission gate chain, and return the
+    gate report + compiled scene graph WITHOUT promoting. Admission
+    violations come back in the payload (ok=false), not as an error —
+    the builder UI renders them next to the questions."""
+    detail = store.get(slug)
+    if detail is None:
+        return _problem(status.HTTP_404_NOT_FOUND, "Project not found")
+    if not sculptor_bridge.sculptor_ok():
+        return _problem(status.HTTP_503_SERVICE_UNAVAILABLE,
+                        "Sculptor unavailable", sculptor_bridge.sculptor_error())
+    from sculptor.world.author import StaleClarificationError
+    from sculptor.world.project import WorldPromotionError
+
+    try:
+        return await run_in_threadpool(
+            world_store.preview_draft, Path(detail.project_dir),
+            body.session_id,
+            [answer.model_dump() for answer in body.answers])
+    except world_store.UnknownSessionError:
+        return _problem(status.HTTP_404_NOT_FOUND, "Authoring session not found")
+    except (world_store.StaleDraftError, StaleClarificationError) as exc:
+        return _problem(status.HTTP_409_CONFLICT, "Stale draft", str(exc))
+    except (ValueError, WorldPromotionError) as exc:
+        # WorldPromotionError here = malformed project config surfacing
+        # from the runtime-task lookup — same 422 contract as apply.
+        return _problem(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        "Invalid answers", f"{type(exc).__name__}: {exc}")
+
+
+@router.post("/projects/{slug}/worlds/variations")
+async def edit_world_variations(
+    slug: str, body: EditVariationsRequest,
+    store: ProjectStore = Depends(get_store),
+):
+    """Edit registered train.variations by stable id (the CAD-style
+    tweak-a-dimension loop on the promoted world). Train-only by
+    construction: the sculptor primitive re-runs the full gate chain,
+    promotes under the EXISTING evaluation lineage, and hard-verifies
+    the frozen evaluation is byte-identical — an edit that could move
+    the baseline rejects the whole promotion."""
+    detail = store.get(slug)
+    if detail is None:
+        return _problem(status.HTTP_404_NOT_FOUND, "Project not found")
+    if not sculptor_bridge.sculptor_ok():
+        return _problem(status.HTTP_503_SERVICE_UNAVAILABLE,
+                        "Sculptor unavailable", sculptor_bridge.sculptor_error())
+    from sculptor.world.project import WorldPromotionError
+
+    try:
+        lock = store.acquire_lock(slug)
+    except BusyError as exc:
+        return _problem(status.HTTP_409_CONFLICT, "Project busy", str(exc))
+    try:
+        return await run_in_threadpool(
+            world_store.edit_variations, Path(detail.project_dir),
+            [edit.model_dump() for edit in body.edits])
+    except (ValueError, WorldPromotionError) as exc:
+        return _problem(status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        "Variation edit not admitted",
+                        f"{type(exc).__name__}: {exc}")
+    finally:
+        lock.release()
+
+
+@router.get("/projects/{slug}/worlds/scene")
+async def world_scene(
+    slug: str, store: ProjectStore = Depends(get_store),
+):
+    """Scene graph of the promoted selection's materialized evaluation
+    model, for the interactive 3D viewer."""
+    detail = store.get(slug)
+    if detail is None:
+        return _problem(status.HTTP_404_NOT_FOUND, "Project not found")
+    try:
+        return await run_in_threadpool(
+            world_store.scene, Path(detail.project_dir))
+    except FileNotFoundError as exc:
+        return _problem(status.HTTP_404_NOT_FOUND, "No authored world",
+                        str(exc))
 
 
 @router.get("/projects/{slug}/worlds/selection")

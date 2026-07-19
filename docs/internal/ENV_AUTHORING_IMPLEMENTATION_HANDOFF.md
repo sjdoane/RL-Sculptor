@@ -203,6 +203,66 @@ design + Prompt2Policy source evidence in `RL_SCULPTOR_AUDIT.md`
 (2026-07-19 entry). Advisory only; the metric firewall stays
 authoritative.
 
+The 2026-07-19 legibility + interactive-world session (three slices, each
+verified with full suites, live-browser E2E, and an adversarial subagent):
+
+- **World-tab legibility + robot guard.** Root causes of the "G1 behind
+  the boxes" report: (1) previews rendered MjData defaults — a Go1 at
+  qpos0 has fully extended legs and reads as a humanoid at thumbnail
+  size; `preview_renderer._posed_data` now applies keyframe 0 before
+  every render; (2) a blank robot field auto-selected from the PROMPT
+  (live-reproduced: parkour prompt on a Go1 project drafted
+  `unitree_g1:base`); `world_store.author` now defaults to the project's
+  robot via `project_capability_id` (metadata `library_slug` ↔
+  capability `asset_id`) and the resolved id is persisted so re-author
+  stays deterministic. Author + selection responses carry
+  `project_capability_id` / `robot_matches_project`; the UI banners any
+  mismatch (WorldTab, AuthorWorldDialog, NewRunDialog). Also:
+  `course_breakdown` per element type ("5 elements — 3 platform · 2 gap
+  (gaps are spacing — no geometry)"), lineage badges are
+  `promoted`/`superseded` (never the spinning `running`), and the
+  authored world surfaces on Overview (`AuthoredWorldCard`) and in the
+  launch dialog ("Training world: …").
+- **Interactive 3D world view + gated build loop.**
+  `backend/services/scene_export.py` walks a compiled model posed at
+  keyframe 0 into a JSON scene graph (geoms/meshes/hfields/zone sites +
+  semantic entity index from the compiler's stable names:
+  `obstacle__<id>__`, `zone__`, `robot/`; synthetic translucent markers
+  for geometry-less gaps). `GET /worlds/scene` exports the promoted
+  selection's materialized MJB (cache `env/world_scene_v<N>.json`);
+  `POST /worlds/author/preview` is a gated DRY-RUN of an authoring
+  session — `_clarified_bundle` (shared with apply, so answer semantics
+  cannot diverge) → `run_admission_gates` materialized under
+  `worlds/<session>/preview_<hash>/` — env/ untouched, promotion still
+  only via apply. Frontend: `WorldViewer3D.tsx` (three.js 0.185,
+  orbit/pan/zoom, Z-up, raycast click-select, collision groups ≥3
+  hidden), `WorldEntityInspector.tsx` (entity chips + WorldSpec params +
+  variations), WorldTab viewer with PNG fallback, and the full-screen
+  builder in `AuthorWorldDialog` (auto-preview on draft, stale flag on
+  answer change, per-gate chip strip, promote via the unchanged apply
+  path). External CAD round-tripping was evaluated and rejected: mesh
+  edits cannot re-enter the typed spec, so they would bypass the
+  clarifier/gates and orphan the artifacts as source of truth.
+- **Human train-variation edits + a real invariance bug.**
+  `POST /worlds/variations` exposes `apply_world_variation_edits` (§10.2)
+  to the UI; uniform distributions are editable in place in the
+  inspector, each apply promotes a new selection version under the SAME
+  evaluation lineage. Building its test exposed a latent core bug:
+  `_eval_invariance_errors` compared parsed-JSON lists against fresh
+  dataclass tuples, so EVERY train-only edit on a course world was
+  falsely rejected as "evaluation field 'course' changed" (the
+  diagnoser's advisory path had swallowed this silently). Fixed with a
+  canonical-JSON comparison (`_canonical_json` in `world/project.py`);
+  real drift still rejects. Live proof in the lineage UI: a v2→v3
+  variation edit keeps `eval_model_hash` byte-identical while the
+  v1→v2 re-author starts a new lineage.
+
+Verification for the session: RewardSculptor 2,074 passed / 1 skip; UI
+backend 550 passed (20 in `test_worlds.py`, 7 new); `tsc -b` and
+`vite build` clean; live author→preview→answer-edit→promote→
+variation-edit E2E driven through the running dev servers with the
+in-app browser, including scene click-to-inspect both directions.
+
 The active plan is:
 
 1. capability descriptors plus strict WorldSpec/TaskSpec and persistence (done);

@@ -10,8 +10,9 @@ import { NewRunDialog } from "@/components/NewRunDialog";
 import { RewardsTab } from "@/components/RewardsTab";
 import { RobotConfig } from "@/components/RobotConfig";
 import { RobotViewer } from "@/components/RobotViewer";
-import WorldTab from "@/components/WorldTab";
+import WorldTab, { courseBreakdownText } from "@/components/WorldTab";
 import { useLibraryRobot } from "@/hooks/useLibrary";
+import { useWorldSelection } from "@/hooks/useWorlds";
 import { usePhysics } from "@/hooks/usePhysics";
 import { usePolicies } from "@/hooks/usePolicies";
 import { useProject } from "@/hooks/useProjects";
@@ -331,10 +332,54 @@ function OverviewTab({
             </div>
           </div>
 
+          <AuthoredWorldCard slug={slug} onGoTo={onGoTo} />
+
           {configured && (robot?.library_name || project.library_slug) && (
             <RobotLibraryCard slug={slug} librarySlug={(robot?.library_name ?? project.library_slug)!} />
           )}
         </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Authored world (env-authoring): the world training runs under ─────
+function AuthoredWorldCard({ slug, onGoTo }: { slug: string; onGoTo: (tab: TabValue) => void }) {
+  const selection = useWorldSelection(slug);
+  const s = selection.data;
+  if (!s) return null; // no authored world yet — the World tab is the entry point
+  const mismatch = s.shared_summary.robot_matches_project === false;
+  return (
+    <div className="rs-card">
+      <div className="rs-card-head">
+        <div className="rs-card-title"><Icon name="globe" size={16} />Authored world</div>
+        <Btn kind="ghost" size="sm" icon="arrow-right" onClick={() => onGoTo("world")}>World tab</Btn>
+      </div>
+      <div className="rs-kv">
+        <div className="k">selection</div>
+        <div className="v mono">v{s.selection.selection_version} · {s.selection.tuple_hash.slice(0, 12)}</div>
+        <div className="k">robot</div>
+        <div className="v">
+          {s.shared_summary.robot ?? "—"}
+          {mismatch && (
+            <span style={{ color: "var(--st-amber-fg)", marginLeft: 6 }}>
+              ≠ project robot
+            </span>
+          )}
+        </div>
+        <div className="k">terrain</div>
+        <div className="v">{s.shared_summary.terrain_kind ?? "plane"}</div>
+        <div className="k">course</div>
+        <div className="v">{courseBreakdownText(s.shared_summary.course_breakdown, s.shared_summary.course_elements)}</div>
+        {s.world_meta.prompt && (
+          <><div className="k">prompt</div><div className="v" style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={s.world_meta.prompt}>{s.world_meta.prompt}</div></>
+        )}
+      </div>
+      <div className="rs-card-pad" style={{ paddingTop: 8 }}>
+        <p className="rs-hintline" style={{ margin: 0 }}>
+          Sculpt runs on this project train and evaluate inside this world
+          (atomic selection <span className="mono">{s.selection.evaluation_lineage}</span>).
+        </p>
       </div>
     </div>
   );

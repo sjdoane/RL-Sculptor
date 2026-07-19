@@ -1450,6 +1450,10 @@ export interface WorldAuthorResponse {
   session_id: string;
   draft_hash: string;
   capability_id: string;
+  /** The project's configured robot as a capability id (null when no
+   *  capability descriptor maps to it) + whether the draft matches it. */
+  project_capability_id: string | null;
+  robot_matches_project: boolean | null;
   clarification_plan: WorldClarificationPlan;
   underspecification_report: {
     defaulted_load_bearing_paths: string[];
@@ -1487,7 +1491,13 @@ export interface WorldSelection {
     objects: string[];
     zones: string[];
     course_elements: number;
+    /** Per-element-type counts (e.g. {platform: 3, gap: 2}) — gaps are
+     *  spacing elements with no geometry, so the total can exceed what
+     *  the rendered scene shows as solids. */
+    course_breakdown: Record<string, number>;
     robot: string | null;
+    project_capability_id: string | null;
+    robot_matches_project: boolean | null;
   };
   goal: { [extra: string]: unknown };
   train_variations: {
@@ -1533,4 +1543,95 @@ export interface WorldCurriculumIteration {
 export interface WorldCurriculum {
   run: string | null;
   iterations: WorldCurriculumIteration[];
+}
+
+// ── World scene graph (interactive 3D viewer) ──────────────────────────
+export interface WorldSceneGeom {
+  name: string;
+  body: string;
+  type: string; // plane | hfield | sphere | capsule | ellipsoid | cylinder | box | mesh
+  size: number[];
+  pos: number[];
+  quat: number[]; // [w, x, y, z]
+  rgba: number[];
+  group: number;
+  entity_kind: string; // course_element | robot | terrain | object | zone
+  entity_id: string;
+  mesh?: string;
+  hfield?: string;
+}
+
+export interface WorldSceneSite {
+  name: string;
+  type: string;
+  size: number[];
+  pos: number[];
+  quat: number[];
+  rgba: number[];
+  entity_kind: string;
+  entity_id: string;
+}
+
+export interface WorldSceneEntity {
+  kind: string;
+  id: string;
+  label: string;
+  element?: string;
+  params: Record<string, unknown>;
+  variations: {
+    id: string; target: string; class: string;
+    distribution: Record<string, unknown>;
+  }[];
+  geoms: string[];
+  sites?: string[];
+  /** Synthetic translucent box for geometry-less elements (gaps). */
+  marker?: { pos: number[]; size: number[] };
+}
+
+export interface WorldScene {
+  selection_version?: number;
+  tuple_hash?: string;
+  meshes: Record<string, { vertices: number[]; faces: number[] }>;
+  hfields: Record<string, {
+    nrow: number; ncol: number; size: number[]; data: number[];
+  }>;
+  geoms: WorldSceneGeom[];
+  sites: WorldSceneSite[];
+  entities: WorldSceneEntity[];
+}
+
+export interface WorldVariationEditResult {
+  applied: {
+    variation_id: string;
+    old_distribution: Record<string, unknown>;
+    new_distribution: Record<string, unknown>;
+    rationale: string;
+  }[];
+  rejected: { variation_id: string; reason: string }[];
+  selection: { selection_version: number;
+    [extra: string]: unknown } | null;
+  world_version: string | null;
+}
+
+export interface WorldDraftPreview {
+  ok: boolean;
+  session_id: string;
+  result_hash: string;
+  admission: {
+    ok: boolean;
+    gates: {
+      gate: string; ok: boolean;
+      violations: { code: string; message: string;
+        [extra: string]: unknown }[];
+    }[];
+  };
+  scene: WorldScene | null;
+  summary: {
+    robot: string | null;
+    terrain_kind: string | null;
+    course_elements: number;
+    course_breakdown: Record<string, number>;
+    objects: string[];
+    zones: string[];
+  };
 }

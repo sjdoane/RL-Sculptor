@@ -74,6 +74,30 @@ def _prune_stale_sessions(project_dir: Path) -> None:
             continue
 
 
+def project_capability_id(project_dir: Path) -> str | None:
+    """The registered robot capability matching the project's configured
+    robot (metadata.json robot_source.library_slug ↔ capability asset_id);
+    None when the project has no library robot or no capability maps to it
+    (gym robots, uploads)."""
+    meta_path = Path(project_dir) / "metadata.json"
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    robot_source = meta.get("robot_source") if isinstance(meta, dict) else None
+    if not isinstance(robot_source, Mapping):
+        return None
+    slug = str(robot_source.get("library_slug") or "")
+    if not slug:
+        return None
+    from sculptor.world.capabilities import robot_capabilities
+
+    matches = sorted(
+        cap_id for cap_id, cap in robot_capabilities().items()
+        if getattr(cap, "asset_id", None) == slug)
+    return matches[0] if matches else None
+
+
 def author(
     project_dir: Path,
     prompt: str,
@@ -81,7 +105,13 @@ def author(
     robot_capability_id: str | None = None,
     kg_grounding: bool = True,
 ) -> dict[str, Any]:
-    """Author a draft + clarification plan; persist the session inputs."""
+    """Author a draft + clarification plan; persist the session inputs.
+
+    A blank robot defaults to the PROJECT's configured robot when a
+    capability descriptor maps to it — the world the run trains under
+    must not silently swap the robot out from under the project. The
+    author's prompt-based auto-selection only applies when the project
+    robot has no capability mapping."""
     from sculptor.world.author import author_environment
     from sculptor.world.grounding import (
         gather_grounding,
@@ -90,6 +120,9 @@ def author(
     )
 
     _prune_stale_sessions(project_dir)
+    project_capability = project_capability_id(project_dir)
+    if robot_capability_id is None:
+        robot_capability_id = project_capability
     items = gather_grounding(prompt) if kg_grounding else ()
     ids = grounding_ids(items)
     context = grounding_context(items)
@@ -118,6 +151,10 @@ def author(
         "session_id": session_id,
         "draft_hash": draft.draft_hash,
         "capability_id": draft.capability_id,
+        "project_capability_id": project_capability,
+        "robot_matches_project": (
+            None if project_capability is None
+            else draft.capability_id == project_capability),
         "clarification_plan": draft.clarification_plan.to_dict(),
         "underspecification_report":
             draft.underspecification_report.to_dict(),
@@ -144,28 +181,22 @@ def _reauthor(session: Mapping[str, Any]):
     )
 
 
-def apply(
+def _clarified_bundle(
     project_dir: Path,
     session_id: str,
-    answers: Iterable[Mapping[str, str]] = (),
-) -> dict[str, Any]:
-    """Apply clarification answers and atomically admit + promote.
-
-    Unanswered questions take their disclosed system default (the
-    clarifier protocol's "system decides" option) with ``default``
-    provenance; explicit answers record ``user`` provenance. Unknown
-    question ids raise ``ValueError`` (a stale/foreign answer set must
-    not be silently ignored).
-    """
+    answers: Iterable[Mapping[str, str]],
+):
+    """Re-author the persisted session, verify the draft hash, and apply
+    the answer set. Shared by apply (admit + promote) and preview_draft
+    (gated dry-run) so the two can never diverge on answer semantics:
+    unanswered questions take their disclosed system default with
+    ``default`` provenance, explicit answers record ``user``, and unknown
+    question ids raise ``ValueError``."""
     from sculptor.world.author import (
         CLARIFICATION_VERSION,
         ClarificationAnswer,
         ClarificationSubmission,
         apply_clarifications,
-    )
-    from sculptor.world.project import (
-        WorldProjectService,
-        evaluation_lineage_for,
     )
 
     session = _load_session(project_dir, session_id)
@@ -201,7 +232,21 @@ def apply(
         question_set_hash=draft.clarification_plan.question_set_hash,
         answers=tuple(built),
     )
-    applied = apply_clarifications(draft, submission)
+    return draft, apply_clarifications(draft, submission)
+
+
+def apply(
+    project_dir: Path,
+    session_id: str,
+    answers: Iterable[Mapping[str, str]] = (),
+) -> dict[str, Any]:
+    """Apply clarification answers and atomically admit + promote."""
+    from sculptor.world.project import (
+        WorldProjectService,
+        evaluation_lineage_for,
+    )
+
+    draft, applied = _clarified_bundle(project_dir, session_id, answers)
     # §6.1: lineage keys on the SHARED evaluation design only — train /
     # meta / provenance differences preserve the fitness baseline.
     lineage = evaluation_lineage_for(applied.world_spec, applied.task_spec)
@@ -228,6 +273,143 @@ def apply(
     return result
 
 
+def preview_draft(
+    project_dir: Path,
+    session_id: str,
+    answers: Iterable[Mapping[str, str]] = (),
+) -> dict[str, Any]:
+    """Gated dry-run of an authoring session: apply the answers, run the
+    FULL admission gate chain, and return the gate report plus the
+    compiled scene graph — without promoting anything.
+
+    This is the iterative build loop: adjust answers → preview the real
+    compiled scene → promote (via ``apply``) when satisfied. All
+    artifacts live under ``worlds/<session>/preview_<hash>/`` — the
+    authoritative ``env/`` tuple is untouched, so the evaluation freeze
+    and atomic-selection invariants cannot be affected. Results are
+    cached per (draft, answers) since the author + compiler are
+    deterministic.
+    """
+    import hashlib
+
+    from sculptor.world.gates import run_admission_gates
+    from sculptor.world.project import WorldProjectService
+
+    canonical = json.dumps(
+        sorted(
+            ({"question_id": str(a["question_id"]),
+              "choice_id": str(a["choice_id"])} for a in answers),
+            key=lambda a: a["question_id"]),
+        sort_keys=True)
+    session_dir = _sessions_dir(project_dir) / session_id
+    draft, applied = _clarified_bundle(
+        project_dir, session_id, json.loads(canonical))
+    cache_key = hashlib.sha256(
+        (draft.draft_hash + canonical).encode()).hexdigest()[:16]
+    preview_dir = session_dir / f"preview_{cache_key}"
+    cached = preview_dir / "preview.json"
+    if cached.is_file():
+        return json.loads(cached.read_text(encoding="utf-8"))
+
+    service = WorldProjectService(project_dir)
+    report, compiled = run_admission_gates(
+        applied.world_spec, applied.task_spec,
+        materialize_dir=preview_dir / "assets",
+        runtime_task_id=service._runtime_task_id())
+
+    scene = None
+    if compiled is not None and compiled._model is not None:
+        from backend.services.scene_export import scene_from_model
+
+        scene = scene_from_model(compiled._model, applied.world_spec)
+
+    shared = applied.world_spec.get("shared") or {}
+    course = (shared.get("obstacles") or {}).get("course") or []
+    breakdown: dict[str, int] = {}
+    for element in course:
+        kind = str(element.get("element") or "?")
+        breakdown[kind] = breakdown.get(kind, 0) + 1
+    result = {
+        "ok": bool(report.ok),
+        "session_id": session_id,
+        "result_hash": applied.result_hash,
+        "admission": report.to_dict(),
+        "scene": scene,
+        "summary": {
+            "robot": (shared.get("robot") or {}).get("capability_id"),
+            "terrain_kind": (shared.get("terrain") or {}).get("kind"),
+            "course_elements": len(course),
+            "course_breakdown": breakdown,
+            "objects": sorted((shared.get("objects") or {}).keys()),
+            "zones": sorted((shared.get("zones") or {}).keys()),
+        },
+    }
+    preview_dir.mkdir(parents=True, exist_ok=True)
+    _atomic_write_json(cached, result)
+    return result
+
+
+def edit_variations(
+    project_dir: Path,
+    edits: Iterable[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Human-scale train-variation edits from the World UI — the same
+    §10.2 primitive the diagnoser uses: per-edit validation + rollback,
+    meta.version bump, full re-admission, atomic promotion under the
+    EXISTING evaluation lineage, and a hard proof the frozen evaluation
+    did not move. Returns the sculptor result dict (applied / rejected /
+    new selection)."""
+    from sculptor.world.project import (
+        WorldVariationEdit,
+        apply_world_variation_edits,
+    )
+
+    built = [
+        WorldVariationEdit(
+            variation_id=str(edit["variation_id"]),
+            new_distribution=dict(edit["distribution"]),
+            rationale=str(edit.get("rationale") or "ui-edit"),
+        )
+        for edit in edits
+    ]
+    if not built:
+        raise ValueError("no edits supplied")
+    return apply_world_variation_edits(Path(project_dir), built)
+
+
+def scene(project_dir: Path) -> dict[str, Any]:
+    """Scene graph of the PROMOTED selection's materialized evaluation
+    model — the exact compiled scene fitness is scored on, cached per
+    selection version."""
+    env_dir = Path(project_dir) / "env"
+    selection_path = env_dir / "selection_current.json"
+    if not selection_path.is_file():
+        raise FileNotFoundError("project has no authored world selection")
+    from sculptor.world.project import load_selected_world
+
+    _store, selected, bundle = load_selected_world(selection_path)
+    cached = env_dir / f"world_scene_v{selected.selection_version}.json"
+    if cached.is_file():
+        return json.loads(cached.read_text(encoding="utf-8"))
+
+    manifest = bundle["resolved_eval"]
+    mjb_relative = (manifest.get("materialized_assets") or {}).get(
+        "evaluation_mjb")
+    if not mjb_relative:
+        raise FileNotFoundError(
+            "selection has no materialized evaluation model")
+    import mujoco
+
+    from backend.services.scene_export import scene_from_model
+
+    model = mujoco.MjModel.from_binary_path(str(env_dir / mjb_relative))
+    payload = scene_from_model(model, bundle["world"])
+    payload["selection_version"] = selected.selection_version
+    payload["tuple_hash"] = selected.tuple_hash
+    _atomic_write_json(cached, payload)
+    return payload
+
+
 def selection(project_dir: Path) -> dict[str, Any] | None:
     """The authoritative promoted tuple, shaped for display; None when the
     project has no authored world yet."""
@@ -240,6 +422,13 @@ def selection(project_dir: Path) -> dict[str, Any] | None:
     world = bundle["world"]
     task = bundle["task"]
     shared = world.get("shared", {})
+    course = (shared.get("obstacles") or {}).get("course") or []
+    breakdown: dict[str, int] = {}
+    for element in course:
+        kind = str(element.get("element") or "?")
+        breakdown[kind] = breakdown.get(kind, 0) + 1
+    world_robot = (shared.get("robot") or {}).get("capability_id")
+    project_capability = project_capability_id(project_dir)
     return {
         "selection": selected.to_dict(),
         "world_meta": world.get("meta", {}),
@@ -248,9 +437,13 @@ def selection(project_dir: Path) -> dict[str, Any] | None:
             "terrain_kind": (shared.get("terrain") or {}).get("kind"),
             "objects": sorted((shared.get("objects") or {}).keys()),
             "zones": sorted((shared.get("zones") or {}).keys()),
-            "course_elements": len(
-                (shared.get("obstacles") or {}).get("course") or []),
-            "robot": (shared.get("robot") or {}).get("capability_id"),
+            "course_elements": len(course),
+            "course_breakdown": breakdown,
+            "robot": world_robot,
+            "project_capability_id": project_capability,
+            "robot_matches_project": (
+                None if project_capability is None
+                else world_robot == project_capability),
         },
         "goal": (task.get("shared") or {}).get("goal", {}),
         "train_variations": [

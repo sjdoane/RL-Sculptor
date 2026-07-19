@@ -35,6 +35,18 @@ class ApplyWorldRequest(BaseModel):
             "disclosed system default."))
 
 
+class VariationEditBody(BaseModel):
+    variation_id: str
+    distribution: dict = Field(description=(
+        "COMPLETE replacement distribution for the registered variation, "
+        "e.g. {'kind': 'uniform', 'low': 0.1, 'high': 0.4}."))
+    rationale: str = ""
+
+
+class EditVariationsRequest(BaseModel):
+    edits: list[VariationEditBody] = Field(min_length=1)
+
+
 class WorldDraftSummary(BaseModel, extra="allow"):
     session_id: str
     draft_hash: str

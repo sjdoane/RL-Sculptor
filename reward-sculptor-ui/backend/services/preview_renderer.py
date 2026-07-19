@@ -216,6 +216,21 @@ async def render_static_async(
 
 
 # ── implementation ────────────────────────────────────────────────────
+def _posed_data(model: Any) -> Any:
+    """MjData posed for a legible still: keyframe 0 when the model has
+    one (robot assets and compiled evaluation scenes carry an
+    init/home keyframe), else the model default. Without this, a
+    quadruped renders at qpos0 with fully extended legs — tall, spindly,
+    and easy to mistake for a humanoid at thumbnail size."""
+    import mujoco
+
+    data = mujoco.MjData(model)
+    if model.nkey > 0:
+        mujoco.mj_resetDataKeyframe(model, data, 0)
+    mujoco.mj_forward(model, data)
+    return data
+
+
 def _render_mjcf(
     xml_path: Path,
     angle: str = DEFAULT_ANGLE,
@@ -241,8 +256,7 @@ def _render_mjcf(
             kind="parse",
         ) from e
     try:
-        data = mujoco.MjData(model)
-        mujoco.mj_forward(model, data)
+        data = _posed_data(model)
         camera = _build_camera(model, data, angle)
         width, height = size
         with mujoco.Renderer(
@@ -295,8 +309,7 @@ def render_model_preview(
             kind="parse",
         ) from e
     try:
-        data = mujoco.MjData(model)
-        mujoco.mj_forward(model, data)
+        data = _posed_data(model)
         camera = _build_camera(model, data, angle)
         width, height = size
         with mujoco.Renderer(model, height=height, width=width) as renderer:
