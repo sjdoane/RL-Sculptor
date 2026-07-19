@@ -159,6 +159,36 @@ fail-soft for plane/non-curriculum/legacy envs; `diagnose.py` loads it
 best-effort and renders it inside the `# WORLD_VARIATIONS` block —
 stats without registered variations create no edit surface.
 
+Item 5 (backend) — the authoring API is complete in
+`reward-sculptor-ui/backend`:
+
+- `services/world_store.py`: author (gather_grounding → author_environment,
+  session persisted under `<project>/worlds/<session>/` with the exact
+  authoring inputs), apply (deterministic re-author verified against the
+  persisted `draft_hash` → 409 on drift; unanswered questions take their
+  disclosed system default with `default` provenance, explicit answers
+  record `user`; unknown question ids are a 422, never ignored →
+  `apply_clarifications` → `admit_and_promote` with
+  `lineage=world-<result_hash[:24]>`), selection (shaped
+  `load_selected_world` bundle), lineage (immutable `selection_v*.json`
+  history).
+- `routes/worlds.py`: `POST /projects/{slug}/worlds/author`,
+  `POST .../author/apply` (per-project write lock, 409 busy/stale, 422
+  carries the gate-violation summary), `GET .../selection` (404 before
+  first authoring), `GET .../lineage`. Registered in `main.py`.
+- `models/world.py` request/response shapes.
+- `tests/test_worlds.py`: 6 tests running the REAL offline author and
+  REAL admission gate chain (MuJoCo compile) — draft shape with
+  disclosed system-default options, full author→apply→selection→lineage
+  round-trip, 404/422 contracts, ungroundable-prompt 422.
+
+Still open in item 5: the frontend slice — `lib/api.ts` + `lib/types.ts`
+wrappers, `hooks/useWorlds.ts`, an authoring dialog under `components/`
+(paginated questions, each with its system-default option), and
+selection/lineage display in `pages/ProjectDetail.tsx`. Also note
+`services/project_store.py:548` still keys `_compute_status` on the
+legacy per-project `kg/graph.db`.
+
 The active plan is:
 
 1. capability descriptors plus strict WorldSpec/TaskSpec and persistence (done);

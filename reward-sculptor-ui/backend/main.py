@@ -40,6 +40,7 @@ from backend.routes import runs as runs_routes
 from backend.routes import saved as saved_routes
 from backend.routes import system as system_routes
 from backend.routes import trash as trash_routes
+from backend.routes import worlds as worlds_routes
 from backend.services.job_manager import JobManager
 from backend.services import sculptor_bridge
 from backend.services.project_store import ProjectStore
@@ -214,6 +215,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     app.include_router(trash_routes.router)
     app.include_router(saved_routes.router)
     app.include_router(references_routes.router)
+    app.include_router(worlds_routes.router)
     return app
 
 
