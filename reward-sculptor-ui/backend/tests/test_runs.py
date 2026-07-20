@@ -446,6 +446,78 @@ def test_run_sculpt_job_forwards_training_iterations_as_cli_flag(
     )
 
 
+def test_run_sculpt_job_forwards_hardware_overrides_as_cli_flags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Launch-scoped env/device controls shown in the UI must be real."""
+    from backend.services import run_manager
+    from backend.services.job_manager import Job
+
+    project_dir = tmp_path / "hardware-override"
+    project_dir.mkdir()
+    captured: dict = {}
+
+    class _Sentinel(Exception):
+        pass
+
+    async def _fake_exec(*args, **kwargs):
+        captured["cmd"] = list(args)
+        raise _Sentinel()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+    runner = run_manager.run_sculpt_job(
+        project_dir=project_dir,
+        run_params={
+            "behavior_goal": "traverse rough terrain",
+            "iterations": 2,
+            "num_envs_override": 512,
+            "device_override": "cuda:0",
+        },
+    )
+    job = Job(
+        job_id="t_hw", kind="sculpt_run",
+        project_slug="hardware-override", status="running",
+    )
+    job._cancel = asyncio.Event()
+    with pytest.raises(_Sentinel):
+        asyncio.run(runner(job, job._cancel))
+
+    cmd = captured["cmd"]
+    assert cmd[cmd.index("--num-envs") + 1] == "512"
+    assert cmd[cmd.index("--device") + 1] == "cuda:0"
+
+
+def test_launch_rejects_tampered_authored_world_before_job_submission(
+    client: TestClient, fake_sculpt, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from backend.services import world_store
+
+    slug = _make_project_with_library(client, "WorldIntegrity")
+    project = client.get(f"/projects/{slug}").json()
+    selection = Path(project["project_dir"]) / "env" / "selection_current.json"
+    selection.parent.mkdir(parents=True, exist_ok=True)
+    selection.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        world_store, "validate",
+        lambda _project: {"ok": False, "errors": ["task artifact hash mismatch"]},
+    )
+
+    response = client.post(
+        f"/projects/{slug}/runs",
+        json={
+            "behavior_goal": "traverse rough terrain",
+            "iterations": 1,
+            "dry_run": True,
+        },
+    )
+    assert response.status_code == 412, response.text
+    assert response.json()["type"] == "/problems/world-integrity"
+    assert "hash mismatch" in response.json()["detail"]
+    assert client.app.state.job_manager.list(  # type: ignore[attr-defined]
+        kind="sculpt_run", project_slug=slug,
+    ) == []
+
+
 def test_run_sculpt_job_omits_steps_per_iter_flag_when_not_set(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

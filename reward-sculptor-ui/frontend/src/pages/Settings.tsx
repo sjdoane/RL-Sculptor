@@ -8,7 +8,8 @@ import { useSystemInfo } from "@/hooks/useDashboard";
 import { useRemoteSettings, useSharedKgStats, useSystemGpu } from "@/hooks/useLibrary";
 import { useTheme } from "@/hooks/useTheme";
 import { usePurgeTrash, useRestoreTrash, useTrash } from "@/hooks/useTrash";
-import { ApiError, putRemoteSettings, runRemoteDoctor } from "@/lib/api";
+import { ApiError, putAnthropicApiKey, putRemoteSettings, runRemoteDoctor } from "@/lib/api";
+import { qk } from "@/lib/queryKeys";
 import { formatRelative } from "@/lib/utils";
 import type { GpuDevice, RemoteDoctorResponse, RemoteSettings, TrashEntry } from "@/lib/types";
 
@@ -72,8 +73,25 @@ function KvRow({ k, v, mono, truncate }: { k: string; v: string; mono?: boolean;
   );
 }
 
-// ── API key (read-only — no write endpoint; honest per Finding B) ─────
+// ── API key (localhost-only persistence; value is never read back) ────
 function ApiKeyCard({ isSet, masked }: { isSet: boolean; masked: string | null }) {
+  const qc = useQueryClient();
+  const [value, setValue] = useState("");
+  const [show, setShow] = useState(false);
+  const save = useMutation({
+    mutationFn: putAnthropicApiKey,
+    onSuccess: async () => {
+      setValue("");
+      setShow(false);
+      await qc.invalidateQueries({ queryKey: qk.systemInfo() });
+      toast.success("Anthropic API key saved", {
+        description: "Live runs are available now — no backend restart needed.",
+      });
+    },
+    onError: (error: Error) => toast.error("Could not save API key", {
+      description: error.message,
+    }),
+  });
   return (
     <div className="rs-card">
       <div className="rs-card-head">
@@ -81,18 +99,62 @@ function ApiKeyCard({ isSet, masked }: { isSet: boolean; masked: string | null }
         <Badge status={isSet ? "completed" : "errored"} label={isSet ? "Connected" : "Not set"} />
       </div>
       <div className="rs-card-pad rs-vgap-8">
-        {isSet ? (
+        {isSet && (
           <div className="rs-kv">
             <KvRow k="api key" v={masked ?? "set"} mono />
-            <KvRow k="source" v="ANTHROPIC_API_KEY" />
+            <KvRow k="availability" v="Live runs enabled" />
           </div>
-        ) : (
-          <div className="rs-vgap-8">
+        )}
+        {!isSet && (
+          <div className="rs-banner warn">
+            <Icon name="alert-triangle" size={17} />
+            <span className="rs-grow">
+              No key set — only pipeline checks are available until a key is saved.
+            </span>
+          </div>
+        )}
+        <div className="rs-vgap-8" style={{ paddingTop: isSet ? 4 : 0 }}>
+          <Field
+            label={isSet ? "Replace API key" : "Anthropic API key"}
+            hint="Stored locally with owner-only permissions; never returned by the API."
+            htmlFor="anthropic-api-key"
+          >
+            <div className="rs-flex rs-gap-8">
+              <input
+                id="anthropic-api-key"
+                className="rs-input mono rs-grow"
+                type={show ? "text" : "password"}
+                value={value}
+                onChange={(event) => setValue(event.target.value)}
+                placeholder="sk-ant-…"
+                autoComplete="off"
+                spellCheck={false}
+                disabled={save.isPending}
+              />
+              <Btn
+                kind="ghost"
+                icon={show ? "eye-off" : "eye"}
+                onClick={() => setShow((current) => !current)}
+                disabled={save.isPending}
+                title={show ? "Hide key" : "Show key"}
+              >
+                {show ? "Hide" : "Show"}
+              </Btn>
+              <Btn
+                kind="primary"
+                icon={save.isPending ? "loader" : "check"}
+                onClick={() => save.mutate(value.trim())}
+                disabled={save.isPending || value.trim().length < 20}
+              >
+                {save.isPending ? "Saving…" : "Save key"}
+              </Btn>
+            </div>
+          </Field>
+          {!isSet && (
             <p className="rs-sub" style={{ margin: 0 }}>
-              No key set — only <code className="mono">--dry-run</code> sculpt is available. Set{" "}
-              <code className="mono">ANTHROPIC_API_KEY</code> in your shell or in{" "}
-              <code className="mono">../RewardSculptor/.env</code>, then restart the backend.
+              The key activates immediately and remains available after restart.
             </p>
+          )}
             <a
               href="https://console.anthropic.com/settings/keys"
               target="_blank"
@@ -102,8 +164,7 @@ function ApiKeyCard({ isSet, masked }: { isSet: boolean; masked: string | null }
             >
               Get a key at console.anthropic.com <Icon name="external" size={13} />
             </a>
-          </div>
-        )}
+        </div>
       </div>
     </div>
   );

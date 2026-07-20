@@ -15,6 +15,7 @@ import {
   getWorldLineage,
   getWorldScene,
   getWorldSelection,
+  getWorldValidate,
   previewWorldDraft,
 } from "@/lib/api";
 import type { WorldCurriculum } from "@/lib/types";
@@ -28,6 +29,7 @@ import type {
   WorldLineageEntry,
   WorldScene,
   WorldSelection,
+  WorldValidateResult,
 } from "@/lib/types";
 
 export function useWorldSelection(slug: string | undefined) {
@@ -36,6 +38,21 @@ export function useWorldSelection(slug: string | undefined) {
     queryFn: () => getWorldSelection(slug!),
     enabled: !!slug,
     staleTime: 30_000,
+    retry: false,
+  });
+}
+
+/** Independent integrity status for the authoritative tuple.  Consumers use
+ *  this as a launch readiness signal; launch itself revalidates server-side. */
+export function useWorldValidation(
+  slug: string | undefined,
+  enabled = true,
+) {
+  return useQuery<WorldValidateResult>({
+    queryKey: slug ? qk.worldValidation(slug) : ["worldValidation", "_none"],
+    queryFn: () => getWorldValidate(slug!),
+    enabled: !!slug && enabled,
+    staleTime: 15_000,
     retry: false,
   });
 }
@@ -93,6 +110,7 @@ export function useEditWorldVariations(slug: string) {
     mutationFn: (body) => editWorldVariations(slug, body),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: qk.worldSelection(slug) });
+      qc.invalidateQueries({ queryKey: qk.worldValidation(slug) });
       qc.invalidateQueries({ queryKey: qk.worldLineage(slug) });
       qc.invalidateQueries({ queryKey: qk.worldScene(slug) });
     },
@@ -111,6 +129,7 @@ export function useApplyWorldAuthor(slug: string) {
     mutationFn: (body) => applyWorldAuthor(slug, body),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: qk.worldSelection(slug) });
+      qc.invalidateQueries({ queryKey: qk.worldValidation(slug) });
       qc.invalidateQueries({ queryKey: qk.worldLineage(slug) });
       qc.invalidateQueries({ queryKey: qk.worldScene(slug) });
       qc.invalidateQueries({ queryKey: qk.project(slug) });

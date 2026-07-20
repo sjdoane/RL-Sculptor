@@ -453,6 +453,17 @@ class _TestAdapterStub(_StubAdapter):  # dotted path consumable by load_adapter
         super().__init__(project_root=Path.cwd(), primary_metric_schedule=_SCHEDULE)
 
 
+class _ResourceAdapterStub(_TestAdapterStub):
+    """Generic adapter surface used to verify launch-scoped resources."""
+
+    def __init__(
+        self, num_envs: int = 1024, device: str = "cuda:0", **cfg,
+    ):
+        super().__init__(**cfg)
+        self.num_envs = num_envs
+        self.device = device
+
+
 def test_sculpt_run_dry_run_end_to_end(tmp_path: Path, monkeypatch):
     """3 iterations, dry-run, stub adapter — exercises the full orchestration
     path including CHANGELOG, provenance, git commits."""
@@ -501,6 +512,53 @@ def test_sculpt_run_dry_run_end_to_end(tmp_path: Path, monkeypatch):
         capture_output=True, text=True, check=True).stdout
     iter_commits = [line for line in log.splitlines() if "iter " in line]
     assert len(iter_commits) == 3
+
+
+def test_sculpt_run_applies_resource_overrides_without_mutating_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """Hardware overrides are launch-scoped, generic, and reproducible."""
+    import sculptor.sculpt as sculpt_module
+
+    global _SCHEDULE
+    _SCHEDULE = [1.0]
+    proj = _write_minimal_project(tmp_path)
+    config = proj / "config.toml"
+    original = config.read_text(encoding="utf-8").replace(
+        "tests.test_sculpt._TestAdapterStub",
+        "tests.test_sculpt._ResourceAdapterStub",
+    )
+    config.write_text(original, encoding="utf-8")
+
+    loaded: dict[str, object] = {}
+    real_load = sculpt_module.load_adapter
+
+    def capture_load(path):
+        adapter = real_load(path)
+        loaded["adapter"] = adapter
+        return adapter
+
+    monkeypatch.setattr(sculpt_module, "load_adapter", capture_load)
+    sculpt_run(
+        config_path=config,
+        behavior_goal="traverse rough terrain",
+        iterations=1,
+        no_kg=True,
+        dry_run=True,
+        num_envs=256,
+        device="cpu",
+    )
+
+    adapter = loaded["adapter"]
+    assert getattr(adapter, "num_envs") == 256
+    assert getattr(adapter, "device") == "cpu"
+    assert config.read_text(encoding="utf-8") == original
+    context = json.loads(
+        (proj / "reports" / "run_context.json").read_text(encoding="utf-8")
+    )
+    effective = context["config"]["effective"]["adapter"]["config"]
+    assert effective["num_envs"] == 256
+    assert effective["device"] == "cpu"
 
 
 def test_sculpt_run_does_not_stop_after_three_non_improving(tmp_path: Path):

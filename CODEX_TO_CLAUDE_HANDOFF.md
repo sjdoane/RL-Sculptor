@@ -578,3 +578,62 @@ In parallel, assemble the first real gauntlet manifest from archived
 honest/gamed rollouts, keeping human-test clips disjoint from metric generation
 and calibration. A charter-aware global-matrix coordinator is also needed
 before restoring multi-pod sharding into one campaign output.
+
+## Release-candidate UI + launch hardening 2026-07-20 (Codex)
+
+Sam is now the sole operator and requires the lab-call workflow to be UI-only
+after the one-time `./run.sh` startup. This slice makes the World-to-training
+path honest and usable without terminal configuration:
+
+- Fixed the previously cosmetic launch controls: `num_envs` and `device`
+  overrides now flow from the React dialog through FastAPI, the subprocess CLI,
+  `sculpt_run`, the effective `run_context.json`, and the adapter instance.
+  Application is capability/attribute based, with no robot or task-name keying;
+  project `config.toml` remains immutable.
+- Added a fail-closed server gate before job submission. If a project has a
+  promoted authored selection, the backend verifies the atomic tuple again and
+  returns a 412 `/problems/world-integrity` before LLM/GPU work on drift. Legacy
+  projects with no authored selection retain their existing built-in scene.
+- Added localhost UI key configuration in Settings. It writes atomically under
+  the user project-data root with mode 0600, activates immediately, restores on
+  later launches when no environment key overrides it, and only returns a
+  masked suffix. `run.sh` now uses pinned pnpm 9.12 through Corepack and gives
+  correct guidance when only a UI-saved key may exist.
+- Added a launch-readiness rail (LLM key, CUDA/mjlab/rsl_rl, authored tuple),
+  three explicit plans (pipeline, rehearsal, overnight), scaled ETA, launch-time
+  tuple revalidation, no-world and robot-mismatch confirmations, and truthful
+  custom-plan state after manual edits. World now precedes Rewards in the
+  project workflow and offers `Train this world` only with a valid selection.
+- Added the full UI-only operator procedure and recovery path at
+  `reward-sculptor-ui/docs/LAB_CALL_DEMO_RUNBOOK.md`; linked it from the UI
+  README. The reliable showcase intentionally uses the built-in `go1_trot`
+  ground-truth metric in steer mode instead of adding launch-time generated-
+  metric variance.
+
+Prepared local demo state (user data, not committed): project
+`lab-call-authored-rough-terrain`, Unitree Go1 / mjlab /
+`Mjlab-Velocity-Rough-Unitree-Go1`. World selection v2 was authored and
+promoted entirely in the UI from:
+“Traverse a parkour course of ascending boxes with gaps, moving forward
+steadily without falling.” It materializes three platforms plus two gaps,
+preserves v1 in lineage, and passes schema, capability, budget, build,
+initial-penetration, settle, placement, and reachability gates. Selection v2
+hash prefix is `af0d135c5b49`.
+
+Verification on the final pre-commit tree:
+
+- UI focused: 49 passed (`test_system.py`, `test_runs.py`).
+- Core focused: 41 passed (`test_run_cli_overrides.py`, `test_sculpt.py`).
+- Full UI backend: 554 passed in 3m04s.
+- Full core command required by Sam: 2,137 passed / 1 optional-JAX skip in
+  4m23s with `MUJOCO_GL=egl` and `test_refs_preview.py` excluded.
+- Frontend `tsc -b && vite build`: passed (2,761 modules).
+- Ruff on both new Python files, compileall on the touched Python trees, and
+  `git diff --check`: passed. Whole legacy-file Ruff still reports pre-existing
+  unused-import/E402 debt in large files, so the scoped new-file result is the
+  claimed lint evidence.
+
+The real 4-cycle GPU showcase run is intentionally launched only after this
+release-candidate commit, so Vite/uvicorn reloads cannot interrupt it. Append a
+second handoff section with its run id, artifact paths, timings, fitness values,
+and rollout inspection before declaring the overnight rehearsal complete.

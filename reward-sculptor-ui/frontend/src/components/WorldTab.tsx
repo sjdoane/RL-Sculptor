@@ -16,8 +16,8 @@ import {
   useWorldLineage,
   useWorldScene,
   useWorldSelection,
+  useWorldValidation,
 } from "@/hooks/useWorlds";
-import { getWorldValidate } from "@/lib/api";
 
 /** "5 elements — 3 platform · 2 gap"; gaps carry no geometry, so call
  *  that out rather than letting the total look inconsistent with the
@@ -35,29 +35,32 @@ export function courseBreakdownText(
   return `${total} elements — ${parts.join(" · ")}${suffix}`;
 }
 
-async function runIntegrityCheck(slug: string) {
-  try {
-    const result = await getWorldValidate(slug);
-    if (result.ok) {
-      toast.success(
-        `Integrity verified: selection v${result.selection_version}, ` +
-        "every artifact hash matches",
-      );
-    } else {
-      toast.error(`Integrity FAILED: ${result.errors.join("; ")}`);
-    }
-  } catch (err) {
-    toast.error(err instanceof Error ? err.message : String(err));
-  }
-}
-
-export default function WorldTab({ slug }: { slug: string }) {
+export default function WorldTab({
+  slug, launchAction,
+}: {
+  slug: string;
+  launchAction?: React.ReactNode;
+}) {
   const selection = useWorldSelection(slug);
+  const validation = useWorldValidation(slug, !!selection.data);
   const lineage = useWorldLineage(slug);
   const curriculum = useWorldCurriculum(slug);
   const scene = useWorldScene(slug, !!selection.data);
   const [selectedEntity, setSelectedEntity] = useState<string | null>(null);
   const editVariations = useEditWorldVariations(slug);
+  const runIntegrityCheck = async () => {
+    const result = await validation.refetch();
+    if (result.data?.ok) {
+      toast.success(
+        `Integrity verified: selection v${result.data.selection_version}, ` +
+        "every artifact hash matches",
+      );
+    } else {
+      toast.error(
+        `Integrity FAILED: ${result.data?.errors.join("; ") || result.error?.message || "unknown error"}`,
+      );
+    }
+  };
   const onEditVariation = (
     variationId: string, distribution: Record<string, unknown>,
   ) => {
@@ -116,15 +119,31 @@ export default function WorldTab({ slug }: { slug: string }) {
           </span>
         </div>
       )}
+      {validation.data && !validation.data.ok && (
+        <div className="rs-banner err">
+          <Icon name="alert-triangle" size={17} />
+          <span className="rs-grow">
+            <b>Training blocked: the authored tuple failed integrity verification.</b>{" "}
+            {validation.data.errors.join("; ")}
+          </span>
+        </div>
+      )}
       <div className="rs-card">
         <div className="rs-card-head">
-          <div className="rs-card-title">Authoritative world tuple</div>
+          <div className="rs-card-title">
+            Authoritative world tuple
+            {validation.data?.ok && (
+              <Badge status="completed" label="Verified for launch" />
+            )}
+          </div>
           <div style={{ display: "flex", gap: 8 }}>
             <Btn icon="shield-check" size="sm"
-                 onClick={() => void runIntegrityCheck(slug)}>
-              Verify integrity
+                 onClick={() => void runIntegrityCheck()}
+                 disabled={validation.isFetching}>
+              {validation.isFetching ? "Verifying…" : "Verify integrity"}
             </Btn>
             <AuthorWorldDialog slug={slug} />
+            {validation.data?.ok && launchAction}
           </div>
         </div>
         <div className="rs-card-pad">

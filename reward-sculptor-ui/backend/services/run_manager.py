@@ -406,10 +406,13 @@ def run_sculpt_job(
     # Any field here also needs a matching CLI flag in sculptor/cli.py's
     # `run` command OR an env var the CLI reads.
     training_iterations = run_params.get("training_iterations")
-    # num_envs / device overrides flow through config.toml at project
-    # create-time (backend/routes/projects.py::create_project) so they
-    # don't need per-run plumbing yet. `expand_kg` is a sculpt-loop
-    # feature not wired up to the CLI yet — pass-through flag only.
+    # Per-run hardware overrides must reach the subprocess; the UI presents
+    # them as launch-scoped safety controls (especially important on 8 GiB
+    # laptop GPUs), so silently falling back to config.toml is unsafe.
+    num_envs_override = run_params.get("num_envs_override")
+    device_override = run_params.get("device_override")
+    # `expand_kg` is a sculpt-loop feature not wired up to the CLI yet —
+    # pass-through flag only.
     expand_kg = bool(run_params.get("expand_kg", False))
     # §Ship-7: rollout-video + RL knobs. Forwarded to `sculpt run` as
     # long-form CLI flags (see sculptor/cli.py::run). None means the
@@ -521,6 +524,10 @@ def run_sculpt_job(
             cmd.append("--dry-run")
         if training_iterations is not None:
             cmd += ["--steps-per-iter", str(int(training_iterations))]
+        if num_envs_override is not None:
+            cmd += ["--num-envs", str(int(num_envs_override))]
+        if device_override is not None:
+            cmd += ["--device", str(device_override)]
         if max_episode_steps is not None:
             cmd += ["--max-episode-steps", str(int(max_episode_steps))]
         if playback_speed is not None:
@@ -591,6 +598,10 @@ def run_sculpt_job(
         job.params.setdefault("dry_run", dry_run)
         if training_iterations is not None:
             job.params.setdefault("training_iterations", int(training_iterations))
+        if num_envs_override is not None:
+            job.params.setdefault("num_envs_override", int(num_envs_override))
+        if device_override is not None:
+            job.params.setdefault("device_override", str(device_override))
         if expand_kg:
             job.params.setdefault("expand_kg", expand_kg)
         # §Ship-7: stash the new params so the Runs-tab summary can

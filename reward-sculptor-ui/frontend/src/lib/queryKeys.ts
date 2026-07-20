@@ -74,6 +74,7 @@ export const qk = {
   // Environment authoring (env-authoring item 5): the promoted world
   // tuple + its immutable selection history.
   worldSelection: (slug: string) => ["worldSelection", slug] as const,
+  worldValidation: (slug: string) => ["worldValidation", slug] as const,
   worldLineage: (slug: string) => ["worldLineage", slug] as const,
   worldCurriculum: (slug: string) => ["worldCurriculum", slug] as const,
   worldScene: (slug: string) => ["worldScene", slug] as const,

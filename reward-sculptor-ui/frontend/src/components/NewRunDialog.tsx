@@ -4,9 +4,11 @@ import { toast } from "sonner";
 import { Icon } from "@/components/rs/icon";
 import { Btn, Field, Modal, ToggleRow } from "@/components/rs/primitives";
 import { courseBreakdownText } from "@/components/WorldTab";
+import { useSystemInfo } from "@/hooks/useDashboard";
+import { useSystemGpu } from "@/hooks/useLibrary";
 import { useCalibrateMetric, useGenerateMetric, useMetricGenProgress, useProjectMetrics } from "@/hooks/useMetrics";
 import { useLaunchRun } from "@/hooks/useRuns";
-import { useWorldSelection } from "@/hooks/useWorlds";
+import { useWorldSelection, useWorldValidation } from "@/hooks/useWorlds";
 import { ApiError } from "@/lib/api";
 import type { ProjectDetail } from "@/lib/types";
 import { SPEC_METRIC_NAMES } from "@/lib/types";
@@ -52,6 +54,34 @@ function formatEta(seconds: number): { label: string; finishAt: string } {
         minute: "2-digit",
       });
   return { label: humanizeSeconds(seconds), finishAt: finishStr };
+}
+
+function ReadinessCell({
+  icon, label, state, detail,
+}: {
+  icon: string;
+  label: string;
+  state: "ready" | "checking" | "attention" | "blocked";
+  detail: string;
+}) {
+  const color = state === "ready"
+    ? "var(--st-emerald)"
+    : state === "blocked"
+      ? "var(--st-rose)"
+      : state === "attention"
+        ? "var(--st-amber)"
+        : "var(--rs-muted)";
+  return (
+    <div style={{ padding: "10px 11px", background: "var(--surface-strong)", minWidth: 0 }}>
+      <div style={{ display: "flex", gap: 6, alignItems: "center", color, fontSize: 11.5, fontWeight: 650 }}>
+        <Icon name={state === "ready" ? "check-circle" : state === "checking" ? "loader" : icon} size={13} className={state === "checking" ? "rs-spin" : undefined} />
+        <span>{label}</span>
+      </div>
+      <div style={{ marginTop: 3, fontSize: 10.5, lineHeight: 1.35, color: "var(--rs-muted)", overflow: "hidden", textOverflow: "ellipsis" }}>
+        {detail}
+      </div>
+    </div>
+  );
 }
 
 
@@ -133,15 +163,65 @@ function pickAdapterDefaults(project: ProjectDetail): {
   };
 }
 
+type RunProfile = "custom" | "pipeline" | "rehearsal" | "overnight";
+
+function profileBudget(
+  profile: Exclude<RunProfile, "custom">,
+  defaults: ReturnType<typeof pickAdapterDefaults>,
+) {
+  const gym = defaults.kind === "gym_sb3";
+  const cartpole = defaults.kind === "mjlab_cartpole";
+  if (profile === "pipeline") {
+    return {
+      iterations: 1,
+      trainingIters: gym ? 1_000 : 100,
+      numEnvs: gym ? defaults.num_envs : Math.min(defaults.num_envs, 256),
+      dryRun: true,
+      interactive: false,
+      maxEpisodeSteps: 180,
+      rolloutEpisodes: 1,
+      renderSize: "960x540" as const,
+    };
+  }
+  if (profile === "rehearsal") {
+    return {
+      iterations: 2,
+      trainingIters: gym ? 15_000 : cartpole ? 250 : 350,
+      numEnvs: gym ? defaults.num_envs : Math.min(defaults.num_envs, 512),
+      dryRun: false,
+      interactive: true,
+      maxEpisodeSteps: 300,
+      rolloutEpisodes: 2,
+      renderSize: "960x540" as const,
+    };
+  }
+  return {
+    iterations: gym ? 6 : 4,
+    trainingIters: gym ? 40_000 : cartpole ? 500 : 750,
+    numEnvs: gym ? defaults.num_envs : Math.min(defaults.num_envs, 1024),
+    dryRun: false,
+    interactive: false,
+    maxEpisodeSteps: 500,
+    rolloutEpisodes: 2,
+    renderSize: "960x540" as const,
+  };
+}
+
 
 export function NewRunDialog({
   slug,
   project,
   onLaunched,
+  onOpenWorld,
+  triggerLabel = "New run",
+  triggerKind = "primary",
 }: {
   slug: string;
   project: ProjectDetail;
   onLaunched: (runId: string) => void;
+  onOpenWorld?: () => void;
+  triggerLabel?: string;
+  triggerKind?: "primary" | "quiet" | "ghost";
 }) {
   const [open, setOpen] = useState(false);
   const [tab, setTab] = useState<"basic" | "advanced">("basic");
@@ -149,6 +229,7 @@ export function NewRunDialog({
   const isMjlab = defaults.kind.startsWith("mjlab");
 
   const [behavior, setBehavior] = useState("");
+  const [profile, setProfile] = useState<RunProfile>("custom");
   type RenderSize = "default" | "1920x1080" | "960x540" | "320x240";
   const [iterations, setIterations] = useState(defaults.iterations);
   const [trainingIters, setTrainingIters] = useState<number | "">(
@@ -161,6 +242,9 @@ export function NewRunDialog({
   // §Ship 39 (H1): pause-for-feedback by default (the requested default);
   // flippable to Auto at any time from the run header once it's running.
   const [interactive, setInteractive] = useState(true);
+  const [allowDefaultWorld, setAllowDefaultWorld] = useState(false);
+  const [allowRobotMismatch, setAllowRobotMismatch] = useState(false);
+  const [validatingLaunch, setValidatingLaunch] = useState(false);
   const [expandKg, setExpandKg] = useState(false);
   // §Ship-7: rollout-video + RL knobs. Empty string = "leave blank →
   // use runner/config default".
@@ -186,6 +270,12 @@ export function NewRunDialog({
   // undefined for legacy projects; the atomic selection file drives the
   // adapter, so this is disclosure, not configuration).
   const worldSel = useWorldSelection(open ? slug : undefined);
+  const worldValidation = useWorldValidation(
+    open ? slug : undefined,
+    !!worldSel.data,
+  );
+  const systemInfo = useSystemInfo();
+  const gpuInfo = useSystemGpu();
   // §Ship 35: per-project generated metrics + the generate action.
   const projectMetrics = useProjectMetrics(slug, open);
   const genMetric = useGenerateMetric(slug);
@@ -214,8 +304,21 @@ export function NewRunDialog({
   const etaSeconds = useMemo(() => {
     if (dryRun) return 50;
     const perCycle = SECONDS_PER_CYCLE[defaults.kind] ?? 300;
-    return perCycle * iterations;
-  }, [dryRun, defaults.kind, iterations]);
+    const inner = typeof trainingIters === "number"
+      ? trainingIters / defaults.training_iterations
+      : 1;
+    const envScale = isMjlab && typeof numEnvs === "number"
+      ? numEnvs / defaults.num_envs
+      : 1;
+    // LLM/rollout work is a fixed slice; training scales with the inner
+    // budget and parallel env count. This stays an estimate, but unlike the
+    // old calculation it responds to the launch controls the user changes.
+    const cycleScale = 0.2 + 0.8 * Math.max(0.1, inner) * Math.max(0.2, envScale);
+    return perCycle * iterations * cycleScale;
+  }, [
+    dryRun, defaults.kind, defaults.num_envs,
+    defaults.training_iterations, isMjlab, iterations, numEnvs, trainingIters,
+  ]);
   const eta = useMemo(() => formatEta(etaSeconds), [etaSeconds]);
   const isLongRun = etaSeconds >= 30 * 60; // 30 min
   const hasPriorIters = project.n_iterations_completed > 0;
@@ -224,13 +327,30 @@ export function NewRunDialog({
   // when the adapter changes (defaults drift with the project).
   useEffect(() => {
     if (open) {
-      if (!behavior && project.description) setBehavior(project.description);
+      setBehavior((current) => current || project.description || "");
       setIterations(defaults.iterations);
       setTrainingIters(defaults.training_iterations);
       setNumEnvs(defaults.num_envs);
       setDevice(defaults.device);
+      setProfile("custom");
+      setAllowDefaultWorld(false);
+      setAllowRobotMismatch(false);
     }
-  }, [open, project.description, defaults, behavior]);
+  }, [open, project.description, defaults]);
+
+  const applyProfile = (next: Exclude<RunProfile, "custom">) => {
+    const budget = profileBudget(next, defaults);
+    setProfile(next);
+    setIterations(budget.iterations);
+    setTrainingIters(budget.trainingIters);
+    setNumEnvs(budget.numEnvs);
+    setDryRun(budget.dryRun);
+    setInteractive(budget.interactive);
+    setMaxEpisodeSteps(budget.maxEpisodeSteps);
+    setRolloutEpisodes(budget.rolloutEpisodes);
+    setRenderSize(budget.renderSize);
+    setSeed(42);
+  };
 
   // Single entry point for the Generate button AND the inline retry below,
   // so the error affordance re-runs exactly what failed. The api call carries
@@ -266,10 +386,44 @@ export function NewRunDialog({
     );
   };
 
-  const submit = () => {
+  const submit = async () => {
     if (behavior.trim().length < 4) {
       toast.error("Behavior goal too short", { description: "At least 4 chars." });
       return;
+    }
+    if (!dryRun && systemInfo.data?.anthropic_api_key_set === false) {
+      toast.error("Live-run API key is not configured", {
+        description: "Open Settings → Anthropic API, save a key, then launch again.",
+      });
+      return;
+    }
+    if (!worldSel.data && !allowDefaultWorld) {
+      toast.error("Choose the training world", {
+        description: "Author a world, or explicitly confirm the project default scene.",
+      });
+      return;
+    }
+    if (
+      worldSel.data?.shared_summary.robot_matches_project === false
+      && !allowRobotMismatch
+    ) {
+      toast.error("Authored-world robot differs from the project", {
+        description: "Re-author for the project robot, or explicitly confirm the mismatch.",
+      });
+      return;
+    }
+    if (worldSel.data) {
+      setValidatingLaunch(true);
+      const checked = await worldValidation.refetch();
+      setValidatingLaunch(false);
+      if (checked.error || !checked.data?.ok) {
+        toast.error("Authored world failed launch verification", {
+          description: checked.data?.errors.join("; ")
+            || checked.error?.message
+            || "The authoritative tuple could not be verified.",
+        });
+        return;
+      }
     }
     const body = {
       behavior_goal: behavior.trim(),
@@ -341,16 +495,28 @@ export function NewRunDialog({
       type="number"
       className="rs-input mono"
       value={v}
-      onChange={(e) => set(e.target.value === "" ? "" : Number(e.target.value))}
+      onChange={(e) => {
+        set(e.target.value === "" ? "" : Number(e.target.value));
+        setProfile("custom");
+      }}
       disabled={launch.isPending}
     />
   );
+
+  const launchBusy = launch.isPending || validatingLaunch;
+  const apiReady = dryRun || systemInfo.data?.anthropic_api_key_set === true;
+  const gpuReady = !isMjlab || (
+    gpuInfo.data?.cuda_available === true
+    && gpuInfo.data?.mjlab_available === true
+    && gpuInfo.data?.rsl_rl_available === true
+  );
+  const worldReady = !!worldSel.data && worldValidation.data?.ok === true;
 
   return (
     <>
       {/* Reset any stale generate error from a previous open — the mutation
           outlives the Modal (it's conditionally rendered below). */}
-      <Btn kind="primary" size="sm" icon="play" onClick={() => { genMetric.reset(); setOpen(true); }}>New run</Btn>
+      <Btn kind={triggerKind} size="sm" icon="play" onClick={() => { genMetric.reset(); setOpen(true); }}>{triggerLabel}</Btn>
       {open && (
         <Modal
           title="Launch a sculpt run"
@@ -362,16 +528,76 @@ export function NewRunDialog({
             )
           }
           icon="play"
-          onClose={() => { if (!launch.isPending) setOpen(false); }}
+          onClose={() => { if (!launchBusy) setOpen(false); }}
           footer={
             <>
-              <Btn kind="quiet" onClick={() => setOpen(false)} disabled={launch.isPending}>Cancel</Btn>
-              <Btn kind="primary" icon={launch.isPending ? "loader" : "play"} onClick={submit} disabled={launch.isPending}>
-                {launch.isPending ? "Launching…" : "Launch"}
+              <Btn kind="quiet" onClick={() => setOpen(false)} disabled={launchBusy}>Cancel</Btn>
+              <Btn kind="primary" icon={launchBusy ? "loader" : "play"} onClick={() => void submit()} disabled={launchBusy}>
+                {validatingLaunch ? "Verifying world…" : launch.isPending ? "Launching…" : "Launch"}
               </Btn>
             </>
           }
         >
+          <div style={{ display: "grid", gap: 8 }}>
+            <div className="rs-eyebrow">Run plan</div>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 8 }}>
+              {([
+                ["pipeline", "Pipeline check", "~50 s · stubbed LLM · no GPU commitment"],
+                ["rehearsal", "Live rehearsal", "2 real cycles · pauses for feedback"],
+                ["overnight", "Overnight showcase", "4 real cycles · auto · call-ready evidence"],
+              ] as const).map(([value, label, description]) => (
+                <button
+                  key={value}
+                  type="button"
+                  onClick={() => applyProfile(value)}
+                  disabled={launchBusy}
+                  style={{
+                    border: profile === value
+                      ? "1px solid var(--rs-primary)"
+                      : "1px solid var(--hairline)",
+                    borderRadius: "var(--radius-md)",
+                    background: profile === value
+                      ? "color-mix(in srgb, var(--rs-primary) 7%, var(--surface-strong))"
+                      : "var(--surface-strong)",
+                    padding: "10px 11px", textAlign: "left", cursor: "pointer",
+                    color: "var(--ink)", font: "inherit",
+                  }}
+                >
+                  <span style={{ display: "block", fontSize: 12.5, fontWeight: 650 }}>{label}</span>
+                  <span style={{ display: "block", marginTop: 3, fontSize: 10.5, lineHeight: 1.4, color: "var(--rs-muted)" }}>{description}</span>
+                </button>
+              ))}
+            </div>
+            {profile === "custom" && (
+              <div className="rs-hintline">Project defaults loaded. Pick a plan or tune Advanced directly.</div>
+            )}
+          </div>
+
+          <div
+            style={{
+              display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))",
+              gap: 1, overflow: "hidden", borderRadius: "var(--radius-md)",
+              border: "1px solid var(--hairline)", background: "var(--hairline)",
+            }}
+          >
+            <ReadinessCell
+              icon="key" label="Live authoring"
+              state={apiReady ? "ready" : systemInfo.isLoading ? "checking" : "blocked"}
+              detail={dryRun ? "not needed for pipeline check" : apiReady ? "API key configured" : "save a key in Settings"}
+            />
+            <ReadinessCell
+              icon="cpu" label="Training runtime"
+              state={gpuReady ? "ready" : gpuInfo.isLoading ? "checking" : "blocked"}
+              detail={!isMjlab ? "CPU adapter ready" : gpuReady ? `${device} · mjlab + rsl_rl ready` : "CUDA/mjlab preflight failed"}
+            />
+            <ReadinessCell
+              icon="globe" label="Authored world"
+              state={worldReady ? "ready" : worldValidation.isLoading ? "checking" : worldSel.data ? "blocked" : "attention"}
+              detail={worldReady
+                ? `v${worldSel.data!.selection.selection_version} · tuple verified`
+                : worldSel.data ? "integrity verification required" : "project default unless authored"}
+            />
+          </div>
           {/* ETA estimate + resume-warning (S8 / §7.7) */}
           <div
             style={{
@@ -436,11 +662,48 @@ export function NewRunDialog({
               </div>
               {worldSel.data.shared_summary.robot_matches_project === false && (
                 <div style={{ fontSize: 11, lineHeight: 1.45, color: "var(--st-amber-fg)" }}>
-                  This world&apos;s robot differs from the project robot
-                  ({worldSel.data.shared_summary.project_capability_id}) — the run
-                  trains the authored world&apos;s robot. Re-author from the World
-                  tab if that is unintended.
+                  <div>
+                    This world&apos;s robot differs from the project robot
+                    ({worldSel.data.shared_summary.project_capability_id}) — the run
+                    trains the authored world&apos;s robot.
+                  </div>
+                  <label style={{ display: "flex", gap: 7, alignItems: "center", marginTop: 6, cursor: "pointer" }}>
+                    <input
+                      type="checkbox"
+                      checked={allowRobotMismatch}
+                      onChange={(event) => setAllowRobotMismatch(event.target.checked)}
+                    />
+                    I intend to train the authored world&apos;s robot.
+                  </label>
                 </div>
+              )}
+            </div>
+          )}
+          {!worldSel.isLoading && !worldSel.data && (
+            <div className="rs-banner warn">
+              <Icon name="globe" size={17} />
+              <div className="rs-grow" style={{ minWidth: 0 }}>
+                <div style={{ fontWeight: 650 }}>No authored world is selected.</div>
+                <div style={{ marginTop: 2, fontSize: 11, lineHeight: 1.45 }}>
+                  Author terrain, objects, and task semantics in the World tab,
+                  or explicitly continue with the project&apos;s built-in scene.
+                </div>
+                <label style={{ display: "flex", gap: 7, alignItems: "center", marginTop: 7, cursor: "pointer", fontSize: 11.5 }}>
+                  <input
+                    type="checkbox"
+                    checked={allowDefaultWorld}
+                    onChange={(event) => setAllowDefaultWorld(event.target.checked)}
+                  />
+                  Use the project default scene for this run.
+                </label>
+              </div>
+              {onOpenWorld && (
+                <Btn
+                  kind="ghost" size="sm" icon="globe"
+                  onClick={() => { setOpen(false); onOpenWorld(); }}
+                >
+                  Author world
+                </Btn>
               )}
             </div>
           )}
@@ -466,12 +729,12 @@ export function NewRunDialog({
                 />
               </Field>
               <ToggleRow
-                on={dryRun} onChange={setDryRun} label="Dry run"
+                on={dryRun} onChange={(value) => { setDryRun(value); setProfile("custom"); }} label="Dry run"
                 title={<><code className="mono">--dry-run</code> · smoke-test the pipeline</>}
                 desc="training steps capped at 1000, LLM calls stubbed — ~50 s total"
               />
               <ToggleRow
-                on={interactive} onChange={setInteractive} label="Pause for my feedback each iteration"
+                on={interactive} onChange={(value) => { setInteractive(value); setProfile("custom"); }} label="Pause for my feedback each iteration"
                 title={<>Manual mode · review the rollout, then steer the next iteration</>}
                 desc="Default on. Flip to Auto at any point from the run header while it's running."
               />
@@ -502,7 +765,7 @@ export function NewRunDialog({
                       id="run-device"
                       className="rs-input mono"
                       value={device}
-                      onChange={(e) => setDevice(e.target.value)}
+                      onChange={(e) => { setDevice(e.target.value); setProfile("custom"); }}
                       disabled={launch.isPending}
                       placeholder="cuda:0"
                     />
@@ -539,7 +802,7 @@ export function NewRunDialog({
                       <select
                         id="run-resolution"
                         value={renderSize}
-                        onChange={(e) => setRenderSize(e.target.value as RenderSize)}
+                        onChange={(e) => { setRenderSize(e.target.value as RenderSize); setProfile("custom"); }}
                         disabled={launch.isPending}
                         aria-label="Rollout video resolution"
                       >
@@ -561,7 +824,11 @@ export function NewRunDialog({
                   <div className="rs-select">
                     <select
                       value={autoAdjustPhysics === null ? "default" : autoAdjustPhysics ? "on" : "off"}
-                      onChange={(e) => { const v = e.target.value; setAutoAdjustPhysics(v === "default" ? null : v === "on"); }}
+                      onChange={(e) => {
+                        const v = e.target.value;
+                        setAutoAdjustPhysics(v === "default" ? null : v === "on");
+                        setProfile("custom");
+                      }}
                       disabled={launch.isPending}
                       aria-label="Auto-physics on severe"
                     >

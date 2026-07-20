@@ -92,12 +92,13 @@ function RunStatusBadge({
 
 // ── public entry ──────────────────────────────────────────────────────
 export default function RunsTab({
-  slug, project, selectedStage, setSelectedStage,
+  slug, project, selectedStage, setSelectedStage, onOpenWorld,
 }: {
   slug: string;
   project: ProjectDetail;
   selectedStage?: SelectedStage | null;
   setSelectedStage?: (value: SelectedStage | null) => void;
+  onOpenWorld?: () => void;
 }) {
   const missions = useMissions(slug);
   // §Ship 21d: keep /runs polling through stage boundaries while a mission
@@ -170,7 +171,7 @@ export default function RunsTab({
             <h2 className="rs-h2">Training</h2>
             <div className="rs-flex rs-gap-8">
               <NewMissionDialog slug={slug} onCreated={(s) => setMissionDialogSlug(s)} />
-              <NewRunDialog slug={slug} project={project} onLaunched={(id) => setSelectedRunId(id)} />
+              <NewRunDialog slug={slug} project={project} onLaunched={(id) => setSelectedRunId(id)} onOpenWorld={onOpenWorld} />
             </div>
           </div>
           <div className="rs-card">
@@ -201,6 +202,7 @@ export default function RunsTab({
           onSelectStageRow={selectStageRow}
           onOpenMissionDialog={setMissionDialogSlug}
           onLaunchedRun={(id) => setSelectedRunId(id)}
+          onOpenWorld={onOpenWorld}
         />
         {selected ? (
           <RunDetailPane slug={slug} runId={selected} runs={runs} />
@@ -342,7 +344,7 @@ function durationStr(start: string, end: string): string {
 
 // ── sidebar ───────────────────────────────────────────────────────────
 function RunSidebar({
-  slug, project, sculptRuns, missionGroups, stageLabels, selected, selectedStage, onSelectRun, onSelectStageRow, onOpenMissionDialog, onLaunchedRun,
+  slug, project, sculptRuns, missionGroups, stageLabels, selected, selectedStage, onSelectRun, onSelectStageRow, onOpenMissionDialog, onLaunchedRun, onOpenWorld,
 }: {
   slug: string;
   project: ProjectDetail;
@@ -355,6 +357,7 @@ function RunSidebar({
   onSelectStageRow: (run: RunSummary) => void;
   onOpenMissionDialog: (missionSlug: string) => void;
   onLaunchedRun: (id: string) => void;
+  onOpenWorld?: () => void;
 }) {
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
   const toggle = (s: string) => setCollapsed((st) => ({ ...st, [s]: !st[s] }));
@@ -367,7 +370,7 @@ function RunSidebar({
             instead of forcing a horizontal scrollbar. */}
         <div className="rs-flex rs-gap-6 rs-wrap">
           <NewMissionDialog slug={slug} onCreated={(s) => onOpenMissionDialog(s)} />
-          <NewRunDialog slug={slug} project={project} onLaunched={onLaunchedRun} />
+          <NewRunDialog slug={slug} project={project} onLaunched={onLaunchedRun} onOpenWorld={onOpenWorld} />
         </div>
       </div>
 

@@ -981,7 +981,7 @@ export async function regenerateStageMetric(
 
 
 // ── Dashboard + System ───────────────────────────────────────────────
-import type { DashboardSummary, SystemInfo } from "./types";
+import type { ApiKeyStatus, DashboardSummary, SystemInfo } from "./types";
 
 export async function getDashboard(): Promise<DashboardSummary> {
   return handle<DashboardSummary>(await fetch("/api/dashboard"));
@@ -989,6 +989,16 @@ export async function getDashboard(): Promise<DashboardSummary> {
 
 export async function getSystemInfo(): Promise<SystemInfo> {
   return handle<SystemInfo>(await fetch("/api/system/info"));
+}
+
+export async function putAnthropicApiKey(apiKey: string): Promise<ApiKeyStatus> {
+  return handle<ApiKeyStatus>(
+    await fetch("/api/system/api-key", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ api_key: apiKey }),
+    }),
+  );
 }
 
 // ── §Ship 35: auto-generated objective metrics ────────────────────────

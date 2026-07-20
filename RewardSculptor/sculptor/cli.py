@@ -8,6 +8,7 @@ store (see `sculptor.kg.store.SculptorKG`).
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any, Optional
 
@@ -1208,6 +1209,14 @@ def run(
              "For mjlab this is rsl_rl max_iterations; for gym_sb3 it's "
              "env steps per cycle. UI's 'rsl_rl iters / cycle' field "
              "maps to this."),
+    num_envs: Optional[int] = typer.Option(
+        None, "--num-envs", min=1, max=8192,
+        help="Override [adapter].config.num_envs for this run. "
+             "Supported by adapters that expose a parallel env count."),
+    device: Optional[str] = typer.Option(
+        None, "--device",
+        help="Override the adapter device for this run (cpu, cuda, or "
+             "cuda:N)."),
     # §Ship-7: rollout-video + RL knobs. Each defaults to None, meaning
     # the runner picks a sensible default (real-time video, 500-step
     # episodes, auto-rendered framerate). UI's Advanced tab surfaces
@@ -1307,6 +1316,10 @@ def run(
 
     if fitness_mode not in ("steer", "observe"):
         raise typer.BadParameter("--fitness-mode must be 'steer' or 'observe'")
+    if device is not None and not re.fullmatch(r"(?:cpu|cuda(?::\d+)?)", device):
+        raise typer.BadParameter(
+            "--device must be 'cpu', 'cuda', or 'cuda:N'"
+        )
 
     # Resolve the metric (built-in name or generated-metric path) to a
     # fitness fn (fail fast before any GPU work). None keeps the blind loop.
@@ -1324,6 +1337,8 @@ def run(
         config_path=config, behavior_goal=behavior, iterations=iterations,
         resume=resume_run, no_kg=no_kg, dry_run=dry_run,
         steps_per_iter=steps_per_iter,
+        num_envs=num_envs,
+        device=device,
         max_episode_steps=max_episode_steps,
         playback_speed=playback_speed,
         render_every=render_every,

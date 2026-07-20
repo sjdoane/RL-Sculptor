@@ -28,8 +28,8 @@ const ReportsTabLazy = lazy(() => import("@/components/ReportsTab"));
 // take the results. Values appear in the URL (?tab=) so keep them stable.
 const TABS = [
   { value: "overview", label: "Overview", icon: "gauge" },
-  { value: "rewards", label: "Rewards", icon: "file-code" },
   { value: "world", label: "World", icon: "globe" },
+  { value: "rewards", label: "Rewards", icon: "file-code" },
   { value: "physics", label: "Physics", icon: "cpu" },
   { value: "knowledge", label: "Knowledge", icon: "network" },
   { value: "training", label: "Training", icon: "activity" },
@@ -186,7 +186,14 @@ export default function ProjectDetail() {
         </div>
         <div className="rs-phead-spacer" />
         {p && <ProjectSettingsDialog project={p} />}
-        {p && canRun && <NewRunDialog slug={slug!} project={p} onLaunched={() => setTab("training")} />}
+        {p && canRun && (
+          <NewRunDialog
+            slug={slug!}
+            project={p}
+            onLaunched={() => setTab("training")}
+            onOpenWorld={() => setTab("world")}
+          />
+        )}
       </div>
 
       {project.isLoading ? (
@@ -240,7 +247,21 @@ export default function ProjectDetail() {
               />
             </ScrollPad>
           )}
-          {tab === "world" && <ScrollPad><WorldTab slug={slug!} /></ScrollPad>}
+          {tab === "world" && (
+            <ScrollPad>
+              <WorldTab
+                slug={slug!}
+                launchAction={canRun ? (
+                  <NewRunDialog
+                    slug={slug!}
+                    project={p}
+                    onLaunched={() => setTab("training")}
+                    triggerLabel="Train this world"
+                  />
+                ) : undefined}
+              />
+            </ScrollPad>
+          )}
           {tab === "physics" && <ScrollPad><PhysicsTab slug={slug!} project={p} /></ScrollPad>}
           {tab === "knowledge" && <KnowledgeGraphTab slug={slug!} />}
           {tab === "training" && (
@@ -248,6 +269,7 @@ export default function ProjectDetail() {
               <RunsTabLazy
                 slug={slug!}
                 project={p}
+                onOpenWorld={() => setTab("world")}
                 selectedStage={selectedStage}
                 setSelectedStage={setSelectedStage}
               />
@@ -396,14 +418,19 @@ function WorkflowCard({
 }) {
   const policies = usePolicies(slug);
   const rewards = useRewards(slug);
+  const world = useWorldSelection(slug);
   // Don't flash a wrong checklist while the queries settle (or mislead
   // forever if one errors) — the card is orientation, not status-critical.
-  if (policies.isLoading || rewards.isLoading || policies.error || rewards.error) {
+  if (
+    policies.isLoading || rewards.isLoading || world.isLoading
+    || policies.error || rewards.error
+  ) {
     return null;
   }
   const hasIters = project.n_iterations_completed > 0;
   const hasPolicies = (policies.data?.length ?? 0) > 0;
   const rewardShaped = (rewards.data?.length ?? 0) > 1 || hasIters;
+  const worldAuthored = !!world.data;
   const steps: Array<{
     label: string; done: boolean; tab: TabValue; hint: string;
   }> = [
@@ -412,8 +439,12 @@ function WorkflowCard({
       hint: "Pick a library robot or upload a URDF/MJCF.",
     },
     {
+      label: "Author the world", done: worldAuthored, tab: "world",
+      hint: "Describe terrain, objects, task semantics, and train variations.",
+    },
+    {
       label: "Shape the reward", done: rewardShaped, tab: "rewards",
-      hint: "Review v0 or edit it — the sculptor iterates from here.",
+      hint: "Review the grounded starting reward — the sculptor iterates from here.",
     },
     {
       label: "Train", done: hasIters, tab: "training",

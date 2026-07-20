@@ -49,7 +49,7 @@ from backend.routes.missions import (
     _extract_objective_fitness,
     _read_fitness_and_naturalness,
 )
-from backend.services import mission_store
+from backend.services import mission_store, world_store
 from backend.services.job_manager import Job, JobManager
 from backend.services.project_store import ProjectStore
 from backend.services.run_manager import (
@@ -515,6 +515,30 @@ def launch_run(
             )
 
     project_dir = Path(detail.project_dir)
+    # A promoted authored world is part of the run's scientific input, not a
+    # cosmetic preview. Verify the atomic tuple at the last responsible
+    # moment so a stale browser or direct API client cannot start training on
+    # tampered/drifted artifacts. Legacy projects without a selection keep
+    # their existing default-scene behavior.
+    selection_path = project_dir / "env" / "selection_current.json"
+    if selection_path.is_file():
+        try:
+            world_report = world_store.validate(project_dir)
+        except Exception as exc:  # noqa: BLE001 — fail closed before GPU work
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "authored world could not be verified",
+                detail=f"{type(exc).__name__}: {exc}",
+                type_="/problems/world-integrity",
+            )
+        if not bool(world_report.get("ok")):
+            errors = world_report.get("errors") or ["unknown integrity error"]
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "authored world integrity check failed",
+                detail="; ".join(str(error) for error in errors),
+                type_="/problems/world-integrity",
+            )
     run_params: dict[str, Any] = body.model_dump()
     job = jobs.submit(
         kind="sculpt_run",

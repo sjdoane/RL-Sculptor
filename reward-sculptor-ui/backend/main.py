@@ -43,6 +43,7 @@ from backend.routes import trash as trash_routes
 from backend.routes import worlds as worlds_routes
 from backend.services.job_manager import JobManager
 from backend.services import sculptor_bridge
+from backend.services.api_key_store import load_saved_key
 from backend.services.project_store import ProjectStore
 
 
@@ -61,6 +62,10 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
     root = s.resolved_projects_root
     root.mkdir(parents=True, exist_ok=True)
+    # A key entered in Settings becomes available immediately when saved and
+    # is restored on later launches.  An explicit process environment value
+    # always wins over the UI-saved copy.
+    load_saved_key(root)
     store = ProjectStore(root)
 
     app = FastAPI(

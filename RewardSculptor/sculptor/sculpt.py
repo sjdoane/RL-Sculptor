@@ -2324,6 +2324,8 @@ def sculpt_run(
     no_kg: bool = False,
     dry_run: bool = False,
     steps_per_iter: Optional[int] = None,
+    num_envs: Optional[int] = None,
+    device: Optional[str] = None,
     max_episode_steps: Optional[int] = None,
     playback_speed: Optional[float] = None,
     render_every: Optional[int] = None,
@@ -2460,6 +2462,19 @@ def sculpt_run(
             f"[sculpt] CLI override: {key}={val!r}",
             file=sys.stderr, flush=True,
         )
+    # Launch-scoped adapter resource overrides. Keep config.toml immutable:
+    # the effective values are recorded in run_context.json and applied only
+    # to this adapter instance. Attribute-based application stays generic
+    # across present and future adapters instead of keying on robot/task ids.
+    adapter_cfg = dict(cfg.get("adapter") or {})
+    adapter_values = dict(adapter_cfg.get("config") or {})
+    if num_envs is not None:
+        adapter_values["num_envs"] = int(num_envs)
+    if device is not None:
+        adapter_values["device"] = str(device)
+    if num_envs is not None or device is not None:
+        adapter_cfg["config"] = adapter_values
+        cfg["adapter"] = adapter_cfg
     # §Selection statistics: the progress-tie noise band for keep-best /
     # revert (see `_lex_improved`/`_lex_regressed`). Default 1e-5 sits
     # above the measured seed-noise ramp (1e-7..4e-6, audit §6) and well
@@ -2481,6 +2496,26 @@ def sculpt_run(
             f"no rewards/ dir in {project} — run `sculpt init` first.")
 
     adapter = load_adapter(config_path)
+    if num_envs is not None:
+        if not hasattr(adapter, "num_envs"):
+            raise ValueError(
+                f"{type(adapter).__name__} does not support --num-envs"
+            )
+        adapter.num_envs = int(num_envs)
+        print(
+            f"[sculpt] CLI override: num_envs={num_envs}",
+            file=sys.stderr, flush=True,
+        )
+    if device is not None:
+        if not hasattr(adapter, "device"):
+            raise ValueError(
+                f"{type(adapter).__name__} does not support --device"
+            )
+        adapter.device = str(device)
+        print(
+            f"[sculpt] CLI override: device={device!r}",
+            file=sys.stderr, flush=True,
+        )
     authored_tuple_hash = _pin_authored_selection(adapter, project)
     if authored_tuple_hash:
         _emit_event({

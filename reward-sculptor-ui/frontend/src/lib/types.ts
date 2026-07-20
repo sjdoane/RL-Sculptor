@@ -631,6 +631,12 @@ export interface SystemInfo {
   cuda_device_names: string[];
 }
 
+export interface ApiKeyStatus {
+  configured: boolean;
+  masked: string | null;
+  persisted: boolean;
+}
+
 // ── GPU info (GET /system/gpu) ─────────────────────────────────────────
 export interface GpuDevice {
   index: number;
