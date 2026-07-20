@@ -5,9 +5,10 @@ Hosts the runtime pieces the orchestrator (`sculpt.mission_run`) needs:
   * `_build_criterion_namespace(iter_outcome)` — loads `behavior.json` +
     `trajectory.npz` from the iter's rollout dir, packages them into the
     namespace a success_criterion Python expression can reference.
-  * `_evaluate_success_criterion(criterion, namespace)` — ast-parsed
-    safe-eval that rejects attribute access, function calls outside the
-    math allow-list, and any access to `__builtins__`.
+  * `_evaluate_success_criterion(criterion, namespace)` — ast-parsed,
+    OS-isolated evaluation that rejects attribute access and function calls
+    outside the numerical allow-list before executing the expression in the
+    same resource-limited/seccomp worker used by generated metrics.
   * `StageResult` / `MissionResult` dataclasses — shape of what
     `mission_run` returns to the caller.
 
@@ -93,6 +94,8 @@ BARE_IDENTIFIERS: frozenset[str] = frozenset({
     # Tensor-ish methods that numpy arrays expose as attributes; we'll
     # allow `.mean()`, `.max()`, etc. via the ast.Attribute checker.
 })
+
+_SAFE_CALLABLE_NAMES = BARE_IDENTIFIERS - {"metric"}
 
 # Method names allowed on array objects inside the criterion. Anything
 # NOT on this list is blocked, preventing e.g. `.tobytes()`,
@@ -290,6 +293,119 @@ def _validate_criterion_ast(
                     f"{node.id!r}. Available in namespace: "
                     f"{sorted(namespace_keys)}"
                 )
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            if (node.func.id in namespace_keys
+                    and node.func.id not in _SAFE_CALLABLE_NAMES):
+                raise CriterionEvalError(
+                    f"criterion calls disallowed function {node.func.id!r}. "
+                    f"Allowed bare callables: {sorted(_SAFE_CALLABLE_NAMES)}"
+                )
+
+
+# Trusted adapter source for the hardened generated-code worker.  The criterion
+# itself remains data until this function runs *after* rlimits, NO_NEW_PRIVS,
+# and (fail-closed on Linux) seccomp are installed.  The parent AST gate is
+# still the semantic contract; the worker is the independent containment layer.
+_CRITERION_SANDBOX_SOURCE = r'''
+def compute_spec(arrays, behavior, meta):
+    trajectory = {
+        name[len("trajectory::"):]: value
+        for name, value in arrays.items()
+        if name.startswith("trajectory::")
+    }
+    if meta["info_is_trajectory"]:
+        info = trajectory
+    else:
+        info = {
+            name[len("info::"):]: value
+            for name, value in arrays.items()
+            if name.startswith("info::")
+        }
+    namespace = dict(meta["scalars"])
+    namespace.update({
+        "behavior": behavior,
+        "components": meta["components"],
+        "trajectory": trajectory,
+        "info": info,
+    })
+    helpers = {
+        "abs": abs, "min": min, "max": max, "sum": sum, "len": len,
+        "round": round, "float": float, "int": int, "bool": bool,
+    }
+    namespace.update({
+        name: helpers[name] for name in meta["helpers"]
+    })
+    compiled = compile(meta["criterion"], "<success_criterion>", "eval")
+    result = eval(compiled, {"__builtins__": __builtins__}, namespace)
+    return {"spec_score": bool(result)}
+'''
+
+_CRITERION_DICT_NAMES = frozenset({
+    "behavior", "components", "trajectory", "info",
+})
+
+
+def _evaluate_criterion_isolated(
+    criterion: str, namespace: dict[str, Any],
+) -> bool:
+    """Evaluate one pre-validated criterion in a fresh hardened worker.
+
+    A fresh process per decision prevents one criterion from poisoning the
+    globals used by another.  Import lazily to avoid making mission model
+    imports pull in the full evaluation layer when no criterion is run.
+    """
+    from sculptor.eval.generated_metric import _SandboxedGeneratedMetric
+
+    def _mapping(name: str) -> dict[str, Any]:
+        value = namespace.get(name, {})
+        if value is None:
+            return {}
+        if not isinstance(value, dict):
+            raise CriterionEvalError(
+                f"criterion namespace {name!r} must be a dict, got "
+                f"{type(value).__name__}")
+        return value
+
+    trajectory = _mapping("trajectory")
+    info = namespace.get("info", trajectory)
+    if info is None:
+        info = {}
+    if not isinstance(info, dict):
+        raise CriterionEvalError(
+            f"criterion namespace 'info' must be a dict, got "
+            f"{type(info).__name__}")
+    wire_arrays = {
+        f"trajectory::{name}": value for name, value in trajectory.items()
+    }
+    info_is_trajectory = info is trajectory
+    if not info_is_trajectory:
+        wire_arrays.update({
+            f"info::{name}": value for name, value in info.items()
+        })
+    scalars = {
+        name: value for name, value in namespace.items()
+        if name not in _CRITERION_DICT_NAMES
+        and name not in _SAFE_CALLABLE_NAMES
+        and not callable(value)
+    }
+    meta = {
+        "criterion": criterion,
+        "components": _mapping("components"),
+        "scalars": scalars,
+        "helpers": sorted(_SAFE_CALLABLE_NAMES.intersection(namespace)),
+        "info_is_trajectory": info_is_trajectory,
+    }
+    worker = _SandboxedGeneratedMetric(
+        _CRITERION_SANDBOX_SOURCE, Path("<success-criterion>"))
+    try:
+        worker.start()
+        result = worker(wire_arrays, _mapping("behavior"), meta)
+    finally:
+        worker.close()
+    if "spec_score" not in result:
+        raise CriterionEvalError(
+            "criterion sandbox returned no boolean result")
+    return bool(result["spec_score"])
 
 
 def _evaluate_success_criterion(
@@ -302,9 +418,9 @@ def _evaluate_success_criterion(
     names the criterion can reference; values are whatever the criterion
     binds (scalars, numpy arrays, dicts for subscript access).
 
-    The eval is run with `__builtins__={}`, so Python's built-in
-    `__import__`, `open`, `eval`, etc. are unreachable. Names not in
-    `namespace` raise NameError rather than resolving to a builtin.
+    The expression never executes in this process. The validated immutable
+    string and a bounded copy of its numerical namespace cross into a fresh
+    resource-limited worker. Linux fails closed unless seccomp is active.
     """
     try:
         # Strip first: the decompose-time validator strips before
@@ -321,19 +437,7 @@ def _evaluate_success_criterion(
     _validate_criterion_ast(tree, namespace_keys=set(namespace.keys()))
 
     try:
-        compiled = compile(tree, filename="<criterion>", mode="eval")
-        # Safety note: we DON'T zero out __builtins__ because numpy's
-        # ndarray methods (.mean, .max, .std) internally call
-        # `__import__` to resolve dependencies, and an empty
-        # __builtins__ dict turns that into a KeyError. The primary
-        # safety layer is the AST walker above — it already rejects
-        # ast.Call to names outside the namespace, ast.Attribute
-        # outside SAFE_ATTRIBUTE_METHODS, ast.Lambda, ast.FunctionDef,
-        # etc. Letting eval see real __builtins__ only lets code
-        # ALREADY validated-as-safe run; anything dangerous would
-        # have been caught at parse time.
-        eval_globals = {"__builtins__": __builtins__}
-        result = eval(compiled, eval_globals, namespace)
+        result = _evaluate_criterion_isolated(criterion.strip(), namespace)
     except AttributeError as e:  # noqa: BLE001 — re-raised
         # §Ship 21c: torch idioms (.float(), .long(), .cpu(), etc.)
         # crash here on numpy arrays. Decompose-time validator catches
@@ -378,6 +482,16 @@ def _evaluate_success_criterion(
             f"did not produce this iter. Available keys — {avail_str}. "
             f"Reference only keys your reward_seed_prompt actually defines, "
             f"or use `<dict>.get({missing!r}, <default>)` for a soft check."
+        ) from e
+    except ValueError as e:
+        if "ambiguous" in str(e).lower() or "more than one" in str(e).lower():
+            raise CriterionEvalError(
+                "criterion result is a multi-element array; wrap with .all(), "
+                ".any(), .mean(), or compare to a scalar to reduce to a "
+                f"single boolean. Original: {e}"
+            ) from e
+        raise CriterionEvalError(
+            f"criterion raised at eval time: {type(e).__name__}: {e}"
         ) from e
     except Exception as e:  # noqa: BLE001 — re-raised as our type
         raise CriterionEvalError(

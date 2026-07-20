@@ -397,10 +397,10 @@ before a new headline campaign:
   short-hold behaviors;
 - add hard timeouts to every model call plus a job-level metric-generation
   watchdog;
-- finish process/container isolation for generated metric and criterion code
-  (**partial 2026-07-19:** generated objective metrics now execute behind a
-  resource-limited, secret-free process boundary that fails closed on Linux
-  without seccomp; success-criterion expression isolation remains open);
+- maintain process/container isolation for generated metric and criterion code
+  (**completed 2026-07-19:** both objective metrics and mission success
+  criteria now execute behind the shared resource-limited, secret-free process
+  boundary that fails closed on Linux without seccomp);
 - select p10, median, and p90 episode videos for review rather than presenting
   only the best-return episode.
 

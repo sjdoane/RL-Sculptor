@@ -1,8 +1,77 @@
+# Latest handoff — mission success-criterion process isolation (2026-07-19)
+
+Codex completed and verified the remaining evaluator-isolation half of P0.11
+while Claude continued the A4 evidence track. This slice is self-contained in
+the commit that includes this handoff. It starts from `e2d4a4d`, touches no
+A4-owned adapter/spec-audit/calibration/evidence files, and launches no GPU
+work. The pre-existing transient `.fleaven*`, `.ingest*`, `.metric*`, and
+`.pytest*` artifacts remain untracked and were not staged.
+
+Decision and implementation:
+
+- `mission_runtime._evaluate_success_criterion` previously AST-screened an
+  LLM-authored expression, then compiled/evaluated it in the campaign process
+  with real builtins. The AST gate was strong but explicitly non-proving, so
+  this was the remaining process-isolation gap documented by the roadmap.
+- Criteria now reuse the already adversarially hardened generated-metric worker
+  rather than creating a second syscall/resource policy that could drift. The
+  parent still parses and validates the exact immutable expression; compilation,
+  eval, and boolean coercion happen only after the worker has established its
+  private cwd/environment, rlimits, `NO_NEW_PRIVS`, and fail-closed Linux
+  seccomp filter.
+- A trusted adapter transports `metric`, `behavior`, `components`,
+  `trajectory`, and `info` through the bounded JSON/raw-array protocol. It
+  preserves `info is trajectory` when aliased and keeps the mappings distinct
+  when a caller supplies them separately. Helper functions are reconstructed
+  from a fixed builtin allowlist; caller-supplied callables never cross IPC.
+- Every criterion decision gets a fresh worker. This is intentional: a bypassed
+  expression can mutate or crash its own interpreter, but cannot poison the
+  next stage's authority decision. Hangs retain the parent-enforced 3-second
+  wall limit, and native crashes become `CriterionEvalError` without taking
+  down the campaign.
+- Runtime diagnostics remain compatible: remote `KeyError` still becomes the
+  recoverable `CriterionMissingKeyError`; NumPy ambiguous-array results keep
+  the `.all()`/`.any()` guidance; unknown-name error ordering is unchanged.
+  The AST validator now also enforces its previously documented but missing
+  rule that bare calls must target the fixed numerical helper allowlist.
+
+Files changed/added:
+
+- `RewardSculptor/sculptor/mission_runtime.py`
+- `RewardSculptor/tests/test_criterion_sandbox.py` (new)
+- `RewardSculptor/docs/generated_metric_sandbox.md` (now documents both
+  evaluator paths and their explicit non-goals)
+- `docs/internal/REWARDSCULPTOR_RESEARCH_GRADE_ROADMAP.md` (metric + criterion
+  isolation item marked complete)
+
+Verification evidence:
+
+- Criterion boundary suite: **9 passed**. It independently bypasses the AST
+  validator and proves filesystem/socket attempts are denied, parent secrets
+  are absent, infinite expressions time out, a native `ctypes` crash is local,
+  and interpreter/builtins poisoning does not cross decisions. It also pins
+  normal numerical semantics and distinct `info`/`trajectory` mappings.
+- Focused mission/decomposition/criterion battery: **260 passed in 37.14s**.
+- Repository-wide requested command:
+  `MUJOCO_GL=egl .venv/bin/python -m pytest tests/ -q
+  --ignore=tests/test_refs_preview.py` -> **2,134 passed, 1 optional-JAX skip,
+  152 warnings in 229.69s (3:49)**.
+- `uvx ruff check`, targeted `compileall`, and `git diff --check` passed.
+
+Honest boundary: objective metrics and mission success criteria are now both
+OS-isolated. This does **not** claim isolation for generated reward
+implementations, tools, or algorithm code; those remain separate A8 capability
+boundaries. Static semantic gates and evaluator calibration also remain
+necessary—the process sandbox prevents parent compromise/DoS, not reward
+gaming or a scientifically invalid criterion.
+
+---
+
 # Latest handoff — generated objective-metric process isolation (2026-07-19)
 
 Codex completed a separate CPU-only P0.11 slice while Claude continued A4 GPU
-evidence collection. It is intentionally **uncommitted** on
-`ship-20-ux-revamp` at coordinator commit `5a4978c`. No A4-owned adapter,
+evidence collection. It was committed as `70a87d8` on
+`ship-20-ux-revamp`. No A4-owned adapter,
 spec-audit/metric-axiom/calibration, evidence-doc, benchmark-doc, or GPU file was
 modified; no GPU command was launched. The already-committed coordinator was
 also left untouched.
