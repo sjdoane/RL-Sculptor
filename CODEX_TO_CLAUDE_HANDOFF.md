@@ -674,3 +674,10 @@ Also added ignore rules for the explicitly protected local `.fleaven*`,
 `.ingest*`, `.metric*`, and `.pytest*` transcripts. The files remain untouched
 and unstaged, but they no longer make `run_context.json` falsely label a clean
 source commit dirty.
+
+For the call, use the clean successor project
+`lab-call-authored-parkour` (“Lab Call — Authored Parkour”), not the rehearsal
+project above. It was created entirely through the UI after the fix, has no
+failed-run history, and promoted the matching parkour prompt as World selection
+v1 with tuple-hash prefix `34caeae995be`; all eight admission gates passed.
+The lab-call runbook now points to this final project.

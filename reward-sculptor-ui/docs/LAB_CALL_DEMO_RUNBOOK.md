@@ -34,14 +34,14 @@ owner-only permissions. The UI and API only display its masked suffix.
 
 ### 3. Use the prepared project
 
-Open **Projects → Lab Call — Authored Rough Terrain**. It is configured as:
+Open **Projects → Lab Call — Authored Parkour**. It is configured as:
 
 - Robot: `Unitree Go1`
 - Adapter: `mjlab`
 - Task: `Mjlab-Velocity-Rough-Unitree-Go1`
 - Device: `cuda:0`
 
-The **World** tab should show `Authoritative world tuple`, selection `v2`, and
+The **World** tab should show `Authoritative world tuple`, selection `v1`, and
 `Verified for launch`. The scene is a five-element ordered parkour course with
 three ascending platforms and two physical gaps.
 
@@ -153,7 +153,7 @@ robots share the same core world-selection and launch contract.
 
 - Keep the laptop on AC power and disable sleep for the call window.
 - Start `./run.sh` and verify the dashboard reports no orphaned active job.
-- Open the prepared project and confirm World selection v2 is verified.
+- Open the prepared project and confirm World selection v1 is verified.
 - Confirm at least one completed rollout video plays in Training or Results.
 - Do not re-author or relaunch the completed project immediately before the call.
 - Keep one known-good result open in a browser tab as the presentation fallback.
