@@ -9,7 +9,7 @@ Covers the three claims the benchmark manifests depend on:
    finger groups, objects, and injectable contact sensors (CPU spec
    compile only — no env construction, no GPU);
 3. the recorder produces honest per-step arrays: object root states,
-   bilateral-contact grasp evidence, per-step target identity remapped to
+   independent-contact grasp evidence, per-step target identity remapped to
    the discovered object order, and a manifest that states every
    derivation.
 """
@@ -22,6 +22,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
+import sculptor.adapters.manipulation_telemetry as telemetry_module
+import sculptor.world.capabilities as capabilities_module
 from sculptor.adapters.manipulation_telemetry import (
     TELEMETRY_MANIFEST_NAME,
     ManipulationDiscovery,
@@ -146,6 +148,41 @@ def test_discovery_requires_objects_and_one_robot():
         _scene_cfg({}), discovery).sensor_names == ()
 
 
+def test_generic_multi_body_gripper_becomes_independent_evidence_groups(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Future grippers need descriptor data, not a new robot-name branch."""
+    capability = SimpleNamespace(
+        capability_id="example:three_finger_arm",
+        body_roles={
+            "end_effector": ("wrist",),
+            "gripper": ("finger_a", "finger_b", "finger_c"),
+        },
+        site_roles={"tool_center": ("tcp",)},
+        capabilities=frozenset({"manipulation", "grasp", "lift"}),
+    )
+    monkeypatch.setattr(
+        capabilities_module, "robot_capabilities",
+        lambda: {capability.capability_id: capability},
+    )
+    monkeypatch.setattr(
+        telemetry_module, "_robot_model_names",
+        lambda _cfg: (
+            {"wrist", "finger_a", "finger_b", "finger_c"}, {"tcp"}),
+    )
+    discovery = discover_from_cfg(_scene_cfg({
+        "arm": _actuated_cfg(), "workpiece": _passive_cfg(),
+    }))
+    assert discovery is not None
+    assert discovery.capability_id == "example:three_finger_arm"
+    assert discovery.finger_groups == {
+        "finger_0": ("finger_a",),
+        "finger_1": ("finger_b",),
+        "finger_2": ("finger_c",),
+    }
+    assert discovery.grasp_capable is True
+
+
 # ── 3. recorder semantics on a fake env ───────────────────────────────
 N = 4  # fake env count
 
@@ -235,8 +272,14 @@ def _fake_env(*, multi_target: bool):
 def test_recorder_records_objects_contacts_grasp_and_target(tmp_path: Path):
     env, discovery = _fake_env(multi_target=True)
     recorder = ManipulationRecorder(env, discovery)
-    recorder.append()
-    recorder.append()
+    recorder.append(
+        valid_mask=np.asarray([1, 1, 0, 1]),
+        terminal_mask=np.asarray([0, 0, 1, 0]),
+    )
+    recorder.append(
+        valid_mask=np.asarray([1, 0, 0, 1]),
+        terminal_mask=np.asarray([0, 1, 0, 0]),
+    )
     arrays = recorder.finalize()
 
     assert arrays["ee_pos_w"].shape == (2, N, 3)
@@ -258,13 +301,20 @@ def test_recorder_records_objects_contacts_grasp_and_target(tmp_path: Path):
     assert arrays["target_object_index"].dtype == np.int32
     assert arrays["target_object_index"][0].tolist() == [1, 0, 0, 1]
     assert arrays["target__pos_w"].shape == (2, N, 3)
+    assert arrays["rollout_valid"].dtype == np.bool_
+    assert arrays["rollout_valid"].tolist() == [
+        [True, True, False, True], [True, False, False, True]]
+    assert arrays["rollout_terminal"].tolist() == [
+        [False, False, True, False], [False, True, False, False]]
 
     recorder.write_manifest(tmp_path, arrays)
     manifest = json.loads(
         (tmp_path / TELEMETRY_MANIFEST_NAME).read_text(encoding="utf-8"))
     assert manifest["object_names"] == ["cube", "other"]
     assert manifest["grasp_capable"] is True
-    assert "bilateral finger contact" in manifest["derivations"]["grasp"]
+    assert "two independent" in manifest["derivations"]["grasp"]
+    assert manifest["schema_version"] == 2
+    assert manifest["target_contract"]["position_frame"] == "world"
     assert manifest["channels"]["grasp__cube"]["shape"] == [2, N]
 
 

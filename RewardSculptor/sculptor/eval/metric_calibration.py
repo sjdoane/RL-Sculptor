@@ -203,6 +203,24 @@ def calibrate_metric(
     `ok=True` (steer-rights earned) iff rho ≥ threshold. Never raises."""
     if builtin_name not in _SPEC_FNS:
         raise KeyError(f"unknown built-in metric {builtin_name!r}")
+    if builtin_name == "object_lift_hold":
+        # Unlike fixed-shape locomotion arrays, manipulation keys and contact
+        # semantics come from a task's frozen sidecar/catalog. Inventing one
+        # generic synthetic ladder here would grant misleading calibration
+        # rights across arbitrary objects and grippers. Use task-derived real
+        # rollouts after the task receives an A4 certificate.
+        return {
+            "ok": False,
+            "spearman": 0.0,
+            "threshold": threshold,
+            "builtin": builtin_name,
+            "error": (
+                "object_lift_hold calibration requires task-derived frozen "
+                "rollouts and a matching manipulation channel contract; the "
+                "legacy synthetic calibration ladder is intentionally "
+                "unavailable"
+            ),
+        }
     try:
         catalog = resolve_channel_catalog(channel_catalog)
     except Exception as e:  # noqa: BLE001

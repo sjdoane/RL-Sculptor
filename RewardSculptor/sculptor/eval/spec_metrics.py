@@ -747,12 +747,287 @@ def spec_go1_trot(
     }
 
 
+def _prefix_length(mask: np.ndarray) -> int:
+    """Length of the initial true run in a one-dimensional boolean mask."""
+    false = np.flatnonzero(~mask)
+    return int(false[0]) if false.size else int(mask.size)
+
+
+def _longest_true_run(mask: np.ndarray) -> int:
+    """Longest contiguous true run in a one-dimensional boolean mask."""
+    best = current = 0
+    for value in mask:
+        current = current + 1 if bool(value) else 0
+        best = max(best, current)
+    return best
+
+
+def spec_object_lift_hold(
+    arrays: Mapping[str, np.ndarray],
+    behavior: Mapping[str, Any],
+    meta: Optional[Mapping[str, Any]] = None,
+) -> dict[str, float]:
+    """Target-aware lift-clear-and-hold completion for grasping robots.
+
+    This metric is deliberately capability- and artifact-driven: there are no
+    robot, task, or object-name branches. A completion requires one target to
+    begin below its world-space goal, rise at least 8 cm, remain within the
+    task's (capped) 5 cm goal tolerance for 0.5 s, remain mechanically held by
+    at least two independent contact groups, and stay dynamically quiet. For
+    multi-object tasks every non-target object must remain within 5 cm of its
+    initial pose through completion.
+
+    Episode and command boundaries are hard boundaries. Invalid target IDs,
+    post-reset samples, command changes, implausible state jumps, and
+    excessive velocity turn the affected environment into an honest zero;
+    non-finite telemetry and forged grasp/contact disagreement fail the
+    whole artifact closed. ``spec_score`` is the binary
+    completion rate across the originally requested vector environments; the
+    continuous fields are diagnostics only and never substitute for completion.
+    """
+    contract = dict((meta or {}).get("manipulation_telemetry") or {})
+    object_names = tuple(contract.get("object_names") or ())
+    finger_groups = tuple(sorted((contract.get("finger_groups") or {}).keys()))
+    if not object_names:
+        raise ValueError("manipulation telemetry declares no objects")
+    if not bool(contract.get("grasp_capable")) or len(finger_groups) < 2:
+        raise ValueError(
+            "object_lift_hold requires two independent grasp-contact groups")
+
+    step_dt = float(behavior.get("step_dt") or 0.0)
+    if not np.isfinite(step_dt) or not 0.001 <= step_dt <= 0.2:
+        raise ValueError(f"invalid behavior.step_dt {step_dt!r}")
+
+    target_idx = np.asarray(arrays["target_object_index"])
+    target_pos = np.asarray(arrays["target__pos_w"], dtype=np.float64)
+    valid = np.asarray(arrays["rollout_valid"], dtype=bool)
+    terminal = np.asarray(arrays["rollout_terminal"], dtype=bool)
+    if target_idx.ndim != 2:
+        raise ValueError(
+            f"target_object_index must be (T, E), got {target_idx.shape}")
+    T, E = target_idx.shape
+    if target_pos.shape != (T, E, 3):
+        raise ValueError(f"target__pos_w must be {(T, E, 3)}")
+    if valid.shape != (T, E) or terminal.shape != (T, E):
+        raise ValueError("rollout masks must match target_object_index")
+
+    positions: list[np.ndarray] = []
+    lin_velocities: list[np.ndarray] = []
+    ang_velocities: list[np.ndarray] = []
+    grasps: list[np.ndarray] = []
+    for name in object_names:
+        pos = np.asarray(arrays[f"object__{name}__pos_w"], dtype=np.float64)
+        lin = np.asarray(
+            arrays[f"object__{name}__lin_vel_w"], dtype=np.float64)
+        ang = np.asarray(
+            arrays[f"object__{name}__ang_vel_w"], dtype=np.float64)
+        grasp = np.asarray(arrays[f"grasp__{name}"]) > 0.5
+        if pos.shape != (T, E, 3) or lin.shape != (T, E, 3) \
+                or ang.shape != (T, E, 3) or grasp.shape != (T, E):
+            raise ValueError(f"object {name!r} telemetry shapes are inconsistent")
+        contacts = [
+            np.asarray(arrays[f"contact__{group}__{name}"]) > 0.5
+            for group in finger_groups
+        ]
+        if any(contact.shape != (T, E) for contact in contacts):
+            raise ValueError(f"object {name!r} contact shapes are inconsistent")
+        derived = np.sum(np.stack(contacts, axis=0), axis=0) >= 2
+        if not np.array_equal(grasp, derived):
+            raise ValueError(
+                f"grasp__{name} disagrees with independent contact channels")
+        positions.append(pos)
+        lin_velocities.append(lin)
+        ang_velocities.append(ang)
+        grasps.append(grasp)
+
+    pos_all = np.stack(positions, axis=0)       # (O, T, E, 3)
+    lin_all = np.stack(lin_velocities, axis=0)
+    ang_all = np.stack(ang_velocities, axis=0)
+    grasp_all = np.stack(grasps, axis=0)        # (O, T, E)
+    if not all(np.all(np.isfinite(value)) for value in (
+        target_pos, pos_all, lin_all, ang_all,
+    )):
+        raise ValueError("manipulation telemetry contains non-finite values")
+
+    declared_tolerance = (
+        (contract.get("target_contract") or {})
+        .get("declared_success_threshold_m", 0.05)
+    )
+    try:
+        target_tolerance = min(0.05, float(declared_tolerance))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid target success threshold") from exc
+    if not np.isfinite(target_tolerance) or target_tolerance <= 0:
+        raise ValueError("invalid target success threshold")
+
+    baseline_frames = max(2, int(np.ceil(0.10 / step_dt)))
+    pickup_frames = max(baseline_frames, int(np.ceil(0.20 / step_dt)))
+    hold_frames = max(2, int(np.ceil(0.50 / step_dt)))
+    max_grasp_gap = max(1, int(np.floor(0.10 / step_dt)))
+    min_clearance = 0.08
+    max_distractor_displacement = 0.05
+
+    completions = np.zeros(E, dtype=bool)
+    structurally_valid = np.zeros(E, dtype=bool)
+    physically_valid = np.zeros(E, dtype=bool)
+    peak_lifts = np.zeros(E, dtype=np.float64)
+    min_goal_errors = np.full(E, np.inf, dtype=np.float64)
+    best_grasp_fractions = np.zeros(E, dtype=np.float64)
+    longest_holds = np.zeros(E, dtype=np.float64)
+    distractor_displacements = np.zeros(E, dtype=np.float64)
+
+    for env_index in range(E):
+        env_valid = valid[:, env_index]
+        valid_len = _prefix_length(env_valid)
+        # The validity mask must be one contiguous prefix. A terminal marker is
+        # either absent (capture ended) or exactly the first invalid sample.
+        if np.any(env_valid[valid_len:]):
+            continue
+        terminal_at = np.flatnonzero(terminal[:, env_index])
+        if terminal_at.size > 1:
+            continue
+        if terminal_at.size and int(terminal_at[0]) != valid_len:
+            continue
+        if valid_len < baseline_frames + hold_frames:
+            continue
+
+        first_index = int(target_idx[0, env_index])
+        if not 0 <= first_index < len(object_names):
+            continue
+        first_target = target_pos[0, env_index]
+        # Treat a command/identity resample as a new attempt. Only the first
+        # uninterrupted command segment can score, preventing mid-rollout
+        # object resets from masquerading as transport.
+        same_identity = target_idx[:valid_len, env_index] == first_index
+        same_command = np.linalg.norm(
+            target_pos[:valid_len, env_index] - first_target, axis=-1,
+        ) <= 1e-6
+        segment_len = _prefix_length(same_identity & same_command)
+        if segment_len < baseline_frames + hold_frames:
+            continue
+        structurally_valid[env_index] = True
+
+        obj_pos = pos_all[first_index, :segment_len, env_index]
+        obj_lin = lin_all[first_index, :segment_len, env_index]
+        obj_ang = ang_all[first_index, :segment_len, env_index]
+        obj_grasp = grasp_all[first_index, :segment_len, env_index]
+        baseline = np.median(obj_pos[:baseline_frames], axis=0)
+        initial_goal_error = float(np.linalg.norm(first_target - baseline))
+        vertical_goal_gap = float(first_target[2] - baseline[2])
+        if vertical_goal_gap < min_clearance or initial_goal_error < min_clearance:
+            continue
+        if float(np.mean(obj_grasp[:baseline_frames])) > 0.2:
+            continue
+        # Spawned rigid bodies can settle for a few frames. A maximum-speed
+        # gate made a single normal contact impulse veto the whole attempt on
+        # real YAM rollouts; the median rejects sustained initial motion while
+        # the jump/global-speed gates below still reject resets and explosions.
+        if float(np.median(np.linalg.norm(
+            obj_lin[:baseline_frames], axis=-1,
+        ))) > 0.5:
+            continue
+
+        # Global plausibility gates are relative (vectorized world origins may
+        # be far from zero). The absolute displacement floor below tolerates
+        # contact impulses, so a sub-floor crawl with forged zero velocities
+        # is NOT caught here: honest simulator provenance is established by
+        # the spec-audit evidence hashes, not by these physics gates alone.
+        implausible = False
+        for object_index in range(len(object_names)):
+            p = pos_all[object_index, :segment_len, env_index]
+            lv = lin_all[object_index, :segment_len, env_index]
+            av = ang_all[object_index, :segment_len, env_index]
+            speed = np.linalg.norm(lv, axis=-1)
+            if np.max(speed) > 10.0 or np.max(np.linalg.norm(av, axis=-1)) > 100.0:
+                implausible = True
+                break
+            if segment_len > 1:
+                step_displacement = np.linalg.norm(np.diff(p, axis=0), axis=-1)
+                speed_bound = (
+                    3.0 * np.maximum(speed[:-1], speed[1:]) * step_dt + 0.02)
+                if np.any(step_displacement > np.maximum(0.12, speed_bound)):
+                    implausible = True
+                    break
+            object_baseline = np.median(p[:baseline_frames], axis=0)
+            if np.max(np.linalg.norm(p - object_baseline, axis=-1)) > 5.0:
+                implausible = True
+                break
+        if implausible:
+            continue
+        physically_valid[env_index] = True
+
+        lift = obj_pos[:, 2] - baseline[2]
+        error = np.linalg.norm(obj_pos - first_target, axis=-1)
+        lin_speed = np.linalg.norm(obj_lin, axis=-1)
+        ang_speed = np.linalg.norm(obj_ang, axis=-1)
+        goal_stable = (
+            (lift >= min_clearance)
+            & (error <= target_tolerance)
+            & (lin_speed <= 0.15)
+            & (ang_speed <= 1.0)
+        )
+        peak_lifts[env_index] = max(0.0, float(np.max(lift)))
+        min_goal_errors[env_index] = float(np.min(error))
+        longest_holds[env_index] = (
+            _longest_true_run(goal_stable) * step_dt)
+
+        for start in range(pickup_frames, segment_len - hold_frames + 1):
+            stop = start + hold_frames
+            if not np.all(goal_stable[start:stop]):
+                continue
+            held = obj_grasp[start:stop]
+            grasp_fraction = float(np.mean(held))
+            best_grasp_fractions[env_index] = max(
+                best_grasp_fractions[env_index], grasp_fraction)
+            if grasp_fraction < 0.8:
+                continue
+            if _longest_true_run(~held) > max_grasp_gap:
+                continue
+
+            disturbed = 0.0
+            for other_index in range(len(object_names)):
+                if other_index == first_index:
+                    continue
+                other = pos_all[other_index, :stop, env_index]
+                other_base = np.median(other[:baseline_frames], axis=0)
+                disturbed = max(
+                    disturbed,
+                    float(np.max(np.linalg.norm(other - other_base, axis=-1))),
+                )
+            distractor_displacements[env_index] = disturbed
+            if disturbed > max_distractor_displacement:
+                continue
+            completions[env_index] = True
+            break
+
+    finite_goal_errors = min_goal_errors[np.isfinite(min_goal_errors)]
+    return {
+        "completion_rate": float(np.mean(completions)) if E else 0.0,
+        "structurally_valid_rate": float(np.mean(structurally_valid)) if E else 0.0,
+        "physically_valid_rate": float(np.mean(physically_valid)) if E else 0.0,
+        "mean_peak_lift_m": float(np.mean(peak_lifts)) if E else 0.0,
+        "mean_min_goal_error_m": (
+            float(np.mean(finite_goal_errors))
+            if finite_goal_errors.size else 0.0),
+        "mean_best_grasp_fraction": (
+            float(np.mean(best_grasp_fractions)) if E else 0.0),
+        "mean_longest_goal_hold_s": (
+            float(np.mean(longest_holds)) if E else 0.0),
+        "max_distractor_displacement_m": (
+            float(np.max(distractor_displacements)) if E else 0.0),
+        "target_tolerance_m": target_tolerance,
+        "required_hold_s": hold_frames * step_dt,
+        "spec_score": float(np.mean(completions)) if E else 0.0,
+    }
+
+
 _SPEC_FNS: dict[str, Callable[..., dict[str, float]]] = {
     "cartpole_balance": spec_cartpole_balance,
     "g1_floss": spec_g1_floss,
     "g1_jump": spec_g1_jump,
     "g1_kick": spec_g1_kick,
     "go1_trot": spec_go1_trot,
+    "object_lift_hold": spec_object_lift_hold,
 }
 
 
@@ -813,6 +1088,12 @@ _REQUIRED_ARRAYS: dict[str, tuple[str, ...]] = {
     # working with stationarity=1.0.
     "g1_kick": ("joint_vel", "projected_gravity_b", "root_link_pos_w"),
     "go1_trot": ("root_link_pos_w", "projected_gravity_b"),
+    # Object-specific state/contact keys are expanded from the hashable
+    # manipulation sidecar by `_manipulation_required_arrays`.
+    "object_lift_hold": (
+        "target_object_index", "target__pos_w",
+        "rollout_valid", "rollout_terminal",
+    ),
 }
 
 #: §Ship 54-pre (#12): the FULL set of physical observables each spec metric MAY
@@ -831,6 +1112,11 @@ _METRIC_OBSERVABLES: dict[str, tuple[str, ...]] = {
         "joint_pos", "left_foot_pos_b", "right_foot_pos_b",
     ),
     "go1_trot": ("root_link_pos_w", "projected_gravity_b"),
+    "object_lift_hold": (
+        "target_object_index", "target__pos_w",
+        "rollout_valid", "rollout_terminal",
+        "object_state", "object_contact", "grasp_evidence",
+    ),
 }
 
 
@@ -847,6 +1133,59 @@ def metric_observables(spec_name: str) -> frozenset[str]:
 
 #: Capture settings echoed into every result for E2 parity assertions.
 _CAPTURE_KEYS = ("step_dt", "max_episode_steps", "rollout_num_envs")
+
+
+def _load_manipulation_manifest(rollout_dir: Path) -> dict[str, Any]:
+    """Load and strictly validate the dynamic manipulation array contract."""
+    path = rollout_dir / "manipulation_telemetry.json"
+    if not path.is_file():
+        raise ValueError(f"manipulation_telemetry.json missing in {rollout_dir}")
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict):
+        raise ValueError("manipulation telemetry manifest must be an object")
+    if manifest.get("schema_version") != 2:
+        raise ValueError(
+            "object_lift_hold requires manipulation telemetry schema 2 "
+            "with first-episode masks")
+    names = manifest.get("object_names")
+    if not isinstance(names, list) or not names or any(
+        not isinstance(name, str) or not name for name in names
+    ) or len(set(names)) != len(names):
+        raise ValueError("manipulation telemetry object_names are invalid")
+    groups = manifest.get("finger_groups")
+    if not isinstance(groups, dict) or len(groups) < 2 or any(
+        not isinstance(group, str) or not group
+        or not isinstance(bodies, list) or not bodies
+        for group, bodies in groups.items()
+    ):
+        raise ValueError(
+            "object_lift_hold requires at least two contact-evidence groups")
+    if manifest.get("grasp_capable") is not True:
+        raise ValueError("manipulation telemetry is not grasp-capable")
+    target_contract = manifest.get("target_contract")
+    if not isinstance(target_contract, dict) \
+            or target_contract.get("position_frame") != "world":
+        raise ValueError("target position must declare the world frame")
+    channels = manifest.get("channels")
+    if not isinstance(channels, dict):
+        raise ValueError("manipulation telemetry channels are missing")
+    return manifest
+
+
+def _manipulation_required_arrays(
+    manifest: Mapping[str, Any],
+) -> tuple[str, ...]:
+    needed = list(_REQUIRED_ARRAYS["object_lift_hold"])
+    groups = sorted(manifest["finger_groups"])
+    for name in manifest["object_names"]:
+        needed.extend((
+            f"object__{name}__pos_w",
+            f"object__{name}__lin_vel_w",
+            f"object__{name}__ang_vel_w",
+            f"grasp__{name}",
+        ))
+        needed.extend(f"contact__{group}__{name}" for group in groups)
+    return tuple(needed)
 
 
 def compute_spec_metrics(
@@ -885,6 +1224,10 @@ def compute_spec_metrics(
                 pass
         arrays: dict[str, np.ndarray] = {}
         needed = _REQUIRED_ARRAYS[spec_name]
+        if spec_name == "object_lift_hold":
+            manipulation_manifest = _load_manipulation_manifest(rollout_dir)
+            meta["manipulation_telemetry"] = manipulation_manifest
+            needed = _manipulation_required_arrays(manipulation_manifest)
         if needed:
             npz_path = rollout_dir / "trajectory.npz"
             if not npz_path.is_file():
@@ -901,6 +1244,17 @@ def compute_spec_metrics(
                     }
                 for k in needed:
                     arrays[k] = z[k]
+                    if spec_name == "object_lift_hold":
+                        declared = manipulation_manifest["channels"].get(k)
+                        if not isinstance(declared, dict):
+                            raise ValueError(
+                                f"manipulation manifest omits channel {k!r}")
+                        if declared.get("shape") != list(arrays[k].shape):
+                            raise ValueError(
+                                f"manifest shape disagrees for channel {k!r}")
+                        if declared.get("dtype") != str(arrays[k].dtype):
+                            raise ValueError(
+                                f"manifest dtype disagrees for channel {k!r}")
         out = _SPEC_FNS[spec_name](arrays, behavior, meta)
         capture = {k: behavior.get(k) for k in _CAPTURE_KEYS if k in behavior}
         return {"spec_name": spec_name, **out, "capture": capture}

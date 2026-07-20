@@ -40,7 +40,9 @@ results as a new headline claim until each spec has a held-out A4 audit.
 
 The included `cross_embodiment_frontier_v1.json` adds the real registered YAM
 lift and multi-cube manipulation tasks as compile-only arm/gripper frontiers.
-Their limitations are concrete: current generic rollouts do not archive the
-object, end-effector, grasp, and target-identity observables needed to grade
-them. This prevents the suite from claiming cross-embodiment coverage merely
-because the UI can render an arm.
+Schema-2 generic rollouts and the `object_lift_hold` implementation now cover
+their object, target, independent-contact, grasp, temporal-hold, and distractor
+semantics. Their remaining blocker is evidence, not mechanism: no task-scoped
+real-rollout A4 certificate or frozen evaluation split exists. This prevents
+the suite from claiming cross-embodiment coverage merely because code and UI
+support an arm.

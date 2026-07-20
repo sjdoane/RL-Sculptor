@@ -347,7 +347,7 @@ export interface RunParamsPayload {
   early_stop_enabled?: boolean | null;
   early_stop_patience?: number | null;
   // §Ship 34/35 — objective fitness-in-the-loop. A built-in spec name
-  // (go1_trot / g1_kick / g1_jump / g1_floss / cartpole_balance) or a generated
+  // (including capability-driven object_lift_hold) or a generated
   // metric id ("gen:<id>"); null = the blind loop. §Ship 42: the sentinel
   // "generate-at-launch" defers generation to the run's first phase (see
   // run_manager LAUNCH_GEN_SENTINEL).
@@ -381,7 +381,8 @@ export type SpecMetricName =
   | "g1_floss"
   | "g1_jump"
   | "g1_kick"
-  | "go1_trot";
+  | "go1_trot"
+  | "object_lift_hold";
 
 /** §Ship 35: an auto-generated objective metric (per project), referenced
  *  in a run as fitness_metric = "gen:<id>". Observe-only until calibrated. */
@@ -421,6 +422,7 @@ export const SPEC_METRIC_NAMES: SpecMetricName[] = [
   "g1_jump",
   "g1_kick",
   "go1_trot",
+  "object_lift_hold",
 ];
 
 // Extend RunSummary / RunDetail with the new Phase-6 classification

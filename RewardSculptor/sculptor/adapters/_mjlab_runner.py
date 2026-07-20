@@ -158,7 +158,8 @@ def _cfg_to_dict(cfg: Any) -> dict[str, Any]:
 
 
 # Keys in the sculptor state schema for velocity-family tasks. Manipulation
-# tasks (Yam) would extend with ee_pose / object_poses — deferred to M4.
+# Registered manipulation tasks extend this base contract through the generic
+# capability-discovered recorder in manipulation_telemetry.py.
 _DEFAULT_SCHEMA_KEYS = (
     "qpos", "qvel", "base_lin_vel_b", "base_ang_vel_b",
     "projected_gravity_b", "actuator_force", "command_vel",
@@ -2162,11 +2163,16 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
             # authored rollout instead of silently emitting a partial NPZ.
             world_channel_recorder.append()
         if manip_recorder is not None:
-            # Registered-task manipulation channels; internally per-channel
-            # fail-soft, and belt-and-braces guarded here so no derived
-            # combination (e.g. bilateral grasp) can ever end the rollout.
+            # mjlab auto-resets before returning from a done step, so that
+            # step's scene state belongs to the next episode. Persist the
+            # boundary explicitly; metrics must never stitch attempts across
+            # it. `ep_done` freezes the mask after each env's first episode.
             try:
-                manip_recorder.append()
+                first_done = dones.bool() & (~ep_done)
+                manip_recorder.append(
+                    valid_mask=(~ep_done) & (~dones.bool()),
+                    terminal_mask=first_done,
+                )
             except Exception as e:  # noqa: BLE001
                 print(f"[runner] manipulation-telemetry step skipped: "
                       f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)

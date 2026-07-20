@@ -501,9 +501,10 @@ def _render_fitness_metrics_block() -> str:
         "# AVAILABLE_FITNESS_METRICS\n"
         "Optional per-stage objectives you MAY assign to a stage's "
         "`steering_metric` when one DIRECTLY measures that stage's sub-goal "
-        f"for this robot: {spec_metric_names()}. They are robot-specific "
-        "(g1_* are humanoid; go1_trot is a quadruped gait; cartpole_balance "
-        "is cartpole). Assign ONLY a correct fit; otherwise leave it null."
+        f"for this robot: {spec_metric_names()}. Calibration scope matters: "
+        "g1_* are humanoid, go1_trot is a quadruped gait, cartpole_balance "
+        "is cartpole, and object_lift_hold is capability-driven manipulation. "
+        "Assign ONLY a correct fit; otherwise leave it null."
     )
 
 

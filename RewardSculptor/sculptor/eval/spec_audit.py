@@ -44,7 +44,16 @@ AUTHORITY_COVERAGE: dict[str, frozenset[str]] = {
     }),
     "A4_reporting": ATTACK_CLASSES,
 }
-_INPUT_FILENAMES = ("behavior.json", "trajectory.npz", "mjcf_limits.json")
+_INPUT_FILENAMES = (
+    "behavior.json",
+    "trajectory.npz",
+    "mjcf_limits.json",
+    # Dynamic object names, contact groups, target frame, and channel shapes
+    # are part of a manipulation metric's evaluator input. Excluding this
+    # sidecar would allow a certificate's semantics to change without its
+    # evidence hash changing.
+    "manipulation_telemetry.json",
+)
 _TOP_FIELDS = {
     "schema_version", "audit_id", "spec_name", "authority_target", "cases",
     "notes",

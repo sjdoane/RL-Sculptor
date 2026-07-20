@@ -1,3 +1,117 @@
+# Latest handoff — generic temporal manipulation evaluator (2026-07-19)
+
+Read this section first, then inspect the current diff with **WSL Git** from
+`/home/samjd/projects` (Windows Git misreports WSL executable bits). The branch
+is `ship-20-ux-revamp`. Do not delete or stage the pre-existing untracked
+`.fleaven*`, `.ingest*`, `.metric*`, or `.pytest*` files.
+
+Codex continued from commits `c4610ac` and `e628827` and implemented the next
+highest-impact slice. The work is currently uncommitted:
+
+- Manipulation telemetry is schema 2. Registered vectorized rollouts now write
+  `rollout_valid` and `rollout_terminal`; the done sample is explicitly invalid
+  because mjlab has already auto-reset its scene state. The sidecar declares
+  the world-space target contract and task success threshold.
+- Grasp discovery is capability-driven for future robots: left/right finger
+  roles work as before; a generic multi-body `gripper` is split into independent
+  contact-evidence groups. `grasp__<object>` means at least two groups contact
+  simultaneously. A one-contact suction-like tool fails closed until it has a
+  real retention-evidence adapter. There are no YAM/G1/task-name branches.
+- New built-in `object_lift_hold` dynamically loads object/contact keys from the
+  sidecar and requires: valid first command segment, initial separation/no
+  initial grasp, 8 cm clearance, goal error <= declared threshold capped at
+  5 cm, 0.5 s stable hold, >=80% two-group contact with <=0.1 s dropout,
+  plausible finite kinematics, and <=5 cm non-target disturbance. Its
+  `spec_score` is binary completion rate; continuous values are diagnostics.
+  Missing/legacy/tampered telemetry earns an observable zero.
+- Spec-audit evidence hashes now include `manipulation_telemetry.json`.
+  `tests/test_object_lift_hold_spec.py` covers the competent target-aware
+  multi-object case, all ten A4 attack classes, wrong-target flicker,
+  distractor disturbance, forged grasp evidence, schema downgrade, spawn
+  settling, and calibration-authority refusal. These are implementation tests,
+  **not A4 evidence**.
+- The metric-axiom layer has a real manipulation family rather than a vacuous
+  exemption: world translation/yaw/object renaming must be invariant, while
+  wrong-target selection, distractor motion, proxy-only contact, truncation,
+  and unstable holds must not improve the score.
+- `docs/audits/object_lift_hold_a4_evidence_plan.md` is the frozen real-evidence
+  plan. The cross-embodiment frontier is truthfully versioned to 1.2.0 but YAM
+  remains `compile_only`, `campaign_ready=false`, `A0_rejected`, and has no
+  metric/certificate reference until separate real-rollout A4 audits and frozen
+  splits pass for single- and multi-cube tasks.
+- CLI/decomposer help and the UI `SpecMetricName` registry include the new
+  metric. Legacy synthetic generated-metric calibration explicitly refuses this
+  dynamic manipulation metric; task-derived frozen rollouts are required.
+
+Verification already completed:
+
+- Targeted integration suite: 194 passed. Manipulation axioms/audit subset:
+  46 passed. Core new files pass Ruff; `compileall` and `git diff --check` pass.
+- Broad Python suite: 2,104 passed, 1 optional-JAX skip in 3m27s, with only
+  `tests/test_refs_preview.py` excluded because its real OpenGL tests can abort
+  this headless WSL process.
+- Native WSL frontend TypeScript check: passed (`pnpm typecheck`).
+- Real CUDA/EGL YAM rollouts reused `/tmp/manip_smoke/checkpoint.pt` without
+  retraining. A 60-step, 64-env schema-2 artifact had 13 manipulation channels,
+  correct target index 0, 64/64 structurally and physically valid envs after
+  real-data calibration, and honest score 0 for an untrained/no-grasp policy.
+- A 1,000-step reset-boundary rollout proved every env records 999 valid samples
+  followed by exactly one invalid terminal sample; the evaluator stayed valid
+  and scored 0. Artifacts: `/tmp/manip_smoke_schema2_egl` and
+  `/tmp/manip_smoke_schema2_reset`.
+- The first renderer attempt failed on unavailable
+  X11 `:0`; `MUJOCO_GL=egl` is the working headless path.
+
+Resume by running the focused and broad suites after inspecting the diff, then
+fix any failures. Do **not** promote YAM. The next research step is to train or
+obtain a genuinely competent lift policy, freeze disjoint seeds/world/layout
+splits, collect real artifacts for every A4 class following the evidence plan,
+run separate single-/multi-cube audits, and promote only a passing certificate.
+
+## Verified + hardened 2026-07-19 (Claude)
+
+The slice above was verified and committed. Broad suite: 2,104 passed /
+1 optional-JAX skip before hardening; frontend `pnpm typecheck` clean. An
+adversarial subagent CONFIRMED every claim (including the runner's
+valid/terminal mask contract, end-to-end) and ran a mutation battery.
+Three mutations were caught by the existing tests; one compound mutation
+was not: **removing BOTH the grasp-fraction and grasp-gap gates survived
+all 101 focused tests and the axiom checker** — the two gates are
+mutually redundant on dense evidence, and no test asserted that a
+"telekinesis" transport with uniformly absent (self-consistent) contact
+evidence scores zero. Hardening applied before commit:
+
+- `tests/test_object_lift_hold_spec.py`: new
+  `test_telekinesis_lift_without_grasp_evidence_scores_zero`.
+- `eval/metric_axioms.py`: new `no_grasp_evidence` negative in the
+  manipulation family (kills the compound mutation).
+- `eval/spec_metrics.py`: two honesty fixes — the plausibility-gate
+  comment falsely claimed teleports need forged huge velocities (a
+  sub-0.12 m/step crawl with forged zero velocities passes the physics
+  gates; provenance hashing is the actual defense, now stated), and the
+  docstring now says non-finite telemetry / forged grasp disagreement
+  fail the WHOLE artifact closed (the implementation raises globally,
+  stricter than the per-env wording claimed).
+
+Documented residuals (accepted, not fixed): sub-floor slow-teleport and
+median-gate laundering are only reachable via forged artifacts, which
+the spec-audit evidence hashes and simulator-path requirement exclude;
+descriptor `gripper` body lists are not deduplicated (a malicious
+descriptor could alias one body into two "independent" groups — the
+capability registry is trusted input today).
+
+A4 evidence collection has started per
+`docs/audits/object_lift_hold_a4_evidence_plan.md`: a full 5000-iteration
+`Mjlab-Lift-Cube-Yam` training run (1024 envs, seed 42, upstream RL
+config) is running detached with artifacts under
+`~/rs_evidence/object_lift_hold_v1/`. Evaluation seeds/splits will be
+frozen in a `freeze.json` citing this commit BEFORE any outcome rollouts
+are collected; training seed 42 is reserved for the policy and excluded
+from evaluation splits. Mid-training checkpoints (every 100 iters) are
+candidates for the `falling`/partial-competence attack classes.
+
+---
+
 # RewardSculptor implementation handoff
 
 Read this file, then inspect the current diff before changing anything. The

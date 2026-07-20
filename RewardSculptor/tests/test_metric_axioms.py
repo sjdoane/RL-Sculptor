@@ -49,7 +49,8 @@ def test_builtins_pass_all_axioms(builtin):
     never trip their own L1 axioms (cartpole reads only behavior, so its
     perturbations are inert → vacuously passes)."""
     fam = {"g1_kick": "kick", "g1_floss": "floss", "g1_jump": "jump",
-           "go1_trot": "locomotion", "cartpole_balance": "cartpole"}[builtin]
+           "go1_trot": "locomotion", "cartpole_balance": "cartpole",
+           "object_lift_hold": "manipulation"}[builtin]
     res = check_metric_axioms(_SPEC_FNS[builtin], family=fam)
     assert res["ok"], (builtin, res["reasons"], res["details"])
 

@@ -1109,14 +1109,15 @@ def run(
         None, "--early-stop-patience",
         help="Compatibility no-op: accepted but ignored."),
     # §Ship 34: objective fitness-in-the-loop. `--fitness-metric` names a
-    # spec metric (go1_trot / g1_kick / g1_floss / cartpole_balance); the
+    # spec metric (including capability-driven object_lift_hold); the
     # loop then best-selects on it, shows it to the diagnoser, and
     # plateau/target early-stops. None = blind (criterion/metric-history
     # only). The UI's "Objective fitness metric" dropdown maps here.
     fitness_metric: Optional[str] = typer.Option(
         None, "--fitness-metric",
         help="Spec-metric name to use as ground-truth fitness in the loop "
-             "(go1_trot, g1_kick, g1_floss, cartpole_balance). Must match "
+             "(go1_trot, g1_kick, g1_floss, cartpole_balance, "
+             "object_lift_hold). Must match "
              "the robot. Omit for the blind loop."),
     fitness_target: Optional[float] = typer.Option(
         None, "--fitness-target",
@@ -1234,7 +1235,7 @@ def gen_metric(
         help="Skip the independent-LLM review gate (validation still runs)."),
     calibrate_against: Optional[str] = typer.Option(
         None, "--calibrate-against",
-        help="Built-in metric (go1_trot/g1_kick/g1_floss/cartpole_balance) "
+        help="Built-in metric (including object_lift_hold) "
              "to calibrate the generated metric against (earns steer-rights "
              "if Spearman >= 0.7)."),
 ):
@@ -1756,7 +1757,7 @@ def mission_run_cli(
     fitness_metric: Optional[str] = typer.Option(
         None, "--fitness-metric",
         help="Spec-metric name used as ground-truth fitness in EVERY "
-             "stage's loop (go1_trot, g1_kick, g1_floss, cartpole_balance). "
+             "stage's loop (including capability-driven object_lift_hold). "
              "Sound for single-skill missions. Omit for the blind loop."),
     fitness_target: Optional[float] = typer.Option(
         None, "--fitness-target",

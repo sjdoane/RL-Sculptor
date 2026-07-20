@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "suite_id": "rewardsculptor-cross-embodiment-frontier",
-  "suite_version": "1.1.0",
+  "suite_version": "1.2.0",
   "benchmarks": [
     {
       "name": "yam_lift_cube",
@@ -25,8 +25,8 @@
       "spec_authority": "A0_rejected",
       "spec_audit_certificate": null,
       "known_limitations": [
-        "rollouts persist end-effector pose, object pose/velocity, per-finger gripper contact, bilateral-contact grasp evidence, and the lift target (generic capability-discovered telemetry; sidecar manipulation_telemetry.json), but no success specification consumes them yet",
-        "no hand-authored held-out lift-and-hold success specification has passed the adversarial audit battery",
+        "the generic object_lift_hold temporal specification consumes schema-2 manipulation_telemetry.json, but it has not passed a genuinely held-out adversarial audit battery on this task",
+        "no real-rollout A4 certificate exists; deterministic synthetic attack tests are implementation checks, not evaluator authority",
         "no frozen evaluation seed/world split exists for this task"
       ],
       "notes": "A real registered mjlab arm task and the first required gripper-dependent frontier. It is intentionally visible but impossible to launch as a benchmark until its evaluator authority exists."
@@ -54,9 +54,9 @@
       "spec_authority": "A0_rejected",
       "spec_audit_certificate": null,
       "known_limitations": [
-        "rollouts persist all cube poses/velocities and the per-step selected target identity (target_object_index, remapped to the discovered object order; sidecar manipulation_telemetry.json), but no audited success specification consumes them yet",
+        "the generic object_lift_hold specification consumes all cube states, per-step target identity, grasp evidence, and distractor displacement, but no task-scoped real-rollout A4 certificate exists",
         "the generated-metric interface cannot reference these arrays without a channel catalog, so target-vs-distractor discrimination exists only for hand-authored spec metrics",
-        "no disturbance predicate or held-out object-layout split is frozen"
+        "the disturbance predicate is implemented at 5 cm, but no held-out object-layout split is frozen"
       ],
       "notes": "Longer-horizon multi-object arm frontier. Do not replace the missing object semantics with mean return or generic joint-motion proxies."
     }

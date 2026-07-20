@@ -122,3 +122,19 @@ def test_tampering_unknown_fields_and_overwrite_are_rejected(tmp_path: Path) -> 
     typo.write_text(json.dumps(doc), encoding="utf-8")
     with pytest.raises(SpecAuditError, match="unknown fields"):
         load_spec_audit_manifest(typo)
+
+
+def test_manipulation_sidecar_is_part_of_the_frozen_evidence_hash(
+    tmp_path: Path,
+) -> None:
+    manifest = _audit_manifest(tmp_path)
+    doc = json.loads(manifest.read_text(encoding="utf-8"))
+    rollout = Path(doc["cases"][0]["rollout_dir"])
+    sidecar = rollout / "manipulation_telemetry.json"
+    sidecar.write_text(json.dumps({"schema_version": 2, "object_names": ["a"]}))
+    before = load_spec_audit_manifest(manifest)["cases"][0]
+    assert "manipulation_telemetry.json" in before["evaluator_input_sha256"]
+
+    sidecar.write_text(json.dumps({"schema_version": 2, "object_names": ["b"]}))
+    after = load_spec_audit_manifest(manifest)["cases"][0]
+    assert after["evidence_sha256"] != before["evidence_sha256"]

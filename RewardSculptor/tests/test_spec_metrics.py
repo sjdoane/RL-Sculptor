@@ -669,6 +669,7 @@ def test_spec_metric_names_lists_all() -> None:
 
     assert spec_metric_names() == [
         "cartpole_balance", "g1_floss", "g1_jump", "g1_kick", "go1_trot",
+        "object_lift_hold",
     ]
 
 

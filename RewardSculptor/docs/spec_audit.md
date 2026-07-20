@@ -28,7 +28,7 @@ never silently grants a larger authority level.
 {
   "schema_version": 1,
   "audit_id": "yam-lift-spec-v1",
-  "spec_name": "yam_lift_cube",
+  "spec_name": "object_lift_hold",
   "authority_target": "A4_reporting",
   "notes": "Held-out objects, worlds, and seeds; none used during metric authoring.",
   "cases": [
@@ -52,8 +52,9 @@ never silently grants a larger authority level.
 
 Use one or more independent artifacts for every required class. Paths are
 resolved relative to the manifest. The runner hashes the exact evaluator
-inputs (`behavior.json`, `trajectory.npz`, and `mjcf_limits.json` when
-present), so replacing evidence after an audit changes the certificate.
+inputs (`behavior.json`, `trajectory.npz`, `mjcf_limits.json`, and
+`manipulation_telemetry.json` when present), so replacing evidence or its
+declared object/contact semantics after an audit changes the certificate.
 Thresholds are normalized to `[0, 1]` and frozen before results are inspected.
 
 Run the audit into a fresh directory:
@@ -91,8 +92,10 @@ earlier certificate under the same path.
   counterexample requires a new versioned audit.
 
 The current YAM lift frontiers in
-`docs/benchmarks/cross_embodiment_frontier_v1.json` remain compile-only because
-the rollout contract does not yet persist object pose, end-effector pose,
-gripper contact, and grasp state. Their path to campaign readiness is: add
-those observables, implement the temporal lift-and-hold spec, assemble held-out
-evidence, pass this audit, then change the benchmark manifest in a new version.
+`docs/benchmarks/cross_embodiment_frontier_v1.json` remain compile-only. Schema-2
+rollouts now persist first-episode boundaries, object state, target identity,
+independent contact groups, and grasp evidence, and `object_lift_hold` consumes
+them. The remaining path is evidentiary: freeze unseen seeds/worlds/layouts,
+collect real competent and adversarial rollouts, pass separate task-scoped A4
+audits, and only then promote the benchmark manifest in a new version. The
+synthetic counterexamples in the test suite never grant evaluator authority.

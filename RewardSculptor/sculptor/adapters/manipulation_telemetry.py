@@ -18,11 +18,11 @@ gap **generically**:
   much as a gripper arm); gripper-contact and grasp channels appear only
   when the matched capability actually advertises finger roles and the
   ``grasp`` capability.
-- **Honest signals only.** ``grasp__<object>`` is bilateral finger
-  contact (left AND right finger groups simultaneously touching the
-  object) — a mechanical proxy recorded as evidence, not a claim of
-  force-closure. The sidecar manifest states this derivation explicitly
-  so a success specification or auditor can weigh it.
+- **Honest signals only.** ``grasp__<object>`` requires simultaneous
+  object contact by at least two independent finger groups — a mechanical
+  proxy recorded as evidence, not a claim of force-closure. The sidecar
+  manifest states this derivation explicitly so a success specification or
+  auditor can weigh it.
 - **Target identity is recorded, not inferred.** The task's command term
   is duck-typed against the documented mjlab API: a term carrying
   ``target_selection`` plus ``cfg.entity_names`` yields a per-step
@@ -35,6 +35,12 @@ Array naming follows the authored-world ChannelCatalog vocabulary
 across authored and registered tasks. Authored runs keep their catalog
 recorder; this module is only engaged when no world selection is pinned,
 so the two can never double-write.
+
+``rollout_valid`` and ``rollout_terminal`` make the first-episode boundary
+explicit for every vectorized environment. This is load-bearing: mjlab
+auto-resets completed environments before the recorder can inspect the scene,
+so a terminal sample contains the *next* reset state and must never be joined
+to the preceding manipulation attempt.
 
 Everything here is fail-soft: any discovery or per-step failure degrades
 to "channel absent" (feature-detect discipline, mirroring the foot
@@ -50,7 +56,7 @@ from typing import Any, Mapping
 import numpy as np
 
 TELEMETRY_MANIFEST_NAME = "manipulation_telemetry.json"
-TELEMETRY_SCHEMA_VERSION = 1
+TELEMETRY_SCHEMA_VERSION = 2
 
 #: Candidate mjlab data attributes per root-state suffix (API drift across
 #: versions — same tolerance set as the world channel runtime).
@@ -114,14 +120,22 @@ class ManipulationDiscovery:
             "contact_sensors": list(self.sensor_names),
             "derivations": {
                 "grasp": (
-                    "bilateral finger contact: left AND right finger-group "
-                    "contact with the object in the same step — a mechanical "
-                    "grasp proxy, not force-closure verification"),
+                    "simultaneous object contact by at least two independent "
+                    "finger groups in the same step — a mechanical grasp "
+                    "proxy, not force-closure verification"),
                 "target_object_index": (
                     "per-step index into object_names taken from the task "
                     "command term (target_selection for multi-object "
                     "commands; the command's static entity_name otherwise); "
                     "-1 when the task declares no object target"),
+                "rollout_valid": (
+                    "true only for samples in each vectorized environment's "
+                    "first episode; false on and after an auto-resetting "
+                    "terminal transition"),
+                "rollout_terminal": (
+                    "true on the first done transition per environment; its "
+                    "scene state is post-reset and therefore rollout_valid "
+                    "is false for that sample"),
             },
         }
 
@@ -229,10 +243,17 @@ def discover_from_cfg(env_cfg: Any) -> ManipulationDiscovery | None:
         if not finger_groups:
             gripper = capability.body_roles.get("gripper")
             if gripper:
-                finger_groups["gripper"] = tuple(gripper)
+                # Preserve independent contact evidence when a descriptor uses
+                # a generic multi-body gripper instead of left/right roles.
+                # A one-body suction or magnetic tool is not promoted from
+                # contact alone: that would not prove object retention.
+                finger_groups.update({
+                    f"finger_{index}": (name,)
+                    for index, name in enumerate(gripper)
+                })
         grasp_capable = (
             "grasp" in capability.capabilities
-            and "left" in finger_groups and "right" in finger_groups)
+            and len(finger_groups) >= 2)
 
     return ManipulationDiscovery(
         robot_entity=robot_name,
@@ -399,8 +420,26 @@ class ManipulationRecorder:
         return array.astype(np.float32, copy=False)
 
     # ── per step ──────────────────────────────────────────────────
-    def append(self) -> None:
+    def append(
+        self,
+        *,
+        valid_mask: Any | None = None,
+        terminal_mask: Any | None = None,
+    ) -> None:
+        """Record one simulator step.
+
+        Only the runner owns vectorized episode state, so it supplies the two
+        masks. They remain optional for recorder-only integrations, but the
+        reporting-grade lift spec requires both and fails closed on legacy
+        rollouts that do not establish episode boundaries.
+        """
         discovery = self.discovery
+        valid = _to_numpy(valid_mask)
+        terminal = _to_numpy(terminal_mask)
+        if valid is not None and valid.ndim == 1:
+            self._push("rollout_valid", valid > 0)
+        if terminal is not None and terminal.ndim == 1:
+            self._push("rollout_terminal", terminal > 0)
         if self._robot is not None:
             data = getattr(self._robot, "data", None)
             if self._ee_site_index is not None:
@@ -446,11 +485,13 @@ class ManipulationRecorder:
             contact_by_object.setdefault(obj, {})[group] = value
         if discovery.grasp_capable:
             for obj, groups in contact_by_object.items():
-                left, right = groups.get("left"), groups.get("right")
-                if left is not None and right is not None:
+                contacts = list(groups.values())
+                if len(contacts) >= 2:
                     self._push(
                         f"grasp__{obj}",
-                        ((left > 0) & (right > 0)).astype(np.float32))
+                        (np.sum(np.stack(
+                            [value > 0 for value in contacts], axis=0,
+                        ), axis=0) >= 2).astype(np.float32))
 
         if self._target is not None:
             term, static_index = self._target
@@ -507,12 +548,30 @@ class ManipulationRecorder:
             stacked = np.stack(buffers, axis=0)
             if key == "target_object_index":
                 stacked = stacked.astype(np.int32)
+            elif key in {"rollout_valid", "rollout_terminal"}:
+                stacked = stacked.astype(np.bool_)
             arrays[key] = stacked
         return arrays
 
     def write_manifest(self, output_dir: Path,
                        arrays: Mapping[str, np.ndarray]) -> None:
         manifest = self.discovery.to_manifest()
+        if self._target is not None:
+            term, _ = self._target
+            cfg = getattr(term, "cfg", None)
+            threshold = getattr(cfg, "success_threshold", None)
+            target_contract: dict[str, Any] = {
+                "position_frame": "world",
+                "command_term_type": type(term).__name__,
+            }
+            try:
+                threshold_float = float(threshold)
+                if np.isfinite(threshold_float) and threshold_float > 0:
+                    target_contract["declared_success_threshold_m"] = (
+                        threshold_float)
+            except (TypeError, ValueError):
+                pass
+            manifest["target_contract"] = target_contract
         manifest["channels"] = {
             key: {"shape": list(value.shape), "dtype": str(value.dtype)}
             for key, value in sorted(arrays.items())}
