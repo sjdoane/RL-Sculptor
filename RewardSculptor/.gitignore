@@ -24,6 +24,14 @@ kg/graph.db.merged
 kg/pdfs/
 runs/
 
+# Local evidence / ingestion / metric-rebuild transcripts. These are
+# reproducibility scratch outputs, not source inputs; leaving them unignored
+# makes run_context.json report a dirty code tree even at a clean commit.
+.fleaven*
+.ingest*
+.metric*
+.pytest*
+
 # OS / editor
 .DS_Store
 Thumbs.db

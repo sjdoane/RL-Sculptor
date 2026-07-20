@@ -637,3 +637,40 @@ The real 4-cycle GPU showcase run is intentionally launched only after this
 release-candidate commit, so Vite/uvicorn reloads cannot interrupt it. Append a
 second handoff section with its run id, artifact paths, timings, fitness values,
 and rollout inspection before declaring the overnight rehearsal complete.
+
+## Live-launch blocker found and fixed 2026-07-20 (Codex)
+
+The first UI launch (`job_8bae6f6985e66471`) did its job as a rehearsal and
+failed before completing iteration 0. It verified the new override plumbing
+(`steps_per_iter=750`, `num_envs=1024`, `device='cuda:0'`) and pinned tuple
+`af0d135c...`, then exposed a real authored-world integration bug: overlaying
+the course's plane onto the registered rough task left mjlab's base
+`terrain_levels` curriculum enabled. That curriculum asserts that a live
+terrain generator exists during the first reset.
+
+Fixed in `sculptor/world/compiler.py`: after either train or frozen-evaluation
+scene overlay, reconcile curricula against the actual terrain capability. If
+there is no live generator, remove only terms whose declared term/function
+semantics are `terrain_levels`/`terrain_levels_*`; preserve unrelated terms
+such as `command_vel`. The decision never inspects a robot or task name. The
+runner emits the adjustment, and `ResolvedWorldBundle.runtime_adjustments`
+records it for callers/tests.
+
+Regression evidence:
+
+- The new test builds and promotes a plane selection, applies it to the real
+  registered `Mjlab-Velocity-Rough-Unitree-Go1` cfg, proves only
+  `terrain_levels` is removed, and preserves `command_vel`.
+- 150 focused world/env-spec/mjlab tests passed.
+- Post-fix broad suite: 2,138 passed / 1 optional-JAX skip in 4m09s.
+- A real CPU construction + reset with two environments and the actual local
+  selection v2 succeeded (`RESET_OK af0d135c... ['command_vel']`). This reaches
+  the exact reset site that asserted in the failed launch.
+- Compileall and diff check passed. Scoped Ruff passed with `F401` ignored only
+  because the two inspected legacy files already carry three pre-existing
+  unused `mujoco` imports; the new code introduced no additional Ruff finding.
+
+Also added ignore rules for the explicitly protected local `.fleaven*`,
+`.ingest*`, `.metric*`, and `.pytest*` transcripts. The files remain untouched
+and unstaged, but they no longer make `run_context.json` falsely label a clean
+source commit dirty.

@@ -196,6 +196,7 @@ class ResolvedWorldBundle:
     train: bool
     refs: Mapping[str, Mapping[str, Any]]
     runtime_robot_asset_hash: str | None = None
+    runtime_adjustments: tuple[str, ...] = ()
 
 
 def _materialized_cfg_types() -> tuple[type[Any], type[Any]]:
@@ -1228,6 +1229,44 @@ def _runtime_robot_hash(env_cfg: Any) -> str | None:
         return None
 
 
+def _reconcile_terrain_curriculum(env_cfg: Any) -> tuple[str, ...]:
+    """Remove curriculum terms incompatible with the overlaid terrain.
+
+    mjlab rough-terrain tasks ship a ``terrain_levels`` curriculum whose
+    implementation requires ``scene.terrain.terrain_generator``.  An authored
+    plane (and a frozen materialized evaluation terrain) deliberately has no
+    live generator, so retaining that base-task term makes the first reset
+    assert before training begins.  Detect the dependency from the curriculum
+    term/function semantics—not a robot or task identifier—and preserve every
+    unrelated curriculum term.
+    """
+    scene_cfg = getattr(env_cfg, "scene", env_cfg)
+    terrain_cfg = getattr(scene_cfg, "terrain", None)
+    if getattr(terrain_cfg, "terrain_generator", None) is not None:
+        return ()
+    curriculum = getattr(env_cfg, "curriculum", None)
+    if not isinstance(curriculum, dict):
+        return ()
+
+    removed: list[str] = []
+    for name, term in tuple(curriculum.items()):
+        func = getattr(term, "func", None)
+        identifiers = {
+            str(name).lower(),
+            str(getattr(func, "__name__", "")).lower(),
+        }
+        requires_live_generator = any(
+            value == "terrain_levels" or value.startswith("terrain_levels_")
+            for value in identifiers
+        )
+        if requires_live_generator:
+            curriculum.pop(name, None)
+            removed.append(
+                f"curriculum:{name}→removed(no live terrain generator)"
+            )
+    return tuple(removed)
+
+
 def apply_world_selection(
     env_cfg: Any, selection_path: Path | str, *, train: bool,
     runtime_task_id: str | None = None,
@@ -1324,10 +1363,12 @@ def apply_world_selection(
                 frozen_flat_patch_radii_m=terrain.get(
                     "flat_patch_radii_m", {}))
         _apply_scene_and_runtime(env_cfg, authored_scene, runtime)
+    runtime_adjustments = _reconcile_terrain_curriculum(env_cfg)
     return ResolvedWorldBundle(
         tuple_hash=selection.tuple_hash,
         evaluation_lineage=selection.evaluation_lineage,
         manifest=manifest, channel_catalog=catalog, train=train,
         refs={kind: dataclasses.asdict(ref)
               for kind, ref in selection.refs.items()},
-        runtime_robot_asset_hash=runtime_robot_hash)
+        runtime_robot_asset_hash=runtime_robot_hash,
+        runtime_adjustments=runtime_adjustments)

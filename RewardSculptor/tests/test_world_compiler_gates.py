@@ -260,6 +260,70 @@ def test_immutable_selection_applies_materialized_eval_without_regeneration(
         replay_model.hfield_data, compiled._model.hfield_data)
 
 
+def test_authored_plane_removes_only_generator_dependent_curriculum(
+    tmp_path: Path,
+) -> None:
+    """A real rough-task cfg must reset after an authored plane overlay.
+
+    Regression for the first UI-launched parkour run: mjlab's retained
+    terrain-level curriculum asserted because the authored plane correctly has
+    no terrain generator.  Keep the unrelated command curriculum intact.
+    """
+    from mjlab.tasks.registry import load_env_cfg
+
+    project = tmp_path / "project"
+    store = WorldArtifactStore(project)
+    world = _world(robot="unitree_go1:base")
+    world["shared"]["robot"]["required_capabilities"] = ["locomotion"]
+    task = _task(robot="unitree_go1:base")
+    task["shared"]["contacts"]["desired"] = []
+    report, compiled = run_admission_gates(
+        world, task, materialize_dir=store.env_dir / "eval_assets",
+        settle_steps=20,
+        runtime_task_id="Mjlab-Velocity-Rough-Unitree-Go1",
+    )
+    assert report.ok and compiled is not None
+
+    rewards = project / "rewards"
+    rewards.mkdir(parents=True)
+    reward_path = rewards / "v1.py"
+    reward_path.write_text("REWARD_SPEC = {}\n", encoding="utf-8")
+    env_spec_path = store.env_dir / "v1.json"
+    env_spec_path.write_text("{}\n", encoding="utf-8")
+    refs = {
+        "reward": ArtifactRef.from_path(
+            "reward", "v1", reward_path, base=project),
+        "env_spec": ArtifactRef.from_path(
+            "env_spec", "v1", env_spec_path, base=project),
+        "world": store.write_json("world", world),
+        "task": store.write_json("task", task),
+        "resolved_eval": store.write_json(
+            "resolved_eval", compiled.resolved_eval.to_dict()),
+        "channel_catalog": store.write_json(
+            "channel_catalog", compiled.channel_catalog.to_dict()),
+        "clarifications": store.write_json("clarifications", {"items": []}),
+    }
+    selection = store.promote(refs, evaluation_lineage="eval-test")
+    immutable = store.env_dir / f"selection_v{selection.selection_version}.json"
+
+    env_cfg = load_env_cfg("Mjlab-Velocity-Rough-Unitree-Go1")
+    assert "terrain_levels" in env_cfg.curriculum
+    assert "command_vel" in env_cfg.curriculum
+    bundle = apply_world_selection(
+        env_cfg,
+        immutable,
+        train=True,
+        runtime_task_id="Mjlab-Velocity-Rough-Unitree-Go1",
+    )
+
+    assert env_cfg.scene.terrain.terrain_generator is None
+    assert "terrain_levels" not in env_cfg.curriculum
+    assert "command_vel" in env_cfg.curriculum
+    assert bundle.runtime_adjustments == (
+        "curriculum:terrain_levels→removed(no live terrain generator)",
+    )
+
+
 # ── env-authoring §10.1: train-time terrain difficulty span ───────────────
 def _span_world(rng, *, kind="generator", mode="curriculum_grid"):
     return {

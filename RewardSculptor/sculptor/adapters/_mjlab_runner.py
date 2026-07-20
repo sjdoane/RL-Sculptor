@@ -609,9 +609,16 @@ def _apply_world_selection(
         return None
     from sculptor.world.compiler import apply_world_selection
 
-    return apply_world_selection(
+    bundle = apply_world_selection(
         env_cfg, Path(selection_path).resolve(), train=train,
         runtime_task_id=task_id)
+    for adjustment in bundle.runtime_adjustments:
+        print(
+            f"[runner] authored-world runtime adjustment: {adjustment}",
+            file=sys.stderr,
+            flush=True,
+        )
+    return bundle
 
 
 def _load_authored_robot_capability(selection_path: str) -> Any | None:
