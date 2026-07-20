@@ -208,6 +208,10 @@ class CampaignConfig:
         self, registry: Optional[dict[str, BenchmarkTask]] = None,
     ) -> None:
         registry = BENCHMARKS if registry is None else registry
+        if not self.benchmarks:
+            raise ValueError("campaign needs at least one benchmark")
+        if len(set(self.benchmarks)) != len(self.benchmarks):
+            raise ValueError("duplicate benchmarks would duplicate campaign jobs")
         for b in self.benchmarks:
             benchmark = get_benchmark(b, registry)
             if not benchmark.campaign_ready:
@@ -228,6 +232,10 @@ class CampaignConfig:
                     f"benchmark {b!r} uses adapter {benchmark.adapter!r} but "
                     "the eval harness has no adapter class mapping for it"
                 )
+        if not self.conditions:
+            raise ValueError("campaign needs at least one condition")
+        if len(set(self.conditions)) != len(self.conditions):
+            raise ValueError("duplicate conditions would duplicate campaign jobs")
         for c in self.conditions:
             if c not in CONDITIONS:
                 raise KeyError(
@@ -922,6 +930,21 @@ def _report_html(campaign: dict[str, Any]) -> str:
         f'<p style="color:#b00">⚠ {w}</p>'
         for w in all_warnings
     )
+    coverage = campaign.get("coverage")
+    coverage_html = ""
+    if isinstance(coverage, dict):
+        complete = bool(coverage.get("complete"))
+        state = "COMPLETE" if complete else "INCOMPLETE"
+        missing = int(coverage.get("n_missing", 0))
+        expected = int(coverage.get("n_expected", 0))
+        completed = int(coverage.get("n_completed", 0))
+        color = "#176b3a" if complete else "#9a3412"
+        coverage_html = (
+            f"<p style='border:1px solid {color};padding:.75rem;color:{color}'>"
+            f"<strong>Coverage {state}</strong>: {completed}/{expected} jobs; "
+            f"{missing} missing. Partial aggregates are not a complete "
+            "campaign result.</p>"
+        )
     return (
         "<!doctype html><meta charset='utf-8'>"
         f"<title>eval: {campaign['name']}</title>"
@@ -931,7 +954,7 @@ def _report_html(campaign: dict[str, Any]) -> str:
         "stratified-bootstrap CIs over paired seeds. Compare conditions "
         "via the paired-difference table, and read every comparison "
         "against its <code>total_rl_iterations</code> GPU budget.</p>"
-        f"{warn}{''.join(rows)}{pairwise_html}</body>"
+        f"{coverage_html}{warn}{''.join(rows)}{pairwise_html}</body>"
     )
 
 

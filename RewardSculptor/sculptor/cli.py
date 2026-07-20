@@ -491,6 +491,144 @@ def eval_run(
         typer.echo(f"WARNING: {w}", err=True)
 
 
+shard_app = typer.Typer(
+    name="shard",
+    help="Run one frozen eval matrix safely across processes or pods.",
+    no_args_is_help=True,
+)
+eval_app.add_typer(shard_app, name="shard")
+
+
+@shard_app.command("prepare")
+def eval_shard_prepare(
+    out: Path = typer.Option(..., "--out", help="Global campaign output dir."),
+    shards: int = typer.Option(
+        ..., "--shards", min=1, help="Number of operational worker shards.",
+    ),
+    benchmark: list[str] = typer.Option(
+        ..., "--benchmark", "-b", help="Benchmark name (repeatable).",
+    ),
+    benchmark_manifest: list[Path] = typer.Option(
+        [], "--benchmark-manifest",
+        help="Strict external benchmark-suite JSON (repeatable).",
+    ),
+    condition: list[str] = typer.Option(
+        ..., "--condition", "-c", help="Condition name (repeatable).",
+    ),
+    seeds: int = typer.Option(
+        3, "--seeds", min=1,
+        help="Number of paired seeds (1000, 1017, 1034, ...).",
+    ),
+    iterations: int = typer.Option(2, "--iterations", min=1),
+    steps_per_iter: int = typer.Option(300, "--steps-per-iter", min=1),
+    rollout_episodes: int = typer.Option(4, "--rollout-episodes", min=1),
+    spec_threshold: float = typer.Option(0.5, "--spec-threshold"),
+    eureka_k: int = typer.Option(4, "--eureka-k", min=1),
+    fitness_in_loop: bool = typer.Option(False, "--fitness-in-loop"),
+    name: Optional[str] = typer.Option(None, "--name"),
+):
+    """Charter the full matrix once and emit self-contained shard dirs."""
+    from sculptor.eval import CampaignConfig
+    from sculptor.eval.charter import CharterError
+    from sculptor.eval.sharding import ShardError, prepare_sharded_campaign
+
+    cfg = CampaignConfig(
+        name=name or Path(out).name,
+        out_dir=Path(out),
+        benchmarks=list(benchmark),
+        conditions=list(condition),
+        seeds=[1000 + 17 * index for index in range(int(seeds))],
+        benchmark_manifests=list(benchmark_manifest),
+        iterations=iterations,
+        steps_per_iter=steps_per_iter,
+        rollout_episodes=rollout_episodes,
+        spec_threshold=spec_threshold,
+        eureka_k=eureka_k,
+        fitness_in_loop=fitness_in_loop,
+    )
+    try:
+        coordinator = prepare_sharded_campaign(cfg, shard_count=shards)
+    except (CharterError, ShardError, OSError, ValueError, KeyError) as exc:
+        typer.echo(f"shard preparation failed: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    typer.echo(f"global charter: {Path(out) / 'campaign_charter.json'}")
+    typer.echo(f"coordinator:    {Path(out) / 'campaign_shards.json'}")
+    typer.echo(f"design hash:    {coordinator['charter']['design_sha256']}")
+    for record in coordinator["shards"]:
+        manifest = (
+            Path(out) / record["relative_dir"] / "shard_manifest.json"
+        )
+        typer.echo(
+            f"{record['shard_id']}: {record['n_jobs']} jobs -> {manifest}"
+        )
+
+
+@shard_app.command("run")
+def eval_shard_run(
+    manifest: Path = typer.Argument(..., help="Transported shard_manifest.json."),
+    require_remote: bool = typer.Option(
+        False, "--require-remote",
+        help="Abort unless an enabled SCULPTOR_REMOTE_* target resolves.",
+    ),
+):
+    """Run only a shard's assigned jobs under its complete global charter."""
+    import os as _os
+
+    from sculptor.adapters._remote import RemoteConfig
+    from sculptor.eval.charter import CharterError
+    from sculptor.eval.sharding import ShardError, run_campaign_shard
+
+    remote = RemoteConfig.from_sources(None, _os.environ)
+    if require_remote and (remote is None or not remote.enabled):
+        typer.echo(
+            "[eval shard] --require-remote set but no enabled remote resolved; "
+            "aborting before training.",
+            err=True,
+        )
+        raise typer.Exit(3)
+    try:
+        report = run_campaign_shard(manifest)
+    except (CharterError, ShardError, OSError, ValueError, KeyError) as exc:
+        typer.echo(f"shard run failed: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    coverage = report["coverage"]
+    typer.echo(
+        f"{report['shard_id']}: {coverage['n_completed']}/"
+        f"{coverage['n_expected']} assigned jobs complete"
+    )
+    typer.echo(f"report: {Path(manifest).parent / 'shard_report.json'}")
+
+
+@shard_app.command("merge")
+def eval_shard_merge(
+    out: Path = typer.Option(..., "--out", help="Global campaign output dir."),
+    shard_dir: list[Path] = typer.Option(
+        [], "--shard-dir",
+        help="Fetched shard output dir (repeatable; default: local plan dirs).",
+    ),
+):
+    """Verify available shards and merge results with explicit coverage."""
+    from sculptor.eval.charter import CharterError
+    from sculptor.eval.sharding import ShardError, merge_sharded_campaign
+
+    try:
+        report = merge_sharded_campaign(
+            out, list(shard_dir) if shard_dir else None,
+        )
+    except (CharterError, ShardError, OSError, ValueError, KeyError) as exc:
+        typer.echo(f"shard merge failed: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    coverage = report["coverage"]
+    state = "COMPLETE" if coverage["complete"] else "INCOMPLETE"
+    typer.echo(
+        f"coverage {state}: {coverage['n_completed']}/"
+        f"{coverage['n_expected']} jobs; {coverage['n_missing']} missing"
+    )
+    typer.echo(f"report: {Path(out) / 'campaign_report.json'}")
+    for warning in report.get("authority_warnings", []):
+        typer.echo(f"WARNING: {warning}", err=True)
+
+
 @eval_app.command("report")
 def eval_report(
     out: Path = typer.Argument(..., help="Campaign dir with job results."),

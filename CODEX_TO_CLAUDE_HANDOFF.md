@@ -1,4 +1,124 @@
-# Latest handoff — generic temporal manipulation evaluator (2026-07-19)
+# Latest handoff — charter-aware global-matrix coordinator (2026-07-19)
+
+Codex completed the CPU-only, file-disjoint coordinator task. The work is
+intentionally **uncommitted** on `ship-20-ux-revamp`. Claude's A4/GPU-owned
+files (`sculptor/adapters/*`, the four named `eval/spec_*`/`metric_*` files,
+and `docs/audits/*` / `docs/benchmarks/*`) were not modified, and no training
+or evidence-collection GPU job was launched.
+
+What was implemented:
+
+- New `sculptor/eval/sharding.py` creates one full benchmark × condition × seed
+  design and charters it once at the campaign root. It seals a deterministic
+  global partition, then emits transportable `shards/shard-NNN` directories.
+  Every manifest embeds the complete partition and only assigns jobs from it;
+  no worker creates or verifies a subset design.
+- Every shard carries a byte-identical charter replica plus frozen external
+  input replicas. A worker reconstructs the full config and frozen benchmark
+  definitions, verifies current source/dependency identity against the full
+  charter, verifies physical inputs, then seals `shard_run_identity.json`
+  before running its first job. The charter replica is verification material,
+  not a second charter.
+- The charter now records explicit per-file `pyproject.toml` / `uv.lock`
+  hashes and a dependency-identity hash in addition to the aggregate source
+  tree hash. Manifests, worker identities, and merge provenance must match all
+  of these fields exactly.
+- KG isolation is preserved across pods: `campaign_inputs/kg_base.db` at the
+  global root is the chartered source; each shard receives a verified
+  byte-identical replica; existing harness logic then creates a private
+  writable `inputs/kg.db` per assigned job. Altered shard or root KG bytes are
+  rejected.
+- Worker crash-resume uses the existing `_run_job` artifacts but adds checks
+  that cached result identity equals the assigned atomic tuple. The sealed
+  manifest and worker runtime identity must also match exactly on resume.
+- Merge verifies the root runtime, coordinator, shard manifest, charter
+  replica, runtime/dependency identity, external inputs, result lineage,
+  result path/tuple, and frozen assignment. It rejects a tuple claimed by two
+  shards before assignment handling. It copies verified job trees into the
+  global campaign output and seals cumulative per-result provenance in
+  `campaign_merge.json`; repeated merge is idempotent.
+- Missing shards/jobs are allowed only as explicit partial evidence. JSON and
+  HTML reports use `status: incomplete_coverage`, include exact expected /
+  completed / missing counts, enumerate missing tuples, and warn that partial
+  aggregates are not a complete campaign result.
+- Added `sculpt eval shard prepare`, `sculpt eval shard run`, and
+  `sculpt eval shard merge`. `docs/campaign_plan.md` now gives the supported
+  three-pod recipe and retains an explicit ban on ad hoc merging of separately
+  chartered subset campaigns.
+- `CampaignConfig.validate` now rejects empty or duplicate benchmark and
+  condition axes, preventing a malformed Cartesian product at its source.
+
+Files changed/added:
+
+- `RewardSculptor/sculptor/eval/sharding.py` (new)
+- `RewardSculptor/tests/test_eval_sharding.py` (new)
+- `RewardSculptor/sculptor/eval/charter.py`
+- `RewardSculptor/sculptor/eval/harness.py`
+- `RewardSculptor/sculptor/eval/__init__.py`
+- `RewardSculptor/sculptor/cli.py`
+- `RewardSculptor/docs/campaign_plan.md`
+
+Verification evidence:
+
+- Focused coordinator suite: **7 passed**. It covers foreign-charter rejection,
+  duplicate tuple rejection across shards, honest missing-shard coverage,
+  altered KG-base rejection, deliberately re-sealed runtime-hash drift,
+  exact shard resume, and a real two-process CPU stub matrix merged end to end.
+- Existing eval harness suite: **20 passed**.
+- New files: `uvx ruff check` passed; `compileall` passed.
+- Requested broad suite passed exactly:
+  `MUJOCO_GL=egl .venv/bin/python -m pytest tests/ -q
+  --ignore=tests/test_refs_preview.py` → **2112 passed, 1 optional-JAX skip,
+  152 warnings in 302.91s (5:02)**.
+- `git diff --check` passed before the broad run. Run it once more before any
+  commit after inspecting the final diff.
+
+Do not stage/delete the pre-existing `.fleaven*`, `.ingest*`, `.metric*`, or
+`.pytest*` files. Do not promote YAM or change any `A0_rejected` /
+`compile_only` status. Suggested next action: review the uncommitted diff,
+rerun `tests/test_eval_sharding.py` if modifying coordinator logic, then commit
+this slice separately from the concurrent A4 evidence work.
+
+## Verified + hardened 2026-07-19 (Claude)
+
+Adversarial verification CONFIRMED all coordinator claims (independent
+broad suite 2,112 passed / 1 optional-JAX skip; focused 7 + 20 passed;
+file-disjointness from the concurrent A4 work holds exactly). Mutation
+battery: foreign-charter-at-merge, cross-shard duplicate, and
+runtime-reference no-op mutations were all caught by existing tests; two
+findings were hardened before commit:
+
+- **Merge now trusts only attested results.** The verifier fabricated
+  `final_spec_score: 999.0` in a shard `result.json` after the worker
+  sealed its `shard_report.json`; merge accepted and reported it, because
+  the sealed report was never consulted. `_scan_shard_results` now
+  requires a sealed, charter/runtime-verified report bound to the exact
+  manifest and run identity, and every merged result must equal its
+  attested job record (`spec_series`/`cached` runtime annotations
+  excluded). Results without a report refuse to merge ("resume the shard
+  to completion before merging"). Honest scope note: with no secrets, a
+  tamperer who rewrites BOTH files and reseals still passes — this is
+  tamper-evidence depth, not access control; post-first-merge drift was
+  already pinned by provenance `result_sha256`.
+- **`_verify_charter_reference` is now pinned.** No-op'ing it survived
+  all 7 sharding tests (it is redundant with byte-level charter checks on
+  every path) — a direct unit test now kills that mutation. The duplicate
+  -job test forges the attestation (reseal) so the cross-shard duplicate
+  path stays independently tested.
+
+Documented residuals (accepted): `missing_shards` lists only absent shard
+dirs, not present-but-empty shards (job-level coverage is exact);
+`_differences` emits a noisy-but-correct diff preview on runtime-identity
+mismatches; partial-merge reports carry aggregates over the partial set —
+quoting `aggregates` without `status`/`coverage` is a reader error the
+JSON/HTML markers already guard.
+
+After hardening: sharding+harness focused 30 passed; broad suite rerun
+green (2,115 passed / 1 optional-JAX skip expected — 3 new tests).
+
+---
+
+# Previous handoff — generic temporal manipulation evaluator (2026-07-19)
 
 Read this section first, then inspect the current diff with **WSL Git** from
 `/home/samjd/projects` (Windows Git misreports WSL executable bits). The branch

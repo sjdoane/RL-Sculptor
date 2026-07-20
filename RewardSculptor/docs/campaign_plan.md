@@ -67,27 +67,65 @@ GPU** (3 × 5090 @ $0.69/hr ≈ 29 h wall ≈ 1.2 days) + **~$50–90 LLM**
 Trim lever if needed: drop `plain_ppo` (unmatched) and `mission_no_kg`
 from one heavy benchmark each (−~10 h).
 
-## Sharding (historical plan; blocked pending charter-aware coordination)
+## Safe charter-aware sharding
 
-Do **not** launch the commands below against one shared output directory. They
-use different benchmark lists and therefore describe different frozen
-designs; the charter now rejects that unsafe merge. The current supported
-path is one harness process per output directory, routed to one remote GPU.
-Multi-pod execution needs an explicit coordinator that freezes one global job
-matrix and gives workers operational shards without changing the scientific
-design. Until that exists, separate shard reports must not be merged into one
-headline campaign after the fact.
+`sculpt eval shard` is the only supported way to merge multi-process or
+multi-pod results into one campaign. Preparation receives the **entire**
+benchmark × condition × seed design, creates one global charter, and then
+partitions its already-frozen Cartesian product by job assignment. A shard
+manifest is not a smaller experiment: it carries the full partition and
+references the same charter design, runtime, dependency, and external-input
+hashes as every other shard.
+
+Prepare once on the coordinating machine (repeat every `-b` and `-c`; never
+prepare separate benchmark subsets):
 
 ```bash
-# pod A                                   # pod B                       # pod C
-sculpt eval run --out ~/rs_campaign \
-  -b g1_floss   <ALL_CONDITIONS>          -b g1_kick  <ALL_CONDITIONS>  -b go1_trot -b cartpole_balance <ALL_CONDITIONS>
-  --seeds 5 --iterations 4 --steps-per-iter 600 --name e4-campaign
+sculpt eval shard prepare --out ~/rs_campaign --shards 3 \
+  -b cartpole_balance -b g1_floss -b g1_kick -b go1_trot \
+  -c mission -c mission_no_kg -c full -c eureka \
+  -c seed_only_matched -c plain_ppo_matched -c plain_ppo \
+  --seeds 5 --iterations 4 --steps-per-iter 600 --eureka-k 3 \
+  --name e4-campaign
 ```
 
-The command sketch is retained only as the original budget allocation, not as
-an executable launch recipe. Every job remains resumable inside its own
-chartered output directory.
+This creates `~/rs_campaign/shards/shard-000` through `shard-002`.
+Transport each complete shard directory to one pod, preserving its internal
+layout, and run it there:
+
+```bash
+sculpt eval shard run /workspace/shard-000/shard_manifest.json
+```
+
+Each worker verifies the full charter against its current source and
+dependency hashes before its first job. It also verifies its byte-identical KG
+base replica, records a sealed worker runtime identity, and creates a private
+writable `inputs/kg.db` copy per assigned job. Re-running the same command is
+the crash-resume path: only exact matching `result.json`, charter, manifest,
+runtime, dependency, and KG lineage are reused.
+
+Fetch the completed shard directories back without combining their contents,
+then merge them at the global root:
+
+```bash
+sculpt eval shard merge --out ~/rs_campaign \
+  --shard-dir ~/fetched/shard-000 \
+  --shard-dir ~/fetched/shard-001 \
+  --shard-dir ~/fetched/shard-002
+```
+
+Merge rejects foreign charters, altered runtime/dependency or KG hashes,
+manifests that differ from the frozen partition, result tuples outside their
+assignment, and a `(benchmark, condition, seed)` claimed by multiple shards.
+Missing shards are not an integrity error: available verified results are
+merged, while `campaign_report.json`, `campaign_merge.json`, and `report.html`
+declare `incomplete_coverage` and enumerate every missing tuple. Such partial
+aggregates are diagnostic only, not the headline campaign result.
+
+The old pattern—independent `sculpt eval run` commands with different
+benchmark lists followed by an ad hoc merge—remains unsafe and unsupported.
+Those commands define different charter hashes; the coordinator does not and
+cannot reinterpret them as one experiment.
 
 Launch detached on Windows (WSL kills `setsid` children when the last
 client exits): `Start-Process -WindowStyle Hidden wsl 'bash -c "…"'`.

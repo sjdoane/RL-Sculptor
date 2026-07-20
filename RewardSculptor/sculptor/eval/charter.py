@@ -93,6 +93,21 @@ def _source_tree_hash() -> tuple[str, list[str]]:
     return digest.hexdigest(), relative_paths
 
 
+def _dependency_file_hashes() -> dict[str, str]:
+    """Return explicit hashes for the dependency declarations in the design.
+
+    The aggregate source-tree hash already covers these files.  Recording the
+    individual hashes as well gives distributed workers and offline mergers a
+    precise dependency identity to compare without weakening that aggregate.
+    """
+    project_dir = Path(__file__).resolve().parents[2]
+    return {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in (project_dir / "pyproject.toml", project_dir / "uv.lock")
+        if path.is_file()
+    }
+
+
 def _snapshot(value: Any) -> dict[str, Any]:
     if is_dataclass(value):
         return asdict(value)
@@ -117,6 +132,7 @@ def build_campaign_design(
     config = _snapshot(cfg)
     config.pop("out_dir", None)
     source_hash, source_files = _source_tree_hash()
+    dependency_hashes = _dependency_file_hashes()
     requested_benchmarks = [
         _snapshot(benchmarks[name]) for name in cfg.benchmarks
     ]
@@ -158,6 +174,8 @@ def build_campaign_design(
             "source_tree_sha256": source_hash,
             "source_file_count": len(source_files),
             "source_roots": ["sculptor/", "pyproject.toml", "uv.lock"],
+            "dependency_files_sha256": dependency_hashes,
+            "dependency_identity_sha256": _sha256(dependency_hashes),
         },
         "external_inputs": dict(external_inputs or {}),
     }

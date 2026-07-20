@@ -29,6 +29,18 @@ from sculptor.eval.harness import (
     aggregate,
     run_campaign,
 )
+from sculptor.eval.sharding import (
+    COORDINATOR_FILENAME,
+    MERGE_FILENAME,
+    SHARD_MANIFEST_FILENAME,
+    DuplicateShardResultError,
+    ShardDesignMismatchError,
+    ShardError,
+    ShardIntegrityError,
+    merge_sharded_campaign,
+    prepare_sharded_campaign,
+    run_campaign_shard,
+)
 from sculptor.eval.generated_metric import (
     compute_generated_metric,
     make_generated_fitness_fn,
@@ -111,6 +123,16 @@ __all__ = [
     "EvalCondition",
     "aggregate",
     "run_campaign",
+    "COORDINATOR_FILENAME",
+    "SHARD_MANIFEST_FILENAME",
+    "MERGE_FILENAME",
+    "ShardError",
+    "ShardIntegrityError",
+    "ShardDesignMismatchError",
+    "DuplicateShardResultError",
+    "prepare_sharded_campaign",
+    "run_campaign_shard",
+    "merge_sharded_campaign",
     "iqm",
     "stratified_bootstrap_ci",
 ]
