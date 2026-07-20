@@ -1,3 +1,118 @@
+# Latest handoff — generated objective-metric process isolation (2026-07-19)
+
+Codex completed a separate CPU-only P0.11 slice while Claude continued A4 GPU
+evidence collection. It is intentionally **uncommitted** on
+`ship-20-ux-revamp` at coordinator commit `5a4978c`. No A4-owned adapter,
+spec-audit/metric-axiom/calibration, evidence-doc, benchmark-doc, or GPU file was
+modified; no GPU command was launched. The already-committed coordinator was
+also left untouched.
+
+Decision and implementation:
+
+- Generated objective metrics were the highest-impact file-disjoint open
+  security gap: the AST denylist was explicitly documented as non-proving, but
+  `load_generated_module` still executed accepted LLM code in the campaign
+  process. It now returns a module-like callable proxy and executes both module
+  top-level code and every `compute_spec` call only in a persistent worker.
+  Existing validation and calibration paths inherit the boundary without edits
+  to Claude-owned `metric_calibration.py`.
+- The loader reads one immutable source snapshot, hashes it, screens it, sends
+  that exact snapshot to the worker, and parses `REQUIRED_JOINT_ROLES` from the
+  same bytes. Editing the file after load cannot split validated metadata from
+  deployed code.
+- IPC is bounded, length-framed JSON plus raw contiguous numeric arrays. Pickle
+  is never used. Results stay schema-compatible; diagnostic provenance is
+  available at `compute_spec.sandbox_info` (isolation level, source SHA-256,
+  limits, timeout).
+- Workers get a private temp cwd and an allowlisted, credential-free
+  environment. Each call has a 3-second parent wall timeout. Worker limits are
+  fail-closed on Linux: 1.5 GiB address space, 120 seconds cumulative CPU,
+  zero-byte regular-file/core caps, and <=16 FDs.
+- Linux also fails closed unless libseccomp loads. `NO_NEW_PRIVS` is explicit;
+  the filter is installed before any untrusted exec and denies filesystem
+  access/mutation, network, fork/clone/exec, ptrace/cross-process/PID-fd access,
+  namespace escape, kernel-programming/async-IO surfaces, and System V IPC.
+  Other platforms retain the process/IPC/environment/wall-time boundary but do
+  not claim Linux syscall containment.
+- Trusted NumPy `linalg`/`random`/`fft`/`polynomial`/masked-array paths preload
+  before open syscalls are sealed. This was required for score equivalence:
+  `np.median` otherwise lazily tried to import `numpy.ma`. Common remote
+  numerical exceptions such as `IndexError` remain their native exception type
+  because task-derived calibration uses those diagnostics; OS denials stay
+  explicit `MetricSandboxExecutionError`s.
+
+Files changed/added:
+
+- `RewardSculptor/sculptor/eval/generated_metric.py`
+- `RewardSculptor/sculptor/eval/_metric_sandbox_worker.py` (new)
+- `RewardSculptor/tests/test_metric_sandbox.py` (new)
+- `RewardSculptor/docs/generated_metric_sandbox.md` (new)
+- `docs/internal/REWARDSCULPTOR_RESEARCH_GRADE_ROADMAP.md` (marks only the
+  generated-metric half of the isolation item complete)
+
+Verification evidence:
+
+- Adversarial boundary suite: **9 passed**. It bypasses `_ast_safety` on purpose
+  and independently proves top-level/call-time file writes, sockets, and child
+  process creation are blocked; parent secrets are absent; source snapshots are
+  frozen; hangs are killed; a native `ctypes` segfault kills only the worker and
+  a fresh worker scores normally afterward; configured rlimits and Linux
+  seccomp provenance are asserted.
+- Generated-metric/calibration compatibility battery: **335 passed** in 84.54s
+  (generated metrics, metric axioms, task-derived calibration, reference
+  anchoring, robustness, joint roles, channel catalogs, sandbox).
+- Repository-wide requested command passed:
+  `MUJOCO_GL=egl .venv/bin/python -m pytest tests/ -q
+  --ignore=tests/test_refs_preview.py` -> **2,124 passed, 1 optional-JAX skip,
+  152 warnings in 278.71s (4:38)**.
+- `uvx ruff check` on all new/changed Python files, targeted `compileall`, and
+  `git diff --check` all pass.
+
+Honest residual: this slice isolates generated **objective metrics**, not the
+separate mission success-criterion expression evaluator. Criterion isolation
+remains an explicit P0.11/A8 follow-up; do not represent all generated code as
+isolated yet. Suggested next action is adversarial review of the worker/filter,
+then commit this slice separately from A4. Do not stage/delete the pre-existing
+`.fleaven*`, `.ingest*`, `.metric*`, or `.pytest*` files.
+
+## Verified + hardened 2026-07-19 (Claude)
+
+Adversarial review (the suggested next action) CONFIRMED every containment
+claim: eight live escape payloads through the real `load_generated_module`
+path — env-secret exfil, `os.kill(getppid)`, raw-`ctypes` syscalls
+bypassing glibc, `fork`+`memfd_create`, object-dtype return, oversized
+return, at-import socket — were all blocked at the OS layer (seccomp
+EPERM / JSON-encode refusal / no parent DoS), with the env allowlist
+carrying no PATH/HOME/LD_PRELOAD and `np.median` scoring identically in
+and out of the sandbox. One genuine defect was found and fixed before
+commit:
+
+- **IPC frame injection via shared fd 1 (integrity).** The worker only
+  redirected the Python-level `sys.stdout`; raw fd 1 stayed wired to the
+  control pipe, so a metric doing `os.write(1, <forged frame>)` injected
+  its own response — the verifier made a call return `spec_score: 0.999`
+  and desynced every following call. This is score forgery, not a sandbox
+  escape (the return is JSON-parsed, no pickle/RCE), but scores drive
+  selection/best-of-N/calibration, so it matters. The static AST gate
+  blocks the write primitives today, but this slice's whole premise is
+  that AST gates get bypassed, so the process boundary must stand alone.
+  Fix (`_metric_sandbox_worker.py`, worker-owned): the control channel is
+  dup'd onto private descriptors and fd 0/1 are repointed at `/dev/null`
+  before any untrusted code runs, so `print`/`os.write(1, …)`/inherited
+  stdio land in the void; /proc fd enumeration is already seccomp-denied.
+  Regression test `test_forged_stdout_frame_cannot_forge_score_or_desync`
+  (mutation-verified: it FAILS on the pre-fix worker — the forged
+  `{'FORGED': True}` reaches the parent — and PASSES on the fixed one).
+
+Sandbox suite now 10 passed; broad suite green (2,124 passed / 1
+optional-JAX skip pre-fix; the fix touches only the worker + one test).
+Accepted residual (documented by the verifier, not fixed): `error_type`
+lets a metric spoof its OWN failure's reported exception class — cosmetic,
+grants no capability. The mission success-criterion evaluator remains
+un-isolated as Codex documented.
+
+---
+
 # Latest handoff — charter-aware global-matrix coordinator (2026-07-19)
 
 Codex completed the CPU-only, file-disjoint coordinator task. The work is

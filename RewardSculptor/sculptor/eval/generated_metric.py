@@ -17,42 +17,34 @@ OBSERVE-ONLY (computed + displayed, no influence). This module is the
 RUNTIME side (load + compute + resolve); generation lives in `metric_gen`,
 validation in `metric_validate`, calibration in `metric_calibration`.
 
-SECURITY (§round-9/10): the metric is UNTRUSTED LLM-authored code, and `metric_validate.
-_ast_safety` is the containment gate — hardened to block the numpy IO/pickle surface,
-native submodules, `def __reduce__`-style gadgets, dunder tokens in string literals, and
-`allow_pickle`, plus the round-28/29 frame/generator/coroutine/cython introspection prefix
-family (`gi_`/`cr_`/`ag_`/`f_`/`tb_`/`func_`) that reaches the live builtins dict. It is
-enforced inside `load_generated_module` (§round-10), the single chokepoint EVERY exec path
-shares (validation, the per-rollout runtime scorer, calibration, the best-of-N discriminator,
-role-read) — so the gate runs before EVERY exec, not only at validation time. That is still a
-STATIC allow/deny gate, NOT a proof of containment, and the rounds-27→29 hardening EMPIRICALLY
-confirmed it cannot be proven complete: two CRITICAL escape CLASSES were reproduced in
-consecutive rounds (round-28 `gi_frame.f_builtins`, round-29 numpy-cython `func_globals`),
-each slipping a freshly-patched denylist. The DURABLE containment (the convergence path) is to
-run the module exec + `compute_spec` in a restricted SUBPROCESS.
+SECURITY (§round-9/10/31): generated metrics are UNTRUSTED LLM-authored code.  The
+static `metric_validate._ast_safety` gate remains defense in depth, but is not the
+containment boundary: every accepted source snapshot is now compiled and executed only
+in a dedicated worker process.  The worker has a private cwd, a secret-free environment,
+memory/CPU/file-size/fd rlimits, a parent-enforced wall timeout, and (fail-closed on Linux)
+a seccomp filter denying filesystem, network, process-spawn, tracing, and kernel-program
+syscalls.  Requests and results use bounded JSON/raw-array IPC; pickle is never used.
+`REQUIRED_JOINT_ROLES` is parsed from that same immutable source snapshot without exec.
 
-  DESIGN CONSTRAINT (round-29, code-verified): the cheap in-process "empty/curated
-  `__builtins__`" variant is NOT viable here — numpy's ndarray methods (`.mean`/`.max`/`.std`)
-  internally call `__import__`, so an emptied `__builtins__` breaks legitimate metrics.
-  (`mission_runtime._evaluate_success_criterion` deliberately KEEPS real `__builtins__` for
-  exactly this reason and relies on a strict no-attribute-access AST validator instead — an
-  approach a numpy-computation metric cannot use.) So fix B must be a true PROCESS sandbox with
-  real builtins INSIDE but the process locked down OUTSIDE: a separate process (crash/hang/
-  memory isolation; `RLIMIT_CPU`/`RLIMIT_AS`/timeout), restricted cwd, and — for containment
-  against `os.system`/`unlink`/network rather than just robustness — a syscall filter
-  (seccomp-bpf) or `bubblewrap`/`nsjail`. It also requires reading `REQUIRED_JOINT_ROLES`
-  STATICALLY (AST, no exec) since a top-level exploit runs at module-exec time. This is a
-  dedicated reviewed increment (high blast radius over the score path; must stay score-identical
-  vs the 937-test corpus). Until it lands, the comprehensive denylist above is the live gate and
-  the realistic threat is low (the metric source is SYSTEM-generated from the user's own goal,
-  not adversarial third-party input).
+The worker deliberately retains real builtins: numpy ndarray methods internally need
+`__import__`, so a curated-builtins pseudo-sandbox breaks legitimate metrics.  Real
+builtins are safe only because they live behind the OS process/syscall boundary.  This
+module-like proxy preserves existing validation/calibration call sites while ensuring no
+generated module top-level code or `compute_spec` body executes in the parent process.
 """
 from __future__ import annotations
 
 import ast
-import importlib.util
+import hashlib
 import json
+import os
 from pathlib import Path
+import struct
+import subprocess
+import sys
+import tempfile
+import threading
+import types
 from typing import Any, Callable, Optional
 
 import numpy as np
@@ -71,6 +63,49 @@ from sculptor.world.channels import (
 
 #: The function a generated metric module must define.
 GENERATED_FN_NAME = "compute_spec"
+
+#: Maximum wall time for one generated metric invocation.  Metrics operate on
+#: persisted arrays and should be vectorized; exceeding this is a hard failure,
+#: not an invitation to stall a campaign worker.
+METRIC_CALL_TIMEOUT_SECONDS = 3.0
+
+#: Imports and numpy initialization happen before the syscall filter is loaded,
+#: so worker startup gets a wider (still bounded) allowance than a metric call.
+METRIC_STARTUP_TIMEOUT_SECONDS = 15.0
+
+_MAX_SANDBOX_FRAME_BYTES = 512 * 1024 * 1024
+_MAX_SANDBOX_RESPONSE_BYTES = 1024 * 1024
+
+
+class MetricSandboxError(RuntimeError):
+    """Base error raised at the generated-metric process boundary."""
+
+
+class MetricSandboxUnavailable(MetricSandboxError):
+    """The required OS containment boundary could not be established."""
+
+
+class MetricSandboxTimeout(MetricSandboxError):
+    """A generated metric exceeded its wall-time budget and was terminated."""
+
+
+class MetricSandboxExecutionError(MetricSandboxError):
+    """The sandboxed metric raised or returned an invalid wire result."""
+
+
+# Preserve the small set of ordinary numerical/shape errors that callers use
+# diagnostically.  OS/security exceptions intentionally remain wrapped as
+# MetricSandboxExecutionError so a denied escape is unmistakable.
+_REMOTE_BUILTIN_EXCEPTIONS: dict[str, type[Exception]] = {
+    "ArithmeticError": ArithmeticError,
+    "AssertionError": AssertionError,
+    "IndexError": IndexError,
+    "KeyError": KeyError,
+    "OverflowError": OverflowError,
+    "TypeError": TypeError,
+    "ValueError": ValueError,
+    "ZeroDivisionError": ZeroDivisionError,
+}
 
 #: §Ship 49: optional module-level constant a generated metric declares to
 #: name the canonical joint ROLES it needs (e.g.
@@ -127,19 +162,274 @@ def _catalog_hash_from_npz(npz: Any) -> str | None:
     return str(value)
 
 
-def load_generated_module(module_path: Path | str):
-    """Import a generated-metric module and return the MODULE. Uses a unique
-    module name so re-loading an edited metric never hits a stale
-    sys.modules entry.
+def _sandbox_json_default(value: Any) -> Any:
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        if value.size > 4096:
+            raise ValueError("metadata array is too large for metric sandbox IPC")
+        return value.tolist()
+    if isinstance(value, Path):
+        return str(value)
+    raise TypeError(f"not JSON serializable: {type(value).__name__}")
 
-    §round-10 SECURITY: the static safety gate (`_ast_safety`) is enforced HERE,
-    at the single chokepoint EVERY exec path shares (the per-rollout runtime
-    scorer, calibration, the best-of-N discriminator, role-read) — so untrusted
-    LLM-authored source is screened on every path, not only at validation time. A
-    violation refuses to exec (raise) rather than running arbitrary code; callers
-    that must never raise (compute_generated_metric) already wrap this in
-    try/except and degrade to an honest 0.0. (`_ast_safety` is imported lazily:
-    metric_validate imports this function, so a top-level import would cycle.)"""
+
+def _read_exact(stream: Any, size: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining:
+        chunk = stream.read(remaining)
+        if not chunk:
+            raise EOFError("metric sandbox worker closed its protocol stream")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def _read_sandbox_frame(stream: Any) -> bytes:
+    size = struct.unpack(">Q", _read_exact(stream, 8))[0]
+    if size > _MAX_SANDBOX_RESPONSE_BYTES:
+        raise MetricSandboxError(
+            f"metric sandbox response exceeds {_MAX_SANDBOX_RESPONSE_BYTES} bytes")
+    return _read_exact(stream, size)
+
+
+def _write_sandbox_frame(stream: Any, payload: bytes) -> None:
+    if len(payload) > _MAX_SANDBOX_FRAME_BYTES:
+        raise MetricSandboxError(
+            f"metric sandbox request exceeds {_MAX_SANDBOX_FRAME_BYTES} bytes")
+    stream.write(struct.pack(">Q", len(payload)))
+    stream.write(payload)
+    stream.flush()
+
+
+def _encode_metric_request(
+    arrays: dict[str, np.ndarray], behavior: dict, meta: dict,
+) -> bytes:
+    """Encode numeric arrays without pickle and JSON-encode the small metadata."""
+    raw_parts: list[bytes] = []
+    array_headers: list[dict[str, Any]] = []
+    offset = 0
+    for name, value in arrays.items():
+        array = np.ascontiguousarray(value)
+        if array.dtype.hasobject:
+            raise MetricSandboxError(
+                f"object dtype is forbidden for metric array {name!r}")
+        raw = array.tobytes(order="C")
+        array_headers.append({
+            "name": str(name),
+            "dtype": array.dtype.str,
+            "shape": list(array.shape),
+            "offset": offset,
+            "nbytes": len(raw),
+        })
+        raw_parts.append(raw)
+        offset += len(raw)
+    header = json.dumps(
+        {"arrays": array_headers, "behavior": behavior, "meta": meta},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=_sandbox_json_default,
+    ).encode("utf-8")
+    payload = struct.pack(">Q", len(header)) + header + b"".join(raw_parts)
+    if len(payload) > _MAX_SANDBOX_FRAME_BYTES:
+        raise MetricSandboxError(
+            f"metric inputs exceed {_MAX_SANDBOX_FRAME_BYTES} byte IPC limit")
+    return payload
+
+
+class _SandboxedGeneratedMetric:
+    """Callable proxy whose module load and invocations stay in one worker."""
+
+    def __init__(self, source: str, source_path: Path) -> None:
+        self._source = source
+        self._source_path = source_path
+        self._source_sha256 = hashlib.sha256(source.encode("utf-8")).hexdigest()
+        self._process: subprocess.Popen[bytes] | None = None
+        self._workdir: tempfile.TemporaryDirectory[str] | None = None
+        self._lock = threading.Lock()
+        self._isolation: str | None = None
+        self._resource_limits: dict[str, int | None] = {}
+
+    @property
+    def sandbox_info(self) -> dict[str, Any]:
+        return {
+            "isolation": self._isolation,
+            "source_sha256": self._source_sha256,
+            "call_timeout_seconds": METRIC_CALL_TIMEOUT_SECONDS,
+            "resource_limits": dict(self._resource_limits),
+        }
+
+    def start(self) -> None:
+        with self._lock:
+            self._start_locked()
+
+    def _start_locked(self) -> None:
+        if self._process is not None and self._process.poll() is None:
+            return
+        self._stop_locked()
+        worker = Path(__file__).with_name("_metric_sandbox_worker.py")
+        if not worker.is_file():
+            raise MetricSandboxUnavailable(
+                f"metric sandbox worker is missing: {worker}")
+        self._workdir = tempfile.TemporaryDirectory(
+            prefix="rewardsculptor-metric-")
+        # Never inherit API tokens, cloud credentials, or campaign secrets.
+        # The absolute interpreter/worker paths make PATH unnecessary.
+        environment = {
+            "PYTHONNOUSERSITE": "1",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONHASHSEED": "0",
+            "OMP_NUM_THREADS": "1",
+            "OPENBLAS_NUM_THREADS": "1",
+            "MKL_NUM_THREADS": "1",
+            "NUMEXPR_NUM_THREADS": "1",
+            "VECLIB_MAXIMUM_THREADS": "1",
+            "LC_ALL": "C.UTF-8",
+        }
+        # Required by Python on Windows; harmlessly absent on POSIX.  The
+        # Linux deployment is stricter because it requires seccomp below.
+        for name in ("SYSTEMROOT", "WINDIR"):
+            if value := os.environ.get(name):
+                environment[name] = value
+        try:
+            self._process = subprocess.Popen(
+                [sys.executable, str(worker)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                cwd=self._workdir.name,
+                env=environment,
+                bufsize=0,
+                close_fds=True,
+            )
+            load_payload = json.dumps(
+                {"source": self._source}, ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            response = self._exchange_locked(
+                load_payload, METRIC_STARTUP_TIMEOUT_SECONDS, "startup")
+            ready = json.loads(response.decode("utf-8"))
+            if not isinstance(ready, dict) or not ready.get("ok"):
+                detail = ready.get("error", "invalid startup response") \
+                    if isinstance(ready, dict) else "invalid startup response"
+                raise MetricSandboxExecutionError(str(detail))
+            isolation = ready.get("isolation")
+            if sys.platform.startswith("linux") \
+                    and isolation != "process+rlimit+seccomp":
+                raise MetricSandboxUnavailable(
+                    "generated metrics require seccomp isolation on Linux; "
+                    f"worker reported {isolation!r}")
+            self._isolation = str(isolation)
+            limits = ready.get("resource_limits")
+            self._resource_limits = dict(limits) if isinstance(limits, dict) else {}
+        except Exception:
+            self._stop_locked()
+            raise
+
+    def _exchange_locked(self, payload: bytes, timeout: float, phase: str) -> bytes:
+        process = self._process
+        if process is None or process.stdin is None or process.stdout is None:
+            raise MetricSandboxError("metric sandbox worker is not running")
+        result: list[bytes] = []
+        errors: list[BaseException] = []
+
+        def _io() -> None:
+            try:
+                _write_sandbox_frame(process.stdin, payload)
+                result.append(_read_sandbox_frame(process.stdout))
+            except BaseException as exc:  # crossed back to the controlling thread
+                errors.append(exc)
+
+        io_thread = threading.Thread(
+            target=_io, name="metric-sandbox-ipc", daemon=True)
+        io_thread.start()
+        io_thread.join(timeout)
+        if io_thread.is_alive():
+            self._stop_locked()
+            io_thread.join(1.0)
+            raise MetricSandboxTimeout(
+                f"generated metric {phase} exceeded {timeout:.3g}s wall timeout")
+        if errors:
+            self._stop_locked()
+            raise MetricSandboxError(
+                f"metric sandbox {phase} protocol failed: {errors[0]}") from errors[0]
+        if not result:
+            self._stop_locked()
+            raise MetricSandboxError(
+                f"metric sandbox {phase} returned no response")
+        return result[0]
+
+    def __call__(
+        self, arrays: dict[str, np.ndarray], behavior: dict, meta: dict,
+    ) -> dict:
+        payload = _encode_metric_request(arrays, behavior, meta)
+        with self._lock:
+            self._start_locked()
+            response = self._exchange_locked(
+                payload, METRIC_CALL_TIMEOUT_SECONDS, "call")
+        try:
+            decoded = json.loads(response.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise MetricSandboxExecutionError(
+                f"worker returned invalid JSON: {exc}") from exc
+        if not isinstance(decoded, dict) or not decoded.get("ok"):
+            detail = decoded.get("error", "invalid worker response") \
+                if isinstance(decoded, dict) else "invalid worker response"
+            if isinstance(decoded, dict):
+                remote_type = decoded.get("error_type")
+                exception_type = _REMOTE_BUILTIN_EXCEPTIONS.get(str(remote_type))
+                if exception_type is not None:
+                    raise exception_type(str(decoded.get("error_message", detail)))
+            raise MetricSandboxExecutionError(str(detail))
+        result = decoded.get("result")
+        if not isinstance(result, dict):
+            raise MetricSandboxExecutionError(
+                "generated metric did not return a JSON object")
+        return result
+
+    def close(self) -> None:
+        with self._lock:
+            self._stop_locked()
+
+    def _stop_locked(self) -> None:
+        process, self._process = self._process, None
+        if process is not None:
+            if process.poll() is None:
+                process.kill()
+            for stream in (process.stdin, process.stdout):
+                if stream is not None:
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
+            try:
+                process.wait(timeout=1.0)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        workdir, self._workdir = self._workdir, None
+        if workdir is not None:
+            workdir.cleanup()
+        self._isolation = None
+        self._resource_limits = {}
+
+    def __del__(self) -> None:  # pragma: no cover - best-effort interpreter cleanup
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+def load_generated_module(module_path: Path | str):
+    """Load a generated metric as a module-like sandbox proxy.
+
+    The source is read exactly once, statically screened, and passed as an
+    immutable snapshot to the worker.  Starting the worker eagerly preserves
+    import-time failure semantics while keeping all module exec outside the
+    parent.  (`_ast_safety` is lazy-imported to avoid an import cycle.)
+    """
     from sculptor.eval.metric_validate import _ast_safety  # lazy — avoid import cycle
     module_path = Path(module_path)
     try:
@@ -151,15 +441,14 @@ def load_generated_module(module_path: Path | str):
         raise ImportError(
             f"refusing to exec untrusted metric {module_path}: "
             f"_ast_safety violations: {violations}")
-    spec = importlib.util.spec_from_file_location(
-        f"_genmetric_{module_path.stem}_{abs(hash(str(module_path)))}",
-        module_path,
+    metric = _SandboxedGeneratedMetric(source, module_path.resolve())
+    metric.start()
+    return types.SimpleNamespace(
+        __file__=str(module_path.resolve()),
+        _metric_source_snapshot=source,
+        __metric_sandbox__=metric,
+        compute_spec=metric,
     )
-    if spec is None or spec.loader is None:
-        raise ImportError(f"cannot load generated metric at {module_path}")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
 
 
 def load_generated_metric(module_path: Path | str) -> Callable[..., dict]:
@@ -217,6 +506,13 @@ def read_required_roles(module_or_path) -> list[str]:
     metric validated as a knee-reader was granted while deploying as a shoulder-reader. A
     single static source of truth makes validated == deployed. (Falls back to live `getattr`
     only when a module exposes no readable `__file__` — a synthetic/in-memory module.)"""
+    # A sandbox proxy carries the exact source snapshot that was screened and
+    # sent to its worker.  Prefer it over re-reading the path: validated roles
+    # and executed code must remain one atomic artifact even if a file is
+    # replaced after load.
+    snapshot = getattr(module_or_path, "_metric_source_snapshot", None)
+    if isinstance(snapshot, str):
+        return read_required_roles_static(snapshot)
     src_path: Optional[Path] = None
     if isinstance(module_or_path, (str, Path)):
         src_path = Path(module_or_path)
