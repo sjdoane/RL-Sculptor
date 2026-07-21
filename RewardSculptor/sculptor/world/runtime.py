@@ -145,6 +145,15 @@ class WorldChannelRuntime:
     def _object_position(self, name: str) -> np.ndarray:
         return self._entity_state(name, "pos_w")
 
+    def _local_position(self, position: np.ndarray) -> np.ndarray:
+        """Translate world-space state into each environment's local frame."""
+        origins = _to_numpy(self.scene.env_origins, dtype=np.float32)
+        if origins.shape != (self.num_envs, 3):
+            raise WorldRuntimeError(
+                f"scene env_origins has shape {origins.shape}, expected "
+                f"({self.num_envs}, 3)")
+        return position - origins
+
     def _goal_tolerance(self) -> float:
         success = self.goal.get("success", {})
         return float(success.get("tolerance_m", 0.0))
@@ -154,6 +163,7 @@ class WorldChannelRuntime:
             self._robot_position() if entity == "robot"
             else self._object_position(entity)
         )
+        position = self._local_position(position)
         signed = _signed_distance_to_zone(position, self.zones[region])
         return signed <= self._goal_tolerance()
 
@@ -162,6 +172,7 @@ class WorldChannelRuntime:
             self._robot_position() if entity == "robot"
             else self._object_position(entity)
         )
+        position = self._local_position(position)
         signed = _signed_distance_to_zone(position, self.zones[region])
         return np.maximum(signed - self._goal_tolerance(), 0.0)
 
@@ -193,10 +204,13 @@ class WorldChannelRuntime:
     def _update_waypoints(self) -> None:
         if self._waypoints.size == 0:
             return
-        position = self._robot_position()
+        position = self._local_position(self._robot_position())
         last = len(self._waypoints) - 1
         target = self._waypoints[np.minimum(self._waypoint_index, last)]
-        distance = np.linalg.norm(position - target, axis=-1)
+        # Course waypoints are traversal gates, not root-height targets. XY
+        # distance forces the robot through each platform footprint while the
+        # collidable geometry itself enforces climbing/jumping onto its top.
+        distance = np.linalg.norm(position[..., :2] - target[..., :2], axis=-1)
         tolerance = max(0.0, self._goal_tolerance()) or 0.25
         reached = (self._waypoint_index < len(self._waypoints)) & (
             distance <= tolerance)
@@ -206,7 +220,7 @@ class WorldChannelRuntime:
         )
         complete = self._waypoint_index >= len(self._waypoints)
         target = self._waypoints[np.minimum(self._waypoint_index, last)]
-        distance = np.linalg.norm(position - target, axis=-1)
+        distance = np.linalg.norm(position[..., :2] - target[..., :2], axis=-1)
         self._last_waypoint_distance = np.where(complete, 0.0, distance)
         self._last_waypoint_complete = complete
 
@@ -383,6 +397,15 @@ class TorchWorldRewardRuntime:
     def _robot_position(self) -> Any:
         return self._entity_state("robot", "pos_w")
 
+    def _local_position(self, position: Any) -> Any:
+        origins = self.scene.env_origins.to(
+            device=position.device, dtype=position.dtype)
+        if origins.shape != position.shape:
+            raise WorldRuntimeError(
+                f"scene env_origins has shape {tuple(origins.shape)}, "
+                f"expected {tuple(position.shape)}")
+        return position - origins
+
     def _zone_center(self, name: str, *, dtype: Any) -> Any:
         return self.torch.as_tensor(
             _center3(self.zones[name]), device=self.env.device, dtype=dtype)
@@ -391,6 +414,7 @@ class TorchWorldRewardRuntime:
         position = (
             self._robot_position() if entity == "robot"
             else self._entity_state(entity, "pos_w"))
+        position = self._local_position(position)
         zone = self.zones[region]
         center = self._zone_center(region, dtype=position.dtype)
         if zone["kind"] == "disk":
@@ -428,11 +452,12 @@ class TorchWorldRewardRuntime:
     def _waypoint_distance(self) -> Any:
         if self._waypoints is None:
             raise WorldRuntimeError("waypoint producer used for a non-waypoint goal")
-        position = self._robot_position()
+        position = self._local_position(self._robot_position())
         last = self._waypoints.shape[0] - 1
         target = self._waypoints[
             self.torch.clamp(self._waypoint_index, max=last)]
-        distance = self.torch.linalg.norm(position - target, dim=-1)
+        distance = self.torch.linalg.norm(
+            position[..., :2] - target[..., :2], dim=-1)
         tolerance = max(0.0, float(
             self.goal.get("success", {}).get("tolerance_m", 0.0))) or 0.25
         reached = (
@@ -443,7 +468,8 @@ class TorchWorldRewardRuntime:
         complete = self._waypoint_index >= self._waypoints.shape[0]
         target = self._waypoints[
             self.torch.clamp(self._waypoint_index, max=last)]
-        distance = self.torch.linalg.norm(position - target, dim=-1)
+        distance = self.torch.linalg.norm(
+            position[..., :2] - target[..., :2], dim=-1)
         return self.torch.where(complete, self.torch.zeros_like(distance), distance)
 
     def _contact(self, source: Mapping[str, Any]) -> Any:

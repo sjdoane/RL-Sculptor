@@ -14,6 +14,7 @@ import hashlib
 import json
 import io
 import math
+import re
 import struct
 import tempfile
 from unittest import mock
@@ -625,27 +626,69 @@ def _world_spec_editor(
     def edit(spec: Any) -> None:
         import mujoco
 
-        course_body = spec.worldbody.add_body(name="authored_course")
-        for primitive in course:
-            sx, sy, sz = primitive.size_m
-            course_body.add_geom(
-                name=f"obstacle__{primitive.primitive_id}",
-                type=mujoco.mjtGeom.mjGEOM_BOX,
-                pos=primitive.position_m, size=(sx / 2, sy / 2, sz / 2),
-                mass=0.0)
-        for name, zone in sorted(zones.items()):
-            if zone["kind"] == "disk":
-                center = tuple(map(float, zone["center_m"])) + (0.01,)
-                size = (float(zone["radius_m"]), 0.01, 0.0)
-                geom_type = mujoco.mjtGeom.mjGEOM_CYLINDER
-            else:
-                center = tuple(map(float, zone["center_m"]))
-                sx, sy, sz = map(float, zone["size_m"])
-                size = (sx / 2, sy / 2, sz / 2)
-                geom_type = mujoco.mjtGeom.mjGEOM_BOX
-            spec.worldbody.add_site(
-                name=f"zone__{name}", pos=center, size=size,
-                type=geom_type, group=4, rgba=(0.1, 0.9, 0.1, 0.25))
+        # mjlab offsets each parallel robot by an environment origin. Static
+        # authored geometry must be repeated at those same origins; adding one
+        # course at global (0, 0) makes every non-central robot see no boxes and
+        # sends world-space waypoint rewards toward the wrong environment.
+        # TerrainEntity has already emitted these sites before Scene.spec_fn is
+        # called, so they are the simulator's authoritative placement source.
+        indexed_origins: list[tuple[int, tuple[float, float, float]]] = []
+        for site in spec.sites:
+            match = re.fullmatch(r"env_origin_(\d+)", str(site.name or ""))
+            if match:
+                indexed_origins.append((
+                    int(match.group(1)), tuple(map(float, site.pos))))
+        if not indexed_origins:
+            indexed_origins = [(0, (0.0, 0.0, 0.0))]
+
+        # Generator terrains may assign multiple envs to one physical tile.
+        # One course per unique origin avoids overlapping duplicate collision
+        # geoms while preserving the terrain allocator's exact coordinates.
+        origins: list[tuple[int, tuple[float, float, float]]] = []
+        seen: set[tuple[float, float, float]] = set()
+        for env_index, origin in sorted(indexed_origins):
+            key = tuple(round(value, 7) for value in origin)
+            if key not in seen:
+                seen.add(key)
+                origins.append((env_index, origin))
+
+        single = len(origins) == 1
+        for env_index, origin in origins:
+            suffix = "" if single else f"__env_{env_index:04d}"
+            course_body = spec.worldbody.add_body(
+                name=f"authored_course{suffix}")
+            for primitive_index, primitive in enumerate(course):
+                sx, sy, sz = primitive.size_m
+                pos = tuple(
+                    origin[axis] + primitive.position_m[axis]
+                    for axis in range(3)
+                )
+                # Alternating high-contrast colors make platform boundaries
+                # and gaps legible in compressed rollout video.
+                rgba = (
+                    (0.16, 0.52, 0.92, 1.0)
+                    if primitive_index % 2 == 0
+                    else (0.95, 0.58, 0.16, 1.0)
+                )
+                course_body.add_geom(
+                    name=f"obstacle__{primitive.primitive_id}{suffix}",
+                    type=mujoco.mjtGeom.mjGEOM_BOX,
+                    pos=pos, size=(sx / 2, sy / 2, sz / 2),
+                    mass=0.0, friction=(1.0, 0.005, 0.0001), rgba=rgba)
+            for name, zone in sorted(zones.items()):
+                if zone["kind"] == "disk":
+                    local = tuple(map(float, zone["center_m"])) + (0.01,)
+                    size = (float(zone["radius_m"]), 0.01, 0.0)
+                    geom_type = mujoco.mjtGeom.mjGEOM_CYLINDER
+                else:
+                    local = tuple(map(float, zone["center_m"]))
+                    sx, sy, sz = map(float, zone["size_m"])
+                    size = (sx / 2, sy / 2, sz / 2)
+                    geom_type = mujoco.mjtGeom.mjGEOM_BOX
+                center = tuple(origin[axis] + local[axis] for axis in range(3))
+                spec.worldbody.add_site(
+                    name=f"zone__{name}{suffix}", pos=center, size=size,
+                    type=geom_type, group=4, rgba=(0.1, 0.9, 0.1, 0.25))
     return edit
 
 
@@ -1267,6 +1310,68 @@ def _reconcile_terrain_curriculum(env_cfg: Any) -> tuple[str, ...]:
     return tuple(removed)
 
 
+def _reconcile_waypoint_course(
+    env_cfg: Any, manifest: ResolvedEvaluation, *, train: bool,
+) -> tuple[str, ...]:
+    """Align resets and velocity commands with a fixed linear course.
+
+    A waypoint course is compiled along local +X. Generic velocity tasks may
+    otherwise randomize spawn yaw over 360 degrees and issue lateral/backward
+    commands, leaving the policy unable to infer which visually identical
+    reset should approach the course. Detect only declared goal/config
+    semantics; no robot or registered task identifier participates.
+    """
+    goal = manifest.task_shared.get("goal", {})
+    if goal.get("type") != "waypoint_sequence" or not manifest.course:
+        return ()
+
+    adjustments: list[str] = []
+    events = getattr(env_cfg, "events", None)
+    if isinstance(events, dict):
+        for name, term in events.items():
+            params = getattr(term, "params", None)
+            pose_range = params.get("pose_range") if isinstance(params, dict) else None
+            if not isinstance(pose_range, dict) or not all(
+                    axis in pose_range for axis in ("x", "y", "yaw")):
+                continue
+            pose_range["x"] = (-0.10, 0.05) if train else (0.0, 0.0)
+            pose_range["y"] = (-0.08, 0.08) if train else (0.0, 0.0)
+            pose_range["yaw"] = (-0.08, 0.08) if train else (0.0, 0.0)
+            adjustments.append(f"event:{name}→aligned with course +X")
+
+    commands = getattr(env_cfg, "commands", None)
+    if isinstance(commands, dict):
+        for name, term in commands.items():
+            ranges = getattr(term, "ranges", None)
+            if not all(hasattr(ranges, field) for field in (
+                    "lin_vel_x", "lin_vel_y", "ang_vel_z")):
+                continue
+            ranges.lin_vel_x = (0.45, 1.0) if train else (0.8, 0.8)
+            ranges.lin_vel_y = (0.0, 0.0)
+            ranges.ang_vel_z = (0.0, 0.0)
+            if hasattr(ranges, "heading"):
+                ranges.heading = None
+            for field, value in (
+                ("heading_command", False),
+                ("rel_standing_envs", 0.0),
+                ("rel_heading_envs", 0.0),
+                ("rel_forward_envs", 1.0),
+            ):
+                if hasattr(term, field):
+                    setattr(term, field, value)
+            adjustments.append(f"command:{name}→forward course traversal")
+
+    curriculum = getattr(env_cfg, "curriculum", None)
+    if isinstance(curriculum, dict):
+        for name, term in tuple(curriculum.items()):
+            func_name = str(getattr(getattr(term, "func", None), "__name__", ""))
+            if str(name) == "command_vel" or func_name == "commands_vel":
+                curriculum.pop(name, None)
+                adjustments.append(
+                    f"curriculum:{name}→removed(fixed course direction)")
+    return tuple(adjustments)
+
+
 def apply_world_selection(
     env_cfg: Any, selection_path: Path | str, *, train: bool,
     runtime_task_id: str | None = None,
@@ -1363,7 +1468,10 @@ def apply_world_selection(
                 frozen_flat_patch_radii_m=terrain.get(
                     "flat_patch_radii_m", {}))
         _apply_scene_and_runtime(env_cfg, authored_scene, runtime)
-    runtime_adjustments = _reconcile_terrain_curriculum(env_cfg)
+    runtime_adjustments = (
+        *_reconcile_terrain_curriculum(env_cfg),
+        *_reconcile_waypoint_course(env_cfg, manifest, train=train),
+    )
     return ResolvedWorldBundle(
         tuple_hash=selection.tuple_hash,
         evaluation_lineage=selection.evaluation_lineage,

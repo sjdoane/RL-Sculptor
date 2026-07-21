@@ -586,6 +586,20 @@ function ProjectBestPolicyCard({
                 </span>
               )}
             </div>
+            <div style={{
+              marginBottom: 12,
+              padding: "10px 12px",
+              border: "1px solid color-mix(in srgb, var(--st-amber) 55%, transparent)",
+              borderRadius: 8,
+              background: "color-mix(in srgb, var(--st-amber) 9%, transparent)",
+              color: "var(--st-amber)",
+              fontSize: 12,
+              lineHeight: 1.5,
+            }}>
+              Policy-selection fitness is not proof of authored-goal completion.
+              Confirm the task-success and waypoint channels and visually inspect
+              obstacle interaction before presenting this replay as a success.
+            </div>
             <p className="rs-sub" style={{ margin: "0 0 14px", maxWidth: 820 }}>
               The left clip is the policy used for selection. The fresh replay
               is a separate post-selection rollout, so agreement is evidence

@@ -317,10 +317,32 @@ def _build_sculptor_term_class(
                 elif k == "actuator_force":
                     out[k] = _get("actuator_force", 1)
                 elif k == "command_vel":
-                    try:
-                        v = env.command_manager.get_command("base_velocity")
-                    except Exception:  # noqa: BLE001
-                        v = None
+                    # Term names are task configuration, not adapter
+                    # semantics. Discover the velocity command by its ranges
+                    # so current ``twist`` and legacy ``base_velocity`` tasks
+                    # both expose the command the policy actually observes.
+                    v = None
+                    manager = env.command_manager
+                    names = list(dict.fromkeys([
+                        "base_velocity", "twist",
+                        *list(getattr(manager, "active_terms", ()) or ()),
+                    ]))
+                    for name in names:
+                        try:
+                            term_cfg = manager.get_term_cfg(name)
+                            ranges = getattr(term_cfg, "ranges", None)
+                            if not all(hasattr(ranges, field) for field in (
+                                "lin_vel_x", "lin_vel_y", "ang_vel_z",
+                            )):
+                                continue
+                            candidate = manager.get_command(name)
+                            if (candidate is not None and candidate.ndim == 2
+                                    and candidate.shape[0] == N
+                                    and candidate.shape[1] >= 3):
+                                v = candidate[:, :3]
+                                break
+                        except Exception:  # noqa: BLE001
+                            continue
                     # `get_command` can return None silently on tasks that
                     # don't have a "base_velocity" command (Cartpole, Yam,
                     # any non-locomotion task). Don't let a None leak into

@@ -780,3 +780,54 @@ The complete UI-only rehearsal and exact call script live in
 narrow: the run demonstrates an immutable authored-world tuple, end-to-end
 reward/environment optimization, metric-firewall selection, and fresh-seed
 locomotion reproduction. It does not yet demonstrate solved platform clearing.
+
+## Critical parkour correction 2026-07-21 (Codex)
+
+Sam visually rejected the showcase, correctly: Go1 never mounted a platform
+and ran away from the visible course. The old run is **not valid parkour
+evidence**. Direct inspection of `iter_4/rollout/trajectory.npz` found the
+root cause, not a subjective policy-quality issue:
+
+- mjlab placed the 64 rollout robots at tiled `scene.env_origins`, while the
+  compiler emitted only one static course at global `(0, 0)`;
+- both NumPy and Torch waypoint runtimes compared world-space robot positions
+  to unshifted local waypoint coordinates;
+- initial first-waypoint distances were therefore 1.1–10.5 m depending on the
+  environment tile, and every `goal__complete_course__waypoint_index` remained
+  exactly zero for all 500 recorded steps;
+- the waypoint target also used the platform box-center Z in full 3D, making a
+  robot root on top of a platform fail a nominal 0.25 m reach tolerance;
+- the sculpted `command_vel` channel requested obsolete command term
+  `base_velocity`, while installed mjlab calls the actual observed velocity
+  command `twist`, so the custom velocity term silently trained against zeros;
+- the base velocity task randomized spawn yaw over ±π and issued lateral,
+  backward, and turning commands despite the authored linear course being +X.
+
+Immediate source fixes (intentionally committed without tests at Sam's
+request):
+
+1. The course/zone spec editor discovers mjlab's authoritative
+   `env_origin_<n>` sites and emits one high-contrast, high-friction copy of
+   authored geometry per unique environment origin. This fixes collision and
+   rollout rendering together, including non-Go1 robots because the logic is
+   scene-semantic only.
+2. Region and waypoint producers translate world-space entity positions into
+   each environment's local frame. Course reach/progress uses XY distance;
+   physical platform geometry, rather than an unreachable root-height target,
+   enforces climbing.
+3. Velocity command capture discovers a term by its `lin_vel_x/lin_vel_y/
+   ang_vel_z` range contract, supporting current `twist`, legacy
+   `base_velocity`, and future semantic equivalents without task-name keying.
+4. Waypoint-course application structurally aligns reset pose/yaw and forward
+   velocity commands with course +X, disables lateral/turning/standing command
+   sampling, and removes only the velocity-command curriculum that would later
+   re-widen those ranges.
+5. The Results evidence card now warns explicitly that selection fitness is not
+   authored-goal completion and requires task-channel plus visual validation.
+
+Because the compiler/runtime source changed, the old promoted tuple must fail
+exact-match verification. Re-author/promote the same World prompt in the UI to
+produce a new admitted tuple, then launch a new run. Do not reuse the old
+checkpoint or show its Result card as successful evidence. No tests were run
+for this emergency slice per Sam's explicit instruction; the next agent should
+review and test it before claiming the replacement run works.

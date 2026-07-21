@@ -1,5 +1,12 @@
 # RewardSculptor lab-call demo runbook
 
+> **Critical correction (July 21):** The completed `job_434b10c7d3fd8eb2`
+> must not be presented as successful parkour. Its robots and waypoint targets
+> were in different environment-origin frames; all recorded waypoint indices
+> stayed at zero. The source fix invalidates the old tuple by design. Re-author
+> and promote the World in the UI, then train a new run before using parkour as
+> evidence.
+
 This is the reliable path for the July 21 research-lab demonstration. After
 one startup command, project creation, world authoring, launch, monitoring,
 steering, stopping, and resuming are all performed in the UI.
@@ -140,11 +147,11 @@ If time permits, open **Robot Library** to show that authoring is capability-
 driven and not keyed to Go1 or G1. Gym robots, quadrupeds, humanoids, and arm
 robots share the same core world-selection and launch contract.
 
-## Completed rehearsal result
+## Invalidated historical rehearsal
 
-The known-good run is `job_434b10c7d3fd8eb2` in **Lab Call — Authored
+The historical run is `job_434b10c7d3fd8eb2` in **Lab Call — Authored
 Parkour**. It completed all four requested cycles and then re-evaluated the
-selected best policy on fresh seed `90001`:
+selected policy on fresh seed `90001`, but it is not valid task evidence:
 
 - fitness progressed `0.00159 → 0.20701 → 0.26848 → 0.23281`;
 - iteration 4 (displayed as the third new cycle in this continued project) was
@@ -153,14 +160,13 @@ selected best policy on fresh seed `90001`:
   `0.26848`;
 - the best rollout stayed upright and showed coherent sustained locomotion;
   the fresh replay reproduced that behavior;
-- the evidence does **not** yet justify claiming that Go1 visibly cleared the
-  ascending platforms. Present it as a successful end-to-end authored-world
-  optimization run with reproducible locomotion progress and an honest metric
-  firewall, not as solved parkour.
+- direct trajectory inspection found zero waypoint advancement in every
+  recorded environment because geometry and targets were not translated to
+  each environment origin. Do not present its fitness as course progress.
 
-For the call, show the best rollout and its fresh replay from **Results**. The
-durable best artifacts are also retained under the project's local data root,
-but no terminal access is required to present them.
+Retain the artifacts as failure provenance, but do not show the old Results
+card as successful parkour. A replacement run must use a newly promoted World
+tuple compiled after the environment-origin fix.
 
 ## Recovery guide
 
