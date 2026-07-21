@@ -176,6 +176,14 @@ MODEL_ID = model_for("metric_gen")
 #: code (a confusing downstream "missing compute_spec"). 16000 leaves ample room for
 #: thinking AND a complete metric (observed ~7.3-7.5k total per generation).
 MAX_TOKENS = 16000
+#: §reviewer-truncation fix: the review call had the SAME class of bug MAX_TOKENS
+#: fixed for generation — adaptive THINKING shares the budget with the structured
+#: JSON verdict, and at the old 4000 cap a reviewer whose thinking ran long emitted a
+#: TRUNCATED verdict ("Invalid JSON: EOF while parsing a string"), which `.parse()`
+#: raised as a ValidationError → the reviewer counted as an ERROR against quorum and a
+#: whole panel could fail-closed on a harness token limit rather than a real veto.
+#: Give the verdict the same headroom generation gets; the JSON payload itself is tiny.
+REVIEW_MAX_TOKENS = 16000
 #: §review-feedback retry: how many times a VALIDATION-passing but REVIEWER-VETOED
 #: metric is regenerated with the reviewer's concerns fed back before giving up. Bounds
 #: the extra (gen + review) cost; the validation-failure feedback loop is separate.
@@ -305,10 +313,29 @@ def _review_one(
     else:
         user_content = payload
     try:
-        resp = client.messages.parse(
-            model=model, max_tokens=4000, thinking={"type": "adaptive"},
-            system=system, messages=[{"role": "user", "content": user_content}],
-            output_format=MetricReview)
+        try:
+            resp = client.messages.parse(
+                model=model, max_tokens=REVIEW_MAX_TOKENS,
+                thinking={"type": "adaptive"},
+                system=system,
+                messages=[{"role": "user", "content": user_content}],
+                output_format=MetricReview)
+        except Exception as first_err:  # noqa: BLE001
+            # A truncated/invalid structured verdict (adaptive thinking ran long)
+            # is recoverable — re-roll once via a second user turn (diagnose.py's
+            # `_parse_with_retry` pattern) before demoting to a no-evidence error.
+            resp = client.messages.parse(
+                model=model, max_tokens=REVIEW_MAX_TOKENS,
+                thinking={"type": "adaptive"},
+                system=system,
+                messages=[
+                    {"role": "user", "content": user_content},
+                    {"role": "user", "content":
+                     "Your previous reply did not parse as the required review "
+                     f"schema (error: {first_err!s}). Re-emit ONLY the structured "
+                     "review now, keeping any free text short."},
+                ],
+                output_format=MetricReview)
         log_llm_call(
             "metric_review", model,
             system="\n\n".join(str(b.get("text", "")) for b in system),

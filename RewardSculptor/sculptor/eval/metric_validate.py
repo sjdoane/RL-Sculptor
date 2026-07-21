@@ -208,6 +208,33 @@ def resolve_behavior_family(
     # locomotion example) and "strike" matched the idiom "strike a balance",
     # false-rejecting good metrics. "bound"/"strike" dropped ("bound" is a
     # quadruped GAIT; "strike" is too idiomatic — "kick" is the clear token).
+    # §compound-traversal fix: a parkour / traversal objective (climb onto
+    # supports, jump OFF / OVER / ACROSS an obstacle, vault, traverse a course)
+    # is a LOCOMOTIVE task whose success REQUIRES base travel. It must never
+    # resolve to a STATIONARY family (kick/floss/jump) — that fires the
+    # stationarity axiom and the walker ceiling against the very forward motion
+    # the goal demands (the live "climb two boxes … then jump off" false
+    # rejection: the metric scored the parkour positive high, but family "jump"
+    # then vetoed forward travel, and no metric could ever be accepted). Resolve
+    # to None (novel/compound) — the `active_parkour` + prompt-derived positive
+    # archetypes anchor non-degeneracy, NO stationary-skill gate fires, and
+    # task-VALIDITY defers to `calibrate_task_derived` behind the firewall (the
+    # same path every family-None novel goal already takes). Checked BEFORE the
+    # kick/floss/jump words so a compound "climb … jump off" is not captured by
+    # the bare "jump" token. A plain in-place "jump as high as you can" has no
+    # traversal cue and still resolves to the stationary jump family below.
+    _traversal_word = has(
+        "climb", "climbs", "climbing", "parkour", "traverse", "traverses",
+        "traversing", "vault", "vaults", "vaulting", "clamber", "clambers",
+        "clambering")
+    _traversal_phrase = any(
+        p in g for p in (
+            "jump off", "jumps off", "jumping off", "jump over", "jumps over",
+            "jumping over", "jump across", "jumps across", "jump onto",
+            "jumps onto", "leap off", "leaps off", "leap over", "leaps over",
+            "hop off", "hop over", "obstacle course"))
+    if _traversal_word or _traversal_phrase:
+        return None
     if has("kick", "kicks", "kicking"):
         return "kick"
     if has("floss", "flossing", "opposition", "antiphase") or "anti-phase" in g:
@@ -664,9 +691,16 @@ def _abstract_objective_program(
     def has(*words: str) -> bool:
         return any(word in tokens for word in words)
 
+    # Keep this traversal vocabulary ALIGNED with resolve_behavior_family's
+    # `_traversal_word`: a goal that function sends to family None (vault,
+    # traverse, clamber, …) MUST also produce a climb/jump_off probe here, or
+    # `abstract_is_traversal` stays False, the parkour positives are never
+    # re-added, and the metric is false-rejected (the two detectors disagreeing).
     staged_climb = has(
         "climb", "climbs", "climbing", "ascend", "ascending", "stairs",
-        "steps", "boxes", "platforms", "parkour",
+        "steps", "boxes", "platforms", "parkour", "vault", "vaults", "vaulting",
+        "traverse", "traverses", "traversing", "clamber", "clambers",
+        "clambering",
     )
     wants_dwell = has(
         "pause", "pauses", "pausing", "wait", "waiting", "hold", "holding",
@@ -692,8 +726,13 @@ def _abstract_objective_program(
         "jump", "jumps", "jumping", "hop", "hops", "hopping", "leap",
         "leaps", "leaping",
     )
+    # "jump OFF/OVER/ACROSS/ONTO" is a forward LEAP (jump_off — travel + arc +
+    # flight); a bare "jump" is the stationary skill. The over/across/onto words
+    # mirror resolve_behavior_family's `_traversal_phrase` so a "jump over the
+    # hurdle" goal (routed to family None there) carries a jump_off probe here.
     if wants_jump:
-        phases.append("jump_off" if staged_climb or has("off") else "jump")
+        leap = staged_climb or has("off", "over", "across", "onto")
+        phases.append("jump_off" if leap else "jump")
     if has("land", "lands", "landing") and (not phases or phases[-1] != "jump_off"):
         phases.append("land")
     if has("crouch", "crouches", "crouching", "squat", "squats", "squatting"):
@@ -728,6 +767,22 @@ def _abstract_objective_probe(phases: Sequence[str]) -> Optional[dict[str, np.nd
     root[..., 2] = 0.55
     gravity = _upright_g()
     joints = np.zeros((T, E, J), dtype=np.float64)
+    # Physically-consistent end-effector channels: a nominal grounded stance whose
+    # support schedule LIFTS both feet during flight phases and whose left foot
+    # SWINGS forward during a kick. The former exemplar fabricated both feet as
+    # permanently in-contact at the origin — strictly WORSE than omitting them: the
+    # metric prompt tells authors to read the foot-contact SUPPORT SCHEDULE to
+    # detect a jump/leap flight phase, so an always-in-contact probe scored EVERY
+    # such (correct) metric 0 (the live "climb … jump off" non-degeneracy all-zero).
+    # An ABSENT channel abstains to a neutral 1.0; a present-but-wrong one FAILS.
+    lfoot = np.zeros((T, E, 3), dtype=np.float64)
+    rfoot = np.zeros((T, E, 3), dtype=np.float64)
+    lfoot[..., 1] = 0.10   # nominal pelvis-frame stance (foot below + to the side)
+    rfoot[..., 1] = -0.10
+    lfoot[..., 2] = -0.55
+    rfoot[..., 2] = -0.55
+    contact_l = np.ones((T, E), dtype=np.float64)
+    contact_r = np.ones((T, E), dtype=np.float64)
     start = max(5, int(0.10 * T))
     bounds = np.linspace(start, T, len(clean) + 1, dtype=int)
     x = y = 0.0
@@ -800,6 +855,28 @@ def _abstract_objective_probe(phases: Sequence[str]) -> Optional[dict[str, np.nd
             burst = np.sin(np.pi * np.clip(u * 3.0, 0.0, 1.0))
             joints[a:b, :, 0:4] = (0.8 * burst)[:, None, None]
 
+        # End-effector support schedule + kick swing (see the channel note above):
+        # flight phases LIFT both feet so a support-schedule metric sees a real
+        # airborne window; a kick swings the left foot forward (signed anterior +x)
+        # so a foot-direction metric reads a correctly-directed strike. Every window
+        # ENDS grounded (touchdown), so the final frame certifies a landed stance.
+        if phase == "jump":
+            air = np.sin(np.pi * u) > 0.25
+        elif phase == "jump_off":
+            air = (u > 0.12) & (u < 0.92)
+        elif phase == "land":
+            air = u < 0.85
+        else:
+            air = None
+        if air is not None:
+            grounded = np.where(air, 0.0, 1.0)[:, None]
+            contact_l[a:b] = grounded
+            contact_r[a:b] = grounded
+        elif phase == "kick":
+            swing = 0.30 * np.sin(np.pi * u)
+            lfoot[a:b, :, 0] = swing[:, None]
+            contact_l[a:b] = (swing < 0.15).astype(np.float64)[:, None]
+
         if b < T:
             root[b:, :, 0] = x
             root[b:, :, 1] = y
@@ -808,17 +885,15 @@ def _abstract_objective_probe(phases: Sequence[str]) -> Optional[dict[str, np.nd
             gravity[b:, :, 2] = -np.sqrt(max(0.0, 1.0 - tilt * tilt))
             joints[b:] = joints[b - 1]
 
-    feet = np.zeros((T, E, 3), dtype=np.float64)
-    contact = np.ones((T, E), dtype=np.float64)
     return {
         "joint_pos": joints,
         "joint_vel": np.gradient(joints, axis=0) / 0.02,
         "projected_gravity_b": gravity,
         "root_link_pos_w": root,
-        "left_foot_pos_b": feet,
-        "right_foot_pos_b": feet.copy(),
-        "left_foot_contact": contact,
-        "right_foot_contact": contact.copy(),
+        "left_foot_pos_b": lfoot,
+        "right_foot_pos_b": rfoot,
+        "left_foot_contact": contact_l,
+        "right_foot_contact": contact_r,
     }
 
 
@@ -1970,7 +2045,18 @@ def validate_generated_metric(
     abstract_program = _abstract_objective_program(
         behavior_goal, getattr(mod, "ABSTRACT_OBJECTIVE", None))
     abstract_probe = _abstract_objective_probe(abstract_program)
-    if abstract_probe is not None:
+    # The prompt-derived probe anchors non-degeneracy ONLY for a genuine TRAVERSAL /
+    # parkour goal, where its ROOT-trajectory signature (climb height + a forward
+    # jump-off) is hard to game. For an in-place gesture or a recognized family, the
+    # FIXED family positive is the authoritative, hard-to-game anchor; the probe there
+    # is mere joint oscillation that a flail/energy rewarder scores high — so, added as
+    # a universal positive, it MASKS a still/flail negative (the live 4f1dfef/a6e2eec
+    # regression that broke the walker-fold and flail-under-kick gates) instead of
+    # discriminating. Those goals keep the fixed battery + vacuous/selectivity path.
+    abstract_is_traversal = (
+        abstract_probe is not None
+        and ("climb" in abstract_program or "jump_off" in abstract_program))
+    if abstract_is_traversal:
         arche["prompt_competent"] = abstract_probe
     catalog_cases: dict[str, str] = {}
     if catalog is not None:
@@ -2072,10 +2158,14 @@ def validate_generated_metric(
     # stand-and-thrash bypass the review found.
     positive_keys = (
         "active", "active_kick", "active_floss", "active_jump",
-        "active_parkour",
     )
-    if "prompt_competent" in scores:
-        positive_keys += ("prompt_competent",)
+    if abstract_is_traversal:
+        # Compound-traversal positives (the generic `active_parkour` exemplar + the
+        # prompt-derived `prompt_competent`) anchor a parkour metric. BOTH travel
+        # forward, so they are scoped to a real traversal goal — as universal
+        # positives they rescued an in-place metric that merely rewards walking
+        # (the walker-fold bypass) and masked the flail/still negatives.
+        positive_keys += ("active_parkour", "prompt_competent")
     negative_keys = ("still", "fallen", "upright_flail", "chaotic")
 
     nondegen = True
