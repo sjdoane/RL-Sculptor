@@ -608,3 +608,60 @@ def test_parkour_course_world_admits_and_promotes(client: TestClient):
     assert r.status_code == 200, r.text
     selection = client.get(f"/projects/{slug}/worlds/selection").json()
     assert selection["shared_summary"]["course_elements"] > 0
+
+
+def test_llm_author_capture_replay_is_deterministic(client: TestClient, monkeypatch):
+    """With the LLM author enabled, the model's output is CAPTURED at author time
+    and REPLAYED at apply time — so the non-deterministic model still satisfies the
+    draft-hash re-author contract (apply must not StaleDraftError)."""
+    from backend.services import world_store
+    from sculptor.world.author import author_environment
+
+    class _EchoModel:
+        # A deterministic stand-in for the LLM: returns a valid spec by delegating
+        # to the offline author for the request's robot.
+        def generate_authoring(self, request):
+            cap = request["selected_robot"]["capability_id"]
+            d = author_environment(request["prompt"], robot_capability_id=cap)
+            return {"world_spec": d.world_spec, "task_spec": d.task_spec,
+                    "parameter_provenance":
+                        d.world_spec["meta"]["parameter_provenance"]}
+
+    monkeypatch.setattr(world_store, "_llm_author_model", lambda: _EchoModel())
+
+    slug = _make_project(client)
+    draft = _author(client, slug)
+    project_dir = Path(client.get(f"/projects/{slug}").json()["project_dir"])
+    session = world_store._load_session(project_dir, draft["session_id"])
+    # The LLM output was captured for deterministic replay.
+    captured = session["inputs"]["authoring_output"]
+    assert captured is not None and "world_spec" in captured
+
+    # apply re-authors via the replay model → draft_hash matches → admits.
+    r = client.post(
+        f"/projects/{slug}/worlds/author/apply",
+        json={"session_id": draft["session_id"], "answers": []})
+    assert r.status_code == 200, r.text
+
+
+def test_llm_author_falls_back_to_offline_on_model_error(client: TestClient, monkeypatch):
+    """A model failure never blocks authoring: the store falls back to the
+    deterministic offline author (nothing captured → offline replay at apply)."""
+    from backend.services import world_store
+
+    class _BoomModel:
+        def generate_authoring(self, request):
+            raise RuntimeError("api unavailable")
+
+    monkeypatch.setattr(world_store, "_llm_author_model", lambda: _BoomModel())
+
+    slug = _make_project(client)
+    draft = _author(client, slug)
+    project_dir = Path(client.get(f"/projects/{slug}").json()["project_dir"])
+    session = world_store._load_session(project_dir, draft["session_id"])
+    assert session["inputs"]["authoring_output"] is None    # offline was used
+
+    r = client.post(
+        f"/projects/{slug}/worlds/author/apply",
+        json={"session_id": draft["session_id"], "answers": []})
+    assert r.status_code == 200, r.text

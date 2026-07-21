@@ -11,9 +11,13 @@ time, verifying the recomputed ``draft_hash`` against the persisted one
 raises ``StaleDraftError`` instead of silently applying answers to a
 different question set.
 
-Only the offline deterministic author is wired here; if an LLM author
-model is ever added, the re-author trick stops working and the draft
-must be held server-side instead.
+The optional LLM author (enabled by ``RS_WORLD_LLM_AUTHOR=1``) is
+non-deterministic, so the re-author trick alone would break. It is made
+reproducible by CAPTURING the model's declarative output at author time and
+persisting it in the session; ``_reauthor`` then REPLAYS that exact output
+through the same ``AuthorModel`` seam, so the recomputed ``draft_hash`` still
+matches. A model failure / invalid spec falls back to the deterministic offline
+author (nothing captured → offline replay), so a bad model never blocks authoring.
 """
 from __future__ import annotations
 
@@ -112,7 +116,7 @@ def author(
     must not silently swap the robot out from under the project. The
     author's prompt-based auto-selection only applies when the project
     robot has no capability mapping."""
-    from sculptor.world.author import author_environment
+    from sculptor.world.author import AuthoringError, author_environment
     from sculptor.world.grounding import (
         gather_grounding,
         grounding_context,
@@ -126,9 +130,28 @@ def author(
     items = gather_grounding(prompt) if kg_grounding else ()
     ids = grounding_ids(items)
     context = grounding_context(items)
-    draft = author_environment(
-        prompt, robot_capability_id=robot_capability_id,
-        grounding=ids, grounding_context=context)
+
+    # Optional LLM author (RS_WORLD_LLM_AUTHOR): capture its declarative output so
+    # apply-time re-author can replay it deterministically; fall back to offline on
+    # any failure/invalid spec (the local validators gate the model output).
+    authoring_output = None
+    model = _llm_author_model()
+    if model is not None:
+        capture = _CaptureModel(model)
+        try:
+            draft = author_environment(
+                prompt, model=capture, robot_capability_id=robot_capability_id,
+                grounding=ids, grounding_context=context)
+            authoring_output = capture.captured
+        except AuthoringError:
+            authoring_output = None
+            draft = author_environment(
+                prompt, robot_capability_id=robot_capability_id,
+                grounding=ids, grounding_context=context)
+    else:
+        draft = author_environment(
+            prompt, robot_capability_id=robot_capability_id,
+            grounding=ids, grounding_context=context)
 
     session_id = draft.draft_hash[:24]
     session_dir = _sessions_dir(project_dir) / session_id
@@ -143,6 +166,9 @@ def author(
             "robot_capability_id": robot_capability_id,
             "grounding": ids,
             "grounding_context": context,
+            # Present only when the LLM author produced the draft; drives the
+            # deterministic replay in _reauthor (None → offline re-author).
+            "authoring_output": authoring_output,
         },
     })
     _atomic_write_json(session_dir / "draft.json", draft.to_dict())
@@ -169,12 +195,54 @@ def _load_session(project_dir: Path, session_id: str) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _llm_author_model():
+    """The optional LLM world author, or None. Enabled by RS_WORLD_LLM_AUTHOR
+    ∈ {1,true,yes}. Isolated in one function so tests can monkeypatch it with a
+    fake model without touching the environment or the API."""
+    if os.environ.get("RS_WORLD_LLM_AUTHOR", "").strip().lower() not in (
+            "1", "true", "yes", "on"):
+        return None
+    from sculptor.world.llm_author import LLMWorldAuthor
+
+    return LLMWorldAuthor()
+
+
+class _CaptureModel:
+    """Wrap an AuthorModel, recording its declarative output so apply-time
+    re-author can replay it verbatim (the LLM is non-deterministic; the captured
+    output makes the draft-hash contract reproducible)."""
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+        self.captured: dict[str, Any] | None = None
+
+    def generate_authoring(self, request: Mapping[str, Any]) -> Mapping[str, Any]:
+        out = dict(self._inner.generate_authoring(request))
+        self.captured = out
+        return out
+
+
+class _ReplayModel:
+    """Return a persisted authoring output verbatim — a deterministic AuthorModel
+    that reproduces the exact draft the LLM produced at author time."""
+
+    def __init__(self, captured: Mapping[str, Any]) -> None:
+        self._captured = dict(captured)
+
+    def generate_authoring(self, request: Mapping[str, Any]) -> Mapping[str, Any]:
+        return self._captured
+
+
 def _reauthor(session: Mapping[str, Any]):
     from sculptor.world.author import author_environment
 
     inputs = session.get("inputs") or {}
+    # Replay the captured LLM output when present; else deterministic offline.
+    captured = inputs.get("authoring_output")
+    model = _ReplayModel(captured) if isinstance(captured, Mapping) else None
     return author_environment(
         str(inputs.get("prompt") or ""),
+        model=model,
         robot_capability_id=inputs.get("robot_capability_id") or None,
         grounding=tuple(inputs.get("grounding") or ()),
         grounding_context=tuple(inputs.get("grounding_context") or ()),
