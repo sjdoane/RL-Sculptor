@@ -145,6 +145,55 @@ def test_export_bundle_contents_and_manifest(tmp_path):
     assert all(len(f["sha256"]) == 64 for f in manifest["files"])
 
 
+def test_deployment_contract_and_inference_script(tmp_path):
+    """The bundle carries a sim→real hardware contract (joint order, control
+    rate, action scale/offset, default pose, obs layout) + a runnable
+    inference.py — everything a hardware controller needs that the raw network
+    cannot express."""
+    project = _make_project(tmp_path)  # real Go1 task_id
+    res = export_policy_bundle(project)
+    with zipfile.ZipFile(res.bundle_path) as zf:
+        names = set(zf.namelist())
+        manifest = json.loads(zf.read("manifest.json"))
+        infer_src = zf.read("inference.py").decode()
+
+    assert "inference.py" in names
+    dep = manifest["deployment"]
+    assert dep["available"] is True
+    # joint ORDER the action/obs vectors index — the Go1 12-DOF layout
+    jn = dep["joint_names"]
+    assert len(jn) == 12
+    assert jn[0] == "FR_hip_joint" and jn[3] == "FL_hip_joint"
+    # control rate 0.005 s * decimation 4 = 50 Hz
+    assert dep["control"]["control_hz"] == pytest.approx(50.0)
+    # action → joint-target contract
+    assert dep["action"]["use_default_offset"] is True
+    assert "default_joint_pos" in dep["action"]["target_formula"]
+    assert set(dep["action"]["scale"]) == set(jn)
+    assert set(dep["default_joint_pos"]) == set(jn)
+    assert dep["default_joint_pos"]["FR_thigh_joint"] == pytest.approx(0.9)
+    # ordered observation layout
+    obs_terms = [t["name"] for t in dep["observation"]["terms"]]
+    assert "projected_gravity" in obs_terms and "joint_pos" in obs_terms
+    # the inference skeleton is parameterized, not a stub
+    assert "read_robot_state" in infer_src and "send_joint_targets" in infer_src
+    assert "default_vec + scale_vec * action" in infer_src
+
+
+def test_deployment_contract_degrades_without_task_id(tmp_path):
+    """No task_id → no joint manifest: the bundle still ships inference.py and a
+    deployment block flagged unavailable (never a wrong guess)."""
+    project = _make_project(tmp_path, task_id=None)
+    res = export_policy_bundle(project)
+    with zipfile.ZipFile(res.bundle_path) as zf:
+        assert "inference.py" in zf.namelist()
+        manifest = json.loads(zf.read("manifest.json"))
+    dep = manifest["deployment"]
+    assert dep["available"] is False
+    assert dep["joint_names"] is None
+    assert any("deployment" in w for w in manifest["warnings"])
+
+
 def test_export_picks_latest_iter_by_default(tmp_path):
     project = _make_project(tmp_path, iters=[0, 3, 7])
     res = export_policy_bundle(project)

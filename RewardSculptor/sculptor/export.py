@@ -4,10 +4,12 @@ A bundle is a single zip that carries everything needed to reproduce or
 deploy one trained iteration:
 
     policy_<project>_iter<N>.zip
-    ├── manifest.json        # schema, provenance, dims, hashes
+    ├── manifest.json        # schema, provenance, dims, hashes, deployment
     ├── checkpoint.pt|zip    # the raw trained checkpoint, byte-exact
     ├── policy.onnx          # actor network, ONNX (best-effort)
     ├── policy_ts.pt         # actor network, TorchScript (best-effort)
+    ├── inference.py         # runnable hardware skeleton (obs order + action
+    │                        #   formula + rate baked in; 2 robot-SDK seams)
     ├── reward/
     │   ├── reward_spec.json # REWARD_SPEC snapshot the iter trained under
     │   └── v<n>.py          # exact reward source (when resolvable)
@@ -16,7 +18,14 @@ deploy one trained iteration:
     ├── config.toml          # project config snapshot
     ├── metrics.json         # the iter's training/eval metrics
     ├── run_context.json     # package versions / SHAs / seeds (if recorded)
-    └── DEPLOY.md            # loading recipes (ONNX / TorchScript / raw)
+    └── DEPLOY.md            # loading recipes + sim→real hardware contract
+
+The manifest ``deployment`` block is the sim→real interface contract the raw
+network cannot carry: the joint ORDER the action/obs vectors index (from the
+robot manifest), the action→joint-target formula + per-joint scale + default
+pose, the control rate (sim dt × decimation), and the ordered observation
+layout — all read best-effort from the mjlab task cfg, degrading to the joint
+order + a flag when mjlab is not importable.
 
 Checkpoint formats understood:
 
@@ -230,6 +239,10 @@ def export_policy_bundle(
         elif ckpt.suffix == ".zip":
             net_meta = _export_sb3_actor(ckpt, stage, files, warnings)
 
+        # Sim→real hardware contract (joint order, action scale/offset, control
+        # rate, obs layout) — the interface the raw network cannot carry.
+        deployment = _deployment_contract(project, net_meta, warnings)
+
         manifest: dict[str, Any] = {
             "schema_version": EXPORT_SCHEMA_VERSION,
             "kind": "reward-sculptor-policy-bundle",
@@ -245,12 +258,19 @@ def export_policy_bundle(
             "reward_version": reward_version,
             "env_spec_source": env_spec_source,
             "network": net_meta,
+            "deployment": deployment,
             "warnings": warnings,
         }
 
         deploy_md = _render_deploy_md(manifest)
         (stage / "DEPLOY.md").write_text(deploy_md, encoding="utf-8")
         files.append((stage / "DEPLOY.md", "DEPLOY.md"))
+
+        # Runnable inference skeleton (obs order + action formula + rate baked
+        # in; only the two robot-SDK seams are left for the operator).
+        (stage / "inference.py").write_text(
+            _render_inference_py(manifest), encoding="utf-8")
+        files.append((stage / "inference.py", "inference.py"))
 
         # File table with hashes (manifest lists everything but itself).
         manifest["files"] = [
@@ -619,6 +639,256 @@ def _resolve_activation(project: Path, warnings: list[str]) -> tuple[str, bool]:
     return "elu", True
 
 
+def _task_id_from_config(project: Path) -> Optional[str]:
+    """The adapter's mjlab `task_id` from the project config.toml (or None)."""
+    try:
+        try:
+            import tomllib
+        except ImportError:  # pragma: no cover - py<3.11
+            import tomli as tomllib  # type: ignore[no-redef]
+        with (project / "config.toml").open("rb") as f:
+            cfg = tomllib.load(f)
+        tid = ((cfg.get("adapter") or {}).get("config") or {}).get("task_id")
+        return tid if isinstance(tid, str) and tid else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _resolve_per_joint(
+    pattern_map: dict, joint_names: list[str],
+) -> dict[str, Any]:
+    """mjlab joint-name-pattern → value maps (e.g. action scale, default pose)
+    resolved against the ordered `joint_names`. Each joint takes the value of
+    the LAST pattern that matches it (mjlab's more-specific-later convention);
+    a literal (non-regex) key falls back to exact match."""
+    import re
+
+    out: dict[str, Any] = {}
+    for jn in joint_names:
+        chosen: Any = None
+        for pat, val in pattern_map.items():
+            try:
+                if re.fullmatch(str(pat), jn) or re.search(str(pat), jn):
+                    chosen = val
+            except re.error:
+                if str(pat) == jn:
+                    chosen = val
+        if chosen is not None:
+            out[jn] = float(chosen) if isinstance(chosen, (int, float)) else chosen
+    return out
+
+
+def _deployment_contract(
+    project: Path, net_meta: dict[str, Any], warnings: list[str],
+) -> dict[str, Any]:
+    """The sim→real interface contract a hardware controller needs but the raw
+    checkpoint/ONNX cannot carry: the joint ORDER the action/obs vectors index,
+    the action target formula + per-joint scale + default pose, the control
+    rate, and the ordered observation layout.
+
+    `joint_names` (order) come from the captured robot manifest and are ALWAYS
+    present for a known robot. The rest is read best-effort from the mjlab task
+    cfg (like `_resolve_activation`); when mjlab is not importable the contract
+    still ships the joint order + a flag naming what is missing, never a wrong
+    guess."""
+    from sculptor.eval.robot_manifest import robot_joint_names
+
+    task_id = _task_id_from_config(project)
+    joint_names = robot_joint_names(task_id) if task_id else None
+    contract: dict[str, Any] = {
+        "task_id": task_id,
+        "joint_names": joint_names,
+        "joint_order_source": (
+            "reward-sculptor robot manifest (captured from real rollouts)"
+            if joint_names else "unavailable — robot not in the manifest"),
+        "action": {
+            "output": "mean_action",
+            "target_formula": (
+                "q_target[j] = default_joint_pos[j] + scale[j] * action[j]"),
+            "note": "action indices align 1:1 with joint_names order",
+        },
+    }
+    if joint_names is None:
+        warnings.append(
+            "deployment: robot not in the joint manifest — the bundle ships "
+            "network dims but no joint-order / action-scale mapping")
+        contract["available"] = False
+        return contract
+
+    if not task_id:
+        contract["available"] = False
+        return contract
+    try:
+        from mjlab.tasks.registry import load_env_cfg
+
+        ec = load_env_cfg(task_id)
+        # Control rate.
+        sim = getattr(ec, "sim", None)
+        mj = getattr(sim, "mujoco", None) if sim else None
+        dt = float(getattr(mj, "timestep", 0.0) or 0.0)
+        dec = int(getattr(ec, "decimation", 0) or 0)
+        if dt > 0 and dec > 0:
+            contract["control"] = {
+                "sim_timestep_s": dt, "decimation": dec,
+                "control_dt_s": round(dt * dec, 6),
+                "control_hz": round(1.0 / (dt * dec), 4),
+            }
+        grav = getattr(mj, "gravity", None) if mj else None
+        if grav is not None:
+            contract["gravity"] = [float(x) for x in grav]
+
+        # Action term: scale + default-offset + clip.
+        actions = getattr(ec, "actions", None) or {}
+        for name, term in (actions.items() if hasattr(actions, "items") else []):
+            scale = getattr(term, "scale", None)
+            contract["action"]["term"] = name
+            contract["action"]["type"] = type(term).__name__
+            contract["action"]["use_default_offset"] = bool(
+                getattr(term, "use_default_offset", False))
+            clip = getattr(term, "clip", None)
+            if clip is not None:
+                contract["action"]["clip"] = clip
+            if isinstance(scale, dict):
+                contract["action"]["scale"] = _resolve_per_joint(
+                    scale, joint_names)
+            elif isinstance(scale, (int, float)):
+                contract["action"]["scale"] = {
+                    jn: float(scale) for jn in joint_names}
+            break
+
+        # Default joint pose (the offset the action rides on).
+        scene = getattr(ec, "scene", None)
+        ents = getattr(scene, "entities", None) if scene else None
+        robot = ents.get("robot") if hasattr(ents, "get") else None
+        init = getattr(robot, "init_state", None) if robot else None
+        jp = getattr(init, "joint_pos", None) if init else None
+        if isinstance(jp, dict):
+            contract["default_joint_pos"] = _resolve_per_joint(jp, joint_names)
+
+        # Observation layout — the ORDERED terms the actor vector concatenates.
+        obs = getattr(ec, "observations", None) or {}
+        group = obs.get("actor") or obs.get("policy") if hasattr(obs, "get") else None
+        terms = getattr(group, "terms", None) if group else None
+        if isinstance(terms, dict):
+            layout = []
+            for tname, tcfg in terms.items():
+                func = getattr(tcfg, "func", None)
+                layout.append({
+                    "name": tname,
+                    "source": getattr(func, "__name__", None) if func else None,
+                    "scale": getattr(tcfg, "scale", None),
+                })
+            contract["observation"] = {
+                "note": "concatenated in this order into the actor obs vector",
+                "obs_dim": net_meta.get("obs_dim"),
+                "terms": layout,
+            }
+        contract["available"] = True
+        contract["source"] = f"mjlab task cfg '{task_id}'"
+    except Exception as e:  # noqa: BLE001 — best-effort, never fatal
+        warnings.append(
+            f"deployment: could not read the mjlab task cfg for {task_id!r} "
+            f"({type(e).__name__}: {e}) — shipping joint order only")
+        contract["available"] = False
+    return contract
+
+
+def _render_inference_py(manifest: dict[str, Any]) -> str:
+    """A runnable inference skeleton parameterized by the deployment contract:
+    it encodes the EXACT obs order, action formula, per-joint scale, default
+    pose and control rate — the hard, error-prone part — and marks the two
+    robot-SDK seams (`read_robot_state`, `send_joint_targets`) the operator
+    fills in for their specific hardware."""
+    dep = manifest.get("deployment") or {}
+    net = manifest.get("network") or {}
+    obs_dim = net.get("obs_dim", "OBS_DIM")
+    hz = (dep.get("control") or {}).get("control_hz", 50.0)
+    obs_terms = (dep.get("observation") or {}).get("terms") or []
+    obs_lines = "\n".join(
+        f"    #   {i}: {t.get('name')}  (source: {t.get('source')})"
+        for i, t in enumerate(obs_terms)) or "    #   (obs layout unavailable — see env_spec.json)"
+    return f'''#!/usr/bin/env python3
+"""Real-hardware inference skeleton for a Reward Sculptor policy bundle.
+
+Generated for project {manifest.get('project')!r}, iter {manifest.get('iter_index')}.
+Everything hardware-INDEPENDENT is filled in from manifest.json (joint order,
+action scale, default pose, observation layout, control rate). You only wire the
+two SDK seams marked `TODO(hardware)` below to your robot's driver.
+
+    python inference.py            # dry-run: zeros in, prints target angles
+
+SAFETY: before closing the loop on a real robot, (1) verify joint_names order
+matches your SDK exactly, (2) ramp to default_joint_pos slowly, (3) keep an
+e-stop in reach. The policy was trained in sim; unverified transfer can be
+violent.
+"""
+import json, time
+from pathlib import Path
+import numpy as np
+
+HERE = Path(__file__).resolve().parent
+M = json.loads((HERE / "manifest.json").read_text())
+DEP = M.get("deployment", {{}})
+JOINT_NAMES = DEP.get("joint_names") or []
+SCALE = DEP.get("action", {{}}).get("scale", {{}})
+DEFAULT_POS = DEP.get("default_joint_pos", {{}})
+USE_OFFSET = DEP.get("action", {{}}).get("use_default_offset", True)
+CONTROL_HZ = {hz}
+OBS_DIM = {obs_dim}
+
+scale_vec = np.array([SCALE.get(j, 1.0) for j in JOINT_NAMES], dtype=np.float32)
+default_vec = np.array([DEFAULT_POS.get(j, 0.0) for j in JOINT_NAMES], dtype=np.float32)
+
+
+def load_policy():
+    """Prefer ONNX (obs-normalization is baked in — feed RAW obs)."""
+    try:
+        import onnxruntime as ort
+        sess = ort.InferenceSession(str(HERE / "policy.onnx"))
+        return lambda obs: sess.run(["action"], {{"obs": obs[None].astype(np.float32)}})[0][0]
+    except Exception:
+        import torch
+        net = torch.jit.load(str(HERE / "policy_ts.pt")).eval()
+        return lambda obs: net(torch.as_tensor(obs[None], dtype=torch.float32)).detach().numpy()[0]
+
+
+def read_robot_state():
+    """TODO(hardware): return the RAW observation vector, length OBS_DIM,
+    concatenated in EXACTLY this order (see manifest deployment.observation):
+{obs_lines}
+    Joint pos/vel are RELATIVE to default_joint_pos, in JOINT_NAMES order."""
+    return np.zeros(OBS_DIM, dtype=np.float32)
+
+
+def send_joint_targets(q_target):
+    """TODO(hardware): command position targets (rad), one per JOINT_NAMES entry,
+    to your PD controller. q_target is a float array aligned with JOINT_NAMES."""
+    print("q_target:", np.round(q_target, 4).tolist())
+
+
+def main():
+    policy = load_policy()
+    dt = 1.0 / CONTROL_HZ
+    while True:
+        t0 = time.perf_counter()
+        obs = read_robot_state()
+        action = np.asarray(policy(obs), dtype=np.float32)
+        q_target = default_vec + scale_vec * action if USE_OFFSET else scale_vec * action
+        send_joint_targets(q_target)
+        time.sleep(max(0.0, dt - (time.perf_counter() - t0)))
+
+
+if __name__ == "__main__":
+    # Dry run: one step with a zero observation.
+    policy = load_policy()
+    obs = read_robot_state()
+    action = np.asarray(policy(obs), dtype=np.float32)
+    q = default_vec + scale_vec * action if USE_OFFSET else scale_vec * action
+    print(f"obs_dim={{obs.size}} action_dim={{action.size}} control_hz={{CONTROL_HZ}}")
+    print("first target angles:", np.round(q, 4).tolist()[:8], "...")
+'''
+
+
 def _onnx_export(model, example, onnx_path: Path) -> None:
     import torch
 
@@ -795,10 +1065,54 @@ def _render_deploy_md(manifest: dict[str, Any]) -> str:
         "",
         "The network outputs the **mean action** of the Gaussian policy "
         "(deterministic deployment). Observation layout, scaling, and "
-        "action post-processing must match training — see `env_spec.json`, "
-        "`config.toml`, and the adapter's state schema.",
+        "action post-processing must match training — the sim→real contract "
+        "below (and `manifest.json` → `deployment`) captures exactly that.",
         "",
     ]
+    dep = manifest.get("deployment") or {}
+    if dep.get("joint_names"):
+        jn = dep["joint_names"]
+        act = dep.get("action") or {}
+        ctrl = dep.get("control") or {}
+        lines += [
+            "## Sim→real hardware contract",
+            "",
+            "**`inference.py` is a runnable skeleton** with all of this baked "
+            "in — you only fill the two `TODO(hardware)` seams (`read_robot_"
+            "state`, `send_joint_targets`) for your robot's SDK.",
+            "",
+            f"- **Joints ({len(jn)})**, in the order the action/obs vectors "
+            f"index (source: {dep.get('joint_order_source')}):",
+            "  ```",
+            "  " + ", ".join(jn),
+            "  ```",
+        ]
+        if ctrl.get("control_hz"):
+            lines.append(
+                f"- **Control rate:** {ctrl['control_hz']} Hz "
+                f"(sim dt {ctrl.get('sim_timestep_s')}s × decimation "
+                f"{ctrl.get('decimation')} = {ctrl.get('control_dt_s')}s).")
+        if act.get("target_formula"):
+            off = ("uses the default-pose offset" if act.get("use_default_offset")
+                   else "does NOT use a default-pose offset")
+            lines.append(
+                f"- **Action → joint targets:** `{act['target_formula']}` "
+                f"(this policy {off}).")
+        if dep.get("default_joint_pos") is not None:
+            lines.append(
+                "- **`default_joint_pos` + per-joint `action` `scale`** are in "
+                "`manifest.json` → `deployment` — apply them exactly.")
+        if (dep.get("observation") or {}).get("terms"):
+            order = " → ".join(
+                t.get("name") for t in dep["observation"]["terms"])
+            lines.append(
+                f"- **Observation order** (concatenate in this order): {order}.")
+        if not dep.get("available", True):
+            lines.append(
+                "- ⚠️ The mjlab task cfg was not readable at export time, so "
+                "action scale / default pose / obs layout may be absent — see "
+                "`env_spec.json` and `config.toml`, and the warnings below.")
+        lines.append("")
     if net.get("obs_normalization_baked") and net.get("exports"):
         lines += [
             "Observation normalization — `(x - mean) / (std + 0.01)`, the "
