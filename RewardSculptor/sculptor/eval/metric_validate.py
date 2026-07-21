@@ -633,7 +633,9 @@ def _upright_g() -> np.ndarray:
 def _archetypes() -> dict[str, dict]:
     """Synthetic archetype rollouts spanning a competence axis. Negatives
     (`still`/`fallen`/`chaotic`/`upright_flail`) plus a POSITIVE per behavior
-    family (`active` locomotion, `active_kick`, `active_floss`, `active_jump`).
+    family (`active` locomotion, `active_kick`, `active_floss`, `active_jump`) plus
+    a generic compound traversal (`active_parkour`: climb, dwell, climb, dwell,
+    then jump away and land).
     A valid task metric scores its family positive strictly above the negatives
     with non-trivial spread (the gate picks the family in
     `validate_generated_metric`)."""
@@ -746,6 +748,45 @@ def _archetypes() -> dict[str, dict]:
     rootj = np.zeros((T, E, 3)); rootj[..., 2] = zj[:, None]
     active_jump = arrays(jpj, jvj, _upright_g(), rootj)
 
+    # Compound traversal: approach/climb onto two progressively higher supports,
+    # remain still on each one, then jump horizontally away while descending to
+    # the starting height.  This is deliberately robot- and task-name agnostic:
+    # it represents the observable physics of a staged parkour objective, not a
+    # particular quadruped, scene, box count, or simulator.  The former jump-only
+    # positive had zero horizontal travel and no elevated dwell, making every
+    # honest climb→pause→jump completion metric look constant-zero and therefore
+    # impossible to generate regardless of retries.
+    i0 = max(4, int(0.20 * T))
+    i1 = max(i0 + 4, int(0.30 * T))
+    i2 = max(i1 + 6, int(0.46 * T))
+    i3 = max(i2 + 4, int(0.56 * T))
+    i4 = max(i3 + 6, int(0.72 * T))
+    i5 = max(i4 + 6, int(0.88 * T))
+
+    zp = np.full(T, 0.55)
+    xp = np.zeros(T)
+    zp[i0:i1] = np.linspace(0.55, 0.85, i1 - i0, endpoint=False)
+    zp[i1:i2] = 0.85
+    zp[i2:i3] = np.linspace(0.85, 1.15, i3 - i2, endpoint=False)
+    zp[i3:i4] = 1.15
+    zp[i4:i5] = np.linspace(1.15, 0.55, i5 - i4)
+    xp[i0:i1] = np.linspace(0.0, 0.45, i1 - i0, endpoint=False)
+    xp[i1:i2] = 0.45
+    xp[i2:i3] = np.linspace(0.45, 0.90, i3 - i2, endpoint=False)
+    xp[i3:i4] = 0.90
+    xp[i4:i5] = np.linspace(0.90, 1.80, i5 - i4)
+    xp[i5:] = 1.80
+
+    jvp = np.zeros((T, E, J))
+    for start in (i0, i2, i4):
+        for jdx in (0, 1, 2, 3):
+            jvp[start:min(start + 5, T), :, jdx] = 6.0
+    jpp = np.cumsum(jvp, axis=0) * 0.02
+    rootp = np.zeros((T, E, 3))
+    rootp[..., 0] = xp[:, None]
+    rootp[..., 2] = zp[:, None]
+    active_parkour = arrays(jpp, jvp, _upright_g(), rootp)
+
     # §Ship 47: a realistic forward WALKER — upright, at STANDING height
     # (z≈0.70), travelling forward with FAST alternating hip/knee gait
     # swings (peak ≈6 rad/s, well above any kick threshold). This is the
@@ -801,7 +842,8 @@ def _archetypes() -> dict[str, dict]:
     return {"still": still, "fallen": fallen, "chaotic": chaotic,
             "active": active, "upright_flail": upright_flail,
             "active_kick": active_kick, "active_floss": active_floss,
-            "active_jump": active_jump, "walker": walker,
+            "active_jump": active_jump, "active_parkour": active_parkour,
+            "walker": walker,
             "active_kick_behind": active_kick_behind,
             "one_leg_balance": one_leg_balance, "partial_kick": partial_kick}
 
@@ -1748,7 +1790,8 @@ def validate_generated_metric(
         # below isolate the authored-channel failure modes directly.
         for name, arrays in arche.items():
             case = ("competent" if name in {
-                "active", "active_kick", "active_floss", "active_jump"
+                "active", "active_kick", "active_floss", "active_jump",
+                "active_parkour",
             } else "far_idle")
             arrays.update(catalog_fixture_arrays(
                 catalog, time_steps=T, num_envs=E, case=case))
@@ -1830,7 +1873,10 @@ def validate_generated_metric(
     # joint speed of any archetype), so a peak-speed reward-hack (which scores
     # chaotic above the real positives) is rejected — closing the
     # stand-and-thrash bypass the review found.
-    positive_keys = ("active", "active_kick", "active_floss", "active_jump")
+    positive_keys = (
+        "active", "active_kick", "active_floss", "active_jump",
+        "active_parkour",
+    )
     negative_keys = ("still", "fallen", "upright_flail", "chaotic")
 
     nondegen = True
