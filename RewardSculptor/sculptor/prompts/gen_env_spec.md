@@ -68,6 +68,27 @@ Decision checklist:
 7. **`friction_range`.** Widen only when the goal demands robustness
    across surfaces; tighten toward nominal (e.g. [0.7, 1.0]) for
    precision contact skills where friction lottery adds noise.
+7b. **Physics domain randomization** (sim-to-real dynamics gap — Dynamics
+   Randomization arXiv 1710.06537, RMA 2107.04034, Walk-These-Ways 2212.03238).
+   The runtime ALREADY applies a moderate baseline (`body_mass_scale_range`
+   0.85-1.15, `joint_damping_scale_range`/`joint_armature_scale_range` 0.8-1.2)
+   to EVERY train run even if you omit them — so you only add/retune the axes
+   the goal makes uncertain. Multiplicative [lo, hi] scales about the nominal
+   model value, each sampled per-env at startup:
+   - `body_mass_scale_range` — link masses (payload/CAD error). Widen to
+     ~[0.8, 1.25] for goals that carry/push loads.
+   - `pd_kp_scale_range` / `pd_kd_scale_range` — controller stiffness/damping
+     (real gains drift). ~[0.85, 1.15] for gaits; only set on PD-actuated robots.
+   - `motor_strength_scale_range` — actuator effort limit (torque headroom).
+     ~[0.85, 1.15]; do NOT set below ~0.8 for explosive skills that need torque.
+   - `com_offset_m` — per-link CoM shift magnitude (m), applied ±on x/y/z to
+     EVERY link independently, so keep it SMALL (~0.02-0.05).
+   - `body_friction_range` — whole-body (not just foot) contact friction; add for
+     skills that brace/fall/contact with the torso or arms.
+   **MODERATE discipline (BeyondMimic 2508.08241):** randomize only genuinely-
+   uncertain params — over-wide ranges dilute the control objective and yield an
+   overly-conservative policy (a known failure mode). Prefer the baseline unless
+   the goal specifically demands more robustness.
 8. **`entropy_coef_scale`.** 1.5-2.5 for explosive single-burst skills
    (exploration must survive early fall penalties); 1.0 (omit) for
    gaits; never above 3 without cause — high entropy destabilizes PPO.

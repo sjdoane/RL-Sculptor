@@ -55,6 +55,13 @@ _SHARED_SCALARS: dict[str, tuple[float, float]] = {
 _TRAIN_SCALARS: dict[str, tuple[float, float]] = {
     "min_base_height_termination_m": (0.02, 1.0),
     "entropy_coef_scale": (0.25, 4.0),
+    # §sim2real DR (RMA arXiv 2107.04034; Dynamics Randomization 1710.06537):
+    # per-link center-of-mass offset magnitude (m), sampled as (−off, +off) on
+    # each of x/y/z per body at env startup. The real robot's link CoMs are never
+    # exactly the CAD values, so the policy learns robustness to the shift. NOTE
+    # this perturbs EVERY link independently (not just the trunk), so keep it
+    # SMALL (~0.02–0.05) — a large per-link CoM shift is heavy DR. 0.0 == off.
+    "com_offset_m": (0.0, 0.3),
     # Uniform per-joint noise magnitude (radians) added on top of
     # `reset_joint_pos_target` when present (§REFERENCE_TRAJECTORY_PLAN
     # §8 part 2 — get-up posture resets need SOME variation per episode,
@@ -79,6 +86,27 @@ _TRAIN_RANGES: dict[str, tuple[float, float]] = {
     "reset_joint_velocity_radps": (-10.0, 10.0),
     # Startup domain randomization of foot-geom friction.
     "friction_range": (0.05, 2.5),
+    # §sim2real physics DR — the core dynamics-randomization axes the
+    # literature says to randomize FIRST for zero-shot transfer (Dynamics
+    # Randomization, arXiv 1710.06537: mass, damping, friction, motor gains;
+    # RMA, 2107.04034: payload/mass, motor strength, friction; Rapid Locomotion,
+    # 2205.02824 + Walk-These-Ways, 2212.03238: Kp/Kd + motor strength). Each is
+    # a multiplicative [lo, hi] SCALE about the nominal model value, sampled
+    # per-env at startup (so the 4096-env batch spans the distribution and the
+    # per-iteration seed re-rolls it each round). Keep ranges MODERATE
+    # (BeyondMimic 2508.08241: randomize only genuinely-uncertain params — too
+    # wide dilutes the control objective and yields an overly-conservative
+    # policy, FailureMode too_wide_dr_ranges). Absent == off.
+    "body_mass_scale_range": (0.5, 2.0),          # link masses ×
+    "pd_kp_scale_range": (0.5, 2.0),              # position-gain (stiffness) ×
+    "pd_kd_scale_range": (0.5, 2.0),              # velocity-gain (damping) ×
+    "motor_strength_scale_range": (0.5, 2.0),     # actuator effort limit ×
+    "joint_damping_scale_range": (0.0, 5.0),      # joint (dof) damping ×
+    "joint_armature_scale_range": (0.0, 5.0),     # rotor armature/inertia ×
+    # Whole-body (not just foot) contact friction, ABSOLUTE tangential
+    # coefficient — feet already covered by friction_range; this adds torso/
+    # knee/arm contact friction so falls and braces transfer too.
+    "body_friction_range": (0.05, 2.5),
     # Root-orientation reset offsets (radians), mjlab
     # `reset_root_state_uniform`'s `pose_range["roll"|"pitch"]` semantics
     # — a get-up clip's lying start is exactly a large pitch (face-up/
@@ -106,6 +134,16 @@ _JOINT_TARGET_ELEMENT_BOUNDS = (-6.4, 6.4)   # generous; true joint limits
                                               # clamp at apply time.
 _JOINT_TARGET_MAX_LEN = 64
 _TRAIN_JOINT_TARGET_KEYS = {"reset_joint_pos_target"}
+#: §DeepMimic phase RSI (arXiv 1804.02717): downsampled reference trajectories —
+#: `[K][J]` matrices (K frames spanning the motion). `reset_joints_to_reference`
+#: samples a random frame per env each reset, so the batch covers the whole
+#: motion manifold, and initializes joint VELOCITY from the same frame (a dynamic
+#: skill's mid-motion pose is meaningless at rest). Derived data, so NOT in
+#: ITERABLE_TRAIN_KEYS (the diagnoser tunes scalar knobs, not the reference clip).
+_TRAJ_MAX_FRAMES = 64
+_JOINT_VEL_ELEMENT_BOUNDS = (-40.0, 40.0)   # generous rad/s rail; mjlab clamps
+_TRAIN_TRAJECTORY_KEYS = {
+    "reset_joint_pos_trajectory", "reset_joint_vel_trajectory"}
 #: Boolean train-only switches. `fell_over_termination` (default True =
 #: today's behavior, i.e. the task's standard orientation/bad-pose
 #: termination stays active) — a GET-UP stage's lying reset (root
@@ -128,7 +166,7 @@ _PUSH_ANGULAR_MAX = 3.0
 _SHARED_KEYS = set(_SHARED_SCALARS) | {"zero_velocity_commands", "push_events"}
 _TRAIN_KEYS = (
     set(_TRAIN_SCALARS) | set(_TRAIN_RANGES) | _TRAIN_JOINT_TARGET_KEYS
-    | _TRAIN_BOOLS | {"push_events"}
+    | _TRAIN_TRAJECTORY_KEYS | _TRAIN_BOOLS | {"push_events"}
 )
 _TOP_KEYS = {"env_spec_version", "meta", "shared", "train"}
 
@@ -189,6 +227,43 @@ def _check_joint_target(name: str, v: Any, errors: list[str]) -> None:
         if not (lo <= float(x) <= hi):
             errors.append(
                 f"{name}: element {x} outside hard bounds [{lo}, {hi}]")
+
+
+def _check_joint_trajectory(name: str, v: Any,
+                            elem_bounds: tuple[float, float],
+                            errors: list[str]) -> None:
+    """`reset_joint_pos_trajectory` / `reset_joint_vel_trajectory`: a `[K][J]`
+    matrix — K downsampled reference frames, each a per-joint vector — for
+    DeepMimic phase RSI (§reset_joints_to_reference samples a random frame per
+    env). J is validated against the robot at apply time (same as the single
+    target); here only frame-count, rectangularity, and per-element bounds are
+    checked."""
+    if (not isinstance(v, (list, tuple)) or not (1 <= len(v) <= _TRAJ_MAX_FRAMES)):
+        errors.append(
+            f"{name}: must be a list of 1..{_TRAJ_MAX_FRAMES} frames, got {v!r}")
+        return
+    lo, hi = elem_bounds
+    width: int | None = None
+    for i, frame in enumerate(v):
+        if (not isinstance(frame, (list, tuple)) or len(frame) == 0
+                or len(frame) > _JOINT_TARGET_MAX_LEN
+                or not all(_is_num(x) for x in frame)):
+            errors.append(
+                f"{name}[{i}]: must be a non-empty <= {_JOINT_TARGET_MAX_LEN}"
+                f"-vector of finite numbers, got {frame!r}")
+            return
+        if width is None:
+            width = len(frame)
+        elif len(frame) != width:
+            errors.append(
+                f"{name}: ragged — frame {i} has {len(frame)} joints, "
+                f"expected {width}")
+            return
+        for x in frame:
+            if not (lo <= float(x) <= hi):
+                errors.append(
+                    f"{name}[{i}]: element {x} outside bounds [{lo}, {hi}]")
+                return
 
 
 def _check_push(name: str, v: Any, errors: list[str]) -> None:
@@ -263,6 +338,37 @@ def validate_env_spec(spec: Any) -> list[str]:
     for k in _TRAIN_JOINT_TARGET_KEYS:
         if k in train:
             _check_joint_target(f"train.{k}", train[k], errors)
+    for k in _TRAIN_TRAJECTORY_KEYS:
+        if k in train:
+            bounds = (_JOINT_VEL_ELEMENT_BOUNDS if "vel" in k
+                      else _JOINT_TARGET_ELEMENT_BOUNDS)
+            _check_joint_trajectory(f"train.{k}", train[k], bounds, errors)
+    # §RSI trajectory pairing: the reset event samples ONE frame index from the
+    # position trajectory and indexes the VELOCITY trajectory with it, so the two
+    # must share frame count K and joint width J — and a velocity trajectory with
+    # no position trajectory is meaningless (would be silently ignored). Reject
+    # both here so a reset-time crash / silent no-op becomes a clear schema error.
+    pos_t = train.get("reset_joint_pos_trajectory")
+    vel_t = train.get("reset_joint_vel_trajectory")
+    if vel_t is not None:
+        if pos_t is None:
+            errors.append(
+                "train.reset_joint_vel_trajectory: requires "
+                "reset_joint_pos_trajectory (velocity RSI needs the paired "
+                "position frames)")
+        elif (isinstance(pos_t, (list, tuple))
+              and isinstance(vel_t, (list, tuple))):
+            if len(pos_t) != len(vel_t):
+                errors.append(
+                    f"train: reset_joint_vel_trajectory has {len(vel_t)} "
+                    f"frames but reset_joint_pos_trajectory has {len(pos_t)}")
+            elif (pos_t and vel_t and isinstance(pos_t[0], (list, tuple))
+                  and isinstance(vel_t[0], (list, tuple))
+                  and len(pos_t[0]) != len(vel_t[0])):
+                errors.append(
+                    f"train: reset_joint_vel_trajectory joint width "
+                    f"{len(vel_t[0])} != reset_joint_pos_trajectory width "
+                    f"{len(pos_t[0])}")
     for k in _TRAIN_BOOLS:
         if k in train and not isinstance(train[k], bool):
             errors.append(f"train.{k}: must be a boolean, got {train[k]!r}")

@@ -40,6 +40,15 @@ def _fake_cfg_full() -> SimpleNamespace:
     cfg.events["foot_friction"] = SimpleNamespace(params={
         "ranges": (0.3, 1.2),
     })
+    # A PD-actuated 'robot' scene entity, so _primary_robot_entity resolves and
+    # the actuator-type guard admits the pd_gains / motor_strength DR axes (a
+    # non-PD robot like cartpole is exercised in the GPU smoke test).
+    class BuiltinPositionActuatorCfg:  # name matches the PD-actuator whitelist
+        pass
+
+    cfg.scene = SimpleNamespace(entities={
+        "robot": SimpleNamespace(articulation=SimpleNamespace(
+            actuators=(BuiltinPositionActuatorCfg(),)))})
     return cfg
 
 
@@ -782,3 +791,183 @@ def test_load_adapter_injects_project_eval_reset(tmp_path) -> None:
     (tmp_path / "env" / "eval_reset.json").unlink()
     adapter2 = load_adapter(tmp_path / "config.toml")
     assert adapter2.eval_reset_path == ""
+
+
+# ── §sim2real physics domain randomization ─────────────────────────────────
+def test_physics_dr_knobs_validate() -> None:
+    """The new physics-DR axes (mass/gains/motor/damping/armature/CoM/friction)
+    validate inside their envelopes and reject outside."""
+    spec = {"env_spec_version": 1, "train": {
+        "body_mass_scale_range": [0.8, 1.2],
+        "com_offset_m": 0.05,
+        "pd_kp_scale_range": [0.9, 1.1],
+        "pd_kd_scale_range": [0.9, 1.1],
+        "motor_strength_scale_range": [0.9, 1.1],
+        "joint_damping_scale_range": [0.5, 1.5],
+        "joint_armature_scale_range": [0.5, 1.5],
+        "body_friction_range": [0.4, 1.2],
+    }}
+    assert es.validate_env_spec(spec) == []
+    # all are diagnoser-tunable across iterations
+    for k in ("body_mass_scale_range", "pd_kp_scale_range",
+              "motor_strength_scale_range", "joint_damping_scale_range"):
+        assert k in es.ITERABLE_TRAIN_KEYS
+    # out-of-envelope rejected
+    bad = es.validate_env_spec({"env_spec_version": 1,
+                                "train": {"body_mass_scale_range": [0.5, 9.0]}})
+    assert any("body_mass_scale_range" in e for e in bad)
+
+
+def test_physics_dr_events_wire_train_only() -> None:
+    """Physics-DR knobs become startup dr.* events on the robot for TRAIN, and
+    NONE of them touch the rollout cfg (evaluation stays un-randomized)."""
+    spec = {"env_spec_version": 1, "train": {
+        "body_mass_scale_range": [0.8, 1.2],
+        "pd_kp_scale_range": [0.9, 1.1],
+        "motor_strength_scale_range": [0.9, 1.1],
+        "body_friction_range": [0.4, 1.2],
+    }}
+    assert es.validate_env_spec(spec) == []
+    cfg = _fake_cfg_full()
+    _mjlab_runner._apply_env_spec(cfg, spec, train=True)
+    installed = {k for k in cfg.events if k.startswith("env_dr__")}
+    assert {"env_dr__body_mass", "env_dr__pd_gains", "env_dr__motor_strength",
+            "env_dr__body_friction"} <= installed
+    assert cfg.events["env_dr__body_mass"].mode == "startup"
+    # rollout: no physics DR events (train-only)
+    cfg2 = _fake_cfg_full()
+    _mjlab_runner._apply_env_spec(cfg2, spec, train=False)
+    assert not any(k.startswith("env_dr__") for k in cfg2.events)
+
+
+def test_always_on_physics_dr_defaults_on_train() -> None:
+    """Even with NO spec, a TRAIN call gets the crash-safe baseline physics DR
+    (mass/damping/armature) — the 'in any case' guarantee — while a rollout with
+    no spec stays completely untouched."""
+    for empty in (None, {}):
+        cfg = _fake_cfg_full()
+        _mjlab_runner._apply_env_spec(cfg, empty, train=True)
+        installed = {k for k in cfg.events if k.startswith("env_dr__")}
+        assert installed == {"env_dr__body_mass", "env_dr__joint_damping",
+                             "env_dr__joint_armature"}
+    # rollout with no spec: still a no-op (metric sees the true task)
+    cfg_eval = _fake_cfg_full()
+    _mjlab_runner._apply_env_spec(cfg_eval, None, train=False)
+    assert not any(k.startswith("env_dr__") for k in cfg_eval.events)
+
+
+def test_explicit_physics_dr_overrides_default() -> None:
+    """An explicit range wins over the baseline default for the same axis."""
+    cfg = _fake_cfg_full()
+    _mjlab_runner._apply_env_spec(
+        cfg, {"env_spec_version": 1,
+              "train": {"body_mass_scale_range": [0.5, 1.5]}}, train=True)
+    assert cfg.events["env_dr__body_mass"].params["ranges"] == (0.5, 1.5)
+
+
+# ── §DeepMimic phase RSI (full-trajectory random-phase reset + joint_vel) ────
+def test_rsi_trajectory_validates_and_is_not_iterable() -> None:
+    spec = {"env_spec_version": 1, "train": {
+        "reset_joint_pos_trajectory": [[0.1, 0.2], [0.15, 0.25], [0.2, 0.3]],
+        "reset_joint_vel_trajectory": [[0.0, 0.0], [1.0, -1.0], [2.0, -2.0]],
+    }}
+    assert es.validate_env_spec(spec) == []
+    # ragged (uneven joint width across frames) is rejected
+    ragged = es.validate_env_spec({"env_spec_version": 1, "train": {
+        "reset_joint_pos_trajectory": [[0.1, 0.2], [0.1, 0.2, 0.3]]}})
+    assert any("ragged" in e for e in ragged)
+    # velocity out of the generous rail is rejected
+    fast = es.validate_env_spec({"env_spec_version": 1, "train": {
+        "reset_joint_vel_trajectory": [[999.0, 0.0]]}})
+    assert any("reset_joint_vel_trajectory" in e for e in fast)
+    # derived clip data — not a diagnoser-tunable scalar knob
+    assert "reset_joint_pos_trajectory" not in es.ITERABLE_TRAIN_KEYS
+
+
+def test_rsi_trajectory_wires_phase_reset_event() -> None:
+    spec = {"env_spec_version": 1, "train": {
+        "reset_joint_pos_trajectory": [[0.1, 0.2, 0.3], [0.2, 0.3, 0.4]],
+        "reset_joint_vel_trajectory": [[0.0, 0.0, 0.0], [1.0, -1.0, 0.5]],
+    }}
+    assert es.validate_env_spec(spec) == []
+    cfg = _fake_cfg_full()
+    _mjlab_runner._apply_env_spec(cfg, spec, train=True, task_id="")
+    ev = cfg.events["reset_robot_joints_to_reference"]
+    assert ev.mode == "reset"
+    assert "joint_pos_traj" in ev.params and "joint_vel_traj" in ev.params
+    # rollout: reference reset is train-only
+    cfg2 = _fake_cfg_full()
+    _mjlab_runner._apply_env_spec(cfg2, spec, train=False)
+    assert "reset_robot_joints_to_reference" not in cfg2.events
+
+
+def test_phase_rsi_reset_samples_pos_and_vel_from_same_frame() -> None:
+    """Each env resets to a RANDOM reference frame, and its joint velocity comes
+    from that SAME frame (not the default zeros the single-target path uses)."""
+    import torch
+    from types import SimpleNamespace
+
+    pos = torch.tensor([[0.0, 0.0, 0.0], [0.5, -0.5, 0.5], [1.0, -1.0, 1.0]])
+    vel = torch.tensor([[0.0, 0.0, 0.0], [2.0, -2.0, 1.0], [4.0, -4.0, 2.0]])
+
+    class _Asset:
+        data = SimpleNamespace(
+            default_joint_vel=torch.zeros(8, 3),
+            soft_joint_pos_limits=torch.tensor([[[-3.0, 3.0]] * 3] * 8))
+
+        def write_joint_state_to_sim(self, jp, jv, env_ids, joint_ids):
+            self.pos, self.vel = jp.clone(), jv.clone()
+
+    asset = _Asset()
+    env = SimpleNamespace(num_envs=8, device="cpu", scene={"robot": asset})
+    torch.manual_seed(3)
+    _mjlab_runner.reset_joints_to_reference(
+        env, None, joint_pos_traj=pos, joint_vel_traj=vel,
+        asset_cfg=SimpleNamespace(name="robot", joint_ids=slice(None)))
+    for r in range(8):
+        match = [k for k in range(3) if torch.allclose(asset.pos[r], pos[k], atol=1e-4)]
+        assert match, asset.pos[r].tolist()
+        assert torch.allclose(asset.vel[r], vel[match[0]], atol=1e-4)
+
+
+def test_pd_gains_dr_skipped_on_non_pd_robot() -> None:
+    """pd_gains / motor_strength DR must be SKIPPED (not installed → no GPU
+    startup crash) when the robot's actuators are not PD/position — e.g. a
+    motor-actuated cartpole."""
+    cfg = _fake_cfg_full()
+
+    class XmlActuatorCfg:            # motor actuator (command_field != position)
+        command_field = None
+
+    cfg.scene = SimpleNamespace(entities={
+        "cartpole": SimpleNamespace(articulation=SimpleNamespace(
+            actuators=(XmlActuatorCfg(),)))})
+    spec = {"env_spec_version": 1, "train": {
+        "pd_kp_scale_range": [0.9, 1.1], "motor_strength_scale_range": [0.9, 1.1],
+        "body_mass_scale_range": [0.9, 1.1]}}
+    _mjlab_runner._apply_env_spec(cfg, spec, train=True)
+    assert "env_dr__pd_gains" not in cfg.events
+    assert "env_dr__motor_strength" not in cfg.events
+    # mass DR (actuator-independent) still applies on the non-PD robot
+    assert "env_dr__body_mass" in cfg.events
+
+
+def test_rsi_trajectory_pairing_validation() -> None:
+    # velocity trajectory without a position trajectory is rejected
+    e1 = es.validate_env_spec({"env_spec_version": 1, "train": {
+        "reset_joint_vel_trajectory": [[0.0, 0.0], [1.0, 1.0]]}})
+    assert any("requires reset_joint_pos_trajectory" in e for e in e1)
+    # mismatched frame count K rejected
+    e2 = es.validate_env_spec({"env_spec_version": 1, "train": {
+        "reset_joint_pos_trajectory": [[0.1, 0.2], [0.3, 0.4]],
+        "reset_joint_vel_trajectory": [[0.0, 0.0]]}})
+    assert any("frames" in e and "reset_joint_vel_trajectory" in e for e in e2)
+    # mismatched joint width J rejected
+    e3 = es.validate_env_spec({"env_spec_version": 1, "train": {
+        "reset_joint_pos_trajectory": [[0.1, 0.2, 0.3]],
+        "reset_joint_vel_trajectory": [[0.0, 0.0]]}})
+    assert any("width" in e for e in e3)
+    # matched pair validates
+    assert es.validate_env_spec({"env_spec_version": 1, "train": {
+        "reset_joint_pos_trajectory": [[0.1, 0.2], [0.3, 0.4]],
+        "reset_joint_vel_trajectory": [[0.0, 0.0], [1.0, -1.0]]}}) == []

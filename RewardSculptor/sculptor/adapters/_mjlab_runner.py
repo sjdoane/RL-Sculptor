@@ -569,9 +569,11 @@ def _resolve_env_spec(args: argparse.Namespace) -> "dict | None":
 def reset_joints_to_reference(
     env: Any,
     env_ids: Any,
-    joint_pos_target,  # noqa: ANN001 — torch.Tensor, mjlab-only at call time
+    joint_pos_target=None,  # noqa: ANN001 — torch.Tensor, mjlab-only at call time
     joint_pos_noise: float = 0.0,
     asset_cfg: Any = None,
+    joint_pos_traj=None,  # noqa: ANN001 — [K, J] torch.Tensor for phase RSI
+    joint_vel_traj=None,  # noqa: ANN001 — [K, J] torch.Tensor for phase RSI
 ) -> None:
     """Reset every selected joint to an EXPLICIT per-joint target (+ small
     symmetric noise), rather than mjlab's shipped
@@ -596,12 +598,20 @@ def reset_joints_to_reference(
     explicit target vector instead of the standing default + a random
     offset).
 
-    `joint_pos_target` must already be a tensor on `env.device` with one
-    element per joint selected by `asset_cfg` (the caller — this
-    module's `_apply_env_spec` — resolves/validates that length against
-    the robot's actual joint count before injecting this event; a
-    mismatch is a clear `ValueError` there, never a silent
-    misassignment here).
+    §DeepMimic phase RSI (arXiv 1804.02717): when `joint_pos_traj` ([K, J], K
+    downsampled reference frames) is given INSTEAD of a single `joint_pos_target`,
+    each env samples a random frame k∈[0,K) at reset and initializes from THAT
+    frame — so the batch covers the whole motion manifold, not one posture (the
+    canonical RSI that "enables parallel learning of the motion phases"). When
+    `joint_vel_traj` is also given, the joint VELOCITIES are initialized from the
+    same frame too (a dynamic skill's mid-motion pose is meaningless at rest); the
+    prior single-target path leaves velocity at the default (zeros).
+
+    `joint_pos_target` / `joint_pos_traj` must already be tensors on `env.device`
+    with one element per joint (J) selected by `asset_cfg` — the caller
+    (`_apply_env_spec`) resolves/validates J against the robot's actual joint
+    count before injecting this event; a mismatch is a clear `ValueError` there,
+    never a silent misassignment here.
     """
     import torch
 
@@ -612,21 +622,31 @@ def reset_joints_to_reference(
         asset_cfg = SceneEntityCfg("robot")
     if env_ids is None:
         env_ids = torch.arange(env.num_envs, device=env.device, dtype=torch.int)
+    n = len(env_ids)
 
     asset = env.scene[asset_cfg.name]
     default_joint_vel = asset.data.default_joint_vel
     soft_joint_pos_limits = asset.data.soft_joint_pos_limits
 
-    target = joint_pos_target.to(device=env.device, dtype=torch.float32)
-    joint_pos = target.unsqueeze(0).expand(len(env_ids), -1).clone()
+    joint_vel = default_joint_vel[env_ids][:, asset_cfg.joint_ids].clone()
+    if joint_pos_traj is not None:
+        # Phase RSI: per-env random reference frame.
+        pos_traj = joint_pos_traj.to(device=env.device, dtype=torch.float32)
+        k = int(pos_traj.shape[0])
+        frame = torch.randint(0, max(1, k), (n,), device=env.device)
+        joint_pos = pos_traj[frame].clone()                      # [n, J]
+        if joint_vel_traj is not None:
+            vel_traj = joint_vel_traj.to(device=env.device, dtype=torch.float32)
+            joint_vel = vel_traj[frame].clone()                  # [n, J]
+    else:
+        target = joint_pos_target.to(device=env.device, dtype=torch.float32)
+        joint_pos = target.unsqueeze(0).expand(n, -1).clone()
     if joint_pos_noise:
         joint_pos = joint_pos + sample_uniform(
             -float(joint_pos_noise), float(joint_pos_noise),
             joint_pos.shape, env.device)
     joint_pos_limits = soft_joint_pos_limits[env_ids][:, asset_cfg.joint_ids]
     joint_pos = joint_pos.clamp_(joint_pos_limits[..., 0], joint_pos_limits[..., 1])
-
-    joint_vel = default_joint_vel[env_ids][:, asset_cfg.joint_ids].clone()
 
     joint_ids = asset_cfg.joint_ids
     if isinstance(joint_ids, list):
@@ -682,6 +702,64 @@ def _load_authored_robot_capability(selection_path: str) -> Any | None:
     )
 
 
+def _primary_robot_entity(env_cfg: Any) -> str:
+    """The scene's articulated-robot entity NAME — NOT hard-coded 'robot'. The
+    locomotion tasks name it 'robot', but cartpole names it 'cartpole', object
+    tasks add object entities, etc. A DR / reset event that targets a name the
+    scene doesn't have raises KeyError at env startup and crashes training (the
+    cartpole smoke-train regression). Prefer 'robot'; else the first non-terrain
+    entity; fall back to 'robot' when the scene cfg isn't introspectable."""
+    try:
+        ents = getattr(getattr(env_cfg, "scene", None), "entities", None)
+        names = list(ents.keys()) if hasattr(ents, "keys") else []
+        if "robot" in names:
+            return "robot"
+        for n in names:
+            if str(n).lower() not in ("terrain", "ground", "plane", "light"):
+                return str(n)
+    except Exception:  # noqa: BLE001
+        pass
+    return "robot"
+
+
+def _is_pd_actuated(env_cfg: Any, rname: str) -> bool:
+    """True iff EVERY actuator on the robot is a PD/position type mjlab's
+    `dr.pd_gains` / `dr.effort_limits` support (BuiltinPosition, IdealPd, or an
+    XmlActuator in `position` command mode). A motor/velocity/muscle actuator —
+    e.g. the cartpole `<motor>` — makes those DR funcs raise TypeError at env
+    STARTUP (invisible to cfg-building tests), aborting training. When we cannot
+    confirm PD actuation we skip the gain/effort DR axes rather than risk that
+    crash (the always-on mass/damping/armature axes are safe regardless)."""
+    try:
+        acts = env_cfg.scene.entities[rname].articulation.actuators
+    except Exception:  # noqa: BLE001
+        return False
+    if not acts:
+        return False
+    for a in acts:
+        tname = type(a).__name__
+        if tname in ("BuiltinPositionActuatorCfg", "IdealPdActuatorCfg"):
+            continue
+        if tname == "XmlActuatorCfg" and getattr(a, "command_field", None) == "position":
+            continue
+        return False   # any non-PD actuator → skip the gain/effort DR axes
+    return True
+
+
+#: §always-on baseline physics domain randomization (arXiv 1710.06537 mass +
+#: joint damping; RMA 2107.04034). ONLY crash-safe pure model-field SCALE axes —
+#: every body has a mass and every dof a (possibly-zero) damping/armature, so
+#: scaling them can never fault at env startup on any robot. Kept MODERATE
+#: (BeyondMimic 2508.08241: over-wide DR dilutes the objective). Merged for any
+#: TRAIN spec that omits them; richer axes (pd_gains, motor strength, CoM,
+#: whole-body friction) are opt-in via the env spec / generator.
+_DEFAULT_PHYSICS_DR: dict[str, tuple[float, float]] = {
+    "body_mass_scale_range": (0.85, 1.15),
+    "joint_damping_scale_range": (0.8, 1.2),
+    "joint_armature_scale_range": (0.8, 1.2),
+}
+
+
 def _apply_env_spec(env_cfg: Any, spec: "dict | None", *,
                     train: bool = True, task_id: str = "") -> None:
     """§RL_SCULPTOR_AUDIT (env generalization, 2026-07-04): apply a
@@ -710,11 +788,28 @@ def _apply_env_spec(env_cfg: Any, spec: "dict | None", *,
     already trusts. Omitted only when the spec carries no joint-target
     key (no behavior change for every existing caller)."""
     if not spec:
-        return
+        # Rollout with no spec stays untouched (evaluation must be
+        # un-randomized so the metric sees the TRUE task). A TRAIN call with no
+        # spec still gets the always-on physics DR below — the "in any case"
+        # guarantee that every training run/stage is domain-randomized.
+        if not train:
+            return
+        spec = {}
     import math
 
     shared = spec.get("shared") or {}
-    train_sec = (spec.get("train") or {}) if train else {}
+    train_sec = dict(spec.get("train") or {}) if train else {}
+    # §always-on physics DR (Dynamics Randomization arXiv 1710.06537; RMA
+    # 2107.04034): fill CRASH-SAFE, MODERATE defaults for any physics axis the
+    # spec/LLM omitted, so EVERY train run/stage is dynamics-randomized even with
+    # no authored/generated env spec. Only pure model-field SCALE axes go here
+    # (mass/damping/armature can never crash on any robot); actuator-shape-
+    # dependent axes (pd_gains/effort/CoM/body-friction) stay OPT-IN via the spec
+    # so a non-PD or unusual robot can't fault at env startup. Train-only:
+    # train_sec is empty on rollout, keeping evaluation un-randomized.
+    if train:
+        for _k, _v in _DEFAULT_PHYSICS_DR.items():
+            train_sec.setdefault(_k, _v)
     applied: list[str] = []
 
     def _skip(what: str, e: Exception) -> None:
@@ -903,20 +998,28 @@ def _apply_env_spec(env_cfg: Any, spec: "dict | None", *,
     # a silent misassignment): the caller already validated the spec
     # schema-wise, but "does this vector match THIS robot" is a
     # robot-specific check the schema layer cannot make.
+    # §DeepMimic phase RSI (arXiv 1804.02717): a full downsampled reference
+    # TRAJECTORY (reset_joint_pos_trajectory [K][J], + optional _vel_) takes
+    # precedence over the single median posture — the reset event then samples a
+    # random frame per env and initializes joint pos AND vel from it, so the
+    # batch covers the whole motion manifold instead of one pose.
     jpt = train_sec.get("reset_joint_pos_target")
+    jpt_traj = train_sec.get("reset_joint_pos_trajectory")
+    jvt_traj = train_sec.get("reset_joint_vel_trajectory")
     jpt_noise = train_sec.get("reset_joint_pos_noise_rad")
-    if jpt is not None:
+    if jpt is not None or jpt_traj is not None:
         try:
             from sculptor.eval.robot_manifest import robot_joint_names
 
+            # Joint width comes from the trajectory's frames when present, else
+            # the single target.
+            width = len(jpt_traj[0]) if jpt_traj is not None else len(jpt)
             canonical = robot_joint_names(task_id)
-            if canonical is not None and len(jpt) != len(canonical):
+            if canonical is not None and width != len(canonical):
                 raise ValueError(
-                    f"reset_joint_pos_target has {len(jpt)} elements but "
-                    f"robot {task_id!r} has {len(canonical)} joints "
-                    f"({canonical[:3]}...) — refusing to apply a "
-                    f"mismatched per-joint reset (would silently "
-                    f"misassign joints)")
+                    f"reference reset has {width} joints but robot "
+                    f"{task_id!r} has {len(canonical)} ({canonical[:3]}...) — "
+                    f"refusing to apply a mismatched per-joint reset")
             reset = getattr(env_cfg, "events", None)
             if isinstance(reset, dict):
                 import torch
@@ -924,21 +1027,41 @@ def _apply_env_spec(env_cfg: Any, spec: "dict | None", *,
                 from mjlab.managers.event_manager import EventTermCfg
                 from mjlab.managers.scene_entity_config import SceneEntityCfg
 
-                target_t = torch.tensor(
-                    [float(x) for x in jpt], dtype=torch.float32)
+                params: dict[str, Any] = {
+                    "joint_pos_noise": float(jpt_noise or 0.0),
+                    "asset_cfg": SceneEntityCfg(
+                        _primary_robot_entity(env_cfg), joint_names=(".*",)),
+                }
+                if jpt_traj is not None:
+                    params["joint_pos_traj"] = torch.tensor(
+                        [[float(x) for x in frame] for frame in jpt_traj],
+                        dtype=torch.float32)
+                    # Only carry the velocity trajectory when its shape matches
+                    # (same K frames, same J) — the reset event indexes it with a
+                    # frame sampled from the position traj, so a mismatch would
+                    # crash at reset. A validated spec can't reach here mismatched;
+                    # this is the defensive backstop for an unvalidated caller.
+                    vel_ok = (jvt_traj is not None
+                              and len(jvt_traj) == len(jpt_traj)
+                              and len(jvt_traj[0]) == width)
+                    if vel_ok:
+                        params["joint_vel_traj"] = torch.tensor(
+                            [[float(x) for x in frame] for frame in jvt_traj],
+                            dtype=torch.float32)
+                    elif jvt_traj is not None:
+                        _skip("phase-RSI velocity trajectory", RuntimeError(
+                            "shape mismatch with position trajectory — "
+                            "using default joint velocities"))
+                    label = (f"phase-RSI {len(jpt_traj)} frames×{width} joints"
+                             + (", +vel" if vel_ok else ""))
+                else:
+                    params["joint_pos_target"] = torch.tensor(
+                        [float(x) for x in jpt], dtype=torch.float32)
+                    label = f"{width} joints"
                 reset["reset_robot_joints_to_reference"] = EventTermCfg(
-                    func=reset_joints_to_reference,
-                    mode="reset",
-                    params={
-                        "joint_pos_target": target_t,
-                        "joint_pos_noise": float(jpt_noise or 0.0),
-                        "asset_cfg": SceneEntityCfg(
-                            "robot", joint_names=(".*",)),
-                    },
-                )
+                    func=reset_joints_to_reference, mode="reset", params=params)
                 applied.append(
-                    f"events:+reset_robot_joints_to_reference"
-                    f"({len(jpt)} joints)")
+                    f"events:+reset_robot_joints_to_reference({label})")
         except Exception as e:  # noqa: BLE001
             _skip("reference joint-posture reset", e)
 
@@ -952,6 +1075,105 @@ def _apply_env_spec(env_cfg: Any, spec: "dict | None", *,
                 applied.append(f"events:foot_friction→({fr[0]:g},{fr[1]:g})")
         except Exception as e:  # noqa: BLE001
             _skip("friction randomization", e)
+
+    # ── §sim2real physics domain randomization ──────────────────────────────
+    # Mass, base CoM, PD gains, motor strength, joint damping/armature, and
+    # whole-body friction as startup DR events on the robot (Dynamics
+    # Randomization arXiv 1710.06537; RMA 2107.04034; Rapid Locomotion 2205.02824
+    # + Walk-These-Ways 2212.03238). This runs on EVERY train/rollout — the
+    # world-INDEPENDENT chokepoint both the mission-stage and single-run paths
+    # funnel through — so physics DR is applied in every case, not only for
+    # authored worlds. `startup` mode (each env samples once → the parallel batch
+    # spans the distribution; the per-iteration seed re-rolls it) avoids the
+    # expensive per-reset recompute mjlab warns about for mass/armature.
+    physics_specs: list[tuple[str, Any, str]] = []
+    try:
+        from mjlab.envs.mdp import dr as _dr
+        from mjlab.managers.event_manager import EventTermCfg as _ETC
+        from mjlab.managers.scene_entity_config import SceneEntityCfg as _SEC
+
+        _rname = _primary_robot_entity(env_cfg)
+        bodies = _SEC(_rname, body_names=(".*",))
+        joints = _SEC(_rname, joint_names=(".*",))
+        acts = _SEC(_rname, actuator_names=(".*",))
+        geoms = _SEC(_rname, geom_names=(".*",))
+
+        def _rng(key: str) -> "tuple[float, float] | None":
+            v = train_sec.get(key)
+            return (float(v[0]), float(v[1])) if v is not None else None
+
+        m = _rng("body_mass_scale_range")
+        if m is not None:
+            physics_specs.append(("env_dr__body_mass", _ETC(
+                mode="startup", func=_dr.body_mass,
+                params={"asset_cfg": bodies, "operation": "scale", "ranges": m}),
+                f"body_mass×{m}"))
+        com = train_sec.get("com_offset_m")
+        if com is not None and float(com) > 0.0:
+            c = float(com)
+            physics_specs.append(("env_dr__com", _ETC(
+                mode="startup", func=_dr.body_com_offset,
+                params={"asset_cfg": bodies, "operation": "add",
+                        "ranges": {0: (-c, c), 1: (-c, c), 2: (-c, c)}}),
+                f"com±{c:g}m"))
+        # pd_gains / effort_limits ONLY support PD/position actuators — a
+        # motor/velocity actuator (cartpole) makes them raise at env startup, so
+        # gate on the actual actuator type (the install try/except can't catch a
+        # runtime startup fault). Real target robots (g1/go1/go2 IdealPd, yam
+        # BuiltinPosition) are PD; the axes are simply dropped elsewhere.
+        pd_ok = _is_pd_actuated(env_cfg, _rname)
+        kp, kd = _rng("pd_kp_scale_range"), _rng("pd_kd_scale_range")
+        if (kp is not None or kd is not None) and pd_ok:
+            physics_specs.append(("env_dr__pd_gains", _ETC(
+                mode="startup", func=_dr.pd_gains,
+                params={"asset_cfg": acts, "operation": "scale",
+                        "kp_range": kp or (1.0, 1.0), "kd_range": kd or (1.0, 1.0)}),
+                f"pd_gains(kp×{kp},kd×{kd})"))
+        elif (kp is not None or kd is not None) and not pd_ok:
+            _skip("pd_gains DR", RuntimeError(
+                f"robot {_rname!r} is not PD-actuated — skipping gain DR"))
+        eff = _rng("motor_strength_scale_range")
+        if eff is not None and pd_ok:
+            physics_specs.append(("env_dr__motor_strength", _ETC(
+                mode="startup", func=_dr.effort_limits,
+                params={"asset_cfg": acts, "operation": "scale",
+                        "effort_limit_range": eff}),
+                f"motor_strength×{eff}"))
+        elif eff is not None and not pd_ok:
+            _skip("motor_strength DR", RuntimeError(
+                f"robot {_rname!r} is not PD-actuated — skipping effort DR"))
+        dmp = _rng("joint_damping_scale_range")
+        if dmp is not None:
+            physics_specs.append(("env_dr__joint_damping", _ETC(
+                mode="startup", func=_dr.dof_damping,
+                params={"asset_cfg": joints, "operation": "scale", "ranges": dmp}),
+                f"joint_damping×{dmp}"))
+        arm = _rng("joint_armature_scale_range")
+        if arm is not None:
+            physics_specs.append(("env_dr__joint_armature", _ETC(
+                mode="startup", func=_dr.dof_armature,
+                params={"asset_cfg": joints, "operation": "scale", "ranges": arm}),
+                f"joint_armature×{arm}"))
+        bfr = _rng("body_friction_range")
+        if bfr is not None:
+            physics_specs.append(("env_dr__body_friction", _ETC(
+                mode="startup", func=_dr.geom_friction,
+                params={"asset_cfg": geoms, "operation": "abs", "ranges": bfr}),
+                f"body_friction={bfr}"))
+    except Exception as e:  # noqa: BLE001 — mjlab DR API import/build failure
+        _skip("physics DR setup", e)
+
+    if physics_specs:
+        try:
+            events = getattr(env_cfg, "events", None)
+            if isinstance(events, dict):
+                for name, term, label in physics_specs:
+                    events[name] = term
+                    applied.append(f"events:+{name}({label})")
+            else:
+                _skip("physics DR install", RuntimeError("env_cfg has no events"))
+        except Exception as e:  # noqa: BLE001
+            _skip("physics DR install", e)
 
     # §get-up RSI fix (2026-07-09): a lying-start reset (large pitch/roll
     # offset from upright) trips the task's own fell-over/bad-orientation

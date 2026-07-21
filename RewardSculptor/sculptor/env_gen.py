@@ -83,6 +83,24 @@ class _TrainModel(BaseModel):
     # in practice (see sculptor/reference.py), not LLM-generated today.
     reset_joint_pos_target: Optional[list[float]] = None
     reset_joint_pos_noise_rad: Optional[float] = None
+    # §DeepMimic phase RSI (arXiv 1804.02717) — downsampled reference [K][J]
+    # trajectories. Schema field-parity only: DERIVED by sculptor/reference.py
+    # (a clip's actual motion), never invented by the LLM from a goal alone.
+    reset_joint_pos_trajectory: Optional[list[list[float]]] = None
+    reset_joint_vel_trajectory: Optional[list[list[float]]] = None
+    # §sim2real physics domain randomization (arXiv 1710.06537 / 2107.04034 /
+    # 2212.03238) — multiplicative scales about the nominal model value (friction
+    # is an absolute coefficient). A crash-safe subset (mass/damping/armature) is
+    # applied to EVERY train run by default; these let the generator widen or add
+    # axes for goals that need more robustness (keep MODERATE — 2508.08241).
+    body_mass_scale_range: Optional[list[float]] = None
+    com_offset_m: Optional[float] = None
+    pd_kp_scale_range: Optional[list[float]] = None
+    pd_kd_scale_range: Optional[list[float]] = None
+    motor_strength_scale_range: Optional[list[float]] = None
+    joint_damping_scale_range: Optional[list[float]] = None
+    joint_armature_scale_range: Optional[list[float]] = None
+    body_friction_range: Optional[list[float]] = None
     # Disables the task's standard fell-over/bad-orientation termination
     # for TRAIN only (§ get-up RSI fix, 2026-07-09) — a lying-start
     # reset trips that termination on itself, killing get-up training
