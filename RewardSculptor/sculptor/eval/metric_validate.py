@@ -630,6 +630,198 @@ def _upright_g() -> np.ndarray:
     return g
 
 
+_ABSTRACT_PHASES = frozenset({
+    "climb", "dwell", "move_forward", "move_backward", "move_left",
+    "move_right", "jump", "jump_off", "land", "crouch", "tilt",
+    "recover", "oscillate", "reach", "kick",
+})
+
+
+def _abstract_objective_program(
+    behavior_goal: Optional[str], declared: Any = None,
+) -> list[str]:
+    """Compile free text (or a generated declarative companion) to task-space phases.
+
+    The phase vocabulary is intentionally embodiment-neutral: it describes root motion,
+    dwell, posture, and generic articulation rather than joint indices, robot names, or
+    simulator tasks.  A generated metric may declare ``ABSTRACT_OBJECTIVE =
+    {"phases": [...]}`` beside ``compute_spec``; old metrics get the deterministic text
+    inference below.  The declaration only selects from this closed vocabulary and can
+    never provide executable validator code.
+    """
+    phases: list[str] = []
+    if isinstance(declared, Mapping):
+        raw = declared.get("phases")
+        if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)):
+            phases = [str(p).strip().lower() for p in raw]
+            phases = [p for p in phases if p in _ABSTRACT_PHASES][:8]
+    if phases:
+        return phases
+
+    g = (behavior_goal or "").lower()
+    tokens = set(re.findall(r"[a-z]+", g))
+
+    def has(*words: str) -> bool:
+        return any(word in tokens for word in words)
+
+    staged_climb = has(
+        "climb", "climbs", "climbing", "ascend", "ascending", "stairs",
+        "steps", "boxes", "platforms", "parkour",
+    )
+    wants_dwell = has(
+        "pause", "pauses", "pausing", "wait", "waiting", "hold", "holding",
+        "stop", "stopping", "dwell", "dwelling",
+    )
+    if staged_climb:
+        # Two levels express progression without assuming a particular scene count.
+        for _ in range(2):
+            phases.append("climb")
+            if wants_dwell:
+                phases.append("dwell")
+
+    if has("forward", "forwards", "ahead") and not staged_climb:
+        phases.append("move_forward")
+    elif has("backward", "backwards", "reverse"):
+        phases.append("move_backward")
+    elif has("left"):
+        phases.append("move_left")
+    elif has("right"):
+        phases.append("move_right")
+
+    wants_jump = has(
+        "jump", "jumps", "jumping", "hop", "hops", "hopping", "leap",
+        "leaps", "leaping",
+    )
+    if wants_jump:
+        phases.append("jump_off" if staged_climb or has("off") else "jump")
+    if has("land", "lands", "landing") and (not phases or phases[-1] != "jump_off"):
+        phases.append("land")
+    if has("crouch", "crouches", "crouching", "squat", "squats", "squatting"):
+        phases.append("crouch")
+    if has("bend", "bends", "bending", "bow", "bows", "lean", "leans", "tilt"):
+        phases.append("tilt")
+    if has("recover", "recovers", "return", "returns", "upright", "stand", "standing"):
+        phases.append("recover")
+    if has("wave", "waves", "waving", "reach", "reaches", "reaching", "raise"):
+        phases.append("reach")
+    if has("kick", "kicks", "kicking"):
+        phases.append("kick")
+    if has("oscillate", "oscillates", "oscillating", "floss", "flossing", "shake"):
+        phases.append("oscillate")
+    return phases[:8]
+
+
+def _abstract_objective_probe(phases: Sequence[str]) -> Optional[dict[str, np.ndarray]]:
+    """Retarget an abstract phase program onto the validator's universal channels.
+
+    This is a kinematic *validator exemplar*, not a stored robot trajectory.  Root and
+    gravity live in task space; generic articulation is projected onto the synthetic
+    named body and later subjected to the existing joint-permutation gate.  Therefore
+    the same prompt-derived oracle works for quadrupeds, bipeds, and arms whenever the
+    authored metric uses their persisted universal/task channels.
+    """
+    clean = [str(p) for p in phases if str(p) in _ABSTRACT_PHASES][:8]
+    if not clean:
+        return None
+
+    root = np.zeros((T, E, 3), dtype=np.float64)
+    root[..., 2] = 0.55
+    gravity = _upright_g()
+    joints = np.zeros((T, E, J), dtype=np.float64)
+    start = max(5, int(0.10 * T))
+    bounds = np.linspace(start, T, len(clean) + 1, dtype=int)
+    x = y = 0.0
+    z = 0.55
+    tilt = 0.0
+
+    for phase, a, b in zip(clean, bounds[:-1], bounds[1:]):
+        if b <= a:
+            continue
+        n = b - a
+        u = np.linspace(0.0, 1.0, n)
+        root[a:b, :, 0] = x
+        root[a:b, :, 1] = y
+        root[a:b, :, 2] = z
+        gravity[a:b, :, 0] = tilt
+        gravity[a:b, :, 2] = -np.sqrt(max(0.0, 1.0 - tilt * tilt))
+
+        if phase == "climb":
+            root[a:b, :, 0] = (x + 0.35 * u)[:, None]
+            root[a:b, :, 2] = (z + 0.30 * u)[:, None]
+            x += 0.35
+            z += 0.30
+        elif phase == "move_forward":
+            root[a:b, :, 0] = (x + 0.90 * u)[:, None]
+            x += 0.90
+        elif phase == "move_backward":
+            root[a:b, :, 0] = (x - 0.90 * u)[:, None]
+            x -= 0.90
+        elif phase == "move_left":
+            root[a:b, :, 1] = (y + 0.70 * u)[:, None]
+            y += 0.70
+        elif phase == "move_right":
+            root[a:b, :, 1] = (y - 0.70 * u)[:, None]
+            y -= 0.70
+        elif phase == "jump":
+            root[a:b, :, 0] = (x + 0.70 * u)[:, None]
+            root[a:b, :, 2] = (z + 0.45 * np.sin(np.pi * u))[:, None]
+            x += 0.70
+        elif phase == "jump_off":
+            root[a:b, :, 0] = (x + 1.20 * u)[:, None]
+            arc = (1.0 - u) * z + u * 0.55 + 0.25 * np.sin(np.pi * u)
+            root[a:b, :, 2] = arc[:, None]
+            x += 1.20
+            z = 0.55
+        elif phase == "land":
+            root[a:b, :, 2] = ((1.0 - u) * z + u * 0.55)[:, None]
+            z = 0.55
+        elif phase == "crouch":
+            root[a:b, :, 2] = (z - 0.25 * u)[:, None]
+            joints[a:b] = (0.9 * u)[:, None, None]
+            z -= 0.25
+        elif phase == "tilt":
+            gravity[a:b, :, 0] = (0.85 * u)[:, None]
+            gravity[a:b, :, 2] = (-np.sqrt(1.0 - (0.85 * u) ** 2))[:, None]
+            tilt = 0.85
+        elif phase == "recover":
+            gravity[a:b, :, 0] = (tilt * (1.0 - u))[:, None]
+            gravity[a:b, :, 2] = (-np.sqrt(
+                1.0 - (tilt * (1.0 - u)) ** 2))[:, None]
+            root[a:b, :, 2] = (z + (0.55 - z) * u)[:, None]
+            tilt = 0.0
+            z = 0.55
+        elif phase in {"oscillate", "reach", "kick"}:
+            wave = np.sin(6.0 * np.pi * u)
+            cols = (6, 7, 8, 9) if phase == "reach" else (0, 1, 2, 3)
+            amplitude = 1.4 if phase == "reach" else 0.8
+            joints[a:b, :, list(cols)] = (amplitude * wave)[:, None, None]
+
+        if phase in {"climb", "jump", "jump_off"}:
+            burst = np.sin(np.pi * np.clip(u * 3.0, 0.0, 1.0))
+            joints[a:b, :, 0:4] = (0.8 * burst)[:, None, None]
+
+        if b < T:
+            root[b:, :, 0] = x
+            root[b:, :, 1] = y
+            root[b:, :, 2] = z
+            gravity[b:, :, 0] = tilt
+            gravity[b:, :, 2] = -np.sqrt(max(0.0, 1.0 - tilt * tilt))
+            joints[b:] = joints[b - 1]
+
+    feet = np.zeros((T, E, 3), dtype=np.float64)
+    contact = np.ones((T, E), dtype=np.float64)
+    return {
+        "joint_pos": joints,
+        "joint_vel": np.gradient(joints, axis=0) / 0.02,
+        "projected_gravity_b": gravity,
+        "root_link_pos_w": root,
+        "left_foot_pos_b": feet,
+        "right_foot_pos_b": feet.copy(),
+        "left_foot_contact": contact,
+        "right_foot_contact": contact.copy(),
+    }
+
+
 def _archetypes() -> dict[str, dict]:
     """Synthetic archetype rollouts spanning a competence axis. Negatives
     (`still`/`fallen`/`chaotic`/`upright_flail`) plus a POSITIVE per behavior
@@ -1775,6 +1967,11 @@ def validate_generated_metric(
     meta = {"joint_names": list(_NAMES_12)}
     inject_joint_roles(meta, required_roles, lenient=True)
     arche = _archetypes()
+    abstract_program = _abstract_objective_program(
+        behavior_goal, getattr(mod, "ABSTRACT_OBJECTIVE", None))
+    abstract_probe = _abstract_objective_probe(abstract_program)
+    if abstract_probe is not None:
+        arche["prompt_competent"] = abstract_probe
     catalog_cases: dict[str, str] = {}
     if catalog is not None:
         catalog_cases = {
@@ -1791,7 +1988,7 @@ def validate_generated_metric(
         for name, arrays in arche.items():
             case = ("competent" if name in {
                 "active", "active_kick", "active_floss", "active_jump",
-                "active_parkour",
+                "active_parkour", "prompt_competent",
             } else "far_idle")
             arrays.update(catalog_fixture_arrays(
                 catalog, time_steps=T, num_envs=E, case=case))
@@ -1877,6 +2074,8 @@ def validate_generated_metric(
         "active", "active_kick", "active_floss", "active_jump",
         "active_parkour",
     )
+    if "prompt_competent" in scores:
+        positive_keys += ("prompt_competent",)
     negative_keys = ("still", "fallen", "upright_flail", "chaotic")
 
     nondegen = True
@@ -2137,6 +2336,7 @@ def validate_generated_metric(
             "archetype_scores": scores, "family": family,
             "goal_frame": frame, "nondegeneracy_vacuous": vacuous,
             "selectivity_probe": selectivity,
+            "abstract_objective_program": abstract_program,
             "required_roles": required_roles, "axioms": axioms,
             "references": reference_results,
             "channel_catalog_hash": (

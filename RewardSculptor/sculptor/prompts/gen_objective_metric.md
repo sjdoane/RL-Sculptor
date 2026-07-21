@@ -6,16 +6,38 @@ as a competence GATE, not a score to be maximised — its job is to score a
 degenerate sub-behavior at ZERO, not at "a little".
 
 Output a single self-contained Python module (and nothing else outside the
-code fence). It may declare an optional module constant naming the joint
+code fence). It MUST declare an embodiment-neutral `ABSTRACT_OBJECTIVE`
+validator program, may declare an optional module constant naming the joint
 ROLES it reads, and must define `compute_spec`:
 
     import numpy as np
 
+    ABSTRACT_OBJECTIVE = {
+        "phases": ["climb", "dwell", "jump_off"]
+    }
     REQUIRED_JOINT_ROLES = ["left_hip_pitch", "left_knee"]   # only if you read joints
 
     def compute_spec(arrays, behavior, meta):
         # ... compute from physical rollout quantities ...
         return {"spec_score": <float in [0,1]>, "<subcomponent>": <float>, ...}
+
+## ABSTRACT OBJECTIVE VALIDATOR (required even without a reference motion)
+
+Translate the prompt into an ordered task-space phase program beside the
+metric. This is the independent synthetic competent example used when no
+stored trajectory exists. Use ONLY these closed-vocabulary phase names:
+`climb`, `dwell`, `move_forward`, `move_backward`, `move_left`, `move_right`,
+`jump`, `jump_off`, `land`, `crouch`, `tilt`, `recover`, `oscillate`, `reach`,
+`kick`. Preserve ordering and repetition: "climb two boxes, pause on each,
+then jump off" should be `["climb", "dwell", "climb", "dwell", "jump_off"]`,
+not merely `["jump"]`.
+
+The core validator safely retargets these abstract phases onto universal root,
+gravity, named-joint-role, end-effector, and authored task channels. Do NOT put
+robot names, simulator task IDs, raw joint indices, executable code, thresholds,
+or environment geometry in `ABSTRACT_OBJECTIVE`; it is a data-only intent
+program, not a second metric. `compute_spec` remains the actual objective
+measurement and must agree with every required phase.
 
 ## GOAL FRAME — resolve this FIRST, abstain when unknown
 
