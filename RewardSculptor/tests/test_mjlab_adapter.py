@@ -28,6 +28,51 @@ def test_base_reward_contract_default_fields() -> None:
     assert c.state_schema is None
 
 
+def test_scalar_policy_std_guard_clamps_initial_and_optimizer_values() -> None:
+    """Legacy rsl_rl scalar exploration must never cross below zero."""
+    from types import SimpleNamespace
+
+    torch = pytest.importorskip("torch")
+    from sculptor.adapters._mjlab_runner import _install_scalar_std_guard
+
+    std_param = torch.nn.Parameter(torch.tensor([-0.25, 0.5]))
+    optimizer = torch.optim.SGD([std_param], lr=1.0)
+    runner = SimpleNamespace(
+        alg=SimpleNamespace(
+            actor=SimpleNamespace(
+                distribution=SimpleNamespace(std_param=std_param),
+            ),
+            optimizer=optimizer,
+        ),
+    )
+
+    handle = _install_scalar_std_guard(runner, minimum=0.01)
+    assert handle is not None
+    assert torch.all(std_param >= 0.01)
+
+    # A finite optimizer update would drive both values negative without the
+    # post-step hook; the guard repairs them before the next action sample.
+    std_param.grad = torch.ones_like(std_param)
+    optimizer.step()
+    assert torch.all(std_param >= 0.01)
+    handle.remove()
+
+
+def test_scalar_policy_std_guard_ignores_other_distributions() -> None:
+    """Log-std and non-Gaussian policies remain byte-for-byte untouched."""
+    from types import SimpleNamespace
+
+    from sculptor.adapters._mjlab_runner import _install_scalar_std_guard
+
+    runner = SimpleNamespace(
+        alg=SimpleNamespace(
+            actor=SimpleNamespace(distribution=SimpleNamespace()),
+            optimizer=SimpleNamespace(),
+        ),
+    )
+    assert _install_scalar_std_guard(runner) is None
+
+
 def test_component_probe_dataclass_shape() -> None:
     p = ComponentProbe(ok=True, components={"x": 1.0}, total=1.0, error=None)
     assert p.ok is True

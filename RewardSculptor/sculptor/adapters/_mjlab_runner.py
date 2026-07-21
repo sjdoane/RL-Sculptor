@@ -1161,6 +1161,56 @@ def _apply_rl_profile(rl_cfg: Any, profile: str) -> None:
     _apply_rl_spec(rl_cfg, jump_preset_spec())
 
 
+def _install_scalar_std_guard(runner: Any, *, minimum: float = 1e-4) -> Any:
+    """Keep directly-parameterized Gaussian policy noise positive.
+
+    Some rsl_rl task configs still use ``GaussianDistribution`` with
+    ``std_type=\"scalar\"``.  That representation is an unconstrained trainable
+    parameter, so a perfectly finite PPO update can move one action's standard
+    deviation below zero.  The *next* minibatch then fails inside
+    ``torch.normal`` (``normal expects all elements of std >= 0.0``), often near
+    the end of an otherwise healthy long run.
+
+    Clamp only the legacy direct ``std_param`` after every optimizer step.  Log
+    parameterizations and non-Gaussian distributions have no ``std_param`` and
+    remain untouched.  Returning the optimizer hook handle lets the caller
+    remove it deterministically when training finishes.
+    """
+    algorithm = getattr(runner, "alg", None)
+    actor = getattr(algorithm, "actor", None)
+    distribution = getattr(actor, "distribution", None)
+    std_param = getattr(distribution, "std_param", None)
+    optimizer = getattr(algorithm, "optimizer", None)
+    register_hook = getattr(optimizer, "register_step_post_hook", None)
+    if std_param is None:
+        return None
+    if not callable(register_hook):
+        raise RuntimeError(
+            "rsl_rl uses an unconstrained scalar policy standard deviation, "
+            "but this PyTorch optimizer cannot install the required positivity "
+            "guard"
+        )
+
+    def _clamp_scalar_std(*_unused: Any) -> None:
+        # ``detach`` shares storage without recording the repair in autograd;
+        # it also avoids importing torch in this runner's lightweight paths.
+        std_param.detach().clamp_(min=float(minimum))
+
+    # A resumed checkpoint may already contain an invalid value, so repair it
+    # once before the first sample as well as after every subsequent step.
+    _clamp_scalar_std()
+    handle = register_hook(_clamp_scalar_std)
+    print(
+        "[SCULPT-EVENT] " + json.dumps({
+            "type": "policy_std_guard_installed",
+            "parameterization": "scalar",
+            "minimum": float(minimum),
+        }),
+        flush=True,
+    )
+    return handle
+
+
 def _cmd_train(args: argparse.Namespace) -> None:
     # Lazy heavy imports — stay out of the module top.
     from mjlab.envs.manager_based_rl_env import ManagerBasedRlEnv
@@ -1411,12 +1461,15 @@ def _cmd_train(args: argparse.Namespace) -> None:
 
     _poll_thread = _threading.Thread(target=_progress_poller, daemon=True)
     _poll_thread.start()
+    std_guard_handle = _install_scalar_std_guard(runner)
     try:
         runner.learn(
             num_learning_iterations=args.max_iterations,
             init_at_random_ep_len=True,
         )
     finally:
+        if std_guard_handle is not None:
+            std_guard_handle.remove()
         _stop.set()
         _poll_thread.join(timeout=3.0)
         # §7.1: capture one final window for any samples accumulated AFTER

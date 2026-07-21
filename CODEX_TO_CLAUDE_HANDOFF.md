@@ -681,3 +681,37 @@ project above. It was created entirely through the UI after the fix, has no
 failed-run history, and promoted the matching parkour prompt as World selection
 v1 with tuple-hash prefix `34caeae995be`; all eight admission gates passed.
 The lab-call runbook now points to this final project.
+
+## Full showcase recovery hardening 2026-07-20 (Codex)
+
+The clean UI-only overnight run for `lab-call-authored-parkour` launched as
+`job_78e64f36f2525215` from source `b38a6b8...`. Iteration 0 completed the
+entire train/rollout/audit/diagnose/edit pipeline: 750 PPO iterations, a
+7,029,739-byte checkpoint, 500-frame MP4 plus trajectory/reward trace, realism
+audit `ok`, raw return `37.4471`, firewall fitness `0.00095`, and three grounded
+reward edits. The low firewall fitness honestly identified reset-like travel
+despite a high simulator return, which is useful lab-call evidence of the
+metric firewall doing real work.
+
+Iteration 1 then exposed a long-horizon dependency failure near its final PPO
+update: rsl_rl's registered Go1 config uses an unconstrained trainable
+`GaussianDistribution` standard deviation (`std_type="scalar"`); one action's
+value crossed below zero and `torch.normal` raised `normal expects all elements
+of std >= 0.0`. The World build, GPU memory, and physics were healthy. The run
+was left intact as failure evidence and was not resumed across a changed source
+hash.
+
+Recovery is generic and policy-capability based. `_mjlab_runner.py` now detects
+only distributions exposing the legacy direct `std_param`, clamps an invalid
+resumed value before sampling, and installs a PyTorch optimizer post-step hook
+that enforces a `1e-4` minimum before the next minibatch. Log-std and
+non-Gaussian distributions remain untouched. The hook is removed
+deterministically after training. The UI backend also classifies this exact
+signature as `policy_distribution_instability` with an actionable explanation
+instead of an empty unknown-error card.
+
+Focused evidence before the replacement launch: 36 mjlab-adapter tests and 12
+error-classifier tests passed; scoped Ruff, compileall, and `git diff --check`
+passed. The replacement must be launched as a new UI run after committing this
+fix so its immutable run context records the new clean source hash. Preserve
+the original errored run and its `iter_0` artifacts for provenance.

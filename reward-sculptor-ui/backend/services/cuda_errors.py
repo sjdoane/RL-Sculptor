@@ -71,7 +71,30 @@ def classify(text: str, *, current_num_envs: Optional[int] = None) -> CudaErrorC
             },
         )
 
-    # 2. OOM — several wordings in the wild.
+    # 2. Legacy scalar Gaussian exploration can cross below zero after an
+    # optimizer step.  RewardSculptor's mjlab runner installs a positivity
+    # guard, but classify older/unpatched runs precisely instead of presenting
+    # an empty generic failure card.
+    if "normal expects all elements of std >= 0.0" in needle:
+        return CudaErrorClass(
+            kind="policy_distribution_instability",
+            title="Policy exploration became unstable",
+            detail=(
+                "A directly learned Gaussian action standard deviation crossed "
+                "below zero during PPO optimization. The environment and World "
+                "build remain valid; the policy distribution needs the scalar-"
+                "standard-deviation guard before training can continue."
+            ),
+            suggestions=[
+                "Update RewardSculptor to a build with the policy standard-"
+                "deviation guard, then launch a new exact-match run.",
+                "Keep the same World selection, seed, environment count, and "
+                "training budget so results remain comparable.",
+            ],
+            problem_type="/problems/policy-distribution-instability",
+        )
+
+    # 3. OOM — several wordings in the wild.
     oom_markers = [
         "cuda out of memory",
         "out of memory",
@@ -103,7 +126,7 @@ def classify(text: str, *, current_num_envs: Optional[int] = None) -> CudaErrorC
             problem_type="/problems/cuda-oom",
         )
 
-    # 3. Driver / runtime mismatch.
+    # 4. Driver / runtime mismatch.
     if (
         "cuda driver version is insufficient" in needle
         or "the provided ptx was compiled with an unsupported toolchain" in needle
@@ -126,7 +149,7 @@ def classify(text: str, *, current_num_envs: Optional[int] = None) -> CudaErrorC
             problem_type="/problems/cuda-driver-too-old",
         )
 
-    # 4. CUDA missing entirely.
+    # 5. CUDA missing entirely.
     no_cuda_markers = [
         "no cuda-capable device",
         "cuda_error_no_device",
