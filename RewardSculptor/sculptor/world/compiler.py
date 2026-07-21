@@ -1445,10 +1445,17 @@ def apply_world_selection(
         raise WorldCompileError(
             "runtime robot asset does not match evaluation manifest")
 
+    world_dr_applied: tuple[str, ...] = ()
     if train:
         compiled = compile_world(world, task)
         expand_train_terrain_difficulty(compiled, world)
         apply_compiled_world(env_cfg, compiled)
+        # Per-episode domain randomization: the authored `train.variations`
+        # (box heights, object mass/friction) become mjlab reset events so each
+        # env re-samples its layout every episode — the sim-to-real robustness
+        # lever. Train-only; evaluation always replays the frozen manifest.
+        from sculptor.world.randomization import install_world_randomizations
+        world_dr_applied = tuple(install_world_randomizations(env_cfg, world))
     else:
         authored_scene, _, _ = compile_scene_cfg(world)
         runtime = compile_task_runtime(world, task, robot)
@@ -1471,6 +1478,8 @@ def apply_world_selection(
     runtime_adjustments = (
         *_reconcile_terrain_curriculum(env_cfg),
         *_reconcile_waypoint_course(env_cfg, manifest, train=train),
+        *(f"per-episode domain randomization → {msg}"
+          for msg in world_dr_applied),
     )
     return ResolvedWorldBundle(
         tuple_hash=selection.tuple_hash,
