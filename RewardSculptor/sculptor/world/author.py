@@ -390,17 +390,58 @@ def _portable_offline_capability(
     return max(ranked, key=lambda item: (item[0], item[1]))[2]
 
 
+# Deliberately NO "a"/"an": they are ARTICLES ("a box course" = a parkour
+# course, not 1 box), so treating them as a count mis-reads "a course with 8
+# steps" as 1. Explicit "single"/"one" still count.
+_NUMBER_WORDS = {
+    "single": 1, "one": 1, "two": 2, "three": 3, "four": 4,
+    "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+    "eleven": 11, "twelve": 12,
+}
+_COURSE_NOUNS = r"(?:boxes|box|platforms?|steps?|obstacles?|blocks?|stairs?|hurdles?)"
+_COUNT_RE = re.compile(
+    r"(\d+|" + "|".join(_NUMBER_WORDS) + r")\s+(?:more\s+|tall\s+|high\s+)*"
+    + _COURSE_NOUNS)
+
+
+def _parse_count(prompt: str, *, default: int, lo: int = 1, hi: int = 12) -> int:
+    """Extract a requested course-element COUNT from free text, e.g. "4 boxes",
+    "climb five platforms". Clamped to [lo, hi]; falls back to `default` when no
+    count is stated (so an unquantified "parkour course" keeps its nominal length).
+    Fixes the "prompt for 4 boxes, get 3" bug — the template never read the number."""
+    text = prompt.casefold()
+    m = _COUNT_RE.search(text)
+    if not m:
+        return default
+    token = m.group(1)
+    n = int(token) if token.isdigit() else _NUMBER_WORDS.get(token, default)
+    return max(lo, min(hi, n))
+
+
 def _intent(prompt: str) -> str:
     text = prompt.casefold()
+    is_object = (
+        any(token in text for token in
+            ("ball", "object", "cube", "block", "gripper", "grasp"))
+        and any(token in text for token in
+                ("goal", "region", "score", "into", "onto", "place", "move",
+                 "push", "put", "drop", "kick", "throw", "roll", "carry")))
+    # Specific parkour cues win outright.
     if any(token in text for token in (
             "parkour", "course of boxes", "box course", "obstacle course",
             "vault", "hurdle")):
         return "parkour"
-    if (any(token in text for token in
-            ("ball", "object", "cube", "block", "gripper", "grasp"))
-            and any(token in text for token in
-                    ("goal", "region", "score", "into", "place", "move"))):
+    # An object-manipulation prompt is object_to_region EVEN IF it mentions a box
+    # or platform ("push the block onto the platform") — the generic parkour nouns
+    # below must not steal it.
+    if is_object:
         return "object_to_region"
+    # Generic climb / box / platform cues (no object task) → parkour. This is what
+    # lets "generate 4 boxes" / "climb two boxes then jump off" ground at all.
+    if any(token in text for token in (
+            "boxes", "platform", "platforms",
+            "climb", "climbs", "climbing")):
+        return "parkour"
     if any(token in text for token in
            ("uneven", "rough terrain", "rough ground", "slope", "terrain")):
         return "uneven_terrain"
@@ -556,6 +597,7 @@ def _author_uneven(world: dict[str, Any], task: dict[str, Any]) -> None:
 
 def _author_parkour(
     world: dict[str, Any], task: dict[str, Any], cap: RobotCapability,
+    *, count: int = 3,
 ) -> None:
     step = max(0.12, min(0.35, cap.geometry.max_step_height_m * 0.60))
     gap = max(0.15, min(0.45, cap.geometry.max_gap_m * 0.55))
@@ -564,44 +606,58 @@ def _author_parkour(
     # admission and teaches no useful parkour behavior.
     lead_in = round(max(0.6, cap.geometry.foot_length_m * 3.0), 4)
     world["shared"]["obstacles"]["start_offset_m"] = lead_in
-    world["shared"]["obstacles"]["course"] = [
-        {"id": "box_01", "element": "platform", "nominal": {
-            "height_m": round(step * 0.70, 4), "length_m": 1.0, "width_m": 1.2,
-        }},
-        {"id": "gap_01", "element": "gap", "nominal": {
-            "length_m": round(gap, 4), "width_m": 1.2, "depth_m": 0.5,
-        }},
-        {"id": "box_02", "element": "platform", "nominal": {
-            "height_m": round(step, 4), "length_m": 1.1, "width_m": 1.2,
-        }},
-        {"id": "gap_02", "element": "gap", "nominal": {
-            "length_m": round(gap * 1.15, 4), "width_m": 1.2, "depth_m": 0.5,
-        }},
-        {"id": "box_03", "element": "platform", "nominal": {
-            "height_m": round(step * 0.85, 4), "length_m": 1.2, "width_m": 1.2,
-        }},
+
+    # Build `count` platforms separated by gaps.  Heights ramp gently across the
+    # course (each within the robot's max step height) and widths grow slightly so
+    # later, higher platforms stay landable — the shape the fixed 3-box template
+    # encoded, generalized to any authored count.
+    n = max(1, min(12, int(count)))
+    course: list[dict[str, Any]] = []
+    height_ceiling = max(step, cap.geometry.max_step_height_m)
+    for i in range(n):
+        frac = i / max(1, n - 1)                        # 0 → 1 across the course
+        height = min(height_ceiling, step * (0.70 + 0.45 * frac))
+        course.append({
+            "id": f"box_{i + 1:02d}", "element": "platform", "nominal": {
+                "height_m": round(height, 4),
+                "length_m": round(1.0 + 0.1 * i, 4), "width_m": 1.2,
+            }})
+        if i < n - 1:
+            course.append({
+                "id": f"gap_{i + 1:02d}", "element": "gap", "nominal": {
+                    "length_m": round(gap * (1.0 + 0.15 * frac), 4),
+                    "width_m": 1.2, "depth_m": 0.5,
+                }})
+    world["shared"]["obstacles"]["course"] = course
+
+    # Domain-randomize a representative MIDDLE platform's height and (when the
+    # course has ≥2 platforms) a gap length, so training sees a distribution of
+    # layouts rather than one frozen course (sim-to-real robustness).
+    mid_box = course[2 * (n // 2)]["id"]                # a central platform id
+    variations: list[dict[str, Any]] = [
+        {
+            "id": "middle_box_height",
+            "target": f"/shared/obstacles/course/@{mid_box}/nominal/height_m",
+            "class": "model_field",
+            "distribution": {
+                "kind": "uniform", "low": round(step * 0.55, 4),
+                "high": round(min(cap.geometry.max_step_height_m, step * 1.25), 4),
+            },
+        },
     ]
+    if n >= 2:
+        mid_gap = f"gap_{max(1, n // 2):02d}"
+        variations.append({
+            "id": "second_gap_length",
+            "target": f"/shared/obstacles/course/@{mid_gap}/nominal/length_m",
+            "class": "model_field",
+            "distribution": {
+                "kind": "uniform", "low": round(gap * 0.70, 4),
+                "high": round(min(cap.geometry.max_gap_m, gap * 1.30), 4),
+            },
+        })
     world["train"] = {
-        "variations": [
-            {
-                "id": "middle_box_height",
-                "target": "/shared/obstacles/course/@box_02/nominal/height_m",
-                "class": "model_field",
-                "distribution": {
-                    "kind": "uniform", "low": round(step * 0.55, 4),
-                    "high": round(min(cap.geometry.max_step_height_m, step * 1.25), 4),
-                },
-            },
-            {
-                "id": "second_gap_length",
-                "target": "/shared/obstacles/course/@gap_02/nominal/length_m",
-                "class": "model_field",
-                "distribution": {
-                    "kind": "uniform", "low": round(gap * 0.70, 4),
-                    "high": round(min(cap.geometry.max_gap_m, gap * 1.30), 4),
-                },
-            },
-        ],
+        "variations": variations,
         "curriculum": {
             "difficulty_range": [0.0, 1.0],
             "promotion": {
@@ -651,7 +707,7 @@ def _push_contact_role(cap: RobotCapability) -> str:
 
 def _author_object_to_region(
     world: dict[str, Any], task: dict[str, Any], cap: RobotCapability,
-    required: frozenset[str],
+    required: frozenset[str], *, prompt: str = "",
 ) -> None:
     radius = round(max(0.035, min(0.11, cap.geometry.reach_radius_m * 0.08)), 4)
     reach = max(0.25, cap.geometry.reach_radius_m)
@@ -676,6 +732,25 @@ def _author_object_to_region(
             },
         },
     }
+    # A "soccer goal" / "net" prompt gets a physical goal FRAME (posts +
+    # crossbar) standing on the ground at the target region — so "a ball and a
+    # soccer goal" authors a visible goal, not just an invisible reward zone.
+    # (The `frame` primitive was in the schema + compiler all along; no template
+    # ever emitted one.)
+    if any(word in prompt.casefold() for word in ("goal", "net", "soccer")):
+        post_r = round(max(0.02, radius * 0.5), 4)
+        opening_w = round(min(2.0, radius * 12.0), 4)
+        opening_h = round(min(1.5, radius * 9.0), 4)
+        world["shared"]["objects"]["target_goal"] = {
+            "shape": "frame", "fixed": True,
+            "nominal": {
+                "opening_m": [opening_w, opening_h],
+                "post_radius_m": post_r, "depth_m": 0.3,
+                # Body raised so the posts' lower ends rest on the z=0 ground.
+                "pose": {"position_m": [
+                    goal_x, 0.0, round(opening_h / 2 + post_r, 4)]},
+            },
+        }
     role = (_grasp_contact_role(cap) if "grasp" in required
             else _push_contact_role(cap))
     task["shared"]["goal"] = {
@@ -774,9 +849,9 @@ def _offline_author(
     if intent == "uneven_terrain":
         _author_uneven(world, task)
     elif intent == "parkour":
-        _author_parkour(world, task, cap)
+        _author_parkour(world, task, cap, count=_parse_count(prompt, default=3))
     elif intent == "object_to_region":
-        _author_object_to_region(world, task, cap, required)
+        _author_object_to_region(world, task, cap, required, prompt=prompt)
     else:
         _author_robot_to_region(world, task)
 

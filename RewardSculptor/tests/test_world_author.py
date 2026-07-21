@@ -19,6 +19,7 @@ from sculptor.world.author import (
     author_environment,
     default_clarification_submission,
 )
+from sculptor.world.author import _parse_count
 from sculptor.world.capabilities import CapabilityError
 from sculptor.world.task_spec import validate_task_spec
 from sculptor.world.world_spec import validate_world_spec
@@ -354,3 +355,70 @@ def test_injected_author_model_has_small_strict_interface() -> None:
             "Stay stable and walk on uneven terrain.",
             robot_capability_id="unitree_g1:base",
         )
+
+
+def test_parse_count_reads_requested_number():
+    """The offline parkour template now reads a COUNT from the prompt — the
+    "prompt for 4 boxes, get 3" bug was that the template ignored the number."""
+    assert _parse_count("generate 4 boxes", default=3) == 4
+    assert _parse_count("a parkour course with five platforms", default=3) == 5
+    assert _parse_count("climb two boxes then jump off", default=3) == 2
+    # unquantified → nominal default
+    assert _parse_count("build a parkour course", default=3) == 3
+    # articles are not counts ("a course with 8 steps" is 8, not 1)
+    assert _parse_count("a box course with 8 steps", default=3) == 8
+    # clamped to a sane range
+    assert _parse_count("999 boxes", default=3) == 12
+
+
+def test_parkour_authors_requested_platform_count():
+    draft = author_environment(
+        "generate a parkour course with 4 boxes",
+        robot_capability_id="unitree_g1:base")
+    world = draft.world_spec
+    assert validate_world_spec(world) == []
+    platforms = [c["id"] for c in world["shared"]["obstacles"]["course"]
+                 if c["element"] == "platform"]
+    assert platforms == ["box_01", "box_02", "box_03", "box_04"]
+    # variation targets stay valid ids for the authored length
+    targets = {v["target"] for v in world["train"]["variations"]}
+    course_ids = {c["id"] for c in world["shared"]["obstacles"]["course"]}
+    for t in targets:
+        ref = t.split("@")[1].split("/")[0]
+        assert ref in course_ids, (t, course_ids)
+
+
+def test_object_prompt_authors_ball_and_soccer_goal():
+    draft = author_environment(
+        "Use a gripper robot to move a ball into a soccer goal",
+        robot_capability_id="yam:parallel_gripper")
+    world = draft.world_spec
+    assert validate_world_spec(world) == []
+    objects = world["shared"]["objects"]
+    assert objects["target_object"]["shape"] == "sphere"        # the ball
+    assert objects["target_goal"]["shape"] == "frame"           # the soccer goal
+    assert objects["target_goal"]["fixed"] is True
+
+
+def test_object_prompt_without_goal_word_has_no_frame():
+    draft = author_environment(
+        "Use a gripper robot to move a cube into the region",
+        robot_capability_id="yam:parallel_gripper")
+    objects = draft.world_spec["shared"]["objects"]
+    assert "target_goal" not in objects
+
+
+def test_intent_routing_object_vs_parkour_precedence():
+    """Object-manipulation prompts are not stolen by the generic box/platform
+    parkour cues, and generic climb/box cues still ground as parkour."""
+    from sculptor.world.author import _intent
+    # object-manipulation wins even when it mentions a box/platform
+    assert _intent("push the block onto the platform") == "object_to_region"
+    assert _intent("move the cube into the goal region") == "object_to_region"
+    assert _intent("score the ball into the soccer goal") == "object_to_region"
+    # generic climb/box cues (no object task) → parkour
+    assert _intent("generate 4 boxes") == "parkour"
+    assert _intent("climb two boxes then jump off") == "parkour"
+    assert _intent("climb onto the platform") == "parkour"
+    # specific parkour cues still win
+    assert _intent("parkour course of boxes") == "parkour"
