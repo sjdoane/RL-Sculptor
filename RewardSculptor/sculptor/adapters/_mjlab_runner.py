@@ -35,6 +35,29 @@ from typing import Any
 _COMPONENT_SINK: dict[str, list[float]] | None = None
 
 
+def _to_host_numpy(value: Any) -> Any:
+    """Convert tensor-like simulator metadata to a host NumPy array.
+
+    mjlab/mujoco-warp models may expose limits as CUDA tensors. Calling
+    ``np.asarray`` on those tensors raises instead of copying implicitly.
+    Detach and move only values that advertise those tensor operations; plain
+    NumPy arrays and lists retain the normal conversion path.
+    """
+    import numpy as np
+
+    candidate = value
+    detach = getattr(candidate, "detach", None)
+    if callable(detach):
+        candidate = detach()
+    cpu = getattr(candidate, "cpu", None)
+    if callable(cpu):
+        candidate = cpu()
+    to_numpy = getattr(candidate, "numpy", None)
+    if callable(to_numpy):
+        candidate = to_numpy()
+    return np.asarray(candidate)
+
+
 def _record_components(
     sink: dict[str, list[float]] | None,
     components: dict[str, Any],
@@ -2022,8 +2045,14 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
                     if m is not None:
                         break
         if m is not None:
-            fr = np.asarray(getattr(m, "actuator_forcerange"), dtype=np.float64)
-            jr = np.asarray(getattr(m, "jnt_range"), dtype=np.float64)
+            fr = np.asarray(
+                _to_host_numpy(getattr(m, "actuator_forcerange")),
+                dtype=np.float64,
+            )
+            jr = np.asarray(
+                _to_host_numpy(getattr(m, "jnt_range")),
+                dtype=np.float64,
+            )
             # Names: use mujoco's id→name helpers when present, else
             # leave as positional indices (audit tolerates empty lists).
             def _names(model, count: int, kind: str) -> list[str]:

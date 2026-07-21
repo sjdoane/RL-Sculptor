@@ -20,6 +20,41 @@ from sculptor.adapters.base import (
 )
 
 
+def test_to_host_numpy_moves_tensor_metadata_to_cpu() -> None:
+    """CUDA-like simulator metadata is copied to host before NumPy sees it."""
+    import numpy as np
+
+    from sculptor.adapters._mjlab_runner import _to_host_numpy
+
+    calls: list[str] = []
+
+    class FakeCudaTensor:
+        def detach(self):
+            calls.append("detach")
+            return self
+
+        def cpu(self):
+            calls.append("cpu")
+            return self
+
+        def numpy(self):
+            calls.append("numpy")
+            return np.array([[1.0, 2.0], [3.0, 4.0]])
+
+    result = _to_host_numpy(FakeCudaTensor())
+
+    assert calls == ["detach", "cpu", "numpy"]
+    np.testing.assert_array_equal(result, [[1.0, 2.0], [3.0, 4.0]])
+
+
+def test_to_host_numpy_keeps_plain_metadata_supported() -> None:
+    import numpy as np
+
+    from sculptor.adapters._mjlab_runner import _to_host_numpy
+
+    np.testing.assert_array_equal(_to_host_numpy([[0.0, 1.0]]), [[0.0, 1.0]])
+
+
 def test_base_reward_contract_default_fields() -> None:
     c = RewardContract(observation_space_spec=None, action_space_spec=None)
     assert c.supports_batched is False

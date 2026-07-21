@@ -9,10 +9,13 @@ import { Icon } from "@/components/rs/icon";
 import { Badge, Btn, EmptyState } from "@/components/rs/primitives";
 import { useMission, useMissions, useStageIterations } from "@/hooks/useMissions";
 import { usePolicies } from "@/hooks/usePolicies";
+import { useProjectIterations } from "@/hooks/useRuns";
 import {
   ApiError,
   getReportsSources,
   policyExportUrl,
+  projectFreshRolloutUrl,
+  projectIterRolloutUrl,
   stageCheckpointUrl,
   stageExportUrl,
   stageRolloutUrl,
@@ -190,6 +193,26 @@ export function ReportsTab({
         : { kind: "mission", missionSlug: effectiveSourceValue },
     [effectiveSourceValue],
   );
+  const projectIters = useProjectIterations(slug, {
+    enabled: source.kind === "project",
+  });
+  const projectBestIter: StageIteration | null = useMemo(() => {
+    const rows = (projectIters.data ?? []).filter((row) => row.has_checkpoint);
+    if (rows.length === 0) return null;
+    const hasSteerFitness = rows.some((row) => row.steer_fitness != null);
+    const hasFitness = rows.some((row) => row.fitness != null);
+    const score = (row: StageIteration): number | null => {
+      if (hasSteerFitness) return row.steer_fitness;
+      if (hasFitness) return row.fitness;
+      return row.primary_metric;
+    };
+    return rows.reduce((best, row) => {
+      const candidate = score(row);
+      const incumbent = score(best);
+      if (candidate == null) return best;
+      return incumbent == null || candidate > incumbent ? row : best;
+    });
+  }, [projectIters.data]);
 
   // §Increment 3: which stage within the picked mission. Sticky local
   // pick (cleared whenever the mission source changes so a stale stage
@@ -359,7 +382,14 @@ export function ReportsTab({
         </div>
 
         {source.kind === "project" ? (
-          <PoliciesCard slug={slug} />
+          <>
+            <PoliciesCard slug={slug} />
+            <ProjectBestPolicyCard
+              slug={slug}
+              iteration={projectBestIter}
+              isLoading={projectIters.isLoading}
+            />
+          </>
         ) : (
           <>
             <StagePicker
@@ -493,6 +523,116 @@ export function ReportsTab({
             </div>
           </div>
         )}
+      </div>
+    </div>
+  );
+}
+
+// ── Project best-policy evidence ─────────────────────────────────────
+// Standalone runs previously buried their most persuasive artifact in the
+// Training timeline while mission runs had a Results-tab hero. Rank only on
+// one declared scale (steer fitness, objective fitness, then legacy return)
+// and keep the fresh replay visually distinct from the selection rollout.
+function ProjectBestPolicyCard({
+  slug, iteration, isLoading,
+}: {
+  slug: string;
+  iteration: StageIteration | null;
+  isLoading: boolean;
+}) {
+  const score = iteration?.steer_fitness ?? iteration?.fitness ?? null;
+  const metricLabel = iteration?.steer_fitness != null
+    ? "steering fitness"
+    : iteration?.fitness != null
+      ? "objective fitness"
+      : "legacy return";
+  return (
+    <div className="rs-card" style={{ marginBottom: 22 }}>
+      <div className="rs-card-head">
+        <div className="rs-card-title">
+          <Icon name="video" size={16} />Selected best-policy evidence
+          {iteration ? ` · iter ${iteration.iter_index}` : ""}
+        </div>
+        <span className="rs-sub" style={{ fontSize: 12 }}>
+          selection rollout · fresh held-out replay
+        </span>
+      </div>
+      <div className="rs-card-pad">
+        {isLoading ? (
+          <p className="rs-sub" style={{ margin: 0 }}>Loading…</p>
+        ) : !iteration ? (
+          <EmptyState
+            icon="video"
+            title="No trained policy evidence yet"
+            sub="Complete a standalone run to compare its selected rollout and fresh replay here."
+          />
+        ) : (
+          <>
+            <div className="rs-flex rs-gap-8 rs-wrap" style={{ marginBottom: 12 }}>
+              {iteration.reward_version && (
+                <span className="rs-tag mono">reward {iteration.reward_version}</span>
+              )}
+              {score != null ? (
+                <span className="rs-tag" style={{ color: "var(--st-emerald)" }}>
+                  {metricLabel} {score.toFixed(5)}
+                </span>
+              ) : iteration.primary_metric != null ? (
+                <span className="rs-tag">legacy return {iteration.primary_metric.toFixed(2)}</span>
+              ) : null}
+              {iteration.fresh_rollout_count > 0 && (
+                <span className="rs-tag" style={{ color: "var(--st-blue)" }}>
+                  {iteration.fresh_rollout_count} fresh replay
+                  {iteration.fresh_rollout_count === 1 ? "" : "s"}
+                </span>
+              )}
+            </div>
+            <p className="rs-sub" style={{ margin: "0 0 14px", maxWidth: 820 }}>
+              The left clip is the policy used for selection. The fresh replay
+              is a separate post-selection rollout, so agreement is evidence
+              against choosing a one-seed accident.
+            </p>
+            <div style={{
+              display: "grid",
+              gridTemplateColumns: iteration.fresh_rollout_count > 0
+                ? "repeat(auto-fit, minmax(min(100%, 360px), 1fr))"
+                : "minmax(0, 1fr)",
+              gap: 14,
+            }}>
+              {iteration.has_rollout && (
+                <EvidenceVideo
+                  label="Selection rollout"
+                  src={projectIterRolloutUrl(slug, iteration.iter_index)}
+                />
+              )}
+              {iteration.fresh_rollout_count > 0 && (
+                <EvidenceVideo
+                  label="Fresh held-out replay"
+                  src={projectFreshRolloutUrl(slug, iteration.iter_index, 0)}
+                />
+              )}
+            </div>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function EvidenceVideo({ label, src }: { label: string; src: string }) {
+  return (
+    <div>
+      <div className="rs-eyebrow" style={{ marginBottom: 7 }}>{label}</div>
+      <div className="rs-viewer">
+        <video
+          src={src}
+          className="rs-viewer-stage"
+          style={{ width: "100%", aspectRatio: "16/9", background: "#16150f" }}
+          controls
+          playsInline
+          preload="metadata"
+        >
+          <track kind="captions" />
+        </video>
       </div>
     </div>
   );

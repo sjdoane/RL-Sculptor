@@ -31,7 +31,7 @@ def _make_project(client: TestClient) -> str:
 
 def _plant_iter(
     project_dir: Path, i: int, *, metric: float = 10.0,
-    reward_version: str = "v0",
+    reward_version: str = "v0", fitness: float | None = None,
 ) -> None:
     it = project_dir / "runs" / f"iter_{i}"
     it.mkdir(parents=True, exist_ok=True)
@@ -45,6 +45,8 @@ def _plant_iter(
         json.dumps({"version": reward_version}))
     (it / "metrics.json").write_text(
         json.dumps({"metrics": {"mean_return": metric}}))
+    if fitness is not None:
+        (it / "fitness.json").write_text(json.dumps({"fitness": fitness}))
 
 
 def test_list_policies_empty(client: TestClient, tmp_projects_root: Path):
@@ -65,13 +67,14 @@ def test_list_policies_returns_disk_iters(
     slug = _make_project(client)
     pdir = tmp_projects_root / slug
     _plant_iter(pdir, 0, metric=5.0)
-    _plant_iter(pdir, 2, metric=9.5, reward_version="v2")
+    _plant_iter(pdir, 2, metric=9.5, reward_version="v2", fitness=0.37)
     r = client.get(f"/projects/{slug}/policies")
     assert r.status_code == 200
     rows = r.json()
     assert [row["iter_index"] for row in rows] == [0, 2]
     assert rows[1]["primary_metric"] == pytest.approx(9.5)
     assert rows[1]["reward_version"] == "v2"
+    assert rows[1]["fitness"] == pytest.approx(0.37)
     assert rows[0]["checkpoint"] == "checkpoint.pt"
     assert rows[0]["checkpoint_bytes"] > 0
 

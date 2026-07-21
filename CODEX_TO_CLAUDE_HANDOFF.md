@@ -715,3 +715,68 @@ error-classifier tests passed; scoped Ruff, compileall, and `git diff --check`
 passed. The replacement must be launched as a new UI run after committing this
 fix so its immutable run context records the new clean source hash. Preserve
 the original errored run and its `iter_0` artifacts for provenance.
+
+## Completed UI-only lab showcase 2026-07-21 (Codex)
+
+The replacement run completed successfully from the UI with no terminal-side
+launch configuration:
+
+- Project: `lab-call-authored-parkour`; job:
+  `job_434b10c7d3fd8eb2`; clean source:
+  `8a2de1d45c8e40eb55544d9397054b3f9f0a498e`.
+- Start/end: `2026-07-21T00:12:52Z` → `2026-07-21T02:34:26Z`
+  (2 h 21 m 34 s).
+- Exact controls: 4 outer cycles, 750 rsl_rl iterations/cycle, 1024 envs,
+  `cuda:0`, 500 episode steps, two rollout episodes, seed 42, 960×540 video,
+  `go1_trot` in steer mode with patience 4, KG enabled.
+- Fitness: iter 2 `0.00159`, iter 3 `0.20701`, iter 4 `0.26848` (selected
+  best), iter 5 `0.23281`. Iter indices continue the project's preserved
+  provenance; the job still ran exactly four new cycles.
+- Best selection pinned iter 4 reward `v4.py`, env spec v1, tuple
+  `2ec5d679...`, and then ran a fresh held-out seed 90001. Fresh fitness was
+  `0.25805` versus selected fitness `0.26848`.
+- Visual inspection confirmed coherent, upright, sustained locomotion in the
+  selected rollout and its fresh replay. It did not clearly show platform
+  clearing, so the defensible claim is reproducible authored-world optimization
+  and locomotion progress, not solved parkour.
+- Best video:
+  `~/.local/share/reward-sculptor/projects/lab-call-authored-parkour/runs/iter_4/rollout/rollout.mp4`.
+  Fresh replay:
+  `~/.local/share/reward-sculptor/projects/lab-call-authored-parkour/runs/iter_4/rollout_fresh_0/rollout.mp4`.
+
+Post-run hardening fixes three honest demo gaps. `_mjlab_runner` now moves
+CUDA-backed actuator/joint limit tensors to CPU before NumPy snapshotting, so
+realism metadata no longer emits a nonfatal conversion warning. The Run Detail
+API rehydrates all recorded `RunParams` rather than falsely returning null for
+the advanced UI controls that were actually used. The New Run ETA is calibrated
+from the completed Go1 run and models PPO iterations, environment count, fixed
+cycle overhead, and final fresh evaluation; the old UI showed 44 minutes for a
+job that took 2 h 21 m.
+
+The Results tab is now call-ready without filesystem or terminal work. Policy
+fitness comes from each iteration's authoritative `fitness.json` (with the old
+`behavior.json` field retained only as a legacy fallback), so iter 4 is visibly
+marked best. A dedicated evidence card shows its selection rollout and the
+separate fresh held-out replay side by side, labels the steering fitness, and
+reports the fresh replay count. The backend serves fresh rollouts through a
+bounded project/iteration/index route rather than exposing local paths. The UI
+`Build report` action was exercised on the real project and successfully
+rendered the reward/reference/changelog report.
+
+Final verification on this uncommitted slice:
+
+- Full core suite: 2,142 passed / 1 optional-JAX collection skip in 4 m 58 s
+  with the required `MUJOCO_GL=egl` command and `test_refs_preview.py` excluded.
+- Full UI backend suite: 558 passed in 3 m 10 s.
+- Focused post-run suites: core export + mjlab adapter 70 passed; UI runs,
+  policies, and project-disk routes 68 passed.
+- Frontend production build passed (2,761 transformed modules).
+- Scoped Ruff, compileall, and `git diff --check` passed.
+- Browser verification covered the World integrity/provenance view, the
+  measured 2.3 h launch ETA, both real video endpoints, and report generation.
+
+The complete UI-only rehearsal and exact call script live in
+`reward-sculptor-ui/docs/LAB_CALL_DEMO_RUNBOOK.md`. Keep the scientific claim
+narrow: the run demonstrates an immutable authored-world tuple, end-to-end
+reward/environment optimization, metric-firewall selection, and fresh-seed
+locomotion reproduction. It does not yet demonstrate solved platform clearing.

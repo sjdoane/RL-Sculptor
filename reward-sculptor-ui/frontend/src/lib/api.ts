@@ -941,6 +941,13 @@ export function projectIterRolloutUrl(slug: string, iterIndex: number): string {
   return `/api/projects/${slug}/iterations/${iterIndex}/rollout`;
 }
 
+/** Fresh held-out replay produced after best-policy selection. */
+export function projectFreshRolloutUrl(
+  slug: string, iterIndex: number, freshIndex: number,
+): string {
+  return `/api/projects/${slug}/iterations/${iterIndex}/fresh-rollouts/${freshIndex}`;
+}
+
 /** GET .../stages/{stage}/env-spec — the applied env curriculum for a
  *  stage. `current.meta.source` starting "reference:" ⇒ RSI applied. */
 export async function getStageEnvSpec(

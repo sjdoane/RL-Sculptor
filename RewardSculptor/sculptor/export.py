@@ -90,13 +90,20 @@ def list_exportable_iters(runs_root: Path | str) -> list[dict[str, Any]]:
         metrics = _load_json(d / "metrics.json") or {}
         spec = _load_json(d / "reward_spec.json") or {}
         behavior = _load_json(d / "rollout" / "behavior.json") or {}
+        fitness_doc = _load_json(d / "fitness.json") or {}
         primary = None
         mm = metrics.get("metrics")
         if isinstance(mm, dict):
             v = mm.get("mean_return")
             if isinstance(v, (int, float)):
                 primary = float(v)
-        fitness = behavior.get("fitness")
+        # Current objective-fitness runs persist the firewall score beside
+        # the iteration in fitness.json.  behavior.json is rollout telemetry
+        # and only older runs stored a fitness scalar there.  Prefer the
+        # authoritative current file while retaining the legacy fallback.
+        fitness = fitness_doc.get("fitness")
+        if not isinstance(fitness, (int, float)):
+            fitness = behavior.get("fitness")
         out.append({
             "iter_index": int(m.group(1)),
             "checkpoint": ckpt.name,
@@ -172,7 +179,6 @@ def export_policy_bundle(
                           "reward/reward_spec.json"))
         else:
             warnings.append("reward_spec.json missing from the iter dir")
-        reward_src = None
         if isinstance(reward_version, str):
             # reward_spec.json is on-disk data — validate before it becomes
             # a path component (a hostile "../../x" must not read outside
@@ -180,7 +186,6 @@ def export_policy_bundle(
             if re.fullmatch(r"v\d+", reward_version):
                 cand = project / "rewards" / f"{reward_version}.py"
                 if cand.is_file():
-                    reward_src = cand
                     files.append((cand, f"reward/{cand.name}"))
                 else:
                     warnings.append(

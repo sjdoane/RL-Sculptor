@@ -173,6 +173,49 @@ def test_launch_run_returns_summary(
     assert "1707.06347" in body["iterations"][0]["paper_refs"]
 
 
+def test_get_run_preserves_advanced_launch_params(
+    client: TestClient, tmp_projects_root: Path, fake_sculpt, monkeypatch
+) -> None:
+    """Run history must report the exact controls the UI actually launched."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-fake")
+    slug = _make_project_with_library(client, "AdvancedRunHistory")
+    launch_params = {
+        "behavior_goal": "cross the authored platform course",
+        "iterations": 4,
+        "no_kg": False,
+        "dry_run": False,
+        "training_iterations": 750,
+        "num_envs_override": 1024,
+        "device_override": "cuda:0",
+        "max_episode_steps": 500,
+        "playback_speed": 1.0,
+        "rollout_episodes": 2,
+        "render_width": 960,
+        "render_height": 540,
+        "seed": 42,
+        "fitness_metric": "go1_trot",
+        "fitness_mode": "steer",
+        "fitness_patience": 4,
+        "start_mode": "auto",
+    }
+    response = client.post(f"/projects/{slug}/runs", json=launch_params)
+    assert response.status_code == 202, response.text
+
+    run_id = response.json()["run_id"]
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        detail_response = client.get(f"/projects/{slug}/runs/{run_id}")
+        assert detail_response.status_code == 200, detail_response.text
+        detail = detail_response.json()
+        if detail["status"] == "completed":
+            break
+        time.sleep(0.05)
+    assert detail["status"] == "completed", detail
+
+    for field, expected in launch_params.items():
+        assert detail["params"][field] == expected, field
+
+
 def test_cannot_launch_two_concurrent_runs(
     client: TestClient, tmp_projects_root: Path, fake_sculpt, monkeypatch
 ) -> None:

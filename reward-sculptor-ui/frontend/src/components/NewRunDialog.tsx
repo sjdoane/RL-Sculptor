@@ -14,25 +14,41 @@ import type { ProjectDetail } from "@/lib/types";
 import { SPEC_METRIC_NAMES } from "@/lib/types";
 
 
-// ── Per-adapter expected seconds-per-cycle (S8 / §7.7) ───────────────
+// ── Per-adapter wall-clock model (S8 / §7.7) ─────────────────────────
 //
-// Rough wall-clock budget per outer sculpt iter, derived from the
-// envelope at the top of pickAdapterDefaults + real-world numbers in
-// CONTEXT.md. Used ONLY to warn the user before a long run — never
-// used to gate anything. Honest enough to give a useful number, loose
-// enough that the user doesn't anchor on it.
-//
-//   gym_sb3:        ~180 s/cycle (3 min)     — train + rollout + LLM
-//   mjlab_cartpole: ~60 s/cycle              — fast toy task
-//   mjlab_go1:      ~1320 s/cycle (22 min)   — Sam's observed Go1 at 1500 iters
-//   mjlab_g1:       ~1500 s/cycle (25 min)   — heavier humanoid
-//   mjlab_other:    ~600 s/cycle (10 min)    — conservative
-const SECONDS_PER_CYCLE: Record<string, number> = {
+// Used only for an honest pre-launch expectation, never as a gate.  mjlab
+// training is modeled from the controls that dominate runtime: PPO iterations
+// and parallel environment count, plus fixed rollout/LLM overhead.  Go1 is
+// calibrated from the 2026-07-20 authored-world showcase on an RTX 5070
+// Laptop: 750 iters × 1024 envs took ~34 min/cycle, plus ~3 min for the final
+// fresh best-policy evaluation.  The previous proportional heuristic reported
+// 44 min for the whole four-cycle job; the observed duration was 2 h 21 min.
+const LEGACY_SECONDS_PER_CYCLE: Record<string, number> = {
   gym_sb3: 180,
-  mjlab_cartpole: 60,
-  mjlab_go1: 1320,
-  mjlab_g1: 1500,
-  mjlab_other: 600,
+};
+
+const MJLAB_TIMING: Record<string, {
+  fixedSeconds: number;
+  secondsPerTrainingIter: number;
+  referenceEnvs: number;
+  finalEvalSeconds: number;
+}> = {
+  mjlab_cartpole: {
+    fixedSeconds: 20, secondsPerTrainingIter: 0.8,
+    referenceEnvs: 256, finalEvalSeconds: 20,
+  },
+  mjlab_go1: {
+    fixedSeconds: 450, secondsPerTrainingIter: 2.15,
+    referenceEnvs: 1024, finalEvalSeconds: 180,
+  },
+  mjlab_g1: {
+    fixedSeconds: 480, secondsPerTrainingIter: 2.6,
+    referenceEnvs: 1024, finalEvalSeconds: 210,
+  },
+  mjlab_other: {
+    fixedSeconds: 300, secondsPerTrainingIter: 1.5,
+    referenceEnvs: 1024, finalEvalSeconds: 150,
+  },
 };
 
 function humanizeSeconds(sec: number): string {
@@ -303,21 +319,32 @@ export function NewRunDialog({
   // total (the comment on the --dry-run checkbox promises "~50 s total").
   const etaSeconds = useMemo(() => {
     if (dryRun) return 50;
-    const perCycle = SECONDS_PER_CYCLE[defaults.kind] ?? 300;
-    const inner = typeof trainingIters === "number"
+    const timing = MJLAB_TIMING[defaults.kind];
+    if (isMjlab && timing) {
+      const innerIters = typeof trainingIters === "number"
+        ? trainingIters
+        : defaults.training_iterations;
+      const envs = typeof numEnvs === "number" ? numEnvs : defaults.num_envs;
+      // More parallel envs increase simulator work, but GPU batching keeps the
+      // scaling sublinear. Bound the ratio so a malformed transient UI value
+      // cannot produce a zero/negative estimate.
+      const envRatio = Math.max(0.125, envs / timing.referenceEnvs);
+      const envScale = Math.pow(envRatio, 0.35);
+      const perCycle = timing.fixedSeconds
+        + timing.secondsPerTrainingIter * innerIters * envScale;
+      const finalBestEval = fitnessMetric ? timing.finalEvalSeconds : 0;
+      return perCycle * iterations + finalBestEval;
+    }
+
+    const perCycle = LEGACY_SECONDS_PER_CYCLE[defaults.kind] ?? 300;
+    const innerScale = typeof trainingIters === "number"
       ? trainingIters / defaults.training_iterations
       : 1;
-    const envScale = isMjlab && typeof numEnvs === "number"
-      ? numEnvs / defaults.num_envs
-      : 1;
-    // LLM/rollout work is a fixed slice; training scales with the inner
-    // budget and parallel env count. This stays an estimate, but unlike the
-    // old calculation it responds to the launch controls the user changes.
-    const cycleScale = 0.2 + 0.8 * Math.max(0.1, inner) * Math.max(0.2, envScale);
-    return perCycle * iterations * cycleScale;
+    return perCycle * iterations * Math.max(0.1, innerScale);
   }, [
     dryRun, defaults.kind, defaults.num_envs,
-    defaults.training_iterations, isMjlab, iterations, numEnvs, trainingIters,
+    defaults.training_iterations, fitnessMetric, isMjlab, iterations,
+    numEnvs, trainingIters,
   ]);
   const eta = useMemo(() => formatEta(etaSeconds), [etaSeconds]);
   const isLongRun = etaSeconds >= 30 * 60; // 30 min

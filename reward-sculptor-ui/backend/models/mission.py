@@ -463,6 +463,10 @@ class StageIterationSummary(BaseModel):
     # None when `fitness` came from the legacy `_extract_objective_fitness`
     # scrape (no fitness.json at all for this iter).
     fitness_source: Optional[str] = None
+    # Project-level best-policy evaluation may leave one or more fresh-seed
+    # replay directories next to the ordinary rollout. Mission stages default
+    # to zero until they adopt the same artifact convention.
+    fresh_rollout_count: int = 0
 
 
 class StageIterPaperRef(BaseModel):

@@ -615,21 +615,34 @@ def get_run(
             type_="/problems/not-found",
         )
     summary = _run_summary(job)
-    # §Ship 21: stage runs don't have a top-level RunParams (the
-    # parent mission_execute owns those); synthesize a minimal one
-    # from the stage's recorded fields so RunDetail's existing shape
-    # holds. behavior_goal becomes the stage's goal_text.
+    # Rehydrate every recorded launch field for standalone runs.  The old
+    # minimal reconstruction kept only behavior/iterations/no_kg/dry_run, so
+    # the detail API claimed advanced UI values were null even while the
+    # durable subprocess log proved that training_iterations, num_envs,
+    # device, rollout, seed, and metric overrides were active.  Filter by the
+    # Pydantic model fields because job.params also contains runtime-only
+    # values such as cmd/control_file.
+    #
+    # §Ship 21: stage runs don't have a full top-level RunParams (the parent
+    # mission_execute owns those); missing fields simply retain model defaults
+    # and behavior_goal becomes the stage's goal_text.
     iters_for_params = int(
         job.params.get("iterations_requested")
         or job.params.get("iterations")
         or 1
     )
-    params = RunParams(
-        behavior_goal=str(job.params.get("behavior_goal") or ""),
-        iterations=iters_for_params,
-        no_kg=bool(job.params.get("no_kg") or False),
-        dry_run=bool(job.params.get("dry_run") or False),
-    )
+    params_payload = {
+        field_name: job.params[field_name]
+        for field_name in RunParams.model_fields
+        if field_name in job.params
+    }
+    params_payload.update({
+        "behavior_goal": str(job.params.get("behavior_goal") or ""),
+        "iterations": iters_for_params,
+        "no_kg": bool(job.params.get("no_kg") or False),
+        "dry_run": bool(job.params.get("dry_run") or False),
+    })
+    params = RunParams.model_validate(params_payload)
     iterations = [
         IterEventSummary(**it) for it in build_iterations_summary(job)
     ]
@@ -1055,6 +1068,11 @@ def list_project_iterations(
         fitness = _extract_objective_fitness(d, spec, evidence)
 
         rollout_path = d / "rollout" / "rollout.mp4"
+        fresh_rollout_count = sum(
+            1
+            for path in d.glob("rollout_fresh_*/rollout.mp4")
+            if path.is_file() and path.stat().st_size >= 2048
+        )
         # §D24 (F4): plain project-level runs never go through mission
         # stage selection, so this file won't exist here today — read it
         # anyway for symmetry with `list_stage_iterations` (same model,
@@ -1092,6 +1110,7 @@ def list_project_iterations(
             naturalness_flag=naturalness_flag,
             naturalness_hard_reject=naturalness_hard_reject,
             fitness_source=fitness_source,
+            fresh_rollout_count=fresh_rollout_count,
         ))
     return out
 
@@ -1129,6 +1148,50 @@ def get_project_iter_rollout(
                 f"iter {iter_index} has no rollout.mp4 in the project "
                 "runs tree (either it never rendered or the iter "
                 "errored before rollout capture)"
+            ),
+            type_="/problems/not-found",
+        )
+    return FileResponse(path, media_type="video/mp4")
+
+
+@router.get(
+    "/projects/{slug}/iterations/{iter_index}/fresh-rollouts/{fresh_index}",
+    response_class=FileResponse,
+    responses={
+        200: {"content": {"video/mp4": {}}},
+        404: {"model": ProblemDetail},
+    },
+)
+def get_project_iter_fresh_rollout(
+    slug: str,
+    iter_index: int,
+    fresh_index: int,
+    store: ProjectStore = Depends(get_store),
+) -> Any:
+    """Fresh-seed best-policy replay from durable project artifacts."""
+    detail = store.get(slug)
+    if detail is None:
+        return _problem(
+            status.HTTP_404_NOT_FOUND, "project not found",
+            detail=f"no project with slug {slug!r}",
+            type_="/problems/not-found",
+        )
+    if fresh_index < 0:
+        return _problem(
+            status.HTTP_404_NOT_FOUND, "fresh rollout not available",
+            detail="fresh rollout index must be non-negative",
+            type_="/problems/not-found",
+        )
+    path = (
+        Path(detail.project_dir) / "runs" / f"iter_{iter_index}"
+        / f"rollout_fresh_{fresh_index}" / "rollout.mp4"
+    )
+    if not path.is_file() or path.stat().st_size < 2048:
+        return _problem(
+            status.HTTP_404_NOT_FOUND, "fresh rollout not available",
+            detail=(
+                f"iter {iter_index} has no complete fresh rollout "
+                f"at index {fresh_index}"
             ),
             type_="/problems/not-found",
         )

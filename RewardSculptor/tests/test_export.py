@@ -102,6 +102,19 @@ def test_list_exportable_iters_ignores_empty_checkpoint(tmp_path):
     assert list_exportable_iters(project / "runs") == []
 
 
+def test_list_exportable_iters_prefers_authoritative_fitness_file(tmp_path):
+    project = _make_project(tmp_path, iters=[0])
+    iteration = project / "runs" / "iter_0"
+    (iteration / "fitness.json").write_text(json.dumps({"fitness": 0.42}))
+    rollout = iteration / "rollout"
+    rollout.mkdir()
+    (rollout / "behavior.json").write_text(json.dumps({"fitness": 0.11}))
+
+    rows = list_exportable_iters(project / "runs")
+
+    assert rows[0]["fitness"] == pytest.approx(0.42)
+
+
 # ── bundle building (rsl_rl path, real fixture) ────────────────────────────
 
 def test_export_bundle_contents_and_manifest(tmp_path):

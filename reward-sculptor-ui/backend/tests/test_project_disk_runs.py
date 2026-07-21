@@ -330,6 +330,42 @@ def test_project_iter_rollout_200(
     assert r.content == b"v" * 4096
 
 
+def test_project_iter_fresh_rollout_is_counted_and_served(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    iteration = _seed_project_iter(project_dir, 4, with_rollout=True)
+    fresh = iteration / "rollout_fresh_0"
+    fresh.mkdir()
+    (fresh / "rollout.mp4").write_bytes(b"f" * 4096)
+
+    rows = client.get(f"/projects/{slug}/iterations").json()
+    assert rows[0]["fresh_rollout_count"] == 1
+    response = client.get(f"/projects/{slug}/iterations/4/fresh-rollouts/0")
+    assert response.status_code == 200
+    assert response.content == b"f" * 4096
+
+
+def test_project_iter_fresh_rollout_rejects_missing_or_truncated(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    iteration = _seed_project_iter(project_dir, 1)
+    fresh = iteration / "rollout_fresh_0"
+    fresh.mkdir()
+    (fresh / "rollout.mp4").write_bytes(b"f" * 100)
+
+    rows = client.get(f"/projects/{slug}/iterations").json()
+    assert rows[0]["fresh_rollout_count"] == 0
+    for index in (-1, 0, 2):
+        response = client.get(
+            f"/projects/{slug}/iterations/1/fresh-rollouts/{index}"
+        )
+        assert response.status_code == 404
+
+
 def test_project_iter_rollout_404_missing_and_truncated(
     client: TestClient, tmp_projects_root: Path,
 ) -> None:

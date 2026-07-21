@@ -41,9 +41,13 @@ Open **Projects → Lab Call — Authored Parkour**. It is configured as:
 - Task: `Mjlab-Velocity-Rough-Unitree-Go1`
 - Device: `cuda:0`
 
-The **World** tab should show `Authoritative world tuple`, selection `v1`, and
-`Verified for launch`. The scene is a five-element ordered parkour course with
-three ascending platforms and two physical gaps.
+The **World** tab should show `Authoritative world tuple` and `Verified for
+launch`. The authored World remains `v1`; the atomic tuple-selection version
+may be higher because each promoted reward/environment revision advances its
+lineage. The scene is a five-element ordered parkour course with three
+ascending platforms and two authored gap intervals. The gaps are spacing
+between platforms rather than hidden collision geometry, which the World UI
+states explicitly.
 
 If the prepared project is unavailable, create it entirely in the UI with the
 values above, then follow the world-authoring recipe below.
@@ -96,7 +100,9 @@ From **World**, choose **Train this world**. Use these exact settings:
 
 The readiness rail must show API key configured, `cuda:0 · mjlab + rsl_rl
 ready`, and the authored world tuple verified. The estimated time should be
-about 44 minutes on the demo laptop. Choose **Launch** once.
+roughly 2 hours 20 minutes on the demo laptop. The completed rehearsal took
+2 hours 21 minutes 34 seconds. Choose **Launch** once and keep the laptop awake
+and on AC power.
 
 `go1_trot` is the dependable showcase metric: it scores forward locomotion and
 stability while the authored task and environment enforce the ordered course.
@@ -134,6 +140,28 @@ If time permits, open **Robot Library** to show that authoring is capability-
 driven and not keyed to Go1 or G1. Gym robots, quadrupeds, humanoids, and arm
 robots share the same core world-selection and launch contract.
 
+## Completed rehearsal result
+
+The known-good run is `job_434b10c7d3fd8eb2` in **Lab Call — Authored
+Parkour**. It completed all four requested cycles and then re-evaluated the
+selected best policy on fresh seed `90001`:
+
+- fitness progressed `0.00159 → 0.20701 → 0.26848 → 0.23281`;
+- iteration 4 (displayed as the third new cycle in this continued project) was
+  selected as the best atomic artifact tuple;
+- the fresh held-out score was `0.25805`, close to the selected score of
+  `0.26848`;
+- the best rollout stayed upright and showed coherent sustained locomotion;
+  the fresh replay reproduced that behavior;
+- the evidence does **not** yet justify claiming that Go1 visibly cleared the
+  ascending platforms. Present it as a successful end-to-end authored-world
+  optimization run with reproducible locomotion progress and an honest metric
+  firewall, not as solved parkour.
+
+For the call, show the best rollout and its fresh replay from **Results**. The
+durable best artifacts are also retained under the project's local data root,
+but no terminal access is required to present them.
+
 ## Recovery guide
 
 - **Out of memory:** stop from the Training header, relaunch, and change
@@ -153,7 +181,7 @@ robots share the same core world-selection and launch contract.
 
 - Keep the laptop on AC power and disable sleep for the call window.
 - Start `./run.sh` and verify the dashboard reports no orphaned active job.
-- Open the prepared project and confirm World selection v1 is verified.
+- Open the prepared project and confirm the World tuple is verified.
 - Confirm at least one completed rollout video plays in Training or Results.
 - Do not re-author or relaunch the completed project immediately before the call.
 - Keep one known-good result open in a browser tab as the presentation fallback.

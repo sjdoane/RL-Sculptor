@@ -1048,6 +1048,8 @@ export interface StageIteration {
   // it directly, "log_backfill" when a later backfill pass recovered it
   // from run logs after the fact, null when neither ran.
   fitness_source: "live" | "log_backfill" | null;
+  /** Fresh held-out replay videos stored for selected-best evaluation. */
+  fresh_rollout_count: number;
 }
 
 // GET .../stages/{stage}/selection — the stage's keep-best decision
