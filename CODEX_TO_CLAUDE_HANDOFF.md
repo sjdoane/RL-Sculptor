@@ -1095,3 +1095,22 @@ at the 0.3 realism floor, and Worlds with no installed command surface remain
 unchanged. Detection uses schema/runtime-adjustment semantics only; there is no
 robot name or simulator task-id keying. Focused adapter/compiler/runtime tests:
 58 passed. Scoped Ruff, compileall, and `git diff --check` passed.
+
+## Interrupted-train policy recovery 2026-07-22 (Codex)
+
+The UI-launched showcase run ended during outer iteration 3 when the backend's
+reload watcher reacted to an urgent core edit. It had valid rsl_rl checkpoints
+through `iter_3/logs/model_600.pt`, but no promoted `checkpoint.pt`; the old
+resume path therefore discarded that current-iteration policy and warm-started
+again from the previous outer iteration.
+
+`_train_or_resume` now scans an incomplete iteration's existing
+`logs/model_<iteration>.pt` files newest-first, verifies each with `torch.load`,
+and uses the newest parseable policy as the warm start. A torn newest file falls
+back to the next valid model. The recovery emits `partial_train_recovered` with
+the exact source and any superseded prior-iteration warm start. Adapters without
+the existing `init_policy_path` contract remain on their prior path. Focused
+resume/warm-start tests: 57 passed; compileall and `git diff --check` passed.
+Whole-file Ruff still reports unrelated pre-existing unused imports/locals in
+the 7k-line `sculpt.py` and its historical test module; no finding points at the
+new recovery code.

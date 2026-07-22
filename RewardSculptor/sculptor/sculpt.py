@@ -897,6 +897,41 @@ def _alive_reward_keys(reward_path: Path) -> set[str]:
 
 
 # ── Per-phase resume helpers ─────────────────────────────────────────────
+def _latest_valid_partial_policy(iter_dir: Path) -> Optional[Path]:
+    """Return the newest parseable intermediate policy in an incomplete iter.
+
+    MJLab/rsl_rl writes ``logs/model_<iteration>.pt`` throughout a long train,
+    while Sculptor promotes ``checkpoint.pt`` only after the subprocess exits
+    successfully. A backend reload or machine interruption must therefore
+    recover the newest valid intermediate policy instead of discarding hours of
+    learning and falling back to the previous outer iteration.
+
+    This remains adapter-neutral at the orchestration boundary: it recognizes
+    the existing rsl_rl filename convention and returns ``None`` for every
+    other adapter. Corrupt/truncated candidates are skipped newest-first.
+    """
+    logs_dir = iter_dir / "logs"
+    if not logs_dir.is_dir():
+        return None
+    candidates: list[tuple[int, Path]] = []
+    for path in logs_dir.glob("model_*.pt"):
+        suffix = path.stem.removeprefix("model_")
+        if suffix.isdigit() and path.stat().st_size > 0:
+            candidates.append((int(suffix), path))
+    if not candidates:
+        return None
+
+    import torch as _torch
+
+    for _iteration, path in sorted(candidates, reverse=True):
+        try:
+            _torch.load(path, map_location="cpu", weights_only=False)
+        except Exception:  # noqa: BLE001 -- interrupted save; try older model
+            continue
+        return path
+    return None
+
+
 def _train_or_resume(
     *, adapter, iter_index: int, iter_dir: Path,
     reward_module_path: Path, steps: int, seed: int,
@@ -969,7 +1004,23 @@ def _train_or_resume(
             logs_path=iter_dir / "logs",
         )
 
-    # Fresh training run — no checkpoint or all candidates corrupt.
+    # Fresh/recovered training run — no promoted checkpoint or all promoted
+    # candidates corrupt. Prefer this iter's newest valid intermediate policy
+    # over a previous-iter warm start: it was trained under the exact current
+    # reward/seed/world tuple and is strictly closer to the interrupted phase.
+    partial_policy = _latest_valid_partial_policy(iter_dir)
+    if partial_policy is not None:
+        superseded = init_policy_path
+        init_policy_path = partial_policy
+        _emit_event({
+            "type": "partial_train_recovered",
+            "iter": iter_index,
+            "checkpoint": str(partial_policy),
+            "superseded_warm_start": (
+                str(superseded) if superseded is not None else None
+            ),
+        })
+
     train_kwargs: dict[str, Any] = dict(
         reward_module_path=reward_module_path,
         output_dir=iter_dir,

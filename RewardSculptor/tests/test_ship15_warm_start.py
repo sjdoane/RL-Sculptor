@@ -190,6 +190,64 @@ def test_train_or_resume_forwards_init_policy_path_to_supporting_adapter(
     assert captured["init_policy_path"] == init_ckpt
 
 
+def test_train_or_resume_prefers_latest_valid_partial_policy(
+    tmp_path: Path, monkeypatch,
+):
+    """An interrupted current iter must not discard its newest valid model."""
+    import torch
+    from sculptor import sculpt as sculpt_mod
+
+    captured: dict = {}
+    adapter = _make_sculpt_adapter_with_kwarg(captured)
+    iter_dir = tmp_path / "iter_3"
+    logs = iter_dir / "logs"
+    logs.mkdir(parents=True)
+    torch.save({"model": "older"}, logs / "model_550.pt")
+    torch.save({"model": "newest"}, logs / "model_600.pt")
+    previous_iter = tmp_path / "iter_2.pt"
+    previous_iter.write_bytes(b"stub")
+    events: list[dict] = []
+    monkeypatch.setattr(sculpt_mod, "_emit_event", events.append)
+
+    sculpt_mod._train_or_resume(
+        adapter=adapter, iter_index=3, iter_dir=iter_dir,
+        reward_module_path=tmp_path / "v3.py", steps=750, seed=45,
+        init_policy_path=previous_iter,
+    )
+
+    assert captured["init_policy_path"] == logs / "model_600.pt"
+    recovered = [e for e in events if e.get("type") == "partial_train_recovered"]
+    assert recovered == [{
+        "type": "partial_train_recovered",
+        "iter": 3,
+        "checkpoint": str(logs / "model_600.pt"),
+        "superseded_warm_start": str(previous_iter),
+    }]
+
+
+def test_train_or_resume_skips_corrupt_newest_partial_policy(
+    tmp_path: Path,
+):
+    """A torn newest save falls back to the preceding parseable checkpoint."""
+    import torch
+    from sculptor.sculpt import _train_or_resume
+
+    captured: dict = {}
+    adapter = _make_sculpt_adapter_with_kwarg(captured)
+    iter_dir = tmp_path / "iter_1"
+    logs = iter_dir / "logs"
+    logs.mkdir(parents=True)
+    torch.save({"model": "valid"}, logs / "model_100.pt")
+    (logs / "model_150.pt").write_bytes(b"torn")
+
+    _train_or_resume(
+        adapter=adapter, iter_index=1, iter_dir=iter_dir,
+        reward_module_path=tmp_path / "v1.py", steps=200, seed=43,
+    )
+
+    assert captured["init_policy_path"] == logs / "model_100.pt"
+
+
 def test_train_or_resume_drops_init_policy_path_for_unsupported_adapter(
     tmp_path: Path, monkeypatch,
 ):
