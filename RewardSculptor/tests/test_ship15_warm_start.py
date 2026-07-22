@@ -193,7 +193,8 @@ def test_train_or_resume_forwards_init_policy_path_to_supporting_adapter(
 def test_train_or_resume_prefers_latest_valid_partial_policy(
     tmp_path: Path, monkeypatch,
 ):
-    """An interrupted current iter must not discard its newest valid model."""
+    """A restarted counter must not hide the newest valid recovery model."""
+    import os
     import torch
     from sculptor import sculpt as sculpt_mod
 
@@ -203,7 +204,11 @@ def test_train_or_resume_prefers_latest_valid_partial_policy(
     logs = iter_dir / "logs"
     logs.mkdir(parents=True)
     torch.save({"model": "older"}, logs / "model_550.pt")
-    torch.save({"model": "newest"}, logs / "model_600.pt")
+    torch.save({"model": "old_high_counter"}, logs / "model_600.pt")
+    torch.save({"model": "newest_after_restart"}, logs / "model_50.pt")
+    os.utime(logs / "model_550.pt", ns=(1_000_000_000, 1_000_000_000))
+    os.utime(logs / "model_600.pt", ns=(2_000_000_000, 2_000_000_000))
+    os.utime(logs / "model_50.pt", ns=(3_000_000_000, 3_000_000_000))
     previous_iter = tmp_path / "iter_2.pt"
     previous_iter.write_bytes(b"stub")
     events: list[dict] = []
@@ -215,12 +220,12 @@ def test_train_or_resume_prefers_latest_valid_partial_policy(
         init_policy_path=previous_iter,
     )
 
-    assert captured["init_policy_path"] == logs / "model_600.pt"
+    assert captured["init_policy_path"] == logs / "model_50.pt"
     recovered = [e for e in events if e.get("type") == "partial_train_recovered"]
     assert recovered == [{
         "type": "partial_train_recovered",
         "iter": 3,
-        "checkpoint": str(logs / "model_600.pt"),
+        "checkpoint": str(logs / "model_50.pt"),
         "superseded_warm_start": str(previous_iter),
     }]
 

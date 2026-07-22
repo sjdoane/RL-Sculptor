@@ -913,17 +913,23 @@ def _latest_valid_partial_policy(iter_dir: Path) -> Optional[Path]:
     logs_dir = iter_dir / "logs"
     if not logs_dir.is_dir():
         return None
-    candidates: list[tuple[int, Path]] = []
+    candidates: list[tuple[int, int, Path]] = []
     for path in logs_dir.glob("model_*.pt"):
         suffix = path.stem.removeprefix("model_")
         if suffix.isdigit() and path.stat().st_size > 0:
-            candidates.append((int(suffix), path))
+            stat = path.stat()
+            # rsl_rl restarts its model counter when a training subprocess is
+            # resumed.  An older model_600.pt can therefore coexist with a
+            # newly-written model_50.pt.  Filesystem write time, not the
+            # counter embedded in the name, identifies the newest recovery
+            # point; the counter is only a deterministic tie-breaker.
+            candidates.append((stat.st_mtime_ns, int(suffix), path))
     if not candidates:
         return None
 
     import torch as _torch
 
-    for _iteration, path in sorted(candidates, reverse=True):
+    for _mtime_ns, _iteration, path in sorted(candidates, reverse=True):
         try:
             _torch.load(path, map_location="cpu", weights_only=False)
         except Exception:  # noqa: BLE001 -- interrupted save; try older model
