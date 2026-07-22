@@ -1042,3 +1042,8 @@ shows four alternating green waypoint disks plus the larger finish disk;
 selecting a disk highlights it and exposes its exact authored parameters.
 Frontend typecheck, production build, `git diff --check`, and live UI visual /
 interaction checks passed before commit.
+
+The two pre-existing React Router v7 future-flag warnings were also removed by
+opting `BrowserRouter` into `v7_startTransition` and `v7_relativeSplatPath`.
+A fresh live Training tab then reported an empty warning/error console; the
+frontend typecheck and production build passed for this follow-up as well.
