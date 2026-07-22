@@ -9,8 +9,11 @@ import cost, per the lazy-import rule in MJLAB_PIVOT_DESIGN §7.
 
 Reward injection: when `--reward-module-path` is passed, the runner
 adds `SculptorRewardTerm` and attenuates task-shipped terms to a 0.3x
-realism floor. `cfg.scale_rewards_by_dt` is set to False so the reward
-module's raw per-step return survives without dt-scaling. When
+realism floor. It also adds a task-independent survival guard and explicit
+non-timeout termination penalty. Without those terms, an early policy can
+learn to fall immediately to avoid accumulating realism penalties, making a
+less-negative return look like progress. `cfg.scale_rewards_by_dt` is set to
+False so the reward module's raw per-step return survives without dt-scaling. When
 `--reward-module-path` is omitted, training uses the task's default
 reward terms unchanged (useful for the GPU smoke test).
 """
@@ -32,6 +35,41 @@ from typing import Any
 # the term more than once). `None` disables capture — the `__call__` path
 # stays allocation-free when no sink is active.
 _COMPONENT_SINK: dict[str, list[float]] | None = None
+
+# §termination economics: custom rewards are deliberately composed with a
+# subset of each task's native realism rewards. Those priors contain penalties
+# (action rate, joint limits, collision costs, ...) that can make an untrained
+# policy's per-step return negative. If failure ends the episode without a
+# penalty, PPO can improve the episodic return simply by failing sooner. A
+# constant survival term does not change the ordering of equal-length
+# successful trajectories; it only makes premature non-timeout termination an
+# economically dominated escape. The terminal penalty adds a clear final-step
+# separation and is intentionally larger than a single survival step.
+_SCULPTOR_SURVIVAL_WEIGHT = 1.0
+_SCULPTOR_FAILURE_WEIGHT = -5.0
+
+
+def _install_sculptor_termination_economics(
+    rewards: dict[str, Any],
+    reward_term_cfg: Any,
+    mdp: Any,
+) -> None:
+    """Install robot/task-agnostic survival and failure reward terms.
+
+    ``mdp.is_terminated`` excludes time-limit terminations, so completing a
+    full episode is never punished. Fixed-base tasks with no failure
+    termination simply receive the same constant horizon offset in every
+    trajectory. Names are reserved under the ``sculptor_`` prefix so authored
+    reward components cannot shadow the guard.
+    """
+    rewards["sculptor_survival"] = reward_term_cfg(
+        func=mdp.is_alive,
+        weight=_SCULPTOR_SURVIVAL_WEIGHT,
+    )
+    rewards["sculptor_failure"] = reward_term_cfg(
+        func=mdp.is_terminated,
+        weight=_SCULPTOR_FAILURE_WEIGHT,
+    )
 
 
 def _to_host_numpy(value: Any) -> Any:
@@ -1531,6 +1569,7 @@ def _cmd_train(args: argparse.Namespace) -> None:
 
     # Reward injection (optional).
     if args.reward_module_path:
+        from mjlab.envs import mdp as envs_mdp
         from mjlab.managers.reward_manager import RewardTermCfg
 
         env_cfg.scale_rewards_by_dt = False
@@ -1570,9 +1609,21 @@ def _cmd_train(args: argparse.Namespace) -> None:
             weight=1.0,
             params={"reward_module_path": args.reward_module_path},
         )
+        _install_sculptor_termination_economics(
+            env_cfg.rewards,
+            RewardTermCfg,
+            envs_mdp,
+        )
         print(
             f"[runner] injected SculptorRewardTerm; {sum(1 for t in env_cfg.rewards.values() if t and getattr(t, 'weight', 0) == 0)} default terms zeroed",
             file=sys.stderr, flush=True,
+        )
+        print(
+            "[runner] installed termination economics: "
+            f"survival={_SCULPTOR_SURVIVAL_WEIGHT:+g}/step, "
+            f"non-timeout failure={_SCULPTOR_FAILURE_WEIGHT:+g}",
+            file=sys.stderr,
+            flush=True,
         )
 
     env = ManagerBasedRlEnv(env_cfg, device=args.device)

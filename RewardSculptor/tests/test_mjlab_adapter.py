@@ -108,6 +108,46 @@ def test_scalar_policy_std_guard_ignores_other_distributions() -> None:
     assert _install_scalar_std_guard(runner) is None
 
 
+def test_sculpted_reward_installs_non_timeout_termination_economics() -> None:
+    """A custom reward cannot improve return merely by ending sooner."""
+    from types import SimpleNamespace
+
+    from sculptor.adapters._mjlab_runner import (
+        _SCULPTOR_FAILURE_WEIGHT,
+        _SCULPTOR_SURVIVAL_WEIGHT,
+        _install_sculptor_termination_economics,
+    )
+
+    class FakeRewardTermCfg:
+        def __init__(self, *, func, weight):
+            self.func = func
+            self.weight = weight
+
+    def is_alive(_env):
+        return "alive"
+
+    def is_terminated(_env):
+        return "terminated"
+
+    native = object()
+    rewards = {"native_task_term": native}
+    mdp = SimpleNamespace(is_alive=is_alive, is_terminated=is_terminated)
+
+    _install_sculptor_termination_economics(
+        rewards,
+        FakeRewardTermCfg,
+        mdp,
+    )
+
+    assert rewards["native_task_term"] is native
+    assert rewards["sculptor_survival"].func is is_alive
+    assert rewards["sculptor_survival"].weight == _SCULPTOR_SURVIVAL_WEIGHT
+    assert rewards["sculptor_survival"].weight > 0
+    assert rewards["sculptor_failure"].func is is_terminated
+    assert rewards["sculptor_failure"].weight == _SCULPTOR_FAILURE_WEIGHT
+    assert rewards["sculptor_failure"].weight < -_SCULPTOR_SURVIVAL_WEIGHT
+
+
 def test_component_probe_dataclass_shape() -> None:
     p = ComponentProbe(ok=True, components={"x": 1.0}, total=1.0, error=None)
     assert p.ok is True
