@@ -18,7 +18,9 @@ import pytest
 from sculptor.diagnose import Diagnosis, ProposedEdit
 from sculptor.edit import (
     EditValidationError,
+    _call_compute_reward,
     _call_compute_reward_batched,
+    _current_reward_component_keys,
     _extract_formula_identifiers,
     _pre_validate,
     apply_edits,
@@ -717,6 +719,34 @@ def test_batched_preflight_preserves_vector_info_shapes():
         match="shape.*invalid|invalid.*shape",
     ):
         _call_compute_reward_batched(_BadVectorReward(), contract)
+
+
+def test_legacy_parent_vector_fallback_is_not_used_for_new_validation():
+    """A broken parent remains inspectable solely so the LLM can repair it."""
+    from sculptor.adapters.base import RewardContract
+
+    class _LegacyParent:
+        @staticmethod
+        def compute_reward(state, action, next_state, info):
+            # Works for legacy feature-only (3,), fails for exact (1, 3).
+            values = [float(value) for value in info["relative"]]
+            magnitude = sum(value * value for value in values) ** 0.5
+            return magnitude, {"distance": magnitude}
+
+    contract = RewardContract(
+        observation_space_spec=None,
+        action_space_spec=None,
+        expected_info_keys=["relative"],
+        supports_batched=True,
+        state_schema={"actuator_force": (2,)},
+        info_schema={"relative": (3,)},
+    )
+
+    with pytest.raises(EditValidationError):
+        _call_compute_reward(_LegacyParent(), contract)
+    assert _current_reward_component_keys(_LegacyParent(), contract) == {
+        "distance",
+    }
 
 
 def test_build_dummy_inputs_gym_path_unchanged():

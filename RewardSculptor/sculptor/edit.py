@@ -229,7 +229,9 @@ def _dummy_from_space(space) -> Any:
     return np.zeros((1,), dtype=np.float32)
 
 
-def _build_dummy_inputs(contract) -> tuple[Any, Any, Any, dict]:
+def _build_dummy_inputs(
+    contract, *, info_leading_batch: bool = True,
+) -> tuple[Any, Any, Any, dict]:
     """Synthesize dummy inputs matching the reward's expected shape.
 
     Two contract flavors:
@@ -275,12 +277,16 @@ def _build_dummy_inputs(contract) -> tuple[Any, Any, Any, dict]:
         # does `info["fallen"].to(device)` or arithmetic with it.
         info_keys = list(contract.expected_info_keys or [])
         info_schema = getattr(contract, "info_schema", None) or {}
-        info = {
-            key: torch.zeros(
-                (1, *tuple(info_schema.get(key, ()))), dtype=torch.float32,
-            )
-            for key in info_keys
-        }
+        info: dict[str, Any] = {}
+        for key in info_keys:
+            feature_shape = tuple(info_schema.get(key, ()))
+            if info_leading_batch:
+                shape = (1, *feature_shape)
+            else:
+                # Legacy scalar rewards consumed a feature vector directly,
+                # but still expected scalar fields as one-element tensors.
+                shape = feature_shape or (1,)
+            info[key] = torch.zeros(shape, dtype=torch.float32)
         return state, action, next_state, info
     # Gym-style path unchanged (gym_sb3 uses numpy throughout).
     state = _dummy_from_space(contract.observation_space_spec)
@@ -290,8 +296,11 @@ def _build_dummy_inputs(contract) -> tuple[Any, Any, Any, dict]:
     return state, action, next_state, info
 
 
-def _call_compute_reward(mod, contract) -> tuple[float, dict]:
-    s, a, ns, info = _build_dummy_inputs(contract)
+def _call_compute_reward(
+    mod, contract, *, info_leading_batch: bool = True,
+) -> tuple[float, dict]:
+    s, a, ns, info = _build_dummy_inputs(
+        contract, info_leading_batch=info_leading_batch)
     try:
         out = mod.compute_reward(s, a, ns, info)
     except Exception as e:  # noqa: BLE001 — module bug → retryable
@@ -741,7 +750,23 @@ def _call_compute_reward_batched(mod, contract) -> None:
 
 
 def _current_reward_component_keys(current_module, contract) -> set[str]:
-    _, components = _call_compute_reward(current_module, contract)
+    try:
+        _, components = _call_compute_reward(current_module, contract)
+    except EditValidationError as exact_shape_error:
+        # Migration-only escape hatch: a parent authored before info_schema
+        # existed may understand a vector feature as shape (3,) but not the
+        # runtime-faithful single-env batch shape (1, 3). We still need its
+        # component names in order to prompt a repair. Newly generated code
+        # never gets this fallback: _post_validate below uses the strict
+        # exact-shape call plus the N=2 batched probe.
+        info_schema = getattr(contract, "info_schema", None) or {}
+        if not any(tuple(shape) for shape in info_schema.values()):
+            raise
+        try:
+            _, components = _call_compute_reward(
+                current_module, contract, info_leading_batch=False)
+        except EditValidationError:
+            raise exact_shape_error
     return set(components.keys())
 
 
