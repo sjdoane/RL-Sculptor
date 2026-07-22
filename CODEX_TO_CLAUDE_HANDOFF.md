@@ -936,3 +936,17 @@ the UI/runtime path.
 Verification already completed for the two UI commits: frontend typecheck and
 production build passed after both `433aed0` and `0e47450`; `git diff --check`
 was clean. No additional automated tests were launched during the live run.
+
+## Prompt-only abstract validator expansion 2026-07-22 (Codex)
+
+Objective-metric validation now uses the independently compiled, embodiment-
+neutral `ABSTRACT_OBJECTIVE` trace as the competent positive for every novel
+goal and every compound goal when no stored reference trajectory exists, not
+only for traversal/parkour. The same trace is composed with the authored-world
+competent channel fixture, so physical motion and task-state completion must
+agree. Recognized single-skill goals retain their hardened fixed archetypes;
+real references remain stronger evidence when present. `meta.json` now persists
+the exact abstract program plus `stored_trajectory_required: false`, making the
+prompt-only validator basis visible and auditable from UI artifacts. No tests
+were run, per Sam's explicit emergency instruction; only `git diff --check` was
+performed.
