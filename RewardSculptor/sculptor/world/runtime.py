@@ -312,7 +312,7 @@ class WorldChannelRuntime:
             value = self._entity_state(str(source["entity"]), suffix)
         elif producer == "region_relative":
             center = _center3(self.zones[str(source["region"])])
-            value = center - self._robot_position()
+            value = center - self._local_position(self._robot_position())
         elif producer == "object_region_distance":
             value = self._region_distance(
                 str(source["object"]), str(source["region"]))
@@ -521,7 +521,7 @@ class TorchWorldRewardRuntime:
                     raise WorldRuntimeError(f"unknown entity channel {spec.name!r}")
                 value = self._entity_state(str(source["entity"]), suffix)
             elif producer == "region_relative":
-                position = self._robot_position()
+                position = self._local_position(self._robot_position())
                 value = self._zone_center(
                     str(source["region"]), dtype=position.dtype) - position
             elif producer in {"object_region_distance", "robot_region_distance"}:

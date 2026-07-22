@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 from pathlib import Path
+from types import SimpleNamespace
 
 import mujoco
 import numpy as np
@@ -12,7 +13,10 @@ from mjlab.scene import Scene, SceneCfg
 
 from sculptor.world.compiler import (
     ResolvedEvaluation,
+    _install_task_observations,
+    _reconcile_waypoint_course,
     apply_world_selection,
+    compile_task_runtime,
     compile_world,
     install_materialized_terrain_factory,
     materialized_terrain_types,
@@ -146,6 +150,90 @@ def test_generated_compilation_is_deterministic_and_robot_agnostic() -> None:
     assert sensor.secondary_policy == "first"
     assert sensor.secondary.entity == "ball"
     assert arm.robot.capability_id == "yam:parallel_gripper"
+
+
+def test_authored_task_observations_reach_actor_and_critic() -> None:
+    """The manifest observation contract must change the policy input."""
+    import torch
+    from mjlab.managers.observation_manager import ObservationGroupCfg
+
+    world = _world()
+    task = _task()
+    robot = resolve_robot_capability("unitree_g1:base")
+    runtime = compile_task_runtime(world, task, robot)
+    cfg = SimpleNamespace(observations={
+        "actor": ObservationGroupCfg(terms={}),
+        "critic": ObservationGroupCfg(terms={}),
+    })
+    _install_task_observations(
+        cfg, runtime, zones=world["shared"]["zones"], robot=robot)
+
+    expected = {"authored_object__ball", "authored_region__goal"}
+    assert expected <= set(cfg.observations["actor"].terms)
+    assert expected <= set(cfg.observations["critic"].terms)
+
+    class Scene(dict):
+        pass
+
+    scene = Scene({
+        "robot": SimpleNamespace(data=SimpleNamespace(
+            root_link_pos_w=torch.tensor([[11.0, 20.0, 0.7]]),
+            root_link_quat_w=torch.tensor([[1.0, 0.0, 0.0, 0.0]]),
+        )),
+        "ball": SimpleNamespace(data=SimpleNamespace(
+            root_link_pos_w=torch.tensor([[12.0, 21.0, 0.5]]),
+        )),
+    })
+    scene.env_origins = torch.tensor([[10.0, 20.0, 0.0]])
+    env = SimpleNamespace(scene=scene)
+
+    region_cfg = cfg.observations["actor"].terms["authored_region__goal"]
+    object_cfg = cfg.observations["actor"].terms["authored_object__ball"]
+    torch.testing.assert_close(
+        region_cfg.func(env, **region_cfg.params),
+        torch.tensor([[-0.4, 0.0, -0.5]]),
+    )
+    torch.testing.assert_close(
+        object_cfg.func(env, **object_cfg.params),
+        torch.tensor([[1.0, 1.0, -0.2]]),
+    )
+
+
+def test_explicit_waypoint_zones_align_commands_without_materialized_course() -> None:
+    """A slalom made from named zones is still a fixed waypoint course."""
+    ranges = SimpleNamespace(
+        lin_vel_x=(-1.0, 1.0), lin_vel_y=(-1.0, 1.0),
+        ang_vel_z=(-0.5, 0.5), heading=(-3.14, 3.14),
+    )
+    command = SimpleNamespace(
+        ranges=ranges, heading_command=True, rel_standing_envs=0.1,
+        rel_heading_envs=1.0, rel_forward_envs=0.0,
+    )
+    reset = SimpleNamespace(params={
+        "pose_range": {"x": (-1.0, 1.0), "y": (-1.0, 1.0),
+                       "yaw": (-3.14, 3.14)},
+    })
+    env_cfg = SimpleNamespace(
+        events={"reset_base": reset}, commands={"twist": command},
+        curriculum={"command_vel": object()},
+    )
+    manifest = SimpleNamespace(
+        task_shared={"goal": {
+            "type": "waypoint_sequence",
+            "waypoints": ["waypoint_01", "finish"],
+        }},
+        course=(),
+    )
+
+    adjustments = _reconcile_waypoint_course(env_cfg, manifest, train=True)
+
+    assert ranges.lin_vel_x == (0.45, 1.0)
+    assert ranges.lin_vel_y == (0.0, 0.0)
+    assert ranges.ang_vel_z == (0.0, 0.0)
+    assert ranges.heading is None
+    assert reset.params["pose_range"]["yaw"] == (-0.08, 0.08)
+    assert "command_vel" not in env_cfg.curriculum
+    assert any("forward course traversal" in item for item in adjustments)
 
 
 def test_materialized_terrain_replays_exact_heightfield(tmp_path: Path) -> None:

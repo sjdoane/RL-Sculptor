@@ -950,3 +950,22 @@ the exact abstract program plus `stored_trajectory_required: false`, making the
 prompt-only validator basis visible and auditable from UI artifacts. No tests
 were run, per Sam's explicit emergency instruction; only `git diff --check` was
 performed.
+
+## Authored-world policy observability fix 2026-07-22 (Codex)
+
+The first post-shape-fix G1 slalom training run was stopped after a read-only
+audit proved it could not learn the authored route: TaskSpec observation
+bindings were persisted but never installed into MJLab actor/critic inputs;
+explicit waypoint-zone routes skipped reset/command alignment whenever the
+obstacle `course` list was empty; and region-relative reward channels mixed
+local zone coordinates with replicated world-space robot positions. The core
+compiler/runtime now installs body-frame region, object, semantic end-effector,
+and authored height-scan observations for every compatible embodiment in both
+train and evaluation, recognizes explicit named waypoint routes for alignment,
+and localizes NumPy/Torch region channels by `env_origins`.
+
+Evidence: focused suites 58 passed; GPU runtime construction on the real G1
+selection produced actor shape `(2, 168)` with five authored region vectors and
+the 54-ray authored scan, command ranges `(0.45,1.0)/(0,0)/(0,0)`, no command
+curriculum, and finite `(2,3)` finish-relative samples. The invalid run
+`job_08a12eb8b01dea07` was stopped before relaunch.

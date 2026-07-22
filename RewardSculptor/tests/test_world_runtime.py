@@ -128,3 +128,35 @@ def test_torch_reward_runtime_never_exposes_metric_only_channels() -> None:
     assert "contact__desired__0" in info
     assert "goal__score__success" not in info
     assert "goal__score__inside" not in info
+
+
+def test_region_relative_channels_are_local_to_each_environment_origin() -> None:
+    """Replicated worlds must expose the same local goal vector in every env."""
+    torch = pytest.importorskip("torch")
+    runtime, ball = _runtime(num_envs=2)
+    origins = np.asarray(
+        [[0.0, 0.0, 0.0], [10.0, 20.0, 0.0]], dtype=np.float32)
+    robot_local = np.asarray([1.0, 2.0, 0.0], dtype=np.float32)
+    ball_local = np.asarray([4.0, 0.0, 0.5], dtype=np.float32)
+    runtime.env.scene.env_origins = origins.copy()
+    runtime.env.scene["robot"].data.root_link_pos_w = origins + robot_local
+    ball.data.root_link_pos_w = origins + ball_local
+
+    channel = "region__goal_mouth__relative"
+    expected = np.repeat(
+        np.asarray([[3.0, -2.0, 0.5]], dtype=np.float32), 2, axis=0)
+    np.testing.assert_allclose(runtime.sample().channels[channel], expected)
+
+    env = runtime.env
+    env.device = "cpu"
+    env.scene.env_origins = torch.as_tensor(origins)
+    for entity_name in ("robot", "ball"):
+        data = env.scene[entity_name].data
+        for key, value in vars(data).items():
+            setattr(data, key, torch.as_tensor(value))
+    env.scene["authored_contact__desired__0"].data.found = torch.ones(
+        (2, 1), dtype=torch.bool)
+    reward_runtime = TorchWorldRewardRuntime(
+        env, catalog=runtime.catalog, manifest=runtime.manifest)
+    torch.testing.assert_close(
+        reward_runtime.sample()[channel], torch.as_tensor(expected))

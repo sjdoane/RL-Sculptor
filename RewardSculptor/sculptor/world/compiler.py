@@ -200,6 +200,155 @@ class ResolvedWorldBundle:
     runtime_adjustments: tuple[str, ...] = ()
 
 
+def _root_body_relative(env: Any, target_pos_w: Any) -> Any:
+    """Express a world-space target position in the robot root frame.
+
+    Authored observations must be useful across replicated environments and
+    arbitrary embodiments.  MuJoCo scene state is world-space (including each
+    environment origin), while authored geometry is local to one environment.
+    The caller resolves that translation; this helper removes robot root
+    translation and orientation without assuming a robot/task name.
+    """
+    from mjlab.utils.lab_api.math import quat_apply_inverse
+
+    robot = env.scene["robot"]
+    root_pos_w = robot.data.root_link_pos_w
+    root_quat_w = robot.data.root_link_quat_w
+    return quat_apply_inverse(root_quat_w, target_pos_w - root_pos_w)
+
+
+def authored_region_relative_observation(
+    env: Any, *, center_m: tuple[float, float, float],
+) -> Any:
+    """Body-frame vector from the robot root to an authored region center."""
+    import torch
+
+    robot_pos = env.scene["robot"].data.root_link_pos_w
+    raw_origins = getattr(env.scene, "env_origins", None)
+    origins = (
+        torch.zeros_like(robot_pos)
+        if raw_origins is None
+        else raw_origins.to(device=robot_pos.device, dtype=robot_pos.dtype)
+    )
+    if tuple(origins.shape) != tuple(robot_pos.shape):
+        raise WorldCompileError(
+            "scene env_origins shape does not match robot root positions")
+    center = torch.as_tensor(
+        center_m, device=robot_pos.device, dtype=robot_pos.dtype)
+    return _root_body_relative(env, origins + center)
+
+
+def authored_object_relative_observation(
+    env: Any, *, object_name: str,
+) -> Any:
+    """Body-frame vector from the robot root to an authored object root."""
+    target = env.scene[object_name].data.root_link_pos_w
+    if target.ndim == 3 and target.shape[1] == 1:
+        target = target[:, 0]
+    return _root_body_relative(env, target)
+
+
+def authored_end_effector_relative_observation(
+    env: Any, *, role_kind: str, role_names: tuple[str, ...],
+) -> Any:
+    """Body-frame vector to a semantic end-effector site/body centroid."""
+    robot = env.scene["robot"]
+    if role_kind == "site":
+        available = tuple(robot.site_names)
+        positions = robot.data.site_pos_w
+    elif role_kind == "body":
+        available = tuple(robot.body_names)
+        positions = robot.data.body_link_pos_w
+    else:
+        raise WorldCompileError(
+            f"unsupported end-effector semantic role kind {role_kind!r}")
+    missing = [name for name in role_names if name not in available]
+    if missing:
+        raise WorldCompileError(
+            f"semantic end-effector names are absent at runtime: {missing}")
+    indices = [available.index(name) for name in role_names]
+    target = positions[:, indices].mean(dim=1)
+    return _root_body_relative(env, target)
+
+
+def _install_task_observations(
+    env_cfg: Any,
+    runtime: TaskRuntimePlan,
+    *,
+    zones: Mapping[str, Any],
+    robot: RobotCapability,
+) -> None:
+    """Install validated authored observations into actor and critic groups.
+
+    ``compile_task_runtime`` has always preserved these bindings in the
+    manifest, but the overlay previously installed only their sensors.  The
+    policy therefore could neither see a waypoint/region nor locate an object,
+    even though rewards and rollout metrics could.  Add only fixed-shape,
+    embodiment-neutral terms and use semantic capability roles for end
+    effectors.  Train and evaluation both call this same chokepoint.
+    """
+    observations = getattr(env_cfg, "observations", None)
+    if not isinstance(observations, dict):
+        return
+
+    from mjlab.managers.observation_manager import ObservationTermCfg
+
+    bindings = runtime.observation_bindings
+    terms: dict[str, Any] = {}
+    # Task-space vectors are clipped before a modest scale so ordinary
+    # metre-scale courses enter the policy near O(1) without losing direction.
+    vector_kwargs = {"clip": (-20.0, 20.0), "scale": 0.1}
+
+    for name in bindings.get("region_relative", ()):
+        zone = zones[str(name)]
+        raw_center = list(zone["center_m"])
+        center = tuple(float(v) for v in (
+            raw_center if len(raw_center) == 3 else [*raw_center, 0.0]
+        ))
+        terms[f"authored_region__{name}"] = ObservationTermCfg(
+            func=authored_region_relative_observation,
+            params={"center_m": center},
+            **vector_kwargs,
+        )
+
+    for name in bindings.get("object_relative", ()):
+        terms[f"authored_object__{name}"] = ObservationTermCfg(
+            func=authored_object_relative_observation,
+            params={"object_name": str(name)},
+            **vector_kwargs,
+        )
+
+    for role in bindings.get("end_effector_relative", ()):
+        role_kind, role_names = robot.resolve_semantic_role(str(role))
+        terms[f"authored_end_effector__{role}"] = ObservationTermCfg(
+            func=authored_end_effector_relative_observation,
+            params={
+                "role_kind": role_kind,
+                "role_names": tuple(role_names),
+            },
+            clip=(-5.0, 5.0),
+        )
+
+    height = bindings.get("height_scan", {})
+    if isinstance(height, Mapping) and height.get("enabled"):
+        from mjlab.envs import mdp as envs_mdp
+
+        terms["authored_height_scan"] = ObservationTermCfg(
+            func=envs_mdp.height_scan,
+            params={"sensor_name": str(height["sensor"])},
+            clip=(-5.0, 5.0),
+            scale=0.2,
+        )
+
+    if not terms:
+        return
+    for group_name in ("actor", "critic", "policy"):
+        group = observations.get(group_name)
+        group_terms = getattr(group, "terms", None)
+        if isinstance(group_terms, dict):
+            group_terms.update(copy.deepcopy(terms))
+
+
 def _materialized_cfg_types() -> tuple[type[Any], type[Any]]:
     """Create lazy terrain adapter types without importing mjlab at CLI import."""
     import mujoco
@@ -803,6 +952,14 @@ def compile_task_runtime(
             pattern=GridPatternCfg(size=(1.6, 1.0), resolution=0.2),
             max_distance=5.0, exclude_parent_body=True,
             include_geom_groups=(0,), debug_vis=False))
+    raw_end_effectors = observations.get("end_effector_relative", ())
+    end_effectors = (
+        ["end_effector"]
+        if raw_end_effectors is True or raw_end_effectors == "auto"
+        else []
+        if raw_end_effectors is False
+        else list(raw_end_effectors)
+    )
     observation_bindings = {
         "proprioception": observations.get("proprioception", True),
         "height_scan": (
@@ -810,8 +967,7 @@ def compile_task_runtime(
             if height_enabled else {"enabled": False}),
         "object_relative": list(observations.get("object_relative", ())),
         "region_relative": list(observations.get("region_relative", ())),
-        "end_effector_relative": list(
-            observations.get("end_effector_relative", ())),
+        "end_effector_relative": end_effectors,
     }
     reset_bindings = tuple(copy.deepcopy(
         task.get("train", {}).get("goal_sampling", ())))
@@ -1196,6 +1352,12 @@ def apply_compiled_world(env_cfg: Any, compiled: CompiledWorld) -> None:
     existing_sensors.update({
         sensor.name: sensor for sensor in compiled.task_runtime.sensor_cfgs})
     scene_cfg.sensors = tuple(existing_sensors.values())
+    _install_task_observations(
+        env_cfg,
+        compiled.task_runtime,
+        zones=compiled.resolved_eval.zones,
+        robot=compiled.robot,
+    )
 
 
 def train_difficulty_span(world: Mapping[str, Any]) -> tuple[float, float] | None:
@@ -1252,7 +1414,12 @@ def expand_train_terrain_difficulty(
 
 
 def _apply_scene_and_runtime(
-    env_cfg: Any, authored_scene: Any, runtime: TaskRuntimePlan,
+    env_cfg: Any,
+    authored_scene: Any,
+    runtime: TaskRuntimePlan,
+    *,
+    zones: Mapping[str, Any],
+    robot: RobotCapability,
 ) -> None:
     scene_cfg = getattr(env_cfg, "scene", env_cfg)
     scene_cfg.terrain = authored_scene.terrain
@@ -1265,6 +1432,8 @@ def _apply_scene_and_runtime(
         sensor.name: sensor for sensor in getattr(scene_cfg, "sensors", ())}
     existing_sensors.update({sensor.name: sensor for sensor in runtime.sensor_cfgs})
     scene_cfg.sensors = tuple(existing_sensors.values())
+    _install_task_observations(
+        env_cfg, runtime, zones=zones, robot=robot)
 
 
 def _runtime_robot_hash(env_cfg: Any) -> str | None:
@@ -1328,7 +1497,15 @@ def _reconcile_waypoint_course(
     semantics; no robot or registered task identifier participates.
     """
     goal = manifest.task_shared.get("goal", {})
-    if goal.get("type") != "waypoint_sequence" or not manifest.course:
+    requested_waypoints = goal.get("waypoints")
+    has_explicit_route = (
+        isinstance(requested_waypoints, (list, tuple))
+        and bool(requested_waypoints)
+    )
+    if (
+        goal.get("type") != "waypoint_sequence"
+        or not (manifest.course or has_explicit_route)
+    ):
         return ()
 
     adjustments: list[str] = []
@@ -1480,7 +1657,13 @@ def apply_world_selection(
                 frozen_flat_patches=terrain.get("flat_patches", {}),
                 frozen_flat_patch_radii_m=terrain.get(
                     "flat_patch_radii_m", {}))
-        _apply_scene_and_runtime(env_cfg, authored_scene, runtime)
+        _apply_scene_and_runtime(
+            env_cfg,
+            authored_scene,
+            runtime,
+            zones=manifest.zones,
+            robot=robot,
+        )
     runtime_adjustments = (
         *_reconcile_terrain_curriculum(env_cfg),
         *_reconcile_waypoint_course(env_cfg, manifest, train=train),
