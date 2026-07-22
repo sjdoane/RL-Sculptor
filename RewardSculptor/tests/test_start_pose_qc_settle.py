@@ -24,6 +24,7 @@ import pytest
 from sculptor.reference import (
     G1_CLASS_STAND_M,
     SettleUnavailable,
+    _archetype,
     _body_frame_gravity_x,
     _quat_from_pitch_roll,
     _quat_wxyz_to_pitch_rad,
@@ -82,6 +83,27 @@ def _airborne_clip() -> dict:
     return make_procedural_jump_clip()
 
 
+def _origin_relative_dataset_clip(
+    tokens: list[str], *, z: "np.ndarray | None" = None,
+    quat: "np.ndarray | None" = None,
+) -> dict:
+    n = 120
+    clip = {
+        "root_pos_z": np.asarray(
+            z if z is not None else 0.04 + 0.03 * np.sin(np.linspace(0, 8, n)),
+            dtype=np.float64,
+        ),
+        "fps": 60.0,
+        "meta": {"source": "dataset", "tokens": tokens},
+        "root_quat_wxyz": np.tile(
+            quat if quat is not None else np.array([1.0, 0.0, 0.0, 0.0]),
+            (n, 1),
+        ),
+    }
+    assert validate_clip(clip) == []
+    return clip
+
+
 # Pitch offsets that produce a clean prone / supine lying pose — same
 # convention `_quat_from_pitch_roll` and `_body_frame_gravity_x` use
 # (verified numerically in this file's own pinned test below).
@@ -131,6 +153,34 @@ def test_standing_rejects_getup_and_mid_start() -> None:
 def test_standing_accepts_non_low_archetypes() -> None:
     check_start_pose_compatibility(_standing_flat_clip(), "standing")
     check_start_pose_compatibility(_airborne_clip(), "standing")
+
+
+def test_origin_relative_upright_dataset_walk_is_not_a_getup() -> None:
+    clip = _origin_relative_dataset_clip(["walk", "to", "run"])
+    assert _archetype(clip) == "other"
+    check_start_pose_compatibility(clip, "standing")
+    assert derive_eval_reset(clip) is None
+
+
+def test_origin_relative_dataset_without_orientation_stays_fail_closed() -> None:
+    clip = _origin_relative_dataset_clip(["walk", "to", "run"])
+    clip.pop("root_quat_wxyz")
+    assert _archetype(clip) == "getup"
+    with pytest.raises(ValueError, match="lying/crouched start"):
+        check_start_pose_compatibility(clip, "standing")
+
+
+def test_origin_relative_dataset_crouch_uses_mid_start_semantics() -> None:
+    clip = _origin_relative_dataset_clip(["deep", "crouch", "hold"])
+    assert _archetype(clip) == "mid_start"
+    check_start_pose_compatibility(clip, "crouched")
+
+
+def test_low_dataset_clip_with_lying_orientation_remains_getup() -> None:
+    clip = _origin_relative_dataset_clip(
+        ["get", "up", "from", "floor"], quat=_PRONE_QUAT)
+    assert _archetype(clip) == "getup"
+    check_start_pose_compatibility(clip, "prone")
 
 
 def test_unrecognized_start_pose_raises() -> None:

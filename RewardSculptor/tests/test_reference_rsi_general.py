@@ -40,6 +40,8 @@ import pytest
 
 from sculptor.env_spec import validate_env_spec
 from sculptor.reference import (
+    G1_CLASS_STAND_M,
+    _archetype,
     apply_reference_rsi,
     derive_eval_reset,
     derive_reference_reset,
@@ -99,6 +101,27 @@ def _make_never_rising_never_low_clip(*, fps: float = 50.0) -> dict:
     """Flat at standing height the whole time — garbage input for RSI
     (neither jump- nor get-up-shaped)."""
     return {"root_pos_z": np.full(120, 0.78), "fps": fps}
+
+
+def _make_origin_relative_hop_clip(*, fps: float = 60.0) -> dict:
+    n = 120
+    u = np.linspace(0.0, 1.0, n)
+    return {
+        "root_pos_z": 0.02 + 0.28 * np.sin(np.pi * u) ** 2,
+        "fps": fps,
+        "root_quat_wxyz": np.tile([1.0, 0.0, 0.0, 0.0], (n, 1)),
+        "meta": {"source": "dataset", "tokens": ["run", "to", "hop"]},
+    }
+
+
+def test_origin_relative_dataset_hop_is_airborne_with_physical_sunk_guard() -> None:
+    clip = _make_origin_relative_hop_clip()
+    assert _archetype(clip) == "airborne"
+    keys = derive_rsi_train_keys(clip)
+    assert keys["reset_height_offset_m"][0] == pytest.approx(0.0)
+    assert keys["reset_height_offset_m"][1] > 0.2
+    assert keys["min_base_height_termination_m"] == pytest.approx(
+        round(0.64 * G1_CLASS_STAND_M, 2))
 
 
 def _make_mid_start_clip(

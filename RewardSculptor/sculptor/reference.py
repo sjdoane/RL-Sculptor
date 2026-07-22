@@ -86,17 +86,18 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
 
 from sculptor.env_spec import (
-    ENV_SPEC_VERSION,
     _JOINT_TARGET_ELEMENT_BOUNDS,
     _JOINT_TARGET_MAX_LEN,
     _TRAIN_RANGES,
     _TRAIN_SCALARS,
+    ENV_SPEC_VERSION,
     read_current_env_spec,
     write_env_spec_version,
 )
@@ -416,6 +417,80 @@ def _clamp_scalar(key: str, v: float) -> float:
     return min(max(round(min(max(v, lo), hi), 4), lo), hi)
 
 
+_DATASET_MID_START_TOKENS = frozenset({
+    "crouch", "crouched", "crouching", "kneel", "kneeling", "sit",
+    "sits", "sitting", "squat", "squatting",
+})
+_DATASET_AIRBORNE_TOKENS = frozenset({
+    "bound", "bounding", "hop", "hops", "hopping", "jump", "jumps",
+    "jumping", "leap", "leaps", "leaping", "parkour", "vault",
+    "vaulting",
+})
+_ORIGIN_RELATIVE_UPRIGHT_GZ_MAX = -0.75
+
+
+def _dataset_motion_tokens(clip: dict) -> set[str]:
+    """Normalized advisory motion words for converted dataset clips.
+
+    The ingester persists ``meta.source == "dataset"`` and its filename
+    tokens inside ``clip.npz``.  These words may refine an otherwise
+    representation-ambiguous *upright* clip, but never override measured
+    orientation by themselves.
+    """
+    meta = clip.get("meta")
+    if not isinstance(meta, dict) or meta.get("source") != "dataset":
+        return set()
+    raw: list[str] = []
+    for key in ("tokens", "text", "motion", "name"):
+        value = meta.get(key)
+        if isinstance(value, (list, tuple)):
+            raw.extend(str(item) for item in value)
+        elif value is not None:
+            raw.append(str(value))
+    return set(re.findall(r"[a-z]+", " ".join(raw).lower()))
+
+
+def _origin_relative_upright_dataset_clip(clip: dict) -> bool:
+    """Whether a low numeric root-z is an origin-relative upright pose.
+
+    Large retargeted-motion corpora commonly zero root translation while
+    preserving the body's world orientation.  Absolute height thresholds
+    therefore cannot distinguish their standing walk/hop clips from a true
+    lying start.  Require all three independent signals before interpreting
+    the height as relative: explicit dataset metadata, a numerically low
+    start, and measured start-window gravity that is strongly upright.
+
+    Missing/corrupt orientation returns ``False`` and preserves the historical
+    fail-closed absolute-height classification.  No robot or task identifier
+    participates in this representation check.
+    """
+    if not _dataset_motion_tokens(clip):
+        return False
+    z = np.asarray(clip.get("root_pos_z"), dtype=np.float64)
+    quat = clip.get("root_quat_wxyz")
+    if z.ndim != 1 or z.size < 2 or quat is None:
+        return False
+    fps = float(clip["fps"])
+    nw = max(2, int(_ARCHETYPE_WINDOW_S * fps), int(0.1 * len(z)))
+    if float(np.mean(z[:nw])) >= _GETUP_START_MAX_M:
+        return False
+    q = np.asarray(quat, dtype=np.float64)
+    if q.ndim != 2 or q.shape[1] != 4 or q.shape[0] < nw:
+        return False
+    q = q[:nw]
+    norms = np.linalg.norm(q, axis=1)
+    valid = np.isfinite(q).all(axis=1) & (norms > 1e-9)
+    if not valid.any():
+        return False
+    q = q[valid] / norms[valid, None]
+    g = _quat_wxyz_to_gravity_b(q).mean(axis=0)
+    g_norm = float(np.linalg.norm(g))
+    return bool(
+        g_norm > 1e-9
+        and float(g[2] / g_norm) <= _ORIGIN_RELATIVE_UPRIGHT_GZ_MAX
+    )
+
+
 def _archetype(clip: dict) -> str:
     """Classify a reference clip's shape (§8).
 
@@ -472,6 +547,19 @@ def _archetype(clip: dict) -> str:
     # (a 0.5 s end-MEDIAN once misclassified a QC-passing segment, D15).
     nw = max(2, int(_ARCHETYPE_WINDOW_S * fps), int(0.1 * len(z)))
     start = float(np.mean(z[:nw]))
+    if _origin_relative_upright_dataset_clip(clip):
+        # Translation is relative, so use measured orientation plus the
+        # dataset's advisory motion words.  Ordinary locomotion remains
+        # ``other`` even when gait bounce exceeds the old 1 cm jump threshold;
+        # crouch/sit and airborne intent require explicit matching words.
+        tokens = _dataset_motion_tokens(clip)
+        if tokens & _DATASET_MID_START_TOKENS:
+            return "mid_start"
+        n0 = max(2, int(0.2 * fps))
+        z0 = float(np.median(z[:n0]))
+        if tokens & _DATASET_AIRBORNE_TOKENS and (z > z0 + 0.01).any():
+            return "airborne"
+        return "other"
     if start < _GETUP_START_MAX_M:
         return "getup"
     if start < _GETUP_END_MIN_M:
@@ -576,7 +664,17 @@ def derive_rsi_train_keys(clip: dict) -> dict:
     vz_lo = float(vz[window].min())
     vz_hi = float(vz[window].max())
     sunk_lo, sunk_hi = _TRAIN_SCALARS["min_base_height_termination_m"]
-    sunk = round(min(max(_SUNK_FRAC_OF_STAND * z0, sunk_lo), sunk_hi), 2)
+    # Origin-relative retargets correctly express the jump's height DELTA but
+    # not an absolute standing height.  Use the same physical default-height
+    # anchor as reset derivation for the termination threshold; otherwise z0~0
+    # clamps the guard near the floor and silently removes its protective value.
+    sunk_anchor = (
+        _G1_CLASS_STAND_M
+        if _origin_relative_upright_dataset_clip(clip)
+        else z0
+    )
+    sunk = round(
+        min(max(_SUNK_FRAC_OF_STAND * sunk_anchor, sunk_lo), sunk_hi), 2)
     return {
         "reset_height_offset_m": _clamp_range(
             "reset_height_offset_m", 0.0, height_hi),
