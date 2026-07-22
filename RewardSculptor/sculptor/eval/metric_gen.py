@@ -603,6 +603,8 @@ def _review_metric(
             response_text=response_text_blocks(resp),
             usage=getattr(resp, "usage", None))
         r = resp.parsed_output
+        if r is None:
+            raise RuntimeError("structured reviewer returned no parsed output")
         approved = bool(r.approved)
         exploit = str(getattr(r, "gaming_exploit", "") or "")
         concerns = list(r.concerns)
@@ -615,6 +617,26 @@ def _review_metric(
         return {"approved": False,
                 "concerns": [f"review call failed: {type(e).__name__}: {e}"],
                 "summary": ""}
+
+
+def _single_review_unavailable(
+    review_out: Optional[dict[str, Any]], review_panel: Optional[dict[str, Any]],
+) -> bool:
+    """Return whether the advisory single reviewer produced no evidence.
+
+    Deterministic validation remains authoritative for code safety and physical
+    discrimination. A transport/parser outage is neither an approval nor a semantic
+    veto, so it must not trigger an LLM rewrite of already-valid code. Panel quorum
+    behavior is intentionally unchanged; this applies only to the legacy single-
+    reviewer path, whose byte-stable review object identifies infrastructure failure
+    through its existing concern prefix.
+    """
+    if review_panel is not None or not review_out:
+        return False
+    concerns = review_out.get("concerns") or []
+    return bool(concerns) and all(
+        str(concern).startswith("review call failed:") for concern in concerns
+    )
 
 
 def generate_objective_metric(
@@ -863,6 +885,11 @@ def generate_objective_metric(
                         selected_candidate = cand["candidate"]
                         metric_path.write_text(source, encoding="utf-8")
                         break
+                    if _single_review_unavailable(review_out, review_panel):
+                        # No semantic evidence exists to rank a sibling. Preserve
+                        # the mechanically strongest candidate and stop spending
+                        # author/reviewer tokens on an infrastructure outage.
+                        break
                 # none approved → review_out is the last (rejected) one; source/validation
                 # stay as the discrimination-winner (already on disk); accepted stays False.
             else:
@@ -870,7 +897,15 @@ def generate_objective_metric(
                     source, validation,
                     "Passed validation — running independent review…")
 
-        accepted = bool(passed and (review_out is None or review_out.get("approved")))
+        review_unavailable = _single_review_unavailable(review_out, review_panel)
+        accepted = bool(
+            passed
+            and (
+                review_out is None
+                or review_out.get("approved")
+                or review_unavailable
+            )
+        )
 
         # §review-feedback retry: a metric that PASSED validation but the reviewer VETOED is
         # otherwise a dead-end — the feedback-retry loop above fires only on a VALIDATION
@@ -880,6 +915,7 @@ def generate_objective_metric(
         rev_retry = 0
         while (review and passed and not accepted
                and review_out and not review_out.get("approved")
+               and not review_unavailable
                and rev_retry < _MAX_REVIEW_RETRIES):
             rev_retry += 1
             _emit({"stage": "regenerating", "max": _MAX_REVIEW_RETRIES,
@@ -913,10 +949,18 @@ def generate_objective_metric(
                 source, validation,
                 f"Re-reviewing the corrected metric (retry {rev_retry})…")
             accepted = bool(review_out and review_out.get("approved"))
+            review_unavailable = _single_review_unavailable(
+                review_out, review_panel)
+            if review_unavailable:
+                accepted = True
 
         _emit({"stage": "done", "accepted": accepted,
-               "message": ("Metric accepted." if accepted
-                           else "Metric rejected — see reasons.")})
+               "message": (
+                   "Metric accepted; independent review was unavailable."
+                   if accepted and review_unavailable
+                   else "Metric accepted." if accepted
+                   else "Metric rejected — see reasons."
+               )})
         record = {
             "accepted": accepted,
             "validation_passed": passed,
@@ -925,6 +969,10 @@ def generate_objective_metric(
             "validation": validation,
             "review": review_out,
             "review_panel": review_panel,
+            # Honest degraded-mode marker: deterministic gates passed, but the
+            # advisory single reviewer returned no semantic evidence. Calibration
+            # still controls steer rights exactly as before.
+            "review_unavailable": review_unavailable,
             "attempts": attempts,
             "n_candidates": n_candidates,
             "candidates": candidates,

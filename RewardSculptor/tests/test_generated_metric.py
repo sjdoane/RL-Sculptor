@@ -645,6 +645,16 @@ class _FakeClient:
         self.messages = _Messages(src, approved, gaming_exploit)
 
 
+class _UnavailableReviewMessages(_Messages):
+    def parse(self, **kw):
+        return _Parsed(None)
+
+
+class _UnavailableReviewClient:
+    def __init__(self, src):
+        self.messages = _UnavailableReviewMessages(src, approved=False)
+
+
 def test_generate_objective_metric_accepts_good(tmp_path):
     from sculptor.eval.metric_gen import generate_objective_metric
     out = tmp_path / "m"
@@ -672,6 +682,24 @@ def test_generate_objective_metric_review_can_veto(tmp_path):
         "trot forward", tmp_path / "m3",
         client=_FakeClient(GOOD, approved=False), max_attempts=1)
     assert rec["validation_passed"] and not rec["accepted"]
+
+
+def test_review_outage_preserves_mechanically_valid_candidate(tmp_path):
+    """No reviewer evidence is not a semantic veto and must never cause an LLM
+    rewrite of code that already passed the deterministic metric firewall."""
+    from sculptor.eval.metric_gen import generate_objective_metric
+
+    client = _UnavailableReviewClient(GOOD)
+    rec = generate_objective_metric(
+        "trot forward", tmp_path / "review-down", client=client,
+        max_attempts=1)
+    assert rec["validation_passed"] and rec["accepted"]
+    assert rec["review_unavailable"] is True
+    assert rec["review"]["approved"] is False
+    assert rec["review"]["concerns"] == [
+        "review call failed: RuntimeError: structured reviewer returned no parsed output"
+    ]
+    assert client.messages.creates == 1
 
 
 def test_single_review_named_exploit_forces_reject(tmp_path):
