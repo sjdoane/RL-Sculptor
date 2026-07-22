@@ -390,9 +390,13 @@ function StageMetricChip({
     );
   }
   if (status === "inherited") {
+    const label = steeringMetric ? `metric: ${steeringMetric}` : "metric: inherited";
+    const title = steeringMetric
+      ? `Uses the configured steering metric ${steeringMetric}`
+      : "Falls back to the mission-level fitness metric";
     return (
-      <span className="rs-badge slate" style={{ fontSize: 9.5 }} title="Falls back to the mission-level fitness metric">
-        metric: inherited
+      <span className="rs-badge slate" style={{ fontSize: 9.5 }} title={title}>
+        {label}
       </span>
     );
   }
