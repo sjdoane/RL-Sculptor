@@ -545,6 +545,9 @@ class StageObjectiveMetric(BaseModel):
     review_summary: Optional[str] = None
     n_candidates: Optional[int] = None
     calibrated: Optional[bool] = None
+    validator_basis: Optional[str] = None
+    abstract_objective_program: list[str] = []
+    channel_catalog_hash: Optional[str] = None
     # §R1 remainder (plan §9): the reference clips this metric was
     # certified against, mirrored from meta["validation"]["references"].
     # [] when no references were attached (pre-R1 records and non-

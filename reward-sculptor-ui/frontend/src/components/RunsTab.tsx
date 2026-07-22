@@ -881,7 +881,27 @@ function StageObjectiveMetricCard({ query }: { query: ReturnType<typeof useQuery
         {typeof data.n_candidates === "number" && (
           <span className="rs-tag" style={{ fontSize: 10.5 }}>{data.n_candidates} candidate{data.n_candidates === 1 ? "" : "s"} sampled</span>
         )}
+        {data.validator_basis && (
+          <span className="rs-tag" style={{ fontSize: 10.5 }}>
+            <Icon name="shield-check" size={11} />
+            {data.validator_basis.replaceAll("+", " + ")}
+          </span>
+        )}
       </div>
+      {data.abstract_objective_program.length > 0 && (
+        <div style={{ marginTop: 10 }}>
+          <div className="rs-sub" style={{ fontSize: 10.5, marginBottom: 6 }}>
+            Prompt-native validator plan
+          </div>
+          <div className="rs-flex rs-wrap rs-gap-8">
+            {data.abstract_objective_program.map((phase, index) => (
+              <span className="rs-tag" style={{ fontSize: 10.5 }} key={`${phase}-${index}`}>
+                {index + 1}. {phase.replaceAll("_", " ")}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
       {data.review_summary && (
         <p className="rs-sub" style={{ margin: "8px 0 0", fontSize: 12, lineHeight: 1.5 }}>{data.review_summary}</p>
       )}

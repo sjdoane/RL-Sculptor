@@ -159,6 +159,7 @@ def generate_objective_metric(
     review: bool = True,
     n_candidates: int = 1,
     on_event=None,
+    channel_catalog: Any = None,
 ) -> dict:
     """Generate + validate + review an objective fitness metric (the only
     module allowed to import sculptor.eval). Returns the full record.
@@ -170,8 +171,27 @@ def generate_objective_metric(
     candidates and selects the most-discriminating valid one (offline)."""
     from sculptor.eval import generate_objective_metric as _gen
 
-    return _gen(behavior_goal, out_dir, robot_hint=robot_hint, review=review,
-                n_candidates=n_candidates, on_event=on_event)
+    return _gen(
+        behavior_goal,
+        out_dir,
+        robot_hint=robot_hint,
+        review=review,
+        n_candidates=n_candidates,
+        on_event=on_event,
+        channel_catalog=channel_catalog,
+    )
+
+
+def load_project_channel_catalog(project_dir: "Path") -> Any:
+    """Load the active World's exact metric-channel contract, if present.
+
+    Kept behind this bridge so the rest of the backend preserves its single
+    sculptor integration boundary.  The core loader fails closed when a
+    selection exists but its catalog is missing, corrupt, or hash-drifted.
+    """
+    from sculptor.world.channels import load_project_channel_catalog as _load
+
+    return _load(project_dir)
 
 
 def calibrate_objective_metric(

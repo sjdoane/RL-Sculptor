@@ -405,6 +405,9 @@ export interface MetricSummary {
   gates?: Record<string, boolean> | null;
   reasons?: string[] | null;
   archetype_scores?: Record<string, number> | null;
+  validator_basis?: string | null;
+  abstract_objective_program?: string[] | null;
+  channel_catalog_hash?: string | null;
   calibration?: { ok?: boolean; spearman?: number; builtin?: string } | null;
   // §best-of-N: how many candidates were sampled + which one won (with its
   // offline discrimination). null/1 for the single-shot path.
@@ -1161,6 +1164,9 @@ export interface StageObjectiveMetric {
   review_summary: string | null;
   n_candidates: number | null;
   calibrated: boolean | null;
+  validator_basis: string | null;
+  abstract_objective_program: string[];
+  channel_catalog_hash: string | null;
   references: StageMetricReference[];
 }
 

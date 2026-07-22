@@ -1532,6 +1532,8 @@ def get_stage_metric(
     behavior_goal = meta.get("behavior_goal")
     n_candidates = meta.get("n_candidates")
     calibrated = meta.get("calibrated")
+    validation = meta.get("validation") if isinstance(meta.get("validation"), dict) else {}
+    abstract_program = validation.get("abstract_objective_program")
 
     return StageObjectiveMetric(
         status=status_value,  # type: ignore[arg-type]
@@ -1541,6 +1543,15 @@ def get_stage_metric(
         review_summary=_stage_review_summary(meta),
         n_candidates=n_candidates if isinstance(n_candidates, int) else None,
         calibrated=calibrated if isinstance(calibrated, bool) else None,
+        validator_basis=(
+            meta.get("validator_basis")
+            if isinstance(meta.get("validator_basis"), str) else None),
+        abstract_objective_program=(
+            [str(phase) for phase in abstract_program]
+            if isinstance(abstract_program, list) else []),
+        channel_catalog_hash=(
+            meta.get("channel_catalog_hash")
+            if isinstance(meta.get("channel_catalog_hash"), str) else None),
         references=_stage_metric_references(meta),
     )
 
@@ -1696,6 +1707,7 @@ def regenerate_stage_metric(
             from sculptor.llm import set_llm_log_dir
             from sculptor.mission import load_mission, save_mission
             from sculptor.mission_metrics import generate_stage_metrics
+            from sculptor.world.channels import load_project_channel_catalog
 
             md = mission_store.mission_dir(project_dir, mission_slug)
 
@@ -1744,6 +1756,7 @@ def regenerate_stage_metric(
                     n_candidates=n_candidates,
                     on_event=_emit_metric_ev,
                     only_stages=[stage],
+                    channel_catalog=load_project_channel_catalog(project_dir),
                 )
                 # §step 4b: does generate_stage_metrics persist
                 # mission.json itself? No — it mutates `mission` in

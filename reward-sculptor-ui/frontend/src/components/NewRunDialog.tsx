@@ -396,7 +396,9 @@ export function NewRunDialog({
               ? ` — picked candidate ${m.selected_candidate + 1}/${m.n_candidates}`
               : "";
             toast.success(`Generated ${m.id} (observe-only until calibrated)${pick}`, {
-              description: m.review?.summary ?? "Validated + reviewed.",
+              description: m.validator_basis
+                ? `Validated from ${m.validator_basis.replaceAll("+", " + ")}.`
+                : m.review?.summary ?? "Validated + reviewed.",
             });
           } else {
             const why = (m.reasons && m.reasons[0])

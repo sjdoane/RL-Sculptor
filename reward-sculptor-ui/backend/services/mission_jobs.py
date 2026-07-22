@@ -194,6 +194,7 @@ def run_mission_decompose_job(
             from sculptor.llm import set_llm_log_dir
             from sculptor.mission import load_mission, save_mission
             from sculptor.mission_metrics import generate_stage_metrics
+            from sculptor.world.channels import load_project_channel_catalog
 
             md = mission_store.mission_dir(project_dir, mission_slug)
             mission = load_mission(md)
@@ -218,7 +219,8 @@ def run_mission_decompose_job(
             report = generate_stage_metrics(
                 mission, robot_hint=getattr(adapter, "task_id", None),
                 n_candidates=stage_metric_candidates,
-                on_event=_emit_metric_ev)
+                on_event=_emit_metric_ev,
+                channel_catalog=load_project_channel_catalog(project_dir))
             save_mission(mission, md)
             return report
 

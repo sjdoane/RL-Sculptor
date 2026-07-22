@@ -43,6 +43,9 @@ class MetricSummary(BaseModel):
     gates: Optional[dict] = None
     reasons: Optional[list] = None
     archetype_scores: Optional[dict] = None
+    validator_basis: Optional[str] = None
+    abstract_objective_program: Optional[list[str]] = None
+    channel_catalog_hash: Optional[str] = None
     calibration: Optional[dict] = None
     source: Optional[str] = None
     recorded_at: Optional[str] = None

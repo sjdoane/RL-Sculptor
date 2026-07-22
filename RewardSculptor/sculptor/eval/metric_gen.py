@@ -945,6 +945,19 @@ def generate_objective_metric(
             # references_used/reference_signatures above, at the
             # field-VALUE level).
             "eval_reset_preview": eval_reset,
+            # Every generated metric now records the independent oracle that
+            # certified it.  A stored motion is optional: without one, the
+            # closed-vocabulary prompt program is retargeted onto universal
+            # kinematics and, when a World is active, its exact task channels.
+            "validator_basis": (
+                "reference+world+abstract"
+                if references_used and catalog is not None
+                else "reference+abstract"
+                if references_used
+                else "world+abstract"
+                if catalog is not None
+                else "abstract"
+            ),
             "channel_catalog_hash": (
                 catalog.catalog_hash if catalog is not None else None),
         }

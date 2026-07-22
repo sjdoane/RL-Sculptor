@@ -100,6 +100,9 @@ def _summary(gid: str, rec: dict) -> dict[str, Any]:
         "gates": validation.get("gates"),
         "reasons": validation.get("reasons"),
         "archetype_scores": validation.get("archetype_scores"),
+        "validator_basis": rec.get("validator_basis"),
+        "abstract_objective_program": validation.get("abstract_objective_program"),
+        "channel_catalog_hash": rec.get("channel_catalog_hash"),
         # §Ship 50: L1 axiom per-layer breakdown (for the UI evidence line +
         # the Ship-52 trust score). None for pre-Ship-50 records.
         "axioms": validation.get("axioms"),
@@ -128,11 +131,18 @@ def generate(
     §Ship 40: `on_event` streams pipeline progress to the caller.
     §best-of-N: `n_candidates` >1 samples N candidates and keeps the most
     discriminating valid one (default 1 → single-shot-with-retry)."""
+    # A promoted World is part of the objective contract, not merely scene
+    # decoration.  Its metric-only task channels are the strongest available
+    # validator substrate when the prompt has no stored demonstration.  The
+    # loader is fail-closed once a selection exists, so a corrupt/stale catalog
+    # can never silently downgrade generation to a generic no-world metric.
+    channel_catalog = sculptor_bridge.load_project_channel_catalog(project_dir)
     root = _metrics_root(project_dir)
     gid = _next_id(root)
     rec = sculptor_bridge.generate_objective_metric(
         behavior_goal, root / gid, robot_hint=robot_hint, review=review,
-        n_candidates=n_candidates, on_event=on_event)
+        n_candidates=n_candidates, on_event=on_event,
+        channel_catalog=channel_catalog)
     rec["id"] = gid
     # Re-stamp meta.json with the id so list/calibrate can find it. Atomic write so a
     # concurrent reader never sees a partial file (§round-7).
