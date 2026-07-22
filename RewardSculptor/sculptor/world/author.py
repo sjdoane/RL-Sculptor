@@ -399,9 +399,15 @@ _NUMBER_WORDS = {
     "eleven": 11, "twelve": 12,
 }
 _COURSE_NOUNS = r"(?:boxes|box|platforms?|steps?|obstacles?|blocks?|stairs?|hurdles?)"
+_COURSE_COUNT_MODIFIER = (
+    r"(?:progressively|more|high-friction|low-friction|taller|higher|lower|"
+    r"shorter|wider|narrower|tall|high|low|raised|staggered|ascending|"
+    r"descending|identical|small|large)"
+)
 _COUNT_RE = re.compile(
-    r"(\d+|" + "|".join(_NUMBER_WORDS) + r")\s+(?:more\s+|tall\s+|high\s+)*"
-    + _COURSE_NOUNS)
+    r"\b(\d+|" + "|".join(_NUMBER_WORDS) + r")\b\s+"
+    r"(?:" + _COURSE_COUNT_MODIFIER + r"\s*,?\s*)*"
+    + _COURSE_NOUNS + r"\b")
 
 
 def _parse_count(prompt: str, *, default: int, lo: int = 1, hi: int = 12) -> int:
@@ -1311,6 +1317,45 @@ def _raise_validation(world: dict[str, Any], task: dict[str, Any]) -> None:
         raise AuthoringError("invalid authored environment:\n- " + "\n- ".join(errors))
 
 
+def _raise_prompt_semantic_drift(
+    prompt: str, world: Mapping[str, Any],
+) -> None:
+    """Reject schema-valid drafts that contradict explicit prompt facts.
+
+    Structural validators can prove that three platforms are safe and
+    buildable; they cannot prove that three satisfies an explicit request for
+    four.  Keep this gate deliberately narrow and deterministic: only an
+    explicit course-element cardinality in a parkour prompt is enforced here.
+    That gives the hybrid author a clean rejection signal and lets it fall back
+    to the exact-count offline compiler instead of silently promoting drift.
+    """
+    try:
+        intent = _intent(prompt)
+    except AuthoringError:
+        # Novel model-only intents have no offline semantic oracle yet.  Their
+        # schema/capability/build gates remain authoritative.
+        return
+    if intent != "parkour":
+        return
+    requested = _parse_count(prompt, default=0)
+    if requested <= 0:
+        return
+    shared = world.get("shared")
+    obstacles = shared.get("obstacles") if isinstance(shared, Mapping) else None
+    course = obstacles.get("course") if isinstance(obstacles, Mapping) else None
+    actual = 0
+    if isinstance(course, list):
+        actual = sum(
+            1 for item in course
+            if isinstance(item, Mapping) and item.get("element") == "platform"
+        )
+    if actual != requested:
+        raise AuthoringError(
+            "author model contradicted explicit prompt cardinality: "
+            f"requested {requested} parkour platform(s), authored {actual}"
+        )
+
+
 class WorldAuthor:
     """Produce strict environment drafts with an optional injected model."""
 
@@ -1423,6 +1468,7 @@ class WorldAuthor:
                 cap.require(_required_capabilities(prompt))
             except CapabilityError as exc:
                 raise AuthoringError(str(exc)) from exc
+        _raise_prompt_semantic_drift(prompt, world)
         return _build_draft(
             prompt, cap, candidates, world, task, provenance,
             capability_source,

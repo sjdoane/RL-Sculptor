@@ -116,6 +116,35 @@ def test_hybrid_falls_back_when_llm_spec_invalid():
     assert draft.world_spec["shared"]["obstacles"]["course"]
 
 
+def test_hybrid_rejects_valid_but_wrong_explicit_course_count():
+    """Schema-valid geometry may still contradict an explicit prompt fact.
+
+    The model returns the nominal three-platform template for a four-box
+    request.  The semantic gate must reject it, and hybrid fallback must
+    compile the requested four platforms rather than promote the drift.
+    """
+    seed = author_environment(_PARKOUR, robot_capability_id="unitree_g1:base")
+    client = _FakeClient(json.dumps({
+        "world_spec": seed.world_spec,
+        "task_spec": seed.task_spec,
+        "parameter_provenance": seed.world_spec["meta"]["parameter_provenance"],
+    }))
+    prompt = (
+        "Build a parkour course with four progressively taller, "
+        "high-friction boxes in a straight line."
+    )
+
+    draft = hybrid_author_environment(
+        prompt, client=client, robot_capability_id="unitree_g1:base")
+
+    platforms = [
+        item for item in draft.world_spec["shared"]["obstacles"]["course"]
+        if item["element"] == "platform"
+    ]
+    assert client.calls == 1
+    assert len(platforms) == 4
+
+
 def test_hybrid_falls_back_when_client_errors():
     client = _FakeClient(RuntimeError("api down"))
     draft = hybrid_author_environment(

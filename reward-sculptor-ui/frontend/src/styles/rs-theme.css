@@ -404,9 +404,11 @@ input, textarea, select { font: inherit; color: inherit; }
 .rs-modal.full .rs-modal-body { flex: 1; min-height: 0; }
 .rs-modal-body.flush { padding: 0; }
 .rs-modal-head { display: flex; align-items: center; justify-content: space-between; padding: 20px 22px 16px; border-bottom: 1px solid var(--hairline); }
+.rs-modal-head > :first-child { flex: 1 1 auto; min-width: 0; }
+.rs-modal-head .rs-sub { line-height: 1.4; overflow-wrap: anywhere; }
 .rs-modal-body { padding: 20px 22px; display: flex; flex-direction: column; gap: 16px; }
 .rs-modal-foot { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 16px 22px; border-top: 1px solid var(--hairline); }
-.rs-modal-x { background: none; border: 0; color: var(--rs-muted); padding: 4px; border-radius: var(--radius-sm); }
+.rs-modal-x { flex: 0 0 auto; align-self: flex-start; background: none; border: 0; color: var(--rs-muted); padding: 4px; border-radius: var(--radius-sm); }
 .rs-modal-x:hover { color: var(--ink); background: var(--surface-strong); }
 
 /* modal tabs */

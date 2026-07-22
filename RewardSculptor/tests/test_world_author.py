@@ -363,6 +363,10 @@ def test_parse_count_reads_requested_number():
     assert _parse_count("generate 4 boxes", default=3) == 4
     assert _parse_count("a parkour course with five platforms", default=3) == 5
     assert _parse_count("climb two boxes then jump off", default=3) == 2
+    assert _parse_count(
+        "four progressively taller, high-friction boxes in a straight line",
+        default=3,
+    ) == 4
     # unquantified → nominal default
     assert _parse_count("build a parkour course", default=3) == 3
     # articles are not counts ("a course with 8 steps" is 8, not 1)
