@@ -379,13 +379,20 @@ def _pitch_sign(start_pose: Optional[str]) -> float:
 
 
 def _synthesize_clip(
-    parsed: dict[str, Any], *, start_pose: Optional[str], goal_text_sha: str,
+    parsed: dict[str, Any], *, start_pose: Optional[str], goal_text: str,
+    goal_text_sha: str,
 ) -> dict[str, Any]:
     """Deterministically interpolate `parsed`'s keyframe sketch into a
-    `sculptor.reference`-format clip dict at `_FPS`. No joint channels —
-    `validate_clip` requires only `root_pos_z` + `fps`; the reference
-    gate battery auto-skips `root_only` when no posture channel exists,
-    and runs it (correctly) when `root_quat_wxyz` is present."""
+    `sculptor.reference`-format clip dict at `_FPS`.
+
+    The LLM sketch owns only grounded task-space quantities (height and
+    orientation). We compose it with the same deterministic abstract phase
+    retargeter used by prompt-native metric validation to add an embodiment-
+    neutral articulation/support outline. This is a validator exemplar rather
+    than a robot trajectory: it gives the unchanged ``root_only`` attack
+    something real to remove without pretending that an invented joint vector
+    is a deployable motion or keying on a robot name.
+    """
     keyframes = parsed["keyframes"]
     duration_s = float(parsed["duration_s"])
     t_kf = np.array([kf["t"] for kf in keyframes], dtype=np.float64)
@@ -396,6 +403,78 @@ def _synthesize_clip(
     z = _cosine_ease_interp(t_frames, t_kf, z_kf)
 
     clip: dict[str, Any] = {"root_pos_z": z, "fps": _FPS}
+
+    # Compose the prompt-native phase oracle with the numerically grounded LLM
+    # sketch. Import lazily to keep this reference module loadable without the
+    # evaluation stack and avoid a module-level dependency cycle.
+    abstract_phases: list[str] = []
+    try:
+        from sculptor.eval.metric_validate import (
+            _NAMES_12,
+            _abstract_objective_probe,
+            _abstract_objective_program,
+        )
+
+        abstract_phases = _abstract_objective_program(goal_text, None)
+        probe = _abstract_objective_probe(
+            abstract_phases, behavior_goal=goal_text)
+    except Exception:  # noqa: BLE001 — task-space sketch remains usable alone
+        probe = None
+
+    def _resample(values: np.ndarray) -> np.ndarray:
+        values = np.asarray(values, dtype=np.float64)
+        old_t = np.linspace(0.0, 1.0, values.shape[0])
+        new_t = np.linspace(0.0, 1.0, n_frames)
+        flat = values.reshape(values.shape[0], -1)
+        out = np.stack(
+            [np.interp(new_t, old_t, flat[:, i]) for i in range(flat.shape[1])],
+            axis=1,
+        )
+        return out.reshape((n_frames,) + values.shape[1:])
+
+    # A height-changing body must articulate even when the phase parser has no
+    # vocabulary for the prompt. This flexion outline is derived from the
+    # grounded root sketch: low states are flexed and high states extended.
+    z_range = float(np.ptp(z))
+    joints: Optional[np.ndarray] = None
+    joint_names: list[str] = []
+    if probe is not None:
+        joints = _resample(probe["joint_pos"][:, 0, :])
+        joint_names = list(_NAMES_12)
+        root_xy = _resample(probe["root_link_pos_w"][:, 0, :2])
+        if float(np.ptp(root_xy, axis=0).max()) > 1e-9:
+            clip["root_pos_xy"] = root_xy
+
+        leg_phases = {
+            "climb", "dwell", "move_forward", "move_backward",
+            "move_left", "move_right", "jump", "jump_off", "land",
+            "crouch", "recover", "kick",
+        }
+        if leg_phases.intersection(abstract_phases):
+            src_idx = np.rint(np.linspace(
+                0, probe["left_foot_contact"].shape[0] - 1, n_frames,
+            )).astype(int)
+            clip["contact_left_foot"] = (
+                probe["left_foot_contact"][src_idx, 0] > 0.5
+            ).astype(np.float64)
+            clip["contact_right_foot"] = (
+                probe["right_foot_contact"][src_idx, 0] > 0.5
+            ).astype(np.float64)
+    if z_range > 0.03:
+        if joints is None:
+            joints = np.zeros((n_frames, 12), dtype=np.float64)
+            joint_names = [
+                "left_hip_pitch", "right_hip_pitch", "left_knee", "right_knee",
+                "left_ankle", "right_ankle", "left_shoulder_pitch",
+                "right_shoulder_pitch", "left_elbow", "right_elbow", "torso",
+                "neck",
+            ]
+        flex = 0.65 * (float(np.max(z)) - z) / z_range
+        joints[:, :4] += flex[:, None] * np.array([1.0, -1.0, 1.0, -1.0])
+    if joints is not None and float(np.ptp(joints, axis=0).max()) > 1e-6:
+        clip["joint_pos"] = joints
+        clip["joint_vel"] = np.gradient(joints, axis=0) * _FPS
+        clip["joint_names"] = joint_names
 
     g_kf_raw = [kf["g_z"] for kf in keyframes]
     if all(g is not None for g in g_kf_raw):
@@ -424,6 +503,7 @@ def _synthesize_clip(
         "duration_s": round(duration_s, 3),
         "keyframe_count": len(keyframes),
         "start_pose": start_pose,
+        "abstract_objective_phases": abstract_phases,
     }
     return clip
 
@@ -620,7 +700,8 @@ def synthesize_reference_clip(
         str(goal_text).encode("utf-8", "replace")).hexdigest()
     try:
         clip = _synthesize_clip(
-            parsed, start_pose=start_pose, goal_text_sha=goal_text_sha)
+            parsed, start_pose=start_pose, goal_text=goal_text,
+            goal_text_sha=goal_text_sha)
     except Exception as e:  # noqa: BLE001 — never let synthesis crash the caller
         logger.info("synthesize_reference_clip: synthesis_error: %s", e)
         return None, f"synthesis_error:{type(e).__name__}: {e}"

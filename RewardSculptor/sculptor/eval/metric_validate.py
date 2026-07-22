@@ -744,8 +744,28 @@ def _abstract_objective_program(
         "stop", "stopping", "dwell", "dwelling",
     )
     if staged_climb:
-        # Two levels express progression without assuming a particular scene count.
-        for _ in range(2):
+        # Preserve an explicitly prompted course cardinality. This is still an
+        # abstract phase count—not scene geometry—and therefore works for any
+        # robot or simulator. Uncounted traversal keeps the historical two-level
+        # progression exemplar; the twelve-phase schema cap bounds complexity.
+        number_words = {
+            "one": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+            "six": 6,
+        }
+        level_count = 2
+        count_match = re.search(
+            r"\b(\d+|one|two|three|four|five|six)\s+"
+            r"(?:progressively\s+)?(?:taller\s+)?"
+            r"(?:boxes|platforms|steps|levels)\b",
+            g,
+        )
+        if count_match:
+            raw_count = count_match.group(1)
+            parsed_count = (
+                int(raw_count) if raw_count.isdigit() else number_words[raw_count]
+            )
+            level_count = max(1, min(parsed_count, 6 if wants_dwell else 12))
+        for _ in range(level_count):
             phases.append("climb")
             if wants_dwell:
                 phases.append("dwell")
@@ -768,8 +788,15 @@ def _abstract_objective_program(
     # mirror resolve_behavior_family's `_traversal_phrase` so a "jump over the
     # hurdle" goal (routed to family None there) carries a jump_off probe here.
     if wants_jump:
-        leap = staged_climb or has("off", "over", "across", "onto")
-        phases.append("jump_off" if leap else "jump")
+        # When the prompt says "jump onto each box", those jumps ARE the
+        # already-expanded climb phases. Add a separate leap only when the text
+        # explicitly asks to leave/cross the course. This prevents a box-chain
+        # validator from inventing a terminal jump that belongs to a later mode.
+        leap = has("off", "over", "across")
+        if not staged_climb or leap:
+            phases.append("jump_off" if leap or has("onto") else "jump")
+    elif staged_climb and has("launch", "launches", "launching"):
+        phases.append("jump_off")
     if has("land", "lands", "landing") and (not phases or phases[-1] != "jump_off"):
         phases.append("land")
     if has("crouch", "crouches", "crouching", "squat", "squats", "squatting"):
@@ -963,6 +990,19 @@ def _abstract_objective_probe(
             cols = (6, 7, 8, 9) if phase == "reach" else (0, 1, 2, 3)
             amplitude = 1.4 if phase == "reach" else 0.8
             joints[a:b, :, list(cols)] = (amplitude * wave)[:, None, None]
+
+        if phase in {
+            "move_forward", "move_backward", "move_left", "move_right",
+        }:
+            # Embodiment-neutral alternating articulation for locomotion. It
+            # lives on the synthetic named body and is permutation-tested
+            # later; no simulator joint convention or robot/task identifier
+            # enters this validator exemplar.
+            gait = np.sin(4.0 * np.pi * u)
+            joints[a:b, :, 0] = (0.55 * gait)[:, None]
+            joints[a:b, :, 1] = (-0.55 * gait)[:, None]
+            joints[a:b, :, 2] = (-0.35 * gait)[:, None]
+            joints[a:b, :, 3] = (0.35 * gait)[:, None]
 
         if phase in {"climb", "jump", "jump_off"}:
             burst = np.sin(np.pi * np.clip(u * 3.0, 0.0, 1.0))

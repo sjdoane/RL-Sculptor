@@ -30,7 +30,6 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-
 from sculptor.refs.synth import (
     _cosine_ease_interp,
     _pitch_sign,
@@ -79,6 +78,8 @@ def test_good_sketch_synthesizes_a_valid_clip():
     assert validate_clip(clip) == []
     assert clip["fps"] == pytest.approx(30.0)
     assert clip["root_quat_wxyz"].shape == (clip["root_pos_z"].shape[0], 4)
+    assert clip["joint_pos"].shape == (clip["root_pos_z"].shape[0], 12)
+    assert float(np.ptp(clip["joint_pos"], axis=0).max()) > 0.3
     assert clip["meta"]["source"] == "synthetic"
     assert clip["meta"]["confidence"] == pytest.approx(0.8)
     assert clip["meta"]["start_pose"] == "crouched"
@@ -104,7 +105,49 @@ def test_deterministic_given_same_inputs():
     np.testing.assert_array_equal(clip_a["root_pos_z"], clip_b["root_pos_z"])
     np.testing.assert_array_equal(
         clip_a["root_quat_wxyz"], clip_b["root_quat_wxyz"])
+    np.testing.assert_array_equal(clip_a["joint_pos"], clip_b["joint_pos"])
     assert clip_a["meta"] == clip_b["meta"]
+
+
+def test_parkour_sketch_composes_abstract_articulation_support_and_travel():
+    payload = {
+        "keyframes": [
+            {"t": 0.0, "root_z": 0.74, "g_z": -1.0},
+            {"t": 1.0, "root_z": 0.55, "g_z": -0.96},
+            {"t": 2.0, "root_z": 0.86, "g_z": -0.98},
+            {"t": 3.0, "root_z": 0.68, "g_z": -0.96},
+            {"t": 4.0, "root_z": 0.98, "g_z": -0.98},
+            {"t": 5.0, "root_z": 0.80, "g_z": -0.96},
+            {"t": 6.0, "root_z": 1.10, "g_z": -0.98},
+            {"t": 7.0, "root_z": 1.19, "g_z": -1.0},
+        ],
+        "duration_s": 7.0,
+        "rationale": "four grounded box mounts with terminal hold",
+        "confidence": 0.9,
+        "commitments": {
+            "start_z_band": [0.68, 0.78],
+            "end_z_band": [1.10, 1.20],
+            "end_more_upright_than_start": False,
+        },
+    }
+    clip, reason = synthesize_reference_clip(
+        "jump onto four boxes and pause on each box",
+        start_pose="standing", llm_call=_mock(payload))
+    assert reason is None, reason
+    assert clip is not None
+    assert clip["meta"]["abstract_objective_phases"] == [
+        "climb", "dwell", "climb", "dwell", "climb", "dwell",
+        "climb", "dwell",
+    ]
+    assert float(np.ptp(clip["joint_pos"], axis=0).max()) > 0.5
+    assert float(clip["root_pos_xy"][-1, 0]) > 1.0
+    assert np.any(clip["contact_left_foot"] < 0.5)
+    assert np.any(clip["contact_right_foot"] < 0.5)
+
+    from sculptor.refs.perturb import root_motion_only
+
+    root_only = root_motion_only(clip)
+    assert float(np.ptp(root_only["joint_pos"], axis=0).max()) == 0.0
 
 
 # ── infra failure paths ──────────────────────────────────────────────────
@@ -411,9 +454,9 @@ def test_synthetic_clip_passes_the_six_gate_battery_with_an_honest_metric():
     analogous-signature donor (a mismatched clip's numbers are still real
     physical data for this robot, per the D28 spec)."""
     from sculptor.eval.metric_validate import validate_generated_metric
+    from sculptor.reference import derive_eval_reset, load_clip, validate_clip
     from sculptor.refs.convert import kinematic_signature
     from sculptor.refs.perturb import perturbation_suite
-    from sculptor.reference import derive_eval_reset, load_clip, validate_clip
 
     donor = load_clip(FIXTURE_CLIP)
     donor_sig = kinematic_signature(donor)
@@ -441,8 +484,7 @@ def test_synthetic_clip_passes_the_six_gate_battery_with_an_honest_metric():
     assert reason is None, reason
     assert validate_clip(clip) == []
 
-    # The six-gate battery must run UNCHANGED on a jointless synthetic
-    # clip — the perturbation suite itself must build cleanly.
+    # The six-gate battery runs unchanged on the composed synthetic clip.
     suite = perturbation_suite(clip)
     assert set(suite) >= {
         "reversal", "freeze_start", "freeze_end", "shuffle", "root_only",
@@ -459,7 +501,8 @@ def test_synthetic_clip_passes_the_six_gate_battery_with_an_honest_metric():
 def compute_spec(arrays, behavior, meta):
     root = arrays.get("root_link_pos_w")
     g = arrays.get("projected_gravity_b")
-    if root is None or g is None:
+    jp = arrays.get("joint_pos")
+    if root is None or g is None or jp is None:
         return {"spec_score": 0.0}
     z = root[..., 2]
     n = z.shape[0]
@@ -467,7 +510,9 @@ def compute_spec(arrays, behavior, meta):
     rise = np.clip(z[-q:].mean() - z[:min(5, n)].min(), 0.0, None)
     gz = g[..., 2] / np.maximum(np.linalg.norm(g, axis=-1), 1e-9)
     upright_end = np.clip((-gz[-q:].mean() - 0.3) / 0.6, 0.0, 1.0)
-    val = float(np.clip(rise / 0.33, 0.0, 1.0) * upright_end)
+    rom = float(np.max(np.max(jp, axis=0) - np.min(jp, axis=0)))
+    articulated = np.clip(rom / 0.4, 0.0, 1.0)
+    val = float(min(np.clip(rise / 0.33, 0.0, 1.0), upright_end, articulated))
     return {"spec_score": val}
 '''
     p = Path(__file__).parent / "_synth_integration_metric_tmp.py"
