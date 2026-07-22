@@ -17,7 +17,7 @@ import { useEffect, useRef } from "react";
 import * as THREE from "three";
 import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 
-import type { WorldScene, WorldSceneGeom } from "@/lib/types";
+import type { WorldScene, WorldSceneGeom, WorldSceneSite } from "@/lib/types";
 
 const HIGHLIGHT = new THREE.Color(0xffa94d);
 
@@ -84,6 +84,39 @@ function geomGeometry(
     case "plane":
       // Rendered as the ground grid; no solid geometry.
       return null;
+    default:
+      return null;
+  }
+}
+
+/** Build semantic-site geometry with MuJoCo's size and axis conventions.
+ *
+ * Zones are exported as thin cylinder sites (``[radius, half-height, 0]``).
+ * Treating every non-sphere site as a box makes those cylinders have zero
+ * Z thickness, so authored waypoints disappear from the exact-scene view.
+ */
+function siteGeometry(site: WorldSceneSite): THREE.BufferGeometry | null {
+  const s = site.size;
+  switch (site.type) {
+    case "sphere":
+      return new THREE.SphereGeometry(s[0], 24, 16);
+    case "ellipsoid": {
+      const g = new THREE.SphereGeometry(1, 24, 16);
+      g.scale(s[0], s[1], s[2]);
+      return g;
+    }
+    case "cylinder": {
+      const g = new THREE.CylinderGeometry(s[0], s[0], s[1] * 2, 32);
+      g.rotateX(Math.PI / 2);
+      return g;
+    }
+    case "capsule": {
+      const g = new THREE.CapsuleGeometry(s[0], s[1] * 2, 6, 16);
+      g.rotateX(Math.PI / 2);
+      return g;
+    }
+    case "box":
+      return new THREE.BoxGeometry(s[0] * 2, s[1] * 2, s[2] * 2);
     default:
       return null;
   }
@@ -173,16 +206,15 @@ export default function WorldViewer3D({
     }
 
     for (const site of scene.sites) {
-      const s = site.size;
-      const geometry = site.type === "sphere"
-        ? new THREE.SphereGeometry(s[0], 20, 14)
-        : new THREE.BoxGeometry(s[0] * 2, s[1] * 2, s[2] * 2);
-      const [r, g, b] = site.rgba;
+      const geometry = siteGeometry(site);
+      if (!geometry) continue;
+      const [r, g, b, a] = site.rgba;
       const mat = new THREE.MeshStandardMaterial({
         color: new THREE.Color(r, g, b),
         transparent: true,
-        opacity: 0.3,
+        opacity: a,
         depthWrite: false,
+        side: THREE.DoubleSide,
       });
       const mesh = new THREE.Mesh(geometry, mat);
       mesh.position.set(site.pos[0], site.pos[1], site.pos[2]);

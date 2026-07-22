@@ -1019,3 +1019,26 @@ iteration, and wrote a checkpoint. The first smoke reached construction but
 stopped at an unconfigured W&B login; rerunning with the same disabled-W&B
 setting used by the UI completed cleanly. The old slalom job was already
 cooperatively stopped, so no active GPU work was interrupted by this slice.
+
+## Live G1 route learning + visible task zones 2026-07-22 (Codex)
+
+The UI-launched showcase job `job_00197adcc90c9911` is actively training
+selection v8 / reward v3 / metric `gen_003` on the GPU; do not edit the
+reload-watched core while its `_mjlab_runner train` worker is alive. The
+goal-conditioned command produced real ordered progress: checkpoint 300
+reached waypoint 1 in 15/64 environments; checkpoint 350 reached waypoint 1
+in 49/64 and waypoint 2 in 15/64 while surviving the full 1,000-step rollout.
+A different-seed checkpoint-400 robustness sample reached 33/64 and 3/64.
+No sample has reached waypoint 3 yet, so this is learning evidence, not a
+success claim. Only 4/64 checkpoint-350 environments touched any forbidden
+box; the validator honestly returned completion 0 and progress 0.030.
+
+The World tab's exact-scene viewer had a separate demo-facing bug: MuJoCo zone
+sites are thin cylinders, but every non-sphere site was rendered as a box,
+turning `[radius, 0.01, 0]` into invisible zero-Z geometry. `WorldViewer3D`
+now honors sphere, ellipsoid, cylinder, capsule, and box site geometry using
+MuJoCo's Z-axis and half-size conventions. The live compiled slalom scene now
+shows four alternating green waypoint disks plus the larger finish disk;
+selecting a disk highlights it and exposes its exact authored parameters.
+Frontend typecheck, production build, `git diff --check`, and live UI visual /
+interaction checks passed before commit.
