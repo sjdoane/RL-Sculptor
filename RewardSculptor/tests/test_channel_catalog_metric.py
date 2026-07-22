@@ -18,6 +18,7 @@ from sculptor.eval.partition_gate import (
     build_partition_prompt_block,
     screen_edits,
 )
+from sculptor.world.author import author_environment
 from sculptor.world.channels import (
     ChannelCatalog,
     catalog_fixture_arrays,
@@ -81,6 +82,32 @@ DYNAMIC_KEY_METRIC = '''
 def compute_spec(arrays, behavior, meta):
     key = "goal" + "__score__success"
     return {"spec_score": float(arrays[key].mean())}
+'''
+
+
+PROMPT_NATIVE_PARKOUR_METRIC = '''
+import numpy as np
+
+ABSTRACT_OBJECTIVE = {
+    "phases": [
+        "climb", "dwell", "climb", "dwell",
+        "climb", "dwell", "climb", "dwell",
+    ]
+}
+
+def compute_spec(arrays, behavior, meta):
+    root = arrays["root_link_pos_w"]
+    height_gain = float((root[..., 2].max(axis=0) - root[..., 2].min(axis=0)).mean())
+    waypoint = float(arrays["goal__complete_course__waypoint_index"].max())
+    completed = float(arrays["goal__complete_course__success"].mean())
+    physical = float(height_gain > 0.9)
+    progress = float(np.clip(waypoint / 4.0, 0.0, 1.0))
+    return {
+        "spec_score": float(physical * progress * completed),
+        "physical_traversal": physical,
+        "waypoint_progress": progress,
+        "completion_gate": completed,
+    }
 '''
 
 
@@ -185,6 +212,44 @@ def test_validation_uses_exact_catalog_and_degenerate_object_fixtures(tmp_path):
         behavior_goal="move the ball into the goal and hold it there",
         channel_catalog=catalog)
     assert not dynamic["gates"]["catalog_literal_array_access"]
+
+
+def test_prompt_native_traversal_composes_physics_and_world_without_reference(
+    tmp_path: Path,
+) -> None:
+    """A legitimate compound metric needs physical traversal AND authored
+    completion in the same competent fixture; neither half alone may rescue it.
+
+    This is the no-stored-trajectory path: the physical exemplar is retargeted
+    from ``ABSTRACT_OBJECTIVE`` while the World catalog supplies the frozen
+    waypoint state.
+    """
+    draft = author_environment(
+        "Build four progressively taller boxes; jump onto each and pause",
+        robot_capability_id="unitree_g1:base",
+    )
+    catalog = compile_channel_catalog(draft.world_spec, draft.task_spec)
+    path = _write_metric(tmp_path, PROMPT_NATIVE_PARKOUR_METRIC, "parkour.py")
+
+    result = validate_generated_metric(
+        PROMPT_NATIVE_PARKOUR_METRIC,
+        path,
+        behavior_goal=(
+            "jump onto four progressively taller boxes, pause stably on every "
+            "box, then continue through the course"
+        ),
+        channel_catalog=catalog,
+    )
+
+    assert result["ok"], result["reasons"]
+    assert result["abstract_objective_program"] == [
+        "climb", "dwell", "climb", "dwell",
+        "climb", "dwell", "climb", "dwell",
+    ]
+    scores = result["archetype_scores"]
+    assert scores["catalog_competent"] > 0.9
+    assert scores["catalog_far_idle"] == pytest.approx(0.0)
+    assert scores["prompt_competent"] > 0.9
 
 
 def test_runtime_requires_matching_catalog_hash_and_loads_only_allowlist(tmp_path):

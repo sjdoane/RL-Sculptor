@@ -664,6 +664,43 @@ _ABSTRACT_PHASES = frozenset({
 })
 
 
+def _declared_abstract_objective(source: str) -> Optional[Mapping[str, Any]]:
+    """Read the data-only declaration from source without executing it.
+
+    Generated metrics execute behind a process proxy that intentionally exposes
+    only ``compute_spec``; module globals are not reflected back into the parent.
+    Reading ``getattr(mod, "ABSTRACT_OBJECTIVE")`` therefore always lost the
+    declaration and silently fell back to coarse text inference.  ``literal_eval``
+    accepts only inert Python literals, after which the closed phase vocabulary
+    below remains the authority.
+    """
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return None
+    for node in tree.body:
+        value: Optional[ast.expr] = None
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name) and target.id == "ABSTRACT_OBJECTIVE"
+            for target in node.targets
+        ):
+            value = node.value
+        elif (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == "ABSTRACT_OBJECTIVE"
+        ):
+            value = node.value
+        if value is None:
+            continue
+        try:
+            declared = ast.literal_eval(value)
+        except (ValueError, TypeError, SyntaxError, MemoryError, RecursionError):
+            return None
+        return declared if isinstance(declared, Mapping) else None
+    return None
+
+
 def _abstract_objective_program(
     behavior_goal: Optional[str], declared: Any = None,
 ) -> list[str]:
@@ -2063,7 +2100,7 @@ def validate_generated_metric(
     inject_joint_roles(meta, required_roles, lenient=True)
     arche = _archetypes()
     abstract_program = _abstract_objective_program(
-        behavior_goal, getattr(mod, "ABSTRACT_OBJECTIVE", None))
+        behavior_goal, _declared_abstract_objective(source))
     abstract_probe = _abstract_objective_probe(abstract_program)
     # The prompt-derived probe anchors non-degeneracy ONLY for a genuine TRAVERSAL /
     # parkour goal, where its ROOT-trajectory signature (climb height + a forward
