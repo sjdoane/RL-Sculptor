@@ -86,6 +86,52 @@ def test_authored_waypoint_command_rewards_keep_nominal_weight() -> None:
     assert _full_weight_authored_command_rewards(bundle) == frozenset()
 
 
+def test_rollout_evidence_excludes_metric_only_channels() -> None:
+    """Diagnosis receives batch progress, never frozen completion truth."""
+    import numpy as np
+
+    from sculptor.adapters._mjlab_runner import (
+        _reward_visible_rollout_evidence,
+    )
+
+    catalog = SimpleNamespace(channels=(
+        SimpleNamespace(
+            name="goal__route__distance", access="shared_shaping",
+            metric_role="progress", producer="waypoint_distance"),
+        SimpleNamespace(
+            name="goal__route__success", access="metric_only",
+            metric_role="completion", producer="success_hold"),
+        SimpleNamespace(
+            name="object__box__lin_vel_w", access="shared_shaping",
+            metric_role="state", producer="entity_state"),
+        SimpleNamespace(
+            name="object__box__pos_w", access="shared_shaping",
+            metric_role="state", producer="entity_state"),
+    ))
+    trajectory = {
+        "goal__route__distance": np.asarray([
+            [3.0, 4.0], [1.0, 2.0], [0.0, 99.0]], dtype=np.float32),
+        "goal__route__success": np.ones((3, 2), dtype=bool),
+        "object__box__lin_vel_w": np.asarray([
+            [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+            [[0.2, 0.0, 0.0], [0.0, 0.0, 0.0]],
+            [[9.0, 0.0, 0.0], [9.0, 0.0, 0.0]],
+        ], dtype=np.float32),
+        "object__box__pos_w": np.zeros((3, 2, 3), dtype=np.float32),
+    }
+    # The last row is an auto-reset and must not contaminate the summary.
+    valid = np.asarray([[True, True], [True, True], [False, False]])
+    evidence = _reward_visible_rollout_evidence(
+        trajectory, catalog, valid)
+
+    channels = evidence["channels"]
+    assert set(channels) == {
+        "goal__route__distance", "object__box__lin_vel_w"}
+    assert channels["goal__route__distance"]["final_median"] == 1.5
+    assert channels["goal__route__distance"]["final_zero_fraction"] == 0.0
+    assert channels["object__box__lin_vel_w"]["max_over_time_median"] == 0.1
+    assert "goal__route__success" not in channels
+
 def test_base_reward_contract_default_fields() -> None:
     c = RewardContract(observation_space_spec=None, action_space_spec=None)
     assert c.supports_batched is False

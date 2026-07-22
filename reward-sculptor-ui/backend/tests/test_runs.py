@@ -841,7 +841,10 @@ def test_run_sculpt_job_launch_gen_sentinel_disabled_runs_blind(
 def _fake_bridge_gen(*, accept: bool):
     """A mocked sculptor_bridge.generate_objective_metric: writes metric.py,
     fires the Ship-40 stage events, returns an accept/reject rec (no LLM)."""
-    def _gen(behavior_goal, out_dir, *, robot_hint=None, review=True, n_candidates=1, on_event=None):
+    def _gen(
+        behavior_goal, out_dir, *, robot_hint=None, review=True,
+        n_candidates=1, on_event=None, channel_catalog=None,
+    ):
         if on_event:
             on_event({"stage": "generating", "attempt": 1, "max": 3,
                       "message": "Generating candidate metric (attempt 1/3)…"})
@@ -1036,7 +1039,10 @@ def _fake_bridge_gen_seq(*accepts):
     attempt), writing metric.py each time."""
     state = {"i": 0}
 
-    def _gen(behavior_goal, out_dir, *, robot_hint=None, review=True, n_candidates=1, on_event=None):
+    def _gen(
+        behavior_goal, out_dir, *, robot_hint=None, review=True,
+        n_candidates=1, on_event=None, channel_catalog=None,
+    ):
         accept = accepts[min(state["i"], len(accepts) - 1)]
         state["i"] += 1
         if on_event:
@@ -1159,7 +1165,10 @@ def test_launch_gen_clears_progress_sidecar_on_cancel(
     from backend.services import metric_store, run_manager, sculptor_bridge
     from backend.services.job_manager import Job
 
-    def _gen_then_cancel(behavior_goal, out_dir, *, robot_hint=None, review=True, n_candidates=1, on_event=None):
+    def _gen_then_cancel(
+        behavior_goal, out_dir, *, robot_hint=None, review=True,
+        n_candidates=1, on_event=None, channel_catalog=None,
+    ):
         if on_event:  # write an active-progress sidecar, then get cancelled
             on_event({"stage": "generating", "attempt": 1, "max": 4, "message": "working"})
         raise asyncio.CancelledError()

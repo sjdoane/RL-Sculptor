@@ -1217,3 +1217,64 @@ one 750-PPO cycle, 1,024 envs, seed 42, two 1,000-step 1080p rollouts,
 `05de8e0f`) and `warm_start_loaded` for actor + critic before PPO iteration 0.
 The train worker is active: do not edit reload-watched core or run GPU audits
 until it finishes.
+
+## Official iter-5 audit + finite terminal arrival 2026-07-22 (Codex)
+
+UI job `55bbca2ef13a4c4a` finished and preserved
+`runs/iter_5/checkpoint.pt`. The official first-episode-safe trajectory and the
+complete 20-second 1920×1080 MP4 prove that the automatic diagnosis is wrong:
+the rendered robot visibly traverses past the four-box course, and an
+independent region-crossing audit finds all four intermediate regions in exact
+order for 64/64 environments. The batch remained upright with zero falls;
+62/64 entered the finish and 57/64 had no forbidden contact.
+
+The run is still not accepted as solved. Only 39/64 reached authored waypoint
+index 5 before timeout, 16/64 asserted the authored success channel, terminal
+horizontal speed averaged 0.13373 m/s, the final-window still fraction averaged
+0.561, and only environment 33 satisfied the full conjunctive validator. The
+rendered environment reached index 5 with zero contact and correct order but
+ended at 0.157 m/s with only 43% of its last two seconds below the speed gate.
+The full video and late keyframes show the actual failure: upright route
+completion followed by foot/torso shifting at the finish, not off-course
+loitering.
+
+The 2 m terminal brake introduced after iter 3 used a linear speed scale with
+no floor. It therefore approached the 0.35 m completion tolerance
+asymptotically: median index-5 time regressed from step 799 in iter 3 to step
+966 in iter 5, leaving too little dwell. The embodiment-neutral
+`WaypointVelocityCommand` now retains a 0.35 minimum speed scale until the
+finish tolerance is crossed, scales yaw authority down with the terminal
+approach instead of circling the target, then latches the base command's
+standing semantic and exact zero velocity. Intermediate route behavior is
+unchanged.
+
+Diagnosis is hardened without weakening the metric firewall. Every authored
+rollout now writes a batch-wide `reward_visible_rollout_evidence` summary into
+`behavior.json`, derived only from catalogued `shared_shaping` progress and
+entity-motion channels over each environment's first episode. All
+`metric_only` success/contact/objective channels are structurally excluded.
+The preliminary prompt must treat this 64-environment evidence as more
+representative than four frames from one percentile-labelled episode. On the
+archived iter-5 data, the safe summary reports goal waypoint-distance median
+2.16975→0.0 and finish-relative magnitude median 8.03509→0.79244, which directly
+prevents the false “never approached the route/finish” claim without exposing
+held-out completion truth.
+
+The UI's filesystem watcher also now waits for post-encode `behavior.json`
+before emitting its one-shot `rollout_done` and starting clip generation. The
+runner's explicit event was already correctly ordered, but the synthetic file
+event fired as soon as a growing MP4 exceeded 2 KiB and exhausted the bounded
+ffmpeg retry before the moov atom landed.
+
+Verification: focused core 65 passed; focused UI clip suite 7 passed; broad core
+2,218 passed / 1 expected optional-JAX skip in 4m44s; compileall,
+`git diff --check`, and scoped Ruff (ignoring only pre-existing F401 findings)
+passed. A pre-existing test-double drift exposed by the full UI suite was also
+corrected: metric generator fakes now accept the already-production
+`channel_catalog` argument; the affected metrics/run group is 49 passed.
+The complete UI backend suite then passed 563/563 in 3m08s.
+The false auto-generated reward v6 and env v3 remain preserved as provenance,
+but `selection_current.json` still correctly pins reward v5 + env v1 (selection
+v12). Do not train v6/env v3. The next action is a UI Resume from iter 5 after
+this code commit, using the pinned v5/env-v1 tuple and one focused recovery
+cycle; inspect the same full acceptance conjunction afterward.

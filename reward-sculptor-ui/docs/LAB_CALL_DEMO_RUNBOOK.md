@@ -23,22 +23,27 @@ Open **Projects → G1 Lab Showcase — Weave and Stop**.
   v1; the frozen world/task/evaluation half is unchanged)
 - Evaluation lineage: `world-58560025c10981814943d42e`
 - Objective metric: `gen_003` (accepted, prompt-native, observe-only)
-- Current live recovery job: `55bbca2ef13a4c4a` (clean code `919d20c`)
-- Latest completed showcase job: `80d549c83b41a134`
+- Latest completed recovery job: `55bbca2ef13a4c4a` (code `919d20c`)
+- Next recovery: pending UI Resume after the finite-arrival code update
 
-The July 22 iter-3 rollout completed the ordered route in 59/64 environments;
-58/64 asserted authored success and 51/64 both completed and avoided every
-box. It is not yet accepted as solved: only one environment satisfied the full
-two-second terminal-stillness gate. The frozen official metric reported zero
-because its last sample was MJLab's automatic reset-to-spawn frame, which
-looked like a 3.92 m/s teleport and erased signed displacement. A first-episode
-artifact-boundary fix and longer final-target braking are now active in the
-live recovery. Reward v5 crossfades route income into stronger terminal
-stillness without copying the held-out completion gate. The UI log has also
-proved that Resume crossed the missing iter-4 index and loaded actor + critic
-from the competent iter-3 checkpoint before PPO iteration 0. Treat the old
-`fit 0.00 / prog 0.005` card as preserved historical evidence of that capture
-defect, not as evidence that the robot failed to traverse the course.
+The July 22 iter-5 rollout independently crossed all four intermediate regions
+in exact order in 64/64 environments; 62/64 entered the finish, 57/64 avoided
+every box, and none fell. It is not yet accepted as solved: only 39/64 crossed
+the final waypoint tolerance before timeout, terminal speed averaged
+`0.13373 m/s`, the last-window still fraction averaged `0.561`, and only one
+environment satisfied the full two-second terminal-stillness gate. The
+20-second 1080p video is valid and shows upright course traversal followed by
+shifting at the finish.
+
+The completed run exposed that the longer final-target brake was too slow: its
+linear scale approached the completion tolerance asymptotically, moving median
+completion from step 799 to step 966. The next recovery uses a finite terminal
+arrival floor, reduced terminal yaw, and an explicit standing latch after
+crossing. Reward v5 still crossfades route income into terminal stillness
+without copying the held-out completion gate. The iter-5 auto-diagnosis that
+claims the robot never weaves is contradicted by the frozen trajectory and
+video; reward v6 and env v3 are preserved as failure provenance and must not be
+selected for the recovery. `selection_current.json` remains pinned to v5/v1.
 
 ## One-time startup
 
@@ -107,16 +112,16 @@ generated metric stays **observe-only** until it earns steer rights through
 empirical calibration; leave it in observe mode rather than weakening that
 trust boundary. The prepared project already has accepted metric `gen_003`.
 
-## Current one-cycle recovery
+## Next one-cycle recovery
 
-The live job `55bbca2ef13a4c4a` uses the exact behavior goal above with Auto
+Use **Resume** in the Training tab with the exact behavior goal above, Auto
 mode, one sculpt iteration, 750 rsl_rl iterations, 1,024 environments,
 `cuda:0`, 1,000 episode steps, two rollout episodes, seed 42, 1920×1080 video,
 and `gen_003` observe-only. It is intentionally a focused continuation from
-the competent iter-3 policy, not a new cold-start benchmark. Before accepting
-any duplicate launch, verify the Training log contains all three lines:
+the preserved iter-5 policy, not a new cold-start benchmark. Before letting
+the cycle continue, verify the Training log contains all three lines:
 
-- `resume_warm_start_resolved ... runs/iter_3/checkpoint.pt`
+- `resume_warm_start_resolved ... runs/iter_5/checkpoint.pt`
 - `warm_start_loaded ... load_cfg_keys=[actor, critic]`
 - `preserved authored command supervision at full weight`
 

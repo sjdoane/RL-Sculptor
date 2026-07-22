@@ -51,6 +51,47 @@ def _fake_job(slug: str, run_id: str = "job_fake") -> Job:
     )
 
 
+def test_filesystem_rollout_event_waits_for_post_encode_marker(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A growing MP4 must not consume the watcher's one-shot event."""
+    from backend.services import run_manager
+
+    project_dir = tmp_path / "proj"
+    source = _prep_source_mp4(project_dir, iter_n=0)
+    iter_dir = source.parent.parent
+    job = _fake_job("proj")
+    rendered: list[int] = []
+
+    class FakeStreamer:
+        async def maybe_render(self, _job, iter_n, _project_dir):
+            rendered.append(iter_n)
+
+    monkeypatch.setattr(
+        run_manager, "_streamer_for", lambda _job: FakeStreamer())
+    seen_rollouts: set[int] = set()
+    seen_done: set[int] = set()
+
+    async def check() -> None:
+        run_manager._check_iter_artifacts(
+            job, iter_dir, 0, seen_rollouts=seen_rollouts,
+            seen_iter_done=seen_done)
+        await asyncio.sleep(0)
+        assert not seen_rollouts
+        assert not any(e.get("type") == "rollout_done" for e in job.events)
+
+        (source.parent / "behavior.json").write_text("{}", encoding="utf-8")
+        run_manager._check_iter_artifacts(
+            job, iter_dir, 0, seen_rollouts=seen_rollouts,
+            seen_iter_done=seen_done)
+        await asyncio.sleep(0)
+
+    asyncio.run(check())
+    assert seen_rollouts == {0}
+    assert rendered == [0]
+    assert sum(e.get("type") == "rollout_done" for e in job.events) == 1
+
+
 # ── happy path ────────────────────────────────────────────────────────
 def test_streamer_emits_new_clip(tmp_path: Path) -> None:
     project_dir = tmp_path / "proj"

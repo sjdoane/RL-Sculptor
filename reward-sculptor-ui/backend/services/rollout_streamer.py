@@ -1,6 +1,6 @@
 """Per-run live-clip generator.
 
-On every filesystem-derived `rollout_done` event the streamer's
+On every artifact-ready filesystem-derived `rollout_done` event the streamer's
 `maybe_render(job, iter_n, project_dir)` method:
 
   1. confirms the sculptor's full 20 s rollout.mp4 is on disk + non-empty;
@@ -150,11 +150,10 @@ def _truncate_mp4(
     contain a keyframe, which is common for the adapter's rollout.mp4.
     Ultrafast runs in ~50-150 ms per 2 s clip on CPU (Prompt 9 R1 + R3).
 
-    Retry loop: the filesystem watcher can fire while the adapter is
-    still flushing its mp4 to disk ("moov atom not found" — the moov
-    atom is written last on file close). We retry up to 6 times with
-    exponential backoff up to ~3 s total; if still failing, we surface
-    a clip_skipped event rather than block forever.
+    The watcher normally gates this call on the post-encode behavior.json
+    readiness marker. Keep the bounded retry loop as defense in depth for
+    non-atomic/network filesystems: retry up to 6 times with exponential
+    backoff up to ~3 s total, then surface an honest clip_skipped event.
     """
     if _RENDER_SLOWDOWN_S is not None:
         # R3 test harness: artificial per-render sleep so saturation is

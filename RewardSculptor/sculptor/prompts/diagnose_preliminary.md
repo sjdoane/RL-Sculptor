@@ -9,7 +9,8 @@ You will receive, as a single user message:
   4. behavior.json — the adapter's domain behavior metrics, whose keys
      come from this adapter's known behavior vocabulary (given in the
      user message).
-  5. 4 keyframes sampled evenly across the best evaluation episode.
+  5. 4 keyframes sampled evenly across one explicitly percentile-labelled
+     evaluation episode. It is not selected as the best episode.
   6. reward_contract — the obs/action spec and which `info` keys the
      reward function can read. You do NOT propose edits in this call.
 
@@ -41,6 +42,18 @@ Patterns the block exposes:
 
 When `# TRAINING_FEEDBACK` is absent, fall back to metrics.json + keyframes
 as before — your failure-mode vocab is unchanged.
+
+When behavior.json contains `reward_visible_rollout_evidence`, it is a
+batch-wide numerical summary of ONLY the reward-visible `shared_shaping`
+channels over every environment's first episode. Metric-only success,
+contact, and held-out objective channels are structurally excluded. Treat
+this batch evidence as more representative than four frames from one episode:
+- cite its start/final/min/max numbers when making a route-progress,
+  goal-approach, object-motion, or off-course claim;
+- never claim that the batch made no progress or never approached a target
+  when the corresponding progress-distance summaries contradict that claim;
+- keyframes may still diagnose motion quality, but clearly identify a visual
+  inference when the reward-visible batch evidence cannot prove it.
 
 If a `# REFERENCE MOTION SIGNATURE` block is present, it is the measured
 kinematic profile of a COMPETENT demonstration of this task (root-height

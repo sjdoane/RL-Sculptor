@@ -18,7 +18,7 @@ def _make_project(client: TestClient, name: str = "Metrics") -> str:
 
 
 def _fake_generate(behavior_goal, out_dir, *, robot_hint=None, review=True,
-                   n_candidates=1, on_event=None):
+                   n_candidates=1, on_event=None, channel_catalog=None):
     if on_event:  # §Ship 40: exercise the progress channel
         on_event({"stage": "generating", "attempt": 1, "max": 3,
                   "message": "Generating candidate metric (attempt 1/3)…"})
@@ -88,7 +88,7 @@ def test_generate_best_of_n_forwarded_and_surfaced(client: TestClient, monkeypat
     captured: dict = {}
 
     def fake_gen(behavior_goal, out_dir, *, robot_hint=None, review=True,
-                 n_candidates=1, on_event=None):
+                 n_candidates=1, on_event=None, channel_catalog=None):
         captured["n_candidates"] = n_candidates
         rec = _fake_generate(behavior_goal, out_dir, robot_hint=robot_hint, review=review)
         rec.update({"n_candidates": n_candidates, "selected_candidate": 1,
@@ -124,7 +124,10 @@ def test_generate_writes_live_progress_then_clears(client: TestClient, monkeypat
 
     seen: dict = {}
 
-    def fake_gen(behavior_goal, out_dir, *, robot_hint=None, review=True, n_candidates=1, on_event=None):
+    def fake_gen(
+        behavior_goal, out_dir, *, robot_hint=None, review=True,
+        n_candidates=1, on_event=None, channel_catalog=None,
+    ):
         if on_event:
             on_event({"stage": "generating", "attempt": 1, "max": 3,
                       "message": "Generating candidate metric (attempt 1/3)…"})

@@ -813,6 +813,89 @@ def _full_weight_authored_command_rewards(world_bundle: Any | None) -> frozenset
     return frozenset()
 
 
+def _reward_visible_rollout_evidence(
+    trajectory: Mapping[str, Any], catalog: Any, valid_mask: Any,
+) -> dict[str, Any]:
+    """Summarize batch-wide task evidence without crossing the metric firewall.
+
+    Four rendered keyframes are necessarily ambiguous for courses, contacts,
+    and manipulation.  The authored channel catalog already labels which
+    arrays reward authoring may see.  Summarize only ``shared_shaping``
+    progress and motion channels, over each environment's first episode, so
+    the diagnoser can ground its visual interpretation without receiving a
+    success predicate, held-out contact, objective score, or other metric-only
+    signal.  The selection is semantic (catalog role/access), never keyed to a
+    robot, task, goal, or channel name.
+    """
+    import numpy as np
+
+    mask = np.asarray(valid_mask, dtype=bool)
+    if mask.ndim != 2:
+        return {}
+
+    def rounded(value: float) -> float:
+        return round(float(value), 5)
+
+    summaries: dict[str, Any] = {}
+    for spec in tuple(getattr(catalog, "channels", ()) or ()):
+        if str(getattr(spec, "access", "")) != "shared_shaping":
+            continue
+        role = str(getattr(spec, "metric_role", ""))
+        producer = str(getattr(spec, "producer", ""))
+        if role != "progress" and producer != "entity_state":
+            continue
+        name = str(getattr(spec, "name", ""))
+        # Position and quaternion state add prompt volume but little behavioral
+        # evidence; for generic entity state, retain only motion channels.
+        if producer == "entity_state" and not name.endswith(
+                ("__lin_vel_w", "__ang_vel_w")):
+            continue
+        raw = trajectory.get(name)
+        if raw is None:
+            continue
+        values = np.asarray(raw)
+        if values.ndim < 2 or values.shape[:2] != mask.shape:
+            continue
+        magnitude = (
+            np.linalg.norm(values, axis=-1)
+            if values.ndim > 2 else values.astype(np.float64, copy=False)
+        )
+        if magnitude.shape != mask.shape:
+            continue
+        per_env: list[np.ndarray] = [
+            magnitude[:, env_i][mask[:, env_i]]
+            for env_i in range(mask.shape[1])
+        ]
+        per_env = [series[np.isfinite(series)] for series in per_env
+                   if series.size]
+        if not per_env or any(not series.size for series in per_env):
+            continue
+        start = np.asarray([series[0] for series in per_env])
+        final = np.asarray([series[-1] for series in per_env])
+        minimum = np.asarray([np.min(series) for series in per_env])
+        maximum = np.asarray([np.max(series) for series in per_env])
+        summaries[name] = {
+            "role": role,
+            "value": "vector_magnitude" if values.ndim > 2 else "scalar",
+            "environments": len(per_env),
+            "start_median": rounded(np.median(start)),
+            "final_median": rounded(np.median(final)),
+            "final_p10": rounded(np.quantile(final, 0.1)),
+            "final_p90": rounded(np.quantile(final, 0.9)),
+            "final_zero_fraction": rounded(np.mean(np.abs(final) <= 1e-6)),
+            "min_over_time_median": rounded(np.median(minimum)),
+            "max_over_time_median": rounded(np.median(maximum)),
+            "max_over_time_p90": rounded(np.quantile(maximum, 0.9)),
+        }
+    if not summaries:
+        return {}
+    return {
+        "policy": "shared_shaping channels only; metric_only excluded",
+        "episode_scope": "first episode per environment",
+        "channels": summaries,
+    }
+
+
 def _load_authored_robot_capability(selection_path: str) -> Any | None:
     if not selection_path:
         return None
@@ -2990,6 +3073,11 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
         "max_episode_steps": int(max_steps),
         "rollout_num_envs": int(num_envs),
     }
+    if world_bundle is not None:
+        shaping_evidence = _reward_visible_rollout_evidence(
+            trajectory, world_bundle.channel_catalog, state_valid_mask)
+        if shaping_evidence:
+            behavior["reward_visible_rollout_evidence"] = shaping_evidence
     (output_dir / "behavior.json").write_text(json.dumps(behavior, indent=2))
 
     # §7.3: persist the mjcf-limits snapshot taken at env-init time so

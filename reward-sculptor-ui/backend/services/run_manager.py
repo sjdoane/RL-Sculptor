@@ -1017,7 +1017,14 @@ def _check_iter_artifacts(
     seen_realism: set[int] | None = None,
 ) -> None:
     mp4 = iter_dir / "rollout" / "rollout.mp4"
-    if n not in seen_rollouts and mp4.is_file() and mp4.stat().st_size > 2048:
+    # An MP4 becomes visible before ffmpeg writes its closing moov atom.  The
+    # rollout runner writes behavior.json only after video encoding and all
+    # trajectory artifacts are closed, so use it as the generic readiness
+    # marker.  Emitting on file-size alone permanently marked the iteration as
+    # seen while the clip worker was still receiving "moov atom not found".
+    behavior = iter_dir / "rollout" / "behavior.json"
+    if (n not in seen_rollouts and mp4.is_file()
+            and mp4.stat().st_size > 2048 and behavior.is_file()):
         seen_rollouts.add(n)
         job.emit({
             "type": "rollout_done",

@@ -495,7 +495,7 @@ def _waypoint_velocity_command_types() -> tuple[type[Any], type[Any]]:
                 distance / float(self.cfg.slow_radius_m), min=0.35, max=1.0)
             terminal_scale = torch.clamp(
                 distance / float(self.cfg.terminal_slow_radius_m),
-                min=0.0, max=1.0)
+                min=float(self.cfg.terminal_min_speed_scale), max=1.0)
             speed = float(self.cfg.cruise_speed_mps) * torch.where(
                 terminal_target, terminal_scale, normal_scale)
             speed = torch.where(complete, torch.zeros_like(speed), speed)
@@ -516,14 +516,27 @@ def _waypoint_velocity_command_types() -> tuple[type[Any], type[Any]]:
 
             self.vel_command_b[:, 0] = vx_b
             self.vel_command_b[:, 1] = vy_b
-            self.vel_command_b[:, 2] = torch.clamp(
+            yaw_rate = torch.clamp(
                 float(self.cfg.turn_gain) * bearing_b,
                 min=-float(self.cfg.max_yaw_rate),
                 max=float(self.cfg.max_yaw_rate),
             )
+            # Slow the turn request with the terminal linear approach.  A
+            # full-rate yaw command next to the finish made the body circle
+            # and shuffle around the target even while its linear command was
+            # braking.  Intermediate route turns retain their full authority.
+            yaw_scale = torch.where(
+                terminal_target, terminal_scale, torch.ones_like(speed))
+            self.vel_command_b[:, 2] = yaw_rate * yaw_scale
             self.vel_command_b[complete] = 0.0
             self.vel_command_w[:, :2] = velocity_w
             self.vel_command_w[:, 2] = self.vel_command_b[:, 2]
+            # Preserve the semantic distinction offered by the base command:
+            # completed authored routes are standing commands, not merely a
+            # coincidental all-zero velocity sample.  Consumers that only use
+            # the command tensor remain unchanged; future embodiment-specific
+            # standing priors can use this flag without task-name keying.
+            self.is_standing_env[:] = complete
 
     @dataclass(kw_only=True)
     class WaypointVelocityCommandCfg(UniformVelocityCommandCfg):
@@ -532,6 +545,7 @@ def _waypoint_velocity_command_types() -> tuple[type[Any], type[Any]]:
         cruise_speed_mps: float = 0.8
         slow_radius_m: float = 0.75
         terminal_slow_radius_m: float = 2.0
+        terminal_min_speed_scale: float = 0.35
         turn_gain: float = 2.0
         max_yaw_rate: float = 1.5
 
