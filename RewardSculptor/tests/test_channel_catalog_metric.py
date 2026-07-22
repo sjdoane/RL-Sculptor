@@ -11,6 +11,7 @@ from sculptor.eval.generated_metric import (
     compute_generated_metric,
 )
 from sculptor.eval.metric_validate import (
+    _abstract_objective_program,
     _abstract_objective_probe,
     discrimination_of_metric,
     validate_generated_metric,
@@ -27,6 +28,22 @@ from sculptor.world.channels import (
     validate_channel_catalog,
     validate_trajectory_channels,
 )
+
+
+def test_slalom_boxes_compile_as_planar_route_not_climbs():
+    goal = (
+        "Run a smooth slalom through four ordered waypoints, alternating "
+        "around four boxes, then stop upright for 2 seconds."
+    )
+    assert _abstract_objective_program(goal) == [
+        "move_forward", "recover", "dwell",
+    ]
+    assert _abstract_objective_program(
+        "Jump onto four boxes and pause on each platform"
+    ) == [
+        "climb", "dwell", "climb", "dwell",
+        "climb", "dwell", "climb", "dwell",
+    ]
 
 
 def _catalog() -> ChannelCatalog:

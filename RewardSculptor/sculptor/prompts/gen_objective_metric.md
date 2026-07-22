@@ -222,6 +222,14 @@ Any array may be ABSENT — always `arrays.get(k)` + guard for None.
     always the right spelling (a live metric was rejected five retries in a
     row for `getattr(meta, ...)`).
 
+    When an EXACT CHANNEL CATALOG is provided below, its names intentionally
+    contain `__`. Those catalog-key literals are the sole exception to the
+    dunder-string rule, and only when written DIRECTLY at every access, e.g.
+    `arrays.get("goal__task__success")`. Never assign channel-name constants,
+    concatenate/build a key, put keys in a list/tuple/dict, or loop over key
+    strings: the static catalog gate requires a literal declared key directly
+    inside each `arrays.get("...")` or `arrays["..."]` expression.
+
 Think about which physical signature DEFINITELY distinguishes success from the
 specific failure modes — wrong direction, incomplete/partial motion, tiny
 amplitude, balancing instead of acting, flailing instead of executing — then

@@ -933,7 +933,7 @@ def generate_objective_metric(
         # objection (a missing signed-direction check, a too-soft gate) gets corrected
         # instead of failing the run. Only runs with review on + a concrete veto.
         rev_retry = 0
-        while (review and passed and not accepted
+        while (review and not accepted
                and review_out and not review_out.get("approved")
                and not review_unavailable
                and rev_retry < _MAX_REVIEW_RETRIES):
@@ -948,6 +948,16 @@ def generate_objective_metric(
                 + json.dumps(review_out.get("concerns") or [], indent=2)
                 + "\nRewrite the metric to FIX every concern (keep the sharp completion gate "
                 + "× min-of-saturating-channels form). Output ONLY the corrected module.")
+            if validation is not None and not passed:
+                user += (
+                    "\n\nThe previous reviewer-feedback correction then FAILED the static "
+                    "validation gates:\n"
+                    + json.dumps(validation.get("reasons") or [], indent=2)
+                    + "\nFix these validation failures too. In particular, every authored "
+                      "channel access must put its exact catalog key literal directly inside "
+                      "arrays.get(\"...\"); do not build, alias, group, or loop over channel "
+                      "key strings."
+                )
             try:
                 source = _sample_source(client, system_prompt, user, model=model)
             except Exception as e:  # noqa: BLE001 — a failed retry call ends the retries
@@ -964,7 +974,11 @@ def generate_objective_metric(
                              "reasons": validation["reasons"]})
             passed = bool(validation["ok"])
             if not passed:
-                break                        # the correction broke validation — stop thrashing
+                # Keep the bounded review-retry budget moving.  The next retry
+                # receives both the original semantic veto and these concrete
+                # static-gate failures; previously one invalid correction
+                # discarded the remaining repair attempt immediately.
+                continue
             review_out, review_panel = _dispatch_review(
                 source, validation,
                 f"Re-reviewing the corrected metric (retry {rev_retry})…")

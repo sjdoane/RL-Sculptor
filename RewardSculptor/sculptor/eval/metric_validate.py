@@ -755,6 +755,18 @@ def _abstract_objective_program(
         "pause", "pauses", "pausing", "wait", "waiting", "hold", "holding",
         "stop", "stopping", "dwell", "dwelling",
     )
+    # Objects describe geometry, not necessarily a vertical action.  A slalom
+    # or weave AROUND boxes is planar route following; treating the noun
+    # "boxes" alone as a climb invents vertical motion and gives the generated
+    # metric's independent validator the wrong positive exemplar.
+    planar_route = has(
+        "slalom", "slaloms", "weave", "weaves", "weaving", "zigzag",
+        "waypoint", "waypoints",
+    ) or (
+        has("around")
+        and has("box", "boxes", "obstacle", "obstacles", "cone", "cones")
+    )
+    staged_climb = staged_climb and not planar_route
     if staged_climb:
         # Preserve an explicitly prompted course cardinality. This is still an
         # abstract phase count—not scene geometry—and therefore works for any
@@ -782,7 +794,7 @@ def _abstract_objective_program(
             if wants_dwell:
                 phases.append("dwell")
 
-    if has("forward", "forwards", "ahead") and not staged_climb:
+    if planar_route or (has("forward", "forwards", "ahead") and not staged_climb):
         phases.append("move_forward")
     elif has("backward", "backwards", "reverse"):
         phases.append("move_backward")
@@ -829,6 +841,8 @@ def _abstract_objective_program(
         phases.append("kick")
     if has("oscillate", "oscillates", "oscillating", "floss", "flossing", "shake"):
         phases.append("oscillate")
+    if wants_dwell and not staged_climb:
+        phases.append("dwell")
     return phases[:12]
 
 

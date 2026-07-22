@@ -876,6 +876,34 @@ def test_review_feedback_retry_recovers(tmp_path):
     assert any(a.get("review_retry") for a in rec["attempts"])    # a review-retry happened
 
 
+def test_review_feedback_retry_repairs_an_invalid_correction(tmp_path):
+    """A semantic-review repair can itself violate a static gate.
+
+    Preserve the remaining bounded retry, feed it both failure classes, and
+    accept the next source instead of abandoning generation after one invalid
+    correction.
+    """
+    from sculptor.eval.metric_gen import generate_objective_metric
+
+    out = tmp_path / "rfr_static"
+    client = _SelectiveReviewClient(
+        [TOE_TOUCH_NOVEL, BAD_IMPORT, COARSE_DIP],
+        reject_marker="REQUIRED_JOINT_ROLES",
+    )
+    rec = generate_objective_metric(
+        "touch your toes then stand back up", out,
+        robot_hint="unitree_g1", client=client, n_candidates=1,
+    )
+
+    assert rec["accepted"], rec
+    repairs = [a for a in rec["attempts"] if a.get("review_retry")]
+    assert len(repairs) == 2
+    assert repairs[0]["ok"] is False
+    assert repairs[1]["ok"] is True
+    assert "FAILED the static validation gates" in client.messages.users[-1]
+    assert (out / "metric.py").read_text().strip() == COARSE_DIP.strip()
+
+
 def test_review_veto_gives_up_after_bounded_retries(tmp_path):
     """A persistently-vetoed metric stops after _MAX_REVIEW_RETRIES (no infinite loop):
     not accepted, and the bounded retries are recorded."""
