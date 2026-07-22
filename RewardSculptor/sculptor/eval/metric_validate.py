@@ -2284,7 +2284,27 @@ def validate_generated_metric(
             )
         )
     )
-    if abstract_is_traversal:
+    # A real reference remains the strongest task-specific validator.  When no
+    # trajectory exists, however, a novel/compound goal must not be judged only
+    # against the generic fold/wave battery: that battery is intentionally broad
+    # and may not perform the prompted phase sequence at all.  Retarget the
+    # independently compiled task-space program into its competent validator
+    # exemplar for every otherwise-unrecognized goal.  Recognized single-skill
+    # families keep their hardened fixed positives (kick/jump/floss/locomotion),
+    # while traversal retains its existing prompt-native path.  This is
+    # embodiment-neutral: the probe uses universal root/gravity/end-effector
+    # quantities and named roles, never robot IDs or simulator task names.
+    abstract_is_prompt_native = bool(
+        abstract_probe is not None
+        and (
+            abstract_is_traversal
+            or (
+                not references
+                and (family is None or len(abstract_program) > 1)
+            )
+        )
+    )
+    if abstract_is_prompt_native:
         arche["prompt_competent"] = abstract_probe
     catalog_cases: dict[str, str] = {}
     if catalog is not None:
@@ -2316,7 +2336,7 @@ def validate_generated_metric(
             # that conjunctively required motion and waypoint success score zero.
             competent_base = (
                 arche["prompt_competent"]
-                if name == "catalog_competent" and abstract_is_traversal
+                if name == "catalog_competent" and abstract_is_prompt_native
                 else arche["still"]
             )
             fixture_base = {
@@ -2400,13 +2420,15 @@ def validate_generated_metric(
     positive_keys = (
         "active", "active_kick", "active_floss", "active_jump",
     )
-    if abstract_is_traversal:
+    if abstract_is_prompt_native:
         # Compound-traversal positives (the generic `active_parkour` exemplar + the
-        # prompt-derived `prompt_competent`) anchor a parkour metric. BOTH travel
-        # forward, so they are scoped to a real traversal goal — as universal
-        # positives they rescued an in-place metric that merely rewards walking
-        # (the walker-fold bypass) and masked the flail/still negatives.
-        positive_keys += ("active_parkour", "prompt_competent")
+        # prompt-derived `prompt_competent`) anchor parkour.  For a novel prompt
+        # with no stored reference, only the prompt-derived exemplar is added: it
+        # preserves the actual ordered phase program rather than silently asking
+        # a generic posture/gesture probe to stand in for the requested action.
+        if abstract_is_traversal:
+            positive_keys += ("active_parkour",)
+        positive_keys += ("prompt_competent",)
     negative_keys = ("still", "fallen", "upright_flail", "chaotic")
 
     nondegen = True

@@ -1027,6 +1027,11 @@ def generate_objective_metric(
             # references_used/reference_signatures above, at the
             # field-VALUE level).
             "eval_reset_preview": eval_reset,
+            # Persist the exact data-only oracle shared by authoring and
+            # validation.  This makes prompt-only certification auditable in
+            # the UI/artifact even when no trajectory was attached.
+            "abstract_objective": abstract_objective,
+            "stored_trajectory_required": False,
             # Every generated metric now records the independent oracle that
             # certified it.  A stored motion is optional: without one, the
             # closed-vocabulary prompt program is retargeted onto universal
