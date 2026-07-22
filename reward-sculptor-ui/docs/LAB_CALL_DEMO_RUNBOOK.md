@@ -24,7 +24,8 @@ Open **Projects → G1 Lab Showcase — Weave and Stop**.
 - Evaluation lineage: `world-58560025c10981814943d42e`
 - Objective metric: `gen_003` (accepted, prompt-native, observe-only)
 - Latest completed recovery job: `55bbca2ef13a4c4a` (code `919d20c`)
-- Next recovery: pending UI Resume after the finite-arrival code update
+- Active recovery: UI job `job_556e643b0b1ad22b`, launched from clean code
+  `83413d9` with **Resume exact promoted tuple** enabled
 
 The July 22 iter-5 rollout independently crossed all four intermediate regions
 in exact order in 64/64 environments; 62/64 entered the finish, 57/64 avoided

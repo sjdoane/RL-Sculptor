@@ -1311,3 +1311,16 @@ switch, use one 750-PPO recovery cycle, Auto, 1,024 envs, seed 42, two 1,000-ste
 1080p episodes, and `gen_003` observe-only. Confirm the restore event names
 reward v5/env v1 before PPO begins, then audit the full conjunctive acceptance
 gate.
+
+Committed as `83413d9`. The corrected continuation is now running from the UI
+as `job_556e643b0b1ad22b` with exactly those settings. Its visible event log
+recorded `promoted_tuple_restored` before any training output: selection v12,
+tuple `785b6c62f942d41b250618c4bda3bb5a2d53023fb12b51bf8299c0efd11eedef`,
+reward v5 SHA `67680111…`, and env v1 SHA `35b6122c…`. The actual worker command
+loads `runs/iter_5/checkpoint.pt`, trains against `rewards/current.py` and
+`env/current.json` after restoration, and pins `env/selection_v13.json`; that
+iteration artifact has the same tuple hash and exact reward-v5/env-v1 refs.
+PPO is active. Do not edit reload-watched core or run intermediate GPU audits.
+After it finishes, inspect the official first-episode-safe trajectory, metric
+and fitness artifacts, keyframes, and full MP4 against the entire acceptance
+conjunction before making any further change.
