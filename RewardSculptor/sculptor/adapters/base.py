@@ -158,6 +158,14 @@ class RewardContract:
     # The reward module's compute_reward_batched receives dict[str, Tensor]
     # where tensor.shape == (num_envs, *state_schema[k]).
     state_schema: Optional[dict[str, tuple[int, ...]]] = None
+    # Per-step feature shape for every ``info`` value, excluding the leading
+    # num_envs dimension. Most legacy signals are scalar ``()``, while
+    # authored channels such as region-relative positions and object linear
+    # velocities are vectors like ``(3,)``. Validators and prompt builders
+    # must preserve these shapes; pretending every value is ``(N,)`` lets a
+    # generated reward pass preflight and then crash on the first real env
+    # step when it reshapes an ``(N, 3)`` tensor to ``(N,)``.
+    info_schema: Optional[dict[str, tuple[int, ...]]] = None
     # Optional resolved WorldSpec channel contract. It is represented as
     # JSON-compatible data here to avoid coupling adapter contributors to a
     # particular compiler class. Authored runners verify its content hash.

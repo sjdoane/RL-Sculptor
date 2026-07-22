@@ -18,6 +18,7 @@ import pytest
 from sculptor.diagnose import Diagnosis, ProposedEdit
 from sculptor.edit import (
     EditValidationError,
+    _call_compute_reward_batched,
     _extract_formula_identifiers,
     _pre_validate,
     apply_edits,
@@ -673,6 +674,7 @@ def test_build_dummy_inputs_uses_state_schema_when_present(tmp_path):
             "projected_gravity_b": (3,),
             "command_vel": (3,),
         },
+        info_schema={"episode_length": (), "terminated": ()},
     )
     state, action, next_state, info = _build_dummy_inputs(contract)
     assert isinstance(state, dict), "state must be a dict for schema contracts"
@@ -683,6 +685,38 @@ def test_build_dummy_inputs_uses_state_schema_when_present(tmp_path):
     assert state["actuator_force"].shape == (1, 12)
     assert isinstance(info, dict)
     assert "episode_length" in info and "terminated" in info
+
+
+def test_batched_preflight_preserves_vector_info_shapes():
+    """A vector authored channel must reach the probe as (N, 3).
+
+    This is the exact pre-training regression that previously let generated
+    code reshape ``region__finish__relative`` from (1024, 3) to (1024,) and
+    crash on the first Mjlab step.
+    """
+    from sculptor.adapters.base import RewardContract
+
+    class _BadVectorReward:
+        @staticmethod
+        def compute_reward_batched(state, action, next_state, info):
+            n = action.shape[0]
+            finish = info["region__finish__relative"].reshape(n)
+            return finish, {"finish": finish}
+
+    contract = RewardContract(
+        observation_space_spec=None,
+        action_space_spec=None,
+        expected_info_keys=["region__finish__relative"],
+        supports_batched=True,
+        state_schema={"actuator_force": (2,)},
+        info_schema={"region__finish__relative": (3,)},
+    )
+
+    with pytest.raises(
+        EditValidationError,
+        match="shape.*invalid|invalid.*shape",
+    ):
+        _call_compute_reward_batched(_BadVectorReward(), contract)
 
 
 def test_build_dummy_inputs_gym_path_unchanged():

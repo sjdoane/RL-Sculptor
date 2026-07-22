@@ -497,6 +497,9 @@ class MjlabAdapter(SculptorAdapter):
     def reward_contract(self) -> RewardContract:
         state_schema = _schema_for_task(self.task_id)
         info_keys = _info_keys_for_task(self.task_id)
+        info_schema: dict[str, tuple[int, ...]] = {
+            key: () for key in info_keys
+        }
         channel_catalog = None
         if self._world_bundle is not None:
             from sculptor.world.capabilities import resolve_robot_capability
@@ -520,6 +523,22 @@ class MjlabAdapter(SculptorAdapter):
             ]
             info_keys = list(dict.fromkeys(
                 list(_INFO_KEYS) + list(cap.reward_info_keys) + shared_names))
+            info_schema = {key: () for key in info_keys}
+            for channel in channel_catalog.get("channels", []):
+                if channel.get("access") != "shared_shaping":
+                    continue
+                name = str(channel.get("name", ""))
+                raw_shape = channel.get("shape", [])
+                if not name or not isinstance(raw_shape, list):
+                    continue
+                # Catalog trajectories are (T, N, *feature). The reward
+                # runtime exposes one simulator step, hence (N, *feature).
+                trailing = raw_shape[2:]
+                if all(
+                    isinstance(dim, int) and not isinstance(dim, bool) and dim > 0
+                    for dim in trailing
+                ):
+                    info_schema[name] = tuple(trailing)
         return RewardContract(
             observation_space_spec=None,
             action_space_spec=None,
@@ -533,6 +552,7 @@ class MjlabAdapter(SculptorAdapter):
             # in hand (MJLAB_PIVOT_DESIGN §3.3).
             min_gpu_memory_gb=6.0 if "G1" in self.task_id else 4.0,
             state_schema=state_schema,
+            info_schema=info_schema,
             channel_catalog=channel_catalog,
         )
 
@@ -556,9 +576,10 @@ class MjlabAdapter(SculptorAdapter):
             """\
             import importlib.util, json, sys
             import torch
-            path, schema_json, action_dim, info_keys_json = sys.argv[1:5]
+            path, schema_json, action_dim, info_keys_json, info_schema_json = sys.argv[1:6]
             schema = json.loads(schema_json)
             info_keys = json.loads(info_keys_json)
+            info_schema = json.loads(info_schema_json)
             spec = importlib.util.spec_from_file_location('_probe', path)
             mod = importlib.util.module_from_spec(spec)
             try:
@@ -568,7 +589,10 @@ class MjlabAdapter(SculptorAdapter):
                 next_state = {k: torch.zeros((1, *shape), dtype=torch.float32)
                               for k, shape in schema.items()}
                 action = torch.zeros((1, int(action_dim)), dtype=torch.float32)
-                info = {k: torch.zeros((1,), dtype=torch.float32) for k in info_keys}
+                info = {
+                    k: torch.zeros((1, *info_schema.get(k, [])), dtype=torch.float32)
+                    for k in info_keys
+                }
                 out = mod.compute_reward(state, action, next_state, info)
                 if not (isinstance(out, tuple) and len(out) == 2):
                     raise TypeError(f'compute_reward must return (reward, components); got {type(out).__name__}')
@@ -596,12 +620,17 @@ class MjlabAdapter(SculptorAdapter):
 
         schema_json = json.dumps({k: list(v) for k, v in schema.items()})
         info_keys_json = json.dumps(contract.expected_info_keys)
+        info_schema_json = json.dumps({
+            key: list(shape)
+            for key, shape in (contract.info_schema or {}).items()
+        })
 
         try:
             proc = subprocess.run(
                 [
                     sys.executable, "-c", script,
                     str(path), schema_json, str(action_dim), info_keys_json,
+                    info_schema_json,
                 ],
                 capture_output=True, text=True, timeout=30.0,
             )

@@ -274,7 +274,13 @@ def _build_dummy_inputs(contract) -> tuple[Any, Any, Any, dict]:
         # Info as dict of torch scalars — Claude's batched path often
         # does `info["fallen"].to(device)` or arithmetic with it.
         info_keys = list(contract.expected_info_keys or [])
-        info = {k: torch.zeros((1,), dtype=torch.float32) for k in info_keys}
+        info_schema = getattr(contract, "info_schema", None) or {}
+        info = {
+            key: torch.zeros(
+                (1, *tuple(info_schema.get(key, ()))), dtype=torch.float32,
+            )
+            for key in info_keys
+        }
         return state, action, next_state, info
     # Gym-style path unchanged (gym_sb3 uses numpy throughout).
     state = _dummy_from_space(contract.observation_space_spec)
@@ -698,8 +704,13 @@ def _call_compute_reward_batched(mod, contract) -> None:
                   for k, shape in schema.items()}
     action_dim = int(schema.get("actuator_force", (1,))[0])
     action = torch.zeros((n, action_dim), dtype=torch.float32)
-    info = {k: torch.zeros((n,), dtype=torch.float32)
-            for k in (contract.expected_info_keys or [])}
+    info_schema = getattr(contract, "info_schema", None) or {}
+    info = {
+        key: torch.zeros(
+            (n, *tuple(info_schema.get(key, ()))), dtype=torch.float32,
+        )
+        for key in (contract.expected_info_keys or [])
+    }
     try:
         out = mod.compute_reward_batched(state, action, next_state, info)
     except Exception as e:  # noqa: BLE001 — surface as validation error
@@ -1118,8 +1129,13 @@ def _build_user_prompt(
     supports_batched = bool(getattr(contract, "supports_batched", False))
     if supports_batched:
         schema = getattr(contract, "state_schema", None) or {}
+        info_schema = getattr(contract, "info_schema", None) or {}
         training_device = getattr(contract, "training_device", "any")
         schema_serialized = {k: list(v) for k, v in schema.items()}
+        info_schema_serialized = {
+            key: list(info_schema.get(key, ()))
+            for key in (contract.expected_info_keys or [])
+        }
         batched_block = (
             "# BATCHED_CONTRACT (supports_batched=True)\n"
             "This adapter trains on GPU with parallel environments. Your "
@@ -1136,8 +1152,13 @@ def _build_user_prompt(
             f"  state / next_state: dict[str, Tensor] with per-key "
             f"feature shapes = {json.dumps(schema_serialized, sort_keys=True)}\n"
             f"  action: Tensor shape (N, action_dim)\n"
-            f"  info:   dict[str, Tensor of shape (N,)] with keys "
-            f"{list(contract.expected_info_keys)}\n\n"
+            "  info:   dict[str, Tensor] with per-key feature shapes "
+            "below (each runtime tensor is (N, *feature_shape); [] means "
+            "a scalar per env):\n"
+            f"{json.dumps(info_schema_serialized, sort_keys=True)}\n\n"
+            "Never reshape a vector-valued info channel to (N,). Reduce "
+            "it intentionally (for example, a relative-position or velocity "
+            "3-vector usually needs a norm over dim=-1).\n\n"
             "Output shapes:\n"
             "  rewards:     Tensor shape (N,) on the same device as inputs\n"
             "  components:  dict[str, Tensor of shape (N,)]\n\n"

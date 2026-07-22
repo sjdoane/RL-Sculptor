@@ -146,6 +146,7 @@ def test_mjlab_adapter_reward_contract_is_batched() -> None:
     assert c.training_device == "gpu"
     assert c.min_gpu_memory_gb is not None and c.min_gpu_memory_gb > 0
     assert c.state_schema is not None
+    assert c.info_schema is not None
     # Keys the sculptor reward-term snapshot emits for velocity tasks.
     expected_keys = {
         "qpos", "qvel", "base_lin_vel_b", "base_ang_vel_b",
