@@ -20,9 +20,11 @@ import { SPEC_METRIC_NAMES } from "@/lib/types";
 // training is modeled from the controls that dominate runtime: PPO iterations
 // and parallel environment count, plus fixed rollout/LLM overhead.  Go1 is
 // calibrated from the 2026-07-20 authored-world showcase on an RTX 5070
-// Laptop: 750 iters × 1024 envs took ~34 min/cycle, plus ~3 min for the final
-// fresh best-policy evaluation.  The previous proportional heuristic reported
-// 44 min for the whole four-cycle job; the observed duration was 2 h 21 min.
+// Laptop: 750 iters × 1024 envs took ~34 min/cycle on the flat baseline, plus
+// ~3 min for the final fresh best-policy evaluation. Authored legged-robot
+// worlds can be materially slower because scene objects and perceptive sensors
+// add work to every vectorized step. The 2026-07-22 G1 slalom (four objects,
+// five regions, height scan) ran at roughly 4.5× the flat-world calibration.
 const LEGACY_SECONDS_PER_CYCLE: Record<string, number> = {
   gym_sb3: 180,
 };
@@ -332,8 +334,16 @@ export function NewRunDialog({
       // cannot produce a zero/negative estimate.
       const envRatio = Math.max(0.125, envs / timing.referenceEnvs);
       const envScale = Math.pow(envRatio, 0.35);
+      // Keep the flat-task calibration for projects without an authored world,
+      // but price in the measured cost of authored scenes for legged robots.
+      // This is deliberately conservative: an honest overestimate is safer than
+      // telling a user a four-cycle overnight run will finish after one cycle.
+      const authoredWorldScale = worldSel.data
+        && defaults.kind !== "mjlab_cartpole"
+        ? 4
+        : 1;
       const perCycle = timing.fixedSeconds
-        + timing.secondsPerTrainingIter * innerIters * envScale;
+        + timing.secondsPerTrainingIter * innerIters * envScale * authoredWorldScale;
       const finalBestEval = fitnessMetric ? timing.finalEvalSeconds : 0;
       return perCycle * iterations + finalBestEval;
     }
@@ -346,7 +356,7 @@ export function NewRunDialog({
   }, [
     dryRun, defaults.kind, defaults.num_envs,
     defaults.training_iterations, fitnessMetric, isMjlab, iterations,
-    numEnvs, trainingIters,
+    numEnvs, trainingIters, worldSel.data,
   ]);
   const eta = useMemo(() => formatEta(etaSeconds), [etaSeconds]);
   const isLongRun = etaSeconds >= 30 * 60; // 30 min
