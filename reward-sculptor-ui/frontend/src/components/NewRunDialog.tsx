@@ -929,8 +929,8 @@ export function NewRunDialog({
                   </Btn>}
                   <span style={{ color: "var(--rs-muted)" }}>
                     {isLaunchGen
-                      ? "generated at launch as the run's first step — runs observe-only, auto-calibrated against a matching built-in."
-                      : "built-ins steer directly; an auto-generated metric observes until it passes calibration."}
+                      ? "generated at launch from the prompt — no stored trajectory required; runs observe-only until calibrated."
+                      : "prompt-native validation works without a stored trajectory; generated metrics observe until calibration."}
                   </span>
                 </div>
 

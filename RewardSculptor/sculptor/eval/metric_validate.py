@@ -232,8 +232,16 @@ def resolve_behavior_family(
             "jump off", "jumps off", "jumping off", "jump over", "jumps over",
             "jumping over", "jump across", "jumps across", "jump onto",
             "jumps onto", "leap off", "leaps off", "leap over", "leaps over",
-            "hop off", "hop over", "obstacle course"))
-    if _traversal_word or _traversal_phrase:
+            "hop off", "hop over", "obstacle course", "box to box",
+            "box to the next", "platform to platform", "platform to the next",
+            "from each box", "from each platform"))
+    _course_object = has("box", "boxes", "platform", "platforms", "step", "steps")
+    _course_sequence = _course_object and (
+        has("each", "next", "pause", "pauses", "pausing", "dwell", "dwelling")
+        or "as far as possible" in g
+        or "as far as it can" in g
+    )
+    if _traversal_word or _traversal_phrase or _course_sequence:
         return None
     if has("kick", "kicks", "kicking"):
         return "kick"
@@ -735,10 +743,14 @@ def _abstract_objective_program(
     # re-added, and the metric is false-rejected (the two detectors disagreeing).
     staged_climb = has(
         "climb", "climbs", "climbing", "ascend", "ascending", "stairs",
-        "steps", "boxes", "platforms", "parkour", "vault", "vaults", "vaulting",
+        "step", "steps", "box", "boxes", "platform", "platforms",
+        "level", "levels", "parkour", "vault", "vaults", "vaulting",
         "traverse", "traverses", "traversing", "clamber", "clambers",
         "clambering",
-    )
+    ) or any(phrase in g for phrase in (
+        "box to box", "box to the next", "platform to platform",
+        "platform to the next", "from each box", "from each platform",
+    ))
     wants_dwell = has(
         "pause", "pauses", "pausing", "wait", "waiting", "hold", "holding",
         "stop", "stopping", "dwell", "dwelling",
@@ -792,7 +804,13 @@ def _abstract_objective_program(
         # already-expanded climb phases. Add a separate leap only when the text
         # explicitly asks to leave/cross the course. This prevents a box-chain
         # validator from inventing a terminal jump that belongs to a later mode.
-        leap = has("off", "over", "across")
+        leap = has("off", "over", "across") or (
+            staged_climb and any(phrase in g for phrase in (
+                "as far as possible", "as far as it can", "as far as they can",
+                "from the top box", "from the top platform", "from the last box",
+                "from the last platform", "final jump", "last jump",
+            ))
+        )
         if not staged_climb or leap:
             phases.append("jump_off" if leap or has("onto") else "jump")
     elif staged_climb and has("launch", "launches", "launching"):
@@ -2197,8 +2215,15 @@ def validate_generated_metric(
     meta = {"joint_names": list(_NAMES_12)}
     inject_joint_roles(meta, required_roles, lenient=True)
     arche = _archetypes()
-    abstract_program = _abstract_objective_program(
+    # The prompt compiler is the authority whenever it can express the goal.
+    # Generated code is untrusted and must not be allowed to weaken its own
+    # validator by declaring a smaller/easier program (for example reducing a
+    # box-to-box course to one generic jump).  The module declaration remains a
+    # useful fallback for novel gestures outside the deterministic vocabulary.
+    prompt_program = _abstract_objective_program(behavior_goal, None)
+    declared_program = _abstract_objective_program(
         behavior_goal, _declared_abstract_objective(source))
+    abstract_program = prompt_program or declared_program
     abstract_probe = _abstract_objective_probe(
         abstract_program, behavior_goal=behavior_goal)
     # The prompt-derived probe anchors non-degeneracy ONLY for a genuine TRAVERSAL /

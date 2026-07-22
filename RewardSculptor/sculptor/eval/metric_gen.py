@@ -21,7 +21,10 @@ from typing import Any, Callable, Mapping, Optional
 
 from pydantic import BaseModel
 
-from sculptor.eval.metric_validate import validate_generated_metric
+from sculptor.eval.metric_validate import (
+    _abstract_objective_program,
+    validate_generated_metric,
+)
 from sculptor.eval.robot_manifest import robot_joint_names
 from sculptor.llm import (
     llm_log_dir,
@@ -733,6 +736,23 @@ def generate_objective_metric(
         base_user = json.dumps(
             {"behavior_goal": behavior_goal, "robot_hint": robot_hint},
             indent=2, default=str,
+        )
+        # One prompt-native task program is shared by authoring and validation.
+        # It is deliberately task-space/embodiment-neutral: no stored motion is
+        # required, and the validator retargets it onto universal physical and
+        # authored-world channels for the selected robot at validation time.
+        abstract_objective = {
+            "schema_version": 1,
+            "phases": _abstract_objective_program(behavior_goal, None),
+            "source": "prompt_compiler",
+            "stored_trajectory_required": False,
+        }
+        base_user += (
+            "\n\n# SYSTEM-COMPILED ABSTRACT OBJECTIVE (AUTHORITATIVE)\n"
+            + json.dumps(abstract_objective, indent=2, default=str)
+            + "\nCopy the phases EXACTLY into ABSTRACT_OBJECTIVE. The validator "
+              "uses this same program to synthesize its competent task-space "
+              "probe; do not omit, merge, reorder, or rename phases."
         )
         if catalog is not None:
             catalog_context = {

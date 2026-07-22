@@ -32,6 +32,12 @@ stored trajectory exists. Use ONLY these closed-vocabulary phase names:
 then jump off" should be `["climb", "dwell", "climb", "dwell", "jump_off"]`,
 not merely `["jump"]`.
 
+The user message may include a `SYSTEM-COMPILED ABSTRACT OBJECTIVE` block.
+When present it is AUTHORITATIVE: copy its phase list exactly. It is produced
+from the same prompt by the validator and prevents the metric author and the
+independent validator from silently interpreting a compound objective as two
+different tasks. Never shorten it to make a candidate easier to validate.
+
 The core validator safely retargets these abstract phases onto universal root,
 gravity, named-joint-role, end-effector, and authored task channels. Do NOT put
 robot names, simulator task IDs, raw joint indices, executable code, thresholds,

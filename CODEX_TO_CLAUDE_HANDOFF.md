@@ -876,3 +876,27 @@ No tests were run for this emergency slice, per Sam's explicit request. Editing
 the reloader-watched core file restarted the UI backend and interrupted the old
 in-memory mission job `job_dabcf4eb43259bda`; regenerate the affected stage
 metric in the UI against this committed validator before using it as evidence.
+
+## Authoritative prompt-native objective compiler 2026-07-22 (Codex)
+
+Closed the remaining no-trajectory mismatch exposed by the recent Unitree Go1
+box-course generations. Metric authoring and validation now receive one shared,
+system-compiled `ABSTRACT_OBJECTIVE`: the generator is told to copy its ordered
+phases exactly, while the validator treats the prompt compiler as authoritative
+and uses a generated module's declaration only when the deterministic compiler
+has no vocabulary for the goal. Untrusted metric code can therefore no longer
+weaken its own validator by collapsing a multi-box course into a generic jump.
+
+The compiler now recognizes singular/plural box, platform, step, and level
+language; box-to-box / each-box sequences; pauses; and terminal “as far as
+possible” jumps. These compound goals resolve as novel traversal rather than a
+stationary jump family, preventing calibration and nondegeneracy from selecting
+the wrong built-in archetype. The existing embodiment-neutral retargeter then
+synthesizes the competent physical/task-channel probe directly from the prompt;
+no stored trajectory and no robot/task-name keying are required. The New Run UI
+now says this explicitly beside metric generation.
+
+No tests were run for this emergency slice, exactly as Sam requested. `git diff
+--check` was clean. Regenerate the Go1 objective metric from the UI; prior
+rejected `gen_001`/`gen_002` artifacts retain their old validation record and
+must not be represented as having passed the new compiler.
