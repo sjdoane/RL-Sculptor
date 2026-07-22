@@ -900,3 +900,39 @@ No tests were run for this emergency slice, exactly as Sam requested. `git diff
 --check` was clean. Regenerate the Go1 objective metric from the UI; prior
 rejected `gen_001`/`gen_002` artifacts retain their old validation record and
 must not be represented as having passed the new compiler.
+
+## Live UI recovery + bounded training evidence 2026-07-22 (Codex)
+
+Verified the recovery/UI changes against a real in-app-browser launch of
+`tracking-first-ui-verification / four-box-parkour-demo`, entirely through the
+product UI. The launch dialog now rejects an invalid 2-step override inline
+without losing the application, then accepted a bounded 1-round, 100-step,
+64-environment GPU run. The live Training view streamed launch, reference,
+training, rollout, objective-fitness, realism-audit, and reward-edit events;
+its GPU and fitness panels stayed responsive. The Overview robot viewer was
+checked in Live, Static (including all camera choices and re-render), and
+Replay modes. The live view now correctly correlates a `rollout_done` event
+that omits `iter` with its preceding `iter_started` event (commit `0e47450`).
+
+The bounded run produced iter-0 MP4/checkpoint/export links, objective fitness
+0.0, and an honest “criterion unmet” selection. It is plumbing evidence, not
+parkour-success evidence: the robot terminated after eight rollout steps, and
+the mission replanner opened an upright-balance sub-stage. That sub-stage's
+first model edit had a syntax error and entered the existing retry path. The
+mission was then stopped through the UI's Stop button and native confirmation.
+The persisted UI returned to `Ready`; the active sub-stage showed `Stopped
+(mission cancelled)`, `ws closed`, and `run_stopped (user)`. A fresh browser
+console contained no errors (only the two pre-existing React Router v7 future
+flag warnings).
+
+This run was created before the authoritative prompt-native metric compiler
+commit `a2f8ead`, so its disk artifact correctly still shows the older rejected
+blind fallback. Do not use it to claim the compiler fix or successful course
+completion. The next meaningful UI run must regenerate/promote the objective
+metric, use a newly admitted post-parkour-fix World tuple, and allow enough
+training budget to judge locomotion and platform traversal rather than only
+the UI/runtime path.
+
+Verification already completed for the two UI commits: frontend typecheck and
+production build passed after both `433aed0` and `0e47450`; `git diff --check`
+was clean. No additional automated tests were launched during the live run.
