@@ -415,6 +415,120 @@ def _materialized_cfg_types() -> tuple[type[Any], type[Any]]:
     return MaterializedTerrainEntityCfg, MaterializedTerrainEntity
 
 
+def _waypoint_velocity_command_types() -> tuple[type[Any], type[Any]]:
+    """Create a goal-conditioned velocity command without eager mjlab imports.
+
+    Authored waypoint tasks previously replaced the base task's command with a
+    constant +X request.  That is adequate for a straight staircase, but it is
+    actively contradictory for slaloms and any route that turns: the base
+    locomotion reward teaches the policy to ignore the next authored target.
+    This command retargets the existing velocity-policy interface onto the
+    current waypoint and emits zero after sequence completion.  It therefore
+    works for every embodiment exposing a velocity command, while tasks with a
+    different command surface remain untouched.
+    """
+    import torch
+    from mjlab.tasks.velocity.mdp.velocity_command import (
+        UniformVelocityCommand,
+        UniformVelocityCommandCfg,
+    )
+
+    class WaypointVelocityCommand(UniformVelocityCommand):
+        cfg: Any
+
+        def __init__(self, cfg: Any, env: Any) -> None:
+            super().__init__(cfg, env)
+            self._waypoints = torch.as_tensor(
+                cfg.waypoints_m, device=self.device, dtype=torch.float32)
+            self._waypoint_index = torch.zeros(
+                self.num_envs, device=self.device, dtype=torch.long)
+
+        def _resample_command(self, env_ids: Any) -> None:
+            # The configured timer exceeds the episode horizon, so this path is
+            # the per-episode reset.  Keep route state private per environment.
+            self._waypoint_index[env_ids] = 0
+            self.vel_command_b[env_ids] = 0.0
+            self.vel_command_w[env_ids] = 0.0
+            self.is_heading_env[env_ids] = False
+            self.is_standing_env[env_ids] = False
+            self.is_world_env[env_ids] = False
+            self.is_forward_env[env_ids] = False
+
+        def _update_command(self) -> None:
+            root_pos = self.robot.data.root_link_pos_w
+            raw_origins = getattr(self._env.scene, "env_origins", None)
+            origins = (
+                torch.zeros_like(root_pos)
+                if raw_origins is None
+                else raw_origins.to(device=root_pos.device, dtype=root_pos.dtype)
+            )
+            if tuple(origins.shape) != tuple(root_pos.shape):
+                raise WorldCompileError(
+                    "scene env_origins shape does not match robot root positions")
+            local_xy = (root_pos - origins)[:, :2]
+            last = self._waypoints.shape[0] - 1
+            target = self._waypoints[
+                torch.clamp(self._waypoint_index, max=last), :2]
+            distance = torch.linalg.norm(target - local_xy, dim=-1)
+            reached = (
+                (self._waypoint_index < self._waypoints.shape[0])
+                & (distance <= float(self.cfg.tolerance_m))
+            )
+            self._waypoint_index = torch.clamp(
+                self._waypoint_index + reached.long(),
+                max=self._waypoints.shape[0],
+            )
+            complete = self._waypoint_index >= self._waypoints.shape[0]
+
+            target = self._waypoints[
+                torch.clamp(self._waypoint_index, max=last), :2]
+            delta_w = target - local_xy
+            distance = torch.linalg.norm(delta_w, dim=-1)
+            direction_w = delta_w / torch.clamp(distance[:, None], min=1e-6)
+            speed = float(self.cfg.cruise_speed_mps) * torch.clamp(
+                distance / float(self.cfg.slow_radius_m), min=0.35, max=1.0)
+            speed = torch.where(complete, torch.zeros_like(speed), speed)
+            velocity_w = direction_w * speed[:, None]
+
+            # The base policy consumes body-frame velocity commands.  Rotate
+            # the authored world-space target direction on every step, then
+            # request a matching yaw rate so the body visibly follows turns
+            # instead of merely crab-walking through the route.
+            heading = self.robot.data.heading_w
+            cos_h = torch.cos(heading)
+            sin_h = torch.sin(heading)
+            vx_w = velocity_w[:, 0]
+            vy_w = velocity_w[:, 1]
+            vx_b = cos_h * vx_w + sin_h * vy_w
+            vy_b = -sin_h * vx_w + cos_h * vy_w
+            bearing_b = torch.atan2(vy_b, vx_b)
+
+            self.vel_command_b[:, 0] = vx_b
+            self.vel_command_b[:, 1] = vy_b
+            self.vel_command_b[:, 2] = torch.clamp(
+                float(self.cfg.turn_gain) * bearing_b,
+                min=-float(self.cfg.max_yaw_rate),
+                max=float(self.cfg.max_yaw_rate),
+            )
+            self.vel_command_b[complete] = 0.0
+            self.vel_command_w[:, :2] = velocity_w
+            self.vel_command_w[:, 2] = self.vel_command_b[:, 2]
+
+    @dataclass(kw_only=True)
+    class WaypointVelocityCommandCfg(UniformVelocityCommandCfg):
+        waypoints_m: tuple[tuple[float, float, float], ...]
+        tolerance_m: float = 0.25
+        cruise_speed_mps: float = 0.8
+        slow_radius_m: float = 0.75
+        turn_gain: float = 2.0
+        max_yaw_rate: float = 1.5
+
+        def build(self, env: Any) -> WaypointVelocityCommand:
+            return WaypointVelocityCommand(self, env)
+
+    return WaypointVelocityCommandCfg, WaypointVelocityCommand
+
+
 _MATERIALIZED_TYPES: tuple[type[Any], type[Any]] | None = None
 
 
@@ -1488,13 +1602,14 @@ def _reconcile_terrain_curriculum(env_cfg: Any) -> tuple[str, ...]:
 def _reconcile_waypoint_course(
     env_cfg: Any, manifest: ResolvedEvaluation, *, train: bool,
 ) -> tuple[str, ...]:
-    """Align resets and velocity commands with a fixed linear course.
+    """Align resets and velocity commands with an authored waypoint course.
 
-    A waypoint course is compiled along local +X. Generic velocity tasks may
-    otherwise randomize spawn yaw over 360 degrees and issue lateral/backward
-    commands, leaving the policy unable to infer which visually identical
-    reset should approach the course. Detect only declared goal/config
-    semantics; no robot or registered task identifier participates.
+    Generic velocity tasks otherwise randomize spawn yaw over 360 degrees and
+    issue commands unrelated to the authored route.  Resets stay aligned with
+    the course entrance, while compatible velocity-command terms are replaced
+    by an embodiment-neutral goal-conditioned command that points at the active
+    waypoint and becomes zero after completion. Detect only declared
+    goal/config semantics; no robot or registered task identifier participates.
     """
     goal = manifest.task_shared.get("goal", {})
     requested_waypoints = goal.get("waypoints")
@@ -1524,25 +1639,68 @@ def _reconcile_waypoint_course(
 
     commands = getattr(env_cfg, "commands", None)
     if isinstance(commands, dict):
+        raw_waypoints: list[tuple[float, float, float]] = []
+        if requested_waypoints == "auto":
+            raw_waypoints = [
+                tuple(float(v) for v in primitive.position_m)
+                for primitive in manifest.course
+            ]
+        else:
+            by_source = {
+                str(primitive.source_id): primitive
+                for primitive in manifest.course
+            }
+            for waypoint_name in requested_waypoints:
+                name = str(waypoint_name)
+                if name in manifest.zones:
+                    center = list(manifest.zones[name]["center_m"])
+                    if len(center) == 2:
+                        center.append(0.0)
+                    raw_waypoints.append(tuple(float(v) for v in center))
+                elif name in by_source:
+                    raw_waypoints.append(tuple(
+                        float(v) for v in by_source[name].position_m))
+                else:  # frozen compiler validation should make this unreachable
+                    raise WorldCompileError(
+                        f"waypoint {name!r} is absent from the resolved world")
+        if not raw_waypoints:
+            raise WorldCompileError(
+                "waypoint sequence has no resolved command targets")
+
         for name, term in commands.items():
             ranges = getattr(term, "ranges", None)
             if not all(hasattr(ranges, field) for field in (
                     "lin_vel_x", "lin_vel_y", "ang_vel_z")):
                 continue
-            ranges.lin_vel_x = (0.45, 1.0) if train else (0.8, 0.8)
-            ranges.lin_vel_y = (0.0, 0.0)
-            ranges.ang_vel_z = (0.0, 0.0)
+            WaypointVelocityCommandCfg, _ = _waypoint_velocity_command_types()
+            ranges = copy.deepcopy(ranges)
+            ranges.lin_vel_x = (-1.0, 1.0)
+            ranges.lin_vel_y = (-1.0, 1.0)
+            ranges.ang_vel_z = (-1.5, 1.5)
             if hasattr(ranges, "heading"):
                 ranges.heading = None
-            for field, value in (
-                ("heading_command", False),
-                ("rel_standing_envs", 0.0),
-                ("rel_heading_envs", 0.0),
-                ("rel_forward_envs", 1.0),
-            ):
-                if hasattr(term, field):
-                    setattr(term, field, value)
-            adjustments.append(f"command:{name}→forward course traversal")
+            commands[name] = WaypointVelocityCommandCfg(
+                entity_name=str(getattr(term, "entity_name", "robot")),
+                resampling_time_range=(1_000.0, 1_000.0),
+                debug_vis=bool(getattr(term, "debug_vis", False)),
+                heading_command=False,
+                heading_control_stiffness=1.0,
+                rel_standing_envs=0.0,
+                rel_heading_envs=0.0,
+                rel_world_envs=0.0,
+                rel_forward_envs=0.0,
+                init_velocity_prob=0.0,
+                ranges=ranges,
+                waypoints_m=tuple(raw_waypoints),
+                tolerance_m=(
+                    max(0.0, float(
+                        goal.get("success", {}).get("tolerance_m", 0.0)))
+                    or 0.25
+                ),
+                cruise_speed_mps=0.8,
+            )
+            adjustments.append(
+                f"command:{name}→goal-conditioned waypoint traversal")
 
     curriculum = getattr(env_cfg, "curriculum", None)
     if isinstance(curriculum, dict):
@@ -1551,7 +1709,7 @@ def _reconcile_waypoint_course(
             if str(name) == "command_vel" or func_name == "commands_vel":
                 curriculum.pop(name, None)
                 adjustments.append(
-                    f"curriculum:{name}→removed(fixed course direction)")
+                    f"curriculum:{name}→removed(goal-conditioned route)")
     return tuple(adjustments)
 
 

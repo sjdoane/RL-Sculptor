@@ -990,3 +990,32 @@ schedule, and authored-world competent channels; a stored trajectory remains
 optional. The active G1 slalom job was cooperatively stopped before editing the
 reload-watched core so its partial artifacts were not killed mid-write. No
 tests or test-like validation commands were run, per Sam's explicit request.
+
+## Goal-conditioned authored route commands 2026-07-22 (Codex)
+
+The first corrected-observation G1 slalom rollout proved the policy could
+locomote (one rendered environment reached roughly x=7.8 m), but it traveled
+almost straight along one side: no environment advanced beyond the first
+ordered waypoint. The root cause was the world compiler's fixed +X velocity
+command. It directly contradicted any authored route with lateral turns, while
+the sculpted reward paid for speed magnitude rather than target-directed
+velocity.
+
+Authored `waypoint_sequence` tasks now replace any compatible base velocity
+command with a robot/task-name-independent `WaypointVelocityCommand`. It keeps
+private per-environment route state, continuously rotates the current authored
+target direction into the robot body frame, commands both planar velocity and
+yaw toward that target, slows near each gate, advances only inside the frozen
+goal tolerance, and emits exactly zero after final completion so terminal hold
+and stillness are learnable. Tasks without a velocity-command surface remain
+untouched. The existing command observation and base velocity-tracking reward
+now provide dense, directed supervision without leaking metric-only completion
+channels into reward code.
+
+Evidence: focused compiler contract 13 passed; focused world/runtime group 41
+passed; a real CUDA G1 smoke constructed the 168-D authored observation set,
+reported `WaypointVelocityCommand` as the live command term, completed one PPO
+iteration, and wrote a checkpoint. The first smoke reached construction but
+stopped at an unconfigured W&B login; rerunning with the same disabled-W&B
+setting used by the UI completed cleanly. The old slalom job was already
+cooperatively stopped, so no active GPU work was interrupted by this slice.

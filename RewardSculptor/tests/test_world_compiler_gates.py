@@ -200,7 +200,7 @@ def test_authored_task_observations_reach_actor_and_critic() -> None:
 
 
 def test_explicit_waypoint_zones_align_commands_without_materialized_course() -> None:
-    """A slalom made from named zones is still a fixed waypoint course."""
+    """A named-zone slalom gets a goal-conditioned, not fixed +X, command."""
     ranges = SimpleNamespace(
         lin_vel_x=(-1.0, 1.0), lin_vel_y=(-1.0, 1.0),
         ang_vel_z=(-0.5, 0.5), heading=(-3.14, 3.14),
@@ -221,19 +221,96 @@ def test_explicit_waypoint_zones_align_commands_without_materialized_course() ->
         task_shared={"goal": {
             "type": "waypoint_sequence",
             "waypoints": ["waypoint_01", "finish"],
+            "success": {"tolerance_m": 0.35},
         }},
         course=(),
+        zones={
+            "waypoint_01": {
+                "kind": "disk", "center_m": [2.0, 0.85], "radius_m": 0.35,
+            },
+            "finish": {
+                "kind": "disk", "center_m": [4.0, 0.0], "radius_m": 0.35,
+            },
+        },
     )
 
     adjustments = _reconcile_waypoint_course(env_cfg, manifest, train=True)
 
-    assert ranges.lin_vel_x == (0.45, 1.0)
-    assert ranges.lin_vel_y == (0.0, 0.0)
-    assert ranges.ang_vel_z == (0.0, 0.0)
-    assert ranges.heading is None
+    routed = env_cfg.commands["twist"]
+    assert routed.waypoints_m == ((2.0, 0.85, 0.0), (4.0, 0.0, 0.0))
+    assert routed.tolerance_m == 0.35
+    assert routed.ranges.lin_vel_x == (-1.0, 1.0)
+    assert routed.ranges.lin_vel_y == (-1.0, 1.0)
+    assert routed.ranges.ang_vel_z == (-1.5, 1.5)
+    assert routed.ranges.heading is None
     assert reset.params["pose_range"]["yaw"] == (-0.08, 0.08)
     assert "command_vel" not in env_cfg.curriculum
-    assert any("forward course traversal" in item for item in adjustments)
+    assert any("goal-conditioned waypoint traversal" in item
+               for item in adjustments)
+
+
+def test_waypoint_velocity_command_turns_and_stops_per_environment() -> None:
+    """The command follows the active target and zeroes only completed envs."""
+    import torch
+
+    ranges = SimpleNamespace(
+        lin_vel_x=(-1.0, 1.0), lin_vel_y=(-1.0, 1.0),
+        ang_vel_z=(-1.5, 1.5), heading=None,
+    )
+    command = SimpleNamespace(
+        ranges=ranges, entity_name="robot", debug_vis=False,
+    )
+    env_cfg = SimpleNamespace(
+        events={}, commands={"twist": command}, curriculum={},
+    )
+    manifest = SimpleNamespace(
+        task_shared={"goal": {
+            "type": "waypoint_sequence",
+            "waypoints": ["left", "right", "finish"],
+            "success": {"tolerance_m": 0.2},
+        }},
+        course=(),
+        zones={
+            "left": {"kind": "disk", "center_m": [1.0, 1.0]},
+            "right": {"kind": "disk", "center_m": [2.0, -1.0]},
+            "finish": {"kind": "disk", "center_m": [3.0, 0.0]},
+        },
+    )
+    _reconcile_waypoint_course(env_cfg, manifest, train=True)
+
+    robot = SimpleNamespace(data=SimpleNamespace(
+        root_link_pos_w=torch.zeros((2, 3)),
+        root_link_lin_vel_b=torch.zeros((2, 3)),
+        root_link_ang_vel_b=torch.zeros((2, 3)),
+        heading_w=torch.zeros(2),
+    ))
+
+    class FakeScene(dict):
+        pass
+
+    scene = FakeScene(robot=robot)
+    scene.env_origins = torch.zeros((2, 3))
+    env = SimpleNamespace(num_envs=2, device="cpu", scene=scene)
+    term = env_cfg.commands["twist"].build(env)
+    term._update_command()
+    assert term.command[0, 0] > 0
+    assert term.command[0, 1] > 0
+    assert term.command[0, 2] > 0
+
+    robot.data.root_link_pos_w[0, :2] = torch.tensor([1.0, 1.0])
+    term._update_command()
+    assert term._waypoint_index.tolist() == [1, 0]
+    assert term.command[0, 1] < 0
+    assert term.command[0, 2] < 0
+    assert term.command[1, 1] > 0
+
+    robot.data.root_link_pos_w[0, :2] = torch.tensor([2.0, -1.0])
+    term._update_command()
+    robot.data.root_link_pos_w[0, :2] = torch.tensor([3.0, 0.0])
+    term._update_command()
+    assert term._waypoint_index.tolist() == [3, 0]
+    torch.testing.assert_close(term.command[0], torch.zeros(3))
+    assert torch.linalg.norm(term.command[1]) > 0
 
 
 def test_materialized_terrain_replays_exact_heightfield(tmp_path: Path) -> None:
