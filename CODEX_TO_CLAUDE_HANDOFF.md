@@ -1,3 +1,9 @@
+> **⚠️ SUPERSEDED — the current handoff is [`HANDOFF.md`](HANDOFF.md) at the repo root.**
+> On "read handoff", read `HANDOFF.md` and begin its Task 1. This file below is
+> older, task-specific history kept for reference only.
+
+---
+
 # Latest handoff — mission success-criterion process isolation (2026-07-19)
 
 Codex completed and verified the remaining evaluator-isolation half of P0.11
