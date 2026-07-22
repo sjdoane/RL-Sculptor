@@ -147,7 +147,15 @@ class WorldChannelRuntime:
 
     def _local_position(self, position: np.ndarray) -> np.ndarray:
         """Translate world-space state into each environment's local frame."""
-        origins = _to_numpy(self.scene.env_origins, dtype=np.float32)
+        raw_origins = getattr(self.scene, "env_origins", None)
+        # Single-world backends and lightweight adapter/test scenes may not
+        # expose replicated-environment origins.  Their world frame already
+        # is the local frame, so the mathematically correct origin is zero.
+        origins = (
+            np.zeros((self.num_envs, 3), dtype=np.float32)
+            if raw_origins is None
+            else _to_numpy(raw_origins, dtype=np.float32)
+        )
         if origins.shape != (self.num_envs, 3):
             raise WorldRuntimeError(
                 f"scene env_origins has shape {origins.shape}, expected "
@@ -398,8 +406,12 @@ class TorchWorldRewardRuntime:
         return self._entity_state("robot", "pos_w")
 
     def _local_position(self, position: Any) -> Any:
-        origins = self.scene.env_origins.to(
-            device=position.device, dtype=position.dtype)
+        raw_origins = getattr(self.scene, "env_origins", None)
+        origins = (
+            self.torch.zeros_like(position)
+            if raw_origins is None
+            else raw_origins.to(device=position.device, dtype=position.dtype)
+        )
         if origins.shape != position.shape:
             raise WorldRuntimeError(
                 f"scene env_origins has shape {tuple(origins.shape)}, "

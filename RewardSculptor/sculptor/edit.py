@@ -767,6 +767,150 @@ def _current_reward_references(current_module) -> list[dict]:
     return out
 
 
+_REFERENCE_KERNEL_FUNCTIONS = (
+    "_scalar",
+    "_phase_index_scalar",
+    "_reference_tracking_numpy",
+    "_phase_index_batched",
+    "_reference_tracking_batched",
+    "compute_reward",
+    "compute_reward_batched",
+)
+
+_REFERENCE_KERNEL_GLOBALS = {
+    "_W_JOINT_POS", "_W_JOINT_VEL", "_W_ROOT", "_W_ORIENTATION",
+    "_TRACKING_WEIGHT", "_RESIDUAL_MAX", "_ALIVE_BONUS",
+}
+
+
+def _reference_tracking_contract(mod) -> "dict[str, Any] | None":
+    spec = getattr(mod, "REWARD_SPEC", {}) or {}
+    composition = spec.get("composition") if isinstance(spec, dict) else None
+    if (not isinstance(composition, dict)
+            or composition.get("type") != "reference_tracking_residual"):
+        return None
+    return dict(composition)
+
+
+def _reference_kernel_hash(source: str) -> "str | None":
+    """Stable AST hash of immutable targets, kernels, and composition."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+    by_name = {
+        node.name: node for node in tree.body if isinstance(
+            node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    if any(name not in by_name for name in _REFERENCE_KERNEL_FUNCTIONS):
+        return None
+    assignments: dict[str, ast.AST] = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    assignments[target.id] = node
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            assignments[node.target.id] = node
+    immutable_names = sorted(
+        name for name in assignments
+        if name.startswith("REFERENCE_") or name in _REFERENCE_KERNEL_GLOBALS)
+    if (not any(name.startswith("REFERENCE_") for name in immutable_names)
+            or not _REFERENCE_KERNEL_GLOBALS.issubset(immutable_names)):
+        return None
+    payload = "\n".join(
+        ast.dump(by_name[name], annotate_fields=True, include_attributes=False)
+        for name in _REFERENCE_KERNEL_FUNCTIONS
+    )
+    payload += "\n" + "\n".join(
+        ast.dump(assignments[name], annotate_fields=True, include_attributes=False)
+        for name in immutable_names
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _validate_reference_tracking_contract(
+    *, mod, source: str, components: dict, parent: dict[str, Any],
+    parent_kernel_hash: str,
+) -> None:
+    """Keep the motion prior immutable while allowing bounded task residuals."""
+    child = _reference_tracking_contract(mod)
+    if child is None:
+        raise EditValidationError(
+            "tracking-first contract removed: preserve "
+            "REWARD_SPEC.composition.type='reference_tracking_residual'")
+    for key in ("reference_clip_id", "reference_target_sha256"):
+        if child.get(key) != parent.get(key):
+            raise EditValidationError(
+                f"tracking-first contract changed {key}: preserve the attached "
+                "reference identity exactly")
+    try:
+        parent_weight = float(parent["tracking_weight"])
+        child_weight = float(child["tracking_weight"])
+        residual_max = float(child["residual_max"])
+    except (KeyError, TypeError, ValueError) as e:
+        raise EditValidationError(
+            f"tracking-first composition has invalid numeric fields: {e}") from e
+    if abs(child_weight - parent_weight) > 1e-9:
+        raise EditValidationError(
+            "tracking-first contract changed tracking_weight; the reference "
+            "base may not be weakened or amplified by an LLM edit")
+    if residual_max < 0.0 or residual_max > 0.35 * child_weight:
+        raise EditValidationError(
+            f"tracking residual_max={residual_max:g} must be within [0, "
+            f"{0.35 * child_weight:g}] (<=35% of tracking_weight)")
+    required_components = {
+        "reference_tracking", "tracking_joint_pos", "tracking_joint_vel",
+        "tracking_root_height", "tracking_orientation", "residual_task",
+    }
+    missing = sorted(required_components - set(components))
+    if missing:
+        raise EditValidationError(
+            f"tracking-first reward dropped required components: {missing}")
+    try:
+        residual_probe = float(components["residual_task"])
+    except (TypeError, ValueError) as e:
+        raise EditValidationError(
+            f"residual_task is not scalar/numeric on the scalar path: {e}") from e
+    if not (0.0 <= residual_probe <= residual_max + 1e-9):
+        raise EditValidationError(
+            f"residual_task={residual_probe:g} escapes [0, residual_max="
+            f"{residual_max:g}] on validation inputs")
+
+    target_hash = getattr(mod, "REFERENCE_TARGET_SHA256", None)
+    if target_hash != parent.get("reference_target_sha256"):
+        raise EditValidationError(
+            "REFERENCE_TARGET_SHA256 changed or disappeared; preserve the "
+            "attached motion targets exactly")
+    try:
+        targets = {
+            "joint_pos": np.round(np.asarray(
+                mod.REFERENCE_JOINT_POS, dtype=np.float64), 5).tolist(),
+            "joint_vel": np.round(np.asarray(
+                mod.REFERENCE_JOINT_VEL, dtype=np.float64), 5).tolist(),
+            "root_z": np.round(np.asarray(
+                mod.REFERENCE_ROOT_Z, dtype=np.float64), 5).tolist(),
+            "gravity": (
+                np.round(np.asarray(
+                    mod.REFERENCE_GRAVITY, dtype=np.float64), 5).tolist()
+                if mod.REFERENCE_GRAVITY is not None else None),
+        }
+    except (AttributeError, TypeError, ValueError) as e:
+        raise EditValidationError(
+            f"reference target arrays changed or disappeared: {e}") from e
+    actual_hash = hashlib.sha256(json.dumps(
+        targets, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    if actual_hash != target_hash:
+        raise EditValidationError(
+            "reference target arrays no longer match REFERENCE_TARGET_SHA256")
+    if _reference_kernel_hash(source) != parent_kernel_hash:
+        raise EditValidationError(
+            "immutable reference tracking kernel changed; restore the parent's "
+            "phase clock and _reference_tracking_* functions and edit only the "
+            "bounded residual")
+
+
 # ── KG validation helpers ─────────────────────────────────────────────────
 def _missing_paper_ids(arxiv_ids: Iterable[str], kg_store: SculptorKG) -> list[str]:
     missing: list[str] = []
@@ -1148,6 +1292,8 @@ def _post_validate(new_source: str, *, contract, kg_store: SculptorKG,
                    parent_hash: str, new_version: str,
                    write_to: Path,
                    parent_hparams: "dict[str, Any] | None" = None,
+                   parent_tracking: "dict[str, Any] | None" = None,
+                   parent_tracking_kernel_hash: "str | None" = None,
                    metric_observables: "frozenset[str] | None" = None,
                    replay_inputs=None,
                    replay_parent: "dict | None" = None,
@@ -1253,6 +1399,21 @@ def _post_validate(new_source: str, *, contract, kg_store: SculptorKG,
             raise EditValidationError(
                 f"REWARD_SPEC.parent_hash does not match expected "
                 f"{parent_hash!r} (got {spec.get('parent_hash')!r})")
+
+        # A stage with an attached reference is tracking-FIRST by construction.
+        # The LLM may edit only compute_reward's bounded residual: reference
+        # arrays, phase clock, kernels, identity, and relative scale are frozen.
+        if parent_tracking is not None:
+            if not parent_tracking_kernel_hash:
+                raise EditValidationError(
+                    "parent tracking reward is missing its immutable kernel")
+            _validate_reference_tracking_contract(
+                mod=mod,
+                source=new_source,
+                components=components,
+                parent=parent_tracking,
+                parent_kernel_hash=parent_tracking_kernel_hash,
+            )
 
         # References shape + every arxiv_id present in KG.
         refs = spec.get("references", None)
@@ -1406,6 +1567,10 @@ def apply_edits(
         current_source = current_reward_path.read_text(encoding="utf-8")
         current_version = _current_reward_version(current_module)
         current_references = _current_reward_references(current_module)
+        parent_tracking = _reference_tracking_contract(current_module)
+        parent_tracking_kernel_hash = (
+            _reference_kernel_hash(current_source)
+            if parent_tracking is not None else None)
         parent_hash = hashlib.sha256(
             current_source.encode("utf-8")).hexdigest()[:16]
         # §Ship 54-pre (#12): parent hparam VALUES for the post-LLM partition
@@ -1618,6 +1783,8 @@ def apply_edits(
                         kg_store=kg_store, parent_hash=parent_hash,
                         new_version=new_iter_id, write_to=target_path,
                         parent_hparams=gate_parent_hparams,
+                        parent_tracking=parent_tracking,
+                        parent_tracking_kernel_hash=parent_tracking_kernel_hash,
                         metric_observables=metric_observables,
                         replay_inputs=replay_inputs,
                         replay_parent=replay_parent,
@@ -1652,6 +1819,8 @@ def apply_edits(
                     parent_hash=parent_hash, new_version=new_iter_id,
                     write_to=target_path,
                     parent_hparams=gate_parent_hparams,
+                    parent_tracking=parent_tracking,
+                    parent_tracking_kernel_hash=parent_tracking_kernel_hash,
                     metric_observables=metric_observables,
                     replay_inputs=replay_inputs,
                     replay_parent=replay_parent,
@@ -1698,6 +1867,8 @@ def apply_edits(
                     parent_hash=parent_hash, new_version=new_iter_id,
                     write_to=target_path,
                     parent_hparams=gate_parent_hparams,
+                    parent_tracking=parent_tracking,
+                    parent_tracking_kernel_hash=parent_tracking_kernel_hash,
                     metric_observables=metric_observables,
                     replay_inputs=replay_inputs,
                     replay_parent=replay_parent,
@@ -1734,6 +1905,8 @@ def apply_edits(
                         parent_hash=parent_hash, new_version=new_iter_id,
                         write_to=target_path,
                         parent_hparams=gate_parent_hparams,
+                        parent_tracking=parent_tracking,
+                        parent_tracking_kernel_hash=parent_tracking_kernel_hash,
                         metric_observables=metric_observables,
                         replay_inputs=replay_inputs,
                         replay_parent=replay_parent,

@@ -867,6 +867,15 @@ function SpecPanel({ detail, label = "REWARD_SPEC" }: { detail: RewardVersionDet
   const hparams = Object.entries(spec.hyperparameters);
   const grounding = Object.entries(spec.grounding ?? {});
   const arxivRe = /^(?:\d{4}\.\d{4,5}|[a-z-]+\/\d{7})/i;
+  const composition = spec.composition?.type === "reference_tracking_residual"
+    ? spec.composition
+    : null;
+  const compositionTotal = composition
+    ? Math.max(0.0001, composition.tracking_weight + composition.residual_max)
+    : 1;
+  const trackingPct = composition
+    ? Math.round(100 * composition.tracking_weight / compositionTotal)
+    : 0;
   return (
     <div className="rs-card">
       <div className="rs-card-head">
@@ -875,6 +884,43 @@ function SpecPanel({ detail, label = "REWARD_SPEC" }: { detail: RewardVersionDet
       </div>
       <div className="rs-card-pad">
         {spec.description && <p className="rs-sub" style={{ margin: "0 0 12px" }}>{spec.description}</p>}
+        {composition && (
+          <div style={{
+            margin: "0 0 18px",
+            border: "1px solid color-mix(in srgb, var(--rs-primary) 42%, var(--hairline))",
+            borderRadius: "var(--radius-md)",
+            background: "color-mix(in srgb, var(--rs-primary) 5%, var(--surface-strong))",
+            padding: "13px 14px",
+          }}>
+            <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 16, marginBottom: 10 }}>
+              <div style={{ display: "flex", alignItems: "flex-start", gap: 9 }}>
+                <Icon name="activity" size={16} color="var(--rs-primary)" />
+                <div>
+                  <div style={{ fontSize: 12.5, fontWeight: 650, color: "var(--ink)" }}>Motion prior is steering this reward</div>
+                  <div className="rs-sub" style={{ fontSize: 11, marginTop: 2 }}>
+                    The attached motion supplies the dense objective. The sculptor can only author the capped task residual.
+                  </div>
+                </div>
+              </div>
+              <span className="rs-badge amber" style={{ flexShrink: 0, fontSize: 9.5 }}>reference locked</span>
+            </div>
+            <div aria-label={`${trackingPct}% reference tracking, ${100 - trackingPct}% maximum residual`} style={{
+              display: "flex", height: 8, overflow: "hidden", borderRadius: 999,
+              background: "var(--surface-card)", border: "1px solid var(--hairline)",
+            }}>
+              <div style={{ width: `${trackingPct}%`, background: "var(--rs-primary)" }} />
+              <div style={{ flex: 1, background: "var(--st-amber)" }} />
+            </div>
+            <div style={{ display: "flex", justifyContent: "space-between", gap: 12, marginTop: 7, fontSize: 10.5 }}>
+              <span><b style={{ color: "var(--rs-primary)" }}>{trackingPct}%</b> reference tracking base</span>
+              <span><b style={{ color: "var(--st-amber)" }}>{100 - trackingPct}%</b> maximum residual</span>
+            </div>
+            <div className="mono" style={{ marginTop: 10, display: "flex", flexWrap: "wrap", gap: "4px 14px", color: "var(--rs-muted)", fontSize: 10 }}>
+              <span>clip {composition.reference_clip_id ?? "unknown"}</span>
+              {composition.reference_target_sha256 && <span title={composition.reference_target_sha256}>target {composition.reference_target_sha256.slice(0, 12)}â€¦</span>}
+            </div>
+          </div>
+        )}
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 16, fontSize: 12 }}>
           <div>
             <div className="rs-eyebrow" style={{ marginBottom: 6 }}>Hyperparameters</div>

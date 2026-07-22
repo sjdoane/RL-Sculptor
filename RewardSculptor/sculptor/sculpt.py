@@ -6008,6 +6008,52 @@ def _run_one_stage(
         )
         # Only materialize v1 if we haven't already (resume case).
         if latest_n == 0:
+            # Lokesh/DeepMimic direction: an attached reference is the reward's
+            # structural base, not merely prose shown to the LLM.  Replace the
+            # freshly-scaffolded constant-alive v0 with a deterministic,
+            # phase-indexed tracking reward before asking the LLM for v1.  The
+            # editor may then add only a bounded task residual; edit.py preserves
+            # the reference target hash across all later iterations.  Plain
+            # stages remain byte-for-byte on the historical prompt-only path.
+            if (stage_reference_clip_id
+                    and _is_pristine_starter_reward(latest_reward_file)):
+                try:
+                    from sculptor.mission_metrics import load_stage_reference_clip
+                    from sculptor.refs.track import (
+                        generate_tracking_residual_reward_source,
+                    )
+
+                    sig_robot = _stage_reference_robot_slug(
+                        stage_dir=stage_dir,
+                        project_root=mission_dir.parent.parent,
+                    )
+                    loaded_clip_id, tracking_clip, _ = load_stage_reference_clip(
+                        stage, sig_robot)
+                    tracking_source = generate_tracking_residual_reward_source(
+                        clip=tracking_clip,
+                        clip_id=loaded_clip_id,
+                        version="v0",
+                    )
+                    latest_reward_file.write_text(
+                        tracking_source, encoding="utf-8")
+                    emit({
+                        "type": "stage_reference_tracking_seeded",
+                        "stage_name": stage.name,
+                        "clip_id": loaded_clip_id,
+                        "reward_path": str(latest_reward_file),
+                    })
+                except Exception as e:  # noqa: BLE001
+                    # A reference explicitly attached for tracking is a core
+                    # objective, not advisory prompt context.  Falling back to
+                    # free-form scalar shaping would silently violate the mode
+                    # contract, so fail this stage cleanly and visibly.
+                    return _fail_stage(
+                        stage,
+                        "reference_tracking_seed_failed",
+                        f"could not build tracking-first reward: "
+                        f"{type(e).__name__}: {e}",
+                        emit,
+                    )
             from sculptor.adapters.base import load_adapter
             adapter_for_contract = load_adapter(stage_dir / "config.toml")
             apply_prompt_edit(

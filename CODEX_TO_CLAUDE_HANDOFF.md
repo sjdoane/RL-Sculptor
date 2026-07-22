@@ -837,3 +837,19 @@ produce a new admitted tuple, then launch a new run. Do not reuse the old
 checkpoint or show its Result card as successful evidence. No tests were run
 for this emergency slice per Sam's explicit instruction; the next agent should
 review and test it before claiming the replacement run works.
+
+## Tracking-first reward checkpoint 2026-07-21 (Codex)
+
+Implemented HANDOFF.md Task 1. Referenced stages now seed a deterministic
+16-phase joint/velocity/root/orientation tracking base before v1 generation.
+Only `_residual_task_numpy` and `_residual_task_batched` are editable; the
+targets, hash, kernels, weights, final composition wrappers, fall gate, and cap
+are mechanically frozen in both LLM and manual UI edit paths. No-reference
+stages are unchanged. The Rewards tab shows an explicit tracking/residual band,
+clip id, and target hash. Also fixed the outstanding World-runtime
+`env_origins` regressions with a zero-origin fallback for single-world scenes.
+
+Evidence: core 2,178 passed / 1 optional-JAX skip; UI backend 562 passed;
+focused suites 51 + 25 passed; frontend typecheck/build passed; scoped Ruff,
+compileall, and diff check passed. Next: run HANDOFF.md §6 live browser
+verification, fix every UI defect, and commit that evidence before Task 2.

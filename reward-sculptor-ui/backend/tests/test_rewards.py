@@ -11,8 +11,15 @@ import hashlib
 import textwrap
 from pathlib import Path
 
+import numpy as np
 import pytest
 from fastapi.testclient import TestClient
+
+from backend.services.reward_store import (
+    _extract_reward_spec,
+    _validate_manual_tracking_edit,
+)
+from sculptor.refs.track import generate_tracking_residual_reward_source
 
 
 def _make_project(client: TestClient, name: str = "Rewards") -> str:
@@ -51,6 +58,45 @@ def _human_source(parent_path: Path, *, alive_bonus: float = 2.5) -> str:
             components = {{"alive_bonus": alive}}
             return alive, components
         ''')
+
+
+def _tracking_clip() -> dict:
+    n = 20
+    return {
+        "root_pos_z": np.linspace(0.3, 0.7, n),
+        "fps": 30.0,
+        "joint_pos": np.zeros((n, 2)),
+        "joint_names": ["left_joint", "right_joint"],
+    }
+
+
+def test_manual_tracking_guard_allows_residual_hooks_only() -> None:
+    parent_source = generate_tracking_residual_reward_source(
+        clip=_tracking_clip(), clip_id="clip-a",
+    )
+    child_source = parent_source.replace(
+        "    return 0.0\n\n\ndef compute_reward",
+        "    return 0.1\n\n\ndef compute_reward",
+    )
+    parent_spec, parent_err = _extract_reward_spec(parent_source)
+    child_spec, child_err = _extract_reward_spec(child_source)
+    assert parent_err is None and child_err is None
+    assert _validate_manual_tracking_edit(
+        parent_source, parent_spec, child_source, child_spec,
+    ) == []
+
+
+def test_manual_tracking_guard_rejects_composition_drift() -> None:
+    parent_source = generate_tracking_residual_reward_source(
+        clip=_tracking_clip(), clip_id="clip-a",
+    )
+    child_source = parent_source.replace("_TRACKING_WEIGHT = 1.0", "_TRACKING_WEIGHT = 0.1")
+    parent_spec, _ = _extract_reward_spec(parent_source)
+    child_spec, _ = _extract_reward_spec(child_source)
+    violations = _validate_manual_tracking_edit(
+        parent_source, parent_spec, child_source, child_spec,
+    )
+    assert any("immutable" in violation for violation in violations)
 
 
 # ── list + detail ─────────────────────────────────────────────────────

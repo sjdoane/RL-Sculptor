@@ -156,6 +156,14 @@ export interface RewardRef {
   citation: string;
 }
 
+export interface RewardComposition {
+  type: string;
+  reference_clip_id: string | null;
+  reference_target_sha256: string | null;
+  tracking_weight: number;
+  residual_max: number;
+}
+
 export interface RewardSpec {
   version: string;
   parent_hash: string;
@@ -163,6 +171,7 @@ export interface RewardSpec {
   description: string;
   hyperparameters: Record<string, number>;
   references: RewardRef[];
+  composition?: RewardComposition | null;
   /** Map of `hparam_name → citation-or-justification` — the KG-grounding
    *  mandate from 2026-04-22. Empty for pre-mandate rewards.
    *  SpecPanel renders this alongside hyperparameters so Sam can audit

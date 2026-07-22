@@ -42,6 +42,7 @@ adapter contract, `sculptor.reference`, or `sculptor.eval`. It:
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 from dataclasses import dataclass, field
@@ -80,6 +81,12 @@ DEFAULT_N_EPISODES = 2
 #: phase-indexed targets) — keeps the generated reward source small and
 #: the phase clock (`t/T`) well-defined regardless of clip fps.
 N_PHASE_TARGETS = 32
+
+# Normal mission rewards are returned to the LLM on every edit.  Sixteen
+# targets preserve the reference's phase structure while keeping the immutable
+# motion prior comfortably inside the editor's output budget.  Tier-D
+# certification keeps the denser 32-target default above.
+REFERENCE_REWARD_PHASE_TARGETS = 16
 
 
 class TrackError(RuntimeError):
@@ -193,7 +200,7 @@ REWARD_SPEC: dict = {{
     "version": "tierD-track-v1",
     "description": "DeepMimic-style phase-indexed tracking reward for "
                     "Tier-D certification of clip {clip_id!r}.",
-    "author": "sculptor.refs.track",
+    "author": "sculptor",
     "parent_hash": None,
     "hyperparameters": {{
         "joint_err_weight": {joint_err_weight!r},
@@ -251,6 +258,267 @@ def compute_reward(state, action, next_state, info):
     }}
     reward = joint_term + root_term
     return float(reward), components
+'''
+
+
+def generate_tracking_residual_reward_source(
+    *,
+    clip: dict[str, Any],
+    clip_id: str,
+    version: str = "v0",
+    n_phase_targets: int = REFERENCE_REWARD_PHASE_TARGETS,
+    residual_max: float = 0.25,
+) -> str:
+    """Build the tracking-FIRST stage reward used by normal mission runs.
+
+    Unlike :func:`generate_tracking_reward_source` (the small scalar Tier-D
+    certification project), this module implements both the scalar authoring
+    contract and the GPU-batched mjlab contract.  The reference is converted
+    through the same canonical ``clip_to_arrays`` path used by metric trust,
+    downsampled into phase targets, and embedded as immutable data.  Subsequent
+    LLM edits may add a bounded task residual, but the tracking target hash and
+    composition contract are preserved by ``sculptor.edit``.
+    """
+    from sculptor.refs.convert import clip_to_arrays
+
+    arrays, meta = clip_to_arrays(clip, n_envs=1)
+    if "joint_pos" not in arrays or not meta.get("joint_names"):
+        raise TrackError(
+            f"clip {clip_id!r} has no joint trajectory; cannot construct "
+            "a tracking-first stage reward")
+
+    def _target(name: str) -> Optional[np.ndarray]:
+        arr = arrays.get(name)
+        if arr is None:
+            return None
+        return downsample_phase_targets(
+            np.asarray(arr[:, 0], dtype=np.float64), n=n_phase_targets)
+
+    joint_pos = _target("joint_pos")
+    joint_vel = _target("joint_vel")
+    root_pos = _target("root_link_pos_w")
+    gravity = _target("projected_gravity_b")
+    assert joint_pos is not None and joint_vel is not None and root_pos is not None
+
+    # Hash exactly the rounded arrays embedded in source.  This is the durable
+    # parent→child identity checked after every LLM rewrite.
+    rounded_targets = {
+        "joint_pos": np.round(joint_pos, 5).tolist(),
+        "joint_vel": np.round(joint_vel, 5).tolist(),
+        "root_z": np.round(root_pos[:, 2], 5).tolist(),
+        "gravity": (
+            np.round(gravity, 5).tolist() if gravity is not None else None),
+    }
+    target_hash = hashlib.sha256(json.dumps(
+        rounded_targets, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+
+    fps = float(clip.get("fps") or 30.0)
+    n_frames = int(np.asarray(clip["root_pos_z"]).shape[0])
+    duration_s = max(1.0 / fps, (n_frames - 1) / fps)
+    names_literal = repr([str(name) for name in meta["joint_names"]])
+    jp_literal = _format_array_literal(joint_pos)
+    jv_literal = _format_array_literal(joint_vel)
+    rz_literal = _format_array_literal(root_pos[:, 2])
+    gravity_literal = (
+        _format_array_literal(gravity) if gravity is not None else "None")
+    n_joints = int(joint_pos.shape[1])
+    orientation_weight = 0.20 if gravity is not None else 0.0
+    root_weight = 0.25 + (0.20 - orientation_weight)
+
+    return f'''"""Reference-tracking base plus bounded task residual.
+
+Generated deterministically from clip {clip_id!r}.  REFERENCE_* data and
+``_reference_tracking_*`` functions are the immutable motion prior; reward
+editing may only author the small residual task term.
+"""
+from __future__ import annotations
+
+import numpy as np
+
+REFERENCE_TARGET_SHA256 = {target_hash!r}
+REFERENCE_JOINT_NAMES = {names_literal}
+REFERENCE_N_PHASES = {n_phase_targets}
+REFERENCE_N_JOINTS = {n_joints}
+REFERENCE_DURATION_S = {duration_s!r}
+REFERENCE_JOINT_POS = np.asarray({jp_literal}, dtype=np.float64)
+REFERENCE_JOINT_VEL = np.asarray({jv_literal}, dtype=np.float64)
+REFERENCE_ROOT_Z = np.asarray({rz_literal}, dtype=np.float64)
+REFERENCE_GRAVITY = {'np.asarray(' + gravity_literal + ', dtype=np.float64)' if gravity is not None else 'None'}
+
+REWARD_SPEC: dict = {{
+    "version": {version!r},
+    "description": "Tracking-first reward generated from the attached reference; "
+                   "task-specific residual starts at zero.",
+    "author": "sculptor",
+    "parent_hash": None,
+    "supports_batched": True,
+    "composition": {{
+        "type": "reference_tracking_residual",
+        "reference_clip_id": {clip_id!r},
+        "reference_target_sha256": {target_hash!r},
+        "tracking_weight": 1.0,
+        "residual_max": {float(residual_max)!r},
+    }},
+    "hyperparameters": {{
+        "tracking_weight": 1.0,
+        "residual_max": {float(residual_max)!r},
+        "joint_position_kernel": 8.0,
+        "joint_velocity_kernel": 0.10,
+        "root_height_kernel": 40.0,
+        "orientation_kernel": 4.0,
+        "alive_bonus": 0.05,
+    }},
+    "grounding": {{
+        "tracking_weight": "Reference motion is the structural objective; normalized tracking channels sum to one.",
+        "residual_max": "Residual is capped at 25% of the unit tracking base so it cannot replace the motion prior.",
+        "joint_position_kernel": "DeepMimic-style Gaussian tracking kernel over measured reference joint positions.",
+        "joint_velocity_kernel": "Velocity errors are in rad/s and need a wider Gaussian than position errors.",
+        "root_height_kernel": "A 0.1 m root-height miss decays the channel materially without forming a hard cliff.",
+        "orientation_kernel": "Projected-gravity error measures body orientation without yaw assumptions.",
+        "alive_bonus": "Small positive floor prevents termination-seeking while remaining below task tracking signal.",
+    }},
+    "references": [],
+}}
+
+_W_JOINT_POS = 0.40
+_W_JOINT_VEL = 0.15
+_W_ROOT = {root_weight!r}
+_W_ORIENTATION = {orientation_weight!r}
+_TRACKING_WEIGHT = 1.0
+_RESIDUAL_MAX = {float(residual_max)!r}
+_ALIVE_BONUS = 0.05
+
+
+def _scalar(info, key, default=0.0):
+    value = info.get(key, default)
+    arr = np.asarray(value, dtype=np.float64).reshape(-1)
+    return float(arr[0]) if arr.size else float(default)
+
+
+def _phase_index_scalar(info):
+    elapsed = _scalar(info, "episode_length") * _scalar(info, "step_dt", 0.02)
+    fraction = min(max(elapsed / REFERENCE_DURATION_S, 0.0), 0.999999)
+    return min(REFERENCE_N_PHASES - 1, int(fraction * REFERENCE_N_PHASES))
+
+
+def _reference_tracking_numpy(next_state, info):
+    qpos = np.asarray(next_state["qpos"], dtype=np.float64).reshape(-1)
+    qvel = np.asarray(next_state["qvel"], dtype=np.float64).reshape(-1)
+    if qpos.size < REFERENCE_N_JOINTS or qvel.size < REFERENCE_N_JOINTS:
+        raise ValueError("state has fewer joints than the attached reference")
+    i = _phase_index_scalar(info)
+    pos_err = qpos[-REFERENCE_N_JOINTS:] - REFERENCE_JOINT_POS[i]
+    vel_err = qvel[-REFERENCE_N_JOINTS:] - REFERENCE_JOINT_VEL[i]
+    root_err = _scalar(info, "base_height") - float(REFERENCE_ROOT_Z[i])
+    joint_pos = float(np.exp(-8.0 * np.mean(pos_err ** 2)))
+    joint_vel = float(np.exp(-0.10 * np.mean(vel_err ** 2)))
+    root_height = float(np.exp(-40.0 * root_err ** 2))
+    orientation = 1.0
+    if REFERENCE_GRAVITY is not None:
+        gravity = np.asarray(
+            next_state["projected_gravity_b"], dtype=np.float64).reshape(-1)[-3:]
+        orientation = float(np.exp(-4.0 * np.mean(
+            (gravity - REFERENCE_GRAVITY[i]) ** 2)))
+    base = (_W_JOINT_POS * joint_pos + _W_JOINT_VEL * joint_vel
+            + _W_ROOT * root_height + _W_ORIENTATION * orientation)
+    return base, joint_pos, joint_vel, root_height, orientation
+
+
+def _residual_task_numpy(state, action, next_state, info):
+    """Editable task hook. Return raw residual credit; wrapper bounds it."""
+    del state, action, next_state, info
+    return 0.0
+
+
+def compute_reward(state, action, next_state, info):
+    base, joint_pos, joint_vel, root_height, orientation = (
+        _reference_tracking_numpy(next_state, info))
+    residual_task = float(np.clip(
+        _residual_task_numpy(state, action, next_state, info),
+        0.0, _RESIDUAL_MAX))
+    alive = _ALIVE_BONUS
+    not_fallen = 1.0 - min(max(_scalar(info, "fallen"), 0.0), 1.0)
+    total = (_TRACKING_WEIGHT * base + residual_task + alive) * not_fallen
+    return float(total), {{
+        "reference_tracking": float(base),
+        "tracking_joint_pos": joint_pos,
+        "tracking_joint_vel": joint_vel,
+        "tracking_root_height": root_height,
+        "tracking_orientation": orientation,
+        "residual_task": residual_task,
+        "alive_bonus": alive * not_fallen,
+    }}
+
+
+def _phase_index_batched(info, like):
+    import torch
+    step = info.get("episode_length", torch.zeros_like(like))
+    dt = info.get("step_dt", torch.full_like(like, 0.02))
+    fraction = torch.clamp(step * dt / REFERENCE_DURATION_S, 0.0, 0.999999)
+    return torch.clamp(
+        (fraction * REFERENCE_N_PHASES).long(), 0, REFERENCE_N_PHASES - 1)
+
+
+def _reference_tracking_batched(next_state, info):
+    import torch
+    qpos = next_state["qpos"]
+    qvel = next_state["qvel"]
+    if qpos.shape[-1] < REFERENCE_N_JOINTS or qvel.shape[-1] < REFERENCE_N_JOINTS:
+        raise ValueError("state has fewer joints than the attached reference")
+    like = qpos[:, 0]
+    i = _phase_index_batched(info, like)
+    target_pos = torch.as_tensor(
+        REFERENCE_JOINT_POS, device=qpos.device, dtype=qpos.dtype)[i]
+    target_vel = torch.as_tensor(
+        REFERENCE_JOINT_VEL, device=qvel.device, dtype=qvel.dtype)[i]
+    pos_err = qpos[:, -REFERENCE_N_JOINTS:] - target_pos
+    vel_err = qvel[:, -REFERENCE_N_JOINTS:] - target_vel
+    joint_pos = torch.exp(-8.0 * torch.mean(pos_err ** 2, dim=-1))
+    joint_vel = torch.exp(-0.10 * torch.mean(vel_err ** 2, dim=-1))
+    target_root = torch.as_tensor(
+        REFERENCE_ROOT_Z, device=qpos.device, dtype=qpos.dtype)[i]
+    root_height = torch.exp(-40.0 * (
+        info.get("base_height", torch.zeros_like(like)) - target_root) ** 2)
+    orientation = torch.ones_like(like)
+    if REFERENCE_GRAVITY is not None:
+        target_gravity = torch.as_tensor(
+            REFERENCE_GRAVITY, device=qpos.device, dtype=qpos.dtype)[i]
+        orientation = torch.exp(-4.0 * torch.mean((
+            next_state["projected_gravity_b"][:, -3:] - target_gravity) ** 2,
+            dim=-1))
+    base = (_W_JOINT_POS * joint_pos + _W_JOINT_VEL * joint_vel
+            + _W_ROOT * root_height + _W_ORIENTATION * orientation)
+    return base, joint_pos, joint_vel, root_height, orientation
+
+
+def _residual_task_batched(state, action, next_state, info, like):
+    """Editable task hook. Return raw per-env credit; wrapper bounds it."""
+    import torch
+    del state, action, next_state, info
+    return torch.zeros_like(like)
+
+
+def compute_reward_batched(state, action, next_state, info):
+    import torch
+    base, joint_pos, joint_vel, root_height, orientation = (
+        _reference_tracking_batched(next_state, info))
+    residual_task = torch.clamp(
+        _residual_task_batched(state, action, next_state, info, base),
+        0.0, _RESIDUAL_MAX)
+    alive = torch.full_like(base, _ALIVE_BONUS)
+    not_fallen = 1.0 - torch.clamp(
+        info.get("fallen", torch.zeros_like(base)), 0.0, 1.0)
+    total = (_TRACKING_WEIGHT * base + residual_task + alive) * not_fallen
+    return total, {{
+        "reference_tracking": base,
+        "tracking_joint_pos": joint_pos,
+        "tracking_joint_vel": joint_vel,
+        "tracking_root_height": root_height,
+        "tracking_orientation": orientation,
+        "residual_task": residual_task,
+        "alive_bonus": alive * not_fallen,
+    }}
 '''
 
 

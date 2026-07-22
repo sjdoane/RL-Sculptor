@@ -82,6 +82,33 @@ present:
 When no such block is present, ground reward-spec numbers exactly as
 before (citations / physics first-principles) — this section is a no-op.
 
+## TRACKING-FIRST COMPOSITION (hard contract when the parent declares it)
+
+If `CURRENT_REWARD_SOURCE.REWARD_SPEC["composition"]["type"]` is
+`"reference_tracking_residual"`, the attached reference is the immutable
+structural reward base. You are NOT authoring the motion from scratch.
+
+  - Preserve every `REFERENCE_*` target array, all `_W_*` / composition
+    constants, phase clock, tracking helpers, `compute_reward`, and
+    `compute_reward_batched` exactly. Preserve the composition's
+    `reference_clip_id`, `reference_target_sha256`, and `tracking_weight`.
+  - Preserve all `tracking_*` component outputs and `reference_tracking`.
+    Never replace them with a guessed posture/velocity proxy or reduce their
+    weight to make a residual dominate.
+  - Author ONLY the bodies of `_residual_task_numpy` and
+    `_residual_task_batched`: goal direction, environment interaction,
+    completion/guard, or safety gating not already encoded by the motion.
+    Return raw credit in both paths; the immutable wrappers clamp it into
+    `[0, residual_max]`. Express failure by withholding residual credit or
+    zero-gating it, not by adding an unbounded penalty. Keep the two hook
+    implementations semantically equivalent.
+  - The final non-fallen reward is
+    `tracking_weight * reference_tracking + residual_task + small_alive_bonus`.
+    The residual maximum must stay <= 35% of `tracking_weight`.
+  - Record the composition unchanged in the child `REWARD_SPEC`. The validator
+    mechanically rejects a changed target hash, dropped tracking component,
+    weakened tracking weight, or oversized residual.
+
 ## REQUIREMENTS (all mandatory)
 
 1. Return the COMPLETE new Python module source. No markdown fences, no

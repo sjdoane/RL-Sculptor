@@ -114,3 +114,36 @@ Do these top-to-bottom. Each is a substantial chunk. Fully unit-test each before
 - UI frontend: `reward-sculptor-ui/frontend/src/` (pages under `components/`: `WorldTab`, `WorldViewer3D`, `RewardsTab`, `RunsTab`, `KnowledgeGraphTab`, `PhysicsTab`, `ReportsTab`, `RobotViewer`, dialogs `AuthorWorldDialog`/`NewMissionDialog`/`NewRunDialog`/`ReferencePickerDialog`; routing in `App.tsx`).
 
 **First action on "read handoff": begin Task 1.**
+
+---
+
+## 8. Progress update 2026-07-21 — Task 1 implemented (Codex)
+
+Task 1 is implemented and ready for the §6 live UI verification. An attached
+stage reference now deterministically replaces the pristine v0 placeholder
+with a compact, 16-phase DeepMimic-style base (joint position, joint velocity,
+root height, and orientation when available). The LLM can edit only scalar and
+batched residual hooks; reference targets, target hash, tracking kernels,
+tracking weight, composition wrappers, fall gate, and residual cap are frozen
+by AST/content validation. Manual UI edits enforce the same invariant. Stages
+without an attached reference stay on the historical reward path.
+
+The Rewards tab now renders the composition explicitly (reference tracking vs.
+maximum residual, clip id, and target hash). The initial broad suite exposed
+the three previously documented World-runtime failures: scenes without
+`env_origins` had lost the correct zero-origin fallback. That compatibility
+regression is fixed for NumPy and Torch runtimes.
+
+Verification at this checkpoint:
+
+- core focused reference suite: 51 passed;
+- UI focused reward suite: 25 passed;
+- full core suite: 2,178 passed / 1 optional-JAX skip;
+- full UI backend suite: 562 passed;
+- frontend TypeScript check and production build: passed (2,761 modules);
+- scoped Ruff, compileall, and `git diff --check`: passed.
+
+Next action: commit this slice, then execute §6 through the real browser before
+starting Task 2. In particular, create/attach a reference and confirm the
+Rewards composition card appears in both themes and the browser console stays
+clean.

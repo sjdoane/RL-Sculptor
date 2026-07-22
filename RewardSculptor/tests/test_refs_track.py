@@ -28,6 +28,7 @@ from sculptor.refs.track import (
     build_track_project,
     compute_tracking_errors,
     downsample_phase_targets,
+    generate_tracking_residual_reward_source,
     generate_tracking_reward_source,
     read_donor_adapter_config,
     track_clip,
@@ -196,6 +197,121 @@ def test_generate_tracking_reward_source_raises_on_qpos_too_short():
     next_state = {"qpos": np.zeros(5)}  # too short for 3 tracked joints
     with pytest.raises(ValueError, match="too short"):
         compute_reward({}, None, next_state, {"episode_length": 0})
+
+
+def test_tracking_first_reward_scores_reference_and_supports_cpu_batch():
+    torch = pytest.importorskip("torch")
+    src = generate_tracking_residual_reward_source(
+        clip=_make_getup_clip(), clip_id="getup1",
+    )
+    # The immutable prior is deliberately compact enough for complete-module
+    # editor responses, even on robots with many joints.
+    assert len(src) < 30_000
+    ns: dict = {}
+    exec(compile(src, "tracking_first_reward", "exec"), ns)  # noqa: S102
+    assert ns["REFERENCE_N_PHASES"] == 16
+    composition = ns["REWARD_SPEC"]["composition"]
+    assert composition["type"] == "reference_tracking_residual"
+    assert composition["residual_max"] <= 0.35 * composition["tracking_weight"]
+
+    next_state = {
+        "qpos": ns["REFERENCE_JOINT_POS"][0].copy(),
+        "qvel": ns["REFERENCE_JOINT_VEL"][0].copy(),
+    }
+    info = {
+        "episode_length": 0.0,
+        "step_dt": 1.0 / 30.0,
+        "base_height": float(ns["REFERENCE_ROOT_Z"][0]),
+        "fallen": 0.0,
+    }
+    matched, components = ns["compute_reward"]({}, None, next_state, info)
+    perturbed_state = {
+        "qpos": next_state["qpos"] + 1.0,
+        "qvel": next_state["qvel"] + 3.0,
+    }
+    perturbed_info = dict(info, base_height=info["base_height"] + 0.4)
+    perturbed, _ = ns["compute_reward"](
+        {}, None, perturbed_state, perturbed_info,
+    )
+    assert matched > perturbed
+    assert components["reference_tracking"] > 0.99
+    assert components["residual_task"] == 0.0
+
+    batch_state = {
+        key: torch.as_tensor(value).repeat(2, 1)
+        for key, value in next_state.items()
+    }
+    batch_info = {
+        "episode_length": torch.zeros(2),
+        "step_dt": torch.full((2,), 1.0 / 30.0),
+        "base_height": torch.full((2,), info["base_height"]),
+        "fallen": torch.zeros(2),
+    }
+    rewards, batch_components = ns["compute_reward_batched"](
+        batch_state, torch.zeros((2, 1)), batch_state, batch_info,
+    )
+    assert rewards.shape == (2,)
+    assert torch.isfinite(rewards).all()
+    assert torch.all(batch_components["residual_task"] == 0.0)
+
+
+def test_tracking_first_validator_allows_hooks_but_freezes_composition():
+    from types import SimpleNamespace
+
+    from sculptor.edit import (
+        EditValidationError,
+        _reference_kernel_hash,
+        _reference_tracking_contract,
+        _validate_reference_tracking_contract,
+    )
+
+    parent_source = generate_tracking_residual_reward_source(
+        clip=_make_getup_clip(), clip_id="getup1",
+    )
+    parent_ns: dict = {}
+    exec(compile(parent_source, "parent_tracking", "exec"), parent_ns)  # noqa: S102
+    parent_mod = SimpleNamespace(**parent_ns)
+    parent = _reference_tracking_contract(parent_mod)
+    parent_hash = _reference_kernel_hash(parent_source)
+    assert parent is not None and parent_hash is not None
+
+    # Residual hooks are the only intentionally editable surface.
+    child_source = parent_source.replace(
+        "    return 0.0\n\n\ndef compute_reward",
+        "    return 0.1\n\n\ndef compute_reward",
+    ).replace(
+        "    return torch.zeros_like(like)\n\n\ndef compute_reward_batched",
+        "    return torch.full_like(like, 0.1)\n\n\ndef compute_reward_batched",
+    )
+    child_ns: dict = {}
+    exec(compile(child_source, "child_tracking", "exec"), child_ns)  # noqa: S102
+    next_state = {
+        "qpos": child_ns["REFERENCE_JOINT_POS"][0].copy(),
+        "qvel": child_ns["REFERENCE_JOINT_VEL"][0].copy(),
+    }
+    info = {
+        "episode_length": 0.0, "step_dt": 1.0 / 30.0,
+        "base_height": float(child_ns["REFERENCE_ROOT_Z"][0]),
+        "fallen": 0.0,
+    }
+    _, components = child_ns["compute_reward"]({}, None, next_state, info)
+    _validate_reference_tracking_contract(
+        mod=SimpleNamespace(**child_ns), source=child_source,
+        components=components, parent=parent, parent_kernel_hash=parent_hash,
+    )
+
+    weakened = child_source.replace("_TRACKING_WEIGHT = 1.0", "_TRACKING_WEIGHT = 0.1")
+    weakened_ns: dict = {}
+    exec(compile(weakened, "weakened_tracking", "exec"), weakened_ns)  # noqa: S102
+    _, weakened_components = weakened_ns["compute_reward"](
+        {}, None, next_state, info,
+    )
+    with pytest.raises(EditValidationError, match="immutable reference tracking"):
+        _validate_reference_tracking_contract(
+            mod=SimpleNamespace(**weakened_ns), source=weakened,
+            components=weakened_components, parent=parent,
+            parent_kernel_hash=parent_hash,
+        )
 
 
 # ── error-metric computation ─────────────────────────────────────────────
