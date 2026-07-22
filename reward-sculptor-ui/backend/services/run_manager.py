@@ -385,6 +385,65 @@ def read_control_file(path: Path) -> dict[str, Any]:
     return {"mode": "auto", "resume_token": 0, "feedback": None, "stop": False}
 
 
+def _restore_promoted_training_inputs(project_dir: Path) -> dict[str, Any]:
+    """Restore mutable training pointers from the promoted atomic tuple.
+
+    ``selection_current.json`` is the authority.  The full selection and every
+    referenced artifact hash are verified before either convenience pointer is
+    changed.  The artifact-store lock prevents a concurrent promotion from
+    changing the selection between verification and restoration.
+
+    This is deliberately generic: refs are resolved by artifact kind/version,
+    never by robot or task name.
+    """
+    from sculptor.edit import _write_current_reexport
+    from sculptor.env_spec import load_env_spec, repoint_env_current
+    from sculptor.world.artifacts import WorldArtifactStore
+    from sculptor.world.project import load_selected_world
+
+    project_dir = Path(project_dir).expanduser().resolve()
+    store = WorldArtifactStore(project_dir)
+    with store.locked():
+        verified_store, selection, _bundle = load_selected_world(
+            store.selection_path,
+        )
+        reward_ref = selection.refs.get("reward")
+        env_ref = selection.refs.get("env_spec")
+        if reward_ref is None or reward_ref.kind != "reward":
+            raise ValueError("promoted selection has no valid reward ref")
+        if env_ref is None or env_ref.kind != "env_spec":
+            raise ValueError("promoted selection has no valid env_spec ref")
+
+        # resolve_ref rechecks each immutable artifact's SHA-256.  Confinement
+        # additionally prevents a hand-crafted selection from repointing the
+        # mutable inputs outside their project-local stores.
+        reward_path = verified_store.resolve_ref(reward_ref)
+        env_path = verified_store.resolve_ref(env_ref)
+        rewards_dir = (project_dir / "rewards").resolve()
+        env_dir = (project_dir / "env").resolve()
+        if (reward_path.parent != rewards_dir
+                or reward_path.name != f"{reward_ref.version}.py"):
+            raise ValueError("promoted reward ref is outside the reward store")
+        if (env_path.parent != env_dir
+                or env_path.name != f"{env_ref.version}.json"):
+            raise ValueError("promoted env_spec ref is outside the env store")
+
+        # Validate both sources before either mutable pointer is changed.
+        load_env_spec(env_path)
+        compile(reward_path.read_text(encoding="utf-8"), str(reward_path), "exec")
+        _write_current_reexport(rewards_dir, reward_path)
+        repoint_env_current(env_dir, env_ref.version)
+
+    return {
+        "selection_version": selection.selection_version,
+        "tuple_hash": selection.tuple_hash,
+        "reward_version": reward_ref.version,
+        "reward_sha256": reward_ref.sha256,
+        "env_spec_version": env_ref.version,
+        "env_spec_sha256": env_ref.sha256,
+    }
+
+
 # ── public API ────────────────────────────────────────────────────────
 def run_sculpt_job(
     *,
@@ -447,8 +506,30 @@ def run_sculpt_job(
     # Auto/Manual toggle works at ANY point mid-run, regardless of start mode.
     start_mode = run_params.get("start_mode")
     start_mode = start_mode if start_mode in ("manual", "auto") else "auto"
+    resume_exact_tuple = bool(run_params.get("resume_exact_tuple", False))
 
     async def _runner(job: Job, cancel: asyncio.Event) -> dict[str, Any]:
+        if resume_exact_tuple:
+            try:
+                restored = await asyncio.to_thread(
+                    _restore_promoted_training_inputs, project_dir,
+                )
+            except Exception as exc:
+                job.emit({
+                    "type": "promoted_tuple_restore_failed",
+                    "source": "ui_resume",
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
+                raise RuntimeError(
+                    "could not restore the promoted training tuple; "
+                    "the sculpt subprocess was not started"
+                ) from exc
+            job.emit({
+                "type": "promoted_tuple_restored",
+                "source": "ui_resume",
+                **restored,
+            })
+
         # Prepare env — strip empty ANTHROPIC_API_KEY so the .env file
         # in the project (or sculptor's own) can win; matches the
         # sculptor/__init__.py behavior.

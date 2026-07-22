@@ -2267,4 +2267,10 @@ if hasattr(_mod, "compute_reward_batched"):
     compute_reward_batched = _mod.compute_reward_batched
     __all__.append("compute_reward_batched")
 '''
-    current.write_text(src, encoding="utf-8")
+    # ``current.py`` is a mutable convenience pointer (the promoted world
+    # selection remains authoritative), but readers still must never observe a
+    # truncated module if the process dies during a rewrite.  Match the env
+    # pointer's tmp+replace discipline.
+    tmp = rewards_dir / "current.py.tmp"
+    tmp.write_text(src, encoding="utf-8")
+    tmp.replace(current)

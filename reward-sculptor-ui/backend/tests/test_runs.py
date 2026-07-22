@@ -436,6 +436,159 @@ def test_run_sculpt_job_ignores_existing_legacy_kg(
     assert captured["env"]["SCULPTOR_KG_PATH"] != str(legacy_db)
 
 
+def _promoted_recovery_project(project_dir: Path) -> tuple[Path, Path]:
+    """Build the smallest valid atomic tuple needed by recovery tests."""
+    from sculptor.edit import _write_current_reexport
+    from sculptor.world.artifacts import ArtifactRef, WorldArtifactStore
+
+    env_dir = project_dir / "env"
+    rewards_dir = project_dir / "rewards"
+    env_dir.mkdir(parents=True)
+    rewards_dir.mkdir(parents=True)
+
+    promoted_reward = rewards_dir / "v1.py"
+    draft_reward = rewards_dir / "v2.py"
+    promoted_reward.write_text("REWARD_SPEC = {}\ndef compute_reward(_obs): return 1.0\n")
+    draft_reward.write_text("REWARD_SPEC = {}\ndef compute_reward(_obs): return 2.0\n")
+    _write_current_reexport(rewards_dir, draft_reward)
+
+    promoted_env = env_dir / "v1.json"
+    draft_env = env_dir / "v2.json"
+    promoted_env.write_text(json.dumps({
+        "env_spec_version": 1,
+        "meta": {"version": "v1", "parent": "v0", "source": "test",
+                 "rationale": "promoted test input"},
+        "shared": {}, "train": {},
+    }))
+    draft_env.write_text(json.dumps({
+        "env_spec_version": 1,
+        "meta": {"version": "v2", "parent": "v1", "source": "test",
+                 "rationale": "unpromoted test draft"},
+        "shared": {}, "train": {"entropy_coef_scale": 2.0},
+    }))
+    (env_dir / "current.json").write_text(draft_env.read_text())
+
+    refs = {
+        "reward": ArtifactRef.from_path(
+            "reward", "v1", promoted_reward, base=project_dir,
+        ),
+        "env_spec": ArtifactRef.from_path(
+            "env_spec", "v1", promoted_env, base=project_dir,
+        ),
+    }
+    for kind in (
+        "world", "task", "resolved_eval", "channel_catalog", "clarifications",
+    ):
+        artifact = env_dir / f"{kind}_v1.json"
+        artifact.write_text("{}")
+        refs[kind] = ArtifactRef.from_path(
+            kind, "v1", artifact, base=project_dir,
+        )
+    WorldArtifactStore(project_dir).promote(
+        refs, evaluation_lineage="recovery-test",
+    )
+    return promoted_reward, promoted_env
+
+
+def test_restore_promoted_training_inputs_uses_hash_verified_tuple(
+    tmp_path: Path,
+) -> None:
+    from backend.services import run_manager
+
+    project_dir = tmp_path / "promoted-recovery"
+    promoted_reward, promoted_env = _promoted_recovery_project(project_dir)
+
+    result = run_manager._restore_promoted_training_inputs(project_dir)
+
+    assert result["selection_version"] == 1
+    assert result["reward_version"] == "v1"
+    assert result["env_spec_version"] == "v1"
+    assert promoted_reward.name in (
+        project_dir / "rewards" / "current.py"
+    ).read_text()
+    assert json.loads((project_dir / "env" / "current.json").read_text()) == (
+        json.loads(promoted_env.read_text())
+    )
+
+
+def test_restore_promoted_training_inputs_rejects_hash_drift_before_repoint(
+    tmp_path: Path,
+) -> None:
+    from backend.services import run_manager
+
+    project_dir = tmp_path / "tampered-recovery"
+    promoted_reward, _promoted_env = _promoted_recovery_project(project_dir)
+    reward_current = project_dir / "rewards" / "current.py"
+    env_current = project_dir / "env" / "current.json"
+    reward_before = reward_current.read_bytes()
+    env_before = env_current.read_bytes()
+
+    promoted_reward.write_text("REWARD_SPEC = {}\ndef compute_reward(_obs): return 99.0\n")
+    with pytest.raises(ValueError, match="hash mismatch"):
+        run_manager._restore_promoted_training_inputs(project_dir)
+
+    assert reward_current.read_bytes() == reward_before
+    assert env_current.read_bytes() == env_before
+
+
+def test_run_sculpt_job_restores_promoted_tuple_before_subprocess(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from backend.services import run_manager
+    from backend.services.job_manager import Job
+
+    project_dir = tmp_path / "ui-recovery"
+    project_dir.mkdir()
+    order: list[str] = []
+
+    def _fake_restore(path: Path) -> dict:
+        assert path == project_dir
+        order.append("restore")
+        return {
+            "selection_version": 7,
+            "tuple_hash": "f" * 64,
+            "reward_version": "v4",
+            "reward_sha256": "a" * 64,
+            "env_spec_version": "v2",
+            "env_spec_sha256": "b" * 64,
+        }
+
+    class _Sentinel(Exception):
+        pass
+
+    async def _fake_exec(*args, **kwargs):
+        order.append("subprocess")
+        raise _Sentinel()
+
+    monkeypatch.setattr(
+        run_manager, "_restore_promoted_training_inputs", _fake_restore,
+    )
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+    runner = run_manager.run_sculpt_job(
+        project_dir=project_dir,
+        run_params={
+            "behavior_goal": "recover the last accepted behavior",
+            "iterations": 1,
+            "resume_exact_tuple": True,
+        },
+    )
+    job = Job(
+        job_id="t_recovery", kind="sculpt_run",
+        project_slug="ui-recovery", status="running",
+    )
+    job._cancel = asyncio.Event()
+    with pytest.raises(_Sentinel):
+        asyncio.run(runner(job, job._cancel))
+
+    assert order == ["restore", "subprocess"]
+    restored = next(
+        event for event in job.events
+        if event.get("type") == "promoted_tuple_restored"
+    )
+    assert restored["selection_version"] == 7
+    assert restored["reward_version"] == "v4"
+
+
 # ── Test 1 follow-up (Issue C): training_iterations plumbing ─────────
 def test_run_sculpt_job_forwards_training_iterations_as_cli_flag(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

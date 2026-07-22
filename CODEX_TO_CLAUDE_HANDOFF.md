@@ -1278,3 +1278,36 @@ but `selection_current.json` still correctly pins reward v5 + env v1 (selection
 v12). Do not train v6/env v3. The next action is a UI Resume from iter 5 after
 this code commit, using the pinned v5/env-v1 tuple and one focused recovery
 cycle; inspect the same full acceptance conjunction afterward.
+
+## UI exact-promoted-tuple recovery 2026-07-22 (Codex)
+
+The prior instruction to resume v5/env-v1 exposed a UI integrity gap: ordinary
+Resume intentionally trains the newly diagnosed mutable `rewards/current.py`
+and `env/current.json`, which now point to the preserved-but-rejected v6/env-v3
+drafts. Selecting v5 in the Rewards viewer does not and should not silently
+change training inputs. The user therefore had no honest UI-only way to reject
+those drafts and continue from atomic selection v12.
+
+New Run → Advanced now has an explicit **Resume exact promoted tuple** recovery
+switch (off by default so normal iterative resumes still consume their new
+drafts). When enabled, the backend locks the artifact store, reads
+`selection_current.json`, verifies the tuple hash and every referenced artifact
+SHA-256, confines reward/env refs to their project-local version stores,
+validates/compiles both sources, restores `rewards/current.py` and
+`env/current.json`, and emits `promoted_tuple_restored` with selection, tuple,
+artifact versions, and hashes before spawning `sculptor.cli`. Any mismatch
+emits `promoted_tuple_restore_failed` and prevents the subprocess/GPU from
+starting. This path is artifact-kind driven and contains no robot/task-name
+keying. Reward-pointer rewrites now also use tmp+replace so readers cannot see
+a truncated module after a crash.
+
+Verification: three new recovery tests pass, including exact restore, hash-drift
+rejection with both mutable pointers unchanged, and restore-before-subprocess
+ordering/provenance. TypeScript project checking passes; compileall and scoped
+Ruff pass (ignoring only the repository's pre-existing E402/F401 findings).
+Browser verification against the live app shows the new switch with selection
+v12 and exact hash-verified recovery language. The next launch must enable this
+switch, use one 750-PPO recovery cycle, Auto, 1,024 envs, seed 42, two 1,000-step
+1080p episodes, and `gen_003` observe-only. Confirm the restore event names
+reward v5/env v1 before PPO begins, then audit the full conjunctive acceptance
+gate.

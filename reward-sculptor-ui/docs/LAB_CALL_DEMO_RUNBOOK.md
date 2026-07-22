@@ -147,6 +147,9 @@ From **World**, choose **Train this world**, or open **New run**. Select
 - Fitness mode: `observe`
 - Fitness patience: `4`
 - Resume: enabled
+- Resume exact promoted tuple: leave **off** for a normal iteration; turn
+  **on** only when intentionally rejecting unpromoted diagnosis drafts and
+  continuing from the last accepted atomic tuple
 - Knowledge graph: enabled
 - Auto-physics on severe: project default
 
@@ -244,6 +247,12 @@ failure-analysis story only.
   newest valid learned policy. The Training log must emit
   `resume_warm_start_resolved` followed by `warm_start_loaded`; stop the run if
   a fresh actor is initialized instead.
+- **Reject a bad automatic diagnosis:** open New run → Advanced and enable
+  **Resume exact promoted tuple**. The launch must log
+  `promoted_tuple_restored` with the expected selection/tuple hash and
+  reward/env versions before training starts. A hash mismatch fails closed
+  before the GPU process launches; never repair the immutable artifacts in
+  place.
 - **World verification turns red:** choose **Verify integrity**; re-author and
   promote only if the tuple genuinely changed. Never bypass the gate.
 - **Metric generation fails:** use the inline Retry control. Do not promote a

@@ -376,6 +376,9 @@ export interface RunParamsPayload {
   // §Ship 39 (H1): interactive start mode. "manual" pauses for human feedback
   // at each iteration boundary (the UI default); "auto" runs straight through.
   start_mode?: "manual" | "auto";
+  // Explicit recovery path: restore reward + env inputs from the last promoted
+  // atomic world tuple before the resumed sculpt process starts.
+  resume_exact_tuple?: boolean;
 }
 
 /** §Ship 39 (H1): the interactive control sidecar state (PATCH response). */

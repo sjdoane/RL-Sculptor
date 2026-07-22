@@ -155,6 +155,12 @@ class RunParams(BaseModel):
     start_mode: Literal["manual", "auto"] = "auto"
     """Interactive start mode. manual = pause-for-feedback each iteration."""
 
+    resume_exact_tuple: bool = False
+    """Before resuming, restore reward/env inputs from the authoritative
+    promoted atomic selection.  This is an explicit recovery control for
+    rejecting unpromoted diagnosis drafts; normal iterative resumes keep using
+    the newly generated drafts."""
+
 
 class RunControl(BaseModel):
     """PATCH /projects/{slug}/runs/{run_id}/control body — interactive

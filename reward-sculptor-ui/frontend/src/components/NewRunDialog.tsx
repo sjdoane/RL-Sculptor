@@ -262,6 +262,9 @@ export function NewRunDialog({
   // §Ship 39 (H1): pause-for-feedback by default (the requested default);
   // flippable to Auto at any time from the run header once it's running.
   const [interactive, setInteractive] = useState(true);
+  // Recovery-only: reject mutable diagnosis drafts and restore the reward/env
+  // refs from selection_current.json before the subprocess starts.
+  const [resumeExactTuple, setResumeExactTuple] = useState(false);
   const [allowDefaultWorld, setAllowDefaultWorld] = useState(false);
   const [allowRobotMismatch, setAllowRobotMismatch] = useState(false);
   const [validatingLaunch, setValidatingLaunch] = useState(false);
@@ -372,6 +375,7 @@ export function NewRunDialog({
       setNumEnvs(defaults.num_envs);
       setDevice(defaults.device);
       setProfile("custom");
+      setResumeExactTuple(false);
       setAllowDefaultWorld(false);
       setAllowRobotMismatch(false);
     }
@@ -520,6 +524,10 @@ export function NewRunDialog({
           : null,
       // §Ship 39 (H1): manual = pause for human feedback each iteration.
       start_mode: interactive ? ("manual" as const) : ("auto" as const),
+      // Explicitly opt in: ordinary iterative resumes must continue to consume
+      // their newly generated drafts, while recovery can reject them in favor
+      // of the last promoted atomic tuple.
+      resume_exact_tuple: resumeExactTuple,
     };
     launch.mutate(body, {
       onSuccess: (r) => {
@@ -800,6 +808,15 @@ export function NewRunDialog({
             </>
           ) : (
             <>
+              {hasPriorIters && worldSel.data && (
+                <ToggleRow
+                  on={resumeExactTuple}
+                  onChange={(value) => { setResumeExactTuple(value); setProfile("custom"); }}
+                  label="Resume exact promoted tuple"
+                  title={<>Recovery mode · restore selection v{worldSel.data.selection.selection_version} before training</>}
+                  desc="Reject unpromoted reward/environment drafts and resume from the exact hash-verified atomic tuple."
+                />
+              )}
               <div className="rs-row2">
                 <Field label="Sculpt iters (outer)" htmlFor="run-iters">
                   {numField(iterations, (v) => setIterations(typeof v === "number" ? v : 1), { id: "run-iters", min: 1, max: 100 })}
