@@ -32,23 +32,56 @@ import type {
   TechniqueSummary,
 } from "./types";
 
+type FastApiValidationIssue = {
+  loc?: unknown;
+  msg?: unknown;
+};
+
+/** Convert RFC-7807/FastAPI error details into text that is safe to render.
+ * FastAPI's 422 payload uses an array of objects even though the public UI
+ * contract is a string. Passing that raw array to Sonner makes React attempt
+ * to render the objects and can unmount the entire application. */
+export function formatProblemDetail(detail: unknown, fallback: string): string {
+  if (typeof detail === "string" && detail.trim()) return detail;
+  if (Array.isArray(detail)) {
+    const issues = detail.map((raw) => {
+      if (raw == null || typeof raw !== "object") return String(raw);
+      const issue = raw as FastApiValidationIssue;
+      const path = Array.isArray(issue.loc)
+        ? issue.loc
+            .filter((part) => part !== "body" && part !== "query" && part !== "path")
+            .map((part) => String(part).replaceAll("_", " "))
+            .join(" › ")
+        : "";
+      const message = typeof issue.msg === "string" ? issue.msg : "Invalid value";
+      return path ? `${path}: ${message}` : message;
+    }).filter(Boolean);
+    if (issues.length) return issues.join("; ");
+  }
+  if (detail != null && typeof detail === "object") {
+    const message = (detail as { msg?: unknown }).msg;
+    if (typeof message === "string" && message.trim()) return message;
+    try {
+      return JSON.stringify(detail);
+    } catch {
+      // Fall through to the endpoint's stable title.
+    }
+  }
+  return fallback || "Request failed";
+}
+
 export class ApiError extends Error {
   status: number;
   type: string;
   problem: ProblemDetail;
   constructor(problem: ProblemDetail) {
-    // FastAPI 422s put an ARRAY of validation errors in `detail` —
-    // stringify it so toasts don't render "[object Object]".
-    super(
-      typeof problem.detail === "string" && problem.detail
-        ? problem.detail
-        : problem.detail != null && typeof problem.detail === "object"
-          ? JSON.stringify(problem.detail)
-          : problem.title,
-    );
+    const detail = formatProblemDetail(problem.detail, problem.title);
+    super(detail);
     this.status = problem.status;
     this.type = problem.type;
-    this.problem = problem;
+    // Preserve endpoint-specific fields (for example `missing_stages`) while
+    // ensuring every caller sees a render-safe textual detail.
+    this.problem = { ...problem, detail };
     this.name = "ApiError";
   }
 }

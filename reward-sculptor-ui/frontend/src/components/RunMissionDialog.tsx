@@ -86,6 +86,7 @@ export function RunMissionDialog({
   // without leaving the dialog. Cleared on open/close and on the next
   // successful or differently-typed submit.
   const [missingStages, setMissingStages] = useState<string[] | null>(null);
+  const [launchError, setLaunchError] = useState<string | null>(null);
   const regen = useRegenerateStageMetric(slug);
   const [regenStage, setRegenStage] = useState<string | null>(null);
   const [regenJobId, setRegenJobId] = useState<string | null>(null);
@@ -136,6 +137,7 @@ export function RunMissionDialog({
   // dialog opens or closes, so a re-open starts clean.
   useEffect(() => {
     setMissingStages(null);
+    setLaunchError(null);
     setRegenStage(null);
     setRegenJobId(null);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -280,6 +282,48 @@ export function RunMissionDialog({
   // the stage_metric_required 409 guard for this one launch. Normal
   // submits never set it.
   const submit = (proceedBlind?: boolean) => {
+    const ranges: Array<[string, number | "", number, number]> = [
+      ["Rounds per stage", iterations, 1, 200],
+      ["Steps per round", stepsPerIter, 100, 200_000],
+      ["Seed", seed, 0, 2_000_000_000],
+      ["Edit candidates", editCandidates, 1, 5],
+      ["Rollout episodes", rolloutEpisodes, 1, 32],
+      ["Episode steps", maxEpisodeSteps, 50, 5_000],
+      ["Playback speed", playbackSpeed, 0.1, 10],
+      ["num envs", numEnvs, 1, 8_192],
+      ["Fitness patience", fitnessPatience, 1, 50],
+    ];
+    if (earlyStopOnCriterion) ranges.push(["Stability window", stabilityWindow, 1, 10]);
+    if (extendOnImprovement) {
+      ranges.push(
+        ["Max extensions", maxExtensions, 0, 3],
+        ["Extension factor", extensionFactor, 0.1, 1.5],
+        ["Improvement threshold", extensionThreshold, 0, 1],
+      );
+    }
+    const invalid = ranges.find(([, value, min, max]) =>
+      typeof value === "number" && (!Number.isFinite(value) || value < min || value > max));
+    if (invalid) {
+      const [label, , min, max] = invalid;
+      const message = `${label} must be between ${min.toLocaleString()} and ${max.toLocaleString()}.`;
+      setLaunchError(message);
+      toast.error("Check mission configuration", { description: message });
+      return;
+    }
+    const integerLabels = new Set([
+      "Rounds per stage", "Steps per round", "Seed", "Edit candidates",
+      "Rollout episodes", "Episode steps", "num envs", "Fitness patience",
+      "Stability window", "Max extensions",
+    ]);
+    const nonInteger = ranges.find(([label, value]) =>
+      integerLabels.has(label) && typeof value === "number" && !Number.isInteger(value));
+    if (nonInteger) {
+      const message = `${nonInteger[0]} must be a whole number.`;
+      setLaunchError(message);
+      toast.error("Check mission configuration", { description: message });
+      return;
+    }
+    setLaunchError(null);
     const body = buildBody();
     if (proceedBlind) body.proceed_blind = true;
     const variables: RunMissionVariables = { missionSlug, body };
@@ -287,6 +331,7 @@ export function RunMissionDialog({
       onSuccess: () => {
         setOpen(false);
         setMissingStages(null);
+        setLaunchError(null);
         toast.success("Mission run queued", {
           description: Object.keys(body).length
             ? "Custom config applied; watch the live event stream."
@@ -309,6 +354,7 @@ export function RunMissionDialog({
             ? err.problem.detail ?? err.problem.title
             : err.message;
         toast.error("Could not run mission", { description: detail });
+        setLaunchError(detail);
       },
     });
   };
@@ -359,6 +405,12 @@ export function RunMissionDialog({
             </>
           }
         >
+          {launchError && (
+            <Banner kind="err" icon="alert-triangle">
+              <span style={{ fontWeight: 600, display: "block" }}>Check mission configuration</span>
+              <span style={{ fontSize: 12, display: "block" }}>{launchError}</span>
+            </Banner>
+          )}
           {missingStages && missingStages.length > 0 && (
             <Banner kind="warn" icon="alert-triangle">
               <span style={{ fontWeight: 600, display: "block" }}>
