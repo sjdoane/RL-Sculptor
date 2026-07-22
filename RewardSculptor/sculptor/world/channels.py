@@ -273,6 +273,17 @@ def compile_channel_catalog(
     observations = task.get("shared", {}).get("observations", {})
     objects = world.get("shared", {}).get("objects", {})
     zones = world.get("shared", {}).get("zones", {})
+    goal = task.get("shared", {}).get("goal", {})
+    raw_waypoints = goal.get("waypoints", [])
+    waypoint_order = (
+        {
+            str(name): index
+            for index, name in enumerate(raw_waypoints)
+            if isinstance(name, str)
+        }
+        if isinstance(raw_waypoints, list)
+        else {}
+    )
     for name in sorted(objects):
         source = {"entity": name}
         channels.extend([
@@ -287,11 +298,16 @@ def compile_channel_catalog(
         ])
     for zone_name in sorted(zones):
         if zone_name in observations.get("region_relative", []):
+            source: dict[str, Any] = {"region": zone_name}
+            if zone_name in waypoint_order:
+                source.update({
+                    "sequence_index": waypoint_order[zone_name],
+                    "sequence_count": len(waypoint_order),
+                })
             channels.append(_channel(
                 f"region__{zone_name}__relative", ("T", "N", 3),
                 "region_relative", "shared_shaping", "progress",
-                {"region": zone_name}))
-    goal = task.get("shared", {}).get("goal", {})
+                source))
     goal_id = str(goal.get("id", "goal"))
     if goal.get("type") == "object_to_region":
         subject = str(goal["subject"])
@@ -528,6 +544,68 @@ def catalog_fixture_arrays(
         raise ValueError("fixture dimensions must be positive")
     out: dict[str, Any] = {}
     shape_values = {"T": time_steps, "N": num_envs, "J": 1}
+
+    # Ordered route fixtures must be temporal traces, not a set of regions all
+    # reported at zero distance from frame zero. Prefer compiler-authored
+    # sequence indices. Older frozen catalogs predate that metadata, so infer
+    # the conventional waypoint_N ordering and place a finish/goal region last.
+    has_waypoint_sequence = any(
+        spec.producer == "waypoint_state" for spec in catalog.channels)
+    region_specs = [
+        spec for spec in catalog.channels if spec.producer == "region_relative"
+    ]
+
+    def _region_order(spec: ChannelSpec) -> tuple[int, int, str]:
+        explicit = spec.source.get("sequence_index")
+        if isinstance(explicit, int) and not isinstance(explicit, bool):
+            return (0, explicit, spec.name)
+        region = str(spec.source.get("region", ""))
+        match = re.search(r"(?:waypoint|checkpoint|gate)[_-]?(\d+)$", region)
+        if match:
+            return (1, int(match.group(1)), region)
+        terminal = any(word in region.lower() for word in ("finish", "goal", "target"))
+        return (3 if terminal else 2, 0, region)
+
+    indexed_region_specs = [
+        spec for spec in region_specs
+        if isinstance(spec.source.get("sequence_index"), int)
+        and not isinstance(spec.source.get("sequence_index"), bool)
+    ]
+    route_regions = (
+        sorted(indexed_region_specs or region_specs, key=_region_order)
+        if has_waypoint_sequence
+        else []
+    )
+    route_region_index = {
+        spec.name: index for index, spec in enumerate(route_regions)
+    }
+    # Reserve at least 60% of the rollout for a terminal hold. This makes a
+    # two-second success hold observable in the canonical 3.6 s prompt probe.
+    terminal_start = min(
+        time_steps - 1,
+        max(0, int(round(0.40 * time_steps))),
+    )
+    nonterminal_count = max(0, len(route_regions) - 1)
+    if nonterminal_count:
+        first_center = min(
+            terminal_start,
+            max(0, int(round(0.08 * time_steps))),
+        )
+        last_center = max(
+            first_center,
+            terminal_start - max(1, int(round(0.05 * time_steps))),
+        )
+        route_centers = np.linspace(
+            first_center,
+            last_center,
+            nonterminal_count,
+            dtype=int,
+        ).tolist()
+    else:
+        route_centers = []
+    if route_regions:
+        route_centers.append(terminal_start)
+
     for spec in catalog.channels:
         shape = tuple(shape_values.get(dim, dim) for dim in spec.shape)
         dtype = np.dtype(spec.dtype)
@@ -544,6 +622,27 @@ def catalog_fixture_arrays(
                 # The object is settled after task completion; velocity is not
                 # a proxy for success.
                 arr[...] = 0
+        elif producer == "region_relative" and spec.name in route_region_index:
+            distance = {
+                "far_idle": 1.0,
+                "edge_camping": 0.005,
+                "contact_flicker": 0.0,
+                "forbidden_contact": 0.4,
+            }.get(case)
+            if distance is not None:
+                arr[..., 0] = distance
+            else:
+                index = route_region_index[spec.name]
+                center = route_centers[index]
+                width = max(2, int(round(0.025 * time_steps)))
+                trace = np.minimum(
+                    1.0,
+                    np.abs(np.arange(time_steps, dtype=np.float64) - center)
+                    / float(width),
+                )
+                if index == len(route_regions) - 1:
+                    trace[center:] = 0.0
+                arr[..., 0] = trace[:, None]
         elif producer in {"region_relative", "object_region_distance",
                           "robot_region_distance", "waypoint_distance",
                           "object_velocity_error", "configuration_error"}:

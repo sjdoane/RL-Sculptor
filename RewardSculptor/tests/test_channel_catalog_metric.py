@@ -33,7 +33,8 @@ from sculptor.world.channels import (
 def test_slalom_boxes_compile_as_planar_route_not_climbs():
     goal = (
         "Run a smooth slalom through four ordered waypoints, alternating "
-        "around four boxes, then stop upright for 2 seconds."
+        "around four boxes, then remain upright and still there continuously "
+        "for 2 seconds."
     )
     assert _abstract_objective_program(goal) == [
         "move_forward", "recover", "dwell",
@@ -44,6 +45,33 @@ def test_slalom_boxes_compile_as_planar_route_not_climbs():
         "climb", "dwell", "climb", "dwell",
         "climb", "dwell", "climb", "dwell",
     ]
+
+
+def test_competent_route_fixture_visits_regions_in_order_and_holds_finish():
+    draft = author_environment(
+        "Build a slalom around four boxes with ordered waypoints and a finish zone",
+        robot_capability_id="unitree_g1:base",
+    )
+    catalog = compile_channel_catalog(draft.world_spec, draft.task_spec)
+    route_specs = sorted(
+        (
+            spec for spec in catalog.channels
+            if spec.producer == "region_relative"
+            and "sequence_index" in spec.source
+        ),
+        key=lambda spec: spec.source["sequence_index"],
+    )
+    assert len(route_specs) >= 2
+    arrays = catalog_fixture_arrays(
+        catalog, time_steps=180, num_envs=2, case="competent")
+    first_hits = []
+    for spec in route_specs:
+        distance = np.linalg.norm(arrays[spec.name], axis=-1)
+        first_hits.append(int(np.argmax(distance[:, 0] < 0.75)))
+    assert first_hits == sorted(first_hits)
+    assert len(set(first_hits)) == len(first_hits)
+    finish_distance = np.linalg.norm(arrays[route_specs[-1].name], axis=-1)
+    assert np.all(finish_distance[-100:] < 0.75)
 
 
 def _catalog() -> ChannelCatalog:
@@ -310,6 +338,57 @@ def test_prompt_native_traversal_composes_physics_and_world_without_reference(
     assert result["abstract_objective_program"] == [
         "climb", "dwell", "climb", "dwell",
         "climb", "dwell", "climb", "dwell",
+    ]
+    scores = result["archetype_scores"]
+    assert scores["catalog_competent"] > 0.9
+    assert scores["catalog_far_idle"] == pytest.approx(0.0)
+    assert scores["prompt_competent"] > 0.9
+
+
+def test_prompt_native_planar_route_composes_motion_with_world_state(
+    tmp_path: Path,
+) -> None:
+    """Planar authored routes need the same composed competent fixture as parkour."""
+    draft = author_environment(
+        "Build a slalom around four boxes with ordered waypoints and a finish zone",
+        robot_capability_id="unitree_g1:base",
+    )
+    catalog = compile_channel_catalog(draft.world_spec, draft.task_spec)
+    success_name = next(
+        name for name in catalog.names()
+        if name.startswith("goal__") and name.endswith("__success")
+    )
+    source = f'''\
+import numpy as np
+
+ABSTRACT_OBJECTIVE = {{"phases": ["move_forward", "recover", "dwell"]}}
+
+def compute_spec(arrays, behavior, meta):
+    root = arrays.get("root_link_pos_w")
+    success = arrays.get("{success_name}")
+    if root is None or success is None:
+        return {{"spec_score": 0.0}}
+    dx = root[-1, :, 0] - root[0, :, 0]
+    speed = np.linalg.norm(np.diff(root, axis=0)[..., :2], axis=-1)
+    physical = (dx > 0.5) & (np.mean(speed[-20:], axis=0) < 0.02)
+    completed = np.mean(success[-3:] > 0.5, axis=0) >= 1.0
+    return {{"spec_score": float(np.mean(physical & completed))}}
+'''
+    path = _write_metric(tmp_path, source, "planar_route.py")
+
+    result = validate_generated_metric(
+        source,
+        path,
+        behavior_goal=(
+            "Run a slalom around four boxes through ordered waypoints, enter "
+            "the finish zone, then stop upright and hold for 2 seconds"
+        ),
+        channel_catalog=catalog,
+    )
+
+    assert result["ok"], result["reasons"]
+    assert result["abstract_objective_program"] == [
+        "move_forward", "recover", "dwell",
     ]
     scores = result["archetype_scores"]
     assert scores["catalog_competent"] > 0.9

@@ -165,11 +165,25 @@ Any array may be ABSENT — always `arrays.get(k)` + guard for None.
    over a window before thresholding); a metric an explosive one-frame whip
    can inflate is gameable.
 
-6. **DATA SUFFICIENCY — abstain, never proxy.** If a signal you need (a foot
-   contact, a foot position, a specific role) is ABSENT, that channel must
-   abstain (neutral 1.0 + a flag in the subcomponents) — NEVER silently
-   substitute a magnitude proxy that re-introduces the blind spot the real
-   signal would have closed.
+6. **DATA SUFFICIENCY — distinguish OPTIONAL evidence from GOAL-DEFINING
+   evidence.** If an optional signal (a corroborating foot contact, foot
+   position, or specific role) is ABSENT, that optional channel must abstain
+   (neutral 1.0 + a flag in the subcomponents) — NEVER silently substitute a
+   magnitude proxy that re-introduces the blind spot the real signal closed.
+   But a catalog channel that certifies a prompted requirement (ordered
+   waypoints, target/finish entry, forbidden contact, hold duration, authored
+   success) is GOAL-DEFINING: its absence must FAIL CLOSED to spec_score 0
+   unless you independently verify that same requirement from other available
+   physical arrays. Never convert missing goal-defining evidence into credit.
+
+   Catalog completion channels are necessary evidence, not sufficient physical
+   proof. The adversarial battery deliberately gives completed catalog state to
+   unrelated active motions. Therefore pair route/waypoint/success channels
+   with an independent physical signature from universal arrays when possible:
+   signed root displacement along the resolved course axis, non-trivial path
+   amplitude, terminal stillness/hold, posture, and sustained (not one-frame)
+   state. A kick, jump, or oscillation performed in place must not pass a
+   navigation/slalom metric merely because an authored flag says complete.
 
 7. **METRIC ≠ REWARD (no style regularizers here).** The metric is a pass/fail
    competence gate. Do NOT put smoothness / action-rate / jerk / energy

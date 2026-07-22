@@ -753,7 +753,8 @@ def _abstract_objective_program(
     ))
     wants_dwell = has(
         "pause", "pauses", "pausing", "wait", "waiting", "hold", "holding",
-        "stop", "stopping", "dwell", "dwelling",
+        "stop", "stopping", "dwell", "dwelling", "still", "stationary",
+        "continuously",
     )
     # Objects describe geometry, not necessarily a vertical action.  A slalom
     # or weave AROUND boxes is planar route following; treating the noun
@@ -978,17 +979,17 @@ def _abstract_objective_probe(
             x += 0.35
             z += 0.30
         elif phase == "move_forward":
-            root[a:b, :, 0] = (x + 0.90 * u)[:, None]
-            x += 0.90
+            root[a:b, :, 0] = (x + 3.00 * u)[:, None]
+            x += 3.00
         elif phase == "move_backward":
-            root[a:b, :, 0] = (x - 0.90 * u)[:, None]
-            x -= 0.90
+            root[a:b, :, 0] = (x - 3.00 * u)[:, None]
+            x -= 3.00
         elif phase == "move_left":
-            root[a:b, :, 1] = (y + 0.70 * u)[:, None]
-            y += 0.70
+            root[a:b, :, 1] = (y + 2.00 * u)[:, None]
+            y += 2.00
         elif phase == "move_right":
-            root[a:b, :, 1] = (y - 0.70 * u)[:, None]
-            y -= 0.70
+            root[a:b, :, 1] = (y - 2.00 * u)[:, None]
+            y -= 2.00
         elif phase == "jump":
             root[a:b, :, 0] = (x + 0.70 * u)[:, None]
             root[a:b, :, 2] = (z + 0.45 * np.sin(np.pi * u))[:, None]
@@ -2248,9 +2249,41 @@ def validate_generated_metric(
     # a universal positive, it MASKS a still/flail negative (the live 4f1dfef/a6e2eec
     # regression that broke the walker-fold and flail-under-kick gates) instead of
     # discriminating. Those goals keep the fixed battery + vacuous/selectivity path.
+    # A prompt-native planar route is just as much a traversal as parkour.
+    # The authored catalog's competent state supplies waypoint/region truth,
+    # while this probe supplies the missing root-motion + terminal-dwell
+    # physics.  Restricting composition to climb/jump_off made every honest
+    # slalom validator fail: its catalog_competent fixture was built on the
+    # dead-still archetype, so required signed travel/path amplitude could
+    # never pass.  Directional root phases remain embodiment-neutral and are
+    # safe to retarget for bipeds, quadrupeds, and mobile manipulators.
+    ballistic_traversal_phases = {"climb", "jump_off"}
+    planar_traversal_phases = {
+        "move_forward", "move_backward", "move_left", "move_right",
+    }
+    has_route_catalog = (
+        catalog is not None
+        and any(
+            channel.producer in {"waypoint_state", "robot_region_distance"}
+            for channel in catalog.channels
+        )
+    )
     abstract_is_traversal = (
         abstract_probe is not None
-        and ("climb" in abstract_program or "jump_off" in abstract_program))
+        and (
+            any(
+                phase in ballistic_traversal_phases
+                for phase in abstract_program
+            )
+            or (
+                has_route_catalog
+                and any(
+                    phase in planar_traversal_phases
+                    for phase in abstract_program
+                )
+            )
+        )
+    )
     if abstract_is_traversal:
         arche["prompt_competent"] = abstract_probe
     catalog_cases: dict[str, str] = {}
