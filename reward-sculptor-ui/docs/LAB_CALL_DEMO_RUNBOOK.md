@@ -214,7 +214,12 @@ failure-analysis story only.
 - **Out of memory:** Stop in Training, relaunch with `512` environments, and
   let the UI update the estimate/plan to custom.
 - **Sleep, power loss, or backend restart:** rerun `./run.sh`, open the same
-  project, and relaunch the same settings with Resume enabled.
+  project, and relaunch the same settings with Resume enabled. Resume searches
+  the actual preceding iteration artifacts rather than assuming reward and run
+  indices are contiguous, so a UI-authored reward-version gap still loads the
+  newest valid learned policy. The Training log must emit
+  `resume_warm_start_resolved` followed by `warm_start_loaded`; stop the run if
+  a fresh actor is initialized instead.
 - **World verification turns red:** choose **Verify integrity**; re-author and
   promote only if the tuple genuinely changed. Never bypass the gate.
 - **Metric generation fails:** use the inline Retry control. Do not promote a

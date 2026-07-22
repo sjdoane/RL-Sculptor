@@ -12,6 +12,8 @@ Covers:
     reason="local_checkpoint_wins" when a resume-path checkpoint exists AND
     init_policy_path was set — so Ship-16 orchestrator can tell "warm-
     started" apart from "resumed an in-flight iter".
+  * UI-style resume finds the newest valid preceding policy even when reward
+    versioning leaves gaps in the outer-iteration directory sequence.
   * `sculpt_run` passes init_policy_path ONLY to iter 0 of the run.
   * The `_mjlab_runner` CLI's argparse accepts --load-pretrained-policy.
   * Integration: a real rsl_rl PPO load roundtrip on CPU with tiny dummy
@@ -253,6 +255,42 @@ def test_train_or_resume_skips_corrupt_newest_partial_policy(
     assert captured["init_policy_path"] == logs / "model_100.pt"
 
 
+def test_latest_preceding_policy_crosses_reward_version_gap(tmp_path: Path):
+    """A v3 -> v5 prompt edit must warm-start iter_5 from iter_3."""
+    import torch
+    from sculptor.sculpt import _latest_preceding_policy
+
+    runs = tmp_path / "runs"
+    iter_3 = runs / "iter_3"
+    iter_3.mkdir(parents=True)
+    checkpoint = iter_3 / "checkpoint.pt"
+    torch.save({"model": "competent"}, checkpoint)
+    # `iter_4` intentionally does not exist.  An empty current iteration is
+    # realistic after the UI has pinned its tuple but before training starts.
+    (runs / "iter_5").mkdir()
+
+    assert _latest_preceding_policy(runs, before_iter=5) == checkpoint
+
+
+def test_latest_preceding_policy_skips_corrupt_newer_checkpoint(
+    tmp_path: Path,
+):
+    """Resume searches backward until a checkpoint satisfies integrity."""
+    import torch
+    from sculptor.sculpt import _latest_preceding_policy
+
+    runs = tmp_path / "runs"
+    older = runs / "iter_2"
+    older.mkdir(parents=True)
+    valid = older / "checkpoint.pt"
+    torch.save({"model": "valid"}, valid)
+    newer = runs / "iter_4"
+    newer.mkdir()
+    (newer / "checkpoint.pt").write_bytes(b"torn")
+
+    assert _latest_preceding_policy(runs, before_iter=5) == valid
+
+
 def test_train_or_resume_drops_init_policy_path_for_unsupported_adapter(
     tmp_path: Path, monkeypatch,
 ):
@@ -394,6 +432,10 @@ def test_sculpt_run_init_policy_iter_0_guard_in_source():
     assert "init_policy_path not found" in src, (
         "sculpt_run must fail fast with a clear FileNotFoundError when "
         "init_policy_path points to a non-existent file."
+    )
+    assert "_latest_preceding_policy(" in src, (
+        "UI Resume must recover the newest valid preceding policy when "
+        "reward versioning leaves a gap before the next outer iteration."
     )
 
 

@@ -938,6 +938,60 @@ def _latest_valid_partial_policy(iter_dir: Path) -> Optional[Path]:
     return None
 
 
+def _valid_promoted_policy(iter_dir: Path) -> Optional[Path]:
+    """Return this iteration's first loadable promoted checkpoint.
+
+    Torch checkpoints are parsed before reuse; zip-based adapters remain
+    opaque but must at least have non-zero content.  Keeping this check in one
+    place makes same-iteration resume and cross-iteration warm-start apply the
+    same integrity rule.
+    """
+    for ext in ("pt", "zip"):
+        checkpoint = iter_dir / f"checkpoint.{ext}"
+        if not checkpoint.is_file() or checkpoint.stat().st_size == 0:
+            continue
+        if ext == "pt":
+            try:
+                import torch as _torch
+
+                _torch.load(
+                    checkpoint, map_location="cpu", weights_only=False)
+            except Exception:  # noqa: BLE001 -- corrupt; try next candidate
+                continue
+        return checkpoint
+    return None
+
+
+def _latest_preceding_policy(
+    runs_dir: Path, *, before_iter: int,
+) -> Optional[Path]:
+    """Find the newest recoverable policy from an earlier outer iteration.
+
+    Reward versions and outer-iteration directories are intentionally
+    monotonic but need not be contiguous: a UI-authored reward can advance
+    ``v3`` to ``v5`` without ever training ``iter_4``.  Resume must therefore
+    search actual ``iter_<N>`` artifacts instead of assuming ``N - 1`` exists.
+    A completed checkpoint wins within an iteration; otherwise its newest
+    parseable intermediate model is eligible.  The current iteration is
+    excluded because :func:`_train_or_resume` handles its exact-tuple crash
+    recovery with higher precedence.
+    """
+    candidates: list[tuple[int, Path]] = []
+    for iter_dir in runs_dir.glob("iter_*"):
+        suffix = iter_dir.name.removeprefix("iter_")
+        if suffix.isdigit() and int(suffix) < before_iter:
+            candidates.append((int(suffix), iter_dir))
+
+    for _index, iter_dir in sorted(candidates, reverse=True):
+        promoted = _valid_promoted_policy(iter_dir)
+        if promoted is not None:
+            return promoted
+        partial = _latest_valid_partial_policy(iter_dir)
+        if partial is not None:
+            return partial
+    return None
+
+
 def _train_or_resume(
     *, adapter, iter_index: int, iter_dir: Path,
     reward_module_path: Path, steps: int, seed: int,
@@ -962,22 +1016,9 @@ def _train_or_resume(
     from sculptor.adapters.base import TrainResult
 
     # Most adapters save to `checkpoint.pt`; gym_sb3 uses `checkpoint.zip`.
-    # Check for either so we can resume across both paths.
-    for ext in ("pt", "zip"):
-        ckpt = iter_dir / f"checkpoint.{ext}"
-        if not ckpt.is_file() or ckpt.stat().st_size == 0:
-            continue
-        # Integrity check: torch can parse the `.pt`; we treat `.zip`
-        # (SB3) as opaque since we don't have a standalone validator.
-        ok = True
-        if ext == "pt":
-            try:
-                import torch as _torch
-                _torch.load(ckpt, map_location="cpu", weights_only=False)
-            except Exception:  # noqa: BLE001 — corrupt checkpoint, fall through
-                ok = False
-        if not ok:
-            continue
+    # Apply the same integrity rule used by cross-iteration resume discovery.
+    ckpt = _valid_promoted_policy(iter_dir)
+    if ckpt is not None:
         # Assemble best-effort metrics from prior metrics.json.
         metrics: dict[str, float] = {}
         try:
@@ -2596,6 +2637,30 @@ def sculpt_run(
             f"[sculpt] warning: rewards/ already has v{start_iter}.py but "
             f"--resume was not passed. Running fresh starting at iter 0.\n")
         start_iter = 0
+
+    # UI Resume should continue from learned behavior, not merely from the
+    # latest reward number.  Hand-authored/prompt-authored rewards can create
+    # gaps between reward versions and run directories (for example v3 -> v5
+    # with no iter_4).  When the caller did not choose an explicit policy and
+    # this iteration has no exact-tuple checkpoint/partial model of its own,
+    # warm-start from the newest valid preceding run artifact.  Same-iteration
+    # recovery still wins inside `_train_or_resume`, and explicit user intent
+    # always wins by leaving `init_ckpt` untouched.
+    if resume and init_ckpt is None and start_iter > 0:
+        current_iter_dir = runs_dir / f"iter_{start_iter}"
+        current_policy = (
+            _valid_promoted_policy(current_iter_dir)
+            or _latest_valid_partial_policy(current_iter_dir)
+        )
+        if current_policy is None:
+            init_ckpt = _latest_preceding_policy(
+                runs_dir, before_iter=start_iter)
+            if init_ckpt is not None:
+                _emit_event({
+                    "type": "resume_warm_start_resolved",
+                    "iter": start_iter,
+                    "source": str(init_ckpt),
+                })
 
     end_iter = start_iter + iterations
     # §Ship-7: `[iteration].seed` override (from CLI) wins over legacy

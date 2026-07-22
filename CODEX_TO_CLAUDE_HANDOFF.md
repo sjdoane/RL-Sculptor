@@ -1183,3 +1183,27 @@ Verification: focused compiler/runner/runtime 60 passed; focused channel,
 generated-metric, fitness, and realism 137 passed; broad CPU suite 2,215
 passed / 1 expected optional-JAX skip in 4m35s; scoped Ruff, compileall, and
 `git diff --check` passed before commit.
+
+## Gap-safe UI resume warm-start 2026-07-22 (Codex)
+
+The first post-fix UI launch (`a640baaa954fc1f7`) correctly pinned clean code
+`354fee1`, reward v5, env v1, and immutable selection v11, but exposed a
+separate generic resume gap before useful GPU work began. Prompt-authored
+rewards had advanced v3 to v5 without an `iter_4`; `sculpt_run` used the reward
+number as `start_iter` and passed no warm start, so iter 5 began from random
+weights instead of the competent iter-3 policy. The job was cooperatively
+stopped in the UI at RL iteration 0 and produced no policy checkpoint.
+
+UI Resume now resolves the newest valid policy from actual preceding
+`runs/iter_<N>` directories whenever the new iteration has no exact-tuple
+checkpoint or partial model and the user did not supply an explicit init
+policy. It searches across missing indices, prefers a promoted checkpoint
+within an iteration, falls back to the newest parseable partial model, and
+skips corrupt newer artifacts. Explicit user choice remains highest priority;
+same-iteration crash recovery still supersedes the preceding-policy warm start
+inside `_train_or_resume`. The logic is adapter/robot/task-name independent and
+the adapter retains final checkpoint compatibility validation.
+
+Verification: focused warm-start suite 20 passed; broad CPU suite 2,217 passed
+/ 1 expected optional-JAX skip in 4m54s; scoped Ruff E9/F63/F7/F82, compileall,
+and `git diff --check` passed before commit.
