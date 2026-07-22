@@ -1076,3 +1076,22 @@ missing/empty companion. The exact phase program actually used is persisted in
 references, when present, remain additive stronger evidence rather than a
 prerequisite. No tests were run for this urgent slice, per Sam's explicit
 instruction; only `git diff --check` was performed before commit.
+
+## Full-strength authored command supervision 2026-07-22 (Codex)
+
+The interrupted G1 slalom trace exposed a generic weighting bug: the compiled
+`WaypointVelocityCommand` was producing the correct body-frame lateral/yaw
+targets and the policy tracked them accurately, but `_cmd_train` multiplied
+MJLab's `track_linear_velocity` and `track_angular_velocity` terms by the same
+0.3 realism-floor scale used for posture/smoothness priors. The generated reward
+only observed speed magnitude and waypoint distance, so the only dense signal
+that distinguished left/right route turns was unnecessarily three times weak.
+
+When—and only when—the immutable World manifest declares a
+`waypoint_sequence` and the compiler confirms it actually installed a
+goal-conditioned command on a compatible base environment, those two nominal
+command-tracking rewards now retain full weight. All other default terms remain
+at the 0.3 realism floor, and Worlds with no installed command surface remain
+unchanged. Detection uses schema/runtime-adjustment semantics only; there is no
+robot name or simulator task-id keying. Focused adapter/compiler/runtime tests:
+58 passed. Scoped Ruff, compileall, and `git diff --check` passed.

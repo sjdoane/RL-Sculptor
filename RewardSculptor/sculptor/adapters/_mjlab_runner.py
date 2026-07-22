@@ -9,7 +9,9 @@ import cost, per the lazy-import rule in MJLAB_PIVOT_DESIGN §7.
 
 Reward injection: when `--reward-module-path` is passed, the runner
 adds `SculptorRewardTerm` and attenuates task-shipped terms to a 0.3x
-realism floor. It also adds a task-independent survival guard and explicit
+realism floor, except nominal command-tracking terms whose command was
+replaced by an authored task goal. It also adds a task-independent survival
+guard and explicit
 non-timeout termination penalty. Without those terms, an early policy can
 learn to fall immediately to avoid accumulating realism penalties, making a
 less-negative return look like progress. `cfg.scale_rewards_by_dt` is set to
@@ -22,10 +24,9 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 
 # ── Component capture sink (§7.1 / §7.2 — Eureka-style reward reflection) ──
@@ -748,6 +749,37 @@ def _apply_world_selection(
             flush=True,
         )
     return bundle
+
+
+def _full_weight_authored_command_rewards(world_bundle: Any | None) -> frozenset[str]:
+    """Return base reward terms that are part of an authored command contract.
+
+    The generic 0.3 realism floor is appropriate for posture, smoothness, and
+    safety priors, but it must not attenuate the simulator's dense supervision
+    for a command that the authored World replaced with a task goal.  Doing so
+    made lateral waypoint turns three times less important than their nominal
+    locomotion objective even though the policy observation already carried the
+    correct goal-conditioned command.
+
+    Detect the compiled schema and the compiler's installed runtime adjustment,
+    never a robot name or registered simulator task id.  The adjustment check is
+    important: a declarative goal alone must not preserve command rewards when
+    the selected base environment had no compatible command surface.
+    """
+    if world_bundle is None:
+        return frozenset()
+    manifest = getattr(world_bundle, "manifest", None)
+    task_shared = getattr(manifest, "task_shared", {})
+    goal = task_shared.get("goal", {}) if isinstance(task_shared, Mapping) else {}
+    adjustments = tuple(getattr(world_bundle, "runtime_adjustments", ()) or ())
+    installed = any(
+        "goal-conditioned waypoint traversal" in str(adjustment)
+        for adjustment in adjustments
+    )
+    if isinstance(goal, Mapping) and goal.get("type") == "waypoint_sequence" \
+            and installed:
+        return frozenset({"track_linear_velocity", "track_angular_velocity"})
+    return frozenset()
 
 
 def _load_authored_robot_capability(selection_path: str) -> Any | None:
@@ -1584,16 +1616,21 @@ def _cmd_train(args: argparse.Namespace) -> None:
         # exactly how Sam's overnight v2..v7 reward-hacked by
         # flipping onto the base (sculptor_primary rewarded upward
         # body motion irrespective of how the body got up there).
-        # Keep them at 0.3× so the physics-plausible prior dominates
-        # fine-grained control while sculptor_primary (weight=1.0 below)
-        # dominates the task objective.
+        # Keep them at 0.3× so the physics-plausible prior complements
+        # sculptor_primary (weight=1.0 below).  A default reward that tracks a
+        # command replaced by the authored World is different: it is now dense
+        # TASK supervision, so preserve its nominal weight.  This lets a route
+        # command teach lateral turns and heading while the generated reward
+        # remains responsible for completion, contact, and terminal-hold intent.
         existing = getattr(env_cfg, "rewards", None)
         REALISM_FLOOR_SCALE = 0.3
+        full_weight_terms = _full_weight_authored_command_rewards(world_bundle)
         if isinstance(existing, dict):
             for k in list(existing.keys()):
                 term = existing[k]
                 if term is not None and hasattr(term, "weight"):
-                    term.weight = float(term.weight) * REALISM_FLOOR_SCALE
+                    scale = 1.0 if str(k) in full_weight_terms else REALISM_FLOOR_SCALE
+                    term.weight = float(term.weight) * scale
         else:
             env_cfg.rewards = {}
 
@@ -1618,6 +1655,13 @@ def _cmd_train(args: argparse.Namespace) -> None:
             f"[runner] injected SculptorRewardTerm; {sum(1 for t in env_cfg.rewards.values() if t and getattr(t, 'weight', 0) == 0)} default terms zeroed",
             file=sys.stderr, flush=True,
         )
+        if full_weight_terms:
+            print(
+                "[runner] preserved authored command supervision at full weight: "
+                + ", ".join(sorted(full_weight_terms)),
+                file=sys.stderr,
+                flush=True,
+            )
         print(
             "[runner] installed termination economics: "
             f"survival={_SCULPTOR_SURVIVAL_WEIGHT:+g}/step, "

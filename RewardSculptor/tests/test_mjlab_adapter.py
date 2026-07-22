@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from unittest.mock import patch
+from types import SimpleNamespace
 
 import pytest
 
@@ -15,7 +16,6 @@ from sculptor.adapters.base import (
     ComponentProbe,
     RewardContract,
     RolloutResult,
-    SculptorAdapter,
     TrainResult,
 )
 
@@ -53,6 +53,37 @@ def test_to_host_numpy_keeps_plain_metadata_supported() -> None:
     from sculptor.adapters._mjlab_runner import _to_host_numpy
 
     np.testing.assert_array_equal(_to_host_numpy([[0.0, 1.0]]), [[0.0, 1.0]])
+
+
+def test_authored_waypoint_command_rewards_keep_nominal_weight() -> None:
+    """Only a successfully installed goal command earns full supervision."""
+    from sculptor.adapters._mjlab_runner import (
+        _full_weight_authored_command_rewards,
+    )
+
+    bundle = SimpleNamespace(
+        manifest=SimpleNamespace(task_shared={
+            "goal": {"type": "waypoint_sequence"},
+        }),
+        runtime_adjustments=(
+            "command:velocity→goal-conditioned waypoint traversal",
+        ),
+    )
+    assert _full_weight_authored_command_rewards(bundle) == frozenset({
+        "track_linear_velocity", "track_angular_velocity",
+    })
+
+    # A goal declaration without a compatible installed command surface must
+    # retain the conservative realism-floor behavior.
+    bundle.runtime_adjustments = ()
+    assert _full_weight_authored_command_rewards(bundle) == frozenset()
+
+    # Non-navigation authored tasks never inherit locomotion-specific terms.
+    bundle.manifest.task_shared["goal"]["type"] = "object_region"
+    bundle.runtime_adjustments = (
+        "command:velocity→goal-conditioned waypoint traversal",
+    )
+    assert _full_weight_authored_command_rewards(bundle) == frozenset()
 
 
 def test_base_reward_contract_default_fields() -> None:
@@ -597,7 +628,6 @@ def test_run_with_cleanup_kills_subprocess_on_exception(tmp_path: Path) -> None:
     cleanup path is broken, this test hangs for 30s+; healthy path
     terminates within 2-5s via SIGTERM to the process group."""
     import os
-    import signal
     import threading
     import time
 
