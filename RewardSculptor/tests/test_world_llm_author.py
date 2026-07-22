@@ -145,6 +145,34 @@ def test_hybrid_rejects_valid_but_wrong_explicit_course_count():
     assert len(platforms) == 4
 
 
+def test_hybrid_rejects_slalom_that_drops_ordered_terminal_goal():
+    prompt = (
+        "Run a slalom around four boxes through ordered waypoints without "
+        "touching them, then stop in the finish zone for 2 seconds."
+    )
+    seed = author_environment(prompt, robot_capability_id="unitree_g1:base")
+    wrong_task = copy.deepcopy(seed.task_spec)
+    wrong_task["shared"]["goal"] = {
+        "id": "reach_finish", "type": "robot_to_region", "region": "finish",
+        "success": {
+            "predicate": "distance_below", "hold_s": 2.0,
+            "tolerance_m": 0.35,
+        },
+    }
+    client = _FakeClient(json.dumps({
+        "world_spec": seed.world_spec,
+        "task_spec": wrong_task,
+        "parameter_provenance": seed.world_spec["meta"]["parameter_provenance"],
+    }))
+
+    draft = hybrid_author_environment(
+        prompt, client=client, robot_capability_id="unitree_g1:base")
+
+    assert client.calls == 1
+    assert draft.task_spec["shared"]["goal"]["type"] == "waypoint_sequence"
+    assert draft.task_spec["shared"]["goal"]["waypoints"][-1] == "finish"
+
+
 def test_hybrid_falls_back_when_client_errors():
     client = _FakeClient(RuntimeError("api down"))
     draft = hybrid_author_environment(

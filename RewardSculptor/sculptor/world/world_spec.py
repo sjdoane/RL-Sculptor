@@ -437,19 +437,40 @@ def editable_registry(spec: dict[str, Any]) -> dict[str, str]:
             registry[prefix] = klass
 
     shared = spec.get("shared", {})
-    for name, entry in shared.get("terrain", {}).get(
-            "sub_terrains", {}).items():
+    if not isinstance(shared, dict):
+        return registry
+    terrain = shared.get("terrain", {})
+    sub_terrains = terrain.get("sub_terrains", {}) \
+        if isinstance(terrain, dict) else {}
+    if not isinstance(sub_terrains, dict):
+        sub_terrains = {}
+    for name, entry in sub_terrains.items():
+        if not isinstance(entry, dict):
+            continue
         leaves(entry.get("nominal", {}),
                f"/shared/terrain/sub_terrains/{name}/nominal",
                "generator_parameter")
-    for item in shared.get("obstacles", {}).get("course", []):
+    obstacles = shared.get("obstacles", {})
+    course = obstacles.get("course", []) if isinstance(obstacles, dict) else []
+    if not isinstance(course, list):
+        course = []
+    for item in course:
+        if not isinstance(item, dict):
+            continue
         item_id = item.get("id")
         if item_id:
             leaves(item.get("nominal", {}),
                    f"/shared/obstacles/course/@{item_id}/nominal",
                    "model_field")
-    for name, obj in shared.get("objects", {}).items():
+    objects = shared.get("objects", {})
+    if not isinstance(objects, dict):
+        objects = {}
+    for name, obj in objects.items():
+        if not isinstance(obj, dict):
+            continue
         nominal = obj.get("nominal", {})
+        if not isinstance(nominal, dict):
+            continue
         for key, value in nominal.items():
             klass = "state" if key == "pose" else "model_field"
             leaves(value, f"/shared/objects/{name}/nominal/{key}", klass)

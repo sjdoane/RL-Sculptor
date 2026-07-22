@@ -721,12 +721,18 @@ def _contact_match(
     if kind == "robot":
         names: list[str] = []
         for role in raw.split("|"):
-            namespace, resolved = robot.resolve_semantic_role(role)
-            if namespace != "body":
-                raise WorldCompileError(
-                    f"contact selector {selector!r} resolves to a site; "
-                    "contacts require body roles")
-            names.extend(resolved)
+            if role == "any":
+                names.extend((robot.root_body, *(
+                    name for resolved in robot.body_roles.values()
+                    for name in resolved
+                )))
+            else:
+                namespace, resolved = robot.resolve_semantic_role(role)
+                if namespace != "body":
+                    raise WorldCompileError(
+                        f"contact selector {selector!r} resolves to a site; "
+                        "contacts require body roles")
+                names.extend(resolved)
         concrete = tuple(dict.fromkeys(names))
         return (ContactMatch(mode="body", pattern=concrete, entity="robot"),
                 {"kind": kind, "mode": "body", "entity": "robot",

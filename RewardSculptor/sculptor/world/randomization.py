@@ -48,6 +48,8 @@ _COURSE_RE = re.compile(
     r"^/shared/obstacles/course/@(?P<id>[^/]+)/nominal/(?P<field>[a-z_]+)$")
 _OBJECT_RE = re.compile(
     r"^/shared/objects/(?P<name>[^/]+)/nominal/(?P<field>[a-z_]+)$")
+_OBJECT_POSITION_RE = re.compile(
+    r"^/shared/objects/(?P<name>[^/]+)/nominal/pose/position_m/(?P<axis>[012])$")
 
 
 @dataclass(frozen=True)
@@ -58,6 +60,7 @@ class Randomization:
     target_name: str              # geom name (course) or entity name (object)
     low: float
     high: float
+    axis: int | None = None
 
 
 def _range_from_distribution(dist: Mapping[str, Any]) -> Optional[tuple[float, float]]:
@@ -106,6 +109,12 @@ def resolve_world_randomizations(world: Mapping[str, Any]) -> list[Randomization
             continue
         low, high = rng
         vid = str(var.get("id", target))
+        m = _OBJECT_POSITION_RE.match(target)
+        if m:
+            out.append(Randomization(
+                vid, "object_position", m.group("name"), low, high,
+                int(m.group("axis"))))
+            continue
         m = _COURSE_RE.match(target)
         if m and m.group("field") == "height_m":
             out.append(Randomization(
@@ -256,6 +265,19 @@ def install_world_randomizations(env_cfg: Any, world: Mapping[str, Any]) -> list
                 })
             installed.append(f"{r.var_id}: object '{r.target_name}' friction "
                              f"∈[{r.low:.3g},{r.high:.3g}] per reset")
+        elif r.kind == "object_position" and r.axis is not None:
+            events[f"world_dr__{r.var_id}"] = EventTermCfg(
+                mode="reset", func=dr.body_pos,
+                params={
+                    "asset_cfg": SceneEntityCfg(
+                        r.target_name, body_names=(r.target_name,)),
+                    "operation": "abs", "ranges": (r.low, r.high),
+                    "axes": [r.axis],
+                })
+            axis_name = "xyz"[r.axis]
+            installed.append(
+                f"{r.var_id}: object '{r.target_name}' {axis_name} "
+                f"∈[{r.low:.3g},{r.high:.3g}]m per reset")
 
     if course_specs:
         events["world_dr__course"] = EventTermCfg(

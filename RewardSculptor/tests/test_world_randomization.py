@@ -43,6 +43,14 @@ def _object_world():
     ]}}
 
 
+def _object_position_world():
+    return {"train": {"variations": [
+        {"id": "box_lateral_position",
+         "target": "/shared/objects/box_01/nominal/pose/position_m/1",
+         "distribution": {"kind": "uniform", "low": -0.08, "high": 0.08}},
+    ]}}
+
+
 # ── distribution → range ─────────────────────────────────────────────────────
 
 def test_range_from_distribution():
@@ -76,6 +84,14 @@ def test_resolve_object_mass_and_friction():
     assert ("object_friction", "target_object") in kinds
 
 
+def test_resolve_object_position_axis():
+    assert resolve_world_randomizations(_object_position_world()) == [
+        Randomization(
+            "box_lateral_position", "object_position", "box_01",
+            -0.08, 0.08, axis=1),
+    ]
+
+
 def test_resolve_empty_world():
     assert resolve_world_randomizations({}) == []
     assert resolve_world_randomizations({"train": {"variations": []}}) == []
@@ -105,6 +121,18 @@ def test_install_object_events():
     assert mass.params["ranges"] == (0.12, 0.32)
     assert mass.params["asset_cfg"].name == "target_object"
     assert len(msgs) == 2
+
+
+def test_install_object_position_event():
+    env_cfg = types.SimpleNamespace(events={})
+    msgs = install_world_randomizations(env_cfg, _object_position_world())
+    term = env_cfg.events["world_dr__box_lateral_position"]
+    assert term.mode == "reset"
+    assert term.params["operation"] == "abs"
+    assert term.params["ranges"] == (-0.08, 0.08)
+    assert term.params["axes"] == [1]
+    assert term.params["asset_cfg"].name == "box_01"
+    assert any("box_01" in message and " y " in message for message in msgs)
 
 
 def test_install_no_events_dict_is_noop():

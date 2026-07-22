@@ -432,6 +432,12 @@ def _intent(prompt: str) -> str:
         and any(token in text for token in
                 ("goal", "region", "score", "into", "onto", "place", "move",
                  "push", "put", "drop", "kick", "throw", "roll", "carry")))
+    # Planar obstacle-navigation cues are not parkour.  Route these before the
+    # generic box/obstacle checks below so "slalom around four boxes" cannot be
+    # silently rewritten as "climb three platforms" by the offline fallback.
+    if any(token in text for token in (
+            "slalom", "weave", "weaving", "zig-zag", "zigzag")):
+        return "slalom"
     # Specific parkour cues win outright.
     if any(token in text for token in (
             "parkour", "course of boxes", "box course", "obstacle course",
@@ -684,6 +690,90 @@ def _author_parkour(
     task["shared"]["observations"]["height_scan"] = True
 
 
+def _author_slalom(
+    world: dict[str, Any], task: dict[str, Any], *, count: int = 4,
+) -> None:
+    """Author a planar weave without coupling to a robot or task name.
+
+    The obstacles are ordinary fixed objects because WorldSpec course elements
+    are intentionally one-dimensional.  Explicit waypoint zones encode the
+    alternating free-space path, while the final zone remains the last ordered
+    waypoint long enough for the runtime hold predicate to enforce dwell.
+    """
+    n = max(1, min(12, int(count)))
+    spacing = 1.5
+    first_x = 2.0
+    obstacle_offset = 0.0
+    waypoint_offset = 0.85
+    box_size = [0.45, 0.45, 0.75]
+
+    objects: dict[str, Any] = {}
+    zones: dict[str, Any] = {}
+    waypoints: list[str] = []
+    variations: list[dict[str, Any]] = []
+    for index in range(n):
+        number = index + 1
+        x = round(first_x + index * spacing, 4)
+        box_id = f"slalom_box_{number:02d}"
+        waypoint_id = f"waypoint_{number:02d}"
+        side = waypoint_offset if index % 2 == 0 else -waypoint_offset
+        objects[box_id] = {
+            "shape": "box", "fixed": True,
+            "nominal": {
+                "size_m": box_size,
+                "rgba": [1.0, 0.28, 0.02, 1.0],
+                "pose": {"position_m": [x, obstacle_offset, box_size[2] / 2]},
+            },
+        }
+        zones[waypoint_id] = {
+            "kind": "disk", "center_m": [x, side], "radius_m": 0.45,
+        }
+        waypoints.append(waypoint_id)
+        variations.append({
+            "id": f"{box_id}_lateral_position",
+            "target": (
+                f"/shared/objects/{box_id}/nominal/pose/position_m/1"
+            ),
+            "class": "state",
+            "distribution": {"kind": "uniform", "low": -0.08, "high": 0.08},
+        })
+
+    finish_x = round(first_x + n * spacing, 4)
+    zones["finish"] = {
+        "kind": "disk", "center_m": [finish_x, 0.0], "radius_m": 0.9,
+    }
+    waypoints.append("finish")
+    world["shared"]["objects"] = objects
+    world["shared"]["zones"] = zones
+    world["train"] = {
+        "variations": variations,
+        "curriculum": {
+            "difficulty_range": [0.0, 1.0],
+            "promotion": {
+                "signal": "waypoint_success", "promote_above": 0.75,
+                "demote_below": 0.50,
+            },
+        },
+    }
+    task["shared"]["control_mode"] = "waypoint_following"
+    task["shared"]["goal"] = {
+        "id": "complete_slalom_and_stop", "type": "waypoint_sequence",
+        "waypoints": waypoints,
+        "success": {
+            "predicate": "sequence_complete", "hold_s": 2.0,
+            "tolerance_m": 0.35, "ordered": True,
+        },
+    }
+    task["shared"]["contacts"]["forbidden"] = [
+        ["robot:any", f"object:slalom_box_{index + 1:02d}"]
+        for index in range(n)
+    ]
+    task["shared"]["observations"].update({
+        "height_scan": True,
+        "region_relative": waypoints,
+    })
+
+
 def _grasp_contact_role(cap: RobotCapability) -> str:
     if "gripper" in cap.body_roles:
         return "gripper"
@@ -854,6 +944,8 @@ def _offline_author(
     )
     if intent == "uneven_terrain":
         _author_uneven(world, task)
+    elif intent == "slalom":
+        _author_slalom(world, task, count=_parse_count(prompt, default=4))
     elif intent == "parkour":
         _author_parkour(world, task, cap, count=_parse_count(prompt, default=3))
     elif intent == "object_to_region":
@@ -875,6 +967,63 @@ def _offline_author(
         "/task/shared/goal/waypoints": "prompt",
         "/task/shared/goal/success/predicate": "prompt",
     }
+    if intent == "slalom":
+        # The slalom cue and parsed cardinality directly determine object
+        # topology.  Treating the collection itself as an omitted default
+        # would ask whether to delete all obstacles, which necessarily makes
+        # the requested waypoint/contact task invalid and leaves no valid
+        # clarification alternative.
+        provenance["/world/shared/objects"] = "prompt"
+        text = prompt.casefold()
+        explicit_size = "0.45" in text and "0.75" in text
+        explicit_positions = (
+            "x=" in text or "approximately at" in text
+            or "roughly at" in text
+        )
+        explicit_color = "orange" in text
+        explicit_waypoints = "waypoint" in text
+        explicit_generous = "generous" in text
+        explicit_finish = "finish zone" in text
+        explicit_collision_avoidance = any(token in text for token in (
+            "without touching", "avoid contact", "without contact",
+        ))
+        explicit_lateral_randomization = (
+            "random" in text and "0.08" in text and "lateral" in text
+        )
+        explicit_dwell = bool(re.search(
+            r"\b(?:2|two)(?:\.0)?\s*(?:s|sec|second)", text))
+        for name in world["shared"]["objects"]:
+            prefix = f"/world/shared/objects/{name}"
+            if explicit_size:
+                provenance[f"{prefix}/nominal/size_m"] = "prompt"
+            if explicit_positions:
+                provenance[f"{prefix}/nominal/pose/position_m"] = "prompt"
+            if explicit_color:
+                provenance[f"{prefix}/nominal/rgba"] = "prompt"
+        for name in world["shared"]["zones"]:
+            prefix = f"/world/shared/zones/{name}"
+            if explicit_positions or explicit_waypoints:
+                provenance[f"{prefix}/center_m"] = "prompt"
+            if ((name == "finish" and explicit_finish)
+                    or (name != "finish" and explicit_generous)):
+                provenance[f"{prefix}/radius_m"] = "prompt"
+        if explicit_generous:
+            provenance[
+                "/task/shared/goal/success/tolerance_m"
+            ] = "prompt"
+        if explicit_dwell:
+            provenance["/task/shared/goal/success/hold_s"] = "prompt"
+        if explicit_collision_avoidance:
+            provenance["/task/shared/contacts/forbidden"] = "prompt"
+            provenance["/task/shared/contacts/desired"] = "prompt"
+            provenance["/task/shared/contacts/terminate_on"] = "prompt"
+        if "ordered" in text:
+            provenance["/task/shared/goal/success/ordered"] = "prompt"
+        if explicit_lateral_randomization:
+            for index in range(len(world["train"]["variations"])):
+                prefix = f"/world/train/variations/{index}/distribution"
+                provenance[f"{prefix}/low"] = "prompt"
+                provenance[f"{prefix}/high"] = "prompt"
     for index, item in enumerate(world["shared"]["obstacles"]["course"]):
         provenance[f"/world/shared/obstacles/course/{index}/id"] = "prompt"
         provenance[f"/world/shared/obstacles/course/{index}/element"] = "prompt"
@@ -1318,14 +1467,14 @@ def _raise_validation(world: dict[str, Any], task: dict[str, Any]) -> None:
 
 
 def _raise_prompt_semantic_drift(
-    prompt: str, world: Mapping[str, Any],
+    prompt: str, world: Mapping[str, Any], task: Mapping[str, Any],
 ) -> None:
     """Reject schema-valid drafts that contradict explicit prompt facts.
 
     Structural validators can prove that three platforms are safe and
     buildable; they cannot prove that three satisfies an explicit request for
-    four.  Keep this gate deliberately narrow and deterministic: only an
-    explicit course-element cardinality in a parkour prompt is enforced here.
+    four.  Keep this gate deliberately narrow and deterministic: explicit
+    obstacle cardinality is enforced for parkour and planar slalom prompts.
     That gives the hybrid author a clean rejection signal and lets it fall back
     to the exact-count offline compiler instead of silently promoting drift.
     """
@@ -1335,12 +1484,64 @@ def _raise_prompt_semantic_drift(
         # Novel model-only intents have no offline semantic oracle yet.  Their
         # schema/capability/build gates remain authoritative.
         return
-    if intent != "parkour":
+    if intent not in {"parkour", "slalom"}:
         return
     requested = _parse_count(prompt, default=0)
     if requested <= 0:
         return
     shared = world.get("shared")
+    if intent == "slalom":
+        objects = shared.get("objects") if isinstance(shared, Mapping) else None
+        actual = sum(
+            1 for name, item in objects.items()
+            if isinstance(name, str)
+            and not any(token in name for token in ("finish", "zone", "marker"))
+            and isinstance(item, Mapping) and item.get("shape") == "box"
+        ) if isinstance(objects, Mapping) else 0
+        # A slalom is not merely N obstacles: it needs an ordered planar path.
+        # The task validator checks the IDs later; this narrow oracle makes an
+        # LLM draft fall back when it loses the action semantics entirely.
+        if actual != requested:
+            raise AuthoringError(
+                "author model contradicted explicit prompt cardinality: "
+                f"requested {requested} slalom obstacle(s), authored {actual}"
+            )
+        task_shared = task.get("shared")
+        goal = task_shared.get("goal") \
+            if isinstance(task_shared, Mapping) else None
+        success = goal.get("success") if isinstance(goal, Mapping) else None
+        waypoints = goal.get("waypoints") if isinstance(goal, Mapping) else None
+        ordered_path = (
+            isinstance(goal, Mapping)
+            and goal.get("type") == "waypoint_sequence"
+            and isinstance(waypoints, list)
+            and len(waypoints) == requested + 1
+            and isinstance(success, Mapping)
+            and success.get("ordered") is True
+        )
+        if not ordered_path:
+            raise AuthoringError(
+                "author model dropped the requested ordered slalom path or "
+                "terminal waypoint"
+            )
+        prompt_text = prompt.casefold()
+        dwell = re.search(
+            r"\b(\d+(?:\.\d+)?)\s*(?:s|sec|second)", prompt_text)
+        if dwell and float(success.get("hold_s", 0.0)) < float(dwell.group(1)):
+            raise AuthoringError(
+                "author model shortened the requested terminal dwell"
+            )
+        if any(token in prompt_text for token in (
+                "without touching", "avoid contact", "without contact")):
+            contacts = task_shared.get("contacts") \
+                if isinstance(task_shared, Mapping) else None
+            forbidden = contacts.get("forbidden") \
+                if isinstance(contacts, Mapping) else None
+            if not isinstance(forbidden, list) or len(forbidden) < requested:
+                raise AuthoringError(
+                    "author model dropped requested obstacle-contact exclusions"
+                )
+        return
     obstacles = shared.get("obstacles") if isinstance(shared, Mapping) else None
     course = obstacles.get("course") if isinstance(obstacles, Mapping) else None
     actual = 0
@@ -1468,7 +1669,7 @@ class WorldAuthor:
                 cap.require(_required_capabilities(prompt))
             except CapabilityError as exc:
                 raise AuthoringError(str(exc)) from exc
-        _raise_prompt_semantic_drift(prompt, world)
+        _raise_prompt_semantic_drift(prompt, world, task)
         return _build_draft(
             prompt, cap, candidates, world, task, provenance,
             capability_source,

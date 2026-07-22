@@ -426,3 +426,53 @@ def test_intent_routing_object_vs_parkour_precedence():
     assert _intent("climb onto the platform") == "parkour"
     # specific parkour cues still win
     assert _intent("parkour course of boxes") == "parkour"
+
+
+def test_slalom_preserves_obstacles_waypoints_and_terminal_dwell():
+    from sculptor.world.author import _intent
+
+    prompt = (
+        "Run a slalom around four bright boxes through ordered waypoints, "
+        "then enter a finish zone, stop, and remain there for 2 seconds."
+    )
+    assert _intent(prompt) == "slalom"
+    draft = author_environment(
+        prompt, robot_capability_id="unitree_g1:base")
+    world, task = draft.world_spec, draft.task_spec
+    assert validate_world_spec(world) == []
+    assert validate_task_spec(task, world=world) == []
+    boxes = {
+        name: item for name, item in world["shared"]["objects"].items()
+        if name.startswith("slalom_box_")
+    }
+    assert list(boxes) == [f"slalom_box_{i:02d}" for i in range(1, 5)]
+    assert all(item["fixed"] and item["shape"] == "box"
+               for item in boxes.values())
+    goal = task["shared"]["goal"]
+    assert goal["waypoints"] == [
+        "waypoint_01", "waypoint_02", "waypoint_03", "waypoint_04", "finish"]
+    assert goal["success"]["hold_s"] == 2.0
+    assert task["shared"]["contacts"]["forbidden"] == [
+        ["robot:any", f"object:slalom_box_{i:02d}"] for i in range(1, 5)]
+    assert len(world["train"]["variations"]) == 4
+
+    from sculptor.world.capabilities import resolve_robot_capability
+    from sculptor.world.task_spec import parse_contact_selector
+
+    cap = resolve_robot_capability("unitree_g1:base")
+    resolved = parse_contact_selector("robot:any", world=world)
+    assert resolved is not None
+    assert resolved[0] == "robot"
+    assert cap.root_body in resolved[1]
+
+
+def test_fully_specified_slalom_does_not_repeat_clarifications():
+    draft = author_environment(
+        "Build a generous slalom with four bright orange boxes at roughly "
+        "x=2.0, 3.5, 5.0, and 6.5. Each is 0.45 by 0.45 by 0.75 m. Use "
+        "ordered waypoints approximately at alternating sides, a large finish "
+        "zone, and stop there for 2 seconds without touching any box. Randomize "
+        "each box lateral position by 0.08 m.",
+        robot_capability_id="unitree_g1:base",
+    )
+    assert len(draft.clarification_plan.questions) <= 1

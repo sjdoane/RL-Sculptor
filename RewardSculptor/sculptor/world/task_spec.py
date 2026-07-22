@@ -83,10 +83,16 @@ def parse_contact_selector(
             return None
         names: list[str] = []
         for role in raw_name.split("|"):
-            try:
-                names.extend(cap.resolve_role(role))
-            except CapabilityError as exc:
-                local_errors.append(f"{path}: {exc}")
+            if role == "any":
+                names.extend((cap.root_body, *(
+                    name for resolved in cap.body_roles.values()
+                    for name in resolved
+                )))
+            else:
+                try:
+                    names.extend(cap.resolve_role(role))
+                except CapabilityError as exc:
+                    local_errors.append(f"{path}: {exc}")
         return ("robot", tuple(dict.fromkeys(names))) if names else None
     if kind == "object":
         if raw_name not in objects:
