@@ -651,8 +651,8 @@ def _permute_joint_arrays(
 # ── synthetic archetype rollouts (non-degeneracy gate) ───────────────
 
 
-def _upright_g() -> np.ndarray:
-    g = np.zeros((T, E, 3), dtype=np.float64)
+def _upright_g(time_steps: int = T) -> np.ndarray:
+    g = np.zeros((time_steps, E, 3), dtype=np.float64)
     g[..., 2] = -1.0
     return g
 
@@ -813,10 +813,15 @@ def _abstract_objective_probe(
         "parkour", "vault", "vaulting",
     })
 
-    root = np.zeros((T, E, 3), dtype=np.float64)
+    # Compound prompt-native tasks need enough physical time for repeated
+    # transition + hold semantics.  Keep the fixed archetype battery at its
+    # historical 120 frames, but give this independent exemplar 3.6 s so four
+    # real 0.25 s dwells remain observable after a metric's smoothing window.
+    probe_steps = max(T, 180)
+    root = np.zeros((probe_steps, E, 3), dtype=np.float64)
     root[..., 2] = 0.55
-    gravity = _upright_g()
-    joints = np.zeros((T, E, J), dtype=np.float64)
+    gravity = _upright_g(probe_steps)
+    joints = np.zeros((probe_steps, E, J), dtype=np.float64)
     # Physically-consistent end-effector channels: a nominal grounded stance whose
     # support schedule LIFTS both feet during flight phases and whose left foot
     # SWINGS forward during a kick. The former exemplar fabricated both feet as
@@ -825,15 +830,15 @@ def _abstract_objective_probe(
     # detect a jump/leap flight phase, so an always-in-contact probe scored EVERY
     # such (correct) metric 0 (the live "climb … jump off" non-degeneracy all-zero).
     # An ABSENT channel abstains to a neutral 1.0; a present-but-wrong one FAILS.
-    lfoot = np.zeros((T, E, 3), dtype=np.float64)
-    rfoot = np.zeros((T, E, 3), dtype=np.float64)
+    lfoot = np.zeros((probe_steps, E, 3), dtype=np.float64)
+    rfoot = np.zeros((probe_steps, E, 3), dtype=np.float64)
     lfoot[..., 1] = 0.10   # nominal pelvis-frame stance (foot below + to the side)
     rfoot[..., 1] = -0.10
     lfoot[..., 2] = -0.55
     rfoot[..., 2] = -0.55
-    contact_l = np.ones((T, E), dtype=np.float64)
-    contact_r = np.ones((T, E), dtype=np.float64)
-    start = max(5, int(0.10 * T))
+    contact_l = np.ones((probe_steps, E), dtype=np.float64)
+    contact_r = np.ones((probe_steps, E), dtype=np.float64)
+    start = max(5, int(0.10 * probe_steps))
     # A pause is a duration constraint, not an instantaneous pose.  Equal-sized
     # slices made a multi-waypoint program's dwell windows too short for the
     # smoothing and hold-time gates that a correct metric is expected to use.
@@ -855,12 +860,38 @@ def _abstract_objective_probe(
         # compound program; otherwise its window bleeds into the last motion
         # phase and a correct final-stillness gate observes non-zero speed.
         weights[-1] = max(weights[-1], 4.0)
-    cumulative = np.concatenate(([0.0], np.cumsum(weights)))
-    bounds = start + np.rint(
-        (T - start) * cumulative / cumulative[-1]
-    ).astype(int)
-    bounds[0] = start
-    bounds[-1] = T
+    available = probe_steps - start
+    minimum = np.full(len(clean), 4, dtype=int)
+    for index, phase in enumerate(clean):
+        if phase == "dwell":
+            # 0.25 s hold plus a 0.1 s smoothing margin at the synthetic
+            # probe's canonical 50 Hz sampling rate.
+            minimum[index] = 18
+        elif phase in {"land", "recover"}:
+            minimum[index] = 15
+    if clean[-1] in {"dwell", "land", "recover"}:
+        minimum[-1] = 35
+
+    if int(minimum.sum()) <= available:
+        extra = available - int(minimum.sum())
+        shares = extra * weights / weights.sum()
+        additions = np.floor(shares).astype(int)
+        remainder = extra - int(additions.sum())
+        if remainder:
+            order = np.argsort(-(shares - additions), kind="stable")
+            additions[order[:remainder]] += 1
+        lengths = minimum + additions
+        bounds = start + np.concatenate(([0], np.cumsum(lengths)))
+    else:
+        # Extremely long programs cannot fit every real-time minimum into the
+        # fixed validator horizon. Preserve every phase and its relative
+        # duration honestly rather than dropping the tail.
+        cumulative = np.concatenate(([0.0], np.cumsum(weights)))
+        bounds = start + np.rint(
+            available * cumulative / cumulative[-1]
+        ).astype(int)
+        bounds[0] = start
+        bounds[-1] = probe_steps
     x = y = 0.0
     z = 0.55
     tilt = 0.0
@@ -877,8 +908,14 @@ def _abstract_objective_probe(
         gravity[a:b, :, 2] = -np.sqrt(max(0.0, 1.0 - tilt * tilt))
 
         if phase == "climb":
-            root[a:b, :, 0] = (x + 0.35 * u)[:, None]
-            root[a:b, :, 2] = (z + 0.30 * u)[:, None]
+            # Complete the short ballistic ascent early enough to leave a
+            # clean touchdown plateau before the following dwell.  Long
+            # compound programs have only a few frames per transition; using
+            # the whole slice for interpolation caused smoothing-based metrics
+            # to consume the first part of every legitimate hold.
+            climb_u = np.clip(3.0 * u, 0.0, 1.0)
+            root[a:b, :, 0] = (x + 0.35 * climb_u)[:, None]
+            root[a:b, :, 2] = (z + 0.30 * climb_u)[:, None]
             x += 0.35
             z += 0.30
         elif phase == "move_forward":
@@ -955,7 +992,7 @@ def _abstract_objective_probe(
             lfoot[a:b, :, 0] = swing[:, None]
             contact_l[a:b] = (swing < 0.15).astype(np.float64)[:, None]
 
-        if b < T:
+        if b < probe_steps:
             root[b:, :, 0] = x
             root[b:, :, 1] = y
             root[b:, :, 2] = z
@@ -2155,8 +2192,9 @@ def validate_generated_metric(
                 "active", "active_kick", "active_floss", "active_jump",
                 "active_parkour", "prompt_competent",
             } else "far_idle")
+            case_steps = int(next(iter(arrays.values())).shape[0])
             arrays.update(catalog_fixture_arrays(
-                catalog, time_steps=T, num_envs=E, case=case))
+                catalog, time_steps=case_steps, num_envs=E, case=case))
         for name, case in catalog_cases.items():
             # The authored-world competent case must demonstrate BOTH physical
             # competence and task-channel completion.  For a prompt-native
@@ -2173,8 +2211,9 @@ def validate_generated_metric(
                 key: value.copy() for key, value in competent_base.items()
                 if key in ALLOWED_ARRAYS
             }
+            case_steps = int(next(iter(fixture_base.values())).shape[0])
             fixture_base.update(catalog_fixture_arrays(
-                catalog, time_steps=T, num_envs=E, case=case))
+                catalog, time_steps=case_steps, num_envs=E, case=case))
             arche[name] = fixture_base
     scores: dict[str, float] = {}
 

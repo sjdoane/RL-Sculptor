@@ -11,6 +11,7 @@ from sculptor.eval.generated_metric import (
     compute_generated_metric,
 )
 from sculptor.eval.metric_validate import (
+    _abstract_objective_probe,
     discrimination_of_metric,
     validate_generated_metric,
 )
@@ -254,6 +255,28 @@ def test_prompt_native_traversal_composes_physics_and_world_without_reference(
     waypoint_trace = competent["goal__complete_course__waypoint_index"]
     assert np.array_equal(np.unique(waypoint_trace), np.arange(5))
     assert np.all(np.diff(waypoint_trace, axis=0) >= 0)
+
+    probe = _abstract_objective_probe(
+        ["climb", "dwell"] * 4,
+        behavior_goal="jump onto four boxes and pause on each",
+    )
+    assert probe is not None
+    z = probe["root_link_pos_w"][:, 0, 2]
+    supported = (
+        (probe["left_foot_contact"][:, 0] > 0.5)
+        & (probe["right_foot_contact"][:, 0] > 0.5)
+        & (np.abs(np.gradient(z)) < 1e-9)
+    )
+    padded = np.pad(supported.astype(np.int8), (1, 1))
+    changes = np.diff(padded)
+    starts = np.flatnonzero(changes == 1)
+    ends = np.flatnonzero(changes == -1)
+    stable_holds = [
+        (start, end) for start, end in zip(starts, ends)
+        if end - start >= 13 and float(np.mean(z[start:end])) > 0.6
+    ]
+    assert len(stable_holds) >= 4
+    assert supported[-30:].all()
     path = _write_metric(tmp_path, PROMPT_NATIVE_PARKOUR_METRIC, "parkour.py")
 
     result = validate_generated_metric(
