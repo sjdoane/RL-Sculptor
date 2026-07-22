@@ -1055,3 +1055,24 @@ physical acceptance criteria, call narrative, honest incomplete-run fallback,
 and preserved warnings about the invalid historical Go1 evidence. Its current
 status paragraph intentionally says the live run is incomplete until the
 official selected rollout proves the full course and terminal hold.
+
+## Frozen abstract objective companion 2026-07-22 (Codex)
+
+Prompt-only metric generation now treats the abstract task program as one
+first-class contract shared by metric authoring and its independent validator.
+When the deterministic compiler recognizes the prompt, the exact ordered phase
+list is passed through every best-of-N, retry, and review-repair validation call;
+a generated metric whose `ABSTRACT_OBJECTIVE` omits, merges, renames, or reorders
+those phases is rejected. This closes the remaining seam where author and
+validator could silently certify different interpretations of the same prompt.
+
+For genuinely novel prompts outside the deterministic parser, generation no
+longer freezes an empty "authoritative" phase list. The metric author must emit
+a non-empty, inert `ABSTRACT_OBJECTIVE` companion beside `compute_spec`; the
+validator literal-parses that data (never executes it), retargets it onto the
+universal task-space probe and any exact authored-world channels, and rejects a
+missing/empty companion. The exact phase program actually used is persisted in
+`meta.json`. This is embodiment-neutral and requires no stored trajectory; real
+references, when present, remain additive stronger evidence rather than a
+prerequisite. No tests were run for this urgent slice, per Sam's explicit
+instruction; only `git diff --check` was performed before commit.

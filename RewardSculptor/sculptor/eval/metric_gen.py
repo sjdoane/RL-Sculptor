@@ -481,6 +481,7 @@ def _best_of_n(
     references: Optional[list[tuple[str, dict]]] = None,
     eval_reset: Optional[dict[str, Any]] = None,
     channel_catalog: ChannelCatalog | None = None,
+    abstract_objective: Optional[Mapping[str, Any]] = None,
 ) -> tuple[bool, str, Optional[dict[str, Any]], list[dict[str, Any]], Optional[int]]:
     """Sample `n` candidate metrics (decorrelated by FRAMING — temperature stays 1.0,
     required by the generator's extended thinking), validate each, and
@@ -512,7 +513,8 @@ def _best_of_n(
         val = validate_generated_metric(
             src, cpath, behavior_goal=behavior_goal, robot_hint=robot_hint,
             robot_joint_names=robot_names, references=references,
-            eval_reset=eval_reset, channel_catalog=channel_catalog)
+            eval_reset=eval_reset, channel_catalog=channel_catalog,
+            abstract_objective=abstract_objective)
         rec: dict[str, Any] = {"candidate": i, "ok": bool(val["ok"]),
                                "reasons": val["reasons"], "_src": src, "_val": val}
         if val["ok"]:
@@ -741,19 +743,40 @@ def generate_objective_metric(
         # It is deliberately task-space/embodiment-neutral: no stored motion is
         # required, and the validator retargets it onto universal physical and
         # authored-world channels for the selected robot at validation time.
+        compiled_phases = _abstract_objective_program(behavior_goal, None)
         abstract_objective = {
             "schema_version": 1,
-            "phases": _abstract_objective_program(behavior_goal, None),
-            "source": "prompt_compiler",
+            "phases": compiled_phases,
+            "source": (
+                "prompt_compiler" if compiled_phases
+                else "metric_companion"
+            ),
             "stored_trajectory_required": False,
         }
-        base_user += (
-            "\n\n# SYSTEM-COMPILED ABSTRACT OBJECTIVE (AUTHORITATIVE)\n"
-            + json.dumps(abstract_objective, indent=2, default=str)
-            + "\nCopy the phases EXACTLY into ABSTRACT_OBJECTIVE. The validator "
-              "uses this same program to synthesize its competent task-space "
-              "probe; do not omit, merge, reorder, or rename phases."
-        )
+        if compiled_phases:
+            base_user += (
+                "\n\n# SYSTEM-COMPILED ABSTRACT OBJECTIVE (AUTHORITATIVE)\n"
+                + json.dumps(abstract_objective, indent=2, default=str)
+                + "\nCopy the phases EXACTLY into ABSTRACT_OBJECTIVE. The validator "
+                  "uses this same program to synthesize its competent task-space "
+                  "probe; do not omit, merge, reorder, or rename phases."
+            )
+        else:
+            # A genuinely novel prompt may sit outside the deterministic closed-
+            # vocabulary parser.  Do not freeze such a prompt to an empty program:
+            # the metric and its data-only companion are authored together, then the
+            # validator reads that literal declaration and retargets it onto universal
+            # task-space channels.  This remains executable-code-free and requires no
+            # stored robot trajectory.
+            base_user += (
+                "\n\n# ABSTRACT OBJECTIVE COMPANION REQUIRED\n"
+                "The deterministic prompt compiler could not fully express this novel "
+                "objective. Author ABSTRACT_OBJECTIVE together with compute_spec using "
+                "the closed phase vocabulary and preserve the complete prompted order. "
+                "The validator will read that inert literal declaration and synthesize "
+                "the embodiment-neutral competent probe from it; a missing or empty "
+                "declaration is rejected. No stored trajectory is required."
+            )
         if catalog is not None:
             catalog_context = {
                 "channel_catalog_hash": catalog.catalog_hash,
@@ -803,7 +826,8 @@ def generate_objective_metric(
                 behavior_goal=behavior_goal, robot_hint=robot_hint,
                 robot_names=robot_names, out_dir=out_dir, metric_path=metric_path,
                 n=n_candidates, model=model, emit=_emit, references=references,
-                eval_reset=eval_reset, channel_catalog=catalog)
+                eval_reset=eval_reset, channel_catalog=catalog,
+                abstract_objective=abstract_objective)
             if not passed:
                 # best-of-N samples DIVERSE candidates but does NOT feed validation
                 # failures back; if NONE were valid, fall through to the retry-with-
@@ -851,7 +875,8 @@ def generate_objective_metric(
                     source, metric_path,
                     behavior_goal=behavior_goal, robot_hint=robot_hint,
                     robot_joint_names=robot_names, references=references,
-                    eval_reset=eval_reset, channel_catalog=catalog)
+                    eval_reset=eval_reset, channel_catalog=catalog,
+                    abstract_objective=abstract_objective)
                 attempts.append({"attempt": attempt, "ok": validation["ok"],
                                  "reasons": validation["reasons"]})
                 if validation["ok"]:
@@ -969,7 +994,8 @@ def generate_objective_metric(
             validation = validate_generated_metric(
                 source, metric_path, behavior_goal=behavior_goal, robot_hint=robot_hint,
                 robot_joint_names=robot_names, references=references,
-                eval_reset=eval_reset, channel_catalog=catalog)
+                eval_reset=eval_reset, channel_catalog=catalog,
+                abstract_objective=abstract_objective)
             attempts.append({"review_retry": rev_retry, "ok": validation["ok"],
                              "reasons": validation["reasons"]})
             passed = bool(validation["ok"])
@@ -1030,7 +1056,15 @@ def generate_objective_metric(
             # Persist the exact data-only oracle shared by authoring and
             # validation.  This makes prompt-only certification auditable in
             # the UI/artifact even when no trajectory was attached.
-            "abstract_objective": abstract_objective,
+            "abstract_objective": {
+                **abstract_objective,
+                # For a novel prompt, persist the exact companion program that
+                # validation actually used rather than the compiler's empty seed.
+                "phases": (
+                    (validation or {}).get("abstract_objective_program")
+                    or abstract_objective["phases"]
+                ),
+            },
             "stored_trajectory_required": False,
             # Every generated metric now records the independent oracle that
             # certified it.  A stored motion is optional: without one, the

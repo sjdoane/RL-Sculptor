@@ -2090,6 +2090,7 @@ def validate_generated_metric(
     references: Optional[list[tuple[str, dict]]] = None,
     eval_reset: Optional[dict[str, Any]] = None,
     channel_catalog: ChannelCatalog | Mapping[str, Any] | Path | str | None = None,
+    abstract_objective: Optional[Mapping[str, Any]] = None,
 ) -> dict[str, Any]:
     """Run all MUST-HAVE gates on a generated metric. `source` is the
     module text (for static gates); `module_path` is where it's been
@@ -2249,15 +2250,36 @@ def validate_generated_metric(
     meta = {"joint_names": list(_NAMES_12)}
     inject_joint_roles(meta, required_roles, lenient=True)
     arche = _archetypes()
-    # The prompt compiler is the authority whenever it can express the goal.
+    # The generator passes the exact inert objective contract used for metric
+    # authoring.  Keep that single contract authoritative here rather than
+    # independently reinterpreting the prompt.  Direct/legacy validator callers
+    # without a contract retain deterministic prompt compilation.
     # Generated code is untrusted and must not be allowed to weaken its own
     # validator by declaring a smaller/easier program (for example reducing a
     # box-to-box course to one generic jump).  The module declaration remains a
     # useful fallback for novel gestures outside the deterministic vocabulary.
     prompt_program = _abstract_objective_program(behavior_goal, None)
     declared_program = _abstract_objective_program(
-        behavior_goal, _declared_abstract_objective(source))
-    abstract_program = prompt_program or declared_program
+        None, _declared_abstract_objective(source))
+    contract_program = _abstract_objective_program(None, abstract_objective)
+    if abstract_objective is not None:
+        if contract_program:
+            aligned = declared_program == contract_program
+            if not aligned:
+                reasons.append(
+                    "[abstract-objective] metric declaration drifted from the "
+                    "authoritative prompt-compiled phase program")
+        else:
+            # For a prompt outside the deterministic parser, authoring the metric
+            # and its inert companion together is the trajectory-free fallback.
+            # Empty means there is still no competent validator exemplar.
+            aligned = bool(declared_program)
+            if not aligned:
+                reasons.append(
+                    "[abstract-objective] novel prompt requires a non-empty "
+                    "ABSTRACT_OBJECTIVE companion declaration")
+        gates["abstract_objective_alignment"] = aligned
+    abstract_program = contract_program or prompt_program or declared_program
     abstract_probe = _abstract_objective_probe(
         abstract_program, behavior_goal=behavior_goal)
     # The prompt-derived probe anchors non-degeneracy ONLY for a genuine TRAVERSAL /
