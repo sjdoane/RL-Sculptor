@@ -98,13 +98,16 @@ ABSTRACT_OBJECTIVE = {
 def compute_spec(arrays, behavior, meta):
     root = arrays["root_link_pos_w"]
     height_gain = float((root[..., 2].max(axis=0) - root[..., 2].min(axis=0)).mean())
-    waypoint = float(arrays["goal__complete_course__waypoint_index"].max())
+    waypoint = arrays["goal__complete_course__waypoint_index"]
+    waypoint_max = float(waypoint.max())
+    ordered_steps = float(np.mean((np.diff(waypoint, axis=0) > 0).sum(axis=0) >= 4))
     completed = float(arrays["goal__complete_course__success"].mean())
     physical = float(height_gain > 0.9)
-    progress = float(np.clip(waypoint / 4.0, 0.0, 1.0))
+    progress = float(np.clip(waypoint_max / 4.0, 0.0, 1.0))
     return {
-        "spec_score": float(physical * progress * completed),
+        "spec_score": float(physical * ordered_steps * progress * completed),
         "physical_traversal": physical,
+        "ordered_waypoint_steps": ordered_steps,
         "waypoint_progress": progress,
         "completion_gate": completed,
     }
@@ -229,6 +232,14 @@ def test_prompt_native_traversal_composes_physics_and_world_without_reference(
         robot_capability_id="unitree_g1:base",
     )
     catalog = compile_channel_catalog(draft.world_spec, draft.task_spec)
+    waypoint_channel = catalog.by_name()[
+        "goal__complete_course__waypoint_index"]
+    assert waypoint_channel.source["waypoint_count"] == 4
+    competent = catalog_fixture_arrays(
+        catalog, time_steps=120, num_envs=2, case="competent")
+    waypoint_trace = competent["goal__complete_course__waypoint_index"]
+    assert np.array_equal(np.unique(waypoint_trace), np.arange(5))
+    assert np.all(np.diff(waypoint_trace, axis=0) >= 0)
     path = _write_metric(tmp_path, PROMPT_NATIVE_PARKOUR_METRIC, "parkour.py")
 
     result = validate_generated_metric(

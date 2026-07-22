@@ -235,6 +235,35 @@ def _channel(
         max_bytes_per_rollout=bytes_, source=dict(source))
 
 
+def _waypoint_count(world: Mapping[str, Any], goal: Mapping[str, Any]) -> int:
+    """Cardinality of the runtime waypoint sequence.
+
+    Mirrors the compiler's declarative course expansion without importing the
+    compiler (which already imports this module).  Keeping the count in the
+    channel source lets offline fixtures express ordered progress rather than a
+    task-agnostic integer sentinel.
+    """
+    requested = goal.get("waypoints", "auto")
+    if isinstance(requested, list):
+        return len(requested)
+    count = 0
+    course = world.get("shared", {}).get("obstacles", {}).get("course", [])
+    for entry in course if isinstance(course, list) else []:
+        if not isinstance(entry, Mapping):
+            continue
+        kind = entry.get("element")
+        nominal = entry.get("nominal") or {}
+        if kind == "gap":
+            continue
+        if kind == "stairs":
+            count += int(nominal.get("num_steps", 0))
+        elif kind == "stepping_stones":
+            count += int(nominal.get("count", 0))
+        else:
+            count += 1
+    return count
+
+
 def compile_channel_catalog(
     world: dict[str, Any], task: dict[str, Any],
 ) -> ChannelCatalog:
@@ -311,7 +340,10 @@ def compile_channel_catalog(
                 dtype="bool"),
         ])
     elif goal.get("type") == "waypoint_sequence":
-        source = {"goal": goal_id}
+        source = {
+            "goal": goal_id,
+            "waypoint_count": _waypoint_count(world, goal),
+        }
         channels.extend([
             _channel(
                 f"goal__{goal_id}__waypoint_distance", ("T", "N"),
@@ -546,7 +578,22 @@ def catalog_fixture_arrays(
                 if case == "forbidden_contact":
                     arr[...] = True
         elif producer == "waypoint_state" and case == "competent":
-            arr[...] = np.iinfo(dtype).max if np.issubdtype(dtype, np.integer) else 1
+            # A competent sequence is a TRACE, not a constant terminal marker.
+            # Metrics are expected to reject teleportation/skipped waypoints and
+            # commonly inspect ordered plateaus.  The old ``int.max`` at every
+            # frame made all such honest metrics see zero transitions.
+            raw_count = spec.source.get("waypoint_count", 4)
+            waypoint_count = (
+                int(raw_count)
+                if isinstance(raw_count, int) and not isinstance(raw_count, bool)
+                else 4
+            )
+            waypoint_count = max(
+                1, min(waypoint_count, max(1, time_steps - 1)))
+            bounds = np.linspace(
+                0, time_steps, waypoint_count + 2, dtype=int)
+            for index, (start, end) in enumerate(zip(bounds[:-1], bounds[1:])):
+                arr[start:end, ...] = index
         elif role == "completion" and case == "competent":
             arr[...] = True
         out[spec.name] = arr
