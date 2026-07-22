@@ -19,10 +19,11 @@ Open **Projects → G1 Lab Showcase — Weave and Stop**.
 - Adapter: `mjlab`
 - Task: `Mjlab-Velocity-Flat-Unitree-G1`
 - Device: `cuda:0`
-- Promoted authored tuple: `38d2e98950c3…` (selection revisions preserve
-  the identical frozen tuple)
+- Current training tuple: `785b6c62f942…` (selection v12: reward v5 + env
+  v1; the frozen world/task/evaluation half is unchanged)
 - Evaluation lineage: `world-58560025c10981814943d42e`
 - Objective metric: `gen_003` (accepted, prompt-native, observe-only)
+- Current live recovery job: `55bbca2ef13a4c4a` (clean code `919d20c`)
 - Latest completed showcase job: `80d549c83b41a134`
 
 The July 22 iter-3 rollout completed the ordered route in 59/64 environments;
@@ -31,10 +32,13 @@ box. It is not yet accepted as solved: only one environment satisfied the full
 two-second terminal-stillness gate. The frozen official metric reported zero
 because its last sample was MJLab's automatic reset-to-spawn frame, which
 looked like a 3.92 m/s teleport and erased signed displacement. A first-episode
-artifact-boundary fix and longer final-target braking are verified and queued
-for the next UI resume. Treat the old `fit 0.00 / prog 0.005` card as preserved
-historical evidence of that capture defect, not as evidence that the robot
-failed to traverse the course.
+artifact-boundary fix and longer final-target braking are now active in the
+live recovery. Reward v5 crossfades route income into stronger terminal
+stillness without copying the held-out completion gate. The UI log has also
+proved that Resume crossed the missing iter-4 index and loaded actor + critic
+from the competent iter-3 checkpoint before PPO iteration 0. Treat the old
+`fit 0.00 / prog 0.005` card as preserved historical evidence of that capture
+defect, not as evidence that the robot failed to traverse the course.
 
 ## One-time startup
 
@@ -102,6 +106,21 @@ authored-world channels construct the competent validator fixture. A newly
 generated metric stays **observe-only** until it earns steer rights through
 empirical calibration; leave it in observe mode rather than weakening that
 trust boundary. The prepared project already has accepted metric `gen_003`.
+
+## Current one-cycle recovery
+
+The live job `55bbca2ef13a4c4a` uses the exact behavior goal above with Auto
+mode, one sculpt iteration, 750 rsl_rl iterations, 1,024 environments,
+`cuda:0`, 1,000 episode steps, two rollout episodes, seed 42, 1920×1080 video,
+and `gen_003` observe-only. It is intentionally a focused continuation from
+the competent iter-3 policy, not a new cold-start benchmark. Before accepting
+any duplicate launch, verify the Training log contains all three lines:
+
+- `resume_warm_start_resolved ... runs/iter_3/checkpoint.pt`
+- `warm_start_loaded ... load_cfg_keys=[actor, critic]`
+- `preserved authored command supervision at full weight`
+
+If any is absent, use **Stop** and diagnose before spending the GPU budget.
 
 ## Exact overnight launch settings
 

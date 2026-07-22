@@ -1207,3 +1207,13 @@ the adapter retains final checkpoint compatibility validation.
 Verification: focused warm-start suite 20 passed; broad CPU suite 2,217 passed
 / 1 expected optional-JAX skip in 4m54s; scoped Ruff E9/F63/F7/F82, compileall,
 and `git diff --check` passed before commit.
+
+Committed as `919d20c`. The replacement UI job is
+`55bbca2ef13a4c4a`: clean `919d20c`, reward v5 + env v1, iter selection v12 /
+tuple `785b6c62f942d41b250618c4bda3bb5a2d53023fb12b51bf8299c0efd11eedef`,
+one 750-PPO cycle, 1,024 envs, seed 42, two 1,000-step 1080p rollouts,
+`gen_003` observe-only, Auto. Its live log proves
+`resume_warm_start_resolved` from `runs/iter_3/checkpoint.pt` (sha8
+`05de8e0f`) and `warm_start_loaded` for actor + critic before PPO iteration 0.
+The train worker is active: do not edit reload-watched core or run GPU audits
+until it finishes.
