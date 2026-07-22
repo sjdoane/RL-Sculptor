@@ -1047,3 +1047,11 @@ The two pre-existing React Router v7 future-flag warnings were also removed by
 opting `BrowserRouter` into `v7_startTransition` and `v7_relativeSplatPath`.
 A fresh live Training tab then reported an empty warning/error console; the
 frontend typecheck and production build passed for this follow-up as well.
+
+`reward-sculptor-ui/docs/LAB_CALL_DEMO_RUNBOOK.md` was replaced with the
+current G1 showcase workflow: exact world and behavior prompts, UI-only metric
+generation, exact 4×750 / 1024-env / 1,000-step / 1080p launch settings,
+physical acceptance criteria, call narrative, honest incomplete-run fallback,
+and preserved warnings about the invalid historical Go1 evidence. Its current
+status paragraph intentionally says the live run is incomplete until the
+official selected rollout proves the full course and terminal hold.

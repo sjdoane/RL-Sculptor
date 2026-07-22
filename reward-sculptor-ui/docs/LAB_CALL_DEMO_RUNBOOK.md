@@ -1,193 +1,229 @@
-# RewardSculptor lab-call demo runbook
+# RewardSculptor research-lab demo runbook
 
-> **Critical correction (July 21):** The completed `job_434b10c7d3fd8eb2`
-> must not be presented as successful parkour. Its robots and waypoint targets
-> were in different environment-origin frames; all recorded waypoint indices
-> stayed at zero. The source fix invalidates the old tuple by design. Re-author
-> and promote the World in the UI, then train a new run before using parkour as
-> evidence.
+This is the July 22 end-to-end showcase: author a physical world from one
+prompt, generate a prompt-native objective validator without a stored
+trajectory, train a Unitree G1 against the immutable world tuple, and inspect
+the result entirely in the UI.
 
-This is the reliable path for the July 21 research-lab demonstration. After
-one startup command, project creation, world authoring, launch, monitoring,
-steering, stopping, and resuming are all performed in the UI.
+> **Evidence rule:** do not call the slalom solved until the selected rollout
+> proves all five ordered regions, zero forbidden box contacts, finish entry,
+> terminal speed below `0.12 m/s`, and a continuous two-second upright hold.
+> Reward return and visually plausible walking are not substitutes.
 
-## Night-before run
+## Current prepared project
 
-### 1. Start once
+Open **Projects → G1 Lab Showcase — Weave and Stop**.
 
-In WSL:
+- Project slug: `g1-lab-showcase-weave-and-stop`
+- Robot: `Unitree G1`
+- Adapter: `mjlab`
+- Task: `Mjlab-Velocity-Flat-Unitree-G1`
+- Device: `cuda:0`
+- Promoted selection: `v8` (`38d2e98950c3…`)
+- Evaluation lineage: `world-58560025c10981814943d42e`
+- Objective metric: `gen_003` (accepted, prompt-native, observe-only)
+- Active showcase job: `job_00197adcc90c9911`
+
+The active job is still training at the time this guide was updated. It has
+demonstrated real ordered learning through waypoint 2, but not yet waypoint 3;
+that is progress evidence, not a completion claim. Replace this paragraph with
+the final selected-iteration evidence after the official rollout finishes.
+
+## One-time startup
+
+In WSL, run:
 
 ```bash
 cd ~/projects/reward-sculptor-ui
 ./run.sh
 ```
 
-Keep that terminal and the laptop awake, plugged in, and on AC power. The UI
-opens at `http://localhost:5173`. Do not edit configuration files for the demo.
+Keep that terminal open. Keep the laptop awake, plugged into AC power, and on a
+cooling surface. Everything after startup is done at `http://localhost:5173`.
 
-### 2. Check readiness in the UI
+In **Settings**, verify:
 
-Open **Settings** and confirm all three:
+1. **Anthropic API** says `Connected`.
+2. **GPU** reports the RTX 5070 Laptop GPU, CUDA, `mjlab`, and `rsl_rl` ready.
+3. **Knowledge graph** is populated.
 
-1. **Anthropic API** says `Connected`. If it does not, paste the key into the
-   owner-only field and choose **Save & activate**. It takes effect immediately;
-   no restart is needed.
-2. **GPU** shows `GeForce RTX 5070 Laptop GPU`, CUDA available, and both
-   `mjlab` and `rsl_rl` ready.
-3. **Knowledge graph** shows the shared corpus rather than an empty graph.
+If the API key is missing, paste it into the owner-only field and choose
+**Save & activate**. No app restart is required.
 
-The saved API key is stored in the local RewardSculptor data directory with
-owner-only permissions. The UI and API only display its masked suffix.
+## World authoring, entirely in the UI
 
-### 3. Use the prepared project
+The prepared project is already promoted. For a clean re-creation, make a new
+G1 project in the UI, open **World → Author world**, leave the capability ID
+blank so the project robot is inherited, and paste this exact prompt:
 
-Open **Projects → Lab Call — Authored Parkour**. It is configured as:
+> On flat high-traction ground, build a clearly visible slalom using four identical bright orange boxes centered along the +X direction at roughly x=2.0, 3.5, 5.0, and 6.5 metres. Each box should be about 0.45 m wide, 0.45 m deep, and 0.75 m tall, with collision enabled. Give the robot a generous alternating path around them using ordered waypoints approximately at (2.0, +0.85), (3.5, -0.85), (5.0, +0.85), and (6.5, -0.85). Add a large contrasting finish zone centered near (8.0, 0.0). The task is to start upright facing +X, run through every waypoint in order without touching a box, enter the finish zone, come to a complete stop, and remain upright and still there for at least 2 seconds. Randomize floor friction mildly and each box lateral position by at most 0.08 m without closing the path. Preserve generous clearances and high-contrast rendering.
 
-- Robot: `Unitree Go1`
-- Adapter: `mjlab`
-- Task: `Mjlab-Velocity-Rough-Unitree-Go1`
-- Device: `cuda:0`
+Choose **Draft world** and keep **System decides** for any clarification unless
+the lab specifically wants to discuss one. Confirm all admission gates are
+green: schema, capability, budget, build, initial penetration, settle,
+placement, and reachability. Then choose **Preview scene → Apply & promote**.
 
-The **World** tab should show `Authoritative world tuple` and `Verified for
-launch`. The authored World remains `v1`; the atomic tuple-selection version
-may be higher because each promoted reward/environment revision advances its
-lineage. The scene is a five-element ordered parkour course with three
-ascending platforms and two authored gap intervals. The gaps are spacing
-between platforms rather than hidden collision geometry, which the World UI
-states explicitly.
+Before training, the World tab must say **Verified for launch**. In the 3D
+scene, confirm:
 
-If the prepared project is unavailable, create it entirely in the UI with the
-values above, then follow the world-authoring recipe below.
+- one G1 at the start;
+- four orange collision boxes on the centerline;
+- four green waypoint disks alternating left/right;
+- one larger green finish disk after the course.
 
-### 4. Re-create the authored world if needed
+Click `waypoint_01` and show that the inspector reports
+`center_m=[2,0.85]`, `kind=disk`, and `radius_m=0.45`. This is the clearest
+visual proof that the natural-language task became executable geometry and
+task state, not merely a background image.
 
-Open **World → Author world** and paste this prompt:
+## Prompt-native objective metric
 
-> Traverse a parkour course of ascending boxes with gaps, moving forward steadily without falling.
+Open **New run** and paste this exact behavior goal:
 
-Leave **Robot capability ID** blank so the project robot is used. Choose
-**Draft world**. Keep **System decides** for every clarification, moving through
-all five pages. Confirm that all eight gates are green:
+> Start upright facing +X. Run a smooth slalom through waypoint_01, waypoint_02, waypoint_03, and waypoint_04 in exact order, alternating around the four orange boxes with zero robot-box contacts. Enter the finish zone, decelerate, then remain upright and still there continuously for at least 2.0 s. Success requires ordered waypoint completion, no forbidden contact or fall, finish entry, and terminal horizontal base speed <0.12 m/s; elapsed time matters only after physical success.
 
-- schema
-- capability
-- budget
-- build
-- initial penetration
-- settle
-- placement
-- reachability
+Under **Objective fitness metric**:
 
-Choose **Preview scene**, inspect the course, then **Apply & promote**. Do not
-launch until the World page says `Verified for launch`. Promotion is an atomic
-world/task/reward/evaluation tuple; launch rechecks that same tuple server-side.
+1. choose `best-of-3`;
+2. choose **Generate from goal** (or **Generate a metric from this goal at
+   launch** on a fresh project);
+3. wait for generate → validate → review to finish;
+4. use the accepted generated metric.
 
-### 5. Launch the complete showcase run
+No stored trajectory is required. The independent abstract objective and the
+authored-world channels construct the competent validator fixture. A newly
+generated metric stays **observe-only** until it earns steer rights through
+empirical calibration; leave it in observe mode rather than weakening that
+trust boundary. The prepared project already has accepted metric `gen_003`.
 
-From **World**, choose **Train this world**. Use these exact settings:
+## Exact overnight launch settings
 
-- Run plan: **Overnight showcase**
-- Behavior goal:
+From **World**, choose **Train this world**, or open **New run**. Select
+**Overnight showcase**, then expand **Advanced** and use:
 
-  > Trot forward steadily across the authored ascending-platform course, clear each gap, and remain upright without falling.
-
-- Mode: `Auto` (the preset turns off pause-for-feedback)
+- Behavior goal: exact text above
+- Mode: `Auto`
 - Sculpt iterations: `4`
 - rsl_rl iterations per cycle: `750`
-- num_envs override: `1024`
+- Environments: `1024`
 - Device: `cuda:0`
-- Episode steps: `500`
+- Episode steps: `1000` (20 simulated seconds)
 - Rollout episodes: `2`
 - Seed: `42`
-- Video resolution: `960×540`
-- Objective fitness metric: `go1_trot`
-- Fitness mode: `steer`
+- Video: `1920×1080`
+- Objective metric: accepted generated metric (`gen_003` in the prepared
+  project)
+- Fitness mode: `observe`
 - Fitness patience: `4`
-- Knowledge graph: enabled; do not select the ablation toggle
+- Resume: enabled
+- Knowledge graph: enabled
+- Auto-physics on severe: project default
 
-The readiness rail must show API key configured, `cuda:0 · mjlab + rsl_rl
-ready`, and the authored world tuple verified. The estimated time should be
-roughly 2 hours 20 minutes on the demo laptop. The completed rehearsal took
-2 hours 21 minutes 34 seconds. Choose **Launch** once and keep the laptop awake
-and on AC power.
+The readiness rail must show a configured API key, CUDA/MJLab/rsl_rl ready,
+and the selected world tuple verified. A four-cycle run is an overnight job;
+do not rely on a two-hour estimate for this 1,000-step authored-world setup.
 
-`go1_trot` is the dependable showcase metric: it scores forward locomotion and
-stability while the authored task and environment enforce the ordered course.
-The generated-metric path is valuable for a separate experiment, but it adds
-LLM-generation and calibration variance that is unnecessary for the live call.
+Choose **Launch** once. The app moves to **Training** and streams:
 
-### 6. Monitor without a terminal
+1. the exact world selection and launch manifest;
+2. reward generation/validation;
+3. GPU training;
+4. rollout and 1080p video capture;
+5. objective metric and realism audit;
+6. diagnosis plus the next atomic reward/world selection.
 
-The UI switches to **Training** after launch. Watch for this sequence:
+Do not edit reload-watched core files during an active worker. Use the UI Stop
+control before any core change. Resume reuses only exact-matching completed
+artifacts; it never pretends a partial or drifted artifact is complete.
 
-1. run accepted with an authored-world selection and launch manifest;
-2. reward generation and validation;
-3. GPU training for the current outer iteration;
-4. rollout capture and video;
-5. objective-fitness score, diagnosis, and reward/environment edit;
-6. the next iteration starts automatically.
+## Acceptance checklist for the finished run
 
-The run header can switch between **Auto** and **Manual**, stop the process, or
-resume a previously interrupted run. Completed iteration artifacts are reused
-only when the existing checkpoint, rollout, and trajectory match the run.
+In **Training** or **Results**, select the chosen iteration and verify the disk
+artifacts and visible UI agree:
 
-## Call-day presentation flow
+- waypoint index reaches `5`;
+- authored success is observed;
+- ordered waypoint verification passes;
+- `contact_frac = 0` and every forbidden-contact channel stays false;
+- no sustained fall is detected;
+- the robot is inside the finish disk during the terminal window;
+- terminal horizontal speed is `< 0.12 m/s`;
+- at least 90% of the final two-second window is below that speed;
+- the robot remains upright during that hold;
+- the rollout video visibly shows the same weave, finish, and stop.
 
-Use this three-minute narrative:
+If any item fails, present it as a diagnosed research iteration, not as solved.
+The metric's dense progress score is useful for ranking partial policies, but
+only the conjunctive completion gate establishes success.
 
-1. **World tab:** show the natural-language prompt, selected robot, materialized
-   3D scene, passing gates, train variations, and immutable selection lineage.
-2. **Training tab:** show the run plan/readiness rail, live GPU state, iteration
-   timeline, rollout video, objective fitness, and the diagnosis/edit loop.
-3. **Rewards and Results:** compare reward versions, show literature references,
-   metric history, and the best rollout. Emphasize that environment and reward
-   changes are versioned together rather than being hidden side effects.
+## Three-minute call flow
 
-If time permits, open **Robot Library** to show that authoring is capability-
-driven and not keyed to Go1 or G1. Gym robots, quadrupeds, humanoids, and arm
-robots share the same core world-selection and launch contract.
+1. **World (about 60 s).** Show the exact prompt, verified tuple, robot and
+   task, visible orange obstacles, alternating green task disks, a selected
+   waypoint's parameters, train-only randomization, and immutable lineage.
+2. **Training (about 75 s).** Show the one-prompt goal, live/completed GPU run,
+   iteration timeline, objective trust status, reward diagnosis, physics
+   audit, and atomic environment/reward revisions.
+3. **Results + Rewards (about 45 s).** Play the selected rollout, show the
+   completion subcomponents and contact/hold evidence, compare reward
+   versions, and show literature grounding.
 
-## Invalidated historical rehearsal
+If asked about generality, open **Robot Library**. The implementation is keyed
+to capabilities and control surfaces, not G1 or Go1 names: humanoids,
+quadrupeds, arms, grippers, and future robots use the same world-selection and
+validator contracts when their capability descriptors support the task.
 
-The historical run is `job_434b10c7d3fd8eb2` in **Lab Call — Authored
-Parkour**. It completed all four requested cycles and then re-evaluated the
-selected policy on fresh seed `90001`, but it is not valid task evidence:
+## Honest fallback if training is still running
 
-- fitness progressed `0.00159 → 0.20701 → 0.26848 → 0.23281`;
-- iteration 4 (displayed as the third new cycle in this continued project) was
-  selected as the best atomic artifact tuple;
-- the fresh held-out score was `0.25805`, close to the selected score of
-  `0.26848`;
-- the best rollout stayed upright and showed coherent sustained locomotion;
-  the fresh replay reproduced that behavior;
-- direct trajectory inspection found zero waypoint advancement in every
-  recorded environment because geometry and targets were not translated to
-  each environment origin. Do not present its fitness as course progress.
+Do not substitute the old Go1 parkour run or call a partial G1 checkpoint a
+success. Instead:
 
-Retain the artifacts as failure provenance, but do not show the old Results
-card as successful parkour. A replacement run must use a newly promoted World
-tuple compiled after the environment-origin fix.
+1. show the fully verified World tab and interactive task geometry;
+2. show the live ordered-learning evidence in Training;
+3. show the validator's honest zero completion plus its progress/contact
+   subcomponents;
+4. explain the identified control conflict and the generic goal-conditioned
+   command fix;
+5. state which acceptance gate remains unmet.
 
-## Recovery guide
+That is a stronger research demonstration than a cherry-picked video with an
+unsupported success claim.
 
-- **Out of memory:** stop from the Training header, relaunch, and change
-  `num_envs` from `1024` to `512`. The UI marks the plan `custom` and updates
-  the estimate.
-- **Laptop sleep, power loss, or backend restart:** start with `./run.sh`, open
-  the same project, and relaunch the same settings. Resume reuses only exact-
-  matching completed artifacts.
-- **World verification turns red:** return to World, choose **Verify integrity**,
-  and re-author/promote if the tuple really changed. Do not bypass the gate.
-- **LLM failure:** keep the project and run artifacts. Verify the key in Settings,
-  then relaunch; no file editing is necessary.
-- **Generated metric rejected:** for the live call, select built-in `go1_trot`
-  and steer. Rejected generated metrics must not be promoted merely to continue.
+## Invalidated historical Go1 rehearsal
+
+The historical `job_434b10c7d3fd8eb2` in **Lab Call — Authored Parkour** is
+failure provenance only. Its robots and waypoint targets were in different
+environment-origin frames, and every recorded waypoint index stayed at zero.
+Although it completed four cycles and produced coherent forward locomotion,
+its fitness is not evidence of platform traversal. Do not show it as solved.
+
+Likewise, the later short Go1 UI plumbing run proved launch, streaming,
+rollout, objective evaluation, and cancellation, but terminated after only
+eight rollout steps and did not prove parkour. Keep both artifacts for the
+failure-analysis story only.
+
+## Recovery
+
+- **Out of memory:** Stop in Training, relaunch with `512` environments, and
+  let the UI update the estimate/plan to custom.
+- **Sleep, power loss, or backend restart:** rerun `./run.sh`, open the same
+  project, and relaunch the same settings with Resume enabled.
+- **World verification turns red:** choose **Verify integrity**; re-author and
+  promote only if the tuple genuinely changed. Never bypass the gate.
+- **Metric generation fails:** use the inline Retry control. Do not promote a
+  rejected metric. For a live fallback, show the already accepted `gen_003`
+  as observe-only.
+- **LLM key missing:** fix it in Settings and relaunch; no file editing is
+  required.
 
 ## Morning checklist
 
-- Keep the laptop on AC power and disable sleep for the call window.
-- Start `./run.sh` and verify the dashboard reports no orphaned active job.
-- Open the prepared project and confirm the World tuple is verified.
-- Confirm at least one completed rollout video plays in Training or Results.
-- Do not re-author or relaunch the completed project immediately before the call.
-- Keep one known-good result open in a browser tab as the presentation fallback.
+- Laptop on AC, sleep disabled, cooling unobstructed.
+- `./run.sh` running and Dashboard free of orphaned jobs.
+- Prepared project opens and World says **Verified for launch**.
+- 3D scene visibly contains boxes, alternating waypoint disks, and finish.
+- Browser warning/error console is clean.
+- At least one completed video plays from Training or Results.
+- Completion claims match the objective subcomponents and trajectory.
+- Keep the verified project open in one tab before the call.
+- Do not re-author or relaunch immediately before presenting.
