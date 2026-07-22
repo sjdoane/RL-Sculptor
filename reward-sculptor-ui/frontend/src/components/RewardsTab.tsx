@@ -876,6 +876,16 @@ function SpecPanel({ detail, label = "REWARD_SPEC" }: { detail: RewardVersionDet
   const trackingPct = composition
     ? Math.round(100 * composition.tracking_weight / compositionTotal)
     : 0;
+  const phaseDuration = composition
+    && typeof composition.phase_duration_s === "number"
+    && Number.isFinite(composition.phase_duration_s)
+    ? composition.phase_duration_s
+    : null;
+  const phaseContract = composition?.phase_mode === "loop"
+    ? `loops${phaseDuration !== null ? ` every ${phaseDuration.toFixed(2)} s` : ""}`
+    : composition?.phase_mode === "hold"
+      ? "plays once, then holds"
+      : null;
   return (
     <div className="rs-card">
       <div className="rs-card-head">
@@ -919,6 +929,29 @@ function SpecPanel({ detail, label = "REWARD_SPEC" }: { detail: RewardVersionDet
               <span>clip {composition.reference_clip_id ?? "unknown"}</span>
               {composition.reference_target_sha256 && <span title={composition.reference_target_sha256}>target {composition.reference_target_sha256.slice(0, 12)}â€¦</span>}
             </div>
+            {(phaseContract || composition.root_height_frame === "episode_relative") && (
+              <div style={{
+                marginTop: 10,
+                paddingTop: 9,
+                borderTop: "1px solid color-mix(in srgb, var(--rs-primary) 18%, var(--hairline))",
+                display: "flex",
+                alignItems: "center",
+                flexWrap: "wrap",
+                gap: 7,
+              }}>
+                <span className="rs-eyebrow" style={{ marginRight: 2 }}>Temporal contract</span>
+                {phaseContract && (
+                  <span className="rs-badge" title="How the reference clock behaves after the source motion ends">
+                    {composition.phase_mode === "loop" ? "↻" : "→"} {phaseContract}
+                  </span>
+                )}
+                {composition.root_height_frame === "episode_relative" && (
+                  <span className="rs-badge" title="Vertical motion is measured from each environment's own reset height">
+                    height from reset
+                  </span>
+                )}
+              </div>
+            )}
           </div>
         )}
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 16, fontSize: 12 }}>

@@ -88,6 +88,19 @@ N_PHASE_TARGETS = 32
 # certification keeps the denser 32-target default above.
 REFERENCE_REWARD_PHASE_TARGETS = 16
 
+# A locomotion prior must keep producing a gait after its source clip ends;
+# clamping a non-zero velocity target against one frozen joint pose creates an
+# impossible objective.  Detect a repeatable, translation-dominant suffix from
+# kinematics alone (no robot/task-name keys) and loop only that suffix.  Large
+# vertical motions such as get-ups and jumps deliberately stay one-shot.
+_LOCOMOTION_MIN_TRAVEL_M = 0.50
+_LOCOMOTION_MAX_VERTICAL_RANGE_M = 0.20
+_LOOP_MIN_PERIOD_S = 0.30
+_LOOP_MAX_PERIOD_S = 1.50
+_LOOP_MAX_JOINT_RMS_RAD = 0.25
+_LOOP_MAX_ROOT_Z_DELTA_M = 0.12
+_LOOP_MAX_GRAVITY_RMS = 0.20
+
 
 class TrackError(RuntimeError):
     """Raised for setup failures (bad donor config, clip missing common
@@ -114,6 +127,62 @@ def downsample_phase_targets(
     phases = np.linspace(0.0, 1.0, n, endpoint=False)
     idx = np.clip(np.round(phases * (t - 1)).astype(int), 0, t - 1)
     return array[idx]
+
+
+def select_tracking_phase_window(
+    *,
+    joint_pos: np.ndarray,
+    root_pos: np.ndarray,
+    gravity: Optional[np.ndarray],
+    fps: float,
+) -> tuple[slice, str]:
+    """Choose a one-shot clip or a repeatable locomotion suffix.
+
+    The decision is embodiment-neutral and derived only from the reference:
+    meaningful horizontal translation, small vertical excursion, and an
+    end-pose match within a plausible gait-period lookback.  Returning a slice
+    keeps every target channel aligned.  ``"hold"`` means play once and then
+    hold the terminal pose with a zero velocity target; ``"loop"`` means wrap
+    the selected suffix indefinitely.
+    """
+    q = np.asarray(joint_pos, dtype=np.float64)
+    root = np.asarray(root_pos, dtype=np.float64)
+    g = None if gravity is None else np.asarray(gravity, dtype=np.float64)
+    if q.ndim != 2 or root.ndim != 2 or root.shape[1] < 3:
+        return slice(None), "hold"
+    if q.shape[0] != root.shape[0] or q.shape[0] < 4 or fps <= 0.0:
+        return slice(None), "hold"
+
+    horizontal_travel = float(np.linalg.norm(root[-1, :2] - root[0, :2]))
+    vertical_range = float(np.ptp(root[:, 2]))
+    if (horizontal_travel < _LOCOMOTION_MIN_TRAVEL_M
+            or vertical_range > _LOCOMOTION_MAX_VERTICAL_RANGE_M):
+        return slice(None), "hold"
+
+    min_lookback = max(2, int(round(_LOOP_MIN_PERIOD_S * fps)))
+    max_lookback = max(min_lookback + 1, int(round(_LOOP_MAX_PERIOD_S * fps)))
+    lo = max(0, q.shape[0] - 1 - max_lookback)
+    hi = q.shape[0] - min_lookback
+    if hi <= lo:
+        return slice(None), "hold"
+
+    candidates = np.arange(lo, hi, dtype=np.int64)
+    joint_rms = np.sqrt(np.mean((q[candidates] - q[-1]) ** 2, axis=1))
+    root_delta = np.abs(root[candidates, 2] - root[-1, 2])
+    if g is not None and g.shape == root.shape:
+        gravity_rms = np.sqrt(np.mean((g[candidates] - g[-1]) ** 2, axis=1))
+    else:
+        gravity_rms = np.zeros_like(joint_rms)
+    score = joint_rms + 2.0 * root_delta + 0.5 * gravity_rms
+    best_local = int(np.argmin(score))
+    start = int(candidates[best_local])
+    suffix_travel = float(np.linalg.norm(root[-1, :2] - root[start, :2]))
+    if (joint_rms[best_local] > _LOOP_MAX_JOINT_RMS_RAD
+            or root_delta[best_local] > _LOOP_MAX_ROOT_Z_DELTA_M
+            or gravity_rms[best_local] > _LOOP_MAX_GRAVITY_RMS
+            or suffix_travel < 0.15):
+        return slice(None), "hold"
+    return slice(start, None), "loop"
 
 
 # ── tracking reward source generation ───────────────────────────────────
@@ -287,18 +356,38 @@ def generate_tracking_residual_reward_source(
             f"clip {clip_id!r} has no joint trajectory; cannot construct "
             "a tracking-first stage reward")
 
-    def _target(name: str) -> Optional[np.ndarray]:
+    def _raw_target(name: str) -> Optional[np.ndarray]:
         arr = arrays.get(name)
         if arr is None:
             return None
-        return downsample_phase_targets(
-            np.asarray(arr[:, 0], dtype=np.float64), n=n_phase_targets)
+        return np.asarray(arr[:, 0], dtype=np.float64)
 
-    joint_pos = _target("joint_pos")
-    joint_vel = _target("joint_vel")
-    root_pos = _target("root_link_pos_w")
-    gravity = _target("projected_gravity_b")
-    assert joint_pos is not None and joint_vel is not None and root_pos is not None
+    joint_pos_raw = _raw_target("joint_pos")
+    joint_vel_raw = _raw_target("joint_vel")
+    root_pos_raw = _raw_target("root_link_pos_w")
+    gravity_raw = _raw_target("projected_gravity_b")
+    assert (joint_pos_raw is not None and joint_vel_raw is not None
+            and root_pos_raw is not None)
+
+    fps = float(clip.get("fps") or 30.0)
+    phase_window, phase_mode = select_tracking_phase_window(
+        joint_pos=joint_pos_raw,
+        root_pos=root_pos_raw,
+        gravity=gravity_raw,
+        fps=fps,
+    )
+    joint_pos_raw = joint_pos_raw[phase_window]
+    joint_vel_raw = joint_vel_raw[phase_window]
+    root_pos_raw = root_pos_raw[phase_window]
+    if gravity_raw is not None:
+        gravity_raw = gravity_raw[phase_window]
+
+    joint_pos = downsample_phase_targets(joint_pos_raw, n=n_phase_targets)
+    joint_vel = downsample_phase_targets(joint_vel_raw, n=n_phase_targets)
+    root_pos = downsample_phase_targets(root_pos_raw, n=n_phase_targets)
+    gravity = (
+        downsample_phase_targets(gravity_raw, n=n_phase_targets)
+        if gravity_raw is not None else None)
 
     # Hash exactly the rounded arrays embedded in source.  This is the durable
     # parent→child identity checked after every LLM rewrite.
@@ -313,8 +402,7 @@ def generate_tracking_residual_reward_source(
         rounded_targets, sort_keys=True, separators=(",", ":"),
     ).encode("utf-8")).hexdigest()
 
-    fps = float(clip.get("fps") or 30.0)
-    n_frames = int(np.asarray(clip["root_pos_z"]).shape[0])
+    n_frames = int(joint_pos_raw.shape[0])
     duration_s = max(1.0 / fps, (n_frames - 1) / fps)
     names_literal = repr([str(name) for name in meta["joint_names"]])
     jp_literal = _format_array_literal(joint_pos)
@@ -341,6 +429,7 @@ REFERENCE_JOINT_NAMES = {names_literal}
 REFERENCE_N_PHASES = {n_phase_targets}
 REFERENCE_N_JOINTS = {n_joints}
 REFERENCE_DURATION_S = {duration_s!r}
+REFERENCE_PHASE_MODE = {phase_mode!r}
 REFERENCE_JOINT_POS = np.asarray({jp_literal}, dtype=np.float64)
 REFERENCE_JOINT_VEL = np.asarray({jv_literal}, dtype=np.float64)
 REFERENCE_ROOT_Z = np.asarray({rz_literal}, dtype=np.float64)
@@ -359,6 +448,9 @@ REWARD_SPEC: dict = {{
         "reference_target_sha256": {target_hash!r},
         "tracking_weight": 1.0,
         "residual_max": {float(residual_max)!r},
+        "phase_mode": {phase_mode!r},
+        "phase_duration_s": {duration_s!r},
+        "root_height_frame": "episode_relative",
     }},
     "hyperparameters": {{
         "tracking_weight": 1.0,
@@ -398,7 +490,10 @@ def _scalar(info, key, default=0.0):
 
 def _phase_index_scalar(info):
     elapsed = _scalar(info, "episode_length") * _scalar(info, "step_dt", 0.02)
-    fraction = min(max(elapsed / REFERENCE_DURATION_S, 0.0), 0.999999)
+    if REFERENCE_PHASE_MODE == "loop":
+        fraction = (max(elapsed, 0.0) % REFERENCE_DURATION_S) / REFERENCE_DURATION_S
+    else:
+        fraction = min(max(elapsed / REFERENCE_DURATION_S, 0.0), 0.999999)
     return min(REFERENCE_N_PHASES - 1, int(fraction * REFERENCE_N_PHASES))
 
 
@@ -409,8 +504,16 @@ def _reference_tracking_numpy(next_state, info):
         raise ValueError("state has fewer joints than the attached reference")
     i = _phase_index_scalar(info)
     pos_err = qpos[-REFERENCE_N_JOINTS:] - REFERENCE_JOINT_POS[i]
-    vel_err = qvel[-REFERENCE_N_JOINTS:] - REFERENCE_JOINT_VEL[i]
-    root_err = _scalar(info, "base_height") - float(REFERENCE_ROOT_Z[i])
+    elapsed = _scalar(info, "episode_length") * _scalar(info, "step_dt", 0.02)
+    target_vel = REFERENCE_JOINT_VEL[i]
+    if REFERENCE_PHASE_MODE == "hold" and elapsed >= REFERENCE_DURATION_S:
+        target_vel = np.zeros_like(target_vel)
+    vel_err = qvel[-REFERENCE_N_JOINTS:] - target_vel
+    reference_root_delta = float(REFERENCE_ROOT_Z[i] - REFERENCE_ROOT_Z[0])
+    base_height = _scalar(info, "base_height")
+    actual_root_delta = _scalar(
+        info, "base_height_delta", base_height - float(REFERENCE_ROOT_Z[0]))
+    root_err = actual_root_delta - reference_root_delta
     joint_pos = float(np.exp(-8.0 * np.mean(pos_err ** 2)))
     joint_vel = float(np.exp(-0.10 * np.mean(vel_err ** 2)))
     root_height = float(np.exp(-40.0 * root_err ** 2))
@@ -455,7 +558,11 @@ def _phase_index_batched(info, like):
     import torch
     step = info.get("episode_length", torch.zeros_like(like))
     dt = info.get("step_dt", torch.full_like(like, 0.02))
-    fraction = torch.clamp(step * dt / REFERENCE_DURATION_S, 0.0, 0.999999)
+    elapsed = torch.clamp(step * dt, min=0.0)
+    if REFERENCE_PHASE_MODE == "loop":
+        fraction = torch.remainder(elapsed, REFERENCE_DURATION_S) / REFERENCE_DURATION_S
+    else:
+        fraction = torch.clamp(elapsed / REFERENCE_DURATION_S, 0.0, 0.999999)
     return torch.clamp(
         (fraction * REFERENCE_N_PHASES).long(), 0, REFERENCE_N_PHASES - 1)
 
@@ -472,14 +579,24 @@ def _reference_tracking_batched(next_state, info):
         REFERENCE_JOINT_POS, device=qpos.device, dtype=qpos.dtype)[i]
     target_vel = torch.as_tensor(
         REFERENCE_JOINT_VEL, device=qvel.device, dtype=qvel.dtype)[i]
+    elapsed = info.get("episode_length", torch.zeros_like(like)) * info.get(
+        "step_dt", torch.full_like(like, 0.02))
+    if REFERENCE_PHASE_MODE == "hold":
+        target_vel = torch.where(
+            (elapsed >= REFERENCE_DURATION_S)[:, None],
+            torch.zeros_like(target_vel), target_vel)
     pos_err = qpos[:, -REFERENCE_N_JOINTS:] - target_pos
     vel_err = qvel[:, -REFERENCE_N_JOINTS:] - target_vel
     joint_pos = torch.exp(-8.0 * torch.mean(pos_err ** 2, dim=-1))
     joint_vel = torch.exp(-0.10 * torch.mean(vel_err ** 2, dim=-1))
     target_root = torch.as_tensor(
         REFERENCE_ROOT_Z, device=qpos.device, dtype=qpos.dtype)[i]
+    reference_root_delta = target_root - float(REFERENCE_ROOT_Z[0])
+    base_height = info.get("base_height", torch.zeros_like(like))
+    actual_root_delta = info.get(
+        "base_height_delta", base_height - float(REFERENCE_ROOT_Z[0]))
     root_height = torch.exp(-40.0 * (
-        info.get("base_height", torch.zeros_like(like)) - target_root) ** 2)
+        actual_root_delta - reference_root_delta) ** 2)
     orientation = torch.ones_like(like)
     if REFERENCE_GRAVITY is not None:
         target_gravity = torch.as_tensor(

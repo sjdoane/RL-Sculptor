@@ -31,6 +31,7 @@ from sculptor.refs.track import (
     generate_tracking_residual_reward_source,
     generate_tracking_reward_source,
     read_donor_adapter_config,
+    select_tracking_phase_window,
     track_clip,
     update_provenance_tier_d,
     verify_tierd_certificate,
@@ -117,6 +118,39 @@ def test_downsample_phase_targets_single_frame_source():
     assert out.shape == (4, 2)
     assert (out == 1.0).any() or (out == 2.0).any()  # sanity: values echoed
     np.testing.assert_allclose(out, np.tile(arr, (4, 1)))
+
+
+def test_tracking_phase_window_loops_repeatable_translation_suffix():
+    fps = 60.0
+    t = np.arange(180, dtype=np.float64) / fps
+    phase = 2.0 * np.pi * t / 0.75
+    joints = np.stack([np.sin(phase), np.cos(phase)], axis=1)
+    root = np.stack([
+        0.8 * t, np.zeros_like(t), 0.72 + 0.03 * np.sin(phase),
+    ], axis=1)
+    gravity = np.tile(np.array([0.0, 0.0, -1.0]), (len(t), 1))
+
+    window, mode = select_tracking_phase_window(
+        joint_pos=joints, root_pos=root, gravity=gravity, fps=fps)
+
+    assert mode == "loop"
+    assert window.start is not None and window.start > 0
+    assert 0.3 <= (len(t) - 1 - window.start) / fps <= 1.5
+
+
+def test_tracking_phase_window_keeps_large_vertical_motion_one_shot():
+    fps = 30.0
+    t = np.arange(90, dtype=np.float64) / fps
+    joints = np.stack([np.sin(t), np.cos(t)], axis=1)
+    root = np.stack([
+        t, np.zeros_like(t), np.linspace(0.15, 0.80, len(t)),
+    ], axis=1)
+
+    window, mode = select_tracking_phase_window(
+        joint_pos=joints, root_pos=root, gravity=None, fps=fps)
+
+    assert mode == "hold"
+    assert window == slice(None)
 
 
 # ── tracking-reward source generation ────────────────────────────────────
@@ -221,7 +255,9 @@ def test_tracking_first_reward_scores_reference_and_supports_cpu_batch():
     info = {
         "episode_length": 0.0,
         "step_dt": 1.0 / 30.0,
-        "base_height": float(ns["REFERENCE_ROOT_Z"][0]),
+        # Simulator and reference origins may differ; displacement does not.
+        "base_height": 0.74,
+        "base_height_delta": 0.0,
         "fallen": 0.0,
     }
     matched, components = ns["compute_reward"]({}, None, next_state, info)
@@ -229,7 +265,9 @@ def test_tracking_first_reward_scores_reference_and_supports_cpu_batch():
         "qpos": next_state["qpos"] + 1.0,
         "qvel": next_state["qvel"] + 3.0,
     }
-    perturbed_info = dict(info, base_height=info["base_height"] + 0.4)
+    perturbed_info = dict(
+        info, base_height=info["base_height"] + 0.4,
+        base_height_delta=0.4)
     perturbed, _ = ns["compute_reward"](
         {}, None, perturbed_state, perturbed_info,
     )
@@ -245,6 +283,7 @@ def test_tracking_first_reward_scores_reference_and_supports_cpu_batch():
         "episode_length": torch.zeros(2),
         "step_dt": torch.full((2,), 1.0 / 30.0),
         "base_height": torch.full((2,), info["base_height"]),
+        "base_height_delta": torch.zeros(2),
         "fallen": torch.zeros(2),
     }
     rewards, batch_components = ns["compute_reward_batched"](
@@ -253,6 +292,35 @@ def test_tracking_first_reward_scores_reference_and_supports_cpu_batch():
     assert rewards.shape == (2,)
     assert torch.isfinite(rewards).all()
     assert torch.all(batch_components["residual_task"] == 0.0)
+
+
+def test_tracking_first_locomotion_prior_wraps_repeatable_gait():
+    n = 180
+    fps = 60.0
+    t = np.arange(n, dtype=np.float64) / fps
+    phase = 2.0 * np.pi * t / 0.75
+    clip = {
+        "root_pos_z": 0.05 + 0.02 * np.sin(phase),
+        "root_pos_xy": np.stack([0.8 * t, np.zeros_like(t)], axis=1),
+        "fps": fps,
+        "joint_pos": np.stack([np.sin(phase), np.cos(phase)], axis=1),
+        "joint_names": ["left_hip_pitch_joint", "right_hip_pitch_joint"],
+    }
+    src = generate_tracking_residual_reward_source(
+        clip=clip, clip_id="translation-gait")
+    ns: dict = {}
+    exec(compile(src, "looping_tracking", "exec"), ns)  # noqa: S102
+
+    assert ns["REFERENCE_PHASE_MODE"] == "loop"
+    assert ns["REWARD_SPEC"]["composition"]["root_height_frame"] == (
+        "episode_relative")
+    start = ns["_phase_index_scalar"]({
+        "episode_length": 0.0, "step_dt": 0.02})
+    wrapped = ns["_phase_index_scalar"]({
+        "episode_length": ns["REFERENCE_DURATION_S"] / 0.02,
+        "step_dt": 0.02,
+    })
+    assert start == wrapped == 0
 
 
 def test_tracking_first_validator_allows_hooks_but_freezes_composition():
@@ -291,7 +359,7 @@ def test_tracking_first_validator_allows_hooks_but_freezes_composition():
     }
     info = {
         "episode_length": 0.0, "step_dt": 1.0 / 30.0,
-        "base_height": float(child_ns["REFERENCE_ROOT_Z"][0]),
+        "base_height": 0.74, "base_height_delta": 0.0,
         "fallen": 0.0,
     }
     _, components = child_ns["compute_reward"]({}, None, next_state, info)
@@ -310,6 +378,23 @@ def test_tracking_first_validator_allows_hooks_but_freezes_composition():
         _validate_reference_tracking_contract(
             mod=SimpleNamespace(**weakened_ns), source=weakened,
             components=weakened_components, parent=parent,
+            parent_kernel_hash=parent_hash,
+        )
+
+    # Temporal semantics are part of the motion prior too: an edit cannot
+    # relabel a one-shot reference as looping (or hide its height frame) while
+    # leaving the target arrays untouched.
+    phase_drift = child_source.replace(
+        '"phase_mode": \'hold\'', '"phase_mode": \'loop\'', 1)
+    phase_drift_ns: dict = {}
+    exec(compile(
+        phase_drift, "phase_drift_tracking", "exec"), phase_drift_ns)  # noqa: S102
+    _, phase_drift_components = phase_drift_ns["compute_reward"](
+        {}, None, next_state, info)
+    with pytest.raises(EditValidationError, match="changed phase_mode"):
+        _validate_reference_tracking_contract(
+            mod=SimpleNamespace(**phase_drift_ns), source=phase_drift,
+            components=phase_drift_components, parent=parent,
             parent_kernel_hash=parent_hash,
         )
 

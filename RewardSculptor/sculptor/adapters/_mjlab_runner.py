@@ -8,12 +8,11 @@ means the UI / health-check / adapter-instantiation paths never pay the
 import cost, per the lazy-import rule in MJLAB_PIVOT_DESIGN §7.
 
 Reward injection: when `--reward-module-path` is passed, the runner
-patches the loaded task cfg's `rewards` dict to contain a single active
-term (`SculptorRewardTerm`) and zeroes the weight of every task-shipped
-term. `cfg.scale_rewards_by_dt` is set to False so the reward module's
-raw per-step return survives without dt-scaling. When `--reward-module-path`
-is omitted, training uses the task's default reward terms unchanged —
-useful for the GPU smoke test.
+adds `SculptorRewardTerm` and attenuates task-shipped terms to a 0.3x
+realism floor. `cfg.scale_rewards_by_dt` is set to False so the reward
+module's raw per-step return survives without dt-scaling. When
+`--reward-module-path` is omitted, training uses the task's default
+reward terms unchanged (useful for the GPU smoke test).
 """
 
 from __future__ import annotations
@@ -189,6 +188,25 @@ _DEFAULT_SCHEMA_KEYS = (
 )
 
 
+def _episode_relative_base_height(base_z, episode_length, anchor):
+    """Return per-env height displacement and the refreshed reset anchor.
+
+    Reference datasets disagree on whether root Z is absolute, ground-relative,
+    or normalized to start at zero.  The invariant that transfers across
+    embodiments and authored terrain is vertical *change from this episode's
+    reset*.  Capture the first observed height after every reset and never
+    share it across environments.
+    """
+    import torch
+
+    if (anchor is None or anchor.shape != base_z.shape
+            or anchor.device != base_z.device or anchor.dtype != base_z.dtype):
+        anchor = torch.full_like(base_z, float("nan"))
+    fresh = (episode_length <= 1.0) | ~torch.isfinite(anchor)
+    anchor = torch.where(fresh, base_z.detach(), anchor)
+    return base_z - anchor, anchor
+
+
 def _build_sculptor_term_class(
     schema_keys: tuple[str, ...], robot_capability: Any | None = None,
     world_bundle: Any | None = None,
@@ -231,6 +249,7 @@ def _build_sculptor_term_class(
                     env, catalog=world_bundle.channel_catalog,
                     manifest=world_bundle.manifest)
             self._prev = self._snapshot(env)
+            self._base_height_anchor = None
 
         @staticmethod
         def _find_articulated_entity(env):
@@ -501,14 +520,19 @@ def _build_sculptor_term_class(
                 fallen = (proj_g_z_b >= 0.0).to(dtype=action.dtype)
             except Exception:  # noqa: BLE001
                 fallen = torch.zeros(env.num_envs, device=env.device, dtype=action.dtype)
+            episode_length = env.episode_length_buf.float()
+            base_height_delta, self._base_height_anchor = (
+                _episode_relative_base_height(
+                    base_z, episode_length, self._base_height_anchor))
             info = {
-                "episode_length": env.episode_length_buf.float(),
+                "episode_length": episode_length,
                 "terminated": env.termination_manager.terminated.float(),
                 "time_outs": env.termination_manager.time_outs.float(),
                 "step_dt": torch.full(
                     (env.num_envs,), float(env.step_dt), device=env.device
                 ),
                 "base_height": base_z,
+                "base_height_delta": base_height_delta,
                 "fallen": fallen,
             }
             # §Ship 46: per-foot kick channels (contact / swing speed /
@@ -533,6 +557,8 @@ def _build_sculptor_term_class(
         def reset(self, env_ids):  # type: ignore[no-untyped-def]
             for k in list(self._prev.keys()):
                 self._prev[k][env_ids] = 0.0
+            if self._base_height_anchor is not None:
+                self._base_height_anchor[env_ids] = float("nan")
             if self._world_reward_runtime is not None:
                 self._world_reward_runtime.reset(env_ids)
 

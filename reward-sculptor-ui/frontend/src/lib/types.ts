@@ -162,6 +162,9 @@ export interface RewardComposition {
   reference_target_sha256: string | null;
   tracking_weight: number;
   residual_max: number;
+  phase_mode?: "loop" | "hold" | string;
+  phase_duration_s?: number;
+  root_height_frame?: "episode_relative" | string;
 }
 
 export interface RewardSpec {

@@ -186,7 +186,10 @@ _INFO_KEYS: list[str] = [
     # frame Z of the root link; `fallen` is a bool tensor, True when
     # the base is inverted enough that gravity projects upward in
     # the body frame (robot is clearly not in a recoverable pose).
-    "base_height", "fallen",
+    # ``base_height_delta`` is measured from each environment's own reset
+    # height, so motion priors can track vertical displacement on any robot,
+    # terrain elevation, or platform spawn without assuming a nominal height.
+    "base_height", "base_height_delta", "fallen",
 ]
 
 # §Ship 46: extra info keys surfaced for the G1 humanoid so a sculpted
@@ -202,7 +205,7 @@ _INFO_KEYS: list[str] = [
 # keys are advertised ONLY for the G1 biped (which has 'left_foot' /
 # 'right_foot' sites that fix the per-foot column order across the
 # contact / height / site-velocity tensors); other robots keep the
-# 6-key base contract and the runner emits zeros they never reference.
+# universal base contract and the runner emits zeros they never reference.
 # `base_horizontal_speed` lets the diagnoser tell standing from walking
 # (info previously had no base velocity, so a forward walker read as
 # "standing still").

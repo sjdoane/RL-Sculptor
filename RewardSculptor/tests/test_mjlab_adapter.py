@@ -730,6 +730,26 @@ def test_snapshots_to_trajectory_fills_missing_keys_with_last_seen() -> None:
 # CPU-only — fakes the mjlab sensor/entity API so the hot path is exercised
 # without a GPU or the mjlab package.
 
+def test_episode_relative_base_height_is_per_env_and_reset_safe() -> None:
+    pytest.importorskip("torch")
+    import torch
+    from sculptor.adapters._mjlab_runner import _episode_relative_base_height
+
+    anchor = None
+    delta, anchor = _episode_relative_base_height(
+        torch.tensor([0.74, 1.10]), torch.tensor([1.0, 1.0]), anchor)
+    assert torch.allclose(delta, torch.zeros(2))
+    delta, anchor = _episode_relative_base_height(
+        torch.tensor([0.82, 1.06]), torch.tensor([2.0, 2.0]), anchor)
+    assert torch.allclose(delta, torch.tensor([0.08, -0.04]), atol=1e-6)
+
+    # Only env 1 reset; env 0 retains its own original episode anchor.
+    anchor[1] = float("nan")
+    delta, anchor = _episode_relative_base_height(
+        torch.tensor([0.85, 0.66]), torch.tensor([3.0, 1.0]), anchor)
+    assert torch.allclose(delta, torch.tensor([0.11, 0.0]), atol=1e-6)
+
+
 def _make_term():
     """Build a SculptorRewardTerm and bypass __init__ (which needs a real
     env + reward module). _foot_info / _resolve_foot_handles only touch

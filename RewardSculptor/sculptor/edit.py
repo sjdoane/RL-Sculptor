@@ -839,7 +839,10 @@ def _validate_reference_tracking_contract(
         raise EditValidationError(
             "tracking-first contract removed: preserve "
             "REWARD_SPEC.composition.type='reference_tracking_residual'")
-    for key in ("reference_clip_id", "reference_target_sha256"):
+    for key in (
+        "reference_clip_id", "reference_target_sha256", "phase_mode",
+        "phase_duration_s", "root_height_frame",
+    ):
         if child.get(key) != parent.get(key):
             raise EditValidationError(
                 f"tracking-first contract changed {key}: preserve the attached "
