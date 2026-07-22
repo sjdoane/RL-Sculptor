@@ -969,3 +969,24 @@ selection produced actor shape `(2, 168)` with five authored region vectors and
 the 54-ray authored scan, command ranges `(0.45,1.0)/(0,0)/(0,0)`, no command
 curriculum, and finite `(2,3)` finish-relative samples. The invalid run
 `job_08a12eb8b01dea07` was stopped before relaunch.
+
+## Compound prompt validator chronology fix 2026-07-22 (Codex)
+
+The remaining Go1 no-trajectory failure was a chronology bug in the shared
+abstract-objective compiler, not a need for a robot-specific demonstration.
+For “jump from each box to the next, pause on each, jump as far as possible,
+land, then run,” the compiler previously dropped the explicit landing and the
+terminal run. The generated metric therefore required post-landing evidence
+that its independent competent validator never performed, and every validation
+archetype scored exactly zero.
+
+The compiler now treats `jump_off` and an explicitly requested `land` as
+separate phases, recognizes run/sprint/dash/race language, and defers that
+planar phase until after a staged climb/jump/landing course. The exact prompt
+now compiles to `climb, dwell, climb, dwell, jump_off, land, move_forward`,
+which is also what both recent Go1 metric candidates independently declared.
+The existing embodiment-neutral retargeter supplies the kinematics, contact
+schedule, and authored-world competent channels; a stored trajectory remains
+optional. The active G1 slalom job was cooperatively stopped before editing the
+reload-watched core so its partial artifacts were not killed mid-write. No
+tests or test-like validation commands were run, per Sam's explicit request.

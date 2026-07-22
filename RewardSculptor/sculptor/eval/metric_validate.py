@@ -795,14 +795,26 @@ def _abstract_objective_program(
             if wants_dwell:
                 phases.append("dwell")
 
-    if planar_route or (has("forward", "forwards", "ahead") and not staged_climb):
-        phases.append("move_forward")
+    # Resolve the requested planar phase once, but preserve its position in a
+    # compound course.  In "climb the boxes, jump off, land, then run", the
+    # run is a terminal phase; emitting it before ``jump_off`` gave the
+    # prompt-only competent probe the wrong chronology and made every honest
+    # metric score it zero.  Route-only goals retain their historical order.
+    planar_phase: Optional[str] = None
+    wants_run = has(
+        "run", "runs", "running", "sprint", "sprints", "sprinting",
+        "dash", "dashes", "dashing", "race", "races", "racing",
+    )
+    if planar_route or has("forward", "forwards", "ahead") or wants_run:
+        planar_phase = "move_forward"
     elif has("backward", "backwards", "reverse"):
-        phases.append("move_backward")
+        planar_phase = "move_backward"
     elif has("left"):
-        phases.append("move_left")
+        planar_phase = "move_left"
     elif has("right"):
-        phases.append("move_right")
+        planar_phase = "move_right"
+    if planar_phase is not None and not staged_climb:
+        phases.append(planar_phase)
 
     wants_jump = has(
         "jump", "jumps", "jumping", "hop", "hops", "hopping", "leap",
@@ -828,8 +840,15 @@ def _abstract_objective_program(
             phases.append("jump_off" if leap or has("onto") else "jump")
     elif staged_climb and has("launch", "launches", "launching"):
         phases.append("jump_off")
-    if has("land", "lands", "landing") and (not phases or phases[-1] != "jump_off"):
+    # ``jump_off`` describes the airborne transfer; an explicitly requested
+    # landing is a separate completion phase and must not be silently folded
+    # away.  Metrics commonly gate on a stable post-impact state.
+    if has("land", "lands", "landing") and (
+        not phases or phases[-1] != "land"
+    ):
         phases.append("land")
+    if staged_climb and planar_phase is not None:
+        phases.append(planar_phase)
     if has("crouch", "crouches", "crouching", "squat", "squats", "squatting"):
         phases.append("crouch")
     if has("bend", "bends", "bending", "bow", "bows", "lean", "leans", "tilt"):
