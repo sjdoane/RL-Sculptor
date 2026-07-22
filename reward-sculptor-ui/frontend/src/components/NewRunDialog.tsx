@@ -27,6 +27,8 @@ const LEGACY_SECONDS_PER_CYCLE: Record<string, number> = {
   gym_sb3: 180,
 };
 
+const MAX_BEHAVIOR_GOAL_LENGTH = 500;
+
 const MJLAB_TIMING: Record<string, {
   fixedSeconds: number;
   secondsPerTrainingIter: number;
@@ -384,6 +386,12 @@ export function NewRunDialog({
   // a client-side timeout scaled by n_candidates, so isPending ALWAYS
   // resolves — no more frozen "Generating…" spinner on a dropped connection.
   const runGenerate = () => {
+    if (behavior.trim().length > MAX_BEHAVIOR_GOAL_LENGTH) {
+      toast.error("Behavior goal too long", {
+        description: `Use at most ${MAX_BEHAVIOR_GOAL_LENGTH} characters.`,
+      });
+      return;
+    }
     genMetric.mutate(
       { behavior_goal: behavior.trim(), n_candidates: metricCandidates },
       {
@@ -418,6 +426,12 @@ export function NewRunDialog({
   const submit = async () => {
     if (behavior.trim().length < 4) {
       toast.error("Behavior goal too short", { description: "At least 4 chars." });
+      return;
+    }
+    if (behavior.trim().length > MAX_BEHAVIOR_GOAL_LENGTH) {
+      toast.error("Behavior goal too long", {
+        description: `Use at most ${MAX_BEHAVIOR_GOAL_LENGTH} characters.`,
+      });
       return;
     }
     if (!dryRun && systemInfo.data?.anthropic_api_key_set === false) {
@@ -744,15 +758,21 @@ export function NewRunDialog({
 
           {tab === "basic" ? (
             <>
-              <Field label="Behavior goal" htmlFor="run-goal">
+              <Field
+                label="Behavior goal"
+                htmlFor="run-goal"
+                hint={`${behavior.length}/${MAX_BEHAVIOR_GOAL_LENGTH}`}
+              >
                 <textarea
                   id="run-goal"
                   className="rs-textarea"
                   value={behavior}
-                  onChange={(e) => setBehavior(e.target.value)}
+                  onChange={(e) => setBehavior(
+                    e.target.value.slice(0, MAX_BEHAVIOR_GOAL_LENGTH),
+                  )}
                   placeholder="Run forward as fast as possible without falling."
                   style={{ minHeight: 84 }}
-                  maxLength={500}
+                  maxLength={MAX_BEHAVIOR_GOAL_LENGTH}
                   disabled={launch.isPending}
                   autoFocus
                 />
