@@ -158,6 +158,37 @@ def _compute_playback_fps(
     return max(1.0, min(derived, 240.0))
 
 
+def _freeze_invalid_first_episode_steps(
+    values: Any, valid_mask: Any,
+) -> Any:
+    """Replace post-reset samples with the last first-episode state.
+
+    mjlab auto-resets an environment *inside* ``step`` before returning.  A
+    state sampled on a done step therefore belongs to the next episode and
+    creates a teleport in the recorded trajectory.  Objective metrics then
+    misread the reset displacement as extreme terminal speed and erase real
+    course progress.  Keep the rectangular ``(T, N, ...)`` contract while
+    making its padding absorbing: after an environment's first invalid state,
+    repeat its last valid state rather than stitching in a new attempt.
+
+    ``valid_mask`` is persisted separately so mask-aware consumers can still
+    distinguish measured samples from absorbing padding.  A malformed input
+    is returned unchanged; rollout telemetry must never crash artifact write.
+    """
+    import numpy as np
+
+    array = np.asarray(values)
+    mask = np.asarray(valid_mask, dtype=bool)
+    if array.ndim < 2 or mask.ndim != 2 or array.shape[:2] != mask.shape:
+        return array
+    frozen = array.copy()
+    for step in range(1, array.shape[0]):
+        invalid = ~mask[step]
+        if np.any(invalid):
+            frozen[step, invalid] = frozen[step - 1, invalid]
+    return frozen
+
+
 def _snapshots_to_trajectory(
     snapshots: list[dict[str, float]],
 ) -> dict[str, list[float]]:
@@ -2531,6 +2562,11 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
     left_foot_pos_b_buf: list[np.ndarray] = []
     right_foot_pos_b_buf: list[np.ndarray] = []
     per_term_reward_buf: dict[str, list[np.ndarray]] = {}
+    # Post-step mjlab state is already reset for environments whose `done`
+    # fired.  These masks let artifact finalization preserve only each env's
+    # first episode instead of stitching the reset attempt onto it.
+    first_episode_state_valid_buf: list[np.ndarray] = []
+    first_episode_action_valid_buf: list[np.ndarray] = []
 
     # Resolve the articulated robot entity once — mirrors the discovery
     # logic in `SculptorRewardTerm._find_articulated_entity` so fixed-base
@@ -2608,33 +2644,51 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
 
     t0 = time.time()
     for step in range(max_steps):
+        active_before = ~ep_done
         with torch.inference_mode():
             action = policy(obs)
         obs, rew, dones, _extras = wrapped.step(action)
+        dones_bool = dones.bool()
+        state_valid = active_before & (~dones_bool)
+        first_episode_state_valid_buf.append(
+            state_valid.detach().cpu().numpy().astype(bool, copy=False))
+        first_episode_action_valid_buf.append(
+            active_before.detach().cpu().numpy().astype(bool, copy=False))
         if world_channel_recorder is not None:
             # Sample every catalogued task observable at the same cadence as
             # base trajectory state. Missing/malformed producers fail the
             # authored rollout instead of silently emitting a partial NPZ.
             world_channel_recorder.append()
+            # The recorder owns independent NumPy route/hold state.  Keep it
+            # synchronized with mjlab's automatic per-env reset even though
+            # finalized first-episode arrays absorb all later samples.
+            try:
+                done_ids = np.flatnonzero(
+                    dones_bool.detach().cpu().numpy().astype(bool, copy=False))
+                if done_ids.size:
+                    world_channel_recorder.runtime.reset(done_ids)
+            except Exception as e:  # noqa: BLE001
+                print(f"[runner] authored recorder reset skipped: "
+                      f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
         if manip_recorder is not None:
             # mjlab auto-resets before returning from a done step, so that
             # step's scene state belongs to the next episode. Persist the
             # boundary explicitly; metrics must never stitch attempts across
             # it. `ep_done` freezes the mask after each env's first episode.
             try:
-                first_done = dones.bool() & (~ep_done)
+                first_done = dones_bool & (~ep_done)
                 manip_recorder.append(
-                    valid_mask=(~ep_done) & (~dones.bool()),
+                    valid_mask=(~ep_done) & (~dones_bool),
                     terminal_mask=first_done,
                 )
             except Exception as e:  # noqa: BLE001
                 print(f"[runner] manipulation-telemetry step skipped: "
                       f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
         # Freeze cumulative return/length on the first `done` per env.
-        active = (~ep_done).float()
+        active = active_before.float()
         ep_return += rew * active
         ep_length += active.int()
-        ep_done |= dones.bool()
+        ep_done |= dones_bool
 
         # Record env[0]'s step reward as a representative trajectory
         # (preserves the old single-env semantics for downstream
@@ -2761,14 +2815,6 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
     ep_returns = ep_return[:n_episodes].detach().cpu().tolist()
     ep_lengths = ep_length[:n_episodes].detach().int().cpu().tolist()
 
-    print("[SCULPT-EVENT] " + json.dumps({
-        "type": "rollout_done",
-        "n_episodes": n_episodes,
-        "total_steps": step + 1,
-        "frames_recorded": len(frames),
-        "elapsed_s": round(time.time() - t0, 1),
-    }), flush=True)
-
     # Write video.
     import subprocess
     import shutil
@@ -2849,6 +2895,11 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
             [e for e, L in enumerate(ep_lengths) for _ in range(L)], dtype=np.int32
         ),
     }
+    state_valid_mask = np.stack(
+        first_episode_state_valid_buf, axis=0).astype(bool, copy=False)
+    action_valid_mask = np.stack(
+        first_episode_action_valid_buf, axis=0).astype(bool, copy=False)
+    trajectory["first_episode_valid_mask"] = state_valid_mask
     for key, buf in (
         ("joint_pos", joint_pos_buf),
         ("joint_vel", joint_vel_buf),
@@ -2864,13 +2915,23 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
     ):
         arr = _stack_if_consistent(buf)
         if arr is not None:
-            trajectory[key] = arr
+            valid = action_valid_mask if key == "action" else state_valid_mask
+            trajectory[key] = _freeze_invalid_first_episode_steps(arr, valid)
     for name, arrs in per_term_reward_buf.items():
         stacked = _stack_if_consistent(arrs)
         if stacked is not None:
-            trajectory[f"reward_term__{name}"] = stacked
+            trajectory[f"reward_term__{name}"] = (
+                _freeze_invalid_first_episode_steps(
+                    stacked, action_valid_mask))
     if world_channel_recorder is not None:
-        trajectory.update(world_channel_recorder.finalize())
+        world_arrays = world_channel_recorder.finalize()
+        trajectory.update({
+            key: (
+                _freeze_invalid_first_episode_steps(value, state_valid_mask)
+                if np.asarray(value).ndim >= 2 else value
+            )
+            for key, value in world_arrays.items()
+        })
     if manip_recorder is not None:
         try:
             manip_arrays = {
@@ -2946,6 +3007,18 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
             f"{type(e).__name__}: {e}",
             file=sys.stderr, flush=True,
         )
+
+    # This event is the backend's cue to inspect/transcode the video.  Emit it
+    # only after ffmpeg, trajectory, behavior, and limits files are closed;
+    # emitting before encoding raced the UI clip worker against an incomplete
+    # MP4 (`moov atom not found`) even though the final video was valid.
+    print("[SCULPT-EVENT] " + json.dumps({
+        "type": "rollout_done",
+        "n_episodes": n_episodes,
+        "total_steps": step + 1,
+        "frames_recorded": len(frames),
+        "elapsed_s": round(time.time() - t0, 1),
+    }), flush=True)
 
     env.close()
     print(json.dumps({"status": "ok", "video": str(video_path)}))

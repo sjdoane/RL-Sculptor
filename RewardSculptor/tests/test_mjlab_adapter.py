@@ -1008,3 +1008,44 @@ def test_compute_playback_fps_clamps_playback_speed() -> None:
     assert _compute_playback_fps(
         step_dt=0.02, render_every=1, playback_speed=100.0,
     ) == pytest.approx(240.0)
+
+
+def test_first_episode_freeze_removes_auto_reset_teleport() -> None:
+    """A done-step state is the next episode and must become absorbing padding."""
+    import numpy as np
+
+    from sculptor.adapters._mjlab_runner import (
+        _freeze_invalid_first_episode_steps,
+    )
+
+    root = np.asarray([
+        [[0.0, 0.0], [10.0, 0.0]],
+        [[1.0, 0.0], [11.0, 0.0]],
+        [[0.0, 0.0], [12.0, 0.0]],  # env 0 auto-reset to spawn
+        [[0.2, 0.0], [10.0, 0.0]],  # both are now later attempts
+    ])
+    valid = np.asarray([
+        [True, True],
+        [True, True],
+        [False, True],
+        [False, False],
+    ])
+
+    frozen = _freeze_invalid_first_episode_steps(root, valid)
+
+    np.testing.assert_array_equal(frozen[:, 0, 0], [0.0, 1.0, 1.0, 1.0])
+    np.testing.assert_array_equal(frozen[:, 1, 0], [10.0, 11.0, 12.0, 12.0])
+    assert not np.shares_memory(frozen, root)
+
+
+def test_first_episode_freeze_fails_soft_on_incompatible_mask() -> None:
+    import numpy as np
+
+    from sculptor.adapters._mjlab_runner import (
+        _freeze_invalid_first_episode_steps,
+    )
+
+    values = np.arange(6).reshape(3, 2)
+    result = _freeze_invalid_first_episode_steps(
+        values, np.ones((2, 2), dtype=bool))
+    np.testing.assert_array_equal(result, values)

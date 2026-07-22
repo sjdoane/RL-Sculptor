@@ -19,15 +19,22 @@ Open **Projects → G1 Lab Showcase — Weave and Stop**.
 - Adapter: `mjlab`
 - Task: `Mjlab-Velocity-Flat-Unitree-G1`
 - Device: `cuda:0`
-- Promoted selection: `v8` (`38d2e98950c3…`)
+- Promoted authored tuple: `38d2e98950c3…` (selection revisions preserve
+  the identical frozen tuple)
 - Evaluation lineage: `world-58560025c10981814943d42e`
 - Objective metric: `gen_003` (accepted, prompt-native, observe-only)
-- Active showcase job: `job_00197adcc90c9911`
+- Latest completed showcase job: `80d549c83b41a134`
 
-The active job is still training at the time this guide was updated. It has
-demonstrated real ordered learning through waypoint 2, but not yet waypoint 3;
-that is progress evidence, not a completion claim. Replace this paragraph with
-the final selected-iteration evidence after the official rollout finishes.
+The July 22 iter-3 rollout completed the ordered route in 59/64 environments;
+58/64 asserted authored success and 51/64 both completed and avoided every
+box. It is not yet accepted as solved: only one environment satisfied the full
+two-second terminal-stillness gate. The frozen official metric reported zero
+because its last sample was MJLab's automatic reset-to-spawn frame, which
+looked like a 3.92 m/s teleport and erased signed displacement. A first-episode
+artifact-boundary fix and longer final-target braking are verified and queued
+for the next UI resume. Treat the old `fit 0.00 / prog 0.005` card as preserved
+historical evidence of that capture defect, not as evidence that the robot
+failed to traverse the course.
 
 ## One-time startup
 

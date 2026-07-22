@@ -306,6 +306,9 @@ def test_waypoint_velocity_command_turns_and_stops_per_environment() -> None:
 
     robot.data.root_link_pos_w[0, :2] = torch.tensor([2.0, -1.0])
     term._update_command()
+    terminal_approach_speed = torch.linalg.norm(term.command[0, :2])
+    assert 0 < terminal_approach_speed < term.cfg.cruise_speed_mps
+    assert term.cfg.terminal_slow_radius_m > term.cfg.slow_radius_m
     robot.data.root_link_pos_w[0, :2] = torch.tensor([3.0, 0.0])
     term._update_command()
     assert term._waypoint_index.tolist() == [3, 0]

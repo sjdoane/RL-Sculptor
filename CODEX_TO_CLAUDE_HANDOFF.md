@@ -1146,3 +1146,40 @@ Verification: focused metric + warm-start suites 144 passed; broad CPU suite
 `git diff --check` passed. Scoped Ruff still reports only historical E702/F401/
 F841 findings in the long pre-existing validator/test modules, with no finding
 on the newly added composition or recovery lines.
+
+## Official iter-3 slalom audit + reset-safe terminal phase 2026-07-22 (Codex)
+
+UI job `80d549c83b41a134` completed cleanly from the recovered iter-3 policy.
+The frozen official card says `fit 0.00 / progress 0.005`, but trajectory and
+video inspection isolated two different facts that must not be conflated:
+
+- Route competence is real: 59/64 environments reached ordered waypoint index
+  5, 58/64 asserted authored success, 51/64 completed without any forbidden
+  box contact, and no environment fell. The full 20-second 1080p video is
+  valid and visibly shows traversal; its earlier `moov atom not found` clip
+  warning was a race while ffmpeg was still writing.
+- Terminal stillness remains incomplete: after excluding the automatic reset
+  sample, terminal speed averaged 0.145 m/s and only one environment satisfied
+  the exact continuous two-second `<0.12 m/s` gate. This is not yet a solved
+  claim.
+
+MJLab auto-resets inside `step`. The runner recorded that next-episode state as
+the final trajectory row: every root jumped roughly 7.6 m back to its spawn
+while goal channels remained complete. `gen_003` therefore measured 3.92 m/s
+terminal speed and 0.019 m net travel. Removing only that reset row raises the
+same frozen metric's dense progress from 0.005 to 0.810 and exposes the one
+true full-gate environment, without changing the underlying policy.
+
+Subsequent rollouts now persist a per-environment first-episode validity mask
+and replace post-reset samples with absorbing last-valid state instead of
+stitching a second attempt. The authored channel recorder's private route state
+is reset per done environment. The finish command also uses a longer 2 m
+braking approach only for the final target, while intermediate gates retain
+their crossing-speed floor. Finally, `rollout_done` is emitted only after the
+MP4 and all artifacts are fully closed, eliminating the UI clip race. None of
+this rewrites the frozen iter-3 evidence.
+
+Verification: focused compiler/runner/runtime 60 passed; focused channel,
+generated-metric, fitness, and realism 137 passed; broad CPU suite 2,215
+passed / 1 expected optional-JAX skip in 4m35s; scoped Ruff, compileall, and
+`git diff --check` passed before commit.

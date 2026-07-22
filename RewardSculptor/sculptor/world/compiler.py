@@ -485,8 +485,19 @@ def _waypoint_velocity_command_types() -> tuple[type[Any], type[Any]]:
             delta_w = target - local_xy
             distance = torch.linalg.norm(delta_w, dim=-1)
             direction_w = delta_w / torch.clamp(distance[:, None], min=1e-6)
-            speed = float(self.cfg.cruise_speed_mps) * torch.clamp(
+            # Intermediate gates need a non-zero crossing speed, but the
+            # terminal target is qualitatively different: the prompted dwell
+            # begins immediately after entry.  Start braking over a longer
+            # terminal approach so the command does not jump from ~0.4 m/s to
+            # zero at the finish tolerance boundary.
+            terminal_target = self._waypoint_index == last
+            normal_scale = torch.clamp(
                 distance / float(self.cfg.slow_radius_m), min=0.35, max=1.0)
+            terminal_scale = torch.clamp(
+                distance / float(self.cfg.terminal_slow_radius_m),
+                min=0.0, max=1.0)
+            speed = float(self.cfg.cruise_speed_mps) * torch.where(
+                terminal_target, terminal_scale, normal_scale)
             speed = torch.where(complete, torch.zeros_like(speed), speed)
             velocity_w = direction_w * speed[:, None]
 
@@ -520,6 +531,7 @@ def _waypoint_velocity_command_types() -> tuple[type[Any], type[Any]]:
         tolerance_m: float = 0.25
         cruise_speed_mps: float = 0.8
         slow_radius_m: float = 0.75
+        terminal_slow_radius_m: float = 2.0
         turn_gain: float = 2.0
         max_yaw_rate: float = 1.5
 
@@ -1698,9 +1710,11 @@ def _reconcile_waypoint_course(
                     or 0.25
                 ),
                 cruise_speed_mps=0.8,
+                terminal_slow_radius_m=2.0,
             )
             adjustments.append(
-                f"command:{name}→goal-conditioned waypoint traversal")
+                f"command:{name}→goal-conditioned waypoint traversal "
+                f"with terminal braking")
 
     curriculum = getattr(env_cfg, "curriculum", None)
     if isinstance(curriculum, dict):
