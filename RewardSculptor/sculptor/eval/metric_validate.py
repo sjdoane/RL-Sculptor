@@ -787,7 +787,9 @@ def _abstract_objective_program(
     return phases[:12]
 
 
-def _abstract_objective_probe(phases: Sequence[str]) -> Optional[dict[str, np.ndarray]]:
+def _abstract_objective_probe(
+    phases: Sequence[str], *, behavior_goal: Optional[str] = None,
+) -> Optional[dict[str, np.ndarray]]:
     """Retarget an abstract phase program onto the validator's universal channels.
 
     This is a kinematic *validator exemplar*, not a stored robot trajectory.  Root and
@@ -799,6 +801,17 @@ def _abstract_objective_probe(phases: Sequence[str]) -> Optional[dict[str, np.nd
     clean = [str(p) for p in phases if str(p) in _ABSTRACT_PHASES][:12]
     if not clean:
         return None
+    goal_tokens = set(re.findall(r"[a-z]+", (behavior_goal or "").lower()))
+    # ``climb`` is intentionally embodiment-neutral and can mean a supported
+    # stair ascent or a ballistic box mount.  Preserve that distinction from
+    # the prompt: only mount/parkour/jump language gives climb phases a flight
+    # window.  This lets honest box-chain metrics count takeoff/landing events
+    # without teaching every generic climb to hop.
+    airborne_climb = bool(goal_tokens & {
+        "box", "boxes", "hop", "hops", "hopping", "jump", "jumps",
+        "jumping", "leap", "leaps", "leaping", "mount", "mounting",
+        "parkour", "vault", "vaulting",
+    })
 
     root = np.zeros((T, E, 3), dtype=np.float64)
     root[..., 2] = 0.55
@@ -836,6 +849,12 @@ def _abstract_objective_probe(phases: Sequence[str]) -> Optional[dict[str, np.nd
         [duration_weight.get(phase, 1.0) for phase in clean],
         dtype=np.float64,
     )
+    if clean[-1] in {"dwell", "land", "recover"}:
+        # The final task state is where objective metrics verify settle/hold
+        # completion.  Reserve a full half-second-scale tail even in a long
+        # compound program; otherwise its window bleeds into the last motion
+        # phase and a correct final-stillness gate observes non-zero speed.
+        weights[-1] = max(weights[-1], 4.0)
     cumulative = np.concatenate(([0.0], np.cumsum(weights)))
     bounds = start + np.rint(
         (T - start) * cumulative / cumulative[-1]
@@ -917,7 +936,9 @@ def _abstract_objective_probe(phases: Sequence[str]) -> Optional[dict[str, np.nd
         # airborne window; a kick swings the left foot forward (signed anterior +x)
         # so a foot-direction metric reads a correctly-directed strike. Every window
         # ENDS grounded (touchdown), so the final frame certifies a landed stance.
-        if phase == "jump":
+        if phase == "climb" and airborne_climb:
+            air = (u > 0.12) & (u < 0.78)
+        elif phase == "jump":
             air = np.sin(np.pi * u) > 0.25
         elif phase == "jump_off":
             air = (u > 0.12) & (u < 0.92)
@@ -2101,7 +2122,8 @@ def validate_generated_metric(
     arche = _archetypes()
     abstract_program = _abstract_objective_program(
         behavior_goal, _declared_abstract_objective(source))
-    abstract_probe = _abstract_objective_probe(abstract_program)
+    abstract_probe = _abstract_objective_probe(
+        abstract_program, behavior_goal=behavior_goal)
     # The prompt-derived probe anchors non-degeneracy ONLY for a genuine TRAVERSAL /
     # parkour goal, where its ROOT-trajectory signature (climb height + a forward
     # jump-off) is hard to game. For an in-place gesture or a recognized family, the

@@ -101,12 +101,26 @@ def compute_spec(arrays, behavior, meta):
     waypoint = arrays["goal__complete_course__waypoint_index"]
     waypoint_max = float(waypoint.max())
     ordered_steps = float(np.mean((np.diff(waypoint, axis=0) > 0).sum(axis=0) >= 4))
+    left_contact = arrays.get("left_foot_contact")
+    right_contact = arrays.get("right_foot_contact")
+    if left_contact is None or right_contact is None:
+        airborne_hops = 0.0
+    else:
+        flight = (left_contact < 0.5) & (right_contact < 0.5)
+        starts = flight[1:] & (~flight[:-1])
+        airborne_hops = float(np.mean(starts.sum(axis=0) >= 3))
     completed = float(arrays["goal__complete_course__success"].mean())
     physical = float(height_gain > 0.9)
+    final_motion = np.linalg.norm(np.diff(root[-25:], axis=0), axis=-1)
+    final_pause = float(final_motion.mean() < 0.01)
     progress = float(np.clip(waypoint_max / 4.0, 0.0, 1.0))
     return {
-        "spec_score": float(physical * ordered_steps * progress * completed),
+        "spec_score": float(
+            physical * airborne_hops * final_pause
+            * ordered_steps * progress * completed),
         "physical_traversal": physical,
+        "airborne_hops": airborne_hops,
+        "final_stable_pause": final_pause,
         "ordered_waypoint_steps": ordered_steps,
         "waypoint_progress": progress,
         "completion_gate": completed,
