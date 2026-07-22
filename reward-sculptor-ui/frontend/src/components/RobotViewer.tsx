@@ -447,10 +447,22 @@ function LiveStageRollout({ slug, runId, run }: { slug: string; runId: string | 
 
   const latestIter = useMemo(() => {
     let best: number | null = null;
+    let activeIter: number | null = null;
     for (const ev of events.events) {
+      const i = (ev as { iter?: unknown }).iter;
+      if (ev.type === "iter_started" && typeof i === "number") {
+        activeIter = i;
+      }
       if (ev.type === "iter_rolled_out" || ev.type === "rollout_done" || ev.type === "iter_completed") {
-        const i = (ev as { iter?: unknown }).iter;
-        if (typeof i === "number" && (best === null || i > best)) best = i;
+        // The mjlab adapter's `rollout_done` event describes the capture
+        // (steps/frames/timing) but historically omits `iter`. Correlate it
+        // with the latest `iter_started` event so Live can show the finished
+        // clip immediately instead of waiting for the whole iteration (and
+        // its potentially long LLM diagnosis) to commit.
+        const rolloutIter = typeof i === "number" ? i : activeIter;
+        if (rolloutIter !== null && (best === null || rolloutIter > best)) {
+          best = rolloutIter;
+        }
       }
     }
     if (best === null && run && run.iterations_completed > 0) best = run.iterations_completed - 1;
