@@ -853,3 +853,26 @@ Evidence: core 2,178 passed / 1 optional-JAX skip; UI backend 562 passed;
 focused suites 51 + 25 passed; frontend typecheck/build passed; scoped Ruff,
 compileall, and diff check passed. Next: run HANDOFF.md §6 live browser
 verification, fix every UI defect, and commit that evidence before Task 2.
+
+## Prompt-native compound objective validation 2026-07-22 (Codex)
+
+Fixed the live four-box mission's no-reference validation failure without
+introducing robot/task-name special cases. The generated metric already emitted
+an embodiment-neutral `ABSTRACT_OBJECTIVE`, and the promoted World already
+provided competent task-channel fixtures, but the validator evaluated them as
+separate positives: `catalog_competent` inherited a physically still rollout.
+Consequently any honest metric requiring both traversal and waypoint success
+scored zero even though each half of the validator existed.
+
+`metric_validate.py` now composes the prompt-derived task-space traversal with
+the competent authored-channel state for `catalog_competent`. Negative catalog
+cases remain still plus their failing task state, preserving the firewall.
+Phase programs accept up to 12 ordered/repeated phases, and dwell/land/recover
+receive duration-weighted windows; this makes real pause/settle gates possible
+within a fixed 120-frame synthetic rollout (the previous equal eight-way split
+was shorter than smoothing plus the requested hold duration).
+
+No tests were run for this emergency slice, per Sam's explicit request. Editing
+the reloader-watched core file restarted the UI backend and interrupted the old
+in-memory mission job `job_dabcf4eb43259bda`; regenerate the affected stage
+metric in the UI against this committed validator before using it as evidence.

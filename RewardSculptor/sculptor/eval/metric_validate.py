@@ -681,7 +681,7 @@ def _abstract_objective_program(
         raw = declared.get("phases")
         if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)):
             phases = [str(p).strip().lower() for p in raw]
-            phases = [p for p in phases if p in _ABSTRACT_PHASES][:8]
+            phases = [p for p in phases if p in _ABSTRACT_PHASES][:12]
     if phases:
         return phases
 
@@ -747,7 +747,7 @@ def _abstract_objective_program(
         phases.append("kick")
     if has("oscillate", "oscillates", "oscillating", "floss", "flossing", "shake"):
         phases.append("oscillate")
-    return phases[:8]
+    return phases[:12]
 
 
 def _abstract_objective_probe(phases: Sequence[str]) -> Optional[dict[str, np.ndarray]]:
@@ -759,7 +759,7 @@ def _abstract_objective_probe(phases: Sequence[str]) -> Optional[dict[str, np.nd
     the same prompt-derived oracle works for quadrupeds, bipeds, and arms whenever the
     authored metric uses their persisted universal/task channels.
     """
-    clean = [str(p) for p in phases if str(p) in _ABSTRACT_PHASES][:8]
+    clean = [str(p) for p in phases if str(p) in _ABSTRACT_PHASES][:12]
     if not clean:
         return None
 
@@ -784,7 +784,27 @@ def _abstract_objective_probe(phases: Sequence[str]) -> Optional[dict[str, np.nd
     contact_l = np.ones((T, E), dtype=np.float64)
     contact_r = np.ones((T, E), dtype=np.float64)
     start = max(5, int(0.10 * T))
-    bounds = np.linspace(start, T, len(clean) + 1, dtype=int)
+    # A pause is a duration constraint, not an instantaneous pose.  Equal-sized
+    # slices made a multi-waypoint program's dwell windows too short for the
+    # smoothing and hold-time gates that a correct metric is expected to use.
+    # Allocate more of the fixed probe horizon to phases whose meaning requires
+    # persistence, without teaching the validator any robot- or task-specific
+    # joint convention.
+    duration_weight = {
+        "dwell": 2.5,
+        "land": 1.5,
+        "recover": 1.5,
+    }
+    weights = np.asarray(
+        [duration_weight.get(phase, 1.0) for phase in clean],
+        dtype=np.float64,
+    )
+    cumulative = np.concatenate(([0.0], np.cumsum(weights)))
+    bounds = start + np.rint(
+        (T - start) * cumulative / cumulative[-1]
+    ).astype(int)
+    bounds[0] = start
+    bounds[-1] = T
     x = y = 0.0
     z = 0.55
     tilt = 0.0
@@ -2079,8 +2099,19 @@ def validate_generated_metric(
             arrays.update(catalog_fixture_arrays(
                 catalog, time_steps=T, num_envs=E, case=case))
         for name, case in catalog_cases.items():
+            # The authored-world competent case must demonstrate BOTH physical
+            # competence and task-channel completion.  For a prompt-native
+            # traversal there may be no stored trajectory, so compose the
+            # generated abstract task-space exemplar with the competent catalog
+            # state.  Building this case from ``still`` made every sound metric
+            # that conjunctively required motion and waypoint success score zero.
+            competent_base = (
+                arche["prompt_competent"]
+                if name == "catalog_competent" and abstract_is_traversal
+                else arche["still"]
+            )
             fixture_base = {
-                key: value.copy() for key, value in arche["still"].items()
+                key: value.copy() for key, value in competent_base.items()
                 if key in ALLOWED_ARRAYS
             }
             fixture_base.update(catalog_fixture_arrays(
