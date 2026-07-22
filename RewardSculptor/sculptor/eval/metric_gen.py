@@ -13,6 +13,7 @@ metrics run observe-only until calibrated.
 """
 from __future__ import annotations
 
+import ast
 import json
 import re
 import time
@@ -23,6 +24,7 @@ from pydantic import BaseModel
 
 from sculptor.eval.metric_validate import (
     _abstract_objective_program,
+    _declared_abstract_objective,
     validate_generated_metric,
 )
 from sculptor.eval.robot_manifest import robot_joint_names
@@ -454,6 +456,63 @@ def _sample_source(client: Any, system_prompt: str, user_content: str,
     return _strip_code("\n".join(chunks))
 
 
+def _compose_frozen_abstract_objective(
+    source: str, contract: Optional[Mapping[str, Any]],
+) -> str:
+    """Splice a known data-only objective contract into generated source.
+
+    When the deterministic prompt compiler already produced an ordered phase
+    program, copying that inert literal is a system responsibility—not another
+    instruction the metric-author LLM can forget and burn a retry on. An
+    explicit author declaration is left untouched so the validator can reject
+    any drift. Novel prompts with an empty compiler program are also untouched;
+    their jointly-authored companion remains required.
+
+    Insert after a module docstring and any ``__future__`` imports so otherwise
+    valid generated modules retain Python's future-import placement contract.
+    """
+    if not isinstance(contract, Mapping):
+        return source
+    phases = contract.get("phases")
+    if not isinstance(phases, list) or not phases:
+        return source
+    if _declared_abstract_objective(source) is not None:
+        return source
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return source
+
+    insert_after = 0
+    for index, node in enumerate(tree.body):
+        is_docstring = (
+            index == 0
+            and isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Constant)
+            and isinstance(node.value.value, str)
+        )
+        is_future = isinstance(node, ast.ImportFrom) and node.module == "__future__"
+        if not (is_docstring or is_future):
+            break
+        insert_after = int(getattr(node, "end_lineno", node.lineno))
+
+    declaration = {
+        "schema_version": int(contract.get("schema_version", 1)),
+        "phases": list(phases),
+        "source": "prompt_compiler",
+        "stored_trajectory_required": False,
+    }
+    lines = source.splitlines(keepends=True)
+    prefix = f"ABSTRACT_OBJECTIVE = {declaration!r}\n\n"
+    if insert_after == 0:
+        return prefix + source
+    before = "".join(lines[:insert_after])
+    after = "".join(lines[insert_after:])
+    if before and not before.endswith("\n"):
+        before += "\n"
+    return before + "\n" + prefix + after
+
+
 # ── §best-of-N: sample N candidates, select the most-discriminating valid one ──
 #: Per-candidate FRAMING nudges (varied composition emphasis) — the ONLY
 #: decorrelation lever. Temperature is NOT varied: the generator runs with extended
@@ -503,6 +562,7 @@ def _best_of_n(
         user = base_user + (f"\n\n{framing}" if framing else "")
         try:
             src = _sample_source(client, system_prompt, user, model=model)
+            src = _compose_frozen_abstract_objective(src, abstract_objective)
         except Exception as e:  # noqa: BLE001 — one candidate's API failure is not fatal
             cands.append({"candidate": i, "api_error": f"{type(e).__name__}: {e}"})
             continue
@@ -858,6 +918,8 @@ def generate_objective_metric(
                     )
                 try:
                     source = _sample_source(client, system_prompt, user, model=model)
+                    source = _compose_frozen_abstract_objective(
+                        source, abstract_objective)
                 except Exception as e:  # noqa: BLE001 — API failure = failed attempt
                     attempts.append({"attempt": attempt,
                                      "api_error": f"{type(e).__name__}: {e}"})
@@ -985,6 +1047,8 @@ def generate_objective_metric(
                 )
             try:
                 source = _sample_source(client, system_prompt, user, model=model)
+                source = _compose_frozen_abstract_objective(
+                    source, abstract_objective)
             except Exception as e:  # noqa: BLE001 — a failed retry call ends the retries
                 attempts.append({"review_retry": rev_retry,
                                  "api_error": f"{type(e).__name__}: {e}"})

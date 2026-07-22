@@ -805,13 +805,20 @@ def _abstract_objective_program(
         "run", "runs", "running", "sprint", "sprints", "sprinting",
         "dash", "dashes", "dashing", "race", "races", "racing",
     )
-    if planar_route or has("forward", "forwards", "ahead") or wants_run:
+    wants_planar_motion = planar_route or wants_run or has(
+        "move", "moves", "moving", "walk", "walks", "walking",
+        "trot", "trots", "trotting", "travel", "travels", "traveling",
+        "locomote", "locomotion",
+    )
+    if wants_planar_motion and (
+        planar_route or has("forward", "forwards", "ahead") or wants_run
+    ):
         planar_phase = "move_forward"
-    elif has("backward", "backwards", "reverse"):
+    elif wants_planar_motion and has("backward", "backwards", "reverse"):
         planar_phase = "move_backward"
-    elif has("left"):
+    elif wants_planar_motion and has("left"):
         planar_phase = "move_left"
-    elif has("right"):
+    elif wants_planar_motion and has("right"):
         planar_phase = "move_right"
     if planar_phase is not None and not staged_climb:
         phases.append(planar_phase)
@@ -1029,12 +1036,21 @@ def _abstract_objective_probe(
         elif phase == "tilt":
             gravity[a:b, :, 0] = (0.85 * u)[:, None]
             gravity[a:b, :, 2] = (-np.sqrt(1.0 - (0.85 * u) ** 2))[:, None]
+            # A bend/bow is not orientation-only: retarget the abstract torso
+            # tilt onto symmetric named hip flexion as well. This lets a
+            # trajectory-free validator distinguish a whole-body bow from an
+            # externally rotated rigid body, without assuming an embodiment's
+            # raw joint indices (the synthetic names are permutation-tested).
+            joints[a:b, :, 0] = (0.9 * u)[:, None]
+            joints[a:b, :, 1] = (0.9 * u)[:, None]
             tilt = 0.85
         elif phase == "recover":
             gravity[a:b, :, 0] = (tilt * (1.0 - u))[:, None]
             gravity[a:b, :, 2] = (-np.sqrt(
                 1.0 - (tilt * (1.0 - u)) ** 2))[:, None]
             root[a:b, :, 2] = (z + (0.55 - z) * u)[:, None]
+            start_pose = joints[a - 1].copy() if a > 0 else np.zeros((E, J))
+            joints[a:b] = ((1.0 - u)[:, None, None] * start_pose[None, ...])
             tilt = 0.0
             z = 0.55
         elif phase in {"oscillate", "reach", "kick"}:

@@ -1114,3 +1114,35 @@ resume/warm-start tests: 57 passed; compileall and `git diff --check` passed.
 Whole-file Ruff still reports unrelated pre-existing unused imports/locals in
 the 7k-line `sculpt.py` and its historical test module; no finding points at the
 new recovery code.
+
+## Prompt-native validator composition + restart-safe recovery 2026-07-22 (Codex)
+
+The first broad verification after the frozen abstract-objective slice exposed
+23 regressions: legacy/generated candidates that omitted the new inert
+declaration were rejected even when the deterministic prompt compiler already
+owned an exact phase program. Generation now composes that frozen data literal
+into every best-of-N, normal retry, and review-repair candidate as a system
+operation. It inserts after module docstrings and `__future__` imports, leaves
+explicit author declarations untouched so drift is still rejected, and leaves
+truly novel empty compiler programs to the jointly-authored companion path.
+The contract is never inferred from a stored trajectory.
+
+The abstract probe also no longer mistakes directional adjectives such as
+"kick forward" or "bend forward" for an extra locomotion phase. Bend/bow
+programs retarget torso tilt onto symmetric named hip flexion and recover that
+pose, making prompt-native compound validators non-vacuous without raw joint
+index assumptions in production logic.
+
+A live stop/resume revealed a second edge case in interrupted training: rsl_rl
+restarts its numeric model counter, so a newly written `model_50.pt` can coexist
+with an older `model_600.pt`. Partial-policy recovery now orders candidates by
+filesystem write time (numeric counter only breaks ties), verifies newest to
+oldest, and therefore preserves the actual newest learning. The live UI trace
+showing full-strength authored command supervision and partial recovery is saved
+as `reward-sculptor-ui/.ui-verification/2026-07-22-lokesh-final/29-live-resume-command-supervision-light.png`.
+
+Verification: focused metric + warm-start suites 144 passed; broad CPU suite
+2,213 passed / 1 expected optional-JAX skip in 4m22s; compileall and
+`git diff --check` passed. Scoped Ruff still reports only historical E702/F401/
+F841 findings in the long pre-existing validator/test modules, with no finding
+on the newly added composition or recovery lines.

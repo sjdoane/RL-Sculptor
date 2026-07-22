@@ -169,9 +169,11 @@ def test_compound_bend_then_wave_passes_vacuously():
     v = _val(COMPOUND_BEND_WAVE,
              "bend over touch your toes stand up then wave your arms in the air")
     assert v["ok"], v["reasons"]
-    assert v["nondegeneracy_vacuous"] is True
-    assert v["selectivity_probe"]["competent"] >= 0.5
-    assert v["selectivity_probe"]["spread"] >= 0.1
+    assert v["nondegeneracy_vacuous"] is False
+    assert v["abstract_objective_program"] == ["tilt", "recover", "reach"]
+    assert "prompt_competent" in v["archetype_scores"]
+    assert v["archetype_scores"]["prompt_competent"] >= 0.5
+    assert v["selectivity_probe"] is None
 
 
 def test_pure_wave_metric_passes_vacuously():
@@ -388,16 +390,18 @@ def compute_spec(arrays, behavior, meta):
 
 
 def test_fold_goal_with_directional_word_resolves_to_none():
-    """§round-3 fix: a FOLD/bow goal that contains a stray directional word ('bend
-    FORWARD into a deep bow') no longer MIS-resolves to locomotion — the posture verb
-    (bend/bow) suppresses the bare-'forward' locomotion cue — so it resolves to None and
-    reaches the selectivity probe (instead of being false-rejected on the locomotion
-    normal path where its forward-travel positive scores ~0)."""
+    """A posture direction must not invent a locomotion phase.
+
+    The prompt-native validator represents this as tilt→recover directly, so
+    it no longer needs the older vacuous/selectivity fallback.
+    """
     from sculptor.eval.metric_validate import resolve_behavior_family
     assert resolve_behavior_family("bend forward into a deep bow and return upright") is None
     v = _val(BOW_TILT_RETURN, "bend forward into a deep bow and return upright")
     assert v["family"] is None
-    assert v["nondegeneracy_vacuous"] is True
+    assert v["nondegeneracy_vacuous"] is False
+    assert v["abstract_objective_program"] == ["tilt", "recover"]
+    assert "prompt_competent" in v["archetype_scores"]
     assert v["ok"], v["reasons"]
 
 

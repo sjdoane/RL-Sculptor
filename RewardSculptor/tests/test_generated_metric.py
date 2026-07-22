@@ -664,6 +664,40 @@ def test_generate_objective_metric_accepts_good(tmp_path):
     assert rec["review"]["approved"]
     assert (out / "metric.py").is_file() and (out / "meta.json").is_file()
     assert rec["calibrated"] is False  # steer-rights not granted yet
+    written = (out / "metric.py").read_text(encoding="utf-8")
+    assert "ABSTRACT_OBJECTIVE" in written
+    assert rec["abstract_objective"]["phases"] == ["move_forward"]
+
+
+def test_frozen_objective_composition_preserves_future_import_position():
+    from sculptor.eval.metric_gen import _compose_frozen_abstract_objective
+
+    source = (
+        '"""metric module"""\n'
+        "from __future__ import annotations\n"
+        "import numpy as np\n"
+        "def compute_spec(arrays, behavior, meta):\n"
+        "    return {'spec_score': 0.0}\n"
+    )
+    composed = _compose_frozen_abstract_objective(source, {
+        "schema_version": 1,
+        "phases": ["move_forward", "dwell"],
+    })
+    compile(composed, "<metric>", "exec")
+    assert composed.index("from __future__") < composed.index("ABSTRACT_OBJECTIVE")
+
+
+def test_explicit_abstract_objective_drift_is_rejected(tmp_path):
+    from sculptor.eval.metric_validate import validate_generated_metric
+
+    source = "ABSTRACT_OBJECTIVE = {'phases': ['jump']}\n" + GOOD
+    path = _write(tmp_path, "drift.py", source)
+    result = validate_generated_metric(
+        source, path, behavior_goal="trot forward",
+        abstract_objective={"schema_version": 1, "phases": ["move_forward"]},
+    )
+    assert result["gates"]["abstract_objective_alignment"] is False
+    assert any("drifted" in reason for reason in result["reasons"])
 
 
 def test_generate_objective_metric_rejects_bad_and_retries(tmp_path):
@@ -802,7 +836,9 @@ def test_best_of_n_selects_most_discriminating(tmp_path):
         "touch your toes then stand back up", out, robot_hint="unitree_g1",
         client=client, n_candidates=2)
     assert rec["accepted"] and rec["selected_candidate"] == 1
-    assert (out / "metric.py").read_text().strip() == TOE_TOUCH_NOVEL.strip()
+    written = (out / "metric.py").read_text().strip()
+    assert "ABSTRACT_OBJECTIVE" in written
+    assert written.endswith(TOE_TOUCH_NOVEL.strip())
     discs = {c["candidate"]: c.get("discrimination") for c in rec["candidates"]}
     assert discs[1] > discs[0]                    # the selected one is more discriminating
     # REGRESSION: the generator uses extended thinking, which the API rejects for any
@@ -853,7 +889,9 @@ def test_best_of_n_reviews_in_order_and_accepts_approved(tmp_path):
         client=client, n_candidates=2)
     assert rec["accepted"], rec                          # the approved sibling carried it
     assert rec["selected_candidate"] == 1                # the lower-disc, review-APPROVED one
-    assert (out / "metric.py").read_text().strip() == COARSE_DIP.strip()
+    written = (out / "metric.py").read_text().strip()
+    assert "ABSTRACT_OBJECTIVE" in written
+    assert written.endswith(COARSE_DIP.strip())
     assert len(client.messages.reviewed) == 2            # rejected top, then approved next
 
 
@@ -871,7 +909,9 @@ def test_review_feedback_retry_recovers(tmp_path):
         "touch your toes then stand back up", out, robot_hint="unitree_g1",
         client=client, n_candidates=1)
     assert rec["accepted"], rec                       # the review-feedback retry recovered
-    assert (out / "metric.py").read_text().strip() == COARSE_DIP.strip()
+    written = (out / "metric.py").read_text().strip()
+    assert "ABSTRACT_OBJECTIVE" in written
+    assert written.endswith(COARSE_DIP.strip())
     assert len(client.messages.reviewed) == 2         # rejected, then approved after feedback
     assert any(a.get("review_retry") for a in rec["attempts"])    # a review-retry happened
 
@@ -901,7 +941,9 @@ def test_review_feedback_retry_repairs_an_invalid_correction(tmp_path):
     assert repairs[0]["ok"] is False
     assert repairs[1]["ok"] is True
     assert "FAILED the static validation gates" in client.messages.users[-1]
-    assert (out / "metric.py").read_text().strip() == COARSE_DIP.strip()
+    written = (out / "metric.py").read_text().strip()
+    assert "ABSTRACT_OBJECTIVE" in written
+    assert written.endswith(COARSE_DIP.strip())
 
 
 def test_review_veto_gives_up_after_bounded_retries(tmp_path):
