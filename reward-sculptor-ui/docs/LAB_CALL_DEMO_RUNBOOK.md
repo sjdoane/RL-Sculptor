@@ -208,6 +208,15 @@ Launch one exact-promoted-tuple cycle from selection v20 and warm-start
 `runs/iter_11/checkpoint.pt`. Require actor+critic warm-start, tracking weights
 2.0, terminal weight 4, hold 2, and continuity scale 2 before PPO iteration 0.
 
+That recovery is active as UI job `b12d93ae0b4b3029`, iter 12, from clean
+commit `16d7c5e`. It restored selection v20, pinned selection v21 with the
+unchanged promoted tuple, and loaded actor plus critic from
+`runs/iter_11/checkpoint.pt` (sha8 `e1833254`). The live log confirms
+goal-conditioned terminal braking, tracking weights 2.0, entropy 0.0075,
+whole-body terminal continuity at weight 4, hold 2 seconds, and continuity
+scale 2. PPO iteration 0 is active. Wait for the official rollout before
+making any presentation claim.
+
 ## Exact overnight launch settings
 
 From **World**, choose **Train this world**, or open **New run**. Select

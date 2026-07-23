@@ -1768,3 +1768,22 @@ applicable reward revision: both LLM edits were rejected by validation. Its
 environment draft remains unpromoted diagnosis provenance. The next safe run
 is one UI exact-tuple continuation from selection v20, reward v7/env v4,
 warm-starting iter 11 after this whole-body gate is committed.
+
+## Iter-12 whole-body-hold recovery launched 2026-07-23 (Codex)
+
+UI job `b12d93ae0b4b3029` is the active one-cycle exact-tuple recovery. New Run
+retained the exact behavior goal and used Auto, 750 PPO iterations, 1,024
+environments, seed 42, two 1,000-step 1920x1080 episodes, and `gen_003`
+observe-only. The UI restored selection v20; iter 12 pinned
+`selection_v21.json` with the unchanged promoted reward-v7/env-v4 tuple.
+
+Run context captured clean commit `16d7c5e`. The worker resolved and loaded
+`runs/iter_11/checkpoint.pt` (sha8 `e1833254`) for actor and critic. Live logs
+prove goal-conditioned traversal with terminal braking, tracking weights 2.0,
+entropy coefficient 0.0075, and the new whole-body continuity contract at
+terminal weight 4, `hold_s=2`, continuity scale 2. PPO iteration 0 is active.
+
+Do not run an intermediate GPU audit or edit watched core. After completion,
+apply the same strict actual-geometry, first-episode-safe artifact, keyframe,
+and full-video acceptance audit. The rendered uninterrupted 100-frame hold
+remains mandatory.
