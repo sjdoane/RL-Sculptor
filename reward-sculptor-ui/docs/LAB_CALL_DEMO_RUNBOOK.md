@@ -148,6 +148,24 @@ and are not the verified promoted tuple. Before PPO starts, verify the log says
 `installed authored terminal continuity-aware whole-body stillness
 supervision` with hold 2 seconds and continuity scale 2.
 
+### Current timestep-correct recovery
+
+UI job `100d2d25b054acf2` is the active one-cycle iter-10 continuation. It was
+launched entirely through New Run from clean commit `f30f14a` with the exact
+goal, Auto, 750 PPO iterations, 1,024 environments, seed 42, two 1,000-step
+1920x1080 episodes, `gen_003` observe-only, and **Resume exact promoted
+tuple**. The UI restored selection v18 and iter 10 pinned selection v19 with
+the unchanged promoted reward-v7/env-v4 tuple.
+
+The live worker loaded actor and critic from `runs/iter_9/checkpoint.pt` (sha8
+`75129866`). The log confirms goal-conditioned traversal with terminal
+braking, tracking weights 2.0, entropy coefficient 0.0075, and the
+timestep-correct continuity-aware terminal stillness term at weight 1,
+`hold_s=2`, continuity scale 2. PPO iteration 0 is active. Do not run an
+intermediate GPU audit or edit watched core. When the run completes, apply the
+full strict trajectory and video checklist below; do not infer success from
+the frozen metric alone.
+
 ## Exact overnight launch settings
 
 From **World**, choose **Train this world**, or open **New run**. Select

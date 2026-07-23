@@ -1606,3 +1606,36 @@ reward v10/env v8 as diagnosis provenance and do not train them: both reward
 edits were partition-gate flagged. The next safe run is one exact-tuple
 750-PPO continuation from selection v18 (reward v7/env v4), warm-starting the
 iter-9 checkpoint after this fix is committed.
+
+## Iter-10 timestep-correct recovery launched 2026-07-23 (Codex)
+
+The safe continuation is active from the UI as job `100d2d25b054acf2`.
+New Run used the exact behavior goal above, Auto, one 750-PPO cycle, 1,024
+environments, seed 42, two 1,000-step 1920x1080 episodes, `gen_003`
+observe-only, and **Resume exact promoted tuple**.
+
+Launch provenance is verified. The UI emitted `promoted_tuple_restored` for
+selection v18, then iter 10 pinned `selection_v19.json` with the unchanged
+tuple
+`de07325bab038d29fa6705148f795d201d8159c42d93b8ddd92c4ec41f2226db`,
+reward v7 SHA
+`b6c65d349b9f23f5b36de68ec25eb5d48879ac5b84f1aa86a30949e5a4290df9`,
+and env v4 SHA
+`db049dafa3fb1fa0bc5ce590c485ec62c469b3bfa4aab757255b36adcadcbb39`.
+The captured code is clean commit `f30f14a639a09184446338352f0534a9d7502f00`.
+
+The worker resolved `runs/iter_9/checkpoint.pt` (sha8 `75129866`) and loaded
+both actor and critic. Its live log proves goal-conditioned waypoint traversal
+with terminal braking, full authored `track_linear_velocity` and
+`track_angular_velocity` weights of 2.0, entropy coefficient 0.0075, and the
+timestep-correct continuity-aware whole-body stillness term at weight 1,
+`hold_s=2`, and continuity scale 2. PPO iteration 0 is active.
+
+Do not run an intermediate GPU audit or edit reload-watched core while this
+worker is alive. After it completes and preserves/promotes the checkpoint,
+inspect the official first-episode-safe trajectory, objective/fitness
+artifacts, keyframes, and full MP4. Acceptance remains the full physical
+conjunction: ordered actual waypoint disks, actual finish entry, index 5, zero
+forbidden contact, no sustained fall, uprightness, terminal horizontal speed
+below 0.12 m/s, and a literal uninterrupted 100-frame post-completion hold
+inside the finish. The frozen metric's 90%-quiet proxy is not sufficient.
