@@ -110,6 +110,30 @@ def test_authored_terminal_standing_requires_installed_dwell_command() -> None:
     assert not _authored_terminal_standing_enabled(bundle)
 
 
+def test_authored_terminal_stillness_balances_command_supervision() -> None:
+    from sculptor.adapters._mjlab_runner import (
+        _authored_terminal_stillness_weight,
+    )
+
+    rewards = {
+        "track_linear_velocity": SimpleNamespace(weight=2.0),
+        "track_angular_velocity": SimpleNamespace(weight=2.0),
+        "unrelated_posture": SimpleNamespace(weight=20.0),
+    }
+    authored_terms = frozenset({
+        "track_linear_velocity",
+        "track_angular_velocity",
+    })
+
+    assert _authored_terminal_stillness_weight(
+        rewards, authored_terms) == 4.0
+    # Missing, malformed, and zero-weight command terms retain the safe floor.
+    assert _authored_terminal_stillness_weight(
+        {"track_linear_velocity": SimpleNamespace(weight="bad")},
+        authored_terms,
+    ) == 1.0
+
+
 def test_authored_terminal_stillness_is_dense_and_phase_gated() -> None:
     torch = pytest.importorskip("torch")
 

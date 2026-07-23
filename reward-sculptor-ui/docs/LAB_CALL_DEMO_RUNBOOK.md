@@ -148,23 +148,38 @@ and are not the verified promoted tuple. Before PPO starts, verify the log says
 `installed authored terminal continuity-aware whole-body stillness
 supervision` with hold 2 seconds and continuity scale 2.
 
-### Current timestep-correct recovery
+### Latest timestep-correct recovery
 
-UI job `100d2d25b054acf2` is the active one-cycle iter-10 continuation. It was
-launched entirely through New Run from clean commit `f30f14a` with the exact
-goal, Auto, 750 PPO iterations, 1,024 environments, seed 42, two 1,000-step
-1920x1080 episodes, `gen_003` observe-only, and **Resume exact promoted
-tuple**. The UI restored selection v18 and iter 10 pinned selection v19 with
-the unchanged promoted reward-v7/env-v4 tuple.
+UI job `100d2d25b054acf2` completed iter 10 from clean commit `f30f14a`,
+preserved its checkpoint, and atomically marked completion. It restored
+selection v18 and pinned selection v19 with the unchanged promoted
+reward-v7/env-v4 tuple. The frozen metric improved to fitness 0.16316 and
+terminal speed 0.09115 m/s.
 
-The live worker loaded actor and critic from `runs/iter_9/checkpoint.pt` (sha8
-`75129866`). The log confirms goal-conditioned traversal with terminal
-braking, tracking weights 2.0, entropy coefficient 0.0075, and the
-timestep-correct continuity-aware terminal stillness term at weight 1,
-`hold_s=2`, continuity scale 2. PPO iteration 0 is active. Do not run an
-intermediate GPU audit or edit watched core. When the run completes, apply the
-full strict trajectory and video checklist below; do not infer success from
-the frozen metric alone.
+The stricter audit found 62/64 actual ordered route-and-finish traversals,
+58/64 zero-contact trajectories, 62/64 without a sustained fall, and 25/64
+literal uninterrupted 100-frame terminal holds. Twenty-three environments
+satisfied the entire physical conjunction—up from 10/64 on iter 9.
+Environment 0 completed the route with zero contact and no fall, but its
+longest literal hold was 90 frames and it ended at 0.44162 m/s. Keyframes and
+the full video visibly show small terminal corrective steps, so this is still
+a near miss rather than the final showcase proof.
+
+Training traces showed terminal stillness contributing only about 4.6
+episodic reward versus roughly 110.7 from the two command-tracking terms.
+The next generic recovery balances those objectives: after route completion,
+terminal stillness weight becomes the aggregate authored command-tracking
+weight (4.0 for this tuple) instead of the fixed 1.0 floor. It remains exactly
+zero before completion and uses only compiled command capabilities and live
+term weights. Automatic reward v11 and its environment draft are rejected
+diagnosis provenance because both proposed reward edits tripped the partition
+gate.
+
+The next launch must use **Resume exact promoted tuple**, one 750-PPO cycle,
+and warm-start `runs/iter_10/checkpoint.pt`. Before allowing PPO to continue,
+verify the terminal-supervision log reports weight 4, hold 2 seconds, and
+continuity scale 2, alongside actor+critic warm-start and full tracking
+weights.
 
 ## Exact overnight launch settings
 

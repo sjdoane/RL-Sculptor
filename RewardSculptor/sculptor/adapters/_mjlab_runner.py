@@ -835,6 +835,33 @@ def _authored_terminal_hold_s(world_bundle: Any | None) -> float:
     return hold_s if hold_s > 0.0 else 0.0
 
 
+def _authored_terminal_stillness_weight(
+    rewards: Mapping[str, Any],
+    authored_command_terms: frozenset[str],
+) -> float:
+    """Balance terminal supervision against the installed command contract.
+
+    Route-following terms can carry several times the nominal weight of the
+    terminal stillness term.  Once the finite route completes, those terms
+    become zero-command tracking objectives, but a broad tracking kernel can
+    still pay a stepping equilibrium much more than the stricter authored
+    dwell signal.  Make the phase-gated terminal objective at least as strong
+    as the aggregate command supervision that delivered the robot there.
+
+    The calculation uses only compiled command capabilities and live term
+    weights.  It therefore adapts to future velocity-command embodiments
+    without robot, simulator-task, or authored-prompt keying.
+    """
+    command_weight = 0.0
+    for name in authored_command_terms:
+        term = rewards.get(name)
+        try:
+            command_weight += abs(float(getattr(term, "weight", 0.0)))
+        except (TypeError, ValueError):
+            continue
+    return max(_SCULPTOR_TERMINAL_STILLNESS_WEIGHT, command_weight)
+
+
 def _authored_terminal_stillness_state(
     env: Any, *, lin_std: float, ang_std: float, joint_std: float,
 ) -> tuple[Any, Any, Any]:
@@ -1941,12 +1968,14 @@ def _cmd_train(args: argparse.Namespace) -> None:
         schema_keys = tuple(args.schema_keys.split(",")) if args.schema_keys else _DEFAULT_SCHEMA_KEYS
         terminal_hold_s = _authored_terminal_hold_s(world_bundle)
         terminal_standing = terminal_hold_s > 0.0
+        terminal_stillness_weight = _authored_terminal_stillness_weight(
+            env_cfg.rewards, full_weight_terms)
         if terminal_standing:
             AuthoredTerminalStillnessTerm = (
                 _build_authored_terminal_stillness_term_class())
             env_cfg.rewards["sculptor_terminal_stillness"] = RewardTermCfg(
                 func=AuthoredTerminalStillnessTerm,
-                weight=_SCULPTOR_TERMINAL_STILLNESS_WEIGHT,
+                weight=terminal_stillness_weight,
                 params={
                     "lin_std": 0.12,
                     "ang_std": 0.5,
@@ -1986,7 +2015,7 @@ def _cmd_train(args: argparse.Namespace) -> None:
             print(
                 "[runner] installed authored terminal continuity-aware "
                 "whole-body stillness supervision at weight "
-                f"{_SCULPTOR_TERMINAL_STILLNESS_WEIGHT:g}, "
+                f"{terminal_stillness_weight:g}, "
                 f"hold_s {terminal_hold_s:g}, continuity scale "
                 f"{_SCULPTOR_TERMINAL_CONTINUITY_SCALE:g}",
                 file=sys.stderr,

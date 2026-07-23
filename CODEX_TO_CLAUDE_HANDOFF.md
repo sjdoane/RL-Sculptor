@@ -1639,3 +1639,59 @@ conjunction: ordered actual waypoint disks, actual finish entry, index 5, zero
 forbidden contact, no sustained fall, uprightness, terminal horizontal speed
 below 0.12 m/s, and a literal uninterrupted 100-frame post-completion hold
 inside the finish. The frozen metric's 90%-quiet proxy is not sufficient.
+
+## Official iter-10 audit + balanced terminal supervision 2026-07-23 (Codex)
+
+UI job `100d2d25b054acf2` completed, preserved
+`runs/iter_10/checkpoint.pt`, and atomically marked iter 10 complete. Frozen
+`gen_003` reports fitness 0.16316, progress 0.83372, ordered-course evidence
+in 63/64, success in 62/64, contact in 6/64, falls in 2/64, terminal speed
+0.09115 m/s, and its permissive completion gate in 19/64. The realism audit
+is clean: no joint-limit or torque saturation, no reset launch, and no
+naturalness rejection.
+
+The independent first-episode-safe audit used the actual authored horizontal
+geometry and every valid sample. It found 62/64 actual ordered traversals of
+all four 0.45 m waypoint disks plus the 0.9 m finish disk, 62/64
+waypoint-index-5 and success observations, 58/64 zero-contact trajectories,
+and 62/64 full-length/no-sustained-fall trajectories. Twenty-five environments
+held continuously for at least 100 frames after index 5 while inside the
+finish, upright, and below 0.12 m/s. Twenty-three (`6, 7, 10, 12, 15, 16, 17,
+21, 22, 30, 31, 32, 33, 34, 35, 40, 41, 45, 50, 51, 52, 57, 62`) also had
+the complete ordered route, zero forbidden contact, success, and no fall, so
+they satisfy the full physical conjunction. This more than doubles iter 9's
+10/64 full-conjunction count. The longest hold was 147 frames; mean and median
+longest holds were 88.52 and 91.5 frames. Terminal mean speed averaged
+0.10063 m/s; 53/64 terminal means were below 0.12 m/s.
+
+Rendered environment 0 again completed every actual disk in order, with
+entries at steps 131/287/450/592/689, reached waypoint index 5 at 778 and
+authored success at 878, and had zero forbidden contact and no fall. Its
+terminal mean speed was 0.07826 m/s, but its longest literal hold was only
+90 frames and final instantaneous speed was 0.44162 m/s. The official
+keyframes, full-video sheet, terminal-video sheet, and trajectory agree: the
+weave and upright finish are visible, but the robot performs small corrective
+steps through the terminal phase. The rendered showcase therefore remains
+honestly incomplete despite the substantial batch-level improvement.
+
+Training traces explain the remaining imbalance. Near PPO iteration 749,
+`sculptor_terminal_stillness` contributed about 4.6 episodic reward while
+full-strength linear and angular command tracking contributed about 110.7
+combined. The strict dwell objective was phase-gated correctly and the command
+was already zero after route completion, but its signal was too small relative
+to the broad zero-command tracking kernels.
+
+Terminal stillness weight is now computed generically from the compiled
+command contract: it is at least the sum of the absolute live weights of the
+authored command-tracking terms, with the existing 1.0 floor. For this tuple it
+becomes 4.0, matching the 2.0 linear plus 2.0 angular supervision. The term
+remains inactive before route completion, so it cannot trade navigation for
+standing early. The calculation uses only installed command capabilities and
+term weights—no robot, simulator task, channel, or prompt name.
+
+Focused Mjlab adapter verification is 48/48 passing; scoped Ruff, compileall,
+and `git diff --check` pass. Automatic reward v11 and its paired environment
+draft remain diagnosis provenance only: both reward edits were
+partition-gate flagged. The next safe run is one UI exact-promoted-tuple
+continuation from selection v19 (reward v7/env v4), warm-starting iter 10
+after this balanced-supervision slice is committed.
