@@ -145,6 +145,26 @@ below against the official first-episode-safe trajectory and full video.
 `gen_003` remains observe-only and its 90%-quiet proxy does not establish the
 literal uninterrupted 100-frame hold.
 
+### Iter-8 result and next recovery
+
+Iter 8 completed the exact-tuple recovery. The independent batch audit found
+62/64 complete ordered routes, 59/64 zero-contact trajectories, 64/64 terminal
+uprightness, and 9/64 literal uninterrupted 100-frame holds satisfying the
+full physical conjunction. This improves the literal result from 4/64, but the
+rendered environment 0 reached only 41 consecutive quiet frames despite a
+clean route, upright finish, 0.09638 m/s terminal mean speed, and zero contact.
+The official video is therefore not yet the literal two-second demonstration.
+
+The runtime now rewards consecutive terminal stillness rather than treating
+interrupted quiet samples as equivalent. Another one-cycle recovery should
+use the same settings, enable **Resume exact promoted tuple**, restore
+selection v15 (reward v7 + env v4), and warm-start
+`runs/iter_8/checkpoint.pt`. Do not consume automatic env v6; both reward edits
+were filtered and the change does not represent the verified promoted tuple.
+Before PPO starts, verify the log says
+`installed authored terminal continuity-aware whole-body stillness
+supervision` with hold 2 seconds and continuity scale 2.
+
 ## Exact overnight launch settings
 
 From **World**, choose **Train this world**, or open **New run**. Select

@@ -160,6 +160,68 @@ def test_authored_terminal_stillness_is_dense_and_phase_gated() -> None:
     assert reward[2].item() == 0.0
 
 
+def test_authored_terminal_stillness_rewards_continuity_and_resets() -> None:
+    torch = pytest.importorskip("torch")
+
+    from sculptor.adapters._mjlab_runner import (
+        _build_authored_terminal_stillness_term_class,
+    )
+
+    command = SimpleNamespace(
+        is_standing_env=torch.tensor([True, True, False]))
+
+    class CommandManager:
+        active_terms = ("route",)
+
+        @staticmethod
+        def get_term(name):
+            assert name == "route"
+            return command
+
+    data = SimpleNamespace(
+        root_link_lin_vel_b=torch.zeros(3, 3),
+        root_link_ang_vel_b=torch.zeros(3, 3),
+        joint_vel=torch.zeros(3, 2),
+    )
+    env = SimpleNamespace(
+        num_envs=3,
+        device=torch.device("cpu"),
+        step_dt=0.02,
+        command_manager=CommandManager(),
+        scene={"robot": SimpleNamespace(data=data)},
+    )
+    term_type = _build_authored_terminal_stillness_term_class()
+    term = term_type(SimpleNamespace(), env)
+    params = {
+        "lin_std": 0.12,
+        "ang_std": 0.5,
+        "joint_std": 1.0,
+        "hold_s": 0.1,
+        "continuity_scale": 2.0,
+    }
+
+    first = term(env, **params)
+    second = term(env, **params)
+    assert second[0].item() > first[0].item() > 1.0
+    assert second[1].item() > first[1].item() > 1.0
+    assert first[2].item() == 0.0
+
+    # A corrective step breaks the uninterrupted dwell and loses accumulated
+    # progress instead of retaining credit for a high quiet-sample fraction.
+    data.root_link_lin_vel_b[0, 0] = 0.2
+    interrupted = term(env, **params)
+    assert interrupted[0].item() < 0.0
+    assert interrupted[1].item() > second[1].item()
+
+    # Reward-manager selective reset clears only the requested environment.
+    term.reset(torch.tensor([0]))
+    data.root_link_lin_vel_b[0, 0] = 0.0
+    after_reset = term(env, **params)
+    torch.testing.assert_close(after_reset[0], first[0])
+    assert after_reset[1].item() > interrupted[1].item()
+    assert after_reset[2].item() == 0.0
+
+
 def test_rollout_evidence_excludes_metric_only_channels() -> None:
     """Diagnosis receives batch progress, never frozen completion truth."""
     import numpy as np

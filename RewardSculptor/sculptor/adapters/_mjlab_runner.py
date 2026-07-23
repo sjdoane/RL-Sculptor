@@ -49,6 +49,7 @@ _COMPONENT_SINK: dict[str, list[float]] | None = None
 _SCULPTOR_SURVIVAL_WEIGHT = 1.0
 _SCULPTOR_FAILURE_WEIGHT = -5.0
 _SCULPTOR_TERMINAL_STILLNESS_WEIGHT = 1.0
+_SCULPTOR_TERMINAL_CONTINUITY_SCALE = 2.0
 
 
 def _install_sculptor_termination_economics(
@@ -816,22 +817,28 @@ def _full_weight_authored_command_rewards(world_bundle: Any | None) -> frozenset
 
 def _authored_terminal_standing_enabled(world_bundle: Any | None) -> bool:
     """Whether the compiled command contract has a terminal dwell phase."""
+    return _authored_terminal_hold_s(world_bundle) > 0.0
+
+
+def _authored_terminal_hold_s(world_bundle: Any | None) -> float:
+    """Return the positive dwell duration installed by an authored command."""
     if not _full_weight_authored_command_rewards(world_bundle):
-        return False
+        return 0.0
     manifest = getattr(world_bundle, "manifest", None)
     task_shared = getattr(manifest, "task_shared", {})
     goal = task_shared.get("goal", {}) if isinstance(task_shared, Mapping) else {}
     success = goal.get("success", {}) if isinstance(goal, Mapping) else {}
     try:
-        return float(success.get("hold_s", 0.0)) > 0.0
+        hold_s = float(success.get("hold_s", 0.0))
     except (TypeError, ValueError):
-        return False
+        return 0.0
+    return hold_s if hold_s > 0.0 else 0.0
 
 
-def _authored_terminal_stillness_reward(
+def _authored_terminal_stillness_state(
     env: Any, *, lin_std: float, ang_std: float, joint_std: float,
-) -> Any:
-    """Dense whole-body stillness, active only after an authored command ends.
+) -> tuple[Any, Any, Any]:
+    """Return terminal-phase mask, whole-body score, and horizontal speed.
 
     The command term owns phase truth and exposes is_standing_env once its
     finite route completes.  Query that capability generically across active
@@ -845,7 +852,8 @@ def _authored_terminal_stillness_reward(
         int(env.num_envs), device=env.device, dtype=torch.bool)
     manager = getattr(env, "command_manager", None)
     if manager is None:
-        return standing.float()
+        zeros = standing.float()
+        return standing, zeros, torch.full_like(zeros, float("inf"))
     for name in tuple(getattr(manager, "active_terms", ()) or ()):
         try:
             term = manager.get_term(name)
@@ -875,7 +883,8 @@ def _authored_terminal_stillness_reward(
             if robot is not None:
                 break
     if robot is None:
-        return standing.float() * 0.0
+        zeros = standing.float() * 0.0
+        return standing, zeros, torch.full_like(zeros, float("inf"))
 
     data = robot.data
     lin_vel = getattr(data, "root_link_lin_vel_b", None)
@@ -886,7 +895,8 @@ def _authored_terminal_stillness_reward(
         ang_vel = getattr(data, "root_link_ang_vel_w", None)
     joint_vel = getattr(data, "joint_vel", None)
     if lin_vel is None or ang_vel is None or joint_vel is None:
-        return standing.float() * 0.0
+        zeros = standing.float() * 0.0
+        return standing, zeros, torch.full_like(zeros, float("inf"))
 
     horizontal_speed = torch.linalg.vector_norm(lin_vel[:, :2], dim=-1)
     angular_speed = torch.linalg.vector_norm(ang_vel, dim=-1)
@@ -896,7 +906,92 @@ def _authored_terminal_stillness_reward(
         + 0.25 * torch.exp(-torch.square(angular_speed / float(ang_std)))
         + 0.15 * torch.exp(-torch.square(joint_rms / float(joint_std)))
     )
+    return standing, score, horizontal_speed
+
+
+def _authored_terminal_stillness_reward(
+    env: Any, *, lin_std: float, ang_std: float, joint_std: float,
+) -> Any:
+    """Dense whole-body stillness, active only after an authored command ends."""
+    standing, score, _horizontal_speed = _authored_terminal_stillness_state(
+        env,
+        lin_std=lin_std,
+        ang_std=ang_std,
+        joint_std=joint_std,
+    )
     return score * standing.to(dtype=score.dtype)
+
+
+def _build_authored_terminal_stillness_term_class():
+    """Build stateful dwell supervision with an interruption-sensitive streak.
+
+    A frame-wise stillness score cannot distinguish one uninterrupted dwell
+    from many quiet samples separated by corrective steps.  The compiled
+    authored goal supplies the required dwell duration.  This term accumulates
+    a private per-environment quiet streak only in the command's terminal
+    standing phase, rewards increasing consecutive progress, and applies the
+    lost progress as an interruption penalty.  Its reset method follows the
+    reward manager's selective per-environment reset contract.
+    """
+    import torch
+
+    class AuthoredTerminalStillnessTerm:
+        def __init__(self, _cfg, env):  # type: ignore[no-untyped-def]
+            self._quiet_streak_s = torch.zeros(
+                int(env.num_envs), device=env.device)
+
+        def __call__(
+            self,
+            env,
+            *,
+            lin_std: float,
+            ang_std: float,
+            joint_std: float,
+            hold_s: float,
+            continuity_scale: float,
+        ):
+            standing, score, horizontal_speed = (
+                _authored_terminal_stillness_state(
+                    env,
+                    lin_std=lin_std,
+                    ang_std=ang_std,
+                    joint_std=joint_std,
+                )
+            )
+            dtype = score.dtype
+            if (
+                tuple(self._quiet_streak_s.shape) != tuple(standing.shape)
+                or self._quiet_streak_s.device != standing.device
+                or self._quiet_streak_s.dtype != dtype
+            ):
+                self._quiet_streak_s = torch.zeros_like(
+                    score, device=standing.device, dtype=dtype)
+
+            duration = max(float(hold_s), float(env.step_dt))
+            previous = self._quiet_streak_s
+            quiet = standing & (horizontal_speed < float(lin_std))
+            streak = torch.where(
+                quiet,
+                torch.clamp(previous + float(env.step_dt), max=duration),
+                torch.zeros_like(previous),
+            )
+            previous_progress = previous / duration
+            progress = streak / duration
+            delta = torch.where(
+                standing,
+                progress - previous_progress,
+                torch.zeros_like(progress),
+            )
+            continuity = torch.square(progress) + delta
+            self._quiet_streak_s = torch.where(
+                standing, streak, torch.zeros_like(streak)).detach()
+            dense = score * standing.to(dtype=dtype)
+            return dense + float(continuity_scale) * continuity
+
+        def reset(self, env_ids):  # type: ignore[no-untyped-def]
+            self._quiet_streak_s[env_ids] = 0.0
+
+    return AuthoredTerminalStillnessTerm
 
 
 def _reward_visible_rollout_evidence(
@@ -1835,15 +1930,20 @@ def _cmd_train(args: argparse.Namespace) -> None:
             env_cfg.rewards = {}
 
         schema_keys = tuple(args.schema_keys.split(",")) if args.schema_keys else _DEFAULT_SCHEMA_KEYS
-        terminal_standing = _authored_terminal_standing_enabled(world_bundle)
+        terminal_hold_s = _authored_terminal_hold_s(world_bundle)
+        terminal_standing = terminal_hold_s > 0.0
         if terminal_standing:
+            AuthoredTerminalStillnessTerm = (
+                _build_authored_terminal_stillness_term_class())
             env_cfg.rewards["sculptor_terminal_stillness"] = RewardTermCfg(
-                func=_authored_terminal_stillness_reward,
+                func=AuthoredTerminalStillnessTerm,
                 weight=_SCULPTOR_TERMINAL_STILLNESS_WEIGHT,
                 params={
                     "lin_std": 0.12,
                     "ang_std": 0.5,
                     "joint_std": 1.0,
+                    "hold_s": terminal_hold_s,
+                    "continuity_scale": _SCULPTOR_TERMINAL_CONTINUITY_SCALE,
                 },
             )
         SculptorRewardTerm = _build_sculptor_term_class(
@@ -1875,8 +1975,11 @@ def _cmd_train(args: argparse.Namespace) -> None:
             )
         if terminal_standing:
             print(
-                "[runner] installed authored terminal whole-body stillness "
-                f"supervision at weight {_SCULPTOR_TERMINAL_STILLNESS_WEIGHT:g}",
+                "[runner] installed authored terminal continuity-aware "
+                "whole-body stillness supervision at weight "
+                f"{_SCULPTOR_TERMINAL_STILLNESS_WEIGHT:g}, "
+                f"hold_s {terminal_hold_s:g}, continuity scale "
+                f"{_SCULPTOR_TERMINAL_CONTINUITY_SCALE:g}",
                 file=sys.stderr,
                 flush=True,
             )

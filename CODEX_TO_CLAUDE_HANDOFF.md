@@ -1461,3 +1461,49 @@ full MP4. Acceptance still requires the entire physical conjunction, including
 zero forbidden contact and a literal uninterrupted 100-frame post-completion,
 inside-finish, upright run below 0.12 m/s. `gen_003`'s 90%-quiet proxy is not
 sufficient by itself.
+
+## Official iter-8 audit + continuity-aware supervision 2026-07-22 (Codex)
+
+UI job `3b5f34bedc5af06d` completed from the exact promoted reward-v7/env-v4
+tuple and preserved `runs/iter_8/checkpoint.pt`. The official rollout contains
+999 valid first-episode rows for every one of 64 environments and a valid
+20-second 1920x1080 MP4. Frozen `gen_003` reports fitness 0.13858, progress
+0.83574, completion gate 18/64, contact in 5/64, zero falls, success seen in
+62/64, and terminal speed 0.10458 m/s.
+
+The stricter independent audit found 62/64 complete ordered crossings of all
+four actual 0.45 m waypoint disks plus the actual 0.9 m finish disk, 62/64
+waypoint-index-5 and authored-success observations, 59/64 zero-contact
+trajectories, and 64/64 terminal uprightness. Terminal mean horizontal speed
+was 0.10560 m/s; 52/64 terminal means were below 0.12 m/s. Nine environments
+(`4, 12, 13, 24, 34, 37, 48, 49, 50`) satisfied the literal uninterrupted
+100-frame post-completion, inside-finish, upright hold below 0.12 m/s, and all
+nine also had zero contact and the full ordered route. This improves the
+literal conjunction from 4/64 to 9/64.
+
+The rendered environment 0 completed all five disks in order, reached index 5
+at step 759, asserted authored success at 859, stayed upright, and had zero
+forbidden contact. It ended inside the finish at distance 0.2914 m with
+terminal mean speed 0.09638 m/s, but its longest uninterrupted quiet run was
+only 41 frames. Visual inspection of the official full and terminal contact
+sheets agrees: the weave and upright finish are clear, but small corrective
+steps remain. The showcase therefore remains honestly incomplete.
+
+The remaining control defect is generic: frame-wise dense stillness gives
+nearly the same aggregate credit to a continuous dwell and to quiet samples
+separated by corrective steps. Terminal supervision is now a stateful reward
+term with a private per-environment quiet streak. It activates only when a
+compiled compatible waypoint command exposes terminal standing and a positive
+authored dwell duration. Consecutive progress grows toward that exact duration;
+an interruption loses the accumulated progress and resets the streak.
+Selective reward-manager resets clear only the affected environments. Dense
+horizontal, angular, and joint-velocity shaping remains, and no embodiment,
+task id, or prompt name is used.
+
+Verification: focused Mjlab adapter suite 47/47 passed; scoped Ruff,
+compileall, and `git diff --check` passed. The automatic iter-8 diagnosis
+created env v6 and filtered both reward edits. Preserve it as provenance and
+do not train it: the next safe run must again use **Resume exact promoted
+tuple** from selection v15 (reward v7/env v4), warm-start iter 8, and run one
+750-PPO recovery cycle. Confirm the new continuity-aware supervision line
+before PPO begins.
