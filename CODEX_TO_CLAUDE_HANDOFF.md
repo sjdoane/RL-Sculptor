@@ -1548,3 +1548,16 @@ keyword call. No GPU training or checkpoint was lost. Focused Mjlab adapter
 verification is 47/47 passing; Ruff, compileall, and `git diff --check` pass.
 Relaunch the same exact-tuple iter-9 configuration and require the continuity
 installation line plus actor/critic warm-start before PPO iteration 0.
+
+The corrected UI relaunch is active as job `dde47f043fe792ec` from clean commit
+`e1b5d50`. It restored selection v17, then pinned selection v18 with the same
+tuple `de07325bab038d29fa6705148f795d201d8159c42d93b8ddd92c4ec41f2226db`.
+The runner correctly allocated iter 9, resolved `runs/iter_8/checkpoint.pt`,
+and loaded both actor and critic (source sha8 `8a7e6a83`). Live configuration
+proves goal-conditioned waypoint traversal with terminal braking, full
+`track_linear_velocity` and `track_angular_velocity` weights of 2.0, entropy
+coefficient 0.0075, and continuity-aware terminal stillness at weight 1 with
+`hold_s=2` and continuity scale 2. PPO iteration 0 is active. Do not edit
+reload-watched core or run an intermediate GPU audit while this worker lives.
+After completion, apply the same strict official-artifact/video acceptance
+audit used for iter 8.
