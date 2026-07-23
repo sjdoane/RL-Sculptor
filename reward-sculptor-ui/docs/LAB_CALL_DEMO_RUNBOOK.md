@@ -23,24 +23,30 @@ Open **Projects → G1 Lab Showcase — Weave and Stop**.
   env v4; the frozen world/task/evaluation half is unchanged)
 - Evaluation lineage: `world-58560025c10981814943d42e`
 - Objective metric: `gen_003` (accepted, prompt-native, observe-only)
-- Latest completed recovery job: `b12d93ae0b4b3029`, iter 12, clean code
-  `16d7c5e`; it consumed reward v7 + env v4 and warm-started iter 11.
-- Active exact-tuple recovery: `7449bab7e0aa9fb9`, iter 13, launch commit
-  `884cce0`; it warm-started actor and critic from iter 12.
+- Accepted completed job: `7449bab7e0aa9fb9`, iter 13, launch commit
+  `884cce0`; it consumed reward v7 + env v4 and warm-started actor and critic
+  from iter 12.
+- Accepted clip: `runs/iter_13/rollout/rollout.mp4`
+- No recovery is active. Do not relaunch or replace this clip before the call.
 
-The iter-12 rollout completed the ordered route and actual finish in 63/64
-environments, avoided every forbidden contact in 58/64, and had no sustained
-falls. Twenty-six environments satisfy the full literal horizontal
-conjunction; 24 also satisfy whole-body quiet for the complete 100-frame hold.
+The selected rendered rollout now passes the complete evidence rule. It
+entered the four actual waypoint disks and finish at steps
+122/273/405/547/640, reached index 5 at 691 and success at 791, had zero
+forbidden contact and no fall, and stayed inside the finish. Its uninterrupted
+accepted window is steps 887-998: 112 frames/2.24 seconds upright with
+horizontal speed below 0.12 m/s and joint RMS velocity below 1.0 rad/s.
 
-It is still not accepted as the call-ready proof because rendered environment
-0, although clean and visibly correct through the weave, achieved 92 rather
-than 100 consecutive horizontal frames and 81 whole-body-qualified frames.
-Small corrective steps remain visible in the terminal video. The frozen
-`gen_003` metric reports 24 completions using its 90%-quiet proxy; the runbook
-applies the stronger consecutive criterion. Iter 13 is continuing the same
-correct contract because its terminal reward was still rising at the end of
-iter 12.
+Within that window, horizontal speed max/mean/final was
+0.11465/0.04124/0.04408 m/s; joint RMS max/mean/final was
+0.94536/0.40303/0.29952 rad/s; finish distance remained 0.157-0.180 m.
+Keyframes and the complete video visibly show the same alternating course,
+upright finish entry, and planted hold. This is the call-ready proof.
+
+The strict 64-environment batch audit found 62 actual ordered route/finish
+traversals, 58 zero-contact trajectories, zero falls, 23 full horizontal
+conjunctions, and 19 full joint-qualified whole-body conjunctions. Treat this
+as strong selected-rollout evidence, not a claim of universal seed-level
+robustness. Frozen `gen_003` reports 29/64 using its looser proxy.
 
 ## One-time startup
 
@@ -212,15 +218,14 @@ whole-body quiet thresholds (horizontal 0.12 m/s, angular 0.5 rad/s, joint
 RMS 1.0 rad/s) before PPO iteration 0. The official 100-frame rendered hold
 remains mandatory.
 
-That continuation is active as UI job `7449bab7e0aa9fb9`, iter 13, from clean
-commit `884cce0`. The UI restored selection v21 and pinned selection v22 with
-the unchanged reward-v7/env-v4 tuple. The worker loaded actor plus critic from
-`runs/iter_12/checkpoint.pt` (sha8 `40095ac5`); live configuration confirms
-goal-conditioned terminal braking, linear/angular tracking weights 2.0,
-entropy 0.0075, and whole-body terminal continuity at weight 4, hold 2
-seconds, and continuity scale 2. PPO iteration 0 is active. Do not run an
-intermediate audit or edit watched core; wait for the official rollout before
-making a presentation claim.
+That continuation completed as UI job `7449bab7e0aa9fb9`, iter 13. The UI
+restored selection v21, pinned selection v22 with the unchanged
+reward-v7/env-v4 tuple, and loaded actor plus critic from
+`runs/iter_12/checkpoint.pt` (sha8 `40095ac5`). Its official rendered
+environment 0 passed the complete strict conjunction with a 112-frame
+whole-body-qualified hold. Use iter 13 for the call. Keep automatic reward v13
+and environment v12 as unpromoted diagnosis provenance; two reward edits were
+partition-gate flagged and are not part of the accepted tuple.
 
 ## Exact overnight launch settings
 

@@ -1861,3 +1861,51 @@ Do not run an intermediate GPU audit or edit reload-watched core while iter
 the strict actual-geometry, first-episode-safe trajectory, objective/fitness,
 keyframe, and full-video audit. The rendered uninterrupted 100-frame
 post-completion hold remains the acceptance gate.
+
+## Official iter-13 acceptance 2026-07-23 (Codex)
+
+UI job `7449bab7e0aa9fb9` completed, preserved
+`runs/iter_13/checkpoint.pt`, wrote the exact-tuple completion marker, and
+closed normally. Frozen `gen_003` reports fitness 0.24734, progress 0.84141,
+course 0.92196, finish 0.80196, hold 0.46406, stillness 0.42090,
+uprightness 0.62443, its permissive completion gate in 29/64, contact in
+6/64, zero falls, and terminal speed 0.08224 m/s. The realism audit is clean:
+no torque or joint-limit saturation, no reset launch, no naturalness flag,
+and joint-velocity p99 9.98.
+
+The stricter first-episode-safe audit used 999 valid samples in every
+environment and the actual authored horizontal geometry. It found 62/64
+ordered traversals of the four 0.45 m waypoint disks plus the 0.9 m finish,
+62/64 index-5 and authored-success observations, 58/64 zero-contact
+trajectories, and 64/64 without a sustained fall. Twenty-five environments
+produced a literal uninterrupted 100-frame horizontal hold and 23 satisfied
+the complete horizontal physical conjunction. Twenty-one produced a
+joint-qualified whole-body hold and 19 satisfied that full conjunction. This
+batch conjunction count is lower than iter 12, so do not claim broad policy
+robustness from this seed; the selected rendered rollout is the accepted
+showcase evidence.
+
+Rendered environment 0 is the first official clip to pass every showcase
+gate. It entered the actual waypoint/finish disks at steps
+122/273/405/547/640, reached waypoint index 5 at 691 and authored success at
+791, had zero forbidden contact and no fall, and remained inside the finish.
+From steps 887 through 998 it held continuously for 112 frames (2.24 s):
+horizontal speed stayed below 0.12 m/s (max 0.11465, mean 0.04124, final
+0.04408), joint RMS velocity stayed below 1.0 rad/s (max 0.94536, mean
+0.40303, final 0.29952), projected-gravity z remained between -0.84656 and
+-0.82860, base height remained 0.63114-0.63921 m, and finish distance remained
+0.15674-0.17973 m.
+
+The official keyframes, full 20-second video sheet, terminal sheet, and a
+10-fps sheet covering the entire 2.24-second accepted window were inspected.
+They visibly agree with the trajectory: the robot completes the alternating
+course, enters the finish upright, and stays planted in essentially the same
+pose throughout the verified window with no corrective step. The accepted
+video is
+`runs/iter_13/rollout/rollout.mp4`.
+
+Automatic reward v13 and environment v12 are diagnosis provenance only. Two
+reward edits were partition-gate flagged, and neither draft is part of the
+accepted immutable selection v22 reward-v7/env-v4 tuple. Do not relaunch or
+replace the accepted clip before the lab call. The complex UI workflow and
+physical behavior are now proven for the selected official rollout.
