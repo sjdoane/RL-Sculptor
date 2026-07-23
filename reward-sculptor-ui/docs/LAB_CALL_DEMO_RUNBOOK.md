@@ -190,32 +190,26 @@ continuity scale 2, and entropy coefficient 0.0075. PPO iteration 0 is active.
 Do not run an intermediate audit; apply the complete acceptance checklist only
 after the job finishes and preserves its official rollout.
 
-Iter 11 is now complete. Its strict batch audit found 25/64 full physical
-conjunctions, but rendered environment 0 still held only 82/100 frames.
-Although it ended at 0.08116 m/s, the keyframes and terminal video clearly
-show a repeated wide-stance sway. Do not present it as the solved clip.
+Iter 12 is complete. It preserved 63/64 actual ordered route-and-finish
+traversals, 58/64 zero-contact trajectories, and 64/64 no-fall trajectories.
+Twenty-six environments met the strict horizontal full conjunction, and 24
+also met the whole-body quiet contract. Rendered environment 0 traversed
+every actual disk in order with zero contact and no fall, ended at 0.01920
+m/s, and remained inside the finish, but its longest horizontal hold was
+92/100 frames and its longest whole-body-qualified hold was 81/100. The
+keyframes and terminal video still show corrective steps and arm/torso sway.
+Do not present it as the solved clip.
 
-The weight-4 term increased terminal-stillness reward as intended, but exposed
-a continuity loophole: only horizontal base speed reset the streak, so
-in-place stepping, rotation, and joint motion could retain nominal
-uninterrupted credit. The next recovery requires whole-body quiet:
-horizontal speed below 0.12 m/s, angular speed below 0.5 rad/s, and joint RMS
-velocity below 1.0 rad/s. Any one exceeding its threshold loses the accumulated
-streak. This remains phase-gated, timestep-correct, balanced at weight 4, and
-generic across velocity-command robots.
-
-Launch one exact-promoted-tuple cycle from selection v20 and warm-start
-`runs/iter_11/checkpoint.pt`. Require actor+critic warm-start, tracking weights
-2.0, terminal weight 4, hold 2, and continuity scale 2 before PPO iteration 0.
-
-That recovery is active as UI job `b12d93ae0b4b3029`, iter 12, from clean
-commit `16d7c5e`. It restored selection v20, pinned selection v21 with the
-unchanged promoted tuple, and loaded actor plus critic from
-`runs/iter_11/checkpoint.pt` (sha8 `e1833254`). The live log confirms
-goal-conditioned terminal braking, tracking weights 2.0, entropy 0.0075,
-whole-body terminal continuity at weight 4, hold 2 seconds, and continuity
-scale 2. PPO iteration 0 is active. Wait for the official rollout before
-making any presentation claim.
+The stricter reward is learning rather than plateauing: its 100-iteration
+block average rose from 0.0 to 19.54 during iter 12, while route reliability
+held at 63/64 and terminal speed improved. Continue the exact contract for one
+more recovery cycle before changing supervision. Launch from selection v21
+with **Resume exact promoted tuple**, warm-start
+`runs/iter_12/checkpoint.pt`, and require actor+critic warm-start, tracking
+weights 2.0, terminal weight 4, hold 2 seconds, continuity scale 2, and the
+whole-body quiet thresholds (horizontal 0.12 m/s, angular 0.5 rad/s, joint
+RMS 1.0 rad/s) before PPO iteration 0. The official 100-frame rendered hold
+remains mandatory.
 
 ## Exact overnight launch settings
 

@@ -1787,3 +1787,48 @@ Do not run an intermediate GPU audit or edit watched core. After completion,
 apply the same strict actual-geometry, first-episode-safe artifact, keyframe,
 and full-video acceptance audit. The rendered uninterrupted 100-frame hold
 remains mandatory.
+
+## Official iter-12 audit + exact-contract continuation 2026-07-23 (Codex)
+
+UI job `b12d93ae0b4b3029` completed, preserved
+`runs/iter_12/checkpoint.pt`, and atomically marked iter 12 complete. Frozen
+`gen_003` reports fitness 0.19524, progress 0.84841, ordered-course evidence
+0.92183, finish evidence 0.79884, hold evidence 0.40625, stillness 0.41599,
+uprightness 0.62220, its permissive completion gate in 24/64, contact in 6/64,
+zero falls, and terminal speed 0.07633 m/s. The realism audit remains clean:
+no joint-limit or torque saturation, no reset launch, and no naturalness
+rejection; joint-velocity p99 improved to 9.77.
+
+The independent first-episode-safe audit found 63/64 actual ordered
+traversals of all four 0.45 m waypoint disks plus the 0.9 m finish disk,
+63/64 index-5 and authored-success observations, 58/64 zero-contact
+trajectories, and 64/64 full-length/no-sustained-fall trajectories.
+Twenty-eight environments produced a literal uninterrupted 100-frame
+horizontal hold after index 5 while inside the finish and upright; 26 also
+satisfied the complete ordered-route, success, zero-contact, and no-fall
+conjunction. Requiring the newly trained whole-body quiet contract as well
+reduced those counts to 26 and 24 respectively. The horizontal longest-run
+mean/median were 94.53/96.5 frames and the whole-body-qualified
+mean/median were 89.95/89.5 frames. Sixty-one of 64 terminal mean speeds and
+59/64 final speeds were below 0.12 m/s.
+
+Rendered environment 0 completed the actual zones at steps
+127/266/406/543/626, reached index 5 at 687 and authored success at 787, and
+had zero forbidden contact and no fall. It finished 0.436 m from the finish
+center with terminal mean speed 0.05849 m/s and final speed 0.01920 m/s. Its
+longest literal horizontal hold was nevertheless only 92 frames, and its
+longest whole-body-qualified hold was 81 frames. The official keyframes,
+complete-video sheet, and terminal sheet agree: the route is real and clean,
+but the robot still alternates small corrective steps and arm/torso motion
+inside the finish. The showcase therefore remains honestly incomplete.
+
+This is not a stalled supervision signal. The newly strict
+`sculptor_terminal_stillness` episodic reward averaged 0.0 over PPO
+iterations 0-99, then rose through 0.52, 8.74, 13.02, 15.41, 16.85, and
+17.73 in successive 100-iteration blocks, reaching 19.54 over iterations
+700-749. Route reliability stayed at 63/64 while terminal speed and
+joint-velocity p99 improved. The highest-quality next action is therefore one
+more exact-promoted-tuple recovery cycle from selection v21, warm-starting the
+iter-12 actor and critic without changing the now-correct generic contract.
+Do not train the automatic reward/environment diagnosis drafts; they remain
+unpromoted provenance.
