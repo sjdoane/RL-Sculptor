@@ -1381,3 +1381,51 @@ whole-body stillness supervision at weight 1 before PPO iteration 0. Do not
 edit reload-watched core or run an intermediate GPU audit while iter 7 is
 alive. The heartbeat monitor has been updated to this job and the literal
 100-frame acceptance rule.
+
+## Official iter-7 audit + continuity-validator hardening 2026-07-22 (Codex)
+
+UI job `5f7e50d020ead92c` completed and preserved
+`runs/iter_7/checkpoint.pt`. The official first-episode mask contains 999
+valid samples for every environment (the timeout/reset row is correctly
+absorbed). All 64 environments independently crossed the four authored disks
+in order, reached waypoint index 5, entered the actual 0.9 m finish disk, and
+remained upright; 55/64 had zero forbidden contact and 62/64 asserted the
+authored two-second success channel. Mean terminal horizontal speed improved
+from 0.11179 to 0.09803 m/s, with 52/64 terminal means below 0.12 m/s.
+
+The literal continuous hold improved from 0/64 to 4/64. Environments
+18, 31, 39, and 57 each produced an uninterrupted post-completion,
+inside-finish, upright run of at least 100 speed samples below 0.12 m/s; the
+longest was 156 frames. Those same four satisfy the full physical conjunction,
+including zero contact. The rendered environment 0 completed the course in
+order at step 742, asserted authored success at 842, entered the finish with
+zero contact, remained upright, ended at exactly zero instantaneous speed, and
+averaged 0.06675 m/s over the terminal window. It still reached only 63
+consecutive quiet frames, so the official video cannot yet be claimed as the
+literal two-second demonstration. Visual inspection of the full valid
+20-second 1920×1080 MP4 and 5 Hz terminal sheet agrees: a correct weave and
+calm upright finish remain punctuated by small foot/arm adjustments.
+
+`gen_003` reports 6/64 completion because its immutable gate accepts more
+than 90% quiet samples. Future prompt-native metrics are now hardened:
+duration-qualified or explicitly continuous dwell goals receive an adversarial
+competent fixture with nine sparse 0.30 m/s interruptions across the terminal
+two seconds. It retains over 90% quiet samples and all authored completion
+state but has no uninterrupted hold. The metric must floor that fixture at
+0.05 or below. The authoring prompt also explicitly requires consecutive-run
+logic using duration / step_dt and forbids mean, percentile, or fraction
+proxies for continuity. This uses universal root motion plus compiled task
+state and contains no robot/task-name keying.
+
+Do not train automatic drafts reward v8/env v5 next. Their diagnosis claims
+0.24 m/s residual motion despite the official frozen trajectory measuring
+0.09803 m/s, and both reward edits were partition-gate flagged. Preserve them
+as provenance. The next safe continuation is **Resume exact promoted tuple**
+from selection v14 (reward v7/env v4), warm-starting iter 7 for one more
+750-PPO cycle with the same UI settings. This keeps the proven route and
+stillness gradient while rejecting stale/partition-flagged drafts.
+
+Verification for the continuity hardening: channel-catalog metric suite 10/10;
+generated metric, reference-generation, and spec-metric suites 124/124;
+compileall, `git diff --check`, and scoped Ruff passed. Ruff ignored only the
+file's pre-existing E402/F401/E702 debt; no new finding remains.

@@ -19,35 +19,29 @@ Open **Projects → G1 Lab Showcase — Weave and Stop**.
 - Adapter: `mjlab`
 - Task: `Mjlab-Velocity-Flat-Unitree-G1`
 - Device: `cuda:0`
-- Promoted training tuple: `785b6c62f942…` (selection v13: reward v5 + env
-  v1; the frozen world/task/evaluation half is unchanged)
+- Promoted training tuple: `de07325bab038d29…` (selection v14: reward v7 +
+  env v4; the frozen world/task/evaluation half is unchanged)
 - Evaluation lineage: `world-58560025c10981814943d42e`
 - Objective metric: `gen_003` (accepted, prompt-native, observe-only)
-- Latest completed recovery job: `556e643b0b1ad22b` (code `83413d9`,
-  exact promoted tuple restored before training)
-- Active recovery job: `5f7e50d020ead92c`, iter 7, clean code `2b84fab`.
-  Normal Resume consumed reward v7 + env v4 and pinned selection v14 / tuple
-  `de07325bab038d29…`; exact promoted-tuple recovery was correctly left off.
+- Latest completed recovery job: `5f7e50d020ead92c`, iter 7, clean code
+  `2b84fab`; it consumed reward v7 + env v4 and warm-started iter 6.
+- No recovery is active while the exact iter-7 artifacts are being audited.
 
-The July 22 iter-6 rollout independently crossed all four intermediate regions
-in exact order in 64/64 environments; 63/64 entered the finish and reached
-waypoint index 5, 55/64 avoided every box, and none fell. The rendered
-environment completed the route with zero contact, remained upright, and ended
-at 0.08203 m/s. The 20-second 1080p video is valid and visibly shows the weave,
-finish entry, and an upright stopping attempt.
+The July 22 iter-7 rollout crossed all four authored disks in exact order,
+reached waypoint index 5, entered the actual finish disk, and remained upright
+in 64/64 environments; 55/64 avoided every box and 62/64 asserted authored
+success. Mean terminal speed improved to 0.09803 m/s. Four environments now
+satisfy the complete literal conjunction, including one uninterrupted
+100-frame post-completion hold; the longest hold is 156 frames.
 
-It is not yet accepted as solved. Batch terminal speed averaged 0.11179 m/s,
-only 41/64 ended below 0.12 m/s, and no environment stayed continuously below
-that threshold for all 100 frames of the required two seconds; the best
-continuous run was 75 frames. The frozen `gen_003` metric's 90%-quiet proxy
-marks three environments complete, but this runbook deliberately applies the
-literal continuous physical criterion. The next generic recovery adds
-whole-body stillness supervision only after the compiled command enters its
-terminal standing phase, while reward v7 doubles the authored settling weight,
-adds finish double-support shaping, and env v4 reduces entropy. Route command
-tracking remains at full weight. That recovery is now active; its log proves
-the iter-6 actor + critic warm start, entropy coefficient 0.0075, and terminal
-whole-body stillness term at weight 1 before PPO iteration 0.
+It is still not accepted as the call-ready proof because the rendered
+environment, although clean and visibly correct through the weave, achieved
+only 63 consecutive quiet frames. Its terminal mean was 0.06675 m/s and final
+instantaneous speed was zero, but small foot/arm corrections interrupt the
+literal two seconds. The frozen `gen_003` metric reports six completions
+because it uses a 90%-quiet proxy; the runbook applies the stronger consecutive
+criterion. Future generated metrics now receive an adversarial interrupted
+hold fixture so that shortcut is rejected before acceptance.
 
 ## One-time startup
 
@@ -121,12 +115,14 @@ trust boundary. The prepared project already has accepted metric `gen_003`.
 Use **Resume** in the Training tab with the exact behavior goal above, Auto
 mode, one sculpt iteration, 750 rsl_rl iterations, 1,024 environments,
 `cuda:0`, 1,000 episode steps, two rollout episodes, seed 42, 1920×1080 video,
-and `gen_003` observe-only. Leave **Resume exact promoted tuple** off: this
-normal iteration intentionally consumes diagnosis drafts reward v7 + env v4
-and continues from the preserved iter-6 policy. Before letting the cycle
-continue, verify the Training log contains all four facts:
+and `gen_003` observe-only. Enable **Resume exact promoted tuple** to reject
+the stale, partition-flagged reward-v8/env-v5 diagnosis drafts and restore
+selection v14 (reward v7 + env v4) before continuing from the preserved iter-7
+policy. Before letting the cycle continue, verify the Training log contains
+all five facts:
 
-- `resume_warm_start_resolved ... runs/iter_6/checkpoint.pt`
+- `promoted_tuple_restored ... selection v14 ... reward v7 ... env v4`
+- `resume_warm_start_resolved ... runs/iter_7/checkpoint.pt`
 - `warm_start_loaded ... load_cfg_keys=[actor, critic]`
 - `preserved authored command supervision at full weight`
 - `installed authored terminal whole-body stillness supervision`

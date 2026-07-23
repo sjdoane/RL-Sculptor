@@ -284,3 +284,10 @@ cannot pass is an automatic self-rejection.
 - Episode boundaries are where success lives (the end state IS the goal) —
   any operation with boundary artifacts (convolve/filtfilt padding, gradient
   endpoints) corrupts exactly the frames your completion gate reads.
+- If the goal says a state must be held continuously, uninterrupted, or for a
+  stated duration, the completion gate must find one CONSECUTIVE run of
+  qualifying frames whose length is at least duration / step_dt. A window
+  mean, median, percentile, or fraction such as 90% quiet samples is not
+  continuity: sparse violations can satisfy those summaries while breaking
+  every genuine hold. The validator includes a competent terminal state with
+  sparse one-frame interruptions specifically to reject this shortcut.

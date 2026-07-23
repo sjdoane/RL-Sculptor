@@ -672,6 +672,63 @@ _ABSTRACT_PHASES = frozenset({
 })
 
 
+def _requires_uninterrupted_hold(behavior_goal: Optional[str]) -> bool:
+    """Return whether success requires one gap-free dwell interval."""
+    goal = (behavior_goal or "").lower()
+    explicit = any(
+        word in goal
+        for word in (
+            "continuous", "continuously", "uninterrupted",
+            "without interruption", "consecutive",
+        )
+    )
+    duration = bool(re.search(
+        r"\b(?:for\s+(?:at\s+least\s+)?|at\s+least\s+)"
+        r"\d+(?:\.\d+)?\s*"
+        r"(?:s|sec|secs|second|seconds|minute|minutes)\b",
+        goal,
+    ))
+    dwell = any(
+        word in goal
+        for word in (
+            "hold", "remain", "stay", "pause", "wait", "dwell",
+            "still", "stationary", "stop",
+        )
+    )
+    return explicit or (duration and dwell)
+
+
+def _interrupted_hold_probe(
+    arrays: Mapping[str, Any], *, step_dt: float = 0.02,
+) -> dict[str, Any]:
+    """Clone a competent rollout but interrupt its terminal dwell sparsely.
+
+    Nine single-frame 0.30 m/s root motions are spread through the final two
+    seconds.  More than 90 percent of samples remain below 0.12 m/s, so a
+    fraction/mean proxy passes, while no uninterrupted two-second interval
+    exists.  Catalog completion state deliberately remains competent: the
+    metric must verify the prompted physical continuity, not trust a summary.
+    """
+    probe = {
+        key: value.copy() if hasattr(value, "copy") else value
+        for key, value in arrays.items()
+    }
+    root = probe.get("root_link_pos_w")
+    if not isinstance(root, np.ndarray) or root.ndim != 3 or root.shape[0] < 30:
+        return probe
+    hold_steps = min(
+        root.shape[0] - 2,
+        max(10, int(round(2.0 / float(step_dt)))),
+    )
+    start = root.shape[0] - hold_steps
+    spike_steps = np.linspace(
+        start + 1, root.shape[0] - 2, 9, dtype=int)
+    delta = 0.30 * float(step_dt)
+    for step in np.unique(spike_steps):
+        root[step:, :, 0] += delta
+    return probe
+
+
 def _declared_abstract_objective(source: str) -> Optional[Mapping[str, Any]]:
     """Read the data-only declaration from source without executing it.
 
@@ -2404,6 +2461,9 @@ def validate_generated_metric(
             fixture_base.update(catalog_fixture_arrays(
                 catalog, time_steps=case_steps, num_envs=E, case=case))
             arche[name] = fixture_base
+        if _requires_uninterrupted_hold(behavior_goal):
+            arche["catalog_interrupted_hold"] = _interrupted_hold_probe(
+                arche["catalog_competent"])
     scores: dict[str, float] = {}
 
     # 3 + 4: determinism + bounded/finite, over every archetype.
@@ -2689,6 +2749,23 @@ def validate_generated_metric(
                     f"vs competent {competent_score:.3f}; require separation "
                     f">= {spread_min:.3f}")
         gates["catalog_degenerate_fixtures"] = catalog_degenerate_ok
+        if _requires_uninterrupted_hold(behavior_goal):
+            interrupted_score = scores.get(
+                "catalog_interrupted_hold", float("nan"))
+            continuous_ceiling = min(float(distractor_ceiling), 0.05)
+            continuous_ok = (
+                np.isfinite(interrupted_score)
+                and interrupted_score <= continuous_ceiling
+            )
+            gates["continuous_hold_interruption"] = continuous_ok
+            if not continuous_ok:
+                reasons.append(
+                    "[continuous-hold] a physically interrupted terminal "
+                    f"dwell scored {interrupted_score:.3f}; an explicitly "
+                    "continuous duration must fail its completion gate, not "
+                    "pass through a mean or quiet-sample fraction "
+                    f"(required <= {continuous_ceiling:.3f})"
+                )
 
     # §REFERENCE_TRAJECTORY_PLAN §5: reference-anchored validation — ADDITIVE,
     # only runs when the caller attaches reference clip(s) and the metric

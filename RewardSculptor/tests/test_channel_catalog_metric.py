@@ -369,8 +369,16 @@ def compute_spec(arrays, behavior, meta):
     if root is None or success is None:
         return {{"spec_score": 0.0}}
     dx = root[-1, :, 0] - root[0, :, 0]
-    speed = np.linalg.norm(np.diff(root, axis=0)[..., :2], axis=-1)
-    physical = (dx > 0.5) & (np.mean(speed[-20:], axis=0) < 0.02)
+    dt = float(behavior.get("step_dt", 0.02) or 0.02)
+    speed = np.linalg.norm(
+        np.diff(root, axis=0)[..., :2], axis=-1) / dt
+    quiet = speed < 0.12
+    run = np.zeros(root.shape[1])
+    best = np.zeros(root.shape[1])
+    for t in range(quiet.shape[0]):
+        run = np.where(quiet[t], run + 1.0, 0.0)
+        best = np.maximum(best, run)
+    physical = (dx > 0.5) & (best >= round(2.0 / dt))
     completed = np.mean(success[-3:] > 0.5, axis=0) >= 1.0
     return {{"spec_score": float(np.mean(physical & completed))}}
 '''
@@ -394,6 +402,57 @@ def compute_spec(arrays, behavior, meta):
     assert scores["catalog_competent"] > 0.9
     assert scores["catalog_far_idle"] == pytest.approx(0.0)
     assert scores["prompt_competent"] > 0.9
+    assert scores["catalog_interrupted_hold"] == pytest.approx(0.0)
+    assert result["gates"]["continuous_hold_interruption"]
+
+
+def test_continuous_hold_rejects_quiet_sample_fraction_proxy(
+    tmp_path: Path,
+) -> None:
+    draft = author_environment(
+        "Build a slalom around four boxes with ordered waypoints and a finish zone",
+        robot_capability_id="unitree_g1:base",
+    )
+    catalog = compile_channel_catalog(draft.world_spec, draft.task_spec)
+    success_name = next(
+        name for name in catalog.names()
+        if name.startswith("goal__") and name.endswith("__success")
+    )
+    source = f'''\
+import numpy as np
+
+ABSTRACT_OBJECTIVE = {{"phases": ["move_forward", "recover", "dwell"]}}
+
+def compute_spec(arrays, behavior, meta):
+    root = arrays.get("root_link_pos_w")
+    success = arrays.get("{success_name}")
+    if root is None or success is None:
+        return {{"spec_score": 0.0}}
+    dt = float(behavior.get("step_dt", 0.02) or 0.02)
+    speed = np.linalg.norm(
+        np.diff(root, axis=0)[..., :2], axis=-1) / dt
+    quiet_fraction = np.mean(speed[-100:] < 0.12, axis=0)
+    dx = root[-1, :, 0] - root[0, :, 0]
+    completed = np.mean(success[-3:] > 0.5, axis=0) >= 1.0
+    physical = (dx > 0.5) & (quiet_fraction > 0.9)
+    return {{"spec_score": float(np.mean(physical & completed))}}
+'''
+    path = _write_metric(tmp_path, source, "fraction_hold.py")
+
+    result = validate_generated_metric(
+        source,
+        path,
+        behavior_goal=(
+            "Run through the ordered slalom, enter the finish, then remain "
+            "upright and still continuously for at least 2 seconds"
+        ),
+        channel_catalog=catalog,
+    )
+
+    assert not result["ok"]
+    assert not result["gates"]["continuous_hold_interruption"]
+    assert result["archetype_scores"]["catalog_interrupted_hold"] > 0.9
+    assert any("[continuous-hold]" in reason for reason in result["reasons"])
 
 
 def test_runtime_requires_matching_catalog_hash_and_loads_only_allowlist(tmp_path):
