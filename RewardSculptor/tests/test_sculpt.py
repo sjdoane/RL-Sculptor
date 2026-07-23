@@ -25,11 +25,83 @@ from sculptor.adapters.base import (
     TrainResult,
 )
 from sculptor.sculpt import (
+    _find_resume_start_iteration,
     _should_early_stop,
     regenerate_reward_template,
     sculpt_init,
     sculpt_run,
 )
+
+
+def _write_reward_version(rewards_dir: Path, version: int) -> None:
+    rewards_dir.mkdir(parents=True, exist_ok=True)
+    (rewards_dir / f"v{version}.py").write_text(
+        "def compute_reward(*args, **kwargs):\n    return 0.0, {}\n",
+        encoding="utf-8",
+    )
+
+
+def _write_completion_marker(runs_dir: Path, version: int, **overrides) -> None:
+    iter_dir = runs_dir / f"iter_{version}"
+    iter_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema": 1,
+        "state": "completed",
+        "iter": version,
+    }
+    payload.update(overrides)
+    (iter_dir / "iteration_complete.json").write_text(
+        json.dumps(payload),
+        encoding="utf-8",
+    )
+
+
+def test_resume_advances_past_completed_no_edit_iteration(tmp_path: Path):
+    rewards = tmp_path / "rewards"
+    runs = tmp_path / "runs"
+    _write_reward_version(rewards, 3)
+    _write_completion_marker(runs, 3)
+
+    assert _find_resume_start_iteration(rewards, runs) == 4
+
+
+def test_resume_advances_past_contiguous_completion_markers(tmp_path: Path):
+    rewards = tmp_path / "rewards"
+    runs = tmp_path / "runs"
+    _write_reward_version(rewards, 3)
+    _write_completion_marker(runs, 3)
+    _write_completion_marker(runs, 4)
+
+    assert _find_resume_start_iteration(rewards, runs) == 5
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"schema": 2},
+        {"state": "running"},
+        {"iter": 99},
+    ],
+)
+def test_resume_reuses_iteration_with_invalid_completion_marker(
+    tmp_path: Path,
+    overrides: dict,
+):
+    rewards = tmp_path / "rewards"
+    runs = tmp_path / "runs"
+    _write_reward_version(rewards, 3)
+    _write_completion_marker(runs, 3, **overrides)
+
+    assert _find_resume_start_iteration(rewards, runs) == 3
+
+
+def test_resume_does_not_jump_over_completion_marker_gap(tmp_path: Path):
+    rewards = tmp_path / "rewards"
+    runs = tmp_path / "runs"
+    _write_reward_version(rewards, 3)
+    _write_completion_marker(runs, 4)
+
+    assert _find_resume_start_iteration(rewards, runs) == 3
 
 
 # ── Metric-plateau auto-kill compatibility ───────────────────────────────
@@ -485,6 +557,13 @@ def test_sculpt_run_dry_run_end_to_end(tmp_path: Path, monkeypatch):
         assert (proj / "runs" / f"iter_{i}" / "checkpoint.zip").is_file()
         assert (proj / "runs" / f"iter_{i}" / "rollout" / "behavior.json").is_file()
         assert (proj / "runs" / f"iter_{i}" / "diagnosis.json").is_file()
+        completion = json.loads(
+            (proj / "runs" / f"iter_{i}" / "iteration_complete.json").read_text(
+                encoding="utf-8",
+            )
+        )
+        assert completion["state"] == "completed"
+        assert completion["iter"] == i
     for n in (1, 2, 3):
         assert (proj / "rewards" / f"v{n}.py").is_file()
     # current.py now re-exports v3

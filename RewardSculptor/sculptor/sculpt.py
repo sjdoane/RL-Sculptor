@@ -278,6 +278,77 @@ def _find_latest_reward_version(rewards_dir: Path) -> tuple[int, Path]:
     return best_n, best_path
 
 
+_ITERATION_COMPLETE_MARKER = "iteration_complete.json"
+
+
+def _iteration_has_completion_marker(iter_dir: Path, iter_index: int) -> bool:
+    """Return whether ``iter_dir`` has this runner's valid durable marker.
+
+    A mere file is not enough: corrupt, copied, or wrong-index markers must
+    preserve same-iteration crash recovery rather than silently skipping work.
+    """
+    marker = iter_dir / _ITERATION_COMPLETE_MARKER
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return (
+        isinstance(payload, dict)
+        and payload.get("schema") == 1
+        and type(payload.get("iter")) is int
+        and payload.get("iter") == iter_index
+        and payload.get("state") == "completed"
+    )
+
+
+def _find_resume_start_iteration(
+    rewards_dir: Path,
+    runs_dir: Path,
+) -> int:
+    """Choose the first unfinished iteration without redefining resume.
+
+    Reward versions normally advance the iteration counter. A fully valid
+    iteration may intentionally produce no reward rewrite, however, so reward
+    numbering alone can point back at work that already completed. Durable,
+    contiguous completion markers advance past only those iterations. A
+    missing/corrupt marker keeps the existing same-iteration crash-resume
+    behavior.
+    """
+    start_iter, _ = _find_latest_reward_version(rewards_dir)
+    while _iteration_has_completion_marker(
+        runs_dir / f"iter_{start_iter}", start_iter
+    ):
+        start_iter += 1
+    return start_iter
+
+
+def _write_iteration_completion_marker(
+    iter_dir: Path,
+    *,
+    iter_index: int,
+    checkpoint_path: Path,
+    reward_version_before: int,
+    reward_version_after: int | None,
+    world_selection_hash: str | None,
+) -> None:
+    """Atomically make a completed iteration distinguishable from a crash."""
+    from sculptor.run_context import write_json_atomic
+
+    write_json_atomic(
+        iter_dir / _ITERATION_COMPLETE_MARKER,
+        {
+            "schema": 1,
+            "state": "completed",
+            "iter": int(iter_index),
+            "completed_at": _utc_now_iso(),
+            "checkpoint": str(checkpoint_path),
+            "reward_version_before": int(reward_version_before),
+            "reward_version_after": reward_version_after,
+            "world_selection_hash": world_selection_hash,
+        },
+    )
+
+
 def _current_reward_target(rewards_dir: Path) -> Optional[Path]:
     """The v<n>.py that rewards/current.py ACTUALLY re-exports — i.e. the
     reward training runs. Parses the `_LATEST = _HERE / 'v<n>.py'` line
@@ -2249,6 +2320,21 @@ def _run_one_iter(
         "reward_version_after": reward_version_after,
         "paper_refs": sorted(set(applied_paper_refs)),
     })
+    _write_iteration_completion_marker(
+        iter_dir,
+        iter_index=iter_index,
+        checkpoint_path=checkpoint_path,
+        reward_version_before=(
+            int(_m_trained.group(1)) if _m_trained else latest_n
+        ),
+        reward_version_after=reward_version_after,
+        world_selection_hash=world_selection_hash,
+    )
+    _emit_event({
+        "type": "iteration_completion_marked",
+        "iter": iter_index,
+        "marker": str(iter_dir / _ITERATION_COMPLETE_MARKER),
+    })
 
     # §Ship 48: never-silent env-extension signal. The diagnoser flags edits
     # it WANTS but can't ground because the adapter doesn't expose the needed
@@ -2631,7 +2717,17 @@ def sculpt_run(
 
     # Start iter index
     latest_n_before_loop, _ = _find_latest_reward_version(rewards_dir)
-    start_iter = latest_n_before_loop if resume else 0
+    start_iter = (
+        _find_resume_start_iteration(rewards_dir, runs_dir)
+        if resume
+        else 0
+    )
+    if resume and start_iter > latest_n_before_loop:
+        _emit_event({
+            "type": "resume_completed_iterations_advanced",
+            "reward_version": latest_n_before_loop,
+            "start_iter": start_iter,
+        })
     if not resume and start_iter != 0:
         sys.stderr.write(
             f"[sculpt] warning: rewards/ already has v{start_iter}.py but "

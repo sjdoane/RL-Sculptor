@@ -1507,3 +1507,32 @@ do not train it: the next safe run must again use **Resume exact promoted
 tuple** from selection v15 (reward v7/env v4), warm-start iter 8, and run one
 750-PPO recovery cycle. Confirm the new continuity-aware supervision line
 before PPO begins.
+
+## Completed-iteration Resume allocator hardening 2026-07-22 (Codex)
+
+The first post-fix UI Resume, job `6d377b31a78cfbca`, restored the exact
+selection-v15 tuple correctly but exposed a generic counter bug before any GPU
+worker launched: reward numbering still pointed at 8, so the runner selected
+completed `iter_8`, skipped its checkpoint and rollout, and repeated only the
+diagnosis/edit phases. That no-op run is preserved as failure provenance. It
+created unused automatic drafts reward v9 and env v7; do not train them. The
+next exact-tuple restore must continue from immutable reward v7/env v4.
+
+The runner now writes an atomic `iteration_complete.json` only after an
+iteration has completed training, rollout, objective/realism evaluation,
+diagnosis, and edits. Resume begins at the latest reward number and advances
+only across a contiguous sequence of valid, matching completion markers.
+Missing, corrupt, wrong-schema, wrong-state, and wrong-index markers retain
+the existing same-iteration crash-resume path. This closes the no-edit/no-op
+case without weakening partial-run recovery or assuming contiguous reward and
+run indices. The UI log emits `iteration_completion_marked` at completion and
+`resume_completed_iterations_advanced` when the marker, rather than a new
+reward file, advances the counter.
+
+Focused orchestrator + warm-start verification is 65/65 passing, including
+contiguous advance, invalid-marker rejection, gap preservation, and an
+end-to-end dry-run that checks the durable marker. Scoped Ruff (with only the
+files' recorded pre-existing debt ignored), compileall, and `git diff --check`
+also pass. Relaunch from the UI only after this slice is committed; expected
+next iteration is 9 and its live command must warm-start from
+`runs/iter_8/checkpoint.pt`.

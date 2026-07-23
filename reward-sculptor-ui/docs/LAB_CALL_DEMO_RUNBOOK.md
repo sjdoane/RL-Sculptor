@@ -282,7 +282,10 @@ failure-analysis story only.
   project, and relaunch the same settings with Resume enabled. Resume searches
   the actual preceding iteration artifacts rather than assuming reward and run
   indices are contiguous, so a UI-authored reward-version gap still loads the
-  newest valid learned policy. The Training log must emit
+  newest valid learned policy. A completed iteration also has an atomic
+  `iteration_complete.json`; Resume advances past only contiguous, valid
+  completion markers, while a missing or corrupt marker keeps same-iteration
+  crash recovery. The Training log must emit
   `resume_warm_start_resolved` followed by `warm_start_loaded`; stop the run if
   a fresh actor is initialized instead.
 - **Reject a bad automatic diagnosis:** open New run → Advanced and enable
