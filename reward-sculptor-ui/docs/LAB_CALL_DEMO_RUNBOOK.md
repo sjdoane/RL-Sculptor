@@ -181,6 +181,15 @@ verify the terminal-supervision log reports weight 4, hold 2 seconds, and
 continuity scale 2, alongside actor+critic warm-start and full tracking
 weights.
 
+That recovery is now active as UI job `801b0549f5be7328`, iter 11, from clean
+commit `356a188`. It restored selection v19 and pinned selection v20 with the
+unchanged promoted tuple. The live worker loaded actor and critic from
+`runs/iter_10/checkpoint.pt` (sha8 `11d72466`) and logged exactly the expected
+tracking weights 2.0, terminal stillness weight 4, two-second hold,
+continuity scale 2, and entropy coefficient 0.0075. PPO iteration 0 is active.
+Do not run an intermediate audit; apply the complete acceptance checklist only
+after the job finishes and preserves its official rollout.
+
 ## Exact overnight launch settings
 
 From **World**, choose **Train this world**, or open **New run**. Select

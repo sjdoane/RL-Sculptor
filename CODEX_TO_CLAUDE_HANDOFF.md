@@ -1695,3 +1695,26 @@ draft remain diagnosis provenance only: both reward edits were
 partition-gate flagged. The next safe run is one UI exact-promoted-tuple
 continuation from selection v19 (reward v7/env v4), warm-starting iter 10
 after this balanced-supervision slice is committed.
+
+## Iter-11 balanced-hold recovery launched 2026-07-23 (Codex)
+
+The next safe recovery is active from the UI as job `801b0549f5be7328`.
+New Run used the exact 484-character behavior goal, Auto, one 750-PPO cycle,
+1,024 environments, seed 42, two 1,000-step 1920x1080 episodes, `gen_003`
+observe-only, and **Resume exact promoted tuple**.
+
+The UI restored selection v19 and the runner pinned `selection_v20.json` for
+iter 11 with the unchanged tuple
+`de07325bab038d29fa6705148f795d201d8159c42d93b8ddd92c4ec41f2226db`,
+reward v7, and env v4. Run context captured clean commit `356a188`. The worker
+resolved and loaded `runs/iter_10/checkpoint.pt` (sha8 `11d72466`) for both
+actor and critic. Live configuration proves goal-conditioned route traversal
+with terminal braking, full linear/angular tracking weights of 2.0, entropy
+coefficient 0.0075, and continuity-aware terminal stillness at balanced
+weight 4, `hold_s=2`, continuity scale 2. PPO iteration 0 is active.
+
+Do not run an intermediate GPU audit or edit watched core while iter 11 is
+alive. After completion, preserve/promote its checkpoint and repeat the
+strict actual-geometry, first-episode-safe trajectory, objective/fitness,
+keyframe, and full-video audit. The full physical conjunction and rendered
+100-frame hold remain the acceptance gate.
