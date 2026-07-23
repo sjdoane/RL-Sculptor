@@ -288,6 +288,11 @@ failure-analysis story only.
   crash recovery. The Training log must emit
   `resume_warm_start_resolved` followed by `warm_start_loaded`; stop the run if
   a fresh actor is initialized instead.
+- **A run errors before PPO iteration 0:** preserve the failed job, inspect its
+  traceback, fix and verify the generic runtime contract, then relaunch the
+  identical UI configuration. A pre-PPO configuration failure has not produced
+  a new learned checkpoint; Resume must still load the last valid promoted
+  actor and critic.
 - **Reject a bad automatic diagnosis:** open New run → Advanced and enable
   **Resume exact promoted tuple**. The launch must log
   `promoted_tuple_restored` with the expected selection/tuple hash and

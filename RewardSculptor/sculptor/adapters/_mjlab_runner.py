@@ -936,7 +936,10 @@ def _build_authored_terminal_stillness_term_class():
     import torch
 
     class AuthoredTerminalStillnessTerm:
-        def __init__(self, _cfg, env):  # type: ignore[no-untyped-def]
+        def __init__(self, cfg, env):  # type: ignore[no-untyped-def]
+            # ManagerBase constructs class-backed terms with these exact
+            # keyword names (`func(cfg=term_cfg, env=self._env)`).
+            del cfg
             self._quiet_streak_s = torch.zeros(
                 int(env.num_envs), device=env.device)
 

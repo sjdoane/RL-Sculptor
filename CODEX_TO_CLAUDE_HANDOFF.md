@@ -1536,3 +1536,15 @@ files' recorded pre-existing debt ignored), compileall, and `git diff --check`
 also pass. Relaunch from the UI only after this slice is committed; expected
 next iteration is 9 and its live command must warm-start from
 `runs/iter_8/checkpoint.pt`.
+
+The first real iter-9 launch, UI job `d81e0e8471509b7a`, proved the allocator
+fix (`iter 9` appeared immediately) but failed before PPO during reward-manager
+construction. Mjlab instantiates class-backed reward terms with keyword
+arguments `cfg=` and `env=`; the new continuity term had named the first
+argument `_cfg`, so Python rejected the manager's exact contract. The
+constructor now accepts the canonical `cfg` name and explicitly discards the
+unused value. Its regression test also constructs the term with the real
+keyword call. No GPU training or checkpoint was lost. Focused Mjlab adapter
+verification is 47/47 passing; Ruff, compileall, and `git diff --check` pass.
+Relaunch the same exact-tuple iter-9 configuration and require the continuity
+installation line plus actor/critic warm-start before PPO iteration 0.

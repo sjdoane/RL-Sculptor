@@ -191,7 +191,8 @@ def test_authored_terminal_stillness_rewards_continuity_and_resets() -> None:
         scene={"robot": SimpleNamespace(data=data)},
     )
     term_type = _build_authored_terminal_stillness_term_class()
-    term = term_type(SimpleNamespace(), env)
+    # Match ManagerBase's real class-backed term construction contract.
+    term = term_type(cfg=SimpleNamespace(), env=env)
     params = {
         "lin_std": 0.12,
         "ang_std": 0.5,
