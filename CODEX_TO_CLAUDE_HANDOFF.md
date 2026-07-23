@@ -1561,3 +1561,48 @@ coefficient 0.0075, and continuity-aware terminal stillness at weight 1 with
 reload-watched core or run an intermediate GPU audit while this worker lives.
 After completion, apply the same strict official-artifact/video acceptance
 audit used for iter 8.
+
+## Official iter-9 audit + timestep-invariant continuity 2026-07-23 (Codex)
+
+UI job `dde47f043fe792ec` completed, atomically marked iter 9 complete, and
+preserved `runs/iter_9/checkpoint.pt`. The frozen metric reports fitness
+0.10508, progress 0.84581, ordered course 64/64, authored success 63/64,
+contact in 8/64, zero falls, terminal speed 0.09795 m/s, and its permissive
+completion gate in 14/64.
+
+The independent first-episode-safe audit used 999 valid samples in every
+environment and the actual authored geometry: four 0.45 m horizontal waypoint
+disks and the 0.9 m finish disk. It found 63/64 actual ordered course+finish
+traversals, 63/64 waypoint-index-5 and authored-success observations, 56/64
+zero-contact trajectories, and 64/64 without a sustained fall. Fourteen
+environments produced a literal uninterrupted 100-frame post-completion,
+inside-finish, upright hold below 0.12 m/s; ten of those also had zero
+forbidden contact and therefore satisfy the full physical conjunction. The
+longest hold was 172 frames. Terminal mean speed was 0.09883 m/s, with 52/64
+terminal means below 0.12 m/s.
+
+Rendered environment 0 again completed the entire route with zero contact and
+no fall: waypoint entries were steps 121/268/431/569, finish entry 674,
+waypoint index 5 at 774, and authored success at 874. Its longest literal hold
+improved from 41 to 85 frames and terminal mean speed improved to 0.07587 m/s,
+but final instantaneous speed was 0.18832 m/s. Full and terminal video sheets
+agree that the robot is upright and inside the finish while continuing small
+corrective steps. The showcase remains honestly incomplete.
+
+The audit exposed a generic units bug in the continuity term. Mjlab's reward
+manager integrates term values by multiplying them by `step_dt`; the
+state-potential difference was returned as a dimensionless per-step delta, so
+both the gain for building a streak and the penalty for breaking it were
+attenuated by 0.02 at 50 Hz. The term now returns the potential difference as
+`delta / step_dt`. Its integrated effect is therefore invariant to simulator
+timestep, and a corrective step loses the accumulated potential at the
+intended strength. Dense stillness and phase gating are unchanged; there is no
+robot, task, channel-name, or prompt-name keying.
+
+Focused Mjlab verification is 47/47 passing, including a regression requiring
+a partial-streak interruption to remain strongly negative after downstream dt
+integration. Ruff, compileall, and `git diff --check` pass. Preserve automatic
+reward v10/env v8 as diagnosis provenance and do not train them: both reward
+edits were partition-gate flagged. The next safe run is one exact-tuple
+750-PPO continuation from selection v18 (reward v7/env v4), warm-starting the
+iter-9 checkpoint after this fix is committed.

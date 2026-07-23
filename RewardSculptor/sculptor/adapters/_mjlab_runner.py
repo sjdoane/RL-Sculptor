@@ -970,22 +970,28 @@ def _build_authored_terminal_stillness_term_class():
                 self._quiet_streak_s = torch.zeros_like(
                     score, device=standing.device, dtype=dtype)
 
-            duration = max(float(hold_s), float(env.step_dt))
+            step_dt = max(float(env.step_dt), 1e-6)
+            duration = max(float(hold_s), step_dt)
             previous = self._quiet_streak_s
             quiet = standing & (horizontal_speed < float(lin_std))
             streak = torch.where(
                 quiet,
-                torch.clamp(previous + float(env.step_dt), max=duration),
+                torch.clamp(previous + step_dt, max=duration),
                 torch.zeros_like(previous),
             )
             previous_progress = previous / duration
             progress = streak / duration
-            delta = torch.where(
+            # RewardManager applies scale_by_dt after evaluating this term.
+            # Express the potential difference as a per-second rate so its
+            # integrated gain/loss is invariant to the simulator timestep.
+            # Without `/ step_dt`, a corrective step lost only dt times its
+            # accumulated progress and was effectively free at 50 Hz.
+            delta_rate = torch.where(
                 standing,
-                progress - previous_progress,
+                (progress - previous_progress) / step_dt,
                 torch.zeros_like(progress),
             )
-            continuity = torch.square(progress) + delta
+            continuity = torch.square(progress) + delta_rate
             self._quiet_streak_s = torch.where(
                 standing, streak, torch.zeros_like(streak)).detach()
             dense = score * standing.to(dtype=dtype)

@@ -19,28 +19,27 @@ Open **Projects → G1 Lab Showcase — Weave and Stop**.
 - Adapter: `mjlab`
 - Task: `Mjlab-Velocity-Flat-Unitree-G1`
 - Device: `cuda:0`
-- Promoted training tuple: `de07325bab038d29…` (selection v17: reward v7 +
+- Promoted training tuple: `de07325bab038d29…` (selection v18: reward v7 +
   env v4; the frozen world/task/evaluation half is unchanged)
 - Evaluation lineage: `world-58560025c10981814943d42e`
 - Objective metric: `gen_003` (accepted, prompt-native, observe-only)
-- Latest completed recovery job: `3b5f34bedc5af06d`, iter 8, clean code
-  `c28e36a`; it consumed reward v7 + env v4 and warm-started iter 7.
-- Active recovery job: `dde47f043fe792ec`, iter 9, clean code `e1b5d50`; it
-  restored the exact tuple and warm-started actor + critic from iter 8.
+- Latest completed recovery job: `dde47f043fe792ec`, iter 9, clean code
+  `e1b5d50`; it consumed reward v7 + env v4 and warm-started iter 8.
+- No recovery is active while the timestep-invariant continuity fix is being
+  committed.
 
-The July 22 iter-8 rollout completed the ordered route and actual finish in
-62/64 environments, stayed upright in 64/64, and avoided every forbidden
-contact in 59/64. Terminal mean speed was 0.10560 m/s, with 52/64 below
-0.12 m/s. Nine environments satisfy the full literal conjunction, including
-one uninterrupted 100-frame post-completion hold.
+The iter-9 rollout completed the ordered route and actual finish in 63/64
+environments, avoided every forbidden contact in 56/64, and had no sustained
+falls. Terminal mean speed was 0.09883 m/s, with 52/64 below 0.12 m/s. Ten
+environments satisfy the full literal conjunction, including an uninterrupted
+100-frame post-completion hold.
 
-It is still not accepted as the call-ready proof because the rendered
-environment 0, although clean and visibly correct through the weave, achieved
-only 41 consecutive quiet frames. Small corrective steps interrupt the
-literal two seconds. The frozen `gen_003` metric reports 18 completions because
-it uses a 90%-quiet proxy; the runbook applies the stronger consecutive
-criterion. Future generated metrics receive an adversarial interrupted-hold
-fixture so that shortcut is rejected before acceptance.
+It is still not accepted as the call-ready proof because rendered environment
+0, although clean and visibly correct through the weave, achieved 85 rather
+than 100 consecutive quiet frames and ended at 0.18832 m/s. Small corrective
+steps remain visible in the terminal video. The frozen `gen_003` metric reports
+14 completions using its 90%-quiet proxy; the runbook applies the stronger
+consecutive criterion.
 
 ## One-time startup
 
@@ -109,29 +108,29 @@ generated metric stays **observe-only** until it earns steer rights through
 empirical calibration; leave it in observe mode rather than weakening that
 trust boundary. The prepared project already has accepted metric `gen_003`.
 
-## Active one-cycle recovery
+## Next one-cycle recovery
 
 Use **Resume** in the Training tab with the exact behavior goal above, Auto
 mode, one sculpt iteration, 750 rsl_rl iterations, 1,024 environments,
 `cuda:0`, 1,000 episode steps, two rollout episodes, seed 42, 1920×1080 video,
 and `gen_003` observe-only. Enable **Resume exact promoted tuple** to reject
 all stale, partition-flagged automatic diagnosis drafts and restore selection
-v17 (reward v7 + env v4) before continuing from the preserved iter-8
+v18 (reward v7 + env v4) before continuing from the preserved iter-9
 policy. Before letting the cycle continue, verify the Training log contains
 all five facts:
 
-- `promoted_tuple_restored ... selection v17 ... reward v7 ... env v4`
-- `resume_warm_start_resolved ... runs/iter_8/checkpoint.pt`
+- `promoted_tuple_restored ... selection v18 ... reward v7 ... env v4`
+- `resume_warm_start_resolved ... runs/iter_9/checkpoint.pt`
 - `warm_start_loaded ... load_cfg_keys=[actor, critic]`
 - `preserved authored command supervision at full weight`
 - `installed authored terminal continuity-aware whole-body stillness`
 
 If any is absent, use **Stop** and diagnose before spending the GPU budget.
 
-### Active exact-tuple recovery
+### Latest completed exact-tuple recovery
 
-That recovery is now running as UI job `dde47f043fe792ec`, iter 9. The launch
-restored selection v17 and pinned selection v18 with tuple
+UI job `dde47f043fe792ec`, iter 9, restored selection v17 and pinned selection
+v18 with tuple
 `de07325bab038d29fa6705148f795d201d8159c42d93b8ddd92c4ec41f2226db`,
 reward v7, and env v4 from clean code commit `e1b5d50`. The worker loaded both
 actor and critic from `runs/iter_8/checkpoint.pt` and logged full-strength
@@ -139,29 +138,13 @@ linear/angular waypoint-command supervision, terminal braking, entropy
 coefficient 0.0075, and continuity-aware terminal whole-body stillness at
 weight 1.0, `hold_s=2`, and continuity scale 2.
 
-Leave the run alone while PPO is active: do not edit reload-watched core or
-run an intermediate GPU audit. When it finishes, use the acceptance checklist
-below against the official first-episode-safe trajectory and full video.
-`gen_003` remains observe-only and its 90%-quiet proxy does not establish the
-literal uninterrupted 100-frame hold.
-
-### Iter-8 result and next recovery
-
-Iter 8 completed the exact-tuple recovery. The independent batch audit found
-62/64 complete ordered routes, 59/64 zero-contact trajectories, 64/64 terminal
-uprightness, and 9/64 literal uninterrupted 100-frame holds satisfying the
-full physical conjunction. This improves the literal result from 4/64, but the
-rendered environment 0 reached only 41 consecutive quiet frames despite a
-clean route, upright finish, 0.09638 m/s terminal mean speed, and zero contact.
-The official video is therefore not yet the literal two-second demonstration.
-
-The runtime now rewards consecutive terminal stillness rather than treating
-interrupted quiet samples as equivalent. Another one-cycle recovery should
-use the same settings, enable **Resume exact promoted tuple**, restore
-selection v15 (reward v7 + env v4), and warm-start
-`runs/iter_8/checkpoint.pt`. Do not consume automatic env v6; both reward edits
-were filtered and the change does not represent the verified promoted tuple.
-Before PPO starts, verify the log says
+The strict iter-9 audit is summarized above. Its 85-frame rendered hold is a
+near miss, not a success. The next recovery corrects the continuity term's
+units: because the reward manager multiplies by `step_dt`, streak-potential
+gain and loss are now returned as a per-second rate. That keeps the integrated
+interruption penalty invariant across simulator timesteps. Do not consume
+automatic reward v10 or env v8; both reward edits were partition-gate flagged
+and are not the verified promoted tuple. Before PPO starts, verify the log says
 `installed authored terminal continuity-aware whole-body stillness
 supervision` with hold 2 seconds and continuity scale 2.
 

@@ -209,9 +209,11 @@ def test_authored_terminal_stillness_rewards_continuity_and_resets() -> None:
 
     # A corrective step breaks the uninterrupted dwell and loses accumulated
     # progress instead of retaining credit for a high quiet-sample fraction.
+    # The potential loss is a per-second rate because RewardManager scales the
+    # returned value by dt; keep it strong enough to survive that integration.
     data.root_link_lin_vel_b[0, 0] = 0.2
     interrupted = term(env, **params)
-    assert interrupted[0].item() < 0.0
+    assert interrupted[0].item() < -10.0
     assert interrupted[1].item() > second[1].item()
 
     # Reward-manager selective reset clears only the requested environment.
