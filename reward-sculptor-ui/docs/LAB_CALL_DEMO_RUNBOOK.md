@@ -19,32 +19,32 @@ Open **Projects → G1 Lab Showcase — Weave and Stop**.
 - Adapter: `mjlab`
 - Task: `Mjlab-Velocity-Flat-Unitree-G1`
 - Device: `cuda:0`
-- Current training tuple: `785b6c62f942…` (selection v12: reward v5 + env
+- Promoted training tuple: `785b6c62f942…` (selection v13: reward v5 + env
   v1; the frozen world/task/evaluation half is unchanged)
 - Evaluation lineage: `world-58560025c10981814943d42e`
 - Objective metric: `gen_003` (accepted, prompt-native, observe-only)
-- Latest completed recovery job: `55bbca2ef13a4c4a` (code `919d20c`)
-- Active recovery: UI job `job_556e643b0b1ad22b`, launched from clean code
-  `83413d9` with **Resume exact promoted tuple** enabled
+- Latest completed recovery job: `556e643b0b1ad22b` (code `83413d9`,
+  exact promoted tuple restored before training)
+- Next normal Resume consumes the preserved iter-6 diagnosis drafts: reward
+  v7 + env v4. Leave **Resume exact promoted tuple** off for that cycle.
 
-The July 22 iter-5 rollout independently crossed all four intermediate regions
-in exact order in 64/64 environments; 62/64 entered the finish, 57/64 avoided
-every box, and none fell. It is not yet accepted as solved: only 39/64 crossed
-the final waypoint tolerance before timeout, terminal speed averaged
-`0.13373 m/s`, the last-window still fraction averaged `0.561`, and only one
-environment satisfied the full two-second terminal-stillness gate. The
-20-second 1080p video is valid and shows upright course traversal followed by
-shifting at the finish.
+The July 22 iter-6 rollout independently crossed all four intermediate regions
+in exact order in 64/64 environments; 63/64 entered the finish and reached
+waypoint index 5, 55/64 avoided every box, and none fell. The rendered
+environment completed the route with zero contact, remained upright, and ended
+at 0.08203 m/s. The 20-second 1080p video is valid and visibly shows the weave,
+finish entry, and an upright stopping attempt.
 
-The completed run exposed that the longer final-target brake was too slow: its
-linear scale approached the completion tolerance asymptotically, moving median
-completion from step 799 to step 966. The next recovery uses a finite terminal
-arrival floor, reduced terminal yaw, and an explicit standing latch after
-crossing. Reward v5 still crossfades route income into terminal stillness
-without copying the held-out completion gate. The iter-5 auto-diagnosis that
-claims the robot never weaves is contradicted by the frozen trajectory and
-video; reward v6 and env v3 are preserved as failure provenance and must not be
-selected for the recovery. `selection_current.json` remains pinned to v5/v1.
+It is not yet accepted as solved. Batch terminal speed averaged 0.11179 m/s,
+only 41/64 ended below 0.12 m/s, and no environment stayed continuously below
+that threshold for all 100 frames of the required two seconds; the best
+continuous run was 75 frames. The frozen `gen_003` metric's 90%-quiet proxy
+marks three environments complete, but this runbook deliberately applies the
+literal continuous physical criterion. The next generic recovery adds
+whole-body stillness supervision only after the compiled command enters its
+terminal standing phase, while reward v7 doubles the authored settling weight,
+adds finish double-support shaping, and env v4 reduces entropy. Route command
+tracking remains at full weight.
 
 ## One-time startup
 
@@ -118,13 +118,15 @@ trust boundary. The prepared project already has accepted metric `gen_003`.
 Use **Resume** in the Training tab with the exact behavior goal above, Auto
 mode, one sculpt iteration, 750 rsl_rl iterations, 1,024 environments,
 `cuda:0`, 1,000 episode steps, two rollout episodes, seed 42, 1920×1080 video,
-and `gen_003` observe-only. It is intentionally a focused continuation from
-the preserved iter-5 policy, not a new cold-start benchmark. Before letting
-the cycle continue, verify the Training log contains all three lines:
+and `gen_003` observe-only. Leave **Resume exact promoted tuple** off: this
+normal iteration intentionally consumes diagnosis drafts reward v7 + env v4
+and continues from the preserved iter-6 policy. Before letting the cycle
+continue, verify the Training log contains all four facts:
 
-- `resume_warm_start_resolved ... runs/iter_5/checkpoint.pt`
+- `resume_warm_start_resolved ... runs/iter_6/checkpoint.pt`
 - `warm_start_loaded ... load_cfg_keys=[actor, critic]`
 - `preserved authored command supervision at full weight`
+- `installed authored terminal whole-body stillness supervision`
 
 If any is absent, use **Stop** and diagnose before spending the GPU budget.
 
@@ -183,7 +185,7 @@ artifacts and visible UI agree:
 - no sustained fall is detected;
 - the robot is inside the finish disk during the terminal window;
 - terminal horizontal speed is `< 0.12 m/s`;
-- at least 90% of the final two-second window is below that speed;
+- one uninterrupted two-second (100-frame) window stays below that speed;
 - the robot remains upright during that hold;
 - the rollout video visibly shows the same weave, finish, and stop.
 

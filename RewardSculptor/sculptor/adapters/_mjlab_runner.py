@@ -48,6 +48,7 @@ _COMPONENT_SINK: dict[str, list[float]] | None = None
 # separation and is intentionally larger than a single survival step.
 _SCULPTOR_SURVIVAL_WEIGHT = 1.0
 _SCULPTOR_FAILURE_WEIGHT = -5.0
+_SCULPTOR_TERMINAL_STILLNESS_WEIGHT = 1.0
 
 
 def _install_sculptor_termination_economics(
@@ -811,6 +812,91 @@ def _full_weight_authored_command_rewards(world_bundle: Any | None) -> frozenset
             and installed:
         return frozenset({"track_linear_velocity", "track_angular_velocity"})
     return frozenset()
+
+
+def _authored_terminal_standing_enabled(world_bundle: Any | None) -> bool:
+    """Whether the compiled command contract has a terminal dwell phase."""
+    if not _full_weight_authored_command_rewards(world_bundle):
+        return False
+    manifest = getattr(world_bundle, "manifest", None)
+    task_shared = getattr(manifest, "task_shared", {})
+    goal = task_shared.get("goal", {}) if isinstance(task_shared, Mapping) else {}
+    success = goal.get("success", {}) if isinstance(goal, Mapping) else {}
+    try:
+        return float(success.get("hold_s", 0.0)) > 0.0
+    except (TypeError, ValueError):
+        return False
+
+
+def _authored_terminal_stillness_reward(
+    env: Any, *, lin_std: float, ang_std: float, joint_std: float,
+) -> Any:
+    """Dense whole-body stillness, active only after an authored command ends.
+
+    The command term owns phase truth and exposes is_standing_env once its
+    finite route completes.  Query that capability generically across active
+    commands: no embodiment, simulator task id, or authored prompt name is
+    involved.  Before completion this term is identically zero and therefore
+    cannot trade route progress for standing early.
+    """
+    import torch
+
+    standing = torch.zeros(
+        int(env.num_envs), device=env.device, dtype=torch.bool)
+    manager = getattr(env, "command_manager", None)
+    if manager is None:
+        return standing.float()
+    for name in tuple(getattr(manager, "active_terms", ()) or ()):
+        try:
+            term = manager.get_term(name)
+        except (KeyError, AttributeError):
+            continue
+        flag = getattr(term, "is_standing_env", None)
+        if flag is not None and tuple(flag.shape) == tuple(standing.shape):
+            standing |= flag.to(device=env.device, dtype=torch.bool)
+
+    robot = None
+    try:
+        robot = env.scene["robot"]
+    except (KeyError, TypeError):
+        pass
+    if robot is None:
+        for attr in ("entities", "_entities"):
+            entities = getattr(env.scene, attr, None)
+            if not isinstance(entities, Mapping):
+                continue
+            robot = next(
+                (
+                    entity for entity in entities.values()
+                    if hasattr(getattr(entity, "data", None), "joint_vel")
+                ),
+                None,
+            )
+            if robot is not None:
+                break
+    if robot is None:
+        return standing.float() * 0.0
+
+    data = robot.data
+    lin_vel = getattr(data, "root_link_lin_vel_b", None)
+    if lin_vel is None:
+        lin_vel = getattr(data, "root_link_lin_vel_w", None)
+    ang_vel = getattr(data, "root_link_ang_vel_b", None)
+    if ang_vel is None:
+        ang_vel = getattr(data, "root_link_ang_vel_w", None)
+    joint_vel = getattr(data, "joint_vel", None)
+    if lin_vel is None or ang_vel is None or joint_vel is None:
+        return standing.float() * 0.0
+
+    horizontal_speed = torch.linalg.vector_norm(lin_vel[:, :2], dim=-1)
+    angular_speed = torch.linalg.vector_norm(ang_vel, dim=-1)
+    joint_rms = torch.sqrt(torch.mean(torch.square(joint_vel), dim=-1))
+    score = (
+        0.60 * torch.exp(-torch.square(horizontal_speed / float(lin_std)))
+        + 0.25 * torch.exp(-torch.square(angular_speed / float(ang_std)))
+        + 0.15 * torch.exp(-torch.square(joint_rms / float(joint_std)))
+    )
+    return score * standing.to(dtype=score.dtype)
 
 
 def _reward_visible_rollout_evidence(
@@ -1749,6 +1835,17 @@ def _cmd_train(args: argparse.Namespace) -> None:
             env_cfg.rewards = {}
 
         schema_keys = tuple(args.schema_keys.split(",")) if args.schema_keys else _DEFAULT_SCHEMA_KEYS
+        terminal_standing = _authored_terminal_standing_enabled(world_bundle)
+        if terminal_standing:
+            env_cfg.rewards["sculptor_terminal_stillness"] = RewardTermCfg(
+                func=_authored_terminal_stillness_reward,
+                weight=_SCULPTOR_TERMINAL_STILLNESS_WEIGHT,
+                params={
+                    "lin_std": 0.12,
+                    "ang_std": 0.5,
+                    "joint_std": 1.0,
+                },
+            )
         SculptorRewardTerm = _build_sculptor_term_class(
             schema_keys,
             _load_authored_robot_capability(
@@ -1773,6 +1870,13 @@ def _cmd_train(args: argparse.Namespace) -> None:
             print(
                 "[runner] preserved authored command supervision at full weight: "
                 + ", ".join(sorted(full_weight_terms)),
+                file=sys.stderr,
+                flush=True,
+            )
+        if terminal_standing:
+            print(
+                "[runner] installed authored terminal whole-body stillness "
+                f"supervision at weight {_SCULPTOR_TERMINAL_STILLNESS_WEIGHT:g}",
                 file=sys.stderr,
                 flush=True,
             )

@@ -10,6 +10,7 @@ from sculptor.world.runtime import (
     TorchWorldRewardRuntime,
     WorldChannelRecorder,
     WorldChannelRuntime,
+    WorldRuntimeError,
 )
 from tests.test_world_foundation import _task, _world
 
@@ -105,6 +106,25 @@ def test_success_hold_resets_after_region_exit() -> None:
 
     ball.data.root_link_pos_w[...] = np.asarray([[4.0, 0.0, 0.5]])
     assert not runtime.sample().channels["goal__score__success"].item()
+
+
+def test_runtime_reset_clears_only_requested_environment_state() -> None:
+    runtime, _ball = _runtime(num_envs=2)
+    runtime.sample()
+    assert runtime.sample().channels["goal__score__success"].all()
+    runtime._waypoint_index[:] = [3, 4]
+    runtime._last_waypoint_distance[:] = [1.5, 2.5]
+    runtime._last_waypoint_complete[:] = True
+
+    runtime.reset(np.asarray([0]))
+
+    assert runtime._waypoint_index.tolist() == [0, 4]
+    assert runtime._last_waypoint_distance.tolist() == [0.0, 2.5]
+    assert runtime._last_waypoint_complete.tolist() == [False, True]
+    after = runtime.sample().channels["goal__score__success"]
+    assert after.tolist() == [False, True]
+    with pytest.raises(WorldRuntimeError, match="reset env_ids must be within"):
+        runtime.reset(np.asarray([runtime.num_envs]))
 
 
 def test_torch_reward_runtime_never_exposes_metric_only_channels() -> None:

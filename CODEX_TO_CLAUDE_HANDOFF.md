@@ -1324,3 +1324,47 @@ PPO is active. Do not edit reload-watched core or run intermediate GPU audits.
 After it finishes, inspect the official first-episode-safe trajectory, metric
 and fitness artifacts, keyframes, and full MP4 against the entire acceptance
 conjunction before making any further change.
+
+## Official iter-6 audit + terminal whole-body supervision 2026-07-22 (Codex)
+
+UI job `556e643b0b1ad22b` completed from exact promoted selection v12 and
+preserved `runs/iter_6/checkpoint.pt`. The exact-restore event, immutable
+tuple hashes, iter-5 warm start, full authored command weights, and valid
+20-second 1920×1080 MP4 are all proven in the official artifacts.
+
+The policy now solves route traversal but still does not satisfy the literal
+terminal requirement. Independent first-episode inspection found ordered
+region crossings in 64/64 environments, waypoint index 5 in 63/64, finish
+entry in 63/64, uprightness in 64/64, and zero forbidden contact in 55/64.
+The rendered environment reached index 5, entered the finish, stayed upright,
+and had zero box contact with terminal horizontal speed 0.08203 m/s. The full
+video visibly shows the weave and an upright finish.
+
+This is not accepted as solved: batch terminal speed averaged 0.11179 m/s but
+only 41/64 ended below 0.12 m/s, and no environment remained continuously
+below 0.12 m/s for all 100 frames of the required two seconds. The longest
+continuous quiet run was 75 frames. `gen_003` reports three full-gate
+environments because its frozen hold proxy asks for more than 90% quiet
+samples rather than true continuity; that score remains useful observe-only
+evidence but cannot override the stronger physical acceptance audit.
+
+The rollout also emitted
+`WorldChannelRuntime object has no attribute reset` after simulator
+auto-reset. The generic runtime now implements selective per-environment reset
+for hold, predicate, and waypoint temporal state, preventing later episodes
+from inheriting a completed route. A second generic addition installs dense
+whole-body stillness supervision only when a compiled authored command both
+advertises terminal standing and has a positive dwell contract. It combines
+horizontal base velocity, full angular velocity, and joint RMS velocity and is
+identically zero before route completion. Discovery uses compiled command
+capabilities and scene articulation surfaces, never an embodiment or simulator
+task name. Existing full-weight linear and angular command tracking is
+unchanged.
+
+Verification: focused runtime/adapter suite 51 passed in 13 seconds; scoped
+Ruff, compileall, `git diff --check`, and the focused suite all passed. The
+next UI Resume should consume the iter-6 diagnosis drafts reward v7/env v4
+(settling weight 1.6, finish double support, entropy scale 0.75), leave exact
+promoted-tuple recovery off, warm-start iter 6, and run one 750-PPO recovery
+cycle. Require the terminal-stillness provenance line before PPO starts, then
+repeat the full continuous-hold audit.

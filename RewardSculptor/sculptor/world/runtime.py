@@ -126,6 +126,29 @@ class WorldChannelRuntime:
         self._last_waypoint_complete = np.zeros(self.num_envs, dtype=bool)
         self._waypoints = self._resolve_waypoints()
 
+    def reset(self, env_ids: Any) -> None:
+        """Reset private temporal state for simulator-reset environments.
+
+        Replicated simulators auto-reset only the environments that terminate.
+        Keeping route progress or hold time across that boundary contaminates
+        later episodes and can make recorder output disagree with simulator
+        state.  Reset exactly the requested rows so unaffected environments
+        retain their in-progress temporal state.
+        """
+        ids = _to_numpy(env_ids).astype(np.int64, copy=False).reshape(-1)
+        if ids.size == 0:
+            return
+        if np.any(ids < 0) or np.any(ids >= self.num_envs):
+            raise WorldRuntimeError(
+                "reset env_ids must be within [0, num_envs)"
+            )
+        self._hold_elapsed[ids] = 0.0
+        self._waypoint_index[ids] = 0
+        self._last_waypoint_distance[ids] = 0.0
+        self._last_waypoint_complete[ids] = False
+        if self._last_predicate is not None:
+            self._last_predicate[ids] = False
+
     def _entity_state(self, entity_name: str, suffix: str) -> np.ndarray:
         entity = _scene_item(self.scene, entity_name)
         data = getattr(entity, "data", None)

@@ -86,6 +86,80 @@ def test_authored_waypoint_command_rewards_keep_nominal_weight() -> None:
     assert _full_weight_authored_command_rewards(bundle) == frozenset()
 
 
+def test_authored_terminal_standing_requires_installed_dwell_command() -> None:
+    from sculptor.adapters._mjlab_runner import (
+        _authored_terminal_standing_enabled,
+    )
+
+    bundle = SimpleNamespace(
+        manifest=SimpleNamespace(task_shared={
+            "goal": {
+                "type": "waypoint_sequence",
+                "success": {"hold_s": 2.0},
+            },
+        }),
+        runtime_adjustments=(
+            "command:velocity→goal-conditioned waypoint traversal",
+        ),
+    )
+    assert _authored_terminal_standing_enabled(bundle)
+    bundle.manifest.task_shared["goal"]["success"]["hold_s"] = 0.0
+    assert not _authored_terminal_standing_enabled(bundle)
+    bundle.manifest.task_shared["goal"]["success"]["hold_s"] = 2.0
+    bundle.runtime_adjustments = ()
+    assert not _authored_terminal_standing_enabled(bundle)
+
+
+def test_authored_terminal_stillness_is_dense_and_phase_gated() -> None:
+    torch = pytest.importorskip("torch")
+
+    from sculptor.adapters._mjlab_runner import (
+        _authored_terminal_stillness_reward,
+    )
+
+    command = SimpleNamespace(
+        is_standing_env=torch.tensor([True, True, False]))
+
+    class CommandManager:
+        active_terms = ("route",)
+
+        @staticmethod
+        def get_term(name):
+            assert name == "route"
+            return command
+
+    data = SimpleNamespace(
+        root_link_lin_vel_b=torch.tensor([
+            [0.0, 0.0, 0.0],
+            [0.12, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+        ]),
+        root_link_ang_vel_b=torch.tensor([
+            [0.0, 0.0, 0.0],
+            [0.5, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+        ]),
+        joint_vel=torch.tensor([
+            [0.0, 0.0],
+            [1.0, 1.0],
+            [0.0, 0.0],
+        ]),
+    )
+    env = SimpleNamespace(
+        num_envs=3,
+        device=torch.device("cpu"),
+        command_manager=CommandManager(),
+        scene={"robot": SimpleNamespace(data=data)},
+    )
+
+    reward = _authored_terminal_stillness_reward(
+        env, lin_std=0.12, ang_std=0.5, joint_std=1.0)
+
+    torch.testing.assert_close(reward[0], torch.tensor(1.0))
+    assert 0.3 < reward[1].item() < 0.5
+    assert reward[2].item() == 0.0
+
+
 def test_rollout_evidence_excludes_metric_only_channels() -> None:
     """Diagnosis receives batch progress, never frozen completion truth."""
     import numpy as np
