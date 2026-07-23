@@ -19,27 +19,28 @@ Open **Projects → G1 Lab Showcase — Weave and Stop**.
 - Adapter: `mjlab`
 - Task: `Mjlab-Velocity-Flat-Unitree-G1`
 - Device: `cuda:0`
-- Promoted training tuple: `de07325bab038d29…` (selection v18: reward v7 +
+- Promoted training tuple: `de07325bab038d29…` (selection v22: reward v7 +
   env v4; the frozen world/task/evaluation half is unchanged)
 - Evaluation lineage: `world-58560025c10981814943d42e`
 - Objective metric: `gen_003` (accepted, prompt-native, observe-only)
-- Latest completed recovery job: `dde47f043fe792ec`, iter 9, clean code
-  `e1b5d50`; it consumed reward v7 + env v4 and warm-started iter 8.
-- No recovery is active while the timestep-invariant continuity fix is being
-  committed.
+- Latest completed recovery job: `b12d93ae0b4b3029`, iter 12, clean code
+  `16d7c5e`; it consumed reward v7 + env v4 and warm-started iter 11.
+- Active exact-tuple recovery: `7449bab7e0aa9fb9`, iter 13, launch commit
+  `884cce0`; it warm-started actor and critic from iter 12.
 
-The iter-9 rollout completed the ordered route and actual finish in 63/64
-environments, avoided every forbidden contact in 56/64, and had no sustained
-falls. Terminal mean speed was 0.09883 m/s, with 52/64 below 0.12 m/s. Ten
-environments satisfy the full literal conjunction, including an uninterrupted
-100-frame post-completion hold.
+The iter-12 rollout completed the ordered route and actual finish in 63/64
+environments, avoided every forbidden contact in 58/64, and had no sustained
+falls. Twenty-six environments satisfy the full literal horizontal
+conjunction; 24 also satisfy whole-body quiet for the complete 100-frame hold.
 
 It is still not accepted as the call-ready proof because rendered environment
-0, although clean and visibly correct through the weave, achieved 85 rather
-than 100 consecutive quiet frames and ended at 0.18832 m/s. Small corrective
-steps remain visible in the terminal video. The frozen `gen_003` metric reports
-14 completions using its 90%-quiet proxy; the runbook applies the stronger
-consecutive criterion.
+0, although clean and visibly correct through the weave, achieved 92 rather
+than 100 consecutive horizontal frames and 81 whole-body-qualified frames.
+Small corrective steps remain visible in the terminal video. The frozen
+`gen_003` metric reports 24 completions using its 90%-quiet proxy; the runbook
+applies the stronger consecutive criterion. Iter 13 is continuing the same
+correct contract because its terminal reward was still rising at the end of
+iter 12.
 
 ## One-time startup
 
@@ -210,6 +211,16 @@ weights 2.0, terminal weight 4, hold 2 seconds, continuity scale 2, and the
 whole-body quiet thresholds (horizontal 0.12 m/s, angular 0.5 rad/s, joint
 RMS 1.0 rad/s) before PPO iteration 0. The official 100-frame rendered hold
 remains mandatory.
+
+That continuation is active as UI job `7449bab7e0aa9fb9`, iter 13, from clean
+commit `884cce0`. The UI restored selection v21 and pinned selection v22 with
+the unchanged reward-v7/env-v4 tuple. The worker loaded actor plus critic from
+`runs/iter_12/checkpoint.pt` (sha8 `40095ac5`); live configuration confirms
+goal-conditioned terminal braking, linear/angular tracking weights 2.0,
+entropy 0.0075, and whole-body terminal continuity at weight 4, hold 2
+seconds, and continuity scale 2. PPO iteration 0 is active. Do not run an
+intermediate audit or edit watched core; wait for the official rollout before
+making a presentation claim.
 
 ## Exact overnight launch settings
 

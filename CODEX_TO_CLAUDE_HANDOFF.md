@@ -1832,3 +1832,32 @@ more exact-promoted-tuple recovery cycle from selection v21, warm-starting the
 iter-12 actor and critic without changing the now-correct generic contract.
 Do not train the automatic reward/environment diagnosis drafts; they remain
 unpromoted provenance.
+
+## Iter-13 exact-contract continuation launched 2026-07-23 (Codex)
+
+The UI-launched recovery is active as job `7449bab7e0aa9fb9`. New Run retained
+the exact 484-character behavior goal and used Auto, one 750-PPO cycle, 1,024
+environments, seed 42, two 1,000-step 1920x1080 episodes, `gen_003`
+observe-only, and **Resume exact promoted tuple**.
+
+The UI emitted `promoted_tuple_restored` for selection v21 with tuple
+`de07325bab038d29fa6705148f795d201d8159c42d93b8ddd92c4ec41f2226db`,
+reward v7 SHA
+`b6c65d349b9f23f5b36de68ec25eb5d48879ac5b84f1aa86a30949e5a4290df9`,
+and env v4 SHA
+`db049dafa3fb1fa0bc5ce590c485ec62c469b3bfa4aab757255b36adcadcbb39`.
+Iter 13 pins `selection_v22.json` with the same tuple. Run context captured
+clean commit `884cce054c0c6f46a61bf1681074d8858ba660af`.
+
+The worker resolved and loaded actor plus critic from
+`runs/iter_12/checkpoint.pt` (sha8 `40095ac5`). Its live configuration proves
+goal-conditioned waypoint traversal with terminal braking, preserved
+`track_linear_velocity` and `track_angular_velocity` weights of 2.0, entropy
+coefficient 0.0075, and continuity-aware whole-body terminal stillness at
+weight 4, `hold_s=2`, and continuity scale 2. PPO iteration 0 is active.
+
+Do not run an intermediate GPU audit or edit reload-watched core while iter
+13 is alive. Let it finish and preserve/promote its checkpoint, then repeat
+the strict actual-geometry, first-episode-safe trajectory, objective/fitness,
+keyframe, and full-video audit. The rendered uninterrupted 100-frame
+post-completion hold remains the acceptance gate.
