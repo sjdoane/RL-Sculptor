@@ -864,8 +864,8 @@ def _authored_terminal_stillness_weight(
 
 def _authored_terminal_stillness_state(
     env: Any, *, lin_std: float, ang_std: float, joint_std: float,
-) -> tuple[Any, Any, Any]:
-    """Return terminal-phase mask, whole-body score, and horizontal speed.
+) -> tuple[Any, Any, Any, Any]:
+    """Return terminal phase, score, horizontal speed, and whole-body quiet.
 
     The command term owns phase truth and exposes is_standing_env once its
     finite route completes.  Query that capability generically across active
@@ -880,7 +880,12 @@ def _authored_terminal_stillness_state(
     manager = getattr(env, "command_manager", None)
     if manager is None:
         zeros = standing.float()
-        return standing, zeros, torch.full_like(zeros, float("inf"))
+        return (
+            standing,
+            zeros,
+            torch.full_like(zeros, float("inf")),
+            standing,
+        )
     for name in tuple(getattr(manager, "active_terms", ()) or ()):
         try:
             term = manager.get_term(name)
@@ -911,7 +916,12 @@ def _authored_terminal_stillness_state(
                 break
     if robot is None:
         zeros = standing.float() * 0.0
-        return standing, zeros, torch.full_like(zeros, float("inf"))
+        return (
+            standing,
+            zeros,
+            torch.full_like(zeros, float("inf")),
+            torch.zeros_like(standing),
+        )
 
     data = robot.data
     lin_vel = getattr(data, "root_link_lin_vel_b", None)
@@ -923,28 +933,40 @@ def _authored_terminal_stillness_state(
     joint_vel = getattr(data, "joint_vel", None)
     if lin_vel is None or ang_vel is None or joint_vel is None:
         zeros = standing.float() * 0.0
-        return standing, zeros, torch.full_like(zeros, float("inf"))
+        return (
+            standing,
+            zeros,
+            torch.full_like(zeros, float("inf")),
+            torch.zeros_like(standing),
+        )
 
     horizontal_speed = torch.linalg.vector_norm(lin_vel[:, :2], dim=-1)
     angular_speed = torch.linalg.vector_norm(ang_vel, dim=-1)
     joint_rms = torch.sqrt(torch.mean(torch.square(joint_vel), dim=-1))
+    whole_body_quiet = (
+        (horizontal_speed < float(lin_std))
+        & (angular_speed < float(ang_std))
+        & (joint_rms < float(joint_std))
+    )
     score = (
         0.60 * torch.exp(-torch.square(horizontal_speed / float(lin_std)))
         + 0.25 * torch.exp(-torch.square(angular_speed / float(ang_std)))
         + 0.15 * torch.exp(-torch.square(joint_rms / float(joint_std)))
     )
-    return standing, score, horizontal_speed
+    return standing, score, horizontal_speed, whole_body_quiet
 
 
 def _authored_terminal_stillness_reward(
     env: Any, *, lin_std: float, ang_std: float, joint_std: float,
 ) -> Any:
     """Dense whole-body stillness, active only after an authored command ends."""
-    standing, score, _horizontal_speed = _authored_terminal_stillness_state(
-        env,
-        lin_std=lin_std,
-        ang_std=ang_std,
-        joint_std=joint_std,
+    standing, score, _horizontal_speed, _whole_body_quiet = (
+        _authored_terminal_stillness_state(
+            env,
+            lin_std=lin_std,
+            ang_std=ang_std,
+            joint_std=joint_std,
+        )
     )
     return score * standing.to(dtype=score.dtype)
 
@@ -980,7 +1002,7 @@ def _build_authored_terminal_stillness_term_class():
             hold_s: float,
             continuity_scale: float,
         ):
-            standing, score, horizontal_speed = (
+            standing, score, _horizontal_speed, whole_body_quiet = (
                 _authored_terminal_stillness_state(
                     env,
                     lin_std=lin_std,
@@ -1000,7 +1022,12 @@ def _build_authored_terminal_stillness_term_class():
             step_dt = max(float(env.step_dt), 1e-6)
             duration = max(float(hold_s), step_dt)
             previous = self._quiet_streak_s
-            quiet = standing & (horizontal_speed < float(lin_std))
+            # Base translation alone is not a sufficient definition of
+            # stillness: a policy can step in place, rotate, or swing joints
+            # while remaining under the horizontal-speed threshold.  Require
+            # every velocity component already used by the dense whole-body
+            # score so an uninterrupted dwell cannot hide a rhythmic sway.
+            quiet = standing & whole_body_quiet
             streak = torch.where(
                 quiet,
                 torch.clamp(previous + step_dt, max=duration),

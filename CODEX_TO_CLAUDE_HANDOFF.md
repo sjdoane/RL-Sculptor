@@ -1718,3 +1718,53 @@ alive. After completion, preserve/promote its checkpoint and repeat the
 strict actual-geometry, first-episode-safe trajectory, objective/fitness,
 keyframe, and full-video audit. The full physical conjunction and rendered
 100-frame hold remain the acceptance gate.
+
+## Official iter-11 audit + whole-body continuity gate 2026-07-23 (Codex)
+
+UI job `801b0549f5be7328` completed, preserved
+`runs/iter_11/checkpoint.pt`, and atomically marked iter 11 complete. Frozen
+`gen_003` reports fitness 0.11491, progress 0.83198, ordered-course evidence
+in 61/64, success in 60/64, contact in 7/64, a fall in 1/64, terminal speed
+0.07942 m/s, and its permissive completion gate in 14/64. The realism audit
+remains clean, although joint-velocity p99 increased from 10.95 to 17.80.
+
+The strict first-episode-safe audit found 60/64 actual ordered route-and-finish
+traversals, 60/64 index-5 and success observations, 57/64 zero-contact
+trajectories, and 61/64 full-length/no-sustained-fall trajectories. Twenty-seven
+environments produced a literal uninterrupted 100-frame horizontal hold;
+twenty-five (`2, 3, 4, 6, 7, 10, 12, 16, 18, 22, 24, 26, 38, 39, 41, 42,
+47, 50, 51, 52, 53, 55, 56, 59, 60`) also satisfied the complete ordered
+route, zero-contact, success, and no-fall conjunction. This is a small
+batch-level improvement over iter 10's 23/64, but route reliability and falls
+regressed.
+
+Rendered environment 0 completed the actual disks at steps
+121/275/423/561/671, reached index 5 at 756 and success at 856, and had zero
+contact and no fall. It finished at 0.3372 m from center, with terminal mean
+speed 0.09416 m/s and final speed 0.08116 m/s, but its longest literal quiet
+run was only 82 frames. Keyframes, the complete video sheet, and the terminal
+sheet all show a repeated wide-stance sway. The showcase remains incomplete.
+
+The weight correction worked mechanically: terminal-stillness contribution
+rose from about 4.6 to 20 episodic reward. It exposed the next generic loophole.
+Continuity considered only horizontal base speed, so a policy could step in
+place, rotate, and swing joints without resetting its nominal uninterrupted
+streak. The rendered behavior and increased joint-velocity p99 are direct
+evidence of that exploit.
+
+Continuity now requires the same whole-body quiet contract used by the dense
+stillness score: horizontal speed below 0.12 m/s, angular speed below 0.5
+rad/s, and joint RMS velocity below 1.0 rad/s. Any translation, rotation, or
+joint-driven stepping loses the accumulated streak potential. Dense shaping,
+the exact horizontal task threshold, terminal phase gate, timestep correction,
+balanced weight, frozen metric, and command contract are unchanged. The logic
+uses robot state capabilities generically and has no embodiment, task,
+channel, or prompt-name keying.
+
+Focused Mjlab verification is 48/48 passing, including independent
+horizontal, joint-only, and angular interruption regressions plus selective
+reset. Ruff, compileall, and `git diff --check` pass. Iter 11 produced no
+applicable reward revision: both LLM edits were rejected by validation. Its
+environment draft remains unpromoted diagnosis provenance. The next safe run
+is one UI exact-tuple continuation from selection v20, reward v7/env v4,
+warm-starting iter 11 after this whole-body gate is committed.

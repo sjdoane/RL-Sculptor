@@ -231,6 +231,13 @@ def test_authored_terminal_stillness_rewards_continuity_and_resets() -> None:
     assert second[1].item() > first[1].item() > 1.0
     assert first[2].item() == 0.0
 
+    # Reward-manager selective reset clears only the requested environment.
+    term.reset(torch.tensor([0]))
+    after_reset = term(env, **params)
+    torch.testing.assert_close(after_reset[0], first[0])
+    assert after_reset[1].item() > second[1].item()
+    assert after_reset[2].item() == 0.0
+
     # A corrective step breaks the uninterrupted dwell and loses accumulated
     # progress instead of retaining credit for a high quiet-sample fraction.
     # The potential loss is a per-second rate because RewardManager scales the
@@ -240,13 +247,18 @@ def test_authored_terminal_stillness_rewards_continuity_and_resets() -> None:
     assert interrupted[0].item() < -10.0
     assert interrupted[1].item() > second[1].item()
 
-    # Reward-manager selective reset clears only the requested environment.
-    term.reset(torch.tensor([0]))
+    # In-place stepping and rotation must also break the uninterrupted hold,
+    # even when horizontal base translation remains below the task threshold.
     data.root_link_lin_vel_b[0, 0] = 0.0
-    after_reset = term(env, **params)
-    torch.testing.assert_close(after_reset[0], first[0])
-    assert after_reset[1].item() > interrupted[1].item()
-    assert after_reset[2].item() == 0.0
+    data.joint_vel[1, 0] = 2.0
+    joint_interrupted = term(env, **params)
+    assert joint_interrupted[1].item() < -10.0
+
+    data.joint_vel[1, 0] = 0.0
+    term(env, **params)
+    data.root_link_ang_vel_b[1, 2] = 1.0
+    angular_interrupted = term(env, **params)
+    assert angular_interrupted[1].item() < -10.0
 
 
 def test_rollout_evidence_excludes_metric_only_channels() -> None:

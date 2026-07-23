@@ -190,6 +190,24 @@ continuity scale 2, and entropy coefficient 0.0075. PPO iteration 0 is active.
 Do not run an intermediate audit; apply the complete acceptance checklist only
 after the job finishes and preserves its official rollout.
 
+Iter 11 is now complete. Its strict batch audit found 25/64 full physical
+conjunctions, but rendered environment 0 still held only 82/100 frames.
+Although it ended at 0.08116 m/s, the keyframes and terminal video clearly
+show a repeated wide-stance sway. Do not present it as the solved clip.
+
+The weight-4 term increased terminal-stillness reward as intended, but exposed
+a continuity loophole: only horizontal base speed reset the streak, so
+in-place stepping, rotation, and joint motion could retain nominal
+uninterrupted credit. The next recovery requires whole-body quiet:
+horizontal speed below 0.12 m/s, angular speed below 0.5 rad/s, and joint RMS
+velocity below 1.0 rad/s. Any one exceeding its threshold loses the accumulated
+streak. This remains phase-gated, timestep-correct, balanced at weight 4, and
+generic across velocity-command robots.
+
+Launch one exact-promoted-tuple cycle from selection v20 and warm-start
+`runs/iter_11/checkpoint.pt`. Require actor+critic warm-start, tracking weights
+2.0, terminal weight 4, hold 2, and continuity scale 2 before PPO iteration 0.
+
 ## Exact overnight launch settings
 
 From **World**, choose **Train this world**, or open **New run**. Select
