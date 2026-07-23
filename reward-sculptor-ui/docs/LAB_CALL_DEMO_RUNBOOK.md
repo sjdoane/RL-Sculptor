@@ -129,6 +129,22 @@ all five facts:
 
 If any is absent, use **Stop** and diagnose before spending the GPU budget.
 
+### Active exact-tuple recovery
+
+That recovery is now running as UI job `3b5f34bedc5af06d`, iter 8. The launch
+restored and pinned selection v15 with tuple
+`de07325bab038d29fa6705148f795d201d8159c42d93b8ddd92c4ec41f2226db`,
+reward v7, and env v4 from clean code commit `c28e36a`. The worker loaded both
+actor and critic from `runs/iter_7/checkpoint.pt` and logged full-strength
+linear/angular waypoint-command supervision, terminal braking, entropy
+coefficient 0.0075, and terminal whole-body stillness weight 1.0.
+
+Leave the run alone while PPO is active: do not edit reload-watched core or
+run an intermediate GPU audit. When it finishes, use the acceptance checklist
+below against the official first-episode-safe trajectory and full video.
+`gen_003` remains observe-only and its 90%-quiet proxy does not establish the
+literal uninterrupted 100-frame hold.
+
 ## Exact overnight launch settings
 
 From **World**, choose **Train this world**, or open **New run**. Select

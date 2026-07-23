@@ -1429,3 +1429,35 @@ Verification for the continuity hardening: channel-catalog metric suite 10/10;
 generated metric, reference-generation, and spec-metric suites 124/124;
 compileall, `git diff --check`, and scoped Ruff passed. Ruff ignored only the
 file's pre-existing E402/F401/E702 debt; no new finding remains.
+
+## Iter-8 exact-tuple continuation launched 2026-07-22 (Codex)
+
+The safe continuation is now running from the UI as job
+`3b5f34bedc5af06d`. New Run used the exact behavior goal above, Auto, one
+750-PPO cycle, 1,024 environments, seed 42, two 1,000-step 1920x1080
+episodes, `gen_003` observe-only, and **Resume exact promoted tuple**.
+
+The pre-training provenance is fully verified. The UI emitted
+`promoted_tuple_restored`, and iter 8 pinned `selection_v15.json` with the
+same promoted tuple
+`de07325bab038d29fa6705148f795d201d8159c42d93b8ddd92c4ec41f2226db`.
+Its immutable refs are reward v7 SHA
+`b6c65d349b9f23f5b36de68ec25eb5d48879ac5b84f1aa86a30949e5a4290df9`
+and env v4 SHA
+`db049dafa3fb1fa0bc5ce590c485ec62c469b3bfa4aab757255b36adcadcbb39`.
+The captured code is clean commit `c28e36a604e00540aed341c9ae6699a23a4705c1`.
+
+The worker resolved and loaded `runs/iter_7/checkpoint.pt` (sha8
+`6cb79ed3`) for both actor and critic. The live log also proves
+goal-conditioned waypoint traversal with terminal braking, full authored
+`track_linear_velocity` and `track_angular_velocity` weights of 2.0,
+entropy coefficient 0.0075, and `sculptor_terminal_stillness` weight 1.0.
+PPO is active. Do not edit reload-watched core or run an intermediate GPU
+audit while this worker is alive.
+
+After iter 8 finishes, preserve/promote its checkpoint and inspect the official
+first-episode-safe trajectory, objective/fitness artifacts, keyframes, and
+full MP4. Acceptance still requires the entire physical conjunction, including
+zero forbidden contact and a literal uninterrupted 100-frame post-completion,
+inside-finish, upright run below 0.12 m/s. `gen_003`'s 90%-quiet proxy is not
+sufficient by itself.
