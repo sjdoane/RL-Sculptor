@@ -1909,3 +1909,27 @@ reward edits were partition-gate flagged, and neither draft is part of the
 accepted immutable selection v22 reward-v7/env-v4 tuple. Do not relaunch or
 replace the accepted clip before the lab call. The complex UI workflow and
 physical behavior are now proven for the selected official rollout.
+
+## Selected-policy report provenance hardened 2026-07-23 (Codex)
+
+The live Results tab correctly selected iter 13 and its official video, but
+the generated showcase report exposed a presentation provenance bug: it
+loaded the numerically latest reward draft (`rewards/v13.py`) and described an
+older iteration as the ending behavior. Those drafts are diagnosis
+provenance, not the immutable tuple that produced the accepted policy.
+
+`sculptor/timelapse.py` now selects the highest-fitness completed policy
+(newer iteration wins an exact tie), falls back safely for legacy projects,
+and loads the reward module pinned by that iteration's `artifact_tuple.json`.
+Report behavior, primary-metric endpoints, labels, and summary/edit deltas now
+use the selected policy and list position, so sparse iteration numbering does
+not corrupt provenance. Core selection remains robot/task-name independent.
+A regression creates newer, lower-fitness completed policies plus a newer
+reward draft and requires the report to select the best policy's pinned
+reward.
+
+Verification: focused timelapse tests 9/9 passed in 3.58 seconds; full
+CPU-only suite passed with 2,231 tests and one optional-JAX skip in 281.65
+seconds; scoped Ruff, compileall, and `git diff --check` passed. Rebuild the
+Results report once after this commit and confirm its markdown says
+`Selected policy reward module: rewards/v7.py` and `Selected (iter 13)`.

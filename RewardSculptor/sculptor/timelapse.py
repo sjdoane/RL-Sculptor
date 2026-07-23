@@ -34,10 +34,8 @@ import re
 import shutil
 import subprocess
 import sys
-import textwrap
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 
 # ── Small path helpers ──────────────────────────────────────────────────
@@ -59,18 +57,8 @@ def _load_json(path: Path, default=None):
         return {} if default is None else default
 
 
-def _load_final_reward_spec(rewards_dir: Path) -> tuple[Path, dict]:
-    """Return (path_to_latest_vN.py, REWARD_SPEC)."""
-    best: tuple[int, Path] | None = None
-    for p in rewards_dir.glob("v*.py"):
-        m = re.fullmatch(r"v(\d+)", p.stem)
-        if m:
-            n = int(m.group(1))
-            if best is None or n > best[0]:
-                best = (n, p)
-    if best is None:
-        return rewards_dir / "v0.py", {}
-    path = best[1]
+def _load_reward_spec(path: Path) -> tuple[Path, dict]:
+    """Return ``(path, REWARD_SPEC)`` without mutating import state."""
     spec = importlib.util.spec_from_file_location(
         f"_sculpt_final_reward_{abs(hash(str(path)))}", path)
     if spec is None or spec.loader is None:
@@ -83,6 +71,20 @@ def _load_final_reward_spec(rewards_dir: Path) -> tuple[Path, dict]:
     return path, getattr(mod, "REWARD_SPEC", {}) or {}
 
 
+def _load_final_reward_spec(rewards_dir: Path) -> tuple[Path, dict]:
+    """Return ``(path_to_latest_vN.py, REWARD_SPEC)`` as a fallback."""
+    best: tuple[int, Path] | None = None
+    for p in rewards_dir.glob("v*.py"):
+        m = re.fullmatch(r"v(\d+)", p.stem)
+        if m:
+            n = int(m.group(1))
+            if best is None or n > best[0]:
+                best = (n, p)
+    if best is None:
+        return rewards_dir / "v0.py", {}
+    return _load_reward_spec(best[1])
+
+
 def _find_iter_dirs(runs_dir: Path) -> list[Path]:
     dirs: list[tuple[int, Path]] = []
     if not runs_dir.is_dir():
@@ -93,6 +95,57 @@ def _find_iter_dirs(runs_dir: Path) -> list[Path]:
             dirs.append((int(m.group(1)), d))
     dirs.sort(key=lambda x: x[0])
     return [d for _, d in dirs]
+
+
+def _iter_number(iter_dir: Path) -> int:
+    match = re.fullmatch(r"iter_(\d+)", iter_dir.name)
+    return int(match.group(1)) if match else -1
+
+
+def _select_report_iter_dir(iter_dirs: list[Path]) -> Path | None:
+    """Choose the same completed policy the Results UI should foreground.
+
+    A diagnosis may create newer reward/environment drafts after training.
+    Report provenance must instead follow an immutable completed policy. Among
+    completed policies with objective fitness, select the highest fitness and
+    break ties toward the newer iteration. Fall back to the newest completed
+    iteration, then the newest directory for legacy projects without markers.
+    """
+    completed: list[Path] = []
+    scored: list[tuple[float, int, Path]] = []
+    for iter_dir in iter_dirs:
+        marker = _load_json(iter_dir / "iteration_complete.json")
+        if marker.get("state") != "completed":
+            continue
+        completed.append(iter_dir)
+        fitness = _load_json(iter_dir / "fitness.json").get("fitness")
+        try:
+            scored.append((float(fitness), _iter_number(iter_dir), iter_dir))
+        except (TypeError, ValueError):
+            pass
+    if scored:
+        return max(scored, key=lambda item: (item[0], item[1]))[2]
+    if completed:
+        return completed[-1]
+    return iter_dirs[-1] if iter_dirs else None
+
+
+def _load_selected_reward_spec(
+    project: Path,
+    selected_iter_dir: Path | None,
+    rewards_dir: Path,
+) -> tuple[Path, dict]:
+    """Load the reward pinned to the selected policy's immutable tuple."""
+    if selected_iter_dir is not None:
+        artifact_tuple = _load_json(selected_iter_dir / "artifact_tuple.json")
+        reward_ref = ((artifact_tuple.get("refs") or {}).get("reward") or {})
+        reward_rel = reward_ref.get("path")
+        if isinstance(reward_rel, str) and reward_rel:
+            candidate = (project / reward_rel).resolve()
+            project_root = project.resolve()
+            if candidate.is_relative_to(project_root) and candidate.is_file():
+                return _load_reward_spec(candidate)
+    return _load_final_reward_spec(rewards_dir)
 
 
 def _select_iter_indices(n_iters: int) -> list[int]:
@@ -294,12 +347,13 @@ def _build_final_mp4(
         label_idx = 1 + 2 * i
         video_idx = 1 + 2 * i + 1
         v = f"v{i}"
-        l = f"l{i}"
+        label_tag = f"l{i}"
         filter_parts.append(
             f"[{video_idx}:v]scale={panel_size}:{panel_size},"
             f"setsar=1,fps={fps}[{v}]")
-        filter_parts.append(f"[{label_idx}:v]scale={panel_size}:56[{l}]")
-        filter_parts.append(f"[{v}][{l}]overlay=0:H-h[p{i}]")
+        filter_parts.append(
+            f"[{label_idx}:v]scale={panel_size}:56[{label_tag}]")
+        filter_parts.append(f"[{v}][{label_tag}]overlay=0:H-h[p{i}]")
         panel_tags.append(f"[p{i}]")
 
     if n >= 2:
@@ -345,7 +399,7 @@ def _collect_iter_edits(
     was applied (i.e., metric[i+1] - metric[i]). For the last iter, delta
     is None (not yet measured)."""
     out: list[_EditSummary] = []
-    for d in iter_dirs:
+    for position, d in enumerate(iter_dirs):
         m = re.fullmatch(r"iter_(\d+)", d.name)
         if not m:
             continue
@@ -355,9 +409,12 @@ def _collect_iter_edits(
             continue
         # delta = metric[i+1] - metric[i] when both exist
         delta = None
-        if len(metric_history) > i + 1 and len(metric_history) > i:
+        if len(metric_history) > position + 1:
             try:
-                delta = float(metric_history[i + 1]) - float(metric_history[i])
+                delta = (
+                    float(metric_history[position + 1])
+                    - float(metric_history[position])
+                )
             except Exception:  # noqa: BLE001
                 delta = None
         for e in diag.get("proposed_edits", []) or []:
@@ -412,6 +469,7 @@ def _write_final_report_md(
     provenance: dict,
     final_mp4_path: Path,
     final_mp4_ok: bool,
+    selected_iter_dir: Path | None = None,
 ) -> Path:
     iter_cfg = config.get("iteration", {}) or {}
     primary_key = str(iter_cfg.get("primary_metric", "mean_return"))
@@ -419,12 +477,21 @@ def _write_final_report_md(
     adapter_class = (config.get("adapter", {}) or {}).get("class", "(unknown)")
 
     first_iter = iter_dirs[0] if iter_dirs else None
-    last_iter = iter_dirs[-1] if iter_dirs else None
+    last_iter = selected_iter_dir or (iter_dirs[-1] if iter_dirs else None)
     first_behavior = _load_json(first_iter / "rollout" / "behavior.json") if first_iter else {}
     last_behavior = _load_json(last_iter / "rollout" / "behavior.json") if last_iter else {}
 
     starting_metric = metric_history[0] if metric_history else None
-    ending_metric = metric_history[-1] if metric_history else None
+    selected_position = (
+        iter_dirs.index(last_iter)
+        if last_iter is not None and last_iter in iter_dirs
+        else len(iter_dirs) - 1
+    )
+    ending_metric = (
+        metric_history[selected_position]
+        if 0 <= selected_position < len(metric_history)
+        else None
+    )
 
     # Top-3 impactful edits
     ranked = [e for e in edits if e.delta is not None
@@ -452,7 +519,7 @@ def _write_final_report_md(
 
     # Summary table rows
     summary_rows: list[dict] = []
-    for d in iter_dirs:
+    for position, d in enumerate(iter_dirs):
         m = re.fullmatch(r"iter_(\d+)", d.name)
         if not m:
             continue
@@ -464,7 +531,11 @@ def _write_final_report_md(
         n_novel = sum(1 for e in applied if not (e.get("paper_refs") or []))
         summary_rows.append({
             "iter": i,
-            "metric": metric_history[i] if i < len(metric_history) else None,
+            "metric": (
+                metric_history[position]
+                if position < len(metric_history)
+                else None
+            ),
             "num_references_added": n_refs,
             "num_novel_edits": n_novel,
         })
@@ -483,7 +554,7 @@ def _write_final_report_md(
         if starting_metric is not None and ending_metric is not None
         else f"- **Primary metric (`{primary_key}`)**: n/a"
     )
-    lines.append(f"- **Final reward module**: "
+    lines.append(f"- **Selected policy reward module**: "
                  f"[`rewards/{final_reward_path.name}`](rewards/{final_reward_path.name})  "
                  f"(version `{final_reward_spec.get('version', '?')}`)")
     video_status = "[final.mp4](" + str(final_mp4_path.as_posix()) + ")" if final_mp4_ok else \
@@ -492,10 +563,10 @@ def _write_final_report_md(
 
     # Behavior before/after
     lines.append("## Behavior: starting vs ending\n")
-    lines.append(f"**Starting** (iter {0}): "
+    lines.append(f"**Starting** (iter {_iter_number(first_iter) if first_iter else '?'}): "
                  f"{_describe_behavior(first_behavior, behavior_metric_names)}")
     lines.append("")
-    lines.append(f"**Ending** (iter {len(iter_dirs) - 1}): "
+    lines.append(f"**Selected** (iter {_iter_number(last_iter) if last_iter else '?'}): "
                  f"{_describe_behavior(last_behavior, behavior_metric_names)}\n")
 
     # Top 3 most impactful edits
@@ -621,8 +692,12 @@ def build_report(
     metric_history_obj = _load_json(project / "reports" / "metric_history.json")
     metric_history: list[float] = list(metric_history_obj.get("history", []))
 
-    # Final reward
-    final_reward_path, final_reward_spec = _load_final_reward_spec(rewards_dir)
+    # The Results UI foregrounds a completed policy, not a later diagnosis
+    # draft. Keep report behavior/reward provenance attached to that policy's
+    # immutable artifact tuple.
+    selected_iter_dir = _select_report_iter_dir(iter_dirs)
+    final_reward_path, final_reward_spec = _load_selected_reward_spec(
+        project, selected_iter_dir, rewards_dir)
 
     # Provenance
     provenance = _load_json(project / "reports" / "provenance.json") or {}
@@ -643,10 +718,11 @@ def build_report(
                 f"({mp4}); dropping from time-lapse.\n")
             continue
         metric = metric_history[idx] if idx < len(metric_history) else None
+        iter_number = _iter_number(d)
         if metric is None:
-            label = f"Iter {idx}"
+            label = f"Iter {iter_number}"
         else:
-            label = f"Iter {idx}   {primary_key}={metric:+.3f}"
+            label = f"Iter {iter_number}   {primary_key}={metric:+.3f}"
         panel_videos.append(mp4)
         panel_labels.append(label)
 
@@ -664,7 +740,12 @@ def build_report(
         behavior_goal=behavior_goal,
         total_iters=len(iter_dirs),
         starting_metric=metric_history[0] if metric_history else None,
-        ending_metric=metric_history[-1] if metric_history else None,
+        ending_metric=(
+            metric_history[iter_dirs.index(selected_iter_dir)]
+            if selected_iter_dir in iter_dirs
+            and iter_dirs.index(selected_iter_dir) < len(metric_history)
+            else None
+        ),
         primary_key=primary_key,
         adapter_class=(cfg.get("adapter", {}) or {}).get("class", "(unknown)"),
         width=title_width, height=480,
@@ -702,6 +783,7 @@ def build_report(
         edits=edits, final_reward_path=final_reward_path,
         final_reward_spec=final_reward_spec, provenance=provenance,
         final_mp4_path=out_mp4, final_mp4_ok=mp4_ok,
+        selected_iter_dir=selected_iter_dir,
     )
 
     return ReportResult(

@@ -27,6 +27,9 @@ Open **Projects → G1 Lab Showcase — Weave and Stop**.
   `884cce0`; it consumed reward v7 + env v4 and warm-started actor and critic
   from iter 12.
 - Accepted clip: `runs/iter_13/rollout/rollout.mp4`
+- Results report: rebuilt from the accepted completed policy; it must identify
+  iter 13 and the selection-v22 reward module `rewards/v7.py`, not a newer
+  unpromoted diagnosis draft.
 - No recovery is active. Do not relaunch or replace this clip before the call.
 
 The selected rendered rollout now passes the complete evidence rule. It
@@ -226,6 +229,16 @@ environment 0 passed the complete strict conjunction with a 112-frame
 whole-body-qualified hold. Use iter 13 for the call. Keep automatic reward v13
 and environment v12 as unpromoted diagnosis provenance; two reward edits were
 partition-gate flagged and are not part of the accepted tuple.
+
+The Results report now follows the highest-fitness completed policy and loads
+the reward module pinned in that policy's immutable artifact tuple. This fixes
+the prior presentation-only mismatch where the generated report described a
+newer diagnosis draft as the final reward and labeled an older run as the
+ending behavior even though Results correctly selected iter 13. The generic
+selection logic is independent of robot and task names and handles sparse
+iteration numbers. Verification: focused report tests 9/9, full CPU suite
+2,231 passed with one optional-JAX skip, Ruff, compileall, and
+`git diff --check`.
 
 ## Exact overnight launch settings
 

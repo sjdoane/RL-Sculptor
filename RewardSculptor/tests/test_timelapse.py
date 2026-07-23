@@ -87,13 +87,13 @@ def _write_project_at(project: Path, *, n_iters: int,
 
     # config.toml — use the real GymSB3Adapter dotted class so build_report
     # can still try to read the [adapter] block. We don't actually load it.
-    (project / "config.toml").write_text(textwrap.dedent(f"""
+    (project / "config.toml").write_text(textwrap.dedent("""
         [target]
         name = "unit_test"
 
         [adapter]
         class = "tests.stub.AdapterStub"
-        config = {{}}
+        config = {}
 
         [kg]
         environment_tag = "unit_test"
@@ -237,6 +237,52 @@ def test_build_report_produces_md_and_calls_mp4_builder(tmp_path: Path, monkeypa
     assert "novel_term_0" in md
     # Retired entries with still_active=false are omitted.
     assert "removed_term" not in md.lower()
+
+
+def test_report_uses_best_completed_policy_and_its_pinned_reward(
+    tmp_path: Path,
+):
+    project = _write_project(
+        tmp_path,
+        n_iters=4,
+        metric_history=[10.0, 12.0, 20.0, 15.0],
+    )
+    fitness_values = [0.1, 0.2, 0.9, 0.3]
+    for i, fitness in enumerate(fitness_values):
+        iter_dir = project / "runs" / f"iter_{i}"
+        (iter_dir / "iteration_complete.json").write_text(
+            json.dumps({"state": "completed", "iter": i}),
+            encoding="utf-8",
+        )
+        (iter_dir / "fitness.json").write_text(
+            json.dumps({"fitness": fitness}),
+            encoding="utf-8",
+        )
+
+    selected = project / "runs" / "iter_2"
+    (selected / "artifact_tuple.json").write_text(
+        json.dumps({
+            "refs": {
+                "reward": {
+                    "path": "rewards/v1.py",
+                    "version": "v1",
+                },
+            },
+        }),
+        encoding="utf-8",
+    )
+
+    result = build_report(
+        config_path=project / "config.toml",
+        out_mp4=tmp_path / "final.mp4",
+    )
+    md = result.final_report_md_path.read_text(encoding="utf-8")
+
+    assert "**Selected policy reward module**" in md
+    assert "rewards/v1.py" in md
+    assert "rewards/v4.py" not in md
+    assert "**Selected** (iter 2)" in md
+    assert "+10.0000 → +20.0000" in md
 
 
 def test_build_report_with_valid_mp4s_calls_builder(tmp_path: Path, monkeypatch):
@@ -386,13 +432,21 @@ def test_build_mission_report_stitches_mp4_across_stages(
     # walk has 3 iters -> _select_iter_indices(3) = [0, 1, 2] (all, <=3 cap).
     assert len(received["panel_videos"]) == 5
     assert len(received["panel_labels"]) == 5
-    stand_labels = [l for l in received["panel_labels"] if l.startswith("stand")]
-    walk_labels = [l for l in received["panel_labels"] if l.startswith("walk")]
+    stand_labels = [
+        label for label in received["panel_labels"] if label.startswith("stand")
+    ]
+    walk_labels = [
+        label for label in received["panel_labels"] if label.startswith("walk")
+    ]
     assert len(stand_labels) == 2
     assert len(walk_labels) == 3
     # Label format: "<stage> · iter N · <primary_key>=<value>".
-    assert any("stand · iter 0 · mean_return=" in l for l in stand_labels)
-    assert any("walk · iter 2 · mean_return=+20.000" in l for l in walk_labels)
+    assert any(
+        "stand · iter 0 · mean_return=" in label for label in stand_labels
+    )
+    assert any(
+        "walk · iter 2 · mean_return=+20.000" in label for label in walk_labels
+    )
 
     md = result.final_report_md_path.read_text(encoding="utf-8")
     assert "[final.mp4]" in md
