@@ -238,7 +238,9 @@ ending behavior even though Results correctly selected iter 13. The generic
 selection logic is independent of robot and task names and handles sparse
 iteration numbers. Verification: focused report tests 9/9, full CPU suite
 2,231 passed with one optional-JAX skip, Ruff, compileall, and
-`git diff --check`.
+`git diff --check`. The live Results rebuild was also checked: it renders
+`rewards/v7.py`, `Selected (iter 13)`, and keeps iter 13 foregrounded as the
+best policy at fitness 0.24734.
 
 ## Exact overnight launch settings
 

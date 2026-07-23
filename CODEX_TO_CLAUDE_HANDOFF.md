@@ -1931,5 +1931,7 @@ reward.
 Verification: focused timelapse tests 9/9 passed in 3.58 seconds; full
 CPU-only suite passed with 2,231 tests and one optional-JAX skip in 281.65
 seconds; scoped Ruff, compileall, and `git diff --check` passed. Rebuild the
-Results report once after this commit and confirm its markdown says
-`Selected policy reward module: rewards/v7.py` and `Selected (iter 13)`.
+Results report completed successfully in the live UI after commit `c129a72`;
+its rendered markdown now says `Selected policy reward module:
+rewards/v7.py` and `Selected (iter 13)`. Results still foregrounds iter 13 as
+best with steering fitness 0.24734 and the accepted official rollout.
