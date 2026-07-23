@@ -25,8 +25,9 @@ Open **Projects → G1 Lab Showcase — Weave and Stop**.
 - Objective metric: `gen_003` (accepted, prompt-native, observe-only)
 - Latest completed recovery job: `556e643b0b1ad22b` (code `83413d9`,
   exact promoted tuple restored before training)
-- Next normal Resume consumes the preserved iter-6 diagnosis drafts: reward
-  v7 + env v4. Leave **Resume exact promoted tuple** off for that cycle.
+- Active recovery job: `5f7e50d020ead92c`, iter 7, clean code `2b84fab`.
+  Normal Resume consumed reward v7 + env v4 and pinned selection v14 / tuple
+  `de07325bab038d29…`; exact promoted-tuple recovery was correctly left off.
 
 The July 22 iter-6 rollout independently crossed all four intermediate regions
 in exact order in 64/64 environments; 63/64 entered the finish and reached
@@ -44,7 +45,9 @@ literal continuous physical criterion. The next generic recovery adds
 whole-body stillness supervision only after the compiled command enters its
 terminal standing phase, while reward v7 doubles the authored settling weight,
 adds finish double-support shaping, and env v4 reduces entropy. Route command
-tracking remains at full weight.
+tracking remains at full weight. That recovery is now active; its log proves
+the iter-6 actor + critic warm start, entropy coefficient 0.0075, and terminal
+whole-body stillness term at weight 1 before PPO iteration 0.
 
 ## One-time startup
 

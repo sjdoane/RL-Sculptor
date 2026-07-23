@@ -1368,3 +1368,16 @@ next UI Resume should consume the iter-6 diagnosis drafts reward v7/env v4
 promoted-tuple recovery off, warm-start iter 6, and run one 750-PPO recovery
 cycle. Require the terminal-stillness provenance line before PPO starts, then
 repeat the full continuous-hold audit.
+
+That recovery is now active as UI job `5f7e50d020ead92c`, iter 7, from clean
+commit `2b84fab`. The UI launched one 750-PPO cycle with 1,024 environments,
+seed 42, two 1,000-step 1920×1080 episodes, Auto, and `gen_003` observe-only.
+Normal Resume correctly pinned reward v7 + env v4 as selection v14 / tuple
+`de07325bab038d29fa6705148f795d201d8159c42d93b8ddd92c4ec41f2226db`.
+The live log proves warm-start loading of actor + critic from iter 6 (sha8
+`ee4ab29e`), full-weight authored linear/angular command supervision,
+goal-conditioned terminal braking, entropy coefficient 0.0075, and terminal
+whole-body stillness supervision at weight 1 before PPO iteration 0. Do not
+edit reload-watched core or run an intermediate GPU audit while iter 7 is
+alive. The heartbeat monitor has been updated to this job and the literal
+100-frame acceptance rule.
