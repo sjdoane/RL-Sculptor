@@ -2271,3 +2271,19 @@ warm-starting iter 18 checkpoint SHA8 `ffe80ac9`. Use one 750-PPO cycle,
 progression, original 0.350 m predicate, four direct `-8` contact sensors,
 route RSI, physical local-frame placement, entropy 0.01, and actor+critic warm
 start. Do not present iter 18 as success.
+
+That corrected proof is now live as UI job `job_0825a00f4219404d`, iter 19.
+It launched from clean code commit `cdbec1c` (controller commit `b883447`),
+pins selection v28 / tuple
+`b3574e18c09b2fda89467ac50ce0234e6ac744b624b6a7d068b91dd662378c07`,
+reward v17 SHA
+`aaaf2a20cf86532a5ba522f2e30b422133fb4927017906a07e19e0881b4a6e38`,
+and env v15 SHA
+`08837c8d2f093bfe572cf60b012f997ccb3e2dffa2402592bdb8abe1a922c5f7`.
+The live startup log proves all four 0.268 m embodiment-clearance entries,
+the outside approach stage with 0.100 m margin followed by the unchanged
+0.350 m task disk, 0.025 m stage slack, 50/50 route RSI, local-frame objects,
+four direct contact sensors at `-8`, full authored velocity-command weights,
+whole-body terminal stillness, entropy 0.01, and actor+critic warm start from
+iter 18 SHA8 `ffe80ac9`. PPO iteration 0 is active. Do not edit
+reload-watched core or run intermediate GPU audits until iter 19 finishes.

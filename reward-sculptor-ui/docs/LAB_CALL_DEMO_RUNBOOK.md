@@ -351,3 +351,12 @@ forbidden-contact channels at weight `-8`, 50/50 entrance/midroute RSI,
 physical object local pose + environment origin, entropy coefficient 0.01,
 and actor+critic warm start from iter 18. Acceptance remains the full checklist
 above; iter 18 must never be promoted as showcase success.
+
+Current proof run: UI job `job_0825a00f4219404d`, iter 19, clean launch
+commit `cdbec1c`, selection v28, tuple
+`b3574e18c09b2fda89467ac50ce0234e6ac744b624b6a7d068b91dd662378c07`.
+The log confirms reward v17 SHA `aaaf2a20cf86532a...`, env v15 SHA
+`08837c8d2f093bfe...`, all two-phase entry/RSI/contact/alignment invariants,
+entropy 0.01, and actor+critic warm start from iter 18 SHA8 `ffe80ac9`.
+PPO iteration 0 is active. Let this worker finish before inspecting official
+rollout evidence or changing runtime code.
