@@ -507,7 +507,10 @@ def _waypoint_velocity_command_types() -> tuple[type[Any], type[Any]]:
             # zero at the finish tolerance boundary.
             terminal_target = self._waypoint_index == last
             normal_scale = torch.clamp(
-                distance / float(self.cfg.slow_radius_m), min=0.35, max=1.0)
+                distance / float(self.cfg.slow_radius_m),
+                min=float(self.cfg.intermediate_min_speed_scale),
+                max=1.0,
+            )
             terminal_scale = torch.clamp(
                 distance / float(self.cfg.terminal_slow_radius_m),
                 min=float(self.cfg.terminal_min_speed_scale), max=1.0)
@@ -559,6 +562,7 @@ def _waypoint_velocity_command_types() -> tuple[type[Any], type[Any]]:
         tolerance_m: float = 0.25
         cruise_speed_mps: float = 0.8
         slow_radius_m: float = 0.75
+        intermediate_min_speed_scale: float = 0.35
         terminal_slow_radius_m: float = 2.0
         terminal_min_speed_scale: float = 0.35
         turn_gain: float = 2.0
@@ -1933,6 +1937,13 @@ def _reconcile_waypoint_course(
     if clearance_adjustments:
         command_tolerance = min(
             goal_tolerance, max(0.08, 0.4 * goal_tolerance))
+    # A command that must enter a tight clearance subtarget cannot retain the
+    # base route's 35%-of-cruise speed floor: at the transition boundary that
+    # floor can carry the robot past the target faster than the controller can
+    # turn.  Let the ordinary distance ramp slow naturally for adjusted
+    # routes.  Its positive tolerance still guarantees non-zero crossing
+    # speed, while unadjusted routes preserve the established 0.35 floor.
+    intermediate_min_speed_scale = 0.10 if clearance_adjustments else 0.35
     adjustments: list[str] = []
     adjustments.extend(
         f"command:forbidden-contact clearance→{item}"
@@ -1943,6 +1954,10 @@ def _reconcile_waypoint_course(
             "command:forbidden-contact clearance→transition radius "
             f"{command_tolerance:.3f} m (task predicate remains "
             f"{goal_tolerance:.3f} m)"
+        )
+        adjustments.append(
+            "command:forbidden-contact clearance→intermediate approach "
+            f"speed floor {intermediate_min_speed_scale:.2f}x cruise"
         )
     events = getattr(env_cfg, "events", None)
     if isinstance(events, dict):
@@ -2010,6 +2025,7 @@ def _reconcile_waypoint_course(
                 waypoints_m=raw_waypoints,
                 tolerance_m=command_tolerance,
                 cruise_speed_mps=0.8,
+                intermediate_min_speed_scale=intermediate_min_speed_scale,
                 terminal_slow_radius_m=2.0,
             )
             adjustments.append(

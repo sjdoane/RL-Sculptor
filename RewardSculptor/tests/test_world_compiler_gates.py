@@ -341,7 +341,10 @@ def test_forbidden_object_waypoint_uses_embodiment_clearance_subtarget() -> None
     routed = env_cfg.commands["twist"]
     assert routed.waypoints_m == points
     assert routed.tolerance_m == pytest.approx(0.14)
+    assert routed.intermediate_min_speed_scale == pytest.approx(0.10)
     assert any("task predicate remains 0.350 m" in item
+               for item in adjustments)
+    assert any("speed floor 0.10x cruise" in item
                for item in adjustments)
 
 
