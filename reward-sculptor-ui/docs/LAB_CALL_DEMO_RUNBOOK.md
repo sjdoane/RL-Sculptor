@@ -401,3 +401,14 @@ lines plus:
 `installed clearance-stage reward firewall: predicate-centered generated reward withheld during command-only safe approach; command/contact/survival supervision remains active`
 
 All acceptance criteria above remain conjunctive. Never promote iter 19.
+
+Current proof run: UI job `job_86d707964503d576`, iter 20, clean captured
+commit `b734809` (firewall `3dfae11`), selection v29, tuple
+`1793447534bb34385f3fe43b7cb3ba796582583f6d8d8530f8359c4e51a12710`.
+It uses reward v17 SHA `aaaf2a20cf86532a...` and env v16 SHA
+`46fa68a262828da90...`. The live log proves actor+critic warm start from iter
+19 checkpoint SHA8 `182e00f5`, entropy coefficient 0.015, all prior physical
+alignment/RSI/contact/command invariants, and the exact clearance-stage
+firewall line. PPO iteration 1/750 is active. Leave the worker alone until
+completion, then apply the full acceptance checklist to its official
+first-episode-safe evidence.

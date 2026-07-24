@@ -2332,3 +2332,19 @@ exact promoted-tuple recovery off, use reward v17 plus env v16, warm-start
 iter 19, and prove the startup firewall log before PPO. It remains one
 750-iteration, 1,024-environment, seed-42 proof cycle with two 1,000-step
 1920x1080 rollouts and `gen_003` observe-only.
+
+That corrected proof is now live as UI job `job_86d707964503d576`, iter 20,
+under clean captured code commit `b734809` (firewall implementation
+`3dfae11`). It pins selection v29 / tuple
+`1793447534bb34385f3fe43b7cb3ba796582583f6d8d8530f8359c4e51a12710`,
+reward v17 SHA
+`aaaf2a20cf86532a5ba522f2e30b422133fb4927017906a07e19e0881b4a6e38`,
+and env v16 SHA
+`46fa68a262828da90f551e8a81718a37fe6647df41bd12bba18513f617fda9b8`.
+The UI-launched worker loaded actor and critic from iter 19 checkpoint SHA8
+`182e00f5`, raised entropy coefficient from 0.01 to 0.015, emitted the exact
+clearance-stage firewall proof line, and entered PPO iteration 1/750. Do not
+edit reload-watched core or run intermediate GPU audits while iter 20 is
+alive. After it stops, audit only the official trajectory, fitness/objective
+artifacts, scene audit, keyframes, and full video against the full physical
+acceptance conjunction.
