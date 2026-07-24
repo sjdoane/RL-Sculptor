@@ -311,3 +311,43 @@ instead of trusting a plausible video or local-coordinate metric.
 - Selected video passes every acceptance item.
 - Results export is enabled only for valid evidence.
 - Keep the verified project open before the call.
+
+## Current authoritative correction after iter 18
+
+Iter 18 is diagnostic evidence only. Its physical-scene audit is aligned and
+53/64 environments were contact-free, but **0/64** completed the actual route
+and finish. The rendered robot cleared the first three boxes, then parked
+between boxes 3 and 4. The cause was not rendering: the immutable raw-disk
+objective had advanced while the command still waited for a stricter safe cap,
+so reward and command requested different waypoints.
+
+Commit `b883447` replaces that post-success cap with a generic two-phase entry:
+
+1. approach a finite-width stage outside the authored disk on its incoming,
+   obstacle-safe side;
+2. target and enter the original authored disk, with command and evaluator
+   advancing on the same frame.
+
+The stage is derived from typed robot reach, object bounds, route tangent, and
+authored tolerance. Route RSI uses the same stages. An early disk entry also
+synchronizes immediately, so the immutable objective can never remain ahead of
+the command. The evaluator, metric firewall, contact sensors, task predicate,
+and atomic tuple rules are unchanged.
+
+Launch the next proof through **New run** with:
+
+- exact promoted-tuple recovery: **off**;
+- reward: v17 (speed-qualified capture + finish-qualified settle);
+- environment: v15;
+- warm start: iter 18 checkpoint SHA8 `ffe80ac9`;
+- Auto, one outer cycle, 750 PPO iterations, 1,024 environments, `cuda:0`;
+- 1,000 episode steps, two rollout episodes, seed 42, 1920×1080;
+- objective `gen_003`, observe-only; no reference-motion prior for this
+  continuation.
+
+Before iteration 0, confirm the log reports outside-stage then frozen-disk
+waypoint progression, the unchanged 0.350 m authored predicate, four direct
+forbidden-contact channels at weight `-8`, 50/50 entrance/midroute RSI,
+physical object local pose + environment origin, entropy coefficient 0.01,
+and actor+critic warm start from iter 18. Acceptance remains the full checklist
+above; iter 18 must never be promoted as showcase success.

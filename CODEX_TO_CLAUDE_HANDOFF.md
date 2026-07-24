@@ -2217,3 +2217,57 @@ objects, direct contact supervision, entropy coefficient 0.01, and
 actor+critic warm start from iter 17 checkpoint SHA8 `91fa1b84`. PPO
 iteration 0 is active. Do not edit reload-watched core or run intermediate
 GPU audits until it finishes.
+
+## Iter 18 command/objective race + two-phase entry 2026-07-24 (Codex)
+
+UI job `job_99e23f1f888a44a5` completed iter 18. The official artifact is
+physically trustworthy but is not a successful demonstration:
+
+- physical-scene audit: aligned, maximum error `0.00 m`;
+- contact-free: 53/64;
+- no sustained fall proxy: 51/64;
+- actual route + finish: **0/64**;
+- no 100-frame hold and no full conjunction;
+- rendered env 0 stayed upright/contact-free and reached waypoint index 3,
+  but visibly parked between boxes 3 and 4.
+
+The full video/contact sheet and trajectory agree. Env 0 converged near local
+`(4.925, 1.030)`, about 6 cm before the safe-cap plane. The frozen raw-disk
+objective had already advanced to waypoint 4, while the command still targeted
+waypoint 3's safe cap. Reward v16's dense active-waypoint capture then pulled
+toward raw waypoint 4 while base command tracking pulled backward toward the
+waypoint 3 cap. This contradictory equilibrium is a semantic race: any
+command-only subset of a frozen success disk necessarily advances later than
+the immutable objective.
+
+Commit `b883447` (`fix(world): stage safe waypoint entries before disk
+success`) removes the second post-success gate without weakening the frozen
+predicate:
+
+- each clearance-adjusted waypoint gets a finite-width command-only approach
+  stage **outside** its authored disk, on the incoming and obstacle-safe side;
+- the stage ray is constructed from typed obstacle-away clearance, authored
+  tolerance, and route tangent, so entry at the original disk boundary has the
+  required embodiment clearance;
+- after crossing the outside stage, the command targets the immutable disk
+  center and advances on the exact original disk-entry frame;
+- any stochastic early disk entry also advances the command immediately,
+  ensuring command and frozen objective can never remain split;
+- train-only route RSI uses the same outside stages while preserving original
+  logical waypoint indices;
+- unadjusted routes retain ordinary authored disk entry, and no robot, task,
+  object, prompt, or simulator name keys the behavior.
+
+Focused compiler/adapter verification is **66 passed**. Scoped Ruff,
+compileall, and `git diff --check` pass. The automatic diagnosis authored
+reward v17, which independently removes the observed parking income by
+speed-qualifying the capture kernel and finish-zone-qualifying settle income.
+
+The next proof must be launched through **New run** in the UI with exact
+promoted-tuple recovery off, so it consumes reward v17 and env v15 while
+warm-starting iter 18 checkpoint SHA8 `ffe80ac9`. Use one 750-PPO cycle,
+1,024 environments, seed 42, two 1,000-step 1920×1080 episodes, Auto,
+`gen_003` observe-only. Require startup proof of outside-stage→frozen-disk
+progression, original 0.350 m predicate, four direct `-8` contact sensors,
+route RSI, physical local-frame placement, entropy 0.01, and actor+critic warm
+start. Do not present iter 18 as success.
