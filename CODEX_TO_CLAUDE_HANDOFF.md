@@ -2206,3 +2206,14 @@ kernel) and env v15 SHA
 (entropy scale restored to 1.0). The next UI Resume should keep exact
 promoted-tuple recovery off so it consumes both evidence-authored drafts and
 warm-starts iter 17.
+
+That proof run is now live as UI job `job_99e23f1f888a44a5`, iter 18, under
+clean launch commit `07ec6dc`. It pins selection v27 / tuple
+`ca96cf73ebc66aecbd227e62d8c0217bf061492173ed2b82e86fd21d489f5c82`
+with the exact reward v16 and env v15 hashes above. The live log proves the
+safe-cap transition inside the frozen 0.350 m predicate, 0.025 m clearance
+slack, four embodiment-derived safe targets, route RSI, local-frame physical
+objects, direct contact supervision, entropy coefficient 0.01, and
+actor+critic warm start from iter 17 checkpoint SHA8 `91fa1b84`. PPO
+iteration 0 is active. Do not edit reload-watched core or run intermediate
+GPU audits until it finishes.

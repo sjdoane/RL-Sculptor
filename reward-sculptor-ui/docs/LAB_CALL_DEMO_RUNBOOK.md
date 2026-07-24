@@ -233,6 +233,12 @@ For the next proof run, keep exact recovery **off** and verify:
 - every previously required physical alignment, contact, RSI, and command
   supervision line.
 
+Current proof run: UI job `job_99e23f1f888a44a5`, iter 18, clean launch
+commit `07ec6dc`, selection v27, tuple
+`ca96cf73ebc66aecbd227e62d8c0217bf061492173ed2b82e86fd21d489f5c82`.
+The log confirms reward v16, env v15, safe-cap progression, entropy 0.01,
+and actor+critic warm start from iter 17 checkpoint SHA8 `91fa1b84`.
+
 Inspect the first official rollout before committing to an overnight run.
 The physical-scene audit must say **aligned**. If the route is learning and
 the boxes are visibly co-located, launch **Overnight showcase**:
