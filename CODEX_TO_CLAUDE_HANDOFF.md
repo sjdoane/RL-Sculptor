@@ -2021,3 +2021,8 @@ Verification:
 The current demo procedure is fully replaced by
 `reward-sculptor-ui/docs/LAB_CALL_DEMO_RUNBOOK.md`. It explicitly treats iter
 13 as invalid failure provenance and requires a fresh aligned rollout.
+
+Final broad verification after both implementation slices:
+`MUJOCO_GL=egl .venv/bin/python -m pytest tests/ -q
+--ignore=tests/test_refs_preview.py` completed in 293.25 seconds with
+**2,242 passed / 1 optional-JAX skip** (163 warnings, no failures).
