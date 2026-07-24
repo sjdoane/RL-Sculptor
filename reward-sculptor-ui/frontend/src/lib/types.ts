@@ -379,6 +379,10 @@ export interface RunParamsPayload {
   // Explicit recovery path: restore reward + env inputs from the last promoted
   // atomic world tuple before the resumed sculpt process starts.
   resume_exact_tuple?: boolean;
+  // Optional pre-existing motion. The exact robot namespace is paired with
+  // the clip id so the backend never resolves from a fallback embodiment.
+  reference_clip_id?: string | null;
+  reference_robot?: string | null;
 }
 
 /** §Ship 39 (H1): the interactive control sidecar state (PATCH response). */

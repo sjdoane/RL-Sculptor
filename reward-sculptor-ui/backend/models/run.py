@@ -8,7 +8,7 @@ underlying Job.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Annotated, Any, Literal, Optional
+from typing import Annotated, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -160,6 +160,34 @@ class RunParams(BaseModel):
     promoted atomic selection.  This is an explicit recovery control for
     rejecting unpromoted diagnosis drafts; normal iterative resumes keep using
     the newly generated drafts."""
+
+    reference_clip_id: Optional[
+        Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,95}$")]
+    ] = None
+    """Optional pre-existing motion used as an immutable tracking prior.
+    The normal behavior prompt is authored as a bounded task residual around
+    that prior; route/object RSI remains an independent world curriculum."""
+
+    reference_robot: Optional[
+        Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")]
+    ] = None
+    """Reference-library embodiment namespace for ``reference_clip_id``.
+    Required when a clip is selected so identically named clips can never be
+    resolved from the wrong robot library."""
+
+    reference_clip_id: Optional[
+        Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,95}$")]
+    ] = None
+    """Optional pre-existing motion used as an immutable tracking prior.
+    The normal behavior prompt is authored as a bounded task residual around
+    that prior; route/object RSI remains an independent world curriculum."""
+
+    reference_robot: Optional[
+        Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")]
+    ] = None
+    """Reference-library embodiment namespace for ``reference_clip_id``.
+    Required when a clip is selected so identically named clips can never be
+    resolved from the wrong robot library."""
 
 
 class RunControl(BaseModel):

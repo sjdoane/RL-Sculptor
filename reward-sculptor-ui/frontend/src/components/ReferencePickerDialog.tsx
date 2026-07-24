@@ -105,11 +105,13 @@ export function ReferencePickerDialog({
   stageName,
   currentClipId,
   initialQuery,
+  robot = "g1",
+  onPick,
   onClose,
 }: {
   slug: string;
-  missionSlug: string;
-  stageName: string;
+  missionSlug?: string;
+  stageName?: string;
   /** Currently attached clip, if any — pre-selects it so re-opening the
    *  picker on an already-attached stage shows the existing choice. */
   currentClipId?: string | null;
@@ -118,6 +120,13 @@ export function ReferencePickerDialog({
    *  noise (0000_motorcycle…) — opening pre-searched on the stage's
    *  own goal surfaces relevant clips immediately. */
   initialQuery?: string;
+  /** Reference-library embodiment namespace. The normal run picker derives
+   *  this from project metadata; mission callers keep the historical g1
+   *  default unless they pass a different robot. */
+  robot?: string;
+  /** Standalone selection mode. When provided, selecting a clip returns it
+   *  to the caller instead of mutating a mission stage. */
+  onPick?: (selection: { clipId: string; robot: string }) => void;
   onClose: () => void;
 }) {
   const [queryInput, setQueryInput] = useState(initialQuery ?? "");
@@ -130,8 +139,12 @@ export function ReferencePickerDialog({
   const [selectedClipId, setSelectedClipId] = useState<string | null>(currentClipId ?? null);
 
   const trimmed = debouncedQuery.trim();
-  const search = useReferenceSearch(trimmed, { enabled: trimmed.length > 0 });
-  const browse = useReferenceIndex({ enabled: trimmed.length === 0 });
+  const search = useReferenceSearch(trimmed, {
+    robot, enabled: trimmed.length > 0,
+  });
+  const browse = useReferenceIndex({
+    robot, enabled: trimmed.length === 0,
+  });
 
   const rows: PickerRow[] = trimmed.length > 0
     ? (search.data ?? []).map(toRow)
@@ -141,9 +154,20 @@ export function ReferencePickerDialog({
   const libraryEmpty = trimmed.length === 0 && !browse.isLoading && !browse.isError && rows.length === 0;
 
   const attach = useAttachStageReference(slug);
+  const isStandalone = onPick !== undefined;
+  const isCommitting = !isStandalone && attach.isPending;
 
   const doAttach = () => {
     if (!selectedClipId) return;
+    if (onPick) {
+      onPick({ clipId: selectedClipId, robot });
+      onClose();
+      return;
+    }
+    if (!missionSlug || !stageName) {
+      toast.error("Reference destination is missing");
+      return;
+    }
     attach.mutate(
       { missionSlug, stageName, clipId: selectedClipId },
       {
@@ -169,18 +193,20 @@ export function ReferencePickerDialog({
     <Modal
       icon="video"
       title="Pick a reference clip"
-      subtitle={`Stage ${stageName}`}
+      subtitle={stageName ? `Stage ${stageName}` : `Motion prior · ${robot}`}
       onClose={onClose}
       footer={
         <>
-          <Btn kind="quiet" onClick={onClose} disabled={attach.isPending}>Cancel</Btn>
+          <Btn kind="quiet" onClick={onClose} disabled={isCommitting}>Cancel</Btn>
           <Btn
             kind="primary"
-            icon={attach.isPending ? "loader" : "check"}
+            icon={isCommitting ? "loader" : "check"}
             onClick={doAttach}
-            disabled={!selectedClipId || attach.isPending}
+            disabled={!selectedClipId || isCommitting}
           >
-            {attach.isPending ? "Attaching…" : "Attach"}
+            {isCommitting
+              ? "Attaching…"
+              : isStandalone ? "Use motion" : "Attach"}
           </Btn>
         </>
       }

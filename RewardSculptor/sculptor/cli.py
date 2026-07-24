@@ -1310,6 +1310,12 @@ def run(
         3600.0, "--feedback-timeout",
         help="Max seconds to wait at an interactive pause before auto-resuming "
              "(so a dead client can't pin the GPU)."),
+    reference_clip: Optional[str] = typer.Option(
+        None, "--reference-clip",
+        help="Reference-library clip id used as an immutable tracking prior."),
+    reference_robot: Optional[str] = typer.Option(
+        None, "--reference-robot",
+        help="Exact reference-library robot namespace for --reference-clip."),
 ):
     """Run the inner loop: train → rollout → diagnose → edit → commit."""
     from sculptor.sculpt import sculpt_run
@@ -1356,6 +1362,8 @@ def run(
         init_policy_path=init_policy,
         control_file=control_file,
         feedback_timeout=feedback_timeout,
+        reference_clip_id=reference_clip,
+        reference_robot=reference_robot,
     )
     # Only override sculpt_run's defaults when explicitly provided.
     if fitness_target is not None:

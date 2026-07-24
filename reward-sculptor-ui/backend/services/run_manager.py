@@ -507,6 +507,8 @@ def run_sculpt_job(
     start_mode = run_params.get("start_mode")
     start_mode = start_mode if start_mode in ("manual", "auto") else "auto"
     resume_exact_tuple = bool(run_params.get("resume_exact_tuple", False))
+    reference_clip_id = run_params.get("reference_clip_id")
+    reference_robot = run_params.get("reference_robot")
 
     async def _runner(job: Job, cancel: asyncio.Event) -> dict[str, Any]:
         if resume_exact_tuple:
@@ -625,6 +627,11 @@ def run_sculpt_job(
             cmd += ["--rollout-episodes", str(int(rollout_episodes))]
         if seed is not None:
             cmd += ["--seed", str(int(seed))]
+        if reference_clip_id is not None and reference_robot is not None:
+            cmd += [
+                "--reference-clip", str(reference_clip_id),
+                "--reference-robot", str(reference_robot),
+            ]
         if auto_adjust_physics is not None:
             # typer's --flag/--no-flag convention.
             cmd.append(
@@ -704,6 +711,8 @@ def run_sculpt_job(
             ("fitness_metric", eff_fitness_metric),
             ("fitness_mode", final_fitness_mode),
             ("fitness_patience", fitness_patience),
+            ("reference_clip_id", reference_clip_id),
+            ("reference_robot", reference_robot),
         ):
             if val is not None:
                 job.params.setdefault(key, val)

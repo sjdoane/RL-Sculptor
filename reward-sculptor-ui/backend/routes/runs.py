@@ -542,6 +542,37 @@ def launch_run(
                 detail="; ".join(str(error) for error in errors),
                 type_="/problems/world-integrity",
             )
+    if bool(body.reference_clip_id) != bool(body.reference_robot):
+        return _problem(
+            status.HTTP_412_PRECONDITION_FAILED,
+            "reference motion is incomplete",
+            detail=(
+                "reference_clip_id and reference_robot must be supplied "
+                "together"
+            ),
+            type_="/problems/reference-motion",
+        )
+    if body.reference_clip_id and body.reference_robot:
+        # Resolve the exact (embodiment, clip) pair before queuing GPU work.
+        # The index is a cache, so provenance + clip bytes remain the
+        # authoritative existence check.
+        from sculptor.refs import library as reference_library
+
+        ref_dir = reference_library.clip_dir(
+            body.reference_robot, body.reference_clip_id,
+        )
+        provenance_path = ref_dir / reference_library.PROVENANCE_FILENAME
+        clip_path = ref_dir / reference_library.CLIP_FILENAME
+        if not provenance_path.is_file() or not clip_path.is_file():
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "reference motion is unavailable",
+                detail=(
+                    f"no complete reference clip "
+                    f"{body.reference_robot}/{body.reference_clip_id}"
+                ),
+                type_="/problems/reference-motion",
+            )
     run_params: dict[str, Any] = body.model_dump()
     job = jobs.submit(
         kind="sculpt_run",

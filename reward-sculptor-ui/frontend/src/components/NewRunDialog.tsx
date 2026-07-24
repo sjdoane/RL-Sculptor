@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { toast } from "sonner";
 
 import { Icon } from "@/components/rs/icon";
+import { ReferencePickerDialog } from "@/components/ReferencePickerDialog";
 import { Btn, Field, Modal, ToggleRow } from "@/components/rs/primitives";
 import { courseBreakdownText } from "@/components/WorldTab";
 import { useSystemInfo } from "@/hooks/useDashboard";
@@ -30,6 +31,32 @@ const LEGACY_SECONDS_PER_CYCLE: Record<string, number> = {
 };
 
 const MAX_BEHAVIOR_GOAL_LENGTH = 500;
+
+function referenceRobotForProject(project: ProjectDetail): string {
+  const hints = [
+    project.adapter_config?.reference_robot,
+    project.library_slug,
+    project.adapter_config?.robot,
+    project.adapter_config?.task_id,
+    project.env_id,
+  ];
+  for (const raw of hints) {
+    if (typeof raw !== "string" || !raw.trim()) continue;
+    const tokens = raw.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+    for (const token of [...tokens].reverse()) {
+      // Asset-family suffixes such as "29dof" carry morphology detail but
+      // are not library namespaces; prefer the preceding embodiment token.
+      if (/^\d+$/.test(token) || /^\d+dof$/.test(token)) continue;
+      if (["mjlab", "velocity", "flat", "unitree", "booster"].includes(token)) {
+        continue;
+      }
+      return token;
+    }
+  }
+  // Unknown embodiments fail closed with an empty picker instead of silently
+  // borrowing another robot's motion namespace.
+  return "unassigned";
+}
 
 const MJLAB_TIMING: Record<string, {
   fixedSeconds: number;
@@ -288,6 +315,12 @@ export function NewRunDialog({
   // g1-kick-v3 run at iter 4). Default 4 here so a hard exploratory skill
   // gets room to escape a local optimum; "" → sculpt default.
   const [fitnessPatience, setFitnessPatience] = useState<number | "">(4);
+  const [referenceClipId, setReferenceClipId] = useState<string | null>(null);
+  const [referencePickerOpen, setReferencePickerOpen] = useState(false);
+  const referenceRobot = useMemo(
+    () => referenceRobotForProject(project),
+    [project],
+  );
   const launch = useLaunchRun(slug);
   // §env-authoring: the authored world this run will train under (404 →
   // undefined for legacy projects; the atomic selection file drives the
@@ -378,6 +411,8 @@ export function NewRunDialog({
       setResumeExactTuple(false);
       setAllowDefaultWorld(false);
       setAllowRobotMismatch(false);
+      setReferenceClipId(null);
+      setReferencePickerOpen(false);
     }
   }, [open, project.description, defaults]);
 
@@ -528,6 +563,8 @@ export function NewRunDialog({
       // their newly generated drafts, while recovery can reject them in favor
       // of the last promoted atomic tuple.
       resume_exact_tuple: resumeExactTuple,
+      reference_clip_id: referenceClipId,
+      reference_robot: referenceClipId ? referenceRobot : null,
     };
     launch.mutate(body, {
       onSuccess: (r) => {
@@ -795,6 +832,62 @@ export function NewRunDialog({
                   autoFocus
                 />
               </Field>
+              <div
+                style={{
+                  display: "flex", alignItems: "center", gap: 11,
+                  border: "1px solid var(--hairline)",
+                  borderRadius: "var(--radius-md)",
+                  padding: "11px 12px",
+                  background: referenceClipId
+                    ? "color-mix(in srgb, var(--rs-primary) 5%, var(--surface-strong))"
+                    : "var(--surface-strong)",
+                }}
+              >
+                <div
+                  style={{
+                    width: 30, height: 30, flex: "0 0 30px",
+                    borderRadius: "var(--radius-sm)",
+                    display: "grid", placeItems: "center",
+                    background: "var(--canvas-soft)",
+                    color: referenceClipId ? "var(--rs-primary)" : "var(--rs-muted)",
+                  }}
+                >
+                  <Icon name="video" size={15} />
+                </div>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ fontSize: 12.5, fontWeight: 650 }}>
+                    {referenceClipId ? "Motion prior attached" : "Pre-existing motion (optional)"}
+                  </div>
+                  <div
+                    style={{
+                      marginTop: 3, fontSize: 10.8, lineHeight: 1.45,
+                      color: "var(--rs-muted)",
+                    }}
+                  >
+                    {referenceClipId
+                      ? <><code className="mono">{referenceRobot}/{referenceClipId}</code> becomes the immutable tracking base; this goal can only add a bounded task residual.</>
+                      : "Choose a retargeted clip to preserve its gait or pose sequence while the authored world and route RSI teach the novel task."}
+                  </div>
+                </div>
+                {referenceClipId && (
+                  <Btn
+                    kind="ghost" size="xs" icon="x"
+                    onClick={() => setReferenceClipId(null)}
+                    disabled={launchBusy}
+                  >
+                    Clear
+                  </Btn>
+                )}
+                <Btn
+                  kind={referenceClipId ? "quiet" : "ghost"}
+                  size="sm"
+                  icon="search"
+                  onClick={() => setReferencePickerOpen(true)}
+                  disabled={launchBusy}
+                >
+                  {referenceClipId ? "Change" : "Choose motion"}
+                </Btn>
+              </div>
               <ToggleRow
                 on={dryRun} onChange={(value) => { setDryRun(value); setProfile("custom"); }} label="Dry run"
                 title={<><code className="mono">--dry-run</code> · smoke-test the pipeline</>}
@@ -1123,6 +1216,16 @@ export function NewRunDialog({
             </>
           )}
         </Modal>
+      )}
+      {referencePickerOpen && (
+        <ReferencePickerDialog
+          slug={slug}
+          currentClipId={referenceClipId}
+          initialQuery={behavior}
+          robot={referenceRobot}
+          onPick={({ clipId }) => setReferenceClipId(clipId)}
+          onClose={() => setReferencePickerOpen(false)}
+        />
       )}
     </>
   );

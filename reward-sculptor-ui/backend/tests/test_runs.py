@@ -173,6 +173,57 @@ def test_launch_run_returns_summary(
     assert "1707.06347" in body["iterations"][0]["paper_refs"]
 
 
+def test_launch_run_reference_motion_requires_exact_library_pair(
+    client: TestClient,
+    tmp_path: Path,
+    fake_sculpt,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-fake")
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(tmp_path / "references"))
+    slug = _make_project_with_library(client, "ReferenceRun")
+
+    incomplete = client.post(
+        f"/projects/{slug}/runs",
+        json={
+            "behavior_goal": "walk with this style while weaving",
+            "iterations": 1,
+            "reference_clip_id": "walk_cycle",
+        },
+    )
+    assert incomplete.status_code == 412
+    assert incomplete.json()["title"] == "reference motion is incomplete"
+
+    missing = client.post(
+        f"/projects/{slug}/runs",
+        json={
+            "behavior_goal": "walk with this style while weaving",
+            "iterations": 1,
+            "reference_clip_id": "walk_cycle",
+            "reference_robot": "demo",
+        },
+    )
+    assert missing.status_code == 412
+    assert missing.json()["title"] == "reference motion is unavailable"
+
+    from sculptor.refs import library
+
+    ref_dir = library.clip_dir("demo", "walk_cycle")
+    ref_dir.mkdir(parents=True)
+    (ref_dir / library.CLIP_FILENAME).write_bytes(b"test-clip")
+    (ref_dir / library.PROVENANCE_FILENAME).write_text("{}")
+    launched = client.post(
+        f"/projects/{slug}/runs",
+        json={
+            "behavior_goal": "walk with this style while weaving",
+            "iterations": 1,
+            "reference_clip_id": "walk_cycle",
+            "reference_robot": "demo",
+        },
+    )
+    assert launched.status_code == 202, launched.text
+
+
 def test_get_run_preserves_advanced_launch_params(
     client: TestClient, tmp_projects_root: Path, fake_sculpt, monkeypatch
 ) -> None:
@@ -681,6 +732,46 @@ def test_run_sculpt_job_forwards_hardware_overrides_as_cli_flags(
     cmd = captured["cmd"]
     assert cmd[cmd.index("--num-envs") + 1] == "512"
     assert cmd[cmd.index("--device") + 1] == "cuda:0"
+
+
+def test_run_sculpt_job_forwards_reference_pair_as_cli_flags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from backend.services import run_manager
+    from backend.services.job_manager import Job
+
+    project_dir = tmp_path / "reference-flags"
+    project_dir.mkdir()
+    captured: dict = {}
+
+    class _Sentinel(Exception):
+        pass
+
+    async def _fake_exec(*args, **kwargs):
+        captured["cmd"] = list(args)
+        raise _Sentinel()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+    runner = run_manager.run_sculpt_job(
+        project_dir=project_dir,
+        run_params={
+            "behavior_goal": "preserve this gait while weaving",
+            "iterations": 1,
+            "reference_clip_id": "walk_cycle",
+            "reference_robot": "g1",
+        },
+    )
+    job = Job(
+        job_id="t_reference", kind="sculpt_run",
+        project_slug="reference-flags", status="running",
+    )
+    job._cancel = asyncio.Event()
+    with pytest.raises(_Sentinel):
+        asyncio.run(runner(job, job._cancel))
+
+    cmd = captured["cmd"]
+    assert cmd[cmd.index("--reference-clip") + 1] == "walk_cycle"
+    assert cmd[cmd.index("--reference-robot") + 1] == "g1"
 
 
 def test_launch_rejects_tampered_authored_world_before_job_submission(

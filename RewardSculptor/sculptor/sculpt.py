@@ -458,6 +458,147 @@ def _promote_iteration_selection(
     return promoted.tuple_hash, pinned
 
 
+def _prepare_reference_guided_run(
+    *,
+    adapter: Any,
+    project: Path,
+    rewards_dir: Path,
+    behavior_goal: str,
+    clip_id: str,
+    robot: str,
+    kg_store: Any,
+    dry_run: bool,
+) -> dict[str, Any]:
+    """Atomically install a normal-run reference prior plus task residual.
+
+    The expensive build is completed in a private staging directory first.
+    Only then is one immutable reward version created and the authored tuple
+    promoted.  A cache tied to the selected reward hash makes exact UI resumes
+    idempotent while a changed prompt, clip, robot, or clip content produces a
+    new reward version.
+    """
+    from sculptor.reference_run import (
+        build_reference_guided_reward,
+        load_exact_reference_motion,
+        reference_input_hash,
+    )
+    from sculptor.world.artifacts import WorldArtifactStore, file_sha256
+
+    selection_path = Path(
+        str(getattr(adapter, "world_selection_path", "") or "")
+    ).resolve()
+    store = WorldArtifactStore(project)
+    selection = store.read_selection(selection_path)
+    if selection is None:
+        raise ValueError(
+            "reference-guided runs require an authoritative authored "
+            "selection so the new reward can be bound atomically"
+        )
+
+    _clip, _provenance, clip_sha256 = load_exact_reference_motion(
+        clip_id=clip_id, robot=robot,
+    )
+    input_hash = reference_input_hash(
+        clip_id=clip_id,
+        robot=robot,
+        clip_sha256=clip_sha256,
+        behavior_goal=behavior_goal,
+    )
+    cache_path = project / "reports" / "reference_motion_current.json"
+    selected_reward_ref = selection.refs.get("reward")
+    selected_reward_path: Optional[Path] = None
+    if selected_reward_ref is not None:
+        selected_reward_path = Path(selected_reward_ref.path)
+        if not selected_reward_path.is_absolute():
+            selected_reward_path = project / selected_reward_path
+        selected_reward_path = selected_reward_path.resolve()
+    try:
+        cache = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        cache = {}
+    if (
+        selected_reward_path is not None
+        and selected_reward_path.is_file()
+        and cache.get("input_hash") == input_hash
+        and cache.get("reward_sha256") == file_sha256(selected_reward_path)
+        and cache.get("tuple_hash") == selection.tuple_hash
+        and (dry_run or cache.get("task_residual_authored") is True)
+    ):
+        _emit_event({
+            "type": "reference_motion_reused",
+            "clip_id": clip_id,
+            "robot": robot,
+            "reward_path": str(selected_reward_path),
+            "tuple_hash": selection.tuple_hash,
+        })
+        return dict(cache)
+
+    latest_n, _latest_path = _find_latest_reward_version(rewards_dir)
+    reward_version = f"v{latest_n + 1}"
+    _emit_event({
+        "type": "reference_motion_preparing",
+        "clip_id": clip_id,
+        "robot": robot,
+        "reward_version": reward_version,
+        "task_residual": "skipped_dry_run" if dry_run else "authoring",
+    })
+    built = build_reference_guided_reward(
+        clip_id=clip_id,
+        robot=robot,
+        behavior_goal=behavior_goal,
+        reward_version=reward_version,
+        reward_contract=adapter.reward_contract(),
+        kg_store=kg_store,
+        dry_run=dry_run,
+    )
+    env_ref = selection.refs.get("env_spec")
+    if env_ref is None:
+        raise ValueError(
+            "authored selection has no env_spec; cannot bind reference reward"
+        )
+    target_path = rewards_dir / f"{reward_version}.py"
+    # Immutable reward versions are never overwritten.  If a concurrent
+    # process allocated this name, fail closed rather than rebasing the
+    # already-authored source onto a different selection.
+    with target_path.open("x", encoding="utf-8") as handle:
+        handle.write(built.source)
+
+    tuple_hash, pinned = _promote_iteration_selection(
+        adapter,
+        project,
+        reward_path=target_path,
+        env_spec_version=env_ref.version,
+        base_selection=selection_path,
+    )
+    if tuple_hash is None or pinned is None:
+        raise ValueError("reference reward promotion produced no authored tuple")
+    _write_current_reexport(rewards_dir, target_path)
+
+    result = {
+        "schema": 1,
+        "input_hash": input_hash,
+        "clip_id": built.clip_id,
+        "robot": built.robot,
+        "clip_sha256": built.clip_sha256,
+        "reference_target_sha256": built.target_sha256,
+        "phase_mode": built.phase_mode,
+        "phase_duration_s": built.phase_duration_s,
+        "task_residual_authored": built.task_residual_authored,
+        "reward_version": reward_version,
+        "reward_path": str(target_path.resolve()),
+        "reward_sha256": file_sha256(target_path),
+        "selection_path": str(pinned.resolve()),
+        "tuple_hash": tuple_hash,
+    }
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(
+        json.dumps(result, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    _emit_event({"type": "reference_motion_installed", **result})
+    return result
+
+
 # ── Git helpers (optional) ───────────────────────────────────────────────
 def _is_git_repo(project: Path) -> bool:
     r = subprocess.run(
@@ -2534,6 +2675,8 @@ def sculpt_run(
     control_file: Optional[Path | str] = None,
     feedback_timeout: float = 3600.0,
     feedback_poll_interval: float = 2.0,
+    reference_clip_id: Optional[str] = None,
+    reference_robot: Optional[str] = None,
 ) -> SculptRunResult:
     """§Ship-19d: `per_iter_callback` is fired AFTER each iter's
     artifacts are persisted. Returning `None` keeps the loop running;
@@ -2715,6 +2858,23 @@ def sculpt_run(
         from sculptor.kg.store import SculptorKG
         kg_store = SculptorKG()
 
+    if bool(reference_clip_id) != bool(reference_robot):
+        raise ValueError(
+            "reference_clip_id and reference_robot must be supplied together"
+        )
+    reference_motion_context: Optional[dict[str, Any]] = None
+    if reference_clip_id and reference_robot:
+        reference_motion_context = _prepare_reference_guided_run(
+            adapter=adapter,
+            project=project,
+            rewards_dir=rewards_dir,
+            behavior_goal=behavior_goal,
+            clip_id=reference_clip_id,
+            robot=reference_robot,
+            kg_store=kg_store,
+            dry_run=dry_run,
+        )
+
     # Start iter index
     latest_n_before_loop, _ = _find_latest_reward_version(rewards_dir)
     start_iter = (
@@ -2779,6 +2939,7 @@ def sculpt_run(
         "no_kg": bool(no_kg),
         "dry_run": bool(dry_run),
         "behavior_goal": behavior_goal,
+        "reference_motion": reference_motion_context,
         # §Ship 24 (R1): seed surfaced at run start so any result can
         # be tied back to its seed plan from the event stream alone.
         "base_seed": int(base_seed),
@@ -2799,6 +2960,8 @@ def sculpt_run(
             iterations=int(iterations),
             start_iter=int(start_iter),
         )
+        if reference_motion_context is not None:
+            _rc["reference_motion"] = reference_motion_context
         _rc_path = write_run_context(paths["reports"], _rc)
         _emit_event({
             "type": "run_context_captured",
