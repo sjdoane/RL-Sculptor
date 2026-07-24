@@ -440,6 +440,16 @@ def _waypoint_velocity_command_types() -> tuple[type[Any], type[Any]]:
             super().__init__(cfg, env)
             self._waypoints = torch.as_tensor(
                 cfg.waypoints_m, device=self.device, dtype=torch.float32)
+            self._predicate_waypoints = torch.as_tensor(
+                cfg.predicate_waypoints_m,
+                device=self.device,
+                dtype=torch.float32,
+            )
+            self._clearance_shifts = torch.as_tensor(
+                cfg.clearance_shifts_m,
+                device=self.device,
+                dtype=torch.float32,
+            )
             self._waypoint_index = torch.zeros(
                 self.num_envs, device=self.device, dtype=torch.long)
             raw_starts = getattr(
@@ -482,12 +492,20 @@ def _waypoint_velocity_command_types() -> tuple[type[Any], type[Any]]:
                     "scene env_origins shape does not match robot root positions")
             local_xy = (root_pos - origins)[:, :2]
             last = self._waypoints.shape[0] - 1
-            target = self._waypoints[
-                torch.clamp(self._waypoint_index, max=last), :2]
-            distance = torch.linalg.norm(target - local_xy, dim=-1)
+            active_index = torch.clamp(self._waypoint_index, max=last)
+            predicate_center = self._predicate_waypoints[
+                active_index, :2]
+            clearance_shift = self._clearance_shifts[active_index, :2]
             reached = (
                 (self._waypoint_index < self._waypoints.shape[0])
-                & (distance <= float(self.cfg.tolerance_m))
+                & _waypoint_transition_reached(
+                    local_xy,
+                    predicate_center,
+                    clearance_shift,
+                    tolerance_m=float(self.cfg.tolerance_m),
+                    clearance_slack_m=float(
+                        self.cfg.clearance_transition_slack_m),
+                )
             )
             self._waypoint_index = torch.clamp(
                 self._waypoint_index + reached.long(),
@@ -559,7 +577,10 @@ def _waypoint_velocity_command_types() -> tuple[type[Any], type[Any]]:
     @dataclass(kw_only=True)
     class WaypointVelocityCommandCfg(UniformVelocityCommandCfg):
         waypoints_m: tuple[tuple[float, float, float], ...]
+        predicate_waypoints_m: tuple[tuple[float, float, float], ...]
+        clearance_shifts_m: tuple[tuple[float, float, float], ...]
         tolerance_m: float = 0.25
+        clearance_transition_slack_m: float = 0.025
         cruise_speed_mps: float = 0.8
         slow_radius_m: float = 0.75
         intermediate_min_speed_scale: float = 0.35
@@ -572,6 +593,44 @@ def _waypoint_velocity_command_types() -> tuple[type[Any], type[Any]]:
             return WaypointVelocityCommand(self, env)
 
     return WaypointVelocityCommandCfg, WaypointVelocityCommand
+
+
+def _waypoint_transition_reached(
+    local_xy: Any,
+    predicate_center_xy: Any,
+    clearance_shift_xy: Any,
+    *,
+    tolerance_m: float,
+    clearance_slack_m: float,
+) -> Any:
+    """Return entry into the authored disk's obstacle-safe outer cap.
+
+    An adjusted command point is a steering target, not a second task
+    predicate. Requiring entry into a tiny ball around it creates a low-speed
+    local optimum, while using only the broad authored disk permits a turn
+    before the embodiment clears the obstacle. For adjusted waypoints, require
+    both the immutable disk predicate and crossing the clearance half-space.
+    Unadjusted waypoints retain the original disk-entry rule.
+    """
+    import torch
+
+    relative = local_xy - predicate_center_xy
+    inside_authored_disk = (
+        torch.linalg.norm(relative, dim=-1) <= float(tolerance_m)
+    )
+    shift_distance = torch.linalg.norm(clearance_shift_xy, dim=-1)
+    adjusted = shift_distance > 1e-6
+    clearance_direction = clearance_shift_xy / torch.clamp(
+        shift_distance[:, None], min=1e-6)
+    clearance_progress = torch.sum(
+        relative * clearance_direction, dim=-1)
+    slack = torch.minimum(
+        torch.full_like(
+            shift_distance, max(0.0, float(clearance_slack_m))),
+        shift_distance,
+    )
+    crossed_safe_cap = clearance_progress >= shift_distance - slack
+    return inside_authored_disk & (~adjusted | crossed_safe_cap)
 
 
 _MATERIALIZED_TYPES: tuple[type[Any], type[Any]] | None = None
@@ -1917,9 +1976,16 @@ def _reconcile_waypoint_course(
     ):
         return ()
 
+    predicate_waypoints = _resolved_waypoint_points(
+        manifest, requested_waypoints)
     raw_waypoints, clearance_adjustments = (
         _clearance_adjusted_waypoint_points(
             manifest, requested_waypoints, robot)
+    )
+    clearance_shifts = tuple(
+        tuple(adjusted[axis] - predicate[axis] for axis in range(3))
+        for adjusted, predicate in zip(
+            raw_waypoints, predicate_waypoints, strict=True)
     )
     try:
         goal_tolerance = max(
@@ -1927,23 +1993,11 @@ def _reconcile_waypoint_course(
         ) or 0.25
     except (TypeError, ValueError):
         goal_tolerance = 0.25
-    # A shifted target uses the authored region's outer side to preserve
-    # obstacle clearance.  Reusing the broad task predicate radius would
-    # advance the velocity command before the robot reaches that safe side,
-    # causing it to cut diagonally back across the forbidden object.  Keep
-    # ordinary routes unchanged; only clearance-adjusted routes get a tighter
-    # command transition.  The task predicate itself remains frozen.
-    command_tolerance = goal_tolerance
-    if clearance_adjustments:
-        command_tolerance = min(
-            goal_tolerance, max(0.08, 0.4 * goal_tolerance))
-    # A command that must enter a tight clearance subtarget cannot retain the
-    # base route's 35%-of-cruise speed floor: at the transition boundary that
-    # floor can carry the robot past the target faster than the controller can
-    # turn.  Let the ordinary distance ramp slow naturally for adjusted
-    # routes.  Its positive tolerance still guarantees non-zero crossing
-    # speed, while unadjusted routes preserve the established 0.35 floor.
-    intermediate_min_speed_scale = 0.10 if clearance_adjustments else 0.35
+    # Retain half of the compiler's 5 cm geometric clearance margin while
+    # giving a moving policy a finite-width safe cap to cross. This transition
+    # remains inside the immutable authored disk and does not redefine task
+    # success.
+    clearance_transition_slack_m = 0.025
     adjustments: list[str] = []
     adjustments.extend(
         f"command:forbidden-contact clearance→{item}"
@@ -1951,13 +2005,9 @@ def _reconcile_waypoint_course(
     )
     if clearance_adjustments:
         adjustments.append(
-            "command:forbidden-contact clearance→transition radius "
-            f"{command_tolerance:.3f} m (task predicate remains "
-            f"{goal_tolerance:.3f} m)"
-        )
-        adjustments.append(
-            "command:forbidden-contact clearance→intermediate approach "
-            f"speed floor {intermediate_min_speed_scale:.2f}x cruise"
+            "command:forbidden-contact clearance→safe-cap transition "
+            f"inside frozen {goal_tolerance:.3f} m task predicate "
+            f"with {clearance_transition_slack_m:.3f} m clearance slack"
         )
     events = getattr(env_cfg, "events", None)
     if isinstance(events, dict):
@@ -2023,9 +2073,13 @@ def _reconcile_waypoint_course(
                 init_velocity_prob=0.0,
                 ranges=ranges,
                 waypoints_m=raw_waypoints,
-                tolerance_m=command_tolerance,
+                predicate_waypoints_m=predicate_waypoints,
+                clearance_shifts_m=clearance_shifts,
+                tolerance_m=goal_tolerance,
+                clearance_transition_slack_m=(
+                    clearance_transition_slack_m),
                 cruise_speed_mps=0.8,
-                intermediate_min_speed_scale=intermediate_min_speed_scale,
+                intermediate_min_speed_scale=0.35,
                 terminal_slow_radius_m=2.0,
             )
             adjustments.append(

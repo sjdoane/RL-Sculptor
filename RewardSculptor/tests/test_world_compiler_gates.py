@@ -340,12 +340,68 @@ def test_forbidden_object_waypoint_uses_embodiment_clearance_subtarget() -> None
         env_cfg, manifest, train=False, robot=robot)
     routed = env_cfg.commands["twist"]
     assert routed.waypoints_m == points
-    assert routed.tolerance_m == pytest.approx(0.14)
-    assert routed.intermediate_min_speed_scale == pytest.approx(0.10)
-    assert any("task predicate remains 0.350 m" in item
+    assert routed.predicate_waypoints_m == (
+        (2.0, 0.85, 0.0),
+        (4.0, 0.0, 0.0),
+    )
+    assert routed.clearance_shifts_m[0] == pytest.approx(
+        (0.0, required_clearance - 0.85, 0.0))
+    assert routed.clearance_shifts_m[1] == (0.0, 0.0, 0.0)
+    assert routed.tolerance_m == pytest.approx(0.35)
+    assert routed.clearance_transition_slack_m == pytest.approx(0.025)
+    assert routed.intermediate_min_speed_scale == pytest.approx(0.35)
+    assert any("safe-cap transition" in item
                for item in adjustments)
-    assert any("speed floor 0.10x cruise" in item
+    assert any("frozen 0.350 m task predicate" in item
                for item in adjustments)
+
+
+def test_waypoint_transition_requires_authored_disk_and_safe_cap() -> None:
+    torch = pytest.importorskip("torch")
+
+    from sculptor.world.compiler import _waypoint_transition_reached
+
+    centers = torch.tensor([
+        [2.0, 0.85],
+        [4.0, 0.0],
+    ])
+    shifts = torch.tensor([
+        [0.0, 0.268],
+        [0.0, 0.0],
+    ])
+    positions = torch.tensor([
+        [2.0, 1.098],  # Inside disk and 2 cm short of the steering target.
+        [4.2, 0.0],  # Ordinary, unadjusted disk entry.
+    ])
+    reached = _waypoint_transition_reached(
+        positions,
+        centers,
+        shifts,
+        tolerance_m=0.35,
+        clearance_slack_m=0.025,
+    )
+    assert reached.tolist() == [True, True]
+
+    # Entering the broad disk on the obstacle side is too early to turn.
+    positions[0] = torch.tensor([2.0, 1.05])
+    assert not bool(_waypoint_transition_reached(
+        positions,
+        centers,
+        shifts,
+        tolerance_m=0.35,
+        clearance_slack_m=0.025,
+    )[0])
+
+    # Crossing the clearance plane far outside the authored disk cannot skip
+    # the frozen task predicate.
+    positions[0] = torch.tensor([2.3, 1.2])
+    assert not bool(_waypoint_transition_reached(
+        positions,
+        centers,
+        shifts,
+        tolerance_m=0.35,
+        clearance_slack_m=0.025,
+    )[0])
 
 
 def test_route_rsi_places_robot_before_sampled_local_waypoint() -> None:
