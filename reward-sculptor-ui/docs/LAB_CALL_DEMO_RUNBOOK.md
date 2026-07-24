@@ -153,9 +153,29 @@ radius and switched toward the next waypoint before reaching the safe side.
 Commit `63dbc28` keeps the task predicate frozen at 0.35 m but tightens the
 command-only transition radius to 0.14 m whenever clearance subtargets exist.
 
+Iter 16 shows that the tighter target fixed contact but exposed an approach
+controller mismatch:
+
+- physical-scene audit remained aligned at `0.00 m`;
+- contact-free environments improved again, from 34/64 to **58/64**;
+- only 1/64 completed the actual route and finish;
+- rendered env 0 was contact-free but stopped after waypoint 3;
+- no environment produced a valid 100-frame terminal hold.
+
+The command still carried a 0.28 m/s intermediate speed floor into a 0.14 m
+transition radius, so it could overshoot the tight safe subtarget. The
+corrected runtime keeps the existing 0.35x floor for ordinary routes and uses
+a 0.10x floor only for clearance-adjusted routes. The automatic iter 16
+diagnosis also found that promoted reward v7 pays terminal settle income
+before ordered completion. UI-authored reward v15 already fixes that exploit
+by gating settle income on the reward-visible route-completion proxy and
+tightening the finish crossfade.
+
 ## Recommended corrected proof run
 
-After `63dbc28`, choose **Resume** with exact promoted tuple recovery enabled:
+After the clearance approach-speed correction, choose **Resume** with exact
+promoted tuple recovery disabled so the run consumes the already-generated
+reward v15 instead of restoring promoted reward v7:
 
 - Mode: Auto
 - Outer sculpt cycles: 1
@@ -168,16 +188,18 @@ After `63dbc28`, choose **Resume** with exact promoted tuple recovery enabled:
 - Video: 1920×1080
 - Objective metric: `gen_003`
 - Fitness mode: observe
-- Resume exact promoted tuple: on
+- Resume exact promoted tuple: **off**
 
 Before iteration 0, the Training log must show:
 
 - four embodiment-clearance waypoint adjustments;
 - clearance transition radius `0.140 m`, while the task predicate remains
   `0.350 m`;
+- clearance intermediate approach speed floor `0.10x` cruise;
 - four compiled forbidden-contact sensors;
 - forbidden-contact supervision at weight `-8`;
-- warm start from iter 15;
+- warm start from iter 16;
+- selected reward v15 (route-gated terminal settle), not reward v7;
 - physical object placement at local pose + environment origin.
 
 Inspect the first official rollout before committing to an overnight run.

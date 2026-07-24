@@ -2108,3 +2108,41 @@ object, task, or simulator name controls the behavior.
 Verification: focused compiler/adapter suite **64 passed**; scoped Ruff
 (excluding the documented pre-existing F401 imports), compileall, and diff
 check passed. Relaunch through UI exact recovery from iter 15 is required.
+
+## Iter 16 route-stall diagnosis + clearance approach control 2026-07-24 (Codex)
+
+UI job `job_76049ba5693da89f` completed iter 16 under `63dbc28` and clean
+launch context `bf7772d`. The tighter clearance transition nearly solved
+contact, but did not produce a valid policy:
+
+- scene audit stayed exactly aligned (`0.00 m`);
+- contact-free evaluation improved from 34/64 to **58/64**;
+- only 1/64 completed the actual route and finish;
+- rendered env 0 was contact-free but stopped after waypoint 3;
+- no environment achieved the 100-frame hold or full conjunction.
+
+The command required a 0.14 m target entry while retaining the ordinary
+intermediate-route speed floor of 35% cruise (0.28 m/s). That floor was
+designed for broad gates, but is too fast for a tight obstacle-clearance
+subtarget: policies overshot/oscillated before the command could advance.
+The frozen objective had already advanced at its unchanged 0.35 m predicate,
+creating conflicting route and command phases. The automatic diagnosis also
+confirmed a second, independent stop-early exploit in reward v7:
+`finish_settle` paid strongly near the finish before ordered completion.
+
+The existing UI-authored reward v15 already implements the evidence-grounded
+reward correction: it gates settle income by the reward-visible route
+completion proxy and tightens the finish crossfade, without exposing held-out
+metric truth. The next run must therefore be a normal Resume with exact
+promoted-tuple recovery **off**, so it consumes reward v15 instead of
+restoring promoted v7.
+
+Commit `0c4d000` (`fix(world): slow into clearance subtargets`) adds a
+configurable intermediate approach floor. Ordinary routes preserve `0.35x`
+cruise. Only routes with
+clearance-adjusted subtargets use `0.10x`, allowing the distance ramp to slow
+naturally into the tight transition while retaining non-zero crossing speed.
+No robot, task, object, or simulator name participates. Focused
+compiler/adapter tests pass **64/64**; scoped Ruff, compileall, and diff check
+pass. Launch one UI Resume from iter 16 with reward v15, env v4, exact
+recovery off.
