@@ -50,6 +50,8 @@ _SCULPTOR_SURVIVAL_WEIGHT = 1.0
 _SCULPTOR_FAILURE_WEIGHT = -5.0
 _SCULPTOR_TERMINAL_STILLNESS_WEIGHT = 1.0
 _SCULPTOR_TERMINAL_CONTINUITY_SCALE = 2.0
+_SCULPTOR_FORBIDDEN_CONTACT_WEIGHT = 4.0
+_SCULPTOR_FORBIDDEN_CONTACT_WEIGHT_SCALE = 2.0
 
 
 def _install_sculptor_termination_economics(
@@ -860,6 +862,74 @@ def _authored_terminal_stillness_weight(
         except (TypeError, ValueError):
             continue
     return max(_SCULPTOR_TERMINAL_STILLNESS_WEIGHT, command_weight)
+
+
+def _authored_forbidden_contact_sensor_names(
+    world_bundle: Any | None,
+) -> tuple[str, ...]:
+    """Return compiled sensors for every authored forbidden contact pair."""
+    if world_bundle is None:
+        return ()
+    manifest = getattr(world_bundle, "manifest", None)
+    task_shared = getattr(manifest, "task_shared", {})
+    contacts = (
+        task_shared.get("contacts", {})
+        if isinstance(task_shared, Mapping)
+        else {}
+    )
+    forbidden = (
+        contacts.get("forbidden", ())
+        if isinstance(contacts, Mapping)
+        else ()
+    )
+    if not isinstance(forbidden, (list, tuple)):
+        return ()
+    return tuple(
+        f"authored_contact__forbidden__{index}"
+        for index, pair in enumerate(forbidden)
+        if isinstance(pair, (list, tuple)) and len(pair) == 2
+    )
+
+
+def _authored_forbidden_contact_weight(
+    rewards: Mapping[str, Any],
+    authored_command_terms: frozenset[str],
+) -> float:
+    """Scale collision avoidance above the command income it must override."""
+    command_weight = 0.0
+    for name in authored_command_terms:
+        term = rewards.get(name)
+        try:
+            command_weight += abs(float(getattr(term, "weight", 0.0)))
+        except (TypeError, ValueError):
+            continue
+    return max(
+        _SCULPTOR_FORBIDDEN_CONTACT_WEIGHT,
+        _SCULPTOR_FORBIDDEN_CONTACT_WEIGHT_SCALE * command_weight,
+    )
+
+
+def _authored_forbidden_contact_penalty(
+    env: Any, *, sensor_names: tuple[str, ...],
+) -> Any:
+    """Binary per-environment contact truth from compiled simulator sensors."""
+    import torch
+
+    found_any = torch.zeros(
+        int(env.num_envs), device=env.device, dtype=torch.bool)
+    for name in sensor_names:
+        try:
+            sensor = env.scene[name]
+        except (KeyError, TypeError) as exc:
+            raise RuntimeError(
+                f"compiled forbidden-contact sensor is absent: {name}"
+            ) from exc
+        found = sensor.data.found
+        if found.ndim > 1:
+            found = torch.any(
+                found > 0, dim=tuple(range(1, found.ndim)))
+        found_any |= found.to(device=env.device, dtype=torch.bool)
+    return found_any.to(dtype=torch.float32)
 
 
 def _authored_terminal_stillness_state(
@@ -1997,6 +2067,16 @@ def _cmd_train(args: argparse.Namespace) -> None:
         terminal_standing = terminal_hold_s > 0.0
         terminal_stillness_weight = _authored_terminal_stillness_weight(
             env_cfg.rewards, full_weight_terms)
+        forbidden_contact_sensors = (
+            _authored_forbidden_contact_sensor_names(world_bundle))
+        forbidden_contact_weight = _authored_forbidden_contact_weight(
+            env_cfg.rewards, full_weight_terms)
+        if forbidden_contact_sensors:
+            env_cfg.rewards["sculptor_forbidden_contact"] = RewardTermCfg(
+                func=_authored_forbidden_contact_penalty,
+                weight=-forbidden_contact_weight,
+                params={"sensor_names": forbidden_contact_sensors},
+            )
         if terminal_standing:
             AuthoredTerminalStillnessTerm = (
                 _build_authored_terminal_stillness_term_class())
@@ -2045,6 +2125,14 @@ def _cmd_train(args: argparse.Namespace) -> None:
                 f"{terminal_stillness_weight:g}, "
                 f"hold_s {terminal_hold_s:g}, continuity scale "
                 f"{_SCULPTOR_TERMINAL_CONTINUITY_SCALE:g}",
+                file=sys.stderr,
+                flush=True,
+            )
+        if forbidden_contact_sensors:
+            print(
+                "[runner] installed authored forbidden-contact supervision "
+                f"at weight {-forbidden_contact_weight:g} from sensors: "
+                + ", ".join(forbidden_contact_sensors),
                 file=sys.stderr,
                 flush=True,
             )

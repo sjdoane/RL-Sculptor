@@ -1755,8 +1755,142 @@ def _resolved_waypoint_points(
     return tuple(raw_waypoints)
 
 
+def _object_horizontal_radius(record: Mapping[str, Any]) -> float:
+    """Conservative horizontal bounding radius for an authored object."""
+    nominal = record.get("nominal", record)
+    shape = str(record.get("shape", ""))
+    if shape == "box":
+        size = tuple(float(value) for value in nominal.get("size_m", ()))
+        if len(size) >= 2:
+            return math.hypot(0.5 * size[0], 0.5 * size[1])
+    if shape in {"sphere", "cylinder", "capsule"}:
+        try:
+            return max(0.0, float(nominal.get("radius_m", 0.0)))
+        except (TypeError, ValueError):
+            return 0.0
+    if shape == "frame":
+        opening = tuple(float(value) for value in nominal.get("opening_m", ()))
+        try:
+            post_radius = max(0.0, float(nominal.get("post_radius_m", 0.0)))
+        except (TypeError, ValueError):
+            post_radius = 0.0
+        if len(opening) >= 1:
+            return 0.5 * max(opening) + post_radius
+    return 0.0
+
+
+def _forbidden_object_names(manifest: ResolvedEvaluation) -> tuple[str, ...]:
+    """Resolve authored forbidden-contact object selectors without name keying."""
+    contacts = manifest.task_shared.get("contacts", {})
+    pairs = contacts.get("forbidden", ()) if isinstance(contacts, Mapping) else ()
+    names: list[str] = []
+    for pair in pairs:
+        if not isinstance(pair, (list, tuple)):
+            continue
+        for selector in pair:
+            prefix, separator, raw_name = str(selector).partition(":")
+            if separator and prefix == "object" and raw_name in manifest.objects:
+                names.append(raw_name)
+    return tuple(dict.fromkeys(names))
+
+
+def _clearance_adjusted_waypoint_points(
+    manifest: ResolvedEvaluation,
+    requested_waypoints: Any,
+    robot: RobotCapability | None,
+) -> tuple[tuple[tuple[float, float, float], ...], tuple[str, ...]]:
+    """Choose safe command subtargets inside authored waypoint regions.
+
+    A waypoint region describes a set, not an obligation to steer at its
+    center.  When that center lies within a forbidden object's collision
+    envelope, center tracking can teach a policy to graze the obstacle while
+    still satisfying the abstract region predicate.  Move the command target
+    away from the nearest conflicting object, but keep it inside both the
+    authored region and the goal tolerance.  The clearance comes from the
+    selected robot capability's geometry, so this generalizes to quadrupeds,
+    humanoids, arms, and future embodiments without robot/task-name branches.
+    """
+    raw = _resolved_waypoint_points(manifest, requested_waypoints)
+    if (
+        robot is None
+        or not isinstance(requested_waypoints, (list, tuple))
+        or not requested_waypoints
+    ):
+        return raw, ()
+    forbidden_names = _forbidden_object_names(manifest)
+    if not forbidden_names:
+        return raw, ()
+
+    goal = manifest.task_shared.get("goal", {})
+    success = goal.get("success", {}) if isinstance(goal, Mapping) else {}
+    try:
+        tolerance = max(0.0, float(success.get("tolerance_m", 0.0))) or 0.25
+    except (TypeError, ValueError):
+        tolerance = 0.25
+    reach = max(0.0, float(robot.geometry.reach_radius_m))
+    clearance_margin_m = 0.05
+    adjusted = list(raw)
+    notes: list[str] = []
+
+    for index, waypoint_name in enumerate(requested_waypoints):
+        name = str(waypoint_name)
+        zone = manifest.zones.get(name)
+        if not isinstance(zone, Mapping) or zone.get("kind") != "disk":
+            continue
+        try:
+            zone_radius = max(0.0, float(zone.get("radius_m", 0.0)))
+        except (TypeError, ValueError):
+            continue
+        if zone_radius <= 0.0:
+            continue
+        center = adjusted[index]
+        conflicts: list[tuple[float, str, tuple[float, float], float]] = []
+        for object_name in forbidden_names:
+            record = manifest.objects[object_name]
+            nominal = record.get("nominal", record)
+            pose = nominal.get("pose", {}) if isinstance(nominal, Mapping) else {}
+            position = tuple(float(value) for value in pose.get("position_m", ()))
+            if len(position) < 2:
+                continue
+            delta = (center[0] - position[0], center[1] - position[1])
+            distance = math.hypot(*delta)
+            required = (
+                reach + _object_horizontal_radius(record) + clearance_margin_m
+            )
+            deficit = required - distance
+            if deficit > 1e-6 and distance > 1e-6:
+                conflicts.append((deficit, object_name, delta, distance))
+        if not conflicts:
+            continue
+
+        deficit, object_name, delta, distance = max(conflicts)
+        # Staying within 80% of the predicate tolerance makes the adjusted
+        # command point itself a valid waypoint completion state.  The region
+        # radius provides an independent geometric cap.
+        max_shift = min(0.9 * zone_radius, 0.8 * tolerance)
+        shift = min(deficit, max_shift)
+        if shift <= 1e-6:
+            continue
+        unit = (delta[0] / distance, delta[1] / distance)
+        adjusted[index] = (
+            center[0] + unit[0] * shift,
+            center[1] + unit[1] * shift,
+            center[2],
+        )
+        notes.append(
+            f"waypoint {name!r} shifted {shift:.3f} m inside its region "
+            f"for {reach:.3f} m embodiment reach clearance from forbidden "
+            f"object {object_name!r}"
+        )
+    return tuple(adjusted), tuple(notes)
+
+
 def _reconcile_waypoint_course(
-    env_cfg: Any, manifest: ResolvedEvaluation, *, train: bool,
+    env_cfg: Any,
+    manifest: ResolvedEvaluation,
+    *,
+    train: bool,
+    robot: RobotCapability | None = None,
 ) -> tuple[str, ...]:
     """Align resets and velocity commands with an authored waypoint course.
 
@@ -1779,9 +1913,15 @@ def _reconcile_waypoint_course(
     ):
         return ()
 
-    raw_waypoints = _resolved_waypoint_points(
-        manifest, requested_waypoints)
+    raw_waypoints, clearance_adjustments = (
+        _clearance_adjusted_waypoint_points(
+            manifest, requested_waypoints, robot)
+    )
     adjustments: list[str] = []
+    adjustments.extend(
+        f"command:forbidden-contact clearance→{item}"
+        for item in clearance_adjustments
+    )
     events = getattr(env_cfg, "events", None)
     if isinstance(events, dict):
         for name, term in tuple(events.items()):
@@ -1991,7 +2131,8 @@ def apply_world_selection(
     ))
     runtime_adjustments = (
         *_reconcile_terrain_curriculum(env_cfg),
-        *_reconcile_waypoint_course(env_cfg, manifest, train=train),
+        *_reconcile_waypoint_course(
+            env_cfg, manifest, train=train, robot=robot),
         *(f"physical scene alignment → {msg}"
           for msg in object_placement_applied),
         *(f"per-episode domain randomization → {msg}"

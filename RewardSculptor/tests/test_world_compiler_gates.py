@@ -8,11 +8,13 @@ from types import SimpleNamespace
 
 import mujoco
 import numpy as np
+import pytest
 
 from mjlab.scene import Scene, SceneCfg
 
 from sculptor.world.compiler import (
     ResolvedEvaluation,
+    _clearance_adjusted_waypoint_points,
     _install_task_observations,
     _reconcile_waypoint_course,
     apply_world_selection,
@@ -264,6 +266,59 @@ def test_explicit_waypoint_zones_align_commands_without_materialized_course() ->
                for item in adjustments)
     assert any("collision-local route starts" in item
                for item in adjustments)
+
+
+def test_forbidden_object_waypoint_uses_embodiment_clearance_subtarget() -> None:
+    """A command may use a safer point inside the same authored region."""
+    robot = resolve_robot_capability("unitree_g1:base")
+    manifest = SimpleNamespace(
+        task_shared={
+            "goal": {
+                "type": "waypoint_sequence",
+                "success": {"tolerance_m": 0.35},
+            },
+            "contacts": {
+                "forbidden": [
+                    ["robot:any", "object:box"],
+                ],
+            },
+        },
+        course=(),
+        zones={
+            "waypoint": {
+                "kind": "disk",
+                "center_m": [2.0, 0.85],
+                "radius_m": 0.45,
+            },
+            "finish": {
+                "kind": "disk",
+                "center_m": [4.0, 0.0],
+                "radius_m": 0.9,
+            },
+        },
+        objects={
+            "box": {
+                "shape": "box",
+                "nominal": {
+                    "pose": {"position_m": [2.0, 0.0, 0.375]},
+                    "size_m": [0.45, 0.45, 0.75],
+                },
+            },
+        },
+    )
+
+    points, notes = _clearance_adjusted_waypoint_points(
+        manifest, ["waypoint", "finish"], robot)
+
+    object_radius = (2.0 * (0.45 / 2.0) ** 2) ** 0.5
+    required_clearance = (
+        robot.geometry.reach_radius_m + object_radius + 0.05)
+    assert points[0][0] == pytest.approx(2.0)
+    assert points[0][1] == pytest.approx(required_clearance)
+    assert points[0][1] - 0.85 <= 0.8 * 0.35 + 1e-9
+    assert points[1] == (4.0, 0.0, 0.0)
+    assert len(notes) == 1
+    assert "embodiment reach clearance" in notes[0]
 
 
 def test_route_rsi_places_robot_before_sampled_local_waypoint() -> None:

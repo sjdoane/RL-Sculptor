@@ -134,6 +134,54 @@ def test_authored_terminal_stillness_balances_command_supervision() -> None:
     ) == 1.0
 
 
+def test_authored_forbidden_contact_supervision_uses_compiled_sensors() -> None:
+    torch = pytest.importorskip("torch")
+
+    from sculptor.adapters._mjlab_runner import (
+        _authored_forbidden_contact_penalty,
+        _authored_forbidden_contact_sensor_names,
+        _authored_forbidden_contact_weight,
+    )
+
+    bundle = SimpleNamespace(manifest=SimpleNamespace(task_shared={
+        "contacts": {
+            "forbidden": [
+                ["robot:any", "object:first"],
+                ["robot:any", "object:second"],
+            ],
+        },
+    }))
+    names = _authored_forbidden_contact_sensor_names(bundle)
+    assert names == (
+        "authored_contact__forbidden__0",
+        "authored_contact__forbidden__1",
+    )
+    assert _authored_forbidden_contact_weight(
+        {
+            "track_linear_velocity": SimpleNamespace(weight=2.0),
+            "track_angular_velocity": SimpleNamespace(weight=2.0),
+        },
+        frozenset({"track_linear_velocity", "track_angular_velocity"}),
+    ) == 8.0
+
+    scene = {
+        names[0]: SimpleNamespace(
+            data=SimpleNamespace(found=torch.tensor([
+                [False], [True], [False],
+            ])),
+        ),
+        names[1]: SimpleNamespace(
+            data=SimpleNamespace(found=torch.tensor([
+                [False], [False], [True],
+            ])),
+        ),
+    }
+    env = SimpleNamespace(num_envs=3, device="cpu", scene=scene)
+    penalty = _authored_forbidden_contact_penalty(
+        env, sensor_names=names)
+    assert penalty.tolist() == [0.0, 1.0, 1.0]
+
+
 def test_authored_terminal_stillness_is_dense_and_phase_gated() -> None:
     torch = pytest.importorskip("torch")
 
