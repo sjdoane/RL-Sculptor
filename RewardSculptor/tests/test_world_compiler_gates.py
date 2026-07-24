@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import math
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -319,7 +320,8 @@ def test_forbidden_object_waypoint_uses_embodiment_clearance_subtarget() -> None
     assert points[0][1] - 0.85 <= 0.8 * 0.35 + 1e-9
     assert points[1] == (4.0, 0.0, 0.0)
     assert len(notes) == 1
-    assert "embodiment reach clearance" in notes[0]
+    assert "embodiment reach" in notes[0]
+    assert "radial entry clearance" in notes[0]
 
     ranges = SimpleNamespace(
         lin_vel_x=(-1.0, 1.0),
@@ -337,9 +339,12 @@ def test_forbidden_object_waypoint_uses_embodiment_clearance_subtarget() -> None
         curriculum={},
     )
     adjustments = _reconcile_waypoint_course(
-        env_cfg, manifest, train=False, robot=robot)
+        env_cfg, manifest, train=True, robot=robot)
     routed = env_cfg.commands["twist"]
-    assert routed.waypoints_m == points
+    assert routed.waypoints_m == (
+        (2.0, 0.85, 0.0),
+        (4.0, 0.0, 0.0),
+    )
     assert routed.predicate_waypoints_m == (
         (2.0, 0.85, 0.0),
         (4.0, 0.0, 0.0),
@@ -347,61 +352,182 @@ def test_forbidden_object_waypoint_uses_embodiment_clearance_subtarget() -> None
     assert routed.clearance_shifts_m[0] == pytest.approx(
         (0.0, required_clearance - 0.85, 0.0))
     assert routed.clearance_shifts_m[1] == (0.0, 0.0, 0.0)
+    stage = routed.clearance_staging_shifts_m[0]
+    assert math.hypot(stage[0], stage[1]) == pytest.approx(0.45)
+    assert stage[0] < 0.0
+    assert stage[1] > 0.0
+    # Following the stage ray into the immutable disk reaches its boundary
+    # with the same obstacle-away clearance as the original safe subtarget.
+    assert stage[1] * (0.35 / 0.45) == pytest.approx(
+        required_clearance - 0.85)
+    assert routed.clearance_staging_shifts_m[1] == (0.0, 0.0, 0.0)
     assert routed.tolerance_m == pytest.approx(0.35)
     assert routed.clearance_transition_slack_m == pytest.approx(0.025)
+    assert routed.clearance_stage_capture_radius_m == pytest.approx(0.15)
     assert routed.intermediate_min_speed_scale == pytest.approx(0.35)
-    assert any("safe-cap transition" in item
+    assert any("outside approach stage" in item
                for item in adjustments)
-    assert any("frozen 0.350 m task predicate" in item
+    assert any("frozen 0.350 m task-disk entry" in item
                for item in adjustments)
+    rsi_points = env_cfg.events[
+        "world_route_state_initialization"].params["waypoints_m"]
+    assert rsi_points[0] == pytest.approx((
+        2.0 + stage[0],
+        0.85 + stage[1],
+        0.0,
+    ))
+    assert rsi_points[1] == (4.0, 0.0, 0.0)
 
 
-def test_waypoint_transition_requires_authored_disk_and_safe_cap() -> None:
+def test_clearance_stage_requires_plane_crossing_and_finite_width() -> None:
     torch = pytest.importorskip("torch")
 
-    from sculptor.world.compiler import _waypoint_transition_reached
+    from sculptor.world.compiler import _clearance_stage_reached
 
     centers = torch.tensor([
         [2.0, 0.85],
         [4.0, 0.0],
     ])
     shifts = torch.tensor([
-        [0.0, 0.268],
+        [-0.29, 0.344],
         [0.0, 0.0],
     ])
     positions = torch.tensor([
-        [2.0, 1.098],  # Inside disk and 2 cm short of the steering target.
-        [4.2, 0.0],  # Ordinary, unadjusted disk entry.
+        [1.72, 1.19],  # Crossed the finite-width outside stage.
+        [4.0, 0.0],  # Unadjusted waypoints have no separate stage.
     ])
-    reached = _waypoint_transition_reached(
+    reached = _clearance_stage_reached(
         positions,
         centers,
         shifts,
-        tolerance_m=0.35,
+        capture_radius_m=0.15,
         clearance_slack_m=0.025,
     )
-    assert reached.tolist() == [True, True]
+    assert reached.tolist() == [True, False]
 
-    # Entering the broad disk on the obstacle side is too early to turn.
+    # Entering the immutable disk is not itself approach-stage completion.
     positions[0] = torch.tensor([2.0, 1.05])
-    assert not bool(_waypoint_transition_reached(
+    assert not bool(_clearance_stage_reached(
         positions,
         centers,
         shifts,
-        tolerance_m=0.35,
+        capture_radius_m=0.15,
         clearance_slack_m=0.025,
     )[0])
 
-    # Crossing the clearance plane far outside the authored disk cannot skip
-    # the frozen task predicate.
-    positions[0] = torch.tensor([2.3, 1.2])
-    assert not bool(_waypoint_transition_reached(
+    # Crossing the plane far beside the planned approach cannot trigger it.
+    stage_direction = shifts[0] / torch.linalg.norm(shifts[0])
+    tangent = torch.tensor([-stage_direction[1], stage_direction[0]])
+    positions[0] = centers[0] + shifts[0] + 0.2 * tangent
+    assert not bool(_clearance_stage_reached(
         positions,
         centers,
         shifts,
-        tolerance_m=0.35,
+        capture_radius_m=0.15,
         clearance_slack_m=0.025,
     )[0])
+
+
+def test_adjusted_waypoint_stages_then_synchronizes_on_frozen_disk() -> None:
+    """The command never invents a second route-success predicate."""
+    import torch
+
+    robot_capability = resolve_robot_capability("unitree_g1:base")
+    ranges = SimpleNamespace(
+        lin_vel_x=(-1.0, 1.0),
+        lin_vel_y=(-1.0, 1.0),
+        ang_vel_z=(-1.5, 1.5),
+        heading=None,
+    )
+    env_cfg = SimpleNamespace(
+        events={},
+        commands={"twist": SimpleNamespace(
+            ranges=ranges,
+            entity_name="robot",
+            debug_vis=False,
+        )},
+        curriculum={},
+    )
+    manifest = SimpleNamespace(
+        task_shared={
+            "goal": {
+                "type": "waypoint_sequence",
+                "waypoints": ["waypoint", "finish"],
+                "success": {"tolerance_m": 0.35},
+            },
+            "contacts": {
+                "forbidden": [["robot:any", "object:box"]],
+            },
+        },
+        course=(),
+        zones={
+            "waypoint": {
+                "kind": "disk",
+                "center_m": [2.0, 0.85],
+                "radius_m": 0.45,
+            },
+            "finish": {
+                "kind": "disk",
+                "center_m": [4.0, 0.0],
+                "radius_m": 0.9,
+            },
+        },
+        objects={
+            "box": {
+                "shape": "box",
+                "nominal": {
+                    "pose": {"position_m": [2.0, 0.0, 0.375]},
+                    "size_m": [0.45, 0.45, 0.75],
+                },
+            },
+        },
+    )
+    _reconcile_waypoint_course(
+        env_cfg, manifest, train=False, robot=robot_capability)
+    cfg = env_cfg.commands["twist"]
+
+    robot = SimpleNamespace(data=SimpleNamespace(
+        root_link_pos_w=torch.zeros((1, 3)),
+        root_link_lin_vel_b=torch.zeros((1, 3)),
+        root_link_ang_vel_b=torch.zeros((1, 3)),
+        heading_w=torch.zeros(1),
+    ))
+
+    class FakeScene(dict):
+        pass
+
+    scene = FakeScene(robot=robot)
+    scene.env_origins = torch.zeros((1, 3))
+    env = SimpleNamespace(num_envs=1, device="cpu", scene=scene)
+    term = cfg.build(env)
+    term._update_command()
+    assert term._waypoint_index.item() == 0
+    assert not term._clearance_stage_complete.item()
+
+    stage = (
+        torch.tensor(cfg.predicate_waypoints_m[0][:2])
+        + torch.tensor(cfg.clearance_staging_shifts_m[0][:2])
+    )
+    robot.data.root_link_pos_w[0, :2] = stage
+    term._update_command()
+    assert term._waypoint_index.item() == 0
+    assert term._clearance_stage_complete.item()
+    # Once staged, the command points inward at the immutable disk center.
+    assert term.command[0, 0] > 0
+    assert term.command[0, 1] < 0
+
+    robot.data.root_link_pos_w[0, :2] = torch.tensor([2.0, 0.85])
+    term._update_command()
+    assert term._waypoint_index.item() == 1
+    assert not term._clearance_stage_complete.item()
+
+    # A stochastic early disk entry must still advance on the exact frame the
+    # frozen objective advances, preventing persistent command/metric drift.
+    fresh = cfg.build(env)
+    fresh._clearance_stage_complete[:] = False
+    fresh._waypoint_index[:] = 0
+    fresh._update_command()
+    assert fresh._waypoint_index.item() == 1
 
 
 def test_route_rsi_places_robot_before_sampled_local_waypoint() -> None:

@@ -450,8 +450,15 @@ def _waypoint_velocity_command_types() -> tuple[type[Any], type[Any]]:
                 device=self.device,
                 dtype=torch.float32,
             )
+            self._clearance_staging_shifts = torch.as_tensor(
+                cfg.clearance_staging_shifts_m,
+                device=self.device,
+                dtype=torch.float32,
+            )
             self._waypoint_index = torch.zeros(
                 self.num_envs, device=self.device, dtype=torch.long)
+            self._clearance_stage_complete = torch.zeros(
+                self.num_envs, device=self.device, dtype=torch.bool)
             raw_starts = getattr(
                 env, "_sculptor_waypoint_start_index", None)
             if raw_starts is not None:
@@ -472,6 +479,7 @@ def _waypoint_velocity_command_types() -> tuple[type[Any], type[Any]]:
                 self._waypoint_index[env_ids] = raw_starts[env_ids].to(
                     device=self.device, dtype=torch.long).clamp(
                         min=0, max=self._waypoints.shape[0] - 1)
+            self._clearance_stage_complete[env_ids] = False
             self.vel_command_b[env_ids] = 0.0
             self.vel_command_w[env_ids] = 0.0
             self.is_heading_env[env_ids] = False
@@ -496,16 +504,38 @@ def _waypoint_velocity_command_types() -> tuple[type[Any], type[Any]]:
             predicate_center = self._predicate_waypoints[
                 active_index, :2]
             clearance_shift = self._clearance_shifts[active_index, :2]
-            reached = (
-                (self._waypoint_index < self._waypoints.shape[0])
-                & _waypoint_transition_reached(
-                    local_xy,
-                    predicate_center,
-                    clearance_shift,
-                    tolerance_m=float(self.cfg.tolerance_m),
-                    clearance_slack_m=float(
-                        self.cfg.clearance_transition_slack_m),
-                )
+            staging_shift = self._clearance_staging_shifts[
+                active_index, :2]
+            adjusted = torch.linalg.norm(clearance_shift, dim=-1) > 1e-6
+            inside_authored_disk = (
+                torch.linalg.norm(
+                    local_xy - predicate_center, dim=-1)
+                <= float(self.cfg.tolerance_m)
+            )
+            stage_reached = _clearance_stage_reached(
+                local_xy,
+                predicate_center,
+                staging_shift,
+                capture_radius_m=float(
+                    self.cfg.clearance_stage_capture_radius_m),
+                clearance_slack_m=float(
+                    self.cfg.clearance_transition_slack_m),
+            )
+            stage_complete = (
+                self._clearance_stage_complete | ~adjusted | stage_reached
+            )
+            valid = self._waypoint_index < self._waypoints.shape[0]
+            # The frozen task predicate is authoritative. If stochastic
+            # motion enters its disk before the approach stage, advance the
+            # command on that same frame rather than allowing command and
+            # metric state to disagree. The outside stage remains the
+            # supervised target, and direct contact terms penalize unsafe
+            # shortcuts during training.
+            reached = valid & inside_authored_disk
+            self._clearance_stage_complete = torch.where(
+                reached,
+                torch.zeros_like(stage_complete),
+                stage_complete,
             )
             self._waypoint_index = torch.clamp(
                 self._waypoint_index + reached.long(),
@@ -513,8 +543,23 @@ def _waypoint_velocity_command_types() -> tuple[type[Any], type[Any]]:
             )
             complete = self._waypoint_index >= self._waypoints.shape[0]
 
-            target = self._waypoints[
-                torch.clamp(self._waypoint_index, max=last), :2]
+            target_index = torch.clamp(self._waypoint_index, max=last)
+            target_center = self._predicate_waypoints[target_index, :2]
+            target_staging_shift = self._clearance_staging_shifts[
+                target_index, :2]
+            target_adjusted = (
+                torch.linalg.norm(
+                    self._clearance_shifts[target_index, :2], dim=-1)
+                > 1e-6
+            )
+            use_staging_target = (
+                target_adjusted & ~self._clearance_stage_complete & ~complete
+            )
+            target = target_center + torch.where(
+                use_staging_target[:, None],
+                target_staging_shift,
+                torch.zeros_like(target_staging_shift),
+            )
             delta_w = target - local_xy
             distance = torch.linalg.norm(delta_w, dim=-1)
             direction_w = delta_w / torch.clamp(distance[:, None], min=1e-6)
@@ -579,8 +624,11 @@ def _waypoint_velocity_command_types() -> tuple[type[Any], type[Any]]:
         waypoints_m: tuple[tuple[float, float, float], ...]
         predicate_waypoints_m: tuple[tuple[float, float, float], ...]
         clearance_shifts_m: tuple[tuple[float, float, float], ...]
+        clearance_staging_shifts_m: tuple[
+            tuple[float, float, float], ...]
         tolerance_m: float = 0.25
         clearance_transition_slack_m: float = 0.025
+        clearance_stage_capture_radius_m: float = 0.15
         cruise_speed_mps: float = 0.8
         slow_radius_m: float = 0.75
         intermediate_min_speed_scale: float = 0.35
@@ -595,42 +643,41 @@ def _waypoint_velocity_command_types() -> tuple[type[Any], type[Any]]:
     return WaypointVelocityCommandCfg, WaypointVelocityCommand
 
 
-def _waypoint_transition_reached(
+def _clearance_stage_reached(
     local_xy: Any,
     predicate_center_xy: Any,
-    clearance_shift_xy: Any,
+    staging_shift_xy: Any,
     *,
-    tolerance_m: float,
+    capture_radius_m: float,
     clearance_slack_m: float,
 ) -> Any:
-    """Return entry into the authored disk's obstacle-safe outer cap.
+    """Return crossing of a finite-width approach stage outside a task disk.
 
-    An adjusted command point is a steering target, not a second task
-    predicate. Requiring entry into a tiny ball around it creates a low-speed
-    local optimum, while using only the broad authored disk permits a turn
-    before the embodiment clears the obstacle. For adjusted waypoints, require
-    both the immutable disk predicate and crossing the clearance half-space.
-    Unadjusted waypoints retain the original disk-entry rule.
+    The stage is a command-only target on the incoming, obstacle-safe side of
+    an adjusted waypoint. It never redefines objective success: after crossing
+    this plane the command targets the immutable authored center, and the
+    original disk-entry predicate advances the route.
     """
     import torch
 
     relative = local_xy - predicate_center_xy
-    inside_authored_disk = (
-        torch.linalg.norm(relative, dim=-1) <= float(tolerance_m)
-    )
-    shift_distance = torch.linalg.norm(clearance_shift_xy, dim=-1)
+    shift_distance = torch.linalg.norm(staging_shift_xy, dim=-1)
     adjusted = shift_distance > 1e-6
-    clearance_direction = clearance_shift_xy / torch.clamp(
+    staging_direction = staging_shift_xy / torch.clamp(
         shift_distance[:, None], min=1e-6)
-    clearance_progress = torch.sum(
-        relative * clearance_direction, dim=-1)
+    progress = torch.sum(relative * staging_direction, dim=-1)
+    tangential = relative - progress[:, None] * staging_direction
+    tangential_distance = torch.linalg.norm(tangential, dim=-1)
     slack = torch.minimum(
         torch.full_like(
             shift_distance, max(0.0, float(clearance_slack_m))),
         shift_distance,
     )
-    crossed_safe_cap = clearance_progress >= shift_distance - slack
-    return inside_authored_disk & (~adjusted | crossed_safe_cap)
+    crossed_stage = progress >= shift_distance - slack
+    captured_stage_width = (
+        tangential_distance <= max(0.0, float(capture_radius_m))
+    )
+    return adjusted & crossed_stage & captured_stage_width
 
 
 _MATERIALIZED_TYPES: tuple[type[Any], type[Any]] | None = None
@@ -1862,16 +1909,17 @@ def _clearance_adjusted_waypoint_points(
     requested_waypoints: Any,
     robot: RobotCapability | None,
 ) -> tuple[tuple[tuple[float, float, float], ...], tuple[str, ...]]:
-    """Choose safe command subtargets inside authored waypoint regions.
+    """Resolve obstacle-safe disk-entry clearance points for route commands.
 
     A waypoint region describes a set, not an obligation to steer at its
     center.  When that center lies within a forbidden object's collision
-    envelope, center tracking can teach a policy to graze the obstacle while
-    still satisfying the abstract region predicate.  Move the command target
-    away from the nearest conflicting object, but keep it inside both the
-    authored region and the goal tolerance.  The clearance comes from the
-    selected robot capability's geometry, so this generalizes to quadrupeds,
-    humanoids, arms, and future embodiments without robot/task-name branches.
+    envelope, center tracking can teach a policy to graze the obstacle. Compute
+    the minimum obstacle-away radial component needed at disk entry while
+    keeping that point inside both the authored region and goal tolerance.
+    The command runtime converts it into an outside approach stage, then
+    targets the immutable disk. Clearance comes from the selected robot
+    capability's geometry, so this generalizes to quadrupeds, humanoids, arms,
+    and future embodiments without robot/task-name branches.
     """
     raw = _resolved_waypoint_points(manifest, requested_waypoints)
     if (
@@ -1927,9 +1975,9 @@ def _clearance_adjusted_waypoint_points(
             continue
 
         deficit, object_name, delta, distance = max(conflicts)
-        # Staying within 80% of the predicate tolerance makes the adjusted
-        # command point itself a valid waypoint completion state.  The region
-        # radius provides an independent geometric cap.
+        # Staying within 80% of the predicate tolerance leaves a nonzero
+        # incoming tangent on the safe disk boundary. The region radius
+        # provides an independent geometric cap.
         max_shift = min(0.9 * zone_radius, 0.8 * tolerance)
         shift = min(deficit, max_shift)
         if shift <= 1e-6:
@@ -1941,11 +1989,100 @@ def _clearance_adjusted_waypoint_points(
             center[2],
         )
         notes.append(
-            f"waypoint {name!r} shifted {shift:.3f} m inside its region "
-            f"for {reach:.3f} m embodiment reach clearance from forbidden "
-            f"object {object_name!r}"
+            f"waypoint {name!r} requires {shift:.3f} m obstacle-away radial "
+            f"entry clearance for {reach:.3f} m embodiment reach from "
+            f"forbidden object {object_name!r}"
         )
     return tuple(adjusted), tuple(notes)
+
+
+def _clearance_staging_waypoint_shifts(
+    predicate_waypoints: tuple[tuple[float, float, float], ...],
+    clearance_shifts: tuple[tuple[float, float, float], ...],
+    *,
+    tolerance_m: float,
+    outside_margin_m: float,
+) -> tuple[tuple[float, float, float], ...]:
+    """Place obstacle-safe approach stages outside immutable waypoint disks.
+
+    A clearance shift identifies the obstacle-away direction and the minimum
+    safe radial component at disk entry.  For each adjusted waypoint, combine
+    that component with the incoming route tangent to select a safe point on
+    the authored disk's approach-side boundary, then extend it by a small
+    command-only margin.  The policy therefore approaches from outside and
+    enters the original disk on the safe side; no second success predicate is
+    introduced.
+    """
+    if len(predicate_waypoints) != len(clearance_shifts):
+        raise WorldCompileError(
+            "clearance shifts must align one-to-one with waypoint predicates")
+    tolerance = max(1e-6, float(tolerance_m))
+    staging_radius = tolerance + max(0.0, float(outside_margin_m))
+    stages: list[tuple[float, float, float]] = []
+    for index, raw_shift in enumerate(clearance_shifts):
+        clearance_x = float(raw_shift[0])
+        clearance_y = float(raw_shift[1])
+        clearance_distance = math.hypot(clearance_x, clearance_y)
+        if clearance_distance <= 1e-6:
+            stages.append((0.0, 0.0, 0.0))
+            continue
+
+        clearance_x /= clearance_distance
+        clearance_y /= clearance_distance
+        if index + 1 < len(predicate_waypoints):
+            route_x = (
+                predicate_waypoints[index + 1][0]
+                - predicate_waypoints[index][0]
+            )
+            route_y = (
+                predicate_waypoints[index + 1][1]
+                - predicate_waypoints[index][1]
+            )
+        elif index:
+            route_x = (
+                predicate_waypoints[index][0]
+                - predicate_waypoints[index - 1][0]
+            )
+            route_y = (
+                predicate_waypoints[index][1]
+                - predicate_waypoints[index - 1][1]
+            )
+        else:
+            route_x, route_y = 1.0, 0.0
+
+        # Project route travel onto the line tangent to the obstacle-away
+        # direction. The deterministic perpendicular fallback handles routes
+        # that happen to be radial at this waypoint.
+        route_dot_clearance = (
+            route_x * clearance_x + route_y * clearance_y)
+        tangent_x = route_x - route_dot_clearance * clearance_x
+        tangent_y = route_y - route_dot_clearance * clearance_y
+        tangent_norm = math.hypot(tangent_x, tangent_y)
+        if tangent_norm <= 1e-6:
+            tangent_x, tangent_y = clearance_y, -clearance_x
+            if tangent_x * route_x + tangent_y * route_y < 0.0:
+                tangent_x, tangent_y = -tangent_x, -tangent_y
+            tangent_norm = 1.0
+        tangent_x /= tangent_norm
+        tangent_y /= tangent_norm
+
+        safe_radial_component = min(clearance_distance, 0.999 * tolerance)
+        approach_component = math.sqrt(max(
+            0.0,
+            tolerance * tolerance
+            - safe_radial_component * safe_radial_component,
+        ))
+        boundary_x = (
+            clearance_x * safe_radial_component
+            - tangent_x * approach_component
+        )
+        boundary_y = (
+            clearance_y * safe_radial_component
+            - tangent_y * approach_component
+        )
+        scale = staging_radius / tolerance
+        stages.append((boundary_x * scale, boundary_y * scale, 0.0))
+    return tuple(stages)
 
 
 def _reconcile_waypoint_course(
@@ -1978,14 +2115,14 @@ def _reconcile_waypoint_course(
 
     predicate_waypoints = _resolved_waypoint_points(
         manifest, requested_waypoints)
-    raw_waypoints, clearance_adjustments = (
+    clearance_targets, clearance_adjustments = (
         _clearance_adjusted_waypoint_points(
             manifest, requested_waypoints, robot)
     )
     clearance_shifts = tuple(
         tuple(adjusted[axis] - predicate[axis] for axis in range(3))
         for adjusted, predicate in zip(
-            raw_waypoints, predicate_waypoints, strict=True)
+            clearance_targets, predicate_waypoints, strict=True)
     )
     try:
         goal_tolerance = max(
@@ -1993,11 +2130,19 @@ def _reconcile_waypoint_course(
         ) or 0.25
     except (TypeError, ValueError):
         goal_tolerance = 0.25
-    # Retain half of the compiler's 5 cm geometric clearance margin while
-    # giving a moving policy a finite-width safe cap to cross. This transition
-    # remains inside the immutable authored disk and does not redefine task
-    # success.
+    clearance_stage_outside_margin_m = 0.10
     clearance_transition_slack_m = 0.025
+    clearance_staging_shifts = _clearance_staging_waypoint_shifts(
+        predicate_waypoints,
+        clearance_shifts,
+        tolerance_m=goal_tolerance,
+        outside_margin_m=clearance_stage_outside_margin_m,
+    )
+    staging_waypoints = tuple(
+        tuple(predicate[axis] + stage[axis] for axis in range(3))
+        for predicate, stage in zip(
+            predicate_waypoints, clearance_staging_shifts, strict=True)
+    )
     adjustments: list[str] = []
     adjustments.extend(
         f"command:forbidden-contact clearance→{item}"
@@ -2005,9 +2150,10 @@ def _reconcile_waypoint_course(
     )
     if clearance_adjustments:
         adjustments.append(
-            "command:forbidden-contact clearance→safe-cap transition "
-            f"inside frozen {goal_tolerance:.3f} m task predicate "
-            f"with {clearance_transition_slack_m:.3f} m clearance slack"
+            "command:forbidden-contact clearance→outside approach stage then "
+            f"frozen {goal_tolerance:.3f} m task-disk entry "
+            f"({clearance_stage_outside_margin_m:.3f} m outside margin, "
+            f"{clearance_transition_slack_m:.3f} m stage slack)"
         )
     events = getattr(env_cfg, "events", None)
     if isinstance(events, dict):
@@ -2034,7 +2180,7 @@ def _reconcile_waypoint_course(
                 mode="reset",
                 func=reset_robot_along_waypoint_route,
                 params={
-                    "waypoints_m": raw_waypoints,
+                    "waypoints_m": staging_waypoints,
                     "midroute_probability": 0.5,
                     "approach_distance_m": (0.25, 0.55),
                     "lateral_jitter_m": 0.12,
@@ -2072,9 +2218,10 @@ def _reconcile_waypoint_course(
                 rel_forward_envs=0.0,
                 init_velocity_prob=0.0,
                 ranges=ranges,
-                waypoints_m=raw_waypoints,
+                waypoints_m=predicate_waypoints,
                 predicate_waypoints_m=predicate_waypoints,
                 clearance_shifts_m=clearance_shifts,
+                clearance_staging_shifts_m=clearance_staging_shifts,
                 tolerance_m=goal_tolerance,
                 clearance_transition_slack_m=(
                     clearance_transition_slack_m),
