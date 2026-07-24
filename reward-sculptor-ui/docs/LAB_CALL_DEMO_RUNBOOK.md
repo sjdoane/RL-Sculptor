@@ -202,6 +202,13 @@ Before iteration 0, the Training log must show:
 - selected reward v15 (route-gated terminal settle), not reward v7;
 - physical object placement at local pose + environment origin.
 
+Current proof run: UI job `job_4ff8e2081df13d11`, iter 17, clean launch
+commit `5b0c834`, selection v26, tuple
+`0a7bc62b2fb1a1134de3a1a02b70e072d71e7a2aba9eb02d036327d6fdf868e6`.
+All startup checks above passed and actor+critic loaded from iter 16
+checkpoint SHA8 `56d1d91a`. Let this worker finish before auditing or editing
+runtime code.
+
 Inspect the first official rollout before committing to an overnight run.
 The physical-scene audit must say **aligned**. If the route is learning and
 the boxes are visibly co-located, launch **Overnight showcase**:

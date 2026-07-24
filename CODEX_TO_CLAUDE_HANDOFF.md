@@ -2146,3 +2146,16 @@ No robot, task, object, or simulator name participates. Focused
 compiler/adapter tests pass **64/64**; scoped Ruff, compileall, and diff check
 pass. Launch one UI Resume from iter 16 with reward v15, env v4, exact
 recovery off.
+
+That corrected run is now live as UI job `job_4ff8e2081df13d11`, iter 17,
+under clean code commit `5b0c834`. It pins `selection_v26`, tuple
+`0a7bc62b2fb1a1134de3a1a02b70e072d71e7a2aba9eb02d036327d6fdf868e6`,
+reward v15 SHA
+`3f66bdbeb08080e6c3585afb98e89295d19a21490eb914d617155222701af64c`,
+and env v4 SHA
+`db049dafa3fb1fa0bc5ce590c485ec62c469b3bfa4aab757255b36adcadcbb39`.
+The live log proves the `0.10x` clearance approach floor, `0.140 m`
+transition, `0.350 m` frozen predicate, route RSI, physical alignment,
+four `-8` contact sensors, full command weights, and actor+critic warm start
+from iter 16 checkpoint SHA8 `56d1d91a`. PPO iteration 0 is active. Do not
+edit reload-watched core or run intermediate GPU audits until it finishes.
