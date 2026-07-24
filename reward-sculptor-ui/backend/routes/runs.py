@@ -51,6 +51,9 @@ from backend.routes.missions import (
 )
 from backend.services import mission_store, world_store
 from backend.services.job_manager import Job, JobManager
+from backend.services.physical_scene_audit import (
+    audit_physical_scene_alignment,
+)
 from backend.services.project_store import ProjectStore
 from backend.services.run_manager import (
     build_iterations_summary,
@@ -1113,6 +1116,36 @@ def list_project_iterations(
             fresh_rollout_count=fresh_rollout_count,
         ))
     return out
+
+
+@router.get(
+    "/projects/{slug}/iterations/{iter_index}/physical-scene-audit",
+    responses={404: {"model": ProblemDetail}},
+)
+def get_project_iter_physical_scene_audit(
+    slug: str,
+    iter_index: int,
+    store: ProjectStore = Depends(get_store),
+) -> Any:
+    """Fail-closed evidence check that physical objects share the task frame."""
+    detail = store.get(slug)
+    if detail is None:
+        return _problem(
+            status.HTTP_404_NOT_FOUND,
+            "project not found",
+            detail=f"no project with slug {slug!r}",
+            type_="/problems/not-found",
+        )
+    project_dir = Path(detail.project_dir)
+    iter_dir = project_dir / "runs" / f"iter_{iter_index}"
+    if not iter_dir.is_dir():
+        return _problem(
+            status.HTTP_404_NOT_FOUND,
+            "iteration not found",
+            detail=f"iter {iter_index} does not exist",
+            type_="/problems/not-found",
+        )
+    return audit_physical_scene_alignment(project_dir, iter_dir)
 
 
 @router.get(

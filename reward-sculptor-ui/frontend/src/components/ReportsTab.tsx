@@ -32,6 +32,26 @@ type ReportSource =
 
 const PROJECT_SOURCE_VALUE = "__project__";
 
+interface PhysicalSceneAudit {
+  status: "aligned" | "misaligned" | "not_applicable" | "unavailable";
+  max_error_m: number | null;
+  threshold_m: number;
+  objects_checked: string[];
+  reason: string;
+}
+
+async function fetchPhysicalSceneAudit(
+  slug: string, iterIndex: number,
+): Promise<PhysicalSceneAudit> {
+  const response = await fetch(
+    `/api/projects/${slug}/iterations/${iterIndex}/physical-scene-audit`,
+  );
+  if (!response.ok) {
+    throw new Error(`physical-scene audit failed (${response.status})`);
+  }
+  return await response.json() as PhysicalSceneAudit;
+}
+
 function sourceToValue(s: ReportSource): string {
   return s.kind === "project" ? PROJECT_SOURCE_VALUE : s.missionSlug;
 }
@@ -540,6 +560,20 @@ function ProjectBestPolicyCard({
   iteration: StageIteration | null;
   isLoading: boolean;
 }) {
+  const physicalScene = useQuery<PhysicalSceneAudit>({
+    queryKey: [
+      ...qk.project(slug),
+      "iterations",
+      iteration?.iter_index ?? null,
+      "physical-scene-audit",
+    ],
+    queryFn: () => fetchPhysicalSceneAudit(slug, iteration!.iter_index),
+    enabled: iteration != null && iteration.has_rollout,
+    staleTime: 30_000,
+  });
+  const sceneInvalid = physicalScene.data?.status === "misaligned";
+  const sceneValid = physicalScene.data?.status === "aligned"
+    || physicalScene.data?.status === "not_applicable";
   const score = iteration?.steer_fitness ?? iteration?.fitness ?? null;
   const metricLabel = iteration?.steer_fitness != null
     ? "steering fitness"
@@ -550,7 +584,10 @@ function ProjectBestPolicyCard({
     <div className="rs-card" style={{ marginBottom: 22 }}>
       <div className="rs-card-head">
         <div className="rs-card-title">
-          <Icon name="video" size={16} />Selected best-policy evidence
+          <Icon name={sceneInvalid ? "alert-triangle" : "video"} size={16} />
+          {sceneInvalid
+            ? "Invalid evidence — physical scene mismatch"
+            : "Selected best-policy evidence"}
           {iteration ? ` · iter ${iteration.iter_index}` : ""}
         </div>
         <span className="rs-sub" style={{ fontSize: 12 }}>
@@ -573,8 +610,11 @@ function ProjectBestPolicyCard({
                 <span className="rs-tag mono">reward {iteration.reward_version}</span>
               )}
               {score != null ? (
-                <span className="rs-tag" style={{ color: "var(--st-emerald)" }}>
-                  {metricLabel} {score.toFixed(5)}
+                <span
+                  className="rs-tag"
+                  style={{ color: sceneInvalid ? "var(--st-rose-fg)" : "var(--st-emerald)" }}
+                >
+                  {sceneInvalid ? "invalid recorded score" : metricLabel} {score.toFixed(5)}
                 </span>
               ) : iteration.primary_metric != null ? (
                 <span className="rs-tag">legacy return {iteration.primary_metric.toFixed(2)}</span>
@@ -586,6 +626,43 @@ function ProjectBestPolicyCard({
                 </span>
               )}
             </div>
+            {sceneInvalid && (
+              <div style={{
+                marginBottom: 12,
+                padding: "12px 14px",
+                border: "1px solid color-mix(in srgb, var(--st-rose) 65%, transparent)",
+                borderRadius: 8,
+                background: "var(--st-rose-bg)",
+                color: "var(--st-rose-fg)",
+                fontSize: 12.5,
+                lineHeight: 1.55,
+              }}>
+                This rollout is not valid task evidence. The robot and virtual
+                waypoint validator used an environment-local course, but the
+                physical objects were in another frame
+                {physicalScene.data?.max_error_m != null
+                  ? ` (maximum object error ${physicalScene.data.max_error_m.toFixed(2)} m)`
+                  : ""}.
+                Retrain with physical-scene alignment before presenting it.
+              </div>
+            )}
+            {physicalScene.isLoading && (
+              <p className="rs-sub" style={{ margin: "0 0 12px" }}>
+                Verifying physical scene alignment…
+              </p>
+            )}
+            {sceneValid && (
+              <div style={{
+                marginBottom: 12,
+                color: "var(--st-emerald)",
+                fontSize: 12,
+              }}>
+                <Icon name="check-circle" size={13} /> Physical scene alignment verified
+                {physicalScene.data?.objects_checked.length
+                  ? ` for ${physicalScene.data.objects_checked.length} fixed object(s)`
+                  : ""}.
+              </div>
+            )}
             <div style={{
               marginBottom: 12,
               padding: "10px 12px",
@@ -915,6 +992,21 @@ function PoliciesCard({ slug }: { slug: string }) {
     if (v == null) return acc;
     return acc == null || v > acc ? v : acc;
   }, null);
+  const bestIterIndex = rows.find((row) => {
+    const metric = rankOf(row);
+    return best != null && metric != null && metric >= best;
+  })?.iter_index ?? null;
+  const bestPhysicalScene = useQuery<PhysicalSceneAudit>({
+    queryKey: [
+      ...qk.project(slug),
+      "iterations",
+      bestIterIndex,
+      "physical-scene-audit",
+    ],
+    queryFn: () => fetchPhysicalSceneAudit(slug, bestIterIndex!),
+    enabled: bestIterIndex != null,
+    staleTime: 30_000,
+  });
   return (
     <div className="rs-card" style={{ marginBottom: 22 }}>
       <div className="rs-card-head">
@@ -938,6 +1030,8 @@ function PoliciesCard({ slug }: { slug: string }) {
           {rows.map((p) => {
             const metric = rankOf(p);
             const isBest = best != null && metric != null && metric >= best;
+            const invalidBest = isBest
+              && bestPhysicalScene.data?.status === "misaligned";
             return (
               <div
                 key={p.iter_index}
@@ -969,21 +1063,40 @@ function PoliciesCard({ slug }: { slug: string }) {
                     r {p.primary_metric.toFixed(1)}
                   </span>
                 ) : null}
-                {isBest && rows.length > 1 && (
+                {invalidBest ? (
+                  <span
+                    className="rs-tag"
+                    style={{ fontSize: 10, color: "var(--st-rose-fg)" }}
+                    title="Physical objects did not share the robot and validator frame"
+                  >
+                    invalid scene
+                  </span>
+                ) : isBest && rows.length > 1 && (
                   <span className="rs-tag" style={{ fontSize: 10, color: "var(--st-emerald)" }}>best</span>
                 )}
                 <span className="rs-sub rs-num" style={{ fontSize: 11 }}>
                   {fmtBytes(p.checkpoint_bytes)}
                 </span>
                 <span style={{ marginLeft: "auto" }}>
-                  <a
-                    href={policyExportUrl(slug, p.iter_index)}
-                    download
-                    className="rs-btn rs-btn-ghost rs-btn-sm"
-                    title="Download a zip with the checkpoint, ONNX/TorchScript policy, reward + env spec snapshots, and a DEPLOY.md recipe"
-                  >
-                    <Icon name="download" size={14} />Export
-                  </a>
+                  {invalidBest ? (
+                    <span
+                      className="rs-btn rs-btn-quiet rs-btn-sm"
+                      aria-disabled="true"
+                      style={{ cursor: "not-allowed", opacity: 0.55 }}
+                      title="Export disabled: this checkpoint's selected evidence failed physical-scene alignment"
+                    >
+                      <Icon name="alert-triangle" size={14} />Audit failed
+                    </span>
+                  ) : (
+                    <a
+                      href={policyExportUrl(slug, p.iter_index)}
+                      download
+                      className="rs-btn rs-btn-ghost rs-btn-sm"
+                      title="Download a zip with the checkpoint, ONNX/TorchScript policy, reward + env spec snapshots, and a DEPLOY.md recipe"
+                    >
+                      <Icon name="download" size={14} />Export
+                    </a>
+                  )}
                 </span>
               </div>
             );
