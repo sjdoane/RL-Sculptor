@@ -12,7 +12,7 @@ after starting the local app.
 
 ## What is fixed
 
-Three committed slices address the failure rather than reinterpreting it:
+Five committed slices address the failure rather than reinterpreting it:
 
 - `11e664d` places every authored object at
   `nominal local pose + per-environment origin` on every train/eval reset.
@@ -29,6 +29,13 @@ Three committed slices address the failure rather than reinterpreting it:
   target-robot clip becomes an immutable phase-indexed tracking prior; the
   behavior prompt may author only a bounded task residual around it. The
   physical world and route RSI remain independent curricula.
+- `0822e07` closes the contact-supervision gap exposed by the first aligned
+  rollout. Command targets now move to embodiment-safe subtargets inside the
+  same authored waypoint disks using the selected robot's declared reach
+  geometry and obstacle bounding volume. Every authored forbidden-contact
+  pair also installs a direct penalty from its compiled simulator contact
+  sensor, so fixed objects no longer appear "contact-clean" merely because
+  their velocity is identically zero.
 
 Reference clips from another embodiment must first be retargeted and
 registered in the target robot's library namespace. RewardSculptor's existing
@@ -60,10 +67,12 @@ Open **Projects → G1 Lab Showcase — Weave and Stop**.
 - Project slug: `g1-lab-showcase-weave-and-stop`
 - Robot/task: Unitree G1 / `Mjlab-Velocity-Flat-Unitree-G1`
 - Device: `cuda:0`
-- Current promoted pre-fix tuple: selection v22, reward v7 + env v4
+- Current promoted tuple: selection v23, reward v7 + env v4
 - Objective metric: `gen_003`, accepted prompt-native and observe-only
 - Historical iter 13: retained as failure provenance; not exportable evidence
-- Fresh proof: required after commit `11e664d`
+- Iter 14: first physically aligned diagnostic rollout; not accepted because
+  all 64 evaluation environments touched at least one box
+- Fresh proof: required after commit `0822e07`
 
 ## World prompt
 
@@ -111,14 +120,31 @@ For the first corrected slalom proof, leaving motion blank is the lowest-risk
 baseline. Use a treadmill/walk clip in a second run to demonstrate
 motion-guided discovery without conflating it with the physical-frame fix.
 
+## Latest physical diagnosis
+
+Iter 14 is the first trustworthy physical-course result:
+
+- physical-scene audit: `aligned`, maximum error `0.00 m`;
+- actual ordered waypoint disks and finish entered: 64/64;
+- rendered env 0 visibly alternated around all four physical boxes and held
+  still for 113 frames;
+- zero forbidden contact: 0/64;
+- no sustained fall: 37/64;
+- full conjunction: 0/64.
+
+The contact timestamps line up with the rendered obstacle passes. The old
+generated `box_disturbance` term inferred contact from object velocity, which
+cannot work for fixed boxes. Treat iter 14 as diagnosed evidence that the
+frame/RSI correction works, not as a successful demonstration.
+
 ## Recommended corrected proof run
 
-Choose **Live rehearsal** first:
+After `0822e07`, choose **Resume** with exact promoted tuple recovery enabled:
 
-- Mode: Manual
-- Outer sculpt cycles: 2
-- PPO iterations per cycle: 350
-- Environments: 512
+- Mode: Auto
+- Outer sculpt cycles: 1
+- PPO iterations per cycle: 750
+- Environments: 1,024
 - Device: `cuda:0`
 - Episode steps: 1,000
 - Rollout episodes: 2
@@ -126,8 +152,15 @@ Choose **Live rehearsal** first:
 - Video: 1920×1080
 - Objective metric: `gen_003`
 - Fitness mode: observe
-- Resume exact promoted tuple: on only when intentionally restoring the last
-  accepted tuple
+- Resume exact promoted tuple: on
+
+Before iteration 0, the Training log must show:
+
+- four embodiment-clearance waypoint adjustments;
+- four compiled forbidden-contact sensors;
+- forbidden-contact supervision at weight `-8`;
+- warm start from iter 14;
+- physical object placement at local pose + environment origin.
 
 Inspect the first official rollout before committing to an overnight run.
 The physical-scene audit must say **aligned**. If the route is learning and
@@ -197,6 +230,7 @@ instead of trusting a plausible video or local-coordinate metric.
 - World says **Verified for launch**.
 - Robot, boxes, route, and finish are visibly co-located.
 - Corrected rollout physical-scene audit is aligned.
+- Forbidden-contact channels are false throughout the selected rollout.
 - Selected video passes every acceptance item.
 - Results export is enabled only for valid evidence.
 - Keep the verified project open before the call.

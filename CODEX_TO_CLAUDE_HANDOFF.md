@@ -2026,3 +2026,53 @@ Final broad verification after both implementation slices:
 `MUJOCO_GL=egl .venv/bin/python -m pytest tests/ -q
 --ignore=tests/test_refs_preview.py` completed in 293.25 seconds with
 **2,242 passed / 1 optional-JAX skip** (163 warnings, no failures).
+
+## First aligned rollout diagnosis + contact-safe supervision 2026-07-24 (Codex)
+
+Fresh UI job `job_22b38fd7ee6bfbb0` completed iter 14 under clean commit
+`443a9c6`. It is the first result whose rendered geometry and abstract task
+share the same frame:
+
+- `/physical-scene-audit` reports `aligned`, maximum error `0.00 m`, all four
+  boxes checked;
+- every one of 64 evaluation environments entered all four actual waypoint
+  disks in order and entered the finish;
+- rendered env 0 reached waypoint index 5 at frame 733, ended inside the
+  finish at 0 m/s, remained upright, and produced a 113-frame whole-body
+  quiet hold;
+- nevertheless, every environment recorded at least one forbidden box
+  contact, only 37/64 met the no-sustained-fall proxy, and the full
+  conjunction was 0/64;
+- the full 20 s video/contact sheet visibly shows the robot and physical
+  boxes co-located and a real alternating route, with contacts during the
+  obstacle passes.
+
+The root cause is generic. Reward v7's `box_disturbance` treated fixed-object
+velocity as a contact proxy, but a fixed box remains at zero velocity even
+when struck. At the same time, command tracking aimed at each waypoint-zone
+center. The centers satisfy the abstract predicate but do not leave the
+selected embodiment's full reach envelope clear of the obstacle.
+
+Commit `0822e07` (`fix(world): supervise obstacle clearance from contacts`)
+adds two capability/data-driven corrections:
+
+- waypoint commands choose a safer subtarget inside the same authored disk
+  when a forbidden object's horizontal bounding volume plus the selected
+  robot capability's reach radius conflicts with the center target; the
+  subtarget remains inside the task tolerance, and route RSI consumes those
+  same safe targets;
+- every authored forbidden contact pair installs direct binary supervision
+  from its already-compiled simulator contact sensor, weighted to dominate
+  the aggregate authored command-tracking income (`-8` for the current
+  2+2 command weights).
+
+There is no robot name, simulator task ID, object name, or prompt phrase in
+the control logic. Box/sphere/cylinder/capsule/frame bounds and arbitrary
+future robot capability geometry are handled through typed manifest data.
+
+Verification for this slice: focused compiler/adapter suite **64 passed**;
+compileall and `git diff --check` passed; scoped Ruff passed when excluding
+three pre-existing F401 side-effect imports in the already-touched compiler
+test surface. A new exact-tuple UI Resume must warm-start iter 14 and prove
+zero contact plus the original route/finish/hold conjunction before this goal
+is complete.
