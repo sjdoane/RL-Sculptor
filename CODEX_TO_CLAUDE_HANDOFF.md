@@ -2159,3 +2159,50 @@ transition, `0.350 m` frozen predicate, route RSI, physical alignment,
 four `-8` contact sensors, full command weights, and actor+critic warm start
 from iter 16 checkpoint SHA8 `56d1d91a`. PPO iteration 0 is active. Do not
 edit reload-watched core or run intermediate GPU audits until it finishes.
+
+## Iter 17 safe-cap correction 2026-07-24 (Codex)
+
+UI job `job_4ff8e2081df13d11` completed iter 17 cleanly with aligned physical
+geometry, but it is not a success:
+
+- physical-scene audit: aligned, maximum error `0.00 m`;
+- contact-free: **61/64**, the best physical-contact result so far;
+- actual route + finish: only 3/64;
+- no 100-frame holds or full conjunctions;
+- rendered env 0 was upright/contact-free but stopped after waypoint 3.
+
+The first-episode trajectory makes the controller defect exact. In env 0,
+the frozen raw-disk predicate advanced waypoint 3 when the local root entered
+the 0.35 m authored disk. The command continued targeting waypoint 3's safe
+point `(5.0, 1.118)` and converged to approximately `(4.844, 1.098)`—only
+2 cm short of that steering target, safely inside the authored disk, but
+outside the artificial 0.14 m target ball. At the `0.10x` velocity floor,
+standing there nearly satisfies the base velocity-tracking reward, so the
+command never advances to waypoint 4. This is a set/steering mismatch, not a
+reward-only failure.
+
+Commit `df8d2f5` (`fix(world): cross obstacle-safe waypoint caps`) replaces
+the second point predicate with a geometric safe-cap transition:
+
+- unadjusted waypoints still advance on the immutable authored disk;
+- adjusted waypoints must be inside that same disk **and** cross the
+  obstacle-clearance half-space derived from the typed shift vector;
+- a 0.025 m transition slack consumes only half of the compiler's existing
+  0.05 m safety margin, giving a moving policy a finite crossing surface;
+- the ordinary `0.35x` intermediate speed floor is restored, because exact
+  low-speed point capture is no longer required;
+- command progression can no longer occur outside or redefine the frozen
+  task predicate.
+
+No robot, task, object, prompt, or simulator name controls the transition.
+Focused compiler/adapter verification is **65 passed**; scoped Ruff,
+compileall, and diff check pass.
+
+The automatic iteration also produced reward v16 SHA
+`8748914a188caec8e9389aeb974fdcd93816ad9e685eaf2edf55b016e1dd6616`
+(sharper, bar-raising terminal phase gate plus dense waypoint-capture
+kernel) and env v15 SHA
+`08837c8d2f093bfe572cf60b012f997ccb3e2dffa2402592bdb8abe1a922c5f7`
+(entropy scale restored to 1.0). The next UI Resume should keep exact
+promoted-tuple recovery off so it consumes both evidence-authored drafts and
+warm-starts iter 17.

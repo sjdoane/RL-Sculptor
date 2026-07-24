@@ -209,6 +209,30 @@ All startup checks above passed and actor+critic loaded from iter 16
 checkpoint SHA8 `56d1d91a`. Let this worker finish before auditing or editing
 runtime code.
 
+Iter 17 finished and must be presented only as diagnostic evidence. Its scene
+audit is aligned and 61/64 environments were contact-free, but only 3/64
+completed the physical route and no environment passed the 100-frame hold.
+Rendered env 0 stopped beside waypoint 3.
+
+The trajectory proved why: the robot was inside the immutable 0.35 m
+waypoint disk and only 2 cm short of the safe steering point, but the command
+was still waiting for its separate 0.14 m target ball. The corrected
+controller now advances through the authored disk's obstacle-safe outer cap:
+inside the frozen disk plus across the typed clearance half-space. It retains
+0.025 m of transition slack within the existing 0.05 m clearance margin and
+restores the ordinary 0.35x crossing-speed floor. There is no second success
+predicate and no robot/task-name keying.
+
+For the next proof run, keep exact recovery **off** and verify:
+
+- reward v16 (route-gate sharpening + dense waypoint capture);
+- env v15 (entropy scale 1.0);
+- `safe-cap transition inside frozen 0.350 m task predicate`;
+- `0.025 m clearance slack`;
+- warm start from iter 17;
+- every previously required physical alignment, contact, RSI, and command
+  supervision line.
+
 Inspect the first official rollout before committing to an overnight run.
 The physical-scene audit must say **aligned**. If the route is learning and
 the boxes are visibly co-located, launch **Overnight showcase**:
