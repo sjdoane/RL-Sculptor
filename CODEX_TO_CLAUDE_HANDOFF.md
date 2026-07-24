@@ -1935,3 +1935,89 @@ Results report completed successfully in the live UI after commit `c129a72`;
 its rendered markdown now says `Selected policy reward module:
 rewards/v7.py` and `Selected (iter 13)`. Results still foregrounds iter 13 as
 best with steering fitness 0.24734 and the accepted official rollout.
+
+## Critical evidence correction + physical course fix 2026-07-24 (Codex)
+
+The preceding "Official iter-13 acceptance" is **retracted**. Visual review
+correctly exposed that the robot was not weaving around the rendered boxes.
+The trajectory/metric route was expressed in the robot's per-environment
+local frame, but the fixed mocap objects remained at unshifted global
+coordinates. In iter 13 environment 0, the robot origin was approximately
+`(7,-7)` while the four boxes stayed at global x positions 2/3.5/5/6.5.
+The measured object-vs-manifest local-frame error is 9.899495 m for every box.
+Local waypoint counts and the 112-frame hold therefore do not establish
+physical slalom success.
+
+Commit `11e664d` (`fix(world): align physical objects and add route RSI`)
+repairs the general runtime contract:
+
+- every authored fixed or floating object receives an explicit train/eval
+  reset at `nominal local pose + env origin`;
+- object-position train variations are composed as local deltas instead of
+  overwriting the frame transform;
+- generic train-only waypoint-route RSI splits episodes between the real
+  entrance and positions just before later waypoints, facing the next target;
+- evaluation resets are untouched;
+- command, NumPy metric, and Torch reward consume the RSI route start
+  consistently;
+- a fixed-geometry alignment invariant blocks waypoint advancement/success
+  whenever physical objects do not match the resolved manifest;
+- all logic is capability/data driven, with no robot or task-name keying.
+
+Focused physical-frame/RSI verification passed 35 tests plus compileall and
+`git diff --check`.
+
+Commit `55865b8` (`feat(results): reject misaligned physical evidence`) adds
+`/physical-scene-audit` and a fail-closed Results presentation. The live UI
+now says **Invalid evidence — physical scene mismatch · iter 13**, reports the
+9.90 m maximum error, removes the "best" label, and disables policy export.
+Backend audit/project tests passed 18 tests; TypeScript passed; the live
+Results screen was visually inspected.
+
+There is no corrected accepted rollout yet. A fresh UI-launched run under
+`11e664d` or newer must pass the physical-scene audit and the original
+ordered-route/contact/finish/hold gates before the showcase goal can be
+declared complete.
+
+## Normal-run reference-motion integration 2026-07-24 (Codex)
+
+Commit `3d92602` (`feat(runs): add UI reference-motion priors`) makes the
+existing reference-motion system available from the ordinary **New run**
+workflow, not only mission stages/CLI:
+
+- **Pre-existing motion → Choose motion** searches the target robot's
+  reference library and shows previews, tier, license, and duration;
+- launch sends an exact `(reference_robot, reference_clip_id)` pair and
+  rejects incomplete/missing pairs before GPU work;
+- the selected clip becomes the deterministic immutable phase-indexed
+  tracking base already used by missions;
+- the behavior prompt is authored only as a bounded residual, and the editor
+  must preserve the reference target hash/composition;
+- build finishes in a private staging directory before one immutable reward
+  and one atomic authored tuple are created;
+- exact resumes reuse only matching clip bytes, behavior goal, selected reward
+  hash, and tuple hash;
+- run events and `run_context.json` record the full motion provenance;
+- route/object RSI remains independent, so motion style and physical
+  exploration compose rather than substitute for one another.
+
+Cross-robot use stays honest: a source motion must be retargeted/registered
+into the target robot namespace through the existing GMR pipeline first.
+There is no silent fallback to another embodiment. This works for any future
+robot whose registered clip and adapter share the reward state contract;
+core run logic has no robot/task-name branches.
+
+Verification:
+
+- reference-run + reference-tracking suites: 60 passed;
+- sculpt orchestration suite: 45 passed;
+- UI run/API suite: 48 passed;
+- TypeScript, compileall, targeted Ruff on new core files, and
+  `git diff --check` passed;
+- a real G1 treadmill clip (24.825 s) compiled into a 19,481-byte tracking
+  prior with recorded clip/target hashes;
+- live UI picker/selection was exercised and visually inspected.
+
+The current demo procedure is fully replaced by
+`reward-sculptor-ui/docs/LAB_CALL_DEMO_RUNBOOK.md`. It explicitly treats iter
+13 as invalid failure provenance and requires a fresh aligned rollout.
