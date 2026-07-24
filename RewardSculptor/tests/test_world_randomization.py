@@ -14,6 +14,7 @@ import pytest
 from sculptor.world.randomization import (
     Randomization,
     _range_from_distribution,
+    install_authored_object_resets,
     install_world_randomizations,
     resolve_world_randomizations,
 )
@@ -123,16 +124,53 @@ def test_install_object_events():
     assert len(msgs) == 2
 
 
-def test_install_object_position_event():
+def test_object_position_is_not_installed_as_global_model_field_write():
     env_cfg = types.SimpleNamespace(events={})
     msgs = install_world_randomizations(env_cfg, _object_position_world())
-    term = env_cfg.events["world_dr__box_lateral_position"]
+    assert "world_dr__box_lateral_position" not in env_cfg.events
+    assert msgs == []
+
+
+def test_install_authored_object_reset_replicates_nominal_pose():
+    env_cfg = types.SimpleNamespace(events={})
+    objects = {
+        "box_01": {
+            "position_m": [2.0, 0.0, 0.375],
+            "quaternion_wxyz": [1.0, 0.0, 0.0, 0.0],
+            "fixed": True,
+        }
+    }
+    msgs = install_authored_object_resets(
+        env_cfg, objects, world=_object_position_world(), train=False)
+    term = env_cfg.events["world_object_pose__box_01"]
     assert term.mode == "reset"
-    assert term.params["operation"] == "abs"
-    assert term.params["ranges"] == (-0.08, 0.08)
-    assert term.params["axes"] == [1]
     assert term.params["asset_cfg"].name == "box_01"
-    assert any("box_01" in message and " y " in message for message in msgs)
+    assert term.params["pose_range"] == {
+        "x": (0.0, 0.0),
+        "y": (0.0, 0.0),
+        "z": (0.0, 0.0),
+        "roll": (0.0, 0.0),
+        "pitch": (0.0, 0.0),
+        "yaw": (0.0, 0.0),
+    }
+    assert any("nominal local pose + env origin" in message for message in msgs)
+
+
+def test_install_authored_object_reset_composes_absolute_train_variation():
+    env_cfg = types.SimpleNamespace(events={})
+    objects = {
+        "box_01": {
+            "position_m": [2.0, 0.25, 0.375],
+            "quaternion_wxyz": [1.0, 0.0, 0.0, 0.0],
+            "fixed": True,
+        }
+    }
+    msgs = install_authored_object_resets(
+        env_cfg, objects, world=_object_position_world(), train=True)
+    term = env_cfg.events["world_object_pose__box_01"]
+    # WorldSpec distribution is absolute; mjlab reset range is a nominal delta.
+    assert term.params["pose_range"]["y"] == pytest.approx((-0.33, -0.17))
+    assert any("y∈[-0.08,0.08]m" in message for message in msgs)
 
 
 def test_install_no_events_dict_is_noop():

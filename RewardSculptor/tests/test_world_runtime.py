@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from sculptor.world.channels import compile_channel_catalog
+from sculptor.world.channels import ChannelCatalog, compile_channel_catalog
 from sculptor.world.runtime import (
     TorchWorldRewardRuntime,
     WorldChannelRecorder,
@@ -180,3 +180,67 @@ def test_region_relative_channels_are_local_to_each_environment_origin() -> None
         env, catalog=runtime.catalog, manifest=runtime.manifest)
     torch.testing.assert_close(
         reward_runtime.sample()[channel], torch.as_tensor(expected))
+
+
+def test_waypoints_cannot_advance_against_misaligned_physical_geometry() -> None:
+    """Virtual local zones must not score while fixed boxes remain global."""
+    origins = np.asarray(
+        [[7.0, -7.0, 0.0], [0.0, 0.0, 0.0]], dtype=np.float32)
+    waypoint = np.asarray([2.0, 0.85, 0.0], dtype=np.float32)
+    robot_pos = origins + waypoint
+    # This is the production failure mode: one global box pose was reused for
+    # every replicated environment instead of adding each env origin.
+    box_pos = np.repeat(
+        np.asarray([[2.0, 0.0, 0.375]], dtype=np.float32), 2, axis=0)
+    scene = _Scene({
+        "robot": SimpleNamespace(data=SimpleNamespace(
+            root_link_pos_w=robot_pos)),
+        "box_01": SimpleNamespace(data=SimpleNamespace(
+            root_link_pos_w=box_pos)),
+    })
+    scene.env_origins = origins
+    env = SimpleNamespace(scene=scene, num_envs=2, step_dt=0.02)
+    catalog = ChannelCatalog.build(
+        world_hash="0" * 64, task_hash="1" * 64, channels=())
+    manifest = SimpleNamespace(
+        task_shared={"goal": {
+            "type": "waypoint_sequence",
+            "waypoints": ["waypoint_01"],
+            "success": {"tolerance_m": 0.35},
+        }},
+        zones={
+            "waypoint_01": {
+                "kind": "disk",
+                "center_m": waypoint.tolist(),
+                "radius_m": 0.35,
+            },
+        },
+        objects={
+            "box_01": {
+                "fixed": True,
+                "position_m": [2.0, 0.0, 0.375],
+            },
+        },
+        course=(),
+    )
+    runtime = WorldChannelRuntime(
+        env, catalog=catalog, manifest=manifest)
+
+    runtime.sample()
+    assert runtime._waypoint_index.tolist() == [0, 1]
+    assert runtime._last_waypoint_complete.tolist() == [False, True]
+
+    # Once each physical object is in nominal-local + env-origin coordinates,
+    # both otherwise-identical local waypoint entries become authoritative.
+    scene["box_01"].data.root_link_pos_w = origins + np.asarray(
+        [2.0, 0.0, 0.375], dtype=np.float32)
+    runtime.sample()
+    assert runtime._waypoint_index.tolist() == [1, 1]
+    assert runtime._last_waypoint_complete.tolist() == [True, True]
+
+
+def test_runtime_reset_consumes_authoritative_route_rsi_index() -> None:
+    runtime, _ball = _runtime(num_envs=2)
+    runtime.env._sculptor_waypoint_start_index = np.asarray([2, 4])
+    runtime.reset(np.asarray([1]))
+    assert runtime._waypoint_index.tolist() == [0, 4]

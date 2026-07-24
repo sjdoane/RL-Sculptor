@@ -121,6 +121,15 @@ class WorldChannelRuntime:
         self.objects = dict(manifest.objects)
         self._hold_elapsed = np.zeros(self.num_envs, dtype=np.float32)
         self._waypoint_index = np.zeros(self.num_envs, dtype=np.int32)
+        raw_starts = getattr(
+            env, "_sculptor_waypoint_start_index", None)
+        if raw_starts is not None:
+            starts = _to_numpy(raw_starts).astype(
+                np.int32, copy=False).reshape(-1)
+            if starts.shape != (self.num_envs,):
+                raise WorldRuntimeError(
+                    "route RSI start index must have one value per environment")
+            self._waypoint_index[:] = starts
         self._last_predicate: np.ndarray | None = None
         self._last_waypoint_distance = np.zeros(self.num_envs, dtype=np.float32)
         self._last_waypoint_complete = np.zeros(self.num_envs, dtype=bool)
@@ -143,7 +152,17 @@ class WorldChannelRuntime:
                 "reset env_ids must be within [0, num_envs)"
             )
         self._hold_elapsed[ids] = 0.0
-        self._waypoint_index[ids] = 0
+        raw_starts = getattr(
+            self.env, "_sculptor_waypoint_start_index", None)
+        if raw_starts is None:
+            self._waypoint_index[ids] = 0
+        else:
+            starts = _to_numpy(raw_starts).astype(
+                np.int32, copy=False).reshape(-1)
+            if starts.shape != (self.num_envs,):
+                raise WorldRuntimeError(
+                    "route RSI start index must have one value per environment")
+            self._waypoint_index[ids] = starts[ids]
         self._last_waypoint_distance[ids] = 0.0
         self._last_waypoint_complete[ids] = False
         if self._last_predicate is not None:
@@ -243,8 +262,11 @@ class WorldChannelRuntime:
         # collidable geometry itself enforces climbing/jumping onto its top.
         distance = np.linalg.norm(position[..., :2] - target[..., :2], axis=-1)
         tolerance = max(0.0, self._goal_tolerance()) or 0.25
-        reached = (self._waypoint_index < len(self._waypoints)) & (
-            distance <= tolerance)
+        reached = (
+            (self._waypoint_index < len(self._waypoints))
+            & (distance <= tolerance)
+            & self._fixed_geometry_aligned()
+        )
         self._waypoint_index = np.minimum(
             self._waypoint_index + reached.astype(np.int32),
             len(self._waypoints),
@@ -254,6 +276,31 @@ class WorldChannelRuntime:
         distance = np.linalg.norm(position[..., :2] - target[..., :2], axis=-1)
         self._last_waypoint_distance = np.where(complete, 0.0, distance)
         self._last_waypoint_complete = complete
+
+    def _fixed_geometry_aligned(self) -> np.ndarray:
+        """Whether fixed authored objects share each environment's local frame.
+
+        Waypoint state is authoritative only when the physical geometry is
+        where the frozen manifest says it is.  This prevents a virtual route
+        (commands/zones translated by env origins while boxes remain global)
+        from ever receiving waypoint completion or success credit.
+        """
+        aligned = np.ones(self.num_envs, dtype=bool)
+        tolerances = getattr(
+            self.env, "_sculptor_object_alignment_tolerance_m", {})
+        for name, record in self.objects.items():
+            if not bool(record.get("fixed", False)):
+                continue
+            nominal = np.asarray(
+                record.get("position_m", ()), dtype=np.float32)
+            if nominal.shape != (3,):
+                raise WorldRuntimeError(
+                    f"fixed object {name!r} has no 3D nominal position")
+            local = self._local_position(self._object_position(str(name)))
+            tolerance = float(tolerances.get(str(name), 0.05))
+            aligned &= (
+                np.linalg.norm(local - nominal, axis=-1) <= tolerance + 1e-7)
+        return aligned
 
     def _contact(self, source: Mapping[str, Any]) -> np.ndarray:
         name = (
@@ -300,7 +347,10 @@ class WorldChannelRuntime:
         if goal_type == "robot_to_region":
             return self._region_predicate("robot", str(self.goal["region"]))
         if goal_type == "waypoint_sequence":
-            return self._last_waypoint_complete
+            return (
+                self._last_waypoint_complete
+                & self._fixed_geometry_aligned()
+            )
         if goal_type == "object_velocity":
             subject = str(self.goal["subject"])
             velocity = self._entity_state(subject, "lin_vel_w")
@@ -417,6 +467,11 @@ class TorchWorldRewardRuntime:
         self._waypoints = self._resolve_waypoints()
         self._waypoint_index = torch.zeros(
             int(env.num_envs), dtype=torch.long, device=env.device)
+        raw_starts = getattr(
+            env, "_sculptor_waypoint_start_index", None)
+        if raw_starts is not None:
+            self._waypoint_index.copy_(
+                raw_starts.to(device=env.device, dtype=torch.long))
 
     def _entity_state(self, name: str, suffix: str) -> Any:
         entity = _scene_item(self.scene, name)
@@ -497,7 +552,8 @@ class TorchWorldRewardRuntime:
             self.goal.get("success", {}).get("tolerance_m", 0.0))) or 0.25
         reached = (
             (self._waypoint_index < self._waypoints.shape[0])
-            & (distance <= tolerance))
+            & (distance <= tolerance)
+            & self._fixed_geometry_aligned())
         self._waypoint_index = self.torch.clamp(
             self._waypoint_index + reached.long(), max=self._waypoints.shape[0])
         complete = self._waypoint_index >= self._waypoints.shape[0]
@@ -506,6 +562,31 @@ class TorchWorldRewardRuntime:
         distance = self.torch.linalg.norm(
             position[..., :2] - target[..., :2], dim=-1)
         return self.torch.where(complete, self.torch.zeros_like(distance), distance)
+
+    def _fixed_geometry_aligned(self) -> Any:
+        aligned = self.torch.ones(
+            int(self.env.num_envs), device=self.env.device, dtype=self.torch.bool)
+        tolerances = getattr(
+            self.env, "_sculptor_object_alignment_tolerance_m", {})
+        for name, record in self.manifest.objects.items():
+            if not bool(record.get("fixed", False)):
+                continue
+            position = self._local_position(
+                self._entity_state(str(name), "pos_w"))
+            nominal = self.torch.as_tensor(
+                record.get("position_m", ()),
+                device=position.device,
+                dtype=position.dtype,
+            )
+            if nominal.shape != (3,):
+                raise WorldRuntimeError(
+                    f"fixed object {name!r} has no 3D nominal position")
+            tolerance = float(tolerances.get(str(name), 0.05))
+            aligned &= (
+                self.torch.linalg.norm(position - nominal, dim=-1)
+                <= tolerance + 1e-7
+            )
+        return aligned
 
     def _contact(self, source: Mapping[str, Any]) -> Any:
         sensor = _scene_item(
@@ -585,7 +666,13 @@ class TorchWorldRewardRuntime:
         return values
 
     def reset(self, env_ids: Any) -> None:
-        self._waypoint_index[env_ids] = 0
+        raw_starts = getattr(
+            self.env, "_sculptor_waypoint_start_index", None)
+        if raw_starts is None:
+            self._waypoint_index[env_ids] = 0
+        else:
+            self._waypoint_index[env_ids] = raw_starts[env_ids].to(
+                device=self.env.device, dtype=self.torch.long)
 
 
 class WorldChannelRecorder:

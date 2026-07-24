@@ -6,11 +6,17 @@ compiled into metadata and never consumed — every episode trained against ONE
 frozen layout, which is exactly what undercuts sim-to-real transfer.
 
 This module turns those declared variations into mjlab reset-time events so each
-parallel environment re-samples its layout every episode. Two paths:
+parallel environment re-samples its layout every episode. Three paths:
 
 * **Object entities** (a ball / cube in an object task) — mass and friction are
   randomized with mjlab's own proven entity DR (`dr.body_mass` / `dr.geom_friction`),
   which handle per-env model-field expansion and indexing.
+* **Object placement** — every authored object, fixed or floating, is explicitly
+  reset to ``nominal local pose + env origin``.  mjlab intentionally does not
+  position fixed-base mocap entities per environment unless such a reset event
+  runs.  Position variations are composed into this reset rather than installed
+  as a second model-field write, keeping geometry, commands, and validators in
+  one frame.
 * **Course platforms** (parkour boxes) — the authored course is raw worldbody
   geometry (not an mjlab entity), so a small custom reset event
   (`randomize_authored_course`) resolves the box geoms by name and re-samples each
@@ -215,6 +221,139 @@ def randomize_authored_course(env: Any, env_ids: Any, *, specs: Sequence[Mapping
 
 # ── install into an mjlab env_cfg (train only) ───────────────────────────────
 
+def install_authored_object_resets(
+    env_cfg: Any,
+    objects: Mapping[str, Any],
+    *,
+    world: Mapping[str, Any] | None = None,
+    train: bool,
+) -> list[str]:
+    """Install the authoritative per-environment pose reset for every object.
+
+    ``EntityCfg.init_state`` is local to an authored world.  mjlab's replicated
+    scene only adds ``scene.env_origins`` when ``reset_root_state_uniform`` is
+    called; without this event, fixed mocap objects stay at the single global
+    origin while each robot follows local commands around its own origin.
+
+    Position distributions target an absolute nominal coordinate in WorldSpec.
+    mjlab's reset API samples a delta, so ranges are translated by the resolved
+    nominal coordinate before they are installed.  Evaluation receives zero
+    deltas and therefore replays the frozen manifest exactly.
+    """
+    if not objects:
+        return []
+    events = getattr(env_cfg, "events", None)
+    if not isinstance(events, dict):
+        return []
+    try:
+        from mjlab.managers.event_manager import EventTermCfg
+        from mjlab.managers.scene_entity_config import SceneEntityCfg
+    except Exception as e:  # noqa: BLE001 — headless / mjlab missing
+        print(
+            "[world-placement] mjlab reset API unavailable, skipping: "
+            f"{type(e).__name__}: {e}",
+            file=sys.stderr,
+            flush=True,
+        )
+        return []
+
+    position_ranges: dict[tuple[str, int], Randomization] = {}
+    if train and world is not None:
+        position_ranges = {
+            (item.target_name, int(item.axis)): item
+            for item in resolve_world_randomizations(world)
+            if item.kind == "object_position" and item.axis is not None
+        }
+
+    installed: list[str] = []
+    axis_names = "xyz"
+    for name, raw in sorted(objects.items()):
+        if not isinstance(raw, Mapping):
+            continue
+        nominal = tuple(float(value) for value in raw.get("position_m", ()))
+        if len(nominal) != 3:
+            raise ValueError(
+                f"resolved authored object {name!r} has no 3D nominal position"
+            )
+        pose_range = {
+            "x": (0.0, 0.0),
+            "y": (0.0, 0.0),
+            "z": (0.0, 0.0),
+            "roll": (0.0, 0.0),
+            "pitch": (0.0, 0.0),
+            "yaw": (0.0, 0.0),
+        }
+        varied: list[str] = []
+        for axis in range(3):
+            variation = position_ranges.get((str(name), axis))
+            if variation is None:
+                continue
+            delta = (
+                float(variation.low) - nominal[axis],
+                float(variation.high) - nominal[axis],
+            )
+            pose_range[axis_names[axis]] = delta
+            varied.append(
+                f"{axis_names[axis]}∈[{variation.low:.3g},{variation.high:.3g}]m"
+            )
+        alignment_tolerance_m = max(
+            0.05,
+            *(
+                max(abs(bounds[0]), abs(bounds[1])) + 0.05
+                for axis, bounds in pose_range.items()
+                if axis in {"x", "y", "z"}
+            ),
+        )
+        events[f"world_object_pose__{name}"] = EventTermCfg(
+            mode="reset",
+            func=reset_authored_object_pose,
+            params={
+                "asset_cfg": SceneEntityCfg(str(name)),
+                "pose_range": pose_range,
+                "velocity_range": {},
+                "alignment_tolerance_m": alignment_tolerance_m,
+            },
+        )
+        detail = f"; train variation {', '.join(varied)}" if varied else ""
+        installed.append(
+            f"object '{name}' → nominal local pose + env origin{detail}"
+        )
+    return installed
+
+
+def reset_authored_object_pose(
+    env: Any,
+    env_ids: Any,
+    *,
+    pose_range: Mapping[str, tuple[float, float]],
+    velocity_range: Mapping[str, tuple[float, float]],
+    asset_cfg: Any,
+    alignment_tolerance_m: float,
+) -> None:
+    """Reset one object in the replicated local frame and publish its invariant.
+
+    The simulator-native helper handles fixed mocap and floating bodies through
+    their correct write APIs.  The tolerance is retained on the environment so
+    command/reward/metric runtimes can fail closed if physical geometry ever
+    drifts away from the authored local frame.
+    """
+    from mjlab.envs.mdp.events import reset_root_state_uniform
+
+    reset_root_state_uniform(
+        env,
+        env_ids,
+        pose_range=dict(pose_range),
+        velocity_range=dict(velocity_range),
+        asset_cfg=asset_cfg,
+    )
+    tolerances = getattr(
+        env, "_sculptor_object_alignment_tolerance_m", None)
+    if not isinstance(tolerances, dict):
+        tolerances = {}
+        env._sculptor_object_alignment_tolerance_m = tolerances
+    tolerances[str(asset_cfg.name)] = float(alignment_tolerance_m)
+
+
 def install_world_randomizations(env_cfg: Any, world: Mapping[str, Any]) -> list[str]:
     """Add reset-mode events to `env_cfg.events` so authored `train.variations`
     actually vary the scene per episode. Returns a human-readable list of what was
@@ -265,19 +404,10 @@ def install_world_randomizations(env_cfg: Any, world: Mapping[str, Any]) -> list
                 })
             installed.append(f"{r.var_id}: object '{r.target_name}' friction "
                              f"∈[{r.low:.3g},{r.high:.3g}] per reset")
-        elif r.kind == "object_position" and r.axis is not None:
-            events[f"world_dr__{r.var_id}"] = EventTermCfg(
-                mode="reset", func=dr.body_pos,
-                params={
-                    "asset_cfg": SceneEntityCfg(
-                        r.target_name, body_names=(r.target_name,)),
-                    "operation": "abs", "ranges": (r.low, r.high),
-                    "axes": [r.axis],
-                })
-            axis_name = "xyz"[r.axis]
-            installed.append(
-                f"{r.var_id}: object '{r.target_name}' {axis_name} "
-                f"∈[{r.low:.3g},{r.high:.3g}]m per reset")
+        # Object-position variations are composed into the authoritative
+        # per-environment pose reset by ``install_authored_object_resets``.
+        # A second body_pos event would write a model field in global
+        # coordinates and can silently undo the env-origin correction.
 
     if course_specs:
         events["world_dr__course"] = EventTermCfg(

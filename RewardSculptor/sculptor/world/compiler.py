@@ -442,11 +442,26 @@ def _waypoint_velocity_command_types() -> tuple[type[Any], type[Any]]:
                 cfg.waypoints_m, device=self.device, dtype=torch.float32)
             self._waypoint_index = torch.zeros(
                 self.num_envs, device=self.device, dtype=torch.long)
+            raw_starts = getattr(
+                env, "_sculptor_waypoint_start_index", None)
+            if raw_starts is not None:
+                self._waypoint_index.copy_(
+                    raw_starts.to(device=self.device, dtype=torch.long).clamp(
+                        min=0, max=self._waypoints.shape[0] - 1))
 
         def _resample_command(self, env_ids: Any) -> None:
             # The configured timer exceeds the episode horizon, so this path is
-            # the per-episode reset.  Keep route state private per environment.
-            self._waypoint_index[env_ids] = 0
+            # the per-episode reset.  Route RSI publishes one authoritative
+            # start index on the environment; evaluation has no such event and
+            # therefore always starts at zero.
+            raw_starts = getattr(
+                self._env, "_sculptor_waypoint_start_index", None)
+            if raw_starts is None:
+                self._waypoint_index[env_ids] = 0
+            else:
+                self._waypoint_index[env_ids] = raw_starts[env_ids].to(
+                    device=self.device, dtype=torch.long).clamp(
+                        min=0, max=self._waypoints.shape[0] - 1)
             self.vel_command_b[env_ids] = 0.0
             self.vel_command_w[env_ids] = 0.0
             self.is_heading_env[env_ids] = False
@@ -1625,6 +1640,121 @@ def _reconcile_terrain_curriculum(env_cfg: Any) -> tuple[str, ...]:
     return tuple(removed)
 
 
+def reset_robot_along_waypoint_route(
+    env: Any,
+    env_ids: Any,
+    *,
+    waypoints_m: tuple[tuple[float, float, float], ...],
+    midroute_probability: float,
+    approach_distance_m: tuple[float, float],
+    lateral_jitter_m: float,
+    asset_name: str = "robot",
+) -> None:
+    """Train-only route RSI in the same local frame as authored geometry.
+
+    A configurable fraction of resets starts immediately before a later
+    waypoint, facing it.  The remaining resets retain the base task's entrance
+    pose and therefore preserve full-route learning.  The sampled logical route
+    index is published once on ``env`` so command, reward, and metric runtimes
+    all resume from the same state; evaluation never installs this event.
+    """
+    import torch
+    from mjlab.utils.lab_api.math import quat_from_euler_xyz, quat_mul
+
+    if env_ids is None:
+        env_ids = torch.arange(
+            env.num_envs, device=env.device, dtype=torch.long)
+    env_ids = env_ids.to(device=env.device, dtype=torch.long)
+    starts = getattr(env, "_sculptor_waypoint_start_index", None)
+    if starts is None or tuple(starts.shape) != (int(env.num_envs),):
+        starts = torch.zeros(
+            int(env.num_envs), device=env.device, dtype=torch.long)
+        env._sculptor_waypoint_start_index = starts
+    starts[env_ids] = 0
+
+    points = torch.as_tensor(
+        waypoints_m, device=env.device, dtype=torch.float32)
+    if points.shape[0] <= 1 or env_ids.numel() == 0:
+        return
+    use_midroute = torch.rand(
+        env_ids.numel(), device=env.device) < float(midroute_probability)
+    selected_env_ids = env_ids[use_midroute]
+    if selected_env_ids.numel() == 0:
+        return
+    selected_indices = torch.randint(
+        1, points.shape[0],
+        (selected_env_ids.numel(),),
+        device=env.device,
+        dtype=torch.long,
+    )
+    starts[selected_env_ids] = selected_indices
+
+    target = points[selected_indices, :2]
+    previous = points[selected_indices - 1, :2]
+    direction = target - previous
+    direction = direction / torch.clamp(
+        torch.linalg.norm(direction, dim=-1, keepdim=True), min=1e-6)
+    low, high = (float(value) for value in approach_distance_m)
+    approach = low + (high - low) * torch.rand(
+        selected_env_ids.numel(), 1, device=env.device)
+    normal = torch.stack((-direction[:, 1], direction[:, 0]), dim=-1)
+    lateral = (
+        2.0 * torch.rand(
+            selected_env_ids.numel(), 1, device=env.device) - 1.0
+    ) * float(lateral_jitter_m)
+    local_xy = target - direction * approach + normal * lateral
+
+    robot = env.scene[asset_name]
+    if bool(getattr(robot, "is_fixed_base", False)):
+        starts[selected_env_ids] = 0
+        return
+    root_state = robot.data.default_root_state[selected_env_ids].clone()
+    root_state[:, :2] = (
+        local_xy + env.scene.env_origins[selected_env_ids, :2])
+    yaw = torch.atan2(direction[:, 1], direction[:, 0])
+    zeros = torch.zeros_like(yaw)
+    root_state[:, 3:7] = quat_mul(
+        root_state[:, 3:7],
+        quat_from_euler_xyz(zeros, zeros, yaw),
+    )
+    root_state[:, 7:13] = 0.0
+    robot.write_root_state_to_sim(root_state, env_ids=selected_env_ids)
+
+
+def _resolved_waypoint_points(
+    manifest: ResolvedEvaluation,
+    requested_waypoints: Any,
+) -> tuple[tuple[float, float, float], ...]:
+    raw_waypoints: list[tuple[float, float, float]] = []
+    if requested_waypoints == "auto":
+        raw_waypoints = [
+            tuple(float(value) for value in primitive.position_m)
+            for primitive in manifest.course
+        ]
+    else:
+        by_source = {
+            str(primitive.source_id): primitive
+            for primitive in manifest.course
+        }
+        for waypoint_name in requested_waypoints:
+            name = str(waypoint_name)
+            if name in manifest.zones:
+                center = list(manifest.zones[name]["center_m"])
+                if len(center) == 2:
+                    center.append(0.0)
+                raw_waypoints.append(tuple(float(value) for value in center))
+            elif name in by_source:
+                raw_waypoints.append(tuple(
+                    float(value) for value in by_source[name].position_m))
+            else:  # frozen compiler validation should make this unreachable
+                raise WorldCompileError(
+                    f"waypoint {name!r} is absent from the resolved world")
+    if not raw_waypoints:
+        raise WorldCompileError(
+            "waypoint sequence has no resolved command targets")
+    return tuple(raw_waypoints)
+
+
 def _reconcile_waypoint_course(
     env_cfg: Any, manifest: ResolvedEvaluation, *, train: bool,
 ) -> tuple[str, ...]:
@@ -1649,50 +1779,48 @@ def _reconcile_waypoint_course(
     ):
         return ()
 
+    raw_waypoints = _resolved_waypoint_points(
+        manifest, requested_waypoints)
     adjustments: list[str] = []
     events = getattr(env_cfg, "events", None)
     if isinstance(events, dict):
-        for name, term in events.items():
+        for name, term in tuple(events.items()):
             params = getattr(term, "params", None)
             pose_range = params.get("pose_range") if isinstance(params, dict) else None
             if not isinstance(pose_range, dict) or not all(
                     axis in pose_range for axis in ("x", "y", "yaw")):
                 continue
+            asset_cfg = params.get("asset_cfg")
+            if (
+                asset_cfg is not None
+                and str(getattr(asset_cfg, "name", "")) != "robot"
+            ):
+                continue
             pose_range["x"] = (-0.10, 0.05) if train else (0.0, 0.0)
             pose_range["y"] = (-0.08, 0.08) if train else (0.0, 0.0)
             pose_range["yaw"] = (-0.08, 0.08) if train else (0.0, 0.0)
             adjustments.append(f"event:{name}→aligned with course +X")
+        if train:
+            from mjlab.managers.event_manager import EventTermCfg
+
+            events["world_route_state_initialization"] = EventTermCfg(
+                mode="reset",
+                func=reset_robot_along_waypoint_route,
+                params={
+                    "waypoints_m": raw_waypoints,
+                    "midroute_probability": 0.5,
+                    "approach_distance_m": (0.25, 0.55),
+                    "lateral_jitter_m": 0.12,
+                    "asset_name": "robot",
+                },
+            )
+            adjustments.append(
+                "event:world_route_state_initialization→50% entrance / "
+                "50% collision-local route starts (train only)"
+            )
 
     commands = getattr(env_cfg, "commands", None)
     if isinstance(commands, dict):
-        raw_waypoints: list[tuple[float, float, float]] = []
-        if requested_waypoints == "auto":
-            raw_waypoints = [
-                tuple(float(v) for v in primitive.position_m)
-                for primitive in manifest.course
-            ]
-        else:
-            by_source = {
-                str(primitive.source_id): primitive
-                for primitive in manifest.course
-            }
-            for waypoint_name in requested_waypoints:
-                name = str(waypoint_name)
-                if name in manifest.zones:
-                    center = list(manifest.zones[name]["center_m"])
-                    if len(center) == 2:
-                        center.append(0.0)
-                    raw_waypoints.append(tuple(float(v) for v in center))
-                elif name in by_source:
-                    raw_waypoints.append(tuple(
-                        float(v) for v in by_source[name].position_m))
-                else:  # frozen compiler validation should make this unreachable
-                    raise WorldCompileError(
-                        f"waypoint {name!r} is absent from the resolved world")
-        if not raw_waypoints:
-            raise WorldCompileError(
-                "waypoint sequence has no resolved command targets")
-
         for name, term in commands.items():
             ranges = getattr(term, "ranges", None)
             if not all(hasattr(ranges, field) for field in (
@@ -1717,7 +1845,7 @@ def _reconcile_waypoint_course(
                 rel_forward_envs=0.0,
                 init_velocity_prob=0.0,
                 ranges=ranges,
-                waypoints_m=tuple(raw_waypoints),
+                waypoints_m=raw_waypoints,
                 tolerance_m=(
                     max(0.0, float(
                         goal.get("success", {}).get("tolerance_m", 0.0)))
@@ -1850,9 +1978,22 @@ def apply_world_selection(
             zones=manifest.zones,
             robot=robot,
         )
+    # Entity init poses are authored in environment-local coordinates.  mjlab
+    # only applies replicated env origins to fixed mocap and floating entities
+    # through an explicit reset event.  Install it for BOTH train and eval so
+    # physical objects occupy the same frame as commands, zones, and metrics.
+    from sculptor.world.randomization import install_authored_object_resets
+    object_placement_applied = tuple(install_authored_object_resets(
+        env_cfg,
+        manifest.objects,
+        world=world,
+        train=train,
+    ))
     runtime_adjustments = (
         *_reconcile_terrain_curriculum(env_cfg),
         *_reconcile_waypoint_course(env_cfg, manifest, train=train),
+        *(f"physical scene alignment → {msg}"
+          for msg in object_placement_applied),
         *(f"per-episode domain randomization → {msg}"
           for msg in world_dr_applied),
     )

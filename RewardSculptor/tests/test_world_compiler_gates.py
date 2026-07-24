@@ -20,6 +20,7 @@ from sculptor.world.compiler import (
     compile_world,
     install_materialized_terrain_factory,
     materialized_terrain_types,
+    reset_robot_along_waypoint_route,
 )
 from sculptor.world.artifacts import ArtifactRef, WorldArtifactStore
 from sculptor.world.gates import run_admission_gates
@@ -213,8 +214,16 @@ def test_explicit_waypoint_zones_align_commands_without_materialized_course() ->
         "pose_range": {"x": (-1.0, 1.0), "y": (-1.0, 1.0),
                        "yaw": (-3.14, 3.14)},
     })
+    object_reset = SimpleNamespace(params={
+        "asset_cfg": SimpleNamespace(name="box_01"),
+        "pose_range": {
+            "x": (0.0, 0.0), "y": (-0.5, 0.5), "z": (0.0, 0.0),
+            "roll": (0.0, 0.0), "pitch": (0.0, 0.0), "yaw": (0.0, 0.0),
+        },
+    })
     env_cfg = SimpleNamespace(
-        events={"reset_base": reset}, commands={"twist": command},
+        events={"reset_base": reset, "object_reset": object_reset},
+        commands={"twist": command},
         curriculum={"command_vel": object()},
     )
     manifest = SimpleNamespace(
@@ -244,9 +253,72 @@ def test_explicit_waypoint_zones_align_commands_without_materialized_course() ->
     assert routed.ranges.ang_vel_z == (-1.5, 1.5)
     assert routed.ranges.heading is None
     assert reset.params["pose_range"]["yaw"] == (-0.08, 0.08)
+    assert object_reset.params["pose_range"]["x"] == (0.0, 0.0)
+    assert object_reset.params["pose_range"]["y"] == (-0.5, 0.5)
+    assert "world_route_state_initialization" in env_cfg.events
+    route_rsi = env_cfg.events["world_route_state_initialization"]
+    assert route_rsi.mode == "reset"
+    assert route_rsi.params["midroute_probability"] == 0.5
     assert "command_vel" not in env_cfg.curriculum
     assert any("goal-conditioned waypoint traversal" in item
                for item in adjustments)
+    assert any("collision-local route starts" in item
+               for item in adjustments)
+
+
+def test_route_rsi_places_robot_before_sampled_local_waypoint() -> None:
+    import torch
+
+    num_envs = 8
+    origins = torch.stack((
+        torch.arange(num_envs, dtype=torch.float32) * 10.0,
+        torch.zeros(num_envs),
+        torch.zeros(num_envs),
+    ), dim=-1)
+    default = torch.zeros((num_envs, 13), dtype=torch.float32)
+    default[:, 2] = 0.8
+    default[:, 3] = 1.0
+
+    class FakeRobot:
+        is_fixed_base = False
+        data = SimpleNamespace(default_root_state=default)
+
+        def write_root_state_to_sim(self, root_state, env_ids=None):
+            self.written = root_state.clone()
+            self.written_ids = env_ids.clone()
+
+    class FakeScene(dict):
+        pass
+
+    robot = FakeRobot()
+    scene = FakeScene(robot=robot)
+    scene.env_origins = origins
+    env = SimpleNamespace(
+        num_envs=num_envs, device="cpu", scene=scene)
+    waypoints = (
+        (2.0, 0.85, 0.0),
+        (3.5, -0.85, 0.0),
+        (5.0, 0.85, 0.0),
+    )
+    torch.manual_seed(4)
+    reset_robot_along_waypoint_route(
+        env,
+        None,
+        waypoints_m=waypoints,
+        midroute_probability=1.0,
+        approach_distance_m=(0.25, 0.55),
+        lateral_jitter_m=0.12,
+    )
+
+    starts = env._sculptor_waypoint_start_index
+    assert torch.all(starts >= 1)
+    assert torch.all(starts < len(waypoints))
+    local_xy = robot.written[:, :2] - origins[:, :2]
+    targets = torch.as_tensor(waypoints)[starts, :2]
+    distances = torch.linalg.norm(targets - local_xy, dim=-1)
+    assert torch.all(distances >= 0.24)
+    assert torch.all(distances <= 0.58)
+    assert torch.all(robot.written[:, 7:13] == 0)
 
 
 def test_waypoint_velocity_command_turns_and_stops_per_environment() -> None:
@@ -493,6 +565,10 @@ def test_authored_plane_removes_only_generator_dependent_curriculum(
     assert "command_vel" in env_cfg.curriculum
     assert bundle.runtime_adjustments == (
         "curriculum:terrain_levels→removed(no live terrain generator)",
+        (
+            "physical scene alignment → object 'ball' → "
+            "nominal local pose + env origin"
+        ),
     )
 
 
