@@ -1917,11 +1917,33 @@ def _reconcile_waypoint_course(
         _clearance_adjusted_waypoint_points(
             manifest, requested_waypoints, robot)
     )
+    try:
+        goal_tolerance = max(
+            0.0, float(goal.get("success", {}).get("tolerance_m", 0.0))
+        ) or 0.25
+    except (TypeError, ValueError):
+        goal_tolerance = 0.25
+    # A shifted target uses the authored region's outer side to preserve
+    # obstacle clearance.  Reusing the broad task predicate radius would
+    # advance the velocity command before the robot reaches that safe side,
+    # causing it to cut diagonally back across the forbidden object.  Keep
+    # ordinary routes unchanged; only clearance-adjusted routes get a tighter
+    # command transition.  The task predicate itself remains frozen.
+    command_tolerance = goal_tolerance
+    if clearance_adjustments:
+        command_tolerance = min(
+            goal_tolerance, max(0.08, 0.4 * goal_tolerance))
     adjustments: list[str] = []
     adjustments.extend(
         f"command:forbidden-contact clearance→{item}"
         for item in clearance_adjustments
     )
+    if clearance_adjustments:
+        adjustments.append(
+            "command:forbidden-contact clearance→transition radius "
+            f"{command_tolerance:.3f} m (task predicate remains "
+            f"{goal_tolerance:.3f} m)"
+        )
     events = getattr(env_cfg, "events", None)
     if isinstance(events, dict):
         for name, term in tuple(events.items()):
@@ -1986,11 +2008,7 @@ def _reconcile_waypoint_course(
                 init_velocity_prob=0.0,
                 ranges=ranges,
                 waypoints_m=raw_waypoints,
-                tolerance_m=(
-                    max(0.0, float(
-                        goal.get("success", {}).get("tolerance_m", 0.0)))
-                    or 0.25
-                ),
+                tolerance_m=command_tolerance,
                 cruise_speed_mps=0.8,
                 terminal_slow_radius_m=2.0,
             )

@@ -275,6 +275,7 @@ def test_forbidden_object_waypoint_uses_embodiment_clearance_subtarget() -> None
         task_shared={
             "goal": {
                 "type": "waypoint_sequence",
+                "waypoints": ["waypoint", "finish"],
                 "success": {"tolerance_m": 0.35},
             },
             "contacts": {
@@ -319,6 +320,29 @@ def test_forbidden_object_waypoint_uses_embodiment_clearance_subtarget() -> None
     assert points[1] == (4.0, 0.0, 0.0)
     assert len(notes) == 1
     assert "embodiment reach clearance" in notes[0]
+
+    ranges = SimpleNamespace(
+        lin_vel_x=(-1.0, 1.0),
+        lin_vel_y=(-1.0, 1.0),
+        ang_vel_z=(-1.5, 1.5),
+        heading=None,
+    )
+    env_cfg = SimpleNamespace(
+        events={},
+        commands={"twist": SimpleNamespace(
+            ranges=ranges,
+            entity_name="robot",
+            debug_vis=False,
+        )},
+        curriculum={},
+    )
+    adjustments = _reconcile_waypoint_course(
+        env_cfg, manifest, train=False, robot=robot)
+    routed = env_cfg.commands["twist"]
+    assert routed.waypoints_m == points
+    assert routed.tolerance_m == pytest.approx(0.14)
+    assert any("task predicate remains 0.350 m" in item
+               for item in adjustments)
 
 
 def test_route_rsi_places_robot_before_sampled_local_waypoint() -> None:
