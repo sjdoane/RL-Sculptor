@@ -72,7 +72,7 @@ Open **Projects → G1 Lab Showcase — Weave and Stop**.
 - Historical iter 13: retained as failure provenance; not exportable evidence
 - Iter 14: first physically aligned diagnostic rollout; not accepted because
   all 64 evaluation environments touched at least one box
-- Fresh proof: required after commit `0822e07`
+- Fresh proof: required after commit `63dbc28`
 
 ## World prompt
 
@@ -137,9 +137,25 @@ generated `box_disturbance` term inferred contact from object velocity, which
 cannot work for fixed boxes. Treat iter 14 as diagnosed evidence that the
 frame/RSI correction works, not as a successful demonstration.
 
+Iter 15 validates the direct sensor penalty and clearance subtargets:
+
+- physical-scene audit remains perfectly aligned at `0.00 m`;
+- contact-free environments improved from 0/64 to 34/64;
+- 62/64 completed the physical route and finish;
+- 51/64 met the no-sustained-fall proxy;
+- six environments passed the full route/contact/fall/whole-body-hold
+  conjunction.
+
+The rendered environment still brushed box 1 for three frames and held only
+51 uninterrupted frames. Its trajectory showed why: the shifted safe target
+was correct, but the velocity command reused the broad 0.35 m task-predicate
+radius and switched toward the next waypoint before reaching the safe side.
+Commit `63dbc28` keeps the task predicate frozen at 0.35 m but tightens the
+command-only transition radius to 0.14 m whenever clearance subtargets exist.
+
 ## Recommended corrected proof run
 
-After `0822e07`, choose **Resume** with exact promoted tuple recovery enabled:
+After `63dbc28`, choose **Resume** with exact promoted tuple recovery enabled:
 
 - Mode: Auto
 - Outer sculpt cycles: 1
@@ -157,9 +173,11 @@ After `0822e07`, choose **Resume** with exact promoted tuple recovery enabled:
 Before iteration 0, the Training log must show:
 
 - four embodiment-clearance waypoint adjustments;
+- clearance transition radius `0.140 m`, while the task predicate remains
+  `0.350 m`;
 - four compiled forbidden-contact sensors;
 - forbidden-contact supervision at weight `-8`;
-- warm start from iter 14;
+- warm start from iter 15;
 - physical object placement at local pose + environment origin.
 
 Inspect the first official rollout before committing to an overnight run.

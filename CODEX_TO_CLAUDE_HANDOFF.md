@@ -2076,3 +2076,35 @@ three pre-existing F401 side-effect imports in the already-touched compiler
 test surface. A new exact-tuple UI Resume must warm-start iter 14 and prove
 zero contact plus the original route/finish/hold conjunction before this goal
 is complete.
+
+## Iter 15 improvement + premature-turn correction 2026-07-24 (Codex)
+
+UI job `job_6988b3289674ac23` completed iter 15 under `0822e07` and clean
+launch context `104eadf`. Direct contact supervision and the embodiment-aware
+subtargets worked:
+
+- scene audit: aligned, `0.00 m` maximum error;
+- actual route + finish: 62/64;
+- contact-free: **34/64**, up from 0/64;
+- no sustained fall proxy: 51/64;
+- horizontal 100-frame full conjunction: 9/64;
+- whole-body 100-frame full conjunction: **6/64**.
+
+The official rendered env 0 completed the route but contacted box 1 for three
+frames and held only 51 frames. At those contact frames its local root moved
+from approximately `(2.04, 0.54)` to `(2.07, 0.52)`. The nominal safe
+subtarget was near `(2.0, 1.118)`, but the command's unchanged 0.35 m switch
+radius declared that subtarget reached early and began the diagonal turn
+toward the next negative-Y waypoint while still alongside box 1.
+
+Commit `63dbc28` (`fix(world): reach clearance subtargets before turning`)
+fixes the general set-versus-command distinction. When and only when a route
+uses forbidden-object clearance subtargets, the command transition radius is
+tightened to `max(0.08, 0.4 * task_tolerance)` (0.14 m here). The immutable
+task predicate remains 0.35 m. Ordinary routes are byte-for-byte unchanged.
+The adjusted command and route RSI share the same safe targets; no robot,
+object, task, or simulator name controls the behavior.
+
+Verification: focused compiler/adapter suite **64 passed**; scoped Ruff
+(excluding the documented pre-existing F401 imports), compileall, and diff
+check passed. Relaunch through UI exact recovery from iter 15 is required.
