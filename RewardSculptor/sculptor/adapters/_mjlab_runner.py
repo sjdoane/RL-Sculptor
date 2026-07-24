@@ -52,6 +52,12 @@ _SCULPTOR_TERMINAL_STILLNESS_WEIGHT = 1.0
 _SCULPTOR_TERMINAL_CONTINUITY_SCALE = 2.0
 _SCULPTOR_FORBIDDEN_CONTACT_WEIGHT = 4.0
 _SCULPTOR_FORBIDDEN_CONTACT_WEIGHT_SCALE = 2.0
+# A command-only obstacle-clearance stage deliberately targets a point outside
+# the immutable task predicate. Predicate-centered generated shaping would pull
+# in the opposite direction during that short phase, so withhold it entirely.
+# Command tracking, direct contact, survival, and native realism terms are
+# separate rewards and remain active.
+_CLEARANCE_STAGE_PRIMARY_SCALE = 0.0
 
 
 def _install_sculptor_termination_economics(
@@ -620,6 +626,8 @@ def _build_sculptor_term_class(
             rewards, _components = self._mod.compute_reward_batched(
                 self._prev, action, state, info
             )
+            rewards, _components = _apply_clearance_stage_reward_firewall(
+                env, rewards, _components)
             # §7.1 / §7.2: feed the module-level component sink when
             # training has enabled it. No-op when `_COMPONENT_SINK is None`,
             # which keeps rollout + non-sculpt runs allocation-free.
@@ -930,6 +938,101 @@ def _authored_forbidden_contact_penalty(
                 found > 0, dim=tuple(range(1, found.ndim)))
         found_any |= found.to(device=env.device, dtype=torch.bool)
     return found_any.to(dtype=torch.float32)
+
+
+def _clearance_stage_primary_scale(env: Any) -> Any:
+    """Return a per-environment firewall for command-only clearance stages.
+
+    The authored task predicate remains immutable, while a capable command
+    term may temporarily target an obstacle-safe approach point outside that
+    predicate. Generated rewards only observe predicate-centered channels and
+    therefore cannot distinguish this intentional phase from failure to
+    approach the raw goal. Detect the command capability itself and suppress
+    only the conflicting generated reward until its approach stage completes.
+
+    This is intentionally based on typed runtime state, never an embodiment,
+    simulator task id, or prompt-specific name.
+    """
+    import torch
+
+    scale = torch.ones(
+        int(env.num_envs), device=env.device, dtype=torch.float32)
+    manager = getattr(env, "command_manager", None)
+    if manager is None:
+        return scale
+
+    for name in tuple(getattr(manager, "active_terms", ()) or ()):
+        try:
+            term = manager.get_term(name)
+            shifts = getattr(term, "_clearance_shifts")
+            waypoint_index = getattr(term, "_waypoint_index")
+            stage_complete = getattr(term, "_clearance_stage_complete")
+        except (AttributeError, KeyError, RuntimeError):
+            continue
+
+        if (
+            not torch.is_tensor(shifts)
+            or shifts.ndim < 2
+            or shifts.shape[0] < 1
+            or shifts.shape[1] < 2
+        ):
+            continue
+        waypoint_index = torch.as_tensor(
+            waypoint_index, device=env.device, dtype=torch.long)
+        stage_complete = torch.as_tensor(
+            stage_complete, device=env.device, dtype=torch.bool)
+        if (
+            tuple(waypoint_index.shape) != tuple(scale.shape)
+            or tuple(stage_complete.shape) != tuple(scale.shape)
+        ):
+            continue
+
+        valid = (
+            (waypoint_index >= 0)
+            & (waypoint_index < int(shifts.shape[0]))
+        )
+        active_index = waypoint_index.clamp(
+            min=0, max=int(shifts.shape[0]) - 1)
+        active_shifts = shifts.to(
+            device=env.device, dtype=torch.float32)[active_index, :2]
+        adjusted = torch.linalg.norm(active_shifts, dim=-1) > 1e-6
+        stage_active = valid & adjusted & ~stage_complete
+        scale = torch.where(
+            stage_active,
+            torch.full_like(scale, _CLEARANCE_STAGE_PRIMARY_SCALE),
+            scale,
+        )
+    return scale
+
+
+def _apply_clearance_stage_reward_firewall(
+    env: Any,
+    rewards: Any,
+    components: Any,
+) -> tuple[Any, Any]:
+    """Scale generated reward outputs to match active clearance-stage truth."""
+    import torch
+
+    scale = _clearance_stage_primary_scale(env)
+
+    def _scale_per_env(value: Any) -> Any:
+        if (
+            not torch.is_tensor(value)
+            or value.ndim < 1
+            or int(value.shape[0]) != int(scale.shape[0])
+        ):
+            return value
+        broadcast_shape = (int(scale.shape[0]),) + (1,) * (value.ndim - 1)
+        return value * scale.to(
+            device=value.device, dtype=value.dtype).reshape(broadcast_shape)
+
+    scaled_rewards = _scale_per_env(rewards)
+    if isinstance(components, dict):
+        components = {
+            name: _scale_per_env(value)
+            for name, value in components.items()
+        }
+    return scaled_rewards, components
 
 
 def _authored_terminal_stillness_state(
@@ -2133,6 +2236,19 @@ def _cmd_train(args: argparse.Namespace) -> None:
                 "[runner] installed authored forbidden-contact supervision "
                 f"at weight {-forbidden_contact_weight:g} from sensors: "
                 + ", ".join(forbidden_contact_sensors),
+                file=sys.stderr,
+                flush=True,
+            )
+        if any(
+            "outside approach stage" in str(adjustment)
+            for adjustment in (
+                getattr(world_bundle, "runtime_adjustments", ()) or ())
+        ):
+            print(
+                "[runner] installed clearance-stage reward firewall: "
+                "predicate-centered generated reward withheld during "
+                "command-only safe approach; command/contact/survival "
+                "supervision remains active",
                 file=sys.stderr,
                 flush=True,
             )

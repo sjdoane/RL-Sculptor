@@ -182,6 +182,80 @@ def test_authored_forbidden_contact_supervision_uses_compiled_sensors() -> None:
     assert penalty.tolist() == [0.0, 1.0, 1.0]
 
 
+def test_clearance_stage_reward_firewall_is_per_env_and_capability_gated() -> None:
+    torch = pytest.importorskip("torch")
+
+    from sculptor.adapters._mjlab_runner import (
+        _apply_clearance_stage_reward_firewall,
+        _clearance_stage_primary_scale,
+    )
+
+    command = SimpleNamespace(
+        _clearance_shifts=torch.tensor([
+            [0.268, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+            [-0.268, 0.0, 0.0],
+        ]),
+        _waypoint_index=torch.tensor([0, 0, 1, 2, 3]),
+        _clearance_stage_complete=torch.tensor([
+            False, True, False, False, False,
+        ]),
+    )
+
+    class CommandManager:
+        active_terms = ("route", "ordinary")
+
+        @staticmethod
+        def get_term(name):
+            if name == "route":
+                return command
+            return SimpleNamespace()
+
+    env = SimpleNamespace(
+        num_envs=5,
+        device=torch.device("cpu"),
+        command_manager=CommandManager(),
+    )
+
+    scale = _clearance_stage_primary_scale(env)
+    assert scale.tolist() == [0.0, 1.0, 1.0, 0.0, 1.0]
+
+    rewards = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0])
+    components = {
+        "dense": rewards.clone(),
+        "matrix": torch.stack((rewards, rewards + 10.0), dim=-1),
+        "scalar": torch.tensor(7.0),
+        "metadata": "unchanged",
+    }
+    scaled_rewards, scaled_components = (
+        _apply_clearance_stage_reward_firewall(
+            env, rewards, components))
+
+    assert scaled_rewards.tolist() == [0.0, 2.0, 3.0, 0.0, 5.0]
+    assert scaled_components["dense"].tolist() == [
+        0.0, 2.0, 3.0, 0.0, 5.0,
+    ]
+    assert scaled_components["matrix"].tolist() == [
+        [0.0, 0.0],
+        [2.0, 12.0],
+        [3.0, 13.0],
+        [0.0, 0.0],
+        [5.0, 15.0],
+    ]
+    assert scaled_components["scalar"].item() == 7.0
+    assert scaled_components["metadata"] == "unchanged"
+
+    # A command manager without the typed clearance capability is unchanged.
+    plain_env = SimpleNamespace(
+        num_envs=2,
+        device=torch.device("cpu"),
+        command_manager=SimpleNamespace(
+            active_terms=(),
+        ),
+    )
+    assert _clearance_stage_primary_scale(plain_env).tolist() == [1.0, 1.0]
+
+
 def test_authored_terminal_stillness_is_dense_and_phase_gated() -> None:
     torch = pytest.importorskip("torch")
 
