@@ -2348,3 +2348,54 @@ edit reload-watched core or run intermediate GPU audits while iter 20 is
 alive. After it stops, audit only the official trajectory, fitness/objective
 artifacts, scene audit, keyframes, and full video against the full physical
 acceptance conjunction.
+
+## Iter 20 horizon impossibility + schedule correction 2026-07-24 (Codex)
+
+UI job `job_86d707964503d576` completed iter 20. The reward firewall worked:
+the official video visibly weaves through the co-located physical box course
+instead of parking before an outside stage. The result is still diagnostic,
+not showcase success:
+
+- physical-scene audit: `aligned`, maximum error `0.00 m`;
+- actual route + finish: 3/64;
+- contact-free: 48/64;
+- no sustained fall: 64/64;
+- route + contact-free: 3/64;
+- no 100-frame post-completion hold and no full conjunction;
+- rendered env 0 was contact-free and upright but reached only waypoint 3.
+
+The official first-episode trajectory makes the remaining failure
+quantitative. All 64 environments reached waypoint 2, 60 reached waypoint 3,
+30 reached waypoint 4, and only three reached waypoint 5. Median transition
+times were 4.80 s, 9.64 s, 15.86 s, and 18.56 s; the three completions occurred
+at 19.50–19.68 s. A 20 s episode requiring a two-second terminal hold cannot
+accept a completion after 18 s, irrespective of policy quality. The fixed
+0.8 m/s cruise schedule made the frozen objective temporally infeasible once
+the real 12.740 m staged command path, turns, disk entries, and terminal
+braking were included.
+
+Commit `3039879` (`Make waypoint cruise horizon aware`) replaces that fixed
+speed with a generic immutable-horizon schedule:
+
+- command path length includes the aligned origin, every typed outside
+  clearance stage, every original predicate center, and the finish;
+- the schedule reserves the authored hold plus a bounded settle margin;
+- a conservative 0.70 traversal-efficiency allowance accounts for ordinary
+  stage capture, turning, disk entry, and braking;
+- the resulting cruise is capped by the installed velocity-command domain;
+- short routes retain the 0.8 m/s nominal command;
+- task horizon, hold, tolerances, evaluator, reward firewall, and atomic tuple
+  are untouched, with no robot/task/object/prompt/simulator-name keying.
+
+For this exact project the compiler reports a 12.740 m command path, 16.000 s
+traversal window, and 1.000 m/s cruise capped by the command domain. Focused
+compiler/adapter verification is **68 passed**; scoped Ruff, compileall, and
+`git diff --check` pass. The completed checkpoint is
+`runs/iter_20/checkpoint.pt`, SHA8 `c1dbcce9`. Automatic reward v18 generation
+failed both syntax attempts, so the next UI New run must use reward v17 plus
+new env v17 (entropy scale 2.0), exact promoted-tuple recovery off, and warm
+start iter 20. Keep the same one-cycle 750-PPO, 1,024-environment, seed-42,
+two-episode 1920×1080 proof settings. Before PPO, require the new
+`horizon-aware cruise 1.000 m/s ... 12.740 m ... 16.000 s` line in addition
+to all alignment, staged-entry, RSI, contact, firewall, whole-body-stillness,
+and actor+critic warm-start proofs.

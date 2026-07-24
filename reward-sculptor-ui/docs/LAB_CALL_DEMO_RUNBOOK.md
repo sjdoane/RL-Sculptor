@@ -412,3 +412,47 @@ alignment/RSI/contact/command invariants, and the exact clearance-stage
 firewall line. PPO iteration 1/750 is active. Leave the worker alone until
 completion, then apply the full acceptance checklist to its official
 first-episode-safe evidence.
+
+## Current authoritative correction after iter 20
+
+Iter 20 is aligned diagnostic evidence, not showcase success. The full video
+now shows real alternating traversal around the physical orange boxes, and
+48/64 environments were contact-free with no sustained falls. Only 3/64
+entered the finish after the ordered route, however, and none could satisfy
+the uninterrupted 100-frame hold.
+
+This time the official timing—not rendering or reward conflict—is decisive.
+Median waypoint-4 entry occurred at 18.56 seconds, and the only three route
+completions occurred at 19.50–19.68 seconds. The frozen episode is 20 seconds
+and the frozen terminal dwell is two seconds, so the fixed 0.8 m/s cruise
+schedule made success impossible even for those completing policies.
+
+Commit `3039879` derives cruise speed generically from the full staged command
+path, episode horizon, authored hold, settle reserve, traversal-efficiency
+allowance, and installed command-domain cap. It changes no task predicate,
+tolerance, hold, evaluator, firewall, or atomic tuple. The exact project now
+compiles to:
+
+- staged command path: 12.740 m;
+- traversal window: 16.000 s;
+- horizon-aware cruise: 1.000 m/s, capped by the command domain.
+
+Focused compiler/adapter verification is **68 passed**; Ruff, compileall, and
+diff check pass. Launch the next proof through **New run** with:
+
+- exact promoted-tuple recovery: **off**;
+- reward: v17 (reward v18 does not exist because both generated edits failed
+  syntax validation);
+- environment: v17 (entropy coefficient scale 2.0);
+- warm start: iter 20 checkpoint SHA8 `c1dbcce9`;
+- Auto, one cycle, 750 PPO iterations, 1,024 environments on `cuda:0`;
+- 1,000 episode steps, two rollout episodes, seed 42, 1920×1080;
+- `gen_003` observe-only and no motion prior for this continuation.
+
+Before PPO iteration 0, require the startup log to report horizon-aware
+`1.000 m/s` cruise for the `12.740 m` path and `16.000 s` traversal window,
+plus the existing actor+critic warm start, local-frame physical boxes,
+two-phase outside-stage→frozen-disk controller, 50/50 route RSI, four direct
+contact sensors at `-8`, full command weights, whole-body terminal stillness,
+and clearance-stage reward firewall. Keep the full acceptance checklist
+conjunctive; never promote iter 20.
