@@ -2399,3 +2399,21 @@ two-episode 1920×1080 proof settings. Before PPO, require the new
 `horizon-aware cruise 1.000 m/s ... 12.740 m ... 16.000 s` line in addition
 to all alignment, staged-entry, RSI, contact, firewall, whole-body-stillness,
 and actor+critic warm-start proofs.
+
+That proof is now live as UI job `job_ac1eb30cafc3fdee`, iter 21, under clean
+captured launch commit `6c541ff` (schedule implementation `3039879`). It pins
+selection v30 / tuple
+`d44cd6a28364eeb08ae086e8739ad220ed09fe0324d3d76ade04607ea4b7d978`,
+reward v17 SHA
+`aaaf2a20cf86532a5ba522f2e30b422133fb4927017906a07e19e0881b4a6e38`,
+and env v17 SHA
+`1d1655a8397c9df92291c9c62891b75c36298ffa361cf6933f28e0cbb92a4f63`.
+The live log proves 1.000 m/s horizon-aware cruise for the 12.740 m staged
+path and 16.000 s traversal window, 50/50 route RSI, local-pose physical
+objects, four direct contact sensors at `-8`, full `track_linear_velocity`
+and `track_angular_velocity` weights `2.0`, clearance-stage reward firewall,
+whole-body terminal stillness at weight `4`, entropy coefficient `0.02`, and
+actor+critic warm start from iter 20 SHA8 `c1dbcce9`. PPO is active on 1,024
+environments. Do not edit reload-watched core or run intermediate GPU audits;
+let iter 21 finish, then apply the full physical acceptance conjunction to its
+official first-episode-safe artifacts and full video.

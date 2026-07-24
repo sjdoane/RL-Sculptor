@@ -456,3 +456,13 @@ two-phase outside-stage→frozen-disk controller, 50/50 route RSI, four direct
 contact sensors at `-8`, full command weights, whole-body terminal stillness,
 and clearance-stage reward firewall. Keep the full acceptance checklist
 conjunctive; never promote iter 20.
+
+Current proof run: UI job `job_ac1eb30cafc3fdee`, iter 21, clean captured
+commit `6c541ff`, selection v30 / tuple
+`d44cd6a28364eeb08ae086e8739ad220ed09fe0324d3d76ade04607ea4b7d978`.
+It uses reward v17 SHA `aaaf2a20cf86532a...` and env v17 SHA
+`1d1655a8397c9df9...`. The live log proves every required startup invariant,
+including the 1.000 m/s horizon-aware schedule, entropy 0.02, and actor+critic
+warm start from iter 20 SHA8 `c1dbcce9`. PPO is active at 1,024 environments.
+Leave the worker alone until it finishes; then audit only official artifacts
+and the full video against the complete acceptance checklist.
