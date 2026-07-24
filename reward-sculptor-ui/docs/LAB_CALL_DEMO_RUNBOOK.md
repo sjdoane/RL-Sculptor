@@ -360,3 +360,44 @@ The log confirms reward v17 SHA `aaaf2a20cf86532a...`, env v15 SHA
 entropy 0.01, and actor+critic warm start from iter 18 SHA8 `ffe80ac9`.
 PPO iteration 0 is active. Let this worker finish before inspecting official
 rollout evidence or changing runtime code.
+
+## Current authoritative correction after iter 19
+
+Iter 19 is physically aligned diagnostic evidence, not showcase success. The
+video finally shows real interaction with the four rendered boxes, but only
+1/64 environments completed the actual ordered route and finish, 44/64 were
+contact-free, none completed a 100-frame hold, and rendered env 0 stopped
+after waypoint 2. The physical-scene audit remained aligned at `0.00 m`.
+
+The official trajectory localized the failure immediately before the outside
+approach stages. During that command-only phase, the base velocity rewards
+point toward the safe outside stage while generated reward v17 still points
+toward the immutable disk center. Both signals are individually correct in
+their own coordinate contracts, but together they create a dense
+training-only equilibrium.
+
+Commit `3dfae11` installs a generic clearance-stage reward firewall:
+
+- while the command's typed outside stage is active, only the conflicting
+  generated `sculptor_primary` reward and its component diagnostics are
+  withheld;
+- command tracking, direct contact supervision, survival/failure economics,
+  terminal stillness, and native realism priors stay active;
+- generated reward returns at full strength for the immutable disk-entry and
+  terminal phases;
+- no robot, task, object, prompt, or simulator name selects the behavior.
+
+Focused compiler/adapter verification is **67 passed**; Ruff, compileall, and
+diff check pass. The automatic reward-v18 edit failed both syntax retries, so
+the next UI New run must use reward v17. It may consume newly authored env v16
+(entropy scale 1.5), with exact promoted-tuple recovery **off**, and warm-start
+the iter 19 checkpoint. Keep the same proof settings: Auto, one cycle, 750 PPO
+iterations, 1,024 environments on `cuda:0`, seed 42, two 1,000-step
+1920x1080 episodes, and `gen_003` observe-only.
+
+Before PPO iteration 0, require the previous two-phase/RSI/contact/alignment
+lines plus:
+
+`installed clearance-stage reward firewall: predicate-centered generated reward withheld during command-only safe approach; command/contact/survival supervision remains active`
+
+All acceptance criteria above remain conjunctive. Never promote iter 19.

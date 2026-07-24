@@ -2287,3 +2287,48 @@ four direct contact sensors at `-8`, full authored velocity-command weights,
 whole-body terminal stillness, entropy 0.01, and actor+critic warm start from
 iter 18 SHA8 `ffe80ac9`. PPO iteration 0 is active. Do not edit
 reload-watched core or run intermediate GPU audits until iter 19 finishes.
+
+## Iter 19 generated-reward conflict + clearance-stage firewall 2026-07-24 (Codex)
+
+UI job `job_0825a00f4219404d` completed iter 19. The two-phase controller
+removed the command/objective race and the official video now shows the robot
+physically interacting with the aligned box course, but the policy still
+stalls before completion. This is diagnostic evidence, not a showcase result:
+
+- physical-scene audit: aligned, maximum error `0.00 m`;
+- actual route + finish: 1/64;
+- finish entered: 3/64;
+- contact-free: 44/64;
+- route + contact-free: 0/64;
+- no 100-frame hold and no full conjunction;
+- rendered env 0 reached only waypoint index 2, contacted for five frames,
+  never entered finish, and ended at 0.1113 m/s.
+
+The full first-episode index histogram was `[0, 0, 9, 33, 21, 1]` for maximum
+indices 0 through 5. The largest groups converged immediately before the
+outside approach stages for waypoints 3 and 4. That localization exposed the
+remaining conflict: the base command reward correctly targets the temporary
+outside stage, but generated reward v17 can only see the immutable raw
+waypoint channel and simultaneously pulls toward the disk center. The policy
+learned a compromise between two contradictory dense objectives. Scene
+placement, rendering, and the frozen evaluator are not the cause.
+
+Commit `3dfae11` (`fix: firewall generated reward during clearance staging`)
+adds a generic per-environment training firewall. While an active command
+term reports an incomplete typed clearance stage, `sculptor_primary` and its
+recorded component values are scaled to zero. Full command tracking, direct
+forbidden-contact penalties, survival/failure economics, terminal stillness,
+and native realism priors remain active. Generated reward returns at full
+scale as soon as the command enters the immutable predicate phase. The
+firewall is capability/state driven and contains no robot, task, object,
+prompt, or simulator-name keying; evaluator/catalog channels and task
+predicates are untouched.
+
+Verification for the code slice: focused compiler/adapter suite **67 passed**;
+Ruff, compileall, and `git diff --check` passed. Iter 19's automatic reward
+v18 generation failed both syntax attempts, so no reward v18 exists. It did
+author env v16 with entropy scale 1.5. The next UI New run must therefore keep
+exact promoted-tuple recovery off, use reward v17 plus env v16, warm-start
+iter 19, and prove the startup firewall log before PPO. It remains one
+750-iteration, 1,024-environment, seed-42 proof cycle with two 1,000-step
+1920x1080 rollouts and `gen_003` observe-only.
