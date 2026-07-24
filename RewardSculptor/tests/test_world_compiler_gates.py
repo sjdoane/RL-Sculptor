@@ -16,6 +16,7 @@ from mjlab.scene import Scene, SceneCfg
 from sculptor.world.compiler import (
     ResolvedEvaluation,
     _clearance_adjusted_waypoint_points,
+    _horizon_aware_waypoint_cruise,
     _install_task_observations,
     _reconcile_waypoint_course,
     apply_world_selection,
@@ -426,6 +427,51 @@ def test_clearance_stage_requires_plane_crossing_and_finite_width() -> None:
         capture_radius_m=0.15,
         clearance_slack_m=0.025,
     )[0])
+
+
+def test_waypoint_cruise_reserves_horizon_for_authored_terminal_hold() -> None:
+    """Long routes accelerate generically without redefining the objective."""
+    waypoints = (
+        (2.0, 0.85, 0.0),
+        (3.5, -0.85, 0.0),
+        (5.0, 0.85, 0.0),
+        (6.5, -0.85, 0.0),
+        (8.0, 0.0, 0.0),
+    )
+    no_stages = tuple((0.0, 0.0, 0.0) for _ in waypoints)
+
+    speed, path_length, traversal_window = (
+        _horizon_aware_waypoint_cruise(
+            waypoints,
+            no_stages,
+            episode_length_s=20.0,
+            hold_s=2.0,
+            max_speed_mps=1.0,
+        )
+    )
+
+    assert path_length == pytest.approx(10.698696, abs=1e-6)
+    assert traversal_window == pytest.approx(16.0)
+    assert speed == pytest.approx(path_length / (16.0 * 0.70))
+    assert 0.8 < speed < 1.0
+
+    capped_speed, _, _ = _horizon_aware_waypoint_cruise(
+        waypoints,
+        no_stages,
+        episode_length_s=20.0,
+        hold_s=2.0,
+        max_speed_mps=0.9,
+    )
+    assert capped_speed == pytest.approx(0.9)
+
+    short_speed, _, _ = _horizon_aware_waypoint_cruise(
+        ((1.0, 0.0, 0.0), (2.0, 0.0, 0.0)),
+        ((0.0, 0.0, 0.0), (0.0, 0.0, 0.0)),
+        episode_length_s=20.0,
+        hold_s=2.0,
+        max_speed_mps=1.0,
+    )
+    assert short_speed == pytest.approx(0.8)
 
 
 def test_adjusted_waypoint_stages_then_synchronizes_on_frozen_disk() -> None:

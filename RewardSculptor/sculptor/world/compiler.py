@@ -2085,6 +2085,71 @@ def _clearance_staging_waypoint_shifts(
     return tuple(stages)
 
 
+def _horizon_aware_waypoint_cruise(
+    predicate_waypoints: tuple[tuple[float, float, float], ...],
+    clearance_staging_shifts: tuple[tuple[float, float, float], ...],
+    *,
+    episode_length_s: float,
+    hold_s: float,
+    max_speed_mps: float,
+    nominal_speed_mps: float = 0.8,
+) -> tuple[float, float, float]:
+    """Fit a waypoint command schedule inside the immutable task horizon.
+
+    The route controller must leave time for an authored terminal dwell; a
+    fixed cruise speed can make an otherwise valid objective impossible on a
+    long course.  Estimate the actual command path, including command-only
+    clearance stages, reserve the frozen hold plus a bounded settle margin,
+    and account for ordinary turning/braking inefficiency.  The result never
+    exceeds the installed velocity-command domain and does not alter any task
+    predicate, tolerance, or episode length.
+
+    Returns ``(cruise_speed_mps, path_length_m, traversal_window_s)``.
+    """
+    if len(predicate_waypoints) != len(clearance_staging_shifts):
+        raise WorldCompileError(
+            "clearance staging shifts must align one-to-one with waypoints")
+
+    command_points: list[tuple[float, float]] = [(0.0, 0.0)]
+    for waypoint, staging_shift in zip(
+            predicate_waypoints, clearance_staging_shifts, strict=True):
+        if math.hypot(
+                float(staging_shift[0]), float(staging_shift[1])) > 1e-6:
+            command_points.append((
+                float(waypoint[0]) + float(staging_shift[0]),
+                float(waypoint[1]) + float(staging_shift[1]),
+            ))
+        command_points.append((float(waypoint[0]), float(waypoint[1])))
+
+    path_length_m = sum(
+        math.hypot(current[0] - previous[0], current[1] - previous[1])
+        for previous, current in zip(
+            command_points, command_points[1:])
+    )
+    horizon_s = max(0.1, float(episode_length_s))
+    terminal_hold_s = max(0.0, float(hold_s))
+    settle_reserve_s = min(2.0, max(0.5, 0.10 * horizon_s))
+    traversal_window_s = max(
+        0.1, horizon_s - terminal_hold_s - settle_reserve_s)
+
+    # Curved waypoint travel does not realize commanded speed continuously:
+    # turn-in, stage capture, disk entry, and terminal braking all consume
+    # time.  A conservative embodiment-neutral efficiency allowance prevents
+    # the ideal straight-line estimate from exhausting the frozen horizon.
+    traversal_efficiency = 0.70
+    required_speed_mps = (
+        path_length_m / (traversal_window_s * traversal_efficiency)
+        if path_length_m > 1e-9
+        else 0.0
+    )
+    speed_cap_mps = max(0.0, float(max_speed_mps))
+    cruise_speed_mps = min(
+        speed_cap_mps,
+        max(float(nominal_speed_mps), required_speed_mps),
+    )
+    return cruise_speed_mps, path_length_m, traversal_window_s
+
+
 def _reconcile_waypoint_course(
     env_cfg: Any,
     manifest: ResolvedEvaluation,
@@ -2206,6 +2271,31 @@ def _reconcile_waypoint_course(
             ranges.ang_vel_z = (-1.5, 1.5)
             if hasattr(ranges, "heading"):
                 ranges.heading = None
+            termination = manifest.task_shared.get("termination", {})
+            success = goal.get("success", {})
+            try:
+                episode_length_s = float(
+                    termination.get("episode_length_s", 20.0))
+            except (AttributeError, TypeError, ValueError):
+                episode_length_s = 20.0
+            try:
+                hold_s = float(success.get("hold_s", 0.0))
+            except (AttributeError, TypeError, ValueError):
+                hold_s = 0.0
+            linear_command_cap_mps = max(
+                abs(float(bound))
+                for field in ("lin_vel_x", "lin_vel_y")
+                for bound in getattr(ranges, field)
+            )
+            cruise_speed_mps, path_length_m, traversal_window_s = (
+                _horizon_aware_waypoint_cruise(
+                    predicate_waypoints,
+                    clearance_staging_shifts,
+                    episode_length_s=episode_length_s,
+                    hold_s=hold_s,
+                    max_speed_mps=linear_command_cap_mps,
+                )
+            )
             commands[name] = WaypointVelocityCommandCfg(
                 entity_name=str(getattr(term, "entity_name", "robot")),
                 resampling_time_range=(1_000.0, 1_000.0),
@@ -2225,13 +2315,20 @@ def _reconcile_waypoint_course(
                 tolerance_m=goal_tolerance,
                 clearance_transition_slack_m=(
                     clearance_transition_slack_m),
-                cruise_speed_mps=0.8,
+                cruise_speed_mps=cruise_speed_mps,
                 intermediate_min_speed_scale=0.35,
                 terminal_slow_radius_m=2.0,
             )
             adjustments.append(
                 f"command:{name}→goal-conditioned waypoint traversal "
                 f"with terminal braking")
+            adjustments.append(
+                f"command:{name}→horizon-aware cruise "
+                f"{cruise_speed_mps:.3f} m/s for {path_length_m:.3f} m "
+                f"command path in {traversal_window_s:.3f} s traversal "
+                f"window (episode {episode_length_s:.3f} s, terminal hold "
+                f"{hold_s:.3f} s, command cap "
+                f"{linear_command_cap_mps:.3f} m/s)")
 
     curriculum = getattr(env_cfg, "curriculum", None)
     if isinstance(curriculum, dict):
