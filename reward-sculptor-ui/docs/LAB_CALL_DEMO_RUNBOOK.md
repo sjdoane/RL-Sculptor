@@ -725,3 +725,29 @@ enters every disk and finish in order, has no forbidden contact or fall, and
 holds a default-like upright pose with horizontal, angular, and joint motion
 quiet for 100 uninterrupted post-completion frames. Do not substitute a batch
 rate or an older video for that disclosed-lane proof.
+
+## Iter 25 is improved diagnostic evidence, not final
+
+Iter 25 completed and its physical scene is aligned at `0.00 m`. The official
+trajectory has 60/64 ordered physical route completions, 55/64 contact-free
+lanes, 52/64 satisfying both, and no sustained falls. Ten lanes hold
+horizontal speed for 100 frames and nine also keep angular and joint motion
+quiet, but **0/64** satisfy the default-like posture requirement. Full
+conjunction remains **0/64**.
+
+The disclosed lane 10 (requested and resolved, percentile `0.53125`) is
+contact-free and enters the actual disks at frames
+`[166, 376, 562, 764, 844]`. It achieves 111 uninterrupted velocity-quiet
+post-completion frames, ending at `0.105 m/s` horizontal speed,
+`0.178 rad/s` angular speed, and `0.329 rad/s` joint RMS. Its terminal pose is
+still `0.763 rad` RMS from the robot's own default. The complete video shows
+the real weave followed by a deep squat with raised arms. Do not present it
+as success.
+
+The next runtime uses a strict smooth posture conjunction. It multiplies the
+kinematic stillness score by every available posture factor directly,
+instead of taking their geometric mean and thereby diluting a single bad
+factor. Missing posture signals remain fail-soft; the objective and physical
+task are unchanged. The next UI recovery run must warm-start iter 25, preserve
+the current physical controller/contact/firewall invariants, and prove the
+same disclosed lane's 100-frame posture-qualified hold before promotion.

@@ -351,11 +351,11 @@ def test_terminal_stillness_rejects_motionless_collapse() -> None:
     assert standing.tolist() == [True, True, True]
     assert quiet.tolist() == [True, False, False]
     torch.testing.assert_close(score[0], torch.tensor(1.0))
-    # Posture is a conjunctive gate, not a small additive bonus: a perfectly
-    # motionless but tipped or folded body must not retain most of the terminal
-    # reward and become a stable local optimum.
-    assert score[1].item() < 0.5
-    assert score[2].item() < 0.5
+    # Posture is a strict smooth conjunction, not a small additive bonus or a
+    # geometric mean that dilutes one bad factor: a perfectly motionless but
+    # tipped or folded body must retain less than one fifth of terminal income.
+    assert score[1].item() < 0.2
+    assert score[2].item() < 0.2
 
 
 def test_motion_quality_info_is_reset_safe_and_embodiment_agnostic() -> None:

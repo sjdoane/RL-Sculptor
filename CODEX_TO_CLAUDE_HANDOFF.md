@@ -2726,3 +2726,40 @@ inspect the official all-lane trajectory/objective/fitness artifacts,
 behavior evidence-lane disclosure, lane-10 keyframes and full video, and the
 Results physical-scene audit. Success remains the full physical conjunction;
 iter 24 and every older video remain diagnostic evidence only.
+
+## Iter 25 audit + strict posture conjunction 2026-07-24 (Codex)
+
+UI job `job_65bfa68b72389283` completed iter 25 and preserved checkpoint SHA
+`d5c1f8552626c2cf4c3e5cffef11edc61ccace0c6564a0fbb433f5ea3702f51b`.
+The Results physical-scene audit is `aligned` at `0.00 m`; `behavior.json`
+proves requested and resolved evidence lane 10 with percentile `0.53125`.
+The official first-episode trajectory shows:
+
+- all five actual disks entered in order and index 5 reached: **60/64**;
+- contact-free: **55/64**, with failures by box `[1, 5, 3, 1]`;
+- route plus contact-free: **52/64**;
+- no sustained fall: **64/64** (official `fell_frac=0.0`);
+- 100-frame horizontal hold: **10/64**;
+- 100-frame horizontal/angular/joint-velocity hold: **9/64**;
+- posture-qualified whole-body hold: **0/64**;
+- full physical conjunction: **0/64**.
+
+Lane 10 is aligned, contact-free, and enters the disks at frames
+`[166, 376, 562, 764, 844]`. It holds all three velocity channels quiet for
+111 uninterrupted post-completion frames and terminates at `0.105 m/s`
+horizontal speed, `0.178 rad/s` angular speed, and `0.329 rad/s` joint RMS.
+It nevertheless finishes `0.763 rad` RMS from the articulation's own default
+pose (`0.724 rad` mean over the last 100 frames), with projected-gravity z
+`-0.770`. The keyframes and full 20-second video visibly show a real
+alternating weave around the co-located boxes followed by a deep squat with
+raised arms. Iter 25 is diagnostic, not showcase success.
+
+The residual runtime issue is generic. Multiplying by the **geometric mean**
+of uprightness and default-pose factors still takes a square root when both
+signals are available, diluting one bad factor enough for a folded but quiet
+body to retain a large terminal income. The corrected terminal term uses the
+strict smooth **product** of all available posture factors. One failing
+factor can no longer be hidden by a moderately good one; missing posture
+signals remain fail-soft. No robot/task/object/prompt name, frozen evaluator,
+world geometry, route, tolerance, contact rule, hold duration, or metric
+channel changes.

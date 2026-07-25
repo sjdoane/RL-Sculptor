@@ -1185,17 +1185,19 @@ def _authored_terminal_stillness_state(
         + 0.25 * torch.exp(-torch.square(angular_speed / float(ang_std)))
         + 0.15 * torch.exp(-torch.square(joint_rms / float(joint_std)))
     )
-    posture_product = torch.ones_like(score)
-    posture_factor_count = 0
+    posture_factor = torch.ones_like(score)
+    posture_signal_available = False
 
     # A motionless collapse is not an authored upright hold.  Projected
     # gravity and the articulation's own default joint pose are generic
     # posture references available on every floating-base locomotion robot;
     # no embodiment or task identifier is involved.  Gate the kinematic score
-    # by the geometric mean of the available posture scores: an additive
-    # posture bonus let a perfectly motionless collapse retain most of the
-    # terminal reward and form a strong local optimum.  Missing signals remain
-    # fail-soft for fixed-base/custom adapters, preserving their old behavior.
+    # by the product of every available posture score.  This is a smooth
+    # conjunction: the former geometric mean diluted a single failing posture
+    # factor (for example a folded articulation under a moderately upright
+    # torso), leaving enough terminal income to form a stable crouch optimum.
+    # Missing signals remain fail-soft for fixed-base/custom adapters,
+    # preserving their old behavior.
     projected_gravity = getattr(data, "projected_gravity_b", None)
     if (
         projected_gravity is not None
@@ -1207,8 +1209,8 @@ def _authored_terminal_stillness_state(
         upright_score = torch.exp(
             -torch.square((gravity_z + 1.0) / float(upright_std))
         )
-        posture_product *= upright_score
-        posture_factor_count += 1
+        posture_factor *= upright_score
+        posture_signal_available = True
         whole_body_quiet &= gravity_z < float(upright_z_max)
 
     joint_pos = getattr(data, "joint_pos", None)
@@ -1225,14 +1227,10 @@ def _authored_terminal_stillness_state(
         pose_score = torch.exp(
             -torch.square(joint_pos_rms / float(joint_pos_std))
         )
-        posture_product *= pose_score
-        posture_factor_count += 1
+        posture_factor *= pose_score
+        posture_signal_available = True
         whole_body_quiet &= joint_pos_rms < float(joint_pos_tolerance)
-    if posture_factor_count:
-        posture_factor = torch.pow(
-            torch.clamp(posture_product, min=1e-12),
-            1.0 / float(posture_factor_count),
-        )
+    if posture_signal_available:
         score *= posture_factor
     return standing, score, horizontal_speed, whole_body_quiet
 
@@ -2352,8 +2350,8 @@ def _cmd_train(args: argparse.Namespace) -> None:
         if terminal_standing:
             print(
                 "[runner] installed authored terminal continuity-aware "
-                "whole-body stillness supervision with multiplicative "
-                "posture gate at weight "
+                "whole-body stillness supervision with strict multiplicative "
+                "posture conjunction at weight "
                 f"{terminal_stillness_weight:g}, "
                 f"hold_s {terminal_hold_s:g}, continuity scale "
                 f"{_SCULPTOR_TERMINAL_CONTINUITY_SCALE:g}",
