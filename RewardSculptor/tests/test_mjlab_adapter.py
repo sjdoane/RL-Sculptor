@@ -182,12 +182,13 @@ def test_authored_forbidden_contact_supervision_uses_compiled_sensors() -> None:
     assert penalty.tolist() == [0.0, 1.0, 1.0]
 
 
-def test_clearance_stage_reward_firewall_is_per_env_and_capability_gated() -> None:
+def test_clearance_maneuver_reward_firewall_is_per_env_and_capability_gated(
+) -> None:
     torch = pytest.importorskip("torch")
 
     from sculptor.adapters._mjlab_runner import (
-        _apply_clearance_stage_reward_firewall,
-        _clearance_stage_primary_scale,
+        _apply_clearance_maneuver_reward_firewall,
+        _clearance_maneuver_primary_scale,
     )
 
     command = SimpleNamespace(
@@ -217,8 +218,11 @@ def test_clearance_stage_reward_firewall_is_per_env_and_capability_gated() -> No
         command_manager=CommandManager(),
     )
 
-    scale = _clearance_stage_primary_scale(env)
-    assert scale.tolist() == [0.0, 1.0, 1.0, 0.0, 1.0]
+    scale = _clearance_maneuver_primary_scale(env)
+    # Both the outside approach and the through-disk traversal are command-only
+    # phases around the same immutable predicate. Predicate-centered generated
+    # shaping remains withheld until that predicate advances.
+    assert scale.tolist() == [0.0, 0.0, 1.0, 0.0, 1.0]
 
     rewards = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0])
     components = {
@@ -228,16 +232,16 @@ def test_clearance_stage_reward_firewall_is_per_env_and_capability_gated() -> No
         "metadata": "unchanged",
     }
     scaled_rewards, scaled_components = (
-        _apply_clearance_stage_reward_firewall(
+        _apply_clearance_maneuver_reward_firewall(
             env, rewards, components))
 
-    assert scaled_rewards.tolist() == [0.0, 2.0, 3.0, 0.0, 5.0]
+    assert scaled_rewards.tolist() == [0.0, 0.0, 3.0, 0.0, 5.0]
     assert scaled_components["dense"].tolist() == [
-        0.0, 2.0, 3.0, 0.0, 5.0,
+        0.0, 0.0, 3.0, 0.0, 5.0,
     ]
     assert scaled_components["matrix"].tolist() == [
         [0.0, 0.0],
-        [2.0, 12.0],
+        [0.0, 0.0],
         [3.0, 13.0],
         [0.0, 0.0],
         [5.0, 15.0],
@@ -253,7 +257,8 @@ def test_clearance_stage_reward_firewall_is_per_env_and_capability_gated() -> No
             active_terms=(),
         ),
     )
-    assert _clearance_stage_primary_scale(plain_env).tolist() == [1.0, 1.0]
+    assert _clearance_maneuver_primary_scale(
+        plain_env).tolist() == [1.0, 1.0]
 
 
 def test_authored_terminal_stillness_is_dense_and_phase_gated() -> None:

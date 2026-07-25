@@ -3057,3 +3057,49 @@ run intermediate GPU audits or edit reload-watched core while iter 29 is
 alive. On completion, preserve the checkpoint and judge only the official
 all-lane artifacts plus the disclosed lane's keyframes/full video and Results
 scene audit against the complete physical conjunction.
+
+## Iter 29 audit + full clearance-maneuver firewall 2026-07-25 (Codex)
+
+UI job `job_2ebcb47d3cee200f` completed iter 29 and preserved its checkpoint.
+The Results physical-scene audit is `aligned` with `0.00 m` maximum error,
+realism is `ok`, and `behavior.json` proves requested/resolved precommitted
+lane 10 at percentile `0.546875`. The immutable evidence rejects this policy:
+
+- ordered route completion and authored success: **0/64**;
+- maximum-index distribution: `{0: 41, 1: 1, 2: 21, 4: 1}`;
+- forbidden-contact-free: **63/64** (six box-2 contact frames in lane 0);
+- sustained-fall-free: **64/64**;
+- 100-frame horizontal, velocity, posture-qualified, and full-conjunction
+  holds: **0/64**;
+- objective fitness `0.00000`, progress `0.27111`, terminal-speed aggregate
+  `0.12258 m/s`.
+
+Lane 10 is contact-free and enters the actual first authored zone at frame
+121, but its minimum frozen-predicate distance is `0.3533 m` against the
+unchanged `0.3500 m` tolerance. It therefore never advances even waypoint 1,
+ends `6.208 m` from finish, and has no post-completion hold. The full
+20-second video shows the robot approach the first co-located box, move onto
+the safe side of it, and park there for the remaining horizon. It is not a
+weave-and-stop and must never be presented as success.
+
+The direct contact channels override the generated diagnosis's visual
+contact inference for lane 10: all four lane-10 channels are false. Its
+reward-basin diagnosis is otherwise consistent with the trace. The existing
+firewall withheld predicate-centered generated shaping only during the
+outside approach stage, then restored that shaping while the typed command
+was still deliberately traversing the obstacle-safe chord into the disk.
+That gives the policy contradictory credit during one command-only maneuver
+and explains the stable just-outside parking equilibrium.
+
+The generic correction extends the typed, per-environment firewall through
+both safe approach and safe traversal, ending only when the immutable
+waypoint predicate advances. Authored linear/angular command supervision,
+direct forbidden-contact supervision, survival, and realism remain active;
+the task predicate, tolerance, route, robot capability, and generated reward
+are unchanged. No robot, task, object, or prompt name is used.
+
+Focused compiler + adapter verification is **70 passed**. Scoped Ruff
+(`F,E9`), compileall, and diff check pass. The next UI recovery should
+warm-start iter 26 (the last checkpoint with seven real full-conjunction
+lanes), restore the exact promoted reward v20/env v21 tuple, and prove the
+same complete physical conjunction on the newly precommitted evidence lane.

@@ -679,7 +679,7 @@ def _build_sculptor_term_class(
             rewards, _components = self._mod.compute_reward_batched(
                 self._prev, action, state, info
             )
-            rewards, _components = _apply_clearance_stage_reward_firewall(
+            rewards, _components = _apply_clearance_maneuver_reward_firewall(
                 env, rewards, _components)
             # §7.1 / §7.2: feed the module-level component sink when
             # training has enabled it. No-op when `_COMPONENT_SINK is None`,
@@ -995,15 +995,16 @@ def _authored_forbidden_contact_penalty(
     return found_any.to(dtype=torch.float32)
 
 
-def _clearance_stage_primary_scale(env: Any) -> Any:
-    """Return a per-environment firewall for command-only clearance stages.
+def _clearance_maneuver_primary_scale(env: Any) -> Any:
+    """Return a per-environment firewall for command-only clearance maneuvers.
 
     The authored task predicate remains immutable, while a capable command
-    term may temporarily target an obstacle-safe approach point outside that
-    predicate. Generated rewards only observe predicate-centered channels and
-    therefore cannot distinguish this intentional phase from failure to
-    approach the raw goal. Detect the command capability itself and suppress
-    only the conflicting generated reward until its approach stage completes.
+    term may temporarily target obstacle-safe approach and traversal points
+    around that predicate. Generated rewards only observe predicate-centered
+    channels and therefore cannot distinguish either intentional phase from
+    failure to approach the raw goal. Detect the command capability itself and
+    suppress only the conflicting generated reward until the immutable
+    predicate advances to the next waypoint.
 
     This is intentionally based on typed runtime state, never an embodiment,
     simulator task id, or prompt-specific name.
@@ -1021,7 +1022,6 @@ def _clearance_stage_primary_scale(env: Any) -> Any:
             term = manager.get_term(name)
             shifts = getattr(term, "_clearance_shifts")
             waypoint_index = getattr(term, "_waypoint_index")
-            stage_complete = getattr(term, "_clearance_stage_complete")
         except (AttributeError, KeyError, RuntimeError):
             continue
 
@@ -1034,12 +1034,7 @@ def _clearance_stage_primary_scale(env: Any) -> Any:
             continue
         waypoint_index = torch.as_tensor(
             waypoint_index, device=env.device, dtype=torch.long)
-        stage_complete = torch.as_tensor(
-            stage_complete, device=env.device, dtype=torch.bool)
-        if (
-            tuple(waypoint_index.shape) != tuple(scale.shape)
-            or tuple(stage_complete.shape) != tuple(scale.shape)
-        ):
+        if tuple(waypoint_index.shape) != tuple(scale.shape):
             continue
 
         valid = (
@@ -1051,24 +1046,24 @@ def _clearance_stage_primary_scale(env: Any) -> Any:
         active_shifts = shifts.to(
             device=env.device, dtype=torch.float32)[active_index, :2]
         adjusted = torch.linalg.norm(active_shifts, dim=-1) > 1e-6
-        stage_active = valid & adjusted & ~stage_complete
+        maneuver_active = valid & adjusted
         scale = torch.where(
-            stage_active,
+            maneuver_active,
             torch.full_like(scale, _CLEARANCE_STAGE_PRIMARY_SCALE),
             scale,
         )
     return scale
 
 
-def _apply_clearance_stage_reward_firewall(
+def _apply_clearance_maneuver_reward_firewall(
     env: Any,
     rewards: Any,
     components: Any,
 ) -> tuple[Any, Any]:
-    """Scale generated reward outputs to match active clearance-stage truth."""
+    """Scale generated rewards to match active clearance-maneuver truth."""
     import torch
 
-    scale = _clearance_stage_primary_scale(env)
+    scale = _clearance_maneuver_primary_scale(env)
 
     def _scale_per_env(value: Any) -> Any:
         if (
@@ -2372,10 +2367,11 @@ def _cmd_train(args: argparse.Namespace) -> None:
                 getattr(world_bundle, "runtime_adjustments", ()) or ())
         ):
             print(
-                "[runner] installed clearance-stage reward firewall: "
-                "predicate-centered generated reward withheld during "
-                "command-only safe approach; command/contact/survival "
-                "supervision remains active",
+                "[runner] installed clearance-maneuver reward firewall: "
+                "predicate-centered generated reward withheld through "
+                "command-only safe approach and traversal until the frozen "
+                "waypoint advances; command/contact/survival supervision "
+                "remains active",
                 file=sys.stderr,
                 flush=True,
             )

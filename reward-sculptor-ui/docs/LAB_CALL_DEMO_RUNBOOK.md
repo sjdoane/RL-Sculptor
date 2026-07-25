@@ -966,3 +966,49 @@ and artifacts to prove scene alignment, visible alternating physical-box
 traversal, all actual disks plus finish in order, index 5, zero contact, no
 fall, upright/default-like posture, terminal horizontal speed below
 `0.12 m/s`, and 100 uninterrupted post-completion whole-body-quiet frames.
+
+## Iter 28 and iter 29 remain diagnostic-only
+
+Iter 28 is aligned and contact-free in all 64 lanes, but no lane completes
+the route. The disclosed lane enters only the first two physical waypoint
+zones, stops near waypoint 3, and never reaches finish. Its old `0.025 m`
+inside target left measured predicate misses of `0.3514 m` and `0.3547 m`
+against the immutable `0.3500 m` tolerance.
+
+Iter 29 retested from iter 26 with a `0.050 m` inside target. Its scene is
+also exactly aligned and 63/64 lanes are contact-free, but it again produces
+0/64 route completions and 0 holds. The maximum-index distribution is
+`{0: 41, 1: 1, 2: 21, 4: 1}`. Lane 10 is contact-free, reaches the first
+actual zone at frame 121, then parks just outside its frozen predicate at a
+minimum distance of `0.3533 m`. The complete video is a first-box approach
+followed by stasis, not a weave.
+
+Objective fitness is correctly `0.00000`: success is conjunctive, and no lane
+has route completion, finish entry, or the 100-frame hold. The physical-scene
+audit remains `aligned` at `0.00 m`; layout is not the failure. Ignore the
+generated diagnosis's lane-10 visual-contact inference because all four
+official lane-10 contact channels are false.
+
+## Next proof: firewall the complete safe clearance maneuver
+
+The controller has one generic reward conflict left. Predicate-centered
+generated reward is withheld while the robot approaches the command-only
+outside stage, but was restored immediately after that stage even though the
+typed controller was still traversing its obstacle-safe chord into the
+immutable disk. The policy can therefore earn contradictory shaping by
+parking just outside the predicate.
+
+The corrected per-environment firewall remains active for both approach and
+traversal, and ends only when the frozen waypoint predicate advances.
+Authored linear/angular command reward, direct contact supervision, survival,
+and realism stay active throughout. The disk, tolerance, physical objects,
+robot capability, and generated reward are unchanged, and the implementation
+contains no robot/task/object-name branch.
+
+Focused compiler + adapter suites pass **70 tests**. Scoped Ruff (`F,E9`),
+compileall, and diff check pass. Commit this slice, then launch the next proof
+through **New run → Advanced** with exact promoted reward v20/env v21,
+actor+critic warm start from iter 26, one 750-PPO cycle, 1,024 CUDA
+environments, seed 42, two 1,000-step 1920×1080 episodes, Auto,
+`gen_003` observe-only, and a precommitted evidence lane. Final acceptance
+remains the complete physical conjunction, never visual plausibility alone.
