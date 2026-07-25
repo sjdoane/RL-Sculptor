@@ -570,3 +570,21 @@ fully conjunctive: the disclosed video lane and official batch evidence must
 show the aligned physical boxes, ordered weave and finish, zero forbidden
 contact, no sustained fall, upright posture, terminal horizontal speed below
 `0.12 m/s`, and 100 uninterrupted post-completion whole-body-quiet frames.
+
+Current proof run: UI job `job_0102595ce1cf9e61`, iter 23, clean launch
+commit `6ebc857`, selection v32 / tuple
+`014c62f4757b1e91d8689afcddd568cd85a8d699778154d22729c8b5a70397fd`.
+It uses reward v18 SHA `48c34c86b939d332...`, env v19 SHA
+`84c9a5ff58c12ffb...`, and explicitly loads actor plus critic from iter 22
+checkpoint SHA8 `e3c665ec`. The UI command precommits evidence environment
+**10** and preserves the full 64-lane batch evidence.
+
+The live startup log proves the 1.000 m/s horizon schedule for the 12.740 m
+staged path, terminal predicate-boundary braking, 0.268 m typed clearance and
+outside approach stages, unchanged 0.350 m frozen disks, 50/25/25 train-only
+RSI, local-frame physical boxes, four direct contact sensors at `-8`, both
+command weights at `2.0`, the clearance-stage reward firewall, terminal
+whole-body stillness at weight `4`, and entropy coefficient `0.0075`. PPO is
+active on 1,024 environments. Leave the worker alone until it finishes; then
+audit only the official artifacts and the disclosed lane-10 video against the
+complete physical acceptance conjunction above.

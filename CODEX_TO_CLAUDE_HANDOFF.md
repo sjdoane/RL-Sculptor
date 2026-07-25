@@ -2535,3 +2535,44 @@ frozen iter-22 batch and is disclosed in launch/evidence metadata; it does not
 change training or batch scoring. Require startup proof for posture-aware
 terminal stillness, full command/contact/controller invariants, and actor +
 critic warm start before leaving the worker alone.
+
+## Iter 23 precommitted showcase lane live 2026-07-24 (Codex)
+
+The next proof was launched entirely through the ordinary **New run** UI as
+job `job_0102595ce1cf9e61`, under clean code commit `6ebc857`. It is iter 23
+and pins selection v32 / tuple
+`014c62f4757b1e91d8689afcddd568cd85a8d699778154d22729c8b5a70397fd`,
+reward v18 SHA
+`48c34c86b939d332f5c543ca93756d33d21aca9e351e6d5d57c3bfb1d393498d`,
+and env v19 SHA
+`84c9a5ff58c12ffb91755d5afaadb60b67555da35b4b824cb174ad87520014c2`.
+Exact promoted-tuple recovery was off. The worker loaded actor and critic from
+`runs/iter_22/checkpoint.pt`, source SHA8 `e3c665ec`.
+
+The UI launch record and live worker command prove one 750-PPO cycle, 1,024
+environments on `cuda:0`, seed 42, two 1,000-step 1920x1080 episodes,
+`gen_003` observe-only, and precommitted evidence environment **10**. Startup
+also proves:
+
+- 1.000 m/s horizon-aware cruise for the 12.740 m staged path and 16.000 s
+  traversal window, plus terminal predicate-boundary braking;
+- 0.268 m typed embodiment clearance, outside approach stages, and unchanged
+  0.350 m frozen predicate disks;
+- train-only 50% entrance / 25% collision-local interior / 25% terminal
+  approach RSI;
+- all four physical boxes at nominal local pose plus environment origin;
+- four compiled forbidden-contact sensors at weight `-8`;
+- full `track_linear_velocity` and `track_angular_velocity` weights `2.0`;
+- clearance-stage reward firewall and terminal whole-body stillness weight
+  `4`;
+- entropy coefficient `0.0075` from env v19.
+
+PPO is active. Do not edit reload-watched core or run an intermediate GPU
+audit. Let iter 23 finish and preserve its checkpoint, then inspect the
+official all-lane trajectory/fitness, precommitted lane-10 keyframes and full
+video, `behavior.json` lane disclosure, and Results physical-scene audit.
+Acceptance remains fully conjunctive: tight scene alignment, visible ordered
+weaving around the actual boxes, every waypoint and finish entered, index 5,
+zero forbidden contact, no sustained fall, upright/default-like posture,
+terminal horizontal speed below `0.12 m/s`, and 100 uninterrupted
+post-completion frames of horizontal, angular, joint, and posture quiet.
