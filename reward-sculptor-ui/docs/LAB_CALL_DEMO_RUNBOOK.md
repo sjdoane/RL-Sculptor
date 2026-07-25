@@ -1012,3 +1012,28 @@ actor+critic warm start from iter 26, one 750-PPO cycle, 1,024 CUDA
 environments, seed 42, two 1,000-step 1920×1080 episodes, Auto,
 `gen_003` observe-only, and a precommitted evidence lane. Final acceptance
 remains the complete physical conjunction, never visual plausibility alone.
+
+## Live proof: iter 30 full clearance-maneuver firewall
+
+UI job `job_8d340a6c65c057f4` is running iter 30 from clean commit
+`a3d21d4efd2b92edc5a283cd0b18d0e2d2295148`. Selection v39 pins the exact
+promoted reward v20/environment v21 tuple. The UI proves actor and critic
+loaded from iter 26 checkpoint SHA8 `d5a35ae6`, and the corrected runtime
+reports that predicate-centered generated shaping is withheld through both
+the command-only safe approach and traversal until each immutable waypoint
+advances.
+
+All physical invariants remain installed: the four typed `0.268 m`
+obstacle-away entries with `0.100 m` outside stages and safe through-disk
+targets, local-frame boxes, four direct contact sensors at weight -8, full
+linear/angular command supervision, 50/25/25 train-only RSI, 1.000 m/s
+horizon cruise, 2.000 m terminal brake to at most 0.050 m/s, strict-product
+whole-body terminal stillness at weight 4, and entropy `0.01`.
+
+This is an Auto run with one 750-PPO cycle, 1,024 CUDA environments, seed 42,
+two 1,000-step 1920×1080 episodes, exact promoted recovery on, precommitted
+evidence lane 10, and `gen_003` observe-only. Leave the live worker and
+reload-watched core untouched. After it stops, require the official scene
+audit, all-lane trajectory/fitness, and lane-10 keyframes/full video to prove
+the entire aligned, ordered, contact-free, no-fall, upright, terminal-speed,
+and uninterrupted 100-frame whole-body-hold conjunction.

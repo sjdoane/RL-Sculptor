@@ -3103,3 +3103,32 @@ Focused compiler + adapter verification is **70 passed**. Scoped Ruff
 warm-start iter 26 (the last checkpoint with seven real full-conjunction
 lanes), restore the exact promoted reward v20/env v21 tuple, and prove the
 same complete physical conjunction on the newly precommitted evidence lane.
+
+## Iter 30 live full-maneuver-firewall recovery 2026-07-25 (Codex)
+
+UI New Run job `job_8d340a6c65c057f4` is running iter 30 from clean commit
+`a3d21d4efd2b92edc5a283cd0b18d0e2d2295148`. The UI emitted
+`promoted_tuple_restored`; selection v39 pins the exact promoted tuple
+`95afc97b6000593eab01c8e7b374b71dbf20f6e75e647008d322f8270b0b88c7`,
+reward v20, and env v21. `warm_start_checkpoint_resolved`, `iter_started`,
+and `warm_start_loaded` prove explicit actor+critic recovery from iter 26
+checkpoint SHA8 `d5a35ae6`.
+
+Startup output proves the new generic clearance-maneuver firewall is active:
+predicate-centered generated shaping is withheld through both the safe
+outside approach and the safe traversal until the frozen waypoint advances.
+Authored command, direct contact, and survival supervision remain active. The
+worker also retains all four typed `0.268 m` obstacle-away entries, their
+`0.100 m` outside stages and `0.050 m`-inside safe chord targets, four contact
+sensors at weight -8, full linear/angular command weights 2, 1.000 m/s
+horizon cruise, 2.000 m terminal braking to at most 0.050 m/s, 50/25/25
+train-only RSI, local-frame boxes, strict-product whole-body stillness at
+weight 4, and entropy `0.01`.
+
+Launch settings are Auto, exact promoted recovery on, one 750-PPO cycle,
+1,024 environments on `cuda:0`, seed 42, two 1,000-step 1920x1080 episodes,
+precommitted evidence lane 10, and `gen_003` observe-only. Do not run an
+intermediate GPU audit or edit reload-watched core while iter 30 is alive.
+After checkpoint preservation, require the official all-lane artifacts,
+disclosed lane-10 keyframes/full video, and Results scene audit to prove the
+complete physical conjunction before promotion.
