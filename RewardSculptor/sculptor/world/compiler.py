@@ -574,9 +574,31 @@ def _waypoint_velocity_command_types() -> tuple[type[Any], type[Any]]:
                 min=float(self.cfg.intermediate_min_speed_scale),
                 max=1.0,
             )
+            if bool(self.cfg.terminal_stop_at_predicate_boundary):
+                # A terminal dwell begins at the immutable predicate boundary,
+                # not at its center. Constant-deceleration braking gives the
+                # physically natural v∝sqrt(distance-to-stop) profile: it
+                # preserves useful approach speed yet reaches the boundary at
+                # an authored-standing-compatible crawl instead of issuing a
+                # discontinuous 0.35 m/s → 0 command.
+                distance_to_boundary = torch.clamp(
+                    distance - float(self.cfg.tolerance_m), min=0.0)
+                terminal_scale = torch.sqrt(torch.clamp(
+                    distance_to_boundary
+                    / float(self.cfg.terminal_slow_radius_m),
+                    min=0.0,
+                    max=1.0,
+                ))
+            else:
+                terminal_scale = torch.clamp(
+                    distance / float(self.cfg.terminal_slow_radius_m),
+                    max=1.0,
+                )
             terminal_scale = torch.clamp(
-                distance / float(self.cfg.terminal_slow_radius_m),
-                min=float(self.cfg.terminal_min_speed_scale), max=1.0)
+                terminal_scale,
+                min=float(self.cfg.terminal_min_speed_scale),
+                max=1.0,
+            )
             speed = float(self.cfg.cruise_speed_mps) * torch.where(
                 terminal_target, terminal_scale, normal_scale)
             speed = torch.where(complete, torch.zeros_like(speed), speed)
@@ -634,6 +656,7 @@ def _waypoint_velocity_command_types() -> tuple[type[Any], type[Any]]:
         intermediate_min_speed_scale: float = 0.35
         terminal_slow_radius_m: float = 2.0
         terminal_min_speed_scale: float = 0.35
+        terminal_stop_at_predicate_boundary: bool = False
         turn_gain: float = 2.0
         max_yaw_rate: float = 1.5
 
@@ -1756,6 +1779,7 @@ def reset_robot_along_waypoint_route(
     *,
     waypoints_m: tuple[tuple[float, float, float], ...],
     midroute_probability: float,
+    terminal_fraction_within_midroute: float = 0.0,
     approach_distance_m: tuple[float, float],
     lateral_jitter_m: float,
     asset_name: str = "robot",
@@ -1791,12 +1815,30 @@ def reset_robot_along_waypoint_route(
     selected_env_ids = env_ids[use_midroute]
     if selected_env_ids.numel() == 0:
         return
-    selected_indices = torch.randint(
-        1, points.shape[0],
-        (selected_env_ids.numel(),),
-        device=env.device,
-        dtype=torch.long,
-    )
+    terminal_fraction = min(
+        1.0, max(0.0, float(terminal_fraction_within_midroute)))
+    if terminal_fraction > 0.0 and points.shape[0] > 2:
+        # Dwell objectives need deliberate exposure to the qualitatively
+        # different terminal phase. Preserve half of all resets at the course
+        # entrance, then split the mid-route half between interior recovery
+        # and terminal approach. Sampling the whole suffix uniformly made the
+        # terminal share shrink as routes gained more waypoints.
+        selected_indices = torch.randint(
+            1, points.shape[0] - 1,
+            (selected_env_ids.numel(),),
+            device=env.device,
+            dtype=torch.long,
+        )
+        terminal_reset = torch.rand(
+            selected_env_ids.numel(), device=env.device) < terminal_fraction
+        selected_indices[terminal_reset] = points.shape[0] - 1
+    else:
+        selected_indices = torch.randint(
+            1, points.shape[0],
+            (selected_env_ids.numel(),),
+            device=env.device,
+            dtype=torch.long,
+        )
     starts[selected_env_ids] = selected_indices
 
     target = points[selected_indices, :2]
@@ -2195,6 +2237,17 @@ def _reconcile_waypoint_course(
         ) or 0.25
     except (TypeError, ValueError):
         goal_tolerance = 0.25
+    termination = manifest.task_shared.get("termination", {})
+    success = goal.get("success", {})
+    try:
+        episode_length_s = float(
+            termination.get("episode_length_s", 20.0))
+    except (AttributeError, TypeError, ValueError):
+        episode_length_s = 20.0
+    try:
+        hold_s = float(success.get("hold_s", 0.0))
+    except (AttributeError, TypeError, ValueError):
+        hold_s = 0.0
     clearance_stage_outside_margin_m = 0.10
     clearance_transition_slack_m = 0.025
     clearance_staging_shifts = _clearance_staging_waypoint_shifts(
@@ -2247,15 +2300,25 @@ def _reconcile_waypoint_course(
                 params={
                     "waypoints_m": staging_waypoints,
                     "midroute_probability": 0.5,
+                    "terminal_fraction_within_midroute": (
+                        0.5 if hold_s > 0.0 else 0.0
+                    ),
                     "approach_distance_m": (0.25, 0.55),
                     "lateral_jitter_m": 0.12,
                     "asset_name": "robot",
                 },
             )
-            adjustments.append(
-                "event:world_route_state_initialization→50% entrance / "
-                "50% collision-local route starts (train only)"
-            )
+            if hold_s > 0.0:
+                adjustments.append(
+                    "event:world_route_state_initialization→50% entrance / "
+                    "25% collision-local interior / 25% terminal-approach "
+                    "starts (train only)"
+                )
+            else:
+                adjustments.append(
+                    "event:world_route_state_initialization→50% entrance / "
+                    "50% collision-local route starts (train only)"
+                )
 
     commands = getattr(env_cfg, "commands", None)
     if isinstance(commands, dict):
@@ -2271,17 +2334,6 @@ def _reconcile_waypoint_course(
             ranges.ang_vel_z = (-1.5, 1.5)
             if hasattr(ranges, "heading"):
                 ranges.heading = None
-            termination = manifest.task_shared.get("termination", {})
-            success = goal.get("success", {})
-            try:
-                episode_length_s = float(
-                    termination.get("episode_length_s", 20.0))
-            except (AttributeError, TypeError, ValueError):
-                episode_length_s = 20.0
-            try:
-                hold_s = float(success.get("hold_s", 0.0))
-            except (AttributeError, TypeError, ValueError):
-                hold_s = 0.0
             linear_command_cap_mps = max(
                 abs(float(bound))
                 for field in ("lin_vel_x", "lin_vel_y")
@@ -2317,7 +2369,15 @@ def _reconcile_waypoint_course(
                     clearance_transition_slack_m),
                 cruise_speed_mps=cruise_speed_mps,
                 intermediate_min_speed_scale=0.35,
-                terminal_slow_radius_m=2.0,
+                terminal_slow_radius_m=(
+                    1.0 if hold_s > 0.0 else 2.0
+                ),
+                terminal_min_speed_scale=(
+                    min(0.35, 0.10 / max(cruise_speed_mps, 1e-6))
+                    if hold_s > 0.0
+                    else 0.35
+                ),
+                terminal_stop_at_predicate_boundary=hold_s > 0.0,
             )
             adjustments.append(
                 f"command:{name}→goal-conditioned waypoint traversal "
@@ -2329,6 +2389,12 @@ def _reconcile_waypoint_course(
                 f"window (episode {episode_length_s:.3f} s, terminal hold "
                 f"{hold_s:.3f} s, command cap "
                 f"{linear_command_cap_mps:.3f} m/s)")
+            if hold_s > 0.0:
+                adjustments.append(
+                    f"command:{name}→terminal boundary braking "
+                    f"(entry command ≤{0.10:.3f} m/s, "
+                    f"{1.0:.3f} m constant-deceleration span)"
+                )
 
     curriculum = getattr(env_cfg, "curriculum", None)
     if isinstance(curriculum, dict):

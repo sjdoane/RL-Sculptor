@@ -3110,6 +3110,8 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
     joint_torque_buf: list[np.ndarray] = []
     projected_gravity_b_buf: list[np.ndarray] = []
     root_link_pos_w_buf: list[np.ndarray] = []
+    root_link_lin_vel_b_buf: list[np.ndarray] = []
+    root_link_ang_vel_b_buf: list[np.ndarray] = []
     # §Metric-quality laws (LAW 3/4): per-foot ground contact + foot position
     # in the pelvis frame, persisted to the metric arrays so an objective
     # metric can measure signed forward-kick DIRECTION (anterior foot
@@ -3279,6 +3281,12 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
             rp = _tensor_to_np(getattr(d, "root_link_pos_w", None))
             if rp is not None:
                 root_link_pos_w_buf.append(rp)
+            rlv = _tensor_to_np(getattr(d, "root_link_lin_vel_b", None))
+            if rlv is not None:
+                root_link_lin_vel_b_buf.append(rlv)
+            rav = _tensor_to_np(getattr(d, "root_link_ang_vel_b", None))
+            if rav is not None:
+                root_link_ang_vel_b_buf.append(rav)
             # §Metric-quality laws (LAW 3/4): per-foot contact + pelvis-frame
             # foot position. Each signal is independently guarded so a missing
             # sensor/site degrades to "field absent" (an empty buf is dropped
@@ -3467,6 +3475,8 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
         ("actuator_force", actuator_force_buf),
         ("projected_gravity_b", projected_gravity_b_buf),
         ("root_link_pos_w", root_link_pos_w_buf),
+        ("root_link_lin_vel_b", root_link_lin_vel_b_buf),
+        ("root_link_ang_vel_b", root_link_ang_vel_b_buf),
         ("left_foot_contact", left_foot_contact_buf),
         ("right_foot_contact", right_foot_contact_buf),
         ("left_foot_pos_b", left_foot_pos_b_buf),

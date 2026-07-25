@@ -234,7 +234,7 @@ def test_explicit_waypoint_zones_align_commands_without_materialized_course() ->
         task_shared={"goal": {
             "type": "waypoint_sequence",
             "waypoints": ["waypoint_01", "finish"],
-            "success": {"tolerance_m": 0.35},
+            "success": {"tolerance_m": 0.35, "hold_s": 2.0},
         }},
         course=(),
         zones={
@@ -263,10 +263,17 @@ def test_explicit_waypoint_zones_align_commands_without_materialized_course() ->
     route_rsi = env_cfg.events["world_route_state_initialization"]
     assert route_rsi.mode == "reset"
     assert route_rsi.params["midroute_probability"] == 0.5
+    assert route_rsi.params["terminal_fraction_within_midroute"] == 0.5
+    assert routed.terminal_stop_at_predicate_boundary is True
+    assert routed.terminal_slow_radius_m == pytest.approx(1.0)
+    assert (
+        routed.cruise_speed_mps * routed.terminal_min_speed_scale
+        <= 0.10 + 1e-9
+    )
     assert "command_vel" not in env_cfg.curriculum
     assert any("goal-conditioned waypoint traversal" in item
                for item in adjustments)
-    assert any("collision-local route starts" in item
+    assert any("collision-local interior" in item
                for item in adjustments)
 
 
@@ -366,6 +373,8 @@ def test_forbidden_object_waypoint_uses_embodiment_clearance_subtarget() -> None
     assert routed.clearance_transition_slack_m == pytest.approx(0.025)
     assert routed.clearance_stage_capture_radius_m == pytest.approx(0.15)
     assert routed.intermediate_min_speed_scale == pytest.approx(0.35)
+    assert routed.terminal_stop_at_predicate_boundary is False
+    assert routed.terminal_min_speed_scale == pytest.approx(0.35)
     assert any("outside approach stage" in item
                for item in adjustments)
     assert any("frozen 0.350 m task-disk entry" in item
@@ -630,6 +639,19 @@ def test_route_rsi_places_robot_before_sampled_local_waypoint() -> None:
     assert torch.all(distances <= 0.58)
     assert torch.all(robot.written[:, 7:13] == 0)
 
+    torch.manual_seed(5)
+    reset_robot_along_waypoint_route(
+        env,
+        None,
+        waypoints_m=waypoints,
+        midroute_probability=1.0,
+        terminal_fraction_within_midroute=1.0,
+        approach_distance_m=(0.25, 0.55),
+        lateral_jitter_m=0.12,
+    )
+    assert torch.all(
+        env._sculptor_waypoint_start_index == len(waypoints) - 1)
+
 
 def test_waypoint_velocity_command_turns_and_stops_per_environment() -> None:
     """The command follows the active target and zeroes only completed envs."""
@@ -649,7 +671,7 @@ def test_waypoint_velocity_command_turns_and_stops_per_environment() -> None:
         task_shared={"goal": {
             "type": "waypoint_sequence",
             "waypoints": ["left", "right", "finish"],
-            "success": {"tolerance_m": 0.2},
+            "success": {"tolerance_m": 0.2, "hold_s": 2.0},
         }},
         course=(),
         zones={
@@ -688,11 +710,11 @@ def test_waypoint_velocity_command_turns_and_stops_per_environment() -> None:
 
     robot.data.root_link_pos_w[0, :2] = torch.tensor([2.0, -1.0])
     term._update_command()
-    terminal_approach_speed = torch.linalg.norm(term.command[0, :2])
-    assert 0 < terminal_approach_speed < term.cfg.cruise_speed_mps
-    assert term.cfg.terminal_slow_radius_m > term.cfg.slow_radius_m
-    assert terminal_approach_speed >= (
-        term.cfg.cruise_speed_mps * term.cfg.terminal_min_speed_scale)
+    robot.data.root_link_pos_w[0, :2] = torch.tensor([2.79, 0.0])
+    term._update_command()
+    terminal_entry_speed = torch.linalg.norm(term.command[0, :2])
+    assert 0 < terminal_entry_speed <= 0.10 + 1e-6
+    assert term.cfg.terminal_stop_at_predicate_boundary is True
     assert abs(term.command[0, 2]) < term.cfg.max_yaw_rate
     robot.data.root_link_pos_w[0, :2] = torch.tensor([3.0, 0.0])
     term._update_command()

@@ -2417,3 +2417,54 @@ actor+critic warm start from iter 20 SHA8 `c1dbcce9`. PPO is active on 1,024
 environments. Do not edit reload-watched core or run intermediate GPU audits;
 let iter 21 finish, then apply the full physical acceptance conjunction to its
 official first-episode-safe artifacts and full video.
+
+## Iter 21 route breakthrough + terminal-control correction 2026-07-24 (Codex)
+
+UI job `job_ac1eb30cafc3fdee` completed iter 21 and preserved
+`runs/iter_21/checkpoint.pt`. Horizon-aware scheduling produced a large,
+physically real route improvement, but this remains diagnostic evidence:
+
+- physical-scene audit: `aligned`, maximum error `0.00 m`;
+- ordered route + finish: **40/64** (up from 3/64);
+- contact-free: **30/64**; route + contact-free: **18/64**;
+- generated success channel seen: 9/64, only 3/64 contact-free;
+- forbidden-contact counts by box: `[6, 30, 2, 1]`;
+- no 100-frame horizontal or whole-body hold; full conjunction 0/64;
+- rendered env 0 entered all five predicates by 17.64 s, but touched box 2,
+  achieved only a 35-frame horizontal hold / 30-frame joint-quiet lower-bound
+  hold, and visibly kept correcting its stance.
+
+The official full video and keyframes show the actual robot weaving around the
+co-located orange boxes; this is no longer a detached-scene or parking failure.
+Median ordered entries were 4.02, 8.54, 13.24, 16.41, and 18.60 seconds.
+The remaining terminal failure is now causal: the controller commanded a
+minimum `0.35 × cruise = 0.35 m/s` until the exact finish-disk entry frame and
+then discontinuously switched to zero. In training, only half of resets were
+mid-route and those were uniform over four suffix targets, so just 12.5% of
+all resets deliberately exposed terminal approach/standing.
+
+The next generic runtime slice fixes both sides without changing the frozen
+objective:
+
+- authored dwell routes use constant-deceleration
+  `v ∝ sqrt(distance-to-predicate-boundary)` braking over the final 1.0 m;
+- the command reaches the immutable boundary at at most 0.10 m/s, below the
+  standing supervision's 0.12 m/s horizontal threshold, then becomes zero;
+- train-only RSI remains 50% full-course, while the other half is split into
+  25% interior recovery and 25% terminal-approach starts;
+- non-dwell waypoint routes retain the previous controller and RSI behavior;
+- official rollout trajectories now persist root body-frame linear and
+  angular velocity, allowing the uninterrupted whole-body hold to be proven
+  directly alongside joint velocity;
+- task horizon, waypoints, tolerance, hold, metric firewall, contact sensors,
+  evaluation freeze, and atomic tuple are unchanged; no robot/task/object/
+  prompt/simulator-name keying is used.
+
+Verification for this slice: focused compiler/adapter suite **68 passed**;
+scoped Ruff, compileall, and `git diff --check` pass. Iter 21's automatic
+reward-v18 edit again failed syntax validation, while env v18 was authored
+with entropy scale 1.0. The next proof must therefore be a normal UI Resume
+with exact promoted-tuple recovery **off**, reward v17 + env v18, and warm
+start from iter 21. Require startup logs for the 0.10 m/s terminal-boundary
+brake, 50/25/25 phase-balanced RSI, all existing physical alignment/contact/
+firewall invariants, and actor+critic warm start before PPO.

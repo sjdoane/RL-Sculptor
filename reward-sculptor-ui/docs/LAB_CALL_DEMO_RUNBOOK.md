@@ -466,3 +466,51 @@ including the 1.000 m/s horizon-aware schedule, entropy 0.02, and actor+critic
 warm start from iter 20 SHA8 `c1dbcce9`. PPO is active at 1,024 environments.
 Leave the worker alone until it finishes; then audit only official artifacts
 and the full video against the complete acceptance checklist.
+
+## Current authoritative correction after iter 21
+
+Iter 21 is the first run where the scheduling correction materially solved the
+course: **40/64** environments entered all four ordered waypoint predicates
+and the finish, the aligned full video visibly weaves around the real orange
+boxes, and 18/64 combined route completion with zero forbidden contact.
+Physical-scene error remains `0.00 m`. It is still not showcase success:
+30/64 were contact-free, box 2 accounted for 30 contact failures, and no
+environment produced the required uninterrupted 100-frame hold.
+
+The terminal command explains the hold failure. It retained a 0.35 m/s floor
+until finish-disk entry, then jumped to zero; rendered env 0 completed at
+17.64 s but continued whole-body corrections and held horizontally quiet for
+only 35 frames. Uniform mid-route RSI also devoted only 12.5% of all resets to
+the terminal phase.
+
+The corrected generic runtime now:
+
+- brakes with a constant-deceleration square-root profile against distance to
+  the immutable finish-predicate boundary;
+- crosses that boundary at no more than 0.10 m/s and then commands standing;
+- preserves 50% full-route resets and splits the remainder into 25% interior
+  recovery plus 25% terminal-approach resets for authored dwell goals;
+- records root linear and angular velocity in official trajectories, so the
+  2-second whole-body hold can be checked exactly rather than inferred.
+
+No evaluator, task predicate, tolerance, horizon, hold, contact rule, reward
+firewall, or tuple invariant changed. Focused compiler/adapter tests are
+**68 passed**, with Ruff, compileall, and diff checks clean.
+
+Launch the next proof through normal **Resume** with:
+
+- exact promoted-tuple recovery: **off**;
+- reward: v17 (automatic reward v18 failed syntax validation);
+- environment: v18 (entropy coefficient scale 1.0);
+- warm start: iter 21 checkpoint;
+- Auto, one cycle, 750 PPO iterations, 1,024 environments on `cuda:0`;
+- 1,000 episode steps, two rollout episodes, seed 42, 1920×1080;
+- `gen_003` observe-only and no motion prior for this continuation.
+
+Before PPO iteration 0, require the log to report terminal predicate-boundary
+braking with entry command `≤0.100 m/s`, 50/25/25 phase-balanced route RSI,
+the existing 1.000 m/s horizon-aware cruise, actor+critic warm start, aligned
+physical objects, two-phase clearance stages, four direct contact sensors at
+`-8`, full velocity-command weights, terminal whole-body stillness, and the
+clearance-stage reward firewall. Acceptance remains fully conjunctive; never
+present iter 21 as the final result.
