@@ -696,3 +696,32 @@ aligned physical boxes, four direct contact sensors at `-8`, full command
 weights, and clearance reward firewall. Final acceptance remains the full
 physical conjunction; no batch aggregate or visually convincing weave can
 substitute for the disclosed lane's posture-qualified 100-frame hold.
+
+## Live proof: iter 25
+
+The run above is active as UI job `job_65bfa68b72389283`, iter 25, from clean
+captured commit `8a2d451`. The UI resolved Warm-start checkpoint 24 at full
+SHA `c9b0fee59f4898d889d853634535b97e96b0b8830d3d778843e7dc16c4bef238`
+and the worker loaded both actor and critic. Iter 25 pins selection v34 /
+tuple `4d91af1045ed0afa4290b1a3c0b2284ae8e02394c9dce190bb876f9d44329a02`.
+Exact promoted recovery is off; reward v20 and env v20 are authoritative.
+
+The visible startup log confirms:
+
+- terminal stillness uses the multiplicative posture gate at weight 4;
+- env-v20 entropy changes `0.01 -> 0.005`;
+- all four forbidden-contact sensors remain at `-8`;
+- both authored velocity-command terms retain full supervision;
+- the safe-stage reward firewall, two-phase 0.268 m clearance entries,
+  unchanged 0.350 m task disks, 50/25/25 RSI, aligned boxes, 1.000 m/s
+  horizon schedule, and terminal boundary brake remain active;
+- PPO iteration 0/750 is running on 1,024 environments with seed 42, evidence
+  lane 10, two 1,000-step 1920x1080 episodes, Auto, and `gen_003`
+  observe-only.
+
+Leave the live worker untouched. On completion, use Results plus the official
+artifacts to verify lane 10 visibly weaves around the co-located boxes,
+enters every disk and finish in order, has no forbidden contact or fall, and
+holds a default-like upright pose with horizontal, angular, and joint motion
+quiet for 100 uninterrupted post-completion frames. Do not substitute a batch
+rate or an older video for that disclosed-lane proof.

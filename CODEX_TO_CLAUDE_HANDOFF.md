@@ -2695,3 +2695,34 @@ observe-only. Before leaving PPO alone, require actor+critic load from iter
 24 and the new `multiplicative posture gate` startup line alongside every
 existing physical alignment, staged-route, contact, command, RSI, firewall,
 and horizon invariant.
+
+## Iter 25 live posture-conjunction proof 2026-07-24 (Codex)
+
+The next proof is now live, launched entirely through the ordinary UI as job
+`job_65bfa68b72389283`, iter 25. The UI captured clean code commit
+`8a2d451cc7ac3eeeb827be635e3199f504b7e2c9`, kept exact promoted-tuple
+recovery off, selected current reward v20 and env v20, and explicitly
+resolved iter 24 checkpoint SHA
+`c9b0fee59f4898d889d853634535b97e96b0b8830d3d778843e7dc16c4bef238`.
+Iter 25 pins selection v34 / tuple
+`4d91af1045ed0afa4290b1a3c0b2284ae8e02394c9dce190bb876f9d44329a02`.
+
+The visible UI log proves `warm_start_loaded` for both actor and critic from
+iter 24 (SHA8 `c9b0fee5`), `entropy_coef 0.01 -> 0.005`, and active PPO
+iteration 0/750 on 1,024 environments. It also proves the new terminal
+whole-body stillness supervision with **multiplicative posture gate** at
+weight 4, four forbidden-contact sensors at weight -8, full
+`track_linear_velocity` and `track_angular_velocity` supervision, the
+clearance-stage reward firewall, 1.000 m/s horizon-aware schedule, terminal
+predicate-boundary braking, four 0.268 m typed clearance entries with
+outside stages followed by the unchanged 0.350 m task disks, 50/25/25
+train-only RSI, and all physical boxes at nominal local pose plus environment
+origin. The UI settings are one cycle, seed 42, lane 10, two 1,000-step
+1920x1080 episodes, Auto, and `gen_003` observe-only.
+
+Do not edit reload-watched core or run an intermediate GPU audit while the
+iter 25 worker is alive. After it finishes and preserves the checkpoint,
+inspect the official all-lane trajectory/objective/fitness artifacts,
+behavior evidence-lane disclosure, lane-10 keyframes and full video, and the
+Results physical-scene audit. Success remains the full physical conjunction;
+iter 24 and every older video remain diagnostic evidence only.
