@@ -7,7 +7,7 @@ import math
 from pathlib import Path
 from types import SimpleNamespace
 
-import mujoco
+import mujoco  # noqa: F401 - fail collection if the runtime is unavailable
 import numpy as np
 import pytest
 
@@ -265,10 +265,10 @@ def test_explicit_waypoint_zones_align_commands_without_materialized_course() ->
     assert route_rsi.params["midroute_probability"] == 0.5
     assert route_rsi.params["terminal_fraction_within_midroute"] == 0.5
     assert routed.terminal_stop_at_predicate_boundary is True
-    assert routed.terminal_slow_radius_m == pytest.approx(1.0)
+    assert routed.terminal_slow_radius_m == pytest.approx(2.0)
     assert (
         routed.cruise_speed_mps * routed.terminal_min_speed_scale
-        <= 0.10 + 1e-9
+        <= 0.05 + 1e-9
     )
     assert "command_vel" not in env_cfg.curriculum
     assert any("goal-conditioned waypoint traversal" in item
@@ -567,9 +567,20 @@ def test_adjusted_waypoint_stages_then_synchronizes_on_frozen_disk() -> None:
     term._update_command()
     assert term._waypoint_index.item() == 0
     assert term._clearance_stage_complete.item()
-    # Once staged, the command points inward at the immutable disk center.
-    assert term.command[0, 0] > 0
-    assert term.command[0, 1] < 0
+    # Once staged, the command keeps the computed obstacle-away clearance
+    # target inside the immutable disk. The disk itself remains authoritative
+    # for advancement, but the desired path no longer cuts back to its center.
+    safe_target = (
+        torch.tensor(cfg.predicate_waypoints_m[0][:2])
+        + torch.tensor(cfg.clearance_shifts_m[0][:2])
+    )
+    expected_direction = safe_target - stage
+    expected_direction = (
+        expected_direction / torch.linalg.norm(expected_direction)
+    )
+    actual_direction = term.command[0, :2]
+    actual_direction = actual_direction / torch.linalg.norm(actual_direction)
+    torch.testing.assert_close(actual_direction, expected_direction)
 
     robot.data.root_link_pos_w[0, :2] = torch.tensor([2.0, 0.85])
     term._update_command()

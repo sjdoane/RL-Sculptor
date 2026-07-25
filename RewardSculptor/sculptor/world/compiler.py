@@ -545,20 +545,33 @@ def _waypoint_velocity_command_types() -> tuple[type[Any], type[Any]]:
 
             target_index = torch.clamp(self._waypoint_index, max=last)
             target_center = self._predicate_waypoints[target_index, :2]
+            target_clearance_shift = self._clearance_shifts[
+                target_index, :2]
             target_staging_shift = self._clearance_staging_shifts[
                 target_index, :2]
             target_adjusted = (
-                torch.linalg.norm(
-                    self._clearance_shifts[target_index, :2], dim=-1)
+                torch.linalg.norm(target_clearance_shift, dim=-1)
                 > 1e-6
             )
             use_staging_target = (
                 target_adjusted & ~self._clearance_stage_complete & ~complete
             )
-            target = target_center + torch.where(
+            # After capturing the outside stage, keep aiming at the
+            # obstacle-away point already computed inside the authored disk.
+            # Steering at the predicate center here throws that clearance
+            # away and lets a lagging locomotion policy cut the obstacle
+            # corner. Objective truth is still the immutable disk: the raw
+            # predicate advances the command on its first entry, so this safe
+            # in-region target never becomes a second success condition.
+            command_shift = torch.where(
                 use_staging_target[:, None],
                 target_staging_shift,
-                torch.zeros_like(target_staging_shift),
+                target_clearance_shift,
+            )
+            target = target_center + torch.where(
+                target_adjusted[:, None] & ~complete[:, None],
+                command_shift,
+                torch.zeros_like(command_shift),
             )
             delta_w = target - local_xy
             distance = torch.linalg.norm(delta_w, dim=-1)
@@ -1439,7 +1452,7 @@ def _materialize_terrain(
 ) -> dict[str, Any]:
     """Persist buffer-backed generated terrain as exact file-backed assets."""
     import imageio.v3 as iio
-    import mujoco
+    import mujoco  # noqa: F401 - validates/initializes the MuJoCo runtime
 
     output_dir.mkdir(parents=True, exist_ok=True)
     assets = output_dir / "assets"
@@ -1505,7 +1518,7 @@ def compile_world(
     runtime_task_id: str | None = None,
 ) -> CompiledWorld:
     """Validate, build, and freeze one world/task pair on CPU."""
-    import mujoco
+    import mujoco  # noqa: F401 - validates/initializes the MuJoCo runtime
     from mjlab.scene import Scene
 
     world_errors = validate_world_spec(world)
@@ -2369,11 +2382,9 @@ def _reconcile_waypoint_course(
                     clearance_transition_slack_m),
                 cruise_speed_mps=cruise_speed_mps,
                 intermediate_min_speed_scale=0.35,
-                terminal_slow_radius_m=(
-                    1.0 if hold_s > 0.0 else 2.0
-                ),
+                terminal_slow_radius_m=2.0,
                 terminal_min_speed_scale=(
-                    min(0.35, 0.10 / max(cruise_speed_mps, 1e-6))
+                    min(0.35, 0.05 / max(cruise_speed_mps, 1e-6))
                     if hold_s > 0.0
                     else 0.35
                 ),
@@ -2392,8 +2403,8 @@ def _reconcile_waypoint_course(
             if hold_s > 0.0:
                 adjustments.append(
                     f"command:{name}→terminal boundary braking "
-                    f"(entry command ≤{0.10:.3f} m/s, "
-                    f"{1.0:.3f} m constant-deceleration span)"
+                    f"(entry command ≤{0.05:.3f} m/s, "
+                    f"{2.0:.3f} m constant-deceleration span)"
                 )
 
     curriculum = getattr(env_cfg, "curriculum", None)

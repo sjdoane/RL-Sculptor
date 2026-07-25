@@ -2795,3 +2795,72 @@ preservation, inspect the official all-lane artifacts and the disclosed
 lane-10 keyframes/full video. Promotion still requires the complete physical
 conjunction, including 100 uninterrupted post-completion frames of horizontal,
 angular, joint, uprightness, and default-pose quiet inside finish.
+
+## Iter 26 audit + clearance-preserving terminal recovery 2026-07-24 (Codex)
+
+UI job `job_f61191b6d9080217` completed iter 26 and preserved
+`runs/iter_26/checkpoint.pt` at SHA
+`d5a35ae6c0a3f2ca8cc7cc6c5fce076fcb8499cae8e1351c7ed04bd864c54cea`.
+The Results physical-scene audit is `aligned` at `0.00 m`; `behavior.json`
+proves requested/resolved precommitted evidence lane 10 (percentile `0.625`).
+The official first-episode trajectory shows:
+
+- every actual disk entered in order: **64/64**;
+- waypoint index 5 reached: **62/64**;
+- contact-free: **48/64**, with failures by box `[4, 9, 4, 0]`;
+- physical route + index 5 + contact-free: **46/64**;
+- no sustained fall: **64/64**;
+- literal 100-frame horizontal hold: **13/64**;
+- horizontal/angular/joint-velocity hold: **9/64**;
+- posture-qualified whole-body hold: **9/64**;
+- full physical conjunction: **7/64**, lanes
+  `[15, 18, 20, 36, 45, 52, 57]`.
+
+The strict posture product therefore fixed the prior folded-pose basin:
+posture-qualified holds improved from 0 to 9 and the frozen upright channel
+rose from `0.34964` to `0.65013`. The UI fitness remains only `0.18120`
+because it is the 64-lane frozen conjunction, not a score for the rendered
+video alone: completion gate is `20/64`, contact-free fraction `48/64`, and
+only seven lanes satisfy every physical requirement simultaneously.
+
+Lane 10 visibly performs the correct alternating weave around the co-located
+boxes and stops upright-ish inside finish. It enters the real disks at frames
+`[141, 290, 499, 697, 768]` and reaches index 5 at frame `805`. It is still
+diagnostic rather than promotable:
+
+- box 2 contact occurs at frames `389-390`; box 3 contact occurs at frame
+  `590`;
+- root-to-box center distance at those contacts is only `0.396-0.427 m`,
+  proving a physical corner cut rather than detached scene evidence;
+- its uninterrupted posture-qualified terminal streak is frames `927-999`,
+  **73 frames / 1.46 s**, with the last horizontal-speed violation at frame
+  `926`;
+- terminal horizontal speed is `0.0160 m/s`, angular speed `0.175 rad/s`,
+  joint RMS `0.204 rad/s`, projected-gravity z `-0.834`, and default-pose RMS
+  `0.522 rad`.
+
+The residual controller defects are generic and now corrected without
+changing the frozen objective. First, after the outside clearance stage the
+command had discarded its already-computed obstacle-away point and aimed at
+the obstacle-adjacent disk center, inviting a tracking-lag corner cut. It now
+continues toward that safe point **inside the same authored disk**; the raw
+disk-entry predicate remains the sole advancement authority, so no second
+success condition is introduced. Second, terminal constant-deceleration
+braking now spans `2.0 m` instead of `1.0 m` and caps predicate-boundary entry
+command at `0.05 m/s` instead of `0.10 m/s`, giving the learned body time to
+settle before the frozen two-second dwell window. Both rules derive only from
+typed capability geometry, authored forbidden objects, disk predicates, and
+hold semantics; there is no robot, task, object-name, or prompt branch.
+
+Focused verification is **18 passed** in
+`tests/test_world_compiler_gates.py` and **52 passed** in
+`tests/test_mjlab_adapter.py`. Before the next launch, also require scoped
+Ruff (`F,E9`), compileall, and `git diff --check`. The next proof must be an
+ordinary UI New run with exact promoted recovery off, current reward v20 and
+environment v21, explicit Warm-start checkpoint **26**, the same one-cycle
+750-PPO / 1,024-environment / seed-42 / two-episode 1920x1080 settings,
+precommitted evidence lane **10**, Auto, and `gen_003` observe-only. Require
+actor+critic load from the iter 26 SHA plus startup lines proving
+clearance-preserving in-disk targets, `2.0 m`/`0.05 m/s` terminal braking,
+aligned physical boxes, direct contact supervision, full command weights,
+50/25/25 RSI, and the reward firewall before leaving PPO alone.

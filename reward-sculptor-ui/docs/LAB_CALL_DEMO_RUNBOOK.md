@@ -781,3 +781,47 @@ video—to visibly weave around the co-located boxes, enter every disk and
 finish in order, avoid contact and sustained fall, and maintain a default-like
 upright pose with horizontal, angular, and joint motion quiet for 100
 uninterrupted post-completion frames inside finish.
+
+## Iter 26 is visually convincing but not yet promotable
+
+Iter 26 completed and preserved checkpoint SHA
+`d5a35ae6c0a3f2ca8cc7cc6c5fce076fcb8499cae8e1351c7ed04bd864c54cea`.
+The scene audit is aligned at `0.00 m`, every lane enters the five real disks
+in order, 62/64 reach index 5, 48/64 are contact-free, and no lane sustains a
+fall. The strict posture product is a real improvement: nine lanes achieve
+the posture-qualified 100-frame hold and seven satisfy the entire physical
+conjunction. Fitness is nevertheless `0.18120` because it aggregates the
+frozen 64-lane conjunction; it does not grade only the attractive rendered
+lane.
+
+The disclosed lane 10 visibly weaves around the actual boxes and stops in a
+much better upright/default-like pose, but it clips box 2 for two frames and
+box 3 for one frame. Its root is only `0.396-0.427 m` from those box centers,
+showing a physical corner cut. It reaches index 5 at frame `805` and ends
+quiet, but its uninterrupted full-body streak is only frames `927-999`:
+**73 frames / 1.46 seconds**. Never present iter 26 as final success.
+
+The next generic controller recovery keeps the obstacle-away target after an
+outside clearance stage instead of steering back to the unsafe disk center.
+The immutable authored disk still advances the route on first entry, so the
+fix adds no new objective predicate. Terminal boundary braking also starts
+over `2.0 m` and reaches the boundary at at most `0.05 m/s`, providing more
+pre-entry settling time. Focused compiler and adapter suites pass
+**18 + 52 tests**.
+
+Launch the next proof entirely through **New run → Advanced**:
+
+- exact promoted-tuple recovery: **off**;
+- reward/environment: current **v20 / v21**;
+- Warm-start checkpoint: **26**;
+- one cycle, 750 PPO iterations, 1,024 environments on `cuda:0`;
+- 1,000 episode steps, two rollout episodes, seed 42, 1920×1080;
+- Evidence environment: **10**;
+- Auto, `gen_003` observe-only, no new motion prior.
+
+Before leaving the worker alone, require actor and critic load from iter 26,
+the clearance-preserving in-disk target line, `2.0 m` terminal brake with
+`0.05 m/s` boundary command, and all existing aligned-scene, physical-box,
+contact `-8`, full command-weight, 50/25/25 RSI, strict-posture, and firewall
+invariants. Final acceptance remains the disclosed lane's complete physical
+conjunction, not visual plausibility or a batch partial-pass count.
