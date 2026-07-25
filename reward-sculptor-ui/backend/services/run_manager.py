@@ -19,12 +19,12 @@ the fs wins.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
@@ -68,6 +68,51 @@ _ADVERSARIAL_ENABLED = os.getenv("RS_ADVERSARIAL_ARCHETYPES", "1") == "1"
 #: the cmd is built; until then (or if it yields no accepted metric) the run is
 #: blind. Keep in sync with the frontend value in NewRunDialog.tsx / types.ts.
 LAUNCH_GEN_SENTINEL = "generate-at-launch"
+
+
+def _file_sha256(path: Path, *, chunk_size: int = 1 << 20) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def resolve_warm_start_checkpoint(
+    project_dir: Path, iteration: int,
+) -> Path:
+    """Resolve an explicit UI warm-start within this project's run history.
+
+    The UI supplies an iteration number rather than a path. Only a non-empty
+    promoted checkpoint directly under ``runs/iter_N`` is eligible, and
+    symlinks escaping ``runs`` fail closed. ``checkpoint.pt`` is preferred
+    when an adapter left both formats behind.
+    """
+    if isinstance(iteration, bool) or not isinstance(iteration, int):
+        raise TypeError("warm-start iteration must be an integer")
+    if iteration < 0:
+        raise ValueError("warm-start iteration must be non-negative")
+
+    runs_root = (project_dir / "runs").resolve()
+    iter_dir = runs_root / f"iter_{iteration}"
+    for name in ("checkpoint.pt", "checkpoint.zip"):
+        candidate = iter_dir / name
+        try:
+            resolved = candidate.resolve(strict=True)
+        except FileNotFoundError:
+            continue
+        try:
+            resolved.relative_to(runs_root)
+        except ValueError as exc:
+            raise ValueError(
+                f"warm-start checkpoint escapes project runs: {candidate}"
+            ) from exc
+        if resolved.is_file() and resolved.stat().st_size > 0:
+            return resolved
+
+    raise FileNotFoundError(
+        f"no non-empty checkpoint.pt or checkpoint.zip for iter_{iteration}"
+    )
 
 
 def _resolve_fitness_metric(project_dir: Path, fitness_metric: str) -> Optional[str]:
@@ -508,10 +553,42 @@ def run_sculpt_job(
     start_mode = run_params.get("start_mode")
     start_mode = start_mode if start_mode in ("manual", "auto") else "auto"
     resume_exact_tuple = bool(run_params.get("resume_exact_tuple", False))
+    warm_start_iteration = run_params.get("warm_start_iteration")
     reference_clip_id = run_params.get("reference_clip_id")
     reference_robot = run_params.get("reference_robot")
 
     async def _runner(job: Job, cancel: asyncio.Event) -> dict[str, Any]:
+        warm_start_checkpoint: Optional[Path] = None
+        warm_start_sha256: Optional[str] = None
+        if warm_start_iteration is not None:
+            try:
+                warm_start_checkpoint = await asyncio.to_thread(
+                    resolve_warm_start_checkpoint,
+                    project_dir,
+                    warm_start_iteration,
+                )
+                warm_start_sha256 = await asyncio.to_thread(
+                    _file_sha256, warm_start_checkpoint,
+                )
+            except Exception as exc:
+                job.emit({
+                    "type": "warm_start_checkpoint_failed",
+                    "source": "ui_launch",
+                    "iteration": warm_start_iteration,
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
+                raise RuntimeError(
+                    "could not resolve the explicitly selected warm-start "
+                    "checkpoint; the sculpt subprocess was not started"
+                ) from exc
+            job.emit({
+                "type": "warm_start_checkpoint_resolved",
+                "source": "ui_launch",
+                "iteration": int(warm_start_iteration),
+                "checkpoint": str(warm_start_checkpoint),
+                "checkpoint_sha256": warm_start_sha256,
+            })
+
         if resume_exact_tuple:
             try:
                 restored = await asyncio.to_thread(
@@ -602,6 +679,8 @@ def run_sculpt_job(
             # `start_iter=0` either way.
             "--resume",
         ]
+        if warm_start_checkpoint is not None:
+            cmd += ["--init-policy", str(warm_start_checkpoint)]
         if no_kg:
             cmd.append("--no-kg")
         if dry_run:
@@ -695,6 +774,16 @@ def run_sculpt_job(
             job.params.setdefault("device_override", str(device_override))
         if expand_kg:
             job.params.setdefault("expand_kg", expand_kg)
+        if warm_start_checkpoint is not None:
+            job.params.setdefault(
+                "warm_start_iteration", int(warm_start_iteration),
+            )
+            job.params.setdefault(
+                "warm_start_checkpoint", str(warm_start_checkpoint),
+            )
+            job.params.setdefault(
+                "warm_start_checkpoint_sha256", warm_start_sha256,
+            )
         # §Ship-7: stash the new params so the Runs-tab summary can
         # surface them (non-None entries only to keep the payload lean).
         for key, val in (
@@ -918,7 +1007,7 @@ async def _fs_watcher(
     emit overlapping events, but the filesystem ones are tagged
     `source=fs` and should be preferred by the frontend on conflict."""
     try:
-        from watchfiles import Change, awatch
+        from watchfiles import awatch
     except Exception:  # noqa: BLE001
         return
 

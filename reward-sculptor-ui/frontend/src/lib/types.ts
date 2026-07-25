@@ -380,6 +380,9 @@ export interface RunParamsPayload {
   // Explicit recovery path: restore reward + env inputs from the last promoted
   // atomic world tuple before the resumed sculpt process starts.
   resume_exact_tuple?: boolean;
+  // Explicit policy-only recovery. The backend resolves this iteration to a
+  // non-empty checkpoint inside this project's runs directory.
+  warm_start_iteration?: number | null;
   // Optional pre-existing motion. The exact robot namespace is paired with
   // the clip id so the backend never resolves from a fallback embodiment.
   reference_clip_id?: string | null;

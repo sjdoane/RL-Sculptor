@@ -167,19 +167,13 @@ class RunParams(BaseModel):
     rejecting unpromoted diagnosis drafts; normal iterative resumes keep using
     the newly generated drafts."""
 
-    reference_clip_id: Optional[
-        Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,95}$")]
+    warm_start_iteration: Optional[
+        Annotated[int, Field(ge=0, le=999_999)]
     ] = None
-    """Optional pre-existing motion used as an immutable tracking prior.
-    The normal behavior prompt is authored as a bounded task residual around
-    that prior; route/object RSI remains an independent world curriculum."""
-
-    reference_robot: Optional[
-        Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")]
-    ] = None
-    """Reference-library embodiment namespace for ``reference_clip_id``.
-    Required when a clip is selected so identically named clips can never be
-    resolved from the wrong robot library."""
+    """Explicit policy recovery source.  The backend resolves this only as
+    this project's ``runs/iter_N/checkpoint.pt`` or ``checkpoint.zip`` and
+    passes it to ``sculpt run --init-policy``.  It never changes the selected
+    reward, environment, or objective-metric mode."""
 
     reference_clip_id: Optional[
         Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,95}$")]

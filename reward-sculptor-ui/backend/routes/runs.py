@@ -14,11 +14,6 @@ import re
 from pathlib import Path
 from typing import Any, Optional
 
-# §Ship 21e: snake-case-ish segment guard for mission_slug / stage_name
-# before they're used to build filesystem paths. Mirrors the same
-# allow-list the rewards routes apply. Rejects "..", "/", "\\", etc.
-_SAFE_PATH_SEGMENT = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
-
 from fastapi import (
     APIRouter,
     Depends,
@@ -59,9 +54,14 @@ from backend.services.run_manager import (
     build_iterations_summary,
     control_file_path,
     read_control_file,
+    resolve_warm_start_checkpoint,
     run_sculpt_job,
     write_control_file,
 )
+
+# Snake-case-ish segment guard for mission_slug / stage_name before they are
+# used to build filesystem paths. Rejects traversal and path separators.
+_SAFE_PATH_SEGMENT = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 
 
 router = APIRouter(tags=["runs"])
@@ -541,6 +541,18 @@ def launch_run(
                 "authored world integrity check failed",
                 detail="; ".join(str(error) for error in errors),
                 type_="/problems/world-integrity",
+            )
+    if body.warm_start_iteration is not None:
+        try:
+            resolve_warm_start_checkpoint(
+                project_dir, body.warm_start_iteration,
+            )
+        except Exception as exc:
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "warm-start checkpoint is unavailable",
+                detail=f"{type(exc).__name__}: {exc}",
+                type_="/problems/warm-start",
             )
     if bool(body.reference_clip_id) != bool(body.reference_robot):
         return _problem(

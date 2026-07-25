@@ -16,6 +16,7 @@ subprocess startup.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import time
 from pathlib import Path
@@ -638,6 +639,104 @@ def test_run_sculpt_job_restores_promoted_tuple_before_subprocess(
     )
     assert restored["selection_version"] == 7
     assert restored["reward_version"] == "v4"
+
+
+# ── Explicit policy checkpoint recovery ──────────────────────────────
+def test_resolve_warm_start_checkpoint_is_project_local_and_nonempty(
+    tmp_path: Path,
+) -> None:
+    from backend.services.run_manager import resolve_warm_start_checkpoint
+
+    project_dir = tmp_path / "checkpoint-project"
+    iter_dir = project_dir / "runs" / "iter_22"
+    iter_dir.mkdir(parents=True)
+    (iter_dir / "checkpoint.pt").write_bytes(b"")
+    zip_checkpoint = iter_dir / "checkpoint.zip"
+    zip_checkpoint.write_bytes(b"policy")
+
+    assert resolve_warm_start_checkpoint(project_dir, 22) == zip_checkpoint
+
+    outside = tmp_path / "outside.pt"
+    outside.write_bytes(b"outside policy")
+    escaped_iter = project_dir / "runs" / "iter_23"
+    escaped_iter.mkdir()
+    (escaped_iter / "checkpoint.pt").symlink_to(outside)
+    with pytest.raises(ValueError, match="escapes project runs"):
+        resolve_warm_start_checkpoint(project_dir, 23)
+
+
+def test_run_sculpt_job_forwards_explicit_warm_start_with_hash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from backend.services import run_manager
+    from backend.services.job_manager import Job
+
+    project_dir = tmp_path / "warm-start-project"
+    checkpoint = project_dir / "runs" / "iter_22" / "checkpoint.pt"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_bytes(b"trusted actor and critic")
+    captured: dict[str, list[str]] = {}
+
+    class _Sentinel(Exception):
+        pass
+
+    async def _fake_exec(*args, **kwargs):
+        captured["cmd"] = list(args)
+        raise _Sentinel()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+    runner = run_manager.run_sculpt_job(
+        project_dir=project_dir,
+        run_params={
+            "behavior_goal": "recover a stable traversal policy",
+            "iterations": 1,
+            "warm_start_iteration": 22,
+        },
+    )
+    job = Job(
+        job_id="t_warm_start",
+        kind="sculpt_run",
+        project_slug="warm-start-project",
+        status="running",
+    )
+    job._cancel = asyncio.Event()
+    with pytest.raises(_Sentinel):
+        asyncio.run(runner(job, job._cancel))
+
+    cmd = captured["cmd"]
+    assert cmd[cmd.index("--init-policy") + 1] == str(checkpoint)
+    event = next(
+        item for item in job.events
+        if item.get("type") == "warm_start_checkpoint_resolved"
+    )
+    assert event["iteration"] == 22
+    assert event["checkpoint"] == str(checkpoint)
+    assert event["checkpoint_sha256"] == hashlib.sha256(
+        checkpoint.read_bytes()
+    ).hexdigest()
+    assert job.params["warm_start_iteration"] == 22
+
+
+def test_launch_rejects_missing_warm_start_before_job_submission(
+    client: TestClient, fake_sculpt,
+) -> None:
+    slug = _make_project_with_library(client, "Missing Warm Start")
+    response = client.post(
+        f"/projects/{slug}/runs",
+        json={
+            "behavior_goal": "recover a stable traversal policy",
+            "iterations": 1,
+            "dry_run": True,
+            "warm_start_iteration": 404,
+        },
+    )
+
+    assert response.status_code == 412, response.text
+    assert response.json()["type"] == "/problems/warm-start"
+    assert "iter_404" in response.json()["detail"]
+    assert client.app.state.job_manager.list(  # type: ignore[attr-defined]
+        kind="sculpt_run", project_slug=slug,
+    ) == []
 
 
 # ── Test 1 follow-up (Issue C): training_iterations plumbing ─────────

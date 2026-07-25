@@ -292,6 +292,9 @@ export function NewRunDialog({
   // Recovery-only: reject mutable diagnosis drafts and restore the reward/env
   // refs from selection_current.json before the subprocess starts.
   const [resumeExactTuple, setResumeExactTuple] = useState(false);
+  // Policy-only recovery: explicitly select a completed iteration checkpoint
+  // without changing reward/environment inputs or objective-metric authority.
+  const [warmStartIteration, setWarmStartIteration] = useState<number | "">("");
   const [allowDefaultWorld, setAllowDefaultWorld] = useState(false);
   const [allowRobotMismatch, setAllowRobotMismatch] = useState(false);
   const [validatingLaunch, setValidatingLaunch] = useState(false);
@@ -410,6 +413,7 @@ export function NewRunDialog({
       setDevice(defaults.device);
       setProfile("custom");
       setResumeExactTuple(false);
+      setWarmStartIteration("");
       setAllowDefaultWorld(false);
       setAllowRobotMismatch(false);
       setReferenceClipId(null);
@@ -567,6 +571,8 @@ export function NewRunDialog({
       // their newly generated drafts, while recovery can reject them in favor
       // of the last promoted atomic tuple.
       resume_exact_tuple: resumeExactTuple,
+      warm_start_iteration:
+        typeof warmStartIteration === "number" ? warmStartIteration : null,
       reference_clip_id: referenceClipId,
       reference_robot: referenceClipId ? referenceRobot : null,
     };
@@ -913,6 +919,41 @@ export function NewRunDialog({
                   title={<>Recovery mode · restore selection v{worldSel.data.selection.selection_version} before training</>}
                   desc="Reject unpromoted reward/environment drafts and resume from the exact hash-verified atomic tuple."
                 />
+              )}
+              {hasPriorIters && (
+                <div
+                  style={{
+                    border: "1px solid var(--hairline)",
+                    borderRadius: "var(--radius-md)",
+                    padding: 13,
+                    background: "var(--surface-strong)",
+                  }}
+                >
+                  <Field
+                    label="Warm-start checkpoint (optional)"
+                    htmlFor="run-warm-start-iteration"
+                  >
+                    {numField(
+                      warmStartIteration,
+                      (value) => {
+                        setWarmStartIteration(value);
+                        setProfile("custom");
+                      },
+                      {
+                        id: "run-warm-start-iteration",
+                        min: 0,
+                        max: 999999,
+                        placeholder: "Iteration, e.g. 22",
+                      },
+                    )}
+                    <p className="rs-hintline">
+                      Explicit policy recovery only: loads actor + critic from{" "}
+                      <code className="mono">runs/iter_N/checkpoint</code>. The
+                      selected reward, world tuple, and objective-metric mode do
+                      not change.
+                    </p>
+                  </Field>
+                </div>
               )}
               <div className="rs-row2">
                 <Field label="Sculpt iters (outer)" htmlFor="run-iters">
