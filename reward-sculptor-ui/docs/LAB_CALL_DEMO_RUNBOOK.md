@@ -571,6 +571,39 @@ show the aligned physical boxes, ordered weave and finish, zero forbidden
 contact, no sustained fall, upright posture, terminal horizontal speed below
 `0.12 m/s`, and 100 uninterrupted post-completion whole-body-quiet frames.
 
+## Iter 28 is aligned, contact-free, and route-incomplete
+
+Iter 28 completed with checkpoint SHA
+`8032c012dff39a68b5054f81bf35037bc1a2b691ad466bd3f12f0e126e732edc`.
+Its scene audit is aligned at `0.00 m`, realism is `ok`, every one of the 64
+official lanes is forbidden-contact-free, and no lane sustains a fall.
+Nonetheless, 0/64 complete the ordered actual-disk route, 0/64 reach index 5,
+and 0/64 produce any valid post-completion hold. The index distribution is
+`{0: 50, 1: 1, 2: 12, 3: 1}`.
+
+Requested/resolved lane 10 (percentile `0.0625`) enters only disks 1 and 2 at
+frames `[137, 309]`, advances their `0.350 m` predicates at frames 158 and
+573, and ends at index 2, `3.306 m` from finish. The complete video shows the
+same partial physical weave and then parking near waypoint 3. This is
+diagnostic evidence, not a showcase result.
+
+The measured stall distances expose the remaining geometric issue:
+`0.3514 m` and `0.3547 m` versus the immutable `0.3500 m` predicate. A
+through-disk target only `0.025 m` inside cannot absorb the policy's ordinary
+`0.026–0.030 m` command-tracking lag. The generic controller now preserves
+the same obstacle-safe radial clearance and chord but places the target
+`0.050 m` inside, at radius `0.300 m`. Disk entry is still the sole route
+advancement authority. Focused compiler + adapter suites pass **70 tests**;
+scoped Ruff (`F,E9`), compileall, and diff check pass.
+
+For the next New Run, use exact promoted reward v20/env v21 and explicitly
+warm-start actor+critic from iter 26, the last checkpoint with real
+full-conjunction lanes. Keep Auto, one 750-PPO cycle, 1,024 CUDA environments,
+seed 42, two 1,000-step 1920x1080 episodes, lane 10, and `gen_003`
+observe-only. Require startup proof of the `0.050 m` inside margin plus all
+existing alignment, contact `-8`, full command, 50/25/25 RSI, firewall,
+strict posture, horizon, and terminal-braking invariants.
+
 Current proof run: UI job `job_0102595ce1cf9e61`, iter 23, clean launch
 commit `6ebc857`, selection v32 / tuple
 `014c62f4757b1e91d8689afcddd568cd85a8d699778154d22729c8b5a70397fd`.

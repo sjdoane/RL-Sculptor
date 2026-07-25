@@ -2351,7 +2351,12 @@ def _reconcile_waypoint_course(
         hold_s = 0.0
     clearance_stage_outside_margin_m = 0.10
     clearance_transition_slack_m = 0.025
-    clearance_traversal_inside_margin_m = 0.025
+    # Leave enough predicate depth to absorb ordinary closed-loop tracking
+    # lag.  A target only one transition-slack inside the disk can still form
+    # a stable equilibrium just outside the immutable predicate when the
+    # locomotion policy trails its command by a few centimetres.  Two slacks
+    # preserve the same obstacle-safe chord while making first entry robust.
+    clearance_traversal_inside_margin_m = 0.050
     clearance_staging_shifts = _clearance_staging_waypoint_shifts(
         predicate_waypoints,
         clearance_shifts,

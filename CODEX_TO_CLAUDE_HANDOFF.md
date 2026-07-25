@@ -2986,3 +2986,46 @@ iter 28 is alive. After checkpoint preservation, audit only the official
 all-lane trajectory and fitness/objective artifacts, disclosed lane-10
 behavior/keyframes/full video, and Results physical-scene audit against the
 complete physical conjunction before any promotion.
+
+## Iter 28 audit + robust predicate-depth recovery 2026-07-25 (Codex)
+
+UI job `job_e71a1d16d5100f1b` completed iter 28 and preserved
+`runs/iter_28/checkpoint.pt` at SHA
+`8032c012dff39a68b5054f81bf35037bc1a2b691ad466bd3f12f0e126e732edc`.
+The Results physical-scene audit is `aligned` with `0.00 m` maximum error,
+realism is `ok`, and `behavior.json` proves requested/resolved precommitted
+lane 10 (percentile `0.0625`). The official first-episode-safe trajectory and
+full 20-second video reject the policy:
+
+- ordered actual-disk route completion: **0/64**;
+- waypoint index 5 and authored success: **0/64**;
+- maximum-index distribution: `{0: 50, 1: 1, 2: 12, 3: 1}`;
+- forbidden-contact-free: **64/64**;
+- sustained-fall-free: **64/64**;
+- 100-frame horizontal, whole-velocity, posture-qualified, and full
+  conjunction holds: **0/64**.
+
+Lane 10 enters only actual waypoint disks 1 and 2 at frames `[137, 309]`,
+advances their frozen predicates at frames 158 and 573, and never enters
+waypoint 3, waypoint 4, or finish. It is contact-free but ends at index 2,
+`3.306 m` from finish. The video shows a real but partial weave among the
+co-located boxes followed by parking near waypoint 3, not the requested
+weave-and-stop. Never present iter 28 as success.
+
+The immutable trace gives a precise generic controller cause. At the first
+two predicates, the robot settles at `0.3514 m` and `0.3547 m` while the
+frozen tolerance is `0.3500 m`. The new safe chord targeted radius
+`0.325 m`—only `0.025 m` inside—so ordinary closed-loop tracking lag of
+roughly `0.026–0.030 m` still leaves a stable just-outside equilibrium.
+The controller now keeps the same typed radial obstacle clearance and
+through-disk chord but targets radius `0.300 m`, two transition slacks
+(`0.050 m`) inside the immutable predicate. Raw disk entry remains the only
+advancement condition; no robot, task, object, or prompt name is used.
+
+Focused compiler + adapter verification remains **70 passed**. Scoped Ruff
+(`F,E9`), compileall, and diff check pass. The next UI proof should recover
+actor+critic from iter 26—the last checkpoint with real full-conjunction
+lanes—rather than continue the iter 27→28 route regression. It must retain
+exact promoted reward v20/env v21 and every physical-scene/contact/RSI/
+firewall/posture invariant, then prove precommitted lane 10's complete
+physical conjunction before promotion.
