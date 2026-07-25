@@ -1069,3 +1069,29 @@ reward v20/environment v21, retain the aligned boxes, four direct contact
 sensors at `-8`, full velocity-command supervision, 50/25/25 RSI,
 full-maneuver firewall, terminal brake, and strict whole-body stillness, and
 judge only the disclosed lane's complete physical conjunction.
+
+## Live proof: iter 31 clearance-preserving full-disk traversal
+
+UI job `job_1fae6e454ac140cf` is running iter 31 from clean captured commit
+`3150e7a10daa7a9d2154f607ce4ea6f52d921bb9`. Exact promoted recovery restored
+selection v39, and iter 31 pins selection v40 with the same hash-verified
+reward v20/environment v21 tuple. The worker loaded actor and critic from
+iter 26 checkpoint SHA8 `d5a35ae6` and entered PPO iteration 0/750.
+
+The startup line now reports four typed `0.268 m` obstacle-away entries with
+their `0.100 m` outside stages and clearance-preserving traversal through
+each frozen `0.350 m` disk to a `0.100 m` outgoing margin. It retains the
+complete-maneuver generated-reward firewall, all four direct contact sensors
+at weight -8, full linear/angular command terms, 50/25/25 train-only RSI,
+aligned local-frame boxes, 1.000 m/s horizon scheduling, 2.000 m terminal
+braking to at most 0.050 m/s, strict-product whole-body stillness at weight 4,
+and entropy `0.01`.
+
+This is an Auto run with one 750-PPO cycle, 1,024 CUDA environments, seed 42,
+two 1,000-step 1920×1080 episodes, precommitted evidence lane 10, and
+`gen_003` observe-only. Leave the live worker untouched. On completion,
+preserve its checkpoint and require the official scene audit, all-lane
+trajectory/fitness, and disclosed lane's keyframes/full video to prove every
+disk plus finish in order, zero contact, no fall, upright/default-like posture,
+terminal horizontal speed below `0.12 m/s`, and 100 uninterrupted
+post-completion whole-body-quiet frames.

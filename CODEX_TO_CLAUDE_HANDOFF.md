@@ -3174,3 +3174,33 @@ warm-start actor+critic from iter 26, restore exact promoted reward v20/env
 v21, preserve every physical-scene/contact/RSI/firewall/posture invariant,
 and prove the precommitted evidence lane's entire physical conjunction before
 promotion.
+
+## Iter 31 live full-disk-traversal recovery 2026-07-25 (Codex)
+
+UI New Run job `job_1fae6e454ac140cf` is running iter 31 from clean captured
+commit `3150e7a10daa7a9d2154f607ce4ea6f52d921bb9`. The UI emitted
+`promoted_tuple_restored`; selection v40 pins exact promoted tuple
+`95afc97b6000593eab01c8e7b374b71dbf20f6e75e647008d322f8270b0b88c7`,
+reward v20 SHA
+`b05bd4fa1ec200ff6e2330d32d0ca8f2bfb095a3878e50fb7433439e32db55e9`,
+and env v21 SHA
+`a56ea1a4baaa66ce5190d2cd29c41a79471ab4f497d81ce866e932082eba134c`.
+`warm_start_loaded` proves actor+critic recovery from iter 26 checkpoint
+SHA8 `d5a35ae6`, and PPO iteration 0/750 is active.
+
+Startup output proves all four typed `0.268 m` obstacle-away entries retain
+their `0.100 m` outside approach stages, then command across each unchanged
+`0.350 m` disk on the identical safe chord to a `0.100 m` outgoing margin.
+The raw disk still advances the route on first entry. The full-maneuver reward
+firewall, four contact sensors at -8, full command weights, 50/25/25 RSI,
+local-pose-plus-environment-origin boxes, 1.000 m/s horizon cruise, 2.000 m
+terminal braking to at most 0.050 m/s, strict-product whole-body terminal
+stillness at weight 4, and entropy `0.01` are also active.
+
+Settings are Auto, one 750-PPO cycle, 1,024 environments on `cuda:0`, seed
+42, two 1,000-step 1920x1080 episodes, exact promoted recovery on,
+precommitted evidence lane 10, `gen_003` observe-only, and no reference
+motion. Do not run an intermediate GPU audit or edit reload-watched core while
+iter 31 is alive. After checkpoint preservation, judge the official all-lane
+artifacts, disclosed lane-10 keyframes/full video, and Results scene audit
+against the complete physical conjunction before promotion.
