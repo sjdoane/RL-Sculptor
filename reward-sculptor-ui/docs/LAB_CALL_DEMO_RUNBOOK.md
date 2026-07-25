@@ -881,3 +881,32 @@ aligned boxes, four contact sensors at `-8`, full velocity-command weights,
 50/25/25 train-only RSI, reward firewall, strict whole-body terminal posture,
 horizon scheduling, and terminal boundary braking. Final acceptance remains
 the disclosed lane's complete physical conjunction.
+
+## Live proof: iter 28 through-disk recovery
+
+UI job `job_e71a1d16d5100f1b` is running iter 28 from clean captured commit
+`9195e554b3d15c5ed73c26414d28f22a562eff65`. The UI restored selection v36
+before training and iter 28 pins selection v37 with exact promoted tuple
+`95afc97b6000593eab01c8e7b374b71dbf20f6e75e647008d322f8270b0b88c7`,
+reward v20, and env v21. `warm_start_loaded` proves actor+critic recovery
+from iter 27 checkpoint SHA8 `15d2a843`, and PPO 0/750 is active.
+
+The worker startup line must remain visible in the demonstration evidence:
+the four typed `0.268 m` obstacle-away entries keep their `0.100 m` outside
+stages, then command through each unchanged `0.350 m` authored disk along the
+same safe chord with a `0.025 m` inside margin. Disk entry alone advances the
+route. All existing safeguards are also live: local-frame box alignment,
+four contact sensors at `-8`, full linear/angular command weights 2,
+50/25/25 train-only RSI, the clearance-stage reward firewall,
+strict-product whole-body terminal stillness at weight 4, `1.000 m/s`
+horizon scheduling, `2.000 m`/`0.050 m/s` terminal braking, and entropy
+`0.01`.
+
+This is an Auto run with one 750-PPO cycle, 1,024 CUDA environments, seed 42,
+two 1,000-step 1920x1080 episodes, precommitted evidence lane 10, and
+`gen_003` observe-only. Do not inspect the GPU or change reload-watched core
+while the worker is alive. After it stops, require the official lane-10 video
+and artifacts to prove scene alignment, visible alternating physical-box
+traversal, all actual disks plus finish in order, index 5, zero contact, no
+fall, upright/default-like posture, terminal horizontal speed below
+`0.12 m/s`, and 100 uninterrupted post-completion whole-body-quiet frames.

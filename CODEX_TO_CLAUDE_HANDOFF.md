@@ -2950,3 +2950,39 @@ Focused compiler + adapter verification is **70 passed**. Scoped Ruff
 through the UI only after this slice is committed, warm-start iter 27, retain
 the current physical-scene/contact/RSI/firewall/posture invariants, and prove
 the same disclosed lane's full physical conjunction before promotion.
+
+## Iter 28 live obstacle-safe disk traversal recovery 2026-07-25 (Codex)
+
+UI New Run job `job_e71a1d16d5100f1b` is running iter 28 from clean captured
+commit `9195e554b3d15c5ed73c26414d28f22a562eff65`. The UI emitted
+`promoted_tuple_restored` before training, so selection v37 pins the exact
+promoted tuple
+`95afc97b6000593eab01c8e7b374b71dbf20f6e75e647008d322f8270b0b88c7`,
+reward v20 SHA
+`b05bd4fa1ec200ff6e2330d32d0ca8f2bfb095a3878e50fb7433439e32db55e9`,
+and env v21 SHA
+`a56ea1a4baaa66ce5190d2cd29c41a79471ab4f497d81ce866e932082eba134c`.
+The worker explicitly loaded actor and critic from
+`runs/iter_27/checkpoint.pt` SHA8 `15d2a843`, and PPO iteration 0/750 is
+active.
+
+Startup evidence proves the generic controller correction is installed:
+each typed `0.268 m` obstacle-away entry uses its existing `0.100 m` outside
+stage, then commands through the unchanged `0.350 m` authored disk on the
+same clearance-preserving chord with a `0.025 m` inside margin. The frozen
+disk predicate remains the only route advancement authority. The run also
+retains `1.000 m/s` horizon-aware cruise for the `12.740 m` staged path,
+`2.000 m` terminal braking to at most `0.050 m/s`, 50/25/25 train-only RSI,
+local-pose-plus-environment-origin boxes, four forbidden-contact sensors at
+weight -8, full linear/angular command weights 2, the clearance-stage reward
+firewall, strict-product whole-body terminal stillness at weight 4, and
+entropy `0.01`.
+
+Launch settings are Auto, one 750-PPO cycle, 1,024 environments on `cuda:0`,
+seed 42, two 1,000-step 1920x1080 episodes, precommitted evidence lane 10,
+`gen_003` observe-only, exact promoted-tuple recovery on, and no reference
+motion. Do not run intermediate GPU audits or edit reload-watched core while
+iter 28 is alive. After checkpoint preservation, audit only the official
+all-lane trajectory and fitness/objective artifacts, disclosed lane-10
+behavior/keyframes/full video, and Results physical-scene audit against the
+complete physical conjunction before any promotion.
