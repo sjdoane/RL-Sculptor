@@ -495,3 +495,141 @@ def compose_reference(
                 f"{max_joint_vel_rad_s:.2f} rad/s; the blend is too short for "
                 "how far the poses are apart.")
     return acc
+
+
+# ── library registration ────────────────────────────────────────────────
+def _merge_source_licenses(
+    parents: Sequence[Mapping[str, Any]],
+) -> tuple[str, str]:
+    """Combine parent licenses/attributions for a composite.
+
+    A composite is a derivative of EVERY source it draws frames from, so it
+    inherits every one of their terms — not the first one's. When sources
+    disagree the composite carries the conjunction, because silently
+    stamping one dataset's license onto frames from another is exactly the
+    provenance failure `library`'s license guard exists to prevent.
+    """
+    licenses: list[str] = []
+    attributions: list[str] = []
+    for prov in parents:
+        lic = str(prov.get("license") or "").strip()
+        att = str(prov.get("attribution") or "").strip()
+        if lic and lic not in licenses:
+            licenses.append(lic)
+        if att and att not in attributions:
+            attributions.append(att)
+    if not licenses:
+        raise ComposeError(
+            "no source clip carried a license; refusing to register a "
+            "composite with unknown terms")
+    license_ = licenses[0] if len(licenses) == 1 else (
+        "composite: " + " AND ".join(sorted(licenses)))
+    attribution = "; ".join(attributions) if attributions else "unknown"
+    return license_, attribution
+
+
+def compose_and_register(
+    robot: str,
+    segments: Sequence[Mapping[str, Any]],
+    *,
+    clip_id: str,
+    text: str = "",
+    labels: Optional[Sequence[str]] = None,
+    root: Optional[Any] = None,
+    license: Optional[str] = None,
+    attribution: Optional[str] = None,
+    **compose_kwargs: Any,
+):
+    """Compose spans of registered library clips and register the result.
+
+    `segments` entries name library clips by id rather than carrying arrays:
+
+        {"clip_id": "0016_kicking1_poses_120_jpos",
+         "t_start_s": 0.8, "t_end_s": 2.0, "label": "strike"}
+
+    The composite is registered at **tier K** (kinematics only, no dynamics
+    guarantee) — the same tier a fresh retarget gets, and for the same
+    reason. `refs.track`'s Tier-D certification is what promotes it, and
+    until that runs the provenance says so.
+
+    Licenses are inherited from every parent (see `_merge_source_licenses`).
+    Pass `license`/`attribution` only to override deliberately.
+    """
+    from pathlib import Path
+
+    from sculptor.reference import load_clip, save_clip
+    from sculptor.refs import library
+
+    library.validate_clip_id(clip_id)
+    resolved: list[dict[str, Any]] = []
+    parents: list[dict[str, Any]] = []
+    for i, spec in enumerate(segments):
+        source_id = spec.get("clip_id")
+        if not source_id:
+            raise ComposeError(f"segment {i} has no 'clip_id'")
+        d = library.clip_dir(robot, str(source_id), root=root)
+        clip_path = d / library.CLIP_FILENAME
+        if not clip_path.is_file():
+            raise ComposeError(
+                f"segment {i}: clip {source_id!r} is not in the {robot} library")
+        resolved.append({**dict(spec), "clip": load_clip(clip_path),
+                         "source_id": str(source_id)})
+        try:
+            parents.append(library.read_provenance(robot, str(source_id),
+                                                   root=root))
+        except Exception:  # noqa: BLE001 — a missing parent record is caught
+            parents.append({})   # by the license merge below, with a clearer error
+
+    composite = compose_reference(resolved, **compose_kwargs)
+
+    merged_license, merged_attribution = _merge_source_licenses(parents)
+    comp_meta = composite["meta"]["composition"]
+    n_frames = int(np.asarray(composite["root_pos_z"]).shape[0])
+    prov = library.make_provenance(
+        clip_id=clip_id,
+        robot=robot,
+        source={
+            "kind": "compose",
+            "parent_clip_ids": [s["source_id"] for s in resolved],
+            "segments": comp_meta["segments"],
+        },
+        license=license or merged_license,
+        attribution=attribution or merged_attribution,
+        content_sha256_=library.content_sha256(
+            np.ascontiguousarray(
+                composite["root_pos_z"], dtype=np.float64).tobytes()),
+        retarget={
+            "tool": "sculptor.refs.compose",
+            "notes": (
+                "Kinematic composite of spans from the listed parent clips: "
+                "SE(2)-aligned at each seam, smoothstep cross-faded, "
+                "velocities recomputed from the composed positions. No "
+                "dynamics guarantee — momentum is not conserved across a "
+                "seam. Promote to tier D only via refs.track certification."),
+        },
+        # Tier K for the same reason a fresh retarget is: kinematics only.
+        tier="K",
+        fps_source=float(composite["fps"]),
+        parent_clip_id=resolved[0]["source_id"],
+        joint_mapping={"identity": True, "source": "composed"},
+        labels=list(labels or []) + ["composed"],
+        text=text,
+        qc={
+            "n_frames": n_frames,
+            "duration_s": round(n_frames / float(composite["fps"]), 4),
+            "root_z_range": [
+                round(float(composite["root_pos_z"].min()), 4),
+                round(float(composite["root_pos_z"].max()), 4),
+            ],
+            "composition": comp_meta["seam_report"],
+            "n_sources": len(resolved),
+        },
+    )
+
+    d = library.clip_dir(robot, clip_id, root=root)
+    save_clip(d / library.CLIP_FILENAME, composite)
+    prov_path = library.write_provenance(robot, clip_id, prov, root=root)
+    return library.LibraryClip(
+        robot=robot, clip_id=clip_id,
+        clip_path=Path(d) / library.CLIP_FILENAME,
+        provenance_path=prov_path, provenance=prov)

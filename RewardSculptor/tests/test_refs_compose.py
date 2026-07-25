@@ -232,3 +232,102 @@ def test_seam_report_measures_rather_than_asserts():
     assert report["peak_joint_vel_rad_s"] is not None
     assert report["duration_s"] > 0
     assert len(report["seams"]) == 1
+
+
+# ── library registration ────────────────────────────────────────────────
+def _register_source(root, robot, clip_id, clip, *, license_="cc-by-4.0",
+                     attribution="Dataset A"):
+    from sculptor.reference import save_clip
+    from sculptor.refs import library
+
+    prov = library.make_provenance(
+        clip_id=clip_id, robot=robot,
+        source={"kind": "test"}, license=license_, attribution=attribution,
+        content_sha256_="0" * 64)
+    d = library.clip_dir(robot, clip_id, root=root)
+    save_clip(d / library.CLIP_FILENAME, clip)
+    library.write_provenance(robot, clip_id, prov, root=root)
+
+
+def test_compose_and_register_records_every_parent(tmp_path):
+    from sculptor.reference import load_clip
+    from sculptor.refs.compose import compose_and_register
+
+    _register_source(tmp_path, "g1", "src_a", _clip())
+    _register_source(tmp_path, "g1", "src_b", _clip(joint_offset=0.05))
+
+    lc = compose_and_register(
+        "g1",
+        [{"clip_id": "src_a", "label": "approach"},
+         {"clip_id": "src_b", "label": "strike"}],
+        clip_id="novel--g1", text="a novel motion", labels=["novel"],
+        root=tmp_path)
+
+    prov = lc.provenance
+    # A composite is kinematics-only until refs.track certifies it.
+    assert prov["tier"] == "K"
+    assert prov["source"]["kind"] == "compose"
+    assert prov["source"]["parent_clip_ids"] == ["src_a", "src_b"]
+    assert "composed" in prov["labels"]
+    assert prov["qc"]["n_sources"] == 2
+    # The saved clip round-trips with its composition provenance intact.
+    rt = load_clip(lc.clip_path)
+    assert validate_clip(rt) == []
+    assert [s["label"] for s in rt["meta"]["composition"]["segments"]] == [
+        "approach", "strike"]
+
+
+def test_registration_inherits_a_single_shared_license(tmp_path):
+    from sculptor.refs.compose import compose_and_register
+
+    _register_source(tmp_path, "g1", "src_a", _clip())
+    _register_source(tmp_path, "g1", "src_b", _clip(joint_offset=0.05))
+    lc = compose_and_register(
+        "g1", [{"clip_id": "src_a"}, {"clip_id": "src_b"}],
+        clip_id="novel--g1", root=tmp_path)
+    assert lc.provenance["license"] == "cc-by-4.0"
+
+
+def test_registration_carries_every_license_when_sources_disagree(tmp_path):
+    """A composite is a derivative of EVERY source it draws frames from.
+    Stamping one dataset's terms onto another's frames is the provenance
+    failure the library's license guard exists to prevent."""
+    from sculptor.refs.compose import compose_and_register
+
+    _register_source(tmp_path, "g1", "src_a", _clip(),
+                     license_="cc-by-4.0", attribution="Dataset A")
+    _register_source(tmp_path, "g1", "src_b", _clip(joint_offset=0.05),
+                     license_="cc-by-nc-4.0", attribution="Dataset B")
+    lc = compose_and_register(
+        "g1", [{"clip_id": "src_a"}, {"clip_id": "src_b"}],
+        clip_id="novel--g1", root=tmp_path)
+
+    license_ = lc.provenance["license"]
+    assert license_.startswith("composite:")
+    assert "cc-by-4.0" in license_ and "cc-by-nc-4.0" in license_
+    assert "Dataset A" in lc.provenance["attribution"]
+    assert "Dataset B" in lc.provenance["attribution"]
+
+
+def test_registration_rejects_a_missing_source_clip(tmp_path):
+    from sculptor.refs.compose import compose_and_register
+
+    _register_source(tmp_path, "g1", "src_a", _clip())
+    with pytest.raises(ComposeError, match="not in the g1 library"):
+        compose_and_register(
+            "g1", [{"clip_id": "src_a"}, {"clip_id": "nope"}],
+            clip_id="novel--g1", root=tmp_path)
+
+
+def test_registration_refuses_unlicensed_sources(tmp_path):
+    from sculptor.reference import save_clip
+    from sculptor.refs import library
+    from sculptor.refs.compose import compose_and_register
+
+    for cid in ("src_a", "src_b"):
+        d = library.clip_dir("g1", cid, root=tmp_path)
+        save_clip(d / library.CLIP_FILENAME, _clip())  # no provenance written
+    with pytest.raises(ComposeError, match="license"):
+        compose_and_register(
+            "g1", [{"clip_id": "src_a"}, {"clip_id": "src_b"}],
+            clip_id="novel--g1", root=tmp_path)
