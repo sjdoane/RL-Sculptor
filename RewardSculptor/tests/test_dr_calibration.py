@@ -175,3 +175,71 @@ def test_profile_axes_are_all_real_env_spec_keys():
     p.pop("dr_profile")
     spec = {"env_spec_version": 1, "shared": {}, "train": p}
     assert validate_env_spec(spec) == []
+
+
+# ── wiring into env-spec generation ─────────────────────────────────────
+def test_calibration_overrides_a_generated_push_magnitude():
+    """The LLM authors push_events without ever seeing the motion, so its
+    magnitude is a guess. An attached clip measures the behavior."""
+    from sculptor.env_gen import calibrate_push_from_reference
+
+    spec = {
+        "env_spec_version": 1,
+        "meta": {"source": "generated"},
+        "shared": {},
+        "train": {"push_events": {
+            "enabled": True, "interval_s": [4.0, 8.0],
+            "linear_mps": 2.9, "angular_radps": 1.4}},
+    }
+    out = calibrate_push_from_reference(spec, _clip(1.0))
+    push = out["train"]["push_events"]
+    assert push["linear_mps"] == pytest.approx(0.5, abs=0.05)
+    # Interval and enablement are task DECISIONS, not measurements — keep them.
+    assert push["interval_s"] == [4.0, 8.0]
+    assert push["enabled"] is True
+    # Provenance records what it replaced.
+    cal = out["meta"]["push_calibration"]
+    assert cal["generated_linear_mps"] == 2.9
+    assert cal["calibrated_linear_mps"] == pytest.approx(0.5, abs=0.05)
+
+
+def test_calibration_leaves_disabled_pushes_alone():
+    from sculptor.env_gen import calibrate_push_from_reference
+
+    spec = {"env_spec_version": 1, "shared": {},
+            "train": {"push_events": {"enabled": False}}}
+    out = calibrate_push_from_reference(spec, _clip(1.0))
+    assert out["train"]["push_events"] == {"enabled": False}
+    assert "push_calibration" not in out.get("meta", {})
+
+
+def test_calibration_is_a_noop_when_no_push_was_generated():
+    from sculptor.env_gen import calibrate_push_from_reference
+
+    spec = {"env_spec_version": 1, "shared": {}, "train": {}}
+    assert calibrate_push_from_reference(spec, _clip(1.0)) == spec
+
+
+def test_calibrated_spec_still_validates():
+    from sculptor.env_gen import calibrate_push_from_reference
+    from sculptor.env_spec import validate_env_spec
+
+    spec = {
+        "env_spec_version": 1,
+        "shared": {},
+        "train": {"push_events": {
+            "enabled": True, "interval_s": [4.0, 8.0], "linear_mps": 2.9}},
+    }
+    out = calibrate_push_from_reference(spec, _clip(1.4))
+    out.pop("meta", None)     # meta is free-form; the schema checks the rest
+    assert validate_env_spec(out) == []
+
+
+def test_an_unusable_clip_never_fails_the_run():
+    """A measurement problem must not take down env-spec generation."""
+    from sculptor.env_gen import calibrate_push_from_reference
+
+    spec = {"env_spec_version": 1, "shared": {},
+            "train": {"push_events": {"enabled": True, "linear_mps": 2.0}}}
+    out = calibrate_push_from_reference(spec, {"fps": 60.0})  # no root_pos_z
+    assert out["train"]["push_events"]["linear_mps"] == 2.0

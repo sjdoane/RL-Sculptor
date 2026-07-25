@@ -179,15 +179,67 @@ def _user_content(behavior_goal: str, task_id: str) -> str:
     )
 
 
+def calibrate_push_from_reference(
+    spec: dict, clip, *, fraction: float | None = None,
+) -> dict:
+    """Replace a generated push magnitude with one matched to the behavior.
+
+    The LLM authors `push_events` without ever seeing the motion, so its
+    magnitude is a guess — and a push that barely perturbs a run knocks over a
+    crouch. An attached reference clip MEASURES the behavior's characteristic
+    speed, and the recommended recipe sizes the imparted momentum at a
+    fraction of the behavior's own (RESEARCH_DIRECTION.md §6). Because the push
+    and the behavior act on the same body, mass cancels and the sizing is a
+    pure velocity ratio.
+
+    Only the magnitudes are overridden. Whether pushes are enabled at all, and
+    their interval, stay with the generated spec — those are task decisions,
+    not measurements. Mutates and returns `spec`; a clip that yields no usable
+    speed leaves it untouched.
+    """
+    from sculptor.refs.dr_calibration import (
+        DEFAULT_PUSH_MOMENTUM_FRACTION, push_events_for_behavior,
+    )
+
+    train = spec.setdefault("train", {})
+    push = train.get("push_events") or spec.get("shared", {}).get("push_events")
+    if not isinstance(push, dict) or not push.get("enabled", False):
+        return spec
+    try:
+        matched = push_events_for_behavior(
+            clip, fraction=float(
+                fraction if fraction is not None
+                else DEFAULT_PUSH_MOMENTUM_FRACTION))
+    except Exception:  # noqa: BLE001 — an unusable clip must not fail the run
+        return spec
+
+    calibrated = dict(push)
+    calibrated["linear_mps"] = matched["linear_mps"]
+    calibrated["angular_radps"] = matched["angular_radps"]
+    train["push_events"] = calibrated
+    meta = spec.setdefault("meta", {})
+    meta["push_calibration"] = {
+        **matched["provenance"],
+        "generated_linear_mps": push.get("linear_mps"),
+        "calibrated_linear_mps": matched["linear_mps"],
+    }
+    return spec
+
+
 def generate_env_spec(
     *,
     behavior_goal: str,
     task_id: str,
     client=None,
+    reference_clip=None,
 ) -> dict:
     """Generate + validate an env spec from the behavior goal. Raises
     on any failure (no client, parse failure twice, validation failure
-    twice) — the CALLER decides that failure means task defaults."""
+    twice) — the CALLER decides that failure means task defaults.
+
+    `reference_clip` (optional): when the stage has an attached reference,
+    robustness-push magnitudes are re-sized to that behavior's measured speed
+    instead of the LLM's blind guess. See `calibrate_push_from_reference`."""
     if client is None:
         import anthropic
 
@@ -218,7 +270,8 @@ def generate_env_spec(
     except Exception as e:  # noqa: BLE001 — parse/API failure counts as attempt 1
         spec, errors, call_failed = None, [f"{type(e).__name__}: {e}"], True
     if not errors:
-        return spec
+        return (calibrate_push_from_reference(spec, reference_clip)
+                if reference_clip is not None else spec)
     preamble = (
         "The previous attempt failed before producing a parseable spec"
         if call_failed else
@@ -233,4 +286,8 @@ def generate_env_spec(
         raise ValueError(
             "generated env spec failed validation twice:\n  - "
             + "\n  - ".join(errors))
+    # Calibrate only AFTER the spec validates, so a measurement can never be
+    # blamed for a validation failure that was the generator's.
+    if reference_clip is not None:
+        spec = calibrate_push_from_reference(spec, reference_clip)
     return spec
