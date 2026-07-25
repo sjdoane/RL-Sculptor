@@ -70,6 +70,17 @@ def test_model_for_unknown_role_never_crashes(monkeypatch):
     assert model_for("not_a_role") == "claude-test-all"
 
 
+def test_calibration_is_model_disjoint_from_metric_gen():
+    """§RESEARCH_GAP_ANALYSIS §3.5: the competence-ladder / gaming-archetype
+    author must NOT be the same model as the metric author. If they share a
+    blind spot, L2 agreement passes without catching it, so the ladder stops
+    being independent evidence. This is a real scientific-validity invariant,
+    not a style rule — it is the reason `calibration` is pinned off whatever
+    the all-in-system default currently is (opus-5 as of 2026-07-25).
+    """
+    assert model_for("calibration") != model_for("metric_gen")
+
+
 # ── review panel ─────────────────────────────────────────────────────────
 def test_review_panel_default_is_author_disjoint():
     """§LAW 9 blinding by construction: the default panel must never

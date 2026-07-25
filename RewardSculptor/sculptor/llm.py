@@ -19,10 +19,10 @@ the single place that answers two questions:
      → no-op; a failing sink NEVER raises into the pipeline (provenance
      is advisory, the loop is not).
 
-Role assignments (2026-07-09 pass — fable-5 across the board, one
+Role assignments (2026-07-25 pass — opus-5 across the board, one
 principled exception):
 
-  * fable-5 on EVERY in-system role: decomposition, diagnosis, reward
+  * opus-5 on EVERY in-system role: decomposition, diagnosis, reward
     writing, metric authoring/review, env-spec generation, KG extraction/
     research, MJCF editing, reference reranking, eureka baseline (the
     baseline arm must be model-matched to the treatment arm or an E4-v2
@@ -46,44 +46,50 @@ from typing import Any, Optional
 #: role → default model id. Roles are the stable names run_context.py
 #: records; renaming one breaks provenance comparability across runs.
 ROLE_DEFAULTS: dict[str, str] = {
-    "decompose": "claude-fable-5",
-    "diagnose": "claude-fable-5",
-    "edit": "claude-fable-5",
-    "metric_gen": "claude-fable-5",
-    "metric_review": "claude-fable-5",
-    # calibration is the ONE deliberate exception to the all-fable-5
-    # policy (2026-07-09): §RESEARCH_GAP_ANALYSIS §3.5 requires the
+    "decompose": "claude-opus-5",
+    "diagnose": "claude-opus-5",
+    "edit": "claude-opus-5",
+    "metric_gen": "claude-opus-5",
+    "metric_review": "claude-opus-5",
+    # calibration is the ONE deliberate exception to the all-opus-5
+    # policy (2026-07-25): §RESEARCH_GAP_ANALYSIS §3.5 requires the
     # ladder/archetype author to be model-DISJOINT from metric_gen so a
-    # shared blind spot can't pass L2 agreement — metric_gen is fable-5,
+    # shared blind spot can't pass L2 agreement — metric_gen is opus-5,
     # so calibration must not be.
     "calibration": "claude-opus-4-8",
-    "eureka_baseline": "claude-fable-5",
-    "env_gen": "claude-fable-5",
-    "kg_extract": "claude-fable-5",
-    "kg_research": "claude-fable-5",
-    "mjcf_editor": "claude-fable-5",
+    "eureka_baseline": "claude-opus-5",
+    "env_gen": "claude-opus-5",
+    "kg_extract": "claude-opus-5",
+    "kg_research": "claude-opus-5",
+    "mjcf_editor": "claude-opus-5",
     # reference-clip retrieval reranking (§R1_BUILD_SPEC decision 7):
     # OPTIONAL role — retrieve.py's deterministic layer is always-on and
     # never blocked by this call.
-    "reference_rerank": "claude-fable-5",
+    "reference_rerank": "claude-opus-5",
     # §D24 F1 (docs/internal/REFERENCE_BUILD_LOG.md D23/D24): proposes
     # the goal-aligned SUB-SPAN of a reference clip (`sculptor.refs.
-    # spans.select_reference_span`). Follows the D1 all-fable-5 default
+    # spans.select_reference_span`). Follows the D1 all-opus-5 default
     # — this role is not the metric author/ladder pair D1 keeps
     # model-disjoint, so no exception applies.
-    "span_select": "claude-fable-5",
+    "span_select": "claude-opus-5",
     # §D24 F2 (docs/internal/REFERENCE_BUILD_LOG.md D23/D24): re-grounds a
     # stage's blind-authored `success_criterion` in the CROPPED reference
     # clip's real kinematic signature, right after a span attaches
-    # (`sculptor.decompose.ground_stage_criterion`). Same D1 all-fable-5
+    # (`sculptor.decompose.ground_stage_criterion`). Same D1 all-opus-5
     # default — not the metric author/ladder pair kept model-disjoint.
-    "criterion_ground": "claude-fable-5",
+    "criterion_ground": "claude-opus-5",
     # §D28 F-SYNTH (docs/internal/REFERENCE_BUILD_LOG.md D28): sketches a
     # LAST-RESORT synthetic exemplar (`sculptor.refs.synth.
     # synthesize_reference_clip`) when no real reference clip matches a
-    # stage's goal closely enough to certify against. Same D1 all-fable-5
+    # stage's goal closely enough to certify against. Same D1 all-opus-5
     # default — not the metric author/ladder pair kept model-disjoint.
-    "exemplar_synth": "claude-fable-5",
+    "exemplar_synth": "claude-opus-5",
+    # UI actuator-datasheet extraction (`reward-sculptor-ui` physics tab):
+    # parses a vendor PDF/text sheet into typed actuator limits. Previously
+    # hardcoded in the route, which silently bypassed this registry and its
+    # provenance contract; routed here 2026-07-25. Same D1 all-opus-5
+    # default — not the metric author/ladder pair kept model-disjoint.
+    "datasheet_extract": "claude-opus-5",
 }
 
 #: §LAW 9 review panel: author-DISJOINT by construction — none of these

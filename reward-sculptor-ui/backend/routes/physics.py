@@ -663,11 +663,15 @@ async def extract_datasheet_pdf(
     # the event loop doesn't park for up to the per-request timeout.
     try:
         import anthropic
+        from sculptor.llm import model_for
         client = anthropic.Anthropic(max_retries=2, timeout=60.0)
+        # Resolved from the central role registry (never hardcoded) so a
+        # model upgrade is one table edit and RS_MODEL_* overrides apply.
+        datasheet_model = model_for("datasheet_extract")
 
         def _call_claude() -> str:
             resp = client.messages.create(
-                model="claude-opus-4-7",
+                model=datasheet_model,
                 max_tokens=4_000,
                 system=system_prompt,
                 messages=[{"role": "user", "content": text_for_claude}],
