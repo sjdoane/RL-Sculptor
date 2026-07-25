@@ -2864,3 +2864,42 @@ actor+critic load from the iter 26 SHA plus startup lines proving
 clearance-preserving in-disk targets, `2.0 m`/`0.05 m/s` terminal braking,
 aligned physical boxes, direct contact supervision, full command weights,
 50/25/25 RSI, and the reward firewall before leaving PPO alone.
+
+## Iter 27 live clearance-preserving recovery 2026-07-24 (Codex)
+
+The next proof is live as ordinary UI New-run job
+`job_0b8d143e516a7920`, iter 27. The UI captured clean code commit
+`7e394526a95a7f17fc8bd8caf907af1de57e9c5c`, kept exact promoted-tuple
+recovery off, and explicitly resolved iter 26 checkpoint SHA
+`d5a35ae6c0a3f2ca8cc7cc6c5fce076fcb8499cae8e1351c7ed04bd864c54cea`.
+Iter 27 pins selection v36 / tuple
+`95afc97b6000593eab01c8e7b374b71dbf20f6e75e647008d322f8270b0b88c7`,
+reward v20 SHA
+`b05bd4fa1ec200ff6e2330d32d0ca8f2bfb095a3878e50fb7433439e32db55e9`,
+and env v21 SHA
+`a56ea1a4baaa66ce5190d2cd29c41a79471ab4f497d81ce866e932082eba134c`.
+
+The persisted startup log proves actor and critic loaded from iter 26 (SHA8
+`d5a35ae6`) and PPO entered learning iteration 0/750 on 1,024 environments.
+It also proves:
+
+- four typed `0.268 m` obstacle-away in-disk clearance targets and the
+  outside-stage controller under the clean commit that preserves those
+  targets through disk entry;
+- terminal boundary braking at at most `0.050 m/s` across a `2.000 m`
+  constant-deceleration span;
+- 1.000 m/s horizon-aware cruise for the 12.740 m staged path and 16 s
+  traversal window;
+- 50% entrance / 25% collision-local / 25% terminal-approach train-only RSI;
+- all four boxes at nominal local pose plus environment origin;
+- four forbidden-contact sensors at weight -8, full linear/angular command
+  weights, the clearance-stage reward firewall, entropy `0.01`, and strict
+  product whole-body terminal stillness at weight 4.
+
+The UI settings are Auto, one 750-PPO cycle, 1,024 environments on `cuda:0`,
+seed 42, two 1,000-step 1920x1080 episodes, precommitted evidence lane 10,
+and `gen_003` observe-only with no reference-motion override. Do not run an
+intermediate GPU audit or edit reload-watched core while iter 27 is alive.
+After checkpoint preservation, audit only the official trajectory,
+fitness/objective artifacts, behavior disclosure, keyframes/full video, and
+Results physical-scene audit against the complete physical conjunction.

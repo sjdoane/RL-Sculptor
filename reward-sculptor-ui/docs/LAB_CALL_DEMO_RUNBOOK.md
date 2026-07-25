@@ -825,3 +825,27 @@ the clearance-preserving in-disk target line, `2.0 m` terminal brake with
 contact `-8`, full command-weight, 50/25/25 RSI, strict-posture, and firewall
 invariants. Final acceptance remains the disclosed lane's complete physical
 conjunction, not visual plausibility or a batch partial-pass count.
+
+## Live proof: iter 27 clearance-preserving recovery
+
+UI job `job_0b8d143e516a7920` is running iter 27 from clean captured commit
+`7e39452`. Exact promoted recovery is off; reward v20 and environment v21 are
+authoritative. The UI resolved Warm-start checkpoint 26 at full SHA
+`d5a35ae6c0a3f2ca8cc7cc6c5fce076fcb8499cae8e1351c7ed04bd864c54cea`
+and pins selection v36 / tuple
+`95afc97b6000593eab01c8e7b374b71dbf20f6e75e647008d322f8270b0b88c7`.
+
+The startup record confirms actor+critic recovery and PPO iteration 0/750.
+It retains all four typed clearance targets and outside stages under the
+controller commit that keeps the safe in-disk target active until the frozen
+disk predicate advances. It also confirms the new `2.000 m` terminal brake
+and `0.050 m/s` boundary command, 1.000 m/s horizon schedule, 50/25/25 RSI,
+aligned physical boxes, contact `-8`, full command weights, strict-product
+terminal stillness, entropy `0.01`, and the clearance reward firewall.
+
+Settings are one cycle, 1,024 environments on `cuda:0`, seed 42, two
+1,000-step 1920×1080 episodes, evidence lane 10, Auto, and `gen_003`
+observe-only. Leave the worker untouched. On completion, require the
+disclosed lane—not an older video or batch partial pass—to satisfy the full
+aligned weave, zero-contact, ordered-finish, no-fall, upright/default-like,
+terminal-speed, and uninterrupted 100-frame whole-body hold conjunction.
