@@ -1226,3 +1226,88 @@ def test_diagnose_stale_rotation_never_drops_below_two_results(
     # re-admitted by the floor and must not appear as "excluded".
     assert "technique:tech_c" in rotate_rec["query"]
     assert "technique:tech_b" not in rotate_rec["query"]
+
+
+# ── §Iter-29 regression: held-out observable inventory ──────────────────
+# Iter 29 of the g1-lab-showcase campaign burned a full iteration emitting
+# `requires_env_extension` for a `box_contact` field that already existed as
+# the compiled `contact__forbidden__{0..3}` channels. The diagnoser had been
+# told only that held-out channels were "structurally excluded" from its
+# evidence — never that they exist or what they are named — so it inferred
+# contact from a box-VELOCITY proxy that is blind to a robot leaning on a
+# stationary box. These tests pin the inventory that prevents that.
+class _FakeChannel:
+    def __init__(self, name: str, access: str) -> None:
+        self.name = name
+        self.access = access
+
+
+class _FakeCatalog:
+    def __init__(self, channels) -> None:
+        self.channels = channels
+
+
+class _FakeContract:
+    observation_space_spec = "Box(29,)"
+    action_space_spec = "Box(29,)"
+    expected_info_keys = ["root_link_pos_w", "joint_pos"]
+    expected_components = {"upright": "float"}
+
+
+def test_reward_contract_names_held_out_channels():
+    from sculptor.diagnose import _render_reward_contract
+
+    catalog = _FakeCatalog([
+        _FakeChannel("object__slalom_box_01__lin_vel_w", "shared_shaping"),
+        _FakeChannel("contact__forbidden__0", "metric_only"),
+        _FakeChannel("contact__forbidden__1", "metric_only"),
+    ])
+    text = _render_reward_contract(_FakeContract(), catalog)
+
+    # The exact channels iter 29 claimed did not exist are now named.
+    assert "contact__forbidden__0" in text
+    assert "contact__forbidden__1" in text
+    assert "held_out_metric_observables" in text
+    # Reward-visible channels are NOT relisted as held-out.
+    held_block = text.split("held_out_metric_observables")[1]
+    assert "object__slalom_box_01__lin_vel_w" not in held_block
+    # The two behaviors that actually wasted the iteration are named.
+    assert "requires_env_extension" in text
+    assert "VELOCITY" in text
+
+
+def test_reward_contract_unchanged_without_catalog():
+    """No authored catalog (legacy/registered tasks) → byte-identical to the
+    historical rendering, so this cannot perturb non-authored projects."""
+    from sculptor.diagnose import _render_reward_contract
+
+    baseline = (
+        "observation_space: Box(29,)\n"
+        "action_space:      Box(29,)\n"
+        "expected_info_keys: ['root_link_pos_w', 'joint_pos']\n"
+        "expected_components: {'upright': 'float'}"
+    )
+    assert _render_reward_contract(_FakeContract(), None) == baseline
+    # A catalog with no metric_only channels is equally inert.
+    empty = _FakeCatalog([_FakeChannel("joint_pos", "base")])
+    assert _render_reward_contract(_FakeContract(), empty) == baseline
+
+
+def test_held_out_inventory_never_leaks_values():
+    """Names only. Emitting VALUES here would breach the metric firewall the
+    partition gate exists to enforce."""
+    from sculptor.diagnose import _render_held_out_observables
+
+    catalog = _FakeCatalog([_FakeChannel("goal__g__success", "metric_only")])
+    text = _render_held_out_observables(catalog)
+    assert "goal__g__success" in text
+    assert "may NOT read or reconstruct" in text
+
+
+def test_catalog_loader_is_fail_soft(tmp_path):
+    """A project with no authored world must degrade to None, not raise."""
+    from sculptor.diagnose import _load_iter_channel_catalog
+
+    iter_dir = tmp_path / "proj" / "runs" / "iter_0"
+    iter_dir.mkdir(parents=True)
+    assert _load_iter_channel_catalog(iter_dir) is None

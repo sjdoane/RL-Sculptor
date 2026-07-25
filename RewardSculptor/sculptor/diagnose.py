@@ -136,7 +136,12 @@ class _ProposedEditModel(BaseModel):
             "suggested_value null (or describe the ideal formula in prose "
             "without using the ungrounded field as code). The editor stage "
             "skips these edits; they serve as recorded proposals for the "
-            "adapter author to expose new env state."
+            "adapter author to expose new env state. "
+            "FIRST check held_out_metric_observables in the reward contract: "
+            "an observable listed there already EXISTS and is measured by the "
+            "judge, so requesting it here is a false signal that wastes the "
+            "iteration. Reward code being unable to READ a channel is the "
+            "deliberate metric firewall, NOT a missing field."
         ),
     )
 
@@ -599,7 +604,65 @@ def _format_training_feedback(data: dict) -> str:
     return "\n".join(lines)
 
 
-def _render_reward_contract(contract) -> str:
+def _load_iter_channel_catalog(iter_dir: Path):
+    """Fail-soft: the authored-world catalog for the project owning
+    `iter_dir` (`<project>/runs/iter_N`), or None.
+
+    Absence is the normal case for legacy/registered-task projects and must
+    never break a diagnosis — identical discipline to every other optional
+    artifact this module loads.
+    """
+    try:
+        from sculptor.world.channels import load_project_channel_catalog
+        return load_project_channel_catalog(iter_dir.parent.parent)
+    except Exception:  # noqa: BLE001 — provenance is advisory, the loop is not
+        return None
+
+
+def _render_held_out_observables(catalog) -> str:
+    """Name the metric_only channels that ALREADY EXIST.
+
+    §Iter-29 regression: the diagnoser was told only that held-out channels
+    are "structurally excluded" from its evidence summary — never that they
+    exist or what they are called. It concluded no robot↔object contact
+    observable existed at all, inferred contact from a box-VELOCITY proxy
+    (blind to a robot leaning on a stationary box), and burned the iteration
+    emitting a `requires_env_extension` request for a `box_contact` field
+    that was already compiled as `contact__forbidden__{0..3}`.
+
+    Naming the inventory (names only — never values, which would breach the
+    metric firewall) is what makes `requires_env_extension` an honest
+    "this observable does not exist" signal instead of a guess.
+    """
+    if catalog is None:
+        return ""
+    try:
+        names = sorted(
+            channel.name for channel in catalog.channels
+            if channel.access == "metric_only")
+    except Exception:  # noqa: BLE001
+        return ""
+    if not names:
+        return ""
+    return (
+        "\nheld_out_metric_observables (THESE ALREADY EXIST — the held-out "
+        "judge scores them):\n"
+        f"  {', '.join(names)}\n"
+        "  Reward code may NOT read or reconstruct these; that separation is "
+        "deliberate.\n"
+        "  But they ARE measured, so do NOT set requires_env_extension asking "
+        "for an\n"
+        "  observable this list already covers, and do NOT substitute a weaker "
+        "proxy\n"
+        "  (e.g. inferring contact from an object's VELOCITY — that is blind to "
+        "resting\n"
+        "  or leaning contact that never moves the object). Cite the channel by "
+        "name\n"
+        "  and describe the physical effect instead."
+    )
+
+
+def _render_reward_contract(contract, catalog=None) -> str:
     obs = getattr(contract, "observation_space_spec", None)
     act = getattr(contract, "action_space_spec", None)
     return (
@@ -607,6 +670,7 @@ def _render_reward_contract(contract) -> str:
         f"action_space:      {act}\n"
         f"expected_info_keys: {list(contract.expected_info_keys)}\n"
         f"expected_components: {contract.expected_components}"
+        f"{_render_held_out_observables(catalog)}"
     )
 
 
@@ -1139,7 +1203,8 @@ def diagnose(
             "passing a dict isn't enough because we need reward_contract() from the "
             "instantiated adapter.")
     contract = adapter.reward_contract()
-    contract_text = _render_reward_contract(contract)
+    contract_text = _render_reward_contract(
+        contract, _load_iter_channel_catalog(iter_dir))
 
     # §env generalization 3/4: the active env spec — but ONLY when it is
     # the loop-MANAGED per-project file (env/current.json next to the
