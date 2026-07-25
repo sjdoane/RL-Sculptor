@@ -113,7 +113,7 @@ Do these top-to-bottom. Each is a substantial chunk. Fully unit-test each before
 - UI backend: `reward-sculptor-ui/backend/` (routes: `worlds.py`, `missions.py`, `runs`/`policies.py`; services: `world_store.py`, `mission_jobs.py`, `run_manager.py`, `metric_store.py`).
 - UI frontend: `reward-sculptor-ui/frontend/src/` (pages under `components/`: `WorldTab`, `WorldViewer3D`, `RewardsTab`, `RunsTab`, `KnowledgeGraphTab`, `PhysicsTab`, `ReportsTab`, `RobotViewer`, dialogs `AuthorWorldDialog`/`NewMissionDialog`/`NewRunDialog`/`ReferencePickerDialog`; routing in `App.tsx`).
 
-**First action on "read handoff": begin Task 1.**
+**First action on "read handoff": read §9 for current state, then begin the top open task.**
 
 ---
 
@@ -147,3 +147,93 @@ Next action: commit this slice, then execute §6 through the real browser before
 starting Task 2. In particular, create/attach a reference and confirm the
 Rewards composition card appears in both themes and the browser console stays
 clean.
+
+---
+
+## 9. Progress update 2026-07-25 (Claude Opus 5) — read this first
+
+### What landed this session
+
+| commit | what |
+|---|---|
+| `343d389` feat(llm) | **Every in-system role moved to `claude-opus-5`** (was fable-5). The `calibration` role stays on `opus-4-8` — RESEARCH_GAP_ANALYSIS §3.5 requires it model-DISJOINT from `metric_gen` or a shared blind spot passes L2 agreement unnoticed. That invariant had no test; it has one now. Also routed the UI actuator-datasheet extractor through the registry (it hardcoded `opus-4-7`, bypassing provenance). |
+| `ad02825` fix(diagnose) | Diagnose now renders `held_out_metric_observables` (names only) beside `expected_info_keys`. See "the iter-29 finding" below. |
+| `d4a9134` feat(refs) | **`sculptor/refs/compose.py` — compose novel motions from spans of several solved clips.** The headline capability. |
+| `cfaa8f6` feat(refs) | `compose_and_register` — composites become first-class library clips (tier K, multi-parent provenance, license conjunction). |
+| `870423a` feat(ui) | Compose UI in the reference picker + **a real nested-modal layout fix** (see below). |
+| `bf641c0` feat(refs) | `sculptor/refs/dr_calibration.py` — behavior-matched push sizing + task-typed DR. |
+
+**Test state: `2294 passed, 1 skipped (jax), 0 failed`** for the library
+(`MUJOCO_GL=egl uv run pytest tests/ -q --ignore=tests/test_refs_preview.py`),
+**579 passed** for the UI backend. Note the baseline in §5 is stale: the 3
+`test_world_runtime` failures it says to expect are **fixed** — expect zero.
+
+### The iter-29 finding (closes out the Codex showcase campaign)
+
+The `g1-lab-showcase-weave-and-stop` campaign ran 29 iterations and **regressed**.
+Peak objective fitness was **0.247 at iter 13**; iters 27/28/29 all scored
+**0.0** with `order_ok_frac` ~0.0. Each "recovery" iteration added another
+geometric constraint (clearance chord → through-disk → predicate depth) and
+route completion collapsed. This is the scalar-shaping oscillation
+`docs/RESEARCH_DIRECTION.md` predicts, and it is the evidence for the pivot —
+**do not launch iter 30 of the same loop.**
+
+Iter 29 also burned itself emitting `requires_env_extension` for a `box_contact`
+field that **already existed** as `contact__forbidden__{0..3}`. Root cause: the
+diagnoser was told held-out channels were "structurally excluded" from its
+evidence but never that they EXIST or what they are named, so it inferred
+contact from box VELOCITY — blind to a robot leaning on a stationary box, which
+is exactly the failure it exhibited. `build_partition_prompt_block` already
+names those channels but was wired only into `edit.py`; the diagnoser is the
+stage that emits `requires_env_extension`. Fixed in `ad02825`.
+
+### The new capability: compose (`sculptor/refs/compose.py`)
+
+Every reference consumer was **single-clip**. A goal whose motion is not
+substantially contained in some single clip had no reference and fell through
+to `refs.synth` (an LLM sketch) or ran blind. Compose stitches spans of
+*different* solved clips into one candidate, so every frame stays real solved
+data. Verified on the real 6,013-clip library: `running_on_spot` +
+`one_leg_jump` + `kicking1` (mixed 60/120 fps) → a 3.70 s jumping kick that
+exists in no single clip, seams at 0.023 and 0.009 rad.
+
+Continuity is the whole problem — SE(2)-align each seam (the kick clip needed
+−1.52 rad or the root teleports), smoothstep cross-fade (C1, so the blend adds
+no velocity step), recompute velocities from the composed positions, reorder
+joints by NAME (positional composition silently swaps limbs).
+
+**Honest boundary, recorded in the artifact:** kinematic only. Momentum is not
+conserved across a seam. Output is `certified: false` at tier K, and
+`refs.track`'s existing Tier-D physics run is the admission filter. **Compose
+then track; never compose and trust.**
+
+### A real UI bug worth knowing about
+
+`.rs-modal` animates `transform` with fill-mode `both`, so it keeps a non-none
+transform forever — which makes it a **containing block for `position: fixed`
+descendants**. Every modal opened from inside another modal had its fixed scrim
+resolve against the parent dialog's box instead of the viewport, clipping its
+own header and footer. `Modal` now portals its scrim to `<body>`. Found only by
+driving the browser — the automated overflow audit passed it.
+
+### Demonstration (evidence in `reward-sculptor-ui/.ui-verification/`)
+
+`2026-07-25-compose/` — all 12 pages, light + dark, zero console errors, no
+horizontal overflow, plus the compose flow end to end.
+`2026-07-25-demo/` — a real GPU run launched through the UI whose reference is
+the composed `novel-running-jump-kick--g1`. Both composites rank **above** the
+real kick clips for "jumping kick" (25.75 / 19.61 vs 18.51).
+
+### Open, in priority order
+
+1. **TASK 2 — OGMP modes** (§4). Still the best value/effort left and it is the
+   reviewer's own framework. `compose`'s per-segment structure is a natural
+   fit: one composed segment ≈ one mode, and `meta.composition.segments`
+   already carries the boundaries a transition guard would key on.
+2. **Wire `dr_calibration` into the live pipeline.** The module is pure and
+   tested but nothing calls it yet — `sculpt.py` / `_mjlab_runner.py` should
+   pull the task-typed profile and the momentum-matched push instead of the
+   flat always-on set.
+3. **Tier-D certify a composite.** `refs.track` exists and compose emits
+   `certified: false`; nothing has closed that loop on a composed clip yet.
+4. **TASK 3 (RMA teacher/student)** and **TASK 4** in §4 are untouched.
