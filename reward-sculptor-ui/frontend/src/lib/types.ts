@@ -1437,6 +1437,52 @@ export interface RefIndexRow {
   has_preview: boolean;
 }
 
+// POST /references/compose — one span of one already-registered clip.
+export interface ComposeSegment {
+  clip_id: string;
+  t_start_s?: number | null;
+  t_end_s?: number | null;
+  label?: string | null;
+}
+
+// Per-seam discontinuity measured on the composed clip. This is the number
+// that decides whether a composite is worth a tracking run, so it is shown
+// rather than reduced to a pass/fail badge.
+export interface ComposeSeam {
+  frame: number;
+  time_s: number;
+  max_joint_jump_rad?: number;
+  mean_joint_jump_rad?: number;
+  root_z_jump_m?: number;
+}
+
+export interface ComposeQc {
+  n_frames: number;
+  duration_s: number;
+  n_sources: number;
+  root_z_range: [number, number] | null;
+  composition: {
+    seams: ComposeSeam[];
+    peak_joint_vel_rad_s: number | null;
+    peak_root_vel_z_m_s: number | null;
+    duration_s: number;
+  };
+}
+
+export interface ComposeResult {
+  clip_id: string;
+  robot: string;
+  tier: string;
+  /** Always false on creation — refs.track certification is the only
+   *  thing that promotes a composite past kinematics. */
+  certified: boolean;
+  license: string;
+  attribution: string;
+  parent_clip_ids: string[];
+  qc: ComposeQc;
+  next_step: string;
+}
+
 // GET /references/{clip_id} — provenance.json content + the index row.
 export interface RefDetail {
   index: RefIndexRow;

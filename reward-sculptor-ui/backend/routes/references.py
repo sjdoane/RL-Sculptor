@@ -149,6 +149,104 @@ def list_or_search_references(
     return rows[:k] if k else rows
 
 
+# ── POST /references/compose ─────────────────────────────────────────
+class ComposeSegment(BaseModel):
+    """One span of one already-registered library clip."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    clip_id: str
+    t_start_s: Optional[float] = None
+    t_end_s: Optional[float] = None
+    label: Optional[str] = None
+
+
+class ComposeRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    clip_id: str
+    robot: str = "g1"
+    segments: list[ComposeSegment]
+    text: str = ""
+    labels: list[str] = []
+    blend_s: float = 0.20
+    target_fps: Optional[float] = None
+    # `strict=False` still MEASURES every seam — it only declines to refuse.
+    # Exposed because a marginal composite is sometimes worth eyeballing in
+    # the preview before deciding, and the seam report says how bad it is.
+    strict: bool = True
+
+
+@router.post(
+    "/references/compose",
+    responses={400: {"model": ProblemDetail}, 409: {"model": ProblemDetail}},
+)
+def compose_reference_clip(body: ComposeRequest) -> Any:
+    """Compose spans of several solved clips into one novel candidate clip.
+
+    This is the "solve for a motion nobody recorded" path: the goal's phases
+    each exist in some clip, just never in the same one. The result registers
+    at tier K and is explicitly NOT certified — `sculptor.refs.track` is what
+    promotes it — so the response returns the seam report for the caller to
+    judge before spending a tracking run.
+    """
+    from sculptor.refs import library
+    from sculptor.refs.compose import ComposeError, compose_and_register
+
+    if not _valid_clip_id(body.clip_id):
+        return _problem(
+            status.HTTP_400_BAD_REQUEST, "invalid clip_id",
+            detail=f"{body.clip_id!r} must match {_CLIP_ID_RE.pattern}")
+    if len(body.segments) < 2:
+        return _problem(
+            status.HTTP_400_BAD_REQUEST, "need at least 2 segments",
+            detail="a single span is a crop, not a composition")
+    for seg in body.segments:
+        if not _valid_clip_id(seg.clip_id):
+            return _problem(
+                status.HTTP_400_BAD_REQUEST, "invalid source clip_id",
+                detail=f"{seg.clip_id!r} must match {_CLIP_ID_RE.pattern}")
+    if _find_index_row(body.clip_id) is not None:
+        return _problem(
+            status.HTTP_409_CONFLICT, "clip_id already exists",
+            detail=f"{body.clip_id!r} is already in the library")
+
+    try:
+        composed = compose_and_register(
+            body.robot,
+            [seg.model_dump(exclude_none=True) for seg in body.segments],
+            clip_id=body.clip_id,
+            text=body.text,
+            labels=body.labels,
+            blend_s=body.blend_s,
+            target_fps=body.target_fps,
+            strict=body.strict,
+        )
+    except ComposeError as exc:
+        # Every ComposeError is a caller-fixable statement about the spans
+        # (they do not meet, the joint sets differ, a source is missing), so
+        # it is a 400 carrying the actual measurement, not a 500.
+        return _problem(
+            status.HTTP_400_BAD_REQUEST, "cannot compose these segments",
+            detail=str(exc))
+
+    library.rebuild_index()
+    prov = composed.provenance
+    return {
+        "clip_id": composed.clip_id,
+        "robot": composed.robot,
+        "tier": prov.get("tier"),
+        "certified": False,
+        "license": prov.get("license"),
+        "attribution": prov.get("attribution"),
+        "parent_clip_ids": (prov.get("source") or {}).get("parent_clip_ids", []),
+        "qc": prov.get("qc", {}),
+        "next_step": (
+            "Kinematic candidate only — momentum is not conserved across a "
+            "seam. Certify with sculptor.refs.track before training on it."),
+    }
+
+
 # ── GET /references/{clip_id} ────────────────────────────────────────
 @router.get(
     "/references/{clip_id}",

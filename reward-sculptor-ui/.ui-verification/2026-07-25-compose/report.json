@@ -1,0 +1,221 @@
+{
+  "results": [
+    {
+      "file": "01-dashboard-light.png",
+      "name": "dashboard",
+      "theme": "light",
+      "note": "",
+      "overflow": 0,
+      "clipped": [],
+      "title": "Reward Sculptor"
+    },
+    {
+      "file": "02-projects-light.png",
+      "name": "projects",
+      "theme": "light",
+      "note": "",
+      "overflow": 0,
+      "clipped": [],
+      "title": "Reward Sculptor"
+    },
+    {
+      "file": "03-saved-light.png",
+      "name": "saved",
+      "theme": "light",
+      "note": "",
+      "overflow": 0,
+      "clipped": [],
+      "title": "Reward Sculptor"
+    },
+    {
+      "file": "04-library-light.png",
+      "name": "library",
+      "theme": "light",
+      "note": "",
+      "overflow": 0,
+      "clipped": [],
+      "title": "Reward Sculptor"
+    },
+    {
+      "file": "05-settings-light.png",
+      "name": "settings",
+      "theme": "light",
+      "note": "",
+      "overflow": 0,
+      "clipped": [],
+      "title": "Reward Sculptor"
+    },
+    {
+      "file": "06-proj-overview-light.png",
+      "name": "proj-overview",
+      "theme": "light",
+      "note": "",
+      "overflow": 0,
+      "clipped": [],
+      "title": "Reward Sculptor"
+    },
+    {
+      "file": "07-proj-world-light.png",
+      "name": "proj-world",
+      "theme": "light",
+      "note": "",
+      "overflow": 0,
+      "clipped": [],
+      "title": "Reward Sculptor"
+    },
+    {
+      "file": "08-proj-rewards-light.png",
+      "name": "proj-rewards",
+      "theme": "light",
+      "note": "",
+      "overflow": 0,
+      "clipped": [],
+      "title": "Reward Sculptor"
+    },
+    {
+      "file": "09-proj-physics-light.png",
+      "name": "proj-physics",
+      "theme": "light",
+      "note": "",
+      "overflow": 0,
+      "clipped": [],
+      "title": "Reward Sculptor"
+    },
+    {
+      "file": "10-proj-knowledge-light.png",
+      "name": "proj-knowledge",
+      "theme": "light",
+      "note": "",
+      "overflow": 0,
+      "clipped": [],
+      "title": "Reward Sculptor"
+    },
+    {
+      "file": "11-proj-training-light.png",
+      "name": "proj-training",
+      "theme": "light",
+      "note": "",
+      "overflow": 0,
+      "clipped": [],
+      "title": "Reward Sculptor"
+    },
+    {
+      "file": "12-proj-results-light.png",
+      "name": "proj-results",
+      "theme": "light",
+      "note": "",
+      "overflow": 0,
+      "clipped": [],
+      "title": "Reward Sculptor"
+    },
+    {
+      "file": "13-dashboard-dark.png",
+      "name": "dashboard",
+      "theme": "dark",
+      "note": "",
+      "overflow": 0,
+      "clipped": [],
+      "title": "Reward Sculptor"
+    },
+    {
+      "file": "14-projects-dark.png",
+      "name": "projects",
+      "theme": "dark",
+      "note": "",
+      "overflow": 0,
+      "clipped": [],
+      "title": "Reward Sculptor"
+    },
+    {
+      "file": "15-saved-dark.png",
+      "name": "saved",
+      "theme": "dark",
+      "note": "",
+      "overflow": 0,
+      "clipped": [],
+      "title": "Reward Sculptor"
+    },
+    {
+      "file": "16-library-dark.png",
+      "name": "library",
+      "theme": "dark",
+      "note": "",
+      "overflow": 0,
+      "clipped": [],
+      "title": "Reward Sculptor"
+    },
+    {
+      "file": "17-settings-dark.png",
+      "name": "settings",
+      "theme": "dark",
+      "note": "",
+      "overflow": 0,
+      "clipped": [],
+      "title": "Reward Sculptor"
+    },
+    {
+      "file": "18-proj-overview-dark.png",
+      "name": "proj-overview",
+      "theme": "dark",
+      "note": "",
+      "overflow": 0,
+      "clipped": [],
+      "title": "Reward Sculptor"
+    },
+    {
+      "file": "19-proj-world-dark.png",
+      "name": "proj-world",
+      "theme": "dark",
+      "note": "",
+      "overflow": 0,
+      "clipped": [],
+      "title": "Reward Sculptor"
+    },
+    {
+      "file": "20-proj-rewards-dark.png",
+      "name": "proj-rewards",
+      "theme": "dark",
+      "note": "",
+      "overflow": 0,
+      "clipped": [],
+      "title": "Reward Sculptor"
+    },
+    {
+      "file": "21-proj-physics-dark.png",
+      "name": "proj-physics",
+      "theme": "dark",
+      "note": "",
+      "overflow": 0,
+      "clipped": [],
+      "title": "Reward Sculptor"
+    },
+    {
+      "file": "22-proj-knowledge-dark.png",
+      "name": "proj-knowledge",
+      "theme": "dark",
+      "note": "",
+      "overflow": 0,
+      "clipped": [],
+      "title": "Reward Sculptor"
+    },
+    {
+      "file": "23-proj-training-dark.png",
+      "name": "proj-training",
+      "theme": "dark",
+      "note": "",
+      "overflow": 0,
+      "clipped": [],
+      "title": "Reward Sculptor"
+    },
+    {
+      "file": "24-proj-results-dark.png",
+      "name": "proj-results",
+      "theme": "dark",
+      "note": "",
+      "overflow": 0,
+      "clipped": [],
+      "title": "Reward Sculptor"
+    }
+  ],
+  "consoleErrors": []
+}

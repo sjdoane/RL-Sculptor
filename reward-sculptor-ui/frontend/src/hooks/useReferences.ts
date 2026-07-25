@@ -2,6 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 
 import {
   attachStageReference,
+  composeReference,
   detachStageReference,
   listReferences,
   searchReferences,
@@ -73,6 +74,22 @@ export function useDetachStageReference(slug: string) {
       detachStageReference(slug, missionSlug, stageName),
     onSuccess: (_mission, { missionSlug }) => {
       qc.invalidateQueries({ queryKey: qk.mission(slug, missionSlug) });
+    },
+  });
+}
+
+/** POST /references/compose — build a novel clip from spans of solved ones.
+ *
+ *  Invalidates every reference query on success: the composite is a real
+ *  library clip the moment it registers, so the picker's browse listing and
+ *  any open search must show it immediately (it is usually the clip the user
+ *  is about to attach). */
+export function useComposeReference() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: composeReference,
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ["references"] });
     },
   });
 }

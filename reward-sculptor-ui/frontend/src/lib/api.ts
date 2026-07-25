@@ -1166,7 +1166,13 @@ export async function purgeTrash(entryId: string): Promise<void> {
 }
 
 // ── Reference library (R1) ─────────────────────────────────────────────
-import type { RefDetail, RefIndexRow, RefMatch } from "./types";
+import type {
+  ComposeResult,
+  ComposeSegment,
+  RefDetail,
+  RefIndexRow,
+  RefMatch,
+} from "./types";
 
 /** GET /references?robot=&q=&k=&llm= — search hits, ranked. `useLlm`
  *  defaults to false: the UI's as-you-type path stays deterministic
@@ -1190,6 +1196,30 @@ export async function listReferences(opts?: { robot?: string }): Promise<RefInde
   const u = new URL("/api/references", window.location.origin);
   u.searchParams.set("robot", opts?.robot ?? "g1");
   return handle<RefIndexRow[]>(await fetch(u.pathname + u.search));
+}
+
+/** POST /references/compose — build ONE novel clip out of spans of several
+ *  already-solved clips. This is the path for a goal whose motion exists in
+ *  no single clip: its phases were each recorded, just never together.
+ *  The result registers at tier K and is NOT certified; the response carries
+ *  the seam measurements so the caller can judge it before spending a
+ *  tracking run on it. */
+export async function composeReference(body: {
+  clip_id: string;
+  robot?: string;
+  segments: ComposeSegment[];
+  text?: string;
+  labels?: string[];
+  blend_s?: number;
+  strict?: boolean;
+}): Promise<ComposeResult> {
+  return handle<ComposeResult>(
+    await fetch("/api/references/compose", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  );
 }
 
 export async function getReference(clipId: string): Promise<RefDetail> {

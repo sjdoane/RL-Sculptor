@@ -618,3 +618,154 @@ def test_detach_reference_404_unknown_stage(
 
     r = client.delete(f"/projects/{slug}/missions/m1/stages/no-such-stage/reference")
     assert r.status_code == 404
+
+
+# ── POST /references/compose ───────────────────────────────────────────
+# Composition is how the system reaches a motion that exists in NO single
+# clip: the goal's phases were each recorded, just never together. These
+# pin the route's guards and the honesty of what it returns.
+def _seed_composable(root: Path) -> None:
+    """Two richer clips (joints + root pose) that can actually be composed."""
+    import numpy as np
+
+    from sculptor.reference import save_clip
+    from sculptor.refs import library
+
+    for idx, clip_id in enumerate(("src_alpha", "src_beta")):
+        n, fps = 120, 60.0
+        t = np.arange(n, dtype=np.float64) / fps
+        jp = (0.05 * idx + 0.10 * np.sin(2 * np.pi * 0.5 * t)[:, None]
+              + 0.01 * np.arange(4)[None, :])
+        clip = {
+            "fps": fps,
+            "joint_names": [f"joint_{i}" for i in range(4)],
+            "root_pos_z": 0.70 + 0.02 * np.sin(2 * np.pi * 0.5 * t),
+            "root_pos_xy": np.stack([0.5 * t, np.zeros(n)], axis=1),
+            "root_quat_wxyz": np.tile(np.array([1.0, 0.0, 0.0, 0.0]), (n, 1)),
+            "joint_pos": jp,
+        }
+        d = library.clip_dir("g1", clip_id, root=root)
+        save_clip(d / "clip.npz", clip)
+        _write_provenance(d, clip_id=clip_id, text=f"source {clip_id}",
+                          labels=["source"], n_frames=n, fps=fps)
+    library.rebuild_index(root=root)
+
+
+def test_compose_creates_a_novel_clip_from_two_sources(
+    client: TestClient, refs_root: Path,
+) -> None:
+    _seed_composable(refs_root)
+    r = client.post("/references/compose", json={
+        "clip_id": "novel-motion--g1",
+        "robot": "g1",
+        "text": "a motion no single clip contains",
+        "segments": [
+            {"clip_id": "src_alpha", "label": "approach"},
+            {"clip_id": "src_beta", "label": "strike"},
+        ],
+    })
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["clip_id"] == "novel-motion--g1"
+    assert body["parent_clip_ids"] == ["src_alpha", "src_beta"]
+    # Kinematic candidate, never presented as solved.
+    assert body["tier"] == "K"
+    assert body["certified"] is False
+    assert "momentum is not conserved" in body["next_step"]
+    # The seam measurements the caller needs to judge it are returned.
+    assert body["qc"]["n_sources"] == 2
+    assert len(body["qc"]["composition"]["seams"]) == 1
+
+    # And it is immediately reachable through the normal library surface,
+    # so the reference picker / stage attach need no special case.
+    detail = client.get("/references/novel-motion--g1")
+    assert detail.status_code == 200
+    assert detail.json()["provenance"]["source"]["kind"] == "compose"
+
+
+def test_compose_rejects_a_single_segment(
+    client: TestClient, refs_root: Path,
+) -> None:
+    _seed_composable(refs_root)
+    r = client.post("/references/compose", json={
+        "clip_id": "novel--g1", "robot": "g1",
+        "segments": [{"clip_id": "src_alpha"}],
+    })
+    assert r.status_code == 400
+    assert "at least 2" in r.json()["title"]
+
+
+def test_compose_rejects_traversal_shaped_ids(
+    client: TestClient, refs_root: Path,
+) -> None:
+    _seed_composable(refs_root)
+    r = client.post("/references/compose", json={
+        "clip_id": "../../etc/passwd", "robot": "g1",
+        "segments": [{"clip_id": "src_alpha"}, {"clip_id": "src_beta"}],
+    })
+    assert r.status_code == 400
+    r2 = client.post("/references/compose", json={
+        "clip_id": "novel--g1", "robot": "g1",
+        "segments": [{"clip_id": "../../x"}, {"clip_id": "src_beta"}],
+    })
+    assert r2.status_code == 400
+
+
+def test_compose_refuses_to_overwrite_an_existing_clip(
+    client: TestClient, refs_root: Path,
+) -> None:
+    _seed_composable(refs_root)
+    r = client.post("/references/compose", json={
+        "clip_id": "src_alpha", "robot": "g1",
+        "segments": [{"clip_id": "src_alpha"}, {"clip_id": "src_beta"}],
+    })
+    assert r.status_code == 409
+
+
+def test_compose_missing_source_is_a_400_not_a_500(
+    client: TestClient, refs_root: Path,
+) -> None:
+    """A ComposeError is always a caller-fixable statement about the spans,
+    so it must surface as a 400 carrying the real reason."""
+    _seed_composable(refs_root)
+    r = client.post("/references/compose", json={
+        "clip_id": "novel--g1", "robot": "g1",
+        "segments": [{"clip_id": "src_alpha"}, {"clip_id": "does_not_exist"}],
+    })
+    assert r.status_code == 400
+    assert "not in the g1 library" in r.json()["detail"]
+
+
+def test_compose_surfaces_the_seam_measurement_on_refusal(
+    client: TestClient, refs_root: Path,
+) -> None:
+    """Spans that do not meet are refused in cheap kinematics rather than in
+    an expensive tracking run — and the response says by how much."""
+    import numpy as np
+
+    from sculptor.reference import save_clip
+    from sculptor.refs import library
+
+    _seed_composable(refs_root)
+    n, fps = 120, 60.0
+    t = np.arange(n, dtype=np.float64) / fps
+    far = {
+        "fps": fps,
+        "joint_names": [f"joint_{i}" for i in range(4)],
+        "root_pos_z": 0.70 + 0.02 * np.sin(2 * np.pi * 0.5 * t),
+        "root_pos_xy": np.stack([0.5 * t, np.zeros(n)], axis=1),
+        "root_quat_wxyz": np.tile(np.array([1.0, 0.0, 0.0, 0.0]), (n, 1)),
+        "joint_pos": np.full((n, 4), 5.0),   # radians away from src_alpha
+    }
+    d = library.clip_dir("g1", "src_far", root=refs_root)
+    save_clip(d / "clip.npz", far)
+    _write_provenance(d, clip_id="src_far", text="far", labels=[],
+                      n_frames=n, fps=fps)
+    library.rebuild_index(root=refs_root)
+
+    r = client.post("/references/compose", json={
+        "clip_id": "novel--g1", "robot": "g1", "blend_s": 0.0,
+        "segments": [{"clip_id": "src_alpha"}, {"clip_id": "src_far"}],
+    })
+    assert r.status_code == 400
+    assert "seam discontinuity" in r.json()["detail"]

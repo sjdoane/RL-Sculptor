@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
 
+import { ComposeMotionDialog } from "@/components/ComposeMotionDialog";
 import { Icon } from "@/components/rs/icon";
 import { Btn, EmptyState, Modal } from "@/components/rs/primitives";
 import {
@@ -137,6 +138,7 @@ export function ReferencePickerDialog({
   }, [queryInput]);
 
   const [selectedClipId, setSelectedClipId] = useState<string | null>(currentClipId ?? null);
+  const [composing, setComposing] = useState(false);
 
   const trimmed = debouncedQuery.trim();
   const search = useReferenceSearch(trimmed, {
@@ -197,6 +199,18 @@ export function ReferencePickerDialog({
       onClose={onClose}
       footer={
         <>
+          {/* No single clip covers every goal. Composing is the path when the
+              motion exists only as phases spread across several clips, so the
+              affordance belongs here — at the moment the search comes up short. */}
+          <Btn
+            kind="quiet"
+            icon="plus"
+            onClick={() => setComposing(true)}
+            disabled={isCommitting}
+          >
+            Compose novel
+          </Btn>
+          <span className="rs-grow" />
           <Btn kind="quiet" onClick={onClose} disabled={isCommitting}>Cancel</Btn>
           <Btn
             kind="primary"
@@ -238,7 +252,11 @@ export function ReferencePickerDialog({
         />
       )}
       {!isLoading && !isError && !libraryEmpty && trimmed.length > 0 && rows.length === 0 && (
-        <EmptyState icon="search" title="No matches" sub={`Nothing matches "${trimmed}".`} />
+        <EmptyState
+          icon="search"
+          title="No matches"
+          sub={`Nothing matches "${trimmed}". If this motion exists only as separate phases, compose it from them.`}
+        />
       )}
 
       {rows.length > 0 && (
@@ -259,6 +277,20 @@ export function ReferencePickerDialog({
           <div className="rs-sub" style={{ fontSize: 10.5, marginBottom: 6 }}>Preview</div>
           <PreviewImage clipId={selectedClipId} />
         </div>
+      )}
+
+      {composing && (
+        <ComposeMotionDialog
+          robot={robot}
+          onClose={() => setComposing(false)}
+          onComposed={(clipId) => {
+            // The composite is almost always the clip the user came here to
+            // attach, so select it and put it in the search box rather than
+            // making them hunt for it in a 6k-row listing.
+            setSelectedClipId(clipId);
+            setQueryInput(clipId);
+          }}
+        />
       )}
     </Modal>
   );

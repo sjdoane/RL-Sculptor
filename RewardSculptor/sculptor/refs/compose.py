@@ -629,6 +629,17 @@ def compose_and_register(
     d = library.clip_dir(robot, clip_id, root=root)
     save_clip(d / library.CLIP_FILENAME, composite)
     prov_path = library.write_provenance(robot, clip_id, prov, root=root)
+
+    # Render the keyframe strip. A composite is the clip a user most wants to
+    # LOOK at — it is novel and uncertified, and a glance at the strip catches
+    # a nonsense seam that the scalar seam report cannot convey. Non-fatal by
+    # the same rule ingest uses: a missing preview must never fail a register.
+    try:
+        from sculptor.refs.preview import render_preview_png
+        render_preview_png(composite, d / "preview.png")
+    except Exception:  # noqa: BLE001 — headless/EGL-less hosts have no renderer
+        pass
+
     return library.LibraryClip(
         robot=robot, clip_id=clip_id,
         clip_path=Path(d) / library.CLIP_FILENAME,

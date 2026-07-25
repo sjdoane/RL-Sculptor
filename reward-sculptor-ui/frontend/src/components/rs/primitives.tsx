@@ -1,4 +1,5 @@
 import { useEffect, useRef } from "react";
+import { createPortal } from "react-dom";
 import type {
   ButtonHTMLAttributes, CSSProperties, ReactNode,
 } from "react";
@@ -393,7 +394,15 @@ export function Modal({
       prev?.focus?.();
     };
   }, []);
-  return (
+  // Portal to <body>. `.rs-modal` animates `transform` with fill-mode `both`,
+  // so it keeps a non-none transform forever — which makes it a containing
+  // block for `position: fixed` descendants. A modal rendered INSIDE another
+  // modal therefore had its `position: fixed` scrim resolve against the parent
+  // dialog's box instead of the viewport, clipping the nested dialog's header
+  // and footer (seen on the reference picker's compose dialog). The portal
+  // takes the scrim out of that subtree so `fixed` means fixed again.
+  // MODAL_STACK still orders Escape/focus-trap correctly across nesting.
+  return createPortal(
     <div
       className="rs-scrim"
       onPointerDown={(e) => { scrimPointerDown.current = e.target === e.currentTarget; }}
@@ -425,6 +434,7 @@ export function Modal({
         <div className={"rs-modal-body" + (flush ? " flush" : "")}>{children}</div>
         {footer && <div className="rs-modal-foot">{footer}</div>}
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }
