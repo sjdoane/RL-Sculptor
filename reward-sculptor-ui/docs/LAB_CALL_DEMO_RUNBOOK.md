@@ -647,3 +647,52 @@ also prove 750 PPO iterations, 1,024 environments, seed 42, lane 10, two
 1,000-step 1920×1080 episodes, `gen_003` observe-only, reward-v19 posture
 revert, entropy `0.0075`, and every physical controller/contact/firewall
 invariant above. PPO is active. Leave the worker untouched until completion.
+
+## Current authoritative correction after iter 24
+
+Iter 24 restored the real task but is still diagnostic, not final evidence.
+The physical scene is aligned at `0.00 m`; 63/64 lanes entered every actual
+waypoint disk and the finish in order, 49/64 were contact-free, and all 64
+avoided a sustained fall. All 15 contact failures were on box 2. The disclosed
+lane 10 visibly performs the alternating weave around the real orange boxes,
+enters the finish at 15.90 seconds, makes no forbidden contact, and holds
+horizontal speed below `0.12 m/s` for 106 uninterrupted frames.
+
+It nevertheless ends in a deep squat with raised arms. Lane 10's terminal
+speed channels are quiet (`0.0079 m/s` horizontal, `0.196 rad/s` angular,
+`0.304 rad/s` joint RMS), but its default-pose RMS error is `1.003 rad`.
+Across the full batch, 18/64 lanes achieved the horizontal hold and **0/64**
+achieved the posture-qualified whole-body hold. Never present iter 24 as
+success.
+
+The terminal runtime now treats posture as a conjunction rather than a small
+bonus. The velocity-based stillness score is multiplied by the geometric mean
+of the posture signals generically available on the articulation:
+projected-gravity uprightness and RMS distance from its own default joint
+pose. This removes the high-reward motionless-collapse basin while preserving
+dense gradients, full reward for honest upright stillness, and fail-soft
+behavior when a custom/fixed-base robot lacks a posture signal. The change has
+no robot/task-name keying and does not alter the frozen objective or world.
+
+Verification: Mjlab adapter suite **52 passed**, scoped Ruff (`F,E9`),
+compileall, and diff check pass.
+
+Launch the next proof entirely through **New run -> Advanced**:
+
+- exact promoted-tuple recovery: **off**;
+- reward: **v20** (adds a dense base-height gate to settle income);
+- environment: **v20** (`0.5x` entropy scale);
+- Warm-start checkpoint: **24**;
+- one cycle, 750 PPO iterations, 1,024 environments on `cuda:0`;
+- 1,000 episode steps, two rollout episodes, seed 42, 1920x1080;
+- Evidence environment: **10**;
+- `gen_003` observe-only, no new motion prior.
+
+Require `warm_start_checkpoint_resolved` for iter 24, actor and critic load,
+and the new `multiplicative posture gate` terminal-stillness line before
+leaving the worker alone. Also retain the 1.000 m/s horizon schedule,
+predicate-boundary brake, two-phase clearance controller, 50/25/25 RSI,
+aligned physical boxes, four direct contact sensors at `-8`, full command
+weights, and clearance reward firewall. Final acceptance remains the full
+physical conjunction; no batch aggregate or visually convincing weave can
+substitute for the disclosed lane's posture-qualified 100-frame hold.

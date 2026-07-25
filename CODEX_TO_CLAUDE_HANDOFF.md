@@ -2642,3 +2642,56 @@ physical invariant, including reward-v19 anti-parking recovery, entropy
 reward firewall, aligned boxes, staged controller, and 50/25/25 RSI. PPO
 iteration 0/750 is active on 1,024 environments. Do not edit reload-watched
 core or run intermediate GPU audits until iter 24 finishes.
+
+## Iter 24 route recovery + conjunctive posture correction 2026-07-24 (Codex)
+
+UI job `job_0d2b45c89d3cf056` completed iter 24 and preserved
+`runs/iter_24/checkpoint.pt`. Explicit policy-only recovery from iter 22
+restored the physical task while keeping the current reward/environment
+authority:
+
+- physical-scene audit: `aligned`, maximum error `0.00 m`;
+- ordered real waypoint disks plus finish: **63/64**;
+- waypoint index 5: **63/64**;
+- contact-free: **49/64**, with every failure isolated to box 2
+  (`[0, 15, 0, 0]`);
+- route plus contact-free: **49/64**;
+- no gross fall: **64/64**;
+- literal 100-frame horizontal hold: **18/64**;
+- posture-qualified 100-frame whole-body hold: **0/64**;
+- full physical conjunction: **0/64**.
+
+The precommitted evidence lane 10 is honest diagnostic evidence. It entered
+the four actual waypoint disks and finish at frames
+`[159, 373, 582, 717, 795]`, had zero forbidden-contact frames, and achieved
+106 uninterrupted horizontal-quiet frames. Its terminal horizontal speed was
+`0.0079 m/s`, angular speed `0.196 rad/s`, and joint-velocity RMS
+`0.304 rad/s`, but default-pose RMS error was `1.003 rad`. The full video and
+keyframes visibly show a real alternating weave around the co-located orange
+boxes followed by a deep squat with raised arms. This is not showcase success.
+
+The causal runtime defect was generic: terminal kinematic stillness and
+posture were combined additively, so a perfectly motionless collapsed pose
+could retain roughly 80% of the terminal reward even though the continuity
+streak correctly rejected it. The corrected runtime now multiplies the
+kinematic stillness score by the geometric mean of every available generic
+posture factor (projected-gravity uprightness and distance from the
+articulation's own default joint pose). Honest upright stillness remains
+fully rewarded; a quiet collapse has its credit withheld; missing posture
+signals remain fail-soft for fixed-base/custom adapters. No robot, task,
+object, simulator, or prompt name is used, and the frozen evaluator,
+waypoints, tolerances, hold, contact rules, metric firewall, and atomic tuple
+are unchanged.
+
+Focused verification is **52 passed** in `tests/test_mjlab_adapter.py`;
+scoped Ruff (`F,E9`), compileall, and `git diff --check` pass. Iter 24's
+automatic reward v20 independently adds a dense base-height posture gate to
+`finish_settle`, while env v20 uses the case-grounded `0.5x` entropy scale.
+The next proof should use the ordinary UI New run with exact promoted-tuple
+recovery off, reward v20 + env v20, explicit Warm-start checkpoint **24**,
+the same one-cycle 750-PPO / 1,024-environment / seed-42 / two-episode
+1920x1080 settings, precommitted evidence lane **10**, and `gen_003`
+observe-only. Before leaving PPO alone, require actor+critic load from iter
+24 and the new `multiplicative posture gate` startup line alongside every
+existing physical alignment, staged-route, contact, command, RSI, firewall,
+and horizon invariant.
