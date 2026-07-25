@@ -2576,3 +2576,50 @@ weaving around the actual boxes, every waypoint and finish entered, index 5,
 zero forbidden contact, no sustained fall, upright/default-like posture,
 terminal horizontal speed below `0.12 m/s`, and 100 uninterrupted
 post-completion frames of horizontal, angular, joint, and posture quiet.
+
+## Iter 23 regression + explicit UI checkpoint recovery 2026-07-24 (Codex)
+
+UI job `job_0102595ce1cf9e61` completed and preserved iter 23, but it is
+diagnostic failure, not showcase evidence. The official scene audit is still
+`aligned` with maximum error `0.0 m`, the precommitted evidence lane is
+honestly recorded as lane 10 (return percentile `0.453125`), and direct
+contact supervision remained effective at **62/64 contact-free**. Physical
+task performance nevertheless collapsed:
+
+- waypoint-index maxima were `{0: 48, 1: 4, 2: 11, 3: 1}`;
+- **0/64** reached index 5 or entered the finish;
+- lane 10 stayed beside the first box, never contacted it, and ended about
+  `6.34 m` from the finish;
+- terminal median finish distance was `6.48 m`; no lane met the route/finish/
+  hold conjunction;
+- lane 10's final horizontal speed was low, but default-pose RMS error was
+  about `0.786 rad`, so it was neither a completed route nor an acceptable
+  upright hold.
+
+The aligned world, staged controller, and contact penalty are not the
+regression. Reward v18 doubled the ordinary posture coefficient from `0.15`
+to `0.30` (and added a swing-speed cap), creating a strong stationary basin
+near the first waypoint. The generated `gen_003` metric was observe-only, so
+it must not silently select or roll back a checkpoint; doing so would violate
+the metric firewall.
+
+Commit `62f9a1b` adds a generic, explicit **Warm-start checkpoint** field to
+the ordinary New Run UI. The user supplies only an iteration number. The
+backend resolves it exclusively to this project's non-empty
+`runs/iter_N/checkpoint.pt` or `.zip`, rejects missing/empty or symlink-escaped
+files before GPU work, emits the source path plus full SHA-256, and forwards
+it as `--init-policy`. This is policy-only recovery: it never changes the
+reward, environment tuple, or objective-metric authority. The same commit
+removes a duplicated reference-motion model declaration and clears existing
+Ruff import-order/dead-import findings in the touched run modules.
+
+Verification: backend run suite **51 passed**, frontend TypeScript, scoped
+Ruff, compileall, and `git diff --check` pass.
+
+The next proof must be launched entirely through the UI with exact
+promoted-tuple recovery **off**, current reward v19 + env v19, explicit
+**Warm-start checkpoint = 22**, Auto, one 750-PPO cycle, 1,024 environments,
+seed 42, two 1,000-step 1920x1080 episodes, `gen_003` observe-only, and
+precommitted evidence lane 10. Require the new
+`warm_start_checkpoint_resolved` event and actor+critic load from iter 22
+before leaving PPO alone. Never present iter 23 as success.

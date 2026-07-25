@@ -588,3 +588,49 @@ whole-body stillness at weight `4`, and entropy coefficient `0.0075`. PPO is
 active on 1,024 environments. Leave the worker alone until it finishes; then
 audit only the official artifacts and the disclosed lane-10 video against the
 complete physical acceptance conjunction above.
+
+## Current authoritative correction after iter 23
+
+Iter 23 is not demo evidence. Its physical scene is correctly aligned and
+62/64 evaluation lanes avoided every box contact, but **0/64** completed the
+route or entered the finish. The disclosed lane-10 video honestly shows the
+robot parked beside the first box; it never reached the remainder of the
+course. The batch waypoint-index maxima were `{0:48, 1:4, 2:11, 3:1}`.
+
+Reward v18 over-corrected ordinary posture (coefficient `0.15 → 0.30`) and
+created a stationary first-waypoint basin. Because `gen_003` is observe-only,
+the software must not automatically choose an older checkpoint from its
+scores. Commit `62f9a1b` instead adds an explicit, metric-independent
+**Warm-start checkpoint** field in **New run → Advanced**:
+
+- enter an iteration number, never a filesystem path;
+- the backend accepts only a non-empty checkpoint under this project's exact
+  `runs/iter_N` directory and rejects missing, empty, or escaping files;
+- the launch log records `warm_start_checkpoint_resolved`, the exact path,
+  iteration, and full SHA-256;
+- only actor/critic initialization changes. Reward, environment, frozen
+  objective, fitness mode, and atomic tuple remain exactly as selected.
+
+Verification for the control: backend run suite **51 passed**, frontend
+TypeScript, Ruff, compileall, and diff check pass.
+
+Launch the next proof entirely in the UI:
+
+- open **New run → Advanced**;
+- exact promoted-tuple recovery: **off**;
+- Warm-start checkpoint: **22**;
+- keep current reward v19 and environment v19;
+- Auto, one outer cycle, 750 PPO iterations, 1,024 environments on `cuda:0`;
+- 1,000 episode steps, two rollout episodes, seed 42, 1920×1080;
+- Evidence environment: **10**;
+- `gen_003` observe-only and no new motion prior.
+
+Before PPO, require `warm_start_checkpoint_resolved` for iter 22 and both
+actor and critic load events, then the existing physical alignment, staged
+route, horizon-aware cruise, terminal brake, 50/25/25 RSI, contact `-8`, full
+command weights, reward firewall, and posture-aware stillness lines. Leave
+the GPU worker alone after startup. Final acceptance remains conjunctive:
+aligned visible boxes, ordered physical weave and finish, no forbidden
+contact or sustained fall, upright/default-like posture, terminal horizontal
+speed below `0.12 m/s`, and 100 uninterrupted post-completion frames quiet in
+horizontal, angular, joint, and posture channels.
