@@ -3029,3 +3029,31 @@ lanes—rather than continue the iter 27→28 route regression. It must retain
 exact promoted reward v20/env v21 and every physical-scene/contact/RSI/
 firewall/posture invariant, then prove precommitted lane 10's complete
 physical conjunction before promotion.
+
+## Iter 29 live robust predicate-depth recovery 2026-07-25 (Codex)
+
+UI job `job_2ebcb47d3cee200f` is running iter 29 from clean captured commit
+`874968e3f644c49488d1440952e42807b7343508`. The UI emitted
+`promoted_tuple_restored`; selection v38 pins exact promoted tuple
+`95afc97b6000593eab01c8e7b374b71dbf20f6e75e647008d322f8270b0b88c7`,
+reward v20, and env v21. Explicit New Run recovery loaded actor and critic
+from iter 26 checkpoint SHA8 `d5a35ae6`, intentionally returning to the last
+policy with real full-conjunction lanes rather than compounding the iter
+27→28 route regression. PPO iteration 0/750 is active.
+
+The live worker proves the four typed `0.268 m` obstacle-away entries retain
+their `0.100 m` outside stages and now command through each unchanged
+`0.350 m` authored disk on the same safe chord with a robust `0.050 m` inside
+margin. It also retains the `1.000 m/s` horizon schedule, `2.000 m` terminal
+brake to at most `0.050 m/s`, 50/25/25 train-only RSI, local-frame boxes,
+four contact sensors at -8, full command weights 2, the clearance-stage
+reward firewall, strict-product whole-body stillness at weight 4, and entropy
+`0.01`.
+
+Settings are Auto, one 750-PPO cycle, 1,024 environments on `cuda:0`, seed
+42, two 1,000-step 1920x1080 episodes, precommitted lane 10, exact promoted
+recovery on, `gen_003` observe-only, and no reference-motion override. Do not
+run intermediate GPU audits or edit reload-watched core while iter 29 is
+alive. On completion, preserve the checkpoint and judge only the official
+all-lane artifacts plus the disclosed lane's keyframes/full video and Results
+scene audit against the complete physical conjunction.

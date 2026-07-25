@@ -604,6 +604,29 @@ observe-only. Require startup proof of the `0.050 m` inside margin plus all
 existing alignment, contact `-8`, full command, 50/25/25 RSI, firewall,
 strict posture, horizon, and terminal-braking invariants.
 
+## Live proof: iter 29 robust predicate depth
+
+UI job `job_2ebcb47d3cee200f` is running iter 29 from clean captured commit
+`874968e3f644c49488d1440952e42807b7343508`. Selection v38 restores the
+exact promoted reward v20/env v21 tuple, and `warm_start_loaded` proves both
+actor and critic came from iter 26 checkpoint SHA8 `d5a35ae6`. PPO 0/750 is
+active.
+
+The startup record shows the intended generic geometry: each `0.100 m`
+outside stage transitions to a clearance-preserving chord whose target is
+`0.050 m` inside the unchanged `0.350 m` authored predicate. It also proves
+aligned local-frame boxes, four contact sensors at `-8`, full linear/angular
+command weights 2, 50/25/25 train-only RSI, the clearance reward firewall,
+strict whole-body terminal posture at weight 4, `1.000 m/s` horizon
+scheduling, `2.000 m`/`0.050 m/s` terminal braking, and entropy `0.01`.
+
+The run is Auto with one 750-PPO cycle, 1,024 CUDA environments, seed 42, two
+1,000-step 1920x1080 episodes, precommitted lane 10, and `gen_003`
+observe-only. Leave the worker untouched. After it stops, the lane-10 video
+and official batch artifacts must prove every item in the physical acceptance
+checklist; no batch partial rate, attractive clip, or prior iteration can
+substitute for that conjunction.
+
 Current proof run: UI job `job_0102595ce1cf9e61`, iter 23, clean launch
 commit `6ebc857`, selection v32 / tuple
 `014c62f4757b1e91d8689afcddd568cd85a8d699778154d22729c8b5a70397fd`.
