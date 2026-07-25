@@ -3241,3 +3241,33 @@ UI launch; then recover actor+critic from the last checkpoint with real
 full-conjunction lanes (iter 26), restore exact promoted reward v20/env v21,
 and keep all existing scene, contact, RSI, terminal-braking, posture, and
 evidence-lane invariants.
+
+## Iter 32 live safe-cap recovery 2026-07-25 (Codex)
+
+UI New Run job `job_28fa781d092c229e` is running iter 32 from clean captured
+commit `697a2ae5bc0c76d9741643a91b5cbf6946363914`. Exact promoted recovery is
+on; selection v41 pins tuple
+`95afc97b6000593eab01c8e7b374b71dbf20f6e75e647008d322f8270b0b88c7`,
+reward v20 SHA
+`b05bd4fa1ec200ff6e2330d32d0ca8f2bfb095a3878e50fb7433439e32db55e9`,
+and env v21 SHA
+`a56ea1a4baaa66ce5190d2cd29c41a79471ab4f497d81ce866e932082eba134c`.
+The UI resolved iter 26 checkpoint SHA8 `d5a35ae6`, and the runner emitted
+`warm_start_loaded` with `load_cfg_keys ["actor", "critic"]`.
+
+Startup output proves all four typed `0.268 m` obstacle-away safe caps, their
+`0.100 m` outside stages, the new full-speed traversal to the in-disk cap,
+and the unchanged `0.350 m` raw predicate. It also proves the full-maneuver
+generated-reward firewall, 1.000 m/s horizon cruise, 2.000 m terminal brake
+to at most 0.050 m/s, 50/25/25 train-only RSI, local-pose-plus-origin boxes,
+four forbidden-contact sensors at -8, full linear/angular command weights,
+strict-product terminal whole-body stillness at weight 4, entropy `0.01`,
+and PPO learning iteration 0/750.
+
+Settings are Auto, one 750-PPO cycle, 1,024 environments on `cuda:0`, seed
+42, two 1,000-step 1920x1080 episodes, precommitted evidence lane 10,
+`gen_003` observe-only, and no reference motion. Do not run an intermediate
+GPU audit or edit reload-watched core while iter 32 is alive. After the worker
+stops, preserve its checkpoint and apply the full immutable all-lane,
+lane-10 video/keyframe, and Results physical-scene conjunction before any
+promotion.

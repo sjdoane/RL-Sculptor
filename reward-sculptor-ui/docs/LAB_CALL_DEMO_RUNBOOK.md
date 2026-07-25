@@ -1128,3 +1128,26 @@ environments, seed 42, two 1,000-step 1920x1080 episodes, Auto,
 `gen_003` observe-only, exact promoted recovery on, and precommitted evidence
 lane 10. Reapply the complete conjunctive acceptance audit after the worker
 stops.
+
+## Live proof: iter 32 full-speed safe-cap traversal
+
+UI job `job_28fa781d092c229e` is running iter 32 from clean captured commit
+`697a2ae5bc0c76d9741643a91b5cbf6946363914`. Selection v41 pins the exact
+promoted reward v20/environment v21 tuple, and the runner loaded both actor
+and critic from iter 26 checkpoint SHA8 `d5a35ae6`.
+
+The startup log reports four typed `0.268 m` obstacle-away caps, `0.100 m`
+outside stages, and full-speed traversal to each cap inside the unchanged
+`0.350 m` raw disk. The raw disk remains the sole advancement authority.
+The full-maneuver reward firewall, four direct contact sensors at -8, full
+linear/angular command terms, 50/25/25 RSI, aligned local-frame boxes,
+1.000 m/s horizon scheduling, 2.000 m terminal braking to at most
+0.050 m/s, strict-product whole-body stillness at weight 4, entropy `0.01`,
+and PPO iteration 0/750 are active.
+
+This Auto run uses one 750-PPO cycle, 1,024 CUDA environments, seed 42, two
+1,000-step 1920x1080 episodes, precommitted evidence lane 10, and `gen_003`
+observe-only. Do not touch reload-watched core or run an intermediate GPU
+audit. Once stopped, preserve the checkpoint and require the official scene
+audit, all-lane artifacts, and lane-10 keyframes/full video to prove the
+entire physical conjunction.
