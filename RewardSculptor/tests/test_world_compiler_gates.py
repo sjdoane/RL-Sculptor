@@ -369,6 +369,12 @@ def test_forbidden_object_waypoint_uses_embodiment_clearance_subtarget() -> None
     assert stage[1] * (0.35 / 0.45) == pytest.approx(
         required_clearance - 0.85)
     assert routed.clearance_staging_shifts_m[1] == (0.0, 0.0, 0.0)
+    traversal = routed.clearance_traversal_shifts_m[0]
+    assert math.hypot(traversal[0], traversal[1]) == pytest.approx(0.325)
+    assert traversal[0] > 0.0
+    assert traversal[1] == pytest.approx(
+        required_clearance - 0.85)
+    assert routed.clearance_traversal_shifts_m[1] == (0.0, 0.0, 0.0)
     assert routed.tolerance_m == pytest.approx(0.35)
     assert routed.clearance_transition_slack_m == pytest.approx(0.025)
     assert routed.clearance_stage_capture_radius_m == pytest.approx(0.15)
@@ -567,12 +573,12 @@ def test_adjusted_waypoint_stages_then_synchronizes_on_frozen_disk() -> None:
     term._update_command()
     assert term._waypoint_index.item() == 0
     assert term._clearance_stage_complete.item()
-    # Once staged, the command keeps the computed obstacle-away clearance
-    # target inside the immutable disk. The disk itself remains authoritative
-    # for advancement, but the desired path no longer cuts back to its center.
+    # Once staged, the command aims through the immutable disk on the outgoing
+    # side of the same obstacle-safe chord. The disk itself remains the only
+    # advancement authority.
     safe_target = (
         torch.tensor(cfg.predicate_waypoints_m[0][:2])
-        + torch.tensor(cfg.clearance_shifts_m[0][:2])
+        + torch.tensor(cfg.clearance_traversal_shifts_m[0][:2])
     )
     expected_direction = safe_target - stage
     expected_direction = (

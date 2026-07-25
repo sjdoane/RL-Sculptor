@@ -849,3 +849,35 @@ observe-only. Leave the worker untouched. On completion, require the
 disclosed lane—not an older video or batch partial pass—to satisfy the full
 aligned weave, zero-contact, ordered-finish, no-fall, upright/default-like,
 terminal-speed, and uninterrupted 100-frame whole-body hold conjunction.
+
+## Iter 27 is aligned but route-incomplete
+
+Iter 27 completed and preserved checkpoint SHA
+`15d2a8434fe6b9f332760e8a71bb61e261994f41de66650ebcd2fc1f406084b6`.
+Its scene audit is aligned at `0.00 m`, realism is `ok`, 63/64 lanes avoid
+forbidden contact, and no lane sustains a fall. It is not task evidence:
+0/64 complete the ordered route, 0/64 reach index 5, objective fitness is
+zero, and the maximum-index distribution is
+`{0: 41, 1: 9, 2: 13, 3: 1}`.
+
+The requested and resolved lane 10 (percentile `0.03125`) is contact-free but
+enters only waypoint zones 1–3 at frames `[135, 545, 998]`. It advances only
+the first two frozen command predicates, never reaches waypoint 4 or finish,
+and ends `3.535 m` from finish at index 2 and `0.178 m/s`. The complete video
+shows a slow, high-sway partial weave among the boxes, not a weave-and-stop.
+
+The next generic controller correction retains the same typed obstacle-away
+radial clearance and outside approach stage, but aims through the authored
+disk on the outgoing side of that safe chord. This avoids the measured
+near-boundary hover while leaving the unchanged disk predicate as the only
+route advancement authority. The command-only target is `0.025 m` inside the
+disk; it does not add a success condition. Focused compiler + adapter suites
+pass **70 tests**, with scoped Ruff (`F,E9`), compileall, and diff check also
+passing.
+
+For the next UI New Run, warm-start iter 27 and require startup proof of the
+clearance-preserving through-disk chord together with all prior invariants:
+aligned boxes, four contact sensors at `-8`, full velocity-command weights,
+50/25/25 train-only RSI, reward firewall, strict whole-body terminal posture,
+horizon scheduling, and terminal boundary braking. Final acceptance remains
+the disclosed lane's complete physical conjunction.

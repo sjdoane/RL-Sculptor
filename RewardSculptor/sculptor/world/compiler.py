@@ -455,6 +455,11 @@ def _waypoint_velocity_command_types() -> tuple[type[Any], type[Any]]:
                 device=self.device,
                 dtype=torch.float32,
             )
+            self._clearance_traversal_shifts = torch.as_tensor(
+                cfg.clearance_traversal_shifts_m,
+                device=self.device,
+                dtype=torch.float32,
+            )
             self._waypoint_index = torch.zeros(
                 self.num_envs, device=self.device, dtype=torch.long)
             self._clearance_stage_complete = torch.zeros(
@@ -549,6 +554,8 @@ def _waypoint_velocity_command_types() -> tuple[type[Any], type[Any]]:
                 target_index, :2]
             target_staging_shift = self._clearance_staging_shifts[
                 target_index, :2]
+            target_traversal_shift = self._clearance_traversal_shifts[
+                target_index, :2]
             target_adjusted = (
                 torch.linalg.norm(target_clearance_shift, dim=-1)
                 > 1e-6
@@ -556,17 +563,20 @@ def _waypoint_velocity_command_types() -> tuple[type[Any], type[Any]]:
             use_staging_target = (
                 target_adjusted & ~self._clearance_stage_complete & ~complete
             )
-            # After capturing the outside stage, keep aiming at the
-            # obstacle-away point already computed inside the authored disk.
-            # Steering at the predicate center here throws that clearance
-            # away and lets a lagging locomotion policy cut the obstacle
-            # corner. Objective truth is still the immutable disk: the raw
-            # predicate advances the command on its first entry, so this safe
-            # in-region target never becomes a second success condition.
+            # After capturing the outside stage, aim through the authored
+            # disk along the same obstacle-safe chord. A target with only the
+            # radial clearance component sits close to the entry boundary;
+            # tracking lag can form a low-speed equilibrium just outside the
+            # disk. The traversal target keeps that radial clearance but adds
+            # an outgoing tangent component inside the disk, so the command
+            # has useful forward authority across the immutable boundary.
+            # Objective truth is still the authored disk: the raw predicate
+            # advances the command on first entry, before this steering target
+            # itself must be reached.
             command_shift = torch.where(
                 use_staging_target[:, None],
                 target_staging_shift,
-                target_clearance_shift,
+                target_traversal_shift,
             )
             target = target_center + torch.where(
                 target_adjusted[:, None] & ~complete[:, None],
@@ -660,6 +670,8 @@ def _waypoint_velocity_command_types() -> tuple[type[Any], type[Any]]:
         predicate_waypoints_m: tuple[tuple[float, float, float], ...]
         clearance_shifts_m: tuple[tuple[float, float, float], ...]
         clearance_staging_shifts_m: tuple[
+            tuple[float, float, float], ...]
+        clearance_traversal_shifts_m: tuple[
             tuple[float, float, float], ...]
         tolerance_m: float = 0.25
         clearance_transition_slack_m: float = 0.025
@@ -2140,6 +2152,82 @@ def _clearance_staging_waypoint_shifts(
     return tuple(stages)
 
 
+def _clearance_traversal_waypoint_shifts(
+    clearance_shifts: tuple[tuple[float, float, float], ...],
+    clearance_staging_shifts: tuple[tuple[float, float, float], ...],
+    *,
+    tolerance_m: float,
+    inside_margin_m: float,
+) -> tuple[tuple[float, float, float], ...]:
+    """Aim through adjusted disks while preserving obstacle clearance.
+
+    The outside stage and obstacle-away radial shift define an incoming chord
+    of the immutable task disk. Reflect that chord's tangential component to
+    the outgoing side, then keep the target a small margin inside the disk.
+    The straight segment from stage to traversal target therefore maintains
+    the same radial obstacle clearance while giving a lagging velocity policy
+    enough forward authority to cross the authored predicate boundary.
+
+    These are command-only steering targets. The unchanged disk predicate
+    still advances the route on first entry.
+    """
+    if len(clearance_shifts) != len(clearance_staging_shifts):
+        raise WorldCompileError(
+            "clearance and staging shifts must align one-to-one")
+    tolerance = max(1e-6, float(tolerance_m))
+    capture_radius = max(
+        0.0,
+        tolerance - max(0.0, float(inside_margin_m)),
+    )
+    traversals: list[tuple[float, float, float]] = []
+    for clearance, stage in zip(
+            clearance_shifts, clearance_staging_shifts, strict=True):
+        clearance_xy = (
+            float(clearance[0]),
+            float(clearance[1]),
+        )
+        clearance_distance = math.hypot(*clearance_xy)
+        stage_xy = (float(stage[0]), float(stage[1]))
+        stage_distance = math.hypot(*stage_xy)
+        if clearance_distance <= 1e-6 or stage_distance <= 1e-6:
+            traversals.append((0.0, 0.0, 0.0))
+            continue
+
+        boundary_scale = tolerance / stage_distance
+        boundary_xy = (
+            stage_xy[0] * boundary_scale,
+            stage_xy[1] * boundary_scale,
+        )
+        incoming_tangent = (
+            boundary_xy[0] - clearance_xy[0],
+            boundary_xy[1] - clearance_xy[1],
+        )
+        tangent_distance = math.hypot(*incoming_tangent)
+        if tangent_distance <= 1e-6:
+            traversals.append((
+                clearance_xy[0],
+                clearance_xy[1],
+                0.0,
+            ))
+            continue
+        tangent_direction = (
+            incoming_tangent[0] / tangent_distance,
+            incoming_tangent[1] / tangent_distance,
+        )
+        safe_capture_radius = max(capture_radius, clearance_distance)
+        outgoing_component = math.sqrt(max(
+            0.0,
+            safe_capture_radius * safe_capture_radius
+            - clearance_distance * clearance_distance,
+        ))
+        traversals.append((
+            clearance_xy[0] - tangent_direction[0] * outgoing_component,
+            clearance_xy[1] - tangent_direction[1] * outgoing_component,
+            0.0,
+        ))
+    return tuple(traversals)
+
+
 def _horizon_aware_waypoint_cruise(
     predicate_waypoints: tuple[tuple[float, float, float], ...],
     clearance_staging_shifts: tuple[tuple[float, float, float], ...],
@@ -2263,11 +2351,18 @@ def _reconcile_waypoint_course(
         hold_s = 0.0
     clearance_stage_outside_margin_m = 0.10
     clearance_transition_slack_m = 0.025
+    clearance_traversal_inside_margin_m = 0.025
     clearance_staging_shifts = _clearance_staging_waypoint_shifts(
         predicate_waypoints,
         clearance_shifts,
         tolerance_m=goal_tolerance,
         outside_margin_m=clearance_stage_outside_margin_m,
+    )
+    clearance_traversal_shifts = _clearance_traversal_waypoint_shifts(
+        clearance_shifts,
+        clearance_staging_shifts,
+        tolerance_m=goal_tolerance,
+        inside_margin_m=clearance_traversal_inside_margin_m,
     )
     staging_waypoints = tuple(
         tuple(predicate[axis] + stage[axis] for axis in range(3))
@@ -2282,9 +2377,11 @@ def _reconcile_waypoint_course(
     if clearance_adjustments:
         adjustments.append(
             "command:forbidden-contact clearance→outside approach stage then "
-            f"frozen {goal_tolerance:.3f} m task-disk entry "
+            f"clearance-preserving traversal through frozen "
+            f"{goal_tolerance:.3f} m task-disk entry "
             f"({clearance_stage_outside_margin_m:.3f} m outside margin, "
-            f"{clearance_transition_slack_m:.3f} m stage slack)"
+            f"{clearance_transition_slack_m:.3f} m stage slack, "
+            f"{clearance_traversal_inside_margin_m:.3f} m inside margin)"
         )
     events = getattr(env_cfg, "events", None)
     if isinstance(events, dict):
@@ -2377,6 +2474,8 @@ def _reconcile_waypoint_course(
                 predicate_waypoints_m=predicate_waypoints,
                 clearance_shifts_m=clearance_shifts,
                 clearance_staging_shifts_m=clearance_staging_shifts,
+                clearance_traversal_shifts_m=(
+                    clearance_traversal_shifts),
                 tolerance_m=goal_tolerance,
                 clearance_transition_slack_m=(
                     clearance_transition_slack_m),

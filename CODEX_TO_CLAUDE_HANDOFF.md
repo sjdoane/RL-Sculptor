@@ -2903,3 +2903,50 @@ intermediate GPU audit or edit reload-watched core while iter 27 is alive.
 After checkpoint preservation, audit only the official trajectory,
 fitness/objective artifacts, behavior disclosure, keyframes/full video, and
 Results physical-scene audit against the complete physical conjunction.
+
+## Iter 27 audit + obstacle-safe disk traversal recovery 2026-07-25 (Codex)
+
+UI job `job_0b8d143e516a7920` completed iter 27 and preserved
+`runs/iter_27/checkpoint.pt` at SHA
+`15d2a8434fe6b9f332760e8a71bb61e261994f41de66650ebcd2fc1f406084b6`.
+The Results physical-scene audit is `aligned` at `0.00 m`, and
+`behavior.json` proves requested/resolved precommitted evidence lane 10
+(percentile `0.03125`). Realism is `ok`, 63/64 lanes are contact-free, the
+only batch contact is box 2, and `fell_frac` is zero. The recovery nevertheless
+regressed route execution:
+
+- ordered physical route completion: **0/64**;
+- waypoint index 5: **0/64**;
+- maximum-index distribution: `{0: 41, 1: 9, 2: 13, 3: 1}`;
+- terminal-speed aggregate: `0.20274 m/s`;
+- objective fitness: `0.00000`, progress `0.24263`.
+
+Lane 10 is contact-free and remains upright enough to avoid a fall, but the
+official trajectory enters only waypoint zones 1–3 at frames
+`[135, 545, 998]`. The frozen `0.350 m` command predicate advances only the
+first two at frames `[339, 787]`; waypoint 3 is still `0.450 m` away on the
+last frame, so waypoint 4 and finish are never approached. The full video
+shows an alternating but slow, high-sway weave among the first boxes rather
+than a completed task. It ends `3.535 m` from finish at index 2, horizontal
+speed `0.178 m/s`, angular speed `0.434 rad/s`, joint RMS velocity
+`0.466 rad/s`, projected-gravity z `-0.825`, and default-pose RMS
+`0.758 rad`. There is no post-completion hold because completion never occurs.
+Never present iter 27 as success.
+
+The immutable evidence identifies a generic controller basin. After each
+outside stage, the prior correction aimed only at the `0.268 m`
+obstacle-away radial point near the disk boundary. Lane 10 then spent 212 and
+258 frames creeping from the first two stages into their predicates; it
+reached waypoint 3's stage only at frame 974. The new controller preserves
+the same typed radial clearance but adds the route's outgoing tangent
+component, producing a straight obstacle-safe chord from the outside stage
+through the authored disk. Its steering target is `0.025 m` inside the frozen
+predicate; the unchanged raw disk entry remains the sole advancement
+authority and fires before the target itself must be reached. No robot, task,
+object-name, or prompt branch was added.
+
+Focused compiler + adapter verification is **70 passed**. Scoped Ruff
+(`F,E9`), compileall, and diff check pass. The next proof must be launched
+through the UI only after this slice is committed, warm-start iter 27, retain
+the current physical-scene/contact/RSI/firewall/posture invariants, and prove
+the same disclosed lane's full physical conjunction before promotion.
