@@ -331,3 +331,65 @@ def test_registration_refuses_unlicensed_sources(tmp_path):
         compose_and_register(
             "g1", [{"clip_id": "src_a"}, {"clip_id": "src_b"}],
             clip_id="novel--g1", root=tmp_path)
+
+
+# ── dataset motion tokens ───────────────────────────────────────────────
+# `sculptor.reference._archetype` classifies origin-relative dataset clips
+# using their advisory motion words. A composite that carried only its FIRST
+# segment's words described itself wrongly — a running+jump+kick composite
+# read as "running on spot", classified `other`, and `derive_rsi_train_keys`
+# refused it, which blocked Tier-D certification of exactly the composites
+# most worth certifying.
+def _dataset_clip(tokens: str, **kw) -> dict:
+    c = _clip(**kw)
+    c["meta"] = {"source": "dataset", "tokens": tokens}
+    return c
+
+
+def test_composite_carries_motion_tokens_from_every_source():
+    out = compose_reference([
+        {"clip": _dataset_clip("running on spot"), "label": "approach"},
+        {"clip": _dataset_clip("one leg jump", joint_offset=0.05), "label": "launch"},
+        {"clip": _dataset_clip("kicking1", joint_offset=0.02), "label": "strike"},
+    ])
+    from sculptor.reference import _dataset_motion_tokens
+
+    tokens = _dataset_motion_tokens(out)
+    # The composite genuinely contains a jump; its words must say so.
+    assert "jump" in tokens
+    assert "running" in tokens
+    assert "kicking" in tokens
+    assert out["meta"]["source"] == "dataset"
+
+
+def test_composite_of_dataset_clips_is_archetype_classifiable():
+    """The end this serves: a composite containing a jump must reach the
+    airborne branch so RSI/eval-reset derivation (and therefore Tier-D
+    certification) can run on it at all."""
+    from sculptor.reference import _archetype
+
+    out = compose_reference([
+        {"clip": _dataset_clip("running on spot"), "label": "approach"},
+        {"clip": _dataset_clip("one leg jump", joint_offset=0.05), "label": "launch"},
+    ])
+    # Make the composite genuinely rise, as a real jump composite does.
+    out["root_pos_z"][len(out["root_pos_z"]) // 2:] += 0.05
+    assert _archetype(out) == "airborne"
+
+
+def test_non_dataset_sources_do_not_fabricate_a_dataset_marker():
+    """Only real dataset provenance may set meta.source='dataset' — the
+    archetype classifier trusts that marker."""
+    out = compose_reference([
+        {"clip": _clip()}, {"clip": _clip(joint_offset=0.05)},
+    ])
+    assert (out.get("meta") or {}).get("source") != "dataset"
+
+
+def test_token_merge_is_order_stable_and_deduped():
+    out = compose_reference([
+        {"clip": _dataset_clip("jump twist")},
+        {"clip": _dataset_clip("jump land", joint_offset=0.05)},
+    ])
+    tokens = str(out["meta"]["tokens"])
+    assert tokens.count("jump") == 1, tokens

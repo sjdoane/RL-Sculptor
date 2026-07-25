@@ -352,6 +352,49 @@ def seam_report(clip: dict, seam_frames: Sequence[int]) -> dict[str, Any]:
     }
 
 
+def _merged_dataset_meta(sources: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    """Union the dataset motion words of every source segment.
+
+    `sculptor.reference._archetype` classifies origin-relative dataset clips
+    (the AMASS-retargeted bulk of the library, whose root translation is zeroed
+    so absolute height thresholds mean nothing) using these advisory words
+    rather than height. A composite that inherited only its FIRST segment's
+    words therefore described itself wrongly: a running+jump+kick composite
+    read as "running on spot", classified `other`, and `derive_rsi_train_keys`
+    refused it — blocking Tier-D certification of exactly the composites most
+    worth certifying.
+
+    Only real dataset provenance propagates `source: "dataset"`; the marker is
+    never fabricated, because the classifier trusts it.
+
+    Known limitation, stated rather than hidden: the classifier checks
+    crouch/sit words BEFORE airborne ones, and those describe a START pose
+    while a composite's start is only its FIRST segment. A composite that
+    starts upright and crouches later can therefore read as `mid_start`.
+    Refining that needs the classifier to consult `meta.composition`, which is
+    a change to `sculptor.reference`, not here.
+    """
+    words: list[str] = []
+    is_dataset = False
+    for src in sources:
+        meta = src.get("meta")
+        if not isinstance(meta, Mapping) or meta.get("source") != "dataset":
+            continue
+        is_dataset = True
+        for key in ("tokens", "text", "motion", "name"):
+            value = meta.get(key)
+            if isinstance(value, (list, tuple)):
+                words.extend(str(v) for v in value)
+            elif value is not None:
+                words.append(str(value))
+    if not is_dataset:
+        return {}
+    seen: dict[str, None] = {}
+    for word in " ".join(words).split():
+        seen.setdefault(word, None)
+    return {"source": "dataset", "tokens": " ".join(seen)}
+
+
 # ── public API ──────────────────────────────────────────────────────────
 def compose_reference(
     segments: Iterable[Mapping[str, Any]],
@@ -458,6 +501,9 @@ def compose_reference(
     report = seam_report(acc, seam_frames)
     acc["meta"] = {
         **(acc.get("meta") or {}),
+        # Advisory motion words describing the WHOLE composite, not just its
+        # first phase — the archetype classifier reads these.
+        **_merged_dataset_meta(cropped),
         "composition": {
             "schema_version": 1,
             "segments": provenance,

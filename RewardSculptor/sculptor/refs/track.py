@@ -271,6 +271,9 @@ REWARD_SPEC: dict = {{
                     "Tier-D certification of clip {clip_id!r}.",
     "author": "sculptor",
     "parent_hash": None,
+    # MjlabAdapter refuses a reward without this flag AND a
+    # `compute_reward_batched` entry point (see the batched section below).
+    "supports_batched": True,
     "hyperparameters": {{
         "joint_err_weight": {joint_err_weight!r},
         "root_err_weight": {root_err_weight!r},
@@ -327,6 +330,57 @@ def compute_reward(state, action, next_state, info):
     }}
     reward = joint_term + root_term
     return float(reward), components
+
+
+# ── GPU-batched entry point (mjlab) ────────────────────────────────────
+# MjlabAdapter trains thousands of envs at once and REQUIRES this entry
+# point; without it a Tier-D certification cannot train on the mjlab path
+# at all. Same two-Gaussian formula as `compute_reward` above, vectorized.
+#
+# Two state-layout differences from the scalar path, both forced by mjlab:
+#   * joints are the TRAILING N_JOINTS of a per-env `qpos` row, not
+#     `qpos[7:7+N]` of a full MuJoCo qpos vector;
+#   * root height arrives as `info["base_height"]`, and is compared as a
+#     DELTA from the reference's own first frame. Absolute comparison is
+#     meaningless for the origin-relative retargeted clips that make up
+#     most of the library — their root_z sits near 0 while a standing G1
+#     base is ~0.74 m, so an absolute error would saturate the kernel at
+#     zero for every frame regardless of how well the motion tracked.
+def compute_reward_batched(state, action, next_state, info):
+    import torch
+
+    del state, action
+    qpos = next_state["qpos"]
+    if qpos.shape[-1] < N_JOINTS:
+        raise ValueError(
+            f"batched qpos has {{qpos.shape[-1]}} columns, fewer than the "
+            f"{{N_JOINTS}} tracked joints")
+    like = qpos[:, 0]
+
+    step = info.get("episode_length", torch.zeros_like(like))
+    phase = torch.clamp(step / float(EPISODE_LEN_STEPS), 0.0, 0.999999) \
+        if EPISODE_LEN_STEPS > 0 else torch.zeros_like(like)
+    i = torch.clamp((phase * N_PHASE).long(), 0, N_PHASE - 1)
+
+    target_joint = torch.as_tensor(
+        TARGET_JOINT_POS, device=qpos.device, dtype=qpos.dtype)[i]
+    target_root = torch.as_tensor(
+        TARGET_ROOT_Z, device=qpos.device, dtype=qpos.dtype)[i]
+
+    joint_err = qpos[:, -N_JOINTS:] - target_joint
+    joint_term = torch.exp(
+        -JOINT_ERR_WEIGHT * torch.mean(joint_err ** 2, dim=-1))
+
+    root0 = float(TARGET_ROOT_Z[0])
+    base_height = info.get("base_height", torch.zeros_like(like))
+    actual_delta = info.get("base_height_delta", base_height - root0)
+    root_err = actual_delta - (target_root - root0)
+    root_term = torch.exp(-ROOT_ERR_WEIGHT * root_err ** 2)
+
+    return joint_term + root_term, {{
+        "joint_tracking": joint_term,
+        "root_tracking": root_term,
+    }}
 '''
 
 

@@ -525,3 +525,111 @@ def test_snapped_end_boundary_past_duration_is_clamped_and_accepted():
         llm_call=_mock_span_call(8.1, 14.267, [0.45, 0.60], up=True))
     assert span is not None, reason
     assert span["t_end_s"] <= duration + 1e-9
+
+
+# ── Tier-D tracking reward: mjlab batched contract ─────────────────────
+# MjlabAdapter REQUIRES compute_reward_batched; without it a Tier-D
+# certification cannot train on the mjlab path at all, which is how the
+# certification loop silently stopped working after mjlab's batched contract
+# landed. These pin the entry point and its numerical agreement with the
+# scalar path.
+def _tierd_module(tmp_path):
+    import importlib.util
+
+    import numpy as np
+
+    from sculptor.refs.track import generate_tracking_reward_source
+
+    n_phase, n_joints = 8, 4
+    rng = np.random.default_rng(0)
+    src = generate_tracking_reward_source(
+        clip_id="unit--g1",
+        joint_names=[f"j{i}" for i in range(n_joints)],
+        target_joint_pos=rng.normal(size=(n_phase, n_joints)),
+        target_root_z=np.linspace(0.0, 0.05, n_phase),
+        episode_len_steps=100,
+    )
+    path = tmp_path / "current.py"
+    path.write_text(src, encoding="utf-8")
+    spec = importlib.util.spec_from_file_location("tierd_rw", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_tierd_reward_declares_the_batched_contract(tmp_path):
+    mod = _tierd_module(tmp_path)
+    assert mod.REWARD_SPEC.get("supports_batched") is True
+    assert hasattr(mod, "compute_reward_batched")
+    assert hasattr(mod, "compute_reward")
+
+
+def test_tierd_batched_scores_an_on_target_pose_at_one(tmp_path):
+    torch = pytest.importorskip("torch")
+    mod = _tierd_module(tmp_path)
+
+    i = 3
+    step = (i + 0.5) / mod.N_PHASE * mod.EPISODE_LEN_STEPS
+    target = torch.as_tensor(mod.TARGET_JOINT_POS[i], dtype=torch.float64)
+    qpos = target.repeat(4, 1)
+    z0, tz = float(mod.TARGET_ROOT_Z[0]), float(mod.TARGET_ROOT_Z[i])
+    info = {
+        "episode_length": torch.full((4,), float(step), dtype=torch.float64),
+        "base_height": torch.full((4,), z0 + (tz - z0), dtype=torch.float64),
+    }
+    total, comp = mod.compute_reward_batched(None, None, {"qpos": qpos}, info)
+    assert float(comp["joint_tracking"][0]) == pytest.approx(1.0, abs=1e-9)
+    assert float(comp["root_tracking"][0]) == pytest.approx(1.0, abs=1e-9)
+    assert float(total[0]) == pytest.approx(2.0, abs=1e-9)
+
+
+def test_tierd_batched_joint_kernel_matches_the_scalar_path(tmp_path):
+    """Same two-Gaussian formula, two state layouts. A divergence here means
+    a Tier-D verdict computed during training disagrees with the one the
+    scalar contract documents."""
+    import numpy as np
+
+    torch = pytest.importorskip("torch")
+    mod = _tierd_module(tmp_path)
+
+    i, off = 3, 0.3
+    step = (i + 0.5) / mod.N_PHASE * mod.EPISODE_LEN_STEPS
+    target = mod.TARGET_JOINT_POS[i]
+
+    qpos = torch.as_tensor(target + off, dtype=torch.float64).repeat(4, 1)
+    info = {
+        "episode_length": torch.full((4,), float(step), dtype=torch.float64),
+        "base_height": torch.zeros(4, dtype=torch.float64),
+    }
+    _, batched = mod.compute_reward_batched(None, None, {"qpos": qpos}, info)
+
+    scalar_qpos = np.zeros(7 + mod.N_JOINTS)
+    scalar_qpos[2] = float(mod.TARGET_ROOT_Z[i])
+    scalar_qpos[7:] = target + off
+    _, scalar = mod.compute_reward(
+        None, None, {"qpos": scalar_qpos}, {"episode_length": int(step)})
+
+    assert float(batched["joint_tracking"][0]) == pytest.approx(
+        scalar["joint_tracking"], abs=1e-12)
+    assert float(batched["joint_tracking"][0]) == pytest.approx(
+        float(np.exp(-mod.JOINT_ERR_WEIGHT * off ** 2)), abs=1e-12)
+
+
+def test_tierd_batched_root_uses_a_delta_not_an_absolute_height(tmp_path):
+    """Origin-relative retargeted clips (most of the library) carry root_z
+    near 0 while a standing G1 base is ~0.74 m. An absolute comparison would
+    saturate the kernel at zero for every frame however well it tracked."""
+    torch = pytest.importorskip("torch")
+    mod = _tierd_module(tmp_path)
+
+    i = 4
+    step = (i + 0.5) / mod.N_PHASE * mod.EPISODE_LEN_STEPS
+    qpos = torch.as_tensor(mod.TARGET_JOINT_POS[i], dtype=torch.float64).repeat(2, 1)
+    z0, tz = float(mod.TARGET_ROOT_Z[0]), float(mod.TARGET_ROOT_Z[i])
+    # A base sitting 0.74 m up but tracking the reference's DELTA perfectly.
+    info = {
+        "episode_length": torch.full((2,), float(step), dtype=torch.float64),
+        "base_height_delta": torch.full((2,), tz - z0, dtype=torch.float64),
+    }
+    _, comp = mod.compute_reward_batched(None, None, {"qpos": qpos}, info)
+    assert float(comp["root_tracking"][0]) == pytest.approx(1.0, abs=1e-9)
