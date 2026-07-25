@@ -1095,3 +1095,36 @@ trajectory/fitness, and disclosed lane's keyframes/full video to prove every
 disk plus finish in order, zero contact, no fall, upright/default-like posture,
 terminal horizontal speed below `0.12 m/s`, and 100 uninterrupted
 post-completion whole-body-quiet frames.
+
+## Iter 31 result and iter 32 safe-cap recovery
+
+Iter 31 completed and preserved its checkpoint, but it is diagnostic only.
+The scene audit is perfectly aligned (`0.0 m` maximum box error), while the
+official trajectory has only `1/64` success/index-5 lanes, `63/64`
+contact-free lanes, `63/64` no-sustained-fall lanes, and zero 100-frame
+whole-body holds. Env 37 was the sole route completion and produced only a
+98-frame qualifying quiet streak.
+
+Precommitted lane 10 remained contact-free and upright enough to avoid the
+fall gate, but stayed at index 0. It entered only the first actual zone,
+stopped at a `0.40619 m` minimum distance from the frozen waypoint-1 center,
+and ended `5.7410 m` from finish. The keyframes and full video show approach
+to the first maneuver followed by a stationary wide-crouched shuffle between
+the first pair of boxes. Do not present this video as a successful weave.
+
+The outgoing steering point was itself outside the raw disk, so a policy could
+arc around the predicate and converge on the command without route progress.
+The generic recovery commands the embodiment-derived safe radial cap inside
+the unchanged disk and applies a `1.0x` cruise floor during the typed
+clearance traversal. Convergence therefore implies raw predicate entry, while
+the outside stage, obstacle-safe half-space, four contact sensors, reward
+firewall, and frozen success definition remain intact.
+
+Verification for the next launch is 70 focused compiler/adapter tests, scoped
+Ruff `F,E9`, compileall, and diff check. Launch only through New Run after the
+fix commit is clean. Recover actor+critic from iter 26, restore exact promoted
+reward v20/environment v21, keep one 750-PPO cycle with 1,024 CUDA
+environments, seed 42, two 1,000-step 1920x1080 episodes, Auto,
+`gen_003` observe-only, exact promoted recovery on, and precommitted evidence
+lane 10. Reapply the complete conjunctive acceptance audit after the worker
+stops.

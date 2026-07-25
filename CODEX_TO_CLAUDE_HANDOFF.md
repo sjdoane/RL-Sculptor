@@ -3204,3 +3204,40 @@ motion. Do not run an intermediate GPU audit or edit reload-watched core while
 iter 31 is alive. After checkpoint preservation, judge the official all-lane
 artifacts, disclosed lane-10 keyframes/full video, and Results scene audit
 against the complete physical conjunction before promotion.
+
+## Iter 31 immutable audit and safe-cap recovery 2026-07-25 (Codex)
+
+Iter 31/job `job_1fae6e454ac140cf` stopped cleanly and preserved its
+checkpoint. The Results physical-scene audit is aligned with `0.0 m` maximum
+error for all four boxes, and the official tuple remains selection v40 with
+reward v20/environment v21. This is diagnostic evidence, not acceptance:
+fitness is `0.00993`, progress is `0.22307`, only `1/64` lanes reached
+success/index 5, `63/64` were contact-free, `63/64` avoided sustained fall,
+and no lane satisfied the required 100-frame whole-body hold. The sole
+route-complete lane, env 37, was contact-free and quiet for only 98
+consecutive frames, two frames short.
+
+The disclosed lane 10 was contact-free and did not fall, but never advanced
+waypoint index 0. It entered only actual zone 1, came no closer than
+`0.40619 m` to the frozen waypoint-1 center, and finished `5.7410 m` from the
+goal. Its keyframes and full video show the G1 approach the first maneuver,
+then shuffle in a wide crouch between the first box pair for the remainder of
+the episode. It did not perform the alternating route.
+
+Artifact geometry identifies the generic failure. The outgoing command target
+was outside the immutable disk, so lane 10 reached it by arcing around the
+disk: its final root position was about `0.134 m` from that steering target
+while remaining outside the `0.350 m` predicate. The next correction restores
+the typed embodiment-safe radial cap inside the raw disk as the traversal
+target and holds the clearance traversal command at the full `1.0x` cruise
+floor until the raw predicate advances. Every convergent path must now enter
+the unchanged disk, while the obstacle-away half-space, outside stage,
+contact supervision, full-maneuver reward firewall, and task truth remain
+unchanged. The implementation contains no robot, task, object, or prompt name.
+
+Focused compiler and adapter verification is **70 passed**. Scoped Ruff
+(`F,E9`), compileall, and diff check pass. Commit this slice before the next
+UI launch; then recover actor+critic from the last checkpoint with real
+full-conjunction lanes (iter 26), restore exact promoted reward v20/env v21,
+and keep all existing scene, contact, RSI, terminal-braking, posture, and
+evidence-lane invariants.

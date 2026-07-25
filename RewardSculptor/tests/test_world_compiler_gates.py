@@ -370,15 +370,16 @@ def test_forbidden_object_waypoint_uses_embodiment_clearance_subtarget() -> None
         required_clearance - 0.85)
     assert routed.clearance_staging_shifts_m[1] == (0.0, 0.0, 0.0)
     traversal = routed.clearance_traversal_shifts_m[0]
-    assert math.hypot(traversal[0], traversal[1]) == pytest.approx(0.450)
-    assert traversal[0] > 0.0
-    assert traversal[1] == pytest.approx(
+    assert traversal == pytest.approx(
+        routed.clearance_shifts_m[0])
+    assert math.hypot(traversal[0], traversal[1]) == pytest.approx(
         required_clearance - 0.85)
     assert routed.clearance_traversal_shifts_m[1] == (0.0, 0.0, 0.0)
     assert routed.tolerance_m == pytest.approx(0.35)
     assert routed.clearance_transition_slack_m == pytest.approx(0.025)
     assert routed.clearance_stage_capture_radius_m == pytest.approx(0.15)
     assert routed.intermediate_min_speed_scale == pytest.approx(0.35)
+    assert routed.clearance_traversal_min_speed_scale == pytest.approx(1.0)
     assert routed.terminal_stop_at_predicate_boundary is False
     assert routed.terminal_min_speed_scale == pytest.approx(0.35)
     assert any("outside approach stage" in item
@@ -573,9 +574,8 @@ def test_adjusted_waypoint_stages_then_synchronizes_on_frozen_disk() -> None:
     term._update_command()
     assert term._waypoint_index.item() == 0
     assert term._clearance_stage_complete.item()
-    # Once staged, the command aims through the immutable disk on the outgoing
-    # side of the same obstacle-safe chord. The disk itself remains the only
-    # advancement authority.
+    # Once staged, the command aims at the embodiment-safe cap inside the
+    # immutable disk. The disk itself remains the only advancement authority.
     safe_target = (
         torch.tensor(cfg.predicate_waypoints_m[0][:2])
         + torch.tensor(cfg.clearance_traversal_shifts_m[0][:2])
@@ -587,6 +587,26 @@ def test_adjusted_waypoint_stages_then_synchronizes_on_frozen_disk() -> None:
     actual_direction = term.command[0, :2]
     actual_direction = actual_direction / torch.linalg.norm(actual_direction)
     torch.testing.assert_close(actual_direction, expected_direction)
+    assert torch.linalg.norm(term.command[0, :2]) == pytest.approx(
+        cfg.cruise_speed_mps)
+
+    # A policy that drifted around the old outgoing target is pulled back to
+    # the in-disk cap with full command authority instead of parking outside.
+    safe_shift = torch.tensor(
+        cfg.clearance_traversal_shifts_m[0][:2])
+    robot.data.root_link_pos_w[0, :2] = (
+        torch.tensor(cfg.predicate_waypoints_m[0][:2])
+        + torch.tensor([0.36, safe_shift[1].item() + 0.13])
+    )
+    term._update_command()
+    assert term._waypoint_index.item() == 0
+    assert torch.linalg.norm(term.command[0, :2]) == pytest.approx(
+        cfg.cruise_speed_mps)
+    drift_direction = safe_target - robot.data.root_link_pos_w[0, :2]
+    drift_direction = drift_direction / torch.linalg.norm(drift_direction)
+    actual_direction = term.command[0, :2]
+    actual_direction = actual_direction / torch.linalg.norm(actual_direction)
+    torch.testing.assert_close(actual_direction, drift_direction)
 
     robot.data.root_link_pos_w[0, :2] = torch.tensor([2.0, 0.85])
     term._update_command()
