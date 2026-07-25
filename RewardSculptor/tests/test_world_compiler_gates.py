@@ -370,7 +370,7 @@ def test_forbidden_object_waypoint_uses_embodiment_clearance_subtarget() -> None
         required_clearance - 0.85)
     assert routed.clearance_staging_shifts_m[1] == (0.0, 0.0, 0.0)
     traversal = routed.clearance_traversal_shifts_m[0]
-    assert math.hypot(traversal[0], traversal[1]) == pytest.approx(0.300)
+    assert math.hypot(traversal[0], traversal[1]) == pytest.approx(0.450)
     assert traversal[0] > 0.0
     assert traversal[1] == pytest.approx(
         required_clearance - 0.85)

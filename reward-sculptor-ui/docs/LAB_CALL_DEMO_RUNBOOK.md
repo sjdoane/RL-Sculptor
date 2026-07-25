@@ -1037,3 +1037,35 @@ reload-watched core untouched. After it stops, require the official scene
 audit, all-lane trajectory/fitness, and lane-10 keyframes/full video to prove
 the entire aligned, ordered, contact-free, no-fall, upright, terminal-speed,
 and uninterrupted 100-frame whole-body-hold conjunction.
+
+## Iter 30 is aligned but parks at waypoint 1
+
+Iter 30 completed and preserved its checkpoint. The scene audit is exactly
+aligned, realism is `ok`, and requested/resolved lane 10 is recorded at
+percentile `0.796875`. It is diagnostic only: 0/64 lanes complete the route,
+52/64 are contact-free, no lane sustains a fall, and no lane achieves any
+100-frame terminal hold. The maximum-index distribution is
+`{0: 36, 1: 9, 2: 18, 4: 1}`; fitness is correctly zero.
+
+Lane 10 remains contact-free but enters only the first actual waypoint zone,
+never advances the frozen waypoint-1 predicate, and ends `6.037 m` from
+finish. Its closest approach is `0.3845 m` against the immutable `0.3500 m`
+tolerance. The complete video shows the robot reach the safe side of the
+first physical box and park there, not traverse the slalom.
+
+The complete clearance-maneuver firewall is active and removes
+predicate-centered generated shaping during the maneuver, so the remaining
+failure is command geometry rather than scene alignment or lane-10 contact.
+An in-disk steering target can still yield a just-outside equilibrium when a
+velocity policy trails its command. The next generic controller target
+continues along the identical obstacle-safe chord to `0.100 m` beyond the
+outgoing disk boundary. It does not change success: the original `0.350 m`
+disk still advances the command immediately on first entry.
+
+Focused compiler + adapter suites pass **70 tests**; scoped Ruff (`F,E9`),
+compileall, and diff check also pass. Commit the correction before launching
+the next UI proof. Recover actor+critic from iter 26, keep exact promoted
+reward v20/environment v21, retain the aligned boxes, four direct contact
+sensors at `-8`, full velocity-command supervision, 50/25/25 RSI,
+full-maneuver firewall, terminal brake, and strict whole-body stillness, and
+judge only the disclosed lane's complete physical conjunction.

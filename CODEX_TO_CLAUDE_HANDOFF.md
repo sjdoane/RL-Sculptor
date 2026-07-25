@@ -3132,3 +3132,45 @@ intermediate GPU audit or edit reload-watched core while iter 30 is alive.
 After checkpoint preservation, require the official all-lane artifacts,
 disclosed lane-10 keyframes/full video, and Results scene audit to prove the
 complete physical conjunction before promotion.
+
+## Iter 30 audit + clearance-preserving full-disk traversal 2026-07-25 (Codex)
+
+UI job `job_8d340a6c65c057f4` completed iter 30 and wrote its completion
+marker. The Results physical-scene audit is `aligned` with `0.00 m` maximum
+error, realism is `ok`, and `behavior.json` proves requested/resolved
+precommitted lane 10 at percentile `0.796875`. The immutable evidence rejects
+the policy:
+
+- ordered route completion and authored success: **0/64**;
+- maximum-index distribution: `{0: 36, 1: 9, 2: 18, 4: 1}`;
+- forbidden-contact-free: **52/64**;
+- sustained-fall-free: **64/64**;
+- 100-frame horizontal, velocity, posture-qualified, and full-conjunction
+  holds: **0/64**;
+- objective fitness `0.00000`, progress `0.27484`, and aggregate terminal
+  horizontal speed `0.17055 m/s`.
+
+Lane 10 is contact-free and does not sustain a fall, but it enters only the
+first actual waypoint zone at frame 186, never advances waypoint 1, and ends
+`6.037 m` from finish. Its minimum frozen-predicate distance is `0.3845 m`
+against the unchanged `0.3500 m` tolerance. The full video shows an approach
+to the correct co-located first box followed by parking on its safe side for
+the remaining horizon. It is not a weave-and-stop and must never be presented
+as success.
+
+The full-maneuver reward firewall removes the earlier generated-reward
+conflict but cannot by itself prevent a command-tracking equilibrium. Iter
+30's `0.050 m`-inside traversal target still lets a lagging velocity policy
+settle before immutable disk entry. The generic correction now continues the
+same obstacle-safe chord to a command-only point `0.100 m` beyond the outgoing
+disk boundary. Radial clearance is unchanged, while forward authority remains
+present through the full predicate. The untouched `0.350 m` authored disk
+still advances the route on first entry, before the outgoing steering target
+must be reached. No robot, task, object, or prompt name is used.
+
+Focused compiler + adapter verification is **70 passed**. Scoped Ruff
+(`F,E9`), compileall, and diff check pass. The next UI proof should again
+warm-start actor+critic from iter 26, restore exact promoted reward v20/env
+v21, preserve every physical-scene/contact/RSI/firewall/posture invariant,
+and prove the precommitted evidence lane's entire physical conjunction before
+promotion.
