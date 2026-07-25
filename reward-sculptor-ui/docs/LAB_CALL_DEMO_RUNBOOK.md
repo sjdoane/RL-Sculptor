@@ -514,3 +514,14 @@ physical objects, two-phase clearance stages, four direct contact sensors at
 `-8`, full velocity-command weights, terminal whole-body stillness, and the
 clearance-stage reward firewall. Acceptance remains fully conjunctive; never
 present iter 21 as the final result.
+
+Current proof run: UI job `job_94a8897853269309`, iter 22, clean launch
+commit `a642572`, selection v31 / tuple
+`f9456723bfac3a1911042ad5adac1627ad35beeceecb525d043f2923c34503d8`.
+It uses reward v17 SHA `aaaf2a20cf86532a...`, env v18 SHA
+`5388a2bb5d094aef...`, and explicitly loads iter 21 checkpoint SHA8
+`675b6296`. The UI startup log proves the 1.000 m/s horizon-aware route,
+0.100 m/s terminal-boundary entry command, 50/25/25 RSI, physical alignment,
+direct contact supervision, full command weights, terminal stillness, and
+reward firewall. PPO iteration 1/750 is active. Do not run an intermediate
+GPU audit or edit reload-watched core while this worker is alive.

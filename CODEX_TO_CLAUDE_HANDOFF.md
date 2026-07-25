@@ -2468,3 +2468,19 @@ with exact promoted-tuple recovery **off**, reward v17 + env v18, and warm
 start from iter 21. Require startup logs for the 0.10 m/s terminal-boundary
 brake, 50/25/25 phase-balanced RSI, all existing physical alignment/contact/
 firewall invariants, and actor+critic warm start before PPO.
+
+That proof is now live as UI job `job_94a8897853269309`, iter 22, under clean
+captured code commit `a642572`. Normal Resume kept exact promoted-tuple
+recovery off and pinned selection v31 / tuple
+`f9456723bfac3a1911042ad5adac1627ad35beeceecb525d043f2923c34503d8`,
+reward v17 SHA
+`aaaf2a20cf86532a5ba522f2e30b422133fb4927017906a07e19e0881b4a6e38`,
+and env v18 SHA
+`5388a2bb5d094aef865e6f0c69dc2af015400f43ed308f0d8ab1a8942d61e331`.
+The worker command explicitly warm-starts iter 21 checkpoint SHA8 `675b6296`.
+The live UI log proves the 1.000 m/s horizon schedule, `≤0.100 m/s` terminal
+boundary brake, 50/25/25 phase-balanced RSI, local-frame objects, four direct
+contact sensors at `-8`, full authored command weights, terminal stillness,
+and clearance-stage firewall; PPO iteration 1/750 is active on 1,024
+environments. Do not edit reload-watched core or run an intermediate GPU
+audit. Preserve the checkpoint, then evaluate only official iter-22 evidence.
