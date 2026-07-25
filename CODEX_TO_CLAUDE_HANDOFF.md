@@ -2623,3 +2623,22 @@ seed 42, two 1,000-step 1920x1080 episodes, `gen_003` observe-only, and
 precommitted evidence lane 10. Require the new
 `warm_start_checkpoint_resolved` event and actor+critic load from iter 22
 before leaving PPO alone. Never present iter 23 as success.
+
+That proof is now live as UI job `job_0d2b45c89d3cf056`, iter 24, under
+clean captured commit `9fda226`. The ordinary New Run UI kept exact promoted
+recovery off, accepted Warm-start checkpoint 22, and pinned selection v33 /
+tuple
+`2262c85d4d823331ac510211688d81573cf80fd3218c0fa23ee1e5fa0cc5cfa9`,
+reward v19 SHA
+`ee9941bb5cb6177801dcb1dd63541988ef15bc7a4d982fad1507e327e682bc5b`,
+and env v19 SHA
+`84c9a5ff58c12ffb91755d5afaadb60b67555da35b4b824cb174ad87520014c2`.
+The UI log emitted `warm_start_checkpoint_resolved` with full source SHA
+`e3c665ecde508fa1ea9f3f12c519b285a5bc8e8116acdb83213fd1a2d8041c21`;
+the worker then emitted `warm_start_loaded` with `load_cfg_keys:
+["actor", "critic"]`. It also proves every requested launch setting and
+physical invariant, including reward-v19 anti-parking recovery, entropy
+`0.0075`, full command weights, terminal stillness, direct contact sensors,
+reward firewall, aligned boxes, staged controller, and 50/25/25 RSI. PPO
+iteration 0/750 is active on 1,024 environments. Do not edit reload-watched
+core or run intermediate GPU audits until iter 24 finishes.

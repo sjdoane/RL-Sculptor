@@ -634,3 +634,16 @@ aligned visible boxes, ordered physical weave and finish, no forbidden
 contact or sustained fall, upright/default-like posture, terminal horizontal
 speed below `0.12 m/s`, and 100 uninterrupted post-completion frames quiet in
 horizontal, angular, joint, and posture channels.
+
+Current proof run: UI job `job_0d2b45c89d3cf056`, iter 24, clean captured
+commit `9fda226`. The UI pinned selection v33 / tuple
+`2262c85d4d823331ac510211688d81573cf80fd3218c0fa23ee1e5fa0cc5cfa9`,
+reward v19 SHA `ee9941bb5cb61778...`, and env v19 SHA
+`84c9a5ff58c12ffb...`, with exact promoted recovery off. The new recovery
+event records iter 22 checkpoint SHA
+`e3c665ecde508fa1ea9f3f12c519b285a5bc8e8116acdb83213fd1a2d8041c21`,
+and `warm_start_loaded` confirms both actor and critic. The UI/worker logs
+also prove 750 PPO iterations, 1,024 environments, seed 42, lane 10, two
+1,000-step 1920×1080 episodes, `gen_003` observe-only, reward-v19 posture
+revert, entropy `0.0075`, and every physical controller/contact/firewall
+invariant above. PPO is active. Leave the worker untouched until completion.
