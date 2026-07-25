@@ -2763,3 +2763,35 @@ factor can no longer be hidden by a moderately good one; missing posture
 signals remain fail-soft. No robot/task/object/prompt name, frozen evaluator,
 world geometry, route, tolerance, contact rule, hold duration, or metric
 channel changes.
+
+## Iter 26 live strict-posture proof 2026-07-24 (Codex)
+
+The strict-product recovery proof is live as UI job
+`job_f61191b6d9080217`, iter 26, launched entirely through the ordinary New
+run flow from clean captured commit
+`bb8e085035e72110f8e18267227245b3c0b50050`. Exact promoted-tuple recovery
+is off. The UI selected reward v20 and current environment v21, explicitly
+resolved iter 25 checkpoint SHA
+`d5c1f8552626c2cf4c3e5cffef11edc61ccace0c6564a0fbb433f5ea3702f51b`,
+and pins selection v35 / tuple
+`95afc97b6000593eab01c8e7b374b71dbf20f6e75e647008d322f8270b0b88c7`.
+
+The persisted UI job log proves env v21 applied `entropy_coef 0.01 -> 0.01`,
+`warm_start_loaded` restored both actor and critic from iter 25 (SHA8
+`d5c1f855`), and PPO entered iteration 0/750. The visible startup and live
+training log retain the strict multiplicative terminal-posture conjunction
+at weight 4, four direct forbidden-contact sensors at -8, full
+`track_linear_velocity` and `track_angular_velocity` supervision, the
+clearance-stage reward firewall, 1.000 m/s horizon-aware scheduling,
+predicate-boundary braking, four typed 0.268 m clearance entries with outside
+stages before the unchanged 0.350 m task disks, 50/25/25 train-only RSI, and
+all four physical boxes at nominal local pose plus environment origin.
+
+Settings remain one cycle, 750 PPO iterations, 1,024 environments on
+`cuda:0`, seed 42, precommitted evidence lane 10, two 1,000-step 1920x1080
+episodes, Auto, and `gen_003` observe-only. Do not edit reload-watched core or
+run an intermediate GPU audit while iter 26 is alive. After checkpoint
+preservation, inspect the official all-lane artifacts and the disclosed
+lane-10 keyframes/full video. Promotion still requires the complete physical
+conjunction, including 100 uninterrupted post-completion frames of horizontal,
+angular, joint, uprightness, and default-pose quiet inside finish.

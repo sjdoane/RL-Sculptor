@@ -751,3 +751,33 @@ factor. Missing posture signals remain fail-soft; the objective and physical
 task are unchanged. The next UI recovery run must warm-start iter 25, preserve
 the current physical controller/contact/firewall invariants, and prove the
 same disclosed lane's 100-frame posture-qualified hold before promotion.
+
+## Live proof: iter 26 strict posture conjunction
+
+UI job `job_f61191b6d9080217` is running iter 26 from clean captured commit
+`bb8e085`. Exact promoted recovery is off; reward v20 and current environment
+v21 are authoritative. The UI resolved iter 25 checkpoint SHA
+`d5c1f8552626c2cf4c3e5cffef11edc61ccace0c6564a0fbb433f5ea3702f51b`
+and pins selection v35 / tuple
+`95afc97b6000593eab01c8e7b374b71dbf20f6e75e647008d322f8270b0b88c7`.
+
+The launch record confirms:
+
+- env v21 applies `entropy_coef 0.01 -> 0.01`;
+- actor and critic loaded from iter 25 (SHA8 `d5c1f855`);
+- PPO entered iteration 0/750 on 1,024 environments;
+- terminal stillness uses the strict smooth product of every available
+  posture factor at weight 4;
+- four forbidden-contact sensors remain at -8 and both authored velocity
+  command terms retain full supervision;
+- the safe-stage firewall, two-phase 0.268 m clearance entries, unchanged
+  0.350 m task disks, 50/25/25 RSI, aligned physical boxes, 1.000 m/s horizon
+  schedule, and terminal predicate-boundary brake remain active.
+
+The remaining settings are seed 42, evidence lane 10, two 1,000-step
+1920x1080 episodes, Auto, and `gen_003` observe-only. Leave the live worker
+untouched. On completion, require lane 10—not a batch aggregate or older
+video—to visibly weave around the co-located boxes, enter every disk and
+finish in order, avoid contact and sustained fall, and maintain a default-like
+upright pose with horizontal, angular, and joint motion quiet for 100
+uninterrupted post-completion frames inside finish.
