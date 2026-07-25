@@ -352,6 +352,7 @@ export interface RunParamsPayload {
   // cost is resolution-independent, so high-res is the sane default.
   render_width?: number | null;
   render_height?: number | null;
+  render_env_index?: number | null;
   rollout_episodes?: number | null;
   seed?: number | null;
   auto_adjust_physics?: boolean | null;

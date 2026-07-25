@@ -91,6 +91,12 @@ class RunParams(BaseModel):
     ] = None
     """Rollout video height in px. None = runner default (720)."""
 
+    render_env_index: Optional[
+        Annotated[int, Field(ge=0, le=63)]
+    ] = None
+    """Precommitted parallel evaluation lane shown in the rollout video.
+    Batch metrics still cover every lane. None = lane 0."""
+
     rollout_episodes: Optional[
         Annotated[int, Field(ge=1, le=32)]
     ] = None

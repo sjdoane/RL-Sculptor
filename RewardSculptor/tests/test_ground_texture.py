@@ -71,7 +71,7 @@ def test_ground_texture_no_scene_is_safe():
 # ── rollout viewer config (720p default + no ghost neighbor envs) ─────────
 
 def _viewer_ns(**over):
-    base = dict(width=320, height=240, max_extra_envs=2)
+    base = dict(width=320, height=240, max_extra_envs=2, env_idx=0)
     base.update(over)
     return SimpleNamespace(**base)
 
@@ -89,9 +89,11 @@ def test_rollout_viewer_defaults_to_720p_no_extra_envs():
 
 def test_rollout_viewer_args_override():
     viewer = _viewer_ns()
-    args = SimpleNamespace(render_width=960, render_height=540)
+    args = SimpleNamespace(
+        render_width=960, render_height=540, render_env_index=10)
     _mjlab_runner._configure_rollout_viewer(SimpleNamespace(viewer=viewer), args)
     assert (viewer.width, viewer.height) == (960, 540)
+    assert viewer.env_idx == 10
 
 
 def test_rollout_viewer_zero_args_mean_default():

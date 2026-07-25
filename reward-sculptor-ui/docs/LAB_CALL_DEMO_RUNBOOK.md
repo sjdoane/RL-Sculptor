@@ -525,3 +525,48 @@ It uses reward v17 SHA `aaaf2a20cf86532a...`, env v18 SHA
 direct contact supervision, full command weights, terminal stillness, and
 reward firewall. PPO iteration 1/750 is active. Do not run an intermediate
 GPU audit or edit reload-watched core while this worker is alive.
+
+## Current authoritative correction after iter 22
+
+Iter 22 solved most of the physical task across the evaluation batch:
+57/64 lanes completed the ordered route, 52/64 avoided every box contact, and
+four lanes (`10, 11, 15, 50`) combined route/contact/no-fall with a literal
+100-frame whole-body velocity hold. The scene remains aligned at tight error
+and the video shows the robot traversing the actual box course. Do not present
+iter 22 as final proof: the fixed displayed lane 0 finished while deeply
+crouched and flailing, with terminal speed `0.443 m/s`.
+
+The generic runtime now refuses to count a motionless collapse as terminal
+stillness. It gates the continuity streak on projected-gravity uprightness and
+RMS distance from each robot's own default joint pose, and it exposes
+reset-safe `action_rate` plus `joint_vel_rms` channels for generated rewards.
+No robot or task name is used.
+
+The Advanced New Run dialog also has an **Evidence environment** field. It is
+a transparent, pre-run choice of which parallel evaluation lane the video
+tracks; it never changes training, the full 64-lane trajectory, or batch
+fitness. `behavior.json` records the requested/resolved index, return, and
+percentile. Automatic post-hoc best-lane selection is not implemented.
+
+Verification: core focused suites **140 passed**, backend run suite **48
+passed**, frontend TypeScript, scoped Ruff, compileall, and diff check pass.
+
+Launch the next proof entirely in the UI:
+
+- click **New run** (not exact-tuple recovery);
+- keep exact promoted-tuple recovery **off** so reward v18 and env v19 are
+  consumed;
+- Auto, one cycle, 750 PPO iterations, 1,024 environments on `cuda:0`;
+- 1,000 episode steps, two rollout episodes, seed 42, 1920×1080;
+- Evidence environment: **10**;
+- `gen_003` observe-only, no new motion prior.
+
+Reward v18 increases posture supervision and caps excessive foot swing; env
+v19 reduces entropy to `0.75x`. The run must warm-start actor and critic from
+iter 22. Before PPO, verify the existing alignment, staged-route, horizon,
+terminal-braking, 50/25/25 RSI, contact `-8`, full command-weight, and reward
+firewall lines, plus posture-aware terminal stillness. Acceptance is still
+fully conjunctive: the disclosed video lane and official batch evidence must
+show the aligned physical boxes, ordered weave and finish, zero forbidden
+contact, no sustained fall, upright posture, terminal horizontal speed below
+`0.12 m/s`, and 100 uninterrupted post-completion whole-body-quiet frames.

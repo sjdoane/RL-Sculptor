@@ -1579,6 +1579,7 @@ def test_run_sculpt_job_forwards_ship7_params_as_cli_flags(
             "rollout_fps": 30,
             "render_width": 1920,
             "render_height": 1080,
+            "render_env_index": 10,
             "rollout_episodes": 10,
             "seed": 1337,
             "auto_adjust_physics": True,
@@ -1602,6 +1603,8 @@ def test_run_sculpt_job_forwards_ship7_params_as_cli_flags(
     assert cmd[cmd.index("--render-width") + 1] == "1920"
     assert "--render-height" in cmd
     assert cmd[cmd.index("--render-height") + 1] == "1080"
+    assert "--render-env-index" in cmd
+    assert cmd[cmd.index("--render-env-index") + 1] == "10"
     assert "--rollout-episodes" in cmd
     assert cmd[cmd.index("--rollout-episodes") + 1] == "10"
     assert "--seed" in cmd
@@ -1722,7 +1725,7 @@ def test_run_sculpt_job_omits_ship7_flags_when_not_set(
     for flag in (
         "--max-episode-steps", "--playback-speed", "--render-every",
         "--rollout-fps", "--render-width", "--render-height",
-        "--rollout-episodes", "--seed",
+        "--render-env-index", "--rollout-episodes", "--seed",
         "--auto-adjust-physics", "--no-auto-adjust-physics",
     ):
         assert flag not in cmd, f"{flag} leaked when not set: {cmd}"

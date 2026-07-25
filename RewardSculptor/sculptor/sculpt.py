@@ -1328,6 +1328,7 @@ def _rollout_or_resume(
     fps: float | None = None,
     render_width: int | None = None,
     render_height: int | None = None,
+    render_env_index: int | None = None,
     seed: int | None = None,
 ) -> None:
     """Skip `adapter.rollout` when the three artifacts it produces
@@ -1363,6 +1364,7 @@ def _rollout_or_resume(
         ("fps", fps),
         ("render_width", render_width),
         ("render_height", render_height),
+        ("render_env_index", render_env_index),
         # §Selection statistics: distinct eval seeds per repeat rollout —
         # adapters that don't declare `seed` (gym_sb3) silently skip it.
         ("seed", seed),
@@ -1807,6 +1809,7 @@ def _run_one_iter(
         fps=iter_cfg.get("rollout_fps"),
         render_width=iter_cfg.get("render_width"),
         render_height=iter_cfg.get("render_height"),
+        render_env_index=iter_cfg.get("render_env_index"),
     )
 
     # §Ship 33: objective task fitness on this rollout (ground truth,
@@ -2657,6 +2660,7 @@ def sculpt_run(
     rollout_fps: Optional[float] = None,
     render_width: Optional[int] = None,
     render_height: Optional[int] = None,
+    render_env_index: Optional[int] = None,
     rollout_episodes: Optional[int] = None,
     seed: Optional[int] = None,
     auto_adjust_physics: Optional[bool] = None,
@@ -2766,6 +2770,7 @@ def sculpt_run(
         ("rollout_fps", rollout_fps),
         ("render_width", render_width),
         ("render_height", render_height),
+        ("render_env_index", render_env_index),
         ("rollout_episodes", rollout_episodes),
         ("seed", seed),
         ("auto_adjust_physics", auto_adjust_physics),

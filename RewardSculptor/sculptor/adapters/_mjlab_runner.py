@@ -287,6 +287,51 @@ def _episode_relative_base_height(base_z, episode_length, anchor):
     return base_z - anchor, anchor
 
 
+def _motion_quality_info(
+    action, previous_action, episode_length, joint_vel,
+):
+    """Return universal smoothness scalars and the next action anchor.
+
+    The reward contract advertises these channels for every mjlab
+    articulation, so the runtime must define them without task, robot, or
+    joint-name assumptions.  RMS reductions keep their scale comparable as
+    embodiments gain joints.  Reset frames are zeroed so an episode boundary
+    cannot manufacture a large action-rate penalty.
+    """
+    import torch
+
+    if (
+        previous_action is None
+        or tuple(previous_action.shape) != tuple(action.shape)
+        or previous_action.device != action.device
+        or previous_action.dtype != action.dtype
+    ):
+        previous_action = torch.zeros_like(action)
+    fresh = episode_length <= 1.0
+    action_rate = torch.sqrt(
+        torch.mean(torch.square(action - previous_action), dim=-1)
+    )
+    action_rate = torch.where(
+        fresh, torch.zeros_like(action_rate), action_rate)
+
+    if (
+        joint_vel is None
+        or getattr(joint_vel, "ndim", 0) != 2
+        or joint_vel.shape[0] != action.shape[0]
+    ):
+        joint_vel_rms = torch.zeros_like(action_rate)
+    else:
+        joint_vel_rms = torch.sqrt(
+            torch.mean(torch.square(joint_vel), dim=-1)
+        ).to(dtype=action.dtype)
+        joint_vel_rms = torch.where(
+            fresh, torch.zeros_like(joint_vel_rms), joint_vel_rms)
+    return {
+        "action_rate": action_rate,
+        "joint_vel_rms": joint_vel_rms,
+    }, action.detach().clone()
+
+
 def _build_sculptor_term_class(
     schema_keys: tuple[str, ...], robot_capability: Any | None = None,
     world_bundle: Any | None = None,
@@ -330,6 +375,7 @@ def _build_sculptor_term_class(
                     manifest=world_bundle.manifest)
             self._prev = self._snapshot(env)
             self._base_height_anchor = None
+            self._previous_action = None
 
         @staticmethod
         def _find_articulated_entity(env):
@@ -615,6 +661,13 @@ def _build_sculptor_term_class(
                 "base_height_delta": base_height_delta,
                 "fallen": fallen,
             }
+            motion_info, self._previous_action = _motion_quality_info(
+                action,
+                self._previous_action,
+                episode_length,
+                getattr(data, "joint_vel", None),
+            )
+            info.update(motion_info)
             # §Ship 46: per-foot kick channels (contact / swing speed /
             # height) + base horizontal speed, so a sculpted reward can
             # shape a single-leg kick. Zero-filled on non-biped tasks.
@@ -641,6 +694,8 @@ def _build_sculptor_term_class(
                 self._prev[k][env_ids] = 0.0
             if self._base_height_anchor is not None:
                 self._base_height_anchor[env_ids] = float("nan")
+            if self._previous_action is not None:
+                self._previous_action[env_ids] = 0.0
             if self._world_reward_runtime is not None:
                 self._world_reward_runtime.reset(env_ids)
 
@@ -1037,6 +1092,10 @@ def _apply_clearance_stage_reward_firewall(
 
 def _authored_terminal_stillness_state(
     env: Any, *, lin_std: float, ang_std: float, joint_std: float,
+    upright_z_max: float = -0.7,
+    joint_pos_tolerance: float = 0.6,
+    upright_std: float = 0.35,
+    joint_pos_std: float = 0.6,
 ) -> tuple[Any, Any, Any, Any]:
     """Return terminal phase, score, horizontal speed, and whole-body quiet.
 
@@ -1126,11 +1185,51 @@ def _authored_terminal_stillness_state(
         + 0.25 * torch.exp(-torch.square(angular_speed / float(ang_std)))
         + 0.15 * torch.exp(-torch.square(joint_rms / float(joint_std)))
     )
+
+    # A motionless collapse is not an authored upright hold.  Projected
+    # gravity and the articulation's own default joint pose are generic
+    # posture references available on every floating-base locomotion robot;
+    # no embodiment or task identifier is involved.  Missing signals remain
+    # fail-soft for fixed-base/custom adapters, preserving their old behavior.
+    projected_gravity = getattr(data, "projected_gravity_b", None)
+    if (
+        projected_gravity is not None
+        and getattr(projected_gravity, "ndim", 0) == 2
+        and projected_gravity.shape[0] == standing.shape[0]
+        and projected_gravity.shape[1] >= 3
+    ):
+        gravity_z = projected_gravity[:, 2]
+        upright_score = torch.exp(
+            -torch.square((gravity_z + 1.0) / float(upright_std))
+        )
+        score = 0.80 * score + 0.20 * upright_score
+        whole_body_quiet &= gravity_z < float(upright_z_max)
+
+    joint_pos = getattr(data, "joint_pos", None)
+    default_joint_pos = getattr(data, "default_joint_pos", None)
+    if (
+        joint_pos is not None
+        and default_joint_pos is not None
+        and tuple(joint_pos.shape) == tuple(default_joint_pos.shape)
+        and getattr(joint_pos, "ndim", 0) == 2
+    ):
+        joint_pos_rms = torch.sqrt(
+            torch.mean(torch.square(joint_pos - default_joint_pos), dim=-1)
+        )
+        pose_score = torch.exp(
+            -torch.square(joint_pos_rms / float(joint_pos_std))
+        )
+        score = 0.80 * score + 0.20 * pose_score
+        whole_body_quiet &= joint_pos_rms < float(joint_pos_tolerance)
     return standing, score, horizontal_speed, whole_body_quiet
 
 
 def _authored_terminal_stillness_reward(
     env: Any, *, lin_std: float, ang_std: float, joint_std: float,
+    upright_z_max: float = -0.7,
+    joint_pos_tolerance: float = 0.6,
+    upright_std: float = 0.35,
+    joint_pos_std: float = 0.6,
 ) -> Any:
     """Dense whole-body stillness, active only after an authored command ends."""
     standing, score, _horizontal_speed, _whole_body_quiet = (
@@ -1139,6 +1238,10 @@ def _authored_terminal_stillness_reward(
             lin_std=lin_std,
             ang_std=ang_std,
             joint_std=joint_std,
+            upright_z_max=upright_z_max,
+            joint_pos_tolerance=joint_pos_tolerance,
+            upright_std=upright_std,
+            joint_pos_std=joint_pos_std,
         )
     )
     return score * standing.to(dtype=score.dtype)
@@ -1174,6 +1277,10 @@ def _build_authored_terminal_stillness_term_class():
             joint_std: float,
             hold_s: float,
             continuity_scale: float,
+            upright_z_max: float = -0.7,
+            joint_pos_tolerance: float = 0.6,
+            upright_std: float = 0.35,
+            joint_pos_std: float = 0.6,
         ):
             standing, score, _horizontal_speed, whole_body_quiet = (
                 _authored_terminal_stillness_state(
@@ -1181,6 +1288,10 @@ def _build_authored_terminal_stillness_term_class():
                     lin_std=lin_std,
                     ang_std=ang_std,
                     joint_std=joint_std,
+                    upright_z_max=upright_z_max,
+                    joint_pos_tolerance=joint_pos_tolerance,
+                    upright_std=upright_std,
+                    joint_pos_std=joint_pos_std,
                 )
             )
             dtype = score.dtype
@@ -2190,6 +2301,10 @@ def _cmd_train(args: argparse.Namespace) -> None:
                     "lin_std": 0.12,
                     "ang_std": 0.5,
                     "joint_std": 1.0,
+                    "upright_z_max": -0.7,
+                    "joint_pos_tolerance": 0.6,
+                    "upright_std": 0.35,
+                    "joint_pos_std": 0.6,
                     "hold_s": terminal_hold_s,
                     "continuity_scale": _SCULPTOR_TERMINAL_CONTINUITY_SCALE,
                 },
@@ -2608,6 +2723,9 @@ def _configure_rollout_viewer(env_cfg: Any, args: Any) -> None:
             viewer.height = max(64, h)
         if hasattr(viewer, "max_extra_envs"):
             viewer.max_extra_envs = 0
+        if hasattr(viewer, "env_idx"):
+            viewer.env_idx = int(
+                getattr(args, "render_env_index", 0) or 0)
     except Exception as e:  # noqa: BLE001 — cosmetics must never kill a rollout
         print(f"[runner] viewer config skipped: {type(e).__name__}: {e}",
               file=sys.stderr, flush=True)
@@ -2830,6 +2948,13 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
     # minimum that still fits alongside a trained policy in <1 GiB.
     MIN_ENVS_FOR_WARP = 64
     num_envs = max(n_episodes, MIN_ENVS_FOR_WARP)
+    requested_render_env_index = int(
+        getattr(args, "render_env_index", 0) or 0)
+    render_env_index = max(
+        0, min(requested_render_env_index, num_envs - 1))
+    # Keep the normalized value as the single source for viewer config,
+    # trajectory selection, and evidence metadata.
+    args.render_env_index = render_env_index
 
     env_cfg = load_env_cfg(args.task_id)
     env_cfg.scene.num_envs = num_envs
@@ -3251,10 +3376,10 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
         ep_length += active.int()
         ep_done |= dones_bool
 
-        # Record env[0]'s step reward as a representative trajectory
-        # (preserves the old single-env semantics for downstream
-        # analysis in diagnose + reports).
-        all_rewards.append(float(rew[0].item()))
+        # The rendered lane is precommitted before rollout. Keep its scalar
+        # reward series aligned with the video while the full state tensors
+        # continue to cover every evaluation lane.
+        all_rewards.append(float(rew[render_env_index].item()))
 
         # §7.1: expanded-trajectory capture. Skipped frames (when the
         # entity lookup fails) still let `rewards` + per-term capture
@@ -3347,16 +3472,19 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
         except Exception:  # noqa: BLE001 — reward_manager API drift; skip silently
             pass
 
-        # Render only while env[0]'s first episode is ongoing. After
-        # env[0] hits done, mujoco_warp's auto-reset warps it to a
+        # Render only while the precommitted lane's first episode is ongoing.
+        # After it hits done, mujoco_warp's auto-reset warps it to a
         # fresh initial pose — continuing to record produces a glitchy
         # video where the Cartpole snaps from upright to hanging and
         # back every episode boundary (Issue F from Test 1 2026-04-22).
         # Sam's Cartpole video showed the pole "teleporting" and
         # checkered-floor flashes at the reset frames — this guard
-        # stops the video at env[0]'s first terminal so the user sees
+        # stops the video at the lane's first terminal so the user sees
         # exactly one clean episode.
-        if step % render_every == 0 and not bool(ep_done[0].item()):
+        if (
+            step % render_every == 0
+            and not bool(ep_done[render_env_index].item())
+        ):
             frame = env.render()
             if frame is not None:
                 frames.append(np.asarray(frame, dtype=np.uint8))
@@ -3376,11 +3504,14 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
                 "fps": round(step / elapsed, 1) if elapsed > 0 else None,
             }), flush=True)
 
-        if bool(ep_done[:n_episodes].all().item()):
+        tracked_done = bool(ep_done[:n_episodes].all().item())
+        rendered_done = bool(ep_done[render_env_index].item())
+        if tracked_done and rendered_done:
             break
 
     ep_returns = ep_return[:n_episodes].detach().cpu().tolist()
     ep_lengths = ep_length[:n_episodes].detach().int().cpu().tolist()
+    all_first_episode_returns = ep_return.detach().cpu().tolist()
 
     # Write video.
     import subprocess
@@ -3539,17 +3670,21 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
         "mean_return": float(np.mean(ep_returns)) if ep_returns else 0.0,
         "mean_episode_length": float(np.mean(ep_lengths)) if ep_lengths else 0.0,
         "max_episode_length": int(max(ep_lengths)) if ep_lengths else 0,
-        # §2026-07-19 (after Prompt2Policy's percentile-selected judge
-        # videos): the video/keyframes record env[0]'s FIRST episode — an
-        # arbitrary draw, not the best. Record its return and where it
-        # sits in this rollout's return distribution (inclusive CDF) so
-        # the diagnoser can weigh the frames' representativeness instead
-        # of assuming them typical.
+        # The video lane is declared at launch, never selected post-hoc from
+        # rollout outcomes. Record its identity and percentile across every
+        # parallel first episode so the evidence remains transparent.
+        "rendered_env_index": int(render_env_index),
+        "rendered_env_index_requested": int(requested_render_env_index),
+        "rendered_env_selection": "precommitted",
         "rendered_episode_return": (
-            float(ep_returns[0]) if ep_returns else None),
+            float(all_first_episode_returns[render_env_index])
+            if all_first_episode_returns else None),
         "rendered_episode_percentile": (
-            float(np.mean([r <= ep_returns[0] for r in ep_returns]))
-            if ep_returns else None),
+            float(np.mean([
+                r <= all_first_episode_returns[render_env_index]
+                for r in all_first_episode_returns
+            ]))
+            if all_first_episode_returns else None),
         # §Ship 26 (E1/M1): capture settings are load-bearing for spec
         # metrics (frequency bands are in cycles/FRAME; episode-length
         # normalization needs the cap). Persisting them lets the eval
@@ -3727,6 +3862,13 @@ def main() -> None:
     # 1280x720 both ~200 ms/frame, so high-res is free).
     p_roll.add_argument("--render-width", type=int, default=0)
     p_roll.add_argument("--render-height", type=int, default=0)
+    p_roll.add_argument(
+        "--render-env-index", type=int, default=0,
+        help=(
+            "precommitted parallel rollout lane to render; clamped to the "
+            "available evaluation batch and disclosed in behavior.json"
+        ),
+    )
     # §Selection statistics: deterministic eval seed for repeat rollouts
     # of the same checkpoint. 0 (default) = legacy unseeded behavior.
     p_roll.add_argument("--seed", type=int, default=0)

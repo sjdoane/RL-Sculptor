@@ -190,6 +190,12 @@ _INFO_KEYS: list[str] = [
     # height, so motion priors can track vertical displacement on any robot,
     # terrain elevation, or platform spawn without assuming a nominal height.
     "base_height", "base_height_delta", "fallen",
+    # Universal motion-quality channels.  These are embodiment-agnostic
+    # reductions over the adapter's canonical action/joint tensors, so reward
+    # authoring can respond to flailing without guessing simulator internals.
+    # ``action_rate`` is RMS(a_t - a_{t-1}); ``joint_vel_rms`` is the
+    # whole-articulation RMS joint velocity.  Both are zero on reset frames.
+    "action_rate", "joint_vel_rms",
 ]
 
 # §Ship 46: extra info keys surfaced for the G1 humanoid so a sculpted
@@ -902,6 +908,7 @@ class MjlabAdapter(SculptorAdapter):
         fps: float | None = None,
         render_width: int | None = None,
         render_height: int | None = None,
+        render_env_index: int | None = None,
         seed: int | None = None,
     ) -> RolloutResult:
         """§Ship-7: accept rollout-video knobs so the UI can drive them
@@ -914,6 +921,8 @@ class MjlabAdapter(SculptorAdapter):
           * `render_every` — capture every N-th step; 0/None = auto-cap.
           * `fps` — hard override on playback fps; 0/None = derive from
             env.step_dt * render_every / playback_speed.
+          * `render_env_index` — precommitted parallel rollout lane shown
+            in the video. Batch metrics still cover every evaluation lane.
           * `seed` — §Selection statistics: deterministic eval seed so
             repeat rollouts of the SAME checkpoint (multi-seed eval,
             fresh-seed re-eval) sample distinct, reproducible resets.
@@ -948,6 +957,8 @@ class MjlabAdapter(SculptorAdapter):
             cmd += ["--render-width", str(int(render_width))]
         if render_height is not None:
             cmd += ["--render-height", str(int(render_height))]
+        if render_env_index is not None:
+            cmd += ["--render-env-index", str(int(render_env_index))]
         if seed is not None:
             cmd += ["--seed", str(int(seed))]
         if self.env_spec_path:
@@ -988,6 +999,8 @@ class MjlabAdapter(SculptorAdapter):
                 options["--render-width"] = str(int(render_width))
             if render_height is not None:
                 options["--render-height"] = str(int(render_height))
+            if render_env_index is not None:
+                options["--render-env-index"] = str(int(render_env_index))
             if seed is not None:
                 options["--seed"] = str(int(seed))
             if not self.env_spec_path and self.env_profile:

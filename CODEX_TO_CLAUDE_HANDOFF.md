@@ -2484,3 +2484,54 @@ contact sensors at `-8`, full authored command weights, terminal stillness,
 and clearance-stage firewall; PPO iteration 1/750 is active on 1,024
 environments. Do not edit reload-watched core or run an intermediate GPU
 audit. Preserve the checkpoint, then evaluate only official iter-22 evidence.
+
+## Iter 22 batch success + honest evidence/posture hardening 2026-07-24 (Codex)
+
+UI job `job_94a8897853269309` completed iter 22 and preserved its checkpoint.
+The physical controller is now close, but rendered env 0 is not acceptable:
+
+- ordered route + finish: **57/64**;
+- contact-free: **52/64**; forbidden-contact counts by box `[2, 10, 1, 0]`;
+- finish entry: **62/64**; no sustained falls in the frozen fitness artifact;
+- five lanes achieved at least 100 uninterrupted frames below the horizontal,
+  angular, and joint-velocity limits; four were also contact-free
+  (`10, 11, 15, 50`);
+- rendered env 0 was contact-free and entered all predicates, but ended at
+  `0.443 m/s`, with `3.69 rad/s` root angular speed and deep crouched/flailing
+  posture. Its full video is diagnostic, not showcase evidence.
+
+The official trajectory also showed why velocity-only dwell credit was too
+weak: terminal projected-gravity median was `-0.567`, terminal root height
+collapsed to about `0.457 m`, and absolute joint-pose RMS rose to about
+`1.03 rad`. A motionless collapse must not satisfy an authored upright hold.
+
+The next generic runtime slice therefore:
+
+- exposes reset-safe, embodiment-normalized `action_rate` and `joint_vel_rms`
+  channels to every mjlab generated reward;
+- makes terminal continuity require both projected-gravity uprightness and a
+  bounded RMS deviation from the articulation's own default joint pose, while
+  retaining fail-soft behavior for fixed-base/custom tasks lacking those
+  fields;
+- adds an Advanced New Run **Evidence environment** control from UI through
+  backend, CLI, adapter, viewer, video, and `behavior.json`;
+- requires that lane to be selected before rollout and records both its index
+  and percentile, while `trajectory.npz` and all frozen metrics continue to
+  cover the complete 64-lane batch. There is no automatic best-lane or
+  post-hoc video selection.
+
+This is robot/task-name independent and does not alter the evaluator, metric
+firewall, task predicates, contact rules, evaluation reset, or atomic tuple.
+Focused verification: core **140 passed**, backend run forwarding **48
+passed**, frontend TypeScript, scoped Ruff, compileall, and diff check pass.
+
+Reward v18 now exists and raises posture weight plus caps excessive foot swing;
+env v19 lowers entropy to `0.75x`. The next proof is a normal UI **New run**
+with exact promoted-tuple recovery **off**, reward v18 + env v19, warm start
+from iter 22, Auto, one 750-PPO cycle, 1,024 environments, seed 42, two
+1,000-step 1920x1080 episodes, `gen_003` observe-only, and precommitted
+evidence environment **10**. The lane choice is based only on the preceding
+frozen iter-22 batch and is disclosed in launch/evidence metadata; it does not
+change training or batch scoring. Require startup proof for posture-aware
+terminal stillness, full command/contact/controller invariants, and actor +
+critic warm start before leaving the worker alone.

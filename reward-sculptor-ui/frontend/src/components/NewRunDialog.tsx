@@ -302,6 +302,7 @@ export function NewRunDialog({
   const [playbackSpeed, setPlaybackSpeed] = useState<number | "">("");
   const [rolloutEpisodes, setRolloutEpisodes] = useState<number | "">("");
   const [seed, setSeed] = useState<number | "">("");
+  const [renderEnvIndex, setRenderEnvIndex] = useState<number | "">(0);
   // Rollout video resolution. "default" = runner default (1280×720);
   // render cost is resolution-independent so this is mostly a debug knob.
   const [renderSize, setRenderSize] = useState<RenderSize>("default");
@@ -413,6 +414,7 @@ export function NewRunDialog({
       setAllowRobotMismatch(false);
       setReferenceClipId(null);
       setReferencePickerOpen(false);
+      setRenderEnvIndex(0);
     }
   }, [open, project.description, defaults]);
 
@@ -539,6 +541,8 @@ export function NewRunDialog({
         renderSize === "default" ? null : Number(renderSize.split("x")[0]),
       render_height:
         renderSize === "default" ? null : Number(renderSize.split("x")[1]),
+      render_env_index:
+        typeof renderEnvIndex === "number" ? renderEnvIndex : null,
       seed: typeof seed === "number" ? seed : null,
       auto_adjust_physics: autoAdjustPhysics,
       // §Ship 34: null = blind loop; a spec name turns on fitness-guided
@@ -982,6 +986,17 @@ export function NewRunDialog({
                       </select>
                     </div>
                     <p className="rs-hintline">Render cost is resolution-independent — high-res is free.</p>
+                  </Field>
+                  <Field label="Evidence environment" htmlFor="run-render-env">
+                    {numField(renderEnvIndex, setRenderEnvIndex, {
+                      id: "run-render-env",
+                      min: 0,
+                      max: 63,
+                      placeholder: "0",
+                    })}
+                    <p className="rs-hintline">
+                      Precommit the parallel lane shown in video. Full-batch metrics stay unchanged.
+                    </p>
                   </Field>
                 </div>
               </div>

@@ -1240,6 +1240,10 @@ def run(
     render_height: Optional[int] = typer.Option(
         None, "--render-height",
         help="Rollout video height in px (default 720)."),
+    render_env_index: Optional[int] = typer.Option(
+        None, "--render-env-index", min=0, max=63,
+        help="Precommit which parallel evaluation lane is rendered in the "
+             "video (0-63). Batch metrics remain unchanged."),
     rollout_episodes: Optional[int] = typer.Option(
         None, "--rollout-episodes",
         help="Override [iteration].rollout_episodes (default 6)."),
@@ -1351,6 +1355,7 @@ def run(
         rollout_fps=rollout_fps,
         render_width=render_width,
         render_height=render_height,
+        render_env_index=render_env_index,
         rollout_episodes=rollout_episodes,
         seed=seed,
         auto_adjust_physics=auto_adjust_physics,

@@ -306,6 +306,84 @@ def test_authored_terminal_stillness_is_dense_and_phase_gated() -> None:
     assert reward[2].item() == 0.0
 
 
+def test_terminal_stillness_rejects_motionless_collapse() -> None:
+    torch = pytest.importorskip("torch")
+
+    from sculptor.adapters._mjlab_runner import (
+        _authored_terminal_stillness_state,
+    )
+
+    command = SimpleNamespace(
+        is_standing_env=torch.tensor([True, True, True]))
+
+    class CommandManager:
+        active_terms = ("route",)
+
+        @staticmethod
+        def get_term(name):
+            assert name == "route"
+            return command
+
+    default = torch.zeros(3, 4)
+    data = SimpleNamespace(
+        root_link_lin_vel_b=torch.zeros(3, 3),
+        root_link_ang_vel_b=torch.zeros(3, 3),
+        joint_vel=torch.zeros(3, 4),
+        joint_pos=default.clone(),
+        default_joint_pos=default,
+        projected_gravity_b=torch.tensor([
+            [0.0, 0.0, -1.0],   # honest neutral hold
+            [0.0, 0.0, -0.5],   # motionless but tipped/crouched
+            [0.0, 0.0, -1.0],   # upright base, collapsed articulation
+        ]),
+    )
+    data.joint_pos[2] = 1.0
+    env = SimpleNamespace(
+        num_envs=3,
+        device=torch.device("cpu"),
+        command_manager=CommandManager(),
+        scene={"robot": SimpleNamespace(data=data)},
+    )
+
+    standing, score, _speed, quiet = _authored_terminal_stillness_state(
+        env, lin_std=0.12, ang_std=0.5, joint_std=1.0)
+
+    assert standing.tolist() == [True, True, True]
+    assert quiet.tolist() == [True, False, False]
+    torch.testing.assert_close(score[0], torch.tensor(1.0))
+    assert score[1].item() < score[0].item()
+    assert score[2].item() < score[0].item()
+
+
+def test_motion_quality_info_is_reset_safe_and_embodiment_agnostic() -> None:
+    torch = pytest.importorskip("torch")
+
+    from sculptor.adapters._mjlab_runner import _motion_quality_info
+
+    action = torch.tensor([
+        [1.0, -1.0],
+        [2.0, 0.0],
+    ])
+    previous = torch.zeros_like(action)
+    joint_vel = torch.tensor([
+        [3.0, 4.0, 0.0],
+        [0.0, 6.0, 8.0],
+    ])
+    episode_length = torch.tensor([1.0, 2.0])
+
+    info, next_anchor = _motion_quality_info(
+        action, previous, episode_length, joint_vel)
+
+    assert info["action_rate"][0].item() == 0.0
+    assert info["joint_vel_rms"][0].item() == 0.0
+    torch.testing.assert_close(
+        info["action_rate"][1], torch.sqrt(torch.tensor(2.0)))
+    torch.testing.assert_close(
+        info["joint_vel_rms"][1], torch.sqrt(torch.tensor(100.0 / 3.0)))
+    torch.testing.assert_close(next_anchor, action)
+    assert next_anchor.data_ptr() != action.data_ptr()
+
+
 def test_authored_terminal_stillness_rewards_continuity_and_resets() -> None:
     torch = pytest.importorskip("torch")
 
