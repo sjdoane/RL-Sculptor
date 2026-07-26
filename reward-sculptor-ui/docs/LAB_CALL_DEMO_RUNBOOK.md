@@ -1215,3 +1215,37 @@ untouched. After completion, preserve the checkpoint and require the official
 all-lane artifacts, lane-10 keyframes/full video, and Results scene audit to
 prove the ordered, aligned, contact-free, no-fall, upright/default-like,
 sub-0.12 m/s, uninterrupted 100-frame whole-body-hold conjunction.
+
+## Iter 33 has one real full pass, but lane 10 is still too late
+
+Iter 33 completed cleanly. Its checkpoint SHA is
+`8fc761779f5592d90eab457089c05bec9255f0d0b0671bd406ff298c6645347e`,
+the physical-scene endpoint is aligned at `0.0 m` maximum box error, realism
+is `ok`, and no lane sustains a fall.
+
+The horizon-budgeted brake is a real improvement: fitness rises to `0.13804`,
+progress to `0.76106`, `61/64` lanes enter every actual `0.350 m` disk and
+reach index 5, `46/64` declare authored success, and `43/64` are contact-free.
+Two lanes produce a strict 100-frame post-success hold. Env 21 is the first
+fresh complete conjunction, with actual entries
+`[157, 348, 518, 634, 725]`, success at 825, no contact or fall, and 112
+uninterrupted strict whole-body-quiet frames.
+
+Do not call the rendered evidence accepted yet. Requested/resolved lane 10 is
+recorded as precommitted at return percentile `0.765625`. Its full video
+visibly shows the alternating route and stop, and the immutable trace confirms
+entries `[179, 371, 592, 717, 893]`, index 5, no forbidden contact, no fall,
+upright/default-like posture, and final horizontal speed `0.11379 m/s`.
+However, authored success arrives at frame 993, leaving only three strict
+post-success frames. The last frame is `0.35530 m` from finish center, just
+`0.00530 m` outside the frozen disk. This is why the video can look successful
+while the objective fitness remains only 0.14: the score is a 64-lane frozen
+conjunction, and the disclosed lane lacks the separate uninterrupted proof
+window.
+
+The generic controller has now demonstrated the complete behavior, so do not
+move the evaluator, route, `0.350 m` tolerance, 1,000-step horizon, 2-second
+hold, or `1.000 m/s` command cap. Run one consolidation cycle from iter 33
+with exact promoted reward v20/environment v21, actor+critic recovery,
+precommitted lane 10, and all current scene/contact/RSI/firewall/posture
+invariants. Promotion still requires a fresh rendered full conjunction.

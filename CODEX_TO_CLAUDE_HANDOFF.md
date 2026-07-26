@@ -3351,3 +3351,42 @@ Do not run an intermediate GPU audit or edit reload-watched core while iter
 33 is alive. After the worker stops, preserve its checkpoint and judge the
 official all-lane trajectory/fitness, lane-10 behavior/keyframes/full video,
 and Results physical-scene audit against the complete physical conjunction.
+
+## Iter 33 immutable audit and consolidation decision 2026-07-26 (Codex)
+
+Iter 33/job `job_f3d7e4c744ed6494` completed cleanly and preserved checkpoint
+SHA
+`8fc761779f5592d90eab457089c05bec9255f0d0b0671bd406ff298c6645347e`.
+The official Results endpoint reports `aligned`, `0.0 m` maximum error against
+the `0.15 m` threshold, and exact agreement for all four boxes. Realism is
+`ok`; no lane sustains a fall.
+
+The shorter horizon-budgeted brake materially improves the frozen result.
+Fitness is `0.13804`, progress is `0.76106`, `61/64` lanes enter all five
+actual `0.350 m` regions in order and reach index 5, `46/64` declare authored
+success, and `43/64` remain contact-free. Two lanes supply a 100-frame strict
+post-success whole-body hold. Env 21 is the first fresh complete conjunction:
+it enters the regions at frames `[157, 348, 518, 634, 725]`, declares success
+at 825, remains contact-free and fall-free, and supplies 112 uninterrupted
+strict frames. This is real all-lane physical evidence that the controller
+can solve the task, but it is not the disclosed rendered proof.
+
+Precommitted lane 10 is aligned, contact-free, fall-free, and visually
+performs the alternating weave. Its actual-region entries are
+`[179, 371, 592, 717, 893]`; index 5 arrives at 893 and success at 993. The
+full video shows an upright/default-like stop, and the final horizontal speed
+is `0.11379 m/s`, but only three strict frames remain. Its last frame also
+drifts to `0.35530 m` from the finish center, `0.00530 m` outside the frozen
+disk. It therefore fails the required rendered 100-frame post-success
+whole-body proof despite looking successful.
+
+This is a robustness/timing shortfall, not a new geometry or evaluator defect.
+The same controller/checkpoint already produced one full conjunction and the
+change improved authored success from `30/64` to `46/64`. Preserve the
+successful generic fix and continue policy consolidation rather than altering
+the frozen route, tolerances, hold, horizon, command cap, or evidence
+definition. The next UI run should restore exact promoted reward v20/env v21,
+warm-start actor and critic from iter 33, retain precommitted lane 10 and every
+scene/contact/RSI/firewall/posture invariant, and train one further 750-PPO
+cycle. Promotion remains blocked until the disclosed lane itself supplies the
+complete conjunction.
