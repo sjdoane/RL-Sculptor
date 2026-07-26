@@ -2,6 +2,7 @@ import { useState } from "react";
 import { toast } from "sonner";
 
 import { Icon } from "@/components/rs/icon";
+import { ModeTimeline } from "@/components/ModeTimeline";
 import { Btn, EmptyState, Modal } from "@/components/rs/primitives";
 import { useComposeReference, useReferenceSearch } from "@/hooks/useReferences";
 import { ApiError } from "@/lib/api";
@@ -189,7 +190,9 @@ function SegmentRow({
 
 /** The seam measurements, shown rather than reduced to a badge — this is
  *  what tells you whether the composite is worth a tracking run. */
-function ResultPanel({ result }: { result: ComposeResult }) {
+function ResultPanel(
+  { result, segmentLabels }: { result: ComposeResult; segmentLabels: string[] },
+) {
   const comp = result.qc.composition;
   const worst = comp.seams.reduce(
     (acc, s) => Math.max(acc, s.max_joint_jump_rad ?? 0), 0);
@@ -226,8 +229,22 @@ function ResultPanel({ result }: { result: ComposeResult }) {
           </div>
         ))}
       </div>
-      <div className="rs-sub" style={{ fontSize: 10.5, marginBottom: 8 }}>
+      <div className="rs-sub" style={{ fontSize: 10.5, marginBottom: 10 }}>
         composed from {result.parent_clip_ids.join(" → ")}
+      </div>
+
+      {/* The composite's phases ARE its OGMP modes — same derivation the
+          library performs, shown here so the automaton is visible before
+          the clip is attached and trained on. */}
+      <div style={{ marginBottom: 10 }}>
+        <ModeTimeline
+          segments={result.parent_clip_ids.map((id, i) => ({
+            index: i, label: segmentLabels[i], source_id: id,
+          }))}
+          seamFrames={comp.seams.map((s) => s.frame)}
+          nFrames={result.qc.n_frames}
+          fps={result.qc.n_frames / Math.max(result.qc.duration_s, 1e-6)}
+        />
       </div>
       <div className="rs-banner" style={{ fontSize: 11 }}>
         <Icon name="alert-triangle" size={15} />
@@ -261,6 +278,9 @@ export function ComposeMotionDialog({
   const [name, setName] = useState("");
   const [drafts, setDrafts] = useState<Draft[]>(() => [emptyDraft(), emptyDraft()]);
   const [result, setResult] = useState<ComposeResult | null>(null);
+  // Labels as they were AT SUBMIT — editing a phase afterwards must not
+  // relabel a composite that is already registered.
+  const [composedLabels, setComposedLabels] = useState<string[]>([]);
   const compose = useComposeReference();
 
   const clipId = toClipId(name, robot);
@@ -298,6 +318,8 @@ export function ComposeMotionDialog({
       {
         onSuccess: (res) => {
           setResult(res);
+          setComposedLabels(
+            drafts.map((d, i) => d.label.trim() || `phase_${i + 1}`));
           toast.success("Motion composed", { description: res.clip_id });
           onComposed?.(res.clip_id);
         },
@@ -384,7 +406,7 @@ export function ComposeMotionDialog({
 
       {result && (
         <div style={{ marginTop: 14 }}>
-          <ResultPanel result={result} />
+          <ResultPanel result={result} segmentLabels={composedLabels} />
         </div>
       )}
       {!result && drafts.every((d) => !d.clipId) && (
