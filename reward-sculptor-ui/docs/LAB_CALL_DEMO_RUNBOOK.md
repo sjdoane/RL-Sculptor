@@ -1391,3 +1391,35 @@ braking schedule, retention depth, contact gate, evaluator, robot, or task
 changes. Focused compiler and Mjlab adapter tests are **71 passed**; scoped
 Ruff (`F,E9`), compileall, and diff check pass. Commit this slice, then launch
 the next exact-tuple proof from the preserved iter 35 actor+critic checkpoint.
+
+## Live proof: iter 36 raw-completion dwell alignment
+
+UI job `job_81f8bddf6568cccf` is running iter 36 from clean captured commit
+`c6daa6ea4f5d45bd3dac2f295c7437f23bf90cb1`. Exact promoted recovery restored
+selection v44 and the unchanged hash-verified tuple
+`95afc97b6000593eab01c8e7b374b71dbf20f6e75e647008d322f8270b0b88c7`
+with reward v20/environment v21. The UI resolved iter 35 checkpoint SHA
+`2426ab41d6a53adcde2c4b8cc333d23985bc33ecc8130d2a924cda54361cc173`;
+startup proves actor+critic loading and PPO `0/750`.
+
+This run changes only the eligibility boundary of the generic terminal
+stillness supervision. It now begins on raw route completion, the same frame
+the immutable authored two-second dwell starts. The bounded retention command
+continues independently until the robot is `0.100 m` inside the unchanged
+finish disk, and exact zero velocity still waits for that command completion.
+
+The New Run form pins Auto, one 750-PPO cycle, 1,024 CUDA environments, seed
+42, two 1,000-step 1920x1080 episodes, precommitted lane 10, `gen_003`
+observe-only, exact promoted recovery, and no reference motion. The restored
+tuple retains the four typed `0.268 m` entries, unchanged `0.350 m` disks,
+`0.100 m` outside stages, full-speed safe-cap traversal, full-maneuver reward
+firewall, `1.000 m/s` cruise, `0.500 m` terminal brake to at most
+`0.100 m/s`, 50/25/25 train-only RSI, aligned boxes, four contact sensors at
+-8, full linear/angular weights 2, strict-product terminal stillness at
+weight 4, and entropy `0.01`.
+
+Leave reload-watched core and the GPU worker untouched. On completion,
+preserve the checkpoint and require the aligned Results scene plus the full
+ordered-route, contact-free, fall-free, upright/default-like, terminal-speed,
+and uninterrupted 100-frame whole-body-hold conjunction in the disclosed
+evidence lane.

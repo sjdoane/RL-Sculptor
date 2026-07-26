@@ -3580,3 +3580,42 @@ does not alter the route, raw predicates, success signal, two-second dwell,
 definition, evaluator, robot, or task. Focused compiler + Mjlab adapter tests
 are **71 passed**; scoped Ruff (`F,E9`), compileall, and `git diff --check`
 pass.
+
+## Iter 36 live raw-completion dwell proof 2026-07-26 (Codex)
+
+UI New Run job `job_81f8bddf6568cccf` is running iter 36 from clean captured
+commit `c6daa6ea4f5d45bd3dac2f295c7437f23bf90cb1`. Exact promoted recovery
+restored selection v44 / tuple
+`95afc97b6000593eab01c8e7b374b71dbf20f6e75e647008d322f8270b0b88c7`,
+reward v20 SHA
+`b05bd4fa1ec200ff6e2330d32d0ca8f2bfb095a3878e50fb7433439e32db55e9`,
+and env v21 SHA
+`a56ea1a4baaa66ce5190d2cd29c41a79471ab4f497d81ce866e932082eba134c`.
+The UI resolved iter 35 checkpoint SHA
+`2426ab41d6a53adcde2c4b8cc333d23985bc33ecc8130d2a924cda54361cc173`;
+startup proves actor+critic loading from that exact file and PPO iteration
+`0/750`.
+
+This is the first live proof in which terminal stillness supervision becomes
+eligible on immutable raw route completion, aligned with the unchanged
+authored two-second dwell. The separate bounded center-directed command still
+builds the existing `0.100 m` in-disk retention depth before zero velocity.
+All preceding route, clearance, command, contact, success, and evidence
+semantics remain unchanged.
+
+The visible New Run settings are Auto, one 750-PPO cycle, 1,024 environments
+on `cuda:0`, seed 42, two 1,000-step 1920x1080 episodes, precommitted evidence
+lane 10, `gen_003` observe-only, exact promoted recovery on, and no reference
+motion. The restored tuple retains four typed `0.268 m` obstacle-away entries,
+unchanged `0.350 m` raw disks, `0.100 m` outside stages, full-speed safe-cap
+traversal, the full-maneuver generated-reward firewall, `1.000 m/s` horizon
+cruise, a `0.500 m` terminal brake to at most `0.100 m/s`, 50/25/25 train-only
+RSI, aligned local-frame boxes, four forbidden-contact sensors at -8, full
+linear/angular command weights 2, strict-product whole-body terminal
+stillness at weight 4, and entropy `0.01`.
+
+Do not edit reload-watched core or run an intermediate GPU audit while the
+worker is live. After it stops, preserve the checkpoint and inspect the
+official all-lane trajectory/fitness, lane-10 behavior/keyframes/full video,
+and Results physical-scene audit. Acceptance remains the complete physical
+conjunction, including 100 uninterrupted post-success frames inside finish.
