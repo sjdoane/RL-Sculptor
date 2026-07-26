@@ -1423,3 +1423,32 @@ preserve the checkpoint and require the aligned Results scene plus the full
 ordered-route, contact-free, fall-free, upright/default-like, terminal-speed,
 and uninterrupted 100-frame whole-body-hold conjunction in the disclosed
 evidence lane.
+
+## Accepted proof: iter 36 passes the full physical conjunction
+
+Iter 36/job `job_81f8bddf6568cccf` completed cleanly. Preserve checkpoint SHA
+`e097634491a7d165924e9ce5e2e359f17062843da3eb5b98545e880da408fb2b`
+as the accepted showcase baseline. The Results scene is aligned at `0.0 m`,
+realism is `ok`, fitness is `0.19907`, and progress is `0.85414`.
+
+The immutable first-episode batch has `64/64` ordered actual routes/index 5,
+`61/64` authored successes, `61/64` contact-free lanes, and `64/64` lanes
+without a sustained fall. Two lanes provide a strict 100-frame
+horizontal/angular/joint/upright/default-pose hold.
+
+The disclosed evidence lane is one of those passes. `behavior.json` records
+requested/resolved lane 10, `precommitted`, percentile `1.0`, and rendered
+return `53.47784`. Its actual-region entries are
+`[161, 310, 510, 642, 757]`; index 5 arrives at 757 and authored success at
+857. All four forbidden-contact channels remain false and no fall occurs.
+The strict whole-body conjunction is uninterrupted for **102 frames, 876
+through 977**, while the robot remains inside finish.
+
+Final lane-10 evidence remains inside finish at `0.26387 m`, with horizontal
+speed `0.05336 m/s`, angular speed `0.20480 rad/s`, joint-velocity RMS
+`0.28258 rad/s`, projected-gravity z `-0.78606`, and default-pose RMS error
+`0.52336 rad`. The keyframes and complete 20-second video visibly show the
+alternating traversal around the actual boxes and sustained upright stop.
+
+This satisfies the unchanged acceptance conjunction. Use iter 36 for the
+physical showcase; do not launch another recovery run.

@@ -3619,3 +3619,48 @@ worker is live. After it stops, preserve the checkpoint and inspect the
 official all-lane trajectory/fitness, lane-10 behavior/keyframes/full video,
 and Results physical-scene audit. Acceptance remains the complete physical
 conjunction, including 100 uninterrupted post-success frames inside finish.
+
+## Iter 36 accepted physical showcase 2026-07-26 (Codex)
+
+Iter 36/job `job_81f8bddf6568cccf` completed cleanly and preserved checkpoint
+SHA
+`e097634491a7d165924e9ce5e2e359f17062843da3eb5b98545e880da408fb2b`.
+The captured artifact tuple is selection v45 with the unchanged promoted
+tuple hash. The Results physical-scene audit is `aligned` at `0.0 m` maximum
+error against the `0.15 m` threshold, with exact agreement for all four
+boxes. Realism is `ok`, frozen fitness is `0.19907`, and progress is
+`0.85414`.
+
+The official first-episode all-lane audit reports:
+
+- all five actual `0.350 m` regions in order and index 5: **64/64**;
+- authored success: **61/64**;
+- forbidden-contact-free: **61/64**, with failures by box `[2, 2, 0, 0]`;
+- no sustained fall: **64/64**;
+- 100-frame horizontal holds: **4/64**;
+- 100-frame horizontal/angular/joint-velocity holds: **2/64**;
+- 100-frame posture-qualified holds: **15/64**;
+- strict 100-frame whole-body holds: **2/64**.
+
+Most importantly, the precommitted rendered evidence is itself an accepted
+full conjunction. `behavior.json` records requested/resolved lane 10,
+selection `precommitted`, return percentile `1.0`, and rendered return
+`53.47784`. Lane 10 enters the five actual regions at
+`[161, 310, 510, 642, 757]`, reaches index 5 at 757, declares authored
+success at 857, has every forbidden-contact channel false, and has no fall.
+It then provides **102 uninterrupted strict frames from 876 through 977**
+inside finish, satisfying horizontal, angular, joint, uprightness, and
+default-pose quiet simultaneously.
+
+At the final frame lane 10 is `0.26387 m` from the finish center, with
+horizontal speed `0.05336 m/s`, angular speed `0.20480 rad/s`,
+joint-velocity RMS `0.28258 rad/s`, projected-gravity z `-0.78606`, and
+default-pose RMS error `0.52336 rad`. All are inside the frozen strict
+thresholds. The official keyframes and full 20-second video visibly show an
+upright robot traversing the alternating sides of the actual orange boxes,
+entering the finish, and settling into the sustained terminal stance.
+
+This is the first fresh, precommitted, aligned, contact-free physical proof
+that satisfies the complete showcase conjunction. Preserve iter 36 as the
+accepted checkpoint and evidence baseline. No further recovery run is
+required.
