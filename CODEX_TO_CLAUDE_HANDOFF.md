@@ -3420,3 +3420,48 @@ Settings are Auto, one 750-PPO cycle, 1,024 environments on `cuda:0`, seed
 Do not run an intermediate GPU audit or edit reload-watched core while iter
 34 is alive. After checkpoint preservation, repeat the official all-lane,
 lane-10 video/keyframe, behavior disclosure, and Results-scene conjunction.
+
+## Iter 34 immutable audit and post-entry diagnosis 2026-07-26 (Codex)
+
+Iter 34/job `job_f38c41b2a11c3a2b` completed cleanly and preserved checkpoint
+SHA
+`7f49a4c75116e094004431da87e5318ee9e57dd51576419a18f9ad1f63aebca1`.
+The official Results endpoint is `aligned` with `0.0 m` maximum error against
+the `0.15 m` threshold and exact agreement for all four boxes. Realism is
+`ok`; frozen fitness is `0.20768`, progress is `0.84666`, and `fell_frac` is
+zero.
+
+Route consolidation succeeded, but the showcase conjunction did not:
+
+- all five actual `0.350 m` disks in order and index 5: **64/64**;
+- authored success: **61/64**;
+- forbidden-contact-free: **44/64**, with contact failures by box
+  `[3, 16, 0, 1]`;
+- 100-frame horizontal, whole-velocity, posture-qualified, and strict holds:
+  **2/64** at each gate;
+- full physical conjunction: **0/64**.
+
+The two strict-hold lanes are envs 3 and 5, with streaks of 133 and 100
+frames. Both contact box 2 before the terminal phase, so neither is a full
+pass. `behavior.json` proves requested/resolved precommitted lane 10 at
+percentile `0.609375`. Lane 10 visibly completes the alternating weave and
+stops upright/default-like. Its actual entries are
+`[153, 321, 548, 694, 793]`, index 5 arrives at 793, and authored success at
+893. It contacts box 2 on 16 frames from 376 through 401. After success it is
+quiet enough kinematically, but the finish distance is already `0.35335 m`
+and drifts to `0.43786 m`; therefore it supplies zero strict in-finish frames.
+
+The immutable trace exposes one generic command-state defect at both
+intermediate and terminal predicates. Raw disk entry correctly advances
+objective truth immediately, but the command simultaneously discards the
+just-entered obstacle-safe maneuver. Lane 10 enters waypoint 2 at only
+`0.140 m` obstacle-away radial depth versus the compiled `0.268 m` safe
+component; the next-waypoint command then pulls it back across box 2. At the
+finish, raw entry immediately changes the command to zero at the predicate
+boundary, leaving no inward retention margin against ordinary settling
+drift. The next controller slice must preserve raw predicate authority while
+finishing a short command-only post-entry follow-through: complete the
+previous obstacle-away radial component before releasing the next route
+target, and settle to a bounded interior terminal target before declaring
+the command standing. No evaluator, route, tolerance, horizon, hold, object,
+robot/task name, or success signal changes.

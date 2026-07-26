@@ -1272,3 +1272,33 @@ exact promoted recovery, and no reference motion. Leave the live worker and
 reload-watched core untouched. On completion, require the full official
 scene, route, contact, fall, posture, terminal-speed, and uninterrupted
 100-frame whole-body-hold conjunction in the disclosed evidence.
+
+## Iter 34 completes every route but has no contact-free strict hold
+
+Iter 34 completed cleanly and preserved checkpoint SHA
+`7f49a4c75116e094004431da87e5318ee9e57dd51576419a18f9ad1f63aebca1`.
+The Results physical-scene audit is aligned at `0.0 m`, realism is `ok`, and
+`fell_frac` is zero. Fitness is `0.20768` and progress is `0.84666`.
+
+The immutable first-episode audit reports `64/64` ordered actual routes and
+index 5, `61/64` authored successes, and `44/64` contact-free lanes. Two
+lanes hold the complete horizontal/angular/joint/upright/default-pose
+conjunction for at least 100 frames, but both contacted box 2 earlier.
+Accordingly the full physical conjunction is **0/64**.
+
+Requested/resolved precommitted lane 10 is recorded at percentile `0.609375`.
+It visibly performs the alternating weave and upright stop, entering the five
+actual disks at `[153, 321, 548, 694, 793]` and declaring success at 893.
+It nevertheless contacts box 2 on 16 frames and, after success, drifts from
+`0.35335 m` to `0.43786 m` from the finish center. It has zero strict
+post-success in-finish frames and is diagnostic only.
+
+The controller currently throws away a safe maneuver on the same frame that
+the immutable disk advances. At waypoint 2, lane 10 has reached only
+`0.140 m` of the compiled `0.268 m` obstacle-away radial component when raw
+entry fires, so the next target pulls it across the box. At the finish, the
+command becomes zero directly on the boundary and provides no retention
+depth. Preserve raw predicate advancement, but finish a short command-only
+post-entry follow-through before releasing the next target or declaring the
+terminal standing phase. Do not change the scene, raw disks, ordering,
+horizon, two-second hold, command cap, or evidence definition.
