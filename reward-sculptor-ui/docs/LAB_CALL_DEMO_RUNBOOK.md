@@ -1249,3 +1249,26 @@ hold, or `1.000 m/s` command cap. Run one consolidation cycle from iter 33
 with exact promoted reward v20/environment v21, actor+critic recovery,
 precommitted lane 10, and all current scene/contact/RSI/firewall/posture
 invariants. Promotion still requires a fresh rendered full conjunction.
+
+## Live proof: iter 34 consolidation from the first full-pass checkpoint
+
+UI job `job_f38c41b2a11c3a2b` is running iter 34 from clean captured commit
+`4edcb1a48ccb0e8223403e110b58900336190d75`. Exact promoted recovery pins
+selection v43 to the same hash-verified reward v20/environment v21 tuple.
+The UI resolved iter 33 checkpoint SHA8 `8fc76177`, and the runner confirms
+actor+critic loading and PPO iteration 0/750.
+
+Startup reconfirms the four typed 0.268 m obstacle-away entries, 0.100 m
+outside stages, full-speed safe-cap traversal into unchanged 0.350 m raw
+disks, full-maneuver generated-reward firewall, 1.000 m/s horizon cruise,
+0.500 m terminal brake to at most 0.100 m/s, 50/25/25 train-only RSI,
+aligned local-frame boxes, four contact sensors at -8, full linear/angular
+command weights 2, strict-product whole-body terminal stillness at weight 4,
+and entropy 0.01.
+
+This is one Auto 750-PPO cycle with 1,024 CUDA environments, seed 42, two
+1,000-step 1920×1080 episodes, precommitted lane 10, `gen_003` observe-only,
+exact promoted recovery, and no reference motion. Leave the live worker and
+reload-watched core untouched. On completion, require the full official
+scene, route, contact, fall, posture, terminal-speed, and uninterrupted
+100-frame whole-body-hold conjunction in the disclosed evidence.

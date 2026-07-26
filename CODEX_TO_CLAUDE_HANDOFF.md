@@ -3390,3 +3390,33 @@ warm-start actor and critic from iter 33, retain precommitted lane 10 and every
 scene/contact/RSI/firewall/posture invariant, and train one further 750-PPO
 cycle. Promotion remains blocked until the disclosed lane itself supplies the
 complete conjunction.
+
+## Iter 34 live policy-consolidation proof 2026-07-26 (Codex)
+
+UI New Run job `job_f38c41b2a11c3a2b` is running iter 34 from clean captured
+commit `4edcb1a48ccb0e8223403e110b58900336190d75`. Exact promoted recovery pins
+selection v43 to tuple
+`95afc97b6000593eab01c8e7b374b71dbf20f6e75e647008d322f8270b0b88c7`,
+reward v20 SHA
+`b05bd4fa1ec200ff6e2330d32d0ca8f2bfb095a3878e50fb7433439e32db55e9`,
+and env v21 SHA
+`a56ea1a4baaa66ce5190d2cd29c41a79471ab4f497d81ce866e932082eba134c`.
+The UI resolved iter 33 checkpoint SHA
+`8fc761779f5592d90eab457089c05bec9255f0d0b0671bd406ff298c6645347e`;
+the runner proves `warm_start_loaded` for actor and critic and PPO iteration
+0/750 is active.
+
+Startup output reconfirms all four `0.268 m` typed obstacle-away entries,
+`0.100 m` outside stages, full-speed safe-cap traversal into the unchanged
+`0.350 m` raw disks, the full clearance-maneuver reward firewall, `1.000 m/s`
+horizon cruise, `0.500 m` terminal braking to at most `0.100 m/s`, 50/25/25
+train-only RSI, local-pose-plus-origin boxes, four forbidden-contact sensors
+at -8, full linear/angular command weights 2, strict-product whole-body
+terminal stillness at weight 4, and entropy `0.01`.
+
+Settings are Auto, one 750-PPO cycle, 1,024 environments on `cuda:0`, seed
+42, two 1,000-step 1920x1080 episodes, precommitted evidence lane 10,
+`gen_003` observe-only, exact promoted recovery on, and no reference motion.
+Do not run an intermediate GPU audit or edit reload-watched core while iter
+34 is alive. After checkpoint preservation, repeat the official all-lane,
+lane-10 video/keyframe, behavior disclosure, and Results-scene conjunction.
