@@ -3319,3 +3319,35 @@ through New Run with exact promoted reward v20/environment v21, actor+critic
 recovery from iter 32, and all existing scene/contact/RSI/firewall/posture
 invariants. Promotion still requires fresh physical proof of the entire
 conjunction.
+
+## Iter 33 live horizon-budgeted terminal recovery 2026-07-26 (Codex)
+
+UI New Run job `job_f3d7e4c744ed6494` is running iter 33 from clean captured
+commit `6098ce5cbc10136c1a6c6c4170a2c5442d02d69a`. Exact promoted recovery
+restored selection v41, and iter 33 pins selection v42 with tuple
+`95afc97b6000593eab01c8e7b374b71dbf20f6e75e647008d322f8270b0b88c7`,
+reward v20 SHA
+`b05bd4fa1ec200ff6e2330d32d0ca8f2bfb095a3878e50fb7433439e32db55e9`,
+and env v21 SHA
+`a56ea1a4baaa66ce5190d2cd29c41a79471ab4f497d81ce866e932082eba134c`.
+The UI resolved iter 32 checkpoint SHA
+`341780453413279d8049e5423f2d018d69a66d42621be47fcafa45e638fc8be0`;
+`warm_start_loaded` proves both actor and critic loaded from it.
+
+Startup output proves all four typed `0.268 m` obstacle-away entries,
+`0.100 m` outside stages, full-speed safe-cap traversal into each unchanged
+`0.350 m` raw disk, and the full clearance-maneuver reward firewall. The new
+horizon budget keeps the `1.000 m/s` cruise but uses a `0.500 m` terminal
+constant-deceleration span with boundary command at most `0.100 m/s`. The
+50/25/25 train-only RSI, local-pose-plus-origin boxes, four forbidden-contact
+sensors at -8, full linear/angular command weights 2, strict-product
+whole-body terminal stillness at weight 4, entropy `0.01`, and PPO learning
+iteration 0/750 are active.
+
+Settings are Auto, one 750-PPO cycle, 1,024 environments on `cuda:0`, seed
+42, two 1,000-step 1920x1080 episodes, precommitted evidence lane 10,
+`gen_003` observe-only, exact promoted recovery on, and no reference motion.
+Do not run an intermediate GPU audit or edit reload-watched core while iter
+33 is alive. After the worker stops, preserve its checkpoint and judge the
+official all-lane trajectory/fitness, lane-10 behavior/keyframes/full video,
+and Results physical-scene audit against the complete physical conjunction.

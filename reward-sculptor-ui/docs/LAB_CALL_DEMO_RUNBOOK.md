@@ -1189,3 +1189,29 @@ seed 42, two 1,000-step 1920×1080 episodes, Auto, evidence lane 10,
 `gen_003` observe-only, exact promoted recovery, aligned boxes, four contact
 sensors at -8, full command weights, 50/25/25 RSI, the full-maneuver reward
 firewall, strict-product whole-body stillness weight 4, and entropy `0.01`.
+
+## Live proof: iter 33 horizon-budgeted terminal braking
+
+UI job `job_f3d7e4c744ed6494` is running iter 33 from clean captured commit
+`6098ce5cbc10136c1a6c6c4170a2c5442d02d69a`. Exact promoted recovery pins
+selection v42 to the hash-verified reward v20/environment v21 tuple. The UI
+resolved iter 32 checkpoint SHA8 `34178045`, and the runner confirms
+`warm_start_loaded` for both actor and critic.
+
+The startup log proves the generic timing correction is active: the staged
+12.740 m route retains its 1.000 m/s cruise, while the terminal brake now
+uses the horizon-budgeted 0.500 m span and reaches the unchanged finish
+predicate boundary at at most 0.100 m/s. All four typed 0.268 m
+obstacle-away entries, 0.100 m outside stages, full-speed in-disk safe caps,
+the unchanged 0.350 m raw waypoint predicates, full-maneuver reward firewall,
+50/25/25 RSI, aligned local-frame boxes, four direct contact sensors at -8,
+full velocity-command supervision, strict-product whole-body stillness at
+weight 4, and entropy 0.01 remain installed. PPO iteration 0/750 is active.
+
+This Auto run uses 1,024 CUDA environments, seed 42, two 1,000-step
+1920×1080 episodes, exact promoted recovery, precommitted evidence lane 10,
+and `gen_003` observe-only. Leave the worker and reload-watched core
+untouched. After completion, preserve the checkpoint and require the official
+all-lane artifacts, lane-10 keyframes/full video, and Results scene audit to
+prove the ordered, aligned, contact-free, no-fall, upright/default-like,
+sub-0.12 m/s, uninterrupted 100-frame whole-body-hold conjunction.
