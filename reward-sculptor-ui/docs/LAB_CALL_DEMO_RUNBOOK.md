@@ -1355,3 +1355,39 @@ Leave reload-watched core and the GPU worker untouched. After completion,
 require the aligned Results scene plus the full ordered-route, contact-free,
 fall-free, upright/default-like, terminal-speed, and uninterrupted 100-frame
 whole-body-hold conjunction in the disclosed evidence.
+
+## Iter 35 keeps lane 10 safe and inside finish but completes too late
+
+Iter 35 completed cleanly and preserved checkpoint SHA
+`2426ab41d6a53adcde2c4b8cc333d23985bc33ecc8130d2a924cda54361cc173`.
+The Results scene is aligned at `0.0 m`, realism is `ok`, fitness is
+`0.06642`, and progress is `0.76759`.
+
+The official first-episode trace has `63/64` ordered actual routes/index 5,
+`44/64` authored successes, and `53/64` contact-free lanes. Contact failures
+by box are `[3, 7, 1, 0]`; the generated fall proxy flags one lane. No lane
+provides a 100-frame horizontal, whole-velocity, posture-qualified, or strict
+post-success hold, so the full conjunction is `0/64`.
+
+Lane 10 is now honest visual evidence of the route geometry and the two safety
+fixes. It is precommitted at percentile `0.328125`, enters the real regions at
+`[210, 399, 607, 809, 895]`, remains contact-free and fall-free, and the
+keyframes/full video visibly show the alternating weave and upright stop.
+It stays inside finish at `0.24082 m`; final horizontal/angular/joint speeds
+are `0.04510 m/s`, `0.16687 rad/s`, and `0.26598 rad/s`, with
+projected-gravity z `-0.78747` and default-pose RMS error `0.50857 rad`.
+However, success arrives at frame 995, leaving only four proof frames.
+
+The trace identifies a terminal-phase timing mismatch. The unchanged success
+dwell starts at raw finish entry (frame 895), but the training-only terminal
+stillness term did not activate until the command reached its retention
+target at frame 971. That throws away 76 of the 100 pre-success dwell frames.
+The generic command now exposes standing/dwell on raw route completion while
+continuing the same bounded center-directed retention command until it is
+`0.100 m` inside the disk. Exact zero velocity still waits for retention.
+
+No route, predicate, success signal, dwell duration, horizon, command cap,
+braking schedule, retention depth, contact gate, evaluator, robot, or task
+changes. Focused compiler and Mjlab adapter tests are **71 passed**; scoped
+Ruff (`F,E9`), compileall, and diff check pass. Commit this slice, then launch
+the next exact-tuple proof from the preserved iter 35 actor+critic checkpoint.

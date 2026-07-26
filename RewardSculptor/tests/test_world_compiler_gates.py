@@ -646,16 +646,17 @@ def test_adjusted_waypoint_stages_then_synchronizes_on_frozen_disk() -> None:
     assert term._waypoint_index.item() == 1
     assert not term._clearance_followthrough_pending.item()
 
-    # Terminal raw entry also advances immediately. The command retains a
+    # Terminal raw entry also advances immediately and begins the authored
+    # dwell phase on that same frame. The command independently retains a
     # small in-disk target until it has positional margin against settling
-    # drift, then and only then declares the standing phase.
+    # drift, then becomes exactly zero.
     finish_center = torch.tensor(cfg.predicate_waypoints_m[1][:2])
     robot.data.root_link_pos_w[0, :2] = (
         finish_center + torch.tensor([-0.34, 0.0]))
     term._update_command()
     assert term._waypoint_index.item() == 2
     assert not term._terminal_settle_complete.item()
-    assert not term.is_standing_env.item()
+    assert term.is_standing_env.item()
     assert torch.linalg.norm(term.command[0, :2]) == pytest.approx(
         cfg.cruise_speed_mps * cfg.terminal_min_speed_scale)
 

@@ -773,11 +773,15 @@ def _waypoint_velocity_command_types() -> tuple[type[Any], type[Any]]:
             self.vel_command_w[:, :2] = velocity_w
             self.vel_command_w[:, 2] = self.vel_command_b[:, 2]
             # Preserve the semantic distinction offered by the base command:
-            # completed authored routes are standing commands, not merely a
-            # coincidental all-zero velocity sample.  Consumers that only use
-            # the command tensor remain unchanged; future embodiment-specific
-            # standing priors can use this flag without task-name keying.
-            self.is_standing_env[:] = command_complete
+            # once the immutable route completes, the authored dwell phase has
+            # begun even if the bounded terminal-retention command is still
+            # building its in-disk margin.  That command is already capped at
+            # the authored standing-compatible speed, so terminal stillness
+            # supervision must start on the same frame as the authored success
+            # dwell instead of losing part of its training window.  Consumers
+            # that only use the command tensor remain unchanged; zero velocity
+            # still waits for command_complete.
+            self.is_standing_env[:] = route_complete
 
     @dataclass(kw_only=True)
     class WaypointVelocityCommandCfg(UniformVelocityCommandCfg):

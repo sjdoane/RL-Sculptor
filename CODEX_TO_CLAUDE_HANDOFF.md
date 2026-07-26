@@ -3524,3 +3524,59 @@ PPO is active. Do not edit reload-watched core or run an intermediate GPU
 audit. After the worker stops, preserve its checkpoint and judge the official
 all-lane trajectory/fitness, lane-10 behavior/keyframes/full video, and
 Results physical-scene audit against the unchanged complete conjunction.
+
+## Iter 35 immutable audit and terminal-phase diagnosis 2026-07-26 (Codex)
+
+Iter 35/job `job_2b3ff05c45a4f2c1` completed cleanly and preserved checkpoint
+SHA
+`2426ab41d6a53adcde2c4b8cc333d23985bc33ecc8130d2a924cda54361cc173`.
+The Results physical-scene audit is `aligned` with `0.0 m` maximum error
+against the `0.15 m` threshold and exact agreement for all four boxes.
+Realism is `ok`. Frozen fitness is `0.06642` and progress is `0.76759`.
+
+The immutable first-episode audit reports:
+
+- all five actual `0.350 m` disks in order and index 5: **63/64**;
+- authored success: **44/64**;
+- forbidden-contact-free: **53/64**, with contact failures by box
+  `[3, 7, 1, 0]`;
+- the generated sustained-fall proxy flags **1/64**;
+- 100-frame horizontal, whole-velocity, posture-qualified, and strict holds:
+  **0/64**;
+- full physical conjunction: **0/64**.
+
+The contact and finish-retention corrections work in the disclosed evidence.
+Requested/resolved precommitted lane 10 is percentile `0.328125`, remains
+contact-free and fall-free, enters the actual regions at
+`[210, 399, 607, 809, 895]`, and reaches index 5 at 895. The keyframes and
+full 20-second video show the complete alternating weave and an
+upright/default-like stop inside finish. Final finish distance is
+`0.24082 m`; horizontal speed is `0.04510 m/s`, angular speed
+`0.16687 rad/s`, joint-velocity RMS `0.26598 rad/s`, projected-gravity z
+`-0.78747`, and default-pose RMS error `0.50857 rad`.
+
+The remaining failure is timing and exposes a generic terminal-phase semantic
+mismatch. Lane 10 enters the raw finish at frame 895, so the unchanged
+authored two-second dwell declares success at frame 995. The command reaches
+its `0.100 m` in-disk retention depth only at frame 971. Terminal stillness
+training was keyed to that later command-settle event, discarding 76 of the
+100 pre-success dwell frames and leaving only four post-success proof frames.
+The same mismatch affects faster lanes: envs 48 and 35 finish at frames 752
+and 759 and are contact-free, but terminal quiet begins too late for either to
+produce the required post-success streak.
+
+## Terminal dwell supervision aligned with raw completion 2026-07-26 (Codex)
+
+The command now publishes the generic standing/dwell phase on immutable route
+completion rather than waiting for its separate retention target. This is the
+same frame on which the authored success dwell starts. The bounded retention
+command still continues at the unchanged standing-compatible speed until the
+robot is `0.100 m` inside the raw finish disk, and exact zero velocity still
+waits for that command-settle event.
+
+This changes only when terminal stillness supervision becomes eligible. It
+does not alter the route, raw predicates, success signal, two-second dwell,
+1,000-step horizon, velocity cap, terminal brake, retention depth, contact
+definition, evaluator, robot, or task. Focused compiler + Mjlab adapter tests
+are **71 passed**; scoped Ruff (`F,E9`), compileall, and `git diff --check`
+pass.
