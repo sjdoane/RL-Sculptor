@@ -201,6 +201,9 @@ def test_clearance_maneuver_reward_firewall_is_per_env_and_capability_gated(
         _clearance_stage_complete=torch.tensor([
             False, True, False, False, False,
         ]),
+        _clearance_followthrough_pending=torch.tensor([
+            False, False, True, False, False,
+        ]),
     )
 
     class CommandManager:
@@ -222,7 +225,7 @@ def test_clearance_maneuver_reward_firewall_is_per_env_and_capability_gated(
     # Both the outside approach and the through-disk traversal are command-only
     # phases around the same immutable predicate. Predicate-centered generated
     # shaping remains withheld until that predicate advances.
-    assert scale.tolist() == [0.0, 0.0, 1.0, 0.0, 1.0]
+    assert scale.tolist() == [0.0, 0.0, 0.0, 0.0, 1.0]
 
     rewards = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0])
     components = {
@@ -235,14 +238,14 @@ def test_clearance_maneuver_reward_firewall_is_per_env_and_capability_gated(
         _apply_clearance_maneuver_reward_firewall(
             env, rewards, components))
 
-    assert scaled_rewards.tolist() == [0.0, 0.0, 3.0, 0.0, 5.0]
+    assert scaled_rewards.tolist() == [0.0, 0.0, 0.0, 0.0, 5.0]
     assert scaled_components["dense"].tolist() == [
-        0.0, 0.0, 3.0, 0.0, 5.0,
+        0.0, 0.0, 0.0, 0.0, 5.0,
     ]
     assert scaled_components["matrix"].tolist() == [
         [0.0, 0.0],
         [0.0, 0.0],
-        [3.0, 13.0],
+        [0.0, 0.0],
         [0.0, 0.0],
         [5.0, 15.0],
     ]

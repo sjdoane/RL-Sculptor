@@ -3465,3 +3465,27 @@ previous obstacle-away radial component before releasing the next route
 target, and settle to a bounded interior terminal target before declaring
 the command standing. No evaluator, route, tolerance, horizon, hold, object,
 robot/task name, or success signal changes.
+
+## Generic post-entry command follow-through implemented 2026-07-26 (Codex)
+
+The controller now separates immutable predicate truth from physical command
+completion. Raw disk entry still advances `_waypoint_index` on the exact same
+frame. If an intermediate clearance disk is entered before the robot reaches
+the compiled obstacle-away radial component, the command latches the previous
+waypoint and continues at full authority toward its existing embodiment-safe
+in-disk cap. It releases the next route target once radial progress is within
+the existing `0.025 m` transition slack. The generated-reward firewall now
+also recognizes this typed follow-through state, so predicate-centered shaping
+cannot undo it.
+
+At terminal raw entry, the route is likewise complete immediately, but the
+command continues toward the unchanged finish center at the existing
+`≤0.100 m/s` terminal command until it is `0.100 m` inside the frozen
+`0.350 m` predicate. Only then does it emit zero velocity and publish the
+standing phase. This gives settling drift a geometric retention margin while
+the authored success signal and two-second dwell remain untouched.
+
+The change is capability- and predicate-derived; it introduces no task,
+robot, object-name, evaluator, tolerance, horizon, hold, route, or success
+branch. Focused compiler + Mjlab adapter verification is **71 passed**.
+Scoped Ruff (`F,E9`), compileall, and `git diff --check` also pass.

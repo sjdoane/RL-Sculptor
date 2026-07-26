@@ -464,6 +464,12 @@ def _waypoint_velocity_command_types() -> tuple[type[Any], type[Any]]:
                 self.num_envs, device=self.device, dtype=torch.long)
             self._clearance_stage_complete = torch.zeros(
                 self.num_envs, device=self.device, dtype=torch.bool)
+            self._clearance_followthrough_pending = torch.zeros(
+                self.num_envs, device=self.device, dtype=torch.bool)
+            self._clearance_followthrough_index = torch.zeros(
+                self.num_envs, device=self.device, dtype=torch.long)
+            self._terminal_settle_complete = torch.zeros(
+                self.num_envs, device=self.device, dtype=torch.bool)
             raw_starts = getattr(
                 env, "_sculptor_waypoint_start_index", None)
             if raw_starts is not None:
@@ -485,6 +491,9 @@ def _waypoint_velocity_command_types() -> tuple[type[Any], type[Any]]:
                     device=self.device, dtype=torch.long).clamp(
                         min=0, max=self._waypoints.shape[0] - 1)
             self._clearance_stage_complete[env_ids] = False
+            self._clearance_followthrough_pending[env_ids] = False
+            self._clearance_followthrough_index[env_ids] = 0
+            self._terminal_settle_complete[env_ids] = False
             self.vel_command_b[env_ids] = 0.0
             self.vel_command_w[env_ids] = 0.0
             self.is_heading_env[env_ids] = False
@@ -532,11 +541,40 @@ def _waypoint_velocity_command_types() -> tuple[type[Any], type[Any]]:
             valid = self._waypoint_index < self._waypoints.shape[0]
             # The frozen task predicate is authoritative. If stochastic
             # motion enters its disk before the approach stage, advance the
-            # command on that same frame rather than allowing command and
-            # metric state to disagree. The outside stage remains the
-            # supervised target, and direct contact terms penalize unsafe
-            # shortcuts during training.
+            # objective index on that same frame rather than allowing command
+            # and metric state to disagree. A command-only follow-through may
+            # remain active after that advancement: entering a disk at its
+            # incoming tangent does not prove that the embodiment has reached
+            # the obstacle-away radial component needed for a safe exit.
             reached = valid & inside_authored_disk
+            clearance_distance = torch.linalg.norm(
+                clearance_shift, dim=-1)
+            clearance_direction = clearance_shift / torch.clamp(
+                clearance_distance[:, None], min=1e-6)
+            clearance_progress = torch.sum(
+                (local_xy - predicate_center) * clearance_direction,
+                dim=-1,
+            )
+            followthrough_needed = (
+                reached
+                & adjusted
+                & (active_index < last)
+                & (
+                    clearance_progress
+                    < clearance_distance
+                    - float(self.cfg.clearance_transition_slack_m)
+                )
+            )
+            self._clearance_followthrough_index = torch.where(
+                followthrough_needed,
+                active_index,
+                self._clearance_followthrough_index,
+            )
+            self._clearance_followthrough_pending = torch.where(
+                reached,
+                followthrough_needed,
+                self._clearance_followthrough_pending,
+            )
             self._clearance_stage_complete = torch.where(
                 reached,
                 torch.zeros_like(stage_complete),
@@ -546,7 +584,42 @@ def _waypoint_velocity_command_types() -> tuple[type[Any], type[Any]]:
                 self._waypoint_index + reached.long(),
                 max=self._waypoints.shape[0],
             )
-            complete = self._waypoint_index >= self._waypoints.shape[0]
+            route_complete = (
+                self._waypoint_index >= self._waypoints.shape[0])
+
+            followthrough_index = torch.clamp(
+                self._clearance_followthrough_index, max=last)
+            followthrough_center = self._predicate_waypoints[
+                followthrough_index, :2]
+            followthrough_shift = self._clearance_shifts[
+                followthrough_index, :2]
+            followthrough_distance = torch.linalg.norm(
+                followthrough_shift, dim=-1)
+            followthrough_direction = (
+                followthrough_shift / torch.clamp(
+                    followthrough_distance[:, None], min=1e-6)
+            )
+            followthrough_progress = torch.sum(
+                (local_xy - followthrough_center)
+                * followthrough_direction,
+                dim=-1,
+            )
+            followthrough_reached = (
+                followthrough_progress
+                >= followthrough_distance
+                - float(self.cfg.clearance_transition_slack_m)
+            )
+            self._clearance_followthrough_pending &= ~followthrough_reached
+
+            terminal_center = self._predicate_waypoints[last, :2]
+            terminal_inside_retention = (
+                torch.linalg.norm(local_xy - terminal_center, dim=-1)
+                <= float(self.cfg.terminal_retention_radius_m)
+            )
+            self._terminal_settle_complete |= (
+                route_complete & terminal_inside_retention)
+            command_complete = (
+                route_complete & self._terminal_settle_complete)
 
             target_index = torch.clamp(self._waypoint_index, max=last)
             target_center = self._predicate_waypoints[target_index, :2]
@@ -561,7 +634,10 @@ def _waypoint_velocity_command_types() -> tuple[type[Any], type[Any]]:
                 > 1e-6
             )
             use_staging_target = (
-                target_adjusted & ~self._clearance_stage_complete & ~complete
+                target_adjusted
+                & ~self._clearance_stage_complete
+                & ~route_complete
+                & ~self._clearance_followthrough_pending
             )
             # After capturing the outside stage, aim at the embodiment-safe
             # radial cap inside the authored disk. A target beyond the disk
@@ -577,9 +653,21 @@ def _waypoint_velocity_command_types() -> tuple[type[Any], type[Any]]:
                 target_traversal_shift,
             )
             target = target_center + torch.where(
-                target_adjusted[:, None] & ~complete[:, None],
+                target_adjusted[:, None] & ~route_complete[:, None],
                 command_shift,
                 torch.zeros_like(command_shift),
+            )
+            # Raw predicate entry owns task progress, but command state must
+            # not instantly discard an unfinished safety maneuver. Continue
+            # toward the just-entered disk's embodiment-safe radial cap until
+            # its obstacle-away component is reached, then release the next
+            # route target. This adds no objective gate or task-specific name.
+            followthrough_target = (
+                followthrough_center + followthrough_shift)
+            target = torch.where(
+                self._clearance_followthrough_pending[:, None],
+                followthrough_target,
+                target,
             )
             delta_w = target - local_xy
             distance = torch.linalg.norm(delta_w, dim=-1)
@@ -589,7 +677,13 @@ def _waypoint_velocity_command_types() -> tuple[type[Any], type[Any]]:
             # begins immediately after entry.  Start braking over a longer
             # terminal approach so the command does not jump from ~0.4 m/s to
             # zero at the finish tolerance boundary.
-            terminal_target = self._waypoint_index == last
+            terminal_target = (
+                ~self._clearance_followthrough_pending
+                & (
+                    (self._waypoint_index == last)
+                    | (route_complete & ~command_complete)
+                )
+            )
             normal_scale = torch.clamp(
                 distance / float(self.cfg.slow_radius_m),
                 min=float(self.cfg.intermediate_min_speed_scale),
@@ -598,7 +692,7 @@ def _waypoint_velocity_command_types() -> tuple[type[Any], type[Any]]:
             clearance_traversal = (
                 target_adjusted
                 & self._clearance_stage_complete
-                & ~complete
+                & ~route_complete
             )
             # The safe cap sits inside the immutable disk. Keep full forward
             # authority until entry so a velocity policy cannot form a
@@ -606,7 +700,10 @@ def _waypoint_velocity_command_types() -> tuple[type[Any], type[Any]]:
             # only to typed clearance maneuvers; ordinary waypoints retain
             # their configured intermediate approach floor.
             normal_scale = torch.where(
-                clearance_traversal,
+                (
+                    clearance_traversal
+                    | self._clearance_followthrough_pending
+                ),
                 torch.clamp(
                     normal_scale,
                     min=float(
@@ -641,7 +738,8 @@ def _waypoint_velocity_command_types() -> tuple[type[Any], type[Any]]:
             )
             speed = float(self.cfg.cruise_speed_mps) * torch.where(
                 terminal_target, terminal_scale, normal_scale)
-            speed = torch.where(complete, torch.zeros_like(speed), speed)
+            speed = torch.where(
+                command_complete, torch.zeros_like(speed), speed)
             velocity_w = direction_w * speed[:, None]
 
             # The base policy consumes body-frame velocity commands.  Rotate
@@ -671,7 +769,7 @@ def _waypoint_velocity_command_types() -> tuple[type[Any], type[Any]]:
             yaw_scale = torch.where(
                 terminal_target, terminal_scale, torch.ones_like(speed))
             self.vel_command_b[:, 2] = yaw_rate * yaw_scale
-            self.vel_command_b[complete] = 0.0
+            self.vel_command_b[command_complete] = 0.0
             self.vel_command_w[:, :2] = velocity_w
             self.vel_command_w[:, 2] = self.vel_command_b[:, 2]
             # Preserve the semantic distinction offered by the base command:
@@ -679,7 +777,7 @@ def _waypoint_velocity_command_types() -> tuple[type[Any], type[Any]]:
             # coincidental all-zero velocity sample.  Consumers that only use
             # the command tensor remain unchanged; future embodiment-specific
             # standing priors can use this flag without task-name keying.
-            self.is_standing_env[:] = complete
+            self.is_standing_env[:] = command_complete
 
     @dataclass(kw_only=True)
     class WaypointVelocityCommandCfg(UniformVelocityCommandCfg):
@@ -699,6 +797,7 @@ def _waypoint_velocity_command_types() -> tuple[type[Any], type[Any]]:
         clearance_traversal_min_speed_scale: float = 1.0
         terminal_slow_radius_m: float = 2.0
         terminal_min_speed_scale: float = 0.35
+        terminal_retention_radius_m: float = 0.15
         terminal_stop_at_predicate_boundary: bool = False
         turn_gain: float = 2.0
         max_yaw_rate: float = 1.5
@@ -2335,6 +2434,9 @@ def _reconcile_waypoint_course(
         hold_s = 0.0
     clearance_stage_outside_margin_m = 0.10
     clearance_transition_slack_m = 0.025
+    terminal_retention_depth_m = min(0.10, 0.5 * goal_tolerance)
+    terminal_retention_radius_m = max(
+        0.0, goal_tolerance - terminal_retention_depth_m)
     clearance_staging_shifts = _clearance_staging_waypoint_shifts(
         predicate_waypoints,
         clearance_shifts,
@@ -2487,6 +2589,8 @@ def _reconcile_waypoint_course(
                     if hold_s > 0.0
                     else 0.35
                 ),
+                terminal_retention_radius_m=(
+                    terminal_retention_radius_m),
                 terminal_stop_at_predicate_boundary=hold_s > 0.0,
             )
             adjustments.append(
@@ -2504,7 +2608,9 @@ def _reconcile_waypoint_course(
                     f"command:{name}→terminal boundary braking "
                     f"(entry command ≤{terminal_entry_speed_mps:.3f} m/s, "
                     f"{terminal_slow_radius_m:.3f} m horizon-budgeted "
-                    f"constant-deceleration span)"
+                    f"constant-deceleration span) then "
+                    f"{terminal_retention_depth_m:.3f} m in-disk retention "
+                    "before standing"
                 )
 
     curriculum = getattr(env_cfg, "curriculum", None)

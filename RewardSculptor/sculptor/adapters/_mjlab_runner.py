@@ -1047,6 +1047,13 @@ def _clearance_maneuver_primary_scale(env: Any) -> Any:
             device=env.device, dtype=torch.float32)[active_index, :2]
         adjusted = torch.linalg.norm(active_shifts, dim=-1) > 1e-6
         maneuver_active = valid & adjusted
+        followthrough_pending = getattr(
+            term, "_clearance_followthrough_pending", None)
+        if torch.is_tensor(followthrough_pending):
+            followthrough_pending = followthrough_pending.to(
+                device=env.device, dtype=torch.bool)
+            if tuple(followthrough_pending.shape) == tuple(scale.shape):
+                maneuver_active |= followthrough_pending
         scale = torch.where(
             maneuver_active,
             torch.full_like(scale, _CLEARANCE_STAGE_PRIMARY_SCALE),

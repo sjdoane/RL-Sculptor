@@ -1302,3 +1302,23 @@ depth. Preserve raw predicate advancement, but finish a short command-only
 post-entry follow-through before releasing the next target or declaring the
 terminal standing phase. Do not change the scene, raw disks, ordering,
 horizon, two-second hold, command cap, or evidence definition.
+
+## Post-entry follow-through recovery
+
+The generic waypoint command now preserves raw predicate authority while
+finishing the physical maneuver that entry interrupted:
+
+- an intermediate raw disk still advances on the same frame;
+- if its compiled obstacle-away radial component is not yet reached, the
+  command keeps the previous safe cap at full authority until it is within the
+  existing `0.025 m` transition slack;
+- the generated-reward firewall remains active through that typed
+  follow-through;
+- final raw entry still completes the route immediately, while a
+  `≤0.100 m/s` center-directed command builds `0.100 m` of in-disk retention
+  depth before zero velocity and standing are declared.
+
+The frozen `0.350 m` predicates, sequence, success signal, two-second dwell,
+1,000-step horizon, and 1.000 m/s command cap do not change. Focused compiler
+and Mjlab adapter tests are **71 passed**; scoped Ruff (`F,E9`), compileall,
+and diff check pass. Commit this slice before launching the next UI proof.

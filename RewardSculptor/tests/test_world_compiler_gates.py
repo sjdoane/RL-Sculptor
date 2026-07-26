@@ -630,9 +630,46 @@ def test_adjusted_waypoint_stages_then_synchronizes_on_frozen_disk() -> None:
     term._update_command()
     assert term._waypoint_index.item() == 1
     assert not term._clearance_stage_complete.item()
+    assert term._clearance_followthrough_pending.item()
+    expected_direction = (
+        safe_target - robot.data.root_link_pos_w[0, :2])
+    expected_direction = (
+        expected_direction / torch.linalg.norm(expected_direction))
+    actual_direction = term.command[0, :2]
+    actual_direction = actual_direction / torch.linalg.norm(actual_direction)
+    torch.testing.assert_close(actual_direction, expected_direction)
+
+    # Objective truth has already advanced, but the next route target is not
+    # released until the embodiment-safe radial component is recovered.
+    robot.data.root_link_pos_w[0, :2] = safe_target
+    term._update_command()
+    assert term._waypoint_index.item() == 1
+    assert not term._clearance_followthrough_pending.item()
+
+    # Terminal raw entry also advances immediately. The command retains a
+    # small in-disk target until it has positional margin against settling
+    # drift, then and only then declares the standing phase.
+    finish_center = torch.tensor(cfg.predicate_waypoints_m[1][:2])
+    robot.data.root_link_pos_w[0, :2] = (
+        finish_center + torch.tensor([-0.34, 0.0]))
+    term._update_command()
+    assert term._waypoint_index.item() == 2
+    assert not term._terminal_settle_complete.item()
+    assert not term.is_standing_env.item()
+    assert torch.linalg.norm(term.command[0, :2]) == pytest.approx(
+        cfg.cruise_speed_mps * cfg.terminal_min_speed_scale)
+
+    robot.data.root_link_pos_w[0, :2] = (
+        finish_center + torch.tensor([-0.20, 0.0]))
+    term._update_command()
+    assert term._terminal_settle_complete.item()
+    assert term.is_standing_env.item()
+    assert torch.linalg.norm(term.command[0, :2]) == pytest.approx(0.0)
+    assert cfg.terminal_retention_radius_m == pytest.approx(0.25)
 
     # A stochastic early disk entry must still advance on the exact frame the
     # frozen objective advances, preventing persistent command/metric drift.
+    robot.data.root_link_pos_w[0, :2] = safe_target
     fresh = cfg.build(env)
     fresh._clearance_stage_complete[:] = False
     fresh._waypoint_index[:] = 0
