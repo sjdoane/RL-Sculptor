@@ -1151,3 +1151,41 @@ observe-only. Do not touch reload-watched core or run an intermediate GPU
 audit. Once stopped, preserve the checkpoint and require the official scene
 audit, all-lane artifacts, and lane-10 keyframes/full video to prove the
 entire physical conjunction.
+
+## Iter 32 looks successful but is time-disqualified
+
+Iter 32 completed with a perfectly aligned scene and a real route recovery:
+62/64 lanes enter the five actual regions in order, 30/64 reach authored
+success/index 5, 56/64 are contact-free, and no lane sustains a fall. The
+frozen fit is nevertheless only `0.08365` because the completion gate is
+`11/64`, terminal-speed aggregate is `0.19921 m/s`, and **0/64** lanes
+provide the separate 100-frame post-success whole-body hold.
+
+Lane 10 is the clearest explanation for a viewer. The full video visibly
+shows the robot weave around the real orange boxes and stop in the finish.
+The immutable trace agrees on geometry and safety: actual-region entries are
+frames `[108, 310, 508, 697, 823]`, index 5 arrives at 842, all four contact
+channels stay false, no sustained fall occurs, and final horizontal/angular/
+joint speeds are `0.0353 m/s`, `0.1278 rad/s`, and `0.3840 rad/s`. But the
+authored 2-second dwell does not declare success until frame 942, and the
+strict quiet window starts at 968. Only 31 proof frames remain before the
+1,000-step horizon. Never substitute the attractive video for the frozen
+conjunction.
+
+The next recovery is generic and timing-only. The former fixed `2.000 m`
+terminal brake consumed about two seconds of the same horizon needed for
+staged route transitions. Terminal braking is now budgeted from route length,
+traversal window, cruise cap, and command-segment count. This staged course
+uses a `0.500 m` constant-deceleration span and reaches the unchanged raw
+predicate boundary with at most a `0.100 m/s` command, still below the frozen
+`0.12 m/s` stop threshold. The raw disk, authored hold, episode length,
+scene, contacts, route, and reward authority are unchanged.
+
+Focused compiler/adapter verification is 71 passed; scoped Ruff `F,E9`,
+compileall, and diff check pass. After the clean commit, launch only through
+New Run, recover actor+critic from iter 32, restore exact promoted reward
+v20/environment v21, and retain one 750-PPO cycle, 1,024 CUDA environments,
+seed 42, two 1,000-step 1920×1080 episodes, Auto, evidence lane 10,
+`gen_003` observe-only, exact promoted recovery, aligned boxes, four contact
+sensors at -8, full command weights, 50/25/25 RSI, the full-maneuver reward
+firewall, strict-product whole-body stillness weight 4, and entropy `0.01`.

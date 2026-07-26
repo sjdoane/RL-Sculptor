@@ -2235,6 +2235,48 @@ def _horizon_aware_waypoint_cruise(
     return cruise_speed_mps, path_length_m, traversal_window_s
 
 
+def _horizon_aware_terminal_brake_radius(
+    *,
+    path_length_m: float,
+    traversal_window_s: float,
+    cruise_speed_mps: float,
+    command_segment_count: int,
+    maximum_radius_m: float = 2.0,
+    minimum_radius_m: float = 0.5,
+    transition_reserve_s: float = 0.35,
+) -> float:
+    """Budget terminal braking without consuming route-transition slack.
+
+    For the constant-deceleration profile used by the waypoint command, a
+    brake span of ``radius`` adds approximately ``radius / cruise_speed`` to
+    the corresponding constant-speed travel time. A fixed long span can
+    therefore make a staged, turn-heavy course miss the same horizon whose
+    cruise speed was already capped by the installed command domain.
+
+    Reserve a small, embodiment-neutral allowance for every command
+    transition before the terminal segment, then spend only the remaining
+    schedule slack on braking. The lower bound keeps the stop physically
+    progressive when the route is horizon-saturated; the upper bound retains
+    the gentler legacy profile on short routes with ample time.
+    """
+    speed = max(0.0, float(cruise_speed_mps))
+    if speed <= 1e-9:
+        return max(0.0, float(maximum_radius_m))
+
+    cruise_time_s = max(0.0, float(path_length_m)) / speed
+    schedule_slack_s = max(
+        0.0, float(traversal_window_s) - cruise_time_s)
+    intermediate_transitions = max(0, int(command_segment_count) - 1)
+    transition_budget_s = (
+        intermediate_transitions * max(0.0, float(transition_reserve_s))
+    )
+    braking_budget_s = max(0.0, schedule_slack_s - transition_budget_s)
+    scheduled_radius_m = speed * braking_budget_s
+    lower = max(0.0, float(minimum_radius_m))
+    upper = max(lower, float(maximum_radius_m))
+    return min(upper, max(lower, scheduled_radius_m))
+
+
 def _reconcile_waypoint_course(
     env_cfg: Any,
     manifest: ResolvedEvaluation,
@@ -2396,6 +2438,21 @@ def _reconcile_waypoint_course(
                     max_speed_mps=linear_command_cap_mps,
                 )
             )
+            command_segment_count = len(predicate_waypoints) + sum(
+                math.hypot(float(shift[0]), float(shift[1])) > 1e-6
+                for shift in clearance_staging_shifts
+            )
+            terminal_slow_radius_m = (
+                _horizon_aware_terminal_brake_radius(
+                    path_length_m=path_length_m,
+                    traversal_window_s=traversal_window_s,
+                    cruise_speed_mps=cruise_speed_mps,
+                    command_segment_count=command_segment_count,
+                )
+                if hold_s > 0.0
+                else 2.0
+            )
+            terminal_entry_speed_mps = 0.10
             commands[name] = WaypointVelocityCommandCfg(
                 entity_name=str(getattr(term, "entity_name", "robot")),
                 resampling_time_range=(1_000.0, 1_000.0),
@@ -2420,9 +2477,13 @@ def _reconcile_waypoint_course(
                 cruise_speed_mps=cruise_speed_mps,
                 intermediate_min_speed_scale=0.35,
                 clearance_traversal_min_speed_scale=1.0,
-                terminal_slow_radius_m=2.0,
+                terminal_slow_radius_m=terminal_slow_radius_m,
                 terminal_min_speed_scale=(
-                    min(0.35, 0.05 / max(cruise_speed_mps, 1e-6))
+                    min(
+                        0.35,
+                        terminal_entry_speed_mps
+                        / max(cruise_speed_mps, 1e-6),
+                    )
                     if hold_s > 0.0
                     else 0.35
                 ),
@@ -2441,8 +2502,9 @@ def _reconcile_waypoint_course(
             if hold_s > 0.0:
                 adjustments.append(
                     f"command:{name}→terminal boundary braking "
-                    f"(entry command ≤{0.05:.3f} m/s, "
-                    f"{2.0:.3f} m constant-deceleration span)"
+                    f"(entry command ≤{terminal_entry_speed_mps:.3f} m/s, "
+                    f"{terminal_slow_radius_m:.3f} m horizon-budgeted "
+                    f"constant-deceleration span)"
                 )
 
     curriculum = getattr(env_cfg, "curriculum", None)

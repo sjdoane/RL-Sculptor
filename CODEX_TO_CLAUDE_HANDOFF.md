@@ -3271,3 +3271,51 @@ GPU audit or edit reload-watched core while iter 32 is alive. After the worker
 stops, preserve its checkpoint and apply the full immutable all-lane,
 lane-10 video/keyframe, and Results physical-scene conjunction before any
 promotion.
+
+## Iter 32 immutable audit + horizon-budgeted terminal recovery 2026-07-26 (Codex)
+
+Iter 32/job `job_28fa781d092c229e` completed cleanly and preserved its
+checkpoint. The safe-cap correction restored real route execution: the
+official first-episode trajectory has `62/64` ordered actual-disk traversals,
+`30/64` authored-success/index-5 routes, `56/64` contact-free lanes, and
+`64/64` without a sustained fall. The Results scene audit is aligned at
+`0.0 m`, realism is `ok`, and the frozen objective reports fitness `0.08365`
+with progress `0.74374`.
+
+This is still diagnostic evidence. The frozen completion gate is only
+`11/64`, terminal-speed aggregate is `0.19921 m/s`, and no lane supplies the
+required uninterrupted 100-frame post-success whole-body hold. Only env 34
+declares success early enough to leave 100 samples; it stays fully quiet for
+81 before a late horizontal/angular correction. The other 29 successful
+lanes declare success at frames 910-997 and therefore cannot fit a further
+100 samples in the immutable 1,000-step episode.
+
+Precommitted lane 10 visibly performs the requested alternating weave around
+the co-located boxes. It enters the five actual regions at frames
+`[108, 310, 508, 697, 823]`, reaches index 5 at 842, declares authored
+success at 942, remains contact-free and fall-free, and ends at `0.0353 m/s`
+horizontal speed with quiet angular/joint motion and an upright/default-like
+pose. Its strict post-success window begins only at frame 968, so the
+available proof is **31 frames**, not 100. The full video and terminal sheet
+therefore explain why it looks successful while the aggregate fit remains
+low: visual plausibility in one disclosed lane is not the 64-lane frozen
+conjunction.
+
+The generic timing defect is the fixed `2.000 m` constant-deceleration span.
+At a `1.000 m/s` command cap it adds about two seconds over constant-speed
+travel, consuming transition slack that the staged, turn-heavy route also
+needs. The controller now budgets terminal braking from path length,
+traversal window, installed cruise cap, and command-segment count. It reserves
+`0.35 s` for each pre-terminal transition and spends only the remaining slack
+on braking, bounded to a physically progressive `0.5-2.0 m` span. This course
+therefore uses `0.500 m`; the boundary command is `0.100 m/s`, below the
+unchanged `0.12 m/s` acceptance threshold, and still becomes exactly zero on
+raw predicate entry. No evaluator, horizon, hold, task tolerance, route,
+robot, object, or task name changed.
+
+Focused compiler + adapter verification is **71 passed**. Scoped Ruff
+(`F,E9`), compileall, and diff check pass. Commit this slice, then launch
+through New Run with exact promoted reward v20/environment v21, actor+critic
+recovery from iter 32, and all existing scene/contact/RSI/firewall/posture
+invariants. Promotion still requires fresh physical proof of the entire
+conjunction.

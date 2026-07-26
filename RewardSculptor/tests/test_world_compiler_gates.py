@@ -16,6 +16,7 @@ from mjlab.scene import Scene, SceneCfg
 from sculptor.world.compiler import (
     ResolvedEvaluation,
     _clearance_adjusted_waypoint_points,
+    _horizon_aware_terminal_brake_radius,
     _horizon_aware_waypoint_cruise,
     _install_task_observations,
     _reconcile_waypoint_course,
@@ -268,7 +269,7 @@ def test_explicit_waypoint_zones_align_commands_without_materialized_course() ->
     assert routed.terminal_slow_radius_m == pytest.approx(2.0)
     assert (
         routed.cruise_speed_mps * routed.terminal_min_speed_scale
-        <= 0.05 + 1e-9
+        <= 0.10 + 1e-9
     )
     assert "command_vel" not in env_cfg.curriculum
     assert any("goal-conditioned waypoint traversal" in item
@@ -488,6 +489,23 @@ def test_waypoint_cruise_reserves_horizon_for_authored_terminal_hold() -> None:
         max_speed_mps=1.0,
     )
     assert short_speed == pytest.approx(0.8)
+
+
+def test_terminal_brake_radius_preserves_staged_route_transition_slack() -> None:
+    """A horizon-saturated staged route cannot spend all slack braking."""
+    assert _horizon_aware_terminal_brake_radius(
+        path_length_m=12.74,
+        traversal_window_s=16.0,
+        cruise_speed_mps=1.0,
+        command_segment_count=9,
+    ) == pytest.approx(0.5)
+
+    assert _horizon_aware_terminal_brake_radius(
+        path_length_m=4.0,
+        traversal_window_s=16.0,
+        cruise_speed_mps=0.8,
+        command_segment_count=2,
+    ) == pytest.approx(2.0)
 
 
 def test_adjusted_waypoint_stages_then_synchronizes_on_frozen_disk() -> None:
