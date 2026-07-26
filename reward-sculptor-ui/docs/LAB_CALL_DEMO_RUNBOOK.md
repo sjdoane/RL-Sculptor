@@ -1322,3 +1322,36 @@ The frozen `0.350 m` predicates, sequence, success signal, two-second dwell,
 1,000-step horizon, and 1.000 m/s command cap do not change. Focused compiler
 and Mjlab adapter tests are **71 passed**; scoped Ruff (`F,E9`), compileall,
 and diff check pass. Commit this slice before launching the next UI proof.
+
+## Live proof: iter 35 post-entry command follow-through
+
+UI job `job_2b3ff05c45a4f2c1` is running iter 35 from clean captured commit
+`34b551455cd3cd76210e6700f2bec3780350c4ee`. Exact promoted recovery restored
+selection v43 and the hash-verified reward v20/environment v21 tuple. The UI
+resolved iter 34 checkpoint SHA8 `7f49a4c7`, and startup proves actor+critic
+warm-start loading.
+
+This run adds only command completion after immutable predicate entry:
+
+- every raw disk still advances objective truth on the entry frame;
+- an unfinished obstacle-away maneuver keeps its existing safe-cap command
+  and full-maneuver reward firewall until the typed radial component is
+  complete;
+- final raw entry still completes the route immediately, while the existing
+  bounded terminal command builds `0.100 m` of in-disk retention depth before
+  publishing zero velocity and standing.
+
+All four 0.268 m typed entries, unchanged 0.350 m raw disks, 0.100 m outside
+stages, full-speed safe-cap traversal, 1.000 m/s cruise, 0.500 m terminal
+brake to at most 0.100 m/s, 50/25/25 train-only RSI, aligned local-frame
+boxes, four contact sensors at -8, full linear/angular command weights 2,
+strict-product whole-body terminal stillness at weight 4, and entropy 0.01
+remain active.
+
+The New Run form pins Auto, one 750-PPO cycle, 1,024 CUDA environments, seed
+42, two 1,000-step 1920x1080 episodes, precommitted lane 10, `gen_003`
+observe-only, exact promoted recovery, and no reference motion. PPO is live.
+Leave reload-watched core and the GPU worker untouched. After completion,
+require the aligned Results scene plus the full ordered-route, contact-free,
+fall-free, upright/default-like, terminal-speed, and uninterrupted 100-frame
+whole-body-hold conjunction in the disclosed evidence.

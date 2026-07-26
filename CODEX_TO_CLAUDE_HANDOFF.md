@@ -3489,3 +3489,38 @@ The change is capability- and predicate-derived; it introduces no task,
 robot, object-name, evaluator, tolerance, horizon, hold, route, or success
 branch. Focused compiler + Mjlab adapter verification is **71 passed**.
 Scoped Ruff (`F,E9`), compileall, and `git diff --check` also pass.
+
+## Iter 35 live post-entry follow-through proof 2026-07-26 (Codex)
+
+UI New Run job `job_2b3ff05c45a4f2c1` is running iter 35 from clean captured
+commit `34b551455cd3cd76210e6700f2bec3780350c4ee`. Exact promoted recovery
+restored selection v43 / tuple
+`95afc97b6000593eab01c8e7b374b71dbf20f6e75e647008d322f8270b0b88c7`,
+reward v20 SHA
+`b05bd4fa1ec200ff6e2330d32d0ca8f2bfb095a3878e50fb7433439e32db55e9`,
+and env v21 SHA
+`a56ea1a4baaa66ce5190d2cd29c41a79471ab4f497d81ce866e932082eba134c`.
+The UI resolved iter 34 checkpoint SHA
+`7f49a4c75116e094004431da87e5318ee9e57dd51576419a18f9ad1f63aebca1`;
+startup proves the explicit UI recovery and actor+critic warm start.
+
+This is the first live proof with generic command-only post-entry
+follow-through. Intermediate raw disk entry still advances the frozen route
+immediately while an unfinished typed obstacle-away maneuver retains its
+existing safe-cap command and reward firewall. Terminal raw entry likewise
+completes the route immediately while the bounded center-directed command
+builds the existing `0.100 m` retention depth before standing. The four
+`0.268 m` typed entries, unchanged `0.350 m` raw disks, `0.100 m` outside
+stages, full-speed safe-cap traversal, `1.000 m/s` horizon cruise, `0.500 m`
+terminal brake to at most `0.100 m/s`, 50/25/25 train-only RSI, aligned
+local-frame boxes, four forbidden-contact sensors at -8, full linear/angular
+command weights 2, strict-product whole-body terminal stillness at weight 4,
+and entropy `0.01` remain intact.
+
+Settings are Auto, one 750-PPO cycle, 1,024 environments on `cuda:0`, seed
+42, two 1,000-step 1920x1080 episodes, precommitted evidence lane 10,
+`gen_003` observe-only, exact promoted recovery on, and no reference motion.
+PPO is active. Do not edit reload-watched core or run an intermediate GPU
+audit. After the worker stops, preserve its checkpoint and judge the official
+all-lane trajectory/fitness, lane-10 behavior/keyframes/full video, and
+Results physical-scene audit against the unchanged complete conjunction.
