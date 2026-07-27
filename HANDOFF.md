@@ -958,3 +958,100 @@ gravity.
 
 Same as §13: this is a reward module, not a trained policy. Training with it
 needs the GPU, which recert5 has (round 2 of 3 as of this writing).
+
+---
+
+## §15 — training with the authored per-mode reward, and the bug it exposed
+
+§13/§14 ended with "this is a reward module, not a trained policy." This closes
+that: a policy has now trained on the authored per-mode reward, driven entirely
+from the UI. Getting there surfaced a physics bug that had been silently
+corrupting **every run on an authored world**, not just this one.
+
+### Promotion — the gap that made the feature a no-op
+
+Authoring writes `mode_reward_v*.py`. `reward_store._V_RE` only recognizes
+`v<n>.py`, so those files are not in the version chain: pressing **New run**
+after authoring all three modes trained `v0.py`'s starter `alive_bonus` and
+discarded the work, silently.
+
+`promote_mode_reward` closes it — library, `sculpt modes promote`, a POST route,
+and a **Use for training** button. It refuses a module with any unauthored stub
+unless `allow_unauthored`, because a module where 2 of 3 modes still `return
+0.0` looks like a working reward to every downstream consumer.
+
+Live: `mode_reward_v3.py` → `v1.py`, `rewards/current.py` re-exports it, and the
+Rewards tab shows `Reward v1 · SCULPTOR`.
+
+### The bug: constraint buffers sized for the wrong scene
+
+First UI run died 18 learning iterations in with
+`ValueError: observation group 'actor' contains NaN`, behind **197,037** lines of
+`nefc overflow - please increase njmax to 336` on stderr.
+
+mjlab sizes `njmax`/`nconmax` per task against that task's **own** scene — the
+G1 flat velocity config pins `njmax=300` for a bare plane. An authored world
+replaces the scene, so the constant stops describing what the robot can touch.
+Measured on the 7-element box course at the real `num_envs=1024` config, 120
+steps of random actions:
+
+| njmax | nconmax | overflow lines | peak nefc/world | peak GPU |
+|------:|--------:|---------------:|----------------:|---------:|
+| 300 | 64 | 112,130 | 496 | ~3.5 GiB |
+| 768 | 256 | 0 | 625 | 3585 MiB |
+| 1536 | 512 | 0 | 532 | 3767 MiB |
+| 3072 | 1024 | 0 | 610 | 4289 MiB |
+
+**The default overflows on ~100% of steps.** Not an edge case near the crash —
+the physics was wrong from step 0 of every run that ever used an authored world.
+Overflow is silent: mjwarp drops constraint rows, prints to stderr, and keeps
+stepping with wrong contact forces until observations go NaN.
+
+`_reconcile_constraint_budget` (in `world/compiler.py`) raises the buffers when a
+world is applied, on both the train and eval paths. Two things worth keeping:
+
+- **It only ever raises.** A task asking for more knows something about its
+  scene that this function does not.
+- **`nconmax=None` counts as unset, not as "big enough."** None means "use
+  mjwarp's heuristic", and measured on this same scene the heuristic overflows
+  **worse** than the pinned default (68,974 vs 9,124 lines). Handing sizing back
+  to the simulator is not the fix here — that was the first thing tried.
+
+Overridable via `RS_WORLD_NJMAX` / `RS_WORLD_NCONMAX`; garbage values fall back
+to the measured floor.
+
+### Result
+
+Same run, after the fix — clean telemetry, zero overflow, event count 1,586
+instead of 20,000+:
+
+```
+Learning iteration 28/300      Mean reward: 177.91
+Total steps: 712704            Mean episode length: 131.71
+Steps per second: 7146
+Episode_Reward/sculptor_primary: 54.9698     <- the authored per-mode reward
+Episode_Reward/sculptor_survival: 22.8000
+Episode_Reward/sculptor_failure: -0.2500
+```
+
+Before the fix the same run reached mean reward 33.36 at learning iteration 17
+and then NaN'd. 
+
+### A note on what this says about the earlier runs
+
+Every past run on an authored world was training against dropped contacts. Runs
+that "just didn't converge" on a box course are now suspect — the physics they
+saw was not the physics the world describes. Worth re-reading any conclusion
+drawn from a course run before this commit.
+
+### Still open
+
+- The 197k-line stderr flood is fixed at the source, but nothing *diagnoses* an
+  overflow if a future world exceeds even the raised floor. A dedupe + one
+  `physics_edit_suggested`-style event would turn the next occurrence from a
+  wall of text into a finding.
+- recert5 finished: the composed clip is still **INFEASIBLE**, tier stays K.
+  `mean_joint_err 0.190` and `root_z_rmse 0.014` both pass, but
+  `motion_ratio 1.147` — the tracker is *worse than holding the mean pose*
+  (static baseline `0.165` rad). Item #9 is a clip/tracker problem, not a
+  threshold problem; do not touch `STATIC_BASELINE_RATIO_MAX` to make it pass.
