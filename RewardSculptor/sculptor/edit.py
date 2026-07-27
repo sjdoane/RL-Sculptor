@@ -1300,16 +1300,20 @@ def _call_llm(
     *,
     on_event=None,
     attempt: int = 1,
+    max_tokens: int | None = None,
 ) -> str:
+    """One rewrite call. `max_tokens` overrides `MAX_TOKENS` for callers whose
+    module is long enough that the default truncates — see `apply_edits`."""
     if on_event is not None:
         on_event({
             "type": "log_line",
             "text": f"[edit] LLM request start (attempt {attempt}, "
                     f"user_prompt_chars={len(user_content)})",
         })
+    limit = int(max_tokens or MAX_TOKENS)
     resp = client.messages.create(
         model=MODEL_ID,
-        max_tokens=MAX_TOKENS,
+        max_tokens=limit,
         thinking={"type": "adaptive"},
         cache_control={"type": "ephemeral"},
         system=system_prompt,
@@ -1326,6 +1330,15 @@ def _call_llm(
         meta={"attempt": attempt})
     if not chunks:
         raise EditValidationError("LLM returned no text blocks")
+    if getattr(resp, "stop_reason", None) == "max_tokens":
+        # Say so, rather than letting the half-written module surface as a
+        # baffling `SyntaxError: '(' was never closed`. Raised inside the
+        # repair-retry loop's `try`, so the reminder reaches the next attempt.
+        raise EditValidationError(
+            f"response was cut off at the {limit}-token ceiling — the module "
+            f"is incomplete, not wrong. Emit the SAME module more concisely: "
+            f"no commentary, short docstrings, and do not restate unchanged "
+            f"code you could have left alone.")
     out = _strip_markdown_fence("".join(chunks))
     if on_event is not None:
         on_event({
@@ -1563,6 +1576,7 @@ def apply_edits(
     replay_inputs=None,
     hack_replays: "list[dict] | None" = None,
     n_candidates: int = 1,
+    max_tokens: int | None = None,
 ) -> Path:
     """Produce a new reward module from `diagnosis` applied to
     `current_reward_path`. Writes `<rewards_dir>/<new_iter_id>.py` and
@@ -1823,6 +1837,7 @@ def apply_edits(
                     cand_source = _call_llm(
                         client, _EDIT_SYSTEM, framed_prompt,
                         on_event=on_event, attempt=1,
+                        max_tokens=max_tokens,
                     )
                     rec["source"] = cand_source
                     rec["source_sha256"] = hashlib.sha256(
@@ -1910,6 +1925,7 @@ def apply_edits(
                 new_source = _call_llm(
                     client, _EDIT_SYSTEM, retry_user,
                     on_event=on_event, attempt=2,
+                    max_tokens=max_tokens,
                 )
                 _post_validate(
                     new_source, contract=reward_contract, kg_store=kg_store,
@@ -1943,6 +1959,7 @@ def apply_edits(
                     new_source = _call_llm(
                         client, _EDIT_SYSTEM, attempt_prompt,
                         on_event=on_event, attempt=attempt,
+                        max_tokens=max_tokens,
                     )
                     if on_event is not None:
                         on_event({
@@ -2016,6 +2033,7 @@ def apply_prompt_edit(
     kg_store: "SculptorKG | None" = None,
     client=None,
     on_event=None,
+    max_tokens: int | None = None,
 ) -> Path:
     """One-shot reward rewrite from a user's natural-language prompt.
 
@@ -2140,6 +2158,7 @@ def apply_prompt_edit(
         kg_store=kg_store,
         client=client,
         on_event=on_event,
+        max_tokens=max_tokens,
     )
 
 

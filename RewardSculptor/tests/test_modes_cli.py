@@ -12,6 +12,7 @@ drifted from its graph, a mode that does not exist, a missing contract.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import numpy as np
@@ -229,6 +230,320 @@ def test_authoring_before_scaffolding_says_which_command_to_run(
         "--mode", "launch", "--file", str(tmp_path / "nothing.py"),
         "--print-prompt"])
     assert r.exit_code == 1 and "modes scaffold" in r.output
+
+
+def _fake_adapter(monkeypatch, project: Path):
+    """A project whose adapter yields an mjlab-shaped contract, without mjlab.
+
+    The point is to exercise everything `modes author` does AROUND the model
+    call — build the twin, graft, write, re-probe — which is where the code
+    under test lives.
+    """
+    import types
+
+    project.mkdir(parents=True, exist_ok=True)
+    (project / "config.toml").write_text("[target]\nname = 'fake'\n")
+    contract = types.SimpleNamespace(
+        supports_batched=True,
+        state_schema={"qpos": (29,), "projected_gravity_b": (3,),
+                      "actuator_force": (29,)},
+        info_schema={"episode_length": (), "step_dt": (), "base_height": ()},
+        expected_info_keys=["episode_length", "step_dt", "base_height"])
+    monkeypatch.setattr(
+        "sculptor.adapters.base.load_adapter",
+        lambda _p: types.SimpleNamespace(reward_contract=lambda: contract))
+    return contract
+
+
+def test_authoring_builds_a_twin_grafts_it_back_and_re_probes(
+        tmp_path, monkeypatch):
+    """The whole `modes author` machinery minus the model.
+
+    This is the path that had a `NameError: name 'clip' is not defined` in it,
+    invisible to every other test here because `--print-prompt` returns before
+    reaching it."""
+    from sculptor.mode_rewards import MODE_FN_PREFIX, authored_modes
+
+    root = tmp_path / "refs"
+    _write_composite(root, seams=[150, 300], n=444)
+    out = tmp_path / "v0.py"
+    assert _run(monkeypatch, root, [
+        "modes", "scaffold", "--clip-id", "novel-jump-kick--g1",
+        "--out", str(out)]).exit_code == 0
+    assert "TARGET_JOINT_POS" in out.read_text(), "backbone is on by default"
+
+    project = tmp_path / "proj"
+    _fake_adapter(monkeypatch, project)
+
+    seen = {}
+
+    def _fake_edit(*, current_reward_path, user_prompt, new_iter_id, **_kw):
+        # What the model would return: the twin with 'launch' filled in.
+        src = Path(current_reward_path).read_text(encoding="utf-8")
+        seen["twin"] = src
+        seen["prompt"] = user_prompt
+        for fn, body in (
+            (f"{MODE_FN_PREFIX}launch(state, action, next_state, info)",
+             "    del state, action, next_state, info\n    return 0.25, {'takeoff': 0.25}\n"),
+            (f"{MODE_FN_PREFIX}launch_batched(state, action, next_state, info, like)",
+             "    del state, action, next_state, info\n    return like + 0.25, {'takeoff': like + 0.25}\n"),
+        ):
+            head = f"def {fn}:"
+            i = src.index(head)
+            j = src.index("\ndef ", i)
+            src = src[:i] + head + "\n" + body + src[j:]
+        dest = Path(current_reward_path).parent / f"{new_iter_id}.py"
+        dest.write_text(src, encoding="utf-8")
+        return dest
+
+    monkeypatch.setattr("sculptor.edit.apply_prompt_edit", _fake_edit)
+    r = _run(monkeypatch, root, [
+        "modes", "author", "--clip-id", "novel-jump-kick--g1",
+        "--mode", "launch", "--file", str(out), "--project", str(project),
+        "--goal", "run in and strike at the apex"])
+    assert r.exit_code == 0, r.output
+
+    # The twin the model saw: no float tables, but state-dependent.
+    # The literals are the whole reason the twin exists — a real g1 scaffold
+    # is 32x29 of them and the model mangled the table when asked to
+    # reproduce it. Size alone understates this here (the fixture has 6
+    # joints), so assert on the literals themselves.
+    scaffold = out.read_text()
+    floats = re.compile(r"-?\d+\.\d{3,}")
+
+    def _table_rows(src):  # a row of the target table, vs. a lone window bound
+        return [ln for ln in src.splitlines() if len(floats.findall(ln)) >= 3]
+
+    assert len(_table_rows(scaffold)) > 10
+    assert _table_rows(seen["twin"]) == []
+    assert "np.zeros((N_PHASE, N_JOINTS)" in seen["twin"]
+    assert len(seen["twin"]) < len(scaffold)
+    assert "_mode_launch_batched" in seen["prompt"]
+
+    # And the grafted result carries the authored mode AND the real tables.
+    v1 = (tmp_path / "v1.py").read_text(encoding="utf-8")
+    assert authored_modes(v1)["launch"] is True
+    assert authored_modes(v1)["approach"] is False
+    assert "np.zeros((N_PHASE, N_JOINTS)" not in v1, "real targets, not the twin's"
+    assert "0.25" in v1
+    assert "1/3 modes authored" in r.output
+    assert "--mode approach" in r.output and "--mode strike" in r.output
+
+
+def test_a_helper_the_model_defines_is_carried_across_the_graft(
+        tmp_path, monkeypatch):
+    """The second real authoring run died here.
+
+    The model wrote the mode plus an `_info_b` helper at module level; the
+    graft took only the two mode functions, and the result failed the batched
+    probe with `NameError: name '_info_b' is not defined`."""
+    from sculptor.mode_rewards import MODE_FN_PREFIX
+
+    root = tmp_path / "refs"
+    _write_composite(root)
+    out = tmp_path / "v0.py"
+    _run(monkeypatch, root, ["modes", "scaffold", "--clip-id",
+                             "novel-jump-kick--g1", "--out", str(out)])
+    project = tmp_path / "proj"
+    _fake_adapter(monkeypatch, project)
+
+    def _edit_with_helper(*, current_reward_path, new_iter_id, **_kw):
+        src = Path(current_reward_path).read_text(encoding="utf-8")
+        # A helper calling a second helper, to pin the transitive case.
+        src += ("\n\ndef _launch_scale():\n    return _launch_gain() * 2.0\n"
+                "\n\ndef _launch_gain():\n    return 0.125\n")
+        for fn, body in (
+            (f"{MODE_FN_PREFIX}launch(state, action, next_state, info)",
+             "    del state, action, next_state, info\n"
+             "    v = _launch_scale()\n    return v, {'takeoff': v}\n"),
+            (f"{MODE_FN_PREFIX}launch_batched(state, action, next_state, info, like)",
+             "    del state, action, next_state, info\n"
+             "    v = like + _launch_scale()\n    return v, {'takeoff': v}\n"),
+        ):
+            head = f"def {fn}:"
+            i = src.index(head)
+            j = src.index("\ndef ", i)
+            src = src[:i] + head + "\n" + body + src[j:]
+        dest = Path(current_reward_path).parent / f"{new_iter_id}.py"
+        dest.write_text(src, encoding="utf-8")
+        return dest
+
+    monkeypatch.setattr("sculptor.edit.apply_prompt_edit", _edit_with_helper)
+    r = _run(monkeypatch, root, [
+        "modes", "author", "--clip-id", "novel-jump-kick--g1",
+        "--mode", "launch", "--file", str(out), "--project", str(project)])
+    assert r.exit_code == 0, r.output
+
+    v1 = (tmp_path / "v1.py").read_text(encoding="utf-8")
+    assert "def _launch_scale()" in v1 and "def _launch_gain()" in v1
+    # Carried once, not once per grafted function.
+    assert v1.count("def _launch_scale()") == 1
+    ns: dict = {}
+    exec(compile(v1, "v1.py", "exec"), ns)
+    assert ns["_mode_launch"]({}, None, {"qpos": [0.0] * 6}, {})[0] == 0.25
+
+
+def test_the_twin_does_not_grow_as_modes_get_authored(tmp_path, monkeypatch):
+    """The third call has to fit in the same budget as the first.
+
+    Authoring is one mode per call and `apply_prompt_edit` regenerates the
+    whole module, so carrying each finished mode's body into the next twin
+    made it grow monotonically — mode 'approach' hit that live and both
+    attempts came back truncated. The twin carries what a neighbour PAYS, not
+    how."""
+    from sculptor.mode_rewards import MODE_FN_PREFIX
+
+    root = tmp_path / "refs"
+    _write_composite(root)
+    out = tmp_path / "v0.py"
+    _run(monkeypatch, root, ["modes", "scaffold", "--clip-id",
+                             "novel-jump-kick--g1", "--out", str(out)])
+    project = tmp_path / "proj"
+    _fake_adapter(monkeypatch, project)
+
+    twins = {}
+
+    def _edit_for(mode):
+        # A deliberately bulky body, so a twin that carried it would show.
+        filler = "\n".join(f"    x{i} = {i}.0 + float(len(info))" for i in range(60))
+
+        def _edit(*, current_reward_path, new_iter_id, **_kw):
+            src = Path(current_reward_path).read_text(encoding="utf-8")
+            twins[mode] = src
+            for suffix, sig, ret in (
+                ("", "(state, action, next_state, info)", "0.5"),
+                ("_batched", "(state, action, next_state, info, like)", "like + 0.5"),
+            ):
+                fn = f"{MODE_FN_PREFIX}{mode}{suffix}"
+                head = f"def {fn}{sig}:"
+                i = src.index(head)
+                j = src.index("\ndef ", i)
+                src = (src[:i] + head + "\n    del state, action, next_state\n"
+                       + filler + f"\n    v = {ret}\n"
+                       + f"    return v, {{'{mode}_core': v, '{mode}_aux': v}}\n"
+                       + src[j:])
+            dest = Path(current_reward_path).parent / f"{new_iter_id}.py"
+            dest.write_text(src, encoding="utf-8")
+            return dest
+        return _edit
+
+    src_file = out
+    for n, mode in enumerate(("approach", "launch", "strike"), start=1):
+        monkeypatch.setattr("sculptor.edit.apply_prompt_edit", _edit_for(mode))
+        r = _run(monkeypatch, root, [
+            "modes", "author", "--clip-id", "novel-jump-kick--g1",
+            "--mode", mode, "--file", str(src_file), "--project", str(project)])
+        assert r.exit_code == 0, r.output
+        assert f"{n}/3 modes authored" in r.output
+        src_file = tmp_path / f"v{n}.py"
+
+    # The third twin is no bigger than the first, despite two finished modes.
+    assert len(twins["strike"]) <= len(twins["approach"]) * 1.1
+    # And it says what they pay without carrying how.
+    assert "pays approach_core, approach_aux" in twins["strike"]
+    assert "x59 = 59.0" not in twins["strike"], "neighbour bodies stayed out"
+    # while the real module has every one of them.
+    final = src_file.read_text(encoding="utf-8")
+    assert final.count("x59 = 59.0") == 6, "3 modes x scalar+batched"
+
+
+def _author_reading(monkeypatch, keys):
+    """Patch the edit call to author `launch` reading `keys` out of info."""
+    from sculptor.mode_rewards import MODE_FN_PREFIX
+
+    reads = " + ".join(f"float(info.get({k!r}, 0.0))" for k in keys) or "0.0"
+    treads = " + ".join(f"info.get({k!r}, like)" for k in keys) or "like"
+
+    def _edit(*, current_reward_path, new_iter_id, **_kw):
+        src = Path(current_reward_path).read_text(encoding="utf-8")
+        for fn, body in (
+            (f"{MODE_FN_PREFIX}launch(state, action, next_state, info)",
+             f"    del state, action, next_state\n"
+             f"    v = {reads}\n    return v, {{'takeoff': v}}\n"),
+            (f"{MODE_FN_PREFIX}launch_batched(state, action, next_state, info, like)",
+             f"    del state, action, next_state\n"
+             f"    v = like + ({treads})\n    return v, {{'takeoff': v}}\n"),
+        ):
+            head = f"def {fn}:"
+            i = src.index(head)
+            j = src.index("\ndef ", i)
+            src = src[:i] + head + "\n" + body + src[j:]
+        dest = Path(current_reward_path).parent / f"{new_iter_id}.py"
+        dest.write_text(src, encoding="utf-8")
+        return dest
+
+    monkeypatch.setattr("sculptor.edit.apply_prompt_edit", _edit)
+
+
+def test_a_mode_reading_an_info_key_the_env_never_sends_is_rejected(
+        tmp_path, monkeypatch):
+    """The failure no other probe can see.
+
+    `info.get(key, 0.0)` on a key the env does not publish imports fine, runs
+    fine, validates fine — and pays a constant for the whole of training. That
+    is the exact shape of a gameable reward, so it is a rejection."""
+    root = tmp_path / "refs"
+    _write_composite(root)
+    out = tmp_path / "v0.py"
+    _run(monkeypatch, root, ["modes", "scaffold", "--clip-id",
+                             "novel-jump-kick--g1", "--out", str(out)])
+    project = tmp_path / "proj"
+    _fake_adapter(monkeypatch, project)
+    _author_reading(monkeypatch, ["base_height", "toe_pressure_left"])
+
+    r = _run(monkeypatch, root, [
+        "modes", "author", "--clip-id", "novel-jump-kick--g1",
+        "--mode", "launch", "--file", str(out), "--project", str(project)])
+    assert r.exit_code == 1
+    assert "toe_pressure_left" in r.output
+    assert "base_height" in r.output, "the real key is listed as available"
+    assert "constant" in r.output
+
+
+def test_a_mode_reading_only_declared_keys_passes_the_key_gate(
+        tmp_path, monkeypatch):
+    """The gate has to stay quiet on the generated backbone, which reads
+    `base_height_delta`/`base_height` itself — a false positive here would
+    make every authored mode unauthorable."""
+    root = tmp_path / "refs"
+    _write_composite(root)
+    out = tmp_path / "v0.py"
+    _run(monkeypatch, root, ["modes", "scaffold", "--clip-id",
+                             "novel-jump-kick--g1", "--out", str(out)])
+    project = tmp_path / "proj"
+    _fake_adapter(monkeypatch, project)
+    _author_reading(monkeypatch, ["base_height", "episode_length"])
+
+    r = _run(monkeypatch, root, [
+        "modes", "author", "--clip-id", "novel-jump-kick--g1",
+        "--mode", "launch", "--file", str(out), "--project", str(project)])
+    assert r.exit_code == 0, r.output
+    assert "1/3 modes authored" in r.output
+
+
+def test_a_model_that_edits_nothing_is_reported_rather_than_accepted(
+        tmp_path, monkeypatch):
+    """A silent no-op is worse than a rejection: the next call would move on to
+    the following mode, leaving this one an unpaid stub."""
+    root = tmp_path / "refs"
+    _write_composite(root)
+    out = tmp_path / "v0.py"
+    _run(monkeypatch, root, ["modes", "scaffold", "--clip-id",
+                             "novel-jump-kick--g1", "--out", str(out)])
+    project = tmp_path / "proj"
+    _fake_adapter(monkeypatch, project)
+
+    def _no_op(*, current_reward_path, new_iter_id, **_kw):
+        dest = Path(current_reward_path).parent / f"{new_iter_id}.py"
+        dest.write_text(Path(current_reward_path).read_text(), encoding="utf-8")
+        return dest
+
+    monkeypatch.setattr("sculptor.edit.apply_prompt_edit", _no_op)
+    r = _run(monkeypatch, root, [
+        "modes", "author", "--clip-id", "novel-jump-kick--g1",
+        "--mode", "launch", "--file", str(out), "--project", str(project)])
+    assert r.exit_code == 1
+    assert "unauthored stub" in r.output
 
 
 def test_the_authored_output_name_chains_across_modes():

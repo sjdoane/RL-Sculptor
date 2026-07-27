@@ -151,7 +151,8 @@ def _stub_body_batched(mode: Mode) -> str:
     )
 
 
-def _tracking_block(clip: Mapping[str, Any], n_phase: int) -> tuple[str, str, str]:
+def _tracking_block(clip: Mapping[str, Any], n_phase: int,
+                    placeholder: bool = False) -> tuple[str, str, str]:
     """`(constants, scalar_fns, batched_fns)` for the reference-tracking
     backbone, or three empty strings when `clip` is None.
 
@@ -166,6 +167,10 @@ def _tracking_block(clip: Mapping[str, Any], n_phase: int) -> tuple[str, str, st
     boundary would be a different (and arguably better) design, but it would
     also mean the backbone is no longer the thing that has been measured, so
     it is left for after a per-mode clip certifies.
+
+    `placeholder=True` emits the same code with the phase tables replaced by
+    `np.zeros(...)` — see `authoring_twin_source` for why that exists and why
+    the fake numbers are harmless.
     """
     import numpy as np
 
@@ -202,12 +207,31 @@ def _tracking_block(clip: Mapping[str, Any], n_phase: int) -> tuple[str, str, st
             f".reshape(N_PHASE, 3)")
         orientation_weight = ORIENTATION_ERR_WEIGHT
 
+    joint_literal = (f"np.asarray({_format_array_literal(joint_pos)}, "
+                     f"dtype=np.float64).reshape(N_PHASE, N_JOINTS)")
+    root_literal = (f"np.asarray({_format_array_literal(root_z)}, "
+                    f"dtype=np.float64)")
+    banner = ("Paid in EVERY mode. The automaton decides which TASK terms "
+              "apply; it does\n# not change what the robot is supposed to be "
+              "tracking, so the backbone is\n# mode-independent by "
+              "construction. Same formula as `sculptor.refs.track`.")
+    if placeholder:
+        joint_literal = "np.zeros((N_PHASE, N_JOINTS), dtype=np.float64)"
+        root_literal = "np.zeros(N_PHASE, dtype=np.float64)"
+        if quat is not None:
+            gravity_literal = (
+                "np.tile(np.array([0.0, 0.0, -1.0], dtype=np.float64), "
+                "(N_PHASE, 1))")
+        banner = ("PLACEHOLDER TARGETS — this module is an authoring "
+                  "scaffold, not a\n# trainable reward. The real reference "
+                  "tables live in the module these\n# authored bodies are "
+                  "grafted into; only the mode functions are copied\n# "
+                  "across, so these values are never used to train anything.")
+
     constants = f'''import numpy as np
 
 # ── reference-tracking backbone ────────────────────────────────────────
-# Paid in EVERY mode. The automaton decides which TASK terms apply; it does
-# not change what the robot is supposed to be tracking, so the backbone is
-# mode-independent by construction. Same formula as `sculptor.refs.track`.
+# {banner}
 JOINT_NAMES = {joint_names!r}
 N_JOINTS = {len(joint_names)}
 N_PHASE = {n_phase}
@@ -218,8 +242,8 @@ ROOT_ERR_WEIGHT = {ROOT_ERR_WEIGHT!r}
 # no-op rather than a silently-wrong upright target.
 ORIENTATION_ERR_WEIGHT = {orientation_weight!r}
 
-TARGET_JOINT_POS = np.asarray({_format_array_literal(joint_pos)}, dtype=np.float64).reshape(N_PHASE, N_JOINTS)
-TARGET_ROOT_Z = np.asarray({_format_array_literal(root_z)}, dtype=np.float64)
+TARGET_JOINT_POS = {joint_literal}
+TARGET_ROOT_Z = {root_literal}
 TARGET_GRAVITY = {gravity_literal}
 '''
 
@@ -349,6 +373,7 @@ def generate_mode_reward_scaffold(
     clip_id: str = "",
     clip: Optional[Mapping[str, Any]] = None,
     n_phase: int = 32,
+    placeholder_targets: bool = False,
 ) -> str:
     """Emit a reward module whose mode gating is correct by construction.
 
@@ -408,7 +433,8 @@ def generate_mode_reward_scaffold(
 
     has_track = clip is not None
     track_const, track_scalar, track_batched = (
-        _tracking_block(clip, int(n_phase)) if has_track else ("", "", ""))
+        _tracking_block(clip, int(n_phase), bool(placeholder_targets))
+        if has_track else ("", "", ""))
     # The calls are spliced rather than always emitted-and-zeroed: a stubs-only
     # scaffold must not require `qpos` in the contract, since it does not read
     # the state at all.
@@ -633,21 +659,225 @@ def compute_reward_batched(state, action, next_state, info):
 
 
 def _fn_span(source: str, fn_name: str) -> Optional[tuple[int, int]]:
-    """`(start, end)` of `fn_name`'s whole `def` block, or None if absent."""
-    m = re.search(
-        rf"^def {re.escape(fn_name)}\(.*?\):\n.*?"
-        rf"(?=\n\ndef |\n\n_MODE_FNS|\Z)",
-        source, re.M | re.S)
-    return (m.start(), m.end()) if m else None
+    """`(start, end)` character span of `fn_name`'s whole `def` block.
+
+    Parsed rather than pattern-matched. The graft is load-bearing — it is how
+    an authored mode reaches the trainable module — and a regex has to guess
+    where a function ends from blank lines, which is a property of whatever
+    formatting the model happened to emit. `ast` knows.
+
+    Falls back to a regex only when the source does not parse, so a caller
+    inspecting a half-written file still gets an answer instead of an
+    exception.
+    """
+    import ast
+
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        m = re.search(
+            rf"^def {re.escape(fn_name)}\(.*?\):\n.*?"
+            rf"(?=\n+def |\n+_MODE_FNS|\Z)",
+            source, re.M | re.S)
+        return (m.start(), m.end()) if m else None
+
+    lines = source.splitlines(keepends=True)
+    offsets = [0]
+    for line in lines:
+        offsets.append(offsets[-1] + len(line))
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef) and node.name == fn_name:
+            # `lineno` is 1-based and excludes decorators, which the generated
+            # module never uses; `end_lineno` is inclusive.
+            return offsets[node.lineno - 1], offsets[node.end_lineno]
+    return None
+
+
+def _module_bindings(source: str) -> dict[str, tuple[int, int]]:
+    """Module-level name -> character span of the statement that binds it.
+
+    Only top-level statements count: a name bound inside a function is that
+    function's business, not the module's.
+    """
+    import ast
+
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return {}
+    lines = source.splitlines(keepends=True)
+    offsets = [0]
+    for line in lines:
+        offsets.append(offsets[-1] + len(line))
+    out: dict[str, tuple[int, int]] = {}
+    for node in tree.body:
+        span = (offsets[node.lineno - 1], offsets[node.end_lineno])
+        names: list[str] = []
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names = [node.name]
+        elif isinstance(node, ast.Assign):
+            names = [t.id for t in node.targets if isinstance(t, ast.Name)]
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            names = [node.target.id]
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            names = [a.asname or a.name.split(".")[0] for a in node.names]
+        for name in names:
+            out.setdefault(name, span)
+    return out
+
+
+def _free_names(source: str, fn_name: str) -> set[str]:
+    """Names `fn_name` reads that it does not itself bind.
+
+    Approximate on purpose — a name that is both a parameter and a global read
+    would be missed, which the generated code never does. What it has to catch
+    is the case that matters: a call to a helper defined elsewhere.
+    """
+    import ast
+
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return set()
+    fn = next((n for n in tree.body
+               if isinstance(n, ast.FunctionDef) and n.name == fn_name), None)
+    if fn is None:
+        return set()
+    bound = {a.arg for a in fn.args.args}
+    bound |= {a.arg for a in fn.args.kwonlyargs}
+    read: set[str] = set()
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Name):
+            (read if isinstance(node.ctx, ast.Load) else bound).add(node.id)
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node is not fn:
+            bound.add(node.name)
+        elif isinstance(node, ast.alias):
+            bound.add(node.asname or node.name.split(".")[0])
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            bound.add(node.name)
+    return read - bound
+
+
+def _carry_helpers(base: str, authored: str, fn_names: Sequence[str]) -> str:
+    """Append helpers the authored bodies call but `base` does not define.
+
+    A model asked for one function often writes two — the first real authoring
+    run came back with the mode calling an `_info_b` it had defined at module
+    level, which the graft dropped, and the module then failed the batched
+    probe with `NameError: name '_info_b' is not defined`. Prohibiting helpers
+    in the prompt would be one answer; carrying them is the better one, since
+    a helper shared by the scalar and batched halves is exactly how you keep
+    the two from drifting.
+
+    Only names that are (a) read by a grafted body, (b) undefined in `base`
+    and (c) defined at module level in `authored` are carried, so nothing here
+    can overwrite the dispatch, the windows or another mode. Transitive: a
+    helper that calls a helper brings it along.
+    """
+    import builtins
+
+    donor = _module_bindings(authored)
+    have = set(_module_bindings(base)) | set(dir(builtins))
+    wanted: list[str] = []
+    queue = [n for fn in fn_names for n in sorted(_free_names(base, fn))]
+    while queue:
+        name = queue.pop(0)
+        if name in have or name in wanted or name not in donor:
+            continue
+        wanted.append(name)
+        queue.extend(sorted(_free_names(authored, name)))
+    if not wanted:
+        return base
+    # Emit in the donor's own order so a helper that references another still
+    # reads top-down, and so the result is stable across runs.
+    wanted.sort(key=lambda n: donor[n][0])
+    blocks = [authored[donor[n][0]:donor[n][1]].rstrip("\n") for n in wanted]
+    return (base.rstrip("\n") + "\n\n\n"
+            + "\n\n\n".join(blocks) + "\n")
 
 
 def _body_after(source: str, fn_name: str) -> Optional[str]:
-    """Source of `fn_name`'s body, or None when it is absent."""
-    m = re.search(
-        rf"^def {re.escape(fn_name)}\(.*?\):\n(.*?)"
-        rf"(?=\n\ndef |\n\n_MODE_FNS|\Z)",
-        source, re.M | re.S)
-    return m.group(1) if m else None
+    """Source of `fn_name`'s body (everything after the `def` line), or None."""
+    span = _fn_span(source, fn_name)
+    if span is None:
+        return None
+    block = source[span[0]:span[1]]
+    head, sep, body = block.partition(":\n")
+    return body if sep else None
+
+
+def _strip_prose(source: str, keep_prefix: str = MODE_FN_PREFIX) -> str:
+    """Drop comments and docstrings, except from functions named `keep_prefix*`.
+
+    Only used on the authoring twin. `apply_prompt_edit` rewrites the whole
+    module, so every byte of prose in it is prose the model has to reproduce
+    out of a bounded output budget — and the first two real runs both died on
+    that budget. The per-mode docstrings are kept because they are the part the
+    model is being asked to act on; the explanations of how the dispatch works
+    are for humans reading the real module, and the real module still has them.
+
+    Returns `source` unchanged if it does not parse, so this can never be the
+    thing that breaks an authoring run.
+    """
+    import ast
+
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return source
+
+    if (tree.body and isinstance(tree.body[0], ast.Expr)
+            and isinstance(tree.body[0].value, ast.Constant)
+            and isinstance(tree.body[0].value.value, str)):
+        tree.body.pop(0)
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FunctionDef) or node.name.startswith(keep_prefix):
+            continue
+        body = node.body
+        if (body and isinstance(body[0], ast.Expr)
+                and isinstance(body[0].value, ast.Constant)
+                and isinstance(body[0].value.value, str)):
+            # A function whose only statement is its docstring would become an
+            # empty body, which is a SyntaxError.
+            node.body = body[1:] if len(body) > 1 else [ast.Pass()]
+    return ast.unparse(ast.fix_missing_locations(tree)) + "\n"
+
+
+def authoring_twin_source(
+    graph: ModeGraph,
+    *,
+    clip: Optional[Mapping[str, Any]] = None,
+    behavior_goal: str = "",
+    clip_id: str = "",
+    n_phase: int = 4,
+) -> str:
+    """A small, literal-free stand-in to run `apply_prompt_edit` against.
+
+    Two measured problems make authoring against the real module unworkable,
+    and this fixes both:
+
+    1. `apply_prompt_edit` rewrites the WHOLE module. A backbone-carrying
+       scaffold is ~27 KB of which most is a 32x29 table of float literals, and
+       the model expands what it rewrites — the first real run truncated inside
+       the table (`SyntaxError: '[' was never closed`). The tables here are
+       `np.zeros(...)`, so there is nothing to mangle and nothing to spend
+       output tokens on.
+    2. `sculptor.edit` rejects a reward that returns the same value across its
+       state probes — rightly, since a constant reward gives PPO no gradient.
+       But a per-mode module is *deliberately* zero outside the active mode, so
+       a stubs-only twin reads as constant-0 and is rejected for a property it
+       is supposed to have. The placeholder backbone is state-dependent (it
+       reads qpos, height and gravity), so the twin passes that gate on the
+       same grounds the real module does.
+
+    The fake numbers are harmless because only `_mode_*` functions are grafted
+    back (`graft_mode_bodies`); no line written here reaches training. Pass the
+    real `clip` so the twin has the right `N_JOINTS` and duration — an authored
+    body that indexes joints must see the real joint count.
+    """
+    return _strip_prose(generate_mode_reward_scaffold(
+        graph, behavior_goal=behavior_goal, clip_id=clip_id, clip=clip,
+        n_phase=n_phase, placeholder_targets=True))
 
 
 def graft_mode_bodies(base: str, authored: str,
@@ -671,6 +901,7 @@ def graft_mode_bodies(base: str, authored: str,
     Raises `ModeError` when a named mode is missing from either side.
     """
     out = base
+    grafted: list[str] = []
     for name in mode_names:
         ident = mode_ident(name)
         for fn in (MODE_FN_PREFIX + ident,
@@ -686,6 +917,71 @@ def graft_mode_bodies(base: str, authored: str,
             out = (out[:dst_span[0]]
                    + authored[src_span[0]:src_span[1]]
                    + out[dst_span[1]:])
+            grafted.append(fn)
+    return _carry_helpers(out, authored, grafted)
+
+
+def _component_names(source: str, fn_name: str) -> list[str]:
+    """String keys of the dict literals inside `fn_name` — its components."""
+    import ast
+
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return []
+    fn = next((n for n in tree.body
+               if isinstance(n, ast.FunctionDef) and n.name == fn_name), None)
+    if fn is None:
+        return []
+    names: list[str] = []
+    for node in ast.walk(fn):
+        if isinstance(node, ast.Dict):
+            for k in node.keys:
+                if isinstance(k, ast.Constant) and isinstance(k.value, str):
+                    if k.value not in names:
+                        names.append(k.value)
+    return names
+
+
+def summarize_authored_modes(twin: str, authored: str,
+                             mode_names: Sequence[str]) -> str:
+    """Note what the already-authored modes pay, without their bodies.
+
+    Authoring is one mode per call, so by the third call the module carries two
+    finished modes — and `apply_prompt_edit` makes the model reproduce all of
+    it. Grafting the real neighbours in was the first attempt at telling the
+    model what they own; it put the twin back over the output budget and both
+    attempts at mode 'approach' came back truncated
+    (`'(' was never closed`).
+
+    What the model actually needs from a neighbour is which terms are already
+    paid, so it does not pay them twice — not how they are computed. That is a
+    line of component names. The summary never leaves the twin: the graft back
+    into the real module copies one mode, this one.
+    """
+    out = twin
+    for name in mode_names:
+        ident = mode_ident(name)
+        scalar = MODE_FN_PREFIX + ident
+        batched = scalar + BATCHED_FN_SUFFIX
+        comps = _component_names(authored, scalar) or ["(unnamed)"]
+        listed = ", ".join(comps)
+        pairs = ", ".join(f"{c!r}: 0.0" for c in comps if c != "(unnamed)")
+        for fn, sig, ret in (
+            (scalar, "(state, action, next_state, info)",
+             f"    return 0.0, {{{pairs}}}\n"),
+            (batched, "(state, action, next_state, info, like)",
+             f"    return like, {{{', '.join(f'{c!r}: like' for c in comps if c != '(unnamed)')}}}\n"),
+        ):
+            span = _fn_span(out, fn)
+            if span is None:
+                continue
+            block = (f"def {fn}{sig}:\n"
+                     f"    \"\"\"ALREADY AUTHORED — pays {listed}. Shown so you do "
+                     f"not pay these again; do not edit, it is discarded.\"\"\"\n"
+                     f"    del state, action, next_state, info\n"
+                     f"{ret}")
+            out = out[:span[0]] + block + out[span[1]:]
     return out
 
 
@@ -822,6 +1118,9 @@ def _render_authoring_prompt(graph: ModeGraph, mode_name: str,
         "against this window's slice of the rollout.\n"
         "- Leave `compute_reward`, `compute_reward_batched`, `MODE_WINDOWS_S`, "
         "`MODE_ORDER`, `_mode_masks` and the other modes untouched.\n"
+        f"- A shared helper is fine — define it at module level, name it "
+        f"`_{ident}_<what>`, and both halves may call it. Anything you add "
+        "elsewhere is discarded.\n"
         "\nBatched half — signature `(state, action, next_state, info, like)`:\n"
         "- `like` is zeros of shape (num_envs,); build terms from it "
         "(`torch.zeros_like(like)`, `torch.full_like(like, c)`) so device and "
@@ -892,10 +1191,12 @@ __all__ = [
     "MODE_COMPONENT_PREFIX",
     "MODE_FN_PREFIX",
     "authored_modes",
+    "authoring_twin_source",
     "generate_mode_reward_scaffold",
     "graft_mode_bodies",
     "mode_authoring_prompt",
     "mode_ident",
     "mode_windows_s",
+    "summarize_authored_modes",
     "validate_mode_reward_source",
 ]

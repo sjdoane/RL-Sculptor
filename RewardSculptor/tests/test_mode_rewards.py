@@ -13,6 +13,7 @@ have sailed past.
 from __future__ import annotations
 
 import importlib.util
+import re
 
 import numpy as np
 import pytest
@@ -23,6 +24,7 @@ from sculptor.mode_rewards import (
     MODE_COMPONENT_PREFIX,
     MODE_FN_PREFIX,
     authored_modes,
+    authoring_twin_source,
     generate_mode_reward_scaffold,
     graft_mode_bodies,
     mode_authoring_prompt,
@@ -788,6 +790,79 @@ def test_a_grafted_module_still_clears_the_pre_flight_probes(tmp_path):
         expected_info_keys=["episode_length", "step_dt", "base_height"])
     _call_compute_reward(mod, contract)
     _call_compute_reward_batched(mod, contract)
+
+
+def test_the_authoring_twin_is_small_and_carries_no_tables(tmp_path):
+    """Both real authoring runs died on the model's output budget: the first
+    truncated inside the 32x29 float table (`SyntaxError: '[' was never
+    closed`), the second only after the tables were gone. `apply_prompt_edit`
+    rewrites the WHOLE module, so every byte in it is a byte the model has to
+    reproduce."""
+    clip = _tracking_clip(j=29)          # G1's real actuated-joint count
+    g = _graph(fps=120.0, span=80)
+    full = generate_mode_reward_scaffold(g, clip=clip)
+    twin = authoring_twin_source(g, clip=clip)
+
+    assert len(twin) < len(full) / 2
+    assert "np.zeros((N_PHASE, N_JOINTS)" in twin
+    assert "TARGET_JOINT_POS" in twin, "the shape stays; only the numbers go"
+    assert validate_mode_reward_source(twin, g) == []
+    # The per-mode docstrings survive — they are the part being acted on.
+    assert authored_modes(twin) == {
+        "approach": False, "launch": False, "land": False}
+    # The real joint count and duration do, too: a body that indexes joints
+    # must see the same shape it will see after grafting.
+    mod = _load(twin, tmp_path, name="tw1")
+    assert mod.N_JOINTS == 29
+    assert mod.REFERENCE_DURATION_S == pytest.approx(2.0)
+
+
+def test_the_twin_is_state_dependent_so_edits_own_gate_accepts_it(tmp_path):
+    """The second real run was rejected with `reward is state-independent:
+    compute_reward returned the IDENTICAL total (0.0)`. That gate is right —
+    a constant reward gives PPO no gradient — but a per-mode module is
+    DELIBERATELY zero outside the active mode, so a stubs-only twin reads as
+    constant-0 and is rejected for a property it is supposed to have. The
+    placeholder backbone reads qpos, height and gravity, so the twin clears the
+    gate on the same grounds the real module does."""
+    mod = _load(authoring_twin_source(_graph(fps=120.0, span=80),
+                                      clip=_tracking_clip()),
+                tmp_path, name="tw2")
+    info = {"episode_length": 20, "step_dt": 0.02, "base_height": 0.70}
+    a, _ = mod.compute_reward(
+        {}, None, {"qpos": np.linspace(-0.3, 0.3, mod.N_JOINTS),
+                   "projected_gravity_b": np.array([0., 0., -1.])}, info)
+    b, _ = mod.compute_reward(
+        {}, None, {"qpos": np.linspace(-0.9, 0.9, mod.N_JOINTS),
+                   "projected_gravity_b": np.array([0.2, 0., -0.98])},
+        {**info, "base_height": 0.90})
+    assert a != b, "a stubs-only twin would return 0.0 for both"
+
+
+def test_a_twin_without_a_clip_still_has_no_backbone(tmp_path):
+    """`clip=None` is the stubs-only case, which stays available — it is what
+    scalar-only adapters and the `--no-tracking` path want."""
+    twin = authoring_twin_source(_graph(), clip=None)
+    assert "TARGET_JOINT_POS" not in twin
+    assert validate_mode_reward_source(twin, _graph()) == []
+
+
+def test_function_spans_are_parsed_rather_than_pattern_matched():
+    """The graft is how an authored mode reaches the trainable module, and a
+    regex has to guess where a function ends from blank lines — a property of
+    whatever formatting the model happened to emit. Two blank lines, one, or
+    none must all graft the same."""
+    g = _graph()
+    base = generate_mode_reward_scaffold(g)
+    authored = _author(base, "launch")
+    tight = re.sub(r"\n\n+(?=def )", "\n", authored)
+    assert "\n\ndef " not in tight, "the fixture must actually be tight"
+
+    loose = graft_mode_bodies(base, authored, ["launch"])
+    packed = graft_mode_bodies(base, tight, ["launch"])
+    assert authored_modes(loose)["launch"] is True
+    assert authored_modes(packed)["launch"] is True
+    assert validate_mode_reward_source(packed, g) == []
 
 
 def test_a_fresh_scaffold_passes_edits_real_pre_flight_probe(tmp_path):

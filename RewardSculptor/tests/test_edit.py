@@ -839,10 +839,11 @@ def test_apply_prompt_edit_threads_kg_arxiv_ids_into_paper_refs(monkeypatch, tmp
 
     def fake_apply_edits(
         current_reward_path, diagnosis, new_iter_id, reward_contract,
-        *, kg_store=None, client=None, on_event=None,
+        *, kg_store=None, client=None, on_event=None, max_tokens=None,
     ):
         captured["paper_refs"] = list(diagnosis.proposed_edits[0].paper_refs)
         captured["lit_context_count"] = len(diagnosis.literature_context)
+        captured["max_tokens"] = max_tokens
         return tmp_path / "v1.py"
 
     monkeypatch.setattr(edit_mod, "apply_edits", fake_apply_edits)
@@ -1717,3 +1718,55 @@ def test_apply_prompt_edit_injects_reference_signature_when_stage_dir_has_file(
     user_msg = client.messages.calls[0]["messages"][0]["content"]
     assert "# REFERENCE MOTION SIGNATURE" in user_msg
     assert "g1_jump_ref_01" in user_msg
+
+
+# ── token ceiling ─────────────────────────────────────────────────────────
+class _StoppedClient(_StubClient):
+    """`_StubClient` whose response carries a `stop_reason`."""
+
+    def __init__(self, text: str, stop_reason: str):
+        super().__init__(text)
+        inner = self.messages.create
+
+        def create(**kw):
+            resp = inner(**kw)
+            resp.stop_reason = stop_reason
+            return resp
+
+        self.messages.create = create
+
+
+def test_a_truncated_response_says_so_instead_of_a_syntax_error():
+    """Every real `sculpt modes author` run had attempt 1 come back as
+    `SyntaxError: '(' was never closed` — a complete module cut in half. The
+    stop reason says exactly that, and the message is what the retry sees."""
+    from sculptor.edit import _call_llm
+
+    client = _StoppedClient("def compute_reward(", "max_tokens")
+    with pytest.raises(EditValidationError) as e:
+        _call_llm(client, "sys", "user")
+    assert "cut off" in str(e.value)
+    assert "16000-token ceiling" in str(e.value)
+    assert "incomplete, not wrong" in str(e.value)
+
+
+def test_a_complete_response_at_the_ceiling_is_not_flagged():
+    from sculptor.edit import _call_llm
+
+    client = _StoppedClient("x = 1\n", "end_turn")
+    assert _call_llm(client, "sys", "user") == "x = 1\n"
+
+
+def test_max_tokens_overrides_the_default_without_changing_it():
+    """`modes author` needs a bigger ceiling than a training-mission edit,
+    whose 240s HTTP timeout is calibrated against the 16K default."""
+    from sculptor.edit import MAX_TOKENS, _call_llm
+
+    client = _StubClient("x = 1\n")
+    _call_llm(client, "sys", "user")
+    assert client.messages.calls[0]["max_tokens"] == MAX_TOKENS
+
+    client = _StubClient("x = 1\n")
+    _call_llm(client, "sys", "user", max_tokens=32000)
+    assert client.messages.calls[0]["max_tokens"] == 32000
+    assert MAX_TOKENS == 16000, "the shared default is unchanged"

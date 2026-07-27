@@ -715,11 +715,7 @@ declaring no info keys, and with the backbone present.
 
 ### Still open in this lane
 
-1. **No end-to-end LLM authoring pass has run.** `sculpt modes author` is wired
-   through `apply_prompt_edit` and every guard around it is tested
-   (stale-scaffold refusal, unknown mode, missing contract, silent-no-op
-   detection), but no mode has actually been authored by a model yet. That needs
-   a project whose adapter supplies the contract; the GPU was busy with recert5.
+1. ~~**No end-to-end LLM authoring pass has run.**~~ **Closed — see §13.**
 2. **The backbone duplicates `refs/track.py`'s emitter.** Both build the same
    phase tables and the same two-Gaussian formula. `mode_rewards` imports the
    pure helpers (`downsample_phase_targets`, `projected_gravity_from_quat`,
@@ -731,3 +727,144 @@ declaring no info keys, and with the backbone present.
    independently. `generate_mode_reward_scaffold` takes a `goal_by_mode` map and
    `mode_authoring_prompt` takes `mode_goal` for the same reason. A `goal_text`
    field on `Mode` would delete both.
+
+### Found while doing this — a latent bug in `refs/track.py`
+
+**The Tier-D tracking reward's SCALAR `compute_reward` would crash on the real
+mjlab contract.** It slices `qpos[7:7+N_JOINTS]` assuming a full MuJoCo vector
+(7 free-joint DOFs + N actuated), but `MjlabAdapter.reward_contract()` for
+`Mjlab-Velocity-Flat-Unitree-G1` declares **`qpos: (29,)`** — actuated joints
+only. Feeding that layout in raises `qpos too short for 29 tracked joints`.
+
+Found the hard way: the identical slice in my backbone was rejected by
+`edit.py`'s scalar pre-flight probe during a real `sculpt modes author` run,
+*after* the model had already been called. `mode_rewards` now takes the trailing
+`N_JOINTS` (correct for both layouts, and the same slice the batched path uses)
+and prefers `info["base_height_delta"]` for root height, falling back to
+`qpos[2]` only when qpos really is a full MuJoCo vector.
+
+`track.py` is not currently *broken* by this, for two reasons that are both
+accidents: `build_track_project` writes `rewards/current.py` directly rather
+than through `apply_edits`, so nothing ever probes it; and the mjlab runner only
+ever calls `compute_reward_batched`. So the scalar half of the Tier-D reward is
+effectively dead code that would raise if anything exercised it — including any
+future replay-based scorer. **Not fixed here on purpose**: a ~6.5 h `sculpt refs
+track` certification had `track.py` loaded. Fix it together with the emitter
+dedup in #2 above.
+
+---
+
+## 13. Progress update 2026-07-27 — the authoring loop closes
+
+All three modes of `novel-running-jump-kick--g1` are now authored by a model
+through `sculpt modes author`, and the finished module clears every gate. This
+was §12's #1 and it is closed. Four things had to be fixed to get there, each
+found by running the thing rather than by reading it.
+
+### 1. The twin grew as modes got authored (and blew the output budget)
+
+Authoring is one mode per call and `apply_prompt_edit` regenerates the WHOLE
+module, so the first design carried each finished mode's body into the next
+call's twin — "so the model sees the real neighbours". By mode 3 that put the
+twin back at ~17 KB and **both attempts came back truncated**.
+
+What a model needs from a neighbour is which terms are already paid, not how.
+`summarize_authored_modes` replaces a finished neighbour's body with one line
+of component names. Twin size across the three calls: 10.9 KB → 11.4 KB →
+11.4 KB, flat. The summary never leaves the twin.
+
+### 2. A model asked for one function writes two
+
+The first successful edit called an `_info_b` helper it had defined at module
+level; `graft_mode_bodies` copied only the two mode functions, and the module
+failed the batched probe with `NameError: name '_info_b' is not defined`.
+
+`_carry_helpers` now transplants module-level definitions that the grafted
+bodies read and the base does not define — transitively, so a helper calling a
+helper comes along. It is scoped by construction: a name already defined in the
+base is never overwritten, so the dispatch, the windows and the other modes
+still cannot be touched. The prompt now also says a shared helper is fine and
+names the convention, which is how the final run produced `_launch_scalar`,
+`_launch_tensor`, `_launch_ramp01`, `_launch_ramp01_batched`.
+
+### 3. Attempt 1 truncated on EVERY run — it was the token ceiling
+
+Every real authoring call failed its first attempt with a truncation-shaped
+`SyntaxError` (`'(' was never closed`, `unterminated triple-quoted string`).
+`edit.MAX_TOKENS = 16000` shared with adaptive thinking is not enough for
+"write a single-leg-takeoff reward" *plus* carrying the module back.
+
+- `_call_llm` now takes an optional `max_tokens`, defaulting to `MAX_TOKENS`.
+  Threaded through `apply_edits` and `apply_prompt_edit`. **The shared default
+  is unchanged** — its 240 s HTTP timeout is calibrated against it for the
+  training-mission path, and that path is not what needed more room.
+- `sculpt modes author` passes 32000. The final mode authored on attempt 1
+  with no retry.
+- `_call_llm` also now checks `stop_reason == "max_tokens"` and raises
+  `EditValidationError` saying the response was **cut off, not wrong**. Raised
+  inside the repair-retry loop's `try`, so the next attempt is told to be
+  concise instead of being handed a baffling parse error.
+
+### 4. New gate: a mode may not read an `info` key the env never publishes
+
+The first authored mode reached for ten info keys through a helper doing
+`info.get(key, 0.0)`. All ten happened to be real. Had one not been, that term
+would have paid a constant 0.0 for the whole of training while the module
+imported, ran, and passed every existing probe — which is the exact shape of a
+gameable reward.
+
+`_probe_info_keys` runs the authored mode's two halves against a recording
+`info` dict built from the contract and rejects any key not in
+`expected_info_keys`. Recorded at runtime, so a key reached through a helper, a
+loop or an f-string is caught the same as a literal. This is an ADDITIVE gate;
+nothing was relaxed.
+
+### The result
+
+`sculpt modes author` x3 on `novel-running-jump-kick--g1`:
+
+```
+approach  0.00–1.25 s   frames [0,150)    from 50002_running_on_spot
+launch    1.25–2.50 s   frames [150,300)  from 50002_one_leg_jump
+strike    2.50–3.70 s   frames [300,444)  from 0016_kicking1
+```
+
+Batched dispatch walked across wall clock, `active_mode_index` and each mode's
+component:
+
+```
+t (s)          0.20    0.80    1.40    2.00    2.60    3.50
+active index   0       0       1       1       2       2
+mode_approach  2.197   2.197   0       0       0       0
+mode_launch    0       0       2.700   2.700   0       0
+mode_strike    0       0       0       0       0.387   1.210
+```
+
+Each mode pays only inside its own window; the index steps at 1.25 s and 2.5 s,
+which is seam frames 150 and 300 at 120 fps. Totals add the tracking backbone.
+
+What the model wrote for `launch`, unedited: `run_in_speed` ramped on
+`base_horizontal_speed`, `single_leg_support` paying most for exactly one foot
+in contact and less for flight, `takeoff_rise` on `base_height_delta`,
+`trail_leg_swing` as the max over the two legs of (height x swing speed) gated
+on that foot being airborne, an `action_rate` penalty, and an alive bonus —
+every term multiplied by `(1 - fallen)`. Scalar and batched halves compute the
+same quantity through shared helpers. That is a genuinely reasonable
+single-leg-takeoff reward and none of it is in the scaffold.
+
+### Verification
+
+- `2539 passed, 1 skipped` (jax) — up from 2526.
+- `tests/test_modes_cli.py` 22 tests, including the whole authoring machinery
+  with the model call stubbed: twin construction, graft, helper carry,
+  re-probe, the info-key gate firing and NOT false-positiving on the backbone,
+  and twin size staying flat across all three modes.
+- `tests/test_edit.py` +3 for the token ceiling, asserting `MAX_TOKENS` is
+  still 16000.
+- Both gates re-run against the real `v3.py`: clean for all three modes.
+
+### Still open
+
+The `sculpt modes author` output is a reward module, not a trained policy — it
+has not been through a training run yet. That is the natural next step and it
+needs the GPU, which recert5 still has.
