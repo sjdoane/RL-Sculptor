@@ -14,6 +14,7 @@ import hashlib
 import json
 import io
 import math
+import os
 import re
 import struct
 import tempfile
@@ -1881,6 +1882,85 @@ def _runtime_robot_hash(env_cfg: Any) -> str | None:
         return None
 
 
+#: Per-world constraint/contact allocation for a scene an authored world has
+#: replaced. mjlab sizes these per task against that task's OWN scene — the G1
+#: flat velocity config pins ``njmax=300`` for a bare plane and leaves
+#: ``nconmax=None``. An authored world swaps the scene out from under those
+#: constants, so they stop describing what the robot can touch.
+#:
+#: Measured on the 7-element box course (3 gap, 4 platform) at the real
+#: num_envs=1024 training config, 120 steps of random actions:
+#:
+#:   njmax   nconmax   overflow lines   peak nefc/world   peak GPU
+#:     300        64          112,130               496     ~3.5 GiB
+#:     768       256                0               625     3585 MiB
+#:    1536       512                0               532     3767 MiB
+#:    3072      1024                0               610     4289 MiB
+#:
+#: The task default overflows on ~100% of steps — not an edge case. Overflow is
+#: SILENT: mjwarp drops constraint rows, prints to stderr, and keeps stepping
+#: with wrong contact forces until observations go NaN and rsl_rl aborts. The
+#: run that found this died ~18 learning iterations in behind 197k unread
+#: stderr lines.
+#:
+#: mjwarp's own heuristic (``njmax=None``) is deliberately NOT the fallback:
+#: measured on the same scene it overflows WORSE than the pinned task default
+#: (68,974 vs 9,124 lines), so handing sizing back to the simulator is not a
+#: fix here.
+#:
+#: 1536/512 is ~2.5x the observed peak for +182 MiB over the tightest clean
+#: budget — headroom a trained policy driving real contacts can spend, at a
+#: cost that still fits an 8 GiB card.
+AUTHORED_WORLD_NJMAX = 1536
+AUTHORED_WORLD_NCONMAX = 512
+
+
+def _int_env(name: str, default: int) -> int:
+    """Read a positive int override, ignoring blank/garbage values."""
+    raw = (os.environ.get(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def _reconcile_constraint_budget(env_cfg: Any) -> tuple[str, ...]:
+    """Grow the constraint/contact buffers to fit the authored scene.
+
+    Only ever raises: a task that already asks for more than the authored-world
+    floor knows something about its own scene that this function does not, and
+    silently shrinking it would reintroduce the overflow in the other
+    direction. ``nconmax=None`` means "use mjwarp's heuristic", which measured
+    worse than the pinned default here, so None counts as unset and is raised.
+    """
+    sim_cfg = getattr(env_cfg, "sim", None)
+    if sim_cfg is None or not hasattr(sim_cfg, "njmax"):
+        return ()  # non-mjlab adapter — no such knobs
+
+    njmax_floor = _int_env("RS_WORLD_NJMAX", AUTHORED_WORLD_NJMAX)
+    nconmax_floor = _int_env("RS_WORLD_NCONMAX", AUTHORED_WORLD_NCONMAX)
+
+    notes: list[str] = []
+    for attr, floor in (("njmax", njmax_floor), ("nconmax", nconmax_floor)):
+        current = getattr(sim_cfg, attr, None)
+        if current is not None and int(current) >= floor:
+            continue
+        setattr(sim_cfg, attr, floor)
+        was = "heuristic" if current is None else str(int(current))
+        notes.append(f"{attr} {was}→{floor}")
+
+    if not notes:
+        return ()
+    return (
+        "constraint budget for authored scene: " + ", ".join(notes)
+        + " (task defaults are sized for the task's own scene; overflow drops "
+          "contact rows silently and ends in NaN observations)",
+    )
+
+
 def _reconcile_terrain_curriculum(env_cfg: Any) -> tuple[str, ...]:
     """Remove curriculum terms incompatible with the overlaid terrain.
 
@@ -2749,6 +2829,10 @@ def apply_world_selection(
         train=train,
     ))
     runtime_adjustments = (
+        # Before anything else reads the scene: the authored geometry is in
+        # place by now, and both the train and eval paths put the SAME course
+        # in front of the robot, so both need the budget raised.
+        *_reconcile_constraint_budget(env_cfg),
         *_reconcile_terrain_curriculum(env_cfg),
         *_reconcile_waypoint_course(
             env_cfg, manifest, train=train, robot=robot),

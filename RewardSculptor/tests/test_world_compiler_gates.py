@@ -988,7 +988,16 @@ def test_authored_plane_removes_only_generator_dependent_curriculum(
     assert env_cfg.scene.terrain.terrain_generator is None
     assert "terrain_levels" not in env_cfg.curriculum
     assert "command_vel" in env_cfg.curriculum
+    # The constraint budget is raised first: even this rough task's own
+    # njmax=1500 / nconmax=35 are sized for ITS scene, not for the authored
+    # course now standing in front of the robot.
     assert bundle.runtime_adjustments == (
+        (
+            "constraint budget for authored scene: njmax 1500→1536, "
+            "nconmax 35→512 (task defaults are sized for the task's own "
+            "scene; overflow drops contact rows silently and ends in NaN "
+            "observations)"
+        ),
         "curriculum:terrain_levels→removed(no live terrain generator)",
         (
             "physical scene alignment → object 'ball' → "
@@ -1071,3 +1080,86 @@ def test_resolved_evaluation_with_admission_round_trips_course():
     assert payload["course"][0]["primitive_id"] == "b__platform"
     again = stamped.with_admission({"ok": False}).to_dict()
     assert again["course"] == payload["course"]
+
+
+# ── constraint budget for authored scenes ─────────────────────────────
+def _sim_cfg(njmax, nconmax):
+    """Minimal stand-in for mjlab's SimulationCfg — only the two knobs."""
+    return SimpleNamespace(sim=SimpleNamespace(njmax=njmax, nconmax=nconmax))
+
+
+def test_authored_scene_raises_flat_plane_constraint_budget():
+    """The bug this closes: mjlab's G1 flat config pins njmax=300 for a bare
+    plane. An authored box course overflows it on ~100% of steps, mjwarp drops
+    contact rows silently, and training dies on NaN observations ~18 learning
+    iterations later."""
+    from sculptor.world.compiler import (
+        AUTHORED_WORLD_NCONMAX, AUTHORED_WORLD_NJMAX,
+        _reconcile_constraint_budget,
+    )
+
+    cfg = _sim_cfg(300, None)
+    notes = _reconcile_constraint_budget(cfg)
+
+    assert cfg.sim.njmax == AUTHORED_WORLD_NJMAX
+    assert cfg.sim.nconmax == AUTHORED_WORLD_NCONMAX
+    assert notes and "njmax 300→" in notes[0]
+    # nconmax=None is mjwarp's heuristic, which measured WORSE than the pinned
+    # default here — it must read as unset, not as "already big enough".
+    assert "nconmax heuristic→" in notes[0]
+
+
+def test_constraint_budget_never_shrinks_a_larger_task_default():
+    """A task asking for more than the floor knows something about its own
+    scene that we do not; lowering it would recreate the overflow the other
+    way round."""
+    from sculptor.world.compiler import _reconcile_constraint_budget
+
+    cfg = _sim_cfg(9000, 4000)
+    assert _reconcile_constraint_budget(cfg) == ()
+    assert (cfg.sim.njmax, cfg.sim.nconmax) == (9000, 4000)
+
+
+def test_constraint_budget_is_a_no_op_without_the_knobs():
+    """gym_sb3 and friends have no sim cfg — must not raise."""
+    from sculptor.world.compiler import _reconcile_constraint_budget
+
+    assert _reconcile_constraint_budget(SimpleNamespace()) == ()
+    assert _reconcile_constraint_budget(SimpleNamespace(sim=SimpleNamespace())) == ()
+
+
+def test_constraint_budget_honors_env_overrides(monkeypatch):
+    from sculptor.world.compiler import _reconcile_constraint_budget
+
+    monkeypatch.setenv("RS_WORLD_NJMAX", "4096")
+    monkeypatch.setenv("RS_WORLD_NCONMAX", "2048")
+    cfg = _sim_cfg(300, 64)
+    _reconcile_constraint_budget(cfg)
+    assert (cfg.sim.njmax, cfg.sim.nconmax) == (4096, 2048)
+
+
+@pytest.mark.parametrize("bad", ["", "   ", "not-a-number", "0", "-5"])
+def test_constraint_budget_ignores_garbage_overrides(monkeypatch, bad):
+    """A typo'd env var must fall back to the measured floor, not disable the
+    fix or allocate zero rows."""
+    from sculptor.world.compiler import (
+        AUTHORED_WORLD_NJMAX, _reconcile_constraint_budget,
+    )
+
+    monkeypatch.setenv("RS_WORLD_NJMAX", bad)
+    cfg = _sim_cfg(300, 64)
+    _reconcile_constraint_budget(cfg)
+    assert cfg.sim.njmax == AUTHORED_WORLD_NJMAX
+
+
+def test_constraint_budget_floor_exceeds_measured_peak():
+    """Guards the constant against a future edit that trims it below what the
+    box course actually needs. Measured peak was 625 rows/world at
+    num_envs=1024 under random actions."""
+    from sculptor.world.compiler import (
+        AUTHORED_WORLD_NCONMAX, AUTHORED_WORLD_NJMAX,
+    )
+
+    MEASURED_PEAK_NEFC = 625
+    assert AUTHORED_WORLD_NJMAX >= 2 * MEASURED_PEAK_NEFC
+    assert AUTHORED_WORLD_NCONMAX >= 256
