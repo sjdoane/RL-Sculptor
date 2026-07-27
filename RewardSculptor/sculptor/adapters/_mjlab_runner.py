@@ -2827,6 +2827,50 @@ def _configure_rollout_viewer(env_cfg: Any, args: Any) -> None:
               file=sys.stderr, flush=True)
 
 
+def _hide_untracked_authored_geometry(env: Any, env_idx: int) -> None:
+    """Make other environments' authored courses invisible in rollout video.
+
+    `max_extra_envs = 0` above stops mjlab drawing neighbouring ROBOTS, but
+    authored course geometry lives in the shared worldbody — one copy per env
+    origin, always in the model, always drawn. At training widths that fills
+    the frame with a field of identical courses and buries the one the tracked
+    robot is actually running, which reads as a broken scene.
+
+    Alpha only. `geom_rgba`/`site_rgba` are render inputs; collision geometry,
+    contacts and every observation are untouched, so the video shows the same
+    physics it always did — just the tracked environment's slice of it.
+
+    FULLY DEFENSIVE, like the viewer config: cosmetics must never kill a run.
+    """
+    try:
+        import re as _re
+
+        model = env.sim.mj_model
+        keep = f"__env_{int(env_idx):04d}"
+        hidden = 0
+        for array, count, getter in (
+            (getattr(model, "geom_rgba", None), model.ngeom, model.geom),
+            (getattr(model, "site_rgba", None), model.nsite, model.site),
+        ):
+            if array is None:
+                continue
+            for index in range(count):
+                name = getter(index).name or ""
+                if not _re.match(r"(obstacle|zone)__.*__env_\d{4}$", name):
+                    continue
+                if name.endswith(keep):
+                    continue
+                array[index][3] = 0.0
+                hidden += 1
+        if hidden:
+            print(f"[runner] rollout video: hid {hidden} authored geoms/sites "
+                  f"belonging to environments other than env {env_idx}",
+                  file=sys.stderr, flush=True)
+    except Exception as e:  # noqa: BLE001 — cosmetics must never kill a rollout
+        print(f"[runner] authored-geometry culling skipped: "
+              f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
+
+
 def _apply_ground_texture(env_cfg: Any) -> None:
     """§Ship 35: give the rendered floor an IMAGE texture instead of the
     default solid/checker terrain. PURELY COSMETIC and rollout-render only.
@@ -3138,6 +3182,8 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
     env = ManagerBasedRlEnv(
         env_cfg, device=args.device, render_mode="rgb_array"
     )
+    _hide_untracked_authored_geometry(
+        env, int(getattr(args, "render_env_index", 0) or 0))
     world_channel_recorder = None
     if world_bundle is not None:
         from sculptor.world.runtime import (

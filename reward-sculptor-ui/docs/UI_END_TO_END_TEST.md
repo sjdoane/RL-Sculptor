@@ -36,10 +36,20 @@ You should see:
 - one iteration chip along the bottom: **`iter 1`**
 - a 10-second video, 1280×720
 
-The robot crouches in the first half-second and then holds that crouch for
-the rest of the clip. **That is the correct video and a real result** — the
-policy found a reward hack, which the diagnoser then caught. It is not a
-broken render.
+**This video shows a broken scene, and that is expected — it was rendered
+before the fix.** The frame is packed with interpenetrating orange and blue
+boxes and the robot is embedded in one of them. That is real: mjlab shares
+one model across all 1024 parallel environments and repeats the authored
+course at each one, but the environment grid pitch was mjlab's 2.0 m default
+while the course reaches 6.8 m forward — so every course overlapped its
+neighbours three deep and every robot spawned inside someone else's boxes.
+Fixed in `9e3e5cf`; **any run you launch now renders one clean course.** The
+old artifacts on disk are kept as-is rather than re-rendered, because the
+policy in them was trained in the broken scene and re-rendering would only
+make bad training look tidy.
+
+So use this step to confirm the *player* works (10.00 s, iter 1, scrubbable),
+and judge the *scene* on a run you launch yourself in Test 3 or 4.
 
 > This is what you were looking at before, and you were right to flag it.
 > The viewer was defaulting to a *different* run — a five-day-old
@@ -167,16 +177,20 @@ are enough for me to find the artifacts on disk.
 
 ## Known-open, so you don't re-report them
 
-- The v1 policy games the terminal mode: `strike` carries 98.6 % of reward
-  mass, so the policy crouches and holds (0.297 m of travel in 10 s, zero
-  terminations). Structural cause is that the training episode isn't tied
-  to the 3.7 s reference clip length.
+- `strike` carries 98.6 % of v1's reward mass — a real property of the
+  reward function, and the structural cause is that the training episode
+  isn't tied to the 3.7 s reference clip length. But the *behavioural*
+  reading I drew from it ("the policy learned to crouch and hold") is no
+  longer trustworthy: that policy trained with its legs inside solid boxes,
+  so it could not translate even if it wanted to. Needs re-collecting on a
+  correctly-pitched scene.
 - All five proposed edits were filtered at pre-flight, so v1 never advanced
   to v2 automatically.
-- Runs from before the constraint-budget fix (anything dated on or before
-  2026-07-22, including the whole `four-box-parkour-demo` mission) trained
-  against silently dropped contacts. Their conclusions are not trustworthy
-  and they're queued for a re-check.
+- **Every authored-world run before `9e3e5cf` trained in an
+  interpenetrating scene** — all five projects with a course, not just the
+  parkour mission. Conclusions from those runs are being re-checked. The
+  constraint-budget increase I made earlier was treating a symptom of this;
+  with the pitch fixed the scene fits the task's own default.
 - `recert5` is INFEASIBLE: four wrist joints sit at exactly 0.0000 in the
   reference, and `mean_joint_err_rad` averages uniformly over all 29
   joints.

@@ -1128,6 +1128,166 @@ def test_constraint_budget_is_a_no_op_without_the_knobs():
     assert _reconcile_constraint_budget(SimpleNamespace(sim=SimpleNamespace())) == ()
 
 
+# ── env grid pitch vs. authored course footprint ──────────────────────
+def _course_world(
+    *lengths_m: float, generated: bool = False, lead_gap_m: float = 0.0,
+) -> dict:
+    """A world whose linear course is a run of platforms of the given lengths
+    laid end to end, optionally starting `lead_gap_m` in front of the origin
+    (a real authored course leaves the robot room to accelerate)."""
+    world = _world(generated=generated)
+    course = []
+    if lead_gap_m:
+        course.append({
+            "id": "approach", "element": "gap",
+            "nominal": {"length_m": lead_gap_m, "width_m": 1.2, "depth_m": 0.0},
+            "variations": [],
+        })
+    for index, length in enumerate(lengths_m, start=1):
+        course.append({
+            "id": f"box_{index:02d}", "element": "platform",
+            "nominal": {"length_m": length, "width_m": 1.2, "height_m": 0.3},
+            "variations": [],
+        })
+    world["shared"]["obstacles"]["course"] = course
+    world["shared"]["objects"] = {}
+    return world
+
+
+def _scene_cfg(env_spacing: float, *, terrain=None):
+    """Minimal stand-in for mjlab's SceneCfg — only the pitch and terrain."""
+    return SimpleNamespace(
+        scene=SimpleNamespace(env_spacing=env_spacing, terrain=terrain))
+
+
+def test_env_spacing_widens_to_clear_the_authored_course():
+    """The bug this closes: mjlab shares one model across parallel envs and
+    separates them by a 2.0 m grid pitch sized for a bare robot. An authored
+    course reaching several metres forward of the origin gets repeated at every
+    origin, so each robot spawns INSIDE a neighbour's boxes. Physics keeps
+    stepping and per-env observations look ordinary — the only symptom is a
+    rollout video full of interpenetrating boxes."""
+    from sculptor.world.compiler import (
+        AUTHORED_COURSE_CLEARANCE_M, _reconcile_env_spacing, authored_footprint_m,
+    )
+
+    world = _course_world(1.0, 1.1, 1.2)
+    span_x, span_y = authored_footprint_m(world)
+    cfg = _scene_cfg(2.0)
+
+    notes = _reconcile_env_spacing(cfg, world)
+
+    assert cfg.scene.env_spacing == pytest.approx(
+        span_x + AUTHORED_COURSE_CLEARANCE_M)
+    assert cfg.scene.env_spacing > span_x > 2.0
+    assert notes and "env_spacing 2→" in notes[0]
+    assert "spawn" in notes[0].lower() or "neighbouring" in notes[0]
+    assert span_y < span_x  # the run is long in x, narrow in y
+
+
+def test_env_spacing_measures_from_the_origin_not_the_first_box():
+    """The robot spawns at the origin, so the span that must fit the pitch runs
+    origin→far edge. Measuring first-box→last-box would under-report by the
+    approach gap and leave the spawn inside a neighbour's geometry."""
+    from sculptor.world.compiler import authored_footprint_m, resolve_course
+
+    world = _course_world(1.0, 1.0, lead_gap_m=0.8)
+    course = resolve_course(world)
+    first_to_last = (
+        max(p.position_m[0] + p.size_m[0] / 2 for p in course)
+        - min(p.position_m[0] - p.size_m[0] / 2 for p in course))
+    span_x, _ = authored_footprint_m(world)
+
+    # The 0.8 m approach gap is part of what has to clear the neighbour.
+    assert span_x == pytest.approx(first_to_last + 0.8)
+    assert span_x > first_to_last
+    assert span_x == pytest.approx(
+        max(p.position_m[0] + p.size_m[0] / 2 for p in course))
+
+
+def test_env_spacing_never_narrows_a_wider_task_default():
+    """A task that already spreads its envs further apart knows something about
+    its own scene; narrowing the pitch would create the overlap we are here to
+    remove."""
+    from sculptor.world.compiler import _reconcile_env_spacing
+
+    cfg = _scene_cfg(50.0)
+    assert _reconcile_env_spacing(cfg, _course_world(1.0, 1.0)) == ()
+    assert cfg.scene.env_spacing == 50.0
+
+
+def test_env_spacing_is_a_no_op_without_an_authored_course():
+    """A bare-robot world has no geometry to clear — the task's own pitch is
+    the right one and must be left alone."""
+    from sculptor.world.compiler import _reconcile_env_spacing
+
+    world = _world()
+    world["shared"]["objects"] = {}
+    cfg = _scene_cfg(2.0)
+    assert _reconcile_env_spacing(cfg, world) == ()
+    assert cfg.scene.env_spacing == 2.0
+
+
+def test_env_spacing_is_a_no_op_without_the_knob():
+    """Non-mjlab adapters have no scene cfg — must not raise."""
+    from sculptor.world.compiler import _reconcile_env_spacing
+
+    world = _course_world(1.0)
+    assert _reconcile_env_spacing(SimpleNamespace(), world) == ()
+    assert _reconcile_env_spacing(
+        SimpleNamespace(scene=SimpleNamespace()), world) == ()
+
+
+def test_generator_terrain_rejects_a_course_larger_than_its_tile():
+    """Generator terrains take env origins from terrain tiles and ignore
+    env_spacing, so an oversized course cannot be fixed by widening the pitch.
+    Reaching the GPU anyway would reproduce the same silent interpenetration —
+    refuse instead of pretending the scene is valid."""
+    from sculptor.world.compiler import WorldCompileError, _reconcile_env_spacing
+
+    terrain = SimpleNamespace(
+        terrain_type="generator",
+        terrain_generator=SimpleNamespace(size=(4.0, 4.0)))
+    cfg = _scene_cfg(2.0, terrain=terrain)
+
+    with pytest.raises(WorldCompileError, match="does not fit inside one terrain tile"):
+        _reconcile_env_spacing(cfg, _course_world(2.0, 2.0, 2.0))
+
+
+def test_generator_terrain_accepts_a_course_inside_its_tile():
+    """The pitch is the tile's, not ours — a course that fits needs no note."""
+    from sculptor.world.compiler import _reconcile_env_spacing
+
+    terrain = SimpleNamespace(
+        terrain_type="generator",
+        terrain_generator=SimpleNamespace(size=(40.0, 40.0)))
+    cfg = _scene_cfg(2.0, terrain=terrain)
+
+    assert _reconcile_env_spacing(cfg, _course_world(1.0, 1.0)) == ()
+    assert cfg.scene.env_spacing == 2.0
+
+
+@pytest.mark.parametrize("spacing", [2.0, 2.5, 3.0, 4.0])
+def test_reconciled_pitch_leaves_every_spawn_outside_every_neighbour(spacing):
+    """The property that actually matters: after reconciliation, no repeat of
+    the course at ±k·pitch may contain the origin where the robot spawns."""
+    from sculptor.world.compiler import (
+        _reconcile_env_spacing, resolve_course,
+    )
+
+    world = _course_world(1.0, 1.1, 1.2, 1.3)
+    cfg = _scene_cfg(spacing)
+    _reconcile_env_spacing(cfg, world)
+    pitch = cfg.scene.env_spacing
+
+    boxes = [(p.position_m[0] - p.size_m[0] / 2, p.position_m[0] + p.size_m[0] / 2)
+             for p in resolve_course(world)]
+    for k in list(range(-6, 0)) + list(range(1, 7)):
+        for x0, x1 in boxes:
+            assert not (x0 + k * pitch <= 0.0 <= x1 + k * pitch), (
+                f"neighbour at {k * pitch:+.2f} m still swallows the spawn")
+
+
 def test_constraint_budget_honors_env_overrides(monkeypatch):
     from sculptor.world.compiler import _reconcile_constraint_budget
 

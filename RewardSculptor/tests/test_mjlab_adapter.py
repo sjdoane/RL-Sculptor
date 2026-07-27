@@ -1567,3 +1567,90 @@ def test_generated_tracking_rewards_declare_the_flag() -> None:
     ns: dict = {}
     exec(compile(src, "r", "exec"), ns)  # noqa: S102
     assert ns["REWARD_SPEC"]["reference_tracking"] is True
+
+
+# ── rollout video: only the tracked env's authored geometry ───────────
+def _fake_model(n_envs: int, per_env: int = 4):
+    """Stand-in for an mjlab model carrying one authored course per env
+    origin, the way `_world_spec_editor` emits them."""
+    geom_names, site_names = [], []
+    for env_index in range(n_envs):
+        suffix = f"__env_{env_index:04d}"
+        geom_names += [f"obstacle__box_{i:02d}__platform{suffix}"
+                       for i in range(per_env)]
+        site_names.append(f"zone__start{suffix}")
+    geom_names.append("terrain")          # shared, must survive
+    geom_names.append("unitree_g1:pelvis")
+
+    geom_rgba = [[0.5, 0.5, 0.5, 1.0] for _ in geom_names]
+    site_rgba = [[0.1, 0.9, 0.1, 0.25] for _ in site_names]
+    return SimpleNamespace(
+        ngeom=len(geom_names), nsite=len(site_names),
+        geom_rgba=geom_rgba, site_rgba=site_rgba,
+        geom=lambda i: SimpleNamespace(name=geom_names[i]),
+        site=lambda i: SimpleNamespace(name=site_names[i]),
+        _geom_names=geom_names, _site_names=site_names)
+
+
+def test_rollout_video_hides_other_envs_authored_courses() -> None:
+    """mjlab shares one model across parallel envs, so every env's authored
+    course is always in it and always drawn — a field of identical courses that
+    buries the one the tracked robot is running. `max_extra_envs=0` only hides
+    neighbouring ROBOTS; static geometry needs this."""
+    from sculptor.adapters._mjlab_runner import _hide_untracked_authored_geometry
+
+    model = _fake_model(n_envs=8)
+    env = SimpleNamespace(sim=SimpleNamespace(mj_model=model))
+
+    _hide_untracked_authored_geometry(env, 3)
+
+    for index, name in enumerate(model._geom_names):
+        alpha = model.geom_rgba[index][3]
+        if name.endswith("__env_0003") or "__env_" not in name:
+            assert alpha == 1.0, f"{name} must stay visible"
+        else:
+            assert alpha == 0.0, f"{name} must be hidden"
+    for index, name in enumerate(model._site_names):
+        expected = 0.25 if name.endswith("__env_0003") else 0.0
+        assert model.site_rgba[index][3] == expected
+
+
+def test_rollout_video_culling_touches_alpha_only() -> None:
+    """Collision geometry, contacts and observations must be untouched — the
+    video has to show the same physics it always did."""
+    from sculptor.adapters._mjlab_runner import _hide_untracked_authored_geometry
+
+    model = _fake_model(n_envs=4)
+    env = SimpleNamespace(sim=SimpleNamespace(mj_model=model))
+
+    _hide_untracked_authored_geometry(env, 0)
+
+    for row in model.geom_rgba:
+        assert row[:3] == [0.5, 0.5, 0.5]   # only the alpha channel moved
+
+
+def test_rollout_video_culling_is_a_no_op_on_a_single_env_scene() -> None:
+    """With one origin `_world_spec_editor` emits unsuffixed names; nothing
+    should be hidden, least of all the only course in the scene."""
+    from sculptor.adapters._mjlab_runner import _hide_untracked_authored_geometry
+
+    names = ["obstacle__box_01__platform", "zone__start", "terrain"]
+    model = SimpleNamespace(
+        ngeom=3, nsite=0, geom_rgba=[[1.0, 1.0, 1.0, 1.0]] * 3, site_rgba=[],
+        geom=lambda i: SimpleNamespace(name=names[i]),
+        site=lambda i: SimpleNamespace(name=""))
+    env = SimpleNamespace(sim=SimpleNamespace(mj_model=model))
+
+    _hide_untracked_authored_geometry(env, 0)
+
+    assert all(row[3] == 1.0 for row in model.geom_rgba)
+
+
+def test_rollout_video_culling_never_raises() -> None:
+    """Cosmetics must never kill a rollout — a model that does not look the way
+    we expect has to no-op, not except."""
+    from sculptor.adapters._mjlab_runner import _hide_untracked_authored_geometry
+
+    _hide_untracked_authored_geometry(SimpleNamespace(), 0)
+    _hide_untracked_authored_geometry(
+        SimpleNamespace(sim=SimpleNamespace(mj_model=object())), 0)

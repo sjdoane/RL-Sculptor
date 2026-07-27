@@ -1911,6 +1911,23 @@ def _runtime_robot_hash(env_cfg: Any) -> str | None:
 #: 1536/512 is ~2.5x the observed peak for +182 MiB over the tightest clean
 #: budget — headroom a trained policy driving real contacts can spend, at a
 #: cost that still fits an 8 GiB card.
+#:
+#: CORRECTION. Every measurement above was taken with `_reconcile_env_spacing`
+#: absent, i.e. on a scene where 48 of 64 robots spawned INSIDE a neighbouring
+#: environment's boxes. Most of that contact pressure was the burial, not the
+#: course. Re-measured on the same world with the pitch reconciled, 64 envs,
+#: 60 steps:
+#:
+#:   env_spacing   spawns buried   peak nefc/world
+#:         2.00 m         48/64                496   <- overflows njmax=300
+#:         7.80 m          0/64                239   <- fits the task default
+#:
+#: So the overflow was a SYMPTOM of the spacing bug and this floor was treating
+#: it. The floor stays — it never shrinks a larger task default, a trained
+#: policy jumping on boxes drives more contacts than the zero-action probe
+#: above, and +182 MiB is cheap insurance — but it is headroom now, not a
+#: necessity. Re-measure with a trained policy on a correctly-pitched scene
+#: before tuning it down.
 AUTHORED_WORLD_NJMAX = 1536
 AUTHORED_WORLD_NCONMAX = 512
 
@@ -1958,6 +1975,96 @@ def _reconcile_constraint_budget(env_cfg: Any) -> tuple[str, ...]:
         "constraint budget for authored scene: " + ", ".join(notes)
         + " (task defaults are sized for the task's own scene; overflow drops "
           "contact rows silently and ends in NaN observations)",
+    )
+
+
+#: Clear space left between one environment's authored geometry and the next
+#: environment's origin, in metres. mjlab shares ONE MuJoCo model across every
+#: parallel env and separates them by offsetting each robot to `env_origin_i`,
+#: so `_world_spec_editor` must repeat the authored course at every origin. If
+#: the grid pitch is smaller than the course, those repeats interpenetrate —
+#: and because the course extends FORWARD of the origin the robot spawns inside
+#: a *neighbour's* box, which is not visible in any per-env view.
+AUTHORED_COURSE_CLEARANCE_M = 1.0
+
+
+def authored_footprint_m(world: Mapping[str, Any]) -> tuple[float, float]:
+    """XY span the authored geometry occupies around one environment origin.
+
+    The origin itself is included: the robot spawns there, so the span that
+    must fit inside the env grid pitch runs from the origin to the far edge of
+    the last box, not merely from the first box to the last.
+    """
+    xs = [0.0]
+    ys = [0.0]
+    for primitive in resolve_course(world):
+        sx, sy, _ = primitive.size_m
+        px, py, _ = primitive.position_m
+        xs += [px - sx / 2, px + sx / 2]
+        ys += [py - sy / 2, py + sy / 2]
+    for resolved in resolve_objects(world).values():
+        pos = resolved.get("position_m")
+        if not pos:
+            continue
+        xs.append(float(pos[0]))
+        ys.append(float(pos[1]))
+    return (max(xs) - min(xs), max(ys) - min(ys))
+
+
+def _reconcile_env_spacing(
+    env_cfg: Any, world: Mapping[str, Any],
+) -> tuple[str, ...]:
+    """Widen the env grid pitch so authored courses cannot interpenetrate.
+
+    Only applies to plane terrains, which lay envs out on a square grid of
+    `scene.env_spacing` (mjlab default 2.0 m — sized for a bare robot, not for
+    authored geometry in front of it). Generator terrains take their origins
+    from terrain tiles and ignore the knob; that case is checked instead.
+
+    Left unreconciled, mjlab's 2.0 m default against a multi-metre course puts
+    every robot inside one or more neighbours' boxes at reset. The failure is
+    silent in three separate ways: physics keeps stepping, per-env observations
+    look ordinary, and the only visible symptom is a rollout video packed with
+    overlapping boxes that reads as a renderer bug. It also manufactures the
+    contact pressure that the constraint-budget floor above was raised to
+    absorb — so run this FIRST and let that floor cover honest contacts only.
+    """
+    scene_cfg = getattr(env_cfg, "scene", None)
+    if scene_cfg is None or not hasattr(scene_cfg, "env_spacing"):
+        return ()  # non-mjlab adapter — no such knob
+
+    span_x, span_y = authored_footprint_m(world)
+    if span_x <= 0.0 and span_y <= 0.0:
+        return ()  # no authored geometry — the task's own default is right
+
+    terrain_cfg = getattr(scene_cfg, "terrain", None)
+    if getattr(terrain_cfg, "terrain_type", "plane") != "plane":
+        # Tile-placed origins: we cannot widen the pitch without re-authoring
+        # the terrain, so a course that does not fit is an authoring error and
+        # must not reach the GPU pretending to be a valid scene.
+        generator = getattr(terrain_cfg, "terrain_generator", None)
+        size = getattr(generator, "size", None)
+        if not size:
+            return ()
+        tile_x, tile_y = float(size[0]), float(size[1])
+        if span_x <= tile_x and span_y <= tile_y:
+            return ()
+        raise WorldCompileError(
+            f"authored course ({span_x:.2f} x {span_y:.2f} m) does not fit "
+            f"inside one terrain tile ({tile_x:.2f} x {tile_y:.2f} m). Every "
+            "environment would spawn inside a neighbouring tile's geometry. "
+            "Shorten the course or enlarge shared.terrain.layout.tile_size_m.")
+
+    needed = round(max(span_x, span_y) + AUTHORED_COURSE_CLEARANCE_M, 3)
+    current = float(getattr(scene_cfg, "env_spacing", 0.0) or 0.0)
+    if current >= needed:
+        return ()
+    scene_cfg.env_spacing = needed
+    return (
+        f"env grid pitch for authored scene: env_spacing {current:g}→{needed:g} m "
+        f"(course footprint {span_x:.2f} x {span_y:.2f} m about the origin; at "
+        f"{current:g} m every robot spawns inside a neighbouring environment's "
+        "boxes — silent in physics and in per-env observations)",
     )
 
 
@@ -2829,6 +2936,11 @@ def apply_world_selection(
         train=train,
     ))
     runtime_adjustments = (
+        # First: the env grid pitch. A pitch narrower than the course buries
+        # every robot in a neighbour's geometry, which manufactures most of the
+        # contact pressure the budget below absorbs. Fix the cause, then size
+        # the buffer for what honest contacts actually need.
+        *_reconcile_env_spacing(env_cfg, world),
         # Before anything else reads the scene: the authored geometry is in
         # place by now, and both the train and eval paths put the SAME course
         # in front of the robot, so both need the budget raised.

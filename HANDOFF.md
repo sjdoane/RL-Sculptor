@@ -1369,3 +1369,95 @@ the timeout (unit tests green, truncated twice more) → actually count the toke
 Every round the tests passed. The only thing that found the next layer was making
 the real call — the same lesson as the `njmax` bug in §15, where the build was
 green while the physics was wrong on 100% of steps.
+
+## §18 — the authored world was interpenetrating itself; §15–§16 are partly wrong
+
+Sam looked at the iter-1 replay and said the scene was "covered in weird orange,
+blue, and yellow overlapping boxes that are all inside of each other," with the
+robot "phased inside one." He was right, and the cause invalidates conclusions
+drawn in §15 and §16.
+
+### What was happening
+
+mjlab shares ONE MuJoCo model across every parallel environment and separates
+them by offsetting each robot to `env_origin_i`. Static authored geometry must
+therefore be repeated at every origin — `_world_spec_editor` does exactly that,
+deliberately, and the comment there explains why. What nothing checked is
+whether the grid PITCH is large enough to hold a course.
+
+  * `SceneCfg.env_spacing` defaults to **2.0 m** (mjlab, sized for a bare robot).
+  * The authored course reaches **6.80 m** forward of the origin.
+
+So each course overlapped its neighbours three deep, and because the course
+extends forward of the origin — where the robot spawns — every robot started
+inside one or more *other* environments' boxes.
+
+Measured on the real world, 64 envs, 60 steps, zero action:
+
+| env_spacing | spawns buried | peak nefc/world |
+|---|---|---|
+| 2.00 m (mjlab default) | **48 / 64** | 496 |
+| 7.80 m (reconciled) | **0 / 64** | 239 |
+
+Every authored world in the system is `kind: "plane"`, and every project with a
+course was affected: `gauntlet-demo`, `go1-parkouor`, `unitree-go1-2`,
+`unitree-go1-3`, `tracking-first-ui-verification`.
+
+### What this corrects
+
+**§15 is wrong about the njmax bug.** The task default is `njmax=300`. The
+buried scene peaks at 496 → overflow on ~100% of steps. The reconciled scene
+peaks at **239 — under the task's own default**. The constraint-budget floor
+raised in `0901428` was treating a symptom; the overflow was the burial. The
+floor stays (it never shrinks a larger task default, and a trained policy
+jumping on boxes will drive more contacts than a zero-action probe) but it is
+headroom now, not a necessity. The measurement table on
+`AUTHORED_WORLD_NJMAX` carries this correction inline.
+
+**§16's reward-hack conclusion is now suspect.** "The policy crouches and
+holds, 0.297 m in 10 s, zero terminations" was measured on a policy trained in
+a scene where its own legs started inside solid boxes. A robot that cannot
+translate is not the same finding as a robot that has *learned not to*. The
+diagnoser's read (98.6% of reward mass on `strike`) is a property of the reward
+function and still stands; the behavioural evidence has to be re-collected on a
+correctly-pitched scene before "reward hacking" is a claim rather than a guess.
+
+### The fix
+
+`_reconcile_env_spacing(env_cfg, world)` runs FIRST in `runtime_adjustments`,
+ahead of the constraint budget, so the buffer is sized for honest contacts:
+
+  * **Plane terrain** — widen `scene.env_spacing` to the authored footprint
+    measured *from the origin* (not first-box-to-last-box; the approach gap is
+    part of what has to clear) plus `AUTHORED_COURSE_CLEARANCE_M = 1.0`. Never
+    narrows a task that already asks for more.
+  * **Generator terrain** — origins come from terrain tiles and ignore the
+    knob, so a course that does not fit inside a tile raises
+    `WorldCompileError` rather than reaching the GPU. No world in the system
+    uses this path today; it is closed before one does.
+
+Emitted as a visible runtime adjustment:
+
+> `env grid pitch for authored scene: env_spacing 2→7.796 m (course footprint
+> 6.80 x 1.20 m about the origin; at 2 m every robot spawns inside a
+> neighbouring environment's boxes — silent in physics and in per-env
+> observations)`
+
+Separately, `_hide_untracked_authored_geometry` zeroes the alpha on other
+environments' course geoms and zone sites before the rollout renders. Alpha
+only — collision geometry, contacts and observations are untouched. This is the
+static-geometry analogue of the existing `max_extra_envs = 0`, which only ever
+hid neighbouring *robots*.
+
+### Why it stayed invisible
+
+Three independent silences stacked: physics kept stepping (MuJoCo resolves
+interpenetration by pushing, it does not error), per-environment observations
+looked ordinary (each robot sees plausible contact and height readings), and
+the one place it WAS visible — the rollout video — reads as a renderer bug
+rather than a physics bug. The njmax overflow was the only hard signal, and it
+was 197k unread stderr lines.
+
+Tests: `tests/test_world_compiler_gates.py` (7, incl. a property test that no
+repeat at ±k·pitch may contain the origin) and `tests/test_mjlab_adapter.py`
+(4, incl. alpha-only and never-raises). Library suite 2578 passed.
