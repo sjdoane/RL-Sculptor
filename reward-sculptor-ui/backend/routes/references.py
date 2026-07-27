@@ -884,3 +884,83 @@ def author_mode_reward(
                 "filename": src.name, "out_filename": dest.name},
     )
     return job.to_summary()
+
+
+class ModePromoteRequest(BaseModel):
+    """POST .../mode-reward/promote — put an authored mode reward into the
+    project's reward version chain so a run actually uses it."""
+
+    model_config = ConfigDict(extra="forbid")
+    filename: str
+    #: Promote even though some modes are still stubs. A stub pays nothing, so
+    #: this trains a reward that is blank across part of the episode — which is
+    #: legitimate for a bare scaffold (the tracking backbone alone is the
+    #: Tier-D path) and a mistake otherwise, hence explicit.
+    allow_unauthored: bool = False
+
+
+@router.post(
+    "/projects/{slug}/references/{clip_id}/mode-reward/promote",
+    responses={404: {"model": ProblemDetail}, 409: {"model": ProblemDetail},
+               422: {"model": ProblemDetail}},
+)
+def promote_mode_reward_route(
+    slug: str, clip_id: str, body: ModePromoteRequest, request: Request,
+) -> Any:
+    """Make the authored reward the one a run will train.
+
+    Authoring writes `mode_reward_v<n>.py`, which is NOT a version — only
+    `v<n>.py` is, and `rewards/current.py` (what every adapter imports) points
+    at one. Without this step, pressing Run after authoring trains whatever
+    `current.py` pointed at before, silently. Synchronous: it is a file copy
+    plus a probe, not a model call.
+    """
+    from sculptor.mode_rewards import ModeAuthorError, promote_mode_reward
+
+    store: ProjectStore = request.app.state.project_store
+    jobs: JobManager = request.app.state.job_manager
+    project_dir = _project_dir(store, slug)
+    if project_dir is None:
+        return _problem(
+            status.HTTP_404_NOT_FOUND, "project not found",
+            detail=f"no project with slug {slug!r}",
+            type_="/problems/not-found")
+
+    if jobs.has_active_sculpt_run(slug):
+        return _problem(
+            status.HTTP_409_CONFLICT, "sculpt run in progress",
+            detail="Repointing current.py under a live run would swap the "
+                   "reward mid-training. Stop the run first.",
+            type_="/problems/state-conflict")
+
+    src = _reward_dest(project_dir, body.filename)
+    if src is None:
+        return _problem(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, "invalid filename",
+            detail=f"{body.filename!r} must be a bare .py filename",
+            type_="/problems/validation-error")
+    if not src.is_file():
+        return _problem(
+            status.HTTP_404_NOT_FOUND, "reward not found",
+            detail=f"{src.name} does not exist in this project's rewards/",
+            type_="/problems/not-found")
+
+    contract = None
+    try:
+        from sculptor.adapters.base import load_adapter
+        contract = load_adapter(project_dir / "config.toml").reward_contract()
+    except Exception:  # noqa: BLE001 — probe is a bonus, absence is not fatal
+        contract = None
+
+    try:
+        out = promote_mode_reward(
+            src, contract=contract, allow_unauthored=body.allow_unauthored)
+    except ModeAuthorError as e:
+        return _problem(
+            status.HTTP_409_CONFLICT, "reward not promotable", detail=str(e),
+            type_="/problems/state-conflict")
+
+    return {"version": out["version"], "filename": out["filename"],
+            "path": out["path"], "clip_id": clip_id,
+            "unauthored": out["unauthored"],
+            "source_filename": out["source_filename"]}

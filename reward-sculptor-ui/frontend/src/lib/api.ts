@@ -1480,3 +1480,32 @@ export async function authorModeReward(
     ),
   );
 }
+
+export type ModePromoteResult = {
+  version: number;
+  filename: string;
+  path: string;
+  clip_id: string;
+  unauthored: string[];
+  source_filename: string;
+};
+
+/** POST .../mode-reward/promote — put the authored reward into the project's
+ *  reward version chain. Without this a run trains whatever `current.py`
+ *  pointed at before: `mode_reward_v<n>.py` is not a version. */
+export async function promoteModeReward(
+  slug: string,
+  clipId: string,
+  body: { filename: string; allow_unauthored?: boolean },
+): Promise<ModePromoteResult> {
+  return handle<ModePromoteResult>(
+    await fetch(
+      `/api/projects/${encodeURIComponent(slug)}/references/${encodeURIComponent(clipId)}/mode-reward/promote`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      },
+    ),
+  );
+}

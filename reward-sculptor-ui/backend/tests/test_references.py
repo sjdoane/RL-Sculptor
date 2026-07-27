@@ -1078,3 +1078,154 @@ def test_authoring_for_a_non_composite_reference_is_422(
         f"/projects/{slug}/references/walk1_subject2/mode-reward/author",
         json={"clip_id": "walk1_subject2", "mode": "whole"})
     assert r.status_code == 422, r.text
+
+
+# ── promotion: the step that makes a run actually use the reward ─────────
+PROMOTE_URL = ("/projects/{slug}/references/novel-jump-kick--g1"
+               "/mode-reward/promote")
+
+
+def _patch_adapter(monkeypatch):
+    """Stand in for the project's adapter so the mjlab-shaped reward contract
+    is available without an mjlab environment. The authoring job loads it for
+    real, which is the point — this only removes the env dependency."""
+    import types
+
+    contract = types.SimpleNamespace(
+        supports_batched=True,
+        state_schema={"qpos": (29,), "projected_gravity_b": (3,),
+                      "actuator_force": (29,)},
+        info_schema={"episode_length": (), "step_dt": (), "base_height": ()},
+        expected_info_keys=["episode_length", "step_dt", "base_height"])
+    monkeypatch.setattr(
+        "sculptor.adapters.base.load_adapter",
+        lambda _p: types.SimpleNamespace(reward_contract=lambda: contract))
+    return contract
+
+
+def _author_all(client: TestClient, slug: str, monkeypatch) -> str:
+    """Author every mode, returning the final filename."""
+    from sculptor.mode_rewards import MODE_FN_PREFIX
+
+    _patch_adapter(monkeypatch)
+
+    name = "mode_reward_v0.py"
+    for i, mode in enumerate(("approach", "launch", "strike"), start=1):
+        def _edit(*, current_reward_path, new_iter_id, _m=mode, **_kw):
+            src = Path(current_reward_path).read_text(encoding="utf-8")
+            for suffix, sig, ret in (
+                ("", "(state, action, next_state, info)", "0.5"),
+                ("_batched", "(state, action, next_state, info, like)",
+                 "like + 0.5"),
+            ):
+                fn = f"{MODE_FN_PREFIX}{_m}{suffix}"
+                head = f"def {fn}{sig}:"
+                j = src.index(head)
+                k = src.index("\ndef ", j)
+                src = (src[:j] + head + "\n    del state, action, next_state, info\n"
+                       + f"    v = {ret}\n    return v, {{'{_m}_core': v}}\n"
+                       + src[k:])
+            dest = Path(current_reward_path).parent / f"{new_iter_id}.py"
+            dest.write_text(src, encoding="utf-8")
+            return dest
+        monkeypatch.setattr("sculptor.edit.apply_prompt_edit", _edit)
+        r = client.post(AUTHOR_URL.format(slug=slug),
+                        json={"clip_id": "novel-jump-kick--g1", "mode": mode,
+                              "filename": name})
+        assert r.status_code == 202, r.text
+        # Authoring is a background job; the next call reads the file it
+        # writes, so it has to actually be finished.
+        _await_job(client, r.json()["job_id"])
+        name = f"mode_reward_v{i}.py"
+    return name
+
+
+def _await_job(client: TestClient, job_id: str, tries: int = 200) -> dict:
+    import time
+
+    for _ in range(tries):
+        d = client.get(f"/jobs/{job_id}").json()
+        if d["status"] in ("completed", "errored", "stopped"):
+            assert d["status"] == "completed", d.get("error")
+            return d
+        time.sleep(0.05)
+    raise AssertionError(f"job {job_id} did not finish")
+
+
+def test_promoting_makes_the_authored_reward_the_one_a_run_trains(
+    client: TestClient, refs_root: Path, monkeypatch,
+) -> None:
+    """The step without which the whole feature silently does nothing:
+    `mode_reward_v3.py` is not a version, and `current.py` — what every
+    adapter imports — points at a `v<n>.py`."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    _write_composite(refs_root)
+    slug = _make_project(client)
+    _scaffold(client, slug)
+    final = _author_all(client, slug, monkeypatch)
+
+    before = client.get(f"/projects/{slug}/rewards").json()
+    assert [v["version"] for v in before] == [0], "authoring alone adds no version"
+
+    r = client.post(PROMOTE_URL.format(slug=slug), json={"filename": final})
+    assert r.status_code == 200, r.text
+    assert r.json()["version"] == 1
+    assert r.json()["unauthored"] == []
+
+    after = client.get(f"/projects/{slug}/rewards").json()
+    assert [v["version"] for v in after] == [1, 0]
+    promoted = client.get(f"/projects/{slug}/rewards/1").json()
+    assert promoted["spec"]["version"] == "v1"
+    assert "def compute_reward_batched(" in promoted["source"]
+
+
+def test_promoting_a_half_authored_reward_is_refused(
+    client: TestClient, refs_root: Path, monkeypatch,
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    _write_composite(refs_root)
+    slug = _make_project(client)
+    _scaffold(client, slug)
+    r = client.post(PROMOTE_URL.format(slug=slug),
+                    json={"filename": "mode_reward_v0.py"})
+    assert r.status_code == 409, r.text
+    d = r.json()["detail"]
+    assert "unauthored stub" in d and "approach" in d
+    assert [v["version"] for v in client.get(f"/projects/{slug}/rewards").json()] == [0]
+
+
+def test_a_bare_scaffold_can_be_promoted_deliberately(
+    client: TestClient, refs_root: Path, monkeypatch,
+) -> None:
+    """The tracking backbone alone is trainable — that IS the Tier-D path — so
+    the refusal is a flag, not a wall."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+    _write_composite(refs_root)
+    slug = _make_project(client)
+    _scaffold(client, slug)
+    r = client.post(PROMOTE_URL.format(slug=slug),
+                    json={"filename": "mode_reward_v0.py",
+                          "allow_unauthored": True})
+    assert r.status_code == 200, r.text
+    assert sorted(r.json()["unauthored"]) == ["approach", "launch", "strike"]
+    assert [v["version"] for v in client.get(f"/projects/{slug}/rewards").json()] == [1, 0]
+
+
+def test_promoting_a_filename_that_escapes_the_project_is_refused(
+    client: TestClient, refs_root: Path,
+) -> None:
+    _write_composite(refs_root)
+    slug = _make_project(client)
+    for name in ("../../etc/passwd.py", "sub/dir.py", "nope"):
+        r = client.post(PROMOTE_URL.format(slug=slug), json={"filename": name})
+        assert r.status_code == 422, f"{name} -> {r.status_code}"
+
+
+def test_promoting_a_missing_file_is_404(
+    client: TestClient, refs_root: Path,
+) -> None:
+    _write_composite(refs_root)
+    slug = _make_project(client)
+    r = client.post(PROMOTE_URL.format(slug=slug),
+                    json={"filename": "mode_reward_v9.py"})
+    assert r.status_code == 404, r.text

@@ -164,25 +164,32 @@ def test_an_unauthored_mode_pays_nothing_and_says_so(tmp_path):
 
 def _author(src, mode, *, scalar=True, batched=True):
     """Replace `mode`'s stub bodies the way a real authoring pass would — the
-    whole function, docstring included, so the stub marker goes with it."""
+    whole function, docstring included, so the stub marker goes with it.
+
+    Spans come from the library's own AST helper rather than "up to the next
+    `def`". A naive scan is wrong for the LAST mode in the module: the text
+    between its scalar body and the next `def` includes `_MODE_FNS` and
+    `compute_reward`, and splicing over that deletes the dispatch.
+    """
+    from sculptor.mode_rewards import _fn_span
+
     out = src
     if scalar:
-        start = out.index(f"def {MODE_FN_PREFIX}{mode}(")
-        end = out.index(f"def {MODE_FN_PREFIX}{mode}{BATCHED_FN_SUFFIX}(")
+        fn = f"{MODE_FN_PREFIX}{mode}"
+        start, end = _fn_span(out, fn)
         out = out[:start] + (
-            f"def {MODE_FN_PREFIX}{mode}(state, action, next_state, info):\n"
+            f"def {fn}(state, action, next_state, info):\n"
             f'    """{mode}: authored."""\n'
             "    del state, action, next_state, info\n"
-            "    return 1.0, {}\n\n\n") + out[end:]
+            "    return 1.0, {}\n") + out[end:]
     if batched:
-        start = out.index(f"def {MODE_FN_PREFIX}{mode}{BATCHED_FN_SUFFIX}(")
-        tail = out.index("\n\ndef ", start)
+        fn = f"{MODE_FN_PREFIX}{mode}{BATCHED_FN_SUFFIX}"
+        start, end = _fn_span(out, fn)
         out = out[:start] + (
-            f"def {MODE_FN_PREFIX}{mode}{BATCHED_FN_SUFFIX}"
-            "(state, action, next_state, info, like):\n"
+            f"def {fn}(state, action, next_state, info, like):\n"
             f'    """{mode}: authored."""\n'
             "    del state, action, next_state, info\n"
-            "    return like + 1.0, {}\n") + out[tail:]
+            "    return like + 1.0, {}\n") + out[end:]
     return out
 
 
@@ -903,3 +910,117 @@ def test_validation_catches_a_scaffold_with_the_batched_half_stripped():
     stripped = src[:start] + src[src.index("\n\ndef ", start) + 2:]
     errors = validate_mode_reward_source(stripped, g)
     assert any("launch" in e and BATCHED_FN_SUFFIX in e for e in errors)
+
+
+# ── promotion into the reward version chain ──────────────────────────────
+def _rewards_dir(tmp_path, *, tracking=True, author_all=True):
+    """A project-shaped rewards/ holding a scaffold and a v0 starter."""
+    from sculptor.mode_rewards import generate_mode_reward_scaffold
+
+    d = tmp_path / "rewards"
+    d.mkdir()
+    (d / "v0.py").write_text(
+        "REWARD_SPEC: dict = {'version': 'v0', 'parent_hash': ''}\n"
+        "def compute_reward(state, action, next_state, info):\n"
+        "    return 1.0, {'alive': 1.0}\n", encoding="utf-8")
+    src = generate_mode_reward_scaffold(
+        _graph(), clip=_tracking_clip() if tracking else None,
+        behavior_goal="a test behavior", clip_id="c--g1")
+    if author_all:
+        for m in _graph().modes:
+            src = _author(src, m.name)
+    (d / "mode_reward_v3.py").write_text(src, encoding="utf-8")
+    return d
+
+
+def test_promoting_puts_the_module_in_the_version_chain(tmp_path):
+    """Without this the feature does nothing: only `v<n>.py` is a version, and
+    `current.py` — what every adapter imports — points at one."""
+    from sculptor.mode_rewards import promote_mode_reward
+
+    d = _rewards_dir(tmp_path)
+    out = promote_mode_reward(d / "mode_reward_v3.py")
+    assert out["version"] == 1
+    assert (d / "v1.py").is_file()
+    assert "v1.py" in (d / "current.py").read_text(encoding="utf-8")
+    assert out["parent_hash"] and len(out["parent_hash"]) == 16
+
+
+def test_the_promoted_spec_reads_as_the_version_it_now_is(tmp_path):
+    """`reward_store` literal-evals the REWARD_SPEC dict and never executes
+    the module, so the version has to be rewritten IN the literal — a
+    `REWARD_SPEC[...] = ...` line at the bottom would be invisible to it."""
+    import ast
+
+    from sculptor.mode_rewards import promote_mode_reward
+
+    d = _rewards_dir(tmp_path)
+    promote_mode_reward(d / "mode_reward_v3.py")
+    tree = ast.parse((d / "v1.py").read_text(encoding="utf-8"))
+    spec = next(ast.literal_eval(n.value) for n in tree.body
+                if isinstance(n, (ast.Assign, ast.AnnAssign))
+                and "REWARD_SPEC" in ast.dump(n))
+    assert spec["version"] == "v1"
+    assert spec["author"] == "sculptor"
+    assert spec["parent_hash"]
+    # and the rest of the spec survived the rewrite — the windows in
+    # particular, which are how a per-mode metric finds its slice.
+    assert sorted(spec["mode_windows_s"]) == sorted(
+        m.name for m in _graph().modes)
+
+
+def test_promoting_a_half_authored_module_is_refused(tmp_path):
+    """A stub pays nothing. Promoting one trains a reward that is blank across
+    part of the episode — silently, since everything else about it validates."""
+    from sculptor.mode_rewards import ModeAuthorError, promote_mode_reward
+
+    d = _rewards_dir(tmp_path, author_all=False)
+    with pytest.raises(ModeAuthorError) as e:
+        promote_mode_reward(d / "mode_reward_v3.py")
+    assert "unauthored stub" in str(e.value)
+    for m in _graph().modes:
+        assert m.name in str(e.value)
+    assert not (d / "v1.py").exists(), "refused means nothing was written"
+
+
+def test_a_scaffold_can_be_promoted_on_purpose(tmp_path):
+    """The tracking backbone alone IS trainable — that is the whole Tier-D
+    path — so this is a flag, not a hard refusal."""
+    from sculptor.mode_rewards import promote_mode_reward
+
+    d = _rewards_dir(tmp_path, author_all=False)
+    out = promote_mode_reward(d / "mode_reward_v3.py", allow_unauthored=True)
+    assert out["version"] == 1
+    assert sorted(out["unauthored"]) == sorted(m.name for m in _graph().modes)
+
+
+def test_promoting_chains_rather_than_overwriting(tmp_path):
+    from sculptor.mode_rewards import promote_mode_reward
+
+    d = _rewards_dir(tmp_path)
+    assert promote_mode_reward(d / "mode_reward_v3.py")["version"] == 1
+    assert promote_mode_reward(d / "mode_reward_v3.py")["version"] == 2
+    assert (d / "v1.py").is_file() and (d / "v2.py").is_file()
+    assert "v2.py" in (d / "current.py").read_text(encoding="utf-8")
+
+
+def test_the_promoted_module_still_imports_and_pays_per_mode(tmp_path):
+    """The point of promotion is that current.py loads it — so the promoted
+    file has to survive the spec rewrite as working code."""
+    import importlib.util
+
+    from sculptor.mode_rewards import promote_mode_reward
+
+    d = _rewards_dir(tmp_path)
+    promote_mode_reward(d / "mode_reward_v3.py")
+    spec = importlib.util.spec_from_file_location("promoted", d / "current.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert hasattr(mod, "compute_reward")
+    assert hasattr(mod, "compute_reward_batched"), "mjlab looks this up on current"
+    total, comps = mod.compute_reward(
+        {}, None,
+        {"qpos": [0.0] * 6, "projected_gravity_b": [0.0, 0.0, -1.0]},
+        _info(0.5))
+    assert isinstance(total, float)
+    assert any(k.startswith(MODE_COMPONENT_PREFIX) for k in comps)

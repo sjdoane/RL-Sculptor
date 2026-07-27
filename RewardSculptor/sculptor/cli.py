@@ -2942,3 +2942,52 @@ def modes_author(
 
 if __name__ == "__main__":  # pragma: no cover
     app()
+
+
+@modes_app.command("promote")
+def modes_promote(
+    file: str = typer.Option(
+        ..., "--file", help="Authored mode-reward module to promote."),
+    project_dir: Optional[Path] = typer.Option(
+        None, "--project", help="Sculpt project whose adapter supplies the "
+        "reward contract for the pre-promotion probe."),
+    allow_unauthored: bool = typer.Option(
+        False, "--allow-unauthored", help="Promote even though some modes are "
+        "still stubs — trains the tracking backbone alone."),
+) -> None:
+    """Put an authored mode reward into the project's reward version chain.
+
+    `modes author` writes `mode_reward_v<n>.py`, which is not a version:
+    `rewards/current.py` — the module every adapter imports — points at a
+    `v<n>.py`. Without this step a run trains whatever `current.py` pointed at
+    before, silently. This copies the module in as the next version and
+    repoints `current.py` at it.
+    """
+    from sculptor.mode_rewards import ModeAuthorError, promote_mode_reward
+
+    path = Path(file).expanduser()
+    if not path.is_file():
+        typer.echo(f"[modes promote] no module at {path}", err=True)
+        raise typer.Exit(code=1)
+
+    contract = None
+    if project_dir is not None:
+        from sculptor.adapters.base import load_adapter
+        config_path = Path(project_dir) / "config.toml"
+        if not config_path.is_file():
+            typer.echo(f"[modes promote] {config_path} not found", err=True)
+            raise typer.Exit(code=2)
+        contract = load_adapter(config_path).reward_contract()
+
+    try:
+        out = promote_mode_reward(
+            path, contract=contract, allow_unauthored=allow_unauthored)
+    except ModeAuthorError as e:
+        typer.echo(f"[modes promote] refused: {e}", err=True)
+        raise typer.Exit(code=1) from e
+
+    typer.echo(f"[modes promote] {path.name} -> v{out['version']}.py; "
+               f"current.py now points at it")
+    if out["unauthored"]:
+        typer.echo(f"[modes promote] WARNING: {len(out['unauthored'])} mode(s) "
+                   f"still pay nothing: {', '.join(out['unauthored'])}")

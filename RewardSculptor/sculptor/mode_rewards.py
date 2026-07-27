@@ -1202,6 +1202,7 @@ __all__ = [
     "mode_windows_s",
     "probe_info_keys",
     "probe_reward_module",
+    "promote_mode_reward",
     "summarize_authored_modes",
     "validate_mode_reward_source",
 ]
@@ -1426,3 +1427,107 @@ def author_mode(*, source: str, graph: ModeGraph, mode: str, contract,
             f"the right function.")
     return {"source": grafted, "prompt": prompt, "authored": authored,
             "pending": [n for n, ok in authored.items() if not ok]}
+
+
+def _rewrite_reward_spec(source: str, updates: Mapping[str, Any]) -> str:
+    """Return `source` with `REWARD_SPEC`'s keys updated in the literal.
+
+    Rewritten in place rather than mutated at import: readers of a reward
+    module (`reward_store._extract_reward_spec`, the version list, the diff
+    view) `ast.literal_eval` the dict literal and never execute the module, so
+    a `REWARD_SPEC[...] = ...` line appended at the bottom would be invisible
+    to every one of them.
+    """
+    import ast
+
+    tree = ast.parse(source)
+    lines = source.splitlines(keepends=True)
+    offsets = [0]
+    for line in lines:
+        offsets.append(offsets[-1] + len(line))
+    for node in tree.body:
+        target = None
+        if isinstance(node, ast.Assign):
+            target = next((t for t in node.targets
+                           if isinstance(t, ast.Name) and t.id == "REWARD_SPEC"),
+                          None)
+        elif (isinstance(node, ast.AnnAssign)
+                and isinstance(node.target, ast.Name)
+                and node.target.id == "REWARD_SPEC"):
+            target = node.target
+        if target is None or node.value is None:
+            continue
+        spec = ast.literal_eval(node.value)
+        if not isinstance(spec, dict):
+            raise ModeAuthorError("REWARD_SPEC is not a dict literal")
+        spec.update(updates)
+        start, end = offsets[node.lineno - 1], offsets[node.end_lineno]
+        # `repr` of a dict of literals stays literal-evaluable, which is the
+        # only property the readers need.
+        return (source[:start] + f"REWARD_SPEC: dict = {spec!r}\n"
+                + source[end:])
+    raise ModeAuthorError("no module-level REWARD_SPEC assignment to update")
+
+
+def promote_mode_reward(path, *, contract=None, allow_unauthored: bool = False,
+                        author: str = "sculptor") -> dict:
+    """Copy a mode-reward module into the project's reward version chain.
+
+    Without this the feature does nothing. Authoring writes
+    `rewards/mode_reward_v<n>.py`, but only `v<n>.py` is a version: it is what
+    `reward_store.list_versions` matches, what the Rewards tab lists, and
+    `rewards/current.py` — the module every adapter actually imports — points
+    at one. Author a per-mode reward and press Run without this step and the
+    run trains whatever `current.py` pointed at before, silently.
+
+    Refuses a module with unauthored stubs unless `allow_unauthored`. A stub
+    pays nothing, so promoting a half-authored module trains a reward that is
+    blank across part of the episode — the same silent-underpay failure the
+    `UNAUTHORED STUB` marker exists to make loud. Scaffolds are legitimately
+    trainable on their tracking backbone alone, which is why this is a flag
+    rather than a hard refusal.
+    """
+    import hashlib
+    import re as _re
+    from pathlib import Path as _Path
+
+    from sculptor.edit import _write_current_reexport
+
+    path = _Path(path)
+    rewards_dir = path.parent
+    source = path.read_text(encoding="utf-8")
+
+    authored = authored_modes(source)
+    unauthored = [n for n, ok in authored.items() if not ok]
+    if unauthored and not allow_unauthored:
+        raise ModeAuthorError(
+            f"{path.name} has {len(unauthored)} unauthored stub(s): "
+            f"{', '.join(unauthored)}. Each pays nothing, so promoting this "
+            f"trains a reward that is blank for that part of the episode. "
+            f"Author them, or pass allow_unauthored to train the tracking "
+            f"backbone alone.")
+
+    if contract is not None:
+        err = probe_reward_module(path, contract)
+        if err:
+            raise ModeAuthorError(f"{path.name} fails the reward contract: {err}")
+
+    versions = sorted(
+        int(m.group(1))
+        for p in rewards_dir.iterdir()
+        for m in [_re.fullmatch(r"v(\d+)\.py", p.name)] if m)
+    n = (versions[-1] + 1) if versions else 0
+    parent_hash = ""
+    if versions:
+        parent_hash = hashlib.sha256(
+            (rewards_dir / f"v{versions[-1]}.py").read_text(encoding="utf-8")
+            .encode("utf-8")).hexdigest()[:16]
+
+    promoted = _rewrite_reward_spec(source, {
+        "version": f"v{n}", "parent_hash": parent_hash, "author": author})
+    dest = rewards_dir / f"v{n}.py"
+    dest.write_text(promoted, encoding="utf-8")
+    _write_current_reexport(rewards_dir, dest)
+    return {"version": n, "path": str(dest), "filename": dest.name,
+            "unauthored": unauthored, "parent_hash": parent_hash,
+            "source_filename": path.name}

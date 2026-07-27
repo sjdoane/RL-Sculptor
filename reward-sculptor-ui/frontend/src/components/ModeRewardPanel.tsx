@@ -7,6 +7,7 @@ import {
   getJob,
   getReferenceModes,
   listReferences,
+  promoteModeReward,
   scaffoldModeReward,
   type ModeRewardResult,
   type ReferenceModeGraph,
@@ -54,6 +55,7 @@ export function ModeRewardPanel({
   const [error, setError] = useState<string | null>(null);
   const [log, setLog] = useState<string[]>([]);
   const [modeGoals, setModeGoals] = useState<Record<string, string>>({});
+  const [promoted, setPromoted] = useState<number | null>(null);
 
   useEffect(() => {
     if (!clipId) {
@@ -65,6 +67,7 @@ export function ModeRewardPanel({
     setGraph(null);
     setGraphError(null);
     setReward(null);
+    setPromoted(null);
     getReferenceModes(clipId, robot)
       .then((g) => live && setGraph(g))
       .catch((e) =>
@@ -184,6 +187,7 @@ export function ModeRewardPanel({
         overwrite: true,
       });
       setReward(r);
+      setPromoted(null);
       setLog((l) => [...l, `scaffolded ${r.filename} — ${r.modes.length} modes`]);
     } catch (e) {
       setError(e instanceof ApiError ? e.message : String(e));
@@ -232,6 +236,7 @@ export function ModeRewardPanel({
                 }
               : prev,
           );
+          setPromoted(null);
           setLog((l) => [...l, `${mode}: authored → ${out.filename}`]);
           break;
         }
@@ -244,6 +249,27 @@ export function ModeRewardPanel({
           break;
         }
       }
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : String(e));
+    } finally {
+      setBusy(null);
+    }
+  }
+
+  async function onPromote(allowUnauthored: boolean) {
+    if (!reward) return;
+    setBusy("promote");
+    setError(null);
+    try {
+      const r = await promoteModeReward(slug, clipId, {
+        filename: reward.filename,
+        allow_unauthored: allowUnauthored,
+      });
+      setPromoted(r.version);
+      setLog((l) => [
+        ...l,
+        `promoted ${r.source_filename} → v${r.version}.py (current.py now points at it)`,
+      ]);
     } catch (e) {
       setError(e instanceof ApiError ? e.message : String(e));
     } finally {
@@ -316,6 +342,46 @@ export function ModeRewardPanel({
               </div>
             );
           })}
+        </div>
+      )}
+
+      {reward && (
+        <div
+          className="rs-flex rs-gap-8"
+          style={{ marginTop: 12, paddingTop: 11,
+                   borderTop: "1px solid var(--hairline)" }}
+        >
+          <div className="rs-grow rs-sub" style={{ fontSize: 11 }}>
+            {promoted !== null ? (
+              <>
+                Promoted to <b>v{promoted}.py</b> — a run will train this
+                reward.
+              </>
+            ) : doneCount < reward.modes.length ? (
+              <>
+                {reward.modes.length - doneCount} mode(s) still pay nothing.
+                Promoting now trains the tracking backbone alone.
+              </>
+            ) : (
+              <>
+                Not in the reward chain yet. Until you promote it, a run trains
+                whatever <code>current.py</code> points at.
+              </>
+            )}
+          </div>
+          <Btn
+            kind={doneCount === reward.modes.length ? "primary" : "ghost"}
+            size="sm"
+            icon="check-circle"
+            disabled={busy !== null || promoted !== null}
+            onClick={() => onPromote(doneCount < reward.modes.length)}
+          >
+            {busy === "promote"
+              ? "Promoting…"
+              : promoted !== null
+                ? `Training v${promoted}`
+                : "Use for training"}
+          </Btn>
         </div>
       )}
 
