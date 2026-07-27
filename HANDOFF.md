@@ -868,3 +868,93 @@ single-leg-takeoff reward and none of it is in the scaffold.
 The `sculpt modes author` output is a reward module, not a trained policy — it
 has not been through a training run yet. That is the natural next step and it
 needs the GPU, which recert5 still has.
+
+---
+
+## 14. Progress update 2026-07-27 — per-mode authoring is reachable from the UI
+
+`sculpt modes author` worked (§13) but only from a terminal. It now runs from
+the Rewards tab, and — the part that matters more — the CLI and the UI run the
+SAME implementation.
+
+### One implementation, not two
+
+`mode_rewards.author_mode` holds the whole sequence: stale-scaffold check,
+prompt, stub twin, neighbour summaries, `apply_prompt_edit`, graft, helper
+carry, re-validate, contract re-probe, info-key gate, silent-no-op check. The
+CLI was rewritten to call it; `cli.py` now decides only where the file goes and
+what to print. `probe_reward_module` / `probe_info_keys` moved into the library
+with it.
+
+This is not tidying. Duplicating that sequence into the backend would have put
+a second copy of the phase-window contract in the tree, which is the exact
+shape of the bug that has cost this repo two Tier-D certifications. The CLI's
+22 tests pass unchanged across the move — that is what makes it a refactor.
+
+### What was added
+
+- `mode_author` job kind + `backend/services/mode_jobs.py`, mirroring
+  `reward_jobs.py`'s `asyncio.to_thread` shape. 900 s ceiling.
+- `POST /projects/{slug}/references/{clip_id}/mode-reward/author` → 202 + job.
+  Refuses, each before any model call: unknown mode (naming the ones that
+  exist), missing scaffold, in-place write, a filename that escapes the
+  project, a second concurrent authoring job, a live sculpt run, and a missing
+  `ANTHROPIC_API_KEY`.
+- Authoring always chains to a NEW file (`mode_reward_v0` → `v1` → …), so the
+  scaffold survives a rejected edit and the caller chains by passing the
+  previous filename back.
+- `ModeRewardPanel` on the Rewards tab: scaffold, then one row per mode with
+  its window, a per-mode goal field, and an Author button. Shown when the
+  reward's `composition.reference_clip_id` is set. A non-composite clip gets an
+  explanatory banner rather than an error — one mode with nothing to transition
+  to is a real answer.
+
+### Verified live, not just in tests
+
+Against the running backend, through the HTTP API, all three modes of
+`novel-running-jump-kick--g1`:
+
+```
+scaffold  -> mode_reward_v0.py   0/3
+launch    -> mode_reward_v1.py   1/3   3m42s
+approach  -> mode_reward_v2.py   2/3
+strike    -> mode_reward_v3.py   3/3
+```
+
+`mode_reward_v3.py` in the real project passes the contract probe and the
+info-key gate for all three modes. Walked across wall clock with an upright
+`projected_gravity_b`, a 2.5 m/s run-in and a rise through takeoff:
+
+```
+t (s)          0.20    0.80    1.40    2.00    2.60    3.50
+active index   0       0       1       1       2       2
+mode_approach  1.480   1.164   0       0       0       0
+mode_launch    0       0       2.150   2.450   0       0
+mode_strike    0       0       0       0       0.650   0.950
+```
+
+Note this is a DIFFERENT authoring of `launch` than §13's, and a better one: it
+gates on `projected_gravity_b` for uprightness and projects `base_lin_vel_b`
+onto the up axis for takeoff velocity, where the CLI sample used only scalar
+info channels. Worth knowing when reading either — two samples of the same
+prompt produce different, both-valid rewards, which is the point of keeping the
+gating out of the model's hands.
+
+**A trap for whoever measures these next.** A first pass at the walk above fed
+`torch.randn * 0.05` as the state and `mode_launch` read 0.000 across its whole
+window — which looks exactly like a dead term. It was not: random
+`projected_gravity_b` normalizes to a random direction, the uprightness gate
+reads ~0, and everything downstream of it is multiplied by zero. Zero-or-noise
+state is fine for a shape probe and useless for a value probe. Feed physical
+gravity.
+
+### Verification
+
+- `2539 passed, 1 skipped` (library) — unchanged across the refactor.
+- `604 passed` (backend), `test_references.py` 42 → 50.
+- Frontend typechecks and builds.
+
+### Still open
+
+Same as §13: this is a reward module, not a trained policy. Training with it
+needs the GPU, which recert5 has (round 2 of 3 as of this writing).
