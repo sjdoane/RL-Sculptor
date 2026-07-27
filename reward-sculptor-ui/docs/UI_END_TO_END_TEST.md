@@ -14,7 +14,7 @@ iteration already on disk**. `tracking-first-ui-verification` has
 you the same broken video. There is no UI toggle for this.
 
 ```bash
-mv ~/.local/share/reward-sculptor/projects/tracking-first-ui-verification/runs/iter_1 ~/.local/share/reward-sculptor/projects/tracking-first-ui-verification/runs/_prefix_iter_1
+cd ~/.local/share/reward-sculptor/projects/tracking-first-ui-verification/runs && for d in iter_*; do mv "$d" "_prefix_$d"; done && ls
 ```
 
 Renamed, not deleted — the leading underscore takes it out of the
