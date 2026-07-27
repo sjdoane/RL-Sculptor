@@ -11,6 +11,7 @@ directly; the real GPU tracking pass is the orchestrator's job later
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import numpy as np
@@ -21,8 +22,10 @@ from sculptor.refs import library
 from sculptor.refs.track import (
     DEFAULT_ITERATIONS,
     MEAN_JOINT_ERR_THRESHOLD_RAD,
+    MIN_REFERENCE_MOTION_RAD,
     ORIGIN_RELATIVE_MAX_ROOT_Z_M,
     ROOT_Z_RMSE_THRESHOLD_M,
+    STATIC_BASELINE_RATIO_MAX,
     TierDCertificate,
     TrackError,
     TrackingErrors,
@@ -596,6 +599,146 @@ def test_absolute_clip_keeps_charging_a_constant_offset_as_error():
     assert errs.root_frame == "absolute"
     assert errs.root_z_rmse_m == pytest.approx(0.2, abs=1e-9)
     assert not errs.feasible
+
+
+# ── the static-pose control ───────────────────────────────────────────────
+#
+# The first real certification exposed that `mean_joint_err_rad < 0.35` alone
+# is not a tracking test: on novel-running-jump-kick--g1 the trained policy
+# scored 0.1685 rad, the SAME rollout played backwards scored 0.1691, and
+# holding the rollout's time-averaged pose scored 0.1624 — better than the
+# policy. Mean absolute error is blind to temporal structure, so a clip whose
+# joint excursions are small next to the threshold certifies by standing
+# still. These pin the control that closes that hole.
+def _moving_clip(n: int = 60, *, amp: float = 0.5) -> dict:
+    """A clip whose two joints genuinely swing, so 'hold one pose' is a
+    meaningfully worse strategy than tracking."""
+    t = np.linspace(0.0, 2 * np.pi, n)
+    joint_pos = np.stack([amp * np.sin(t), amp * np.cos(t)], axis=1)
+    return {
+        "root_pos_z": np.full(n, 0.74), "fps": 30.0, "joint_pos": joint_pos,
+        "joint_names": ["left_hip_pitch_joint", "right_hip_pitch_joint"],
+    }
+
+
+def test_a_perfect_tracker_beats_the_static_baseline():
+    clip = _moving_clip()
+    errs = compute_tracking_errors(
+        clip=clip, rollout_joint_pos=clip["joint_pos"].copy(),
+        rollout_root_z=clip["root_pos_z"].copy(),
+        rollout_joint_names=clip["joint_names"])
+    assert errs.mean_joint_err_rad < 1e-9
+    assert errs.static_baseline_err_rad > 0.2   # standing still would be bad
+    assert errs.beats_static_baseline
+    assert errs.feasible
+    assert errs.motion_ratio == pytest.approx(1.0, abs=1e-6)
+
+
+def test_standing_still_no_longer_certifies():
+    """The headline hole: a rollout that holds one pose has a small mean
+    absolute error against a modest-amplitude reference, and used to pass."""
+    clip = _moving_clip(amp=0.30)
+    frozen = np.tile(clip["joint_pos"].mean(axis=0), (len(clip["joint_pos"]), 1))
+    errs = compute_tracking_errors(
+        clip=clip, rollout_joint_pos=frozen,
+        rollout_root_z=clip["root_pos_z"].copy(),
+        rollout_joint_names=clip["joint_names"])
+    # It still clears the absolute joint threshold — that is exactly the hole.
+    assert errs.mean_joint_err_rad < MEAN_JOINT_ERR_THRESHOLD_RAD
+    # ...but it cannot beat the static control, because it IS the control.
+    assert not errs.beats_static_baseline
+    assert not errs.feasible
+    assert errs.motion_ratio == pytest.approx(0.0, abs=1e-9)
+
+
+def test_a_time_reversed_rollout_does_not_certify():
+    """Playing the reference backwards has the same mean absolute error, so
+    only a control that sees temporal structure can reject it."""
+    clip = _moving_clip()
+    errs = compute_tracking_errors(
+        clip=clip, rollout_joint_pos=clip["joint_pos"][::-1].copy(),
+        rollout_root_z=clip["root_pos_z"].copy(),
+        rollout_joint_names=clip["joint_names"])
+    assert not errs.feasible
+
+
+def test_a_motionless_reference_skips_the_control_rather_than_failing():
+    """A constant reference IS tracked by a constant pose; failing it would
+    be a false negative, so the vacuous comparison is skipped."""
+    n = 40
+    clip = {
+        "root_pos_z": np.full(n, 0.74), "fps": 30.0,
+        "joint_pos": np.zeros((n, 2)),
+        "joint_names": ["left_hip_pitch_joint", "right_hip_pitch_joint"],
+    }
+    errs = compute_tracking_errors(
+        clip=clip, rollout_joint_pos=np.zeros((n, 2)),
+        rollout_root_z=clip["root_pos_z"].copy(),
+        rollout_joint_names=clip["joint_names"])
+    assert errs.static_baseline_err_rad < MIN_REFERENCE_MOTION_RAD
+    assert errs.beats_static_baseline
+    assert errs.feasible
+
+
+def test_root_only_scoring_is_not_failed_by_the_control():
+    """No common joints -> no joint trace -> the control cannot apply."""
+    clip = _moving_clip()
+    errs = compute_tracking_errors(
+        clip=clip, rollout_joint_pos=np.zeros((60, 2)),
+        rollout_root_z=clip["root_pos_z"].copy(),
+        rollout_joint_names=["unrelated_a", "unrelated_b"])
+    assert errs.n_common_joints == 0
+    assert errs.beats_static_baseline
+    assert errs.feasible
+
+
+def test_phase_clock_tracks_wall_time_not_the_training_budget(tmp_path: Path):
+    """`episode_len_steps` used to be `steps_per_iteration` — a count of PPO
+    updates. At the 2000 default against ~500-step episodes the reference
+    played at quarter speed and the policy never saw past phase 0.25."""
+    from sculptor.refs.track import DEFAULT_CONTROL_HZ
+
+    n, fps = 444, 120.0                      # the real composite: 3.70 s
+    clip = {
+        "root_pos_z": np.full(n, 0.05), "fps": fps,
+        "joint_pos": np.zeros((n, 2)),
+        "joint_names": ["left_hip_pitch_joint", "right_hip_pitch_joint"],
+    }
+    donor = tmp_path / "donor"
+    donor.mkdir()
+    (donor / "config.toml").write_text(
+        '[adapter]\nclass = "sculptor.adapters.mjlab.MjlabAdapter"\n'
+        '[adapter.config]\ntask_id = "t"\n', encoding="utf-8")
+    plan = build_track_project(
+        clip=clip, clip_id="c", robot="g1", donor_project=donor,
+        project_dir=tmp_path / "proj", steps_per_iteration=2000)
+
+    src = (plan.reward_path).read_text(encoding="utf-8")
+    match = re.search(r"^EPISODE_LEN_STEPS = (\d+)", src, re.M)
+    assert match, "reward must declare EPISODE_LEN_STEPS"
+    got = int(match.group(1))
+    # 3.70 s at 50 Hz = 185 steps -- NOT the 2000 training budget.
+    assert got == round((n / fps) * DEFAULT_CONTROL_HZ) == 185
+    assert got != 2000
+
+
+def test_static_baseline_constants_are_documented():
+    assert STATIC_BASELINE_RATIO_MAX == 0.80
+    assert MIN_REFERENCE_MOTION_RAD == 0.02
+
+
+def test_certificate_reports_the_control_it_ran():
+    """An auditor must be able to see the control's number, not just the
+    verdict."""
+    clip = _moving_clip()
+    errs = compute_tracking_errors(
+        clip=clip, rollout_joint_pos=clip["joint_pos"].copy(),
+        rollout_root_z=clip["root_pos_z"].copy(),
+        rollout_joint_names=clip["joint_names"])
+    d = errs.to_dict()
+    assert d["beats_static_baseline"] is True
+    assert d["static_baseline_err_rad"] > 0.2
+    assert d["thresholds"]["static_baseline_ratio_max"] == STATIC_BASELINE_RATIO_MAX
 
 
 def test_origin_relative_threshold_constant_is_physically_separated():

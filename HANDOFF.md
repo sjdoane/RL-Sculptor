@@ -285,13 +285,49 @@ Guardrails, in `tests/test_refs_track.py`:
 - an absolute clip still charges a constant 20 cm offset as real error, so the
   pre-existing intent is untouched.
 
-### Result: the first Tier-D clip in the library
+### …which then exposed that the gate behind it does not discriminate
 
-`novel-running-jump-kick--g1` — itself composed from three unrelated AMASS
-clips (running-on-spot + one-leg-jump + kicking) — is the first clip to pass:
-`mean_joint_err_rad` **0.1685** (2.1× margin) and `root_z_rmse_m` **0.0251**
-(4.8× margin) at `duration_coverage` 1.0 over 29 common joints. That is the
-Lokesh thesis end to end: solved data → novel motion → physics-certified.
+With the frame bug fixed, the composite "passed" — `mean_joint_err_rad` 0.1685
+against 0.35. **That pass was not real.** Scoring trivial baselines against the
+same reference:
+
+| baseline | mean\|err\| rad | passed 0.35? |
+|---|---|---|
+| trained policy | 0.1685 | ✓ |
+| the same rollout played **backwards** | 0.1691 | ✓ |
+| rollout **phase-shifted** half a clip | 0.1689 | ✓ |
+| rollout's mean pose held **constant** | **0.1624** | ✓ (beats the policy) |
+| clip's mean pose held constant | **0.1486** | ✓ |
+| all joints at zero | 0.3042 | ✓ |
+
+Mean absolute error is blind to temporal structure. On a clip whose joint
+excursions (0.18 rad std) are small next to the threshold, **standing still
+passes** — and the trained policy's own motion amplitude was 0.050 rad, 28% of
+the reference's.
+
+So certification now runs a control: `static_baseline_err_rad` is what the
+rollout's own time-averaged pose would have scored, and `feasible` requires
+beating it by `STATIC_BASELINE_RATIO_MAX = 0.80`. This makes the gate strictly
+harder, never easier. `motion_ratio` is reported alongside. A motionless
+reference skips the control (vacuous, not a failure), as does root-only
+scoring.
+
+**Current honest verdict on the composite: NOT certified.**
+`beats_static_baseline: false`, `motion_ratio: 0.278`, `feasible: false`.
+
+### Root cause: the phase clock ran on the training budget
+
+`build_track_project` set `episode_len_steps = int(steps_per_iteration)`. But
+`steps_per_iteration` is mjlab's `max_iterations` — a count of **PPO updates**,
+not env steps (this module's own §DEFAULT_ITERATIONS docstring says so). At the
+2000 default against ~500-step episodes, the phase clock only ever reached
+`500/2000 = 0.25`: the policy never saw past the first quarter of the reference
+— never reached the jump or the kick of a three-phase composite — and the
+reference played at quarter speed.
+
+Now derived from wall time: `round(duration_s * DEFAULT_CONTROL_HZ)`, i.e.
+**185** steps for the 3.70 s composite at mjlab's 50 Hz, not 2000. A
+re-certification with the corrected clock is running.
 
 ### Landmine that cost 13 GPU-hours
 

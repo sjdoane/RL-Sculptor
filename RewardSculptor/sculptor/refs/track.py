@@ -69,6 +69,22 @@ ROOT_Z_RMSE_THRESHOLD_M = 0.12
 #: for the 6015 clips ingested before the field existed.
 ORIGIN_RELATIVE_MAX_ROOT_Z_M = 0.30
 
+#: A tracking policy must beat the best CONSTANT pose by this factor to
+#: certify. Measured on the first real certification attempt, the absolute
+#: joint gate alone did not discriminate at all: the trained policy scored
+#: 0.1685 rad, the same rollout played BACKWARDS scored 0.1691, and simply
+#: holding the rollout's time-averaged pose scored 0.1624 — better than the
+#: policy. A mean-absolute-error threshold is blind to temporal structure,
+#: so on a clip whose joint excursions are small relative to the threshold,
+#: standing still passes. Requiring the policy to beat "hold one pose"
+#: turns the gate back into a test of tracking rather than of posture.
+STATIC_BASELINE_RATIO_MAX = 0.80
+
+#: Below this the reference has effectively no joint motion to track, so the
+#: static-baseline comparison is vacuous (a constant reference IS tracked by
+#: a constant pose) and is skipped rather than failing the clip.
+MIN_REFERENCE_MOTION_RAD = 0.02
+
 #: Reward-shaping weights for the generated tracking reward's Gaussian
 #: kernels: `exp(-w * err**2)`. Chosen so a "close" pose (few-degree
 #: joint error, few-cm root error) scores near 1.0 while a "way off"
@@ -84,6 +100,13 @@ ROOT_ERR_WEIGHT = 40.0
 #: (see `MjlabAdapter.train`'s docstring — `steps` IS max_iterations,
 #: not env steps), so this module trains ONE adapter.train() call with
 #: `steps=iterations`.
+#: Control rate the generated tracking reward assumes when converting the
+#: clip's duration into a phase-clock length. mjlab's G1 velocity task steps
+#: at 50 Hz (`step_dt` 0.02, see `_mjlab_runner`'s `video_params`). Exposed
+#: as a `build_track_project` argument so a task with a different rate can
+#: override rather than silently mistime the reference.
+DEFAULT_CONTROL_HZ = 50.0
+
 DEFAULT_ITERATIONS = 3
 DEFAULT_STEPS_PER_ITERATION = 2000
 DEFAULT_N_EPISODES = 2
@@ -725,12 +748,35 @@ class TrackingErrors:
     #: DIVIDED OUT and is not part of `root_z_rmse_m`; it is reported so a
     #: certificate never hides what it chose not to measure.
     root_z_offset_m: float = 0.0
+    #: What the BEST CONSTANT POSE would have scored — the rollout's own
+    #: time-averaged pose held for the whole clip. This is the "policy did
+    #: nothing" control; `mean_joint_err_rad` must beat it. Defaults to 0.0
+    #: meaning "no static control applies" (root-only scoring, or a caller
+    #: that predates the field), which skips the comparison the same way a
+    #: motionless reference does — `compute_tracking_errors` always supplies
+    #: a real value when there are joints to compare.
+    static_baseline_err_rad: float = 0.0
+    #: How much of the reference's joint motion the rollout actually
+    #: reproduced (std over time, rollout / clip). Informational.
+    motion_ratio: float = 0.0
+
+    @property
+    def beats_static_baseline(self) -> bool:
+        """Did the policy do better than holding one pose? Vacuous — and so
+        skipped — for a reference with no joint motion to track."""
+        if not np.isfinite(self.static_baseline_err_rad):
+            return False
+        if self.static_baseline_err_rad < MIN_REFERENCE_MOTION_RAD:
+            return True
+        return (self.mean_joint_err_rad
+                <= self.static_baseline_err_rad * STATIC_BASELINE_RATIO_MAX)
 
     @property
     def feasible(self) -> bool:
         return (
             self.mean_joint_err_rad < MEAN_JOINT_ERR_THRESHOLD_RAD
             and self.root_z_rmse_m < ROOT_Z_RMSE_THRESHOLD_M
+            and self.beats_static_baseline
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -743,10 +789,16 @@ class TrackingErrors:
             "n_common_joints": self.n_common_joints,
             "root_frame": self.root_frame,
             "root_z_offset_m": round(self.root_z_offset_m, 6),
+            "static_baseline_err_rad": (
+                round(self.static_baseline_err_rad, 6)
+                if np.isfinite(self.static_baseline_err_rad) else None),
+            "beats_static_baseline": self.beats_static_baseline,
+            "motion_ratio": round(self.motion_ratio, 6),
             "feasible": self.feasible,
             "thresholds": {
                 "mean_joint_err_rad": MEAN_JOINT_ERR_THRESHOLD_RAD,
                 "root_z_rmse_m": ROOT_Z_RMSE_THRESHOLD_M,
+                "static_baseline_ratio_max": STATIC_BASELINE_RATIO_MAX,
             },
         }
 
@@ -823,6 +875,10 @@ def compute_tracking_errors(
     common_names: list[str] = []
     mean_err = 0.0
     max_err = 0.0
+    # No common joints -> root-only scoring; there is no joint trace to
+    # compare against a static pose, so the control is vacuously satisfied.
+    static_err = 0.0
+    motion_ratio = 0.0
     if clip_joint_pos is not None and clip_joint_names and t_rollout > 0:
         clip_idx, rollout_idx, common_names = _resolve_common_joints(
             list(clip_joint_names), list(rollout_joint_names))
@@ -840,6 +896,14 @@ def compute_tracking_errors(
             abs_err = np.abs(err)
             mean_err = float(np.mean(abs_err))
             max_err = float(np.max(abs_err))
+            # The control: what the policy would have scored by holding its
+            # own time-averaged pose for the whole clip. If it cannot beat
+            # that, it did not track anything.
+            static_pose = np.mean(rollout_at_n, axis=0, keepdims=True)
+            static_err = float(np.mean(np.abs(clip_at_n - static_pose)))
+            clip_motion = float(np.mean(np.std(clip_at_n, axis=0)))
+            rollout_motion = float(np.mean(np.std(rollout_at_n, axis=0)))
+            motion_ratio = (rollout_motion / clip_motion) if clip_motion > 0 else 0.0
 
     # Root height must be scored in the SAME frame the reward optimized, or
     # certification measures something the policy was never trained to do.
@@ -875,6 +939,8 @@ def compute_tracking_errors(
         n_common_joints=len(common_names),
         root_frame=root_frame,
         root_z_offset_m=root_offset,
+        static_baseline_err_rad=static_err,
+        motion_ratio=motion_ratio,
     )
 
 
@@ -971,6 +1037,7 @@ def build_track_project(
     steps_per_iteration: int = DEFAULT_STEPS_PER_ITERATION,
     n_episodes: int = DEFAULT_N_EPISODES,
     n_phase_targets: int = N_PHASE_TARGETS,
+    control_hz: float = DEFAULT_CONTROL_HZ,
 ) -> TrackPlan:
     """Build the throwaway sculpt project directory (config.toml +
     rewards/current.py + env/ RSI+eval-reset), WITHOUT training. Used by
@@ -987,7 +1054,18 @@ def build_track_project(
     adapter_cfg = read_donor_adapter_config(donor_project)
     config_path = write_project_config_toml(project_dir, adapter_cfg)
 
-    episode_len_steps = int(steps_per_iteration)
+    # The phase clock must advance with WALL TIME, not with the training
+    # budget. This used to read `int(steps_per_iteration)`, but per this
+    # module's own docstring `steps` IS mjlab's `max_iterations` — a count of
+    # PPO updates, not env steps. With the default 2000 against ~500-step
+    # episodes the reference played at a quarter speed and the policy never
+    # saw past phase 0.25, i.e. never reached the jump or the kick of a
+    # three-phase composite. Deriving the clock from the clip's real duration
+    # makes the reference play at true speed.
+    fps = float(clip.get("fps") or 0.0) or 30.0
+    n_frames = int(np.asarray(clip["root_pos_z"]).shape[0])
+    duration_s = n_frames / fps if fps > 0 else 0.0
+    episode_len_steps = max(1, int(round(duration_s * float(control_hz))))
     target_joint_pos = downsample_phase_targets(
         np.asarray(clip["joint_pos"], dtype=np.float64), n=n_phase_targets)
     target_root_z = downsample_phase_targets(
