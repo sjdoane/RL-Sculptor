@@ -72,9 +72,26 @@ from sculptor.llm import log_llm_call, model_for
 MODEL_ID = model_for("edit")
 MAX_TOKENS = 16000
 
-#: Rough bytes-per-token for Python source. Used only to size the output
-#: ceiling, so it is deliberately conservative (real Python runs ~3.5-4).
-_BYTES_PER_TOKEN = 3.5
+#: Bytes-per-token for a generated reward module, MEASURED rather than
+#: assumed. A first pass used 3.5 (the usual figure for prose-like Python) and
+#: under-counted the live per-mode reward by 30%, so the raised ceiling was
+#: still only 1.12x the module and the response was truncated twice more.
+#: Counted with `messages.count_tokens` on the real file:
+#:
+#:   v1.py whole module     49,310 B -> 20,173 tok   2.44 B/tok
+#:   TARGET_JOINT_POS        8,326 B ->  5,540 tok   1.50 B/tok
+#:   TARGET_GRAVITY          1,194 B ->    675 tok   1.77 B/tok
+#:
+#: Dense float literals tokenize about half as well as code, so a module's
+#: ratio depends on how much inlined data it carries. 2.2 sits under the mixed
+#: case and near the data-heavy one; erring low errs toward a LARGER ceiling,
+#: which is the safe direction.
+_BYTES_PER_TOKEN = 2.2
+
+#: Hard ceiling, so a pathological module cannot request an absurd budget.
+#: `claude-opus-5` accepts at least 96000 output tokens (probed); 64000 leaves
+#: margin without being a real constraint on any reward we generate.
+MAX_REWRITE_TOKENS = 64000
 
 #: A whole-module rewrite must be able to emit the WHOLE module plus its
 #: changes. `MAX_TOKENS` is a fine ceiling for a 500-line reward and a hard
@@ -83,7 +100,11 @@ _BYTES_PER_TOKEN = 3.5
 #: (TARGET_JOINT_POS alone is 8.3 KB) the editor has to restate verbatim. The
 #: first sculpt run over one died with `response was cut off at the 16000-token
 #: ceiling`, so the loop could train the reward but never evolve it.
-_REWRITE_HEADROOM = 1.6
+#:
+#: 2.0, not 1.6: the budget has to cover the whole module AND the adaptive
+#: thinking that precedes it, which is charged against the same ceiling. A
+#: 1.12x-of-module budget was measured truncating on both attempts.
+_REWRITE_HEADROOM = 2.0
 
 
 #: Per-request HTTP ceiling at `MAX_TOKENS`, and the seconds-per-token it
@@ -108,7 +129,7 @@ def _rewrite_token_ceiling(source: str) -> int:
     byte-for-byte.
     """
     needed = int(len(source) / _BYTES_PER_TOKEN * _REWRITE_HEADROOM)
-    return max(MAX_TOKENS, needed)
+    return min(MAX_REWRITE_TOKENS, max(MAX_TOKENS, needed))
 RETRY_REMINDER_PREFIX = (
     "Your previous response failed validation. Fix the following and return "
     "ONLY the complete new reward.py source as plain Python — no markdown "

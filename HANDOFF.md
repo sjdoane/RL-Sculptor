@@ -1296,6 +1296,28 @@ Three coupled limits, one of which was only visible by making the real call.
 Worth remembering that the unit tests for the ceiling all passed while the
 end-to-end path was still broken.
 
+**And the ceiling itself was still wrong, because it was estimated.** The second
+replay got past the timeout and truncated anyway, twice. Counting with
+`messages.count_tokens` instead of guessing:
+
+```
+v1.py whole module     49,310 B -> 20,173 tok   2.44 B/tok
+  TARGET_JOINT_POS      8,326 B ->  5,540 tok   1.50 B/tok   <- 27% of the module
+  TARGET_GRAVITY        1,194 B ->    675 tok   1.77 B/tok
+```
+
+The 3.5 B/tok figure is right for prose-like Python and 30% optimistic here,
+because dense float literals tokenize about half as well as code. The "raised"
+ceiling of 22,541 was therefore only **1.12x** the module — and adaptive
+thinking is charged against the same budget, so there was never room. Now 2.2
+B/tok with 2.0x headroom: 44,827, or 2.22x the module, hard-capped at 64,000
+(`claude-opus-5` was probed and accepts at least 96,000).
+
+**This is the argument for the sidecar (#17), not a footnote to it.** One float
+table is 5,540 tokens — 27% of the module — that the editor must retype exactly
+on every single rewrite, and nothing checks it came back unchanged. The ceiling
+fix makes the loop work; moving the tables out is what makes it sane.
+
 ### The better fix, not taken here
 
 Raising the ceiling treats the symptom. The real problem is that **~2.5k tokens

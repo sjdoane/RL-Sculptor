@@ -1794,10 +1794,13 @@ def test_a_generated_per_mode_reward_gets_room_to_be_rewritten():
     ceiling = _rewrite_token_ceiling(source)
 
     assert ceiling > MAX_TOKENS
-    # Must clear the module's own token count with room for the edit, or the
-    # response is truncated again for the same reason.
-    module_tokens = len(source) / 3.5
-    assert ceiling > module_tokens * 1.4
+    # Must clear the module's own token count with room for BOTH the edit and
+    # the adaptive thinking charged against the same ceiling. The live v1.py
+    # measures 20,173 real tokens at 49,310 bytes (2.44 B/tok); a first pass
+    # assumed 3.5 B/tok, issued 22,541, and truncated on both attempts.
+    MEASURED_BYTES_PER_TOKEN = 2.44
+    module_tokens = len(source) / MEASURED_BYTES_PER_TOKEN
+    assert ceiling > module_tokens * 2.0
 
 
 def test_rewrite_ceiling_grows_monotonically_with_source_size():
@@ -1860,3 +1863,26 @@ def test_a_big_module_gets_both_ceilings_raised_together():
     ceiling = _rewrite_token_ceiling(big)
     assert ceiling > MAX_TOKENS
     assert _rewrite_http_timeout_s(ceiling) > BASE_HTTP_TIMEOUT_S
+
+
+def test_the_bytes_per_token_estimate_stays_conservative():
+    """Measured with `messages.count_tokens` on the live per-mode reward:
+    49,310 bytes -> 20,173 tokens (2.44 B/tok), and its float tables alone run
+    1.50 B/tok. The constant must stay at or under the measured mixed case —
+    erring low errs toward a larger ceiling, which is the safe direction."""
+    from sculptor.edit import _BYTES_PER_TOKEN
+
+    MEASURED_WHOLE_MODULE = 2.44
+    MEASURED_FLOAT_TABLE = 1.50
+    assert _BYTES_PER_TOKEN <= MEASURED_WHOLE_MODULE
+    # Below the float-table ratio would be pure waste on every ordinary reward.
+    assert _BYTES_PER_TOKEN >= MEASURED_FLOAT_TABLE
+
+
+def test_the_rewrite_ceiling_is_hard_capped():
+    """A pathological module must not request a budget the API rejects."""
+    from sculptor.edit import MAX_REWRITE_TOKENS, _rewrite_token_ceiling
+
+    assert _rewrite_token_ceiling("z" * 10_000_000) == MAX_REWRITE_TOKENS
+    # Probed against claude-opus-5, which accepted 96000.
+    assert MAX_REWRITE_TOKENS <= 96000
