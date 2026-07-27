@@ -1089,3 +1089,76 @@ drawn from a course run before this commit.
 
   The frozen wrists are worth a look on their own — four DoF at exactly 0.0000
   across all 444 frames is retargeting output, not human motion.
+
+---
+
+## §16 — what the first trained policy actually learned (and it isn't the kick)
+
+The run in §15 completed: 300 learning iterations, mean reward 177 → **3239**,
+`reward_spec.json` in `iter_1/` records `version: v1` with all three mode
+windows, so the policy demonstrably trained on the authored per-mode reward.
+
+It also learned to game it. `reward_trajectory.json`, first → last recorded
+sample:
+
+```
+mode_strike                  0.8064 -> 1.2979      strike.landing_absorption  0.4322 -> 0.6900
+mode_approach                0.0132 -> 0.0133      strike.landing_stability   0.3071 -> 0.5128
+mode_launch                  0.0037 -> 0.0040      joint_tracking             0.2700 -> 0.0343
+active_mode_index            1.4501 -> 1.8204      __episode_length          378    -> 535
+```
+
+Share of per-mode reward mass actually paid: **strike 98.6%, approach 1.0%,
+launch 0.4%.** Meanwhile `joint_tracking` — the term that makes the policy
+resemble the reference at all — fell by 8x.
+
+### Why
+
+Two effects compound, and neither is a bug in the generated code:
+
+1. **The terminal mode absorbs the tail.** The dispatch clamps time past the
+   last window into the last mode, matching `sculptor.modes.mode_at_frame`. The
+   windows are authored against a **3.7 s** clip; the mjlab G1 episode ran
+   **9.5–10.7 s** (cap 20 s). So `strike` owns 74–88% of every episode, not the
+   32% its authored window describes.
+
+   The model predicts `active_mode_index` 1.61 (at 477 steps) to 1.81 (at 1000);
+   observed mean was **1.75**. The clock is not drifting — this is the dispatch
+   working exactly as written.
+
+2. **Strike's terms pay ~15x more per step** than approach's, on top of owning
+   6x more time.
+
+Net: the cheapest policy is to survive a long episode standing stably and farm
+`landing_absorption` + `landing_stability` forever. Reward went up 18x. The
+robot is not doing a running jump kick.
+
+### This is the reward-hacking the system exists to surface
+
+Worth being precise about what did and didn't work. The authoring loop, the
+graft, the info-key gate, promotion, and training all did their jobs — an LLM
+wrote three mode rewards, they were scoped correctly, and a policy optimized
+them. The failure is at the level *above* the per-mode terms: **nothing ties the
+episode to the clip**, so the automaton's proportions are silently rescaled by
+whatever episode length the base task happens to use.
+
+### Candidate fixes, in the order I would try them
+
+1. **End the episode when the automaton ends.** A reference-tracking episode
+   that runs 3x the clip is not tracking the clip for 2/3 of its life. This is
+   the honest fix and it makes every mode's authored window mean what it says.
+2. **Do not clamp — pay nothing past the terminal window.** Cheaper, but leaves
+   a long unrewarded tail the policy will still optimize against via the
+   survival bonus.
+3. **Normalize each mode's per-step pay by its window duration** so total mass
+   per mode matches the authored proportion. Fixes the magnitude half only; the
+   time-share half stays broken.
+
+Do **not** "fix" this by shrinking strike's weights by hand. The imbalance is
+structural — it would come back the moment the episode length changed.
+
+### Do not read the reward curve as progress
+
+Mean reward 177 → 3239 looks like a training success and is the opposite. Any
+future comparison across per-mode reward versions has to control for episode
+length, or it is comparing how long the robot stood up.
