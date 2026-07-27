@@ -827,6 +827,49 @@ def _resolve_common_joints(
     return clip_idx, rollout_idx, names
 
 
+#: `env_spec`'s validated bounds for `episode_length_s` (see
+#: `sculptor.env_spec`). A clip outside this window cannot cap its episode.
+_EPISODE_LENGTH_S_BOUNDS = (2.0, 60.0)
+
+
+def _cap_episode_to_reference(env_dir: Path, duration_s: float) -> bool:
+    """Cap the training episode to the reference's own duration.
+
+    Without this the episode runs its task default (~10 s) while the phase
+    clock finishes in `duration_s`, so the tail of every episode is the robot
+    holding the reference's last frame — on the 3.70 s composite that was 62%
+    of each episode. Worse, `compute_tracking_errors` index-aligns the WHOLE
+    rollout against the WHOLE clip, so a rollout 2.7x longer than the
+    reference compares mismatched phases and the certificate is meaningless.
+
+    Returns whether the cap was applied; a clip outside `env_spec`'s validated
+    `episode_length_s` window is left alone rather than written invalid."""
+    lo, hi = _EPISODE_LENGTH_S_BOUNDS
+    if not (lo <= duration_s <= hi):
+        return False
+    spec_path = env_dir / "current.json"
+    if not spec_path.is_file():
+        return False
+    try:
+        spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    spec.setdefault("shared", {})["episode_length_s"] = round(float(duration_s), 4)
+
+    from sculptor.env_spec import validate_env_spec
+
+    if validate_env_spec(spec):
+        return False  # never write a spec the validator rejects
+    payload = json.dumps(spec, indent=2, sort_keys=True)
+    spec_path.write_text(payload, encoding="utf-8")
+    # `apply_reference_rsi` writes the versioned copy alongside current.json;
+    # keep them identical so the run's recorded spec matches what it ran.
+    versioned = env_dir / f"{spec.get('meta', {}).get('version', 'v0')}.json"
+    if versioned.is_file():
+        versioned.write_text(payload, encoding="utf-8")
+    return True
+
+
 def clip_root_frame(clip: dict[str, Any]) -> str:
     """Whether `clip["root_pos_z"]` is a world height or an origin-relative
     excursion. Returns `"absolute"` or `"origin_relative"`.
@@ -1086,6 +1129,7 @@ def build_track_project(
 
     env_dir = project_dir / "env"
     apply_reference_rsi(env_dir, clip)
+    _cap_episode_to_reference(env_dir, duration_s)
     eval_reset = derive_eval_reset(clip)
     if eval_reset is not None:
         env_dir.mkdir(parents=True, exist_ok=True)

@@ -722,6 +722,55 @@ def test_phase_clock_tracks_wall_time_not_the_training_budget(tmp_path: Path):
     assert got != 2000
 
 
+def _donor(tmp_path: Path) -> Path:
+    d = tmp_path / "donor"
+    d.mkdir(exist_ok=True)
+    (d / "config.toml").write_text(
+        '[adapter]\nclass = "sculptor.adapters.mjlab.MjlabAdapter"\n'
+        '[adapter.config]\ntask_id = "t"\n', encoding="utf-8")
+    return d
+
+
+def _clip_of_duration(seconds: float, fps: float = 120.0) -> dict:
+    n = max(2, int(round(seconds * fps)))
+    return {
+        "root_pos_z": np.full(n, 0.05), "fps": fps,
+        "joint_pos": np.zeros((n, 2)),
+        "joint_names": ["left_hip_pitch_joint", "right_hip_pitch_joint"],
+    }
+
+
+def test_episode_is_capped_to_the_reference_duration(tmp_path: Path):
+    """Otherwise the episode outruns the phase clock and its tail is the robot
+    holding the last frame — and the scorer index-aligns a rollout far longer
+    than the reference, comparing mismatched phases."""
+    plan = build_track_project(
+        clip=_clip_of_duration(3.70), clip_id="c", robot="g1",
+        donor_project=_donor(tmp_path), project_dir=tmp_path / "proj")
+    spec = json.loads((plan.env_dir / "current.json").read_text())
+    assert spec["shared"]["episode_length_s"] == pytest.approx(3.70, abs=1e-3)
+
+
+def test_capped_episode_still_validates_as_an_env_spec(tmp_path: Path):
+    from sculptor.env_spec import validate_env_spec
+
+    plan = build_track_project(
+        clip=_clip_of_duration(4.0), clip_id="c", robot="g1",
+        donor_project=_donor(tmp_path), project_dir=tmp_path / "proj")
+    assert validate_env_spec(
+        json.loads((plan.env_dir / "current.json").read_text())) == []
+
+
+def test_a_clip_too_short_to_cap_is_left_alone(tmp_path: Path):
+    """env_spec floors episode_length_s at 2.0 s; a 1 s clip must not write an
+    invalid spec, it must simply not cap."""
+    plan = build_track_project(
+        clip=_clip_of_duration(1.0), clip_id="c", robot="g1",
+        donor_project=_donor(tmp_path), project_dir=tmp_path / "proj")
+    spec = json.loads((plan.env_dir / "current.json").read_text())
+    assert "episode_length_s" not in spec.get("shared", {})
+
+
 def test_static_baseline_constants_are_documented():
     assert STATIC_BASELINE_RATIO_MAX == 0.80
     assert MIN_REFERENCE_MOTION_RAD == 0.02
