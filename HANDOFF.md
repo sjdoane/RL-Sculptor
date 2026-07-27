@@ -1055,3 +1055,37 @@ drawn from a course run before this commit.
   `motion_ratio 1.147` — the tracker is *worse than holding the mean pose*
   (static baseline `0.165` rad). Item #9 is a clip/tracker problem, not a
   threshold problem; do not touch `STATIC_BASELINE_RATIO_MAX` to make it pass.
+
+  Measured the clip to find out why it loses to a static pose. It is **not** a
+  low-motion clip — the right knee sweeps 1.708 rad (98°) and leg joints average
+  0.206 rad of deviation. The problem is the *denominator*:
+
+  ```
+  whole-body mean |q - mean_q|   0.1489 rad   (8.5 deg)
+    leg joints (12)              0.2058 rad   peak 1.098
+    arm joints (14)              0.1178 rad
+  6/29 joints move < 0.05 rad on average
+  left/right wrist pitch + yaw:  0.0000 rad   <- frozen, all four
+  ```
+
+  `mean_joint_err_rad` averages uniformly over all 29 joints, so four
+  identically-frozen wrists plus two near-frozen joints deflate the static
+  baseline and the tracker's error together. The `beats_static_baseline` test
+  ends up decided partly by DoF that carry no task information at all.
+
+  Two separable questions for whoever picks this up, and they want different
+  fixes:
+  1. *Is the metric measuring the right thing?* A task-weighted or
+     motion-weighted joint error (weight by each joint's variance in the
+     reference) would stop dead wrists from voting. That is a metric change and
+     goes through the `metric_validate` gates like any other — it is **not** a
+     threshold relaxation, and must not be done by touching
+     `STATIC_BASELINE_RATIO_MAX`.
+  2. *Is the tracker actually learning the kick?* Independent of (1), 0.190 rad
+     mean error with a 1.098 rad peak excursion says it is smoothing through the
+     large leg swings. Look at per-joint error on `right_knee_joint` and
+     `right_hip_pitch_joint` specifically before concluding anything from the
+     whole-body average.
+
+  The frozen wrists are worth a look on their own — four DoF at exactly 0.0000
+  across all 444 frames is retargeting output, not human motion.
