@@ -853,7 +853,11 @@ class TrackingErrors:
     mean_joint_err_rad: float
     max_joint_err_rad: float
     root_z_rmse_m: float
-    duration_coverage: float  # rollout_frames / target_frames, clamped [0, 1]
+    #: Fraction of the reference's WALL TIME the rollout spans, clamped [0, 1].
+    #: Seconds, not frames — a 120 fps clip and a 50 Hz rollout of the same
+    #: 3.70 s have 444 vs 185 frames, and the frame ratio reported 41.7%
+    #: coverage for a rollout that ran the entire motion.
+    duration_coverage: float
     common_joint_names: list[str] = field(default_factory=list)
     n_common_joints: int = 0
     #: Which convention `root_z_rmse_m` was measured in — "absolute" (world
@@ -1022,6 +1026,7 @@ def compute_tracking_errors(
     rollout_root_z: np.ndarray,
     rollout_joint_names: list[str],
     rollout_gravity: Optional[np.ndarray] = None,
+    control_hz: float = DEFAULT_CONTROL_HZ,
 ) -> TrackingErrors:
     """Score a rollout (`trajectory.npz`-shaped arrays) against the clip
     it was tracking. `rollout_joint_pos` is `(T, J_rollout)`,
@@ -1041,7 +1046,18 @@ def compute_tracking_errors(
 
     t_rollout = rollout_root_z.shape[0]
     t_clip = clip_root_z.shape[0]
-    duration_coverage = min(1.0, t_rollout / t_clip) if t_clip > 0 else 0.0
+    # How much of the reference's WALL TIME the rollout spans. Frame counts are
+    # not comparable across the two: a 120 fps clip and a 50 Hz rollout covering
+    # the identical 3.70 s have 444 and 185 frames, and dividing those reported
+    # 41.7% coverage for a rollout that in fact ran the whole motion — exactly
+    # 50/120. Convert both to seconds first.
+    clip_fps = float(clip.get("fps") or 0.0)
+    clip_duration_s = (t_clip / clip_fps) if clip_fps > 0 else float(t_clip)
+    rollout_duration_s = (
+        (t_rollout / control_hz) if control_hz > 0 else float(t_rollout))
+    duration_coverage = (
+        min(1.0, rollout_duration_s / clip_duration_s)
+        if clip_duration_s > 0 else 0.0)
 
     common_names: list[str] = []
     mean_err = 0.0

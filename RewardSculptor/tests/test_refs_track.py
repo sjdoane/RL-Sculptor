@@ -482,7 +482,12 @@ def test_compute_tracking_errors_duration_coverage_short_rollout():
     errs = compute_tracking_errors(
         clip=clip, rollout_joint_pos=clip["joint_pos"][:short_len],
         rollout_root_z=clip["root_pos_z"][:short_len],
-        rollout_joint_names=clip["joint_names"])
+        rollout_joint_names=clip["joint_names"],
+        # This "rollout" is a prefix of the clip's OWN frames, so it is sampled
+        # at the clip's rate, not the G1 task's 50 Hz. Coverage is a wall-time
+        # ratio now, so the rate has to be stated truthfully for the frame
+        # ratio and the time ratio to coincide.
+        control_hz=clip["fps"])
     assert errs.duration_coverage == pytest.approx(short_len / 40)
 
 
@@ -1521,3 +1526,46 @@ def test_orientation_is_skipped_when_the_clip_has_no_quaternion():
         rollout_root_z=np.zeros(n), rollout_joint_names=["a", "b"],
         rollout_gravity=np.tile(np.array([1.0, 0.0, 0.0]), (n, 1)))
     assert e.orientation_err == 0.0
+
+
+def test_duration_coverage_is_wall_time_not_frame_count():
+    """The real case: a 444-frame 120 fps clip and a 185-step 50 Hz rollout
+    both span 3.70 s. Dividing frame counts reported 41.7% coverage — exactly
+    50/120 — for a rollout that ran the entire motion."""
+    from sculptor.refs.track import compute_tracking_errors
+
+    n_clip, n_roll = 444, 185
+    clip = {"joint_pos": np.zeros((n_clip, 2)), "joint_names": ["a", "b"],
+            "root_pos_z": np.zeros(n_clip), "fps": 120.0}
+    e = compute_tracking_errors(
+        clip=clip, rollout_joint_pos=np.zeros((n_roll, 2)),
+        rollout_root_z=np.zeros(n_roll), rollout_joint_names=["a", "b"],
+        control_hz=50.0)
+    assert e.duration_coverage == pytest.approx(1.0)
+
+
+def test_a_rollout_that_really_stops_early_still_reports_partial_coverage():
+    """The metric must not become vacuous — half the wall time is half."""
+    from sculptor.refs.track import compute_tracking_errors
+
+    clip = {"joint_pos": np.zeros((444, 2)), "joint_names": ["a", "b"],
+            "root_pos_z": np.zeros(444), "fps": 120.0}
+    e = compute_tracking_errors(
+        clip=clip, rollout_joint_pos=np.zeros((92, 2)),
+        rollout_root_z=np.zeros(92), rollout_joint_names=["a", "b"],
+        control_hz=50.0)
+    assert e.duration_coverage == pytest.approx(92 / 50 / 3.70, rel=1e-3)
+
+
+def test_duration_coverage_falls_back_to_frames_without_fps():
+    """A clip with no fps has no wall-clock interpretation; comparing frames is
+    the only thing left, and must not divide by zero."""
+    from sculptor.refs.track import compute_tracking_errors
+
+    clip = {"joint_pos": np.zeros((100, 2)), "joint_names": ["a", "b"],
+            "root_pos_z": np.zeros(100)}
+    e = compute_tracking_errors(
+        clip=clip, rollout_joint_pos=np.zeros((50, 2)),
+        rollout_root_z=np.zeros(50), rollout_joint_names=["a", "b"],
+        control_hz=0.0)
+    assert e.duration_coverage == pytest.approx(0.5)
