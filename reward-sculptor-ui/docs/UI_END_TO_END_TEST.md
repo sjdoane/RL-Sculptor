@@ -1,196 +1,199 @@
-# End-to-end UI test — run this yourself
+# End-to-end UI run — do this yourself
 
-Four tests, in order, shortest first. Each one stands alone: stop after any
-of them and you'll still have told me something useful. Times are measured
-on this machine (RTX 5070 Laptop), not estimates.
+One run, start to finish, through the UI. Two stages: a ~4 min stubbed
+check that proves the world is fixed, then a ~45 min real cycle-pair with
+live LLM calls. Times measured on this machine (RTX 5070 Laptop).
 
-| # | What it proves | Time | Costs |
-|---|---|---|---|
-| 1 | The last run's artifacts are real and visible | 2 min | nothing |
-| 2 | Per-mode reward authoring — the headline feature | ~5 min | 3 LLM calls |
-| 3 | Launch → train → rollout → diagnose plumbing | 50 s | nothing (stubbed) |
-| 4 | The real loop, end to end | ~1.9 h | GPU + LLM |
+---
 
-## Start
+## Step 0 — clear the stale iteration (one terminal command)
+
+`sculpt run` always passes `--resume`, and resume **skips training for any
+iteration already on disk**. `tracking-first-ui-verification` has
+`iter_1` from before the world fix, so a new run would reuse it and show
+you the same broken video. There is no UI toggle for this.
+
+```bash
+mv ~/.local/share/reward-sculptor/projects/tracking-first-ui-verification/runs/iter_1 ~/.local/share/reward-sculptor/projects/tracking-first-ui-verification/runs/_prefix_iter_1
+```
+
+Renamed, not deleted — the leading underscore takes it out of the
+`iter_*` glob the API lists, and you can move it back any time. The old
+run card stays in the Runs tab; its Replay will now say *no rollout on
+disk*, which is correct.
+
+Use **this** project, not a new one. A fresh project has no authored
+world, so it trains on flat ground and exercises none of the geometry
+that was broken.
+
+## Step 1 — start the UI
 
 ```bash
 cd ~/projects/reward-sculptor-ui && ./run.sh
 ```
 
-That's the only terminal command in this document. It starts both servers
-and opens <http://localhost:5173>. Ctrl+C stops everything. If you already
-had the UI open, reload the page once — the replay fixes below shipped
-after your last session.
-
----
-
-## Test 1 — see what's already on disk (2 min)
+Opens <http://localhost:5173>. Ctrl+C stops both servers. If it was
+already open, hard-reload the page once.
 
 Open **Projects → Tracking First UI Verification**.
 
-**1a. Overview tab → click `Replay`** (top-right of the robot viewer, next
-to `Static` and `Live`).
+---
 
-You should see:
-- the overlay reads **`replay · iter 1 · 10.00s`**
-- one iteration chip along the bottom: **`iter 1`**
-- a 10-second video, 1280×720
+## Step 2 — pipeline check (~4 min, no LLM spend)
 
-**This video shows a broken scene, and that is expected — it was rendered
-before the fix.** The frame is packed with interpenetrating orange and blue
-boxes and the robot is embedded in one of them. That is real: mjlab shares
-one model across all 1024 parallel environments and repeats the authored
-course at each one, but the environment grid pitch was mjlab's 2.0 m default
-while the course reaches 6.8 m forward — so every course overlapped its
-neighbours three deep and every robot spawned inside someone else's boxes.
-Fixed in `9e3e5cf`; **any run you launch now renders one clean course.** The
-old artifacts on disk are kept as-is rather than re-rendered, because the
-policy in them was trained in the broken scene and re-rendering would only
-make bad training look tidy.
+**Runs tab → New run.** Under **RUN PLAN** pick **Pipeline check**.
 
-So use this step to confirm the *player* works (10.00 s, iter 1, scrubbable),
-and judge the *scene* on a run you launch yourself in Test 3 or 4.
+That sets: 1 outer iteration, 100 rsl_rl iters, 256 envs, `--dry-run`
+(every LLM call stubbed), 180-step episodes, 1 rollout episode, 960×540.
 
-> This is what you were looking at before, and you were right to flag it.
-> The viewer was defaulting to a *different* run — a five-day-old
-> `four-box-parkour-demo / run_to_course` stage whose rollout is genuinely
-> **0.07 s long (7 frames)**. That run predates the constraint-budget fix;
-> its episode died after 7 physics steps. Three bugs stacked up to put it on
-> screen; all three are fixed in commit `7faa7de`. If a rollout is ever
-> that short again, the overlay now says so explicitly —
-> `replay · iter 0 · 0.07s truncated` in amber.
+**Behavior goal** — the box starts empty; paste this:
 
-**1b. Rewards tab.** Expect `Versions 2`, with **`v1 SCULPTOR 3.5`** and
-`v0 HUMAN`. Click `v1` — the source header should say
-*"Auto-generated per-mode reward scaffold for clip
-`novel-running-jump-kick--g1`"* and `MODE_WINDOWS_S` should list three
-modes: `approach` 0–1.25 s, `launch` 1.25–2.5 s, `strike` 2.5–3.7 s.
+```
+Run in, launch off one leg, and strike with the trailing leg at the apex, tracking the composed novel-running-jump-kick reference throughout.
+```
 
-**1c. Training tab.** The run card for `324d2a0b8a474b02` should read
-`COMPLETED`, `iter 1`, `r 3.5`, and:
+**Pre-existing motion → Choose motion.** Search:
 
-> `v1 · 5 edits filtered — reward_hacking, static_equilibrium, sparse_reward, reward_saturation`
+```
+running jump kick
+```
 
-That line means the diagnoser watched the rollout, correctly identified
-reward hacking, proposed 5 fixes — and pre-flight rejected all 5, so no v2
-was written. The diagnosis is the working part; the edit gate is what to
-scrutinise.
+Pick **`novel-running-jump-kick--g1`** (top hit, 444 frames @ 120 fps,
+3.7 s). The card should change to *"Motion prior attached"*. This is the
+headline research path — the clip becomes the immutable tracking base and
+the goal above can only add a bounded residual on top of it. Skip this
+and you're just training a kick from scratch.
 
-*Optional deep check:* in the Event log, set the filter to **`Log lines`**
-and look for `constraint budget for authored scene: njmax 300→1536`. That
-is the fix that stopped silent contact-row overflow. There should be zero
-`nefc overflow` lines in the whole run.
+Click **Launch**. The card's `~50 s` estimate is calibrated on cartpole;
+for G1 with an authored world expect **3–5 min** — about 40 s of env
+build, ~3 min of training, then rollout + render.
+
+### What to check while it runs
+
+**Training tab → Event log → filter `Log lines`.** Three lines prove the
+world fix is live:
+
+```
+env grid pitch for authored scene: env_spacing 2→7.796 m
+constraint budget for authored scene: njmax 300→1536
+event:world_route_state_initialization→50% entrance / 25% collision-local interior / 25% terminal-approach starts
+```
+
+The first is the fix for the interpenetrating boxes. The second is
+headroom. The third is the route reset that used to drop the robot
+through its own platforms.
+
+There should be **zero** `nefc overflow` lines.
+
+### What to check when it finishes
+
+**Overview tab → `Replay`** (top-right of the viewer, next to `Static`
+and `Live`).
+
+- **one** course, not a lattice of overlapping boxes
+- the robot standing **on** the ground and the platforms, not sunk into
+  them
+- overlay reads roughly **`replay · iter 1 · 1.3s`**
+
+**That short duration is the policy, not the player.** Clip length is
+`actual episode length × 0.02 s`, capped at `max_episode_steps` — not
+always the cap itself. A 100-iteration policy falls at about step 64, so
+you get ~1.3 s (measured here: 1.26 s, 63 frames). The old 10.00 s clip
+was a 500-step episode that survived to its cap. The genuinely-broken
+case you saw was 7 frames, and the viewer now labels anything under
+1.0 s `truncated` in amber. No amber label means the episode really ran
+that long.
+
+The scene is the whole point of this step. The policy will be bad — 100
+iterations is nothing — but the *scene* must be right. If it isn't, stop
+here and send me the frame.
 
 ---
 
-## Test 2 — author a per-mode reward (~5 min, no GPU)
+## Step 3 — the real run (~45 min, live LLM)
 
-This is the feature to judge. It takes a composed motion, splits it into
-OGMP modes, and has Claude write a separate reward for each phase.
+Run Step 0's command again if you want cycle 1 to actually train
+(the pipeline check just wrote a new `iter_1`).
 
-1. **Rewards tab**, scroll to the bottom card: **Per-mode reward**.
-2. In the search box type `running jump kick`, press **Search**.
-3. Pick **`novel-running-jump-kick--g1`** (top hit — "running approach into
-   a one-leg jumping kick", 444 frames @ 120 fps, 3.7 s).
-4. The card should now read *"3 modes at 120 fps. The windows and the
-   dispatch are generated from the automaton; a model writes only one
-   mode's terms per call."*
-5. Click **Scaffold reward**. Fast, no LLM — it writes the dispatch and the
-   mode windows and leaves the three `_mode_*` bodies as stubs. The three
-   modes (`approach`, `launch`, `strike`) each get an **Author** button.
-6. Click **Author** on each mode in turn. Each is a real Claude call,
-   **1–3 min**. The button reads `Authoring…` then `Authored`.
-7. When all three say `Authored`, click **Use for training**.
+**Runs tab → New run → Live rehearsal.** That is 2 outer cycles, 350
+rsl_rl iters each, 512 envs, real LLM calls, 300-step episodes, 2 rollout
+episodes, and it pauses for your feedback between cycles.
 
-**What to check:** step 7 is the one that used to silently do nothing.
-`mode_reward_v*.py` files are not reward versions, so the promote step has
-to copy the authored file into the version chain. This project currently
-has `v0` and `v1`, so promotion should write **`v2`** — the version list at
-the top of the tab should gain a **`v2 SCULPTOR`** entry whose source is
-your authored per-mode reward, not the starter `alive_bonus`. If the
-version count doesn't change, that's a bug worth reporting.
+Same behavior goal, and attach the same motion prior again — the dialog
+does not remember either between launches:
 
-**Worth deliberately breaking:** click **Use for training** after authoring
-only one or two modes. It should *refuse*, naming the unauthored modes — an
-empty stub pays zero reward for its slice of the episode, so promoting a
-half-authored module would silently train a reward that's blank for part of
-every rollout. If it promotes anyway, tell me.
+```
+Run in, launch off one leg, and strike with the trailing leg at the apex, tracking the composed novel-running-jump-kick reference throughout.
+```
 
-**Also worth judging:** open the authored source and read the three
-`_mode_*` bodies. Do the reward terms actually differ per phase, or did
-Claude write three variations of the same posture term? That is a research
-question I can't answer for you.
+The dialog estimates ~1.9 h; that is deliberately conservative. Measured
+here it is closer to **20 min per cycle**.
 
----
+Per cycle you should see, in the Training tab: train → rollout renders →
+live clip appears → diagnose → a reward edit proposed → **pause**. Each
+cycle's replay caps at 6.00 s (300 × 0.02) but will be shorter for as
+long as the policy is still falling early.
 
-## Test 3 — 50-second pipeline check
+**The pause is not a hang.** An amber card appears —
+*"Awaiting your feedback · after iteration 1"* — with a text box and
+**Continue** / **Continue + go Auto**. Type what you saw in the replay
+(or nothing) and press Continue.
 
-**Runs tab → New run.** Under **RUN PLAN**, pick **Pipeline check**
-(`~50 s · stubbed LLM · no GPU commitment`). The estimate line should
-update to `Estimated wall-clock: 50 s`. Click **Launch**.
+Useful feedback to paste for cycle 1, if the replay shows what I expect:
 
-This caps training at 1000 steps and stubs every LLM call, so it exercises
-launch → env build → train → rollout → render → diagnose plumbing without
-spending anything. Watch the **Training tab**: events should stream, a
-rollout should render, and the run should end `COMPLETED`.
+```
+The robot is not translating forward — it crouches and holds instead of running in. Weight the approach phase's forward progress much harder relative to posture, and check whether the episode is ending before the strike window is ever reached.
+```
 
-**Two things that will confuse you if you don't know them:**
-
-- **Manual mode is ON by default.** The run pauses after each iteration
-  with an amber card: *"Awaiting your feedback · after iteration N"*, a
-  text box, and **Continue** / **Continue + go Auto**. It is not hung. Type
-  what you saw (or nothing) and press Continue.
-- **Resume is on.** This project already has `iter_1` on disk, so a new run
-  reuses it instead of retraining. The dialog says so explicitly —
-  *"Resume is enabled — this project has 1 iter(s) on disk"*. For a truly
-  clean run, start a fresh project (**New project** → Robot Library →
-  **Unitree G1**, marked READY TO TRAIN).
+After cycle 2, the **Rewards tab** should show a new version and the
+Runs tab should show a `v_n → v_n+1` transition. If all proposed edits
+get filtered at pre-flight, no new version is written — that has happened
+before and is worth reporting, but it is a known behaviour, not a crash.
 
 ---
 
-## Test 4 — the real loop (~1.9 h)
+## Optional — per-mode reward authoring (~5 min, 3 LLM calls)
 
-Same dialog, pick **Live rehearsal** (`2 real cycles · pauses for
-feedback`). Estimate should read ~1.9 h. Launch, then leave the Training
-tab open.
+Independent of the run above; no GPU. This is the headline research
+feature: split a composed motion into OGMP modes and have Claude write a
+separate reward for each phase.
 
-Per cycle you should see: train → rollout renders → live clip appears →
-diagnose → reward edit proposed → the pause for your feedback. After it
-finishes, the Rewards tab should show a new version and the Runs tab should
-show the `v_n → v_n+1` transition.
+1. **Rewards tab**, bottom card: **Per-mode reward**.
+2. Search box: `running jump kick` → **Search**.
+3. Pick **`novel-running-jump-kick--g1`** (444 frames @ 120 fps, 3.7 s).
+4. Card reads *"3 modes at 120 fps…"*.
+5. **Scaffold reward** — instant, no LLM. Writes the dispatch and the
+   mode windows (`approach` 0–1.25 s, `launch` 1.25–2.5 s, `strike`
+   2.5–3.7 s), leaves three `_mode_*` bodies as stubs.
+6. **Author** on each mode in turn — a real Claude call each, 1–3 min.
+7. All three `Authored` → **Use for training**. The version list at the
+   top of the tab should gain a new `SCULPTOR` entry.
 
-**Overnight showcase** (4 cycles, auto, ~9.2 h) is the same thing without
-the pauses. Only worth it once Test 4 looks right.
+**Worth deliberately breaking:** hit **Use for training** after authoring
+only one mode. It should refuse and name the unauthored ones. An empty
+stub pays zero reward for its slice of every episode.
+
+**Worth judging:** open the authored source. Do the three `_mode_*`
+bodies actually differ, or are they three variations of the same posture
+term? I can't answer that for you.
 
 ---
 
-## What I'd most like to hear back
+## What I'd like back
 
-1. Did the Test 1 replay show `iter 1 · 10.00s`, or something else?
-2. In Test 2, did **Use for training** produce a new version?
-3. Do the three authored mode rewards look meaningfully different from each
-   other?
-4. Anything that looked broken, ambiguous, or that made you stop and guess.
+1. Step 2's replay frame — one course, feet on top?
+2. Did Step 3 reach a new reward version, or did pre-flight filter
+   everything?
+3. Anything ambiguous enough that you had to guess.
 
-Screenshots of anything odd are ideal — the run's slug and iteration number
-are enough for me to find the artifacts on disk.
+## Known-open, so you don't re-report it
 
-## Known-open, so you don't re-report them
-
-- `strike` carries 98.6 % of v1's reward mass — a real property of the
-  reward function, and the structural cause is that the training episode
-  isn't tied to the 3.7 s reference clip length. But the *behavioural*
-  reading I drew from it ("the policy learned to crouch and hold") is no
-  longer trustworthy: that policy trained with its legs inside solid boxes,
-  so it could not translate even if it wanted to. Needs re-collecting on a
-  correctly-pitched scene.
-- All five proposed edits were filtered at pre-flight, so v1 never advanced
-  to v2 automatically.
-- **Every authored-world run before `9e3e5cf` trained in an
-  interpenetrating scene** — all five projects with a course, not just the
-  parkour mission. Conclusions from those runs are being re-checked. The
-  constraint-budget increase I made earlier was treating a symptom of this;
-  with the pitch fixed the scene fits the task's own default.
-- `recert5` is INFEASIBLE: four wrist joints sit at exactly 0.0000 in the
-  reference, and `mean_joint_err_rad` averages uniformly over all 29
-  joints.
+- **Every authored-world run before `828fd18` trained in an
+  interpenetrating scene** — all five projects with a course. Any
+  conclusion drawn from those runs is being re-checked, including
+  "the policy learned to crouch and hold" (it couldn't translate; its
+  legs were inside solid boxes).
+- The training episode isn't tied to the 3.7 s reference clip length, so
+  `strike` carries most of the reward mass.
+- `recert5` is INFEASIBLE: four wrist joints sit at exactly 0.0000 in
+  the reference and `mean_joint_err_rad` averages over all 29 joints.
