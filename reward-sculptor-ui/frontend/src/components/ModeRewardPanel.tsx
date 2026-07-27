@@ -1,14 +1,17 @@
 import { useEffect, useState } from "react";
 import { Icon } from "@/components/rs/icon";
+import { Btn } from "@/components/rs/primitives";
 import {
   ApiError,
   authorModeReward,
   getJob,
   getReferenceModes,
+  listReferences,
   scaffoldModeReward,
   type ModeRewardResult,
   type ReferenceModeGraph,
 } from "@/lib/api";
+import type { RefIndexRow } from "@/lib/types";
 
 /**
  * Per-mode reward authoring for a composed reference.
@@ -28,15 +31,22 @@ import {
  */
 export function ModeRewardPanel({
   slug,
-  clipId,
+  clipId: initialClipId,
   robot = "g1",
   goal = "",
 }: {
   slug: string;
-  clipId: string;
+  /** The attached reference, when the reward already names one. Absent is
+   *  the normal case — per-mode authoring is what you do BEFORE there is a
+   *  tracking reward — so the panel can also find a composite itself. */
+  clipId?: string;
   robot?: string;
   goal?: string;
 }) {
+  const [clipId, setClipId] = useState<string>(initialClipId ?? "");
+  const [query, setQuery] = useState("");
+  const [hits, setHits] = useState<RefIndexRow[] | null>(null);
+  const [searching, setSearching] = useState(false);
   const [graph, setGraph] = useState<ReferenceModeGraph | null>(null);
   const [graphError, setGraphError] = useState<string | null>(null);
   const [reward, setReward] = useState<ModeRewardResult | null>(null);
@@ -46,9 +56,15 @@ export function ModeRewardPanel({
   const [modeGoals, setModeGoals] = useState<Record<string, string>>({});
 
   useEffect(() => {
+    if (!clipId) {
+      setGraph(null);
+      setGraphError(null);
+      return;
+    }
     let live = true;
     setGraph(null);
     setGraphError(null);
+    setReward(null);
     getReferenceModes(clipId, robot)
       .then((g) => live && setGraph(g))
       .catch((e) =>
@@ -62,17 +78,85 @@ export function ModeRewardPanel({
     };
   }, [clipId, robot]);
 
-  if (graphError) {
+  async function runSearch() {
+    setSearching(true);
+    try {
+      setHits(await listReferences({ robot, q: query, k: 8 }));
+    } catch {
+      setHits([]);
+    } finally {
+      setSearching(false);
+    }
+  }
+
+  const picker = (
+    <div style={{ marginTop: 10 }}>
+      <div className="rs-flex rs-gap-8">
+        <input
+          className="rs-input rs-grow"
+          style={{ fontSize: 12 }}
+          placeholder="find a composed reference, e.g. 'running jump kick'"
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          onKeyDown={(e) => e.key === "Enter" && runSearch()}
+        />
+        <Btn kind="ghost" size="sm" icon="search" onClick={runSearch}
+             disabled={searching}>
+          {searching ? "Searching…" : "Search"}
+        </Btn>
+      </div>
+      {hits && hits.length === 0 && (
+        <div className="rs-sub" style={{ fontSize: 11, marginTop: 8 }}>
+          No clips matched. Compose one from the reference picker first — a
+          per-mode reward needs a motion with more than one phase.
+        </div>
+      )}
+      {hits && hits.length > 0 && (
+        <div style={{ display: "grid", gap: 4, marginTop: 8 }}>
+          {hits.map((h) => (
+            <button
+              key={h.clip_id}
+              className="rs-btn rs-btn-quiet rs-btn-sm"
+              style={{ justifyContent: "flex-start", fontSize: 12,
+                       border: "1px solid var(--hairline)" }}
+              onClick={() => setClipId(h.clip_id)}
+            >
+              <span className="mono">{h.clip_id}</span>
+              {h.text && (
+                <span className="rs-sub" style={{ marginLeft: 8 }}>
+                  {h.text}
+                </span>
+              )}
+            </button>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+
+  if (!clipId || graphError) {
     return (
       <div className="rs-card" style={{ padding: 14 }}>
-        <div className="rs-banner info" style={{ fontSize: 12 }}>
-          <Icon name="info" size={15} />
-          <span className="rs-grow">
-            No mode automaton for <code>{clipId}</code> — {graphError}. Per-mode
-            rewards need a composed reference; a single clip is one mode with
-            nothing to transition to.
-          </span>
+        <div className="rs-flex rs-gap-8" style={{ marginBottom: 4 }}>
+          <Icon name="layers" size={16} />
+          <strong style={{ fontSize: 13 }}>Per-mode reward</strong>
         </div>
+        <div className="rs-sub" style={{ fontSize: 11 }}>
+          {graphError ? (
+            <>
+              No mode automaton for <code>{clipId}</code> — {graphError}. A
+              per-mode reward needs a composed reference; a single clip is one
+              mode with nothing to transition to.
+            </>
+          ) : (
+            <>
+              A composed reference's phases ARE its OGMP modes. Pick one and
+              each phase gets its own reward terms, paid only inside its own
+              window.
+            </>
+          )}
+        </div>
+        {picker}
       </div>
     );
   }
@@ -169,9 +253,10 @@ export function ModeRewardPanel({
 
   return (
     <div className="rs-card" style={{ padding: 14 }}>
-      <div className="rs-row" style={{ alignItems: "center", marginBottom: 4 }}>
+      <div className="rs-flex rs-gap-8" style={{ marginBottom: 4 }}>
         <Icon name="layers" size={16} />
         <strong style={{ fontSize: 13 }}>Per-mode reward</strong>
+        <span className="mono rs-sub" style={{ fontSize: 11 }}>{clipId}</span>
         <span className="rs-grow" />
         {reward && (
           <span className="rs-sub" style={{ fontSize: 11 }}>
@@ -186,13 +271,10 @@ export function ModeRewardPanel({
       </div>
 
       {!reward && (
-        <button
-          className="rs-btn"
-          disabled={busy !== null}
-          onClick={onScaffold}
-        >
+        <Btn kind="primary" size="sm" icon="layers"
+             disabled={busy !== null} onClick={onScaffold}>
           {busy === "scaffold" ? "Scaffolding…" : "Scaffold reward"}
-        </button>
+        </Btn>
       )}
 
       {reward && (
@@ -200,11 +282,7 @@ export function ModeRewardPanel({
           {reward.modes.map((m) => {
             const isDone = authored.has(m.name);
             return (
-              <div
-                key={m.name}
-                className="rs-row"
-                style={{ alignItems: "center", gap: 8 }}
-              >
+              <div key={m.name} className="rs-flex rs-gap-10">
                 <Icon
                   name={isDone ? "check-circle" : "circle"}
                   size={15}
@@ -226,13 +304,15 @@ export function ModeRewardPanel({
                     setModeGoals((g) => ({ ...g, [m.name]: e.target.value }))
                   }
                 />
-                <button
-                  className="rs-btn"
+                <Btn
+                  kind={isDone ? "quiet" : "primary"}
+                  size="sm"
+                  icon={isDone ? "check" : "sparkles"}
                   disabled={isDone || busy !== null}
                   onClick={() => onAuthor(m.name)}
                 >
                   {busy === m.name ? "Authoring…" : isDone ? "Authored" : "Author"}
-                </button>
+                </Btn>
               </div>
             );
           })}

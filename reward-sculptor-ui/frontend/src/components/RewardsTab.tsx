@@ -647,18 +647,19 @@ function ReadOnlyPane({
 
       <SpecPanel detail={detail} />
 
-      {/* Per-mode authoring for the attached reference. Shown next to the
-          spec because that is where the attached clip is already named, and
-          the two answer the same question from opposite ends: the spec says
-          what this reward IS, this says what each phase of it still owes. */}
-      {detail.spec.composition?.type === "reference_tracking_residual"
-        && detail.spec.composition.reference_clip_id && (
-        <ModeRewardPanel
-          slug={slug}
-          clipId={detail.spec.composition.reference_clip_id}
-          goal={detail.spec.description ?? ""}
-        />
-      )}
+      {/* Per-mode authoring. Seeded with the attached clip when the reward
+          already names one, but shown either way: authoring a per-mode reward
+          is what you do BEFORE there is a tracking reward, so gating it on
+          one would hide the feature exactly when it is wanted. */}
+      <ModeRewardPanel
+        slug={slug}
+        clipId={
+          detail.spec.composition?.type === "reference_tracking_residual"
+            ? detail.spec.composition.reference_clip_id ?? undefined
+            : undefined
+        }
+        goal={detail.spec.description ?? ""}
+      />
     </>
   );
 }

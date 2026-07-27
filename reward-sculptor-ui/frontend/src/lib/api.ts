@@ -1212,9 +1212,15 @@ export async function searchReferences(
 
 /** GET /references (no q) — the slim index listing. Used for the
  *  picker's empty-query state ("browse everything"). */
-export async function listReferences(opts?: { robot?: string }): Promise<RefIndexRow[]> {
+export async function listReferences(
+  opts?: { robot?: string; q?: string; k?: number },
+): Promise<RefIndexRow[]> {
   const u = new URL("/api/references", window.location.origin);
   u.searchParams.set("robot", opts?.robot ?? "g1");
+  // `q` switches the endpoint from the slim index listing to the retrieval
+  // search — same shape back, so callers that only list are unaffected.
+  if (opts?.q?.trim()) u.searchParams.set("q", opts.q.trim());
+  if (opts?.k) u.searchParams.set("k", String(opts.k));
   return handle<RefIndexRow[]>(await fetch(u.pathname + u.search));
 }
 
