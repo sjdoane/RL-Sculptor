@@ -105,11 +105,15 @@ export function useControlRun(slug: string) {
  *  Mirrors useStageIterations. */
 export function useProjectIterations(
   slug: string | undefined,
-  opts?: { enabled?: boolean },
+  opts?: { enabled?: boolean; refetchIntervalMs?: number | null },
 ) {
   return useQuery<StageIteration[]>({
     queryKey: slug ? qk.projectIters(slug) : ["projectIters", "_none"],
     queryFn: () => getProjectIterations(slug!),
     enabled: !!slug && (opts?.enabled ?? true),
+    refetchInterval:
+      typeof opts?.refetchIntervalMs === "number" && opts.refetchIntervalMs > 0
+        ? opts.refetchIntervalMs
+        : false,
   });
 }
