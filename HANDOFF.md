@@ -1336,3 +1336,36 @@ and that is the design question to settle first.
 
 Filed rather than done, because the ceiling fix unblocks the loop now and the
 sidecar change deserves its own review.
+
+### Verified end to end
+
+Third replay of the same call, with all three limits corrected:
+
+```
+old ceiling: 16000   new ceiling: 44827
+WROTE .../v2.py  (61,727 bytes, 1,235 lines)
+  TARGET_JOINT_POS     IDENTICAL
+  TARGET_ROOT_Z        IDENTICAL
+  TARGET_GRAVITY       IDENTICAL
+  _mode_approach / _mode_launch / _mode_strike        present
+  compute_reward / compute_reward_batched / _MODE_FNS present
+  MODE_WINDOWS_S                                      present
+```
+
+The loop can now evolve a per-mode reward. `v2` is a real edit, not a
+reformatting: `hyperparameters` goes from `{}` to a named set,
+`references` cites Bjelonic et al. (2025), a `grounding` map ties each
+hyperparameter to a paper, and the dead gated terms are replaced with floored
+variants (`launch_gate_floor`, `launch_support_floor`, `air_floor`,
+`land_vz_on_ref`) — which is what the diagnosis asked for. `mode_windows_s` is
+unchanged: the editor left the dispatch alone, as the scaffold instructs.
+
+The 928 floats came back byte-identical on this rewrite. That is one sample and
+nothing in the production path checks it — the replay harness did. #17 stands.
+
+**Method note.** This bug was "fixed" three times and only the third was real:
+raise the ceiling (unit tests green, end-to-end died on APITimeoutError) → scale
+the timeout (unit tests green, truncated twice more) → actually count the tokens.
+Every round the tests passed. The only thing that found the next layer was making
+the real call — the same lesson as the `njmax` bug in §15, where the build was
+green while the physics was wrong on 100% of steps.
