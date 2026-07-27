@@ -1133,6 +1133,26 @@ Net: the cheapest policy is to survive a long episode standing stably and farm
 `landing_absorption` + `landing_stability` forever. Reward went up 18x. The
 robot is not doing a running jump kick.
 
+### The rollout confirms it visually and numerically
+
+`iter_1/rollout/keyframes/frame_04.png` and `frame_11.png` are, to the eye, the
+same image: same crouch, same arm position, same stance. Measured over the
+500-step (10 s) rollout, 64 envs:
+
+```
+mean_episode_length            500.0 steps   <- all 6 episodes hit the cap, zero terminations
+net horizontal displacement    0.297 m       -> 0.030 m/s   (the reference is a RUN)
+total path length              0.895 m
+root height                    0.798 -> 0.610 m, range 0.190 m over the whole episode
+joint |dev| from own mean      0.0384 rad (2.20 deg), last 8 s
+  reference clip, same measure 0.1489 rad (8.53 deg)   -> policy moves 4x LESS than the clip
+double support                 75.9%
+```
+
+A running jump kick that travels 30 cm in ten seconds at 3 cm/s, never leaves
+double support for long, and holds its joints four times stiller than the
+reference is not a running jump kick. The policy crouched once and held.
+
 ### This is the reward-hacking the system exists to surface
 
 Worth being precise about what did and didn't work. The authoring loop, the
