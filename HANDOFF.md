@@ -480,3 +480,254 @@ Two things fall out of actually reading it that the abstract does not tell you:
    achievable threshold; inventing one would be a made-up number. Set it from
    data once a run certifies. `test_orientation_does_not_gate_certification`
    pins that on purpose — a fully inverted rollout is still `feasible` today.
+
+---
+
+## 11. Progress update 2026-07-26 — the gauntlet runs PER MODE and PER TRANSITION
+
+Task 2 (§4), the gating half. `sculptor/modes.py` writes the hybrid automaton
+down and its own docstring says it stops short of running the gauntlet against
+it; this is that piece. Per-mode reward **authoring** is a separate, concurrent
+workstream (`sculptor/mode_rewards.py`) — untouched here.
+
+### What landed
+
+`sculptor/eval/mode_metrics.py`, `prompts/gen_mode_metric.md`,
+`prompts/review_mode_metric.md`, `tests/test_mode_metrics.py` (47 tests), plus
+two additive parameters on `generate_objective_metric`.
+
+1. **Per-mode scoring.** `score_modes(fn, arrays, behavior, meta, graph)` slices
+   a rollout to each mode's window and scores each slice, with `metrics_by_mode`
+   so a mode is graded by its OWN metric. On the test fixture — a rollout that
+   moves for its first half and is frozen for its second — the episode score is
+   **0.50 and looks survivable while `strike` scores 0.000**. That is the whole
+   claim: the degenerate half gets an address instead of being averaged away.
+   The iter-29 campaign in §9 is what this is for; nothing in that loop could
+   say which part of the route had collapsed, because nothing scored a part.
+   Slices cross the real untrusted-code boundary, not just a test callable: one
+   test drives `score_modes` with a metric loaded through
+   `load_generated_metric`, so the seccomp worker's array-IPC wire format is
+   exercised on sliced arrays.
+
+2. **Wall time, not frame counts.** Windows come from `mode_phase_windows`
+   (SECONDS), and `resolve_step_dt` READS the rollout's own `step_dt` and
+   **raises rather than defaulting to 0.02**. A 120 fps reference and a 50 Hz
+   rollout describe the same 2 s; matching by frame count would put a boundary
+   at frame 120 of a 100-frame rollout. This repo has shipped a silently-wrong
+   phase clock twice (§10: `episode_len_steps` from `max_iterations`; the
+   Physics tab's 500 vs 200 Hz), and a wrong clock here is worse than a crash —
+   every mode still gets a plausible score, attributed to the wrong mode.
+
+3. **An unentered mode is not a zero.** A mode the episode ended before reaching
+   is `scored: False, score: None`. "Never performed" and "performed
+   degenerately" are opposite diagnoses — the first says the policy stalls
+   earlier, the second says this mode's reward is wrong — and collapsing them to
+   0.0 destroys exactly what per-mode scoring adds.
+
+4. **Per-transition guard firing.** `check_transitions` answers, per guard,
+   whether it fired. Phase guard: *"the approach→strike guard fires at 1.000s
+   but the rollout is 40 frames (0.800s) long — the policy never left
+   approach."* Predicate guard: the verdict from `mission_runtime`'s isolated
+   seccomp evaluator, the SAME one that runs mission success criteria and never
+   an inline eval, as `modes.Guard` requires. No namespace → `fired: None`, an
+   explicit abstain that is never collapsed into `False`.
+
+5. **The existing quality machinery, re-pointed one mode at a time.**
+   `validate_mode_metrics` runs the **unmodified** `validate_generated_metric`
+   per mode with the mode's own goal and its own CROPPED slice of the reference
+   (`mode_reference_clip`, cut at the composition's real seam frames), so the
+   perturbation suite asks "can this metric tell THIS PHASE from this phase
+   reversed / frozen / shuffled". `calibrate_mode_metrics` runs
+   `calibrate_task_derived` per mode, which is what points the metric-blind
+   ladder author AND the metric-blind gaming author at the sub-behavior. That
+   last one is the least obvious and the sharpest test in the set: an
+   episode-wide gaming policy has to fool every phase at once, a mode-scoped one
+   only has to fool a two-second window. It defaults to `adversarial=True`
+   here — new surface starts strict rather than being loosened into strictness
+   later.
+
+6. **A per-mode report.** `mode_gauntlet_report` + `render_mode_report` key every
+   finding by mode and print the episode score **last** — leading with it is the
+   thing that hid the failure in the first place.
+
+### The per-mode goal must NOT be the episode goal
+
+`resolve_behavior_family` word-matches the whole goal string. Splice the episode
+goal into a mode goal and every mode of "run up and kick the ball" resolves to
+family `kick` — so the approach mode's non-degeneracy is anchored against a kick
+positive and an honest run-up metric is false-rejected. `mode_goal_text`
+therefore returns the mode's OWN goal only (a caller-supplied `mode_goals` entry,
+else the humanized mode name), and the episode goal reaches the author as
+*context* through the prompt appendix, where it informs the prose without
+steering family resolution. `goal_source` records which of the two was used, so a
+report never implies more grounding than there was.
+
+### What I deliberately did NOT gate, and why
+
+* **Guard firing.** Reported; gates nothing. Whether a guard fired is a fact
+  about the ROLLOUT (did the episode last long enough, did the predicate hold);
+  this package's gates judge METRICS. A policy that stalls in mode 1 is a thing
+  to diagnose, not evidence that mode 1's metric is bad.
+  `test_guard_firing_is_reported_but_never_fails_a_metric` pins it.
+* **Mode coverage.** The fraction of a mode's window a rollout reached is a
+  number in the record and nothing more. There is no data behind any particular
+  coverage floor — same reasoning as `TrackingErrors.orientation_err` in §10.
+* **`worst_mode_gap`** (episode score − worst scored mode). This is the exact
+  signature of "a degenerate sub-motion averaged away", and it is still only
+  reported. Where to draw a line on it is unknown, so drawing one would be an
+  invented number.
+* **No new synthetic positive, anywhere.** Running the gate "per mode" changes
+  WHICH GOAL is passed and nothing else.
+  `test_per_mode_validation_adds_no_synthetic_positive_to_the_fixed_battery`
+  asserts the `archetype_scores` and `gates` produced through the mode layer are
+  identical to a direct `validate_generated_metric` call. Nothing in
+  `metric_validate.py` / `metric_axioms.py` / `metric_gen.py` was relaxed; the
+  only change to `metric_gen.py` is two optional `*_appendix` parameters that ADD
+  system-prompt text (default `None` → byte-identical, pinned by a test) and can
+  neither remove a rule from the shared rubric nor touch a gate.
+
+### Found while doing this, and out of my scope
+
+1. **`modes.py` accepts a mode finer than the control rate.** `Mode("wind_up",
+   (0, 1))` on a 120 fps reference is 0.0083 s — below one step at 50 Hz.
+   `validate_mode_graph` only checks `lo < hi` in FRAMES, so it validates, and
+   nothing downstream can score it. `mode_metrics` reports it distinctly
+   (`shorter_than_one_step`) rather than mislabelling it "never entered", but the
+   real fix is for the automaton to know the control rate, or at minimum for
+   `validate_mode_graph`'s docstring to say frame ranges are unchecked against
+   it. Same family as the Nyquist finding in §10.
+2. **A phase guard is a clock, and "fired" invites a misread.** `modes.py` calls
+   a guard that never fires a diagnosable event, which is right — but "fired"
+   means only that the episode lasted long enough to reach the handover time,
+   NOT that the sub-behavior succeeded. What the mode achieved is what
+   `score_modes` measures. Worth one sentence in `Guard`'s docstring; today a
+   reader has to infer it.
+3. **`Mode` carries no goal text.** `Mode(name, frame_range, reward_terms,
+   success_predicate)` — a per-mode metric needs a goal, and
+   `modes_from_composition` derives names from free-text composition segment
+   labels (`mode_2` when unlabeled). A `goal_text` field would remove the
+   caller-supplied `mode_goals` map entirely.
+4. **The isolated criterion evaluator is private.**
+   `mission_runtime._evaluate_success_criterion` / `._build_criterion_namespace`
+   are the only isolated expression evaluator in the codebase, and `modes.Guard`
+   explicitly delegates predicate guards to them. `mode_metrics` imports the
+   private name knowingly — a second evaluator would be a second security
+   boundary to audit — but they want a public alias.
+5. **Nothing derives a predicate guard from data yet.** `modes_from_composition`
+   emits phase guards only, so every derived automaton's handovers are pure
+   clocks. Predicate guards work end to end here (tested against the real
+   sandbox) but have no producer.
+
+### Verification
+
+`tests/test_mode_metrics.py`: **47 passed**. Full library suite
+(`MUJOCO_GL=egl uv run pytest tests/ -q -m "not gpu"`): **2507 passed, 1 skipped
+(jax), 7 deselected, 0 failed**.
+
+GPU-marked tests were deselected on purpose — a ~6.5 h `sculpt refs track`
+certification was live on the GPU and a smoke train would have contended with
+it. Note that `conftest.py`'s auto-skip does not cover this case: it skips
+`@gpu` only when CUDA is ABSENT, and CUDA is present precisely because the
+certification is running, so a plain `pytest tests/` would have started a
+second GPU job. Re-run those 7 once the GPU is free.
+
+## 12. Progress update 2026-07-26 — per-mode reward AUTHORING
+
+Task 2 (§4), the authoring half, concurrent with §11's gating half.
+`sculptor/modes.py` writes the automaton down; §11 scores against it; this turns
+it into reward code. File ownership was disjoint by design — nothing here
+touches `sculptor/eval/**`, nothing in §11 touches `sculptor/mode_rewards.py`.
+
+### What landed
+
+`sculptor/mode_rewards.py`, `tests/test_mode_rewards.py` (50 tests),
+`tests/test_modes_cli.py` (13), and a `sculpt modes` CLI (`show` / `scaffold` /
+`author`).
+
+1. **The gating is derived, not authored.** The obvious approach — prompt an LLM
+   for one module handling all the modes — puts the gating inside generated
+   code, where it is unverifiable and silently wrong when the phase clock is
+   off. **Both real Tier-D failures in this repo were clock bugs, not reward
+   bugs** (§10). So `generate_mode_reward_scaffold` emits the clock, the windows
+   and the dispatch deterministically from the graph, and the LLM fills one
+   function body per mode. `apply_prompt_edit`'s KG grounding, repair retries and
+   pre-flight probes all keep working unchanged — the only new thing is what the
+   prompt asks for.
+
+2. **Two functions per mode, because mjlab only calls one of them.**
+   `adapters/mjlab.py:670` dispatches to `compute_reward_batched` and treats its
+   absence as a reward-contract violation. A scalar-only scaffold could never
+   have trained. Each mode now has a `_batched` twin, and `authored_modes`
+   requires BOTH — a mode written only in the scalar half evaluates correctly in
+   replay and pays exactly zero in training, which reads as a *bad* reward
+   rather than a missing one.
+
+3. **Per-env masking, not a scalar clock.** mjlab's envs reset independently, so
+   at any step they sit at different points in the automaton. `_mode_masks`
+   mirrors `active_mode` term for term and a test sweeps 260 steps asserting the
+   two paths never disagree about which mode owns an instant — a rollout is
+   SCORED through the scalar path (§11) and TRAINED through the batched one, and
+   disagreement would mean grading terms the policy was never paid for.
+
+4. **`torch.where`, not `mask * value`.** Every mode's function runs for every
+   env before masking (that is what makes it vectorizable), but a mode's terms
+   are only defined inside its own window. `0.0 * nan == nan`, so a multiply
+   lets one out-of-window env poison the whole batch. Measured on a mode whose
+   term is `sqrt(t - 1.0)`: a multiply spreads nan to **63 of 260 steps**,
+   `where` gives **0**, and the in-window value is untouched — a numerical bug
+   inside the window still surfaces, which is the right direction to fail in.
+
+5. **The tracking backbone, so a scaffold is trainable before it is authored.**
+   Pass `clip=` and the module carries the same two-Gaussian-plus-orientation
+   reward `refs/track.py` emits — the one that took a Tier-D rollout from 28% of
+   the reference's joint amplitude to 85%. Without it a scaffold pays zero until
+   every mode is authored, and even then nothing tells the policy to follow the
+   reference. With it, `sculpt modes scaffold` produces a trainable reward
+   immediately and authoring adds mode-specific task terms on top. That layering
+   is OGMP's own shape: one oracle tracked throughout, a per-mode objective
+   above it. The tracking clock stays GLOBAL over the composite (the automaton
+   decides which TASK terms apply; it does not change what the robot should be
+   tracking) — re-anchoring phase per mode is defensible but would mean the
+   backbone is no longer the version that has been measured.
+
+6. **The prompt budgets for its own limit.** `apply_prompt_edit` hard-rejects a
+   prompt over 2000 chars (`edit.py:2042`) and a behavior goal is free text a
+   user typed. Unbudgeted, a long goal failed at the *end* of the authoring
+   call, after the KG query, with an error about a character count. The fixed
+   part is now 1500 chars and the free text is truncated visibly, in
+   `--print-prompt`, before any model is called.
+
+### Verified live
+
+`sculpt modes show --clip-id novel-running-jump-kick--g1` reads the real
+composite's own provenance: 3 modes @ 120 fps — `approach` [0,150) = 0.000–1.250s
+from `50002_running_on_spot_poses_60_jpos`, `launch` [150,300) = 1.250–2.500s
+from `50002_one_leg_jump_poses_60_jpos`, `strike` [300,444) = 2.500–3.700s from
+`0016_kicking1_poses_120_jpos`. `sculpt modes scaffold` on that clip emits a
+386-line module: `N_JOINTS=29`, `N_PHASE=32`, `REFERENCE_DURATION_S=3.7`,
+`ORIENTATION_ERR_WEIGHT=4.0`, `supports_batched: True`. Both paths run finite
+over the whole episode, and the scalar/batched `joint_tracking` and
+`orientation_tracking` agree to **4e-8** (`root_tracking` differs by
+construction — scalar absolute z vs batched delta-from-frame-0, per §10's
+origin-relative finding). The generated module clears `edit.py`'s real
+`_call_compute_reward_batched` probe on an mjlab-shaped contract, on one
+declaring no info keys, and with the backbone present.
+
+### Still open in this lane
+
+1. **No end-to-end LLM authoring pass has run.** `sculpt modes author` is wired
+   through `apply_prompt_edit` and every guard around it is tested
+   (stale-scaffold refusal, unknown mode, missing contract, silent-no-op
+   detection), but no mode has actually been authored by a model yet. That needs
+   a project whose adapter supplies the contract; the GPU was busy with recert5.
+2. **The backbone duplicates `refs/track.py`'s emitter.** Both build the same
+   phase tables and the same two-Gaussian formula. `mode_rewards` imports the
+   pure helpers (`downsample_phase_targets`, `projected_gravity_from_quat`,
+   the weights) but re-emits the source text. Factoring out one shared fragment
+   is the right fix and was deliberately NOT done while a `refs track` job had
+   `track.py` loaded — worth doing next, since two copies of a phase clock is
+   exactly the shape of the bug that has bitten twice.
+3. **`Mode` still carries no goal text** — same finding as §11's #3, reached
+   independently. `generate_mode_reward_scaffold` takes a `goal_by_mode` map and
+   `mode_authoring_prompt` takes `mode_goal` for the same reason. A `goal_text`
+   field on `Mode` would delete both.

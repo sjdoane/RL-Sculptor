@@ -64,6 +64,21 @@ from sculptor.eval.metric_calibration import (
 )
 from sculptor.eval.metric_gen import generate_objective_metric
 from sculptor.eval.metric_validate import validate_generated_metric
+from sculptor.eval.mode_metrics import (
+    ModeMetricError,
+    ModeSlice,
+    calibrate_mode_metrics,
+    check_transitions,
+    generate_mode_metrics,
+    mode_gauntlet_report,
+    mode_goal_text,
+    mode_reference_clip,
+    mode_slices,
+    render_mode_report,
+    resolve_step_dt,
+    score_modes,
+    validate_mode_metrics,
+)
 from sculptor.eval.spec_metrics import (
     compute_spec_metrics,
     make_spec_fitness_fn,
@@ -110,6 +125,19 @@ __all__ = [
     "load_and_verify_study_key",
     "validate_generated_metric",
     "generate_objective_metric",
+    "ModeMetricError",
+    "ModeSlice",
+    "calibrate_mode_metrics",
+    "check_transitions",
+    "generate_mode_metrics",
+    "mode_gauntlet_report",
+    "mode_goal_text",
+    "mode_reference_clip",
+    "mode_slices",
+    "render_mode_report",
+    "resolve_step_dt",
+    "score_modes",
+    "validate_mode_metrics",
     "adversarial_archetype_gate",
     "adversarial_archetype_gate_spec",
     "calibrate_metric",
