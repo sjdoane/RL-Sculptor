@@ -717,9 +717,38 @@ def test_phase_clock_tracks_wall_time_not_the_training_budget(tmp_path: Path):
     match = re.search(r"^EPISODE_LEN_STEPS = (\d+)", src, re.M)
     assert match, "reward must declare EPISODE_LEN_STEPS"
     got = int(match.group(1))
-    # 3.70 s at 50 Hz = 185 steps -- NOT the 2000 training budget.
-    assert got == round((n / fps) * DEFAULT_CONTROL_HZ) == 185
+    # 3.70 s at the measured 25 Hz = 92 steps -- NOT the 2000 training budget.
+    assert got == round((n / fps) * DEFAULT_CONTROL_HZ) == 92
     assert got != 2000
+    # ...and the reward carries the real duration so it can clock off step_dt
+    # rather than trusting the build-time rate at all.
+    assert re.search(r"^REFERENCE_DURATION_S = 3\.7", src, re.M)
+
+
+def test_phase_clock_prefers_step_dt_over_the_assumed_rate():
+    """Two build-time rate assumptions have already been wrong (the training
+    budget, then 50 Hz for a 25 Hz task). The reward must clock off the
+    `step_dt` mjlab publishes, so a wrong build-time rate cannot mistime it."""
+    n_phase = 32
+    src = generate_tracking_reward_source(
+        clip_id="c",
+        joint_names=["left_hip_pitch_joint"],
+        target_joint_pos=np.zeros((n_phase, 1)),
+        target_root_z=np.zeros(n_phase),
+        episode_len_steps=9999,        # deliberately absurd build-time value
+        duration_s=4.0,
+    )
+    ns: dict = {}
+    exec(compile(src, "tracking_reward", "exec"), ns)  # noqa: S102
+    phase_index = ns["_phase_index"]
+    # Half the reference elapsed (2.0 s of 4.0 s at 40 Hz) -> half the phases,
+    # despite EPISODE_LEN_STEPS claiming the episode is 9999 steps long.
+    assert phase_index({"episode_length": 80, "step_dt": 0.025}) == n_phase // 2
+    assert phase_index({"episode_length": 0, "step_dt": 0.025}) == 0
+    # Past the end clamps to the last phase rather than indexing out of range.
+    assert phase_index({"episode_length": 500, "step_dt": 0.025}) == n_phase - 1
+    # Without step_dt it falls back to the build-time count.
+    assert phase_index({"episode_length": 0}) == 0
 
 
 def _donor(tmp_path: Path) -> Path:

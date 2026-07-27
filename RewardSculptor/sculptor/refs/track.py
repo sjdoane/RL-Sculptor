@@ -100,12 +100,16 @@ ROOT_ERR_WEIGHT = 40.0
 #: (see `MjlabAdapter.train`'s docstring — `steps` IS max_iterations,
 #: not env steps), so this module trains ONE adapter.train() call with
 #: `steps=iterations`.
-#: Control rate the generated tracking reward assumes when converting the
-#: clip's duration into a phase-clock length. mjlab's G1 velocity task steps
-#: at 50 Hz (`step_dt` 0.02, see `_mjlab_runner`'s `video_params`). Exposed
-#: as a `build_track_project` argument so a task with a different rate can
-#: override rather than silently mistime the reference.
-DEFAULT_CONTROL_HZ = 50.0
+#: FALLBACK control rate for the build-time phase-clock length. The generated
+#: reward prefers the `step_dt` the mjlab runner publishes per step, so this
+#: only matters for an adapter that does not report it.
+#:
+#: Measured, not assumed: with `episode_length_s` capped to a 3.70 s reference
+#: the G1 velocity task reported a mean `episode_length` of 92.9 steps, i.e.
+#: 3.70 / 92.9 = 0.0398 s per control step. The 0.02 `step_dt` that appears in
+#: `_mjlab_runner`'s `video_params` is the PHYSICS timestep; the control loop
+#: decimates it by 2. Assuming 50 Hz here made the clock run at half speed.
+DEFAULT_CONTROL_HZ = 25.0
 
 DEFAULT_ITERATIONS = 3
 DEFAULT_STEPS_PER_ITERATION = 2000
@@ -240,6 +244,7 @@ def generate_tracking_reward_source(
     target_joint_pos: np.ndarray,
     target_root_z: np.ndarray,
     episode_len_steps: int,
+    duration_s: float = 0.0,
     joint_err_weight: float = JOINT_ERR_WEIGHT,
     root_err_weight: float = ROOT_ERR_WEIGHT,
 ) -> str:
@@ -323,6 +328,13 @@ JOINT_NAMES = {names_literal}
 N_JOINTS = {n_joints}
 N_PHASE = {n_phase}
 EPISODE_LEN_STEPS = {episode_len_steps!r}
+# The reference's true duration. The phase clock prefers wall time --
+# `episode_length * step_dt`, with `step_dt` published per-step by the mjlab
+# runner -- because EPISODE_LEN_STEPS has to assume a control rate at BUILD
+# time and that assumption has been wrong twice: first as the training budget
+# (2000 PPO updates), then as 50 Hz when the G1 task actually steps at 25 Hz
+# (physics 0.02 with decimation 2). Reading step_dt removes the guess.
+REFERENCE_DURATION_S = {duration_s!r}
 JOINT_ERR_WEIGHT = {joint_err_weight!r}
 ROOT_ERR_WEIGHT = {root_err_weight!r}
 
@@ -333,7 +345,13 @@ TARGET_ROOT_Z = np.asarray({root_z_literal}, dtype=np.float64)
 
 def _phase_index(info) -> int:
     step = int(info.get("episode_length", 0) or 0)
-    phase = (step / float(EPISODE_LEN_STEPS)) if EPISODE_LEN_STEPS > 0 else 0.0
+    step_dt = float(info.get("step_dt", 0.0) or 0.0)
+    if REFERENCE_DURATION_S > 0.0 and step_dt > 0.0:
+        phase = (step * step_dt) / REFERENCE_DURATION_S
+    elif EPISODE_LEN_STEPS > 0:
+        phase = step / float(EPISODE_LEN_STEPS)
+    else:
+        phase = 0.0
     phase = min(max(phase, 0.0), 0.999999)
     return int(phase * N_PHASE)
 
@@ -393,8 +411,14 @@ def compute_reward_batched(state, action, next_state, info):
     like = qpos[:, 0]
 
     step = info.get("episode_length", torch.zeros_like(like))
-    phase = torch.clamp(step / float(EPISODE_LEN_STEPS), 0.0, 0.999999) \
-        if EPISODE_LEN_STEPS > 0 else torch.zeros_like(like)
+    step_dt = info.get("step_dt", None)
+    if REFERENCE_DURATION_S > 0.0 and step_dt is not None:
+        phase = torch.clamp(
+            (step * step_dt) / REFERENCE_DURATION_S, 0.0, 0.999999)
+    elif EPISODE_LEN_STEPS > 0:
+        phase = torch.clamp(step / float(EPISODE_LEN_STEPS), 0.0, 0.999999)
+    else:
+        phase = torch.zeros_like(like)
     i = torch.clamp((phase * N_PHASE).long(), 0, N_PHASE - 1)
 
     target_joint = torch.as_tensor(
@@ -1120,6 +1144,7 @@ def build_track_project(
         target_joint_pos=target_joint_pos,
         target_root_z=target_root_z,
         episode_len_steps=episode_len_steps,
+        duration_s=duration_s,
     )
     rewards_dir = project_dir / "rewards"
     rewards_dir.mkdir(parents=True, exist_ok=True)
