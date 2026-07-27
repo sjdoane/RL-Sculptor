@@ -237,3 +237,65 @@ real kick clips for "jumping kick" (25.75 / 19.61 vs 18.51).
 3. **Tier-D certify a composite.** `refs.track` exists and compose emits
    `certified: false`; nothing has closed that loop on a composed clip yet.
 4. **TASK 3 (RMA teacher/student)** and **TASK 4** in §4 are untouched.
+
+---
+
+## 10. Progress update 2026-07-26 (Claude Opus 5) — the Tier-D root-frame bug
+
+### Why no clip had ever been certified
+
+Closing item 3 above surfaced a bug that had silently capped the whole
+reference library at tier K. `compute_tracking_errors` compared the clip's
+`root_pos_z` **directly** against the rollout's `root_link_pos_w[..., 2]` —
+but retargeted AMASS zeroes root translation, so a clip's `root_pos_z` is an
+*excursion* near 0 while the rollout reports a ~0.74 m **world** height.
+
+The two are not in the same frame. The resulting `root_z_rmse_m` measured the
+robot's standing height, not its tracking:
+
+| | before | after | gate |
+|---|---|---|---|
+| `root_z_rmse_m` | 0.7439 | **0.0251** | < 0.12 |
+| `mean_joint_err_rad` | 0.1685 | 0.1685 | < 0.35 |
+
+Measured library-wide: **5798 of 6015 g1 clips are origin-relative** (217 carry
+absolute heights), and **all 6015 sat at tier K** — the `root_z_rmse_m < 0.12`
+gate was unsatisfiable for 96% of the library since it was written.
+
+The reward was never wrong: `compute_reward_batched` compares mjlab's
+`base_height_delta` (measured from each env's own reset anchor, supplied by
+`_mjlab_runner.py:661`) against the reference's excursion from its first
+frame. Its `root_tracking` term ran 0.776 → 0.953 over the real run — healthy,
+never saturated. So **the scorer was certifying something different from what
+the reward optimized**; the fix makes them agree.
+
+### What the fix is (and is not)
+
+`ROOT_Z_RMSE_THRESHOLD_M` is **unchanged at 0.12**. What changed is the frame:
+`clip_root_frame()` resolves a clip as `absolute` or `origin_relative`
+(explicit `clip["root_frame"]` wins, else the `ORIGIN_RELATIVE_MAX_ROOT_Z_M
+= 0.30` band), and only origin-relative clips have the constant offset divided
+out. That offset is recorded as `root_z_offset_m` on the certificate rather
+than dropped, so an auditor can always see what was *not* measured.
+
+Guardrails, in `tests/test_refs_track.py`:
+- a flat rollout that never leaves the ground while the reference hops still
+  **fails** (`test_origin_relative_scoring_still_fails_a_flat_rollout`);
+- an inverted rollout (crouches as the reference rises) still **fails**;
+- an absolute clip still charges a constant 20 cm offset as real error, so the
+  pre-existing intent is untouched.
+
+### Result: the first Tier-D clip in the library
+
+`novel-running-jump-kick--g1` — itself composed from three unrelated AMASS
+clips (running-on-spot + one-leg-jump + kicking) — is the first clip to pass:
+`mean_joint_err_rad` **0.1685** (2.1× margin) and `root_z_rmse_m` **0.0251**
+(4.8× margin) at `duration_coverage` 1.0 over 29 common joints. That is the
+Lokesh thesis end to end: solved data → novel motion → physics-certified.
+
+### Landmine that cost 13 GPU-hours
+
+`refs track` writes its throwaway project to `<clip_dir>/tierD_work/`, and
+`train/logs/model_*.pt` **survive a crash**. After the 2026-07-26 reboot the
+policy was recoverable and only needed rollout + scoring — do not restart a
+certification from zero without checking `tierD_work/train/logs/` first.

@@ -57,6 +57,18 @@ import numpy as np
 MEAN_JOINT_ERR_THRESHOLD_RAD = 0.35
 ROOT_Z_RMSE_THRESHOLD_M = 0.12
 
+#: Above which a clip's root height is read as a WORLD height, below which
+#: as an origin-relative excursion. Retargeted AMASS clips zero the root
+#: translation, so their `root_pos_z` is "height above the initial pose"
+#: and lives near 0 (measured library-wide: 5798 of 6015 g1 clips peak
+#: under 0.11 m) while a standing G1 base is ~0.74 m. A humanoid whose
+#: base stays under 0.30 m for an ENTIRE clip is not standing at any
+#: point, which no locomotion/jump/kick reference does — so this cleanly
+#: separates the two conventions. A clip may state the convention
+#: outright via `clip["root_frame"]`; the heuristic is only the fallback
+#: for the 6015 clips ingested before the field existed.
+ORIGIN_RELATIVE_MAX_ROOT_Z_M = 0.30
+
 #: Reward-shaping weights for the generated tracking reward's Gaussian
 #: kernels: `exp(-w * err**2)`. Chosen so a "close" pose (few-degree
 #: joint error, few-cm root error) scores near 1.0 while a "way off"
@@ -704,6 +716,15 @@ class TrackingErrors:
     duration_coverage: float  # rollout_frames / target_frames, clamped [0, 1]
     common_joint_names: list[str] = field(default_factory=list)
     n_common_joints: int = 0
+    #: Which convention `root_z_rmse_m` was measured in — "absolute" (world
+    #: heights compared directly) or "origin_relative" (vertical excursions
+    #: compared, each trace referenced to its own first frame).
+    root_frame: str = "absolute"
+    #: The constant world-height difference between the two traces' first
+    #: frames. Under "origin_relative" this is the frame offset that was
+    #: DIVIDED OUT and is not part of `root_z_rmse_m`; it is reported so a
+    #: certificate never hides what it chose not to measure.
+    root_z_offset_m: float = 0.0
 
     @property
     def feasible(self) -> bool:
@@ -720,6 +741,8 @@ class TrackingErrors:
             "duration_coverage": round(self.duration_coverage, 6),
             "common_joint_names": list(self.common_joint_names),
             "n_common_joints": self.n_common_joints,
+            "root_frame": self.root_frame,
+            "root_z_offset_m": round(self.root_z_offset_m, 6),
             "feasible": self.feasible,
             "thresholds": {
                 "mean_joint_err_rad": MEAN_JOINT_ERR_THRESHOLD_RAD,
@@ -750,6 +773,24 @@ def _resolve_common_joints(
             rollout_idx.append(ri)
             names.append(name)
     return clip_idx, rollout_idx, names
+
+
+def clip_root_frame(clip: dict[str, Any]) -> str:
+    """Whether `clip["root_pos_z"]` is a world height or an origin-relative
+    excursion. Returns `"absolute"` or `"origin_relative"`.
+
+    An explicit `clip["root_frame"]` wins; otherwise the height band decides
+    (see `ORIGIN_RELATIVE_MAX_ROOT_Z_M`). Unknown explicit values fall
+    through to the heuristic rather than raising — scoring a rollout must
+    never fail closed on a metadata typo."""
+    stated = clip.get("root_frame")
+    if stated in ("absolute", "origin_relative"):
+        return str(stated)
+    z = np.asarray(clip.get("root_pos_z", ()), dtype=np.float64)
+    if z.size == 0:
+        return "absolute"
+    return ("origin_relative" if float(np.max(z)) < ORIGIN_RELATIVE_MAX_ROOT_Z_M
+            else "absolute")
 
 
 def compute_tracking_errors(
@@ -800,10 +841,27 @@ def compute_tracking_errors(
             mean_err = float(np.mean(abs_err))
             max_err = float(np.max(abs_err))
 
+    # Root height must be scored in the SAME frame the reward optimized, or
+    # certification measures something the policy was never trained to do.
+    # `compute_reward_batched` compares mjlab's `base_height_delta` (measured
+    # from each env's own reset anchor) against the reference's excursion from
+    # ITS first frame. For an origin-relative clip the two traces therefore
+    # differ by a constant ~0.74 m frame offset that is not tracking error at
+    # all; comparing them raw made `root_z_rmse_m < 0.12` unsatisfiable for the
+    # 96% of the library that is origin-relative, and no clip had ever reached
+    # tier D. The offset is divided out here and reported separately as
+    # `root_z_offset_m` rather than silently dropped. Absolute clips keep the
+    # direct comparison — there a constant offset IS a real tracking error.
+    root_frame = clip_root_frame(clip)
     n = min(t_rollout, t_clip) if t_clip > 0 and t_rollout > 0 else 0
+    root_offset = 0.0
     if n > 0:
         clip_z_at_n = downsample_phase_targets(clip_root_z, n=n)
         rollout_z_at_n = downsample_phase_targets(rollout_root_z, n=n)
+        root_offset = float(rollout_z_at_n[0] - clip_z_at_n[0])
+        if root_frame == "origin_relative":
+            clip_z_at_n = clip_z_at_n - clip_z_at_n[0]
+            rollout_z_at_n = rollout_z_at_n - rollout_z_at_n[0]
         root_rmse = float(np.sqrt(np.mean((clip_z_at_n - rollout_z_at_n) ** 2)))
     else:
         root_rmse = float("inf")
@@ -815,6 +873,8 @@ def compute_tracking_errors(
         duration_coverage=duration_coverage,
         common_joint_names=common_names,
         n_common_joints=len(common_names),
+        root_frame=root_frame,
+        root_z_offset_m=root_offset,
     )
 
 

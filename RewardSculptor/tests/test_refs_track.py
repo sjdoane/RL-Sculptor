@@ -21,11 +21,13 @@ from sculptor.refs import library
 from sculptor.refs.track import (
     DEFAULT_ITERATIONS,
     MEAN_JOINT_ERR_THRESHOLD_RAD,
+    ORIGIN_RELATIVE_MAX_ROOT_Z_M,
     ROOT_Z_RMSE_THRESHOLD_M,
     TierDCertificate,
     TrackError,
     TrackingErrors,
     build_track_project,
+    clip_root_frame,
     compute_tracking_errors,
     downsample_phase_targets,
     generate_tracking_residual_reward_source,
@@ -489,6 +491,118 @@ def test_tracking_errors_to_dict_shape():
     assert d["feasible"] is True
     assert d["thresholds"]["mean_joint_err_rad"] == MEAN_JOINT_ERR_THRESHOLD_RAD
     assert d["thresholds"]["root_z_rmse_m"] == ROOT_Z_RMSE_THRESHOLD_M
+    # A certificate must say which convention it measured root height in.
+    assert d["root_frame"] == "absolute"
+    assert d["root_z_offset_m"] == 0.0
+
+
+# ── root-height frame convention ──────────────────────────────────────────
+#
+# Retargeted AMASS zeroes root translation, so a clip's `root_pos_z` is an
+# excursion near 0 while the rollout reports a ~0.74 m world height. Scoring
+# them against each other measured the standing height of the robot, not its
+# tracking, and made ROOT_Z_RMSE_THRESHOLD_M unreachable for 96% of the
+# library. These pin the frame resolution and — importantly — that dividing
+# the offset out does NOT let a vertically-wrong rollout through.
+STANDING_G1_BASE_M = 0.7624   # measured from the real g1 rollout
+
+
+def _make_hop_clip(n: int = 30, *, absolute: bool = False) -> dict:
+    """A clip that rises 0.25 m, holds, and returns. Origin-relative unless
+    `absolute`, in which case the same excursion sits on a standing base."""
+    z = np.concatenate([np.zeros(5), np.full(n - 10, 0.25), np.zeros(5)])
+    if absolute:
+        z = z + STANDING_G1_BASE_M
+    joint_pos = np.zeros((n, 2))
+    joint_pos[:, 0] = np.linspace(0.0, 0.1, n)
+    return {
+        "root_pos_z": z, "fps": 30.0, "joint_pos": joint_pos,
+        "joint_names": ["left_hip_pitch_joint", "right_hip_pitch_joint"],
+    }
+
+
+def test_clip_root_frame_detects_the_retargeted_amass_convention():
+    assert clip_root_frame(_make_hop_clip()) == "origin_relative"
+    assert clip_root_frame(_make_hop_clip(absolute=True)) == "absolute"
+    # The getup fixture spans 0.2 -> 0.75 m: a real world height.
+    assert clip_root_frame(_make_getup_clip(20)) == "absolute"
+
+
+def test_clip_root_frame_prefers_an_explicit_declaration():
+    """A clip that states its convention is believed over the height band."""
+    clip = _make_hop_clip()                      # would sniff origin_relative
+    clip["root_frame"] = "absolute"
+    assert clip_root_frame(clip) == "absolute"
+
+
+def test_clip_root_frame_falls_back_when_the_declaration_is_junk():
+    """A metadata typo must not fail scoring closed."""
+    clip = _make_hop_clip()
+    clip["root_frame"] = "world-ish"
+    assert clip_root_frame(clip) == "origin_relative"
+
+
+def test_origin_relative_clip_scores_the_excursion_not_the_standing_height():
+    """The real bug: a rollout that tracks the motion perfectly, offset by the
+    robot's standing height, must certify — the offset is a frame convention,
+    not tracking error."""
+    clip = _make_hop_clip()
+    rollout_z = clip["root_pos_z"] + STANDING_G1_BASE_M
+    errs = compute_tracking_errors(
+        clip=clip, rollout_joint_pos=clip["joint_pos"].copy(),
+        rollout_root_z=rollout_z, rollout_joint_names=clip["joint_names"])
+    assert errs.root_frame == "origin_relative"
+    assert errs.root_z_rmse_m < 1e-9
+    assert errs.feasible
+    # The offset is divided out, but recorded — never silently dropped.
+    assert errs.root_z_offset_m == pytest.approx(STANDING_G1_BASE_M, abs=1e-9)
+
+
+def test_origin_relative_scoring_still_fails_a_flat_rollout():
+    """The anti-gaming case. Dividing out the offset must not wave through a
+    robot that never leaves the ground while the reference hops."""
+    clip = _make_hop_clip()
+    flat = np.full(clip["root_pos_z"].shape, STANDING_G1_BASE_M)
+    errs = compute_tracking_errors(
+        clip=clip, rollout_joint_pos=clip["joint_pos"].copy(),
+        rollout_root_z=flat, rollout_joint_names=clip["joint_names"])
+    assert errs.root_frame == "origin_relative"
+    assert errs.mean_joint_err_rad < 1e-9        # joints track perfectly...
+    assert errs.root_z_rmse_m > ROOT_Z_RMSE_THRESHOLD_M   # ...height does not
+    assert not errs.feasible
+
+
+def test_origin_relative_scoring_still_fails_an_inverted_rollout():
+    """A rollout that crouches exactly when the reference rises has zero
+    constant offset and must fail on shape alone."""
+    clip = _make_hop_clip()
+    inverted = STANDING_G1_BASE_M - clip["root_pos_z"]
+    errs = compute_tracking_errors(
+        clip=clip, rollout_joint_pos=clip["joint_pos"].copy(),
+        rollout_root_z=inverted, rollout_joint_names=clip["joint_names"])
+    assert errs.root_z_rmse_m > ROOT_Z_RMSE_THRESHOLD_M
+    assert not errs.feasible
+
+
+def test_absolute_clip_keeps_charging_a_constant_offset_as_error():
+    """Unchanged behavior where the clip really is in world coordinates: a
+    robot standing 20 cm too high is not tracking, and the frame fix must not
+    quietly excuse it."""
+    clip = _make_getup_clip(20)
+    errs = compute_tracking_errors(
+        clip=clip, rollout_joint_pos=clip["joint_pos"].copy(),
+        rollout_root_z=clip["root_pos_z"] + 0.2,
+        rollout_joint_names=clip["joint_names"])
+    assert errs.root_frame == "absolute"
+    assert errs.root_z_rmse_m == pytest.approx(0.2, abs=1e-9)
+    assert not errs.feasible
+
+
+def test_origin_relative_threshold_constant_is_physically_separated():
+    """The band must sit well below a standing humanoid base and well above
+    the retargeted clips' peak excursion, or the sniff is a coin flip."""
+    assert ORIGIN_RELATIVE_MAX_ROOT_Z_M == 0.30
+    assert ORIGIN_RELATIVE_MAX_ROOT_Z_M < STANDING_G1_BASE_M / 2
 
 
 # ── donor-config templating ───────────────────────────────────────────────
