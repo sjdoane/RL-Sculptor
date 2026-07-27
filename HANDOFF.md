@@ -1277,6 +1277,25 @@ diagnosable at all — without it this surfaces as
 `SyntaxError: '(' was never closed`, which reads as a model failure rather than
 a budget one, and sends you looking in the wrong place.
 
+**The ceiling alone was not the fix, and only replaying the real call showed
+that.** Raising `max_tokens` and leaving the HTTP timeout at its 240s wall just
+relocates the failure: the first replay of the per-mode edit at a 22,541 ceiling
+died on `anthropic.APITimeoutError` instead. The 240s figure was calibrated
+against `MAX_TOKENS`, so the two have to move as a pair —
+`_rewrite_http_timeout_s` scales the wall with the ceiling, floored at 240s so
+every existing call site keeps its tuned budget exactly.
+
+That cascaded once more. Authoring runs at `AUTHOR_MAX_TOKENS = 32000`, so one
+attempt is ~480s and `apply_prompt_edit`'s two attempts are ~960s — past the
+flat 900s `DEFAULT_MODE_AUTHOR_TIMEOUT_S`, which would have killed a legitimate
+retry. That budget is now *derived* from `_rewrite_http_timeout_s(
+AUTHOR_MAX_TOKENS)` (1440s) rather than hardcoded, so raising either ceiling
+cannot silently outgrow it again.
+
+Three coupled limits, one of which was only visible by making the real call.
+Worth remembering that the unit tests for the ceiling all passed while the
+end-to-end path was still broken.
+
 ### The better fix, not taken here
 
 Raising the ceiling treats the symptom. The real problem is that **~2.5k tokens

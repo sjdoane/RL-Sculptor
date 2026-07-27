@@ -86,6 +86,20 @@ _BYTES_PER_TOKEN = 3.5
 _REWRITE_HEADROOM = 1.6
 
 
+#: Per-request HTTP ceiling at `MAX_TOKENS`, and the seconds-per-token it
+#: implies. 240s for 16000 tokens is the calibrated pair (see the client
+#: construction in `apply_edits`); anything above that ceiling gets
+#: proportionally longer, floored at the original 240s so every existing call
+#: site keeps its tuned budget exactly.
+BASE_HTTP_TIMEOUT_S = 240.0
+
+
+def _rewrite_http_timeout_s(max_tokens: int | None) -> float:
+    """HTTP timeout that matches the output ceiling it has to carry."""
+    limit = int(max_tokens or MAX_TOKENS)
+    return max(BASE_HTTP_TIMEOUT_S, BASE_HTTP_TIMEOUT_S * limit / MAX_TOKENS)
+
+
 def _rewrite_token_ceiling(source: str) -> int:
     """Output ceiling for rewriting `source` in full.
 
@@ -1761,9 +1775,16 @@ def apply_edits(
         # backoff envelope tight enough for a user-facing workflow
         # (was 6 — 10+ min backoff is fine for CLI batch, not for a
         # UI Rewards-tab button).
+        #
+        # The 240s figure is calibrated against MAX_TOKENS. Raising the
+        # ceiling for a large module without raising this just relocates the
+        # failure from "response was cut off" to APITimeoutError — measured,
+        # not predicted: the first replay of the per-mode edit at a 22,541
+        # ceiling died on the 240s wall. Scale them together.
         if client is None:
             import anthropic
-            client = anthropic.Anthropic(max_retries=2, timeout=240.0)
+            client = anthropic.Anthropic(
+                max_retries=2, timeout=_rewrite_http_timeout_s(max_tokens))
 
         # §7.2: load Eureka-format reward trajectory if present so the
         # rewrite prompt shows the SAME per-component data the diagnoser

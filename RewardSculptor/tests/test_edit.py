@@ -1829,3 +1829,34 @@ def test_apply_edits_ceiling_is_derived_from_the_reward_being_rewritten(
     assert edit_mod._rewrite_token_ceiling(big) == max(
         edit_mod.MAX_TOKENS,
         int(len(big) / edit_mod._BYTES_PER_TOKEN * edit_mod._REWRITE_HEADROOM))
+
+
+def test_http_timeout_scales_with_the_token_ceiling():
+    """Raising the output ceiling without raising the HTTP ceiling just moves
+    the failure from `response was cut off` to APITimeoutError. Measured: the
+    first replay of a per-mode edit at a 22,541 ceiling died on the 240s wall."""
+    from sculptor.edit import (
+        BASE_HTTP_TIMEOUT_S, MAX_TOKENS, _rewrite_http_timeout_s,
+    )
+
+    # Existing call sites keep their calibrated budget exactly.
+    assert _rewrite_http_timeout_s(None) == BASE_HTTP_TIMEOUT_S
+    assert _rewrite_http_timeout_s(MAX_TOKENS) == BASE_HTTP_TIMEOUT_S
+    assert _rewrite_http_timeout_s(MAX_TOKENS // 2) == BASE_HTTP_TIMEOUT_S
+
+    # A doubled ceiling needs roughly a doubled wall.
+    assert _rewrite_http_timeout_s(2 * MAX_TOKENS) == 2 * BASE_HTTP_TIMEOUT_S
+    assert _rewrite_http_timeout_s(22541) > BASE_HTTP_TIMEOUT_S
+
+
+def test_a_big_module_gets_both_ceilings_raised_together():
+    """The two knobs have to move as a pair — that pairing is the fix."""
+    from sculptor.edit import (
+        BASE_HTTP_TIMEOUT_S, MAX_TOKENS, _rewrite_http_timeout_s,
+        _rewrite_token_ceiling,
+    )
+
+    big = "# pad\n" * 9000
+    ceiling = _rewrite_token_ceiling(big)
+    assert ceiling > MAX_TOKENS
+    assert _rewrite_http_timeout_s(ceiling) > BASE_HTTP_TIMEOUT_S

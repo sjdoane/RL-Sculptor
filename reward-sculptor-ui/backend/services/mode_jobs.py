@@ -20,12 +20,28 @@ from typing import Any, Awaitable, Callable
 
 from backend.services.job_manager import Job
 
-# Same budget as a reward prompt-edit, for the same reason: `apply_prompt_edit`
-# makes up to two attempts of 180-240s each plus SDK backoff. Authoring uses a
-# LARGER token ceiling than a normal edit (`AUTHOR_MAX_TOKENS`), so if anything
-# a single attempt runs longer, not shorter.
+def _default_author_timeout_s() -> float:
+    """Job budget that actually covers what `author_mode` can spend.
+
+    `apply_prompt_edit` makes up to two attempts, and each attempt's HTTP
+    ceiling now scales with the token ceiling (`edit._rewrite_http_timeout_s`)
+    rather than being pinned at 240s. Authoring runs at `AUTHOR_MAX_TOKENS`
+    (32000), so one attempt is ~480s and two are ~960s — the previous flat 900s
+    would have aborted a legitimate second attempt.
+
+    Derived rather than hardcoded so raising either ceiling can't silently
+    outgrow this again. The 1.5x is SDK backoff between attempts.
+    """
+    try:
+        from sculptor.edit import _rewrite_http_timeout_s
+        from sculptor.mode_rewards import AUTHOR_MAX_TOKENS
+    except Exception:  # noqa: BLE001 — sculptor missing/renamed: keep the job runnable
+        return 1800.0
+    return max(900.0, 2 * _rewrite_http_timeout_s(AUTHOR_MAX_TOKENS) * 1.5)
+
+
 DEFAULT_MODE_AUTHOR_TIMEOUT_S = float(
-    os.environ.get("RS_MODE_AUTHOR_TIMEOUT_S", "900")
+    os.environ.get("RS_MODE_AUTHOR_TIMEOUT_S") or _default_author_timeout_s()
 )
 
 
