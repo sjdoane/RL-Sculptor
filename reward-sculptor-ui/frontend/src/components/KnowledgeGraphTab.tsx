@@ -10,7 +10,7 @@ import { PaperDetailModal } from "@/components/PaperDetailModal";
 import { Icon } from "@/components/rs/icon";
 import { Badge, Btn, EmptyState } from "@/components/rs/primitives";
 import { useAddSeeds, usePapers, usePendingSeeds, useTechniques } from "@/hooks/useKG";
-import { ApiError, healStubTitles, ingestGlobalKgSeeds } from "@/lib/api";
+import { ApiError, healStubTitles, indexFullText, ingestGlobalKgSeeds } from "@/lib/api";
 import type { JobSummary } from "@/lib/types";
 
 export function KnowledgeGraphTab({ slug }: { slug: string }) {
@@ -49,6 +49,27 @@ export function KnowledgeGraphTab({ slug }: { slug: string }) {
     onError: (err) => {
       const msg = err instanceof ApiError ? err.problem.detail ?? err.problem.title : (err as Error).message;
       toast.error("Heal-stubs failed", { description: msg });
+    },
+  });
+
+  const indexBodies = useMutation({
+    mutationFn: () => indexFullText(slug),
+    onSuccess: ({ indexed, missing, skipped }) => {
+      if (skipped > 0) {
+        toast.warning("Full-text search unavailable", {
+          description: "This SQLite build lacks FTS5 — search stays abstract-only.",
+        });
+      } else {
+        toast.success(`Indexed ${indexed} paper ${indexed === 1 ? "body" : "bodies"}`, {
+          description: missing > 0
+            ? `${missing} had no stored body (ingested without a PDF).`
+            : "Paper search now reaches body text, not just abstracts.",
+        });
+      }
+    },
+    onError: (err) => {
+      const msg = err instanceof ApiError ? err.problem.detail ?? err.problem.title : (err as Error).message;
+      toast.error("Full-text indexing failed", { description: msg });
     },
   });
 
@@ -115,6 +136,16 @@ export function KnowledgeGraphTab({ slug }: { slug: string }) {
               title="Re-ingest papers whose title is still 'arxiv:XXXX' (rate-limit stubs)"
             >
               Heal stubs
+            </Btn>
+            <Btn
+              kind="ghost"
+              size="sm"
+              icon={indexBodies.isPending ? "loader" : "search"}
+              disabled={indexBodies.isPending}
+              onClick={() => indexBodies.mutate()}
+              title="Index paper bodies so search reaches full text, not just abstracts (local, no network)"
+            >
+              Index bodies
             </Btn>
             <AddSeedsDialog slug={slug} onJobSubmitted={onJobSubmitted} />
             <ResearchTopicDialog slug={slug} onJobSubmitted={onJobSubmitted} />

@@ -235,6 +235,26 @@ export async function healStubTitles(
   );
 }
 
+/** POST /projects/{slug}/kg/index-fulltext — indexes every Paper's stored body
+ *  for lexical retrieval. Paper search ranks on title+abstract only, so a paper
+ *  whose body answers a question but whose abstract never names the topic is
+ *  otherwise unfindable. Local and fast (no network, no LLM). */
+export interface IndexFullTextResponse {
+  indexed: number;
+  missing: number;
+  skipped: number;
+}
+
+export async function indexFullText(
+  projectSlug: string,
+): Promise<IndexFullTextResponse> {
+  return handle<IndexFullTextResponse>(
+    await fetch(`/api/projects/${projectSlug}/kg/index-fulltext`, {
+      method: "POST",
+    }),
+  );
+}
+
 /** §Ship-8: per-project settings (config.toml [iteration] block).
  *  §Ship-9a: adds early_stop_enabled + early_stop_patience. */
 export interface IterationSettings {

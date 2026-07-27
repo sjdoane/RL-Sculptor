@@ -581,3 +581,52 @@ def kg_heal_stubs(
             "total": len(results),
         },
     }
+
+
+# ── lexical index over paper bodies ─────────────────────────────────────
+@router.post(
+    "/projects/{slug}/kg/index-fulltext",
+    responses={
+        200: {"description": "Index counts."},
+        404: {"model": ProblemDetail},
+        500: {"model": ProblemDetail},
+    },
+)
+def kg_index_fulltext(
+    slug: str,
+    store: ProjectStore = Depends(get_store),
+) -> Any:
+    """Index every Paper's stored body for lexical retrieval.
+
+    Paper search ranks on `title + abstract + rationale` only, so a paper
+    that answers a question in its body but never says so in its abstract
+    could not be retrieved — and extraction only ever summarizes the
+    first ~28K chars of each paper into the graph. This builds the recall
+    path over the rest.
+
+    Local and fast (no network, no LLM), unlike `heal-stubs`. Safe to
+    re-run; re-indexing a paper replaces its row. Response:
+    `{"indexed": n, "missing": n, "skipped": n}`.
+    """
+    project_dir = _project_dir(store, slug)
+    if project_dir is None:
+        return _problem(
+            status.HTTP_404_NOT_FOUND, "project not found",
+            type_="/problems/not-found",
+        )
+    try:
+        from sculptor.kg.ingest import backfill_full_text_index
+        from sculptor.kg.store import SculptorKG
+
+        db = kg_store.project_kg_db_path(project_dir)
+        db.parent.mkdir(parents=True, exist_ok=True)
+        with SculptorKG(db) as kg:
+            counts = backfill_full_text_index(store=kg)
+    except Exception as e:  # noqa: BLE001
+        return _problem(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "index-fulltext failed",
+            detail=f"{type(e).__name__}: {e}",
+            type_="/problems/preview-failed",
+        )
+    return counts

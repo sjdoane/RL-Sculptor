@@ -251,3 +251,55 @@ def test_heal_stubs_counts_results_correctly(
 def test_heal_stubs_unknown_project_404(client: TestClient) -> None:
     r = client.post("/projects/does-not-exist/kg/heal-stubs")
     assert r.status_code == 404
+
+
+# ── index-fulltext route ────────────────────────────────────────────────
+def test_index_fulltext_returns_counts(
+    client: TestClient, tmp_projects_root: Path, monkeypatch,
+) -> None:
+    slug = _make_project_with_library(client, "IdxCounts")
+    from sculptor.kg import ingest
+
+    monkeypatch.setattr(
+        ingest, "backfill_full_text_index",
+        lambda *a, **kw: {"indexed": 7, "missing": 2, "skipped": 0})
+
+    r = client.post(f"/projects/{slug}/kg/index-fulltext")
+    assert r.status_code == 200, r.text
+    assert r.json() == {"indexed": 7, "missing": 2, "skipped": 0}
+
+
+def test_index_fulltext_reports_skipped_when_fts5_is_absent(
+    client: TestClient, tmp_projects_root: Path, monkeypatch,
+) -> None:
+    """Without FTS5 the graph still opens and search degrades to
+    abstract-only — the route must say so, not 500."""
+    slug = _make_project_with_library(client, "IdxNoFts")
+    from sculptor.kg import ingest
+
+    monkeypatch.setattr(
+        ingest, "backfill_full_text_index",
+        lambda *a, **kw: {"indexed": 0, "missing": 0, "skipped": 5})
+
+    r = client.post(f"/projects/{slug}/kg/index-fulltext")
+    assert r.status_code == 200
+    assert r.json()["skipped"] == 5
+
+
+def test_index_fulltext_404s_on_unknown_project(client: TestClient) -> None:
+    assert client.post("/projects/nope/kg/index-fulltext").status_code == 404
+
+
+def test_index_fulltext_surfaces_a_failure_as_a_problem(
+    client: TestClient, tmp_projects_root: Path, monkeypatch,
+) -> None:
+    slug = _make_project_with_library(client, "IdxBoom")
+    from sculptor.kg import ingest
+
+    def _boom(*a, **kw):
+        raise RuntimeError("disk full")
+
+    monkeypatch.setattr(ingest, "backfill_full_text_index", _boom)
+    r = client.post(f"/projects/{slug}/kg/index-fulltext")
+    assert r.status_code == 500
+    assert "disk full" in r.json()["detail"]
