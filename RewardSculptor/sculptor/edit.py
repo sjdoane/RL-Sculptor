@@ -71,6 +71,30 @@ from sculptor.llm import log_llm_call, model_for
 
 MODEL_ID = model_for("edit")
 MAX_TOKENS = 16000
+
+#: Rough bytes-per-token for Python source. Used only to size the output
+#: ceiling, so it is deliberately conservative (real Python runs ~3.5-4).
+_BYTES_PER_TOKEN = 3.5
+
+#: A whole-module rewrite must be able to emit the WHOLE module plus its
+#: changes. `MAX_TOKENS` is a fine ceiling for a 500-line reward and a hard
+#: wall for a generated one: a per-mode reward over a 3-mode automaton is
+#: ~1000 lines / ~12.4k tokens, of which ~2.5k is inlined reference tables
+#: (TARGET_JOINT_POS alone is 8.3 KB) the editor has to restate verbatim. The
+#: first sculpt run over one died with `response was cut off at the 16000-token
+#: ceiling`, so the loop could train the reward but never evolve it.
+_REWRITE_HEADROOM = 1.6
+
+
+def _rewrite_token_ceiling(source: str) -> int:
+    """Output ceiling for rewriting `source` in full.
+
+    Scales with the module so large generated rewards stay editable, and never
+    returns less than `MAX_TOKENS` — small rewards keep their existing budget
+    byte-for-byte.
+    """
+    needed = int(len(source) / _BYTES_PER_TOKEN * _REWRITE_HEADROOM)
+    return max(MAX_TOKENS, needed)
 RETRY_REMINDER_PREFIX = (
     "Your previous response failed validation. Fix the following and return "
     "ONLY the complete new reward.py source as plain Python — no markdown "
@@ -1628,6 +1652,9 @@ def apply_edits(
     try:
         current_module = _load_reward_module(current_reward_path)
         current_source = current_reward_path.read_text(encoding="utf-8")
+        # The model has to emit this whole module back, so the ceiling has to
+        # fit it. An explicit caller value still wins.
+        max_tokens = max_tokens or _rewrite_token_ceiling(current_source)
         current_version = _current_reward_version(current_module)
         current_references = _current_reward_references(current_module)
         parent_tracking = _reference_tracking_contract(current_module)

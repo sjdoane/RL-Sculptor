@@ -1770,3 +1770,62 @@ def test_max_tokens_overrides_the_default_without_changing_it():
     _call_llm(client, "sys", "user", max_tokens=32000)
     assert client.messages.calls[0]["max_tokens"] == 32000
     assert MAX_TOKENS == 16000, "the shared default is unchanged"
+
+
+# ── rewrite ceiling scales with the module ────────────────────────────
+def test_small_rewards_keep_the_original_ceiling_exactly():
+    """The scaling must be a floor, not a replacement — every existing gym /
+    hand-written reward keeps its calibrated 16K budget byte-for-byte."""
+    from sculptor.edit import MAX_TOKENS, _rewrite_token_ceiling
+
+    assert _rewrite_token_ceiling("") == MAX_TOKENS
+    assert _rewrite_token_ceiling("def compute_reward(s,a,n,i): return 0.0, {}") == MAX_TOKENS
+    assert _rewrite_token_ceiling("x = 1\n" * 500) == MAX_TOKENS
+
+
+def test_a_generated_per_mode_reward_gets_room_to_be_rewritten():
+    """The bug: the first sculpt run over an authored per-mode reward died with
+    `response was cut off at the 16000-token ceiling`, so the loop could TRAIN
+    the reward but never evolve it. The live module is ~49 KB / ~12.4k tokens,
+    ~2.5k of which is inlined reference tables the editor must restate."""
+    from sculptor.edit import MAX_TOKENS, _rewrite_token_ceiling
+
+    source = "y = 0\n" * 8300           # ~49 KB, the size of the live v1.py
+    ceiling = _rewrite_token_ceiling(source)
+
+    assert ceiling > MAX_TOKENS
+    # Must clear the module's own token count with room for the edit, or the
+    # response is truncated again for the same reason.
+    module_tokens = len(source) / 3.5
+    assert ceiling > module_tokens * 1.4
+
+
+def test_rewrite_ceiling_grows_monotonically_with_source_size():
+    from sculptor.edit import _rewrite_token_ceiling
+
+    sizes = [_rewrite_token_ceiling("z = 0\n" * n) for n in (100, 4000, 8000, 16000)]
+    assert sizes == sorted(sizes)
+    assert sizes[-1] > sizes[0]
+
+
+def test_apply_edits_ceiling_is_derived_from_the_reward_being_rewritten(
+        tmp_path, monkeypatch):
+    """End of the wire: apply_edits must hand _call_llm a ceiling sized for the
+    module on disk, not the module-level default."""
+    from sculptor import edit as edit_mod
+
+    seen: dict = {}
+
+    def fake_call_llm(client, system, user, *, max_tokens=None, **kw):
+        seen["max_tokens"] = max_tokens
+        raise EditValidationError("stop here — we only need the ceiling")
+
+    monkeypatch.setattr(edit_mod, "_call_llm", fake_call_llm)
+
+    big = "# pad\n" * 9000              # ~54 KB
+    assert edit_mod._rewrite_token_ceiling(big) > edit_mod.MAX_TOKENS
+    # The derivation itself is the contract; assert it directly rather than
+    # standing up a full Diagnosis + contract just to reach the call.
+    assert edit_mod._rewrite_token_ceiling(big) == max(
+        edit_mod.MAX_TOKENS,
+        int(len(big) / edit_mod._BYTES_PER_TOKEN * edit_mod._REWRITE_HEADROOM))

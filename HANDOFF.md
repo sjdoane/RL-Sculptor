@@ -1182,3 +1182,116 @@ structural — it would come back the moment the episode length changed.
 Mean reward 177 → 3239 looks like a training success and is the opposite. Any
 future comparison across per-mode reward versions has to control for episode
 length, or it is comparing how long the robot stood up.
+
+---
+
+## §17 — the sculpt loop could train the per-mode reward but not evolve it
+
+The iteration in §16 finished all four stages. The last one failed:
+
+```
+[sculpt] iter 1: apply_edits skipped — EditValidationError: response was cut off
+at the 16000-token ceiling — the module is incomplete, not wrong.
+```
+
+The run completed and kept `v1`, so nothing was corrupted — but the whole point
+of the loop is that stage 4 writes `v2`. **A per-mode reward could be authored,
+promoted, and trained, and then the loop could not iterate on it.**
+
+### The diagnosis was right — only the write failed
+
+Worth being clear about what worked, because it is the strongest evidence so far
+that the loop functions. Stage 3 found the §16 reward hack **on its own**, from
+the same `reward_trajectory.json` I read by hand, at confidence 0.76:
+
+```
+failure_modes: reward_hacking, static_equilibrium, sparse_reward, reward_saturation
+```
+
+Its proposed edits, quoted:
+
+> `mode_strike` is the dominant component (0.81 → 1.30) versus every launch term
+> at ≤0.01 — a >100x imbalance that makes 'sit in the strike window and stay
+> alive' the highest-value policy: terminated stays 0.00, episode_length climbs
+> 378 → 535 (full horizon), and joint_tracking collapses 0.27 → 0.03 while
+> return rises.
+
+> `joint_tracking` degraded monotonically 0.27 → 0.03 while total return ROSE,
+> proving the posture/landing channel can be harvested with the reference motion
+> fully abandoned. Following PhysHOI's task-agnostic imitation reward, which
+> MULTIPLIES kinematic rewards together so none of them may be small, gate the
+> landing/posture credit …
+
+It also found something my hand analysis missed. Several mode terms are not
+merely outweighed — they are **identically dead**:
+
+```
+approach.run_speed              0.00 across all six windows
+launch.takeoff_rise             0.00
+launch.vertical_launch          0.00
+launch.single_support           0.00
+launch.trailing_leg_drive       0.00
+strike.apex_leg_swing           0.00   <- the actual kick
+strike.flight_foot_clearance    0.00
+```
+
+These are gated behind thresholds (speed, flight detection, apex height) that a
+frozen policy never reaches, so they pay nothing and produce no gradient toward
+ever reaching them. That is a cold-start problem in the authored terms, not a
+weighting problem, and it needs a different fix from §16's: dense,
+threshold-free terms that pay partial credit from the current state. §16's
+episode-length fix and this one are both required — neither alone is enough.
+
+So the pipeline diagnosed its own generated reward correctly and grounded the
+remedy in cited literature. The only broken link was the token budget for
+writing the result down.
+
+### Why
+
+`apply_edits` does a whole-module rewrite: the model emits the complete new
+`reward.py`. `MAX_TOKENS = 16000` is a comfortable ceiling for a hand-written
+reward and a wall for a generated one. The live module:
+
+```
+v0.py (starter alive_bonus)      57 lines    2.0 KB     ~0.5k tokens
+v1.py (3-mode automaton)      1,038 lines   49.4 KB    ~12.4k tokens
+  TARGET_JOINT_POS             8.3 KB   16.9%
+  TARGET_* tables total        9.9 KB   20.0%   <- ~2.5k tokens of pure DATA
+```
+
+A fifth of the module is inlined reference tables (32x29 joint targets, root
+heights, gravity vectors). The editor has to restate all of it verbatim to
+change one weight, and 12.4k of the 16k budget is gone before it writes
+anything new.
+
+### Fix
+
+`_rewrite_token_ceiling(source)` sizes the ceiling from the module being
+rewritten — `max(MAX_TOKENS, len(source)/3.5 * 1.6)`. It is a **floor, not a
+replacement**: every existing hand-written and gym reward keeps its calibrated
+16K budget byte-for-byte (the 240s HTTP timeout is tuned against it). The live
+`v1.py` gets 22,541.
+
+Note the earlier `stop_reason == "max_tokens"` detection is what made this
+diagnosable at all — without it this surfaces as
+`SyntaxError: '(' was never closed`, which reads as a model failure rather than
+a budget one, and sends you looking in the wrong place.
+
+### The better fix, not taken here
+
+Raising the ceiling treats the symptom. The real problem is that **~2.5k tokens
+of the module are data the LLM has no business rewriting** and cannot improve.
+Moving `TARGET_JOINT_POS` / `TARGET_ROOT_Z` / `TARGET_GRAVITY` into a sidecar
+loaded at import would cut a fifth of the module and remove a whole class of
+transcription risk — every rewrite currently re-types 928 floats and nothing
+checks they came back unchanged.
+
+That is a larger change: the scaffold generator, the validator, promotion, and
+`current.py`'s by-path loader all have to agree on where the sidecar lives and
+how it travels with a promoted version. `reward_store._extract_reward_spec` is
+AST-only and never executes the module, so it is unaffected — but a promoted
+`v<n>.py` that references a sidecar is no longer a single self-contained file,
+and that is the design question to settle first.
+
+Filed rather than done, because the ceiling fix unblocks the loop now and the
+sidecar change deserves its own review.
