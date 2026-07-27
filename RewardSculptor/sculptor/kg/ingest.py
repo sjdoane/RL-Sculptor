@@ -34,6 +34,7 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import re
+import os
 import sys
 import time
 from pathlib import Path
@@ -267,6 +268,42 @@ def _fetch_arxiv_metadata(
                 )
                 return None
     return None
+
+
+def backfill_full_text_index(
+    store: SculptorKG | None = None,
+) -> dict[str, int]:
+    """Index every Paper's stored body for lexical retrieval.
+
+    Bodies have always been written to disk, but nothing ever read them at
+    query time — paper ranking used `title + abstract + rationale` only, and
+    extraction summarized at most 28K chars per paper into the graph. This
+    makes the rest of the corpus reachable.
+
+    Idempotent: re-indexing a paper replaces its row. Returns counts of
+    `indexed` / `missing` (no body on disk) / `skipped` (FTS5 unavailable).
+    """
+    owns_store = store is None
+    store = store or SculptorKG()
+    out = {"indexed": 0, "missing": 0, "skipped": 0}
+    try:
+        for node in store.find_nodes(kind="Paper"):
+            path = getattr(node, "full_text_path", "") or ""
+            if not path or not os.path.isfile(path):
+                out["missing"] += 1
+                continue
+            try:
+                body = Path(path).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                out["missing"] += 1
+                continue
+            ok = store.index_paper_fulltext(
+                node.id, str(getattr(node, "arxiv_id", "") or ""), body)
+            out["indexed" if ok else "skipped"] += 1
+        return out
+    finally:
+        if owns_store:
+            store.close()
 
 
 def heal_stub_titles(

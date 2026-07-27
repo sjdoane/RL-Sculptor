@@ -18,7 +18,7 @@ import {
   type MotorLimitsRequest,
   type MotorSpec,
 } from "@/lib/api";
-import type { MjcfSummary, ProjectDetail } from "@/lib/types";
+import type { MjcfSummary, MjcfTiming, ProjectDetail } from "@/lib/types";
 
 const _MOTOR_LIMITS_TEMPLATE = `Update the MJCF actuator forceranges and joint damping/armature/frictionloss to match my motor datasheet. Apply the standard workflow:
   - forcerange = ±peak_torque (stall torque from datasheet)
@@ -251,13 +251,23 @@ function SummaryPanel({ summary }: { summary: MjcfSummary }) {
           </div>
           <hr className="rs-divider" style={{ margin: "14px 0" }} />
           <div className="rs-kv">
-            <div className="k">timestep</div><div className="v">{fmt(summary.timestep)}</div>
+            <div className="k">timestep</div>
+            <div className="v">
+              {fmt(summary.timestep)}
+              {summary.timing?.mjcf_overridden && (
+                <span style={{ color: "var(--rs-warn, #d08a3e)", marginLeft: 6, fontSize: 11 }}>
+                  (overridden — see Timing)
+                </span>
+              )}
+            </div>
             <div className="k">gravity</div><div className="v">{fmtVec(summary.gravity)}</div>
             <div className="k">integrator</div><div className="v">{summary.integrator ?? "—"}</div>
             <div className="k">solver</div><div className="v">{summary.solver ?? "—"}</div>
           </div>
         </div>
       </div>
+
+      <TimingCard timing={summary.timing} />
 
       <div className="rs-card">
         <div className="rs-card-head"><div className="rs-card-title"><Icon name="cpu" size={16} />Joints</div><span className="rs-num" style={{ color: "var(--rs-muted)", fontSize: 12 }}>{summary.joints.length}</span></div>
@@ -296,6 +306,77 @@ function SummaryPanel({ summary }: { summary: MjcfSummary }) {
         </div>
       </div>
     </>
+  );
+}
+
+/** Physics vs control rate — the two numbers that decide sim2real transfer and
+ *  that this UI previously showed neither of correctly. The MJCF summary above
+ *  reports what the robot XML compiles to; mjlab's task config overrides it, so
+ *  for the G1 the tab said 500 Hz while training ran at 200 Hz. The control
+ *  rate (physics ÷ decimation) is the one that has to match the hardware loop
+ *  and was not displayed anywhere. */
+function TimingCard({ timing }: { timing: MjcfTiming | null }) {
+  return (
+    <div className="rs-card">
+      <div className="rs-card-head">
+        <div className="rs-card-title"><Icon name="gauge" size={16} />Timing</div>
+        {timing && (
+          <span className="rs-num" style={{ color: "var(--rs-muted)", fontSize: 12 }}>
+            {timing.control_hz} Hz control
+          </span>
+        )}
+      </div>
+      <div className="rs-card-pad">
+        {!timing ? (
+          <p className="rs-sub" style={{ fontStyle: "italic" }}>
+            Unknown — this project has no resolvable mjlab task, so the rates
+            training would use can't be read. (Not defaulted on purpose: a
+            guessed timestep is what made this invisible before.)
+          </p>
+        ) : (
+          <>
+            <div className="rs-sysgrid">
+              <div className="rs-sysitem">
+                <span className="lab">physics</span>
+                <span className="val" style={{ fontSize: 20 }}>{timing.physics_hz} Hz</span>
+              </div>
+              <div className="rs-sysitem">
+                <span className="lab">control</span>
+                <span className="val" style={{ fontSize: 20 }}>{timing.control_hz} Hz</span>
+              </div>
+              <div className="rs-sysitem">
+                <span className="lab">decimation</span>
+                <span className="val" style={{ fontSize: 20 }}>{timing.decimation}×</span>
+              </div>
+            </div>
+            <hr className="rs-divider" style={{ margin: "14px 0" }} />
+            <div className="rs-kv">
+              <div className="k">physics dt</div><div className="v">{timing.physics_dt} s</div>
+              <div className="k">control dt</div><div className="v">{timing.control_dt} s</div>
+              <div className="k">task</div>
+              <div className="v" style={{ textTransform: "none" }}>{timing.task_id}</div>
+            </div>
+            {timing.mjcf_overridden && (
+              <p className="rs-sub" style={{ marginTop: 10, fontSize: 12 }}>
+                The MJCF compiles to <strong>{fmt(timing.mjcf_timestep)} s</strong>, but
+                the task sets <strong>{timing.physics_dt} s</strong> — training uses the
+                task's value. Editing <code>&lt;option timestep&gt;</code> in the XML
+                below will <em>not</em> change the rate training runs at.
+              </p>
+            )}
+            {timing.findings.length > 0 && (
+              <ul style={{ marginTop: 10, paddingLeft: 18 }}>
+                {timing.findings.map((f) => (
+                  <li key={f} className="rs-sub" style={{ fontSize: 12, color: "var(--rs-warn, #d08a3e)" }}>
+                    {f}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </>
+        )}
+      </div>
+    </div>
   );
 }
 

@@ -819,6 +819,26 @@ export interface MjcfGeomSummary {
   friction: [number, number, number];
 }
 
+/** The rates training actually runs at. Distinct from `MjcfSummary.timestep`,
+ *  which is only what the robot XML compiles to — for the G1 those differ by
+ *  2.5x because mjlab's task config overrides the MJCF. */
+export interface MjcfTiming {
+  physics_dt: number;
+  physics_hz: number;
+  decimation: number;
+  control_dt: number;
+  control_hz: number;
+  task_id: string;
+  /** What the MJCF compiles to, for comparison. */
+  mjcf_timestep: number | null;
+  /** True when the task overrides the MJCF — the MJCF number is NOT the one
+   *  that trains, and the panel says so. */
+  mjcf_overridden: boolean;
+  /** Advisory findings from `validate_timing` (Nyquist vs the reference,
+   *  physics band, deployable control band, series elasticity). */
+  findings: string[];
+}
+
 export interface MjcfSummary {
   timestep: number | null;
   gravity: number[] | null;
@@ -832,6 +852,9 @@ export interface MjcfSummary {
    *  XML, etc.). UI surfaces this inline + offers a "Re-materialize"
    *  button that re-copies the library source + assets. */
   parse_error: string | null;
+  /** null when the project's task can't be resolved — rendered as "unknown"
+   *  rather than defaulted, so a guess never looks like a measurement. */
+  timing: MjcfTiming | null;
 }
 
 export interface PhysicsLoadResponse {

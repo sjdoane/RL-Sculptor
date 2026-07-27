@@ -1003,6 +1003,38 @@ def kg_heal_stubs(store: Optional[Path] = _STORE_OPT):
             )
 
 
+@kg_app.command("index-fulltext")
+def kg_index_fulltext(store: Optional[Path] = _STORE_OPT):
+    """Index every Paper's stored body for lexical retrieval.
+
+    Paper search embeds `title + abstract + rationale` only, so a paper that
+    answers a question in its body but never says so in its abstract could not
+    be retrieved — and extraction only ever summarized the first ~28K chars of
+    each paper into the graph. This builds the recall path over the rest.
+
+    Local and fast (no network, no LLM); safe to re-run — re-indexing a paper
+    replaces its row. Run it after any bulk ingest.
+    """
+    from sculptor.kg.ingest import backfill_full_text_index
+
+    with _open_store(store) as kg:
+        res = backfill_full_text_index(store=kg)
+        typer.echo(
+            f"full-text index: {res['indexed']} indexed, "
+            f"{res['missing']} missing a body, {res['skipped']} skipped"
+        )
+        if res["skipped"]:
+            typer.echo(
+                "  note: skipped means this SQLite build lacks FTS5 — "
+                "retrieval falls back to abstract-only ranking"
+            )
+        if res["missing"]:
+            typer.echo(
+                "  tip: papers missing a body were ingested without a PDF; "
+                "`sculpt kg doctor` lists dead full_text_path entries"
+            )
+
+
 @kg_app.command("doctor")
 def kg_doctor(
     store: Optional[Path] = _STORE_OPT,
