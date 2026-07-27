@@ -537,3 +537,199 @@ def detach_stage_reference(
     save_mission(mission, md)
 
     return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+
+# ── the OGMP mode automaton + its reward scaffold ──────────────────────
+# `ModeTimeline.tsx` already draws the automaton at compose time by mirroring
+# the derivation in TypeScript. These endpoints are for the half that cannot be
+# mirrored: turning it into reward code. `sculptor.mode_rewards` emits a module
+# whose per-mode gating is derived from the graph rather than authored, because
+# both real Tier-D failures in this repo were phase-clock bugs — see
+# HANDOFF.md §12.
+class ModeRewardRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    clip_id: str
+    robot: str = "g1"
+    goal: str = ""
+    #: Include the reference-tracking backbone. Default on: without it every
+    #: mode is a stub paying zero, so the module is not trainable until every
+    #: mode has been authored.
+    tracking: bool = True
+    #: Filename under `<project>/rewards/`. Never a path — see `_reward_dest`.
+    filename: str = "mode_reward_v0.py"
+    overwrite: bool = False
+
+
+def _load_mode_graph(clip_id: str, robot: str):
+    """`(clip, graph)` or a `_problem(...)` response. Never raises."""
+    from sculptor.modes import ModeError, modes_from_composition
+    from sculptor.reference import load_clip
+    from sculptor.refs.library import CLIP_FILENAME
+
+    if not _valid_clip_id(clip_id):
+        return None, _problem(
+            status.HTTP_404_NOT_FOUND, "reference clip not found",
+            detail=f"malformed clip_id {clip_id!r}",
+            type_="/problems/not-found")
+    path = _clip_dir_for(clip_id, robot) / CLIP_FILENAME
+    if not path.is_file():
+        return None, _problem(
+            status.HTTP_404_NOT_FOUND, "reference clip not found",
+            detail=f"no clip at {path}", type_="/problems/not-found")
+    try:
+        clip = load_clip(path)
+        return (clip, modes_from_composition(clip, clip_id=clip_id)), None
+    except ModeError as e:
+        # The common case is a single-clip reference: there is one mode and no
+        # transition to derive, which is a 422 (the request is well-formed, the
+        # clip just is not a composite) rather than a 404 or a 500.
+        return None, _problem(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "reference has no mode automaton", detail=str(e),
+            type_="/problems/not-a-composite")
+    except (OSError, ValueError) as e:
+        return None, _problem(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "reference clip could not be read", detail=str(e),
+            type_="/problems/unreadable-clip")
+
+
+@router.get(
+    "/references/{clip_id}/modes",
+    responses={404: {"model": ProblemDetail}, 422: {"model": ProblemDetail}},
+)
+def get_reference_modes(clip_id: str, robot: str = Query("g1")) -> Any:
+    """The hybrid automaton derived from a composite's own provenance."""
+    from sculptor.mode_rewards import mode_windows_s
+
+    loaded, err = _load_mode_graph(clip_id, robot)
+    if err is not None:
+        return err
+    _clip, graph = loaded
+    windows = mode_windows_s(graph)
+    return {
+        "clip_id": clip_id,
+        "fps": graph.fps,
+        "modes": [
+            {"name": m.name,
+             "frame_range": list(m.frame_range),
+             "start_s": windows[m.name][0],
+             "end_s": windows[m.name][1],
+             "source_clip_id": m.source_clip_id}
+            for m in graph.modes
+        ],
+        "transitions": [
+            {"from_mode": t.from_mode, "to_mode": t.to_mode,
+             "guard_kind": t.guard.kind,
+             "at_phase": t.guard.at_phase,
+             "expression": t.guard.expression}
+            for t in graph.transitions
+        ],
+    }
+
+
+def _reward_dest(project_dir: Path, filename: str) -> Optional[Path]:
+    """`<project>/rewards/<filename>`, or None when `filename` tries to escape.
+
+    The name reaches this from a request body, so it is validated rather than
+    trusted: anything with a separator, a parent ref, or a non-`.py` suffix is
+    refused outright instead of being sanitized into something that looks
+    accepted.
+    """
+    name = (filename or "").strip()
+    if not name or not re.fullmatch(r"[A-Za-z0-9_.-]+\.py", name):
+        return None
+    if name.startswith(".") or ".." in name:
+        return None
+    return project_dir / "rewards" / name
+
+
+@router.post(
+    "/projects/{slug}/references/{clip_id}/mode-reward",
+    responses={404: {"model": ProblemDetail}, 409: {"model": ProblemDetail},
+               422: {"model": ProblemDetail}},
+)
+def scaffold_mode_reward(
+    slug: str, clip_id: str, body: ModeRewardRequest, request: Request,
+) -> Any:
+    """Write a per-mode reward scaffold into the project's `rewards/`.
+
+    The modes come back with `authored: false` — every body is a stub paying
+    nothing, and the point of the scaffold is the gating, not the terms. With
+    the tracking backbone the module is still trainable as-is; authoring adds
+    mode-specific task terms on top of it.
+    """
+    from sculptor.mode_rewards import (authored_modes,
+                                       generate_mode_reward_scaffold,
+                                       mode_windows_s,
+                                       validate_mode_reward_source)
+    from sculptor.modes import ModeError
+
+    store: ProjectStore = request.app.state.project_store
+    project_dir = _project_dir(store, slug)
+    if project_dir is None:
+        return _problem(
+            status.HTTP_404_NOT_FOUND, "project not found",
+            detail=f"no project with slug {slug!r}",
+            type_="/problems/not-found")
+
+    if clip_id != body.clip_id:
+        return _problem(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, "clip_id mismatch",
+            detail=f"path says {clip_id!r}, body says {body.clip_id!r}",
+            type_="/problems/validation-error")
+
+    loaded, err = _load_mode_graph(clip_id, body.robot)
+    if err is not None:
+        return err
+    clip, graph = loaded
+
+    dest = _reward_dest(project_dir, body.filename)
+    if dest is None:
+        return _problem(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, "invalid filename",
+            detail=f"{body.filename!r} must be a bare .py filename",
+            type_="/problems/validation-error")
+    if dest.exists() and not body.overwrite:
+        return _problem(
+            status.HTTP_409_CONFLICT, "reward file already exists",
+            detail=f"{dest.name} exists; regenerating would discard any "
+                   "authored mode bodies. Pass overwrite=true to replace it.",
+            type_="/problems/conflict")
+
+    try:
+        source = generate_mode_reward_scaffold(
+            graph, behavior_goal=body.goal, clip_id=clip_id,
+            clip=clip if body.tracking else None)
+    except ModeError as e:
+        return _problem(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "could not scaffold a reward for this automaton", detail=str(e),
+            type_="/problems/validation-error")
+
+    errors = validate_mode_reward_source(source, graph)
+    if errors:   # a scaffold failing its own validator is a bug here, not input
+        return _problem(
+            status.HTTP_422_UNPROCESSABLE_ENTITY, "scaffold failed validation",
+            detail="; ".join(errors), type_="/problems/validation-error")
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(source, encoding="utf-8")
+
+    authored = authored_modes(source)
+    windows = mode_windows_s(graph)
+    return {
+        "path": str(dest),
+        "filename": dest.name,
+        "clip_id": clip_id,
+        "tracking": bool(body.tracking),
+        "modes": [
+            {"name": name,
+             "start_s": windows[name][0],
+             "end_s": windows[name][1],
+             "authored": bool(done)}
+            for name, done in authored.items()
+        ],
+        "unauthored": [n for n, done in authored.items() if not done],
+    }

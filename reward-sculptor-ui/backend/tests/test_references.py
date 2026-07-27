@@ -769,3 +769,160 @@ def test_compose_surfaces_the_seam_measurement_on_refusal(
     })
     assert r.status_code == 400
     assert "seam discontinuity" in r.json()["detail"]
+
+
+# ── the OGMP mode automaton + its reward scaffold ──────────────────────
+# `ModeTimeline.tsx` already draws the automaton at compose time by mirroring
+# the derivation in TypeScript. These cover the half that cannot be mirrored:
+# turning it into reward code (HANDOFF.md §12).
+def _write_composite(root: Path, clip_id: str = "novel-jump-kick--g1",
+                     robot: str = "g1", *, n: int = 240, fps: float = 120.0,
+                     j: int = 6, seams=(80, 160),
+                     labels=("approach", "launch", "strike")) -> Path:
+    from sculptor.refs import library
+
+    t = np.arange(n, dtype=np.float64) / fps
+    d = library.clip_dir(robot, clip_id, root=root)
+    d.mkdir(parents=True, exist_ok=True)
+    meta = {"clip_id": clip_id,
+            "composition": {
+                "seam_frames": list(seams),
+                "segments": [{"index": i, "label": label,
+                              "source_id": f"src_{i}", "source_fps": 60.0,
+                              "source_frames": [0, 60]}
+                             for i, label in enumerate(labels)]}}
+    np.savez(
+        d / "clip.npz",
+        fps=np.float64(fps),
+        root_pos_z=0.70 + 0.02 * np.sin(2 * np.pi * 0.5 * t),
+        root_quat_wxyz=np.tile(np.array([1.0, 0.0, 0.0, 0.0]), (n, 1)),
+        joint_pos=(0.10 * np.sin(2 * np.pi * 0.5 * t)[:, None]
+                   + 0.01 * np.arange(j)[None, :]),
+        joint_names=np.array([f"joint_{i}" for i in range(j)]),
+        meta_json=np.frombuffer(json.dumps(meta).encode(), dtype=np.uint8),
+    )
+    return d
+
+
+def test_reference_modes_are_derived_from_the_clips_own_provenance(
+    client: TestClient, refs_root: Path,
+) -> None:
+    """One composed segment is one mode, each seam a transition — a read of
+    what `refs.compose` already recorded, not a new derivation."""
+    _write_composite(refs_root)
+    r = client.get("/references/novel-jump-kick--g1/modes")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["fps"] == 120.0
+    assert [m["name"] for m in body["modes"]] == ["approach", "launch", "strike"]
+    assert body["modes"][0]["start_s"] == 0.0
+    # `mode_phase_windows` rounds to 4 dp — 0.1 ms, five orders of magnitude
+    # finer than the 20 ms control step these windows gate against.
+    assert body["modes"][0]["end_s"] == pytest.approx(80 / 120.0, abs=1e-4)
+    assert body["modes"][-1]["end_s"] == pytest.approx(2.0, abs=1e-4)
+    assert [(t["from_mode"], t["to_mode"]) for t in body["transitions"]] == [
+        ("approach", "launch"), ("launch", "strike")]
+
+
+def test_a_non_composite_reference_is_422_not_500(
+    client: TestClient, refs_root: Path,
+) -> None:
+    """The common mistake. The request is well-formed; the clip just is not a
+    composite, so there is one mode and no transition to derive."""
+    _seed_library(refs_root)
+    r = client.get("/references/walk1_subject2/modes")
+    assert r.status_code == 422, r.text
+    assert "composition" in r.json()["detail"]
+
+
+def test_modes_for_a_malformed_clip_id_is_404(client: TestClient) -> None:
+    assert client.get("/references/..%2Fetc/modes").status_code in (404, 400)
+
+
+def test_scaffolding_a_mode_reward_writes_it_into_the_project(
+    client: TestClient, refs_root: Path, tmp_path: Path,
+) -> None:
+    _write_composite(refs_root)
+    slug = _make_project(client)
+    r = client.post(
+        f"/projects/{slug}/references/novel-jump-kick--g1/mode-reward",
+        json={"clip_id": "novel-jump-kick--g1",
+              "goal": "run in and strike at the apex"})
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["unauthored"] == ["approach", "launch", "strike"]
+    assert all(m["authored"] is False for m in body["modes"])
+
+    written = Path(body["path"])
+    assert written.is_file() and written.name == "mode_reward_v0.py"
+    src = written.read_text(encoding="utf-8")
+    assert "def compute_reward_batched(" in src
+    assert "run in and strike at the apex" in src
+    # Tracking is on by default — without it the module pays zero until every
+    # mode is authored, and nothing tells the policy to follow the reference.
+    assert "TARGET_JOINT_POS" in src
+    assert body["tracking"] is True
+
+
+def test_scaffolding_without_tracking_omits_the_backbone(
+    client: TestClient, refs_root: Path,
+) -> None:
+    _write_composite(refs_root)
+    slug = _make_project(client)
+    r = client.post(
+        f"/projects/{slug}/references/novel-jump-kick--g1/mode-reward",
+        json={"clip_id": "novel-jump-kick--g1", "tracking": False})
+    assert r.status_code == 200, r.text
+    assert "TARGET_JOINT_POS" not in Path(r.json()["path"]).read_text()
+
+
+def test_scaffolding_twice_is_a_409_unless_overwrite(
+    client: TestClient, refs_root: Path,
+) -> None:
+    """Regenerating discards authored mode bodies. The scaffold is the cheap
+    half; the authored terms are the expensive one."""
+    _write_composite(refs_root)
+    slug = _make_project(client)
+    url = f"/projects/{slug}/references/novel-jump-kick--g1/mode-reward"
+    payload = {"clip_id": "novel-jump-kick--g1"}
+    assert client.post(url, json=payload).status_code == 200
+    again = client.post(url, json=payload)
+    assert again.status_code == 409, again.text
+    assert "overwrite" in again.json()["detail"]
+    assert client.post(url, json={**payload, "overwrite": True}).status_code == 200
+
+
+def test_a_filename_cannot_escape_the_rewards_directory(
+    client: TestClient, refs_root: Path,
+) -> None:
+    """`filename` arrives in a request body, so it is validated rather than
+    sanitized into something that merely looks accepted."""
+    _write_composite(refs_root)
+    slug = _make_project(client)
+    url = f"/projects/{slug}/references/novel-jump-kick--g1/mode-reward"
+    for bad in ("../escape.py", "sub/dir.py", "no_extension", ".hidden.py",
+                "/abs/path.py"):
+        r = client.post(url, json={"clip_id": "novel-jump-kick--g1",
+                                   "filename": bad})
+        assert r.status_code == 422, f"{bad!r} was accepted: {r.text}"
+
+
+def test_a_clip_id_mismatch_between_path_and_body_is_refused(
+    client: TestClient, refs_root: Path,
+) -> None:
+    _write_composite(refs_root)
+    slug = _make_project(client)
+    r = client.post(
+        f"/projects/{slug}/references/novel-jump-kick--g1/mode-reward",
+        json={"clip_id": "something-else--g1"})
+    assert r.status_code == 422, r.text
+
+
+def test_scaffolding_for_an_unknown_project_is_404(
+    client: TestClient, refs_root: Path,
+) -> None:
+    _write_composite(refs_root)
+    r = client.post(
+        "/projects/no-such-project/references/novel-jump-kick--g1/mode-reward",
+        json={"clip_id": "novel-jump-kick--g1"})
+    assert r.status_code == 404, r.text
