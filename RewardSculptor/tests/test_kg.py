@@ -15,10 +15,16 @@ from sculptor.kg.schema import (
     Environment,
     FailureMode,
     Paper,
+    PROVENANCE_LLM_EXTRACTION,
+    PROVENANCE_OBSERVED_RUN,
+    PROVENANCE_PAPER_CLAIM,
+    PROVENANCE_SEED,
     Relation,
     RewardComponent,
     Result,
+    RunCase,
     Technique,
+    evidence_tag,
     make_environment_id,
     make_failure_mode_id,
     make_paper_id,
@@ -198,11 +204,13 @@ def test_default_db_path_respects_backend_alias(tmp_path, monkeypatch):
     assert default_db_path() == target.resolve()
 
 
-def test_default_db_path_prefers_legacy_cwd_db(tmp_path, monkeypatch):
-    """When no env var is set and a legacy <cwd>/kg/graph.db already
-    exists, default_db_path returns it (back-compat with pre-Phase-1
-    per-project DBs)."""
-    from sculptor.kg.store import default_db_path
+def test_default_db_path_ignores_legacy_cwd_db(tmp_path, monkeypatch, capsys):
+    """2026-07-03: a cwd-relative kg/graph.db is NO LONGER honored — the
+    back-compat preference fragmented the graph by launch directory (the
+    tuck-jump E2E diagnosed against a 6-technique stub while the shared
+    graph held 493 techniques). The shared path always wins; the stray
+    file just triggers a stderr pointer at `sculpt kg merge`."""
+    from sculptor.kg.store import default_db_path, shared_db_path
 
     monkeypatch.delenv("SCULPTOR_KG_PATH", raising=False)
     monkeypatch.delenv("RS_KG_PATH", raising=False)
@@ -212,7 +220,124 @@ def test_default_db_path_prefers_legacy_cwd_db(tmp_path, monkeypatch):
     legacy_db.write_bytes(b"SQLite format 3\x00" + b"\x00" * 100)
     monkeypatch.chdir(tmp_path)
 
-    assert default_db_path() == legacy_db.resolve()
+    assert default_db_path() == shared_db_path()
+    assert "sculpt kg merge" in capsys.readouterr().err
+
+
+def test_default_db_path_alias_precedence_matches_ui(tmp_path, monkeypatch):
+    from sculptor.kg.store import default_db_path
+
+    rs_path = tmp_path / "rs.db"
+    sculptor_path = tmp_path / "sculptor.db"
+    monkeypatch.setenv("RS_KG_PATH", str(rs_path))
+    monkeypatch.setenv("SCULPTOR_KG_PATH", str(sculptor_path))
+    assert default_db_path() == rs_path.resolve()
+
+
+def test_merge_stores_is_additive_and_never_clobbers(tmp_path):
+    """merge_stores copies missing nodes/edges/embeddings and NEVER
+    overwrites an existing destination node (a legacy stub must not
+    clobber the shared graph's richer node of the same id)."""
+    import numpy as np
+
+    from sculptor.kg.schema import Edge, FailureMode, Relation, RunCase
+    from sculptor.kg.store import SculptorKG, merge_stores
+
+    src = SculptorKG(tmp_path / "stray.db")
+    dst = SculptorKG(tmp_path / "shared.db")
+    try:
+        # dst holds the rich node; src holds a stub with the SAME id.
+        dst.add_node(FailureMode(
+            id="failure:static_equilibrium", name="static_equilibrium",
+            description="rich paper-derived description"))
+        src.add_node(FailureMode(
+            id="failure:static_equilibrium", name="static_equilibrium",
+            description="(diagnoser-flagged stub)"))
+        # A vector for the poorer same-id source node must NOT be copied onto
+        # the richer destination node and later trust-stamped as fresh.
+        src.set_embedding(
+            "failure:static_equilibrium", "test-model",
+            np.zeros(4, dtype=np.float32), text="stub text")
+        # src-only content.
+        case = RunCase(id="case:x", task="hop", symptom="stand-still")
+        src.add_node(case)
+        src.add_edge(Edge(src="case:x", dst="failure:static_equilibrium",
+                          relation=Relation.INSTANTIATES))
+        src.set_embedding("case:x", "test-model",
+                          np.ones(4, dtype=np.float32), text="known source text")
+        legacy_case = RunCase(id="case:legacy", task="hop", symptom="old")
+        src.add_node(legacy_case)
+        src.set_embedding("case:legacy", "test-model",
+                          np.full(4, 2, dtype=np.float32))
+        src.close()
+
+        counts = merge_stores(tmp_path / "stray.db", dst)
+        assert counts["nodes"] == 2                # both cases copied
+        assert counts["nodes_skipped"] == 1        # stub did NOT clobber
+        assert counts["edges"] == 1
+        assert counts["embeddings"] == 1
+        kept = dst.get_node("failure:static_equilibrium")
+        assert kept.description == "rich paper-derived description"
+        assert dst.has_node("case:x")
+        assert dst.has_embedding("case:x", "test-model")
+        assert dst.has_node("case:legacy")
+        assert not dst.has_embedding("case:legacy", "test-model")
+        assert not dst.has_embedding(
+            "failure:static_equilibrium", "test-model")
+        # Idempotent: merging again adds nothing.
+        counts2 = merge_stores(tmp_path / "stray.db", dst)
+        assert counts2["nodes"] == 0 and counts2["edges"] == 0
+    finally:
+        dst.close()
+
+
+def test_merge_stores_unions_corroborating_edge_supports(tmp_path):
+    from sculptor.kg.schema import Edge, FailureMode, Relation, Technique
+    from sculptor.kg.store import SculptorKG, merge_stores
+
+    src = SculptorKG(tmp_path / "stray.db")
+    dst = SculptorKG(tmp_path / "shared.db")
+    tech = Technique(id="technique:rsi", name="rsi")
+    failure = FailureMode(id="failure:stuck", name="stuck")
+    for store in (src, dst):
+        store.add_node(tech)
+        store.add_node(failure)
+    dst.add_edge(Edge(
+        src=tech.id, dst=failure.id, relation=Relation.ADDRESSES,
+        data={"source_paper_id": "paper:dst", "evidence": "dst evidence",
+              "supports": [{"source_paper_id": "paper:dst",
+                            "evidence": "dst evidence"}]}))
+    src.add_edge(Edge(
+        src=tech.id, dst=failure.id, relation=Relation.ADDRESSES,
+        data={"source_paper_id": "paper:src", "evidence": "src evidence",
+              "supports": [{"source_paper_id": "paper:src",
+                            "evidence": "src evidence"}]}))
+    src.close()
+    try:
+        counts = merge_stores(tmp_path / "stray.db", dst)
+        assert counts["edges"] == 1
+        edge = dst.neighbors(
+            tech.id, relation=Relation.ADDRESSES, direction="out")[0][0]
+        assert edge.data["supports"] == [
+            {"source_paper_id": "paper:dst", "evidence": "dst evidence"},
+            {"source_paper_id": "paper:src", "evidence": "src evidence"},
+        ]
+        assert merge_stores(tmp_path / "stray.db", dst)["edges"] == 0
+    finally:
+        dst.close()
+
+
+def test_merge_stores_rejects_self_merge(tmp_path):
+    import pytest as _pytest
+
+    from sculptor.kg.store import SculptorKG, merge_stores
+
+    dst = SculptorKG(tmp_path / "one.db")
+    try:
+        with _pytest.raises(ValueError, match="same database"):
+            merge_stores(tmp_path / "one.db", dst)
+    finally:
+        dst.close()
 
 
 def test_default_db_path_falls_back_to_shared(monkeypatch, tmp_path):
@@ -394,3 +519,91 @@ def test_heal_stub_titles_reports_still_stubbed_when_retry_fails(
 
     results = ingest.heal_stub_titles(store=kg)
     assert results == {"9999.00099": "still_stubbed"}
+
+
+# ── §Agentic-data upgrade 1: provenance trust tiers ───────────────────────
+def test_provenance_defaults_per_node_type(kg):
+    """Each node kind gets its documented default provenance when the
+    field is omitted at construction."""
+    paper = Paper(id=make_paper_id("x"), arxiv_id="x", title="X")
+    tech = Technique(id=make_technique_id("t"), name="t")
+    fm = FailureMode(id=make_failure_mode_id("f"), name="f")
+    rc = RewardComponent(id=make_reward_component_id("c"), name="c")
+    case = RunCase(id="case:x", task="kick")
+
+    assert paper.provenance == PROVENANCE_SEED
+    assert tech.provenance == PROVENANCE_PAPER_CLAIM
+    assert fm.provenance == PROVENANCE_PAPER_CLAIM
+    assert rc.provenance == PROVENANCE_PAPER_CLAIM
+    assert case.provenance == PROVENANCE_OBSERVED_RUN
+
+    for node in (paper, tech, fm, rc, case):
+        kg.add_node(node)
+        fetched = kg.get_node(node.id)
+        assert fetched.provenance == node.provenance
+
+
+def test_provenance_explicit_override_roundtrips(kg):
+    tech = Technique(id=make_technique_id("t2"), name="t2",
+                     provenance=PROVENANCE_LLM_EXTRACTION)
+    kg.add_node(tech)
+    fetched = kg.get_node(tech.id)
+    assert fetched.provenance == PROVENANCE_LLM_EXTRACTION
+
+
+def test_old_format_row_loads_with_type_default_provenance(kg):
+    """A node serialized BEFORE the provenance field existed (no
+    'provenance' key in the JSON blob) must still load — `row_to_node`
+    calls `cls(id=node_id, **data)`, and a dataclass field with a default
+    is simply absent from `**data`, so the type's own default fires."""
+    import json as _json
+    import sqlite3 as _sqlite3
+
+    old_technique_blob = {"name": "old_tech", "description": "pre-upgrade row"}
+    conn = _sqlite3.connect(kg.db_path)
+    conn.execute(
+        "INSERT INTO nodes (id, kind, data) VALUES (?, ?, ?)",
+        (make_technique_id("old_tech"), "Technique", _json.dumps(old_technique_blob)),
+    )
+    conn.commit()
+    conn.close()
+
+    fetched = kg.get_node(make_technique_id("old_tech"))
+    assert fetched is not None
+    assert fetched.provenance == PROVENANCE_PAPER_CLAIM  # type default, not KeyError
+    assert fetched.useful_citations == 0
+
+    old_paper_blob = {"arxiv_id": "y", "title": "Old Paper"}
+    conn = _sqlite3.connect(kg.db_path)
+    conn.execute(
+        "INSERT INTO nodes (id, kind, data) VALUES (?, ?, ?)",
+        (make_paper_id("y"), "Paper", _json.dumps(old_paper_blob)),
+    )
+    conn.commit()
+    conn.close()
+    fetched_paper = kg.get_node(make_paper_id("y"))
+    assert fetched_paper.provenance == PROVENANCE_SEED
+
+
+def test_evidence_tag_covers_all_known_tiers():
+    assert "observed" in evidence_tag(PROVENANCE_OBSERVED_RUN).lower()
+    assert "paper" in evidence_tag(PROVENANCE_PAPER_CLAIM).lower()
+    assert "seed" in evidence_tag(PROVENANCE_SEED).lower()
+    assert "llm" in evidence_tag(PROVENANCE_LLM_EXTRACTION).lower()
+
+
+def test_evidence_tag_degrades_gracefully_on_unknown_value():
+    """Provenance is advisory rendering metadata — an unrecognized value
+    (e.g. a stray string, or None from a very old row) must never raise;
+    it degrades to the least-trusted tag."""
+    assert evidence_tag(None) == evidence_tag(PROVENANCE_LLM_EXTRACTION)
+    assert evidence_tag("some_future_tier") == evidence_tag(PROVENANCE_LLM_EXTRACTION)
+
+
+def test_useful_citations_defaults_to_zero_and_roundtrips(kg):
+    tech = Technique(id=make_technique_id("cited"), name="cited")
+    assert tech.useful_citations == 0
+    tech.useful_citations = 7
+    kg.add_node(tech)
+    fetched = kg.get_node(tech.id)
+    assert fetched.useful_citations == 7

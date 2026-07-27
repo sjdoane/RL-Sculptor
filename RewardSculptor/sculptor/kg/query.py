@@ -1,8 +1,11 @@
 """sculptor/kg/query.py — the KG read surface the diagnoser/editor consumes.
 
-Three entry points:
-  * query_techniques(failure_modes, domain_filter=None, top_k=5)
-      Graph walk. For each named failure mode, list techniques that ADDRESS it
+Entry points:
+  * query_techniques(failure_modes, domain_filter=None, top_k=5,
+                      extra_failure_node_ids=None)
+      Graph walk. For each named failure mode (plus any already-resolved
+      FailureMode node ids passed via `extra_failure_node_ids` — e.g. from
+      `resolve_failure_modes_semantic`), list techniques that ADDRESS it
       (optionally restricted to techniques whose papers EVALUATE_ON an env
       whose tags include `domain_filter`).
 
@@ -11,16 +14,26 @@ Three entry points:
       description embeddings. Embeddings are populated lazily and persisted
       via `SculptorKG.set_embedding`.
 
+  * resolve_failure_modes_semantic(store, descriptors, top_k_per=2,
+                                    min_similarity=0.45)
+      Sentence-transformer cosine similarity between free-text failure
+      descriptors and cached FailureMode name+description embeddings —
+      the semantic counterpart to `_resolve_failure_modes`'s fixed-enum
+      fuzzy resolution. Returns FailureMode node ids for use as
+      `query_techniques`'s `extra_failure_node_ids`.
+
   * cite(arxiv_id) -> str
       Short human-facing citation string.
 
-All three return / use `TechniqueMatch` dataclasses so the downstream editor
-sees a uniform shape regardless of which path produced the candidate.
+`query_techniques` / `query_semantic` return `TechniqueMatch` dataclasses so
+the downstream editor sees a uniform shape regardless of which path
+produced the candidate.
 """
 
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 from dataclasses import dataclass, field
@@ -49,6 +62,64 @@ EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 #: query_semantic is for exploration tools only, never for prompts.
 DEFAULT_MIN_PROMPT_SIMILARITY = 0.35
 
+#: §Agentic-data upgrade 2 (usage-based enrichment): cap on the
+#: useful_citations ranking boost. Retrieval must stay RELEVANCE-dominated
+#: — a technique cited in ten past "helped" edits is a mild tie-breaker
+#: signal, not grounds to outrank something the current failure/behavior
+#: text actually matches. 0.05 is small next to the ~0.35-1.0 range of a
+#: real relevance/similarity score, and log1p makes the boost diminish
+#: fast (citation count 1 -> ~0.007, 10 -> ~0.024, 100 -> ~0.046,
+#: asymptoting at the 0.05 cap) so no amount of accumulated usage can ever
+#: let a barely-relevant technique leapfrog a strongly-relevant one.
+USEFUL_CITATION_BOOST_CAP = 0.05
+_USEFUL_CITATION_BOOST_SCALE = 0.01
+
+
+def _citation_boost(useful_citations: int) -> float:
+    """CAPPED ranking boost from usage history. Applied to the score used
+    for ORDERING only — never to gate/floor thresholds, which must be
+    checked on the raw relevance/similarity score before this is added
+    (otherwise a below-floor match could be boosted back above it)."""
+    if not useful_citations or useful_citations <= 0:
+        return 0.0
+    return min(
+        USEFUL_CITATION_BOOST_CAP,
+        _USEFUL_CITATION_BOOST_SCALE * math.log1p(useful_citations),
+    )
+
+
+#: §KG-retrieval fix 4 (outcome-stats ranking): cap on the per-FailureMode
+#: helped/regressed ranking adjustment — same "small, ORDERING-only tie-
+#: breaker" contract as `USEFUL_CITATION_BOOST_CAP` above, deliberately
+#: scaled a bit larger (0.15 vs 0.05) because this signal is SCOPED to the
+#: queried failure mode(s) rather than a global usage count, so it is a
+#: more targeted (and thus more trustworthy) tie-breaker.
+OUTCOME_STATS_ADJUSTMENT_CAP = 0.15
+_OUTCOME_STATS_ADJUSTMENT_SCALE = 0.03
+
+
+def _outcome_stats_adjustment(
+    outcome_stats: dict | None, queried_failure_mode_ids: set[str],
+) -> float:
+    """Net helped-minus-regressed signal from THIS project's own RunCase
+    verdicts, restricted to the failure mode(s) actually being queried
+    (`query_techniques`'s enum-resolved + `extra_failure_node_ids`).
+    Applied to the ORDERING score only, alongside `_citation_boost` — never
+    to a similarity floor. Deterministic: a technique with no recorded
+    stats for the queried failure modes returns 0.0 (no behavior change)."""
+    if not outcome_stats or not queried_failure_mode_ids:
+        return 0.0
+    net = 0
+    for fm_id in queried_failure_mode_ids:
+        entry = outcome_stats.get(fm_id)
+        if not entry:
+            continue
+        net += int(entry.get("helped", 0) or 0) - int(entry.get("regressed", 0) or 0)
+    return max(
+        -OUTCOME_STATS_ADJUSTMENT_CAP,
+        min(OUTCOME_STATS_ADJUSTMENT_CAP, _OUTCOME_STATS_ADJUSTMENT_SCALE * net),
+    )
+
 
 # ── Result shape ────────────────────────────────────────────────────────────
 @dataclass
@@ -60,6 +131,12 @@ class TechniqueMatch:
     relevance_score: float
     matched_on: list[str] = field(default_factory=list)  # diag: why it matched
     source_paper_ids: list[str] = field(default_factory=list)
+
+
+@dataclass
+class PaperMatch:
+    paper: Paper
+    relevance_score: float
 
 
 # ── cite() ──────────────────────────────────────────────────────────────────
@@ -139,6 +216,18 @@ def _resolve_failure_modes(
     return out
 
 
+def _normalize_domain_tag(value: str) -> str:
+    import re
+    return re.sub(r"_+", "_", re.sub(
+        r"[^a-z0-9]+", "_", value.strip().lower())).strip("_")
+
+
+def _domain_tags_compatible(a: str, b: str) -> bool:
+    # Normalize spaces/hyphens/underscores and allow a taxonomy's qualified
+    # child (`continuous_locomotion`) to match its head tag (`locomotion`).
+    return (a == b or a.endswith("_" + b) or b.endswith("_" + a))
+
+
 def _paper_touches_domain(
     store: SculptorKG, paper_id: str, domain: str
 ) -> bool:
@@ -146,15 +235,31 @@ def _paper_touches_domain(
     include the domain string (case-insensitive)."""
     if not domain:
         return True
-    target = domain.strip().lower()
+    target = _normalize_domain_tag(domain)
     for _, env_id in store.neighbors(paper_id, relation=Relation.EVALUATES_ON, direction="out"):
         env = store.get_node(env_id)
         if isinstance(env, Environment):
-            tags = [t.lower() for t in env.tags]
-            name = env.name.lower()
-            if target in tags or target in name:
+            tags = [_normalize_domain_tag(t) for t in env.tags]
+            name = _normalize_domain_tag(env.name)
+            if any(_domain_tags_compatible(target, tag) for tag in tags) or target in name:
                 return True
     return False
+
+
+def _edge_supports(data: dict[str, Any] | None) -> dict[str, str]:
+    """Normalize legacy single-source and new corroborating edge data."""
+    data = data or {}
+    out: dict[str, str] = {}
+    for support in data.get("supports", []) or []:
+        if not isinstance(support, dict):
+            continue
+        pid = str(support.get("source_paper_id") or "")
+        if pid:
+            out[pid] = str(support.get("evidence") or "")
+    legacy_pid = str(data.get("source_paper_id") or "")
+    if legacy_pid:
+        out.setdefault(legacy_pid, str(data.get("evidence") or ""))
+    return out
 
 
 def query_techniques(
@@ -163,9 +268,18 @@ def query_techniques(
     top_k: int = 5,
     *,
     store: SculptorKG | None = None,
+    extra_failure_node_ids: list[str] | None = None,
 ) -> list[TechniqueMatch]:
     """Techniques that ADDRESS any of `failure_modes`, optionally filtered by
     the domain tag of the introducing paper's evaluation environment.
+
+    `extra_failure_node_ids`: additional FailureMode node ids (already
+    resolved — e.g. via `resolve_failure_modes_semantic` matching free-text
+    failure descriptors) merged in alongside the enum-resolved nodes from
+    `failure_modes`, before the ADDRESSES walk below. Deduped by node id;
+    unknown / non-FailureMode ids are silently skipped. Ranking is
+    otherwise unchanged — a technique simply gets credit for however many
+    FailureMode nodes it addresses, enum- or descriptor-resolved alike.
 
     Ranking: more matched failure modes first, then introducing paper's year
     (newer first), then technique name.
@@ -174,8 +288,23 @@ def query_techniques(
     store = store or SculptorKG()
     try:
         fm_map = _resolve_failure_modes(store, failure_modes)
+        if extra_failure_node_ids:
+            existing_ids = {fm.id for fm in fm_map.values()}
+            for node_id in extra_failure_node_ids:
+                if not node_id or node_id in existing_ids:
+                    continue
+                node = store.get_node(node_id)
+                if isinstance(node, FailureMode):
+                    fm_map[node_id] = node
+                    existing_ids.add(node_id)
         if not fm_map:
             return []
+        # §KG-retrieval fix 4: the full set of FailureMode ids this call is
+        # querying for (enum-resolved ∪ extra_failure_node_ids) — used
+        # below to scope the outcome-stats ranking adjustment to what was
+        # actually asked about, not a technique's stats against every
+        # failure mode it has ever touched.
+        queried_fm_ids = {fm.id for fm in fm_map.values()}
 
         # For each FailureMode, find all Techniques with ADDRESSES edges into it.
         # (Edge direction: Technique -> FailureMode.)
@@ -193,14 +322,17 @@ def query_techniques(
                     "matched_fms": set(),
                     "evidence": "",
                     "source_paper_ids": set(),
+                    "support_by_paper": {},
                 })
                 bucket["matched_raw"].add(raw)
                 bucket["matched_fms"].add(fm.name)
                 if not bucket["evidence"] and edge.data.get("evidence"):
                     bucket["evidence"] = edge.data["evidence"]
-                src = edge.data.get("source_paper_id")
-                if src:
+                for src, evidence in _edge_supports(edge.data).items():
                     bucket["source_paper_ids"].add(src)
+                    old = bucket["support_by_paper"].get(src, "")
+                    if len(evidence) > len(old):
+                        bucket["support_by_paper"][src] = evidence
 
         # Resolve introducing paper(s) via INTRODUCES inbound edges; fall back
         # to whichever paper provided the ADDRESSES edge.
@@ -220,28 +352,50 @@ def query_techniques(
                     if isinstance(p, Paper):
                         intro_papers.append(p)
 
+            support_papers: list[Paper] = []
+            for pid in bucket["source_paper_ids"]:
+                p = store.get_node(pid)
+                if isinstance(p, Paper):
+                    support_papers.append(p)
+            citation_candidates = support_papers or intro_papers
             if domain_filter:
-                keep = any(
-                    _paper_touches_domain(store, p.id, domain_filter)
-                    for p in intro_papers
-                )
-                if not keep:
+                citation_candidates = [
+                    p for p in citation_candidates
+                    if _paper_touches_domain(store, p.id, domain_filter)
+                ]
+                if not citation_candidates:
                     continue
 
+            # Citation and evidence MUST come from the same supporting paper.
+            # The former newest-introducing-paper rule could put a 2025
+            # citation beside a claim/evidence recorded from a 2020 paper.
             newest_paper = max(
-                intro_papers, key=lambda p: (p.year or 0, p.arxiv_id), default=None)
+                citation_candidates,
+                key=lambda p: (p.year or 0, p.arxiv_id), default=None)
             citation = cite(newest_paper.arxiv_id, store=store) if newest_paper else "(unknown paper)"
+            evidence = (
+                bucket["support_by_paper"].get(newest_paper.id, "")
+                if newest_paper else "") or bucket["evidence"]
 
             score = float(len(bucket["matched_fms"]))
             if newest_paper and newest_paper.year:
                 # Tiny tie-breaker so newer papers rank higher at the same score.
                 score += min((newest_paper.year - 2000) / 1000.0, 0.05)
+            # §Agentic-data upgrade 2: capped usage-based boost, ORDERING only.
+            # query_techniques has no similarity floor to protect (the graph
+            # walk is a hard ADDRESSES-edge match, not a threshold), so the
+            # boost is simply added to the tie-break score here.
+            score += _citation_boost(tech.useful_citations)
+            # §KG-retrieval fix 4: capped outcome-stats adjustment, ORDERING
+            # only — same rationale as the citation boost above.
+            score += _outcome_stats_adjustment(
+                getattr(tech, "outcome_stats", None), queried_fm_ids)
 
             results.append(TechniqueMatch(
                 technique=tech,
                 description=tech.description,
                 paper_citation=citation,
-                evidence=bucket["evidence"],
+                evidence=evidence,
                 relevance_score=score,
                 matched_on=sorted(bucket["matched_fms"]),
                 source_paper_ids=sorted(bucket["source_paper_ids"]),
@@ -340,55 +494,167 @@ def _embed_text(text: str, model_name: str = EMBEDDING_MODEL):
     return np.asarray(vec, dtype=np.float32)
 
 
-def _ensure_technique_embeddings(
-    store: SculptorKG, model_name: str = EMBEDDING_MODEL
-) -> list[tuple[Technique, Any]]:
-    """Embed every Technique description that doesn't have a cached embedding
-    yet, return (technique, vector) for all techniques."""
+def technique_embed_text(t: Technique) -> str:
+    """Canonical embed-text for a Technique — the SINGLE definition both
+    the embedding writer and the staleness check hash against."""
+    return f"{t.name}. {t.description}".strip(". ")
+
+
+def failure_mode_embed_text(m: FailureMode) -> str:
+    """Canonical embed-text for a FailureMode (see technique_embed_text)."""
+    return f"{m.name}. {m.description}".strip(". ")
+
+
+def paper_embed_text(p: Paper) -> str:
+    """Canonical authoring/research retrieval text for a Paper."""
+    tags = ", ".join(p.tags)
+    return (
+        f"{p.title}. {p.abstract} Applicability: {p.rationale}. Tags: {tags}"
+    ).strip(". ")
+
+
+def _ensure_paper_embeddings(
+    store: SculptorKG, model_name: str = EMBEDDING_MODEL,
+) -> list[tuple[Paper, Any]]:
+    papers: list[Paper] = store.find_nodes(kind=Paper.kind)  # type: ignore[assignment]
+    return ensure_embeddings(
+        store, papers, paper_embed_text, model_name, label="Paper")
+
+
+def ensure_embeddings(
+    store: SculptorKG,
+    nodes: list[Any],
+    text_fn,
+    model_name: str = EMBEDDING_MODEL,
+    *,
+    label: str = "node",
+) -> list[tuple[Any, Any]]:
+    """Shared lazy embedding pool: embed nodes whose vector is MISSING or
+    STALE (text changed since the vector was cached — extraction merges
+    enrich descriptions, case verdicts are re-attributed on resume), stamp
+    trust-once hashes onto pre-hash rows, return (node, vector) for every
+    node with a vector.
+
+    §Phase-0 hardening 2026-07-18: replaces the three copy-pasted
+    `_ensure_*_embeddings` bodies whose `has_embedding`-only check served
+    stale geometry forever after a node's text changed."""
     import numpy as np
 
     _t0 = time.time()
-    techniques: list[Technique] = store.find_nodes(kind=Technique.kind)  # type: ignore[assignment]
+    need: list[tuple[Any, str]] = []
+    for n in nodes:
+        text = text_fn(n)
+        if not text:
+            continue
+        status = store.embedding_status(n.id, model_name, text)
+        if status == "unhashed":
+            # Pre-hash row: trust the cached vector once, start tracking.
+            store.backfill_embedding_hash(n.id, model_name, text)
+        elif status in ("missing", "stale"):
+            need.append((n, text))
     log.info(
-        "kg.query: fetched %d Technique nodes in %.2fs",
-        len(techniques), time.time() - _t0,
-    )
-    _t0 = time.time()
-    need: list[Technique] = [
-        t for t in techniques
-        if not store.has_embedding(t.id, model_name) and (t.description or t.name)
-    ]
-    log.info(
-        "kg.query: has_embedding scan: %d of %d missing in %.2fs",
-        len(need), len(techniques), time.time() - _t0,
+        "kg.query: embedding scan (%s): %d of %d to (re)embed in %.2fs",
+        label, len(need), len(nodes), time.time() - _t0,
     )
     if need:
-        log.info(
-            "kg.query: backfilling %d technique embeddings (first query after ingest)",
-            len(need),
-        )
         embedder = _get_embedder(model_name)
-        texts = [f"{t.name}. {t.description}".strip(". ") for t in need]
         _t0 = time.time()
-        vecs = embedder.encode(texts, normalize_embeddings=True)
-        log.info(
-            "kg.query: embedder.encode(%d texts) took %.2fs",
-            len(texts), time.time() - _t0,
+        vecs = np.asarray(
+            embedder.encode([t for _, t in need], normalize_embeddings=True),
+            dtype=np.float32,
         )
-        vecs = np.asarray(vecs, dtype=np.float32)
-        for t, v in zip(need, vecs):
-            store.set_embedding(t.id, model_name, v)
+        log.info(
+            "kg.query: embedder.encode(%d %s texts) took %.2fs",
+            len(need), label, time.time() - _t0,
+        )
+        for (n, text), v in zip(need, vecs):
+            store.set_embedding(n.id, model_name, v, text=text)
 
-    _t0 = time.time()
-    out: list[tuple[Technique, Any]] = []
-    for t in techniques:
-        v = store.get_embedding(t.id, model_name)
+    out: list[tuple[Any, Any]] = []
+    for n in nodes:
+        v = store.get_embedding(n.id, model_name)
         if v is not None:
-            out.append((t, v))
-    log.info(
-        "kg.query: loaded %d embeddings in %.2fs",
-        len(out), time.time() - _t0,
-    )
+            out.append((n, v))
+    return out
+
+
+def _ensure_technique_embeddings(
+    store: SculptorKG, model_name: str = EMBEDDING_MODEL
+) -> list[tuple[Technique, Any]]:
+    """Staleness-aware Technique embedding pool (see ensure_embeddings)."""
+    techniques: list[Technique] = store.find_nodes(kind=Technique.kind)  # type: ignore[assignment]
+    return ensure_embeddings(
+        store, techniques, technique_embed_text, model_name,
+        label="Technique")
+
+
+def _ensure_failure_mode_embeddings(
+    store: SculptorKG, model_name: str = EMBEDDING_MODEL
+) -> list[tuple[FailureMode, Any]]:
+    """Staleness-aware FailureMode embedding pool (see ensure_embeddings)."""
+    modes: list[FailureMode] = store.find_nodes(kind=FailureMode.kind)  # type: ignore[assignment]
+    return ensure_embeddings(
+        store, modes, failure_mode_embed_text, model_name,
+        label="FailureMode")
+
+
+#: Default cosine floor for descriptor->FailureMode resolution
+#: (§KG-retrieval fix 2). Higher than DEFAULT_MIN_PROMPT_SIMILARITY
+#: (0.35) because a false-positive FailureMode match feeds
+#: query_techniques's ADDRESSES walk and can pull in unrelated
+#: techniques — descriptor resolution should stay conservative.
+DEFAULT_MIN_DESCRIPTOR_SIMILARITY = 0.45
+
+
+def resolve_failure_modes_semantic(
+    store: SculptorKG,
+    descriptors: list[str],
+    *,
+    top_k_per: int = 2,
+    min_similarity: float = DEFAULT_MIN_DESCRIPTOR_SIMILARITY,
+    model_name: str = EMBEDDING_MODEL,
+) -> list[str]:
+    """Embedding-match free-text failure descriptors onto FailureMode node
+    ids — the semantic counterpart to `_resolve_failure_modes`'s fixed-enum
+    fuzzy resolution.
+
+    For each descriptor, ranks all FailureModes by cosine similarity
+    between the descriptor text and `"{name}. {description}"`, keeping up
+    to `top_k_per` above `min_similarity`. Results across all descriptors
+    are deduped by node id (first-seen order). Returns `[]` when
+    `descriptors` is empty, the KG has no FailureMode embeddings, or
+    nothing clears the floor — the same best-effort, never-internally-
+    guarded shape as `query_semantic` (a broken/missing embedder raises
+    through to the caller, which is expected to guard it exactly like it
+    guards `query_semantic`).
+    """
+    import numpy as np
+
+    if not descriptors:
+        return []
+    pool = _ensure_failure_mode_embeddings(store, model_name)
+    if not pool:
+        return []
+
+    seen: set[str] = set()
+    out: list[str] = []
+    for desc in descriptors:
+        text = str(desc or "").strip()
+        if not text:
+            continue
+        qv = _embed_text(text, model_name)
+        scored = []
+        for fm, v in pool:
+            sim = float(np.dot(qv, v))
+            if sim < min_similarity:
+                continue
+            scored.append((sim, fm))
+        scored.sort(key=lambda x: -x[0])
+        for _, fm in scored[:top_k_per]:
+            if fm.id in seen:
+                continue
+            seen.add(fm.id)
+            out.append(fm.id)
     return out
 
 
@@ -432,29 +698,35 @@ def query_semantic(
             time.time() - _t0,
         )
         # Vectors are L2-normalized, so dot product == cosine similarity.
+        # §Agentic-data upgrade 2: the min_similarity FLOOR is checked on the
+        # raw cosine `sim` — BEFORE the usage-based boost is added — so a
+        # tangential match can never be resurrected above the floor by
+        # citation count. The boost only reorders among matches that
+        # already cleared the floor on relevance alone.
         scored = []
         for tech, v in pool:
             sim = float(np.dot(qv, v))
             if sim < min_similarity:
                 continue
-            scored.append((sim, tech))
+            ranked_score = sim + _citation_boost(tech.useful_citations)
+            scored.append((ranked_score, sim, tech))
         scored.sort(key=lambda x: -x[0])
 
         results: list[TechniqueMatch] = []
-        for sim, tech in scored[:top_k]:
+        for ranked_score, sim, tech in scored[:top_k]:
             intro_papers: list[Paper] = []
-            evidence = ""
+            intro_evidence: dict[str, str] = {}
             for edge, paper_id in store.neighbors(
                 tech.id, relation=Relation.INTRODUCES, direction="in"
             ):
                 p = store.get_node(paper_id)
                 if isinstance(p, Paper):
                     intro_papers.append(p)
-                    if not evidence and edge.data.get("evidence"):
-                        evidence = edge.data["evidence"]
+                    intro_evidence[p.id] = str(edge.data.get("evidence") or "")
             newest = max(
                 intro_papers, key=lambda p: (p.year or 0, p.arxiv_id), default=None)
             citation = cite(newest.arxiv_id, store=store) if newest else "(unknown paper)"
+            evidence = intro_evidence.get(newest.id, "") if newest else ""
 
             results.append(TechniqueMatch(
                 technique=tech,
@@ -466,6 +738,59 @@ def query_semantic(
                 source_paper_ids=[p.id for p in intro_papers],
             ))
         return results
+    finally:
+        if owns_store:
+            store.close()
+
+
+def query_papers(
+    text: str,
+    top_k: int = 5,
+    *,
+    tags: list[str] | None = None,
+    tier: str | None = None,
+    store: SculptorKG | None = None,
+    model_name: str = EMBEDDING_MODEL,
+    min_similarity: float = 0.0,
+) -> list[PaperMatch]:
+    """Semantic Paper retrieval with exact structured campaign filters.
+
+    Every requested tag must match one paper tag after separator and
+    qualified-taxonomy normalization (`locomotion` matches
+    `continuous_locomotion`). Tier is case-insensitive. Unlike Technique
+    retrieval, this makes metadata-only A/B papers useful before extraction.
+    """
+    import numpy as np
+
+    owns_store = store is None
+    store = store or SculptorKG()
+    try:
+        requested = [str(t) for t in (tags or []) if str(t).strip()]
+        candidates: list[Paper] = store.find_nodes(kind=Paper.kind)  # type: ignore[assignment]
+        if tier:
+            wanted_tier = str(tier).upper()
+            candidates = [p for p in candidates if (p.tier or "").upper() == wanted_tier]
+        if requested:
+            candidates = [
+                p for p in candidates
+                if all(any(
+                    _domain_tags_compatible(_normalize_domain_tag(want),
+                                            _normalize_domain_tag(have))
+                    for have in p.tags)
+                    for want in requested)
+            ]
+        if not candidates:
+            return []
+        pool = ensure_embeddings(
+            store, candidates, paper_embed_text, model_name, label="Paper")
+        qv = _embed_text(text, model_name)
+        scored = [
+            (float(np.dot(qv, vec)), paper) for paper, vec in pool
+        ]
+        scored = [row for row in scored if row[0] >= min_similarity]
+        scored.sort(key=lambda row: (-row[0], row[1].arxiv_id))
+        return [PaperMatch(paper=p, relevance_score=score)
+                for score, p in scored[:top_k]]
     finally:
         if owns_store:
             store.close()

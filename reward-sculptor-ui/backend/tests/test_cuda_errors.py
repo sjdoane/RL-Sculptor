@@ -45,6 +45,15 @@ def test_unknown_on_generic_error() -> None:
     assert r.title
 
 
+def test_policy_distribution_instability_detected() -> None:
+    msg = "RuntimeError: normal expects all elements of std >= 0.0"
+    r = classify(msg)
+    assert r.kind == "policy_distribution_instability"
+    assert "exploration" in r.title.lower()
+    assert r.problem_type == "/problems/policy-distribution-instability"
+    assert any("World" in suggestion for suggestion in r.suggestions)
+
+
 def test_suggest_num_envs_snaps_to_power_of_two() -> None:
     r = classify("CUDA out of memory", current_num_envs=3000)
     # 3000 // 2 = 1500 — snaps to 1024

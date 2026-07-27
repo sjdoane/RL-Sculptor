@@ -66,3 +66,54 @@ def test_ground_texture_no_scene_is_safe():
     # An env_cfg without a spec_fn-capable scene must not raise.
     _mjlab_runner._apply_ground_texture(SimpleNamespace(scene=SimpleNamespace()))
     _mjlab_runner._apply_ground_texture(SimpleNamespace())
+
+
+# ── rollout viewer config (720p default + no ghost neighbor envs) ─────────
+
+def _viewer_ns(**over):
+    base = dict(width=320, height=240, max_extra_envs=2, env_idx=0)
+    base.update(over)
+    return SimpleNamespace(**base)
+
+
+def test_rollout_viewer_defaults_to_720p_no_extra_envs():
+    viewer = _viewer_ns()
+    _mjlab_runner._configure_rollout_viewer(
+        SimpleNamespace(viewer=viewer), SimpleNamespace())
+    assert viewer.width == 1280
+    assert viewer.height == 720
+    # The glitchy-background fix: neighbor envs auto-reset mid-episode,
+    # so they must never be in frame.
+    assert viewer.max_extra_envs == 0
+
+
+def test_rollout_viewer_args_override():
+    viewer = _viewer_ns()
+    args = SimpleNamespace(
+        render_width=960, render_height=540, render_env_index=10)
+    _mjlab_runner._configure_rollout_viewer(SimpleNamespace(viewer=viewer), args)
+    assert (viewer.width, viewer.height) == (960, 540)
+    assert viewer.env_idx == 10
+
+
+def test_rollout_viewer_zero_args_mean_default():
+    viewer = _viewer_ns()
+    args = SimpleNamespace(render_width=0, render_height=0)
+    _mjlab_runner._configure_rollout_viewer(SimpleNamespace(viewer=viewer), args)
+    assert (viewer.width, viewer.height) == (1280, 720)
+
+
+def test_rollout_viewer_clamps_tiny_sizes():
+    viewer = _viewer_ns()
+    args = SimpleNamespace(render_width=8, render_height=8)
+    _mjlab_runner._configure_rollout_viewer(SimpleNamespace(viewer=viewer), args)
+    assert viewer.width >= 64 and viewer.height >= 64
+
+
+def test_rollout_viewer_missing_attrs_are_safe():
+    # No viewer at all, and a viewer lacking the attributes: never raises.
+    _mjlab_runner._configure_rollout_viewer(SimpleNamespace(), SimpleNamespace())
+    bare = SimpleNamespace()
+    _mjlab_runner._configure_rollout_viewer(
+        SimpleNamespace(viewer=bare), SimpleNamespace())
+    assert not hasattr(bare, "width")  # hasattr-guarded, not force-set

@@ -406,6 +406,217 @@ def test_create_mission_response_includes_params_mission_slug(
     assert body["params"].get("goal") == "Hold cartpole upright"
 
 
+# ── §MISSION_RUN_PARITY: per-stage metric best-of-N ──────────────────
+def test_create_mission_forwards_stage_metric_candidates(
+    client: TestClient, tmp_projects_root: Path, monkeypatch,
+) -> None:
+    """§MISSION_RUN_PARITY: NewMissionDialog's Basic-tab best-of-N select
+    POSTs `stage_metric_candidates` alongside `gen_stage_metrics`. The
+    route must forward BOTH to the decompose runner factory (which passes
+    n_candidates into generate_stage_metrics as its second phase).
+    """
+    captured: dict[str, object] = {}
+
+    async def _stub_runner(job, cancel):
+        return {"mission_slug": "stubbed", "n_stages": 0}
+
+    def _factory(**kwargs):
+        captured["gen_stage_metrics"] = kwargs.get("gen_stage_metrics")
+        captured["stage_metric_candidates"] = kwargs.get(
+            "stage_metric_candidates")
+        return _stub_runner
+
+    monkeypatch.setattr(
+        "backend.routes.missions.run_mission_decompose_job", _factory,
+    )
+
+    slug = _make_project(client)
+    r = client.post(
+        f"/projects/{slug}/missions",
+        json={
+            "goal": "Squat then launch into a vertical jump and land",
+            "gen_stage_metrics": True,
+            "stage_metric_candidates": 3,
+        },
+    )
+    assert r.status_code == 202, r.text
+    assert captured["gen_stage_metrics"] is True
+    assert captured["stage_metric_candidates"] == 3
+
+
+def test_create_mission_stage_metric_candidates_defaults_to_one() -> None:
+    """CreateMissionRequest carries gen_stage_metrics=True +
+    stage_metric_candidates=1 by default (no body change needed for the
+    single-shot path), and validates the 1..4 bound."""
+    import pytest as _pytest
+    from pydantic import ValidationError
+
+    from backend.models.mission import CreateMissionRequest
+
+    req = CreateMissionRequest(goal="Stand on one leg without falling")
+    assert req.gen_stage_metrics is True
+    assert req.stage_metric_candidates == 1
+
+    req2 = CreateMissionRequest(
+        goal="Stand on one leg", gen_stage_metrics=False,
+        stage_metric_candidates=4,
+    )
+    assert req2.gen_stage_metrics is False
+    assert req2.stage_metric_candidates == 4
+
+    # Out-of-bound N is a 422 (Field ge=1, le=4).
+    with _pytest.raises(ValidationError):
+        CreateMissionRequest(goal="x" * 8, stage_metric_candidates=5)
+
+
+def test_decompose_job_passes_n_candidates_to_generate_stage_metrics(
+    tmp_projects_root: Path, monkeypatch,
+) -> None:
+    """§MISSION_RUN_PARITY: run_mission_decompose_job's stage-metrics
+    phase calls generate_stage_metrics(..., n_candidates=N). Mock the
+    generator + decompose so no Anthropic/GPU call fires; assert the
+    n_candidates kwarg threads all the way through.
+    """
+    import asyncio
+    import json
+
+    from backend.services import mission_jobs as mj_mod
+    from backend.services.job_manager import Job
+
+    # Build a real sculpt project so load_adapter + config.toml resolve.
+    project_dir = tmp_projects_root / "cand_proj"
+    from sculptor.sculpt import sculpt_init
+    sculpt_init(project_dir, "gym_sb3")
+    mission_slug = "cand-mission"
+
+    captured: dict[str, object] = {}
+
+    # Stub decompose_task so it writes a minimal 1-stage mission + returns.
+    def _fake_decompose_task(goal, reward_contract, *, kg_store=None):
+        from sculptor.mission import Mission, Stage
+        return Mission(
+            goal=goal,
+            stages=[Stage(
+                name="stage_0", goal_text="do the thing",
+                success_criterion="metric > 0.5", max_iterations=2,
+                parent_stage=None, reward_seed_prompt="seed",
+            )],
+            decomposition_model="stub",
+            decomposition_rationale="stub",
+        )
+
+    def _fake_generate_stage_metrics(mission, *, robot_hint=None,
+                                     n_candidates=1, **_kw):
+        captured["n_candidates"] = n_candidates
+        return {"generated": [], "rejected": [], "skipped": []}
+
+    # The freshly-scaffolded gym_sb3 config has env_id="CHANGE_ME", which a
+    # real load_adapter can't gym.make — stub it (the decompose + metrics
+    # phases only need reward_contract() + a task_id hint).
+    class _FakeContract:
+        expected_info_keys: list = []
+        expected_components = None
+
+    class _FakeAdapter:
+        task_id = None
+
+        def reward_contract(self):
+            return _FakeContract()
+
+    monkeypatch.setattr(
+        "sculptor.adapters.base.load_adapter", lambda _p: _FakeAdapter(),
+    )
+    monkeypatch.setattr(
+        "sculptor.decompose.decompose_task", _fake_decompose_task,
+    )
+    monkeypatch.setattr(
+        "sculptor.mission_metrics.generate_stage_metrics",
+        _fake_generate_stage_metrics,
+    )
+
+    runner = mj_mod.run_mission_decompose_job(
+        project_dir=project_dir,
+        project_slug="cand_proj",
+        goal="Squat then jump",
+        mission_slug=mission_slug,
+        no_kg=True,  # skip the shared KG DB in the test
+        gen_stage_metrics=True,
+        stage_metric_candidates=3,
+    )
+    job = Job(job_id="j1", kind="mission_decompose", project_slug="cand_proj")
+    result = asyncio.run(runner(job, asyncio.Event()))
+
+    assert result["n_stages"] == 1
+    assert captured["n_candidates"] == 3
+
+
+# ── §MISSION_RUN_PARITY: run-time knob → CLI flag translation ─────────
+def test_build_mission_run_flags_emits_parity_knobs(
+    tmp_path: Path,
+) -> None:
+    """§MISSION_RUN_PARITY: RunMissionRequest's per-launch knobs translate
+    into the matching `sculpt mission-run` flags. Names MUST match
+    sculptor/cli.py::mission_run_cli's typer Options. None-valued fields
+    are skipped (defer to the stage's inherited config).
+    """
+    from backend.models.mission import RunMissionRequest
+    from backend.services.mission_jobs import _build_mission_run_flags
+
+    body = RunMissionRequest(
+        edit_candidates=3,
+        rollout_episodes=8,
+        max_episode_steps=750,
+        playback_speed=0.5,
+        render_width=960,
+        render_height=540,
+        fitness_patience=4,
+        num_envs_override=1024,
+        device_override="cuda:1",
+    )
+    flags = _build_mission_run_flags(
+        body.model_dump(exclude_none=False), tmp_path,
+    )
+
+    # Adjacent flag+value pairs so we assert the exact value too.
+    def _val(flag: str) -> str:
+        i = flags.index(flag)
+        return flags[i + 1]
+
+    assert "--edit-candidates" in flags and _val("--edit-candidates") == "3"
+    assert "--render-width" in flags and _val("--render-width") == "960"
+    assert "--render-height" in flags and _val("--render-height") == "540"
+    assert "--rollout-episodes" in flags and _val("--rollout-episodes") == "8"
+    assert "--max-episode-steps" in flags
+    assert "--playback-speed" in flags and _val("--playback-speed") == "0.5"
+    assert "--fitness-patience" in flags and _val("--fitness-patience") == "4"
+    assert "--num-envs" in flags and _val("--num-envs") == "1024"
+    assert "--device" in flags and _val("--device") == "cuda:1"
+
+
+def test_build_mission_run_flags_skips_unset_parity_knobs(
+    tmp_path: Path,
+) -> None:
+    """§MISSION_RUN_PARITY: an empty RunMissionRequest emits none of the
+    parity flags, and a blank device_override string is skipped (must not
+    shadow the stage's inherited device with '')."""
+    from backend.models.mission import RunMissionRequest
+    from backend.services.mission_jobs import _build_mission_run_flags
+
+    flags = _build_mission_run_flags(
+        RunMissionRequest().model_dump(exclude_none=False), tmp_path,
+    )
+    for flag in (
+        "--edit-candidates", "--rollout-episodes", "--max-episode-steps",
+        "--playback-speed", "--render-width", "--render-height",
+        "--fitness-patience", "--num-envs", "--device",
+    ):
+        assert flag not in flags
+
+    # Blank device string is dropped even though it's not None.
+    flags2 = _build_mission_run_flags({"device_override": ""}, tmp_path)
+    assert "--device" not in flags2
+
+
 # ── Slug derivation ──────────────────────────────────────────────────
 def test_derive_unique_mission_slug_basic():
     from backend.services.mission_store import derive_unique_mission_slug
@@ -496,6 +707,8 @@ def test_run_mission_409_when_other_gpu_job_active(
 def test_delete_mission_returns_freed_bytes(
     client: TestClient, tmp_projects_root: Path,
 ) -> None:
+    """Chunk A1: delete is a MOVE into the trash — gone from
+    .missions/ but recoverable under `.trash/`."""
     slug = _make_project(client)
     md = _seed_mission_on_disk(tmp_projects_root / slug, "alpha")
     # Drop a non-trivial file in the mission so freed_bytes > 0.
@@ -507,6 +720,12 @@ def test_delete_mission_returns_freed_bytes(
     assert body["mission_slug"] == "alpha"
     assert body["freed_bytes"] >= 1024
     assert not md.exists()
+
+    trash_root = tmp_projects_root.parent / ".trash"
+    entries = [d for d in trash_root.iterdir() if d.is_dir()]
+    assert len(entries) == 1
+    assert (entries[0] / "trash_meta.json").is_file()
+    assert (entries[0] / "alpha" / "extra.bin").is_file()
 
 
 def test_delete_mission_409_when_active_job(
@@ -664,3 +883,1287 @@ def test_load_mission_reconstructs_mission_dir_from_file_location(
     (dir_a / "mission.json").rename(dir_b / "mission.json")
     loaded = load_mission(dir_b)
     assert loaded.mission_dir == str(dir_b.resolve())
+
+
+# ── §C2 stage de-siloing: disk-truth stage-iteration endpoints ────────
+# Covers:
+#   - GET .../stages/{stage}/iterations — disk-truth iter rows, no job
+#     required (survives backend restart / stage-past-active).
+#   - GET .../stages/{stage}/iterations/{i}/rollout — FileResponse or
+#     404, same >2048-byte guard as routes/runs.py::get_iter_rollout.
+#   - GET .../stages/{stage}/env-spec — mirrors the project-level
+#     env-spec route, scoped to the stage's own env/ dir.
+#   - Path-traversal segments 404 rather than escaping the stage dir.
+def _seed_stage_dir(
+    project_dir: Path, mission_slug: str, stage: str,
+) -> Path:
+    """`<mission_dir>/stages/<stage>/` — bare dir (no runs/ yet). The
+    mission.json itself still needs `_seed_mission_on_disk`; this only
+    materializes the stage subtree the C2 routes read directly."""
+    stage_dir = (
+        project_dir / ".missions" / mission_slug / "stages" / stage
+    )
+    stage_dir.mkdir(parents=True, exist_ok=True)
+    return stage_dir
+
+
+def _seed_stage_iter(
+    stage_dir: Path,
+    iter_index: int,
+    *,
+    with_rollout: bool = False,
+    with_checkpoint: bool = False,
+    primary_metric: float | None = None,
+    fitness: float | None = None,
+    reward_version: str | None = None,
+    fitness_contradiction: dict | None = None,
+) -> Path:
+    """`<stage_dir>/runs/iter_<N>/` with the sidecar files the C2
+    iterations endpoint reads. `with_rollout=True` writes a >2048-byte
+    rollout.mp4 (the route's serve guard rejects smaller files, so the
+    fixture must clear it to exercise the 200 path).
+
+    `fitness_contradiction` (§D24 F4): when given, writes
+    `fitness_contradiction.json` with that payload — the durable flag
+    `sculpt.py`'s `_maybe_emit_fitness_contradiction` drops when a
+    stage's success criterion passed on this iter while the objective
+    fitness was at/near zero.
+    """
+    iter_dir = stage_dir / "runs" / f"iter_{iter_index}"
+    iter_dir.mkdir(parents=True, exist_ok=True)
+    if with_rollout:
+        rollout_dir = iter_dir / "rollout"
+        rollout_dir.mkdir(parents=True, exist_ok=True)
+        (rollout_dir / "rollout.mp4").write_bytes(b"\x00" * 4096)
+        if fitness is not None:
+            (rollout_dir / "behavior.json").write_text(
+                json.dumps({"fitness": fitness})
+            )
+    if with_checkpoint:
+        (iter_dir / "checkpoint.pt").write_bytes(b"\x00" * 128)
+    if primary_metric is not None:
+        (iter_dir / "metrics.json").write_text(
+            json.dumps({"metrics": {"mean_return": primary_metric}})
+        )
+    if reward_version is not None:
+        (iter_dir / "reward_spec.json").write_text(
+            json.dumps({"version": reward_version})
+        )
+    if fitness_contradiction is not None:
+        (iter_dir / "fitness_contradiction.json").write_text(
+            json.dumps(fitness_contradiction)
+        )
+    return iter_dir
+
+
+def test_list_stage_iterations_reports_rollout_and_checkpoint_flags(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    stage_dir = _seed_stage_dir(project_dir, "alpha", "stage_0")
+
+    # iter_0: rollout + checkpoint + fitness + reward version.
+    _seed_stage_iter(
+        stage_dir, 0,
+        with_rollout=True, with_checkpoint=True,
+        primary_metric=0.42, fitness=0.9, reward_version="v2",
+    )
+    # iter_1: neither rollout nor checkpoint (still training / errored
+    # before capture) — the route must NOT require a checkpoint to list
+    # a row (unlike sculptor.export.list_exportable_iters).
+    _seed_stage_iter(stage_dir, 1)
+
+    r = client.get(
+        f"/projects/{slug}/missions/alpha/stages/stage_0/iterations",
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert len(body) == 2
+
+    row0 = next(row for row in body if row["iter_index"] == 0)
+    assert row0["has_rollout"] is True
+    assert row0["has_checkpoint"] is True
+    assert row0["primary_metric"] == 0.42
+    assert row0["fitness"] == 0.9
+    assert row0["reward_version"] == "v2"
+
+    row1 = next(row for row in body if row["iter_index"] == 1)
+    assert row1["has_rollout"] is False
+    assert row1["has_checkpoint"] is False
+    assert row1["primary_metric"] is None
+    assert row1["fitness"] is None
+    assert row1["reward_version"] is None
+    # §D24 (F4): no flag file for either row → both default to no
+    # contradiction, not a crash on the absent file.
+    assert row0["fitness_contradiction"] is False
+    assert row0["fitness_components"] is None
+    assert row1["fitness_contradiction"] is False
+    assert row1["fitness_components"] is None
+
+
+def test_list_stage_iterations_reports_fitness_contradiction_flag(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    """§D24 (F4): a run-dir fixture with `fitness_contradiction.json` ->
+    the iteration row flags it True and passes through the components
+    breakdown; a sibling iter with no such file -> False/None."""
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    stage_dir = _seed_stage_dir(project_dir, "alpha", "stage_0")
+
+    _seed_stage_iter(
+        stage_dir, 0,
+        with_rollout=True, fitness=0.0,
+        fitness_contradiction={
+            "type": "fitness_contradiction",
+            "stage_name": "stage_0",
+            "iter": 0,
+            "fitness": 0.0,
+            "criterion": "root_height > 0.35",
+            "components": {
+                "gate_upright_frac": 1.0, "gate_reached_035": 0.0,
+            },
+        },
+    )
+    _seed_stage_iter(stage_dir, 1, with_rollout=True, fitness=0.8)
+
+    r = client.get(
+        f"/projects/{slug}/missions/alpha/stages/stage_0/iterations",
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+
+    row0 = next(row for row in body if row["iter_index"] == 0)
+    assert row0["fitness_contradiction"] is True
+    assert row0["fitness_components"] == {
+        "gate_upright_frac": 1.0, "gate_reached_035": 0.0,
+    }
+
+    row1 = next(row for row in body if row["iter_index"] == 1)
+    assert row1["fitness_contradiction"] is False
+    assert row1["fitness_components"] is None
+
+
+def test_list_stage_iterations_recovers_fitness_from_reward_spec_and_evidence(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    """§list/detail fitness parity (UI item 8): before this fix, the LIST
+    endpoint bare-read `behavior.json['fitness']` only — null for any
+    iteration whose objective fitness landed elsewhere. The DETAIL
+    endpoint's `_extract_objective_fitness` already recovered these via
+    `reward_spec.json` / `diagnosis.json`'s evidence prose; the LIST
+    endpoint now shares that same helper and must recover them too."""
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    stage_dir = _seed_stage_dir(project_dir, "alpha", "stage_0")
+
+    # iter_0: fitness ONLY in reward_spec.json — no behavior.json at all.
+    iter0 = _seed_stage_iter(stage_dir, 0, with_rollout=True)
+    (iter0 / "reward_spec.json").write_text(
+        json.dumps({"version": "v3", "objective_fitness": 0.87})
+    )
+
+    # iter_1: fitness ONLY recoverable from diagnosis.json's evidence
+    # prose — no behavior.json, no structured reward_spec/fitness.json.
+    iter1 = _seed_stage_iter(stage_dir, 1, with_rollout=True)
+    (iter1 / "diagnosis.json").write_text(
+        json.dumps({
+            "evidence": "Objective fitness is 0.64123 on this rollout.",
+        })
+    )
+
+    r = client.get(
+        f"/projects/{slug}/missions/alpha/stages/stage_0/iterations",
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+
+    row0 = next(row for row in body if row["iter_index"] == 0)
+    assert row0["fitness"] == pytest.approx(0.87)
+
+    row1 = next(row for row in body if row["iter_index"] == 1)
+    assert row1["fitness"] == pytest.approx(0.64123)
+
+
+def test_list_stage_iterations_uses_metric_history_by_index(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    """When `reports/metric_history.json` exists it is the canonical
+    per-index series — preferred over the iter's own metrics.json."""
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    stage_dir = _seed_stage_dir(project_dir, "alpha", "stage_0")
+
+    reports_dir = stage_dir / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    (reports_dir / "metric_history.json").write_text(json.dumps([0.1, 0.55]))
+
+    # iter_1's own metrics.json disagrees with the history — history wins.
+    _seed_stage_iter(stage_dir, 1, primary_metric=0.99)
+
+    r = client.get(
+        f"/projects/{slug}/missions/alpha/stages/stage_0/iterations",
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert len(body) == 1
+    assert body[0]["iter_index"] == 1
+    assert body[0]["primary_metric"] == 0.55
+
+
+def test_list_stage_iterations_404_unknown_mission_or_stage(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    slug = _make_project(client)
+    _seed_mission_on_disk(tmp_projects_root / slug, "alpha")
+
+    r = client.get(
+        f"/projects/{slug}/missions/no-such/stages/stage_0/iterations",
+    )
+    assert r.status_code == 404
+
+    r = client.get(
+        f"/projects/{slug}/missions/alpha/stages/no-such-stage/iterations",
+    )
+    assert r.status_code == 404
+
+
+def test_list_stage_iterations_empty_when_no_runs_dir(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    """A stage dir that exists but hasn't trained yet (no runs/ at
+    all) returns an empty list, not a 404 — the stage is real."""
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    _seed_stage_dir(project_dir, "alpha", "stage_0")
+
+    r = client.get(
+        f"/projects/{slug}/missions/alpha/stages/stage_0/iterations",
+    )
+    assert r.status_code == 200
+    assert r.json() == []
+
+
+def test_get_stage_iter_rollout_200_and_404(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    stage_dir = _seed_stage_dir(project_dir, "alpha", "stage_0")
+    _seed_stage_iter(stage_dir, 0, with_rollout=True)
+    _seed_stage_iter(stage_dir, 1)  # no rollout
+
+    r = client.get(
+        f"/projects/{slug}/missions/alpha/stages/stage_0/iterations/0/rollout",
+    )
+    assert r.status_code == 200
+    assert r.headers["content-type"] == "video/mp4"
+    assert len(r.content) == 4096
+
+    r = client.get(
+        f"/projects/{slug}/missions/alpha/stages/stage_0/iterations/1/rollout",
+    )
+    assert r.status_code == 404
+
+
+def test_get_stage_iter_rollout_404_below_size_guard(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    """A truncated / still-being-written rollout.mp4 (<2048 bytes)
+    must 404 rather than serve a broken clip, mirroring
+    routes/runs.py::get_iter_rollout's guard."""
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    stage_dir = _seed_stage_dir(project_dir, "alpha", "stage_0")
+    rollout_dir = stage_dir / "runs" / "iter_0" / "rollout"
+    rollout_dir.mkdir(parents=True)
+    (rollout_dir / "rollout.mp4").write_bytes(b"\x00" * 100)
+
+    r = client.get(
+        f"/projects/{slug}/missions/alpha/stages/stage_0/iterations/0/rollout",
+    )
+    assert r.status_code == 404
+
+
+def test_stage_routes_404_on_traversal_segment(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    """A `..` (or any non-slug) component in `mission_slug` or `stage`
+    must 404, not escape the project dir. FastAPI's path routing
+    itself collapses a literal `..` segment before dispatch for some
+    of these, so we exercise both the router-level guard AND the
+    inner `_SAFE_PATH_SEGMENT` check via a would-be-valid-looking but
+    disallowed segment (uppercase / spaces), which the router does NOT
+    normalize away.
+    """
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    _seed_stage_dir(project_dir, "alpha", "stage_0")
+
+    for bad_mission, bad_stage in (
+        ("alpha", "Stage 0"),
+        ("alpha", "..%2Fescape"),
+        ("Alpha!!", "stage_0"),
+    ):
+        r = client.get(
+            f"/projects/{slug}/missions/{bad_mission}/stages/{bad_stage}/iterations",
+        )
+        assert r.status_code == 404, (bad_mission, bad_stage, r.text)
+
+    # A literal ".." path segment for `stage` — most HTTP clients /
+    # ASGI routers normalize this before it reaches our handler, so
+    # assert the net effect (never a 200, never data from outside the
+    # stage dir) rather than depending on FastAPI's exact behavior.
+    r = client.get(f"/projects/{slug}/missions/alpha/stages/../env-spec")
+    assert r.status_code != 200
+
+
+def test_get_stage_env_spec_no_env_dir_returns_null_not_404(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    """A grounded stage (never ran env-spec adaptation) has no env/
+    dir at all. That's `{current: null, versions: []}` — the stage
+    itself is real, so this must NOT 404."""
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    _seed_stage_dir(project_dir, "alpha", "stage_0")
+
+    r = client.get(
+        f"/projects/{slug}/missions/alpha/stages/stage_0/env-spec",
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["active"] is False
+    assert body["current"] is None
+    assert body["versions"] == []
+
+
+def test_get_stage_env_spec_surfaces_rsi_meta_source(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    """§RSI chip: `current.meta.source` starting `"reference:"` means
+    reference-state-initialization seeded the stage's train-side reset
+    ranges. The route must pass it through verbatim so the UI can
+    detect the prefix."""
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    stage_dir = _seed_stage_dir(project_dir, "alpha", "stage_0")
+
+    env_dir = stage_dir / "env"
+    env_dir.mkdir(parents=True)
+    spec = {
+        "env_spec_version": 1,
+        "meta": {"source": "reference:procedural:jump", "version": "v0"},
+        "shared": {},
+        "train": {},
+    }
+    (env_dir / "v0.json").write_text(json.dumps(spec))
+    (env_dir / "current.json").write_text(json.dumps(spec))
+
+    r = client.get(
+        f"/projects/{slug}/missions/alpha/stages/stage_0/env-spec",
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["active"] is True
+    assert body["current"]["meta"]["source"] == "reference:procedural:jump"
+    assert body["versions"] == ["v0"]
+
+
+def test_get_stage_env_spec_404_unknown_mission_or_stage(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    slug = _make_project(client)
+    _seed_mission_on_disk(tmp_projects_root / slug, "alpha")
+
+    r = client.get(
+        f"/projects/{slug}/missions/no-such/stages/stage_0/env-spec",
+    )
+    assert r.status_code == 404
+
+    r = client.get(
+        f"/projects/{slug}/missions/alpha/stages/no-such-stage/env-spec",
+    )
+    assert r.status_code == 404
+
+
+# ── §fitness.json/selection.json backend increment (commit f1c339d
+# follow-up): richer iteration rows + the selection endpoint + the log
+# backfill ────────────────────────────────────────────────────────────
+def test_list_stage_iterations_reads_fitness_json_when_present(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    """An iter with `fitness.json` (the sculptor loop now persists this
+    LIVE as of commit f1c339d) carries fitness/steer_fitness/progress/
+    naturalness_flag/fitness_source straight from that file; a sibling
+    iter with no fitness.json falls back to the pre-existing legacy
+    extraction, with the new fields staying null/False."""
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    stage_dir = _seed_stage_dir(project_dir, "alpha", "stage_0")
+
+    iter0 = _seed_stage_iter(stage_dir, 0, with_rollout=True)
+    (iter0 / "fitness.json").write_text(json.dumps({
+        "schema": 1, "iter": 0,
+        "fitness": 0.91, "progress": 0.75,
+        "steer_fitness": 0.85, "steer_progress": 0.7,
+        "naturalness_factor": 0.9, "naturalness_flag": "severe_no_reject",
+        "naturalness_hard_reject": False,
+        "observe_only": False, "eval_seeds": None, "fitness_per_seed": None,
+        "components": None, "source": "live",
+        "recorded_at": "2026-07-13T00:00:00+00:00",
+    }))
+
+    # iter_1: legacy shape only — fitness recoverable via reward_spec.json,
+    # no fitness.json at all.
+    iter1 = _seed_stage_iter(stage_dir, 1, with_rollout=True)
+    (iter1 / "reward_spec.json").write_text(
+        json.dumps({"version": "v1", "objective_fitness": 0.42})
+    )
+
+    r = client.get(
+        f"/projects/{slug}/missions/alpha/stages/stage_0/iterations",
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+
+    row0 = next(row for row in body if row["iter_index"] == 0)
+    assert row0["fitness"] == pytest.approx(0.91)
+    assert row0["steer_fitness"] == pytest.approx(0.85)
+    assert row0["progress"] == pytest.approx(0.75)
+    assert row0["naturalness_flag"] == "severe_no_reject"
+    assert row0["naturalness_hard_reject"] is False
+    assert row0["fitness_source"] == "live"
+
+    row1 = next(row for row in body if row["iter_index"] == 1)
+    assert row1["fitness"] == pytest.approx(0.42)
+    assert row1["steer_fitness"] is None
+    assert row1["progress"] is None
+    assert row1["naturalness_flag"] is None
+    assert row1["naturalness_hard_reject"] is False
+    assert row1["fitness_source"] is None
+
+
+def test_get_stage_selection_returns_verbatim_when_file_present(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    stage_dir = _seed_stage_dir(project_dir, "alpha", "stage_0")
+    reports_dir = stage_dir / "reports"
+    reports_dir.mkdir(parents=True)
+    payload = {
+        "schema": 1, "stage": "stage_0",
+        "recorded_at": "2026-07-13T00:00:00+00:00",
+        "selected_iter_index": 1, "selection_source": "criterion+fitness",
+        "criterion_ok": True, "criterion": "root_height > 0.5",
+        "criterion_error": None, "start_state_mismatch": None,
+        "gate": {"skipped": False, "checked": 2, "mismatched_count": 0},
+        "candidates": [
+            {"iter_index": 0, "criterion_pass": False, "criterion_error": None,
+             "gate_mismatched": False, "fitness": 0.1, "steer_fitness": 0.1,
+             "progress": 0.2, "steer_progress": 0.2, "primary_metric": 1.0,
+             "selected": False},
+            {"iter_index": 1, "criterion_pass": True, "criterion_error": None,
+             "gate_mismatched": False, "fitness": 0.9, "steer_fitness": 0.9,
+             "progress": 0.95, "steer_progress": 0.95, "primary_metric": 2.0,
+             "selected": True},
+        ],
+    }
+    (reports_dir / "selection.json").write_text(json.dumps(payload))
+
+    r = client.get(
+        f"/projects/{slug}/missions/alpha/stages/stage_0/selection",
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["synthesized"] is False
+    assert body["schema"] == 1
+    assert body["selected_iter_index"] == 1
+    assert body["selection_source"] == "criterion+fitness"
+    assert len(body["candidates"]) == 2
+    assert body["candidates"][1]["selected"] is True
+
+
+def test_get_stage_selection_synthesizes_when_file_absent(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    """No `reports/selection.json` (every stage that predates commit
+    f1c339d) — the endpoint must still answer, synthesized from
+    mission.json's stage record + each iter's own on-disk fitness."""
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    stage_dir = _seed_stage_dir(project_dir, "alpha", "stage_0")
+    _seed_stage_iter(stage_dir, 0, with_rollout=True, fitness=0.2)
+    _seed_stage_iter(stage_dir, 1, with_rollout=True, fitness=0.8)
+
+    mission_path = project_dir / ".missions" / "alpha" / "mission.json"
+    mission = json.loads(mission_path.read_text())
+    mission["stages"][0]["status"] = "succeeded"
+    mission["stages"][0]["selected_iter_index"] = 1
+    mission["stages"][0]["selection_source"] = "fitness_fallback"
+    mission_path.write_text(json.dumps(mission))
+
+    r = client.get(
+        f"/projects/{slug}/missions/alpha/stages/stage_0/selection",
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["synthesized"] is True
+    assert body["schema"] == 0
+    assert body["selected_iter_index"] == 1
+    assert body["selection_source"] == "fitness_fallback"
+    assert body["criterion"] == "metric > 0.5"
+
+    candidates = {c["iter_index"]: c for c in body["candidates"]}
+    assert candidates[0]["fitness"] == pytest.approx(0.2)
+    assert candidates[0]["selected"] is False
+    assert candidates[0]["criterion_pass"] is None
+    assert candidates[1]["fitness"] == pytest.approx(0.8)
+    assert candidates[1]["selected"] is True
+
+
+def test_backfill_mission_fitness_writes_missing_and_skips_existing(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    """A fake `_execute_*.log` with a `stage_started` + two `iter_fitness`
+    SCULPT-EVENT markers — one iter dir exists with no fitness.json (gets
+    backfilled), one iter dir doesn't exist at all (counted, not written).
+    No trajectory.npz/mjcf_limits.json on the existing iter, so the
+    steer recompute exercises the recorded-`realism_audit.json` fallback
+    path (seeded with a `naturalness` dict) rather than a fresh audit."""
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    stage_dir = _seed_stage_dir(project_dir, "alpha", "stage_0")
+
+    iter0 = _seed_stage_iter(stage_dir, 0)  # exists, no fitness.json yet
+    (iter0 / "realism_audit.json").write_text(json.dumps({
+        "verdict": "severe",
+        "naturalness": {
+            "verdict": "severe", "hard_reject": False,
+            "steer_factor": 0.5, "flag": "severe_no_reject",
+            "reason": "vel p99 high",
+        },
+    }))
+
+    mission_dir = project_dir / ".missions" / "alpha"
+    log_lines = [
+        "[sculpt] starting stage_0",
+        json.dumps({
+            "type": "stage_started", "stage_name": "stage_0",
+            "stage_index": 0,
+        }),
+        json.dumps({
+            "type": "iter_fitness", "iter": 0, "fitness": 0.8,
+            "progress": 0.6, "observe_only": False,
+        }),
+        # iter 1 has no runs/iter_1 dir at all — must be counted
+        # no_iter_dir, never written.
+        json.dumps({
+            "type": "iter_fitness", "iter": 1, "fitness": 0.9,
+            "progress": 0.7, "observe_only": False,
+        }),
+    ]
+    (mission_dir / "_execute_fake123.log").write_text(
+        "\n".join(
+            f"[SCULPT-EVENT] {line}" if line.startswith("{") else line
+            for line in log_lines
+        ) + "\n",
+    )
+
+    r = client.post(f"/projects/{slug}/missions/alpha/backfill-fitness")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["written"] == 1
+    assert body["skipped_existing"] == 0
+    assert body["no_iter_dir"] == 1
+    assert body["stages"] == {"stage_0": 1}
+
+    written = json.loads((iter0 / "fitness.json").read_text())
+    assert written["schema"] == 1
+    assert written["iter"] == 0
+    assert written["fitness"] == pytest.approx(0.8)
+    assert written["progress"] == pytest.approx(0.6)
+    assert written["source"] == "log_backfill"
+    # No trajectory files → fell back to the recorded realism_audit.json's
+    # naturalness dict for the steer recompute.
+    assert written["naturalness_flag"] == "severe_no_reject"
+    assert written["naturalness_hard_reject"] is False
+    assert written["steer_fitness"] == pytest.approx(0.4)  # 0.8 * 0.5
+    assert written["steer_progress"] == pytest.approx(0.3)  # 0.6 * 0.5
+
+    # A second call must NOT overwrite the file just written.
+    r2 = client.post(f"/projects/{slug}/missions/alpha/backfill-fitness")
+    assert r2.status_code == 200, r2.text
+    assert r2.json()["skipped_existing"] == 1
+    assert r2.json()["written"] == 0
+
+
+# ── §completed-mission review: metric_history object-shape parse ─────
+def test_list_stage_iterations_metric_history_object_shape(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    """The real on-disk shape is `{"primary_metric": "mean_return",
+    "history": [...]}`, NOT a bare list — the route must read `.history`,
+    not fall through to treating the whole object as falsy/wrong-shaped."""
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    stage_dir = _seed_stage_dir(project_dir, "alpha", "stage_0")
+
+    reports_dir = stage_dir / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    (reports_dir / "metric_history.json").write_text(json.dumps({
+        "primary_metric": "mean_return",
+        "history": [43.49194463094076, 42.68934631347656, 43.27508099873861],
+    }))
+    _seed_stage_iter(stage_dir, 0)
+    _seed_stage_iter(stage_dir, 1)
+    _seed_stage_iter(stage_dir, 2)
+
+    r = client.get(
+        f"/projects/{slug}/missions/alpha/stages/stage_0/iterations",
+    )
+    assert r.status_code == 200, r.text
+    body = {row["iter_index"]: row for row in r.json()}
+    assert body[0]["primary_metric"] == pytest.approx(43.49194463094076)
+    assert body[1]["primary_metric"] == pytest.approx(42.68934631347656)
+    assert body[2]["primary_metric"] == pytest.approx(43.27508099873861)
+
+
+# ── §completed-mission review: GET .../iterations/{i}/detail ─────────
+def _seed_full_iter_detail(stage_dir: Path, iter_index: int) -> Path:
+    """A stage iter with reward_spec.json (description + references),
+    diagnosis.json (evidence with the leading-number fallback phrasing +
+    literature_context), and reward_trajectory.json (mixed __-prefixed
+    and real components) — the full set `get_stage_iter_detail` reads."""
+    iter_dir = stage_dir / "runs" / f"iter_{iter_index}"
+    iter_dir.mkdir(parents=True, exist_ok=True)
+    (iter_dir / "reward_spec.json").write_text(json.dumps({
+        "version": "v2",
+        "description": "Crouch skill objective plus base stability terms.",
+        "references": [
+            {
+                "arxiv_id": "2010.11251",
+                "citation": "Lee et al. (2020). arXiv:2010.11251",
+                "how_used": "Smooth Gaussian kernel technique.",
+            },
+        ],
+    }))
+    (iter_dir / "diagnosis.json").write_text(json.dumps({
+        "evidence": "The run is largely healthy: objective fitness is 0.99963 and stable.",
+        "confidence": 0.7,
+        "failure_modes": ["reward_saturation"],
+        "literature_context": [
+            {
+                "paper_citation": "He et al. (2024). arXiv:2406.08858",
+                "description": "Stable standing bias augmentation.",
+            },
+        ],
+    }))
+    (iter_dir / "reward_trajectory.json").write_text(json.dumps({
+        "__episode_length": [17, 18, 19],
+        "__terminated": [0, 0, 0],
+        "alive_bonus": [0.1, 0.1, 0.1],
+        "crouch_depth": [0.2, 0.4, 0.6],
+    }))
+    (iter_dir / "metrics.json").write_text(
+        json.dumps({"metrics": {"mean_return": 43.49}})
+    )
+    return iter_dir
+
+
+def test_get_stage_iter_detail_assembles_all_fields(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    stage_dir = _seed_stage_dir(project_dir, "alpha", "stage_0")
+    _seed_full_iter_detail(stage_dir, 0)
+
+    r = client.get(
+        f"/projects/{slug}/missions/alpha/stages/stage_0/iterations/0/detail",
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["iter_index"] == 0
+    assert body["reward_version"] == "v2"
+    assert body["reward_description"] == "Crouch skill objective plus base stability terms."
+    assert body["reward_references"] == [{
+        "arxiv_id": "2010.11251",
+        "citation": "Lee et al. (2020). arXiv:2010.11251",
+        "description": "Smooth Gaussian kernel technique.",
+        "grounded": None,
+    }]
+    assert body["primary_metric"] == pytest.approx(43.49)
+    # No structured objective_fitness anywhere on disk -> regex fallback
+    # pulls the leading number out of the evidence prose.
+    assert body["objective_fitness"] == pytest.approx(0.99963)
+    assert "objective fitness is 0.99963" in body["evidence"]
+    assert body["confidence"] == pytest.approx(0.7)
+    assert body["failure_modes"] == ["reward_saturation"]
+    assert body["literature_context"] == [{
+        "arxiv_id": None,
+        "citation": "He et al. (2024). arXiv:2406.08858",
+        "description": "Stable standing bias augmentation.",
+        "grounded": None,
+    }]
+    # __-prefixed bookkeeping keys excluded; real components meaned.
+    assert body["components"] == {
+        "alive_bonus": 0.1,
+        "crouch_depth": pytest.approx(0.4),
+    }
+
+
+def test_get_stage_iter_detail_grounded_true_false_absent(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    """The diagnoser tags each cited paper `grounded: true` (retrieved
+    from the KG this iteration) or `grounded: false` (recalled by the
+    model, not retrieved). Both `reward_spec.json.references` and
+    `diagnosis.json.literature_context` entries carry the tag and it
+    must pass through untouched; an entry with no `grounded` key at all
+    (old diagnosis.json files predate the tag) must come through as
+    `None`, not `False`."""
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    stage_dir = _seed_stage_dir(project_dir, "alpha", "stage_0")
+    iter_dir = stage_dir / "runs" / "iter_0"
+    iter_dir.mkdir(parents=True)
+    (iter_dir / "reward_spec.json").write_text(json.dumps({
+        "version": "v1",
+        "references": [
+            {
+                "arxiv_id": "1111.11111",
+                "citation": "Retrieved et al.",
+                "how_used": "retrieved this iter",
+                "grounded": True,
+            },
+            {
+                "arxiv_id": "2222.22222",
+                "citation": "Recalled et al.",
+                "how_used": "recalled from training",
+                "grounded": False,
+            },
+            {
+                "arxiv_id": "3333.33333",
+                "citation": "Legacy et al.",
+                "how_used": "no grounded tag on disk",
+            },
+        ],
+    }))
+    (iter_dir / "diagnosis.json").write_text(json.dumps({
+        "literature_context": [
+            {"paper_citation": "Retrieved Lit.", "grounded": True},
+            {"paper_citation": "Recalled Lit.", "grounded": False},
+            {"paper_citation": "Legacy Lit."},
+        ],
+    }))
+
+    r = client.get(
+        f"/projects/{slug}/missions/alpha/stages/stage_0/iterations/0/detail",
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert [ref["grounded"] for ref in body["reward_references"]] == [True, False, None]
+    assert [ref["grounded"] for ref in body["literature_context"]] == [True, False, None]
+
+
+def test_get_stage_iter_detail_structured_objective_fitness_wins(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    """When reward_spec.json carries a structured `objective_fitness`,
+    it's used directly rather than falling through to the evidence
+    regex."""
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    stage_dir = _seed_stage_dir(project_dir, "alpha", "stage_0")
+    iter_dir = stage_dir / "runs" / "iter_0"
+    iter_dir.mkdir(parents=True)
+    (iter_dir / "reward_spec.json").write_text(json.dumps({
+        "version": "v0", "objective_fitness": 0.5,
+    }))
+    (iter_dir / "diagnosis.json").write_text(json.dumps({
+        "evidence": "Objective fitness is 0.9 per the prose.",
+    }))
+
+    r = client.get(
+        f"/projects/{slug}/missions/alpha/stages/stage_0/iterations/0/detail",
+    )
+    assert r.status_code == 200, r.text
+    assert r.json()["objective_fitness"] == pytest.approx(0.5)
+
+
+def test_get_stage_iter_detail_tolerates_all_files_missing(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    """An iter dir with none of the sidecar files present must return
+    200 with every optional field null/[], never a 500."""
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    stage_dir = _seed_stage_dir(project_dir, "alpha", "stage_0")
+    (stage_dir / "runs" / "iter_0").mkdir(parents=True)
+
+    r = client.get(
+        f"/projects/{slug}/missions/alpha/stages/stage_0/iterations/0/detail",
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body == {
+        "iter_index": 0,
+        "reward_version": None,
+        "reward_description": None,
+        "reward_references": [],
+        "primary_metric": None,
+        "objective_fitness": None,
+        "evidence": None,
+        "confidence": None,
+        "failure_modes": [],
+        "literature_context": [],
+        "components": None,
+    }
+
+
+def test_get_stage_iter_detail_404_unknown_stage_or_iter(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    stage_dir = _seed_stage_dir(project_dir, "alpha", "stage_0")
+    _seed_stage_iter(stage_dir, 0)
+
+    r = client.get(
+        f"/projects/{slug}/missions/alpha/stages/no-such/iterations/0/detail",
+    )
+    assert r.status_code == 404
+
+    r = client.get(
+        f"/projects/{slug}/missions/alpha/stages/stage_0/iterations/9/detail",
+    )
+    assert r.status_code == 404
+
+
+# ── §completed-mission review: GET .../stages/{stage}/metric ─────────
+def test_get_stage_metric_accepted(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    _seed_stage_dir(project_dir, "alpha", "stage_0")
+
+    sm_dir = project_dir / ".missions" / "alpha" / "stage_metrics" / "stage_0"
+    sm_dir.mkdir(parents=True)
+    (sm_dir / "metric.py").write_text("def compute_spec(*a, **k): return {}\n")
+    (sm_dir / "meta.json").write_text(json.dumps({
+        "accepted": True,
+        "validation_passed": True,
+        "behavior_goal": "crouch and hold",
+        "n_candidates": 3,
+        "calibrated": False,
+        "review": {"approved": True, "summary": "Gate + min() of bounded channels."},
+    }))
+
+    r = client.get(f"/projects/{slug}/missions/alpha/stages/stage_0/metric")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "accepted"
+    assert body["behavior_goal"] == "crouch and hold"
+    assert body["validation_passed"] is True
+    assert body["n_candidates"] == 3
+    assert body["calibrated"] is False
+    assert body["review_summary"] == "Gate + min() of bounded channels."
+    assert "def compute_spec" in body["metric_source"]
+    # §R1 remainder: no references attached -> [], never null.
+    assert body["references"] == []
+
+
+def test_get_stage_metric_with_references(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    """meta.json's `validation.references` (written by
+    `_validate_references`) mirrors into the route's `references` field
+    as `{clip_id, gates}`, dropping the heavier reasons/scores payload."""
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    _seed_stage_dir(project_dir, "alpha", "stage_0")
+
+    sm_dir = project_dir / ".missions" / "alpha" / "stage_metrics" / "stage_0"
+    sm_dir.mkdir(parents=True)
+    (sm_dir / "metric.py").write_text("def compute_spec(*a, **k): return {}\n")
+    (sm_dir / "meta.json").write_text(json.dumps({
+        "accepted": True,
+        "validation_passed": True,
+        "behavior_goal": "jump up and land",
+        "calibrated": False,
+        "validation": {
+            "gates": {"bounded": True},
+            "references": [
+                {
+                    "clip_id": "jump_demo_clip",
+                    "gates": {
+                        "reference_nondegeneracy": True,
+                        "reference_monotonicity": True,
+                        "reference_negatives": False,
+                    },
+                    "reasons": ["[reference:jump_demo_clip] negatives: ..."],
+                    "scores": {"full": 0.9},
+                },
+            ],
+        },
+    }))
+
+    r = client.get(f"/projects/{slug}/missions/alpha/stages/stage_0/metric")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["references"] == [{
+        "clip_id": "jump_demo_clip",
+        "gates": {
+            "reference_nondegeneracy": True,
+            "reference_monotonicity": True,
+            "reference_negatives": False,
+        },
+    }]
+
+
+def test_get_stage_metric_malformed_reference_entries_are_skipped(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    """A reference entry missing/mistyping `clip_id`, or a non-list
+    `references`/non-dict `validation`, degrades to an empty (or
+    partial) list rather than 500ing the whole metric card."""
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    _seed_stage_dir(project_dir, "alpha", "stage_0")
+
+    sm_dir = project_dir / ".missions" / "alpha" / "stage_metrics" / "stage_0"
+    sm_dir.mkdir(parents=True)
+    (sm_dir / "meta.json").write_text(json.dumps({
+        "accepted": True,
+        "validation": {
+            "references": [
+                {"clip_id": "good_clip", "gates": {"reference_negatives": True}},
+                {"gates": {"reference_negatives": True}},  # missing clip_id
+                "not-a-dict",
+                {"clip_id": "clip_with_bad_gates", "gates": "not-a-dict"},
+            ],
+        },
+    }))
+
+    r = client.get(f"/projects/{slug}/missions/alpha/stages/stage_0/metric")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["references"] == [
+        {"clip_id": "good_clip", "gates": {"reference_negatives": True}},
+        {"clip_id": "clip_with_bad_gates", "gates": {}},
+    ]
+
+
+def test_get_stage_metric_rejected(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    _seed_stage_dir(project_dir, "alpha", "stage_0")
+
+    sm_dir = project_dir / ".missions" / "alpha" / "stage_metrics" / "stage_0"
+    sm_dir.mkdir(parents=True)
+    (sm_dir / "meta.json").write_text(json.dumps({
+        "accepted": False,
+        "validation_passed": False,
+    }))
+
+    r = client.get(f"/projects/{slug}/missions/alpha/stages/stage_0/metric")
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "rejected"
+
+
+def test_get_stage_metric_inherited(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    """No stage_metrics dir at all, but the stage's mission.json carries
+    a `steering_metric` -> "inherited"."""
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    md = project_dir / ".missions" / "alpha"
+    md.mkdir(parents=True)
+    payload = {
+        "schema_version": 1,
+        "goal": "test mission",
+        "decomposition_model": "claude-opus-4-7",
+        "decomposition_rationale": "test",
+        "created_at": "2026-04-24T00:00:00+00:00",
+        "current_stage_idx": 0,
+        "stages": [{
+            "name": "stage_0",
+            "goal_text": "step 0",
+            "success_criterion": "metric > 0.5",
+            "max_iterations": 2,
+            "parent_stage": None,
+            "reward_seed_prompt": "seed",
+            "kg_seed_papers": [],
+            "status": "pending",
+            "final_policy_path": None,
+            "final_reward_path": None,
+            "best_metric": None,
+            "iterations_used": 0,
+            "started_at": None,
+            "finished_at": None,
+            "redecomposition_attempts": 0,
+            "steering_metric": "some_inherited_metric",
+        }],
+    }
+    (md / "mission.json").write_text(json.dumps(payload))
+    _seed_stage_dir(project_dir, "alpha", "stage_0")
+
+    r = client.get(f"/projects/{slug}/missions/alpha/stages/stage_0/metric")
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "inherited"
+
+
+def test_get_stage_metric_none(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    _seed_stage_dir(project_dir, "alpha", "stage_0")
+
+    r = client.get(f"/projects/{slug}/missions/alpha/stages/stage_0/metric")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "none"
+    assert body["behavior_goal"] is None
+    assert body["metric_source"] is None
+
+
+def test_get_stage_metric_malformed_meta_never_500s(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    _seed_stage_dir(project_dir, "alpha", "stage_0")
+
+    sm_dir = project_dir / ".missions" / "alpha" / "stage_metrics" / "stage_0"
+    sm_dir.mkdir(parents=True)
+    (sm_dir / "meta.json").write_text("{not valid json")
+
+    r = client.get(f"/projects/{slug}/missions/alpha/stages/stage_0/metric")
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "rejected"
+
+
+def test_get_stage_metric_404_unknown_mission_or_stage(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    slug = _make_project(client)
+    _seed_mission_on_disk(tmp_projects_root / slug, "alpha")
+
+    r = client.get(f"/projects/{slug}/missions/no-such/stages/stage_0/metric")
+    assert r.status_code == 404
+
+    r = client.get(f"/projects/{slug}/missions/alpha/stages/no-such-stage/metric")
+    assert r.status_code == 404
+
+
+# ── §completed-mission review: actuator-limits mission/stage scope ───
+def test_actuator_limits_mission_stage_scope(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    import numpy as np
+
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    stage_dir = _seed_stage_dir(project_dir, "alpha", "stage_0")
+
+    rd = stage_dir / "runs" / "iter_0" / "rollout"
+    rd.mkdir(parents=True)
+    T, E = 12, 4
+    jv = np.zeros((T, E, 2))
+    jt = np.zeros((T, E, 2))
+    jv[..., 0] = 10.0
+    jt[..., 0] = 100.0
+    jv[..., 1] = 5.0
+    jt[..., 1] = 20.0
+    np.savez(
+        rd / "trajectory.npz", joint_vel=jv, joint_torque=jt,
+        projected_gravity_b=np.zeros((T, E, 3)),
+    )
+    (rd / "mjcf_limits.json").write_text(
+        json.dumps({"joint_names": ["left_knee_joint", "left_ankle_pitch_joint"]})
+    )
+
+    r = client.get(
+        f"/projects/{slug}/reports/actuator-limits"
+        f"?mission_slug=alpha&stage=stage_0"
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ok"] is True
+    assert body["available_iters"] == [0]
+    assert len(body["motors"]) == 2
+
+    # Project-level scope (no params) must be unaffected — no rollouts
+    # on the project's own runs/ tree.
+    r2 = client.get(f"/projects/{slug}/reports/actuator-limits")
+    assert r2.status_code == 200
+    assert r2.json()["ok"] is False
+
+
+def test_actuator_limits_mission_stage_404_unknown(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    slug = _make_project(client)
+    _seed_mission_on_disk(tmp_projects_root / slug, "alpha")
+
+    r = client.get(
+        f"/projects/{slug}/reports/actuator-limits"
+        f"?mission_slug=no-such&stage=stage_0"
+    )
+    assert r.status_code == 404
+
+    r = client.get(
+        f"/projects/{slug}/reports/actuator-limits"
+        f"?mission_slug=alpha&stage=no-such-stage"
+    )
+    assert r.status_code == 404
+
+
+# ── §completed-mission review: GET .../iterations/{i}/export ─────────
+def _plant_stage_checkpoint(stage_dir: Path, iter_index: int) -> Path:
+    torch = pytest.importorskip("torch")
+    it = stage_dir / "runs" / f"iter_{iter_index}"
+    it.mkdir(parents=True, exist_ok=True)
+    sd = {
+        "mlp.0.weight": torch.zeros(8, 4), "mlp.0.bias": torch.zeros(8),
+        "mlp.2.weight": torch.zeros(2, 8), "mlp.2.bias": torch.zeros(2),
+        "distribution.std_param": torch.zeros(2),
+    }
+    torch.save({"actor_state_dict": sd, "iter": 5}, it / "checkpoint.pt")
+    (it / "reward_spec.json").write_text(json.dumps({"version": "v0"}))
+    return it
+
+
+def test_get_stage_iter_export_downloads_zip_bundle(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    import io
+    import zipfile
+
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    stage_dir = _seed_stage_dir(project_dir, "alpha", "stage_0")
+    _plant_stage_checkpoint(stage_dir, 1)
+
+    r = client.get(
+        f"/projects/{slug}/missions/alpha/stages/stage_0/iterations/1/export",
+    )
+    assert r.status_code == 200, r.text
+    assert r.headers["content-type"] == "application/zip"
+    assert "alpha_stage_0_iter1_policy.zip" in r.headers.get("content-disposition", "")
+    with zipfile.ZipFile(io.BytesIO(r.content)) as zf:
+        names = set(zf.namelist())
+        manifest = json.loads(zf.read("manifest.json"))
+    assert {"manifest.json", "checkpoint.pt", "DEPLOY.md"} <= names
+    assert manifest["iter_index"] == 1
+
+
+def test_get_stage_iter_export_404_no_checkpoint(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    stage_dir = _seed_stage_dir(project_dir, "alpha", "stage_0")
+    _seed_stage_iter(stage_dir, 0)  # no checkpoint
+
+    r = client.get(
+        f"/projects/{slug}/missions/alpha/stages/stage_0/iterations/0/export",
+    )
+    assert r.status_code == 404
+    assert "no exportable" in r.json()["detail"]
+
+
+def test_get_stage_iter_export_wires_stage_runs_root(
+    client: TestClient, tmp_projects_root: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Route-wiring check: `export_policy_bundle` must be called with
+    `runs_root` pointed at THIS stage's own runs tree, not the
+    project-level runs/ dir — proven by monkeypatching the sculptor call
+    and asserting on the `runs_root` it received."""
+    slug = _make_project(client)
+    project_dir = tmp_projects_root / slug
+    _seed_mission_on_disk(project_dir, "alpha")
+    stage_dir = _seed_stage_dir(project_dir, "alpha", "stage_0")
+    (stage_dir / "runs" / "iter_2").mkdir(parents=True)
+
+    calls: list[dict] = []
+
+    class _FakeResult:
+        bundle_path = None
+
+    def _fake_export_policy_bundle(
+        project_dir_arg, *, iter_index, runs_root, out_path=None,
+    ):
+        calls.append({
+            "project_dir": project_dir_arg,
+            "iter_index": iter_index,
+            "runs_root": runs_root,
+            "out_path": out_path,
+        })
+        # Write a tiny real zip so FileResponse has something to serve.
+        import zipfile as zf_mod
+
+        bundle_dir = project_dir_arg / "exports"
+        bundle_dir.mkdir(parents=True, exist_ok=True)
+        bundle_path = bundle_dir / "fake.zip"
+        with zf_mod.ZipFile(bundle_path, "w") as zf:
+            zf.writestr("manifest.json", json.dumps({"iter_index": iter_index}))
+        result = _FakeResult()
+        result.bundle_path = bundle_path
+        return result
+
+    import sculptor.export as sculptor_export
+
+    monkeypatch.setattr(
+        sculptor_export, "export_policy_bundle", _fake_export_policy_bundle,
+    )
+
+    r = client.get(
+        f"/projects/{slug}/missions/alpha/stages/stage_0/iterations/2/export",
+    )
+    assert r.status_code == 200, r.text
+    assert len(calls) == 1
+    assert calls[0]["iter_index"] == 2
+    assert calls[0]["runs_root"] == stage_dir / "runs"
+    # Stage-scoped out_path so two stages sharing an iter index don't
+    # collide on one project-level bundle file.
+    assert calls[0]["out_path"] == (
+        project_dir / "exports" / "policy_alpha_stage_0_iter2.zip"
+    )

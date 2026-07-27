@@ -18,6 +18,9 @@ import pytest
 from sculptor.diagnose import Diagnosis, ProposedEdit
 from sculptor.edit import (
     EditValidationError,
+    _call_compute_reward,
+    _call_compute_reward_batched,
+    _current_reward_component_keys,
     _extract_formula_identifiers,
     _pre_validate,
     apply_edits,
@@ -503,6 +506,64 @@ def compute_reward(state, action, next_state, info):
         )
 
 
+def test_apply_edits_rs_edit_repair_retries_knob_extends_attempts(
+    v0_path, kg, monkeypatch,
+):
+    """§RS_EDIT_REPAIR_RETRIES: with the knob unset/at its default (1),
+    two straight failures exhaust the retry budget and raise (mirrors
+    `test_apply_edits_raises_on_second_failure`). Setting the env var to
+    2 grants ONE more attempt — the same two-failures-then-good sequence
+    that would previously raise now succeeds on attempt 3."""
+    import hashlib
+
+    from sculptor.kg.query import cite
+
+    parent_hash = hashlib.sha256(
+        v0_path.read_text(encoding="utf-8").encode("utf-8")).hexdigest()[:16]
+    citation = cite("1801.00690", store=kg)
+
+    broken = '''\
+"""still missing REWARD_SPEC."""
+def compute_reward(state, action, next_state, info):
+    return 0.0, {"a": 0.0}
+'''
+    good = _render_v1_source(parent_hash, citation)
+
+    diagnosis = Diagnosis(
+        failure_modes=["component_imbalance"], evidence="",
+        proposed_edits=[
+            ProposedEdit(
+                target_term="alive_bonus", operation="increase",
+                rationale="grounded", suggested_value="3.0",
+                paper_refs=["1801.00690"],
+            ),
+        ],
+        confidence=0.9,
+    )
+
+    # Default (unset) — 2 straight failures still raise (unchanged
+    # behavior; byte-identical to pre-knob).
+    client_default = _StubClient(broken, broken)
+    with pytest.raises(EditValidationError):
+        apply_edits(
+            current_reward_path=v0_path, diagnosis=diagnosis,
+            new_iter_id="v1", reward_contract=_hopper_contract(),
+            kg_store=kg, client=client_default,
+        )
+    assert len(client_default.messages.calls) == 2
+
+    # RS_EDIT_REPAIR_RETRIES=2 — a 3rd attempt is granted and succeeds.
+    monkeypatch.setenv("RS_EDIT_REPAIR_RETRIES", "2")
+    client_extended = _StubClient(broken, broken, good)
+    out_path = apply_edits(
+        current_reward_path=v0_path, diagnosis=diagnosis,
+        new_iter_id="v1", reward_contract=_hopper_contract(),
+        kg_store=kg, client=client_extended,
+    )
+    assert out_path.is_file()
+    assert len(client_extended.messages.calls) == 3
+
+
 def test_apply_edits_rejects_bad_reference_arxiv_id(v0_path, kg):
     """Generated module cites an arxiv_id that isn't in the KG."""
     import hashlib
@@ -615,6 +676,7 @@ def test_build_dummy_inputs_uses_state_schema_when_present(tmp_path):
             "projected_gravity_b": (3,),
             "command_vel": (3,),
         },
+        info_schema={"episode_length": (), "terminated": ()},
     )
     state, action, next_state, info = _build_dummy_inputs(contract)
     assert isinstance(state, dict), "state must be a dict for schema contracts"
@@ -625,6 +687,66 @@ def test_build_dummy_inputs_uses_state_schema_when_present(tmp_path):
     assert state["actuator_force"].shape == (1, 12)
     assert isinstance(info, dict)
     assert "episode_length" in info and "terminated" in info
+
+
+def test_batched_preflight_preserves_vector_info_shapes():
+    """A vector authored channel must reach the probe as (N, 3).
+
+    This is the exact pre-training regression that previously let generated
+    code reshape ``region__finish__relative`` from (1024, 3) to (1024,) and
+    crash on the first Mjlab step.
+    """
+    from sculptor.adapters.base import RewardContract
+
+    class _BadVectorReward:
+        @staticmethod
+        def compute_reward_batched(state, action, next_state, info):
+            n = action.shape[0]
+            finish = info["region__finish__relative"].reshape(n)
+            return finish, {"finish": finish}
+
+    contract = RewardContract(
+        observation_space_spec=None,
+        action_space_spec=None,
+        expected_info_keys=["region__finish__relative"],
+        supports_batched=True,
+        state_schema={"actuator_force": (2,)},
+        info_schema={"region__finish__relative": (3,)},
+    )
+
+    with pytest.raises(
+        EditValidationError,
+        match="shape.*invalid|invalid.*shape",
+    ):
+        _call_compute_reward_batched(_BadVectorReward(), contract)
+
+
+def test_legacy_parent_vector_fallback_is_not_used_for_new_validation():
+    """A broken parent remains inspectable solely so the LLM can repair it."""
+    from sculptor.adapters.base import RewardContract
+
+    class _LegacyParent:
+        @staticmethod
+        def compute_reward(state, action, next_state, info):
+            # Works for legacy feature-only (3,), fails for exact (1, 3).
+            values = [float(value) for value in info["relative"]]
+            magnitude = sum(value * value for value in values) ** 0.5
+            return magnitude, {"distance": magnitude}
+
+    contract = RewardContract(
+        observation_space_spec=None,
+        action_space_spec=None,
+        expected_info_keys=["relative"],
+        supports_batched=True,
+        state_schema={"actuator_force": (2,)},
+        info_schema={"relative": (3,)},
+    )
+
+    with pytest.raises(EditValidationError):
+        _call_compute_reward(_LegacyParent(), contract)
+    assert _current_reward_component_keys(_LegacyParent(), contract) == {
+        "distance",
+    }
 
 
 def test_build_dummy_inputs_gym_path_unchanged():
@@ -779,7 +901,10 @@ REWARD_SPEC = {
     "grounding": {"w_u": "arXiv:1707.02286 Mnih survey"},
 }
 def compute_reward(state, action, next_state, info):
-    return 1.0, {"w_u": 1.0}
+    # State-dependent so the dead-reward variance pre-screen doesn't
+    # fire first — this test targets the grounding-vs-references check.
+    v = float(state[0]) + 1.0
+    return v, {"w_u": v}
 """
 
     # Build a contract that won't trip other validator checks.
@@ -1081,3 +1206,514 @@ def compute_reward(state, action, next_state, info):
     )
     user_msg = client.messages.calls[0]["messages"][0]["content"]
     assert "# TRAINING_FEEDBACK" not in user_msg
+
+
+# ── §Convergence (RL_SCULPTOR_AUDIT loop 3): dead-reward pre-screen ──────
+
+
+def _variance_probe_contract():
+    from sculptor.adapters.base import RewardContract
+    return RewardContract(
+        observation_space_spec=None,
+        action_space_spec=None,
+        expected_info_keys=["fallen", "base_height"],
+        expected_components=None,
+        supports_batched=False,
+        training_device="cpu",
+    )
+
+
+def test_variance_probe_rejects_constant_reward():
+    """The v0-class degenerate (constant alive-bonus) must be rejected
+    before it can burn a GPU iteration training 'stand still'."""
+    from types import SimpleNamespace
+    from sculptor.edit import EditValidationError, _probe_reward_variance
+
+    mod = SimpleNamespace(
+        compute_reward=lambda s, a, ns, info: (1.0, {"alive_bonus": 1.0}))
+    with pytest.raises(EditValidationError, match="state-independent"):
+        _probe_reward_variance(mod, _variance_probe_contract())
+
+
+def test_variance_probe_passes_state_dependent_reward():
+    from types import SimpleNamespace
+    from sculptor.edit import _probe_reward_variance
+
+    def _r(s, a, ns, info):
+        v = float(s[0])
+        return v, {"height": v, "alive": 1.0}
+
+    _probe_reward_variance(
+        SimpleNamespace(compute_reward=_r), _variance_probe_contract())
+
+
+def test_variance_probe_passes_difference_only_reward():
+    """A reward built purely of next-state-minus-state terms is state-
+    sensitive even though every UNIFORM fill zeroes it — the asymmetric
+    probes must save it from a false reject."""
+    from types import SimpleNamespace
+    from sculptor.edit import _probe_reward_variance
+
+    def _r(s, a, ns, info):
+        v = float(ns[0]) - float(s[0])
+        return v, {"ascent": v}
+
+    _probe_reward_variance(
+        SimpleNamespace(compute_reward=_r), _variance_probe_contract())
+
+
+def test_variance_probe_passes_info_gated_reward():
+    from types import SimpleNamespace
+    from sculptor.edit import _probe_reward_variance
+
+    def _r(s, a, ns, info):
+        v = 2.0 * float(info["base_height"])
+        return v, {"launch": v}
+
+    _probe_reward_variance(
+        SimpleNamespace(compute_reward=_r), _variance_probe_contract())
+
+
+def test_variance_probe_tolerates_crashing_probes():
+    """A reward that crashes on every non-zero fill leaves <2 surviving
+    probes — insufficient evidence must PASS, never false-reject."""
+    from types import SimpleNamespace
+    from sculptor.edit import _probe_reward_variance
+
+    def _r(s, a, ns, info):
+        if float(s[0]) != 0.0 or float(ns[0]) != 0.0:
+            raise ValueError("guarded")
+        return 1.0, {"c": 1.0}
+
+    _probe_reward_variance(
+        SimpleNamespace(compute_reward=_r), _variance_probe_contract())
+
+
+def test_apply_edits_injects_case_memory_block(v0_path, kg, monkeypatch):
+    """§2026-07-03 case-memory upgrade: the rewrite prompt carries the same
+    CASE MEMORY block the diagnoser sees, so the rewriter doesn't re-make a
+    reward mistake a past run already measured as regressing."""
+    import hashlib
+
+    from sculptor.kg import cases as kg_cases
+    from sculptor.kg.query import cite
+    from sculptor.kg.schema import RunCase
+
+    parent_hash = hashlib.sha256(
+        v0_path.read_text(encoding="utf-8").encode("utf-8")).hexdigest()[:16]
+    source = _render_v1_source(parent_hash, cite("1801.00690", store=kg))
+    client = _StubClient(source)
+
+    past = kg_cases.CaseMatch(
+        case=RunCase(
+            id="case:past", task="run forward", symptom="component_imbalance",
+            verdict="regressed",
+            edits=["increase ctrl_cost_weight"],
+            edit_summary=("iter 3: [component_imbalance] → applied: increase "
+                          "ctrl_cost_weight → regressed (progress -0.0200)."),
+        ),
+        relevance_score=0.91,
+    )
+    captured_q: dict = {}
+
+    def fake_query_cases(text, top_k=3, *, store=None, min_similarity=0.0,
+                         model_name=None):
+        captured_q["text"] = text
+        return [past]
+
+    monkeypatch.setattr(kg_cases, "query_cases", fake_query_cases)
+
+    diagnosis = Diagnosis(
+        failure_modes=["component_imbalance"], evidence="",
+        proposed_edits=[ProposedEdit(
+            target_term="alive_bonus", operation="increase",
+            rationale="Raise alive bonus.", suggested_value="3.0",
+            paper_refs=["1801.00690"])],
+        confidence=0.9,
+        behavior_goal="run forward without falling",
+    )
+    apply_edits(
+        current_reward_path=v0_path, diagnosis=diagnosis,
+        new_iter_id="v1", reward_contract=_hopper_contract(),
+        kg_store=kg, client=client,
+    )
+    prompt = client.messages.calls[0]["messages"][0]["content"]
+    assert "# CASE MEMORY" in prompt
+    assert "increase ctrl_cost_weight" in prompt
+    assert "[-]" in prompt                       # regressed marker
+    # the query keyed on goal + failure modes.
+    assert "run forward" in captured_q["text"]
+    assert "component_imbalance" in captured_q["text"]
+
+
+def test_apply_edits_case_memory_failure_is_silent(v0_path, kg, monkeypatch):
+    """A broken case query must not block the edit (advisory only)."""
+    import hashlib
+
+    from sculptor.kg import cases as kg_cases
+    from sculptor.kg.query import cite
+
+    parent_hash = hashlib.sha256(
+        v0_path.read_text(encoding="utf-8").encode("utf-8")).hexdigest()[:16]
+    client = _StubClient(_render_v1_source(parent_hash, cite("1801.00690", store=kg)))
+    monkeypatch.setattr(
+        kg_cases, "query_cases",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("model missing")))
+
+    diagnosis = Diagnosis(
+        failure_modes=["component_imbalance"], evidence="",
+        proposed_edits=[ProposedEdit(
+            target_term="alive_bonus", operation="increase",
+            rationale="x", suggested_value="3.0",
+            paper_refs=["1801.00690"])],
+        confidence=0.9, behavior_goal="run",
+    )
+    out = apply_edits(
+        current_reward_path=v0_path, diagnosis=diagnosis,
+        new_iter_id="v1", reward_contract=_hopper_contract(),
+        kg_store=kg, client=client,
+    )
+    assert out.is_file()
+    assert "# CASE MEMORY" not in client.messages.calls[0]["messages"][0]["content"]
+
+
+# ── §best-of-K candidate edits ────────────────────────────────────────────
+_VK_BATCHED_SOURCE = '''\
+"""v1 — best-of-K candidate (forward_weight __W__), with batched path."""
+from __future__ import annotations
+import numpy as np
+
+REWARD_SPEC = {
+    "version": "v1",
+    "description": "candidate forward_weight=__W__",
+    "author": "sculptor",
+    "parent_hash": "__PARENT_HASH__",
+    "hyperparameters": {
+        "forward_weight": __W__,
+        "alive_bonus": 1.0,
+        "ctrl_cost_weight": 1e-3,
+    },
+    "references": [
+        {
+            "arxiv_id": "1801.00690",
+            "citation": "__CITATION__",
+            "how_used": "forward-weight tuning per DM Control guidance",
+        }
+    ],
+}
+
+
+def compute_reward(state, action, next_state, info):
+    fwd = float(info.get("x_velocity", 0.0))
+    components = {
+        "forward_velocity": REWARD_SPEC["hyperparameters"]["forward_weight"] * fwd,
+        "alive_bonus": REWARD_SPEC["hyperparameters"]["alive_bonus"],
+    }
+    return components["forward_velocity"] + components["alive_bonus"], components
+
+
+def compute_reward_batched(state, action, next_state, info):
+    import torch
+    fwd = torch.as_tensor(info["x_velocity"]).reshape(-1).float()
+    w = REWARD_SPEC["hyperparameters"]["forward_weight"]
+    components = {
+        "forward_velocity": w * fwd,
+        "alive_bonus": torch.ones_like(fwd),
+    }
+    return components["forward_velocity"] + components["alive_bonus"], components
+'''
+
+
+def _render_vk_source(parent_hash: str, citation: str, weight: float) -> str:
+    return (
+        _VK_BATCHED_SOURCE
+        .replace("__PARENT_HASH__", parent_hash)
+        .replace("__CITATION__", citation)
+        .replace("__W__", repr(weight))
+    )
+
+
+def _replay_batch(x_vel: float, n: int = 64):
+    """Minimal (state, action, next_state, info) replay tuple — only
+    info matters to the candidate sources above."""
+    import torch
+
+    state = torch.zeros((n, 11), dtype=torch.float32)
+    action = torch.zeros((n, 3), dtype=torch.float32)
+    next_state = torch.zeros((n, 11), dtype=torch.float32)
+    info = {"x_velocity": torch.full((n,), float(x_vel))}
+    return (state, action, next_state, info)
+
+
+def _bok_diagnosis() -> Diagnosis:
+    return Diagnosis(
+        failure_modes=["component_imbalance"], evidence="",
+        proposed_edits=[
+            ProposedEdit(
+                target_term="alive_bonus", operation="increase",
+                rationale="grounded", suggested_value="3.0",
+                paper_refs=["1801.00690"],
+            ),
+        ],
+        confidence=0.9,
+        behavior_goal="run forward without falling",
+    )
+
+
+def test_apply_edits_best_of_k_selects_by_hack_margin(v0_path, kg, tmp_path):
+    """K=2 with replay evidence: the candidate whose reward separates the
+    archived honest rollout from the archived exploit MORE (larger
+    forward_weight → larger honest−hack margin) must win, even though it
+    is NOT the first valid candidate."""
+    import hashlib
+
+    from sculptor.kg.query import cite
+
+    parent_hash = hashlib.sha256(
+        v0_path.read_text(encoding="utf-8").encode("utf-8")).hexdigest()[:16]
+    citation = cite("1801.00690", store=kg)
+    # Candidate 0 (default framing): weak separation (w=0.1 → margin 0.3).
+    # Candidate 1 (MINIMAL-DIFF framing): strong separation (w=1.0 → 3.0).
+    weak = _render_vk_source(parent_hash, citation, 0.1)
+    strong = _render_vk_source(parent_hash, citation, 1.0)
+    client = _StubClient(weak, strong)
+
+    iter_dir = tmp_path / "iter_bok"
+    iter_dir.mkdir()
+    out_path = apply_edits(
+        current_reward_path=v0_path, diagnosis=_bok_diagnosis(),
+        new_iter_id="v1", reward_contract=_hopper_contract(),
+        kg_store=kg, client=client,
+        iter_dir=iter_dir,
+        replay_inputs=_replay_batch(2.0),
+        hack_replays=[{"label": "iter 3 (sit-farm)",
+                       "replay_inputs": _replay_batch(-1.0)}],
+        n_candidates=2,
+    )
+    assert out_path.is_file()
+    assert len(client.messages.calls) == 2
+    # The second call's prompt carries the framing directive.
+    assert "MINIMAL-DIFF" in client.messages.calls[1]["messages"][0]["content"]
+
+    spec = importlib.util.spec_from_file_location("v1_bok", out_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert mod.REWARD_SPEC["hyperparameters"]["forward_weight"] == 1.0
+
+    report = json.loads(
+        (iter_dir / "edit_candidates.json").read_text(encoding="utf-8"))
+    assert report["selected"] == 1
+    assert len(report["candidates"]) == 2
+    margins = [c["hack_margin"] for c in report["candidates"]]
+    assert margins[1] > margins[0]
+    assert (iter_dir / "edit_candidates" / "cand0.py").is_file()
+    assert (iter_dir / "edit_candidates" / "cand1.py").is_file()
+
+
+def test_apply_edits_best_of_k_no_replays_keeps_first_valid(v0_path, kg, tmp_path):
+    """No replay evidence → margins are all None → the DEFAULT framing
+    (candidate 0) wins on the lowest-index tiebreak."""
+    import hashlib
+
+    from sculptor.kg.query import cite
+
+    parent_hash = hashlib.sha256(
+        v0_path.read_text(encoding="utf-8").encode("utf-8")).hexdigest()[:16]
+    citation = cite("1801.00690", store=kg)
+    first = _render_vk_source(parent_hash, citation, 0.5)
+    second = _render_vk_source(parent_hash, citation, 2.0)
+    client = _StubClient(first, second)
+
+    iter_dir = tmp_path / "iter_bok2"
+    iter_dir.mkdir()
+    out_path = apply_edits(
+        current_reward_path=v0_path, diagnosis=_bok_diagnosis(),
+        new_iter_id="v1", reward_contract=_hopper_contract(),
+        kg_store=kg, client=client, iter_dir=iter_dir,
+        n_candidates=2,
+    )
+    assert out_path.is_file()
+    spec = importlib.util.spec_from_file_location("v1_bok2", out_path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    assert mod.REWARD_SPEC["hyperparameters"]["forward_weight"] == 0.5
+    report = json.loads(
+        (iter_dir / "edit_candidates.json").read_text(encoding="utf-8"))
+    assert report["selected"] == 0
+
+
+def test_apply_edits_best_of_k_all_invalid_falls_back_to_retry(v0_path, kg):
+    """Every candidate fails validation → one repair retry (seeded with
+    the first candidate's error), same semantics as the K=1 attempt 2."""
+    import hashlib
+
+    from sculptor.kg.query import cite
+
+    parent_hash = hashlib.sha256(
+        v0_path.read_text(encoding="utf-8").encode("utf-8")).hexdigest()[:16]
+    citation = cite("1801.00690", store=kg)
+    broken = '"""broken — no REWARD_SPEC."""\ndef compute_reward(s, a, n, i):\n    return 0.0, {"a": 0.0}\n'
+    good = _render_v1_source(parent_hash, citation)
+    client = _StubClient(broken, broken, good)
+
+    out_path = apply_edits(
+        current_reward_path=v0_path, diagnosis=_bok_diagnosis(),
+        new_iter_id="v1", reward_contract=_hopper_contract(),
+        kg_store=kg, client=client,
+        n_candidates=2,
+    )
+    assert out_path.is_file()
+    assert len(client.messages.calls) == 3
+    retry_msg = client.messages.calls[2]["messages"][0]["content"]
+    assert "VALIDATION_ERRORS_ON_PREVIOUS_ATTEMPT" in retry_msg
+
+
+# ── §reference-grounded edit: REFERENCE MOTION SIGNATURE block ────────────
+def _write_reference_signature(stage_dir: Path, **overrides) -> None:
+    payload = {
+        "schema": 1,
+        "clip_id": "g1_jump_ref_01",
+        "robot": "g1",
+        "tier": "K",
+        "text": "Reference standing long jump.",
+        "signature": {
+            "duration_s": 1.8,
+            "fps": 30.0,
+            "n_frames": 54,
+            "root_z": {
+                "start": 0.1, "end": 0.72, "min": 0.1, "min_t": 0.0,
+                "max": 0.72, "max_t": 1.5,
+            },
+            "root_velocity_mps": {"min": -0.2, "max": 1.4},
+            "phases": [
+                {"phase": "rising", "t_start": 0.0, "t_end": 1.5,
+                 "z_start": 0.1, "z_end": 0.72},
+            ],
+        },
+    }
+    payload.update(overrides)
+    (stage_dir / "reference_signature.json").write_text(
+        json.dumps(payload), encoding="utf-8")
+
+
+def test_apply_edits_injects_reference_signature_when_stage_dir_has_file(
+    v0_path, kg,
+):
+    """`<stage_dir>/reference_signature.json` (stage_dir = v0_path's
+    grandparent, i.e. `rewards/`'s parent) present -> the edit_rewriter
+    prompt must carry a `# REFERENCE MOTION SIGNATURE` block with the
+    real clip numbers."""
+    stage_dir = v0_path.parents[1]
+    _write_reference_signature(stage_dir)
+
+    import hashlib
+
+    from sculptor.kg.query import cite
+
+    parent_hash = hashlib.sha256(
+        v0_path.read_text(encoding="utf-8").encode("utf-8")).hexdigest()[:16]
+    citation = cite("1801.00690", store=kg)
+    good = _render_v1_source(parent_hash, citation)
+    client = _StubClient(good)
+
+    apply_edits(
+        current_reward_path=v0_path, diagnosis=_bok_diagnosis(),
+        new_iter_id="v1", reward_contract=_hopper_contract(),
+        kg_store=kg, client=client,
+    )
+
+    user_msg = client.messages.calls[0]["messages"][0]["content"]
+    assert "# REFERENCE MOTION SIGNATURE" in user_msg
+    assert "g1_jump_ref_01" in user_msg
+    assert "0.72" in user_msg  # root_z.max flows through verbatim
+
+
+def test_apply_edits_omits_reference_signature_when_file_missing(v0_path, kg):
+    """No reference_signature.json (plain runs, no reference attached) —
+    the block must be absent, prompt shape unchanged from before."""
+    import hashlib
+
+    from sculptor.kg.query import cite
+
+    parent_hash = hashlib.sha256(
+        v0_path.read_text(encoding="utf-8").encode("utf-8")).hexdigest()[:16]
+    citation = cite("1801.00690", store=kg)
+    good = _render_v1_source(parent_hash, citation)
+    client = _StubClient(good)
+
+    apply_edits(
+        current_reward_path=v0_path, diagnosis=_bok_diagnosis(),
+        new_iter_id="v1", reward_contract=_hopper_contract(),
+        kg_store=kg, client=client,
+    )
+
+    user_msg = client.messages.calls[0]["messages"][0]["content"]
+    assert "# REFERENCE MOTION SIGNATURE" not in user_msg
+
+
+def test_apply_edits_omits_reference_signature_when_corrupt(v0_path, kg):
+    """A corrupt/wrong-schema reference_signature.json must silently
+    no-op — never crash apply_edits(), never inject a partial block."""
+    stage_dir = v0_path.parents[1]
+    (stage_dir / "reference_signature.json").write_text(
+        "{not valid json", encoding="utf-8")
+
+    import hashlib
+
+    from sculptor.kg.query import cite
+
+    parent_hash = hashlib.sha256(
+        v0_path.read_text(encoding="utf-8").encode("utf-8")).hexdigest()[:16]
+    citation = cite("1801.00690", store=kg)
+    good = _render_v1_source(parent_hash, citation)
+    client = _StubClient(good)
+
+    out_path = apply_edits(
+        current_reward_path=v0_path, diagnosis=_bok_diagnosis(),
+        new_iter_id="v1", reward_contract=_hopper_contract(),
+        kg_store=kg, client=client,
+    )
+    assert out_path.is_file()
+
+    user_msg = client.messages.calls[0]["messages"][0]["content"]
+    assert "# REFERENCE MOTION SIGNATURE" not in user_msg
+
+
+def test_apply_prompt_edit_injects_reference_signature_when_stage_dir_has_file(
+    tmp_path, kg,
+):
+    """`apply_prompt_edit` (the Rewards-tab one-shot-prompt / v1-seed path)
+    routes through `apply_edits`, so it must inherit the same reference
+    grounding — verified end-to-end (not stubbing `apply_edits`) so this
+    catches a regression in either function."""
+    from sculptor.edit import apply_prompt_edit
+
+    rewards = tmp_path / "rewards"
+    rewards.mkdir()
+    v0 = rewards / "v0.py"
+    v0.write_text(V0_REWARD_SOURCE, encoding="utf-8")
+    (rewards / "__init__.py").write_text("", encoding="utf-8")
+    _write_reference_signature(tmp_path)
+
+    client = _StubClient(
+        "REWARD_SPEC = {}\n"
+        "def compute_reward(s, a, n, i): return 1.0, {'alive': 1.0}\n"
+    )
+
+    try:
+        apply_prompt_edit(
+            current_reward_path=v0,
+            user_prompt="add an action-rate penalty to smooth gait",
+            new_iter_id="v1",
+            reward_contract=_hopper_contract(),
+            kg_store=kg,
+            client=client,
+        )
+    except Exception:  # noqa: BLE001 — the stub response fails post-flight
+        # validation; irrelevant here, we only care what was SENT.
+        pass
+
+    assert client.messages.calls, "edit_rewriter was never called"
+    user_msg = client.messages.calls[0]["messages"][0]["content"]
+    assert "# REFERENCE MOTION SIGNATURE" in user_msg
+    assert "g1_jump_ref_01" in user_msg

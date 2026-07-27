@@ -27,6 +27,7 @@ from typing import Any, Optional
 from backend.models.reward import (
     ComponentProbe,
     ManualEditRequest,
+    RewardComposition,
     RewardRef,
     RewardSpec,
     RewardVersionDetail,
@@ -140,6 +141,93 @@ def _compute_reward_signature_ok(source: str) -> Optional[str]:
     return "no module-level compute_reward function found"
 
 
+_TRACKING_IMMUTABLE_FUNCTIONS = {
+    "_scalar", "_phase_index_scalar", "_reference_tracking_numpy",
+    "_phase_index_batched", "_reference_tracking_batched",
+    "compute_reward", "compute_reward_batched",
+}
+_TRACKING_IMMUTABLE_GLOBALS = {
+    "_W_JOINT_POS", "_W_JOINT_VEL", "_W_ROOT", "_W_ORIENTATION",
+    "_TRACKING_WEIGHT", "_RESIDUAL_MAX", "_ALIVE_BONUS",
+}
+
+
+def _tracking_immutable_hash(source: str) -> Optional[str]:
+    """Hash tracking targets and composition without executing reward code."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+    functions = {
+        node.name: node for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    if not _TRACKING_IMMUTABLE_FUNCTIONS.issubset(functions):
+        return None
+    assignments: dict[str, ast.AST] = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    assignments[target.id] = node
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            assignments[node.target.id] = node
+    names = sorted(
+        name for name in assignments
+        if name.startswith("REFERENCE_") or name in _TRACKING_IMMUTABLE_GLOBALS
+    )
+    if (not any(name.startswith("REFERENCE_") for name in names)
+            or not _TRACKING_IMMUTABLE_GLOBALS.issubset(names)):
+        return None
+    nodes = [functions[name] for name in sorted(_TRACKING_IMMUTABLE_FUNCTIONS)]
+    nodes.extend(assignments[name] for name in names)
+    payload = "\n".join(
+        ast.dump(node, annotate_fields=True, include_attributes=False)
+        for node in nodes
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _validate_manual_tracking_edit(
+    current_source: str,
+    current_spec: dict[str, Any],
+    new_source: str,
+    new_spec: dict[str, Any],
+) -> list[str]:
+    """Return violations when a manual edit weakens a tracking-first base."""
+    parent = current_spec.get("composition")
+    if not isinstance(parent, dict) or parent.get("type") != "reference_tracking_residual":
+        return []
+    child = new_spec.get("composition")
+    if not isinstance(child, dict) or child.get("type") != "reference_tracking_residual":
+        return ["tracking-first composition cannot be removed by a manual edit"]
+    violations: list[str] = []
+    for key in ("reference_clip_id", "reference_target_sha256"):
+        if child.get(key) != parent.get(key):
+            violations.append(f"tracking-first {key} must match the parent exactly")
+    try:
+        parent_weight = float(parent["tracking_weight"])
+        child_weight = float(child["tracking_weight"])
+        residual_max = float(child["residual_max"])
+        if abs(parent_weight - child_weight) > 1e-9:
+            violations.append("tracking-first tracking_weight must match the parent")
+        if residual_max < 0.0 or residual_max > 0.35 * child_weight:
+            violations.append(
+                "tracking-first residual_max must be between zero and 35% of "
+                "tracking_weight"
+            )
+    except (KeyError, TypeError, ValueError):
+        violations.append("tracking-first composition numeric fields are invalid")
+    parent_hash = _tracking_immutable_hash(current_source)
+    child_hash = _tracking_immutable_hash(new_source)
+    if parent_hash is None or child_hash != parent_hash:
+        violations.append(
+            "reference targets, tracking kernels, and composition wrappers are "
+            "immutable; edit only the residual task hooks"
+        )
+    return violations
+
+
 def _spec_from_dict(raw: dict[str, Any]) -> RewardSpec:
     refs_raw = raw.get("references") or []
     refs: list[RewardRef] = []
@@ -169,6 +257,13 @@ def _spec_from_dict(raw: dict[str, Any]) -> RewardSpec:
             s = str(v).strip()
             if s:
                 grounding[str(k)] = s
+    composition_raw = raw.get("composition")
+    composition = None
+    if isinstance(composition_raw, dict) and composition_raw.get("type"):
+        try:
+            composition = RewardComposition.model_validate(composition_raw)
+        except Exception:  # noqa: BLE001 - malformed optional metadata is omitted
+            composition = None
     return RewardSpec(
         version=str(raw.get("version") or ""),
         parent_hash=str(raw.get("parent_hash") or ""),
@@ -177,6 +272,7 @@ def _spec_from_dict(raw: dict[str, Any]) -> RewardSpec:
         hyperparameters=hparams,
         references=refs,
         grounding=grounding,
+        composition=composition,
     )
 
 
@@ -508,6 +604,19 @@ def apply_manual_edit(
                         f"Ingest {aid} via POST /kg/seeds before citing it."
                     )
 
+        current_source = current_path.read_text(encoding="utf-8")
+        current_spec, current_spec_err = _extract_reward_spec(current_source)
+        if current_spec_err is None:
+            tracking_violations = _validate_manual_tracking_edit(
+                current_source, current_spec, body.source, spec_dict,
+            )
+            violations.extend(tracking_violations)
+            if tracking_violations:
+                suggestions.append(
+                    "Keep the reference base unchanged and implement task credit "
+                    "only in _residual_task_numpy/_residual_task_batched."
+                )
+
     if violations:
         raise RewardValidationError(violations, suggestions)
 
@@ -552,6 +661,8 @@ def _write_current_reexport(rewards_dir: Path, target: Path) -> None:
         "assert _spec.loader is not None\n"
         "_spec.loader.exec_module(_mod)\n\n"
         "compute_reward = _mod.compute_reward\n"
+        "if hasattr(_mod, 'compute_reward_batched'):\n"
+        "    compute_reward_batched = _mod.compute_reward_batched\n"
         "REWARD_SPEC = _mod.REWARD_SPEC\n"
     )
     (rewards_dir / "current.py").write_text(content, encoding="utf-8")

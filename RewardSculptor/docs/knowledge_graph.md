@@ -24,14 +24,16 @@ longer triggers a fresh Claude extract — the new project sees the
 existing 46 seed papers (plus any you added via "Research a topic") from
 day one.
 
-**Overrides** (highest precedence first):
+**Overrides** (highest precedence first, identical in the UI and core):
 
-- `$RS_KG_PATH` — UI-facing override. Used by the backend test suite to
+- `$RS_KG_PATH` — application/UI-facing override. Used by the backend test suite to
   redirect to a per-test tmp DB.
-- `$SCULPTOR_KG_PATH` — legacy alias. Either env var wins.
-- Legacy per-project DB at `<project>/kg/graph.db` — if one already
-  exists on disk (e.g. from a pre-Phase-1 project), the backend uses it
-  in place. No silent migration.
+- `$SCULPTOR_KG_PATH` — legacy sculptor-side alias.
+- Legacy per-project / per-directory DBs (`<cwd>/kg/graph.db`,
+  `<project>/kg/graph.db`) are **no longer honored anywhere**
+  (sculptor side removed 2026-07-03 loop 5a; UI backend aligned
+  2026-07-18 Phase-0 hardening). A leftover legacy file only triggers a
+  warning pointing at `sculpt kg merge <path>` — one graph, one path.
 
 **First-start bootstrap**: when the backend boots and finds no shared
 DB, it copies the bundled pre-extracted sqlite from
@@ -87,7 +89,7 @@ Ingest into any existing project:
 cd ~/.local/share/reward-sculptor/projects/<slug>
 
 # Call sculpt's CLI against the global seeds file:
-uv run --project ~/projects/RewardSculptor sculpt kg ingest \
+uv run --project ~/projects/RewardSculptor python -m sculptor.kg.ingest \
     ~/projects/RewardSculptor/examples/kg_seeds_global.yml
 
 # Then extract entities (Techniques / FailureModes / RewardComponents
@@ -95,7 +97,8 @@ uv run --project ~/projects/RewardSculptor sculpt kg ingest \
 uv run --project ~/projects/RewardSculptor sculpt kg extract --all
 ```
 
-Expected: ~50 papers ingested (PDFs cached at `kg/pdfs/`), ~100+
+Expected: ~50 papers ingested (PDFs cached beside the shared DB at
+`~/.local/share/sculptor/kg/pdfs/`), ~100+
 Techniques / FailureModes / RewardComponents extracted. First ingest
 is slow (~2-5 minutes on cold arxiv cache); subsequent runs are
 idempotent.
@@ -129,9 +132,50 @@ Go to any project's **KG tab** → `Add seeds`. Paste an arxiv ID
 (`2401.16337`) or a full URL (`https://arxiv.org/abs/2401.16337`).
 Check `auto extract` to trigger extraction immediately after ingest.
 
-## Proposed follow-up: prompt-time research
+## Integrity: `sculpt kg doctor`
 
-**Not yet implemented** — this is the next KG milestone. The intent:
+The shared graph accretes from many writers (seed ingest, extraction,
+run-case memory, UI research jobs, legacy merges). `sculpt kg doctor`
+reports every silent-degradation class in one pass — dangling edges,
+orphan embeddings, stub-titled papers, dead `full_text_path` sidecars,
+missing/stale embeddings (embeddings carry a `text_hash` of the exact
+embedded text since 2026-07-18, so a description enriched by a later
+extraction re-embeds instead of serving stale geometry) — and
+`--fix` repairs the mechanical ones (`--reembed-all` for a full
+embedding rebuild, `--no-network` to skip the two arxiv-touching heals).
+Paper applicability metadata is also embedded. Read-only without `--fix`;
+after `--fix` it performs a second audit and exits 1 if any issue remains.
+
+## Structured research campaigns and hybrid extraction
+
+Campaign seed entries may include `tier`, `tags`, `rationale`, and
+`source_url`. Ingestion persists them on the Paper node instead of using the
+rationale only for console output. `query_papers(...)` combines semantic
+similarity with tier/tag filters, so metadata-only A/B papers remain useful
+before entity extraction.
+
+For a hybrid campaign, select the exact high-priority tier rather than using
+an ID-sorted `--limit` or extracting the entire graph:
+
+```bash
+uv run sculpt kg extract \
+  --seeds kg_seeds_env_authoring_2026-07.yml \
+  --tier S
+```
+
+`--tag` can further restrict a campaign. Extraction edges retain a support
+list when multiple papers corroborate the same technique/failure claim, and
+retrieval renders evidence beside a citation from that same source.
+
+## Prompt-time research — implemented
+
+Implemented as `sculptor/kg/research.py` (`research_topic`) + the UI
+backend's `POST /projects/{slug}/kg/research` job: Claude proposes
+arxiv IDs for a topic, IDs are normalized + deduped against the KG,
+each surviving ID's REAL title/abstract is fetched from arxiv and
+embedding-checked against the topic (hallucinated-ID guard,
+threshold 0.15), then ingest + extract run. The original design sketch
+below is kept for history:
 
 1. When the user types a behavior goal ("jump 30 cm vertically with a
    pogo-stick SEA"), sculptor's diagnoser queries the KG for relevant

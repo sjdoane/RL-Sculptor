@@ -58,6 +58,57 @@ mismatches. If you want to note a citation in grounding, mirror it in
 references; if you prefer pure physics justification, leave arxiv_ids
 out of the grounding string entirely.
 
+## REFERENCE-GROUNDING (when a `# REFERENCE MOTION SIGNATURE` block is present)
+
+The block is the measured kinematic profile of a COMPETENT demonstration
+of this task — real numbers (root-height extrema + WHEN they occur, phase
+segmentation, velocity ranges, contact schedule), not a guess. When it is
+present:
+  - Numeric reward-spec fields that describe a target height, phase
+    timing, velocity scale, or gate threshold MUST be grounded in these
+    reference numbers where the reference exposes the corresponding
+    quantity (e.g. a standing-height target near `reference.root_z.max`,
+    a liftoff/landing gate timed near the matching `phases[i]` entry, a
+    velocity scale near `reference.root_velocity_mps`) rather than an
+    invented round number.
+  - `REWARD_SPEC["grounding"]` for such a field should reference the
+    specific reference figure (e.g. `"reference root_z.max=0.72 @ t=1.5s"`)
+    alongside — or instead of — an arxiv citation; this satisfies
+    requirement 3's grounding rule just as a physics-first-principles
+    justification would.
+  - When the reference doesn't cover a given quantity (e.g. it has no
+    orientation data), fall back to citations / physics first-principles
+    as usual for that field.
+When no such block is present, ground reward-spec numbers exactly as
+before (citations / physics first-principles) — this section is a no-op.
+
+## TRACKING-FIRST COMPOSITION (hard contract when the parent declares it)
+
+If `CURRENT_REWARD_SOURCE.REWARD_SPEC["composition"]["type"]` is
+`"reference_tracking_residual"`, the attached reference is the immutable
+structural reward base. You are NOT authoring the motion from scratch.
+
+  - Preserve every `REFERENCE_*` target array, all `_W_*` / composition
+    constants, phase clock, tracking helpers, `compute_reward`, and
+    `compute_reward_batched` exactly. Preserve the composition's
+    `reference_clip_id`, `reference_target_sha256`, and `tracking_weight`.
+  - Preserve all `tracking_*` component outputs and `reference_tracking`.
+    Never replace them with a guessed posture/velocity proxy or reduce their
+    weight to make a residual dominate.
+  - Author ONLY the bodies of `_residual_task_numpy` and
+    `_residual_task_batched`: goal direction, environment interaction,
+    completion/guard, or safety gating not already encoded by the motion.
+    Return raw credit in both paths; the immutable wrappers clamp it into
+    `[0, residual_max]`. Express failure by withholding residual credit or
+    zero-gating it, not by adding an unbounded penalty. Keep the two hook
+    implementations semantically equivalent.
+  - The final non-fallen reward is
+    `tracking_weight * reference_tracking + residual_task + small_alive_bonus`.
+    The residual maximum must stay <= 35% of `tracking_weight`.
+  - Record the composition unchanged in the child `REWARD_SPEC`. The validator
+    mechanically rejects a changed target hash, dropped tracking component,
+    weakened tracking weight, or oversized residual.
+
 ## REQUIREMENTS (all mandatory)
 
 1. Return the COMPLETE new Python module source. No markdown fences, no
@@ -123,5 +174,38 @@ out of the grounding string entirely.
    flat zero during training is the INTENDED behavior").
 
 9. No side effects on import. No print/logging at module scope.
+
+10. **Net-positive-living rule** (machine-checked). The loop replays
+   your module over the archived rollout of the CURRENT policy; if the
+   mean per-step TOTAL over non-fallen frames is meaningfully negative,
+   your module is rejected. Physics of the failure: when episodes can
+   terminate (fall detection), a sustained negative living reward makes
+   immediate self-termination the optimal policy — the agent learns to
+   fall on purpose to stop the pain (observed twice: penalty-heavy
+   edits collapsed to 16-18-step instant-fall episodes). Therefore:
+     - size every penalty so that `alive/base bonus + earned shaping ≥
+       total penalties` in EVERY commonly-visited, recoverable pose
+       (standing, crouch, kneel, mid-air), not just the ideal pose;
+     - to kill an exploit, make it earn LESS than the intended behavior
+       (relative disadvantage), not absolutely negative — cap or zero
+       the exploited term under the exploit condition instead of
+       stacking a new negative term on top.
+
+11. **Progress-preservation rule** (hard skills). When the DIAGNOSIS /
+   OBJECTIVE_PROGRESS shows the current policy makes REAL partial
+   progress (dense progress channels or physical behavior deltas moved
+   — e.g. genuine liftoff, knee flexion, reduced drift), your edit must
+   be MINIMAL and phase-directed:
+     - keep the terms AND magnitudes that pay for the achieved partial
+       behavior — do not zero, re-gate, or re-threshold them;
+     - NEVER gate credit at a level the policy has not yet reached
+       (e.g. requiring base_height above standing before ANY tuck credit
+       when the current apex is 5 cm) — ramp credit smoothly FROM the
+       currently-achieved value TOWARD the target instead;
+     - add credit for the MISSING phase named by the weakest fitness
+       sub-channel (e.g. landing / return-to-stance) rather than
+       re-shaping the phases that already work;
+     - prefer ONE new term + at most small (<20 %) weight adjustments
+       over broad rewrites.
 
 Return the new source now.

@@ -14,14 +14,29 @@ a unique constraint.
 
 Path discovery
 --------------
-Default DB path: `<cwd>/kg/graph.db`. Override per call via the constructor,
-or globally via the `SCULPTOR_KG_PATH` environment variable. The parent
-directory is created on first use.
+Default DB path: the user-wide shared graph at
+`~/.local/share/sculptor/kg/graph.db` (see `default_db_path`). Override per
+call via the constructor, or globally via `SCULPTOR_KG_PATH` / `RS_KG_PATH`.
+The parent directory is created on first use.
+
+Embedding freshness (§Phase-0 hardening 2026-07-18)
+---------------------------------------------------
+`node_embeddings` carries a `text_hash` of the EXACT text that was embedded.
+Callers that maintain lazy embedding pools (kg/query.py, kg/cases.py) pass
+the canonical text into `set_embedding` and use `embedding_status` to detect
+when a node's text changed after its vector was cached (extraction merges
+enrich descriptions; case verdicts are re-attributed on resume) — a stale
+vector is re-embedded instead of silently serving the old text's geometry.
+Legacy rows (hash NULL) are trusted once and backfilled via
+`backfill_embedding_hash`; `sculpt kg doctor --reembed-all` forces a full
+refresh when that one-time trust is not wanted.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import os
 import sqlite3
 import time
@@ -42,6 +57,8 @@ from sculptor.kg.schema import (
     row_to_node,
 )
 
+
+log = logging.getLogger(__name__)
 
 DEFAULT_RELATIVE_DB_PATH = Path("kg") / "graph.db"
 ENV_VAR = "SCULPTOR_KG_PATH"
@@ -64,20 +81,36 @@ def default_db_path() -> Path:
     """Resolve the default KG path.
 
     Resolution order:
-      1. `$SCULPTOR_KG_PATH` if set (legacy override).
-      2. `$RS_KG_PATH` if set (backend alias used by the UI test harness).
-      3. A legacy `<cwd>/kg/graph.db` if one already exists on disk
-         (back-compat for users who ran pre-M7 `sculpt run` from inside
-         a project dir, which seeded a per-project DB).
-      4. The user-wide shared path: `~/.local/share/sculptor/kg/graph.db`.
+      1. `$RS_KG_PATH` if set (application-wide/backend override).
+      2. `$SCULPTOR_KG_PATH` if set (legacy sculptor-side alias).
+      3. The user-wide shared path: `~/.local/share/sculptor/kg/graph.db`.
+
+    A cwd-relative `<cwd>/kg/graph.db` is NO LONGER honored (removed
+    2026-07-03). The back-compat preference silently FRAGMENTED the
+    graph by launch directory: the 2026-07 tuck-jump E2E ran its
+    diagnoses against a 6-technique repo-local stub while the shared
+    graph held 493 techniques + the whole run-case memory — the
+    diagnoser was starved of 98 % of the KG and its cases were recorded
+    into a silo no other entry point would ever read. One graph, one
+    path; tests/CI isolate via the env vars.
     """
-    env = os.environ.get(ENV_VAR) or os.environ.get(BACKEND_ENV_VAR)
+    # Keep this order identical to reward-sculptor-ui's resolver. If both
+    # aliases are present, disagreeing precedence would make in-process UI
+    # reads and default SculptorKG() writers open different databases.
+    env = os.environ.get(BACKEND_ENV_VAR) or os.environ.get(ENV_VAR)
     if env:
         return Path(env).expanduser().resolve()
     legacy = (Path.cwd() / DEFAULT_RELATIVE_DB_PATH).resolve()
-    if legacy.is_file():
-        return legacy
-    return shared_db_path()
+    shared = shared_db_path()
+    if legacy.is_file() and legacy != shared:
+        import sys
+        print(
+            f"[kg] ignoring legacy per-directory DB at {legacy} — using the "
+            f"shared graph at {shared}. Merge it with "
+            f"`sculpt kg merge {legacy}` (or delete it) to silence this.",
+            file=sys.stderr, flush=True,
+        )
+    return shared
 
 
 _SCHEMA_SQL = """
@@ -105,10 +138,170 @@ CREATE TABLE IF NOT EXISTS node_embeddings (
     dim        INTEGER NOT NULL,
     vector     BLOB NOT NULL,
     updated_at REAL NOT NULL,
+    text_hash  TEXT,
     PRIMARY KEY (node_id, model)
 );
 CREATE INDEX IF NOT EXISTS idx_embeddings_model ON node_embeddings(model);
 """
+
+
+def embedding_text_hash(text: str) -> str:
+    """Canonical hash of the exact text a vector was computed from."""
+    return hashlib.sha256(text.encode("utf-8", errors="replace")).hexdigest()[:16]
+
+
+def _merge_corroborating_edge_data(
+    destination_raw: str, source_raw: str,
+) -> str | None:
+    """Union paper-level claim supports without overwriting destination data.
+
+    Edge JSON has an outer serialization envelope (``data`` +
+    ``created_at``). Only claim provenance inside the nested data mapping is
+    merged. Non-claim collisions remain destination-wins.
+    """
+    try:
+        destination = json.loads(destination_raw)
+        source = json.loads(source_raw)
+    except (TypeError, ValueError):
+        return None
+    dst_data = destination.get("data")
+    src_data = source.get("data")
+    if not isinstance(dst_data, dict) or not isinstance(src_data, dict):
+        return None
+
+    def supports(data: dict[str, Any]) -> dict[str, str]:
+        out: dict[str, str] = {}
+        for item in data.get("supports", []) or []:
+            if not isinstance(item, dict):
+                continue
+            paper_id = str(item.get("source_paper_id") or "")
+            if paper_id:
+                out[paper_id] = str(item.get("evidence") or "")
+        paper_id = str(data.get("source_paper_id") or "")
+        if paper_id:
+            out.setdefault(paper_id, str(data.get("evidence") or ""))
+        return out
+
+    dst_supports = supports(dst_data)
+    src_supports = supports(src_data)
+    if not dst_supports and not src_supports:
+        return None
+    combined = dict(dst_supports)
+    for paper_id, evidence in src_supports.items():
+        if paper_id not in combined or (not combined[paper_id] and evidence):
+            combined[paper_id] = evidence
+    merged_data = dict(dst_data)
+    merged_data["supports"] = [
+        {"source_paper_id": paper_id, "evidence": evidence}
+        for paper_id, evidence in sorted(combined.items())
+    ]
+    if not merged_data.get("source_paper_id") and src_data.get("source_paper_id"):
+        merged_data["source_paper_id"] = src_data["source_paper_id"]
+        merged_data["evidence"] = src_data.get("evidence", "")
+    if merged_data == dst_data:
+        return None
+    destination["data"] = merged_data
+    return json.dumps(destination, default=str)
+
+
+def merge_stores(src_path: Path | str, dst: "SculptorKG") -> dict[str, int]:
+    """Merge a stray/legacy KG database INTO `dst` (the shared graph).
+
+    Additive-only, never destructive to `dst`:
+      * nodes copied ONLY when the id is absent in dst — a legacy stub
+        (e.g. a diagnoser-flagged FailureMode with a placeholder
+        description) must never clobber the shared graph's richer
+        paper-derived node of the same id;
+      * edges: new claims are inserted and corroborating paper supports are
+        unioned on composite-key collisions;
+      * embeddings copied only when (node_id, model) is absent and the source
+        row carries a text hash. Unhashed legacy vectors are never portable:
+        their source text is unknowable, so lazy embedding must rebuild them.
+
+    The source file is left untouched — the caller decides whether to
+    rename/delete it. Returns counts: {nodes, edges, embeddings,
+    nodes_skipped}."""
+    src_path = Path(src_path).expanduser().resolve()
+    if not src_path.is_file():
+        raise FileNotFoundError(src_path)
+    if src_path == dst.db_path:
+        raise ValueError("source and destination are the same database")
+    src = sqlite3.connect(str(src_path))
+    src.row_factory = sqlite3.Row
+    counts = {"nodes": 0, "edges": 0, "embeddings": 0, "nodes_skipped": 0}
+    # An embedding can be copied safely only when the destination node is
+    # byte-identical to the source node (including a newly copied node).
+    # Copying a legacy vector onto a richer same-id destination node and then
+    # trust-once stamping its NULL hash permanently mislabeled stale geometry
+    # as fresh in the live graph.
+    embedding_eligible_ids: set[str] = set()
+    try:
+        src_embedding_cols = {
+            row["name"]
+            for row in src.execute("PRAGMA table_info(node_embeddings)")
+        }
+        has_text_hash = "text_hash" in src_embedding_cols
+        with dst._tx() as cx:
+            for row in src.execute("SELECT id, kind, data FROM nodes"):
+                existing = cx.execute(
+                    "SELECT kind, data FROM nodes WHERE id = ?", (row["id"],)
+                ).fetchone()
+                cur = cx.execute(
+                    "INSERT OR IGNORE INTO nodes (id, kind, data) "
+                    "VALUES (?, ?, ?)",
+                    (row["id"], row["kind"], row["data"]))
+                if cur.rowcount:
+                    counts["nodes"] += 1
+                    embedding_eligible_ids.add(row["id"])
+                else:
+                    counts["nodes_skipped"] += 1
+                    if (existing is not None
+                            and existing["kind"] == row["kind"]
+                            and existing["data"] == row["data"]):
+                        embedding_eligible_ids.add(row["id"])
+            for row in src.execute(
+                    "SELECT src, dst, relation, data FROM edges"):
+                existing_edge = cx.execute(
+                    "SELECT data FROM edges "
+                    "WHERE src = ? AND dst = ? AND relation = ?",
+                    (row["src"], row["dst"], row["relation"]),
+                ).fetchone()
+                if existing_edge is None:
+                    cx.execute(
+                        "INSERT INTO edges (src, dst, relation, data) "
+                        "VALUES (?, ?, ?, ?)",
+                        (row["src"], row["dst"], row["relation"], row["data"]))
+                    counts["edges"] += 1
+                else:
+                    merged = _merge_corroborating_edge_data(
+                        existing_edge["data"], row["data"])
+                    if merged is not None:
+                        cx.execute(
+                            "UPDATE edges SET data = ? "
+                            "WHERE src = ? AND dst = ? AND relation = ?",
+                            (merged, row["src"], row["dst"], row["relation"]))
+                        counts["edges"] += 1
+            if src_embedding_cols:  # very old stores may predate this table
+                emb_sql = (
+                    "SELECT node_id, model, dim, vector, updated_at, text_hash "
+                    "FROM node_embeddings" if has_text_hash else
+                    "SELECT node_id, model, dim, vector, updated_at, "
+                    "NULL AS text_hash FROM node_embeddings"
+                )
+                for row in src.execute(emb_sql):
+                    if (row["node_id"] not in embedding_eligible_ids
+                            or not row["text_hash"]):
+                        continue
+                    cur = cx.execute(
+                        "INSERT OR IGNORE INTO node_embeddings "
+                        "(node_id, model, dim, vector, updated_at, text_hash) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (row["node_id"], row["model"], row["dim"],
+                         row["vector"], row["updated_at"], row["text_hash"]))
+                    counts["embeddings"] += int(cur.rowcount or 0)
+    finally:
+        src.close()
+    return counts
 
 
 class SculptorKG:
@@ -121,7 +314,21 @@ class SculptorKG:
         self._conn = sqlite3.connect(str(self.db_path))
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA_SQL)
+        self._migrate()
         self._conn.commit()
+
+    def _migrate(self) -> None:
+        """In-place additive migrations for DBs created before a column
+        existed. CREATE TABLE IF NOT EXISTS never alters an existing
+        table, so new columns must be added here. Additive-only — never
+        drops or rewrites data."""
+        cols = {
+            row["name"]
+            for row in self._conn.execute("PRAGMA table_info(node_embeddings)")
+        }
+        if "text_hash" not in cols:
+            self._conn.execute(
+                "ALTER TABLE node_embeddings ADD COLUMN text_hash TEXT")
 
     # ── lifecycle ───────────────────────────────────────────────────────────
     def close(self) -> None:
@@ -245,7 +452,9 @@ class SculptorKG:
 
         out: list[tuple[Edge, str]] = []
         for row in self._conn.execute(sql, args).fetchall():
-            edge = row_to_edge(row["src"], row["dst"], row["relation"], json.loads(row["data"]))
+            edge = self._row_to_edge_tolerant(row)
+            if edge is None:
+                continue
             other = edge.dst if edge.src == node_id else edge.src
             out.append((edge, other))
         return out
@@ -255,9 +464,34 @@ class SculptorKG:
         rows = self._conn.execute(
             "SELECT src, dst, relation, data FROM edges").fetchall()
         for row in rows:
-            yield row_to_edge(
+            edge = self._row_to_edge_tolerant(row)
+            if edge is not None:
+                yield edge
+
+    def _row_to_edge_tolerant(self, row: sqlite3.Row) -> Edge | None:
+        """Deserialize one edge row; skip (with a once-per-relation warning)
+        rows whose relation string is unknown to this code version instead
+        of letting ONE such row abort a whole neighbors()/all_edges() scan.
+        A newer schema writing a new Relation must not brick older readers'
+        retrieval — the unknown edges are simply invisible to them."""
+        try:
+            return row_to_edge(
                 row["src"], row["dst"], row["relation"],
                 json.loads(row["data"]))
+        except Exception:
+            rel = str(row["relation"])
+            warned = getattr(self, "_warned_relations_seen", None)
+            if warned is None:
+                warned = set()
+                self._warned_relations_seen = warned
+            if rel not in warned:
+                warned.add(rel)
+                log.warning(
+                    "kg.store: skipping edge(s) with unknown/undecodable "
+                    "relation %r (src=%r) — written by a newer schema or "
+                    "corrupt; run `sculpt kg doctor` to enumerate",
+                    rel, str(row["src"]))
+            return None
 
     # ── counts / stats ──────────────────────────────────────────────────────
     def count_nodes(self, kind: str | None = None) -> int:
@@ -278,17 +512,64 @@ class SculptorKG:
         return int(r[0])
 
     # ── embeddings ──────────────────────────────────────────────────────────
-    def set_embedding(self, node_id: str, model: str, vector: "np.ndarray") -> None:
-        """Store (or replace) a node's embedding for a given model."""
+    def set_embedding(
+        self,
+        node_id: str,
+        model: str,
+        vector: "np.ndarray",
+        *,
+        text: str | None = None,
+    ) -> None:
+        """Store (or replace) a node's embedding for a given model.
+
+        `text`: the EXACT text the vector was computed from. When given,
+        its hash is stored alongside so `embedding_status` can detect
+        staleness after the node's text changes. Omitting it (legacy
+        callers, tests seeding synthetic vectors) stores a NULL hash —
+        treated as trusted-once by `embedding_status`."""
         import numpy as np
 
         v = np.asarray(vector, dtype=np.float32).ravel()
         blob = v.tobytes()
+        th = embedding_text_hash(text) if text is not None else None
         with self._tx() as cx:
             cx.execute(
                 "INSERT OR REPLACE INTO node_embeddings "
-                "(node_id, model, dim, vector, updated_at) VALUES (?, ?, ?, ?, ?)",
-                (node_id, model, int(v.shape[0]), blob, time.time()),
+                "(node_id, model, dim, vector, updated_at, text_hash) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (node_id, model, int(v.shape[0]), blob, time.time(), th),
+            )
+
+    def embedding_status(self, node_id: str, model: str, text: str) -> str:
+        """Freshness of a cached embedding vs `text` (the node's CURRENT
+        canonical embed-text). One of:
+          * "missing"  — no cached vector;
+          * "fresh"    — cached hash matches `text`'s hash;
+          * "stale"    — cached hash present and DIFFERENT (text changed);
+          * "unhashed" — cached vector from before hash tracking (or
+            seeded without text). Callers should `backfill_embedding_hash`
+            (trust-once) or re-embed, per their policy."""
+        row = self._conn.execute(
+            "SELECT text_hash FROM node_embeddings "
+            "WHERE node_id = ? AND model = ?",
+            (node_id, model),
+        ).fetchone()
+        if row is None:
+            return "missing"
+        if row["text_hash"] is None:
+            return "unhashed"
+        return "fresh" if row["text_hash"] == embedding_text_hash(text) else "stale"
+
+    def backfill_embedding_hash(self, node_id: str, model: str, text: str) -> None:
+        """Stamp `text`'s hash onto an existing embedding row WITHOUT
+        re-embedding — the trust-once migration for pre-hash rows (we
+        cannot know what text produced the old vector; from this point on
+        changes are tracked). No-op when the row is absent."""
+        with self._tx() as cx:
+            cx.execute(
+                "UPDATE node_embeddings SET text_hash = ? "
+                "WHERE node_id = ? AND model = ? AND text_hash IS NULL",
+                (embedding_text_hash(text), node_id, model),
             )
 
     def get_embedding(self, node_id: str, model: str) -> "np.ndarray | None":

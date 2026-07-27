@@ -19,12 +19,12 @@ the fs wins.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
 import subprocess
 import sys
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
@@ -47,14 +47,20 @@ _GEN_ID_RE = re.compile(r"^[A-Za-z0-9_]+$")
 #: calibration only ever runs observe-only.
 _TASK_DERIVED_ENABLED = os.getenv("RS_TASK_DERIVED_CALIBRATION", "1") == "1"
 
-#: §Ship 53: gate the L3 adversarial gaming-archetype check (an independent,
-#: metric-blind author proposes ~3 OFF-GOAL gaming policies; a metric that scores
-#: any in competent territory is GAMEABLE and DENIED steer-rights). DEFAULT OFF —
-#: it can DENY a grant the L2 ladders gave, so it ships dormant until audited; set
-#: RS_ADVERSARIAL_ARCHETYPES=1 to enforce. Adds ONE metric-blind author call on a
-#: novel-task launch, only when the ladders already grant. Observe-only stays
-#: never-silent: a gameable deny names the gaming policy + its score.
-_ADVERSARIAL_ENABLED = os.getenv("RS_ADVERSARIAL_ARCHETYPES", "0") == "1"
+#: §Ship 53 / §Metric-quality laws (LAW 9): gate the L3 adversarial gaming-
+#: archetype check (an independent, metric-blind author proposes OFF-GOAL gaming
+#: policies; a metric that scores any in competent territory is GAMEABLE). DEFAULT
+#: ON (Sam's call, 2026-06-19) for HIGH-STAKES acceptance — granting steer-rights
+#: to a NOVEL-task metric (a one-shot per-launch decision), and AUDIT-ONLY probing
+#: of the hand-authored spec_* ground truth a generated metric calibrates against
+#: (the surface that never ran on the metric that scored g1-kick-v5). Set
+#: RS_ADVERSARIAL_ARCHETYPES=0 to disable. Cost: one metric-blind author call per
+#: high-stakes launch (Sam approved). It can DENY a task-derived grant (never the
+#: built-in fence — that probe is record-and-warn). Routine per-iteration metric
+#: generation makes NO adversarial call, so it stays OFF for routine work by
+#: construction. Observe-only stays never-silent: a deny/finding names the policy
+#: + its score.
+_ADVERSARIAL_ENABLED = os.getenv("RS_ADVERSARIAL_ARCHETYPES", "1") == "1"
 
 #: §Ship 42: dropdown sentinel — "generate the objective metric at launch as the
 #: run's first phase" (vs picking an existing built-in / gen:<id>). Ship 43 runs
@@ -62,6 +68,51 @@ _ADVERSARIAL_ENABLED = os.getenv("RS_ADVERSARIAL_ARCHETYPES", "0") == "1"
 #: the cmd is built; until then (or if it yields no accepted metric) the run is
 #: blind. Keep in sync with the frontend value in NewRunDialog.tsx / types.ts.
 LAUNCH_GEN_SENTINEL = "generate-at-launch"
+
+
+def _file_sha256(path: Path, *, chunk_size: int = 1 << 20) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def resolve_warm_start_checkpoint(
+    project_dir: Path, iteration: int,
+) -> Path:
+    """Resolve an explicit UI warm-start within this project's run history.
+
+    The UI supplies an iteration number rather than a path. Only a non-empty
+    promoted checkpoint directly under ``runs/iter_N`` is eligible, and
+    symlinks escaping ``runs`` fail closed. ``checkpoint.pt`` is preferred
+    when an adapter left both formats behind.
+    """
+    if isinstance(iteration, bool) or not isinstance(iteration, int):
+        raise TypeError("warm-start iteration must be an integer")
+    if iteration < 0:
+        raise ValueError("warm-start iteration must be non-negative")
+
+    runs_root = (project_dir / "runs").resolve()
+    iter_dir = runs_root / f"iter_{iteration}"
+    for name in ("checkpoint.pt", "checkpoint.zip"):
+        candidate = iter_dir / name
+        try:
+            resolved = candidate.resolve(strict=True)
+        except FileNotFoundError:
+            continue
+        try:
+            resolved.relative_to(runs_root)
+        except ValueError as exc:
+            raise ValueError(
+                f"warm-start checkpoint escapes project runs: {candidate}"
+            ) from exc
+        if resolved.is_file() and resolved.stat().st_size > 0:
+            return resolved
+
+    raise FileNotFoundError(
+        f"no non-empty checkpoint.pt or checkpoint.zip for iter_{iteration}"
+    )
 
 
 def _resolve_fitness_metric(project_dir: Path, fitness_metric: str) -> Optional[str]:
@@ -160,7 +211,7 @@ async def _await_gen_decision(
 
 async def _generate_at_launch(
     job: Job, project_dir: Path, behavior_goal: str,
-    control_path: Path, cancel: asyncio.Event,
+    control_path: Path, cancel: asyncio.Event, *, n_candidates: int = 1,
 ) -> Optional[str]:
     """§Ship 43/44/45: generate the objective metric as the run's FIRST phase,
     streaming the Ship-40 stage events into THIS run's event stream, then
@@ -195,7 +246,8 @@ async def _generate_at_launch(
         try:
             rec = await asyncio.to_thread(
                 metric_store.generate, project_dir, behavior_goal,
-                robot_hint=robot_hint, review=True, on_event=_on_event)
+                robot_hint=robot_hint, review=True,
+                n_candidates=n_candidates, on_event=_on_event)
         except asyncio.CancelledError:
             # §Ship 45 review (MEDIUM): clear the Ship-40 progress sidecar on
             # Stop. CancelledError is a BaseException that bypasses the
@@ -239,6 +291,37 @@ async def _generate_at_launch(
                     job.emit({"type": "metric_calibration_done", "source": "launch_gen",
                               "gen_id": gid, "builtin": builtin, "calibrated": False,
                               "error": f"{type(e).__name__}: {e}"})
+                # §Metric-quality laws (LAW 9): AUDIT-ONLY adversarial probe of the
+                # HAND-AUTHORED ground-truth spec_* metric this generated metric is
+                # calibrating AGAINST — the gate that never ran on spec_g1_kick, the
+                # metric that scored g1-kick-v5. Records + warns; NEVER revokes the
+                # fence (built-ins are the trusted calibration anchor). Flag-gated;
+                # scoped to families with a curated loser set (kick today). Bounded
+                # by a timeout; never fails the run.
+                if _ADVERSARIAL_ENABLED and sculptor_bridge.has_spec_audit(builtin):
+                    job.emit({"type": "metric_spec_audit_started",
+                              "source": "launch_gen", "builtin": builtin})
+                    try:
+                        audit = await asyncio.wait_for(
+                            asyncio.to_thread(sculptor_bridge.audit_builtin_spec_metric,
+                                              builtin, behavior_goal, robot_hint),
+                            timeout=180.0)
+                        job.emit({"type": "metric_spec_audit", "source": "launch_gen",
+                                  "builtin": builtin, "audit_only": True,
+                                  "ran": bool(audit.get("ran")),
+                                  "gameable": bool(audit.get("gameable")),
+                                  "worst_name": audit.get("worst_name"),
+                                  "worst_gaming": audit.get("worst_gaming"),
+                                  "coverage_gaps": audit.get("coverage_gaps"),
+                                  "reason": audit.get("reason")})
+                    except asyncio.TimeoutError:
+                        job.emit({"type": "metric_spec_audit", "source": "launch_gen",
+                                  "builtin": builtin, "audit_only": True, "ran": False,
+                                  "reason": "spec audit timed out (>180s) — not enforced"})
+                    except Exception as e:  # noqa: BLE001 — audit never affects the run
+                        job.emit({"type": "metric_spec_audit", "source": "launch_gen",
+                                  "builtin": builtin, "audit_only": True, "ran": False,
+                                  "error": f"{type(e).__name__}: {e}"})
             elif _TASK_DERIVED_ENABLED:
                 # §Ship 51: novel task (no built-in) → earn steer-rights by
                 # ranking K independently-authored competence ladders. No GPU is
@@ -248,11 +331,17 @@ async def _generate_at_launch(
                 # from steering regardless).
                 job.emit({"type": "metric_calibration_started", "source": "launch_gen",
                           "gen_id": gid, "method": "task_derived", "k_sources": 3})
+                # §round-5: stamp a calibration token so a >300s orphan (asyncio.to_thread
+                # can't be cancelled) cannot persist calibrated=true AFTER we surface
+                # 'observe-only' — on timeout we re-stamp and the orphan's late write is a
+                # no-op. None-safe: stamp_cal_token never raises.
+                cal_token = metric_store.stamp_cal_token(project_dir, gid)
                 try:
                     cal = await asyncio.wait_for(
                         asyncio.to_thread(metric_store.calibrate_task_derived,
                                           project_dir, gid, behavior_goal, robot_hint,
-                                          adversarial=_ADVERSARIAL_ENABLED),
+                                          adversarial=_ADVERSARIAL_ENABLED,
+                                          expect_token=cal_token, require_token=True),
                         timeout=300.0)
                     c = cal.get("calibration") or {}
                     adv = c.get("adversarial") or {}
@@ -267,6 +356,14 @@ async def _generate_at_launch(
                               "trust": (cal.get("trust") or {}).get("trust"),
                               "reason": c.get("reason")})
                 except asyncio.TimeoutError:
+                    # §round-5/6: force calibrated=false + re-stamp the token (atomically)
+                    # so the still-running orphan thread's late write is rejected AND can't
+                    # resurrect calibrated=true behind this observe-only verdict (even via a
+                    # lost-update race). Best-effort; never fails the run.
+                    try:
+                        metric_store.supersede_calibration(project_dir, gid)
+                    except Exception:  # noqa: BLE001
+                        pass
                     job.emit({"type": "metric_calibration_done", "source": "launch_gen",
                               "gen_id": gid, "method": "task_derived", "calibrated": False,
                               "reason": "task-derived calibration timed out (>300s) — observe-only"})
@@ -333,6 +430,65 @@ def read_control_file(path: Path) -> dict[str, Any]:
     return {"mode": "auto", "resume_token": 0, "feedback": None, "stop": False}
 
 
+def _restore_promoted_training_inputs(project_dir: Path) -> dict[str, Any]:
+    """Restore mutable training pointers from the promoted atomic tuple.
+
+    ``selection_current.json`` is the authority.  The full selection and every
+    referenced artifact hash are verified before either convenience pointer is
+    changed.  The artifact-store lock prevents a concurrent promotion from
+    changing the selection between verification and restoration.
+
+    This is deliberately generic: refs are resolved by artifact kind/version,
+    never by robot or task name.
+    """
+    from sculptor.edit import _write_current_reexport
+    from sculptor.env_spec import load_env_spec, repoint_env_current
+    from sculptor.world.artifacts import WorldArtifactStore
+    from sculptor.world.project import load_selected_world
+
+    project_dir = Path(project_dir).expanduser().resolve()
+    store = WorldArtifactStore(project_dir)
+    with store.locked():
+        verified_store, selection, _bundle = load_selected_world(
+            store.selection_path,
+        )
+        reward_ref = selection.refs.get("reward")
+        env_ref = selection.refs.get("env_spec")
+        if reward_ref is None or reward_ref.kind != "reward":
+            raise ValueError("promoted selection has no valid reward ref")
+        if env_ref is None or env_ref.kind != "env_spec":
+            raise ValueError("promoted selection has no valid env_spec ref")
+
+        # resolve_ref rechecks each immutable artifact's SHA-256.  Confinement
+        # additionally prevents a hand-crafted selection from repointing the
+        # mutable inputs outside their project-local stores.
+        reward_path = verified_store.resolve_ref(reward_ref)
+        env_path = verified_store.resolve_ref(env_ref)
+        rewards_dir = (project_dir / "rewards").resolve()
+        env_dir = (project_dir / "env").resolve()
+        if (reward_path.parent != rewards_dir
+                or reward_path.name != f"{reward_ref.version}.py"):
+            raise ValueError("promoted reward ref is outside the reward store")
+        if (env_path.parent != env_dir
+                or env_path.name != f"{env_ref.version}.json"):
+            raise ValueError("promoted env_spec ref is outside the env store")
+
+        # Validate both sources before either mutable pointer is changed.
+        load_env_spec(env_path)
+        compile(reward_path.read_text(encoding="utf-8"), str(reward_path), "exec")
+        _write_current_reexport(rewards_dir, reward_path)
+        repoint_env_current(env_dir, env_ref.version)
+
+    return {
+        "selection_version": selection.selection_version,
+        "tuple_hash": selection.tuple_hash,
+        "reward_version": reward_ref.version,
+        "reward_sha256": reward_ref.sha256,
+        "env_spec_version": env_ref.version,
+        "env_spec_sha256": env_ref.sha256,
+    }
+
+
 # ── public API ────────────────────────────────────────────────────────
 def run_sculpt_job(
     *,
@@ -354,10 +510,13 @@ def run_sculpt_job(
     # Any field here also needs a matching CLI flag in sculptor/cli.py's
     # `run` command OR an env var the CLI reads.
     training_iterations = run_params.get("training_iterations")
-    # num_envs / device overrides flow through config.toml at project
-    # create-time (backend/routes/projects.py::create_project) so they
-    # don't need per-run plumbing yet. `expand_kg` is a sculpt-loop
-    # feature not wired up to the CLI yet — pass-through flag only.
+    # Per-run hardware overrides must reach the subprocess; the UI presents
+    # them as launch-scoped safety controls (especially important on 8 GiB
+    # laptop GPUs), so silently falling back to config.toml is unsafe.
+    num_envs_override = run_params.get("num_envs_override")
+    device_override = run_params.get("device_override")
+    # `expand_kg` is a sculpt-loop feature not wired up to the CLI yet —
+    # pass-through flag only.
     expand_kg = bool(run_params.get("expand_kg", False))
     # §Ship-7: rollout-video + RL knobs. Forwarded to `sculpt run` as
     # long-form CLI flags (see sculptor/cli.py::run). None means the
@@ -366,6 +525,9 @@ def run_sculpt_job(
     playback_speed = run_params.get("playback_speed")
     render_every = run_params.get("render_every")
     rollout_fps = run_params.get("rollout_fps")
+    render_width = run_params.get("render_width")
+    render_height = run_params.get("render_height")
+    render_env_index = run_params.get("render_env_index")
     rollout_episodes = run_params.get("rollout_episodes")
     seed = run_params.get("seed")
     auto_adjust_physics = run_params.get("auto_adjust_physics")
@@ -377,6 +539,9 @@ def run_sculpt_job(
     # §Ship 35: observe vs steer (default steer). Only meaningful with a
     # metric set; harmless otherwise.
     fitness_mode = run_params.get("fitness_mode")
+    # §best-of-N: candidates to sample for a generate-at-launch metric (1 →
+    # single-shot). Only used on the LAUNCH_GEN_SENTINEL path below.
+    metric_n_candidates = int(run_params.get("metric_n_candidates", 1) or 1)
     # §Ship 48: patience for the fitness-plateau early-stop (the live early
     # stop; the early_stop_* knobs above are a no-op for it). Only meaningful
     # with a metric set. None → sculpt-lib default (2).
@@ -387,8 +552,64 @@ def run_sculpt_job(
     # Auto/Manual toggle works at ANY point mid-run, regardless of start mode.
     start_mode = run_params.get("start_mode")
     start_mode = start_mode if start_mode in ("manual", "auto") else "auto"
+    resume_exact_tuple = bool(run_params.get("resume_exact_tuple", False))
+    warm_start_iteration = run_params.get("warm_start_iteration")
+    reference_clip_id = run_params.get("reference_clip_id")
+    reference_robot = run_params.get("reference_robot")
 
     async def _runner(job: Job, cancel: asyncio.Event) -> dict[str, Any]:
+        warm_start_checkpoint: Optional[Path] = None
+        warm_start_sha256: Optional[str] = None
+        if warm_start_iteration is not None:
+            try:
+                warm_start_checkpoint = await asyncio.to_thread(
+                    resolve_warm_start_checkpoint,
+                    project_dir,
+                    warm_start_iteration,
+                )
+                warm_start_sha256 = await asyncio.to_thread(
+                    _file_sha256, warm_start_checkpoint,
+                )
+            except Exception as exc:
+                job.emit({
+                    "type": "warm_start_checkpoint_failed",
+                    "source": "ui_launch",
+                    "iteration": warm_start_iteration,
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
+                raise RuntimeError(
+                    "could not resolve the explicitly selected warm-start "
+                    "checkpoint; the sculpt subprocess was not started"
+                ) from exc
+            job.emit({
+                "type": "warm_start_checkpoint_resolved",
+                "source": "ui_launch",
+                "iteration": int(warm_start_iteration),
+                "checkpoint": str(warm_start_checkpoint),
+                "checkpoint_sha256": warm_start_sha256,
+            })
+
+        if resume_exact_tuple:
+            try:
+                restored = await asyncio.to_thread(
+                    _restore_promoted_training_inputs, project_dir,
+                )
+            except Exception as exc:
+                job.emit({
+                    "type": "promoted_tuple_restore_failed",
+                    "source": "ui_resume",
+                    "error": f"{type(exc).__name__}: {exc}",
+                })
+                raise RuntimeError(
+                    "could not restore the promoted training tuple; "
+                    "the sculpt subprocess was not started"
+                ) from exc
+            job.emit({
+                "type": "promoted_tuple_restored",
+                "source": "ui_resume",
+                **restored,
+            })
+
         # Prepare env — strip empty ANTHROPIC_API_KEY so the .env file
         # in the project (or sculptor's own) can win; matches the
         # sculptor/__init__.py behavior.
@@ -436,7 +657,8 @@ def run_sculpt_job(
                 and os.environ.get("SCULPTOR_LAUNCH_GEN", "1") != "0"
                 and not cancel.is_set()):
             eff_fitness_metric = await _generate_at_launch(
-                job, project_dir, behavior_goal, control_path, cancel)
+                job, project_dir, behavior_goal, control_path, cancel,
+                n_candidates=metric_n_candidates)
             # §Ship 44: a launch-generated metric STEERS iff it earned
             # steer-rights via launch-time calibration; request steer and let
             # the steer_allowed firewall below downgrade to observe otherwise.
@@ -457,12 +679,18 @@ def run_sculpt_job(
             # `start_iter=0` either way.
             "--resume",
         ]
+        if warm_start_checkpoint is not None:
+            cmd += ["--init-policy", str(warm_start_checkpoint)]
         if no_kg:
             cmd.append("--no-kg")
         if dry_run:
             cmd.append("--dry-run")
         if training_iterations is not None:
             cmd += ["--steps-per-iter", str(int(training_iterations))]
+        if num_envs_override is not None:
+            cmd += ["--num-envs", str(int(num_envs_override))]
+        if device_override is not None:
+            cmd += ["--device", str(device_override)]
         if max_episode_steps is not None:
             cmd += ["--max-episode-steps", str(int(max_episode_steps))]
         if playback_speed is not None:
@@ -471,10 +699,21 @@ def run_sculpt_job(
             cmd += ["--render-every", str(int(render_every))]
         if rollout_fps is not None:
             cmd += ["--rollout-fps", str(float(rollout_fps))]
+        if render_width is not None:
+            cmd += ["--render-width", str(int(render_width))]
+        if render_height is not None:
+            cmd += ["--render-height", str(int(render_height))]
+        if render_env_index is not None:
+            cmd += ["--render-env-index", str(int(render_env_index))]
         if rollout_episodes is not None:
             cmd += ["--rollout-episodes", str(int(rollout_episodes))]
         if seed is not None:
             cmd += ["--seed", str(int(seed))]
+        if reference_clip_id is not None and reference_robot is not None:
+            cmd += [
+                "--reference-clip", str(reference_clip_id),
+                "--reference-robot", str(reference_robot),
+            ]
         if auto_adjust_physics is not None:
             # typer's --flag/--no-flag convention.
             cmd.append(
@@ -529,8 +768,22 @@ def run_sculpt_job(
         job.params.setdefault("dry_run", dry_run)
         if training_iterations is not None:
             job.params.setdefault("training_iterations", int(training_iterations))
+        if num_envs_override is not None:
+            job.params.setdefault("num_envs_override", int(num_envs_override))
+        if device_override is not None:
+            job.params.setdefault("device_override", str(device_override))
         if expand_kg:
             job.params.setdefault("expand_kg", expand_kg)
+        if warm_start_checkpoint is not None:
+            job.params.setdefault(
+                "warm_start_iteration", int(warm_start_iteration),
+            )
+            job.params.setdefault(
+                "warm_start_checkpoint", str(warm_start_checkpoint),
+            )
+            job.params.setdefault(
+                "warm_start_checkpoint_sha256", warm_start_sha256,
+            )
         # §Ship-7: stash the new params so the Runs-tab summary can
         # surface them (non-None entries only to keep the payload lean).
         for key, val in (
@@ -538,6 +791,7 @@ def run_sculpt_job(
             ("playback_speed", playback_speed),
             ("render_every", render_every),
             ("rollout_fps", rollout_fps),
+            ("render_env_index", render_env_index),
             ("rollout_episodes", rollout_episodes),
             ("seed", seed),
             ("auto_adjust_physics", auto_adjust_physics),
@@ -550,6 +804,8 @@ def run_sculpt_job(
             ("fitness_metric", eff_fitness_metric),
             ("fitness_mode", final_fitness_mode),
             ("fitness_patience", fitness_patience),
+            ("reference_clip_id", reference_clip_id),
+            ("reference_robot", reference_robot),
         ):
             if val is not None:
                 job.params.setdefault(key, val)
@@ -751,7 +1007,7 @@ async def _fs_watcher(
     emit overlapping events, but the filesystem ones are tagged
     `source=fs` and should be preferred by the frontend on conflict."""
     try:
-        from watchfiles import Change, awatch
+        from watchfiles import awatch
     except Exception:  # noqa: BLE001
         return
 
@@ -762,10 +1018,14 @@ async def _fs_watcher(
     seen_citations: set[tuple[int, str]] = set()
     seen_realism: set[int] = set()
 
-    # Pre-scan (in case iter_0 was already created before the watcher
-    # booted — happens in a fast dry-run startup race).
-    _scan_once(
-        job, project_dir,
+    # Pre-SEED the dedup sets with iterations/artifacts/rewards already on disk
+    # at run start (NO emit) so a RESUMED run never surfaces the PRIOR run's
+    # iters as 'running' / re-applies their edits. The live subprocess stdout
+    # re-emits iter_started/iter_completed for the iters this run executes, and
+    # the awatch loop below catches anything CREATED during this run (incl. a
+    # fresh run's iter_0 written after this seed).
+    _preseed_seen(
+        project_dir,
         seen_iters=seen_iters,
         seen_iter_done=seen_iter_done,
         seen_rollouts=seen_rollouts,
@@ -809,8 +1069,7 @@ class _StopEventAdapter:
         return self._cancel.is_set()
 
 
-def _scan_once(
-    job: Job,
+def _preseed_seen(
     project_dir: Path,
     *,
     seen_iters: set[int],
@@ -820,6 +1079,25 @@ def _scan_once(
     seen_citations: set[tuple[int, str]],
     seen_realism: set[int] | None = None,
 ) -> None:
+    """Populate the watcher's dedup sets with iterations/artifacts/rewards
+    ALREADY on disk when this run STARTS — WITHOUT emitting any event.
+
+    Those belong to a PRIOR run (or this run is a `--resume`), so the watcher
+    must NOT surface them as 'started/running' iteration cards or re-applied
+    edits in THIS run's timeline. (The bug this fixes: a resumed run showed the
+    previous run's iters perpetually RUNNING, because the fs watcher emitted
+    `iter_started` for every on-disk iter_<n> dir but `iter_completed` only ever
+    comes from the live subprocess stdout for the iters it actually runs.)
+
+    The live subprocess stdout drives the timeline for the iters this run
+    executes — it re-emits `iter_started`/`iter_completed` for the resumed range
+    — and the `awatch` loop + `_handle_fs_changes` catch anything CREATED during
+    this run. Artifact sets are keyed on artifact VALIDITY (the same predicates
+    `_check_iter_artifacts` uses), not mere dir existence, so a half-written
+    prior iter can't strand a stray rollout_done/diagnosed. `seen_citations` is
+    covered transitively: it is only written inside `_emit_edit_applied`, which
+    is gated by `seen_rewards`."""
+    _ = seen_citations  # transitively covered via seen_rewards; kept for parity
     runs_dir = project_dir / "runs"
     if runs_dir.is_dir():
         for d in runs_dir.iterdir():
@@ -827,25 +1105,31 @@ def _scan_once(
             if not m:
                 continue
             n = int(m.group(1))
-            if n not in seen_iters:
-                seen_iters.add(n)
-                job.emit({"type": "iter_started", "source": "fs", "iter": n})
-            _check_iter_artifacts(
-                job, d, n, seen_rollouts=seen_rollouts,
-                seen_iter_done=seen_iter_done,
-                seen_realism=seen_realism,
-            )
+            seen_iters.add(n)
+            mp4 = d / "rollout" / "rollout.mp4"
+            if mp4.is_file() and mp4.stat().st_size > 2048:
+                seen_rollouts.add(n)
+            if seen_realism is not None and (d / "realism_audit.json").is_file():
+                try:
+                    if isinstance(json.loads(
+                            (d / "realism_audit.json").read_text(encoding="utf-8")),
+                            dict):
+                        seen_realism.add(n)
+                except Exception:  # noqa: BLE001
+                    pass
+            if (d / "diagnosis.json").is_file():
+                try:
+                    if json.loads((d / "diagnosis.json").read_text(encoding="utf-8")):
+                        seen_iter_done.add(n)
+                except Exception:  # noqa: BLE001
+                    pass
 
     rewards_dir = project_dir / "rewards"
     if rewards_dir.is_dir():
         for p in rewards_dir.iterdir():
             mv = re.fullmatch(r"v(\d+)\.py", p.name)
-            if not mv:
-                continue
-            v = int(mv.group(1))
-            if v > 0 and v not in seen_rewards:
-                seen_rewards.add(v)
-                _emit_edit_applied(job, rewards_dir, v, seen_citations)
+            if mv and int(mv.group(1)) > 0:
+                seen_rewards.add(int(mv.group(1)))
 
 
 def _handle_fs_changes(
@@ -916,7 +1200,14 @@ def _check_iter_artifacts(
     seen_realism: set[int] | None = None,
 ) -> None:
     mp4 = iter_dir / "rollout" / "rollout.mp4"
-    if n not in seen_rollouts and mp4.is_file() and mp4.stat().st_size > 2048:
+    # An MP4 becomes visible before ffmpeg writes its closing moov atom.  The
+    # rollout runner writes behavior.json only after video encoding and all
+    # trajectory artifacts are closed, so use it as the generic readiness
+    # marker.  Emitting on file-size alone permanently marked the iteration as
+    # seen while the clip worker was still receiving "moov atom not found".
+    behavior = iter_dir / "rollout" / "behavior.json"
+    if (n not in seen_rollouts and mp4.is_file()
+            and mp4.stat().st_size > 2048 and behavior.is_file()):
         seen_rollouts.add(n)
         job.emit({
             "type": "rollout_done",
@@ -1146,9 +1437,16 @@ def _iter_events(job: Job) -> list[dict[str, Any]]:
                 # because the adapter doesn't expose the needed field
                 # (requires_env_extension). None until an iter defers ≥1.
                 "env_extension_suggestion": None,
+                # §env generalization: env-curriculum change applied at
+                # this iter's boundary (None until env_spec_updated fires).
+                "env_spec_update": None,
                 # §Ship 34: objective fitness-in-the-loop (None for blind runs).
                 "fitness": None,
                 "best_fitness": None,
+                # §Convergence loop 1: dense sub-success progress (ranking
+                # signal below the completion gate). None when the metric
+                # doesn't emit progress_score.
+                "progress": None,
             },
         )
         if etype == "iter_started":
@@ -1256,9 +1554,34 @@ def _iter_events(job: Job) -> list[dict[str, Any]]:
                 slot["fitness"] = float(ev.get("fitness"))
             if isinstance(ev.get("best_so_far"), (int, float)):
                 slot["best_fitness"] = float(ev.get("best_so_far"))
+            if isinstance(ev.get("progress"), (int, float)):
+                slot["progress"] = float(ev.get("progress"))
         elif etype == "best_reward_selected":
             if isinstance(ev.get("fitness"), (int, float)):
                 slot["best_fitness"] = float(ev.get("fitness"))
+        elif etype == "env_spec_updated":
+            # §env generalization: the diagnoser's env-curriculum change
+            # (applied + rejected with reasons) for this iter's boundary.
+            slot["env_spec_update"] = {
+                "new_version": ev.get("new_version"),
+                "applied": list(ev.get("applied") or []),
+                "rejected": list(ev.get("rejected") or []),
+            }
+
+    # §fix: a sequential sculpt loop runs ONE iter at a time, so only the
+    # highest-started iter can still be running. A LOWER iter still marked
+    # "running" lost its `iter_completed` (a dropped stdout line, or a
+    # crash-then-resume) — the loop demonstrably advanced past it, so reconcile
+    # it to "completed" rather than stranding a stale RUNNING card. The current
+    # (highest-started) iter keeps its event-derived status. Defense-in-depth
+    # alongside the watcher pre-seed: `completed` is otherwise STRICTLY
+    # stdout-`iter_completed`-driven with no artifact fallback.
+    started_idxs = [i for i, s in by_iter.items() if s.get("started_at")]
+    if started_idxs:
+        max_started = max(started_idxs)
+        for i, s in by_iter.items():
+            if i < max_started and s["status"] == "running":
+                s["status"] = "completed"
 
     return [by_iter[k] for k in sorted(by_iter.keys())]
 

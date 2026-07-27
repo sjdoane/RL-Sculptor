@@ -16,6 +16,7 @@ subprocess startup.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import time
 from pathlib import Path
@@ -171,6 +172,100 @@ def test_launch_run_returns_summary(
     assert body["iterations"][1]["primary_metric"] == 12.5
     # Citations attached to iter 0's edit.
     assert "1707.06347" in body["iterations"][0]["paper_refs"]
+
+
+def test_launch_run_reference_motion_requires_exact_library_pair(
+    client: TestClient,
+    tmp_path: Path,
+    fake_sculpt,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-fake")
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(tmp_path / "references"))
+    slug = _make_project_with_library(client, "ReferenceRun")
+
+    incomplete = client.post(
+        f"/projects/{slug}/runs",
+        json={
+            "behavior_goal": "walk with this style while weaving",
+            "iterations": 1,
+            "reference_clip_id": "walk_cycle",
+        },
+    )
+    assert incomplete.status_code == 412
+    assert incomplete.json()["title"] == "reference motion is incomplete"
+
+    missing = client.post(
+        f"/projects/{slug}/runs",
+        json={
+            "behavior_goal": "walk with this style while weaving",
+            "iterations": 1,
+            "reference_clip_id": "walk_cycle",
+            "reference_robot": "demo",
+        },
+    )
+    assert missing.status_code == 412
+    assert missing.json()["title"] == "reference motion is unavailable"
+
+    from sculptor.refs import library
+
+    ref_dir = library.clip_dir("demo", "walk_cycle")
+    ref_dir.mkdir(parents=True)
+    (ref_dir / library.CLIP_FILENAME).write_bytes(b"test-clip")
+    (ref_dir / library.PROVENANCE_FILENAME).write_text("{}")
+    launched = client.post(
+        f"/projects/{slug}/runs",
+        json={
+            "behavior_goal": "walk with this style while weaving",
+            "iterations": 1,
+            "reference_clip_id": "walk_cycle",
+            "reference_robot": "demo",
+        },
+    )
+    assert launched.status_code == 202, launched.text
+
+
+def test_get_run_preserves_advanced_launch_params(
+    client: TestClient, tmp_projects_root: Path, fake_sculpt, monkeypatch
+) -> None:
+    """Run history must report the exact controls the UI actually launched."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-fake")
+    slug = _make_project_with_library(client, "AdvancedRunHistory")
+    launch_params = {
+        "behavior_goal": "cross the authored platform course",
+        "iterations": 4,
+        "no_kg": False,
+        "dry_run": False,
+        "training_iterations": 750,
+        "num_envs_override": 1024,
+        "device_override": "cuda:0",
+        "max_episode_steps": 500,
+        "playback_speed": 1.0,
+        "rollout_episodes": 2,
+        "render_width": 960,
+        "render_height": 540,
+        "seed": 42,
+        "fitness_metric": "go1_trot",
+        "fitness_mode": "steer",
+        "fitness_patience": 4,
+        "start_mode": "auto",
+    }
+    response = client.post(f"/projects/{slug}/runs", json=launch_params)
+    assert response.status_code == 202, response.text
+
+    run_id = response.json()["run_id"]
+    deadline = time.time() + 10
+    while time.time() < deadline:
+        detail_response = client.get(f"/projects/{slug}/runs/{run_id}")
+        assert detail_response.status_code == 200, detail_response.text
+        detail = detail_response.json()
+        if detail["status"] == "completed":
+            break
+        time.sleep(0.05)
+    assert detail["status"] == "completed", detail
+
+    for field, expected in launch_params.items():
+        assert detail["params"][field] == expected, field
 
 
 def test_cannot_launch_two_concurrent_runs(
@@ -353,16 +448,16 @@ def test_run_sculpt_job_exports_shared_kg_path_for_new_project(
     )
 
 
-def test_run_sculpt_job_honors_existing_legacy_kg(
+def test_run_sculpt_job_ignores_existing_legacy_kg(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Opposite case: if a project DOES have a pre-existing legacy
-    `<project>/kg/graph.db`, `run_sculpt_job` keeps pointing at it (no
-    silent migration to shared, per `project_kg_db_path`'s contract)."""
+    """A legacy project-local graph must never fragment spawned training
+    away from the shared graph; the resolver warns and exports shared."""
     import asyncio
 
     from backend.services import run_manager
     from backend.services.job_manager import Job
+    from backend.services.kg_store import shared_kg_db_path
 
     project_dir = tmp_path / "legacy-proj"
     (project_dir / "kg").mkdir(parents=True)
@@ -389,7 +484,259 @@ def test_run_sculpt_job_honors_existing_legacy_kg(
     with pytest.raises(_Sentinel):
         asyncio.run(runner(job, job._cancel))
 
-    assert captured["env"]["SCULPTOR_KG_PATH"] == str(legacy_db)
+    assert captured["env"]["SCULPTOR_KG_PATH"] == str(shared_kg_db_path())
+    assert captured["env"]["SCULPTOR_KG_PATH"] != str(legacy_db)
+
+
+def _promoted_recovery_project(project_dir: Path) -> tuple[Path, Path]:
+    """Build the smallest valid atomic tuple needed by recovery tests."""
+    from sculptor.edit import _write_current_reexport
+    from sculptor.world.artifacts import ArtifactRef, WorldArtifactStore
+
+    env_dir = project_dir / "env"
+    rewards_dir = project_dir / "rewards"
+    env_dir.mkdir(parents=True)
+    rewards_dir.mkdir(parents=True)
+
+    promoted_reward = rewards_dir / "v1.py"
+    draft_reward = rewards_dir / "v2.py"
+    promoted_reward.write_text("REWARD_SPEC = {}\ndef compute_reward(_obs): return 1.0\n")
+    draft_reward.write_text("REWARD_SPEC = {}\ndef compute_reward(_obs): return 2.0\n")
+    _write_current_reexport(rewards_dir, draft_reward)
+
+    promoted_env = env_dir / "v1.json"
+    draft_env = env_dir / "v2.json"
+    promoted_env.write_text(json.dumps({
+        "env_spec_version": 1,
+        "meta": {"version": "v1", "parent": "v0", "source": "test",
+                 "rationale": "promoted test input"},
+        "shared": {}, "train": {},
+    }))
+    draft_env.write_text(json.dumps({
+        "env_spec_version": 1,
+        "meta": {"version": "v2", "parent": "v1", "source": "test",
+                 "rationale": "unpromoted test draft"},
+        "shared": {}, "train": {"entropy_coef_scale": 2.0},
+    }))
+    (env_dir / "current.json").write_text(draft_env.read_text())
+
+    refs = {
+        "reward": ArtifactRef.from_path(
+            "reward", "v1", promoted_reward, base=project_dir,
+        ),
+        "env_spec": ArtifactRef.from_path(
+            "env_spec", "v1", promoted_env, base=project_dir,
+        ),
+    }
+    for kind in (
+        "world", "task", "resolved_eval", "channel_catalog", "clarifications",
+    ):
+        artifact = env_dir / f"{kind}_v1.json"
+        artifact.write_text("{}")
+        refs[kind] = ArtifactRef.from_path(
+            kind, "v1", artifact, base=project_dir,
+        )
+    WorldArtifactStore(project_dir).promote(
+        refs, evaluation_lineage="recovery-test",
+    )
+    return promoted_reward, promoted_env
+
+
+def test_restore_promoted_training_inputs_uses_hash_verified_tuple(
+    tmp_path: Path,
+) -> None:
+    from backend.services import run_manager
+
+    project_dir = tmp_path / "promoted-recovery"
+    promoted_reward, promoted_env = _promoted_recovery_project(project_dir)
+
+    result = run_manager._restore_promoted_training_inputs(project_dir)
+
+    assert result["selection_version"] == 1
+    assert result["reward_version"] == "v1"
+    assert result["env_spec_version"] == "v1"
+    assert promoted_reward.name in (
+        project_dir / "rewards" / "current.py"
+    ).read_text()
+    assert json.loads((project_dir / "env" / "current.json").read_text()) == (
+        json.loads(promoted_env.read_text())
+    )
+
+
+def test_restore_promoted_training_inputs_rejects_hash_drift_before_repoint(
+    tmp_path: Path,
+) -> None:
+    from backend.services import run_manager
+
+    project_dir = tmp_path / "tampered-recovery"
+    promoted_reward, _promoted_env = _promoted_recovery_project(project_dir)
+    reward_current = project_dir / "rewards" / "current.py"
+    env_current = project_dir / "env" / "current.json"
+    reward_before = reward_current.read_bytes()
+    env_before = env_current.read_bytes()
+
+    promoted_reward.write_text("REWARD_SPEC = {}\ndef compute_reward(_obs): return 99.0\n")
+    with pytest.raises(ValueError, match="hash mismatch"):
+        run_manager._restore_promoted_training_inputs(project_dir)
+
+    assert reward_current.read_bytes() == reward_before
+    assert env_current.read_bytes() == env_before
+
+
+def test_run_sculpt_job_restores_promoted_tuple_before_subprocess(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from backend.services import run_manager
+    from backend.services.job_manager import Job
+
+    project_dir = tmp_path / "ui-recovery"
+    project_dir.mkdir()
+    order: list[str] = []
+
+    def _fake_restore(path: Path) -> dict:
+        assert path == project_dir
+        order.append("restore")
+        return {
+            "selection_version": 7,
+            "tuple_hash": "f" * 64,
+            "reward_version": "v4",
+            "reward_sha256": "a" * 64,
+            "env_spec_version": "v2",
+            "env_spec_sha256": "b" * 64,
+        }
+
+    class _Sentinel(Exception):
+        pass
+
+    async def _fake_exec(*args, **kwargs):
+        order.append("subprocess")
+        raise _Sentinel()
+
+    monkeypatch.setattr(
+        run_manager, "_restore_promoted_training_inputs", _fake_restore,
+    )
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+    runner = run_manager.run_sculpt_job(
+        project_dir=project_dir,
+        run_params={
+            "behavior_goal": "recover the last accepted behavior",
+            "iterations": 1,
+            "resume_exact_tuple": True,
+        },
+    )
+    job = Job(
+        job_id="t_recovery", kind="sculpt_run",
+        project_slug="ui-recovery", status="running",
+    )
+    job._cancel = asyncio.Event()
+    with pytest.raises(_Sentinel):
+        asyncio.run(runner(job, job._cancel))
+
+    assert order == ["restore", "subprocess"]
+    restored = next(
+        event for event in job.events
+        if event.get("type") == "promoted_tuple_restored"
+    )
+    assert restored["selection_version"] == 7
+    assert restored["reward_version"] == "v4"
+
+
+# ── Explicit policy checkpoint recovery ──────────────────────────────
+def test_resolve_warm_start_checkpoint_is_project_local_and_nonempty(
+    tmp_path: Path,
+) -> None:
+    from backend.services.run_manager import resolve_warm_start_checkpoint
+
+    project_dir = tmp_path / "checkpoint-project"
+    iter_dir = project_dir / "runs" / "iter_22"
+    iter_dir.mkdir(parents=True)
+    (iter_dir / "checkpoint.pt").write_bytes(b"")
+    zip_checkpoint = iter_dir / "checkpoint.zip"
+    zip_checkpoint.write_bytes(b"policy")
+
+    assert resolve_warm_start_checkpoint(project_dir, 22) == zip_checkpoint
+
+    outside = tmp_path / "outside.pt"
+    outside.write_bytes(b"outside policy")
+    escaped_iter = project_dir / "runs" / "iter_23"
+    escaped_iter.mkdir()
+    (escaped_iter / "checkpoint.pt").symlink_to(outside)
+    with pytest.raises(ValueError, match="escapes project runs"):
+        resolve_warm_start_checkpoint(project_dir, 23)
+
+
+def test_run_sculpt_job_forwards_explicit_warm_start_with_hash(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from backend.services import run_manager
+    from backend.services.job_manager import Job
+
+    project_dir = tmp_path / "warm-start-project"
+    checkpoint = project_dir / "runs" / "iter_22" / "checkpoint.pt"
+    checkpoint.parent.mkdir(parents=True)
+    checkpoint.write_bytes(b"trusted actor and critic")
+    captured: dict[str, list[str]] = {}
+
+    class _Sentinel(Exception):
+        pass
+
+    async def _fake_exec(*args, **kwargs):
+        captured["cmd"] = list(args)
+        raise _Sentinel()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+    runner = run_manager.run_sculpt_job(
+        project_dir=project_dir,
+        run_params={
+            "behavior_goal": "recover a stable traversal policy",
+            "iterations": 1,
+            "warm_start_iteration": 22,
+        },
+    )
+    job = Job(
+        job_id="t_warm_start",
+        kind="sculpt_run",
+        project_slug="warm-start-project",
+        status="running",
+    )
+    job._cancel = asyncio.Event()
+    with pytest.raises(_Sentinel):
+        asyncio.run(runner(job, job._cancel))
+
+    cmd = captured["cmd"]
+    assert cmd[cmd.index("--init-policy") + 1] == str(checkpoint)
+    event = next(
+        item for item in job.events
+        if item.get("type") == "warm_start_checkpoint_resolved"
+    )
+    assert event["iteration"] == 22
+    assert event["checkpoint"] == str(checkpoint)
+    assert event["checkpoint_sha256"] == hashlib.sha256(
+        checkpoint.read_bytes()
+    ).hexdigest()
+    assert job.params["warm_start_iteration"] == 22
+
+
+def test_launch_rejects_missing_warm_start_before_job_submission(
+    client: TestClient, fake_sculpt,
+) -> None:
+    slug = _make_project_with_library(client, "Missing Warm Start")
+    response = client.post(
+        f"/projects/{slug}/runs",
+        json={
+            "behavior_goal": "recover a stable traversal policy",
+            "iterations": 1,
+            "dry_run": True,
+            "warm_start_iteration": 404,
+        },
+    )
+
+    assert response.status_code == 412, response.text
+    assert response.json()["type"] == "/problems/warm-start"
+    assert "iter_404" in response.json()["detail"]
+    assert client.app.state.job_manager.list(  # type: ignore[attr-defined]
+        kind="sculpt_run", project_slug=slug,
+    ) == []
 
 
 # ── Test 1 follow-up (Issue C): training_iterations plumbing ─────────
@@ -443,6 +790,118 @@ def test_run_sculpt_job_forwards_training_iterations_as_cli_flag(
     assert cmd[sp_idx + 1] == "100", (
         f"expected --steps-per-iter 100, got {cmd[sp_idx + 1]!r}"
     )
+
+
+def test_run_sculpt_job_forwards_hardware_overrides_as_cli_flags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Launch-scoped env/device controls shown in the UI must be real."""
+    from backend.services import run_manager
+    from backend.services.job_manager import Job
+
+    project_dir = tmp_path / "hardware-override"
+    project_dir.mkdir()
+    captured: dict = {}
+
+    class _Sentinel(Exception):
+        pass
+
+    async def _fake_exec(*args, **kwargs):
+        captured["cmd"] = list(args)
+        raise _Sentinel()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+    runner = run_manager.run_sculpt_job(
+        project_dir=project_dir,
+        run_params={
+            "behavior_goal": "traverse rough terrain",
+            "iterations": 2,
+            "num_envs_override": 512,
+            "device_override": "cuda:0",
+        },
+    )
+    job = Job(
+        job_id="t_hw", kind="sculpt_run",
+        project_slug="hardware-override", status="running",
+    )
+    job._cancel = asyncio.Event()
+    with pytest.raises(_Sentinel):
+        asyncio.run(runner(job, job._cancel))
+
+    cmd = captured["cmd"]
+    assert cmd[cmd.index("--num-envs") + 1] == "512"
+    assert cmd[cmd.index("--device") + 1] == "cuda:0"
+
+
+def test_run_sculpt_job_forwards_reference_pair_as_cli_flags(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from backend.services import run_manager
+    from backend.services.job_manager import Job
+
+    project_dir = tmp_path / "reference-flags"
+    project_dir.mkdir()
+    captured: dict = {}
+
+    class _Sentinel(Exception):
+        pass
+
+    async def _fake_exec(*args, **kwargs):
+        captured["cmd"] = list(args)
+        raise _Sentinel()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+    runner = run_manager.run_sculpt_job(
+        project_dir=project_dir,
+        run_params={
+            "behavior_goal": "preserve this gait while weaving",
+            "iterations": 1,
+            "reference_clip_id": "walk_cycle",
+            "reference_robot": "g1",
+        },
+    )
+    job = Job(
+        job_id="t_reference", kind="sculpt_run",
+        project_slug="reference-flags", status="running",
+    )
+    job._cancel = asyncio.Event()
+    with pytest.raises(_Sentinel):
+        asyncio.run(runner(job, job._cancel))
+
+    cmd = captured["cmd"]
+    assert cmd[cmd.index("--reference-clip") + 1] == "walk_cycle"
+    assert cmd[cmd.index("--reference-robot") + 1] == "g1"
+
+
+def test_launch_rejects_tampered_authored_world_before_job_submission(
+    client: TestClient, fake_sculpt, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from backend.services import world_store
+
+    slug = _make_project_with_library(client, "WorldIntegrity")
+    project = client.get(f"/projects/{slug}").json()
+    selection = Path(project["project_dir"]) / "env" / "selection_current.json"
+    selection.parent.mkdir(parents=True, exist_ok=True)
+    selection.write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(
+        world_store, "validate",
+        lambda _project: {"ok": False, "errors": ["task artifact hash mismatch"]},
+    )
+
+    response = client.post(
+        f"/projects/{slug}/runs",
+        json={
+            "behavior_goal": "traverse rough terrain",
+            "iterations": 1,
+            "dry_run": True,
+        },
+    )
+    assert response.status_code == 412, response.text
+    assert response.json()["type"] == "/problems/world-integrity"
+    assert "hash mismatch" in response.json()["detail"]
+    assert client.app.state.job_manager.list(  # type: ignore[attr-defined]
+        kind="sculpt_run", project_slug=slug,
+    ) == []
 
 
 def test_run_sculpt_job_omits_steps_per_iter_flag_when_not_set(
@@ -725,7 +1184,10 @@ def test_run_sculpt_job_launch_gen_sentinel_disabled_runs_blind(
 def _fake_bridge_gen(*, accept: bool):
     """A mocked sculptor_bridge.generate_objective_metric: writes metric.py,
     fires the Ship-40 stage events, returns an accept/reject rec (no LLM)."""
-    def _gen(behavior_goal, out_dir, *, robot_hint=None, review=True, on_event=None):
+    def _gen(
+        behavior_goal, out_dir, *, robot_hint=None, review=True,
+        n_candidates=1, on_event=None, channel_catalog=None,
+    ):
         if on_event:
             on_event({"stage": "generating", "attempt": 1, "max": 3,
                       "message": "Generating candidate metric (attempt 1/3)…"})
@@ -803,6 +1265,110 @@ def test_run_sculpt_job_launch_gen_accepts_and_steers(
     assert cmd[cmd.index("--fitness-mode") + 1] == "observe"
 
 
+def test_run_sculpt_job_launch_gen_spec_audit_emits(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """§Metric-quality laws (LAW 9): with the adversarial flag ON, a launch-
+    generated KICK metric calibrating against g1_kick ALSO runs the AUDIT-ONLY
+    adversarial probe of the hand-authored spec_g1_kick (the gate that never ran on
+    the metric that scored g1-kick-v5) and streams a metric_spec_audit event —
+    record-only, never revoking the ground-truth fence."""
+    import asyncio
+
+    from backend.services import run_manager, sculptor_bridge
+    from backend.services.job_manager import Job
+
+    monkeypatch.setattr(run_manager, "_ADVERSARIAL_ENABLED", True)
+    monkeypatch.setattr(sculptor_bridge, "generate_objective_metric",
+                        _fake_bridge_gen(accept=True))
+    monkeypatch.setattr(
+        sculptor_bridge, "calibrate_objective_metric",
+        lambda metric_path, builtin, threshold=0.7: {
+            "ok": True, "spearman": 0.95, "builtin": builtin})
+    captured_audit: dict = {}
+
+    def _fake_audit(builtin, goal, robot_hint=None, *, client=None):
+        captured_audit["args"] = (builtin, goal)
+        return {"ran": True, "gameable": False, "worst_name": "active_kick_behind",
+                "worst_gaming": 0.01, "coverage_gaps": [], "reason": None}
+
+    monkeypatch.setattr(sculptor_bridge, "audit_builtin_spec_metric", _fake_audit)
+    project_dir = tmp_path / "lg-audit"
+    project_dir.mkdir()
+    captured: dict = {}
+
+    class _Sentinel(Exception):
+        pass
+
+    async def _fake_exec(*args, **kwargs):
+        captured["cmd"] = list(args)
+        raise _Sentinel()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+    runner = run_manager.run_sculpt_job(
+        project_dir=project_dir,
+        run_params={"behavior_goal": "repeatedly kick with one leg", "iterations": 1,
+                    "fitness_metric": "generate-at-launch", "fitness_mode": "observe"},
+    )
+    job = Job(job_id="t_lgaudit", kind="sculpt_run", project_slug="lg-audit", status="running")
+    job._cancel = asyncio.Event()
+    with pytest.raises(_Sentinel):
+        asyncio.run(runner(job, job._cancel))
+
+    audits = [e for e in job.events if e.get("type") == "metric_spec_audit"]
+    assert audits, [e.get("type") for e in job.events]
+    assert audits[0]["audit_only"] is True and audits[0]["ran"] is True
+    assert audits[0]["gameable"] is False        # audit never revokes the fence
+    assert captured_audit["args"][0] == "g1_kick"
+
+
+def test_run_sculpt_job_launch_gen_spec_audit_off_by_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Flag OFF (the unit-test default) → no spec audit fires, no metric_spec_audit
+    event, and no bridge audit call (byte-identical to before the seam)."""
+    import asyncio
+
+    from backend.services import run_manager, sculptor_bridge
+    from backend.services.job_manager import Job
+
+    # _disable_network_adversarial autouse already forces the flag OFF.
+    monkeypatch.setattr(sculptor_bridge, "generate_objective_metric",
+                        _fake_bridge_gen(accept=True))
+    monkeypatch.setattr(
+        sculptor_bridge, "calibrate_objective_metric",
+        lambda metric_path, builtin, threshold=0.7: {
+            "ok": True, "spearman": 0.95, "builtin": builtin})
+
+    def _boom_audit(*a, **k):
+        raise AssertionError("audit must not run when the flag is off")
+
+    monkeypatch.setattr(sculptor_bridge, "audit_builtin_spec_metric", _boom_audit)
+    project_dir = tmp_path / "lg-audit-off"
+    project_dir.mkdir()
+    captured: dict = {}
+
+    class _Sentinel(Exception):
+        pass
+
+    async def _fake_exec(*args, **kwargs):
+        captured["cmd"] = list(args)
+        raise _Sentinel()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_exec)
+    runner = run_manager.run_sculpt_job(
+        project_dir=project_dir,
+        run_params={"behavior_goal": "repeatedly kick with one leg", "iterations": 1,
+                    "fitness_metric": "generate-at-launch", "fitness_mode": "observe"},
+    )
+    job = Job(job_id="t_lgaudit_off", kind="sculpt_run", project_slug="lg-audit-off",
+              status="running")
+    job._cancel = asyncio.Event()
+    with pytest.raises(_Sentinel):
+        asyncio.run(runner(job, job._cancel))
+    assert not [e for e in job.events if e.get("type") == "metric_spec_audit"]
+
+
 async def _decision_blind(control_path, cancel, *, timeout_s=1800.0):
     return "blind"
 
@@ -816,7 +1382,10 @@ def _fake_bridge_gen_seq(*accepts):
     attempt), writing metric.py each time."""
     state = {"i": 0}
 
-    def _gen(behavior_goal, out_dir, *, robot_hint=None, review=True, on_event=None):
+    def _gen(
+        behavior_goal, out_dir, *, robot_hint=None, review=True,
+        n_candidates=1, on_event=None, channel_catalog=None,
+    ):
         accept = accepts[min(state["i"], len(accepts) - 1)]
         state["i"] += 1
         if on_event:
@@ -939,7 +1508,10 @@ def test_launch_gen_clears_progress_sidecar_on_cancel(
     from backend.services import metric_store, run_manager, sculptor_bridge
     from backend.services.job_manager import Job
 
-    def _gen_then_cancel(behavior_goal, out_dir, *, robot_hint=None, review=True, on_event=None):
+    def _gen_then_cancel(
+        behavior_goal, out_dir, *, robot_hint=None, review=True,
+        n_candidates=1, on_event=None, channel_catalog=None,
+    ):
         if on_event:  # write an active-progress sidecar, then get cancelled
             on_event({"stage": "generating", "attempt": 1, "max": 4, "message": "working"})
         raise asyncio.CancelledError()
@@ -1104,6 +1676,9 @@ def test_run_sculpt_job_forwards_ship7_params_as_cli_flags(
             "playback_speed": 2.0,
             "render_every": 3,
             "rollout_fps": 30,
+            "render_width": 1920,
+            "render_height": 1080,
+            "render_env_index": 10,
             "rollout_episodes": 10,
             "seed": 1337,
             "auto_adjust_physics": True,
@@ -1123,6 +1698,12 @@ def test_run_sculpt_job_forwards_ship7_params_as_cli_flags(
     assert cmd[cmd.index("--render-every") + 1] == "3"
     assert "--rollout-fps" in cmd
     assert cmd[cmd.index("--rollout-fps") + 1] == "30.0"
+    assert "--render-width" in cmd
+    assert cmd[cmd.index("--render-width") + 1] == "1920"
+    assert "--render-height" in cmd
+    assert cmd[cmd.index("--render-height") + 1] == "1080"
+    assert "--render-env-index" in cmd
+    assert cmd[cmd.index("--render-env-index") + 1] == "10"
     assert "--rollout-episodes" in cmd
     assert cmd[cmd.index("--rollout-episodes") + 1] == "10"
     assert "--seed" in cmd
@@ -1242,7 +1823,8 @@ def test_run_sculpt_job_omits_ship7_flags_when_not_set(
     cmd = captured["cmd"]
     for flag in (
         "--max-episode-steps", "--playback-speed", "--render-every",
-        "--rollout-fps", "--rollout-episodes", "--seed",
+        "--rollout-fps", "--render-width", "--render-height",
+        "--render-env-index", "--rollout-episodes", "--seed",
         "--auto-adjust-physics", "--no-auto-adjust-physics",
     ):
         assert flag not in cmd, f"{flag} leaked when not set: {cmd}"
@@ -1714,3 +2296,38 @@ def test_control_endpoint_merges_mode_resume_and_stop(
         json={"mode": "auto"}).status_code == 404
 
     client.delete(f"/projects/{slug}/runs/{run_id}")
+
+
+def test_env_spec_update_surfaced_in_iter_summary() -> None:
+    """§env generalization: an `env_spec_updated` event lands in the iter
+    slot's `env_spec_update` field (applied + rejected with reasons — the
+    diagnoser's env-curriculum change); an iter without the event keeps
+    the field None."""
+    from backend.services.job_manager import Job
+    from backend.services.run_manager import build_iterations_summary
+
+    job = Job(job_id="t_envspec", kind="sculpt_run", project_slug="p",
+              status="completed")
+    job.events = [
+        {"type": "iter_started", "iter": 0},
+        {"type": "env_spec_updated", "iter": 0,
+         "new_version": "v1",
+         "applied": ["entropy_coef_scale=1.5"],
+         "rejected": [{"parameter": "entropy_coef_scale",
+                       "reason": "99.0 outside hard bounds [0.25, 4.0]"}]},
+        {"type": "iter_completed", "iter": 0, "failure_modes": [],
+         "edit_count": 0},
+        {"type": "iter_started", "iter": 1},
+        {"type": "iter_completed", "iter": 1, "failure_modes": [],
+         "edit_count": 1},
+    ]
+    iters = build_iterations_summary(job)
+    s0 = next(it for it in iters if it["iter_index"] == 0)
+    s1 = next(it for it in iters if it["iter_index"] == 1)
+    assert s0["env_spec_update"] == {
+        "new_version": "v1",
+        "applied": ["entropy_coef_scale=1.5"],
+        "rejected": [{"parameter": "entropy_coef_scale",
+                      "reason": "99.0 outside hard bounds [0.25, 4.0]"}],
+    }
+    assert s1["env_spec_update"] is None

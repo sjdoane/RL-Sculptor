@@ -1,6 +1,7 @@
 """sculptor/kg/extract.py — LLM-powered entity extraction.
 
-For each Paper in the KG, ask Claude Opus 4.7 to extract:
+For each Paper in the KG, ask Claude (the registry's "kg_extract" role,
+`sculptor.llm.model_for`) to extract:
   * Techniques (named methods or design patterns)
   * Failure modes (training pathologies the paper discusses)
   * Reward components (reusable reward-shaping terms)
@@ -24,6 +25,7 @@ CLI:
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import sys
@@ -39,6 +41,7 @@ from sculptor.kg.schema import (
     Environment,
     FailureMode,
     Paper,
+    PROVENANCE_PAPER_CLAIM,
     Relation,
     RewardComponent,
     Technique,
@@ -47,11 +50,13 @@ from sculptor.kg.schema import (
     make_paper_id,
     make_reward_component_id,
     make_technique_id,
+    merge_provenance,
 )
 from sculptor.kg.store import SculptorKG
+from sculptor.llm import log_llm_call, model_for, response_text_blocks
 
 
-MODEL_ID = "claude-opus-4-7"
+MODEL_ID = model_for("kg_extract")
 MAX_TOKENS = 8192
 MAX_EXCERPT_CHARS = 28_000    # ~7K tokens — enough for most papers' key sections
 MIN_EVIDENCE_CHARS = 20       # reject snippets that are just category names
@@ -191,13 +196,18 @@ def _call_claude(client, system_prompt: str, user_prompt: str) -> ExtractionPayl
             messages=[{"role": "user", "content": user_prompt}],
             output_format=ExtractionPayload,
         )
+        log_llm_call(
+            "kg_extract", MODEL_ID, system=system_prompt, user=user_prompt,
+            response_text=response_text_blocks(resp),
+            usage=getattr(resp, "usage", None), meta={"attempt": 1})
         return resp.parsed_output  # type: ignore[return-value]
     except Exception as first_err:
         # Retry once with a corrective reminder appended as a follow-up user turn.
+        retry_reminder = f"{RETRY_REMINDER} Error was: {first_err!s}"
         corrected_messages = [
             {"role": "user", "content": user_prompt},
             # 4.7 disallows assistant prefill; use a second user turn instead.
-            {"role": "user", "content": f"{RETRY_REMINDER} Error was: {first_err!s}"},
+            {"role": "user", "content": retry_reminder},
         ]
         # Second attempt: re-run with the nudge; propagate any failure.
         resp = client.messages.parse(
@@ -208,6 +218,11 @@ def _call_claude(client, system_prompt: str, user_prompt: str) -> ExtractionPayl
             messages=corrected_messages,
             output_format=ExtractionPayload,
         )
+        log_llm_call(
+            "kg_extract", MODEL_ID, system=system_prompt,
+            user=f"{user_prompt}\n\n{retry_reminder}",
+            response_text=response_text_blocks(resp),
+            usage=getattr(resp, "usage", None), meta={"attempt": 2})
         return resp.parsed_output  # type: ignore[return-value]
 
 
@@ -224,20 +239,37 @@ def _materialize(
         return isinstance(ev, str) and len(ev.strip()) >= MIN_EVIDENCE_CHARS
 
     # 1. Techniques
+    #
+    # MERGE DISCIPLINE (§Phase-0 hardening 2026-07-18): when the node
+    # already exists, mutate it with dataclasses.replace so every field
+    # this payload does NOT speak to survives. The old rebuild-from-
+    # scratch merge silently reset `useful_citations` and `outcome_stats`
+    # — the run-learned ranking signals cases.record_run_cases spends
+    # whole GPU runs accumulating — to 0/{} on every re-extraction that
+    # mentioned the same technique. Provenance merges by trust tier
+    # (a paper attestation upgrades an llm-inferred stub, never the
+    # reverse). Same pattern for FailureMode/RewardComponent/Environment.
     technique_name_to_id: dict[str, str] = {}
     for t in payload.techniques:
         if not _good_evidence(t.evidence):
             continue
         tid = make_technique_id(t.name)
         existing = store.get_node(tid)
-        # Merge tags / description if already present; prefer richer text.
         if isinstance(existing, Technique):
-            tags = sorted(set(existing.tags) | set(t.tags))
-            description = existing.description if len(existing.description) > len(t.description) else t.description
+            node = dataclasses.replace(
+                existing,
+                description=(existing.description
+                             if len(existing.description) > len(t.description)
+                             else t.description),
+                tags=sorted(set(existing.tags) | set(t.tags)),
+                provenance=merge_provenance(
+                    existing.provenance, PROVENANCE_PAPER_CLAIM),
+            )
         else:
-            tags = sorted(set(t.tags))
-            description = t.description
-        store.add_node(Technique(id=tid, name=t.name, description=description, tags=tags))
+            node = Technique(
+                id=tid, name=t.name, description=t.description,
+                tags=sorted(set(t.tags)))
+        store.add_node(node)
         technique_name_to_id[t.name] = tid
         created_node_ids.append(tid)
 
@@ -249,16 +281,25 @@ def _materialize(
         fid = make_failure_mode_id(f.name)
         existing = store.get_node(fid)
         if isinstance(existing, FailureMode):
-            symptoms = sorted(set(existing.symptoms) | set(f.symptoms))
-            description = existing.description if len(existing.description) > len(f.description) else f.description
-            env_tag = existing.environment_tag or f.environment_tag
+            # A diagnoser-flagged stub carries the placeholder description;
+            # a real paper description (even a shorter one) beats it.
+            _stub = existing.description.startswith("(diagnoser-flagged")
+            node = dataclasses.replace(
+                existing,
+                description=(f.description if _stub or
+                             len(f.description) > len(existing.description)
+                             else existing.description),
+                symptoms=sorted(set(existing.symptoms) | set(f.symptoms)),
+                environment_tag=existing.environment_tag or f.environment_tag,
+                provenance=merge_provenance(
+                    existing.provenance, PROVENANCE_PAPER_CLAIM),
+            )
         else:
-            symptoms = sorted(set(f.symptoms))
-            description = f.description
-            env_tag = f.environment_tag
-        store.add_node(FailureMode(
-            id=fid, name=f.name, description=description,
-            symptoms=symptoms, environment_tag=env_tag))
+            node = FailureMode(
+                id=fid, name=f.name, description=f.description,
+                symptoms=sorted(set(f.symptoms)),
+                environment_tag=f.environment_tag)
+        store.add_node(node)
         failure_name_to_id[f.name] = fid
         created_node_ids.append(fid)
 
@@ -270,16 +311,22 @@ def _materialize(
         rid = make_reward_component_id(r.name)
         existing = store.get_node(rid)
         if isinstance(existing, RewardComponent):
-            hparams = {**existing.hyperparameters, **r.hyperparameters}
-            description = existing.description if len(existing.description) > len(r.description) else r.description
-            formula = existing.formula or r.formula
+            node = dataclasses.replace(
+                existing,
+                description=(existing.description
+                             if len(existing.description) > len(r.description)
+                             else r.description),
+                formula=existing.formula or r.formula,
+                hyperparameters={**existing.hyperparameters,
+                                 **r.hyperparameters},
+                provenance=merge_provenance(
+                    existing.provenance, PROVENANCE_PAPER_CLAIM),
+            )
         else:
-            hparams = dict(r.hyperparameters)
-            description = r.description
-            formula = r.formula
-        store.add_node(RewardComponent(
-            id=rid, name=r.name, description=description,
-            formula=formula, hyperparameters=hparams))
+            node = RewardComponent(
+                id=rid, name=r.name, description=r.description,
+                formula=r.formula, hyperparameters=dict(r.hyperparameters))
+        store.add_node(node)
         reward_component_name_to_id[r.name] = rid
         created_node_ids.append(rid)
 
@@ -291,12 +338,18 @@ def _materialize(
         eid = make_environment_id(e.name)
         existing = store.get_node(eid)
         if isinstance(existing, Environment):
-            tags = sorted(set(existing.tags) | set(e.tags))
-            description = existing.description if len(existing.description) > len(e.description) else e.description
+            node = dataclasses.replace(
+                existing,
+                description=(existing.description
+                             if len(existing.description) > len(e.description)
+                             else e.description),
+                tags=sorted(set(existing.tags) | set(e.tags)),
+            )
         else:
-            tags = sorted(set(e.tags))
-            description = e.description
-        store.add_node(Environment(id=eid, name=e.name, description=description, tags=tags))
+            node = Environment(
+                id=eid, name=e.name, description=e.description,
+                tags=sorted(set(e.tags)))
+        store.add_node(node)
         environment_name_to_id[e.name] = eid
         created_node_ids.append(eid)
 
@@ -329,6 +382,48 @@ def _materialize(
     # Edge construction — evidence carried in the edge's data blob.
     edge_count = 0
 
+    def _add_supported_edge(
+        src: str, dst: str, relation: Relation, evidence: str,
+    ) -> None:
+        """Upsert a many-paper claim without erasing corroboration.
+
+        The edge table intentionally has one row per (src, dst, relation),
+        so claim-level provenance belongs in a `supports` list inside the
+        data blob. Legacy single-source fields remain mirrored for older
+        readers, while new readers can keep citation and evidence aligned.
+        """
+        existing_data: dict[str, Any] = {}
+        for old_edge, other in store.neighbors(
+                src, relation=relation, direction="out"):
+            if other == dst:
+                existing_data = dict(old_edge.data or {})
+                break
+        by_paper: dict[str, str] = {}
+        for support in existing_data.get("supports", []) or []:
+            if not isinstance(support, dict):
+                continue
+            pid = str(support.get("source_paper_id") or "")
+            if pid:
+                by_paper[pid] = str(support.get("evidence") or "")
+        legacy_pid = str(existing_data.get("source_paper_id") or "")
+        if legacy_pid:
+            by_paper.setdefault(
+                legacy_pid, str(existing_data.get("evidence") or ""))
+        if evidence or paper.id not in by_paper:
+            by_paper[paper.id] = evidence
+        supports = [
+            {"source_paper_id": pid, "evidence": ev}
+            for pid, ev in sorted(by_paper.items())
+        ]
+        store.add_edge(Edge(
+            src=src, dst=dst, relation=relation,
+            data={
+                "evidence": by_paper.get(paper.id, evidence),
+                "source_paper_id": paper.id,
+                "supports": supports,
+            },
+        ))
+
     # Paper INTRODUCES Technique
     technique_evidence = {t.name: t.evidence for t in payload.techniques if _good_evidence(t.evidence)}
     for rel in payload.paper_to_technique:
@@ -348,11 +443,9 @@ def _materialize(
         fid = _lookup_failure_mode(rel.failure_mode)
         if not (tid and fid):
             continue
-        store.add_edge(Edge(
-            src=tid, dst=fid, relation=Relation.ADDRESSES,
-            data={"evidence": failure_evidence.get(rel.failure_mode, ""),
-                  "source_paper_id": paper.id},
-        ))
+        _add_supported_edge(
+            tid, fid, Relation.ADDRESSES,
+            failure_evidence.get(rel.failure_mode, ""))
         edge_count += 1
 
     # Technique USES RewardComponent
@@ -362,11 +455,9 @@ def _materialize(
         rid = _lookup_reward_component(rel.reward_component)
         if not (tid and rid):
             continue
-        store.add_edge(Edge(
-            src=tid, dst=rid, relation=Relation.USES,
-            data={"evidence": rc_evidence.get(rel.reward_component, ""),
-                  "source_paper_id": paper.id},
-        ))
+        _add_supported_edge(
+            tid, rid, Relation.USES,
+            rc_evidence.get(rel.reward_component, ""))
         edge_count += 1
 
     # Paper EVALUATES_ON Environment
@@ -441,6 +532,9 @@ def extract_all(
     store: SculptorKG | None = None,
     force: bool = False,
     limit: int | None = None,
+    paper_ids: set[str] | None = None,
+    tier: str | None = None,
+    tags: set[str] | None = None,
     progress_cb: "Callable[[int, int, str], None] | None" = None,
 ) -> list[ExtractionResult]:
     """Run extraction over every Paper in the store.
@@ -458,16 +552,21 @@ def extract_all(
     store = store or SculptorKG()
     results: list[ExtractionResult] = []
     try:
-        try:
-            import anthropic
-            client = anthropic.Anthropic()
-        except Exception as e:
-            raise RuntimeError(
-                "anthropic client failed to initialize — set ANTHROPIC_API_KEY "
-                f"or install `anthropic`. ({type(e).__name__}: {e})"
-            ) from e
-
         papers: list[Paper] = store.find_nodes(kind=Paper.kind)  # type: ignore[assignment]
+        if paper_ids is not None:
+            present_ids = {p.id for p in papers}
+            for missing_id in sorted(paper_ids - present_ids):
+                results.append(ExtractionResult(
+                    paper_id=missing_id,
+                    error="selected campaign Paper is absent from this store"))
+            papers = [p for p in papers if p.id in paper_ids]
+        if tier:
+            papers = [p for p in papers
+                      if (p.tier or "").upper() == tier.upper()]
+        if tags:
+            wanted = {t.strip().lower() for t in tags if t.strip()}
+            papers = [p for p in papers
+                      if wanted.issubset({t.lower() for t in p.tags})]
         # Extract unextracted first, then (if force) re-extract already-extracted.
         papers.sort(key=lambda p: (p.extracted, p.arxiv_id))
 
@@ -483,6 +582,18 @@ def extract_all(
         skipped_before = [p for p in papers if not (force or not p.extracted)]
         for p in skipped_before:
             results.append(ExtractionResult(paper_id=p.id, skipped=True))
+
+        client = None
+        if work_queue:
+            try:
+                import anthropic
+                client = anthropic.Anthropic()
+            except Exception as e:
+                raise RuntimeError(
+                    "anthropic client failed to initialize — set "
+                    "ANTHROPIC_API_KEY or install `anthropic`. "
+                    f"({type(e).__name__}: {e})"
+                ) from e
 
         done = 0
         for p in work_queue:
@@ -510,10 +621,56 @@ def extract_all(
 
 
 # ── CLI entry (invoked via `sculpt kg extract --all`) ───────────────────────
-def cli_extract_all(store_path: Path | None, force: bool, limit: int | None, print_one: bool) -> int:
+def paper_ids_from_seeds(
+    seeds_path: Path | str,
+    *,
+    tier: str | None = None,
+    tag: str | None = None,
+) -> set[str]:
+    """Select exact Paper IDs from a structured campaign seeds file."""
+    import yaml
+    from sculptor.kg.ingest import _normalize_arxiv_id
+
+    doc = yaml.safe_load(Path(seeds_path).read_text(encoding="utf-8")) or {}
+    entries = doc.get("papers") or []
+    if not isinstance(entries, list):
+        raise ValueError("seeds `papers` must be a list")
+    wanted_tier = tier.upper() if tier else None
+    wanted_tag = tag.lower() if tag else None
+    out: set[str] = set()
+    for entry in entries:
+        if isinstance(entry, str):
+            if not wanted_tier and not wanted_tag:
+                out.add(make_paper_id(_normalize_arxiv_id(entry)))
+            continue
+        if not isinstance(entry, dict):
+            continue
+        if wanted_tier and str(entry.get("tier") or "").upper() != wanted_tier:
+            continue
+        entry_tags = {str(t).lower() for t in (entry.get("tags") or [])}
+        if wanted_tag and wanted_tag not in entry_tags:
+            continue
+        aid = entry.get("arxiv_id") or entry.get("id")
+        if aid:
+            out.add(make_paper_id(_normalize_arxiv_id(str(aid))))
+    return out
+
+
+def cli_extract_all(
+    store_path: Path | None,
+    force: bool,
+    limit: int | None,
+    print_one: bool,
+    *,
+    paper_ids: set[str] | None = None,
+    tier: str | None = None,
+    tags: set[str] | None = None,
+) -> int:
     store = SculptorKG(store_path) if store_path else SculptorKG()
     try:
-        results = extract_all(store=store, force=force, limit=limit)
+        results = extract_all(
+            store=store, force=force, limit=limit,
+            paper_ids=paper_ids, tier=tier, tags=tags)
     finally:
         store.close()
 

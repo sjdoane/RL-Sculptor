@@ -34,7 +34,7 @@ from __future__ import annotations
 from typing import Any, Optional, Union
 
 import numpy as np
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from sculptor.eval.joint_resolver import resolve_joint_roles, select_joints
 
@@ -44,6 +44,17 @@ _BEHAVIOR = {"max_episode_steps": T, "rollout_num_envs": E, "step_dt": DT}
 _VALID_AXES = ("pitch", "roll", "yaw")
 _BURST_WIN = 5
 _HOP_WIN = 20
+
+# §fold-and-return primitive: a single 0→1→0 arc over the whole rollout (dips at
+# mid, returns to start). The pelvis follows base_height − fold_depth·_FOLD_ARC and
+# `fold`-mode groups follow offset + amplitude·_FOLD_ARC IN PHASE, so a squat /
+# toe-touch / deep bow / floor-touch-and-rise renders as a coherent DOWN-AND-UP cycle.
+# The arc is forced-symmetric (start == end), so this is for true dip-AND-RETURN goals
+# ONLY — a one-way height change (sit-to-stand) is a base_height_m [start,end] ramp,
+# not a fold. Byte-for-byte the dip-and-return that metric_validate._selectivity_probe
+# (C1) scores, so the task-derived calibration ladder and the L0 validation probe
+# agree on what a fold competence looks like (the real toe-touch metric scores ≈0.83).
+_FOLD_ARC = (1.0 - np.cos(2.0 * np.pi * np.arange(T) / T)) / 2.0
 
 
 # ── the motion vocabulary (what the blind author fills) ──────────────
@@ -59,13 +70,29 @@ class RoleQuery(BaseModel):
     axes: list[Optional[str]] = Field(default_factory=lambda: ["pitch", None])
     sides: Optional[list[str]] = None
 
+    @field_validator("axes", mode="before")
+    @classmethod
+    def _coerce_axes(cls, v):
+        """§round-13: the blind gaming/ladder author commonly emits `axes: null`
+        (a whole-set null, not a list of nulls). The strict `list[Optional[str]]`
+        type REJECTS that, raising a ValidationError that drops the ENTIRE
+        GamingArchetypeSet — which made the adversarial gate fail OPEN (ran=False
+        → not enforced → false grant). Coerce a top-level null to the default
+        (pitch + single-DOF) so one malformed field degrades to the default, never
+        nukes the whole set; a stray scalar is wrapped into a 1-element list."""
+        if v is None:
+            return ["pitch", None]
+        if isinstance(v, (str, type(None))):
+            return [v]
+        return v
+
 
 class Group(BaseModel):
     """A coordinated set of joints in one motion mode."""
 
     name: str = "g"
     role_query: RoleQuery = Field(default_factory=RoleQuery)
-    mode: str = "oscillate"            # oscillate | burst | hold
+    mode: str = "oscillate"            # oscillate | burst | hold | fold
     amplitude_rad: float = 0.0
     period_frames: int = 25
     phase: float = 0.0
@@ -96,6 +123,8 @@ class MotionSpec(BaseModel):
     lateral_speed_mps: float = 0.0     # [-2,2]
     hop_height_m: float = 0.0          # [0,0.6]
     hop_count: int = 0                 # [0,8]
+    fold_depth_m: float = 0.0          # [0,0.6] pelvis DIP-AND-RETURN depth (squat/
+    #                                    toe-touch/deep bow/floor-touch); 0 = no fold
     groups: list[Group] = Field(default_factory=list)
     coordination: list[Coordination] = Field(default_factory=list)
     tremor: float = 0.0                # [0,2] high-freq jitter (degeneracy)
@@ -180,7 +209,12 @@ def render_rung(
 ) -> tuple[dict, dict, dict]:
     """Render one rung spec to (arrays, behavior, meta). Pure-numpy,
     deterministic given (spec, rung_index). Never raises — bad fields clamp,
-    unknown targets drop (recorded in meta)."""
+    unknown targets drop (recorded in meta).
+
+    A `fold_depth_m` rung dips the pelvis and returns (the inverse of a hop) and a
+    `fold`-mode group flexes its joints and returns IN PHASE — the dip-and-return a
+    monotone `_ramp` base_height cannot express, so a squat / toe-touch / deep bow
+    metric can rank a competence ladder and earn steer-rights."""
     J = len(joint_names)
     t = np.arange(T)
     jp = np.zeros((T, E, J))
@@ -190,9 +224,19 @@ def render_rung(
     up = _ramp(spec.uprightness, 0.0, 1.0)
     g = _upright_gravity(up)
 
-    # root: height (+ hops) and travel.
+    # root: height (− fold dip, + hops) and travel.
     root = np.zeros((T, E, 3))
     root[..., 2] = _ramp(spec.base_height_m, 0.0, 1.2)[:, None]
+    # §fold: a single pelvis dip that returns to start (the INVERSE of a hop —
+    # base_height is a monotone ramp, so a fold needs its own primitive). Applied
+    # before the hop block so a (rare) fold+hop composes; a fold task has hop_count
+    # 0, so this is byte-identical for every non-fold rung (fold_depth_m default 0).
+    fd = _clip(spec.fold_depth_m, 0.0, 0.6)
+    if fd > 0:
+        root[..., 2] -= (fd * _FOLD_ARC)[:, None]
+        # a pelvis can't dip below the floor: clamp ≥0 so a deep fold from a low base
+        # height degrades to a physical posture, never a negative z (degrade-to-safe).
+        root[..., 2] = np.clip(root[..., 2], 0.0, None)
     hh = _clip(spec.hop_height_m, 0.0, 0.6)
     hc = int(_clip(spec.hop_count, 0, 8))
     if hh > 0 and hc > 0:
@@ -257,6 +301,14 @@ def render_rung(
                 s0 = c * bp + 10
                 for i in idxs:
                     burst_jv[s0:s0 + _BURST_WIN, :, i] += peak
+        elif gr.mode == "fold":
+            # flex one direction and return, IN PHASE with the pelvis dip (the same
+            # 0→1→0 arc): off → off+amp at mid → off — a fold/squat/toe-touch/bow
+            # posture (joint ROM = amplitude_rad). phase/spread/period are
+            # intentionally unused: a fold is one synchronized posture arc over the
+            # whole rollout, not a periodic motion, so it stays coherent with the dip.
+            for i in idxs:
+                jp[:, :, i] += (off + amp * _FOLD_ARC)[:, None]
 
     # degradation: tremor (high-freq, on group joints or whole body) + noise.
     tremor = _clip(spec.tremor, 0.0, 2.0)

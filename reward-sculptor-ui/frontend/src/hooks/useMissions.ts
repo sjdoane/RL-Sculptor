@@ -4,19 +4,29 @@ import {
   createMission,
   deleteMission,
   getMission,
+  getStageEnvSpec,
+  getStageIterations,
+  getStageSelection,
   listMissions,
+  postBackfillFitness,
+  regenerateStageMetric,
   runMission,
   type RunMissionRequestBody,
 } from "@/lib/api";
 import { qk } from "@/lib/queryKeys";
 import type {
+  BackfillFitnessResponse,
   CreateMissionRequest,
   DeleteMissionResponse,
+  JobDetail,
   JobSummary,
   MissionDetail,
   MissionJobKind,
   MissionLifecycleStatus,
   MissionSummary,
+  StageEnvSpec,
+  StageIteration,
+  StageSelectionReport,
 } from "@/lib/types";
 
 const MISSION_LIST_POLL_MS = 5000;
@@ -52,6 +62,94 @@ export function useMission(
         : ["mission", "_none"],
     queryFn: () => getMission(slug!, missionSlug!),
     enabled,
+  });
+}
+
+/** §Ship 20 (de-siloing): disk-truth iterations for ANY stage — not
+ *  just the live/current one. Optionally polls while the stage is
+ *  actively training so new iters surface. */
+export function useStageIterations(
+  slug: string | undefined,
+  missionSlug: string | undefined,
+  stageName: string | undefined,
+  opts?: { enabled?: boolean; refetchIntervalMs?: number | null },
+) {
+  const enabled =
+    !!slug && !!missionSlug && !!stageName && (opts?.enabled ?? true);
+  return useQuery<StageIteration[]>({
+    queryKey:
+      slug && missionSlug && stageName
+        ? qk.stageIters(slug, missionSlug, stageName)
+        : ["stageIters", "_none"],
+    queryFn: () => getStageIterations(slug!, missionSlug!, stageName!),
+    enabled,
+    refetchInterval:
+      typeof opts?.refetchIntervalMs === "number" && opts.refetchIntervalMs > 0
+        ? opts.refetchIntervalMs
+        : false,
+  });
+}
+
+/** §Ship 20 (de-siloing): the stage's applied env curriculum. Used to
+ *  detect reference-RSI (`current.meta.source` startsWith "reference:"). */
+export function useStageEnvSpec(
+  slug: string | undefined,
+  missionSlug: string | undefined,
+  stageName: string | undefined,
+  opts?: { enabled?: boolean },
+) {
+  const enabled =
+    !!slug && !!missionSlug && !!stageName && (opts?.enabled ?? true);
+  return useQuery<StageEnvSpec>({
+    queryKey:
+      slug && missionSlug && stageName
+        ? qk.stageEnvSpec(slug, missionSlug, stageName)
+        : ["stageEnvSpec", "_none"],
+    queryFn: () => getStageEnvSpec(slug!, missionSlug!, stageName!),
+    enabled,
+    staleTime: 30_000,
+    retry: false,
+  });
+}
+
+/** §selection-report UI: the stage's keep-best decision report — why
+ *  this iteration (or none) got kept, and the per-candidate ranking
+ *  that led there. Cheap disk read; staleTime matches useStageEnvSpec. */
+export function useStageSelection(
+  slug: string | undefined,
+  missionSlug: string | undefined,
+  stageName: string | undefined,
+  opts?: { enabled?: boolean },
+) {
+  const enabled =
+    !!slug && !!missionSlug && !!stageName && (opts?.enabled ?? true);
+  return useQuery<StageSelectionReport>({
+    queryKey:
+      slug && missionSlug && stageName
+        ? qk.stageSelection(slug, missionSlug, stageName)
+        : ["stageSelection", "_none"],
+    queryFn: () => getStageSelection(slug!, missionSlug!, stageName!),
+    enabled,
+    staleTime: 30_000,
+    retry: false,
+  });
+}
+
+/** §selection-report UI: recover fitness from run logs for every
+ *  iteration on disk missing it (a stage that finished before objective
+ *  fitness was recorded live). 409s while a mission job is running —
+ *  callers should catch `ApiError` and check `.status === 409`.
+ *  Invalidates every stage's iterations + selection report for this
+ *  mission on success, since backfill can touch more than one stage. */
+export function useBackfillFitness(slug: string) {
+  const qc = useQueryClient();
+  return useMutation<BackfillFitnessResponse, Error, string>({
+    mutationFn: (missionSlug) => postBackfillFitness(slug, missionSlug),
+    onSuccess: (_result, missionSlug) => {
+      qc.invalidateQueries({ queryKey: ["stageIters", slug, missionSlug] });
+      qc.invalidateQueries({ queryKey: ["stageSelection", slug, missionSlug] });
+      qc.invalidateQueries({ queryKey: qk.projectIters(slug) });
+    },
   });
 }
 
@@ -168,5 +266,26 @@ export function useDeleteMission(slug: string) {
       qc.invalidateQueries({ queryKey: qk.missions(slug) });
       qc.removeQueries({ queryKey: qk.mission(slug, missionSlug) });
     },
+  });
+}
+
+/** §mission-persistence increment 2: user-triggered regen of one
+ *  stage's steering metric. Note `active_job_kind` on the mission
+ *  summary/detail is strictly "mission_decompose" | "mission_execute"
+ *  on the backend — a `mission_stage_metric_regen` job never appears
+ *  there, so (unlike useCreateMission/useRunMission) this mutation
+ *  does NOT optimistically flip active_job_id to open the mission WS.
+ *  Callers should poll the returned job_id via useJob and invalidate
+ *  the mission query on terminal (see StageCard). */
+export interface RegenerateStageMetricVariables {
+  missionSlug: string;
+  stageName: string;
+  nCandidates?: number;
+}
+
+export function useRegenerateStageMetric(slug: string) {
+  return useMutation<JobDetail, Error, RegenerateStageMetricVariables>({
+    mutationFn: ({ missionSlug, stageName, nCandidates }) =>
+      regenerateStageMetric(slug, missionSlug, stageName, { nCandidates }),
   });
 }

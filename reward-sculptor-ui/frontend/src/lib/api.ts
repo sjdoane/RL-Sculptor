@@ -32,23 +32,56 @@ import type {
   TechniqueSummary,
 } from "./types";
 
+type FastApiValidationIssue = {
+  loc?: unknown;
+  msg?: unknown;
+};
+
+/** Convert RFC-7807/FastAPI error details into text that is safe to render.
+ * FastAPI's 422 payload uses an array of objects even though the public UI
+ * contract is a string. Passing that raw array to Sonner makes React attempt
+ * to render the objects and can unmount the entire application. */
+export function formatProblemDetail(detail: unknown, fallback: string): string {
+  if (typeof detail === "string" && detail.trim()) return detail;
+  if (Array.isArray(detail)) {
+    const issues = detail.map((raw) => {
+      if (raw == null || typeof raw !== "object") return String(raw);
+      const issue = raw as FastApiValidationIssue;
+      const path = Array.isArray(issue.loc)
+        ? issue.loc
+            .filter((part) => part !== "body" && part !== "query" && part !== "path")
+            .map((part) => String(part).replaceAll("_", " "))
+            .join(" › ")
+        : "";
+      const message = typeof issue.msg === "string" ? issue.msg : "Invalid value";
+      return path ? `${path}: ${message}` : message;
+    }).filter(Boolean);
+    if (issues.length) return issues.join("; ");
+  }
+  if (detail != null && typeof detail === "object") {
+    const message = (detail as { msg?: unknown }).msg;
+    if (typeof message === "string" && message.trim()) return message;
+    try {
+      return JSON.stringify(detail);
+    } catch {
+      // Fall through to the endpoint's stable title.
+    }
+  }
+  return fallback || "Request failed";
+}
+
 export class ApiError extends Error {
   status: number;
   type: string;
   problem: ProblemDetail;
   constructor(problem: ProblemDetail) {
-    // FastAPI 422s put an ARRAY of validation errors in `detail` —
-    // stringify it so toasts don't render "[object Object]".
-    super(
-      typeof problem.detail === "string" && problem.detail
-        ? problem.detail
-        : problem.detail != null && typeof problem.detail === "object"
-          ? JSON.stringify(problem.detail)
-          : problem.title,
-    );
+    const detail = formatProblemDetail(problem.detail, problem.title);
+    super(detail);
     this.status = problem.status;
     this.type = problem.type;
-    this.problem = problem;
+    // Preserve endpoint-specific fields (for example `missing_stages`) while
+    // ensuring every caller sees a render-safe textual detail.
+    this.problem = { ...problem, detail };
     this.name = "ApiError";
   }
 }
@@ -217,6 +250,12 @@ export interface IterationSettings {
   seed?: number | null;
   early_stop_enabled?: boolean | null;
   early_stop_patience?: number | null;
+  // §Selection statistics: multi-seed eval, progress-tie noise band,
+  // fresh-seed re-eval of the kept best, hack-income screen toggle.
+  eval_seeds?: number | null;
+  progress_epsilon?: number | null;
+  fresh_eval_seeds?: number | null;
+  hack_income_screen?: boolean | null;
 }
 
 export interface ProjectSettings {
@@ -705,6 +744,29 @@ export function clipUrl(
   return `/api/projects/${slug}/runs/${runId}/clips/iter_${iterIndex}.mp4`;
 }
 
+// ── Policies (trained checkpoints + deployment-bundle export) ─────────
+import type { PolicySummary } from "./types";
+
+/** Disk-backed list of exportable trained iterations. Pass `runId` only
+ *  for mission stage runs (their iters live in the stage's own tree). */
+export async function listPolicies(
+  slug: string, runId?: string,
+): Promise<PolicySummary[]> {
+  const q = runId ? `?run_id=${encodeURIComponent(runId)}` : "";
+  return handle<PolicySummary[]>(
+    await fetch(`/api/projects/${slug}/policies${q}`),
+  );
+}
+
+/** Download URL for a policy deployment bundle (zip: checkpoint + ONNX/
+ *  TorchScript + reward/env-spec/config snapshots + DEPLOY.md). */
+export function policyExportUrl(
+  slug: string, iterIndex: number, runId?: string,
+): string {
+  const q = runId ? `?run_id=${encodeURIComponent(runId)}` : "";
+  return `/api/projects/${slug}/policies/${iterIndex}/export${q}`;
+}
+
 // ── Missions (Ship 18a) ──────────────────────────────────────────────
 import type {
   CreateMissionRequest,
@@ -756,6 +818,21 @@ export interface RunMissionRequestBody {
   // or "gen:<id>") + observe/steer mode.
   fitness_metric?: string | null;
   fitness_mode?: "observe" | "steer";
+  // §MISSION_RUN_PARITY: per-launch knobs mirrored from NewRunDialog,
+  // applied uniformly to every stage. blank/undefined = inherited config.
+  edit_candidates?: number | null;
+  rollout_episodes?: number | null;
+  max_episode_steps?: number | null;
+  playback_speed?: number | null;
+  render_width?: number | null;
+  render_height?: number | null;
+  fitness_patience?: number | null;
+  num_envs_override?: number | null;
+  device_override?: string | null;
+  // §mission-persistence increment 2: one-shot bypass of the
+  // `stage_metric_required` 409 guard for this launch only. Does not
+  // mutate the persisted run_defaults.
+  proceed_blind?: boolean;
 }
 
 export async function runMission(
@@ -791,9 +868,160 @@ export function missionEventsWsUrl(
   return `${scheme}://${window.location.host}/ws/projects/${slug}/missions/${missionSlug}/events`;
 }
 
+// ── Stage de-siloing (disk-truth iterations + env spec) ───────────────
+import type { StageEnvSpec, StageIteration } from "./types";
+
+/** GET .../stages/{stage}/iterations — every iteration on disk for a
+ *  stage, regardless of which stage the live UI is scoped to. */
+export async function getStageIterations(
+  slug: string, missionSlug: string, stageName: string,
+): Promise<StageIteration[]> {
+  return handle<StageIteration[]>(
+    await fetch(
+      `/api/projects/${slug}/missions/${missionSlug}/stages/${encodeURIComponent(stageName)}/iterations`,
+    ),
+  );
+}
+
+/** Rollout mp4 URL for a specific stage iteration. */
+export function stageRolloutUrl(
+  slug: string, missionSlug: string, stageName: string, iterIndex: number,
+): string {
+  return `/api/projects/${slug}/missions/${missionSlug}/stages/${encodeURIComponent(stageName)}/iterations/${iterIndex}/rollout`;
+}
+
+/** Checkpoint download URL for a specific stage iteration. */
+export function stageCheckpointUrl(
+  slug: string, missionSlug: string, stageName: string, iterIndex: number,
+): string {
+  return `/api/projects/${slug}/missions/${missionSlug}/stages/${encodeURIComponent(stageName)}/iterations/${iterIndex}/checkpoint`;
+}
+
+/** Deployment-bundle (.zip) download URL for a stage iteration — the
+ *  checkpoint + ONNX + TorchScript + reward/env spec + DEPLOY.md. */
+export function stageExportUrl(
+  slug: string, missionSlug: string, stageName: string, iterIndex: number,
+): string {
+  return `/api/projects/${slug}/missions/${missionSlug}/stages/${encodeURIComponent(stageName)}/iterations/${iterIndex}/export`;
+}
+
+/** GET .../stages/{stage}/iterations/{i}/detail — reasoning behind a
+ *  finished iteration (diagnosis, cited papers, reward summary). */
+export async function getStageIterDetail(
+  slug: string, missionSlug: string, stageName: string, iterIndex: number,
+): Promise<import("./types").StageIterDetail> {
+  return handle(
+    await fetch(
+      `/api/projects/${slug}/missions/${missionSlug}/stages/${encodeURIComponent(stageName)}/iterations/${iterIndex}/detail`,
+    ),
+  );
+}
+
+/** GET .../stages/{stage}/metric — the stage's objective-metric record. */
+export async function getStageObjectiveMetric(
+  slug: string, missionSlug: string, stageName: string,
+): Promise<import("./types").StageObjectiveMetric> {
+  return handle(
+    await fetch(
+      `/api/projects/${slug}/missions/${missionSlug}/stages/${encodeURIComponent(stageName)}/metric`,
+    ),
+  );
+}
+
+/** GET .../stages/{stage}/selection — the stage's keep-best decision
+ *  report (disk-truth; synthesized from mission.json for stages that
+ *  predate live selection.json writing). */
+export async function getStageSelection(
+  slug: string, missionSlug: string, stageName: string,
+): Promise<import("./types").StageSelectionReport> {
+  return handle(
+    await fetch(
+      `/api/projects/${slug}/missions/${missionSlug}/stages/${encodeURIComponent(stageName)}/selection`,
+    ),
+  );
+}
+
+/** POST .../missions/{mission_slug}/backfill-fitness — recover fitness
+ *  from run logs for every iteration on disk that's missing it. 409s
+ *  while a mission job is live (see ApiError.status). */
+export async function postBackfillFitness(
+  slug: string, missionSlug: string,
+): Promise<import("./types").BackfillFitnessResponse> {
+  return handle(
+    await fetch(
+      `/api/projects/${slug}/missions/${missionSlug}/backfill-fitness`,
+      { method: "POST" },
+    ),
+  );
+}
+
+/** GET /projects/{slug}/iterations — disk-truth iteration list for the
+ *  PROJECT-level runs tree (plain sculpt runs). No JobManager entry
+ *  required, so it keeps working after a backend restart — the data
+ *  source for the synthetic "disk:project" run row. Same row shape as
+ *  the per-stage endpoint. */
+export async function getProjectIterations(
+  slug: string,
+): Promise<StageIteration[]> {
+  return handle<StageIteration[]>(
+    await fetch(`/api/projects/${slug}/iterations`),
+  );
+}
+
+/** Rollout mp4 URL for a project-level iteration (disk-truth; no
+ *  JobManager entry required, unlike iterRolloutUrl). */
+export function projectIterRolloutUrl(slug: string, iterIndex: number): string {
+  return `/api/projects/${slug}/iterations/${iterIndex}/rollout`;
+}
+
+/** Fresh held-out replay produced after best-policy selection. */
+export function projectFreshRolloutUrl(
+  slug: string, iterIndex: number, freshIndex: number,
+): string {
+  return `/api/projects/${slug}/iterations/${iterIndex}/fresh-rollouts/${freshIndex}`;
+}
+
+/** GET .../stages/{stage}/env-spec — the applied env curriculum for a
+ *  stage. `current.meta.source` starting "reference:" ⇒ RSI applied. */
+export async function getStageEnvSpec(
+  slug: string, missionSlug: string, stageName: string,
+): Promise<StageEnvSpec> {
+  return handle<StageEnvSpec>(
+    await fetch(
+      `/api/projects/${slug}/missions/${missionSlug}/stages/${encodeURIComponent(stageName)}/env-spec`,
+    ),
+  );
+}
+
+/** POST .../stages/{stage}/metric/regenerate — user-triggered
+ *  regeneration of one stage's steering metric. 202 JobDetail; 409 if
+ *  the mission has any other active mission-scoped job (decompose,
+ *  execute, a per-stage run, or another regenerate) in flight. */
+export async function regenerateStageMetric(
+  slug: string, missionSlug: string, stageName: string,
+  opts?: { nCandidates?: number },
+): Promise<JobDetail> {
+  // Default 2 candidates: a user clicking Regenerate is paying attention
+  // and wants it to LAND — live evidence (D28): single-candidate regens
+  // failed repeatedly on author-quality rolls (near-constant metric, then
+  // a forbidden-name loop) where a second candidate would have covered.
+  const body = { n_candidates: opts?.nCandidates ?? 2 };
+  return handle<JobDetail>(
+    await fetch(
+      `/api/projects/${slug}/missions/${missionSlug}/stages/${encodeURIComponent(stageName)}/metric/regenerate`,
+      {
+        method: "POST",
+        ...(body
+          ? { headers: { "content-type": "application/json" }, body: JSON.stringify(body) }
+          : {}),
+      },
+    ),
+  );
+}
+
 
 // ── Dashboard + System ───────────────────────────────────────────────
-import type { DashboardSummary, SystemInfo } from "./types";
+import type { ApiKeyStatus, DashboardSummary, SystemInfo } from "./types";
 
 export async function getDashboard(): Promise<DashboardSummary> {
   return handle<DashboardSummary>(await fetch("/api/dashboard"));
@@ -801,6 +1029,16 @@ export async function getDashboard(): Promise<DashboardSummary> {
 
 export async function getSystemInfo(): Promise<SystemInfo> {
   return handle<SystemInfo>(await fetch("/api/system/info"));
+}
+
+export async function putAnthropicApiKey(apiKey: string): Promise<ApiKeyStatus> {
+  return handle<ApiKeyStatus>(
+    await fetch("/api/system/api-key", {
+      method: "PUT",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ api_key: apiKey }),
+    }),
+  );
 }
 
 // ── §Ship 35: auto-generated objective metrics ────────────────────────
@@ -818,13 +1056,20 @@ export async function getMetricGenProgress(slug: string): Promise<MetricGenProgr
 
 export async function generateProjectMetric(
   slug: string,
-  body: { behavior_goal: string; review?: boolean; calibrate_against?: string | null },
+  body: { behavior_goal: string; review?: boolean; n_candidates?: number;
+          calibrate_against?: string | null },
 ): Promise<MetricSummary> {
+  // Each candidate is a ~1-2 min LLM call plus validate/review/regenerate
+  // retries, so budget generously — but DO time out: a dropped connection or
+  // wedged backend used to leave this promise pending forever, freezing the
+  // "Generating…" spinner in NewRunDialog with no way out.
+  const timeoutMs = 5 * 60_000 * Math.max(1, body.n_candidates ?? 1);
   return handle<MetricSummary>(
     await fetch(`/api/projects/${slug}/metrics/generate`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
+      signal: AbortSignal.timeout(timeoutMs),
     }),
   );
 }
@@ -835,5 +1080,290 @@ export async function calibrateProjectMetric(
   return handle<MetricSummary>(
     await fetch(`/api/projects/${slug}/metrics/${metricId}/calibrate?against=${encodeURIComponent(against)}`,
       { method: "POST" }),
+  );
+}
+
+// ── Reports (project-runs vs per-mission) ─────────────────────────────
+import type { ReportsSources } from "./types";
+
+export async function getReportsSources(slug: string): Promise<ReportsSources> {
+  return handle<ReportsSources>(
+    await fetch(`/api/projects/${slug}/reports/sources`),
+  );
+}
+
+// ── Saved missions (durable disk archive) ─────────────────────────────
+import type { SavedEntryDetail, SavedEntrySummary } from "./types";
+
+export async function listSaved(): Promise<SavedEntrySummary[]> {
+  return handle<SavedEntrySummary[]>(await fetch("/api/saved"));
+}
+
+export async function getSaved(entryId: string): Promise<SavedEntryDetail> {
+  return handle<SavedEntryDetail>(
+    await fetch(`/api/saved/${encodeURIComponent(entryId)}`),
+  );
+}
+
+/** URL for an archived file (mp4 / md) under a saved entry. `relpath`
+ *  is a "/"-joined path from the manifest (e.g. a stage video); each
+ *  segment is encoded but the slashes are preserved. */
+export function savedFileUrl(entryId: string, relpath: string): string {
+  const encoded = relpath.split("/").map(encodeURIComponent).join("/");
+  return `/api/saved/${encodeURIComponent(entryId)}/file/${encoded}`;
+}
+
+/** DELETE /saved/{id} — moves the entry to Trash (kind="saved"),
+ *  recoverable from Settings → Trash. Returns 204. */
+export async function deleteSaved(entryId: string): Promise<void> {
+  await handle<void>(
+    await fetch(`/api/saved/${encodeURIComponent(entryId)}`, {
+      method: "DELETE",
+    }),
+  );
+}
+
+/** POST /projects/{slug}/missions/{ms}/save — schedule a mission_save
+ *  job (202 JobDetail). `pinned` maps stage name → iters to force-keep. */
+export async function saveMission(
+  slug: string, missionSlug: string,
+  body?: { pinned?: Record<string, number[]> },
+): Promise<JobDetail> {
+  const init: RequestInit = { method: "POST" };
+  if (body && body.pinned && Object.keys(body.pinned).length > 0) {
+    init.headers = { "content-type": "application/json" };
+    init.body = JSON.stringify({ pinned: body.pinned });
+  }
+  return handle<JobDetail>(
+    await fetch(`/api/projects/${slug}/missions/${missionSlug}/save`, init),
+  );
+}
+
+// ── Trash (recoverable deletes) ───────────────────────────────────────
+import type { TrashEntry } from "./types";
+
+export async function listTrash(): Promise<TrashEntry[]> {
+  return handle<TrashEntry[]>(await fetch("/api/trash"));
+}
+
+export async function restoreTrash(entryId: string): Promise<void> {
+  await handle<void>(
+    await fetch(`/api/trash/${encodeURIComponent(entryId)}/restore`, {
+      method: "POST",
+    }),
+  );
+}
+
+/** Permanent delete. The backend requires `confirm` to equal the
+ *  entry_id as a fat-finger guard, so the UI echoes it. */
+export async function purgeTrash(entryId: string): Promise<void> {
+  await handle<void>(
+    await fetch(
+      `/api/trash/${encodeURIComponent(entryId)}?confirm=${encodeURIComponent(entryId)}`,
+      { method: "DELETE" },
+    ),
+  );
+}
+
+// ── Reference library (R1) ─────────────────────────────────────────────
+import type {
+  ComposeResult,
+  ComposeSegment,
+  RefDetail,
+  RefIndexRow,
+  RefMatch,
+} from "./types";
+
+/** GET /references?robot=&q=&k=&llm= — search hits, ranked. `useLlm`
+ *  defaults to false: the UI's as-you-type path stays deterministic
+ *  (zero API cost, no rerank latency); pass true for an explicit
+ *  "rerank with Claude" affordance if one is ever added. */
+export async function searchReferences(
+  query: string,
+  opts?: { robot?: string; k?: number; useLlm?: boolean },
+): Promise<RefMatch[]> {
+  const u = new URL("/api/references", window.location.origin);
+  u.searchParams.set("q", query);
+  u.searchParams.set("robot", opts?.robot ?? "g1");
+  u.searchParams.set("k", String(opts?.k ?? 10));
+  u.searchParams.set("llm", opts?.useLlm ? "1" : "0");
+  return handle<RefMatch[]>(await fetch(u.pathname + u.search));
+}
+
+/** GET /references (no q) — the slim index listing. Used for the
+ *  picker's empty-query state ("browse everything"). */
+export async function listReferences(opts?: { robot?: string }): Promise<RefIndexRow[]> {
+  const u = new URL("/api/references", window.location.origin);
+  u.searchParams.set("robot", opts?.robot ?? "g1");
+  return handle<RefIndexRow[]>(await fetch(u.pathname + u.search));
+}
+
+/** POST /references/compose — build ONE novel clip out of spans of several
+ *  already-solved clips. This is the path for a goal whose motion exists in
+ *  no single clip: its phases were each recorded, just never together.
+ *  The result registers at tier K and is NOT certified; the response carries
+ *  the seam measurements so the caller can judge it before spending a
+ *  tracking run on it. */
+export async function composeReference(body: {
+  clip_id: string;
+  robot?: string;
+  segments: ComposeSegment[];
+  text?: string;
+  labels?: string[];
+  blend_s?: number;
+  strict?: boolean;
+}): Promise<ComposeResult> {
+  return handle<ComposeResult>(
+    await fetch("/api/references/compose", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  );
+}
+
+export async function getReference(clipId: string): Promise<RefDetail> {
+  return handle<RefDetail>(
+    await fetch(`/api/references/${encodeURIComponent(clipId)}`),
+  );
+}
+
+/** Preview keyframe-strip PNG URL. No existence check here — the
+ *  backend 404s cleanly when a clip has no preview.png; callers should
+ *  hide the <img> on error (see ReferencePickerDialog). */
+export function getReferencePreviewUrl(clipId: string): string {
+  return `/api/references/${encodeURIComponent(clipId)}/preview`;
+}
+
+/** POST .../stages/{stage}/reference body {clip_id} — attach a
+ *  reference clip to a stage. 409 if mission-scoped jobs are live (same
+ *  guard family as regenerateStageMetric). Returns the updated mission. */
+export async function attachStageReference(
+  slug: string, missionSlug: string, stageName: string, clipId: string,
+): Promise<MissionDetail> {
+  return handle<MissionDetail>(
+    await fetch(
+      `/api/projects/${slug}/missions/${missionSlug}/stages/${encodeURIComponent(stageName)}/reference`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ clip_id: clipId }),
+      },
+    ),
+  );
+}
+
+/** DELETE .../stages/{stage}/reference — detach. Same 409 guard. */
+export async function detachStageReference(
+  slug: string, missionSlug: string, stageName: string,
+): Promise<MissionDetail> {
+  return handle<MissionDetail>(
+    await fetch(
+      `/api/projects/${slug}/missions/${missionSlug}/stages/${encodeURIComponent(stageName)}/reference`,
+      { method: "DELETE" },
+    ),
+  );
+}
+
+// ── Worlds (environment authoring, item 5) ─────────────────────────────
+import type {
+  WorldApplyRequest,
+  WorldApplyResponse,
+  WorldAuthorRequest,
+  WorldAuthorResponse,
+  WorldLineageEntry,
+  WorldSelection,
+} from "./types";
+
+export async function authorWorld(
+  slug: string, body: WorldAuthorRequest,
+): Promise<WorldAuthorResponse> {
+  return handle<WorldAuthorResponse>(
+    await fetch(`/api/projects/${slug}/worlds/author`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  );
+}
+
+export async function applyWorldAuthor(
+  slug: string, body: WorldApplyRequest,
+): Promise<WorldApplyResponse> {
+  return handle<WorldApplyResponse>(
+    await fetch(`/api/projects/${slug}/worlds/author/apply`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  );
+}
+
+export async function getWorldSelection(slug: string): Promise<WorldSelection> {
+  return handle<WorldSelection>(
+    await fetch(`/api/projects/${slug}/worlds/selection`),
+  );
+}
+
+export async function getWorldLineage(
+  slug: string,
+): Promise<WorldLineageEntry[]> {
+  return handle<WorldLineageEntry[]>(
+    await fetch(`/api/projects/${slug}/worlds/lineage`),
+  );
+}
+
+export async function getWorldValidate(
+  slug: string,
+): Promise<import("./types").WorldValidateResult> {
+  return handle<import("./types").WorldValidateResult>(
+    await fetch(`/api/projects/${slug}/worlds/validate`),
+  );
+}
+
+export async function getWorldCurriculum(
+  slug: string,
+): Promise<import("./types").WorldCurriculum> {
+  return handle<import("./types").WorldCurriculum>(
+    await fetch(`/api/projects/${slug}/worlds/curriculum`),
+  );
+}
+
+export async function getWorldScene(
+  slug: string,
+): Promise<import("./types").WorldScene> {
+  return handle<import("./types").WorldScene>(
+    await fetch(`/api/projects/${slug}/worlds/scene`),
+  );
+}
+
+export async function editWorldVariations(
+  slug: string,
+  body: { edits: { variation_id: string;
+    distribution: Record<string, unknown>; rationale?: string }[] },
+): Promise<import("./types").WorldVariationEditResult> {
+  return handle<import("./types").WorldVariationEditResult>(
+    await fetch(`/api/projects/${slug}/worlds/variations`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(120_000),
+    }),
+  );
+}
+
+/** Gated dry-run of an authoring session (build loop). The gate chain
+ *  runs a real MuJoCo compile server-side — allow it a generous client
+ *  timeout rather than failing a slow first compile. */
+export async function previewWorldDraft(
+  slug: string, body: WorldApplyRequest,
+): Promise<import("./types").WorldDraftPreview> {
+  return handle<import("./types").WorldDraftPreview>(
+    await fetch(`/api/projects/${slug}/worlds/author/preview`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+      signal: AbortSignal.timeout(120_000),
+    }),
   );
 }

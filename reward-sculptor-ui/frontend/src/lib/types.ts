@@ -156,6 +156,17 @@ export interface RewardRef {
   citation: string;
 }
 
+export interface RewardComposition {
+  type: string;
+  reference_clip_id: string | null;
+  reference_target_sha256: string | null;
+  tracking_weight: number;
+  residual_max: number;
+  phase_mode?: "loop" | "hold" | string;
+  phase_duration_s?: number;
+  root_height_frame?: "episode_relative" | string;
+}
+
 export interface RewardSpec {
   version: string;
   parent_hash: string;
@@ -163,6 +174,7 @@ export interface RewardSpec {
   description: string;
   hyperparameters: Record<string, number>;
   references: RewardRef[];
+  composition?: RewardComposition | null;
   /** Map of `hparam_name → citation-or-justification` — the KG-grounding
    *  mandate from 2026-04-22. Empty for pre-mandate rewards.
    *  SpecPanel renders this alongside hyperparameters so Sam can audit
@@ -269,6 +281,7 @@ export interface KGStats {
   reward_components: number;
   environments: number;
   results: number;
+  run_cases: number;
   edges: number;
   embeddings: number;
 }
@@ -335,6 +348,11 @@ export interface RunParamsPayload {
   playback_speed?: number | null;
   render_every?: number | null;
   rollout_fps?: number | null;
+  // Rollout video resolution; null = runner default (1280×720). Render
+  // cost is resolution-independent, so high-res is the sane default.
+  render_width?: number | null;
+  render_height?: number | null;
+  render_env_index?: number | null;
   rollout_episodes?: number | null;
   seed?: number | null;
   auto_adjust_physics?: boolean | null;
@@ -342,13 +360,16 @@ export interface RunParamsPayload {
   early_stop_enabled?: boolean | null;
   early_stop_patience?: number | null;
   // §Ship 34/35 — objective fitness-in-the-loop. A built-in spec name
-  // (go1_trot / g1_kick / g1_jump / g1_floss / cartpole_balance) or a generated
+  // (including capability-driven object_lift_hold) or a generated
   // metric id ("gen:<id>"); null = the blind loop. §Ship 42: the sentinel
   // "generate-at-launch" defers generation to the run's first phase (see
   // run_manager LAUNCH_GEN_SENTINEL).
   fitness_metric?: string | null;
   // observe = compute + display only (no influence); steer = drives the loop.
   fitness_mode?: "observe" | "steer";
+  // §best-of-N: candidates to sample for a generate-at-launch metric (1 =
+  // single-shot). Only used when fitness_metric === "generate-at-launch".
+  metric_n_candidates?: number;
   // §Ship 48: patience for the fitness-plateau early stop (the LIVE early
   // stop on a steered run; the early_stop_* fields above are a no-op for it).
   // null → sculpt default (2). The UI sends 4 for hard exploratory skills.
@@ -356,6 +377,16 @@ export interface RunParamsPayload {
   // §Ship 39 (H1): interactive start mode. "manual" pauses for human feedback
   // at each iteration boundary (the UI default); "auto" runs straight through.
   start_mode?: "manual" | "auto";
+  // Explicit recovery path: restore reward + env inputs from the last promoted
+  // atomic world tuple before the resumed sculpt process starts.
+  resume_exact_tuple?: boolean;
+  // Explicit policy-only recovery. The backend resolves this iteration to a
+  // non-empty checkpoint inside this project's runs directory.
+  warm_start_iteration?: number | null;
+  // Optional pre-existing motion. The exact robot namespace is paired with
+  // the clip id so the backend never resolves from a fallback embodiment.
+  reference_clip_id?: string | null;
+  reference_robot?: string | null;
 }
 
 /** §Ship 39 (H1): the interactive control sidecar state (PATCH response). */
@@ -373,7 +404,8 @@ export type SpecMetricName =
   | "g1_floss"
   | "g1_jump"
   | "g1_kick"
-  | "go1_trot";
+  | "go1_trot"
+  | "object_lift_hold";
 
 /** §Ship 35: an auto-generated objective metric (per project), referenced
  *  in a run as fitness_metric = "gen:<id>". Observe-only until calibrated. */
@@ -387,7 +419,16 @@ export interface MetricSummary {
   gates?: Record<string, boolean> | null;
   reasons?: string[] | null;
   archetype_scores?: Record<string, number> | null;
+  validator_basis?: string | null;
+  abstract_objective_program?: string[] | null;
+  channel_catalog_hash?: string | null;
   calibration?: { ok?: boolean; spearman?: number; builtin?: string } | null;
+  // §best-of-N: how many candidates were sampled + which one won (with its
+  // offline discrimination). null/1 for the single-shot path.
+  n_candidates?: number | null;
+  selected_candidate?: number | null;
+  candidates?: { candidate: number; ok: boolean; discrimination?: number;
+                 reasons?: string[] }[] | null;
   source?: string | null;
   recorded_at?: string | null;
 }
@@ -407,6 +448,7 @@ export const SPEC_METRIC_NAMES: SpecMetricName[] = [
   "g1_jump",
   "g1_kick",
   "go1_trot",
+  "object_lift_hold",
 ];
 
 // Extend RunSummary / RunDetail with the new Phase-6 classification
@@ -484,6 +526,14 @@ export interface IterEventSummary {
   // §Ship 48: edits deferred for requires_env_extension this iter (the
   // diagnoser wants a field the adapter doesn't expose). null when none.
   env_extension_suggestion?: EnvExtensionSuggestionPayload | null;
+  // §env generalization: the diagnoser's env-curriculum change applied
+  // at this iter's boundary (takes effect NEXT iter's training). null
+  // until an iter proposes env edits.
+  env_spec_update?: {
+    new_version: string | null;
+    applied: string[];
+    rejected: Array<{ parameter: string; reason: string }>;
+  } | null;
   // Populated by `iter_progress` events emitted from inside the mjlab
   // training subprocess. Lets the Timeline panel render a live progress
   // bar for the running iter instead of a silent "running" spinner.
@@ -498,6 +548,10 @@ export interface IterEventSummary {
   // runs (no --fitness-metric).
   fitness?: number | null;
   best_fitness?: number | null;
+  // §Convergence loop 1: dense sub-success progress (metric progress_score,
+  // 0-1) — ranks iterations below the completion gate. Undefined when the
+  // metric doesn't emit it.
+  progress?: number | null;
 }
 
 export interface RunSummary {
@@ -536,6 +590,17 @@ export interface RunDetail extends RunSummary {
   iterations: IterEventSummary[];
   stdout_tail: string[];
   total_event_count: number;
+}
+
+/** One exportable trained iteration (GET /projects/{slug}/policies).
+ *  Disk-backed — survives backend restarts, unlike RunSummary rows. */
+export interface PolicySummary {
+  iter_index: number;
+  checkpoint: string; // "checkpoint.pt" | "checkpoint.zip"
+  checkpoint_bytes: number;
+  primary_metric: number | null;
+  fitness: number | null;
+  reward_version: string | null;
 }
 
 /** Every event the WS stream emits. The frontend switches on
@@ -592,6 +657,12 @@ export interface SystemInfo {
   cuda_device_names: string[];
 }
 
+export interface ApiKeyStatus {
+  configured: boolean;
+  masked: string | null;
+  persisted: boolean;
+}
+
 // ── GPU info (GET /system/gpu) ─────────────────────────────────────────
 export interface GpuDevice {
   index: number;
@@ -635,6 +706,7 @@ export interface SystemKgStatsResponse {
   reward_components: number;
   environments: number;
   results: number;
+  run_cases: number;
   edges: number;
   embeddings: number;
 }
@@ -680,6 +752,12 @@ export interface RewardDiagnosisPayload {
     rationale: string;
     suggested_value?: string | null;
     paper_refs?: string[];
+    // Per-arxiv_id grounding for `paper_refs` above: true if the KG
+    // actually showed that paper to the diagnoser this iteration,
+    // false if it was cited from recall (exists in the KG, not
+    // retrieved this iter). A key missing from this map (including on
+    // diagnosis.json files predating the tag) means unknown, not false.
+    paper_refs_grounded?: Record<string, boolean> | null;
     requires_env_extension?: boolean;
   }>;
   literature_context?: Array<{
@@ -687,6 +765,10 @@ export interface RewardDiagnosisPayload {
     description: string;
     paper_citation: string;
     relevance_score: number;
+    // literature_context is, by construction, what the KG retrieved and
+    // showed the diagnoser this iteration — true for current writers;
+    // absent on diagnoses predating the tag.
+    grounded?: boolean;
   }>;
   confidence?: number;
   iter_dir?: string | null;
@@ -855,7 +937,10 @@ export type StageStatus =
   | "training"
   | "succeeded"
   | "failed"
-  | "skipped";
+  | "skipped"
+  // §mission-persistence: replaced by redecomposition children; terminal,
+  // never runnable again, artifacts retained on disk.
+  | "superseded";
 
 export type MissionLifecycleStatus =
   | "ready"
@@ -889,6 +974,239 @@ export interface StageSchema {
   // display so it stays correct after the WS event window slides;
   // fall back to max_iterations only when null.
   effective_max_iterations: number | null;
+  // §Ship 20 (de-siloing): the iteration the stage actually KEPT as its
+  // policy, and why it was chosen. Both null until selection runs (a
+  // stage can be `succeeded` with these still null on older missions).
+  selected_iter_index?: number | null;
+  selection_source?:
+    | "criterion+fitness"
+    | "criterion_newest"
+    | "fitness_fallback"
+    | "last"
+    | string
+    | null;
+  // §mission-persistence: why the stage ended non-successfully
+  // ("criterion_not_met", "training_errored", "no_checkpoint", ...).
+  // Persisted on the stage going forward; enriched from provenance.json
+  // for older missions. Null when the stage hasn't failed.
+  failure_reason?: string | null;
+  failure_detail?: string | null;
+  // Per-stage objective metric ref (spec name / gen:<id> / path), if any.
+  steering_metric?: string | null;
+  // Server-computed hierarchical number: "1", "1.1", "1.2", "2", ... —
+  // replan children get parentLabel.N. Use this instead of array index
+  // or RunSummary.stage_index for user-facing numbering.
+  display_label?: string;
+  // True for stages reconstructed from an orphaned stages/<name>/ dir
+  // on disk (pre-fix destructive replan) rather than mission.json.
+  on_disk_only?: boolean;
+  // How this stage got (or failed to get) its objective metric.
+  metric_status?: "accepted" | "rejected" | "inherited" | "none" | null;
+  // §D28 F-SYNTH: derived (not mirrored from sculptor.mission.Stage) —
+  // "synthetic" when the accepted metric was certified against a
+  // last-resort synthesized exemplar (no matching reference clip;
+  // never steer-grade on its own — observe-grade until task-derived
+  // calibration), "reference" when a real reference_clip_id is
+  // attached with no synthetic exemplar, null otherwise.
+  exemplar_kind?: "reference" | "synthetic" | null;
+  // §R1 (reference library): attached reference clip, if any. Set via
+  // POST/DELETE .../stages/{stage}/reference (see lib/api.ts). tier and
+  // match_confidence are mirrored from the clip's provenance / the
+  // retrieval result at attach time — null when nothing is attached, or
+  // when attached without a confidence (deterministic-only match).
+  reference_clip_id?: string | null;
+  reference_tier?: string | null;
+  reference_match_confidence?: number | null;
+  // §D24 F1: the goal-aligned sub-span of reference_clip_id, when one
+  // was selected (docs/internal/REFERENCE_BUILD_LOG.md D23/D24). All
+  // four null together when no span applies (no clip attached, the
+  // goal covers the whole clip, or selection was declined) — the stage
+  // then certifies/trains against the FULL clip.
+  reference_span_start_s?: number | null;
+  reference_span_end_s?: number | null;
+  reference_span_confidence?: number | null;
+  reference_span_method?: string | null;
+  // §start_pose: the physical configuration the robot is in at THIS
+  // stage's episode start. null = unspecified (legacy missions, or a
+  // decomposer that omitted the field — NOT the same as "standing").
+  start_pose?:
+    | "supine"
+    | "prone"
+    | "sitting"
+    | "crouched"
+    | "standing"
+    | string
+    | null;
+}
+
+// ── Stage iterations (disk-truth, de-siloed) ─────────────────────────
+// GET /projects/{slug}/missions/{ms}/stages/{stage}/iterations → every
+// iteration that landed on disk for that stage, independent of which
+// stage the live UI is scoped to. Metrics are null until they land.
+export interface StageIteration {
+  iter_index: number;
+  primary_metric: number | null;
+  fitness: number | null;
+  has_rollout: boolean;
+  has_checkpoint: boolean;
+  reward_version: string | null;
+  // §D24 (F4): true when `<iter_dir>/fitness_contradiction.json` exists —
+  // this iter's success criterion evaluated True while the objective
+  // fitness was at/near zero (the D20 hollow-success / D23 exemplar-
+  // scope-mismatch pattern). `fitness_components` is the per-channel
+  // breakdown from that same flag file, for the badge's tooltip.
+  fitness_contradiction: boolean;
+  fitness_components: Record<string, number | boolean> | null;
+  // §selection-report UI: the loop's OWN steering score for this iter —
+  // `fitness` above is the plain objective fitness; `steer_fitness` is
+  // what actually drove keep-best when a realism/naturalness gate could
+  // veto credit (they diverge when the gate fired). `progress` is the
+  // dense per-iter progress signal (not the same scale as fitness).
+  steer_fitness: number | null;
+  progress: number | null;
+  // Naturalness/realism audit outcome for this iter, if the audit ran —
+  // e.g. "reset_launch_explosion". null when the audit didn't flag
+  // anything (or didn't run). `naturalness_hard_reject` is true when the
+  // flag was severe enough to zero out steering credit outright.
+  naturalness_flag: string | null;
+  naturalness_hard_reject: boolean;
+  // Where `fitness`/`steer_fitness` came from: "live" when the run wrote
+  // it directly, "log_backfill" when a later backfill pass recovered it
+  // from run logs after the fact, null when neither ran.
+  fitness_source: "live" | "log_backfill" | null;
+  /** Fresh held-out replay videos stored for selected-best evaluation. */
+  fresh_rollout_count: number;
+}
+
+// GET .../stages/{stage}/selection — the stage's keep-best decision
+// report, disk-truth. When `synthesized` is true, the report was
+// reconstructed from mission.json (older stages that predate live
+// selection.json writing) — `candidates[].criterion_pass` is always null
+// in that case since only the live writer knows what the criterion
+// evaluated to per-candidate at selection time. The backend model is
+// deliberately loose (`extra=allow`), so treat unlisted keys as possible.
+export interface StageSelectionCandidate {
+  iter_index: number;
+  criterion_pass: boolean | null;
+  criterion_error: string | null;
+  gate_mismatched: boolean;
+  fitness: number | null;
+  steer_fitness: number | null;
+  progress: number | null;
+  steer_progress: number | null;
+  primary_metric: number | null;
+  selected: boolean;
+}
+
+export interface StageSelectionReport {
+  synthesized: boolean;
+  schema: number;
+  stage: string;
+  recorded_at: string | null;
+  selected_iter_index: number | null;
+  selection_source: string | null;
+  criterion_ok: boolean | null;
+  criterion: string | null;
+  criterion_error: string | null;
+  start_state_mismatch: string | null;
+  failure_reason?: string | null;
+  failure_detail?: string | null;
+  gate: { skipped: boolean; checked: number; mismatched_count: number } | null;
+  candidates: StageSelectionCandidate[];
+}
+
+// POST .../missions/{mission_slug}/backfill-fitness → summary of a
+// disk-log fitness recovery pass. `stages` maps stage name to the count
+// of fitness.json files written for that stage this call — stages with
+// nothing to backfill are absent, not zero-valued. 409s while a mission
+// job is live.
+export interface BackfillFitnessResponse {
+  written: number;
+  skipped_existing: number;
+  no_iter_dir: number;
+  stages: Record<string, number>;
+}
+
+// ── Completed-stage per-iteration detail (disk-truth) ────────────────
+// GET .../stages/{stage}/iterations/{i}/detail → the reasoning behind a
+// finished iteration (diagnosis, cited papers, reward summary, component
+// values) so the Training tab's disk-truth pane is as rich as the live
+// pane. All fields best-effort from the iter dir; any may be null.
+export interface StageIterPaperRef {
+  arxiv_id?: string | null;
+  citation?: string | null;
+  description?: string | null;
+  // true: retrieved from the KG this iteration. false: cited by the
+  // diagnoser from recall (exists in the KG but wasn't retrieved this
+  // iter). null/undefined: unknown, or predates the grounding tag.
+  grounded?: boolean | null;
+}
+export interface StageIterDetail {
+  iter_index: number;
+  reward_version: string | null;
+  reward_description: string | null;
+  reward_references: StageIterPaperRef[];
+  primary_metric: number | null;
+  // Objective (steering) fitness the loop optimized this iter, if the
+  // metric wrote a structured value; otherwise null and the prose in
+  // `evidence` states it.
+  objective_fitness: number | null;
+  evidence: string | null;
+  confidence: number | null;
+  failure_modes: string[];
+  literature_context: StageIterPaperRef[];
+  // Mean value per reward component over the rollout, if available.
+  components: Record<string, number> | null;
+}
+
+// §R1 remainder (plan §9): one reference clip a stage's objective metric
+// was certified against. Mirrors backend/models/mission.py's
+// StageMetricReference — clip_id + the three per-reference gate verdicts
+// (reference_nondegeneracy / reference_monotonicity / reference_negatives).
+export interface StageMetricReference {
+  clip_id: string;
+  gates: Record<string, boolean>;
+}
+
+// GET .../stages/{stage}/metric → the stage's objective-metric record
+// (what was generated, whether the adversarial panel accepted it).
+export interface StageObjectiveMetric {
+  status: "accepted" | "rejected" | "inherited" | "none";
+  behavior_goal: string | null;
+  metric_source: string | null;
+  validation_passed: boolean | null;
+  review_summary: string | null;
+  n_candidates: number | null;
+  calibrated: boolean | null;
+  validator_basis: string | null;
+  abstract_objective_program: string[];
+  channel_catalog_hash: string | null;
+  references: StageMetricReference[];
+}
+
+// GET .../stages/{stage}/env-spec → the stage's applied env curriculum.
+// `current.meta.source` starting with "reference:" means RSI (reference-
+// state-init) was applied for this stage.
+export interface StageEnvSpecMeta {
+  behavior_goal?: string | null;
+  reasoning?: string | null;
+  source?: string | null;
+  version?: string | null;
+  [key: string]: unknown;
+}
+
+export interface StageEnvSpecCurrent {
+  env_spec_version?: number;
+  meta?: StageEnvSpecMeta;
+  shared?: Record<string, unknown>;
+  train?: Record<string, unknown>;
+  [key: string]: unknown;
+}
+
+export interface StageEnvSpec {
+  active?: boolean;
+  current?: StageEnvSpecCurrent | null;
+  versions?: string[];
 }
 
 export interface MissionSummary {
@@ -931,12 +1249,33 @@ export interface MissionRunDefaults {
   // or "gen:<id>") + observe/steer mode.
   fitness_metric?: string | null;
   fitness_mode?: "observe" | "steer";
+  // §MISSION_RUN_PARITY: per-launch knobs mirrored from NewRunDialog's
+  // stage-applicable set. All optional; blank = the stage's inherited
+  // config default. Applied uniformly to every stage.
+  edit_candidates?: number | null;
+  rollout_episodes?: number | null;
+  max_episode_steps?: number | null;
+  playback_speed?: number | null;
+  render_width?: number | null;
+  render_height?: number | null;
+  fitness_patience?: number | null;
+  num_envs_override?: number | null;
+  device_override?: string | null;
 }
 
 export interface CreateMissionRequest {
   goal: string;             // 8-2000 chars
   mission_slug?: string;    // optional override
   no_kg?: boolean;
+  // §MISSION_RUN_PARITY: per-stage trust-gated metric generation. Default
+  // ON; best-of-N candidates sampled per stage (1..4).
+  gen_stage_metrics?: boolean;
+  stage_metric_candidates?: number;
+  // §mission-persistence increment 2: when true, `POST .../run` 409s
+  // while any runnable stage lacks a steering metric, unless the run
+  // request sets `proceed_blind`. Persisted into `run_defaults` at
+  // creation time by the backend. Default false.
+  stage_metric_required?: boolean;
   // §Ship 21a: optional run-time defaults set via the NewMission
   // Dialog Advanced tab. Persisted on the mission so RunMissionDialog
   // can pre-fill on first open.
@@ -962,4 +1301,422 @@ export interface MissionEvent {
   //   stage_completed_training: { stage_name, iterations_run, ... }
   //   stage_redecomposed: { original_stage_name, sub_stage_names, ... }
   [key: string]: unknown;
+}
+
+// ── Saved missions (durable disk archive) ────────────────────────────
+// GET /saved → slim manifests; GET /saved/{id} → full manifest +
+// mission.json. Files (mp4 / md) are served from /saved/{id}/file/{relpath}.
+export interface SavedKeptCheckpoint {
+  iter: number;
+  bytes: number;
+  reason: string; // "best" | "final" | ...
+}
+
+/** Slim per-stage row in the /saved LIST projection. */
+export interface SavedStageSlim {
+  name: string;
+  status: string;
+  best_metric: number | null;
+  n_kept_checkpoints: number;
+}
+
+export interface SavedEntrySummary {
+  entry_id: string;
+  project_slug: string;
+  mission_slug: string;
+  goal: string;
+  created_at: string; // ISO-8601
+  stages: SavedStageSlim[];
+  total_bytes: number;
+  /** Relpath under the entry, served via /saved/{id}/file/{relpath}.
+   *  Often null. */
+  thumbnail_video: string | null;
+}
+
+/** Fuller per-stage section in the /saved/{id} DETAIL manifest. */
+export interface SavedStageDetail {
+  name: string;
+  status: string;
+  best_metric: number | null;
+  n_iters?: number;
+  /** Relpaths (served via the file endpoint), newest-last. */
+  videos: string[];
+  kept_checkpoints: SavedKeptCheckpoint[];
+}
+
+export interface SavedEntryDetail {
+  entry_id: string;
+  project_slug: string;
+  mission_slug: string;
+  goal: string;
+  created_at: string;
+  schema: number;
+  total_bytes: number;
+  dropped_bytes?: number;
+  source_mission_dir?: string;
+  stages: SavedStageDetail[];
+  // The archived mission.json (open shape; stages carry selection info).
+  mission_json?: Record<string, unknown>;
+}
+
+// ── Reports (project-runs vs per-mission) ────────────────────────────
+// GET /projects/{slug}/reports/sources → what can be built/viewed as a
+// report. `project_runs` is the standalone-run report; each mission is
+// its own buildable/viewable source.
+export interface ReportMissionSource {
+  mission_slug: string;
+  goal: string;
+  lifecycle: MissionLifecycleStatus;
+  has_report: boolean;
+}
+
+export interface ReportsSources {
+  project_runs: { n_iters: number; has_report: boolean };
+  missions: ReportMissionSource[];
+}
+
+// ── Trash (recoverable deletes) ──────────────────────────────────────
+// GET /trash → list of soft-deleted entries. A delete moves the entry
+// into a trash dir; restore moves it back, purge removes it for good.
+export interface TrashEntry {
+  entry_id: string;
+  kind: string;            // e.g. "project" | "mission" | "saved"
+  slug: string;
+  deleted_at: string;      // ISO-8601
+  size_bytes: number;
+  display_name: string;
+  /** True when the on-disk entry couldn't be introspected (corrupt /
+   *  partial). Restore is still allowed; the UI flags it. */
+  unreadable?: boolean;
+}
+
+// ── Shared stage selection (de-silo, Ship 20+) ────────────────────────
+// A stage selection shared across the Overview / Rewards / Training tabs
+// on ProjectDetail, URL-synced as `?stage=missionSlug/stageName`. Lives
+// here (not in pages/ProjectDetail) so components like RobotViewer and
+// RunsTab can import the type without a circular import back into the
+// page module.
+export interface SelectedStage {
+  missionSlug: string;
+  stageName: string;
+}
+
+// ── Reference library (R1) ───────────────────────────────────────────
+// GET /references?robot=&q=&k=&llm= — a retrieval search hit. Mirrors
+// sculptor's RefMatch dataclass (refs/retrieve.py) 1:1.
+export interface RefMatch {
+  clip_id: string;
+  text: string;
+  score: number;
+  /** 0-1 confidence from the optional LLM rerank pass; null when the
+   *  search ran deterministic-only (llm=0, the UI's as-you-type default,
+   *  or the LLM rerank failed and fell back). */
+  match_confidence: number | null;
+  /** One-line LLM rationale; null on the deterministic-only path. */
+  reason: string | null;
+  tier: string;
+  license: string;
+  n_frames: number;
+  fps: number;
+  duration_s: number;
+}
+
+// GET /references (no q) — slim index row. Also the shape of the
+// GET /references/{clip_id} detail's `index` field.
+export interface RefIndexRow {
+  clip_id: string;
+  robot: string;
+  text: string;
+  labels: string[];
+  tier: string;
+  license: string;
+  n_frames: number;
+  fps: number;
+  duration_s: number;
+  root_z_range: [number, number] | null;
+  has_preview: boolean;
+}
+
+// POST /references/compose — one span of one already-registered clip.
+export interface ComposeSegment {
+  clip_id: string;
+  t_start_s?: number | null;
+  t_end_s?: number | null;
+  label?: string | null;
+}
+
+// Per-seam discontinuity measured on the composed clip. This is the number
+// that decides whether a composite is worth a tracking run, so it is shown
+// rather than reduced to a pass/fail badge.
+export interface ComposeSeam {
+  frame: number;
+  time_s: number;
+  max_joint_jump_rad?: number;
+  mean_joint_jump_rad?: number;
+  root_z_jump_m?: number;
+}
+
+export interface ComposeQc {
+  n_frames: number;
+  duration_s: number;
+  n_sources: number;
+  root_z_range: [number, number] | null;
+  composition: {
+    seams: ComposeSeam[];
+    peak_joint_vel_rad_s: number | null;
+    peak_root_vel_z_m_s: number | null;
+    duration_s: number;
+  };
+}
+
+export interface ComposeResult {
+  clip_id: string;
+  robot: string;
+  tier: string;
+  /** Always false on creation — refs.track certification is the only
+   *  thing that promotes a composite past kinematics. */
+  certified: boolean;
+  license: string;
+  attribution: string;
+  parent_clip_ids: string[];
+  qc: ComposeQc;
+  next_step: string;
+}
+
+// GET /references/{clip_id} — provenance.json content + the index row.
+export interface RefDetail {
+  index: RefIndexRow;
+  provenance: Record<string, unknown>;
+}
+
+// ── Worlds (environment authoring, item 5) ─────────────────────────────
+export interface WorldClarificationChoice {
+  choice_id: string;
+  label: string;
+  [extra: string]: unknown;
+}
+
+export interface WorldSystemDefault {
+  choice_id: "system_default";
+  resolves_to: string;
+  label: string;
+  reason: string;
+}
+
+export interface WorldClarificationQuestion {
+  question_id: string;
+  parameter_path: string;
+  prompt: string;
+  choices: WorldClarificationChoice[];
+  default_choice_id: string;
+  default_reason: string;
+  system_default: WorldSystemDefault;
+}
+
+export interface WorldClarificationPage {
+  page: number;
+  questions: WorldClarificationQuestion[];
+}
+
+export interface WorldClarificationPlan {
+  version: number;
+  draft_hash: string;
+  question_set_hash: string;
+  pages: WorldClarificationPage[];
+}
+
+export interface WorldAuthorRequest {
+  prompt: string;
+  robot_capability_id?: string | null;
+  kg_grounding?: boolean;
+}
+
+export interface WorldAuthorResponse {
+  session_id: string;
+  draft_hash: string;
+  capability_id: string;
+  /** The project's configured robot as a capability id (null when no
+   *  capability descriptor maps to it) + whether the draft matches it. */
+  project_capability_id: string | null;
+  robot_matches_project: boolean | null;
+  clarification_plan: WorldClarificationPlan;
+  underspecification_report: {
+    defaulted_load_bearing_paths: string[];
+    [extra: string]: unknown;
+  };
+  kg_grounding: string[];
+}
+
+export interface WorldApplyRequest {
+  session_id: string;
+  answers: { question_id: string; choice_id: string }[];
+}
+
+export interface WorldApplyResponse {
+  ok: boolean;
+  session_id: string;
+  capability_id: string;
+  result_hash: string;
+  evaluation_lineage: string;
+  selection: { selection_version: number; tuple_hash: string;
+    [extra: string]: unknown };
+  admission: { ok: boolean; [extra: string]: unknown };
+  clarification_answers: number;
+  [extra: string]: unknown;
+}
+
+export interface WorldSelection {
+  selection: { selection_version: number; tuple_hash: string;
+    evaluation_lineage: string; [extra: string]: unknown };
+  world_meta: { version?: string; parent?: string | null; prompt?: string;
+    grounding?: string[]; [extra: string]: unknown };
+  task_meta: { [extra: string]: unknown };
+  shared_summary: {
+    terrain_kind: string | null;
+    objects: string[];
+    zones: string[];
+    course_elements: number;
+    /** Per-element-type counts (e.g. {platform: 3, gap: 2}) — gaps are
+     *  spacing elements with no geometry, so the total can exceed what
+     *  the rendered scene shows as solids. */
+    course_breakdown: Record<string, number>;
+    robot: string | null;
+    project_capability_id: string | null;
+    robot_matches_project: boolean | null;
+  };
+  goal: { [extra: string]: unknown };
+  train_variations: {
+    id: string; target: string; class: string;
+    distribution: { [extra: string]: unknown };
+  }[];
+  clarifications: {
+    answer_sources: Record<string, number>;
+    answers: {
+      question_id: string | null;
+      parameter_path: string | null;
+      choice_id: string | null;
+      source: string | null;
+      value: unknown;
+    }[];
+  };
+}
+
+export interface WorldLineageEntry {
+  selection_version: number;
+  created_at: number;
+  tuple_hash: string;
+  evaluation_lineage: string;
+  refs: Record<string, { version: string | number | null }>;
+  eval_model_hash: string | null;
+}
+
+export interface WorldValidateResult {
+  ok: boolean;
+  selection_version: number | null;
+  tuple_hash: string | null;
+  errors: string[];
+}
+
+export interface WorldCurriculumIteration {
+  iter: number;
+  mean_level: number | null;
+  max_level: number | null;
+  num_envs: number | null;
+  histogram: Record<string, number> | null;
+}
+
+export interface WorldCurriculum {
+  run: string | null;
+  iterations: WorldCurriculumIteration[];
+}
+
+// ── World scene graph (interactive 3D viewer) ──────────────────────────
+export interface WorldSceneGeom {
+  name: string;
+  body: string;
+  type: string; // plane | hfield | sphere | capsule | ellipsoid | cylinder | box | mesh
+  size: number[];
+  pos: number[];
+  quat: number[]; // [w, x, y, z]
+  rgba: number[];
+  group: number;
+  entity_kind: string; // course_element | robot | terrain | object | zone
+  entity_id: string;
+  mesh?: string;
+  hfield?: string;
+}
+
+export interface WorldSceneSite {
+  name: string;
+  type: string;
+  size: number[];
+  pos: number[];
+  quat: number[];
+  rgba: number[];
+  entity_kind: string;
+  entity_id: string;
+}
+
+export interface WorldSceneEntity {
+  kind: string;
+  id: string;
+  label: string;
+  element?: string;
+  params: Record<string, unknown>;
+  variations: {
+    id: string; target: string; class: string;
+    distribution: Record<string, unknown>;
+  }[];
+  geoms: string[];
+  sites?: string[];
+  /** Synthetic translucent box for geometry-less elements (gaps). */
+  marker?: { pos: number[]; size: number[] };
+}
+
+export interface WorldScene {
+  selection_version?: number;
+  tuple_hash?: string;
+  meshes: Record<string, { vertices: number[]; faces: number[] }>;
+  hfields: Record<string, {
+    nrow: number; ncol: number; size: number[]; data: number[];
+  }>;
+  geoms: WorldSceneGeom[];
+  sites: WorldSceneSite[];
+  entities: WorldSceneEntity[];
+}
+
+export interface WorldVariationEditResult {
+  applied: {
+    variation_id: string;
+    old_distribution: Record<string, unknown>;
+    new_distribution: Record<string, unknown>;
+    rationale: string;
+  }[];
+  rejected: { variation_id: string; reason: string }[];
+  selection: { selection_version: number;
+    [extra: string]: unknown } | null;
+  world_version: string | null;
+}
+
+export interface WorldDraftPreview {
+  ok: boolean;
+  session_id: string;
+  result_hash: string;
+  admission: {
+    ok: boolean;
+    gates: {
+      gate: string; ok: boolean;
+      violations: { code: string; message: string;
+        [extra: string]: unknown }[];
+    }[];
+  };
+  scene: WorldScene | null;
+  summary: {
+    robot: string | null;
+    terrain_kind: string | null;
+    course_elements: number;
+    course_breakdown: Record<string, number>;
+    objects: string[];
+    zones: string[];
+  };
 }

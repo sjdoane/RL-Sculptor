@@ -72,9 +72,10 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+from sculptor.llm import log_llm_call, model_for, response_text_blocks
 from sculptor.prompts import load_prompt
 
-MODEL_ID = "claude-opus-4-7"
+MODEL_ID = model_for("eureka_baseline")
 #: Eureka samples at temperature 1.0 for candidate diversity (the SDK
 #: default is also 1.0; recorded via the TEMPERATURE attr convention).
 TEMPERATURE = 1.0
@@ -123,6 +124,10 @@ def _sample_candidate(
         system=system_prompt,
         messages=[{"role": "user", "content": user_content}],
     )
+    log_llm_call(
+        "eureka_baseline", model, system=system_prompt, user=user_content,
+        response_text=response_text_blocks(resp),
+        usage=getattr(resp, "usage", None))
     chunks = [
         block.text for block in resp.content
         if getattr(block, "type", "") == "text"

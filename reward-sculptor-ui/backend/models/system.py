@@ -81,5 +81,8 @@ class SystemKgStatsResponse(BaseModel):
     reward_components: int = 0
     environments: int = 0
     results: int = 0
+    #: §2026-07-03: the KG case-memory — this system's own recorded run
+    #: experience (one node per learned iteration).
+    run_cases: int = 0
     edges: int = 0
     embeddings: int = 0

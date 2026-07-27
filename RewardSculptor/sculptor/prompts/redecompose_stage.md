@@ -46,7 +46,9 @@ hopefully softened enough for it to succeed.
       "max_iterations":     <int 1..50>,
       "parent_stage":       <null or earlier sub-stage name>,
       "reward_seed_prompt": "<NL reward spec, 3-2000 chars>",
-      "kg_seed_papers":     ["<arxiv_id>", ...]
+      "kg_seed_papers":     ["<arxiv_id>", ...],
+      "needs_reference_rsi": <true for ballistic/airborne sub-stages OR a non-standing start state — see rule 10>,
+      "start_pose":         <"supine" | "prone" | "sitting" | "crouched" | "standing" | null — see rule 11>
     },
     ...
   ]
@@ -83,9 +85,28 @@ hopefully softened enough for it to succeed.
    original criterion. Don't soften the final criterion — soften the
    PATH to it.
 
+5b. **Sub-stages must be pairwise DISTINCT and must not re-learn a
+   sibling.** Each sub-stage must differ from every other sub-stage (and
+   from every already-SUCCEEDED mission stage) in its start state or its
+   end state — never emit two sub-stages whose descriptions could apply
+   to the same rollout. If an already-succeeded stage covers a
+   sub-skill (e.g. drive-to-stand already trained), do NOT emit a
+   sub-stage that re-learns it: warm-start from it via `parent_stage`
+   and extend. Prefer the MINIMUM ladder — live feedback (2026-07-13):
+   a 4-rung redecomposition contained two near-identical crouch-to-stand
+   rungs plus a rung duplicating a succeeded sibling, tripling the
+   training cost of one sub-skill.
+
 6. **Last sub-stage's goal_text** should clearly accomplish the
    original goal (use similar verbs and domain nouns). It does NOT
    need to be byte-identical — Claude may reword for clarity.
+   **No invented numeric thresholds in any sub-stage's `goal_text`**
+   (same rule as decompose rule 11): describe behavior qualitatively
+   and say what the sub-stage does NOT do; a guessed number propagates
+   into the criterion, metric, and reference-span selection (live D23:
+   an invented "root above ~0.35 m" made a correct floor-sit score
+   zero by construction). Numbers only if copied from a provided
+   reference signature for the motion THIS sub-stage covers.
 
 7. **Each sub-stage's `reward_seed_prompt`** must describe a reward
    that is EXPLICITLY SIMPLER than the failed stage's reward. State
@@ -106,16 +127,87 @@ hopefully softened enough for it to succeed.
    re-validated — an out-of-contract key in ANY sub-stage's criterion
    rejects the whole redecomposition.
    - **`base_height`, `fallen`, and other runtime info-dict keys are NOT
-     persisted.** Derive base height from
-     `trajectory['root_link_pos_w'][..., 2]` and an upright/fallen proxy
-     from `trajectory['projected_gravity_b'][..., 2]` (≈ -1 = upright).
+     persisted.** For base/root HEIGHT use `trajectory['root_height']` (a
+     1-D per-step root z aligned with `rewards`) — NEVER
+     `root_link_pos_w[..., 2]`, which is the `(T, E)` grid over ALL envs and
+     makes `.any()` fire on transient auto-reset teleport spikes. Derive an
+     upright/fallen proxy from `trajectory['projected_gravity_b'][..., 2]`
+     (≈ -1 = upright).
    - **`components[<name>]` must be a term THIS sub-stage's
      `reward_seed_prompt` actually defines.** If unsure a component is
      emitted, use the soft form `components.get('<name>', 0.0)` so a
      missing term reads as "not satisfied" rather than failing the stage.
+   - **Anti-chaos: a bare reach clause is not a success criterion.** A
+     documented real failure (D29): a criterion using
+     `(trajectory['root_height'] > 0.15).any() and
+     (trajectory['projected_gravity_b'][..., 2] < -0.2).any() and
+     behavior['mean_episode_length'] > 100` was satisfied by a physics
+     EXPLOSION that tumbled through every height and orientation on its
+     way — a chaotic/tumbling rollout passes through EVERY height and
+     EVERY orientation at some point, so a bare `.any()` reach clause
+     is trivially chaos-satisfiable. Pair every `.any()`-shaped reach
+     clause with EITHER a **sustained** condition (`.mean() > <frac>`
+     instead of `.any()`) OR an explicit **start-away** condition
+     (also require e.g. `trajectory['root_height'][0] < <below-
+     target>`, so reaching the band is a change of state, not where
+     the sub-stage began). "A criterion an explosion can satisfy is
+     not a success criterion." Also: `behavior['mean_episode_length']
+     > <n>` is NOT evidence of success on a sub-stage whose
+     `start_pose` (rule 11) is non-standing — those sub-stages train
+     WITHOUT fall-termination, so the episode runs full length
+     regardless of what happens, including an explosion that never
+     recovers.
 
 9. **KG seed papers** restricted to the provided slice (same as
    decompose_task's hard rule 6).
+
+10. **Reference-state initialization (`needs_reference_rsi`).** Set
+    `needs_reference_rsi: true` on a sub-stage in EITHER of two cases —
+    ITS core skill involves ballistic/airborne states the policy cannot
+    reach until it has already learned the skill (jump launch, flight,
+    landing, aerial recovery), OR ITS `start_pose` (rule 11) is anything
+    other than `"standing"` (a lying/sitting/crouched episode start is
+    UNTRAINABLE from the env's default standing reset, same as
+    decompose_task rule 9's non-standing case). The orchestrator then
+    starts a fraction of that sub-stage's TRAINING episodes inside those
+    states (heights + vertical velocities / postures from a validated
+    reference trajectory, paired with the required sunk-height
+    termination). Evaluation rollouts are never affected. Keep it
+    `false` for grounded, standing-start sub-stages (standing, crouching-
+    while-upright, walking, kicking): needless RSI wastes training
+    resets on states the sub-stage doesn't need. Decide PER SUB-STAGE —
+    a re-decomposition of an airborne stage typically splits ONE hard
+    stage into a grounded precursor (RSI false) plus a later airborne
+    sub-stage (RSI true); a re-decomposition of a get-up stage typically
+    keeps RSI true across every sub-stage (each is still a non-standing
+    start, just progressively closer to upright) — do NOT blanket-
+    inherit the parent stage's value either way, decide from each
+    sub-stage's own `goal_text`/`start_pose`. This is DeepMimic's RSI
+    result (same as decompose_task rule 9). NOTE: if the ORIGINAL failed
+    stage had a stage-fixed eval reset on disk (a non-standing start WAS
+    already the task), the orchestrator OVERRIDES whatever you set here
+    and forces every sub-stage's `needs_reference_rsi: true` regardless
+    — a get-up sub-stage must never silently revert to a standing
+    default reset.
+
+11. **`start_pose` — the physical configuration THIS SUB-STAGE's episode
+    begins from.** One of `"supine"` (lying on back, face up), `"prone"`
+    (lying on front, face down), `"sitting"`, `"crouched"`, `"standing"`,
+    or `null`. Same vocabulary and derivation rule as `decompose_task`
+    rule 9/10: read it off THIS sub-stage's `goal_text`, not the
+    original failed stage's. **Sub-stages of a re-decomposed get-up
+    stage usually progress through DIFFERENT start poses** as the
+    softened curriculum works its way up — e.g. redecomposing a failed
+    `feet_under_crouch` stage might yield
+    `feet_under_crouch__r1_0` (`start_pose: "supine"`, a more forgiving
+    lower starting point) -> `feet_under_crouch__r1_1`
+    (`start_pose: "crouched"`) -> `feet_under_crouch__r1_2`
+    (`start_pose: "crouched"`, matching the original failed stage's
+    start so the byte-identical final `success_criterion` is evaluated
+    from the SAME start state it originally failed from). Decide PER
+    SUB-STAGE from that sub-stage's own `goal_text` — do NOT
+    blanket-copy the failed stage's `start_pose` onto every sub-stage
+    unless each sub-stage's goal genuinely begins there.
 
 ## Strategy guidance
 

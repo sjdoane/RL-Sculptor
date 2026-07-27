@@ -36,7 +36,10 @@ def test_prompt_includes_batched_block_when_supports_batched_true() -> None:
     contract = RewardContract(
         observation_space_spec=None,
         action_space_spec=None,
-        expected_info_keys=["episode_length", "terminated", "time_outs", "step_dt"],
+        expected_info_keys=[
+            "episode_length", "terminated", "time_outs", "step_dt",
+            "region__finish__relative",
+        ],
         expected_components=None,
         supports_batched=True,
         training_device="gpu",
@@ -46,6 +49,13 @@ def test_prompt_includes_batched_block_when_supports_batched_true() -> None:
             "qvel": (18,),
             "base_lin_vel_b": (3,),
             "command_vel": (3,),
+        },
+        info_schema={
+            "episode_length": (),
+            "terminated": (),
+            "time_outs": (),
+            "step_dt": (),
+            "region__finish__relative": (3,),
         },
     )
     diagnosis = _make_diagnosis()
@@ -78,6 +88,8 @@ def test_prompt_includes_batched_block_when_supports_batched_true() -> None:
     # training_device + supports_batched visible in contract header
     assert "supports_batched:   True" in prompt
     assert "training_device:    gpu" in prompt
+    assert '"region__finish__relative": [3]' in prompt
+    assert "Never reshape a vector-valued info channel to (N,)" in prompt
 
 
 def test_prompt_skips_batched_block_when_supports_batched_false() -> None:

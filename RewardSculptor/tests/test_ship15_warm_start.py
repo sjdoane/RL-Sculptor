@@ -12,6 +12,8 @@ Covers:
     reason="local_checkpoint_wins" when a resume-path checkpoint exists AND
     init_policy_path was set — so Ship-16 orchestrator can tell "warm-
     started" apart from "resumed an in-flight iter".
+  * UI-style resume finds the newest valid preceding policy even when reward
+    versioning leaves gaps in the outer-iteration directory sequence.
   * `sculpt_run` passes init_policy_path ONLY to iter 0 of the run.
   * The `_mjlab_runner` CLI's argparse accepts --load-pretrained-policy.
   * Integration: a real rsl_rl PPO load roundtrip on CPU with tiny dummy
@@ -190,6 +192,105 @@ def test_train_or_resume_forwards_init_policy_path_to_supporting_adapter(
     assert captured["init_policy_path"] == init_ckpt
 
 
+def test_train_or_resume_prefers_latest_valid_partial_policy(
+    tmp_path: Path, monkeypatch,
+):
+    """A restarted counter must not hide the newest valid recovery model."""
+    import os
+    import torch
+    from sculptor import sculpt as sculpt_mod
+
+    captured: dict = {}
+    adapter = _make_sculpt_adapter_with_kwarg(captured)
+    iter_dir = tmp_path / "iter_3"
+    logs = iter_dir / "logs"
+    logs.mkdir(parents=True)
+    torch.save({"model": "older"}, logs / "model_550.pt")
+    torch.save({"model": "old_high_counter"}, logs / "model_600.pt")
+    torch.save({"model": "newest_after_restart"}, logs / "model_50.pt")
+    os.utime(logs / "model_550.pt", ns=(1_000_000_000, 1_000_000_000))
+    os.utime(logs / "model_600.pt", ns=(2_000_000_000, 2_000_000_000))
+    os.utime(logs / "model_50.pt", ns=(3_000_000_000, 3_000_000_000))
+    previous_iter = tmp_path / "iter_2.pt"
+    previous_iter.write_bytes(b"stub")
+    events: list[dict] = []
+    monkeypatch.setattr(sculpt_mod, "_emit_event", events.append)
+
+    sculpt_mod._train_or_resume(
+        adapter=adapter, iter_index=3, iter_dir=iter_dir,
+        reward_module_path=tmp_path / "v3.py", steps=750, seed=45,
+        init_policy_path=previous_iter,
+    )
+
+    assert captured["init_policy_path"] == logs / "model_50.pt"
+    recovered = [e for e in events if e.get("type") == "partial_train_recovered"]
+    assert recovered == [{
+        "type": "partial_train_recovered",
+        "iter": 3,
+        "checkpoint": str(logs / "model_50.pt"),
+        "superseded_warm_start": str(previous_iter),
+    }]
+
+
+def test_train_or_resume_skips_corrupt_newest_partial_policy(
+    tmp_path: Path,
+):
+    """A torn newest save falls back to the preceding parseable checkpoint."""
+    import torch
+    from sculptor.sculpt import _train_or_resume
+
+    captured: dict = {}
+    adapter = _make_sculpt_adapter_with_kwarg(captured)
+    iter_dir = tmp_path / "iter_1"
+    logs = iter_dir / "logs"
+    logs.mkdir(parents=True)
+    torch.save({"model": "valid"}, logs / "model_100.pt")
+    (logs / "model_150.pt").write_bytes(b"torn")
+
+    _train_or_resume(
+        adapter=adapter, iter_index=1, iter_dir=iter_dir,
+        reward_module_path=tmp_path / "v1.py", steps=200, seed=43,
+    )
+
+    assert captured["init_policy_path"] == logs / "model_100.pt"
+
+
+def test_latest_preceding_policy_crosses_reward_version_gap(tmp_path: Path):
+    """A v3 -> v5 prompt edit must warm-start iter_5 from iter_3."""
+    import torch
+    from sculptor.sculpt import _latest_preceding_policy
+
+    runs = tmp_path / "runs"
+    iter_3 = runs / "iter_3"
+    iter_3.mkdir(parents=True)
+    checkpoint = iter_3 / "checkpoint.pt"
+    torch.save({"model": "competent"}, checkpoint)
+    # `iter_4` intentionally does not exist.  An empty current iteration is
+    # realistic after the UI has pinned its tuple but before training starts.
+    (runs / "iter_5").mkdir()
+
+    assert _latest_preceding_policy(runs, before_iter=5) == checkpoint
+
+
+def test_latest_preceding_policy_skips_corrupt_newer_checkpoint(
+    tmp_path: Path,
+):
+    """Resume searches backward until a checkpoint satisfies integrity."""
+    import torch
+    from sculptor.sculpt import _latest_preceding_policy
+
+    runs = tmp_path / "runs"
+    older = runs / "iter_2"
+    older.mkdir(parents=True)
+    valid = older / "checkpoint.pt"
+    torch.save({"model": "valid"}, valid)
+    newer = runs / "iter_4"
+    newer.mkdir()
+    (newer / "checkpoint.pt").write_bytes(b"torn")
+
+    assert _latest_preceding_policy(runs, before_iter=5) == valid
+
+
 def test_train_or_resume_drops_init_policy_path_for_unsupported_adapter(
     tmp_path: Path, monkeypatch,
 ):
@@ -331,6 +432,10 @@ def test_sculpt_run_init_policy_iter_0_guard_in_source():
     assert "init_policy_path not found" in src, (
         "sculpt_run must fail fast with a clear FileNotFoundError when "
         "init_policy_path points to a non-existent file."
+    )
+    assert "_latest_preceding_policy(" in src, (
+        "UI Resume must recover the newest valid preceding policy when "
+        "reward versioning leaves a gap before the next outer iteration."
     )
 
 

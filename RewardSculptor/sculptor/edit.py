@@ -27,8 +27,17 @@ apply_edits() turns a Diagnosis into a new reward module:
        - REWARD_SPEC.references is a list of dicts with arxiv_id / citation /
          how_used, and every arxiv_id exists in the KG.
        - REWARD_SPEC.parent_hash is present and non-empty.
-     On failure: one retry with the validation errors appended to the prompt.
-     Second failure raises `EditValidationError`.
+     On failure: retry with the validation errors appended to the prompt, up
+     to `RS_EDIT_REPAIR_RETRIES` extra attempts (env var; default 1, i.e. 2
+     attempts total — unset reproduces the original single-retry behavior
+     exactly). If every attempt still fails post-flight validation, the
+     LAST attempt's `EditValidationError` is raised. Callers (sculpt.py's
+     stage-v1 materialization and per-iteration edit loop) already catch
+     `EditValidationError` at their boundary and degrade to a clean
+     stage/iteration failure rather than crashing the process — see
+     `sculpt.py::_run_one_stage` (v1_materialization_errored) and
+     `sculpt.py`'s per-iteration `apply_edits` call (edit skipped, iter
+     proceeds unmodified).
 
   4. Write to `<rewards_dir>/<new_iter_id>.py` (e.g. `…/v1.py`) and rewrite
      `<rewards_dir>/current.py` to load-by-path the new file.
@@ -41,28 +50,59 @@ from __future__ import annotations
 import ast
 import hashlib
 import importlib.util
+import itertools
 import json
+import os
 import re
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
 import numpy as np
 
 from sculptor.diagnose import Diagnosis, ProposedEdit
+from sculptor.eval import partition_gate
 from sculptor.kg.query import cite
 from sculptor.kg.schema import make_paper_id
 from sculptor.kg.store import SculptorKG
+from sculptor.llm import log_llm_call, model_for
 
 
-MODEL_ID = "claude-opus-4-7"
+MODEL_ID = model_for("edit")
 MAX_TOKENS = 16000
 RETRY_REMINDER_PREFIX = (
     "Your previous response failed validation. Fix the following and return "
     "ONLY the complete new reward.py source as plain Python — no markdown "
     "fences, no commentary."
 )
+
+# §RS_EDIT_REPAIR_RETRIES: number of EXTRA repair attempts after attempt 1
+# when the LLM's generated reward module fails post-flight validation
+# (SyntaxError, missing compute_reward/REWARD_SPEC, etc — see
+# `_post_validate`). Default 1 (2 attempts total) reproduces the
+# long-standing behavior exactly. Raise via the env var when a
+# stage/project is hitting `v1_materialization_errored` /
+# `apply_edits skipped` from a persistently flaky prompt and a couple
+# more repair rounds are worth the extra API spend; the LAST attempt's
+# EditValidationError is always re-raised to the caller if every
+# attempt (1 + retries) fails post-flight validation.
+_DEFAULT_EDIT_REPAIR_RETRIES = 1
+
+
+def _edit_repair_retries() -> int:
+    """Read `RS_EDIT_REPAIR_RETRIES` (extra attempts beyond attempt 1).
+    Unset/invalid/negative → the default of 1. Read live (not cached) so
+    tests and callers can override per-process without reloading the
+    module."""
+    raw = os.environ.get("RS_EDIT_REPAIR_RETRIES")
+    if raw is None:
+        return _DEFAULT_EDIT_REPAIR_RETRIES
+    try:
+        n = int(raw)
+    except ValueError:
+        return _DEFAULT_EDIT_REPAIR_RETRIES
+    return n if n >= 0 else _DEFAULT_EDIT_REPAIR_RETRIES
 
 
 class EditValidationError(Exception):
@@ -118,6 +158,16 @@ class EditPlan:
     rejection_reasons: list[str]
     cited_arxiv_ids: list[str]
     citation_by_arxiv_id: dict[str, str]
+    # §Ship 54-pre (#12 shaping↔metric partition gate). NON-BLOCKING flags: a
+    # flagged edit STAYS applicable (unlike rejected_edits) — it touches a
+    # held-out metric observable or proposes lowering a completion gate. The
+    # flags drive the editor-prompt warning + changelog; the only HARD gate is
+    # the post-LLM `gate_threshold_regressions` check. Empty unless an objective
+    # metric is steering the run (metric_observables passed) — byte-identical
+    # otherwise. `screen` carries the full ScreenResult for the prompt builder.
+    flagged_edits: list[ProposedEdit] = field(default_factory=list)
+    flag_reasons: list[str] = field(default_factory=list)
+    screen: Any = None
 
 
 # ── Identifier extraction from proposal formulas ─────────────────────────
@@ -179,7 +229,9 @@ def _dummy_from_space(space) -> Any:
     return np.zeros((1,), dtype=np.float32)
 
 
-def _build_dummy_inputs(contract) -> tuple[Any, Any, Any, dict]:
+def _build_dummy_inputs(
+    contract, *, info_leading_batch: bool = True,
+) -> tuple[Any, Any, Any, dict]:
     """Synthesize dummy inputs matching the reward's expected shape.
 
     Two contract flavors:
@@ -224,7 +276,17 @@ def _build_dummy_inputs(contract) -> tuple[Any, Any, Any, dict]:
         # Info as dict of torch scalars — Claude's batched path often
         # does `info["fallen"].to(device)` or arithmetic with it.
         info_keys = list(contract.expected_info_keys or [])
-        info = {k: torch.zeros((1,), dtype=torch.float32) for k in info_keys}
+        info_schema = getattr(contract, "info_schema", None) or {}
+        info: dict[str, Any] = {}
+        for key in info_keys:
+            feature_shape = tuple(info_schema.get(key, ()))
+            if info_leading_batch:
+                shape = (1, *feature_shape)
+            else:
+                # Legacy scalar rewards consumed a feature vector directly,
+                # but still expected scalar fields as one-element tensors.
+                shape = feature_shape or (1,)
+            info[key] = torch.zeros(shape, dtype=torch.float32)
         return state, action, next_state, info
     # Gym-style path unchanged (gym_sb3 uses numpy throughout).
     state = _dummy_from_space(contract.observation_space_spec)
@@ -234,8 +296,11 @@ def _build_dummy_inputs(contract) -> tuple[Any, Any, Any, dict]:
     return state, action, next_state, info
 
 
-def _call_compute_reward(mod, contract) -> tuple[float, dict]:
-    s, a, ns, info = _build_dummy_inputs(contract)
+def _call_compute_reward(
+    mod, contract, *, info_leading_batch: bool = True,
+) -> tuple[float, dict]:
+    s, a, ns, info = _build_dummy_inputs(
+        contract, info_leading_batch=info_leading_batch)
     try:
         out = mod.compute_reward(s, a, ns, info)
     except Exception as e:  # noqa: BLE001 — module bug → retryable
@@ -300,6 +365,332 @@ def _call_compute_reward(mod, contract) -> tuple[float, dict]:
     return reward_f, components
 
 
+def _probe_reward_variance(mod, contract) -> None:
+    """§Convergence (RL_SCULPTOR_AUDIT loop 3): offline dead-reward pre-screen.
+
+    Evaluate `compute_reward` over a battery of diverse deterministic
+    inputs (state/action/info all filled with each probe value); if the
+    TOTAL reward AND every component are constant across every probe,
+    the reward is state-independent — the v0-class degenerate (constant
+    alive-bonus) that gives PPO zero gradient and burns a full GPU
+    iteration training "stand still". Reject so the retry loop
+    regenerates with this feedback.
+
+    Deliberately conservative: a reward with even ONE state-sensitive
+    term passes; probes that crash are skipped (a reward may
+    legitimately guard exotic magnitudes — the zeros probe has already
+    validated); fewer than 2 surviving probes → pass (insufficient
+    evidence beats a false reject)."""
+    # (state, action, next_state, info) fill values per probe. The last
+    # two are ASYMMETRIC (state != next_state) so a reward built purely
+    # of difference terms (next_z - z, displacement shaping) still shows
+    # variance and is not false-rejected.
+    fills = (
+        (0.0, 0.0, 0.0, 0.0),
+        (0.5, 0.5, 0.5, 0.5),
+        (1.0, 1.0, 1.0, 1.0),
+        (-0.5, -0.5, -0.5, -0.5),
+        (0.0, 0.5, 1.0, 0.5),
+        (0.5, 1.0, 0.0, 1.0),
+    )
+    totals: list[float] = []
+    component_rows: list[dict[str, float]] = []
+    for bs, ba, bns, binfo in fills:
+        s, a, ns, info = _build_dummy_inputs(contract)
+
+        def _fill(x, b):
+            try:
+                import torch
+                if isinstance(x, torch.Tensor):
+                    return torch.full_like(x, float(b))
+            except Exception:  # noqa: BLE001 — torch absent → numpy path
+                pass
+            if isinstance(x, np.ndarray):
+                out = x.copy()
+                out.fill(b)
+                return out
+            if isinstance(x, dict):
+                return {k: _fill(v, b) for k, v in x.items()}
+            if isinstance(x, (int, float)):
+                return float(b)
+            return x
+
+        try:
+            out = mod.compute_reward(
+                _fill(s, bs), _fill(a, ba), _fill(ns, bns), _fill(info, binfo))
+            reward, components = out
+            row = {}
+            for k, v in dict(components).items():
+                try:
+                    row[str(k)] = float(v)
+                except Exception:  # noqa: BLE001 — non-scalar component
+                    continue
+            totals.append(float(reward))
+            component_rows.append(row)
+        except Exception:  # noqa: BLE001 — guarded reward → skip this probe
+            continue
+    if len(totals) < 2:
+        return
+    if any(not np.isfinite(t) for t in totals):
+        return  # finiteness is _call_compute_reward's job, not ours
+    tol = 1e-9
+    if max(totals) - min(totals) > tol:
+        return
+    shared = set(component_rows[0])
+    for row in component_rows[1:]:
+        shared &= set(row)
+    for k in shared:
+        vals = [row[k] for row in component_rows]
+        if max(vals) - min(vals) > tol:
+            return
+    raise EditValidationError(
+        "reward is state-independent: compute_reward returned the "
+        f"IDENTICAL total ({totals[0]!r}) and identical per-component "
+        f"values across {len(totals)} diverse input probes (varied "
+        "state/action/next_state/info fills, including asymmetric "
+        "state-vs-next_state). A constant reward gives PPO zero "
+        "gradient — the policy will learn to stand still. Every reward "
+        "must contain at least one term that responds to the physical "
+        "state (height, contacts, joint motion, velocity...) so "
+        "improving the behavior changes the reward."
+    )
+
+
+# §RL_SCULPTOR_AUDIT §4.4 (edit quality): reject floor for the replay
+# screen. A mean per-step total below this on the archived rollout's
+# NON-FALLEN frames means living costs more than terminating — with a
+# reachable termination the optimal policy ends episodes ASAP (the
+# v6/v8 instant-fall collapses). Slightly negative means (transient
+# action costs) are tolerated.
+_REPLAY_MEAN_FLOOR = -0.05
+# Fewer surviving (finite, non-fallen) frames than this → insufficient
+# evidence; pass rather than false-reject (mirrors _probe_reward_variance).
+_REPLAY_MIN_FRAMES = 32
+
+
+def _replay_reward_summary(mod, replay_inputs) -> "dict | None":
+    """Replay a reward module over archived rollout inputs (built by
+    `adapter.build_reward_replay`). Returns
+    `{mean_alive, n_alive, component_means}` or None when the module
+    can't be replayed (no batched path / crash / too few frames) —
+    callers treat None as "no evidence"."""
+    if not replay_inputs or not hasattr(mod, "compute_reward_batched"):
+        return None
+    try:
+        import torch
+
+        state, action, next_state, info = replay_inputs
+        with torch.no_grad():
+            out = mod.compute_reward_batched(state, action, next_state, info)
+        rewards, components = out
+        rewards = rewards.reshape(-1).float()
+        fallen = info.get("fallen")
+        alive = (
+            (fallen.reshape(-1) < 0.5)
+            if isinstance(fallen, torch.Tensor)
+            else torch.ones_like(rewards, dtype=torch.bool)
+        )
+        alive &= torch.isfinite(rewards)
+        n_alive = int(alive.sum().item())
+        if n_alive < _REPLAY_MIN_FRAMES:
+            return None
+        comp_means: dict[str, float] = {}
+        if isinstance(components, dict):
+            for k, v in components.items():
+                try:
+                    comp_means[str(k)] = float(
+                        v.reshape(-1).float()[alive].mean().item())
+                except Exception:  # noqa: BLE001 — non-tensor component
+                    continue
+        return {
+            "mean_alive": float(rewards[alive].mean().item()),
+            "n_alive": n_alive,
+            "component_means": comp_means,
+        }
+    except Exception:  # noqa: BLE001 — replay is advisory evidence
+        return None
+
+
+def _screen_reward_on_replay(mod, replay_inputs, parent_summary=None) -> None:
+    """§RL_SCULPTOR_AUDIT §4.4 (edit quality): anti-collapse screen.
+
+    Replays the CANDIDATE reward on the archived rollout of the policy
+    it will train (the current best behavior). Rejects when the mean
+    per-step total over non-fallen frames is meaningfully negative:
+    with a reachable episode termination, a net-negative living reward
+    makes immediate self-termination the optimum — both diagnoser edits
+    in the tuck-jump E2E (v6, v8-class) collapsed this way, burning a
+    GPU hour each. The reject message carries per-component means on
+    those frames so the retry can rebalance the exact offending terms."""
+    if not replay_inputs:
+        return
+    summary = _replay_reward_summary(mod, replay_inputs)
+    if summary is None:
+        return
+    mean_alive = summary["mean_alive"]
+    if mean_alive >= _REPLAY_MEAN_FLOOR:
+        return
+    comp_s = ", ".join(
+        f"{k}={v:+.3f}" for k, v in sorted(
+            summary["component_means"].items(), key=lambda kv: kv[1]))
+    parent_s = ""
+    if parent_summary is not None:
+        parent_s = (
+            f" The PARENT reward averages {parent_summary['mean_alive']:+.3f} "
+            f"on the same frames, so this is a property of your edit, not "
+            f"of the rollout."
+        )
+    raise EditValidationError(
+        "reward-collapse screen: replaying this module on the archived "
+        "rollout of the CURRENT policy (the behavior your edit must "
+        f"refine, not destroy) gives a mean per-step TOTAL of "
+        f"{mean_alive:+.3f} across {summary['n_alive']} non-fallen "
+        f"frames.{parent_s} A net-negative living reward with a "
+        "reachable episode termination teaches the policy to end "
+        "episodes as fast as possible (deliberate falling) — this "
+        "exact mechanism produced instant-fall policies twice. "
+        f"Per-component means on those frames: {comp_s or '(none)'}. "
+        "Rebalance so the per-step total stays >= 0 in commonly-visited "
+        "non-fallen states: shrink new penalties (aim <= ~0.1/step in "
+        "ordinary poses), keep paying for the partial behavior the "
+        "policy already achieves, and make an exploit UNPROFITABLE "
+        "relative to the intended behavior rather than absolutely "
+        "negative."
+    )
+
+
+# §Hack-income regression screen (RESEARCH_GAP_ANALYSIS §4.1; CARD's
+# Trajectory Preference Evaluation, arXiv:2410.14660, adapted to archived
+# exploits): once the diagnoser has CAUGHT a reward-hacking iteration,
+# that iteration's rollout is a standing demonstration of the exploit.
+# No future candidate may pay it meaningfully MORE per step than the
+# PARENT (edit base) does — a caught hack must become monotonically less
+# profitable across edits, never re-opened. Compared parent-vs-candidate
+# on the SAME frames, so honest credit that incidentally overlaps the
+# exploit (e.g. flight credit on a tumble) passes as long as the edit
+# didn't RAISE it; only the delta the edit introduced can reject.
+# Tolerance below absorbs float noise + incidental term coupling.
+_HACK_INCOME_ABS_TOL = 0.05
+_HACK_INCOME_REL_TOL = 0.10
+
+
+def _screen_hack_income(mod, hack_replays) -> None:
+    """Reject a candidate that raises the per-step income of a KNOWN
+    (diagnosed reward_hacking) archived exploit above its parent's.
+
+    `hack_replays`: list of `{label, replay_inputs, parent_summary}`
+    dicts (built in sculpt.py; parent summaries computed by apply_edits
+    with the same `_replay_reward_summary` the candidate is measured
+    with). Entries without a parent summary or an unreplayable candidate
+    are skipped — no evidence, no reject."""
+    for hr in hack_replays or []:
+        parent = hr.get("parent_summary")
+        if not parent:
+            continue
+        cand = _replay_reward_summary(mod, hr.get("replay_inputs"))
+        if cand is None:
+            continue
+        p_mean = float(parent["mean_alive"])
+        allowed = p_mean + max(_HACK_INCOME_ABS_TOL,
+                               _HACK_INCOME_REL_TOL * abs(p_mean))
+        if cand["mean_alive"] <= allowed:
+            continue
+        comp_s = ", ".join(
+            f"{k}={v:+.3f}" for k, v in sorted(
+                cand["component_means"].items(),
+                key=lambda kv: -kv[1])[:6])
+        raise EditValidationError(
+            f"hack-income screen: {hr.get('label', 'a prior iteration')} "
+            "was diagnosed as REWARD HACKING and its rollout is archived "
+            "as a known exploit. Replaying your candidate on those exact "
+            f"frames pays {cand['mean_alive']:+.3f}/step vs the parent "
+            f"reward's {p_mean:+.3f}/step — this edit makes a CAUGHT "
+            "exploit MORE profitable, re-opening it. Top-paying "
+            f"components on the exploit frames: {comp_s or '(none)'}. "
+            "Gate those terms on the requirement the exploit skips "
+            "(orientation / foot contact / height band) so the exploit "
+            "earns LESS than it did, while keeping the intended behavior "
+            "paid the same."
+        )
+
+
+# ── §best-of-K candidate edits (RESEARCH_GAP_ANALYSIS §3.3 / COULD) ──────
+# One diagnosis → K candidate rewrites under DIVERSE STRATEGY FRAMINGS,
+# screened offline (the full _post_validate stack), ranked on replay
+# evidence, and only the winner trains. GPU cost is unchanged (still one
+# training per iteration); LLM cost is ×K on the edit call only. This is
+# the cheap form of best-of-K selection: the treatment arm's K candidates
+# come from ONE grounded diagnosis under different edit strategies, vs
+# Eureka's blind resampling. Framing (not model or temperature) carries
+# the diversity: the same strongest model explores distinct regions of
+# edit space, mirroring metric_gen's best-of-N FRAMING pattern.
+_EDIT_FRAMINGS: tuple[str, ...] = (
+    # Candidate 1: no suffix — byte-identical to the single-shot prompt.
+    "",
+    "\n\n# STRATEGY DIRECTIVE (candidate framing)\n"
+    "MINIMAL-DIFF: make the SMALLEST coherent change that addresses the "
+    "diagnosis. Prefer retuning existing magnitudes, thresholds and "
+    "gates over adding terms; add a new term only if the diagnosis "
+    "cannot be addressed without one. Keep the component structure "
+    "recognizably the parent's.",
+    "\n\n# STRATEGY DIRECTIVE (candidate framing)\n"
+    "STRUCTURAL: rethink the term structure around the diagnosis. "
+    "Consider phase decomposition (e.g. contact/launch/flight/landing "
+    "gating), removing dead or fighting terms, and re-staging credit so "
+    "each phase pays only when its preconditions hold. Stay within the "
+    "same contract and cited techniques; do not relax completion gates.",
+    "\n\n# STRATEGY DIRECTIVE (candidate framing)\n"
+    "EXPLORATION-FIRST: prioritize making the hard-to-reach states "
+    "reachable and worth visiting (shaping toward the diagnosis's "
+    "missing behavior) over polishing already-achieved behavior. Keep "
+    "already-earned credit intact so the policy does not abandon what "
+    "it can do.",
+    "\n\n# STRATEGY DIRECTIVE (candidate framing)\n"
+    "ROBUSTNESS: assume the policy will try to exploit any unguarded "
+    "credit. Audit every term for degenerate maximizers and gate them; "
+    "prefer bounded, saturating credit over unbounded linear credit.",
+)
+
+
+#: §best-of-K: monotonic staging-name counter — see the staging-name
+#: comment in `_post_validate` for why this must be unique per call.
+_STAGING_COUNTER = itertools.count()
+
+
+def _framing_name(index: int) -> str:
+    """Short label for a framing ("default", "MINIMAL-DIFF", …) for
+    logs + the candidate report."""
+    if index == 0:
+        return "default"
+    try:
+        # Framing shape: "\n\n# STRATEGY DIRECTIVE …\nNAME: directive…"
+        return _EDIT_FRAMINGS[index].strip().splitlines()[1].split(":")[0]
+    except Exception:  # noqa: BLE001 — label only
+        return f"framing_{index}"
+
+
+def _candidate_hack_margin(mod, replay_inputs, hack_replays) -> "float | None":
+    """Offline discrimination score for ranking valid candidates: the
+    WORST-CASE gap between what the candidate pays the archived honest
+    best rollout and what it pays each archived (diagnosed) exploit,
+    per step. Higher = sharper separation of honest behavior from known
+    gaming (CARD-TPE-style order preservation, arXiv:2410.14660, on
+    this project's own replay evidence). None = no evidence (no replays
+    / unreplayable candidate) — callers rank None below any float."""
+    if not replay_inputs or not hack_replays:
+        return None
+    honest = _replay_reward_summary(mod, replay_inputs)
+    if honest is None:
+        return None
+    margins: list[float] = []
+    for hr in hack_replays:
+        cand = _replay_reward_summary(mod, hr.get("replay_inputs"))
+        if cand is None:
+            continue
+        margins.append(float(honest["mean_alive"]) - float(cand["mean_alive"]))
+    return min(margins) if margins else None
+
+
 def _call_compute_reward_batched(mod, contract) -> None:
     """§Ship 31b: execute the BATCHED path pre-flight (N=2 zero
     tensors, runtime-faithful float info). The scalar probe runs pure
@@ -322,8 +713,13 @@ def _call_compute_reward_batched(mod, contract) -> None:
                   for k, shape in schema.items()}
     action_dim = int(schema.get("actuator_force", (1,))[0])
     action = torch.zeros((n, action_dim), dtype=torch.float32)
-    info = {k: torch.zeros((n,), dtype=torch.float32)
-            for k in (contract.expected_info_keys or [])}
+    info_schema = getattr(contract, "info_schema", None) or {}
+    info = {
+        key: torch.zeros(
+            (n, *tuple(info_schema.get(key, ()))), dtype=torch.float32,
+        )
+        for key in (contract.expected_info_keys or [])
+    }
     try:
         out = mod.compute_reward_batched(state, action, next_state, info)
     except Exception as e:  # noqa: BLE001 — surface as validation error
@@ -354,7 +750,23 @@ def _call_compute_reward_batched(mod, contract) -> None:
 
 
 def _current_reward_component_keys(current_module, contract) -> set[str]:
-    _, components = _call_compute_reward(current_module, contract)
+    try:
+        _, components = _call_compute_reward(current_module, contract)
+    except EditValidationError as exact_shape_error:
+        # Migration-only escape hatch: a parent authored before info_schema
+        # existed may understand a vector feature as shape (3,) but not the
+        # runtime-faithful single-env batch shape (1, 3). We still need its
+        # component names in order to prompt a repair. Newly generated code
+        # never gets this fallback: _post_validate below uses the strict
+        # exact-shape call plus the N=2 batched probe.
+        info_schema = getattr(contract, "info_schema", None) or {}
+        if not any(tuple(shape) for shape in info_schema.values()):
+            raise
+        try:
+            _, components = _call_compute_reward(
+                current_module, contract, info_leading_batch=False)
+        except EditValidationError:
+            raise exact_shape_error
     return set(components.keys())
 
 
@@ -362,6 +774,15 @@ def _current_reward_hparam_keys(current_module) -> set[str]:
     spec = getattr(current_module, "REWARD_SPEC", {}) or {}
     hparams = spec.get("hyperparameters", {}) or {}
     return set(hparams.keys())
+
+
+def _current_reward_hparams(current_module) -> dict[str, Any]:
+    """The parent reward's `REWARD_SPEC.hyperparameters` name→value map (not just
+    keys). Source for the §Ship 54-pre partition gate's post-LLM gate-erosion
+    check (`partition_gate.gate_threshold_regressions`)."""
+    spec = getattr(current_module, "REWARD_SPEC", {}) or {}
+    hparams = spec.get("hyperparameters", {}) or {}
+    return dict(hparams) if isinstance(hparams, dict) else {}
 
 
 def _current_reward_version(current_module) -> str:
@@ -380,6 +801,153 @@ def _current_reward_references(current_module) -> list[dict]:
         elif isinstance(r, dict):
             out.append(r)
     return out
+
+
+_REFERENCE_KERNEL_FUNCTIONS = (
+    "_scalar",
+    "_phase_index_scalar",
+    "_reference_tracking_numpy",
+    "_phase_index_batched",
+    "_reference_tracking_batched",
+    "compute_reward",
+    "compute_reward_batched",
+)
+
+_REFERENCE_KERNEL_GLOBALS = {
+    "_W_JOINT_POS", "_W_JOINT_VEL", "_W_ROOT", "_W_ORIENTATION",
+    "_TRACKING_WEIGHT", "_RESIDUAL_MAX", "_ALIVE_BONUS",
+}
+
+
+def _reference_tracking_contract(mod) -> "dict[str, Any] | None":
+    spec = getattr(mod, "REWARD_SPEC", {}) or {}
+    composition = spec.get("composition") if isinstance(spec, dict) else None
+    if (not isinstance(composition, dict)
+            or composition.get("type") != "reference_tracking_residual"):
+        return None
+    return dict(composition)
+
+
+def _reference_kernel_hash(source: str) -> "str | None":
+    """Stable AST hash of immutable targets, kernels, and composition."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return None
+    by_name = {
+        node.name: node for node in tree.body if isinstance(
+            node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    if any(name not in by_name for name in _REFERENCE_KERNEL_FUNCTIONS):
+        return None
+    assignments: dict[str, ast.AST] = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    assignments[target.id] = node
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            assignments[node.target.id] = node
+    immutable_names = sorted(
+        name for name in assignments
+        if name.startswith("REFERENCE_") or name in _REFERENCE_KERNEL_GLOBALS)
+    if (not any(name.startswith("REFERENCE_") for name in immutable_names)
+            or not _REFERENCE_KERNEL_GLOBALS.issubset(immutable_names)):
+        return None
+    payload = "\n".join(
+        ast.dump(by_name[name], annotate_fields=True, include_attributes=False)
+        for name in _REFERENCE_KERNEL_FUNCTIONS
+    )
+    payload += "\n" + "\n".join(
+        ast.dump(assignments[name], annotate_fields=True, include_attributes=False)
+        for name in immutable_names
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _validate_reference_tracking_contract(
+    *, mod, source: str, components: dict, parent: dict[str, Any],
+    parent_kernel_hash: str,
+) -> None:
+    """Keep the motion prior immutable while allowing bounded task residuals."""
+    child = _reference_tracking_contract(mod)
+    if child is None:
+        raise EditValidationError(
+            "tracking-first contract removed: preserve "
+            "REWARD_SPEC.composition.type='reference_tracking_residual'")
+    for key in (
+        "reference_clip_id", "reference_target_sha256", "phase_mode",
+        "phase_duration_s", "root_height_frame",
+    ):
+        if child.get(key) != parent.get(key):
+            raise EditValidationError(
+                f"tracking-first contract changed {key}: preserve the attached "
+                "reference identity exactly")
+    try:
+        parent_weight = float(parent["tracking_weight"])
+        child_weight = float(child["tracking_weight"])
+        residual_max = float(child["residual_max"])
+    except (KeyError, TypeError, ValueError) as e:
+        raise EditValidationError(
+            f"tracking-first composition has invalid numeric fields: {e}") from e
+    if abs(child_weight - parent_weight) > 1e-9:
+        raise EditValidationError(
+            "tracking-first contract changed tracking_weight; the reference "
+            "base may not be weakened or amplified by an LLM edit")
+    if residual_max < 0.0 or residual_max > 0.35 * child_weight:
+        raise EditValidationError(
+            f"tracking residual_max={residual_max:g} must be within [0, "
+            f"{0.35 * child_weight:g}] (<=35% of tracking_weight)")
+    required_components = {
+        "reference_tracking", "tracking_joint_pos", "tracking_joint_vel",
+        "tracking_root_height", "tracking_orientation", "residual_task",
+    }
+    missing = sorted(required_components - set(components))
+    if missing:
+        raise EditValidationError(
+            f"tracking-first reward dropped required components: {missing}")
+    try:
+        residual_probe = float(components["residual_task"])
+    except (TypeError, ValueError) as e:
+        raise EditValidationError(
+            f"residual_task is not scalar/numeric on the scalar path: {e}") from e
+    if not (0.0 <= residual_probe <= residual_max + 1e-9):
+        raise EditValidationError(
+            f"residual_task={residual_probe:g} escapes [0, residual_max="
+            f"{residual_max:g}] on validation inputs")
+
+    target_hash = getattr(mod, "REFERENCE_TARGET_SHA256", None)
+    if target_hash != parent.get("reference_target_sha256"):
+        raise EditValidationError(
+            "REFERENCE_TARGET_SHA256 changed or disappeared; preserve the "
+            "attached motion targets exactly")
+    try:
+        targets = {
+            "joint_pos": np.round(np.asarray(
+                mod.REFERENCE_JOINT_POS, dtype=np.float64), 5).tolist(),
+            "joint_vel": np.round(np.asarray(
+                mod.REFERENCE_JOINT_VEL, dtype=np.float64), 5).tolist(),
+            "root_z": np.round(np.asarray(
+                mod.REFERENCE_ROOT_Z, dtype=np.float64), 5).tolist(),
+            "gravity": (
+                np.round(np.asarray(
+                    mod.REFERENCE_GRAVITY, dtype=np.float64), 5).tolist()
+                if mod.REFERENCE_GRAVITY is not None else None),
+        }
+    except (AttributeError, TypeError, ValueError) as e:
+        raise EditValidationError(
+            f"reference target arrays changed or disappeared: {e}") from e
+    actual_hash = hashlib.sha256(json.dumps(
+        targets, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    if actual_hash != target_hash:
+        raise EditValidationError(
+            "reference target arrays no longer match REFERENCE_TARGET_SHA256")
+    if _reference_kernel_hash(source) != parent_kernel_hash:
+        raise EditValidationError(
+            "immutable reference tracking kernel changed; restore the parent's "
+            "phase clock and _reference_tracking_* functions and edit only the "
+            "bounded residual")
 
 
 # ── KG validation helpers ─────────────────────────────────────────────────
@@ -403,6 +971,9 @@ def _pre_validate(
     contract,
     current_module,
     kg_store: SculptorKG,
+    *,
+    metric_observables: "frozenset[str] | None" = None,
+    current_hparams: "dict[str, Any] | None" = None,
 ) -> EditPlan:
     """Partition proposed edits into applicable / deferred / rejected.
 
@@ -496,6 +1067,23 @@ def _pre_validate(
         else:
             applicable.append(e)
 
+    # 3. §Ship 54-pre (#12) shaping↔metric partition screen — NON-BLOCKING.
+    #    Only when an objective metric is steering the run (metric_observables
+    #    passed). Flags edits that touch a held-out metric observable or propose
+    #    lowering a completion gate; they STAY applicable. Byte-identical when
+    #    metric_observables is None (the gym_sb3 / blind / prompt-edit paths).
+    flagged: list[ProposedEdit] = []
+    flag_reasons: list[str] = []
+    screen = None
+    if metric_observables:
+        screen = partition_gate.screen_edits(
+            applicable,
+            metric_observables=metric_observables,
+            current_hparams=current_hparams or {},
+        )
+        flagged = list(screen.flagged_edits)
+        flag_reasons = list(screen.flag_reasons)
+
     return EditPlan(
         applicable_edits=applicable,
         deferred_edits=deferred,
@@ -503,6 +1091,9 @@ def _pre_validate(
         rejection_reasons=rejection_reasons,
         cited_arxiv_ids=all_refs,
         citation_by_arxiv_id=_citation_map(all_refs, kg_store),
+        flagged_edits=flagged,
+        flag_reasons=flag_reasons,
+        screen=screen,
     )
 
 
@@ -525,6 +1116,10 @@ def _build_user_prompt(
     applicable_edits: list[ProposedEdit],
     deferred_edits: list[ProposedEdit],
     training_feedback: dict | None = None,
+    metric_observables: "frozenset[str] | None" = None,
+    screen: Any = None,
+    case_context: str = "",
+    reference_signature: dict | None = None,
 ) -> str:
     edits_json = [
         {
@@ -559,8 +1154,13 @@ def _build_user_prompt(
     supports_batched = bool(getattr(contract, "supports_batched", False))
     if supports_batched:
         schema = getattr(contract, "state_schema", None) or {}
+        info_schema = getattr(contract, "info_schema", None) or {}
         training_device = getattr(contract, "training_device", "any")
         schema_serialized = {k: list(v) for k, v in schema.items()}
+        info_schema_serialized = {
+            key: list(info_schema.get(key, ()))
+            for key in (contract.expected_info_keys or [])
+        }
         batched_block = (
             "# BATCHED_CONTRACT (supports_batched=True)\n"
             "This adapter trains on GPU with parallel environments. Your "
@@ -577,8 +1177,13 @@ def _build_user_prompt(
             f"  state / next_state: dict[str, Tensor] with per-key "
             f"feature shapes = {json.dumps(schema_serialized, sort_keys=True)}\n"
             f"  action: Tensor shape (N, action_dim)\n"
-            f"  info:   dict[str, Tensor of shape (N,)] with keys "
-            f"{list(contract.expected_info_keys)}\n\n"
+            "  info:   dict[str, Tensor] with per-key feature shapes "
+            "below (each runtime tensor is (N, *feature_shape); [] means "
+            "a scalar per env):\n"
+            f"{json.dumps(info_schema_serialized, sort_keys=True)}\n\n"
+            "Never reshape a vector-valued info channel to (N,). Reduce "
+            "it intentionally (for example, a relative-position or velocity "
+            "3-vector usually needs a norm over dim=-1).\n\n"
             "Output shapes:\n"
             "  rewards:     Tensor shape (N,) on the same device as inputs\n"
             "  components:  dict[str, Tensor of shape (N,)]\n\n"
@@ -609,16 +1214,48 @@ def _build_user_prompt(
                 f"{formatted}\n\n"
             )
 
+    # §Ship 54-pre (#12): the METRIC_PARTITION block — present ONLY when an
+    # objective metric is steering the run. Self-contained (carries its own
+    # rules) so the shared system prompt is untouched and the no-metric path is
+    # byte-identical (empty string → identical f-string bytes).
+    partition_block = ""
+    if metric_observables:
+        partition_block = partition_gate.build_partition_prompt_block(
+            metric_observables,
+            screen if screen is not None else partition_gate.ScreenResult(),
+        )
+
+    # §2026-07-03 case-memory upgrade: the REWRITER is where "don't repeat
+    # the same reward mistake" actually lands — the diagnoser proposes,
+    # but the rewriter picks formulas + magnitudes. Same block the
+    # diagnoser sees; empty string when no cases match / no KG.
+    case_block = f"{case_context}\n\n" if case_context else ""
+
+    # §reference-grounded edit: same "REFERENCE MOTION SIGNATURE" block
+    # diagnose.py now shows — the rewriter is where numeric targets/
+    # thresholds actually get written into code, so it needs the real
+    # competent-motion numbers too, not just the diagnosis's prose.
+    # Absent (no reference clip for this stage) → "" → byte-identical.
+    reference_block = ""
+    if reference_signature:
+        from sculptor.reference_context import render_reference_signature_block
+
+        rendered = render_reference_signature_block(reference_signature)
+        if rendered:
+            reference_block = f"{rendered}\n\n"
+
     return (
         f"# NEW_VERSION\n{new_version}\n\n"
         f"# PARENT_VERSION\n{current_version}\n\n"
         f"# PARENT_HASH\n{parent_hash}\n\n"
         f"# BEHAVIOR_GOAL\n{diagnosis.behavior_goal or '(not supplied)'}\n\n"
+        f"{case_block}"
         f"# DIAGNOSIS\n"
         f"failure_modes: {diagnosis.failure_modes}\n"
         f"evidence: {diagnosis.evidence}\n"
         f"confidence: {diagnosis.confidence:.2f}\n\n"
         f"{feedback_block}"
+        f"{reference_block}"
         f"# REWARD_CONTRACT\n"
         f"observation_space: {contract.observation_space_spec}\n"
         f"action_space:      {contract.action_space_spec}\n"
@@ -627,6 +1264,7 @@ def _build_user_prompt(
         f"supports_batched:   {supports_batched}\n"
         f"training_device:    {getattr(contract, 'training_device', 'any')}\n\n"
         f"{batched_block}"
+        f"{partition_block}"
         f"# APPLICABLE_EDITS (apply these)\n"
         f"{json.dumps(edits_json, indent=2, sort_keys=True, default=str)}\n\n"
         f"# DEFERRED_EDITS (requires_env_extension=true; DO NOT apply — "
@@ -682,6 +1320,10 @@ def _call_llm(
     for block in resp.content:
         if getattr(block, "type", None) == "text":
             chunks.append(block.text)
+    log_llm_call(
+        "edit", MODEL_ID, system=system_prompt, user=user_content,
+        response_text="".join(chunks), usage=getattr(resp, "usage", None),
+        meta={"attempt": attempt})
     if not chunks:
         raise EditValidationError("LLM returned no text blocks")
     out = _strip_markdown_fence("".join(chunks))
@@ -697,7 +1339,15 @@ def _call_llm(
 # ── POST-flight validation ────────────────────────────────────────────────
 def _post_validate(new_source: str, *, contract, kg_store: SculptorKG,
                    parent_hash: str, new_version: str,
-                   write_to: Path) -> Any:
+                   write_to: Path,
+                   parent_hparams: "dict[str, Any] | None" = None,
+                   parent_tracking: "dict[str, Any] | None" = None,
+                   parent_tracking_kernel_hash: "str | None" = None,
+                   metric_observables: "frozenset[str] | None" = None,
+                   replay_inputs=None,
+                   replay_parent: "dict | None" = None,
+                   hack_replays: "list[dict] | None" = None,
+                   promote: bool = True) -> Any:
     """Write source, import, validate, return the imported module.
 
     Raises EditValidationError on any failure (caller decides whether to retry).
@@ -710,13 +1360,26 @@ def _post_validate(new_source: str, *, contract, kg_store: SculptorKG,
     showed a "reward rewrite failed" toast but subsequent loads read
     the polluted file. `_load_reward_module` imports by path, so the
     staging file is loadable even though its name isn't canonical.
+
+    `promote=False` (§best-of-K): run the FULL validation stack but
+    never touch `write_to` — the staging file is unlinked on success
+    too, and the imported module is returned for offline ranking. The
+    winner is re-validated with `promote=True`, so the on-disk invariant
+    ("v<n>.py == validated output") is enforced by the same code path
+    either way.
     """
     write_to.parent.mkdir(parents=True, exist_ok=True)
     # Staging filename MUST end in `.py` so `importlib.util.spec_from_
     # file_location` auto-detects a Python loader. Leading dot marks it
     # as a hidden file so `list_versions` glob `v*.py` ignores it.
-    # e.g. `v1.py` → `.v1.staging.py`.
-    staging = write_to.with_name(f".{write_to.stem}.staging.py")
+    # e.g. `v1.py` → `.v1.staging3.py`. The per-invocation counter is
+    # load-bearing (§best-of-K): candidates staged to the SAME filename
+    # can collide in CPython's mtime+size-keyed bytecode cache — two
+    # same-length sources written within mtime granularity execute the
+    # FIRST candidate's stale .pyc for the second candidate (observed:
+    # both candidates reported the first one's hack margin).
+    staging = write_to.with_name(
+        f".{write_to.stem}.staging{next(_STAGING_COUNTER)}.py")
     staging.write_text(new_source, encoding="utf-8")
     try:
         mod = _load_reward_module(staging, name_hint="_sculptor_new_reward")
@@ -743,6 +1406,19 @@ def _post_validate(new_source: str, *, contract, kg_store: SculptorKG,
         # §Ship 31b: also execute the BATCHED (training) path — the
         # scalar probe alone let tensor-only crashes reach the GPU.
         _call_compute_reward_batched(mod, contract)
+        # §Convergence (RL_SCULPTOR_AUDIT loop 3): dead-reward pre-screen —
+        # a state-independent (constant) reward is rejected BEFORE it can
+        # burn a GPU iteration training "stand still".
+        _probe_reward_variance(mod, contract)
+        # §RL_SCULPTOR_AUDIT §4.4 (loop 4b): anti-collapse screen — the
+        # candidate must not make the archived current-best behavior
+        # net-negative (suicide-by-termination attractor). No-op when the
+        # caller supplied no replay inputs.
+        _screen_reward_on_replay(mod, replay_inputs, replay_parent)
+        # §Hack-income regression screen: a caught exploit must never be
+        # made MORE profitable by an edit. No-op when no prior iteration
+        # was diagnosed reward_hacking (empty/None list).
+        _screen_hack_income(mod, hack_replays)
 
         # expected_components subset check
         if contract.expected_components is not None:
@@ -772,6 +1448,21 @@ def _post_validate(new_source: str, *, contract, kg_store: SculptorKG,
             raise EditValidationError(
                 f"REWARD_SPEC.parent_hash does not match expected "
                 f"{parent_hash!r} (got {spec.get('parent_hash')!r})")
+
+        # A stage with an attached reference is tracking-FIRST by construction.
+        # The LLM may edit only compute_reward's bounded residual: reference
+        # arrays, phase clock, kernels, identity, and relative scale are frozen.
+        if parent_tracking is not None:
+            if not parent_tracking_kernel_hash:
+                raise EditValidationError(
+                    "parent tracking reward is missing its immutable kernel")
+            _validate_reference_tracking_contract(
+                mod=mod,
+                source=new_source,
+                components=components,
+                parent=parent_tracking,
+                parent_kernel_hash=parent_tracking_kernel_hash,
+            )
 
         # References shape + every arxiv_id present in KG.
         refs = spec.get("references", None)
@@ -810,12 +1501,44 @@ def _post_validate(new_source: str, *, contract, kg_store: SculptorKG,
                     f"a full reference entry for each, or remove the arxiv_id "
                     f"from grounding (physics first-principles text is OK)."
                 )
+
+        # §Ship 54-pre (#12) shaping↔metric partition gate — the ONE HARD gate.
+        # Runs ONLY when an objective metric is steering the run; compares the
+        # emitted hyperparameters against the parent's. A same-named, positive,
+        # numerically-LOWERED completion-gate hparam (the g1-kick-v5 whack-a-mole)
+        # is a hard reject → existing retry-once → the iter drops the edit.
+        # REMOVED / renamed / ambiguous-gate / sign-ambiguous lowerings are
+        # ADVISORY (logged, never raised) so a legitimate refactor can't freeze
+        # the loop. Byte-identical when metric_observables is None.
+        if metric_observables and parent_hparams is not None:
+            new_hparams = spec.get("hyperparameters")
+            if isinstance(new_hparams, dict):
+                reg = partition_gate.gate_threshold_regressions(
+                    parent_hparams, new_hparams)
+                for adv in reg.advisory:
+                    print(f"[edit] partition-gate advisory: {adv}",
+                          file=sys.stderr, flush=True)
+                if reg.hard:
+                    raise EditValidationError(
+                        "metric partition gate: the new reward LOWERS a "
+                        "completion/qualification gate the active objective "
+                        "metric relies on — " + "; ".join(reg.hard) + ". A lower "
+                        "gate lets degenerate sub-motions qualify (this is how "
+                        "g1-kick-v5 reward-hacked). Keep or RAISE the gate; "
+                        "improve the behavior instead of easing the bar."
+                    )
     except Exception:
         # Any validation failure — unlink the staging file so the old
         # v<n>.py (if any) stays authoritative. Preserves the invariant
         # "rewards/v<n>.py on disk == validated Claude output".
         staging.unlink(missing_ok=True)
         raise
+
+    # All checks passed. §best-of-K validation-only mode: discard the
+    # staging file, hand the module back for ranking; write_to untouched.
+    if not promote:
+        staging.unlink(missing_ok=True)
+        return mod
 
     # All checks passed — atomically promote staging to the target name
     # so `current.py` + the rewards list see the new version only after
@@ -836,15 +1559,47 @@ def apply_edits(
     client=None,
     on_event=None,
     iter_dir: Path | str | None = None,
+    metric_observables: "frozenset[str] | None" = None,
+    replay_inputs=None,
+    hack_replays: "list[dict] | None" = None,
+    n_candidates: int = 1,
 ) -> Path:
     """Produce a new reward module from `diagnosis` applied to
     `current_reward_path`. Writes `<rewards_dir>/<new_iter_id>.py` and
     rewrites `<rewards_dir>/current.py` to load that file by path.
 
+    `n_candidates`: §best-of-K (RESEARCH_GAP_ANALYSIS §3.3). 1 (default)
+    = the unchanged single-shot-with-retry path, byte-identical. K>1
+    samples K candidates under the `_EDIT_FRAMINGS` strategy directives,
+    validates each through the FULL post-flight stack (promote=False),
+    ranks the valid ones by `_candidate_hack_margin` (ties / no evidence
+    → lowest candidate index, i.e. the unbiased default framing), and
+    promotes only the winner. All-invalid falls back to the existing
+    one-retry repair on the first candidate's errors. A candidate report
+    (framings, verdicts, margins, source hashes) is persisted to
+    `<iter_dir>/edit_candidates.json` plus per-candidate sources under
+    `<iter_dir>/edit_candidates/` when `iter_dir` is given.
+
+    `replay_inputs`: §RL_SCULPTOR_AUDIT §4.4 (loop 4b). Optional
+    `(state, action, next_state, info)` batch reconstructed from the
+    archived rollout the candidate must not destroy (built by
+    `adapter.build_reward_replay`). When supplied, post-flight replays
+    the candidate on it and rejects net-negative-living rewards (the
+    suicide-by-termination collapse); None (default) skips the screen.
+
     `on_event`: optional callable taking a dict. Called at load-bearing
     transitions (pre_validate start/done, LLM request start/response,
     post_validate done, committed). When None (default), no events
     fire — preserves existing sculpt-run call sites unchanged.
+
+    `metric_observables`: §Ship 54-pre (#12). The set of physical observables
+    the ACTIVE objective metric scores (e.g. `{"joint_vel", "left_foot_pos_b",
+    ...}` for g1_kick). When supplied, the shaping↔metric partition gate fires:
+    proposed edits touching a held-out observable / lowering a completion gate
+    are FLAGGED into the editor prompt + changelog (non-blocking), and a new
+    reward that numerically lowers a completion-gate hyperparameter is REJECTED
+    post-write. When None (gym_sb3 / blind / prompt-edit paths), the gate is a
+    complete no-op — byte-identical to the prior behavior.
     """
     current_reward_path = Path(current_reward_path).resolve()
     rewards_dir = current_reward_path.parent
@@ -861,15 +1616,43 @@ def apply_edits(
         current_source = current_reward_path.read_text(encoding="utf-8")
         current_version = _current_reward_version(current_module)
         current_references = _current_reward_references(current_module)
+        parent_tracking = _reference_tracking_contract(current_module)
+        parent_tracking_kernel_hash = (
+            _reference_kernel_hash(current_source)
+            if parent_tracking is not None else None)
         parent_hash = hashlib.sha256(
             current_source.encode("utf-8")).hexdigest()[:16]
+        # §Ship 54-pre (#12): parent hparam VALUES for the post-LLM partition
+        # gate. Only consulted when an objective metric is steering the run.
+        parent_hparams = _current_reward_hparams(current_module)
+        gate_parent_hparams = (
+            parent_hparams if metric_observables else None)
+        # §RL_SCULPTOR_AUDIT §4.4 (loop 4b): the PARENT's replay summary —
+        # baseline for the anti-collapse screen's reject message ("the
+        # parent averages +X on the same frames"). None when replay is
+        # off or the parent itself can't be replayed.
+        replay_parent = (
+            _replay_reward_summary(current_module, replay_inputs)
+            if replay_inputs else None)
+        # §Hack-income regression screen: the PARENT's income on each
+        # archived exploit — the baseline the candidate must not exceed.
+        # Computed here (not in sculpt.py) so parent and candidate are
+        # measured by the exact same replay code path. An unreplayable
+        # parent leaves parent_summary None → that entry is skipped.
+        if hack_replays:
+            hack_replays = [dict(hr) for hr in hack_replays]
+            for hr in hack_replays:
+                hr["parent_summary"] = _replay_reward_summary(
+                    current_module, hr.get("replay_inputs"))
 
         # Pre-flight.
         if on_event is not None:
             on_event({"type": "log_line", "text": "[edit] pre-validate start"})
         plan = _pre_validate(
             diagnosis=diagnosis, contract=reward_contract,
-            current_module=current_module, kg_store=kg_store)
+            current_module=current_module, kg_store=kg_store,
+            metric_observables=metric_observables,
+            current_hparams=parent_hparams)
         if on_event is not None:
             on_event({
                 "type": "log_line",
@@ -898,6 +1681,25 @@ def apply_edits(
                     "count": len(plan.rejected_edits),
                     "reasons": list(plan.rejection_reasons),
                 })
+            # §Ship 54-pre (#12): partition flags — NON-BLOCKING (the edit
+            # stays applicable). Mirrors the rejection surfacing for UI parity.
+            if plan.flag_reasons:
+                for reason in plan.flag_reasons:
+                    on_event({
+                        "type": "log_line",
+                        "text": f"[edit] partition flag: {reason}",
+                    })
+                on_event({
+                    "type": "edits_partition_flagged",
+                    "count": len(plan.flagged_edits),
+                    "reasons": list(plan.flag_reasons),
+                })
+
+        # §Ship 54-pre (#12): partition flags ALSO go to stderr (always
+        # visible — the sculpt loop path passes no on_event, sculpt.py:1261).
+        for reason in plan.flag_reasons:
+            print(f"[edit] partition flag: {reason}",
+                  file=sys.stderr, flush=True)
 
         if not plan.applicable_edits:
             raise EditValidationError(
@@ -940,6 +1742,41 @@ def apply_edits(
             except Exception:  # noqa: BLE001 — never block edit on feedback load
                 training_feedback = {}
 
+        # §2026-07-03: recall this system's OWN past outcomes on similar
+        # tasks/failures into the rewrite prompt (the diagnoser already
+        # sees the same block). Advisory + best-effort: no KG / no model /
+        # no matches → empty block, prompt byte-identical.
+        case_context = ""
+        try:
+            from sculptor.kg.cases import _render_case_context, query_cases
+            from sculptor.kg.query import DEFAULT_MIN_PROMPT_SIMILARITY
+
+            _case_q = (diagnosis.behavior_goal or "") + " | " + ", ".join(
+                diagnosis.failure_modes or [])
+            if _case_q.strip(" |"):
+                case_context = _render_case_context(query_cases(
+                    _case_q, top_k=3, store=kg_store,
+                    min_similarity=DEFAULT_MIN_PROMPT_SIMILARITY))
+        except Exception as e:  # noqa: BLE001 — case memory is advisory
+            print(f"[edit] case-memory query failed ({e}) — skipped.",
+                  file=sys.stderr, flush=True)
+
+        # §reference-grounded edit: `<stage_dir>/rewards/vN.py` is
+        # `current_reward_path`, so the stage dir is `parents[1]`. Resolved
+        # defensively — a layout that doesn't match (no rewards/ parent, or
+        # no reference file) just leaves this None and the prompt is
+        # byte-identical to before this change. `load_reference_signature`
+        # itself never raises, but the `.parents[1]` index lookup can on a
+        # pathological short path, hence the broad except here too.
+        reference_signature: dict | None = None
+        try:
+            from sculptor.reference_context import load_reference_signature
+
+            reference_signature = load_reference_signature(
+                current_reward_path.parents[1])
+        except Exception:  # noqa: BLE001 — advisory context, never blocks an edit
+            reference_signature = None
+
         # Build prompt.
         user_prompt = _build_user_prompt(
             current_source=current_source,
@@ -953,6 +1790,10 @@ def apply_edits(
             applicable_edits=plan.applicable_edits,
             deferred_edits=plan.deferred_edits,
             training_feedback=training_feedback,
+            metric_observables=metric_observables,
+            screen=plan.screen,
+            case_context=case_context,
+            reference_signature=reference_signature,
         )
         if on_event is not None:
             on_event({
@@ -960,48 +1801,201 @@ def apply_edits(
                 "text": f"[edit] prompt built (chars={len(user_prompt)})",
             })
 
-        # Attempt 1.
-        try:
-            new_source = _call_llm(
-                client, _EDIT_SYSTEM, user_prompt,
-                on_event=on_event, attempt=1,
-            )
-            if on_event is not None:
-                on_event({"type": "log_line", "text": "[edit] post-validate (attempt 1)"})
-            _post_validate(
-                new_source, contract=reward_contract, kg_store=kg_store,
-                parent_hash=parent_hash, new_version=new_iter_id,
-                write_to=target_path,
-            )
-        except EditValidationError as first_err:
-            print(f"[edit] first attempt failed: {first_err}. Retrying once.",
-                  file=sys.stderr, flush=True)
-            if on_event is not None:
-                on_event({
-                    "type": "log_line",
-                    "text": f"[edit] attempt 1 rejected: {first_err}; retrying",
-                })
-            # Attempt 2.
-            retry_user = (
-                user_prompt
-                + "\n\n# RETRY\n"
-                + RETRY_REMINDER_PREFIX
-                + "\n\n## VALIDATION_ERRORS_ON_PREVIOUS_ATTEMPT\n"
-                + str(first_err)
-            )
-            new_source = _call_llm(
-                client, _EDIT_SYSTEM, retry_user,
-                on_event=on_event, attempt=2,
-            )
-            if on_event is not None:
-                on_event({"type": "log_line", "text": "[edit] post-validate (attempt 2)"})
-            _post_validate(
-                new_source, contract=reward_contract, kg_store=kg_store,
-                parent_hash=parent_hash, new_version=new_iter_id,
-                write_to=target_path,
-            )
+        # §best-of-K: sample K framed candidates, validate all, promote
+        # the best-ranked. Falls through to the single-shot path below
+        # when K<=1 (byte-identical) or when a winner was promoted.
+        winner_promoted = False
+        if n_candidates and n_candidates > 1:
+            k = min(int(n_candidates), len(_EDIT_FRAMINGS))
+            cand_records: list[dict[str, Any]] = []
+            first_error: EditValidationError | None = None
+            for ci in range(k):
+                framed_prompt = user_prompt + _EDIT_FRAMINGS[ci]
+                if on_event is not None:
+                    on_event({
+                        "type": "log_line",
+                        "text": f"[edit] candidate {ci + 1}/{k} "
+                                f"({_framing_name(ci)})",
+                    })
+                rec: dict[str, Any] = {"index": ci, "valid": False,
+                                       "hack_margin": None}
+                try:
+                    cand_source = _call_llm(
+                        client, _EDIT_SYSTEM, framed_prompt,
+                        on_event=on_event, attempt=1,
+                    )
+                    rec["source"] = cand_source
+                    rec["source_sha256"] = hashlib.sha256(
+                        cand_source.encode("utf-8")).hexdigest()[:16]
+                    cand_mod = _post_validate(
+                        cand_source, contract=reward_contract,
+                        kg_store=kg_store, parent_hash=parent_hash,
+                        new_version=new_iter_id, write_to=target_path,
+                        parent_hparams=gate_parent_hparams,
+                        parent_tracking=parent_tracking,
+                        parent_tracking_kernel_hash=parent_tracking_kernel_hash,
+                        metric_observables=metric_observables,
+                        replay_inputs=replay_inputs,
+                        replay_parent=replay_parent,
+                        hack_replays=hack_replays,
+                        promote=False,
+                    )
+                    rec["valid"] = True
+                    rec["hack_margin"] = _candidate_hack_margin(
+                        cand_mod, replay_inputs, hack_replays)
+                except EditValidationError as e:
+                    rec["error"] = str(e)
+                    if first_error is None:
+                        first_error = e
+                cand_records.append(rec)
+
+            valid = [r for r in cand_records if r["valid"]]
+            if valid:
+                # Rank: evidence beats no-evidence; larger margin beats
+                # smaller; ties keep the LOWEST index (default framing).
+                winner = max(
+                    valid,
+                    key=lambda r: (
+                        r["hack_margin"] is not None,
+                        r["hack_margin"] if r["hack_margin"] is not None
+                        else float("-inf"),
+                        -r["index"],
+                    ),
+                )
+                new_source = winner["source"]
+                _post_validate(
+                    new_source, contract=reward_contract, kg_store=kg_store,
+                    parent_hash=parent_hash, new_version=new_iter_id,
+                    write_to=target_path,
+                    parent_hparams=gate_parent_hparams,
+                    parent_tracking=parent_tracking,
+                    parent_tracking_kernel_hash=parent_tracking_kernel_hash,
+                    metric_observables=metric_observables,
+                    replay_inputs=replay_inputs,
+                    replay_parent=replay_parent,
+                    hack_replays=hack_replays,
+                )
+                winner_promoted = True
+                if on_event is not None:
+                    on_event({
+                        "type": "edit_candidates_ranked",
+                        "n": k,
+                        "valid": len(valid),
+                        "selected": winner["index"],
+                        "margins": [r["hack_margin"] for r in cand_records],
+                    })
+                _write_candidate_report(
+                    iter_dir, new_iter_id, cand_records, winner["index"])
+            else:
+                # Every candidate failed validation — fall through to the
+                # single-shot retry below, seeded with the first error
+                # (same repair semantics as the K=1 path's attempt 2).
+                _write_candidate_report(
+                    iter_dir, new_iter_id, cand_records, None)
+                if on_event is not None:
+                    on_event({
+                        "type": "log_line",
+                        "text": f"[edit] all {k} candidates rejected — "
+                                "falling back to repair retry",
+                    })
+                assert first_error is not None
+                raise_after_retry = first_error
+                retry_user = (
+                    user_prompt
+                    + "\n\n# RETRY\n"
+                    + RETRY_REMINDER_PREFIX
+                    + "\n\n## VALIDATION_ERRORS_ON_PREVIOUS_ATTEMPT\n"
+                    + str(raise_after_retry)
+                )
+                new_source = _call_llm(
+                    client, _EDIT_SYSTEM, retry_user,
+                    on_event=on_event, attempt=2,
+                )
+                _post_validate(
+                    new_source, contract=reward_contract, kg_store=kg_store,
+                    parent_hash=parent_hash, new_version=new_iter_id,
+                    write_to=target_path,
+                    parent_hparams=gate_parent_hparams,
+                    parent_tracking=parent_tracking,
+                    parent_tracking_kernel_hash=parent_tracking_kernel_hash,
+                    metric_observables=metric_observables,
+                    replay_inputs=replay_inputs,
+                    replay_parent=replay_parent,
+                    hack_replays=hack_replays,
+                )
+                winner_promoted = True
+
+        # Attempt 1 (single-shot path; skipped when best-of-K promoted).
+        # §RS_EDIT_REPAIR_RETRIES: bounded repair-retry loop. Attempt 1 is
+        # unconditional; on EditValidationError we re-prompt with the
+        # validation errors appended, up to `_edit_repair_retries()`
+        # additional attempts (default 1, i.e. 2 total attempts — byte-
+        # identical to the pre-knob behavior). The LAST attempt's
+        # EditValidationError is re-raised to the caller (sculpt.py /
+        # apply_prompt_edit callers already catch it and fail the stage
+        # cleanly rather than letting it crash the process).
+        if not winner_promoted:
+            max_retries = _edit_repair_retries()
+            last_err: EditValidationError | None = None
+            attempt_prompt = user_prompt
+            for attempt in range(1, max_retries + 2):
+                try:
+                    new_source = _call_llm(
+                        client, _EDIT_SYSTEM, attempt_prompt,
+                        on_event=on_event, attempt=attempt,
+                    )
+                    if on_event is not None:
+                        on_event({
+                            "type": "log_line",
+                            "text": f"[edit] post-validate (attempt {attempt})",
+                        })
+                    _post_validate(
+                        new_source, contract=reward_contract, kg_store=kg_store,
+                        parent_hash=parent_hash, new_version=new_iter_id,
+                        write_to=target_path,
+                        parent_hparams=gate_parent_hparams,
+                        parent_tracking=parent_tracking,
+                        parent_tracking_kernel_hash=parent_tracking_kernel_hash,
+                        metric_observables=metric_observables,
+                        replay_inputs=replay_inputs,
+                        replay_parent=replay_parent,
+                        hack_replays=hack_replays,
+                    )
+                    last_err = None
+                    break
+                except EditValidationError as err:
+                    last_err = err
+                    if attempt >= max_retries + 1:
+                        break
+                    print(
+                        f"[edit] attempt {attempt} failed: {err}. Retrying "
+                        f"({max_retries + 1 - attempt} attempt(s) left).",
+                        file=sys.stderr, flush=True)
+                    if on_event is not None:
+                        on_event({
+                            "type": "log_line",
+                            "text": (
+                                f"[edit] attempt {attempt} rejected: {err}; "
+                                "retrying"
+                            ),
+                        })
+                    attempt_prompt = (
+                        user_prompt
+                        + "\n\n# RETRY\n"
+                        + RETRY_REMINDER_PREFIX
+                        + "\n\n## VALIDATION_ERRORS_ON_PREVIOUS_ATTEMPT\n"
+                        + str(err)
+                    )
+            if last_err is not None:
+                raise last_err
 
         _write_current_reexport(rewards_dir, target_path)
+        # §Ship 54-pre (#12): persist the partition-gate report next to the
+        # iter so the sculpt loop (which passes no on_event) can surface it in
+        # the changelog. Written ONLY when a metric steers AND there is
+        # something to report — byte-identical otherwise.
+        if metric_observables and (plan.flag_reasons or plan.screen is not None):
+            _write_partition_report(iter_dir, new_iter_id, plan, metric_observables)
         if on_event is not None:
             on_event({
                 "type": "log_line",
@@ -1149,6 +2143,86 @@ def apply_prompt_edit(
     )
 
 
+def _write_partition_report(
+    iter_dir: Path | str | None,
+    new_iter_id: str,
+    plan: EditPlan,
+    metric_observables: "frozenset[str]",
+) -> None:
+    """§Ship 54-pre (#12): persist the partition-gate report to
+    `<iter_dir>/partition_gate.json` so the sculpt loop (no on_event on the
+    apply_edits call) can surface it in the changelog. Never raises — a
+    reporting failure must not break a committed reward edit."""
+    if iter_dir is None:
+        return
+    try:
+        d = Path(iter_dir)
+        if not d.is_dir():
+            return
+        screen = plan.screen
+        report = {
+            "version": new_iter_id,
+            "metric_observables": sorted(metric_observables),
+            "flag_reasons": list(plan.flag_reasons),
+            "flagged_edit_count": len(plan.flagged_edits),
+            "held_out": list(getattr(screen, "held_out", []) or []),
+            "gate_hparams": list(getattr(screen, "gate_hparams", []) or []),
+        }
+        (d / "partition_gate.json").write_text(
+            json.dumps(report, indent=2, sort_keys=True, default=str),
+            encoding="utf-8")
+    except Exception as e:  # noqa: BLE001 — reporting is advisory, never fatal
+        print(f"[edit] partition report write skipped: "
+              f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
+
+
+def _write_candidate_report(
+    iter_dir: Path | str | None,
+    new_iter_id: str,
+    cand_records: "list[dict[str, Any]]",
+    selected: "int | None",
+) -> None:
+    """§best-of-K: persist the candidate slate — every framing's verdict,
+    margin and source — to `<iter_dir>/edit_candidates.json` + the raw
+    candidate sources under `<iter_dir>/edit_candidates/`. This is the
+    per-iteration paper trail for "which strategies were considered and
+    why this one won" (provenance for the selection decision, not just
+    the winning artifact). Never raises."""
+    if iter_dir is None:
+        return
+    try:
+        d = Path(iter_dir)
+        if not d.is_dir():
+            return
+        src_dir = d / "edit_candidates"
+        src_dir.mkdir(exist_ok=True)
+        rows = []
+        for rec in cand_records:
+            source = rec.get("source")
+            if source:
+                (src_dir / f"cand{rec['index']}.py").write_text(
+                    source, encoding="utf-8")
+            rows.append({
+                "index": rec["index"],
+                "framing": _framing_name(rec["index"]),
+                "valid": rec["valid"],
+                "hack_margin": rec["hack_margin"],
+                "source_sha256": rec.get("source_sha256"),
+                "error": rec.get("error"),
+            })
+        report = {
+            "version": new_iter_id,
+            "selected": selected,
+            "candidates": rows,
+        }
+        (d / "edit_candidates.json").write_text(
+            json.dumps(report, indent=2, sort_keys=True, default=str),
+            encoding="utf-8")
+    except Exception as e:  # noqa: BLE001 — reporting is advisory, never fatal
+        print(f"[edit] candidate report write skipped: "
+              f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
+
+
 def _write_current_reexport(rewards_dir: Path, latest: Path) -> None:
     """Rewrite `<rewards_dir>/current.py` so `compute_reward`,
     `REWARD_SPEC`, and (when present) `compute_reward_batched` point
@@ -1193,4 +2267,10 @@ if hasattr(_mod, "compute_reward_batched"):
     compute_reward_batched = _mod.compute_reward_batched
     __all__.append("compute_reward_batched")
 '''
-    current.write_text(src, encoding="utf-8")
+    # ``current.py`` is a mutable convenience pointer (the promoted world
+    # selection remains authoritative), but readers still must never observe a
+    # truncated module if the process dies during a rewrite.  Match the env
+    # pointer's tmp+replace discipline.
+    tmp = rewards_dir / "current.py.tmp"
+    tmp.write_text(src, encoding="utf-8")
+    tmp.replace(current)

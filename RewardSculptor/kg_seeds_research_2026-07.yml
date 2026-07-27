@@ -1,0 +1,70 @@
+# §Research sweep 2026-07-05 — KG expansion seeds (RESEARCH_GAP_ANALYSIS §4).
+#
+# Papers surfaced by the literature sweep behind
+# docs/internal/RESEARCH_GAP_ANALYSIS.md, vetted for APPLICABILITY the
+# same way as kg_seeds_campaign.yml: every entry must plausibly ground a
+# diagnose/edit/env decision or an eval-methodology choice. Committed as
+# the provenance of this KG delta.
+#
+# Ingest:  SCULPTOR_KG_PATH=<shared> ingest_from_seeds(this file)
+# Extract: sculpt kg extract --all   (LLM + PDF cost — run deliberately)
+
+papers:
+  # ── LLM reward design: 2024-2026 successors of the Eureka line
+  - arxiv_id: "2410.14660"
+    title: "CARD: Coder-Agnostic Reward Design with Trajectory Preference Evaluation"
+    rationale: "TPE pre-training gate (candidate reward must rank success>failure trajectories BEFORE GPU is spent) — the published ancestor of the replay/hack-income screens; also evidence that cheap gated single-chain editing rivals population search on manipulation."
+  - arxiv_id: "2406.01309"
+    title: "REvolve: Reward Evolution with Large Language Models using Human Feedback"
+    rationale: "True evolutionary reward search (islands, migration, crossover) with human-Elo fitness; argues Eureka is greedy single-chain — grounds edits about candidate diversity and search topology."
+  - arxiv_id: "2410.17233"
+    title: "ICPL: In-Context Preference Learning for Reward Design"
+    rationale: "Preference-over-videos in-context refinement, ~30x fewer queries than PbRL — grounds diagnose/edit when a human-feedback channel replaces a programmatic fitness."
+  - arxiv_id: "2410.09187"
+    title: "Automatic Reward Shaping from Progress Functions (ProgressCounts)"
+    rationale: "LLM writes a PROGRESS function; count-based intrinsic reward does the shaping — 4 policy samples/task vs Eureka's 48-80. Grounds sparse-reward and sample-budget edits, and progress-channel design."
+
+  # ── LLM/automated environment + curriculum design
+  - arxiv_id: "2411.01775"
+    title: "Eurekaverse: Environment Curriculum Generation via Large Language Models"
+    rationale: "LLM-written env curriculum with held-out never-shown-to-LLM eval benchmark and proxy-metric intermediate selection — the evaluation-hygiene pattern for env co-iteration."
+  - arxiv_id: "2403.12014"
+    title: "EnvGen: Generating and Adapting Environments via LLMs for Training Embodied Agents"
+    rationale: "LLM-generated envs used ONLY for training, all reported numbers from the original env — grounds train/eval separation decisions in the env-spec layer."
+  - arxiv_id: "2405.15568"
+    title: "OMNI-EPIC: Open-endedness via Models of human Notions of Interestingness with Environments Programmed in Code"
+    rationale: "Generates env AND reward as code; separates the success-checker from the training reward; its 72.7% human-agreement study quantifies why ungated generated metrics need a trust pipeline."
+
+  # ── humanoid agile skills: what explosive motion actually requires
+  - arxiv_id: "2406.10759"
+    title: "Humanoid Parkour Learning"
+    rationale: "The reference-free existence proof: H1 platform/gap jumps with NO motion prior — but via fractal terrain forcing, 10-obstacle auto-curriculum (promote >75% / demote <50%), two-stage training. Grounds env-curriculum edits for jump-class skills."
+  - arxiv_id: "2502.08378"
+    title: "HoST: Learning Humanoid Standing-up Control across Diverse Postures"
+    rationale: "G1 non-periodic whole-body skill from scratch via MULTI-CRITIC reward groups + terrain curriculum — grounds reward-decomposition edits when a single scalar reward can't balance phases."
+  - arxiv_id: "2502.01143"
+    title: "ASAP: Aligning Simulation and Real-World Physics for Learning Agile Humanoid Whole-Body Skills"
+    rationale: "Every published G1 jump rides a retargeted reference + delta-action sim2real — grounds reference-trajectory (sculptor/reference.py) and sim2real edits."
+  - arxiv_id: "2403.10506"
+    title: "HumanoidBench: Simulated Humanoid Benchmark for Whole-Body Locomotion and Manipulation"
+    rationale: "Documents jumping as THE hard-exploration failure for shaped-reward RL (hurdle task) — grounds diagnoses that separate exploration failure from reward failure."
+  - arxiv_id: "2401.16337"
+    title: "Curriculum-Based Reinforcement Learning of Quadrupedal Jumping (reference-free)"
+    rationale: "Reference-free quadruped jumping NEEDS a staged curriculum (in-place -> forward -> obstacle); the quadruped contrast for jump-class env edits (also the AME456 capstone's domain)."
+
+  # ── machine-judge reliability + evaluation methodology
+  - arxiv_id: "2310.12921"
+    title: "Vision-Language Models are Zero-Shot Reward Models for Reinforcement Learning (VLM-RM)"
+    rationale: "CLIP-as-reward: 100% on coarse poses, 0% on fine pose distinctions, and policies Goodhart the undiscriminating judge — grounds L4/VLM-grounding design and naturalness-channel caveats."
+  - arxiv_id: "2402.03681"
+    title: "RL-VLM-F: Reinforcement Learning from Vision Language Foundation Model Feedback"
+    rationale: "Raw VLM reward scores are noisy/inconsistent; PAIRWISE preferences with analyze-then-label are the reliable query mode — grounds any VLM-judge integration."
+  - arxiv_id: "2303.07280"
+    title: "Vision-Language Models as Success Detectors (SuccessVQA)"
+    rationale: "Fine-tuned VLM success detectors: 83-85% in-distribution, ~59-62% out-of-distribution — the measured reliability budget for VLM verdicts on novel tasks."
+  - arxiv_id: "2108.13264"
+    title: "Deep Reinforcement Learning at the Edge of the Statistical Precipice"
+    rationale: "IQM + stratified bootstrap CIs + performance profiles; N=10 minimum for trustworthy aggregates — grounds the eval harness's statistics and the in-loop selection-noise fixes."
+  - arxiv_id: "2502.08844"
+    title: "MuJoCo Playground"
+    rationale: "G1/H1 tasks with DOCUMENTED reward formulations + RSL-RL, humanoid training in 15-30 min/GPU — the comparability benchmark and honest human-expert reward baselines."

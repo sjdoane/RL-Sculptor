@@ -47,7 +47,11 @@ def test_create_then_get_project(
     slug = body["slug"]
     assert slug == "test-quadruped"
     assert body["display_name"] == "Test Quadruped"
-    assert body["status"] in ("draft", "configured")
+    # "ready" once the user-wide shared KG exists (bootstrap creates it);
+    # "configured" only when KG resolution finds nothing (legacy fix:
+    # the per-project kg/graph.db is never created anymore and used to
+    # pin every project at "configured" forever).
+    assert body["status"] in ("draft", "configured", "ready")
     assert body["adapter_class"] == "sculptor.adapters.gym_sb3.GymSB3Adapter"
 
     # Filesystem: sculpt_init outputs + UI-only dirs.
@@ -142,6 +146,9 @@ def test_list_empty(client: TestClient) -> None:
 
 # ── delete ─────────────────────────────────────────────────────────────
 def test_delete_project(client: TestClient, tmp_projects_root: Path) -> None:
+    """Chunk A1: delete is a MOVE into the trash, not a hard delete —
+    the project dir must be gone from projects_root but the tree
+    (and its metadata.json) must still exist under `.trash/`."""
     r = client.post("/projects", json={"name": "ToDelete"})
     slug = r.json()["slug"]
     assert (tmp_projects_root / slug).is_dir()
@@ -150,7 +157,18 @@ def test_delete_project(client: TestClient, tmp_projects_root: Path) -> None:
     assert r.status_code == 204
     assert not (tmp_projects_root / slug).exists()
 
-    # Repeat delete should 404.
+    # Gone from the live listing too.
+    r = client.get("/projects")
+    assert slug not in {p["slug"] for p in r.json()}
+
+    # Recoverable: present in trash with the moved tree intact.
+    trash_root = tmp_projects_root.parent / ".trash"
+    entries = [d for d in trash_root.iterdir() if d.is_dir()]
+    assert len(entries) == 1
+    assert (entries[0] / "trash_meta.json").is_file()
+    assert (entries[0] / slug / "metadata.json").is_file()
+
+    # Repeat delete should 404 (already moved out of projects_root).
     r = client.delete(f"/projects/{slug}")
     assert r.status_code == 404
     assert r.json()["type"] == "/problems/not-found"
@@ -647,3 +665,88 @@ def test_patch_settings_no_trailing_newline(
     with config.open("rb") as f:
         parsed = tomllib.load(f)
     assert parsed["iteration"]["steps_per_iter"] == 123
+
+
+# ── §env generalization: read-only env-spec surface ─────────────────────
+def test_env_spec_endpoint_inactive_then_active(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    import json as _json
+
+    r = client.post("/projects", json={"name": "EnvSpec"})
+    assert r.status_code == 201
+    slug = r.json()["slug"]
+
+    # No env spec yet → inactive, no versions.
+    r = client.get(f"/projects/{slug}/env-spec")
+    assert r.status_code == 200, r.text
+    assert r.json() == {"active": False, "current": None, "versions": []}
+
+    # Materialize a spec the way the loop does (v<N>.json + current copy).
+    env_dir = tmp_projects_root / slug / "env"
+    env_dir.mkdir()
+    spec = {
+        "env_spec_version": 1,
+        "meta": {"version": "v0", "source": "generated"},
+        "shared": {"episode_length_s": 10.0},
+        "train": {"entropy_coef_scale": 2.0},
+    }
+    (env_dir / "v0.json").write_text(_json.dumps(spec))
+    spec2 = {**spec, "meta": {"version": "v1", "source": "diagnoser"}}
+    (env_dir / "v1.json").write_text(_json.dumps(spec2))
+    (env_dir / "current.json").write_text(_json.dumps(spec2))
+
+    r = client.get(f"/projects/{slug}/env-spec")
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["active"] is True
+    assert body["versions"] == ["v0", "v1"]
+    assert body["current"]["meta"]["version"] == "v1"
+    assert body["current"]["train"]["entropy_coef_scale"] == 2.0
+
+    # Corrupt current.json degrades to inactive, versions still listed.
+    (env_dir / "current.json").write_text("{not json")
+    r = client.get(f"/projects/{slug}/env-spec")
+    assert r.status_code == 200
+    assert r.json()["active"] is False
+    assert r.json()["versions"] == ["v0", "v1"]
+
+
+def test_env_spec_endpoint_404_for_unknown_project(
+    client: TestClient, tmp_projects_root: Path,
+) -> None:
+    r = client.get("/projects/nope/env-spec")
+    assert r.status_code == 404
+
+
+# ── traversal-shaped slugs (regression: %2E%2E → 500) ──────────────────
+def test_traversal_slug_is_404_not_500(
+    client: TestClient, tmp_projects_root: Path
+) -> None:
+    import shutil
+
+    # Slug ".." resolves to the PARENT of the projects root. Plant a
+    # parseable metadata.json + config.toml there — before the slug guard
+    # in ProjectStore.get this parsed fine, then blew up constructing
+    # ProjectDetail(slug="..") with a pydantic ValidationError → HTTP 500.
+    r = client.post("/projects", json={"name": "Victim"})
+    assert r.status_code == 201
+    slug = r.json()["slug"]
+    parent = tmp_projects_root.parent
+    shutil.copy(tmp_projects_root / slug / "metadata.json", parent)
+    shutil.copy(tmp_projects_root / slug / "config.toml", parent)
+
+    # %2E%2E must stay percent-encoded on the wire — httpx collapses a
+    # literal "/../" client-side — so the route sees slug="..".
+    for path in ("/projects/%2E%2E/env-spec", "/projects/%2E%2E"):
+        r = client.get(path)
+        assert r.status_code == 404, f"{path}: {r.status_code} {r.text}"
+        assert r.json()["type"] == "/problems/not-found"
+
+
+def test_store_get_rejects_malformed_slugs(tmp_path: Path) -> None:
+    from backend.services.project_store import ProjectStore
+
+    store = ProjectStore(tmp_path / "projects")
+    for bad in ("..", ".", "a/b", "a\\b", "A", "-x", "x-", ""):
+        assert store.get(bad) is None, bad

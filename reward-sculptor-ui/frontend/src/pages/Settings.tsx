@@ -3,12 +3,15 @@ import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 
 import { Icon } from "@/components/rs/icon";
-import { Badge, Btn, Field, Segmented, ToggleRow } from "@/components/rs/primitives";
+import { Badge, Btn, EmptyState, Field, Segmented, ToggleRow } from "@/components/rs/primitives";
 import { useSystemInfo } from "@/hooks/useDashboard";
 import { useRemoteSettings, useSharedKgStats, useSystemGpu } from "@/hooks/useLibrary";
 import { useTheme } from "@/hooks/useTheme";
-import { putRemoteSettings, runRemoteDoctor } from "@/lib/api";
-import type { GpuDevice, RemoteDoctorResponse, RemoteSettings } from "@/lib/types";
+import { usePurgeTrash, useRestoreTrash, useTrash } from "@/hooks/useTrash";
+import { ApiError, putAnthropicApiKey, putRemoteSettings, runRemoteDoctor } from "@/lib/api";
+import { qk } from "@/lib/queryKeys";
+import { formatRelative } from "@/lib/utils";
+import type { GpuDevice, RemoteDoctorResponse, RemoteSettings, TrashEntry } from "@/lib/types";
 
 export default function Settings() {
   const { data, isLoading, error } = useSystemInfo();
@@ -43,6 +46,7 @@ export default function Settings() {
         )}
 
         <ThemeCard />
+        <TrashCard />
         <ResetCacheCard />
       </div>
     </div>
@@ -69,8 +73,25 @@ function KvRow({ k, v, mono, truncate }: { k: string; v: string; mono?: boolean;
   );
 }
 
-// ── API key (read-only — no write endpoint; honest per Finding B) ─────
+// ── API key (localhost-only persistence; value is never read back) ────
 function ApiKeyCard({ isSet, masked }: { isSet: boolean; masked: string | null }) {
+  const qc = useQueryClient();
+  const [value, setValue] = useState("");
+  const [show, setShow] = useState(false);
+  const save = useMutation({
+    mutationFn: putAnthropicApiKey,
+    onSuccess: async () => {
+      setValue("");
+      setShow(false);
+      await qc.invalidateQueries({ queryKey: qk.systemInfo() });
+      toast.success("Anthropic API key saved", {
+        description: "Live runs are available now — no backend restart needed.",
+      });
+    },
+    onError: (error: Error) => toast.error("Could not save API key", {
+      description: error.message,
+    }),
+  });
   return (
     <div className="rs-card">
       <div className="rs-card-head">
@@ -78,18 +99,62 @@ function ApiKeyCard({ isSet, masked }: { isSet: boolean; masked: string | null }
         <Badge status={isSet ? "completed" : "errored"} label={isSet ? "Connected" : "Not set"} />
       </div>
       <div className="rs-card-pad rs-vgap-8">
-        {isSet ? (
+        {isSet && (
           <div className="rs-kv">
             <KvRow k="api key" v={masked ?? "set"} mono />
-            <KvRow k="source" v="ANTHROPIC_API_KEY" />
+            <KvRow k="availability" v="Live runs enabled" />
           </div>
-        ) : (
-          <div className="rs-vgap-8">
+        )}
+        {!isSet && (
+          <div className="rs-banner warn">
+            <Icon name="alert-triangle" size={17} />
+            <span className="rs-grow">
+              No key set — only pipeline checks are available until a key is saved.
+            </span>
+          </div>
+        )}
+        <div className="rs-vgap-8" style={{ paddingTop: isSet ? 4 : 0 }}>
+          <Field
+            label={isSet ? "Replace API key" : "Anthropic API key"}
+            hint="Stored locally with owner-only permissions; never returned by the API."
+            htmlFor="anthropic-api-key"
+          >
+            <div className="rs-flex rs-gap-8">
+              <input
+                id="anthropic-api-key"
+                className="rs-input mono rs-grow"
+                type={show ? "text" : "password"}
+                value={value}
+                onChange={(event) => setValue(event.target.value)}
+                placeholder="sk-ant-…"
+                autoComplete="off"
+                spellCheck={false}
+                disabled={save.isPending}
+              />
+              <Btn
+                kind="ghost"
+                icon={show ? "eye-off" : "eye"}
+                onClick={() => setShow((current) => !current)}
+                disabled={save.isPending}
+                title={show ? "Hide key" : "Show key"}
+              >
+                {show ? "Hide" : "Show"}
+              </Btn>
+              <Btn
+                kind="primary"
+                icon={save.isPending ? "loader" : "check"}
+                onClick={() => save.mutate(value.trim())}
+                disabled={save.isPending || value.trim().length < 20}
+              >
+                {save.isPending ? "Saving…" : "Save key"}
+              </Btn>
+            </div>
+          </Field>
+          {!isSet && (
             <p className="rs-sub" style={{ margin: 0 }}>
-              No key set — only <code className="mono">--dry-run</code> sculpt is available. Set{" "}
-              <code className="mono">ANTHROPIC_API_KEY</code> in your shell or in{" "}
-              <code className="mono">../RewardSculptor/.env</code>, then restart the backend.
+              The key activates immediately and remains available after restart.
             </p>
+          )}
             <a
               href="https://console.anthropic.com/settings/keys"
               target="_blank"
@@ -99,8 +164,7 @@ function ApiKeyCard({ isSet, masked }: { isSet: boolean; masked: string | null }
             >
               Get a key at console.anthropic.com <Icon name="external" size={13} />
             </a>
-          </div>
-        )}
+        </div>
       </div>
     </div>
   );
@@ -293,53 +357,38 @@ function RemoteGpuCard() {
             desc="Applies to new runs and mission stages; overrides any [remote] table in project config.toml. Rollouts stay local unless opted in below."
             label="Dispatch training remotely"
           />
-          <div className="rs-flex rs-gap-8 rs-wrap">
-            <div style={{ flex: "2 1 220px" }}>
-              <Field label="Host" htmlFor="rm-host">
-                <input id="rm-host" className="rs-input" placeholder="203.0.113.7" value={f.host}
-                  onChange={(e) => set({ host: e.target.value })} />
-              </Field>
-            </div>
-            <div style={{ flex: "0 1 110px" }}>
-              <Field label="Port" htmlFor="rm-port">
-                <input id="rm-port" className="rs-input" type="number" min={1} max={65535} value={f.port}
-                  onChange={(e) => set({ port: clampPort(e.target.value) })} />
-              </Field>
-            </div>
-            <div style={{ flex: "1 1 120px" }}>
-              <Field label="User" htmlFor="rm-user">
-                <input id="rm-user" className="rs-input" placeholder="root" value={f.user}
-                  onChange={(e) => set({ user: e.target.value })} />
-              </Field>
-            </div>
-          </div>
-          <div className="rs-flex rs-gap-8 rs-wrap">
-            <div style={{ flex: "1 1 220px" }}>
-              <Field label="SSH key path" htmlFor="rm-key">
-                <input id="rm-key" className="rs-input" placeholder="~/.ssh/id_ed25519" value={f.key_path}
-                  onChange={(e) => set({ key_path: e.target.value })} />
-              </Field>
-            </div>
-            <div style={{ flex: "1 1 220px" }}>
-              <Field label="Remote python" hint="printed by provision_remote.sh" htmlFor="rm-python">
-                <input id="rm-python" className="rs-input" value={f.remote_python}
-                  onChange={(e) => set({ remote_python: e.target.value })} />
-              </Field>
-            </div>
-          </div>
-          <div className="rs-flex rs-gap-8 rs-wrap">
-            <div style={{ flex: "1 1 220px" }}>
-              <Field label="Remote workdir" hint="/workspace/… on a network volume" htmlFor="rm-workdir">
-                <input id="rm-workdir" className="rs-input" value={f.remote_workdir}
-                  onChange={(e) => set({ remote_workdir: e.target.value })} />
-              </Field>
-            </div>
-            <div style={{ flex: "0 1 140px" }}>
-              <Field label="Pod device" hint="blank = cuda:0" htmlFor="rm-device">
-                <input id="rm-device" className="rs-input" placeholder="cuda:0" value={f.device}
-                  onChange={(e) => set({ device: e.target.value })} />
-              </Field>
-            </div>
+          {/* All connection fields share ONE grid so rows keep their columns
+              aligned when they wrap (the old per-row flex-basis mix left
+              ragged widths at narrow card sizes). */}
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(190px, 1fr))", gap: 12 }}>
+            <Field label="Host" htmlFor="rm-host">
+              <input id="rm-host" className="rs-input" placeholder="203.0.113.7" value={f.host}
+                onChange={(e) => set({ host: e.target.value })} />
+            </Field>
+            <Field label="Port" htmlFor="rm-port">
+              <input id="rm-port" className="rs-input" type="number" min={1} max={65535} value={f.port}
+                onChange={(e) => set({ port: clampPort(e.target.value) })} />
+            </Field>
+            <Field label="User" htmlFor="rm-user">
+              <input id="rm-user" className="rs-input" placeholder="root" value={f.user}
+                onChange={(e) => set({ user: e.target.value })} />
+            </Field>
+            <Field label="SSH key path" htmlFor="rm-key">
+              <input id="rm-key" className="rs-input" placeholder="~/.ssh/id_ed25519" value={f.key_path}
+                onChange={(e) => set({ key_path: e.target.value })} />
+            </Field>
+            <Field label="Remote python" hint="printed by provision_remote.sh" htmlFor="rm-python">
+              <input id="rm-python" className="rs-input" value={f.remote_python}
+                onChange={(e) => set({ remote_python: e.target.value })} />
+            </Field>
+            <Field label="Remote workdir" hint="/workspace/… on a network volume" htmlFor="rm-workdir">
+              <input id="rm-workdir" className="rs-input" value={f.remote_workdir}
+                onChange={(e) => set({ remote_workdir: e.target.value })} />
+            </Field>
+            <Field label="Pod device" hint="blank = cuda:0" htmlFor="rm-device">
+              <input id="rm-device" className="rs-input" placeholder="cuda:0" value={f.device}
+                onChange={(e) => set({ device: e.target.value })} />
+            </Field>
           </div>
           <ToggleRow
             on={f.rollout_remote}
@@ -425,6 +474,7 @@ function SharedKgCard() {
               <KgStat label="Failure modes" value={data.failure_modes} />
               <KgStat label="Reward comps" value={data.reward_components} />
               <KgStat label="Environments" value={data.environments} />
+              <KgStat label="Run experience" value={data.run_cases} />
               <KgStat label="Edges" value={data.edges} />
             </div>
             <div className="rs-kv">
@@ -492,6 +542,168 @@ function ThemeCard() {
           />
         </div>
       </div>
+    </div>
+  );
+}
+
+// ── trash (recoverable deletes) ───────────────────────────────────────
+function fmtTrashBytes(n: number): string {
+  if (n >= 1e9) return `${(n / 1e9).toFixed(1)} GB`;
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)} MB`;
+  if (n >= 1e3) return `${Math.max(1, Math.round(n / 1e3))} KB`;
+  return `${n} B`;
+}
+
+function TrashCard() {
+  const { data, isLoading, error } = useTrash();
+  const entries = data ?? [];
+  return (
+    <div className="rs-card">
+      <div className="rs-card-head">
+        <div className="rs-card-title"><Icon name="trash" size={16} />Trash</div>
+        <span className="rs-sub" style={{ fontSize: 12 }}>
+          {entries.length > 0 ? `${entries.length} recoverable` : "recoverable deletes"}
+        </span>
+      </div>
+      <div className="rs-card-pad rs-vgap-8">
+        <p className="rs-sub" style={{ margin: 0 }}>
+          Deleted projects and missions land here. Restore returns them to their
+          original location; purge removes them from disk permanently.
+        </p>
+        {isLoading && <p className="rs-sub">Loading trash…</p>}
+        {error && (
+          <div className="rs-banner err">
+            <Icon name="alert-triangle" size={17} />
+            <span className="rs-grow">Could not load trash: {(error as Error).message}</span>
+          </div>
+        )}
+        {!isLoading && !error && entries.length === 0 && (
+          <EmptyState
+            icon="trash"
+            title="Trash is empty"
+            sub="Deleting a project or mission moves it here so it can be recovered."
+          />
+        )}
+        {entries.map((e) => (
+          <TrashRow key={e.entry_id} entry={e} />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function TrashRow({ entry }: { entry: TrashEntry }) {
+  const restore = useRestoreTrash();
+  const purge = usePurgeTrash();
+  const [confirm, setConfirm] = useState("");
+  const [purging, setPurging] = useState(false);
+  const matches = confirm.trim() === entry.entry_id;
+  const busy = restore.isPending || purge.isPending;
+
+  const onRestore = () => {
+    restore.mutate(entry.entry_id, {
+      onSuccess: () => toast.success("Restored", { description: `${entry.display_name} is back in place.` }),
+      onError: (err) => {
+        const msg = err instanceof ApiError ? err.problem.detail ?? err.problem.title : (err as Error).message;
+        toast.error("Could not restore", { description: msg });
+      },
+    });
+  };
+  const onPurge = () => {
+    if (!matches) return;
+    purge.mutate(entry.entry_id, {
+      onSuccess: () => {
+        toast.success("Purged", { description: `${entry.display_name} was permanently deleted.` });
+        setPurging(false);
+        setConfirm("");
+      },
+      onError: (err) => {
+        const msg = err instanceof ApiError ? err.problem.detail ?? err.problem.title : (err as Error).message;
+        toast.error("Could not purge", { description: msg });
+      },
+    });
+  };
+
+  return (
+    <div
+      style={{
+        border: "1px solid var(--hairline)",
+        borderRadius: "var(--radius-md)",
+        padding: "10px 12px",
+        background: "var(--canvas-soft)",
+      }}
+    >
+      <div className="rs-flex rs-gap-12 rs-wrap" style={{ alignItems: "center", fontSize: 12.5 }}>
+        <span className="rs-tag" style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: 0.3 }}>{entry.kind || "unknown"}</span>
+        <span style={{ fontWeight: 500, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={entry.slug}>
+          {entry.display_name}
+        </span>
+        {entry.slug !== entry.display_name && (
+          <code className="mono rs-sub" style={{ fontSize: 11 }}>{entry.slug}</code>
+        )}
+        {entry.unreadable && (
+          <span className="rs-badge amber" style={{ fontSize: 9.5 }}>
+            <Icon name="alert-triangle" size={11} />unreadable
+          </span>
+        )}
+        <span className="rs-num rs-sub" style={{ fontSize: 11 }}>{fmtTrashBytes(entry.size_bytes)}</span>
+        <span className="rs-sub" style={{ fontSize: 11 }}>{formatRelative(entry.deleted_at)}</span>
+        <span style={{ marginLeft: "auto", display: "flex", gap: 8 }}>
+          <Btn
+            kind="ghost"
+            size="sm"
+            icon={restore.isPending ? "loader" : "refresh-cw"}
+            disabled={busy}
+            onClick={onRestore}
+          >
+            Restore
+          </Btn>
+          {!purging && (
+            <Btn kind="quiet" size="sm" icon="trash" disabled={busy} onClick={() => setPurging(true)}>
+              Purge
+            </Btn>
+          )}
+        </span>
+      </div>
+      {purging && (
+        <div
+          className="rs-vgap-8"
+          style={{
+            marginTop: 10,
+            paddingTop: 10,
+            borderTop: "1px solid color-mix(in srgb, var(--st-rose) 35%, transparent)",
+          }}
+        >
+          <p style={{ margin: 0, fontSize: 12, color: "var(--st-rose-fg)" }}>
+            Permanent — this cannot be undone. Type the entry id to confirm.
+          </p>
+          <Field label={<>Type <code className="mono">{entry.entry_id}</code></>} htmlFor={`purge-${entry.entry_id}`}>
+            <input
+              id={`purge-${entry.entry_id}`}
+              className="rs-input mono"
+              value={confirm}
+              onChange={(ev) => setConfirm(ev.target.value)}
+              placeholder={entry.entry_id}
+              disabled={purge.isPending}
+              autoComplete="off"
+            />
+          </Field>
+          <div style={{ display: "flex", justifyContent: "flex-end", gap: 8 }}>
+            <Btn kind="quiet" size="sm" onClick={() => { setPurging(false); setConfirm(""); }} disabled={purge.isPending}>
+              Cancel
+            </Btn>
+            <Btn
+              kind="danger"
+              size="sm"
+              icon={purge.isPending ? "loader" : "trash"}
+              onClick={onPurge}
+              disabled={!matches || purge.isPending}
+            >
+              Purge permanently
+            </Btn>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

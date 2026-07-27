@@ -52,7 +52,9 @@ from sculptor.edit import (
     EditValidationError,
     _write_current_reexport,
     apply_edits,
+    apply_prompt_edit,
 )
+from sculptor.llm import set_llm_log_dir
 
 
 # ── Structured-event markers (additive; dual-write) ──────────────────────
@@ -86,6 +88,17 @@ class IterOutcome:
     #: §Ship 33: ground-truth task fitness on this iter's rollout when a
     #: `fitness_fn` is supplied to sculpt_run; None in the blind default.
     fitness: float | None = None
+    #: §Metric-quality laws (LAW 7): the naturalness-GATED fitness used for
+    #: STEER selection (best-by-fitness, early-stop) — distinct from `fitness`,
+    #: the true, displayed task score. A joint-limit exploit → 0.0; a 'severe'
+    #: (vel/torque) rollout is down-weighted. Defaults to `fitness` (no audit /
+    #: ok verdict / observe mode), so selection is unchanged for clean iters.
+    steer_fitness: float | None = None
+    #: §Metric-quality laws (LAW 11): the naturalness steer-factor this iter
+    #: (1.0 natural, <1 down-weighted, 0 joint-limit exploit) — tracked across
+    #: iters for the Goodhart-onset early-stop (metric rising while naturalness
+    #: falls = gaming). 1.0 when no audit ran (byte-identical default).
+    naturalness_factor: float | None = None
     #: §Ship 33: the reward version FILE actually trained this iter (the
     #: input v<n> that `fitness` measures) — distinct from reward_path_after
     #: (the edit produced FROM it, untested until the next iter). Best-by-
@@ -96,6 +109,37 @@ class IterOutcome:
     #: N+1 reverted, iter N's edit was discarded and never measured, so its
     #: forward fitness delta must NOT be attributed (verdict stays 'unknown').
     reverted_to_best: bool = False
+    #: §Convergence (RL_SCULPTOR_AUDIT §4.1): DENSE sub-success progress in
+    #: [0,1] from the metric's optional `progress_score` key (min over the
+    #: same saturating channels WITHOUT the completion gate). Used ONLY to
+    #: RANK candidates below success — never granted as task success, never
+    #: shown as the fitness. None when the metric doesn't emit it.
+    progress: float | None = None
+    #: The naturalness-GATED progress (mirrors `steer_fitness` for the dense
+    #: channel) — an unnatural rollout cannot rank up via progress either.
+    steer_progress: float | None = None
+    #: §2026-07-03 case-memory upgrade: compact identities of the edits
+    #: APPLIED this iter ("<operation> <target_term>", deferred excluded)
+    #: so the KG run-case records WHAT was tried, not just how many.
+    applied_edits: list[str] = field(default_factory=list)
+    #: The metric's physical component breakdown for this iter's rollout
+    #: (same dict the diagnoser sees) — the case-memory behavior signature.
+    fitness_components: dict[str, Any] | None = None
+    #: §env generalization 3/4: the env-spec version (e.g. "v2") ACTIVE
+    #: while this iter trained — the environment half of the (reward, env)
+    #: training config that `fitness` measured. None when the project has
+    #: no env spec. Keep-best/revert repoint env/current.json to the best
+    #: iter's version, exactly like the reward flow.
+    env_spec_trained: str | None = None
+    #: §Selection statistics: the checkpoint this iter's rollout(s) were
+    #: evaluated from — retained so the end-of-run fresh-seed re-eval can
+    #: re-roll the KEPT best on seeds never used for selection (the
+    #: report-of-max discipline from Empirical Design in RL).
+    checkpoint_path: Path | None = None
+    #: Atomic authored artifact tuple used by both train and rollout. None
+    #: preserves legacy projects that have no WorldSpec selection.
+    world_selection_hash: str | None = None
+    world_selection_path: Path | None = None
 
 
 @dataclass
@@ -110,6 +154,30 @@ class SculptRunResult:
     fitness_history: list[float] = field(default_factory=list)
     best_fitness: float | None = None
     best_fitness_iter: int | None = None
+    #: §Convergence (RL_SCULPTOR_AUDIT §4.1): per-iter dense progress
+    #: (parallel to fitness_history; 0.0 when the metric emits none) and the
+    #: steer-progress of the best iter — the LEXICOGRAPHIC tie-break for
+    #: best-by-fitness selection when spec fitness ties (e.g. all-zero
+    #: below the completion gate).
+    progress_history: list[float] = field(default_factory=list)
+    best_progress: float | None = None
+    #: §env generalization 3/4: env-spec version active at the best iter
+    #: (the environment half of what best_fitness measured); None when the
+    #: project has no env spec.
+    best_env_spec: str | None = None
+    #: §Selection statistics: the kept-best pair re-evaluated on FRESH
+    #: rollout seeds after the run (median / per-seed raw scores). The
+    #: selected `best_fitness` is a max statistic over the run; this is
+    #: the unbiased report number. None when fresh eval didn't run.
+    best_fitness_fresh: float | None = None
+    fresh_fitness_per_seed: list[float] = field(default_factory=list)
+    best_world_selection_hash: str | None = None
+    #: §env-authoring §10.2: the best iteration's PINNED selection file —
+    #: the world half of the winning training config. World revert and the
+    #: end-of-run best-tuple commit source their five immutable refs
+    #: (world/task/eval/catalog/clarifications) from THIS selection, so a
+    #: later diagnoser world edit can never be paired with the best reward.
+    best_world_selection_path: str | None = None
 
     @property
     def final_reward_path(self) -> Path | None:
@@ -130,6 +198,46 @@ class SculptRunResult:
                         and outcome.reward_path_trained):
                     return outcome.reward_path_trained
         return self.final_reward_path
+
+
+# ── Selection statistics ─────────────────────────────────────────────────
+# §RL_SCULPTOR_AUDIT §6 (noise-floor bests) + RESEARCH_GAP_ANALYSIS §7.2:
+# the lexicographic (steer_fitness, steer_progress) comparison used for
+# keep-best/revert is made on NOISY scalars. Measured on tuck-jump E2E
+# runs 1-2: behaviorally-identical re-rolls of the same reward differ by
+# 1e-7..4e-6 in progress (sensor-noise ramps), which minted "new bests"
+# below display precision, reset fitness_patience, and armed reverts on
+# noise-level dips. The epsilon makes a progress tie-break require
+# clearing that measured band; spec fitness comparisons are unchanged
+# (the completion gate is a sharp 0/positive signal, not a noise ramp).
+# progress_epsilon=0.0 restores the exact pre-epsilon behavior.
+def _lex_improved(cur: tuple, best: tuple, progress_epsilon: float) -> bool:
+    """New-best test: spec decides; progress breaks ties only when it
+    clears the noise band."""
+    if cur[0] != best[0]:
+        return cur[0] > best[0]
+    return cur[1] > best[1] + progress_epsilon
+
+
+def _lex_regressed(cur: tuple, best: tuple, progress_epsilon: float) -> bool:
+    """Strict-regression test (arms revert). Symmetric to `_lex_improved`:
+    a progress dip inside the noise band is a TIE (build forward, patience
+    counts), not a regression — reverting on seed noise re-trains the
+    incumbent and discards the corrective edit, the exact deadlock the
+    tie-no-revert fix (loop 1) removed."""
+    if cur[0] != best[0]:
+        return cur[0] < best[0]
+    return cur[1] < best[1] - progress_epsilon
+
+
+def _median(values: list[float]) -> float | None:
+    """Median over per-seed evaluation scores. Chosen over mean (one
+    diverged seed shouldn't drag the estimate) and over IQM (needs ≥4
+    samples to differ from the median; eval_seeds is typically 2-5)."""
+    if not values:
+        return None
+    import statistics
+    return float(statistics.median(values))
 
 
 # ── Config / paths ───────────────────────────────────────────────────────
@@ -170,6 +278,112 @@ def _find_latest_reward_version(rewards_dir: Path) -> tuple[int, Path]:
     return best_n, best_path
 
 
+_ITERATION_COMPLETE_MARKER = "iteration_complete.json"
+
+
+def _iteration_has_completion_marker(iter_dir: Path, iter_index: int) -> bool:
+    """Return whether ``iter_dir`` has this runner's valid durable marker.
+
+    A mere file is not enough: corrupt, copied, or wrong-index markers must
+    preserve same-iteration crash recovery rather than silently skipping work.
+    """
+    marker = iter_dir / _ITERATION_COMPLETE_MARKER
+    try:
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return (
+        isinstance(payload, dict)
+        and payload.get("schema") == 1
+        and type(payload.get("iter")) is int
+        and payload.get("iter") == iter_index
+        and payload.get("state") == "completed"
+    )
+
+
+def _find_resume_start_iteration(
+    rewards_dir: Path,
+    runs_dir: Path,
+) -> int:
+    """Choose the first unfinished iteration without redefining resume.
+
+    Reward versions normally advance the iteration counter. A fully valid
+    iteration may intentionally produce no reward rewrite, however, so reward
+    numbering alone can point back at work that already completed. Durable,
+    contiguous completion markers advance past only those iterations. A
+    missing/corrupt marker keeps the existing same-iteration crash-resume
+    behavior.
+    """
+    start_iter, _ = _find_latest_reward_version(rewards_dir)
+    while _iteration_has_completion_marker(
+        runs_dir / f"iter_{start_iter}", start_iter
+    ):
+        start_iter += 1
+    return start_iter
+
+
+def _write_iteration_completion_marker(
+    iter_dir: Path,
+    *,
+    iter_index: int,
+    checkpoint_path: Path,
+    reward_version_before: int,
+    reward_version_after: int | None,
+    world_selection_hash: str | None,
+) -> None:
+    """Atomically make a completed iteration distinguishable from a crash."""
+    from sculptor.run_context import write_json_atomic
+
+    write_json_atomic(
+        iter_dir / _ITERATION_COMPLETE_MARKER,
+        {
+            "schema": 1,
+            "state": "completed",
+            "iter": int(iter_index),
+            "completed_at": _utc_now_iso(),
+            "checkpoint": str(checkpoint_path),
+            "reward_version_before": int(reward_version_before),
+            "reward_version_after": reward_version_after,
+            "world_selection_hash": world_selection_hash,
+        },
+    )
+
+
+def _current_reward_target(rewards_dir: Path) -> Optional[Path]:
+    """The v<n>.py that rewards/current.py ACTUALLY re-exports — i.e. the
+    reward training runs. Parses the `_LATEST = _HERE / 'v<n>.py'` line
+    that `_write_current_reexport` emits (the only writer of current.py).
+
+    §2026-07-04 run-boundary fix: current.py's target and the highest
+    v<n>.py on disk DIVERGE whenever a run ends with best-by-fitness
+    selection repointing current.py at an older version and a later run
+    resumes (tuck-jump iter 16: trained v14 via current.py while the
+    loop recorded reward_path_trained=v16 AND applied the diagnosis to
+    v16's source — so keep-best then kept a never-trained file). Every
+    consumer of "what trained this iter" must resolve through here.
+
+    Accepts BOTH generated formats — this module's
+    `_LATEST = _HERE / 'v<n>.py'` AND the UI backend's
+    `_TARGET = Path(__file__).resolve().parent / 'v<n>.py'`
+    (reward-sculptor-ui reward_store.py; ported from the parallel
+    worktree fix, which caught that a UI-rewritten current.py would
+    otherwise silently fall back to the buggy latest-version behavior).
+    Returns None when current.py is missing or hand-edited into an
+    unrecognizable shape (callers fall back to the latest version)."""
+    current = rewards_dir / "current.py"
+    if not current.is_file():
+        return None
+    try:
+        text = current.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    m = re.search(r"/\s*(['\"])(v\d+\.py)\1", text)
+    if not m:
+        return None
+    target = rewards_dir / m.group(2)
+    return target if target.is_file() else None
+
+
 def _ensure_current_py(rewards_dir: Path) -> Path:
     """Make sure rewards/current.py exists and re-exports the latest v<n>.py."""
     current = rewards_dir / "current.py"
@@ -177,6 +391,212 @@ def _ensure_current_py(rewards_dir: Path) -> Path:
     if not current.is_file():
         _write_current_reexport(rewards_dir, latest)
     return current
+
+
+def _pin_authored_selection(adapter: Any, project: Path) -> str | None:
+    """Pin selection_current to an immutable selection_vN for this run."""
+    raw = str(getattr(adapter, "world_selection_path", "") or "")
+    if not raw:
+        return None
+    from sculptor.world.artifacts import WorldArtifactStore
+
+    path = Path(raw).resolve()
+    store = WorldArtifactStore(project)
+    selection = store.read_selection(path)
+    if selection is None:
+        raise ValueError(f"authored world selection missing: {path}")
+    pinned = store.env_dir / f"selection_v{selection.selection_version}.json"
+    if not pinned.is_file():
+        raise ValueError(f"immutable authored selection missing: {pinned}")
+    adapter.world_selection_path = str(pinned.resolve())
+    return selection.tuple_hash
+
+
+def _promote_iteration_selection(
+    adapter: Any, project: Path, *, reward_path: Path,
+    env_spec_version: str | None,
+    base_selection: Path | None = None,
+) -> tuple[str | None, Path | None]:
+    """Atomically bind the iter's reward/env versions to its authored world.
+
+    World/task/evaluation/catalog/clarification refs stay immutable within
+    this promotion. Only the reward and legacy EnvSpec refs change as the
+    existing loop searches. One selection replace is the commit point, so
+    train and rollout can never see a mixed tuple after a crash.
+
+    ``base_selection``: source the five immutable refs from THIS pinned
+    selection instead of the adapter's current pointer — the world-half
+    revert/keep-best primitive (§10: revert restores the tuple, never one
+    file in isolation). Reward/env refs still come from the arguments.
+    """
+    raw = str(getattr(adapter, "world_selection_path", "") or "")
+    if not raw:
+        return None, None
+    from sculptor.world.artifacts import ArtifactRef, WorldArtifactStore
+
+    store = WorldArtifactStore(project)
+    source = Path(base_selection).resolve() if base_selection else (
+        Path(raw).resolve())
+    current = store.read_selection(source)
+    if current is None:
+        raise ValueError(f"authored world selection missing: {source}")
+    refs = dict(current.refs)
+    reward = Path(reward_path).resolve()
+    refs["reward"] = ArtifactRef.from_path(
+        "reward", reward.stem, reward, base=project)
+    if env_spec_version:
+        env_path = project / "env" / f"{env_spec_version}.json"
+        if not env_path.is_file():
+            raise ValueError(
+                f"EnvSpec {env_spec_version} missing for authored tuple")
+        refs["env_spec"] = ArtifactRef.from_path(
+            "env_spec", env_spec_version, env_path, base=project)
+    promoted = store.promote(
+        refs, evaluation_lineage=current.evaluation_lineage)
+    pinned = store.env_dir / f"selection_v{promoted.selection_version}.json"
+    adapter.world_selection_path = str(pinned.resolve())
+    return promoted.tuple_hash, pinned
+
+
+def _prepare_reference_guided_run(
+    *,
+    adapter: Any,
+    project: Path,
+    rewards_dir: Path,
+    behavior_goal: str,
+    clip_id: str,
+    robot: str,
+    kg_store: Any,
+    dry_run: bool,
+) -> dict[str, Any]:
+    """Atomically install a normal-run reference prior plus task residual.
+
+    The expensive build is completed in a private staging directory first.
+    Only then is one immutable reward version created and the authored tuple
+    promoted.  A cache tied to the selected reward hash makes exact UI resumes
+    idempotent while a changed prompt, clip, robot, or clip content produces a
+    new reward version.
+    """
+    from sculptor.reference_run import (
+        build_reference_guided_reward,
+        load_exact_reference_motion,
+        reference_input_hash,
+    )
+    from sculptor.world.artifacts import WorldArtifactStore, file_sha256
+
+    selection_path = Path(
+        str(getattr(adapter, "world_selection_path", "") or "")
+    ).resolve()
+    store = WorldArtifactStore(project)
+    selection = store.read_selection(selection_path)
+    if selection is None:
+        raise ValueError(
+            "reference-guided runs require an authoritative authored "
+            "selection so the new reward can be bound atomically"
+        )
+
+    _clip, _provenance, clip_sha256 = load_exact_reference_motion(
+        clip_id=clip_id, robot=robot,
+    )
+    input_hash = reference_input_hash(
+        clip_id=clip_id,
+        robot=robot,
+        clip_sha256=clip_sha256,
+        behavior_goal=behavior_goal,
+    )
+    cache_path = project / "reports" / "reference_motion_current.json"
+    selected_reward_ref = selection.refs.get("reward")
+    selected_reward_path: Optional[Path] = None
+    if selected_reward_ref is not None:
+        selected_reward_path = Path(selected_reward_ref.path)
+        if not selected_reward_path.is_absolute():
+            selected_reward_path = project / selected_reward_path
+        selected_reward_path = selected_reward_path.resolve()
+    try:
+        cache = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        cache = {}
+    if (
+        selected_reward_path is not None
+        and selected_reward_path.is_file()
+        and cache.get("input_hash") == input_hash
+        and cache.get("reward_sha256") == file_sha256(selected_reward_path)
+        and cache.get("tuple_hash") == selection.tuple_hash
+        and (dry_run or cache.get("task_residual_authored") is True)
+    ):
+        _emit_event({
+            "type": "reference_motion_reused",
+            "clip_id": clip_id,
+            "robot": robot,
+            "reward_path": str(selected_reward_path),
+            "tuple_hash": selection.tuple_hash,
+        })
+        return dict(cache)
+
+    latest_n, _latest_path = _find_latest_reward_version(rewards_dir)
+    reward_version = f"v{latest_n + 1}"
+    _emit_event({
+        "type": "reference_motion_preparing",
+        "clip_id": clip_id,
+        "robot": robot,
+        "reward_version": reward_version,
+        "task_residual": "skipped_dry_run" if dry_run else "authoring",
+    })
+    built = build_reference_guided_reward(
+        clip_id=clip_id,
+        robot=robot,
+        behavior_goal=behavior_goal,
+        reward_version=reward_version,
+        reward_contract=adapter.reward_contract(),
+        kg_store=kg_store,
+        dry_run=dry_run,
+    )
+    env_ref = selection.refs.get("env_spec")
+    if env_ref is None:
+        raise ValueError(
+            "authored selection has no env_spec; cannot bind reference reward"
+        )
+    target_path = rewards_dir / f"{reward_version}.py"
+    # Immutable reward versions are never overwritten.  If a concurrent
+    # process allocated this name, fail closed rather than rebasing the
+    # already-authored source onto a different selection.
+    with target_path.open("x", encoding="utf-8") as handle:
+        handle.write(built.source)
+
+    tuple_hash, pinned = _promote_iteration_selection(
+        adapter,
+        project,
+        reward_path=target_path,
+        env_spec_version=env_ref.version,
+        base_selection=selection_path,
+    )
+    if tuple_hash is None or pinned is None:
+        raise ValueError("reference reward promotion produced no authored tuple")
+    _write_current_reexport(rewards_dir, target_path)
+
+    result = {
+        "schema": 1,
+        "input_hash": input_hash,
+        "clip_id": built.clip_id,
+        "robot": built.robot,
+        "clip_sha256": built.clip_sha256,
+        "reference_target_sha256": built.target_sha256,
+        "phase_mode": built.phase_mode,
+        "phase_duration_s": built.phase_duration_s,
+        "task_residual_authored": built.task_residual_authored,
+        "reward_version": reward_version,
+        "reward_path": str(target_path.resolve()),
+        "reward_sha256": file_sha256(target_path),
+        "selection_path": str(pinned.resolve()),
+        "tuple_hash": tuple_hash,
+    }
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(
+        json.dumps(result, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    _emit_event({"type": "reference_motion_installed", **result})
+    return result
 
 
 # ── Git helpers (optional) ───────────────────────────────────────────────
@@ -480,6 +900,15 @@ def _load_json_if_present(path: Path) -> dict:
         return {}
 
 
+def _load_partition_gate_report(iter_dir: Path | None) -> dict:
+    """§Ship 54-pre (#12): read the partition-gate report apply_edits writes to
+    `<iter_dir>/partition_gate.json` (present only when an objective metric
+    steers AND there was something to flag). Empty dict otherwise."""
+    if iter_dir is None:
+        return {}
+    return _load_json_if_present(Path(iter_dir) / "partition_gate.json")
+
+
 # ── Metric extraction ────────────────────────────────────────────────────
 def _extract_primary_metric(
     metrics_json: dict, behavior_json: dict, primary_key: str,
@@ -520,6 +949,7 @@ def _append_changelog(
     behavior_metric_names: list[str],
     behavior: dict,
     diagnosis: Diagnosis,
+    partition_summary: dict | None = None,
 ) -> Path:
     path = project / "CHANGELOG.md"
     if not path.is_file():
@@ -572,6 +1002,16 @@ def _append_changelog(
                 lines.append("    - *paper_refs*: (novel)")
     else:
         lines.append("- **Edits**: (none)")
+
+    # §Ship 54-pre (#12): the shaping↔metric partition gate's flags for this
+    # iter (present only when an objective metric steered the run and something
+    # was flagged). Records WHICH edits reach into the metric's held-out surface
+    # or proposed easing a completion gate — the v5-class signal made visible.
+    if partition_summary and partition_summary.get("flag_reasons"):
+        lines.append("- **Metric partition gate**:")
+        for r in partition_summary.get("flag_reasons", []):
+            lines.append(f"  - {r}")
+
     lines.append("")
     with path.open("a", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
@@ -669,6 +1109,101 @@ def _alive_reward_keys(reward_path: Path) -> set[str]:
 
 
 # ── Per-phase resume helpers ─────────────────────────────────────────────
+def _latest_valid_partial_policy(iter_dir: Path) -> Optional[Path]:
+    """Return the newest parseable intermediate policy in an incomplete iter.
+
+    MJLab/rsl_rl writes ``logs/model_<iteration>.pt`` throughout a long train,
+    while Sculptor promotes ``checkpoint.pt`` only after the subprocess exits
+    successfully. A backend reload or machine interruption must therefore
+    recover the newest valid intermediate policy instead of discarding hours of
+    learning and falling back to the previous outer iteration.
+
+    This remains adapter-neutral at the orchestration boundary: it recognizes
+    the existing rsl_rl filename convention and returns ``None`` for every
+    other adapter. Corrupt/truncated candidates are skipped newest-first.
+    """
+    logs_dir = iter_dir / "logs"
+    if not logs_dir.is_dir():
+        return None
+    candidates: list[tuple[int, int, Path]] = []
+    for path in logs_dir.glob("model_*.pt"):
+        suffix = path.stem.removeprefix("model_")
+        if suffix.isdigit() and path.stat().st_size > 0:
+            stat = path.stat()
+            # rsl_rl restarts its model counter when a training subprocess is
+            # resumed.  An older model_600.pt can therefore coexist with a
+            # newly-written model_50.pt.  Filesystem write time, not the
+            # counter embedded in the name, identifies the newest recovery
+            # point; the counter is only a deterministic tie-breaker.
+            candidates.append((stat.st_mtime_ns, int(suffix), path))
+    if not candidates:
+        return None
+
+    import torch as _torch
+
+    for _mtime_ns, _iteration, path in sorted(candidates, reverse=True):
+        try:
+            _torch.load(path, map_location="cpu", weights_only=False)
+        except Exception:  # noqa: BLE001 -- interrupted save; try older model
+            continue
+        return path
+    return None
+
+
+def _valid_promoted_policy(iter_dir: Path) -> Optional[Path]:
+    """Return this iteration's first loadable promoted checkpoint.
+
+    Torch checkpoints are parsed before reuse; zip-based adapters remain
+    opaque but must at least have non-zero content.  Keeping this check in one
+    place makes same-iteration resume and cross-iteration warm-start apply the
+    same integrity rule.
+    """
+    for ext in ("pt", "zip"):
+        checkpoint = iter_dir / f"checkpoint.{ext}"
+        if not checkpoint.is_file() or checkpoint.stat().st_size == 0:
+            continue
+        if ext == "pt":
+            try:
+                import torch as _torch
+
+                _torch.load(
+                    checkpoint, map_location="cpu", weights_only=False)
+            except Exception:  # noqa: BLE001 -- corrupt; try next candidate
+                continue
+        return checkpoint
+    return None
+
+
+def _latest_preceding_policy(
+    runs_dir: Path, *, before_iter: int,
+) -> Optional[Path]:
+    """Find the newest recoverable policy from an earlier outer iteration.
+
+    Reward versions and outer-iteration directories are intentionally
+    monotonic but need not be contiguous: a UI-authored reward can advance
+    ``v3`` to ``v5`` without ever training ``iter_4``.  Resume must therefore
+    search actual ``iter_<N>`` artifacts instead of assuming ``N - 1`` exists.
+    A completed checkpoint wins within an iteration; otherwise its newest
+    parseable intermediate model is eligible.  The current iteration is
+    excluded because :func:`_train_or_resume` handles its exact-tuple crash
+    recovery with higher precedence.
+    """
+    candidates: list[tuple[int, Path]] = []
+    for iter_dir in runs_dir.glob("iter_*"):
+        suffix = iter_dir.name.removeprefix("iter_")
+        if suffix.isdigit() and int(suffix) < before_iter:
+            candidates.append((int(suffix), iter_dir))
+
+    for _index, iter_dir in sorted(candidates, reverse=True):
+        promoted = _valid_promoted_policy(iter_dir)
+        if promoted is not None:
+            return promoted
+        partial = _latest_valid_partial_policy(iter_dir)
+        if partial is not None:
+            return partial
+    return None
+
+
 def _train_or_resume(
     *, adapter, iter_index: int, iter_dir: Path,
     reward_module_path: Path, steps: int, seed: int,
@@ -693,22 +1228,9 @@ def _train_or_resume(
     from sculptor.adapters.base import TrainResult
 
     # Most adapters save to `checkpoint.pt`; gym_sb3 uses `checkpoint.zip`.
-    # Check for either so we can resume across both paths.
-    for ext in ("pt", "zip"):
-        ckpt = iter_dir / f"checkpoint.{ext}"
-        if not ckpt.is_file() or ckpt.stat().st_size == 0:
-            continue
-        # Integrity check: torch can parse the `.pt`; we treat `.zip`
-        # (SB3) as opaque since we don't have a standalone validator.
-        ok = True
-        if ext == "pt":
-            try:
-                import torch as _torch
-                _torch.load(ckpt, map_location="cpu", weights_only=False)
-            except Exception:  # noqa: BLE001 — corrupt checkpoint, fall through
-                ok = False
-        if not ok:
-            continue
+    # Apply the same integrity rule used by cross-iteration resume discovery.
+    ckpt = _valid_promoted_policy(iter_dir)
+    if ckpt is not None:
         # Assemble best-effort metrics from prior metrics.json.
         metrics: dict[str, float] = {}
         try:
@@ -741,7 +1263,23 @@ def _train_or_resume(
             logs_path=iter_dir / "logs",
         )
 
-    # Fresh training run — no checkpoint or all candidates corrupt.
+    # Fresh/recovered training run — no promoted checkpoint or all promoted
+    # candidates corrupt. Prefer this iter's newest valid intermediate policy
+    # over a previous-iter warm start: it was trained under the exact current
+    # reward/seed/world tuple and is strictly closer to the interrupted phase.
+    partial_policy = _latest_valid_partial_policy(iter_dir)
+    if partial_policy is not None:
+        superseded = init_policy_path
+        init_policy_path = partial_policy
+        _emit_event({
+            "type": "partial_train_recovered",
+            "iter": iter_index,
+            "checkpoint": str(partial_policy),
+            "superseded_warm_start": (
+                str(superseded) if superseded is not None else None
+            ),
+        })
+
     train_kwargs: dict[str, Any] = dict(
         reward_module_path=reward_module_path,
         output_dir=iter_dir,
@@ -788,6 +1326,10 @@ def _rollout_or_resume(
     playback_speed: float | None = None,
     render_every: int | None = None,
     fps: float | None = None,
+    render_width: int | None = None,
+    render_height: int | None = None,
+    render_env_index: int | None = None,
+    seed: int | None = None,
 ) -> None:
     """Skip `adapter.rollout` when the three artifacts it produces
     (`rollout.mp4` + `trajectory.npz` + `behavior.json`) are ALL on
@@ -820,6 +1362,12 @@ def _rollout_or_resume(
         ("playback_speed", playback_speed),
         ("render_every", render_every),
         ("fps", fps),
+        ("render_width", render_width),
+        ("render_height", render_height),
+        ("render_env_index", render_env_index),
+        # §Selection statistics: distinct eval seeds per repeat rollout —
+        # adapters that don't declare `seed` (gym_sb3) silently skip it.
+        ("seed", seed),
     ):
         if value is not None and name in sig.parameters:
             extra[name] = value
@@ -829,6 +1377,49 @@ def _rollout_or_resume(
         n_episodes=n_episodes,
         **extra,
     )
+
+
+def _collect_hack_replays(adapter, runs_dir: Path, iter_index: int,
+                          limit: int = 2) -> list[dict]:
+    """§Hack-income regression screen (edit.py `_screen_hack_income`;
+    CARD arXiv:2410.14660 TPE adapted): archived exploit replays.
+
+    Scans PRIOR iteration dirs for a `reward_hacking` diagnosis whose
+    rollout is still on disk, newest first, and builds a reward replay
+    for each (≤ `limit` — replay construction is the expensive step).
+    Every failure path is skipped silently: the screen is advisory
+    hardening; a missing artifact must never block the edit."""
+    out: list[dict] = []
+    try:
+        candidates: list[tuple[int, Path]] = []
+        for d in Path(runs_dir).glob("iter_*"):
+            try:
+                k = int(d.name.split("_", 1)[1])
+            except (IndexError, ValueError):
+                continue
+            if k >= iter_index:
+                continue
+            diag = d / "diagnosis.json"
+            roll = d / "rollout"
+            if not diag.is_file() or not (roll / "trajectory.npz").is_file():
+                continue
+            try:
+                fm = (json.loads(diag.read_text(encoding="utf-8"))
+                      .get("failure_modes") or [])
+            except Exception:  # noqa: BLE001 — unreadable diagnosis skipped
+                continue
+            if "reward_hacking" in fm:
+                candidates.append((k, roll))
+        for k, roll in sorted(candidates, reverse=True)[:max(0, limit)]:
+            try:
+                replay = adapter.build_reward_replay(roll)
+            except Exception:  # noqa: BLE001 — per-replay best-effort
+                replay = None
+            if replay:
+                out.append({"label": f"iter {k}", "replay_inputs": replay})
+    except Exception:  # noqa: BLE001 — collection is best-effort
+        return out
+    return out
 
 
 # ── One iteration ────────────────────────────────────────────────────────
@@ -919,6 +1510,27 @@ def _fitness_components_for_prompt(detail: dict | None) -> dict | None:
     return out or None
 
 
+# §D24 (F4): the D20 hollow-success / D23 exemplar-scope-mismatch class in
+# one number — a success criterion that reads "satisfied" while the
+# certified objective fitness is at/near zero. 0.05 (not a strict >0.0
+# check) so a near-zero float noise floor still counts as a contradiction
+# rather than a technically-nonzero pass.
+FITNESS_CONTRADICTION_EPS = 0.05
+
+
+def _is_fitness_contradiction(
+    criterion_passed: bool, fitness: float | None,
+) -> bool:
+    """True iff `criterion_passed` while `fitness` is at/near zero.
+    `fitness is None` (no fitness_fn wired for this stage) never
+    contradicts — there is nothing to contradict against."""
+    return (
+        bool(criterion_passed)
+        and fitness is not None
+        and fitness <= FITNESS_CONTRADICTION_EPS
+    )
+
+
 def _run_one_iter(
     *,
     iter_index: int,
@@ -938,6 +1550,8 @@ def _run_one_iter(
     prior_fitness: Optional[dict] = None,
     fitness_observe_only: bool = False,
     revert_base: Optional[Path] = None,
+    env_revert_version: Optional[str] = None,
+    world_revert_selection: Optional[Path] = None,
     human_note: Optional[str] = None,
 ) -> IterOutcome:
     iter_cfg = cfg.get("iteration", {}) or {}
@@ -949,18 +1563,48 @@ def _run_one_iter(
 
     iter_dir = runs_dir / f"iter_{iter_index}"
     iter_dir.mkdir(parents=True, exist_ok=True)
+    # §llm provenance: every LLM call this iteration makes (diagnose /
+    # edit / env / physics) archives to iter_dir/llm_calls.jsonl. The
+    # contextvar is last-set-wins across the single-threaded pipeline.
+    set_llm_log_dir(iter_dir)
 
     reward_path_before = _ensure_current_py(rewards_dir)
     latest_n, latest_reward_file = _find_latest_reward_version(rewards_dir)
 
+    # §2026-07-04 run-boundary fix: training uses current.py, so the edit
+    # base and the trained-reward record must follow current.py's ACTUAL
+    # re-export target — not the highest v<n>.py on disk. The two diverge
+    # when a previous run's best-by-fitness selection repointed current.py
+    # at an older version and this run resumed: the old code then applied
+    # this iter's diagnosis to the wrong source AND recorded (and could
+    # keep-best) a reward that never trained (tuck-jump iter 16 trained
+    # v14 while everything downstream said v16). The new edit is still
+    # numbered v<latest_n+1> (monotonic numbering, trained content).
+    trained_target = _current_reward_target(rewards_dir)
+    if trained_target is None:
+        # A generated current.py whose target file was DELETED would
+        # crash mid-train on import — repair the re-export to the latest
+        # version so training, records, and edits agree again. (A
+        # hand-written, unrecognizable current.py is left alone: training
+        # uses it as-is and the records fall back to the latest version.)
+        cur_text = ""
+        try:
+            cur_text = (rewards_dir / "current.py").read_text(
+                encoding="utf-8")
+        except OSError:
+            pass
+        if "Auto-generated by sculptor.edit" in cur_text:
+            _write_current_reexport(rewards_dir, latest_reward_file)
+        trained_target = latest_reward_file
+
     # §Ship 36 (F1): revert-on-regression. By default this iter trains on
-    # current.py (= latest reward) and edits from the latest v<n>. When the
-    # caller passes `revert_base` (the prior iter regressed fitness), repoint
-    # current.py at the best-so-far reward so BOTH training and the edit base
-    # use it — best-first search instead of compounding a drifting edit. The
-    # new edit is still v<latest_n+1> (monotonic numbering, best content).
-    edit_base = latest_reward_file
-    reward_path_trained = latest_reward_file
+    # current.py and edits from the reward it re-exports. When the caller
+    # passes `revert_base` (the prior iter regressed fitness), repoint
+    # current.py at the best-so-far reward so BOTH training and the edit
+    # base use it — best-first search instead of compounding a drifting
+    # edit.
+    edit_base = trained_target
+    reward_path_trained = trained_target
     reverted_to_best = False
     if revert_base is not None and Path(revert_base).is_file():
         _write_current_reexport(rewards_dir, Path(revert_base))
@@ -987,11 +1631,125 @@ def _run_one_iter(
             "reverted_to": Path(revert_base).name,
         })
 
+    # §env generalization 3/4: the environment half of the revert — when
+    # the prior iter strictly regressed, train under the env spec the
+    # best iter used, not a possibly-degraded diagnoser edit. Reverting
+    # only the reward while keeping a bad env change would attribute the
+    # env's damage to the reward. Best-effort: a missing/invalid target
+    # version logs and trains under the current spec.
+    #
+    # The loop ITERATES only the MANAGED per-project spec — the one the
+    # adapter actually trains under AND that lives at env/current.json.
+    # An explicit config env_spec_path pointing anywhere else is static
+    # configuration: no revert, no version record, no diagnoser edits
+    # (otherwise apply/record would target project/env while training
+    # reads the pinned file — silent divergence).
+    env_dir = project / "env"
+    _active_spec_path = str(getattr(adapter, "env_spec_path", "") or "")
+    try:
+        env_managed = bool(_active_spec_path) and (
+            Path(_active_spec_path).resolve()
+            == (env_dir / "current.json").resolve())
+    except OSError:  # pragma: no cover — unresolvable path
+        env_managed = False
+    if env_managed and revert_base is not None and env_revert_version:
+        try:
+            from sculptor.env_spec import (
+                read_current_env_spec, repoint_env_current)
+
+            _cur = read_current_env_spec(env_dir)
+            _cur_v = ((_cur.get("meta") or {}).get("version")
+                      if _cur else None)
+            if _cur_v != env_revert_version:
+                repoint_env_current(env_dir, env_revert_version)
+                _emit_event({
+                    "type": "env_spec_reverted",
+                    "iter": iter_index,
+                    "reverted_to": env_revert_version,
+                })
+        except Exception as e:  # noqa: BLE001 — revert is best-effort
+            sys.stderr.write(
+                f"[sculpt] iter {iter_index}: env-spec revert to "
+                f"{env_revert_version} failed ({type(e).__name__}: {e}) — "
+                f"training under the current spec\n")
+
+    # Record the env-spec version this iter actually trains under (the
+    # environment half of the training config; None = no spec/defaults
+    # or an unmanaged pinned spec).
+    env_spec_trained: Optional[str] = None
+    if env_managed:
+        try:
+            from sculptor.env_spec import read_current_env_spec as _read_env
+
+            _cur_spec = _read_env(env_dir)
+            if _cur_spec:
+                env_spec_trained = (_cur_spec.get("meta") or {}).get("version")
+                # Snapshot the exact spec into the iter dir (parallel to
+                # reward_spec.json) so policy export / audits can recover
+                # the environment half of the training config even after
+                # the project's current.json has moved on. First write
+                # wins: on crash-resume, _train_or_resume reuses the
+                # already-trained checkpoint, and current.json may have
+                # been repointed by a later apply_env_edits — rewriting
+                # would pair the checkpoint with a spec it never saw.
+                _snap = iter_dir / "env_spec.json"
+                if not _snap.exists():
+                    _snap.write_text(
+                        json.dumps(_cur_spec, indent=2, sort_keys=True,
+                                   default=str),
+                        encoding="utf-8")
+        except Exception as e:  # noqa: BLE001 — invalid spec fails later, loudly
+            sys.stderr.write(
+                f"[sculpt] iter {iter_index}: env spec unreadable "
+                f"({type(e).__name__}: {e})\n")
+
+    # Authored projects promote the complete reward/env/world/task/eval/
+    # catalog/clarification tuple before any GPU work. The adapter is then
+    # pointed at the immutable selection_vN snapshot for both train and
+    # rollout. Legacy projects take the no-op path.
+    #
+    # §env-authoring §10.2: when the prior iteration strictly regressed
+    # after a diagnoser world edit, `world_revert_selection` sources the
+    # five immutable world-half refs from the best iteration's pinned
+    # selection — the world reverts in lockstep with the reward/env pair,
+    # as one tuple. No-op when the world never changed (the refs are
+    # identical) or for legacy projects.
+    _adapter_sel = str(getattr(adapter, "world_selection_path", "") or "")
+    if (world_revert_selection is not None and _adapter_sel
+            and Path(world_revert_selection).resolve()
+            != Path(_adapter_sel).resolve()):
+        _emit_event({
+            "type": "world_selection_reverted",
+            "iter": iter_index,
+            "reverted_to": Path(world_revert_selection).name,
+        })
+    world_selection_hash, world_selection_path = (
+        _promote_iteration_selection(
+            adapter, project, reward_path=Path(reward_path_trained),
+            env_spec_version=env_spec_trained,
+            base_selection=world_revert_selection)
+    )
+    if world_selection_path is not None:
+        tuple_snapshot = iter_dir / "artifact_tuple.json"
+        if not tuple_snapshot.exists():
+            tuple_snapshot.write_bytes(world_selection_path.read_bytes())
+        _emit_event({
+            "type": "artifact_tuple_pinned",
+            "iter": iter_index,
+            "tuple_hash": world_selection_hash,
+            "selection": world_selection_path.name,
+        })
+
+    # §2026-07-04: report the version that actually TRAINS this iter
+    # (current.py's target / the revert base), not the disk maximum —
+    # the two diverge at run boundaries after best-selection.
+    _m_trained = re.fullmatch(r"v(\d+)", Path(reward_path_trained).stem)
     _emit_event({
         "type": "iter_started",
         "iter": iter_index,
         "steps": steps,
-        "reward_version_before": latest_n,
+        "reward_version_before": (
+            int(_m_trained.group(1)) if _m_trained else latest_n),
         "dry_run": bool(dry_run),
         "no_kg": bool(no_kg),
         # §Ship 15: None unless caller requested warm-start for this
@@ -1049,6 +1807,9 @@ def _run_one_iter(
         playback_speed=iter_cfg.get("playback_speed"),
         render_every=iter_cfg.get("render_every"),
         fps=iter_cfg.get("rollout_fps"),
+        render_width=iter_cfg.get("render_width"),
+        render_height=iter_cfg.get("render_height"),
+        render_env_index=iter_cfg.get("render_env_index"),
     )
 
     # §Ship 33: objective task fitness on this rollout (ground truth,
@@ -1057,18 +1818,33 @@ def _run_one_iter(
     # (spec_metric) only when --fitness-in-loop is on; None keeps the
     # blind default. A crash here must never kill the iter — honest None.
     iter_fitness: float | None = None
+    iter_progress: float | None = None
     objective_progress: dict | None = None
+    fitness_components: dict | None = None
+    # §Selection statistics: extra eval-rollout dirs (multi-seed) + the
+    # per-seed raw scores. Populated only when eval_seeds > 1 AND the
+    # fitness fn exposes `detail_dir`; the realism audit below extends
+    # its naturalness check over these dirs (min factor = safe direction).
+    extra_eval_dirs: list[Path] = []
+    fitness_per_seed: list[float] = []
+    progress_per_seed: list[float] = []
     if fitness_fn is not None:
         # §Ship 36 (F2): prefer the `.detail` accessor (rides on the fitness
         # fn) to get the FULL component breakdown in one compute; fall back to
         # the plain float for callers that supply a bare fitness_fn.
         detail_fn = getattr(fitness_fn, "detail", None)
-        fitness_components: dict | None = None
         try:
             if detail_fn is not None:
                 detail = detail_fn(iter_dir) or {}
                 iter_fitness = float(detail.get("spec_score", 0.0) or 0.0)
                 fitness_components = _fitness_components_for_prompt(detail)
+                # §Convergence (RL_SCULPTOR_AUDIT §4.1): the metric's OPTIONAL
+                # dense progress channel (min of pre-gate saturating channels).
+                # Advisory ranking signal only — absent/malformed → None.
+                pr = detail.get("progress_score")
+                if (isinstance(pr, (int, float)) and not isinstance(pr, bool)
+                        and math.isfinite(float(pr))):
+                    iter_progress = min(1.0, max(0.0, float(pr)))
             else:
                 iter_fitness = float(fitness_fn(iter_dir))
         except Exception as e:  # noqa: BLE001 — fitness is advisory, never fatal
@@ -1077,6 +1853,64 @@ def _run_one_iter(
                 f"{type(e).__name__}: {e} — treating as unavailable\n"
             )
             iter_fitness = None
+        # §Selection statistics (RESEARCH_GAP_ANALYSIS §7.2): the keep-best
+        # decision was previously made on ONE rollout batch — a noisy
+        # scalar compared with strict `>`. With `eval_seeds = K > 1` in
+        # [iteration], the same checkpoint is re-rolled K-1 more times on
+        # distinct seeds and the selection scores become the MEDIAN over
+        # seeds (robust to one diverged roll). The primary `rollout/` stays
+        # the diagnoser's view (keyframes / video / components); extras
+        # land in `rollout_eval_<k>/`. Each extra is best-effort: a failed
+        # re-roll is skipped, never fatal. Requires the fitness fn's
+        # `detail_dir` accessor (spec + generated metrics both have it).
+        _eval_seeds = 1
+        try:
+            _eval_seeds = max(1, int(iter_cfg.get("eval_seeds", 1) or 1))
+        except Exception:  # noqa: BLE001 — a malformed knob keeps N=1
+            _eval_seeds = 1
+        detail_dir_fn = getattr(fitness_fn, "detail_dir", None)
+        if (iter_fitness is not None and _eval_seeds > 1
+                and detail_dir_fn is not None):
+            fitness_per_seed = [float(iter_fitness)]
+            progress_per_seed = [float(iter_progress or 0.0)]
+            for k in range(1, _eval_seeds):
+                eval_dir = iter_dir / f"rollout_eval_{k}"
+                try:
+                    eval_dir.mkdir(exist_ok=True)
+                    _rollout_or_resume(
+                        adapter=adapter,
+                        iter_index=iter_index,
+                        rollout_dir=eval_dir,
+                        checkpoint_path=checkpoint_path,
+                        n_episodes=int(iter_cfg.get("rollout_episodes", 6)),
+                        max_episode_steps=iter_cfg.get("max_episode_steps"),
+                        playback_speed=iter_cfg.get("playback_speed"),
+                        render_every=iter_cfg.get("render_every"),
+                        fps=iter_cfg.get("rollout_fps"),
+                        # Deterministic, disjoint from training seeds
+                        # (config seed + iter) and the fresh-eval band
+                        # (90k+): reproducible re-rolls, distinct per k.
+                        seed=10_000 + iter_index * 100 + k,
+                    )
+                    d = detail_dir_fn(eval_dir) or {}
+                    fitness_per_seed.append(
+                        float(d.get("spec_score", 0.0) or 0.0))
+                    pr_k = d.get("progress_score")
+                    progress_per_seed.append(
+                        min(1.0, max(0.0, float(pr_k)))
+                        if (isinstance(pr_k, (int, float))
+                            and not isinstance(pr_k, bool)
+                            and math.isfinite(float(pr_k)))
+                        else 0.0)
+                    extra_eval_dirs.append(eval_dir)
+                except Exception as e:  # noqa: BLE001 — per-seed best-effort
+                    sys.stderr.write(
+                        f"[sculpt] iter {iter_index}: eval seed {k} "
+                        f"skipped — {type(e).__name__}: {e}\n")
+            if len(fitness_per_seed) > 1:
+                iter_fitness = _median(fitness_per_seed)
+                if iter_progress is not None:
+                    iter_progress = _median(progress_per_seed)
         if iter_fitness is not None:
             pf = prior_fitness or {}
             best_so_far = pf.get("best_so_far")
@@ -1095,14 +1929,35 @@ def _run_one_iter(
                 # and was reverted — so it proposes a DIFFERENT direction.
                 "reverted_to_best": reverted_to_best,
             }
+            # §Selection statistics: per-seed dispersion for the diagnoser —
+            # "fitness 0.4 (seeds: 0.0/0.4/0.9)" reads very differently from
+            # a stable 0.4; the LLM should know when behavior is bimodal.
+            if len(fitness_per_seed) > 1:
+                progress["eval_seeds"] = len(fitness_per_seed)
+                progress["fitness_per_seed"] = [
+                    round(v, 5) for v in fitness_per_seed]
             # Always emit for DISPLAY (chart/chip/A/B), even in observe mode.
             _emit_event({
                 "type": "iter_fitness",
                 "iter": iter_index,
                 "fitness": round(iter_fitness, 5),
+                "progress": (round(iter_progress, 5)
+                             if iter_progress is not None else None),
                 "best_so_far": progress["best_so_far"],
                 "delta_vs_previous": progress["delta"],
                 "observe_only": bool(fitness_observe_only),
+                # §Selection statistics: null/absent when eval_seeds=1.
+                "eval_seeds": (len(fitness_per_seed)
+                               if len(fitness_per_seed) > 1 else None),
+                "fitness_per_seed": ([round(v, 5) for v in fitness_per_seed]
+                                     if len(fitness_per_seed) > 1 else None),
+                # §D24 (F4): the same physical sub-component breakdown the
+                # diagnoser sees (`progress["components"]` above) — the
+                # live event previously carried scalars only, so a runtime
+                # zero-fitness contradiction (D20/D23) was invisible without
+                # an offline recompute. None when the detail path didn't
+                # run (plain-float fitness_fn fallback).
+                "components": fitness_components,
             })
             # §Ship 35: in observe mode the diagnoser must NOT see fitness —
             # the signal stays passive (no influence on the run).
@@ -1115,12 +1970,55 @@ def _run_one_iter(
     # surface the verdict. Best-effort — failures (missing file, shape
     # drift) return verdict=unknown rather than crashing the loop.
     audit_result: dict[str, Any] | None = None
+    # §LAW 7: naturalness channel — a SEPARATE signal that gates STEER credit
+    # without touching the displayed fitness. Init to a no-op pass so a failed/
+    # absent audit never suppresses steering, and the steer value defaults to
+    # the true fitness (byte-identical to the pre-LAW-7 loop).
+    naturalness: dict[str, Any] | None = None
+    iter_steer_fitness: float | None = iter_fitness
+    iter_steer_progress: float | None = iter_progress
+    iter_naturalness_factor: float = 1.0   # §LAW 11: tracked for Goodhart-onset
     try:
-        from sculptor.adapters.realism import audit_rollout
+        from sculptor.adapters.realism import (
+            audit_rollout, naturalness_channel, steer_fitness as _steer_fitness)
         audit_result = audit_rollout(
             trajectory_path=rollout_dir / "trajectory.npz",
             limits_path=rollout_dir / "mjcf_limits.json",
         )
+        # §LAW 7: derive the naturalness decision + the naturalness-gated steer
+        # fitness. A joint-limit exploit earns no steer credit; a severe
+        # (vel/torque) rollout is down-weighted. STEER mode only — in observe
+        # mode the verdict is recorded but never alters selection.
+        naturalness = naturalness_channel(audit_result)
+        audit_result["naturalness"] = naturalness
+        iter_naturalness_factor = float(naturalness.get("steer_factor", 1.0) or 1.0)
+        # §Selection statistics: when multi-seed eval ran, audit EVERY
+        # extra rollout and take the MINIMUM steer factor — the safe
+        # direction (an exploit visible on any seed earns no steer
+        # credit; median-ing naturalness would let a 1-in-K joint-limit
+        # exploit through). Best-effort per dir.
+        for _ed in extra_eval_dirs:
+            try:
+                _a = audit_rollout(
+                    trajectory_path=_ed / "trajectory.npz",
+                    limits_path=_ed / "mjcf_limits.json",
+                )
+                _f = float(
+                    naturalness_channel(_a).get("steer_factor", 1.0) or 1.0)
+                if _f < iter_naturalness_factor:
+                    iter_naturalness_factor = _f
+                    naturalness = dict(naturalness)
+                    naturalness["min_factor_source"] = _ed.name
+                    naturalness["steer_factor"] = _f
+            except Exception:  # noqa: BLE001 — extra audits advisory
+                pass
+        if not fitness_observe_only:
+            iter_steer_fitness = _steer_fitness(iter_fitness, naturalness)
+            # §Convergence: gate the dense progress channel identically — an
+            # unnatural rollout cannot rank up via progress either.
+            iter_steer_progress = _steer_fitness(iter_progress, naturalness)
+        if objective_progress is not None:
+            objective_progress["naturalness"] = naturalness
         (iter_dir / "realism_audit.json").write_text(
             json.dumps(audit_result, indent=2, sort_keys=True, default=str),
             encoding="utf-8",
@@ -1134,12 +2032,64 @@ def _run_one_iter(
             "joint_vel_p99_max": audit_result.get("joint_vel_p99_max"),
             "joint_limit_violation_frac": audit_result.get("joint_limit_violation_frac"),
             "top_joints_saturation": audit_result.get("top_joints_saturation") or [],
+            # §LAW 7: surface the naturalness decision for the UI chip + diagnoser.
+            "naturalness_flag": naturalness.get("flag"),
+            "naturalness_hard_reject": bool(naturalness.get("hard_reject")),
+            "naturalness_steer_factor": naturalness.get("steer_factor"),
         })
     except Exception as e:  # noqa: BLE001 — audit must not block the loop
         sys.stderr.write(
             f"[sculpt] iter {iter_index}: realism audit skipped — "
             f"{type(e).__name__}: {e}\n"
         )
+
+    # §Ship-56 (persistence increment): mirror the `iter_fitness` event to
+    # disk so a FINISHED stage's per-iteration fitness survives past the
+    # live job log (the UI already probes `<iter_dir>/fitness.json` for
+    # keys objective_fitness/fitness/value — nothing wrote it before this).
+    # Guard matches the compute guard above: only when a fitness_fn ran AND
+    # produced a value (fitness_fn is not None and iter_fitness is not
+    # None) — never write a stale/empty file in the blind default. Best-
+    # effort, same discipline as the realism-audit write just above.
+    if fitness_fn is not None and iter_fitness is not None:
+        try:
+            _fitness_record = {
+                "schema": 1,
+                "iter": iter_index,
+                "fitness": round(iter_fitness, 5),
+                "progress": (round(iter_progress, 5)
+                             if iter_progress is not None else None),
+                "steer_fitness": (round(iter_steer_fitness, 5)
+                                  if iter_steer_fitness is not None else None),
+                "steer_progress": (round(iter_steer_progress, 5)
+                                   if iter_steer_progress is not None else None),
+                "naturalness_factor": iter_naturalness_factor,
+                "naturalness_flag": (
+                    naturalness.get("flag") if naturalness is not None else None
+                ),
+                "naturalness_hard_reject": bool(
+                    naturalness.get("hard_reject") if naturalness is not None
+                    else False
+                ),
+                "observe_only": bool(fitness_observe_only),
+                "eval_seeds": (len(fitness_per_seed)
+                               if len(fitness_per_seed) > 1 else None),
+                "fitness_per_seed": ([round(v, 5) for v in fitness_per_seed]
+                                     if len(fitness_per_seed) > 1 else None),
+                "components": fitness_components,
+                "source": "live",
+                "recorded_at": _utc_now_iso(),
+            }
+            (iter_dir / "fitness.json").write_text(
+                json.dumps(_fitness_record, indent=2, sort_keys=True,
+                           default=str),
+                encoding="utf-8",
+            )
+        except Exception as e:  # noqa: BLE001 — recording must not block the loop
+            sys.stderr.write(
+                f"[sculpt] iter {iter_index}: fitness.json write skipped — "
+                f"{type(e).__name__}: {e}\n"
+            )
 
     # §7.4 / §Ship-8b: compute + emit the auto-physics SUGGESTION here
     # (UI surfaces the chip ASAP, before diagnose finishes). The actual
@@ -1210,6 +2160,47 @@ def _run_one_iter(
             kg_store=kg_store,
         )
 
+    # §RL_SCULPTOR_AUDIT §4.4 (loop 4b): build the edit anti-collapse
+    # replay from the rollout whose behavior the next edit must refine —
+    # THIS iter's rollout by default; the best-so-far iter's rollout when
+    # this iter strictly regressed the lexicographic (steer, progress)
+    # key (a collapsed rollout is not the behavior to protect). Adapters
+    # without replay support return None → the screen is skipped.
+    replay_inputs = None
+    if not dry_run:
+        replay_dir = rollout_dir
+        pf = prior_fitness or {}
+        best_sf = pf.get("best_so_far")
+        best_dir = pf.get("best_iter_dir")
+        if best_sf is not None and best_dir:
+            cur_key = ((iter_steer_fitness
+                        if iter_steer_fitness is not None else 0.0),
+                       (iter_steer_progress
+                        if iter_steer_progress is not None else 0.0))
+            best_key = (best_sf, pf.get("best_progress") or 0.0)
+            cand = Path(best_dir) / "rollout"
+            if cur_key < best_key and cand.is_dir():
+                replay_dir = cand
+        try:
+            replay_inputs = adapter.build_reward_replay(replay_dir)
+        except Exception as e:  # noqa: BLE001 — screen is best-effort
+            sys.stderr.write(
+                f"[sculpt] iter {iter_index}: reward replay build skipped — "
+                f"{type(e).__name__}: {e}\n")
+
+    # §Hack-income regression screen: archived exploits (prior iters the
+    # diagnoser flagged reward_hacking) the candidate must not re-open.
+    # `hack_income_screen = false` in [iteration] disables.
+    hack_replays: list[dict] = []
+    if not dry_run and bool(iter_cfg.get("hack_income_screen", True)):
+        hack_replays = _collect_hack_replays(adapter, runs_dir, iter_index)
+        if hack_replays:
+            _emit_event({
+                "type": "hack_screen_active",
+                "iter": iter_index,
+                "exploits": [hr["label"] for hr in hack_replays],
+            })
+
     # 4. Apply edits → v<n+1>.py
     new_iter_tag = f"v{latest_n + 1}"
     new_reward_path: Path | None = None
@@ -1231,11 +2222,169 @@ def _run_one_iter(
                 reward_contract=adapter.reward_contract(),
                 kg_store=kg_store,
                 iter_dir=iter_dir,
+                # §Ship 54-pre (#12): hand the active metric's held-out
+                # observable surface to the shaping↔metric partition gate.
+                # None when no objective metric steers (blind run) → gate
+                # no-ops, byte-identical.
+                metric_observables=getattr(
+                    fitness_fn, "metric_observables", None),
+                # §RL_SCULPTOR_AUDIT §4.4 (loop 4b): anti-collapse replay.
+                replay_inputs=replay_inputs,
+                # §Hack-income regression screen: caught exploits stay caught.
+                hack_replays=hack_replays or None,
+                # §best-of-K (RESEARCH_GAP_ANALYSIS §3.3): K framed candidate
+                # rewrites per diagnosis, offline-screened + margin-ranked;
+                # only the winner trains. 1 (default) = single-shot path.
+                n_candidates=int(iter_cfg.get("edit_candidates", 1)),
             )
     except EditValidationError as e:
         sys.stderr.write(
             f"[sculpt] iter {iter_index}: apply_edits skipped — "
             f"{type(e).__name__}: {e}\n")
+
+    # §env generalization 3/4: apply diagnoser-proposed env-curriculum
+    # edits (train section only, validated + bounded) — the environment
+    # counterpart of apply_edits above. The new spec version takes
+    # effect NEXT iter's training, exactly like the reward edit. Skipped
+    # in dry-run (no LLM ran) and when the diagnosis proposed none.
+    applied_env_edits: list[str] = []
+    if diagnosis.proposed_env_edits and not dry_run:
+        if not env_managed:
+            # Diagnose only shows the # ENV_SPEC surface for managed
+            # specs, so this is belt-and-braces — but never silent.
+            _emit_event({
+                "type": "env_spec_updated",
+                "iter": iter_index,
+                "new_version": None,
+                "applied": [],
+                "rejected": [
+                    {"parameter": getattr(e, "parameter", "?"),
+                     "reason": "env spec is not loop-managed "
+                               "(explicit env_spec_path)"}
+                    for e in diagnosis.proposed_env_edits
+                ],
+            })
+        else:
+            try:
+                from sculptor.env_spec import apply_env_edits
+
+                env_edit_result = apply_env_edits(
+                    env_dir, diagnosis.proposed_env_edits)
+                applied_env_edits = list(env_edit_result.get("applied") or [])
+                _emit_event({
+                    "type": "env_spec_updated",
+                    "iter": iter_index,
+                    "new_version": env_edit_result.get("new_version"),
+                    "applied": applied_env_edits,
+                    "rejected": [
+                        {"parameter": p, "reason": r[:300]}
+                        for p, r in (env_edit_result.get("rejected") or [])
+                    ],
+                })
+            except Exception as e:  # noqa: BLE001 — env edits are advisory
+                sys.stderr.write(
+                    f"[sculpt] iter {iter_index}: env-spec edits skipped — "
+                    f"{type(e).__name__}: {e}\n")
+                _emit_event({
+                    "type": "env_spec_updated",
+                    "iter": iter_index,
+                    "new_version": None,
+                    "applied": [],
+                    "rejected": [{
+                        "parameter": "*",
+                        "reason": f"{type(e).__name__}: {e}"[:300]}],
+                })
+
+    # §env-authoring §10.2: apply diagnoser-proposed world-variation
+    # retargets — the authored-world counterpart of the env edits above.
+    # apply_world_variation_edits validates per edit, re-runs the full
+    # admission gate chain, hard-verifies evaluation byte-invariance, and
+    # promotes one atomic tuple with the existing lineage; the adapter is
+    # then repointed so the NEXT iteration trains under it. Advisory:
+    # any failure logs + emits and the loop continues on the current world.
+    applied_world_edits: list[str] = []
+    if getattr(diagnosis, "proposed_world_edits", None) and not dry_run:
+        _world_pin = str(getattr(adapter, "world_selection_path", "") or "")
+        if not _world_pin:
+            # Diagnose only shows # WORLD_VARIATIONS for authored
+            # projects, so this is belt-and-braces — but never silent.
+            _emit_event({
+                "type": "world_variations_updated",
+                "iter": iter_index,
+                "world_version": None,
+                "applied": [],
+                "rejected": [
+                    {"variation_id": getattr(e, "variation_id", "?"),
+                     "reason": "project has no authored world selection"}
+                    for e in diagnosis.proposed_world_edits
+                ],
+            })
+        else:
+            try:
+                from sculptor.world.project import (
+                    WorldVariationEdit,
+                    apply_world_variation_edits,
+                )
+
+                world_edit_result = apply_world_variation_edits(project, [
+                    WorldVariationEdit(
+                        variation_id=e.variation_id,
+                        new_distribution=e.new_distribution,
+                        rationale=e.rationale,
+                    )
+                    for e in diagnosis.proposed_world_edits
+                ])
+                applied_world_edits = [
+                    a["variation_id"]
+                    for a in (world_edit_result.get("applied") or [])]
+                _new_selection = world_edit_result.get("selection")
+                if _new_selection:
+                    _new_pin = (
+                        project / "env" /
+                        f"selection_v{_new_selection['selection_version']}"
+                        ".json")
+                    adapter.world_selection_path = str(_new_pin.resolve())
+                _emit_event({
+                    "type": "world_variations_updated",
+                    "iter": iter_index,
+                    "world_version": world_edit_result.get("world_version"),
+                    "applied": [
+                        {"variation_id": a["variation_id"],
+                         "old_distribution": a["old_distribution"],
+                         "new_distribution": a["new_distribution"]}
+                        for a in (world_edit_result.get("applied") or [])
+                    ],
+                    "rejected": [
+                        {"variation_id": r.get("variation_id", "?"),
+                         "reason": str(r.get("reason", ""))[:300]}
+                        for r in (world_edit_result.get("rejected") or [])
+                    ],
+                })
+            except Exception as e:  # noqa: BLE001 — world edits are advisory
+                sys.stderr.write(
+                    f"[sculpt] iter {iter_index}: world-variation edits "
+                    f"skipped — {type(e).__name__}: {e}\n")
+                _emit_event({
+                    "type": "world_variations_updated",
+                    "iter": iter_index,
+                    "world_version": None,
+                    "applied": [],
+                    "rejected": [{
+                        "variation_id": "*",
+                        "reason": f"{type(e).__name__}: {e}"[:300]}],
+                })
+
+    # §Ship 54-pre (#12): surface the partition-gate report (written by
+    # apply_edits into iter_dir/partition_gate.json when a metric steers and
+    # there is something to flag) on the loop path, which passes no on_event.
+    partition_summary = _load_partition_gate_report(iter_dir)
+    if partition_summary:
+        _emit_event({
+            "type": "partition_gate",
+            "iter": iter_index,
+            "flagged": int(partition_summary.get("flagged_edit_count", 0) or 0),
+            "reasons": list(partition_summary.get("flag_reasons", []) or []),
+        })
 
     # 5. Previous metric for delta display
     history_path = project / "reports" / "metric_history.json"
@@ -1251,6 +2400,7 @@ def _run_one_iter(
         primary_key=primary_key,
         behavior_metric_names=behavior_metric_names,
         behavior=behavior_json, diagnosis=diagnosis,
+        partition_summary=partition_summary,
     )
 
     # Persist metric history for the next iter's delta
@@ -1307,9 +2457,27 @@ def _run_one_iter(
         "edit_count": edit_count,
         "primary_metric": primary_metric,
         "metric_delta": metric_delta,
-        "reward_version_before": latest_n,
+        # §2026-07-04: the version that actually trained (mirrors
+        # iter_started) — not the disk maximum.
+        "reward_version_before": (
+            int(_m_trained.group(1)) if _m_trained else latest_n),
         "reward_version_after": reward_version_after,
         "paper_refs": sorted(set(applied_paper_refs)),
+    })
+    _write_iteration_completion_marker(
+        iter_dir,
+        iter_index=iter_index,
+        checkpoint_path=checkpoint_path,
+        reward_version_before=(
+            int(_m_trained.group(1)) if _m_trained else latest_n
+        ),
+        reward_version_after=reward_version_after,
+        world_selection_hash=world_selection_hash,
+    )
+    _emit_event({
+        "type": "iteration_completion_marked",
+        "iter": iter_index,
+        "marker": str(iter_dir / _ITERATION_COMPLETE_MARKER),
     })
 
     # §Ship 48: never-silent env-extension signal. The diagnoser flags edits
@@ -1342,12 +2510,82 @@ def _run_one_iter(
         failure_modes=list(diagnosis.failure_modes),
         edit_count=edit_count,
         fitness=iter_fitness,
+        steer_fitness=iter_steer_fitness,
+        naturalness_factor=iter_naturalness_factor,
         reward_path_trained=reward_path_trained,
         reverted_to_best=reverted_to_best,
+        progress=iter_progress,
+        steer_progress=iter_steer_progress,
+        # §2026-07-03 case-memory upgrade: what was actually tried +
+        # the behavior signature, so the KG run-case is actionable.
+        applied_edits=[
+            f"{getattr(e, 'operation', '?')} {getattr(e, 'target_term', '?')}"
+            for e in diagnosis.proposed_edits
+            if not getattr(e, "requires_env_extension", False)
+        ] + [
+            # §env generalization 3/4: env-curriculum edits ride the same
+            # case-memory channel so the KG learns environment lessons too.
+            f"env: {a}" for a in applied_env_edits
+        ] + [
+            # §env-authoring §10.2: world-variation retargets ride it too.
+            f"world: {a}" for a in applied_world_edits
+        ],
+        fitness_components=fitness_components,
+        env_spec_trained=env_spec_trained,
+        checkpoint_path=checkpoint_path,
+        world_selection_hash=world_selection_hash,
+        world_selection_path=world_selection_path,
     )
 
 
 # ── Early stop ───────────────────────────────────────────────────────────
+def detect_goodhart_onset(
+    fitness_history: list[float],
+    naturalness_history: list[float],
+    *,
+    window: int = 3,
+    rise_tol: float = 0.02,
+    min_unnatural: int = 2,
+) -> Optional[str]:
+    """§Metric-quality laws (LAW 11): Goodhart-ONSET — the objective metric is
+    still CLIMBING while the policy has SUSTAINABLY *become* less natural, i.e.
+    it is climbing the PROXY by gaming it. Lock the prior best rather than
+    optimize further into the exploit. Returns a stop-reason string, or None.
+
+    Pure + deterministic (offline-testable). Needs >= window+1 aligned points.
+    Fires ONLY when, over the last `window` iters, ALL of:
+      (a) the metric ROSE — recent MAX exceeds the prior MAX by >= `rise_tol`
+          (max-based, so a mid-window dip-then-recover does NOT read as a rise);
+      (b) >= `min_unnatural` of those iters are NON-PASS (naturalness steer-
+          factor < 1.0 — 'severe'/exploit): a SUSTAINED loss of naturalness, not
+          one transient aggressive frame (LAW 7 down-weights a SINGLE severe iter
+          precisely because an aggressive-but-valid kick can momentarily exceed
+          3× nominal joint speed); AND
+      (c) the recent window is, on average, LESS natural than everything before
+          it — the policy is *becoming* less natural (a decline), not merely a
+          run that was always aggressive (which (c) lets through).
+    With the no-audit default (naturalness all 1.0) the count is 0, so onset
+    NEVER fires — byte-identical to the pre-LAW-11 loop."""
+    n = min(len(fitness_history), len(naturalness_history))
+    if n < window + 1:
+        return None
+    recent_f = [float(x) for x in fitness_history[n - window:n]]
+    prior_f = [float(x) for x in fitness_history[:n - window]]
+    recent_nat = [float(x) for x in naturalness_history[n - window:n]]
+    prior_nat = [float(x) for x in naturalness_history[:n - window]]
+    rose = (max(recent_f) - max(prior_f)) >= rise_tol
+    n_unnatural = sum(1 for v in recent_nat if v < 1.0 - 1e-9)
+    declined = (sum(recent_nat) / len(recent_nat)) < (
+        sum(prior_nat) / len(prior_nat)) - 1e-9
+    if rose and n_unnatural >= min_unnatural and declined:
+        return (f"goodhart onset: objective metric still climbing "
+                f"(max {max(prior_f):.3f}→{max(recent_f):.3f}) while "
+                f"{n_unnatural}/{window} recent iters became less natural "
+                f"(severe or mild) — the policy is climbing the proxy by becoming "
+                f"less natural; locking the prior best")
+    return None
+
+
 def _is_metric_still_improving(
     history: list[float],
     *,
@@ -1414,10 +2652,15 @@ def sculpt_run(
     no_kg: bool = False,
     dry_run: bool = False,
     steps_per_iter: Optional[int] = None,
+    num_envs: Optional[int] = None,
+    device: Optional[str] = None,
     max_episode_steps: Optional[int] = None,
     playback_speed: Optional[float] = None,
     render_every: Optional[int] = None,
     rollout_fps: Optional[float] = None,
+    render_width: Optional[int] = None,
+    render_height: Optional[int] = None,
+    render_env_index: Optional[int] = None,
     rollout_episodes: Optional[int] = None,
     seed: Optional[int] = None,
     auto_adjust_physics: Optional[bool] = None,
@@ -1430,9 +2673,14 @@ def sculpt_run(
     fitness_target: Optional[float] = None,
     fitness_observe_only: bool = False,
     fitness_revert: bool = True,
+    eval_seeds: Optional[int] = None,
+    progress_epsilon: Optional[float] = None,
+    fresh_eval_seeds: Optional[int] = None,
     control_file: Optional[Path | str] = None,
     feedback_timeout: float = 3600.0,
     feedback_poll_interval: float = 2.0,
+    reference_clip_id: Optional[str] = None,
+    reference_robot: Optional[str] = None,
 ) -> SculptRunResult:
     """§Ship-19d: `per_iter_callback` is fired AFTER each iter's
     artifacts are persisted. Returning `None` keeps the loop running;
@@ -1520,9 +2768,18 @@ def sculpt_run(
         ("playback_speed", playback_speed),
         ("render_every", render_every),
         ("rollout_fps", rollout_fps),
+        ("render_width", render_width),
+        ("render_height", render_height),
+        ("render_env_index", render_env_index),
         ("rollout_episodes", rollout_episodes),
         ("seed", seed),
         ("auto_adjust_physics", auto_adjust_physics),
+        # §Selection statistics: multi-seed eval + noise band + fresh
+        # re-eval of the kept best. config.toml [iteration] keys of the
+        # same names; None = config/default.
+        ("eval_seeds", eval_seeds),
+        ("progress_epsilon", progress_epsilon),
+        ("fresh_eval_seeds", fresh_eval_seeds),
     )
     # `early_stop_enabled` / `early_stop_patience` remain accepted by the
     # public function and CLI for compatibility, but metric-plateau auto-kill
@@ -1537,6 +2794,29 @@ def sculpt_run(
             f"[sculpt] CLI override: {key}={val!r}",
             file=sys.stderr, flush=True,
         )
+    # Launch-scoped adapter resource overrides. Keep config.toml immutable:
+    # the effective values are recorded in run_context.json and applied only
+    # to this adapter instance. Attribute-based application stays generic
+    # across present and future adapters instead of keying on robot/task ids.
+    adapter_cfg = dict(cfg.get("adapter") or {})
+    adapter_values = dict(adapter_cfg.get("config") or {})
+    if num_envs is not None:
+        adapter_values["num_envs"] = int(num_envs)
+    if device is not None:
+        adapter_values["device"] = str(device)
+    if num_envs is not None or device is not None:
+        adapter_cfg["config"] = adapter_values
+        cfg["adapter"] = adapter_cfg
+    # §Selection statistics: the progress-tie noise band for keep-best /
+    # revert (see `_lex_improved`/`_lex_regressed`). Default 1e-5 sits
+    # above the measured seed-noise ramp (1e-7..4e-6, audit §6) and well
+    # below every real progress signal seen (≥7.65e-3). 0.0 restores the
+    # exact strict-`>` behavior.
+    try:
+        _pe_raw = (cfg.get("iteration") or {}).get("progress_epsilon", 1e-5)
+        _progress_epsilon = max(0.0, float(1e-5 if _pe_raw is None else _pe_raw))
+    except Exception:  # noqa: BLE001 — malformed knob keeps the default
+        _progress_epsilon = 1e-5
     paths = _project_paths(config_path)
     project = paths["project"]
     rewards_dir = paths["rewards"]
@@ -1548,6 +2828,33 @@ def sculpt_run(
             f"no rewards/ dir in {project} — run `sculpt init` first.")
 
     adapter = load_adapter(config_path)
+    if num_envs is not None:
+        if not hasattr(adapter, "num_envs"):
+            raise ValueError(
+                f"{type(adapter).__name__} does not support --num-envs"
+            )
+        adapter.num_envs = int(num_envs)
+        print(
+            f"[sculpt] CLI override: num_envs={num_envs}",
+            file=sys.stderr, flush=True,
+        )
+    if device is not None:
+        if not hasattr(adapter, "device"):
+            raise ValueError(
+                f"{type(adapter).__name__} does not support --device"
+            )
+        adapter.device = str(device)
+        print(
+            f"[sculpt] CLI override: device={device!r}",
+            file=sys.stderr, flush=True,
+        )
+    authored_tuple_hash = _pin_authored_selection(adapter, project)
+    if authored_tuple_hash:
+        _emit_event({
+            "type": "authored_world_pinned",
+            "tuple_hash": authored_tuple_hash,
+            "selection": Path(adapter.world_selection_path).name,
+        })
 
     # Resolve KG store once (shared across iterations). Skip entirely in
     # --no-kg to avoid side-effects on an absent/empty DB.
@@ -1556,14 +2863,65 @@ def sculpt_run(
         from sculptor.kg.store import SculptorKG
         kg_store = SculptorKG()
 
+    if bool(reference_clip_id) != bool(reference_robot):
+        raise ValueError(
+            "reference_clip_id and reference_robot must be supplied together"
+        )
+    reference_motion_context: Optional[dict[str, Any]] = None
+    if reference_clip_id and reference_robot:
+        reference_motion_context = _prepare_reference_guided_run(
+            adapter=adapter,
+            project=project,
+            rewards_dir=rewards_dir,
+            behavior_goal=behavior_goal,
+            clip_id=reference_clip_id,
+            robot=reference_robot,
+            kg_store=kg_store,
+            dry_run=dry_run,
+        )
+
     # Start iter index
     latest_n_before_loop, _ = _find_latest_reward_version(rewards_dir)
-    start_iter = latest_n_before_loop if resume else 0
+    start_iter = (
+        _find_resume_start_iteration(rewards_dir, runs_dir)
+        if resume
+        else 0
+    )
+    if resume and start_iter > latest_n_before_loop:
+        _emit_event({
+            "type": "resume_completed_iterations_advanced",
+            "reward_version": latest_n_before_loop,
+            "start_iter": start_iter,
+        })
     if not resume and start_iter != 0:
         sys.stderr.write(
             f"[sculpt] warning: rewards/ already has v{start_iter}.py but "
             f"--resume was not passed. Running fresh starting at iter 0.\n")
         start_iter = 0
+
+    # UI Resume should continue from learned behavior, not merely from the
+    # latest reward number.  Hand-authored/prompt-authored rewards can create
+    # gaps between reward versions and run directories (for example v3 -> v5
+    # with no iter_4).  When the caller did not choose an explicit policy and
+    # this iteration has no exact-tuple checkpoint/partial model of its own,
+    # warm-start from the newest valid preceding run artifact.  Same-iteration
+    # recovery still wins inside `_train_or_resume`, and explicit user intent
+    # always wins by leaving `init_ckpt` untouched.
+    if resume and init_ckpt is None and start_iter > 0:
+        current_iter_dir = runs_dir / f"iter_{start_iter}"
+        current_policy = (
+            _valid_promoted_policy(current_iter_dir)
+            or _latest_valid_partial_policy(current_iter_dir)
+        )
+        if current_policy is None:
+            init_ckpt = _latest_preceding_policy(
+                runs_dir, before_iter=start_iter)
+            if init_ckpt is not None:
+                _emit_event({
+                    "type": "resume_warm_start_resolved",
+                    "iter": start_iter,
+                    "source": str(init_ckpt),
+                })
 
     end_iter = start_iter + iterations
     # §Ship-7: `[iteration].seed` override (from CLI) wins over legacy
@@ -1586,6 +2944,7 @@ def sculpt_run(
         "no_kg": bool(no_kg),
         "dry_run": bool(dry_run),
         "behavior_goal": behavior_goal,
+        "reference_motion": reference_motion_context,
         # §Ship 24 (R1): seed surfaced at run start so any result can
         # be tied back to its seed plan from the event stream alone.
         "base_seed": int(base_seed),
@@ -1606,6 +2965,8 @@ def sculpt_run(
             iterations=int(iterations),
             start_iter=int(start_iter),
         )
+        if reference_motion_context is not None:
+            _rc["reference_motion"] = reference_motion_context
         _rc_path = write_run_context(paths["reports"], _rc)
         _emit_event({
             "type": "run_context_captured",
@@ -1628,6 +2989,9 @@ def sculpt_run(
     result = SculptRunResult(iterations_run=0)
     #: §Ship 33: iters since the best fitness improved (plateau early-stop).
     iters_since_best = 0
+    #: §LAW 11: per-iter naturalness steer-factor, aligned with
+    #: result.fitness_history, for the Goodhart-onset early-stop.
+    naturalness_history: list[float] = []
     #: §Ship 36 (F1): edit base for the NEXT iter when the last one regressed
     #: fitness (steer mode only); None = build forward from the latest reward.
     revert_base: Optional[Path] = None
@@ -1635,6 +2999,23 @@ def sculpt_run(
     #: (captured at the interactive pause). None = no note this iter.
     pending_human_note: Optional[str] = None
     _control_path: Optional[Path] = Path(control_file) if control_file else None
+
+    # §RL_SCULPTOR_AUDIT §4.4 (loop 4c, gap #4): goal-conditioned starter.
+    # If iteration 0 is about to train the pristine `sculpt init` constant
+    # alive-bonus template and this run carries a behavior goal, generate a
+    # goal-conditioned v1 first (one bounded LLM call; every failure path
+    # keeps the template and proceeds). Skipped on resume (start_iter > 0
+    # implies real rewards exist) and in dry-run (no LLM).
+    if start_iter == 0 and not dry_run and str(behavior_goal or "").strip():
+        # §env generalization 2/4: goal-conditioned env spec first (the
+        # environment the seeded reward will train in), then the seeded
+        # reward. Both are bounded-LLM, once-per-project, fail-open.
+        _maybe_seed_env_spec(
+            project=project, behavior_goal=behavior_goal, adapter=adapter)
+        _maybe_seed_goal_reward(
+            rewards_dir=rewards_dir, behavior_goal=behavior_goal,
+            adapter=adapter, kg_store=kg_store)
+
     try:
         for i in range(start_iter, end_iter):
             t0 = time.time()
@@ -1648,12 +3029,33 @@ def sculpt_run(
                 fitness_fn=fitness_fn,
                 prior_fitness=(
                     {"best_so_far": result.best_fitness,
+                     # §RL_SCULPTOR_AUDIT §4.4 (loop 4b): best PROGRESS +
+                     # the best iter's dir so _run_one_iter can source the
+                     # edit anti-collapse replay from the best-so-far
+                     # rollout when this iter strictly regressed.
+                     "best_progress": result.best_progress,
+                     "best_iter_dir": (
+                         str(runs_dir / f"iter_{result.best_fitness_iter}")
+                         if result.best_fitness_iter is not None else None),
                      "last": (result.fitness_history[-1]
                               if result.fitness_history else None)}
                     if fitness_fn is not None else None
                 ),
                 fitness_observe_only=fitness_observe_only,
                 revert_base=revert_base,
+                # §env generalization 3/4: revert the env spec alongside
+                # the reward — the (reward, env) pair is the training
+                # config keep-best/revert operates on.
+                env_revert_version=(
+                    result.best_env_spec if revert_base is not None else None),
+                # §env-authoring §10.2: the world half reverts with the
+                # same trigger — the tuple moves as one.
+                world_revert_selection=(
+                    Path(result.best_world_selection_path)
+                    if (revert_base is not None
+                        and result.best_world_selection_path
+                        and Path(result.best_world_selection_path).is_file())
+                    else None),
                 human_note=pending_human_note,
             )
             elapsed = time.time() - t0
@@ -1663,26 +3065,78 @@ def sculpt_run(
             result.iterations_run += 1
 
             # §Ship 33: track objective fitness + best-by-fitness selection.
+            strictly_regressed = False
             if fitness_fn is not None:
                 fit = outcome.fitness if outcome.fitness is not None else 0.0
-                result.fitness_history.append(fit)
-                if result.best_fitness is None or fit > result.best_fitness:
-                    result.best_fitness = fit
+                result.fitness_history.append(fit)   # TRUE task fitness (display / A-B)
+                result.progress_history.append(       # §Convergence: dense channel
+                    outcome.progress if outcome.progress is not None else 0.0)
+                naturalness_history.append(           # §LAW 11: aligned naturalness trend
+                    outcome.naturalness_factor
+                    if outcome.naturalness_factor is not None else 1.0)
+                # §LAW 7: best-by-fitness selection uses the naturalness-GATED
+                # steer value, so a joint-limit exploit (steer 0) or a severe-
+                # unnatural iter (down-weighted) cannot become the steered-toward
+                # checkpoint. The recorded history above stays the true score.
+                steer = (outcome.steer_fitness
+                         if outcome.steer_fitness is not None else fit)
+                # §Convergence (RL_SCULPTOR_AUDIT §4.1): LEXICOGRAPHIC key —
+                # spec fitness decides; the dense progress channel ONLY breaks
+                # ties. Below the completion gate (spec 0.0 everywhere, the
+                # tuck-jump failure) progress is the only ranking signal; the
+                # moment any iter clears the gate, spec dominates again.
+                sprog = (outcome.steer_progress
+                         if outcome.steer_progress is not None
+                         else (outcome.progress
+                               if outcome.progress is not None else 0.0))
+                cur_key = (steer, sprog)
+                best_key = ((result.best_fitness, result.best_progress or 0.0)
+                            if result.best_fitness is not None else None)
+                # §Selection statistics: `progress_epsilon` (default 1e-5,
+                # config [iteration]) is the measured noise band of the
+                # dense channel — a tie-break must CLEAR it to mint a new
+                # best, and a dip inside it is a tie, not a regression
+                # (E2E run 2: two best-selections were decided by
+                # sub-display-precision seed noise; audit §6). Spec
+                # fitness comparisons are unaffected. 0.0 = old behavior.
+                if best_key is None or _lex_improved(
+                        cur_key, best_key, _progress_epsilon):
+                    result.best_fitness = steer
+                    result.best_progress = sprog
                     result.best_fitness_iter = outcome.iter_index
+                    result.best_world_selection_hash = (
+                        outcome.world_selection_hash)
+                    # §env-authoring §10.2: the best iter's pinned
+                    # selection — world revert + the end-of-run tuple
+                    # commit source their world-half refs from it.
+                    result.best_world_selection_path = (
+                        str(outcome.world_selection_path)
+                        if outcome.world_selection_path else None)
+                    # §env generalization 3/4: the env half of the best
+                    # (reward, env) training config — revert + end-of-run
+                    # selection restore BOTH together.
+                    result.best_env_spec = outcome.env_spec_trained
                     iters_since_best = 0
                 else:
                     iters_since_best += 1
+                    strictly_regressed = _lex_regressed(
+                        cur_key, best_key, _progress_epsilon)
 
             # §Ship 36 (F1): set the next iter's edit base. If this iter set a
             # new best, keep building forward (revert_base=None — the best IS
-            # the latest). If it regressed, point the next iter at the best-so-
-            # far reward so the search doesn't compound a bad edit. Steer mode
-            # only; observe-only never reverts (the signal stays passive).
+            # the latest). If it STRICTLY regressed, point the next iter at the
+            # best-so-far reward so the search doesn't compound a bad edit.
+            # §Convergence deadlock fix: a TIE with best (common when the
+            # metric reads 0.0 below its completion gate) is NOT a regression —
+            # reverting on ties pinned tuck-jump to v0 forever, retraining the
+            # same reward while every corrective edit was generated but never
+            # trained. Ties keep building forward; patience still counts them.
+            # Steer mode only; observe-only never reverts (signal stays passive).
             if (fitness_fn is not None and not fitness_observe_only
                     and fitness_revert):
                 revert_base = (
                     result.best_reward_path
-                    if iters_since_best >= 1 and result.best_reward_path is not None
+                    if strictly_regressed and result.best_reward_path is not None
                     else None
                 )
 
@@ -1747,6 +3201,16 @@ def sculpt_run(
                               f"{iters_since_best} iters "
                               f"(best={result.best_fitness:.3f} at iter "
                               f"{result.best_fitness_iter})")
+                # §LAW 11: Goodhart-onset — the objective metric is rising while
+                # naturalness falls (the policy is gaming the proxy). Lock the
+                # prior best rather than optimize into the exploit. Checked only
+                # if no target/plateau reason already fired.
+                onset_source = "fitness"
+                if reason is None:
+                    onset = detect_goodhart_onset(
+                        result.fitness_history, naturalness_history)
+                    if onset:
+                        reason, onset_source = onset, "goodhart_onset"
                 if reason:
                     result.early_stopped = True
                     result.early_stop_reason = reason
@@ -1754,7 +3218,7 @@ def sculpt_run(
                         "type": "early_stop",
                         "at_iter": outcome.iter_index,
                         "reason": reason,
-                        "source": "fitness",
+                        "source": onset_source,
                     })
                     break
 
@@ -1808,6 +3272,8 @@ def sculpt_run(
                     "iter": int(result.best_fitness_iter),
                     "fitness": (round(result.best_fitness, 5)
                                 if result.best_fitness is not None else None),
+                    "progress": (round(result.best_progress, 5)
+                                 if result.best_progress is not None else None),
                     "reward": best_path.name,
                 })
             except Exception as e:  # noqa: BLE001 — selection is best-effort
@@ -1815,21 +3281,172 @@ def sculpt_run(
                     f"[sculpt] best-by-fitness current.py rewrite failed: "
                     f"{type(e).__name__}: {e}\n"
                 )
+        # §env generalization 3/4: keep the env half of the best training
+        # config too — repoint env/current.json at the best iter's spec
+        # version so the project resumes (and re-trains) under it.
+        if result.best_env_spec is not None:
+            try:
+                from sculptor.env_spec import (
+                    read_current_env_spec, repoint_env_current)
+
+                _env_dir = project / "env"
+                _cur = read_current_env_spec(_env_dir)
+                _cur_v = ((_cur.get("meta") or {}).get("version")
+                          if _cur else None)
+                if _cur_v != result.best_env_spec:
+                    repoint_env_current(_env_dir, result.best_env_spec)
+                    _emit_event({
+                        "type": "best_env_spec_selected",
+                        "iter": int(result.best_fitness_iter),
+                        "env_spec": result.best_env_spec,
+                    })
+            except Exception as e:  # noqa: BLE001 — selection is best-effort
+                sys.stderr.write(
+                    f"[sculpt] best env-spec repoint failed: "
+                    f"{type(e).__name__}: {e}\n")
+
+        # Commit reward + EnvSpec + authored world/task/eval/catalog as one
+        # selection after keep-best. Fresh evaluation below therefore uses
+        # the exact tuple whose checkpoint and fitness won.
+        if best_path is not None and best_path.is_file():
+            try:
+                # §env-authoring §10.2: source the world-half refs from
+                # the BEST iteration's pinned selection — a diagnoser
+                # world edit after the best iter must not be paired with
+                # the winning reward.
+                _best_base = (
+                    Path(result.best_world_selection_path)
+                    if (result.best_world_selection_path
+                        and Path(result.best_world_selection_path).is_file())
+                    else None)
+                best_hash, best_selection = _promote_iteration_selection(
+                    adapter, project, reward_path=best_path,
+                    env_spec_version=result.best_env_spec,
+                    base_selection=_best_base)
+                if best_hash:
+                    result.best_world_selection_hash = best_hash
+                    _emit_event({
+                        "type": "best_artifact_tuple_selected",
+                        "iter": int(result.best_fitness_iter),
+                        "tuple_hash": best_hash,
+                        "selection": (best_selection.name
+                                      if best_selection else None),
+                    })
+            except Exception as e:  # noqa: BLE001
+                raise RuntimeError(
+                    "failed to atomically select best authored tuple: "
+                    f"{type(e).__name__}: {e}") from e
+
+    # §Selection statistics (RESEARCH_GAP_ANALYSIS §7.2d): re-evaluate the
+    # KEPT best on fresh rollout seeds never used for selection. The
+    # selected best_fitness is a max statistic over the run's evaluations
+    # (Empirical Design in RL flags report-of-max as a pitfall) — this
+    # records the unbiased number beside it. Advisory: never changes the
+    # selection, never raises; `fresh_eval_seeds = 0` disables.
+    if (fitness_fn is not None and not fitness_observe_only
+            and result.best_fitness_iter is not None):
+        try:
+            _fresh_raw = (cfg.get("iteration") or {}).get(
+                "fresh_eval_seeds", 1)
+            _fresh_n = max(0, int(1 if _fresh_raw is None else _fresh_raw))
+        except Exception:  # noqa: BLE001
+            _fresh_n = 1
+        _detail_dir_fn = getattr(fitness_fn, "detail_dir", None)
+        _best_out = next(
+            (o for o in result.completed_iters
+             if o.iter_index == result.best_fitness_iter), None)
+        if (_fresh_n > 0 and _detail_dir_fn is not None
+                and _best_out is not None
+                and _best_out.checkpoint_path is not None
+                and Path(_best_out.checkpoint_path).is_file()):
+            _fresh_scores: list[float] = []
+            for _j in range(_fresh_n):
+                _fresh_dir = _best_out.iter_dir / f"rollout_fresh_{_j}"
+                try:
+                    _fresh_dir.mkdir(exist_ok=True)
+                    _rollout_or_resume(
+                        adapter=adapter,
+                        iter_index=_best_out.iter_index,
+                        rollout_dir=_fresh_dir,
+                        checkpoint_path=Path(_best_out.checkpoint_path),
+                        n_episodes=int((cfg.get("iteration") or {}).get(
+                            "rollout_episodes", 6)),
+                        # Disjoint from training seeds and the in-loop
+                        # eval band (10k+): deterministic held-out seeds.
+                        seed=90_001 + 131 * _j,
+                    )
+                    _d = _detail_dir_fn(_fresh_dir) or {}
+                    _fresh_scores.append(
+                        float(_d.get("spec_score", 0.0) or 0.0))
+                except Exception as e:  # noqa: BLE001 — per-seed best-effort
+                    sys.stderr.write(
+                        f"[sculpt] fresh eval seed {_j} skipped — "
+                        f"{type(e).__name__}: {e}\n")
+            if _fresh_scores:
+                result.fresh_fitness_per_seed = _fresh_scores
+                result.best_fitness_fresh = _median(_fresh_scores)
+                _emit_event({
+                    "type": "best_fresh_eval",
+                    "iter": int(result.best_fitness_iter),
+                    "fitness_fresh": round(result.best_fitness_fresh, 5),
+                    "per_seed": [round(v, 5) for v in _fresh_scores],
+                    # Side-by-side: the (max-statistic) selected value.
+                    "selected_fitness": (
+                        round(result.best_fitness, 5)
+                        if result.best_fitness is not None else None),
+                })
 
     # §Ship 37: persist run-learnings to the KG case-memory so future
     # diagnoses can avoid repeating past mistakes ("the same failure can't
-    # happen twice"). Guarded: only when a KG is in use (not --no-kg) AND
-    # fitness was tracked (so each case carries a verdict). Best-effort —
+    # happen twice"). §2026-07-03: EVERY run records now (was: fitness-
+    # tracked only) — a blind run's "what was tried" is itself memory;
+    # verdicts stay 'unknown' without a measurable signal. Best-effort —
     # reopens its own store (the loop's kg_store is closed in the finally
     # above) and never lets a logging failure affect the run.
-    if not no_kg and fitness_fn is not None and result.fitness_history:
+    if not no_kg and result.completed_iters:
         try:
             from sculptor.kg.cases import record_run_cases
             from sculptor.kg.store import SculptorKG
+
+            # §usage-based enrichment: which papers each iteration's EDITED
+            # reward actually cited — "helped" verdicts bump the cited
+            # techniques' useful_citations (retrieval learns from what
+            # got accepted, not just what was retrieved). Best-effort:
+            # an unreadable reward file skips that iter's references.
+            _iter_refs: dict[int, list[str]] = {}
+            for _oc in result.completed_iters:
+                # Iter N's edit is measured by iter N+1, so credit the reward
+                # produced AFTER N. The previous trained-first order credited
+                # the parent reward that the edit was changing.
+                _rp = getattr(_oc, "reward_path_after", None) or getattr(
+                    _oc, "reward_path_trained", None)
+                if not _rp or not Path(_rp).is_file():
+                    continue
+                try:
+                    from sculptor.edit import (
+                        _current_reward_references,
+                        _load_reward_module,
+                    )
+                    _ids = [
+                        str(r.get("arxiv_id"))
+                        for r in _current_reward_references(
+                            _load_reward_module(Path(_rp)))
+                        if r.get("arxiv_id")]
+                    if _ids:
+                        _iter_refs[int(_oc.iter_index)] = _ids
+                except Exception:  # noqa: BLE001 — enrichment is advisory
+                    continue
+
             _cstore = SculptorKG()
             try:
+                _adapter_cfg = (cfg.get("adapter") or {}).get("config") or {}
+                _robot = str(
+                    _adapter_cfg.get("task_id")
+                    or _adapter_cfg.get("env_id") or "")
                 _n_cases = record_run_cases(
-                    _cstore, task=behavior_goal, result=result)
+                    _cstore, task=behavior_goal, robot=_robot,
+                    project=config_path.parent.name, result=result,
+                    iter_references=_iter_refs or None)
                 if _n_cases:
                     _emit_event({"type": "run_cases_recorded", "count": _n_cases})
             finally:
@@ -1976,6 +3593,184 @@ def _v0_template_for(adapter: str) -> str:
         if _adapter_needs_batched_template(adapter)
         else _V0_SCALAR_REWARD
     )
+
+
+def _is_pristine_starter_reward(reward_path: Path) -> bool:
+    """§RL_SCULPTOR_AUDIT §4.4 (loop 4c): True when `reward_path` is the
+    untouched `sculpt init` starter template — a constant alive-bonus.
+    Detected by its REWARD_SPEC signature (author 'human', version 'v0',
+    exactly one hyperparameter `alive_bonus`, 'Starter reward' in the
+    description) rather than byte comparison, so a template that merely
+    aged across sculptor versions still counts. Any real reward — human-
+    written or sculpted — fails at least one check. Unreadable/broken
+    module → False (never trigger generation on something we can't read)."""
+    try:
+        from sculptor.edit import _load_reward_module
+
+        spec = getattr(_load_reward_module(Path(reward_path)), "REWARD_SPEC", None)
+        if not isinstance(spec, dict):
+            return False
+        return (
+            str(spec.get("author", "")) == "human"
+            and str(spec.get("version", "")) == "v0"
+            and set((spec.get("hyperparameters") or {}).keys()) == {"alive_bonus"}
+            and "Starter reward" in str(spec.get("description", ""))
+        )
+    except Exception:  # noqa: BLE001
+        return False
+
+
+# Goal text is clipped to leave room for the fixed guidance inside
+# apply_prompt_edit's 2000-char prompt ceiling.
+_SEED_GOAL_CLIP = 900
+
+
+def _seed_reward_prompt(behavior_goal: str) -> str:
+    """User-prompt for the goal-conditioned starter generation. Carries
+    the goal + iteration-0 design rules; the edit_rewriter system prompt
+    (incl. the net-positive-living / progress-preservation laws) and the
+    reward contract ride along via apply_prompt_edit."""
+    goal = " ".join(str(behavior_goal).split())[:_SEED_GOAL_CLIP]
+    return (
+        f"GOAL-CONDITIONED STARTER. Behavior goal: {goal}\n"
+        "The current v0 is the scaffold placeholder — a constant "
+        "alive-bonus with zero gradient (policies trained on it stand "
+        "still and its high mean_return makes it an attractor). Replace "
+        "it with the INITIAL shaping reward for this goal, designed for "
+        "iteration-0 training from a randomly-initialized policy:\n"
+        "- decompose the goal into 2-4 physical phases and give EACH a "
+        "dense, bounded term (saturating ramps anchored at values a "
+        "fresh policy already reaches — no cliff thresholds above its "
+        "reach);\n"
+        "- keep a small alive bonus (~0.1) so shaping dominates, and "
+        "zero every bonus when info['fallen'] fires;\n"
+        "- keep the per-step total >= 0 in ordinary non-fallen poses;\n"
+        "- read ONLY the adapter's expected_info_keys / state schema."
+    )
+
+
+def _maybe_seed_goal_reward(
+    *,
+    rewards_dir: Path,
+    behavior_goal: str,
+    adapter: SculptorAdapter,
+    kg_store=None,
+    client=None,
+) -> Optional[Path]:
+    """§RL_SCULPTOR_AUDIT §4.4 (loop 4c, gap #4): goal-conditioned
+    starter. When the reward that iteration 0 would train is still the
+    pristine `sculpt init` constant-alive-bonus template and the run has
+    a behavior goal, generate `v1.py` from the goal via
+    `apply_prompt_edit` (full post-flight stack: probes, variance
+    pre-screen — which rejects a still-constant generation — and one
+    internal retry). Exactly one LLM call (+1 retry) once per project.
+
+    Deliberately NOT done at `sculpt init` time: project creation must
+    stay instant and API-key-free; the first run already spends LLM
+    calls, so the seed rides on it. ANY failure (validation, no API
+    key, network) logs + returns None and the run proceeds on the
+    template — the dead-reward pre-screen still guards later edits."""
+    latest_n, latest = _find_latest_reward_version(rewards_dir)
+    if latest_n != 0 or not _is_pristine_starter_reward(latest):
+        return None
+    _emit_event({
+        "type": "seed_reward_started",
+        "behavior_goal": str(behavior_goal)[:200],
+    })
+    try:
+        new_path = apply_prompt_edit(
+            current_reward_path=latest,
+            user_prompt=_seed_reward_prompt(behavior_goal),
+            new_iter_id="v1",
+            reward_contract=adapter.reward_contract(),
+            kg_store=kg_store,
+            client=client,
+        )
+    except Exception as e:  # noqa: BLE001 — seed is best-effort, run continues
+        sys.stderr.write(
+            f"[sculpt] goal-conditioned starter generation failed "
+            f"({type(e).__name__}: {e}) — iteration 0 trains the v0 "
+            f"template instead.\n")
+        _emit_event({
+            "type": "seed_reward_failed",
+            "error": f"{type(e).__name__}: {e}",
+        })
+        return None
+    _emit_event({
+        "type": "seed_reward_generated",
+        "reward": new_path.name,
+    })
+    print(f"[sculpt] goal-conditioned starter written: {new_path.name} "
+          f"(replaces the constant alive-bonus template for iter 0)",
+          flush=True)
+    return new_path
+
+def _maybe_seed_env_spec(
+    *,
+    project: Path,
+    behavior_goal: str,
+    adapter: SculptorAdapter,
+    client=None,
+) -> Optional[Path]:
+    """§RL_SCULPTOR_AUDIT (env generalization 2/4): goal-conditioned
+    environment adaptation at first run. When the project has no env
+    spec yet — and made no explicit env choice in config.toml (an
+    `env_profile` or `env_spec_path` there is respected, not
+    overridden) — generate one from the behavior goal via the bounded
+    `sculptor.env_gen` pipeline (≤2 LLM calls, full validate_env_spec
+    gate) and activate it for THIS run by pointing the already-built
+    adapter at `env/current.json`. Subsequent runs pick it up via the
+    `load_adapter` convention. ANY failure (no API key, network,
+    validation twice) logs + emits `env_spec_failed` and the run
+    proceeds on task defaults — never blocks.
+
+    Same rationale as `_maybe_seed_goal_reward` for running at first
+    run rather than `sculpt init`: project creation stays instant and
+    API-key-free; the first run already spends LLM calls."""
+    if not hasattr(adapter, "env_spec_path"):
+        return None   # adapter family without env-spec support (gym_sb3)
+    if getattr(adapter, "env_spec_path", "") or getattr(
+            adapter, "env_profile", ""):
+        return None   # explicit config choice stands
+    env_dir = project / "env"
+    if (env_dir / "current.json").is_file():
+        return None   # already generated (or hand-written)
+    task_id = str(getattr(adapter, "task_id", ""))
+    _emit_event({
+        "type": "env_spec_started",
+        "behavior_goal": str(behavior_goal)[:200],
+        "task_id": task_id,
+    })
+    try:
+        from sculptor.env_gen import generate_env_spec
+        from sculptor.env_spec import write_env_spec_version
+
+        spec = generate_env_spec(
+            behavior_goal=behavior_goal, task_id=task_id, client=client)
+        path = write_env_spec_version(env_dir, spec)
+    except Exception as e:  # noqa: BLE001 — generation is best-effort
+        sys.stderr.write(
+            f"[sculpt] env-spec generation failed "
+            f"({type(e).__name__}: {e}) — training on task defaults.\n")
+        _emit_event({
+            "type": "env_spec_failed",
+            "error": f"{type(e).__name__}: {e}",
+        })
+        return None
+    adapter.env_spec_path = str((env_dir / "current.json").resolve())
+    _emit_event({
+        "type": "env_spec_generated",
+        "version": path.stem,
+        "shared": spec.get("shared") or {},
+        "train": spec.get("train") or {},
+        "reasoning": (spec.get("meta") or {}).get("reasoning", "")[:500],
+    })
+    print(f"[sculpt] goal-conditioned env spec written: env/{path.name} "
+          f"(shared={sorted((spec.get('shared') or {}).keys())}, "
+          f"train={sorted((spec.get('train') or {}).keys())})",
+          flush=True)
+    return path
+
 
 _CONFIG_TEMPLATE = '''\
 [target]
@@ -2153,6 +3948,115 @@ def _inherit_parent_adapter_config(
     return True
 
 
+def _toml_scalar(v: Any) -> str:
+    """Serialize a primitive/list as a TOML literal. Mirrors the
+    inline-table style `sculpt_init` / the backend's set_adapter_section
+    emit (sculptor deliberately avoids a `tomli_w` dependency; the
+    configs we touch are flat/inline-table only)."""
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, (int, float)):
+        return str(v)
+    if isinstance(v, str):
+        return '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
+    if isinstance(v, list):
+        return "[" + ", ".join(_toml_scalar(x) for x in v) + "]"
+    if v is None:
+        return '""'
+    return _toml_scalar(str(v))
+
+
+def _apply_stage_run_overrides(
+    stage_config: Path,
+    *,
+    edit_candidates: Optional[int] = None,
+    num_envs: Optional[int] = None,
+    device: Optional[str] = None,
+) -> None:
+    """§MISSION_RUN_PARITY: inject per-launch knobs that have no
+    sculpt_run keyword into the stage's config.toml AFTER it's
+    scaffolded + inherited the parent's sections.
+
+      * `edit_candidates` → an `edit_candidates = N` line under
+        `[iteration]` (read by `_run_one_iter` via
+        `iter_cfg.get("edit_candidates", 1)`). Flat key, upserted.
+      * `num_envs` / `device` → the `[adapter].config` inline table
+        (mjlab reads these; they are NOT sculpt_run kwargs). Parsed via
+        tomllib + re-emitted so the mjlab inline-table form survives.
+
+    All-None is a no-op (a plain mission run stays byte-identical). Best
+    effort: a malformed config is left untouched — load_adapter surfaces
+    the original error downstream, exactly as before this override."""
+    if edit_candidates is None and num_envs is None and device is None:
+        return
+    if not stage_config.is_file():
+        return
+    try:
+        text = stage_config.read_text(encoding="utf-8")
+    except OSError:
+        return
+
+    # ── [iteration].edit_candidates (flat key upsert) ──
+    if edit_candidates is not None:
+        body = _extract_toml_section(text, "iteration")
+        if body is None:
+            # No [iteration] section (unusual — the template has one).
+            # Append a fresh one so the knob is honored.
+            text = (
+                text.rstrip("\n")
+                + f"\n\n[iteration]\nedit_candidates = {int(edit_candidates)}\n"
+            )
+        else:
+            line = f"edit_candidates = {int(edit_candidates)}\n"
+            pat = re.compile(r"^\s*edit_candidates\s*=.*$", re.MULTILINE)
+            if pat.search(body):
+                new_body = pat.sub(line.rstrip("\n"), body, count=1)
+            else:
+                new_body = body.rstrip("\n") + "\n" + line
+            text = _replace_toml_section(text, "iteration", new_body)
+
+    # ── [adapter].config.{num_envs,device} (inline-table re-emit) ──
+    if num_envs is not None or device is not None:
+        try:
+            try:
+                import tomllib
+            except ModuleNotFoundError:  # pragma: no cover — py310
+                import tomli as tomllib  # type: ignore[no-redef]
+            cfg = tomllib.loads(text)
+            adapter = cfg.get("adapter") or {}
+            adapter_class = adapter.get("class") or ""
+            inner = dict(adapter.get("config") or {})
+            if num_envs is not None:
+                inner["num_envs"] = int(num_envs)
+            if device is not None:
+                inner["device"] = str(device)
+            inline = (
+                "{ " + ", ".join(
+                    f"{k} = {_toml_scalar(v)}" for k, v in inner.items()
+                ) + " }"
+                if inner else "{}"
+            )
+            new_block = (
+                f'[adapter]\nclass = "{adapter_class}"\nconfig = {inline}\n'
+            )
+            # Replace the entire [adapter] section (header → next section
+            # header or EOF). Mirrors project_store.set_adapter_section.
+            pat = re.compile(
+                r"^\[adapter\].*?(?=^\[[^\]]+\]|\Z)",
+                re.MULTILINE | re.DOTALL,
+            )
+            text, n = pat.subn(new_block + "\n", text, count=1)
+            if n == 0:
+                text = text.rstrip() + "\n\n" + new_block
+        except Exception:  # noqa: BLE001 — malformed config: leave as-is.
+            pass
+
+    try:
+        stage_config.write_text(text, encoding="utf-8")
+    except OSError:
+        pass
+
+
 def sculpt_init(project_dir: Path | str, adapter: str) -> Path:
     """Scaffold a new Sculptor project. Returns the created project dir."""
     project_dir = Path(project_dir).resolve()
@@ -2222,23 +4126,524 @@ def _is_stage_scaffolded(stage_dir: Path) -> bool:
     )
 
 
+def _iter_checkpoint(iter_dir: Path) -> Optional[Path]:
+    """The checkpoint file (mjlab `.pt` / gym_sb3 `.zip`) in an iter dir,
+    or None. Size>0 guarded (a half-written checkpoint is not warm-
+    startable)."""
+    for ext in ("pt", "zip"):
+        p = Path(iter_dir) / f"checkpoint.{ext}"
+        if p.is_file() and p.stat().st_size > 0:
+            return p
+    return None
+
+
 def _resolve_stage_final_checkpoint(
     sculpt_result: "SculptRunResult",
 ) -> Optional[Path]:
     """Pick the checkpoint path from the last completed iter.
 
-    mjlab writes `checkpoint.pt`, gym_sb3 writes `checkpoint.zip` — glob
-    for both. Returns None if no iter produced a checkpoint (caller
-    marks the stage failed).
+    mjlab writes `checkpoint.pt`, gym_sb3 writes `checkpoint.zip`. Returns
+    None if the last iter produced no checkpoint. Retained for callers
+    that still want the last-iter policy; stage finalization now uses
+    `_select_stage_final_iter` (keep-best) instead.
     """
     if not sculpt_result.completed_iters:
         return None
-    last_iter = sculpt_result.completed_iters[-1]
-    for ext in ("pt", "zip"):
-        p = last_iter.iter_dir / f"checkpoint.{ext}"
-        if p.is_file() and p.stat().st_size > 0:
-            return p
-    return None
+    return _iter_checkpoint(sculpt_result.completed_iters[-1].iter_dir)
+
+
+def _iter_fitness_key(o: "IterOutcome") -> tuple[float, float, float]:
+    """Lexicographic keep-best key for an iteration, mirroring the loop's
+    own `(steer_fitness, steer_progress)` selection with primary_metric as
+    the final tiebreak. Missing channels sort lowest."""
+    NEG = float("-inf")
+    sf = o.steer_fitness if o.steer_fitness is not None else (
+        o.fitness if o.fitness is not None else NEG)
+    sp = o.steer_progress if o.steer_progress is not None else (
+        o.progress if o.progress is not None else NEG)
+    pm = o.primary_metric if o.primary_metric is not None else NEG
+    return (sf, sp, pm)
+
+
+def _evaluate_start_state_gate(
+    with_ckpt: "list[IterOutcome]", stage_dir: Optional[Path],
+) -> Optional[dict]:
+    """§D21 Fix 3 (post-mortem D20): mechanical start-state gate for
+    stages with a stage-FIXED eval reset (`env/eval_reset.json` — §D17
+    get-up-archetype stages).
+
+    D20 root cause: a stage's `success_criterion` (root_height / upright
+    / episode-length) has no start-state clause, so a STANDING rollout
+    can trivially satisfy a get-up criterion when the scaffold silently
+    fell back to the wrong RSI class. This computes, PER CANDIDATE
+    ITERATION, whether its rollout's FRAME-0 state matches the stage's
+    fixed eval reset within tolerance:
+
+      expected_z  = `reference.G1_CLASS_STAND_M` + `reset_height_offset_m`
+      expected_pg = -cos(reset_pitch_offset_rad) * cos(reset_roll_offset_rad)
+      measured_z  = mean over envs of `root_link_pos_w[0, :, 2]`
+      measured_pg = mean over envs of `projected_gravity_b[0, :, 2]`
+      match iff |measured_z - expected_z| <= 0.15 AND
+                |measured_pg - expected_pg| <= 0.30 AND
+                (posture check skipped OR joint_err <= 0.45)
+
+    §F1 posture check (adversarial-audit finding, docs/internal
+    REFERENCE_BUILD_LOG.md D19-D21 context): the z+pg tolerances alone
+    are wide enough that a STANDING rollout (z≈0.74, pg_z≈-1.0) can pass
+    whenever `expected_z >= 0.59` and the reset is near-upright — and a
+    shallow sitting/crouch reset can legitimately land in that band too.
+    When `eval_reset.json` carries `reset_joint_pos_target` (length-J
+    clip-order joint targets) AND the candidate's trajectory carries a
+    `joint_pos` array whose last dimension equals J, this additionally
+    computes:
+
+      measured_q0 = mean over envs of `joint_pos[0, :, :]`   (shape [J])
+      joint_err   = mean over joints of |measured_q0 - reset_joint_pos_target|
+
+    and requires `joint_err <= 0.45` (radians) for a match. Missing
+    `reset_joint_pos_target`, missing `joint_pos`, or a joint-count
+    mismatch SKIPS the posture check for that candidate (z+pg alone
+    still gate it) — it does not fail the candidate outright. (When
+    every candidate lacks well-shaped root/pg arrays, `_select_stage_
+    final_iter` separately fails the stage — see §F6 there.)
+
+    The caller (`_select_stage_final_iter`) excludes gate-MISMATCHED
+    iterations from criterion-passing consideration.
+
+    Returns `None` when `stage_dir` is not supplied (opt-out, e.g. a
+    direct unit-test call bypassing the gate entirely). Otherwise ALWAYS
+    returns a dict — the gate "ran" — even when `eval_reset.json` is
+    absent/corrupt or an iter's trajectory arrays are missing/malformed;
+    those cases are folded into `skipped` / simply excluded from
+    `checked` rather than raising. This function must NEVER crash stage
+    selection.
+
+    Dict keys:
+      skipped: True when `eval_reset.json` is absent or unparseable —
+        no expected state to check against; the gate is a pure no-op.
+      expected_z / expected_pg_z: the derived expected frame-0 values,
+        or None when `skipped`.
+      checked: count of candidates the gate could actually evaluate
+        (trajectory arrays present, well-shaped).
+      mismatched: dict[str(iter_dir) -> True] — present only for
+        iterations that FAILED the tolerance check.
+      mismatched_count: len(mismatched).
+      example_measured_z / example_measured_pg_z: one representative
+        measurement (prefers a mismatched example when any exist, else
+        the first checked iter's) — for the event / failure detail.
+      example_measured_joint_err: the same representative candidate's
+        mean per-joint posture error (radians), or None when the
+        posture check was skipped for it (no target / no joint_pos /
+        dimension mismatch).
+    """
+    result: dict = {
+        "skipped": False,
+        "expected_z": None,
+        "expected_pg_z": None,
+        "checked": 0,
+        "mismatched": {},
+        "mismatched_count": 0,
+        "example_measured_z": None,
+        "example_measured_pg_z": None,
+        "example_measured_joint_err": None,
+    }
+    if stage_dir is None:
+        return None
+
+    eval_reset_path = Path(stage_dir) / "env" / "eval_reset.json"
+    if not eval_reset_path.is_file():
+        result["skipped"] = True
+        return result
+
+    try:
+        eval_reset = json.loads(eval_reset_path.read_text(encoding="utf-8"))
+        from sculptor.reference import G1_CLASS_STAND_M
+
+        offset = float(eval_reset["reset_height_offset_m"])
+        pitch = float(eval_reset.get("reset_pitch_offset_rad", 0.0) or 0.0)
+        roll = float(eval_reset.get("reset_roll_offset_rad", 0.0) or 0.0)
+        expected_z = G1_CLASS_STAND_M + offset
+        expected_pg = -math.cos(pitch) * math.cos(roll)
+    except Exception:  # noqa: BLE001 — corrupt eval_reset.json: no-op gate
+        result["skipped"] = True
+        return result
+
+    result["expected_z"] = expected_z
+    result["expected_pg_z"] = expected_pg
+
+    # §F1 posture target: only present for get-up-shaped stages (D19).
+    # A missing/malformed target simply disables the posture check below
+    # (z+pg tolerances alone still gate); it does not skip the gate.
+    joint_target = eval_reset.get("reset_joint_pos_target")
+    joint_target_arr = None
+    if joint_target:
+        try:
+            import numpy as np
+            _cand = np.asarray(joint_target, dtype=float)
+            if _cand.ndim == 1 and _cand.shape[0] > 0:
+                joint_target_arr = _cand
+        except Exception:  # noqa: BLE001 — malformed target: posture skipped
+            joint_target_arr = None
+
+    from sculptor.mission_runtime import _load_trajectory_arrays
+
+    example_z = example_pg = example_joint_err = None
+    mismatch_example_z = mismatch_example_pg = mismatch_example_joint_err = None
+    for o in with_ckpt:
+        try:
+            import numpy as np
+
+            trajectory, _ = _load_trajectory_arrays(Path(o.iter_dir))
+            root_pos = trajectory.get("root_link_pos_w")
+            pg = trajectory.get("projected_gravity_b")
+            if root_pos is None or pg is None:
+                continue
+            root_arr = np.asarray(root_pos)
+            pg_arr = np.asarray(pg)
+            if (root_arr.ndim != 3 or root_arr.shape[2] < 3
+                    or root_arr.shape[0] < 1 or root_arr.shape[1] < 1):
+                continue
+            if (pg_arr.ndim != 3 or pg_arr.shape[2] < 3
+                    or pg_arr.shape[0] < 1 or pg_arr.shape[1] < 1):
+                continue
+            measured_z = float(np.mean(root_arr[0, :, 2]))
+            measured_pg = float(np.mean(pg_arr[0, :, 2]))
+        except Exception:  # noqa: BLE001 — this iter's data unusable: skip it
+            continue
+
+        # §F1 posture check: independent try/except so a missing/malformed
+        # `joint_pos` array (or joint-count mismatch) merely SKIPS the
+        # posture term for this candidate — it never drops the candidate
+        # from `checked` or forces a z/pg-only failure.
+        joint_err = None
+        if joint_target_arr is not None:
+            try:
+                joint_pos = trajectory.get("joint_pos")
+                if joint_pos is not None:
+                    joint_arr = np.asarray(joint_pos)
+                    if (joint_arr.ndim == 3 and joint_arr.shape[0] >= 1
+                            and joint_arr.shape[1] >= 1
+                            and joint_arr.shape[2] == joint_target_arr.shape[0]):
+                        measured_q0 = np.mean(joint_arr[0, :, :], axis=0)
+                        joint_err = float(
+                            np.mean(np.abs(measured_q0 - joint_target_arr)))
+            except Exception:  # noqa: BLE001 — posture unreadable: skip it
+                joint_err = None
+
+        result["checked"] += 1
+        if example_z is None:
+            example_z, example_pg, example_joint_err = (
+                measured_z, measured_pg, joint_err)
+        matched = (
+            abs(measured_z - expected_z) <= 0.15
+            and abs(measured_pg - expected_pg) <= 0.30
+            and (joint_err is None or joint_err <= 0.45)
+        )
+        if not matched:
+            result["mismatched"][str(o.iter_dir)] = True
+            if mismatch_example_z is None:
+                mismatch_example_z, mismatch_example_pg, mismatch_example_joint_err = (
+                    measured_z, measured_pg, joint_err)
+
+    result["mismatched_count"] = len(result["mismatched"])
+    if mismatch_example_z is not None:
+        result["example_measured_z"] = mismatch_example_z
+        result["example_measured_pg_z"] = mismatch_example_pg
+        result["example_measured_joint_err"] = mismatch_example_joint_err
+    else:
+        result["example_measured_z"] = example_z
+        result["example_measured_pg_z"] = example_pg
+        result["example_measured_joint_err"] = example_joint_err
+    return result
+
+
+def _maybe_emit_fitness_contradiction(
+    *, stage, outcome: "IterOutcome", emit: Optional[Any],
+) -> None:
+    """§D24 (F4): called once per candidate iteration whose success
+    criterion just evaluated True (see `_select_stage_final_iter` below,
+    where this fires for every criterion-passing iter — not only the one
+    ultimately selected — so the D20 hollow-success pattern is caught
+    regardless of the start-state gate outcome). When the same iteration's
+    objective fitness is at/near zero (`_is_fitness_contradiction`), emits
+    a `fitness_contradiction` SCULPT-EVENT and drops a durable
+    `<iter_dir>/fitness_contradiction.json` flag the backend/UI read —
+    the event stream alone is not durable across a restarted backend.
+
+    Never raises: a serialization hiccup degrades to a stderr line, not a
+    failed stage-selection pass (mirrors the fitness-is-advisory idiom
+    used for `fitness_fn` itself above)."""
+    if not _is_fitness_contradiction(True, outcome.fitness):
+        return
+    try:
+        payload = {
+            "type": "fitness_contradiction",
+            "stage_name": getattr(stage, "name", None),
+            "iter": outcome.iter_index,
+            "fitness": round(float(outcome.fitness), 5),
+            "criterion": getattr(stage, "success_criterion", None),
+            "components": outcome.fitness_components,
+        }
+        if emit is not None:
+            emit(payload)
+        (Path(outcome.iter_dir) / "fitness_contradiction.json").write_text(
+            json.dumps(payload, indent=2))
+    except Exception as e:  # noqa: BLE001 — detector is advisory, never fatal
+        sys.stderr.write(
+            f"[sculpt] stage {getattr(stage, 'name', '?')} iter "
+            f"{getattr(outcome, 'iter_index', '?')}: fitness_contradiction "
+            f"emission failed — {type(e).__name__}: {e}\n"
+        )
+
+
+def _select_stage_final_iter(
+    candidates: "list[IterOutcome]",
+    stage,
+    *,
+    stage_dir: Optional[Path] = None,
+    emit: Optional[Any] = None,
+) -> "tuple[Optional[IterOutcome], bool, str, Optional[str], bool, Optional[str]]":
+    """§keep-best finalization (B1). Choose the iteration a stage keeps as
+    its final policy, so a late regression can't discard a good one.
+
+    Returns `(selected, criterion_ok, source, criterion_error,
+    error_is_missing_key, start_state_mismatch_detail)`.
+
+    Rule: among candidates that have a checkpoint AND whose rollout
+    satisfies the stage criterion, keep the one with the highest fitness
+    key (ties → newest iter_index). If none pass, keep the
+    highest-fitness candidate that has a checkpoint anyway (so warm-start /
+    re-decomposition inherit the STRONGEST policy, not the last one) and
+    report criterion failure. A genuine criterion bug (unsafe AST / dtype)
+    raises the SAME error on every iter → no pass → surfaced as
+    `criterion_errored`; a missing-key (metric absent) is a plain
+    non-pass → `criterion_not_met`. Never raises mid-scan.
+
+    §D21 Fix 3: when `stage_dir` is supplied, `_evaluate_start_state_gate`
+    checks every checkpointed candidate's rollout frame-0 state against
+    the stage's `env/eval_reset.json` (if any — a no-op otherwise). A
+    gate-MISMATCHED iteration is excluded from `passing` even when its
+    criterion evaluated True (D20: a standing rollout can trivially
+    satisfy a start-state-blind get-up criterion). If criterion-passing
+    candidates existed but EVERY one of them was gate-mismatched,
+    `start_state_mismatch_detail` is set to an actionable message (not
+    None) instead of the usual `None` — the caller must surface this as
+    a DISTINCT, non-redecomposable failure reason
+    (`"start_state_mismatch"`), not the generic `criterion_not_met`.
+
+    §F6 (fail-closed on zero verifiable candidates): when
+    `eval_reset.json` exists but the gate could not well-shape ANY
+    candidate's root/pg trajectory arrays (`gate["checked"] == 0`), the
+    gate has no evidence either way — treating that as an implicit pass
+    would let malformed/missing trajectory data silently defeat the
+    whole start-state check. Any criterion-passing candidate is instead
+    treated as gate-mismatched (excluded from `passing`), and the
+    `start_state_mismatch_detail` names the verification failure
+    directly rather than claiming a wrong-state match. `eval_reset.json`
+    absent (gate skipped) is unaffected — that path never gated at all.
+    """
+    from sculptor.mission_runtime import (
+        CriterionEvalError,
+        CriterionMissingKeyError,
+        _build_criterion_namespace,
+        _evaluate_success_criterion,
+    )
+
+    # §Ship-56 (persistence increment): record the scan + final keep-decision
+    # to `<stage_dir>/reports/selection.json` so the UI can show WHY this
+    # iter was kept after the mission ends (today it only sees
+    # selected_iter_index/selection_source on mission.json — the per-
+    # candidate reasoning was computed then discarded). Every return point
+    # below routes through `_finalize` so this is a pure recording
+    # addition — the returned tuple is byte-identical to before this
+    # change. `gate` and `rows` are populated by the scan further down;
+    # this helper closes over them by reference (rebound as the scan
+    # proceeds — Python closures read the current value at call time).
+    gate: Optional[dict] = None
+    rows: "list[dict[str, Any]]" = []
+
+    def _finalize(
+        result: "tuple[Optional[IterOutcome], bool, str, Optional[str], bool, Optional[str]]",
+    ) -> "tuple[Optional[IterOutcome], bool, str, Optional[str], bool, Optional[str]]":
+        selected, criterion_ok, source, criterion_error, _missing_key, mismatch = result
+        if stage_dir is not None:
+            try:
+                selected_index = (
+                    selected.iter_index if selected is not None else None)
+                for row in rows:
+                    row["selected"] = (
+                        selected_index is not None
+                        and row["iter_index"] == selected_index)
+                record = {
+                    "schema": 1,
+                    "stage": stage.name,
+                    "recorded_at": _utc_now_iso(),
+                    "selected_iter_index": selected_index,
+                    "selection_source": source,
+                    "criterion_ok": criterion_ok,
+                    "criterion": stage.success_criterion,
+                    "criterion_error": criterion_error,
+                    "start_state_mismatch": mismatch,
+                    "gate": (
+                        {
+                            "skipped": gate["skipped"],
+                            "checked": gate["checked"],
+                            "mismatched_count": gate["mismatched_count"],
+                        } if gate is not None else None
+                    ),
+                    "candidates": rows,
+                }
+                reports_dir = Path(stage_dir) / "reports"
+                reports_dir.mkdir(parents=True, exist_ok=True)
+                (reports_dir / "selection.json").write_text(
+                    json.dumps(record, indent=2, sort_keys=True, default=str),
+                    encoding="utf-8",
+                )
+            except Exception as e:  # noqa: BLE001 — recording is best-effort
+                sys.stderr.write(
+                    f"[sculpt] stage {stage.name}: selection.json write "
+                    f"skipped — {type(e).__name__}: {e}\n"
+                )
+        return result
+
+    # Dedup by iter_dir, keeping the latest occurrence (extension passes
+    # can re-report the same on-disk iter).
+    by_dir: "dict[str, IterOutcome]" = {}
+    for o in candidates:
+        by_dir[str(o.iter_dir)] = o
+    with_ckpt = [o for o in by_dir.values() if _iter_checkpoint(o.iter_dir)]
+    if not with_ckpt:
+        return _finalize((None, False, "last", None, False, None))
+
+    gate = _evaluate_start_state_gate(with_ckpt, stage_dir)
+    if emit is not None and gate is not None:
+        emit({
+            "type": "stage_start_state_gate",
+            "stage_name": stage.name,
+            "checked": gate["checked"],
+            "mismatched": gate["mismatched_count"],
+            "expected_z": gate["expected_z"],
+            "expected_pg_z": gate["expected_pg_z"],
+            "example_measured_z": gate["example_measured_z"],
+            "example_measured_pg_z": gate["example_measured_pg_z"],
+            "example_measured_joint_err": gate["example_measured_joint_err"],
+            "skipped": gate["skipped"],
+        })
+    gate_mismatched = gate["mismatched"] if gate is not None else {}
+    # §F6: eval_reset.json present (gate ran, not skipped) but not a
+    # single candidate had well-shaped trajectory arrays to check —
+    # fail closed instead of letting every criterion-passer through.
+    gate_unverified = bool(
+        gate is not None and not gate["skipped"] and gate["checked"] == 0
+    )
+
+    passing: "list[IterOutcome]" = []
+    raw_passing: "list[IterOutcome]" = []
+    had_fitness = False
+    last_error: Optional[str] = None   # any criterion error message seen
+    only_missing_key = True            # False once a genuine (bug) error seen
+    saw_any_error = False
+    for o in with_ckpt:
+        if o.steer_fitness is not None or o.fitness is not None:
+            had_fitness = True
+        crit_pass: Optional[bool] = None
+        crit_err: Optional[str] = None
+        try:
+            ns = _build_criterion_namespace(
+                iter_dir=Path(o.iter_dir), primary_metric=o.primary_metric)
+            if _evaluate_success_criterion(stage.success_criterion, ns):
+                crit_pass = True
+                raw_passing.append(o)
+                # §D24 (F4): the criterion just read this iter as a
+                # success — check it against the objective fitness BEFORE
+                # the start-state gate below, so a gate-mismatched
+                # "success" (D20's exact hollow pattern) is flagged too.
+                _maybe_emit_fitness_contradiction(
+                    stage=stage, outcome=o, emit=emit)
+                # §D21 Fix 3: a gate-mismatched iter does NOT count as
+                # criterion-satisfying, regardless of what the criterion
+                # expression itself evaluated to. §F6: nor does one when
+                # the gate never verified ANY candidate at all.
+                if (not gate_mismatched.get(str(o.iter_dir), False)
+                        and not gate_unverified):
+                    passing.append(o)
+            else:
+                crit_pass = False
+        except CriterionEvalError as e:
+            saw_any_error = True
+            last_error = str(e)
+            crit_err = str(e)
+            if not isinstance(e, CriterionMissingKeyError):
+                only_missing_key = False
+        except Exception:  # noqa: BLE001 — a flaky iter is a non-pass, not fatal
+            crit_pass = False
+        rows.append({
+            "iter_index": o.iter_index,
+            "criterion_pass": crit_pass,
+            "criterion_error": crit_err,
+            "gate_mismatched": bool(
+                gate_mismatched.get(str(o.iter_dir), False)),
+            "fitness": (round(o.fitness, 5) if o.fitness is not None else None),
+            "steer_fitness": (round(o.steer_fitness, 5)
+                              if o.steer_fitness is not None else None),
+            "progress": (round(o.progress, 5)
+                        if o.progress is not None else None),
+            "steer_progress": (round(o.steer_progress, 5)
+                               if o.steer_progress is not None else None),
+            "primary_metric": (round(o.primary_metric, 5)
+                               if o.primary_metric is not None else None),
+            "selected": False,
+        })
+
+    if passing:
+        winner = max(
+            passing, key=lambda o: (_iter_fitness_key(o), o.iter_index))
+        source = "criterion+fitness" if had_fitness else "criterion_newest"
+        return _finalize((winner, True, source, None, False, None))
+
+    # Nobody passed — keep the strongest policy for the successor anyway.
+    winner = max(with_ckpt, key=lambda o: (_iter_fitness_key(o), o.iter_index))
+
+    # §D21 Fix 3: at least one iter satisfied the criterion, but the gate
+    # rejected EVERY one of them — this is a start-state mismatch, not a
+    # plain criterion miss. Surfaced distinctly so the caller fails the
+    # stage with a non-redecomposable reason (re-authoring the criterion
+    # / reward can't fix a scaffold that started from the wrong state).
+    if raw_passing:
+        if gate_unverified:
+            # §F6: distinct from a measured mismatch — the gate simply
+            # had nothing to measure.
+            detail = (
+                "start-state gate could not verify any candidate "
+                "(missing/malformed trajectory arrays)"
+            )
+        else:
+            detail = (
+                f"{len(raw_passing)} iteration(s) satisfied "
+                f"{stage.success_criterion!r} but ALL started from the wrong "
+                f"state per env/eval_reset.json (expected root z="
+                f"{gate['expected_z']!r}, projected-gravity z="
+                f"{gate['expected_pg_z']!r}; example measured z="
+                f"{gate['example_measured_z']!r}, projected-gravity z="
+                f"{gate['example_measured_pg_z']!r}, mean joint error="
+                f"{gate['example_measured_joint_err']!r}). The scaffold "
+                f"likely fell back to the wrong RSI/reset class."
+            )
+        return _finalize((winner, False, "fitness_fallback", None, False, detail))
+
+    # Preserve the genuine-bug vs missing-key/plain-fail distinction the
+    # old single-iter path drew: a broken criterion still surfaces as
+    # criterion_errored; a missing key carries its message through to the
+    # recoverable criterion_not_met so re-decompose feedback names the key.
+    if saw_any_error and not only_missing_key:
+        return _finalize(
+            (winner, False, "fitness_fallback", last_error, False, None))
+    if saw_any_error:  # only missing-key errors
+        return _finalize(
+            (winner, False, "fitness_fallback", last_error, True, None))
+    # Criterion evaluated cleanly to False on every iter — a plain miss,
+    # no missing key.
+    return _finalize((winner, False, "fitness_fallback", None, False, None))
 
 
 def _verify_stage_adapter_matches(
@@ -2297,6 +4702,38 @@ def _atomic_save_mission(mission, mission_dir: Path) -> None:
     _os.replace(tmp, mission_dir / "mission.json")
 
 
+def _archive_mission_snapshot(
+    mission_dir: Path, *, emit, final: bool = False,
+) -> None:
+    """§durable auto-save (A3): incrementally snapshot the mission into
+    the restart-/delete-proof `saved/` archive (best+final+pinned
+    checkpoints + every video/report/metric; heavy intermediates
+    dropped — see sculptor.archive). Set `RS_AUTO_ARCHIVE=0` to disable.
+    NEVER fatal — a failed archive emits an event and the mission
+    proceeds. project_slug is the dir two levels up
+    (`<project>/.missions/<mission>`)."""
+    import os as _os
+    if _os.environ.get("RS_AUTO_ARCHIVE", "1") != "1":
+        return
+    try:
+        from sculptor.archive import archive_mission, saved_root
+
+        project_slug = Path(mission_dir).parent.parent.name
+        res = archive_mission(
+            Path(mission_dir), saved_root(),
+            project_slug=project_slug, incremental=True)
+        emit({
+            "type": "mission_archived" if final else "mission_stage_archived",
+            "path": str(res.entry_dir),
+            "total_bytes": int(getattr(res, "total_bytes", 0) or 0),
+        })
+    except Exception as e:  # noqa: BLE001 — archiving must never break a run
+        emit({
+            "type": "mission_archive_failed",
+            "error": f"{type(e).__name__}: {e}",
+        })
+
+
 def mission_run(
     mission,
     *,
@@ -2318,6 +4755,18 @@ def mission_run(
     fitness_patience: int = 2,
     fitness_observe_only: bool = False,
     fitness_revert: bool = True,
+    # §MISSION_RUN_PARITY: per-launch knobs mirrored from NewRunDialog and
+    # applied uniformly to EVERY stage's training. All None = the stage's
+    # inherited config wins (a plain mission run stays byte-identical).
+    edit_candidates: Optional[int] = None,
+    rollout_episodes: Optional[int] = None,
+    max_episode_steps: Optional[int] = None,
+    playback_speed: Optional[float] = None,
+    render_width: Optional[int] = None,
+    render_height: Optional[int] = None,
+    num_envs: Optional[int] = None,
+    device: Optional[str] = None,
+    channel_catalog: Optional[Any] = None,
 ):
     """§Ship-19d Goals A + B: optional adaptive iteration control.
 
@@ -2417,6 +4866,20 @@ def mission_run(
     mission_dir = Path(mission.mission_dir).resolve()
     mission_dir.mkdir(parents=True, exist_ok=True)
     (mission_dir / "stages").mkdir(exist_ok=True)
+    # §llm provenance: decomposition-adjacent calls (redecompose, metric
+    # resolution) archive to the mission dir until a stage's iteration
+    # sink takes over in _run_one_iter (last-set-wins).
+    set_llm_log_dir(mission_dir)
+
+    from sculptor.world.channels import (
+        load_project_channel_catalog,
+        resolve_channel_catalog,
+    )
+
+    if channel_catalog is None and mission_dir.parent.name == ".missions":
+        channel_catalog = load_project_channel_catalog(
+            mission_dir.parent.parent)
+    channel_catalog = resolve_channel_catalog(channel_catalog)
 
     # §Ship 34/38: resolve objective fitness fns. The mission-level
     # `fitness_metric` is the default; §Ship 38 lets each Stage carry its own
@@ -2426,19 +4889,30 @@ def mission_run(
     # could not). Pre-resolve ALL distinct refs up front (fail-fast before any
     # GPU work) and cache them so a generated-metric module loads once.
     from sculptor.eval import resolve_fitness_fn as _resolve_fitness_fn
+    from sculptor.mission_metrics import resolve_stage_metric_ref
+
+    # §MISSION_METRIC_GRANULARITY: stage metrics generated at decompose
+    # time are stored as MISSION-DIR-RELATIVE paths (portable mission.json,
+    # inside the 128-char validator bound) — anchor them here before
+    # resolution. Spec names + absolute paths pass through untouched.
+    def _anchored(ref: Optional[str]) -> Optional[str]:
+        return resolve_stage_metric_ref(ref, mission_dir) if ref else ref
+
     _fitness_fn_cache: dict[str, Callable[[Path], float]] = {}
-    # Skip already-succeeded stages (resume): they won't run, so don't let a
-    # since-deleted generated-metric path on one of them fail-fast the whole
-    # resumed mission (§Ship 38 review L2).
-    for _ref in [fitness_metric] + [
-        getattr(s, "steering_metric", None) for s in mission.stages
-        if getattr(s, "status", None) != "succeeded"
+    # Skip terminal stages that will never run again (resume): succeeded and
+    # superseded — don't let a since-deleted generated-metric path on one of
+    # them fail-fast the whole resumed mission (§Ship 38 review L2).
+    for _ref in [_anchored(fitness_metric)] + [
+        _anchored(getattr(s, "steering_metric", None)) for s in mission.stages
+        if getattr(s, "status", None) not in ("succeeded", "superseded")
     ]:
         if _ref and _ref not in _fitness_fn_cache:
-            _fitness_fn_cache[_ref] = _resolve_fitness_fn(_ref)  # fail-fast on bad ref
+            _fitness_fn_cache[_ref] = _resolve_fitness_fn(
+                _ref, channel_catalog=channel_catalog)  # fail-fast on bad ref
 
     def _fitness_fn_for_stage(stage) -> Optional[Callable[[Path], float]]:
-        ref = getattr(stage, "steering_metric", None) or fitness_metric
+        ref = _anchored(
+            getattr(stage, "steering_metric", None) or fitness_metric)
         return _fitness_fn_cache.get(ref) if ref else None
 
     def _emit(payload: dict) -> None:
@@ -2530,6 +5004,26 @@ def mission_run(
                 mission.current_stage_idx += 1
                 continue
 
+            # §mission-persistence increment 1: defensive resume guard.
+            # By construction `current_stage_idx` is set to land on the
+            # first CHILD immediately after a splice (never on the
+            # retained, superseded parent itself), but a superseded
+            # stage is terminal and must never be executed — advance
+            # past it if somehow encountered (e.g. a hand-edited or
+            # older-format mission.json pointing current_stage_idx at
+            # it, or a future code path that doesn't maintain the
+            # invariant). No StageResult is recorded for it — it
+            # already got one (status="failed") on the run that
+            # superseded it.
+            if stage.status == "superseded":
+                _emit({
+                    "type": "stage_skipped",
+                    "stage_name": stage.name,
+                    "reason": "superseded",
+                })
+                mission.current_stage_idx += 1
+                continue
+
             # §Ship 38: pick THIS stage's objective metric (its own
             # steering_metric, else the mission-level default) and surface it.
             _stage_metric_ref = (
@@ -2569,12 +5063,29 @@ def mission_run(
                 fitness_patience=fitness_patience,
                 fitness_observe_only=fitness_observe_only,
                 fitness_revert=fitness_revert,
+                # §MISSION_RUN_PARITY: forward the per-launch knobs.
+                edit_candidates=edit_candidates,
+                rollout_episodes=rollout_episodes,
+                max_episode_steps=max_episode_steps,
+                playback_speed=playback_speed,
+                render_width=render_width,
+                render_height=render_height,
+                num_envs=num_envs,
+                device=device,
             )
             result.stage_results.append(stage_res)
 
             # Persist mission.json AFTER every stage transition so
             # resume sees the latest state.
             _atomic_save_mission(mission, mission_dir)
+
+            # §durable auto-save (A3): snapshot the mission into the
+            # restart-/delete-proof archive AS EACH STAGE FINISHES, so a
+            # user never loses footage to a later crash, regression, or
+            # an accidental project delete. Incremental → one entry per
+            # run. Retention (best+final+pinned checkpoints, all videos)
+            # lives in sculptor.archive. NEVER fatal to the mission.
+            _archive_mission_snapshot(mission_dir, emit=_emit)
 
             # §Ship 24 (R1): per-stage provenance record (never fatal,
             # but observable — warn ONCE per mission if records are
@@ -2650,6 +5161,12 @@ def mission_run(
             redecompositions=_redecompositions,
             emit=_emit,
         )
+
+        # §durable auto-save (A3): final archive snapshot on BOTH the
+        # completed AND halted paths — a halted mission still has footage
+        # worth keeping (e.g. the jump succeeded but the landing stage
+        # didn't). Incremental → folds into the same run entry.
+        _archive_mission_snapshot(mission_dir, emit=_emit, final=True)
 
         _emit({
             "type": "mission_completed" if result.completed
@@ -2928,6 +5445,116 @@ def _parent_env_component_terms(mission, stage) -> set[str]:
         return set()
 
 
+#: Reference-library robot slugs the on-disk library is keyed by
+#: (`sculptor.refs.library.clip_dir(robot, clip_id)`). Mirrors
+#: `mission_metrics._ROBOT_SLUGS` — kept as a small local copy rather
+#: than an import since `mission_metrics.py` is a metric-generation
+#: module or this one has no other dependency on, and the mapping is a
+#: single-source-of-truth-worthy but tiny (3-entry) constant.
+_STAGE_REFERENCE_ROBOT_SLUGS: tuple[str, ...] = ("go2", "go1", "g1")
+
+
+def _stage_reference_robot_slug(*, stage_dir: Path, project_root: Path) -> str:
+    """Resolve the bare robot slug (`"g1"`, `"go1"`, ...) the reference
+    library keys clips by, from the stage's (or the project's, as a
+    fallback for a not-yet-scaffolded stage) `[adapter].config.task_id`
+    — the same adapter/task_id-shaped string used everywhere else
+    (`"Mjlab-Velocity-Flat-Unitree-G1"`). Unknown/unreadable/absent
+    always falls back to `"g1"` (the only populated library robot as of
+    §R1_BUILD_SPEC — mirrors `sculptor.refs`'s own `robot: str = "g1"`
+    default throughout)."""
+    task_id = ""
+    for config_path in (stage_dir / "config.toml", project_root / "config.toml"):
+        if not config_path.is_file():
+            continue
+        try:
+            try:
+                import tomllib
+            except ModuleNotFoundError:  # pragma: no cover
+                import tomli as tomllib  # type: ignore[no-redef]
+            with config_path.open("rb") as f:
+                cfg = tomllib.load(f)
+            task_id = str(
+                ((cfg.get("adapter") or {}).get("config") or {})
+                .get("task_id", "") or "")
+        except Exception:  # noqa: BLE001 — best-effort resolution only
+            task_id = ""
+        if task_id:
+            break
+    hint = task_id.lower()
+    for slug in _STAGE_REFERENCE_ROBOT_SLUGS:
+        if slug in hint:
+            return slug
+    return "g1"
+
+
+def _resolve_stage_rsi_clip(
+    stage, robot: str, *, project_root: Path,
+) -> "tuple[Optional[dict], Optional[str], Optional[str]]":
+    """Resolve the reference clip for a stage's RSI curriculum.
+
+    §D21 Fix 2 (post-mortem D20, docs/internal/REFERENCE_BUILD_LOG.md):
+    precedence is
+
+      1. `stage.reference_clip_id` — a library clip explicitly ATTACHED
+         to THIS stage (§R1_BUILD_SPEC decision 10; covers get-up clips,
+         not just jumps). When set, this is the ONLY acceptable source —
+         a load failure here is FATAL (returned as `fatal_error`), never
+         silently substituted by a lower-precedence clip. Pre-D21 a set-
+         but-unloadable `reference_clip_id` fell through to jump.npz /
+         the procedural jump clip, silently swapping the task class the
+         stage's certified metric was generated against (the D20
+         incident: a get-up mission scaffolded standing/hopping jump
+         RSI when its attached clip failed to load).
+      2. a real (converted mocap) clip at `<project_root>/reference/
+         jump.npz` when present (legacy jump missions, byte-identical
+         behavior — no `reference_clip_id` means no attached-clip
+         contract to honor, so falling through here is not a silent
+         task-class swap, it's the documented default).
+      3. the analytic procedural jump clip (final fallback).
+
+    Returns `(clip, clip_src, fatal_error)`. `fatal_error` is set ONLY
+    for case 1's load failure — callers MUST fail the stage (not
+    proceed) when it is not None. Cases 2/3 never set it — a missing
+    jump.npz is precedence falling through to the always-available
+    procedural clip, not an error condition.
+
+    §D24 F1 item 5 (docs/internal/REFERENCE_BUILD_LOG.md D19/D23/D24):
+    case 1 resolves through `sculptor.mission_metrics.
+    load_stage_reference_clip` (the ONE loader) so a stage carrying a
+    persisted reference span gets the CROPPED clip here too — RSI and
+    eval-reset derivation must agree with what certification scored
+    (§D19's "every clip-shape assumption in ONE place" rule; D23's
+    root-cause chain was exactly cert/RSI/eval-reset disagreeing about
+    what the stage's motion IS). `clip_src` gains a `[t0-t1s]` suffix
+    only when a span applied — byte-identical to before for every
+    stage without one (existing event-payload assertions rely on this).
+    """
+    from sculptor.reference import make_procedural_jump_clip
+    from sculptor.reference import load_clip as _load_clip_fallback
+
+    stage_clip_id = getattr(stage, "reference_clip_id", None)
+    if stage_clip_id:
+        try:
+            from sculptor.mission_metrics import load_stage_reference_clip
+
+            loaded = load_stage_reference_clip(stage, robot)
+            # `stage_clip_id` truthy just above guarantees `loaded` is not
+            # None — the loader only returns None for a falsy clip id.
+            _clip_id, clip, span_meta = loaded
+            src = f"library:{robot}/{stage_clip_id}"
+            if span_meta is not None:
+                src += f"[{span_meta['t_start_s']:.2f}-{span_meta['t_end_s']:.2f}s]"
+            return clip, src, None
+        except Exception as e:  # noqa: BLE001 — fatal for this stage; no fallback
+            return None, None, f"{type(e).__name__}: {e}"
+
+    clip_path = project_root / "reference" / "jump.npz"
+    if clip_path.is_file():
+        return _load_clip_fallback(clip_path), str(clip_path), None
+    return make_procedural_jump_clip(), "procedural:jump", None
+
+
 def _run_one_stage(
     *,
     mission,
@@ -2952,6 +5579,17 @@ def _run_one_stage(
     fitness_patience: int = 2,
     fitness_observe_only: bool = False,
     fitness_revert: bool = True,
+    # §MISSION_RUN_PARITY: per-launch knobs mirrored from NewRunDialog so
+    # a mission run reaches parity with a standalone sculpt run. All
+    # None = defer to the stage's inherited [iteration]/[adapter] config.
+    edit_candidates: Optional[int] = None,
+    rollout_episodes: Optional[int] = None,
+    max_episode_steps: Optional[int] = None,
+    playback_speed: Optional[float] = None,
+    render_width: Optional[int] = None,
+    render_height: Optional[int] = None,
+    num_envs: Optional[int] = None,
+    device: Optional[str] = None,
 ):
     """Helper called by `mission_run` per stage. Kept separate so the
     orchestrator stays readable — `mission_run` is about flow; this
@@ -2959,7 +5597,17 @@ def _run_one_stage(
 
     §Ship 34: `fitness_fn`/`fitness_target`/`fitness_patience` are
     forwarded verbatim to this stage's sculpt_run call(s) so the stage's
-    inner loop is fitness-guided (None = blind, unchanged)."""
+    inner loop is fitness-guided (None = blind, unchanged).
+
+    §MISSION_RUN_PARITY: the video/rollout knobs (`rollout_episodes`,
+    `max_episode_steps`, `playback_speed`, `render_width`,
+    `render_height`) are passed straight through to sculpt_run (which
+    merges them into [iteration]). `edit_candidates` (best-of-K edit
+    search) has no sculpt_run kwarg, so it is injected into the stage's
+    [iteration] config after scaffolding; `num_envs`/`device` are
+    injected into the stage's [adapter] config (they live there, not in
+    sculpt_run's signature). All None = the stage's inherited config
+    value wins, so a plain mission run is byte-identical."""
     from sculptor.mission_runtime import (
         CriterionEvalError,
         StageResult,
@@ -3122,7 +5770,623 @@ def _run_one_stage(
                 f"{type(e).__name__}: {e}", emit,
             )
 
+    # §MISSION_RUN_PARITY: inject per-launch knobs that sculpt_run has no
+    # kwarg for (edit_candidates → [iteration]; num_envs/device →
+    # [adapter].config). Runs on BOTH the fresh-scaffold and resume paths
+    # so a resumed stage still honors the override. All-None = no-op.
+    if edit_candidates is not None or num_envs is not None or device is not None:
+        _apply_stage_run_overrides(
+            stage_dir / "config.toml",
+            edit_candidates=edit_candidates,
+            num_envs=num_envs,
+            device=device,
+        )
+        emit({
+            "type": "stage_run_overrides_applied",
+            "stage_name": stage.name,
+            "edit_candidates": edit_candidates,
+            "num_envs": num_envs,
+            "device": device,
+        })
+
+    # §F2 (adversarial-audit finding): mission.py's validate_mission
+    # FORCES needs_reference_rsi=True for a non-standing start_pose, but
+    # that force only fires at validate_mission() call time — a
+    # persisted mission.json reaching here via Mission.from_json (hand-
+    # edit, legacy file, a future non-validating writer) is never
+    # re-validated. Trusting the persisted `needs_reference_rsi` flag
+    # alone would let start_pose="supine" + needs_reference_rsi=False
+    # skip the ENTIRE scaffold block below un-forced: no eval_reset.json,
+    # gate returns skipped — the exact D20 hollow-success hole. Recompute
+    # the force-rule's condition independently here so the scaffold never
+    # trusts the flag in isolation.
+    non_standing = getattr(stage, "start_pose", None) in {
+        "supine", "prone", "sitting", "crouched",
+    }
+
+    # 2.5 §JUMP_SCAFFOLD (generalized §REFERENCE_TRAJECTORY_PLAN §8 part
+    # 2): decomposer-flagged reference-state initialization. Derive a
+    # validated TRAIN-ONLY RSI curriculum from a reference clip and
+    # persist it as this stage's next env-spec version before any
+    # training. Clip resolution (precedence + the D21 fatal-vs-fallback
+    # split) lives in `_resolve_stage_rsi_clip` — see its docstring.
+    # Failure resolving the env-spec ITSELF (not the clip) is non-fatal —
+    # RSI is curriculum assistance, not correctness; the stage trains
+    # without it. A clip resolution `fatal_error`, however, DOES fail the
+    # stage (§D21 Fix 2, below) — an attached-but-unloadable clip must
+    # never silently substitute a different task class. §F2: a
+    # non-standing start_pose ALSO enters this block even when the
+    # persisted needs_reference_rsi is (incorrectly) False.
+    # §H3 audit fix (docs/internal/REFERENCE_BUILD_LOG.md D23/D24/D25,
+    # fresh-context Opus adversarial audit): the span-derived reset
+    # numbers this scaffold writes depend on WHICH span the stage
+    # currently carries — a stale artifact derived from a DIFFERENT (or
+    # no) span must not be trusted forever just because a
+    # "reference:"-sourced env spec is already in force. Both idempotency
+    # guards below (this one and the reference_signature.json one further
+    # down) compare against a persisted span STAMP and re-derive on a
+    # mismatch. "Both None" (no span, no stamp) counts as a match — the
+    # common case for missions that never use spans at all, unchanged
+    # behavior.
+    _stage_span_stamp = {
+        "t_start_s": getattr(stage, "reference_span_start_s", None),
+        "t_end_s": getattr(stage, "reference_span_end_s", None),
+    }
+
+    def _stamped_span_matches(stamped: Optional[dict]) -> bool:
+        # A missing/absent stamp (pre-fix on-disk artifact, or a spec
+        # with no meta at all) is treated as "derived from no span" —
+        # this only produces a "mismatch" (forcing a re-derive) when the
+        # stage DOES currently carry a span, which errs toward the safe
+        # direction (a spurious but harmless re-derive) over risking a
+        # silently stale artifact.
+        s = stamped or {"t_start_s": None, "t_end_s": None}
+        return (
+            s.get("t_start_s") == _stage_span_stamp["t_start_s"]
+            and s.get("t_end_s") == _stage_span_stamp["t_end_s"])
+
+    if getattr(stage, "needs_reference_rsi", False) or non_standing:
+        stage_env_dir = stage_dir / "env"
+        # Default True (= skip) on a read failure — preserves the
+        # pre-D21 behavior of the whole block degrading to a no-op
+        # rather than risking a duplicate env-spec version stacked on
+        # top of an unreadable-but-possibly-already-applied one.
+        already = True
+        try:
+            from sculptor.env_spec import read_current_env_spec
+
+            current_spec = read_current_env_spec(stage_env_dir)
+            current_meta = (current_spec or {}).get("meta") or {}
+            already = str(current_meta.get("source", "")).startswith(
+                "reference:")
+            if already and not _stamped_span_matches(
+                    current_meta.get("derived_from_span")):
+                already = False
+                emit({
+                    "type": "stage_reference_rsi_span_changed",
+                    "stage_name": stage.name,
+                    "stamped_span": current_meta.get("derived_from_span"),
+                    "current_span": _stage_span_stamp,
+                })
+        except Exception as e:  # noqa: BLE001 — curriculum, not correctness
+            emit({
+                "type": "stage_reference_rsi_failed",
+                "stage_name": stage.name,
+                "error": f"{type(e).__name__}: {e}",
+            })
+        # Resume idempotency: don't stack a new env version per resume —
+        # the reference curriculum is already in force AND derived from
+        # the stage's CURRENT span (see `_stamped_span_matches` above).
+        if not already:
+            project_root = mission_dir.parent.parent
+            robot = _stage_reference_robot_slug(
+                stage_dir=stage_dir, project_root=project_root)
+            clip, clip_src, fatal_error = _resolve_stage_rsi_clip(
+                stage, robot, project_root=project_root)
+
+            # §D21 Fix 2: an ATTACHED clip (`reference_clip_id` set) that
+            # fails to load is FATAL — fail the stage rather than
+            # silently fall through to jump.npz / procedural jump, which
+            # would swap the task class the stage's certified metric was
+            # generated against out from under it (the D20 incident).
+            if fatal_error is not None:
+                emit({
+                    "type": "stage_reference_clip_load_failed",
+                    "stage_name": stage.name,
+                    "reference_clip_id": stage.reference_clip_id,
+                    "error": fatal_error,
+                })
+                return _fail_stage(
+                    stage, "reference_scaffold_failed",
+                    (
+                        f"reference clip {stage.reference_clip_id!r} "
+                        f"attached to this stage failed to load: "
+                        f"{fatal_error}. Refusing to silently fall back "
+                        f"to a different task class (jump RSI) — fix the "
+                        f"clip on disk or detach it from the stage and "
+                        f"re-run."
+                    ),
+                    emit,
+                )
+
+            # §D21 Fix 2: observability for the legacy no-clip-attached
+            # fallback (jump.npz / procedural jump). Behavior is byte-
+            # identical to before — this only discloses which source
+            # fired, for missions that never expected reference RSI to
+            # matter (e.g. a plain jump stage falling back to the
+            # procedural clip).
+            if getattr(stage, "reference_clip_id", None) is None:
+                emit({
+                    "type": "stage_reference_rsi_fallback",
+                    "stage_name": stage.name,
+                    "clip": clip_src,
+                })
+
+            # §start_pose QC (item 4): does the RESOLVED clip's measured
+            # shape agree with the stage-authored start_pose? Runs
+            # against WHATEVER clip actually resolved above — attached,
+            # project jump.npz, or procedural fallback — since a
+            # mismatch matters regardless of clip provenance (a
+            # start_pose="supine" stage training from a standing-ish
+            # procedural jump clip is exactly the D20 "silent wrong task
+            # class" failure mode this closes). No-op when
+            # stage.start_pose is None.
+            stage_start_pose = getattr(stage, "start_pose", None)
+            non_standing_start = stage_start_pose not in (None, "standing")
+            if stage_start_pose is not None:
+                try:
+                    from sculptor.reference import (
+                        check_start_pose_compatibility,
+                    )
+
+                    check_start_pose_compatibility(
+                        clip, stage_start_pose, clip_id=clip_src,
+                    )
+                except ValueError as e:
+                    emit({
+                        "type": "stage_start_pose_mismatch",
+                        "stage_name": stage.name,
+                        "start_pose": stage_start_pose,
+                        "clip": clip_src,
+                        "error": str(e),
+                    })
+                    return _fail_stage(
+                        stage, "reference_scaffold_failed", str(e), emit,
+                    )
+
+            try:
+                from sculptor.reference import (
+                    apply_reference_rsi, derive_eval_reset,
+                )
+
+                # §D20a settle-then-rederive: derive the pre-settle EVAL
+                # reset FIRST (None for airborne/other clips — pure
+                # no-op, unchanged behavior), settle it to physical rest
+                # on CPU MuJoCo when possible, and feed the settled
+                # centers into `apply_reference_rsi` so the persisted
+                # TRAIN ranges re-center on them too (same width, just
+                # re-anchored — never widened/narrowed here).
+                # RS_SETTLE_RESET=0 is the escape hatch (default on).
+                # Settle failure is NEVER fatal (§5) — proceed with the
+                # UNSETTLED values, but disclose the attempt/outcome in
+                # both the env-spec meta rationale (inside
+                # apply_reference_rsi) and the emitted events below.
+                import os as _os
+
+                eval_reset_pre = derive_eval_reset(clip)
+                settled_centers: Optional[dict] = None
+                settle_info: Optional[dict] = None
+                if eval_reset_pre is not None:
+                    if _os.environ.get("RS_SETTLE_RESET", "1") != "0":
+                        try:
+                            from sculptor.reference import (
+                                SettleExplosion, settle_reset,
+                            )
+
+                            settle_result = settle_reset(
+                                eval_reset_pre,
+                                joint_names=clip.get("joint_names"),
+                                robot=robot,
+                            )
+                            settled_centers = settle_result["scalars"]
+                            settle_info = {
+                                "attempted": True,
+                                "succeeded": True,
+                                "delta_z_m": settle_result["delta_z_m"],
+                                "steps": settle_result["steps"],
+                                "converged": settle_result["converged"],
+                                "duration_s": settle_result["duration_s"],
+                            }
+                        except SettleExplosion as e:
+                            # §D29-2: an EXPLOSION-class settle failure (the
+                            # plausibility-bound branch — distinct from mere
+                            # non-convergence, which stays non-fatal) means
+                            # the DERIVED reset pose itself is invalid, not
+                            # settle infrastructure being unavailable.
+                            # Proceeding with the unsettled (exploding)
+                            # reset was the live D29 disaster: a prone reset
+                            # settled to z 2.34 m, logged as a warning, and
+                            # trained on anyway. Fail the stage CLOSED — same
+                            # discipline D21 uses for clip-load failure —
+                            # unless the escape hatch is set.
+                            settle_info = {
+                                "attempted": True,
+                                "succeeded": False,
+                                "error": f"{type(e).__name__}: {e}",
+                                "explosion": True,
+                            }
+                            emit({
+                                "type": "stage_settle_explosion",
+                                "stage_name": stage.name,
+                                "clip": clip_src,
+                                "error": str(e),
+                            })
+                            if _os.environ.get(
+                                    "RS_SETTLE_EXPLOSION_FATAL", "1") != "0":
+                                return _fail_stage(
+                                    stage, "reference_scaffold_failed",
+                                    (
+                                        f"settling the reference-derived "
+                                        f"reset for stage {stage.name!r} "
+                                        f"produced a physically implausible "
+                                        f"result (contact-force explosion "
+                                        f"— the derived pose itself is "
+                                        f"invalid): {e}. Refusing to train "
+                                        f"from an unsettled, exploding "
+                                        f"reset (§D29). Set "
+                                        f"RS_SETTLE_EXPLOSION_FATAL=0 to "
+                                        f"override."
+                                    ),
+                                    emit,
+                                )
+                        except Exception as e:  # noqa: BLE001 — §5: never fatal
+                            settle_info = {
+                                "attempted": True,
+                                "succeeded": False,
+                                "error": f"{type(e).__name__}: {e}",
+                            }
+                    else:
+                        settle_info = {
+                            "attempted": False, "reason": "RS_SETTLE_RESET=0",
+                        }
+
+                spec_path = apply_reference_rsi(
+                    stage_env_dir, clip, settled_centers=settled_centers)
+                # §H3 audit fix: stamp the DERIVING span onto both the
+                # versioned spec and the `current.json` pointer
+                # `apply_reference_rsi` just wrote (env_spec.py's
+                # `write_env_spec_version` keeps them an exact copy of
+                # each other — patch both to preserve that invariant).
+                # `meta`'s inner keys are UNCONSTRAINED by
+                # `validate_env_spec` (only the top-level env-spec keys
+                # and `shared`/`train`'s inner keys are schema-checked —
+                # see `env_spec.py`'s `_TOP_KEYS`/`_SHARED_KEYS`/
+                # `_TRAIN_KEYS` allowlists), so this additive key is
+                # safe. Best-effort: a failure here only means the NEXT
+                # scaffold pass can't detect a span change for this
+                # stage and conservatively re-derives (see
+                # `_stamped_span_matches` above) — never fatal, and
+                # never touches iteration dirs or rewards.
+                try:
+                    for _p in (spec_path, stage_env_dir / "current.json"):
+                        _on_disk = json.loads(
+                            _p.read_text(encoding="utf-8"))
+                        _on_disk.setdefault("meta", {})[
+                            "derived_from_span"] = _stage_span_stamp
+                        _p.write_text(
+                            json.dumps(
+                                _on_disk, indent=2, sort_keys=True),
+                            encoding="utf-8")
+                except Exception as e:  # noqa: BLE001 — advisory bookkeeping
+                    emit({
+                        "type": "stage_reference_rsi_span_stamp_failed",
+                        "stage_name": stage.name,
+                        "error": f"{type(e).__name__}: {e}",
+                    })
+                emit({
+                    "type": "stage_reference_rsi_applied",
+                    "stage_name": stage.name,
+                    "clip": clip_src,
+                    "env_spec": str(spec_path),
+                    "stage_clip_load_error": None,
+                    "settle": settle_info,
+                })
+                # §D17: stage-FIXED eval-rollout reset override, written
+                # ONCE at scaffold time (same point as the train-only RSI
+                # above), decoupled from the diagnoser-iterable env-spec
+                # train section — see `reference.derive_eval_reset`'s
+                # docstring for the full rationale. Non-None only for
+                # get-up/mid_start-archetype clips; jump/other stages get
+                # None and this is a pure no-op (eval stays
+                # standing-start, unchanged behavior). §5: EVAL reset
+                # scalars get the settled values EXACTLY when settling
+                # succeeded (falls back to the unsettled derivation
+                # otherwise). Failure here is non-fatal for a
+                # standing-start stage (the RSI curriculum above already
+                # applied; a missing eval_reset.json just means eval
+                # falls back to today's standing-start behavior) but IS
+                # fatal for a non-standing `start_pose` stage (§4: that
+                # start state IS the task — silently continuing with a
+                # standing-default eval reset would reproduce the exact
+                # D20 hollow-mission failure).
+                try:
+                    final_eval_reset = (
+                        settled_centers if settled_centers is not None
+                        else eval_reset_pre)
+                    if final_eval_reset is not None:
+                        eval_reset_path = stage_env_dir / "eval_reset.json"
+                        stage_env_dir.mkdir(parents=True, exist_ok=True)
+                        eval_reset_path.write_text(
+                            json.dumps(
+                                final_eval_reset, indent=2, sort_keys=True),
+                            encoding="utf-8",
+                        )
+                        emit({
+                            "type": "stage_eval_reset_written",
+                            "stage_name": stage.name,
+                            "clip": clip_src,
+                            "eval_reset": final_eval_reset,
+                            "path": str(eval_reset_path),
+                            "settle": settle_info,
+                        })
+                except Exception as e:  # noqa: BLE001 — see fatal branch below
+                    emit({
+                        "type": "stage_eval_reset_failed",
+                        "stage_name": stage.name,
+                        "error": f"{type(e).__name__}: {e}",
+                    })
+                    if non_standing_start:
+                        return _fail_stage(
+                            stage, "reference_scaffold_failed",
+                            (
+                                f"eval-reset application failed for "
+                                f"start_pose={stage_start_pose!r} stage "
+                                f"{stage.name!r}: {type(e).__name__}: {e}. "
+                                f"A non-standing start is the task, not "
+                                f"curriculum — refusing to silently train "
+                                f"from a standing-default eval reset."
+                            ),
+                            emit,
+                        )
+            except Exception as e:  # noqa: BLE001 — see fatal branch below
+                emit({
+                    "type": "stage_reference_rsi_failed",
+                    "stage_name": stage.name,
+                    "error": f"{type(e).__name__}: {e}",
+                })
+                if non_standing_start:
+                    return _fail_stage(
+                        stage, "reference_scaffold_failed",
+                        (
+                            f"RSI application failed for "
+                            f"start_pose={stage_start_pose!r} stage "
+                            f"{stage.name!r}: {type(e).__name__}: {e}. "
+                            f"Refusing to silently train from a "
+                            f"standing default."
+                        ),
+                        emit,
+                    )
+
+    # §F2 part (b): a non-standing start_pose MUST have produced
+    # env/eval_reset.json by this point — either freshly written by the
+    # block above, or already present from an earlier scaffold pass
+    # (resume idempotency: `already=True` skips re-applying RSI, but the
+    # file from that earlier pass is still on disk, so this check still
+    # passes). Every early-return above treats scaffold failure as
+    # non-fatal by default (curriculum assistance, not correctness) —
+    # but for a non-standing stage the eval-reset override IS the
+    # correctness mechanism (§D17/§D19/§D20); a missing file here means
+    # the block was entered (or skipped un-forced) without ever writing
+    # one, e.g. because the clip carried no posture channels or
+    # `derive_eval_reset` returned None. Fail rather than silently
+    # falling back to a standing-default reset — the exact D20 hollow-
+    # success hole this whole program exists to close.
+    if non_standing and not (stage_dir / "env" / "eval_reset.json").is_file():
+        return _fail_stage(
+            stage, "reference_scaffold_failed",
+            (
+                f"stage {stage.name!r} has start_pose="
+                f"{getattr(stage, 'start_pose', None)!r} (non-standing) "
+                f"but no env/eval_reset.json was produced by the "
+                f"reference-RSI scaffold. A non-standing start is the "
+                f"task, not curriculum — refusing to silently train or "
+                f"evaluate from a standing-default reset."
+            ),
+            emit,
+        )
+
+    # 2.6 §reference_signature (item 6): whenever a reference clip is
+    # ATTACHED to this stage (stage.reference_clip_id set), INDEPENDENT
+    # of needs_reference_rsi, write `<stage_dir>/reference_signature.json`
+    # — a LOCKED schema a sibling worker's diagnose/edit prompts consume
+    # verbatim, so its shape must not deviate. Also QCs start_pose here
+    # for the needs_reference_rsi=False case (2.5 above already QC'd it
+    # when that block ran) — e.g. a `start_pose="standing"` stage
+    # accidentally pointed at a lying clip via the reference picker,
+    # with no RSI curriculum requested at all. Failure to resolve the
+    # clip or write the file is NON-FATAL (log only) — this is
+    # observability/context for a downstream consumer, never
+    # correctness. Idempotent: skipped once the file exists AND its
+    # persisted "span" key still matches the stage's CURRENT span
+    # fields (§H3 audit fix — a stale signature from a since-changed
+    # span must not be trusted just because a file is already there;
+    # see `_stamped_span_matches` above, same "both-None counts as
+    # match" convention).
+    stage_reference_clip_id = getattr(stage, "reference_clip_id", None)
+    _sig_path = stage_dir / "reference_signature.json"
+    _sig_rewrite_reason: Optional[str] = None
+    if stage_reference_clip_id and _sig_path.is_file():
+        try:
+            _existing_sig = json.loads(_sig_path.read_text(encoding="utf-8"))
+            if not _stamped_span_matches(_existing_sig.get("span")):
+                _sig_rewrite_reason = "span_changed"
+        except Exception:  # noqa: BLE001 — unreadable: rewrite, don't trust it
+            _sig_rewrite_reason = "existing_signature_unreadable"
+    if stage_reference_clip_id and (
+            not _sig_path.is_file() or _sig_rewrite_reason is not None):
+        sig_span_meta: Optional[dict] = None
+        try:
+            project_root = mission_dir.parent.parent
+            sig_robot = _stage_reference_robot_slug(
+                stage_dir=stage_dir, project_root=project_root)
+            from sculptor.refs import library as refs_library
+            # §D24 F1 item 5: the ONE loader — a persisted reference span
+            # crops the signature clip here too, so the LOCKED
+            # reference_signature.json a sibling worker's diagnose/edit
+            # prompts consume verbatim reflects the SAME motion
+            # certification scored, not the full clip.
+            from sculptor.mission_metrics import load_stage_reference_clip
+
+            loaded = load_stage_reference_clip(stage, sig_robot)
+            _sig_clip_id, sig_clip, sig_span_meta = loaded
+        except Exception as e:  # noqa: BLE001 — non-fatal (item 6)
+            sig_clip = None
+            emit({
+                "type": "stage_reference_signature_failed",
+                "stage_name": stage.name,
+                "error": f"{type(e).__name__}: {e}",
+            })
+
+        if sig_clip is not None:
+            sig_start_pose = getattr(stage, "start_pose", None)
+            if sig_start_pose is not None and not getattr(
+                    stage, "needs_reference_rsi", False):
+                try:
+                    from sculptor.reference import (
+                        check_start_pose_compatibility,
+                    )
+
+                    check_start_pose_compatibility(
+                        sig_clip, sig_start_pose,
+                        clip_id=f"library:{sig_robot}/{stage_reference_clip_id}",
+                    )
+                except ValueError as e:
+                    emit({
+                        "type": "stage_start_pose_mismatch",
+                        "stage_name": stage.name,
+                        "start_pose": sig_start_pose,
+                        "clip": f"library:{sig_robot}/{stage_reference_clip_id}",
+                        "error": str(e),
+                    })
+                    return _fail_stage(
+                        stage, "reference_scaffold_failed", str(e), emit,
+                    )
+
+            try:
+                from sculptor.refs.convert import kinematic_signature
+
+                try:
+                    sig_text = refs_library.read_provenance(
+                        sig_robot, stage_reference_clip_id).get("text")
+                except Exception:  # noqa: BLE001 — provenance is advisory
+                    sig_text = None
+
+                # §D24 F2 item B2: optional "eval_reset" key — the
+                # stage's certified eval-rollout START state, threaded
+                # into the diagnose/edit prompt via
+                # reference_context.render_reference_signature_block.
+                # Prefer `env/eval_reset.json` when it's already on disk
+                # (block 2.5 above wrote it this pass, or an earlier
+                # scaffold pass did — that's the number every eval
+                # rollout ACTUALLY uses, settled or not); only when it
+                # doesn't exist yet (e.g. this stage never entered the
+                # needs_reference_rsi/non_standing block above) fall back
+                # to a fresh, UNSETTLED derivation from `sig_clip` itself
+                # — cheap (no CPU-MuJoCo settle attempt here), advisory,
+                # never fatal (item 6, same non-fatal contract as the
+                # rest of this block).
+                sig_eval_reset: Optional[dict] = None
+                try:
+                    eval_reset_json_path = stage_dir / "env" / "eval_reset.json"
+                    if eval_reset_json_path.is_file():
+                        sig_eval_reset = {
+                            "scalars": json.loads(
+                                eval_reset_json_path.read_text(
+                                    encoding="utf-8")),
+                            "settled": None,
+                        }
+                    else:
+                        from sculptor.reference import derive_eval_reset
+
+                        derived = derive_eval_reset(sig_clip)
+                        if derived is not None:
+                            sig_eval_reset = {
+                                "scalars": derived, "settled": False}
+                except Exception:  # noqa: BLE001 — advisory only (item 6)
+                    sig_eval_reset = None
+
+                signature_payload = {
+                    "schema": 1,
+                    "clip_id": stage_reference_clip_id,
+                    "robot": sig_robot,
+                    "tier": getattr(stage, "reference_tier", None),
+                    "text": sig_text,
+                    "signature": kinematic_signature(sig_clip),
+                }
+                # §D24 F1 item 5: optional, additive key — schema stays 1
+                # (reference_context.load_reference_signature ignores
+                # unknown keys). Present only when the stage carries a
+                # persisted reference span.
+                if sig_span_meta is not None:
+                    signature_payload["span"] = {
+                        "t_start_s": sig_span_meta["t_start_s"],
+                        "t_end_s": sig_span_meta["t_end_s"],
+                        "confidence": sig_span_meta["confidence"],
+                        "method": sig_span_meta["method"],
+                    }
+                # §D24 F2 item B2: optional, additive key — schema stays 1
+                # (same contract as "span" above).
+                if sig_eval_reset is not None:
+                    signature_payload["eval_reset"] = sig_eval_reset
+                sig_path = stage_dir / "reference_signature.json"
+                sig_path.write_text(
+                    json.dumps(
+                        signature_payload, indent=2, sort_keys=True,
+                        default=str),
+                    encoding="utf-8",
+                )
+                emit({
+                    "type": "stage_reference_signature_written",
+                    "stage_name": stage.name,
+                    "path": str(sig_path),
+                    **({"reason": _sig_rewrite_reason}
+                       if _sig_rewrite_reason else {}),
+                })
+            except Exception as e:  # noqa: BLE001 — non-fatal (item 6)
+                emit({
+                    "type": "stage_reference_signature_failed",
+                    "stage_name": stage.name,
+                    "error": f"{type(e).__name__}: {e}",
+                })
+
     # 3. Materialize v1 from the stage's reward_seed_prompt.
+    #
+    # §edit-degrades-gracefully: `apply_prompt_edit` exhausts its repair
+    # retries (attempt 1 + `RS_EDIT_REPAIR_RETRIES`, see sculptor/edit.py)
+    # and raises `EditValidationError` when the LLM's generated reward
+    # module is invalid on every attempt (e.g. SyntaxError, then a module
+    # lacking `compute_reward` — a real incident, 2026-07-08). That is NOT
+    # transient (the LLM calls themselves succeeded) and is not
+    # recoverable by retrying `_run_one_stage` itself, so it's handled the
+    # same way as any other v1-materialization failure below: the stage
+    # (and ONLY this stage) is marked failed via `_fail_stage`, which
+    # returns a normal `StageResult` rather than letting the exception
+    # unwind past `_run_one_stage`. The caller (`mission_run`'s while-loop,
+    # sculpt.py ~L3848) appends that StageResult, persists mission.json,
+    # archives the mission snapshot, and writes the terminal
+    # `mission_halted_terminal` event — i.e. a clean failed-stage terminal
+    # state, not an uncaught-exception process crash. Earlier stages'
+    # on-disk artifacts (rewards/rollouts/checkpoints) and their
+    # `StageResult`s (already appended in prior loop iterations) are
+    # untouched by this branch — see the "earlier-stage data preserved"
+    # note at the top of `_run_one_stage` and `mission_run`'s per-stage
+    # loop (sculpt.py ~L3812-3897).
+    #
+    # `EditValidationError` is caught explicitly (not just via the
+    # `except Exception` below) so this specific, expected failure mode is
+    # self-documenting at the boundary; any OTHER exception from this
+    # block (adapter load errors, disk errors, etc.) still degrades the
+    # same way via the broader catch.
     try:
         from sculptor.edit import apply_prompt_edit
         latest_n, latest_reward_file = _find_latest_reward_version(
@@ -3130,6 +6394,52 @@ def _run_one_stage(
         )
         # Only materialize v1 if we haven't already (resume case).
         if latest_n == 0:
+            # Lokesh/DeepMimic direction: an attached reference is the reward's
+            # structural base, not merely prose shown to the LLM.  Replace the
+            # freshly-scaffolded constant-alive v0 with a deterministic,
+            # phase-indexed tracking reward before asking the LLM for v1.  The
+            # editor may then add only a bounded task residual; edit.py preserves
+            # the reference target hash across all later iterations.  Plain
+            # stages remain byte-for-byte on the historical prompt-only path.
+            if (stage_reference_clip_id
+                    and _is_pristine_starter_reward(latest_reward_file)):
+                try:
+                    from sculptor.mission_metrics import load_stage_reference_clip
+                    from sculptor.refs.track import (
+                        generate_tracking_residual_reward_source,
+                    )
+
+                    sig_robot = _stage_reference_robot_slug(
+                        stage_dir=stage_dir,
+                        project_root=mission_dir.parent.parent,
+                    )
+                    loaded_clip_id, tracking_clip, _ = load_stage_reference_clip(
+                        stage, sig_robot)
+                    tracking_source = generate_tracking_residual_reward_source(
+                        clip=tracking_clip,
+                        clip_id=loaded_clip_id,
+                        version="v0",
+                    )
+                    latest_reward_file.write_text(
+                        tracking_source, encoding="utf-8")
+                    emit({
+                        "type": "stage_reference_tracking_seeded",
+                        "stage_name": stage.name,
+                        "clip_id": loaded_clip_id,
+                        "reward_path": str(latest_reward_file),
+                    })
+                except Exception as e:  # noqa: BLE001
+                    # A reference explicitly attached for tracking is a core
+                    # objective, not advisory prompt context.  Falling back to
+                    # free-form scalar shaping would silently violate the mode
+                    # contract, so fail this stage cleanly and visibly.
+                    return _fail_stage(
+                        stage,
+                        "reference_tracking_seed_failed",
+                        f"could not build tracking-first reward: "
+                        f"{type(e).__name__}: {e}",
+                        emit,
+                    )
             from sculptor.adapters.base import load_adapter
             adapter_for_contract = load_adapter(stage_dir / "config.toml")
             apply_prompt_edit(
@@ -3156,6 +6466,12 @@ def _run_one_stage(
                 mission_dir=mission_dir,
                 emit=emit,
             )
+    except EditValidationError as e:
+        return _fail_stage(
+            stage, "v1_materialization_errored",
+            f"apply_prompt_edit failed: {type(e).__name__}: {e}",
+            emit,
+        )
     except Exception as e:  # noqa: BLE001
         return _fail_stage(
             stage, "v1_materialization_errored",
@@ -3237,6 +6553,14 @@ def _run_one_stage(
             iterations=max_iters,
             steps_per_iter=steps_per_iter,
             seed=seed,
+            # §MISSION_RUN_PARITY: rollout-video knobs forwarded straight
+            # through (sculpt_run merges them into [iteration]). None =
+            # inherited config wins.
+            max_episode_steps=max_episode_steps,
+            playback_speed=playback_speed,
+            render_width=render_width,
+            render_height=render_height,
+            rollout_episodes=rollout_episodes,
             init_policy_path=warm_start_path,
             per_iter_callback=per_iter_cb,
             fitness_fn=fitness_fn,
@@ -3255,6 +6579,12 @@ def _run_one_stage(
             f"sculpt_run raised: {type(e).__name__}: {e}",
             emit,
         )
+
+    # §keep-best finalization (B1): accumulate EVERY pass's iters. Each
+    # Goal-B extension REPLACES `sculpt_result`, so the final result only
+    # holds the extension's iters — but the best (e.g. jumping) policy may
+    # live in an earlier pass. Union them so selection sees them all.
+    all_iters: "list[IterOutcome]" = list(sculpt_result.completed_iters or [])
 
     # §Ship-19d Goal B: extension loop. Only entered when (a) the
     # caller opted in, (b) Goal A's callback did NOT fire (criterion
@@ -3339,6 +6669,13 @@ def _run_one_stage(
                 iterations=extra_iters,
                 steps_per_iter=steps_per_iter,
                 seed=seed,
+                # §MISSION_RUN_PARITY: same knobs on the Goal-B extension
+                # passes so extended iters render identically.
+                max_episode_steps=max_episode_steps,
+                playback_speed=playback_speed,
+                render_width=render_width,
+                render_height=render_height,
+                rollout_episodes=rollout_episodes,
                 init_policy_path=None,  # resume picks up from local ckpt
                 resume=True,
                 per_iter_callback=per_iter_cb,
@@ -3359,6 +6696,9 @@ def _run_one_stage(
                 f"{type(e).__name__}: {e}",
                 emit,
             )
+        # §keep-best (B1): fold this extension pass's iters into the
+        # candidate pool.
+        all_iters.extend(sculpt_result.completed_iters or [])
 
     stage.iterations_used = sculpt_result.iterations_run
     emit({
@@ -3372,53 +6712,86 @@ def _run_one_stage(
         "effective_max_iterations": effective_max_iterations,
     })
 
-    # 5. Derive final_policy_path from the last iter's checkpoint.
-    final_ckpt = _resolve_stage_final_checkpoint(sculpt_result)
-    if final_ckpt is None:
+    # 5-6. §keep-best finalization (B1): select the BEST iter whose
+    # rollout satisfies the criterion (highest fitness) — NOT the last
+    # iter. This is what makes a jump stage survive a late collapse to
+    # standing: the jumping policy is kept, evaluated, and warm-started
+    # from, even when a later iter regressed. `all_iters` unions every
+    # training + extension pass.
+    if not all_iters:
         return _fail_stage(
             stage, "no_checkpoint",
-            "training completed but no checkpoint.pt / .zip was "
-            "produced in the last iter — successor stages can't "
-            "warm-start from a missing file.",
+            "training completed but produced no iterations.",
             emit,
         )
+    (selected, criterion_ok, selection_source,
+     criterion_error, err_missing_key,
+     start_state_mismatch) = _select_stage_final_iter(
+        all_iters, stage, stage_dir=stage_dir, emit=emit)
+    if selected is None:
+        return _fail_stage(
+            stage, "no_checkpoint",
+            "training completed but no iteration produced a "
+            "checkpoint.pt / .zip — successor stages can't warm-start "
+            "from a missing file.",
+            emit,
+        )
+    final_ckpt = _iter_checkpoint(selected.iter_dir)
     stage.final_policy_path = str(final_ckpt)
     stage.final_reward_path = (
         str(sculpt_result.final_reward_path)
         if sculpt_result.final_reward_path else None
     )
+    stage.best_metric = selected.primary_metric
+    stage.selected_iter_index = selected.iter_index
+    stage.selection_source = selection_source
+    emit({
+        "type": "stage_final_selection",
+        "stage_name": stage.name,
+        "iter": selected.iter_index,
+        "source": selection_source,
+        "criterion_pass": bool(criterion_ok),
+        "metric": selected.primary_metric,
+        "fitness": selected.steer_fitness if selected.steer_fitness is not None
+        else selected.fitness,
+        "n_candidates": len({str(o.iter_dir) for o in all_iters}),
+    })
 
-    # 6. Evaluate success criterion on the last iter's namespace.
-    last_iter = sculpt_result.completed_iters[-1]
-    stage.best_metric = last_iter.primary_metric
-    try:
-        namespace = _build_criterion_namespace(
-            iter_dir=last_iter.iter_dir,
-            primary_metric=last_iter.primary_metric,
-        )
-        criterion_ok = _evaluate_success_criterion(
-            stage.success_criterion, namespace,
-        )
-    except CriterionEvalError as e:
-        # A criterion that references a metric/component the reward never
-        # produced (KeyError → CriterionMissingKeyError) means the measured
-        # quantity is absent — i.e. the goal was NOT met, not that the
-        # criterion is broken. Route it to the recoverable, re-decomposable
-        # `criterion_not_met` so one early/typo'd key reference can't halt
-        # the whole mission. Genuine criterion bugs (syntax / unsafe AST /
-        # numpy-vs-torch dtype) stay `criterion_errored`.
-        missing_key = isinstance(e, CriterionMissingKeyError)
-        reason = "criterion_not_met" if missing_key else "criterion_errored"
+    # A genuine criterion bug (unsafe AST / dtype) raised on every iter →
+    # no pass with a real error surfaced → criterion_errored (unrecoverable,
+    # as before). A plain miss / missing-key stays the recoverable
+    # `criterion_not_met`. `final_policy_path` already points at the
+    # strongest policy either way, so warm-start / re-decompose inherit it.
+    if not criterion_ok and criterion_error is not None and not err_missing_key:
         emit({
             "type": "stage_criterion_evaluated",
             "stage_name": stage.name,
             "satisfied": False,
-            "error": str(e),
-            "missing_key": missing_key,
+            "error": criterion_error,
+            "missing_key": False,
         })
         return _fail_stage(
-            stage, reason, str(e), emit,
-            criterion_error=str(e),
+            stage, "criterion_errored", criterion_error, emit,
+            criterion_error=criterion_error,
+        )
+
+    # §D21 Fix 3: every criterion-passing iter was rejected by the
+    # mechanical start-state gate (env/eval_reset.json frame-0 mismatch —
+    # D20's "hollow success"). Distinct, NON-redecomposable reason: the
+    # scaffold started from the wrong state, which re-authoring the
+    # criterion or reward can't fix.
+    if not criterion_ok and start_state_mismatch is not None:
+        emit({
+            "type": "stage_criterion_evaluated",
+            "stage_name": stage.name,
+            "criterion": stage.success_criterion,
+            "satisfied": False,
+            "last_iter_metric": selected.primary_metric,
+            "missing_key": False,
+            "start_state_mismatch": True,
+        })
+        return _fail_stage(
+            stage, "start_state_mismatch", start_state_mismatch, emit,
         )
 
     emit({
@@ -3426,8 +6799,66 @@ def _run_one_stage(
         "stage_name": stage.name,
         "criterion": stage.success_criterion,
         "satisfied": bool(criterion_ok),
-        "last_iter_metric": last_iter.primary_metric,
+        "last_iter_metric": selected.primary_metric,
+        # True only when the miss was a missing key (recoverable, names the
+        # key for re-decompose feedback); False for a clean criterion-false.
+        "missing_key": err_missing_key,
     })
+
+    # §D29-5: a unanimous certified-zero fitness VETOES criterion success.
+    # D29 live: a chaos/explosion rollout satisfied a bare `.any()`
+    # criterion on EVERY iteration while the six-gate certified metric
+    # scored 0.0 on EVERY one of them (started-low gate saw z_start 0.45
+    # mid-air; no-lunge gate saw 2.4 m travel) — criterion_pass=true,
+    # fitness=0.0 minted "success" under D20's "criterion is the sole
+    # authority" semantics. When the stage HAS a steering metric that
+    # produced FINITE fitness for its candidates, a unanimous certified-
+    # zero (max fitness across every checkpointed candidate <= the SAME
+    # `FITNESS_CONTRADICTION_EPS` F4 uses) means either the rollout
+    # behavior is not what it looks like or the metric is out of scope
+    # for this stage — the loop/diagnoser sorts out which, exactly what
+    # D20 wanted and D29 proved. Resolves as `criterion_pass_fitness_
+    # zero`, which behaves like `criterion_not_met` for redecomposition
+    # (`_REDECOMPOSABLE_REASONS`, below). Stages with NO metric (every
+    # candidate's `.fitness is None`) keep today's criterion-only
+    # behavior, untouched. `RS_FITNESS_VETO=0` disables (default ON).
+    if criterion_ok:
+        import os as _os
+
+        if _os.environ.get("RS_FITNESS_VETO", "1") != "0":
+            _by_dir: dict[str, IterOutcome] = {}
+            for _o in all_iters:
+                _by_dir[str(_o.iter_dir)] = _o
+            _fitness_vals = [
+                _o.fitness for _o in _by_dir.values()
+                if _iter_checkpoint(_o.iter_dir) and _o.fitness is not None
+            ]
+            if _fitness_vals:
+                _max_fitness = max(_fitness_vals)
+                if _max_fitness <= FITNESS_CONTRADICTION_EPS:
+                    emit({
+                        "type": "stage_criterion_fitness_veto",
+                        "stage_name": stage.name,
+                        "max_fitness": round(_max_fitness, 5),
+                        "n_candidates": len(_fitness_vals),
+                        "criterion": stage.success_criterion,
+                    })
+                    return _fail_stage(
+                        stage, "criterion_pass_fitness_zero",
+                        (
+                            f"success_criterion {stage.success_criterion!r} "
+                            f"was satisfied, but the stage's steering "
+                            f"metric produced a UNANIMOUS certified-zero "
+                            f"fitness (max={_max_fitness:.4f} across "
+                            f"{len(_fitness_vals)} candidate iteration(s), "
+                            f"threshold {FITNESS_CONTRADICTION_EPS}) — the "
+                            f"rollout behavior may not be what it looks "
+                            f"like, or the metric is out of scope for this "
+                            f"stage (§D29). Refusing to mint a hollow "
+                            f"success; set RS_FITNESS_VETO=0 to override."
+                        ),
+                        emit,
+                    )
 
     if criterion_ok:
         stage.status = "succeeded"
@@ -3473,13 +6904,19 @@ def _run_one_stage(
             final_reward_path=stage.final_reward_path,
             criterion_satisfied=True,
             last_iter_metric=stage.best_metric,
+            selected_iter_index=stage.selected_iter_index,
+            selection_source=stage.selection_source,
         )
 
     return _fail_stage(
         stage, "criterion_not_met",
-        f"success_criterion {stage.success_criterion!r} evaluated False "
-        f"on last iter (metric={last_iter.primary_metric}).",
+        f"success_criterion {stage.success_criterion!r} was not met by any "
+        f"trained iteration (kept iter {selected.iter_index}, "
+        f"metric={selected.primary_metric}).",
         emit,
+        # Preserve the missing-key detail (if any) so re-decompose feedback
+        # can point Claude at the real absent key.
+        criterion_error=criterion_error,
     )
 
 
@@ -3493,6 +6930,12 @@ def _fail_stage(
 
     stage.status = "failed"
     stage.finished_at = _utc_now_iso()
+    # §mission-persistence increment 1: persist the failure onto the
+    # stage itself (mission.json), not just the ephemeral StageResult /
+    # provenance.json. Without this the reason was lost the moment the
+    # stage was superseded by redecomposition or the process exited.
+    stage.failure_reason = reason
+    stage.failure_detail = detail
     emit({
         "type": "stage_failed",
         "stage_name": stage.name,
@@ -3508,6 +6951,10 @@ def _fail_stage(
         criterion_error=criterion_error,
         last_iter_metric=stage.best_metric,
         failure_reason=reason,
+        # §keep-best (B1): carry the selection (None on pre-selection
+        # failures like training_errored / no_checkpoint).
+        selected_iter_index=getattr(stage, "selected_iter_index", None),
+        selection_source=getattr(stage, "selection_source", None),
     )
 
 
@@ -3526,14 +6973,21 @@ def _utc_now_iso() -> str:
 #   - criterion_errored:  the criterion itself was malformed (bad dtype,
 #     unsafe AST) and slipped past decompose-time validation; a rewrite
 #     can correct it.
-# Both are bounded by the 1-attempt redecomposition cap, so a persistently
-# broken/unmet stage still halts after ONE recovery try rather than wasting
-# the whole multi-hour mission on the first stumble. Infrastructure-class
-# failures (training_errored, no_checkpoint, adapter_mismatch,
-# scaffold_errored, v1_materialization_errored) signal env / code issues
-# re-decomposition can't fix and are deliberately excluded.
+#   - criterion_pass_fitness_zero (§D29-5): the criterion read "satisfied"
+#     but the stage's own certified steering metric scored a unanimous
+#     zero on every candidate — behaves like criterion_not_met for
+#     redecomposition purposes (a re-authored criterion/goal, or a
+#     re-scoped metric, can both plausibly fix this; which one is exactly
+#     what redecomposition + the diagnoser sort out).
+# All three are bounded by the 1-attempt redecomposition cap, so a
+# persistently broken/unmet stage still halts after ONE recovery try
+# rather than wasting the whole multi-hour mission on the first stumble.
+# Infrastructure-class failures (training_errored, no_checkpoint,
+# adapter_mismatch, scaffold_errored, v1_materialization_errored) signal
+# env / code issues re-decomposition can't fix and are deliberately
+# excluded.
 _REDECOMPOSABLE_REASONS: frozenset[str] = frozenset(
-    {"criterion_not_met", "criterion_errored"}
+    {"criterion_not_met", "criterion_errored", "criterion_pass_fitness_zero"}
 )
 
 # Ship 22r: within a single stage's ONE redecomposition (the per-stage cap
@@ -3674,11 +7128,25 @@ def _maybe_redecompose_and_splice(
 
     Side effects on success:
       * `mission.stages[failed_stage_idx:failed_stage_idx+1]` replaced
-        by sub-stages.
+        by `[failed_stage] + sub_stages` — §mission-persistence
+        increment 1: the failed stage is RETAINED (marked
+        "superseded"), not discarded. Its trained iterations stay
+        visible in every UI view / report; only its runnable slot is
+        taken over by the children.
       * Downstream children's `parent_stage` references re-pointed
         from `failed.name` to the LAST sub-stage's name.
-      * `mission.current_stage_idx` set to `failed_stage_idx` so the
-        while-loop processes the first sub-stage next.
+      * `mission.current_stage_idx` set to `failed_stage_idx + 1` (the
+        first sub-stage now sits one slot AFTER the retained,
+        superseded failed stage) so the while-loop processes the first
+        sub-stage next.
+      * `steering_metric` is left exactly as `redecompose_stage`
+        (decompose.py) set it — `None` unless a sub-stage's own draft
+        named one — so the existing LAZY metric generation certifies
+        each sub-stage against its OWN span (§D30: a "defense-in-depth"
+        backstop that used to copy the FAILED stage's steering_metric
+        into any sub-stage lacking one was removed here — it was
+        reproducing D30's wrong-scope-metric hollow-zero bug through a
+        second path once decompose.py stopped inheriting it).
       * mission.json persisted atomically.
       * `stage_redecomposed` event emitted.
 
@@ -3830,6 +7298,11 @@ def _maybe_redecompose_and_splice(
                 reward_contract=reward_contract,
                 kg_store=kg_store,
                 prior_attempt_error=prior_error,
+                # §D24 F1 item 4b: resolves the reference-library robot
+                # slug for per-sub-stage span selection — same hint the
+                # adapter already exposes (mirrors mission_jobs.py's
+                # `robot_hint=getattr(adapter, "task_id", None)`).
+                robot_hint=getattr(adapter, "task_id", None),
             )
         except (MissionValidationError, DecompositionError) as e:
             last_reason, last_detail = "validation_failed", f"{type(e).__name__}: {e}"
@@ -3852,11 +7325,25 @@ def _maybe_redecompose_and_splice(
             continue
 
         last_sub_name = sub_stages[-1].name
-        # Splice: replace the failed stage with sub-stages, repoint downstream.
-        mission.stages[failed_stage_idx:failed_stage_idx + 1] = sub_stages
+        # Splice: RETAIN the failed stage (in place, ahead of its
+        # children) and insert sub-stages immediately after it.
+        # §mission-persistence increment 1: previously this replaced
+        # the failed stage outright (`mission.stages[idx:idx+1] =
+        # sub_stages`), which discarded a stage that could carry many
+        # hours of trained iterations from every UI view / report the
+        # moment it failed. `failed_stage.status` is only flipped to
+        # "superseded" once the splice is confirmed valid (below) —
+        # NOT here — because `_restore_pre_splice` restores the
+        # ORIGINAL `Stage` objects by reference (`saved_stages =
+        # list(mission.stages)` copies the list, not the objects), so
+        # an in-place status mutation made before a failed validation
+        # attempt would survive the "rollback" and corrupt the retry.
+        mission.stages[failed_stage_idx:failed_stage_idx + 1] = (
+            [failed_stage] + sub_stages
+        )
         repointed = _repoint_downstream_children(
             mission.stages, failed_stage.name, last_sub_name,
-            slice_start=failed_stage_idx + len(sub_stages),
+            slice_start=failed_stage_idx + 1 + len(sub_stages),
         )
         # Validate the spliced mission. If invalid, restore the clean
         # pre-splice graph and retry with the error fed back.
@@ -3884,10 +7371,43 @@ def _maybe_redecompose_and_splice(
         })
         return False
 
+    # §mission-persistence increment 1: the splice validated cleanly —
+    # commit the failed stage to its terminal "superseded" state.
+    # failure_reason / failure_detail were already set by `_fail_stage`
+    # and are left untouched (that's the record of WHY it was
+    # superseded). Terminal + never re-entered by the while-loop.
+    failed_stage.status = "superseded"
+
+    # §D30 (docs/internal/REFERENCE_BUILD_LOG.md): a §mission-persistence
+    # increment-1 "defense-in-depth backstop" USED to live here — any
+    # sub-stage the redecomposer left without its own `steering_metric`
+    # copied in the superseded parent's. Its own comment assumed
+    # `redecompose_stage` already did this unconditionally (see
+    # decompose.py) and called itself redundant. D30 (live, 2026-07-13):
+    # a sub-stage's span machinery correctly selected its OWN sub-span
+    # (e.g. the crouch-to-stand tail of a prone-getup clip), but the
+    # inherited metric POINTER carried the PARENT's synthetic-exemplar
+    # metric along with it — which demands a PRONE start the sub-stage is
+    # designed NOT to have. A perfectly correct crouch-to-stand rollout
+    # scored fitness 0.0 under the wrong-scope inherited metric (the
+    # exact D23 exemplar-scope-mismatch class, reborn one level down via
+    # redecomposition instead of decomposition). `decompose.py`'s
+    # `redecompose_stage` was fixed to leave sub-stages' `steering_metric`
+    # `None` (D21 inherited the reference BINDING deliberately; the
+    # metric pointer came along by accident) so the existing LAZY metric
+    # generation (`mission_metrics.generate_stage_metrics`) certifies
+    # each sub-stage against its OWN already-selected span. This backstop
+    # — now the ONLY thing that still copied the parent metric in — was
+    # therefore reproducing D30 through a second path and is REMOVED:
+    # sub-stages simply keep `steering_metric=None` from `redecompose_
+    # stage`, same as every other Stage field that gets lazily generated.
+
     # Reviewer-flagged: persist current_stage_idx BEFORE the splice so
     # a crash-resume starts at the first new sub-stage rather than
-    # skipping ahead.
-    mission.current_stage_idx = failed_stage_idx
+    # skipping ahead. §mission-persistence increment 1: the retained,
+    # superseded failed stage now occupies `failed_stage_idx`, so the
+    # first sub-stage is one slot later.
+    mission.current_stage_idx = failed_stage_idx + 1
 
     # Audit-fix (Ship 17 review, finding #A): if `_atomic_save_mission`
     # fails (disk full / permissions / EIO), the in-memory mission has
@@ -3899,8 +7419,13 @@ def _maybe_redecompose_and_splice(
     try:
         _atomic_save_mission(mission, mission_dir)
     except OSError as e:
-        # Roll back in-memory splice + parent re-pointing.
-        mission.stages[failed_stage_idx:failed_stage_idx + len(sub_stages)] = [failed_stage]
+        # Roll back in-memory splice + parent re-pointing + status +
+        # current_stage_idx. (§D30: no metric-inheritance state to roll
+        # back any more — sub-stages' `steering_metric` was never
+        # mutated here, see the removed backstop's comment above.)
+        mission.stages[failed_stage_idx:failed_stage_idx + 1 + len(sub_stages)] = [failed_stage]
+        failed_stage.status = "failed"
+        mission.current_stage_idx = failed_stage_idx
         # Restore downstream children's parent_stage to the failed name.
         for s in mission.stages[failed_stage_idx + 1:]:
             if s.parent_stage == last_sub_name:
@@ -3917,6 +7442,23 @@ def _maybe_redecompose_and_splice(
             ),
         })
         return False
+
+    # §D21 Fix 1: make the reference-binding inheritance (decompose.py
+    # `redecompose_stage`) observable in logs — every sub-stage carries
+    # the failed stage's reference_clip_id unconditionally; whether the
+    # forced-RSI override fired depends on the failed stage's own
+    # env/eval_reset.json (§D17), recomputed here the same way
+    # `redecompose_stage` did (best-effort — never fatal post-splice).
+    try:
+        forced_reference_rsi = (stage_dir / "env" / "eval_reset.json").is_file()
+    except Exception:  # noqa: BLE001
+        forced_reference_rsi = False
+    emit({
+        "type": "redecomposition_reference_inherited",
+        "stage_name": failed_stage.name,
+        "reference_clip_id": failed_stage.reference_clip_id,
+        "forced_reference_rsi": bool(forced_reference_rsi),
+    })
 
     emit({
         "type": "stage_redecomposed",

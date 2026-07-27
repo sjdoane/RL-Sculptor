@@ -1,4 +1,5 @@
 import { useEffect, useRef } from "react";
+import { createPortal } from "react-dom";
 import type {
   ButtonHTMLAttributes, CSSProperties, ReactNode,
 } from "react";
@@ -30,6 +31,13 @@ export const STATUS_META: Record<string, StatusMeta> = {
   pending:    { label: "Pending",    cls: "slate",   icon: "circle" },
   skipped:    { label: "Skipped",    cls: "slate",   icon: "minus" },
   held:       { label: "Held",       cls: "slate",   icon: "minus" },
+  // §mission-persistence: replaced by redecomposition children; terminal,
+  // non-alarming (artifacts retained) — distinct from "failed".
+  superseded: { label: "Superseded", cls: "slate",   icon: "git-branch" },
+  // §env-authoring: a promoted world selection — terminal + healthy. NOT
+  // "running": lineage entries are immutable history, and a spinner there
+  // reads as a stuck load.
+  promoted:   { label: "Promoted",   cls: "emerald", icon: "check-circle" },
 };
 
 export function Badge({
@@ -47,18 +55,23 @@ export function Badge({
 export function AuthorBadge({ author }: { author: string }) {
   const human = author === "human";
   return (
-    <span className={"rs-abadge " + (human ? "human" : "sculptor")}>
+    <span
+      className={"rs-abadge " + (human ? "human" : "sculptor")}
+      title={human
+        ? "Hand-written by a human (manual edit or saved draft)"
+        : "Written by the sculptor's diagnose-and-edit loop"}
+    >
       <Icon name={human ? "user" : "sparkles"} size={11} />
       {human ? "Human" : "Sculptor"}
     </span>
   );
 }
 
-export function Delta({ value, suffix }: { value: number | null | undefined; suffix?: string }) {
-  if (value == null) return <span className="rs-delta flat">—</span>;
+export function Delta({ value, suffix, title }: { value: number | null | undefined; suffix?: string; title?: string }) {
+  if (value == null) return <span className="rs-delta flat" title={title}>—</span>;
   const cls = value > 0 ? "up" : value < 0 ? "down" : "flat";
   const sign = value > 0 ? "+" : "";
-  return <span className={"rs-delta " + cls}>{sign}{value.toFixed(1)}{suffix ?? ""}</span>;
+  return <span className={"rs-delta " + cls} title={title}>{sign}{value.toFixed(1)}{suffix ?? ""}</span>;
 }
 
 export function FactChip({
@@ -329,6 +342,11 @@ export function Modal({
   footer?: ReactNode;
 }) {
   const ref = useRef<HTMLDivElement>(null);
+  // Scrim clicks only close when the pointer went DOWN on the scrim itself.
+  // Dragging a text selection out of the dialog and releasing on the scrim
+  // fires a click on the scrim (the common ancestor of down + up targets),
+  // which used to close every dialog app-wide mid-selection.
+  const scrimPointerDown = useRef(false);
   // Latest onClose via ref so the mount-once effect never re-binds (avoids
   // focus-thrash when the parent passes an inline arrow for onClose).
   const onCloseRef = useRef(onClose);
@@ -376,8 +394,24 @@ export function Modal({
       prev?.focus?.();
     };
   }, []);
-  return (
-    <div className="rs-scrim" onClick={onClose}>
+  // Portal to <body>. `.rs-modal` animates `transform` with fill-mode `both`,
+  // so it keeps a non-none transform forever — which makes it a containing
+  // block for `position: fixed` descendants. A modal rendered INSIDE another
+  // modal therefore had its `position: fixed` scrim resolve against the parent
+  // dialog's box instead of the viewport, clipping the nested dialog's header
+  // and footer (seen on the reference picker's compose dialog). The portal
+  // takes the scrim out of that subtree so `fixed` means fixed again.
+  // MODAL_STACK still orders Escape/focus-trap correctly across nesting.
+  return createPortal(
+    <div
+      className="rs-scrim"
+      onPointerDown={(e) => { scrimPointerDown.current = e.target === e.currentTarget; }}
+      onClick={(e) => {
+        const armed = scrimPointerDown.current;
+        scrimPointerDown.current = false;
+        if (armed && e.target === e.currentTarget) onClose();
+      }}
+    >
       <div
         ref={ref}
         className={"rs-modal" + (wide ? " wide" : "") + (full ? " full" : "")}
@@ -400,6 +434,7 @@ export function Modal({
         <div className={"rs-modal-body" + (flush ? " flush" : "")}>{children}</div>
         {footer && <div className="rs-modal-foot">{footer}</div>}
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }

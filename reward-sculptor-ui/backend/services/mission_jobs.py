@@ -101,6 +101,8 @@ def run_mission_decompose_job(
     mission_slug: str,
     no_kg: bool = False,
     run_defaults: Optional[dict[str, Any]] = None,
+    gen_stage_metrics: bool = True,
+    stage_metric_candidates: int = 1,
 ) -> Callable[[Job, asyncio.Event], Awaitable[dict[str, Any]]]:
     """Async runner that calls `sculptor.decompose.decompose_task` and
     persists the resulting mission to `<project_dir>/.missions/
@@ -114,6 +116,14 @@ def run_mission_decompose_job(
     mission_slug : pre-resolved unique slug (caller derived via
         `mission_store.derive_unique_mission_slug`).
     no_kg : skip KG context to Claude (faster, less grounded).
+    gen_stage_metrics : §MISSION_METRIC_GRANULARITY — after decompose,
+        generate one trust-gated objective metric per stage from the
+        stage's own goal text (default ON). Rejected generations leave
+        the stage on the mission-level metric fallback.
+    stage_metric_candidates : §MISSION_RUN_PARITY — best-of-N candidates
+        sampled per stage metric (1 = single-shot-with-retry). Forwarded
+        to `generate_stage_metrics(n_candidates=...)`. Only used when
+        `gen_stage_metrics` is True.
     run_defaults : §Ship 21a — optional run-time defaults set up
         front via the NewMissionDialog Advanced tab. Persisted on the
         Mission so RunMissionDialog can pre-fill when the user later
@@ -135,6 +145,7 @@ def run_mission_decompose_job(
             from sculptor.adapters.base import load_adapter
             from sculptor.decompose import decompose_task
             from sculptor.kg.store import SculptorKG
+            from sculptor.llm import set_llm_log_dir
             from sculptor.mission import save_mission
 
             config_path = project_dir / "config.toml"
@@ -145,6 +156,11 @@ def run_mission_decompose_job(
 
             adapter = load_adapter(config_path)
             reward_contract = adapter.reward_contract()
+
+            # §llm provenance: archive decompose calls to the mission dir.
+            _md = mission_store.mission_dir(project_dir, mission_slug)
+            _md.mkdir(parents=True, exist_ok=True)
+            set_llm_log_dir(_md)
 
             kg_store = None if no_kg else SculptorKG()
             try:
@@ -170,6 +186,44 @@ def run_mission_decompose_job(
                 "decomposition_rationale": mission.decomposition_rationale,
             }
 
+        def _do_stage_metrics() -> dict[str, Any]:
+            # §MISSION_METRIC_GRANULARITY: second phase — one trust-gated
+            # metric per stage. Loads the just-saved mission so this phase
+            # is independent of the decompose closure's locals.
+            from sculptor.adapters.base import load_adapter
+            from sculptor.llm import set_llm_log_dir
+            from sculptor.mission import load_mission, save_mission
+            from sculptor.mission_metrics import generate_stage_metrics
+            from sculptor.world.channels import load_project_channel_catalog
+
+            md = mission_store.mission_dir(project_dir, mission_slug)
+            mission = load_mission(md)
+            adapter = load_adapter(project_dir / "config.toml")
+            set_llm_log_dir(md)  # provenance for the metric-gen calls
+
+            # §MISSION_RUN_PARITY: forward the per-stage metric-gen events
+            # (stage_metric_gen_started/accepted/rejected/failed) to the
+            # mission WS so the live feed shows each stage's metric being
+            # built + trust-gated. ONLY typed events pass — the low-level
+            # generate_objective_metric progress dicts carry no `type`
+            # (pipeline stage names, not mission stages) and would flood
+            # the feed, so they're dropped. Mirrors the thread-safe
+            # `job.emit` use in the subprocess streamer below; never raises.
+            def _emit_metric_ev(ev: dict[str, Any]) -> None:
+                try:
+                    if isinstance(ev, dict) and ev.get("type"):
+                        job.emit({**ev, "mission_slug": mission_slug})
+                except Exception:  # noqa: BLE001 — progress is advisory
+                    pass
+
+            report = generate_stage_metrics(
+                mission, robot_hint=getattr(adapter, "task_id", None),
+                n_candidates=stage_metric_candidates,
+                on_event=_emit_metric_ev,
+                channel_catalog=load_project_channel_catalog(project_dir))
+            save_mission(mission, md)
+            return report
+
         try:
             result = await asyncio.to_thread(_do_decompose)
         except Exception as e:  # noqa: BLE001
@@ -182,6 +236,31 @@ def run_mission_decompose_job(
             # Re-raise so the JobManager marks the job errored with
             # this exception's text in `job.error`.
             raise
+
+        if gen_stage_metrics:
+            job.progress = 0.6
+            job.message = (
+                f"generating per-stage metrics "
+                f"({result['n_stages']} stages)")
+            job.emit({
+                "type": "mission_stage_metrics_started",
+                "mission_slug": mission_slug,
+                "n_stages": result["n_stages"],
+            })
+            try:
+                sm_report = await asyncio.to_thread(_do_stage_metrics)
+            except Exception as e:  # noqa: BLE001 — metrics are enhancement;
+                # the decomposed mission is already saved and runnable on
+                # the mission-level fallback. Report, don't fail the job.
+                sm_report = {"generated": [], "rejected": [],
+                             "skipped": [], "error": str(e)}
+            result["stage_metrics"] = sm_report
+            job.emit({
+                "type": "mission_stage_metrics_completed",
+                "mission_slug": mission_slug,
+                **{k: sm_report.get(k) for k in
+                   ("generated", "rejected", "skipped", "error")},
+            })
 
         job.progress = 1.0
         job.message = (
@@ -212,6 +291,15 @@ def _build_mission_run_flags(
         ("seed", "--seed"),
         ("criterion_stability_window", "--criterion-stability-window"),
         ("max_extensions_per_stage", "--max-extensions-per-stage"),
+        # §MISSION_RUN_PARITY: per-launch knobs mirrored from NewRunDialog.
+        # Flag names MUST match sculptor/cli.py::mission_run_cli's Options.
+        ("edit_candidates", "--edit-candidates"),
+        ("rollout_episodes", "--rollout-episodes"),
+        ("max_episode_steps", "--max-episode-steps"),
+        ("render_width", "--render-width"),
+        ("render_height", "--render-height"),
+        ("fitness_patience", "--fitness-patience"),
+        ("num_envs_override", "--num-envs"),
     ]
     for key, flag in int_flags:
         v = run_kwargs.get(key)
@@ -221,11 +309,17 @@ def _build_mission_run_flags(
         ("extension_factor", "--extension-factor"),
         ("extension_improvement_threshold",
          "--extension-improvement-threshold"),
+        ("playback_speed", "--playback-speed"),
     ]
     for key, flag in float_flags:
         v = run_kwargs.get(key)
         if v is not None:
             flags += [flag, str(float(v))]
+    # §MISSION_RUN_PARITY: string device override (mjlab). Skip blanks so
+    # an empty string doesn't shadow the stage's inherited device.
+    device_override = run_kwargs.get("device_override")
+    if device_override not in (None, ""):
+        flags += ["--device", str(device_override)]
     bool_flags = [
         ("early_stop_on_criterion", "--early-stop-on-criterion"),
         ("extend_on_improvement", "--extend-on-improvement"),

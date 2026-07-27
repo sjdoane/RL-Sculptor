@@ -201,7 +201,10 @@ function RobotCard({
         <div style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 10, textTransform: "uppercase", letterSpacing: 0.4, color: "var(--rs-muted)" }}>
           <span>{robot.category.replace(/_/g, " ")}</span>
           {robot.references.length > 0 && (
-            <span style={{ display: "inline-flex", alignItems: "center", gap: 2 }}>
+            <span
+              style={{ display: "inline-flex", alignItems: "center", gap: 2 }}
+              title={`${robot.references.length} reference paper${robot.references.length === 1 ? "" : "s"} / repo${robot.references.length === 1 ? "" : "s"}`}
+            >
               <Icon name="book" size={12} />{robot.references.length}
             </span>
           )}

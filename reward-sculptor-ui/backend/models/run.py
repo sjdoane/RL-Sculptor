@@ -8,7 +8,7 @@ underlying Job.
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Annotated, Any, Literal, Optional
+from typing import Annotated, Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -80,6 +80,23 @@ class RunParams(BaseModel):
     ] = None
     """Hard override on playback fps. 0/None = derive from env.step_dt."""
 
+    render_width: Optional[
+        Annotated[int, Field(ge=64, le=3840)]
+    ] = None
+    """Rollout video width in px. None = runner default (1280).
+    Render cost is resolution-independent on this stack."""
+
+    render_height: Optional[
+        Annotated[int, Field(ge=64, le=2160)]
+    ] = None
+    """Rollout video height in px. None = runner default (720)."""
+
+    render_env_index: Optional[
+        Annotated[int, Field(ge=0, le=63)]
+    ] = None
+    """Precommitted parallel evaluation lane shown in the rollout video.
+    Batch metrics still cover every lane. None = lane 0."""
+
     rollout_episodes: Optional[
         Annotated[int, Field(ge=1, le=32)]
     ] = None
@@ -118,6 +135,13 @@ class RunParams(BaseModel):
     fitness_mode: Literal["observe", "steer"] = "steer"
     """How the fitness signal is used. observe = passive display only."""
 
+    # §best-of-N: when fitness_metric == "generate-at-launch", how many candidate
+    # metrics to sample at launch and select the most-discriminating valid one from
+    # (1 → single-shot-with-retry). Bounded so a typo can't fan out unbounded LLM
+    # calls; ignored for any other fitness_metric value.
+    metric_n_candidates: Annotated[int, Field(ge=1, le=8)] = 1
+    """Best-of-N candidates for a generate-at-launch metric. 1 = single-shot."""
+
     # §Ship 48: patience for the FITNESS-plateau early-stop — the live early
     # stop on a steered run (stop after this many iters with no NEW BEST
     # fitness). This is the knob that actually governs truncation; the
@@ -136,6 +160,34 @@ class RunParams(BaseModel):
     # launches non-interactive (no pause → no hang).
     start_mode: Literal["manual", "auto"] = "auto"
     """Interactive start mode. manual = pause-for-feedback each iteration."""
+
+    resume_exact_tuple: bool = False
+    """Before resuming, restore reward/env inputs from the authoritative
+    promoted atomic selection.  This is an explicit recovery control for
+    rejecting unpromoted diagnosis drafts; normal iterative resumes keep using
+    the newly generated drafts."""
+
+    warm_start_iteration: Optional[
+        Annotated[int, Field(ge=0, le=999_999)]
+    ] = None
+    """Explicit policy recovery source.  The backend resolves this only as
+    this project's ``runs/iter_N/checkpoint.pt`` or ``checkpoint.zip`` and
+    passes it to ``sculpt run --init-policy``.  It never changes the selected
+    reward, environment, or objective-metric mode."""
+
+    reference_clip_id: Optional[
+        Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,95}$")]
+    ] = None
+    """Optional pre-existing motion used as an immutable tracking prior.
+    The normal behavior prompt is authored as a bounded task residual around
+    that prior; route/object RSI remains an independent world curriculum."""
+
+    reference_robot: Optional[
+        Annotated[str, Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")]
+    ] = None
+    """Reference-library embodiment namespace for ``reference_clip_id``.
+    Required when a clip is selected so identically named clips can never be
+    resolved from the wrong robot library."""
 
 
 class RunControl(BaseModel):
@@ -211,6 +263,16 @@ class IterEventSummary(BaseModel):
     # runs. Populated from iter_fitness / best_reward_selected events.
     fitness: Optional[float] = None
     best_fitness: Optional[float] = None
+    # §Convergence loop 1: dense sub-success progress (the metric's
+    # progress_score — ranks iterations below the completion gate). None
+    # when the metric doesn't emit it.
+    progress: Optional[float] = None
+    # §env generalization: diagnoser env-curriculum change applied at
+    # this iter's boundary (env_spec_updated event): {"new_version":
+    # "v2" | None, "applied": ["entropy_coef_scale=1.5", ...],
+    # "rejected": [{"parameter": ..., "reason": ...}]}. Takes effect the
+    # NEXT iteration's training. None until an iter proposes env edits.
+    env_spec_update: Optional[dict] = None
 
 
 class ErrorClassification(BaseModel):
@@ -268,6 +330,19 @@ class RunDetail(RunSummary):
     iterations: list[IterEventSummary]
     stdout_tail: list[str]                # last 200 in-memory lines
     total_event_count: int                # events list size
+
+
+class PolicySummary(BaseModel):
+    """One exportable trained iteration (GET /projects/{slug}/policies).
+    Mirrors sculptor.export.list_exportable_iters — disk-backed, so the
+    list survives backend restarts."""
+
+    iter_index: int
+    checkpoint: str                       # "checkpoint.pt" | "checkpoint.zip"
+    checkpoint_bytes: int
+    primary_metric: Optional[float] = None
+    fitness: Optional[float] = None
+    reward_version: Optional[str] = None
 
 
 class RunWSMessage(BaseModel):

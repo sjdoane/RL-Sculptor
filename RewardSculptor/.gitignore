@@ -3,6 +3,9 @@
 .env.*
 !.env.example
 
+# Adversarial-review scratch (repro harness + agent debris + workflow scripts — never committed)
+scratch_*
+
 # uv / Python
 .venv/
 __pycache__/
@@ -17,8 +20,17 @@ build/
 
 # Sculptor local data
 kg/graph.db
+kg/graph.db.merged
 kg/pdfs/
 runs/
+
+# Local evidence / ingestion / metric-rebuild transcripts. These are
+# reproducibility scratch outputs, not source inputs; leaving them unignored
+# makes run_context.json report a dirty code tree even at a clean commit.
+.fleaven*
+.ingest*
+.metric*
+.pytest*
 
 # OS / editor
 .DS_Store

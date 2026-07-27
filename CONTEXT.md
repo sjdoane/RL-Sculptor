@@ -339,6 +339,772 @@ Append an entry **every time you make a meaningful change**. Format:
 
 Start the next entry below this line.
 
+### 2026-07-01 — convergence loops 1–3 (2 commits on ship-20-ux-revamp): dense progress channel + tie-deadlock fix + dead-reward pre-screen; tuck-jump E2E re-run launched
+
+- **What**: `RewardSculptor/sculptor/sculpt.py` (IterOutcome.progress/steer_progress, SculptRunResult.progress_history/best_progress, phase-3b `progress_score` extraction, naturalness-gated steer progress, LEXICOGRAPHIC best selection `(steer_spec, steer_progress)`, revert only on STRICT tuple regression — ties build forward), `sculptor/prompts/gen_objective_metric.md` (rule 10: metrics must ALSO emit a dense `progress_score` = min of noise-floor-ramped variants of the same channels, no completion gate, never feeds spec_score), `sculptor/prompts/review_objective_metric.md` + `metric_gen.py` consistency lens (progress_score allowlisted with its own reject conditions), `sculptor/edit.py` (`_probe_reward_variance` dead-reward pre-screen in `_post_validate`), tests (+9 across test_fitness_in_loop.py / test_edit.py). New living doc: `docs/internal/RL_SCULPTOR_AUDIT.md` (post-mortem, gap analysis, plan, per-loop change log — read this for the full convergence story).
+- **Why**: tuck-jump post-mortem — all-or-nothing metric read 0.0 every iter, a 0.0 TIE counted as "no new best", §Ship-36 revert fired every iter, so the corrective edits (v2–v5) were generated but NEVER trained; the loop retrained the constant-alive-bonus v0 forever while mean_return looked healthy. Fix per Eureka/DrEureka/Text2Reward practice: dense partial credit for RANKING only, sharp gate for success, ties explore forward, constants rejected before GPU.
+- **Firewall**: `metric_calibration.py` / `metric_validate.py` UNTOUCHED; spec_score composition (gate × min) unchanged.
+- **Verified**: sculptor suite 978 passed / 1 skipped. tuck-jump gen_002 metric (hand-authored, spec byte-identical + progress_score) passes ALL validate gates; on the 5 archived rollouts: spec parity exact, standing progress ≈1e-4, iter_1 supine-hack progress = exactly 0.0. E2E re-run launched 13:33 (iters 5–8 from v5, steer mode, patience 4; log `tuck-jump/runs/sculpt_loop2_1333.log`).
+- **E2E RESULT (same day)**: loop pathologies gone — every edit trained before judgment, strict revert recovered from 2 bad edits (v6/v8 instant-falls), keep-best selected v5, no v0 regression. Behavior moved decisively: dip-hop apex +5.9 cm, knee tuck 0.72 rad, drift 0.29 m (was 4.2 m). Ground-truth `spec_g1_jump` on the kept-best rollout = **0.258 vs old-run best 0.02** (13×; caveat: apex half-range partially credits the stand→kneel drop). Generated gen_002 metric correctly still 0 (behavior lacks return-to-stance). Remaining gap = edit quality on hard skills + env misalignment; full table + verdict in `docs/internal/RL_SCULPTOR_AUDIT.md` §5. Cartpole proxy = negative result (balance env never early-terminates → episode-length spec always 1.0; documented).
+
+### 2026-06-24 — round 43+44 (1 commit on ship-20-ux-revamp): the min-composition law HELD (0 false-grants); made the goal-joint-sensitivity CEILING-AWARE to fix an over-tightening false-reject
+
+- **Round 43 (stress-test the round-42 min-composition law)** — the 5-lens Workflow found **0 false-GRANTS** (the min-composition law held against every grant-side evasion attempt — no non-additive farm, no frame-0-constant evasion, no unprobed-channel grant) and **1 false-REJECT** (3 refuted, all lens-C/working-as-intended). The confirmed defect: the round-42 FIXED `_PERTURB_GOAL_DROP_MIN`=0.8 drop bar OVER-rejects an honest squat metric `up·(0.7·legROM + 0.3·pelvis-descent)` — an ADDITIVE combination of the goal joints (70%) with an ON-GOAL root-z descent (30%, which `_derive_goal_channels` itself places in on_root for fold/squat). Stilling the legs leaves the 0.30 on-goal descent (goal_drop 0.55 < 0.8·comp → flagged), but that 0.30 residual is BELOW the gaming ceiling (gneut 0.26 < 0.49) — nothing actually games it. The 0.8 bar double-counted the on-goal root channel.
+- **Round 44 (fix)** in `metric_calibration.py`:
+  - **(CEILING-AWARE goal-joint sensitivity)** replaced the fixed drop bar with: gameable iff the goal-joint-STILLED score `gneut` ≥ the gaming ceiling `min(_ADV_REL_CEIL·comp, _ADV_ABS_CEIL)`. Semantics: "doing the on-goal root but NOT the goal joints must not look COMPETENT." This fixes the false-reject (honest squat gneut 0.26 < ceiling 0.5 → GRANTS) AND is STRICTER than the old fixed bar where it matters — it catches the round-41 0.4 knife-edge split (`0.4·goal+0.6·root`: gneut 0.56 ≥ ceiling 0.5 → flagged, where the fixed-0.4 drop bar passed it at 0.42). Token-split root farms (α≤0.4, gneut ≥ ceiling) flagged; ZBOB/DIP (0% goal, gneut=comp) flagged; honest products (gneut→0) and honest additive-with-sub-ceiling-residual pass. The `_PERTURB_GOAL_DROP_MIN` constant is retired. **Marginal residual:** the exact α≈0.5 boundary (a pelvis-bobber scoring at exactly the abs ceiling 0.5) is the firewall's inherent ceiling knife-edge — documented, not chased.
+- **Verified** — sculptor **969 passed / 1 skip** (+1 round-44 test; round-41 test updated to the 0.4 knife-edge), UI backend **362 passed**. uvicorn restarted (HTTP 200).
+- **STATUS** — round 43 is a STRONG CONVERGENCE SIGNAL: a full adversarial round found ZERO false-grants against the min-composition law (the realistic false-grant surface is closed across joints, root DOF, on-goal-channel decomposition, additive token-splitting, AND the AST surface had another clean round); the only finding was an over-tightening false-reject, now fixed ceiling-aware (so the law is now both sound AND not over-rejecting honest additive metrics). Fix A is a robust, principled close of the goal-scoping/reward-hacking class. Remaining residuals (α≈0.5 ceiling boundary; oscillate-amplitude character; razor-sharp off-grid matched filter; two-sided 'arch' keyword; velocity-floor ratio) are documented LOW-threat / structural / ladder-quality limits. Remaining durable item: fix B (subprocess sandbox, designed). 3-zero bar not met but the false-GRANT surface is effectively converged. Real-LLM ~95% recheck pending network+API.
+
+### 2026-06-24 — round 40+41 (1 commit on ship-20-ux-revamp): re-attacked the round-39 goal-joint-sensitivity check (3 confirmed) — raised the sensitivity threshold to close the token-split root farms; documented the oscillate-amplitude residual
+
+- **Round 40 (attack the round-39 goal-joint-sensitivity check)** — the 5-lens Workflow found **3 CONFIRMED** (2 refuted, both lens-C working-as-intended: 15/15 honest grant; a ROM-on-burst-ladder deny is correct mode-gating). All 3 share the on-goal root-z hole:
+  - **(token-split root farm on a hop goal, HIGH)** `0.25·leg_ROM + 0.75·pelvis-bob` on an oscillate-leg hop ladder: hop_in_place_upright is dropped (ladder hops), root-z is on-goal (never perturbed), the slow-down is velocity-gated off (oscillate, peak_radps=0), and the round-39 sensitivity check is defeated by the 25% leg token (goal_drop 0.26 > the old 0.15 bar). A pure pelvis-bobber (legs still) scores 0.67 ≥ ceiling; honest hop scores it 0.
+  - **(incidental-hop root-z farm on a wave goal, HIGH)** `0.80·root-z + 0.20·arm` on an arm-wave ladder carrying an incidental hop: the incidental hop marks root-z on-goal (the z-axis analogue of round-36 defect 2 — fixed for travel x/y, not hop/dip), so the dominant root-z farm is never perturbed; the 20% arm token clears the 0.15 sensitivity bar. A still-armed pelvis-bobber scores 0.76; honest wave scores it 0.19.
+  - **(oscillate ROM-only wave metric, MEDIUM)** a goal-scoped ROM-only metric on a FAITHFULLY-rendered oscillate wave ladder: the slow-down (on_goal_char) is gated on burst velocity-mode, so a single slow full-ROM sweep scores at the competent ceiling (an honest oscillation-counting metric scores it 0).
+- **Round 41 (harden)** in `metric_calibration.py`:
+  - **(token-split farms — FIXED, the MIN-COMPOSITION LAW)** raised `_PERTURB_GOAL_DROP_MIN` 0.15 → **0.8** (round-41 first set 0.4, but §round-42 verified 0.4 is a KNIFE-EDGE — a `0.4·goal+0.6·root` split lands at ratio 0.42 > 0.4 while the 0.6 root term still beats the ceiling; any fixed T<0.5 falls to an α=T split). 0.8 enforces the min-composition law: a granted metric must be SUBSTANTIALLY GATED on its goal joints — `completion_gate·min/product(channels)` collapses to ~0 when ANY channel (incl the goal joints) is zeroed (drop ~1.0), whereas an ADDITIVE `α·goal+(1−α)·root` drops only ~α. A USEFUL root farm needs (1−α)≥~0.5 → α≤0.5 → drop≤0.5 < 0.8 → FLAGGED; honest product/min metrics drop ~1.0 → pass; the 20% tolerance allows a small honest additive bonus. Catches BOTH HIGH defects + the knife-edge splits (α≤0.75), independent of the root-z on_root derivation (closes the z-axis incidental-hop hole structurally without the brittle `not goal_joints` gate that fold breaks). Honest corpus (GOOD_KICK, honest hop/fold/wave, all GATED on their goal joints) unaffected (189 calibration tests green).
+  - **(oscillate ROM-only — DOCUMENTED, residual)** the oscillate-rendered amplitude-graded ladder is the same MISMATCHED-CHARACTER residual as the round-38 oscillate-kick: the ladder grades AMPLITUDE (peak_radps=0), so a ROM metric IS calibrated to it; extending the slow-down to oscillate goals would reject honest ROM gesture/wave metrics (the round-26/27 fixtures). The durable answer is a synthesizer oscillation-COUNT signal (so the ladder grades repetition, not just amplitude) — a ladder-quality increment, not a metric-firewall patch. LOW-MEDIUM threat.
+- **Verified** — sculptor **968 passed / 1 skip** (+1 round-41 test), UI backend **362 passed**. uvicorn restarted (HTTP 200).
+- **STATUS** — fix A's goal-joint-sensitivity now requires the metric to be GATED on its goal joints (≥40%), closing the token-split root farms. The loop is now finding increasingly CONTRIVED evasions of the latest hardening (round 40's confirmed defects each need a specific mismatched/incidental-channel ladder + a deliberately-split metric); the REALISTIC-threat false-grant surface (a system-generated goal-scoped metric) is closed across joints, root DOF, on-goal-channel decomposition, and additive token-splitting. Remaining residuals (oscillate-amplitude character; razor-sharp off-grid matched filter; two-sided 'arch' keyword; velocity-floor ratio) are documented LOW-threat / ladder-quality / structural limits. Remaining durable item: fix B (subprocess sandbox, designed). 3-zero bar not met. Real-LLM ~95% recheck pending network+API.
+
+### 2026-06-24 — round 38+39 (1 commit on ship-20-ux-revamp): re-attacked the round-37 fix-A hardenings (3 confirmed), added the GOAL-JOINT SENSITIVITY check (closes 2), documented the oscillate-ladder residual
+
+- **Round 38 (attack the round-37 hardenings)** — the 5-lens Workflow found **3 CONFIRMED** (0 refuted), all escapes of fix A's ladder-derived signals:
+  - **(oscillate-mode kick, HIGH)** `_ladder_is_velocity_mode` keys on burst `peak_radps>0`; a kick goal MIS-RENDERED as a high-frequency amplitude-graded `oscillate` ladder (peak_radps=0, but renders 60 rad/s) is classified ROM-mode → the round-37 slow-down check is skipped → a ROM-only goal-scoped metric grants (a slow large-ROM sweep games it).
+  - **(incidental hop/dip, MEDIUM)** the z-axis analogue of round-36 defect 2: `_derive_goal_channels` marked `zup/zdn` on-goal whenever `_ladder_hops`/crouch with NO `not goal_joints` gate, so an incidental hop in a JOINT-competence (arm-wave) ladder exempted a pelvis-bob farm (reads root-z, never the arms) from BOTH the perturb and neutralize arms.
+  - **(dip-only fold, HIGH)** for a NON-velocity ROM goal, scope's off-goal arms can't fire on the ON-goal dip channel and the slow-down is velocity-gated, so a fold metric reading ONLY pelvis dip (never the leg-flexion goal joints it declares) grants — a straight-down stiff-legged dip games it.
+- **Round 39 (harden)** in `metric_calibration.py`:
+  - **(defects 2+3 — FIXED via GOAL-JOINT SENSITIVITY)** new `_neutralize_goal_joints` + the `goal_drop = comp − goalneut` term: a granted metric must substantially READ its declared goal joints (lose ≥`_PERTURB_GOAL_DROP_MIN`=15% of competence when they are STILLED); if not (`goal_joint_insensitive`), it reads a root/posture channel instead of the goal → gameable. Catches BOTH the pelvis-bob farm (goal_drop 0 on a hopping wave ladder) AND the dip-only fold metric (goal_drop 0) — independent of the on_root derivation, so it closes the z-axis incidental-hop hole structurally. Honest goal-scoped metrics (GOOD_KICK 0.675, fold/wave) drop to ~0 → grant; a pure-posture goal (no goal joints) is SKIPPED. Plus a fix: a `mode="hold"` group (a SETTLED static posture offset — round-21's settled-limb case, amplitude=peak=0) no longer defines goal joints (else an honest lie-rest metric reading height+stillness, not the held limb, was false-rejected by the new check).
+  - **(defect 1 — DOCUMENTED, residual)** an oscillate-rendered kick is a MISMATCHED-LADDER residual: the ladder grades AMPLITUDE (not speed), so a ROM metric IS calibrated to it; rendered peak velocity cannot separate it from an honest amplitude wave (also fast), so velocity-mode stays keyed on burst `peak_radps`. LOW threat (the blind author would render a kick as burst); the durable answer is ladder-quality (render a speed goal with a speed-graded ladder), not a metric-firewall patch.
+- **Verified** — sculptor **967 passed / 1 skip** (+1 round-39 test), UI backend **362 passed**. uvicorn restarted (HTTP 200).
+- **STATUS** — fix A now scopes by channel IDENTITY (off-goal perturb add+remove) AND goal-joint SENSITIVITY (must read its goal joints) AND, for burst goals, motion CHARACTER (slow-down). Round 38's 3 attacks → 2 closed structurally, 1 documented LOW-threat residual. Remaining residuals (oscillate-rendered-kick; razor-sharp off-grid matched filter; two-sided 'arch' keyword; velocity-floor ratio) are all documented LOW-threat / mismatched-ladder / structural limits. The off-goal-channel + goal-decomposition false-grant CLASS is now closed across joints AND root DOF AND on-goal-channel decomposition. Remaining durable item: fix B (subprocess sandbox, designed). 3-zero bar not met. Real-LLM ~95% recheck pending network+API.
+
+### 2026-06-24 — round 36+37 (1 commit on ship-20-ux-revamp): adversarially ATTACKED fix A (3 confirmed), then HARDENED it — incidental-travel bypass + reason bug FIXED, narrow-band partially closed, on-goal-character documented
+
+- **Round 36 (attack fix A)** — the 5-lens Workflow found **3 CONFIRMED** (3 correctly refuted by skeptics: a working-as-intended bilateral-kick "false-reject"; lens C 13/13 honest accept; a namespace-confined `encodings.*` codec AST route = not weaponizable). All 3 attack fix A's one fixed-shape perturbation:
+  - **(narrow-band frequency, HIGH)** a period-40 matched filter on an OFF-goal joint is orthogonal to fix A's fixed period-18 sinusoid → invariant → grants, yet farms a period-40 off-goal policy.
+  - **(incidental-travel, MEDIUM)** when the blind ladder incidentally commands `forward_speed≥0.3` (a co-varying forward step in a kick ladder), `on_root={x,y}` so scope SKIPPED the travel perturbation → a pure-travel confound escaped.
+  - **(on-goal-channel ROM, HIGH)** a slow large-ROM goal-joint sweep grants — fix A perturbs only OFF-goal channels, so a degenerate reading of the ON-goal channel (ROM without the kick's velocity/phase/direction) is a blind spot.
+- **Round 37 (harden fix A)** in `metric_calibration.py`:
+  - **(incidental-travel — FIXED)** travel (x/y) is on-goal ONLY for a GENUINE single-axis locomotion ladder (NO joint competence — `_ladder_travels and not goal_joints`); an incidental forward step in a joint-competence ladder no longer marks travel on-goal (hop/dip stay ladder-derived — a fold ladder genuinely has joint groups AND an on-goal dip). PLUS a new REMOVE direction: `_neutralize_off_goal` + the `drop = comp − neut` term — if the score DROPS when the off-goal motion the competent reference exercises is removed, the metric RELIES on an off-goal channel → gameable (catches the case where ADDING off-goal saturates because the competent reference already travels). The travel confound is DENIED (drop 0.97); GOOD_KICK/walk/fold/balance/wave stay granted (drop 0.0). The verdict is now `gameable iff max(rise, drop) ≥ margin`.
+  - **(narrow-band — PARTIAL)** the off-goal-joint drive is now MULTI-BAND (a sum of periods 7/11/18/29/43) so a reader keyed to a single common band is excited; a RAZOR-SHARP matched filter at an OFF-GRID period on an off-goal joint remains a documented LOW-threat residual (the metric source is SYSTEM-generated — it does not contain pathological narrow-band matched filters; chasing every frequency is unbounded; the durable spirit is goal-channel min-composition).
+  - **(reason bug — FIXED)** the scope deny reason was lost (`adv.setdefault("reason", …)` was a no-op because the gate pre-seeds `reason=None`) → now assigned directly.
+  - **(on-goal-character — FIXED)** fix A also scopes the goal's required motion CHARACTER, not just channel IDENTITY. For a VELOCITY-characterized goal (the blind ladder grades by burst `peak_radps` — `_ladder_is_velocity_mode`), `_slow_goal_joints` replaces the GOAL joints' trajectories with a SLOW ramp through their [min,max] (same ROM, ~zero velocity); a metric that RETAINS ≥0.6 of competence under that slow-down reads only the goal channel's RANGE, not its required SPEED → a slow large-ROM leg sweep games it → gameable (`on_goal_char`). GOOD_KICK retains ~0.26 (velocity-sensitive → grants); a pure-ROM confound retains ~1.0 (flagged). Applied ONLY for burst goals (a fold/ROM goal's slow motion is on-goal, `peak_radps=0` → not subjected — no false-reject of honest fold/wave metrics).
+  - **(fix-A tightening, deliberate)** fix A now (correctly) flags WHOLE-BODY `max(|jv|)`/`max(ptp)` peak/ROM metrics as reward-hackable (an off-goal-joint flail games them — the documented off-goal-channel gap fix A exists to close). TWO round-26/27 honest-fixture tests (which predated fix A and used whole-body stats) were updated to the realistic GOAL-SCOPED form (read the wave's arm joints via roles). The firewall now REQUIRES goal-scoped metrics; the generator prompt already teaches goal-joint scoping, so real generations should comply (real-LLM accept-rate recheck still pending network+API).
+- **Verified** — sculptor **966 passed / 1 skip** (+2 round-37 tests incl. the defect-3 on-goal-character catch; 2 round-26/27 tests updated to goal-scoped), UI backend **362 passed**. uvicorn restarted (HTTP 200).
+- **STATUS** — fix A survives adversarial attack with THREE hardenings: the remove-direction (incidental-travel), multi-band (common-band frequency), and the goal-joint slow-down (on-goal motion-character) — closing all 3 round-36 confirmed attacks except the razor-sharp off-grid matched-filter residual (LOW threat, documented). Remaining residuals (razor-sharp off-grid matched filter on an off-goal joint; the two-sided 'arch' keyword; velocity-floor ratio) are documented LOW-threat / structural limits. The AST surface had another CLEAN round (the only AST candidate was namespace-confined). Remaining durable item: fix B (subprocess sandbox, designed). 3-zero bar not met, but the off-goal-channel false-grant CLASS that drove rounds 32-34 is now structurally closed + hardened. Real-LLM ~95% recheck pending network+API.
+
+### 2026-06-23 — FIX A LANDED (round 35, 1 commit on ship-20-ux-revamp): goal-channel SCOPING via off-goal-perturbation invariance — the DURABLE structural close of the additive-SUM / multiplicative off-goal-channel CLASS (rounds 32-34 whack-a-mole)
+
+- **What** — after rounds 32-34 proved per-channel/per-keyword patching cannot converge (16 defects, with my own patches spawning ≥4 regressions; the live false-grants were all the off-goal-channel + goal-scoping class), designed + EMPIRICALLY validated + LANDED fix A. A 3-variant design Workflow (perturb-joints-and-root / joints-only / required-loser-form) each PROTOTYPED + validated in the harness; the winning variant (full perturb-joints-and-root, RELATIVE invariance) catches 4/4 known farms (min rise +0.536) with 9/9 honest-corpus PASS (max rise +0.000). (The synthesis agent hit the monthly spend cap — now reset — so I did the synthesis + integration + validation by hand.)
+  - **THE CHECK (`off_goal_perturbation_verdict` + `_derive_goal_channels` + `_perturb_off_goal` in `metric_calibration.py`, wired into `calibrate_task_derived` as the `adversarial.scope` verdict).** A genuinely goal-scoped metric's score must NOT RISE when the OFF-goal channels are perturbed on a COMPETENT reference (the top rung of a valid blind ladder). Off-goal = every joint NOT in the ladder groups' role_query (resolved via the same `select_joints` the synthesizer uses — anti-collusion-safe) + every root DOF the ladder does not command (travel x/y via `_ladder_travels`, hop z-up via `_ladder_hops`, dip z-down via `_ladder_has_crouched_rung`/`fold_depth`). It perturbs off-goal joints (large oscillation) + off-goal root DOF, leaving goal joints + `projected_gravity_b` (uprightness — the one NEVER-perturbed on-goal posture channel) + on-goal root unchanged, and re-scores. Gameable iff the rise ≥ `_PERTURB_MARGIN` (0.25) OR ≥ 50% of the remaining headroom (1−comp) above a 0.03 floor (catches a ceiling-SATURATED gate). NEVER raises, NEVER denies on absence of evidence.
+  - **WHY IT IS THE DURABLE FIX.** It closes ALL uncovered channels AT ONCE — joints AND root DOF, ADDITIVE AND MULTIPLICATIVE (it catches the round-34 whole-body-ROM `up·(1−exp(−mean_ROM))` `gate·ROM` confound that the min-composition law ALONE misses, AND the round-34 pelvis-DIP, AND travel/hop). It also makes the existing posture/terminal-down/idle carve-outs SAFE (a collapse/idle/flail confound reads off-goal channels → caught regardless of the keyword classifier). The per-channel probes (walk_away/hop_in_place/near_still/do_nothing/jitter/collapse) are KEPT as defense-in-depth (not removed — that is a separate cleanup with its own risk).
+  - **VALIDATION (empirical, live grant path).** Farms now DENIED via `scope`: whole-body-ROM (comp 0.46→pert 1.00), pelvis-DIP (0.24→0.90), horizontal-travel (0.27→0.97), vertical-hop (0.27→0.95), + a saturated `up·sqrt(ROM)` gate and shoulder-only / hip-roll off-goal farms. Honest corpus GRANTS (invariant, rise +0.000): knee-scoped GOOD_KICK, arm-scoped wave, leg-scoped fold (on-goal pelvis dip preserved), honest hop (on-goal root-z), honest forward-walk + sidestep (on-goal root-x/y), pure-posture balance (reads only the unperturbed uprightness), lie-rest, small gesture. A metric reading WHOLE-BODY `max(ptp)` ROM is (correctly) flagged — it is gameable by an off-goal-joint flail; goal-scoped metrics (reading their goal joints specifically) pass. ONE existing test updated: `GAMEABLE_KICK` (both knees + no stationarity, on a LEFT-kick ladder → rewards the off-goal right leg) is now caught OFFLINE by `scope` even without the opt-in adversarial flag — fix A closes that documented opt-in gap.
+- **Verified** — sculptor **964 passed / 1 skip** (+2 fix-A tests: catches whole-body-ROM + pelvis-DIP; goal-scoped kick/wave/hop GRANT), UI backend **362 passed**. uvicorn restarted (HTTP 200).
+- **STATUS — THE CONVERGENCE FIX IS IN.** Fix A structurally closes the additive-SUM/multiplicative off-goal-channel class that drove rounds 32-34 (no more per-channel whack-a-mole). It does NOT replace the per-channel probes (kept as defense-in-depth) and does NOT resolve the two-sided KEYWORD residuals ('arch'/terminal-down, the velocity-floor ratio) — those remain documented structural limits, but fix A makes the terminal-down carve-out far less load-bearing (a collapse confound on a mismatched ladder is now ALSO caught by scope if it reads off-goal channels). Remaining durable item: fix B (the subprocess sandbox) for the AST surface (DESIGNED; 1 down-payment landed). Next rounds should re-attack fix A itself (can a confound be made invariant to the SPECIFIC perturbation yet still farm a real off-goal policy? — the perturbation is one fixed shape, so a metric keyed to a DIFFERENT off-goal direction/amplitude is the obvious next probe; consider randomizing/strengthening the perturbation). Real-LLM ~95% recheck pending network+API.
+
+### 2026-06-23 — autonomous hardening round 34 (1 commit on ship-20-ux-revamp): 5 CONFIRMED defects — but the loop has DECISIVELY hit the predicted fix-A wall (per-channel/per-keyword patching now generates its OWN regressions). Fixed the 1 surface-REDUCING item; the other 4 are the fix-A structural class.
+
+- **What** — the 5-lens Workflow found **5 CONFIRMED defects, 5/5 skeptic-upheld**. THREE of the five are direct REGRESSIONS of my own round-32/33 patches, and TWO are fresh uncovered off-goal channels — the clearest possible signal that incremental patching cannot converge:
+  - **(FIXED — locomotion-token POLYSEMY false-grant, a round-33 regression) `metric_calibration.py`.** Round-33's `ladder_travels = _ladder_travels(...) or _goal_is_locomotion(...)` let a polysemous locomotion verb in a STATIONARY goal ("slide a puck across the table", "shuffle the deck", "pace your breathing") DROP `walk_away_upright` on a non-traveling ladder → re-opened the round-32 horizontal-travel farm. **Fix:** the LIVE path now TRUSTS THE LADDER ALONE (`ladder_travels = _ladder_travels(valid_ladders)`, same for `ladder_hops`); the keyword stays only as the no-ladder fallback inside `general_required_losers`. This REDUCES the keyword surface (the right direction) and the round-33 sidestep grant still holds (a genuine sidestep ladder DOES travel). +1 regression test. **This was the only clean, surface-reducing fix of the round.**
+  - **(DEFERRED to fix A — pelvis-DIP channel, HIGH false-grant) the vertical-DOWN sibling of round-33's hop.** An additive `up·(0.35·burst + 0.65·dip_credit)` keyed on an UPRIGHT pelvis dip below nominal farms a squat-and-stay-low policy (0.62 ≥ ceiling 0.14; GOOD_KICK scores it 0.0). No loser probes an upright dip (collapse_and_stay_down dips but is non-upright → the metric's `up` gate zeroes it). The 4th root channel after travel(x,y)/hop(z-up).
+  - **(DEFERRED to fix A — WHOLE-BODY-ROM, HIGH false-grant, MULTIPLICATIVE) the decisive one.** `up·(1−exp(−mean_whole_body_ROM/0.4))` — a `gate·channel` (NOT an additive SUM) that farms an upright in-place arm-FLAIL performing none of the kick (scored 0.92; GOOD_KICK scores it 0.0). This **defeats the "min-composition law" framing alone** (it IS a min/product) — it is closed only by GOAL-JOINT SCOPING (the metric reads whole-body joints instead of the goal's knees). Distinct from the documented off-goal-channel exclusion only in that the honest knee-scoped reference scores it 0; structurally it IS that gap.
+  - **(DEFERRED — band-raise floor evasion, HIGH false-grant, a round-33 regression) the single-point-probe limit on the floor.** A metric that RAISES on the whole band `mean|jv| < 0.05` covers BOTH do_nothing (0.0) AND round-33's near_still (0.029) at once → skips both floors → farms a real near-idle policy at `mean|jv|≈0.235` (in the open (0.05, 0.4) window). The round-33 "a covering band self-defeats at runtime" claim is EMPIRICALLY FALSE (the probes sit at ≤0.029 but the farmable policies are at 0.235). Two discrete floor points cannot cover a continuum — the floor's single-point-probe structural limit (same class as the velocity-floor ratio).
+  - **(DEFERRED — 'arch' false-REJECT, MEDIUM, a round-33 regression — the INVERSE of round-33's 'arch' fix) the two-sided keyword leak again.** "arch your back then lie down to rest" is a genuine terminal-down goal containing 'arch' (added round-33 as a return-up verb) → `_goal_is_terminal_down`=False → the round-27 backstop SUBTRACTS the authoritative `ladder_td=True` → keeps collapse_and_stay_down → an honest lie-rest metric (reading end-state low height) is HARD-denied (scores the on-goal collapse 1.0). Exactly the round-32 B+D pattern: a keyword fix in one direction opens a regression in the other. The root issue (skeptic): unlike travel (fixed this round to trust the ladder), `ladder_td` still lets the keyword SUBTRACT a correct ladder signal — but trusting it re-opens the round-28/29/30 mismatched-ladder defenses. Only fix A (goal-joint scoping makes the collapse carve-out safe) resolves it.
+- **Verified** — sculptor **962 passed / 1 skip** (+1 round-34 regression test), UI backend **362 passed**. Defect-3 fix reproduced→fixed→tested; sidestep/hop/GOOD_KICK controls all still grant. uvicorn restarted (HTTP 200).
+- **STATUS — THE WALL IS REACHED; PIVOT TO FIX A.** Across rounds 32→33→34: **16 confirmed defects, of which the last rounds' fixes spawned ≥4 of their own regressions** (round-32 'back'/travel-backstop → round-33 regressions; round-33 'arch'/locomotion-broadening/near_still → round-34 regressions). The remaining live false-grants are ALL the additive-SUM/uncovered-channel + goal-scoping class (travel→hop→dip→whole-body-ROM; the floor continuum) and the two-sided keyword class ('arch'/terminal-down). Per-channel probes and per-verb keywords provably cannot converge and are now net-harmful. **The durable convergence fix is fix A: goal-joint/channel SCOPING via an OFF-GOAL-PERTURBATION INVARIANCE check** — derive the goal joints/channels from the blind ladder (role_query + travels/hops/crouch signals), perturb a COMPETENT reference's OFF-goal channels (off-goal joints + the off-goal root DOF), and DENY if the metric's score does not drop (it rewards off-goal motion). This closes ALL uncovered channels at once (joints AND root DOF, additive AND multiplicative — it catches the whole-body-ROM `gate·ROM` that the min-composition law alone misses) and makes the terminal-down/posture carve-outs SAFE (a collapse/idle confound reads no goal joint → caught regardless of the keyword). It is HIGH blast radius (the grant verdict, must not false-reject the honest corpus) = a dedicated reviewed increment, to be designed+validated via a workflow (the fix-B precedent). The AST surface had a CLEAN round (lens E found ZERO escapes). 3-zero bar NOT met. Real-LLM ~95% recheck pending network+API.
+
+### 2026-06-23 — autonomous hardening round 33 (1 commit on ship-20-ux-revamp): 6 CONFIRMED defects — a 3rd uncovered additive-SUM channel (vertical hop), a regression-attack on the round-32 probe-raise refinement, a 4th numpy AST escape, + the round-32 noun-removal & travel-backstop both regressed
+
+- **What** — the 5-lens Workflow (1 find lens died on an API 500 = inconclusive, not clean) found **6 CONFIRMED defects, 6/6 skeptic-upheld**. The count ROSE again (5→6); the dominant theme is now unmistakable: the additive-SUM / uncovered-channel CLASS is **whack-a-mole** (round-32 closed horizontal travel → round-33 found VERTICAL hop + an orthogonal-feature floor-skip). Fixes in `metric_calibration.py` + `metric_validate.py`:
+  - **(A1/B — HIGH FALSE GRANT, the VERTICAL-hop channel, found by 2 lenses) `metric_calibration.py`.** `walk_away_upright` (round-32) renders only HORIZONTAL diagonal travel with root-z flat, so an additive `up·(0.6·goal + 0.4·hop)` keyed on root-z bounce amplitude evades it (the hop term is dormant on the flat-z ladder, ranks via the goal term, then farms a pure vertical bobber that performs none of the kick → scored 0.37 ≥ ceiling 0.24; honest GOOD_KICK scores it 0.0). **Fix:** a new `hop_in_place_upright` loser (upright + vertical hop + zero joint motion), kept for active-stationary non-balance NON-jump goals, dropped for a JUMP goal (vertical hop on-goal — derived from the blind ladder's commanded hops via the new `_ladder_hops`, keyword fallback `_goal_is_jump`).
+  - **(A2 — HIGH FALSE GRANT, regression-attack on the round-32 probe-raise refinement) `metric_calibration.py`.** A confound surgically RAISES on do_nothing's EXACT signature (`meanjv==0.0 AND up>=0.999`) to skip the per-loser FLOOR, while ROM-gating a flat posture credit BELOW jitter's ROM — so jitter/ref stay motion-monotone (ref>jitter) and the round-32 `do_nothing_farm` refinement (which reasons over the VELOCITY ladder) doesn't fire (the farm is gated on joint-POSITION ROM, orthogonal to the velocity probes). At runtime a near-still upright policy (meanjv 8e-4 ≠ 0) scores the 0.4 floor. **Fix:** a `near_still_upright` floored probe — a near-idle upright stance with a tiny tremor (meanjv > 0, ROM tiny) placed OFF do_nothing's exact zero-motion point. The exact-signature raise doesn't fire here (meanjv > 0) → the floor catches the farm; a band-keyed raise wide enough to cover near_still (meanjv 0.029) also covers — and so raises (→0) on — the even-lower-meanjv idle policies it would farm (self-defeating). Honest onset raises here too (counted 0.0 → floor passes); honest active metrics score it ~0 (kick 0.011, mean-vel 0.048 < floor 0.06 — tremor tuned to 0.001 for the margin).
+  - **(A3 — HIGH FALSE GRANT, a REGRESSION from my round-32 'back' removal) `metric_calibration.py`.** Removing the body-part noun `back` opened "collapse to the floor then ARCH your back off the ground" — a genuine rise-off-the-floor (bridge/backbend) that now carried NO listed rising token → terminal_down=True → collapse_and_stay_down dropped → a low-and-still confound granted on a mis-rendered descent ladder. **Fix:** add the rising VERB `arch` to `_RETURN_UP_TOKENS` (unambiguous — a terminal lie/rest goal does not "arch"; unlike the removed noun). Confirms B+D of round-32 are a two-sided keyword leak that keeps generating gaps.
+  - **(C — HIGH FALSE REJECT, a REGRESSION from my round-32 travel backstop) `metric_calibration.py`.** The round-32 goal-text backstop `if ladder_travels and not _goal_is_locomotion(goal): ladder_travels=False` SUBTRACTED the AUTHORITATIVE `_ladder_travels` signal whenever the goal-verb was off `_LOCOMOTION_TOKENS` (sidestep/strafe/shuffle/backpedal) → kept `walk_away_upright` → HARD-denied honest lateral-locomotion metrics (the probe travels diagonally, so a lateral metric reads its 1.0 m drift → 0.70 ≥ ceiling). The "keyword miss is observe-only" claim was again FALSE. **Fix:** trust the ladder — `ladder_travels = _ladder_travels(...) or _goal_is_locomotion(...)` (the keyword only ADDS recognition, never subtracts a True ladder signal) + broaden `_LOCOMOTION_TOKENS` with the lateral/varied-gait family.
+  - **(E — CRITICAL AST ESCAPE, a 4th class) `metric_validate.py`.** `np.info(<str>, toplevel=<name>)` → `numpy.lib._utils_impl._makenamedict` → `__import__(name)` RUNS the named module's top-level code (RCE), `_ast_safety()==[]` (the import target is a plain runtime str the AST can't see; no blocked NAME appears). **Fix:** add `info`/`test` (+ the historical numpy introspection helpers source/lookfor/who/deprecate/safe_eval) to `_FORBIDDEN_ATTRS`. 4th distinct AST escape class (gi_frame r28, func_globals r29, help r32, np.info r33) → the leaf-name denylist over numpy's public surface is unprovable; fix B (sandbox) is the only durable close.
+- **Verified** — sculptor **961 passed / 1 skip** (+6: 4 round-33 calibration tests + 2 AST escape vectors), UI backend **362 passed**. All fixes reproduced→fixed→regression-tested on the live grant path; round-30/31/32 gaming + round-32 honest-onset + honest small-gesture all preserved; honest hop/sidestep/strafe metrics GRANT (probes correctly dropped for jump/locomotion goals). uvicorn restarted (HTTP 200).
+- **STATUS — THE PROBE-WHACK-A-MOLE IS NOW DECISIVE.** Rounds 32→33 each found a fresh uncovered additive-SUM channel (travel → hop) plus a fresh way to skip a per-loser floor (probe-raise → orthogonal-ROM-gate); the channel list (posture/velocity/completion/travel/hop) and floor-probe set keep growing, and root-channel siblings remain (YAW/spin, base TILT). **Adding per-channel probes cannot converge** — this is exactly the additive-SUM CLASS whose DURABLE close is fix A: (a) the min-composition law (an honest metric is `completion_gate·min(channels)`; a `max(goal, floor)` or `α·goal + β·farm` SUM is gameable) + (b) goal-joint/channel SCOPING (a granted metric must be invariant to OFF-goal channel perturbations — derivable from the blind ladder's role_query + its travels/hops/posture signals). RECOMMENDATION: round 34 should pivot from per-channel probes to a structural fix-A increment (an empirical off-goal-perturbation invariance test on the competent reference closes ALL uncovered channels at once), NOT another find→probe round. The AST surface yielded a 4th escape → fix B still required. Two prior-round regressions (the 'back' removal, the travel backstop) show each keyword/probe patch carries its own regression tail. 3-zero-defect bar NOT met. Real-LLM ~95% recheck pending network+API.
+
+### 2026-06-23 — autonomous hardening round 32 (1 commit on ship-20-ux-revamp): 5 CONFIRMED defects fixed — a CRITICAL travel-channel false-grant, a CRITICAL AST escape, the round-31 probe-raise OVER-FIRE, + a return-up verb gap and a return-up NOUN over-fire
+
+- **What** — the 5-lens Workflow (find → reproduce with the venv + MOCK ladder client → INDEPENDENT skeptic re-reproduce → CONFIRMED-only) found **5 CONFIRMED defects, 5/5 upheld by the skeptics (zero refuted)** — the richest round of the arc. All fixed in `sculptor/eval/metric_calibration.py` + `metric_validate.py`:
+  - **(C — CRITICAL FALSE GRANT, the additive-SUM travel channel) `metric_calibration.py`.** An additive `up·(0.5·burst + 0.5·travel)` farms the wholly-UNCOVERED horizontal-travel channel — EVERY prior required-loser is stationary-upright (do_nothing/jitter/ref) or toppled-in-place (collapse), so all have 0 m base travel, as do all stationary ladder rungs → the `0.5·travel` term is DORMANT on the ranking (rho 0.9747, grants) yet farms a run-forward policy that performs NONE of the kick (scored 0.49 ≥ ceiling 0.20; honest GOOD_KICK scores it 0.0). **Fix:** a new `walk_away_upright` required-loser (upright + DIAGONAL forward+lateral travel + ZERO joint motion → catches a farm keyed on root x-range, y-range, OR xy-norm; a self-found lateral sibling that evaded a forward-only probe is now also caught). KEPT only for an ACTIVE, STATIONARY, NON-balance goal; DROPPED for a locomotion goal (travel on-goal — derived from the blind ladder's commanded `forward/lateral_speed_mps` via the new anti-collusion-safe `_ladder_travels`, with a `_goal_is_locomotion` keyword fallback + goal-text backstop), a balance goal (an uprightness-only balance metric scores an upright traveler high → would false-reject), and a lie goal. The DURABLE close of the additive-SUM CLASS is the min-composition law; this probe closes the specific (large) locomotion channel.
+  - **(E — CRITICAL AST ESCAPE, the `help()` import/exec front-end) `metric_validate.py`.** `help(<chr()-assembled module name>)` → `_sitebuiltins.Helper` → `pydoc` → `importlib.import_module(name)` RUNS the named module's top-level code (RCE), proven through the live `load_generated_module` (imported stdlib `wave`; wrote an arbitrary file via a planted module). `help` is a bare builtin Name with NO `gi_/cr_/ag_/f_/tb_/func_` prefix, no dunder, no `.format`, and the chr()-assembled name dodges the `__`-string scan → it slipped EVERY prior gate. **Fix:** add `help`/`copyright`/`license`/`credits` (the `_sitebuiltins` import/print family) + the reflection primitives `dir`/`hasattr` to `_FORBIDDEN_NAMES`. The AST surface's 2-consecutive-clean streak (r30-31) is BROKEN — this is the 3rd CRITICAL escape CLASS in 5 rounds (gi_frame r28, func_globals r29, help r32), re-confirming the denylist is EMPIRICALLY unprovable → fix B (subprocess sandbox) remains the durable close.
+  - **(A — HIGH FALSE REJECT, the round-31 probe-raise rule OVER-FIRES) `metric_calibration.py`.** An HONEST onset/phase KICK metric (`onset = argwhere(knee_vel > thresh)[0,0]`) legitimately RAISES on the ZERO-motion do_nothing probe (empty selection → IndexError) while SCORING the moving jitter/ref probes far below every threshold — the SAME surgical signature the round-31 "≥1 RAISED ∧ ≥1 SCORED" rule treated as gaming → DENIED (its guarded twin GRANTS; it ranks the ladder identically to GOOD_KICK). The round-31 premise ("a single-probe raise skips a verdict it would breach") is FALSE here — no scored value breaches anything. **Fix:** the three verdict probes form a MOTION LADDER (do_nothing 0 < jitter 1.18 < ref 2.94). Split by which raised: a **jitter/ref** raise is ALWAYS evasion (both are MOTION rollouts an honest metric scores; a pelvis-only honest metric that raises on them also raises on do_nothing → scored_vfp empty → round-15 case, excluded); a **do_nothing** raise is flagged ONLY with positive stillness-farm evidence (motion-ANTI-monotone: it scores the lower-motion jitter ≥ the higher-motion ref → would top the zero-motion do_nothing → breach the floor). The honest onset metric scores ref > jitter → NOT flagged. Verified the round-31 do_nothing-farm + jitter-gaming + round-30 ref-gaming STILL deny, round-15 honest-onset STILL passes; a self-built evade attempt (farm do_nothing yet push ref>jitter) is impossible (the stillness farm inherently makes jitter>ref) AND raises on the real do_nothing policy at runtime → can't reward it.
+  - **(B — HIGH FALSE GRANT, the sit-up return-up verb gap) `metric_calibration.py`.** A 4th returns-up family the jump/righting/lift-self-up families missed — "collapse to the floor then **sit upright**". `sit`/`upright` were absent from `_RETURN_UP_TOKENS` → `_goal_is_terminal_down`=True → the round-27 ladder_td backstop didn't fire → collapse_and_stay_down DROPPED → a collapse-only confound (performs NONE of the 'sit up' half) GRANTED on a mismatched down-ending ladder. **Fix:** add the unambiguous vertical cue `upright` (+ `situp`/`situps`) to `_RETURN_UP_TOKENS` (SAFE direction — only KEEPS the loser). Deliberately NOT bare `sit` — it is ambiguous ("sit DOWN and rest" is terminal) and would re-introduce the defect-D false-reject for the common seated-rest goals.
+  - **(D — MEDIUM FALSE REJECT, return-up NOUN over-fire — the INVERSE of B) `metric_calibration.py`.** The body-part NOUNS `back`/`feet`/`overhead` (added rounds 28-30 as return-to-standing cues) over-fire on GENUINELY-terminal supine goals — "lie on your **back** and rest", "lie down with arms **overhead** and rest" → `_goal_is_terminal_down`=False → the ladder_td backstop OVERRODE the correct down-ending LADDER → collapse_and_stay_down KEPT → an HONEST lie-rest metric that legitimately scores a collapsed policy ≥ the ceiling was firewall-DENIED (a HARD deny, DISPROVING the "broadening is observe-only at worst" claim). **Fix:** REMOVE the three pure body-part nouns (regression-safe — every "to your feet"/"get back up" return-up test goal also carries a rising VERB rebound/scramble/kip/pike/stand/up; the live path's ladder protects a genuine get-up goal). **Residual:** "lie with your **feet up** and rest" still trips on the irreducibly-ambiguous `up` token (in "feet up"), which MUST stay (the safe direction for "collapse then get up") — documented, not patched.
+- **Verified** — sculptor **955 passed / 1 skip** (+12: 6 round-32 calibration tests + 6 round-32 AST escape vectors), UI backend **362 passed**. Every defect reproduced→fixed→regression-tested on the live grant path; the round-30/31 gaming cases + round-15 honest-onset all preserved. uvicorn restarted (HTTP 200).
+- **STATUS** — defects B+D together prove `_RETURN_UP_TOKENS` is two-sidedly leaky (a missed VERB false-grants; an ambiguous NOUN false-rejects), reaffirming the keyword classifier as a structurally-unbounded surface (only unambiguous rising verbs/posture words belong). The travel probe closes a large NEW false-grant channel but the additive-SUM CLASS (any uncovered channel) remains → the min-composition law (durable fix A) is the convergence path. The AST surface yielded a 3rd CRITICAL escape → fix B (sandbox) confirmed as the only provable AST close. Round 32 found 5 defects → the 3-consecutive-ZERO-defect bar is NOT met (and the count rose vs round 31's 2, driven by 2 NEW lens findings: the travel channel + the probe-raise over-fire). Real-LLM ~95% accept recheck still pending network+API.
+
+### 2026-06-23 — autonomous hardening round 31 (1 commit on ship-20-ux-revamp): jitter-probe fail-OPEN fixed; the velocity-floor RATIO confirmed structurally unbounded (4th bypass, documented not patched)
+
+- **What** — the 5-lens Workflow found **2 CONFIRMED** (lenses C broad-false-grant + D honest-false-reject CLEAN — 13/13 honest accept, the dual goal-text-AND-ladder-posture loser-drop gate holds; **lens E AST escape hunt found ZERO** after a novel-numpy-2.x sweep + 8-hop BFS — the AST surface is clean a 2nd consecutive round, rounds 30–31).
+  - **(A1 + the do_nothing-floor sibling — HIGH, FIXED via a UNIFIED rule) the probe-raise fail-OPEN CLASS.** A metric that SELECTIVELY RAISES on a verdict-feeding probe — keyed on its single-point signature so real rungs are unaffected — left that probe unscored → its verdict SILENTLY SKIPPED (fail-OPEN). THREE instances now: round-30 D1 = velocity_peak_ref, round-31 A1 = jitter_in_place (velocity-floor numerator), round-31 = do_nothing_upright (per-loser FLOOR — reproduced: an `up·stillness` farm that raises on do_nothing's up≈1+still signature evades floor_gamed). **Fix (UNIFIED, replacing the A1-specific guard):** the gate tracks RAISED vs SCORED among the three verdict probes {do_nothing_upright, jitter_in_place, velocity_peak_ref}; gameable iff ≥1 RAISED **and** ≥1 SCORED (a surgical raise on the one it would farm while scoring the others). This PRESERVES the round-15 honest-onset case (an onset metric that can't time a static rollout raises on ALL THREE → scores none → not flagged — verified test_round15 green). Residual: a 3-raise attacker evades the gate but then RAISES at runtime on the very idle policies it would farm (can only reward off-probe-point neighborhoods — the documented single-point-probe limit).
+  - **(B1 — HIGH, CONFIRMED STRUCTURAL LIMIT, documented NOT patched) the velocity-floor RATIO is decouplable.** A confound `up·(a·sigmoid_peak_gate(peak) + clip(mean|jv|,0,cap))` ranks via the peak gate (low ratio, like an honest peak metric) while a HARD-CAPPED (clipped-affine, NOT concave) mean term adds the SAME `cap` to both the low-peak jitter and the high-peak velocity_peak_ref probe (both saturate it), so the ratio is UNMOVED and stays <0.57 while the cap farms idle jitter (0.556 of competence). **It is NOT patchable:** the confound's jitter-absolute (0.28) AND ratio (0.41) are BOTH BELOW honest GOOD_KICK's (0.354, 0.531) — GOOD_KICK pays an idle knee-twitch MORE in absolute terms — so ANY velocity-floor threshold catching B1 also false-rejects the honest reference fixture. This is the velocity-floor surface's structural ceiling (4th distinct bypass after knife-edge / fail-open / channel-decouple): the ratio bounds the idle-farm residual to ~the honest-fixture level (~0.52 absolute), not zero — exactly like the keyword classifier + AST denylist. Documented in the `_VEL_FLOOR_RATIO` comment; the DURABLE close is the min-composition law (an additive/decoupled `gate + farm` SUM violates `completion_gate·min(channels)`) + goal-joint scoping, NOT another probe/threshold iteration.
+- **Verified** — sculptor **943 passed / 1 skip** (+2 round-31 gate-level tests: the unified probe-raise rule flags a surgical jitter-raise AND a do_nothing-floor raise, honest-peak control not flagged, round-15 honest-onset preserved), UI backend **362 passed**. uvicorn restarted (HTTP 200).
+- **STATUS** — the velocity-floor RATIO joins the keyword classifier + AST denylist as a THIRD CONFIRMED-unbounded surface (4 bypasses now: knife-edge r27, fail-open r30/D1, jitter-fail-open r31/A1, channel-decouple r31/B1 — the last two clean-fixed / documented-residual). All three surfaces' clean closure requires the DURABLE structural fixes: (A) goal-joint scoping + min-composition-law enforcement (closes the velocity-floor + posture surfaces), (B) the designed subprocess sandbox (closes AST). 3-consecutive-zero-defect bar still not met; the AST surface alone is now 2 consecutive clean rounds.
+
+### 2026-06-23 — autonomous hardening round 30 (1 commit on ship-20-ux-revamp): velocity-floor reference-probe fail-OPEN + a 3rd return-up verb family + my own static-reader regression
+
+- **What** — the 5-lens Workflow found **4 CONFIRMED defects** (D2 refuted as a base-gate artifact). Notably **lens E (a fresh AST escape evading ALL six prefix families gi_/cr_/ag_/f_/tb_/func_) — ~30 reflection routes + a 5643-hop numpy attribute-graph BFS — found ZERO escapes**: the prefix denylist holds against every concrete escape this round (the AST surface is currently robust, though still unprovable in the abstract). Fixes in `metric_calibration.py` + `generated_metric.py`:
+  - **(D1 — HIGH, velocity-floor fail-OPEN) `metric_calibration.py`.** A metric that SELECTIVELY RAISES on the `velocity_peak_ref` reference probe (keying on its high-whole-body-velocity signature so real rungs are unaffected) left `ref_scores` empty → `vfr=None` → the round-26 velocity-floor verdict was SKIPPED (fail-open) → an idle-jitter farm under the ceiling GRANTED. **Fix:** a `reference_only` raise now records 0.0 → the ratio check fails CLOSED (`jitter ≥ 0.57·0` trips whenever jitter ≥ the idle floor); an honest metric scores the ref probe fine and is untouched.
+  - **(A2 + B1 — HIGH, 3rd return-up verb family) `metric_calibration.py`.** `_RETURN_UP_TOKENS` missed the lift-SELF-up / gymnastics-rise verbs (hoist/haul/wrench/jolt/propel/pike/bridge/lever/jackknife/muscle/pop) — "collapse then hoist yourself upright" stayed terminal_down=True → dropped `collapse_and_stay_down` → drop-and-stay confound GRANTED (notably "heave" was closed round-29 while synonyms hoist/haul weren't). **Fix:** broaden `_RETURN_UP_TOKENS` (SAFE direction). [This is the THIRD consecutive round closing a return-up verb gap — the keyword surface is unbounded; the durable fix is goal-joint scoping (A).]
+  - **(A3 — MEDIUM, MY round-29 regression) `generated_metric.py`.** The `5b08511` static role reader made the PATH read static while the MODULE branch still read LIVE `getattr` → a REASSIGNED `REQUIRED_JOINT_ROLES` was VALIDATED under the static first-literal (calibrate reads via path → knees) yet DEPLOYED under the live last-binding (compute_generated_metric reads via module → shoulders) → a knee-validated metric GRANTED while deploying off-goal as a shoulder-reader (validated≠deployed). **Fix:** `read_required_roles` now resolves a module to its `__file__` source and parses STATICALLY on both paths — single source of truth, validated == deployed.
+- **Verified** — sculptor **941 passed / 1 skip** (+3 round-30 tests: lift-self-up verbs deny, reference-probe raise fail-closed at the gate level, path==module role-reader consistency), UI backend **362 passed**. Lens C honest sweep: 0 new firewall false-rejects (the 0.57 + the return-up broadenings haven't dented accept rate; denials are documented keyword-misses). uvicorn restarted (HTTP 200).
+- **STATUS** — 3 surfaces remain unbounded; the AST surface had a CLEAN round (no escape after lens E's exhaustive hunt), the keyword surface yielded its 3rd return-up gap (safe-direction patched), and round-26 velocity-floor had a fail-open (now closed). The durable fixes (A goal-joint scoping, B the now-designed subprocess sandbox) remain the convergence path. 3-consecutive-zero-defect bar still not met.
+
+### 2026-06-23 — fix-B (subprocess sandbox) DESIGN + the static role-reader down-payment
+
+- **What** — after rounds 27–29 proved the AST denylist is unbounded (2 CRITICAL escape classes in 2 rounds), designed the durable containment via a 4-architecture workflow whose agents EMPIRICALLY verified every claim on this WSL2 box, and landed the unanimous "ship-first" safe piece.
+  - **DESIGN DOC: [docs/internal/FIX_B_SANDBOX_DESIGN.md](docs/internal/FIX_B_SANDBOX_DESIGN.md).** Recommended architecture = a PERSISTENT forked worker per grant (fork AFTER numpy/sculptor are imported → zero re-import, sub-ms lockdown, byte-identical scores via the same interpreter; ~2–12 ms/grant) carrying ALL containment layers: separate process + `RLIMIT_CPU`/`RLIMIT_AS`/wall-clock-timeout (crash/hang/memory), `chdir` to a throwaway tmpfs + `RLIMIT_FSIZE=0` (file-write isolation — empirically, neither rlimits NOR seccomp can reliably block writes/`unlink`, so it MUST be filesystem isolation), a ctypes **seccomp-bpf** filter (ERRNO-deny `socket`/`connect`/`execve`/`fork`/`unlink`/`rename` — verified rootless-viable here: `libseccomp.so.2` present, `NO_NEW_PRIVS` OK, numpy byte-identical post-filter, `os.system`→denied), and optionally `os.unshare(NEWUSER|NEWNET|NEWNS)` (all confirmed working rootless; bubblewrap is stronger but isn't installed and `sudo` needs a password → would require vendoring the .deb). Rollout: behind `RS_METRIC_SANDBOX` (default OFF) → byte-parity harness over the 937-test corpus → flip ON; **fail-CLOSED** on launch failure (never silent in-process fallback). Corrected the prior false premise: the cheap empty/curated-`__builtins__` variant is NOT viable (numpy `.mean`/`.max` call `__import__`; `mission_runtime` keeps real builtins).
+  - **DOWN-PAYMENT LANDED:** `generated_metric.read_required_roles_static(source)` — reads `REQUIRED_JOINT_ROLES = ["…"]` by STATIC AST parse (literal list/tuple of strings; else `[]`), and `read_required_roles(path)` now uses it instead of `load_generated_module` → **no longer execs untrusted module top-level code just to read metadata** (proven: a top-level `open('w')` side effect does NOT run on the path role-read). The module-object branch is unchanged. This is the first structural prerequisite of fix B (the sandbox needs no-exec role reading).
+- **Verified** — sculptor **938 passed / 1 skip** (+1 static-roles/no-exec test; score-identity preserved across all calibration/scoring tests), UI backend **362 passed**. uvicorn restarted (HTTP 200).
+- **STATUS** — fix B is now fully designed + has its first safe increment landed; the remaining work (fork-pool `MetricSandbox` + seccomp + parity harness, behind a default-OFF flag) is a dedicated reviewed increment with HIGH score-path blast radius. Current threat stays LOW (system-generated metric source). Fix A (REQUIRED_JOINT_ROLES goal-joint SCOPING — distinct from role READING) still recommended for the posture-confound surface.
+
+### 2026-06-23 — autonomous hardening round 29 (1 commit 86d2bca on ship-20-ux-revamp): 2nd CRITICAL AST escape (numpy cython func_ aliases) + the terminal-down righting-verb gap; the denylist is now PROVEN-incomplete
+
+- **What** — the 5-lens Workflow (reproduce + skeptic re-reproduce → CONFIRMED-only) found **2 CONFIRMED defects** (B1 correctly REJECTED by the skeptic as the documented round-27 bounded velocity-floor residual — the linear-floor grant is carried by the generous-peak burst form identical to honest GOOD_KICK, the floor adds only +0.046 marginal idle credit). Both fixed in commit 86d2bca:
+  - **(E-1 — CRITICAL AST escape, `metric_validate.py`)** numpy CYTHON callables (e.g. `np.random.seed`) expose the Python-2 aliases `func_globals` / `func_code`. `func_globals` IS the module-globals namespace (its `__builtins__` reaches `__import__`); `func_code` + `code.replace` + `types.FunctionType` rebuilds a callable that resolves the import at the C level with NO python-visible dunder. `func_` does NOT start with `f_` (2nd char `u`), so the round-28 prefix deny missed it → `_ast_safety` clean → `os.getcwd()` reached through the live `load_generated_module` gate. **Fix:** add `func_` to the introspection prefix family (non-colliding — no public numpy attr begins with `func_`).
+  - **(A2 — HIGH false-grant, `metric_calibration.py`)** the terminal-down `_RETURN_UP_TOKENS` set missed a NEW returns-up verb family the round-28 jump broadening did not cover — the RIGHTING / return-to-feet verbs (rebound / raise-body / heave / scramble / kip / peel). "collapse then rebound to your feet" stayed terminal_down=True → dropped `collapse_and_stay_down` → a drop-to-floor-and-stay confound GRANTED. **Fix:** broaden `_RETURN_UP_TOKENS` with the righting family (SAFE direction — only ever KEEPS the loser; genuine "come to rest"/"lie still" stay terminal; "come" deliberately excluded).
+- **THE DECISIVE PATTERN (rounds 27→28→29):** every round found a NEW keyword gap (HIGH) AND rounds 28+29 each found a NEW **CRITICAL AST escape CLASS**, each slipping a denylist patched the round before (round-28 `gi_frame.f_builtins` → round-29 `func_globals`). This is the EMPIRICAL proof that the leaf/prefix AST denylist cannot be proven complete — it is an UNBOUNDED surface. The keyword classifier is likewise unbounded but its fix direction (broaden the KEEP-a-loser list) is SAFE (only observe-only false-rejects), whereas each AST gap is a CRITICAL false-grant (RCE).
+- **Why/How** — continue the loop; lens A regression-confirmed the round-28 fixes hold (gi_frame blocked, jump-family denies) and the velocity-floor family stays DENIED; lens C honest sweep = 13/13 GRANT (no accept-rate regression from the round-27 0.57 tightening); lens D found 0 new defects. Both fixes are the SAFE direction.
+- **Verified** — sculptor **937 passed / 1 skip** (+3 round-29 tests: 2 cython-func_ escape vectors blocked, the righting-family terminal-down guard), UI backend **362 passed**; the E-1 exploit now flags `forbidden frame/generator introspection attribute: func_globals/func_code`, honest numpy still passes. uvicorn restarted (HTTP 200).
+- **STATUS / DURABLE FIX B is the convergence path (design constraint CORRECTED here):** the AST denylist is now PROVEN-incomplete (2 CRITICAL escape classes in 2 rounds) → the restricted SUBPROCESS sandbox for `compute_spec` exec is the only structural closure. **Code-verified correction to the prior recommendation:** the cheap in-process "empty/curated `__builtins__`" variant is NOT viable — numpy ndarray methods (`.mean`/`.max`/`.std`) internally call `__import__`, so an emptied `__builtins__` breaks legitimate metrics (`mission_runtime._evaluate_success_criterion` line 314-324 deliberately KEEPS real `__builtins__` for exactly this reason — the prior docstring claim that "the repo already empties `__builtins__`" was WRONG; corrected in `generated_metric.py`). So fix B must be a TRUE process sandbox: real builtins inside, process locked down outside (separate process for crash/hang/memory isolation + `RLIMIT_CPU`/`RLIMIT_AS`/timeout + restricted cwd; and for containment vs `os.system`/`unlink`/network rather than mere robustness, a seccomp-bpf filter or bubblewrap/nsjail), plus STATIC (AST, no-exec) `REQUIRED_JOINT_ROLES` reading (a top-level exploit runs at module-exec time). High blast radius over the score path (must stay score-identical vs the 937-test corpus) → a dedicated reviewed increment. Realistic CURRENT threat is LOW (metric source is SYSTEM-generated from the user's own goal, not adversarial). 3-consecutive-zero-defect bar still not met. Real-LLM ~95% recheck pending network+API.
+
+### 2026-06-23 — autonomous hardening round 28 (1 commit on ship-20-ux-revamp): a CRITICAL frame-reflection AST escape + the round-27 terminal-down keyword gap
+
+- **What** — the 5-lens Workflow (each candidate reproduced + skeptic-re-reproduced → CONFIRMED-only) found **2 CONFIRMED defects** (skeptics correctly REJECTED 3 others — see below). Both fixed:
+  - **(E1 — CRITICAL AST escape, `sculptor/eval/metric_validate.py`)** a generator's `gi_frame.f_builtins` **IS the live builtins dict**; `__import__` is fetched as a dict SUBSCRIPT keyed by a `chr(95)*2+'import'+chr(95)*2` string (no dunder, no single-underscore, no `.format` token the AST walker can see) → `__import__('os')` → RCE; proven non-destructively through the live `load_generated_module` gate (`os.getcwd()` leaked, `open`/`os.remove` bound). This is a PURE-PYTHON language feature with ZERO numpy attributes, so round-25's numpy-attribute-graph BFS could never reach it — i.e. a **NEW escape CLASS found after round-25 declared the numpy surface robust**, proving the AST denylist is fundamentally incomplete. **Fix:** deny the frame / generator / coroutine / traceback introspection attribute PREFIX family (`gi_`/`cr_`/`ag_`/`f_`/`tb_`) on every attribute — closes the whole family (a prefix deny, not a leaf enumeration), and never collides with a physical numpy attr (`flags`/`flat`/`flatten`/`real`/`T` are `fl…`/`re…`/single-letter, never `f_…` — regression-tested).
+  - **(D-B2 — HIGH false-grant, `metric_calibration.py`)** the round-27 `ladder_td` guard relies on `_goal_is_terminal_down`, whose `_RETURN_UP_TOKENS` set MISSED the JUMP family — so "collapse then jump" / "lie down then spring **upward**" / "explode into a jump" misclassified as terminal_down=True ("upward" tokenizes whole, not the standalone "up"; jump/spring/bound/explode absent), the guard did NOT fire, `collapse_and_stay_down` was dropped, and a drop-to-floor-and-stay confound GRANTED on a mis-rendered descent ladder. **Fix:** broaden `_RETURN_UP_TOKENS` with the jump/leap/spring/hop/bound/vault/explode/ascend/upward/skyward family — the SAFE direction (a return-up token only flips terminal_down→False, which KEEPS `collapse_and_stay_down`; can never drop a loser → never a false-grant; symmetric to the round-24 "broaden the ACTIVE list" lesson).
+- **REJECTED by skeptics (NOT defects, important):** (B-LOGFLOOR) a log-saturation "velocity-floor" confound at ratio 0.545<0.57 is a KNOWN-EXCLUSION off-goal-channel ROM confound — its velocity-floor channel fails the base gate ALONE (n_valid=0), the grant is carried by the ROM term, and an honest whole-body-ROM metric rewards the same arm-wave identically; it farms LESS idle (45%) than the accepted honest GOOD_KICK (52%). (C1/C2) the round-27 0.57 tightening "false-rejects" are TRUE rejects of genuinely-gameable peak-BLIND mean-velocity metrics (a `sqrt`/`k=1.0`-saturating metric pays a pure idle tremor 0.99/0.69 of competence); a peak-sensitive honest metric on the identical goal+ladder GRANTS. **Net: the 0.57 threshold causes NO honest accept-rate regression** (the firewall steers toward the peak/intensity-sensitive form).
+- **Why/How** — continue the loop; lens A (bypass-attack the 0.57 fix, 14 candidates) found 0 confirmed (the round-27 family stays DENIED — regression PASS; the honest exp-burst ratio max is 0.5315 so the (0.531,0.57) window is empty for honest metrics). Empirical throughout (live grant path + venv); both fixes are the SAFE direction (E1 strengthens containment; D-B2 only keeps a loser).
+- **Verified** — sculptor **934 passed / 1 skip** (+5 round-28 tests: 3 new AST escape vectors blocked, the `f_`-prefix legit-numpy-attr non-regression, the jump-family returns-up guard), UI backend **362 passed**; the E1 exploit now flags `forbidden frame/generator introspection attribute`, the honest `flags`/`flatten` metric still passes. uvicorn restarted on the latest code (HTTP 200).
+- **STATUS** — the AST denylist is now a CONFIRMED-incomplete surface (a new escape class surfaced 3 rounds after it was declared "robust"), so **(B) the restricted subprocess sandbox for `compute_spec` exec (curated `__builtins__`, no FS/network) is now URGENT, not optional** — it is the only PROVABLE containment and the path that ends the AST whack-a-mole. The two durable structural fixes (A goal-joint scoping, B subprocess sandbox) remain the convergence path. 3-consecutive-ZERO-defect bar still not met (round 28 found 2). Real-LLM ~95% accept recheck still pending network+API.
+
+### 2026-06-23 — autonomous hardening round 27 (1 commit on ship-20-ux-revamp): velocity-floor ratio recalibration + terminal-down goal-text guard
+
+- **What** — a 5-lens adversarial-review Workflow (regression-attack the round-26 fix / broad false-grant / honest false-reject / `git diff 028592e..HEAD` / AST bypass; each candidate reproduced with the venv + MOCK ladder client → independent skeptic re-reproduce → CONFIRMED-only) surfaced **6 CONFIRMED HIGH/MEDIUM false-grants in 2 classes**; both fixed in `sculptor/eval/metric_calibration.py`:
+  - **(Class 1 — velocity-floor, A1/A2/A3/A4/A5/D1) the round-26 PEAK discriminator was a KNIFE-EDGE.** The `jitter ≥ 0.85·velocity_peak_ref` test caught only HEAVILY-saturating mean-velocity floors. An additive confound `up·(0.49·floor(|jv|) + 0.51·rom)` where `floor` is ANY sub-saturating concave map (`1−exp` with k≥0.6, `tanh`, `sqrt`, or peak-keyed) keeps the ratio BELOW 0.85 while farming **32–45% of competence** on the OFF-GOAL `jitter_in_place` probe — the `rom` term both ranks the wave ladder (passes the base gate, rho_min=1.0) and lifts competence so the 0.5 abs-ceiling binds, leaving the whole `[ratio,0.85)×[·,0.5)` window unguarded (`jitter_in_place` carries no per-loser floor). The round-26 "robust to tuning" claim held for FLOOR_v but NOT for the saturation FUNCTION/rate. **Fix: `_VEL_FLOOR_RATIO` 0.85 → 0.57**, empirically calibrated into a clean separation gap — honest fixtures top out at **ratio 0.531** (GOOD_KICK and a generous-`/8` peak metric both legitimately pay the idle twitch ~0.38–0.52, ACCEPTED for a peak metric), every reproduced saturating-floor confound floors at **0.615**. The existing `jitter ≥ 0.15·comp` precondition protects low-farm honest metrics (rom-gated → jitter ~0.03). A confound tuned below 0.57 must become peak-sensitive enough that it CONVERGES to the honest generous-peak form (idle farm ≤ the accepted reference fixtures) → no more gameable than the baseline. **RESIDUAL (honest):** this discriminator sits over an UNBOUNDED functional surface — a THIRD structurally-limited subsystem alongside the keyword classifier; it bounds the idle-farm residual to the honest-fixture level, not to zero. Coupled to the fixed probe amplitudes (jitter tremor 0.04 vs peak_ref 0.10) and GOOD_KICK's 0.531.
+  - **(Class 2 — terminal-down, B1) `ladder_td` flowed UNGUARDED to the loser set** — the round-17/20 work hardened the `static_hold` side (crouched-rung + `_goal_is_static_hold` goal-text backstops) but left the SIBLING `terminal_down` side with no goal-text backstop. A blind author mis-rendering a RETURNS-UP goal ("squat down then jump straight up") as a descent-ENDING ladder passes the per-rung `_spec_is_terminal_down`, so `collapse_and_stay_down` was DROPPED and a drop-to-floor-and-stay confound GRANTED. **Fix: the symmetric guard `if ladder_td and not _goal_is_terminal_down(behavior_goal): ladder_td = False`** — a non-terminal (explicitly returns-up) goal KEEPS `collapse_and_stay_down`. SAFE direction (mirrors `ladder_sh`): a keyword false-negative on a genuine lie/rest goal merely keeps the loser → observe-only false-reject. Side effect (corrected, not a regression): "duck and hold low" (no lie/rest token) is now classified NON-terminal → `collapse_and_stay_down` is KEPT (matching the round-20 test's own name) and catches the descent confound DIRECTLY; `descend_and_thrash` is no longer injected for it; an honest torso-gated duck metric scores the full-collapse heap 0.0 and still grants (verified). `test_round20_active_duck_*` updated to the corrected mechanism.
+- **Why** — continue the find→reproduce→verify→fix→test→commit loop; the round-26 fix is the most-recent-fix lens-A target, and it fell on first contact (confirming the velocity-floor surface is a tuned-threshold heuristic, not a structural close).
+- **How** — empirical throughout (live grant path via `calibrate_task_derived` + a MOCK `_FakeLadderClient`); threshold chosen from a measured honest-vs-confound ratio sweep, not by assertion. NEVER weakened a gate — lowering the ratio STRENGTHENS it (the SAFE direction: can only add observe-only false-rejects, never a false-grant); the `ladder_td` guard is the documented-safe sibling of `ladder_sh`. The AST gate (lens E, ~25 attempts) and the honest false-reject sweep (lens C, 13 honest metrics) came back CLEAN.
+- **Verified** — sculptor **929 passed / 1 skip** (+3 round-27 regression tests: velocity-floor family denied, honest peak/rom not false-rejected, terminal-down guard keeps collapse for returns-up), UI backend **362 passed**; all 6 confounds DENIED + all honest fixtures (GOOD_KICK, /8 & /12 peak, rom, duck) GRANTED, re-confirmed on the live path. uvicorn restarted on the latest code (HTTP 200 `/system/info`).
+- **STATUS** — the velocity-floor verdict is now a THIRD unbounded-surface subsystem (keyword classifier + AST denylist + velocity-floor ratio) that incremental tuning cannot prove-close; the ≥3-consecutive-ZERO-defect bar is still not met. **Neither documented durable structural fix closes Class 1** — (A) REQUIRED_JOINT_ROLES goal-joint scoping does not help (the idle twitch excites goal joints too, so a goal-scoped velocity read still farms), and (B) the subprocess sandbox is an AST-containment fix, orthogonal to scoring. The durable structural fixes (A scoping, B sandbox) remain REQUIRED for the OTHER two surfaces. Real-LLM ~95% accept-rate recheck still pending a network+API run.
+
+### 2026-06-22/23 — autonomous hardening rounds 19–25 + KG integrity (11 commits f2932eb…76b3311 on ship-20-ux-revamp)
+
+- **What** — (KG) `sculptor/kg/viz.py build_kg_html` already tolerated a dangling edge (commit 8e445e0); `sculptor/kg/cases.py record_run_cases` now ENSURES a `FailureMode` node exists before linking a RunCase `INSTANTIATES` edge (was leaving 48 dangling edges → 4 absent failure ids); live shared KG repaired (48 dangling → 0; backfilled `failure:{component-imbalance,premature-termination,reward-saturation,static-equilibrium}`, 325→329). (FIREWALL) five commits of confirmed-defect fixes in `sculptor/eval/metric_calibration.py` + `metric_validate.py`, each found by a 6-lens adversarial-review Workflow (find → reproduce with the venv + a MOCK ladder client → skeptic re-verify → CONFIRMED-only), 16 defects total:
+  - **round-19 (f2932eb, 707f70f):** `_spec_is_static_hold` now reads `base_height_m` (the last unread MotionSpec motion field — a rise/descend RAMP or held squat was mis-read as a still hold); `_spec_is_terminal_down` gated on non-uprightness (a held UPRIGHT deep squat is not lie/rest → keeps `collapse_and_stay_down`); the `fam=="kick"` default path now runs the GENERAL goal-blind losers (was `req_losers=None` → firewall OFF for a novel kick); a terminal-down goal adds a stillness probe; `_ast_safety` blocks `ndarray.dump/dumps/tobytes/tostring` (arbitrary-path pickle write) and the `str.format/format_map` reflection primitive (a `chr(95)`-assembled `__globals__` exfil bypassed the literal-`__` scan).
+  - **round-20 (0ee0297):** the posture classifiers read the WHOLE ladder, not the top rung alone (HOLD vs TRANSITION) — `_ladder_has_crouched_rung` suppresses `static_hold` for a crouch→stand transition; `_spec_is_terminal_down` requires the down top to be STILL (a writhe/duck is active-low, keeps `collapse_and_stay_down`); `collapse_and_thrash` stillness probe added.
+  - **round-21 (6cd38f2):** a strict per-loser FLOOR (`_LOSER_FLOOR_FRAC=0.15·competent_ref`) on the pure-idle anchor `do_nothing_upright` — an additive uprightness-gated floor confound (`up·(FLOOR+(1−FLOOR)·goal)`) paid it up to 49% under the 0.5 ceiling and granted; `static_hold` AND-gated with the goal-text classifier (a postural-stability ladder for an ACTIVE gesture dropped do_nothing); terminal-down now has TWO thrashing probes (`collapse_and_thrash` constant-low + `descend_and_thrash` ramp — one probe can't be both maximally-low AND maximally-descending); `_spec_has_commanded_motion(dynamic_only=)` so a settled HOLD offset (zero velocity) doesn't flip a lie-down to active; `_ladder_has_crouched_rung` requires the low rung ALSO upright (a balance FALL rung is low+non-upright); `competent_ref≤0` → inconclusive (was auto-flagging gameable with a 0 ceiling).
+- **Why** — the round-19 prompt's convergence check + the mission bar of ≥3 consecutive ZERO-defect rounds. The defect counts were 6 → 3 → 7 across rounds 19/20/21 — the per-posture-classification heuristic (inferring goal-type from MotionSpec ladder geometry to decide which deterministic losers to drop) is a LEAKY abstraction with a long edge-case tail; each patch can open a new edge. The round-21 fixes (esp. the per-idle FLOOR and the two-probe terminal-down) are general CLASS-closing improvements, not just point patches.
+- **How** — every fix re-verified against the full accumulated case matrix (balance, salute, fold, lie-still, writhe, duck, squat, sit-to-stand, kick, gesture, descent-crouch, settled-lie) so a new fix can't regress an earlier one. NEVER weakened a gate to pass; the safe direction (keep the loser / deny) chosen on every ambiguous classification.
+- **Verified** — sculptor **907 passed / 1 skip**, UI backend **362 passed**; a 15-case end-to-end firewall+honest-grant matrix clean (every round-19/20/21 confound DENIED, every honest metric GRANTED). KG: `/system/kg/stats` 94/493/1555/519, per-project `kg/graph.html?regenerate=true` → 200 (3 MB), text + semantic (`query_semantic` cosine) search relevant, `heal-stubs` no-op (0 stub titles). uvicorn restarted after each live-path change.
+- **ROUNDS 22–25 (after the spend cap reset; commits e9b1211, cf0a4a9, 563b527, 013bae3, 76b3311):** the loop continued and surfaced TWO subsystems with UNBOUNDED surfaces that incremental patching cannot fully close:
+  - **(SECURITY — now ROBUST) the `_ast_safety` static gate vs numpy's re-export surface.** round-23 found numpy re-exports `os`/`builtins` through SINGLE-UNDERSCORE internals (`np._pytesttester.os.system`, `np._globals.enum.bltns.open`) → denied all single-underscore private attrs + `_FORBIDDEN_NAMES`-as-attrs. round-24 (CRITICAL) found the PUBLIC re-export alias `np.ma.extras.ma` *is* `numpy.ma.core` → `np.ma.extras.ma.inspect.dis.io.FileIO` (write/RCE), `…linecache.getline` (read/exfil), `…builtins.exit` (SystemExit crashes the never-raises scorers). Fix: block the stdlib MODULE NAMES + numpy non-physical submodules + dangerous leaves on EVERY attribute regardless of root (so variable-laundering `m=np.ma` still trips the name check, and any chain dies at the stdlib hop through an unlisted numpy submodule) + block `SystemExit`/`KeyboardInterrupt`/`exit`/`quit` names. **round-25's HARD bypass hunt found ZERO new escapes** — the denylist is now robust (the only fix was an over-block: `np.select` un-blocked). The DURABLE containment remains a restricted subprocess (curated `__builtins__`, no FS/network) — documented follow-on.
+  - **(FIREWALL — STRUCTURALLY LIMITED) the free-text posture keyword classifier.** Deciding whether `do_nothing_upright` is on-goal (drop) vs off-goal (keep) needs a goal-aware signal; the only one available offline is a keyword classifier, which is INCOMPLETE in BOTH directions — round-21 AND-gated on a positive balance keyword (false-REJECTED balance goals the list missed); round-22 inverted to veto-on-active-verb (false-GRANTED gestures whose verb was off the list); round-23 broadened balance keywords (round-24: a balance keyword + an unlisted active verb false-GRANTED, e.g. "shift your center of mass", "salute and stay on your feet"); round-24/25 settled on the SAFE direction (drop do_nothing only on POSITIVE still-hold evidence → a miss is observe-only, never a gate-weakening false-grant) + a NEGATION-aware, broadened ACTIVE-verb veto. There are unboundedly many action verbs, so an active goal naming a balance keyword + an unlisted active verb can still drop the posture losers on a MISMATCHED (incompetent-author) stability ladder. The REALISTIC case is already caught (a competent blind author authors a goal-shaped ladder a posture confound cannot rank → base-gate fail); the residual needs a mismatched ladder.
+- **ROUND-26 (commit c2df0aa) — CLOSED the jitter mean-velocity-floor exploit** (a round-22 documented residual): an additive confound `up·(FLOOR_v·(1−exp(−mean|jv|/k)) + (1−FLOOR_v)·rom)` farmed ~46% via the tiny-ROM `jitter_in_place` probe under the 0.5 ceiling. A flat per-loser floor was non-viable — honest GOOD_KICK pays jitter 0.52 of competence, ABOVE the confound's 0.48 (the MEANS don't separate). Fix = a reference-only `velocity_peak_ref` probe (a whole-body tremor at 2.5× jitter's amplitude → same joint coverage, ~2.5× the PEAK velocity); a MEAN-velocity metric's `1−exp(−mean/k)` SATURATES so it scores jitter ≈ velocity_peak_ref (peak-INSENSITIVE = the farming signature) → gate flags gameable when `jitter ≥ 0.85·velocity_peak_ref AND jitter ≥ the idle floor`. The ratio is INVARIANT to the confound's FLOOR_v (both probes scale together) → robust to tuning, unlike a flat floor. A genuine peak/ROM honest metric scores velocity_peak_ref above jitter and is not flagged.
+- **Verified (final):** sculptor **926 passed / 1 skip**, UI backend **362 passed**; the AST escape vectors + posture-confound + velocity-floor + honest-grant matrices are regression-locked. KG functioning (stats 94/493/1555/519, graph.html 200, semantic search relevant).
+- **STATUS:** the mission bar of ≥3 consecutive ZERO-defect rounds is **NOT met and is not reachable via keyword/denylist patching** — both subsystems have unbounded surfaces. ~30 confirmed defects fixed across rounds 19–25 incl. 6 CRITICAL/HIGH security escapes. **The two DURABLE structural fixes (the path to convergence) are now REQUIRED, not optional, and each warrants a dedicated reviewed increment:** (1) **REQUIRED_JOINT_ROLES goal-joint scoping** — require a granted task-derived metric to declare + read goal-relevant joints (derivable from the blind ladder's group `role_query`s, anti-collusion-safe), so a posture/off-channel confound that reads no goal joint cannot win regardless of the keyword classifier; (2) **a restricted subprocess sandbox** for `compute_spec` exec (empty `__builtins__`, no FS/network) — provable AST containment that closes numpy's unbounded re-export surface. The real-LLM live-grant accept-rate recheck (~95%) is still pending a network+API run.
+
+### 2026-06-22 — autonomous BROADENED hardening (rounds 5–19): security sandbox + calibration concurrency + the RED-TEAM false-grant firewall (10 commits 512cd38…5297d70)
+
+- **What** — continued the reliability drive into the whole recent-change surface + core (run_manager,
+  metric_store, sculptor_bridge, the firewall, generation, the metric runtime, the safety sandbox), via repeated
+  multi-lens adversarial-review Workflows (find → adversarially verify → reconcile), fixing every CONFIRMED
+  defect and re-reviewing each fix until the red-team came back clean. Files: mostly
+  `RewardSculptor/sculptor/eval/{metric_calibration,metric_validate,generated_metric,ladder_synth}.py` +
+  `reward-sculptor-ui/backend/services/{metric_store,run_manager}.py` + regression tests.
+- **The arc (each round = a fix + its own adversarial re-review):**
+  1. **Calibration concurrency/numeric (rounds 5–7, commit 512cd38):** `require_token` fail-closes the live
+     cal path on a None/mismatched token (a None used to disable the orphan guard → resurrected grant);
+     `_gameable_score` coerces a NaN/inf hack score to GAMEABLE in the adversarial gate (NaN had escaped
+     `worst`); built-in `calibrate()` write under `_META_LOCK` + `_atomic_write_json`. Round-8 re-review CLEAN.
+  2. **Security sandbox (rounds 9–11, commits 3828ba5, 5f6c31a, 6e1f923):** `_ast_safety` did NOT contain an
+     untrusted LLM-authored metric (numpy IO/pickle, `import numpy.ctypeslib`, `def __reduce__`, format-string
+     dunders) — 3 CRITICAL escapes, all closed (full dotted import gate, numpy IO/native attr deny-list,
+     `allow_pickle` ban, dunder def/string-literal reject). Then ENFORCED the gate inside
+     `load_generated_module` so it runs before EVERY exec (not only validation); fixed a follow-on `calibrate_
+     metric` "Never raises" break. Process isolation documented as the belt-and-suspenders follow-on.
+  3. **THE BIG ONE — the false-grant FIREWALL (rounds 13–18, commits 74ff605, 2981690, 7e2cc5b, fd3ff02,
+     7e92d61, 6ea4dce, 5297d70):** a RED-TEAM round (agents CONSTRUCTING gaming metrics + running the real
+     grant pipeline) found the deepest defect of the whole effort — the task-derived grant could be EARNED by a
+     metric that does not measure the goal (a pelvis-DEPTH-only proxy, a goal-blind POSTURE/height proxy), 3
+     CRITICAL false grants reproducing in the DEFAULT path. Root cause: the grant relied on blind LLM ladders
+     INCIDENTALLY penalizing the metric's confound; the only goal-aware defense was off by default + fail-open +
+     kick-only. FIX (converged over rounds 14–18): the `adversarial_archetype_gate` runs whenever base_ok,
+     scoring DETERMINISTIC goal-blind required-losers (`do_nothing_upright`, `jitter_in_place`,
+     `collapse_and_stay_down`); a loser RAISE → 0.0 + counted (runtime-equivalent — a metric that raises here
+     also scores the real degenerate policy 0.0 at runtime, so it can't reward it); whether the still-upright
+     losers are ON-goal (a balance/lie task) is decided from the BLIND AUTHORED ladder's top-rung posture
+     (`_spec_is_static_hold`/`_ladder_posture`, reading every MotionSpec motion channel), NOT a brittle goal-
+     keyword classifier (which had a token-gap false-grant every round). `RoleQuery.axes` null-coercion closed
+     a ValidationError fail-open.
+- **Verified** — sculptor **887 passed, 1 skipped**; UI backend **362 passed**; +~60 regression tests across the
+  arc. EMPIRICAL: fold-type generation accept ~95% stable across 3 fresh batches (round-9 curl/duck, round-11
+  toetouch/squat/bow/crouch 4/4); the live `adversarial=True` task-derived grant works (calibrated=true,
+  rho_min 0.894) across 7 consecutive rechecks; the red-team's depth/posture/idle/velocity/subtle-gesture proxies
+  are all DENIED end-to-end while honest fold/balance/gesture metrics still GRANT; all reproduced `_ast_safety`
+  escape vectors are blocked + 27 real on-disk metrics still load. Both suites green at each commit; uvicorn
+  restarted to pick up the live-path changes.
+- **Known/limitations (documented, not blocking):** (1) the deterministic losers cover the posture/depth/idle
+  CONFOUND classes, NOT arbitrary off-goal-channel gaming (e.g. a "wave" metric gamed by leg motion) — the
+  `adversarial=True` LLM breadth pass adds coverage there; a structural fix (require granted metrics to declare
+  `REQUIRED_JOINT_ROLES`) is a separate increment. (2) the goal-keyword classifier remains only as a fallback
+  when no ladder is available. (3) transient h11/httpcore import-contention can make a real anthropic client
+  build fail when many processes spawn at once — not a code or persistent-env issue (a fresh import is healthy);
+  the single-process live path is unaffected.
+
+### 2026-06-21 — novel-task objective metric RELIABILITY DRIVE: 50% → 91% accept + steering path un-blocked (14 false-reject/steer fixes across 4 commits, 3 adversarial-review rounds)
+
+- **What** — drove auto-generated OBJECTIVE METRIC creation for NOVEL fold/posture/gesture goals (toe-touch,
+  squat, bow, crouch, floor-touch, pick-up, kneel, compound "bend→stand→wave", wave) to reliable end-to-end:
+  generation → validation → review → task-derived calibration (steering). Started by REPRODUCING with real
+  best-of-3 generations (baseline **4/8 = 50%** accept; failures dominated by PIPELINE false-rejects, NOT LLM
+  quality), root-caused each, fixed at the gate, regression-tested, adversarially reviewed, looped.
+- **Commits** (branch ship-20-ux-revamp): `2637b01` (round 1, 5 fixes), `b05828b` (round 2, 5 fixes),
+  `47cc6a0` (calibration JSON-mode), `2ead537` (round-3 review fixes). All in `sculptor/eval/metric_validate.py`,
+  `metric_gen.py`, `metric_calibration.py`, `prompts/review_objective_metric.md` + 2 new test files.
+- **The fixes** (each a real false-reject / dead-path, NOT a gate-weakening):
+  1. `_selectivity_probe` rebuilt: PHYSICAL rad/s velocity (`gradient/dt` — was rad/FRAME, 50× too small, so a
+     velocity-thresholding channel never fired); added C3 (overhead arm raise+oscillate, in-band ~2 Hz), C4
+     (sequenced bend→recover→wave compound), C5 (bidirectional torso oscillation for twist/repeated goals);
+     supplies planted foot channels so a foot-reading metric isn't auto-zeroed.
+  2. joint-index gate (`_raw_joint_index_violations`) base-tracked: only flags `joint_*[:, :, N]`, NOT a 3-vector
+     axis read (`root_link_pos_w[:, :, 2]`, `projected_gravity_b[:, :, 2]`) — the runtime permutation gate backstops.
+  3. AST safety allowlists the benign dunder `__name__` (`type(e).__name__`, the never-raise idiom the model emits
+     constantly); the traversal dunders (`__class__`/`__globals__`/…) stay blocked.
+  4. vacuous-branch entry keys on the POSITIVE archetypes ~0 (a fixed-negative-credit metric still reaches the
+     probe); fixed negatives folded into the degenerate anchor (flail/chaos/fall rewarder still rejected); the
+     forward-walker folded for non-forward goals (anti-Goodhart, scoped so a forward goal isn't false-rejected).
+  5. `selectivity_probe` scores surfaced to the independent reviewer on a vacuous pass (+ rubric note) so it stops
+     false-flagging the all-zero fixed battery as "near-constant".
+  6. precise `resolve_behavior_family` (a real gait verb, or a directional cue with NO posture verb, never
+     "in place") so "bend FORWARD into a bow" / "march in place" no longer mis-resolve to locomotion; the vacuous
+     entry KEEPS `family is None`, so a recognized-family wrong-behavior metric (arms-overhead for a KICK goal) is
+     rejected on the normal path, not vacuously rescued (round-3 review finding).
+  7. `_physical_vel` factored to module scope + shared by the graded best-of-N rungs (was a divergent unit);
+     "gameable: '<archetype>'" reject message (actionable feedback) replaces a misleading "near-constant".
+  8. **CALIBRATION STEERING PATH UN-BLOCKED** (the big one): the K blind ladder authors used
+     `messages.parse(output_format=CompetenceLadder)` — that schema (nested Groups + RoleQuery + a float|list Union)
+     is too complex for the API's constrained-decoding grammar compiler, which **400s "schema is too complex" /
+     hangs "grammar compilation timed out" on EVERY call** (an isolation call hung the full 300 s) → 0 usable
+     ladders → NO metric could EVER earn steer-rights. All tests mocked the author, so it never surfaced. FIX: a
+     JSON-mode `_author_structured` (plain `messages.create` + JSON parse, schema pinned in-prompt via
+     `model_json_schema`, fence/prose-tolerant, truncation→skip). The gaming-archetype (L3) author too.
+- **Why**: a false-reject leaves the run BLIND (no metric); the calibration break left every novel metric
+  observe-only FOREVER (steering dead). Both defeat the whole feature. Each fix targets the real root cause
+  (gate logic / prompt / API-mode), never loosens an anti-gaming gate (the firewall keeps an uncalibrated metric
+  observe-only; calibration is the task-validity check).
+- **Verified — EMPIRICAL** (real best-of-3 generations, `robot_hint=Mjlab-Velocity-Flat-Unitree-G1`):
+  - **Generation accept rate 50% → ~95%** — baseline 4/8; round-3 batch 10/11; **final HEAD-code batch 8/8**
+    (toe-touch, squat, bow, crouch, floor-touch, kneel, compound bend→stand→wave, sit→stand) → **18/19 (95%)**
+    across the two post-fix batches. EVERY fold/posture goal type accepted; the only miss across all batches was
+    "raise arms overhead and HOLD" (a static-posture, non-fold edge case with no probe). floor/kneel on the final
+    batch were rescued by the validation-feedback retry fallback when best-of-N found 0 valid candidates.
+  - **Steering payoff PROVEN**: with JSON-mode, the real LLM ladder author emits deep fold ladders across all 3
+    styles (fold_depth_m 0.06→0.46, mode=fold, hip/knee/ankle flex) and `calibrate_task_derived` **GRANTS** for
+    `floor1` ("reach down and touch the floor then rise") and `pickup1` (rho_min 0.894, n_valid 2, agreement 0.67)
+    — the path was 0-grant-possible before. (bow needs a torso-TILT ladder, not the upright pelvis-dip fold — a
+    `render_rung` follow-on; squat/toe were LLM variance.)
+  - Suites green throughout: sculptor **821 → 845 passed, 1 skipped** (+24 regression tests across
+    `tests/test_novel_metric_robustness.py` (new, 23) + `tests/test_task_derived_calibration.py`); UI backend
+    **355 passed**. uvicorn restarted each time the live path changed; `/health` 200.
+- **Adversarial reviews** (multi-lens Workflow → verify → reconcile, acted only on CONFIRMED): round-1 found 2
+  (graded-rung unit divergence, vacuous walker not folded) → fixed; round-3 found 2 (family-scope over-correction,
+  battery velocity unit) → fixed; round-4 (JSON-mode + false-grant + injection) running at handoff.
+- **RESIDUAL / follow-ons** (none block the core fold-metric reliability): (a) `render_rung` fold dips the pelvis
+  upright but does not TILT the torso, so a BOW/toe-touch metric gated on gravity-x can't calibrate against a fold
+  ladder (needs an optional fold-tilt) — bow generates+validates+reviews fine, just stays observe-only; (b) twist
+  /march metrics are flail-gameable unless they bound oscillation frequency / isolate the joint (the gate now
+  surfaces "gameable" feedback, but best-of-N must produce a better metric); (c) static-posture "raise and hold"
+  has no probe; (d) calibration grant RATE is ~2/5 (LLM ladder variance + metric strictness) — improving the
+  ladder author's joint-flex amplitude consistency would raise it.
+
+### 2026-06-21 — review-feedback retry: a reviewer veto regenerates (was a dead-end)
+
+- **What** (`metric_gen.py`): a metric that PASSED validation but the independent reviewer VETOED was a dead-end — the
+  feedback-retry loop only fired on a VALIDATION failure, so a reviewer rejection failed the run with no recovery (a live
+  best-of-3 hit exactly this: 2/3 candidates invalid, the 1 valid one reviewer-rejected → blind). FIX: a bounded
+  review-feedback retry — when a validation-passing metric is vetoed, the reviewer's concerns are fed back, the metric is
+  regenerated, re-validated, and re-reviewed, up to `_MAX_REVIEW_RETRIES` (2). Completes the feedback story: BOTH gate
+  failures (validation + review) now recover via feedback, where before only validation did.
+- **Why**: the generated metrics for a hard NOVEL task (toe-touch) carry real, fixable flaws the reviewer correctly
+  flags (e.g. a `gz`-based bend that credits a backbend, an unsigned hip-amplitude floor); a dead-end on the first veto
+  made the run a coin-flip. Feeding the concern back lets the LLM fix the specific objection.
+- **How**: byte-identical when review is off OR the metric is approved (the loop's guard is false). A persistently-vetoed
+  metric stops after 2 retries (bounded — no infinite loop). A review-retry that BREAKS validation stops (no gate
+  thrashing); `selected_candidate` is cleared (the result is a corrected retry, not a best-of-N candidate).
+- **Verified**: sculptor `819 → 821 passed, 1 skipped` (+ recovery test: vetoed→fed-back→approved; + bounded-give-up
+  test); UI backend `355`. This is the 6th and final robustness fix to the generation pipeline this session (temperature,
+  never-silent, feedback-fallback, truncation, review-in-order, review-feedback-retry). RESIDUAL: generation still has
+  real LLM variance on a hard novel task — these fixes raise the per-run accept odds substantially but don't guarantee
+  every run; best-of-3/4 + the two feedback loops are the levers.
+
+### 2026-06-21 — best-of-N reviews valid candidates IN ORDER (accept the first reviewer-approved)
+
+- **What** (`metric_gen.py`): while verifying the truncation fix, a live best-of-3 validated fine but was REJECTED — the
+  independent LLM reviewer vetoed the selected metric. Root: best-of-N selected the most-DISCRIMINATING valid candidate
+  (offline `graded_discrimination`) and reviewed ONLY that one; the offline discriminator can't predict the LLM reviewer,
+  so a flawed top candidate sank the run even though a slightly-less-discriminating valid SIBLING (cand 0, disc 1.417 vs
+  the rejected cand 2's 1.578) was never reviewed. FIX: `_best_of_n` now returns the valid candidates RANKED by
+  discrimination; `generate_objective_metric` reviews them BEST-FIRST and ACCEPTS the first the reviewer approves
+  (promoting it to source/validation/metric.py/selected_candidate). Stops at the first approval (≤ N reviews). Extracted
+  a `_dispatch_review` helper (panel-or-single) so each candidate goes through the same review path.
+- **Why**: best-of-N's promise is "keep the best ACCEPTABLE candidate" — selecting by an offline proxy and praying the
+  reviewer agrees defeated it. Reviewing in order makes a run succeed whenever ANY valid candidate passes review.
+- **How**: byte-identical for the single-shot / 1-valid path (`len(ranked_valid) <= 1` → the single review of `source`,
+  exactly as before). Only fires when best-of-N has ≥2 valid candidates. Confirmed via a live n=1 run: generation +
+  validation + review all pass for a clean toe-touch metric (reviewer praised "sharp gate × min of saturating channels,
+  all 12 degenerates score 0").
+- **Verified**: sculptor `818 → 819 passed, 1 skipped` (+ review-in-order test: top candidate reviewer-rejected, lower-disc
+  sibling approved → accepted/selected the sibling); UI backend `355 passed`. uvicorn restarted; /health 200.
+
+### 2026-06-21 — metric-gen truncation fix: max_tokens 8000→16000 (Sam saw "missing def compute_spec")
+
+- **What**: a generated metric was rejected with `[contract] missing def compute_spec` → run continues blind. Root cause:
+  the generator runs with adaptive **thinking**, which SHARES `max_tokens` with the code output. A hard metric's think
+  uses 5-8k tokens; at the old `MAX_TOKENS=8000` the code got truncated (`stop_reason=max_tokens`) — sometimes mid-body
+  (syntax error), sometimes before the `def` ever emitted (missing `compute_spec`). Observed: a real generation used
+  7452/8000 output tokens — right at the edge, so a slightly longer think tips it over. FIX (`metric_gen.py`):
+  `MAX_TOKENS = 8000 → 16000` (verified accepted; complete code at ~7.3k total, ample headroom). Plus `_sample_source`
+  now raises a CLEAR `truncated at max_tokens` error when `stop_reason == "max_tokens"`, so a (now-rare) truncation
+  surfaces as "truncated" and triggers a retry, instead of a baffling downstream "missing compute_spec".
+- **Why**: this is the same class as the temperature bug — extended thinking interacting badly with a request param. Both
+  made best-of-N (and single-shot) fail in confusing ways.
+- **How**: `MAX_TOKENS` bump is a one-liner; the truncation guard is byte-identical for existing mocks (they have no
+  `stop_reason` attr → `getattr(...) is None`). The feedback fallback (prior entry) + this fix compound: a truncated
+  candidate now retries with the full 16k budget.
+- **Verified**: sculptor `817 → 818 passed, 1 skipped` (+ truncation-detection test; complete-response path unaffected);
+  two live generations at 16k produced complete `compute_spec` (`end_turn`, ~7.3-7.5k tokens). uvicorn restarted, /health 200.
+
+### 2026-06-21 — best-of-N bugfix: temperature/thinking 400 + feedback fallback (Sam saw "attempt 3/4, all failed")
+
+- **What**: Sam ran best-of-4 at launch and it jumped to "Sampling candidate 3/4" instantly with everything failing. Root
+  cause: the generator runs with extended **thinking** (`adaptive`), and the Anthropic API rejects any `temperature != 1.0`
+  when thinking is on (`400: temperature may only be set to 1 when thinking is enabled`). My best-of-N varied temperature
+  (`_BON_TEMPS = 0.7/0.9/1.0/1.1`), so 3 of every 4 candidates 400'd in milliseconds; only the `temp=1.0` candidate ran.
+  FIX (`metric_gen.py`): dropped temperature variation — candidates now decorrelate by **framing only** (`_BON_FRAMINGS`) +
+  the model's inherent temp-1.0 stochasticity; reverted `_sample_source` to a hardcoded `temperature=1.0`. Confirmed live:
+  a real best-of-2 now runs ~190s (2 genuine calls, no `api_error`) instead of <2s of 400s.
+- **Also fixed two things the bug exposed**: (1) NEVER-SILENT — when all candidates fail, `_best_of_n` now aggregates every
+  candidate's API-error / validation reason into the returned `validation.reasons`, so the UI shows WHY (was returning a
+  bare reject). (2) best-of-N had silently DROPPED the retry-WITH-FEEDBACK loop (single-shot retries 3× feeding validation
+  failures back so the LLM self-corrects); best-of-N sampled N independent candidates with no feedback, making it WORSE
+  than single-shot for goals needing correction (e.g. toe-touch — a fresh best-of-2 produced 2 invalid metrics). Now when
+  best-of-N finds no valid candidate it FALLS BACK to the feedback-retry loop, seeded with the aggregated candidate
+  failures — so best-of-N is never worse than single-shot (diversity-selection on top of correction). The feedback
+  condition changed `attempt>0 and validation` → `validation and not ok` (byte-identical for single-shot: validation is
+  None at attempt 0).
+- **Verified**: sculptor `816 → 817 passed, 1 skipped` (+ regression tests: temps==[1.0,1.0]+thinking, framing
+  decorrelation, all-API-error surfaces "thinking" reason, fallback rescues a 2-invalid run); a live best-of-2 runs both
+  candidates (no 400). uvicorn restarted; `/health` 200. NOTE: a fresh toe-touch generation can still land invalid (LLM
+  variance — the L0 probe / non-degeneracy gate is unforgiving); best-of-N + the feedback fallback improve the odds but
+  don't guarantee a valid metric. Separate generation-quality follow-up if it persists.
+
+### 2026-06-21 — best-of-N wired into the UI (New Run dialog) — both metric-gen surfaces
+
+- **What**: best-of-N was library-only (`n_candidates`); Sam: "everything should always be wired into the UI. That is
+  where I will test." Wired it end-to-end through BOTH metric-generation surfaces. Backend: `GenerateMetricRequest`
+  +`n_candidates` (1..8) → `routes/metrics.py` → `metric_store.generate(n_candidates=…)` → `sculptor_bridge` → the lib;
+  `LaunchRunRequest` +`metric_n_candidates` (1..8) → `run_params` (model_dump) → `run_manager` reads it → threads to
+  `_generate_at_launch(n_candidates=…)` → same `metric_store.generate`. `_summary` now surfaces `n_candidates`/
+  `selected_candidate`/`candidates` (with per-candidate `discrimination`). Frontend (`NewRunDialog.tsx`): a "Best-of-N
+  candidates" `<select>` (1 candidate (fast) / best-of-2/3/4) next to the Generate button, applied to the explicit
+  Generate action (`n_candidates`) AND the generate-at-launch path (`metric_n_candidates`); the success toast names the
+  picked candidate ("picked candidate 2/3"). Types in `types.ts`/`api.ts`/`useMetrics.ts`.
+- **Why**: an opt-in library knob the user can't reach from the UI is, for his workflow, untestable — the UI is the test
+  surface (see memory `no-terminal-after-run-sh`).
+- **How**: every layer defaults to 1 → byte-identical to before; the bound (≤8) is enforced server-side (a typo can't
+  fan out unbounded ~1-2 min LLM calls — `422` test). The 5 existing generate mocks gained `n_candidates=1`.
+- **Verified**: UI backend `354 → 355 passed` (+1 route test: `n_candidates` forwarded, `422` on out-of-range, fields
+  surfaced); frontend `tsc -b` clean + `pnpm build` clean (2750 modules); the live Vite dev server transforms
+  `NewRunDialog.tsx` (HTTP 200) with the new control + both wirings present (HMR-live). Browser click-through was
+  blocked only by the preview server being unable to bind 5173 (held by the WSL relay for the running Vite), not a code
+  issue. uvicorn restarted (no active run); `/health` 200 + OpenAPI shows `n_candidates`.
+
+### 2026-06-21 — best-of-N metric generation: sample N candidates, select the most-discriminating (offline)
+
+- **What** (`sculptor/eval/metric_gen.py` + `metric_validate.py`): `generate_objective_metric` gained opt-in
+  `n_candidates: int = 1`. When >1, `_best_of_n` samples N candidates (varied temperature/framing via `_BON_TEMPS`/
+  `_BON_FRAMINGS`), validates each, and selects the VALID one with the highest OFFLINE discrimination; ties keep the
+  first valid; all-invalid rejects (run stays blind). The selected candidate goes through the SAME review. New
+  deterministic discriminator in metric_validate: `graded_discrimination(fn, meta)` extends `_selectivity_probe` into a
+  GRADED competence ladder (degenerate → partial → good → ideal) along the two goal-agnostic axes the probe covers
+  (upright fold + non-upright posture), `score = max axis of (separation_from_degenerate + monotonicity)`;
+  `discrimination_of_metric(path, roles)` is the load+score entry point. New record keys `n_candidates`/`candidates`/
+  `selected_candidate`; the `review` key shape is unchanged (UI contract).
+- **Why**: single-shot-with-retry takes the first metric that merely VALIDATES; sampling N and selecting the sharpest,
+  most-monotone grader raises quality. The selector must be OFFLINE + DETERMINISTIC (only the N author samples cost LLM)
+  so it adds no nondeterminism to acceptance.
+- **How**: `n_candidates=1` is BYTE-IDENTICAL — the retry-with-feedback loop is line-for-line unchanged (re-indented into
+  an `else`), `_sample_source` default `temperature=1.0` matches the prior hardcoded value, the new record keys are
+  additive. The discriminator is pure-numpy (no RNG/time/LLM). Verified: a COARSE binary candidate (disc 1.0) sampled
+  FIRST loses to a smoothly-grading toe-touch (disc 1.83) sampled second → the SECOND is selected (ranks by
+  discrimination, not first-valid); `n=1` makes exactly one author call; all-invalid → not accepted. Adversarial-review
+  workflow (3 lenses + reconcile, Opus/high) PROVED byte-identical(n=1) + never-raise, and CONFIRMED one major defect:
+  `separation` was in raw UNBOUNDED spec_score units, so a high-amplitude coarse metric could swamp the monotonicity
+  term and mis-rank. FIXED: clamp rung scores to the spec_score [0,1] contract → `separation` ∈ [−1,1], co-scale with
+  `monotonicity` (a binary 5.0-amplitude metric saturates to [1,1,1], mono 0, and loses to a smooth grader);
+  regression-locked. Refuted: the unguarded `write_text` (pre-existing parity with the single path) and the
+  probe-blind-mixed-case (the documented goal-agnostic tie-break limitation → falls back to first-valid, never mis-selects).
+- **Verified**: sculptor `814 → 815 passed, 1 skipped` (+6: most-discriminating selection, ties→first-valid, n=1
+  byte-identical, all-invalid, graded-discriminator ranking/determinism, amplitude-invariance); UI backend `354 passed`.
+
+### 2026-06-21 — STEERING for fold/squat/toe-touch: a `render_rung` "fold-and-return" primitive
+
+- **What** (`sculptor/eval/ladder_synth.py`): the known follow-on from the novel-task L0 fix (entry below). A correct
+  toe-touch/squat metric was ACCEPTED + OBSERVED but could never STEER, because `render_rung`/`render_ladder` could not
+  render the pelvis DIP-AND-RETURN it ranks on (`base_height_m` is a monotone `_ramp`; a hop is up-then-down, the
+  inverse). Added: module const `_FOLD_ARC = (1−cos(2π·arange(T)/T))/2` (a 0→1→0 arc); MotionSpec field
+  `fold_depth_m: float = 0.0` (clamped [0,0.6]); Group `mode="fold"`. render_rung dips the pelvis
+  `root z −= fold_depth·_FOLD_ARC` (clamped ≥0) and a `fold` group flexes its joints `jp += off + amp·_FOLD_ARC` IN
+  PHASE. Byte-for-byte the dip-and-return that `metric_validate._selectivity_probe` (C1) scores, so calibration and the
+  L0 probe agree. Prompt `gen_competence_ladder.md` teaches the blind author to set `fold_depth_m` for true down-AND-up
+  goals (toe-touch/squat/deep bow/floor-touch), to scope fold groups to the goal's joint set, and to make the LOW rungs
+  DISCRIMINATING (a deep dip with NO flex, not just a smaller fold).
+- **Why**: full steering for fold/squat/sit-to-stand needs the renderer to express the inverse-of-a-hop the metric reads;
+  without it `calibrate_task_derived` can't rank a fold ladder, so a correct fold metric stays observe-only forever.
+- **How**: surgical, mirroring the hop/oscillate/burst patterns. DEFAULT BYTE-IDENTICAL — `fold_depth_m` default 0.0 (the
+  `if fd>0` guard skips) and `mode="fold"` is a new branch, so every existing rung (5 families + kick hacks + the
+  degenerate anchor) renders unchanged (full suite confirms). Verified END-TO-END against the REAL on-disk toe-touch
+  metric (`g1-toe-touching/metrics/gen_001`): a rendered fold ladder scores `[0, 0.167, 0.417, 0.75, 0.985]` — monotone,
+  rho_min 1.0, separation 0.985 ≥ 0.2 → `calibrate_task_derived` GRANTS. Adversarial-review workflow (3 lenses +
+  reconcile, Opus/high) confirmed the render math == C1 and never-raise/byte-identical hold; acted on its CONFIRMED
+  defects: (a) the keystone ladder wasn't DISCRIMINATING (a pelvis-depth-only proxy would also be granted) → added a
+  `discriminating_fold_ladder` (deep-dip-NO-flex gaming low rung) + a test proving the real `gate·min(channels)` metric
+  GRANTS while a depth-only proxy is DENIED; (b) removed the over-promised one-way `sit-to-stand` from fold examples (the
+  arc is forced-symmetric; sit-to-stand is a `base_height_m` ramp); (c) clamp pelvis z ≥0 (a deep fold from a low base
+  can't go below the floor); (d) bow=hips/waist joint-set note.
+- **Verified**: sculptor `802 → 814 passed, 1 skipped` (+12: render dip/flex, byte-identical guard, monotone grant,
+  discrimination-vs-proxy, floor clamp, single-arc invariance, …); UI backend `354 passed` (imports unchanged).
+
+### 2026-06-21 — novel-task objective metric no longer false-rejected ("run continues blind"): L0 non-degeneracy gets a goal-agnostic selectivity probe
+
+- **What** (`sculptor/eval/metric_validate.py`): a CORRECT auto-generated metric for a NOVEL task (Sam ran "touch your
+  toes then stand back up" → `g1-toe-touching/metrics/gen_001`) was rejected with "near-constant metric (spread 0.000) —
+  no signal", so the run continued BLIND. Root-caused (empirically): the metric is fine (a clean
+  `completion_gate·min(channels)`: pelvis dip-and-return + hip/knee ROM + upright-at-ends + no-travel veto), but the L0
+  non-degeneracy gate only has goal-appropriate POSITIVE archetypes for 5 hard-coded families (kick/floss/jump/
+  locomotion/cartpole). For `family=None` NONE of `_archetypes()` performs the goal (nothing dips the pelvis), so the
+  metric scores ALL 12 archetypes 0.000 → false-reject. The gate was conflating "is the metric SELECTIVE" (L0's job)
+  with "does it match the GOAL" (calibration's job). FIX: when `family is None` AND every archetype is ~0
+  (`_BATTERY_NEAR_ZERO`), defer to a new `_selectivity_probe(fn, meta)` — a deterministic, OFFLINE, hand-rolled
+  competent-vs-degenerate probe SET (upright dip-and-return + ROM, a non-upright posture arc; vs still + fallen). PASS
+  vacuously (`nondegeneracy_vacuous=True`) iff the metric separates a competent probe from the degenerates by
+  `spread_min`; else reject. Hand-rolled because `render_rung`'s `base_height_m` is a monotone `_ramp` and CANNOT express
+  a dip-and-return.
+- **Why**: the gate's fixed battery can't represent an arbitrary novel goal; adding more hard-coded families doesn't
+  generalize. L0 should only enforce non-degeneracy; task-VALIDITY (goal-match) is the task-derived calibration
+  firewall's job (`run_manager.steer_allowed` reads `meta.calibrated`, set only by `grant_decision` — an accepted-but-
+  uncalibrated metric only OBSERVES, never steers). So the safe fix is to stop L0 over-reaching and let the metric reach
+  calibration.
+- **How**: designed via a multi-agent workflow (map → 5 diverse methods → reconcile). Chosen method = "L0 self-scoping
+  vacuous-pass + calibration firewall" (NOT an LLM-at-validate-time, which would break the offline/deterministic
+  validate hot path + the 3× generate loop; NOT a render_rung rewrite). Improved on the plan: a probe SET (not a single
+  probe) spanning upright + non-upright postures so non-upright novel skills (roll/bow/crawl) also pass, with `still`+
+  `fallen` degenerate probes that catch uprightness-/still-/fall-rewarders. Scoped to `family is None` → all 5 families
+  byte-identical (their positive archetype lights up → battery never "uninformative").
+- **Verified**: real `gen_001` toe-touch metric now PASSES (`ok=True`, `nondegeneracy_vacuous=True`, probe competent
+  0.833 vs degenerate 0.000). Hole stays closed: all-zero → rejected (probe non-selective); still/uprightness/fall
+  rewarders → rejected (they light up the fixed battery, never reach the vacuous branch). Family path byte-identical
+  (kick metric → `nondegeneracy_vacuous=False`). Firewall confirmed: no run_manager change — a vacuous-pass metric stays
+  observe-only until calibrated. Sculptor **802 passed / 1 skipped** (+4 tests), UI backend **354 passed**.
+- **KNOWN FOLLOW-ON (for STEERING, not blocking observe)**: a dip-and-return novel task (toe-touch/squat) is now
+  accepted + OBSERVED, but to earn STEER-rights it must rank a task-derived competence ladder — and `render_ladder`/
+  `render_rung` ALSO can't render a pelvis dip-and-return, so calibration would find no separation → observe-only. Full
+  steering for fold/squat/sit-to-stand tasks needs a `render_rung` "fold/return" primitive (`MotionSpec` field +
+  renderer + the ladder-author prompt) — a separate increment with broader blast radius (calibration for all tasks).
+
+### 2026-06-20 — reports: per-motor actuator-limits charts (finished + live) + adversarial review of the whole uncommitted diff (3 defects fixed)
+
+- **What** — (C) finished the reports feature, then reviewed the entire uncommitted tree:
+  - **Reports (body C, complete)**: `sculptor/adapters/realism.py::actuator_limits_report(trajectory, limits)` returns
+    per-motor SPEED (vs the real `velocity_limit`, always) + TORQUE (vs `effort_limit`, when `joint_torque` present),
+    all JOINT-aligned (speed←`joint_vel`, torque←`joint_torque`=`qfrc_actuator`, limits←name-keyed maps); `_mjlab_runner`
+    persists `joint_torque` (qfrc_actuator, sliced by the SAME `joint_v_adr` as `joint_vel` → aligned). Backend
+    `GET /projects/{slug}/reports/actuator-limits?iter=N` (`backend/routes/reports.py`) + `sculptor_bridge` passthrough;
+    frontend `ActuatorLimitsCard.tsx` (recharts horizontal util-% bars, 100% ReferenceLine, color-by-util, iter `<select>`)
+    wired into `ReportsTab.tsx`.
+  - **Review fixes (3 confirmed by a 6-lens adversarial workflow → verify → reconcile; 12 raw → 3 real)**:
+    1. `metric_gen.py::_review_metric` (the PRODUCTION single-reviewer path — sculptor_bridge/CLI never pass
+       `review_models`) discarded `gaming_exploit`, so the "named-exploit-but-approved can never slip through" invariant
+       only held on the unused panel path. Added the same coercion `_review_one` has.
+    2. `realism.py::naturalness_channel` hard-rejected on the joint-AVERAGED `joint_limit_violation_frac` → a single-joint
+       limit exploit on a 29-DOF G1 dilutes to ~frac/J < the 1% gate. `audit_rollout` now also emits
+       `joint_limit_violation_max` (per-joint worst); the channel thresholds THAT (mean-key fallback keeps older audit
+       dicts / direct test injection no-op + never-raise).
+    3. `ActuatorLimitsCard.tsx` flashed blank on iter-switch (new query key, no `placeholderData`) → added
+       `placeholderData: (prev) => prev` so the card + `<select>` stay mounted while the new iter loads.
+- **Why**: the prior window left the reports feature in-progress and a large uncommitted diff (kick metric, actuator
+  enforcement, full metric-quality-laws build) unreviewed. Both review MEDIUMs are real semantic gaps where the code's own
+  docstring promised an invariant the live path didn't enforce — exactly the high-cost failure modes (a wrongly-approved
+  metric / a limit-exploiting iter winning "best") the build exists to prevent; the correct guard already existed one
+  function over (1) or as an unused audit field (2).
+- **How**: REVIEW-FIRST verification of every load-bearing fact against installed source — actuator vel/effort maps match
+  mjlab `g1_constants`/`go1_constants` EXACTLY; `DcMotorActuatorCfg` swap fields valid + `EntityArticulationInfoCfg`
+  non-frozen (swap genuinely applies); `qfrc_actuator` is a real EntityData prop sliced by `joint_v_adr` (report torque
+  alignment holds); `mjcf_limits.json` carries 29 joint_names; all card CSS vars + the `trending-up` icon exist. The Go1
+  velocity-map asymmetry and the `best_fitness`-shows-steer-value findings were adversarially REFUTED as intended/tested
+  design, not fixed (no scope creep). Surgical fixes mirror existing patterns; both MEDIUMs got a new regression test
+  pinning the previously-untested path (high-DOF single-joint exploit; single-reviewer named-exploit reject).
+- **Verified**: sculptor suite **798 passed / 1 skipped** (+2 new tests), UI backend **354 passed**, frontend
+  `tsc -b --noEmit` clean. Backend restarted (no active sculpt run) → `/health` 200 and
+  `/projects/g1-kick-v7/reports/actuator-limits` 200 returning `ok:true, has_torque:false, iter:11, 29 motors`,
+  per-joint limits name-resolved, **worst speed util = knee 0.57 (11.5/20 rad/s)** — every motor within its real
+  no-load speed, the chart's whole point (the DcMotor enforcement working: knee 11.5 ≪ the pre-fix 43–73). Unknown
+  project → 404.
+
+### 2026-06-20 — actuator-limit enforcement: research-standard torque-speed (no-load-speed) model for every robot (flag-gated, default ON)
+
+- **What** (`sculptor/adapters/_mjlab_runner.py` + `.env.example`): the root fix for the unphysical
+  kicks. mjlab's robot configs use `BuiltinPositionActuatorCfg`, which structurally DROPS each motor's
+  `velocity_limit` (no-load speed), so the sim clamped torque but never velocity → a policy drove joints
+  2–3.7× past the real limit. mjlab already ships the research-standard fix — `DcMotorActuator` (a port of
+  Isaac Lab's DCMotor torque-speed model, Rudin et al. 2022 / legged_gym): available torque falls linearly
+  to ~0 at the no-load speed (motor back-EMF). New guarded `_enforce_actuator_limits(env_cfg)` swaps every
+  `BuiltinPositionActuatorCfg` → `DcMotorActuatorCfg`, re-supplying `velocity_limit` recovered from the
+  joint patterns (`_ACTUATOR_VELOCITY_LIMITS`, cited from mjlab's g1_constants/go1_constants — knee 20,
+  hip_pitch 32, arms 37, Go1 calf 20.06, …) + `saturation_effort = effort_limit` (conservative triangular
+  envelope). Called in BOTH train and rollout (same env_cfg) so the policy trains under — and is evaluated
+  under — the constrained physics. Modeled on the `_apply_ground_texture` precedent (fully defensive: any
+  unrecoverable group is left unchanged + warned; never breaks a run).
+- **Why**: Sam's request — enforce the limits correctly for every actuator on every robot, the most
+  research-acceptable way (his SEA-actuator domain). The naturalness gate (prior entry) only DISCOURAGES
+  exceeding the limit after the fact; this prevents it at the source.
+- **How**: researched + designed via a 3-lens + reconcile workflow (literature → confirmed the DCMotor
+  torque-speed model is the field standard, rejecting hard qvel clamp + actuator nets; mjlab API → it
+  already ships DcMotorActuator, so it's CONFIGURE-ONLY, no per-step clamp; integration → the
+  ground-texture seam). Gated by `RS_ENFORCE_ACTUATOR_LIMITS` — **default ON (Sam's call 2026-06-20)**;
+  set to 0 to recover the old velocity-unconstrained physics.
+- **Verified**: (1) offline swap correct — all G1 + Go1 groups → DcMotor with the right velocity_limit,
+  flag-OFF a clean no-op. (2) **GPU cap holds**: under a hard scripted action the G1 knee \|vel\| p99 drops
+  **45.4 → 23.6 rad/s** (real limit 20; the small overshoot is correct momentum coast), env builds+steps
+  with DcMotor, no NaN. (3) **Go1 regression**: trains sanely with enforcement on (2/2 groups swapped,
+  velocity-tracking error 0.02–0.11, checkpoint written). Sculptor suite **794 passed / 1 skipped** (+1
+  offline swap test).
+- **RISKS**: physics is now strictly harder (lower early return, slower convergence — expected); a policy
+  trained under the OLD physics must be **re-trained, not warm-started**. A fresh g1-kick run will now
+  produce realistic ~20 rad/s kicks instead of 43–73.
+
+### 2026-06-20 — kick metric fixes A+B (from the live g1-kick-v6 run): naturalness per-joint velocity + forward-foot excursion gate
+
+- **What** (Sam ran g1-kick-v6 live; two real findings — the video was already 1× real-time, the kick was
+  genuinely too fast because the sim discards the motor velocity_limit):
+  - **Fix A** (`sculptor/adapters/realism.py`): new `joint_velocity_limit(name)` carries the REAL G1 motor
+    no-load speeds from mjlab g1_constants (knee/hip_roll 20, hip_pitch/yaw/waist_yaw 32, arms 37, wrist
+    22 rad/s), keyed by COMPOUND tokens so non-G1 joints (Go1 `FL_hip`) fall to the nominal 30 → byte-
+    identical fence. `audit_rollout` computes `joint_vel_limit_max_ratio` (worst velp99 ÷ real limit, over
+    joints with a known limit) and `_verdict` OR's it in (severe ≥1.5×, mild ≥1.0× — never replacing the
+    torque/nominal terms; default 0.0 → byte-identical). `naturalness_channel`: **mild now down-weights
+    steer ×0.75** (`_NAT_MILD_STEER_FACTOR`, was 1.0). `sculpt.detect_goodhart_onset` reason reworded
+    (mild now counts as "less natural").
+  - **Fix B** (`sculptor/eval/spec_metrics.py`): the kick completion gate now requires a GENUINE forward-
+    foot excursion — new `_swing_foot_forward_excursion` (shared raw foot-peak kernel `_foot_anterior_peaks`
+    refactored out of `_forward_kick_direction`) × a sharp gate (center 0.20 m). Degrades to 1.0 (no veto)
+    when both foot channels absent → the footless calibration ladder + leg-only callers BYTE-IDENTICAL.
+    `metric_calibration._kick_foot_swing` raised 0.30→0.40 m so `competent_ref` stays 0.78 (≥0.75 gate).
+- **Why**: live run showed standing-with-mild-leg-motion scored 0.22–0.27 (loop kept reverting to it) and
+  the "best" kicks hit knee velp99 43–73 rad/s = 2–3.7× the real 20 rad/s no-load speed (the audit's
+  generic 30 nominal only flagged the single worst iter). Root cause: mjlab declares per-actuator
+  velocity_limit but never passes it to the sim actuator (a separate physics task — see below).
+- **How**: design REVIEWED (GO_WITH_CHANGES → full punch-list acted on): compound tokens (Go1 byte-identical),
+  per-joint term OR'd (not replacing), competent-ref re-amplified, shared foot-peak helper, onset reason +
+  tests. Verified on the v6 data: standing 0.22–0.27 → **0.05–0.07** (separation 1.4×→7.4×); all four
+  violent kicks (6/8/9/10) now **severe** (ratio 2.5–3.7×) → steer ×0.5; standing iters stay `ok`;
+  competent_ref 0.776.
+- **Verified**: sculptor suite **793 passed / 1 skipped** (+4 tests: mild ×0.75, G1 velocity map + Go1
+  fallback, verdict byte-identical, onset-on-mild); UI backend **351 passed**.
+- **NOTE — deeper physics fix (separate, pending Sam's go-ahead):** the sim never enforces velocity_limit
+  (it's metadata dropped before the actuator); Fix A only DISCOURAGES exceeding it after the fact. The
+  root fix = swap mjlab `BuiltinPositionActuatorCfg`→`DcMotorActuatorCfg` (the torque-speed/no-load-speed
+  model mjlab already ships) for every robot. Researched + designed; changes training dynamics, so flagged
+  for approval before implementing.
+
+### 2026-06-19 — #11 (partial): local-GPU smoke confirms the foot-data plumbing path LIVE
+
+- **What**: ran a short G1 train + rollout on the RTX 5070 (WSL2, no RunPod, no API) —
+  `python -m sculptor.adapters._mjlab_runner train --task-id Mjlab-Velocity-Flat-Unitree-G1
+  --num-envs 512 --max-iterations 5 ...` then `... rollout --checkpoint-path .../checkpoint.pt
+  --n-episodes 4 --max-episode-steps 150 ...` (WANDB_MODE=disabled). Inspected the resulting
+  `trajectory.npz` + scored `spec_g1_kick` on it.
+- **Verified LIVE (the GPU-only paths #5 introduced)**:
+  - `left_foot_pos_b`/`right_foot_pos_b` (T,E,3) + `left/right_foot_contact` (T,E) PRESENT, finite,
+    non-zero in `trajectory.npz` from a real GPU rollout — the build-log "live npz population pending
+    GPU smoke" item is now CONFIRMED.
+  - pelvis-frame transform sane: foot anterior-x varies over the gait; foot z-mean −0.73 (below
+    pelvis); `joint_names` n=29 aligned with the buffer width.
+  - `spec_g1_kick` runs live on real 29-DOF GPU arrays with the DIRECTION channel active (foot data
+    present, not abstained) and scores a non-kicking velocity walker **0.0201** — the completion gate
+    (no sagittal-leg launch burst) floors it ~0.06 despite moderate quality channels (intensity 0.34 /
+    amplitude 0.65 / direction 0.63). Live proof that LAW 1's completion gate owns the floor.
+- **NOT done (needs Sam — no API key in this WSL env + no on-disk g1-kick project, only `hopper`)**:
+  the headline kick discrimination on a TRAINED policy (a real forward kick scores high; live
+  one-leg-balance / kick-behind below floor) + the live **#7 steer-gate** and **#10 Goodhart-onset**
+  firing across loop iterations. These need the LLM loop (diagnose/edit) + the g1-kick project + GPU
+  spend. Runbook handed to Sam; the offline test suite already pins the metric's discrimination of those
+  hacks (the deterministic kick archetypes), so this is end-to-end loop confirmation, not new logic.
+
+### 2026-06-19 — Ship 55 (#9): VLM metric-review Panel A — diversified, blinded multi-model review panel
+
+- **What** (`sculptor/eval/metric_gen.py`, library-only):
+  - `MetricReview` += `gaming_exploit: str = ""` (a constructive exploit a reviewer names; non-empty
+    forces a reject — no "named exploit but approved" contradiction). Backward-compatible default.
+  - `REVIEW_PANEL_MODELS = (opus-4-8, sonnet-4-6, haiku-4-5)` — the repo's FIRST multi-model surface;
+    MODEL-ID diversity as the single-vendor "cross-family" substitute. `_LENSES` = 5 focus appendices
+    (completeness / measurability / over_restriction / consistency / naturalness) layered on the
+    `review_objective_metric` rubric; naturalness is the VLM lens.
+  - `_reviewers_from_models(models, author)` round-robins the lenses over the pool MINUS the exact
+    author id (blinding, Panickssery self-preference). `_review_one(...)` = one reviewer: VLM lens with
+    keyframes builds image content via `diagnose._encode_image`, no keyframes → SKIP; a crash → `error`
+    (no-evidence, never a veto); cache_control on the rubric system prefix.
+  - `_review_metric_panel(...)`: aggregate = `(n_eligible>=1) and (n_approve>=ceil(n_eligible/2)) and
+    not vetoed`, where any returned reject vetoes and CRASHES count AGAINST quorum (don't shrink the
+    denominator) — so a lone survivor can't carry the panel and an all-fail panel is fail-closed. The
+    no-keyframe VLM skip is excluded from `n_eligible`. Returns `review` (EXACTLY {approved,concerns,
+    summary} — the UI contract) + sibling provenance (`panel`, `veto_by`, `quorum`, ...). Veto / quorum
+    miss is prepended to `review.concerns` with the (model, lens) named (never-silent).
+  - `generate_objective_metric(..., review_models=None, review_keyframes=None)`: None → the unchanged
+    single-reviewer path (BYTE-IDENTICAL); a list → the panel. New `review_panel` record key (provenance);
+    `review` key unchanged.
+- **Why**: LAW 9 / Panel A — a single LLM reviewer self-prefers and misses gaming vectors; a disjoint,
+  diversified jury with a constructive-exploit veto is the gate between "passes offline axioms" and
+  "trusted." Sam approved the API cost.
+- **How**: design REVIEWED (GO_WITH_CHANGES → acted on the full punch-list): fixed an unsound quorum
+  (thin-survivor false-accept), pinned `review` to exactly {approved,concerns,summary} (provenance in
+  `review_panel`), made the VLM lens text-only-skip at gen-time (keeps the image path for a future
+  POST-rollout re-review), excluded the exact author id. **Shipped LIBRARY-ONLY** — the UI flag wiring
+  is deferred (the VLM lens cannot fire pre-rollout, so a launch-gen text panel buys little; it lands
+  with the post-rollout re-review caller).
+- **Verified**: sculptor suite **789 passed / 1 skipped** (+10 in `tests/test_generated_metric.py`: an
+  extended `_PanelClient` mock routes (model,lens)→verdict + detects image blocks; tests pin
+  byte-identical dispatch, exact `review` keys, one-lens veto, named-exploit reject, all-crash & thin-
+  survivor → not approved, VLM skip vs image-use, blinding). UI suite untouched.
+
+### 2026-06-19 — Ship 54 (#4): adversarial archetype scope — default ON + spec_* surface + kick hack rungs + per-channel coverage
+
+- **What**:
+  - `sculptor/eval/metric_calibration.py` — (1) `adversarial_archetype_gate` gains
+    `required_losers` + `scored_channels`: deterministic gaming probes are scored in their OWN
+    guarded loop that runs REGARDLESS of the LLM-author outcome (author fail/echo/leak no longer
+    early-returns past loser scoring), with `inject_joint_roles` applied per loser; per-channel
+    `coverage`/`coverage_gaps` recorded (a gap is a FLAG, never a deny). With both args unset the
+    function is BYTE-IDENTICAL to Ship 53. (2) new `kick_required_losers(joint_names, goal,
+    robot_hint)` — the documented g1-kick-v5 hacks (partial / whip-and-fall / active_kick_behind /
+    one_leg_balance) rendered WITH `left/right_foot_pos_b` (the direction channel `render_rung`
+    can't render), name-parameterized via `LEG_SAGITTAL_*` + a left filter, frame-scoped
+    CONSERVATIVELY (the rear-direction + one-leg losers DROP on an ambiguous frame — mule/spin/
+    roundhouse/"balancing on one leg" — LAW 0). (3) new `adversarial_archetype_gate_spec(builtin,
+    goal, …)` — the surface that runs the gate on a HAND-AUTHORED `spec_*` metric (the gate never
+    ran on `spec_g1_kick`, the metric that scored v5); competent_ref pinned to a deterministic
+    forward kick (≈0.78); audit_only. (4) `calibrate_task_derived` gains opt-in
+    `adversarial_required_losers` (default OFF → byte-identical; ON injects the kick losers for a
+    novel KICK-VARIANT task only).
+  - `reward-sculptor-ui/backend/services/run_manager.py` — flipped `RS_ADVERSARIAL_ARCHETYPES`
+    DEFAULT **ON** (high-stakes only); added an AUDIT-ONLY adversarial probe of the built-in
+    `spec_*` ground truth a generated metric calibrates against → streams a `metric_spec_audit`
+    event; NEVER revokes the fence. `sculptor_bridge.py` — `has_spec_audit` + `audit_builtin_spec_metric`
+    passthroughs. Backend test conftest forces the flag OFF in unit tests (no network); two new
+    seam tests (on/off).
+- **Why**: LAW 9 — `spec_g1_kick` was hand-authored, never adversarially tested; the L3 gate was
+  flag-OFF AND generated-only, so it never ran on the metric that reward-hacked v5. Close that.
+- **How**: REVISED by a 4-lens adversarial-review workflow (verdict REVISE → acted on the full
+  punch-list): kept kick-losers SPEC-ONLY + opt-in (auto-injecting into the generated path broke 3
+  tests, not 1); restructured the gate so losers score independent of the author; conservative
+  high-confidence frame gating; corrected competent_ref 0.88→measured 0.78 (pinned in CI); added an
+  OLD-form direction-blind fixture to regression-lock the teeth. Data-availability gap (live foot_pos_b)
+  is closed by #5's adapter plumbing, not the gate; sideways kicks are covered by the metric
+  (anterior-x direction), not a loser.
+- **Verified**: sculptor suite **779 passed / 1 skipped** (was 768; +11 new in
+  `tests/test_task_derived_calibration.py`); UI backend suite **351 passed** (added 2 audit-seam
+  tests; the autouse no-network fixture cut the run 389s→2.5s for the touched files). Numbers
+  empirically pinned: competent fwd kick 0.7816, all losers ~0 < ceiling 0.469; OLD-form rear ==
+  competent 0.798 → flagged; GOOD_KICK rear 0.632 with role injection (0.0 without).
+
+### 2026-06-19 — Ship 54-pre (#12): deterministic shaping↔metric PARTITION GATE at the reward-edit commit point
+
+- **What**: new `RewardSculptor/sculptor/eval/partition_gate.py` (pure, offline, no LLM/IO) +
+  wiring into `edit.py`, `spec_metrics.py`, `generated_metric.py`, `sculpt.py`. The gate fires
+  ONLY when an objective metric steers a run. Three pieces:
+  (1) `screen_edits()` — NON-BLOCKING pre-LLM flags: a proposed edit that touches a held-out
+  metric observable (alias map `qvel→joint_vel`, `left_foot_swing_speed→joint_vel`,
+  `base_height→root_link_pos_w`, `fallen→projected_gravity_b`, per-foot `*_pos_b`/`*_contact`
+  identity, etc.) OR lowers/removes a completion-gate hparam. Flags are injected into a
+  self-contained `# METRIC_PARTITION` editor-prompt block + the CHANGELOG + a `partition_gate`
+  event; the edit STAYS applicable. (2) `gate_threshold_regressions()` — the ONE HARD gate, in
+  `_post_validate` inside the validation try (after schema/grounding checks, before the atomic
+  rename): a same-named, positive-valued, numerically-LOWERED completion-gate hparam (REJECT
+  lexicon = gate/completion/qualif/require…) raises `EditValidationError` → existing retry-once
+  → the iter drops the edit. REMOVED/rename/ambiguous-FLAG-lexicon (floor/min/threshold/cycle)/
+  sign-ambiguous lowerings are ADVISORY (stderr only, never raise). (3) `metric_observables(spec)`
+  in spec_metrics + `_generated_metric_observables()` in generated_metric attach
+  `fitness_fn.metric_observables`; `sculpt._run_one_iter` passes it to `apply_edits`
+  (`metric_observables=getattr(fitness_fn, "metric_observables", None)`). New
+  `tests/test_partition_gate.py` (36).
+- **Why**: the REAL g1-kick-v5 root cause was EDITOR whack-a-mole — over 21 iters it lowered a
+  completion/qualification gate (kick_cycle_weight 1.0→0.3 + gate-threshold lowering) and added
+  farm-able reward terms that rewarded the metric's own signal, so the metric climbed while the
+  behavior degraded. The prior ships (#1/#2 spec rebuild, #10 Goodhart-onset) hardened the
+  METRIC; nothing guarded the REWARD-EDIT step where v5 actually broke. This is the load-bearing,
+  LLM-free, offline slice of the deferred "Panel B" — an LLM reward-edit review can layer on later.
+- **How**: design was put through a 4-lens adversarial review (false-positive / wiring / completeness
+  -vs-v5 / efficacy) + reconcile, which RE-SCOPED the first cut: (a) NOTHING pre-LLM rejects an edit
+  — a pre-LLM drop re-introduces the 2026-04-23 loop-freeze and is bypassable by the free-form
+  rewriter; the single hard gate is post-LLM. (b) REJECT lexicon restricted to UNAMBIGUOUS
+  completion-gate roots; direction-ambiguous roots (floor/min/threshold/cycle — `kick_cycle_weight`
+  itself) are FLAG-only, never hard-failed (avoids false-positives on `gait_cycle_freq`,
+  `contact_threshold`, `min_torque`). (c) rename≠removal and non-positive/parse-fail values are
+  advisory, never raise (freeze guard). Token-matched on the snake_case split (not substring) so
+  `terminated` never hits the lexicon. The implementation was then put through a 2-lens impl review
+  (wiring/blockers + false-positive/byte-identical) + reconcile → GO, no defects. DEFAULT
+  BYTE-IDENTICAL: `metric_observables` is None/empty (gym_sb3, blind runs, `apply_prompt_edit`,
+  cartpole's empty observable set) → no screen, empty `partition_block` (identical prompt bytes),
+  no regression check, no side-file. KNOWN UNCOVERED (documented residual risk): an inline-literal
+  gate lowered in the `compute_reward` body (not in `REWARD_SPEC.hyperparameters`) the dict-diff
+  can't see; a farm-able ADDED term (flag + prompt warning only, not post-write-enforced).
+- **Verified**: `tests/test_partition_gate.py` 36 passed (unit: gate_kind/observable_of/screen_edits/
+  gate_threshold_regressions incl. the v5-fix + rename freeze-guard + sci-notation + sign cases;
+  e2e via stub-LLM apply_edits: completion-gate lowering REJECTED, gate-raise COMMITS + writes
+  partition_gate.json, rename does NOT freeze, METRIC_PARTITION block present iff metric set,
+  empty-frozenset byte-identical). Full sculptor suite **768 passed, 1 skipped (jax)** (was 732;
+  +36). Live GPU end-to-end deferred to #11.
+
+### 2026-06-17 — fix: a RESUMED run no longer shows the prior run's iterations as RUNNING
+
+- **What**: two backend-only changes in `reward-sculptor-ui/backend/services/run_manager.py`.
+  (1) The fs watcher's boot pre-scan `_scan_once` (which EMITTED `iter_started`/
+  `edit_applied` for every on-disk `iter_<n>`/`v<n>.py`) is replaced by a no-emit
+  `_preseed_seen` that just POPULATES the dedup sets (seen_iters / seen_iter_done /
+  seen_rollouts / seen_realism / seen_rewards; seen_citations transitively via
+  seen_rewards) from what's already on disk at run start — keyed on artifact VALIDITY
+  (mp4 >2048B, parseable diagnosis/realism JSON), not mere dir existence. (2) `_iter_events`
+  now reconciles a stranded lower iter: in a sequential loop only the highest-started iter
+  can still be running, so any lower iter still "running" (a dropped stdout line / crash-
+  then-resume) is coerced to completed. New `backend/tests/test_run_resume_state.py` (3).
+- **Why**: on a RESUMED run (or any run on a project with prior `iter_<n>` dirs) the UI
+  showed ALL previous iterations as RUNNING simultaneously, forever — Sam's long-standing
+  "the left gets all screwed up… displays all the previous ones as running at the same
+  time." Root cause: the fs watcher emitted `iter_started` (source=fs) for every on-disk
+  iter dir, but `iter_completed` only ever comes from the LIVE subprocess stdout for the
+  iters it actually runs (>= start_iter) — so prior iters got a "started" with no matching
+  "completed" and hung running. Verified live: before, GET /runs/{id} returned 12 iters
+  with 0-8 all `running`; after the fix + re-resume, it returns only the current run's
+  iters (e.g. `[(11,'running')]`), zero stale. The same FS over-emit also re-applied prior
+  edits/citations/realism chips — all fixed by the pre-seed.
+- **How**: the live subprocess stdout re-emits iter_started/iter_completed for the resumed
+  range, and the `awatch` loop catches anything CREATED during this run (incl. a fresh
+  run's iter_0 written after the seed), so the watcher now reports ONLY this run's state.
+  Investigation (2-agent workflow) confirmed all six `seen_*` leak points are covered by
+  the pre-seed and ZERO existing tests break (the watcher tests all drive emits through a
+  monkeypatched fake run_sculpt_job; none exercise `_scan_once` with pre-created dirs).
+  Backend-only — the frontend derives the card badge straight from the backend `it.status`.
+- **Verified**: `backend/tests/test_run_resume_state.py` (3) + full backend suite; live
+  end-to-end on g1-kick-v5 (resumed from iter 11 after the stop-fix-resume, panel clean).
+  NOTE: a resumed run's panel now shows only THAT run's iters (start_iter onward) — the
+  full cross-run history lives in metric_history / the CHANGELOG. Separate open item Sam
+  raised: a "New Run" on a previously-run project always `--resume`s (never restarts at 0);
+  offering an explicit fresh-vs-resume choice is a follow-up.
+
 ### 2026-06-15 — Ship 53: adversarial gaming archetypes (L3)
 
 - **What**: generalize Ship-47's HARD-CODED walker/flail negatives to ANY task.
@@ -353,7 +1119,8 @@ Start the next entry below this line.
   (competent_ref = max top-rung score across valid sources). The verdict is
   recorded under `calibration.adversarial` (provenance hashes + per-archetype
   scores → meta.json) regardless. Backend: `RS_ADVERSARIAL_ARCHETYPES` (default
-  OFF) threaded sculptor_bridge→metric_store→run_manager; `metric_calibration_done`
+  OFF at Ship 53; **flipped ON for high-stakes at Ship 54 / #4**) threaded
+  sculptor_bridge→metric_store→run_manager; `metric_calibration_done`
   now emits `adversarial_ran`/`gameable`. Tests: 8 in
   `test_task_derived_calibration.py` (`_FakeBothClient` branches on output_format).
 - **Why**: L0-L2 prove a metric ranks competence, but a metric can still be

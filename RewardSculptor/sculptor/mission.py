@@ -22,12 +22,21 @@ import dataclasses
 import datetime as _dt
 import json
 import re
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Optional
 
 
 SCHEMA_VERSION = 1
+
+# §start_pose: the physical configuration the robot is in at a stage's
+# episode start. None = legacy/unspecified (older mission.json files, or
+# a decomposer that omitted the field) — treated as "no opinion", NOT as
+# "standing"; the force-rule below only fires on an EXPLICIT non-standing
+# value, never on None.
+START_POSE_VALUES: frozenset[str] = frozenset(
+    {"supine", "prone", "sitting", "crouched", "standing"})
 
 # Valid Stage names: snake_case identifier, ≤ 32 chars. Used as the
 # reward-component-namespace prefix, on-disk subdirectory name, and
@@ -37,8 +46,16 @@ _STAGE_NAME_RE = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 # Stage lifecycle. "pending" = awaits orchestrator; "training" = sculpt_run
 # in-flight; "succeeded"/"failed" = terminal. "skipped" is reserved for
 # Ship 17's fail-through behavior (a failing stage whose successors still
-# try to run from scratch).
-StageStatus = Literal["pending", "training", "succeeded", "failed", "skipped"]
+# try to run from scratch). "superseded" (mission-persistence increment 1):
+# terminal, never runnable — the stage was replaced by re-decomposition
+# children but is RETAINED in `mission.stages` (rather than spliced out)
+# so its trained iterations stay visible in every UI view / report. A
+# superseded stage is permanently excluded from the runnable chain: the
+# orchestrator's while-loop never executes it, and downstream parent
+# references are always re-pointed past it to the last child.
+StageStatus = Literal[
+    "pending", "training", "succeeded", "failed", "skipped", "superseded",
+]
 
 # Matches the existing reward-prompt endpoint's char bounds so a stage's
 # seed prompt drops into `apply_prompt_edit` without adjustment.
@@ -89,6 +106,99 @@ class Stage:
     # the uniform mission metric. Backward-compatible: older mission.json
     # without it load with steering_metric=None via from_dict's filter.
     steering_metric: Optional[str] = None
+    # §JUMP_SCAFFOLD: DeepMimic-style reference-state initialization for
+    # hard-exploration stages (jump launch/flight/landing). When true the
+    # orchestrator derives a validated train-only RSI curriculum from a
+    # reference clip (project clip if present, procedural jump otherwise)
+    # and applies it to this stage's env spec before training. Backward-
+    # compatible: older mission.json load with False via from_dict.
+    needs_reference_rsi: bool = False
+    # §R1_BUILD_SPEC decision 10: the reference-library clip (if any)
+    # ATTACHED to this stage via `POST .../stages/{stage}/reference` —
+    # distinct from `needs_reference_rsi` (which only says the stage
+    # WANTS an RSI curriculum; the orchestrator falls back to the
+    # procedural jump clip when no library clip is attached).
+    # `reference_clip_id` is the library clip id (`sculptor.refs.library`
+    # clip_id charset); `reference_tier` mirrors that clip's provenance
+    # `tier` at attach time (cheap display without a second lookup);
+    # `reference_match_confidence` carries the retrieval match_confidence
+    # from `refs.retrieve.search` when the clip was attached via a
+    # search result (None for a manual/direct attach, or when the
+    # deterministic-only layer produced the match). None on stages with
+    # no reference attached. Backward-compatible: older mission.json
+    # without these keys load with None via from_dict's filter-unknown-
+    # keys path, same guarantee `needs_reference_rsi` already relies on.
+    reference_clip_id: Optional[str] = None
+    reference_tier: Optional[str] = None
+    reference_match_confidence: Optional[float] = None
+    # §D24 F1 (docs/internal/REFERENCE_BUILD_LOG.md D23/D24): the goal-
+    # aligned SUB-SPAN of `reference_clip_id`, selected by
+    # `sculptor.refs.spans.select_reference_span`. D23 diagnosed a live
+    # zero-fitness regression when a stage's goal is a strict sub-phase
+    # of a longer attached clip (e.g. "sit up" is a sub-phase of a full
+    # lying-to-standing get-up) and certification/RSI/eval-reset all ran
+    # against the FULL clip — a physically correct sit-up scored zero
+    # because passing certification against the full clip's own
+    # truncation negatives REQUIRED zeroing exactly that motion.
+    # `reference_span_start_s`/`_end_s` are the snapped-and-QC'd crop
+    # window (seconds, clip-relative); `reference_span_confidence` is
+    # the LLM's reported confidence in [0, 1]; `reference_span_method`
+    # is `"llm+snap+qc"` (see `select_reference_span`'s docstring) or
+    # None. All four are None together whenever no span applies: no
+    # `reference_clip_id` attached, the goal covers the whole clip, or
+    # selection was declined (low confidence / failed mechanical or
+    # end-state QC / LLM unavailable) — a None span means "use the FULL
+    # clip", never a partial/garbage crop.
+    # §D24 W5 hardening (docs/internal/REFERENCE_BUILD_LOG.md): ONE
+    # narrow exception to "all four None together" — when selection was
+    # ATTEMPTED and SEMANTICALLY declined (whole_clip / low_confidence /
+    # qc_reject — see `sculptor.refs.spans.is_semantic_decline`),
+    # `reference_span_method` alone is set to `"declined:<reason>"`
+    # (start/end/confidence stay None) so the decompose-time attach path
+    # and `mission_metrics`'s lazy backfill never re-fire a real LLM call
+    # on a stage that already reached this verdict. An INFRA failure
+    # (llm_unavailable/parse_error/invalid_clip/signature_error) leaves
+    # `reference_span_method` at None (the true "all four None" case) so
+    # a transient failure IS retried on the next pass. Consumers that
+    # need "does a span apply" must keep checking `reference_span_start_s
+    # is not None` (unaffected — `load_stage_reference_clip` only ever
+    # crops when the start/end fields are set). Every consumer of
+    # `reference_clip_id` MUST resolve it through
+    # `sculptor.mission_metrics.load_stage_reference_clip` (the one
+    # loader) rather than cropping independently — §D19's "every
+    # clip-shape assumption in ONE place" rule. Redecompose sub-stages
+    # unconditionally inherit `reference_clip_id`/`_tier`/
+    # `_match_confidence` from the failed stage (D21) but NEVER these
+    # four fields — a new sub-goal needs its own span, freshly
+    # (re-)selected against ITS OWN goal text. Backward-compatible:
+    # older mission.json files load with all four None via
+    # `from_dict`'s filter-unknown-keys path.
+    reference_span_start_s: Optional[float] = None
+    reference_span_end_s: Optional[float] = None
+    reference_span_confidence: Optional[float] = None
+    reference_span_method: Optional[str] = None
+    # §start_pose: the physical configuration the robot is in at THIS
+    # stage's episode start. One of `START_POSE_VALUES` (supine, prone,
+    # sitting, crouched, standing), or None (unspecified — legacy
+    # missions / a decomposer that omitted the field; NOT the same as
+    # "standing", just "no opinion recorded"). Claude sets this in
+    # `decompose_task`/`redecompose_stage` from the mission goal + this
+    # stage's semantics; sub-stages of the SAME mission may carry
+    # DIFFERENT start poses as a get-up motion progresses (e.g.
+    # supine -> crouched -> standing across stages). `validate_mission`
+    # enforces the DETERMINISTIC FORCE RULE: any non-"standing"
+    # start_pose forces `needs_reference_rsi=True` regardless of what
+    # was authored — a non-standing episode start is untrainable
+    # without a reference-derived reset, and prompt compliance on
+    # `needs_reference_rsi` is not trusted on its own (§sculpt.py's
+    # scaffold additionally QCs the ATTACHED CLIP's measured shape
+    # against this value via `sculptor.reference
+    # .check_start_pose_compatibility` — this field only says what the
+    # stage WANTS, not that a compatible clip is actually attached).
+    # Backward-compatible: older mission.json files without this key
+    # load with start_pose=None via `from_dict`'s filter-unknown-keys
+    # path.
+    start_pose: Optional[str] = None
 
     # ── Runtime-populated by orchestrator ────────────────────────────
     status: StageStatus = "pending"
@@ -115,6 +225,29 @@ class Stage:
     # stages that haven't run yet; backward-compatible via Stage.from_
     # dict's filter-unknown-keys path.
     effective_max_iterations: Optional[int] = None
+    # §keep-best finalization (B1): which iteration this stage actually
+    # KEPT as its final policy, and why. The stage no longer finalizes on
+    # the LAST iter — it selects the best iter whose rollout satisfies the
+    # criterion (highest fitness), so a late regression (e.g. a jump stage
+    # that collapses to standing) can't discard the good policy. None on
+    # stages that predate this / haven't run. Backward-compatible via
+    # from_dict's filter-unknown-keys path.
+    selected_iter_index: Optional[int] = None
+    #: "criterion+fitness" | "criterion_newest" | "fitness_fallback" | "last"
+    selection_source: Optional[str] = None
+    # §mission-persistence increment 1: the failure's short reason code
+    # (e.g. "criterion_not_met", "no_checkpoint", "training_errored" —
+    # same vocabulary as `StageResult.failure_reason` /
+    # `_REDECOMPOSABLE_REASONS` in sculpt.py) and its free-form detail
+    # message, persisted onto the stage itself. Previously this only
+    # lived in the ephemeral `StageResult` (mission_runtime.py) and in
+    # provenance.json — never in mission.json — so it was lost the
+    # moment a stage was superseded/spliced-out or the process exited.
+    # None on stages that never failed. Backward-compatible: older
+    # mission.json files without these keys load with None via
+    # `from_dict`'s filter-unknown-keys path.
+    failure_reason: Optional[str] = None
+    failure_detail: Optional[str] = None
 
     def to_dict(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
@@ -363,6 +496,23 @@ def validate_mission(
       * max_iterations ∈ [1, 50].
 
     `info_keys` is the adapter's `expected_info_keys` set.
+
+    §mission-persistence increment 1: a "superseded" stage (retained in
+    `mission.stages` after being replaced by re-decomposition children —
+    see `sculpt._maybe_redecompose_and_splice`) is validated exactly
+    like any other stage. None of the checks above branch on
+    `stage.status`; a superseded stage is structurally unchanged from
+    when it was authored (same name/prompt/criterion/parent), it is
+    simply excluded from the RUNNABLE chain at orchestration time. The
+    one topological rule that matters — no OTHER stage may declare a
+    superseded stage as its `parent_stage` — is enforced not here but
+    by construction: `_repoint_downstream_children` always re-points
+    downstream parents from the superseded name to its last child
+    before the splice is validated, so a lingering reference to a
+    superseded stage's name would already fail
+    `_validate_parent_reference`'s ordinary "must name an earlier
+    stage" check (the name still exists, just structurally orphaned —
+    no consumer is expected to reference it going forward).
     """
     if not mission.stages:
         raise MissionValidationError("mission has no stages")
@@ -414,6 +564,35 @@ def _validate_stage_structure(
                 f"≤128 chars (a spec-metric name or generated-metric path); "
                 f"got {stage.steering_metric!r}"
             )
+    # §start_pose: unknown values are a hard validation error (typos /
+    # LLM drift must not silently pass through as "no opinion" — that
+    # would be indistinguishable from None). A valid, non-"standing"
+    # value that arrives with `needs_reference_rsi=False` is NOT an
+    # error — it is FORCED true here (mutating the stage in place) since
+    # prompt compliance on that separate boolean field is not trusted;
+    # the force is disclosed via `warnings.warn` (this module has no
+    # existing structured-notice channel — `warnings` is the standard
+    # library's own "log/warn without changing the return contract"
+    # mechanism, and `validate_mission` must keep returning None / raise
+    # for every OTHER violation).
+    if stage.start_pose is not None:
+        if stage.start_pose not in START_POSE_VALUES:
+            raise MissionValidationError(
+                f"stage[{idx}].start_pose={stage.start_pose!r} must be "
+                f"one of {sorted(START_POSE_VALUES)} or None"
+            )
+        if stage.start_pose != "standing" and not stage.needs_reference_rsi:
+            warnings.warn(
+                f"stage {stage.name!r} has start_pose="
+                f"{stage.start_pose!r} (non-standing) but "
+                f"needs_reference_rsi=False — forcing "
+                f"needs_reference_rsi=True at validation. A non-standing "
+                f"episode start is untrainable without a reference-"
+                f"derived reset; prompt compliance on needs_reference_rsi "
+                f"is not trusted on its own.",
+                stacklevel=2,
+            )
+            stage.needs_reference_rsi = True
 
 
 def _validate_parent_reference(
@@ -523,8 +702,8 @@ def _validate_success_criterion(stage: Stage, info_keys: set[str]) -> None:
             f"For numpy arrays use `.astype(float)` / `.mean()` / "
             f"`.any()` / `.all()` directly. A bool array's `.mean()` "
             f"already returns the fraction-True; no cast needed.\n"
-            f"  bad:  (trajectory['root_link_pos_w'][..., 2] > 0.65).float().mean()\n"
-            f"  good: (trajectory['root_link_pos_w'][..., 2] > 0.65).mean()"
+            f"  bad:  (trajectory['root_height'] > 0.65).float().mean()\n"
+            f"  good: (trajectory['root_height'] > 0.65).mean()"
         )
 
     # Map `container_name` → allowed-key set. Subscripts against

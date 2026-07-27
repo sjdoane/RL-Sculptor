@@ -32,6 +32,7 @@ from typing import Any, Optional
 
 from pydantic import BaseModel, Field, field_validator
 
+from sculptor.llm import log_llm_call, model_for, response_text_blocks
 from sculptor.mission import (
     MAX_SEED_PROMPT_CHARS,
     MIN_SEED_PROMPT_CHARS,
@@ -43,7 +44,7 @@ from sculptor.mission import (
 from sculptor.prompts import load_prompt
 
 
-MODEL_ID = "claude-opus-4-7"
+MODEL_ID = model_for("decompose")
 MAX_TOKENS = 8000
 # Cap on how many KG techniques we surface to the decomposer. Matches
 # the `KG_TOP_K` used in diagnose.py for symmetry — bigger slices add
@@ -124,6 +125,63 @@ class _StageModel(BaseModel):
         ),
     )
 
+    # §JUMP_SCAFFOLD: DeepMimic-style reference-state initialization for
+    # hard-exploration stages. Every published G1 jump rides a reference
+    # motion (RESEARCH_GAP_ANALYSIS §4.5); RSI is the cheapest transfer —
+    # start a fraction of training episodes INSIDE the airborne/landing
+    # phase so the policy experiences apex → descent → touchdown long
+    # before it can produce a launch. When true, the orchestrator derives
+    # a validated train-only RSI curriculum from a reference clip
+    # (project clip if present, procedural jump otherwise) and applies it
+    # to THIS stage's env spec before training. Rollout evaluation is
+    # untouched (schema-level shared/train split).
+    needs_reference_rsi: bool = Field(
+        default=False,
+        description=(
+            "Set true for a stage whose core skill involves ballistic/"
+            "airborne states the robot cannot yet reach (jump launch, "
+            "flight, landing), OR whose START state is far from the "
+            "robot's default standing reset (lying, sitting, crouched, "
+            "fallen) — e.g. a get-up mission's first stage MUST set this, "
+            "since the env resets standing and the stage is otherwise "
+            "untrainable. Starts a fraction of training episodes in those "
+            "states via a validated reference curriculum. False for "
+            "grounded skills that start from the default standing pose "
+            "(standing, walking, crouching). MUST be true whenever "
+            "`start_pose` below is anything other than 'standing' — "
+            "validation forces it true even if you leave it false, so set "
+            "it explicitly for consistency."
+        ),
+    )
+
+    # §start_pose: the physical configuration the robot is in at THIS
+    # stage's episode start. Locked-vocabulary companion to
+    # `needs_reference_rsi` — see that field's updated description.
+    start_pose: Optional[str] = Field(
+        default=None,
+        description=(
+            "The physical configuration the robot is in at THIS stage's "
+            "episode start. One of 'supine' (lying on back, face up), "
+            "'prone' (lying on front, face down), 'sitting', 'crouched', "
+            "'standing', or null (defaults to standing behavior at "
+            "validation, but prefer 'standing' explicitly when you know "
+            "it). Derive this from the MISSION GOAL and THIS STAGE's "
+            "semantics — phrases like 'starting prone', 'from a seated "
+            "position', 'get up off the ground', 'lying on your back' "
+            "must flow into the matching stage's start_pose. Standing "
+            "unless the mission or stage goal says otherwise. A "
+            "MULTI-STAGE get-up curriculum's sub-goals often have "
+            "DIFFERENT start poses as the motion progresses stage to "
+            "stage (e.g. stage 1 supine -> stage 2 crouched -> stage 3 "
+            "standing) — set EACH stage's start_pose to what THAT "
+            "stage's episode actually begins from, not the mission's "
+            "overall starting pose. Any value other than 'standing' "
+            "means this stage is untrainable from the env's default "
+            "reset and REQUIRES needs_reference_rsi=true (see that "
+            "field)."
+        ),
+    )
+
     @field_validator("init_skill_id", mode="before")
     @classmethod
     def _normalize_init_skill_id(cls, v: Any) -> Optional[str]:
@@ -138,6 +196,14 @@ class _StageModel(BaseModel):
         if v is None:
             return None
         s = str(v).strip()
+        return s or None
+
+    @field_validator("start_pose", mode="before")
+    @classmethod
+    def _normalize_start_pose(cls, v: Any) -> Optional[str]:
+        if v is None:
+            return None
+        s = str(v).strip().lower()
         return s or None
 
 
@@ -191,6 +257,12 @@ def _render_kg_context(
         matches = query_semantic(
             goal, top_k=top_k, store=kg_store,
             min_similarity=DEFAULT_MIN_PROMPT_SIMILARITY)
+        # §Agentic-data upgrade 3: retrieval trajectory log. No iter_dir
+        # context here (decompose runs before any iteration exists), so
+        # out_dir=None falls back to sculptor.llm.llm_log_dir().
+        from sculptor.kg.retrieval_log import log_retrieval
+
+        log_retrieval("decompose", goal, matches, out_dir=None)
     except Exception as e:  # noqa: BLE001
         print(
             f"[decompose] KG query failed ({type(e).__name__}: {e}) — "
@@ -242,11 +314,42 @@ def _render_contract(contract: Any) -> str:
         "OPEN (adapter does not constrain component names)"
         if components is None else sorted(components)
     )
+    # §criterion grounding (smoke-hop-stop finding, 2026-07-06): the
+    # decomposer wrote `trajectory['root_link_pos_w']` criteria for a
+    # gym Hopper project — that key exists only on mjlab articulated
+    # envs, so every criterion eval raises CriterionMissingKeyError and
+    # the stage can never early-stop. Tell the decomposer which
+    # trajectory keys THIS adapter actually persists. supports_batched
+    # is the honest available proxy for "mjlab articulated env".
+    if supports_batched:
+        # §root-height channel (smoke-hop-stop finding, 2026-07-06):
+        # `root_height` is a DERIVED, unambiguous 1-D per-step root z the
+        # runtime synthesizes from `root_link_pos_w`; criteria on base/root
+        # height MUST use it (raw `root_link_pos_w[..., 2]` is the full
+        # (T, E) grid across every env — `.any()` fires on teleport spikes).
+        traj_keys = sorted(
+            {"rewards", "episode_id", "joint_pos", "joint_vel", "action",
+             "actuator_force", "projected_gravity_b", "root_link_pos_w",
+             "root_height"})
+        traj_note = (
+            "  (base/root-HEIGHT criteria MUST use trajectory['root_height'] "
+            "— a 1-D per-step root z; do NOT write root_link_pos_w[..., 2], "
+            "which is the (T, E) grid over ALL envs)\n"
+        )
+    else:
+        traj_keys = ["episode_id", "rewards"]
+        traj_note = (
+            "  (this adapter persists ONLY these — do NOT reference "
+            "joint_pos / root_link_pos_w / other articulated-env keys "
+            "in success criteria; use components/behavior instead)\n"
+        )
     return (
         "# REWARD_CONTRACT\n"
         f"expected_info_keys: {sorted(info_keys)}\n"
         f"expected_components: {components_text}\n"
         f"supports_batched:   {supports_batched}\n"
+        f"available_trajectory_keys: {traj_keys}\n"
+        f"{traj_note}"
     )
 
 
@@ -256,19 +359,137 @@ def _build_user_content(
     kg_context: str,
     skill_context: str = "",
     fitness_metrics_block: str = "",
+    reference_context: str = "",
 ) -> str:
     skill_block = f"{skill_context}\n\n" if skill_context else ""
     metrics_block = f"{fitness_metrics_block}\n\n" if fitness_metrics_block else ""
+    reference_block = f"{reference_context}\n\n" if reference_context else ""
     return (
         f"# BEHAVIOR_GOAL\n{goal}\n\n"
         f"{_render_contract(contract)}\n"
         f"{kg_context}\n\n"
         f"{metrics_block}"
         f"{skill_block}"
+        f"{reference_block}"
         "Emit the decomposition JSON now. Ordered stages only, "
         "topologically valid parent_stage refs, final stage must satisfy "
         "the behavior goal end-to-end."
     )
+
+
+# ── §REFERENCE_TRAJECTORY_PLAN §3/§4/§7: mission-goal-level retrieval ────
+#: Retrieval-confidence floor for AUTO-attaching a match to a stage
+#: without human review (§4.3's "auto-accept only above a high confidence
+#: bar" + §7's build brief's ">= 0.8"). Below this, a match is surfaced in
+#: the prompt context for GROUNDING only — the stage fields stay None so
+#: the UI picker remains the approval surface for anything less certain.
+REFERENCE_ATTACH_CONFIDENCE = 0.8
+#: How many mission-goal-level matches to retrieve for prompt grounding.
+_REFERENCE_RETRIEVE_K = 3
+
+
+def _retrieve_mission_references(
+    goal: str, robot_hint: Optional[str],
+) -> list[Any]:
+    """§decompose_task's single LLM call drafts `success_criterion`
+    alongside `goal_text`/etc in the SAME `_DecompositionModel` parse
+    (see module docstring) — there is no separate later call to ground.
+    So retrieval happens ONCE, up front, against the MISSION's
+    `goal_text` (not per-stage — stages don't exist yet), and the top
+    matches' kinematic signatures are injected into the SAME decompose
+    prompt with instructions to ground stage criteria in them.
+
+    Returns `[]` on ANY failure (no library index on disk, retrieval
+    exception, import failure) — reference grounding is a strict
+    ADDITION, never a decompose blocker. Never raises."""
+    try:
+        from sculptor.refs import library, retrieve
+
+        robot = _reference_robot_slug(robot_hint)
+        if not library.index_path().is_file():
+            return []  # §build brief: only retrieve when an index exists on disk
+        matches = retrieve.search(goal, robot=robot, k=_REFERENCE_RETRIEVE_K)
+        return list(matches or [])
+    except Exception as e:  # noqa: BLE001 — retrieval must never block decompose
+        print(
+            f"[decompose] reference retrieval failed "
+            f"({type(e).__name__}: {e}) — decomposer proceeds without "
+            "reference grounding.", file=sys.stderr, flush=True,
+        )
+        return []
+
+
+#: Same robot-hint -> library-slug convention as `mission_metrics._robot_slug`
+#: (kept local — decompose.py must not import mission_metrics, which would
+#: create a cycle back through sculptor.mission). Default "g1" mirrors the
+#: `robot: str = "g1"` default used throughout `sculptor.refs`.
+_REFERENCE_ROBOT_SLUGS: tuple[str, ...] = ("go2", "go1", "g1")
+
+
+def _reference_robot_slug(robot_hint: Optional[str]) -> str:
+    h = str(robot_hint or "").lower()
+    for slug in _REFERENCE_ROBOT_SLUGS:
+        if slug in h:
+            return slug
+    return "g1"
+
+
+def _load_reference_clip(clip_id: str, robot: str) -> Optional[dict]:
+    """Load one library clip by id, or None on any failure (missing/
+    corrupt clip on disk must never crash decompose)."""
+    try:
+        from sculptor.reference import load_clip
+        from sculptor.refs import library
+
+        path = library.clip_dir(robot, clip_id) / library.CLIP_FILENAME
+        return load_clip(path)
+    except Exception:  # noqa: BLE001 — a bad clip degrades to no signature
+        return None
+
+
+def _render_reference_context(matches: list[Any], robot: str) -> str:
+    """Render retrieved reference matches into a `REFERENCE MOTION
+    SIGNATURES` block: kinematic signatures for grounding stage
+    success_criterion thresholds (§7), plus each match's retrieval
+    metadata (clip_id, match_confidence, tier) so the decomposer can see
+    WHICH clips are confident enough to be worth grounding against.
+    Empty string when there are no matches or nothing loads."""
+    if not matches:
+        return ""
+    from sculptor.refs.convert import kinematic_signature
+
+    lines = [
+        "# REFERENCE MOTION SIGNATURES",
+        "Real mocap/retargeted clips retrieved for this goal. GROUND every "
+        "numeric success_criterion threshold (heights, durations, "
+        "velocities) that corresponds to one of these clips' motion in its "
+        "actual signature values instead of guessing. Also use a "
+        "signature's orientation/phase data to judge whether a stage's "
+        "START state is far from the robot's default standing reset — see "
+        "the needs_reference_rsi rule.",
+        "",
+    ]
+    rendered_any = False
+    for m in matches:
+        clip_id = getattr(m, "clip_id", None)
+        if not clip_id:
+            continue
+        clip = _load_reference_clip(clip_id, robot)
+        if clip is None:
+            continue
+        try:
+            sig = kinematic_signature(clip)
+        except Exception:  # noqa: BLE001 — one bad clip must not block others
+            continue
+        rendered_any = True
+        lines.append(
+            f"## clip_id: {clip_id} "
+            f"(match_confidence={getattr(m, 'match_confidence', None)}, "
+            f"tier={getattr(m, 'tier', None)})"
+        )
+        lines.append(json.dumps(sig, indent=2, default=str))
+        lines.append("")
+    return "\n".join(lines) if rendered_any else ""
 
 
 def _render_fitness_metrics_block() -> str:
@@ -280,9 +501,10 @@ def _render_fitness_metrics_block() -> str:
         "# AVAILABLE_FITNESS_METRICS\n"
         "Optional per-stage objectives you MAY assign to a stage's "
         "`steering_metric` when one DIRECTLY measures that stage's sub-goal "
-        f"for this robot: {spec_metric_names()}. They are robot-specific "
-        "(g1_* are humanoid; go1_trot is a quadruped gait; cartpole_balance "
-        "is cartpole). Assign ONLY a correct fit; otherwise leave it null."
+        f"for this robot: {spec_metric_names()}. Calibration scope matters: "
+        "g1_* are humanoid, go1_trot is a quadruped gait, cartpole_balance "
+        "is cartpole, and object_lift_hold is capability-driven manipulation. "
+        "Assign ONLY a correct fit; otherwise leave it null."
     )
 
 
@@ -405,18 +627,20 @@ def _parse_with_retry(
             messages=[{"role": "user", "content": user_content}],
             output_format=output_format,
         )
+        log_llm_call(
+            "decompose", model, system=system_prompt, user=user_content,
+            response_text=response_text_blocks(resp),
+            usage=getattr(resp, "usage", None), meta={"attempt": 1})
         return resp.parsed_output
     except Exception as first_err:  # noqa: BLE001
+        retry_reminder = (
+            "Previous response failed parse / validation: "
+            f"{first_err!s}. Emit ONLY the strict JSON matching "
+            "the schema — no prose, no markdown fences."
+        )
         retry_messages = [
             {"role": "user", "content": user_content},
-            {
-                "role": "user",
-                "content": (
-                    "Previous response failed parse / validation: "
-                    f"{first_err!s}. Emit ONLY the strict JSON matching "
-                    "the schema — no prose, no markdown fences."
-                ),
-            },
+            {"role": "user", "content": retry_reminder},
         ]
         resp = client.messages.parse(
             model=model,
@@ -426,6 +650,11 @@ def _parse_with_retry(
             messages=retry_messages,
             output_format=output_format,
         )
+        log_llm_call(
+            "decompose", model, system=system_prompt,
+            user=f"{user_content}\n\n{retry_reminder}",
+            response_text=response_text_blocks(resp),
+            usage=getattr(resp, "usage", None), meta={"attempt": 2})
         return resp.parsed_output
 
 
@@ -481,6 +710,8 @@ def _stages_from_model(stages_in: list[_StageModel]) -> list[Stage]:
             kg_seed_papers=list(s.kg_seed_papers or []),
             init_skill_id=s.init_skill_id,
             steering_metric=s.steering_metric,
+            needs_reference_rsi=bool(s.needs_reference_rsi),
+            start_pose=s.start_pose,
         )
         for s in stages_in
     ]
@@ -507,6 +738,147 @@ def _validate_steering_metrics(stages: list[Stage]) -> None:
         )
 
 
+def _select_and_attach_span(stage: Stage, robot: str) -> None:
+    """§D24 F1 item 4 (docs/internal/REFERENCE_BUILD_LOG.md D23/D24):
+    right after a reference clip is attached to `stage` (`decompose_task`'s
+    `_attach_stage_references`, or `redecompose_stage`'s per-sub-stage
+    inheritance below), propose + QC the goal-aligned SUB-SPAN
+    (`sculptor.refs.spans.select_reference_span`) and persist it on the
+    stage. Every downstream consumer of `stage.reference_clip_id` (metric
+    generation, RSI/eval-reset derivation, `reference_signature.json`)
+    resolves the clip through the ONE loader
+    (`sculptor.mission_metrics.load_stage_reference_clip`), so this crop
+    applies everywhere without a second full-clip pass or an independent
+    crop assumption (§D19).
+
+    This makes ONE real LLM call (the `span_select` registry role,
+    production by default — see `select_reference_span`'s docstring; note
+    `decompose_task`/`redecompose_stage` have no `llm_call` override
+    parameter of their own, so tests MUST monkeypatch
+    `sculptor.refs.spans.select_reference_span` directly, same as every
+    other network-touching call in this module's test suite).
+
+    Never raises: any failure (clip fails to load, selection declines)
+    just leaves the four span fields at their default None (full-clip
+    fallback) and logs why — same non-fatal-by-design contract as
+    `_attach_stage_references`'s own retrieval failures.
+
+    §D24 W5 hardening: a stage whose `reference_span_method` already
+    carries a `"declined:<reason>"` marker (`sculptor.refs.spans.
+    is_span_declined`) was ALREADY attempted and semantically declined —
+    skip re-attempting (defensive symmetry with `mission_metrics
+    ._backfill_stage_reference_span`'s own guard; in normal operation
+    this function only runs once per freshly-attached stage, so this
+    guard is belt-and-suspenders, not the primary fix). A FRESH semantic
+    decline here persists the same marker so the later lazy backfill
+    (which resolves this stage from a saved mission.json) never
+    re-fires the call either.
+
+    §D24 F2: right after a span is successfully persisted, this ALSO
+    re-grounds the stage's `success_criterion` in the CROPPED clip's real
+    signature (`ground_stage_criterion`) — the stage contract (goal text,
+    criterion, metric) no longer has to inherit the FULL clip's numbers
+    just because the criterion was authored before any clip was known."""
+    clip_id = stage.reference_clip_id
+    if not clip_id:
+        return
+
+    from sculptor.refs.spans import is_span_declined
+
+    if is_span_declined(stage):
+        return
+
+    clip = _load_reference_clip(clip_id, robot)
+    if clip is None:
+        print(
+            f"[decompose] stage {stage.name!r}: reference clip "
+            f"{clip_id!r} failed to load for span selection — "
+            "proceeding without a span (full clip).",
+            file=sys.stderr, flush=True,
+        )
+        return
+
+    from sculptor.refs.spans import select_reference_span
+
+    span, reason = select_reference_span(
+        clip, goal_text=stage.goal_text, start_pose=stage.start_pose,
+    )
+    if span is None:
+        from sculptor.refs.spans import is_semantic_decline
+
+        if is_semantic_decline(reason):
+            stage.reference_span_method = f"declined:{reason}"
+        print(
+            f"[decompose] stage {stage.name!r}: reference span selection "
+            f"declined ({reason}) — using the full clip.",
+            file=sys.stderr, flush=True,
+        )
+        return
+    stage.reference_span_start_s = span["t_start_s"]
+    stage.reference_span_end_s = span["t_end_s"]
+    stage.reference_span_confidence = span["confidence"]
+    stage.reference_span_method = span["method"]
+
+    try:
+        from sculptor.refs.spans import crop_span
+
+        cropped = crop_span(clip, span["t_start_s"], span["t_end_s"])
+        ground_stage_criterion(stage, cropped)
+    except Exception as e:  # noqa: BLE001 — criterion re-grounding is best-effort
+        print(
+            f"[decompose] stage {stage.name!r}: criterion re-grounding "
+            f"skipped ({type(e).__name__}: {e}) — keeping the original "
+            "criterion.", file=sys.stderr, flush=True,
+        )
+
+
+def _attach_stage_references(stages: list[Stage], robot: str) -> None:
+    """§REFERENCE_TRAJECTORY_PLAN §4/§7/§9: for each drafted stage, run
+    refs retrieval against ITS OWN `goal_text` and attach the top match's
+    fields (`reference_clip_id`/`tier`/`match_confidence`) ONLY when
+    `match_confidence` is not None and >= `REFERENCE_ATTACH_CONFIDENCE`,
+    OR when the deterministic-only layer's top score is a clear standout
+    (>= 2x the second-place score, mirroring the "clear standout" build
+    brief — a single strong deterministic hit with no close competitor is
+    trustworthy even without an LLM confidence number). Otherwise the
+    stage's reference fields stay None — the UI picker remains the
+    approval surface for anything less certain.
+
+    Runs AFTER stages are drafted+parsed (so it sees the LLM's actual
+    per-stage goal_text), mutates `stages` in place. Any retrieval
+    failure for a stage (or globally, e.g. no library index) leaves that
+    stage's fields untouched — never raises."""
+    for stage in stages:
+        try:
+            from sculptor.refs import library, retrieve
+
+            if not library.index_path().is_file():
+                return  # no library at all — skip every remaining stage too
+            matches = retrieve.search(
+                stage.goal_text, robot=robot, k=2)
+        except Exception:  # noqa: BLE001 — retrieval must never block decompose
+            continue
+        if not matches:
+            continue
+        top = matches[0]
+        confidence = getattr(top, "match_confidence", None)
+        is_clear_standout = False
+        if confidence is None and len(matches) >= 2:
+            second_score = getattr(matches[1], "score", 0.0) or 0.0
+            top_score = getattr(top, "score", 0.0) or 0.0
+            is_clear_standout = second_score > 0 and top_score >= 2 * second_score
+        elif confidence is None:
+            is_clear_standout = True  # only one candidate at all — no competitor to beat
+        if (confidence is not None and confidence >= REFERENCE_ATTACH_CONFIDENCE) or (
+                confidence is None and is_clear_standout):
+            stage.reference_clip_id = getattr(top, "clip_id", None)
+            stage.reference_tier = getattr(top, "tier", None)
+            stage.reference_match_confidence = confidence
+            # §D24 F1 item 4a: select the goal-aligned sub-span right
+            # after attach — see `_select_and_attach_span`'s docstring.
+            _select_and_attach_span(stage, robot)
+
+
 # ── Public entry ─────────────────────────────────────────────────────
 def decompose_task(
     goal: str,
@@ -516,6 +888,8 @@ def decompose_task(
     client: Any = None,
     model: str = MODEL_ID,
     skill_library_handle: Any = None,
+    robot_hint: Optional[str] = None,
+    attach_references: bool = True,
 ) -> Mission:
     """Ask Claude to decompose `goal` into a Mission curriculum.
 
@@ -531,12 +905,33 @@ def decompose_task(
     client : optional Anthropic client (for testing / reuse). If None,
         constructs a client with max_retries=2 + timeout=240 s (same
         envelope as the post-Ship-13 edit path).
-    model : Anthropic model id. Defaults to claude-opus-4-7.
+    model : Anthropic model id. Defaults to the registry's "decompose"
+        role (`sculptor.llm.model_for`).
     skill_library_handle : optional `SkillLibraryHandle` (Ship 19).
         When provided, Claude sees up to 5 prior-mission skills
         compatible with the handle's (adapter_class, task_id) pair
         and may set a stage's `init_skill_id` to warm-start from one.
         Unknown ids are rejected at validation time.
+    robot_hint : optional adapter/task_id-shaped robot hint (e.g.
+        "Mjlab-Velocity-Flat-Unitree-G1"), used ONLY to resolve which
+        reference-library robot slug to query (§REFERENCE_TRAJECTORY_PLAN
+        §4); mapped via the same substring convention as
+        `sculptor.eval.robot_manifest.robot_joint_names`, defaulting to
+        "g1". Unrelated to the LLM call itself.
+    attach_references : (default True) §REFERENCE_TRAJECTORY_PLAN §4/§7.
+        When True: (a) retrieves top mission-goal-level reference matches
+        UP FRONT and injects their kinematic signatures into THIS SAME
+        decompose call's prompt so `success_criterion` thresholds can be
+        grounded in real numbers (decompose's stage-drafting and
+        criterion-authoring happen in ONE `_DecompositionModel` parse —
+        there is no separate later call to ground); (b) AFTER stages are
+        drafted, retrieves per-stage and attaches
+        `reference_clip_id`/`reference_tier`/`reference_match_confidence`
+        to a stage only on a high-confidence or clear-standout match
+        (`_attach_stage_references`). Set False to disable both (e.g. in
+        tests, or when the caller wants a bare decomposition). A missing
+        library index or any retrieval failure is always a no-op, never
+        an error, regardless of this flag.
 
     Returns
     -------
@@ -562,9 +957,15 @@ def decompose_task(
     skill_context, available_skill_ids = _render_skill_library_context(
         skill_library_handle,
     )
+    robot = _reference_robot_slug(robot_hint)
+    reference_context = ""
+    if attach_references:
+        mission_matches = _retrieve_mission_references(goal, robot_hint)
+        reference_context = _render_reference_context(mission_matches, robot)
     user_content = _build_user_content(
         goal, reward_contract, kg_context, skill_context=skill_context,
         fitness_metrics_block=_render_fitness_metrics_block(),
+        reference_context=reference_context,
     )
 
     parsed = _parse_with_retry(
@@ -572,6 +973,8 @@ def decompose_task(
     )
 
     stages = _stages_from_model(parsed.stages)
+    if attach_references:
+        _attach_stage_references(stages, robot)
     mission = Mission(
         goal=goal,
         stages=stages,
@@ -750,6 +1153,7 @@ def redecompose_stage(
     client: Any = None,
     model: str = MODEL_ID,
     prior_attempt_error: Optional[str] = None,
+    robot_hint: Optional[str] = None,
 ) -> list[Stage]:
     """Ask Claude to split a failed stage into 2-8 simpler sub-stages.
 
@@ -767,11 +1171,72 @@ def redecompose_stage(
       * Last sub-stage's `success_criterion == failed.success_criterion`
         (byte-equal after `.strip()`).
 
+    §D21 Fix 1 (post-mortem D20, docs/internal/REFERENCE_BUILD_LOG.md):
+    every sub-stage UNCONDITIONALLY inherits the failed stage's
+    `reference_clip_id`/`reference_tier`/`reference_match_confidence` —
+    the sub-stages are phases of the SAME motion the failed stage was
+    attempting, and the clip is also what stage-metric generation reads.
+    Pre-D21, `redecompose_stage` dropped the binding entirely (no
+    retrieval pass, unlike `decompose_task`), so a sub-stage with
+    `needs_reference_rsi=True` and no clip fell through the scaffold's
+    precedence chain to the WRONG task class (procedural jump RSI on a
+    get-up mission — the D20 incident).
+
+    Additionally: when the failed stage's on-disk stage dir contains
+    `env/eval_reset.json` (§D17 — a non-standing eval start means THE
+    START STATE IS THE TASK), every sub-stage's `needs_reference_rsi` is
+    FORCED to True, overriding the LLM's per-sub-stage choice — a
+    get-up sub-stage that scaffolds without RSI silently reverts to the
+    default standing reset, which is exactly the defect this fix closes.
+    The stage-dir lookup degrades gracefully (no force, no crash) if
+    `mission.stage_dir` raises or the dir doesn't exist. When NO
+    eval_reset.json exists, the LLM decides each sub-stage's flag as
+    before (see the comment on the `needs_reference_rsi=` line below —
+    that rule exists for jump decompositions, where a redecomposition
+    typically splits ONE airborne stage into a grounded precursor plus a
+    later airborne sub-stage, and a blanket force would deny the
+    grounded precursor's correctly-False flag).
+
+    §D24 F1 item 4b: every sub-stage inherits the failed stage's
+    `reference_clip_id`/`_tier`/`_match_confidence` (D21, unconditional,
+    unchanged) but NOT its span fields — each sub-stage is a phase of a
+    DIFFERENT (smaller) sub-goal and needs its OWN span, freshly selected
+    against its own `goal_text`/`start_pose` via `_select_and_attach_span`
+    (same helper `decompose_task`'s attach path uses). `robot_hint` (the
+    adapter/task_id-shaped hint, same convention as `decompose_task`'s
+    parameter) resolves which library robot slug to query when running
+    that selection; unrelated to the LLM call itself.
+
+    §D30 fix: every sub-stage's `steering_metric` is left `None` (NOT
+    inherited from the failed stage) — see the inline comment at the
+    `Stage(...)` construction below for the full rationale. This is
+    deliberately asymmetric with the reference-clip inheritance above:
+    the clip identifies the underlying MOTION (shared across sub-stages
+    by construction), while `steering_metric` is a certified pointer
+    scoped to the exact goal/span it was generated against, which is
+    the parent stage's — not any sub-stage's.
+
     Raises `MissionValidationError` on any violation. Caller halts the
     mission on failure (do NOT retry Claude — same envelope as
     `decompose_task`).
     """
     failed_stage: Stage = mission.stages[failed_stage_idx]
+
+    # §D21 Fix 1: does the failed stage have a stage-FIXED eval reset
+    # (§D17 get-up archetype)? If so, the start state IS the task, and
+    # every sub-stage MUST scaffold with reference RSI regardless of
+    # what the redecompose LLM chose per sub-stage. Best-effort: any
+    # failure resolving the stage dir (mission_dir unset, dir missing,
+    # ...) just leaves this False — the LLM's per-sub-stage choice wins,
+    # same as today.
+    force_reference_rsi = False
+    try:
+        _failed_stage_dir = mission.stage_dir(failed_stage.name)
+        force_reference_rsi = (
+            _failed_stage_dir / "env" / "eval_reset.json"
+        ).is_file()
+    except Exception:  # noqa: BLE001 — degrade gracefully, never crash
+        force_reference_rsi = False
 
     if client is None:
         import anthropic
@@ -874,11 +1339,74 @@ def redecompose_stage(
             ),
             reward_seed_prompt=model_stage.reward_seed_prompt,
             kg_seed_papers=list(model_stage.kg_seed_papers or []),
-            # §Ship 38: sub-stages inherit the failed stage's objective so a
-            # re-decomposed phase keeps steering by the same metric.
-            steering_metric=failed_stage.steering_metric,
+            # §D30 fix (docs/internal/REFERENCE_BUILD_LOG.md): do NOT
+            # inherit the failed stage's `steering_metric` here. Unlike
+            # the reference-clip binding (D21, deliberate — sub-stages
+            # are phases of the SAME motion), the parent's steering
+            # metric was authored/certified against the PARENT stage's
+            # goal and span. Copying the pointer trips
+            # `generate_stage_metrics`'s "already set" skip guard, so
+            # no sub-stage ever gets its own metric — it silently steers
+            # by an objective built for a different (usually broader or
+            # differently-scoped) goal. Live: prone_getup_and_hold's
+            # crouch-to-stand sub-stages inherited the parent's
+            # prone-start synthetic-exemplar metric and scored a
+            # PERFECT crouch-to-stand rollout 0.0 on gate_started_prone
+            # even though `_select_and_attach_span` below had already
+            # picked each sub-stage's own correct span. Leaving this
+            # None lets the existing lazy metric-generation path
+            # certify each sub-stage against ITS OWN already-selected
+            # span the next time `generate_stage_metrics` runs over the
+            # mission. `model_stage.steering_metric` is never read here
+            # either — the redecompose LLM is not shown a
+            # `steering_metric` field in its output schema (see
+            # prompts/redecompose_stage.md), so it is always None on
+            # the parsed model; this omission is just explicit about
+            # not resurrecting it from the failed stage.
+            steering_metric=None,
+            # §JUMP_SCAFFOLD refinement (2026-07-06): per-sub-stage RSI —
+            # the redecompose LLM decides each sub-stage's flag (rule 10),
+            # NOT force-inherit from the failed parent. Re-decomposition
+            # usually splits ONE airborne stage into a GROUNDED precursor
+            # (RSI false — else needless resets are wasted on states it
+            # doesn't need) plus a later airborne sub-stage (RSI true); a
+            # blanket `or failed_stage.needs_reference_rsi` denied the
+            # grounded precursors that gain.
+            #
+            # §D21 Fix 1: EXCEPT when the failed stage had a stage-fixed
+            # eval reset (§D17 — the lying/low start IS the task, not
+            # curriculum). In that case every sub-stage MUST scaffold
+            # with reference RSI or it silently reverts to a standing
+            # default reset (the D20 incident) — override the LLM here.
+            needs_reference_rsi=(
+                True if force_reference_rsi else bool(
+                    getattr(model_stage, "needs_reference_rsi", False))
+            ),
+            # §start_pose: PER-SUB-STAGE, model-chosen — unlike the
+            # reference-clip fields below, start_pose is NOT force-
+            # inherited from the failed parent. Sub-stages of a
+            # redecomposed get-up stage typically progress through
+            # DIFFERENT physical configurations (e.g. r1_0 supine ->
+            # r1_2 crouched), so the model picks each one; the D21
+            # force-rule above (and `validate_mission`'s force-rule on
+            # start_pose != "standing") still applies per sub-stage
+            # regardless of what the model set here.
+            start_pose=getattr(model_stage, "start_pose", None),
+            # §D21 Fix 1: unconditional inheritance — sub-stages are
+            # phases of the SAME motion the failed stage was attempting,
+            # and stage-metric generation reads this same clip.
+            reference_clip_id=failed_stage.reference_clip_id,
+            reference_tier=failed_stage.reference_tier,
+            reference_match_confidence=failed_stage.reference_match_confidence,
             redecomposition_attempts=1,  # bound at one level
         ))
+
+    # §D24 F1 item 4b: fresh per-sub-stage span selection (clip inherited
+    # above, span never inherited — see this function's docstring).
+    if failed_stage.reference_clip_id:
+        robot = _reference_robot_slug(robot_hint)
+        for sub_stage in sub_stages:
+            _select_and_attach_span(sub_stage, robot)
 
     # KG citation verification (same as decompose_task).
     _validate_kg_seed_papers(sub_stages, set(available_arxiv_ids), kg_store)
@@ -1018,3 +1546,556 @@ def reconcile_criterion(
         f"reconcile_criterion: rewrite failed validation twice; "
         f"last error: {last_error}"
     )
+
+
+# ── §D24 F2: blind-authored criterion re-grounding ───────────────────
+#: D23 (docs/internal/REFERENCE_BUILD_LOG.md) root-cause chain, step 2:
+#: `success_criterion` is authored in the SAME LLM call as `goal_text`,
+#: BEFORE any per-stage reference clip is known — so it can bake in a
+#: number (e.g. `root_height > 0.35`) that the stage's ACTUAL
+#: goal-aligned motion (a sub-phase of a longer clip) never reaches.
+#: `ground_stage_criterion` closes that gap AFTER a span attaches, by
+#: asking Claude to re-derive the criterion's thresholds from the
+#: CROPPED clip's real kinematic signature, then MECHANICALLY verifying
+#: the rewrite against that same clip before ever adopting it.
+class _CriterionGroundModel(BaseModel):
+    """Claude's response schema for a criterion re-grounding rewrite."""
+
+    rationale: str
+    success_criterion: str
+
+
+def _split_top_level_and(tree: Any) -> list[Any]:
+    """AST-split `tree.body` (an `ast.Expression`) on a top-level `and` —
+    a bare `BoolOp(And, ...)` at the root yields its operands (each
+    independently checkable); anything else (a single comparison, an
+    `or`, ...) is one conjunct: the whole expression. Mirrors reading
+    `"A and B and C"` as three separate claims."""
+    import ast
+
+    body = tree.body
+    if isinstance(body, ast.BoolOp) and isinstance(body.op, ast.And):
+        return list(body.values)
+    return [body]
+
+
+def _conjunct_is_component_free(node: Any) -> bool:
+    """True when `node`'s subtree references NO `components` name
+    anywhere — the mechanically VERIFIABLE half of a criterion (a
+    `components[...]`/`components.get(...)` conjunct can't be checked
+    here: no reward has run against a bare reference clip, so there is
+    no `components` dict to evaluate)."""
+    import ast
+
+    return not any(
+        isinstance(n, ast.Name) and n.id == "components"
+        for n in ast.walk(node)
+    )
+
+
+def _clip_to_trajectory_namespace(clip: dict) -> dict[str, Any]:
+    """Build the SAME flat namespace `_evaluate_success_criterion`
+    (`sculptor.mission_runtime`) evaluates a criterion against — but
+    sourced from a REFERENCE CLIP instead of a rollout's trajectory.npz +
+    behavior.json:
+
+      * `trajectory['root_height']` / `info['root_height']` — the clip's
+        own `root_pos_z` (1-D, matches `_derive_root_height`'s
+        env-0-representative shape convention).
+      * `trajectory['projected_gravity_b']` — `sculptor.refs.convert.
+        _projected_gravity_b(root_quat_wxyz)` when the clip carries
+        orientation; absent otherwise (exactly like a real trajectory
+        missing that key — callers must `.get()`-guard).
+      * `joint_pos`/`joint_vel` pass through when present.
+      * `components` is deliberately an EMPTY dict and `behavior` an
+        empty dict — a criterion conjunct that references either is
+        UNVERIFIABLE against a bare clip (no reward/rollout has run) and
+        must be excluded by the caller (`_conjunct_is_component_free`)
+        before ever reaching this namespace; a lookup that slips through
+        anyway KeyErrors/NameErrors like a real missing key would.
+
+    Never raises — a clip missing a channel just omits that key, same
+    as the real namespace builder."""
+    import numpy as np
+
+    trajectory: dict[str, Any] = {}
+    z = clip.get("root_pos_z")
+    if z is not None:
+        trajectory["root_height"] = np.asarray(z)
+    quat = clip.get("root_quat_wxyz")
+    if quat is not None:
+        from sculptor.refs.convert import _projected_gravity_b
+
+        trajectory["projected_gravity_b"] = _projected_gravity_b(
+            np.asarray(quat, dtype=np.float64))
+    for key in ("joint_pos", "joint_vel"):
+        v = clip.get(key)
+        if v is not None:
+            trajectory[key] = np.asarray(v)
+
+    namespace: dict[str, Any] = {
+        "metric": None,
+        "behavior": {},
+        "components": {},
+        "trajectory": trajectory,
+        "info": trajectory,  # alias, matches the real namespace builder
+    }
+    namespace.update({
+        "abs": abs, "min": min, "max": max, "sum": sum, "len": len,
+        "round": round, "float": float, "int": int, "bool": bool,
+    })
+    return namespace
+
+
+def _mechanically_verify_criterion_on_clip(
+    criterion: str, clip: dict,
+) -> Optional[str]:
+    """§D24 F2 mechanical acceptance gate: AST-split `criterion` on
+    top-level `and`; every conjunct that is `_conjunct_is_component_free`
+    (references only `trajectory`/`info`/`behavior`, no `components`)
+    MUST evaluate `True` against the CROPPED reference clip's own
+    kinematic data (`_clip_to_trajectory_namespace`) — a criterion whose
+    mechanically-checkable half fails on the very exemplar it is meant
+    to certify is exactly the D23 defect (`root_height > 0.35` on a span
+    that never exceeds ~0.16 m) reproduced by a re-grounding call that
+    didn't actually fix anything. `components`-referencing conjuncts are
+    SKIPPED (unverifiable — no reward has run against this clip; a WRONG
+    components-only rewrite is a pre-existing risk `reconcile_criterion`
+    already owns, out of scope here).
+
+    This is the guard that makes a WRONG re-grounded criterion STRICTLY
+    HARDER to adopt than the status quo: the status quo (the original,
+    blind-authored criterion) is kept on ANY failure below.
+
+    Returns `None` when every checkable conjunct passes (including the
+    vacuous case: no checkable conjunct exists, e.g. an all-`components`
+    criterion — nothing to mechanically verify, so it is accepted on
+    trust, same as `reconcile_criterion`'s own components-only
+    tolerance); otherwise a short reason naming the failing conjunct.
+    Never raises — any exception during parse/eval IS the failure
+    reason.
+
+    SAFETY PRECONDITION: this function `eval()`s each checkable conjunct
+    with real `__builtins__` (same convention `_evaluate_success_
+    criterion` documents — numpy's own methods need them, so the AST
+    walker is the ONLY safety layer, not an empty builtins dict). The
+    caller MUST run the static safety gates
+    (`_validate_success_criterion` + `mission_runtime
+    ._validate_criterion_ast`) on `criterion` FIRST and reject before
+    ever calling this — `ground_stage_criterion` does exactly that
+    ordering. This function does NOT re-run those gates itself."""
+    import ast
+
+    try:
+        tree = ast.parse(criterion.strip(), mode="eval")
+    except SyntaxError as e:
+        return f"unparseable: {type(e).__name__}: {e}"
+
+    try:
+        namespace = _clip_to_trajectory_namespace(clip)
+    except Exception as e:  # noqa: BLE001 — no exemplar to check against
+        return f"failed to build the clip namespace: {type(e).__name__}: {e}"
+
+    for conjunct in _split_top_level_and(tree):
+        if not _conjunct_is_component_free(conjunct):
+            # Unverifiable at cert time (no reward has run against this
+            # clip) — but it must still be FAIL-CLOSED: evaluated with an
+            # EMPTY components dict, the conjunct must NOT pass. A live
+            # re-grounding call produced `components.get('x', 1.0) > 0.2`
+            # — a default that makes the conjunct vacuously True whenever
+            # the component is missing, silently deleting one leg of the
+            # success criterion. Fail-closed defaults (the 0.0 the
+            # original blind-authored criteria use) evaluate False here
+            # and are skipped as before; raising (components['x']) is
+            # also fail-closed and fine.
+            expr = ast.fix_missing_locations(ast.Expression(body=conjunct))
+            try:
+                compiled = compile(expr, "<criterion-conjunct>", "eval")
+                empty_ns = dict(namespace)
+                empty_ns["components"] = {}
+                vacuous = bool(eval(  # noqa: S307 — same trusted-namespace contract
+                    compiled, {"__builtins__": __builtins__}, empty_ns))
+            except Exception:  # noqa: BLE001 — raising on missing = fail-closed
+                vacuous = False
+            if vacuous:
+                try:
+                    rendered = ast.unparse(conjunct)
+                except Exception:  # noqa: BLE001
+                    rendered = "<unparseable conjunct>"
+                return (
+                    "components conjunct is FAIL-OPEN (evaluates True with "
+                    f"no components at all — its default vacuously passes): "
+                    f"{rendered}")
+            continue
+        expr = ast.fix_missing_locations(ast.Expression(body=conjunct))
+        try:
+            compiled = compile(expr, "<criterion-conjunct>", "eval")
+            result = eval(  # noqa: S307 — same trusted-namespace contract
+                compiled, {"__builtins__": __builtins__}, namespace)
+        except Exception as e:  # noqa: BLE001 — a raising conjunct fails verification
+            try:
+                rendered = ast.unparse(conjunct)
+            except Exception:  # noqa: BLE001 — rendering itself must never crash
+                rendered = "<unparseable conjunct>"
+            return (
+                f"conjunct raised on the reference clip "
+                f"({type(e).__name__}: {e}): {rendered}")
+        if not bool(result):
+            try:
+                rendered = ast.unparse(conjunct)
+            except Exception:  # noqa: BLE001
+                rendered = "<unparseable conjunct>"
+            return f"conjunct evaluates False on the reference clip: {rendered}"
+    return None
+
+
+# ── §D29-4: anti-chaos discipline for re-grounded criteria ───────────
+#: D29 (docs/internal/REFERENCE_BUILD_LOG.md) live finding: the
+#: re-grounded criterion
+#: `(trajectory['root_height'] > 0.15).any() and
+#:  (trajectory['projected_gravity_b'][..., 2] < -0.2).any() and
+#:  behavior['mean_episode_length'] > 100`
+#: was satisfied by a physics-EXPLOSION rollout that tumbled through
+#: every height and orientation (fall-termination is off for get-up
+#: stages, so episode length is always full). `_mechanically_verify_
+#: criterion_on_clip` above only proves the rewrite passes on the
+#: HONEST exemplar — it cannot see that the same bare `.any()`
+#: reachability is trivially satisfied by chaos too. This is the
+#: complementary NEGATIVE check: the rewrite must also FAIL on
+#: synthetic chaos-shaped trajectories, mechanically constructed (no
+#: LLM), before it is trusted.
+_CHAOS_T_STEPS = 500
+
+
+def _chaos_trajectory_namespace(
+    root_height: Any, pg_z: Any, t_steps: int,
+) -> dict[str, Any]:
+    """Build a criterion-eval namespace from raw `root_height`/`pg_z`
+    arrays, in the SAME shape `_clip_to_trajectory_namespace` produces
+    from a real clip: `trajectory['root_height']` is `(T,)`,
+    `trajectory['projected_gravity_b']` is `(T, 3)` (only z, index 2,
+    varies — x/y are 0.0; every criterion this gate has seen only ever
+    reads `[..., 2]`). Unlike the on-exemplar namespace, `behavior` is
+    POPULATED here (`mean_episode_length=t_steps`) — the live D29
+    criterion's third conjunct reads `behavior['mean_episode_length']`,
+    and the whole point of this battery is to reproduce "fall-
+    termination off -> episode always runs full length" exactly."""
+    import numpy as np
+
+    root_height = np.asarray(root_height, dtype=np.float64)
+    pg_z = np.asarray(pg_z, dtype=np.float64)
+    zeros = np.zeros_like(pg_z)
+    trajectory: dict[str, Any] = {
+        "root_height": root_height,
+        "projected_gravity_b": np.stack([zeros, zeros, pg_z], axis=-1),
+    }
+    namespace: dict[str, Any] = {
+        "metric": None,
+        "behavior": {"mean_episode_length": t_steps},
+        "components": {},
+        "trajectory": trajectory,
+        "info": trajectory,
+    }
+    namespace.update({
+        "abs": abs, "min": min, "max": max, "sum": sum, "len": len,
+        "round": round, "float": float, "int": int, "bool": bool,
+    })
+    return namespace
+
+
+def _chaos_trajectory_namespaces(
+    t_steps: int = _CHAOS_T_STEPS,
+) -> list[tuple[str, dict[str, Any]]]:
+    """Two deterministic, mechanically-constructed chaos archetypes
+    (seeded RNG — same battery every call, so this gate never flakes):
+
+      * **explosion** — root height rockets 0.1 -> 2.5 m in a brief
+        ballistic spike (~8% of the episode) then rests low for the
+        remainder (a contact-force explosion that launches once and
+        collapses); orientation tumbles continuously — `pg_z` sweeps
+        -1..1 sinusoidally (~3 full tumbles across the episode).
+      * **chaotic_flail** — root height jitters in a low resting band
+        MOST of the time, with a sparse ~15%-of-frames burst into the
+        0.1-0.9 m band (uniform); `pg_z` is uniform in [-1, 1] on
+        EVERY frame (no coherent orientation at all).
+
+    Tuning note (measured, see REFERENCE_BUILD_LOG.md D29-4): a fully
+    literal "root height uniform in [0.1, 0.9] on EVERY frame" flail
+    (no duty-cycling) puts ~95% of frames above the live criterion's
+    0.15 m gate — comfortably ABOVE the 30% band a legitimate SUSTAINED
+    criterion uses, which would make this battery reject an honest
+    criterion too (a false positive). Duty-cycling the height burst to
+    ~15% of frames keeps both archetypes' height-band residency well
+    under 30% (empirically ~7.6% / ~11-14%) while still touching the
+    band at least once per episode — enough to trip a bare `.any()`
+    reachability clause, not enough to trip a `.mean() > 0.3` sustained
+    one. `pg_z` residency below -0.2 lands ~40-46% in both archetypes
+    (ungated, matching the literal "uniform in [-1, 1]" spec) — this is
+    fine because the paired/sustained example criterion is a
+    conjunction: its height half already reads False on both
+    archetypes, so the whole `and` stays False regardless of the pg_z
+    fraction.
+    """
+    import numpy as np
+
+    namespaces: list[tuple[str, dict[str, Any]]] = []
+
+    # (i) explosion.
+    rng = np.random.default_rng(1729)
+    t = np.linspace(0.0, 1.0, t_steps)
+    n_spike = max(2, int(round(t_steps * 0.08)))
+    z = rng.uniform(0.02, 0.08, size=t_steps)
+    ramp_len = n_spike // 2
+    fall_len = n_spike - ramp_len
+    spike = np.concatenate([
+        np.linspace(0.1, 2.5, ramp_len),
+        np.linspace(2.5, 0.08, fall_len),
+    ])
+    z[:n_spike] = spike[:n_spike]
+    pg_z = np.sin(2.0 * np.pi * 3.0 * t)  # ~3 tumbles across the episode
+    namespaces.append((
+        "explosion",
+        _chaos_trajectory_namespace(z, pg_z, t_steps),
+    ))
+
+    # (ii) chaotic flail.
+    rng = np.random.default_rng(4104)
+    active = rng.random(t_steps) < 0.15
+    z = np.where(
+        active,
+        rng.uniform(0.1, 0.9, size=t_steps),
+        rng.uniform(0.02, 0.08, size=t_steps),
+    )
+    pg_z = rng.uniform(-1.0, 1.0, size=t_steps)
+    namespaces.append((
+        "chaotic_flail",
+        _chaos_trajectory_namespace(z, pg_z, t_steps),
+    ))
+
+    return namespaces
+
+
+def _criterion_trips_on_chaos(criterion: str, namespace: dict[str, Any]) -> bool:
+    """True iff `criterion` (the FULL expression, not conjunct-split —
+    unlike `_mechanically_verify_criterion_on_clip`, which only checks
+    trajectory/behavior-only conjuncts in isolation) evaluates truthy
+    against a chaos namespace. `components` is the empty dict here
+    (same fail-closed convention as `_clip_to_trajectory_namespace`):
+    a `components.get('x', 0.0) > 0.2`-shaped conjunct reads its
+    fail-closed default and evaluates False, so a criterion whose ONLY
+    discriminating conjunct is a `components` lookup vacuously does
+    NOT trip chaos — safe (it also can't mechanically prove itself
+    non-gameable via `components`, but that is a pre-existing,
+    documented limit of this whole certification path, not something
+    this gate can close).
+
+    Never raises: a parse error, an unsafe construct that somehow
+    reached this point, or a runtime error (missing key, type error)
+    all mean "does not trip" — the SAFE direction (an exception is not
+    a satisfied criterion)."""
+    import ast
+
+    try:
+        tree = ast.parse(criterion.strip(), mode="eval")
+        compiled = compile(tree, "<criterion-chaos>", "eval")
+        result = eval(  # noqa: S307 — same trusted-namespace contract as the on-exemplar check
+            compiled, {"__builtins__": __builtins__}, namespace)
+    except Exception:  # noqa: BLE001 — raising = does not trip = safe
+        return False
+    return bool(result)
+
+
+def _chaos_gate_reject_reason(criterion: str) -> Optional[str]:
+    """§D29-4 acceptance gate: `None` when `criterion` evaluates False
+    on EVERY chaos archetype (safe to adopt); otherwise the name of the
+    first archetype that satisfied it (chaos-gameable — must be
+    rejected). Mirrors `_mechanically_verify_criterion_on_clip`'s
+    contract: never raises, deterministic, caller-owns-the-decision."""
+    for name, namespace in _chaos_trajectory_namespaces():
+        if _criterion_trips_on_chaos(criterion, namespace):
+            return name
+    return None
+
+
+def ground_stage_criterion(
+    stage: Stage,
+    cropped_clip: dict,
+    *,
+    client: Any = None,
+    model: str = MODEL_ID,
+) -> dict[str, Any]:
+    """§D24 F2 (docs/internal/REFERENCE_BUILD_LOG.md D23/D24): re-ground
+    `stage.success_criterion` in the CROPPED reference clip's real
+    kinematic signature, right after a span attaches
+    (`_select_and_attach_span`, both the decompose and redecompose
+    paths) and in `mission_metrics`'s lazy span-backfill path (the
+    channel that fixes an EXISTING mission's criterion, e.g.
+    g1-standing's torso_righting, without a full re-decomposition).
+
+    D23's root cause chain started upstream of certification:
+    `success_criterion` is authored BLIND (in the SAME LLM call as
+    `goal_text`, before any per-stage clip is known), so it can demand a
+    number a sub-phase goal can never satisfy (`root_height > 0.35` on a
+    stage whose goal keeps the pelvis at ~0.14 m). This closes that gap
+    for every stage whose criterion is re-groundable after the fact.
+
+    ONE LLM call (`criterion_ground` role, via `_parse_with_retry` — a
+    schema-repair retry on a malformed RESPONSE only, no outer
+    gate-feedback retry loop like `reconcile_criterion`'s two-attempt
+    scheme): a wrong re-grounding is worse than doing nothing, so this
+    function KEEPS the original criterion on ANY failure (API error,
+    unparseable/empty response, the STATIC safety gates
+    `_validate_success_criterion`/`_validate_criterion_ast` — run FIRST,
+    exactly like `_gate_reconciled_criterion` — or, only once the rewrite
+    is already known SAFE, the MECHANICAL acceptance check
+    `_mechanically_verify_criterion_on_clip`, or (§D29-4, run right
+    after that check) the ANTI-CHAOS check `_chaos_gate_reject_reason`)
+    rather than burning more calls chasing a fix. The on-exemplar
+    mechanical check makes a WRONG re-grounded criterion strictly HARDER
+    to adopt than the status quo: every `trajectory`/`behavior`-only
+    conjunct in the rewrite must evaluate `True` on the cropped
+    reference clip's own data (`components`-referencing conjuncts are
+    unverifiable here and skipped) — a criterion that fails its own
+    reference exemplar is exactly the D23 defect this increment exists
+    to close, so it is REJECTED, never adopted. The anti-chaos check is
+    its NEGATIVE complement (§D29-4, docs/internal/REFERENCE_BUILD_LOG.md
+    D29 finding 4): the on-exemplar check alone cannot see that a bare
+    `.any()`-shaped reach clause is ALSO trivially satisfied by a
+    tumbling/exploding rollout (fall-termination is off for get-up
+    stages, so a chaos rollout runs the full episode length too) — the
+    rewrite must evaluate False against every synthetic chaos archetype
+    in `_chaos_trajectory_namespaces` or it is rejected the same way.
+
+    Mutates `stage.success_criterion` in place ONLY on acceptance.
+    Returns `{"adopted": bool, "rationale": <str>}` ALWAYS (never
+    raises) — `rationale` is Claude's stated rationale when adopted, or
+    a short reason naming why the original was kept otherwise. The
+    caller decides whether/how to surface this (e.g. onto a report
+    entry); this function's own non-adoption paths are also logged to
+    stderr (never silent), mirroring `_select_and_attach_span`'s
+    declined-span logging."""
+    original = stage.success_criterion
+
+    try:
+        from sculptor.refs.convert import kinematic_signature
+
+        signature = kinematic_signature(cropped_clip)
+    except Exception as e:  # noqa: BLE001 — grounding is best-effort
+        reason = f"signature computation failed: {type(e).__name__}: {e}"
+        print(f"[decompose] stage {stage.name!r}: criterion re-grounding "
+              f"skipped ({reason}) — keeping the original criterion.",
+              file=sys.stderr, flush=True)
+        return {"adopted": False, "rationale": reason}
+
+    eval_reset: Optional[dict] = None
+    try:
+        from sculptor.reference import derive_eval_reset
+
+        eval_reset = derive_eval_reset(cropped_clip)
+    except Exception:  # noqa: BLE001 — advisory context only, never blocks
+        eval_reset = None
+
+    if client is None:
+        import anthropic
+
+        client = anthropic.Anthropic(max_retries=2, timeout=240.0)
+
+    system_prompt = load_prompt("criterion_ground")
+    payload: dict[str, Any] = {
+        "stage_name": stage.name,
+        "stage_goal": stage.goal_text,
+        "original_criterion": original,
+        "signature": signature,
+    }
+    if eval_reset is not None:
+        payload["eval_reset"] = eval_reset
+
+    try:
+        parsed = _parse_with_retry(
+            client, system_prompt, json.dumps(payload, indent=2, default=str),
+            output_format=_CriterionGroundModel, model=model,
+        )
+    except Exception as e:  # noqa: BLE001 — a failed call keeps the original
+        reason = f"LLM call failed: {type(e).__name__}: {e}"
+        print(f"[decompose] stage {stage.name!r}: criterion re-grounding "
+              f"{reason} — keeping the original criterion.",
+              file=sys.stderr, flush=True)
+        return {"adopted": False, "rationale": reason}
+
+    new_criterion = (parsed.success_criterion or "").strip()
+    if not new_criterion or new_criterion == original.strip():
+        reason = (parsed.rationale or "no change needed").strip() or (
+            "no change needed")
+        return {"adopted": False, "rationale": reason}
+
+    # Static SAFETY gates FIRST (mirrors `_gate_reconciled_criterion`'s own
+    # discipline, and MUST run before `_mechanically_verify_criterion_on_
+    # clip` below): that function's `eval()` trusts the AST walker as its
+    # ONLY safety layer (same convention `_evaluate_success_criterion`
+    # documents — real `__builtins__` are passed through because numpy's
+    # own methods need them), so a Lambda/unsafe-Call rewrite MUST be
+    # rejected here, before it is ever `eval`'d against the clip.
+    from dataclasses import replace as _dc_replace
+
+    from sculptor.mission import _validate_success_criterion
+
+    candidate = _dc_replace(stage, success_criterion=new_criterion)
+    try:
+        _validate_success_criterion(candidate, set())
+    except MissionValidationError as e:
+        reason = f"failed static validation: {e}"
+        print(f"[decompose] stage {stage.name!r}: re-grounded criterion "
+              f"REJECTED ({reason}) — keeping the original criterion.",
+              file=sys.stderr, flush=True)
+        return {"adopted": False, "rationale": reason}
+
+    import ast as _ast
+
+    from sculptor.mission_runtime import (
+        BARE_IDENTIFIERS,
+        CriterionEvalError,
+        _validate_criterion_ast,
+    )
+
+    try:
+        _validate_criterion_ast(
+            _ast.parse(new_criterion, mode="eval"),
+            namespace_keys=set(BARE_IDENTIFIERS) | {
+                "behavior", "components", "trajectory", "info",
+            },
+        )
+    except (CriterionEvalError, SyntaxError) as e:
+        reason = f"failed the runtime safety gate: {e}"
+        print(f"[decompose] stage {stage.name!r}: re-grounded criterion "
+              f"REJECTED ({reason}) — keeping the original criterion.",
+              file=sys.stderr, flush=True)
+        return {"adopted": False, "rationale": reason}
+
+    # ONLY NOW is it safe to mechanically evaluate the rewrite's
+    # trajectory/behavior-only conjuncts against the cropped clip.
+    fail_reason = _mechanically_verify_criterion_on_clip(
+        new_criterion, cropped_clip)
+    if fail_reason is not None:
+        reason = f"mechanical verification failed: {fail_reason}"
+        print(f"[decompose] stage {stage.name!r}: re-grounded criterion "
+              f"REJECTED ({reason}) — keeping the original criterion "
+              f"{original!r}.", file=sys.stderr, flush=True)
+        return {"adopted": False, "rationale": reason}
+
+    # §D29-4 anti-chaos check: the on-exemplar check above only proves
+    # the rewrite passes on HONEST motion — it says nothing about
+    # whether a chaos/explosion rollout also satisfies it (the live
+    # D29 defect: a bare `.any()`-shaped reach clause is trivially
+    # satisfied by a tumbling explosion). Run AFTER the on-exemplar
+    # check (so a criterion that fails its own exemplar is rejected for
+    # THAT reason first) but still before ever adopting the rewrite.
+    chaos_hit = _chaos_gate_reject_reason(new_criterion)
+    if chaos_hit is not None:
+        reason = f"criterion satisfied by chaos trajectory: {chaos_hit}"
+        print(f"[decompose] stage {stage.name!r}: re-grounded criterion "
+              f"REJECTED ({reason}) — keeping the original criterion "
+              f"{original!r}.", file=sys.stderr, flush=True)
+        return {"adopted": False, "rationale": reason}
+
+    stage.success_criterion = new_criterion
+    return {"adopted": True, "rationale": parsed.rationale}

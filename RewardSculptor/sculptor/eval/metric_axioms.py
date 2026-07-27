@@ -173,11 +173,189 @@ def _eval(fn: Callable[..., dict], arrays: dict, meta: dict) -> float:
         return float("nan")
 
 
+def _manipulation_fixture() -> tuple[dict, dict, dict]:
+    """A capability-described two-object lift, independent of robot names."""
+    time_steps, envs, dt = 70, 2, 0.02
+    names = ("parcel", "spare")
+    arrays: dict[str, np.ndarray] = {
+        "target_object_index": np.zeros((time_steps, envs), dtype=np.int32),
+        "target__pos_w": np.zeros((time_steps, envs, 3), dtype=np.float64),
+        "rollout_valid": np.ones((time_steps, envs), dtype=bool),
+        "rollout_terminal": np.zeros((time_steps, envs), dtype=bool),
+    }
+    arrays["target_object_index"][:, 1] = 1
+    arrays["target__pos_w"][..., 0] = 0.30
+    arrays["target__pos_w"][..., 2] = 0.25
+    for object_index, name in enumerate(names):
+        pos = np.zeros((time_steps, envs, 3), dtype=np.float64)
+        pos[..., 0] = 0.30
+        pos[..., 2] = 0.03
+        grasp = np.zeros((time_steps, envs), dtype=np.float64)
+        for env_index in range(envs):
+            if object_index != int(arrays["target_object_index"][0, env_index]):
+                continue
+            pos[10:25, env_index, 2] = np.linspace(0.03, 0.25, 15)
+            pos[25:, env_index, 2] = 0.25
+            grasp[12:, env_index] = 1.0
+        arrays[f"object__{name}__pos_w"] = pos
+        arrays[f"object__{name}__lin_vel_w"] = np.gradient(pos, dt, axis=0)
+        arrays[f"object__{name}__ang_vel_w"] = np.zeros_like(pos)
+        arrays[f"contact__left__{name}"] = grasp.copy()
+        arrays[f"contact__right__{name}"] = grasp.copy()
+        arrays[f"grasp__{name}"] = grasp
+    contract = {
+        "schema_version": 2,
+        "object_names": list(names),
+        "finger_groups": {"left": ["pad_l"], "right": ["pad_r"]},
+        "grasp_capable": True,
+        "target_contract": {
+            "position_frame": "world",
+            "declared_success_threshold_m": 0.05,
+        },
+    }
+    behavior = {
+        "step_dt": dt,
+        "max_episode_steps": time_steps,
+        "rollout_num_envs": envs,
+    }
+    return arrays, behavior, {"manipulation_telemetry": contract}
+
+
+def _check_manipulation_axioms(fn: Callable[..., dict]) -> dict[str, Any]:
+    """Controlled invariants and exploit monotonicities for dynamic objects."""
+    arrays, behavior, meta = _manipulation_fixture()
+
+    def score(a: dict, m: dict = meta) -> float:
+        try:
+            return float(fn(a, behavior, m).get("spec_score", float("nan")))
+        except Exception:  # noqa: BLE001 - a perturbation crash is a failure
+            return float("nan")
+
+    base = score(arrays)
+    axioms: dict[str, bool] = {}
+    reasons: list[str] = []
+    details: dict[str, Any] = {"operating_score": base}
+    if not np.isfinite(base) or base < 0.99:
+        return {
+            "ok": False,
+            "axioms": {"competent_positive": False},
+            "reasons": [
+                "[axiom:manipulation] competent target-aware lift did not score"
+            ],
+            "details": details,
+        }
+    axioms["competent_positive"] = True
+
+    translated = _copy(arrays)
+    offset = np.asarray([100.0, -50.0, 7.0])
+    translated["target__pos_w"] += offset
+    for name in meta["manipulation_telemetry"]["object_names"]:
+        translated[f"object__{name}__pos_w"] += offset
+    translated_score = score(translated)
+    axioms["object_translation_invariant"] = bool(
+        np.isfinite(translated_score) and abs(translated_score - base) <= 1e-6)
+    details["translation_score"] = translated_score
+
+    rotated = _copy(arrays)
+    theta = np.deg2rad(_YAW_DEG)
+    rotation = np.asarray([
+        [np.cos(theta), -np.sin(theta)],
+        [np.sin(theta), np.cos(theta)],
+    ])
+    for key, value in rotated.items():
+        if key == "target__pos_w" or (
+            key.startswith("object__")
+            and (key.endswith("__pos_w") or key.endswith("__lin_vel_w"))
+        ):
+            value[..., :2] = value[..., :2] @ rotation.T
+    rotated_score = score(rotated)
+    axioms["object_yaw_invariant"] = bool(
+        np.isfinite(rotated_score) and abs(rotated_score - base) <= 1e-6)
+    details["yaw_score"] = rotated_score
+
+    relabeled: dict[str, Any] = {}
+    replacements = {"parcel": "workpiece_a", "spare": "workpiece_b"}
+    for key, value in arrays.items():
+        renamed = key
+        for old, new in replacements.items():
+            renamed = renamed.replace(f"__{old}", f"__{new}")
+        relabeled[renamed] = value.copy() if isinstance(value, np.ndarray) else value
+    relabeled_meta = {
+        "manipulation_telemetry": {
+            **meta["manipulation_telemetry"],
+            "object_names": [replacements[name] for name in
+                             meta["manipulation_telemetry"]["object_names"]],
+        },
+    }
+    relabeled_score = score(relabeled, relabeled_meta)
+    axioms["object_name_invariant"] = bool(
+        np.isfinite(relabeled_score) and abs(relabeled_score - base) <= 1e-6)
+    details["relabel_score"] = relabeled_score
+
+    negatives: dict[str, dict] = {}
+    wrong_target = _copy(arrays)
+    wrong_target["target_object_index"][:, 0] = 1
+    negatives["wrong_target"] = wrong_target
+
+    disturbed = _copy(arrays)
+    spare = disturbed["object__spare__pos_w"]
+    spare[20:, 0, 1] += 0.08
+    disturbed["object__spare__lin_vel_w"] = np.gradient(
+        spare, behavior["step_dt"], axis=0)
+    negatives["distractor_disturbance"] = disturbed
+
+    proxy = _copy(arrays)
+    for name in meta["manipulation_telemetry"]["object_names"]:
+        proxy[f"object__{name}__pos_w"][..., 2] = 0.03
+        proxy[f"object__{name}__lin_vel_w"][:] = 0.0
+    negatives["contact_proxy_only"] = proxy
+
+    truncated = _copy(arrays)
+    truncated["rollout_valid"][38:] = False
+    negatives["time_truncation"] = truncated
+
+    unstable = _copy(arrays)
+    unstable["object__parcel__lin_vel_w"][25:, 0, 0] = 0.5
+    unstable["object__spare__lin_vel_w"][25:, 1, 0] = 0.5
+    negatives["unstable_hold"] = unstable
+
+    # Outcome without mechanism: a perfect transport whose grasp/contact
+    # evidence is uniformly absent (self-consistent, so it cannot be caught
+    # by the forgery cross-check). The grasp-fraction and grasp-gap gates are
+    # individually redundant on dense evidence; this negative is the one
+    # check that fails if BOTH are removed.
+    ungrasped = _copy(arrays)
+    for key in list(ungrasped):
+        if key.startswith("grasp__") or key.startswith("contact__"):
+            ungrasped[key] = np.zeros_like(ungrasped[key])
+    negatives["no_grasp_evidence"] = ungrasped
+
+    for name, perturbed in negatives.items():
+        observed = score(perturbed)
+        ok = np.isfinite(observed) and observed <= 0.5 + 1e-6
+        axioms[name] = bool(ok)
+        details[name + "_score"] = observed
+        if not ok:
+            reasons.append(
+                f"[axiom:{name}] exploit scored {observed!r}; expected <= 0.5")
+
+    for name, passed in axioms.items():
+        if not passed and name not in negatives:
+            reasons.append(f"[axiom:{name}] manipulation invariance failed")
+    return {
+        "ok": all(axioms.values()),
+        "axioms": axioms,
+        "reasons": reasons,
+        "details": details,
+    }
+
+
 def check_metric_axioms(
     fn: Callable[..., dict],
     *,
     family: Optional[str] = None,
     required_roles: Optional[Sequence[str]] = None,
+    torso_target: str = "upright",
     tol_chaos: float = 0.50,
     tol_travel: float = 0.10,
     inv_tol: float = _INVARIANCE_TOL,
@@ -187,9 +365,16 @@ def check_metric_axioms(
 
     `family` (from `resolve_behavior_family`) scopes the stationarity axiom.
     `required_roles` are injected (lenient) so a role-based metric reads the
-    right synthetic columns. The chaos tolerance (0.5) clears the most
-    peak-sensitive GOOD_* metric (~0.33 worst-case) while catching a pure
-    energy rewarder (~1.0); the invariances are exact (1e-6)."""
+    right synthetic columns. `torso_target` (from `resolve_torso_target`, LAW
+    13) scopes the M1 uprightness-monotonicity axiom: it runs ONLY for an
+    `"upright"` skill (the default), and is SKIPPED for a `"horizontal"`
+    (flip/dive/roll/crawl) or `"any"` (handstand/cartwheel) target — a metric
+    that competently rewards a non-upright torso must not be penalised for it.
+    The chaos tolerance (0.5) clears the most peak-sensitive GOOD_* metric
+    (~0.33 worst-case) while catching a pure energy rewarder (~1.0); the
+    invariances are exact (1e-6)."""
+    if family == "manipulation":
+        return _check_manipulation_axioms(fn)
     meta = {"joint_names": list(_NAMES_12)}
     inject_joint_roles(meta, list(required_roles or []), lenient=True)
     arche = _archetypes()
@@ -239,21 +424,28 @@ def check_metric_axioms(
                 f"{base_score + d:.3f} (Δ{d:+.4f}) — the metric reads a "
                 f"frame/units artifact, not physical competence")
 
-    # ── M1 uprightness monotonicity (sweep) ──────────────────────────
-    sweep = [_eval(fn, _tilt(base, deg), meta) for deg in _TILT_SWEEP_DEG]
-    details["uprightness_sweep"] = [
-        round(v, 4) if np.isfinite(v) else None for v in sweep]
-    mono = True
-    for i in range(len(sweep) - 1):
-        a, b2 = sweep[i], sweep[i + 1]
-        if np.isfinite(a) and np.isfinite(b2) and b2 > a + _MONO_TOL:
-            mono = False
-            reasons.append(
-                f"[axiom:uprightness] tilting the base from {int(_TILT_SWEEP_DEG[i])}°"
-                f" to {int(_TILT_SWEEP_DEG[i + 1])}° RAISED the score "
-                f"{a:.3f}→{b2:.3f} — the metric rewards falling, not the behavior")
-            break
-    axioms["uprightness_monotone"] = bool(mono)
+    # ── M1 uprightness monotonicity (sweep) — §LAW 13: upright skills ONLY ──
+    # Tilt the operating point from vertical toward horizontal and require the
+    # score not to RISE. A flip/dive/roll (torso_target="horizontal") or a
+    # handstand/cartwheel ("any") is competently non-upright, so a metric that
+    # scores a tilted torso higher must NOT be penalised — skip the sweep.
+    if torso_target == "upright":
+        sweep = [_eval(fn, _tilt(base, deg), meta) for deg in _TILT_SWEEP_DEG]
+        details["uprightness_sweep"] = [
+            round(v, 4) if np.isfinite(v) else None for v in sweep]
+        mono = True
+        for i in range(len(sweep) - 1):
+            a, b2 = sweep[i], sweep[i + 1]
+            if np.isfinite(a) and np.isfinite(b2) and b2 > a + _MONO_TOL:
+                mono = False
+                reasons.append(
+                    f"[axiom:uprightness] tilting the base from {int(_TILT_SWEEP_DEG[i])}°"
+                    f" to {int(_TILT_SWEEP_DEG[i + 1])}° RAISED the score "
+                    f"{a:.3f}→{b2:.3f} — the metric rewards falling, not the behavior")
+                break
+        axioms["uprightness_monotone"] = bool(mono)
+    else:
+        details["uprightness_monotone_skipped"] = f"torso_target={torso_target}"
 
     # ── M2 no reward for chaos / raw energy ───────────────────────────
     d_cha = _delta(_inject_chaos(base))

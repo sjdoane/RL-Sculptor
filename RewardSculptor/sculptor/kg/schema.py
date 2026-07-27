@@ -18,6 +18,22 @@ Design notes
 
 IDs must be globally unique across node types. Use the helpers
 `make_paper_id`, `make_technique_id`, etc. to build them consistently.
+
+- **§Agentic-data upgrade 1 (provenance trust tiers)**: the node kinds the
+  diagnoser/decomposer actually retrieve and render to Claude (Paper,
+  Technique, FailureMode, RewardComponent, RunCase) carry a `provenance`
+  field — one of "observed_run" | "paper_claim" | "llm_extraction" |
+  "seed" — so a retrieval-time renderer can tell Claude WHERE a claim came
+  from (this system's own runs vs. a paper's claims vs. an LLM inference
+  vs. a hand-seeded fact). Stored in the JSON data blob like any other
+  field, so no store-schema change is needed. Backward compatible for
+  free: `row_to_node` calls `cls(id=node_id, **data)`, and a dataclass
+  field with a default is simply omitted from `**data` on old rows — the
+  type's own default fires. Per-type defaults (see each dataclass):
+  RunCase → "observed_run" (it IS a recorded run); Technique /
+  FailureMode / RewardComponent → "paper_claim" (materialized from
+  extraction with paper evidence attached); Paper → "seed" (the 46-paper
+  KG seed set / ingest entry point).
 """
 
 from __future__ import annotations
@@ -28,6 +44,60 @@ import re
 import time
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
+
+
+# ── Provenance trust tiers ───────────────────────────────────────────────────
+#: §Agentic-data upgrade 1. Free-string rather than an enum (like Relation)
+#: because provenance is advisory metadata for prompt rendering, not a
+#: graph-walk key — an unrecognized value on disk should degrade gracefully
+#: (render as "llm-inferred", the least-trusted tag) rather than raise.
+PROVENANCE_OBSERVED_RUN = "observed_run"
+PROVENANCE_PAPER_CLAIM = "paper_claim"
+PROVENANCE_LLM_EXTRACTION = "llm_extraction"
+PROVENANCE_SEED = "seed"
+
+#: Compact per-item tag rendered inline in prompt context (diagnose.py's
+#: literature block, cases.py's case-memory block) so Claude can see, at a
+#: glance, WHERE each claim came from. `observed_run` gets an emphatic tag
+#: ("in THIS project's own runs") because it is the highest-trust tier —
+#: see the header line each renderer prepends: observations outrank paper
+#: claims when they conflict.
+_EVIDENCE_TAGS: dict[str, str] = {
+    PROVENANCE_OBSERVED_RUN: "[evidence: observed run]",
+    PROVENANCE_PAPER_CLAIM: "[evidence: paper]",
+    PROVENANCE_SEED: "[evidence: seed]",
+    PROVENANCE_LLM_EXTRACTION: "[evidence: llm-inferred]",
+}
+
+
+def evidence_tag(provenance: str | None) -> str:
+    """Compact `[evidence: ...]` tag for a node's provenance value.
+    Unrecognized/None provenance (e.g. a future value not yet known to
+    this module) degrades to the LEAST-trusted tag rather than raising —
+    provenance is advisory rendering metadata, not a graph-integrity
+    constraint."""
+    return _EVIDENCE_TAGS.get(
+        provenance or "", _EVIDENCE_TAGS[PROVENANCE_LLM_EXTRACTION])
+
+
+#: Trust ranking for provenance merges (higher = more trusted). Unknown
+#: values rank lowest, same as the rendering fallback above.
+_PROVENANCE_TRUST: dict[str, int] = {
+    PROVENANCE_OBSERVED_RUN: 3,
+    PROVENANCE_PAPER_CLAIM: 2,
+    PROVENANCE_SEED: 1,
+    PROVENANCE_LLM_EXTRACTION: 0,
+}
+
+
+def merge_provenance(existing: str | None, incoming: str | None) -> str:
+    """Pick the MORE-trusted of two provenance values when merging node
+    data (e.g. a diagnoser-flagged FailureMode stub later attested by a
+    paper extraction upgrades llm_extraction -> paper_claim; the reverse
+    never downgrades). None/unknown values rank as least-trusted."""
+    e = existing or PROVENANCE_LLM_EXTRACTION
+    i = incoming or PROVENANCE_LLM_EXTRACTION
+    return e if _PROVENANCE_TRUST.get(e, 0) >= _PROVENANCE_TRUST.get(i, 0) else i
 
 
 # ── Relation enum ───────────────────────────────────────────────────────────
@@ -53,9 +123,18 @@ class Paper:
     year: int | None = None
     abstract: str = ""
     conclusion_text: str = ""
+    #: Campaign curation metadata. Unlike PDF-derived claims, these fields
+    #: record why the human/system chose this source and make unextracted
+    #: hybrid-corpus papers retrievable by domain.
+    rationale: str = ""
+    tags: list[str] = field(default_factory=list)
+    tier: str | None = None
+    source_url: str = ""
     full_text_path: str | None = None
     ingested_at: float = field(default_factory=time.time)
     extracted: bool = False  # set True after LLM extraction lands in a later prompt
+    #: §Agentic-data upgrade 1: papers are the KG's seed literature set.
+    provenance: str = PROVENANCE_SEED
 
 
 @dataclass
@@ -67,6 +146,25 @@ class Technique:
     name: str
     description: str = ""
     tags: list[str] = field(default_factory=list)
+    #: §Agentic-data upgrade 1: materialized from LLM extraction over a
+    #: paper's text, with paper evidence attached at the edge level.
+    provenance: str = PROVENANCE_PAPER_CLAIM
+    #: §Agentic-data upgrade 2 (usage-based enrichment): incremented each
+    #: time a KEPT ("helped") reward edit cites this technique's
+    #: introducing paper — a coarse, capped signal that this technique has
+    #: actually paid off in THIS project's own runs, not just been
+    #: proposed. See query.py's ranking boost for the (deliberately small)
+    #: cap rationale.
+    useful_citations: int = 0
+    #: §KG-retrieval fix 4 (outcome-stats ranking): per-FailureMode
+    #: helped/regressed tallies from this project's OWN RunCase verdicts —
+    #: `{<failure_mode_node_id>: {"helped": int, "regressed": int}}`.
+    #: Written by `kg.cases.record_run_cases`, read by
+    #: `kg.query.query_techniques`'s ordering boost. Unlike
+    #: `useful_citations` (any "helped" iteration citing this technique's
+    #: paper) this is scoped PER failure mode, so a technique that helps
+    #: with one failure but regresses another doesn't wash out.
+    outcome_stats: dict[str, dict[str, int]] = field(default_factory=dict)
 
 
 @dataclass
@@ -79,6 +177,10 @@ class FailureMode:
     description: str = ""
     symptoms: list[str] = field(default_factory=list)
     environment_tag: str | None = None  # e.g. "continuous_locomotion"
+    #: §Agentic-data upgrade 1: extracted from a paper's text (some are
+    #: diagnoser-flagged stubs — see cases.py — but the type default
+    #: reflects the common paper-derived case).
+    provenance: str = PROVENANCE_PAPER_CLAIM
 
 
 @dataclass
@@ -91,6 +193,8 @@ class RewardComponent:
     description: str = ""
     formula: str | None = None
     hyperparameters: dict[str, float] = field(default_factory=dict)
+    #: §Agentic-data upgrade 1: materialized from paper extraction.
+    provenance: str = PROVENANCE_PAPER_CLAIM
 
 
 @dataclass
@@ -130,6 +234,7 @@ class RunCase:
     id: str
     task: str                                  # the behavior goal
     robot: str = ""                            # env / robot tag (optional)
+    project: str = ""                          # project/stage scope (optional)
     symptom: str = ""                          # short failure description
     failure_modes: list[str] = field(default_factory=list)
     edit_summary: str = ""                     # what was changed in response
@@ -137,7 +242,54 @@ class RunCase:
     fitness_after: float | None = None
     fitness_delta: float | None = None
     verdict: str = "unknown"                   # helped|regressed|neutral|unknown
+    # §2026-07-03 case-content upgrade. The original case carried only
+    # "responded with N edit(s)" — a future diagnoser retrieving it
+    # learned nothing actionable (WHICH edit failed? WHAT was the
+    # behavior?). All optional so pre-upgrade rows load unchanged.
+    #: Compact applied-edit identities, e.g. ["decrease stance_weight",
+    #: "add flight_bonus"] — what a future run must not blindly repeat.
+    edits: list[str] = field(default_factory=list)
+    #: Paper references credited by this case. Persisted so a resumed run
+    #: can update/reverse counters when an unknown verdict becomes measured,
+    #: without double-counting an idempotent re-record.
+    references: list[str] = field(default_factory=list)
+    #: Attribution accounting schema. Rows written before references were
+    #: persisted load as 0, allowing one conservative migration on re-record.
+    attribution_version: int = 0
+    #: Dense sub-success progress (§Convergence): the channel that ranks
+    #: iters when the completion-gated fitness is 0.0 everywhere. Without
+    #: it, every case from a below-gate run was verdict-'neutral' noise.
+    progress_before: float | None = None
+    progress_after: float | None = None
+    progress_delta: float | None = None
+    #: Salient physical numbers from the metric's component breakdown
+    #: (e.g. apex_gain_m_mean, frac_launched) — the behavior signature
+    #: that lets retrieval + the prompt distinguish "stand-still farm"
+    #: from "tumble-bounce" instead of lumping both as reward_hacking.
+    behavior: dict[str, float] = field(default_factory=dict)
     created_at: float = field(default_factory=time.time)
+    #: §Agentic-data upgrade 1: a RunCase IS an observed run by construction.
+    provenance: str = PROVENANCE_OBSERVED_RUN
+    #: §Agentic-data upgrade 4 (freshness metadata). The reward file version
+    #: (e.g. "v3") and env-spec version (e.g. "v2") ACTIVE when this
+    #: iteration trained — lets a future diagnoser (or a human) tell how
+    #: stale a retrieved case is relative to the project's current reward
+    #: / env. Populated in `record_run_cases` from whatever the run-history
+    #: record already carries (`IterOutcome.reward_path_trained` /
+    #: `.env_spec_trained`); None when unavailable (old rows, blind runs
+    #: with no trained-reward path recorded).
+    reward_version: str | None = None
+    env_spec_version: str | None = None
+    #: §Env-authoring §10 (world-tuple identity): the atomic selection's
+    #: tuple_hash plus the world/task artifact versions ACTIVE while this
+    #: iteration trained. Lets retrieval and humans judge how stale a case
+    #: is relative to the project's current authored world, and ties the
+    #: measured outcome to one exact evaluation lineage. Read fail-soft
+    #: from the iteration's pinned selection file; None for legacy
+    #: (non-authored) runs and pre-upgrade rows.
+    world_tuple_hash: str | None = None
+    world_version: int | None = None
+    task_version: int | None = None
 
 
 @dataclass
@@ -216,10 +368,21 @@ def node_to_row(node: Any) -> tuple[str, str, dict[str, Any]]:
 
 
 def row_to_node(node_id: str, kind: str, data: dict[str, Any]) -> Any:
-    """Inverse of `node_to_row`. Looks up the dataclass type by `kind`."""
+    """Inverse of `node_to_row`. Looks up the dataclass type by `kind`.
+
+    Forward-compatible on FIELDS: keys in `data` that this code version's
+    dataclass doesn't know are DROPPED (a row written by a newer schema
+    must not make older readers' `get_node` raise TypeError — symmetric
+    with the backward-compat direction, where a missing key falls back to
+    the field default). Unknown KINDS still raise: a whole node type this
+    code can't represent is not safely partial-readable."""
     cls = NODE_TYPES.get(kind)
     if cls is None:
         raise ValueError(f"unknown node kind: {kind!r}")
+    known = {f.name for f in dataclasses.fields(cls)} - {"id"}
+    extra = data.keys() - known
+    if extra:
+        data = {k: v for k, v in data.items() if k in known}
     return cls(id=node_id, **data)
 
 

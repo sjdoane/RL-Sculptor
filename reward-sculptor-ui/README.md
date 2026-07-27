@@ -37,8 +37,9 @@ The script:
 
 - checks `uv` + `pnpm` are on PATH, `.venv` + `frontend/node_modules`
   exist, and port 8000 is free (with clear messages if any check fails);
-- warns if `ANTHROPIC_API_KEY` isn't set (live runs will fail; dry-run
-  still works);
+- reports when no shell/repository API key is present; a key saved from
+  **Settings → Anthropic API** is loaded automatically and never returned
+  by the API;
 - starts the FastAPI backend on `127.0.0.1:$RS_PORT` (default 8000),
   waits for `/health` to 200;
 - starts the Vite dev server on `127.0.0.1:5173`;
@@ -101,8 +102,11 @@ footgun. Override with `RS_ALLOW_CLOUD_SYNC=true`.
 - **Knowledge graph** — paste arxiv IDs, run ingest + extract as a
   background job, browse papers + extracted techniques + failure
   modes, open the pyvis interactive graph in a modal.
-- **Settings** (`/settings`) — API key status, GPU info, paths, theme
-  toggle, reset-UI-state button.
+- **Settings** (`/settings`) — save or replace the local Anthropic API key,
+  inspect GPU/runtime readiness and paths, toggle theme, and reset UI state.
+
+For a start-to-finish, UI-operated showcase, see the
+[lab-call demo runbook](docs/LAB_CALL_DEMO_RUNBOOK.md).
 
 ## Endpoints (brief)
 

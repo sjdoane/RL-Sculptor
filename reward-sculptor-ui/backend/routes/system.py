@@ -16,7 +16,8 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, HTTPException, Request, status
+from pydantic import BaseModel, ConfigDict, Field, SecretStr
 
 from backend.models.system import (
     RemoteDoctorResponse,
@@ -24,6 +25,7 @@ from backend.models.system import (
     SystemKgStatsResponse,
 )
 from backend.services import kg_store, sculptor_bridge
+from backend.services.api_key_store import mask_key, save_key
 from backend.services.remote_settings import (
     RemoteSettings,
     load_remote_settings,
@@ -33,6 +35,37 @@ from backend.services.remote_settings import (
 
 
 router = APIRouter(prefix="/system", tags=["system"])
+
+
+class ApiKeyUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    api_key: SecretStr = Field(min_length=20, max_length=512)
+
+
+class ApiKeyStatus(BaseModel):
+    configured: bool
+    masked: str | None = None
+    persisted: bool = False
+
+
+@router.put("/api-key", response_model=ApiKeyStatus)
+def put_api_key(request: Request, body: ApiKeyUpdate) -> ApiKeyStatus:
+    """Save a localhost-only API key without ever echoing it back."""
+    root = request.app.state.settings.resolved_projects_root
+    value = body.api_key.get_secret_value()
+    try:
+        save_key(root, value)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=str(exc),
+        ) from exc
+    return ApiKeyStatus(
+        configured=True,
+        masked=mask_key(value.strip()),
+        persisted=True,
+    )
 
 
 @router.get("/remote", response_model=RemoteSettings)
@@ -122,6 +155,7 @@ def get_shared_kg_stats() -> SystemKgStatsResponse:
         reward_components=int(nodes.get("RewardComponent", 0)),
         environments=int(nodes.get("Environment", 0)),
         results=int(nodes.get("Result", 0)),
+        run_cases=int(nodes.get("RunCase", 0)),
         edges=int(raw.get("total_edges", 0)),
         embeddings=int(raw.get("total_embeddings", 0)),
     )

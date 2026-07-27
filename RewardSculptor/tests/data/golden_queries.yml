@@ -1,0 +1,214 @@
+# Golden-query acceptance suite for `sculptor.refs.retrieve` (deterministic
+# layer only, use_llm=False). Consumed by `tests/test_refs_golden_queries.py`.
+#
+# Each entry:
+#   query        free-text search string, exactly as a caller would type it.
+#   category     one of the 12 motion-concept categories this suite is meant
+#                to cover (get-up, fall, walk, run-sprint, jump, sit,
+#                stand-from-sit, crouch, ground-lying, dance, fight, push).
+#   expected     Python regex (re.search, case-insensitive) that a
+#                CORRECT top-`top_n` clip_id must match.
+#   top_n        how many of the top results must contain at least one
+#                match for `expected` (default 1 — exact top-1). Only use
+#                >1 for a query that is genuinely ambiguous between two
+#                defensible clip families; each such case must carry a
+#                `note` explaining the ambiguity.
+#   real_index   whether this query is also checked against the real
+#                on-disk library (~/.local/share/reward-sculptor/references/
+#                index.jsonl). False means the real library currently has
+#                NO clips in this concept class (verified 2026-07-11 by
+#                scanning the 5040-row g1 index for "sit"/"chair"/"seat"
+#                tokens — zero hits), so there is no honest real-index
+#                assertion to make; the query is still exercised against
+#                the in-test fixture index (always on).
+#   note         why `expected`/`top_n` is what it is, when non-obvious.
+#
+# The fixture layer (small in-memory index built in the test module) is
+# ALWAYS on and covers every entry regardless of `real_index`. The
+# real-index layer skips automatically when the real index file is
+# missing (fresh checkout / CI without a downloaded reference library).
+
+queries:
+  # ── get-up ──────────────────────────────────────────────────────────
+  - query: "get up off the ground"
+    category: get-up
+    expected: "^fallandgetup"
+    top_n: 1
+    real_index: true
+    note: >
+      THE locked §decision-7 acceptance query (existing unit tests already
+      pin this exact behavior) — included here too so the golden suite is
+      a complete, self-contained record of the retrieval contract.
+
+  - query: "get back up"
+    category: get-up
+    expected: "^fallandgetup"
+    top_n: 1
+    real_index: true
+
+  # ── fall ────────────────────────────────────────────────────────────
+  - query: "fall down"
+    category: fall
+    expected: "^fallandgetup"
+    top_n: 1
+    real_index: true
+    note: >
+      Regression query for the fall/get-up dilution defect (deferred
+      audit finding, build-log D2 follow-up, fixed 2026-07-11): "fall"
+      used to share a synonym group with "up", and "up" is common enough
+      across the library that it dragged "fall"'s corpus rarity down to
+      near zero, letting an unrelated clip that only shared the common
+      word "up" (bridged) plus the rare literal modifier "down" outrank
+      the actual fallAndGetUp clips. A fallAndGetUp PARENT clip is the
+      defensible top-1 (not a --segNN child): the parent is a strict
+      string prefix of its segment ids, and `deterministic_rank`'s
+      tie-break sorts equal scores by clip_id, so the parent naturally
+      wins ties over its own segments — the same behavior already
+      relied on by the locked "get up off the ground" query.
+
+  - query: "falling over"
+    category: fall
+    expected: "^fallandgetup"
+    top_n: 1
+    real_index: true
+    note: "falling -> fall (own group) synonym bridge, not a literal hit."
+
+  # ── walk ────────────────────────────────────────────────────────────
+  - query: "walk forward"
+    category: walk
+    expected: "walk"
+    top_n: 1
+    real_index: true
+
+  - query: "walking gait"
+    category: walk
+    expected: "walk"
+    top_n: 1
+    real_index: true
+    note: >
+      "walking" (inflected) is not itself a walk-group member — only
+      "walk" is — so this scores via a literal ungrouped-modifier hit on
+      "walking" against the real index (still lands on a genuine walking
+      clip) and via a synonym bridge ("gait" -> walk group) against the
+      fixture's literal "walk" row. Fixing the walk/walking inflection
+      gap is out of scope for this change (see fixture-layer test
+      docstring for the exact mechanism).
+
+  # ── run / sprint ────────────────────────────────────────────────────
+  - query: "run fast"
+    category: run-sprint
+    expected: "run"
+    top_n: 1
+    real_index: true
+
+  - query: "sprint quickly"
+    category: run-sprint
+    expected: "run|sprint"
+    top_n: 1
+    real_index: true
+
+  # ── jump ────────────────────────────────────────────────────────────
+  - query: "jump high"
+    category: jump
+    expected: "jump"
+    top_n: 1
+    real_index: true
+    note: "Also the round-2 concept-boost regression query (existing fixture test)."
+
+  - query: "hop over something"
+    category: jump
+    expected: "jump|hop"
+    top_n: 1
+    real_index: true
+
+  # ── sit (no real-index content) ────────────────────────────────────
+  - query: "sit down"
+    category: sit
+    expected: "sitdown"
+    top_n: 1
+    real_index: false
+    note: >
+      Verified 2026-07-11: the real g1 index (5040 rows) has zero clips
+      whose clip_id or text mentions sitting/chairs/seats. There is no
+      honest real-index top-1 to assert, so this stays fixture-only
+      until sit-content is ingested.
+
+  # ── stand-from-sit (no real-index content) ─────────────────────────
+  - query: "stand up from sitting"
+    category: stand-from-sit
+    expected: "standup"
+    top_n: 1
+    real_index: false
+    note: >
+      Same gap as `sit down` — no sit-adjacent clips exist in the real
+      index to stand up FROM. `kneel_up_from_crawl*` clips are the
+      closest real content (a floor-to-standing transition) but are a
+      crawl-recovery motion, not a sit-to-stand motion; asserting they
+      satisfy "stand up from sitting" would be gaming the test, so this
+      query is intentionally excluded from the real-index layer rather
+      than pinned to a misleading proxy.
+
+  # ── crouch / lie-to-crouch ──────────────────────────────────────────
+  - query: "crouch down"
+    category: crouch
+    expected: "crouch"
+    top_n: 1
+    real_index: true
+
+  - query: "squat low"
+    category: crouch
+    expected: "crouch|squat"
+    top_n: 1
+    real_index: true
+    note: "squat -> crouch group synonym bridge (no literal 'crouch' in the query)."
+
+  # ── ground / lying ──────────────────────────────────────────────────
+  - query: "lie down"
+    category: ground-lying
+    expected: "lie"
+    top_n: 1
+    real_index: true
+
+  - query: "lying flat"
+    category: ground-lying
+    expected: "lie"
+    top_n: 1
+    real_index: true
+    note: >
+      Deliberately avoids the phrase "on the ground": the real index has
+      a handful of unrelated clips whose text literally contains "on
+      the" (e.g. "running on the spot", "baggage on the head"), and
+      those common-stopword tokens ("on", "the") carry a surprisingly
+      high IDF (few rows contain them at all) that out-scores the actual
+      lie-family clips for a query like "lying on the ground" or
+      "prone on the ground". That is a real ranking gap (rare STOPWORDS,
+      not motion concepts, can still swamp a correct match) but it is a
+      distinct defect from the fall/get-up dilution this change fixes,
+      and is out of scope here — recorded, not silently routed around.
+
+  # ── dance ───────────────────────────────────────────────────────────
+  - query: "dance"
+    category: dance
+    expected: "^dance"
+    top_n: 1
+    real_index: true
+
+  - query: "dance around"
+    category: dance
+    expected: "^dance"
+    top_n: 1
+    real_index: true
+
+  # ── fight / boxing ──────────────────────────────────────────────────
+  - query: "fight"
+    category: fight
+    expected: "fight|boxing"
+    top_n: 1
+    real_index: true
+
+  # ── push ────────────────────────────────────────────────────────────
+  - query: "push"
+    category: push
+    expected: "push"
+    top_n: 1
+    real_index: true

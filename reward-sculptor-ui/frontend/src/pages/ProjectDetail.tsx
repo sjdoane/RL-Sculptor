@@ -1,5 +1,5 @@
-import { lazy, Suspense, useState } from "react";
-import { useNavigate, useParams } from "react-router-dom";
+import { lazy, Suspense, useCallback } from "react";
+import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 
 import { Icon } from "@/components/rs/icon";
 import { Badge, Btn, FactChip } from "@/components/rs/primitives";
@@ -10,24 +10,63 @@ import { NewRunDialog } from "@/components/NewRunDialog";
 import { RewardsTab } from "@/components/RewardsTab";
 import { RobotConfig } from "@/components/RobotConfig";
 import { RobotViewer } from "@/components/RobotViewer";
+import WorldTab, { courseBreakdownText } from "@/components/WorldTab";
 import { useLibraryRobot } from "@/hooks/useLibrary";
+import { useWorldSelection } from "@/hooks/useWorlds";
 import { usePhysics } from "@/hooks/usePhysics";
+import { usePolicies } from "@/hooks/usePolicies";
 import { useProject } from "@/hooks/useProjects";
+import { useRewards } from "@/hooks/useRewards";
 import { useRobot } from "@/hooks/useRobot";
 import { formatRelative } from "@/lib/utils";
-import type { ProjectDetail as ProjectDetailShape, RobotStateResponse } from "@/lib/types";
+import type { ProjectDetail as ProjectDetailShape, RobotStateResponse, SelectedStage } from "@/lib/types";
 
 const RunsTabLazy = lazy(() => import("@/components/RunsTab"));
 const ReportsTabLazy = lazy(() => import("@/components/ReportsTab"));
 
+// Ordered as the workflow reads: set up → design the reward → train →
+// take the results. Values appear in the URL (?tab=) so keep them stable.
 const TABS = [
   { value: "overview", label: "Overview", icon: "gauge" },
+  { value: "world", label: "World", icon: "globe" },
   { value: "rewards", label: "Rewards", icon: "file-code" },
   { value: "physics", label: "Physics", icon: "cpu" },
-  { value: "kg", label: "Knowledge Graph", icon: "network" },
-  { value: "runs", label: "Runs", icon: "activity" },
-  { value: "reports", label: "Reports", icon: "file-text" },
+  { value: "knowledge", label: "Knowledge", icon: "network" },
+  { value: "training", label: "Training", icon: "activity" },
+  { value: "results", label: "Results", icon: "file-text" },
 ] as const;
+
+type TabValue = (typeof TABS)[number]["value"];
+
+// Old bookmark / in-app values from before the IA rename.
+const LEGACY_TABS: Record<string, TabValue> = {
+  kg: "knowledge",
+  runs: "training",
+  reports: "results",
+};
+
+function normalizeTab(raw: string | null): TabValue {
+  if (raw && raw in LEGACY_TABS) return LEGACY_TABS[raw];
+  if (raw && TABS.some((t) => t.value === raw)) return raw as TabValue;
+  return "overview";
+}
+
+// A stage selection shared across tabs (currently consumed by Training;
+// Overview/Rewards receive the props so their wiring lands in a later
+// increment). URL-synced via `?stage=missionSlug/stageName` so the
+// selection survives refresh, mirroring the `?tab=` pattern above.
+// (SelectedStage itself is defined in lib/types.ts to avoid a circular
+// import back into this page module from RobotViewer/RunsTab.)
+function parseStageParam(raw: string | null): SelectedStage | null {
+  if (!raw) return null;
+  const idx = raw.indexOf("/");
+  if (idx <= 0 || idx === raw.length - 1) return null;
+  return { missionSlug: raw.slice(0, idx), stageName: raw.slice(idx + 1) };
+}
+
+function stageParam(s: SelectedStage): string {
+  return `${s.missionSlug}/${s.stageName}`;
+}
 
 function humanizeSlug(s: string | null | undefined): string {
   if (!s) return "";
@@ -40,8 +79,7 @@ function adapterShort(cls: string | null | undefined): string {
   return cls.split(".").pop() ?? cls;
 }
 
-// Generic padded scroll container for a tab's page content. Tabs not yet
-// reskinned (Physics/Rewards) render their existing components inside it.
+// Generic padded scroll container for a tab's page content.
 function ScrollPad({ children }: { children: React.ReactNode }) {
   return (
     <div className="rs-scroll">
@@ -98,7 +136,38 @@ export default function ProjectDetail() {
   const nav = useNavigate();
   const project = useProject(slug);
   const robot = useRobot(slug);
-  const [tab, setTab] = useState<string>("overview");
+  // Tab lives in the URL (?tab=training) so refresh keeps your place and
+  // any view is deep-linkable.
+  const [searchParams, setSearchParams] = useSearchParams();
+  const tab = normalizeTab(searchParams.get("tab"));
+  const setTab = (value: TabValue) => {
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        if (value === "overview") next.delete("tab");
+        else next.set("tab", value);
+        return next;
+      },
+      // replace, not push: Back should leave the page, not unwind every
+      // tab click. Deep-linking only needs the URL set.
+      { replace: true },
+    );
+  };
+
+  // Shared stage selection (Training tab consumes this increment;
+  // Overview/Rewards get the plumbing now, wired up later).
+  const selectedStage = parseStageParam(searchParams.get("stage"));
+  const setSelectedStage = useCallback((value: SelectedStage | null) => {
+    setSearchParams(
+      (prev) => {
+        const next = new URLSearchParams(prev);
+        if (!value) next.delete("stage");
+        else next.set("stage", stageParam(value));
+        return next;
+      },
+      { replace: true },
+    );
+  }, [setSearchParams]);
   const p = project.data;
   const canRun = !!p && !p.adapter_unavailable && p.ready_to_train !== false;
 
@@ -117,7 +186,14 @@ export default function ProjectDetail() {
         </div>
         <div className="rs-phead-spacer" />
         {p && <ProjectSettingsDialog project={p} />}
-        {p && canRun && <NewRunDialog slug={slug!} project={p} onLaunched={() => setTab("runs")} />}
+        {p && canRun && (
+          <NewRunDialog
+            slug={slug!}
+            project={p}
+            onLaunched={() => setTab("training")}
+            onOpenWorld={() => setTab("world")}
+          />
+        )}
       </div>
 
       {project.isLoading ? (
@@ -148,18 +224,65 @@ export default function ProjectDetail() {
             ))}
           </div>
 
-          {tab !== "runs" && <FactsBand project={p} />}
-          {tab !== "runs" && (p.adapter_unavailable || p.migration_warning) && <WarningBanners project={p} />}
+          {tab !== "training" && <FactsBand project={p} />}
+          {tab !== "training" && (p.adapter_unavailable || p.migration_warning) && <WarningBanners project={p} />}
 
-          {tab === "overview" && <OverviewTab slug={slug!} project={p} robot={robot.data} />}
-          {tab === "rewards" && <ScrollPad><RewardsTab slug={slug!} project={p} /></ScrollPad>}
-          {tab === "physics" && <ScrollPad><PhysicsTab slug={slug!} project={p} /></ScrollPad>}
-          {tab === "kg" && <KnowledgeGraphTab slug={slug!} />}
-          {tab === "runs" && (
-            <Suspense fallback={<TabFallback />}><RunsTabLazy slug={slug!} project={p} /></Suspense>
+          {tab === "overview" && (
+            <OverviewTab
+              slug={slug!}
+              project={p}
+              robot={robot.data}
+              onGoTo={setTab}
+              selectedStage={selectedStage}
+              setSelectedStage={setSelectedStage}
+            />
           )}
-          {tab === "reports" && (
-            <Suspense fallback={<TabFallback />}><ReportsTabLazy slug={slug!} /></Suspense>
+          {tab === "rewards" && (
+            <ScrollPad>
+              <RewardsTab
+                slug={slug!}
+                project={p}
+                selectedStage={selectedStage}
+                setSelectedStage={setSelectedStage}
+              />
+            </ScrollPad>
+          )}
+          {tab === "world" && (
+            <ScrollPad>
+              <WorldTab
+                slug={slug!}
+                launchAction={canRun ? (
+                  <NewRunDialog
+                    slug={slug!}
+                    project={p}
+                    onLaunched={() => setTab("training")}
+                    triggerLabel="Train this world"
+                  />
+                ) : undefined}
+              />
+            </ScrollPad>
+          )}
+          {tab === "physics" && <ScrollPad><PhysicsTab slug={slug!} project={p} /></ScrollPad>}
+          {tab === "knowledge" && <KnowledgeGraphTab slug={slug!} />}
+          {tab === "training" && (
+            <Suspense fallback={<TabFallback />}>
+              <RunsTabLazy
+                slug={slug!}
+                project={p}
+                onOpenWorld={() => setTab("world")}
+                selectedStage={selectedStage}
+                setSelectedStage={setSelectedStage}
+              />
+            </Suspense>
+          )}
+          {tab === "results" && (
+            <Suspense fallback={<TabFallback />}>
+              <ReportsTabLazy
+                slug={slug!}
+                selectedStage={selectedStage}
+                setSelectedStage={setSelectedStage}
+              />
+            </Suspense>
           )}
         </>
       )}
@@ -180,8 +303,15 @@ function TabFallback() {
 
 // ── Overview ──────────────────────────────────────────────────────────
 function OverviewTab({
-  slug, project, robot,
-}: { slug: string; project: ProjectDetailShape; robot: RobotStateResponse | undefined }) {
+  slug, project, robot, onGoTo, selectedStage, setSelectedStage,
+}: {
+  slug: string;
+  project: ProjectDetailShape;
+  robot: RobotStateResponse | undefined;
+  onGoTo: (tab: TabValue) => void;
+  selectedStage: SelectedStage | null;
+  setSelectedStage: (value: SelectedStage | null) => void;
+}) {
   const configured = isRobotConfigured(robot, project);
   const cfg = project.adapter_config || {};
   const taskId = typeof cfg.task_id === "string" ? cfg.task_id : null;
@@ -191,7 +321,11 @@ function OverviewTab({
     <div className="rs-scroll">
       <div className="rs-pad" style={{ display: "grid", gridTemplateColumns: "minmax(0,1.6fr) minmax(300px,1fr)", gap: 22, alignItems: "start" }}>
         <div className="rs-vgap-16">
-          {configured ? <RobotViewer slug={slug} /> : <RobotConfig slug={slug} />}
+          {configured ? (
+            <RobotViewer slug={slug} selectedStage={selectedStage} setSelectedStage={setSelectedStage} />
+          ) : (
+            <RobotConfig slug={slug} />
+          )}
           <div className="rs-card rs-card-pad">
             <div className="rs-card-title" style={{ marginBottom: 10 }}><Icon name="flag" size={16} />What this project is</div>
             <p className="rs-sub" style={{ lineHeight: 1.6, margin: 0 }}>{project.description || "No description."}</p>
@@ -199,6 +333,12 @@ function OverviewTab({
         </div>
 
         <div className="rs-vgap-16">
+          <WorkflowCard
+            slug={slug}
+            project={project}
+            robotConfigured={configured}
+            onGoTo={onGoTo}
+          />
           <div className="rs-card">
             <div className="rs-card-head"><div className="rs-card-title"><Icon name="info" size={16} />Project facts</div></div>
             <div className="rs-kv">
@@ -214,10 +354,152 @@ function OverviewTab({
             </div>
           </div>
 
+          <AuthoredWorldCard slug={slug} onGoTo={onGoTo} />
+
           {configured && (robot?.library_name || project.library_slug) && (
             <RobotLibraryCard slug={slug} librarySlug={(robot?.library_name ?? project.library_slug)!} />
           )}
         </div>
+      </div>
+    </div>
+  );
+}
+
+// ── Authored world (env-authoring): the world training runs under ─────
+function AuthoredWorldCard({ slug, onGoTo }: { slug: string; onGoTo: (tab: TabValue) => void }) {
+  const selection = useWorldSelection(slug);
+  const s = selection.data;
+  if (!s) return null; // no authored world yet — the World tab is the entry point
+  const mismatch = s.shared_summary.robot_matches_project === false;
+  return (
+    <div className="rs-card">
+      <div className="rs-card-head">
+        <div className="rs-card-title"><Icon name="globe" size={16} />Authored world</div>
+        <Btn kind="ghost" size="sm" icon="arrow-right" onClick={() => onGoTo("world")}>World tab</Btn>
+      </div>
+      <div className="rs-kv">
+        <div className="k">selection</div>
+        <div className="v mono">v{s.selection.selection_version} · {s.selection.tuple_hash.slice(0, 12)}</div>
+        <div className="k">robot</div>
+        <div className="v">
+          {s.shared_summary.robot ?? "—"}
+          {mismatch && (
+            <span style={{ color: "var(--st-amber-fg)", marginLeft: 6 }}>
+              ≠ project robot
+            </span>
+          )}
+        </div>
+        <div className="k">terrain</div>
+        <div className="v">{s.shared_summary.terrain_kind ?? "plane"}</div>
+        <div className="k">course</div>
+        <div className="v">{courseBreakdownText(s.shared_summary.course_breakdown, s.shared_summary.course_elements)}</div>
+        {s.world_meta.prompt && (
+          <><div className="k">prompt</div><div className="v" style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={s.world_meta.prompt}>{s.world_meta.prompt}</div></>
+        )}
+      </div>
+      <div className="rs-card-pad" style={{ paddingTop: 8 }}>
+        <p className="rs-hintline" style={{ margin: 0 }}>
+          Sculpt runs on this project train and evaluate inside this world
+          (atomic selection <span className="mono">{s.selection.evaluation_lineage}</span>).
+        </p>
+      </div>
+    </div>
+  );
+}
+
+// ── Getting-started workflow (first-time-user orientation) ────────────
+function WorkflowCard({
+  slug, project, robotConfigured, onGoTo,
+}: {
+  slug: string;
+  project: ProjectDetailShape;
+  robotConfigured: boolean;
+  onGoTo: (tab: TabValue) => void;
+}) {
+  const policies = usePolicies(slug);
+  const rewards = useRewards(slug);
+  const world = useWorldSelection(slug);
+  // Don't flash a wrong checklist while the queries settle (or mislead
+  // forever if one errors) — the card is orientation, not status-critical.
+  if (
+    policies.isLoading || rewards.isLoading || world.isLoading
+    || policies.error || rewards.error
+  ) {
+    return null;
+  }
+  const hasIters = project.n_iterations_completed > 0;
+  const hasPolicies = (policies.data?.length ?? 0) > 0;
+  const rewardShaped = (rewards.data?.length ?? 0) > 1 || hasIters;
+  const worldAuthored = !!world.data;
+  const steps: Array<{
+    label: string; done: boolean; tab: TabValue; hint: string;
+  }> = [
+    {
+      label: "Configure the robot", done: robotConfigured, tab: "overview",
+      hint: "Pick a library robot or upload a URDF/MJCF.",
+    },
+    {
+      label: "Author the world", done: worldAuthored, tab: "world",
+      hint: "Describe terrain, objects, task semantics, and train variations.",
+    },
+    {
+      label: "Shape the reward", done: rewardShaped, tab: "rewards",
+      hint: "Review the grounded starting reward — the sculptor iterates from here.",
+    },
+    {
+      label: "Train", done: hasIters, tab: "training",
+      hint: "Launch a run or decompose a goal into a mission.",
+    },
+    {
+      label: "Export the policy", done: hasPolicies && !!project.n_iterations_completed, tab: "results",
+      hint: "Download a deployment bundle for sim-to-real.",
+    },
+  ];
+  const next = steps.find((s) => !s.done);
+  // Everything done and exported → the checklist has served its purpose.
+  if (!next && hasPolicies) return null;
+  return (
+    <div className="rs-card">
+      <div className="rs-card-head">
+        <div className="rs-card-title"><Icon name="list" size={16} />Getting started</div>
+      </div>
+      <div className="rs-card-pad rs-vgap-8">
+        {steps.map((s, i) => {
+          const isNext = next === s;
+          return (
+            <button
+              key={s.label}
+              onClick={() => onGoTo(s.tab)}
+              className="rs-flex rs-gap-8"
+              style={{
+                background: "none", border: "none", padding: "4px 0",
+                cursor: "pointer", textAlign: "left", width: "100%",
+                alignItems: "flex-start", font: "inherit", color: "inherit",
+              }}
+              title={s.hint}
+            >
+              <Icon
+                name={s.done ? "check-circle" : "circle"}
+                size={15}
+                color={s.done ? "var(--st-emerald)" : isNext ? "var(--rs-primary)" : "var(--rs-muted)"}
+              />
+              <span style={{ minWidth: 0 }}>
+                <span style={{
+                  display: "block", fontSize: 13,
+                  fontWeight: isNext ? 600 : 400,
+                  color: s.done ? "var(--rs-muted)" : "var(--ink)",
+                }}>
+                  {i + 1}. {s.label}
+                </span>
+                {isNext && (
+                  <span className="rs-sub" style={{ display: "block", fontSize: 11.5, marginTop: 1 }}>
+                    {s.hint}
+                  </span>
+                )}
+              </span>
+            </button>
+          );
+        })}
       </div>
     </div>
   );

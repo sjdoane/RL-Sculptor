@@ -102,6 +102,10 @@ function IterationSettingsSection({
     { key: "render_every", label: "render_every", type: "number", min: 1, max: 100, hint: "capture every Nth step (advanced)" },
     { key: "rollout_fps", label: "rollout_fps (override)", type: "number", step: 1, min: 1, max: 240, hint: "force playback fps (blank = auto)" },
     { key: "seed", label: "seed", type: "number", min: 0, hint: "base RNG seed; iter N uses seed + N" },
+    { key: "eval_seeds", label: "eval_seeds", type: "number", min: 1, max: 10, hint: "rollouts per iter; keep-best selects on the MEDIAN (1 = single-roll legacy)" },
+    { key: "progress_epsilon", label: "progress_epsilon", type: "number", step: 0.00001, min: 0, max: 0.1, hint: "noise band for progress tie-breaks (default 1e-5; 0 = strict)" },
+    { key: "fresh_eval_seeds", label: "fresh_eval_seeds", type: "number", min: 0, max: 10, hint: "end-of-run re-rolls of the kept best on held-out seeds (0 = off)" },
+    { key: "hack_income_screen", label: "hack_income_screen", type: "bool", hint: "reject edits that make a caught exploit MORE profitable" },
   ];
 
   const update = (key: keyof IterationSettings, raw: string | boolean) => {
@@ -244,8 +248,8 @@ function DangerZone({
     if (!matches) return;
     del.mutate(project.slug, {
       onSuccess: () => {
-        toast.success("Project deleted", {
-          description: `Removed ${project.slug} + all runs.`,
+        toast.success("Moved to Trash", {
+          description: `${project.slug} is recoverable from Settings → Trash.`,
         });
         onDeleted();
         nav("/projects");
@@ -266,7 +270,7 @@ function DangerZone({
         <Icon name="trash" size={12} /> Danger zone
       </span>
       <p style={{ margin: "0 0 10px", fontSize: 12, color: "var(--rs-muted)" }}>
-        Deleting removes the project directory + all runs. The sculptor library source is untouched. Type the slug to confirm.
+        Moves the project directory + all runs to Trash — recoverable from Settings → Trash. The sculptor library source is untouched. Type the slug to confirm.
       </p>
       <Field label={<>Type <code className="mono">{project.slug}</code> to confirm</>} htmlFor="confirm-slug">
         <input
@@ -280,7 +284,7 @@ function DangerZone({
       </Field>
       <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 12 }}>
         <Btn kind="danger" size="sm" icon={del.isPending ? "loader" : "trash"} onClick={onDelete} disabled={!matches || del.isPending}>
-          Delete project
+          Move to Trash
         </Btn>
       </div>
     </section>

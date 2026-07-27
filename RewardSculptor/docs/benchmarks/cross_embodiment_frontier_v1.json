@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "suite_id": "rewardsculptor-cross-embodiment-frontier",
+  "suite_version": "1.2.0",
+  "benchmarks": [
+    {
+      "name": "yam_lift_cube",
+      "task_id": "Mjlab-Lift-Cube-Yam",
+      "behavior_goal": "grasp the cube, lift it clear of the table, and hold it steadily",
+      "spec_metric": null,
+      "adapter": "mjlab",
+      "adapter_config": {
+        "num_envs": 2048
+      },
+      "robot_id": "i2rt_yam",
+      "embodiment_family": "robot_arm_with_parallel_gripper",
+      "task_family": "gripper_dependent_manipulation",
+      "required_capabilities": [
+        "arm_control",
+        "grasp",
+        "object_interaction"
+      ],
+      "evaluation_tier": "compile_only",
+      "campaign_ready": false,
+      "spec_authority": "A0_rejected",
+      "spec_audit_certificate": null,
+      "known_limitations": [
+        "the generic object_lift_hold temporal specification consumes schema-2 manipulation_telemetry.json, but it has not passed a genuinely held-out adversarial audit battery on this task",
+        "no real-rollout A4 certificate exists; deterministic synthetic attack tests are implementation checks, not evaluator authority",
+        "no frozen evaluation seed/world split exists for this task"
+      ],
+      "notes": "A real registered mjlab arm task and the first required gripper-dependent frontier. It is intentionally visible but impossible to launch as a benchmark until its evaluator authority exists."
+    },
+    {
+      "name": "yam_multi_cube_lift",
+      "task_id": "Mjlab-Multi-Cube-Seg-Yam",
+      "behavior_goal": "identify, grasp, and lift the requested cube while leaving the other cubes undisturbed",
+      "spec_metric": null,
+      "adapter": "mjlab",
+      "adapter_config": {
+        "num_envs": 1024
+      },
+      "robot_id": "i2rt_yam",
+      "embodiment_family": "robot_arm_with_parallel_gripper",
+      "task_family": "conditional_multi_object_manipulation",
+      "required_capabilities": [
+        "arm_control",
+        "grasp",
+        "object_interaction",
+        "target_conditioning"
+      ],
+      "evaluation_tier": "compile_only",
+      "campaign_ready": false,
+      "spec_authority": "A0_rejected",
+      "spec_audit_certificate": null,
+      "known_limitations": [
+        "the generic object_lift_hold specification consumes all cube states, per-step target identity, grasp evidence, and distractor displacement, but no task-scoped real-rollout A4 certificate exists",
+        "the generated-metric interface cannot reference these arrays without a channel catalog, so target-vs-distractor discrimination exists only for hand-authored spec metrics",
+        "the disturbance predicate is implemented at 5 cm, but no held-out object-layout split is frozen"
+      ],
+      "notes": "Longer-horizon multi-object arm frontier. Do not replace the missing object semantics with mean return or generic joint-motion proxies."
+    }
+  ]
+}

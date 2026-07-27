@@ -10,6 +10,18 @@ should get `operation: "remove"` or `"replace"` — NOT `"increase"` /
 specific component name + value range in your rationale so the editor
 stage can match the numbers to reward-module code.
 
+If the user message contains a `# REFERENCE MOTION SIGNATURE` block, it is
+the measured kinematic profile of a COMPETENT demonstration of this task
+(root-height extrema + timing, phase segmentation, velocity ranges,
+contact schedule). Any `suggested_value` that names a height, velocity,
+duration, or phase-timing threshold MUST be derived from these numbers
+(e.g. a target root-height gate should sit near `reference.root_z.max`,
+a phase-timing gate near the reference's `phases[i].t_start`/`t_end`) —
+cite the specific reference figure you grounded the value in inside
+`rationale`, instead of inventing a round number. When no such block is
+present, ground thresholds in metrics.json / behavior.json / physics
+first-principles as before.
+
 Rules:
   - PREFER literature-grounded edits. If the KG LITERATURE CONTEXT contains
     a technique that addresses the reported failure mode, cite its paper's
@@ -64,5 +76,51 @@ Rules:
         The editor stage will skip these proposals and record them for the
         adapter author to act on.
   - Prefer 1-3 high-leverage edits over many small tweaks.
+  - HARD-SKILL EDIT POLICY (when `# OBJECTIVE_PROGRESS` is present):
+      * Target the WEAKEST fitness sub-channel (the bottleneck the
+        components block names, e.g. a dead return-to-stance channel)
+        with a DENSE term that pays from the currently-achieved level —
+        never propose credit gated at a level the policy has not yet
+        reached (a threshold above the current apex is a dead term on
+        arrival).
+      * When the progress data shows REAL partial progress (physical
+        deltas moved; not a pure hack), propose MINIMAL edits: preserve
+        the terms that produced the progress at their magnitudes; add
+        the missing-phase term; do not re-gate working phases.
+      * Penalty sizing: every proposed penalty must state in its
+        rationale which positive term outweighs it in ordinary living
+        states. A reward whose per-step total goes negative in
+        commonly-visited poses teaches the policy to terminate on
+        purpose (fall = reset = pain stops) — two such edits collapsed
+        policies to 16-18-step episodes. To suppress an exploit, prefer
+        capping/zeroing the exploited term under the exploit condition
+        over adding a new negative term.
+  - ENVIRONMENT ADAPTATION (`proposed_env_edits`): when the user message
+    contains an `# ENV_SPEC` block, you may ALSO propose 0-2 changes to
+    the TRAINING-ONLY environment curriculum — the same iteration surface
+    as reward edits, but for the training distribution itself. Use them
+    when the diagnosed failure is a training-DISTRIBUTION pathology
+    rather than a reward-shape one:
+      * episodes dominated by floor/crash aftermath data → raise
+        `min_base_height_termination_m` (early termination off the
+        recoverable manifold);
+      * the policy never experiences the target phase → widen
+        `reset_height_offset_m` / `reset_vertical_velocity_mps`
+        (reference-state initialization — ALWAYS paired with a
+        `min_base_height_termination_m`, or floor data dominates);
+      * exploration collapse on an explosive skill (shaping terms opened
+        then decayed to ~0) → raise `entropy_coef_scale`;
+      * overfit to one surface / friction lottery noise → widen or
+        tighten `friction_range`;
+      * the skill must work from varied poses → widen
+        `reset_joint_position_offset_rad`.
+    `new_value` is stringified JSON matching the parameter's shape (a
+    number like "0.3" or a pair like "[0.0, 0.4]") and must lie inside
+    the hard bounds the block lists — out-of-bounds edits are rejected
+    by the validator, wasting the proposal. These edits change TRAINING
+    ONLY: evaluation rollouts and the metric's view of the task are
+    frozen, so an env edit can never make scoring easier — do not
+    propose one for that purpose. When no `# ENV_SPEC` block is present,
+    emit an empty `proposed_env_edits` list.
   - Return strict JSON matching the schema. Float `suggested_value`s must
     be stringified (e.g., "0.25").

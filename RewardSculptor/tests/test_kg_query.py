@@ -25,8 +25,13 @@ from sculptor.kg.extract import (
     extract_entities,
 )
 from sculptor.kg.query import (
+    USEFUL_CITATION_BOOST_CAP,
     TechniqueMatch,
+    _citation_boost,
     cite,
+    paper_embed_text,
+    query_papers,
+    query_semantic,
     query_techniques,
 )
 from sculptor.kg.schema import (
@@ -259,6 +264,68 @@ def test_query_techniques_domain_filter(kg):
         ["sparse_reward"], domain_filter="discrete_control", store=kg)
     assert [m.technique.name for m in dc] == ["potential_based_shaping"]
 
+    # Normalized hierarchical tags: a broad `locomotion` tag and the
+    # scaffold's qualified `continuous_locomotion` query interoperate.
+    broad = query_techniques(
+        ["sparse_reward"], domain_filter="locomotion", store=kg)
+    assert [m.technique.name for m in broad] == ["reference_state_initialization"]
+
+
+def test_query_citation_and_evidence_use_same_supporting_paper(kg):
+    from sculptor.kg.schema import (
+        Edge, FailureMode, Paper, Relation, Technique,
+        make_failure_mode_id, make_paper_id, make_technique_id,
+    )
+
+    old = Paper(id=make_paper_id("2000.00001"), arxiv_id="2000.00001",
+                title="Claim Source", authors=["Old Author"], year=2020)
+    unrelated = Paper(id=make_paper_id("2500.00001"),
+                      arxiv_id="2500.00001", title="Newer Intro Only",
+                      authors=["New Author"], year=2025)
+    tech = Technique(id=make_technique_id("method"), name="method")
+    fm = FailureMode(id=make_failure_mode_id("failure"), name="failure")
+    for node in (old, unrelated, tech, fm):
+        kg.add_node(node)
+    kg.add_edge(Edge(src=old.id, dst=tech.id, relation=Relation.INTRODUCES))
+    kg.add_edge(Edge(
+        src=unrelated.id, dst=tech.id, relation=Relation.INTRODUCES))
+    kg.add_edge(Edge(
+        src=tech.id, dst=fm.id, relation=Relation.ADDRESSES,
+        data={"source_paper_id": old.id, "evidence": "old paper evidence"}))
+
+    match = query_techniques(["failure"], store=kg, top_k=1)[0]
+    assert "Claim Source" in match.paper_citation
+    assert "Newer Intro Only" not in match.paper_citation
+    assert match.evidence == "old paper evidence"
+
+
+def test_query_papers_combines_semantic_tier_and_normalized_tag_filters(
+        kg, monkeypatch):
+    import numpy as np
+    import sculptor.kg.query as qmod
+
+    p1 = Paper(
+        id=make_paper_id("2400.00001"), arxiv_id="2400.00001",
+        title="Terrain Curricula", abstract="rough terrain locomotion",
+        rationale="author uneven worlds", tags=["continuous_locomotion", "terrain"],
+        tier="S")
+    p2 = Paper(
+        id=make_paper_id("2400.00002"), arxiv_id="2400.00002",
+        title="Kitchen Objects", abstract="object manipulation",
+        rationale="author object tasks", tags=["objects"], tier="A")
+    for p, vec in ((p1, np.array([1.0, 0.0], np.float32)),
+                   (p2, np.array([0.0, 1.0], np.float32))):
+        kg.add_node(p)
+        kg.set_embedding(
+            p.id, "paper-test", vec, text=paper_embed_text(p))
+    monkeypatch.setattr(
+        qmod, "_embed_text",
+        lambda text, model_name=None: np.array([1.0, 0.0], np.float32))
+    hits = query_papers(
+        "rough walking", tags=["locomotion"], tier="s", store=kg,
+        model_name="paper-test", min_similarity=0.5)
+    assert [h.paper.id for h in hits] == [p1.id]
+
 
 def test_query_techniques_unknown_failure_returns_empty(kg):
     _seed_graph(kg)
@@ -392,3 +459,322 @@ def test_get_embedder_is_thread_safe_under_concurrent_load(monkeypatch):
     )
     # All threads see the same cached instance.
     assert all(r is results[0] for r in results)
+
+
+# ── §Agentic-data upgrade 2: usage-based ranking boost ────────────────────
+def test_citation_boost_is_zero_below_one_and_capped_at_high_counts():
+    assert _citation_boost(0) == 0.0
+    assert _citation_boost(-3) == 0.0
+    small = _citation_boost(1)
+    assert 0.0 < small < USEFUL_CITATION_BOOST_CAP
+    big = _citation_boost(1_000_000)
+    assert big == pytest.approx(USEFUL_CITATION_BOOST_CAP, abs=1e-9)
+    # monotonically non-decreasing.
+    assert _citation_boost(10) >= _citation_boost(1)
+    assert _citation_boost(100) >= _citation_boost(10)
+
+
+def test_query_techniques_boost_breaks_ties_without_exceeding_cap(kg):
+    """Two techniques tied on matched failure-mode count: the one with
+    more useful_citations ranks first, but the boost never overwhelms a
+    real relevance difference (checked via the cap constant itself)."""
+    _seed_graph(kg)
+    tech_rsi = kg.get_node(make_technique_id("reference_state_initialization"))
+    tech_rsi.useful_citations = 50
+    kg.add_node(tech_rsi)
+
+    results = query_techniques(["sparse_reward"], store=kg, top_k=5)
+    # Only RSI addresses sparse_reward directly in the single-failure query
+    # from the base seed graph fixture below — assert the boost is applied
+    # and stays within the documented cap.
+    rsi_match = next(m for m in results if m.technique.name == "reference_state_initialization")
+    assert rsi_match.relevance_score >= 1.0  # base score (1 matched fm) + boost
+    assert rsi_match.relevance_score <= 1.0 + USEFUL_CITATION_BOOST_CAP + 0.05  # + year tie-break slack
+
+
+def test_query_semantic_floor_applies_before_citation_boost(monkeypatch, kg):
+    """A match below min_similarity must NOT be resurrected by a large
+    useful_citations boost — the floor check happens on the raw cosine
+    similarity, before the boost is added."""
+    import numpy as np
+
+    _seed_graph(kg)
+    model_name = "test-model-boost"
+    # RSI sits just BELOW a 0.5 floor; shaping sits comfortably above.
+    below_floor_vec = np.array([0.4, np.sqrt(1 - 0.4 ** 2)], dtype=np.float32)
+    above_floor_vec = np.array([0.9, np.sqrt(1 - 0.9 ** 2)], dtype=np.float32)
+    kg.set_embedding(make_technique_id("reference_state_initialization"),
+                     model_name, below_floor_vec)
+    kg.set_embedding(make_technique_id("potential_based_shaping"),
+                     model_name, above_floor_vec)
+
+    # Give the below-floor technique a huge citation count — if the boost
+    # were applied before the floor check this could push it back above
+    # 0.5 (0.4 + 0.05 cap = 0.45, still short, so also assert the actual
+    # score never crosses the floor even with max boost).
+    tech_rsi = kg.get_node(make_technique_id("reference_state_initialization"))
+    tech_rsi.useful_citations = 10_000_000
+    kg.add_node(tech_rsi)
+
+    import sculptor.kg.query as qmod
+    monkeypatch.setattr(qmod, "_embed_text",
+                        lambda text, mn=model_name: np.array([1.0, 0.0], dtype=np.float32))
+
+    results = query_semantic("anything", top_k=5, store=kg, model_name=model_name,
+                             min_similarity=0.5)
+    names = {m.technique.name for m in results}
+    assert "reference_state_initialization" not in names, (
+        "below-floor match must not be resurrected by the citation boost")
+    assert "potential_based_shaping" in names
+
+
+def test_query_semantic_boost_reorders_within_floor_but_score_stays_raw(monkeypatch, kg):
+    """Among matches that already clear the floor, useful_citations can
+    reorder them — but the displayed relevance_score stays the RAW cosine
+    similarity (the boost affects ordering only, per the upgrade spec)."""
+    import numpy as np
+
+    _seed_graph(kg)
+    model_name = "test-model-boost2"
+    # shaping has slightly higher raw similarity than RSI...
+    rsi_vec = np.array([0.80, np.sqrt(1 - 0.80 ** 2)], dtype=np.float32)
+    shaping_vec = np.array([0.82, np.sqrt(1 - 0.82 ** 2)], dtype=np.float32)
+    kg.set_embedding(make_technique_id("reference_state_initialization"),
+                     model_name, rsi_vec)
+    kg.set_embedding(make_technique_id("potential_based_shaping"),
+                     model_name, shaping_vec)
+
+    # ...but RSI has a large useful_citations boost that should push it
+    # ahead in ORDER while its displayed score remains its raw cosine sim.
+    tech_rsi = kg.get_node(make_technique_id("reference_state_initialization"))
+    tech_rsi.useful_citations = 10_000_000
+    kg.add_node(tech_rsi)
+
+    import sculptor.kg.query as qmod
+    monkeypatch.setattr(qmod, "_embed_text",
+                        lambda text, mn=model_name: np.array([1.0, 0.0], dtype=np.float32))
+
+    results = query_semantic("anything", top_k=5, store=kg, model_name=model_name,
+                             min_similarity=0.0)
+    assert results[0].technique.name == "reference_state_initialization"
+    # displayed score is the RAW cosine similarity, not sim+boost.
+    assert results[0].relevance_score == pytest.approx(0.80, abs=1e-2)
+
+
+# ── §KG-retrieval fix 2: resolve_failure_modes_semantic ────────────────────
+def test_resolve_failure_modes_semantic_matches_descriptor_to_failure_mode(monkeypatch, kg):
+    """A free-text descriptor resolves (via embedding similarity) to the
+    right FailureMode node id — the semantic counterpart to
+    `_resolve_failure_modes`'s fixed-enum fuzzy resolution."""
+    import numpy as np
+
+    from sculptor.kg.query import resolve_failure_modes_semantic
+    from sculptor.kg.schema import FailureMode, make_failure_mode_id
+
+    fm_a = FailureMode(id=make_failure_mode_id("forearm_planking"),
+                       name="forearm_planking",
+                       description="Robot supports weight on forearms instead "
+                                   "of extending its legs.")
+    fm_b = FailureMode(id=make_failure_mode_id("hip_lockout"),
+                       name="hip_lockout",
+                       description="Hip joints stay locked at full extension.")
+    kg.add_node(fm_a)
+    kg.add_node(fm_b)
+
+    model_name = "test-model-fm"
+    vec_a = np.array([1.0, 0.0], dtype=np.float32)
+    vec_b = np.array([0.0, 1.0], dtype=np.float32)
+    kg.set_embedding(fm_a.id, model_name, vec_a)
+    kg.set_embedding(fm_b.id, model_name, vec_b)
+
+    def _should_not_load(*args, **kwargs):  # pragma: no cover - failure path
+        raise RuntimeError("SentenceTransformer should not have been loaded")
+
+    import sculptor.kg.query as qmod
+    monkeypatch.setattr(qmod, "_get_embedder", _should_not_load)
+    monkeypatch.setattr(qmod, "_embed_text", lambda text, mn=model_name: vec_a)
+
+    ids = resolve_failure_modes_semantic(
+        kg, ["planks on forearms without leg drive"], model_name=model_name)
+    assert ids == [fm_a.id]
+
+
+def test_resolve_failure_modes_semantic_floors_below_min_similarity(monkeypatch, kg):
+    import numpy as np
+
+    from sculptor.kg.query import resolve_failure_modes_semantic
+    from sculptor.kg.schema import FailureMode, make_failure_mode_id
+
+    fm_a = FailureMode(id=make_failure_mode_id("far_mode"), name="far_mode",
+                       description="Something else entirely.")
+    kg.add_node(fm_a)
+    model_name = "test-model-fm-floor"
+    kg.set_embedding(fm_a.id, model_name, np.array([1.0, 0.0], dtype=np.float32))
+
+    import sculptor.kg.query as qmod
+    monkeypatch.setattr(
+        qmod, "_embed_text",
+        lambda text, mn=model_name: np.array([0.0, 1.0], dtype=np.float32))
+
+    ids = resolve_failure_modes_semantic(
+        kg, ["totally unrelated phrase"], model_name=model_name, min_similarity=0.45)
+    assert ids == []
+
+
+def test_resolve_failure_modes_semantic_empty_descriptors_returns_empty(kg):
+    from sculptor.kg.query import resolve_failure_modes_semantic
+    assert resolve_failure_modes_semantic(kg, []) == []
+
+
+def test_resolve_failure_modes_semantic_dedupes_and_respects_top_k_per(monkeypatch, kg):
+    """Two descriptors resolving to the SAME node dedupe to one entry;
+    `top_k_per` caps how many nodes a single descriptor can contribute."""
+    import numpy as np
+
+    from sculptor.kg.query import resolve_failure_modes_semantic
+    from sculptor.kg.schema import FailureMode, make_failure_mode_id
+
+    fm_a = FailureMode(id=make_failure_mode_id("mode_a"), name="mode_a", description="a")
+    fm_b = FailureMode(id=make_failure_mode_id("mode_b"), name="mode_b", description="b")
+    kg.add_node(fm_a)
+    kg.add_node(fm_b)
+    model_name = "test-model-fm-dedupe"
+    kg.set_embedding(fm_a.id, model_name, np.array([1.0, 0.0], dtype=np.float32))
+    kg.set_embedding(fm_b.id, model_name, np.array([0.9, np.sqrt(1 - 0.9 ** 2)], dtype=np.float32))
+
+    import sculptor.kg.query as qmod
+    monkeypatch.setattr(
+        qmod, "_embed_text",
+        lambda text, mn=model_name: np.array([1.0, 0.0], dtype=np.float32))
+
+    # Same descriptor text twice -> both resolve to the same top matches;
+    # dedup keeps each node id once.
+    ids = resolve_failure_modes_semantic(
+        kg, ["desc one", "desc two"], model_name=model_name,
+        top_k_per=1, min_similarity=0.5)
+    assert ids == [fm_a.id]
+
+
+# ── §KG-retrieval fix 2: query_techniques(extra_failure_node_ids=...) ──────
+def test_query_techniques_honors_extra_failure_node_ids(kg):
+    """A FailureMode reachable ONLY via `extra_failure_node_ids` (not the
+    enum-resolved `failure_modes` list) still pulls in its technique, and
+    an unknown extra id is silently skipped rather than erroring."""
+    from sculptor.kg.schema import (
+        Edge, FailureMode, Relation, Technique,
+        make_failure_mode_id, make_technique_id,
+    )
+
+    p1, _p2 = _seed_graph(kg)
+
+    fm_niche = FailureMode(id=make_failure_mode_id("niche_failure"),
+                           name="niche_failure", description="A niche failure.")
+    kg.add_node(fm_niche)
+    tech_niche = Technique(id=make_technique_id("niche_fix"),
+                           name="niche_fix", description="Fixes the niche failure.")
+    kg.add_node(tech_niche)
+    kg.add_edge(Edge(src=p1.id, dst=tech_niche.id, relation=Relation.INTRODUCES))
+    kg.add_edge(Edge(src=tech_niche.id, dst=fm_niche.id, relation=Relation.ADDRESSES,
+                     data={"source_paper_id": p1.id}))
+
+    # `failure_modes` alone doesn't resolve to anything real.
+    r = query_techniques(["nonexistent_xyz"], store=kg,
+                         extra_failure_node_ids=[fm_niche.id])
+    names = {m.technique.name for m in r}
+    assert "niche_fix" in names
+
+    # Unknown extra id -> skipped, not an error, not a false match.
+    r2 = query_techniques(["nonexistent_xyz"], store=kg,
+                          extra_failure_node_ids=["failure:does-not-exist"])
+    assert r2 == []
+
+
+def test_query_techniques_extra_failure_node_ids_dedupes_with_enum_resolved(kg):
+    """When the SAME FailureMode is reachable via both the enum-resolved
+    `failure_modes` and `extra_failure_node_ids`, ranking is unaffected —
+    the technique is counted once, not double-credited."""
+    _seed_graph(kg)
+    from sculptor.kg.schema import make_failure_mode_id
+
+    sparse_id = make_failure_mode_id("sparse_reward")
+    r_plain = query_techniques(["sparse_reward"], store=kg, top_k=5)
+    r_dup = query_techniques(
+        ["sparse_reward"], store=kg, top_k=5,
+        extra_failure_node_ids=[sparse_id])
+    assert [m.technique.name for m in r_plain] == [m.technique.name for m in r_dup]
+    assert [m.relevance_score for m in r_plain] == [m.relevance_score for m in r_dup]
+
+
+# ── §KG-retrieval fix 4: outcome-stats ranking ────────────────────────────
+def test_outcome_stats_adjustment_scoped_scaled_and_clamped():
+    from sculptor.kg.query import (
+        OUTCOME_STATS_ADJUSTMENT_CAP,
+        _outcome_stats_adjustment,
+    )
+
+    assert _outcome_stats_adjustment(None, {"failure:x"}) == 0.0
+    assert _outcome_stats_adjustment({}, {"failure:x"}) == 0.0
+
+    stats = {"failure:x": {"helped": 2, "regressed": 0}}
+    # net=2 -> 0.03 * 2 = 0.06, well under the cap.
+    assert _outcome_stats_adjustment(stats, {"failure:x"}) == pytest.approx(0.06)
+
+    # A failure mode NOT in the queried set contributes nothing, even
+    # though the technique has stats for it.
+    assert _outcome_stats_adjustment(stats, {"failure:other"}) == 0.0
+
+    # Clamped at +/- the cap regardless of how lopsided the tally is.
+    huge_helped = {"failure:x": {"helped": 1000, "regressed": 0}}
+    assert _outcome_stats_adjustment(huge_helped, {"failure:x"}) == pytest.approx(
+        OUTCOME_STATS_ADJUSTMENT_CAP)
+    huge_regressed = {"failure:x": {"helped": 0, "regressed": 1000}}
+    assert _outcome_stats_adjustment(huge_regressed, {"failure:x"}) == pytest.approx(
+        -OUTCOME_STATS_ADJUSTMENT_CAP)
+
+
+def test_query_techniques_outcome_stats_reorders_equal_rank_ties(kg):
+    """Two techniques tied on matched-FM count (the seed graph's
+    sparse_reward query) reorder by outcome_stats when one has a
+    helped-dominant record for the QUERIED failure mode and the other's
+    record is for a DIFFERENT failure mode (must not count against/for it)."""
+    _seed_graph(kg)
+    sparse_id = make_failure_mode_id("sparse_reward")
+    hack_id = make_failure_mode_id("reward_hacking")
+
+    # Baseline: with no outcome_stats, alphabetical tie-break sorts
+    # potential_based_shaping before reference_state_initialization.
+    baseline = query_techniques(["sparse_reward"], store=kg, top_k=5)
+    assert [m.technique.name for m in baseline] == [
+        "potential_based_shaping", "reference_state_initialization"]
+
+    tech_rsi = kg.get_node(make_technique_id("reference_state_initialization"))
+    tech_rsi.outcome_stats = {sparse_id: {"helped": 5, "regressed": 0}}
+    kg.add_node(tech_rsi)
+
+    tech_shaping = kg.get_node(make_technique_id("potential_based_shaping"))
+    # Regressed, but on reward_hacking — NOT the queried failure mode below
+    # — so it must not drag potential_based_shaping down for this query.
+    tech_shaping.outcome_stats = {hack_id: {"helped": 0, "regressed": 5}}
+    kg.add_node(tech_shaping)
+
+    results = query_techniques(["sparse_reward"], store=kg, top_k=5)
+    assert results[0].technique.name == "reference_state_initialization"
+    assert results[1].technique.name == "potential_based_shaping"
+
+
+def test_query_techniques_outcome_stats_capped_relative_to_relevance(kg):
+    """The outcome-stats adjustment never exceeds its documented cap, even
+    with an enormous helped/regressed imbalance — same 'small tie-breaker,
+    never overwhelms real relevance' contract as the citation boost."""
+    from sculptor.kg.query import OUTCOME_STATS_ADJUSTMENT_CAP
+
+    _seed_graph(kg)
+    sparse_id = make_failure_mode_id("sparse_reward")
+    tech_rsi = kg.get_node(make_technique_id("reference_state_initialization"))
+    tech_rsi.outcome_stats = {sparse_id: {"helped": 10_000, "regressed": 0}}
+    kg.add_node(tech_rsi)
+
+    results = query_techniques(["sparse_reward"], store=kg, top_k=5)
+    rsi_match = next(
+        m for m in results if m.technique.name == "reference_state_initialization")
+    assert rsi_match.relevance_score <= 1.0 + OUTCOME_STATS_ADJUSTMENT_CAP + 0.05

@@ -442,6 +442,116 @@ def spec_g1_floss(
 # synthetic walker (0.04/frame), ~0.90 for a near-stationary kicker
 # (~0.001/frame). Tuned against the on-disk rollouts (see Ship 47 notes).
 _KICK_STATIONARY_SCALE = 0.01
+# §Metric-quality laws — kick-metric constants. Tuned so a real, repeated,
+# FORWARD kick from an upright, stationary stance scores high while every
+# documented g1-kick-v5 hack (one-leg balance, partial twitch, rear/sideways
+# kick, whip-and-fall, forward walker) floors near 0. See the kick-failure
+# trace in docs/internal/LAWS_OBJECTIVE_METRIC.md.
+_KICK_BURST_FLOOR = 3.0          # sustained sagittal-leg speed that counts as a launch
+_KICK_BURST_WIDTH = 0.8          # transition width of the completion gate on burst speed
+_KICK_UPRIGHT_FLOOR = 0.6        # sustained-uprightness fraction the kick must hold
+_KICK_UPRIGHT_WIDTH = 0.08
+_KICK_INTENSITY_SCALE = 4.0      # saturating scale for kick speed (channel, rad/frame)
+_KICK_AMPLITUDE_SCALE = 0.5      # saturating scale for sagittal-leg range-of-motion (rad)
+_KICK_FOOT_SCALE = 0.12          # saturating scale for forward foot excursion (m, pelvis frame)
+# §kick-fix (Sam 2026-06-20): the completion gate requires a GENUINE forward-foot
+# excursion. On g1-kick-v6 a real kick swung the foot ~0.46 m forward while a
+# standing balance-jiggle moved it only ~0.13 m, yet the latter scored 0.22-0.27 —
+# the launch floor fired on the leg-joint burst alone. This sharp gate (G1 foot
+# geometry) floors the jiggle to ~0. (Absolute metres → G1-specific; an amplitude-
+# relative center is the noted follow-up for smaller robots / low-slow kicks.)
+_KICK_EXCURSION_FLOOR = 0.20     # forward-foot excursion (m) a real kick must clear
+_KICK_EXCURSION_WIDTH = 0.04
+
+
+def _sharp_gate(x: float, center: float, width: float) -> float:
+    """A steep logistic gate in [0,1]: ~0 below `center`, ~1 above, transition
+    over `width`. Used to build a competence GATE that OWNS THE FLOOR (LAW 1) —
+    a degenerate sub-behavior falls to ~0, not to "a little"."""
+    return float(1.0 / (1.0 + np.exp(-(x - center) / max(width, 1e-6))))
+
+
+def _leg_range_of_motion(
+    joint_pos: np.ndarray, joint_indices: Optional[Sequence[int]] = None,
+) -> float:
+    """Range of motion (rad) of the MOST-moving selected leg joint: the robust
+    per-(env,joint) spread (p97.5−p2.5), max over joints, mean over envs. The
+    AMPLITUDE-FLOOR signal (LAW 2) — a micro-twitch has ~0 ROM, a real kick
+    swings through a large arc, so this floors a tiny but correctly-shaped
+    motion that the completion gate alone would let pass."""
+    jp = _check_te(joint_pos)
+    if joint_indices is not None and len(joint_indices) > 0:
+        jp = jp[:, :, list(joint_indices)]
+    if jp.shape[0] < 2 or jp.shape[2] == 0:
+        return 0.0
+    rng = np.quantile(jp, 0.975, axis=0) - np.quantile(jp, 0.025, axis=0)  # (E, J')
+    return float(rng.max(axis=-1).mean())
+
+
+def _foot_anterior_peaks(
+    fp: Optional[np.ndarray],
+) -> Optional[tuple[np.ndarray, np.ndarray]]:
+    """Per-env (E,) peak FORWARD (+x) and BACKWARD (−x) anterior deviation of one
+    foot from its resting median, pelvis frame, in METRES. None when the channel is
+    absent / too short. The single raw kernel shared by the signed-direction channel
+    (LAW 4) and the completion-gate forward-excursion gate (§kick-fix), so the metre
+    excursion and the [0,1] direction score derive from one source."""
+    if fp is None:
+        return None
+    a = _check_te(fp)[..., 0].astype(np.float64)             # (T, E) anterior
+    if a.shape[0] < 2:
+        return None
+    dev = a - np.median(a, axis=0, keepdims=True)            # vs resting anterior
+    fwd = np.clip(dev, 0.0, None).max(axis=0)                # (E,) peak forward
+    back = np.clip(-dev, 0.0, None).max(axis=0)              # (E,) peak backward
+    return fwd, back
+
+
+def _swing_foot_forward_excursion(
+    left_foot_pos_b: Optional[np.ndarray],
+    right_foot_pos_b: Optional[np.ndarray],
+) -> Optional[float]:
+    """The SWING foot's forward (+x) peak excursion from its resting median, in
+    METRES (max over feet of the per-env mean forward peak). None when NEITHER foot
+    channel is present. A genuine kick swings the foot far forward; a standing
+    balance-jiggle barely moves it — so this floors a non-kick whose leg-joint burst
+    happens to clear the launch floor (§kick-fix)."""
+    peaks = []
+    for fp in (left_foot_pos_b, right_foot_pos_b):
+        p = _foot_anterior_peaks(fp)
+        if p is not None:
+            peaks.append(p[0])                              # forward peaks (E,)
+    if not peaks:
+        return None
+    swing = np.maximum.reduce(peaks) if len(peaks) > 1 else peaks[0]
+    return float(swing.mean())
+
+
+def _forward_kick_direction(
+    left_foot_pos_b: Optional[np.ndarray],
+    right_foot_pos_b: Optional[np.ndarray],
+) -> Optional[float]:
+    """Signed FORWARD-ness of the kick from foot position in the PELVIS frame
+    (LAW 4). Per foot, the anterior (x) displacement from its own resting median
+    splits into forward (+) and backward (−) peaks; the per-foot score is
+    (forward fraction) × (saturating forward magnitude). The SWING foot (more
+    motion) wins. A forward kick → ~1; a rear/mule kick → ~0 (backward peak
+    dominates); a purely sideways kick → ~0 (no anterior motion). Returns None
+    when NEITHER foot channel is present, so the metric ABSTAINS (LAW 6) rather
+    than falling back to a direction-free magnitude that re-opens the hole."""
+    def _one(fp: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        p = _foot_anterior_peaks(fp)
+        if p is None:
+            return None
+        fwd, back = p
+        frac = fwd / (fwd + back + 1e-6)                      # forward fraction
+        mag = 1.0 - np.exp(-fwd / _KICK_FOOT_SCALE)           # forward magnitude
+        return frac * mag                                     # (E,)
+    feet = [s for s in (_one(left_foot_pos_b), _one(right_foot_pos_b)) if s is not None]
+    if not feet:
+        return None
+    swing = np.maximum.reduce(feet) if len(feet) > 1 else feet[0]   # swing foot wins
+    return float(np.clip(swing.mean(), 0.0, 1.0))
 
 
 def spec_g1_kick(
@@ -449,53 +559,102 @@ def spec_g1_kick(
     behavior: Mapping[str, Any],
     meta: Optional[Mapping[str, Any]] = None,
 ) -> dict[str, float]:
-    """A kick = repeated high-speed LEG transients launched from an
-    upright, roughly STATIONARY stance. spec_score = saturating burst
-    intensity × ratio gate × uprightness × stationarity. Bursts are
-    leg-only when joint names exist (arm-flailing is not kicking — audit
-    H1) and count only within fully-upright windows (falling is not
-    kicking — audit H2). Ratio gate ramps 2→5, calibrated on real
-    recordings (standing ≈ 2.2–2.4, real kicks ≈ 4.9–5.4); the p99 ratio
-    also qualifies (rare kicks — audit M3). §Ship 47: the stationarity
-    factor stops a forward WALKER from earning kick credit off gait
-    hip-swings (the g1-kick-v3 0.59 Goodhart) — 'balance on the other
-    leg' means the base should not travel."""
+    """A kick = a real, repeated, FORWARD leg swing of meaningful amplitude,
+    launched from an UPRIGHT, roughly STATIONARY stance.
+
+    §Metric-quality-laws rebuild. The prior form was a partial-credit product
+    (`intensity × ratio_gate × up × stationarity`) that scored degenerate
+    sub-motions 0.13–0.38 instead of 0.0 and was reward-hacked over 21
+    g1-kick-v5 iterations (balance-on-one-leg; kick-behind; whip-and-fall).
+    Now a composed gate (LAW 1):
+
+        spec_score = completion_gate · min(quality_channels)
+
+    `completion_gate` ∈ {0,1}-SHARP owns the floor — a sustained sagittal-leg
+    burst (a launch) AND a sustained-upright AND non-travelling stance; a
+    one-leg balance (no burst), a whip-and-fall (not upright) and a forward
+    walker (travelling) all gate to ~0. Quality channels (each saturating
+    [0,1], combined by MIN so none can be traded away):
+      * intensity — sagittal-leg burst speed (how forceful).
+      * amplitude — sagittal-leg range of motion (LAW 2; a micro-twitch ~0);
+                    ABSTAINS when joint_pos is absent.
+      * direction — signed FORWARD foot displacement in the pelvis frame
+                    (LAW 4; a rear/sideways kick ~0); ABSTAINS (LAW 6) when the
+                    left/right_foot_pos_b channels are absent — never a
+                    direction-free magnitude proxy.
+    Sagittal-plane legs only (hip pitch + knee + ankle pitch — §Ship 49), and
+    stationarity is a VETO inside the gate, NEVER positive credit (a frozen
+    one-leg pose is maximally stationary — the §Ship 47 lesson, hardened)."""
     names = list((meta or {}).get("joint_names") or [])
     jv = arrays["joint_vel"]
-    # §Ship 49: SAGITTAL-plane legs only (hip pitch + knee + ankle pitch),
-    # excluding hip roll/yaw. A forward kick lives in the sagittal plane, so
-    # a sideways (hip-roll) kick no longer earns burst credit — the
-    # g1-kick-v4 "kicks but sideways" gap, fixed at the ground-truth level.
     legs = leg_sagittal_indices(names) if len(names) == jv.shape[2] else []
-    mask = upright_mask(arrays["projected_gravity_b"])
+    g = arrays["projected_gravity_b"]
+    mask = upright_mask(g)
     b = burstiness(jv, joint_indices=legs or None, valid_mask=mask)
-    up = uprightness(arrays["projected_gravity_b"])
-    intensity = 1.0 - float(np.exp(-b["burst_p95"] / 5.0))
-    ratio = max(b["burst_ratio_p95"], b["burst_ratio_p99"])
-    ratio_gate = float(np.clip((ratio - 2.0) / 3.0, 0.0, 1.0))
-    # §Ship 36: monotone discrete kick-event diagnostic, reported alongside
-    # the (confounded) ratio score so the diagnoser sees an extremal-Goodhart-
-    # robust signal. spec_score is unchanged pending real-rollout calibration.
-    ev = kick_events_score(jv, arrays["projected_gravity_b"],
-                           joint_indices=legs or None)
-    # §Ship 47: stationarity gate. Degrade to 1.0 (no gate) when
-    # root_link_pos_w is absent so synthetic ladders/callers that omit it
-    # (and the existing leg-only unit tests) are unchanged.
+    up = uprightness(g)
+    ev = kick_events_score(jv, g, joint_indices=legs or None)
+
+    # ── completion gate (sharp; owns the floor) ──────────────────────────
+    # A real launch: sustained sagittal-leg burst above a floor, within upright
+    # windows (burstiness is already masked to upright). kick_events is a
+    # refractory-counted confirmation, reported as a diagnostic alongside.
+    launch = _sharp_gate(b["burst_p95"], _KICK_BURST_FLOOR, _KICK_BURST_WIDTH)
+    upright_gate = _sharp_gate(up, _KICK_UPRIGHT_FLOOR, _KICK_UPRIGHT_WIDTH)
+    # §Ship 47: stationarity VETO. Degrades to 1.0 (no veto) when
+    # root_link_pos_w is absent so leg-only callers/ladders are unchanged.
     root = arrays.get("root_link_pos_w")
     if root is not None:
         speed = float(horizontal_speed(root)["speed_per_frame"])
         stationarity = float(np.clip(np.exp(-speed / _KICK_STATIONARY_SCALE), 0.0, 1.0))
     else:
         speed, stationarity = 0.0, 1.0
-    return {
+    # §kick-fix: require a GENUINE forward-foot excursion — a standing leg-jiggle
+    # clears the burst launch floor but barely moves the foot forward. Degrades to
+    # 1.0 (no veto) when NEITHER foot channel is present, so the footless
+    # calibration ladder + any leg-only caller stay byte-identical (and monotone).
+    fwd_exc = _swing_foot_forward_excursion(
+        arrays.get("left_foot_pos_b"), arrays.get("right_foot_pos_b"))
+    excursion_gate = (1.0 if fwd_exc is None
+                      else _sharp_gate(fwd_exc, _KICK_EXCURSION_FLOOR, _KICK_EXCURSION_WIDTH))
+    completion_gate = float(launch * upright_gate * stationarity * excursion_gate)
+
+    # ── quality channels (min; abstain on absent data) ───────────────────
+    intensity = 1.0 - float(np.exp(-b["burst_p95"] / _KICK_INTENSITY_SCALE))
+    channels = [intensity]
+
+    jp = arrays.get("joint_pos")
+    amplitude: Optional[float] = None
+    if jp is not None and getattr(jp, "ndim", 0) >= 3 and jp.shape[2] == jv.shape[2]:
+        rom = _leg_range_of_motion(jp, legs or None)
+        amplitude = 1.0 - float(np.exp(-rom / _KICK_AMPLITUDE_SCALE))
+        channels.append(amplitude)
+
+    direction = _forward_kick_direction(
+        arrays.get("left_foot_pos_b"), arrays.get("right_foot_pos_b"))
+    if direction is not None:
+        channels.append(direction)
+
+    quality = float(min(channels))
+    score = float(np.clip(completion_gate * quality, 0.0, 1.0))
+
+    out = {
         **b,
         **ev,
         "uprightness": up,
         "leg_subset": 1.0 if legs else 0.0,
         "stationarity": stationarity,
         "horizontal_speed": speed,
-        "spec_score": float(np.clip(intensity * ratio_gate * up * stationarity, 0.0, 1.0)),
+        "completion_gate": completion_gate,
+        "kick_intensity": intensity,
+        "spec_score": score,
     }
+    if amplitude is not None:
+        out["kick_amplitude"] = amplitude
+    if direction is not None:
+        out["kick_direction"] = direction
+    else:
+        out["direction_abstained"] = 1.0
+    return out
 
 
 def spec_g1_jump(
@@ -588,12 +747,287 @@ def spec_go1_trot(
     }
 
 
+def _prefix_length(mask: np.ndarray) -> int:
+    """Length of the initial true run in a one-dimensional boolean mask."""
+    false = np.flatnonzero(~mask)
+    return int(false[0]) if false.size else int(mask.size)
+
+
+def _longest_true_run(mask: np.ndarray) -> int:
+    """Longest contiguous true run in a one-dimensional boolean mask."""
+    best = current = 0
+    for value in mask:
+        current = current + 1 if bool(value) else 0
+        best = max(best, current)
+    return best
+
+
+def spec_object_lift_hold(
+    arrays: Mapping[str, np.ndarray],
+    behavior: Mapping[str, Any],
+    meta: Optional[Mapping[str, Any]] = None,
+) -> dict[str, float]:
+    """Target-aware lift-clear-and-hold completion for grasping robots.
+
+    This metric is deliberately capability- and artifact-driven: there are no
+    robot, task, or object-name branches. A completion requires one target to
+    begin below its world-space goal, rise at least 8 cm, remain within the
+    task's (capped) 5 cm goal tolerance for 0.5 s, remain mechanically held by
+    at least two independent contact groups, and stay dynamically quiet. For
+    multi-object tasks every non-target object must remain within 5 cm of its
+    initial pose through completion.
+
+    Episode and command boundaries are hard boundaries. Invalid target IDs,
+    post-reset samples, command changes, implausible state jumps, and
+    excessive velocity turn the affected environment into an honest zero;
+    non-finite telemetry and forged grasp/contact disagreement fail the
+    whole artifact closed. ``spec_score`` is the binary
+    completion rate across the originally requested vector environments; the
+    continuous fields are diagnostics only and never substitute for completion.
+    """
+    contract = dict((meta or {}).get("manipulation_telemetry") or {})
+    object_names = tuple(contract.get("object_names") or ())
+    finger_groups = tuple(sorted((contract.get("finger_groups") or {}).keys()))
+    if not object_names:
+        raise ValueError("manipulation telemetry declares no objects")
+    if not bool(contract.get("grasp_capable")) or len(finger_groups) < 2:
+        raise ValueError(
+            "object_lift_hold requires two independent grasp-contact groups")
+
+    step_dt = float(behavior.get("step_dt") or 0.0)
+    if not np.isfinite(step_dt) or not 0.001 <= step_dt <= 0.2:
+        raise ValueError(f"invalid behavior.step_dt {step_dt!r}")
+
+    target_idx = np.asarray(arrays["target_object_index"])
+    target_pos = np.asarray(arrays["target__pos_w"], dtype=np.float64)
+    valid = np.asarray(arrays["rollout_valid"], dtype=bool)
+    terminal = np.asarray(arrays["rollout_terminal"], dtype=bool)
+    if target_idx.ndim != 2:
+        raise ValueError(
+            f"target_object_index must be (T, E), got {target_idx.shape}")
+    T, E = target_idx.shape
+    if target_pos.shape != (T, E, 3):
+        raise ValueError(f"target__pos_w must be {(T, E, 3)}")
+    if valid.shape != (T, E) or terminal.shape != (T, E):
+        raise ValueError("rollout masks must match target_object_index")
+
+    positions: list[np.ndarray] = []
+    lin_velocities: list[np.ndarray] = []
+    ang_velocities: list[np.ndarray] = []
+    grasps: list[np.ndarray] = []
+    for name in object_names:
+        pos = np.asarray(arrays[f"object__{name}__pos_w"], dtype=np.float64)
+        lin = np.asarray(
+            arrays[f"object__{name}__lin_vel_w"], dtype=np.float64)
+        ang = np.asarray(
+            arrays[f"object__{name}__ang_vel_w"], dtype=np.float64)
+        grasp = np.asarray(arrays[f"grasp__{name}"]) > 0.5
+        if pos.shape != (T, E, 3) or lin.shape != (T, E, 3) \
+                or ang.shape != (T, E, 3) or grasp.shape != (T, E):
+            raise ValueError(f"object {name!r} telemetry shapes are inconsistent")
+        contacts = [
+            np.asarray(arrays[f"contact__{group}__{name}"]) > 0.5
+            for group in finger_groups
+        ]
+        if any(contact.shape != (T, E) for contact in contacts):
+            raise ValueError(f"object {name!r} contact shapes are inconsistent")
+        derived = np.sum(np.stack(contacts, axis=0), axis=0) >= 2
+        if not np.array_equal(grasp, derived):
+            raise ValueError(
+                f"grasp__{name} disagrees with independent contact channels")
+        positions.append(pos)
+        lin_velocities.append(lin)
+        ang_velocities.append(ang)
+        grasps.append(grasp)
+
+    pos_all = np.stack(positions, axis=0)       # (O, T, E, 3)
+    lin_all = np.stack(lin_velocities, axis=0)
+    ang_all = np.stack(ang_velocities, axis=0)
+    grasp_all = np.stack(grasps, axis=0)        # (O, T, E)
+    if not all(np.all(np.isfinite(value)) for value in (
+        target_pos, pos_all, lin_all, ang_all,
+    )):
+        raise ValueError("manipulation telemetry contains non-finite values")
+
+    declared_tolerance = (
+        (contract.get("target_contract") or {})
+        .get("declared_success_threshold_m", 0.05)
+    )
+    try:
+        target_tolerance = min(0.05, float(declared_tolerance))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid target success threshold") from exc
+    if not np.isfinite(target_tolerance) or target_tolerance <= 0:
+        raise ValueError("invalid target success threshold")
+
+    baseline_frames = max(2, int(np.ceil(0.10 / step_dt)))
+    pickup_frames = max(baseline_frames, int(np.ceil(0.20 / step_dt)))
+    hold_frames = max(2, int(np.ceil(0.50 / step_dt)))
+    max_grasp_gap = max(1, int(np.floor(0.10 / step_dt)))
+    min_clearance = 0.08
+    max_distractor_displacement = 0.05
+
+    completions = np.zeros(E, dtype=bool)
+    structurally_valid = np.zeros(E, dtype=bool)
+    physically_valid = np.zeros(E, dtype=bool)
+    peak_lifts = np.zeros(E, dtype=np.float64)
+    min_goal_errors = np.full(E, np.inf, dtype=np.float64)
+    best_grasp_fractions = np.zeros(E, dtype=np.float64)
+    longest_holds = np.zeros(E, dtype=np.float64)
+    distractor_displacements = np.zeros(E, dtype=np.float64)
+
+    for env_index in range(E):
+        env_valid = valid[:, env_index]
+        valid_len = _prefix_length(env_valid)
+        # The validity mask must be one contiguous prefix. A terminal marker is
+        # either absent (capture ended) or exactly the first invalid sample.
+        if np.any(env_valid[valid_len:]):
+            continue
+        terminal_at = np.flatnonzero(terminal[:, env_index])
+        if terminal_at.size > 1:
+            continue
+        if terminal_at.size and int(terminal_at[0]) != valid_len:
+            continue
+        if valid_len < baseline_frames + hold_frames:
+            continue
+
+        first_index = int(target_idx[0, env_index])
+        if not 0 <= first_index < len(object_names):
+            continue
+        first_target = target_pos[0, env_index]
+        # Treat a command/identity resample as a new attempt. Only the first
+        # uninterrupted command segment can score, preventing mid-rollout
+        # object resets from masquerading as transport.
+        same_identity = target_idx[:valid_len, env_index] == first_index
+        same_command = np.linalg.norm(
+            target_pos[:valid_len, env_index] - first_target, axis=-1,
+        ) <= 1e-6
+        segment_len = _prefix_length(same_identity & same_command)
+        if segment_len < baseline_frames + hold_frames:
+            continue
+        structurally_valid[env_index] = True
+
+        obj_pos = pos_all[first_index, :segment_len, env_index]
+        obj_lin = lin_all[first_index, :segment_len, env_index]
+        obj_ang = ang_all[first_index, :segment_len, env_index]
+        obj_grasp = grasp_all[first_index, :segment_len, env_index]
+        baseline = np.median(obj_pos[:baseline_frames], axis=0)
+        initial_goal_error = float(np.linalg.norm(first_target - baseline))
+        vertical_goal_gap = float(first_target[2] - baseline[2])
+        if vertical_goal_gap < min_clearance or initial_goal_error < min_clearance:
+            continue
+        if float(np.mean(obj_grasp[:baseline_frames])) > 0.2:
+            continue
+        # Spawned rigid bodies can settle for a few frames. A maximum-speed
+        # gate made a single normal contact impulse veto the whole attempt on
+        # real YAM rollouts; the median rejects sustained initial motion while
+        # the jump/global-speed gates below still reject resets and explosions.
+        if float(np.median(np.linalg.norm(
+            obj_lin[:baseline_frames], axis=-1,
+        ))) > 0.5:
+            continue
+
+        # Global plausibility gates are relative (vectorized world origins may
+        # be far from zero). The absolute displacement floor below tolerates
+        # contact impulses, so a sub-floor crawl with forged zero velocities
+        # is NOT caught here: honest simulator provenance is established by
+        # the spec-audit evidence hashes, not by these physics gates alone.
+        implausible = False
+        for object_index in range(len(object_names)):
+            p = pos_all[object_index, :segment_len, env_index]
+            lv = lin_all[object_index, :segment_len, env_index]
+            av = ang_all[object_index, :segment_len, env_index]
+            speed = np.linalg.norm(lv, axis=-1)
+            if np.max(speed) > 10.0 or np.max(np.linalg.norm(av, axis=-1)) > 100.0:
+                implausible = True
+                break
+            if segment_len > 1:
+                step_displacement = np.linalg.norm(np.diff(p, axis=0), axis=-1)
+                speed_bound = (
+                    3.0 * np.maximum(speed[:-1], speed[1:]) * step_dt + 0.02)
+                if np.any(step_displacement > np.maximum(0.12, speed_bound)):
+                    implausible = True
+                    break
+            object_baseline = np.median(p[:baseline_frames], axis=0)
+            if np.max(np.linalg.norm(p - object_baseline, axis=-1)) > 5.0:
+                implausible = True
+                break
+        if implausible:
+            continue
+        physically_valid[env_index] = True
+
+        lift = obj_pos[:, 2] - baseline[2]
+        error = np.linalg.norm(obj_pos - first_target, axis=-1)
+        lin_speed = np.linalg.norm(obj_lin, axis=-1)
+        ang_speed = np.linalg.norm(obj_ang, axis=-1)
+        goal_stable = (
+            (lift >= min_clearance)
+            & (error <= target_tolerance)
+            & (lin_speed <= 0.15)
+            & (ang_speed <= 1.0)
+        )
+        peak_lifts[env_index] = max(0.0, float(np.max(lift)))
+        min_goal_errors[env_index] = float(np.min(error))
+        longest_holds[env_index] = (
+            _longest_true_run(goal_stable) * step_dt)
+
+        for start in range(pickup_frames, segment_len - hold_frames + 1):
+            stop = start + hold_frames
+            if not np.all(goal_stable[start:stop]):
+                continue
+            held = obj_grasp[start:stop]
+            grasp_fraction = float(np.mean(held))
+            best_grasp_fractions[env_index] = max(
+                best_grasp_fractions[env_index], grasp_fraction)
+            if grasp_fraction < 0.8:
+                continue
+            if _longest_true_run(~held) > max_grasp_gap:
+                continue
+
+            disturbed = 0.0
+            for other_index in range(len(object_names)):
+                if other_index == first_index:
+                    continue
+                other = pos_all[other_index, :stop, env_index]
+                other_base = np.median(other[:baseline_frames], axis=0)
+                disturbed = max(
+                    disturbed,
+                    float(np.max(np.linalg.norm(other - other_base, axis=-1))),
+                )
+            distractor_displacements[env_index] = disturbed
+            if disturbed > max_distractor_displacement:
+                continue
+            completions[env_index] = True
+            break
+
+    finite_goal_errors = min_goal_errors[np.isfinite(min_goal_errors)]
+    return {
+        "completion_rate": float(np.mean(completions)) if E else 0.0,
+        "structurally_valid_rate": float(np.mean(structurally_valid)) if E else 0.0,
+        "physically_valid_rate": float(np.mean(physically_valid)) if E else 0.0,
+        "mean_peak_lift_m": float(np.mean(peak_lifts)) if E else 0.0,
+        "mean_min_goal_error_m": (
+            float(np.mean(finite_goal_errors))
+            if finite_goal_errors.size else 0.0),
+        "mean_best_grasp_fraction": (
+            float(np.mean(best_grasp_fractions)) if E else 0.0),
+        "mean_longest_goal_hold_s": (
+            float(np.mean(longest_holds)) if E else 0.0),
+        "max_distractor_displacement_m": (
+            float(np.max(distractor_displacements)) if E else 0.0),
+        "target_tolerance_m": target_tolerance,
+        "required_hold_s": hold_frames * step_dt,
+        "spec_score": float(np.mean(completions)) if E else 0.0,
+    }
+
+
 _SPEC_FNS: dict[str, Callable[..., dict[str, float]]] = {
     "cartpole_balance": spec_cartpole_balance,
     "g1_floss": spec_g1_floss,
     "g1_jump": spec_g1_jump,
     "g1_kick": spec_g1_kick,
     "go1_trot": spec_go1_trot,
+    "object_lift_hold": spec_object_lift_hold,
 }
 
 
@@ -654,10 +1088,104 @@ _REQUIRED_ARRAYS: dict[str, tuple[str, ...]] = {
     # working with stationarity=1.0.
     "g1_kick": ("joint_vel", "projected_gravity_b", "root_link_pos_w"),
     "go1_trot": ("root_link_pos_w", "projected_gravity_b"),
+    # Object-specific state/contact keys are expanded from the hashable
+    # manipulation sidecar by `_manipulation_required_arrays`.
+    "object_lift_hold": (
+        "target_object_index", "target__pos_w",
+        "rollout_valid", "rollout_terminal",
+    ),
 }
+
+#: §Ship 54-pre (#12): the FULL set of physical observables each spec metric MAY
+#: read — `_REQUIRED_ARRAYS` plus the arrays the fn reads opportunistically via
+#: `arrays.get(...)`. This is the metric's "held-out test surface": the
+#: shaping↔metric partition gate (`partition_gate`) warns when a reward edit
+#: touches one of these and hard-rejects a reward that lowers a completion gate.
+#: g1_kick additionally reads joint_pos (amplitude), left/right_foot_pos_b
+#: (signed forward direction) when present (spec_metrics.py:575-585).
+_METRIC_OBSERVABLES: dict[str, tuple[str, ...]] = {
+    "cartpole_balance": (),
+    "g1_floss": ("joint_pos", "projected_gravity_b"),
+    "g1_jump": ("root_link_pos_w", "projected_gravity_b"),
+    "g1_kick": (
+        "joint_vel", "projected_gravity_b", "root_link_pos_w",
+        "joint_pos", "left_foot_pos_b", "right_foot_pos_b",
+    ),
+    "go1_trot": ("root_link_pos_w", "projected_gravity_b"),
+    "object_lift_hold": (
+        "target_object_index", "target__pos_w",
+        "rollout_valid", "rollout_terminal",
+        "object_state", "object_contact", "grasp_evidence",
+    ),
+}
+
+
+def metric_observables(spec_name: str) -> frozenset[str]:
+    """The physical observables `spec_name` scores (its held-out surface for the
+    shaping↔metric partition gate). Falls back to `_REQUIRED_ARRAYS` for any
+    spec not in `_METRIC_OBSERVABLES`; empty set for an unknown name (the gate
+    then no-ops, never raises)."""
+    obs = _METRIC_OBSERVABLES.get(spec_name)
+    if obs is None:
+        obs = _REQUIRED_ARRAYS.get(spec_name, ())
+    return frozenset(obs)
+
 
 #: Capture settings echoed into every result for E2 parity assertions.
 _CAPTURE_KEYS = ("step_dt", "max_episode_steps", "rollout_num_envs")
+
+
+def _load_manipulation_manifest(rollout_dir: Path) -> dict[str, Any]:
+    """Load and strictly validate the dynamic manipulation array contract."""
+    path = rollout_dir / "manipulation_telemetry.json"
+    if not path.is_file():
+        raise ValueError(f"manipulation_telemetry.json missing in {rollout_dir}")
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict):
+        raise ValueError("manipulation telemetry manifest must be an object")
+    if manifest.get("schema_version") != 2:
+        raise ValueError(
+            "object_lift_hold requires manipulation telemetry schema 2 "
+            "with first-episode masks")
+    names = manifest.get("object_names")
+    if not isinstance(names, list) or not names or any(
+        not isinstance(name, str) or not name for name in names
+    ) or len(set(names)) != len(names):
+        raise ValueError("manipulation telemetry object_names are invalid")
+    groups = manifest.get("finger_groups")
+    if not isinstance(groups, dict) or len(groups) < 2 or any(
+        not isinstance(group, str) or not group
+        or not isinstance(bodies, list) or not bodies
+        for group, bodies in groups.items()
+    ):
+        raise ValueError(
+            "object_lift_hold requires at least two contact-evidence groups")
+    if manifest.get("grasp_capable") is not True:
+        raise ValueError("manipulation telemetry is not grasp-capable")
+    target_contract = manifest.get("target_contract")
+    if not isinstance(target_contract, dict) \
+            or target_contract.get("position_frame") != "world":
+        raise ValueError("target position must declare the world frame")
+    channels = manifest.get("channels")
+    if not isinstance(channels, dict):
+        raise ValueError("manipulation telemetry channels are missing")
+    return manifest
+
+
+def _manipulation_required_arrays(
+    manifest: Mapping[str, Any],
+) -> tuple[str, ...]:
+    needed = list(_REQUIRED_ARRAYS["object_lift_hold"])
+    groups = sorted(manifest["finger_groups"])
+    for name in manifest["object_names"]:
+        needed.extend((
+            f"object__{name}__pos_w",
+            f"object__{name}__lin_vel_w",
+            f"object__{name}__ang_vel_w",
+            f"grasp__{name}",
+        ))
+        needed.extend(f"contact__{group}__{name}" for group in groups)
+    return tuple(needed)
 
 
 def compute_spec_metrics(
@@ -696,6 +1224,10 @@ def compute_spec_metrics(
                 pass
         arrays: dict[str, np.ndarray] = {}
         needed = _REQUIRED_ARRAYS[spec_name]
+        if spec_name == "object_lift_hold":
+            manipulation_manifest = _load_manipulation_manifest(rollout_dir)
+            meta["manipulation_telemetry"] = manipulation_manifest
+            needed = _manipulation_required_arrays(manipulation_manifest)
         if needed:
             npz_path = rollout_dir / "trajectory.npz"
             if not npz_path.is_file():
@@ -712,6 +1244,17 @@ def compute_spec_metrics(
                     }
                 for k in needed:
                     arrays[k] = z[k]
+                    if spec_name == "object_lift_hold":
+                        declared = manipulation_manifest["channels"].get(k)
+                        if not isinstance(declared, dict):
+                            raise ValueError(
+                                f"manipulation manifest omits channel {k!r}")
+                        if declared.get("shape") != list(arrays[k].shape):
+                            raise ValueError(
+                                f"manifest shape disagrees for channel {k!r}")
+                        if declared.get("dtype") != str(arrays[k].dtype):
+                            raise ValueError(
+                                f"manifest dtype disagrees for channel {k!r}")
         out = _SPEC_FNS[spec_name](arrays, behavior, meta)
         capture = {k: behavior.get(k) for k in _CAPTURE_KEYS if k in behavior}
         return {"spec_name": spec_name, **out, "capture": capture}
@@ -752,5 +1295,22 @@ def make_spec_fitness_fn(spec_name: str) -> Callable[[Any], float]:
         except Exception:  # noqa: BLE001 — breakdown is advisory, never fatal
             return {}
 
+    def _detail_dir(rollout_dir: Any) -> dict:
+        # §Selection statistics: score an ARBITRARY rollout dir (multi-seed
+        # evaluation rolls into `rollout_eval_<k>/` beside the primary
+        # `rollout/`; fresh-seed re-eval into `rollout_fresh_<j>/`). Same
+        # computation as `_detail` minus the hardcoded subdir. Never raises.
+        try:
+            return compute_spec_metrics(spec_name, Path(rollout_dir))
+        except Exception:  # noqa: BLE001 — advisory, never fatal
+            return {}
+
     _fitness.detail = _detail  # type: ignore[attr-defined]
+    _fitness.detail_dir = _detail_dir  # type: ignore[attr-defined]
+    # §Ship 54-pre (#12): expose the metric's held-out observable surface so the
+    # sculpt loop can hand it to the shaping↔metric partition gate at the
+    # reward-edit commit point (sculpt.py passes
+    # `metric_observables=getattr(fitness_fn, "metric_observables", None)`).
+    _fitness.metric_observables = metric_observables(spec_name)  # type: ignore[attr-defined]
+    _fitness.spec_name = spec_name  # type: ignore[attr-defined]
     return _fitness

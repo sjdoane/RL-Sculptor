@@ -1,0 +1,267 @@
+"""Real-GPU env-construction smoke test for the get-up reference RSI
+curriculum (§REFERENCE_TRAJECTORY_PLAN §8 part 2).
+
+Builds the mjlab G1 env EXACTLY the way a training run would (smallest
+practical num_envs, real `ManagerBasedRlEnv`, `device="cuda:0"`), with
+an env-spec version produced by `apply_reference_rsi` from a synthetic
+get-up clip (lying start z=0.12 m, pitched 90 deg face-up, with a
+per-joint "curled up" `joint_pos` trace), resets it, and asserts the
+OBSERVED root height and orientation in the reset state actually match
+a lying get-up start — not just that the cfg carries the right values.
+This is the highest verification level available (live env, not just
+cfg-mutation assertions): it proves both new mechanisms actually work
+end to end inside mjlab —
+  * `pose_range["pitch"]` orientation wiring (§8 part 1);
+  * the injected `reset_joints_to_reference` event term (§8 part 2,
+    the genuinely new per-joint-target mjlab event this increment
+    adds — mjlab's shipped `reset_joints_by_offset` cannot do this).
+
+Invocation:
+    cd ~/projects/RewardSculptor && uv run pytest -m gpu
+
+Skipped automatically on hosts without CUDA (see conftest.py).
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+# Canonical G1 joint order (mirrors sculptor.eval.robot_manifest.G1_29 —
+# duplicated here as a literal so this test has no hidden coupling to
+# that module's own correctness).
+_G1_JOINTS = (
+    "left_hip_pitch_joint", "left_hip_roll_joint", "left_hip_yaw_joint",
+    "left_knee_joint", "left_ankle_pitch_joint", "left_ankle_roll_joint",
+    "right_hip_pitch_joint", "right_hip_roll_joint", "right_hip_yaw_joint",
+    "right_knee_joint", "right_ankle_pitch_joint", "right_ankle_roll_joint",
+    "waist_yaw_joint", "waist_roll_joint", "waist_pitch_joint",
+    "left_shoulder_pitch_joint", "left_shoulder_roll_joint",
+    "left_shoulder_yaw_joint", "left_elbow_joint", "left_wrist_roll_joint",
+    "left_wrist_pitch_joint", "left_wrist_yaw_joint",
+    "right_shoulder_pitch_joint", "right_shoulder_roll_joint",
+    "right_shoulder_yaw_joint", "right_elbow_joint", "right_wrist_roll_joint",
+    "right_wrist_pitch_joint", "right_wrist_yaw_joint",
+)
+
+
+def _make_synthetic_getup_clip() -> dict:
+    """Lying (z=0.12 m, pitched pi/2 face-up, curled-up joints) -> ramp
+    -> standing (z=0.78 m, upright, straight joints)."""
+    fps = 50.0
+    n_lying, n_ramp, n_stand = 25, 50, 25
+    lying_z = np.full(n_lying, 0.12)
+    ramp_z = np.linspace(0.12, 0.78, n_ramp)
+    stand_z = np.full(n_stand, 0.78)
+    z = np.concatenate([lying_z, ramp_z, stand_z])
+
+    def quat_pitch(theta: float) -> np.ndarray:
+        return np.array([np.cos(theta / 2), 0.0, np.sin(theta / 2), 0.0])
+
+    lying_q = np.tile(quat_pitch(np.pi / 2), (n_lying, 1))
+    ramp_s = np.linspace(0.0, 1.0, n_ramp, endpoint=False)
+    ramp_q = np.stack([quat_pitch(np.pi / 2 * (1 - s)) for s in ramp_s])
+    stand_q = np.tile(quat_pitch(0.0), (n_stand, 1))
+    quat = np.concatenate([lying_q, ramp_q, stand_q], axis=0)
+
+    j = len(_G1_JOINTS)
+    lying_j = np.tile(np.linspace(0.3, -0.3, j), (n_lying, 1))
+    ramp_j = np.linspace(lying_j[0], np.zeros(j), n_ramp)
+    stand_j = np.zeros((n_stand, j))
+    joint_pos = np.concatenate([lying_j, ramp_j, stand_j], axis=0)
+
+    return {
+        "root_pos_z": z, "fps": fps, "root_quat_wxyz": quat,
+        "joint_pos": joint_pos, "joint_names": list(_G1_JOINTS),
+        "meta": {"source": "gpu_smoke:synthetic_getup"},
+    }
+
+
+def _quat_wxyz_to_pitch_rad(q: np.ndarray) -> float:
+    w, x, y, z = q
+    sinp = float(np.clip(2.0 * (w * y - z * x), -1.0, 1.0))
+    return float(np.arcsin(sinp))
+
+
+@pytest.mark.gpu
+def test_getup_rsi_env_reset_is_actually_lying(tmp_path: Path) -> None:
+    """End-to-end: synthetic get-up clip -> apply_reference_rsi ->
+    _apply_env_spec -> real ManagerBasedRlEnv(device="cuda:0") -> reset
+    -> observed root height < 0.35 m and |pitch| > 1.0 rad.
+
+    §get-up RSI fix (2026-07-09): also asserts the built env carries NO
+    fell_over termination term (the fix's cfg-level effect) and that a
+    reset does NOT terminate at step 0 (the LIVE FAILURE this fix
+    closes — the lying reset itself used to trip the standard
+    fell-over/bad-orientation termination on every env, so training
+    never ran; stepping once with zero actions and checking `terminated`
+    is the closest thing to reproducing the original symptom without a
+    full training loop)."""
+    import torch
+
+    from mjlab.envs.manager_based_rl_env import ManagerBasedRlEnv
+    from mjlab.tasks.registry import load_env_cfg
+
+    from sculptor.adapters._mjlab_runner import _apply_env_spec
+    from sculptor.env_spec import read_current_env_spec
+    from sculptor.reference import apply_reference_rsi
+
+    task_id = "Mjlab-Velocity-Flat-Unitree-G1"
+    clip = _make_synthetic_getup_clip()
+    env_dir = tmp_path / "env"
+    apply_reference_rsi(env_dir, clip)
+    spec = read_current_env_spec(env_dir)
+
+    # Sanity on the spec itself before spending GPU time — all four new
+    # keys must be present (the whole point of this increment), plus the
+    # fell_over_termination fix.
+    train = spec["train"]
+    assert "reset_pitch_offset_rad" in train
+    assert "reset_joint_pos_target" in train
+    assert len(train["reset_joint_pos_target"]) == len(_G1_JOINTS)
+    assert train["fell_over_termination"] is False
+
+    env_cfg = load_env_cfg(task_id)
+    # Smallest num_envs the adapter/mjlab stack tolerates for a
+    # construction smoke — this test only needs a reset, not throughput.
+    env_cfg.scene.num_envs = 2
+    _apply_env_spec(env_cfg, spec, train=True, task_id=task_id)
+    assert "fell_over" not in env_cfg.terminations, (
+        "fell_over termination term still present in the built cfg — "
+        "the get-up lying reset would trip it at reset")
+
+    env = ManagerBasedRlEnv(cfg=env_cfg, device="cuda:0")
+    try:
+        env.reset()
+        asset = env.scene["robot"]
+        root_state = asset.data.root_link_pose_w  # (num_envs, 7)
+        heights = root_state[:, 2].detach().cpu().numpy()
+        quats = root_state[:, 3:7].detach().cpu().numpy()
+        pitches = [abs(_quat_wxyz_to_pitch_rad(q)) for q in quats]
+
+        assert (heights < 0.35).all(), (
+            f"reset root height not low enough for a lying get-up "
+            f"start: {heights}")
+        assert all(p > 1.0 for p in pitches), (
+            f"reset pitch magnitude not large enough for a lying "
+            f"get-up start: {pitches}")
+
+        # The per-joint reference posture reset must also be observed —
+        # NOT the standing default (all-zero for this synthetic clip).
+        joint_pos = asset.data.joint_pos.detach().cpu().numpy()
+        target = np.array(train["reset_joint_pos_target"])
+        # Generous tolerance: soft-limit clamping + noise (0.05 rad) may
+        # shift individual joints slightly from the exact target.
+        assert np.abs(joint_pos - target[None, :]).max() < 0.3, (
+            "reset joint_pos does not resemble the reference posture "
+            "target — reset_joints_to_reference may not have fired")
+
+        # §LIVE FAILURE repro/close: step once with zero actions from the
+        # lying reset and confirm the episode does NOT terminate at
+        # step 0. Before this fix, the lying reset's own orientation
+        # tripped fell_over on every env — `terminated` would be
+        # all-True right after the very first step.
+        n_actions = env.action_manager.total_action_dim
+        zero_action = torch.zeros(
+            (env_cfg.scene.num_envs, n_actions), device=env.device)
+        _obs, _rew, terminated, _truncated, _extras = env.step(zero_action)
+        assert not bool(terminated.all()), (
+            "all environments terminated on the very first step from a "
+            "get-up lying reset — fell_over (or an equivalent "
+            "termination) is still firing on the reference reset itself")
+    finally:
+        env.close()
+
+
+@pytest.mark.gpu
+def test_getup_eval_reset_env_reset_is_lying_and_deterministic(
+    tmp_path: Path,
+) -> None:
+    """§D17: the EVAL-side path — build the env the way `_cmd_rollout`
+    does (shared-only `_apply_env_spec(train=False)`, which on its own
+    would reset STANDING for a get-up stage) then layer
+    `_apply_eval_reset` with `derive_eval_reset`'s payload on top, and
+    confirm the OBSERVED reset is actually lying — closing the exact
+    gap D17 exists to fix (eval previously never saw the get-up start
+    at all). Also confirms determinism: two resets of the same env
+    produce the SAME root height/orientation (no per-episode noise —
+    `derive_eval_reset` forces `reset_joint_pos_noise_rad: 0.0` and a
+    single-point pose_range), within a small numerical tolerance."""
+    import torch
+
+    from mjlab.envs.manager_based_rl_env import ManagerBasedRlEnv
+    from mjlab.tasks.registry import load_env_cfg
+
+    from sculptor.adapters._mjlab_runner import _apply_env_spec, _apply_eval_reset
+    from sculptor.reference import derive_eval_reset
+
+    task_id = "Mjlab-Velocity-Flat-Unitree-G1"
+    clip = _make_synthetic_getup_clip()
+    eval_reset = derive_eval_reset(clip)
+    assert eval_reset is not None
+    assert eval_reset["reset_joint_pos_noise_rad"] == 0.0
+
+    env_cfg = load_env_cfg(task_id)
+    env_cfg.scene.num_envs = 4
+    # Shared-only base — exactly `_cmd_rollout`'s call, spec=None means
+    # task defaults (standing-start) with nothing get-up-shaped in it.
+    _apply_env_spec(env_cfg, None, train=False, task_id=task_id)
+    _apply_eval_reset(env_cfg, eval_reset, task_id=task_id)
+    assert "fell_over" not in env_cfg.terminations, (
+        "fell_over termination still present after eval-reset override — "
+        "the lying start would trip it at reset")
+
+    env = ManagerBasedRlEnv(cfg=env_cfg, device="cuda:0")
+    try:
+        heights_by_reset = []
+        quats_by_reset = []
+        for _ in range(2):
+            env.reset()
+            asset = env.scene["robot"]
+            root_state = asset.data.root_link_pose_w
+            heights_by_reset.append(
+                root_state[:, 2].detach().cpu().numpy().copy())
+            quats_by_reset.append(
+                root_state[:, 3:7].detach().cpu().numpy().copy())
+
+        for heights in heights_by_reset:
+            assert (heights < 0.35).all(), (
+                f"eval reset root height not low enough for a lying "
+                f"get-up start: {heights}")
+        for quats in quats_by_reset:
+            pitches = [abs(_quat_wxyz_to_pitch_rad(q)) for q in quats]
+            assert all(p > 1.0 for p in pitches), (
+                f"eval reset pitch magnitude not large enough for a "
+                f"lying get-up start: {pitches}")
+
+        # Determinism: same fixed reset every time, zero noise — height
+        # and PITCH (the get-up-relevant axis this override actually
+        # fixes) must agree within a tight numerical tolerance across
+        # resets. Yaw is deliberately NOT part of the eval-reset payload
+        # (derive_eval_reset only ever emits pitch/roll — a get-up
+        # start's defining axes) — mjlab's default reset_base still
+        # randomizes it, so raw quaternion equality is the wrong check
+        # here; comparing the derived pitch angle isolates the axis this
+        # override actually controls.
+        np.testing.assert_allclose(
+            heights_by_reset[0], heights_by_reset[1], atol=1e-4,
+            err_msg="eval reset height not deterministic across resets")
+        pitches_0 = [abs(_quat_wxyz_to_pitch_rad(q)) for q in quats_by_reset[0]]
+        pitches_1 = [abs(_quat_wxyz_to_pitch_rad(q)) for q in quats_by_reset[1]]
+        np.testing.assert_allclose(
+            pitches_0, pitches_1, atol=1e-2,
+            err_msg="eval reset pitch not deterministic across resets")
+
+        # §step-0 sanity: zero-action step must not terminate every env
+        # (same LIVE-FAILURE guard as the train-side test above).
+        n_actions = env.action_manager.total_action_dim
+        zero_action = torch.zeros(
+            (env_cfg.scene.num_envs, n_actions), device=env.device)
+        _obs, _rew, terminated, _truncated, _extras = env.step(zero_action)
+        assert not bool(terminated.all()), (
+            "all environments terminated on the very first eval step "
+            "from a get-up lying reset")
+    finally:
+        env.close()

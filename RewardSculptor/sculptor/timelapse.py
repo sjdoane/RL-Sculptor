@@ -34,10 +34,8 @@ import re
 import shutil
 import subprocess
 import sys
-import textwrap
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 
 # ── Small path helpers ──────────────────────────────────────────────────
@@ -59,18 +57,8 @@ def _load_json(path: Path, default=None):
         return {} if default is None else default
 
 
-def _load_final_reward_spec(rewards_dir: Path) -> tuple[Path, dict]:
-    """Return (path_to_latest_vN.py, REWARD_SPEC)."""
-    best: tuple[int, Path] | None = None
-    for p in rewards_dir.glob("v*.py"):
-        m = re.fullmatch(r"v(\d+)", p.stem)
-        if m:
-            n = int(m.group(1))
-            if best is None or n > best[0]:
-                best = (n, p)
-    if best is None:
-        return rewards_dir / "v0.py", {}
-    path = best[1]
+def _load_reward_spec(path: Path) -> tuple[Path, dict]:
+    """Return ``(path, REWARD_SPEC)`` without mutating import state."""
     spec = importlib.util.spec_from_file_location(
         f"_sculpt_final_reward_{abs(hash(str(path)))}", path)
     if spec is None or spec.loader is None:
@@ -83,6 +71,20 @@ def _load_final_reward_spec(rewards_dir: Path) -> tuple[Path, dict]:
     return path, getattr(mod, "REWARD_SPEC", {}) or {}
 
 
+def _load_final_reward_spec(rewards_dir: Path) -> tuple[Path, dict]:
+    """Return ``(path_to_latest_vN.py, REWARD_SPEC)`` as a fallback."""
+    best: tuple[int, Path] | None = None
+    for p in rewards_dir.glob("v*.py"):
+        m = re.fullmatch(r"v(\d+)", p.stem)
+        if m:
+            n = int(m.group(1))
+            if best is None or n > best[0]:
+                best = (n, p)
+    if best is None:
+        return rewards_dir / "v0.py", {}
+    return _load_reward_spec(best[1])
+
+
 def _find_iter_dirs(runs_dir: Path) -> list[Path]:
     dirs: list[tuple[int, Path]] = []
     if not runs_dir.is_dir():
@@ -93,6 +95,57 @@ def _find_iter_dirs(runs_dir: Path) -> list[Path]:
             dirs.append((int(m.group(1)), d))
     dirs.sort(key=lambda x: x[0])
     return [d for _, d in dirs]
+
+
+def _iter_number(iter_dir: Path) -> int:
+    match = re.fullmatch(r"iter_(\d+)", iter_dir.name)
+    return int(match.group(1)) if match else -1
+
+
+def _select_report_iter_dir(iter_dirs: list[Path]) -> Path | None:
+    """Choose the same completed policy the Results UI should foreground.
+
+    A diagnosis may create newer reward/environment drafts after training.
+    Report provenance must instead follow an immutable completed policy. Among
+    completed policies with objective fitness, select the highest fitness and
+    break ties toward the newer iteration. Fall back to the newest completed
+    iteration, then the newest directory for legacy projects without markers.
+    """
+    completed: list[Path] = []
+    scored: list[tuple[float, int, Path]] = []
+    for iter_dir in iter_dirs:
+        marker = _load_json(iter_dir / "iteration_complete.json")
+        if marker.get("state") != "completed":
+            continue
+        completed.append(iter_dir)
+        fitness = _load_json(iter_dir / "fitness.json").get("fitness")
+        try:
+            scored.append((float(fitness), _iter_number(iter_dir), iter_dir))
+        except (TypeError, ValueError):
+            pass
+    if scored:
+        return max(scored, key=lambda item: (item[0], item[1]))[2]
+    if completed:
+        return completed[-1]
+    return iter_dirs[-1] if iter_dirs else None
+
+
+def _load_selected_reward_spec(
+    project: Path,
+    selected_iter_dir: Path | None,
+    rewards_dir: Path,
+) -> tuple[Path, dict]:
+    """Load the reward pinned to the selected policy's immutable tuple."""
+    if selected_iter_dir is not None:
+        artifact_tuple = _load_json(selected_iter_dir / "artifact_tuple.json")
+        reward_ref = ((artifact_tuple.get("refs") or {}).get("reward") or {})
+        reward_rel = reward_ref.get("path")
+        if isinstance(reward_rel, str) and reward_rel:
+            candidate = (project / reward_rel).resolve()
+            project_root = project.resolve()
+            if candidate.is_relative_to(project_root) and candidate.is_file():
+                return _load_reward_spec(candidate)
+    return _load_final_reward_spec(rewards_dir)
 
 
 def _select_iter_indices(n_iters: int) -> list[int]:
@@ -294,12 +347,13 @@ def _build_final_mp4(
         label_idx = 1 + 2 * i
         video_idx = 1 + 2 * i + 1
         v = f"v{i}"
-        l = f"l{i}"
+        label_tag = f"l{i}"
         filter_parts.append(
             f"[{video_idx}:v]scale={panel_size}:{panel_size},"
             f"setsar=1,fps={fps}[{v}]")
-        filter_parts.append(f"[{label_idx}:v]scale={panel_size}:56[{l}]")
-        filter_parts.append(f"[{v}][{l}]overlay=0:H-h[p{i}]")
+        filter_parts.append(
+            f"[{label_idx}:v]scale={panel_size}:56[{label_tag}]")
+        filter_parts.append(f"[{v}][{label_tag}]overlay=0:H-h[p{i}]")
         panel_tags.append(f"[p{i}]")
 
     if n >= 2:
@@ -345,7 +399,7 @@ def _collect_iter_edits(
     was applied (i.e., metric[i+1] - metric[i]). For the last iter, delta
     is None (not yet measured)."""
     out: list[_EditSummary] = []
-    for d in iter_dirs:
+    for position, d in enumerate(iter_dirs):
         m = re.fullmatch(r"iter_(\d+)", d.name)
         if not m:
             continue
@@ -355,9 +409,12 @@ def _collect_iter_edits(
             continue
         # delta = metric[i+1] - metric[i] when both exist
         delta = None
-        if len(metric_history) > i + 1 and len(metric_history) > i:
+        if len(metric_history) > position + 1:
             try:
-                delta = float(metric_history[i + 1]) - float(metric_history[i])
+                delta = (
+                    float(metric_history[position + 1])
+                    - float(metric_history[position])
+                )
             except Exception:  # noqa: BLE001
                 delta = None
         for e in diag.get("proposed_edits", []) or []:
@@ -412,6 +469,7 @@ def _write_final_report_md(
     provenance: dict,
     final_mp4_path: Path,
     final_mp4_ok: bool,
+    selected_iter_dir: Path | None = None,
 ) -> Path:
     iter_cfg = config.get("iteration", {}) or {}
     primary_key = str(iter_cfg.get("primary_metric", "mean_return"))
@@ -419,12 +477,21 @@ def _write_final_report_md(
     adapter_class = (config.get("adapter", {}) or {}).get("class", "(unknown)")
 
     first_iter = iter_dirs[0] if iter_dirs else None
-    last_iter = iter_dirs[-1] if iter_dirs else None
+    last_iter = selected_iter_dir or (iter_dirs[-1] if iter_dirs else None)
     first_behavior = _load_json(first_iter / "rollout" / "behavior.json") if first_iter else {}
     last_behavior = _load_json(last_iter / "rollout" / "behavior.json") if last_iter else {}
 
     starting_metric = metric_history[0] if metric_history else None
-    ending_metric = metric_history[-1] if metric_history else None
+    selected_position = (
+        iter_dirs.index(last_iter)
+        if last_iter is not None and last_iter in iter_dirs
+        else len(iter_dirs) - 1
+    )
+    ending_metric = (
+        metric_history[selected_position]
+        if 0 <= selected_position < len(metric_history)
+        else None
+    )
 
     # Top-3 impactful edits
     ranked = [e for e in edits if e.delta is not None
@@ -452,7 +519,7 @@ def _write_final_report_md(
 
     # Summary table rows
     summary_rows: list[dict] = []
-    for d in iter_dirs:
+    for position, d in enumerate(iter_dirs):
         m = re.fullmatch(r"iter_(\d+)", d.name)
         if not m:
             continue
@@ -464,7 +531,11 @@ def _write_final_report_md(
         n_novel = sum(1 for e in applied if not (e.get("paper_refs") or []))
         summary_rows.append({
             "iter": i,
-            "metric": metric_history[i] if i < len(metric_history) else None,
+            "metric": (
+                metric_history[position]
+                if position < len(metric_history)
+                else None
+            ),
             "num_references_added": n_refs,
             "num_novel_edits": n_novel,
         })
@@ -483,7 +554,7 @@ def _write_final_report_md(
         if starting_metric is not None and ending_metric is not None
         else f"- **Primary metric (`{primary_key}`)**: n/a"
     )
-    lines.append(f"- **Final reward module**: "
+    lines.append(f"- **Selected policy reward module**: "
                  f"[`rewards/{final_reward_path.name}`](rewards/{final_reward_path.name})  "
                  f"(version `{final_reward_spec.get('version', '?')}`)")
     video_status = "[final.mp4](" + str(final_mp4_path.as_posix()) + ")" if final_mp4_ok else \
@@ -492,10 +563,10 @@ def _write_final_report_md(
 
     # Behavior before/after
     lines.append("## Behavior: starting vs ending\n")
-    lines.append(f"**Starting** (iter {0}): "
+    lines.append(f"**Starting** (iter {_iter_number(first_iter) if first_iter else '?'}): "
                  f"{_describe_behavior(first_behavior, behavior_metric_names)}")
     lines.append("")
-    lines.append(f"**Ending** (iter {len(iter_dirs) - 1}): "
+    lines.append(f"**Selected** (iter {_iter_number(last_iter) if last_iter else '?'}): "
                  f"{_describe_behavior(last_behavior, behavior_metric_names)}\n")
 
     # Top 3 most impactful edits
@@ -621,8 +692,12 @@ def build_report(
     metric_history_obj = _load_json(project / "reports" / "metric_history.json")
     metric_history: list[float] = list(metric_history_obj.get("history", []))
 
-    # Final reward
-    final_reward_path, final_reward_spec = _load_final_reward_spec(rewards_dir)
+    # The Results UI foregrounds a completed policy, not a later diagnosis
+    # draft. Keep report behavior/reward provenance attached to that policy's
+    # immutable artifact tuple.
+    selected_iter_dir = _select_report_iter_dir(iter_dirs)
+    final_reward_path, final_reward_spec = _load_selected_reward_spec(
+        project, selected_iter_dir, rewards_dir)
 
     # Provenance
     provenance = _load_json(project / "reports" / "provenance.json") or {}
@@ -643,10 +718,11 @@ def build_report(
                 f"({mp4}); dropping from time-lapse.\n")
             continue
         metric = metric_history[idx] if idx < len(metric_history) else None
+        iter_number = _iter_number(d)
         if metric is None:
-            label = f"Iter {idx}"
+            label = f"Iter {iter_number}"
         else:
-            label = f"Iter {idx}   {primary_key}={metric:+.3f}"
+            label = f"Iter {iter_number}   {primary_key}={metric:+.3f}"
         panel_videos.append(mp4)
         panel_labels.append(label)
 
@@ -664,7 +740,12 @@ def build_report(
         behavior_goal=behavior_goal,
         total_iters=len(iter_dirs),
         starting_metric=metric_history[0] if metric_history else None,
-        ending_metric=metric_history[-1] if metric_history else None,
+        ending_metric=(
+            metric_history[iter_dirs.index(selected_iter_dir)]
+            if selected_iter_dir in iter_dirs
+            and iter_dirs.index(selected_iter_dir) < len(metric_history)
+            else None
+        ),
         primary_key=primary_key,
         adapter_class=(cfg.get("adapter", {}) or {}).get("class", "(unknown)"),
         width=title_width, height=480,
@@ -702,10 +783,367 @@ def build_report(
         edits=edits, final_reward_path=final_reward_path,
         final_reward_spec=final_reward_spec, provenance=provenance,
         final_mp4_path=out_mp4, final_mp4_ok=mp4_ok,
+        selected_iter_dir=selected_iter_dir,
     )
 
     return ReportResult(
         final_mp4_path=out_mp4, final_mp4_ok=mp4_ok,
         final_report_md_path=md_path, ffmpeg_stderr=stderr,
         selected_iter_indices=selected,
+    )
+
+
+# ── Mission-aware report (§chunk C1) ────────────────────────────────────
+# A Mission (sculptor.mission.Mission) decomposes a complex goal into an
+# ordered sequence of Stages, each scaffolded as its own mini-project at
+# `<mission_dir>/stages/<stage_name>/` — own config.toml, runs/, rewards/,
+# reports/. `build_mission_report` walks the stages in order and reuses
+# every per-run helper above (unchanged), rather than re-implementing the
+# analytics. `build_report` itself is untouched by any of this.
+@dataclass
+class _StageReportData:
+    """Everything one stage contributes to the mission report — the
+    stage-scoped analog of the locals `build_report` computes inline."""
+
+    stage_name: str
+    stage_dir: Path
+    config: dict
+    iter_dirs: list[Path]
+    metric_history: list[float]
+    edits: list[_EditSummary]
+    final_reward_path: Path
+    final_reward_spec: dict
+    provenance: dict
+    primary_key: str
+    behavior_metric_names: list[str]
+    adapter_class: str
+    load_error: str = ""  # non-empty when config.toml itself was unreadable
+
+
+def _collect_stage_data(stage_dir: Path) -> _StageReportData:
+    """Gather one stage's report analytics. Mirrors the first half of
+    `build_report`'s body, scoped to `stage_dir` instead of a top-level
+    project. Never raises — a stage that hasn't scaffolded yet (or whose
+    config.toml is unreadable) comes back with empty collections and
+    `load_error` set, so the caller can render a graceful placeholder
+    section instead of aborting the whole mission report."""
+    config_path = stage_dir / "config.toml"
+    try:
+        cfg = _parse_toml(config_path)
+    except Exception as e:  # noqa: BLE001 — stage not scaffolded / corrupt
+        return _StageReportData(
+            stage_name=stage_dir.name, stage_dir=stage_dir, config={},
+            iter_dirs=[], metric_history=[], edits=[],
+            final_reward_path=stage_dir / "rewards" / "v0.py",
+            final_reward_spec={}, provenance={}, primary_key="mean_return",
+            behavior_metric_names=[], adapter_class="(unknown)",
+            load_error=f"{type(e).__name__}: {e}",
+        )
+
+    runs_dir = stage_dir / "runs"
+    rewards_dir = stage_dir / "rewards"
+    iter_dirs = _find_iter_dirs(runs_dir)
+
+    metric_history_obj = _load_json(stage_dir / "reports" / "metric_history.json")
+    metric_history: list[float] = list(metric_history_obj.get("history", []))
+
+    final_reward_path, final_reward_spec = _load_final_reward_spec(rewards_dir)
+    provenance = _load_json(stage_dir / "reports" / "provenance.json") or {}
+    edits = _collect_iter_edits(iter_dirs, metric_history)
+
+    iter_cfg = cfg.get("iteration", {}) or {}
+    return _StageReportData(
+        stage_name=stage_dir.name, stage_dir=stage_dir, config=cfg,
+        iter_dirs=iter_dirs, metric_history=metric_history, edits=edits,
+        final_reward_path=final_reward_path,
+        final_reward_spec=final_reward_spec, provenance=provenance,
+        primary_key=str(iter_cfg.get("primary_metric", "mean_return")),
+        behavior_metric_names=list(iter_cfg.get("behavior_metrics", [])),
+        adapter_class=(cfg.get("adapter", {}) or {}).get("class", "(unknown)"),
+    )
+
+
+def _stage_status_line(stage) -> str:  # stage: sculptor.mission.Stage
+    """One-line status summary for the mission-header stage table."""
+    bits = [f"status=`{stage.status}`"]
+    if stage.best_metric is not None:
+        bits.append(f"best_metric={stage.best_metric:+.4f}")
+    bits.append(f"iterations_used={stage.iterations_used}")
+    if stage.parent_stage:
+        bits.append(f"parent=`{stage.parent_stage}`")
+    return ", ".join(bits)
+
+
+def _write_mission_report_section(
+    lines: list[str], *, stage, data: _StageReportData,
+) -> None:  # stage: sculptor.mission.Stage
+    """Append one stage's section (mirrors `_write_final_report_md`'s
+    per-run layout: behavior start→end, top edits, summary table) to
+    the running `lines` buffer. Never raises on missing artifacts —
+    every read below already tolerates absence via `_load_json`."""
+    lines.append(f"## Stage: `{stage.name}`\n")
+    lines.append(f"- **Goal**: _{stage.goal_text}_")
+    lines.append(f"- **Success criterion**: `{stage.success_criterion}`")
+    lines.append(f"- **{_stage_status_line(stage)}**")
+    if data.load_error:
+        lines.append(
+            f"\n_Stage has not scaffolded yet or its config.toml is "
+            f"unreadable ({data.load_error}); no run data to report._\n"
+        )
+        return
+
+    iter_dirs = data.iter_dirs
+    metric_history = data.metric_history
+    primary_key = data.primary_key
+    starting_metric = metric_history[0] if metric_history else None
+    ending_metric = metric_history[-1] if metric_history else None
+
+    lines.append(f"- **Adapter**: `{data.adapter_class}`")
+    lines.append(f"- **Iterations completed**: {len(iter_dirs)}")
+    lines.append(
+        f"- **Primary metric (`{primary_key}`)**: "
+        f"{starting_metric:+.4f} → {ending_metric:+.4f} "
+        f"(Δ {(ending_metric - starting_metric):+.4f})"
+        if starting_metric is not None and ending_metric is not None
+        else f"- **Primary metric (`{primary_key}`)**: n/a"
+    )
+    lines.append("")
+
+    if not iter_dirs:
+        lines.append("_No completed iterations in this stage yet._\n")
+        return
+
+    first_behavior = _load_json(iter_dirs[0] / "rollout" / "behavior.json")
+    last_behavior = _load_json(iter_dirs[-1] / "rollout" / "behavior.json")
+    lines.append("**Behavior: starting vs ending**\n")
+    lines.append(f"- Starting (iter 0): "
+                 f"{_describe_behavior(first_behavior, data.behavior_metric_names)}")
+    lines.append(f"- Ending (iter {len(iter_dirs) - 1}): "
+                 f"{_describe_behavior(last_behavior, data.behavior_metric_names)}\n")
+
+    ranked = [e for e in data.edits if e.delta is not None
+              and not e.requires_env_extension]
+    ranked.sort(key=lambda e: (-(e.delta or 0.0), e.iter_index, e.target_term))
+    top3 = ranked[:3]
+    lines.append("**Top edits (by primary-metric delta)**\n")
+    if not top3:
+        lines.append("_No edits with measurable impact._\n")
+    else:
+        for rank, e in enumerate(top3, 1):
+            delta_s = f"{e.delta:+.4f}" if e.delta is not None else "n/a"
+            refs_s = (", ".join(f"arXiv:{a}" for a in e.paper_refs)
+                      if e.paper_refs else "(novel)")
+            lines.append(f"{rank}. iter {e.iter_index} / `{e.target_term}` "
+                         f"[{e.operation}] — Δ = {delta_s} — {refs_s}")
+        lines.append("")
+
+    lines.append("**Summary**\n")
+    lines.append("| iter | " + primary_key + " |")
+    lines.append("|---:|---:|")
+    for d in iter_dirs:
+        m = re.fullmatch(r"iter_(\d+)", d.name)
+        if not m:
+            continue
+        i = int(m.group(1))
+        metric = metric_history[i] if i < len(metric_history) else None
+        m_s = f"{metric:+.4f}" if isinstance(metric, (int, float)) else "n/a"
+        lines.append(f"| {i} | {m_s} |")
+    lines.append("")
+
+
+def _write_mission_report_md(
+    *, mission, mission_dir: Path, stage_data: dict[str, _StageReportData],
+    final_mp4_path: Path, final_mp4_ok: bool,
+) -> Path:  # mission: sculptor.mission.Mission
+    lines: list[str] = []
+    lines.append("# Sculpt Mission Report\n")
+    lines.append(f"- **Goal**: _{mission.goal}_")
+    lines.append(f"- **Mission directory**: `{mission_dir}`")
+    lines.append(f"- **Stages**: {len(mission.stages)}")
+    lines.append(f"- **Decomposition model**: `{mission.decomposition_model}`")
+    video_status = (
+        "[final.mp4](" + str(final_mp4_path.as_posix()) + ")" if final_mp4_ok
+        else f"_video build failed or skipped; expected at_ "
+             f"`{final_mp4_path.as_posix()}`"
+    )
+    lines.append(f"- **Time-lapse video**: {video_status}\n")
+
+    lines.append("## Decomposition rationale\n")
+    lines.append(f"{mission.decomposition_rationale}\n")
+
+    lines.append("## Stages overview\n")
+    lines.append("| # | stage | status | best_metric | criterion |")
+    lines.append("|---:|---|---|---:|---|")
+    for i, stage in enumerate(mission.stages):
+        best = f"{stage.best_metric:+.4f}" if stage.best_metric is not None else "n/a"
+        crit = stage.success_criterion
+        if len(crit) > 60:
+            crit = crit[:57] + "…"
+        lines.append(f"| {i} | `{stage.name}` | {stage.status} | {best} | `{crit}` |")
+    lines.append("")
+
+    for stage in mission.stages:
+        data = stage_data[stage.name]
+        _write_mission_report_section(lines, stage=stage, data=data)
+
+    out = mission_dir / "reports" / "final_report.md"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text("\n".join(lines), encoding="utf-8")
+    return out
+
+
+_MAX_PANELS_PER_STAGE = 3
+
+
+def _select_mission_panels(
+    stage_data_ordered: list[_StageReportData],
+) -> tuple[list[Path], list[str]]:
+    """Pick ≤`_MAX_PANELS_PER_STAGE` rollout videos per stage, in stage
+    order, using the same `_select_iter_indices` + `_probe_video_ok`
+    gating `build_report` uses per-run. Labels: "<stage> · iter N ·
+    <primary_key>=<value>" (or without the metric when unavailable)."""
+    panel_videos: list[Path] = []
+    panel_labels: list[str] = []
+    for data in stage_data_ordered:
+        if data.load_error or not data.iter_dirs:
+            continue
+        n = len(data.iter_dirs)
+        # Reuse the existing 1/mid/N selector, then cap to the per-stage
+        # panel budget (it already returns ≤3 for n<=... but for larger
+        # n it also returns exactly 3, so this cap is defensive).
+        selected = _select_iter_indices(n)[:_MAX_PANELS_PER_STAGE]
+        for idx in selected:
+            d = data.iter_dirs[idx]
+            mp4 = d / "rollout" / "rollout.mp4"
+            if not _probe_video_ok(mp4):
+                sys.stderr.write(
+                    f"[mission report] stage {data.stage_name!r} iter_{idx}'s "
+                    f"rollout.mp4 missing or too small ({mp4}); dropping "
+                    f"from time-lapse.\n")
+                continue
+            metric = (data.metric_history[idx]
+                      if idx < len(data.metric_history) else None)
+            if metric is None:
+                label = f"{data.stage_name} · iter {idx}"
+            else:
+                label = f"{data.stage_name} · iter {idx} · {data.primary_key}={metric:+.3f}"
+            panel_videos.append(mp4)
+            panel_labels.append(label)
+    return panel_videos, panel_labels
+
+
+def build_mission_report(
+    mission_dir: Path | str, out_mp4: Path | str,
+) -> ReportResult:
+    """Produce `<mission_dir>/reports/final.mp4` + `final_report.md` for
+    a multi-stage Mission. `mission_dir` is the directory holding
+    `mission.json` (see `sculptor.mission.load_mission` / `save_mission`
+    disk layout); `out_mp4` is where the stitched time-lapse is written
+    (conventionally `<mission_dir>/reports/final.mp4`, matching the
+    project-level `build_report`'s convention).
+
+    Walks stages IN ORDER, reusing the exact per-run helpers `build_report`
+    uses (`_find_iter_dirs`, `_collect_iter_edits`, `_select_iter_indices`,
+    `_build_final_mp4`, …) pointed at each stage's own mini-project dir.
+    A stage that hasn't scaffolded yet, or is missing an optional artifact
+    (metric_history.json, provenance.json, a rollout mp4, …), is skipped
+    gracefully rather than raising — the report renders what's available."""
+    from sculptor.mission import load_mission  # local: avoid import cycle
+
+    mission_dir = Path(mission_dir).resolve()
+    mission = load_mission(mission_dir)
+
+    # §mission-persistence increment 1: this loop is status-agnostic by
+    # design — it walks EVERY entry in `mission.stages`, including ones
+    # marked "superseded" (retained after a redecomposition splice, see
+    # `sculpt._maybe_redecompose_and_splice`). A superseded stage has a
+    # real on-disk stage_dir with real trained iterations (that's the
+    # whole point of retaining it instead of discarding it), so
+    # `_collect_stage_data` picks up its footage/metrics the same as
+    # any other stage — no special-casing needed, and nothing here
+    # raises on a superseded stage's presence.
+    stage_data: dict[str, _StageReportData] = {}
+    for stage in mission.stages:
+        try:
+            stage_dir = mission.stage_dir(stage.name)
+        except (RuntimeError, KeyError):
+            stage_dir = mission_dir / "stages" / stage.name
+        stage_data[stage.name] = _collect_stage_data(stage_dir)
+
+    stage_data_ordered = [stage_data[s.name] for s in mission.stages]
+    panel_videos, panel_labels = _select_mission_panels(stage_data_ordered)
+
+    out_mp4 = Path(out_mp4).resolve()
+    out_mp4.parent.mkdir(parents=True, exist_ok=True)
+
+    panel_size = 480
+    title_width = max(panel_size, panel_size * max(1, len(panel_videos)))
+    tmp_dir = out_mp4.parent / ".sculpt_timelapse"
+    tmp_dir.mkdir(exist_ok=True)
+    title_png = tmp_dir / "title.png"
+
+    # Mission-level "primary metric" for the title card: first stage with
+    # a non-empty metric history that also has a steering/primary key.
+    first_with_history = next(
+        (d for d in stage_data_ordered if d.metric_history), None)
+    total_iters = sum(len(d.iter_dirs) for d in stage_data_ordered)
+    _render_title_png(
+        title_png,
+        behavior_goal=mission.goal,
+        total_iters=total_iters,
+        starting_metric=(stage_data_ordered[0].metric_history[0]
+                         if stage_data_ordered and stage_data_ordered[0].metric_history
+                         else None),
+        ending_metric=(stage_data_ordered[-1].metric_history[-1]
+                       if stage_data_ordered and stage_data_ordered[-1].metric_history
+                       else None),
+        primary_key=(first_with_history.primary_key
+                    if first_with_history is not None else "mean_return"),
+        adapter_class=(stage_data_ordered[0].adapter_class
+                       if stage_data_ordered else "(unknown)"),
+        width=title_width, height=480,
+    )
+
+    mp4_ok = False
+    stderr = ""
+    if panel_videos:
+        mp4_ok, stderr = _build_final_mp4(
+            panel_videos=panel_videos, panel_labels=panel_labels,
+            title_png=title_png, out_path=out_mp4, panel_size=panel_size)
+    else:
+        sys.stderr.write(
+            "[mission report] no valid rollout videos across any stage; "
+            "writing title-card-only mp4.\n")
+        ffmpeg = _ffmpeg_exe()
+        if ffmpeg is not None:
+            cmd = [
+                ffmpeg, "-y", "-loglevel", "error",
+                "-loop", "1", "-t", "4", "-i", str(title_png),
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-r", "25",
+                str(out_mp4),
+            ]
+            r = subprocess.run(cmd, capture_output=True, text=True)
+            stderr = r.stderr
+            mp4_ok = (r.returncode == 0 and out_mp4.exists()
+                      and out_mp4.stat().st_size > 0)
+
+    md_path = _write_mission_report_md(
+        mission=mission, mission_dir=mission_dir, stage_data=stage_data,
+        final_mp4_path=out_mp4, final_mp4_ok=mp4_ok,
+    )
+
+    # selected_iter_indices has no single-run meaning for a mission; report
+    # the per-stage-ordered index list flattened (0-based within each
+    # stage) so callers inspecting it still get something meaningful.
+    selected_indices: list[int] = []
+    for data in stage_data_ordered:
+        if data.load_error or not data.iter_dirs:
+            continue
+        selected_indices.extend(
+            _select_iter_indices(len(data.iter_dirs))[:_MAX_PANELS_PER_STAGE])
+
+    return ReportResult(
+        final_mp4_path=out_mp4, final_mp4_ok=mp4_ok,
+        final_report_md_path=md_path, ffmpeg_stderr=stderr,
+        selected_iter_indices=selected_indices,
     )

@@ -2,10 +2,10 @@ import {
   Activity, AlertCircle, AlertTriangle, ArrowLeft, ArrowRight, ArrowUpRight,
   Book, Bot, Camera, Check, CheckCircle2, ChevronDown, ChevronLeft, ChevronRight,
   ChevronUp, Circle, CircleDot, Clock, Command, Copy, Cpu, Download, ExternalLink,
-  FileCode, FileText, Filter, Flag, Folder, Gauge, GitBranch, GitCommitHorizontal,
+  Eye, EyeOff, FileCode, FileText, Filter, Flag, Folder, Gauge, GitBranch, GitCommitHorizontal,
   GitCompare, History, Info, Key, Layers, LayoutGrid, Library, List, Loader2,
   Maximize2, Menu, Minus, Moon, Network, Package, PanelLeft, Pause, Pencil, Play,
-  Plus, RefreshCw, ScrollText, Search, Settings, SlidersHorizontal, Sparkles,
+  Plus, RefreshCw, ScrollText, Search, Settings, SkipForward, SlidersHorizontal, Sparkles,
   Square, Sun, Target, Terminal, Thermometer, TrendingUp, Trash2, Upload, User,
   Video, X, Zap, type LucideIcon,
 } from "lucide-react";
@@ -55,6 +55,8 @@ const ICON_MAP: Record<string, LucideIcon> = {
   upload: Upload,
   download: Download,
   copy: Copy,
+  eye: Eye,
+  "eye-off": EyeOff,
   "trending-up": TrendingUp,
   "alert-triangle": AlertTriangle,
   "alert-circle": AlertCircle,
@@ -83,6 +85,7 @@ const ICON_MAP: Record<string, LucideIcon> = {
   info: Info,
   minus: Minus,
   history: History,
+  "skip-forward": SkipForward,
 };
 
 export interface IconProps {

@@ -1,0 +1,57 @@
+{
+  "attribution": "LAFAN1 Retargeting Dataset (lvhaidong/LAFAN1_Retargeting_Dataset), g1/fallAndGetUp2_subject3.csv",
+  "clip_id": "fallandgetup2_subject3--seg00",
+  "content_sha256": "7ec57d8c439925fac54e2c5918759f0582c0041ef5a5750eaaaa8ed33b76994a",
+  "fps_source": 30.0,
+  "frame_range": [
+    187,
+    615
+  ],
+  "ingested_at": "2026-07-09T20:42:20Z",
+  "joint_mapping": {
+    "identity": true
+  },
+  "labels": [
+    "fall",
+    "and",
+    "get",
+    "up",
+    "2",
+    "subject",
+    "3",
+    "segment"
+  ],
+  "license": "CC BY-NC-ND 4.0",
+  "parent_clip_id": "fallandgetup2_subject3",
+  "qc": {
+    "checks": [
+      "column_count",
+      "finite",
+      "min_frames",
+      "joint_mapping",
+      "plausibility",
+      "motion_class"
+    ],
+    "duration_s": 14.2667,
+    "flags": [],
+    "n_frames": 428,
+    "root_z_range": [
+      0.0985,
+      0.7821
+    ]
+  },
+  "retarget": {
+    "notes": "",
+    "tool": "dataset-provided"
+  },
+  "robot": "g1",
+  "schema": 1,
+  "source": {
+    "kind": "hf_dataset",
+    "path": "g1/fallAndGetUp2_subject3.csv",
+    "repo": "lvhaidong/LAFAN1_Retargeting_Dataset",
+    "url": "https://huggingface.co/datasets/lvhaidong/LAFAN1_Retargeting_Dataset/resolve/main/g1/fallAndGetUp2_subject3.csv"
+  },
+  "text": "fall and get up 2 subject 3 segment",
+  "tier": "K"
+}

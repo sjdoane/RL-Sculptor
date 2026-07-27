@@ -1,4 +1,5 @@
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { toast } from "sonner";
 
 import { Icon } from "@/components/rs/icon";
@@ -6,10 +7,22 @@ import { Badge, Banner, Btn, Modal } from "@/components/rs/primitives";
 import {
   useDeleteMission,
   useMission,
+  useRegenerateStageMetric,
+  useStageEnvSpec,
+  useStageIterations,
 } from "@/hooks/useMissions";
+import { useDetachStageReference } from "@/hooks/useReferences";
+import { useJob } from "@/hooks/useJob";
 import { RunMissionDialog } from "@/components/RunMissionDialog";
+import { ReferencePickerDialog } from "@/components/ReferencePickerDialog";
 import { useMissionEvents } from "@/hooks/useMissionEvents";
-import { ApiError } from "@/lib/api";
+import { ApiError, stageCheckpointUrl, stageExportUrl, stageRolloutUrl } from "@/lib/api";
+import { qk } from "@/lib/queryKeys";
+import { useQueryClient } from "@tanstack/react-query";
+import {
+  formatContradictionTooltip, formatIterMetrics, naturalnessChipText, selectionLabel, selectionSentence,
+} from "@/lib/selection";
+import { failureReasonText, stageLabel, supersededText } from "@/lib/stageDisplay";
 import { formatRelative } from "@/lib/utils";
 import type {
   MissionEvent,
@@ -37,11 +50,31 @@ export function MissionDetailDialog({
   const detail = useMission(slug, missionSlug ?? undefined, {
     enabled: open,
   });
+  const navigate = useNavigate();
   // §Ship-19d: clicking "Run mission" now opens RunMissionDialog (a
   // separate Dialog component) so the user can configure iterations
   // / Goal A / Goal B per launch. The actual mutation is owned by
   // RunMissionDialog. We still keep `del` here for the Delete button.
   const del = useDeleteMission(slug);
+
+  // §Ship 20 (de-siloing): which stage's disk-truth iterations to show.
+  // null = the collapsed stage list; selecting a stage expands its panel.
+  const [selectedStage, setSelectedStage] = useState<string | null>(null);
+  // Reset the selection whenever the dialog closes or the mission changes,
+  // so re-opening starts from the stage list.
+  useEffect(() => {
+    if (!open) setSelectedStage(null);
+  }, [open]);
+  useEffect(() => {
+    setSelectedStage(null);
+  }, [missionSlug]);
+
+  // Deep-link the Rewards tab scoped to a stage, then close this dialog.
+  const viewStageRewards = (stageName: string) => {
+    if (!missionSlug) return;
+    onOpenChange(false);
+    navigate(`/projects/${slug}?tab=rewards&stage=${encodeURIComponent(`${missionSlug}/${stageName}`)}`);
+  };
 
   const mission = detail.data;
   const liveSummary = mission ?? summary;
@@ -73,6 +106,25 @@ export function MissionDetailDialog({
     () => (mission?.stages ? computeStageDepths(mission.stages) : new Map()),
     [mission?.stages],
   );
+
+  // §UX honesty pass: "N/M stages" in the header used to mean current_
+  // stage_idx/n_stages — a live-run pointer, not a completion count, so a
+  // mission with 5 stages and 1 failure read as "5/5 stages" once the
+  // pointer walked off the end. Derive an actual succeeded/total count
+  // from stage statuses instead. Superseded stages (replanned away) are
+  // excluded from the denominator; sub-stages are counted (mission.stages
+  // already includes them, unfiltered). null until the detail loads.
+  const stageCounts = useMemo(() => {
+    if (!mission?.stages) return null;
+    let succeeded = 0, pending = 0, failed = 0, superseded = 0;
+    for (const s of mission.stages) {
+      if (s.status === "succeeded") succeeded++;
+      else if (s.status === "failed") failed++;
+      else if (s.status === "superseded") superseded++;
+      else pending++; // pending | training | skipped
+    }
+    return { succeeded, pending, failed, superseded, total: succeeded + pending + failed };
+  }, [mission?.stages]);
 
   // §Ship-19c: derive per-stage iter history from the WS structured-
   // event stream. iter_started / iter_completed / rollout_done events
@@ -118,9 +170,20 @@ export function MissionDetailDialog({
       title={liveSummary?.goal ?? "Mission"}
       subtitle={
         <span style={{ display: "inline-flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-          <span className="mono">
+          <span
+            className="mono"
+            title={
+              stageCounts
+                ? `succeeded ${stageCounts.succeeded} · pending ${stageCounts.pending} · failed ${stageCounts.failed} · superseded ${stageCounts.superseded}`
+                : undefined
+            }
+          >
             {liveSummary
-              ? `${liveSummary.mission_slug} · ${liveSummary.current_stage_idx}/${liveSummary.n_stages} stages · created ${formatRelative(liveSummary.created_at)}`
+              ? `${liveSummary.mission_slug} · ${
+                  stageCounts
+                    ? `${stageCounts.succeeded}/${stageCounts.total} stages succeeded${stageCounts.superseded > 0 ? ` · ${stageCounts.superseded} superseded` : ""}`
+                    : `${liveSummary.current_stage_idx}/${liveSummary.n_stages} stages`
+                } · created ${formatRelative(liveSummary.created_at)}`
               : "Loading…"}
           </span>
           {liveSummary && <MissionLifecycleBadge lifecycle={liveSummary.lifecycle} />}
@@ -221,20 +284,40 @@ export function MissionDetailDialog({
         </section>
       )}
 
-      {mission && mission.stages.length > 0 && (
+      {mission && mission.stages.length > 0 && missionSlug && (
         <section>
-          <PHead>Stages ({mission.current_stage_idx}/{mission.n_stages})</PHead>
+          <PHead>Stages ({mission.stages.length})</PHead>
           <div style={{ display: "flex", flexDirection: "column", gap: 7 }}>
-            {mission.stages.map((s, idx) => (
-              <StageCard
-                key={s.name}
-                stage={s}
-                depth={stageDepths.get(s.name) ?? 0}
-                isCurrent={idx === mission.current_stage_idx}
-                iters={stageIters.get(s.name) ?? []}
-                effectiveMaxIters={stageEffectiveMaxIters.get(s.name) ?? null}
-              />
-            ))}
+            {mission.stages.map((s, idx) => {
+              const isCurrent = idx === mission.current_stage_idx;
+              const selected = selectedStage === s.name;
+              return (
+                <div key={s.name}>
+                  <StageCard
+                    slug={slug}
+                    missionSlug={missionSlug}
+                    stage={s}
+                    fallbackNumber={idx + 1}
+                    depth={stageDepths.get(s.name) ?? 0}
+                    isCurrent={isCurrent}
+                    iters={stageIters.get(s.name) ?? []}
+                    effectiveMaxIters={stageEffectiveMaxIters.get(s.name) ?? null}
+                    selected={selected}
+                    onToggle={() => setSelectedStage(selected ? null : s.name)}
+                  />
+                  {selected && (
+                    <StagePanel
+                      slug={slug}
+                      missionSlug={missionSlug}
+                      stage={s}
+                      depth={stageDepths.get(s.name) ?? 0}
+                      isActive={isCurrent && activeJobId != null}
+                      onViewRewards={() => viewStageRewards(s.name)}
+                    />
+                  )}
+                </div>
+              );
+            })}
           </div>
         </section>
       )}
@@ -286,6 +369,189 @@ export function MissionLifecycleBadge({
 
 function StageStatusBadge({ status }: { status: StageStatus }) {
   return <Badge status={status} />;
+}
+
+// §mission-persistence increment 2: per-stage objective-metric
+// visibility — the whole point of this increment is that a rejected
+// stage metric (silently falling back to blind/mission-level) is no
+// longer invisible in the UI.
+function StageMetricChip({
+  status,
+  steeringMetric,
+}: {
+  status: StageSchema["metric_status"];
+  steeringMetric: StageSchema["steering_metric"];
+}) {
+  if (status === "accepted") {
+    return (
+      <span className="rs-badge emerald" style={{ fontSize: 9.5 }} title={steeringMetric ?? undefined}>
+        <Icon name="check" size={10} />metric ✓
+      </span>
+    );
+  }
+  if (status === "inherited") {
+    const label = steeringMetric ? `metric: ${steeringMetric}` : "metric: inherited";
+    const title = steeringMetric
+      ? `Uses the configured steering metric ${steeringMetric}`
+      : "Falls back to the mission-level fitness metric";
+    return (
+      <span className="rs-badge slate" style={{ fontSize: 9.5 }} title={title}>
+        {label}
+      </span>
+    );
+  }
+  if (status === "rejected") {
+    return (
+      <span className="rs-badge amber" style={{ fontSize: 9.5 }} title="Generated metric failed the trust gate — this stage falls back to the mission-level metric (or runs blind)">
+        <Icon name="alert-triangle" size={10} />metric rejected — blind fallback
+      </span>
+    );
+  }
+  return (
+    <span className="rs-badge slate" style={{ fontSize: 9.5 }}>
+      no metric
+    </span>
+  );
+}
+
+// §D28 F-SYNTH: no matching reference clip existed for this stage's
+// goal, so the accepted metric was certified against a last-resort
+// SYNTHESIZED exemplar (sculptor.refs.synth) instead of a real one.
+// Observe-grade only — never steer-grade until task-derived
+// calibration upgrades it (see docs/internal/REFERENCE_BUILD_LOG.md D28).
+function SyntheticExemplarChip({ kind }: { kind: StageSchema["exemplar_kind"] }) {
+  if (kind !== "synthetic") return null;
+  return (
+    <span
+      className="rs-badge violet"
+      style={{ fontSize: 9.5, cursor: "help" }}
+      title="No matching reference clip — the metric was certified against a synthesized exemplar grounded on analogous clip data. Observe-grade until task-derived calibration; attach a matching clip and Regenerate for reference-anchored certification."
+    >
+      <Icon name="sparkles" size={10} />synthetic exemplar
+    </span>
+  );
+}
+
+// §R1 (reference library): row after StageMetricChip showing the
+// attached reference clip (text + tier), or a ghost "Pick reference"
+// button that opens ReferencePickerDialog. Kept modest — this is the v1
+// approval surface, not a full library page (spec decision 12).
+function ReferenceRow({
+  slug,
+  missionSlug,
+  stage,
+}: {
+  slug: string;
+  missionSlug: string;
+  stage: StageSchema;
+}) {
+  const [pickerOpen, setPickerOpen] = useState(false);
+  const detach = useDetachStageReference(slug);
+
+  const doDetach = () => {
+    detach.mutate(
+      { missionSlug, stageName: stage.name },
+      {
+        onSuccess: () => toast.success("Reference detached", { description: stage.name }),
+        onError: (err) => {
+          if (err instanceof ApiError && err.status === 409) {
+            toast.error("Mission is busy", {
+              description: "Wait for the running job to finish before detaching a reference.",
+            });
+            return;
+          }
+          const detail = err instanceof ApiError ? (err.problem.detail ?? err.problem.title) : err.message;
+          toast.error("Could not detach reference", { description: String(detail) });
+        },
+      },
+    );
+  };
+
+  return (
+    <div style={{ marginTop: 6, display: "flex", alignItems: "center", flexWrap: "wrap", gap: 8 }}>
+      {stage.start_pose && (
+        <span
+          className="rs-badge slate"
+          style={{ fontSize: 9.5 }}
+          title="Physical configuration the robot is in at this stage's episode start"
+        >
+          <Icon name="user" size={10} />
+          start: {stage.start_pose}
+        </span>
+      )}
+      {stage.reference_clip_id ? (
+        <>
+          <span
+            className="rs-badge slate"
+            style={{ fontSize: 9.5 }}
+            title={
+              stage.reference_match_confidence != null
+                ? `auto-matched ${stage.reference_match_confidence.toFixed(2)}`
+                : undefined
+            }
+          >
+            <Icon name="video" size={10} />
+            {stage.reference_clip_id}
+            {stage.reference_span_start_s != null && stage.reference_span_end_s != null && (
+              <span style={{ opacity: 0.7 }}>
+                &nbsp;· {stage.reference_span_start_s.toFixed(1)}-{stage.reference_span_end_s.toFixed(1)}s
+              </span>
+            )}
+            {stage.reference_tier && <span style={{ opacity: 0.7 }}>&nbsp;· tier {stage.reference_tier}</span>}
+          </span>
+          {stage.reference_span_method?.startsWith("declined:") && (
+            // A declined sub-span selection fails CLOSED: the stage refuses
+            // full-clip certification (D23 class) and runs on the mission
+            // fallback. Without this badge the only trace was the regen
+            // job's result payload — a click that "did nothing".
+            <span
+              className="rs-badge amber"
+              style={{ fontSize: 9.5, cursor: "help" }}
+              title={`Reference sub-span selection declined — the stage refuses full-clip certification and uses the mission-level fallback metric.\n\n${stage.reference_span_method.slice("declined:".length)}\n\nFix the cause (usually the attached clip), then Regenerate metric.`}
+            >
+              <Icon name="alert-triangle" size={10} />
+              span declined
+            </span>
+          )}
+          <Btn
+            kind="ghost" size="xs" icon="pencil"
+            onClick={(e) => { e.stopPropagation(); setPickerOpen(true); }}
+          >
+            Change
+          </Btn>
+          <Btn
+            kind="ghost" size="xs" icon={detach.isPending ? "loader" : "x"}
+            disabled={detach.isPending}
+            onClick={(e) => { e.stopPropagation(); doDetach(); }}
+          >
+            {detach.isPending ? "Detaching…" : "Detach"}
+          </Btn>
+        </>
+      ) : (
+        <>
+          <span className="rs-sub" style={{ fontSize: 10.5 }}>
+            no reference matched —
+          </span>
+          <Btn
+            kind="ghost" size="xs" icon="video"
+            onClick={(e) => { e.stopPropagation(); setPickerOpen(true); }}
+          >
+            pick one
+          </Btn>
+        </>
+      )}
+      {pickerOpen && (
+        <ReferencePickerDialog
+          slug={slug}
+          missionSlug={missionSlug}
+          stageName={stage.name}
+          currentClipId={stage.reference_clip_id}
+          initialQuery={stage.goal_text}
+          onClose={() => setPickerOpen(false)}
+        />
+      )}
+    </div>
+  );
 }
 
 // ── stage tree depth (DFS, cycle-safe) ───────────────────────────────
@@ -427,13 +693,25 @@ function deriveStageEffectiveMaxIters(
 }
 
 function StageCard({
+  slug,
+  missionSlug,
   stage,
+  fallbackNumber,
   depth,
   isCurrent,
   iters,
   effectiveMaxIters,
+  selected,
+  onToggle,
 }: {
+  /** §mission-persistence increment 2: needed for the per-stage
+   *  "Regenerate metric" mutation. */
+  slug: string;
+  missionSlug: string;
   stage: StageSchema;
+  /** 1-based array position, used only while `stage.display_label` is
+   *  absent (older missions predating the field). */
+  fallbackNumber: number;
   depth: number;
   isCurrent: boolean;
   iters: IterRow[];
@@ -443,7 +721,41 @@ function StageCard({
    *  user is mid-launch). The persisted field is the source of truth
    *  once a run has started. */
   effectiveMaxIters: number | null;
+  /** §Ship 20 (de-siloing): whether this stage's disk panel is open. */
+  selected: boolean;
+  onToggle: () => void;
 }) {
+  const qc = useQueryClient();
+  const regen = useRegenerateStageMetric(slug);
+  const [regenJobId, setRegenJobId] = useState<string | null>(null);
+  useJob(regenJobId ?? undefined, {
+    enabled: regenJobId != null,
+    onTerminal: (job) => {
+      setRegenJobId(null);
+      qc.invalidateQueries({ queryKey: qk.mission(slug, missionSlug) });
+      if (job.status === "completed") {
+        toast.success("Metric regeneration finished", { description: `stage ${stage.name}` });
+      } else if (job.status === "errored") {
+        toast.error("Metric regeneration failed", { description: `stage ${stage.name}` });
+      }
+    },
+  });
+  const regenerateMetric = () => {
+    regen.mutate(
+      { missionSlug, stageName: stage.name },
+      {
+        onSuccess: (job) => {
+          setRegenJobId(job.job_id);
+          toast.success("Metric regeneration started", { description: `stage ${stage.name}` });
+        },
+        onError: (err) => {
+          const detail = err instanceof ApiError ? err.problem.detail ?? err.problem.title : err.message;
+          toast.error("Could not regenerate metric", { description: detail });
+        },
+      },
+    );
+  };
+  const regenBusy = regen.isPending || regenJobId != null;
   const orphan = stage.parent_stage !== null && depth === 0;
   // §Ship 20a fallback chain:
   //   1. stage.effective_max_iterations (PERSISTED — source of truth
@@ -463,18 +775,41 @@ function StageCard({
   const itersTooltip = overrideActive
     ? `Claude allocated ${stage.max_iterations} rounds; this run capped at ${effective}.`
     : undefined;
+  // §UX honesty pass: a stage reset to "pending" for redecomposition/
+  // re-run still carries its PRIOR attempt's rounds/best_metric until
+  // the next run overwrites them — without a marker it reads as "half
+  // trained then abandoned" instead of "about to run again".
+  const isStaleAttempt = stage.status === "pending" && stage.iterations_used > 0;
   return (
     <div
       style={{
         marginLeft: depth * 16,
-        border: "1px solid " + (isCurrent ? "var(--rs-primary)" : "var(--hairline)"),
+        border: "1px solid " + (isCurrent || selected ? "var(--rs-primary)" : "var(--hairline)"),
         background: isCurrent ? "rgba(245,78,0,0.04)" : "var(--surface-strong)",
-        borderRadius: "var(--radius-md)",
+        borderRadius: selected ? "var(--radius-md) var(--radius-md) 0 0" : "var(--radius-md)",
         padding: "10px 12px",
         fontSize: 12,
       }}
     >
-      <div style={{ display: "flex", flexWrap: "wrap", alignItems: "center", gap: 8 }}>
+      <button
+        type="button"
+        onClick={onToggle}
+        aria-expanded={selected}
+        title={selected ? "Hide this stage's iterations" : "Show this stage's iterations, rollouts and RSI"}
+        style={{
+          display: "flex", flexWrap: "wrap", alignItems: "center", gap: 8, width: "100%",
+          background: "none", border: 0, padding: 0, margin: 0, cursor: "pointer",
+          textAlign: "left", font: "inherit", color: "inherit",
+        }}
+      >
+        <Icon name={selected ? "chevron-down" : "chevron-right"} size={14} color="var(--rs-muted)" />
+        <span
+          className="mono rs-sub"
+          style={{ fontSize: 10.5, fontWeight: 600 }}
+          title={stage.on_disk_only ? "recovered from disk (not in mission.json)" : undefined}
+        >
+          {stageLabel(stage, fallbackNumber)}
+        </span>
         <StageStatusBadge status={stage.status} />
         <span className="mono" style={{ fontSize: 11.5, fontWeight: 600 }}>{stage.name}</span>
         {stage.parent_stage && (
@@ -486,11 +821,46 @@ function StageCard({
         {stage.redecomposition_attempts > 0 && (
           <span className="rs-badge slate" style={{ fontSize: 9.5 }}>replanned ×{stage.redecomposition_attempts}</span>
         )}
-      </div>
+        {stage.on_disk_only && (
+          <span className="rs-badge slate" style={{ fontSize: 9.5 }} title="Reconstructed from an on-disk stages/ directory (not in mission.json)">
+            <Icon name="history" size={10} />recovered from disk
+          </span>
+        )}
+        <StageMetricChip status={stage.metric_status} steeringMetric={stage.steering_metric} />
+        <SyntheticExemplarChip kind={stage.exemplar_kind} />
+      </button>
+      <ReferenceRow slug={slug} missionSlug={missionSlug} stage={stage} />
+      {stage.status === "superseded" && (
+        <p className="rs-sub" style={{ margin: "6px 0 0", fontSize: 11 }}>{supersededText(stage)}</p>
+      )}
+      {stage.status === "failed" && stage.failure_reason && (
+        <p className="rs-sub" style={{ margin: "6px 0 0", fontSize: 11 }}>
+          {failureReasonText(stage.failure_reason, stage.iterations_used)}
+        </p>
+      )}
+      {/* §mission-persistence increment 2: only offer regeneration for
+          stages that will actually run again (pending) and currently
+          lack a usable metric (rejected/none). A stage mid-training or
+          already succeeded/failed is exempt — the backend's own
+          regenerate route also 409s on a training stage. */}
+      {stage.status === "pending" &&
+        (stage.metric_status === "rejected" || stage.metric_status === "none" || stage.metric_status == null) && (
+          <div style={{ marginTop: 6 }}>
+            <Btn
+              kind="ghost" size="xs" icon={regenBusy ? "loader" : "sparkles"}
+              disabled={regenBusy}
+              onClick={(e) => { e.stopPropagation(); regenerateMetric(); }}
+            >
+              {regenBusy ? "Regenerating…" : "Regenerate metric"}
+            </Btn>
+          </div>
+        )}
       <p style={{ margin: "6px 0 0", fontSize: 11.5, lineHeight: 1.5 }}>{stage.goal_text}</p>
-      <p className="mono" style={{ margin: "6px 0 0", wordBreak: "break-all", borderRadius: "var(--radius-sm)", background: "var(--canvas-soft)", border: "1px solid var(--hairline)", padding: "5px 8px", fontSize: 10.5, color: "var(--rs-muted)" }}>
-        {stage.success_criterion}
-      </p>
+      {stage.success_criterion && (
+        <p className="mono" style={{ margin: "6px 0 0", wordBreak: "break-all", borderRadius: "var(--radius-sm)", background: "var(--canvas-soft)", border: "1px solid var(--hairline)", padding: "5px 8px", fontSize: 10.5, color: "var(--rs-muted)" }}>
+          {stage.success_criterion}
+        </p>
+      )}
       <div style={{ marginTop: 6, display: "flex", flexWrap: "wrap", columnGap: 12, rowGap: 2, fontSize: 10.5, color: "var(--rs-muted)" }}>
         <span
           title={itersTooltip}
@@ -506,11 +876,246 @@ function StageCard({
           {overrideActive && (
             <span aria-hidden="true" style={{ marginLeft: 2, color: "var(--st-amber)" }}>*</span>
           )}
+          {isStaleAttempt && <span style={{ fontStyle: "italic", opacity: 0.8 }}> (from a previous attempt)</span>}
         </span>
-        {stage.best_metric != null && <span>best metric {stage.best_metric.toFixed(3)}</span>}
+        {stage.best_metric != null && (
+          <span title="mean return under this stage's own reward — scales are not comparable across stages; see objective fitness for cross-stage comparison">
+            best reward {stage.best_metric.toFixed(3)}
+            {isStaleAttempt && <span style={{ fontStyle: "italic", opacity: 0.8 }}> (from a previous attempt)</span>}
+          </span>
+        )}
         {stage.kg_seed_papers.length > 0 && <span>kg refs {stage.kg_seed_papers.length}</span>}
       </div>
       {iters.length > 0 && <IterRibbon iters={iters} />}
+    </div>
+  );
+}
+
+// ── Stage panel (de-siloed disk view) ────────────────────────────────
+/** Expanded, disk-truth view of one stage: its iterations (independent
+ *  of live scope), a rollout player for the picked iter, an RSI chip
+ *  when reference-state-init was applied, and a deep-link to the stage's
+ *  reward versions. This is what de-silos completed stages. */
+function StagePanel({
+  slug, missionSlug, stage, depth, isActive, onViewRewards,
+}: {
+  slug: string;
+  missionSlug: string;
+  stage: StageSchema;
+  depth: number;
+  isActive: boolean;
+  onViewRewards: () => void;
+}) {
+  const iters = useStageIterations(slug, missionSlug, stage.name, {
+    refetchIntervalMs: isActive ? 4000 : null,
+  });
+  const envSpec = useStageEnvSpec(slug, missionSlug, stage.name);
+  const rows = iters.data ?? [];
+
+  // Which iteration's rollout to show. Prefer the kept iter, else the
+  // newest with a rollout, else the newest.
+  const [picked, setPicked] = useState<number | null>(null);
+  const defaultIter = useMemo(() => {
+    if (rows.length === 0) return null;
+    const kept =
+      stage.selected_iter_index != null
+        ? rows.find((r) => r.iter_index === stage.selected_iter_index)
+        : undefined;
+    if (kept?.has_rollout) return kept.iter_index;
+    const newestWithRollout = [...rows].reverse().find((r) => r.has_rollout);
+    if (newestWithRollout) return newestWithRollout.iter_index;
+    return rows[rows.length - 1].iter_index;
+  }, [rows, stage.selected_iter_index]);
+  const activeIter = picked ?? defaultIter;
+  const activeRow = rows.find((r) => r.iter_index === activeIter) ?? null;
+
+  const source = envSpec.data?.current?.meta?.source ?? null;
+  const rsiApplied = typeof source === "string" && source.startsWith("reference:");
+
+  return (
+    <div
+      style={{
+        marginLeft: depth * 16,
+        border: "1px solid var(--rs-primary)",
+        borderTop: "none",
+        borderRadius: "0 0 var(--radius-md) var(--radius-md)",
+        background: "var(--surface-card)",
+        padding: "10px 12px",
+        display: "flex",
+        flexDirection: "column",
+        gap: 10,
+      }}
+    >
+      <div className="rs-flex rs-wrap rs-gap-8" style={{ alignItems: "center" }}>
+        {rsiApplied && (
+          <span
+            className="rs-badge emerald"
+            style={{ fontSize: 9.5 }}
+            title={`Reference-state-init curriculum applied (${source})`}
+          >
+            <Icon name="sparkles" size={11} />RSI
+          </span>
+        )}
+        <Btn kind="ghost" size="xs" icon="file-code" onClick={onViewRewards}>
+          View rewards for this stage
+        </Btn>
+      </div>
+
+      {iters.isLoading && <p className="rs-sub" style={{ fontSize: 11, margin: 0 }}>Loading iterations…</p>}
+      {iters.error && (
+        <p style={{ fontSize: 11, margin: 0, color: "var(--st-rose)" }}>
+          {(iters.error as Error).message}
+        </p>
+      )}
+      {!iters.isLoading && !iters.error && rows.length === 0 && (
+        <p className="rs-sub" style={{ fontSize: 11, margin: 0 }}>
+          No iterations on disk yet for this stage.
+        </p>
+      )}
+
+      {rows.length > 0 && (
+        <>
+          {/* Rollout player for the picked iter. */}
+          {activeIter != null && activeRow?.has_rollout ? (
+            <div style={{ border: "1px solid var(--hairline)", borderRadius: "var(--radius-md)", overflow: "hidden" }}>
+              <div className="rs-log-bar" style={{ gap: 8 }}>
+                <Icon name="video" size={13} color="var(--rs-muted)" />
+                <span style={{ fontSize: 11.5, fontWeight: 600 }}>iter {activeIter} rollout</span>
+                <span className="rs-grow" />
+                <a
+                  href={stageRolloutUrl(slug, missionSlug, stage.name, activeIter)}
+                  download={`${stage.name}_iter_${activeIter}.mp4`}
+                  className="rs-btn rs-btn-quiet rs-btn-xs"
+                >
+                  <Icon name="download" size={13} />MP4
+                </a>
+              </div>
+              <video
+                key={activeIter}
+                src={stageRolloutUrl(slug, missionSlug, stage.name, activeIter)}
+                style={{ width: "100%", aspectRatio: "16/9", background: "#16150f", display: "block" }}
+                controls
+                playsInline
+                preload="metadata"
+              >
+                <track kind="captions" />
+              </video>
+            </div>
+          ) : activeIter != null ? (
+            <p className="rs-sub" style={{ fontSize: 11, margin: 0 }}>
+              iter {activeIter} has no rollout video.
+            </p>
+          ) : null}
+
+          {/* §UX honesty pass: export reachable whenever the picked
+              iteration has a checkpoint — independent of whether a
+              rollout exists (a checkpoint can land before/without one). */}
+          {activeIter != null && activeRow?.has_checkpoint && (
+            <div className="rs-flex rs-gap-8">
+              <a
+                href={stageExportUrl(slug, missionSlug, stage.name, activeIter)}
+                download
+                className="rs-btn rs-btn-quiet rs-btn-xs"
+                title="Download the deployment bundle: checkpoint + ONNX + TorchScript + reward/env spec + DEPLOY.md (builds server-side, may take a moment)"
+              >
+                <Icon name="package" size={13} />Export bundle
+              </a>
+              <a
+                href={stageCheckpointUrl(slug, missionSlug, stage.name, activeIter)}
+                download
+                className="rs-btn rs-btn-quiet rs-btn-xs"
+                title="Download the raw checkpoint file only"
+              >
+                <Icon name="download" size={13} />raw .pt
+              </a>
+            </div>
+          )}
+
+          {/* Iteration chips — click to switch the rollout; the kept one
+              carries a labelled badge. */}
+          <div role="list" aria-label="Stage iterations" className="rs-flex rs-wrap rs-gap-6">
+            {rows.map((r) => {
+              const isKept =
+                stage.selected_iter_index != null &&
+                r.iter_index === stage.selected_iter_index;
+              const isPicked = r.iter_index === activeIter;
+              return (
+                <button
+                  key={r.iter_index}
+                  role="listitem"
+                  type="button"
+                  onClick={() => setPicked(r.iter_index)}
+                  title={
+                    `iter ${r.iter_index}` +
+                    (r.reward_version ? ` · reward ${r.reward_version}` : "") +
+                    (r.has_rollout ? "" : " · no rollout") +
+                    (r.has_checkpoint ? " · checkpoint" : "")
+                  }
+                  className="mono"
+                  style={{
+                    display: "inline-flex", alignItems: "center", gap: 5,
+                    borderRadius: 5, padding: "3px 7px", fontSize: 10,
+                    cursor: "pointer",
+                    border: "1px solid " + (isPicked ? "var(--rs-primary)" : "var(--hairline)"),
+                    background: isPicked ? "rgba(245,78,0,0.08)" : "var(--canvas-soft)",
+                    color: "var(--ink)",
+                  }}
+                >
+                  <span style={{ fontWeight: 600 }}>iter {r.iter_index}</span>
+                  {(() => {
+                    const m = formatIterMetrics(r);
+                    if (!m.fitnessText && !m.rewardText) {
+                      return <span style={{ color: "var(--rs-muted)" }}>—</span>;
+                    }
+                    return (
+                      <>
+                        {m.fitnessText && (
+                          <span style={{ color: "var(--rs-muted)" }} title="objective fitness (0-1)">{m.fitnessText}</span>
+                        )}
+                        {m.rewardText && (
+                          <span style={{ color: "var(--rs-muted)", opacity: m.fitnessText ? 0.7 : 1 }} title={m.rewardTitle}>{m.rewardText}</span>
+                        )}
+                      </>
+                    );
+                  })()}
+                  {r.has_rollout && <Icon name="video" size={10} color="var(--rs-muted)" />}
+                  {isKept && (
+                    <span
+                      className="rs-badge emerald"
+                      style={{ fontSize: 8.5, padding: "0 4px" }}
+                      title={selectionSentence(stage.selection_source)}
+                    >
+                      <Icon name="check" size={9} />kept — {selectionLabel(stage.selection_source)}
+                    </span>
+                  )}
+                  {r.fitness_contradiction && (
+                    <span
+                      className="rs-badge rose"
+                      style={{ fontSize: 8.5, padding: "0 4px" }}
+                      title={formatContradictionTooltip(r.fitness_components)}
+                    >
+                      <Icon name="alert-triangle" size={9} />criterion✓ fitness 0
+                    </span>
+                  )}
+                  {(() => {
+                    const nat = naturalnessChipText(r.naturalness_flag, r.naturalness_hard_reject);
+                    if (!nat) return null;
+                    return (
+                      <span
+                        className={"rs-badge " + (r.naturalness_hard_reject ? "rose" : "amber")}
+                        style={{ fontSize: 8.5, padding: "0 4px" }}
+                        title={nat.title}
+                      >
+                        <Icon name="alert-triangle" size={9} />{nat.label}
+                      </span>
+                    );
+                  })()}
+                </button>
+              );
+            })}
+          </div>
+        </>
+      )}
     </div>
   );
 }
@@ -536,7 +1141,7 @@ function IterChip({ row }: { row: IterRow }) {
   let bg: string, fg: string, metricStr: string, pulse = false;
   if (row.completed) {
     bg = "var(--st-emerald-bg)"; fg = "var(--st-emerald-fg)";
-    metricStr = row.primary_metric != null ? row.primary_metric.toFixed(3) : "—";
+    metricStr = row.primary_metric != null ? `r ${row.primary_metric.toFixed(3)}` : "—";
   } else if (row.rollout_done) {
     bg = "rgba(245,78,0,0.10)"; fg = "var(--rs-primary)";
     metricStr = "rollout";
@@ -587,8 +1192,12 @@ function WsStatusChip({
 // Map an event type to one of the rs status colors (decorative).
 function eventCat(type: string): "rose" | "amber" | "emerald" | "blue" | "slate" {
   if (/errored|failed|halted/.test(type)) return "rose";
-  if (/skipped|degraded/.test(type)) return "amber";
-  if (/completed|succeeded|materialized|scaffolded|warm_start_resolved/.test(type)) return "emerald";
+  // §Ship 20: a rejected stage-metric is a soft fall-back to the mission
+  // metric, not an error — amber like skipped/degraded.
+  if (/skipped|degraded|rejected/.test(type)) return "amber";
+  // §Ship 20 (de-siloing): archive/save/final-selection are positive
+  // milestones — emerald alongside completed/accepted/rsi.
+  if (/completed|succeeded|materialized|scaffolded|warm_start_resolved|rsi_applied|accepted|archived|saved|final_selection/.test(type)) return "emerald";
   if (/started|redecompos|criterion|training/.test(type)) return "blue";
   return "slate";
 }
@@ -637,8 +1246,38 @@ function StructuredEventRow({ event }: { event: MissionEvent }) {
   );
 }
 
+function fmtMB(bytes: unknown): string {
+  if (typeof bytes === "number" && Number.isFinite(bytes)) {
+    return `${(bytes / 1_048_576).toFixed(1)} MB`;
+  }
+  return "?";
+}
+
 function describeEvent(ev: MissionEvent): string {
   const type = ev.type;
+  // §Ship 20 (de-siloing): stage/mission persistence lifecycle.
+  if (type === "stage_final_selection") {
+    const iter = (ev as { iter?: number }).iter;
+    const src = (ev as { source?: string }).source;
+    const pass = (ev as { criterion_pass?: boolean }).criterion_pass;
+    const metric = (ev as { metric?: number | null }).metric;
+    return (
+      `Kept iter ${iter ?? "?"}` +
+      (src ? ` (${src})` : "") +
+      ` as the stage policy` +
+      (typeof pass === "boolean" ? ` — criterion ${pass ? "passed" : "unmet"}` : "") +
+      (metric != null ? `, metric ${fmtMetric(metric)}` : "")
+    );
+  }
+  if (type === "mission_stage_archived" || type === "mission_archived") {
+    return `Saved to archive (${fmtMB((ev as { total_bytes?: number }).total_bytes)})`;
+  }
+  if (type === "mission_archive_failed") {
+    return `Archive failed: ${(ev as { error?: string }).error ?? ""}`;
+  }
+  if (type === "mission_saved") {
+    return "Mission saved";
+  }
   if (type === "stage_criterion_evaluated") {
     const passed = (ev as { passed?: boolean }).passed;
     const metric = (ev as { metric?: number | null }).metric;
@@ -675,6 +1314,54 @@ function describeEvent(ev: MissionEvent): string {
   }
   if (type === "mission_decompose_errored" || type === "mission_execute_errored") {
     return (ev as { error?: string }).error ?? "";
+  }
+  // §Ship 20: DeepMimic reference-state-init curriculum for airborne
+  // stages. stage_name rides the row chip; describe the clip + spec here.
+  if (type === "stage_reference_rsi_applied") {
+    const clip = (ev as { clip?: string }).clip;
+    return `reference curriculum applied${clip ? ` (clip: ${clip})` : ""}`;
+  }
+  if (type === "stage_reference_rsi_failed") {
+    const err = (ev as { error?: string }).error ?? "";
+    return `reference curriculum failed${err ? `: ${err}` : ""}`;
+  }
+  // §Ship 20: per-stage trust-gated steering metrics. The bookends carry
+  // no stage; the per-stage gen events carry `stage` (not stage_name) so
+  // name it inline.
+  if (type === "mission_stage_metrics_started") {
+    const n = (ev as { n_stages?: number }).n_stages;
+    return `generating a trust-gated metric per stage${
+      typeof n === "number" ? ` (${n} stages)` : ""
+    }…`;
+  }
+  if (type === "mission_stage_metrics_completed") {
+    const gen = (ev as { generated?: unknown[] }).generated;
+    const rej = (ev as { rejected?: unknown[] }).rejected;
+    const nGen = Array.isArray(gen) ? gen.length : 0;
+    const nRej = Array.isArray(rej) ? rej.length : 0;
+    return `per-stage metrics: ${nGen} generated, ${nRej} fell back to mission metric`;
+  }
+  if (type === "stage_metric_gen_started") {
+    const st = (ev as { stage?: string }).stage;
+    return `stage ${st ?? "?"}: generating metric…`;
+  }
+  if (type === "stage_metric_gen_accepted") {
+    const st = (ev as { stage?: string }).stage;
+    return `stage ${st ?? "?"}: metric generated ✓`;
+  }
+  if (type === "stage_metric_gen_rejected") {
+    const st = (ev as { stage?: string }).stage;
+    const reason = (ev as { reason?: string }).reason ?? "";
+    return `stage ${st ?? "?"}: metric rejected — falls back to mission metric${
+      reason ? ` (${reason})` : ""
+    }`;
+  }
+  if (type === "stage_metric_gen_failed") {
+    const st = (ev as { stage?: string }).stage;
+    const reason = (ev as { reason?: string }).reason ?? "";
+    return `stage ${st ?? "?"}: metric generation failed${
+      reason ? `: ${reason}` : ""
+    }`;
   }
   return "";
 }

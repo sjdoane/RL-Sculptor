@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from unittest.mock import patch
+from types import SimpleNamespace
 
 import pytest
 
@@ -15,10 +16,507 @@ from sculptor.adapters.base import (
     ComponentProbe,
     RewardContract,
     RolloutResult,
-    SculptorAdapter,
     TrainResult,
 )
 
+
+def test_to_host_numpy_moves_tensor_metadata_to_cpu() -> None:
+    """CUDA-like simulator metadata is copied to host before NumPy sees it."""
+    import numpy as np
+
+    from sculptor.adapters._mjlab_runner import _to_host_numpy
+
+    calls: list[str] = []
+
+    class FakeCudaTensor:
+        def detach(self):
+            calls.append("detach")
+            return self
+
+        def cpu(self):
+            calls.append("cpu")
+            return self
+
+        def numpy(self):
+            calls.append("numpy")
+            return np.array([[1.0, 2.0], [3.0, 4.0]])
+
+    result = _to_host_numpy(FakeCudaTensor())
+
+    assert calls == ["detach", "cpu", "numpy"]
+    np.testing.assert_array_equal(result, [[1.0, 2.0], [3.0, 4.0]])
+
+
+def test_to_host_numpy_keeps_plain_metadata_supported() -> None:
+    import numpy as np
+
+    from sculptor.adapters._mjlab_runner import _to_host_numpy
+
+    np.testing.assert_array_equal(_to_host_numpy([[0.0, 1.0]]), [[0.0, 1.0]])
+
+
+def test_authored_waypoint_command_rewards_keep_nominal_weight() -> None:
+    """Only a successfully installed goal command earns full supervision."""
+    from sculptor.adapters._mjlab_runner import (
+        _full_weight_authored_command_rewards,
+    )
+
+    bundle = SimpleNamespace(
+        manifest=SimpleNamespace(task_shared={
+            "goal": {"type": "waypoint_sequence"},
+        }),
+        runtime_adjustments=(
+            "command:velocity→goal-conditioned waypoint traversal",
+        ),
+    )
+    assert _full_weight_authored_command_rewards(bundle) == frozenset({
+        "track_linear_velocity", "track_angular_velocity",
+    })
+
+    # A goal declaration without a compatible installed command surface must
+    # retain the conservative realism-floor behavior.
+    bundle.runtime_adjustments = ()
+    assert _full_weight_authored_command_rewards(bundle) == frozenset()
+
+    # Non-navigation authored tasks never inherit locomotion-specific terms.
+    bundle.manifest.task_shared["goal"]["type"] = "object_region"
+    bundle.runtime_adjustments = (
+        "command:velocity→goal-conditioned waypoint traversal",
+    )
+    assert _full_weight_authored_command_rewards(bundle) == frozenset()
+
+
+def test_authored_terminal_standing_requires_installed_dwell_command() -> None:
+    from sculptor.adapters._mjlab_runner import (
+        _authored_terminal_standing_enabled,
+    )
+
+    bundle = SimpleNamespace(
+        manifest=SimpleNamespace(task_shared={
+            "goal": {
+                "type": "waypoint_sequence",
+                "success": {"hold_s": 2.0},
+            },
+        }),
+        runtime_adjustments=(
+            "command:velocity→goal-conditioned waypoint traversal",
+        ),
+    )
+    assert _authored_terminal_standing_enabled(bundle)
+    bundle.manifest.task_shared["goal"]["success"]["hold_s"] = 0.0
+    assert not _authored_terminal_standing_enabled(bundle)
+    bundle.manifest.task_shared["goal"]["success"]["hold_s"] = 2.0
+    bundle.runtime_adjustments = ()
+    assert not _authored_terminal_standing_enabled(bundle)
+
+
+def test_authored_terminal_stillness_balances_command_supervision() -> None:
+    from sculptor.adapters._mjlab_runner import (
+        _authored_terminal_stillness_weight,
+    )
+
+    rewards = {
+        "track_linear_velocity": SimpleNamespace(weight=2.0),
+        "track_angular_velocity": SimpleNamespace(weight=2.0),
+        "unrelated_posture": SimpleNamespace(weight=20.0),
+    }
+    authored_terms = frozenset({
+        "track_linear_velocity",
+        "track_angular_velocity",
+    })
+
+    assert _authored_terminal_stillness_weight(
+        rewards, authored_terms) == 4.0
+    # Missing, malformed, and zero-weight command terms retain the safe floor.
+    assert _authored_terminal_stillness_weight(
+        {"track_linear_velocity": SimpleNamespace(weight="bad")},
+        authored_terms,
+    ) == 1.0
+
+
+def test_authored_forbidden_contact_supervision_uses_compiled_sensors() -> None:
+    torch = pytest.importorskip("torch")
+
+    from sculptor.adapters._mjlab_runner import (
+        _authored_forbidden_contact_penalty,
+        _authored_forbidden_contact_sensor_names,
+        _authored_forbidden_contact_weight,
+    )
+
+    bundle = SimpleNamespace(manifest=SimpleNamespace(task_shared={
+        "contacts": {
+            "forbidden": [
+                ["robot:any", "object:first"],
+                ["robot:any", "object:second"],
+            ],
+        },
+    }))
+    names = _authored_forbidden_contact_sensor_names(bundle)
+    assert names == (
+        "authored_contact__forbidden__0",
+        "authored_contact__forbidden__1",
+    )
+    assert _authored_forbidden_contact_weight(
+        {
+            "track_linear_velocity": SimpleNamespace(weight=2.0),
+            "track_angular_velocity": SimpleNamespace(weight=2.0),
+        },
+        frozenset({"track_linear_velocity", "track_angular_velocity"}),
+    ) == 8.0
+
+    scene = {
+        names[0]: SimpleNamespace(
+            data=SimpleNamespace(found=torch.tensor([
+                [False], [True], [False],
+            ])),
+        ),
+        names[1]: SimpleNamespace(
+            data=SimpleNamespace(found=torch.tensor([
+                [False], [False], [True],
+            ])),
+        ),
+    }
+    env = SimpleNamespace(num_envs=3, device="cpu", scene=scene)
+    penalty = _authored_forbidden_contact_penalty(
+        env, sensor_names=names)
+    assert penalty.tolist() == [0.0, 1.0, 1.0]
+
+
+def test_clearance_maneuver_reward_firewall_is_per_env_and_capability_gated(
+) -> None:
+    torch = pytest.importorskip("torch")
+
+    from sculptor.adapters._mjlab_runner import (
+        _apply_clearance_maneuver_reward_firewall,
+        _clearance_maneuver_primary_scale,
+    )
+
+    command = SimpleNamespace(
+        _clearance_shifts=torch.tensor([
+            [0.268, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+            [-0.268, 0.0, 0.0],
+        ]),
+        _waypoint_index=torch.tensor([0, 0, 1, 2, 3]),
+        _clearance_stage_complete=torch.tensor([
+            False, True, False, False, False,
+        ]),
+        _clearance_followthrough_pending=torch.tensor([
+            False, False, True, False, False,
+        ]),
+    )
+
+    class CommandManager:
+        active_terms = ("route", "ordinary")
+
+        @staticmethod
+        def get_term(name):
+            if name == "route":
+                return command
+            return SimpleNamespace()
+
+    env = SimpleNamespace(
+        num_envs=5,
+        device=torch.device("cpu"),
+        command_manager=CommandManager(),
+    )
+
+    scale = _clearance_maneuver_primary_scale(env)
+    # Both the outside approach and the through-disk traversal are command-only
+    # phases around the same immutable predicate. Predicate-centered generated
+    # shaping remains withheld until that predicate advances.
+    assert scale.tolist() == [0.0, 0.0, 0.0, 0.0, 1.0]
+
+    rewards = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0])
+    components = {
+        "dense": rewards.clone(),
+        "matrix": torch.stack((rewards, rewards + 10.0), dim=-1),
+        "scalar": torch.tensor(7.0),
+        "metadata": "unchanged",
+    }
+    scaled_rewards, scaled_components = (
+        _apply_clearance_maneuver_reward_firewall(
+            env, rewards, components))
+
+    assert scaled_rewards.tolist() == [0.0, 0.0, 0.0, 0.0, 5.0]
+    assert scaled_components["dense"].tolist() == [
+        0.0, 0.0, 0.0, 0.0, 5.0,
+    ]
+    assert scaled_components["matrix"].tolist() == [
+        [0.0, 0.0],
+        [0.0, 0.0],
+        [0.0, 0.0],
+        [0.0, 0.0],
+        [5.0, 15.0],
+    ]
+    assert scaled_components["scalar"].item() == 7.0
+    assert scaled_components["metadata"] == "unchanged"
+
+    # A command manager without the typed clearance capability is unchanged.
+    plain_env = SimpleNamespace(
+        num_envs=2,
+        device=torch.device("cpu"),
+        command_manager=SimpleNamespace(
+            active_terms=(),
+        ),
+    )
+    assert _clearance_maneuver_primary_scale(
+        plain_env).tolist() == [1.0, 1.0]
+
+
+def test_authored_terminal_stillness_is_dense_and_phase_gated() -> None:
+    torch = pytest.importorskip("torch")
+
+    from sculptor.adapters._mjlab_runner import (
+        _authored_terminal_stillness_reward,
+    )
+
+    command = SimpleNamespace(
+        is_standing_env=torch.tensor([True, True, False]))
+
+    class CommandManager:
+        active_terms = ("route",)
+
+        @staticmethod
+        def get_term(name):
+            assert name == "route"
+            return command
+
+    data = SimpleNamespace(
+        root_link_lin_vel_b=torch.tensor([
+            [0.0, 0.0, 0.0],
+            [0.12, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+        ]),
+        root_link_ang_vel_b=torch.tensor([
+            [0.0, 0.0, 0.0],
+            [0.5, 0.0, 0.0],
+            [0.0, 0.0, 0.0],
+        ]),
+        joint_vel=torch.tensor([
+            [0.0, 0.0],
+            [1.0, 1.0],
+            [0.0, 0.0],
+        ]),
+    )
+    env = SimpleNamespace(
+        num_envs=3,
+        device=torch.device("cpu"),
+        command_manager=CommandManager(),
+        scene={"robot": SimpleNamespace(data=data)},
+    )
+
+    reward = _authored_terminal_stillness_reward(
+        env, lin_std=0.12, ang_std=0.5, joint_std=1.0)
+
+    torch.testing.assert_close(reward[0], torch.tensor(1.0))
+    assert 0.3 < reward[1].item() < 0.5
+    assert reward[2].item() == 0.0
+
+
+def test_terminal_stillness_rejects_motionless_collapse() -> None:
+    torch = pytest.importorskip("torch")
+
+    from sculptor.adapters._mjlab_runner import (
+        _authored_terminal_stillness_state,
+    )
+
+    command = SimpleNamespace(
+        is_standing_env=torch.tensor([True, True, True]))
+
+    class CommandManager:
+        active_terms = ("route",)
+
+        @staticmethod
+        def get_term(name):
+            assert name == "route"
+            return command
+
+    default = torch.zeros(3, 4)
+    data = SimpleNamespace(
+        root_link_lin_vel_b=torch.zeros(3, 3),
+        root_link_ang_vel_b=torch.zeros(3, 3),
+        joint_vel=torch.zeros(3, 4),
+        joint_pos=default.clone(),
+        default_joint_pos=default,
+        projected_gravity_b=torch.tensor([
+            [0.0, 0.0, -1.0],   # honest neutral hold
+            [0.0, 0.0, -0.5],   # motionless but tipped/crouched
+            [0.0, 0.0, -1.0],   # upright base, collapsed articulation
+        ]),
+    )
+    data.joint_pos[2] = 1.0
+    env = SimpleNamespace(
+        num_envs=3,
+        device=torch.device("cpu"),
+        command_manager=CommandManager(),
+        scene={"robot": SimpleNamespace(data=data)},
+    )
+
+    standing, score, _speed, quiet = _authored_terminal_stillness_state(
+        env, lin_std=0.12, ang_std=0.5, joint_std=1.0)
+
+    assert standing.tolist() == [True, True, True]
+    assert quiet.tolist() == [True, False, False]
+    torch.testing.assert_close(score[0], torch.tensor(1.0))
+    # Posture is a strict smooth conjunction, not a small additive bonus or a
+    # geometric mean that dilutes one bad factor: a perfectly motionless but
+    # tipped or folded body must retain less than one fifth of terminal income.
+    assert score[1].item() < 0.2
+    assert score[2].item() < 0.2
+
+
+def test_motion_quality_info_is_reset_safe_and_embodiment_agnostic() -> None:
+    torch = pytest.importorskip("torch")
+
+    from sculptor.adapters._mjlab_runner import _motion_quality_info
+
+    action = torch.tensor([
+        [1.0, -1.0],
+        [2.0, 0.0],
+    ])
+    previous = torch.zeros_like(action)
+    joint_vel = torch.tensor([
+        [3.0, 4.0, 0.0],
+        [0.0, 6.0, 8.0],
+    ])
+    episode_length = torch.tensor([1.0, 2.0])
+
+    info, next_anchor = _motion_quality_info(
+        action, previous, episode_length, joint_vel)
+
+    assert info["action_rate"][0].item() == 0.0
+    assert info["joint_vel_rms"][0].item() == 0.0
+    torch.testing.assert_close(
+        info["action_rate"][1], torch.sqrt(torch.tensor(2.0)))
+    torch.testing.assert_close(
+        info["joint_vel_rms"][1], torch.sqrt(torch.tensor(100.0 / 3.0)))
+    torch.testing.assert_close(next_anchor, action)
+    assert next_anchor.data_ptr() != action.data_ptr()
+
+
+def test_authored_terminal_stillness_rewards_continuity_and_resets() -> None:
+    torch = pytest.importorskip("torch")
+
+    from sculptor.adapters._mjlab_runner import (
+        _build_authored_terminal_stillness_term_class,
+    )
+
+    command = SimpleNamespace(
+        is_standing_env=torch.tensor([True, True, False]))
+
+    class CommandManager:
+        active_terms = ("route",)
+
+        @staticmethod
+        def get_term(name):
+            assert name == "route"
+            return command
+
+    data = SimpleNamespace(
+        root_link_lin_vel_b=torch.zeros(3, 3),
+        root_link_ang_vel_b=torch.zeros(3, 3),
+        joint_vel=torch.zeros(3, 2),
+    )
+    env = SimpleNamespace(
+        num_envs=3,
+        device=torch.device("cpu"),
+        step_dt=0.02,
+        command_manager=CommandManager(),
+        scene={"robot": SimpleNamespace(data=data)},
+    )
+    term_type = _build_authored_terminal_stillness_term_class()
+    # Match ManagerBase's real class-backed term construction contract.
+    term = term_type(cfg=SimpleNamespace(), env=env)
+    params = {
+        "lin_std": 0.12,
+        "ang_std": 0.5,
+        "joint_std": 1.0,
+        "hold_s": 0.1,
+        "continuity_scale": 2.0,
+    }
+
+    first = term(env, **params)
+    second = term(env, **params)
+    assert second[0].item() > first[0].item() > 1.0
+    assert second[1].item() > first[1].item() > 1.0
+    assert first[2].item() == 0.0
+
+    # Reward-manager selective reset clears only the requested environment.
+    term.reset(torch.tensor([0]))
+    after_reset = term(env, **params)
+    torch.testing.assert_close(after_reset[0], first[0])
+    assert after_reset[1].item() > second[1].item()
+    assert after_reset[2].item() == 0.0
+
+    # A corrective step breaks the uninterrupted dwell and loses accumulated
+    # progress instead of retaining credit for a high quiet-sample fraction.
+    # The potential loss is a per-second rate because RewardManager scales the
+    # returned value by dt; keep it strong enough to survive that integration.
+    data.root_link_lin_vel_b[0, 0] = 0.2
+    interrupted = term(env, **params)
+    assert interrupted[0].item() < -10.0
+    assert interrupted[1].item() > second[1].item()
+
+    # In-place stepping and rotation must also break the uninterrupted hold,
+    # even when horizontal base translation remains below the task threshold.
+    data.root_link_lin_vel_b[0, 0] = 0.0
+    data.joint_vel[1, 0] = 2.0
+    joint_interrupted = term(env, **params)
+    assert joint_interrupted[1].item() < -10.0
+
+    data.joint_vel[1, 0] = 0.0
+    term(env, **params)
+    data.root_link_ang_vel_b[1, 2] = 1.0
+    angular_interrupted = term(env, **params)
+    assert angular_interrupted[1].item() < -10.0
+
+
+def test_rollout_evidence_excludes_metric_only_channels() -> None:
+    """Diagnosis receives batch progress, never frozen completion truth."""
+    import numpy as np
+
+    from sculptor.adapters._mjlab_runner import (
+        _reward_visible_rollout_evidence,
+    )
+
+    catalog = SimpleNamespace(channels=(
+        SimpleNamespace(
+            name="goal__route__distance", access="shared_shaping",
+            metric_role="progress", producer="waypoint_distance"),
+        SimpleNamespace(
+            name="goal__route__success", access="metric_only",
+            metric_role="completion", producer="success_hold"),
+        SimpleNamespace(
+            name="object__box__lin_vel_w", access="shared_shaping",
+            metric_role="state", producer="entity_state"),
+        SimpleNamespace(
+            name="object__box__pos_w", access="shared_shaping",
+            metric_role="state", producer="entity_state"),
+    ))
+    trajectory = {
+        "goal__route__distance": np.asarray([
+            [3.0, 4.0], [1.0, 2.0], [0.0, 99.0]], dtype=np.float32),
+        "goal__route__success": np.ones((3, 2), dtype=bool),
+        "object__box__lin_vel_w": np.asarray([
+            [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0]],
+            [[0.2, 0.0, 0.0], [0.0, 0.0, 0.0]],
+            [[9.0, 0.0, 0.0], [9.0, 0.0, 0.0]],
+        ], dtype=np.float32),
+        "object__box__pos_w": np.zeros((3, 2, 3), dtype=np.float32),
+    }
+    # The last row is an auto-reset and must not contaminate the summary.
+    valid = np.asarray([[True, True], [True, True], [False, False]])
+    evidence = _reward_visible_rollout_evidence(
+        trajectory, catalog, valid)
+
+    channels = evidence["channels"]
+    assert set(channels) == {
+        "goal__route__distance", "object__box__lin_vel_w"}
+    assert channels["goal__route__distance"]["final_median"] == 1.5
+    assert channels["goal__route__distance"]["final_zero_fraction"] == 0.0
+    assert channels["object__box__lin_vel_w"]["max_over_time_median"] == 0.1
+    assert "goal__route__success" not in channels
 
 def test_base_reward_contract_default_fields() -> None:
     c = RewardContract(observation_space_spec=None, action_space_spec=None)
@@ -26,6 +524,91 @@ def test_base_reward_contract_default_fields() -> None:
     assert c.training_device == "any"
     assert c.min_gpu_memory_gb is None
     assert c.state_schema is None
+
+
+def test_scalar_policy_std_guard_clamps_initial_and_optimizer_values() -> None:
+    """Legacy rsl_rl scalar exploration must never cross below zero."""
+    from types import SimpleNamespace
+
+    torch = pytest.importorskip("torch")
+    from sculptor.adapters._mjlab_runner import _install_scalar_std_guard
+
+    std_param = torch.nn.Parameter(torch.tensor([-0.25, 0.5]))
+    optimizer = torch.optim.SGD([std_param], lr=1.0)
+    runner = SimpleNamespace(
+        alg=SimpleNamespace(
+            actor=SimpleNamespace(
+                distribution=SimpleNamespace(std_param=std_param),
+            ),
+            optimizer=optimizer,
+        ),
+    )
+
+    handle = _install_scalar_std_guard(runner, minimum=0.01)
+    assert handle is not None
+    assert torch.all(std_param >= 0.01)
+
+    # A finite optimizer update would drive both values negative without the
+    # post-step hook; the guard repairs them before the next action sample.
+    std_param.grad = torch.ones_like(std_param)
+    optimizer.step()
+    assert torch.all(std_param >= 0.01)
+    handle.remove()
+
+
+def test_scalar_policy_std_guard_ignores_other_distributions() -> None:
+    """Log-std and non-Gaussian policies remain byte-for-byte untouched."""
+    from types import SimpleNamespace
+
+    from sculptor.adapters._mjlab_runner import _install_scalar_std_guard
+
+    runner = SimpleNamespace(
+        alg=SimpleNamespace(
+            actor=SimpleNamespace(distribution=SimpleNamespace()),
+            optimizer=SimpleNamespace(),
+        ),
+    )
+    assert _install_scalar_std_guard(runner) is None
+
+
+def test_sculpted_reward_installs_non_timeout_termination_economics() -> None:
+    """A custom reward cannot improve return merely by ending sooner."""
+    from types import SimpleNamespace
+
+    from sculptor.adapters._mjlab_runner import (
+        _SCULPTOR_FAILURE_WEIGHT,
+        _SCULPTOR_SURVIVAL_WEIGHT,
+        _install_sculptor_termination_economics,
+    )
+
+    class FakeRewardTermCfg:
+        def __init__(self, *, func, weight):
+            self.func = func
+            self.weight = weight
+
+    def is_alive(_env):
+        return "alive"
+
+    def is_terminated(_env):
+        return "terminated"
+
+    native = object()
+    rewards = {"native_task_term": native}
+    mdp = SimpleNamespace(is_alive=is_alive, is_terminated=is_terminated)
+
+    _install_sculptor_termination_economics(
+        rewards,
+        FakeRewardTermCfg,
+        mdp,
+    )
+
+    assert rewards["native_task_term"] is native
+    assert rewards["sculptor_survival"].func is is_alive
+    assert rewards["sculptor_survival"].weight == _SCULPTOR_SURVIVAL_WEIGHT
+    assert rewards["sculptor_survival"].weight > 0
+    assert rewards["sculptor_failure"].func is is_terminated
+    assert rewards["sculptor_failure"].weight == _SCULPTOR_FAILURE_WEIGHT
+    assert rewards["sculptor_failure"].weight < -_SCULPTOR_SURVIVAL_WEIGHT
 
 
 def test_component_probe_dataclass_shape() -> None:
@@ -66,6 +649,7 @@ def test_mjlab_adapter_reward_contract_is_batched() -> None:
     assert c.training_device == "gpu"
     assert c.min_gpu_memory_gb is not None and c.min_gpu_memory_gb > 0
     assert c.state_schema is not None
+    assert c.info_schema is not None
     # Keys the sculptor reward-term snapshot emits for velocity tasks.
     expected_keys = {
         "qpos", "qvel", "base_lin_vel_b", "base_ang_vel_b",
@@ -86,6 +670,52 @@ def test_mjlab_g1_state_schema_differs_from_go1() -> None:
     g1 = MjlabAdapter(task_id="Mjlab-Velocity-Flat-Unitree-G1")
     go1 = MjlabAdapter(task_id="Mjlab-Velocity-Flat-Unitree-Go1")
     assert g1.reward_contract().state_schema != go1.reward_contract().state_schema
+
+
+def test_enforce_actuator_limits_swaps_to_dcmotor_with_real_velocity_limits(monkeypatch) -> None:
+    """§actuator-limit enforcement: RS_ENFORCE_ACTUATOR_LIMITS=1 swaps every
+    BuiltinPositionActuatorCfg → DcMotorActuatorCfg carrying the robot's REAL motor
+    no-load speed (G1 knee 20, Go1 calf 20.06), so the sim enforces velocity, not
+    just torque. Flag OFF is a no-op (existing runs bit-identical); an unknown
+    joint pattern is left unchanged (never invents a limit). Config-only — no GPU."""
+    pytest.importorskip("mjlab")
+    from mjlab.actuator import BuiltinPositionActuatorCfg, DcMotorActuatorCfg
+    from mjlab.tasks.registry import load_env_cfg
+
+    from sculptor.adapters._mjlab_runner import (
+        _enforce_actuator_limits,
+        _recover_velocity_limit,
+    )
+
+    def _acts(cfg):
+        return list(cfg.scene.entities["robot"].articulation.actuators)
+
+    # flag explicitly OFF → byte-identical no-op (default is now ON, so set "0")
+    monkeypatch.setenv("RS_ENFORCE_ACTUATOR_LIMITS", "0")
+    g1_off = load_env_cfg("Mjlab-Velocity-Flat-Unitree-G1")
+    _enforce_actuator_limits(g1_off)
+    assert all(isinstance(a, BuiltinPositionActuatorCfg) for a in _acts(g1_off))
+
+    # default (unset) is ON → all groups swapped, real velocity_limits, fields preserved
+    monkeypatch.delenv("RS_ENFORCE_ACTUATOR_LIMITS", raising=False)
+    g1 = load_env_cfg("Mjlab-Velocity-Flat-Unitree-G1")
+    _enforce_actuator_limits(g1)
+    g1a = _acts(g1)
+    assert g1a and all(isinstance(a, DcMotorActuatorCfg) for a in g1a)
+    knee = next(a for a in g1a if any("knee" in p for p in a.target_names_expr))
+    assert knee.velocity_limit == 20.0
+    assert knee.effort_limit == 139.0 and knee.saturation_effort == 139.0
+
+    go1 = load_env_cfg("Mjlab-Velocity-Flat-Unitree-Go1")
+    _enforce_actuator_limits(go1)
+    calf = next(a for a in _acts(go1) if any("calf" in p for p in a.target_names_expr))
+    assert isinstance(calf, DcMotorActuatorCfg) and calf.velocity_limit == 20.06
+
+    # unknown joint pattern → no recoverable limit (caller leaves it unchanged)
+    class _Fake:
+        target_names_expr = (".*_mystery_joint",)
+
+    assert _recover_velocity_limit(_Fake()) is None
 
 
 # ── §Ship 46: per-foot kick channels in the G1 info contract ───────────────
@@ -430,7 +1060,6 @@ def test_run_with_cleanup_kills_subprocess_on_exception(tmp_path: Path) -> None:
     cleanup path is broken, this test hangs for 30s+; healthy path
     terminates within 2-5s via SIGTERM to the process group."""
     import os
-    import signal
     import threading
     import time
 
@@ -603,6 +1232,26 @@ def test_snapshots_to_trajectory_fills_missing_keys_with_last_seen() -> None:
 # ── §Ship 46: per-foot kick channels in the runtime info dict ─────────────
 # CPU-only — fakes the mjlab sensor/entity API so the hot path is exercised
 # without a GPU or the mjlab package.
+
+def test_episode_relative_base_height_is_per_env_and_reset_safe() -> None:
+    pytest.importorskip("torch")
+    import torch
+    from sculptor.adapters._mjlab_runner import _episode_relative_base_height
+
+    anchor = None
+    delta, anchor = _episode_relative_base_height(
+        torch.tensor([0.74, 1.10]), torch.tensor([1.0, 1.0]), anchor)
+    assert torch.allclose(delta, torch.zeros(2))
+    delta, anchor = _episode_relative_base_height(
+        torch.tensor([0.82, 1.06]), torch.tensor([2.0, 2.0]), anchor)
+    assert torch.allclose(delta, torch.tensor([0.08, -0.04]), atol=1e-6)
+
+    # Only env 1 reset; env 0 retains its own original episode anchor.
+    anchor[1] = float("nan")
+    delta, anchor = _episode_relative_base_height(
+        torch.tensor([0.85, 0.66]), torch.tensor([3.0, 1.0]), anchor)
+    assert torch.allclose(delta, torch.tensor([0.11, 0.0]), atol=1e-6)
+
 
 def _make_term():
     """Build a SculptorRewardTerm and bypass __init__ (which needs a real
@@ -791,3 +1440,130 @@ def test_compute_playback_fps_clamps_playback_speed() -> None:
     assert _compute_playback_fps(
         step_dt=0.02, render_every=1, playback_speed=100.0,
     ) == pytest.approx(240.0)
+
+
+def test_first_episode_freeze_removes_auto_reset_teleport() -> None:
+    """A done-step state is the next episode and must become absorbing padding."""
+    import numpy as np
+
+    from sculptor.adapters._mjlab_runner import (
+        _freeze_invalid_first_episode_steps,
+    )
+
+    root = np.asarray([
+        [[0.0, 0.0], [10.0, 0.0]],
+        [[1.0, 0.0], [11.0, 0.0]],
+        [[0.0, 0.0], [12.0, 0.0]],  # env 0 auto-reset to spawn
+        [[0.2, 0.0], [10.0, 0.0]],  # both are now later attempts
+    ])
+    valid = np.asarray([
+        [True, True],
+        [True, True],
+        [False, True],
+        [False, False],
+    ])
+
+    frozen = _freeze_invalid_first_episode_steps(root, valid)
+
+    np.testing.assert_array_equal(frozen[:, 0, 0], [0.0, 1.0, 1.0, 1.0])
+    np.testing.assert_array_equal(frozen[:, 1, 0], [10.0, 11.0, 12.0, 12.0])
+    assert not np.shares_memory(frozen, root)
+
+
+def test_first_episode_freeze_fails_soft_on_incompatible_mask() -> None:
+    import numpy as np
+
+    from sculptor.adapters._mjlab_runner import (
+        _freeze_invalid_first_episode_steps,
+    )
+
+    values = np.arange(6).reshape(3, 2)
+    result = _freeze_invalid_first_episode_steps(
+        values, np.ones((2, 2), dtype=bool))
+    np.testing.assert_array_equal(result, values)
+
+
+# ── reference-tracking narrows the realism floor (HANDOFF §10, option 2) ──
+#
+# A reference dictates posture, gait and body motion frame by frame, so the
+# task's own posture/gait priors stop complementing the sculpted reward and
+# start competing with it. Measured on the first Tier-D attempt: 14 task terms
+# at 0.3x against one tracking term at 1.0x produced a policy that reproduced
+# 28% of the reference's joint amplitude and could not beat a static pose.
+def test_hardware_safety_terms_survive_reference_tracking() -> None:
+    """Limits and smoothness constrain the hardware without prescribing a
+    pose, so they are compatible with any reference and stay on."""
+    from sculptor.adapters._mjlab_runner import _is_hardware_safety_term
+
+    for name in ("dof_pos_limits", "robot_dof_pos_limits", "dof_vel_limits",
+                 "self_collisions", "action_rate_l2", "joint_limits",
+                 "dof_torque_limits"):
+        assert _is_hardware_safety_term(name), name
+
+
+def test_posture_and_gait_terms_are_not_treated_as_safety() -> None:
+    """These are exactly the terms that fight the reference."""
+    from sculptor.adapters._mjlab_runner import _is_hardware_safety_term
+
+    for name in ("pose", "upright", "track_linear_velocity",
+                 "track_angular_velocity", "foot_clearance", "air_time",
+                 "foot_slip", "foot_swing_height", "angular_momentum",
+                 "body_ang_vel", "soft_landing"):
+        assert not _is_hardware_safety_term(name), name
+
+
+def test_the_g1_task_term_split_is_what_we_intend(tmp_path) -> None:
+    """Pin the actual split over the real G1 velocity task's 14 terms, so a
+    future task-term rename cannot silently re-enable a posture prior."""
+    from sculptor.adapters._mjlab_runner import _is_hardware_safety_term
+
+    shipped = [
+        "action_rate_l2", "air_time", "angular_momentum", "body_ang_vel",
+        "dof_pos_limits", "foot_clearance", "foot_slip", "foot_swing_height",
+        "pose", "self_collisions", "soft_landing", "track_angular_velocity",
+        "track_linear_velocity", "upright",
+    ]
+    kept = sorted(n for n in shipped if _is_hardware_safety_term(n))
+    assert kept == ["action_rate_l2", "dof_pos_limits", "self_collisions"]
+
+
+def test_reward_module_flag_is_read_and_fails_soft(tmp_path) -> None:
+    """The runner keys off REWARD_SPEC['reference_tracking']; an unreadable
+    module must NOT be guessed as tracking, since that would silently change
+    which task rewards are active."""
+    from sculptor.adapters._mjlab_runner import _reward_module_declares
+
+    tracking = tmp_path / "tracking.py"
+    tracking.write_text(
+        'REWARD_SPEC = {"reference_tracking": True}\n'
+        "def compute_reward(s, a, ns, i):\n    return 0.0, {}\n",
+        encoding="utf-8")
+    assert _reward_module_declares(tracking, "reference_tracking") is True
+
+    plain = tmp_path / "plain.py"
+    plain.write_text(
+        'REWARD_SPEC = {"version": "v1"}\n'
+        "def compute_reward(s, a, ns, i):\n    return 0.0, {}\n",
+        encoding="utf-8")
+    assert _reward_module_declares(plain, "reference_tracking") is False
+
+    broken = tmp_path / "broken.py"
+    broken.write_text("this is not python(", encoding="utf-8")
+    assert _reward_module_declares(broken, "reference_tracking") is False
+    assert _reward_module_declares(None, "reference_tracking") is False
+
+
+def test_generated_tracking_rewards_declare_the_flag() -> None:
+    """Both tracking-reward generators must set it, or the runner silently
+    keeps the competing posture priors."""
+    import numpy as np
+
+    from sculptor.refs.track import generate_tracking_reward_source
+
+    src = generate_tracking_reward_source(
+        clip_id="c", joint_names=["j0"],
+        target_joint_pos=np.zeros((4, 1)), target_root_z=np.zeros(4),
+        episode_len_steps=100, duration_s=2.0)
+    ns: dict = {}
+    exec(compile(src, "r", "exec"), ns)  # noqa: S102
+    assert ns["REWARD_SPEC"]["reference_tracking"] is True

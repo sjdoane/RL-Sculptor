@@ -216,6 +216,21 @@ async def render_static_async(
 
 
 # ── implementation ────────────────────────────────────────────────────
+def _posed_data(model: Any) -> Any:
+    """MjData posed for a legible still: keyframe 0 when the model has
+    one (robot assets and compiled evaluation scenes carry an
+    init/home keyframe), else the model default. Without this, a
+    quadruped renders at qpos0 with fully extended legs — tall, spindly,
+    and easy to mistake for a humanoid at thumbnail size."""
+    import mujoco
+
+    data = mujoco.MjData(model)
+    if model.nkey > 0:
+        mujoco.mj_resetDataKeyframe(model, data, 0)
+    mujoco.mj_forward(model, data)
+    return data
+
+
 def _render_mjcf(
     xml_path: Path,
     angle: str = DEFAULT_ANGLE,
@@ -241,8 +256,7 @@ def _render_mjcf(
             kind="parse",
         ) from e
     try:
-        data = mujoco.MjData(model)
-        mujoco.mj_forward(model, data)
+        data = _posed_data(model)
         camera = _build_camera(model, data, angle)
         width, height = size
         with mujoco.Renderer(
@@ -259,6 +273,59 @@ def _render_mjcf(
             kind="render",
         ) from e
     return np.asarray(frame, dtype=np.uint8)
+
+
+def render_model_preview(
+    model_path: Path,
+    out_path: Path,
+    angle: str = DEFAULT_ANGLE,
+    *,
+    size: tuple[int, int] = (PREVIEW_WIDTH, PREVIEW_HEIGHT),
+) -> Path:
+    """Render a compiled model file (.mjb binary or MJCF .xml) to a PNG.
+
+    Used by the authored-world preview: the materialized evaluation MJB
+    embeds terrain heightfields, objects, zones, and the robot, so the
+    render shows exactly the scene evaluation replays and scores."""
+    try:
+        import mujoco
+    except Exception as e:  # noqa: BLE001
+        raise PreviewError(
+            f"mujoco import failed: {type(e).__name__}: {e}",
+            kind="mujoco_import",
+        ) from e
+    if not model_path.is_file():
+        raise PreviewError(
+            f"model file not found: {model_path}", kind="model_missing")
+    try:
+        if model_path.suffix == ".mjb":
+            model = mujoco.MjModel.from_binary_path(str(model_path))
+        else:
+            model = mujoco.MjModel.from_xml_path(str(model_path))
+    except Exception as e:  # noqa: BLE001
+        raise PreviewError(
+            f"MuJoCo failed to load {model_path.name}: "
+            f"{type(e).__name__}: {e}",
+            kind="parse",
+        ) from e
+    try:
+        data = _posed_data(model)
+        camera = _build_camera(model, data, angle)
+        width, height = size
+        with mujoco.Renderer(model, height=height, width=width) as renderer:
+            renderer.update_scene(data, camera)
+            frame = renderer.render()
+    except PreviewError:
+        raise
+    except Exception as e:  # noqa: BLE001
+        raise PreviewError(
+            f"MuJoCo render failed for {model_path.name}: "
+            f"{type(e).__name__}: {e}",
+            kind="render",
+        ) from e
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    _encode_png(np.asarray(frame, dtype=np.uint8), out_path)
+    return out_path
 
 
 def _build_camera(model: Any, data: Any, angle: str) -> Any:

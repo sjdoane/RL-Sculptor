@@ -74,9 +74,27 @@ class Settings(BaseSettings):
     # re-render from a mid-training checkpoint.
     live_rollout_device: Literal["cpu", "gpu"] = "cpu"
 
+    # Non-destructive delete (chunk A1): `None` means "derive from
+    # `projects_root`" (see `resolved_trash_root`); set `RS_TRASH_ROOT`
+    # to pin it elsewhere. `trash_retention_days=0` (default) means
+    # keep forever — no expiry sweep is implemented yet, this only
+    # reserves the setting for one.
+    trash_root: Optional[Path] = None
+    trash_retention_days: int = 0
+
     @property
     def resolved_projects_root(self) -> Path:
         return self.projects_root.expanduser().resolve()
+
+    @property
+    def resolved_trash_root(self) -> Path:
+        """`.trash/` sibling of `projects_root` by default — e.g.
+        `~/.local/share/reward-sculptor/.trash/` — so a wiped
+        `projects_root` doesn't take deleted-but-recoverable projects
+        with it. Overridable via `RS_TRASH_ROOT`."""
+        if self.trash_root is not None:
+            return self.trash_root.expanduser().resolve()
+        return self.resolved_projects_root.parent / ".trash"
 
 
 def check_cloud_sync(path: Path) -> Optional[str]:

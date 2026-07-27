@@ -5,6 +5,7 @@ import { BrowserRouter } from "react-router-dom";
 import { Toaster } from "sonner";
 
 import App from "@/App";
+import { AppErrorBoundary } from "@/components/AppErrorBoundary";
 import { bootstrapTheme } from "@/hooks/useTheme";
 import "@/index.css";
 import "@/styles/rs-tokens.css";
@@ -32,9 +33,14 @@ const queryClient = new QueryClient({
 ReactDOM.createRoot(document.getElementById("root")!).render(
   <React.StrictMode>
     <QueryClientProvider client={queryClient}>
-      <BrowserRouter>
-        <App />
-        <Toaster position="bottom-right" richColors closeButton />
+      <BrowserRouter future={{
+        v7_startTransition: true,
+        v7_relativeSplatPath: true,
+      }}>
+        <AppErrorBoundary>
+          <App />
+          <Toaster position="bottom-right" richColors closeButton />
+        </AppErrorBoundary>
       </BrowserRouter>
     </QueryClientProvider>
   </React.StrictMode>,

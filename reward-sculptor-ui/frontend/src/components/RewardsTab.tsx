@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { useQueryClient } from "@tanstack/react-query";
+import { useQueries, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 
 import { Icon } from "@/components/rs/icon";
@@ -16,19 +16,74 @@ import {
   useRewards,
   useSaveReward,
 } from "@/hooks/useRewards";
-import { ApiError } from "@/lib/api";
+import { ApiError, getMission } from "@/lib/api";
 import { qk } from "@/lib/queryKeys";
+import { stageLabel } from "@/lib/stageDisplay";
+import { sanitizeConsoleText } from "@/lib/utils";
 import type {
+  MissionDetail,
+  MissionSummary,
   ProjectDetail,
   RewardVersionDetail,
   RewardVersionSummary,
   RunSummary,
+  SelectedStage,
 } from "@/lib/types";
 
 const SCULPT_LOCK_NOTE =
   "Sculpt run in progress — manual edits locked until the run completes or is stopped.";
 
-export function RewardsTab({ slug, project }: { slug: string; project: ProjectDetail }) {
+// What-is-this-page explainer for first-time users. Dismissal persists per
+// browser (localStorage), so it shows once and stays gone.
+const REWARDS_EXPLAINER_KEY = "rs.rewardsExplainer.dismissed";
+
+function RewardsExplainer() {
+  const [dismissed, setDismissed] = useState(() => {
+    try { return localStorage.getItem(REWARDS_EXPLAINER_KEY) === "1"; }
+    catch { return false; /* private mode */ }
+  });
+  if (dismissed) return null;
+  const dismiss = () => {
+    setDismissed(true);
+    try { localStorage.setItem(REWARDS_EXPLAINER_KEY, "1"); }
+    catch { /* private mode, ignore */ }
+  };
+  return (
+    <div className="rs-banner info" style={{ alignItems: "flex-start" }}>
+      <Icon name="info" size={17} />
+      <span className="rs-grow" style={{ lineHeight: 1.55 }}>
+        <b>How reward evolution works.</b> Each training iteration, the sculptor trains a policy
+        with the current reward, watches the rollout, diagnoses the failure, and writes the next
+        reward version. Versions that improve the tracked metric are kept; regressions are
+        reverted. The list below is that history — every version can be read, diffed against its
+        parent, and traced to the diagnosis that produced it. You can also fork any version by
+        hand, or ask Claude for a rewrite in the prompt box.
+      </span>
+      <button
+        className="rs-modal-x"
+        style={{ flexShrink: 0 }}
+        onClick={dismiss}
+        aria-label="Dismiss explainer"
+        title="Dismiss — won't show again"
+      >
+        <Icon name="x" size={15} />
+      </button>
+    </div>
+  );
+}
+
+export function RewardsTab({
+  slug, project, selectedStage, setSelectedStage,
+}: {
+  slug: string;
+  project: ProjectDetail;
+  // §Ship de-silo: the shared cross-tab stage selection (owned by
+  // ProjectDetail, URL-synced as `?stage=missionSlug/stageName`). When
+  // present it takes precedence over this tab's own live/sticky-stage
+  // auto-detection — see `effectiveScope` below.
+  selectedStage?: SelectedStage | null;
+  setSelectedStage?: (value: SelectedStage | null) => void;
+}) {
   // §Ship 21b/21d scope logic — preserved verbatim from the prior version.
   // When a mission_stage_run is active, the project's global rewards/v0.py
   // doesn't change; Claude's edits land in the STAGE's rewards dir. Auto-
@@ -60,12 +115,52 @@ export function RewardsTab({ slug, project }: { slug: string; project: ProjectDe
   }, [liveStageScope, stickyStageScope]);
   const stageScope = liveStageScope ?? stickyStageScope;
 
+  // §Ship de-silo: `?stage=` is now owned entirely by ProjectDetail, which
+  // parses it into the `selectedStage` prop and passes a setter back down.
+  // (Previously this tab also parsed/wrote `?stage=` itself as a one-shot
+  // seed for `scopeOverride` — that's removed: two components racing to
+  // read+rewrite the same URL param caused exactly the "double-parse"
+  // fight this increment closes. The prop now carries the same
+  // information, so nothing is lost.)
+  const selectedStageScope = selectedStage
+    ? `${selectedStage.missionSlug}/${selectedStage.stageName}`
+    : null;
+
+  // Manual dropdown pick, used only when there's no shared selection to
+  // route through (see RewardsScopeSelector's onChange below). Cleared
+  // whenever the shared prop changes to a new value, so a stage clicked
+  // in Training/Overview always wins over a stale local pick.
   const [scopeOverride, setScopeOverride] = useState<string | null>(null);
+  const [lastPropScope, setLastPropScope] = useState<string | null>(null);
+  useEffect(() => {
+    if (selectedStageScope !== lastPropScope) {
+      setLastPropScope(selectedStageScope);
+      // Only clear the local override when the shared prop transitions to a
+      // NEW non-null stage — that's the "external stage click should win"
+      // case. A transition to null (e.g. our own onChange below calling
+      // setSelectedStage(null) right before setScopeOverride(next)) must
+      // NOT clear it, or a manual "project" pick self-inflicts a clear one
+      // tick later and snaps back to the stage scope.
+      if (selectedStageScope !== null && selectedStageScope !== scopeOverride) {
+        setScopeOverride(null);
+      }
+    }
+  }, [selectedStageScope, lastPropScope, scopeOverride]);
+
+  // Precedence: explicit shared selectedStage prop > local manual override
+  // (dropdown pick, only reachable when no setSelectedStage setter was
+  // given — see RewardsScopeSelector's onChange) > live stage > sticky
+  // stage. The prop sits above the manual override because a stage click
+  // in Training/Overview should win over a stale local pin; but when this
+  // tab's own dropdown IS the routing path (no setter provided), the
+  // override still needs to beat the live/sticky auto-scope, matching the
+  // pre-existing manual-pick-wins-over-auto-follow behavior.
   const effectiveScope: string | null = useMemo(() => {
+    if (selectedStageScope !== null) return selectedStageScope;
     if (scopeOverride === "project") return null;
-    if (scopeOverride && scopeOverride !== "project") return scopeOverride;
+    if (scopeOverride) return scopeOverride;
     return stageScope;
-  }, [scopeOverride, stageScope]);
+  }, [selectedStageScope, scopeOverride, stageScope]);
   const isStageScope = effectiveScope !== null;
   const pollMs = missionActive || liveStageScope != null ? 3000 : null;
 
@@ -73,6 +168,9 @@ export function RewardsTab({ slug, project }: { slug: string; project: ProjectDe
   const [selectedVersion, setSelectedVersion] = useState<number | null>(null);
   const [draftSource, setDraftSource] = useState<string | null>(null);
   const [draftParentVersion, setDraftParentVersion] = useState<number | null>(null);
+  // Watermark for the live auto-follow effect below — declared here so the
+  // scope-reset effect can clear it without a forward reference.
+  const [lastSeenNewest, setLastSeenNewest] = useState<number | null>(null);
 
   useEffect(() => {
     if (selectedVersion === null && list.data && list.data.length > 0) {
@@ -84,15 +182,25 @@ export function RewardsTab({ slug, project }: { slug: string; project: ProjectDe
     setSelectedVersion(null);
     setDraftSource(null);
     setDraftParentVersion(null);
+    setLastSeenNewest(null);
   }, [effectiveScope]);
 
+  // Live auto-follow: while a stage is actively polling (a mission_stage_run
+  // is running), snap the view to a freshly-materialized version so the
+  // user watches Claude iterate in real time. This must NOT fire just
+  // because the user clicked an older version in (read-only) history —
+  // only when `newest` itself has advanced past the last-seen newest do we
+  // treat it as "a new version landed." Track that watermark separately
+  // from `selectedVersion` so manual older-version picks are never
+  // overridden.
   useEffect(() => {
-    if (!isStageScope || !list.data || list.data.length === 0) return;
+    if (!isStageScope || pollMs == null || !list.data || list.data.length === 0) return;
     const newest = list.data[0].version;
-    if (selectedVersion !== null && newest > selectedVersion && draftSource === null) {
+    if (lastSeenNewest !== null && newest > lastSeenNewest && draftSource === null) {
       setSelectedVersion(newest);
     }
-  }, [list.data, isStageScope, selectedVersion, draftSource]);
+    if (newest !== lastSeenNewest) setLastSeenNewest(newest);
+  }, [list.data, isStageScope, pollMs, lastSeenNewest, draftSource]);
 
   const detail = useReward(slug, selectedVersion ?? undefined, effectiveScope, pollMs);
 
@@ -111,6 +219,7 @@ export function RewardsTab({ slug, project }: { slug: string; project: ProjectDe
   return (
     <div className="rs-scroll">
       <div className="rs-pad rs-vgap-16">
+        <RewardsExplainer />
         <PromptEditHero
           slug={slug}
           disabled={Boolean(project.adapter_unavailable) || project.ready_to_train === false}
@@ -118,15 +227,30 @@ export function RewardsTab({ slug, project }: { slug: string; project: ProjectDe
           latestVersion={latestVersion}
         />
 
-        {(stageScope || scopeOverride) && (
-          <RewardsScopeSelector
-            activeStageRun={activeStageRun}
-            stageScope={stageScope}
-            scopeOverride={scopeOverride}
-            effectiveScope={effectiveScope}
-            onChange={setScopeOverride}
-          />
-        )}
+        <RewardsScopeSelector
+          slug={slug}
+          missions={missions.data ?? []}
+          activeStageRun={activeStageRun}
+          stageScope={stageScope}
+          scopeOverride={scopeOverride}
+          effectiveScope={effectiveScope}
+          onChange={(next) => {
+            // "Auto-follow" (null) and "project" pins never correspond to a
+            // SelectedStage — always local. A stage pick routes through the
+            // shared setter when one exists, so picking a stage here also
+            // updates Training/Overview and the `?stage=` URL; otherwise it
+            // falls back to a local-only override.
+            if (next && next !== "project" && setSelectedStage) {
+              const idx = next.indexOf("/");
+              if (idx > 0) {
+                setSelectedStage({ missionSlug: next.slice(0, idx), stageName: next.slice(idx + 1) });
+                return;
+              }
+            }
+            if (setSelectedStage) setSelectedStage(null);
+            setScopeOverride(next);
+          }}
+        />
 
         <div className="rs-twocol">
           {/* Versions */}
@@ -204,49 +328,101 @@ export function RewardsTab({ slug, project }: { slug: string; project: ProjectDe
   );
 }
 
-// ── Scope selector (rs-seg) ──────────────────────────────────────────
+// ── Scope selector (dropdown: Project + every stage of every mission) ─
+// §Ship 20 (de-siloing): the old two-button Project/stage switch only
+// reached the LIVE stage. This dropdown enumerates every stage of every
+// mission (from each mission's detail) so any completed stage's reward
+// versions are reachable, while "Auto-follow live stage" stays the
+// default when a run is active.
+const AUTO_VALUE = "__auto__";
+const PROJECT_VALUE = "project";
+
 function RewardsScopeSelector({
-  activeStageRun, stageScope, scopeOverride, effectiveScope, onChange,
+  slug, missions, activeStageRun, stageScope, scopeOverride, effectiveScope, onChange,
 }: {
+  slug: string;
+  missions: MissionSummary[];
   activeStageRun: RunSummary | null;
   stageScope: string | null;
   scopeOverride: string | null;
   effectiveScope: string | null;
   onChange: (next: string | null) => void;
 }) {
+  // Fetch each mission's detail to enumerate its stages. Cheap + cached
+  // under the same keys the mission dialog uses.
+  const details = useQueries({
+    queries: missions.map((m) => ({
+      queryKey: qk.mission(slug, m.mission_slug),
+      queryFn: () => getMission(slug, m.mission_slug),
+      staleTime: 30_000,
+    })),
+  });
+  const missionStages = useMemo(() => {
+    return missions.map((m, i) => {
+      const d = details[i]?.data as MissionDetail | undefined;
+      return { mission: m, stages: d?.stages ?? [] };
+    });
+  }, [missions, details]);
+
+  const hasAnyStage = missionStages.some((ms) => ms.stages.length > 0);
+  // Nothing to scope to (no missions/stages, no live stage) → hide.
+  if (!hasAnyStage && !stageScope && !scopeOverride) return null;
+
+  // The <select> value: explicit local override, else whatever scope is
+  // actually in effect (e.g. driven by the shared selectedStage prop or
+  // the live/sticky stage), else "auto" (nothing pinned yet).
+  const value = scopeOverride ?? effectiveScope ?? AUTO_VALUE;
   const isStage = effectiveScope !== null;
-  const stageLabel = activeStageRun
-    ? `Stage: ${activeStageRun.stage_name ?? "unknown"}`
-    : stageScope ? `Stage: ${stageScope.split("/")[1] ?? stageScope}` : "Stage";
+
   return (
     <div className="rs-flex-between rs-wrap rs-gap-12">
-      <div className="rs-seg" role="tablist">
-        <button role="tab" aria-selected={!isStage} className={!isStage ? "on" : ""} onClick={() => onChange("project")}>
-          <Icon name="folder" size={14} />Project
-        </button>
-        <button
-          role="tab"
-          aria-selected={isStage}
-          className={isStage ? "on" : ""}
-          disabled={!stageScope && !scopeOverride}
-          style={!stageScope && !scopeOverride ? { opacity: 0.4, cursor: "not-allowed" } : undefined}
-          onClick={() => onChange(stageScope ?? scopeOverride)}
-        >
-          <Icon name="layers" size={14} />{stageLabel}
-        </button>
+      <div className="rs-flex rs-gap-8" style={{ alignItems: "center", minWidth: 0 }}>
+        <span className="rs-eyebrow" style={{ whiteSpace: "nowrap" }}>Reward scope</span>
+        <div className="rs-select" style={{ display: "flex", alignItems: "center" }}>
+          <select
+            aria-label="Reward scope"
+            value={value}
+            onChange={(e) => {
+              const v = e.target.value;
+              onChange(v === AUTO_VALUE ? null : v);
+            }}
+          >
+            {/* Auto-follow only makes sense while a stage is live. */}
+            {stageScope && (
+              <option value={AUTO_VALUE}>
+                Auto-follow live stage{activeStageRun?.stage_name ? ` (${activeStageRun.stage_name})` : ""}
+              </option>
+            )}
+            <option value={PROJECT_VALUE}>Project (global rewards)</option>
+            {missionStages.map(({ mission, stages }) =>
+              stages.length > 0 ? (
+                <optgroup key={mission.mission_slug} label={mission.mission_slug}>
+                  {stages.map((s, idx) => (
+                    <option
+                      key={`${mission.mission_slug}/${s.name}`}
+                      value={`${mission.mission_slug}/${s.name}`}
+                    >
+                      {stageLabel(s, idx + 1)}. {s.name}{s.status === "superseded" ? " (superseded)" : ""}
+                    </option>
+                  ))}
+                </optgroup>
+              ) : null,
+            )}
+          </select>
+        </div>
       </div>
       <div className="rs-flex rs-gap-12">
-        {scopeOverride && (
+        {scopeOverride && stageScope && (
           <button
             className="rs-sub"
             style={{ background: "none", border: 0, fontSize: 12, textDecoration: "underline", textUnderlineOffset: 2, color: "var(--rs-muted)" }}
             onClick={() => onChange(null)}
             title="Stop pinning; follow the active mission stage automatically"
           >
-            Unpin (auto-follow active stage)
+            Auto-follow live stage
           </button>
         )}
-        {isStage && activeStageRun && (
+        {isStage && activeStageRun && effectiveScope === stageScope && (
           <span className="rs-flex rs-gap-6 rs-sub" style={{ fontSize: 12.5 }}>
             <span className="rs-dot live" />live · polling every 3s
           </span>
@@ -388,10 +564,10 @@ function VersionRow({ v, selected, onSelect }: { v: RewardVersionSummary; select
     <button className={"rs-verrow" + (selected ? " on" : "")} onClick={onSelect}>
       <span className="vn">v{v.version}</span>
       <AuthorBadge author={v.author} />
-      <span className="vmetric">
+      <span className="vmetric" title="Primary metric this version's policy achieved">
         {v.primary_metric != null ? v.primary_metric.toFixed(1) : "—"}
         <br />
-        <Delta value={v.metric_delta} />
+        <Delta value={v.metric_delta} title="Metric change vs the previous version" />
       </span>
     </button>
   );
@@ -503,7 +679,7 @@ function WhyThisEditPanel({ slug, version, stageScope }: { slug: string; version
               {diag.data.evidence && (
                 <div>
                   <div className="rs-eyebrow" style={{ marginBottom: 6 }}>Evidence</div>
-                  <p className="rs-sub" style={{ lineHeight: 1.6, margin: 0, whiteSpace: "pre-wrap" }}>{diag.data.evidence}</p>
+                  <p className="rs-sub" style={{ lineHeight: 1.6, margin: 0, whiteSpace: "pre-wrap" }}>{sanitizeConsoleText(diag.data.evidence)}</p>
                 </div>
               )}
               {diag.data.proposed_edits && diag.data.proposed_edits.length > 0 && (
@@ -519,11 +695,22 @@ function WhyThisEditPanel({ slug, version, stageScope }: { slug: string; version
                         </div>
                         <p className="rs-sub" style={{ margin: "6px 0 0", lineHeight: 1.5, fontSize: 12.5 }}>{e.rationale}</p>
                         {e.paper_refs && e.paper_refs.length > 0 && (
-                          <div className="rs-flex rs-wrap rs-gap-6" style={{ marginTop: 6 }}>
+                          <div className="rs-flex rs-wrap rs-gap-6" style={{ marginTop: 6, alignItems: "center" }}>
                             {e.paper_refs.map((aid) => (
-                              <a key={aid} href={`https://arxiv.org/abs/${aid}`} target="_blank" rel="noreferrer noopener" className="rs-tag mono" style={{ fontSize: 10, color: "var(--ink)" }}>
-                                {aid}<Icon name="external" size={11} />
-                              </a>
+                              <span key={aid} className="rs-flex rs-gap-4" style={{ alignItems: "center" }}>
+                                <a href={`https://arxiv.org/abs/${aid}`} target="_blank" rel="noreferrer noopener" className="rs-tag mono" style={{ fontSize: 10, color: "var(--ink)" }}>
+                                  {aid}<Icon name="external" size={11} />
+                                </a>
+                                {e.paper_refs_grounded?.[aid] === false && (
+                                  <span
+                                    className="rs-badge amber"
+                                    style={{ fontSize: 9.5 }}
+                                    title="cited by the model but not retrieved from the knowledge graph this iteration"
+                                  >
+                                    model-recalled
+                                  </span>
+                                )}
+                              </span>
                             ))}
                           </div>
                         )}
@@ -680,6 +867,25 @@ function SpecPanel({ detail, label = "REWARD_SPEC" }: { detail: RewardVersionDet
   const hparams = Object.entries(spec.hyperparameters);
   const grounding = Object.entries(spec.grounding ?? {});
   const arxivRe = /^(?:\d{4}\.\d{4,5}|[a-z-]+\/\d{7})/i;
+  const composition = spec.composition?.type === "reference_tracking_residual"
+    ? spec.composition
+    : null;
+  const compositionTotal = composition
+    ? Math.max(0.0001, composition.tracking_weight + composition.residual_max)
+    : 1;
+  const trackingPct = composition
+    ? Math.round(100 * composition.tracking_weight / compositionTotal)
+    : 0;
+  const phaseDuration = composition
+    && typeof composition.phase_duration_s === "number"
+    && Number.isFinite(composition.phase_duration_s)
+    ? composition.phase_duration_s
+    : null;
+  const phaseContract = composition?.phase_mode === "loop"
+    ? `loops${phaseDuration !== null ? ` every ${phaseDuration.toFixed(2)} s` : ""}`
+    : composition?.phase_mode === "hold"
+      ? "plays once, then holds"
+      : null;
   return (
     <div className="rs-card">
       <div className="rs-card-head">
@@ -688,6 +894,66 @@ function SpecPanel({ detail, label = "REWARD_SPEC" }: { detail: RewardVersionDet
       </div>
       <div className="rs-card-pad">
         {spec.description && <p className="rs-sub" style={{ margin: "0 0 12px" }}>{spec.description}</p>}
+        {composition && (
+          <div style={{
+            margin: "0 0 18px",
+            border: "1px solid color-mix(in srgb, var(--rs-primary) 42%, var(--hairline))",
+            borderRadius: "var(--radius-md)",
+            background: "color-mix(in srgb, var(--rs-primary) 5%, var(--surface-strong))",
+            padding: "13px 14px",
+          }}>
+            <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", gap: 16, marginBottom: 10 }}>
+              <div style={{ display: "flex", alignItems: "flex-start", gap: 9 }}>
+                <Icon name="activity" size={16} color="var(--rs-primary)" />
+                <div>
+                  <div style={{ fontSize: 12.5, fontWeight: 650, color: "var(--ink)" }}>Motion prior is steering this reward</div>
+                  <div className="rs-sub" style={{ fontSize: 11, marginTop: 2 }}>
+                    The attached motion supplies the dense objective. The sculptor can only author the capped task residual.
+                  </div>
+                </div>
+              </div>
+              <span className="rs-badge amber" style={{ flexShrink: 0, fontSize: 9.5 }}>reference locked</span>
+            </div>
+            <div aria-label={`${trackingPct}% reference tracking, ${100 - trackingPct}% maximum residual`} style={{
+              display: "flex", height: 8, overflow: "hidden", borderRadius: 999,
+              background: "var(--surface-card)", border: "1px solid var(--hairline)",
+            }}>
+              <div style={{ width: `${trackingPct}%`, background: "var(--rs-primary)" }} />
+              <div style={{ flex: 1, background: "var(--st-amber)" }} />
+            </div>
+            <div style={{ display: "flex", justifyContent: "space-between", gap: 12, marginTop: 7, fontSize: 10.5 }}>
+              <span><b style={{ color: "var(--rs-primary)" }}>{trackingPct}%</b> reference tracking base</span>
+              <span><b style={{ color: "var(--st-amber)" }}>{100 - trackingPct}%</b> maximum residual</span>
+            </div>
+            <div className="mono" style={{ marginTop: 10, display: "flex", flexWrap: "wrap", gap: "4px 14px", color: "var(--rs-muted)", fontSize: 10 }}>
+              <span>clip {composition.reference_clip_id ?? "unknown"}</span>
+              {composition.reference_target_sha256 && <span title={composition.reference_target_sha256}>target {composition.reference_target_sha256.slice(0, 12)}â€¦</span>}
+            </div>
+            {(phaseContract || composition.root_height_frame === "episode_relative") && (
+              <div style={{
+                marginTop: 10,
+                paddingTop: 9,
+                borderTop: "1px solid color-mix(in srgb, var(--rs-primary) 18%, var(--hairline))",
+                display: "flex",
+                alignItems: "center",
+                flexWrap: "wrap",
+                gap: 7,
+              }}>
+                <span className="rs-eyebrow" style={{ marginRight: 2 }}>Temporal contract</span>
+                {phaseContract && (
+                  <span className="rs-badge" title="How the reference clock behaves after the source motion ends">
+                    {composition.phase_mode === "loop" ? "↻" : "→"} {phaseContract}
+                  </span>
+                )}
+                {composition.root_height_frame === "episode_relative" && (
+                  <span className="rs-badge" title="Vertical motion is measured from each environment's own reset height">
+                    height from reset
+                  </span>
+                )}
+              </div>
+            )}
+          </div>
+        )}
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 16, fontSize: 12 }}>
           <div>
             <div className="rs-eyebrow" style={{ marginBottom: 6 }}>Hyperparameters</div>

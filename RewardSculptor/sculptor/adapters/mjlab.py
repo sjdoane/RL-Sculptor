@@ -186,7 +186,16 @@ _INFO_KEYS: list[str] = [
     # frame Z of the root link; `fallen` is a bool tensor, True when
     # the base is inverted enough that gravity projects upward in
     # the body frame (robot is clearly not in a recoverable pose).
-    "base_height", "fallen",
+    # ``base_height_delta`` is measured from each environment's own reset
+    # height, so motion priors can track vertical displacement on any robot,
+    # terrain elevation, or platform spawn without assuming a nominal height.
+    "base_height", "base_height_delta", "fallen",
+    # Universal motion-quality channels.  These are embodiment-agnostic
+    # reductions over the adapter's canonical action/joint tensors, so reward
+    # authoring can respond to flailing without guessing simulator internals.
+    # ``action_rate`` is RMS(a_t - a_{t-1}); ``joint_vel_rms`` is the
+    # whole-articulation RMS joint velocity.  Both are zero on reset frames.
+    "action_rate", "joint_vel_rms",
 ]
 
 # §Ship 46: extra info keys surfaced for the G1 humanoid so a sculpted
@@ -202,7 +211,7 @@ _INFO_KEYS: list[str] = [
 # keys are advertised ONLY for the G1 biped (which has 'left_foot' /
 # 'right_foot' sites that fix the per-foot column order across the
 # contact / height / site-velocity tensors); other robots keep the
-# 6-key base contract and the runner emits zeros they never reference.
+# universal base contract and the runner emits zeros they never reference.
 # `base_horizontal_speed` lets the diagnoser tell standing from walking
 # (info previously had no base velocity, so a forward walker read as
 # "standing still").
@@ -261,6 +270,40 @@ class MjlabAdapter(SculptorAdapter):
     device: str = "cuda:0"
     max_iterations: int = 1500
     seed: int = 1
+    # §RL_SCULPTOR_AUDIT §4.4: goal-class env alignment. "" (default) keeps
+    # the mjlab task cfg untouched; "jump" retargets the walking-task
+    # mechanics that fight a standing jump (zero velocity commands, no
+    # push events, fell_over at 120°, 10 s episodes — see
+    # `_mjlab_runner._apply_env_profile`). Applied to BOTH train and
+    # rollout so the policy is evaluated under its training distribution.
+    env_profile: str = ""
+    # §RL_SCULPTOR_AUDIT (env generalization): path to a per-project env
+    # spec JSON (sculptor.env_spec schema — the general successor to the
+    # named profiles). Wins over `env_profile` when both are set. The
+    # spec's `shared` section applies to BOTH train and rollout; its
+    # `train` section (RSI resets, sunk termination, domain
+    # randomization, PPO exploration) is train-only. Injected by
+    # `load_adapter` when the project has `env/current.json`; the FILE's
+    # content is re-read by each train/rollout subprocess, so the sculpt
+    # loop can iterate the train section between iterations.
+    env_spec_path: str = ""
+    # Atomic prompt-authored world/task/evaluation/channel tuple. This is
+    # separate from env_spec_path by design: the latter remains the legacy
+    # diagnoser-managed reset/randomization/optimizer surface.
+    world_selection_path: str = ""
+    # §D17: path to a stage-FIXED eval-rollout reset override JSON
+    # (`sculptor.reference.derive_eval_reset`'s payload, written once at
+    # stage-scaffold time to `env/eval_reset.json`). Applied ONLY to
+    # rollout evaluation, AFTER the existing shared-only `_apply_env_spec`
+    # — a small allowlisted set of reset keys (height/pitch/roll collapsed
+    # to a single deterministic value, zero reset velocity/noise,
+    # fell_over_termination popped), NEVER the diagnoser-iterable
+    # `env_spec_path` train section. Injected by `load_adapter` when the
+    # project has `env/eval_reset.json`, same convention as
+    # `env_spec_path` above. Empty (default) = today's behavior, byte-
+    # identical (eval resets standing-start on every task, get-up stages
+    # included).
+    eval_reset_path: str = ""
     rsl_rl_kwargs: dict[str, Any] = field(default_factory=dict)
     # Optional override for the schema keys emitted by the reward-term
     # state snapshot. If empty, derived from task_id via _schema_for_task.
@@ -274,6 +317,8 @@ class MjlabAdapter(SculptorAdapter):
     # Populated by __post_init__.
     _validated: bool = field(default=False, init=False, repr=False)
     _remote_exec: Any = field(default=None, init=False, repr=False)
+    _world_bundle: Optional[dict[str, Any]] = field(
+        default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         # Lazy import — keeps non-mjlab adapters and UI health check
@@ -297,6 +342,84 @@ class MjlabAdapter(SculptorAdapter):
                 f"task_id={self.task_id!r} is not registered in mjlab; "
                 f"known tasks: {sorted(registered)}"
             )
+
+        # §RL_SCULPTOR_AUDIT §4.4: fail fast on an unknown profile here
+        # (clear error at adapter construction) instead of a silent
+        # no-op warning buried in the training subprocess's stderr.
+        if self.env_profile not in ("", "default", "jump"):
+            raise ValueError(
+                f"env_profile={self.env_profile!r} is not supported; "
+                "known profiles: '' (task defaults), 'jump'."
+            )
+        # §env generalization: fail fast on a missing/invalid env spec —
+        # never spawn a GPU subprocess that would die (or half-apply)
+        # under a bad spec. Content is validated again at each
+        # subprocess spawn (the file is re-read so the loop can iterate
+        # it); this init check catches config errors at load time.
+        if self.env_spec_path:
+            from sculptor.env_spec import load_env_spec
+
+            load_env_spec(self.env_spec_path)  # raises ValueError
+            # Pin the path NOW — a relative path resolved again at
+            # spawn time (after a cwd change) could validate one file
+            # and hand the subprocess another.
+            self.env_spec_path = str(Path(self.env_spec_path).resolve())
+
+        if self.world_selection_path:
+            from sculptor.world.artifacts import WorldArtifactStore
+            from sculptor.world.task_spec import validate_task_spec
+            from sculptor.world.world_spec import validate_world_spec
+
+            selection_path = Path(self.world_selection_path).resolve()
+            store = WorldArtifactStore(selection_path.parent.parent)
+            selection = store.read_selection(selection_path)
+            if selection is None:  # defensive: explicit path must exist
+                raise ValueError(
+                    f"world_selection_path not found: {selection_path}")
+            world = store.load_json_ref(selection.refs["world"])
+            task = store.load_json_ref(selection.refs["task"])
+            world_errors = validate_world_spec(world)
+            task_errors = validate_task_spec(task, world=world)
+            if world_errors or task_errors:
+                details = "; ".join(world_errors + task_errors)
+                raise ValueError(
+                    f"world selection {selection.tuple_hash[:12]} invalid: "
+                    f"{details}")
+            self._world_bundle = {
+                "selection": selection.to_dict(),
+                "world": world,
+                "task": task,
+                "resolved_eval": store.load_json_ref(
+                    selection.refs["resolved_eval"]),
+                "channel_catalog": store.load_json_ref(
+                    selection.refs["channel_catalog"]),
+            }
+            self.world_selection_path = str(selection_path)
+
+        # §D17: fail fast on a missing/invalid eval-reset override — same
+        # discipline as env_spec_path above. This file is a plain JSON
+        # dict of allowlisted reset keys (not an env-spec document), so
+        # validation here is just "readable, parses as a JSON object";
+        # the runner validates individual key shapes when it applies them.
+        if self.eval_reset_path:
+            p = Path(self.eval_reset_path)
+            try:
+                payload = json.loads(p.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as e:
+                raise ValueError(
+                    f"eval_reset_path unreadable at "
+                    f"{self.eval_reset_path!r}: {type(e).__name__}: {e}"
+                ) from e
+            if not isinstance(payload, dict):
+                raise ValueError(
+                    f"eval_reset_path={self.eval_reset_path!r} must "
+                    f"contain a JSON object, got {type(payload).__name__}"
+                )
+            # Pin the path NOW — same rationale as env_spec_path (a
+            # relative path resolved again at spawn time, after a cwd
+            # change, could validate one file and hand the subprocess
+            # another).
+            self.eval_reset_path = str(p.resolve())
 
         # num_envs autocap on smaller VRAM. Skipped when remote dispatch
         # is enabled — the local VRAM probe measures the wrong GPU (the
@@ -378,10 +501,54 @@ class MjlabAdapter(SculptorAdapter):
 
     # ── Contract ────────────────────────────────────────────────────────────
     def reward_contract(self) -> RewardContract:
+        state_schema = _schema_for_task(self.task_id)
+        info_keys = _info_keys_for_task(self.task_id)
+        info_schema: dict[str, tuple[int, ...]] = {
+            key: () for key in info_keys
+        }
+        channel_catalog = None
+        if self._world_bundle is not None:
+            from sculptor.world.capabilities import resolve_robot_capability
+
+            robot = self._world_bundle["world"]["shared"]["robot"]
+            cap = resolve_robot_capability(
+                robot["capability_id"],
+                required=robot.get("required_capabilities", []),
+                extra_paths=([robot["descriptor_path"]]
+                             if robot.get("descriptor_path") else []),
+            )
+            # Authored projects are descriptor-driven. Legacy projects retain
+            # their existing task-family compatibility mapping.
+            if cap.reward_state_schema:
+                state_schema = dict(cap.reward_state_schema)
+            channel_catalog = dict(self._world_bundle["channel_catalog"])
+            shared_names = [
+                str(channel["name"])
+                for channel in channel_catalog.get("channels", [])
+                if channel.get("access") == "shared_shaping"
+            ]
+            info_keys = list(dict.fromkeys(
+                list(_INFO_KEYS) + list(cap.reward_info_keys) + shared_names))
+            info_schema = {key: () for key in info_keys}
+            for channel in channel_catalog.get("channels", []):
+                if channel.get("access") != "shared_shaping":
+                    continue
+                name = str(channel.get("name", ""))
+                raw_shape = channel.get("shape", [])
+                if not name or not isinstance(raw_shape, list):
+                    continue
+                # Catalog trajectories are (T, N, *feature). The reward
+                # runtime exposes one simulator step, hence (N, *feature).
+                trailing = raw_shape[2:]
+                if all(
+                    isinstance(dim, int) and not isinstance(dim, bool) and dim > 0
+                    for dim in trailing
+                ):
+                    info_schema[name] = tuple(trailing)
         return RewardContract(
             observation_space_spec=None,
             action_space_spec=None,
-            expected_info_keys=_info_keys_for_task(self.task_id),
+            expected_info_keys=info_keys,
             expected_components=None,
             supports_batched=True,
             training_device="gpu",
@@ -390,7 +557,9 @@ class MjlabAdapter(SculptorAdapter):
             # override could live in a follow-up when VRAM probe data is
             # in hand (MJLAB_PIVOT_DESIGN §3.3).
             min_gpu_memory_gb=6.0 if "G1" in self.task_id else 4.0,
-            state_schema=_schema_for_task(self.task_id),
+            state_schema=state_schema,
+            info_schema=info_schema,
+            channel_catalog=channel_catalog,
         )
 
     # ── Component probe (scalar, subprocess-isolated, mjlab-shaped) ─────────
@@ -404,7 +573,8 @@ class MjlabAdapter(SculptorAdapter):
         """
         import textwrap
 
-        schema = _schema_for_task(self.task_id)
+        contract = self.reward_contract()
+        schema = contract.state_schema or _schema_for_task(self.task_id)
         action_dim = schema.get("actuator_force", (12,))[0]
         path = Path(reward_module_path).resolve()
 
@@ -412,9 +582,10 @@ class MjlabAdapter(SculptorAdapter):
             """\
             import importlib.util, json, sys
             import torch
-            path, schema_json, action_dim, info_keys_json = sys.argv[1:5]
+            path, schema_json, action_dim, info_keys_json, info_schema_json = sys.argv[1:6]
             schema = json.loads(schema_json)
             info_keys = json.loads(info_keys_json)
+            info_schema = json.loads(info_schema_json)
             spec = importlib.util.spec_from_file_location('_probe', path)
             mod = importlib.util.module_from_spec(spec)
             try:
@@ -424,7 +595,10 @@ class MjlabAdapter(SculptorAdapter):
                 next_state = {k: torch.zeros((1, *shape), dtype=torch.float32)
                               for k, shape in schema.items()}
                 action = torch.zeros((1, int(action_dim)), dtype=torch.float32)
-                info = {k: torch.zeros((1,), dtype=torch.float32) for k in info_keys}
+                info = {
+                    k: torch.zeros((1, *info_schema.get(k, [])), dtype=torch.float32)
+                    for k in info_keys
+                }
                 out = mod.compute_reward(state, action, next_state, info)
                 if not (isinstance(out, tuple) and len(out) == 2):
                     raise TypeError(f'compute_reward must return (reward, components); got {type(out).__name__}')
@@ -451,13 +625,18 @@ class MjlabAdapter(SculptorAdapter):
         )
 
         schema_json = json.dumps({k: list(v) for k, v in schema.items()})
-        info_keys_json = json.dumps(_info_keys_for_task(self.task_id))
+        info_keys_json = json.dumps(contract.expected_info_keys)
+        info_schema_json = json.dumps({
+            key: list(shape)
+            for key, shape in (contract.info_schema or {}).items()
+        })
 
         try:
             proc = subprocess.run(
                 [
                     sys.executable, "-c", script,
                     str(path), schema_json, str(action_dim), info_keys_json,
+                    info_schema_json,
                 ],
                 capture_output=True, text=True, timeout=30.0,
             )
@@ -593,9 +772,19 @@ class MjlabAdapter(SculptorAdapter):
         # override from the user still wins if provided.
         effective_schema_keys = (
             list(self.schema_keys) if self.schema_keys
-            else list(_schema_for_task(self.task_id).keys())
+            else list((self.reward_contract().state_schema
+                       or _schema_for_task(self.task_id)).keys())
         )
         cmd += ["--schema-keys", ",".join(effective_schema_keys)]
+        if self.env_spec_path:
+            cmd += ["--env-spec", str(Path(self.env_spec_path).resolve())]
+        elif self.env_profile:
+            cmd += ["--env-profile", self.env_profile]
+        if self.world_selection_path:
+            cmd += [
+                "--world-selection",
+                str(Path(self.world_selection_path).resolve()),
+            ]
 
         executor = self._remote_executor()
         if executor is not None:
@@ -616,14 +805,25 @@ class MjlabAdapter(SculptorAdapter):
                 "--device": runner_device,
                 "--schema-keys": ",".join(effective_schema_keys),
             }
+            if not self.env_spec_path and self.env_profile:
+                options["--env-profile"] = self.env_profile
             input_paths: dict[str, Path] = {}
-            aux_dirs: tuple[Path, ...] = ()
+            aux_dir_list: list[Path] = []
+            if self.env_spec_path:
+                # File input → synced to the pod at its mirror path.
+                input_paths["--env-spec"] = Path(self.env_spec_path).resolve()
+            if self.world_selection_path:
+                selection_path = Path(self.world_selection_path).resolve()
+                input_paths["--world-selection"] = selection_path
+                # Selection refs and materialized terrain assets are relative
+                # to env/. Mirror the complete immutable artifact directory.
+                aux_dir_list.append(selection_path.parent)
             if reward_module_path is not None:
                 input_paths["--reward-module-path"] = Path(reward_module_path)
                 # sculpt passes rewards/current.py — a shim that loads
                 # its sibling v<N>.py at import time, so the whole
                 # rewards/ dir must exist at its mirror path on the pod.
-                aux_dirs = (Path(reward_module_path).resolve().parent,)
+                aux_dir_list.append(Path(reward_module_path).resolve().parent)
             if init_policy_path is not None:
                 input_paths["--load-pretrained-policy"] = Path(init_policy_path).resolve()
             job = RunnerJob(
@@ -635,7 +835,7 @@ class MjlabAdapter(SculptorAdapter):
                 # sculpt.py's resume key) is promoted last.
                 required_artifacts=("metrics.json", "checkpoint.pt"),
                 remote_env=remote_env,
-                aux_dirs=aux_dirs,
+                aux_dirs=tuple(dict.fromkeys(aux_dir_list)),
             )
             proc = executor.execute(job)
         else:
@@ -706,6 +906,10 @@ class MjlabAdapter(SculptorAdapter):
         playback_speed: float | None = None,
         render_every: int | None = None,
         fps: float | None = None,
+        render_width: int | None = None,
+        render_height: int | None = None,
+        render_env_index: int | None = None,
+        seed: int | None = None,
     ) -> RolloutResult:
         """§Ship-7: accept rollout-video knobs so the UI can drive them
         without config-file edits.
@@ -717,6 +921,12 @@ class MjlabAdapter(SculptorAdapter):
           * `render_every` — capture every N-th step; 0/None = auto-cap.
           * `fps` — hard override on playback fps; 0/None = derive from
             env.step_dt * render_every / playback_speed.
+          * `render_env_index` — precommitted parallel rollout lane shown
+            in the video. Batch metrics still cover every evaluation lane.
+          * `seed` — §Selection statistics: deterministic eval seed so
+            repeat rollouts of the SAME checkpoint (multi-seed eval,
+            fresh-seed re-eval) sample distinct, reproducible resets.
+            None = legacy unseeded behavior.
         """
         checkpoint_path = Path(checkpoint_path).resolve()
         output_dir = Path(output_dir).resolve()
@@ -743,6 +953,25 @@ class MjlabAdapter(SculptorAdapter):
             cmd += ["--render-every", str(int(render_every))]
         if fps is not None:
             cmd += ["--fps", str(float(fps))]
+        if render_width is not None:
+            cmd += ["--render-width", str(int(render_width))]
+        if render_height is not None:
+            cmd += ["--render-height", str(int(render_height))]
+        if render_env_index is not None:
+            cmd += ["--render-env-index", str(int(render_env_index))]
+        if seed is not None:
+            cmd += ["--seed", str(int(seed))]
+        if self.env_spec_path:
+            cmd += ["--env-spec", str(Path(self.env_spec_path).resolve())]
+        elif self.env_profile:
+            cmd += ["--env-profile", self.env_profile]
+        if self.eval_reset_path:
+            cmd += ["--eval-reset", str(Path(self.eval_reset_path).resolve())]
+        if self.world_selection_path:
+            cmd += [
+                "--world-selection",
+                str(Path(self.world_selection_path).resolve()),
+            ]
 
         executor = self._remote_executor()
         if executor is not None and executor.cfg.rollout_remote:
@@ -766,16 +995,38 @@ class MjlabAdapter(SculptorAdapter):
                 options["--render-every"] = str(int(render_every))
             if fps is not None:
                 options["--fps"] = str(float(fps))
+            if render_width is not None:
+                options["--render-width"] = str(int(render_width))
+            if render_height is not None:
+                options["--render-height"] = str(int(render_height))
+            if render_env_index is not None:
+                options["--render-env-index"] = str(int(render_env_index))
+            if seed is not None:
+                options["--seed"] = str(int(seed))
+            if not self.env_spec_path and self.env_profile:
+                options["--env-profile"] = self.env_profile
+            rollout_inputs: dict[str, Path] = {
+                "--checkpoint-path": checkpoint_path}
+            if self.env_spec_path:
+                rollout_inputs["--env-spec"] = Path(self.env_spec_path).resolve()
+            if self.eval_reset_path:
+                rollout_inputs["--eval-reset"] = Path(self.eval_reset_path).resolve()
+            rollout_aux_dirs: tuple[Path, ...] = ()
+            if self.world_selection_path:
+                selection_path = Path(self.world_selection_path).resolve()
+                rollout_inputs["--world-selection"] = selection_path
+                rollout_aux_dirs = (selection_path.parent,)
             job = RunnerJob(
                 subcommand="rollout",
                 options=options,
-                input_paths={"--checkpoint-path": checkpoint_path},
+                input_paths=rollout_inputs,
                 output_dir=output_dir,
                 # Ordered: rollout.mp4 last — sculpt.py's rollout-skip
                 # check requires all three non-empty, so a partial sync
                 # can never present as a finished rollout.
                 required_artifacts=("behavior.json", "trajectory.npz", "rollout.mp4"),
                 remote_env=remote_env,
+                aux_dirs=rollout_aux_dirs,
             )
             proc = executor.execute(job)
         else:
@@ -793,6 +1044,152 @@ class MjlabAdapter(SculptorAdapter):
             trajectory_path=output_dir / "trajectory.npz",
             n_episodes=n_episodes,
         )
+
+    # ── Reward replay (edit anti-collapse screen) ───────────────────────────
+    # Cap on replayed frames — one batched compute_reward_batched call on
+    # CPU; 4096 frames × ~30 floats is milliseconds and plenty of episode
+    # coverage. Deterministic (evenly-spaced) subsample, never RNG.
+    _REPLAY_MAX_FRAMES = 4096
+
+    def build_reward_replay(
+        self, rollout_dir: Path,
+    ) -> "tuple[Any, Any, Any, dict] | None":
+        """§RL_SCULPTOR_AUDIT §4.4 (edit quality): reconstruct reward
+        inputs from `trajectory.npz` so edit.py can replay a CANDIDATE
+        reward over the archived behavior of the current policy.
+
+        Fidelity notes (vs the live `SculptorRewardTerm.__call__`):
+          * exact — qpos/qvel/actuator_force/projected_gravity_b/action,
+            info base_height, fallen, per-foot contacts;
+          * approximated — foot heights (root_z + pelvis-frame foot z;
+            exact only when upright), swing speeds + base_horizontal_speed
+            (finite-difference over step_dt), base_lin_vel_b (world-frame
+            finite difference; body≈world when upright);
+          * zero-filled — base_ang_vel_b, command_vel (the jump profile
+            zeroes commands anyway), terminated/time_outs.
+        Good enough for the screen's question — "does this reward make
+        the current behavior net-negative / zero-credit?" — which is
+        dominated by the exact channels. Returns None when the archive
+        lacks the core arrays (screen silently skipped)."""
+        import numpy as np
+        import torch
+
+        rollout_dir = Path(rollout_dir)
+        npz_path = rollout_dir / "trajectory.npz"
+        if not npz_path.is_file():
+            return None
+        try:
+            z = np.load(npz_path)
+        except Exception:  # noqa: BLE001 — unreadable archive → no screen
+            return None
+        files = set(z.files)
+        core = {"joint_pos", "joint_vel", "root_link_pos_w",
+                "projected_gravity_b", "action"}
+        if not core.issubset(files):
+            return None
+        jp = z["joint_pos"]
+        if jp.ndim != 3 or jp.shape[0] < 3:
+            return None
+        T, N = jp.shape[:2]
+
+        step_dt = 0.02
+        try:
+            behavior = json.loads((rollout_dir / "behavior.json").read_text())
+            step_dt = float(behavior.get("step_dt") or 0.02) or 0.02
+        except Exception:  # noqa: BLE001 — default 50 Hz
+            pass
+
+        def _np(key: str) -> "np.ndarray | None":
+            return z[key] if key in files else None
+
+        root = z["root_link_pos_w"].astype(np.float32)      # (T, N, 3)
+        pg = z["projected_gravity_b"].astype(np.float32)    # (T, N, 3)
+        jv = z["joint_vel"].astype(np.float32)
+        act = z["action"].astype(np.float32)
+        af = _np("actuator_force")
+        lfc, rfc = _np("left_foot_contact"), _np("right_foot_contact")
+        lfp, rfp = _np("left_foot_pos_b"), _np("right_foot_pos_b")
+
+        # Transitions t -> t+1; frames beyond the cap are subsampled
+        # evenly so the whole episode (launch, apex, landing, aftermath)
+        # stays represented.
+        n_trans = T - 1
+        flat_total = n_trans * N
+        n_keep = min(flat_total, self._REPLAY_MAX_FRAMES)
+        flat_idx = np.linspace(0, flat_total - 1, num=n_keep).astype(np.int64)
+        t_idx, env_idx = flat_idx // N, flat_idx % N
+
+        def _pick(arr: "np.ndarray", ts: "np.ndarray") -> "np.ndarray":
+            return arr[ts, env_idx]
+
+        # World-frame velocities by finite difference over the transition.
+        root_t, root_t1 = _pick(root, t_idx), _pick(root, t_idx + 1)
+        root_vel = (root_t1 - root_t) / step_dt                    # (F, 3)
+
+        def _foot_world_z(fp: "np.ndarray | None", ts: "np.ndarray") -> "np.ndarray":
+            if fp is None:
+                return np.zeros(len(ts), dtype=np.float32)
+            return np.maximum(
+                0.0, _pick(root, ts)[:, 2] + _pick(fp, ts)[:, 2])
+
+        def _foot_speed(fp: "np.ndarray | None") -> "np.ndarray":
+            if fp is None:
+                return np.zeros(n_keep, dtype=np.float32)
+            p0 = _pick(root, t_idx) + _pick(fp, t_idx)
+            p1 = _pick(root, t_idx + 1) + _pick(fp, t_idx + 1)
+            return np.linalg.norm((p1 - p0) / step_dt, axis=-1)
+
+        schema = _schema_for_task(self.task_id)
+
+        def _t(arr: "np.ndarray") -> "torch.Tensor":
+            return torch.from_numpy(np.ascontiguousarray(arr, dtype=np.float32))
+
+        def _state_at(ts: "np.ndarray") -> dict[str, "torch.Tensor"]:
+            out: dict[str, torch.Tensor] = {}
+            for key, shape in schema.items():
+                if key == "qpos":
+                    out[key] = _t(_pick(jp, ts))
+                elif key == "qvel":
+                    out[key] = _t(_pick(jv, ts))
+                elif key == "actuator_force" and af is not None:
+                    out[key] = _t(_pick(af, ts))
+                elif key == "projected_gravity_b":
+                    out[key] = _t(_pick(pg, ts))
+                elif key == "base_lin_vel_b":
+                    out[key] = _t(root_vel)
+                else:
+                    out[key] = torch.zeros((n_keep, *shape), dtype=torch.float32)
+            return out
+
+        state = _state_at(t_idx)
+        next_state = _state_at(t_idx + 1)
+        action = _t(_pick(act, t_idx))
+
+        pg_t1 = _pick(pg, t_idx + 1)
+        info: dict[str, torch.Tensor] = {
+            "episode_length": _t(t_idx.astype(np.float32)),
+            "terminated": torch.zeros(n_keep, dtype=torch.float32),
+            "time_outs": torch.zeros(n_keep, dtype=torch.float32),
+            "step_dt": torch.full((n_keep,), float(step_dt)),
+            "base_height": _t(root_t1[:, 2]),
+            "fallen": _t((pg_t1[:, 2] >= 0.0).astype(np.float32)),
+        }
+        if "G1" in self.task_id:
+            info.update({
+                "left_foot_contact": _t(
+                    _pick(lfc, t_idx + 1) if lfc is not None
+                    else np.zeros(n_keep, dtype=np.float32)),
+                "right_foot_contact": _t(
+                    _pick(rfc, t_idx + 1) if rfc is not None
+                    else np.zeros(n_keep, dtype=np.float32)),
+                "left_foot_height": _t(_foot_world_z(lfp, t_idx + 1)),
+                "right_foot_height": _t(_foot_world_z(rfp, t_idx + 1)),
+                "left_foot_swing_speed": _t(_foot_speed(lfp)),
+                "right_foot_swing_speed": _t(_foot_speed(rfp)),
+                "base_horizontal_speed": _t(
+                    np.linalg.norm(root_vel[:, :2], axis=-1)),
+            })
+        return state, action, next_state, info
 
     # ── Behavior metrics ────────────────────────────────────────────────────
     def compute_behavior_metrics(self, rollout: RolloutResult) -> dict[str, Any]:

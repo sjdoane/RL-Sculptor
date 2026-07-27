@@ -9,8 +9,35 @@ degrades to shape-only assertions.
 from __future__ import annotations
 
 import importlib.util
+import os
+import stat
 
 from fastapi.testclient import TestClient
+
+
+def test_api_key_can_be_configured_safely_from_ui(
+    client: TestClient, tmp_projects_root, monkeypatch,
+) -> None:
+    """The settings endpoint persists owner-only and never returns the key."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "")
+    key = "sk-ant-test-abcdefghijklmnop"
+    response = client.put("/system/api-key", json={"api_key": key})
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body == {
+        "configured": True,
+        "masked": "************mnop",
+        "persisted": True,
+    }
+    assert key not in response.text
+    assert os.environ["ANTHROPIC_API_KEY"] == key
+
+    saved = tmp_projects_root / "_settings" / "anthropic_api_key"
+    assert saved.read_text(encoding="utf-8").strip() == key
+    assert stat.S_IMODE(saved.stat().st_mode) == 0o600
+    info = client.get("/system/info").json()
+    assert info["anthropic_api_key_set"] is True
+    assert info["anthropic_api_key_masked"] == "************mnop"
 
 
 def test_system_gpu_returns_shape(client: TestClient) -> None:

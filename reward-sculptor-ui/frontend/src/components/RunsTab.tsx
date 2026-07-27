@@ -1,31 +1,105 @@
-import { useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useQueries, useQuery } from "@tanstack/react-query";
 import { toast } from "sonner";
 
 import { Icon } from "@/components/rs/icon";
-import { Badge, Btn, Delta, EmptyState, MetricChart, Sparkline } from "@/components/rs/primitives";
+import { Badge, Btn, Delta, EmptyState, MetricChart, Sparkline, STATUS_META } from "@/components/rs/primitives";
 import { LogViewer } from "@/components/LogViewer";
 import { NewRunDialog } from "@/components/NewRunDialog";
 import { NewMissionDialog } from "@/components/NewMissionDialog";
 import { MissionDetailDialog } from "@/components/MissionDetailDialog";
 import { useSystemGpu } from "@/hooks/useLibrary";
 import { useRunEvents } from "@/hooks/useRunEvents";
-import { useMissions } from "@/hooks/useMissions";
+import {
+  useBackfillFitness, useMission, useMissions, useStageIterations, useStageSelection,
+} from "@/hooks/useMissions";
+import { useReferenceIndex } from "@/hooks/useReferences";
 import { useRegenerateRewardTemplate, useRewards } from "@/hooks/useRewards";
-import { useControlRun, useKillRun, useRun, useRuns } from "@/hooks/useRuns";
-import { ApiError } from "@/lib/api";
-import { formatRelative } from "@/lib/utils";
+import { usePolicies } from "@/hooks/usePolicies";
+import { useControlRun, useKillRun, useProjectIterations, useRun, useRuns } from "@/hooks/useRuns";
+import {
+  ApiError, getMission, getStageIterDetail, getStageObjectiveMetric,
+  policyExportUrl, projectIterRolloutUrl, stageCheckpointUrl, stageExportUrl,
+  stageRolloutUrl,
+} from "@/lib/api";
+import { qk } from "@/lib/queryKeys";
+import {
+  formatContradictionTooltip, formatIterMetrics, naturalnessChipText, selectionLabel, selectionSentence,
+} from "@/lib/selection";
+import { failureReasonText, stageLabel, supersededText } from "@/lib/stageDisplay";
+import { formatRelative, sanitizeConsoleText } from "@/lib/utils";
 import type {
   ErrorClassification,
   IterEventSummary,
+  MissionDetail,
   MissionSummary,
   ProjectDetail,
   RunDetail,
   RunEvent,
   RunSummary,
+  SelectedStage,
+  StageIterDetail,
+  StageIterPaperRef,
+  StageIteration,
+  StageMetricReference,
+  StageObjectiveMetric,
+  StageSelectionCandidate,
+  StageSelectionReport,
 } from "@/lib/types";
 
+// ── benign-error display mapping ────────────────────────────────────────
+// Some RunSummary.error strings mark benign, designed-for outcomes rather
+// than real crashes — a stage that trained fine but missed its success
+// criterion (mission auto-replans it), or a stage run that was collateral
+// from the user cancelling the whole mission. Both should read as
+// something other than a red "Errored" badge. STATUS_META/Badge stay
+// generic (shared by many surfaces); this maps at the call site instead.
+const CRITERION_NOT_MET_ERROR = "criterion_not_met";
+const MISSION_TERMINATED_ERROR = "parent mission_execute terminated mid-stage";
+
+interface RunDisplayStatus {
+  label: string;
+  cls: "slate" | "blue" | "amber" | "emerald" | "rose";
+  icon: string;
+}
+
+/** Maps a run's raw status/error to a display descriptor for badges,
+ *  falling back to the shared STATUS_META lookup for everything else. */
+function runDisplayStatus(run: Pick<RunSummary, "status" | "error">): RunDisplayStatus {
+  if (run.error === CRITERION_NOT_MET_ERROR) {
+    return { label: "Criterion not met", cls: "amber", icon: "alert-circle" };
+  }
+  if (run.error === MISSION_TERMINATED_ERROR) {
+    return { label: "Stopped (mission cancelled)", cls: "slate", icon: "square" };
+  }
+  const m = STATUS_META[run.status] ?? STATUS_META.draft;
+  return { label: m.label, cls: m.cls, icon: m.icon };
+}
+
+/** Badge variant that honors the benign-error remap above; otherwise
+ *  identical to <Badge status={run.status} />. */
+function RunStatusBadge({
+  run, big, label,
+}: { run: Pick<RunSummary, "status" | "error">; big?: boolean; label?: string }) {
+  const d = runDisplayStatus(run);
+  return (
+    <span className={"rs-badge " + d.cls + (big ? " big" : "")}>
+      <Icon name={d.icon} size={12} />
+      {label !== undefined ? label : d.label}
+    </span>
+  );
+}
+
 // ── public entry ──────────────────────────────────────────────────────
-export default function RunsTab({ slug, project }: { slug: string; project: ProjectDetail }) {
+export default function RunsTab({
+  slug, project, selectedStage, setSelectedStage, onOpenWorld,
+}: {
+  slug: string;
+  project: ProjectDetail;
+  selectedStage?: SelectedStage | null;
+  setSelectedStage?: (value: SelectedStage | null) => void;
+  onOpenWorld?: () => void;
+}) {
   const missions = useMissions(slug);
   // §Ship 21d: keep /runs polling through stage boundaries while a mission
   // is active (preserved verbatim).
@@ -42,6 +116,11 @@ export default function RunsTab({ slug, project }: { slug: string; project: Proj
     () => partitionRuns(runs, missions.data ?? []),
     [runs, missions.data],
   );
+  // §Increment 4: display_label lookup (mission_slug -> stage_name ->
+  // {displayLabel, topLevelCount}) for every stage-numbering surface below.
+  // Called unconditionally, before the isLoading/empty early returns, so
+  // rules-of-hooks holds even though those branches don't render RunSidebar.
+  const stageLabels = useMissionStageLabels(slug, missions.data ?? []);
   const allOrderedRunIds = useMemo(
     () => [
       ...sculptRuns.map((r) => r.run_id),
@@ -49,7 +128,31 @@ export default function RunsTab({ slug, project }: { slug: string; project: Proj
     ],
     [sculptRuns, missionGroups],
   );
-  const selected = selectedRunId ?? allOrderedRunIds[0] ?? null;
+  // §Ship de-silo (Training tab): selecting a mission STAGE row now sets
+  // both the live run_id (best-effort, for the active stage) AND the
+  // shared cross-tab `selectedStage` (mission_slug/stage_name) — the
+  // latter is disk-truth and survives the run_id going stale when the
+  // stage is superseded or a later stage errors.
+  const selectStageRow = (run: RunSummary) => {
+    setSelectedRunId(run.run_id);
+    if (run.mission_slug && run.stage_name && setSelectedStage) {
+      setSelectedStage({ missionSlug: run.mission_slug, stageName: run.stage_name });
+    }
+  };
+  // Deep-linked `?stage=` (e.g. from the mission dialog's "view rewards
+  // for this stage" pattern, or a bookmark) with no in-tab click yet:
+  // resolve it to that stage's run_id so the detail pane opens on it
+  // instead of defaulting to the first run in the list.
+  const stageDeepLinkRunId = useMemo(() => {
+    if (!selectedStage) return null;
+    for (const g of missionGroups) {
+      if (g.missionSlug !== selectedStage.missionSlug) continue;
+      const row = g.stages.find((r) => r.stage_name === selectedStage.stageName);
+      if (row) return row.run_id;
+    }
+    return null;
+  }, [selectedStage, missionGroups]);
+  const selected = selectedRunId ?? stageDeepLinkRunId ?? allOrderedRunIds[0] ?? null;
   const missionDialogSummary =
     missionDialogSlug != null
       ? (missions.data ?? []).find((m) => m.mission_slug === missionDialogSlug) ?? null
@@ -65,10 +168,10 @@ export default function RunsTab({ slug, project }: { slug: string; project: Proj
       <div className="rs-scroll">
         <div className="rs-pad">
           <div className="rs-flex-between rs-wrap rs-gap-12" style={{ marginBottom: 16 }}>
-            <h2 className="rs-h2">Runs</h2>
+            <h2 className="rs-h2">Training</h2>
             <div className="rs-flex rs-gap-8">
               <NewMissionDialog slug={slug} onCreated={(s) => setMissionDialogSlug(s)} />
-              <NewRunDialog slug={slug} project={project} onLaunched={(id) => setSelectedRunId(id)} />
+              <NewRunDialog slug={slug} project={project} onLaunched={(id) => setSelectedRunId(id)} onOpenWorld={onOpenWorld} />
             </div>
           </div>
           <div className="rs-card">
@@ -92,10 +195,14 @@ export default function RunsTab({ slug, project }: { slug: string; project: Proj
           project={project}
           sculptRuns={sculptRuns}
           missionGroups={missionGroups}
+          stageLabels={stageLabels}
           selected={selected}
+          selectedStage={selectedStage ?? null}
           onSelectRun={setSelectedRunId}
+          onSelectStageRow={selectStageRow}
           onOpenMissionDialog={setMissionDialogSlug}
           onLaunchedRun={(id) => setSelectedRunId(id)}
+          onOpenWorld={onOpenWorld}
         />
         {selected ? (
           <RunDetailPane slug={slug} runId={selected} runs={runs} />
@@ -133,8 +240,11 @@ function partitionRuns(runs: RunSummary[], missions: MissionSummary[]): { sculpt
   const seen = new Set<string>();
   const missionGroups: MissionGroup[] = [];
   for (const m of missions) {
-    const stages = stagesByMission.get(m.mission_slug);
-    if (!stages || stages.length === 0) continue;
+    // Zero-run missions are still listed (stages: []) — a decomposed
+    // mission must be reachable (curriculum dialog, reference picker,
+    // per-stage metrics) BEFORE its first training run, or it stays
+    // invisible until trained (house rule: every feature UI-reachable).
+    const stages = stagesByMission.get(m.mission_slug) ?? [];
     seen.add(m.mission_slug);
     stages.sort((a, b) => (a.stage_index ?? 0) - (b.stage_index ?? 0) || a.run_id.localeCompare(b.run_id));
     missionGroups.push({ missionSlug: m.mission_slug, mission: m, stages });
@@ -147,12 +257,79 @@ function partitionRuns(runs: RunSummary[], missions: MissionSummary[]): { sculpt
   return { sculptRuns, missionGroups };
 }
 
-function missionRunStateLabel(m: MissionSummary): string {
-  const { current_stage_idx: i, n_stages: n, lifecycle } = m;
+// ── stage display-label plumbing (Increment 4) ───────────────────────
+// display_label ("1", "1.1", …) only lives on StageSchema (mission detail),
+// not on RunSummary rows — so every mission-scoped numbering surface in
+// this tab needs a mission_slug -> stage_name -> StageSchema lookup.
+// Mirrors RewardsTab's RewardsScopeSelector useQueries-per-mission pattern
+// (same query keys, so the cache is shared rather than duplicated).
+interface StageLabelInfo {
+  displayLabel: string;
+  topLevelCount: number;
+}
+
+function useMissionStageLabels(
+  slug: string,
+  missions: MissionSummary[],
+): Map<string, Map<string, StageLabelInfo>> {
+  const details = useQueries({
+    queries: missions.map((m) => ({
+      queryKey: qk.mission(slug, m.mission_slug),
+      queryFn: () => getMission(slug, m.mission_slug),
+      staleTime: 30_000,
+    })),
+  });
+  return useMemo(() => {
+    const out = new Map<string, Map<string, StageLabelInfo>>();
+    missions.forEach((m, i) => {
+      const d = details[i]?.data as MissionDetail | undefined;
+      if (!d) return;
+      const topLevelCount = d.stages.filter((s) => !(s.display_label ?? "").includes(".")).length;
+      const byName = new Map<string, StageLabelInfo>();
+      d.stages.forEach((s, idx) => {
+        byName.set(s.name, { displayLabel: stageLabel(s, idx + 1), topLevelCount });
+      });
+      out.set(m.mission_slug, byName);
+    });
+    return out;
+  }, [missions, details]);
+}
+
+// §Ship de-silo fix: `n` now prefers the REAL stage-run count seen on disk
+// (`knownStages`, from `missionGroups[].stages.length`) over the mission's
+// possibly-stale `n_stages` — for a terminal mission with a later stage
+// errored, `n_stages`/`current_stage_idx` can undercount or freeze on the
+// stage that was live when it errored, showing "Stage 1 of 3" forever.
+// `viewedStageIndex1based`, when given (the row the user is actually
+// looking at, from disk-truth `stage_index`), takes priority for the
+// "Stage N" part so switching stages updates the header immediately.
+//
+// §Increment 4: "Stage N of M" now prefers display_label-derived values —
+// `viewedStageLabel` (e.g. "1.2") for N, and `topLevelCount` (labels with
+// no dot — replan children don't inflate M) for the denominator. Both fall
+// back to the pre-existing index/knownStages arithmetic while the mission
+// detail query (which carries display_label) is still loading.
+function missionRunStateLabel(
+  m: MissionSummary,
+  knownStages: number,
+  viewedStageIndex1based?: number | null,
+  viewedStageLabel?: string | null,
+  topLevelCount?: number | null,
+): string {
+  const { current_stage_idx: i, n_stages, lifecycle } = m;
+  const n = topLevelCount ?? Math.max(n_stages, knownStages);
   if (n === 0) return "Planning…";
-  if (lifecycle === "running") return `Stage ${Math.max(1, i + 1)} of ${n}`;
+  if (lifecycle === "running") {
+    const shown = viewedStageLabel ?? viewedStageIndex1based ?? Math.max(1, i + 1);
+    return `Stage ${shown} of ${n}`;
+  }
   if (lifecycle === "ready") return `${n} stages planned`;
   if (lifecycle === "completed") return `${n} of ${n} stages complete`;
+  // Terminal (errored/halted) mission: show the stage being VIEWED, not
+  // the stale current_stage_idx from whichever stage was live when a
+  // later one errored.
+  if (viewedStageLabel != null) return `Stage ${viewedStageLabel} of ${n}`;
+  if (viewedStageIndex1based != null) return `Stage ${viewedStageIndex1based} of ${n}`;
   return `${i} of ${n} stages complete`;
 }
 
@@ -167,16 +344,20 @@ function durationStr(start: string, end: string): string {
 
 // ── sidebar ───────────────────────────────────────────────────────────
 function RunSidebar({
-  slug, project, sculptRuns, missionGroups, selected, onSelectRun, onOpenMissionDialog, onLaunchedRun,
+  slug, project, sculptRuns, missionGroups, stageLabels, selected, selectedStage, onSelectRun, onSelectStageRow, onOpenMissionDialog, onLaunchedRun, onOpenWorld,
 }: {
   slug: string;
   project: ProjectDetail;
   sculptRuns: RunSummary[];
   missionGroups: MissionGroup[];
+  stageLabels: Map<string, Map<string, StageLabelInfo>>;
   selected: string | null;
+  selectedStage: SelectedStage | null;
   onSelectRun: (id: string) => void;
+  onSelectStageRow: (run: RunSummary) => void;
   onOpenMissionDialog: (missionSlug: string) => void;
   onLaunchedRun: (id: string) => void;
+  onOpenWorld?: () => void;
 }) {
   const [collapsed, setCollapsed] = useState<Record<string, boolean>>({});
   const toggle = (s: string) => setCollapsed((st) => ({ ...st, [s]: !st[s] }));
@@ -185,17 +366,34 @@ function RunSidebar({
     <div className="rs-runs-side">
       <div className="rs-side-head">
         <span className="rs-h3" style={{ fontSize: 15 }}>Runs</span>
-        <div className="rs-flex rs-gap-6">
+        {/* rs-wrap: in the narrow sidebar the pair drops to its own row
+            instead of forcing a horizontal scrollbar. */}
+        <div className="rs-flex rs-gap-6 rs-wrap">
           <NewMissionDialog slug={slug} onCreated={(s) => onOpenMissionDialog(s)} />
-          <NewRunDialog slug={slug} project={project} onLaunched={onLaunchedRun} />
+          <NewRunDialog slug={slug} project={project} onLaunched={onLaunchedRun} onOpenWorld={onOpenWorld} />
         </div>
       </div>
 
       {missionGroups.length > 0 && <div className="rs-side-group">Missions</div>}
       {missionGroups.map((g) => {
         const isCollapsed = collapsed[g.missionSlug] ?? false;
-        const selectedInGroup = g.stages.some((s) => s.run_id === selected);
+        // A row counts as "selected" either by live run_id (normal case)
+        // OR by the shared disk-truth selectedStage (keeps the group open
+        // and the row highlighted even after its run_id goes stale).
+        const isRowSelected = (s: RunSummary) =>
+          s.run_id === selected ||
+          (selectedStage != null && selectedStage.missionSlug === g.missionSlug && selectedStage.stageName === s.stage_name);
+        const selectedInGroup = g.stages.some(isRowSelected);
         const open = !isCollapsed || selectedInGroup;
+        // Which stage the user is actually looking at, for the header's
+        // "Stage N of M" — prefers the row matching selectedStage/selected
+        // over the mission's live (possibly stale) current_stage_idx.
+        const viewedRow = g.stages.find(isRowSelected);
+        const viewedStageIndex1based =
+          viewedRow && typeof viewedRow.stage_index === "number" ? viewedRow.stage_index + 1 : null;
+        const groupLabels = stageLabels.get(g.missionSlug) ?? null;
+        const viewedStageLabel = viewedRow?.stage_name ? groupLabels?.get(viewedRow.stage_name)?.displayLabel ?? null : null;
+        const topLevelCount = groupLabels ? [...groupLabels.values()].reduce((max, v) => Math.max(max, v.topLevelCount), 0) || null : null;
         return (
           <div key={g.missionSlug} className="rs-mission">
             <div className="rs-mhead" role="button" tabIndex={0}
@@ -209,7 +407,7 @@ function RunSidebar({
                 <span style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
                   {g.mission && <Badge status={g.mission.lifecycle} label="" />}
                   <span style={{ fontWeight: 500, fontSize: 13, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                    {g.mission ? missionRunStateLabel(g.mission) : g.missionSlug}
+                    {g.mission ? missionRunStateLabel(g.mission, g.stages.length, viewedStageIndex1based, viewedStageLabel, topLevelCount) : g.missionSlug}
                   </span>
                 </span>
                 {g.mission?.goal && (
@@ -228,8 +426,18 @@ function RunSidebar({
                 <Icon name="list" size={14} />
               </button>
             </div>
+            {/* §Ship de-silo: a visible divider under the mission head so
+                the full stage list reads as one clearly-grouped block. */}
+            {open && g.stages.length > 0 && <div className="rs-stage-divider" aria-hidden="true" />}
             {open && g.stages.map((r) => (
-              <RunRow key={r.run_id} run={r} selected={selected === r.run_id} onSelect={() => onSelectRun(r.run_id)} stageContext />
+              <RunRow
+                key={r.run_id}
+                run={r}
+                displayLabel={r.stage_name ? groupLabels?.get(r.stage_name)?.displayLabel ?? null : null}
+                selected={isRowSelected(r)}
+                onSelect={() => onSelectStageRow(r)}
+                stageContext
+              />
             ))}
           </div>
         );
@@ -244,16 +452,26 @@ function RunSidebar({
 }
 
 function RunRow({
-  run: r, selected, onSelect, stageContext = false,
-}: { run: RunSummary; selected: boolean; onSelect: () => void; stageContext?: boolean }) {
-  const titleText = stageContext ? r.stage_name ?? r.run_id.replace(/^job_/, "") : r.run_id.replace(/^job_/, "");
+  run: r, displayLabel = null, selected, onSelect, stageContext = false,
+}: { run: RunSummary; displayLabel?: string | null; selected: boolean; onSelect: () => void; stageContext?: boolean }) {
+  // §increment 3: the synthetic project-level disk row gets a human
+  // name — "disk:project" is an API id, not a label.
+  const titleText = stageContext
+    ? r.stage_name ?? r.run_id.replace(/^job_/, "")
+    : r.run_id === "disk:project"
+      ? "project runs (recovered)"
+      : r.run_id.replace(/^job_/, "");
   const itersDenom = r.iterations_requested || "?";
+  // §Increment 4: prefer the server's hierarchical display_label ("1.2")
+  // over stage_index+1 — falls back while the mission-detail label map is
+  // still loading (or for disk-reconstructed rows with no stage_index).
+  const numberLabel = displayLabel ?? (typeof r.stage_index === "number" ? String(r.stage_index + 1) : null);
   return (
     <button className={"rs-runrow" + (selected ? " on" : "") + (stageContext ? " rs-stage" : "")} onClick={onSelect}>
-      <Badge status={r.status} label="" />
+      <RunStatusBadge run={r} label="" />
       <span style={{ minWidth: 0, flex: 1 }}>
         <span className="rid" style={{ display: "block", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-          {stageContext && typeof r.stage_index === "number" && <span style={{ color: "var(--rs-muted)" }}>{r.stage_index + 1}. </span>}
+          {stageContext && numberLabel && <span style={{ color: "var(--rs-muted)" }}>{numberLabel}. </span>}
           {titleText}
         </span>
         <span className="rmeta" style={{ display: "block" }}>
@@ -277,6 +495,1095 @@ function RunRow({
 
 // ── detail pane ───────────────────────────────────────────────────────
 function RunDetailPane({ slug, runId, runs }: { slug: string; runId: string; runs: RunSummary[] }) {
+  const summaryEarly = useMemo(() => runs.find((r) => r.run_id === runId) ?? null, [runs, runId]);
+  const isStageRunEarly = summaryEarly?.kind === "mission_stage_run";
+  const missionSlugEarly = summaryEarly?.mission_slug ?? null;
+  const stageNameEarly = summaryEarly?.stage_name ?? null;
+
+  // §Ship de-silo: a mission stage row is only "live" (safe to source from
+  // the in-memory /runs+WS path) while it's the run the mission is
+  // ACTIVELY training right now. Any other stage — completed, superseded
+  // by a later stage starting, or left behind because a LATER stage
+  // errored — must read disk-truth instead, or its data disappears the
+  // moment the live run_id moves on. `useRun`/`iterRolloutUrl` are scoped
+  // to a single run_id and go stale/empty exactly in those cases; the
+  // mission detail tells us definitively whether this run is the one
+  // currently training.
+  const missionDetail = useMission(slug, missionSlugEarly ?? undefined, {
+    enabled: isStageRunEarly && !!missionSlugEarly,
+  });
+  const isLiveStage =
+    !isStageRunEarly ||
+    (missionDetail.data?.active_job_id != null &&
+      missionDetail.data.stages[missionDetail.data.current_stage_idx]?.name === stageNameEarly) ||
+    // Before the mission detail loads, assume live if the run itself is
+    // still running/queued — avoids a one-frame flash to disk-truth for
+    // the common case of a freshly-launched stage.
+    (missionDetail.isLoading && (summaryEarly?.status === "running" || summaryEarly?.status === "queued"));
+  const useDiskTruth = isStageRunEarly && !isLiveStage;
+
+  // §increment 3: the synthetic project-level row (run_id "disk:project",
+  // synthesized by list_runs after a backend restart) has no JobManager
+  // entry — LiveRunDetailPane's useRun/useRunEvents would 404 on it.
+  // Route it to the project-scoped disk-truth pane instead.
+  if (summaryEarly?.run_id === "disk:project") {
+    return <ProjectDiskDetailPane slug={slug} summary={summaryEarly} />;
+  }
+
+  return useDiskTruth && missionSlugEarly && stageNameEarly ? (
+    <StageDetailPane
+      slug={slug}
+      missionSlug={missionSlugEarly}
+      stageName={stageNameEarly}
+      summary={summaryEarly}
+      mission={missionDetail.data ?? null}
+    />
+  ) : (
+    <LiveRunDetailPane slug={slug} runId={runId} runs={runs} mission={isStageRunEarly ? missionDetail.data ?? null : null} />
+  );
+}
+
+// Disk-truth stage view: sources iterations + rollout from
+// `useStageIterations`/`stageRolloutUrl` (the same disk-truth path proven
+// by MissionDetailDialog's StagePanel) instead of the live `useRun` +
+// `iterRolloutUrl`, so a completed/superseded/left-behind stage keeps
+// showing its data no matter what the live job is doing now.
+function StageDetailPane({
+  slug, missionSlug, stageName, summary, mission,
+}: {
+  slug: string;
+  missionSlug: string;
+  stageName: string;
+  summary: RunSummary | null;
+  mission: MissionDetail | null;
+}) {
+  const stage = mission?.stages.find((s) => s.name === stageName) ?? null;
+  const iters = useStageIterations(slug, missionSlug, stageName);
+  const rows = iters.data ?? [];
+
+  const [picked, setPicked] = useState<number | null>(null);
+  // A picked iteration is meaningful only within the stage it was picked
+  // in — switching stages must fall back to the new stage's own kept/
+  // default iteration, not carry iter N across.
+  useEffect(() => {
+    setPicked(null);
+  }, [missionSlug, stageName]);
+  const defaultIter = useMemo(() => {
+    if (rows.length === 0) return null;
+    const kept =
+      stage?.selected_iter_index != null
+        ? rows.find((r) => r.iter_index === stage.selected_iter_index)
+        : undefined;
+    if (kept?.has_rollout) return kept.iter_index;
+    const newestWithRollout = [...rows].reverse().find((r) => r.has_rollout);
+    if (newestWithRollout) return newestWithRollout.iter_index;
+    return rows[rows.length - 1].iter_index;
+  }, [rows, stage?.selected_iter_index]);
+  const activeIter = picked ?? defaultIter;
+  const activeRow = rows.find((r) => r.iter_index === activeIter) ?? null;
+
+  // §narrate-completed-stage: the objective metric that guided this whole
+  // stage (once per stage, not per iteration).
+  const objectiveMetric = useQuery<StageObjectiveMetric>({
+    queryKey: ["stageObjectiveMetric", slug, missionSlug, stageName],
+    queryFn: () => getStageObjectiveMetric(slug, missionSlug, stageName),
+    enabled: !!slug && !!missionSlug && !!stageName,
+    staleTime: 30_000,
+  });
+
+  // §selection-report UI: the keep-decision report ("why this iteration
+  // was kept") — synthesized from mission.json for stages that predate
+  // live selection.json writing.
+  const selection = useStageSelection(slug, missionSlug, stageName);
+
+  // §selection-report UI: recover on-disk fitness from run logs, for
+  // stages that finished before objective fitness was recorded live.
+  // Gated on the MISSION (not just this stage) not being live — the
+  // backend 409s regardless of which stage is asked about while any job
+  // for this mission is running.
+  const backfillFitness = useBackfillFitness(slug);
+  const [backfillNote, setBackfillNote] = useState<string | null>(null);
+  const missionRunning = mission?.active_job_id != null;
+  const handleBackfillFitness = () => {
+    setBackfillNote(null);
+    backfillFitness.mutate(missionSlug, {
+      onSuccess: (res) => {
+        const inStage = res.stages[stageName] ?? 0;
+        setBackfillNote(
+          `recovered fitness for ${res.written} iteration${res.written === 1 ? "" : "s"} across the mission` +
+          (inStage > 0 ? ` (${inStage} in this stage)` : ""),
+        );
+      },
+      onError: (err) => {
+        setBackfillNote(
+          err instanceof ApiError && err.status === 409
+            ? "a run is live — try after it finishes"
+            : err.message,
+        );
+      },
+    });
+  };
+
+  // §narrate-completed-stage: per-iteration reasoning (reward description,
+  // diagnosis evidence, cited papers, components) for the selected iter.
+  const iterDetail = useQuery<StageIterDetail>({
+    queryKey: ["stageIterDetail", slug, missionSlug, stageName, activeIter],
+    queryFn: () => getStageIterDetail(slug, missionSlug, stageName, activeIter as number),
+    enabled: !!slug && !!missionSlug && !!stageName && activeIter != null,
+    staleTime: 30_000,
+  });
+
+  // §UX polish (fitness backfill): the disk-truth list endpoint
+  // (`useStageIterations` above) reads `fitness` from only
+  // `rollout/behavior.json`'s bare `fitness` key, which is empty for
+  // every stage on this deployment (active or not) — so the iteration
+  // list showed an objective-fitness badge ONLY for the live-training
+  // stage, which sources it from in-memory run events instead. The
+  // per-iteration `/detail` endpoint extracts the same value more
+  // thoroughly (reward_spec.json / a dedicated fitness json / a regex
+  // fallback off the diagnoser evidence prose) and already succeeds
+  // where the list endpoint returns null — see `_extract_objective_fitness`
+  // in backend/routes/missions.py. Backfill from there per row so
+  // previous stages' iterations show their fitness too. Shares the exact
+  // query key `iterDetail` above uses for `activeIter`, so selecting that
+  // iter never double-fetches. A real backend fix would teach
+  // `list_stage_iterations` to call `_extract_objective_fitness` instead
+  // of the narrow `behavior.get("fitness")` read — out of scope here
+  // (backend is off-limits while a mission is training).
+  const missingFitnessRows = useMemo(() => rows.filter((r) => r.fitness == null), [rows]);
+  const fitnessBackfill = useQueries({
+    queries: missingFitnessRows.map((r) => ({
+      queryKey: ["stageIterDetail", slug, missionSlug, stageName, r.iter_index],
+      queryFn: () => getStageIterDetail(slug, missionSlug, stageName, r.iter_index),
+      enabled: !!slug && !!missionSlug && !!stageName,
+      staleTime: 30_000,
+    })),
+  });
+  const rowsWithFitness = useMemo(() => {
+    if (missingFitnessRows.length === 0) return rows;
+    const byIter = new Map<number, number | undefined>();
+    missingFitnessRows.forEach((r, i) => {
+      const detail = fitnessBackfill[i]?.data as StageIterDetail | undefined;
+      byIter.set(r.iter_index, detail?.objective_fitness ?? undefined);
+    });
+    return rows.map((r) => {
+      const backfilled = byIter.get(r.iter_index);
+      return backfilled != null ? { ...r, fitness: backfilled } : r;
+    });
+  }, [rows, missingFitnessRows, fitnessBackfill]);
+
+  // §selection-report UI (E): the row-level fitness/steer/progress/
+  // fitness_source fields for the currently-selected iter, so the
+  // reasoning card can show the real values instead of "not tracked".
+  const activeRowForDetail = useMemo(
+    () => rowsWithFitness.find((r) => r.iter_index === activeIter) ?? activeRow,
+    [rowsWithFitness, activeIter, activeRow],
+  );
+
+  return (
+    <div className="rs-runs-detail">
+      <div className="rs-iter-col">
+        <div className="rs-eyebrow" style={{ marginBottom: 12 }}>Iterations</div>
+        {iters.isLoading && <p className="rs-sub" style={{ fontSize: 11 }}>Loading…</p>}
+        {iters.error && <p style={{ fontSize: 11, color: "var(--st-rose)" }}>{(iters.error as Error).message}</p>}
+        {!iters.isLoading && rows.length === 0 && <p className="rs-sub" style={{ fontSize: 11 }}>No iterations on disk yet for this stage.</p>}
+        {rowsWithFitness.map((r) => (
+          <StageIterCard
+            key={r.iter_index}
+            row={r}
+            selected={activeIter === r.iter_index}
+            kept={stage?.selected_iter_index === r.iter_index}
+            selectionSource={stage?.selection_source}
+            onSelect={() => setPicked(r.iter_index)}
+          />
+        ))}
+      </div>
+
+      {/* §UX polish: this column stacks the objective-metric card, rollout
+          player, and per-iteration reasoning panel with no internal
+          self-scrolling child (unlike LiveRunDetailPane's mid-col, whose
+          LogViewer scrolls itself) — override the shared `.rs-mid-col`
+          `overflow: hidden` so long diagnoser evidence/reward-component
+          text stays reachable instead of clipping silently. */}
+      <div className="rs-mid-col" style={{ overflowY: "auto" }}>
+        {summary && <StageContextCard run={summary} displayLabel={stage?.display_label ?? null} />}
+        {stage?.status === "superseded" && (
+          <div className="rs-banner" style={{ margin: "0 16px 8px", background: "var(--canvas-soft)" }}>
+            <Icon name="git-branch" size={15} />
+            <span className="rs-grow" style={{ fontSize: 12 }}>{supersededText(stage)}</span>
+          </div>
+        )}
+        {stage?.status === "failed" && stage.failure_reason && (
+          <p className="rs-sub" style={{ margin: "0 16px 8px", fontSize: 11.5 }}>
+            {failureReasonText(stage.failure_reason, stage.iterations_used)}
+          </p>
+        )}
+        <div className="rs-run-header">
+          <Icon name="activity" size={17} color="var(--rs-muted)" />
+          <span className="mono" style={{ fontSize: 14, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}>
+            {stageName}
+          </span>
+          {summary && <RunStatusBadge run={summary} />}
+          <span className="rs-grow" />
+          <span className="rs-eyebrow" style={{ flexShrink: 0 }}>disk-truth · not the live job</span>
+        </div>
+
+        {/* §narrate-completed-stage: the objective metric that steered
+            this stage — the thing the screen recording wants to point at. */}
+        <div style={{ padding: "0 16px 12px" }}>
+          <StageObjectiveMetricCard query={objectiveMetric} />
+        </div>
+
+        {/* §selection-report UI: the keep-decision report — which iter
+            was kept and why, the per-candidate ranking, and (when this
+            stage still has un-recovered fitness on disk) a button to
+            pull it from run logs. */}
+        <div style={{ padding: "0 16px 12px" }}>
+          <StageSelectionCard
+            query={selection}
+            missingFitnessCount={missingFitnessRows.length}
+            missionRunning={missionRunning}
+            onBackfill={handleBackfillFitness}
+            backfillPending={backfillFitness.isPending}
+            backfillNote={backfillNote}
+          />
+        </div>
+
+        {/* Rollout player for the picked iter — same disk-truth source as
+            MissionDetailDialog's StagePanel, so it survives the run_id
+            going stale. */}
+        {activeIter != null && activeRow?.has_rollout ? (
+          <div style={{ margin: "0 16px 12px", border: "1px solid var(--hairline)", borderRadius: "var(--radius-md)", overflow: "hidden" }}>
+            <div className="rs-log-bar" style={{ gap: 8 }}>
+              <Icon name="video" size={13} color="var(--rs-muted)" />
+              <span style={{ fontSize: 11.5, fontWeight: 600 }}>iter {activeIter} rollout</span>
+              <span className="rs-grow" />
+              <a
+                href={stageRolloutUrl(slug, missionSlug, stageName, activeIter)}
+                download={`${stageName}_iter_${activeIter}.mp4`}
+                className="rs-btn rs-btn-quiet rs-btn-xs"
+              >
+                <Icon name="download" size={13} />MP4
+              </a>
+            </div>
+            <video
+              key={activeIter}
+              src={stageRolloutUrl(slug, missionSlug, stageName, activeIter)}
+              style={{ width: "100%", aspectRatio: "16/9", background: "#16150f", display: "block" }}
+              controls
+              playsInline
+              preload="metadata"
+            >
+              <track kind="captions" />
+            </video>
+          </div>
+        ) : activeIter != null ? (
+          <p className="rs-sub" style={{ margin: "0 16px 12px", fontSize: 11 }}>iter {activeIter} has no rollout video.</p>
+        ) : null}
+
+        {/* §UX honesty pass: export reachable whenever the selected
+            iteration has a checkpoint — independent of has_rollout. */}
+        {activeIter != null && activeRow?.has_checkpoint && (
+          <div className="rs-flex rs-gap-8" style={{ margin: "0 16px 12px" }}>
+            <a
+              href={stageExportUrl(slug, missionSlug, stageName, activeIter)}
+              download
+              className="rs-btn rs-btn-quiet rs-btn-xs"
+              title="Download the deployment bundle: checkpoint + ONNX + TorchScript + reward/env spec + DEPLOY.md (builds server-side, may take a moment)"
+            >
+              <Icon name="package" size={13} />Export bundle
+            </a>
+            <a
+              href={stageCheckpointUrl(slug, missionSlug, stageName, activeIter)}
+              download
+              className="rs-btn rs-btn-quiet rs-btn-xs"
+              title="Download the raw checkpoint file only"
+            >
+              <Icon name="download" size={13} />raw .pt
+            </a>
+          </div>
+        )}
+
+        {/* §narrate-completed-stage: per-iteration score/reasoning/papers
+            for whichever iter is selected on the left. */}
+        {activeIter != null && (
+          <div style={{ padding: "0 16px 12px" }}>
+            <StageIterDetailCard iterIndex={activeIter} query={iterDetail} row={activeRowForDetail ?? null} />
+          </div>
+        )}
+
+        <div style={{ padding: "0 16px" }}>
+          <p className="rs-sub" style={{ fontSize: 12, lineHeight: 1.6 }}>
+            This stage isn't the one currently training, so its data is read straight off
+            disk — it stays available even after a later stage supersedes or errors.
+          </p>
+        </div>
+      </div>
+
+      <div className="rs-extra-col">
+        {missionSlug && stageName && <StageRewardsCard slug={slug} stage={`${missionSlug}/${stageName}`} />}
+      </div>
+    </div>
+  );
+}
+
+// §narrate-completed-stage: status → chip tone/label/icon for the stage
+// objective-metric card.
+const OBJECTIVE_METRIC_STATUS_META: Record<
+  StageObjectiveMetric["status"],
+  { label: string; cls: "slate" | "amber" | "emerald"; icon: string }
+> = {
+  accepted:  { label: "Objective metric ✓", cls: "emerald", icon: "check-circle" },
+  rejected:  { label: "Rejected — blind fallback", cls: "amber", icon: "alert-triangle" },
+  inherited: { label: "Inherited", cls: "slate", icon: "git-branch" },
+  none:      { label: "No objective metric", cls: "slate", icon: "minus" },
+};
+
+/** The objective metric that guided this stage — generated once at stage
+ *  launch, then used to score every iteration. This is the "here's the
+ *  metric that steered training" panel a screen recording narrates. */
+function StageObjectiveMetricCard({ query }: { query: ReturnType<typeof useQuery<StageObjectiveMetric>> }) {
+  const { data, isLoading, error } = query;
+  // §R1 remainder (plan §9): resolve clip_id -> text/tier for the
+  // "Certified against reference" row below. Only fetched when the
+  // metric actually carries references — the index call is cheap (one
+  // GET /references) but no need to fire it for the common no-reference
+  // case.
+  const refIndex = useReferenceIndex({ enabled: (data?.references.length ?? 0) > 0 });
+  if (isLoading) {
+    return <div className="rs-card rs-card-pad"><p className="rs-sub" style={{ fontSize: 11 }}>Loading objective metric…</p></div>;
+  }
+  if (error) {
+    return <div className="rs-card rs-card-pad"><p className="rs-sub" style={{ fontSize: 11, color: "var(--st-rose)" }}>{(error as Error).message}</p></div>;
+  }
+  if (!data) return null;
+  const meta = OBJECTIVE_METRIC_STATUS_META[data.status] ?? OBJECTIVE_METRIC_STATUS_META.none;
+  return (
+    <div className="rs-card rs-card-pad">
+      <div className="rs-flex rs-gap-8" style={{ alignItems: "flex-start" }}>
+        <div className="rs-card-title" style={{ fontSize: 13, flex: 1, minWidth: 0 }}>
+          <Icon name="target" size={15} />Objective metric
+        </div>
+        <span className={"rs-badge " + meta.cls}><Icon name={meta.icon} size={12} />{meta.label}</span>
+      </div>
+      {data.behavior_goal && (
+        <p style={{ margin: "8px 0 0", fontSize: 12.5, lineHeight: 1.5 }}>
+          <span className="rs-sub">Generated from: </span>{data.behavior_goal}
+        </p>
+      )}
+      <div className="rs-flex rs-wrap rs-gap-8" style={{ marginTop: 8 }}>
+        {data.calibrated != null && (
+          <span className="rs-tag" style={{ fontSize: 10.5 }}>
+            <Icon name={data.calibrated ? "check" : "minus"} size={11} />
+            {data.calibrated ? "calibrated" : "not calibrated"}
+          </span>
+        )}
+        {typeof data.n_candidates === "number" && (
+          <span className="rs-tag" style={{ fontSize: 10.5 }}>{data.n_candidates} candidate{data.n_candidates === 1 ? "" : "s"} sampled</span>
+        )}
+        {data.validator_basis && (
+          <span className="rs-tag" style={{ fontSize: 10.5 }}>
+            <Icon name="shield-check" size={11} />
+            {data.validator_basis.replaceAll("+", " + ")}
+          </span>
+        )}
+      </div>
+      {data.abstract_objective_program.length > 0 && (
+        <div style={{ marginTop: 10 }}>
+          <div className="rs-sub" style={{ fontSize: 10.5, marginBottom: 6 }}>
+            Prompt-native validator plan
+          </div>
+          <div className="rs-flex rs-wrap rs-gap-8">
+            {data.abstract_objective_program.map((phase, index) => (
+              <span className="rs-tag" style={{ fontSize: 10.5 }} key={`${phase}-${index}`}>
+                {index + 1}. {phase.replaceAll("_", " ")}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+      {data.review_summary && (
+        <p className="rs-sub" style={{ margin: "8px 0 0", fontSize: 12, lineHeight: 1.5 }}>{data.review_summary}</p>
+      )}
+      {data.references.length > 0 && (
+        <div style={{ marginTop: 10 }}>
+          <div className="rs-sub" style={{ fontSize: 10.5, marginBottom: 6 }}>Certified against reference</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            {data.references.map((reference) => (
+              <ReferenceCertificationRow
+                key={reference.clip_id}
+                reference={reference}
+                indexRow={refIndex.data?.find((r) => r.clip_id === reference.clip_id) ?? null}
+              />
+            ))}
+          </div>
+        </div>
+      )}
+      {data.metric_source && (
+        <details style={{ marginTop: 10 }}>
+          <summary style={{ cursor: "pointer", fontSize: 11.5, color: "var(--rs-muted)", userSelect: "none" }}>
+            View metric source (metric.py)
+          </summary>
+          <pre
+            className="mono"
+            style={{
+              margin: "8px 0 0", padding: 10, fontSize: 10.5, lineHeight: 1.5,
+              background: "var(--canvas-soft)", border: "1px solid var(--hairline)",
+              borderRadius: "var(--radius-sm)", overflow: "auto", maxHeight: 320,
+              whiteSpace: "pre",
+            }}
+          >
+            {data.metric_source}
+          </pre>
+        </details>
+      )}
+    </div>
+  );
+}
+
+function fmtScore(v: number | null | undefined, digits = 3): string {
+  return typeof v === "number" ? v.toFixed(digits) : "—";
+}
+
+/** §selection-report UI: status meta for the keep-decision headline —
+ *  emerald when a criterion-backed pick was kept, amber when it's a
+ *  fitness-only fallback (criterion unmet), slate when nothing was kept
+ *  at all. */
+function selectionHeadlineMeta(
+  data: StageSelectionReport,
+): { icon: string; cls: "slate" | "amber" | "emerald" } {
+  if (data.selected_iter_index == null) return { icon: "minus", cls: "slate" };
+  if (data.selection_source === "fitness_fallback") return { icon: "alert-triangle", cls: "amber" };
+  return { icon: "check-circle", cls: "emerald" };
+}
+
+/** §selection-report UI: "why this iteration was kept" — the keep-best
+ *  decision (headline + criterion text + per-candidate ranking table),
+ *  plus (when this stage still has un-recovered on-disk fitness) a
+ *  quiet button to pull it from run logs. This is the panel that turns
+ *  "iter 3 got kept" into "iter 3 got kept BECAUSE...". */
+function StageSelectionCard({
+  query, missingFitnessCount, missionRunning, onBackfill, backfillPending, backfillNote,
+}: {
+  query: ReturnType<typeof useStageSelection>;
+  missingFitnessCount: number;
+  missionRunning: boolean;
+  onBackfill: () => void;
+  backfillPending: boolean;
+  backfillNote: string | null;
+}) {
+  const { data, isLoading, error } = query;
+  if (isLoading) {
+    return <div className="rs-card rs-card-pad"><p className="rs-sub" style={{ fontSize: 11 }}>Loading keep-decision…</p></div>;
+  }
+  if (error) {
+    return <div className="rs-card rs-card-pad"><p className="rs-sub" style={{ fontSize: 11, color: "var(--st-rose)" }}>{(error as Error).message}</p></div>;
+  }
+  if (!data) return null;
+
+  const meta = selectionHeadlineMeta(data);
+  const candidates = data.candidates ?? [];
+  const noteText = data.start_state_mismatch || data.criterion_error || data.failure_detail;
+
+  return (
+    <div className="rs-card rs-card-pad">
+      <div className="rs-flex rs-gap-8" style={{ alignItems: "flex-start" }}>
+        <div className="rs-card-title" style={{ fontSize: 13, flex: 1, minWidth: 0 }}>
+          <Icon name="flag" size={15} />Why this iteration was kept
+        </div>
+        <span className={"rs-badge " + meta.cls}>
+          <Icon name={meta.icon} size={12} />
+          {data.selected_iter_index != null ? `Kept iter ${data.selected_iter_index}` : "No iteration kept"}
+        </span>
+      </div>
+      <p style={{ margin: "8px 0 0", fontSize: 12.5, lineHeight: 1.5 }} title={selectionSentence(data.selection_source)}>
+        {data.selected_iter_index != null ? (
+          <>
+            <span className="rs-sub">{selectionLabel(data.selection_source)} — </span>
+            {selectionSentence(data.selection_source)}
+          </>
+        ) : (
+          "No iteration was kept for this stage."
+        )}
+      </p>
+
+      {data.criterion && (
+        <div style={{ marginTop: 8 }}>
+          <div className="rs-eyebrow" style={{ marginBottom: 4 }}>Success criterion</div>
+          <p
+            className="mono"
+            style={{
+              margin: 0, wordBreak: "break-all", borderRadius: "var(--radius-sm)",
+              background: "var(--canvas-soft)", border: "1px solid var(--hairline)",
+              padding: "5px 8px", fontSize: 10.5, color: "var(--rs-muted)",
+            }}
+          >
+            {data.criterion}
+          </p>
+        </div>
+      )}
+
+      {noteText && (
+        <div
+          style={{
+            marginTop: 8, padding: "6px 8px", borderRadius: "var(--radius-sm)",
+            background: "var(--st-rose-bg)", color: "var(--st-rose-fg)", fontSize: 11.5, lineHeight: 1.5,
+          }}
+        >
+          {data.start_state_mismatch && <p style={{ margin: 0 }}>Start-state mismatch: {data.start_state_mismatch}</p>}
+          {data.criterion_error && (
+            <p style={{ margin: data.start_state_mismatch ? "4px 0 0" : 0 }}>Criterion error: {data.criterion_error}</p>
+          )}
+          {data.failure_detail && (
+            <p style={{ margin: (data.start_state_mismatch || data.criterion_error) ? "4px 0 0" : 0 }}>
+              {data.failure_reason ? `${data.failure_reason}: ` : ""}{data.failure_detail}
+            </p>
+          )}
+        </div>
+      )}
+
+      {candidates.length > 0 && (
+        <details style={{ marginTop: 10 }} open={candidates.length <= 6}>
+          <summary style={{ cursor: "pointer", fontSize: 11.5, color: "var(--rs-muted)", userSelect: "none" }}>
+            Candidates ({candidates.length})
+          </summary>
+          <div style={{ overflowX: "auto", marginTop: 8 }}>
+            <table className="mono" style={{ width: "100%", borderCollapse: "collapse", fontSize: 10.5 }}>
+              <thead>
+                <tr style={{ textAlign: "left", color: "var(--rs-muted)" }}>
+                  <th style={{ padding: "3px 6px" }}>iter</th>
+                  <th style={{ padding: "3px 6px" }}>criterion</th>
+                  <th style={{ padding: "3px 6px", textAlign: "right" }}>fit</th>
+                  <th style={{ padding: "3px 6px", textAlign: "right" }}>steer</th>
+                  <th style={{ padding: "3px 6px", textAlign: "right" }}>prog</th>
+                  <th style={{ padding: "3px 6px", textAlign: "right" }}>r</th>
+                  <th style={{ padding: "3px 6px" }} />
+                </tr>
+              </thead>
+              <tbody>
+                {candidates.map((c: StageSelectionCandidate) => {
+                  const gated =
+                    c.fitness != null && c.steer_fitness != null &&
+                    Math.abs(c.fitness - c.steer_fitness) > 1e-6;
+                  return (
+                    <tr
+                      key={c.iter_index}
+                      style={{ background: c.selected ? "var(--st-emerald-bg)" : undefined }}
+                    >
+                      <td style={{ padding: "3px 6px", fontWeight: c.selected ? 600 : 400 }}>{c.iter_index}</td>
+                      <td
+                        style={{ padding: "3px 6px" }}
+                        title={
+                          c.criterion_pass == null
+                            ? "not evaluated / unknown"
+                            : (c.criterion_error ?? undefined)
+                        }
+                      >
+                        {c.criterion_pass == null ? "—" : c.criterion_pass ? "✓" : "✗"}
+                        {c.gate_mismatched && (
+                          <span title="start-state gate mismatch" style={{ marginLeft: 4, color: "var(--st-amber-fg)" }}>⚠</span>
+                        )}
+                      </td>
+                      <td style={{ padding: "3px 6px", textAlign: "right" }} title={gated ? "realism-gated" : undefined}>{fmtScore(c.fitness)}</td>
+                      <td
+                        style={{ padding: "3px 6px", textAlign: "right", color: gated ? "var(--st-amber-fg)" : undefined }}
+                        title={gated ? "realism-gated" : undefined}
+                      >
+                        {fmtScore(c.steer_fitness)}
+                      </td>
+                      <td style={{ padding: "3px 6px", textAlign: "right" }}>{fmtScore(c.progress)}</td>
+                      <td style={{ padding: "3px 6px", textAlign: "right" }}>{fmtScore(c.primary_metric, 2)}</td>
+                      <td style={{ padding: "3px 6px" }}>
+                        {c.selected && <span className="rs-badge emerald" style={{ fontSize: 8 }}><Icon name="check" size={9} />kept</span>}
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </details>
+      )}
+
+      {data.synthesized && (
+        <p className="rs-sub" style={{ margin: "8px 0 0", fontSize: 10.5, fontStyle: "italic" }}>
+          reconstructed from disk — this stage ran before selection recording existed; criterion column unknown
+        </p>
+      )}
+
+      {missingFitnessCount > 0 && (
+        <div style={{ marginTop: 10 }}>
+          {missionRunning ? (
+            <p className="rs-sub" style={{ margin: 0, fontSize: 10.5 }}>a run is live — try after it finishes</p>
+          ) : (
+            <button
+              type="button"
+              className="rs-btn rs-btn-quiet rs-btn-xs"
+              disabled={backfillPending}
+              onClick={onBackfill}
+            >
+              <Icon name={backfillPending ? "loader" : "refresh-cw"} size={13} className={backfillPending ? "rs-spin" : undefined} />
+              {backfillPending ? "Recovering…" : "Recover fitness from run logs"}
+            </button>
+          )}
+          {backfillNote && <p className="rs-sub" style={{ margin: "6px 0 0", fontSize: 10.5 }}>{backfillNote}</p>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// §R1 remainder (plan §9): the three §5 per-reference gates, short labels
+// for the pass/fail row. Order matches _validate_references's write order
+// (nondegeneracy, monotonicity, negatives).
+const REFERENCE_GATE_LABELS: Record<string, string> = {
+  reference_nondegeneracy: "nondegenerate",
+  reference_monotonicity: "monotonic",
+  reference_negatives: "rejects negatives",
+};
+
+/** One certified-reference row: clip text/id + tier badge (resolved from
+ *  the reference index when available, else bare clip_id) + a tiny
+ *  check/cross per gate. This is the "certified against reference" line
+ *  from plan §9 — it reuses the SAME gate keys `_validate_references`
+ *  writes, so it never drifts from what actually gated the metric. */
+function ReferenceCertificationRow({
+  reference, indexRow,
+}: {
+  reference: StageMetricReference;
+  indexRow: { text: string; tier: string } | null | undefined;
+}) {
+  const gateEntries = Object.entries(reference.gates);
+  return (
+    <div
+      style={{
+        display: "flex", flexWrap: "wrap", alignItems: "center", gap: 8,
+        padding: "6px 8px", fontSize: 11.5,
+        border: "1px solid var(--hairline)", borderRadius: "var(--radius-sm)",
+        background: "var(--canvas-soft)",
+      }}
+    >
+      <Icon name="video" size={12} color="var(--rs-muted)" />
+      <span style={{ fontWeight: 500, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", maxWidth: 220 }}>
+        {indexRow?.text ?? reference.clip_id}
+      </span>
+      <span className="rs-badge slate" style={{ fontSize: 9 }}>
+        {indexRow?.tier ? `tier ${indexRow.tier}` : reference.clip_id}
+      </span>
+      {gateEntries.length > 0 && (
+        <span className="rs-flex rs-gap-8" style={{ marginLeft: "auto" }}>
+          {gateEntries.map(([gate, passed]) => (
+            <span
+              key={gate}
+              title={`${REFERENCE_GATE_LABELS[gate] ?? gate}: ${passed ? "passed" : "failed"}`}
+              style={{ display: "inline-flex", alignItems: "center", gap: 3, fontSize: 10, color: passed ? "var(--st-emerald-fg)" : "var(--st-rose)" }}
+            >
+              <Icon name={passed ? "check" : "x"} size={11} />
+              {REFERENCE_GATE_LABELS[gate] ?? gate}
+            </span>
+          ))}
+        </span>
+      )}
+    </div>
+  );
+}
+
+/** Merges reward_references + literature_context into one paper-citation
+ *  list, deduping by arxiv_id/citation so the same paper isn't shown twice
+ *  when both fields happen to carry it. */
+function mergePaperRefs(a: StageIterPaperRef[], b: StageIterPaperRef[]): StageIterPaperRef[] {
+  const seen = new Set<string>();
+  const out: StageIterPaperRef[] = [];
+  for (const ref of [...a, ...b]) {
+    const key = (ref.arxiv_id ?? "") + "|" + (ref.citation ?? ref.description ?? "");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(ref);
+  }
+  return out;
+}
+
+/** Per-iteration reasoning: objective fitness / mean return, the reward's
+ *  own description, the diagnoser's evidence prose, failure-mode chips,
+ *  cited papers, and reward-component values. This is the "narrate the
+ *  loop's thinking" panel — every field is best-effort/nullable since
+ *  older iterations won't have all of them. */
+function StageIterDetailCard({
+  iterIndex, query, row,
+}: {
+  iterIndex: number;
+  query: ReturnType<typeof useQuery<StageIterDetail>>;
+  /** §selection-report UI (E): the matching disk-truth iteration row —
+   *  carries fitness/steer_fitness/progress/fitness_source, which the
+   *  /detail endpoint's `objective_fitness` doesn't always have. The
+   *  /detail value still wins when present (it's the more thoroughly
+   *  extracted one); this only fills gaps. */
+  row?: StageIteration | null;
+}) {
+  const { data, isLoading, error } = query;
+  if (isLoading) {
+    return <div className="rs-card rs-card-pad"><p className="rs-sub" style={{ fontSize: 11 }}>Loading iteration detail…</p></div>;
+  }
+  if (error) {
+    return <div className="rs-card rs-card-pad"><p className="rs-sub" style={{ fontSize: 11, color: "var(--st-rose)" }}>{(error as Error).message}</p></div>;
+  }
+  if (!data) return null;
+
+  const failureModes = data.failure_modes.filter((f) => f && f !== "none");
+  const papers = mergePaperRefs(data.reward_references ?? [], data.literature_context ?? []);
+  // §selection-report UI (E): /detail's own objective_fitness takes
+  // precedence (more thorough extraction); fall back to the row's
+  // disk-truth fitness (possibly log-backfilled) when /detail has none.
+  const objectiveFitness = data.objective_fitness ?? row?.fitness ?? null;
+  const steerFitness = row?.steer_fitness ?? null;
+  const steerDiffers =
+    steerFitness != null && objectiveFitness != null && Math.abs(steerFitness - objectiveFitness) > 1e-6;
+  const denseProgress = row?.progress ?? null;
+  const recoveredFromLogs = row?.fitness_source === "log_backfill";
+  const hasScores = objectiveFitness != null || data.primary_metric != null || data.reward_version;
+  const componentEntries = data.components ? Object.entries(data.components) : [];
+  const maxComponentAbs = componentEntries.length
+    ? Math.max(...componentEntries.map(([, v]) => Math.abs(v)), 1e-9)
+    : 1;
+
+  return (
+    <div className="rs-card rs-card-pad">
+      <div className="rs-card-title" style={{ fontSize: 13, marginBottom: 10 }}>
+        <Icon name="circle-dot" size={15} />Iteration {iterIndex} reasoning
+      </div>
+
+      {hasScores && (
+        <div className="rs-flex rs-wrap rs-gap-16" style={{ marginBottom: 10 }}>
+          {objectiveFitness != null ? (
+            <span title="objective fitness — the loop's steering score">
+              <span className="rs-sub" style={{ fontSize: 11 }}>objective fitness</span><br />
+              <span className="rs-num" style={{ fontSize: 17, fontWeight: 600, color: "#b9aef5" }}>
+                {objectiveFitness.toFixed(3)}
+              </span>
+              {steerDiffers && (
+                <span className="rs-sub" style={{ fontSize: 10.5, marginLeft: 5 }} title="realism-gated — differs from the plain objective fitness above">
+                  steer {steerFitness!.toFixed(3)}
+                </span>
+              )}
+              {denseProgress != null && (
+                <span className="rs-sub" style={{ display: "block", fontSize: 10.5 }} title="dense per-iter progress signal — not the same scale as fitness">
+                  dense progress {denseProgress.toFixed(3)}
+                </span>
+              )}
+              {recoveredFromLogs && (
+                <span className="rs-sub" style={{ display: "block", fontSize: 10, fontStyle: "italic" }}>
+                  (recovered from run logs)
+                </span>
+              )}
+            </span>
+          ) : (
+            <span>
+              <span className="rs-sub" style={{ fontSize: 11 }}>objective fitness</span><br />
+              <span className="rs-sub" style={{ fontSize: 12 }}>not tracked this iter — see notes below</span>
+            </span>
+          )}
+          {data.primary_metric != null && (
+            <span title="mean return over the rollout">
+              <span className="rs-sub" style={{ fontSize: 11 }}>mean return</span><br />
+              <span className="rs-num" style={{ fontSize: 15 }}>{data.primary_metric.toFixed(2)}</span>
+            </span>
+          )}
+          {data.reward_version && (
+            <span>
+              <span className="rs-sub" style={{ fontSize: 11 }}>reward</span><br />
+              <span className="rs-num" style={{ fontSize: 15 }}>{data.reward_version}</span>
+            </span>
+          )}
+          {data.confidence != null && (
+            <span title="diagnoser's confidence in this analysis">
+              <span className="rs-sub" style={{ fontSize: 11 }}>confidence</span><br />
+              <span className="rs-num" style={{ fontSize: 15 }}>{(data.confidence * 100).toFixed(0)}%</span>
+            </span>
+          )}
+        </div>
+      )}
+
+      {data.reward_description && (
+        <div style={{ marginBottom: 10 }}>
+          <div className="rs-eyebrow" style={{ marginBottom: 4 }}>Reward reasoning</div>
+          <p style={{ margin: 0, fontSize: 12.5, lineHeight: 1.55 }}>{sanitizeConsoleText(data.reward_description)}</p>
+        </div>
+      )}
+
+      {data.evidence && (
+        <div style={{ marginBottom: 10 }}>
+          <div className="rs-eyebrow" style={{ marginBottom: 4 }}>Diagnosis</div>
+          <p style={{ margin: 0, fontSize: 12.5, lineHeight: 1.55, whiteSpace: "pre-wrap" }}>{sanitizeConsoleText(data.evidence)}</p>
+        </div>
+      )}
+
+      {failureModes.length > 0 && (
+        <div style={{ marginBottom: 10 }}>
+          <div className="rs-eyebrow" style={{ marginBottom: 4 }}>Failure modes</div>
+          <div className="rs-flex rs-wrap rs-gap-6">
+            {failureModes.map((f) => (
+              <span key={f} className="rs-tag mono" style={{ fontSize: 10 }}>{f}</span>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {papers.length > 0 && (
+        <div style={{ marginBottom: componentEntries.length > 0 ? 10 : 0 }}>
+          <div className="rs-eyebrow" style={{ marginBottom: 4 }}>Cited papers</div>
+          <div className="rs-vgap-8">
+            {papers.map((p, i) => (
+              <div key={i} style={{ fontSize: 12, lineHeight: 1.45 }}>
+                {p.arxiv_id && (
+                  <a
+                    href={`https://arxiv.org/abs/${p.arxiv_id}`}
+                    target="_blank"
+                    rel="noreferrer noopener"
+                    className="mono"
+                    style={{ color: "var(--rs-primary)", marginRight: 6 }}
+                  >
+                    {p.arxiv_id}
+                  </a>
+                )}
+                <span>{p.citation ?? p.description ?? "(untitled reference)"}</span>
+                {p.grounded === false && (
+                  <span
+                    className="rs-badge amber"
+                    style={{ fontSize: 9.5, marginLeft: 6 }}
+                    title="cited by the model but not retrieved from the knowledge graph this iteration"
+                  >
+                    model-recalled
+                  </span>
+                )}
+                {p.citation && p.description && p.description !== p.citation && (
+                  <span className="rs-sub" style={{ display: "block", fontSize: 11 }}>{p.description}</span>
+                )}
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {componentEntries.length > 0 && (
+        <div>
+          <div className="rs-eyebrow" style={{ marginBottom: 4 }}>Reward components (mean over rollout)</div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+            {componentEntries.map(([name, value]) => (
+              <div key={name} className="rs-flex rs-gap-8" style={{ alignItems: "center", fontSize: 11.5 }}>
+                <span className="mono rs-sub" style={{ width: 140, flexShrink: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={name}>{name}</span>
+                <span style={{ flex: 1, height: 6, background: "var(--canvas-soft)", borderRadius: 3, overflow: "hidden" }}>
+                  <span
+                    style={{
+                      display: "block", height: "100%",
+                      width: `${Math.min(100, (Math.abs(value) / maxComponentAbs) * 100)}%`,
+                      background: value < 0 ? "var(--st-rose)" : "var(--st-emerald)",
+                      marginLeft: value < 0 ? "auto" : 0,
+                    }}
+                  />
+                </span>
+                <span className="rs-num" style={{ width: 56, textAlign: "right", flexShrink: 0 }}>{value.toFixed(3)}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {!data.reward_description && !data.evidence && papers.length === 0 && componentEntries.length === 0 && !hasScores && (
+        <p className="rs-sub" style={{ fontSize: 11.5 }}>No reasoning recorded for this iteration.</p>
+      )}
+    </div>
+  );
+}
+
+// §increment 3: disk-truth PROJECT-level view — the detail pane for the
+// synthetic "disk:project" row. Mirrors StageDetailPane, but sources
+// iterations + rollout from the project-scoped endpoints
+// (useProjectIterations / projectIterRolloutUrl) instead of a
+// mission-stage's, since plain sculpt runs write straight into
+// <project_dir>/runs/iter_*/.
+function ProjectDiskDetailPane({
+  slug, summary,
+}: { slug: string; summary: RunSummary | null }) {
+  const iters = useProjectIterations(slug);
+  const rows = iters.data ?? [];
+
+  const [picked, setPicked] = useState<number | null>(null);
+  const defaultIter = useMemo(() => {
+    if (rows.length === 0) return null;
+    const newestWithRollout = [...rows].reverse().find((r) => r.has_rollout);
+    if (newestWithRollout) return newestWithRollout.iter_index;
+    return rows[rows.length - 1].iter_index;
+  }, [rows]);
+  const activeIter = picked ?? defaultIter;
+  const activeRow = rows.find((r) => r.iter_index === activeIter) ?? null;
+
+  return (
+    <div className="rs-runs-detail">
+      <div className="rs-iter-col">
+        <div className="rs-eyebrow" style={{ marginBottom: 12 }}>Iterations</div>
+        {iters.isLoading && <p className="rs-sub" style={{ fontSize: 11 }}>Loading…</p>}
+        {iters.error && <p style={{ fontSize: 11, color: "var(--st-rose)" }}>{(iters.error as Error).message}</p>}
+        {!iters.isLoading && rows.length === 0 && <p className="rs-sub" style={{ fontSize: 11 }}>No iterations on disk yet for this project.</p>}
+        {rows.map((r) => (
+          <StageIterCard
+            key={r.iter_index}
+            row={r}
+            selected={activeIter === r.iter_index}
+            kept={false}
+            onSelect={() => setPicked(r.iter_index)}
+          />
+        ))}
+      </div>
+
+      {/* Same clipped-overflow defect as StageDetailPane's mid-col — no
+          self-scrolling child here either, so it needs its own scroll. */}
+      <div className="rs-mid-col" style={{ overflowY: "auto" }}>
+        <div className="rs-run-header">
+          <Icon name="activity" size={17} color="var(--rs-muted)" />
+          <span className="mono" style={{ fontSize: 14, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}>
+            project runs
+          </span>
+          {summary && <RunStatusBadge run={summary} />}
+          <span className="rs-grow" />
+          <span className="rs-eyebrow" style={{ flexShrink: 0 }}>disk-truth · recovered after restart</span>
+        </div>
+
+        {activeIter != null && activeRow?.has_rollout ? (
+          <div style={{ margin: "0 16px 12px", border: "1px solid var(--hairline)", borderRadius: "var(--radius-md)", overflow: "hidden" }}>
+            <div className="rs-log-bar" style={{ gap: 8 }}>
+              <Icon name="video" size={13} color="var(--rs-muted)" />
+              <span style={{ fontSize: 11.5, fontWeight: 600 }}>iter {activeIter} rollout</span>
+              <span className="rs-grow" />
+              <a
+                href={projectIterRolloutUrl(slug, activeIter)}
+                download={`${slug}_iter_${activeIter}.mp4`}
+                className="rs-btn rs-btn-quiet rs-btn-xs"
+              >
+                <Icon name="download" size={13} />MP4
+              </a>
+            </div>
+            <video
+              key={activeIter}
+              src={projectIterRolloutUrl(slug, activeIter)}
+              style={{ width: "100%", aspectRatio: "16/9", background: "#16150f", display: "block" }}
+              controls
+              playsInline
+              preload="metadata"
+            >
+              <track kind="captions" />
+            </video>
+          </div>
+        ) : activeIter != null ? (
+          <p className="rs-sub" style={{ margin: "0 16px 12px", fontSize: 11 }}>iter {activeIter} has no rollout video.</p>
+        ) : null}
+
+        <div style={{ padding: "0 16px" }}>
+          <p className="rs-sub" style={{ fontSize: 12, lineHeight: 1.6 }}>
+            The backend restarted since these runs ended, so their live logs are
+            gone — this view reads the trained iterations straight off disk.
+            Iterations accumulate here across every single run of the project.
+          </p>
+        </div>
+      </div>
+
+      <div className="rs-extra-col">
+        {activeIter != null && activeRow?.has_checkpoint && (
+          <div className="rs-card rs-card-pad">
+            <div className="rs-card-title" style={{ fontSize: 13, marginBottom: 8 }}>
+              <Icon name="package" size={15} />Deploy this policy
+            </div>
+            <p className="rs-sub" style={{ margin: "0 0 10px", fontSize: 12 }}>
+              Download iter {activeIter}'s checkpoint bundled with its
+              reward, env spec, and an ONNX/TorchScript policy network.
+            </p>
+            <a
+              href={policyExportUrl(slug, activeIter)}
+              download
+              className="rs-btn rs-btn-primary rs-btn-sm"
+            >
+              <Icon name="download" size={14} />Export policy bundle
+            </a>
+          </div>
+        )}
+        <StageRewardsCard slug={slug} stage={null} />
+      </div>
+    </div>
+  );
+}
+
+/** §D24 (F4): render the top few `fitness_components` entries as a plain
+ *  "name: value" tooltip string for the contradiction badge — no charts,
+ *  just enough to localize which channel zeroed the fitness at a glance. */
+function StageIterCard({
+  row, selected, kept, selectionSource, onSelect,
+}: {
+  row: StageIteration;
+  selected: boolean;
+  kept: boolean;
+  /** §UX honesty pass: `stage.selection_source` — carries WHY this
+   *  iteration was kept, so the badge isn't a bare unexplained "kept". */
+  selectionSource?: string | null;
+  onSelect: () => void;
+}) {
+  const m = formatIterMetrics(row);
+  return (
+    <button
+      className={"rs-itercard" + (selected ? " on" : "")}
+      style={{ width: "100%", textAlign: "left", cursor: "pointer" }}
+      onClick={onSelect}
+    >
+      <div className="rs-itercard-top">
+        <span className="it">iter {row.iter_index}</span>
+        <span style={{ display: "flex", alignItems: "baseline", gap: 6 }}>
+          {m.fitnessText && (
+            <span className="rs-num" style={{ fontSize: 15, fontWeight: 600, color: "#b9aef5" }}>{m.fitnessText}</span>
+          )}
+          {m.rewardText && (
+            <span className="rs-num" style={{ fontSize: m.fitnessText ? 11 : 13, color: m.fitnessText ? "var(--rs-muted)" : undefined }} title={m.rewardTitle}>{m.rewardText}</span>
+          )}
+        </span>
+      </div>
+      <span className="rs-flex rs-gap-6" style={{ marginTop: 4 }}>
+        {row.has_rollout && <Icon name="video" size={11} color="var(--rs-muted)" />}
+        {row.reward_version && <span className="rs-sub" style={{ fontSize: 10.5 }}>reward {row.reward_version}</span>}
+        {kept && (
+          <span className="rs-badge emerald" style={{ fontSize: 8.5 }} title={selectionSentence(selectionSource)}>
+            <Icon name="check" size={9} />kept · {selectionLabel(selectionSource)}
+          </span>
+        )}
+        {row.fitness_contradiction && (
+          <span
+            className="rs-badge rose"
+            style={{ fontSize: 8.5 }}
+            title={formatContradictionTooltip(row.fitness_components)}
+          >
+            <Icon name="alert-triangle" size={9} />criterion✓ fitness 0
+          </span>
+        )}
+        {(() => {
+          const nat = naturalnessChipText(row.naturalness_flag, row.naturalness_hard_reject);
+          if (!nat) return null;
+          return (
+            <span
+              className={"rs-badge " + (row.naturalness_hard_reject ? "rose" : "amber")}
+              style={{ fontSize: 8.5 }}
+              title={nat.title}
+            >
+              <Icon name="alert-triangle" size={9} />{nat.label}
+            </span>
+          );
+        })()}
+      </span>
+    </button>
+  );
+}
+
+// The original live-job detail pane (unchanged behavior) — used for
+// single sculpt runs and for whichever mission stage is the one
+// ACTIVELY training right now, so "watch it train live" keeps working.
+function LiveRunDetailPane({
+  slug, runId, runs, mission,
+}: { slug: string; runId: string; runs: RunSummary[]; mission?: MissionDetail | null }) {
   const run = useRun(slug, runId);
   const events = useRunEvents(slug, runId);
   const kill = useKillRun(slug);
@@ -358,8 +1665,30 @@ function RunDetailPane({ slug, runId, runs }: { slug: string; runId: string; run
   const missionSlug = summary?.mission_slug ?? run.data?.mission_slug ?? null;
   const stageName = summary?.stage_name ?? run.data?.stage_name ?? null;
   const stageRewardsScope = isStageRun && missionSlug && stageName ? `${missionSlug}/${stageName}` : null;
+  const liveStageLabel = mission?.stages.find((s) => s.name === stageName)?.display_label ?? null;
 
   const mergedIters = useMergedIterations(iters, events.events);
+
+  // Exportable trained checkpoints (disk-backed). Stage runs export from
+  // their own runs tree; plain sculpt runs share the project tree.
+  const policies = usePolicies(slug, isStageRun ? { runId } : undefined);
+  const exportRunId = isStageRun ? runId : undefined;
+  const exportableIters = useMemo(
+    () => new Set((policies.data ?? []).map((p) => p.iter_index)),
+    [policies.data],
+  );
+  // Latest exportable iter OF THIS RUN — iter dirs accumulate across runs
+  // in the project tree, so intersect with the run's own iterations.
+  const latestExportable = useMemo(() => {
+    const runIters = new Set(mergedIters.map((it) => it.iter_index));
+    let best: number | null = null;
+    for (const p of policies.data ?? []) {
+      if (runIters.has(p.iter_index) && (best === null || p.iter_index > best)) {
+        best = p.iter_index;
+      }
+    }
+    return best;
+  }, [policies.data, mergedIters]);
   const isPending = run.data?.status === "queued" && mergedIters.length === 0;
 
   // §Ship 35: fitness is the PRIMARY tracked metric when an objective
@@ -384,7 +1713,7 @@ function RunDetailPane({ slug, runId, runs }: { slug: string; runId: string; run
       )}
 
       <div className="rs-mid-col">
-        {isStageRun && summary && <StageContextCard run={summary} />}
+        {isStageRun && summary && <StageContextCard run={summary} displayLabel={liveStageLabel} />}
         <RunHeader
           run={run.data}
           isActive={isActive}
@@ -441,7 +1770,12 @@ function RunDetailPane({ slug, runId, runs }: { slug: string; runId: string; run
         )}
         {run.data?.error && (
           <div style={{ padding: "0 16px" }}>
-            <RunErrorCard slug={slug} error={run.data.error} classification={run.data.error_classification ?? null} />
+            <RunErrorCard
+              slug={slug}
+              error={run.data.error}
+              classification={run.data.error_classification ?? null}
+              iterationsCompleted={run.data.iterations_completed}
+            />
           </div>
         )}
         <LogViewer events={events.events} />
@@ -468,20 +1802,50 @@ function RunDetailPane({ slug, runId, runs }: { slug: string; runId: string; run
           )}
         </div>
         {stageRewardsScope && <StageRewardsCard slug={slug} stage={stageRewardsScope} />}
+        {!isActive && latestExportable !== null && (
+          <div className="rs-card rs-card-pad">
+            <div className="rs-card-title" style={{ fontSize: 13, marginBottom: 8 }}>
+              <Icon name="package" size={15} />Deploy this policy
+            </div>
+            <p className="rs-sub" style={{ margin: "0 0 10px", fontSize: 12 }}>
+              Download iter {latestExportable}'s checkpoint bundled with its
+              reward, env spec, and an ONNX/TorchScript policy network.
+            </p>
+            <a
+              href={policyExportUrl(slug, latestExportable, exportRunId)}
+              download
+              className="rs-btn rs-btn-primary rs-btn-sm"
+            >
+              <Icon name="download" size={14} />Export policy bundle
+            </a>
+          </div>
+        )}
         {isActive && <RunGpuCard />}
-        {selectedIter !== null && <IterationDetailCard iter={mergedIters.find((it) => it.iter_index === selectedIter) ?? null} />}
+        {selectedIter !== null && (
+          <IterationDetailCard
+            iter={mergedIters.find((it) => it.iter_index === selectedIter) ?? null}
+            exportHref={
+              selectedIter !== null && exportableIters.has(selectedIter)
+                ? policyExportUrl(slug, selectedIter, exportRunId)
+                : null
+            }
+          />
+        )}
       </div>
     </div>
   );
 }
 
-function StageContextCard({ run }: { run: RunSummary }) {
+function StageContextCard({ run, displayLabel = null }: { run: RunSummary; displayLabel?: string | null }) {
+  // §Increment 4: prefer the server's display_label; fall back to
+  // stage_index+1 while the mission-detail lookup is loading (or absent).
+  const numberLabel = displayLabel ?? (typeof run.stage_index === "number" ? String(run.stage_index + 1) : null);
   return (
     <div className="rs-card rs-card-pad" style={{ marginBottom: 0 }}>
       <div className="rs-flex rs-wrap rs-gap-8" style={{ fontSize: 12 }}>
         <Icon name="sparkles" size={14} color="var(--rs-primary)" />
         <span style={{ fontWeight: 500 }}>
-          {typeof run.stage_index === "number" ? `Stage ${run.stage_index + 1}: ` : "Stage: "}
+          {numberLabel ? `Stage ${numberLabel}: ` : "Stage: "}
           <code className="mono">{run.stage_name ?? "(unnamed)"}</code>
         </span>
         <span style={{ color: "var(--rs-muted)" }}>mission <code className="mono">{run.mission_slug}</code></span>
@@ -491,11 +1855,14 @@ function StageContextCard({ run }: { run: RunSummary }) {
   );
 }
 
-function StageRewardsCard({ slug, stage }: { slug: string; stage: string }) {
+// `stage` null ⇒ the project-global reward versions (used by the
+// disk-truth project pane); a `<missionSlug>/<stageName>` string keeps
+// the original per-stage behavior.
+function StageRewardsCard({ slug, stage }: { slug: string; stage: string | null }) {
   const versions = useRewards(slug, stage);
   return (
     <div className="rs-card">
-      <div className="rs-card-head"><div className="rs-card-title" style={{ fontSize: 13 }}><Icon name="file-code" size={15} />Stage rewards</div></div>
+      <div className="rs-card-head"><div className="rs-card-title" style={{ fontSize: 13 }}><Icon name="file-code" size={15} />{stage ? "Stage rewards" : "Rewards"}</div></div>
       <div className="rs-verlist">
         {versions.isLoading && <p className="rs-sub" style={{ padding: "10px 14px", fontSize: 11 }}>Loading…</p>}
         {versions.error && <p style={{ padding: "10px 14px", fontSize: 11, color: "var(--st-rose)" }}>{(versions.error as Error).message}</p>}
@@ -548,7 +1915,7 @@ function RunHeader({ run, isActive, wsConnected, mode, onToggleMode, togglePendi
       <span className="mono" style={{ fontSize: 14, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}>
         {run ? run.run_id.replace(/^job_/, "") : "…"}
       </span>
-      {run && <Badge status={run.status} />}
+      {run && <RunStatusBadge run={run} />}
       {run && <span className="rs-sub" style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", minWidth: 0 }}>{run.behavior_goal}</span>}
       <span className="rs-grow" />
       <span className="rs-flex rs-gap-8 rs-eyebrow" style={{ flexShrink: 0 }}>
@@ -654,12 +2021,20 @@ function IterationTimeline({ iters, selected, onSelect }: { iters: IterEventSumm
                 <span className="rs-num" title="objective fitness (spec_score, 0-1) — primary metric" style={{ fontSize: 15, fontWeight: 600, color: "#b9aef5" }}>
                   fit {it.fitness.toFixed(2)}{typeof it.best_fitness === "number" && it.best_fitness > it.fitness + 1e-9 ? ` (best ${it.best_fitness.toFixed(2)})` : ""}
                 </span>
+                {/* §Convergence loop 1: dense sub-success progress — the
+                    ranking signal below the completion gate. Shown only
+                    when the metric emits progress_score. */}
+                {typeof it.progress === "number" && (
+                  <span className="rs-num" title="dense progress (metric progress_score, 0-1) — ranks iterations below the success gate" style={{ fontSize: 11, color: "#8ec8a6" }}>prog {it.progress.toFixed(3)}</span>
+                )}
                 {it.primary_metric !== null && (
                   <span className="rs-num" title="reward metric (secondary)" style={{ fontSize: 11, color: "var(--rs-muted)" }}>r {it.primary_metric.toFixed(1)}</span>
                 )}
               </span>
             ) : (
-              it.primary_metric !== null && <span className="rs-num" style={{ fontSize: 13 }}>{it.primary_metric.toFixed(1)}</span>
+              it.primary_metric !== null && (
+                <span className="rs-num" title="reward metric — no objective fitness tracked this iter" style={{ fontSize: 13 }}>r {it.primary_metric.toFixed(1)}</span>
+              )
             )}
           </div>
           {it.status === "running" && typeof it.rl_total === "number" && it.rl_total > 0 && (
@@ -672,11 +2047,23 @@ function IterationTimeline({ iters, selected, onSelect }: { iters: IterEventSumm
             </div>
           )}
           {it.failure_modes.length > 0 && !(it.failure_modes.length === 1 && it.failure_modes[0] === "none") && (
-            <span className="ver" style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", display: "block" }}>{it.failure_modes.join(", ")}</span>
+            <span className="ver" style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", display: "block" }} title={it.failure_modes.join(", ")}>{it.failure_modes.join(", ")}</span>
           )}
           {it.realism_audit && typeof it.realism_audit.verdict === "string" && it.realism_audit.verdict !== "ok" && it.realism_audit.verdict !== "unknown" && (
             <span className="rs-tag" style={{ marginTop: 4, fontSize: 10, background: it.realism_audit.verdict === "severe" ? "var(--st-rose-bg)" : "var(--st-amber-bg)", color: it.realism_audit.verdict === "severe" ? "var(--st-rose-fg)" : "var(--st-amber-fg)" }}>
               physics: {it.realism_audit.verdict}
+            </span>
+          )}
+          {it.env_spec_update && (it.env_spec_update.applied.length > 0 || it.env_spec_update.rejected.length > 0) && (
+            <span
+              className="rs-tag mono"
+              style={{ marginTop: 4, fontSize: 10, background: "var(--st-blue-bg)", color: "var(--st-blue-fg)", display: "inline-block" }}
+              title={[
+                ...it.env_spec_update.applied.map((a) => `applied: ${a}`),
+                ...it.env_spec_update.rejected.map((r) => `rejected ${r.parameter}: ${r.reason}`),
+              ].join("; ") + " | training-only env curriculum; takes effect next iteration"}
+            >
+              env {it.env_spec_update.new_version ? `→ ${it.env_spec_update.new_version}` : "edits rejected"}
             </span>
           )}
           {it.physics_edit_suggestion && it.physics_edit_suggestion.prompt && (() => {
@@ -691,7 +2078,7 @@ function IterationTimeline({ iters, selected, onSelect }: { iters: IterEventSumm
                   try { sessionStorage.setItem("pendingPhysicsPrompt", it.physics_edit_suggestion!.prompt); }
                   catch { void navigator.clipboard?.writeText(it.physics_edit_suggestion!.prompt); }
                   const match = window.location.pathname.match(/\/projects\/([^/]+)/);
-                  if (match) window.location.assign(`/projects/${match[1]}`);
+                  if (match) window.location.assign(`/projects/${match[1]}?tab=physics`);
                 }}
                 className="rs-tag"
                 style={{ marginTop: 4, fontSize: 10, cursor: disabled ? "default" : "pointer", background: state === "applied" ? "var(--st-emerald-bg)" : "var(--st-blue-bg)", color: state === "applied" ? "var(--st-emerald-fg)" : "var(--st-blue-fg)" }}
@@ -723,9 +2110,43 @@ function IterationTimeline({ iters, selected, onSelect }: { iters: IterEventSumm
   );
 }
 
-function RunErrorCard({ slug, error, classification }: { slug: string; error: string; classification: ErrorClassification | null }) {
+function RunErrorCard({
+  slug, error, classification, iterationsCompleted,
+}: { slug: string; error: string; classification: ErrorClassification | null; iterationsCompleted?: number }) {
   const regen = useRegenerateRewardTemplate(slug);
   const isContractMismatch = classification?.kind === "reward_contract_mismatch" || classification?.action?.kind === "regenerate_reward_template";
+
+  // §Ship: these two error strings mark benign, designed-for outcomes, not
+  // crashes — render them as friendly non-alarming cards instead of the
+  // raw-string red error banner.
+  if (error === CRITERION_NOT_MET_ERROR) {
+    return (
+      <div className="rs-banner warn" style={{ flexDirection: "column", alignItems: "stretch", gap: 8 }}>
+        <div className="rs-flex rs-gap-8">
+          <Icon name="alert-circle" size={17} />
+          <span className="rs-grow"><b>Success criterion not met.</b></span>
+        </div>
+        <p style={{ margin: 0, fontSize: 12.5 }}>
+          Training completed {iterationsCompleted ?? "N"} iteration{iterationsCompleted === 1 ? "" : "s"} — the
+          stage's success criterion wasn't met, so the mission re-planned the stage.
+        </p>
+      </div>
+    );
+  }
+  if (error === MISSION_TERMINATED_ERROR) {
+    return (
+      <div className="rs-banner" style={{ flexDirection: "column", alignItems: "stretch", gap: 8, background: "var(--canvas-soft)" }}>
+        <div className="rs-flex rs-gap-8">
+          <Icon name="square" size={17} />
+          <span className="rs-grow"><b>Stopped — mission was cancelled.</b></span>
+        </div>
+        <p style={{ margin: 0, fontSize: 12.5, color: "var(--rs-muted)" }}>
+          This stage run was in progress when the mission was stopped; it did not fail on its own.
+        </p>
+      </div>
+    );
+  }
+
   const onRegenerate = () => {
     regen.mutate(undefined, {
       onSuccess: () => toast.success("Reward template regenerated", { description: "rewards/v0.py rewritten for this adapter." }),
@@ -752,12 +2173,24 @@ function RunErrorCard({ slug, error, classification }: { slug: string; error: st
   );
 }
 
-function IterationDetailCard({ iter }: { iter: IterEventSummary | null }) {
+function IterationDetailCard({ iter, exportHref }: { iter: IterEventSummary | null; exportHref: string | null }) {
   if (!iter) return null;
   return (
     <div className="rs-card rs-card-pad">
       <div className="rs-card-title" style={{ fontSize: 13, marginBottom: 10 }}><Icon name="circle-dot" size={15} />Iter {iter.iter_index} · {iter.status}</div>
       <div className="rs-vgap-8">
+        {exportHref && (
+          <div>
+            <a
+              href={exportHref}
+              download
+              className="rs-btn rs-btn-ghost rs-btn-sm"
+              title="Download this iteration's checkpoint bundled with its reward, env spec, and ONNX/TorchScript policy"
+            >
+              <Icon name="download" size={14} />Export policy bundle
+            </a>
+          </div>
+        )}
         {iter.failure_modes.length > 0 && (
           <div>
             <div className="rs-eyebrow" style={{ marginBottom: 4 }}>failure modes</div>
@@ -765,6 +2198,21 @@ function IterationDetailCard({ iter }: { iter: IterEventSummary | null }) {
           </div>
         )}
         {iter.edit_count !== null && <div className="rs-flex-between" style={{ fontSize: 12 }}><span className="rs-sub">edits</span><span className="rs-num">{iter.edit_count}</span></div>}
+        {iter.env_spec_update && (
+          <div>
+            <div className="rs-eyebrow" style={{ marginBottom: 4 }}>
+              env spec{iter.env_spec_update.new_version ? ` → ${iter.env_spec_update.new_version}` : ""}
+            </div>
+            <div className="rs-flex rs-wrap rs-gap-6">
+              {iter.env_spec_update.applied.map((a) => (
+                <span key={a} className="rs-tag mono" style={{ fontSize: 10 }} title="applied to the training-only env curriculum (next iteration)">{a}</span>
+              ))}
+              {iter.env_spec_update.rejected.map((r, i) => (
+                <span key={`rej-${i}`} className="rs-tag mono" style={{ fontSize: 10, opacity: 0.55, textDecoration: "line-through" }} title={r.reason}>{r.parameter}</span>
+              ))}
+            </div>
+          </div>
+        )}
         {iter.paper_refs.length > 0 && (
           <div>
             <div className="rs-eyebrow" style={{ marginBottom: 4 }}>paper refs</div>
@@ -809,6 +2257,8 @@ function _mergeIterSlot(prev: IterEventSummary | undefined, next: IterEventSumma
     // carry it (iter_fitness fires before iter_completed).
     fitness: winner.fitness ?? loser.fitness,
     best_fitness: winner.best_fitness ?? loser.best_fitness,
+    progress: winner.progress ?? loser.progress,
+    env_spec_update: winner.env_spec_update ?? loser.env_spec_update,
   };
 }
 
@@ -1020,9 +2470,18 @@ function useMergedIterations(rest: IterEventSummary[], events: RunEvent[]): Iter
       if (ev.type === "iter_fitness") {
         if (typeof ev.fitness === "number") slot.fitness = ev.fitness;
         if (typeof ev.best_so_far === "number") slot.best_fitness = ev.best_so_far;
+        if (typeof ev.progress === "number") slot.progress = ev.progress;
       }
       if (ev.type === "best_reward_selected") {
         if (typeof ev.fitness === "number") slot.best_fitness = ev.fitness;
+      }
+      // §env generalization: the diagnoser's env-curriculum change.
+      if (ev.type === "env_spec_updated") {
+        slot.env_spec_update = {
+          new_version: typeof ev.new_version === "string" ? ev.new_version : null,
+          applied: Array.isArray(ev.applied) ? (ev.applied as string[]) : [],
+          rejected: Array.isArray(ev.rejected) ? (ev.rejected as Array<{ parameter: string; reason: string }>) : [],
+        };
       }
       eventSlots.set(iter, slot);
     }

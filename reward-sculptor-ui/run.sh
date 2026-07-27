@@ -22,10 +22,11 @@ die()  { warn "$*"; exit 1; }
 
 # ── dependency checks ────────────────────────────────────────────────
 command -v uv   >/dev/null 2>&1 || die "uv is not on PATH. Install from https://docs.astral.sh/uv/"
-command -v pnpm >/dev/null 2>&1 || die "pnpm is not on PATH. Install with: npm i -g pnpm"
+command -v corepack >/dev/null 2>&1 || die "corepack is not on PATH. Install Node 20+ (Corepack included)."
+PNPM=(corepack pnpm@9.12.0)
 
 [ -d ".venv" ] || die ".venv not found. Run 'uv sync' first, then re-run this script."
-[ -d "frontend/node_modules" ] || die "frontend/node_modules not found. Run 'pnpm install --dir frontend' first."
+[ -d "frontend/node_modules" ] || die "frontend/node_modules not found. Run 'corepack pnpm@9.12.0 install --dir frontend' first."
 
 # ── port check ───────────────────────────────────────────────────────
 port_free() {
@@ -136,7 +137,7 @@ if [ -z "${ANTHROPIC_API_KEY:-}" ]; then
     if [ -f "../RewardSculptor/.env" ] && grep -qE '^ANTHROPIC_API_KEY=' "../RewardSculptor/.env"; then
         : # sculptor's .env will be picked up by its own loader
     else
-        warn "ANTHROPIC_API_KEY not set — live runs will fail, dry-run only."
+        warn "No shell/repo API key detected — use a key saved in Settings → Anthropic API, or configure one there before a live run."
     fi
 fi
 
@@ -192,7 +193,7 @@ curl -sf "http://127.0.0.1:$BACKEND_PORT/health" >/dev/null 2>&1 \
     || die "backend did not respond on /health within 10s."
 
 log "starting frontend on http://127.0.0.1:$FRONTEND_PORT"
-( cd frontend && pnpm dev ) &
+( cd frontend && "${PNPM[@]}" dev ) &
 FRONTEND_PID=$!
 
 # Give Vite a moment to bind, then TRY to open the browser. This MUST be

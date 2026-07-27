@@ -30,14 +30,20 @@ from backend.routes import library as library_routes
 from backend.routes import metrics as metrics_routes
 from backend.routes import missions as missions_routes
 from backend.routes import physics as physics_routes
+from backend.routes import policies as policies_routes
 from backend.routes import projects as projects_routes
+from backend.routes import references as references_routes
 from backend.routes import rewards as rewards_routes
 from backend.routes import robot as robot_routes
 from backend.routes import reports as reports_routes
 from backend.routes import runs as runs_routes
+from backend.routes import saved as saved_routes
 from backend.routes import system as system_routes
+from backend.routes import trash as trash_routes
+from backend.routes import worlds as worlds_routes
 from backend.services.job_manager import JobManager
 from backend.services import sculptor_bridge
+from backend.services.api_key_store import load_saved_key
 from backend.services.project_store import ProjectStore
 
 
@@ -56,6 +62,10 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
 
     root = s.resolved_projects_root
     root.mkdir(parents=True, exist_ok=True)
+    # A key entered in Settings becomes available immediately when saved and
+    # is restored on later launches.  An explicit process environment value
+    # always wins over the UI-saved copy.
+    load_saved_key(root)
     store = ProjectStore(root)
 
     app = FastAPI(
@@ -196,6 +206,7 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     app.include_router(rewards_routes.router)
     app.include_router(kg_routes.router)
     app.include_router(runs_routes.router)
+    app.include_router(policies_routes.router)
     app.include_router(reports_routes.router)
     app.include_router(jobs_routes.router)
     app.include_router(jobs_routes.ws_router)
@@ -206,6 +217,10 @@ def create_app(settings: Optional[Settings] = None) -> FastAPI:
     app.include_router(missions_routes.router)
     app.include_router(missions_routes.ws_router)
     app.include_router(metrics_routes.router)
+    app.include_router(trash_routes.router)
+    app.include_router(saved_routes.router)
+    app.include_router(references_routes.router)
+    app.include_router(worlds_routes.router)
     return app
 
 

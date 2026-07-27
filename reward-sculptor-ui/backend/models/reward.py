@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Literal, Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -12,6 +12,17 @@ class RewardRef(BaseModel):
     model_config = ConfigDict(extra="allow")
     arxiv_id: str
     citation: str = ""
+
+
+class RewardComposition(BaseModel):
+    """How the reward's immutable base and authored residual compose."""
+
+    model_config = ConfigDict(extra="allow")
+    type: str
+    reference_clip_id: Optional[str] = None
+    reference_target_sha256: Optional[str] = None
+    tracking_weight: float = 1.0
+    residual_max: float = 0.0
 
 
 class RewardSpec(BaseModel):
@@ -24,6 +35,7 @@ class RewardSpec(BaseModel):
     description: str = ""
     hyperparameters: dict[str, float] = Field(default_factory=dict)
     references: list[RewardRef] = Field(default_factory=list)
+    composition: Optional[RewardComposition] = None
     # Map of `hparam_name → citation-or-justification` for every
     # hyperparameter change. Added by the 2026-04-22 05:30 KG-grounding
     # mandate — every new/changed hp must be accompanied by a specific

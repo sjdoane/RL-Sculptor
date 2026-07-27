@@ -38,10 +38,23 @@ PHYSICS, never by joint column indices):
   forward_speed_mps / lateral_speed_mps: -2..2 base travel (+x forward). Use 0
                  for a STATIONARY skill (kick / balance / in-place jump / floss).
   hop_height_m / hop_count: vertical hops (apex height, number).
+  fold_depth_m:  0..0.6 a SINGLE pelvis dip-and-return over the rollout (lowers by
+                 this many metres at mid, returns to start) — the defining motion of a
+                 FOLD-type goal: toe-touch, squat, deep bow, floor-touch-and-rise. The
+                 arc is symmetric (it ALWAYS returns to start), so use it ONLY for true
+                 down-AND-up goals; a one-way height change (sit-to-stand) is a
+                 base_height_m [start,end] ramp, NOT a fold. 0 = no fold. Pair it with a
+                 `fold`-mode group so the relevant joints flex AS the pelvis dips. Keep
+                 base_height_m at stand height (~0.7) so the dip stays above the floor.
+                 The top rung = deepest dip with full joint flex; the BOTTOM rungs are
+                 PARTIAL/FAILED attempts that a good metric must score low — make them
+                 DISCRIMINATING (a shallow dip, OR a deep dip with NO joint flex, OR a
+                 deep dip with the wrong joints), not just a uniformly smaller fold, so
+                 a metric that only watches pelvis depth cannot rank the ladder.
   groups: a coordinated set of joints moving together. Each group:
      {name, role_query:{segments:[...], axes:["pitch"|"roll"|"yaw"|null],
       sides:["left"|"right"|"front_left"|...|null]},
-      mode:"oscillate"|"burst"|"hold", amplitude_rad, period_frames(>=4),
+      mode:"oscillate"|"burst"|"hold"|"fold", amplitude_rad, period_frames(>=4),
       phase, within_group_phase_spread, offset_rad, peak_radps, burst_count}
      - segments come from the joint anatomy (hip, knee, ankle, thigh, calf,
        shoulder, elbow, wrist, waist). A group expands to EVERY matching joint,
@@ -50,7 +63,11 @@ PHYSICS, never by joint column indices):
        sagittal [pitch, null]; a FORWARD kick uses hip "pitch", a SIDESTEP uses
        hip "roll".
      - oscillate = rhythmic angle; burst = short high-speed velocity transients
-       (a kick/jump push, peak_radps + burst_count); hold = a sustained posture.
+       (a kick/jump push, peak_radps + burst_count); hold = a sustained posture;
+       fold = flex one direction and RETURN, in phase with `fold_depth_m` (a
+       toe-touch/squat/bow — amplitude_rad is the joint flexion ROM at the bottom of
+       the fold). Scope the group to the goal's ACTUAL joint set: hips+knees for a
+       squat, deeper hip flex for a toe-touch, hips+waist (NO knees) for a bow.
   coordination: [{group_a, group_b, relation:"anti_phase"|"in_phase"|
      "phase_lag", lag_frames}] — structure between groups (flossing = hips
      anti_phase arms; trotting = diagonal legs anti_phase).

@@ -1,7 +1,8 @@
 """Prompt-time KG research.
 
 User types a topic in the UI ("SEA physics parameters", "quadruped
-jumping curriculum"); Claude Opus 4.7 returns 5-10 arXiv IDs directly
+jumping curriculum"); Claude (the registry's "kg_research" role,
+`sculptor.llm.model_for`) returns 5-10 arXiv IDs directly
 relevant to that topic. The IDs are then ingested + extracted into the
 shared KG so subsequent sculpt runs can cite the new papers.
 
@@ -30,12 +31,13 @@ from typing import Iterable, Optional
 from pydantic import BaseModel, ConfigDict, Field
 
 from sculptor.kg.store import SculptorKG
+from sculptor.llm import log_llm_call, model_for, response_text_blocks
 from sculptor.prompts import load_prompt
 
 
 log = logging.getLogger(__name__)
 
-_MODEL = "claude-opus-4-7"
+_MODEL = model_for("kg_research")
 _MAX_TOKENS = 2048
 
 # Bare arxiv IDs in YYMM.NNNNN form. No `arXiv:` prefix, no version
@@ -140,27 +142,27 @@ def _fetch_arxiv_metadata_batch(
         return out
     try:
         import arxiv
-        import socket
 
-        socket.setdefaulttimeout(timeout_s)
-        try:
-            client = arxiv.Client(
-                page_size=max(len(arxiv_ids), 1),
-                delay_seconds=3.0, num_retries=1,
-            )
-            search = arxiv.Search(id_list=list(arxiv_ids))
-            for result in client.results(search):
-                entry_id = str(result.entry_id or "")
-                # entry_id looks like `http://arxiv.org/abs/2407.14795v1`
-                aid = entry_id.rsplit("/", 1)[-1]
-                aid = re.sub(r"v\d+$", "", aid, flags=re.IGNORECASE)
-                if aid in out:
-                    out[aid] = {
-                        "title": str(result.title or "").strip(),
-                        "abstract": str(result.summary or "").strip(),
-                    }
-        finally:
-            socket.setdefaulttimeout(None)
+        from sculptor.kg.ingest import make_arxiv_client
+
+        # Session-scoped timeout (make_arxiv_client) — this runs inside a
+        # live uvicorn worker thread; a global socket.setdefaulttimeout
+        # here would leak a 30s timeout onto unrelated server sockets.
+        client = make_arxiv_client(
+            page_size=max(len(arxiv_ids), 1),
+            delay_seconds=3.0, num_retries=1, timeout_s=timeout_s,
+        )
+        search = arxiv.Search(id_list=list(arxiv_ids))
+        for result in client.results(search):
+            entry_id = str(result.entry_id or "")
+            # entry_id looks like `http://arxiv.org/abs/2407.14795v1`
+            aid = entry_id.rsplit("/", 1)[-1]
+            aid = re.sub(r"v\d+$", "", aid, flags=re.IGNORECASE)
+            if aid in out:
+                out[aid] = {
+                    "title": str(result.title or "").strip(),
+                    "abstract": str(result.summary or "").strip(),
+                }
     except Exception as e:  # noqa: BLE001 — arxiv rate-limits are common; don't hard-fail research
         log.warning(
             "research_topic: arxiv batch metadata fetch failed "
@@ -318,6 +320,10 @@ def research_topic(
         messages=[{"role": "user", "content": user_msg}],
         output_format=ResearchResponse,
     )
+    log_llm_call(
+        "kg_research", _MODEL, system=system, user=user_msg,
+        response_text=response_text_blocks(resp),
+        usage=getattr(resp, "usage", None))
     # `messages.parse` returns a ParsedMessage whose parsed payload lives
     # under `.parsed_output` (scans content blocks for the first parsed
     # text block). Previous `.output` was wrong — sibling call sites in

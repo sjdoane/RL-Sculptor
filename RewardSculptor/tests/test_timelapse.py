@@ -18,6 +18,7 @@ from sculptor.timelapse import (
     _collect_iter_edits,
     _describe_behavior,
     _select_iter_indices,
+    build_mission_report,
     build_report,
 )
 
@@ -70,19 +71,29 @@ def test_collect_iter_edits_attributes_delta_to_next_iter(tmp_path: Path):
 def _write_project(tmp_path: Path, *, n_iters: int,
                    metric_history: list[float]) -> Path:
     project = tmp_path / "proj"
+    return _write_project_at(project, n_iters=n_iters, metric_history=metric_history)
+
+
+def _write_project_at(project: Path, *, n_iters: int,
+                      metric_history: list[float]) -> Path:
+    """Same fixture body as `_write_project`, but writes directly at
+    `project` instead of always under `<tmp_path>/proj`. Used both by
+    `_write_project` (project-level tests) and `_write_mission` (which
+    needs each stage's mini-project at a fixed `stages/<name>/` path
+    dictated by `Mission.stage_dir`)."""
     (project / "rewards").mkdir(parents=True)
     (project / "reports").mkdir()
     (project / "runs").mkdir()
 
     # config.toml — use the real GymSB3Adapter dotted class so build_report
     # can still try to read the [adapter] block. We don't actually load it.
-    (project / "config.toml").write_text(textwrap.dedent(f"""
+    (project / "config.toml").write_text(textwrap.dedent("""
         [target]
         name = "unit_test"
 
         [adapter]
         class = "tests.stub.AdapterStub"
-        config = {{}}
+        config = {}
 
         [kg]
         environment_tag = "unit_test"
@@ -228,6 +239,52 @@ def test_build_report_produces_md_and_calls_mp4_builder(tmp_path: Path, monkeypa
     assert "removed_term" not in md.lower()
 
 
+def test_report_uses_best_completed_policy_and_its_pinned_reward(
+    tmp_path: Path,
+):
+    project = _write_project(
+        tmp_path,
+        n_iters=4,
+        metric_history=[10.0, 12.0, 20.0, 15.0],
+    )
+    fitness_values = [0.1, 0.2, 0.9, 0.3]
+    for i, fitness in enumerate(fitness_values):
+        iter_dir = project / "runs" / f"iter_{i}"
+        (iter_dir / "iteration_complete.json").write_text(
+            json.dumps({"state": "completed", "iter": i}),
+            encoding="utf-8",
+        )
+        (iter_dir / "fitness.json").write_text(
+            json.dumps({"fitness": fitness}),
+            encoding="utf-8",
+        )
+
+    selected = project / "runs" / "iter_2"
+    (selected / "artifact_tuple.json").write_text(
+        json.dumps({
+            "refs": {
+                "reward": {
+                    "path": "rewards/v1.py",
+                    "version": "v1",
+                },
+            },
+        }),
+        encoding="utf-8",
+    )
+
+    result = build_report(
+        config_path=project / "config.toml",
+        out_mp4=tmp_path / "final.mp4",
+    )
+    md = result.final_report_md_path.read_text(encoding="utf-8")
+
+    assert "**Selected policy reward module**" in md
+    assert "rewards/v1.py" in md
+    assert "rewards/v4.py" not in md
+    assert "**Selected** (iter 2)" in md
+    assert "+10.0000 → +20.0000" in md
+
+
 def test_build_report_with_valid_mp4s_calls_builder(tmp_path: Path, monkeypatch):
     """Force panel videos to pass the 2KB probe, so `_build_final_mp4`
     actually gets called with the right iter selection."""
@@ -261,3 +318,184 @@ def test_build_report_with_valid_mp4s_calls_builder(tmp_path: Path, monkeypatch)
     assert "mean_return" in received["panel_labels"][0]
     # Iter 4's label should show the final value (25.0).
     assert "+25.000" in received["panel_labels"][-1]
+
+
+# ── build_mission_report (§chunk C1) ────────────────────────────────────
+def _write_mission(
+    tmp_path: Path, *, stage_specs: list[tuple[str, int, list[float]]],
+    valid_mp4s: bool = False,
+) -> Path:
+    """Write a synthetic multi-stage mission tree:
+
+        <mission_dir>/mission.json
+        <mission_dir>/stages/<stage_name>/  (per _write_project_at)
+
+    `stage_specs` is `[(stage_name, n_iters, metric_history), ...]` in
+    stage order. Returns `mission_dir`. `valid_mp4s=True` makes every
+    iter's rollout.mp4 large enough to pass `_probe_video_ok` (2KB).
+    """
+    from sculptor.mission import Mission, Stage, save_mission
+
+    mission_dir = tmp_path / "mission"
+    stages: list[Stage] = []
+    for i, (name, n_iters, metric_history) in enumerate(stage_specs):
+        stage_dir = mission_dir / "stages" / name
+        _write_project_at(stage_dir, n_iters=n_iters, metric_history=metric_history)
+        if valid_mp4s:
+            for iter_dir in (stage_dir / "runs").iterdir():
+                (iter_dir / "rollout" / "rollout.mp4").write_bytes(b"x" * 4096)
+        stages.append(Stage(
+            name=name,
+            goal_text=f"reach the {name} milestone",
+            success_criterion="behavior['mean_return'] > 0",
+            max_iterations=10,
+            parent_stage=stage_specs[i - 1][0] if i > 0 else None,
+            reward_seed_prompt=f"reward the {name} behavior",
+            status="succeeded" if metric_history else "pending",
+            best_metric=metric_history[-1] if metric_history else None,
+            iterations_used=n_iters,
+        ))
+
+    mission = Mission(
+        goal="do a complex multi-stage behavior",
+        stages=stages,
+        decomposition_model="claude-test",
+        decomposition_rationale="split into stand-then-walk for curriculum reasons",
+    )
+    save_mission(mission, mission_dir)
+    return mission_dir
+
+
+def test_build_mission_report_writes_md_with_both_stage_sections(
+    tmp_path: Path, monkeypatch,
+):
+    """Sentinel (<2KB) rollout mp4s mean no panel qualifies — mirrors
+    `test_build_report_produces_md_and_calls_mp4_builder`'s title-only
+    fallback. The markdown must still contain both stage sections."""
+    mission_dir = _write_mission(tmp_path, stage_specs=[
+        ("stand", 2, [5.0, 12.0]),
+        ("walk", 3, [1.0, 8.0, 20.0]),
+    ])
+    out_mp4 = mission_dir / "reports" / "final.mp4"
+
+    result = build_mission_report(mission_dir=mission_dir, out_mp4=out_mp4)
+
+    assert result.final_report_md_path.is_file()
+    md = result.final_report_md_path.read_text(encoding="utf-8")
+
+    assert "# Sculpt Mission Report" in md
+    assert "do a complex multi-stage behavior" in md  # mission goal
+    assert "stand-then-walk" in md  # decomposition_rationale
+    assert "## Stage: `stand`" in md
+    assert "## Stage: `walk`" in md
+    assert "reach the stand milestone" in md  # stage.goal_text
+    assert "reach the walk milestone" in md
+    # Per-stage primary-metric start -> end lines rendered.
+    assert "+5.0000" in md and "+12.0000" in md
+    assert "+1.0000" in md and "+20.0000" in md
+    # Stages overview table lists both by name + status.
+    assert "`stand`" in md and "`walk`" in md
+    assert "succeeded" in md
+
+
+def test_build_mission_report_stitches_mp4_across_stages(
+    tmp_path: Path, monkeypatch,
+):
+    """Valid-sized rollout.mp4s in both stages: `_build_final_mp4` should
+    be invoked once with panels drawn from BOTH stages (capped at 3/stage),
+    labeled "<stage> · iter N · <metric>=<value>"."""
+    mission_dir = _write_mission(
+        tmp_path,
+        stage_specs=[
+            ("stand", 2, [5.0, 12.0]),
+            ("walk", 3, [1.0, 8.0, 20.0]),
+        ],
+        valid_mp4s=True,
+    )
+    out_mp4 = mission_dir / "reports" / "final.mp4"
+
+    received: dict = {}
+
+    def _fake_build_mp4(**kwargs):
+        received["panel_videos"] = kwargs["panel_videos"]
+        received["panel_labels"] = kwargs["panel_labels"]
+        Path(kwargs["out_path"]).write_bytes(b"y" * 10_000)
+        return True, ""
+
+    monkeypatch.setattr("sculptor.timelapse._build_final_mp4", _fake_build_mp4)
+
+    result = build_mission_report(mission_dir=mission_dir, out_mp4=out_mp4)
+
+    assert result.final_mp4_ok is True
+    assert result.final_mp4_path.is_file()
+    # stand has 2 iters -> _select_iter_indices(2) = [0, 1] (both, <=3 cap).
+    # walk has 3 iters -> _select_iter_indices(3) = [0, 1, 2] (all, <=3 cap).
+    assert len(received["panel_videos"]) == 5
+    assert len(received["panel_labels"]) == 5
+    stand_labels = [
+        label for label in received["panel_labels"] if label.startswith("stand")
+    ]
+    walk_labels = [
+        label for label in received["panel_labels"] if label.startswith("walk")
+    ]
+    assert len(stand_labels) == 2
+    assert len(walk_labels) == 3
+    # Label format: "<stage> · iter N · <primary_key>=<value>".
+    assert any(
+        "stand · iter 0 · mean_return=" in label for label in stand_labels
+    )
+    assert any(
+        "walk · iter 2 · mean_return=+20.000" in label for label in walk_labels
+    )
+
+    md = result.final_report_md_path.read_text(encoding="utf-8")
+    assert "[final.mp4]" in md
+
+
+def test_build_mission_report_skips_unscaffolded_stage_gracefully(
+    tmp_path: Path,
+):
+    """A stage listed in mission.json but never scaffolded (no
+    config.toml on disk yet — e.g. mission halted after stage 0) must
+    not raise; its section renders a placeholder and the OTHER stage's
+    data still comes through."""
+    from sculptor.mission import Mission, Stage, save_mission
+
+    mission_dir = tmp_path / "mission"
+    _write_project_at(
+        mission_dir / "stages" / "stand", n_iters=2,
+        metric_history=[3.0, 9.0])
+
+    stages = [
+        Stage(
+            name="stand", goal_text="reach the stand milestone",
+            success_criterion="behavior['mean_return'] > 0",
+            max_iterations=10, parent_stage=None,
+            reward_seed_prompt="reward standing", status="succeeded",
+            best_metric=9.0, iterations_used=2,
+        ),
+        Stage(
+            name="walk", goal_text="reach the walk milestone",
+            success_criterion="behavior['mean_return'] > 0",
+            max_iterations=10, parent_stage="stand",
+            reward_seed_prompt="reward walking", status="pending",
+            best_metric=None, iterations_used=0,
+        ),
+    ]
+    mission = Mission(
+        goal="do a complex multi-stage behavior", stages=stages,
+        decomposition_model="claude-test",
+        decomposition_rationale="split into stand-then-walk",
+    )
+    save_mission(mission, mission_dir)
+
+    out_mp4 = mission_dir / "reports" / "final.mp4"
+    result = build_mission_report(mission_dir=mission_dir, out_mp4=out_mp4)
+
+    assert result.final_report_md_path.is_file()
+    md = result.final_report_md_path.read_text(encoding="utf-8")
+    assert "## Stage: `stand`" in md
+    assert "## Stage: `walk`" in md
+    assert "+3.0000" in md and "+9.0000" in md  # stand's data present
+    # walk's placeholder — never scaffolded, no config.toml.
+    assert "has not scaffolded yet" in md

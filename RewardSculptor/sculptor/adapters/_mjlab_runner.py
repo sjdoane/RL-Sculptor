@@ -8,22 +8,25 @@ means the UI / health-check / adapter-instantiation paths never pay the
 import cost, per the lazy-import rule in MJLAB_PIVOT_DESIGN §7.
 
 Reward injection: when `--reward-module-path` is passed, the runner
-patches the loaded task cfg's `rewards` dict to contain a single active
-term (`SculptorRewardTerm`) and zeroes the weight of every task-shipped
-term. `cfg.scale_rewards_by_dt` is set to False so the reward module's
-raw per-step return survives without dt-scaling. When `--reward-module-path`
-is omitted, training uses the task's default reward terms unchanged —
-useful for the GPU smoke test.
+adds `SculptorRewardTerm` and attenuates task-shipped terms to a 0.3x
+realism floor, except nominal command-tracking terms whose command was
+replaced by an authored task goal. It also adds a task-independent survival
+guard and explicit
+non-timeout termination penalty. Without those terms, an early policy can
+learn to fall immediately to avoid accumulating realism penalties, making a
+less-negative return look like progress. `cfg.scale_rewards_by_dt` is set to
+False so the reward module's raw per-step return survives without dt-scaling. When
+`--reward-module-path` is omitted, training uses the task's default
+reward terms unchanged (useful for the GPU smoke test).
 """
 
 from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 
 # ── Component capture sink (§7.1 / §7.2 — Eureka-style reward reflection) ──
@@ -33,6 +36,74 @@ from typing import Any
 # the term more than once). `None` disables capture — the `__call__` path
 # stays allocation-free when no sink is active.
 _COMPONENT_SINK: dict[str, list[float]] | None = None
+
+# §termination economics: custom rewards are deliberately composed with a
+# subset of each task's native realism rewards. Those priors contain penalties
+# (action rate, joint limits, collision costs, ...) that can make an untrained
+# policy's per-step return negative. If failure ends the episode without a
+# penalty, PPO can improve the episodic return simply by failing sooner. A
+# constant survival term does not change the ordering of equal-length
+# successful trajectories; it only makes premature non-timeout termination an
+# economically dominated escape. The terminal penalty adds a clear final-step
+# separation and is intentionally larger than a single survival step.
+_SCULPTOR_SURVIVAL_WEIGHT = 1.0
+_SCULPTOR_FAILURE_WEIGHT = -5.0
+_SCULPTOR_TERMINAL_STILLNESS_WEIGHT = 1.0
+_SCULPTOR_TERMINAL_CONTINUITY_SCALE = 2.0
+_SCULPTOR_FORBIDDEN_CONTACT_WEIGHT = 4.0
+_SCULPTOR_FORBIDDEN_CONTACT_WEIGHT_SCALE = 2.0
+# A command-only obstacle-clearance stage deliberately targets a point outside
+# the immutable task predicate. Predicate-centered generated shaping would pull
+# in the opposite direction during that short phase, so withhold it entirely.
+# Command tracking, direct contact, survival, and native realism terms are
+# separate rewards and remain active.
+_CLEARANCE_STAGE_PRIMARY_SCALE = 0.0
+
+
+def _install_sculptor_termination_economics(
+    rewards: dict[str, Any],
+    reward_term_cfg: Any,
+    mdp: Any,
+) -> None:
+    """Install robot/task-agnostic survival and failure reward terms.
+
+    ``mdp.is_terminated`` excludes time-limit terminations, so completing a
+    full episode is never punished. Fixed-base tasks with no failure
+    termination simply receive the same constant horizon offset in every
+    trajectory. Names are reserved under the ``sculptor_`` prefix so authored
+    reward components cannot shadow the guard.
+    """
+    rewards["sculptor_survival"] = reward_term_cfg(
+        func=mdp.is_alive,
+        weight=_SCULPTOR_SURVIVAL_WEIGHT,
+    )
+    rewards["sculptor_failure"] = reward_term_cfg(
+        func=mdp.is_terminated,
+        weight=_SCULPTOR_FAILURE_WEIGHT,
+    )
+
+
+def _to_host_numpy(value: Any) -> Any:
+    """Convert tensor-like simulator metadata to a host NumPy array.
+
+    mjlab/mujoco-warp models may expose limits as CUDA tensors. Calling
+    ``np.asarray`` on those tensors raises instead of copying implicitly.
+    Detach and move only values that advertise those tensor operations; plain
+    NumPy arrays and lists retain the normal conversion path.
+    """
+    import numpy as np
+
+    candidate = value
+    detach = getattr(candidate, "detach", None)
+    if callable(detach):
+        candidate = detach()
+    cpu = getattr(candidate, "cpu", None)
+    if callable(cpu):
+        candidate = cpu()
+    to_numpy = getattr(candidate, "numpy", None)
+    if callable(to_numpy):
+        candidate = to_numpy()
+    return np.asarray(candidate)
 
 
 def _record_components(
@@ -97,6 +168,37 @@ def _compute_playback_fps(
     return max(1.0, min(derived, 240.0))
 
 
+def _freeze_invalid_first_episode_steps(
+    values: Any, valid_mask: Any,
+) -> Any:
+    """Replace post-reset samples with the last first-episode state.
+
+    mjlab auto-resets an environment *inside* ``step`` before returning.  A
+    state sampled on a done step therefore belongs to the next episode and
+    creates a teleport in the recorded trajectory.  Objective metrics then
+    misread the reset displacement as extreme terminal speed and erase real
+    course progress.  Keep the rectangular ``(T, N, ...)`` contract while
+    making its padding absorbing: after an environment's first invalid state,
+    repeat its last valid state rather than stitching in a new attempt.
+
+    ``valid_mask`` is persisted separately so mask-aware consumers can still
+    distinguish measured samples from absorbing padding.  A malformed input
+    is returned unchanged; rollout telemetry must never crash artifact write.
+    """
+    import numpy as np
+
+    array = np.asarray(values)
+    mask = np.asarray(valid_mask, dtype=bool)
+    if array.ndim < 2 or mask.ndim != 2 or array.shape[:2] != mask.shape:
+        return array
+    frozen = array.copy()
+    for step in range(1, array.shape[0]):
+        invalid = ~mask[step]
+        if np.any(invalid):
+            frozen[step, invalid] = frozen[step - 1, invalid]
+    return frozen
+
+
 def _snapshots_to_trajectory(
     snapshots: list[dict[str, float]],
 ) -> dict[str, list[float]]:
@@ -158,14 +260,82 @@ def _cfg_to_dict(cfg: Any) -> dict[str, Any]:
 
 
 # Keys in the sculptor state schema for velocity-family tasks. Manipulation
-# tasks (Yam) would extend with ee_pose / object_poses — deferred to M4.
+# Registered manipulation tasks extend this base contract through the generic
+# capability-discovered recorder in manipulation_telemetry.py.
 _DEFAULT_SCHEMA_KEYS = (
     "qpos", "qvel", "base_lin_vel_b", "base_ang_vel_b",
     "projected_gravity_b", "actuator_force", "command_vel",
 )
 
 
-def _build_sculptor_term_class(schema_keys: tuple[str, ...]):
+def _episode_relative_base_height(base_z, episode_length, anchor):
+    """Return per-env height displacement and the refreshed reset anchor.
+
+    Reference datasets disagree on whether root Z is absolute, ground-relative,
+    or normalized to start at zero.  The invariant that transfers across
+    embodiments and authored terrain is vertical *change from this episode's
+    reset*.  Capture the first observed height after every reset and never
+    share it across environments.
+    """
+    import torch
+
+    if (anchor is None or anchor.shape != base_z.shape
+            or anchor.device != base_z.device or anchor.dtype != base_z.dtype):
+        anchor = torch.full_like(base_z, float("nan"))
+    fresh = (episode_length <= 1.0) | ~torch.isfinite(anchor)
+    anchor = torch.where(fresh, base_z.detach(), anchor)
+    return base_z - anchor, anchor
+
+
+def _motion_quality_info(
+    action, previous_action, episode_length, joint_vel,
+):
+    """Return universal smoothness scalars and the next action anchor.
+
+    The reward contract advertises these channels for every mjlab
+    articulation, so the runtime must define them without task, robot, or
+    joint-name assumptions.  RMS reductions keep their scale comparable as
+    embodiments gain joints.  Reset frames are zeroed so an episode boundary
+    cannot manufacture a large action-rate penalty.
+    """
+    import torch
+
+    if (
+        previous_action is None
+        or tuple(previous_action.shape) != tuple(action.shape)
+        or previous_action.device != action.device
+        or previous_action.dtype != action.dtype
+    ):
+        previous_action = torch.zeros_like(action)
+    fresh = episode_length <= 1.0
+    action_rate = torch.sqrt(
+        torch.mean(torch.square(action - previous_action), dim=-1)
+    )
+    action_rate = torch.where(
+        fresh, torch.zeros_like(action_rate), action_rate)
+
+    if (
+        joint_vel is None
+        or getattr(joint_vel, "ndim", 0) != 2
+        or joint_vel.shape[0] != action.shape[0]
+    ):
+        joint_vel_rms = torch.zeros_like(action_rate)
+    else:
+        joint_vel_rms = torch.sqrt(
+            torch.mean(torch.square(joint_vel), dim=-1)
+        ).to(dtype=action.dtype)
+        joint_vel_rms = torch.where(
+            fresh, torch.zeros_like(joint_vel_rms), joint_vel_rms)
+    return {
+        "action_rate": action_rate,
+        "joint_vel_rms": joint_vel_rms,
+    }, action.detach().clone()
+
+
+def _build_sculptor_term_class(
+    schema_keys: tuple[str, ...], robot_capability: Any | None = None,
+    world_bundle: Any | None = None,
+):
     """Factory for the reward-term class. Kept inside the function so
     heavy imports (mjlab, torch) only happen when the runner is actually
     invoked with --reward-module-path."""
@@ -186,6 +356,7 @@ def _build_sculptor_term_class(schema_keys: tuple[str, ...]):
         def __init__(self, cfg, env):  # type: ignore[no-untyped-def]
             path = cfg.params["reward_module_path"]
             self._schema_keys = schema_keys
+            self._robot_capability = robot_capability
             mod = _load_reward_module(path)
             if not hasattr(mod, "compute_reward_batched"):
                 raise AttributeError(
@@ -195,7 +366,16 @@ def _build_sculptor_term_class(schema_keys: tuple[str, ...]):
                     "batched entry point)."
                 )
             self._mod = mod
+            self._world_reward_runtime = None
+            if world_bundle is not None:
+                from sculptor.world.runtime import TorchWorldRewardRuntime
+
+                self._world_reward_runtime = TorchWorldRewardRuntime(
+                    env, catalog=world_bundle.channel_catalog,
+                    manifest=world_bundle.manifest)
             self._prev = self._snapshot(env)
+            self._base_height_anchor = None
+            self._previous_action = None
 
         @staticmethod
         def _find_articulated_entity(env):
@@ -282,15 +462,64 @@ def _build_sculptor_term_class(schema_keys: tuple[str, ...]):
                 elif k == "actuator_force":
                     out[k] = _get("actuator_force", 1)
                 elif k == "command_vel":
-                    try:
-                        v = env.command_manager.get_command("base_velocity")
-                    except Exception:  # noqa: BLE001
-                        v = None
+                    # Term names are task configuration, not adapter
+                    # semantics. Discover the velocity command by its ranges
+                    # so current ``twist`` and legacy ``base_velocity`` tasks
+                    # both expose the command the policy actually observes.
+                    v = None
+                    manager = env.command_manager
+                    names = list(dict.fromkeys([
+                        "base_velocity", "twist",
+                        *list(getattr(manager, "active_terms", ()) or ()),
+                    ]))
+                    for name in names:
+                        try:
+                            term_cfg = manager.get_term_cfg(name)
+                            ranges = getattr(term_cfg, "ranges", None)
+                            if not all(hasattr(ranges, field) for field in (
+                                "lin_vel_x", "lin_vel_y", "ang_vel_z",
+                            )):
+                                continue
+                            candidate = manager.get_command(name)
+                            if (candidate is not None and candidate.ndim == 2
+                                    and candidate.shape[0] == N
+                                    and candidate.shape[1] >= 3):
+                                v = candidate[:, :3]
+                                break
+                        except Exception:  # noqa: BLE001
+                            continue
                     # `get_command` can return None silently on tasks that
                     # don't have a "base_velocity" command (Cartpole, Yam,
                     # any non-locomotion task). Don't let a None leak into
                     # `self._prev` — reset() would crash indexing into it.
                     out[k] = v if v is not None else _zeros(3)
+                elif (self._robot_capability is not None
+                      and k in self._robot_capability.reward_state_sources):
+                    source = self._robot_capability.reward_state_sources[k]
+                    namespace, _, role = source.partition(":")
+                    try:
+                        if namespace == "site":
+                            concrete = self._robot_capability.resolve_site_role(
+                                role)
+                            indices = {
+                                name: index for index, name in
+                                enumerate(tuple(robot.site_names))}
+                            selected = [indices[name] for name in concrete]
+                            values = _get("site_pos_w", 3)[:, selected, :]
+                        elif namespace == "body":
+                            concrete = self._robot_capability.resolve_role(role)
+                            indices = {
+                                name: index for index, name in
+                                enumerate(tuple(robot.body_names))}
+                            selected = [indices[name] for name in concrete]
+                            values = _get("body_link_pos_w", 3)[:, selected, :]
+                        else:
+                            raise KeyError(namespace)
+                        out[k] = values.mean(dim=1)
+                    except Exception:  # noqa: BLE001
+                        shape = self._robot_capability.reward_state_schema.get(
+                            k, (1,))
+                        out[k] = _zeros(int(shape[-1]))
                 else:
                     # Unknown schema key — zero-fill rather than silently
                     # skipping, so `self._prev.keys()` matches the schema
@@ -417,23 +646,41 @@ def _build_sculptor_term_class(schema_keys: tuple[str, ...]):
                 fallen = (proj_g_z_b >= 0.0).to(dtype=action.dtype)
             except Exception:  # noqa: BLE001
                 fallen = torch.zeros(env.num_envs, device=env.device, dtype=action.dtype)
+            episode_length = env.episode_length_buf.float()
+            base_height_delta, self._base_height_anchor = (
+                _episode_relative_base_height(
+                    base_z, episode_length, self._base_height_anchor))
             info = {
-                "episode_length": env.episode_length_buf.float(),
+                "episode_length": episode_length,
                 "terminated": env.termination_manager.terminated.float(),
                 "time_outs": env.termination_manager.time_outs.float(),
                 "step_dt": torch.full(
                     (env.num_envs,), float(env.step_dt), device=env.device
                 ),
                 "base_height": base_z,
+                "base_height_delta": base_height_delta,
                 "fallen": fallen,
             }
+            motion_info, self._previous_action = _motion_quality_info(
+                action,
+                self._previous_action,
+                episode_length,
+                getattr(data, "joint_vel", None),
+            )
+            info.update(motion_info)
             # §Ship 46: per-foot kick channels (contact / swing speed /
             # height) + base horizontal speed, so a sculpted reward can
             # shape a single-leg kick. Zero-filled on non-biped tasks.
             info.update(self._foot_info(env, robot, action.dtype))
+            if self._world_reward_runtime is not None:
+                # The runtime object exposes only base/shared_shaping catalog
+                # entries; metric_only success truth has no reward-side API.
+                info.update(self._world_reward_runtime.sample())
             rewards, _components = self._mod.compute_reward_batched(
                 self._prev, action, state, info
             )
+            rewards, _components = _apply_clearance_maneuver_reward_firewall(
+                env, rewards, _components)
             # §7.1 / §7.2: feed the module-level component sink when
             # training has enabled it. No-op when `_COMPONENT_SINK is None`,
             # which keeps rollout + non-sculpt runs allocation-free.
@@ -445,8 +692,1588 @@ def _build_sculptor_term_class(schema_keys: tuple[str, ...]):
         def reset(self, env_ids):  # type: ignore[no-untyped-def]
             for k in list(self._prev.keys()):
                 self._prev[k][env_ids] = 0.0
+            if self._base_height_anchor is not None:
+                self._base_height_anchor[env_ids] = float("nan")
+            if self._previous_action is not None:
+                self._previous_action[env_ids] = 0.0
+            if self._world_reward_runtime is not None:
+                self._world_reward_runtime.reset(env_ids)
 
     return SculptorRewardTerm
+
+
+def _resolve_env_spec(args: argparse.Namespace) -> "dict | None":
+    """Resolve the effective env spec for a runner invocation.
+
+    `--env-spec <path>` (a validated per-project JSON, see
+    `sculptor.env_spec`) wins; else `--env-profile <name>` names a
+    built-in preset expressed in the SAME schema; else None (task
+    defaults, byte-identical cfg). An invalid spec FILE fails the run
+    loudly — the adapter validates before spawning, so reaching that
+    branch means the file changed underneath us or a caller skipped
+    validation; training under a half-applied env is never acceptable.
+    An unknown profile NAME keeps the historical warn-and-ignore
+    contract."""
+    from sculptor.env_spec import jump_preset_spec, load_env_spec
+
+    spec_path = getattr(args, "env_spec", "") or ""
+    if spec_path:
+        return load_env_spec(spec_path)   # raises on unreadable/invalid
+    profile = getattr(args, "env_profile", "") or ""
+    if not profile or profile == "default":
+        return None
+    if profile != "jump":
+        print(f"[runner] env-profile {profile!r} unknown — ignored",
+              file=sys.stderr, flush=True)
+        return None
+    return jump_preset_spec()
+
+
+def reset_joints_to_reference(
+    env: Any,
+    env_ids: Any,
+    joint_pos_target=None,  # noqa: ANN001 — torch.Tensor, mjlab-only at call time
+    joint_pos_noise: float = 0.0,
+    asset_cfg: Any = None,
+    joint_pos_traj=None,  # noqa: ANN001 — [K, J] torch.Tensor for phase RSI
+    joint_vel_traj=None,  # noqa: ANN001 — [K, J] torch.Tensor for phase RSI
+) -> None:
+    """Reset every selected joint to an EXPLICIT per-joint target (+ small
+    symmetric noise), rather than mjlab's shipped
+    `reset_joints_by_offset` (a single UNIFORM range added to the
+    STANDING default across ALL joints — confirmed by reading
+    `.venv/.../mjlab/envs/mdp/events.py` during recon; it has no
+    per-joint target/keyframe parameter at all).
+
+    §REFERENCE_TRAJECTORY_PLAN §8 part 2: a get-up clip's lying posture
+    (e.g. bent knees/elbows) is materially different PER JOINT from the
+    standing default, so it cannot be expressed as one shared offset.
+    This event is the missing mechanism — a genuinely new mjlab event
+    term, injected the same way `_apply_env_spec` already injects the
+    `sunk` termination term (mjlab's `events`/`terminations` dicts are
+    plain `dict[str, EventTermCfg]` / `dict[str, TerminationTermCfg]`
+    the adapter is free to add entries to; no mjlab fork required).
+
+    Mirrors `reset_joints_by_offset`'s own shape/clamp/write contract
+    (same `soft_joint_pos_limits` clamp, same `write_joint_state_to_sim`
+    call) so it composes with the rest of the reset pipeline identically
+    — only the "what value do we reset around" question changes (an
+    explicit target vector instead of the standing default + a random
+    offset).
+
+    §DeepMimic phase RSI (arXiv 1804.02717): when `joint_pos_traj` ([K, J], K
+    downsampled reference frames) is given INSTEAD of a single `joint_pos_target`,
+    each env samples a random frame k∈[0,K) at reset and initializes from THAT
+    frame — so the batch covers the whole motion manifold, not one posture (the
+    canonical RSI that "enables parallel learning of the motion phases"). When
+    `joint_vel_traj` is also given, the joint VELOCITIES are initialized from the
+    same frame too (a dynamic skill's mid-motion pose is meaningless at rest); the
+    prior single-target path leaves velocity at the default (zeros).
+
+    `joint_pos_target` / `joint_pos_traj` must already be tensors on `env.device`
+    with one element per joint (J) selected by `asset_cfg` — the caller
+    (`_apply_env_spec`) resolves/validates J against the robot's actual joint
+    count before injecting this event; a mismatch is a clear `ValueError` there,
+    never a silent misassignment here.
+    """
+    import torch
+
+    from mjlab.managers.scene_entity_config import SceneEntityCfg
+    from mjlab.utils.lab_api.math import sample_uniform
+
+    if asset_cfg is None:
+        asset_cfg = SceneEntityCfg("robot")
+    if env_ids is None:
+        env_ids = torch.arange(env.num_envs, device=env.device, dtype=torch.int)
+    n = len(env_ids)
+
+    asset = env.scene[asset_cfg.name]
+    default_joint_vel = asset.data.default_joint_vel
+    soft_joint_pos_limits = asset.data.soft_joint_pos_limits
+
+    joint_vel = default_joint_vel[env_ids][:, asset_cfg.joint_ids].clone()
+    if joint_pos_traj is not None:
+        # Phase RSI: per-env random reference frame.
+        pos_traj = joint_pos_traj.to(device=env.device, dtype=torch.float32)
+        k = int(pos_traj.shape[0])
+        frame = torch.randint(0, max(1, k), (n,), device=env.device)
+        joint_pos = pos_traj[frame].clone()                      # [n, J]
+        if joint_vel_traj is not None:
+            vel_traj = joint_vel_traj.to(device=env.device, dtype=torch.float32)
+            joint_vel = vel_traj[frame].clone()                  # [n, J]
+    else:
+        target = joint_pos_target.to(device=env.device, dtype=torch.float32)
+        joint_pos = target.unsqueeze(0).expand(n, -1).clone()
+    if joint_pos_noise:
+        joint_pos = joint_pos + sample_uniform(
+            -float(joint_pos_noise), float(joint_pos_noise),
+            joint_pos.shape, env.device)
+    joint_pos_limits = soft_joint_pos_limits[env_ids][:, asset_cfg.joint_ids]
+    joint_pos = joint_pos.clamp_(joint_pos_limits[..., 0], joint_pos_limits[..., 1])
+
+    joint_ids = asset_cfg.joint_ids
+    if isinstance(joint_ids, list):
+        joint_ids = torch.tensor(joint_ids, device=env.device)
+
+    asset.write_joint_state_to_sim(
+        joint_pos.view(len(env_ids), -1),
+        joint_vel.view(len(env_ids), -1),
+        env_ids=env_ids,
+        joint_ids=joint_ids,
+    )
+
+
+def _apply_world_selection(
+    env_cfg: Any, selection_path: str, *, train: bool,
+    task_id: str | None = None,
+) -> Any | None:
+    """Resolve and apply one immutable prompt-authored world tuple.
+
+    Heavy simulator imports remain inside the compiler. An explicit authored
+    selection is fail-closed: any hash, schema, capability, or materialized
+    evaluation mismatch aborts before the environment or GPU runner exists.
+    """
+    if not selection_path:
+        return None
+    from sculptor.world.compiler import apply_world_selection
+
+    bundle = apply_world_selection(
+        env_cfg, Path(selection_path).resolve(), train=train,
+        runtime_task_id=task_id)
+    for adjustment in bundle.runtime_adjustments:
+        print(
+            f"[runner] authored-world runtime adjustment: {adjustment}",
+            file=sys.stderr,
+            flush=True,
+        )
+    return bundle
+
+
+def _full_weight_authored_command_rewards(world_bundle: Any | None) -> frozenset[str]:
+    """Return base reward terms that are part of an authored command contract.
+
+    The generic 0.3 realism floor is appropriate for posture, smoothness, and
+    safety priors, but it must not attenuate the simulator's dense supervision
+    for a command that the authored World replaced with a task goal.  Doing so
+    made lateral waypoint turns three times less important than their nominal
+    locomotion objective even though the policy observation already carried the
+    correct goal-conditioned command.
+
+    Detect the compiled schema and the compiler's installed runtime adjustment,
+    never a robot name or registered simulator task id.  The adjustment check is
+    important: a declarative goal alone must not preserve command rewards when
+    the selected base environment had no compatible command surface.
+    """
+    if world_bundle is None:
+        return frozenset()
+    manifest = getattr(world_bundle, "manifest", None)
+    task_shared = getattr(manifest, "task_shared", {})
+    goal = task_shared.get("goal", {}) if isinstance(task_shared, Mapping) else {}
+    adjustments = tuple(getattr(world_bundle, "runtime_adjustments", ()) or ())
+    installed = any(
+        "goal-conditioned waypoint traversal" in str(adjustment)
+        for adjustment in adjustments
+    )
+    if isinstance(goal, Mapping) and goal.get("type") == "waypoint_sequence" \
+            and installed:
+        return frozenset({"track_linear_velocity", "track_angular_velocity"})
+    return frozenset()
+
+
+def _authored_terminal_standing_enabled(world_bundle: Any | None) -> bool:
+    """Whether the compiled command contract has a terminal dwell phase."""
+    return _authored_terminal_hold_s(world_bundle) > 0.0
+
+
+def _authored_terminal_hold_s(world_bundle: Any | None) -> float:
+    """Return the positive dwell duration installed by an authored command."""
+    if not _full_weight_authored_command_rewards(world_bundle):
+        return 0.0
+    manifest = getattr(world_bundle, "manifest", None)
+    task_shared = getattr(manifest, "task_shared", {})
+    goal = task_shared.get("goal", {}) if isinstance(task_shared, Mapping) else {}
+    success = goal.get("success", {}) if isinstance(goal, Mapping) else {}
+    try:
+        hold_s = float(success.get("hold_s", 0.0))
+    except (TypeError, ValueError):
+        return 0.0
+    return hold_s if hold_s > 0.0 else 0.0
+
+
+#: Task-shipped reward terms that stay on when a reference is attached.
+#: The test is "does this constrain what the hardware may do, or does it
+#: prescribe what pose the robot holds?" -- limits, self-collision and
+#: actuator smoothness are the former and are compatible with ANY reference;
+#: `pose`, `upright`, the command-tracking terms and the gait shapers
+#: (`foot_clearance`, `air_time`, `foot_slip`, `foot_swing_height`,
+#: `angular_momentum`, `body_ang_vel`, `soft_landing`) are the latter and
+#: fight the motion being tracked. Matched as substrings so a task that names
+#: a term `robot_dof_pos_limits` is still recognised.
+_HARDWARE_SAFETY_TERM_MARKERS: tuple[str, ...] = (
+    "dof_pos_limits",
+    "dof_vel_limits",
+    "dof_torque_limits",
+    "joint_limits",
+    "torque_limits",
+    "self_collision",
+    "action_rate",
+    "action_smoothness",
+)
+
+
+def _is_hardware_safety_term(name: str) -> bool:
+    """Whether a task-shipped reward term constrains the hardware rather than
+    prescribing a posture (see `_HARDWARE_SAFETY_TERM_MARKERS`)."""
+    lowered = name.lower()
+    return any(marker in lowered for marker in _HARDWARE_SAFETY_TERM_MARKERS)
+
+
+def _reward_module_declares(reward_module_path: Any, key: str) -> bool:
+    """Read one boolean flag out of a reward module's `REWARD_SPEC`.
+
+    Fail-soft by design: a reward that cannot be imported here will fail
+    loudly a few lines later when `SculptorRewardTerm` loads it for real, and
+    guessing "tracking" for an unreadable module would silently change which
+    task rewards are active."""
+    if not reward_module_path:
+        return False
+    try:
+        from sculptor.adapters.base import _import_reward_module
+
+        mod = _import_reward_module(Path(reward_module_path))
+        spec = getattr(mod, "REWARD_SPEC", None)
+        return bool(isinstance(spec, dict) and spec.get(key))
+    except Exception:  # noqa: BLE001 — see docstring
+        return False
+
+
+def _authored_terminal_stillness_weight(
+    rewards: Mapping[str, Any],
+    authored_command_terms: frozenset[str],
+) -> float:
+    """Balance terminal supervision against the installed command contract.
+
+    Route-following terms can carry several times the nominal weight of the
+    terminal stillness term.  Once the finite route completes, those terms
+    become zero-command tracking objectives, but a broad tracking kernel can
+    still pay a stepping equilibrium much more than the stricter authored
+    dwell signal.  Make the phase-gated terminal objective at least as strong
+    as the aggregate command supervision that delivered the robot there.
+
+    The calculation uses only compiled command capabilities and live term
+    weights.  It therefore adapts to future velocity-command embodiments
+    without robot, simulator-task, or authored-prompt keying.
+    """
+    command_weight = 0.0
+    for name in authored_command_terms:
+        term = rewards.get(name)
+        try:
+            command_weight += abs(float(getattr(term, "weight", 0.0)))
+        except (TypeError, ValueError):
+            continue
+    return max(_SCULPTOR_TERMINAL_STILLNESS_WEIGHT, command_weight)
+
+
+def _authored_forbidden_contact_sensor_names(
+    world_bundle: Any | None,
+) -> tuple[str, ...]:
+    """Return compiled sensors for every authored forbidden contact pair."""
+    if world_bundle is None:
+        return ()
+    manifest = getattr(world_bundle, "manifest", None)
+    task_shared = getattr(manifest, "task_shared", {})
+    contacts = (
+        task_shared.get("contacts", {})
+        if isinstance(task_shared, Mapping)
+        else {}
+    )
+    forbidden = (
+        contacts.get("forbidden", ())
+        if isinstance(contacts, Mapping)
+        else ()
+    )
+    if not isinstance(forbidden, (list, tuple)):
+        return ()
+    return tuple(
+        f"authored_contact__forbidden__{index}"
+        for index, pair in enumerate(forbidden)
+        if isinstance(pair, (list, tuple)) and len(pair) == 2
+    )
+
+
+def _authored_forbidden_contact_weight(
+    rewards: Mapping[str, Any],
+    authored_command_terms: frozenset[str],
+) -> float:
+    """Scale collision avoidance above the command income it must override."""
+    command_weight = 0.0
+    for name in authored_command_terms:
+        term = rewards.get(name)
+        try:
+            command_weight += abs(float(getattr(term, "weight", 0.0)))
+        except (TypeError, ValueError):
+            continue
+    return max(
+        _SCULPTOR_FORBIDDEN_CONTACT_WEIGHT,
+        _SCULPTOR_FORBIDDEN_CONTACT_WEIGHT_SCALE * command_weight,
+    )
+
+
+def _authored_forbidden_contact_penalty(
+    env: Any, *, sensor_names: tuple[str, ...],
+) -> Any:
+    """Binary per-environment contact truth from compiled simulator sensors."""
+    import torch
+
+    found_any = torch.zeros(
+        int(env.num_envs), device=env.device, dtype=torch.bool)
+    for name in sensor_names:
+        try:
+            sensor = env.scene[name]
+        except (KeyError, TypeError) as exc:
+            raise RuntimeError(
+                f"compiled forbidden-contact sensor is absent: {name}"
+            ) from exc
+        found = sensor.data.found
+        if found.ndim > 1:
+            found = torch.any(
+                found > 0, dim=tuple(range(1, found.ndim)))
+        found_any |= found.to(device=env.device, dtype=torch.bool)
+    return found_any.to(dtype=torch.float32)
+
+
+def _clearance_maneuver_primary_scale(env: Any) -> Any:
+    """Return a per-environment firewall for command-only clearance maneuvers.
+
+    The authored task predicate remains immutable, while a capable command
+    term may temporarily target obstacle-safe approach and traversal points
+    around that predicate. Generated rewards only observe predicate-centered
+    channels and therefore cannot distinguish either intentional phase from
+    failure to approach the raw goal. Detect the command capability itself and
+    suppress only the conflicting generated reward until the immutable
+    predicate advances to the next waypoint.
+
+    This is intentionally based on typed runtime state, never an embodiment,
+    simulator task id, or prompt-specific name.
+    """
+    import torch
+
+    scale = torch.ones(
+        int(env.num_envs), device=env.device, dtype=torch.float32)
+    manager = getattr(env, "command_manager", None)
+    if manager is None:
+        return scale
+
+    for name in tuple(getattr(manager, "active_terms", ()) or ()):
+        try:
+            term = manager.get_term(name)
+            shifts = getattr(term, "_clearance_shifts")
+            waypoint_index = getattr(term, "_waypoint_index")
+        except (AttributeError, KeyError, RuntimeError):
+            continue
+
+        if (
+            not torch.is_tensor(shifts)
+            or shifts.ndim < 2
+            or shifts.shape[0] < 1
+            or shifts.shape[1] < 2
+        ):
+            continue
+        waypoint_index = torch.as_tensor(
+            waypoint_index, device=env.device, dtype=torch.long)
+        if tuple(waypoint_index.shape) != tuple(scale.shape):
+            continue
+
+        valid = (
+            (waypoint_index >= 0)
+            & (waypoint_index < int(shifts.shape[0]))
+        )
+        active_index = waypoint_index.clamp(
+            min=0, max=int(shifts.shape[0]) - 1)
+        active_shifts = shifts.to(
+            device=env.device, dtype=torch.float32)[active_index, :2]
+        adjusted = torch.linalg.norm(active_shifts, dim=-1) > 1e-6
+        maneuver_active = valid & adjusted
+        followthrough_pending = getattr(
+            term, "_clearance_followthrough_pending", None)
+        if torch.is_tensor(followthrough_pending):
+            followthrough_pending = followthrough_pending.to(
+                device=env.device, dtype=torch.bool)
+            if tuple(followthrough_pending.shape) == tuple(scale.shape):
+                maneuver_active |= followthrough_pending
+        scale = torch.where(
+            maneuver_active,
+            torch.full_like(scale, _CLEARANCE_STAGE_PRIMARY_SCALE),
+            scale,
+        )
+    return scale
+
+
+def _apply_clearance_maneuver_reward_firewall(
+    env: Any,
+    rewards: Any,
+    components: Any,
+) -> tuple[Any, Any]:
+    """Scale generated rewards to match active clearance-maneuver truth."""
+    import torch
+
+    scale = _clearance_maneuver_primary_scale(env)
+
+    def _scale_per_env(value: Any) -> Any:
+        if (
+            not torch.is_tensor(value)
+            or value.ndim < 1
+            or int(value.shape[0]) != int(scale.shape[0])
+        ):
+            return value
+        broadcast_shape = (int(scale.shape[0]),) + (1,) * (value.ndim - 1)
+        return value * scale.to(
+            device=value.device, dtype=value.dtype).reshape(broadcast_shape)
+
+    scaled_rewards = _scale_per_env(rewards)
+    if isinstance(components, dict):
+        components = {
+            name: _scale_per_env(value)
+            for name, value in components.items()
+        }
+    return scaled_rewards, components
+
+
+def _authored_terminal_stillness_state(
+    env: Any, *, lin_std: float, ang_std: float, joint_std: float,
+    upright_z_max: float = -0.7,
+    joint_pos_tolerance: float = 0.6,
+    upright_std: float = 0.35,
+    joint_pos_std: float = 0.6,
+) -> tuple[Any, Any, Any, Any]:
+    """Return terminal phase, score, horizontal speed, and whole-body quiet.
+
+    The command term owns phase truth and exposes is_standing_env once its
+    finite route completes.  Query that capability generically across active
+    commands: no embodiment, simulator task id, or authored prompt name is
+    involved.  Before completion this term is identically zero and therefore
+    cannot trade route progress for standing early.
+    """
+    import torch
+
+    standing = torch.zeros(
+        int(env.num_envs), device=env.device, dtype=torch.bool)
+    manager = getattr(env, "command_manager", None)
+    if manager is None:
+        zeros = standing.float()
+        return (
+            standing,
+            zeros,
+            torch.full_like(zeros, float("inf")),
+            standing,
+        )
+    for name in tuple(getattr(manager, "active_terms", ()) or ()):
+        try:
+            term = manager.get_term(name)
+        except (KeyError, AttributeError):
+            continue
+        flag = getattr(term, "is_standing_env", None)
+        if flag is not None and tuple(flag.shape) == tuple(standing.shape):
+            standing |= flag.to(device=env.device, dtype=torch.bool)
+
+    robot = None
+    try:
+        robot = env.scene["robot"]
+    except (KeyError, TypeError):
+        pass
+    if robot is None:
+        for attr in ("entities", "_entities"):
+            entities = getattr(env.scene, attr, None)
+            if not isinstance(entities, Mapping):
+                continue
+            robot = next(
+                (
+                    entity for entity in entities.values()
+                    if hasattr(getattr(entity, "data", None), "joint_vel")
+                ),
+                None,
+            )
+            if robot is not None:
+                break
+    if robot is None:
+        zeros = standing.float() * 0.0
+        return (
+            standing,
+            zeros,
+            torch.full_like(zeros, float("inf")),
+            torch.zeros_like(standing),
+        )
+
+    data = robot.data
+    lin_vel = getattr(data, "root_link_lin_vel_b", None)
+    if lin_vel is None:
+        lin_vel = getattr(data, "root_link_lin_vel_w", None)
+    ang_vel = getattr(data, "root_link_ang_vel_b", None)
+    if ang_vel is None:
+        ang_vel = getattr(data, "root_link_ang_vel_w", None)
+    joint_vel = getattr(data, "joint_vel", None)
+    if lin_vel is None or ang_vel is None or joint_vel is None:
+        zeros = standing.float() * 0.0
+        return (
+            standing,
+            zeros,
+            torch.full_like(zeros, float("inf")),
+            torch.zeros_like(standing),
+        )
+
+    horizontal_speed = torch.linalg.vector_norm(lin_vel[:, :2], dim=-1)
+    angular_speed = torch.linalg.vector_norm(ang_vel, dim=-1)
+    joint_rms = torch.sqrt(torch.mean(torch.square(joint_vel), dim=-1))
+    whole_body_quiet = (
+        (horizontal_speed < float(lin_std))
+        & (angular_speed < float(ang_std))
+        & (joint_rms < float(joint_std))
+    )
+    score = (
+        0.60 * torch.exp(-torch.square(horizontal_speed / float(lin_std)))
+        + 0.25 * torch.exp(-torch.square(angular_speed / float(ang_std)))
+        + 0.15 * torch.exp(-torch.square(joint_rms / float(joint_std)))
+    )
+    posture_factor = torch.ones_like(score)
+    posture_signal_available = False
+
+    # A motionless collapse is not an authored upright hold.  Projected
+    # gravity and the articulation's own default joint pose are generic
+    # posture references available on every floating-base locomotion robot;
+    # no embodiment or task identifier is involved.  Gate the kinematic score
+    # by the product of every available posture score.  This is a smooth
+    # conjunction: the former geometric mean diluted a single failing posture
+    # factor (for example a folded articulation under a moderately upright
+    # torso), leaving enough terminal income to form a stable crouch optimum.
+    # Missing signals remain fail-soft for fixed-base/custom adapters,
+    # preserving their old behavior.
+    projected_gravity = getattr(data, "projected_gravity_b", None)
+    if (
+        projected_gravity is not None
+        and getattr(projected_gravity, "ndim", 0) == 2
+        and projected_gravity.shape[0] == standing.shape[0]
+        and projected_gravity.shape[1] >= 3
+    ):
+        gravity_z = projected_gravity[:, 2]
+        upright_score = torch.exp(
+            -torch.square((gravity_z + 1.0) / float(upright_std))
+        )
+        posture_factor *= upright_score
+        posture_signal_available = True
+        whole_body_quiet &= gravity_z < float(upright_z_max)
+
+    joint_pos = getattr(data, "joint_pos", None)
+    default_joint_pos = getattr(data, "default_joint_pos", None)
+    if (
+        joint_pos is not None
+        and default_joint_pos is not None
+        and tuple(joint_pos.shape) == tuple(default_joint_pos.shape)
+        and getattr(joint_pos, "ndim", 0) == 2
+    ):
+        joint_pos_rms = torch.sqrt(
+            torch.mean(torch.square(joint_pos - default_joint_pos), dim=-1)
+        )
+        pose_score = torch.exp(
+            -torch.square(joint_pos_rms / float(joint_pos_std))
+        )
+        posture_factor *= pose_score
+        posture_signal_available = True
+        whole_body_quiet &= joint_pos_rms < float(joint_pos_tolerance)
+    if posture_signal_available:
+        score *= posture_factor
+    return standing, score, horizontal_speed, whole_body_quiet
+
+
+def _authored_terminal_stillness_reward(
+    env: Any, *, lin_std: float, ang_std: float, joint_std: float,
+    upright_z_max: float = -0.7,
+    joint_pos_tolerance: float = 0.6,
+    upright_std: float = 0.35,
+    joint_pos_std: float = 0.6,
+) -> Any:
+    """Dense whole-body stillness, active only after an authored command ends."""
+    standing, score, _horizontal_speed, _whole_body_quiet = (
+        _authored_terminal_stillness_state(
+            env,
+            lin_std=lin_std,
+            ang_std=ang_std,
+            joint_std=joint_std,
+            upright_z_max=upright_z_max,
+            joint_pos_tolerance=joint_pos_tolerance,
+            upright_std=upright_std,
+            joint_pos_std=joint_pos_std,
+        )
+    )
+    return score * standing.to(dtype=score.dtype)
+
+
+def _build_authored_terminal_stillness_term_class():
+    """Build stateful dwell supervision with an interruption-sensitive streak.
+
+    A frame-wise stillness score cannot distinguish one uninterrupted dwell
+    from many quiet samples separated by corrective steps.  The compiled
+    authored goal supplies the required dwell duration.  This term accumulates
+    a private per-environment quiet streak only in the command's terminal
+    standing phase, rewards increasing consecutive progress, and applies the
+    lost progress as an interruption penalty.  Its reset method follows the
+    reward manager's selective per-environment reset contract.
+    """
+    import torch
+
+    class AuthoredTerminalStillnessTerm:
+        def __init__(self, cfg, env):  # type: ignore[no-untyped-def]
+            # ManagerBase constructs class-backed terms with these exact
+            # keyword names (`func(cfg=term_cfg, env=self._env)`).
+            del cfg
+            self._quiet_streak_s = torch.zeros(
+                int(env.num_envs), device=env.device)
+
+        def __call__(
+            self,
+            env,
+            *,
+            lin_std: float,
+            ang_std: float,
+            joint_std: float,
+            hold_s: float,
+            continuity_scale: float,
+            upright_z_max: float = -0.7,
+            joint_pos_tolerance: float = 0.6,
+            upright_std: float = 0.35,
+            joint_pos_std: float = 0.6,
+        ):
+            standing, score, _horizontal_speed, whole_body_quiet = (
+                _authored_terminal_stillness_state(
+                    env,
+                    lin_std=lin_std,
+                    ang_std=ang_std,
+                    joint_std=joint_std,
+                    upright_z_max=upright_z_max,
+                    joint_pos_tolerance=joint_pos_tolerance,
+                    upright_std=upright_std,
+                    joint_pos_std=joint_pos_std,
+                )
+            )
+            dtype = score.dtype
+            if (
+                tuple(self._quiet_streak_s.shape) != tuple(standing.shape)
+                or self._quiet_streak_s.device != standing.device
+                or self._quiet_streak_s.dtype != dtype
+            ):
+                self._quiet_streak_s = torch.zeros_like(
+                    score, device=standing.device, dtype=dtype)
+
+            step_dt = max(float(env.step_dt), 1e-6)
+            duration = max(float(hold_s), step_dt)
+            previous = self._quiet_streak_s
+            # Base translation alone is not a sufficient definition of
+            # stillness: a policy can step in place, rotate, or swing joints
+            # while remaining under the horizontal-speed threshold.  Require
+            # every velocity component already used by the dense whole-body
+            # score so an uninterrupted dwell cannot hide a rhythmic sway.
+            quiet = standing & whole_body_quiet
+            streak = torch.where(
+                quiet,
+                torch.clamp(previous + step_dt, max=duration),
+                torch.zeros_like(previous),
+            )
+            previous_progress = previous / duration
+            progress = streak / duration
+            # RewardManager applies scale_by_dt after evaluating this term.
+            # Express the potential difference as a per-second rate so its
+            # integrated gain/loss is invariant to the simulator timestep.
+            # Without `/ step_dt`, a corrective step lost only dt times its
+            # accumulated progress and was effectively free at 50 Hz.
+            delta_rate = torch.where(
+                standing,
+                (progress - previous_progress) / step_dt,
+                torch.zeros_like(progress),
+            )
+            continuity = torch.square(progress) + delta_rate
+            self._quiet_streak_s = torch.where(
+                standing, streak, torch.zeros_like(streak)).detach()
+            dense = score * standing.to(dtype=dtype)
+            return dense + float(continuity_scale) * continuity
+
+        def reset(self, env_ids):  # type: ignore[no-untyped-def]
+            self._quiet_streak_s[env_ids] = 0.0
+
+    return AuthoredTerminalStillnessTerm
+
+
+def _reward_visible_rollout_evidence(
+    trajectory: Mapping[str, Any], catalog: Any, valid_mask: Any,
+) -> dict[str, Any]:
+    """Summarize batch-wide task evidence without crossing the metric firewall.
+
+    Four rendered keyframes are necessarily ambiguous for courses, contacts,
+    and manipulation.  The authored channel catalog already labels which
+    arrays reward authoring may see.  Summarize only ``shared_shaping``
+    progress and motion channels, over each environment's first episode, so
+    the diagnoser can ground its visual interpretation without receiving a
+    success predicate, held-out contact, objective score, or other metric-only
+    signal.  The selection is semantic (catalog role/access), never keyed to a
+    robot, task, goal, or channel name.
+    """
+    import numpy as np
+
+    mask = np.asarray(valid_mask, dtype=bool)
+    if mask.ndim != 2:
+        return {}
+
+    def rounded(value: float) -> float:
+        return round(float(value), 5)
+
+    summaries: dict[str, Any] = {}
+    for spec in tuple(getattr(catalog, "channels", ()) or ()):
+        if str(getattr(spec, "access", "")) != "shared_shaping":
+            continue
+        role = str(getattr(spec, "metric_role", ""))
+        producer = str(getattr(spec, "producer", ""))
+        if role != "progress" and producer != "entity_state":
+            continue
+        name = str(getattr(spec, "name", ""))
+        # Position and quaternion state add prompt volume but little behavioral
+        # evidence; for generic entity state, retain only motion channels.
+        if producer == "entity_state" and not name.endswith(
+                ("__lin_vel_w", "__ang_vel_w")):
+            continue
+        raw = trajectory.get(name)
+        if raw is None:
+            continue
+        values = np.asarray(raw)
+        if values.ndim < 2 or values.shape[:2] != mask.shape:
+            continue
+        magnitude = (
+            np.linalg.norm(values, axis=-1)
+            if values.ndim > 2 else values.astype(np.float64, copy=False)
+        )
+        if magnitude.shape != mask.shape:
+            continue
+        per_env: list[np.ndarray] = [
+            magnitude[:, env_i][mask[:, env_i]]
+            for env_i in range(mask.shape[1])
+        ]
+        per_env = [series[np.isfinite(series)] for series in per_env
+                   if series.size]
+        if not per_env or any(not series.size for series in per_env):
+            continue
+        start = np.asarray([series[0] for series in per_env])
+        final = np.asarray([series[-1] for series in per_env])
+        minimum = np.asarray([np.min(series) for series in per_env])
+        maximum = np.asarray([np.max(series) for series in per_env])
+        summaries[name] = {
+            "role": role,
+            "value": "vector_magnitude" if values.ndim > 2 else "scalar",
+            "environments": len(per_env),
+            "start_median": rounded(np.median(start)),
+            "final_median": rounded(np.median(final)),
+            "final_p10": rounded(np.quantile(final, 0.1)),
+            "final_p90": rounded(np.quantile(final, 0.9)),
+            "final_zero_fraction": rounded(np.mean(np.abs(final) <= 1e-6)),
+            "min_over_time_median": rounded(np.median(minimum)),
+            "max_over_time_median": rounded(np.median(maximum)),
+            "max_over_time_p90": rounded(np.quantile(maximum, 0.9)),
+        }
+    if not summaries:
+        return {}
+    return {
+        "policy": "shared_shaping channels only; metric_only excluded",
+        "episode_scope": "first episode per environment",
+        "channels": summaries,
+    }
+
+
+def _load_authored_robot_capability(selection_path: str) -> Any | None:
+    if not selection_path:
+        return None
+    from sculptor.world.capabilities import resolve_robot_capability
+    from sculptor.world.project import load_selected_world
+
+    _store, _selection, bundle = load_selected_world(selection_path)
+    robot = bundle["world"]["shared"]["robot"]
+    return resolve_robot_capability(
+        robot["capability_id"],
+        required=robot.get("required_capabilities", []),
+        extra_paths=([robot["descriptor_path"]]
+                     if robot.get("descriptor_path") else []),
+    )
+
+
+def _primary_robot_entity(env_cfg: Any) -> str:
+    """The scene's articulated-robot entity NAME — NOT hard-coded 'robot'. The
+    locomotion tasks name it 'robot', but cartpole names it 'cartpole', object
+    tasks add object entities, etc. A DR / reset event that targets a name the
+    scene doesn't have raises KeyError at env startup and crashes training (the
+    cartpole smoke-train regression). Prefer 'robot'; else the first non-terrain
+    entity; fall back to 'robot' when the scene cfg isn't introspectable."""
+    try:
+        ents = getattr(getattr(env_cfg, "scene", None), "entities", None)
+        names = list(ents.keys()) if hasattr(ents, "keys") else []
+        if "robot" in names:
+            return "robot"
+        for n in names:
+            if str(n).lower() not in ("terrain", "ground", "plane", "light"):
+                return str(n)
+    except Exception:  # noqa: BLE001
+        pass
+    return "robot"
+
+
+def _is_pd_actuated(env_cfg: Any, rname: str) -> bool:
+    """True iff EVERY actuator on the robot is a PD/position type mjlab's
+    `dr.pd_gains` / `dr.effort_limits` support (BuiltinPosition, IdealPd, or an
+    XmlActuator in `position` command mode). A motor/velocity/muscle actuator —
+    e.g. the cartpole `<motor>` — makes those DR funcs raise TypeError at env
+    STARTUP (invisible to cfg-building tests), aborting training. When we cannot
+    confirm PD actuation we skip the gain/effort DR axes rather than risk that
+    crash (the always-on mass/damping/armature axes are safe regardless)."""
+    try:
+        acts = env_cfg.scene.entities[rname].articulation.actuators
+    except Exception:  # noqa: BLE001
+        return False
+    if not acts:
+        return False
+    for a in acts:
+        tname = type(a).__name__
+        if tname in ("BuiltinPositionActuatorCfg", "IdealPdActuatorCfg"):
+            continue
+        if tname == "XmlActuatorCfg" and getattr(a, "command_field", None) == "position":
+            continue
+        return False   # any non-PD actuator → skip the gain/effort DR axes
+    return True
+
+
+#: §always-on baseline physics domain randomization (arXiv 1710.06537 mass +
+#: joint damping; RMA 2107.04034). ONLY crash-safe pure model-field SCALE axes —
+#: every body has a mass and every dof a (possibly-zero) damping/armature, so
+#: scaling them can never fault at env startup on any robot. Kept MODERATE
+#: (BeyondMimic 2508.08241: over-wide DR dilutes the objective). Merged for any
+#: TRAIN spec that omits them; richer axes (pd_gains, motor strength, CoM,
+#: whole-body friction) are opt-in via the env spec / generator.
+_DEFAULT_PHYSICS_DR: dict[str, tuple[float, float]] = {
+    "body_mass_scale_range": (0.85, 1.15),
+    "joint_damping_scale_range": (0.8, 1.2),
+    "joint_armature_scale_range": (0.8, 1.2),
+}
+
+
+def _apply_env_spec(env_cfg: Any, spec: "dict | None", *,
+                    train: bool = True, task_id: str = "") -> None:
+    """§RL_SCULPTOR_AUDIT (env generalization, 2026-07-04): apply a
+    validated env spec to the loaded task cfg, before the env is built.
+    General successor to the retired jump-only `_apply_env_profile` —
+    the spec's `shared` section applies to BOTH train and rollout (the
+    policy is evaluated under its training task); its `train` section
+    is TRAIN-ONLY curricula (RSI resets, sunk termination, domain
+    randomization) so rollout evaluation — and the metric's view of the
+    task — is never touched by them.
+
+    The measured rationale for the jump preset's values (dead `fallen`
+    signal at 70°, termination-as-escape, RSI/early-termination pairing,
+    command-curriculum re-widening) lives in the audit doc's loop-4a /
+    loop-6 entries; this function only maps schema semantics onto mjlab
+    cfg fields. FULLY DEFENSIVE per-mutation: any cfg-shape drift skips
+    that mutation with a warning, never breaks the run.
+
+    `task_id` (the adapter's `--task-id`, e.g.
+    "Mjlab-Velocity-Flat-Unitree-G1") is ONLY used to resolve the robot's
+    canonical joint order for `train.reset_joint_pos_target`
+    (§REFERENCE_TRAJECTORY_PLAN §8 part 2) — the env isn't built yet at
+    this point, so the live `Entity.joint_names` isn't available; the
+    static manifest (`sculptor.eval.robot_manifest`) is the ground truth
+    used instead, same source the pre-run required-joint-roles gate
+    already trusts. Omitted only when the spec carries no joint-target
+    key (no behavior change for every existing caller)."""
+    if not spec:
+        # Rollout with no spec stays untouched (evaluation must be
+        # un-randomized so the metric sees the TRUE task). A TRAIN call with no
+        # spec still gets the always-on physics DR below — the "in any case"
+        # guarantee that every training run/stage is domain-randomized.
+        if not train:
+            return
+        spec = {}
+    import math
+
+    shared = spec.get("shared") or {}
+    train_sec = dict(spec.get("train") or {}) if train else {}
+    # §always-on physics DR (Dynamics Randomization arXiv 1710.06537; RMA
+    # 2107.04034): fill CRASH-SAFE, MODERATE defaults for any physics axis the
+    # spec/LLM omitted, so EVERY train run/stage is dynamics-randomized even with
+    # no authored/generated env spec. Only pure model-field SCALE axes go here
+    # (mass/damping/armature can never crash on any robot); actuator-shape-
+    # dependent axes (pd_gains/effort/CoM/body-friction) stay OPT-IN via the spec
+    # so a non-PD or unusual robot can't fault at env startup. Train-only:
+    # train_sec is empty on rollout, keeping evaluation un-randomized.
+    if train:
+        for _k, _v in _DEFAULT_PHYSICS_DR.items():
+            train_sec.setdefault(_k, _v)
+    applied: list[str] = []
+
+    def _skip(what: str, e: Exception) -> None:
+        print(f"[runner] env-spec: {what} skipped: "
+              f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
+
+    if shared.get("zero_velocity_commands"):
+        try:
+            twist = (getattr(env_cfg, "commands", None) or {}).get("twist")
+            if twist is not None:
+                wrote_c = False
+                ranges = getattr(twist, "ranges", None)
+                for f in ("lin_vel_x", "lin_vel_y", "ang_vel_z"):
+                    if ranges is not None and hasattr(ranges, f):
+                        setattr(ranges, f, (0.0, 0.0))
+                        wrote_c = True
+                # heading must be None (not (0,0)) — UniformVelocityCommand
+                # rejects ANY truthy heading range when heading_command=False
+                # (caught live: first loop-4 E2E launch, 2026-07-01).
+                if ranges is not None and hasattr(ranges, "heading"):
+                    ranges.heading = None
+                    wrote_c = True
+                for f, v in (("rel_standing_envs", 1.0),
+                             ("rel_heading_envs", 0.0),
+                             ("rel_forward_envs", 0.0),
+                             ("heading_command", False)):
+                    if hasattr(twist, f):
+                        setattr(twist, f, v)
+                        wrote_c = True
+                if wrote_c:
+                    applied.append("commands:twist→zero/standing")
+        except Exception as e:  # noqa: BLE001 — never break a run
+            _skip("command zeroing", e)
+        # Coupled by construction: the command curriculum RE-WIDENS the
+        # zeroed ranges mid-training, silently undoing the zeroing.
+        try:
+            cur = getattr(env_cfg, "curriculum", None)
+            if isinstance(cur, dict) and cur.pop("command_vel", None) is not None:
+                applied.append("curriculum:command_vel→removed")
+        except Exception as e:  # noqa: BLE001
+            _skip("curriculum trim", e)
+
+    # Push events: the train section may override the shared setting
+    # (e.g. robustness pushes during training only).
+    push = train_sec.get("push_events", shared.get("push_events"))
+    if isinstance(push, dict):
+        try:
+            events = getattr(env_cfg, "events", None)
+            if isinstance(events, dict) and "push_robot" in events:
+                if not push.get("enabled", True):
+                    events.pop("push_robot")
+                    applied.append("events:push_robot→removed")
+                else:
+                    term = events["push_robot"]
+                    wrote_p = False
+                    iv = push.get("interval_s")
+                    if iv is not None and hasattr(term, "interval_range_s"):
+                        term.interval_range_s = (float(iv[0]), float(iv[1]))
+                        wrote_p = True
+                    params = getattr(term, "params", None)
+                    vr = (params or {}).get("velocity_range")
+                    if isinstance(vr, dict):
+                        lin = push.get("linear_mps")
+                        if lin is not None:
+                            for ax in ("x", "y", "z"):
+                                if ax in vr:
+                                    vr[ax] = (-float(lin), float(lin))
+                                    wrote_p = True
+                        ang = push.get("angular_radps")
+                        if ang is not None:
+                            for ax in ("roll", "pitch", "yaw"):
+                                if ax in vr:
+                                    vr[ax] = (-float(ang), float(ang))
+                                    wrote_p = True
+                    if wrote_p:
+                        applied.append("events:push_robot→retuned")
+        except Exception as e:  # noqa: BLE001
+            _skip("push_robot", e)
+
+    if shared.get("orientation_termination_deg") is not None:
+        try:
+            term = (getattr(env_cfg, "terminations", None) or {}).get("fell_over")
+            params = getattr(term, "params", None)
+            if isinstance(params, dict) and "limit_angle" in params:
+                deg = float(shared["orientation_termination_deg"])
+                params["limit_angle"] = math.radians(deg)
+                applied.append(f"terminations:fell_over→{deg:g}deg")
+        except Exception as e:  # noqa: BLE001
+            _skip("fell_over relax", e)
+
+    if shared.get("episode_length_s") is not None:
+        try:
+            if hasattr(env_cfg, "episode_length_s"):
+                env_cfg.episode_length_s = float(shared["episode_length_s"])
+                applied.append(f"episode_length_s→{env_cfg.episode_length_s:g}")
+        except Exception as e:  # noqa: BLE001
+            _skip("episode length", e)
+
+    # ── train-only curricula (skipped entirely when train=False) ──────
+    rsi_z = train_sec.get("reset_height_offset_m")
+    rsi_vz = train_sec.get("reset_vertical_velocity_mps")
+    rsi_vxy = train_sec.get("reset_horizontal_velocity_mps")
+    rsi_pitch = train_sec.get("reset_pitch_offset_rad")
+    rsi_roll = train_sec.get("reset_roll_offset_rad")
+    if (rsi_z is not None or rsi_vz is not None or rsi_vxy is not None
+            or rsi_pitch is not None or rsi_roll is not None):
+        try:
+            reset = (getattr(env_cfg, "events", None) or {}).get("reset_base")
+            params = getattr(reset, "params", None)
+            if isinstance(params, dict):
+                # Height/orientation offsets need pose_range; the
+                # velocity keys only write velocity_range — don't couple
+                # them to it. Tag applied[] per ACTUAL write so a dead
+                # sub-knob is visible to the disclosure below (a spec key
+                # the cfg can't honor must never read as applied).
+                wrote: list[str] = []
+                pose_range = params.get("pose_range")
+                if isinstance(pose_range, dict):
+                    if rsi_z is not None:
+                        pose_range["z"] = (float(rsi_z[0]), float(rsi_z[1]))
+                        wrote.append("z")
+                    # §REFERENCE_TRAJECTORY_PLAN §8 part 1: mjlab's
+                    # reset_root_state_uniform natively reads
+                    # pose_range["pitch"]/["roll"] (radians, offset from
+                    # the entity's default orientation via quat_mul) —
+                    # confirmed in .venv/.../mjlab/envs/mdp/events.py.
+                    # A lying get-up start is exactly a large pitch (face
+                    # up/down) or roll (on-the-side) offset.
+                    if rsi_pitch is not None:
+                        pose_range["pitch"] = (
+                            float(rsi_pitch[0]), float(rsi_pitch[1]))
+                        wrote.append("pitch")
+                    if rsi_roll is not None:
+                        pose_range["roll"] = (
+                            float(rsi_roll[0]), float(rsi_roll[1]))
+                        wrote.append("roll")
+                if rsi_vz is not None or rsi_vxy is not None:
+                    vr = params.get("velocity_range")
+                    if not isinstance(vr, dict):
+                        vr = {}
+                        params["velocity_range"] = vr
+                    if rsi_vz is not None:
+                        vr["z"] = (float(rsi_vz[0]), float(rsi_vz[1]))
+                        wrote.append("vz")
+                    if rsi_vxy is not None:
+                        vr["x"] = (float(rsi_vxy[0]), float(rsi_vxy[1]))
+                        vr["y"] = (float(rsi_vxy[0]), float(rsi_vxy[1]))
+                        wrote.append("vxy")
+                if wrote:
+                    applied.append(f"reset_base→RSI({','.join(wrote)})")
+        except Exception as e:  # noqa: BLE001
+            _skip("RSI reset", e)
+
+    jp = train_sec.get("reset_joint_position_offset_rad")
+    jv = train_sec.get("reset_joint_velocity_radps")
+    if jp is not None or jv is not None:
+        try:
+            reset = (getattr(env_cfg, "events", None) or {}).get(
+                "reset_robot_joints")
+            params = getattr(reset, "params", None)
+            if isinstance(params, dict):
+                wrote_j: list[str] = []
+                if jp is not None and "position_range" in params:
+                    params["position_range"] = (float(jp[0]), float(jp[1]))
+                    wrote_j.append("pos")
+                if jv is not None and "velocity_range" in params:
+                    params["velocity_range"] = (float(jv[0]), float(jv[1]))
+                    wrote_j.append("vel")
+                if wrote_j:
+                    applied.append(
+                        f"reset_robot_joints→randomized({','.join(wrote_j)})")
+        except Exception as e:  # noqa: BLE001
+            _skip("joint reset", e)
+
+    # §REFERENCE_TRAJECTORY_PLAN §8 part 2: per-joint reference-posture
+    # reset. mjlab's shipped `reset_joints_by_offset` has NO per-joint
+    # target mechanism (a single uniform range from the STANDING
+    # default — confirmed by reading events.py during recon), so this
+    # injects a NEW event term (`reset_joints_to_reference`, defined
+    # above in this module) exactly like the `sunk` termination below is
+    # already injected into mjlab's plain `dict[str, ...]` managers.
+    # Length is validated against the robot's CANONICAL joint order
+    # (`sculptor.eval.robot_manifest`, resolved via `task_id`) here —
+    # the env isn't built yet, so this is the only ground truth
+    # available at cfg-mutation time. A mismatch is a CLEAR error (never
+    # a silent misassignment): the caller already validated the spec
+    # schema-wise, but "does this vector match THIS robot" is a
+    # robot-specific check the schema layer cannot make.
+    # §DeepMimic phase RSI (arXiv 1804.02717): a full downsampled reference
+    # TRAJECTORY (reset_joint_pos_trajectory [K][J], + optional _vel_) takes
+    # precedence over the single median posture — the reset event then samples a
+    # random frame per env and initializes joint pos AND vel from it, so the
+    # batch covers the whole motion manifold instead of one pose.
+    jpt = train_sec.get("reset_joint_pos_target")
+    jpt_traj = train_sec.get("reset_joint_pos_trajectory")
+    jvt_traj = train_sec.get("reset_joint_vel_trajectory")
+    jpt_noise = train_sec.get("reset_joint_pos_noise_rad")
+    if jpt is not None or jpt_traj is not None:
+        try:
+            from sculptor.eval.robot_manifest import robot_joint_names
+
+            # Joint width comes from the trajectory's frames when present, else
+            # the single target.
+            width = len(jpt_traj[0]) if jpt_traj is not None else len(jpt)
+            canonical = robot_joint_names(task_id)
+            if canonical is not None and width != len(canonical):
+                raise ValueError(
+                    f"reference reset has {width} joints but robot "
+                    f"{task_id!r} has {len(canonical)} ({canonical[:3]}...) — "
+                    f"refusing to apply a mismatched per-joint reset")
+            reset = getattr(env_cfg, "events", None)
+            if isinstance(reset, dict):
+                import torch
+
+                from mjlab.managers.event_manager import EventTermCfg
+                from mjlab.managers.scene_entity_config import SceneEntityCfg
+
+                params: dict[str, Any] = {
+                    "joint_pos_noise": float(jpt_noise or 0.0),
+                    "asset_cfg": SceneEntityCfg(
+                        _primary_robot_entity(env_cfg), joint_names=(".*",)),
+                }
+                if jpt_traj is not None:
+                    params["joint_pos_traj"] = torch.tensor(
+                        [[float(x) for x in frame] for frame in jpt_traj],
+                        dtype=torch.float32)
+                    # Only carry the velocity trajectory when its shape matches
+                    # (same K frames, same J) — the reset event indexes it with a
+                    # frame sampled from the position traj, so a mismatch would
+                    # crash at reset. A validated spec can't reach here mismatched;
+                    # this is the defensive backstop for an unvalidated caller.
+                    vel_ok = (jvt_traj is not None
+                              and len(jvt_traj) == len(jpt_traj)
+                              and len(jvt_traj[0]) == width)
+                    if vel_ok:
+                        params["joint_vel_traj"] = torch.tensor(
+                            [[float(x) for x in frame] for frame in jvt_traj],
+                            dtype=torch.float32)
+                    elif jvt_traj is not None:
+                        _skip("phase-RSI velocity trajectory", RuntimeError(
+                            "shape mismatch with position trajectory — "
+                            "using default joint velocities"))
+                    label = (f"phase-RSI {len(jpt_traj)} frames×{width} joints"
+                             + (", +vel" if vel_ok else ""))
+                else:
+                    params["joint_pos_target"] = torch.tensor(
+                        [float(x) for x in jpt], dtype=torch.float32)
+                    label = f"{width} joints"
+                reset["reset_robot_joints_to_reference"] = EventTermCfg(
+                    func=reset_joints_to_reference, mode="reset", params=params)
+                applied.append(
+                    f"events:+reset_robot_joints_to_reference({label})")
+        except Exception as e:  # noqa: BLE001
+            _skip("reference joint-posture reset", e)
+
+    fr = train_sec.get("friction_range")
+    if fr is not None:
+        try:
+            ev = (getattr(env_cfg, "events", None) or {}).get("foot_friction")
+            params = getattr(ev, "params", None)
+            if isinstance(params, dict) and "ranges" in params:
+                params["ranges"] = (float(fr[0]), float(fr[1]))
+                applied.append(f"events:foot_friction→({fr[0]:g},{fr[1]:g})")
+        except Exception as e:  # noqa: BLE001
+            _skip("friction randomization", e)
+
+    # ── §sim2real physics domain randomization ──────────────────────────────
+    # Mass, base CoM, PD gains, motor strength, joint damping/armature, and
+    # whole-body friction as startup DR events on the robot (Dynamics
+    # Randomization arXiv 1710.06537; RMA 2107.04034; Rapid Locomotion 2205.02824
+    # + Walk-These-Ways 2212.03238). This runs on EVERY train/rollout — the
+    # world-INDEPENDENT chokepoint both the mission-stage and single-run paths
+    # funnel through — so physics DR is applied in every case, not only for
+    # authored worlds. `startup` mode (each env samples once → the parallel batch
+    # spans the distribution; the per-iteration seed re-rolls it) avoids the
+    # expensive per-reset recompute mjlab warns about for mass/armature.
+    physics_specs: list[tuple[str, Any, str]] = []
+    try:
+        from mjlab.envs.mdp import dr as _dr
+        from mjlab.managers.event_manager import EventTermCfg as _ETC
+        from mjlab.managers.scene_entity_config import SceneEntityCfg as _SEC
+
+        _rname = _primary_robot_entity(env_cfg)
+        bodies = _SEC(_rname, body_names=(".*",))
+        joints = _SEC(_rname, joint_names=(".*",))
+        acts = _SEC(_rname, actuator_names=(".*",))
+        geoms = _SEC(_rname, geom_names=(".*",))
+
+        def _rng(key: str) -> "tuple[float, float] | None":
+            v = train_sec.get(key)
+            return (float(v[0]), float(v[1])) if v is not None else None
+
+        m = _rng("body_mass_scale_range")
+        if m is not None:
+            physics_specs.append(("env_dr__body_mass", _ETC(
+                mode="startup", func=_dr.body_mass,
+                params={"asset_cfg": bodies, "operation": "scale", "ranges": m}),
+                f"body_mass×{m}"))
+        com = train_sec.get("com_offset_m")
+        if com is not None and float(com) > 0.0:
+            c = float(com)
+            physics_specs.append(("env_dr__com", _ETC(
+                mode="startup", func=_dr.body_com_offset,
+                params={"asset_cfg": bodies, "operation": "add",
+                        "ranges": {0: (-c, c), 1: (-c, c), 2: (-c, c)}}),
+                f"com±{c:g}m"))
+        # pd_gains / effort_limits ONLY support PD/position actuators — a
+        # motor/velocity actuator (cartpole) makes them raise at env startup, so
+        # gate on the actual actuator type (the install try/except can't catch a
+        # runtime startup fault). Real target robots (g1/go1/go2 IdealPd, yam
+        # BuiltinPosition) are PD; the axes are simply dropped elsewhere.
+        pd_ok = _is_pd_actuated(env_cfg, _rname)
+        kp, kd = _rng("pd_kp_scale_range"), _rng("pd_kd_scale_range")
+        if (kp is not None or kd is not None) and pd_ok:
+            physics_specs.append(("env_dr__pd_gains", _ETC(
+                mode="startup", func=_dr.pd_gains,
+                params={"asset_cfg": acts, "operation": "scale",
+                        "kp_range": kp or (1.0, 1.0), "kd_range": kd or (1.0, 1.0)}),
+                f"pd_gains(kp×{kp},kd×{kd})"))
+        elif (kp is not None or kd is not None) and not pd_ok:
+            _skip("pd_gains DR", RuntimeError(
+                f"robot {_rname!r} is not PD-actuated — skipping gain DR"))
+        eff = _rng("motor_strength_scale_range")
+        if eff is not None and pd_ok:
+            physics_specs.append(("env_dr__motor_strength", _ETC(
+                mode="startup", func=_dr.effort_limits,
+                params={"asset_cfg": acts, "operation": "scale",
+                        "effort_limit_range": eff}),
+                f"motor_strength×{eff}"))
+        elif eff is not None and not pd_ok:
+            _skip("motor_strength DR", RuntimeError(
+                f"robot {_rname!r} is not PD-actuated — skipping effort DR"))
+        dmp = _rng("joint_damping_scale_range")
+        if dmp is not None:
+            physics_specs.append(("env_dr__joint_damping", _ETC(
+                mode="startup", func=_dr.dof_damping,
+                params={"asset_cfg": joints, "operation": "scale", "ranges": dmp}),
+                f"joint_damping×{dmp}"))
+        arm = _rng("joint_armature_scale_range")
+        if arm is not None:
+            physics_specs.append(("env_dr__joint_armature", _ETC(
+                mode="startup", func=_dr.dof_armature,
+                params={"asset_cfg": joints, "operation": "scale", "ranges": arm}),
+                f"joint_armature×{arm}"))
+        bfr = _rng("body_friction_range")
+        if bfr is not None:
+            physics_specs.append(("env_dr__body_friction", _ETC(
+                mode="startup", func=_dr.geom_friction,
+                params={"asset_cfg": geoms, "operation": "abs", "ranges": bfr}),
+                f"body_friction={bfr}"))
+    except Exception as e:  # noqa: BLE001 — mjlab DR API import/build failure
+        _skip("physics DR setup", e)
+
+    if physics_specs:
+        try:
+            events = getattr(env_cfg, "events", None)
+            if isinstance(events, dict):
+                for name, term, label in physics_specs:
+                    events[name] = term
+                    applied.append(f"events:+{name}({label})")
+            else:
+                _skip("physics DR install", RuntimeError("env_cfg has no events"))
+        except Exception as e:  # noqa: BLE001
+            _skip("physics DR install", e)
+
+    # §get-up RSI fix (2026-07-09): a lying-start reset (large pitch/roll
+    # offset from upright) trips the task's own fell-over/bad-orientation
+    # termination on the reset itself — observed live: ALL envs terminate
+    # at step 0 (Episode_Termination/fell_over = num_envs), so get-up
+    # training never runs. `fell_over_termination: False` removes that
+    # term for TRAIN only; the sunk-height termination + episode time_out
+    # remain the episode enders. Term-name confirmed at the
+    # `orientation_termination_deg` site above ("fell_over"); mjlab's
+    # `terminations` cfg is a plain dict (same mechanism the `sunk`
+    # injection below relies on), so removal is a plain `.pop()`.
+    fell_over_off = train_sec.get("fell_over_termination") is False
+    if fell_over_off:
+        try:
+            terms = getattr(env_cfg, "terminations", None)
+            if isinstance(terms, dict) and terms.pop("fell_over", None) is not None:
+                applied.append("terminations:fell_over→removed")
+        except Exception as e:  # noqa: BLE001
+            _skip("fell_over removal", e)
+
+    sunk = train_sec.get("min_base_height_termination_m")
+    if sunk is not None:
+        # Early termination off the recoverable manifold — RSI's required
+        # other half (DeepMimic pairing; measured tuck-jump iters 19-20:
+        # RSI without it converges to the floor basin). TRAIN-ONLY by
+        # schema position — evaluation keeps honest full episodes.
+        try:
+            terms = getattr(env_cfg, "terminations", None)
+            if isinstance(terms, dict):
+                from mjlab.envs.mdp.terminations import (
+                    root_height_below_minimum,
+                )
+                from mjlab.managers.termination_manager import (
+                    TerminationTermCfg,
+                )
+                terms["sunk"] = TerminationTermCfg(
+                    func=root_height_below_minimum,
+                    params={"minimum_height": float(sunk)},
+                )
+                applied.append(f"terminations:+sunk(base<{float(sunk):g}m)")
+        except Exception as e:  # noqa: BLE001
+            _skip("sunk termination", e)
+
+    # Dead-knob disclosure: a spec key this task's cfg can't honor is a
+    # silent no-op by the never-break-a-run contract — but the sculpt
+    # loop's diagnoser iterates on these knobs, so it must be able to
+    # SEE that one is dead (e.g. friction_range on a task without a
+    # foot_friction event) instead of retuning it blindly forever.
+    requested: list[str] = []
+    if shared.get("zero_velocity_commands"):
+        requested.append("commands:twist→zero/standing")
+    if isinstance(push, dict):
+        if not push.get("enabled", True):
+            requested.append("events:push_robot→removed")
+        elif any(push.get(k) is not None
+                 for k in ("interval_s", "linear_mps", "angular_radps")):
+            # enabled=true with no retune values means "keep pushes" —
+            # honored by doing nothing, so it is never a dead knob.
+            requested.append("events:push_robot→retuned")
+    if shared.get("orientation_termination_deg") is not None:
+        requested.append("terminations:fell_over")
+    if shared.get("episode_length_s") is not None:
+        requested.append("episode_length_s")
+    if (rsi_z is not None or rsi_vz is not None or rsi_vxy is not None
+            or rsi_pitch is not None or rsi_roll is not None):
+        requested.append("reset_base→RSI")
+    if jp is not None or jv is not None:
+        requested.append("reset_robot_joints→randomized")
+    if jpt is not None:
+        requested.append("events:+reset_robot_joints_to_reference")
+    if fr is not None:
+        requested.append("events:foot_friction")
+    if fell_over_off:
+        requested.append("terminations:fell_over→removed")
+    if sunk is not None:
+        requested.append("terminations:+sunk")
+    dead = [r for r in requested
+            if not any(a.startswith(r.split("(")[0].split("→")[0])
+                       for a in applied)]
+    print(f"[runner] env-spec applied (train={train}): {applied}"
+          + (f"; NOT APPLICABLE on this task cfg: {dead}" if dead else ""),
+          file=sys.stderr, flush=True)
+
+
+def _apply_eval_reset(env_cfg: Any, payload: "dict | None", *,
+                       task_id: str = "") -> None:
+    """§D17: apply a stage-FIXED eval-rollout reset override — a small
+    ALLOWLISTED subset of `sculptor.reference.derive_eval_reset`'s
+    payload (single deterministic values, not train-iterable ranges).
+
+    Called from `_cmd_rollout` AFTER the existing shared-only
+    `_apply_env_spec(..., train=False, ...)` call, so it only ever adds
+    a fixed lying-start reset on top of the honest shared/eval task cfg
+    — it never reads or is influenced by the diagnoser-iterable
+    `env_spec.py` train section. Reuses the SAME cfg-mutation mechanisms
+    `_apply_env_spec` uses for train (pose_range height/pitch/roll,
+    the injected `reset_joints_to_reference` event, the `fell_over`
+    termination pop) so eval genuinely resets the way the derivation
+    promises — same code path, just fed a single midpoint value instead
+    of a [lo, hi] range. `None`/empty payload is a pure no-op (today's
+    standing-start behavior, byte-identical) — the common case for every
+    non-get-up stage.
+
+    Every mutation is defensive per-key (mirrors `_apply_env_spec`): a
+    cfg-shape drift skips that key with a warning, never breaks the
+    rollout. Announces what it actually wrote so the runner log makes a
+    reference-derived lying-start eval visible, not silent."""
+    if not payload:
+        return
+
+    def _skip(what: str, e: Exception) -> None:
+        print(f"[runner] eval-reset: {what} skipped: "
+              f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
+
+    applied: list[str] = []
+
+    z = payload.get("reset_height_offset_m")
+    vz = payload.get("reset_vertical_velocity_mps")
+    pitch = payload.get("reset_pitch_offset_rad")
+    roll = payload.get("reset_roll_offset_rad")
+    if z is not None or vz is not None or pitch is not None or roll is not None:
+        try:
+            reset = (getattr(env_cfg, "events", None) or {}).get("reset_base")
+            params = getattr(reset, "params", None)
+            if isinstance(params, dict):
+                wrote: list[str] = []
+                pose_range = params.get("pose_range")
+                if isinstance(pose_range, dict):
+                    if z is not None:
+                        pose_range["z"] = (float(z), float(z))
+                        wrote.append("z")
+                    if pitch is not None:
+                        pose_range["pitch"] = (float(pitch), float(pitch))
+                        wrote.append("pitch")
+                    if roll is not None:
+                        pose_range["roll"] = (float(roll), float(roll))
+                        wrote.append("roll")
+                if vz is not None:
+                    vr = params.get("velocity_range")
+                    if not isinstance(vr, dict):
+                        vr = {}
+                        params["velocity_range"] = vr
+                    vr["z"] = (float(vz), float(vz))
+                    wrote.append("vz")
+                if wrote:
+                    applied.append(f"reset_base→eval_reset({','.join(wrote)})")
+        except Exception as e:  # noqa: BLE001
+            _skip("eval reset pose/velocity", e)
+
+    jpt = payload.get("reset_joint_pos_target")
+    jpt_noise = payload.get("reset_joint_pos_noise_rad")
+    if jpt is not None:
+        try:
+            from sculptor.eval.robot_manifest import robot_joint_names
+
+            canonical = robot_joint_names(task_id)
+            if canonical is not None and len(jpt) != len(canonical):
+                raise ValueError(
+                    f"eval-reset reset_joint_pos_target has {len(jpt)} "
+                    f"elements but robot {task_id!r} has "
+                    f"{len(canonical)} joints ({canonical[:3]}...) — "
+                    f"refusing to apply a mismatched per-joint reset")
+            events = getattr(env_cfg, "events", None)
+            if isinstance(events, dict):
+                import torch
+
+                from mjlab.managers.event_manager import EventTermCfg
+                from mjlab.managers.scene_entity_config import SceneEntityCfg
+
+                target_t = torch.tensor(
+                    [float(x) for x in jpt], dtype=torch.float32)
+                events["reset_robot_joints_to_reference"] = EventTermCfg(
+                    func=reset_joints_to_reference,
+                    mode="reset",
+                    params={
+                        "joint_pos_target": target_t,
+                        "joint_pos_noise": float(jpt_noise or 0.0),
+                        "asset_cfg": SceneEntityCfg(
+                            "robot", joint_names=(".*",)),
+                    },
+                )
+                applied.append(
+                    f"events:+reset_robot_joints_to_reference"
+                    f"({len(jpt)} joints)")
+        except Exception as e:  # noqa: BLE001
+            _skip("eval reference joint-posture reset", e)
+
+    if payload.get("fell_over_termination") is False:
+        try:
+            terms = getattr(env_cfg, "terminations", None)
+            if isinstance(terms, dict) and terms.pop("fell_over", None) is not None:
+                applied.append("terminations:fell_over→removed")
+        except Exception as e:  # noqa: BLE001
+            _skip("eval fell_over removal", e)
+
+    print(f"[runner] eval reset: reference-derived lying start "
+          f"(stage-fixed): {applied}", file=sys.stderr, flush=True)
+
+
+def _apply_rl_spec(rl_cfg: Any, spec: "dict | None") -> None:
+    """PPO exploration adjustment from the env spec's train section —
+    `entropy_coef_scale` multiplies the task's default entropy bonus
+    (explosive single-burst skills need higher early exploration than
+    walking defaults; see the audit doc §1). Train-time only (the
+    caller); defensive on cfg-shape drift."""
+    if not spec:
+        return
+    scale = (spec.get("train") or {}).get("entropy_coef_scale")
+    if scale is None:
+        return
+    try:
+        algo = getattr(rl_cfg, "algorithm", None)
+        cur = getattr(algo, "entropy_coef", None)
+        if isinstance(cur, (int, float)) and cur > 0:
+            algo.entropy_coef = float(cur) * float(scale)
+            print(f"[runner] rl-spec: entropy_coef {cur} → "
+                  f"{algo.entropy_coef}", file=sys.stderr, flush=True)
+        else:
+            # entropy_coef_scale IS diagnoser-iterable — a dead knob
+            # must be disclosed like the env-side ones, or the loop
+            # retunes it blindly forever.
+            print("[runner] rl-spec: entropy_coef_scale NOT APPLICABLE "
+                  "(task cfg exposes no positive algorithm.entropy_coef)",
+                  file=sys.stderr, flush=True)
+    except Exception as e:  # noqa: BLE001 — never break a run
+        print(f"[runner] rl-spec skipped: {type(e).__name__}: {e}",
+              file=sys.stderr, flush=True)
+
+
+def _apply_env_profile(env_cfg: Any, profile: str, *, train: bool = True) -> None:
+    """Named-preset entry point: resolve `profile` to its env-spec
+    instance and route through the general applier. Kept as the seam
+    the profile tests pin — the jump preset MUST stay byte-equivalent
+    to the retired hardcoded implementation."""
+    if not profile or profile == "default":
+        return
+    if profile != "jump":
+        print(f"[runner] env-profile {profile!r} unknown — ignored",
+              file=sys.stderr, flush=True)
+        return
+    from sculptor.env_spec import jump_preset_spec
+
+    _apply_env_spec(env_cfg, jump_preset_spec(), train=train)
+
+
+def _apply_rl_profile(rl_cfg: Any, profile: str) -> None:
+    """Named-preset entry point for the PPO side — see _apply_env_profile."""
+    if profile != "jump":
+        return
+    from sculptor.env_spec import jump_preset_spec
+
+    _apply_rl_spec(rl_cfg, jump_preset_spec())
+
+
+def _install_scalar_std_guard(runner: Any, *, minimum: float = 1e-4) -> Any:
+    """Keep directly-parameterized Gaussian policy noise positive.
+
+    Some rsl_rl task configs still use ``GaussianDistribution`` with
+    ``std_type=\"scalar\"``.  That representation is an unconstrained trainable
+    parameter, so a perfectly finite PPO update can move one action's standard
+    deviation below zero.  The *next* minibatch then fails inside
+    ``torch.normal`` (``normal expects all elements of std >= 0.0``), often near
+    the end of an otherwise healthy long run.
+
+    Clamp only the legacy direct ``std_param`` after every optimizer step.  Log
+    parameterizations and non-Gaussian distributions have no ``std_param`` and
+    remain untouched.  Returning the optimizer hook handle lets the caller
+    remove it deterministically when training finishes.
+    """
+    algorithm = getattr(runner, "alg", None)
+    actor = getattr(algorithm, "actor", None)
+    distribution = getattr(actor, "distribution", None)
+    std_param = getattr(distribution, "std_param", None)
+    optimizer = getattr(algorithm, "optimizer", None)
+    register_hook = getattr(optimizer, "register_step_post_hook", None)
+    if std_param is None:
+        return None
+    if not callable(register_hook):
+        raise RuntimeError(
+            "rsl_rl uses an unconstrained scalar policy standard deviation, "
+            "but this PyTorch optimizer cannot install the required positivity "
+            "guard"
+        )
+
+    def _clamp_scalar_std(*_unused: Any) -> None:
+        # ``detach`` shares storage without recording the repair in autograd;
+        # it also avoids importing torch in this runner's lightweight paths.
+        std_param.detach().clamp_(min=float(minimum))
+
+    # A resumed checkpoint may already contain an invalid value, so repair it
+    # once before the first sample as well as after every subsequent step.
+    _clamp_scalar_std()
+    handle = register_hook(_clamp_scalar_std)
+    print(
+        "[SCULPT-EVENT] " + json.dumps({
+            "type": "policy_std_guard_installed",
+            "parameterization": "scalar",
+            "minimum": float(minimum),
+        }),
+        flush=True,
+    )
+    return handle
 
 
 def _cmd_train(args: argparse.Namespace) -> None:
@@ -459,9 +2286,24 @@ def _cmd_train(args: argparse.Namespace) -> None:
 
     env_cfg = load_env_cfg(args.task_id)
     env_cfg.scene.num_envs = args.num_envs
+    # Authored geometry/task semantics are applied first. Legacy EnvSpec then
+    # overlays only its separate reset/randomization/optimizer surface.
+    world_bundle = _apply_world_selection(
+        env_cfg, getattr(args, "world_selection", ""), train=True,
+        task_id=args.task_id)
+    # §RL_SCULPTOR_AUDIT: per-project env spec (--env-spec file wins over
+    # a named --env-profile preset; neither → task defaults, no-op).
+    # train=True additionally applies the train-only curricula section.
+    env_spec = _resolve_env_spec(args)
+    _apply_env_spec(env_cfg, env_spec, train=True, task_id=args.task_id)
+    # §actuator-limit enforcement — flag-gated (default OFF → no-op). MUST run on
+    # the TRAIN env too (not just rollout) so the policy trains against the same
+    # velocity-limited physics it is later evaluated under (no train/rollout mismatch).
+    _enforce_actuator_limits(env_cfg)
 
     # Reward injection (optional).
     if args.reward_module_path:
+        from mjlab.envs import mdp as envs_mdp
         from mjlab.managers.reward_manager import RewardTermCfg
 
         env_cfg.scale_rewards_by_dt = False
@@ -476,29 +2318,157 @@ def _cmd_train(args: argparse.Namespace) -> None:
         # exactly how Sam's overnight v2..v7 reward-hacked by
         # flipping onto the base (sculptor_primary rewarded upward
         # body motion irrespective of how the body got up there).
-        # Keep them at 0.3× so the physics-plausible prior dominates
-        # fine-grained control while sculptor_primary (weight=1.0 below)
-        # dominates the task objective.
+        # Keep them at 0.3× so the physics-plausible prior complements
+        # sculptor_primary (weight=1.0 below).  A default reward that tracks a
+        # command replaced by the authored World is different: it is now dense
+        # TASK supervision, so preserve its nominal weight.  This lets a route
+        # command teach lateral turns and heading while the generated reward
+        # remains responsible for completion, contact, and terminal-hold intent.
         existing = getattr(env_cfg, "rewards", None)
         REALISM_FLOOR_SCALE = 0.3
+        full_weight_terms = _full_weight_authored_command_rewards(world_bundle)
+        # When a REFERENCE is attached the realism prior stops being a
+        # complement and becomes a competitor: the reference already dictates
+        # posture, gait and body motion frame by frame, so `pose` (a nominal-
+        # pose regularizer), `upright`, the command-tracking terms and the
+        # gait-shaping terms are all pulling the policy AWAY from the motion
+        # it is being certified against. Measured on the first Tier-D attempt:
+        # 14 task terms at 0.3x against one tracking term at 1.0x produced a
+        # policy that reproduced 28% of the reference's joint amplitude and
+        # could not beat a static pose.
+        #
+        # So in tracking mode the floor is narrowed to HARDWARE-SAFETY terms
+        # only — limits, self-collision, actuator smoothness — which constrain
+        # what the robot may do without prescribing what pose it holds. The
+        # anti-falling role the broad floor used to play is covered by
+        # `_install_sculptor_termination_economics` below (survival guard +
+        # explicit non-timeout termination penalty), which is why dropping
+        # `upright` here does not reopen the fall-immediately failure mode.
+        tracking = _reward_module_declares(args.reward_module_path,
+                                           "reference_tracking")
         if isinstance(existing, dict):
+            kept, dropped = [], []
             for k in list(existing.keys()):
                 term = existing[k]
-                if term is not None and hasattr(term, "weight"):
-                    term.weight = float(term.weight) * REALISM_FLOOR_SCALE
+                if term is None or not hasattr(term, "weight"):
+                    continue
+                name = str(k)
+                if name in full_weight_terms:
+                    scale = 1.0            # authored command == task supervision
+                elif tracking and not _is_hardware_safety_term(name):
+                    scale = 0.0
+                else:
+                    scale = REALISM_FLOOR_SCALE
+                term.weight = float(term.weight) * scale
+                (dropped if scale == 0.0 else kept).append(name)
+            if tracking:
+                print(
+                    f"[runner] reference-tracking reward: narrowed the realism "
+                    f"floor to hardware-safety terms. kept={sorted(kept)} "
+                    f"dropped={sorted(dropped)}",
+                    file=sys.stderr, flush=True)
         else:
             env_cfg.rewards = {}
 
         schema_keys = tuple(args.schema_keys.split(",")) if args.schema_keys else _DEFAULT_SCHEMA_KEYS
-        SculptorRewardTerm = _build_sculptor_term_class(schema_keys)
+        terminal_hold_s = _authored_terminal_hold_s(world_bundle)
+        terminal_standing = terminal_hold_s > 0.0
+        terminal_stillness_weight = _authored_terminal_stillness_weight(
+            env_cfg.rewards, full_weight_terms)
+        forbidden_contact_sensors = (
+            _authored_forbidden_contact_sensor_names(world_bundle))
+        forbidden_contact_weight = _authored_forbidden_contact_weight(
+            env_cfg.rewards, full_weight_terms)
+        if forbidden_contact_sensors:
+            env_cfg.rewards["sculptor_forbidden_contact"] = RewardTermCfg(
+                func=_authored_forbidden_contact_penalty,
+                weight=-forbidden_contact_weight,
+                params={"sensor_names": forbidden_contact_sensors},
+            )
+        if terminal_standing:
+            AuthoredTerminalStillnessTerm = (
+                _build_authored_terminal_stillness_term_class())
+            env_cfg.rewards["sculptor_terminal_stillness"] = RewardTermCfg(
+                func=AuthoredTerminalStillnessTerm,
+                weight=terminal_stillness_weight,
+                params={
+                    "lin_std": 0.12,
+                    "ang_std": 0.5,
+                    "joint_std": 1.0,
+                    "upright_z_max": -0.7,
+                    "joint_pos_tolerance": 0.6,
+                    "upright_std": 0.35,
+                    "joint_pos_std": 0.6,
+                    "hold_s": terminal_hold_s,
+                    "continuity_scale": _SCULPTOR_TERMINAL_CONTINUITY_SCALE,
+                },
+            )
+        SculptorRewardTerm = _build_sculptor_term_class(
+            schema_keys,
+            _load_authored_robot_capability(
+                getattr(args, "world_selection", "")),
+            world_bundle,
+        )
         env_cfg.rewards["sculptor_primary"] = RewardTermCfg(
             func=SculptorRewardTerm,
             weight=1.0,
             params={"reward_module_path": args.reward_module_path},
         )
+        _install_sculptor_termination_economics(
+            env_cfg.rewards,
+            RewardTermCfg,
+            envs_mdp,
+        )
         print(
             f"[runner] injected SculptorRewardTerm; {sum(1 for t in env_cfg.rewards.values() if t and getattr(t, 'weight', 0) == 0)} default terms zeroed",
             file=sys.stderr, flush=True,
+        )
+        if full_weight_terms:
+            print(
+                "[runner] preserved authored command supervision at full weight: "
+                + ", ".join(sorted(full_weight_terms)),
+                file=sys.stderr,
+                flush=True,
+            )
+        if terminal_standing:
+            print(
+                "[runner] installed authored terminal continuity-aware "
+                "whole-body stillness supervision with strict multiplicative "
+                "posture conjunction at weight "
+                f"{terminal_stillness_weight:g}, "
+                f"hold_s {terminal_hold_s:g}, continuity scale "
+                f"{_SCULPTOR_TERMINAL_CONTINUITY_SCALE:g}",
+                file=sys.stderr,
+                flush=True,
+            )
+        if forbidden_contact_sensors:
+            print(
+                "[runner] installed authored forbidden-contact supervision "
+                f"at weight {-forbidden_contact_weight:g} from sensors: "
+                + ", ".join(forbidden_contact_sensors),
+                file=sys.stderr,
+                flush=True,
+            )
+        if any(
+            "outside approach stage" in str(adjustment)
+            for adjustment in (
+                getattr(world_bundle, "runtime_adjustments", ()) or ())
+        ):
+            print(
+                "[runner] installed clearance-maneuver reward firewall: "
+                "predicate-centered generated reward withheld through "
+                "command-only safe approach and traversal until the frozen "
+                "waypoint advances; command/contact/survival supervision "
+                "remains active",
+                file=sys.stderr,
+                flush=True,
+            )
+        print(
+            "[runner] installed termination economics: "
+            f"survival={_SCULPTOR_SURVIVAL_WEIGHT:+g}/step, "
+            f"non-timeout failure={_SCULPTOR_FAILURE_WEIGHT:+g}",
+            file=sys.stderr,
+            flush=True,
         )
 
     env = ManagerBasedRlEnv(env_cfg, device=args.device)
@@ -510,6 +2480,9 @@ def _cmd_train(args: argparse.Namespace) -> None:
 
     rl_cfg = load_rl_cfg(args.task_id)
     rl_cfg.max_iterations = args.max_iterations
+    # PPO exploration from the env spec's train section (e.g.
+    # entropy_coef_scale). Train-time only — rollout never optimizes.
+    _apply_rl_spec(rl_cfg, env_spec)
 
     agent_cfg_dict = _cfg_to_dict(rl_cfg)
 
@@ -677,12 +2650,15 @@ def _cmd_train(args: argparse.Namespace) -> None:
 
     _poll_thread = _threading.Thread(target=_progress_poller, daemon=True)
     _poll_thread.start()
+    std_guard_handle = _install_scalar_std_guard(runner)
     try:
         runner.learn(
             num_learning_iterations=args.max_iterations,
             init_at_random_ep_len=True,
         )
     finally:
+        if std_guard_handle is not None:
+            std_guard_handle.remove()
         _stop.set()
         _poll_thread.join(timeout=3.0)
         # §7.1: capture one final window for any samples accumulated AFTER
@@ -769,8 +2745,86 @@ def _cmd_train(args: argparse.Namespace) -> None:
     }
     (output_dir / "metrics.json").write_text(json.dumps(metrics, indent=2))
 
+    _write_world_curriculum_stats(env, output_dir)
     env.close()
     print(json.dumps({"status": "ok", "checkpoint": str(ckpt_path)}))
+
+
+def _write_world_curriculum_stats(env: Any, output_dir: Path) -> None:
+    """§env-authoring §10: per-difficulty traversal statistics for the
+    diagnoser. mjlab's terrain curriculum promotes each env's row
+    (`terrain_levels`) on traversal success, so the end-of-training level
+    distribution IS the per-difficulty success summary: mass at high
+    levels = the policy earned promotion; mass pinned at level 0 = the
+    easiest difficulty is still failing. Fail-soft by contract — plane
+    terrain, non-curriculum grids, and legacy envs write nothing."""
+    try:
+        scene = getattr(getattr(env, "unwrapped", env), "scene", None)
+        terrain = getattr(scene, "terrain", None)
+        levels_t = getattr(terrain, "terrain_levels", None)
+        if levels_t is None:
+            return
+        levels = [int(v) for v in levels_t.detach().cpu().tolist()]
+        if not levels:
+            return
+        from collections import Counter
+
+        histogram = Counter(levels)
+        max_level = getattr(terrain, "max_terrain_level", None)
+        stats = {
+            "version": 1,
+            "num_envs": len(levels),
+            "mean_level": round(sum(levels) / len(levels), 3),
+            "max_level": int(max_level) if max_level is not None else None,
+            "histogram": {str(k): int(v) for k, v in sorted(histogram.items())},
+        }
+        (output_dir / "world_curriculum_stats.json").write_text(
+            json.dumps(stats, indent=2, sort_keys=True), encoding="utf-8")
+    except Exception as e:  # noqa: BLE001 — stats are advisory, never fatal
+        print(
+            f"[runner] warning: world curriculum stats skipped: "
+            f"{type(e).__name__}: {e}",
+            file=sys.stderr, flush=True,
+        )
+
+
+_RENDER_DEFAULT_W = 1280
+_RENDER_DEFAULT_H = 720
+
+
+def _configure_rollout_viewer(env_cfg: Any, args: Any) -> None:
+    """Rollout-video viewer settings. FULLY DEFENSIVE (same discipline as
+    `_apply_ground_texture`): any mjlab ViewerConfig drift no-ops rather
+    than break the rollout.
+
+    Two fixes over mjlab defaults:
+    * `max_extra_envs = 0` — the default (2) renders NEIGHBORING envs
+      behind the tracked one, and those neighbors keep auto-resetting
+      mid-episode, so ghost robots teleport around in the background of
+      every video (the guard at the render loop only stops recording at
+      env[0]'s OWN terminal; it never touched the neighbors).
+    * 1280x720 instead of 320x240 — render cost measured on the WSL2
+      path is resolution-independent (~200 ms/frame at both), so the
+      default was leaving quality on the table for free.
+    """
+    try:
+        viewer = getattr(env_cfg, "viewer", None)
+        if viewer is None:
+            return
+        w = int(getattr(args, "render_width", 0) or 0) or _RENDER_DEFAULT_W
+        h = int(getattr(args, "render_height", 0) or 0) or _RENDER_DEFAULT_H
+        if hasattr(viewer, "width"):
+            viewer.width = max(64, w)
+        if hasattr(viewer, "height"):
+            viewer.height = max(64, h)
+        if hasattr(viewer, "max_extra_envs"):
+            viewer.max_extra_envs = 0
+        if hasattr(viewer, "env_idx"):
+            viewer.env_idx = int(
+                getattr(args, "render_env_index", 0) or 0)
+    except Exception as e:  # noqa: BLE001 — cosmetics must never kill a rollout
+        print(f"[runner] viewer config skipped: {type(e).__name__}: {e}",
+              file=sys.stderr, flush=True)
 
 
 def _apply_ground_texture(env_cfg: Any) -> None:
@@ -844,6 +2898,108 @@ def _apply_ground_texture(env_cfg: Any) -> None:
               file=sys.stderr, flush=True)
 
 
+# §actuator-limit enforcement (Sam 2026-06-20): mjlab's robot configs use
+# BuiltinPositionActuatorCfg, which STRUCTURALLY drops each motor's velocity_limit
+# (the ElectricActuator no-load speed) — so the sim clamps TORQUE (effort_limit) but
+# never VELOCITY, and a trained policy drives joints 2-3.7× past the real no-load
+# speed (g1-kick-v6: knee p99 43-73 vs 20 rad/s). mjlab already ships the
+# research-standard fix — DcMotorActuator, a port of Isaac Lab's DCMotor torque-speed
+# model (Rudin et al. 2022 / legged_gym): available torque falls LINEARLY to ~0 at
+# velocity_limit (motor back-EMF), so the joint physically cannot be driven past its
+# no-load speed. We swap the actuator MODEL on env_cfg (both train + rollout) and
+# re-supply the velocity_limit mjlab dropped. Per-pattern no-load speeds, cited from
+# mjlab's own robot constants (single source of truth):
+#   G1  g1_constants.py:91-178   Go1 go1_constants.py:40-72
+_ACTUATOR_VELOCITY_LIMITS: dict[str, float] = {
+    # Unitree G1 (rad/s)
+    ".*_knee_joint": 20.0, ".*_hip_roll_joint": 20.0,                       # 7520-22
+    ".*_hip_pitch_joint": 32.0, ".*_hip_yaw_joint": 32.0, "waist_yaw_joint": 32.0,   # 7520-14
+    ".*_elbow_joint": 37.0, ".*_shoulder_pitch_joint": 37.0,
+    ".*_shoulder_roll_joint": 37.0, ".*_shoulder_yaw_joint": 37.0,
+    ".*_wrist_roll_joint": 37.0,                                            # 5020
+    ".*_wrist_pitch_joint": 22.0, ".*_wrist_yaw_joint": 22.0,               # 4010
+    ".*_ankle_pitch_joint": 37.0, ".*_ankle_roll_joint": 37.0,
+    "waist_pitch_joint": 37.0, "waist_roll_joint": 37.0,                    # 2×5020
+    # Unitree Go1 (rad/s)
+    ".*_hip_joint": 30.1, ".*_thigh_joint": 30.1, ".*_calf_joint": 20.06,
+}
+
+
+def _recover_velocity_limit(actuator_cfg: Any) -> "float | None":
+    """The real motor no-load speed (rad/s) for an actuator group, recovered from
+    its `target_names_expr` (cited from mjlab's robot constants — same source of
+    truth that defines the group). None when no pattern matches (an unknown
+    robot/group → the caller leaves it unchanged), so this never invents a limit."""
+    patterns = getattr(actuator_cfg, "target_names_expr", None) or ()
+    lims = [_ACTUATOR_VELOCITY_LIMITS[p] for p in patterns
+            if p in _ACTUATOR_VELOCITY_LIMITS]
+    return min(lims) if lims else None
+
+
+def _enforce_actuator_limits(env_cfg: Any) -> None:
+    """Swap every `BuiltinPositionActuatorCfg` → `DcMotorActuatorCfg` so the sim
+    enforces each motor's VELOCITY (no-load speed) limit via mjlab's research-standard
+    torque-speed model, on top of the torque (effort) limit it already clamps. Mutates
+    `env_cfg` BEFORE the env is built, so it is active in BOTH train and rollout (the
+    policy trains against — and is evaluated under — the same constrained physics).
+
+    Gated by `RS_ENFORCE_ACTUATOR_LIMITS` (default ON — Sam's call 2026-06-20; set to
+    0/off to disable and recover the old velocity-unconstrained physics). FULLY
+    DEFENSIVE: any group whose velocity_limit can't be recovered, or any API drift,
+    leaves the actuator unchanged + warns — a run never breaks. `saturation_effort =
+    effort_limit` (the conservative triangular torque-speed envelope; raise to the
+    true peak/stall torque when a datasheet is known for a flat-topped curve)."""
+    import os
+    if os.environ.get("RS_ENFORCE_ACTUATOR_LIMITS", "1").strip().lower() not in (
+            "1", "true", "on", "yes"):
+        return
+    try:
+        from mjlab.actuator import BuiltinPositionActuatorCfg, DcMotorActuatorCfg
+    except Exception as e:  # noqa: BLE001 — mjlab without DcMotor → leave as-is
+        print(f"[runner] actuator-limit enforcement skipped (no DcMotorActuatorCfg): "
+              f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
+        return
+    try:
+        entities = getattr(getattr(env_cfg, "scene", None), "entities", None) or {}
+        items = entities.items() if hasattr(entities, "items") else []
+        for ekey, ent in items:
+            art = getattr(ent, "articulation", None)
+            acts = list(getattr(art, "actuators", None) or []) if art is not None else []
+            if not acts:
+                continue
+            new_acts, swapped, unresolved = [], 0, []
+            for a in acts:
+                vlim = _recover_velocity_limit(a)
+                eff = getattr(a, "effort_limit", None)
+                if isinstance(a, BuiltinPositionActuatorCfg) and vlim is not None and eff:
+                    extra = {}
+                    for f in ("viscous_damping", "frictionloss"):
+                        v = getattr(a, f, None)
+                        if v is not None:
+                            extra[f] = v
+                    new_acts.append(DcMotorActuatorCfg(
+                        target_names_expr=a.target_names_expr,
+                        stiffness=a.stiffness, damping=a.damping,
+                        effort_limit=float(eff), armature=a.armature,
+                        velocity_limit=float(vlim),
+                        saturation_effort=float(eff),   # conservative triangular envelope
+                        **extra))
+                    swapped += 1
+                else:
+                    new_acts.append(a)   # unrecoverable / non-builtin → unchanged
+                    if isinstance(a, BuiltinPositionActuatorCfg):
+                        unresolved.append(getattr(a, "target_names_expr", "?"))
+            art.actuators = tuple(new_acts)
+            msg = (f"[runner] actuator-limit enforcement: entity {ekey!r} — "
+                   f"{swapped}/{len(acts)} groups → DcMotor (velocity-limited)")
+            if unresolved:
+                msg += f"; UNRESOLVED (left unchanged): {unresolved}"
+            print(msg, file=sys.stderr, flush=True)
+    except Exception as e:  # noqa: BLE001 — never break a run
+        print(f"[runner] actuator-limit enforcement skipped: {type(e).__name__}: {e}",
+              file=sys.stderr, flush=True)
+
+
 def _cmd_rollout(args: argparse.Namespace) -> None:
     """Run `n_episodes` rollouts and record a video for behavioral review.
 
@@ -888,14 +3044,131 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
     # minimum that still fits alongside a trained policy in <1 GiB.
     MIN_ENVS_FOR_WARP = 64
     num_envs = max(n_episodes, MIN_ENVS_FOR_WARP)
+    requested_render_env_index = int(
+        getattr(args, "render_env_index", 0) or 0)
+    render_env_index = max(
+        0, min(requested_render_env_index, num_envs - 1))
+    # Keep the normalized value as the single source for viewer config,
+    # trajectory selection, and evidence metadata.
+    args.render_env_index = render_env_index
 
     env_cfg = load_env_cfg(args.task_id)
     env_cfg.scene.num_envs = num_envs
+    # Rollout loads the materialized evaluation artifact from the selected
+    # tuple; it never re-samples WorldSpec generators from a seed.
+    world_bundle = _apply_world_selection(
+        env_cfg, getattr(args, "world_selection", ""), train=False,
+        task_id=args.task_id)
+    # §RL_SCULPTOR_AUDIT: SAME spec as train, SHARED section only — a
+    # policy trained with zero commands / no pushes must be evaluated
+    # under that distribution, and the metric arrays must see the
+    # un-truncated fall dynamics. train=False: the train-only curricula
+    # (RSI resets, sunk termination, domain randomization) NEVER apply
+    # here — evaluation starts from the honest task state, or the
+    # metric's view (upright_start / return-to-start-height) would be
+    # corrupted by mid-air spawns.
+    _apply_env_spec(
+        env_cfg, _resolve_env_spec(args), train=False, task_id=args.task_id)
+    # §D17: stage-FIXED eval-reset override — reference-derived lying
+    # start for get-up stages, applied ONLY here (never to training),
+    # AFTER the shared-only env-spec above and strictly ADDITIVE to it.
+    # Absent --eval-reset (the default, and every non-get-up stage) is a
+    # byte-identical no-op. See `_apply_eval_reset`'s docstring and
+    # `sculptor.reference.derive_eval_reset` for the full rationale.
+    _eval_reset_arg = getattr(args, "eval_reset", "") or ""
+    if _eval_reset_arg:
+        try:
+            _eval_reset_payload = json.loads(
+                Path(_eval_reset_arg).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            print(f"[runner] --eval-reset {_eval_reset_arg!r} unreadable "
+                  f"({type(e).__name__}: {e}) — ignored", file=sys.stderr,
+                  flush=True)
+            _eval_reset_payload = None
+        _apply_eval_reset(
+            env_cfg, _eval_reset_payload, task_id=args.task_id)
     # §Ship 35: textured floor in the rendered rollout (cosmetic, guarded).
     _apply_ground_texture(env_cfg)
+    # 720p + no ghost neighbor envs in the background (cosmetic, guarded).
+    _configure_rollout_viewer(env_cfg, args)
+    # §actuator-limit enforcement — flag-gated (default OFF). Same swap as TRAIN so
+    # the rollout physics matches what the policy trained under.
+    _enforce_actuator_limits(env_cfg)
+    # §Selection statistics: deterministic eval seeding for repeat rollouts
+    # of the SAME checkpoint (multi-seed evaluation / fresh-seed re-eval of
+    # the kept best). --seed 0 (default) leaves the legacy RNG state
+    # untouched. Reset-event randomization draws from torch's global RNG;
+    # cfg.seed is additionally honored when the cfg exposes it.
+    _eval_seed = int(getattr(args, "seed", 0) or 0)
+    if _eval_seed:
+        try:
+            import torch
+            torch.manual_seed(_eval_seed)
+        except Exception:  # noqa: BLE001 — seeding is best-effort
+            pass
+        np.random.seed(_eval_seed % (2**32 - 1))
+        if hasattr(env_cfg, "seed"):
+            try:
+                env_cfg.seed = _eval_seed
+            except Exception:  # noqa: BLE001 — frozen cfg tolerated
+                pass
+    # §manipulation telemetry: registered (non-authored) tasks get generic
+    # object/end-effector/contact/target channels discovered from the scene
+    # cfg + capability descriptors — the artifact contract the YAM
+    # benchmark manifests name as their first known limitation. Authored
+    # runs are excluded: their ChannelCatalog recorder is the authoritative
+    # channel contract and the two must never double-write. Contact-sensor
+    # injection must precede env construction; every step is fail-soft.
+    manip_discovery = None
+    if world_bundle is None:
+        try:
+            from sculptor.adapters.manipulation_telemetry import (
+                discover_from_cfg,
+                inject_contact_sensors,
+            )
+
+            manip_discovery = discover_from_cfg(env_cfg)
+            if manip_discovery is not None:
+                manip_discovery = inject_contact_sensors(
+                    env_cfg, manip_discovery)
+        except Exception as e:  # noqa: BLE001 — telemetry must never block
+            print(f"[runner] manipulation-telemetry discovery skipped: "
+                  f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
+            manip_discovery = None
     env = ManagerBasedRlEnv(
         env_cfg, device=args.device, render_mode="rgb_array"
     )
+    world_channel_recorder = None
+    if world_bundle is not None:
+        from sculptor.world.runtime import (
+            WorldChannelRecorder,
+            WorldChannelRuntime,
+        )
+
+        world_channel_recorder = WorldChannelRecorder(WorldChannelRuntime(
+            env, catalog=world_bundle.channel_catalog,
+            manifest=world_bundle.manifest))
+    manip_recorder = None
+    if manip_discovery is not None:
+        try:
+            from sculptor.adapters.manipulation_telemetry import (
+                ManipulationRecorder,
+            )
+
+            manip_recorder = ManipulationRecorder(env, manip_discovery)
+            print("[SCULPT-EVENT] " + json.dumps({
+                "type": "manipulation_telemetry_discovered",
+                "capability_id": manip_discovery.capability_id,
+                "objects": list(manip_discovery.object_names),
+                "ee_site": manip_discovery.ee_site,
+                "finger_groups": sorted(manip_discovery.finger_groups),
+                "grasp_capable": manip_discovery.grasp_capable,
+                "contact_sensors": list(manip_discovery.sensor_names),
+            }), flush=True)
+        except Exception as e:  # noqa: BLE001
+            print(f"[runner] manipulation-telemetry recorder skipped: "
+                  f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
+            manip_recorder = None
 
     # §7.3: snapshot the mujoco model's actuator forceranges + joint
     # ranges. Downstream `sculptor.adapters.realism.audit_rollout` reads
@@ -948,8 +3221,14 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
                     if m is not None:
                         break
         if m is not None:
-            fr = np.asarray(getattr(m, "actuator_forcerange"), dtype=np.float64)
-            jr = np.asarray(getattr(m, "jnt_range"), dtype=np.float64)
+            fr = np.asarray(
+                _to_host_numpy(getattr(m, "actuator_forcerange")),
+                dtype=np.float64,
+            )
+            jr = np.asarray(
+                _to_host_numpy(getattr(m, "jnt_range")),
+                dtype=np.float64,
+            )
             # Names: use mujoco's id→name helpers when present, else
             # leave as positional indices (audit tolerates empty lists).
             def _names(model, count: int, kind: str) -> list[str]:
@@ -1046,9 +3325,30 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
     joint_vel_buf: list[np.ndarray] = []
     action_buf: list[np.ndarray] = []
     actuator_force_buf: list[np.ndarray] = []
+    # §reports: torque in JOINT space (qfrc_actuator) — aligned with joint_vel/names,
+    # unlike `actuator_force` which is in actuator order. Feeds the per-motor
+    # torque-vs-limit report.
+    joint_torque_buf: list[np.ndarray] = []
     projected_gravity_b_buf: list[np.ndarray] = []
     root_link_pos_w_buf: list[np.ndarray] = []
+    root_link_lin_vel_b_buf: list[np.ndarray] = []
+    root_link_ang_vel_b_buf: list[np.ndarray] = []
+    # §Metric-quality laws (LAW 3/4): per-foot ground contact + foot position
+    # in the pelvis frame, persisted to the metric arrays so an objective
+    # metric can measure signed forward-kick DIRECTION (anterior foot
+    # displacement) and the single-vs-double support SCHEDULE (one-leg-balance
+    # veto). Biped-only — stay empty (and are dropped at save time) on tasks
+    # whose robot has no left_foot/right_foot site pair.
+    left_foot_contact_buf: list[np.ndarray] = []
+    right_foot_contact_buf: list[np.ndarray] = []
+    left_foot_pos_b_buf: list[np.ndarray] = []
+    right_foot_pos_b_buf: list[np.ndarray] = []
     per_term_reward_buf: dict[str, list[np.ndarray]] = {}
+    # Post-step mjlab state is already reset for environments whose `done`
+    # fired.  These masks let artifact finalization preserve only each env's
+    # first episode instead of stitching the reset attempt onto it.
+    first_episode_state_valid_buf: list[np.ndarray] = []
+    first_episode_action_valid_buf: list[np.ndarray] = []
 
     # Resolve the articulated robot entity once — mirrors the discovery
     # logic in `SculptorRewardTerm._find_articulated_entity` so fixed-base
@@ -1076,6 +3376,38 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
 
     _robot = _find_robot(env)
 
+    # §Metric-quality laws (LAW 3/4): resolve the foot sites + ground-contact
+    # sensor ONCE, mirroring SculptorRewardTerm._resolve_foot_handles. Returns
+    # None unless a left_foot/right_foot site pair exists (the same named-site
+    # pair that fixes per-foot column order in mjlab) → biped only. The
+    # pelvis-frame foot position uses quat_apply_inverse (the same transform
+    # that derives projected_gravity_b: data.py site_pos_w − root_link_pos_w
+    # rotated by root_link_quat_w); import is lazy + guarded so a future
+    # mjlab rename degrades to "no foot position" rather than crashing the
+    # rollout.
+    def _resolve_feet(e, robot):
+        if robot is None:
+            return None
+        try:
+            names = tuple(robot.site_names)
+        except Exception:  # noqa: BLE001
+            return None
+        idx = {n: i for i, n in enumerate(names)}
+        li, ri = idx.get("left_foot"), idx.get("right_foot")
+        if li is None or ri is None:
+            return None
+        try:
+            contact = e.scene["feet_ground_contact"]
+        except Exception:  # noqa: BLE001
+            contact = None
+        return {"li": li, "ri": ri, "contact": contact}
+
+    _feet = _resolve_feet(env, _robot)
+    try:
+        from mjlab.utils.lab_api.math import quat_apply_inverse as _quat_apply_inverse
+    except Exception:  # noqa: BLE001
+        _quat_apply_inverse = None
+
     def _tensor_to_np(t) -> np.ndarray | None:
         if t is None:
             return None
@@ -1094,19 +3426,56 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
 
     t0 = time.time()
     for step in range(max_steps):
+        active_before = ~ep_done
         with torch.inference_mode():
             action = policy(obs)
         obs, rew, dones, _extras = wrapped.step(action)
+        dones_bool = dones.bool()
+        state_valid = active_before & (~dones_bool)
+        first_episode_state_valid_buf.append(
+            state_valid.detach().cpu().numpy().astype(bool, copy=False))
+        first_episode_action_valid_buf.append(
+            active_before.detach().cpu().numpy().astype(bool, copy=False))
+        if world_channel_recorder is not None:
+            # Sample every catalogued task observable at the same cadence as
+            # base trajectory state. Missing/malformed producers fail the
+            # authored rollout instead of silently emitting a partial NPZ.
+            world_channel_recorder.append()
+            # The recorder owns independent NumPy route/hold state.  Keep it
+            # synchronized with mjlab's automatic per-env reset even though
+            # finalized first-episode arrays absorb all later samples.
+            try:
+                done_ids = np.flatnonzero(
+                    dones_bool.detach().cpu().numpy().astype(bool, copy=False))
+                if done_ids.size:
+                    world_channel_recorder.runtime.reset(done_ids)
+            except Exception as e:  # noqa: BLE001
+                print(f"[runner] authored recorder reset skipped: "
+                      f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
+        if manip_recorder is not None:
+            # mjlab auto-resets before returning from a done step, so that
+            # step's scene state belongs to the next episode. Persist the
+            # boundary explicitly; metrics must never stitch attempts across
+            # it. `ep_done` freezes the mask after each env's first episode.
+            try:
+                first_done = dones_bool & (~ep_done)
+                manip_recorder.append(
+                    valid_mask=(~ep_done) & (~dones_bool),
+                    terminal_mask=first_done,
+                )
+            except Exception as e:  # noqa: BLE001
+                print(f"[runner] manipulation-telemetry step skipped: "
+                      f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
         # Freeze cumulative return/length on the first `done` per env.
-        active = (~ep_done).float()
+        active = active_before.float()
         ep_return += rew * active
         ep_length += active.int()
-        ep_done |= dones.bool()
+        ep_done |= dones_bool
 
-        # Record env[0]'s step reward as a representative trajectory
-        # (preserves the old single-env semantics for downstream
-        # analysis in diagnose + reports).
-        all_rewards.append(float(rew[0].item()))
+        # The rendered lane is precommitted before rollout. Keep its scalar
+        # reward series aligned with the video while the full state tensors
+        # continue to cover every evaluation lane.
+        all_rewards.append(float(rew[render_env_index].item()))
 
         # §7.1: expanded-trajectory capture. Skipped frames (when the
         # entity lookup fails) still let `rewards` + per-term capture
@@ -1124,12 +3493,60 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
             af = _tensor_to_np(getattr(d, "actuator_force", None))
             if af is not None:
                 actuator_force_buf.append(af)
+            jt = _tensor_to_np(getattr(d, "qfrc_actuator", None))   # §reports: joint-space torque
+            if jt is not None:
+                joint_torque_buf.append(jt)
             pg = _tensor_to_np(getattr(d, "projected_gravity_b", None))
             if pg is not None:
                 projected_gravity_b_buf.append(pg)
             rp = _tensor_to_np(getattr(d, "root_link_pos_w", None))
             if rp is not None:
                 root_link_pos_w_buf.append(rp)
+            rlv = _tensor_to_np(getattr(d, "root_link_lin_vel_b", None))
+            if rlv is not None:
+                root_link_lin_vel_b_buf.append(rlv)
+            rav = _tensor_to_np(getattr(d, "root_link_ang_vel_b", None))
+            if rav is not None:
+                root_link_ang_vel_b_buf.append(rav)
+            # §Metric-quality laws (LAW 3/4): per-foot contact + pelvis-frame
+            # foot position. Each signal is independently guarded so a missing
+            # sensor/site degrades to "field absent" (an empty buf is dropped
+            # at save time) rather than crashing the rollout — same discipline
+            # as _foot_info. Contact columns 0/1 = left/right (mjlab wiring,
+            # mirrored from _foot_info); foot position uses the resolved site
+            # indices li/ri.
+            if _feet is not None:
+                fc = _feet["contact"]
+                if fc is not None:
+                    try:
+                        found = fc.data.found  # (N, F)
+                        if found is not None and found.shape[-1] >= 2:
+                            lc = _tensor_to_np((found[:, 0] > 0).float())
+                            rc = _tensor_to_np((found[:, 1] > 0).float())
+                            if lc is not None:
+                                left_foot_contact_buf.append(lc)
+                            if rc is not None:
+                                right_foot_contact_buf.append(rc)
+                    except Exception:  # noqa: BLE001
+                        pass
+                if _quat_apply_inverse is not None:
+                    try:
+                        sp = getattr(d, "site_pos_w", None)        # (N, S, 3)
+                        rq = getattr(d, "root_link_quat_w", None)  # (N, 4)
+                        rpw = getattr(d, "root_link_pos_w", None)  # (N, 3)
+                        li, ri = _feet["li"], _feet["ri"]
+                        if (sp is not None and rq is not None and rpw is not None
+                                and sp.shape[1] > max(li, ri)):
+                            lf_b = _quat_apply_inverse(rq, sp[:, li, :] - rpw)
+                            rf_b = _quat_apply_inverse(rq, sp[:, ri, :] - rpw)
+                            lfp = _tensor_to_np(lf_b)
+                            rfp = _tensor_to_np(rf_b)
+                            if lfp is not None:
+                                left_foot_pos_b_buf.append(lfp)
+                            if rfp is not None:
+                                right_foot_pos_b_buf.append(rfp)
+                    except Exception:  # noqa: BLE001
+                        pass
         ap = _tensor_to_np(action)
         if ap is not None:
             action_buf.append(ap)
@@ -1151,16 +3568,19 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
         except Exception:  # noqa: BLE001 — reward_manager API drift; skip silently
             pass
 
-        # Render only while env[0]'s first episode is ongoing. After
-        # env[0] hits done, mujoco_warp's auto-reset warps it to a
+        # Render only while the precommitted lane's first episode is ongoing.
+        # After it hits done, mujoco_warp's auto-reset warps it to a
         # fresh initial pose — continuing to record produces a glitchy
         # video where the Cartpole snaps from upright to hanging and
         # back every episode boundary (Issue F from Test 1 2026-04-22).
         # Sam's Cartpole video showed the pole "teleporting" and
         # checkered-floor flashes at the reset frames — this guard
-        # stops the video at env[0]'s first terminal so the user sees
+        # stops the video at the lane's first terminal so the user sees
         # exactly one clean episode.
-        if step % render_every == 0 and not bool(ep_done[0].item()):
+        if (
+            step % render_every == 0
+            and not bool(ep_done[render_env_index].item())
+        ):
             frame = env.render()
             if frame is not None:
                 frames.append(np.asarray(frame, dtype=np.uint8))
@@ -1180,19 +3600,14 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
                 "fps": round(step / elapsed, 1) if elapsed > 0 else None,
             }), flush=True)
 
-        if bool(ep_done[:n_episodes].all().item()):
+        tracked_done = bool(ep_done[:n_episodes].all().item())
+        rendered_done = bool(ep_done[render_env_index].item())
+        if tracked_done and rendered_done:
             break
 
     ep_returns = ep_return[:n_episodes].detach().cpu().tolist()
     ep_lengths = ep_length[:n_episodes].detach().int().cpu().tolist()
-
-    print("[SCULPT-EVENT] " + json.dumps({
-        "type": "rollout_done",
-        "n_episodes": n_episodes,
-        "total_steps": step + 1,
-        "frames_recorded": len(frames),
-        "elapsed_s": round(time.time() - t0, 1),
-    }), flush=True)
+    all_first_episode_returns = ep_return.detach().cpu().tolist()
 
     # Write video.
     import subprocess
@@ -1274,21 +3689,57 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
             [e for e, L in enumerate(ep_lengths) for _ in range(L)], dtype=np.int32
         ),
     }
+    state_valid_mask = np.stack(
+        first_episode_state_valid_buf, axis=0).astype(bool, copy=False)
+    action_valid_mask = np.stack(
+        first_episode_action_valid_buf, axis=0).astype(bool, copy=False)
+    trajectory["first_episode_valid_mask"] = state_valid_mask
     for key, buf in (
         ("joint_pos", joint_pos_buf),
         ("joint_vel", joint_vel_buf),
+        ("joint_torque", joint_torque_buf),
         ("action", action_buf),
         ("actuator_force", actuator_force_buf),
         ("projected_gravity_b", projected_gravity_b_buf),
         ("root_link_pos_w", root_link_pos_w_buf),
+        ("root_link_lin_vel_b", root_link_lin_vel_b_buf),
+        ("root_link_ang_vel_b", root_link_ang_vel_b_buf),
+        ("left_foot_contact", left_foot_contact_buf),
+        ("right_foot_contact", right_foot_contact_buf),
+        ("left_foot_pos_b", left_foot_pos_b_buf),
+        ("right_foot_pos_b", right_foot_pos_b_buf),
     ):
         arr = _stack_if_consistent(buf)
         if arr is not None:
-            trajectory[key] = arr
+            valid = action_valid_mask if key == "action" else state_valid_mask
+            trajectory[key] = _freeze_invalid_first_episode_steps(arr, valid)
     for name, arrs in per_term_reward_buf.items():
         stacked = _stack_if_consistent(arrs)
         if stacked is not None:
-            trajectory[f"reward_term__{name}"] = stacked
+            trajectory[f"reward_term__{name}"] = (
+                _freeze_invalid_first_episode_steps(
+                    stacked, action_valid_mask))
+    if world_channel_recorder is not None:
+        world_arrays = world_channel_recorder.finalize()
+        trajectory.update({
+            key: (
+                _freeze_invalid_first_episode_steps(value, state_valid_mask)
+                if np.asarray(value).ndim >= 2 else value
+            )
+            for key, value in world_arrays.items()
+        })
+    if manip_recorder is not None:
+        try:
+            manip_arrays = {
+                key: value
+                for key, value in manip_recorder.finalize().items()
+                if key not in trajectory  # existing contract always wins
+            }
+            trajectory.update(manip_arrays)
+            manip_recorder.write_manifest(output_dir, manip_arrays)
+        except Exception as e:  # noqa: BLE001
+            print(f"[runner] manipulation-telemetry finalize skipped: "
+                  f"{type(e).__name__}: {e}", file=sys.stderr, flush=True)
     np.savez_compressed(output_dir / "trajectory.npz", **trajectory)
 
     # §7.1 / §7.2: per-term time-series as JSON (Eureka Appendix F shape).
@@ -1315,6 +3766,21 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
         "mean_return": float(np.mean(ep_returns)) if ep_returns else 0.0,
         "mean_episode_length": float(np.mean(ep_lengths)) if ep_lengths else 0.0,
         "max_episode_length": int(max(ep_lengths)) if ep_lengths else 0,
+        # The video lane is declared at launch, never selected post-hoc from
+        # rollout outcomes. Record its identity and percentile across every
+        # parallel first episode so the evidence remains transparent.
+        "rendered_env_index": int(render_env_index),
+        "rendered_env_index_requested": int(requested_render_env_index),
+        "rendered_env_selection": "precommitted",
+        "rendered_episode_return": (
+            float(all_first_episode_returns[render_env_index])
+            if all_first_episode_returns else None),
+        "rendered_episode_percentile": (
+            float(np.mean([
+                r <= all_first_episode_returns[render_env_index]
+                for r in all_first_episode_returns
+            ]))
+            if all_first_episode_returns else None),
         # §Ship 26 (E1/M1): capture settings are load-bearing for spec
         # metrics (frequency bands are in cycles/FRAME; episode-length
         # normalization needs the cap). Persisting them lets the eval
@@ -1324,6 +3790,11 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
         "max_episode_steps": int(max_steps),
         "rollout_num_envs": int(num_envs),
     }
+    if world_bundle is not None:
+        shaping_evidence = _reward_visible_rollout_evidence(
+            trajectory, world_bundle.channel_catalog, state_valid_mask)
+        if shaping_evidence:
+            behavior["reward_visible_rollout_evidence"] = shaping_evidence
     (output_dir / "behavior.json").write_text(json.dumps(behavior, indent=2))
 
     # §7.3: persist the mjcf-limits snapshot taken at env-init time so
@@ -1341,6 +3812,18 @@ def _cmd_rollout(args: argparse.Namespace) -> None:
             f"{type(e).__name__}: {e}",
             file=sys.stderr, flush=True,
         )
+
+    # This event is the backend's cue to inspect/transcode the video.  Emit it
+    # only after ffmpeg, trajectory, behavior, and limits files are closed;
+    # emitting before encoding raced the UI clip worker against an incomplete
+    # MP4 (`moov atom not found`) even though the final video was valid.
+    print("[SCULPT-EVENT] " + json.dumps({
+        "type": "rollout_done",
+        "n_episodes": n_episodes,
+        "total_steps": step + 1,
+        "frames_recorded": len(frames),
+        "elapsed_s": round(time.time() - t0, 1),
+    }), flush=True)
 
     env.close()
     print(json.dumps({"status": "ok", "video": str(video_path)}))
@@ -1401,6 +3884,30 @@ def main() -> None:
     p_train.add_argument("--schema-keys", default="",
                          help="comma-separated override for the state-schema keys")
     p_train.add_argument(
+        "--env-profile", default="",
+        help=(
+            "§RL_SCULPTOR_AUDIT §4.4: goal-class env alignment applied to "
+            "the loaded task cfg before the env is built. '' = task "
+            "defaults; 'jump' = zero velocity commands, no push events, "
+            "fell_over at 120°, 10 s episodes."
+        ),
+    )
+    p_train.add_argument(
+        "--env-spec", default="",
+        help=(
+            "path to a per-project env spec JSON (sculptor.env_spec "
+            "schema). Wins over --env-profile. shared section applies "
+            "to train AND rollout; train section is train-only."
+        ),
+    )
+    p_train.add_argument(
+        "--world-selection", default="",
+        help=(
+            "path to a hash-verified prompt-authored selection JSON. "
+            "Applies world/task semantics before legacy --env-spec."
+        ),
+    )
+    p_train.add_argument(
         "--load-pretrained-policy", default=None,
         help=(
             "§Ship 15: path to a prior rsl_rl checkpoint (e.g., "
@@ -1427,6 +3934,40 @@ def main() -> None:
     # §Ship-7: advanced override for frame decimation (1 = every step).
     # Default 0 means "pick automatically to cap at 500 captured frames".
     p_roll.add_argument("--render-every", type=int, default=0)
+    # §RL_SCULPTOR_AUDIT §4.4: must match the train-side spec/profile.
+    p_roll.add_argument("--env-profile", default="")
+    p_roll.add_argument("--env-spec", default="")
+    p_roll.add_argument("--world-selection", default="")
+    # §D17: stage-FIXED eval-rollout reset override (a small allowlisted
+    # subset of reset keys — height/pitch/roll collapsed to a single
+    # deterministic midpoint value, zero reset velocity/noise,
+    # fell_over_termination popped). Applied AFTER the existing
+    # shared-only --env-spec (which never carries train-only RSI ranges
+    # into rollout). Absent (default) = today's behavior, byte-identical.
+    p_roll.add_argument(
+        "--eval-reset", default="",
+        help=(
+            "path to a JSON object of allowlisted eval-reset keys "
+            "(sculptor.reference.derive_eval_reset output). Applied to "
+            "rollout only, after --env-spec/--env-profile; never affects "
+            "training."
+        ),
+    )
+    # Video resolution. 0 = the runner default (1280x720 — measured
+    # resolution-INDEPENDENT render cost on the WSL2 path: 320x240 and
+    # 1280x720 both ~200 ms/frame, so high-res is free).
+    p_roll.add_argument("--render-width", type=int, default=0)
+    p_roll.add_argument("--render-height", type=int, default=0)
+    p_roll.add_argument(
+        "--render-env-index", type=int, default=0,
+        help=(
+            "precommitted parallel rollout lane to render; clamped to the "
+            "available evaluation batch and disclosed in behavior.json"
+        ),
+    )
+    # §Selection statistics: deterministic eval seed for repeat rollouts
+    # of the same checkpoint. 0 (default) = legacy unseeded behavior.
+    p_roll.add_argument("--seed", type=int, default=0)
 
     p_probe = sub.add_parser("vram-probe")
     p_probe.add_argument("--task-id", required=True)

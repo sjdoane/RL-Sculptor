@@ -20,13 +20,26 @@ dropping failures inflates aggregates).
 from __future__ import annotations
 
 import json
+import hashlib
+import os
+import shutil
+import sqlite3
 import time
 import traceback
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from sculptor.eval.benchmarks import BENCHMARKS, BenchmarkTask, get_benchmark
+from sculptor.eval.benchmarks import (
+    BENCHMARKS,
+    BenchmarkTask,
+    benchmark_registry,
+    get_benchmark,
+)
+from sculptor.eval.charter import (
+    freeze_or_verify_campaign_charter,
+    verify_result_lineage,
+)
 from sculptor.eval.spec_metrics import compute_spec_metrics, make_spec_fitness_fn
 from sculptor.eval.stats import iqm, stratified_bootstrap_ci
 
@@ -169,6 +182,9 @@ class CampaignConfig:
     benchmarks: list[str]
     conditions: list[str]
     seeds: list[int]
+    #: Optional strict suite fragments. They can add capability-described
+    #: tasks but cannot override built-ins.
+    benchmark_manifests: list[Path] = field(default_factory=list)
     #: sculpt-mode LLM-loop iterations per job.
     iterations: int = 2
     #: rsl_rl iterations per training run.
@@ -188,9 +204,38 @@ class CampaignConfig:
     #: test seam — overrides the adapter class in scaffolded configs.
     adapter_class_override: Optional[str] = None
 
-    def validate(self) -> None:
+    def validate(
+        self, registry: Optional[dict[str, BenchmarkTask]] = None,
+    ) -> None:
+        registry = BENCHMARKS if registry is None else registry
+        if not self.benchmarks:
+            raise ValueError("campaign needs at least one benchmark")
+        if len(set(self.benchmarks)) != len(self.benchmarks):
+            raise ValueError("duplicate benchmarks would duplicate campaign jobs")
         for b in self.benchmarks:
-            get_benchmark(b)
+            benchmark = get_benchmark(b, registry)
+            if not benchmark.campaign_ready:
+                limitations = "; ".join(benchmark.known_limitations)
+                raise ValueError(
+                    f"benchmark {b!r} is {benchmark.evaluation_tier} and not "
+                    f"campaign-ready: {limitations}"
+                )
+            if benchmark.spec_metric is None:
+                raise ValueError(
+                    f"benchmark {b!r} has no objective spec metric"
+                )
+            if (
+                benchmark.adapter not in _ADAPTER_CLASSES
+                and self.adapter_class_override is None
+            ):
+                raise ValueError(
+                    f"benchmark {b!r} uses adapter {benchmark.adapter!r} but "
+                    "the eval harness has no adapter class mapping for it"
+                )
+        if not self.conditions:
+            raise ValueError("campaign needs at least one condition")
+        if len(set(self.conditions)) != len(self.conditions):
+            raise ValueError("duplicate conditions would duplicate campaign jobs")
         for c in self.conditions:
             if c not in CONDITIONS:
                 raise KeyError(
@@ -212,6 +257,137 @@ def _emit(payload: dict[str, Any]) -> None:
 
 def _job_dir(cfg: CampaignConfig, bench: str, cond: str, seed: int) -> Path:
     return Path(cfg.out_dir) / bench / cond / f"seed_{seed}"
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _campaign_uses_kg(cfg: CampaignConfig) -> bool:
+    return any(
+        CONDITIONS[name].mode in {"sculpt", "mission"}
+        and not CONDITIONS[name].no_kg
+        for name in cfg.conditions
+    )
+
+
+def _prepare_campaign_kg_snapshot(
+    cfg: CampaignConfig,
+) -> tuple[Optional[Path], Optional[dict[str, Any]]]:
+    """Freeze one consistent KG input for all KG-enabled campaign jobs.
+
+    Each job later receives its own writable copy.  This prevents a run case
+    learned by an earlier seed/condition from contaminating a later paired
+    arm, while still allowing crash-resume inside one job.
+    """
+    if not _campaign_uses_kg(cfg):
+        return None, None
+    from sculptor.eval.charter import CHARTER_FILENAME, CharterIntegrityError
+    from sculptor.kg.store import SculptorKG, default_db_path
+    from sculptor.run_context import write_json_atomic
+
+    inputs_dir = Path(cfg.out_dir) / "campaign_inputs"
+    snapshot = inputs_dir / "kg_base.db"
+    record_path = inputs_dir / "kg_base.json"
+    charter_exists = (Path(cfg.out_dir) / CHARTER_FILENAME).is_file()
+    if snapshot.exists() or record_path.exists():
+        if not snapshot.is_file() or not record_path.is_file():
+            raise CharterIntegrityError(
+                "campaign KG snapshot is incomplete (expected kg_base.db and "
+                "kg_base.json)"
+            )
+        try:
+            record = json.loads(record_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise CharterIntegrityError(
+                f"campaign KG snapshot record is unreadable: {exc}"
+            ) from exc
+        actual = _file_sha256(snapshot)
+        if record.get("sha256") != actual:
+            raise CharterIntegrityError(
+                "campaign KG base snapshot hash mismatch; the frozen input "
+                "was altered"
+            )
+        return snapshot, {
+            "kind": "sqlite_kg_snapshot",
+            "sha256": actual,
+            "size_bytes": snapshot.stat().st_size,
+        }
+    if charter_exists:
+        raise CharterIntegrityError(
+            "campaign charter exists but its KG base snapshot is missing"
+        )
+
+    inputs_dir.mkdir(parents=True, exist_ok=True)
+    source = default_db_path()
+    tmp = inputs_dir / "kg_base.db.tmp"
+    try:
+        if source.is_file():
+            # SQLite's backup API includes committed WAL state and produces a
+            # transactionally consistent snapshot even if the source is open.
+            src = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
+            dst = sqlite3.connect(str(tmp))
+            try:
+                src.backup(dst)
+            finally:
+                dst.close()
+                src.close()
+        else:
+            # An absent shared KG is a legitimate, explicitly pinned empty KG.
+            with SculptorKG(tmp):
+                pass
+        os.replace(tmp, snapshot)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+    snapshot_hash = _file_sha256(snapshot)
+    record = {
+        "schema_version": 1,
+        "source_path": str(source),
+        "source_existed": source.is_file(),
+        "sha256": snapshot_hash,
+        "size_bytes": snapshot.stat().st_size,
+    }
+    write_json_atomic(record_path, record)
+    return snapshot, {
+        "kind": "sqlite_kg_snapshot",
+        "sha256": snapshot_hash,
+        "size_bytes": snapshot.stat().st_size,
+    }
+
+
+def _prepare_job_kg(
+    job_dir: Path, base_snapshot: Path, base_sha256: str,
+) -> Path:
+    inputs = job_dir / "inputs"
+    job_kg = inputs / "kg.db"
+    origin_path = inputs / "kg_origin.json"
+    if job_kg.exists() or origin_path.exists():
+        if not job_kg.is_file() or not origin_path.is_file():
+            raise RuntimeError(
+                f"incomplete per-job KG state under {inputs}; refusing an "
+                "ambiguous resume"
+            )
+        origin = json.loads(origin_path.read_text(encoding="utf-8"))
+        if origin.get("base_sha256") != base_sha256:
+            raise RuntimeError(
+                f"per-job KG lineage does not match campaign snapshot: {job_kg}"
+            )
+        return job_kg
+    inputs.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(base_snapshot, job_kg)
+    from sculptor.run_context import write_json_atomic
+
+    write_json_atomic(origin_path, {
+        "schema_version": 1,
+        "base_sha256": base_sha256,
+        "policy": "private_writable_copy_per_campaign_job",
+    })
+    return job_kg
 
 
 def _scaffold_job_project(
@@ -416,11 +592,20 @@ def _run_job(
     bench: BenchmarkTask,
     condition: EvalCondition,
     seed: int,
+    charter_design_sha256: str,
+    kg_base_snapshot: Optional[Path] = None,
+    kg_base_sha256: Optional[str] = None,
 ) -> dict[str, Any]:
     job_dir = _job_dir(cfg, bench.name, condition.name, seed)
     result_path = job_dir / "result.json"
     if result_path.is_file():
         cached = json.loads(result_path.read_text(encoding="utf-8"))
+        if cached.get("charter_design_sha256") != charter_design_sha256:
+            from sculptor.eval.charter import CharterIntegrityError
+
+            raise CharterIntegrityError(
+                f"cached result has no matching charter lineage: {result_path}"
+            )
         cached["cached"] = True
         return cached
 
@@ -429,6 +614,14 @@ def _run_job(
     error: Optional[str] = None
     eureka_summary: Optional[dict[str, Any]] = None
     mission_summary: Optional[dict[str, Any]] = None
+    uses_kg = condition.mode in {"sculpt", "mission"} and not condition.no_kg
+    old_rs_kg = os.environ.get("RS_KG_PATH")
+    had_rs_kg = "RS_KG_PATH" in os.environ
+    if uses_kg:
+        if kg_base_snapshot is None or kg_base_sha256 is None:
+            raise RuntimeError("KG-enabled eval job has no frozen campaign KG input")
+        job_kg = _prepare_job_kg(job_dir, kg_base_snapshot, kg_base_sha256)
+        os.environ["RS_KG_PATH"] = str(job_kg)
     try:
         if condition.mode == "train_only":
             from sculptor.adapters.base import load_adapter
@@ -499,6 +692,13 @@ def _run_job(
     except Exception as e:  # noqa: BLE001 — honest zero, campaign continues
         error = f"{type(e).__name__}: {e}"
         traceback.print_exc()
+    finally:
+        if uses_kg:
+            if had_rs_kg:
+                assert old_rs_kg is not None
+                os.environ["RS_KG_PATH"] = old_rs_kg
+            else:
+                os.environ.pop("RS_KG_PATH", None)
 
     wall = time.monotonic() - t0
     if condition.mode == "mission":
@@ -560,6 +760,7 @@ def _run_job(
     else:
         total_rl_iters = cfg.steps_per_iter * len(series)
     result: dict[str, Any] = {
+        "charter_design_sha256": charter_design_sha256,
         "benchmark": bench.name,
         "condition": condition.name,
         "seed": seed,
@@ -570,6 +771,8 @@ def _run_job(
         # spec and are scored on their last reward.
         "final_rule": (
             "best_across_generations" if condition.mode == "eureka"
+            else "best_across_iterations"
+            if condition.mode in ("sculpt", "mission") and cfg.fitness_in_loop
             else "last_iteration"
         ),
         "best_spec_score": float(best),
@@ -719,10 +922,29 @@ def _report_html(campaign: dict[str, Any]) -> str:
         "<th>95% CI</th><th></th><th></th></tr>"
         + "".join(pair_rows) + "</table>"
     ) if pair_rows else ""
+    all_warnings = [
+        *campaign["aggregates"]["capture_parity_warnings"],
+        *campaign.get("authority_warnings", []),
+    ]
     warn = "".join(
         f'<p style="color:#b00">⚠ {w}</p>'
-        for w in campaign["aggregates"]["capture_parity_warnings"]
+        for w in all_warnings
     )
+    coverage = campaign.get("coverage")
+    coverage_html = ""
+    if isinstance(coverage, dict):
+        complete = bool(coverage.get("complete"))
+        state = "COMPLETE" if complete else "INCOMPLETE"
+        missing = int(coverage.get("n_missing", 0))
+        expected = int(coverage.get("n_expected", 0))
+        completed = int(coverage.get("n_completed", 0))
+        color = "#176b3a" if complete else "#9a3412"
+        coverage_html = (
+            f"<p style='border:1px solid {color};padding:.75rem;color:{color}'>"
+            f"<strong>Coverage {state}</strong>: {completed}/{expected} jobs; "
+            f"{missing} missing. Partial aggregates are not a complete "
+            "campaign result.</p>"
+        )
     return (
         "<!doctype html><meta charset='utf-8'>"
         f"<title>eval: {campaign['name']}</title>"
@@ -732,7 +954,7 @@ def _report_html(campaign: dict[str, Any]) -> str:
         "stratified-bootstrap CIs over paired seeds. Compare conditions "
         "via the paired-difference table, and read every comparison "
         "against its <code>total_rl_iterations</code> GPU budget.</p>"
-        f"{warn}{''.join(rows)}{pairwise_html}</body>"
+        f"{coverage_html}{warn}{''.join(rows)}{pairwise_html}</body>"
     )
 
 
@@ -744,9 +966,38 @@ def run_campaign(
     """Execute the campaign (resumable) and write
     `<out_dir>/campaign_report.json` + `report.html`. Returns the
     report dict."""
-    cfg.validate()
+    registry = benchmark_registry(cfg.benchmark_manifests)
+    cfg.validate(registry)
+    authority_warnings = [
+        f"benchmark {name!r} uses spec {registry[name].spec_metric!r} with "
+        f"authority {registry[name].spec_authority!r}, not a verified "
+        "A4_reporting certificate; treat its campaign result as provisional"
+        for name in cfg.benchmarks
+        if registry[name].spec_authority != "A4_reporting"
+    ]
     out = Path(cfg.out_dir)
     out.mkdir(parents=True, exist_ok=True)
+    kg_base_snapshot, kg_input = _prepare_campaign_kg_snapshot(cfg)
+    external_inputs: dict[str, Any] = {}
+    if kg_input is not None:
+        external_inputs["knowledge_graph"] = kg_input
+    if cfg.benchmark_manifests:
+        external_inputs["benchmark_manifests"] = [
+            {
+                "sha256": _file_sha256(Path(path).expanduser().resolve()),
+                "size_bytes": Path(path).expanduser().resolve().stat().st_size,
+            }
+            for path in cfg.benchmark_manifests
+        ]
+    # Freeze the experiment before emitting a start event or doing any GPU/LLM
+    # work.  Resumes must match the entire design and executable source tree.
+    charter = freeze_or_verify_campaign_charter(
+        cfg,
+        benchmarks=registry,
+        conditions=CONDITIONS,
+        external_inputs=external_inputs,
+    )
+    charter_hash = str(charter["design_sha256"])
     jobs = [
         (b, c, s)
         for b in cfg.benchmarks
@@ -760,10 +1011,12 @@ def run_campaign(
         "benchmarks": cfg.benchmarks,
         "conditions": cfg.conditions,
         "seeds": cfg.seeds,
+        "charter_design_sha256": charter_hash,
+        "authority_warnings": authority_warnings,
     })
     results: list[dict[str, Any]] = []
     for i, (b, c, s) in enumerate(jobs):
-        bench = get_benchmark(b)
+        bench = get_benchmark(b, registry)
         condition = CONDITIONS[c]
         _emit({
             "type": "eval_job_started",
@@ -771,7 +1024,15 @@ def run_campaign(
             "index": i + 1,
             "total": len(jobs),
         })
-        r = _run_job(cfg, bench, condition, s)
+        r = _run_job(
+            cfg,
+            bench,
+            condition,
+            s,
+            charter_hash,
+            kg_base_snapshot,
+            kg_input["sha256"] if kg_input is not None else None,
+        )
         results.append(r)
         _emit({
             "type": "eval_job_finished",
@@ -789,9 +1050,18 @@ def run_campaign(
 
     from sculptor.run_context import capture_run_context, write_json_atomic
 
+    verify_result_lineage(results, charter)
     report = {
         "name": cfg.name,
         "created_at": datetime.now(timezone.utc).isoformat(),
+        "charter": {
+            "path": str(out / "campaign_charter.json"),
+            "schema_version": charter["schema_version"],
+            "design_sha256": charter_hash,
+            "document_sha256": charter["document_sha256"],
+        },
+        "campaign_inputs": external_inputs,
+        "authority_warnings": authority_warnings,
         "config": {
             **{k: v for k, v in asdict(cfg).items() if k != "out_dir"},
             "out_dir": str(cfg.out_dir),

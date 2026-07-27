@@ -25,11 +25,83 @@ from sculptor.adapters.base import (
     TrainResult,
 )
 from sculptor.sculpt import (
+    _find_resume_start_iteration,
     _should_early_stop,
     regenerate_reward_template,
     sculpt_init,
     sculpt_run,
 )
+
+
+def _write_reward_version(rewards_dir: Path, version: int) -> None:
+    rewards_dir.mkdir(parents=True, exist_ok=True)
+    (rewards_dir / f"v{version}.py").write_text(
+        "def compute_reward(*args, **kwargs):\n    return 0.0, {}\n",
+        encoding="utf-8",
+    )
+
+
+def _write_completion_marker(runs_dir: Path, version: int, **overrides) -> None:
+    iter_dir = runs_dir / f"iter_{version}"
+    iter_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "schema": 1,
+        "state": "completed",
+        "iter": version,
+    }
+    payload.update(overrides)
+    (iter_dir / "iteration_complete.json").write_text(
+        json.dumps(payload),
+        encoding="utf-8",
+    )
+
+
+def test_resume_advances_past_completed_no_edit_iteration(tmp_path: Path):
+    rewards = tmp_path / "rewards"
+    runs = tmp_path / "runs"
+    _write_reward_version(rewards, 3)
+    _write_completion_marker(runs, 3)
+
+    assert _find_resume_start_iteration(rewards, runs) == 4
+
+
+def test_resume_advances_past_contiguous_completion_markers(tmp_path: Path):
+    rewards = tmp_path / "rewards"
+    runs = tmp_path / "runs"
+    _write_reward_version(rewards, 3)
+    _write_completion_marker(runs, 3)
+    _write_completion_marker(runs, 4)
+
+    assert _find_resume_start_iteration(rewards, runs) == 5
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"schema": 2},
+        {"state": "running"},
+        {"iter": 99},
+    ],
+)
+def test_resume_reuses_iteration_with_invalid_completion_marker(
+    tmp_path: Path,
+    overrides: dict,
+):
+    rewards = tmp_path / "rewards"
+    runs = tmp_path / "runs"
+    _write_reward_version(rewards, 3)
+    _write_completion_marker(runs, 3, **overrides)
+
+    assert _find_resume_start_iteration(rewards, runs) == 3
+
+
+def test_resume_does_not_jump_over_completion_marker_gap(tmp_path: Path):
+    rewards = tmp_path / "rewards"
+    runs = tmp_path / "runs"
+    _write_reward_version(rewards, 3)
+    _write_completion_marker(runs, 4)
+
+    assert _find_resume_start_iteration(rewards, runs) == 3
 
 
 # ── Metric-plateau auto-kill compatibility ───────────────────────────────
@@ -453,6 +525,17 @@ class _TestAdapterStub(_StubAdapter):  # dotted path consumable by load_adapter
         super().__init__(project_root=Path.cwd(), primary_metric_schedule=_SCHEDULE)
 
 
+class _ResourceAdapterStub(_TestAdapterStub):
+    """Generic adapter surface used to verify launch-scoped resources."""
+
+    def __init__(
+        self, num_envs: int = 1024, device: str = "cuda:0", **cfg,
+    ):
+        super().__init__(**cfg)
+        self.num_envs = num_envs
+        self.device = device
+
+
 def test_sculpt_run_dry_run_end_to_end(tmp_path: Path, monkeypatch):
     """3 iterations, dry-run, stub adapter — exercises the full orchestration
     path including CHANGELOG, provenance, git commits."""
@@ -474,6 +557,13 @@ def test_sculpt_run_dry_run_end_to_end(tmp_path: Path, monkeypatch):
         assert (proj / "runs" / f"iter_{i}" / "checkpoint.zip").is_file()
         assert (proj / "runs" / f"iter_{i}" / "rollout" / "behavior.json").is_file()
         assert (proj / "runs" / f"iter_{i}" / "diagnosis.json").is_file()
+        completion = json.loads(
+            (proj / "runs" / f"iter_{i}" / "iteration_complete.json").read_text(
+                encoding="utf-8",
+            )
+        )
+        assert completion["state"] == "completed"
+        assert completion["iter"] == i
     for n in (1, 2, 3):
         assert (proj / "rewards" / f"v{n}.py").is_file()
     # current.py now re-exports v3
@@ -501,6 +591,53 @@ def test_sculpt_run_dry_run_end_to_end(tmp_path: Path, monkeypatch):
         capture_output=True, text=True, check=True).stdout
     iter_commits = [line for line in log.splitlines() if "iter " in line]
     assert len(iter_commits) == 3
+
+
+def test_sculpt_run_applies_resource_overrides_without_mutating_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """Hardware overrides are launch-scoped, generic, and reproducible."""
+    import sculptor.sculpt as sculpt_module
+
+    global _SCHEDULE
+    _SCHEDULE = [1.0]
+    proj = _write_minimal_project(tmp_path)
+    config = proj / "config.toml"
+    original = config.read_text(encoding="utf-8").replace(
+        "tests.test_sculpt._TestAdapterStub",
+        "tests.test_sculpt._ResourceAdapterStub",
+    )
+    config.write_text(original, encoding="utf-8")
+
+    loaded: dict[str, object] = {}
+    real_load = sculpt_module.load_adapter
+
+    def capture_load(path):
+        adapter = real_load(path)
+        loaded["adapter"] = adapter
+        return adapter
+
+    monkeypatch.setattr(sculpt_module, "load_adapter", capture_load)
+    sculpt_run(
+        config_path=config,
+        behavior_goal="traverse rough terrain",
+        iterations=1,
+        no_kg=True,
+        dry_run=True,
+        num_envs=256,
+        device="cpu",
+    )
+
+    adapter = loaded["adapter"]
+    assert getattr(adapter, "num_envs") == 256
+    assert getattr(adapter, "device") == "cpu"
+    assert config.read_text(encoding="utf-8") == original
+    context = json.loads(
+        (proj / "reports" / "run_context.json").read_text(encoding="utf-8")
+    )
+    effective = context["config"]["effective"]["adapter"]["config"]
+    assert effective["num_envs"] == 256
+    assert effective["device"] == "cpu"
 
 
 def test_sculpt_run_does_not_stop_after_three_non_improving(tmp_path: Path):
@@ -802,3 +939,234 @@ def test_sculpt_run_ignores_legacy_early_stop_and_runs_full_budget(
     )
     assert result.iterations_run == 6
     assert result.early_stopped is False
+
+
+# ── §2026-07-04: run-boundary trained-reward resolution ────────────────────
+def test_current_reward_target_parses_reexport(tmp_path: Path):
+    from sculptor.sculpt import _current_reward_target, _write_current_reexport
+
+    rewards = tmp_path / "rewards"
+    rewards.mkdir()
+    (rewards / "v0.py").write_text("REWARD_SPEC = {}\n", encoding="utf-8")
+    (rewards / "v4.py").write_text("REWARD_SPEC = {}\n", encoding="utf-8")
+
+    # No current.py yet → None.
+    assert _current_reward_target(rewards) is None
+    # Re-export target resolves even when a HIGHER version exists on disk.
+    _write_current_reexport(rewards, rewards / "v0.py")
+    assert _current_reward_target(rewards) == rewards / "v0.py"
+    _write_current_reexport(rewards, rewards / "v4.py")
+    assert _current_reward_target(rewards) == rewards / "v4.py"
+    # Hand-edited/unrecognizable current.py → None (callers fall back).
+    (rewards / "current.py").write_text("from .v4 import *\n", encoding="utf-8")
+    assert _current_reward_target(rewards) is None
+    # Recognizable line but the target file is gone → None.
+    _write_current_reexport(rewards, rewards / "v0.py")
+    (rewards / "v0.py").unlink()
+    assert _current_reward_target(rewards) is None
+
+
+def test_run_boundary_trains_and_edits_current_target(
+        tmp_path: Path, capsys):
+    """§2026-07-04 regression (tuck-jump iter 16): when a previous run's
+    best-by-fitness selection repointed current.py at an OLDER version and
+    a new run resumes, the iter must (a) record that version as
+    reward_path_trained — keep-best must never keep a never-trained file,
+    (b) apply its diagnosis edit to THAT source, and (c) report that
+    version in the iter events — not the highest v<n>.py on disk."""
+    global _SCHEDULE
+    _SCHEDULE = [1.0]
+    proj = _write_minimal_project(tmp_path)
+    rewards = proj / "rewards"
+    # Simulate the previous run: a later edit v2 exists on disk with a
+    # DISTINCT hyperparameter value, but best-selection kept v0.
+    v2_src = (rewards / "v0.py").read_text(encoding="utf-8").replace(
+        '"version": "v0"', '"version": "v2"').replace(
+        '"alive_bonus": 1.0', '"alive_bonus": 7.0')
+    (rewards / "v2.py").write_text(v2_src, encoding="utf-8")
+    from sculptor.sculpt import _write_current_reexport
+    _write_current_reexport(rewards, rewards / "v0.py")
+
+    result = sculpt_run(
+        config_path=proj / "config.toml", behavior_goal="dummy goal",
+        iterations=1, resume=True, no_kg=True, dry_run=True,
+    )
+    (outcome,) = result.completed_iters
+    assert outcome.iter_index == 2               # resume starts at latest_n
+
+    # (a) the trained record follows current.py's re-export target.
+    assert outcome.reward_path_trained == rewards / "v0.py"
+
+    # (b) the new edit is still numbered v3 (monotonic) but its content
+    # derives from v0 (the dry-run canned edit bumps alive_bonus by 0.5:
+    # 1.0 → 1.5). Pre-fix it derived from v2 and read 7.5.
+    v3 = (rewards / "v3.py").read_text(encoding="utf-8")
+    assert '"alive_bonus": 1.5' in v3
+    assert '"alive_bonus": 7.5' not in v3
+
+    # (c) events report the version that actually trained.
+    events = [
+        json.loads(line.split("[SCULPT-EVENT] ", 1)[1])
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("[SCULPT-EVENT] ")
+    ]
+    started = [e for e in events if e["type"] == "iter_started"]
+    completed = [e for e in events if e["type"] == "iter_completed"]
+    assert started and started[0]["reward_version_before"] == 0
+    assert completed and completed[0]["reward_version_before"] == 0
+    assert completed[0]["reward_version_after"] == 3
+
+
+def test_iter_fitness_event_carries_components_dict(
+        tmp_path: Path, capsys):
+    """§D24 (F4): the `iter_fitness` SCULPT-EVENT must carry the same
+    per-channel component breakdown the diagnoser sees, not scalars only.
+    Before this, the D20/D23 hollow-success class (criterion reads
+    'satisfied' while the certified fitness is ~0) was invisible in the
+    live event stream — recovering WHICH channel zeroed the fitness
+    required an offline recompute of the metric."""
+    global _SCHEDULE
+    _SCHEDULE = [1.0]
+    proj = _write_minimal_project(tmp_path)
+
+    class _DetailFitnessFn:
+        """Fake fitness_fn exposing the `.detail` accessor (see
+        `sculptor.eval.spec_metrics.make_spec_fitness_fn`) so the iter's
+        detail path runs without needing a real metric/rollout shape."""
+
+        def __call__(self, iter_dir):
+            return 0.0
+
+        def detail(self, iter_dir):
+            return {
+                "spec_score": 0.0, "spec_name": "torso_righting",
+                "gate_upright_frac": 1.0, "gate_reached_035": 0.0,
+                "error": None,
+            }
+
+    result = sculpt_run(
+        config_path=proj / "config.toml", behavior_goal="dummy goal",
+        iterations=1, no_kg=True, dry_run=True,
+        fitness_fn=_DetailFitnessFn(),
+    )
+    events = [
+        json.loads(line.split("[SCULPT-EVENT] ", 1)[1])
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("[SCULPT-EVENT] ")
+    ]
+    fitness_events = [e for e in events if e["type"] == "iter_fitness"]
+    assert fitness_events, events
+    assert fitness_events[0]["components"] == {
+        "gate_upright_frac": 1.0, "gate_reached_035": 0.0,
+    }
+
+    # §Ship-56: the live `iter_fitness` event must also be MIRRORED to
+    # `<iter_dir>/fitness.json` so a finished stage's per-iteration
+    # fitness survives past the job log (the UI probes this file).
+    (outcome,) = result.completed_iters
+    fitness_json = Path(outcome.iter_dir) / "fitness.json"
+    assert fitness_json.is_file()
+    record = json.loads(fitness_json.read_text(encoding="utf-8"))
+    assert record["iter"] == outcome.iter_index
+    assert record["fitness"] == pytest.approx(0.0)
+    assert record["components"] == {
+        "gate_upright_frac": 1.0, "gate_reached_035": 0.0,
+    }
+    assert record["source"] == "live"
+    assert record["observe_only"] is False
+    assert "recorded_at" in record
+
+
+def test_no_fitness_json_written_when_fitness_fn_is_none(
+        tmp_path: Path, capsys):
+    """The blind default (`fitness_fn=None`) never runs the fitness detail
+    path — `fitness.json` must not appear in the iter dir at all, not an
+    empty/stale placeholder."""
+    global _SCHEDULE
+    _SCHEDULE = [1.0]
+    proj = _write_minimal_project(tmp_path)
+
+    result = sculpt_run(
+        config_path=proj / "config.toml", behavior_goal="dummy goal",
+        iterations=1, no_kg=True, dry_run=True,
+    )
+    (outcome,) = result.completed_iters
+    assert not (Path(outcome.iter_dir) / "fitness.json").exists()
+
+
+def test_iter_fitness_event_components_null_on_plain_float_fallback(
+        tmp_path: Path, capsys):
+    """A `fitness_fn` with no `.detail` accessor (the plain-float
+    fallback path) must carry `"components": None` on the event — never
+    a crash, never a stale/empty dict masquerading as real data."""
+    global _SCHEDULE
+    _SCHEDULE = [1.0]
+    proj = _write_minimal_project(tmp_path)
+
+    sculpt_run(
+        config_path=proj / "config.toml", behavior_goal="dummy goal",
+        iterations=1, no_kg=True, dry_run=True,
+        fitness_fn=lambda iter_dir: 0.42,
+    )
+    events = [
+        json.loads(line.split("[SCULPT-EVENT] ", 1)[1])
+        for line in capsys.readouterr().out.splitlines()
+        if line.startswith("[SCULPT-EVENT] ")
+    ]
+    fitness_events = [e for e in events if e["type"] == "iter_fitness"]
+    assert fitness_events, events
+    assert fitness_events[0]["fitness"] == pytest.approx(0.42)
+    assert fitness_events[0]["components"] is None
+
+
+def test_dangling_current_reexport_is_repaired(tmp_path: Path):
+    """A generated current.py whose target v<n>.py was deleted would crash
+    mid-train on import; the iter must repair the re-export to the latest
+    version before training."""
+    global _SCHEDULE
+    _SCHEDULE = [1.0]
+    proj = _write_minimal_project(tmp_path)
+    rewards = proj / "rewards"
+    v1_src = (rewards / "v0.py").read_text(encoding="utf-8").replace(
+        '"version": "v0"', '"version": "v1"')
+    (rewards / "v1.py").write_text(v1_src, encoding="utf-8")
+    from sculptor.sculpt import _current_reward_target, _write_current_reexport
+    # current.py -> v0, then v0 vanishes (user cleanup).
+    _write_current_reexport(rewards, rewards / "v0.py")
+    (rewards / "v0.py").unlink()
+    assert _current_reward_target(rewards) is None
+
+    result = sculpt_run(
+        config_path=proj / "config.toml", behavior_goal="dummy goal",
+        iterations=1, resume=True, no_kg=True, dry_run=True,
+    )
+    (outcome,) = result.completed_iters
+    # Repaired: trained the latest surviving version, records agree.
+    assert outcome.reward_path_trained == rewards / "v1.py"
+    assert "v1.py" in (rewards / "current.py").read_text(encoding="utf-8") \
+        or "v2.py" in (rewards / "current.py").read_text(encoding="utf-8")
+
+
+def test_current_reward_target_parses_ui_backend_format(tmp_path: Path):
+    """The UI backend (reward_store.py) writes current.py with a
+    `_TARGET = Path(__file__).resolve().parent / 'v<n>.py'` line instead
+    of sculptor's `_LATEST = _HERE / ...`. Both must resolve — a
+    UI-rewritten current.py otherwise silently reverts the run-boundary
+    fix to the buggy latest-version fallback. (Ported from the parallel
+    worktree fix, commit 07c6da2.)"""
+    from sculptor.sculpt import _current_reward_target
+
+    rewards = tmp_path / "rewards"
+    rewards.mkdir()
+    (rewards / "v1.py").write_text("REWARD_SPEC = {}\n", encoding="utf-8")
+    (rewards / "v5.py").write_text("REWARD_SPEC = {}\n", encoding="utf-8")
+    (rewards / "current.py").write_text(
+        '"""Auto-generated by the UI backend."""\n'
+        "import importlib.util\n"
+        "from pathlib import Path\n"
+        "_TARGET = Path(__file__).resolve().parent / 'v1.py'\n"
+        "_spec = importlib.util.spec_from_file_location(\n"
+        '    "_sculpt_current_reward", _TARGET)\n',
+        encoding="utf-8",
+    )
+    assert _current_reward_target(rewards) == rewards / "v1.py"

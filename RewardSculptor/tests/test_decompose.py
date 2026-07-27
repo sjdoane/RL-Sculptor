@@ -30,6 +30,32 @@ from sculptor.decompose import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _isolate_reference_library(tmp_path_factory, monkeypatch):
+    """This module's docstring promises "no real Anthropic or sentence-
+    transformers calls" — but `decompose_task(attach_references=True)`
+    (the default) resolves `sculptor.refs.library.references_root()`,
+    which falls back to the DEVELOPER'S REAL on-disk reference library
+    (`~/.local/share/reward-sculptor/reference`, a genuinely populated
+    multi-thousand-clip index per docs/internal/REFERENCE_BUILD_LOG.md)
+    whenever a test doesn't explicitly override `RS_REFERENCE_ROOT`.
+    §D24 F1 made this a LIVE hazard, not just a slow/flaky one: an
+    attached stage now also triggers `sculptor.refs.spans.
+    select_reference_span`, a REAL Anthropic call, the moment a real
+    retrieval match clears the confidence bar — caught live during this
+    increment's own verification (a genuine outbound HTTPS connection
+    from a supposedly-offline test run). Point every test in this file
+    at a per-test empty tmp dir by default (mirrors conftest.py's
+    `_isolate_shared_kg` for the exact same class of hazard on the KG
+    graph); tests that want a populated index call `_touch_index` (or
+    their own `monkeypatch.setenv("RS_REFERENCE_ROOT", ...)`) which
+    simply overrides this value for the rest of that test."""
+    monkeypatch.setenv(
+        "RS_REFERENCE_ROOT",
+        str(tmp_path_factory.mktemp("refs_isolated_default")),
+    )
+
+
 # ── Minimal RewardContract stub ───────────────────────────────────────
 @dataclass
 class _FakeContract:
@@ -203,6 +229,39 @@ def test_stage_from_dict_drops_unknown_keys():
         "some_future_field": "ignored",  # not on the dataclass
     })
     assert s.name == "s1"
+
+
+# ── 1b. §start_pose — Stage field round-trip + defaults ─────────────
+def test_stage_start_pose_defaults_none():
+    s = Stage(
+        name="s1", goal_text="x", success_criterion="True",
+        max_iterations=2, parent_stage=None, reward_seed_prompt="alive",
+    )
+    assert s.start_pose is None
+
+
+def test_stage_start_pose_roundtrips_through_dict():
+    s = Stage(
+        name="s1", goal_text="x", success_criterion="True",
+        max_iterations=2, parent_stage=None, reward_seed_prompt="alive",
+        start_pose="supine",
+    )
+    d = s.to_dict()
+    assert d["start_pose"] == "supine"
+    s2 = Stage.from_dict(d)
+    assert s2.start_pose == "supine"
+
+
+def test_stage_start_pose_older_mission_json_loads_none():
+    """Back-compat: a mission.json predating start_pose loads with None
+    via from_dict's filter-unknown-keys path (no `start_pose` key at
+    all in the payload)."""
+    s = Stage.from_dict({
+        "name": "s1", "goal_text": "x", "success_criterion": "True",
+        "max_iterations": 2, "parent_stage": None,
+        "reward_seed_prompt": "alive",
+    })
+    assert s.start_pose is None
 
 
 # ── 2. validate_mission — structural rules ──────────────────────────
@@ -502,6 +561,79 @@ def test_validate_rejects_reward_seed_prompt_outside_char_bounds():
         validate_mission(m2, info_keys=set())
 
 
+# ── 2b. §start_pose — validation + the deterministic force rule ─────
+def _stage_with_start_pose(start_pose, needs_reference_rsi=False) -> Stage:
+    return Stage(
+        name="s1", goal_text="x", success_criterion="True",
+        max_iterations=2, parent_stage=None, reward_seed_prompt="alive",
+        start_pose=start_pose, needs_reference_rsi=needs_reference_rsi,
+    )
+
+
+def test_validate_rejects_unknown_start_pose_value():
+    m = Mission(
+        goal="g", stages=[_stage_with_start_pose("levitating")],
+        decomposition_model="x", decomposition_rationale="",
+    )
+    with pytest.raises(MissionValidationError, match="start_pose"):
+        validate_mission(m, info_keys=set())
+
+
+@pytest.mark.parametrize(
+    "pose", ["supine", "prone", "sitting", "crouched"],
+)
+def test_validate_forces_needs_reference_rsi_for_non_standing_start_pose(pose):
+    """The DETERMINISTIC FORCE RULE: any non-'standing' start_pose with
+    needs_reference_rsi=False gets FORCED True at validation — prompt
+    compliance on the separate boolean is not trusted. A warning
+    discloses the force (this module's log/warn channel; see
+    `_validate_stage_structure`)."""
+    stage = _stage_with_start_pose(pose, needs_reference_rsi=False)
+    m = Mission(
+        goal="g", stages=[stage],
+        decomposition_model="x", decomposition_rationale="",
+    )
+    assert stage.needs_reference_rsi is False
+    with pytest.warns(UserWarning, match="needs_reference_rsi"):
+        validate_mission(m, info_keys=set())
+    assert stage.needs_reference_rsi is True
+
+
+def test_validate_standing_start_pose_does_not_force_rsi():
+    stage = _stage_with_start_pose("standing", needs_reference_rsi=False)
+    m = Mission(
+        goal="g", stages=[stage],
+        decomposition_model="x", decomposition_rationale="",
+    )
+    validate_mission(m, info_keys=set())
+    assert stage.needs_reference_rsi is False
+
+
+def test_validate_none_start_pose_does_not_force_rsi():
+    stage = _stage_with_start_pose(None, needs_reference_rsi=False)
+    m = Mission(
+        goal="g", stages=[stage],
+        decomposition_model="x", decomposition_rationale="",
+    )
+    validate_mission(m, info_keys=set())
+    assert stage.needs_reference_rsi is False
+
+
+def test_validate_non_standing_start_pose_already_true_does_not_warn(
+    recwarn,
+):
+    """No force needed (and no warning) when the stage already carries
+    needs_reference_rsi=True alongside a non-standing start_pose."""
+    stage = _stage_with_start_pose("crouched", needs_reference_rsi=True)
+    m = Mission(
+        goal="g", stages=[stage],
+        decomposition_model="x", decomposition_rationale="",
+    )
+    validate_mission(m, info_keys=set())
+    assert stage.needs_reference_rsi is True
+    assert len(recwarn) == 0
+
+
 # ── 3. decompose_task — happy path with stubbed Claude ───────────────
 def test_decompose_happy_path_no_kg(monkeypatch):
     client = _StubClient(_good_decomp_model())
@@ -719,3 +851,408 @@ def test_decompose_task_prompt_contains_hard_rules():
     assert "expected_info_keys" in p
     # Strict JSON instruction at the end.
     assert "JSON" in p
+
+
+def test_needs_reference_rsi_description_covers_non_standing_start():
+    """§REFERENCE_TRAJECTORY_PLAN §7/§9: the flag must ALSO cover a
+    non-standing start state (get-up's first stage), not just
+    ballistic/airborne states — both the prompt and the pydantic field
+    description."""
+    from sculptor.prompts import load_prompt
+
+    p = load_prompt("decompose_task")
+    assert "lying" in p.lower()
+    assert "standing reset" in p.lower()
+
+    field_desc = _StageModel.model_fields["needs_reference_rsi"].description
+    assert "lying" in field_desc.lower() or "standing reset" in field_desc.lower()
+
+
+# ── §start_pose: _StageModel field + decompose parsing ────────────────
+def test_stage_model_start_pose_defaults_none():
+    sm = _StageModel(
+        name="s1", goal_text="x", success_criterion="True",
+        max_iterations=2, parent_stage=None, reward_seed_prompt="alive",
+    )
+    assert sm.start_pose is None
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [("Supine", "supine"), (" prone ", "prone"), ("", None), (None, None)],
+)
+def test_stage_model_normalizes_start_pose(raw, expected):
+    sm = _StageModel(
+        name="s1", goal_text="x", success_criterion="True",
+        max_iterations=2, parent_stage=None, reward_seed_prompt="alive",
+        start_pose=raw,
+    )
+    assert sm.start_pose == expected
+
+
+def test_decompose_task_prompt_contains_start_pose_rule():
+    """Guard against accidental prompt edits dropping the start_pose
+    section — both the JSON schema block and the vocabulary."""
+    from sculptor.prompts import load_prompt
+
+    p = load_prompt("decompose_task")
+    assert "start_pose" in p
+    assert "supine" in p.lower() and "prone" in p.lower()
+    assert "crouched" in p.lower()
+
+
+def test_redecompose_prompt_contains_start_pose_rule():
+    from sculptor.prompts import load_prompt
+
+    p = load_prompt("redecompose_stage")
+    assert "start_pose" in p
+    assert "supine" in p.lower() and "prone" in p.lower()
+
+
+def test_decompose_parses_start_pose_from_claude(monkeypatch):
+    """A stage-level start_pose Claude emits flows through
+    decompose_task into the resulting Mission's Stage — including the
+    coherent needs_reference_rsi:true a get-up first stage requires."""
+    model = _DecompositionModel(
+        decomposition_rationale=(
+            "One stage: rise from lying on the back to standing."
+        ),
+        stages=[
+            _StageModel(
+                name="stand_up",
+                goal_text="From lying on your back, rise to standing.",
+                success_criterion="behavior['mean_return'] > 0.3",
+                max_iterations=4,
+                parent_stage=None,
+                reward_seed_prompt="alive_bonus + upright + rise_progress",
+                kg_seed_papers=[],
+                needs_reference_rsi=True,
+                start_pose="supine",
+            ),
+        ],
+    )
+    client = _StubClient(model)
+    mission = decompose_task(
+        "Get up off the ground from lying on your back",
+        _default_contract(), kg_store=None, client=client,
+        attach_references=False,
+    )
+    assert mission.stages[0].start_pose == "supine"
+    assert mission.stages[0].needs_reference_rsi is True
+
+
+# ── 6. §REFERENCE_TRAJECTORY_PLAN §4/§7: retrieval + attachment ──────
+@dataclass
+class _FakeMatch:
+    clip_id: str
+    text: str = ""
+    score: float = 1.0
+    match_confidence: "float | None" = None
+    reason: "str | None" = None
+    tier: "str | None" = "K"
+    license: "str | None" = "internal"
+    n_frames: "int | None" = 50
+    fps: "float | None" = 30.0
+    duration_s: "float | None" = 2.0
+    rerank: str = "deterministic-only"
+
+
+def _touch_index(tmp_path: Path, monkeypatch) -> Path:
+    """§`_retrieve_mission_references`/`_attach_stage_references` both
+    early-return when no index.jsonl exists on disk — create an empty one
+    under a tmp RS_REFERENCE_ROOT so the retrieval path actually runs."""
+    root = tmp_path / "refs_root"
+    root.mkdir()
+    (root / "index.jsonl").write_text("", encoding="utf-8")
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(root))
+    return root
+
+
+def _mk_clip_for_signature():
+    from sculptor.reference import make_procedural_jump_clip
+
+    return make_procedural_jump_clip()
+
+
+def test_attach_references_true_picks_top_match_above_threshold(
+    tmp_path, monkeypatch,
+):
+    """A stage whose retrieval top match has match_confidence >= 0.8 gets
+    its reference_clip_id/tier/match_confidence set."""
+    _touch_index(tmp_path, monkeypatch)
+    clip = _mk_clip_for_signature()
+    monkeypatch.setattr(
+        "sculptor.reference.load_clip", lambda path: clip)
+    # §D24 F1 item 4a: attach now also runs span selection — stub it so
+    # this test (about the confidence-gate wiring, not span selection)
+    # never makes a real Anthropic call.
+    monkeypatch.setattr(
+        "sculptor.refs.spans.select_reference_span",
+        lambda *a, **kw: (None, "test-no-network"))
+
+    def fake_search(query, robot="g1", k=10, **kw):
+        return [_FakeMatch(clip_id="getup_high_conf", match_confidence=0.92,
+                            tier="D")]
+
+    monkeypatch.setattr("sculptor.refs.retrieve.search", fake_search)
+
+    client = _StubClient(_good_decomp_model())
+    mission = decompose_task(
+        "Stand on one leg and kick", _default_contract(),
+        kg_store=None, client=client, attach_references=True,
+    )
+    for stage in mission.stages:
+        assert stage.reference_clip_id == "getup_high_conf"
+        assert stage.reference_tier == "D"
+        assert stage.reference_match_confidence == pytest.approx(0.92)
+
+
+def test_attach_references_true_leaves_none_below_threshold(
+    tmp_path, monkeypatch,
+):
+    """A low-confidence, non-standout match must NOT be auto-attached —
+    the UI picker remains the approval surface."""
+    _touch_index(tmp_path, monkeypatch)
+    clip = _mk_clip_for_signature()
+    monkeypatch.setattr("sculptor.reference.load_clip", lambda path: clip)
+
+    def fake_search(query, robot="g1", k=10, **kw):
+        # Two close-scoring candidates, low LLM confidence: neither the
+        # confidence bar nor the "clear standout" fallback should fire.
+        return [
+            _FakeMatch(clip_id="maybe_a", match_confidence=0.4, score=1.0),
+            _FakeMatch(clip_id="maybe_b", match_confidence=0.35, score=0.9),
+        ]
+
+    monkeypatch.setattr("sculptor.refs.retrieve.search", fake_search)
+
+    client = _StubClient(_good_decomp_model())
+    mission = decompose_task(
+        "Stand on one leg and kick", _default_contract(),
+        kg_store=None, client=client, attach_references=True,
+    )
+    for stage in mission.stages:
+        assert stage.reference_clip_id is None
+
+
+# ── §D24 F1 item 4a: span selection right after attach ─────────────────
+_FAKE_SPAN = {
+    "t_start_s": 0.0, "t_end_s": 1.5, "confidence": 0.83,
+    "rationale": "test span", "method": "llm+snap+qc",
+}
+
+
+def test_attach_references_selects_and_persists_span(tmp_path, monkeypatch):
+    """Right after a stage's reference clip is attached (confidence
+    above threshold), `select_reference_span` is called once per
+    attached stage and the four span fields are persisted on it — the
+    same stage a `generate_stage_metrics` pass later reads via
+    `load_stage_reference_clip` (the one loader)."""
+    _touch_index(tmp_path, monkeypatch)
+    clip = _mk_clip_for_signature()
+    monkeypatch.setattr("sculptor.reference.load_clip", lambda path: clip)
+
+    span_calls: list[dict] = []
+
+    def fake_select(clip_arg, *, goal_text, start_pose=None, llm_call=None):
+        span_calls.append({"goal_text": goal_text, "start_pose": start_pose})
+        return dict(_FAKE_SPAN), None
+
+    monkeypatch.setattr("sculptor.refs.spans.select_reference_span", fake_select)
+    # §D24 F2: a successfully-attached span now ALSO triggers criterion
+    # re-grounding (`ground_stage_criterion`), a REAL Anthropic call by
+    # default — this test is about span attach/persist, not grounding,
+    # so stub it out (mirrors this file's own `select_reference_span`
+    # stubbing discipline for exactly the same class of hazard).
+    ground_calls: list[dict] = []
+    monkeypatch.setattr(
+        "sculptor.decompose.ground_stage_criterion",
+        lambda stage, clip, **kw: ground_calls.append(
+            {"stage": stage.name}) or {"adopted": False, "rationale": "stubbed"})
+
+    def fake_search(query, robot="g1", k=10, **kw):
+        return [_FakeMatch(clip_id="getup_high_conf", match_confidence=0.92,
+                            tier="D")]
+
+    monkeypatch.setattr("sculptor.refs.retrieve.search", fake_search)
+
+    client = _StubClient(_good_decomp_model())
+    mission = decompose_task(
+        "Stand on one leg and kick", _default_contract(),
+        kg_store=None, client=client, attach_references=True,
+    )
+    # _good_decomp_model has 3 stages, every one gets the same top match.
+    assert len(span_calls) == 3
+    # §D24 F2: criterion re-grounding fires once per stage whose span
+    # attached successfully — same cadence as span selection itself.
+    assert len(ground_calls) == 3
+    for stage in mission.stages:
+        assert stage.reference_clip_id == "getup_high_conf"
+        assert stage.reference_span_start_s == pytest.approx(0.0)
+        assert stage.reference_span_end_s == pytest.approx(1.5)
+        assert stage.reference_span_confidence == pytest.approx(0.83)
+        assert stage.reference_span_method == "llm+snap+qc"
+
+    # Round-trips through mission.json like every other Stage field.
+    save_mission(mission, tmp_path / "m")
+    reloaded = load_mission(tmp_path / "m")
+    assert reloaded.stages[0].reference_span_start_s == pytest.approx(0.0)
+    assert reloaded.stages[0].reference_span_end_s == pytest.approx(1.5)
+
+
+def test_attach_references_span_declined_leaves_fields_none(tmp_path, monkeypatch):
+    """A stage whose clip gets attached but whose span selection is
+    declined (low confidence / QC reject / whatever reason) keeps
+    start/end/confidence at None — the explicit "use the full clip"
+    contract — rather than a partial/garbage value.
+
+    §D24 W5 hardening: a SEMANTIC decline (this one: low_confidence) now
+    persists a `"declined:<reason>"` marker in `reference_span_method`
+    (the ONE field that deliberately breaks the old "all four None
+    together" invariant) so span selection is never re-attempted for
+    this stage — see `sculptor.refs.spans.is_semantic_decline`."""
+    _touch_index(tmp_path, monkeypatch)
+    clip = _mk_clip_for_signature()
+    monkeypatch.setattr("sculptor.reference.load_clip", lambda path: clip)
+    monkeypatch.setattr(
+        "sculptor.refs.spans.select_reference_span",
+        lambda *a, **kw: (None, "low_confidence:0.4"))
+
+    def fake_search(query, robot="g1", k=10, **kw):
+        return [_FakeMatch(clip_id="getup_high_conf", match_confidence=0.92)]
+
+    monkeypatch.setattr("sculptor.refs.retrieve.search", fake_search)
+
+    client = _StubClient(_good_decomp_model())
+    mission = decompose_task(
+        "Stand on one leg and kick", _default_contract(),
+        kg_store=None, client=client, attach_references=True,
+    )
+    for stage in mission.stages:
+        assert stage.reference_clip_id == "getup_high_conf"
+        assert stage.reference_span_start_s is None
+        assert stage.reference_span_end_s is None
+        assert stage.reference_span_confidence is None
+        assert stage.reference_span_method == "declined:low_confidence:0.4"
+
+
+def test_attach_references_span_infra_failure_leaves_method_none(
+    tmp_path, monkeypatch,
+):
+    """An INFRA failure (llm_unavailable/parse_error/invalid_clip/
+    signature_error — as opposed to a semantic verdict) must NOT persist
+    a declined marker — `reference_span_method` stays at the true "all
+    four None" state so the NEXT attempt (decompose-time re-run, or the
+    mission_metrics lazy backfill) retries selection instead of treating
+    a transient outage as a standing decision."""
+    _touch_index(tmp_path, monkeypatch)
+    clip = _mk_clip_for_signature()
+    monkeypatch.setattr("sculptor.reference.load_clip", lambda path: clip)
+    monkeypatch.setattr(
+        "sculptor.refs.spans.select_reference_span",
+        lambda *a, **kw: (None, "llm_unavailable:APIConnectionError: timeout"))
+
+    def fake_search(query, robot="g1", k=10, **kw):
+        return [_FakeMatch(clip_id="getup_high_conf", match_confidence=0.92)]
+
+    monkeypatch.setattr("sculptor.refs.retrieve.search", fake_search)
+
+    client = _StubClient(_good_decomp_model())
+    mission = decompose_task(
+        "Stand on one leg and kick", _default_contract(),
+        kg_store=None, client=client, attach_references=True,
+    )
+    for stage in mission.stages:
+        assert stage.reference_clip_id == "getup_high_conf"
+        assert stage.reference_span_start_s is None
+        assert stage.reference_span_method is None
+
+
+def test_attach_references_false_leaves_stages_untouched(tmp_path, monkeypatch):
+    """`attach_references=False` must skip retrieval entirely — even a
+    high-confidence match must not be attached, and search() must not
+    even be called."""
+    _touch_index(tmp_path, monkeypatch)
+    called = {"search": False}
+
+    def fake_search(query, robot="g1", k=10, **kw):
+        called["search"] = True
+        return [_FakeMatch(clip_id="should_not_attach", match_confidence=0.99)]
+
+    monkeypatch.setattr("sculptor.refs.retrieve.search", fake_search)
+
+    client = _StubClient(_good_decomp_model())
+    mission = decompose_task(
+        "Stand on one leg and kick", _default_contract(),
+        kg_store=None, client=client, attach_references=False,
+    )
+    assert called["search"] is False
+    for stage in mission.stages:
+        assert stage.reference_clip_id is None
+
+
+def test_attach_references_injects_signature_into_decompose_prompt(
+    tmp_path, monkeypatch,
+):
+    """§7: the mission-goal-level retrieval + signature injection happens
+    in the SAME decompose call (decompose has no separate criterion-
+    authoring call) — assert the rendered user_content carries the
+    REFERENCE MOTION SIGNATURES block with real numeric fields."""
+    _touch_index(tmp_path, monkeypatch)
+    clip = _mk_clip_for_signature()
+    monkeypatch.setattr("sculptor.reference.load_clip", lambda path: clip)
+    monkeypatch.setattr(
+        "sculptor.refs.spans.select_reference_span",
+        lambda *a, **kw: (None, "test-no-network"))
+
+    def fake_search(query, robot="g1", k=10, **kw):
+        return [_FakeMatch(clip_id="jump_ref_clip", match_confidence=0.9)]
+
+    monkeypatch.setattr("sculptor.refs.retrieve.search", fake_search)
+
+    client = _StubClient(_good_decomp_model())
+    decompose_task(
+        "Stand on one leg and kick", _default_contract(),
+        kg_store=None, client=client, attach_references=True,
+    )
+    user_content = client.messages.calls[0]["messages"][0]["content"]
+    assert "REFERENCE MOTION SIGNATURES" in user_content
+    assert "jump_ref_clip" in user_content
+    assert "duration_s" in user_content
+    assert "ground" in user_content.lower()
+
+
+def test_attach_references_no_index_on_disk_is_a_noop(tmp_path, monkeypatch):
+    """No `index.jsonl` on disk at all (fresh RS_REFERENCE_ROOT, never
+    ingested) must never raise and must never attach anything — the
+    §build-brief guard on `library.index_path().is_file()`."""
+    root = tmp_path / "empty_refs_root"
+    root.mkdir()
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(root))
+
+    client = _StubClient(_good_decomp_model())
+    mission = decompose_task(
+        "Stand on one leg and kick", _default_contract(),
+        kg_store=None, client=client, attach_references=True,
+    )
+    for stage in mission.stages:
+        assert stage.reference_clip_id is None
+
+
+def test_attach_references_retrieval_exception_never_raises(tmp_path, monkeypatch):
+    """Any retrieval-layer exception (index corrupt, search() bug, etc.)
+    must degrade to "no references" rather than fail decompose_task."""
+    _touch_index(tmp_path, monkeypatch)
+
+    def broken_search(query, robot="g1", k=10, **kw):
+        raise RuntimeError("simulated retrieval failure")
+
+    monkeypatch.setattr("sculptor.refs.retrieve.search", broken_search)
+
+    client = _StubClient(_good_decomp_model())
+    mission = decompose_task(
+        "Stand on one leg and kick", _default_contract(),
+        kg_store=None, client=client, attach_references=True,
+    )
+    for stage in mission.stages:
+        assert stage.reference_clip_id is None

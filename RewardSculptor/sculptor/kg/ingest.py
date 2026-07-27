@@ -32,6 +32,7 @@ Seeds format (see examples/hopper/kg_seeds.yml):
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import re
 import sys
 import time
@@ -133,19 +134,65 @@ def _download_pdf_with_timeout(url: str, dest: Path, *, timeout_s: float) -> Non
     interrupted download never leaves a partial `.pdf` that the idempotency
     check would later mistake for a successful ingest.
     """
+    import tempfile
     import urllib.request
 
-    partial = dest.with_suffix(dest.suffix + ".partial")
+    # A fixed `<paper>.pdf.partial` races when two UI/research workers ingest
+    # the same paper concurrently: one worker can rename the other worker's
+    # file, leaving its final replace with FileNotFoundError. Use a unique
+    # same-directory temporary file; os.replace remains atomic at commit.
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = tempfile.NamedTemporaryFile(
+        mode="wb", prefix=f".{dest.name}.", suffix=".partial",
+        dir=dest.parent, delete=False)
+    partial = Path(tmp.name)
     req = urllib.request.Request(
         url, headers={"User-Agent": "Reward-Sculptor/0.1 (arxiv ingest)"})
-    # Use socket-level timeout for the initial connect + idle reads.
-    with urllib.request.urlopen(req, timeout=timeout_s) as resp, partial.open("wb") as out:
-        while True:
-            chunk = resp.read(1 << 16)
-            if not chunk:
-                break
-            out.write(chunk)
-    partial.replace(dest)
+    try:
+        # Use socket-level timeout for the initial connect + idle reads.
+        with tmp, urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            while True:
+                chunk = resp.read(1 << 16)
+                if not chunk:
+                    break
+                tmp.write(chunk)
+        partial.replace(dest)
+    finally:
+        partial.unlink(missing_ok=True)
+
+
+def make_arxiv_client(
+    *,
+    page_size: int,
+    delay_seconds: float,
+    num_retries: int,
+    timeout_s: float,
+):
+    """Build an `arxiv.Client` whose HTTP timeout is scoped to ITS OWN
+    requests session.
+
+    §Phase-0 hardening 2026-07-18: the old approach set
+    `socket.setdefaulttimeout(timeout_s)` around the call — a
+    process-GLOBAL mutation. The UI backend runs ingest/research inside
+    worker threads of a live uvicorn server, so any socket created by
+    ANOTHER thread during that window (a websocket, a long-poll response)
+    silently inherited a 30s timeout and could die mid-stream. The arxiv
+    package keeps a `requests.Session` at `client._session`; wrapping its
+    `request` with a default timeout confines the bound to arxiv traffic.
+    Fallback: if a future arxiv version drops `_session`, the client is
+    returned un-bounded (requests' default) rather than reintroducing the
+    global mutation."""
+    import arxiv
+
+    client = arxiv.Client(
+        page_size=page_size, delay_seconds=delay_seconds,
+        num_retries=num_retries)
+    sess = getattr(client, "_session", None)
+    if sess is not None and hasattr(sess, "request"):
+        import functools
+
+        sess.request = functools.partial(sess.request, timeout=timeout_s)
+    return client
 
 
 # ── Public API ──────────────────────────────────────────────────────────────
@@ -196,16 +243,13 @@ def _fetch_arxiv_metadata(
             )
             sleep(delay)
         try:
+            client = make_arxiv_client(
+                page_size=1, delay_seconds=1.0, num_retries=1,
+                timeout_s=timeout_s)
             import arxiv
-            import socket
 
-            socket.setdefaulttimeout(timeout_s)
-            try:
-                client = arxiv.Client(page_size=1, delay_seconds=1.0, num_retries=1)
-                search = arxiv.Search(id_list=[arxiv_id])
-                result = next(client.results(search))
-            finally:
-                socket.setdefaulttimeout(None)
+            search = arxiv.Search(id_list=[arxiv_id])
+            result = next(client.results(search))
 
             return {
                 "title": str(result.title).strip(),
@@ -282,6 +326,57 @@ def heal_stub_titles(
     return results
 
 
+def heal_dead_text_paths(
+    store: SculptorKG | None = None,
+    *,
+    force: bool = True,
+) -> dict[str, str]:
+    """Repair Paper nodes whose `full_text_path` no longer exists on disk.
+
+    §Phase-0 hardening 2026-07-18: papers ingested while the KG was rooted
+    somewhere transient (measured live: 20 papers pointing at a wiped
+    `/tmp/pdfs/`) keep a dead sidecar path. Nothing breaks until the next
+    `extract --force`, which then silently loses the BODY_EXCERPT and
+    extracts from abstract+conclusion alone — a quality regression with no
+    error. Re-running `ingest_arxiv(force=True)` re-downloads the PDF into
+    THIS store's pdfs dir, rewrites the sidecar, and preserves the
+    `extracted` flag. Returns `{arxiv_id: "healed" | "still_dead" |
+    "error: ..."}`; papers with a live path are untouched."""
+    owns_store = store is None
+    store = store or SculptorKG()
+    results: dict[str, str] = {}
+    try:
+        dead: list[str] = []
+        for node in store.find_nodes(kind="Paper"):
+            path = getattr(node, "full_text_path", None)
+            if path and not Path(path).is_file():
+                aid = getattr(node, "arxiv_id", "")
+                if aid:
+                    dead.append(str(aid))
+        if not dead:
+            return results
+        print(f"[heal] found {len(dead)} paper(s) with dead full_text_path",
+              flush=True)
+        for aid in dead:
+            try:
+                paper = ingest_arxiv(aid, store=store, force=force)
+                new_path = getattr(paper, "full_text_path", None)
+                if new_path and Path(new_path).is_file():
+                    results[aid] = "healed"
+                    print(f"[heal]   {aid}: -> {new_path}", flush=True)
+                else:
+                    results[aid] = "still_dead"
+                    print(f"[heal]   {aid}: still dead", flush=True)
+            except Exception as e:  # noqa: BLE001
+                results[aid] = f"error: {type(e).__name__}: {e}"
+                print(f"[heal]   {aid}: error {e}", file=sys.stderr,
+                      flush=True)
+    finally:
+        if owns_store:
+            store.close()
+    return results
+
+
 def ingest_arxiv(
     arxiv_id: str,
     *,
@@ -314,11 +409,26 @@ def ingest_arxiv(
         if meta is None:
             fm = fallback_metadata or {}
             meta = {
-                "title": fm.get("title", f"arxiv:{arxiv_id}"),
-                "authors": fm.get("authors", []) or [],
-                "year": fm.get("year"),
-                "abstract": fm.get("abstract", "") or "",
+                "title": (fm.get("title")
+                          or (existing.title if isinstance(existing, Paper)
+                              else f"arxiv:{arxiv_id}")),
+                "authors": (fm.get("authors")
+                            or (existing.authors if isinstance(existing, Paper)
+                                else []) or []),
+                "year": (fm.get("year")
+                         or (existing.year if isinstance(existing, Paper)
+                             else None)),
+                "abstract": (fm.get("abstract")
+                             or (existing.abstract
+                                 if isinstance(existing, Paper) else "") or ""),
             }
+        elif isinstance(existing, Paper):
+            # Even a successful metadata response may omit a field. Healing a
+            # dead sidecar must never downgrade unrelated rich metadata.
+            meta["title"] = meta.get("title") or existing.title
+            meta["authors"] = meta.get("authors") or existing.authors
+            meta["year"] = meta.get("year") or existing.year
+            meta["abstract"] = meta.get("abstract") or existing.abstract
 
         # ── PDF download (direct CDN URL, not API) ────────────────────────
         if not pdf_path.exists() or force:
@@ -330,6 +440,9 @@ def ingest_arxiv(
         text_path = _save_full_text_sidecar(_pdfs_dir(store), arxiv_id, full_text)
         conclusion = _extract_conclusion(full_text)
 
+        fm = fallback_metadata or {}
+        old_tags = list(existing.tags) if isinstance(existing, Paper) else []
+        incoming_tags = [str(t) for t in (fm.get("tags") or []) if t]
         paper = Paper(
             id=paper_id,
             arxiv_id=arxiv_id,
@@ -337,10 +450,24 @@ def ingest_arxiv(
             authors=list(meta["authors"]),
             year=meta["year"],
             abstract=meta["abstract"],
-            conclusion_text=conclusion,
+            conclusion_text=(conclusion or
+                             (existing.conclusion_text
+                              if isinstance(existing, Paper) else "")),
+            rationale=(str(fm.get("rationale") or "") or
+                       (existing.rationale
+                        if isinstance(existing, Paper) else "")),
+            tags=sorted(set(old_tags) | set(incoming_tags)),
+            tier=(str(fm.get("tier") or "").upper() or
+                  (existing.tier if isinstance(existing, Paper) else None)),
+            source_url=(str(fm.get("source_url") or "") or
+                        (existing.source_url
+                         if isinstance(existing, Paper) else "") or
+                        f"https://arxiv.org/abs/{arxiv_id}"),
             full_text_path=str(text_path),
             ingested_at=time.time(),
             extracted=existing.extracted if isinstance(existing, Paper) else False,
+            provenance=(existing.provenance
+                        if isinstance(existing, Paper) else "seed"),
         )
         store.add_node(paper, upsert=True)
         return paper
@@ -390,9 +517,19 @@ def ingest_from_seeds(
                     results["<missing arxiv_id>"] = "error: missing arxiv_id field"
                     continue
                 # Forward any fields the user provided as metadata fallback.
-                for k in ("title", "authors", "year", "abstract"):
+                for k in (
+                    "title", "authors", "year", "abstract", "rationale",
+                    "tags", "tier", "source_url",
+                ):
                     if entry.get(k):
                         fallback[k] = entry[k]
+                if not fallback.get("tags") and rationale:
+                    # Backward compatibility for older campaigns whose domain
+                    # tags lived only in a `[a+b+c]` rationale prefix.
+                    m = re.match(r"^\[([^]]+)\]", rationale.strip())
+                    if m:
+                        fallback["tags"] = [
+                            t.strip() for t in m.group(1).split("+") if t.strip()]
             else:
                 results[str(entry)] = f"error: unsupported entry type {type(entry).__name__}"
                 continue
@@ -403,6 +540,21 @@ def ingest_from_seeds(
                 _pdfs_dir(store) / _safe_pdf_name(_normalize_arxiv_id(arxiv_id))
             ).exists()
             if existing is not None and pdf_present and not force:
+                if isinstance(existing, Paper):
+                    enriched = dataclasses.replace(
+                        existing,
+                        rationale=(str(fallback.get("rationale") or "")
+                                   or existing.rationale),
+                        tags=sorted(set(existing.tags) | {
+                            str(t) for t in (fallback.get("tags") or []) if t}),
+                        tier=(str(fallback.get("tier") or "").upper()
+                              or existing.tier),
+                        source_url=(str(fallback.get("source_url") or "")
+                                    or existing.source_url
+                                    or f"https://arxiv.org/abs/{_normalize_arxiv_id(arxiv_id)}"),
+                    )
+                    if enriched != existing:
+                        store.add_node(enriched)
                 print(f"[ingest]   skip {arxiv_id} — already present", flush=True)
                 results[arxiv_id] = "already_present"
                 continue
@@ -435,7 +587,9 @@ def _build_argparser() -> argparse.ArgumentParser:
     ap.add_argument("--arxiv", action="append", default=[],
                     help="Directly ingest an arxiv id. Can repeat.")
     ap.add_argument("--store", type=Path, default=None,
-                    help="Override KG DB path (default: $SCULPTOR_KG_PATH or ./kg/graph.db).")
+                    help="Override KG DB path (default: $SCULPTOR_KG_PATH / "
+                         "$RS_KG_PATH, else the shared "
+                         "~/.local/share/sculptor/kg/graph.db).")
     ap.add_argument("--force", action="store_true",
                     help="Re-download even if the paper is already ingested.")
     return ap

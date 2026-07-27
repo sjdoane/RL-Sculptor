@@ -39,11 +39,43 @@ export const qk = {
 
   runs: (slug: string) => ["runs", slug] as const,
   run: (slug: string, runId: string) => ["run", slug, runId] as const,
+  policies: (slug: string, runId?: string) =>
+    ["policies", slug, runId ?? "_project"] as const,
 
   missions: (slug: string) => ["missions", slug] as const,
   mission: (slug: string, missionSlug: string) =>
     ["mission", slug, missionSlug] as const,
+  // §Ship 20 (de-siloing): disk-truth stage iterations + env spec.
+  stageIters: (slug: string, missionSlug: string, stageName: string) =>
+    ["stageIters", slug, missionSlug, stageName] as const,
+  // §increment 3: disk-truth PROJECT-level iterations (plain runs).
+  projectIters: (slug: string) => ["projectIters", slug] as const,
+  stageEnvSpec: (slug: string, missionSlug: string, stageName: string) =>
+    ["stageEnvSpec", slug, missionSlug, stageName] as const,
+  // §selection-report UI: the stage's keep-best decision report.
+  stageSelection: (slug: string, missionSlug: string, stageName: string) =>
+    ["stageSelection", slug, missionSlug, stageName] as const,
 
   dashboard: () => ["dashboard"] as const,
   systemInfo: () => ["systemInfo"] as const,
+
+  // Recoverable-delete bin (Settings → Trash).
+  trash: () => ["trash"] as const,
+
+  // Saved-missions library (durable disk archive).
+  saved: () => ["saved"] as const,
+  savedEntry: (entryId: string) => ["saved", entryId] as const,
+
+  // Reference library (R1): search results + slim index browse.
+  referenceSearch: (query: string, robot: string) =>
+    ["references", "search", robot, query] as const,
+  referenceIndex: (robot: string) => ["references", "index", robot] as const,
+
+  // Environment authoring (env-authoring item 5): the promoted world
+  // tuple + its immutable selection history.
+  worldSelection: (slug: string) => ["worldSelection", slug] as const,
+  worldValidation: (slug: string) => ["worldValidation", slug] as const,
+  worldLineage: (slug: string) => ["worldLineage", slug] as const,
+  worldCurriculum: (slug: string) => ["worldCurriculum", slug] as const,
+  worldScene: (slug: string) => ["worldScene", slug] as const,
 };

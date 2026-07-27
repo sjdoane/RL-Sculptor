@@ -158,6 +158,18 @@ class RewardContract:
     # The reward module's compute_reward_batched receives dict[str, Tensor]
     # where tensor.shape == (num_envs, *state_schema[k]).
     state_schema: Optional[dict[str, tuple[int, ...]]] = None
+    # Per-step feature shape for every ``info`` value, excluding the leading
+    # num_envs dimension. Most legacy signals are scalar ``()``, while
+    # authored channels such as region-relative positions and object linear
+    # velocities are vectors like ``(3,)``. Validators and prompt builders
+    # must preserve these shapes; pretending every value is ``(N,)`` lets a
+    # generated reward pass preflight and then crash on the first real env
+    # step when it reshapes an ``(N, 3)`` tensor to ``(N,)``.
+    info_schema: Optional[dict[str, tuple[int, ...]]] = None
+    # Optional resolved WorldSpec channel contract. It is represented as
+    # JSON-compatible data here to avoid coupling adapter contributors to a
+    # particular compiler class. Authored runners verify its content hash.
+    channel_catalog: Optional[dict[str, Any]] = None
 
 
 class SculptorAdapter(ABC):
@@ -195,6 +207,21 @@ class SculptorAdapter(ABC):
         (ok, components, total, error).
         """
         ...
+
+    def build_reward_replay(
+        self, rollout_dir: Path,
+    ) -> "tuple[Any, Any, Any, dict] | None":
+        """§RL_SCULPTOR_AUDIT §4.4 (edit quality): reconstruct a
+        `(state, action, next_state, info)` batch from an archived
+        rollout so edit.py can REPLAY a candidate reward on the actual
+        behavior it must not destroy (the anti-collapse screen).
+
+        Returns one batched tuple (leading dim = sampled frames, CPU
+        tensors/arrays in the same dtypes `compute_reward_batched`
+        receives) or None when the adapter can't reconstruct reward
+        inputs from its rollout artifacts. Default: None (screen is
+        skipped — behavior identical to pre-screen versions)."""
+        return None
 
     def reward_batched(
         self,
@@ -336,6 +363,64 @@ def load_adapter(config_path: Path) -> SculptorAdapter:
             params = {}
         if "remote" in params:
             init_kwargs = {**init_kwargs, "remote": dict(remote_table)}
+
+    # §RL_SCULPTOR_AUDIT (env generalization): a project env spec at
+    # `env/current.json` (written by the goal-conditioned generator and
+    # iterated by the sculpt loop) activates by convention — injected
+    # into adapters that accept `env_spec_path`, unless the config set
+    # one explicitly. Signature-introspected like `remote` above so
+    # spec-unaware adapters (gym_sb3) are untouched.
+    if "env_spec_path" not in init_kwargs:
+        spec_file = config_path.parent / "env" / "current.json"
+        if spec_file.is_file():
+            import inspect
+
+            try:
+                params = inspect.signature(cls).parameters
+            except (TypeError, ValueError):
+                params = {}
+            if "env_spec_path" in params:
+                init_kwargs = {
+                    **init_kwargs, "env_spec_path": str(spec_file.resolve())}
+
+    # Prompt-authored worlds use one hash-verified atomic selection pointer.
+    # This is deliberately separate from legacy env/current.json: WorldSpec
+    # controls geometry/task semantics, while EnvSpec remains the diagnoser's
+    # reset/randomization/optimizer surface.
+    if "world_selection_path" not in init_kwargs:
+        selection_file = config_path.parent / "env" / "selection_current.json"
+        if selection_file.is_file():
+            import inspect
+
+            try:
+                params = inspect.signature(cls).parameters
+            except (TypeError, ValueError):
+                params = {}
+            if "world_selection_path" in params:
+                init_kwargs = {
+                    **init_kwargs,
+                    "world_selection_path": str(selection_file.resolve()),
+                }
+
+    # §D17: a stage-FIXED eval-rollout reset override at
+    # `env/eval_reset.json` (written once at stage-scaffold time by
+    # `sculpt.py`'s §JUMP_SCAFFOLD block via
+    # `sculptor.reference.derive_eval_reset`) activates by the SAME
+    # convention as env_spec_path above — injected into adapters that
+    # accept `eval_reset_path`, unless the config set one explicitly.
+    if "eval_reset_path" not in init_kwargs:
+        reset_file = config_path.parent / "env" / "eval_reset.json"
+        if reset_file.is_file():
+            import inspect
+
+            try:
+                params = inspect.signature(cls).parameters
+            except (TypeError, ValueError):
+                params = {}
+            if "eval_reset_path" in params:
+                init_kwargs = {
+                    **init_kwargs,
+                    "eval_reset_path": str(reset_file.resolve())}
 
     instance = cls(**init_kwargs)
     if not isinstance(instance, SculptorAdapter):

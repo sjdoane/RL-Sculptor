@@ -14,22 +14,26 @@ timeout is 5 s, after which `BusyError` is raised.
 
 from __future__ import annotations
 
-import errno
 import json
-import os
 import re
-import shutil
-import stat
-import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Optional
 
 from filelock import FileLock, Timeout
 
-from backend.models.project import ProjectDetail, ProjectStatus, ProjectSummary
+from backend.models.project import (
+    SLUG_PATTERN,
+    ProjectDetail,
+    ProjectStatus,
+    ProjectSummary,
+)
 from backend.services import sculptor_bridge
 
+
+# Same shape the API layer enforces via SlugStr; checked here too so
+# store methods are safe against raw path-shaped input.
+_SLUG_RE = re.compile(SLUG_PATTERN)
 
 METADATA_FILE = "metadata.json"
 LOCK_FILE = ".sculptor-ui.lock"
@@ -178,6 +182,13 @@ class ProjectStore:
 
     # ── read ─────────────────────────────────────────────────────────────
     def get(self, slug: str) -> Optional[ProjectDetail]:
+        # Reject before touching the filesystem: a non-conforming slug
+        # ("..", "a/b") can never name a project, and building paths from
+        # it may land outside root — e.g. slug ".." hitting a parseable
+        # metadata.json at the parent used to raise a pydantic
+        # ValidationError (HTTP 500) instead of 404.
+        if not _SLUG_RE.fullmatch(slug):
+            return None
         metadata = self._read_metadata(slug)
         if metadata is None:
             return None
@@ -451,11 +462,11 @@ class ProjectStore:
 
     # ── delete ───────────────────────────────────────────────────────────
     def delete(self, slug: str) -> bool:
-        """Delete a project directory. Acquires the per-project lock
-        briefly to block concurrent writes, then releases BEFORE rmtree
-        (Windows can't remove files with open handles). Uses a Windows-
-        aware onexc handler because git writes read-only pack objects
-        under .git/objects/."""
+        """Move a project directory into the trash (chunk A1 — no
+        longer a hard delete; see `backend.services.trash`). Acquires
+        the per-project lock briefly to block concurrent writes, then
+        releases BEFORE the move (Windows can't relocate a directory
+        with open file handles)."""
         project_dir = self._project_dir(slug)
         if not project_dir.is_dir():
             return False
@@ -465,7 +476,11 @@ class ProjectStore:
             pass
         finally:
             lock.release()
-        _rmtree_forced(project_dir)
+        from backend.services import trash
+
+        trash.move_to_trash(
+            project_dir, kind="project", slug=slug, origin=project_dir,
+        )
         return True
 
 
@@ -530,7 +545,17 @@ def _compute_status(project_dir: Path, metadata: dict, n_iters: int) -> ProjectS
         txt = config_path.read_text(encoding="utf-8", errors="replace")
         if "CHANGE_ME" in txt:
             return "draft"
-    kg_db = project_dir / "kg" / "graph.db"
+    # The KG moved to one user-wide shared store (M7 Phase 1); the legacy
+    # per-project kg/graph.db is never created anymore, which pinned every
+    # project at "configured" forever. Resolve through the same helper the
+    # KG routes use (it always returns the shared path) and fall back to
+    # the legacy file only if resolution itself fails.
+    try:
+        from backend.services.kg_store import project_kg_db_path
+
+        kg_db = project_kg_db_path(project_dir)
+    except Exception:  # noqa: BLE001 — status must never raise
+        kg_db = project_dir / "kg" / "graph.db"
     if not kg_db.is_file():
         return "configured"
     if n_iters == 0:
@@ -538,37 +563,6 @@ def _compute_status(project_dir: Path, metadata: dict, n_iters: int) -> ProjectS
     if metadata.get("last_run_status") == "errored":
         return "errored"
     return "completed"
-
-
-def _rmtree_forced(path: Path) -> None:
-    """Cross-platform rmtree that clears Windows read-only bits on
-    failure and retries. git marks `.git/objects/*` pack files
-    read-only, which shutil.rmtree can't remove on Windows without
-    this dance."""
-
-    def _onexc(func: Any, p: str, exc: BaseException) -> None:
-        if isinstance(exc, FileNotFoundError):
-            return
-        if isinstance(exc, PermissionError) or (
-            isinstance(exc, OSError) and getattr(exc, "errno", None) == errno.EACCES
-        ):
-            try:
-                os.chmod(p, stat.S_IWRITE | stat.S_IREAD)
-            except OSError:
-                pass
-            try:
-                func(p)
-                return
-            except Exception:
-                pass
-        raise exc
-
-    if sys.version_info >= (3, 12):
-        shutil.rmtree(path, onexc=_onexc)
-    else:  # pragma: no cover
-        def _legacy(func, p, exc_info):
-            _onexc(func, p, exc_info[1])
-        shutil.rmtree(path, onerror=_legacy)
 
 
 def _parse_iso(s: Optional[str]) -> datetime:

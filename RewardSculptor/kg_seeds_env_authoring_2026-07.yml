@@ -1,0 +1,558 @@
+# §Env-authoring research sweep 2026-07-18 — KG expansion seeds.
+#
+# Corpus behind the prompt-driven environment-authoring architecture
+# (docs/internal/ENV_AUTHORING_ARCHITECTURE.md): six survey domains —
+# (A) LLM env/task generation, (B) procedural terrain + curricula,
+# (C) parkour/obstacle courses, (D) robot-object interaction and
+# goal-conditioned tasks, (E) UED/open-endedness/auto-curricula,
+# (F) simulation scene-building frameworks. 130 surveyed entries were
+# deduped to 102 unique papers and curated to the 89 below; every
+# arxiv id was verified against its abstract page at survey time.
+# Rationales state the SPECIFIC design decision each paper grounds,
+# per kg_seeds_campaign.yml convention.
+#
+# Ingest:  SCULPTOR_KG_PATH=<shared> ingest_from_seeds(this file)
+# Extract: sculpt kg extract --seeds kg_seeds_env_authoring_2026-07.yml --tier S
+#          performs the selected hybrid pass; A/B extraction remains deliberate.
+
+papers:
+
+  # ── S-tier (extraction targets) ───────────────────────────────
+  - arxiv_id: "2411.01775"
+    title: "Eurekaverse: Environment Curriculum Generation via Large Language Models"
+    year: 2024
+    tier: "S"
+    tags: ["llm-env-gen", "terrain", "parkour", "ued-curricula"]
+    rationale: "[llm-env-gen+terrain+parkour+ued-curricula] Directly grounds terrain-as-code for legged locomotion: represent terrain as a parametric generator function the LLM writes/edits, and drive curriculum promotion by feeding per-terrain success statistics back into the next generation round. Also grounds keeping a *set* of environments per stage (diversity guard against overfitting) rather than a single evolving one. The single most direct precedent for RewardSculptor's milestone — it is Eureka-for-terrain. Grounds the core architecture: LLM emits terrain code/parameters against a fixed generator API, an evaluation loop feeds back per-terrain traversal stats, and the LLM iterates (generate -> train -> score -> regenerate). Strongly suggests keeping the generator API small and heightfield-based so LLM-written terrain code is hard to break. Direct precedent for RewardSculptor's environment-authoring milestone: represent courses as generated code against a fixed terrain API, and close the loop by feeding policy success statistics back into the LLM to iterate course difficulty. Grounds the decision that the LLM should emit course-generator programs, not static geometry. The closest published system to RewardSculptor's next milestone — it validates envs-as-code + LLM mutation + performance-based selection for legged robots specifically. Its concrete decisions to borrow: population-based env code sampling per generation (not a single edit), passing per-terrain success statistics back into the authoring prompt, and using success-rate bands to decide which generated terrains are promoted into the next generation's prompt context."
+  - arxiv_id: "2405.15568"
+    title: "OMNI-EPIC: Open-endedness via Models of human Notions of Interestingness with Environments Programmed in Code"
+    year: 2024
+    tier: "S"
+    tags: ["llm-env-gen", "ued-curricula"]
+    rationale: "[llm-env-gen+ued-curricula] The clearest precedent for env+reward co-generation as separate but jointly-authored code artifacts — exactly RewardSculptor's structure once env authoring is added. Grounds the task archive (library of past env specs with train outcomes, reused as few-shot context) and an explicit learnability/interestingness gate before a task enters training. The general blueprint RewardSculptor's milestone instantiates: env-as-code generation + archive-conditioned prompting + a two-gate filter (learnable? interesting/novel?) before a task is admitted. Its specific transferable decisions: store natural-language task descriptions alongside code in the archive for similarity-based novelty checks, and route failed-to-learn tasks back to the author as simplification requests — exactly the diagnose→edit loop extended from reward to env."
+  - arxiv_id: "2407.16186"
+    title: "Automatic Environment Shaping is the Next Frontier in RL"
+    year: 2024
+    tier: "S"
+    tags: ["llm-env-gen", "objects"]
+    rationale: "[llm-env-gen+objects] The thesis statement for RewardSculptor's whole roadmap; cite as the framing that reward shaping (done) and environment authoring (next milestone) are two halves of one environment-shaping problem. Its taxonomy of shapeable components (obs/action/reward/dynamics/terrain/curriculum) is a checklist for what the env schema should eventually expose. The thesis statement for RewardSculptor's next milestone: a prompt must compile to the WHOLE env tuple (object specs, init-state distributions, observation exposure of object state, terminations, success gates), not just a reward function. Grounds widening the generated artifact from reward code to a full environment schema."
+  - arxiv_id: "2406.01967"
+    title: "DrEureka: Language Model Guided Sim-To-Real Transfer"
+    year: 2024
+    tier: "S"
+    tags: ["llm-env-gen", "ued-curricula"]
+    rationale: "[llm-env-gen+ued-curricula] The direct precedent for LLM-authored environment *parameters* (physics/dynamics ranges) as opposed to geometry: grounds a pipeline stage where proposed env parameter ranges are empirically feasibility-probed with a base policy before the LLM commits distributions — a validation gate RewardSculptor should apply to any authored terrain/dynamics randomization. The direct precedent for LLM-authored env/DR surfaces in legged robotics, and its key trick transfers verbatim: before letting the LLM set DR ranges, run cheap perturbation probes to find the policy's break points and feed those measurements into the authoring prompt. Grounds RewardSculptor's split between validated env-spec surface (probed bounds) and LLM-proposed distributions within them."
+  - arxiv_id: "2310.01361"
+    title: "GenSim: Generating Robotic Simulation Tasks via Large Language Models"
+    year: 2023
+    tier: "S"
+    tags: ["llm-env-gen"]
+    rationale: "[llm-env-gen] Grounds code-as-task with hard validation gates: an authored env/task must compile, load in the simulator, and be demonstrably solvable before it's admitted to training. Also grounds the growing few-shot task library — retrieved past specs seed new generations — and the goal-directed vs exploratory generation split (user-prompted vs system-proposed environments)."
+  - arxiv_id: "2311.01455"
+    title: "RoboGen: Towards Unleashing Infinite Data for Automated Robot Learning via Generative Simulation"
+    year: 2023
+    tier: "S"
+    tags: ["llm-env-gen", "objects"]
+    rationale: "[llm-env-gen+objects] The canonical end-to-end blueprint for prompt -> task -> scene spec -> supervision -> training that RewardSculptor's pipeline instantiates for MuJoCo legged robots. Grounds the decomposition where scene generation and reward generation are distinct pipeline stages sharing one task description, and per-subtask choice of training method. The direct end-to-end blueprint for RewardSculptor's milestone: it validates the pipeline shape prompt -> (object/scene spec) -> (task decomposition) -> (per-subtask reward + learning-method choice). Its key transferable decision: keep asset placement generation and reward generation as separately verifiable artifacts."
+  - arxiv_id: "2312.09067"
+    title: "Holodeck: Language Guided Generation of 3D Embodied AI Environments"
+    year: 2023
+    tier: "S"
+    tags: ["llm-env-gen"]
+    rationale: "[llm-env-gen] The key architectural precedent for LLM-emits-constraints, solver-emits-coordinates: in a prompt->env-spec->MuJoCo pipeline, the LLM should author a declarative spec (relations, ranges, counts) and deterministic placement/solver code should ground it — keeping specs editable, re-solvable, and CAD-like rather than baked coordinates."
+  - arxiv_id: "2502.08844"
+    title: "MuJoCo Playground"
+    year: 2025
+    tier: "S"
+    tags: ["terrain", "sim-frameworks"]
+    rationale: "[terrain+sim-frameworks] The direct engineering reference for RewardSculptor's stack (MuJoCo/mjlab + PPO): how to do terrain in MJX where model shapes are compiled — hfield data can be written per-environment but hfield dimensions/topology cannot vary per rollout, pushing the schema toward fixed-resolution heightfield tiles whose DATA is the parametric payload, plus a fixed roster of obstacle geoms resized/repositioned within compiled limits. Note MuJoCo hfield semantics (engine docs, no standalone paper): hfields are rectangular grids with prism-based collision; tall thin steps and razor edges are better represented as box geoms, which is why legged_gym/Isaac Lab convert stair-like heightfields to trimesh — in MuJoCo the analogous choice is hfield for rough/slopes and boxes for stairs/platforms/gaps. Confirms across both GPU backends (MJX and Warp) that per-env variation is numeric-model-field expansion, never structural; useful secondary reference for DR-field design."
+  - arxiv_id: "2406.10759"
+    title: "Humanoid Parkour Learning"
+    year: 2024
+    tier: "S"
+    tags: ["terrain", "parkour"]
+    rationale: "[terrain+parkour] Anchor for the humanoid branch: its terrain suite (fractal rough base + platforms/hurdles/gaps/stairs) is a proven G1-relevant terrain type inventory, and its obstacle dimensions give concrete parameter-range endpoints for a humanoid difficulty schedule. Proves the quadruped course grammar (strips + difficulty rows + fractal noise) transfers to humanoids nearly unchanged — the schema does not need a separate humanoid course representation, only different parameter bounds and a global surface-noise field parameter."
+  - arxiv_id: "2301.04195"
+    title: "Orbit: A Unified Simulation Framework for Interactive Robot Learning Environments"
+    year: 2023
+    tier: "S"
+    tags: ["terrain", "sim-frameworks"]
+    rationale: "[terrain+sim-frameworks] The closest existing artifact to 'CAD-like parametric environment authoring': every terrain is a dataclass config (type name + parameter ranges + proportion weight) compiled into a tiled mesh. RewardSculptor's LLM-emitted terrain schema should mirror this config-as-code pattern (typed sub-terrain entries, proportions, difficulty ranges), which also makes diffs/edits natural. mjlab is an explicit port of this API onto MuJoCo-Warp; its terrain grid (rows=difficulty, cols=type, flat_patch_sampling, env-origin curriculum) is the pattern RewardSculptor's terrain schema should compile into."
+  - arxiv_id: "2306.14874"
+    title: "ANYmal Parkour: Learning Agile Navigation for Quadrupedal Robots"
+    year: 2023
+    tier: "S"
+    tags: ["terrain", "parkour"]
+    rationale: "[terrain+parkour] Grounds a skill-major decomposition of the environment schema: obstacle modules (gap, box, ramp, crawl-bar) as composable scene objects with per-module parameter ranges and per-module curricula, then courses assembled by sequencing modules. This is the 'objects and obstacles' half of prompt-driven authoring, complementary to tiled heightfield terrain. The canonical skill-decomposition alternative to end-to-end: grounds a schema where each course segment is tagged with an obstacle type that maps to a skill, and where per-skill feasibility envelopes (max box height, max gap) validate whether a prompted course is traversable at all."
+  - arxiv_id: "2309.14341"
+    title: "Extreme Parkour with Legged Robots"
+    year: 2023
+    tier: "S"
+    tags: ["terrain", "parkour"]
+    rationale: "[terrain+parkour] Evidence that one policy + one simple reward can cover an extreme terrain family if the terrain curriculum carries the difficulty — reinforcing terrain authoring as the lever RewardSculptor should pull instead of multiplying reward terms. Obstacle parameter ranges (heights/gaps relative to body dimensions) grounds expressing schema ranges in body-normalized units. Grounds three schema decisions: (1) each obstacle primitive carries a scalar difficulty knob mapped to physical dimensions, (2) waypoints along the course are the goal-specification mechanism, and (3) one continuous course strip per terrain cell rather than isolated obstacles."
+  - arxiv_id: "2309.05665"
+    title: "Robot Parkour Learning"
+    year: 2023
+    tier: "S"
+    tags: ["terrain", "parkour"]
+    rationale: "[terrain+parkour] Adds a non-geometric curriculum axis to the schema: obstacle 'softness'/penetration allowance as a curriculum parameter, letting early training pass through geometry that later becomes rigid. A parametric environment layer should support per-object collision softness scheduling, not just size/spacing ramps. Grounds the schema's per-obstacle-type parameter dictionaries (one canonical scalar per skill: height/gap/clearance/width) and a soft-to-hard contact curriculum flag on obstacles — penetrable-then-solid geometry is a concrete, implementable curriculum axis in MuJoCo."
+  - arxiv_id: "2305.14654"
+    title: "Barkour: Benchmarking Animal-level Agility with Quadruped Robots"
+    year: 2023
+    tier: "S"
+    tags: ["terrain", "parkour"]
+    rationale: "[terrain+parkour] Grounds the evaluation half of environment authoring: a fixed, parametrically defined benchmark course with a scalar score lets successive reward/terrain iterations be compared. RewardSculptor should emit not just training terrain but a frozen eval course + metric per mission. Grounds course-level evaluation in the schema: a course is not just geometry but (obstacle sequence, timing-based score, per-obstacle success/penalty rules) — i.e., the prompt should compile to a scoring function alongside the layout, enabling apples-to-apples comparison across generated courses."
+  - arxiv_id: "2201.08117"
+    title: "Learning robust perceptive locomotion for quadrupedal robots in the wild"
+    year: 2022
+    tier: "S"
+    tags: ["terrain"]
+    rationale: "[terrain] Defines the observation contract terrain imposes: a height-scanner grid (ring/grid of query points around base/feet) sampled from the terrain heightfield is the standard perceptive observation, and the terrain schema must support efficient height queries at arbitrary (x,y) to serve it. Also grounds injecting parametric elevation-map noise (offsets, outliers, missing data) as part of the environment spec."
+  - arxiv_id: "2203.01302"
+    title: "Evolving Curricula with Regret-Based Environment Design"
+    year: 2022
+    tier: "S"
+    tags: ["terrain", "ued-curricula"]
+    rationale: "[terrain+ued-curricula] Directly grounds the 'editable like CAD' requirement: if terrains are parameter vectors, curriculum can operate by small edits to existing high-learning-value terrains (bump one stair height, widen one gap) rather than fresh sampling — a natural fit for an LLM/heuristic editor over a parametric schema, with regret/value-loss as the selection signal. The closest algorithmic template for the milestone: the LLM's role maps to ACCEL's edit operator — mutate the current highest-regret env config (raise a step, add a gap, widen a friction range) rather than authoring de novo each iteration. Grounds the design decision that env-parameter mutation should be small, local, and applied to buffer-resident high-regret parents."
+  - arxiv_id: "2109.11978"
+    title: "Learning to Walk in Minutes Using Massively Parallel Deep Reinforcement Learning"
+    year: 2021
+    tier: "S"
+    tags: ["terrain", "parkour", "ued-curricula"]
+    rationale: "[terrain+parkour+ued-curricula] This IS the reference schema for the parametric terrain layer: a small set of typed terrain generators, each exposing 1-3 scalar difficulty knobs, laid out on a tile grid. Grounds the promotion/demotion rule (distance-traversed threshold per episode, per-robot level assignment) and the choice to make 'difficulty' a single normalized scalar that maps to per-type parameter ranges — exactly the structure an LLM should emit. This is the substrate a prompt-to-course system should emit into: grounds the decision to compile a prompt into (terrain-type column, difficulty-parameterization function, row count) triples rather than one fixed course, getting per-robot auto-curriculum for free in mjx/mjlab parallel training. Grounds the population-level implementation of adaptive difficulty in RewardSculptor's actual training stack (MJX PPO with thousands of parallel envs): difficulty is a per-env-instance integer level with promote/demote rules evaluated at episode termination, and the resulting occupancy histogram over levels is itself a free diagnostic signal the diagnoser can read to see where the policy's frontier sits."
+  - arxiv_id: "2010.11251"
+    title: "Learning Quadrupedal Locomotion over Challenging Terrain"
+    year: 2020
+    tier: "S"
+    tags: ["terrain"]
+    rationale: "[terrain] Grounds two decisions: (1) terrain parameter vectors (e.g. step height, roughness amplitude, slope) can be sampled adaptively by measuring per-parameter-cell success and concentrating samples where success is intermediate (~50%), an alternative to Rudin's grid promotion; (2) a small parametric terrain family generalizes far beyond its literal geometry, so the schema does not need to enumerate every real-world terrain."
+  - arxiv_id: "2005.04323"
+    title: "ALLSTEPS: Curriculum-driven Learning of Stepping Stone Skills"
+    year: 2020
+    tier: "S"
+    tags: ["terrain", "parkour"]
+    rationale: "[terrain+parkour] The template for foothold-constrained terrain objects in the schema: stepping stones as a sequence generator with (spacing, height delta, yaw) ranges. Grounds an ablation-backed promotion rule: adapt each parameter range independently based on recent success rate, rather than one global difficulty scalar, for terrain types with multi-dimensional difficulty. Grounds relative parameterization for sparse-foothold course elements: author stepping-stone segments as sequences of relative (distance, height, yaw) offsets with difficulty = sampled range width, and always attach an adaptive range-expansion curriculum — fixed ranges demonstrably fail."
+  - arxiv_id: "2403.10506"
+    title: "HumanoidBench: Simulated Humanoid Benchmark for Whole-Body Locomotion and Manipulation"
+    year: 2024
+    tier: "S"
+    tags: ["objects"]
+    rationale: "[objects] The closest existing artifact to RewardSculptor's target output: humanoid + hands + object + goal + reward + success-gate per task, in MuJoCo. Grounds (a) how hands/grippers are attached as swappable end-effector subtrees in the robot spec, and (b) per-task success thresholds decoupled from reward — plus evidence that generated tasks should ship with low-level skill scaffolding or they will be untrainable."
+  - arxiv_id: "2406.02523"
+    title: "RoboCasa: Large-Scale Simulation of Everyday Tasks for Generalist Robots"
+    year: 2024
+    tier: "S"
+    tags: ["objects"]
+    rationale: "[objects] The strongest precedent for prompt-driven scene+object authoring at scale: an asset registry with category-level object sampling, LLM-composed tasks over a fixed predicate vocabulary, and placement randomization as data amplifier. Grounds schema fields: object category -> asset sampler, per-task scene predicates, and placement distributions."
+  - arxiv_id: "2407.00187"
+    title: "SMPLOlympics: Sports Environments for Physically Simulated Humanoids"
+    year: 2024
+    tier: "S"
+    tags: ["objects"]
+    rationale: "[objects] Grounds a reusable library of sports-goal predicates (ball-into-goal, ball-over-net, ball-through-hoop, object-past-line) that a prompt compiler can instantiate, and the design rule that with a motion prior in place the generated task reward can stay near-sparse — shifting LLM effort from dense shaping to correct goal predicates."
+  - arxiv_id: "2304.01159"
+    title: "DribbleBot: Dynamic Legged Manipulation in the Wild"
+    year: 2023
+    tier: "S"
+    tags: ["objects"]
+    rationale: "[objects] Grounds a 'goal = commanded object velocity' goal type in the schema, distinct from positional goals. Also grounds object-spec fields for rolling dynamics (friction, rolling resistance, drag) and an object-observation-noise randomization block as first-class parts of a generated ball task."
+  - arxiv_id: "2304.13653"
+    title: "Learning Agile Soccer Skills for a Bipedal Robot with Deep Reinforcement Learning"
+    year: 2023
+    tier: "S"
+    tags: ["objects"]
+    rationale: "[objects] The canonical reward-vs-metric separation for a scored object task: success gate = geometric predicate 'ball inside goal region,' shaped reward = ball-velocity-toward-goal-region — a prompt->schema compiler can emit both mechanically from one goal-region spec. Also grounds skill-distillation staging when a single prompt implies multiple skills (walk, kick, recover)."
+  - arxiv_id: "2312.04393"
+    title: "PhysHOI: Physics-Based Imitation of Dynamic Human-Object Interaction"
+    year: 2023
+    tier: "S"
+    tags: ["objects"]
+    rationale: "[objects] The contact graph is the missing formal object in most reward-generation schemas: a prompt like 'kick the ball' compiles to desired contact pairs (foot-ball: yes, hands-ball: no) from which contact sensors, contact rewards, and illegal-contact penalties are derived mechanically. Directly grounds a contact_spec field with per-pair desired/forbidden flags."
+  - arxiv_id: "1802.09464"
+    title: "Multi-Goal Reinforcement Learning: Challenging Robotics Environments and Request for Research"
+    year: 2018
+    tier: "S"
+    tags: ["objects"]
+    rationale: "[objects] The single most direct precedent for the schema's success-gate design: goal = target object pose, success = dist(achieved, desired) < threshold, with the threshold an explicit, prompt-settable field. RewardSculptor's generated envs should expose achieved_goal/desired_goal explicitly to keep relabeling and metric computation mechanical."
+  - arxiv_id: "1707.01495"
+    title: "Hindsight Experience Replay"
+    year: 2017
+    tier: "S"
+    tags: ["objects"]
+    rationale: "[objects] Constrains the schema: success predicates should be defined on a relabelable object-state subspace (distance-to-goal thresholds on object pose), so HER-style relabeling is available for free when LLM-authored dense rewards fail. Argues the compiler should always emit the sparse predicate even when it also emits shaping."
+  - arxiv_id: "2408.15099"
+    title: "No Regrets: Investigating and Improving Regret Approximations for Curriculum Discovery"
+    year: 2024
+    tier: "S"
+    tags: ["ued-curricula"]
+    rationale: "[ued-curricula] This is the single most defensible difficulty metric for the diagnoser: score each authored env config by p(1-p) from a handful of eval rollouts, and prioritize configs near 50% success. It also justifies the success-rate-banded promotion already used in parkour work, and its CVaR-over-worst-levels evaluation is the right robustness report for each RewardSculptor iteration."
+  - arxiv_id: "2110.02439"
+    title: "Replay-Guided Adversarial Environment Design"
+    year: 2021
+    tier: "S"
+    tags: ["ued-curricula"]
+    rationale: "[ued-curricula] Directly grounds a two-stage loop for RewardSculptor: LLM authors candidate env configs (generator), cheap evaluation rollouts score them, but PPO gradient updates happen only on configs that pass the curator's regret/learnability bar. The counterintuitive 'evaluate on it, don't train on it' split is the specific rule worth copying."
+  - arxiv_id: "2012.02096"
+    title: "Emergent Complexity and Zero-shot Transfer via Unsupervised Environment Design"
+    year: 2020
+    tier: "S"
+    tags: ["ued-curricula"]
+    rationale: "[ued-curricula] This is the theoretical spine for any diagnoser that scores authored envs: regret, not raw failure, is the correct selection signal, because it automatically excludes unsolvable levels. RewardSculptor's diagnoser can approximate regret without a second agent via best-observed-return minus current-mean-return per env config — a documented proxy from this line."
+  - arxiv_id: "1910.07113"
+    title: "Solving Rubik's Cube with a Robot Hand"
+    year: 2019
+    tier: "S"
+    tags: ["ued-curricula"]
+    rationale: "[ued-curricula] The canonical per-parameter promotion rule for an LLM-authored env space: represent each authored env dimension as [lo, hi] with performance-thresholded boundary sampling, and let the diagnoser widen/narrow each dimension independently. Also grounds the claim that recurrent policies (already standard in legged RL) are what convert a wide ADR distribution into online system identification."
+  - arxiv_id: "2601.22074"
+    title: "mjlab: A Lightweight Framework for GPU-Accelerated Robot Learning"
+    year: 2026
+    tier: "S"
+    tags: ["sim-frameworks"]
+    rationale: "[sim-frameworks] The actual compile target — the schema must emit exactly what SceneCfg consumes (TerrainEntityCfg/TerrainGeneratorCfg/SubTerrainCfg, EntityCfg.spec_fn, SensorCfg tuple), and its terrain/DR split defines what may vary per env."
+  - arxiv_id: "2006.12983"
+    title: "dm_control: Software and Tasks for Continuous Control"
+    year: 2020
+    tier: "S"
+    tags: ["sim-frameworks"]
+    rationale: "[sim-frameworks] The Entity abstraction (self-contained MJCF-producing unit with attach/detach namespacing and lifecycle hooks) is the direct ancestor of MjSpec attach and mjlab EntityCfg; the cleanest model for what a compiled schema 'object' should be."
+
+  # ── A-tier (strong prior art) ─────────────────────────────────
+  - arxiv_id: "2602.06366"
+    title: "Towards Adaptive Environment Generation for Training Embodied Agents"
+    year: 2026
+    tier: "A"
+    tags: ["llm-env-gen"]
+    rationale: "[llm-env-gen] A 2026 distillation of the design RewardSculptor needs: controllable/parametric env representation + rich diagnostics -> targeted edits. Grounds instrumenting the env spec so every parameter is an adaptation knob, and logging failure modes (where/why the robot fails) rather than scalar returns as the feedback interface."
+  - arxiv_id: "2602.09153"
+    title: "SceneSmith: Agentic Generation of Simulation-Ready Indoor Scenes"
+    year: 2026
+    tier: "A"
+    tags: ["llm-env-gen"]
+    rationale: "[llm-env-gen] Grounds staged generation with per-stage validation (structure -> large elements -> details), and quantitative physics gates (collision rate, stability under simulation) as the acceptance criteria for a compiled scene — directly portable to a MuJoCo settle-test: load, step physics, verify nothing moves/penetrates before training starts."
+  - arxiv_id: "2602.10116"
+    title: "SAGE: Scalable Agentic 3D Scene Generation for Embodied AI"
+    year: 2026
+    tier: "A"
+    tags: ["llm-env-gen"]
+    rationale: "[llm-env-gen] Grounds the generator/critic separation for env authoring: independent validator agents (semantic: does the scene match the prompt; physical: is it stable/solvable) gate refinement iterations, rather than trusting one generation pass — a concrete pattern for RewardSculptor's spec-review stage before compilation to MJCF."
+  - arxiv_id: "2502.13092"
+    title: "Text2World: Benchmarking Large Language Models for Symbolic World Model Generation"
+    year: 2025
+    tier: "A"
+    tags: ["llm-env-gen"]
+    rationale: "[llm-env-gen] Grounds the validation-gate design for structured env specs: correctness of an LLM-emitted spec must be judged by executing it (parse -> ground -> simulate) against multiple criteria, and error-message-driven repair loops measurably help — i.e., budget for a compile-diagnose-repair cycle in the env authoring loop, not one-shot generation."
+  - arxiv_id: "2403.12014"
+    title: "EnvGen: Generating and Adapting Environments via LLMs for Training Embodied Agents"
+    year: 2024
+    tier: "A"
+    tags: ["llm-env-gen"]
+    rationale: "[llm-env-gen] Grounds the cheap outer loop: environment adaptation should consume aggregated training metrics (per-skill/per-terrain success rates), not per-step LLM calls, and should emit edits to a structured env config rather than regenerate from scratch. Also grounds mixing generated environments with the base (flat-ground) environment to avoid catastrophic forgetting of core skills."
+  - arxiv_id: "2409.18382"
+    title: "CurricuLLM: Automatic Task Curricula Design for Learning Complex Robot Skills using Large Language Models"
+    year: 2024
+    tier: "A"
+    tags: ["llm-env-gen", "parkour"]
+    rationale: "[llm-env-gen+parkour] Grounds curriculum promotion rules for a legged-robot pipeline: promotion decisions made by an LLM reading summarized trajectory statistics, and goal distributions authored as code alongside rewards — directly applicable to goal-conditioned task specs (target boxes, waypoints) in the env schema. Grounds treating goal distribution as first-class generated code alongside reward and geometry: a prompted course should compile to (layout, reward, goal/waypoint sampling distribution) triples, and subtask sequencing gives a template for staging 'walk, then hurdle, then full course' curricula from one prompt."
+  - arxiv_id: "2410.03645"
+    title: "GenSim2: Scaling Robot Data Generation with Multi-modal and Reasoning LLMs"
+    year: 2024
+    tier: "A"
+    tags: ["llm-env-gen"]
+    rationale: "[llm-env-gen] Grounds pairing every generated task with an automated solver that must produce successful demonstrations — a stronger solvability gate than static checks — and using VLM review of rendered scenes as part of task verification. Relevant to RewardSculptor's BC warm-start: generated envs should ship with a scripted/planned demo for Demo-RSI."
+  - arxiv_id: "2405.03709"
+    title: "ScenicNL: Generating Probabilistic Scenario Programs from Natural Language"
+    year: 2024
+    tier: "A"
+    tags: ["llm-env-gen"]
+    rationale: "[llm-env-gen] The strongest precedent for prompt -> validated program in a scenario DSL: grounds (1) representing an environment as a *distribution-valued* spec (parameters as ranges, matching CAD-like editability plus domain randomization), and (2) compiler-in-the-loop repair for a DSL the base LLM has barely seen — which will be true of any custom RewardSculptor env schema."
+  - arxiv_id: "2307.14535"
+    title: "Scaling Up and Distilling Down: Language-Guided Robot Skill Acquisition"
+    year: 2023
+    tier: "A"
+    tags: ["llm-env-gen"]
+    rationale: "[llm-env-gen] Grounds success-checker code as a first-class generated artifact, separate from the shaped reward: the env spec should carry an LLM-authored, executable success predicate used for evaluation gating and data labeling, so shaped-reward hacking can't inflate reported success."
+  - arxiv_id: "2310.12931"
+    title: "Eureka: Human-Level Reward Design via Coding Large Language Models"
+    year: 2023
+    tier: "A"
+    tags: ["llm-env-gen"]
+    rationale: "[llm-env-gen] RewardSculptor already implements this family for rewards; the architectural point for env authoring is that Eureka's feed-the-env-source-code-as-context and component-statistics-reflection loop is exactly the machinery Eurekaverse reused for environments — one shared reflect-and-regenerate engine can serve both artifact types."
+  - arxiv_id: "2309.11489"
+    title: "Text2Reward: Reward Shaping with Language Models for Reinforcement Learning"
+    year: 2023
+    tier: "A"
+    tags: ["llm-env-gen"]
+    rationale: "[llm-env-gen] Grounds exposing a typed environment API to the LLM: when RewardSculptor authors an env, it should simultaneously emit the Pythonic abstraction (named bodies, sites, sensors, distances) that downstream reward generation will code against — making the env schema the shared contract between env authoring and reward authoring."
+  - arxiv_id: "2206.06994"
+    title: "ProcTHOR: Large-Scale Embodied AI Using Procedural Generation"
+    year: 2022
+    tier: "A"
+    tags: ["llm-env-gen", "sim-frameworks"]
+    rationale: "[llm-env-gen+sim-frameworks] Grounds the value of a *parametric distribution* over environments rather than single instances: RewardSculptor's env spec should define ranges/distributions (a family of terrains) so each episode samples a variant — the pre-LLM foundation that Holodeck and Eurekaverse both build on. Best precedent for scene-as-validated-JSON-document authored independently of the engine; its staged sampling with per-stage semantic validators maps directly onto LLM-proposed specs plus programmatic validation."
+  - arxiv_id: "2601.07718"
+    title: "Hiking in the Wild: A Scalable Perceptive Parkour Framework for Humanoids"
+    year: 2026
+    tier: "A"
+    tags: ["terrain", "parkour"]
+    rationale: "[terrain+parkour] Two schema-level primitives worth copying: the terrain generator should expose (1) an edge/gradient map so foothold-safety rewards can be computed from the schema, and (2) a validity query for sampling reachable goal locations on arbitrary generated terrain — goal placement is part of the environment spec, and naive placement produces reward hacking. Grounds goal placement rules: the course authoring pipeline should sample waypoints/goals only from validated flat patches of the generated geometry (never on edges or inside obstacles), and export edge maps so foothold-safety terms can be computed against authored geometry."
+  - arxiv_id: "2502.10363"
+    title: "BeamDojo: Learning Agile Humanoid Locomotion on Sparse Footholds"
+    year: 2025
+    tier: "A"
+    tags: ["terrain", "parkour"]
+    rationale: "[terrain+parkour] Grounds a curriculum trick the schema can support cheaply: render a terrain's foothold layout as observation/reward on flat ground before instantiating its risky geometry (terrain spec reused at two physical fidelities). Also motivates a foothold-validity mask as an optional terrain-schema channel alongside heights, and polygonal-foot reward sampling for humanoid feet on MuJoCo hfields. Grounds contact/termination rules for sparse-foothold course elements: the course schema should export a valid-foothold mask per element (beams, stones) that the reward system can query, and support a train-on-proxy-terrain curriculum stage flag."
+  - arxiv_id: "2410.03654"
+    title: "Learning Humanoid Locomotion over Challenging Terrain"
+    year: 2024
+    tier: "A"
+    tags: ["terrain"]
+    rationale: "[terrain] Grounds the flat-then-rough two-phase ordering at the top of the humanoid curriculum (matches RewardSculptor's existing flat-ground BC warm-start: terrain becomes a fine-tuning phase, not a restart). Also the strongest evidence that moderate terrain (slopes/rough/deformable) is feasible blind on a humanoid, reserving perceptive observations for discrete geometry."
+  - arxiv_id: "2411.14386"
+    title: "Learning Humanoid Locomotion with Perceptive Internal Model"
+    year: 2024
+    tier: "A"
+    tags: ["terrain"]
+    rationale: "[terrain] Directly grounds the cheapest perceptive-observation path for a MuJoCo/MJX humanoid stack: sample heights from the schema's heightfield at a scan pattern (no rendering in the training loop), and treat real-robot elevation mapping as the deployment-side counterpart. This is the observation design to default to for terrain missions."
+  - arxiv_id: "2311.10484"
+    title: "Learning Agile Locomotion on Risky Terrains"
+    year: 2023
+    tier: "A"
+    tags: ["terrain"]
+    rationale: "[terrain] Grounds two schema/curriculum choices: (1) risky terrain types (gaps, beams, stones) pair better with goal-reaching task specs than velocity commands — the environment schema should carry a task-mode field; (2) generalist-then-specialist ordering: train on a disordered union of a terrain family before narrowing to an extreme instance."
+  - arxiv_id: "2211.07638"
+    title: "Legged Locomotion in Challenging Terrains using Egocentric Vision"
+    year: 2022
+    tier: "A"
+    tags: ["terrain", "parkour"]
+    rationale: "[terrain+parkour] Grounds the two-tier observation design in the terrain stack: train against cheap geometric queries into the terrain (scandots/height samples the schema must expose) and treat realistic depth rendering as a separate distillation concern. Terrain types here (stairs, curbs, stones, gaps) are a good minimal type inventory for a v1 schema. Grounds the baseline obstacle vocabulary (stairs, curbs, stepping stones, gaps) any course grammar should ship with, and confirms fractal-noise overlay as a global course parameter distinct from per-obstacle difficulty."
+  - arxiv_id: "1901.01753"
+    title: "Paired Open-Ended Trailblazer (POET): Endlessly Generating Increasingly Complex and Diverse Learning Environments and Their Solutions"
+    year: 2019
+    tier: "A"
+    tags: ["terrain", "parkour", "ued-curricula"]
+    rationale: "[terrain+parkour+ued-curricula] Grounds the 'learnability filter' for generated terrain: any auto-generated environment should be admitted to the training pool only if current policy performance falls in a band (not solved, not hopeless). Also a caution: a single linear difficulty scalar can dead-end; maintaining a diverse population of terrain variants avoids curriculum local optima. Grounds the learnability filter in course generation: generated courses should be admitted to the training set only if current policy performance falls in a target band — a minimal-criterion check the authoring pipeline can run cheaply in parallel sim before committing training compute. Grounds two mechanisms: (1) the minimal-criterion admission gate — an authored env enters the training pool only if current-policy score falls inside a band (POET used reward bounds on parent agents); (2) cross-env transfer tests — periodically evaluating the policy on all archived envs to detect which env is now the best stepping stone. Both are cheap for a diagnoser to run."
+  - arxiv_id: "1707.02286"
+    title: "Emergence of Locomotion Behaviours in Rich Environments"
+    year: 2017
+    tier: "A"
+    tags: ["terrain", "parkour"]
+    rationale: "[terrain+parkour] The founding argument that terrain authoring is a substitute for reward engineering: complex skills can come from the environment distribution rather than the reward. For RewardSculptor this justifies making the terrain schema a first-class peer of the reward sculpting loop, and grounds 'randomize parameters per episode within a band' as the baseline curriculum before anything adaptive. Grounds the minimal-reward premise of environment authoring: if the course generator supplies diverse parameterized obstacles, a simple progress-along-course reward suffices — reward complexity can be traded for course complexity, which is exactly RewardSculptor's leverage point."
+  - arxiv_id: "2602.11143"
+    title: "APEX: Learning Adaptive High-Platform Traversal for Humanoid Robots"
+    year: 2026
+    tier: "A"
+    tags: ["parkour"]
+    rationale: "[parkour] Grounds how extreme-height boxes should be treated in the schema: above a height threshold, a box is a multi-phase obstacle (mount edge, surface, dismount edge) rather than a jump, and progress-ratchet rewards along the course axis handle its non-monotone-velocity traversal."
+  - arxiv_id: "2601.07701"
+    title: "Deep Whole-body Parkour"
+    year: 2026
+    tier: "A"
+    tags: ["parkour"]
+    rationale: "[parkour] Grounds a motion-obstacle pairing field in the schema: a course element may optionally reference a motion clip/skill demonstration matched to its geometry — directly compatible with RewardSculptor's BC warm-start/Demo-RSI machinery, extending it from one demo to per-obstacle demo libraries."
+  - arxiv_id: "2505.11164"
+    title: "Parkour in the Wild: Learning a General and Extensible Agile Locomotion Policy Using Multi-expert Distillation and RL Fine-tuning"
+    year: 2025
+    tier: "A"
+    tags: ["parkour"]
+    rationale: "[parkour] Grounds extensibility in the course schema: obstacle types should be an open registry (add a generator + an expert, re-distill) rather than a closed enum, and real-scan meshes should be admissible course elements alongside parametric boxes."
+  - arxiv_id: "2401.17583"
+    title: "Agile But Safe: Learning Collision-Free High-Speed Legged Locomotion"
+    year: 2024
+    tier: "A"
+    tags: ["parkour"]
+    rationale: "[parkour] Grounds the avoid-vs-traverse distinction in a course grammar: obstacles need a semantic flag (traverse/climb vs. avoid/no-contact), and no-contact obstacles imply reach-avoid style termination and penalty rules rather than traversal rewards."
+  - arxiv_id: "2511.03996"
+    title: "Learning Vision-Driven Reactive Soccer Skills for Humanoid Robots"
+    year: 2025
+    tier: "A"
+    tags: ["objects"]
+    rationale: "[objects] State of the humanoid-soccer line through 2026: motion priors + task objective produce naturalistic ball-contact behavior without hand-scripted kick choreography. Grounds schema support for perception-noise models attached to object observations (an object's observability spec), not just its physics."
+  - arxiv_id: "2512.06571"
+    title: "Learning Agile Striker Skills for Humanoid Soccer Robots from Noisy Sensory Input"
+    year: 2025
+    tier: "A"
+    tags: ["objects"]
+    rationale: "[objects] Grounds parameterizing a scored-object task as a sampled (object pose, goal pose) configuration distribution — exactly the fields a prompt->task compiler must randomize — with the success metric aggregated per-configuration (scoring rate over the config distribution, not a single init)."
+  - arxiv_id: "2505.06776"
+    title: "FALCON: Learning Force-Adaptive Humanoid Loco-Manipulation"
+    year: 2025
+    tier: "A"
+    tags: ["objects"]
+    rationale: "[objects] Grounds an object-interaction WRENCH field in the task schema (expected force range at contact) plus a curriculum-on-force-magnitude knob — needed when a prompt implies heavy objects (pushing a box, pulling a cart) rather than a light ball."
+  - arxiv_id: "2403.16967"
+    title: "Visual Whole-Body Control for Legged Loco-Manipulation"
+    year: 2024
+    tier: "A"
+    tags: ["objects"]
+    rationale: "[objects] Grounds the two-layer goal interface for generated tasks: the environment schema defines object placement distributions (height/pose ranges as explicit fields), and task logic emits low-level goals — the prompt compiler should generate the placement distribution, not a single fixed object pose."
+  - arxiv_id: "2406.08858"
+    title: "OmniH2O: Universal and Dexterous Human-to-Humanoid Whole-Body Teleoperation and Learning"
+    year: 2024
+    tier: "A"
+    tags: ["objects"]
+    rationale: "[objects] Grounds the pattern 'one universal goal interface, many frontends': a prompt layer (LLM) writes goals into the same kinematic/goal channel a teleoperator would use. For RewardSculptor, this argues the generated task schema should target a stable goal API rather than bespoke per-task observation wiring."
+  - arxiv_id: "2410.21229"
+    title: "HOVER: Versatile Neural Whole-Body Controller for Humanoid Robots"
+    year: 2024
+    tier: "A"
+    tags: ["objects"]
+    rationale: "[objects] The command-masking idea is directly reusable as a schema mechanism: a generated task declares WHICH goal channels are active (root velocity vs EE pose vs object pose), and one controller family serves all generated tasks. Grounds a 'goal_mode mask' field in the prompt->task schema."
+  - arxiv_id: "2410.00425"
+    title: "ManiSkill3: GPU Parallelized Robotics Simulation and Rendering for Generalizable Embodied AI"
+    year: 2024
+    tier: "A"
+    tags: ["objects", "sim-frameworks"]
+    rationale: "[objects+sim-frameworks] Grounds requiring the object schema to support per-environment object heterogeneity (asset sampled per env instance, not per task) and declarative randomization ranges — critical for MJX/mjlab-style batched training where one prompt must compile to thousands of varied env instances. The only worked example of per-env structural diversity under GPU batching; the union-build + merged-view idea is the template if RewardSculptor ever needs different obstacle sets per env under MJWarp's fixed-topology constraint."
+  - arxiv_id: "2407.11385"
+    title: "Omnigrasp: Grasping Diverse Objects with Simulated Humanoids"
+    year: 2024
+    tier: "A"
+    tags: ["objects"]
+    rationale: "[objects] Grounds 'goal = object trajectory' as a schema goal type generalizing endpoint goals (carry ball to corner, then place), with success measured entirely on object state. Also evidence that a latent skill/motion prior action space is what lets simple generated rewards work on humanoid+gripper object tasks."
+  - arxiv_id: "2208.01160"
+    title: "Hierarchical Reinforcement Learning for Precise Soccer Shooting Skills using a Quadrupedal Robot"
+    year: 2022
+    tier: "A"
+    tags: ["objects"]
+    rationale: "[objects] Grounds 'goal = target landing location for the object' as a task parameter that a planner conditions on, with contact executed by a lower-level skill — a two-level structure a prompt compiler can emit when the prompt says 'score/shoot to X.' The goalkeeper variant grounds goal-region decomposition fields (sub-regions of a goal as discrete goal set)."
+  - arxiv_id: "2210.10044"
+    title: "Deep Whole-Body Control: Learning a Unified Policy for Manipulation and Locomotion"
+    year: 2022
+    tier: "A"
+    tags: ["objects"]
+    rationale: "[objects] Directly grounds a reward-channel-to-actuator-group mapping field in generated reward code: each reward term declares which action subset it credits (arm vs legs). For RewardSculptor this is a concrete, citable mechanism for making LLM-generated multi-term rewards trainable on legged manipulators."
+  - arxiv_id: "1910.10897"
+    title: "Meta-World: A Benchmark and Evaluation for Multi-Task and Meta Reinforcement Learning"
+    year: 2019
+    tier: "A"
+    tags: ["objects"]
+    rationale: "[objects] Grounds factoring a generated task as (skill verb, object, goal position ranges) with reusable dense-reward templates per verb and an independent boolean success predicate — the cleanest citable precedent for reward-vs-metric separation across a large generated task family."
+  - arxiv_id: "1705.06366"
+    title: "Automatic Goal Generation for Reinforcement Learning Agents"
+    year: 2017
+    tier: "A"
+    tags: ["objects", "ued-curricula"]
+    rationale: "[objects+ued-curricula] Grounds making the goal-sampling distribution a first-class, adaptable schema field (not a hard-coded uniform range): a generated task should declare its goal space and permit difficulty-adaptive sampling over it — e.g., ball spawn distance to goal expanding with success rate. The original formalization of success-rate-banded promotion — the same rule appearing as the 50-75% band in parkour curricula. Grounds the diagnoser's promotion policy: an authored env config is 'in-curriculum' iff its measured success rate is within the band; below → simplify or hold; above → promote/mutate harder. The band bounds are the tunable, and this paper shows the mechanism is robust to their exact values."
+  - arxiv_id: "2410.23208"
+    title: "Kinetix: Investigating the Training of General Agents through Open-Ended Physics-Based Control Tasks"
+    year: 2024
+    tier: "A"
+    tags: ["ued-curricula"]
+    rationale: "[ued-curricula] Verified real (Matthews, Beukman, Lu, Foerster; ICLR 2025 oral). Grounds the payoff claim for building a parametric env space at all: broad pretraining over an authored task distribution buys zero-shot and warm-start capability that single-env training cannot, which is the argument for RewardSculptor training across the whole authored env distribution rather than sequentially mastering one env at a time. Its unified goal representation also shows how a fixed goal schema keeps an open task space learnable by one policy."
+  - arxiv_id: "2311.01885"
+    title: "Domain Randomization via Entropy Maximization"
+    year: 2023
+    tier: "A"
+    tags: ["ued-curricula"]
+    rationale: "[ued-curricula] Upgrades ADR's per-boundary heuristic into a principled objective the diagnoser can optimize: 'maximize env-distribution entropy s.t. success >= alpha' is a one-line rule an LLM diagnoser can be prompted to enforce when editing parameter ranges. The success-probability constraint (their alpha) is the same knob as the parkour success band — this paper gives it a formal justification."
+  - arxiv_id: "2107.12808"
+    title: "Open-Ended Learning Leads to Generally Capable Agents"
+    year: 2021
+    tier: "A"
+    tags: ["ued-curricula"]
+    rationale: "[ued-curricula] The reference answer to 'how do you parameterize a space of tasks rather than a single task': a compositional grammar with (a) world parameters, (b) goal predicates, and (c) normalized cross-task scoring so difficulty is comparable across authored envs. For RewardSculptor this grounds making the LLM author emit envs in a constrained schema/grammar (the validated env-spec surface) rather than free-form code, and normalizing returns per-env before any cross-env difficulty comparison."
+  - arxiv_id: "2010.03934"
+    title: "Prioritized Level Replay"
+    year: 2020
+    tier: "A"
+    tags: ["ued-curricula"]
+    rationale: "[ued-curricula] Grounds the level-replay buffer as a first-class component: RewardSculptor should keep a persistent archive of authored env configs scored by value-loss and staleness, and mix replayed configs with newly authored ones each iteration rather than training only on the newest LLM output. The staleness term matters — scores of old configs go stale as the policy improves."
+  - arxiv_id: "1910.07224"
+    title: "Teacher algorithms for curriculum learning of Deep RL in continuously parameterized environments"
+    year: 2019
+    tier: "A"
+    tags: ["ued-curricula"]
+    rationale: "[ued-curricula] The reference mechanism for difficulty metrics over a continuous authored parameter space: learning progress (change in return per env-region), not absolute performance, is the selection signal, which automatically abandons both mastered and currently-unlearnable regions. A diagnoser can implement this directly by binning env-spec parameters and tracking per-bin return deltas between iterations."
+
+  # ── B-tier (curated context) ──────────────────────────────────
+  - arxiv_id: "2411.09823"
+    title: "Architect: Generating Vivid and Interactive 3D Scenes with Hierarchical 2D Inpainting"
+    year: 2024
+    tier: "B"
+    tags: ["llm-env-gen"]
+    rationale: "[llm-env-gen] Grounds the vision-generative alternative to code/constraint-based scene authoring — higher visual richness, but placements are not parametric or editable, which is exactly the property RewardSculptor's CAD-like requirement rules out; useful as the contrast case justifying a schema-first design, and for asset-level detailing later."
+  - arxiv_id: "2404.09465"
+    title: "PhyScene: Physically Interactable 3D Scene Synthesis for Embodied AI"
+    year: 2024
+    tier: "B"
+    tags: ["llm-env-gen"]
+    rationale: "[llm-env-gen] Grounds the concrete validation metrics an env-spec compiler should check before training: no interpenetration, all objects within bounds, and goal/terrain reachability by the robot — implementable as deterministic post-solve checks on the compiled MuJoCo scene."
+  - arxiv_id: "2310.18308"
+    title: "Gen2Sim: Scaling up Robot Learning in Simulation with Generative Models"
+    year: 2023
+    tier: "B"
+    tags: ["llm-env-gen"]
+    rationale: "[llm-env-gen] Grounds asset-conditioned task proposal (ask the LLM what tasks an environment's objects afford) and LLM-assigned physics parameters for generated assets — relevant when the env schema includes free objects whose mass/friction the user prompt doesn't specify."
+  - arxiv_id: "2306.08647"
+    title: "Language to Rewards for Robotic Skill Synthesis"
+    year: 2023
+    tier: "B"
+    tags: ["llm-env-gen"]
+    rationale: "[llm-env-gen] Grounds the parametric-knobs end of the design spectrum: constraining the LLM to fill slots in a curated schema (vs writing free code) buys reliability and real-time editability — the same trade RewardSculptor faces for env specs, arguing for schema-slot authoring with code escape hatches only where needed."
+  - arxiv_id: "2306.10985"
+    title: "LARG, Language-based Automatic Reward and Goal Generation"
+    year: 2023
+    tier: "B"
+    tags: ["llm-env-gen"]
+    rationale: "[llm-env-gen] Grounds goal-conditioned task authoring: the env spec should include an executable goal *sampler* (distribution over goal states/poses) written alongside the reward, so one authored environment yields a goal-conditioned task family rather than a single fixed objective."
+  - arxiv_id: "2504.09997"
+    title: "GenTe: Generative Real-world Terrains for General Legged Robot Locomotion Control"
+    year: 2025
+    tier: "B"
+    tags: ["parkour"]
+    rationale: "[parkour] Grounds two schema decisions: expose the course API to the LLM as typed function calls over a component library (rather than free-form code), and give course elements physical-material parameters (friction, compliance) as a difficulty axis orthogonal to geometry."
+  - arxiv_id: "2502.01143"
+    title: "ASAP: Aligning Simulation and Real-World Physics for Learning Agile Humanoid Whole-Body Skills"
+    year: 2025
+    tier: "B"
+    tags: ["parkour"]
+    rationale: "[parkour] Mostly negative-space grounding: motion-space agility without geometry conditioning cannot compose into courses, arguing the schema should bind each demo/skill to obstacle geometry (as Deep Whole-body Parkour does); its delta-action idea also cautions that authored courses should randomize dynamics, not just geometry."
+  - arxiv_id: "2402.10837"
+    title: "Pedipulate: Enabling Manipulation Skills using a Quadruped Robot's Leg"
+    year: 2024
+    tier: "B"
+    tags: ["objects"]
+    rationale: "[objects] Grounds treating any body part as an end-effector: the schema's 'effector' field should reference a body/site, not assume a gripper — a prompt like 'kick/press/push with the foot' compiles to the same target-tracking primitive as a hand task."
+  - arxiv_id: "2402.12284"
+    title: "Refining Minimax Regret for Unsupervised Environment Design"
+    year: 2024
+    tier: "B"
+    tags: ["ued-curricula"]
+    rationale: "[ued-curricula] Grounds a retirement rule for the env archive: when the diagnoser detects an env config whose regret has plateaued across N iterations (irreducible — e.g., sensor-noise-dominated), it should be demoted/retired rather than allowed to dominate selection. Prevents the adaptive-difficulty loop from wedging on noise-limited configs."
+  - arxiv_id: "2207.05219"
+    title: "Grounding Aleatoric Uncertainty for Unsupervised Environment Design"
+    year: 2022
+    tier: "B"
+    tags: ["ued-curricula"]
+    rationale: "[ued-curricula] A direct sim2real warning for adaptive DR of legged robots: if the diagnoser keeps up-weighting high-friction or low-payload configs because they are learnable, the resulting policy overfits that skew. Design decision it grounds: track the authored curriculum's marginal distribution over each env parameter and either re-weight advantages or schedule a final annealing phase back to the target (deployment) distribution."
+  - arxiv_id: "2206.08896"
+    title: "Evolution through Large Models"
+    year: 2022
+    tier: "B"
+    tags: ["ued-curricula"]
+    rationale: "[ued-curricula] Grounds the mutation-operator design for env authoring: pair the LLM-edit operator with a quality-diversity archive keyed on env descriptors (terrain roughness, obstacle density, dynamics ranges) so authored envs fill a behavior-space grid instead of collapsing to one difficulty axis. MAP-Elites bins double as the diagnoser's coverage report."
+  - arxiv_id: "2110.03239"
+    title: "Understanding Domain Randomization for Sim-to-real Transfer"
+    year: 2021
+    tier: "B"
+    tags: ["ued-curricula"]
+    rationale: "[ued-curricula] Grounds two architecture-level commitments: (1) the LLM-authored env-parameter space must cover plausible real-robot parameters (coverage, not realism, is what the theory needs); (2) the policy consuming the authored distribution should be recurrent or history-conditioned, or the widened distribution wastes its transfer benefit."
+  - arxiv_id: "2003.08536"
+    title: "Enhanced POET: Open-Ended Reinforcement Learning through Unbounded Invention of Learning Challenges and their Solutions"
+    year: 2020
+    tier: "B"
+    tags: ["ued-curricula"]
+    rationale: "[ued-curricula] PATA-EC is the transferable idea: measure novelty of an authored env by the ranking it induces over archived policy checkpoints, not by parameter-space distance. This gives the diagnoser a behavior-grounded duplicate detector for LLM-authored envs that look different in code but are equivalent in difficulty."
+  - arxiv_id: "1909.12892"
+    title: "Automated curricula through setter-solver interactions"
+    year: 2019
+    tier: "B"
+    tags: ["ued-curricula"]
+    rationale: "[ued-curricula] The validity/feasibility/coverage triad is the right acceptance checklist for LLM-authored envs: every authored config should pass (1) a solvability check (scripted or reference-policy probe), (2) a difficulty check (predicted success in band), and (3) a diversity check against the archive. Grounds structuring the diagnoser's env-review rubric as three separate named tests rather than one holistic judgment."
+  - arxiv_id: "2009.12293"
+    title: "robosuite: A Modular Simulation Framework and Benchmark for Robot Learning"
+    year: 2020
+    tier: "B"
+    tags: ["sim-frameworks"]
+    rationale: "[sim-frameworks] Arena-vs-object namespace split and declarative placement samplers are worth borrowing; XML-string merging itself is superseded by MjSpec attach."

@@ -8,6 +8,7 @@ store (see `sculptor.kg.store.SculptorKG`).
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any, Optional
 
@@ -34,6 +35,279 @@ kg_app = typer.Typer(
     no_args_is_help=True,
 )
 app.add_typer(kg_app, name="kg")
+
+
+world_app = typer.Typer(
+    name="world",
+    help="Author, inspect, and validate prompt-driven robot environments.",
+    no_args_is_help=True,
+)
+app.add_typer(world_app, name="world")
+
+
+@world_app.command("author")
+def world_author(
+    prompt: str = typer.Argument(
+        ..., help="Natural-language environment and task description."),
+    project_dir: Path = typer.Option(
+        ..., "--project", "-p", help="Initialized Sculptor project."),
+    robot: Optional[str] = typer.Option(
+        None, "--robot", help="Robot capability ID; auto-select when omitted."),
+    robot_descriptor: list[Path] = typer.Option(
+        [], "--robot-descriptor",
+        help="External RobotCapability JSON (repeatable)."),
+    yes: bool = typer.Option(
+        False, "--yes", "-y",
+        help="Select every disclosed system default without prompting."),
+    interactive: Optional[bool] = typer.Option(
+        None, "--interactive/--no-interactive",
+        help=("Force clarification prompts or select disclosed defaults "
+              "headlessly. By default, terminal input is detected.")),
+    timeout_defaults: bool = typer.Option(
+        False, "--timeout-defaults",
+        help="Select defaults and record timeout_default provenance."),
+    kg_grounding: bool = typer.Option(
+        True, "--kg-grounding/--no-kg-grounding",
+        help=("Ground authoring in the shared knowledge graph "
+              "(best-effort retrieval; never blocks authoring).")),
+    json_out: bool = typer.Option(
+        False, "--json", help="Emit the promoted result as JSON."),
+):
+    """Author, clarify, gate, materialize, and atomically promote a world."""
+    import json as _json
+
+    from sculptor.world.author import (
+        CLARIFICATION_VERSION,
+        ClarificationAnswer,
+        ClarificationSubmission,
+        apply_clarifications,
+        author_environment,
+        default_clarification_submission,
+    )
+    from sculptor.world.grounding import (
+        gather_grounding,
+        grounding_context,
+        grounding_ids,
+    )
+    from sculptor.world.project import WorldProjectService
+
+    try:
+        grounding_items = gather_grounding(prompt) if kg_grounding else ()
+        draft = author_environment(
+            prompt, robot_capability_id=robot,
+            robot_descriptor_paths=robot_descriptor,
+            grounding=grounding_ids(grounding_items),
+            grounding_context=grounding_context(grounding_items))
+        import sys
+
+        should_prompt = (
+            interactive if interactive is not None else sys.stdin.isatty()
+        )
+        if yes or timeout_defaults or not should_prompt:
+            if (not yes and not timeout_defaults and not should_prompt):
+                typer.echo(
+                    "[sculpt world] non-interactive input; selecting every "
+                    "disclosed system default",
+                    err=True,
+                )
+            submission = default_clarification_submission(
+                draft, timeout=timeout_defaults)
+        else:
+            answers: list[ClarificationAnswer] = []
+            total_pages = len(draft.clarification_plan.pages)
+            for page in draft.clarification_plan.pages:
+                typer.echo(
+                    f"Clarification {page.page}/{total_pages} "
+                    f"({len(page.questions)} questions)", err=json_out)
+                for question in page.questions:
+                    typer.echo(f"\n{question.prompt}", err=json_out)
+                    choices = list(question.choices)
+                    for index, choice in enumerate(choices, 1):
+                        typer.echo(
+                            f"  {index}. {choice.label}", err=json_out)
+                    default_index = len(choices) + 1
+                    typer.echo(
+                        f"  {default_index}. {question.system_default_label}",
+                        err=json_out,
+                    )
+                    while True:
+                        selected = typer.prompt(
+                            "Select", type=int, default=default_index,
+                            err=json_out)
+                        if 1 <= selected <= default_index:
+                            break
+                        typer.echo(
+                            f"Select a number from 1 to {default_index}.",
+                            err=True,
+                        )
+                    if selected == default_index:
+                        answers.append(ClarificationAnswer(
+                            question.question_id, "system_default",
+                            source="default"))
+                    else:
+                        answers.append(ClarificationAnswer(
+                            question.question_id,
+                            choices[selected - 1].choice_id,
+                            source="user"))
+            submission = ClarificationSubmission(
+                version=CLARIFICATION_VERSION,
+                draft_hash=draft.draft_hash,
+                question_set_hash=(
+                    draft.clarification_plan.question_set_hash),
+                answers=tuple(answers),
+            )
+        applied = apply_clarifications(draft, submission)
+        from sculptor.world.project import evaluation_lineage_for
+
+        lineage = evaluation_lineage_for(
+            applied.world_spec, applied.task_spec)
+        admitted = WorldProjectService(project_dir).admit_and_promote(
+            world=applied.world_spec, task=applied.task_spec,
+            clarifications=applied.clarification_ledger,
+            evaluation_lineage=lineage,
+            rejected_session_id=f"draft-{draft.draft_hash[:24]}",
+        )
+    except Exception as exc:
+        typer.echo(f"world author failed: {exc}", err=True)
+        raise typer.Exit(1) from exc
+
+    result = {
+        "ok": True,
+        "selection": admitted.promoted.selection.to_dict(),
+        "capability_id": draft.capability_id,
+        "draft_hash": draft.draft_hash,
+        "result_hash": applied.result_hash,
+        "evaluation_lineage": lineage,
+        "admission": admitted.admission,
+        "asset_dir": str(admitted.asset_dir),
+        "clarification_answers": len(
+            applied.clarification_ledger.get("answers", [])),
+        "kg_grounding": grounding_ids(grounding_items),
+    }
+    if json_out:
+        typer.echo(_json.dumps(result, indent=2, sort_keys=True))
+    else:
+        selection_result = admitted.promoted.selection
+        typer.echo(
+            f"[sculpt world] promoted selection_v"
+            f"{selection_result.selection_version} "
+            f"({selection_result.tuple_hash[:12]})")
+        typer.echo(f"  robot:       {draft.capability_id}")
+        typer.echo(f"  lineage:     {lineage}")
+        typer.echo(f"  eval assets: {admitted.asset_dir}")
+        typer.echo(
+            f"  gates:       {len(admitted.admission['gates'])} passed")
+        typer.echo(
+            f"  grounding:   {len(grounding_items)} KG nodes")
+
+
+def _world_selection_path(project_dir: Path, selection: Optional[Path]) -> Path:
+    if selection is not None:
+        return selection.expanduser().resolve()
+    return (project_dir.expanduser().resolve() /
+            "env" / "selection_current.json")
+
+
+@world_app.command("show")
+def world_show(
+    project_dir: Path = typer.Option(
+        ..., "--project", "-p", help="Sculptor project."),
+    selection: Optional[Path] = typer.Option(
+        None, "--selection", help="Pinned selection_vN.json; default current."),
+    json_out: bool = typer.Option(
+        False, "--json", help="Emit the complete selected bundle."),
+):
+    """Show the exact authoritative world/task/evaluation tuple."""
+    import json as _json
+
+    from sculptor.world.project import load_selected_world
+
+    path = _world_selection_path(project_dir, selection)
+    try:
+        _store, selected, bundle = load_selected_world(path)
+    except Exception as exc:
+        typer.echo(f"world show failed: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    if json_out:
+        typer.echo(_json.dumps(bundle, indent=2, sort_keys=True))
+        return
+    world = bundle["world"]
+    task = bundle["task"]
+    shared = world["shared"]
+    goal = task["shared"]["goal"]
+    typer.echo(
+        f"selection_v{selected.selection_version} "
+        f"{selected.tuple_hash[:12]}  lineage={selected.evaluation_lineage}")
+    typer.echo(
+        f"robot:   {shared['robot']['capability_id']} "
+        f"requires={shared['robot'].get('required_capabilities', [])}")
+    typer.echo(
+        f"terrain: {shared['terrain']['kind']}  "
+        f"objects={len(shared.get('objects', {}))}  "
+        f"course={len(shared.get('obstacles', {}).get('course', []))}")
+    typer.echo(
+        f"goal:    {goal['type']} ({goal['id']})  "
+        f"admission={bundle['resolved_eval']['admission']['ok']}")
+
+
+@world_app.command("validate")
+def world_validate(
+    project_dir: Path = typer.Option(
+        ..., "--project", "-p", help="Sculptor project."),
+    selection: Optional[Path] = typer.Option(
+        None, "--selection", help="Pinned selection_vN.json; default current."),
+    json_out: bool = typer.Option(
+        False, "--json", help="Emit the complete gate report."),
+):
+    """Verify the immutable tuple, frozen assets, and runtime fingerprints."""
+    import json as _json
+
+    from sculptor.world.compiler import (
+        ResolvedEvaluation,
+        verify_resolved_evaluation,
+    )
+    from sculptor.world.gates import AdmissionReport
+    from sculptor.world.project import load_selected_world
+
+    path = _world_selection_path(project_dir, selection)
+    try:
+        store, selected, bundle = load_selected_world(path)
+        manifest = ResolvedEvaluation.from_dict(bundle["resolved_eval"])
+        verify_resolved_evaluation(
+            bundle["world"], bundle["task"], bundle["channel_catalog"],
+            manifest,
+            asset_base=store.resolve_ref(
+                selected.refs["resolved_eval"]).parent,
+        )
+        report = AdmissionReport.from_dict(manifest.admission)
+        model_match = True
+        ok = report.ok
+    except Exception as exc:
+        typer.echo(f"world validate failed: {exc}", err=True)
+        raise typer.Exit(1) from exc
+    result = {
+        "ok": ok,
+        "selection_version": selected.selection_version,
+        "tuple_hash": selected.tuple_hash,
+        "evaluation_lineage": selected.evaluation_lineage,
+        "model_hash_match": model_match,
+        "admission": report.to_dict(),
+    }
+    if json_out:
+        typer.echo(_json.dumps(result, indent=2, sort_keys=True))
+    else:
+        typer.echo(
+            f"world validation {'passed' if ok else 'FAILED'}: "
+            f"selection_v{selected.selection_version}")
+        typer.echo(f"  tuple hash: {selected.tuple_hash}")
+        typer.echo(f"  compiled model hash match: {model_match}")
+        for gate in report.gates:
+            typer.echo(
+                f"  [{'ok' if gate.ok else 'FAIL'}] {gate.gate}"
+                + (f" ({len(gate.violations)} violations)"
+                   if gate.violations else ""))
+    if not ok:
+        raise typer.Exit(1)
 
 
 # ── Remote sub-app (§Ship 23) ────────────────────────────────────────────────
@@ -126,6 +400,10 @@ def eval_run(
         ..., "--benchmark", "-b",
         help="Benchmark name (repeatable). See `sculpt eval list`.",
     ),
+    benchmark_manifest: list[Path] = typer.Option(
+        [], "--benchmark-manifest",
+        help="Strict external benchmark-suite JSON (repeatable).",
+    ),
     condition: list[str] = typer.Option(
         ..., "--condition", "-c",
         help="Condition name (repeatable): full | no_kg | plain_ppo | seed_only.",
@@ -197,6 +475,7 @@ def eval_run(
         benchmarks=list(benchmark),
         conditions=list(condition),
         seeds=[1000 + 17 * i for i in range(int(seeds))],
+        benchmark_manifests=list(benchmark_manifest),
         iterations=iterations,
         steps_per_iter=steps_per_iter,
         rollout_episodes=rollout_episodes,
@@ -209,6 +488,146 @@ def eval_run(
     typer.echo(f"html:   {Path(out) / 'report.html'}")
     for w in report["aggregates"]["capture_parity_warnings"]:
         typer.echo(f"WARNING: {w}", err=True)
+    for w in report.get("authority_warnings", []):
+        typer.echo(f"WARNING: {w}", err=True)
+
+
+shard_app = typer.Typer(
+    name="shard",
+    help="Run one frozen eval matrix safely across processes or pods.",
+    no_args_is_help=True,
+)
+eval_app.add_typer(shard_app, name="shard")
+
+
+@shard_app.command("prepare")
+def eval_shard_prepare(
+    out: Path = typer.Option(..., "--out", help="Global campaign output dir."),
+    shards: int = typer.Option(
+        ..., "--shards", min=1, help="Number of operational worker shards.",
+    ),
+    benchmark: list[str] = typer.Option(
+        ..., "--benchmark", "-b", help="Benchmark name (repeatable).",
+    ),
+    benchmark_manifest: list[Path] = typer.Option(
+        [], "--benchmark-manifest",
+        help="Strict external benchmark-suite JSON (repeatable).",
+    ),
+    condition: list[str] = typer.Option(
+        ..., "--condition", "-c", help="Condition name (repeatable).",
+    ),
+    seeds: int = typer.Option(
+        3, "--seeds", min=1,
+        help="Number of paired seeds (1000, 1017, 1034, ...).",
+    ),
+    iterations: int = typer.Option(2, "--iterations", min=1),
+    steps_per_iter: int = typer.Option(300, "--steps-per-iter", min=1),
+    rollout_episodes: int = typer.Option(4, "--rollout-episodes", min=1),
+    spec_threshold: float = typer.Option(0.5, "--spec-threshold"),
+    eureka_k: int = typer.Option(4, "--eureka-k", min=1),
+    fitness_in_loop: bool = typer.Option(False, "--fitness-in-loop"),
+    name: Optional[str] = typer.Option(None, "--name"),
+):
+    """Charter the full matrix once and emit self-contained shard dirs."""
+    from sculptor.eval import CampaignConfig
+    from sculptor.eval.charter import CharterError
+    from sculptor.eval.sharding import ShardError, prepare_sharded_campaign
+
+    cfg = CampaignConfig(
+        name=name or Path(out).name,
+        out_dir=Path(out),
+        benchmarks=list(benchmark),
+        conditions=list(condition),
+        seeds=[1000 + 17 * index for index in range(int(seeds))],
+        benchmark_manifests=list(benchmark_manifest),
+        iterations=iterations,
+        steps_per_iter=steps_per_iter,
+        rollout_episodes=rollout_episodes,
+        spec_threshold=spec_threshold,
+        eureka_k=eureka_k,
+        fitness_in_loop=fitness_in_loop,
+    )
+    try:
+        coordinator = prepare_sharded_campaign(cfg, shard_count=shards)
+    except (CharterError, ShardError, OSError, ValueError, KeyError) as exc:
+        typer.echo(f"shard preparation failed: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    typer.echo(f"global charter: {Path(out) / 'campaign_charter.json'}")
+    typer.echo(f"coordinator:    {Path(out) / 'campaign_shards.json'}")
+    typer.echo(f"design hash:    {coordinator['charter']['design_sha256']}")
+    for record in coordinator["shards"]:
+        manifest = (
+            Path(out) / record["relative_dir"] / "shard_manifest.json"
+        )
+        typer.echo(
+            f"{record['shard_id']}: {record['n_jobs']} jobs -> {manifest}"
+        )
+
+
+@shard_app.command("run")
+def eval_shard_run(
+    manifest: Path = typer.Argument(..., help="Transported shard_manifest.json."),
+    require_remote: bool = typer.Option(
+        False, "--require-remote",
+        help="Abort unless an enabled SCULPTOR_REMOTE_* target resolves.",
+    ),
+):
+    """Run only a shard's assigned jobs under its complete global charter."""
+    import os as _os
+
+    from sculptor.adapters._remote import RemoteConfig
+    from sculptor.eval.charter import CharterError
+    from sculptor.eval.sharding import ShardError, run_campaign_shard
+
+    remote = RemoteConfig.from_sources(None, _os.environ)
+    if require_remote and (remote is None or not remote.enabled):
+        typer.echo(
+            "[eval shard] --require-remote set but no enabled remote resolved; "
+            "aborting before training.",
+            err=True,
+        )
+        raise typer.Exit(3)
+    try:
+        report = run_campaign_shard(manifest)
+    except (CharterError, ShardError, OSError, ValueError, KeyError) as exc:
+        typer.echo(f"shard run failed: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    coverage = report["coverage"]
+    typer.echo(
+        f"{report['shard_id']}: {coverage['n_completed']}/"
+        f"{coverage['n_expected']} assigned jobs complete"
+    )
+    typer.echo(f"report: {Path(manifest).parent / 'shard_report.json'}")
+
+
+@shard_app.command("merge")
+def eval_shard_merge(
+    out: Path = typer.Option(..., "--out", help="Global campaign output dir."),
+    shard_dir: list[Path] = typer.Option(
+        [], "--shard-dir",
+        help="Fetched shard output dir (repeatable; default: local plan dirs).",
+    ),
+):
+    """Verify available shards and merge results with explicit coverage."""
+    from sculptor.eval.charter import CharterError
+    from sculptor.eval.sharding import ShardError, merge_sharded_campaign
+
+    try:
+        report = merge_sharded_campaign(
+            out, list(shard_dir) if shard_dir else None,
+        )
+    except (CharterError, ShardError, OSError, ValueError, KeyError) as exc:
+        typer.echo(f"shard merge failed: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    coverage = report["coverage"]
+    state = "COMPLETE" if coverage["complete"] else "INCOMPLETE"
+    typer.echo(
+        f"coverage {state}: {coverage['n_completed']}/"
+        f"{coverage['n_expected']} jobs; {coverage['n_missing']} missing"
+    )
+    typer.echo(f"report: {Path(out) / 'campaign_report.json'}")
+    for warning in report.get("authority_warnings", []):
+        typer.echo(f"WARNING: {warning}", err=True)
 
 
 @eval_app.command("report")
@@ -220,6 +639,12 @@ def eval_report(
     import json as _json
 
     from sculptor.eval import CampaignConfig, run_campaign  # noqa: F401
+    from sculptor.eval.charter import (
+        CHARTER_FILENAME,
+        CharterError,
+        load_and_verify_charter,
+        verify_result_lineage,
+    )
     from sculptor.eval.harness import _report_html, aggregate
     from sculptor.run_context import write_json_atomic
 
@@ -229,6 +654,13 @@ def eval_report(
     if not results:
         typer.echo(f"no result.json files under {out}", err=True)
         raise typer.Exit(1)
+    charter_path = Path(out) / CHARTER_FILENAME
+    try:
+        charter = load_and_verify_charter(charter_path)
+        verify_result_lineage(results, charter)
+    except CharterError as exc:
+        typer.echo(f"campaign integrity check failed: {exc}", err=True)
+        raise typer.Exit(2) from exc
     report_path = Path(out) / "campaign_report.json"
     try:
         prior = _json.loads(report_path.read_text(encoding="utf-8"))
@@ -248,14 +680,188 @@ def eval_report(
     typer.echo(f"re-aggregated {len(results)} jobs -> {report_path}")
 
 
+@eval_app.command("charter")
+def eval_charter(
+    out: Path = typer.Argument(..., help="Campaign directory to verify."),
+):
+    """Verify and summarize a frozen campaign charter and result lineage."""
+    import json as _json
+
+    from sculptor.eval.charter import (
+        CHARTER_FILENAME,
+        CharterError,
+        load_and_verify_charter,
+        verify_result_lineage,
+    )
+
+    charter_path = Path(out) / CHARTER_FILENAME
+    try:
+        charter = load_and_verify_charter(charter_path)
+        results = [
+            _json.loads(path.read_text(encoding="utf-8"))
+            for path in sorted(Path(out).glob("*/*/seed_*/result.json"))
+        ]
+        verify_result_lineage(results, charter)
+    except (CharterError, OSError, _json.JSONDecodeError) as exc:
+        typer.echo(f"campaign integrity check failed: {exc}", err=True)
+        raise typer.Exit(2) from exc
+
+    campaign = charter["design"]["campaign"]
+    typer.echo("campaign charter: VERIFIED")
+    typer.echo(f"  path:        {charter_path}")
+    typer.echo(f"  campaign:    {campaign['name']}")
+    typer.echo(f"  created:     {charter['created_at']}")
+    typer.echo(f"  design hash: {charter['design_sha256']}")
+    typer.echo(f"  source hash: "
+               f"{charter['design']['runtime_identity']['source_tree_sha256']}")
+    typer.echo(f"  results:     {len(results)} verified")
+
+
+@eval_app.command("spec-audit")
+def eval_spec_audit(
+    manifest: Path = typer.Argument(
+        ..., help="Frozen adversarial spec-audit manifest JSON.",
+    ),
+    out: Path = typer.Option(..., "--out", help="Fresh certificate output dir."),
+):
+    """Run an adversarial evidence battery for one objective spec metric."""
+    import json as _json
+
+    from sculptor.eval.spec_audit import SpecAuditError, run_spec_audit
+
+    try:
+        certificate = run_spec_audit(manifest, out)
+    except SpecAuditError as exc:
+        typer.echo(f"spec audit failed: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    typer.echo(_json.dumps({
+        "audit_id": certificate["audit_id"],
+        "spec_name": certificate["spec_name"],
+        "passed": certificate["passed"],
+        "authority_decision": certificate["authority_decision"],
+        "coverage": certificate["coverage"],
+        "summary": certificate["summary"],
+        "certificate_sha256": certificate["certificate_sha256"],
+        "report": str(Path(out) / "spec_audit_report.md"),
+    }, indent=2))
+    if not certificate["passed"]:
+        raise typer.Exit(1)
+
+
+gauntlet_app = typer.Typer(
+    name="gauntlet",
+    help="Build and analyze blinded evaluator/human-anchor studies.",
+    no_args_is_help=True,
+)
+eval_app.add_typer(gauntlet_app, name="gauntlet")
+
+
+@gauntlet_app.command("build")
+def eval_gauntlet_build(
+    manifest: Path = typer.Argument(
+        ..., help="Private labeled source-manifest JSON.",
+    ),
+    out: Path = typer.Option(..., "--out", help="Fresh study output directory."),
+    seed: int = typer.Option(0, "--seed", help="Frozen pairing/randomization seed."),
+    forms: int = typer.Option(
+        2, "--forms", min=1, max=2,
+        help="One randomized form or two counterbalanced forms.",
+    ),
+    max_pairs_per_group: int = typer.Option(
+        50, "--max-pairs-per-group", min=1,
+        help="Balanced cap within each comparison group.",
+    ),
+    reliability_repeats: int = typer.Option(
+        0, "--reliability-repeats", min=0,
+        help="Hidden repeated pairs used to estimate rater self-consistency.",
+    ),
+    evaluator_tie_band: float = typer.Option(
+        0.0, "--evaluator-tie-band", min=0.0,
+        help="Absolute score difference treated as an evaluator tie.",
+    ),
+):
+    """Build anonymized media packets plus a separate private study key."""
+    import json as _json
+
+    from sculptor.eval.gauntlet import GauntletError, build_blind_study
+
+    try:
+        summary = build_blind_study(
+            manifest, out,
+            seed=seed,
+            forms=forms,
+            max_pairs_per_group=max_pairs_per_group,
+            reliability_repeats=reliability_repeats,
+            evaluator_tie_band=evaluator_tie_band,
+        )
+    except GauntletError as exc:
+        typer.echo(f"gauntlet build failed: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    typer.echo(_json.dumps(summary, indent=2))
+    typer.echo(
+        "Keep study_key.json private until labels are frozen; distribute only "
+        "one study_packet_form_*.json and its referenced assets per rater."
+    )
+
+
+@gauntlet_app.command("analyze")
+def eval_gauntlet_analyze(
+    study_key: Path = typer.Argument(..., help="Private study_key.json."),
+    responses: Path = typer.Argument(..., help="Completed JSONL responses."),
+    out: Path = typer.Option(..., "--out", help="Analysis output directory."),
+):
+    """Validate frozen responses and analyze evaluator-human agreement."""
+    import json as _json
+
+    from sculptor.eval.gauntlet import GauntletError, analyze_blind_study
+
+    try:
+        analysis = analyze_blind_study(study_key, responses, out)
+    except (GauntletError, OSError) as exc:
+        typer.echo(f"gauntlet analysis failed: {exc}", err=True)
+        raise typer.Exit(2) from exc
+    typer.echo(_json.dumps({
+        "study_id": analysis["study_id"],
+        "analysis_sha256": analysis["analysis_sha256"],
+        "counts": analysis["counts"],
+        "human_pair_accuracy": analysis["human"][
+            "pair_majority_accuracy_vs_expected"
+        ],
+        "evaluator_human_alignment": analysis["evaluator"][
+            "pair_accuracy_vs_human_majority"
+        ],
+        "report": str(Path(out) / "gauntlet_analysis.md"),
+    }, indent=2))
+
+
 @eval_app.command("list")
-def eval_list():
+def eval_list(
+    benchmark_manifest: list[Path] = typer.Option(
+        [], "--benchmark-manifest",
+        help="Include a strict external benchmark-suite JSON (repeatable).",
+    ),
+):
     """List benchmarks + conditions."""
-    from sculptor.eval import BENCHMARKS, CONDITIONS
+    from sculptor.eval import CONDITIONS
+    from sculptor.eval.benchmarks import (
+        BenchmarkManifestError,
+        benchmark_registry,
+    )
+
+    try:
+        benchmarks = benchmark_registry(benchmark_manifest)
+    except BenchmarkManifestError as exc:
+        typer.echo(f"benchmark manifest invalid: {exc}", err=True)
+        raise typer.Exit(2) from exc
 
     typer.echo("benchmarks:")
-    for b in BENCHMARKS.values():
-        typer.echo(f"  {b.name:18s} {b.task_id:35s} spec={b.spec_metric}")
+    for b in benchmarks.values():
+        readiness = "ready" if b.campaign_ready else b.evaluation_tier
+        typer.echo(
+            f"  {b.name:22s} {b.embodiment_family:18s} "
+            f"{readiness:16s} authority={b.spec_authority:18s} "
+            f"spec={b.spec_metric or '-'} task={b.task_id}"
+        )
     typer.echo("conditions:")
     for c in CONDITIONS.values():
         typer.echo(f"  {c.name:12s} mode={c.mode:11s} {c.notes}")
@@ -264,7 +870,8 @@ def eval_list():
 _STORE_OPT = typer.Option(
     None,
     "--store",
-    help="Path to the KG DB (default: $SCULPTOR_KG_PATH or ./kg/graph.db).",
+    help="Path to the KG DB (default: $SCULPTOR_KG_PATH / $RS_KG_PATH, else "
+         "the shared ~/.local/share/sculptor/kg/graph.db).",
 )
 
 
@@ -332,6 +939,39 @@ def kg_stats(store: Optional[Path] = _STORE_OPT):
             typer.echo("    (none)")
 
 
+@kg_app.command("merge")
+def kg_merge(
+    source: Path = typer.Argument(
+        ..., exists=True, readable=True,
+        help="Path to a stray/legacy graph.db to merge INTO the shared KG."),
+    store: Optional[Path] = _STORE_OPT,
+    rename_source: bool = typer.Option(
+        True, "--rename-source/--keep-source",
+        help="After a successful merge, rename the source to "
+             "<name>.merged so it can never re-fragment the graph."),
+):
+    """Merge a stray per-directory KG into the shared graph (additive:
+    existing shared nodes are never overwritten; edges/embeddings dedupe).
+
+    Context: pre-2026-07-03 the default DB resolution preferred a
+    cwd-relative kg/graph.db, silently splitting papers/techniques/run
+    cases by launch directory. This command folds those strays back in.
+    """
+    from sculptor.kg.store import merge_stores
+
+    with _open_store(store) as kg:
+        counts = merge_stores(source, kg)
+    typer.echo(
+        f"merged {source} -> {kg.db_path}: "
+        f"+{counts['nodes']} nodes ({counts['nodes_skipped']} already "
+        f"present), +{counts['edges']} edges, "
+        f"+{counts['embeddings']} embeddings")
+    if rename_source:
+        target = source.with_suffix(source.suffix + ".merged")
+        source.rename(target)
+        typer.echo(f"source renamed to {target}")
+
+
 @kg_app.command("heal-stubs")
 def kg_heal_stubs(store: Optional[Path] = _STORE_OPT):
     """§7.7: re-ingest Paper nodes whose title is still `arxiv:XXXX.XXXXX`.
@@ -361,6 +1001,45 @@ def kg_heal_stubs(store: Optional[Path] = _STORE_OPT):
                 "  tip: still-stubbed papers probably hit arxiv rate-limit; "
                 "re-run after ~2 min"
             )
+
+
+@kg_app.command("doctor")
+def kg_doctor(
+    store: Optional[Path] = _STORE_OPT,
+    fix: bool = typer.Option(
+        False, "--fix",
+        help="Repair mechanical issues: delete orphan embeddings + dangling "
+             "edges, re-embed missing/stale vectors, heal stub titles and "
+             "dead full_text_path sidecars (the last two need network)."),
+    reembed_all: bool = typer.Option(
+        False, "--reembed-all",
+        help="With --fix: drop and rebuild EVERY semantic-pool embedding "
+             "(Paper/Technique/FailureMode/RunCase) — the escape hatch for "
+             "pre-hash vectors whose staleness is unknowable."),
+    no_network: bool = typer.Option(
+        False, "--no-network",
+        help="With --fix: skip the two repairs that hit arxiv."),
+):
+    """§Phase-0 hardening: full KG integrity report (referential slack,
+    stub/dead papers, missing + stale embeddings), optionally repaired.
+
+    Read-only without --fix. Exit code 1 when unfixed issues remain."""
+    from sculptor.kg.doctor import format_report, run_doctor
+
+    with _open_store(store) as kg:
+        report = run_doctor(
+            kg, fix=fix, reembed_all=reembed_all, network=not no_network)
+        typer.echo(format_report(report))
+        effective = report.get("post_fix", report)
+        dirty = bool(
+            effective["dangling_edges"] or effective["orphan_embeddings"]
+            or effective["unknown_kind_nodes"]
+            or effective["unknown_relation_edges"]
+            or effective["stub_titled_papers"] or effective["dead_text_paths"]
+            or any(c["missing"] or c["stale"]
+                   for c in effective["embedding_pools"].values()))
+        if dirty:
+            raise typer.Exit(code=1)
 
 
 @kg_app.command("viz")
@@ -413,6 +1092,13 @@ def kg_extract(
         False, "--force", help="Re-extract papers even if already marked extracted."),
     limit: Optional[int] = typer.Option(
         None, "--limit", help="Cap number of papers processed this run."),
+    seeds: Optional[Path] = typer.Option(
+        None, "--seeds", exists=True, readable=True,
+        help="Restrict extraction to Paper IDs in this campaign seeds YAML."),
+    tier: Optional[str] = typer.Option(
+        None, "--tier", help="Restrict to a structured tier (for example S)."),
+    tag: Optional[str] = typer.Option(
+        None, "--tag", help="Restrict to one structured campaign tag."),
     print_one: bool = typer.Option(
         True, "--print-one/--no-print-one",
         help="Dump the first successful payload as JSON for inspection."),
@@ -423,12 +1109,20 @@ def kg_extract(
     Requires `ANTHROPIC_API_KEY` in the environment. Creates Technique,
     FailureMode, RewardComponent, Environment nodes and their edges.
     """
-    from sculptor.kg.extract import cli_extract_all
+    from sculptor.kg.extract import cli_extract_all, paper_ids_from_seeds
 
-    if not (all_ or force):
-        typer.echo("specify --all to extract every unextracted paper")
+    if not (all_ or force or seeds or tier or tag):
+        typer.echo("specify --all, --seeds, --tier, or --tag")
         raise typer.Exit(code=2)
-    raise typer.Exit(code=cli_extract_all(store, force=force, limit=limit, print_one=print_one))
+    paper_ids = (
+        paper_ids_from_seeds(seeds, tier=tier, tag=tag) if seeds else None)
+    if seeds and not paper_ids:
+        typer.echo("selection matched no papers")
+        raise typer.Exit(code=2)
+    raise typer.Exit(code=cli_extract_all(
+        store, force=force, limit=limit, print_one=print_one,
+        paper_ids=paper_ids, tier=(None if seeds else tier),
+        tags=({tag} if tag and not seeds else None)))
 
 
 @app.command()
@@ -515,6 +1209,14 @@ def run(
              "For mjlab this is rsl_rl max_iterations; for gym_sb3 it's "
              "env steps per cycle. UI's 'rsl_rl iters / cycle' field "
              "maps to this."),
+    num_envs: Optional[int] = typer.Option(
+        None, "--num-envs", min=1, max=8192,
+        help="Override [adapter].config.num_envs for this run. "
+             "Supported by adapters that expose a parallel env count."),
+    device: Optional[str] = typer.Option(
+        None, "--device",
+        help="Override the adapter device for this run (cpu, cuda, or "
+             "cuda:N)."),
     # §Ship-7: rollout-video + RL knobs. Each defaults to None, meaning
     # the runner picks a sensible default (real-time video, 500-step
     # episodes, auto-rendered framerate). UI's Advanced tab surfaces
@@ -531,6 +1233,17 @@ def run(
     rollout_fps: Optional[float] = typer.Option(
         None, "--rollout-fps",
         help="Hard override on playback fps (default: derive from step_dt)."),
+    render_width: Optional[int] = typer.Option(
+        None, "--render-width",
+        help="Rollout video width in px (default 1280; render cost is "
+             "resolution-independent on this stack)."),
+    render_height: Optional[int] = typer.Option(
+        None, "--render-height",
+        help="Rollout video height in px (default 720)."),
+    render_env_index: Optional[int] = typer.Option(
+        None, "--render-env-index", min=0, max=63,
+        help="Precommit which parallel evaluation lane is rendered in the "
+             "video (0-63). Batch metrics remain unchanged."),
     rollout_episodes: Optional[int] = typer.Option(
         None, "--rollout-episodes",
         help="Override [iteration].rollout_episodes (default 6)."),
@@ -547,14 +1260,15 @@ def run(
         None, "--early-stop-patience",
         help="Compatibility no-op: accepted but ignored."),
     # §Ship 34: objective fitness-in-the-loop. `--fitness-metric` names a
-    # spec metric (go1_trot / g1_kick / g1_floss / cartpole_balance); the
+    # spec metric (including capability-driven object_lift_hold); the
     # loop then best-selects on it, shows it to the diagnoser, and
     # plateau/target early-stops. None = blind (criterion/metric-history
     # only). The UI's "Objective fitness metric" dropdown maps here.
     fitness_metric: Optional[str] = typer.Option(
         None, "--fitness-metric",
         help="Spec-metric name to use as ground-truth fitness in the loop "
-             "(go1_trot, g1_kick, g1_floss, cartpole_balance). Must match "
+             "(go1_trot, g1_kick, g1_floss, cartpole_balance, "
+             "object_lift_hold). Must match "
              "the robot. Omit for the blind loop."),
     fitness_target: Optional[float] = typer.Option(
         None, "--fitness-target",
@@ -580,6 +1294,15 @@ def run(
         help="Steer mode: on a fitness regression, revert the edit base to "
              "the best-so-far reward instead of compounding the bad edit. "
              "Default on; --no-fitness-revert restores the Ship-33 behavior."),
+    # §2026-07-04 (gap #7): warm-start chaining for complex motions —
+    # e.g. learn a hop, then start the tuck-jump run from that policy.
+    # Previously reachable only via the sculpt_run kwarg (the tuck-jump
+    # E2E needed a hand-written driver script to use it).
+    init_policy: Optional[Path] = typer.Option(
+        None, "--init-policy", exists=True, readable=True,
+        help="rsl_rl checkpoint to warm-start the FIRST iteration's "
+             "training from (actor+critic only; optimizer/iteration "
+             "state skipped). Task obs/action spaces must match."),
     # §Ship 39 (H1): interactive human-in-the-loop control.
     control_file: Optional[Path] = typer.Option(
         None, "--control-file",
@@ -591,29 +1314,48 @@ def run(
         3600.0, "--feedback-timeout",
         help="Max seconds to wait at an interactive pause before auto-resuming "
              "(so a dead client can't pin the GPU)."),
+    reference_clip: Optional[str] = typer.Option(
+        None, "--reference-clip",
+        help="Reference-library clip id used as an immutable tracking prior."),
+    reference_robot: Optional[str] = typer.Option(
+        None, "--reference-robot",
+        help="Exact reference-library robot namespace for --reference-clip."),
 ):
     """Run the inner loop: train → rollout → diagnose → edit → commit."""
     from sculptor.sculpt import sculpt_run
 
     if fitness_mode not in ("steer", "observe"):
         raise typer.BadParameter("--fitness-mode must be 'steer' or 'observe'")
+    if device is not None and not re.fullmatch(r"(?:cpu|cuda(?::\d+)?)", device):
+        raise typer.BadParameter(
+            "--device must be 'cpu', 'cuda', or 'cuda:N'"
+        )
 
     # Resolve the metric (built-in name or generated-metric path) to a
     # fitness fn (fail fast before any GPU work). None keeps the blind loop.
     fitness_fn = None
     if fitness_metric:
         from sculptor.eval import resolve_fitness_fn
-        fitness_fn = resolve_fitness_fn(fitness_metric)
+        from sculptor.world.channels import load_project_channel_catalog
+
+        channel_catalog = load_project_channel_catalog(config.parent)
+        fitness_fn = resolve_fitness_fn(
+            fitness_metric, channel_catalog=channel_catalog)
         _warn_fitness_metric_mismatch(config, fitness_metric)
 
     _sculpt_kwargs = dict(
         config_path=config, behavior_goal=behavior, iterations=iterations,
         resume=resume_run, no_kg=no_kg, dry_run=dry_run,
         steps_per_iter=steps_per_iter,
+        num_envs=num_envs,
+        device=device,
         max_episode_steps=max_episode_steps,
         playback_speed=playback_speed,
         render_every=render_every,
         rollout_fps=rollout_fps,
+        render_width=render_width,
+        render_height=render_height,
+        render_env_index=render_env_index,
         rollout_episodes=rollout_episodes,
         seed=seed,
         auto_adjust_physics=auto_adjust_physics,
@@ -622,8 +1364,11 @@ def run(
         fitness_fn=fitness_fn,
         fitness_observe_only=(fitness_mode == "observe"),
         fitness_revert=fitness_revert,
+        init_policy_path=init_policy,
         control_file=control_file,
         feedback_timeout=feedback_timeout,
+        reference_clip_id=reference_clip,
+        reference_robot=reference_robot,
     )
     # Only override sculpt_run's defaults when explicitly provided.
     if fitness_target is not None:
@@ -656,7 +1401,7 @@ def gen_metric(
         help="Skip the independent-LLM review gate (validation still runs)."),
     calibrate_against: Optional[str] = typer.Option(
         None, "--calibrate-against",
-        help="Built-in metric (go1_trot/g1_kick/g1_floss/cartpole_balance) "
+        help="Built-in metric (including object_lift_hold) "
              "to calibrate the generated metric against (earns steer-rights "
              "if Spearman >= 0.7)."),
 ):
@@ -669,6 +1414,7 @@ def gen_metric(
     from sculptor.eval import calibrate_metric, generate_objective_metric
 
     robot_hint: Optional[str] = None
+    channel_catalog = None
     if config is not None:
         try:
             try:
@@ -678,11 +1424,19 @@ def gen_metric(
             with open(config, "rb") as f:
                 cfg = tomllib.load(f)
             robot_hint = ((cfg.get("adapter") or {}).get("config") or {}).get("task_id")
+            from sculptor.world.channels import load_project_channel_catalog
+
+            channel_catalog = load_project_channel_catalog(config.parent)
         except Exception:  # noqa: BLE001 — hint is best-effort
             robot_hint = None
 
+    metric_kwargs = (
+        {"channel_catalog": channel_catalog}
+        if channel_catalog is not None else {}
+    )
     result = generate_objective_metric(
-        goal, out, robot_hint=robot_hint, review=not no_review)
+        goal, out, robot_hint=robot_hint, review=not no_review,
+        **metric_kwargs)
     typer.echo(f"[gen-metric] accepted={result['accepted']} "
                f"(validation_passed={result['validation_passed']})")
     typer.echo(f"[gen-metric] metric: {result['metric_path']}")
@@ -694,7 +1448,8 @@ def gen_metric(
         for c in rev.get("concerns", []):
             typer.echo(f"  - [review] {c}", err=True)
     if calibrate_against and result["accepted"]:
-        cal = calibrate_metric(result["metric_path"], calibrate_against)
+        cal = calibrate_metric(
+            result["metric_path"], calibrate_against, **metric_kwargs)
         typer.echo(f"[gen-metric] calibration vs {calibrate_against}: "
                    f"spearman={cal.get('spearman')} ok={cal.get('ok')}")
 
@@ -770,6 +1525,15 @@ def mission_init(
             "$SCULPTOR_SKILL_LIBRARY_ROOT or ~/.local/share/sculptor/skills/."
         ),
     ),
+    stage_metrics: bool = typer.Option(
+        True, "--stage-metrics/--no-stage-metrics",
+        help=(
+            "§MISSION_METRIC_GRANULARITY: generate one trust-gated "
+            "objective metric PER STAGE from the stage's goal text "
+            "(default ON). Rejected generations leave the stage on the "
+            "mission-level metric fallback."
+        ),
+    ),
 ):
     """Decompose a goal into a mission curriculum (Ship 14 + 17).
 
@@ -819,6 +1583,14 @@ def mission_init(
         )
     )
 
+    # §llm provenance: archive the decompose call(s) to the mission dir
+    # (created up front — decompose_task itself never writes into it).
+    from sculptor.llm import set_llm_log_dir
+
+    mission_dir = missions_root / mission_slug
+    mission_dir.mkdir(parents=True, exist_ok=True)
+    set_llm_log_dir(mission_dir)
+
     # Open KG (optional).
     kg_store = None if no_kg else SculptorKG()
     try:
@@ -830,9 +1602,41 @@ def mission_init(
         if kg_store is not None:
             kg_store.close()
 
-    mission_dir = missions_root / mission_slug
     mission.mission_dir = str(mission_dir.resolve())
     save_mission(mission, mission_dir)
+
+    # §MISSION_METRIC_GRANULARITY: fresh trust-gated metric per stage,
+    # generated from each stage's own goal text. After save_mission so a
+    # generation crash can never lose the decomposition; re-saved after.
+    if stage_metrics:
+        from sculptor.mission_metrics import generate_stage_metrics
+
+        robot_hint = getattr(adapter, "task_id", None)
+        metric_kwargs = (
+            {"channel_catalog": reward_contract.channel_catalog}
+            if reward_contract.channel_catalog is not None else {}
+        )
+        report = generate_stage_metrics(
+            mission, robot_hint=robot_hint, **metric_kwargs)
+        save_mission(mission, mission_dir)
+        typer.echo(
+            f"[mission-init] stage metrics: "
+            f"{len(report['generated'])} generated, "
+            f"{len(report['rejected'])} rejected (fallback), "
+            f"{len(report['skipped'])} skipped")
+        for row in report["rejected"]:
+            typer.echo(
+                f"[mission-init]   {row['stage']}: {row['reason']}",
+                err=True)
+        print(
+            "[SCULPT-EVENT] " + _json.dumps({
+                "type": "mission_stage_metrics",
+                "mission_slug": mission_slug,
+                "generated": report["generated"],
+                "rejected": report["rejected"],
+            }),
+            flush=True,
+        )
 
     print(
         "[SCULPT-EVENT] " + _json.dumps({
@@ -933,6 +1737,46 @@ def _derive_mission_slug(goal: str, existing: set[str]) -> str:
         candidate = f"{base}-{n}"
         n += 1
     return candidate
+
+
+@app.command("mission-save")
+def mission_save_cli(
+    project_dir: Path = typer.Argument(
+        ..., exists=True, file_okay=False, dir_okay=True,
+    ),
+    mission_slug: str = typer.Argument(
+        ..., help="Mission slug under <project_dir>/.missions/."),
+    pin: list[str] = typer.Option(
+        [], "--pin",
+        help="Extra checkpoints to keep, 'stage:iter' (repeatable). "
+             "Best + final per stage are kept automatically."),
+) -> None:
+    """§durable auto-save: archive a mission into the restart-/delete-
+    proof `saved/` store (best+final+pinned checkpoints + all videos,
+    reports, reward code, metrics). Missions auto-archive as they run;
+    use this to (re-)save a pre-existing mission or add pins."""
+    from sculptor.archive import archive_mission, saved_root
+
+    mission_dir = (project_dir / ".missions" / mission_slug).resolve()
+    if not (mission_dir / "mission.json").is_file():
+        typer.echo(f"[mission-save] no mission at {mission_dir}", err=True)
+        raise typer.Exit(1)
+    pinned: dict[str, set[int]] = {}
+    for spec in pin:
+        try:
+            st, it = spec.split(":")
+            pinned.setdefault(st, set()).add(int(it))
+        except ValueError:
+            typer.echo(f"[mission-save] bad --pin {spec!r} (want stage:iter)",
+                       err=True)
+            raise typer.Exit(2)
+    res = archive_mission(
+        mission_dir, saved_root(), project_slug=project_dir.name,
+        pinned=pinned or None, incremental=False)
+    typer.echo(
+        f"[mission-save] archived → {res.entry_dir} "
+        f"({int(getattr(res, 'total_bytes', 0) or 0) // (1024*1024)} MB, "
+        f"dropped {int(getattr(res, 'dropped_bytes', 0) or 0) // (1024*1024)} MB)")
 
 
 @app.command("mission-run")
@@ -1043,11 +1887,43 @@ def mission_run_cli(
             "Default 5%."
         ),
     ),
+    # §MISSION_RUN_PARITY: per-launch knobs mirrored from `sculpt run` so a
+    # mission reaches parity with a standalone run. Each applies uniformly
+    # to EVERY stage; None = the stage's inherited config value wins.
+    edit_candidates: Optional[int] = typer.Option(
+        None, "--edit-candidates", min=1, max=5,
+        help="Best-of-K framed reward-edit candidates per diagnosis, per "
+             "stage (offline-screened; only the winner trains). Injected "
+             "into each stage's [iteration].edit_candidates. Omit = 1."),
+    rollout_episodes: Optional[int] = typer.Option(
+        None, "--rollout-episodes", min=1, max=32,
+        help="Rollout episodes captured per iter for behavior metrics, "
+             "per stage. Omit = inherited [iteration] value (default 6)."),
+    max_episode_steps: Optional[int] = typer.Option(
+        None, "--max-episode-steps", min=50, max=5000,
+        help="Rollout env steps per episode, per stage. Omit = default 500."),
+    playback_speed: Optional[float] = typer.Option(
+        None, "--playback-speed", min=0.1, max=10.0,
+        help="Rollout video speed multiplier, per stage; 1.0 = real-time."),
+    render_width: Optional[int] = typer.Option(
+        None, "--render-width",
+        help="Rollout video width px, per stage (default 1280)."),
+    render_height: Optional[int] = typer.Option(
+        None, "--render-height",
+        help="Rollout video height px, per stage (default 720)."),
+    num_envs: Optional[int] = typer.Option(
+        None, "--num-envs", min=1, max=8192,
+        help="Override [adapter].config.num_envs for every stage (mjlab). "
+             "Drop if a stage OOMs. Omit = inherited value."),
+    device: Optional[str] = typer.Option(
+        None, "--device",
+        help="Override [adapter].config.device for every stage (mjlab), "
+             "e.g. cuda:0 / cpu. Omit = inherited value."),
     # §Ship 34: fitness-in-the-loop for every stage (uniform spec metric).
     fitness_metric: Optional[str] = typer.Option(
         None, "--fitness-metric",
         help="Spec-metric name used as ground-truth fitness in EVERY "
-             "stage's loop (go1_trot, g1_kick, g1_floss, cartpole_balance). "
+             "stage's loop (including capability-driven object_lift_hold). "
              "Sound for single-skill missions. Omit for the blind loop."),
     fitness_target: Optional[float] = typer.Option(
         None, "--fitness-target",
@@ -1149,6 +2025,8 @@ def mission_run_cli(
 
     kg_store = SculptorKG()
     try:
+        from sculptor.world.channels import load_project_channel_catalog
+
         result = mission_run(
             mission,
             adapter_short_name=short_name,
@@ -1168,6 +2046,16 @@ def mission_run_cli(
             fitness_patience=fitness_patience,
             fitness_observe_only=(fitness_mode == "observe"),
             fitness_revert=fitness_revert,
+            # §MISSION_RUN_PARITY: per-launch knobs → every stage.
+            edit_candidates=edit_candidates,
+            rollout_episodes=rollout_episodes,
+            max_episode_steps=max_episode_steps,
+            playback_speed=playback_speed,
+            render_width=render_width,
+            render_height=render_height,
+            num_envs=num_envs,
+            device=device,
+            channel_catalog=load_project_channel_catalog(project_dir),
         )
     finally:
         kg_store.close()
@@ -1207,6 +2095,554 @@ def report(
     if result.selected_iter_indices:
         typer.echo(
             f"[report] panels from iters {result.selected_iter_indices}")
+
+
+@app.command()
+def export(
+    config: Path = typer.Option(
+        ..., "--config", "-c", exists=True, readable=True,
+        help="Project config.toml. The bundle lands in <project>/exports/."),
+    iter_index: Optional[int] = typer.Option(
+        None, "--iter", "-i",
+        help="Iteration to export (default: latest with a checkpoint)."),
+    out: Optional[Path] = typer.Option(
+        None, "--out", "-o",
+        help="Output zip path (default: <project>/exports/policy_<name>_iter<N>.zip)."),
+    runs_root: Optional[Path] = typer.Option(
+        None, "--runs-root",
+        help="Alternate runs/ tree, e.g. a mission stage's "
+             ".missions/<m>/stages/<s>/runs (default: <project>/runs)."),
+    list_only: bool = typer.Option(
+        False, "--list", help="List exportable iterations and exit."),
+):
+    """Export a trained policy as a self-contained deployment bundle.
+
+    The zip contains the raw checkpoint, best-effort ONNX + TorchScript
+    exports of the actor network, the exact reward version + env spec the
+    iteration trained under, the project config, metrics, and a DEPLOY.md
+    loading recipe — everything a sim-to-real pipeline needs in one file.
+    """
+    from sculptor.export import (
+        ExportError,
+        export_policy_bundle,
+        list_exportable_iters,
+    )
+
+    project = config.resolve().parent
+    root = runs_root if runs_root is not None else project / "runs"
+
+    if list_only:
+        rows = list_exportable_iters(root)
+        if not rows:
+            typer.echo(f"[export] no exportable iterations under {root}")
+            raise typer.Exit(1)
+        for r in rows:
+            metric = (
+                f"{r['primary_metric']:.2f}"
+                if r["primary_metric"] is not None else "—")
+            typer.echo(
+                f"  iter {r['iter_index']:>3}  {r['checkpoint']:<14} "
+                f"reward={r['reward_version'] or '—':<5} metric={metric}")
+        return
+
+    try:
+        result = export_policy_bundle(
+            project, iter_index=iter_index, runs_root=root, out_path=out)
+    except (ExportError, OSError) as e:
+        typer.echo(f"[export] {e}", err=True)
+        raise typer.Exit(1)
+    net = result.manifest.get("network") or {}
+    typer.echo(f"[export] wrote {result.bundle_path}")
+    if net.get("exports"):
+        typer.echo(f"[export] network exports: {', '.join(net['exports'])}")
+    for w in result.warnings:
+        typer.echo(f"[export] warning: {w}", err=True)
+
+
+@app.command()
+def heldout(
+    config: Path = typer.Option(
+        ..., "--config", "-c", exists=True, readable=True,
+        help="Project config.toml. Report lands in <project>/reports/heldout/."),
+    checkpoint: Path = typer.Option(
+        ..., "--checkpoint", exists=True, readable=True,
+        help="Trained checkpoint to evaluate (a kept-best policy)."),
+    metric: str = typer.Option(
+        ..., "--metric",
+        help="HAND spec-metric name (e.g. g1_jump). Generated metrics are "
+             "rejected — the battery exists to score OUTSIDE the loop."),
+    out: Optional[Path] = typer.Option(
+        None, "--out", help="Output dir (default <project>/reports/heldout)."),
+    push_levels: str = typer.Option(
+        "0,0.5,1.0,1.5", "--push-levels",
+        help="Comma-separated push magnitudes m/s (0 = unperturbed base)."),
+    seeds: str = typer.Option(
+        "70001,70002,70003", "--seeds",
+        help="Fresh rollout seeds (70k band — disjoint from the loop's "
+             "selection seeds by convention)."),
+    episodes: int = typer.Option(3, "--episodes"),
+):
+    """§RESEARCH_GAP_ANALYSIS §7.4: held-out evaluation battery.
+
+    Scores a kept policy on a push-perturbation grid over the frozen
+    shared env, with fresh seeds and hand spec metrics — numbers the
+    loop never optimized. Writes `heldout_report.json`.
+    """
+    import json as _json
+
+    from sculptor.adapters.base import load_adapter
+    from sculptor.env_spec import read_current_env_spec
+    from sculptor.eval.heldout import run_heldout_battery
+
+    project = config.resolve().parent
+    adapter = load_adapter(config)
+    base_spec = read_current_env_spec(project / "env")
+    out_dir = out if out is not None else project / "reports" / "heldout"
+    report = run_heldout_battery(
+        adapter=adapter,
+        checkpoint_path=checkpoint,
+        out_dir=out_dir,
+        metric=metric,
+        base_env_spec=base_spec,
+        push_levels=[float(x) for x in push_levels.split(",") if x.strip()],
+        seeds=[int(x) for x in seeds.split(",") if x.strip()],
+        n_episodes=episodes,
+        on_event=lambda ev: typer.echo(f"[heldout] {_json.dumps(ev)}"),
+    )
+    typer.echo(f"[heldout] report: {out_dir / 'heldout_report.json'}")
+    for row in report["levels"]:
+        typer.echo(
+            f"  push {row['push_mps']:>4g} m/s  "
+            f"median {row['median_score']:.3f}  "
+            f"degradation {row['degradation_vs_base']}")
+    if not report["env_spec_lever_available"]:
+        typer.echo(
+            "[heldout] WARNING: adapter has no env_spec lever — perturbed "
+            "cells ran UNPERTURBED (marked in report).", err=True)
+
+
+# ── sculpt reference: RSI curricula from reference clips ─────────────────
+reference_app = typer.Typer(
+    help="Reference trajectories: derive RSI train-curricula from motion "
+         "clips (DeepMimic RSI; train-only, rollout evaluation untouched).")
+app.add_typer(reference_app, name="reference")
+
+
+@reference_app.command("jump")
+def reference_jump(
+    project: Path = typer.Option(
+        ..., "--project",
+        help="Project dir (clip → <project>/reference/, spec → <project>/env/)."),
+    stand_height: float = typer.Option(
+        0.78, "--stand-height", help="Standing base height in metres "
+        "(0.78 = Unitree G1)."),
+    apex_gain: float = typer.Option(
+        0.35, "--apex", help="Jump apex above standing, metres."),
+    crouch_frac: float = typer.Option(
+        0.62, "--crouch", help="Crouch depth as a fraction of stand."),
+    clip: Optional[Path] = typer.Option(
+        None, "--clip",
+        help="Existing clip .npz (e.g. converted retargeted mocap) instead "
+             "of the procedural jump."),
+    apply: bool = typer.Option(
+        True, "--apply/--no-apply",
+        help="Persist the derived RSI curriculum as the next validated "
+             "env-spec version (train scope only)."),
+) -> None:
+    """Generate (or load) a jump reference clip, print its measured phase
+    keyframes (crouch depth / takeoff vz / apex / flight time — prompt-
+    ready numbers instead of guessed thresholds), and derive a validated
+    RSI train-curriculum from its airborne states."""
+    import json as _json
+
+    from sculptor.reference import (
+        apply_reference_rsi, derive_rsi_train_keys, load_clip,
+        make_procedural_jump_clip, phase_keyframes, save_clip)
+
+    project = project.resolve()
+    if clip is not None:
+        c = load_clip(clip)
+        typer.echo(f"[reference] loaded clip: {clip}")
+    else:
+        c = make_procedural_jump_clip(
+            stand_height_m=stand_height, apex_gain_m=apex_gain,
+            crouch_frac=crouch_frac)
+        out = save_clip(project / "reference" / "jump.npz", c)
+        typer.echo(f"[reference] clip written: {out}")
+    typer.echo(_json.dumps(phase_keyframes(c), indent=2))
+    if apply:
+        path = apply_reference_rsi(project / "env", c)
+        typer.echo(
+            f"[reference] env spec written: {path} (train-only RSI + paired "
+            "sunk termination; rollout evaluation untouched)")
+    else:
+        typer.echo("[reference] derived train keys (not applied):")
+        typer.echo(_json.dumps(derive_rsi_train_keys(c), indent=2))
+
+
+# ── sculpt refs: reference motion library (§R1_BUILD_SPEC) ──────────────
+refs_app = typer.Typer(
+    name="refs",
+    help="Reference motion library: ingest/index/list retargeted mocap "
+         "clips (LAFAN1-g1, fleaven-g1) for RSI. `refs search` lands in a "
+         "later worker.",
+    no_args_is_help=True,
+)
+app.add_typer(refs_app, name="refs")
+
+
+@refs_app.command("ingest")
+def refs_ingest(
+    source: str = typer.Option(
+        ..., "--source",
+        help="Dataset source: lafan1-g1 | fleaven-g1."),
+    filter_glob: Optional[str] = typer.Option(
+        None, "--filter", help="fnmatch glob over source filenames, "
+        "e.g. '*fallAndGetUp*'."),
+    no_preview: bool = typer.Option(
+        False, "--no-preview",
+        help="Skip preview.png generation (also the automatic fallback "
+             "when the preview module/GL context is unavailable)."),
+    limit: Optional[int] = typer.Option(
+        None, "--limit", help="Cap number of source files fetched this run."),
+    all_: bool = typer.Option(
+        False, "--all",
+        help="fleaven-g1 only: walk the FULL g1/**/*.npy tree (every "
+             "page of the HF tree API) instead of the default single-"
+             "page listing. Default off — without this flag, behavior "
+             "is unchanged from before this flag existed."),
+    manifest_out: Optional[Path] = typer.Option(
+        None, "--manifest-out",
+        help="With --all: write/reuse the enumerated file list (path+"
+             "size) as JSON at this path, so a full-tree run can be "
+             "resumed/audited. If the file exists and is < 1 day old, "
+             "it is reused instead of re-enumerating (see "
+             "--refresh-manifest)."),
+    refresh_manifest: bool = typer.Option(
+        False, "--refresh-manifest",
+        help="With --all --manifest-out: force re-enumeration even if "
+             "an existing manifest at that path looks fresh."),
+) -> None:
+    """Download + validate + index a batch of clips from a public HF
+    dataset (plain HTTPS, ungated). Idempotent: re-running skips clips
+    whose content hash is already indexed. Rejects are never fatal —
+    logged to `index_rejects.jsonl` with a reason; see that file for
+    anything skipped this run. Unless `--no-preview`, a best-effort
+    `preview.png` keyframe strip is rendered per accepted clip/segment
+    (§decision 8) — a missing preview module or GL/EGL context is
+    logged per-clip and never fails the ingest."""
+    from sculptor.refs.ingest import ingest_source
+    from sculptor.refs.library import rebuild_index
+
+    summary = ingest_source(
+        source, filter_glob=filter_glob, limit=limit, no_preview=no_preview,
+        full_tree=all_, manifest_path=manifest_out,
+        refresh_manifest=refresh_manifest,
+        progress=lambda msg: typer.echo(msg))
+
+    rows = rebuild_index()
+    typer.echo(
+        f"[refs ingest] accepted={len(summary.accepted)} "
+        f"rejected={len(summary.rejected)} "
+        f"skipped_existing={len(summary.skipped_existing)} "
+        f"index_rows={len(rows)}")
+    if summary.rejected:
+        typer.echo("[refs ingest] rejected clips:")
+        for clip_id, reason in summary.rejected:
+            typer.echo(f"  - {clip_id}: {reason}")
+
+
+@refs_app.command("index")
+def refs_index() -> None:
+    """Rebuild `index.jsonl` from every `<robot>/<clip_id>/provenance.json`
+    on disk. The index is a cache — provenance is truth — so this is safe
+    to run any time (e.g. after a manual edit or a partial ingest)."""
+    from sculptor.refs.library import rebuild_index
+
+    rows = rebuild_index()
+    typer.echo(f"[refs index] rebuilt {len(rows)} row(s)")
+
+
+@refs_app.command("list")
+def refs_list(
+    robot: Optional[str] = typer.Option(
+        None, "--robot", help="Filter to one robot (default: all)."),
+) -> None:
+    """List indexed clips (reads index.jsonl; run `sculpt refs index` first
+    if it's missing or stale)."""
+    from sculptor.refs.library import read_index
+
+    rows = read_index()
+    if robot:
+        rows = [r for r in rows if r.get("robot") == robot]
+    if not rows:
+        typer.echo("[refs list] no clips indexed (run `sculpt refs ingest` "
+                    "then `sculpt refs index`)")
+        return
+    for row in rows:
+        preview = "preview" if row.get("has_preview") else "no-preview"
+        typer.echo(
+            f"{row['clip_id']:<40} robot={row['robot']:<6} "
+            f"tier={row.get('tier', '?'):<3} "
+            f"frames={row.get('n_frames', '?'):<6} "
+            f"fps={row.get('fps', '?'):<6} "
+            f"dur={row.get('duration_s', '?')}s "
+            f"[{preview}]  {row.get('text', '')}")
+
+
+@refs_app.command("search")
+def refs_search(
+    query: str = typer.Argument(..., help="Free-text goal, e.g. "
+        "'get up off the ground'."),
+    robot: str = typer.Option("g1", "--robot", help="Robot to search."),
+    k: int = typer.Option(10, "--k", help="Max results to print."),
+    no_llm: bool = typer.Option(
+        False, "--no-llm", help="Skip the optional LLM rerank layer "
+        "(deterministic token-overlap ranking only)."),
+) -> None:
+    """Rank indexed clips against a free-text query (§decision 7).
+    Deterministic token-overlap + synonym-expanded scoring always runs;
+    unless `--no-llm`, the top candidates are reranked by
+    `reference_rerank` with a match_confidence + reason — any failure
+    there (no key, network, parse) silently falls back to the
+    deterministic ranking, never raises."""
+    from sculptor.refs.retrieve import search
+
+    results = search(query, robot=robot, k=k, use_llm=not no_llm)
+    if not results:
+        typer.echo(f"[refs search] no matches for {query!r} (robot={robot})")
+        return
+    for m in results:
+        conf = f"{m.match_confidence:.2f}" if m.match_confidence is not None else "  - "
+        typer.echo(
+            f"{m.clip_id:<40} score={m.score:>8.3f} conf={conf} "
+            f"tier={m.tier or '?':<3} dur={m.duration_s or '?'}s "
+            f"[{m.rerank}]  {m.text}")
+        if m.reason:
+            typer.echo(f"    reason: {m.reason}")
+
+
+@refs_app.command("preview")
+def refs_preview(
+    clip_id: str = typer.Argument(..., help="Clip id to render/re-render."),
+    robot: str = typer.Option("g1", "--robot", help="Robot the clip belongs to."),
+) -> None:
+    """Render (or re-render) a single clip's `preview.png` keyframe
+    strip on demand. Skips cleanly (non-zero exit, actionable message)
+    if `sculptor.refs.preview` can't create a GL/EGL context in this
+    environment — never a stack trace."""
+    from sculptor.reference import load_clip
+    from sculptor.refs import library
+    from sculptor.refs.preview import (
+        PreviewUnavailable, render_preview_png, resolve_mjcf_for_robot)
+
+    clip_path = library.clip_dir(robot, clip_id) / library.CLIP_FILENAME
+    if not clip_path.is_file():
+        typer.echo(f"[refs preview] no such clip: {robot}/{clip_id}", err=True)
+        raise typer.Exit(code=1)
+    clip = load_clip(clip_path)
+    out_path = library.clip_dir(robot, clip_id) / library.PREVIEW_FILENAME
+    try:
+        mjcf_path = resolve_mjcf_for_robot(robot)
+        render_preview_png(clip, out_path, mjcf_path=mjcf_path)
+    except PreviewUnavailable as e:
+        typer.echo(f"[refs preview] unavailable in this environment: {e}", err=True)
+        raise typer.Exit(code=1) from e
+    typer.echo(f"[refs preview] wrote {out_path}")
+
+
+@refs_app.command("retarget")
+def refs_retarget(
+    source: Path = typer.Option(
+        ..., "--source", help="Motion source file (BVH or SMPL-X npz)."),
+    format_: str = typer.Option(
+        "bvh", "--format", help="Source format: bvh | smplx."),
+    robot: list[str] = typer.Option(
+        ..., "--robot",
+        help="Target robot library slug (repeatable), e.g. --robot g1 "
+             "--robot t1. See sculptor.refs.retarget.GMR_ROBOT_IDS for "
+             "the supported slugs."),
+    bvh_format: str = typer.Option(
+        "lafan1", "--bvh-format",
+        help="BVH bone-naming convention: lafan1 | nokov (bvh source only)."),
+    license_: str = typer.Option(
+        ..., "--license", help="License tag for the source clip (provenance)."),
+    attribution: str = typer.Option(
+        ..., "--attribution", help="Attribution string for the source clip."),
+    text: str = typer.Option("", "--text", help="Free-text label for retrieval."),
+    labels: Optional[str] = typer.Option(
+        None, "--labels", help="Comma-separated labels."),
+    roles: Optional[str] = typer.Option(
+        None, "--roles",
+        help="Comma-separated joint roles to verify resolution for (e.g. "
+             "'left_hip_pitch,right_hip_pitch'). Skipped if omitted."),
+    gmr_python: Optional[Path] = typer.Option(
+        None, "--gmr-python",
+        help="Path to GMR's venv python (default: ~/tools/GMR/.venv/bin/python)."),
+) -> None:
+    """Retarget ONE source motion clip to one or more robots via GMR
+    (cross-venv subprocess — see sculptor.refs.retarget), registering
+    each result in the reference library with retarget provenance. Also
+    attempts a best-effort preview render per clip — MJCF resolved BY
+    ROBOT via sculptor.refs.preview.resolve_mjcf_for_robot (g1 from the
+    installed mjlab package, t1 from a local GMR checkout's own asset
+    tree; a robot with no registered resolver logs a skip and never
+    fails the run — the clip stays valid with no preview.png)."""
+    from sculptor.refs.retarget import (
+        RetargetError, attach_role_resolution_qc, retarget_and_register)
+    from sculptor.refs import library
+
+    label_list = [s.strip() for s in labels.split(",") if s.strip()] if labels else []
+    role_list = [s.strip() for s in roles.split(",") if s.strip()] if roles else []
+
+    for r in robot:
+        typer.echo(f"[refs retarget] {source} -> robot={r} (format={format_})")
+        try:
+            lc = retarget_and_register(
+                source, format_, r,
+                license_=license_, attribution=attribution, text=text,
+                labels=label_list, gmr_python=gmr_python, bvh_format=bvh_format)
+        except RetargetError as e:
+            typer.echo(f"[refs retarget] FAILED for robot={r}: {e}", err=True)
+            continue
+        typer.echo(
+            f"[refs retarget] registered {lc.clip_id} "
+            f"(robot={lc.robot}, npz={lc.clip_path})")
+
+        if role_list:
+            summary = attach_role_resolution_qc(r, lc.clip_id, role_list)
+            status = "OK" if summary["ok"] else "FAILED"
+            typer.echo(f"[refs retarget] role resolution {status}: {summary}")
+
+        try:
+            from sculptor.reference import load_clip
+            from sculptor.refs.preview import (
+                PreviewUnavailable, render_preview_png, resolve_mjcf_for_robot)
+
+            clip = load_clip(lc.clip_path)
+            out_path = library.clip_dir(r, lc.clip_id) / library.PREVIEW_FILENAME
+            mjcf_path = resolve_mjcf_for_robot(r)
+            render_preview_png(clip, out_path, mjcf_path=mjcf_path)
+            typer.echo(f"[refs retarget] preview written: {out_path}")
+        except PreviewUnavailable as e:
+            typer.echo(f"[refs retarget] preview unavailable for robot={r}: {e}")
+        except Exception as e:  # noqa: BLE001 — preview must never fail the run
+            typer.echo(
+                f"[refs retarget] preview skipped for robot={r}: "
+                f"{type(e).__name__}: {e}")
+
+    rows = library.rebuild_index()
+    typer.echo(f"[refs retarget] index_rows={len(rows)}")
+
+
+@refs_app.command("resegment")
+def refs_resegment(
+    parent: str = typer.Option(
+        ..., "--parent", help="clip_id of the parent clip to re-segment "
+        "(the un-suffixed clip, not one of its `--segNN` children)."),
+    robot: str = typer.Option("g1", "--robot", help="Robot the parent clip belongs to."),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="Print what would change without "
+        "writing or deleting anything."),
+    no_preview: bool = typer.Option(
+        False, "--no-preview", help="Skip preview.png re-render for the "
+        "new segments."),
+) -> None:
+    """Re-run segmentation for one already-indexed parent clip using the
+    current `sculptor.refs.segment` rules (2026-07-09 settled-start
+    fix), replacing its existing derived `--segNN` segments. Only clips
+    whose provenance `parent_clip_id` matches `--parent` are touched —
+    the rest of the library is untouched. QC-rejected candidates are
+    logged (never written) via the same rejects mechanism ingest uses."""
+    from sculptor.refs.ingest import ResegmentError, resegment_clip
+
+    try:
+        summary = resegment_clip(
+            parent, robot=robot, dry_run=dry_run, no_preview=no_preview,
+            progress=lambda msg: typer.echo(msg))
+    except ResegmentError as e:
+        typer.echo(f"[refs resegment] FAILED: {e}", err=True)
+        raise typer.Exit(code=1) from e
+
+    verb = "would remove" if dry_run else "removed"
+    add_verb = "would add" if dry_run else "added"
+    typer.echo(
+        f"[refs resegment] parent={summary.parent_clip_id} "
+        f"{verb}={len(summary.removed)} {add_verb}={len(summary.added)} "
+        f"rejected={len(summary.rejected)}")
+    for seg_id in summary.removed:
+        typer.echo(f"  - {verb}: {seg_id}")
+    for seg_id in summary.added:
+        typer.echo(f"  + {add_verb}: {seg_id}")
+    for cand_id, reason in summary.rejected:
+        typer.echo(f"  x rejected: {cand_id}: {reason}")
+
+
+@refs_app.command("track")
+def refs_track(
+    clip_id: str = typer.Option(
+        ..., "--clip-id", help="Tier-K clip_id to certify to Tier D."),
+    robot: str = typer.Option("g1", "--robot", help="Robot the clip belongs to."),
+    donor_project: Path = typer.Option(
+        ..., "--donor-project",
+        help="Path to an existing sculpt project whose config.toml "
+             "[adapter] table (class + config) is templated into the "
+             "throwaway tracking project."),
+    iterations: int = typer.Option(
+        3, "--iterations", help="Number of adapter.train() calls "
+        "(each warm-started from the prior checkpoint)."),
+    steps_per_iteration: int = typer.Option(
+        2000, "--steps-per-iteration", help="mjlab max_iterations per "
+        "adapter.train() call (see MjlabAdapter.train's docstring: "
+        "'steps' IS max_iterations, not raw env steps)."),
+    n_episodes: int = typer.Option(
+        2, "--n-episodes", help="Rollout episodes scored against the clip."),
+    seed: int = typer.Option(0, "--seed", help="Train/rollout seed."),
+    project_dir: Optional[Path] = typer.Option(
+        None, "--project-dir",
+        help="Throwaway project directory (default: "
+             "<clip_dir>/tierD_work)."),
+    dry_run: bool = typer.Option(
+        False, "--dry-run",
+        help="Build the throwaway project (config + tracking reward + "
+             "RSI/eval-reset env spec) and print the plan without "
+             "training."),
+) -> None:
+    """Tier-D certification (§REFERENCE_TRAJECTORY_PLAN §2.3, §11 R4):
+    physics-track a Tier-K clip in our own mjlab sim with a bounded
+    DeepMimic-style tracking run. Success within tolerance upgrades the
+    clip's provenance tier K -> D and copies the tracked rollout beside
+    the clip as `tierD_rollout.npz`; failure records
+    `tierD.feasible=false` (a useful verdict, not an error) and leaves
+    the tier unchanged. See `sculptor.refs.track` for the full pipeline."""
+    import json as _json
+
+    from sculptor.refs.track import TrackError, track_clip
+
+    try:
+        result = track_clip(
+            clip_id=clip_id, robot=robot, donor_project=donor_project,
+            iterations=iterations, steps_per_iteration=steps_per_iteration,
+            n_episodes=n_episodes, seed=seed, project_dir=project_dir,
+            dry_run=dry_run, progress=lambda msg: typer.echo(msg))
+    except TrackError as e:
+        typer.echo(f"[refs track] FAILED: {e}", err=True)
+        raise typer.Exit(code=1) from e
+
+    if result.dry_run:
+        typer.echo(
+            f"[refs track] dry-run plan: project_dir={result.plan.project_dir} "
+            f"reward={result.plan.reward_path} config={result.plan.config_path} "
+            f"iterations={result.plan.iterations} "
+            f"steps_per_iteration={result.plan.steps_per_iteration} "
+            f"n_episodes={result.plan.n_episodes} "
+            f"joint_names={result.plan.joint_names}")
+        return
+
+    assert result.errors is not None
+    verdict = "FEASIBLE (tier -> D)" if result.errors.feasible else "INFEASIBLE (tier stays K)"
+    typer.echo(f"[refs track] {clip_id}: {verdict}")
+    typer.echo(_json.dumps(result.errors.to_dict(), indent=2))
 
 
 if __name__ == "__main__":  # pragma: no cover

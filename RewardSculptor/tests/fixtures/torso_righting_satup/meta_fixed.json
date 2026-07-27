@@ -1,0 +1,749 @@
+{
+  "accepted": true,
+  "validation_passed": true,
+  "metric_path": "/home/samjd/.local/share/reward-sculptor/projects/g1-standing/.missions/starting-from-lying-flat-on-its/stage_metrics/torso_righting/metric.py",
+  "source": "\"\"\"\nObjective task-success metric: supine -> upright-torso floor sit for Unitree G1.\n\nGoal frame resolution:\n  * goal_axis    = None      (no horizontal travel direction is part of the goal;\n                              the signed-direction channel therefore ABSTAINS)\n  * support_mode = None      (floor-sitting: neither a foot-stance nor flight\n                              schedule defines this skill; support check ABSTAINS)\n  * torso_target = upright   (chest rotates upright: projected_gravity_b z must\n                              go from the lying start (~ -0.28 at the eval reset,\n                              ~ -0.65 at the reference clip start) toward the\n                              reference terminal value of ~ -0.856)\n\nSuccess signature (grounded in the reference clip + eval start state):\n  * starts NOT upright         : first frames g_z > -0.72   (eval reset ~ -0.28,\n                                 reference clip frame-0     ~ -0.649)\n  * ends torso-upright         : end-window mean g_z < -0.76 (reference ~ -0.84..-0.856)\n  * uprighting arc (amplitude) : g_z drop >= 0.10            (reference ~ 0.19-0.21)\n  * pelvis stays near ground   : end root z < 0.35 m and smoothed max root z\n                                 < 0.55 m for the whole episode (reference\n                                 root z stays in 0.098-0.164 m; a crouch/stand\n                                 belongs to LATER stages and is vetoed)\n  * no travel hack             : horizontal root displacement < 1.5 m\n\nComposition (hard rule 1): spec_score = completion_gate * min(channels).\nAll window reads are relative (earliest frames / last ~0.5 s) so a policy that\nfinishes the transition 16x faster than the reference and then HOLDS the sit\nscores identically to the reference.\n\"\"\"\n\nimport numpy as np\n\n\ndef _smooth_time(x, k):\n    \"\"\"Edge-padded moving average along axis 0. x: (T, E). Never zero-pads.\"\"\"\n    t = x.shape[0]\n    if k <= 1 or t < 2:\n        return x\n    k = int(min(k, t))\n    pad = np.pad(x, ((k // 2, k - 1 - k // 2), (0, 0)), mode=\"edge\")\n    c = np.cumsum(\n        np.concatenate([np.zeros((1, x.shape[1]), dtype=x.dtype), pad], axis=0),\n        axis=0,\n    )\n    return (c[k:] - c[:-k]) / float(k)\n\n\ndef _clip01(x):\n    return np.clip(x, 0.0, 1.0)\n\n\ndef compute_spec(arrays, behavior, meta):\n    out = {\n        \"spec_score\": 0.0,\n        \"progress_score\": 0.0,\n        \"goal_axis\": \"none_abstained\",\n        \"support_mode\": \"none_abstained\",\n        \"torso_target\": \"upright\",\n        \"direction_check_abstained\": 1.0,\n        \"support_check_abstained\": 1.0,\n    }\n\n    grav = arrays.get(\"projected_gravity_b\")\n    root = arrays.get(\"root_link_pos_w\")\n    if grav is None or root is None:\n        out[\"missing_inputs\"] = 1.0\n        return out\n    grav = np.asarray(grav, dtype=np.float64)\n    root = np.asarray(root, dtype=np.float64)\n    if grav.ndim != 3 or root.ndim != 3 or grav.shape[0] < 5 or root.shape[0] < 5:\n        out[\"short_or_malformed\"] = 1.0\n        return out\n    if not (np.all(np.isfinite(grav)) and np.all(np.isfinite(root))):\n        out[\"nonfinite_inputs\"] = 1.0\n        return out\n\n    T = min(grav.shape[0], root.shape[0])\n    E = min(grav.shape[1], root.shape[1])\n    g = grav[:T, :E, 2]          # gravity z in body frame: -1 upright, ~0 lying\n    z = root[:T, :E, 2]          # root height\n    xy = root[:T, :E, :2]        # horizontal root position\n\n    bh = behavior or {}\n    dt = float(bh.get(\"step_dt\") or 0.02)\n    if not np.isfinite(dt) or dt <= 0.0:\n        dt = 0.02\n\n    # spike-robust smoothing (~0.1 s window)\n    k = max(1, int(round(0.1 / dt)))\n    gs = _smooth_time(g, k)\n    zs = _smooth_time(z, k)\n\n    # ---- window reads (relative time; earliest-frames start per FAST-COMPLETION rule)\n    n0 = min(3, T)                                   # earliest frames only\n    n_end = min(T, max(3, int(round(0.5 / dt))))     # last ~0.5 s\n\n    g_start = np.mean(g[:n0], axis=0)                # (E,)\n    g_end = np.mean(gs[-n_end:], axis=0)\n    z_end = np.mean(zs[-n_end:], axis=0)\n    z_max = np.max(zs, axis=0)\n    hold_frac = np.mean(gs[-n_end:] < -0.72, axis=0)\n    delta_g = g_start - g_end                        # >0 means torso became MORE upright\n\n    xy_disp = np.linalg.norm(\n        np.mean(xy[-n0:], axis=0) - np.mean(xy[:n0], axis=0), axis=-1\n    )\n\n    # ---- completion gate (binary, owns the floor) ----------------------------\n    started_away = g_start > -0.72        # eval reset ~ -0.28; reference clip start ~ -0.649\n    ended_upright = g_end < -0.76         # reference terminal ~ -0.84 .. -0.856\n    pelvis_low_end = z_end < 0.35         # reference end root z ~ 0.153 m\n    amplitude_ok = delta_g >= 0.10        # reference arc ~ 0.19-0.21\n    no_travel = xy_disp < 1.5             # sit-ups do not walk away\n    never_rose = z_max < 0.55             # crouch/stand belongs to later stages\n\n    gate = (\n        started_away\n        & ended_upright\n        & pelvis_low_end\n        & amplitude_ok\n        & no_travel\n        & never_rose\n    ).astype(np.float64)\n\n    # ---- saturating channels in [0,1] (min composition) ----------------------\n    # torso_target = upright -> monotone in end-uprightness (reference ~ -0.856 -> 1.0)\n    c_upright = _clip01((-g_end - 0.70) / 0.10)\n    # pelvis stays near ground (reference 0.153 m -> 1.0; crouch ~0.4 -> 0)\n    c_pelvis = _clip01((0.35 - z_end) / 0.10)\n    # uprighting arc amplitude floor (reference ~0.19 -> 1.0; micro-twitch -> 0)\n    c_amp = _clip01((delta_g - 0.08) / 0.10)\n    # sustained hold of the upright-torso sit over the end window\n    c_hold = _clip01((hold_frac - 0.6) / 0.3)\n    # never rose toward crouch/stand anywhere in the episode (reference max 0.164 m)\n    c_lowmax = _clip01((0.55 - z_max) / 0.15)\n\n    channels = np.stack([c_upright, c_pelvis, c_amp, c_hold, c_lowmax], axis=0)\n    per_env = gate * np.min(channels, axis=0)\n    spec = float(np.clip(np.mean(per_env), 0.0, 1.0))\n\n    # ---- dense progress (ranking only; NEVER feeds spec_score) ---------------\n    # same physical quantities, ramping from the sensor-noise floor.\n    p_upright = _clip01((-g_end - 0.30) / 0.50)   # eval-reset dead-still (~-0.28) -> ~0\n    p_delta = _clip01((delta_g - 0.02) / 0.16)    # reference ~0.19 -> 1; frozen -> 0\n    p_pelvis = _clip01((0.55 - z_end) / 0.20)     # standing up ranks down\n    progress = float(\n        np.clip(np.mean(np.min(np.stack([p_upright, p_delta, p_pelvis], axis=0), axis=0)), 0.0, 1.0)\n    )\n\n    out.update(\n        {\n            \"spec_score\": spec,\n            \"progress_score\": progress,\n            \"completion_gate\": float(np.mean(gate)),\n            \"gate_started_away\": float(np.mean(started_away)),\n            \"gate_ended_upright\": float(np.mean(ended_upright)),\n            \"gate_pelvis_low_end\": float(np.mean(pelvis_low_end)),\n            \"gate_amplitude\": float(np.mean(amplitude_ok)),\n            \"gate_no_travel\": float(np.mean(no_travel)),\n            \"gate_never_rose\": float(np.mean(never_rose)),\n            \"chan_upright_end\": float(np.mean(c_upright)),\n            \"chan_pelvis_low\": float(np.mean(c_pelvis)),\n            \"chan_amplitude\": float(np.mean(c_amp)),\n            \"chan_hold\": float(np.mean(c_hold)),\n            \"chan_height_cap\": float(np.mean(c_lowmax)),\n            \"mean_g_start\": float(np.mean(g_start)),\n            \"mean_g_end\": float(np.mean(g_end)),\n            \"mean_delta_g\": float(np.mean(delta_g)),\n            \"mean_z_end\": float(np.mean(z_end)),\n            \"mean_z_max\": float(np.mean(z_max)),\n            \"mean_xy_disp\": float(np.mean(xy_disp)),\n        }\n    )\n    return out\n",
+  "validation": {
+    "ok": true,
+    "gates": {
+      "ast_safety": true,
+      "defines_compute_spec": true,
+      "array_contract": true,
+      "no_raw_joint_index": true,
+      "loads": true,
+      "determinism": true,
+      "bounded": true,
+      "joint_index_robust": true,
+      "nondegeneracy": true,
+      "reference_nondegeneracy:fallandgetup2_subject3--seg00": true,
+      "reference_monotonicity:fallandgetup2_subject3--seg00": true,
+      "reference_negatives:fallandgetup2_subject3--seg00": true,
+      "reference_complete_then_hold:fallandgetup2_subject3--seg00": true,
+      "reference_fast_completion:fallandgetup2_subject3--seg00": true,
+      "reference_settled_start:fallandgetup2_subject3--seg00": true,
+      "axioms": true
+    },
+    "reasons": [
+      "[nondegeneracy] deferred to attached reference(s): the fixed archetype battery is uninformative for this novel goal (best positive 0.000, spread 0.000 < 0.1) \u2014 nondegeneracy is decided by the reference_nondegeneracy/monotonicity/negatives gates below"
+    ],
+    "archetype_scores": {
+      "still": 0.0,
+      "fallen": 0.0,
+      "chaotic": 0.0,
+      "active": 0.0,
+      "upright_flail": 0.0,
+      "active_kick": 0.0,
+      "active_floss": 0.0,
+      "active_jump": 0.0,
+      "walker": 0.0,
+      "active_kick_behind": 0.0,
+      "one_leg_balance": 0.0,
+      "partial_kick": 0.0,
+      "reference:fallandgetup2_subject3--seg00": 1.0,
+      "reference:fallandgetup2_subject3--seg00:reversal": 0.0,
+      "reference:fallandgetup2_subject3--seg00:freeze_start": 0.0,
+      "reference:fallandgetup2_subject3--seg00:freeze_end": 0.0,
+      "reference:fallandgetup2_subject3--seg00:shuffle": 0.0,
+      "reference:fallandgetup2_subject3--seg00:speed_slow": 1.0,
+      "reference:fallandgetup2_subject3--seg00:speed_fast": 0.0,
+      "reference:fallandgetup2_subject3--seg00:trunc_25": 0.0,
+      "reference:fallandgetup2_subject3--seg00:trunc_50": 0.0,
+      "reference:fallandgetup2_subject3--seg00:trunc_75": 0.0,
+      "reference:fallandgetup2_subject3--seg00:root_only": 0.0,
+      "reference:fallandgetup2_subject3--seg00:complete_then_hold": 1.0,
+      "reference:fallandgetup2_subject3--seg00:complete_then_hold_x24": 1.0,
+      "reference:fallandgetup2_subject3--seg00:fast_completion": 1.0,
+      "reference:fallandgetup2_subject3--seg00:settled_start": 1.0
+    },
+    "family": null,
+    "goal_frame": {
+      "goal_axis": null,
+      "support_mode": "double",
+      "torso_target": "upright"
+    },
+    "nondegeneracy_vacuous": false,
+    "selectivity_probe": null,
+    "required_roles": [],
+    "axioms": {
+      "ok": true,
+      "axioms": {
+        "translation_invariant": true,
+        "gravity_scale_invariant": true,
+        "yaw_rotation_invariant": true,
+        "uprightness_monotone": true,
+        "no_reward_for_chaos": true
+      },
+      "reasons": [],
+      "details": {
+        "positive_scores": {
+          "active": 0.0,
+          "active_kick": 0.0,
+          "active_floss": 0.0,
+          "active_jump": 0.0
+        },
+        "operating_point": "active",
+        "operating_score": 0.0,
+        "translation_invariant_delta": 0.0,
+        "gravity_scale_invariant_delta": 0.0,
+        "yaw_rotation_invariant_delta": 0.0,
+        "uprightness_sweep": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "chaos_delta": 0.0
+      }
+    },
+    "references": [
+      {
+        "clip_id": "fallandgetup2_subject3--seg00",
+        "gates": {
+          "reference_nondegeneracy": true,
+          "reference_monotonicity": true,
+          "reference_negatives": true,
+          "reference_complete_then_hold": true,
+          "reference_fast_completion": true,
+          "reference_settled_start": true
+        },
+        "reasons": [],
+        "scores": {
+          "full": 1.0,
+          "reversal": 0.0,
+          "freeze_start": 0.0,
+          "freeze_end": 0.0,
+          "shuffle": 0.0,
+          "speed_slow": 1.0,
+          "speed_fast": 0.0,
+          "trunc_25": 0.0,
+          "trunc_50": 0.0,
+          "trunc_75": 0.0,
+          "root_only": 0.0,
+          "complete_then_hold": 1.0,
+          "complete_then_hold_x24": 1.0,
+          "fast_completion": 1.0,
+          "settled_start": 1.0
+        },
+        "settled_start_orientation_adjusted": true
+      }
+    ]
+  },
+  "review": {
+    "approved": true,
+    "concerns": [
+      "speed_fast reference perturbation scores 0 while fast_completion scores 1: the earliest-3-raw-frames start read can misfire on aggressively time-compressed clips whose frame-0 gravity (-0.649) is already near the -0.72 started_away threshold; in the real eval the reset is ~-0.28 so this is a synthetic-battery artifact, but worth noting.",
+      "A low kneel with upright torso (pelvis just under 0.35 m) could pass the gate; for this stage that outcome is physically adjacent to the stated goal (torso upright, pelvis near ground, no rise past 0.55 m), so it is a proxy tolerance rather than a degenerate exploit.",
+      "hold_frac uses -0.72 while ended_upright uses -0.76; the mean-end gate is the stricter binding constraint so the mild inconsistency is harmless but could be tightened."
+    ],
+    "summary": "The metric has the required form: a binary completion gate (started non-upright, ended torso-upright with amplitude >= 0.10 g_z drop, pelvis low at end, never rose past 0.55 m, no travel) multiplied by min() of five bounded saturating channels. No sums, ratios, or peak/median terms; the only max (z_max) is a smoothed veto that can only lower the score. Direction and support checks correctly ABSTAIN with declared frame fields; torso_target=upright is grounded in reference values. No naturalness terms are fused in. progress_score is a separate min-composed ramp that scores dead-still (~-0.28 g_z) at ~0 and never feeds spec_score. Channel-by-channel gaming attempts fail: a frozen supine pose fails ended_upright/amplitude/hold; a prone or side lie has g_z near 0 and cannot pass ended_upright; a stand/crouch trips z_max and z_end vetoes; a half sit-up twitch fails the 0.10 amplitude gate and c_amp floor; standing archetypes (one-leg balance, walker, flail) all fail never_rose. Archetype battery confirms: all 12 degenerates and all truncation/freeze/reversal/shuffle/root-only perturbations score exactly 0, while the reference, slow, fast-completion, hold, and settled-start variants score 1."
+  },
+  "review_panel": null,
+  "attempts": [
+    {
+      "attempt": 0,
+      "ok": true,
+      "reasons": [
+        "[nondegeneracy] deferred to attached reference(s): the fixed archetype battery is uninformative for this novel goal (best positive 0.000, spread 0.000 < 0.1) \u2014 nondegeneracy is decided by the reference_nondegeneracy/monotonicity/negatives gates below"
+      ]
+    }
+  ],
+  "n_candidates": 1,
+  "candidates": null,
+  "selected_candidate": null,
+  "behavior_goal": "Starting supine (lying flat on the back), rotate and push the torso up off the ground into an upright-torso floor-sitting posture: the chest turns upright while the pelvis stays near the ground. This stage does NOT rise toward a crouch or standing - raising the root belongs to the later stages.",
+  "robot_hint": "Mjlab-Velocity-Flat-Unitree-G1",
+  "model": "claude-fable-5",
+  "calibrated": false,
+  "recorded_at": "2026-07-12T06:28:03-0700",
+  "references_used": [
+    "fallandgetup2_subject3--seg00"
+  ],
+  "reference_signatures": {
+    "fallandgetup2_subject3--seg00": {
+      "duration_s": 8.1,
+      "fps": 30.0,
+      "n_frames": 243,
+      "root_z": {
+        "start": 0.161,
+        "end": 0.153,
+        "min": 0.098,
+        "min_t": 3.7,
+        "max": 0.164,
+        "max_t": 7.8
+      },
+      "root_velocity_mps": {
+        "min": -0.155,
+        "max": 0.092
+      },
+      "phases": [
+        {
+          "phase": "falling",
+          "t_start": 0.0,
+          "t_end": 0.433,
+          "z_start": 0.161,
+          "z_end": 0.119
+        },
+        {
+          "phase": "still",
+          "t_start": 0.433,
+          "t_end": 0.5,
+          "z_start": 0.117,
+          "z_end": 0.117
+        },
+        {
+          "phase": "rising",
+          "t_start": 0.5,
+          "t_end": 0.6,
+          "z_start": 0.121,
+          "z_end": 0.123
+        },
+        {
+          "phase": "still",
+          "t_start": 0.6,
+          "t_end": 0.833,
+          "z_start": 0.123,
+          "z_end": 0.12
+        },
+        {
+          "phase": "falling",
+          "t_start": 0.833,
+          "t_end": 1.067,
+          "z_start": 0.12,
+          "z_end": 0.108
+        },
+        {
+          "phase": "still",
+          "t_start": 1.067,
+          "t_end": 1.133,
+          "z_start": 0.108,
+          "z_end": 0.109
+        },
+        {
+          "phase": "rising",
+          "t_start": 1.133,
+          "t_end": 1.233,
+          "z_start": 0.11,
+          "z_end": 0.112
+        },
+        {
+          "phase": "still",
+          "t_start": 1.233,
+          "t_end": 3.1,
+          "z_start": 0.112,
+          "z_end": 0.117
+        },
+        {
+          "phase": "falling",
+          "t_start": 3.1,
+          "t_end": 3.267,
+          "z_start": 0.116,
+          "z_end": 0.11
+        },
+        {
+          "phase": "still",
+          "t_start": 3.267,
+          "t_end": 3.333,
+          "z_start": 0.109,
+          "z_end": 0.111
+        },
+        {
+          "phase": "falling",
+          "t_start": 3.333,
+          "t_end": 3.667,
+          "z_start": 0.111,
+          "z_end": 0.1
+        },
+        {
+          "phase": "still",
+          "t_start": 3.667,
+          "t_end": 3.7,
+          "z_start": 0.099,
+          "z_end": 0.099
+        },
+        {
+          "phase": "rising",
+          "t_start": 3.7,
+          "t_end": 3.867,
+          "z_start": 0.098,
+          "z_end": 0.107
+        },
+        {
+          "phase": "still",
+          "t_start": 3.867,
+          "t_end": 4.133,
+          "z_start": 0.107,
+          "z_end": 0.105
+        },
+        {
+          "phase": "rising",
+          "t_start": 4.133,
+          "t_end": 4.367,
+          "z_start": 0.106,
+          "z_end": 0.114
+        },
+        {
+          "phase": "still",
+          "t_start": 4.367,
+          "t_end": 5.3,
+          "z_start": 0.114,
+          "z_end": 0.117
+        },
+        {
+          "phase": "rising",
+          "t_start": 5.3,
+          "t_end": 5.733,
+          "z_start": 0.118,
+          "z_end": 0.147
+        },
+        {
+          "phase": "still",
+          "t_start": 5.733,
+          "t_end": 5.8,
+          "z_start": 0.148,
+          "z_end": 0.148
+        },
+        {
+          "phase": "falling",
+          "t_start": 5.8,
+          "t_end": 6.067,
+          "z_start": 0.148,
+          "z_end": 0.124
+        },
+        {
+          "phase": "still",
+          "t_start": 6.067,
+          "t_end": 6.233,
+          "z_start": 0.124,
+          "z_end": 0.125
+        },
+        {
+          "phase": "rising",
+          "t_start": 6.233,
+          "t_end": 6.467,
+          "z_start": 0.126,
+          "z_end": 0.14
+        },
+        {
+          "phase": "still",
+          "t_start": 6.467,
+          "t_end": 6.533,
+          "z_start": 0.142,
+          "z_end": 0.143
+        },
+        {
+          "phase": "falling",
+          "t_start": 6.533,
+          "t_end": 6.667,
+          "z_start": 0.143,
+          "z_end": 0.136
+        },
+        {
+          "phase": "still",
+          "t_start": 6.667,
+          "t_end": 6.7,
+          "z_start": 0.135,
+          "z_end": 0.135
+        },
+        {
+          "phase": "rising",
+          "t_start": 6.7,
+          "t_end": 6.833,
+          "z_start": 0.136,
+          "z_end": 0.145
+        },
+        {
+          "phase": "still",
+          "t_start": 6.833,
+          "t_end": 6.933,
+          "z_start": 0.145,
+          "z_end": 0.141
+        },
+        {
+          "phase": "rising",
+          "t_start": 6.933,
+          "t_end": 7.167,
+          "z_start": 0.142,
+          "z_end": 0.155
+        },
+        {
+          "phase": "still",
+          "t_start": 7.167,
+          "t_end": 7.267,
+          "z_start": 0.156,
+          "z_end": 0.157
+        },
+        {
+          "phase": "falling",
+          "t_start": 7.267,
+          "t_end": 7.4,
+          "z_start": 0.157,
+          "z_end": 0.152
+        },
+        {
+          "phase": "still",
+          "t_start": 7.4,
+          "t_end": 7.5,
+          "z_start": 0.152,
+          "z_end": 0.152
+        },
+        {
+          "phase": "rising",
+          "t_start": 7.5,
+          "t_end": 7.767,
+          "z_start": 0.153,
+          "z_end": 0.163
+        },
+        {
+          "phase": "still",
+          "t_start": 7.767,
+          "t_end": 7.867,
+          "z_start": 0.164,
+          "z_end": 0.163
+        },
+        {
+          "phase": "falling",
+          "t_start": 7.867,
+          "t_end": 8.067,
+          "z_start": 0.163,
+          "z_end": 0.152
+        },
+        {
+          "phase": "still",
+          "t_start": 8.067,
+          "t_end": 8.1,
+          "z_start": 0.153,
+          "z_end": 0.153
+        }
+      ],
+      "orientation": {
+        "initial_gravity_z_b": -0.649,
+        "final_gravity_z_b": -0.856,
+        "note": "gravity_z_b near -1.0 = upright; near 0 or positive = lying/inverted",
+        "timeline": [
+          {
+            "t": 0.0,
+            "z": 0.161,
+            "g_z": -0.649
+          },
+          {
+            "t": 0.733,
+            "z": 0.121,
+            "g_z": -0.603
+          },
+          {
+            "t": 1.467,
+            "z": 0.114,
+            "g_z": -0.591
+          },
+          {
+            "t": 2.2,
+            "z": 0.115,
+            "g_z": -0.598
+          },
+          {
+            "t": 2.933,
+            "z": 0.117,
+            "g_z": -0.625
+          },
+          {
+            "t": 3.667,
+            "z": 0.099,
+            "g_z": -0.531
+          },
+          {
+            "t": 4.4,
+            "z": 0.115,
+            "g_z": -0.63
+          },
+          {
+            "t": 5.133,
+            "z": 0.117,
+            "g_z": -0.618
+          },
+          {
+            "t": 5.867,
+            "z": 0.144,
+            "g_z": -0.706
+          },
+          {
+            "t": 6.6,
+            "z": 0.139,
+            "g_z": -0.684
+          },
+          {
+            "t": 7.333,
+            "z": 0.152,
+            "g_z": -0.791
+          },
+          {
+            "t": 8.067,
+            "z": 0.153,
+            "g_z": -0.856
+          }
+        ]
+      },
+      "contact_inferred": true,
+      "contact_schedule": {
+        "left_foot": {
+          "contact_fraction": 0.514
+        },
+        "right_foot": {
+          "contact_fraction": 0.601
+        }
+      },
+      "joint_motion_energy_by_phase": [
+        {
+          "phase": "falling",
+          "t_start": 0.0,
+          "t_end": 0.433,
+          "mean_abs_joint_vel": 0.528
+        },
+        {
+          "phase": "still",
+          "t_start": 0.433,
+          "t_end": 0.5,
+          "mean_abs_joint_vel": 0.298
+        },
+        {
+          "phase": "rising",
+          "t_start": 0.5,
+          "t_end": 0.6,
+          "mean_abs_joint_vel": 0.299
+        },
+        {
+          "phase": "still",
+          "t_start": 0.6,
+          "t_end": 0.833,
+          "mean_abs_joint_vel": 0.443
+        },
+        {
+          "phase": "falling",
+          "t_start": 0.833,
+          "t_end": 1.067,
+          "mean_abs_joint_vel": 0.556
+        },
+        {
+          "phase": "still",
+          "t_start": 1.067,
+          "t_end": 1.133,
+          "mean_abs_joint_vel": 0.473
+        },
+        {
+          "phase": "rising",
+          "t_start": 1.133,
+          "t_end": 1.233,
+          "mean_abs_joint_vel": 0.524
+        },
+        {
+          "phase": "still",
+          "t_start": 1.233,
+          "t_end": 3.1,
+          "mean_abs_joint_vel": 0.168
+        },
+        {
+          "phase": "falling",
+          "t_start": 3.1,
+          "t_end": 3.267,
+          "mean_abs_joint_vel": 0.349
+        },
+        {
+          "phase": "still",
+          "t_start": 3.267,
+          "t_end": 3.333,
+          "mean_abs_joint_vel": 0.418
+        },
+        {
+          "phase": "falling",
+          "t_start": 3.333,
+          "t_end": 3.667,
+          "mean_abs_joint_vel": 0.433
+        },
+        {
+          "phase": "still",
+          "t_start": 3.667,
+          "t_end": 3.7,
+          "mean_abs_joint_vel": 0.23
+        },
+        {
+          "phase": "rising",
+          "t_start": 3.7,
+          "t_end": 3.867,
+          "mean_abs_joint_vel": 0.27
+        },
+        {
+          "phase": "still",
+          "t_start": 3.867,
+          "t_end": 4.133,
+          "mean_abs_joint_vel": 0.43
+        },
+        {
+          "phase": "rising",
+          "t_start": 4.133,
+          "t_end": 4.367,
+          "mean_abs_joint_vel": 0.436
+        },
+        {
+          "phase": "still",
+          "t_start": 4.367,
+          "t_end": 5.3,
+          "mean_abs_joint_vel": 0.235
+        },
+        {
+          "phase": "rising",
+          "t_start": 5.3,
+          "t_end": 5.733,
+          "mean_abs_joint_vel": 0.639
+        },
+        {
+          "phase": "still",
+          "t_start": 5.733,
+          "t_end": 5.8,
+          "mean_abs_joint_vel": 1.006
+        },
+        {
+          "phase": "falling",
+          "t_start": 5.8,
+          "t_end": 6.067,
+          "mean_abs_joint_vel": 0.801
+        },
+        {
+          "phase": "still",
+          "t_start": 6.067,
+          "t_end": 6.233,
+          "mean_abs_joint_vel": 0.421
+        },
+        {
+          "phase": "rising",
+          "t_start": 6.233,
+          "t_end": 6.467,
+          "mean_abs_joint_vel": 0.49
+        },
+        {
+          "phase": "still",
+          "t_start": 6.467,
+          "t_end": 6.533,
+          "mean_abs_joint_vel": 0.818
+        },
+        {
+          "phase": "falling",
+          "t_start": 6.533,
+          "t_end": 6.667,
+          "mean_abs_joint_vel": 0.685
+        },
+        {
+          "phase": "still",
+          "t_start": 6.667,
+          "t_end": 6.7,
+          "mean_abs_joint_vel": 0.618
+        },
+        {
+          "phase": "rising",
+          "t_start": 6.7,
+          "t_end": 6.833,
+          "mean_abs_joint_vel": 0.387
+        },
+        {
+          "phase": "still",
+          "t_start": 6.833,
+          "t_end": 6.933,
+          "mean_abs_joint_vel": 0.422
+        },
+        {
+          "phase": "rising",
+          "t_start": 6.933,
+          "t_end": 7.167,
+          "mean_abs_joint_vel": 0.792
+        },
+        {
+          "phase": "still",
+          "t_start": 7.167,
+          "t_end": 7.267,
+          "mean_abs_joint_vel": 0.592
+        },
+        {
+          "phase": "falling",
+          "t_start": 7.267,
+          "t_end": 7.4,
+          "mean_abs_joint_vel": 0.701
+        },
+        {
+          "phase": "still",
+          "t_start": 7.4,
+          "t_end": 7.5,
+          "mean_abs_joint_vel": 0.706
+        },
+        {
+          "phase": "rising",
+          "t_start": 7.5,
+          "t_end": 7.767,
+          "mean_abs_joint_vel": 0.491
+        },
+        {
+          "phase": "still",
+          "t_start": 7.767,
+          "t_end": 7.867,
+          "mean_abs_joint_vel": 0.433
+        },
+        {
+          "phase": "falling",
+          "t_start": 7.867,
+          "t_end": 8.067,
+          "mean_abs_joint_vel": 0.438
+        },
+        {
+          "phase": "still",
+          "t_start": 8.067,
+          "t_end": 8.1,
+          "mean_abs_joint_vel": 0.513
+        }
+      ]
+    }
+  },
+  "eval_reset_preview": {
+    "scalars": {
+      "reset_height_offset_m": -0.6477,
+      "reset_vertical_velocity_mps": 0.0,
+      "fell_over_termination": false,
+      "reset_pitch_offset_rad": -1.2623,
+      "reset_roll_offset_rad": -0.3702,
+      "reset_joint_pos_target": [
+        -1.7057,
+        1.5931,
+        0.1978,
+        1.9627,
+        -0.032,
+        -0.217,
+        -0.7471,
+        0.5251,
+        0.1909,
+        0.8998,
+        0.5516,
+        0.2858,
+        -0.1219,
+        0.1414,
+        0.0037,
+        1.8478,
+        -0.5651,
+        -0.1875,
+        -0.5638,
+        0.6704,
+        -0.0208,
+        1.4156,
+        0.514,
+        0.1747,
+        -0.4693,
+        0.4562,
+        -0.8257,
+        0.555,
+        -1.235
+      ],
+      "reset_joint_pos_noise_rad": 0.0
+    },
+    "settled": true,
+    "reason": null,
+    "delta_z_m": -0.0467,
+    "converged": false
+  }
+}

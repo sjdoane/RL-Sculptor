@@ -95,7 +95,7 @@ def test_build_kg_html_highlights_provenance_nodes(kg, tmp_path: Path):
     # The 'removed_term' entry has still_active=False, so it doesn't count.
     assert result.n_active_nodes == 2
     body = out.read_text(encoding="utf-8")
-    assert "2 node(s) highlighted in gold" in body
+    assert "2 node(s) in gold" in body
     # Active-reason text appears in the tooltip somewhere.
     assert "appears in provenance.json" in body
 
@@ -105,7 +105,7 @@ def test_build_kg_html_handles_empty_provenance(kg, tmp_path: Path):
     result = build_kg_html(kg, out, provenance={})
     assert result.n_active_nodes == 0
     body = out.read_text(encoding="utf-8")
-    assert "0 node(s) highlighted in gold" in body
+    assert "OWN run experience" in body   # zero-active note (html-escaped ')
 
 
 def test_build_kg_html_no_provenance_arg(kg, tmp_path: Path):
@@ -113,3 +113,27 @@ def test_build_kg_html_no_provenance_arg(kg, tmp_path: Path):
     result = build_kg_html(kg, out)  # provenance=None default
     assert result.n_active_nodes == 0
     assert out.is_file()
+
+
+def test_build_kg_html_tolerates_dangling_edge(tmp_path: Path):
+    """A DANGLING edge (an edge referencing a node that was never persisted — e.g. an
+    unhealed `failure:…` stub) must NOT crash the viz. pyvis's add_edge asserts the
+    endpoint node exists, which used to 500 the whole live graph.html; the renderer now
+    skips the un-drawable edge and renders the consistent subgraph."""
+    store = SculptorKG(tmp_path / "kg.db")
+    p = Paper(id=make_paper_id("2000.00001"), arxiv_id="2000.00001",
+              title="Paper", authors=["A"], year=2020, abstract="x")
+    t = Technique(id=make_technique_id("good_tech"), name="good_tech",
+                  description="present node", tags=[])
+    store.add_node(p)
+    store.add_node(t)
+    store.add_edge(Edge(src=p.id, dst=t.id, relation=Relation.INTRODUCES, data={}))
+    # a DANGLING edge: dst node id was never added to the store.
+    store.add_edge(Edge(src=t.id, dst=make_failure_mode_id("reward-saturation"),
+                        relation=Relation.ADDRESSES, data={}))
+
+    out = tmp_path / "kg.html"
+    res = build_kg_html(store, out)                 # must NOT raise
+    assert out.is_file() and out.stat().st_size > 1000
+    assert res.n_nodes == 2
+    assert res.n_edges == 1                          # the dangling edge was skipped

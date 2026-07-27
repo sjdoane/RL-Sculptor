@@ -49,7 +49,8 @@ def test_builtins_pass_all_axioms(builtin):
     never trip their own L1 axioms (cartpole reads only behavior, so its
     perturbations are inert → vacuously passes)."""
     fam = {"g1_kick": "kick", "g1_floss": "floss", "g1_jump": "jump",
-           "go1_trot": "locomotion", "cartpole_balance": "cartpole"}[builtin]
+           "go1_trot": "locomotion", "cartpole_balance": "cartpole",
+           "object_lift_hold": "manipulation"}[builtin]
     res = check_metric_axioms(_SPEC_FNS[builtin], family=fam)
     assert res["ok"], (builtin, res["reasons"], res["details"])
 
@@ -200,6 +201,42 @@ def test_handstand_metric_not_false_rejected():
     res = _axioms(HANDSTAND, family=None)        # 'handstand' resolves to no family
     assert res["ok"], (res["reasons"], res["details"])
     assert res["axioms"]["uprightness_monotone"] is True
+
+
+# ── §LAW 13: M1 uprightness is scoped to an UPRIGHT torso target ──────
+
+
+def test_uprightness_axiom_scoped_to_upright_torso():
+    """The M1 sweep penalises a fall-rewarder as an UPRIGHT skill but is SKIPPED
+    for a horizontal target (flip/dive/roll) — the same metric that competently
+    rewards a horizontal torso must not be M1-rejected."""
+    fn, _ = _load(FALL_REWARDER)
+    upright = check_metric_axioms(fn, family="kick", torso_target="upright")
+    flip = check_metric_axioms(fn, family="kick", torso_target="horizontal")
+    assert upright["axioms"]["uprightness_monotone"] is False      # penalised when upright
+    assert "uprightness_monotone" not in flip["axioms"]            # skipped for a flip
+    assert flip["details"].get("uprightness_monotone_skipped")
+    assert not any("uprightness" in r for r in flip["reasons"])
+
+
+def test_resolve_torso_target_keywords():
+    from sculptor.eval.metric_validate import resolve_torso_target
+
+    assert resolve_torso_target("do a backflip") == "horizontal"
+    assert resolve_torso_target("dive forward and roll") == "horizontal"
+    assert resolve_torso_target("hold a handstand") == "any"
+    assert resolve_torso_target("kick forward with one leg") == "upright"
+    assert resolve_torso_target(None) == "upright"
+
+
+def test_validate_does_not_uprightness_reject_a_flip_goal():
+    """End-to-end through validate_generated_metric: a flip goal resolves
+    torso_target='horizontal', so the uprightness axiom never fires (the metric
+    may still fail OTHER gates, but not for holding a non-upright torso)."""
+    d = Path(tempfile.mkdtemp()); p = d / "m.py"; p.write_text(FALL_REWARDER)
+    v = validate_generated_metric(FALL_REWARDER, p, behavior_goal="do a backflip")
+    assert "uprightness_monotone" not in v["axioms"]["axioms"]
+    assert not any("uprightness" in r for r in v["axioms"]["reasons"])
 
 
 # ── determinism + validate integration ───────────────────────────────

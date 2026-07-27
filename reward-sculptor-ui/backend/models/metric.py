@@ -20,6 +20,10 @@ class GenerateMetricRequest(BaseModel):
 
     behavior_goal: Annotated[str, Field(min_length=4, max_length=500)]
     review: bool = True
+    #: §best-of-N: sample N candidates and keep the most-discriminating valid one
+    #: (1 → single-shot-with-retry, byte-identical to before). Bounded so a UI
+    #: typo can't fan out an unbounded number of ~1-2 min LLM calls.
+    n_candidates: Annotated[int, Field(ge=1, le=8)] = 1
     #: optional built-in metric to immediately calibrate against
     #: (earns steer-rights if Spearman >= threshold).
     calibrate_against: Optional[str] = None
@@ -39,6 +43,9 @@ class MetricSummary(BaseModel):
     gates: Optional[dict] = None
     reasons: Optional[list] = None
     archetype_scores: Optional[dict] = None
+    validator_basis: Optional[str] = None
+    abstract_objective_program: Optional[list[str]] = None
+    channel_catalog_hash: Optional[str] = None
     calibration: Optional[dict] = None
     source: Optional[str] = None
     recorded_at: Optional[str] = None

@@ -134,9 +134,30 @@ function prettyLabel(ev: RunEvent): string {
     case "iter_completed": return `iter_completed${iter} metric=${fmtNum(ev.primary_metric)} Δ=${fmtNum(ev.metric_delta)} failure_modes=${JSON.stringify(ev.failure_modes ?? [])}`;
     case "metric_history": return `metric_history len=${Array.isArray(ev.history) ? (ev.history as unknown[]).length : "?"}`;
     // §Ship 34: objective fitness-in-the-loop.
-    case "iter_fitness": return `iter_fitness${iter} fitness=${fmtNum(ev.fitness)} best=${fmtNum(ev.best_so_far)} Δ=${fmtNum(ev.delta_vs_previous)}`;
+    case "iter_fitness": return `iter_fitness${iter} fitness=${fmtNum(ev.fitness)} prog=${fmtNum(ev.progress)} best=${fmtNum(ev.best_so_far)} Δ=${fmtNum(ev.delta_vs_previous)}`;
     case "best_reward_selected": return `best_reward_selected${iter} fitness=${fmtNum(ev.fitness)} reward=${String(ev.reward ?? "?")}`;
+    // §Ship 20: best-of-K reward edit. `selected` is a 0-based winner index.
+    case "edit_candidates_ranked": {
+      const n = (ev as { n?: number }).n;
+      const valid = (ev as { valid?: number }).valid;
+      const sel = (ev as { selected?: number }).selected;
+      return `best-of-K reward: evaluated ${n ?? "?"}, kept candidate ${typeof sel === "number" ? sel + 1 : "?"} (${valid ?? "?"} valid)`;
+    }
     case "fitness_metric_warning": return `⚠ fitness_metric_warning ${String(ev.message ?? "")}`;
+    // §Ship 20 (de-siloing): stage/mission persistence lifecycle.
+    case "stage_final_selection": {
+      const src = (ev as { source?: string }).source;
+      const pass = (ev as { criterion_pass?: boolean }).criterion_pass;
+      return `Kept iter ${ev.iter ?? "?"}${src ? ` (${src})` : ""} as the stage policy${typeof pass === "boolean" ? ` — criterion ${pass ? "passed" : "unmet"}` : ""}`;
+    }
+    case "mission_stage_archived":
+    case "mission_archived": {
+      const b = (ev as { total_bytes?: number }).total_bytes;
+      const mb = typeof b === "number" ? `${(b / 1_048_576).toFixed(1)} MB` : "?";
+      return `Saved to archive (${mb})`;
+    }
+    case "mission_archive_failed": return `Archive failed: ${String(ev.error ?? "")}`;
+    case "mission_saved": return "Mission saved";
     case "early_stop": return `early_stop at iter=${ev.at_iter ?? "?"} reason=${ev.reason ?? ""}`;
     case "run_started": return `run_started iterations=${ev.iterations} goal=${ev.behavior_goal ?? ""}`;
     case "run_completed": return `run_completed rc=${ev.return_code} iters=${ev.iterations_run}`;
@@ -182,7 +203,16 @@ const BADGE_STYLES: Record<string, string> = {
   // for the best-by-fitness pick (matches run_completed's success green).
   iter_fitness: "#1e1b3a|#a99cf0",
   best_reward_selected: "#16302a|#5fd0a0",
+  // §Ship 20: best-of-K reward selection — teal like the other edit events.
+  edit_candidates_ranked: "#13302c|#5fd0c0",
   fitness_metric_warning: "#3a2c12|#f0b35a",
+  // §Ship 20 (de-siloing): stage/mission persistence — green for the
+  // kept-policy selection + archive/save, rose for a failed archive.
+  stage_final_selection: "#16302a|#5fd0a0",
+  mission_stage_archived: "#16302a|#5fd0a0",
+  mission_archived: "#16302a|#5fd0a0",
+  mission_saved: "#16302a|#5fd0a0",
+  mission_archive_failed: "#3a1620|#f08aa6",
   // §Ship 23d: remote-dispatch lifecycle — teal for progress, amber for
   // degraded-but-recovering, rose for failures.
   remote_dispatch_started: "#13302c|#5fd0c0",
