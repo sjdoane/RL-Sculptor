@@ -878,6 +878,115 @@ _REFERENCE_KERNEL_GLOBALS = {
 }
 
 
+#: Sentinel standing in for an elided immutable table. Parses as a plain
+#: Name load, so the redacted module is still valid Python for the model to
+#: read — it is never imported or executed in this form.
+_ELIDED_TABLE_SENTINEL = "_REFERENCE_TABLE_UNCHANGED"
+
+#: Only elide tables big enough to matter. Below this the sentinel costs more
+#: attention than the literal it replaces.
+_ELIDE_MIN_BYTES = 512
+
+
+def _reference_table_blocks(
+    source: str, *, min_bytes: int = _ELIDE_MIN_BYTES,
+) -> "dict[str, tuple[int, int, str]]":
+    """Locate the large immutable `REFERENCE_*` assignments in `source`.
+
+    Returns name -> (start_line, end_line, exact_text), 1-indexed inclusive.
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return {}
+    lines = source.splitlines(keepends=True)
+    found: dict[str, tuple[int, int, str]] = {}
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            names = [t.id for t in node.targets if isinstance(t, ast.Name)]
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            names = [node.target.id]
+        else:
+            continue
+        end = getattr(node, "end_lineno", None)
+        if end is None:
+            continue
+        for name in names:
+            if not name.startswith("REFERENCE_"):
+                continue
+            text = "".join(lines[node.lineno - 1:end])
+            if len(text) >= min_bytes:
+                found[name] = (node.lineno, end, text)
+    return found
+
+
+def _elide_reference_tables(
+    source: str,
+) -> "tuple[str, dict[str, tuple[int, int, str]]]":
+    """Swap large immutable `REFERENCE_*` tables for a one-line sentinel.
+
+    The editor is contractually forbidden from changing these — both
+    `_reference_kernel_hash` and `REFERENCE_TARGET_SHA256` cover them — so
+    making a model retype ~10 KB of dense floats buys nothing and spends the
+    whole output budget doing it. A 6.92 s composed clip produced a 19752-byte
+    tracking base, 51 % of it float tables; the resulting 17956-token ceiling
+    truncated attempt 1, and the truncation reminder ("do not restate
+    unchanged code") then talked attempt 2 into dropping the kernel, so the
+    run died before iteration 1 with `immutable reference tracking kernel
+    changed`. Eliding removes both failure modes at once: the model cannot
+    corrupt what it never sees, and the module it must emit halves.
+    """
+    blocks = _reference_table_blocks(source)
+    if not blocks:
+        return source, {}
+    lines = source.splitlines(keepends=True)
+    # Replace bottom-up so earlier line numbers stay valid.
+    for name, (start, end, _text) in sorted(
+            blocks.items(), key=lambda kv: kv[1][0], reverse=True):
+        lines[start - 1:end] = [
+            f"{name} = {_ELIDED_TABLE_SENTINEL}  "
+            f"# elided verbatim — restored after the edit, do not reproduce\n"
+        ]
+    return "".join(lines), blocks
+
+
+def _restore_reference_tables(
+    source: str, blocks: "dict[str, tuple[int, int, str]]",
+) -> str:
+    """Splice the elided tables back into a model-emitted module.
+
+    Restores in place, so the parent's declaration order (tables before the
+    kernels that close over them) survives. A name the model dropped entirely
+    is left absent on purpose: `_reference_kernel_hash` already refuses that
+    module with a precise message, and silently re-appending would paper over
+    a real structural edit.
+    """
+    if not blocks:
+        return source
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return source
+    lines = source.splitlines(keepends=True)
+    targets: list[tuple[int, int, str]] = []
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            names = [t.id for t in node.targets if isinstance(t, ast.Name)]
+        elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+            names = [node.target.id]
+        else:
+            continue
+        end = getattr(node, "end_lineno", None)
+        if end is None:
+            continue
+        for name in names:
+            if name in blocks:
+                targets.append((node.lineno, end, blocks[name][2]))
+    for start, end, text in sorted(targets, key=lambda t: t[0], reverse=True):
+        lines[start - 1:end] = [text if text.endswith("\n") else text + "\n"]
+    return "".join(lines)
+
+
 def _reference_tracking_contract(mod) -> "dict[str, Any] | None":
     spec = getattr(mod, "REWARD_SPEC", {}) or {}
     composition = spec.get("composition") if isinstance(spec, dict) else None
@@ -1174,6 +1283,7 @@ def _build_user_prompt(
     citation_map: dict[str, str],
     applicable_edits: list[ProposedEdit],
     deferred_edits: list[ProposedEdit],
+    elided_table_names: "Iterable[str] | None" = None,
     training_feedback: dict | None = None,
     metric_observables: "frozenset[str] | None" = None,
     screen: Any = None,
@@ -1284,6 +1394,24 @@ def _build_user_prompt(
             screen if screen is not None else partition_gate.ScreenResult(),
         )
 
+    # The immutable reference tables are shown as one-line sentinels so the
+    # whole output budget goes to the residual instead of retyping dense
+    # floats. Say so explicitly — a model that "helpfully" reconstructs them
+    # would be overwritten anyway, but it would waste the ceiling doing it.
+    elided_block = ""
+    if elided_table_names:
+        names = ", ".join(sorted(elided_table_names))
+        elided_block = (
+            "# ELIDED_IMMUTABLE_TABLES\n"
+            f"These assignments are shown as `NAME = {_ELIDED_TABLE_SENTINEL}` "
+            "instead of their real values: "
+            f"{names}.\n"
+            "Reproduce each line EXACTLY as shown, sentinel and all. Their real "
+            "contents are spliced back in verbatim after you answer, and they "
+            "are hash-checked — you cannot change them, and any attempt to "
+            "write them out costs output budget you need for the residual.\n\n"
+        )
+
     # §2026-07-03 case-memory upgrade: the REWRITER is where "don't repeat
     # the same reward mistake" actually lands — the diagnoser proposes,
     # but the rewriter picks formulas + magnitudes. Same block the
@@ -1333,6 +1461,7 @@ def _build_user_prompt(
         f"{json.dumps(citation_map, indent=2, sort_keys=True)}\n\n"
         f"# PREVIOUS_REFERENCES (preserve entries whose term still exists)\n"
         f"{json.dumps(current_references, indent=2, sort_keys=True, default=str)}\n\n"
+        f"{elided_block}"
         f"# CURRENT_REWARD_SOURCE\n```python\n{current_source}\n```\n\n"
         f"Emit the new reward module source now."
     )
@@ -1393,11 +1522,19 @@ def _call_llm(
         # Say so, rather than letting the half-written module surface as a
         # baffling `SyntaxError: '(' was never closed`. Raised inside the
         # repair-retry loop's `try`, so the reminder reaches the next attempt.
+        # NB: this reminder must never suggest OMITTING code. It used to end
+        # "do not restate unchanged code you could have left alone", which on a
+        # reference-tracking module is a direct instruction to violate the
+        # immutable-kernel contract — attempt 2 obeyed it and died with
+        # "immutable reference tracking kernel changed". Budget is recovered by
+        # eliding the tables before the call, not by dropping code after it.
         raise EditValidationError(
             f"response was cut off at the {limit}-token ceiling — the module "
-            f"is incomplete, not wrong. Emit the SAME module more concisely: "
-            f"no commentary, short docstrings, and do not restate unchanged "
-            f"code you could have left alone.")
+            f"is incomplete, not wrong. Emit the SAME module again, complete, "
+            f"but more concisely: drop commentary and shorten docstrings. "
+            f"Every function, constant and table the parent defined must still "
+            f"be present; omitting or abbreviating any of them fails "
+            f"validation just as hard as truncation did.")
     out = _strip_markdown_fence("".join(chunks))
     if on_event is not None:
         on_event({
@@ -1687,15 +1824,32 @@ def apply_edits(
     try:
         current_module = _load_reward_module(current_reward_path)
         current_source = current_reward_path.read_text(encoding="utf-8")
-        # The model has to emit this whole module back, so the ceiling has to
-        # fit it. An explicit caller value still wins.
-        max_tokens = max_tokens or _rewrite_token_ceiling(current_source)
         current_version = _current_reward_version(current_module)
         current_references = _current_reward_references(current_module)
         parent_tracking = _reference_tracking_contract(current_module)
         parent_tracking_kernel_hash = (
             _reference_kernel_hash(current_source)
             if parent_tracking is not None else None)
+        # A reference-tracking parent carries immutable float tables the model
+        # must not touch. Show it a redacted module and splice them back after
+        # (see `_elide_reference_tables`); every hash below still covers the
+        # FULL parent, so nothing about the contract is weakened.
+        prompt_source, elided_tables = (
+            _elide_reference_tables(current_source)
+            if parent_tracking is not None else (current_source, {}))
+        if elided_tables and on_event is not None:
+            on_event({
+                "type": "log_line",
+                "text": (
+                    f"[edit] eliding {len(elided_tables)} immutable reference "
+                    f"table(s) from the rewrite "
+                    f"({len(current_source)}→{len(prompt_source)} bytes); "
+                    f"restored verbatim before validation"),
+            })
+        # The model has to emit this whole module back, so the ceiling has to
+        # fit what it actually emits — the redacted module. An explicit caller
+        # value still wins.
+        max_tokens = max_tokens or _rewrite_token_ceiling(prompt_source)
         parent_hash = hashlib.sha256(
             current_source.encode("utf-8")).hexdigest()[:16]
         # §Ship 54-pre (#12): parent hparam VALUES for the post-LLM partition
@@ -1862,7 +2016,8 @@ def apply_edits(
 
         # Build prompt.
         user_prompt = _build_user_prompt(
-            current_source=current_source,
+            current_source=prompt_source,
+            elided_table_names=sorted(elided_tables),
             current_version=current_version,
             current_references=current_references,
             new_version=new_iter_id,
@@ -1903,11 +2058,11 @@ def apply_edits(
                 rec: dict[str, Any] = {"index": ci, "valid": False,
                                        "hack_margin": None}
                 try:
-                    cand_source = _call_llm(
+                    cand_source = _restore_reference_tables(_call_llm(
                         client, _EDIT_SYSTEM, framed_prompt,
                         on_event=on_event, attempt=1,
                         max_tokens=max_tokens,
-                    )
+                    ), elided_tables)
                     rec["source"] = cand_source
                     rec["source_sha256"] = hashlib.sha256(
                         cand_source.encode("utf-8")).hexdigest()[:16]
@@ -1991,11 +2146,11 @@ def apply_edits(
                     + "\n\n## VALIDATION_ERRORS_ON_PREVIOUS_ATTEMPT\n"
                     + str(raise_after_retry)
                 )
-                new_source = _call_llm(
+                new_source = _restore_reference_tables(_call_llm(
                     client, _EDIT_SYSTEM, retry_user,
                     on_event=on_event, attempt=2,
                     max_tokens=max_tokens,
-                )
+                ), elided_tables)
                 _post_validate(
                     new_source, contract=reward_contract, kg_store=kg_store,
                     parent_hash=parent_hash, new_version=new_iter_id,
@@ -2025,11 +2180,11 @@ def apply_edits(
             attempt_prompt = user_prompt
             for attempt in range(1, max_retries + 2):
                 try:
-                    new_source = _call_llm(
+                    new_source = _restore_reference_tables(_call_llm(
                         client, _EDIT_SYSTEM, attempt_prompt,
                         on_event=on_event, attempt=attempt,
                         max_tokens=max_tokens,
-                    )
+                    ), elided_tables)
                     if on_event is not None:
                         on_event({
                             "type": "log_line",
