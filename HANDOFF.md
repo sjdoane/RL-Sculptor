@@ -373,3 +373,54 @@ only reason this failure was visible at all.
 `train/logs/model_*.pt` **survive a crash**. After the 2026-07-26 reboot the
 policy was recoverable and only needed rollout + scoring — do not restart a
 certification from zero without checking `tierD_work/train/logs/` first.
+
+### Paper corpus: full text is stored, but only partly *read*
+
+Audited all Paper nodes after OGMP (2403.04205) turned out to be missing from
+the KG entirely. State now:
+
+| check | result |
+|---|---|
+| Paper nodes | 167 |
+| stub titles (`arxiv:…`, from a rate-limited ingest) | 0 |
+| missing full text on disk | 0 |
+| abstract-sized only | 0 |
+| corpus | 11.9 MB, p50 63.7 KB/paper |
+
+So the sidecars under `~/.local/share/sculptor/kg/pdfs/*.txt` are real bodies,
+not abstracts. Two places consume them differently, and the difference matters:
+
+* **`kg/extract.py`** (mines Techniques / FailureModes / RewardComponents) reads
+  a bounded middle slice: skip 1000 chars, then `MAX_EXCERPT_CHARS = 28_000`.
+  Measured coverage across the corpus is **p10 26% / p50 45% / p90 82%, and
+  zero papers are read end-to-end.** The worst are the long ones —
+  `2405.15568` at 9%, `2401.16889` at 12%. Anything the authors put after the
+  ~28 K mark (most Results, Discussion, and appendix tables) never reached the
+  extractor. Not a bug, but it bounds what the KG can possibly know.
+* **`kg/query.py`** ranks papers by `paper_embed_text()` =
+  `title + abstract + rationale` (`query.py:512`). Retrieval never touches
+  `full_text_path` — grep it, there are no hits in `query.py`, `research.py`,
+  or `retrieval_log.py`. A paper whose body answers a question but whose
+  abstract does not mention the topic will rank poorly no matter how good the
+  body is.
+
+Neither is worth fixing blind. Re-extracting 167 papers at full length is a
+large LLM spend, and chunk-embedding bodies changes retrieval ranking
+everywhere — both want a deliberate decision, not a silent upgrade.
+
+**OGMP was ingested this session** (35,231 B body; metadata healed by hand
+because the arXiv API 429'd through all 5 retries — `heal_stub_titles()` in
+`kg/ingest.py:272` is the supported path once the API is reachable).
+
+Two things fall out of actually reading it that the abstract does not tell you:
+
+1. **The paper gives no explicit transition-guard equations.** Mode transitions
+   emerge implicitly from the learned policy. Our `sculptor/modes.py`
+   `Guard`/`predicate` formalization is therefore an **extension beyond** OGMP,
+   not a reproduction of it — describe it that way.
+2. **Its tracking reward weights orientation.** Eq. 8 is
+   `0.475·e^(−5‖er_p‖) + 0.475·e^(−5‖er_o‖)` — position and orientation at
+   equal weight, plus `0.05·e^(−0.01‖u_t‖) − 0.3·𝟙(non-toe contact)`. Our
+   Tier-D reward tracks joints + `root_z` only and **has no orientation term at
+   all**. That is a real gap against the reference method, and a candidate
+   explanation for residual tracking error independent of the floor fix above.
