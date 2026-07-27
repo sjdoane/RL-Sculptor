@@ -1,12 +1,15 @@
 import { useEffect, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { Icon } from "@/components/rs/icon";
 import { Btn } from "@/components/rs/primitives";
+import { ModeTimeline } from "@/components/ModeTimeline";
 import {
   ApiError,
   authorModeReward,
+  browseReferences,
   getJob,
   getReferenceModes,
-  listReferences,
+  listModeRewards,
   promoteModeReward,
   scaffoldModeReward,
   type ModeRewardResult,
@@ -56,6 +59,10 @@ export function ModeRewardPanel({
   const [log, setLog] = useState<string[]>([]);
   const [modeGoals, setModeGoals] = useState<Record<string, string>>({});
   const [promoted, setPromoted] = useState<number | null>(null);
+  const [resumed, setResumed] = useState(false);
+  const [confirmRescaffold, setConfirmRescaffold] = useState(false);
+  const [confirmPartial, setConfirmPartial] = useState(false);
+  const qc = useQueryClient();
 
   useEffect(() => {
     if (!clipId) {
@@ -68,6 +75,9 @@ export function ModeRewardPanel({
     setGraphError(null);
     setReward(null);
     setPromoted(null);
+    setResumed(false);
+    setConfirmRescaffold(false);
+    setConfirmPartial(false);
     getReferenceModes(clipId, robot)
       .then((g) => live && setGraph(g))
       .catch((e) =>
@@ -76,21 +86,58 @@ export function ModeRewardPanel({
           e instanceof ApiError ? e.message : "could not read this clip's modes",
         ),
       );
+    // Pick up any scaffold already on disk for this clip. Authoring progress
+    // used to live only in this component's state, so a reload showed a panel
+    // whose only button was "Scaffold reward" — which overwrote the very
+    // bodies the reload had hidden.
+    listModeRewards(slug)
+      .then((files) => {
+        if (!live) return;
+        const mine = files.find((f) => f.clip_id === clipId);
+        if (!mine) return;
+        setReward({
+          path: mine.path,
+          filename: mine.filename,
+          clip_id: mine.clip_id,
+          tracking: true,
+          modes: mine.modes,
+          unauthored: mine.unauthored,
+        });
+        setResumed(true);
+      })
+      .catch(() => {/* no scaffold yet is the normal first-visit case */});
     return () => {
       live = false;
     };
-  }, [clipId, robot]);
+  }, [clipId, robot, slug]);
 
   async function runSearch() {
     setSearching(true);
     try {
-      setHits(await listReferences({ robot, q: query, k: 8 }));
+      // Browse, not semantic search: a composite you just made is found by
+      // its own name, and `listReferences` capped that at the ten
+      // alphabetically-first clips of ~6000.
+      const r = await browseReferences({ robot, q: query, limit: 8 });
+      setHits(r.rows as RefIndexRow[]);
     } catch {
       setHits([]);
     } finally {
       setSearching(false);
     }
   }
+
+  // Surfaced whenever there is no query yet, so the panel opens on the
+  // composites instead of an empty box the user has to guess at.
+  useEffect(() => {
+    if (clipId || hits !== null) return;
+    let live = true;
+    browseReferences({ robot, composed: true, limit: 8 })
+      .then((r) => live && setHits(r.rows as RefIndexRow[]))
+      .catch(() => {});
+    return () => {
+      live = false;
+    };
+  }, [clipId, hits, robot]);
 
   const picker = (
     <div style={{ marginTop: 10 }}>
@@ -176,20 +223,40 @@ export function ModeRewardPanel({
   );
   const doneCount = authored.size;
 
-  async function onScaffold() {
+  async function onScaffold(overwrite = false) {
     setBusy("scaffold");
     setError(null);
     try {
+      // `overwrite` defaults to FALSE. It used to be hardcoded true, which
+      // defeated the backend's deliberate 409 and silently discarded every
+      // authored mode body on a second click.
       const r = await scaffoldModeReward(slug, clipId, {
         robot,
         goal,
         tracking: true,
-        overwrite: true,
+        overwrite,
       });
       setReward(r);
       setPromoted(null);
+      setResumed(false);
+      setConfirmRescaffold(false);
       setLog((l) => [...l, `scaffolded ${r.filename} — ${r.modes.length} modes`]);
     } catch (e) {
+      if (e instanceof ApiError && e.status === 409) {
+        // Reload what is actually there rather than reporting a conflict the
+        // user can do nothing about.
+        const files = await listModeRewards(slug).catch(() => []);
+        const mine = files.find((f) => f.clip_id === clipId);
+        if (mine) {
+          setReward({
+            path: mine.path, filename: mine.filename, clip_id: mine.clip_id,
+            tracking: true, modes: mine.modes, unauthored: mine.unauthored,
+          });
+          setResumed(true);
+          setLog((l) => [...l, `found existing ${mine.filename} — resumed`]);
+          return;
+        }
+      }
       setError(e instanceof ApiError ? e.message : String(e));
     } finally {
       setBusy(null);
@@ -266,6 +333,13 @@ export function ModeRewardPanel({
         allow_unauthored: allowUnauthored,
       });
       setPromoted(r.version);
+      setConfirmPartial(false);
+      // The Rewards tab reads the version chain through react-query; without
+      // this the new v<n>.py did not appear until a manual reload, which read
+      // as "promote did nothing".
+      qc.invalidateQueries({ queryKey: ["rewards", slug] });
+      qc.invalidateQueries({ queryKey: ["project", slug] });
+      qc.invalidateQueries({ queryKey: ["modeRewards", slug] });
       setLog((l) => [
         ...l,
         `promoted ${r.source_filename} → v${r.version}.py (current.py now points at it)`,
@@ -296,9 +370,26 @@ export function ModeRewardPanel({
         one mode's terms per call.
       </div>
 
+      {/* The same timeline the compose dialog showed. It was built once,
+          rendered once, and then thrown away — this is the screen where
+          "which slice am I authoring" actually matters. */}
+      <div style={{ marginBottom: 12 }}>
+        <ModeTimeline graph={graph} />
+      </div>
+
+      {resumed && (
+        <div className="rs-banner" style={{ fontSize: 11.5, marginBottom: 10 }}>
+          <Icon name="history" size={14} />
+          <span className="rs-grow">
+            Resumed <code>{reward?.filename}</code> from disk — {doneCount} of{" "}
+            {reward?.modes.length} modes already authored.
+          </span>
+        </div>
+      )}
+
       {!reward && (
         <Btn kind="primary" size="sm" icon="layers"
-             disabled={busy !== null} onClick={onScaffold}>
+             disabled={busy !== null} onClick={() => onScaffold(false)}>
           {busy === "scaffold" ? "Scaffolding…" : "Scaffold reward"}
         </Btn>
       )}
@@ -357,6 +448,12 @@ export function ModeRewardPanel({
                 Promoted to <b>v{promoted}.py</b> — a run will train this
                 reward.
               </>
+            ) : confirmPartial ? (
+              <>
+                <b>{reward.unauthored.join(", ") || "Some modes"}</b>{" "}
+                {reward.unauthored.length === 1 ? "is" : "are"} still a stub —
+                that slice of every episode pays exactly zero. Promote anyway?
+              </>
             ) : doneCount < reward.modes.length ? (
               <>
                 {reward.modes.length - doneCount} mode(s) still pay nothing.
@@ -369,19 +466,70 @@ export function ModeRewardPanel({
               </>
             )}
           </div>
+          {confirmPartial && (
+            <Btn kind="quiet" size="sm"
+                 onClick={() => setConfirmPartial(false)}>
+              Cancel
+            </Btn>
+          )}
           <Btn
-            kind={doneCount === reward.modes.length ? "primary" : "ghost"}
+            kind={
+              confirmPartial
+                ? "danger"
+                : doneCount === reward.modes.length
+                  ? "primary"
+                  : "ghost"
+            }
             size="sm"
             icon="check-circle"
             disabled={busy !== null || promoted !== null}
-            onClick={() => onPromote(doneCount < reward.modes.length)}
+            onClick={() => {
+              // `allow_unauthored` used to be passed automatically whenever a
+              // mode was unauthored, which turned the backend's explicit
+              // opt-in into a silent default — the refusal the user is
+              // supposed to see never happened.
+              if (doneCount < reward.modes.length && !confirmPartial) {
+                setConfirmPartial(true);
+                return;
+              }
+              onPromote(doneCount < reward.modes.length);
+            }}
           >
             {busy === "promote"
               ? "Promoting…"
               : promoted !== null
                 ? `Training v${promoted}`
-                : "Use for training"}
+                : confirmPartial
+                  ? "Promote incomplete"
+                  : "Use for training"}
           </Btn>
+        </div>
+      )}
+
+      {reward && promoted === null && (
+        <div className="rs-flex rs-gap-8" style={{ marginTop: 8 }}>
+          <span className="rs-grow" />
+          {confirmRescaffold ? (
+            <>
+              <span className="rs-sub" style={{ fontSize: 10.5 }}>
+                Re-scaffolding discards all {doneCount} authored{" "}
+                {doneCount === 1 ? "body" : "bodies"}.
+              </span>
+              <Btn kind="quiet" size="sm"
+                   onClick={() => setConfirmRescaffold(false)}>
+                Cancel
+              </Btn>
+              <Btn kind="danger" size="sm" disabled={busy !== null}
+                   onClick={() => onScaffold(true)}>
+                Discard and re-scaffold
+              </Btn>
+            </>
+          ) : (
+            <Btn kind="quiet" size="sm" icon="refresh-cw" disabled={busy !== null}
+                 onClick={() => setConfirmRescaffold(true)}>
+              Re-scaffold
+            </Btn>
+          )}
         </div>
       )}
 

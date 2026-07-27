@@ -30,6 +30,7 @@ same v1 surface, just by passing `?robot=t1` — no route change needed.
 
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
 from typing import Any, Optional
@@ -117,14 +118,21 @@ def _clip_dir_for(clip_id: str, robot: str) -> Path:
 def list_or_search_references(
     robot: str = "g1",
     q: Optional[str] = Query(default=None),
-    k: int = Query(default=10, ge=1, le=100),
+    k: int = Query(default=10, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     llm: int = Query(default=0),
 ) -> Any:
     """`q` present → deterministic-by-default search via
     `sculptor.refs.retrieve.search` (§decision 11: `llm=0/1` query
     param controls `use_llm`, default OFF for the UI's as-you-type
     path — an LLM rerank on every keystroke would be slow and costly).
-    `q` absent → the full slim index listing, filtered to `robot`."""
+    `q` absent → the slim index listing, filtered to `robot`.
+
+    Still list-shaped, because the typeahead callers depend on that. Use
+    `GET /references/browse` for the paginated, faceted library view — this
+    endpoint's `k=10` default silently made a ~6000-clip library look like
+    ten alphabetically-first clips, and a freshly composed motion unfindable
+    except by typing its id back into a semantic search box."""
     from sculptor.refs import library, retrieve
 
     if q is not None and q.strip():
@@ -147,7 +155,126 @@ def list_or_search_references(
         ]
 
     rows = [r for r in library.read_index() if r.get("robot") == robot]
+    if offset:
+        rows = rows[offset:]
     return rows[:k] if k else rows
+
+
+@router.get("/references/browse")
+def browse_references(
+    robot: str = "g1",
+    q: Optional[str] = Query(default=None),
+    label: Optional[str] = Query(default=None),
+    tier: Optional[str] = Query(default=None),
+    composed: Optional[bool] = Query(default=None),
+    min_duration_s: Optional[float] = Query(default=None),
+    max_duration_s: Optional[float] = Query(default=None),
+    sort: str = Query(default="recent"),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+) -> Any:
+    """The library, paginated, with the facet counts needed to navigate it.
+
+    `q` here is a plain substring filter over id, text and labels —
+    deliberately NOT the embedding search. Browsing wants "show me everything
+    matching, in a stable order, with a total", and semantic retrieval gives
+    neither a total nor a stable page boundary. `/references?q=` remains the
+    semantic path, and the two are complementary: search when you know what
+    the motion looks like, browse when you want to see what exists.
+    """
+    from sculptor.refs import library
+
+    #: The slim index is an append-only JSONL, so file order IS registration
+    #: order. That is the only recency signal there is — no row carries a
+    #: timestamp — and it is exactly what "show me the clip I just composed"
+    #: needs.
+    all_rows = library.read_index()
+    rows = [dict(r, _seq=i) for i, r in enumerate(all_rows)
+            if r.get("robot") == robot]
+
+    def _is_composed(r: dict) -> bool:
+        return "composed" in (r.get("labels") or [])
+
+    facets = {
+        "tiers": _counts(rows, lambda r: str(r.get("tier") or "?")),
+        "labels": _label_counts(rows),
+        "composed": sum(1 for r in rows if _is_composed(r)),
+        "total": len(rows),
+    }
+
+    if q and q.strip():
+        # AND over whitespace tokens against a normalized haystack. A plain
+        # substring match found nothing for "balance beam", because the ids
+        # are `balance_on_beam03_poses_100_jpos` — the separator, not the
+        # words, was the mismatch.
+        tokens = [t for t in _normalize(q).split() if t]
+        rows = [r for r in rows if all(t in _haystack(r) for t in tokens)]
+    if label:
+        rows = [r for r in rows if label in (r.get("labels") or [])]
+    if tier:
+        rows = [r for r in rows if str(r.get("tier") or "") == tier]
+    if composed is not None:
+        rows = [r for r in rows if _is_composed(r) is composed]
+    if min_duration_s is not None:
+        rows = [r for r in rows
+                if float(r.get("duration_s") or 0) >= min_duration_s]
+    if max_duration_s is not None:
+        rows = [r for r in rows
+                if float(r.get("duration_s") or 0) <= max_duration_s]
+
+    if sort == "duration":
+        rows.sort(key=lambda r: float(r.get("duration_s") or 0), reverse=True)
+    elif sort == "name":
+        rows.sort(key=lambda r: str(r.get("clip_id", "")))
+    else:
+        # "recent" puts composites first, then newest registration. The bulk
+        # corpus was appended after the composites, so a pure recency sort
+        # buries the clip you just made under 6000 corpus rows — which is the
+        # single thing this sort exists to surface.
+        rows.sort(key=lambda r: (_is_composed(r), r["_seq"]), reverse=True)
+
+    total = len(rows)
+    page = []
+    for r in rows[offset:offset + limit]:
+        r = dict(r)
+        r.pop("_seq", None)
+        r["composed"] = _is_composed(r)
+        page.append(r)
+    return {
+        "rows": page,
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "robot": robot,
+        "facets": facets,
+    }
+
+
+def _normalize(s: str) -> str:
+    """Lowercase, and treat `_`/`-`/`.` as word breaks."""
+    return re.sub(r"[^a-z0-9]+", " ", str(s).lower())
+
+
+def _haystack(row: dict) -> str:
+    parts = [row.get("clip_id", ""), row.get("text", "")]
+    parts.extend(str(x) for x in (row.get("labels") or []))
+    return _normalize(" ".join(str(p) for p in parts))
+
+
+def _counts(rows: list[dict], key) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for r in rows:
+        out[key(r)] = out.get(key(r), 0) + 1
+    return dict(sorted(out.items(), key=lambda kv: -kv[1]))
+
+
+def _label_counts(rows: list[dict], *, top: int = 24) -> dict[str, int]:
+    out: dict[str, int] = {}
+    for r in rows:
+        for lab in (r.get("labels") or []):
+            out[str(lab)] = out.get(str(lab), 0) + 1
+    ranked = sorted(out.items(), key=lambda kv: (-kv[1], kv[0]))
+    return dict(ranked[:top])
 
 
 # ── POST /references/compose ─────────────────────────────────────────
@@ -659,6 +786,94 @@ def _chain_name(stem: str, mode_name: str) -> str:
     if m:
         return f"{m.group(1)}{int(m.group(2)) + 1}.py"
     return f"{stem}_{mode_ident(mode_name)}.py"
+
+
+@router.get(
+    "/projects/{slug}/mode-rewards",
+    responses={404: {"model": ProblemDetail}},
+)
+def list_mode_rewards(slug: str, request: Request) -> Any:
+    """Every `mode_reward_v*.py` on disk, with per-mode authored state.
+
+    These files were previously write-only. `reward_store._V_RE` matches
+    `^v(\\d+)\\.py$`, so they are invisible in the Rewards tab; there was no
+    endpoint to read them; and all authoring progress lived in one component's
+    `useState`. Reloading the page therefore showed a panel whose only button
+    was "Scaffold reward", which overwrote the very bodies the reload had
+    hidden. This is the read side that makes the panel resumable.
+    """
+    from sculptor.mode_rewards import authored_modes
+
+    store: ProjectStore = request.app.state.project_store
+    project_dir = _project_dir(store, slug)
+    if project_dir is None:
+        return _problem(
+            status.HTTP_404_NOT_FOUND, "project not found",
+            detail=f"no project with slug {slug!r}",
+            type_="/problems/not-found")
+
+    rewards_dir = project_dir / "rewards"
+    out: list[dict[str, Any]] = []
+    for path in sorted(rewards_dir.glob("mode_reward_v*.py")):
+        try:
+            source = path.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        authored = authored_modes(source)
+        if not authored:
+            continue
+        windows = _mode_windows_from_source(source)
+        clip_id = _spec_str_from_source(source, "reference_clip_id")
+        out.append({
+            "filename": path.name,
+            "path": str(path),
+            "clip_id": clip_id,
+            "mtime": path.stat().st_mtime,
+            "modes": [
+                {"name": name,
+                 "start_s": windows.get(name, (0.0, 0.0))[0],
+                 "end_s": windows.get(name, (0.0, 0.0))[1],
+                 "authored": bool(done)}
+                for name, done in authored.items()
+            ],
+            "unauthored": [n for n, done in authored.items() if not done],
+        })
+    out.sort(key=lambda r: r["mtime"], reverse=True)
+    return {"mode_rewards": out}
+
+
+def _mode_windows_from_source(source: str) -> dict[str, tuple[float, float]]:
+    """`MODE_WINDOWS_S` without importing the module.
+
+    Reading it by literal_eval keeps this endpoint side-effect free — the
+    module's top level builds numpy tables and we only want the windows.
+    """
+    m = re.search(r"^MODE_WINDOWS_S: dict = (\{.*?\n\})", source, re.M | re.S)
+    if not m:
+        return {}
+    try:
+        raw = ast.literal_eval(m.group(1))
+    except (ValueError, SyntaxError):
+        return {}
+    out: dict[str, tuple[float, float]] = {}
+    for name, span in (raw or {}).items():
+        try:
+            out[str(name)] = (float(span[0]), float(span[1]))
+        except (TypeError, ValueError, IndexError):
+            continue
+    return out
+
+
+def _spec_str_from_source(source: str, key: str) -> str:
+    m = re.search(rf'^\s*"{re.escape(key)}":\s*(".*?"|\'.*?\'|None),\s*$',
+                  source, re.M)
+    if not m:
+        return ""
+    try:
+        val = ast.literal_eval(m.group(1))
+    except (ValueError, SyntaxError):
+        return ""
+    return str(val) if isinstance(val, str) else ""
 
 
 @router.post(

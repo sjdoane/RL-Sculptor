@@ -585,6 +585,26 @@ def launch_run(
                 ),
                 type_="/problems/reference-motion",
             )
+        # `_prepare_reference_guided_run` (sculptor/sculpt.py) hard-raises
+        # without an authoritative world selection, because the tracking
+        # reward has to be bound to the world atomically. That raise happens
+        # at subprocess start, so the run appeared to launch and then died
+        # with a ValueError in the log. Say it here, before the GPU is
+        # touched, and say what to do about it.
+        if not selection_path.is_file():
+            return _problem(
+                status.HTTP_412_PRECONDITION_FAILED,
+                "a reference motion needs an authored world",
+                detail=(
+                    "attaching a reference clip makes this a tracking-first "
+                    "run, and the generated tracking reward is bound to the "
+                    "authored world atomically — so the project needs a "
+                    "promoted world first. Author one from the World tab "
+                    "(the default flat scene still needs promoting), or "
+                    "launch without a motion prior."
+                ),
+                type_="/problems/reference-motion",
+            )
     run_params: dict[str, Any] = body.model_dump()
     job = jobs.submit(
         kind="sculpt_run",

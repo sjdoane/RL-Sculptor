@@ -146,6 +146,15 @@ function ReadinessCell({
 //   - mjlab cartpole: 15 outer × 500 iters   = ~30 s/cycle GPU
 //   - mjlab Go1:     12 outer × 1000 iters   = ~90 s/cycle GPU
 //   - mjlab G1:       8 outer × 1500 iters   = ~3 min/cycle GPU
+// `String(undefined)` is the string "undefined", which is truthy, so the
+// `|| "cuda:0"` fallbacks below never fired for an mjlab project whose
+// adapter_config has no explicit device. The dialog then prefilled the literal
+// "undefined" and the launch 422'd on an unparseable device.
+function adapterDevice(project: ProjectDetail): string {
+  const d = project.adapter_config?.device;
+  return typeof d === "string" && d.trim() ? d.trim() : "";
+}
+
 function pickAdapterDefaults(project: ProjectDetail): {
   kind: "gym_sb3" | "mjlab_cartpole" | "mjlab_go1" | "mjlab_g1" | "mjlab_other";
   iterations: number;
@@ -175,7 +184,7 @@ function pickAdapterDefaults(project: ProjectDetail): {
       iterations: 15,
       training_iterations: 500,
       num_envs: Number(project.adapter_config?.num_envs) || 1024,
-      device: String(project.adapter_config?.device) || "cuda:0",
+      device: adapterDevice(project) || "cuda:0",
       training_label: "rsl_rl iters / cycle",
     };
   }
@@ -185,7 +194,7 @@ function pickAdapterDefaults(project: ProjectDetail): {
       iterations: 12,
       training_iterations: 1000,
       num_envs: Number(project.adapter_config?.num_envs) || 2048,
-      device: String(project.adapter_config?.device) || "cuda:0",
+      device: adapterDevice(project) || "cuda:0",
       training_label: "rsl_rl iters / cycle",
     };
   }
@@ -195,7 +204,7 @@ function pickAdapterDefaults(project: ProjectDetail): {
       iterations: 8,
       training_iterations: 1500,
       num_envs: Number(project.adapter_config?.num_envs) || 2048,
-      device: String(project.adapter_config?.device) || "cuda:0",
+      device: adapterDevice(project) || "cuda:0",
       training_label: "rsl_rl iters / cycle",
     };
   }
@@ -298,7 +307,6 @@ export function NewRunDialog({
   const [allowDefaultWorld, setAllowDefaultWorld] = useState(false);
   const [allowRobotMismatch, setAllowRobotMismatch] = useState(false);
   const [validatingLaunch, setValidatingLaunch] = useState(false);
-  const [expandKg, setExpandKg] = useState(false);
   // §Ship-7: rollout-video + RL knobs. Empty string = "leave blank →
   // use runner/config default".
   const [maxEpisodeSteps, setMaxEpisodeSteps] = useState<number | "">("");
@@ -334,6 +342,11 @@ export function NewRunDialog({
     open ? slug : undefined,
     !!worldSel.data,
   );
+  // A tracking-first run binds its generated reward to the authored world
+  // atomically, so `sculpt` refuses to start without a promoted selection.
+  // Block at the button rather than letting the run die in the subprocess.
+  const referenceNeedsWorld =
+    !!referenceClipId && worldSel.isFetched && !worldSel.data?.selection;
   const systemInfo = useSystemInfo();
   const gpuInfo = useSystemGpu();
   // §Ship 35: per-project generated metrics + the generate action.
@@ -533,7 +546,6 @@ export function NewRunDialog({
       num_envs_override:
         isMjlab && typeof numEnvs === "number" ? numEnvs : null,
       device_override: isMjlab ? device : null,
-      expand_kg: expandKg,
       // §Ship-7: only forward when set; null = runner / config default.
       max_episode_steps:
         typeof maxEpisodeSteps === "number" ? maxEpisodeSteps : null,
@@ -640,7 +652,15 @@ export function NewRunDialog({
           footer={
             <>
               <Btn kind="quiet" onClick={() => setOpen(false)} disabled={launchBusy}>Cancel</Btn>
-              <Btn kind="primary" icon={launchBusy ? "loader" : "play"} onClick={() => void submit()} disabled={launchBusy}>
+              <Btn
+                kind="primary"
+                icon={launchBusy ? "loader" : "play"}
+                onClick={() => void submit()}
+                disabled={launchBusy || referenceNeedsWorld}
+                title={referenceNeedsWorld
+                  ? "A motion prior requires a promoted authored world"
+                  : undefined}
+              >
                 {validatingLaunch ? "Verifying world…" : launch.isPending ? "Launching…" : "Launch"}
               </Btn>
             </>
@@ -878,6 +898,23 @@ export function NewRunDialog({
                       ? <><code className="mono">{referenceRobot}/{referenceClipId}</code> becomes the immutable tracking base; this goal can only add a bounded task residual.</>
                       : "Choose a retargeted clip to preserve its gait or pose sequence while the authored world and route RSI teach the novel task."}
                   </div>
+                  {/* A tracking-first run binds its generated reward to the
+                      authored world atomically and refuses to start without a
+                      promoted selection. That refusal used to happen inside
+                      the subprocess, so the run "launched" and then died. */}
+                  {referenceClipId && worldSel.isFetched && !worldSel.data?.selection && (
+                    <div
+                      style={{
+                        marginTop: 6, fontSize: 10.8, lineHeight: 1.45,
+                        color: "var(--st-amber)",
+                      }}
+                    >
+                      This project has no promoted world, and a motion prior
+                      requires one — the tracking reward is bound to the world
+                      atomically. Author and promote a world first, or clear
+                      the motion to launch without it.
+                    </div>
+                  )}
                 </div>
                 {referenceClipId && (
                   <Btn
@@ -1258,11 +1295,13 @@ export function NewRunDialog({
                   </div>
                 )}
 
-                <ToggleRow
-                  on={expandKg} onChange={setExpandKg} label="Expand knowledge graph"
-                  title={<><code className="mono">--expand-kg</code> · auto-research thin topics</>}
-                  desc="Claude researches thin topics before Stage-2 diagnose (Phase 2)"
-                />
+                {/* "Expand knowledge graph" used to live here, labelled
+                    `--expand-kg`. That flag does not exist in the CLI: the
+                    backend accepts the field and stores it on the job, and
+                    nothing ever reads it. A toggle that cannot change the run
+                    is worse than no toggle, so it is gone rather than
+                    disabled. Research a topic explicitly from the Knowledge
+                    tab instead. */}
                 <ToggleRow
                   on={noKg} onChange={setNoKg} label="No knowledge graph"
                   title={<><code className="mono">--no-kg</code> · ablation</>}

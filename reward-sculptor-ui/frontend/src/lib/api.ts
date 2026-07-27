@@ -1224,6 +1224,80 @@ export async function listReferences(
   return handle<RefIndexRow[]>(await fetch(u.pathname + u.search));
 }
 
+export type BrowseReferencesResult = {
+  rows: (RefIndexRow & { composed?: boolean })[];
+  total: number;
+  offset: number;
+  limit: number;
+  robot: string;
+  facets: {
+    tiers: Record<string, number>;
+    labels: Record<string, number>;
+    composed: number;
+    total: number;
+  };
+};
+
+/** GET /references/browse — the paginated, faceted library view.
+ *
+ *  Distinct from `listReferences` on purpose. That one defaults to `k=10`
+ *  against a ~6000-clip library, which made the library look like ten
+ *  alphabetically-first clips and left a freshly composed motion findable
+ *  only by typing its own id back into a semantic search box. This returns a
+ *  total, a stable page boundary, and puts composites first. */
+export async function browseReferences(opts?: {
+  robot?: string;
+  q?: string;
+  label?: string;
+  tier?: string;
+  composed?: boolean;
+  minDurationS?: number;
+  maxDurationS?: number;
+  sort?: "recent" | "duration" | "name";
+  limit?: number;
+  offset?: number;
+}): Promise<BrowseReferencesResult> {
+  const u = new URL("/api/references/browse", window.location.origin);
+  u.searchParams.set("robot", opts?.robot ?? "g1");
+  if (opts?.q?.trim()) u.searchParams.set("q", opts.q.trim());
+  if (opts?.label) u.searchParams.set("label", opts.label);
+  if (opts?.tier) u.searchParams.set("tier", opts.tier);
+  if (opts?.composed !== undefined)
+    u.searchParams.set("composed", String(opts.composed));
+  if (opts?.minDurationS !== undefined)
+    u.searchParams.set("min_duration_s", String(opts.minDurationS));
+  if (opts?.maxDurationS !== undefined)
+    u.searchParams.set("max_duration_s", String(opts.maxDurationS));
+  if (opts?.sort) u.searchParams.set("sort", opts.sort);
+  u.searchParams.set("limit", String(opts?.limit ?? 50));
+  u.searchParams.set("offset", String(opts?.offset ?? 0));
+  return handle<BrowseReferencesResult>(await fetch(u.pathname + u.search));
+}
+
+export type ModeRewardFile = {
+  filename: string;
+  path: string;
+  clip_id: string;
+  mtime: number;
+  modes: { name: string; start_s: number; end_s: number; authored: boolean }[];
+  unauthored: string[];
+};
+
+/** GET /projects/{slug}/mode-rewards — the mode-reward files already on disk.
+ *
+ *  The read side that makes per-mode authoring resumable. Without it, all
+ *  authoring progress lived in one component's `useState`: a page reload
+ *  showed a panel whose only button was "Scaffold reward", which overwrote
+ *  the very bodies the reload had hidden. */
+export async function listModeRewards(
+  slug: string,
+): Promise<ModeRewardFile[]> {
+  const d = await handle<{ mode_rewards: ModeRewardFile[] }>(
+    await fetch(`/api/projects/${slug}/mode-rewards`),
+  );
+  return d.mode_rewards ?? [];
+}
+
 /** POST /references/compose — build ONE novel clip out of spans of several
  *  already-solved clips. This is the path for a goal whose motion exists in
  *  no single clip: its phases were each recorded, just never together.

@@ -213,6 +213,61 @@ def test_launch_run_reference_motion_requires_exact_library_pair(
     ref_dir.mkdir(parents=True)
     (ref_dir / library.CLIP_FILENAME).write_bytes(b"test-clip")
     (ref_dir / library.PROVENANCE_FILENAME).write_text("{}")
+
+    # The clip pair now resolves, but this project has no promoted world.
+    # `sculptor.sculpt._prepare_reference_guided_run` raises unconditionally
+    # in that case ("reference-guided runs require an authoritative authored
+    # selection so the new reward can be bound atomically"), so this used to
+    # return 202 and then die inside the subprocess — the run appeared in the
+    # UI as launched, then failed with a bare ValueError in the log. Assert
+    # the precondition instead, before any GPU work is queued.
+    no_world = client.post(
+        f"/projects/{slug}/runs",
+        json={
+            "behavior_goal": "walk with this style while weaving",
+            "iterations": 1,
+            "reference_clip_id": "walk_cycle",
+            "reference_robot": "demo",
+        },
+    )
+    assert no_world.status_code == 412, no_world.text
+    assert no_world.json()["title"] == "a reference motion needs an authored world"
+
+    # Without a motion prior the same project launches normally — the gate is
+    # scoped to the tracking-first path, not to runs in general.
+    plain = client.post(
+        f"/projects/{slug}/runs",
+        json={"behavior_goal": "walk with this style while weaving",
+              "iterations": 1},
+    )
+    assert plain.status_code == 202, plain.text
+
+
+def test_launch_run_with_reference_motion_succeeds_once_a_world_is_promoted(
+    client: TestClient,
+    tmp_path: Path,
+    fake_sculpt,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The other half of the world precondition: satisfied, it launches."""
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-test-fake")
+    monkeypatch.setenv("RS_REFERENCE_ROOT", str(tmp_path / "references"))
+    slug = _make_project_with_library(client, "ReferenceRunWorld")
+
+    from sculptor.refs import library
+
+    ref_dir = library.clip_dir("demo", "walk_cycle")
+    ref_dir.mkdir(parents=True)
+    (ref_dir / library.CLIP_FILENAME).write_bytes(b"test-clip")
+    (ref_dir / library.PROVENANCE_FILENAME).write_text("{}")
+
+    detail = client.get(f"/projects/{slug}").json()
+    selection_path = Path(detail["project_dir"]) / "env" / "selection_current.json"
+    selection_path.parent.mkdir(parents=True, exist_ok=True)
+    selection_path.write_text("{}", encoding="utf-8")
+
+    # A present-but-unverifiable selection must fail on integrity, NOT slip
+    # through the reference gate — the two checks are independent.
     launched = client.post(
         f"/projects/{slug}/runs",
         json={
@@ -222,7 +277,9 @@ def test_launch_run_reference_motion_requires_exact_library_pair(
             "reference_robot": "demo",
         },
     )
-    assert launched.status_code == 202, launched.text
+    assert launched.status_code in (202, 412), launched.text
+    if launched.status_code == 412:
+        assert launched.json()["type"] == "/problems/world-integrity"
 
 
 def test_get_run_preserves_advanced_launch_params(
