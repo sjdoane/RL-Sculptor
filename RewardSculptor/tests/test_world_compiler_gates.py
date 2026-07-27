@@ -1323,3 +1323,151 @@ def test_constraint_budget_floor_exceeds_measured_peak():
     MEASURED_PEAK_NEFC = 625
     assert AUTHORED_WORLD_NJMAX >= 2 * MEASURED_PEAK_NEFC
     assert AUTHORED_WORLD_NCONMAX >= 256
+
+
+# ── route RSI must land the robot ON the course, not inside it ─────────
+def _reset_env(num_envs: int = 16):
+    """Fake env + robot for the route-RSI event, standing height 0.8 m."""
+    import torch
+
+    default = torch.zeros((num_envs, 13), dtype=torch.float32)
+    default[:, 2] = 0.8
+    default[:, 3] = 1.0
+
+    class FakeRobot:
+        is_fixed_base = False
+        data = SimpleNamespace(default_root_state=default)
+        written = None
+
+        def write_root_state_to_sim(self, root_state, env_ids=None):
+            self.written = root_state.clone()
+
+    class FakeScene(dict):
+        pass
+
+    robot = FakeRobot()
+    scene = FakeScene(robot=robot)
+    scene.env_origins = torch.zeros((num_envs, 3), dtype=torch.float32)
+    return SimpleNamespace(num_envs=num_envs, device="cpu", scene=scene), robot
+
+
+def test_surface_height_reads_the_top_of_the_box_underfoot():
+    """(x_min, x_max, y_min, y_max, top_z) rows; off the boxes the surface is
+    the plane, and overlapping boxes resolve to the highest."""
+    import torch
+
+    from sculptor.world.compiler import _surface_height_at
+
+    boxes = ((0.0, 1.0, -0.6, 0.6, 0.25), (0.5, 2.0, -0.6, 0.6, 0.40))
+    xy = torch.tensor([[0.2, 0.0], [0.7, 0.0], [1.5, 0.0], [5.0, 0.0],
+                       [0.2, 2.0]])
+    got = _surface_height_at(xy, boxes)
+
+    assert got.tolist() == pytest.approx([0.25, 0.40, 0.40, 0.0, 0.0])
+    assert _surface_height_at(xy, ()).tolist() == [0.0] * 5
+
+
+def test_route_rsi_stands_the_robot_on_the_platform_not_inside_it():
+    """The bug this closes: the event rewrote x and y and left z at the
+    flat-ground standing height, so every reset onto a platform drove the
+    robot's shins through the box by the box's own height. MuJoCo resolves the
+    interpenetration by pushing rather than erroring and the height observation
+    still reads plausibly, so nothing downstream notices."""
+    import torch
+
+    from sculptor.world.compiler import reset_robot_along_waypoint_route
+
+    # Three platforms of increasing height, waypoints at their centres.
+    boxes = ((1.5, 2.5, -0.6, 0.6, 0.20),
+             (3.0, 4.0, -0.6, 0.6, 0.35),
+             (4.5, 5.5, -0.6, 0.6, 0.50))
+    waypoints = ((2.0, 0.0, 0.10), (3.5, 0.0, 0.175), (5.0, 0.0, 0.25))
+
+    env, robot = _reset_env()
+    torch.manual_seed(11)
+    reset_robot_along_waypoint_route(
+        env, None, waypoints_m=waypoints, midroute_probability=1.0,
+        approach_distance_m=(0.05, 0.15), lateral_jitter_m=0.05,
+        support_boxes_m=boxes)
+
+    from sculptor.world.compiler import _surface_height_at
+    surface = _surface_height_at(robot.written[:, :2], boxes)
+    clearance = robot.written[:, 2] - surface
+    # Every robot stands its full default height above whatever is underfoot.
+    assert torch.allclose(clearance, torch.full_like(clearance, 0.8), atol=1e-5)
+    assert torch.any(surface > 0.0), "fixture must place some resets on a box"
+
+
+def test_route_rsi_leaves_plane_resets_at_the_default_height():
+    """A route point over open ground must not be lifted — the fix has to be
+    the surface under the robot, not a blanket offset."""
+    import torch
+
+    from sculptor.world.compiler import reset_robot_along_waypoint_route
+
+    waypoints = ((2.0, 0.0, 0.0), (3.5, 0.0, 0.0), (5.0, 0.0, 0.0))
+    env, robot = _reset_env()
+    torch.manual_seed(11)
+    reset_robot_along_waypoint_route(
+        env, None, waypoints_m=waypoints, midroute_probability=1.0,
+        approach_distance_m=(0.05, 0.15), lateral_jitter_m=0.05,
+        support_boxes_m=((10.0, 11.0, -0.6, 0.6, 0.5),))  # far from the route
+
+    assert torch.allclose(
+        robot.written[:, 2], torch.full((env.num_envs,), 0.8), atol=1e-6)
+
+
+def test_route_rsi_without_support_boxes_still_runs():
+    """Older callers pass no course; the event must keep working (at the
+    default height) rather than raise."""
+    import torch
+
+    from sculptor.world.compiler import reset_robot_along_waypoint_route
+
+    env, robot = _reset_env()
+    torch.manual_seed(3)
+    reset_robot_along_waypoint_route(
+        env, None, waypoints_m=((2.0, 0.0, 0.0), (3.5, 0.0, 0.0)),
+        midroute_probability=1.0, approach_distance_m=(0.25, 0.55),
+        lateral_jitter_m=0.12)
+
+    assert robot.written is not None
+    assert torch.allclose(
+        robot.written[:, 2], torch.full((env.num_envs,), 0.8), atol=1e-6)
+
+
+def test_installed_route_rsi_carries_the_course_geometry():
+    """The wiring, not just the function: the event as installed must receive
+    the platform tops, or the fix above never runs in a real training job."""
+    from sculptor.world.compiler import _reconcile_waypoint_course, resolve_course
+
+    world = _course_world(1.0, 1.1, 1.2, lead_gap_m=0.8)
+    course = resolve_course(world)
+    events: dict = {}
+    ranges = SimpleNamespace(
+        lin_vel_x=(-1.0, 1.0), lin_vel_y=(-1.0, 1.0),
+        ang_vel_z=(-1.5, 1.5), heading=None)
+    env_cfg = SimpleNamespace(
+        events=events,
+        commands={"twist": SimpleNamespace(
+            ranges=ranges, entity_name="robot", debug_vis=False)},
+        curriculum={})
+    manifest = SimpleNamespace(
+        course=course,
+        task_shared={"goal": {
+            "type": "waypoint_sequence", "waypoints": "auto",
+            "success": {"tolerance_m": 0.2, "hold_s": 0.0},
+        }},
+        zones={})
+
+    _reconcile_waypoint_course(env_cfg, manifest, train=True, robot=None)
+
+    term = events.get("world_route_state_initialization")
+    assert term is not None, "route RSI was not installed"
+    boxes = term.params["support_boxes_m"]
+    assert len(boxes) == len(course)
+    for (x0, x1, y0, y1, top), primitive in zip(boxes, course):
+        assert top == pytest.approx(
+            primitive.position_m[2] + primitive.size_m[2] / 2)
+        assert x1 - x0 == pytest.approx(primitive.size_m[0])
+        assert y1 - y0 == pytest.approx(primitive.size_m[1])

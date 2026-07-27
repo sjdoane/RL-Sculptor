@@ -2106,6 +2106,33 @@ def _reconcile_terrain_curriculum(env_cfg: Any) -> tuple[str, ...]:
     return tuple(removed)
 
 
+def _surface_height_at(
+    local_xy: Any, support_boxes_m: tuple[tuple[float, ...], ...],
+) -> Any:
+    """Top of the authored geometry under each env-local (x, y), else 0.
+
+    ``support_boxes_m`` rows are ``(x_min, x_max, y_min, y_max, top_z)`` in the
+    same env-local frame the route points use. Overlapping boxes resolve to the
+    highest, which is what a robot dropped from above would land on.
+    """
+    import torch
+
+    if not support_boxes_m:
+        return torch.zeros(
+            local_xy.shape[0], device=local_xy.device, dtype=local_xy.dtype)
+    boxes = torch.as_tensor(
+        support_boxes_m, device=local_xy.device, dtype=local_xy.dtype)
+    x, y = local_xy[:, 0:1], local_xy[:, 1:2]
+    over = (
+        (x >= boxes[None, :, 0]) & (x <= boxes[None, :, 1])
+        & (y >= boxes[None, :, 2]) & (y <= boxes[None, :, 3])
+    )
+    tops = torch.where(
+        over, boxes[None, :, 4].expand_as(over), torch.zeros_like(over,
+                                                                 dtype=x.dtype))
+    return tops.max(dim=1).values
+
+
 def reset_robot_along_waypoint_route(
     env: Any,
     env_ids: Any,
@@ -2115,6 +2142,7 @@ def reset_robot_along_waypoint_route(
     terminal_fraction_within_midroute: float = 0.0,
     approach_distance_m: tuple[float, float],
     lateral_jitter_m: float,
+    support_boxes_m: tuple[tuple[float, ...], ...] = (),
     asset_name: str = "robot",
 ) -> None:
     """Train-only route RSI in the same local frame as authored geometry.
@@ -2124,6 +2152,15 @@ def reset_robot_along_waypoint_route(
     pose and therefore preserve full-route learning.  The sampled logical route
     index is published once on ``env`` so command, reward, and metric runtimes
     all resume from the same state; evaluation never installs this event.
+
+    ``support_boxes_m`` is what the robot would be standing ON at each route
+    point.  Without it this event rewrote x and y and left z at the flat-ground
+    standing height, so every reset onto a platform put the robot's shins
+    through the box by the box's own height — measured at 11.6 cm on the
+    four-box course, on exactly the ``midroute_probability`` share of resets.
+    Nothing catches that downstream: MuJoCo resolves the interpenetration by
+    pushing rather than erroring, and the height observation reads plausibly
+    because the robot really is at standing height above the PLANE.
     """
     import torch
     from mjlab.utils.lab_api.math import quat_from_euler_xyz, quat_mul
@@ -2196,6 +2233,10 @@ def reset_robot_along_waypoint_route(
     root_state = robot.data.default_root_state[selected_env_ids].clone()
     root_state[:, :2] = (
         local_xy + env.scene.env_origins[selected_env_ids, :2])
+    # default_root_state's z is the standing height above FLAT ground. A route
+    # point on a platform is that much higher, so carry the surface up with it.
+    root_state[:, 2] = root_state[:, 2] + _surface_height_at(
+        local_xy, support_boxes_m)
     yaw = torch.atan2(direction[:, 1], direction[:, 0])
     zeros = torch.zeros_like(yaw)
     root_state[:, 3:7] = quat_mul(
@@ -2688,6 +2729,16 @@ def _reconcile_waypoint_course(
                     ),
                     "approach_distance_m": (0.25, 0.55),
                     "lateral_jitter_m": 0.12,
+                    "support_boxes_m": tuple(
+                        (
+                            primitive.position_m[0] - primitive.size_m[0] / 2,
+                            primitive.position_m[0] + primitive.size_m[0] / 2,
+                            primitive.position_m[1] - primitive.size_m[1] / 2,
+                            primitive.position_m[1] + primitive.size_m[1] / 2,
+                            primitive.position_m[2] + primitive.size_m[2] / 2,
+                        )
+                        for primitive in manifest.course
+                    ),
                     "asset_name": "robot",
                 },
             )

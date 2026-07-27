@@ -1461,3 +1461,71 @@ was 197k unread stderr lines.
 Tests: `tests/test_world_compiler_gates.py` (7, incl. a property test that no
 repeat at ±k·pitch may contain the origin) and `tests/test_mjlab_adapter.py`
 (4, incl. alpha-only and never-raises). Library suite 2578 passed.
+
+## §19 — the second burial: route RSI dropped the robot through the platforms
+
+Sam looked at the post-§18 frame and said the robot was "still inside of the
+box… everything below the knees is inside of the box." He was right again, and
+it is a second, independent bug — §18 fixed course-vs-course overlap between
+environments; this one is the robot vs. its OWN course.
+
+`reset_robot_along_waypoint_route` (train-only route RSI, `midroute_probability
+= 0.5`) did this:
+
+```python
+root_state = robot.data.default_root_state[selected_env_ids].clone()
+root_state[:, :2] = local_xy + env.scene.env_origins[selected_env_ids, :2]
+```
+
+It rewrites **x and y only**. `z` stays at `default_root_state`'s value — the
+standing height above FLAT ground. But the route waypoints are the course
+primitives' centres, i.e. points on top of platforms 0.23–0.38 m tall. So every
+mid-route reset put the robot at plane height over a box and its shins ended up
+inside by exactly the box's own height.
+
+Measured on the real world, 32 envs, at reset:
+
+| | envs with a robot geom inside a box | worst penetration |
+|---|---|---|
+| before | **17 / 32** | 11.6 cm (`left_shin_collision`) |
+| after | **0 / 32** | — |
+
+17/32 ≈ 53% matches `midroute_probability = 0.5`: the half that reset at the
+course entrance were always fine, which is why nothing looked wrong half the
+time. Rendered check, pelvis vs. box top:
+
+| | pelvis z | box top | clearance |
+|---|---|---|---|
+| before | 0.680 m | 0.330 m | +0.350 m (needs 0.680) |
+| after | 1.059 m | 0.380 m | **+0.680 m** |
+
+0.680 m is the G1's standing pelvis height, and it now holds across every
+platform height in the course (0.281 / 0.330 / 0.380).
+
+### The fix
+
+`_surface_height_at(local_xy, support_boxes_m)` returns the top of whatever
+authored geometry is under each reset point (0 for open ground, the highest top
+where boxes overlap), and the reset adds it to the default standing height.
+`_reconcile_waypoint_course` now passes the course as
+`(x_min, x_max, y_min, y_max, top_z)` rows when it installs the event, so the
+wiring is covered too — the function being right is useless if the params never
+arrive.
+
+### Why it stayed invisible
+
+Same family of silences as §18, plus one worse: the **root height observation
+reads plausibly**. The robot really is at standing height above the plane; it
+is only wrong relative to the surface it is supposed to be standing on. Nothing
+in the observation vector distinguishes "standing on a 0.33 m box" from
+"buried 0.33 m in a 0.33 m box." Neither did I, until Sam looked at the picture
+— my own check tested the env ORIGIN point rather than the robot's geoms, which
+is a different question and passed while the bug was live.
+
+**Lesson worth keeping:** when checking a geometric invariant, test the thing
+that has to satisfy it (every robot collision geom), not a proxy for it (a
+point near where the robot ought to be).
+
+Tests: 6 in `tests/test_world_compiler_gates.py` — surface lookup incl.
+overlapping boxes and off-course points, full-clearance-on-every-platform,
+plane resets NOT lifted, back-compat with no course, and the install wiring.
