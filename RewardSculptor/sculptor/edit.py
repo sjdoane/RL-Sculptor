@@ -887,11 +887,17 @@ _ELIDED_TABLE_SENTINEL = "_REFERENCE_TABLE_UNCHANGED"
 #: attention than the literal it replaces.
 _ELIDE_MIN_BYTES = 512
 
+#: `REFERENCE_*` is the flat tracking base's naming; a per-mode reward calls
+#: the same immutable arrays `TARGET_*` (see `mode_rewards._scaffold`). Both
+#: are dense float tables the editor may not change, so both get elided.
+_ELIDE_PREFIXES = ("REFERENCE_", "TARGET_")
+
 
 def _reference_table_blocks(
     source: str, *, min_bytes: int = _ELIDE_MIN_BYTES,
+    prefixes: "tuple[str, ...]" = _ELIDE_PREFIXES,
 ) -> "dict[str, tuple[int, int, str]]":
-    """Locate the large immutable `REFERENCE_*` assignments in `source`.
+    """Locate the large immutable table assignments in `source`.
 
     Returns name -> (start_line, end_line, exact_text), 1-indexed inclusive.
     """
@@ -912,7 +918,7 @@ def _reference_table_blocks(
         if end is None:
             continue
         for name in names:
-            if not name.startswith("REFERENCE_"):
+            if not name.startswith(prefixes):
                 continue
             text = "".join(lines[node.lineno - 1:end])
             if len(text) >= min_bytes:
@@ -994,6 +1000,90 @@ def _reference_tracking_contract(mod) -> "dict[str, Any] | None":
             or composition.get("type") != "reference_tracking_residual"):
         return None
     return dict(composition)
+
+
+def _mode_reward_contract(mod) -> "dict[str, Any] | None":
+    """Capture the mode automaton a per-mode reward was scaffolded from.
+
+    Returns None for an ordinary flat reward, so nothing about the old
+    single-function path changes.
+
+    A promoted per-mode reward reaches `apply_edits` as plain source with
+    every reference-tracking guard switched off: its spec has no
+    `composition` key, its arrays are `TARGET_*` not `REFERENCE_*`, and its
+    kernels are named `_phase_index`/`_tracking`, none of which appear in
+    `_REFERENCE_KERNEL_FUNCTIONS`. So the diagnose-and-edit loop was free to
+    drop a mode, shift a window, or collapse the dispatch to one flat
+    function and still pass every gate — the mode whose terms stopped being
+    paid would simply never be paid again, silently. `mode_rewards.
+    validate_mode_reward_source` already catches exactly this; it was just
+    never wired into the editor.
+    """
+    order = getattr(mod, "MODE_ORDER", None)
+    windows = getattr(mod, "MODE_WINDOWS_S", None)
+    if not isinstance(order, list) or not order or not isinstance(windows, dict):
+        return None
+    parsed: dict[str, list[float]] = {}
+    for name, span in windows.items():
+        try:
+            lo, hi = span
+            parsed[str(name)] = [float(lo), float(hi)]
+        except (TypeError, ValueError):
+            return None
+    if not parsed:
+        return None
+    return {"order": [str(n) for n in order], "windows": parsed}
+
+
+def _validate_mode_reward_contract(*, mod, source: str,
+                                   parent: "dict[str, Any]") -> None:
+    """The mode automaton is structure, not tuning — an edit may not move it.
+
+    Deliberately narrow: it fixes the set of modes, their order and their
+    time windows, and requires the dispatch to still be there. Everything
+    inside a `_mode_*` body stays fully editable, which is the whole point
+    of running diagnose-and-edit on a per-mode reward.
+    """
+    child = _mode_reward_contract(mod)
+    if child is None:
+        raise EditValidationError(
+            "parent reward is per-mode (it defines MODE_ORDER and "
+            "MODE_WINDOWS_S) but the rewrite dropped them — the mode "
+            "dispatch is structure, not tuning. Emit the same modes, in the "
+            "same order, with the same windows, and edit only the "
+            "`_mode_*` bodies.")
+
+    if child["order"] != parent["order"]:
+        raise EditValidationError(
+            f"MODE_ORDER changed: expected {parent['order']} but got "
+            f"{child['order']}. Adding, removing or reordering a mode "
+            f"changes which slice of the motion each reward is paid for.")
+
+    for name, span in parent["windows"].items():
+        got = child["windows"].get(name)
+        if got is None:
+            raise EditValidationError(
+                f"MODE_WINDOWS_S lost mode {name!r}; its share of every "
+                f"episode would pay zero reward")
+        if abs(got[0] - span[0]) > 1e-9 or abs(got[1] - span[1]) > 1e-9:
+            raise EditValidationError(
+                f"MODE_WINDOWS_S[{name!r}] moved from {span} to {got}. The "
+                f"windows come from the composition seams; shifting them "
+                f"desynchronizes the reward from the reference clip.")
+
+    for fn in ("compute_reward", "compute_reward_batched"):
+        if not callable(getattr(mod, fn, None)):
+            raise EditValidationError(f"per-mode reward lost {fn}")
+    for table in ("_MODE_FNS", "_MODE_FNS_BATCHED"):
+        fns = getattr(mod, table, None)
+        if not isinstance(fns, dict):
+            raise EditValidationError(
+                f"per-mode reward lost its {table} dispatch table")
+        missing = [n for n in parent["order"] if n not in fns]
+        if missing:
+            raise EditValidationError(
+                f"{table} has no entry for mode(s) {missing} — those modes "
+                f"would raise at runtime or pay nothing")
 
 
 def _reference_kernel_hash(source: str) -> "str | None":
@@ -1284,6 +1374,7 @@ def _build_user_prompt(
     applicable_edits: list[ProposedEdit],
     deferred_edits: list[ProposedEdit],
     elided_table_names: "Iterable[str] | None" = None,
+    parent_modes: "dict[str, Any] | None" = None,
     training_feedback: dict | None = None,
     metric_observables: "frozenset[str] | None" = None,
     screen: Any = None,
@@ -1412,6 +1503,33 @@ def _build_user_prompt(
             "write them out costs output budget you need for the residual.\n\n"
         )
 
+    # A per-mode reward is an automaton, not one function. Nothing in this
+    # prompt used to say so, and `expected_components` is None on every
+    # adapter, so a rewrite that collapsed the dispatch passed every gate.
+    modes_block = ""
+    if parent_modes:
+        rows = "\n".join(
+            f"  - {name}: {parent_modes['windows'][name][0]:.2f}"
+            f"–{parent_modes['windows'][name][1]:.2f} s"
+            for name in parent_modes["order"]
+            if name in parent_modes["windows"])
+        modes_block = (
+            "# PER_MODE_STRUCTURE (FROZEN)\n"
+            "This reward is split into OGMP modes whose windows come from the "
+            "seams of a composed reference motion:\n"
+            f"{rows}\n"
+            "`MODE_ORDER`, `MODE_WINDOWS_S`, `_mode_masks`, `_MODE_FNS`, "
+            "`_MODE_FNS_BATCHED` and both `compute_reward*` dispatchers are "
+            "STRUCTURE: emit them back unchanged. Adding, removing, renaming "
+            "or reordering a mode, or moving a window, is rejected — it would "
+            "desynchronize the reward from the reference clip and silently "
+            "stop paying some slice of every episode.\n"
+            "Make your changes INSIDE the `_mode_*` bodies. That is where all "
+            "the tuning lives, and each body is paid only during its own "
+            "window, so a fix aimed at one phase belongs in that phase's "
+            "function and nowhere else.\n\n"
+        )
+
     # §2026-07-03 case-memory upgrade: the REWRITER is where "don't repeat
     # the same reward mistake" actually lands — the diagnoser proposes,
     # but the rewriter picks formulas + magnitudes. Same block the
@@ -1461,6 +1579,7 @@ def _build_user_prompt(
         f"{json.dumps(citation_map, indent=2, sort_keys=True)}\n\n"
         f"# PREVIOUS_REFERENCES (preserve entries whose term still exists)\n"
         f"{json.dumps(current_references, indent=2, sort_keys=True, default=str)}\n\n"
+        f"{modes_block}"
         f"{elided_block}"
         f"# CURRENT_REWARD_SOURCE\n```python\n{current_source}\n```\n\n"
         f"Emit the new reward module source now."
@@ -1552,6 +1671,7 @@ def _post_validate(new_source: str, *, contract, kg_store: SculptorKG,
                    parent_hparams: "dict[str, Any] | None" = None,
                    parent_tracking: "dict[str, Any] | None" = None,
                    parent_tracking_kernel_hash: "str | None" = None,
+                   parent_modes: "dict[str, Any] | None" = None,
                    metric_observables: "frozenset[str] | None" = None,
                    replay_inputs=None,
                    replay_parent: "dict | None" = None,
@@ -1672,6 +1792,13 @@ def _post_validate(new_source: str, *, contract, kg_store: SculptorKG,
                 parent=parent_tracking,
                 parent_kernel_hash=parent_tracking_kernel_hash,
             )
+
+        # A promoted per-mode reward is an automaton, not one function. The
+        # set of modes, their order and their windows come from the
+        # composition seams and are structure the editor may not move.
+        if parent_modes is not None:
+            _validate_mode_reward_contract(
+                mod=mod, source=new_source, parent=parent_modes)
 
         # References shape + every arxiv_id present in KG.
         refs = spec.get("references", None)
@@ -1830,13 +1957,16 @@ def apply_edits(
         parent_tracking_kernel_hash = (
             _reference_kernel_hash(current_source)
             if parent_tracking is not None else None)
-        # A reference-tracking parent carries immutable float tables the model
-        # must not touch. Show it a redacted module and splice them back after
-        # (see `_elide_reference_tables`); every hash below still covers the
-        # FULL parent, so nothing about the contract is weakened.
+        parent_modes = _mode_reward_contract(current_module)
+        # A reference-tracking or per-mode parent carries immutable float
+        # tables the model must not touch. Show it a redacted module and splice
+        # them back after (see `_elide_reference_tables`); every hash below
+        # still covers the FULL parent, so nothing about the contract is
+        # weakened.
         prompt_source, elided_tables = (
             _elide_reference_tables(current_source)
-            if parent_tracking is not None else (current_source, {}))
+            if (parent_tracking is not None or parent_modes is not None)
+            else (current_source, {}))
         if elided_tables and on_event is not None:
             on_event({
                 "type": "log_line",
@@ -2018,6 +2148,7 @@ def apply_edits(
         user_prompt = _build_user_prompt(
             current_source=prompt_source,
             elided_table_names=sorted(elided_tables),
+            parent_modes=parent_modes,
             current_version=current_version,
             current_references=current_references,
             new_version=new_iter_id,
@@ -2072,6 +2203,7 @@ def apply_edits(
                         new_version=new_iter_id, write_to=target_path,
                         parent_hparams=gate_parent_hparams,
                         parent_tracking=parent_tracking,
+                        parent_modes=parent_modes,
                         parent_tracking_kernel_hash=parent_tracking_kernel_hash,
                         metric_observables=metric_observables,
                         replay_inputs=replay_inputs,
@@ -2108,6 +2240,7 @@ def apply_edits(
                     write_to=target_path,
                     parent_hparams=gate_parent_hparams,
                     parent_tracking=parent_tracking,
+                    parent_modes=parent_modes,
                     parent_tracking_kernel_hash=parent_tracking_kernel_hash,
                     metric_observables=metric_observables,
                     replay_inputs=replay_inputs,
@@ -2157,6 +2290,7 @@ def apply_edits(
                     write_to=target_path,
                     parent_hparams=gate_parent_hparams,
                     parent_tracking=parent_tracking,
+                    parent_modes=parent_modes,
                     parent_tracking_kernel_hash=parent_tracking_kernel_hash,
                     metric_observables=metric_observables,
                     replay_inputs=replay_inputs,
@@ -2196,6 +2330,7 @@ def apply_edits(
                         write_to=target_path,
                         parent_hparams=gate_parent_hparams,
                         parent_tracking=parent_tracking,
+                        parent_modes=parent_modes,
                         parent_tracking_kernel_hash=parent_tracking_kernel_hash,
                         metric_observables=metric_observables,
                         replay_inputs=replay_inputs,

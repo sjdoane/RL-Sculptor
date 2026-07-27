@@ -470,6 +470,12 @@ REWARD_SPEC: dict = {{
     # Consumed by the per-mode metric layer: it slices a rollout by these
     # windows instead of scoring the episode as one undifferentiated blob.
     "mode_windows_s": {{{", ".join(f"{n!r}: {list(w)}" for n, w in windows.items())}}},
+    # Which composed clip this automaton came from. Load-bearing after
+    # promotion: `promote_mode_reward` copies this module into the version
+    # chain, and without the id the UI could not re-open the per-mode panel on
+    # its own reward — it had to make the user search the clip library for it
+    # by hand, twice.
+    "reference_clip_id": {clip_id!r},
     "hyperparameters": {{}},
     "references": [],
 }}
